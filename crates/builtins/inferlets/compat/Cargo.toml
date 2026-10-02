@@ -1,0 +1,13 @@
+[package]
+name = "compat"
+version = "0.1.0"
+edition = "2024"
+description = "The shared core of the API-compatible built-in inferlets: one normalized chat request, one generation loop, one event stream"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+inferlet = { path = "../../../../crates/inferlet" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"

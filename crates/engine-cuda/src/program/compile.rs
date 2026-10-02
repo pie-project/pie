@@ -846,5 +846,4 @@ mod tests {
         disk.store("key", 0, "entry", b"cubin");
         assert_eq!(disk.load("key", 0, "entry"), None);
     }
-
 }

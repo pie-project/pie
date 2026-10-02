@@ -2,7 +2,6 @@ use engine_cuda::{Diagnostics, Knobs};
 
 const WORDS: &[(&str, fn(&Diagnostics) -> bool)] = &[
     ("golden-probe", |d| d.golden_probe),
-    ("golden-skip", |d| d.golden_skip),
     ("arm-trace", |d| d.arm_trace),
     ("capture-serial", |d| d.capture_serial),
     ("boundary-trace", |d| d.boundary_trace),

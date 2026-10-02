@@ -669,7 +669,6 @@ __global__ void moe_matmul_select_mxfp4(
     moe_note_group(group_hits);
 
     const int groups_per_row = k / 32;
-    const int words_per_row = k / 8;
 
     const u8* codes_at = codes;
     const u8* scales_at = scales;
@@ -688,45 +687,58 @@ __global__ void moe_matmul_select_mxfp4(
 #pragma unroll
     for (int r = 0; r < kRows; ++r) row_of[r] = min(row0 + r, n - 1);
 
-    const unsigned* w32 = reinterpret_cast<const unsigned*>(w);
+    // One 16-byte load is a whole 32-code block of a row; a lane issues every
+    // row's block for kU blocks before it computes, so the weights stream.
+    constexpr int kU = 2;
+    const uint4* wq = reinterpret_cast<const uint4*>(w);
+    const uint4* x4 = reinterpret_cast<const uint4*>(x);
 
     float acc[kRows];
 #pragma unroll
     for (int r = 0; r < kRows; ++r) acc[r] = 0.f;
 
-    for (int g = lane_id; g < groups_per_row; g += 32) {
-
-        float part[kRows];
+    for (int g0 = lane_id; g0 < groups_per_row; g0 += 32 * kU) {
+        uint4 ww[kU][kRows];
+        u8 sc[kU][kRows];
 #pragma unroll
-        for (int r = 0; r < kRows; ++r) part[r] = 0.f;
-#pragma unroll
-        for (int q = 0; q < 4; ++q) {
-            float xv[8];
-#pragma unroll
-            for (int j = 0; j < 8; ++j)
-                xv[j] = Elem<T>::to_f32(x[g * 32 + q * 8 + j]);
+        for (int u = 0; u < kU; ++u) {
+            const int g = min(g0 + 32 * u, groups_per_row - 1);
 #pragma unroll
             for (int r = 0; r < kRows; ++r) {
-                __half2 qd[4];
-                mxfp4_unpack8(
-                    w32[static_cast<long long>(row_of[r]) * words_per_row + g * 4 + q],
-                    qd);
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-
-                    const float2 f = __half22float2(qd[j]);
-                    part[r] = fmaf(f.x, xv[2 * j], part[r]);
-                    part[r] = fmaf(f.y, xv[2 * j + 1], part[r]);
-                }
+                const long long at = static_cast<long long>(row_of[r]) * groups_per_row + g;
+                ww[u][r] = wq[at];
+                sc[u][r] = s[at];
             }
         }
 #pragma unroll
-        for (int r = 0; r < kRows; ++r) {
-            acc[r] = fmaf(
-                part[r],
-                mxfp4_block_scale(
-                    s[static_cast<long long>(row_of[r]) * groups_per_row + g]),
-                acc[r]);
+        for (int u = 0; u < kU; ++u) {
+            const int g = g0 + 32 * u;
+            if (g >= groups_per_row) break;
+            float part[kRows];
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) part[r] = 0.f;
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const uint4 xq = x4[g * 4 + q];
+                const T* xe = reinterpret_cast<const T*>(&xq);
+                float xv[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) xv[j] = Elem<T>::to_f32(xe[j]);
+#pragma unroll
+                for (int r = 0; r < kRows; ++r) {
+                    __half2 qd[4];
+                    mxfp4_unpack8((&ww[u][r].x)[q], qd);
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float2 f = __half22float2(qd[j]);
+                        part[r] = fmaf(f.x, xv[2 * j], part[r]);
+                        part[r] = fmaf(f.y, xv[2 * j + 1], part[r]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < kRows; ++r)
+                acc[r] = fmaf(part[r], mxfp4_block_scale(sc[u][r]), acc[r]);
         }
     }
 #pragma unroll

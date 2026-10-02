@@ -4,11 +4,11 @@ pub mod arena;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use checkpoint::file::read::parse_metadata;
-use checkpoint::file::zt;
 use checkpoint::contract::ModelContract;
 use checkpoint::error::Error as LoadError;
 use checkpoint::executor::{Execution, sink::TensorSink};
+use checkpoint::file::read::parse_metadata;
+use checkpoint::file::zt;
 use checkpoint::plan::{LoadPlan, StorageTarget, compile, compile_streaming};
 use checkpoint::types::{ScaleForm, TensorId};
 use kernels_cuda::Tensor;
@@ -78,13 +78,14 @@ pub struct BankSeat {
 }
 
 fn banks(trace: &Trace, places: &[Place]) -> BTreeMap<String, Bank> {
-    trace.params
+    trace
+        .params
         .iter()
         .zip(places)
         .filter(|(param, _)| param.source == ParamSource::Registered)
         .map(|(param, place)| {
-            let adapters = u32::try_from(param.shape.first().copied().unwrap_or(0))
-                .unwrap_or(u32::MAX);
+            let adapters =
+                u32::try_from(param.shape.first().copied().unwrap_or(0)).unwrap_or(u32::MAX);
             let slot = if adapters == 0 {
                 0
             } else {
@@ -108,7 +109,9 @@ fn banks(trace: &Trace, places: &[Place]) -> BTreeMap<String, Bank> {
 
 pub fn device_demand(trace: &Trace) -> Result<u64> {
     let places = places(trace, &crate::experts::Plan::default())?;
-    Ok(places.last().map_or(0, |place| place.offset + place.reserved))
+    Ok(places
+        .last()
+        .map_or(0, |place| place.offset + place.reserved))
 }
 
 pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
@@ -126,11 +129,9 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
                     rows.saturating_mul(width).div_ceil(4)
                 }
                 Dtype::U8g64 => rows.saturating_mul(width),
-                Dtype::U2g16k
-                | Dtype::I3g16k
-                | Dtype::U4g32k
-                | Dtype::U5g32k
-                | Dtype::I6g16k => rows.saturating_mul(width),
+                Dtype::U2g16k | Dtype::I3g16k | Dtype::U4g32k | Dtype::U5g32k | Dtype::I6g16k => {
+                    rows.saturating_mul(width)
+                }
                 other => {
                     let element =
                         model_compiler::arena::elem_bytes(other).ok_or_else(|| Fault::Param {
@@ -171,10 +172,7 @@ pub fn prospect(
         .collect();
     let planes = attachments(&landing, &index)?;
     let ranking = crate::experts::Ranking::of(trace, &planes)?;
-    Ok(Prospect {
-        ranking,
-        planes,
-    })
+    Ok(Prospect { ranking, planes })
 }
 
 fn attachments(landing: &LoadPlan, index: &BTreeMap<&str, usize>) -> Result<Attachments> {
@@ -198,8 +196,13 @@ fn restore_from_checkpoint(
     store: &mut Buffer,
     tier: Option<&mut crate::experts::Tier>,
 ) -> std::result::Result<(), Rotten> {
-    let layout = tier.as_ref().map(|tier| tier.plan().host_layout()).unwrap_or_default();
-    let seated = tier.as_ref().is_some_and(|tier| tier.deferred_image().is_some());
+    let layout = tier
+        .as_ref()
+        .map(|tier| tier.plan().host_layout())
+        .unwrap_or_default();
+    let seated = tier
+        .as_ref()
+        .is_some_and(|tier| tier.deferred_image().is_some());
     let refill = match seated || layout.is_empty() {
         true => None,
         false => Some(serving.refill(&layout).map_err(Rotten::Bytes)?),
@@ -209,7 +212,9 @@ fn restore_from_checkpoint(
         .map(|(param, _, _, _)| u32::try_from(*param).unwrap_or(u32::MAX))
         .collect();
 
-    let base = store.at(0).map_err(|why| Rotten::Machine(format!("{why}")))?;
+    let base = store
+        .at(0)
+        .map_err(|why| Rotten::Machine(format!("{why}")))?;
     let mut transfers = Vec::with_capacity(places.len());
     let mut device_params = Vec::with_capacity(places.len());
     for (param, place) in places.iter().enumerate() {
@@ -259,18 +264,20 @@ fn restore_from_checkpoint(
     let mut hashed = device_params;
     hashed.extend(mapped);
     let (pumped, pinned) = (transfers.len(), pinned_params.len());
-    let into = Into(tier.as_ref().map_or(std::ptr::null_mut(), |tier| tier.host().host()));
+    let into = Into(
+        tier.as_ref()
+            .map_or(std::ptr::null_mut(), |tier| tier.host().host()),
+    );
     let (read, moved, verified) = std::thread::scope(|scope| {
         // SAFETY: `into` is the tier's own uninitialized allocation, which
         // `host_layout` tiles exactly, and no other reader names it yet.
-        let reading =
-            scope.spawn(move || match &refill {
-                None => serving.verify_planes(&pinned_params),
-                Some(refill) => {
-                    let into = into;
-                    unsafe { crate::checkpoint_serving::read_into(refill, into.0) }
-                }
-            });
+        let reading = scope.spawn(move || match &refill {
+            None => serving.verify_planes(&pinned_params),
+            Some(refill) => {
+                let into = into;
+                unsafe { crate::checkpoint_serving::read_into(refill, into.0) }
+            }
+        });
         let (moved, verified) = match (transfers.is_empty(), hashed.is_empty()) {
             (true, true) => (Ok(()), Ok(Ok(()))),
             (true, false) => (Ok(()), Ok(serving.verify_planes(&hashed))),
@@ -306,7 +313,11 @@ fn restore_from_checkpoint(
         serving.path(),
         pumped,
         pinned,
-        if seated { "verified where they lie" } else { "copied and verified" },
+        if seated {
+            "verified where they lie"
+        } else {
+            "copied and verified"
+        },
     );
     Ok(())
 }
@@ -430,17 +441,18 @@ enum Scratch {
 }
 
 impl Scratch {
-    fn fitting(arena: usize, mapped: u64) -> Result<Scratch> {
+    fn fitting(arena: usize, mapped: u64, beside: &Path) -> Result<Scratch> {
         let need = arena as u64 + mapped + (2 << 30);
-        if need <= available_memory() {
+        let free = available_memory();
+        if arena == 0 || need <= free {
             return Ok(Scratch::Ram(vec![0u8; arena]));
         }
         eprintln!(
             "engine-cuda: the load's {arena}-byte transform arena does not fit \
-             what is left of this machine's memory beside its {mapped} mapped \
-             bytes; spilling the arena to disk"
+             the {free} bytes left of this machine's memory beside its {mapped} \
+             mapped bytes; spilling the arena to disk"
         );
-        SpillArena::new(arena).map(Scratch::Disk)
+        SpillArena::new(arena, &[std::env::temp_dir(), beside.to_path_buf()]).map(Scratch::Disk)
     }
 
     fn as_mut(&mut self) -> &mut [u8] {
@@ -451,34 +463,97 @@ impl Scratch {
     }
 }
 
-fn available_memory() -> u64 {
-    let meminfo = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|text| {
-            text.lines().find_map(|line| {
-                let rest = line.strip_prefix("MemAvailable:")?;
-                let kb: u64 = rest.trim().trim_end_matches(" kB").trim().parse().ok()?;
-                Some(kb * 1024)
-            })
-        });
-    let cgroup = || -> Option<u64> {
-        let max: u64 = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
-            .ok()?
-            .trim()
-            .parse()
-            .ok()?;
-        let current: u64 = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
-            .ok()?
-            .trim()
-            .parse()
-            .ok()?;
-        Some(max.saturating_sub(current))
-    }();
-    match (meminfo, cgroup) {
+pub(crate) fn available_memory() -> u64 {
+    let read = |path: &str| std::fs::read_to_string(path).ok();
+    headroom(
+        read("/proc/meminfo").as_deref(),
+        read("/sys/fs/cgroup/memory.max").as_deref(),
+        read("/sys/fs/cgroup/memory.current").as_deref(),
+        read("/sys/fs/cgroup/memory.stat").as_deref(),
+    )
+}
+
+/// `memory.current` counts the page cache the group's reads left behind, which
+/// reclaim hands back on demand, so it is netted out as `MemAvailable` does.
+fn headroom(
+    meminfo: Option<&str>,
+    max: Option<&str>,
+    current: Option<&str>,
+    stat: Option<&str>,
+) -> u64 {
+    let field = |text: Option<&str>, key: &str| -> Option<u64> {
+        text?.lines().find_map(|line| {
+            let rest = line.strip_prefix(key)?;
+            rest.trim().trim_end_matches("kB").trim().parse().ok()
+        })
+    };
+    let number = |text: Option<&str>| -> Option<u64> { text?.trim().parse().ok() };
+    let host = field(meminfo, "MemAvailable:").map(|kb| kb * 1024);
+    let cgroup = number(max).zip(number(current)).map(|(max, current)| {
+        let cached =
+            field(stat, "inactive_file ").unwrap_or(0) + field(stat, "active_file ").unwrap_or(0);
+        max.saturating_sub(current.saturating_sub(cached))
+    });
+    match (host, cgroup) {
         (Some(a), Some(b)) => a.min(b),
         (Some(a), None) | (None, Some(a)) => a,
         (None, None) => u64::MAX,
     }
+}
+
+struct Volume {
+    free: u64,
+    tmpfs: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn volume(at: &Path) -> Option<Volume> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(at.as_os_str().as_bytes()).ok()?;
+    let mut said: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and a struct this frame owns.
+    if unsafe { libc::statfs(path.as_ptr(), &raw mut said) } != 0 {
+        return None;
+    }
+    Some(Volume {
+        free: said
+            .f_bavail
+            .checked_mul(u64::try_from(said.f_bsize).ok()?)?,
+        tmpfs: said.f_type == libc::TMPFS_MAGIC,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn volume(_at: &Path) -> Option<Volume> {
+    None
+}
+
+/// A tmpfs is the memory the spill is leaving, and a volume short of `len`
+/// takes the sparse `ftruncate` and SIGBUSes the landing; a volume `statfs`
+/// cannot describe is taken on trust.
+fn spill_site(
+    candidates: &[(std::path::PathBuf, Option<Volume>)],
+    len: u64,
+) -> std::result::Result<std::path::PathBuf, String> {
+    let mut refused = Vec::new();
+    for (dir, volume) in candidates {
+        match volume {
+            Some(Volume { tmpfs: true, .. }) => {
+                refused.push(format!("{} is a tmpfs", dir.display()));
+            }
+            Some(Volume { free, .. }) if *free < len => refused.push(format!(
+                "{} has {:.2} GiB free",
+                dir.display(),
+                *free as f64 / (1u64 << 30) as f64
+            )),
+            _ => return Ok(dir.clone()),
+        }
+    }
+    Err(format!(
+        "no volume has {:.2} GiB of real disk for the arena: {}. Point TMPDIR at one that does",
+        len as f64 / (1u64 << 30) as f64,
+        refused.join(", ")
+    ))
 }
 
 struct SpillArena {
@@ -487,32 +562,56 @@ struct SpillArena {
 }
 
 impl SpillArena {
-    fn new(len: usize) -> Result<SpillArena> {
-        let dir = std::env::temp_dir();
+    fn new(len: usize, candidates: &[std::path::PathBuf]) -> Result<SpillArena> {
+        let refuse = |why: String| Fault::Load(checkpoint::error::Error::Checkpoint(why));
+        let sites: Vec<_> = candidates
+            .iter()
+            .map(|dir| (dir.clone(), volume(dir)))
+            .collect();
+        let dir = spill_site(&sites, len as u64).map_err(refuse)?;
         let path = dir.join(format!("pie-arena-{}", std::process::id()));
+        eprintln!("engine-cuda: the arena spills to {}", path.display());
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
             .open(&path)
-            .map_err(|why| Fault::Load(checkpoint::error::Error::Checkpoint(format!(
-                "the arena spill file {} does not open: {why}",
-                path.display()
-            ))))?;
+            .map_err(|why| {
+                refuse(format!(
+                    "the arena spill file {} does not open: {why}",
+                    path.display()
+                ))
+            })?;
         let _ = std::fs::remove_file(&path);
         file.set_len(len as u64).map_err(|why| {
-            Fault::Load(checkpoint::error::Error::Checkpoint(format!(
+            refuse(format!(
                 "the arena spill file does not grow to {len} bytes: {why}"
-            )))
+            ))
         })?;
+        // Claim the pages now so a full volume refuses by name instead of
+        // SIGBUS on the first write it cannot back.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the open descriptor and the length it was just sized to.
+            if unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, len as libc::off_t) } != 0 {
+                let why = std::io::Error::last_os_error();
+                if !matches!(
+                    why.raw_os_error(),
+                    Some(libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL)
+                ) {
+                    return Err(refuse(format!(
+                        "the arena spill file under {} does not preallocate {len} bytes: {why}",
+                        dir.display()
+                    )));
+                }
+            }
+        }
         // SAFETY: a fresh shared mapping over a file this fn just created,
         // sized, and unlinked, so no other process can reach it.
-        let map = unsafe { memmap2::MmapMut::map_mut(&file) }.map_err(|why| {
-            Fault::Load(checkpoint::error::Error::Checkpoint(format!(
-                "the arena spill file does not map: {why}"
-            )))
-        })?;
+        let map = unsafe { memmap2::MmapMut::map_mut(&file) }
+            .map_err(|why| refuse(format!("the arena spill file does not map: {why}")))?;
         Ok(SpillArena { map, len })
     }
 
@@ -698,7 +797,7 @@ impl Weights {
                 sink.landed
             } else {
                 let bytes = usize::try_from(landing.memory.arena_bytes()).unwrap_or(0);
-                let mut scratch = Scratch::fitting(bytes, plan.spill_demand())?;
+                let mut scratch = Scratch::fitting(bytes, plan.spill_demand(), snapshot)?;
                 let mut backing: &mut [u8] = scratch.as_mut();
                 Execution::new(&landing, snapshot)
                     .arena(&mut backing)
@@ -768,9 +867,7 @@ impl Weights {
                     codes: packed(experts.as_ref(), &store, &places, at)?,
                     scales: packed(experts.as_ref(), &store, &places, pairing.scales)?,
                     biases: match pairing.biases {
-                        Some(biases) => {
-                            Some(packed(experts.as_ref(), &store, &places, biases)?)
-                        }
+                        Some(biases) => Some(packed(experts.as_ref(), &store, &places, biases)?),
                         None => None,
                     },
                     seat: experts
@@ -931,7 +1028,9 @@ impl Weights {
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
         let mut at = 0u64;
         while at < total {
-            let want = usize::try_from(total - at).unwrap_or(usize::MAX).min(chunk.len());
+            let want = usize::try_from(total - at)
+                .unwrap_or(usize::MAX)
+                .min(chunk.len());
             let slice = &mut chunk[..want];
             self.store.read(at, slice)?;
             for byte in slice.iter() {
@@ -1142,7 +1241,12 @@ impl TensorSink for Landing<'_> {
             return Ok(());
         }
         let streamed = self.plan.resident(at).is_some() || self.plan.pinned(at);
-        if streamed && self.experts.as_ref().is_some_and(|tier| tier.deferred_image().is_some()) {
+        if streamed
+            && self
+                .experts
+                .as_ref()
+                .is_some_and(|tier| tier.deferred_image().is_some())
+        {
             self.landed[at] = true;
             return Ok(());
         }
@@ -1180,8 +1284,9 @@ mod tests {
 
     #[test]
     fn the_store_is_laid_out_aligned_disjoint_and_in_plan_order() {
-        let trace =
-            models::sku("qwen35-d0.8b-bf16-kv-bf16").expect("the catalog ships the SKU").trace;
+        let trace = models::sku("qwen35-d0.8b-bf16-kv-bf16")
+            .expect("the catalog ships the SKU")
+            .trace;
         let trace = trace(Platform::Cuda);
         let places = places(&trace, &crate::experts::Plan::default())
             .expect("every param of a bf16 SKU has an element size");
@@ -1189,7 +1294,11 @@ mod tests {
         assert_eq!(places.len(), trace.params.len());
         let mut end = 0u64;
         for (place, param) in places.iter().zip(&trace.params) {
-            assert!(place.offset >= end, "`{}` overlaps its predecessor", param.name);
+            assert!(
+                place.offset >= end,
+                "`{}` overlaps its predecessor",
+                param.name
+            );
             assert_eq!(place.offset % ALIGN, 0, "`{}` is misaligned", param.name);
             assert!(place.bytes > 0, "`{}` reserves nothing", param.name);
             end = place.offset + place.reserved;
@@ -1201,4 +1310,28 @@ mod tests {
         assert_eq!(places[0].bytes, 248_320 * 1024 * 2);
     }
 
+    #[test]
+    fn the_headroom_nets_the_cgroups_page_cache_out_of_its_usage() {
+        let meminfo = "MemAvailable:   743437580 kB\n";
+        let stat = "anon 758157312\ninactive_file 23216467968\nactive_file 66810552320\n";
+        let pod = headroom(
+            Some(meminfo),
+            Some("93999996928\n"),
+            Some("93473275904\n"),
+            Some(stat),
+        );
+        assert_eq!(
+            pod,
+            93_999_996_928 - (93_473_275_904 - 23_216_467_968 - 66_810_552_320)
+        );
+        assert_eq!(
+            headroom(
+                None,
+                Some("100\n"),
+                Some("100\n"),
+                Some("inactive_file 500\n")
+            ),
+            100
+        );
+    }
 }

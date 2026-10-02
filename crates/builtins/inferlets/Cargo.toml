@@ -1,0 +1,7 @@
+# The inferlets built into the pie binary, one cargo workspace targeting
+[workspace]
+resolver = "2"
+members = ["compat", "compat-openai", "compat-anthropic", "compat-gemini"]
+
+[profile.release]
+lto = true

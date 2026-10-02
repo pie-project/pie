@@ -35,6 +35,7 @@ fn storage_compiler_every_case() {
     a_contract_that_declares_a_name_twice_is_rejected();
     a_contract_whose_declared_shape_is_wrong_is_rejected();
     a_head_boundary_shard_is_one_contiguous_run();
+    a_coalesced_row_shard_bank_stays_internal_and_keeps_the_members_scales();
     a_head_boundary_shard_rejects_an_indivisible_world();
     a_scale_by_zero_is_rejected_at_compile_time();
     a_scale_by_a_non_finite_factor_is_rejected_at_compile_time();
@@ -889,6 +890,96 @@ fn a_head_boundary_shard_is_one_contiguous_run() {
     assert_eq!(reads.len(), 1, "{reads:#?}");
     assert_eq!(reads[0].file_offset, 32);
     assert_eq!(reads[0].span_bytes, 32);
+}
+
+fn a_coalesced_row_shard_bank_stays_internal_and_keeps_the_members_scales() {
+    // sixteen same-shape bf16 planes cut on axis 0 are coalesced into one
+    // `__pie.row_shard_bank.N` at tp>1; the bank is the compiler's staging
+    // buffer and no plan names it, so it must stay internal (engine-cuda's
+    // sink refused the published name on the GLM mini), and a member that
+    // carried `scaling(...)` must still carry it afterwards
+    const N: usize = 16;
+    let rows = 8_i64;
+    let cols = 4_i64;
+    let bytes = (rows * cols * 2) as u64;
+    let mut tensors = Vec::new();
+    for i in 0..N as u32 {
+        tensors.push(sized_raw(
+            i,
+            &format!("w{i}"),
+            u64::from(i) * bytes,
+            bytes,
+            &[rows, cols],
+            DType::Bf16,
+        ));
+    }
+    // verify_plan reads the file back, so the planes need a real backing file
+    let dir = std::env::temp_dir().join(format!("pie-row-shard-bank-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("model.safetensors");
+    std::fs::write(&path, vec![0u8; (bytes * N as u64) as usize]).unwrap();
+    let metadata = Metadata {
+        files: vec![File {
+            id: FileId(0),
+            path: path.to_string_lossy().into_owned(),
+            size_bytes: bytes * N as u64,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors,
+    };
+    let scaling = Scales {
+        of: "w3".to_string(),
+        granularity: QuantGranularity::PerGroup,
+        group_size: 2,
+        channel_axis: 1,
+        form: ScaleForm::Bf16AffineFactors,
+    };
+    let contract = ModelContract {
+        alignment: 256,
+        tensors: (0..N)
+            .map(|i| {
+                let t = TensorContract::new(
+                    format!("w{i}"),
+                    Expr::src(format!("w{i}")).shard(0),
+                    vec![rows, cols],
+                    Encoding::Raw(DType::Bf16),
+                );
+                if i == 3 {
+                    t.scaling(scaling.clone())
+                } else {
+                    t
+                }
+            })
+            .collect(),
+        groups: Vec::new(),
+    };
+    let target = StorageTarget {
+        tp_rank: 1,
+        tp_size: 2,
+        ..StorageTarget::default()
+    };
+    let plan = compile_load_plan(&metadata, &contract, target).unwrap();
+    let view = checkpoint::verify::ContractView::of(&contract);
+    checkpoint::verify::verify_plan(&plan, Some(&view))
+        .unwrap_or_else(|violations| panic!("the coalesced plan does not verify: {violations:#?}"));
+    let published: Vec<&str> = plan
+        .tensors
+        .iter()
+        .filter(|t| t.visibility == checkpoint::types::Visibility::Public)
+        .map(|t| t.name.as_str())
+        .collect();
+    assert!(
+        !published
+            .iter()
+            .any(|name| name.starts_with("__pie.row_shard_bank")),
+        "the bank is published: {published:?}"
+    );
+    assert!(
+        plan.tensors
+            .iter()
+            .any(|t| t.name.starts_with("__pie.row_shard_bank")),
+        "the coalescer did not fire, so this test covers nothing"
+    );
 }
 
 fn a_head_boundary_shard_rejects_an_indivisible_world() {

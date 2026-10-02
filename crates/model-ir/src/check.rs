@@ -171,6 +171,14 @@ pub enum Fault {
         last: Option<Dim>,
         why: HadamardWhy,
     },
+    HadamardSignDtype {
+        node: usize,
+        op: &'static str,
+        x: ValueId,
+        signs: ValueId,
+        act: Dtype,
+        sign: Dtype,
+    },
 }
 
 /// The smallest and largest Hadamard block the Metal butterfly instantiates.
@@ -368,7 +376,7 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
                 // dim must itself be a whole number of blocks.
                 if let Some(s) = signs
                     && in_range(*s)
-                    && let Ty::Tensor { shape, .. } = &trace.values[s.0 as usize].ty
+                    && let Ty::Tensor { shape, dtype: sign } = &trace.values[s.0 as usize].ty
                 {
                     let last = shape.last().copied();
                     if !matches!(last, Some(Dim::Const(d)) if d % u64::from(block) == 0) {
@@ -379,6 +387,22 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
                             block,
                             last,
                             why: HadamardWhy::Signs,
+                        });
+                    }
+                    // The signs multiply the activation on load, so the kernel
+                    // reads both through one element; mismatched dtypes are
+                    // rejected here rather than at launch.
+                    if in_range(*x)
+                        && let Ty::Tensor { dtype: act, .. } = &trace.values[x.0 as usize].ty
+                        && act != sign
+                    {
+                        faults.push(Fault::HadamardSignDtype {
+                            node: j,
+                            op,
+                            x: *x,
+                            signs: *s,
+                            act: *act,
+                            sign: *sign,
                         });
                     }
                 }
@@ -605,6 +629,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::Decode { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE)],
             Attention::Prefill { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE)],
             Attention::Masked { .. } => &[(In(1), PREFILL_PLAN), (In(3), CACHE)],
+            Attention::MaskedLse { .. } => &[(In(1), PREFILL_PLAN), (In(3), CACHE), (Out(1), F32)],
             Attention::Dense { .. } => &[(In(3), I32)],
             Attention::Ragged {
                 mask: RaggedMask::ReferenceSelfOnly { .. },
@@ -617,6 +642,12 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::Ragged { .. } => &[(In(3), I32), (In(4), I32)],
             Attention::DecodeLse { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)],
             Attention::PrefillLse { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE), (Out(1), F32)],
+            Attention::DecodeSelected { .. } => {
+                &[(In(1), DECODE_PLAN), (In(2), I32), (In(3), CACHE)]
+            }
+            Attention::PrefillSelected { .. } => {
+                &[(In(1), PREFILL_PLAN), (In(2), I32), (In(3), CACHE)]
+            }
             Attention::DecodeRel { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE), (In(3), F32)],
             Attention::PrefillRel { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE), (In(3), F32)],
             Attention::Sink { .. } => &[(In(1), F32)],
@@ -649,8 +680,9 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             }
             Attention::SsmKdaStep { .. } | Attention::SsmKdaChunked { .. } => &[(In(5), CACHE)],
             Attention::IndexLayernormRope { .. } | Attention::IndexRope { .. } => &[(In(1), I32)],
-            Attention::IndexTopk { .. } => &[(In(2), CACHE), (Out(0), I32)],
+            Attention::IndexTopk { .. } => &[(In(1), CACHE), (Out(0), I32)],
             Attention::IndexKvAppend { .. } => &[(In(1), CACHE), (In(2), I32), (In(3), I32)],
+            Attention::IndexBlockMean { .. } => &[(In(0), I32), (In(1), I32), (In(2), CACHE)],
             Attention::PoolBoundaryDecode { .. } | Attention::PoolBoundaryPrefill { .. } => &[
                 (In(0), I32),
                 (In(1), U8),
@@ -714,6 +746,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Linear::MlpGegluTanhPacked { .. }
             | Linear::MatmulGeglu { .. }
             | Linear::LmHeadSoftcap { .. }
+            | Linear::MatmulBias { .. }
             | Linear::MlpSitu { .. }
             | Linear::MoeSigmoidGateAdd { .. } => &[],
         },
@@ -1215,6 +1248,24 @@ impl Display for Fault {
                     V(*id)
                 ),
             },
+            Fault::HadamardSignDtype {
+                node,
+                op,
+                x,
+                signs,
+                act,
+                sign,
+            } => {
+                write!(
+                    f,
+                    "node {node} ({op}): the sign diagonal {} is {}, but the activation {} it \
+                     rides is {}; the signs multiply on the activation's element",
+                    V(*signs),
+                    N(*sign),
+                    V(*x),
+                    N(*act)
+                )
+            }
         }
     }
 }

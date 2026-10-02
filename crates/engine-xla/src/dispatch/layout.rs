@@ -1,0 +1,215 @@
+use kernels_xla::layout;
+use model_exec::{DispatchLayout, KernelError};
+use model_ir::Layout;
+
+use model_ir::Operands;
+
+use crate::run::Run;
+
+impl DispatchLayout for Run<'_> {
+    fn dispatch(&mut self, op: &Layout) -> Result<(), KernelError> {
+        self.ctx().scope(op.name());
+        self.layout(op).map_err(crate::error::kernel)
+    }
+}
+
+impl Run<'_> {
+    fn layout(&mut self, op: &Layout) -> Result<(), kernels_xla::Error> {
+        match op {
+            Layout::Embed {
+                ids,
+                table,
+                vocab,
+                y,
+            } => match self.banked(*table) {
+                Some(bank) => layout::embed_gather_mb_4bit(
+                    self.ctx(),
+                    self.tensor(*ids),
+                    bank,
+                    *vocab,
+                    self.tensor(*y),
+                ),
+                None if self.tensor(*table).rows < *vocab => layout::embed_vocab_shard(
+                    self.ctx(),
+                    self.tensor(*ids),
+                    self.tensor(*table),
+                    self.rank(),
+                    self.tensor(*y),
+                ),
+                None => layout::embed(
+                    self.ctx(),
+                    self.tensor(*ids),
+                    self.tensor(*table),
+                    *vocab,
+                    self.tensor(*y),
+                ),
+            },
+
+            Layout::EmbedConcat {
+                ids,
+                table,
+                vocab,
+                y,
+            } => match self.banked(*table) {
+                Some(bank) => {
+                    let ids = self.tensor(*ids);
+                    let width = self.tensor(*y).width / ids.width.max(1);
+                    let guard = layout::table_rows(&bank, width).min(*vocab);
+                    layout::embed_concat_mb_4bit(self.ctx(), ids, bank, guard, self.tensor(*y))
+                }
+                None => {
+                    let plane = self.tensor(*table);
+                    let guard = plane.rows.min(*vocab);
+                    layout::embed_concat(
+                        self.ctx(),
+                        self.tensor(*ids),
+                        plane,
+                        guard,
+                        self.tensor(*y),
+                    )
+                }
+            },
+            Layout::SplitQkv {
+                packed,
+                q_width,
+                kv_width,
+                q,
+                k,
+                v,
+            } => layout::split_qkv(
+                self.ctx(),
+                self.tensor(*packed),
+                *q_width,
+                *kv_width,
+                self.tensor(*q),
+                self.tensor(*k),
+                self.tensor(*v),
+            ),
+            Layout::SplitQGate {
+                packed,
+                head_dim,
+                q,
+                gate,
+            } => layout::split_q_gate(
+                self.ctx(),
+                self.tensor(*packed),
+                *head_dim,
+                self.tensor(*q),
+                self.tensor(*gate),
+            ),
+            Layout::SplitRows {
+                x,
+                width,
+                left,
+                right,
+            } => layout::split_rows(
+                self.ctx(),
+                self.tensor(*x),
+                *width,
+                self.tensor(*left),
+                self.tensor(*right),
+            ),
+
+            Layout::PoolRows { x, side, y } => {
+                layout::pool_rows(self.ctx(), self.tensor(*x), *side, self.tensor(*y))
+            }
+
+            Layout::MergeRows { x, side, y } => {
+                layout::merge_rows(self.ctx(), self.tensor(*x), *side, self.tensor(*y))
+            }
+
+            Layout::ScatterLiveRows {
+                src,
+                routes,
+                y,
+                y_out: _,
+            } => layout::scatter_live_rows(
+                self.ctx(),
+                self.tensor(*src),
+                self.tensor(*routes),
+                self.uncut(*y),
+            ),
+
+            Layout::EmbedWeighted {
+                ids,
+                weights,
+                table,
+                vocab,
+                y,
+            } => layout::embed_weighted(
+                self.ctx(),
+                self.tensor(*ids),
+                self.tensor(*weights),
+                self.tensor(*table),
+                *vocab,
+                self.tensor(*y),
+            ),
+
+            Layout::ScatterRows {
+                src,
+                routes,
+                y,
+                y_out: _,
+            } => layout::scatter_rows(
+                self.ctx(),
+                self.tensor(*src),
+                self.tensor(*routes),
+                self.uncut(*y),
+            ),
+
+            Layout::TopK {
+                x,
+                k,
+                values,
+                indices,
+            } => layout::topk(
+                self.ctx(),
+                self.tensor(*x),
+                *k,
+                self.tensor(*values),
+                self.tensor(*indices),
+            ),
+            Layout::PackRows { x, perm, y } => layout::pack_rows(
+                self.ctx(),
+                self.uncut(*x),
+                self.tensor(*perm),
+                self.tensor(*y),
+            ),
+            Layout::UnpackRows { x, perm, y } => layout::unpack_rows(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*perm),
+                self.uncut(*y),
+            ),
+            Layout::Argmax { xs, y } => {
+                for (column, x) in xs.iter().enumerate() {
+                    layout::argmax(
+                        self.ctx(),
+                        self.tensor(*x),
+                        u32::try_from(column).expect("a draft depth inside u32"),
+                        self.tensor(*y),
+                    )?;
+                }
+                Ok(())
+            }
+            Layout::GatherRows { x, rows, y } => layout::gather_rows(
+                self.ctx(),
+                self.uncut(*x),
+                self.tensor(*rows),
+                self.tensor(*y),
+            ),
+            Layout::Select {
+                table,
+                layer,
+                width,
+                y,
+            } => layout::select(
+                self.ctx(),
+                self.tensor(*table),
+                *layer,
+                *width,
+                self.tensor(*y),
+            ),
+        }
+    }
+}

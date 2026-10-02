@@ -526,19 +526,17 @@ fn build_partner_bootstrap(
         transfer: user_cfg.offload.transfer,
         model_idx,
         page_size: metadata.page_size,
-        request_timeout_secs: user_cfg.runtime.request_timeout.as_secs(),
         max_outstanding: user_cfg.offload.max_outstanding_per_partner,
     })
 }
 
+/// The verbose banner goes to stderr; the ready line is the CLI's to print,
+/// so a process embedding the server (the Node addon, the Python wheel)
+/// keeps its stdout.
 fn log_serving(cfg: &config::Config, url: &str) {
-    use std::io::Write;
-
     if cfg.server.verbose {
         eprintln!("{}", StartupBanner::from_config(cfg).render(url));
     }
-    println!("{}", banner::ready_line(url));
-    let _ = std::io::stdout().flush();
 }
 
 async fn assemble_control_and_edge(

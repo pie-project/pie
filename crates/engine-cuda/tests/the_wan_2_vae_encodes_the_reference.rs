@@ -292,7 +292,11 @@ fn the_encoder_answers_the_reference_chunk_by_chunk() {
         per_chunk.push((k as u32, s));
         got.extend_from_slice(&out);
     }
-    assert_eq!(got.len(), latent.len(), "the fires cover the golden's frames");
+    assert_eq!(
+        got.len(),
+        latent.len(),
+        "the fires cover the golden's frames"
+    );
 
     let whole = score(&got, &latent);
     let (lo, hi) = got

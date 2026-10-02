@@ -10,16 +10,34 @@ use crate::term::{
 };
 use crate::types::{Axis, CheckpointFormat, DType, Encoding, FileId, QuantSpec, TensorId};
 
+fn index(path: &Path) -> Result<Source, Error> {
+    if ztensor::memfs::is_mounted(path) {
+        return Source::open(path).map_err(Error::from);
+    }
+    ztensor_compat::index(path).map_err(Error::from)
+}
+
+fn index_all(paths: &[PathBuf]) -> Result<Source, Error> {
+    if !paths.iter().any(ztensor::memfs::is_mounted) {
+        return ztensor_compat::index_all(paths).map_err(Error::from);
+    }
+    let sources = paths
+        .iter()
+        .map(|path| index(path))
+        .collect::<Result<_, _>>()?;
+    Source::merge(sources).map_err(Error::from)
+}
+
 pub fn parse(path: &Path) -> Result<Metadata, Error> {
-    describe(&ztensor_compat::index(path).map_err(Error::from)?)
+    describe(&index(path)?)
 }
 
 pub fn parse_files(paths: &[PathBuf]) -> Result<Metadata, Error> {
-    describe(&ztensor_compat::index_all(paths).map_err(Error::from)?)
+    describe(&index_all(paths)?)
 }
 
 pub fn parse_groups(path: &Path) -> Result<Vec<(String, Vec<String>)>, Error> {
-    describe_groups(&ztensor_compat::index(path).map_err(Error::from)?)
+    describe_groups(&index(path)?)
 }
 
 pub fn describe_groups(source: &Source) -> Result<Vec<(String, Vec<String>)>, Error> {
@@ -35,23 +53,17 @@ pub fn describe_groups(source: &Source) -> Result<Vec<(String, Vec<String>)>, Er
 }
 
 pub fn parse_attributes(path: &Path) -> Result<Attributes, Error> {
-    Ok(attributes_of(
-        &ztensor_compat::index(path).map_err(Error::from)?,
-    ))
+    Ok(attributes_of(&index(path)?))
 }
 
 pub fn parse_attributes_files(paths: &[PathBuf]) -> Result<Attributes, Error> {
     let mut paths = paths.to_vec();
     paths.sort();
-    Ok(attributes_of(
-        &ztensor_compat::index_all(&paths).map_err(Error::from)?,
-    ))
+    Ok(attributes_of(&index_all(&paths)?))
 }
 
 pub fn parse_tokenizer_tables(path: &Path) -> Result<TokenizerTables, Error> {
-    Ok(tokenizer_tables_of(
-        &ztensor_compat::index(path).map_err(Error::from)?,
-    ))
+    Ok(tokenizer_tables_of(&index(path)?))
 }
 
 fn tokenizer_tables_of(source: &Source) -> TokenizerTables {
@@ -132,7 +144,7 @@ pub fn verify(path: &Path) -> Result<usize, Error> {
 }
 
 pub fn artifact_identity(path: &Path) -> Result<Option<Vec<u8>>, Error> {
-    if !path.is_file()
+    if !(path.is_file() || ztensor::memfs::is_mounted(path))
         || !path
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("zt"))

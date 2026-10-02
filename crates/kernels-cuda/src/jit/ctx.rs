@@ -100,6 +100,18 @@ impl Slabs {
     pub const PROCESS: Slabs = Slabs(0);
 
     #[must_use]
+    pub fn census() -> Vec<(&'static str, usize)> {
+        #[cfg(feature = "cuda")]
+        {
+            crate::jit::device::census()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            Vec::new()
+        }
+    }
+
+    #[must_use]
     pub fn open() -> Slabs {
         static NEXT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
         Slabs(NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed))
@@ -134,18 +146,36 @@ pub struct Pad {
     pub bucket: u32,
 }
 
+impl Pad {
+    /// The rows a kernel launches over for an operand of `rows` rows: the
+    /// fire's rows are padded to the bucket, whatever axis they were read on.
+    #[must_use]
+    pub fn extent(self, rows: u32) -> u32 {
+        if self.bucket > self.rows && rows == self.rows {
+            self.bucket
+        } else {
+            rows
+        }
+    }
+}
+
 pub const NO_REGION: u32 = u32::MAX;
+
+#[cfg(feature = "cuda")]
+pub const SHARED_REGION: u32 = u32::MAX - 1;
 
 pub struct Ctx {
     stream: *mut c_void,
     cublas: *mut c_void,
     comm: *mut c_void,
+    peers: Option<crate::collective::Peers>,
     slabs: Slabs,
 
     pad: core::cell::Cell<Pad>,
 
     stage: core::cell::Cell<u64>,
     region: core::cell::Cell<u32>,
+    lane: core::cell::Cell<u32>,
 }
 
 impl Ctx {
@@ -158,13 +188,12 @@ impl Ctx {
             stream,
             cublas: core::ptr::null_mut(),
             comm: core::ptr::null_mut(),
+            peers: None,
             slabs: Slabs::PROCESS,
-            pad: core::cell::Cell::new(Pad {
-                rows: 0,
-                bucket: 0,
-            }),
+            pad: core::cell::Cell::new(Pad { rows: 0, bucket: 0 }),
             stage: core::cell::Cell::new(0),
             region: core::cell::Cell::new(NO_REGION),
+            lane: core::cell::Cell::new(0),
         }
     }
 
@@ -190,6 +219,21 @@ impl Ctx {
     pub const unsafe fn with_comm(mut self, comm: *mut c_void) -> Self {
         self.comm = comm;
         self
+    }
+
+    /// # Safety
+    ///
+    /// Every pointer in `peers` must stay live, and mapped on this context's
+    /// device, for as long as this context fires collectives.
+    #[must_use]
+    pub const unsafe fn with_peers(mut self, peers: crate::collective::Peers) -> Self {
+        self.peers = Some(peers);
+        self
+    }
+
+    #[must_use]
+    pub const fn peers(&self) -> Option<crate::collective::Peers> {
+        self.peers
     }
 
     #[must_use]
@@ -229,6 +273,48 @@ impl Ctx {
         }
     }
 
+    /// A slab one per stream, whatever region asks: for a tile a launch
+    /// fills and the next launch on the same stream consumes, so a model
+    /// with hundreds of such regions holds one tile a stream, not one a
+    /// region. A capture sees the slab as it was warmed, so arming fires
+    /// the widest plane eagerly first.
+    pub fn scratch_stream(
+        &self,
+        op: &'static str,
+        name: &'static str,
+        bytes: usize,
+    ) -> Result<*mut c_void, Error> {
+        #[cfg(feature = "cuda")]
+        {
+            crate::jit::device::take(self.slabs.0, self.stream, name, NO_REGION, bytes)
+                .map_err(|fault| fault.at(op))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (name, bytes);
+            Err(crate::jit::runtimeless(op))
+        }
+    }
+
+    pub fn scratch_shared(
+        &self,
+        op: &'static str,
+        name: &'static str,
+        bytes: usize,
+    ) -> Result<*mut c_void, Error> {
+        #[cfg(feature = "cuda")]
+        {
+            let region = SHARED_REGION.saturating_sub(self.lane.get().min(1 << 8));
+            crate::jit::device::take(self.slabs.0, self.stream, name, region, bytes)
+                .map_err(|fault| fault.at(op))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (name, bytes);
+            Err(crate::jit::runtimeless(op))
+        }
+    }
+
     #[must_use]
     pub const fn slabs(&self) -> Slabs {
         self.slabs
@@ -250,6 +336,9 @@ impl Ctx {
         self.stage.set(0);
     }
 
+    pub fn arm_lane(&self, lane: u32) {
+        self.lane.set(lane);
+    }
     pub fn arm_region(&self, region: u32) {
         self.region.set(region);
     }
@@ -270,14 +359,12 @@ impl Ctx {
 
     #[must_use]
     pub fn opaque_rows(&self, rows: i32) -> i32 {
-        let pad = self.pad.get();
-        if pad.bucket <= pad.rows {
+        let Ok(stated) = u32::try_from(rows) else {
             return rows;
-        }
-        if rows < 0 || rows.unsigned_abs() != pad.rows {
-            return rows;
-        }
-        i32::try_from(pad.bucket).unwrap_or(rows).max(rows)
+        };
+        i32::try_from(self.pad.get().extent(stated))
+            .unwrap_or(rows)
+            .max(rows)
     }
 
     #[allow(clippy::unused_self)]
@@ -319,8 +406,11 @@ impl Ctx {
         if trace_fires() {
             let now = std::time::Instant::now();
             let gap = {
-                static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
-                let mut last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                static LAST: std::sync::Mutex<Option<std::time::Instant>> =
+                    std::sync::Mutex::new(None);
+                let mut last = LAST
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let gap = last.map_or(0, |at| now.duration_since(at).as_micros());
                 *last = Some(now);
                 gap
@@ -448,6 +538,4 @@ mod tests {
             "the pad is the fire's, and the stream outlives the fire"
         );
     }
-
 }
-

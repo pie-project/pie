@@ -17,13 +17,16 @@ path = "src/lib.rs"
 [dependencies]
 model-ir = { path = "../model-ir" }
 
-eta-ir = { path = "../eta-ir", features = ["serde"] }
+eta-ir = { package = "pie-eta-ir", path = "../eta-ir", features = ["serde"] }
 
 eta-compiler = { path = "../eta-compiler" }
 
 serde = { version = "1.0", features = ["derive"] }
 
 thiserror = "2.0"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 serde_json = "1.0"

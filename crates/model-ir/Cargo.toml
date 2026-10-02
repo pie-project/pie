@@ -12,7 +12,7 @@ name = "model_ir"
 path = "src/lib.rs"
 
 [dependencies]
-dtype = { path = "../dtype" }
+dtype = { package = "pie-dtype", path = "../dtype" }
 serde = { version = "1.0", features = ["derive"] }
 
 [lints]

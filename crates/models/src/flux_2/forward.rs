@@ -72,7 +72,11 @@ impl Model {
                 ports: vec![],
                 positions: None,
                 readout: ReadoutKind::Hidden,
-                readout_width: d.dim,
+                readout_width: if te_tap().is_some() {
+                    super::model::TE_HIDDEN
+                } else {
+                    d.dim
+                },
             });
         }
         let image_side = [Stream::Image, Stream::Reference];
@@ -298,11 +302,23 @@ impl ForwardHybrid for Model {
     }
 }
 
+/// `PIE_FLUX2_TE_TAP=<n>`: export the encoder's residual stream after block
+/// `n` (0 = the embedding) on the hidden seam instead of the projected taps.
+#[must_use]
+pub fn te_tap() -> Option<u32> {
+    std::env::var("PIE_FLUX2_TE_TAP").ok()?.parse().ok()
+}
+
 fn text_encode(arm: &Input<Facts>, te: &TextEncoder) {
     let plan = ops::attn::plan_prefill(arm, te.q_heads, te.kv_heads, te.head_dim, None);
     let ids = arm.tokens();
     let positions = arm.positions();
     let mut y = ops::layout::embed(&ids, &te.embed, te.vocab);
+    let tap_at = te_tap();
+    if tap_at == Some(0) {
+        seam::at(seam::HIDDEN, &[&y]);
+        return;
+    }
     let mut ctx: Option<Value> = None;
     debug_assert_eq!(te.layers.len(), TE_LAYERS as usize);
     for (l, w) in arm.walk_layers(&te.layers) {
@@ -340,6 +356,10 @@ fn text_encode(arm: &Input<Facts>, te: &TextEncoder) {
         );
         y = ops::elemwise::residual_add(&f, &y);
 
+        if tap_at == Some(l + 1) {
+            seam::at(seam::HIDDEN, &[&y]);
+            return;
+        }
         if let Some(tap) = TE_TAPS.iter().position(|&k| k == l + 1) {
             let part = ops::linear::matmul(&y, &te.context_embed[tap]);
             let sum = match ctx.take() {

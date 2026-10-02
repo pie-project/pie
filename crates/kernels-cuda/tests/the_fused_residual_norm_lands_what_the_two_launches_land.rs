@@ -29,7 +29,8 @@ fn check(window: Option<(u32, u32, u32)>) {
     let tensor = |at: u64| Tensor::new(at, planes as u32, hidden as u32, Dtype::Bf16);
 
     norm::residual_add(&ctx, x, &mut tensor(y_ref)).expect("the add fires");
-    norm::rmsnorm_plus_one(&ctx, tensor(y_ref), w, 1e-6, &mut tensor(out_ref)).expect("the norm fires");
+    norm::rmsnorm_plus_one(&ctx, tensor(y_ref), w, 1e-6, &mut tensor(out_ref))
+        .expect("the norm fires");
 
     if window.is_some() {
         let win_at = gpu.up(&[live, base, 0u32, 0u32]);
@@ -50,8 +51,16 @@ fn check(window: Option<(u32, u32, u32)>) {
         let span = r * hidden..(r + 1) * hidden;
         let touched = r >= base as usize && r < (base + live) as usize;
         if touched {
-            assert_eq!(got_y[span.clone()], want_y[span.clone()], "row {r}: the stream differs");
-            for (i, (&got, &want)) in got_out[span.clone()].iter().zip(&want_out[span.clone()]).enumerate() {
+            assert_eq!(
+                got_y[span.clone()],
+                want_y[span.clone()],
+                "row {r}: the stream differs"
+            );
+            for (i, (&got, &want)) in got_out[span.clone()]
+                .iter()
+                .zip(&want_out[span.clone()])
+                .enumerate()
+            {
                 let (g, w) = (from_bf16(got), from_bf16(want));
                 assert!(
                     (g - w).abs() <= w.abs() * (1.0 / 128.0) + 1e-6,
@@ -59,8 +68,15 @@ fn check(window: Option<(u32, u32, u32)>) {
                 );
             }
         } else {
-            assert_eq!(got_y[span.clone()], y_raw[span.clone()], "row {r}: a padded row moved");
-            assert!(got_out[span].iter().all(|&v| v == 0), "row {r}: a padded row was normed");
+            assert_eq!(
+                got_y[span.clone()],
+                y_raw[span.clone()],
+                "row {r}: a padded row moved"
+            );
+            assert!(
+                got_out[span].iter().all(|&v| v == 0),
+                "row {r}: a padded row was normed"
+            );
         }
     }
 }

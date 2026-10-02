@@ -1,4 +1,4 @@
-use engine::fire::{Boundary, Masking, PortFeed, RsReset, RsVerb, SelfCondInput};
+use engine::fire::{AttnClasses, Boundary, Masking, PortFeed, RsReset, RsVerb, SelfCondInput};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Lane<'a> {
@@ -16,6 +16,8 @@ pub struct Seated<'a> {
     pub held: Option<u32>,
     pub kv_less: bool,
     pub translation: &'a [u32],
+    pub window: &'a [u32],
+    pub window_copies: &'a [(u32, u32)],
     pub mask: Option<&'a Masking>,
     pub adapter: Option<u32>,
     pub drafts: bool,
@@ -24,11 +26,13 @@ pub struct Seated<'a> {
     pub self_cond: Option<&'a SelfCondInput>,
     pub rs: RsVerb,
     pub rs_reset: RsReset,
+    pub rs_slot: Option<u32>,
     pub readout: Option<&'a [u32]>,
     pub stream: u8,
     pub group: Option<u32>,
     pub peer: Option<u32>,
     pub ports: &'a [PortFeed],
+    pub attn_classes: Option<&'a AttnClasses>,
 }
 
 impl<'a> Seated<'a> {
@@ -40,6 +44,8 @@ impl<'a> Seated<'a> {
             held: None,
             kv_less: false,
             translation: &[],
+            window: &[],
+            window_copies: &[],
             mask: None,
             adapter: None,
             drafts: false,
@@ -48,11 +54,13 @@ impl<'a> Seated<'a> {
             self_cond: None,
             rs: RsVerb::Fold,
             rs_reset: RsReset::Inferred,
+            rs_slot: None,
             readout: None,
             stream: 0,
             group: None,
             peer: None,
             ports: &[],
+            attn_classes: None,
         }
     }
 

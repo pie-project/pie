@@ -4,6 +4,7 @@ use controller_api::{Health, RoutingTable};
 pub struct AdmissionConfig {
     pub kv_saturate_bucket: u8,
     pub max_inflight_per_worker: u32,
+    pub max_queued_launches: usize,
 }
 
 impl Default for AdmissionConfig {
@@ -11,6 +12,7 @@ impl Default for AdmissionConfig {
         Self {
             kv_saturate_bucket: 240,
             max_inflight_per_worker: 256,
+            max_queued_launches: 4096,
         }
     }
 }
@@ -24,6 +26,8 @@ pub enum AdmissionDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
     ClusterSaturated,
+    NoHealthyWorker,
+    QueueFull,
 }
 
 impl std::fmt::Display for RejectReason {
@@ -32,17 +36,27 @@ impl std::fmt::Display for RejectReason {
             RejectReason::ClusterSaturated => {
                 f.write_str("cluster saturated: no healthy worker has KV/seq headroom")
             }
+            RejectReason::NoHealthyWorker => f.write_str("no healthy worker"),
+            RejectReason::QueueFull => {
+                f.write_str("admission queue full: too many launches waiting for KV/seq headroom")
+            }
         }
     }
 }
 
 pub fn admit(table: &RoutingTable, cfg: &AdmissionConfig) -> AdmissionDecision {
-    let has_headroom = table.workers.iter().any(|w| {
-        w.health == Health::Healthy
-            && w.coarse_load.kv_pressure_bucket < cfg.kv_saturate_bucket
+    let mut healthy = table
+        .workers
+        .iter()
+        .filter(|w| w.health == Health::Healthy)
+        .peekable();
+    if healthy.peek().is_none() {
+        return AdmissionDecision::Reject(RejectReason::NoHealthyWorker);
+    }
+    if healthy.any(|w| {
+        w.coarse_load.kv_pressure_bucket < cfg.kv_saturate_bucket
             && w.coarse_load.inflight < cfg.max_inflight_per_worker
-    });
-    if has_headroom {
+    }) {
         AdmissionDecision::Admit
     } else {
         AdmissionDecision::Reject(RejectReason::ClusterSaturated)

@@ -1,5 +1,5 @@
 use controller_api::WorkerStatus;
-use ids::{ReqId, WorkerId};
+use ids::{ReqId, SessionId, WorkerId};
 
 mod data;
 mod link;
@@ -28,6 +28,12 @@ pub trait WorkerControl {
     async fn cancel(req_id: ReqId);
 
     async fn set_priority(req_id: ReqId, p: Priority);
+
+    // The session's client is gone: tear it down so its processes are
+    // terminated and their KV seats returned, rather than running on
+    // unread. Sent to every connected worker; one that never held the
+    // session ignores it.
+    async fn end_session(session: SessionId);
 
     async fn drain();
 }

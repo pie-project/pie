@@ -1,4 +1,4 @@
-
+//#include "common/bf16.inc.wgsl"
 
 @group(0) @binding(0) var<storage, read> gates: array<u32>;
 @group(0) @binding(1) var<storage, read> normed: array<u32>;
@@ -37,3 +37,4 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     y[(n * H + h) >> 1u] = pie_pack_bf16(lo * inv, hi * inv);
 }
 
+// pie:instantiate hc_mix_bf16

@@ -93,7 +93,9 @@ impl FrameShell for Shell {
                 match self.programs.geometry_of(attached.instance) {
                     None | Some(eta_ir::registry::GeometryClass::Host) => true,
                     Some(eta_ir::registry::GeometryClass::DecodeEnvelope) => {
-                        self.programs.token_device_source(attached.instance).is_some()
+                        self.programs
+                            .token_device_source(attached.instance)
+                            .is_some()
                             && lanes
                                 .get(attached.lane as usize)
                                 .is_some_and(|seated| seated.lane.tokens.len() == 1)
@@ -165,6 +167,7 @@ impl FrameShell for Shell {
         }
 
         let mut device_pages: Vec<Option<Vec<u32>>> = vec![None; lanes.len()];
+        let mut device_window: Vec<Option<Vec<u32>>> = vec![None; lanes.len()];
         let mut device_writes: Vec<Option<(Vec<u32>, Vec<u32>)>> = vec![None; lanes.len()];
         let mut device_masks: Vec<Option<Masking>> = vec![None; lanes.len()];
         let mut lane_rows: Vec<u32> = lanes
@@ -191,8 +194,8 @@ impl FrameShell for Shell {
                     )
                 })
             };
-            device_pages[source] = ports
-                .pages()?
+            let relative = ports.pages()?;
+            device_pages[source] = relative
                 .map(|relative| {
                     relative
                         .iter()
@@ -200,6 +203,15 @@ impl FrameShell for Shell {
                         .collect::<Result<Vec<u32>>>()
                 })
                 .transpose()?;
+            let window = lanes[source].window;
+            if !window.is_empty() {
+                device_window[source] = relative.map(|relative| {
+                    relative
+                        .iter()
+                        .map(|&page| window.get(page as usize).copied().unwrap_or(0))
+                        .collect()
+                });
+            }
             if ports.owns_pages() {
                 lane_rows[source] = ports.rows();
             }
@@ -407,6 +419,42 @@ impl FrameShell for Shell {
                 }
             }
         }
+        // Logits are gathered into the readouts-carved plane; a velocity or
+        // hidden seam is read off a tokens-shaped plane and is bounded by the
+        // fire's own rows.
+        let readouts_ceiling = composition
+            .lanes()
+            .iter()
+            .filter(|row| readout_count[row.source as usize] > 0)
+            .map(|row| match self.exports.readout_for(row.class as usize) {
+                Some(seam) if seam.seam != engine::fire::ReadoutSeam::Logits => {
+                    u64::from(self.budget.max_tokens)
+                }
+                Some(seam) => self
+                    .compiled
+                    .arena
+                    .readout_ceiling_of(seam.value)
+                    .unwrap_or_else(|| model_compiler::arena::readouts_ceiling(&self.budget)),
+                None => model_compiler::arena::readouts_ceiling(&self.budget),
+            })
+            .min()
+            .unwrap_or_else(|| model_compiler::arena::readouts_ceiling(&self.budget));
+        let readout_extent = readout_extent(
+            composition.rows(),
+            if self.pad {
+                composition.bucket()
+            } else {
+                composition.rows()
+            },
+            readout_rows.len(),
+        );
+        if readout_extent > readouts_ceiling {
+            return Err(Fault::Ceiling {
+                what: "rows one fire reads out through its readout plane",
+                need: readout_extent,
+                have: readouts_ceiling,
+            });
+        }
         let descriptor = FireDescriptor::of(&composition);
 
         let lane_facts: Vec<model_exec::fire::LaneFacts> = lanes
@@ -416,18 +464,24 @@ impl FrameShell for Shell {
                 group: seated.group,
             })
             .collect();
+        let lane_classes: Vec<Option<&[i32]>> = lanes
+            .iter()
+            .map(|seated| seated.attn_classes.map(|stated| stated.classes.as_slice()))
+            .collect();
+        let class_table = self.class_table_of(composition.lanes(), lanes)?;
         let (group_of_lane, packings) = if self.feeds.selections.is_empty() {
             (Vec::new(), Vec::new())
         } else {
             let groups = model_exec::fire::group_of_lane(composition.lanes(), &lane_facts);
             let mut packings = Vec::with_capacity(self.feeds.selections.len());
             for &select in &self.feeds.selections {
-                let packed = model_exec::fire::pack(
+                let packed = model_exec::fire::pack_with_classes(
                     select,
                     composition.lanes(),
                     &lane_facts,
                     &groups,
                     composition.rows(),
+                    &lane_classes,
                 )
                 .map_err(model_exec::Error::Fire)?;
                 packings.push(packed);
@@ -692,6 +746,7 @@ impl FrameShell for Shell {
 
         let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
+        let mut window_ids: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
         let mut kv_less_seats: Vec<bool> = Vec::with_capacity(lanes.len());
         let mut masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(lanes.len());
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -700,6 +755,7 @@ impl FrameShell for Shell {
         let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
         let mut slot_ids: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut fresh: Vec<u32> = Vec::new();
+        let mut rs_pages_named = 0u32;
         let mut rs_moves: Vec<RsMove<'a>> = Vec::with_capacity(lanes.len());
         let mut rs_lens: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut rs_order: Vec<u32> = vec![0; lanes.len()];
@@ -768,7 +824,7 @@ impl FrameShell for Shell {
                 RsReset::Held => false,
             };
             if begins {
-                fresh.push(lane.slot);
+                fresh.push(seated.rs_slot.unwrap_or(lane.slot));
             }
             seats.push(Seat {
                 slot: lane.slot,
@@ -779,6 +835,11 @@ impl FrameShell for Shell {
             tables.push(match &device_pages[source] {
                 Some(pages) => std::borrow::Cow::Owned(pages.clone()),
                 None => std::borrow::Cow::Borrowed(seated.pages),
+            });
+            window_ids.push(match (&device_pages[source], &device_window[source]) {
+                (_, Some(ids)) => std::borrow::Cow::Owned(ids.clone()),
+                (Some(_), None) => std::borrow::Cow::Borrowed(&[][..]),
+                (None, None) => std::borrow::Cow::Borrowed(seated.window),
             });
             let masking = device_masks[source].as_ref().or(seated.mask);
             let runs_masked_arm = self.masked.contains(row.class as usize);
@@ -798,10 +859,14 @@ impl FrameShell for Shell {
                 rows: row.rows,
                 bidirectional: seated.bidirectional,
             });
-            slot_ids.push(lane.slot as i32);
+            slot_ids.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
             let fire_lane = rs_moves.len();
             rs_order[row.source as usize] = fire_lane as u32;
             let port = envelope_of[source].and_then(|(held, _)| resolved[held].fold_len.as_deref());
+            if let RsVerb::Buffer { pages, .. } | RsVerb::FoldBuffered { pages, .. } = &seated.rs {
+                rs_pages_named =
+                    rs_pages_named.max(pages.iter().copied().max().map_or(0, |page| page + 1));
+            }
             let (verb, folded) = match &seated.rs {
                 RsVerb::Fold => (RsMove::None, row.rows),
                 RsVerb::Buffer {
@@ -880,6 +945,11 @@ impl FrameShell for Shell {
                         row.source
                     ),
                 });
+            }
+            if verb != RsMove::None
+                && let Some(buffers) = self.buffers.as_mut()
+            {
+                buffers.ensure(&mut self.pools, rs_pages_named)?;
             }
             rs_moves.push(verb);
             rs_lens.push(narrow(u64::from(folded)));
@@ -1105,9 +1175,9 @@ impl FrameShell for Shell {
                     .max()
                     .map_or(0, |pages| u32::try_from(pages).unwrap_or(u32::MAX))
             },
-            state_slots: seats
+            state_slots: slot_ids
                 .iter()
-                .map(|seat| seat.slot.saturating_add(1))
+                .map(|&row| (row as u32).saturating_add(1))
                 .max()
                 .unwrap_or(0),
             workspace: 0,
@@ -1130,15 +1200,70 @@ impl FrameShell for Shell {
         let indptr_host = kv::indptr(&seats)?;
         let paging = self.pools.paging();
         let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
+        let window_tables = if self.pools.has_windowed() {
+            seats
+                .iter()
+                .zip(&tables)
+                .zip(&window_ids)
+                .zip(&kv_less_seats)
+                .map(|(((seat, table), ids), &kv_less)| {
+                    if kv_less {
+                        Ok(table.to_vec())
+                    } else {
+                        kv::window_table(&paging, seat, table, ids)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let window_refs: Vec<&[u32]> = window_tables.iter().map(Vec::as_slice).collect();
         let mut geometries = (0..self.spaces)
-            .map(|_| kv::geometry_with(&paging, &seats, &table_refs))
+            .map(|space| {
+                if self.pools.windowed_space(space as u32) {
+                    kv::geometry_with(&paging, &seats, &window_refs)
+                } else {
+                    kv::geometry_with(&paging, &seats, &table_refs)
+                }
+            })
             .collect::<Result<Vec<_>>>()?;
         super::btrace::mark("page_arith");
         if writes.iter().any(Option::is_some) {
-            for geometry in &mut geometries {
+            let lane_of = |row: usize| {
+                composition
+                    .lanes()
+                    .iter()
+                    .position(|lane| {
+                        (lane.row_offset as usize..(lane.row_offset + lane.rows) as usize)
+                            .contains(&row)
+                    })
+                    .unwrap_or(0)
+            };
+            for (space, geometry) in geometries.iter_mut().enumerate() {
+                let windowed = self.pools.windowed_space(space as u32);
                 for (row, stated) in writes.iter().enumerate() {
                     let Some((page, offset)) = *stated else {
                         continue;
+                    };
+                    let page = if windowed {
+                        let lane = lane_of(row);
+                        let at = tables[lane]
+                            .iter()
+                            .position(|&held| i64::from(held) == i64::from(page));
+                        match at.and_then(|at| window_tables[lane].get(at)) {
+                            Some(&id) if id != 0 => id as i32,
+                            _ => {
+                                return Err(Fault::program(
+                                    "serve::prepare",
+                                    format!(
+                                        "row {row} writes page {page}, which lane {lane}'s \
+                                         windowed table holds no live page for"
+                                    ),
+                                ));
+                            }
+                        }
+                    } else {
+                        page
                     };
                     let (Some(write_page), Some(write_offset)) = (
                         geometry.write_page.get_mut(row),
@@ -1169,7 +1294,23 @@ impl FrameShell for Shell {
             .iter()
             .position(|&rows| rows == composition.bucket())
             .unwrap_or(0) as u32;
-        let copies_here = copies && masks.iter().all(|lane| lane.mask.is_none());
+        let lane_ceiling = self.lane_ceiling();
+        let token_axis = composition.axis(model_ir::RowAxis::Tokens);
+        let patches = composition.axis(model_ir::RowAxis::Patches);
+        let key = record::BodyKey::of_axes(
+            &token_axis.classes,
+            token_axis.bucket,
+            &self.decoding,
+            lane_ceiling,
+            &self.tiers,
+            self.towered.then_some((&patches.classes, patches.bucket)),
+        );
+        let copies_here = copies
+            && key
+                .classes
+                .rungs()
+                .iter()
+                .all(|(class, _)| !self.masked.contains(*class as usize));
         let class_tables = [
             composition.table(model_ir::RowAxis::Tokens),
             composition.table(model_ir::RowAxis::Patches),
@@ -1233,26 +1374,18 @@ impl FrameShell for Shell {
         let staged = crate::mask::stage(&masks)?;
         super::btrace::mark("mask");
 
-        let lane_ceiling = self.lane_ceiling();
-        let token_axis = composition.axis(model_ir::RowAxis::Tokens);
-        let patches = composition.axis(model_ir::RowAxis::Patches);
-        let key = record::BodyKey::of_axes(
-            &token_axis.classes,
-            token_axis.bucket,
-            &self.decoding,
-            lane_ceiling,
-            self.towered.then_some((&patches.classes, patches.bucket)),
-        );
+        let totals = model_ir::PerAxis::from_fn(|axis| composition.axis(axis).rows);
+        // The widened table, as `segmentation` holds it: what a body was
+        // recorded under is what it replays under.
+        let key = key.with_islands(&record::widen(
+            &self.compiled,
+            &windows.admits_axes(totals, &self.shifted, &self.lane_shifted),
+        ));
         let ladder = key.classes.clone();
         let patch_ladder = key.patch.as_ref().map(|axis| axis.classes.clone());
         let records_bodies = self.records_bodies();
         let (admits, world): (std::sync::Arc<[crate::window::Admit]>, bool) = if records_bodies {
-            self.segmentation(
-                &key,
-                &windows,
-                model_ir::PerAxis::from_fn(|axis| composition.axis(axis).rows),
-                copies_here,
-            )
+            self.segmentation(&key, &windows, totals, copies_here)
         } else {
             (Vec::new().into(), true)
         };
@@ -1306,14 +1439,14 @@ impl FrameShell for Shell {
         let mut qo_absolute: Vec<i32> = Vec::new();
         let mut lane_carve = composition.lane_count();
         if bodied {
-            let ceiling = ladder.lane_reach(lane_ceiling).min(self.budget.max_lanes) as usize;
-            lane_carve = lane_carve.max(ceiling as u32);
+            let capacity = crate::window::lane_capacity(self.budget.max_lanes);
+            lane_carve = lane_carve.max(capacity);
             for geometry in &mut geometries {
-                geometry.pad_to(ceiling);
+                geometry.pad_to(capacity as usize);
             }
             qo_absolute = windows.qo_absolute_host().to_vec();
-            kv::pad_indptr(&mut qo_absolute, ceiling);
-            windows.stage_qo_absolute(ceiling as u32);
+            kv::pad_indptr(&mut qo_absolute, capacity as usize);
+            windows.stage_qo_absolute(capacity);
         }
         let geometries = geometries;
 
@@ -1326,6 +1459,7 @@ impl FrameShell for Shell {
                 lane_indptr: &packed.lane_indptr,
                 reference_start: &packed.reference_start,
                 reference_tag: &packed.reference_tag,
+                attn_class: &packed.attn_class,
                 permutation: &packed.permutation,
             })
             .collect();
@@ -1347,6 +1481,9 @@ impl FrameShell for Shell {
                 lane_of_row: &lane_of_row,
                 group_of_lane: &group_of_lane,
                 packings: &packing_fires,
+                class_table: class_table
+                    .as_ref()
+                    .map(|stated| (stated.table.as_slice(), stated.count)),
             },
         )?;
 
@@ -1376,6 +1513,7 @@ impl FrameShell for Shell {
             token_injects,
             bodied,
             admits,
+            islands: key.islands.clone(),
             ladder,
             lane_ceiling,
             patch_ladder,
@@ -1522,9 +1660,17 @@ fn narrow(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
 }
 
+/// The rows a fire's kernels write through its readout plane: a readout as
+/// tall as the fire is launched at the fire's bucket, so the plane must
+/// hold the bucket, not only the rows read out.
+fn readout_extent(rows: u32, bucket: u32, readouts: usize) -> u64 {
+    let pad = kernels_cuda::Pad { rows, bucket };
+    u64::from(pad.extent(u32::try_from(readouts).unwrap_or(u32::MAX)))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FoldLen, resolve_fold_len};
+    use super::{FoldLen, readout_extent, resolve_fold_len};
 
     const PORT: eta_ir::registry::Port = eta_ir::registry::Port::RsFoldLen;
 
@@ -1532,6 +1678,13 @@ mod tests {
     fn prepare_every_case() {
         a_device_fold_length_is_clamped_to_the_bound_it_was_promised();
         a_fold_length_that_resolves_to_zero_is_refused_by_name();
+        a_readout_as_tall_as_the_fire_holds_the_bucket();
+    }
+
+    fn a_readout_as_tall_as_the_fire_holds_the_bucket() {
+        assert_eq!(readout_extent(133, 256, 133), 256);
+        assert_eq!(readout_extent(133, 256, 5), 5);
+        assert_eq!(readout_extent(133, 133, 133), 133);
     }
 
     fn a_device_fold_length_is_clamped_to_the_bound_it_was_promised() {
@@ -1558,5 +1711,88 @@ mod tests {
         }
         let error = resolve_fold_len(FoldLen::Host(4), 0, 0, None).unwrap_err();
         assert!(error.to_string().contains("bonus token"), "{error}");
+    }
+}
+
+impl Shell {
+    /// The attention class table this fire stages: the one every stating
+    /// lane agrees on, checked against each lane's rows, or none.
+    fn class_table_of<'a>(
+        &self,
+        rows: &[model_exec::fire::LaneRow],
+        lanes: &[super::lanes::Seated<'a>],
+    ) -> Result<Option<&'a engine::fire::AttnClasses>> {
+        let mut table: Option<&'a engine::fire::AttnClasses> = None;
+        for (source, seated) in lanes.iter().enumerate() {
+            let Some(stated) = seated.attn_classes else {
+                continue;
+            };
+            if self.feeds.selections.is_empty() {
+                return Err(Fault::program(
+                    "serve::classes",
+                    "a lane states attention classes and this model packs no attention \
+                     group; the mask applies to group-packed `attention.ragged` only",
+                ));
+            }
+            let owned = rows
+                .iter()
+                .find(|r| r.source as usize == source)
+                .map_or(0, |r| r.rows);
+            if stated.classes.len() as u32 != owned {
+                return Err(Fault::program(
+                    "serve::classes",
+                    format!(
+                        "a lane states {} attention classes and carries {owned} rows; one \
+                         class per row",
+                        stated.classes.len()
+                    ),
+                ));
+            }
+            if stated.count == 0 || stated.count > engine::fire::ATTN_CLASSES_MAX {
+                return Err(Fault::program(
+                    "serve::classes",
+                    format!(
+                        "a lane states {} attention classes; the table holds 1..={}",
+                        stated.count,
+                        engine::fire::ATTN_CLASSES_MAX
+                    ),
+                ));
+            }
+            if stated.table.len() as u64 != u64::from(stated.count) * u64::from(stated.count) {
+                return Err(Fault::program(
+                    "serve::classes",
+                    format!(
+                        "a lane's class table is {} bytes for {} classes; it is count x count",
+                        stated.table.len(),
+                        stated.count
+                    ),
+                ));
+            }
+            if let Some(bad) = stated
+                .classes
+                .iter()
+                .find(|c| **c >= 0 && **c as u32 >= stated.count)
+            {
+                return Err(Fault::program(
+                    "serve::classes",
+                    format!(
+                        "a lane's row names attention class {bad} and the table holds {}",
+                        stated.count
+                    ),
+                ));
+            }
+            match table {
+                None => table = Some(stated),
+                Some(have) if have.count == stated.count && have.table == stated.table => {}
+                Some(_) => {
+                    return Err(Fault::program(
+                        "serve::classes",
+                        "two lanes of one fire state different attention class tables; \
+                         a fire reads one",
+                    ));
+                }
+            }
+        }
+        Ok(table)
     }
 }

@@ -1,8 +1,9 @@
-
+//#include "common/bf16.inc.wgsl"
 
 @group(0) @binding(0) var<storage, read_write> x: array<u32>;
 @group(0) @binding(1) var<storage, read> position: array<i32>;
 
+//#if defined(PIE_LAST)
 struct Params {
     base: f32,
     head_dim: i32,
@@ -14,7 +15,7 @@ struct Params {
     pair_half: i32,
     heads: i32,
 }
-
+//#else
 struct Params {
     scale: f32,
     base: f32,
@@ -22,7 +23,7 @@ struct Params {
     pair_half: i32,
     heads: i32,
 }
-
+//#endif
 @group(0) @binding(2) var<uniform> params: Params;
 
 fn rotate_word(i1: u32, i2: u32, theta0: f32, theta1: f32) {
@@ -40,6 +41,7 @@ fn rotate_word(i1: u32, i2: u32, theta0: f32, theta1: f32) {
     x[i2 >> 1u] = pie_pack_bf16(x1_0 * s0 + x2_0 * c0, x1_1 * s1 + x2_1 * c1);
 }
 
+//#if defined(PIE_LAST)
 
 fn tail_inv_freq(i: u32, rotary: u32) -> f32 {
     let d = 2.0 * f32(i) / f32(max(rotary, 1u));
@@ -52,7 +54,7 @@ fn tail_inv_freq(i: u32, rotary: u32) -> f32 {
     }
     return inv_freq;
 }
-
+//#endif
 
 @compute @workgroup_size(PIE_GROUP_X)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -65,7 +67,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let row = gid.z;
     let head_dim = u32(max(params.head_dim, 1));
     let row_base = row * u32(max(params.heads, 0)) * head_dim;
-
+//#if defined(PIE_LAST)
     let rotary = 2u * pair_half;
     let head_base = row_base + h * head_dim + (head_dim - rotary);
     let pos = params.sign * f32(position[row]);
@@ -89,20 +91,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let i1 = head_base + i;
         rotate_word(i1, i1 + pair_half, theta0, theta1);
     }
-
+//#else
+//#if defined(PIE_PROP)
     let d0 = 2.0 * f32(i) / f32(head_dim);
     let d1 = 2.0 * f32(i + 1u) / f32(head_dim);
     let i2_off = head_dim / 2u;
-
+//#else
     let d0 = f32(i) / f32(pair_half);
     let d1 = f32(i + 1u) / f32(pair_half);
     let i2_off = pair_half;
-
+//#endif
     let pos = params.scale * f32(position[row]);
     let theta0 = pos * exp2(-d0 * params.base);
     let theta1 = pos * exp2(-d1 * params.base);
     let i1 = row_base + h * head_dim + i;
     rotate_word(i1, i1 + i2_off, theta0, theta1);
-
+//#endif
 }
 
+// pie:instantiate neox_mb_bf16 PIE_GROUP_X=64
+// pie:instantiate neox_prop_mb_bf16 PIE_GROUP_X=64 PIE_PROP=1
+// pie:instantiate neox_last_mb_bf16 PIE_GROUP_X=64 PIE_LAST=1

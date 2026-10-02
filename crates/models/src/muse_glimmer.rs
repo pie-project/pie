@@ -40,6 +40,16 @@ pub fn skus() -> Vec<crate::Sku> {
             |tp: u32| Model::b30(Dtype::U4g64, Dtype::Bf16, tp),
         ),
         (
+            "muse-glimmer-30b",
+            2,
+            [Dtype::U4g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::muse_glimmer,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::b30(Dtype::U4g64, Dtype::Bf16, tp),
+        ),
+        (
             "muse-glimmer-30b-mini-l8",
             1,
             [Dtype::Bf16],

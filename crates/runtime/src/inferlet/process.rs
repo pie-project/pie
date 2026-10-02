@@ -8,14 +8,15 @@ pub(crate) use ctx::OutputMode;
 pub use ctx::ProcessCtx;
 pub(crate) use residency::ProcessResidency;
 
+use crate::rt::Instant;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use crate::rt::JoinHandle;
 use anyhow::{Result, anyhow};
 use tokio::sync::{Semaphore, oneshot};
-use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 type SharedResultTx = Arc<Mutex<Option<oneshot::Sender<Result<String, String>>>>>;
@@ -417,14 +418,27 @@ pub fn detach(process_id: ProcessId) {
     let _ = SERVICES.send(&resolve(process_id), Message::DetachClient);
 }
 
+/// Ends a process on its owner's behalf, never re-running it. A send that
+/// misses because a restart retired the resolved id follows the new alias.
 pub fn terminate(process_id: ProcessId, result: Result<String, String>) {
-    let process_id = resolve(process_id);
-    if SERVICES
-        .send(&process_id, Message::Terminate { result })
-        .is_ok()
-    {
+    let mut target = resolve(process_id);
+    while !send_terminate(target, result.clone(), false) {
+        let next = resolve(process_id);
+        if next == target {
+            return;
+        }
+        target = next;
+    }
+}
+
+fn send_terminate(process_id: ProcessId, result: Result<String, String>, from_run: bool) -> bool {
+    let sent = SERVICES
+        .send(&process_id, Message::Terminate { result, from_run })
+        .is_ok();
+    if sent {
         crate::scheduler::worker::post_process_terminate(process_id);
     }
+    sent
 }
 
 pub fn stdout(process_id: ProcessId, content: String) {
@@ -474,6 +488,8 @@ enum Message {
     DetachClient,
     Terminate {
         result: Result<String, String>,
+        /// Only the run task's own end may be replaced by a parked restart.
+        from_run: bool,
     },
 
     Stdout {
@@ -535,7 +551,7 @@ impl Process {
             capture_outputs,
             result_tx.clone(),
         );
-        let handle = tokio::spawn(task);
+        let handle = crate::rt::spawn(task);
 
         Process {
             process_id,
@@ -591,6 +607,11 @@ impl Process {
         capture_outputs: bool,
         result_tx: SharedResultTx,
     ) {
+        // Held ahead of every admission permit: a preempted process coming
+        // back must not queue behind permits the held-back processes own.
+        if let Some(planner) = crate::planner::planner() {
+            planner.admit(process_id).await;
+        }
         let prewarm_permit = match PREWARM_ADMISSION.get().and_then(|s| s.as_ref()) {
             Some(sem) => Some(
                 Arc::clone(sem)
@@ -631,6 +652,13 @@ impl Process {
                 .get_typed_func::<(&str,), (Result<String, String>,)>(&mut store, &run_func_export)
                 .map_err(|e| format!("Failed to get 'run' function: {e:?}"))?;
 
+            // A script's component is its language component; the script
+            // itself rides in the launch input.
+            let input = match store.data().script() {
+                Some(script) => script.envelope(&input),
+                None => input,
+            };
+
             let wasm_run_start = Instant::now();
             let call = run_func.call_async(&mut store, (&input,));
             let called = call.await;
@@ -665,7 +693,9 @@ impl Process {
         }
         if crate::planner::trace_enabled() {
             println!(
-                "[process t_us={} pid={}] guest finished ok={} restart_requested={}",
+                "[process t_us={} pid={}] guest finished ok={} restart_requested={} \
+                 admission_wait_us={admission_wait_us} instantiate_us={instantiate_us} \
+                 wasm_run_us={wasm_run_us}",
                 crate::scheduler::fire_timing_now_us(),
                 process_id,
                 result.is_ok(),
@@ -679,7 +709,7 @@ impl Process {
             let _ = tx.send(result.clone());
         }
 
-        terminate(process_id, result);
+        send_terminate(process_id, result, true);
     }
 
     fn restart(&mut self) -> bool {
@@ -716,10 +746,16 @@ impl Process {
         }
     }
 
-    fn terminate(&mut self, result: Result<String, String>) {
+    fn terminate(&mut self, result: Result<String, String>, from_run: bool) {
+        // Queued here before a restart handed the client's pid over.
+        let current = resolve(self.client_pid);
+        if current != self.process_id {
+            terminate(self.client_pid, result);
+            return;
+        }
         self.handle.abort();
 
-        let restarted = restart_requested(self.process_id) && self.restart();
+        let restarted = from_run && restart_requested(self.process_id) && self.restart();
         forget_restart_state(self.process_id);
 
         if !restarted {
@@ -776,8 +812,8 @@ impl ServiceHandler for Process {
                 self.client_id = None;
             }
 
-            Message::Terminate { result } => {
-                self.terminate(result);
+            Message::Terminate { result, from_run } => {
+                self.terminate(result, from_run);
             }
 
             Message::Stdout { content } => self.deliver_event(ProcessEvent::Stdout(content)),
@@ -801,5 +837,113 @@ impl ServiceHandler for Process {
                 }));
             }
         }
+    }
+}
+
+/// A stand-in registered under a process id, so a test can see what the
+/// registry delivers to a process without instantiating a guest.
+#[cfg(test)]
+pub(crate) mod probe {
+    use super::*;
+
+    #[derive(Debug)]
+    pub(crate) enum Seen {
+        Terminate(Result<String, String>),
+        Detach,
+        Other,
+    }
+
+    struct Probe {
+        process_id: ProcessId,
+        report: Option<oneshot::Sender<Seen>>,
+    }
+
+    impl ServiceHandler for Probe {
+        type Message = Message;
+
+        async fn handle(&mut self, msg: Message) {
+            let seen = match msg {
+                Message::Terminate { result, .. } => {
+                    SERVICES.remove(&self.process_id);
+                    Seen::Terminate(result)
+                }
+                Message::DetachClient => Seen::Detach,
+                _ => Seen::Other,
+            };
+            if let Some(report) = self.report.take() {
+                let _ = report.send(seen);
+            }
+        }
+    }
+
+    pub(crate) fn spawn(process_id: ProcessId) -> oneshot::Receiver<Seen> {
+        let (report, seen) = oneshot::channel();
+        SERVICES
+            .spawn(process_id, || Probe {
+                process_id,
+                report: Some(report),
+            })
+            .expect("a fresh process id");
+        seen
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn idle(process_id: ProcessId, client_pid: ProcessId, result_tx: SharedResultTx) -> Process {
+        Process {
+            process_id,
+            client_pid,
+            username: "test".to_string(),
+            program: ProgramName {
+                name: "test".to_string(),
+                version: "0.0.0".to_string(),
+            },
+            input: String::new(),
+            start_time: Instant::now(),
+            handle: crate::rt::spawn(std::future::pending::<()>()),
+            client_id: None,
+            capture_outputs: true,
+            output_buffer: VecDeque::new(),
+            result_tx,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_terminate_queued_behind_restarts_reaches_the_latest_process() {
+        let (client_pid, latest) = (ProcessId::new_v4(), ProcessId::new_v4());
+        let seen = probe::spawn(latest);
+        RESTART_ALIAS.write().unwrap().insert(client_pid, latest);
+        let mut superseded = idle(ProcessId::new_v4(), client_pid, Default::default());
+
+        superseded
+            .handle(Message::Terminate {
+                result: Err("closed".to_string()),
+                from_run: false,
+            })
+            .await;
+
+        let seen = tokio::time::timeout(Duration::from_secs(5), seen).await;
+        RESTART_ALIAS.write().unwrap().remove(&client_pid);
+        assert!(matches!(seen, Ok(Ok(probe::Seen::Terminate(Err(_))))));
+        assert!(superseded.output_buffer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_owner_terminate_is_not_replaced_by_a_parked_restart() {
+        let pid = ProcessId::new_v4();
+        let (tx, rx) = oneshot::channel();
+        let process = idle(pid, pid, Arc::new(Mutex::new(Some(tx))));
+        SERVICES.spawn(pid, || process).unwrap();
+        declare_restartable(pid);
+        assert!(request_restart(pid));
+
+        terminate(pid, Err("closed".to_string()));
+
+        let result = tokio::time::timeout(Duration::from_secs(5), rx).await;
+        assert_eq!(result.unwrap().unwrap(), Err("closed".to_string()));
+        assert!(!RESTART_ALIAS.read().unwrap().contains_key(&pid));
     }
 }

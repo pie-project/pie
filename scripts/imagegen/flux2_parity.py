@@ -142,13 +142,12 @@ def run(args) -> None:
             f"`cargo build -p pie --features cuda`, or pass --pie."
         )
     binary = wasm(args.inferlet)
-    manifest = os.path.join(args.inferlet, "Pie.toml")
     for b, case in enumerate(paths):
         out = os.path.join(args.out, f"pie_{b}.json")
         cmd = [pie]
         if args.config:
             cmd += ["--config", args.config]
-        cmd += ["run", "--path", binary, "--manifest", manifest, "--"]
+        cmd += ["run", "--path", binary, "--"]
         if args.case_file:
             cmd += ["--case_file", os.path.basename(case)]
         else:
@@ -218,7 +217,7 @@ def main() -> int:
     ap.add_argument("cmd", choices=["case", "run", "collect", "compare", "all"])
     ap.add_argument("--golden", default=DEFAULT_GOLDEN)
     ap.add_argument("--out", default="/tmp/flux2-parity")
-    ap.add_argument("--inferlet", default=os.path.join(REPO, "tests/inferlets/flux2-parity"))
+    ap.add_argument("--inferlet", default=os.path.join(REPO, "examples/flux2-parity"))
     ap.add_argument("--config", default=None,
                     help=f"the serving config; its `[model] model` must be the artifact "
                          f"`{DEFAULT_SKU}` imported")

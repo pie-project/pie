@@ -114,6 +114,68 @@ pub fn prefill(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn decode_selected(
+    q: &Value,
+    plan: &Value,
+    selection: &Value,
+    pages: ValueId,
+    window: Option<u32>,
+    head_dim: u32,
+    sm_scale: f32,
+    ratio: u32,
+) -> Value {
+    let r = q.rec();
+    let o = r.fresh(q.ty().clone());
+    r.push(
+        Attention::DecodeSelected {
+            q: q.id(),
+            plan: plan.id(),
+            selection: selection.id(),
+            cache: pages,
+            window,
+            head_dim,
+            sm_scale,
+            ratio,
+            o: o.id(),
+        },
+        &[q, plan, selection],
+    );
+    o
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_selected(
+    q: &Value,
+    plan: &Value,
+    selection: &Value,
+    pages: ValueId,
+    window: Option<u32>,
+    head_dim: u32,
+    kv_heads: u32,
+    sm_scale: f32,
+    ratio: u32,
+) -> Value {
+    let r = q.rec();
+    let o = r.fresh(q.ty().clone());
+    r.push(
+        Attention::PrefillSelected {
+            q: q.id(),
+            plan: plan.id(),
+            selection: selection.id(),
+            cache: pages,
+            window,
+            head_dim,
+            kv_heads,
+            sm_scale,
+            ratio,
+            o: o.id(),
+        },
+        &[q, plan, selection],
+    );
+    o
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn decode_rel(
     q: &Value,
     plan: &Value,
@@ -212,6 +274,44 @@ pub fn masked(
         &[q, plan, mask],
     );
     o
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn masked_lse(
+    q: &Value,
+    plan: &Value,
+    mask: &Value,
+    pages: ValueId,
+    window: Option<u32>,
+    head_dim: u32,
+    kv_heads: u32,
+    causal: bool,
+    sm_scale: f32,
+) -> (Value, Value) {
+    let r = q.rec();
+    let o = r.fresh(q.ty().clone());
+    let lse = r.fresh(tensor(
+        q.rows(),
+        q.width() / u64::from(head_dim),
+        Dtype::F32,
+    ));
+    r.push(
+        Attention::MaskedLse {
+            q: q.id(),
+            plan: plan.id(),
+            mask: mask.id(),
+            cache: pages,
+            window,
+            head_dim,
+            kv_heads,
+            causal,
+            sm_scale,
+            o: o.id(),
+            lse: lse.id(),
+        },
+        &[q, plan, mask],
+    );
+    (o, lse)
 }
 
 pub fn decode_lse(
@@ -508,6 +608,7 @@ pub fn selector_walk(
     picks
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn ple_ngram_ids(
     ids: &Value,
     state: ValueId,
@@ -516,6 +617,7 @@ pub fn ple_ngram_ids(
     primes: &[u64],
     offsets: &[u64],
     heads_per_ngram: u32,
+    map: Option<&Weight>,
 ) -> Value {
     let r = ids.rec();
     let ngram_ids = r.fresh(tensor(ids.rows(), primes.len() as u64, Dtype::I32));
@@ -528,6 +630,7 @@ pub fn ple_ngram_ids(
             primes: primes.to_vec(),
             offsets: offsets.to_vec(),
             heads_per_ngram,
+            map: map.map(|w| r.weight(w)),
             ngram_ids: ngram_ids.id(),
         },
         &[ids],
@@ -535,6 +638,7 @@ pub fn ple_ngram_ids(
     ngram_ids
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn ple_ngram_ids_chunked(
     ids: &Value,
     state: ValueId,
@@ -543,6 +647,7 @@ pub fn ple_ngram_ids_chunked(
     primes: &[u64],
     offsets: &[u64],
     heads_per_ngram: u32,
+    map: Option<&Weight>,
 ) -> Value {
     let r = ids.rec();
     let ngram_ids = r.fresh(tensor(ids.rows(), primes.len() as u64, Dtype::I32));
@@ -555,6 +660,7 @@ pub fn ple_ngram_ids_chunked(
             primes: primes.to_vec(),
             offsets: offsets.to_vec(),
             heads_per_ngram,
+            map: map.map(|w| r.weight(w)),
             ngram_ids: ngram_ids.id(),
         },
         &[ids],
@@ -1052,7 +1158,7 @@ pub fn index_rope(
 #[allow(clippy::too_many_arguments)]
 pub fn index_topk(
     q: &Value,
-    weights: &Value,
+    weights: Option<&Value>,
     keys: ValueId,
     heads: u32,
     head_dim: u32,
@@ -1061,10 +1167,12 @@ pub fn index_topk(
 ) -> Value {
     let r = q.rec();
     let selection = r.fresh(tensor(q.rows(), top_k, Dtype::I32));
+    let mut deps = vec![q];
+    deps.extend(weights);
     r.push(
         Attention::IndexTopk {
             q: q.id(),
-            weights: weights.id(),
+            weights: weights.map(Value::id),
             keys,
             heads,
             head_dim,
@@ -1072,9 +1180,33 @@ pub fn index_topk(
             ratio,
             selection: selection.id(),
         },
-        &[q, weights],
+        &deps,
     );
     selection
+}
+
+pub fn index_block_mean(
+    boundary_pos: &Value,
+    boundary_req: &Value,
+    keys: ValueId,
+    head_dim: u32,
+    ratio: u32,
+    dtype: Dtype,
+) -> Value {
+    let r = boundary_pos.rec();
+    let entries = r.fresh(tensor(boundary_pos.rows(), head_dim, dtype));
+    r.push(
+        Attention::IndexBlockMean {
+            boundary_pos: boundary_pos.id(),
+            boundary_req: boundary_req.id(),
+            keys,
+            head_dim,
+            ratio,
+            entries: entries.id(),
+        },
+        &[boundary_pos, boundary_req],
+    );
+    entries
 }
 
 pub fn index_kv_append(k: &Value, keys: ValueId, write_page: &Value, write_offset: &Value) {

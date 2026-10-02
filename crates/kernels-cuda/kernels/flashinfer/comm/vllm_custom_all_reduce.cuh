@@ -138,6 +138,19 @@ static DINLINE FlagType ld_flag_volatile(FlagType* flag_addr) {
   return flag;
 }
 
+// pie: a rank whose partner never arrives (the ranks diverged) traps after
+// ten minutes, so the load or fire fails with a device fault instead of
+// spinning for the life of the process.
+template <bool acquire>
+static DINLINE void wait_flag(FlagType* flag_addr, FlagType val) {
+  unsigned long long start, now;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(start));
+  while ((acquire ? ld_flag_acquire(flag_addr) : ld_flag_volatile(flag_addr)) != val) {
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+    if (now - start > 600ull * 1000000000ull) __trap();
+  }
+}
+
 template <int ngpus, bool is_start, bool need_fence = false>
 DINLINE void multi_gpu_barrier(const RankSignals& sg, Signal* self_sg, int rank) {
   if constexpr (!is_start) __syncthreads();
@@ -150,10 +163,10 @@ DINLINE void multi_gpu_barrier(const RankSignals& sg, Signal* self_sg, int rank)
     auto self_counter_ptr = &self_sg->peer_counter[val % 2][blockIdx.x][threadIdx.x];
     if constexpr (need_fence) {
       st_flag_release(peer_counter_ptr, val);
-      while (ld_flag_acquire(self_counter_ptr) != val);
+      wait_flag<true>(self_counter_ptr, val);
     } else {
       st_flag_volatile(peer_counter_ptr, val);
-      while (ld_flag_volatile(self_counter_ptr) != val);
+      wait_flag<false>(self_counter_ptr, val);
     }
   }
   if constexpr (is_start || need_fence) __syncthreads();

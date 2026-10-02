@@ -1,4 +1,8 @@
-
+//#include "common/bf16.inc.wgsl"
+//#include "attn/sdpa_online.inc.wgsl"
+//#if defined(PIE_SUBGROUP)
+//#include "common/subgroup.inc.wgsl"
+//#endif
 
 const PIE_PAIRS = PIE_HEAD_DIM / (2 * PIE_LANES);
 const PIE_ELEMS = 2 * PIE_PAIRS;
@@ -19,9 +23,14 @@ fn pie_word_at(base: u32, lane: u32, i: u32) -> u32 {
 @group(0) @binding(8) var<storage, read> attention_mask: array<u32>;
 @group(0) @binding(9) var<storage, read> attention_mask_enabled: array<u32>;
 
+//#if defined(PIE_LSE)
 
 @group(0) @binding(11) var<storage, read_write> lse_out: array<f32>;
+//#endif
+//#if defined(PIE_SELECTED)
 
+@group(0) @binding(11) var<storage, read> selection: array<i32>;
+//#endif
 
 struct Params {
     gqa_factor: i32,
@@ -30,15 +39,21 @@ struct Params {
     scale: f32,
     attention_mask_stride: u32,
     window: i32,
-
+//#if defined(PIE_TILED)
     n_rows: i32,
-
+//#endif
+//#if defined(PIE_SELECTED)
+    top_k: i32,
+    ratio: i32,
+//#endif
 }
-
+//#if defined(PIE_LSE)
 @group(0) @binding(12) var<uniform> params: Params;
-
+//#elif defined(PIE_SELECTED)
+@group(0) @binding(12) var<uniform> params: Params;
+//#else
 @group(0) @binding(10) var<uniform> params: Params;
-
+//#endif
 
 var<workgroup> pie_part: array<array<f32, PIE_LANES>, PIE_ROWS>;
 var<workgroup> pie_pos: array<i32, PIE_ROWS>;
@@ -92,6 +107,7 @@ fn main(
     let n_q_heads = groups.x;
     let kv_head = u32(i32(q_head) / params.gqa_factor);
 
+//#if defined(PIE_TILED)
     let row = group.y * PIE_ROWS + slot;
     let live = row < u32(params.n_rows);
     var req = 0;
@@ -100,14 +116,15 @@ fn main(
         req = req_of_token[row];
         q_pos = position_ids[row];
     }
-
+//#else
     let row = group.y;
     let live = true;
     let req = req_of_token[row];
     let q_pos = position_ids[row];
-
+//#endif
     let start = window_start(q_pos);
 
+//#if defined(PIE_SPLIT)
 
     let split = group.z;
     let n_splits = groups.z;
@@ -116,10 +133,10 @@ fn main(
     let per_split = (key_count + i32(n_splits) - 1) / i32(n_splits);
     let lo = start + i32(split) * per_split;
     let hi = min(q_pos, lo + per_split - 1);
-
+//#else
     let lo = start;
     let hi = q_pos;
-
+//#endif
 
     if (lane == 0u) {
         pie_pos[slot] = q_pos;
@@ -130,13 +147,19 @@ fn main(
         for (var s = 0u; s < PIE_ROWS; s++) {
             last = max(last, pie_pos[s]);
         }
-
+//#if defined(PIE_TILED)
         pie_steps = last + 1;
-
+//#elif defined(PIE_SELECTED)
+        // A block count, not a cell count: `top_k` names blocks under the
+        // unified `index_topk` contract, and the open block adds ratio - 1.
+        let nblocks = (last + 1) / params.ratio;
+        let count = min(params.top_k, nblocks) * params.ratio + (params.ratio - 1);
+        pie_steps = (count + PIE_ROWS - 1) / PIE_ROWS;
+//#else
 
         let count = max(min(last, hi) - lo + 1, 0);
         pie_steps = (count + PIE_ROWS - 1) / PIE_ROWS;
-
+//#endif
     }
     let steps = workgroupUniformLoad(&pie_steps);
 
@@ -144,13 +167,13 @@ fn main(
     if (live) {
         q_base = ((row * n_q_heads + q_head) * PIE_HEAD_DIM) >> 1u;
     }
-
+//#if defined(PIE_SPLIT)
     let o_col = (split * n_rows + row) * n_q_heads + q_head;
     let o_base = (o_col * PIE_HEAD_DIM) >> 1u;
-
+//#else
     let o_col = row * n_q_heads + q_head;
     let o_base = q_base;
-
+//#endif
     var qv: array<f32, PIE_ELEMS>;
     var acc: array<f32, PIE_ELEMS>;
     for (var i = 0u; i < PIE_PAIRS; i++) {
@@ -167,12 +190,29 @@ fn main(
     var max_score = PIE_SDPA_NEG_INF;
     var sum_exp = 0.0;
     for (var j = 0; j < steps; j++) {
-
+//#if defined(PIE_TILED)
         let kp = j;
-
+//#elif defined(PIE_SELECTED)
+        let n = i32(slot) + j * PIE_ROWS;
+        let nblocks = (q_pos + 1) / params.ratio;
+        let sel_end = min(params.top_k, nblocks) * params.ratio;
+        var kp = -1;
+        if (n < sel_end) {
+            let c = selection[row * u32(params.top_k) + u32(n / params.ratio)];
+            if (c >= 0 && c < nblocks) {
+                kp = c * params.ratio + (n % params.ratio);
+            }
+        } else {
+            kp = nblocks * params.ratio + (n - sel_end);
+        }
+//#else
         let kp = lo + i32(slot) + j * PIE_ROWS;
-
+//#endif
+//#if defined(PIE_SELECTED)
+        let take = live && kp >= 0 && keeps(row, kp, q_pos, start);
+//#else
         let take = live && kp <= hi && keeps(row, kp, q_pos, start);
+//#endif
         var base = 0u;
         var partial = 0.0;
         if (take) {
@@ -184,10 +224,10 @@ fn main(
                     + qv[2u * i + 1u] * pie_bf16_to_f32(w >> 16u);
             }
         }
-
+//#if defined(PIE_SUBGROUP)
 
         let score = pie_subgroup_sum16(partial);
-
+//#else
         pie_part[slot][lane] = partial;
         workgroupBarrier();
         var score = 0.0;
@@ -196,7 +236,7 @@ fn main(
         }
 
         workgroupBarrier();
-
+//#endif
         if (take) {
             let sc = sdpa_online_scales(score, max_score);
             max_score = max(max_score, score);
@@ -209,19 +249,20 @@ fn main(
         }
     }
 
+//#if defined(PIE_TILED)
     if (live) {
-
+//#if defined(PIE_LSE)
         if (lane == 0u) {
             lse_out[o_col] = sdpa_lse_base2(max_score, sum_exp);
         }
-
+//#endif
         let inv = select(1.0 / sum_exp, 1.0, sum_exp == 0.0);
         for (var i = 0u; i < PIE_PAIRS; i++) {
             out_[pie_word_at(o_base, lane, i)] =
                 pie_pack_bf16(acc[2u * i] * inv, acc[2u * i + 1u] * inv);
         }
     }
-
+//#else
 
     if (lane == 0u) {
         pie_max[slot] = max_score;
@@ -259,10 +300,55 @@ fn main(
         }
         workgroupBarrier();
     }
-
+//#if defined(PIE_LSE)
     if (lane == 0u && slot == 0u) {
         lse_out[o_col] = sdpa_lse_base2(merged_max, merged_sum);
     }
-
+//#endif
+//#endif
 }
 
+// pie:instantiate sdpa_paged_selected_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_LANES=16 PIE_ROWS=16 PIE_SELECTED=1
+// pie:instantiate sdpa_paged_selected_bfloat16_d_128 PIE_HEAD_DIM=128 PIE_LANES=16 PIE_ROWS=16 PIE_SELECTED=1
+// pie:instantiate sdpa_paged_selected_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_LANES=16 PIE_ROWS=16 PIE_SELECTED=1
+// pie:instantiate sdpa_paged_selected_bfloat16_d_512 PIE_HEAD_DIM=512 PIE_LANES=16 PIE_ROWS=16 PIE_SELECTED=1
+// pie:instantiate sdpa_paged_decode_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_LANES=16 PIE_ROWS=16
+// pie:instantiate sdpa_paged_decode_bfloat16_d_128 PIE_HEAD_DIM=128 PIE_LANES=16 PIE_ROWS=16
+// pie:instantiate sdpa_paged_decode_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_LANES=16 PIE_ROWS=16
+// pie:instantiate sdpa_paged_decode_bfloat16_d_512 PIE_HEAD_DIM=512 PIE_LANES=16 PIE_ROWS=16
+// pie:instantiate sdpa_paged_decode_lse_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_LANES=16 PIE_ROWS=16 PIE_LSE=1
+// pie:instantiate sdpa_paged_decode_lse_bfloat16_d_128 PIE_HEAD_DIM=128 PIE_LANES=16 PIE_ROWS=16 PIE_LSE=1
+// pie:instantiate sdpa_paged_decode_lse_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_LANES=16 PIE_ROWS=16 PIE_LSE=1
+// pie:instantiate sdpa_paged_decode_lse_bfloat16_d_512 PIE_HEAD_DIM=512 PIE_LANES=16 PIE_ROWS=16 PIE_LSE=1
+// pie:instantiate sdpa_paged_split_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_LANES=16 PIE_ROWS=16 PIE_LSE=1 PIE_SPLIT=1
+// pie:instantiate sdpa_paged_split_bfloat16_d_128 PIE_HEAD_DIM=128 PIE_LANES=16 PIE_ROWS=16 PIE_LSE=1 PIE_SPLIT=1
+// pie:instantiate sdpa_paged_split_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_LANES=16 PIE_ROWS=16 PIE_LSE=1 PIE_SPLIT=1
+// pie:instantiate sdpa_paged_split_bfloat16_d_512 PIE_HEAD_DIM=512 PIE_LANES=16 PIE_ROWS=16 PIE_LSE=1 PIE_SPLIT=1
+// pie:instantiate sdpa_paged_tiled_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_LANES=16 PIE_ROWS=16 PIE_TILED=1
+// pie:instantiate sdpa_paged_tiled_bfloat16_d_128 PIE_HEAD_DIM=128 PIE_LANES=16 PIE_ROWS=16 PIE_TILED=1
+// pie:instantiate sdpa_paged_tiled_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_LANES=16 PIE_ROWS=16 PIE_TILED=1
+// pie:instantiate sdpa_paged_tiled_bfloat16_d_512 PIE_HEAD_DIM=512 PIE_LANES=16 PIE_ROWS=16 PIE_TILED=1
+// pie:instantiate sdpa_paged_tiled_lse_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_LANES=16 PIE_ROWS=16 PIE_TILED=1 PIE_LSE=1
+// pie:instantiate sdpa_paged_tiled_lse_bfloat16_d_128 PIE_HEAD_DIM=128 PIE_LANES=16 PIE_ROWS=16 PIE_TILED=1 PIE_LSE=1
+// pie:instantiate sdpa_paged_tiled_lse_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_LANES=16 PIE_ROWS=16 PIE_TILED=1 PIE_LSE=1
+// pie:instantiate sdpa_paged_tiled_lse_bfloat16_d_512 PIE_HEAD_DIM=512 PIE_LANES=16 PIE_ROWS=16 PIE_TILED=1 PIE_LSE=1
+// pie:instantiate sdpa_paged_decode_bfloat16_d_64 @subgroup PIE_HEAD_DIM=64 PIE_LANES=16 PIE_ROWS=64
+// pie:instantiate sdpa_paged_decode_bfloat16_d_128 @subgroup PIE_HEAD_DIM=128 PIE_LANES=16 PIE_ROWS=64
+// pie:instantiate sdpa_paged_decode_bfloat16_d_256 @subgroup PIE_HEAD_DIM=256 PIE_LANES=16 PIE_ROWS=64
+// pie:instantiate sdpa_paged_decode_bfloat16_d_512 @subgroup PIE_HEAD_DIM=512 PIE_LANES=16 PIE_ROWS=64
+// pie:instantiate sdpa_paged_decode_lse_bfloat16_d_64 @subgroup PIE_HEAD_DIM=64 PIE_LANES=16 PIE_ROWS=64 PIE_LSE=1
+// pie:instantiate sdpa_paged_decode_lse_bfloat16_d_128 @subgroup PIE_HEAD_DIM=128 PIE_LANES=16 PIE_ROWS=64 PIE_LSE=1
+// pie:instantiate sdpa_paged_decode_lse_bfloat16_d_256 @subgroup PIE_HEAD_DIM=256 PIE_LANES=16 PIE_ROWS=64 PIE_LSE=1
+// pie:instantiate sdpa_paged_decode_lse_bfloat16_d_512 @subgroup PIE_HEAD_DIM=512 PIE_LANES=16 PIE_ROWS=64 PIE_LSE=1
+// pie:instantiate sdpa_paged_split_bfloat16_d_64 @subgroup PIE_HEAD_DIM=64 PIE_LANES=16 PIE_ROWS=64 PIE_LSE=1 PIE_SPLIT=1
+// pie:instantiate sdpa_paged_split_bfloat16_d_128 @subgroup PIE_HEAD_DIM=128 PIE_LANES=16 PIE_ROWS=64 PIE_LSE=1 PIE_SPLIT=1
+// pie:instantiate sdpa_paged_split_bfloat16_d_256 @subgroup PIE_HEAD_DIM=256 PIE_LANES=16 PIE_ROWS=64 PIE_LSE=1 PIE_SPLIT=1
+// pie:instantiate sdpa_paged_split_bfloat16_d_512 @subgroup PIE_HEAD_DIM=512 PIE_LANES=16 PIE_ROWS=64 PIE_LSE=1 PIE_SPLIT=1
+// pie:instantiate sdpa_paged_tiled_bfloat16_d_64 @subgroup PIE_HEAD_DIM=64 PIE_LANES=16 PIE_ROWS=16 PIE_TILED=1
+// pie:instantiate sdpa_paged_tiled_bfloat16_d_128 @subgroup PIE_HEAD_DIM=128 PIE_LANES=16 PIE_ROWS=16 PIE_TILED=1
+// pie:instantiate sdpa_paged_tiled_bfloat16_d_256 @subgroup PIE_HEAD_DIM=256 PIE_LANES=16 PIE_ROWS=16 PIE_TILED=1
+// pie:instantiate sdpa_paged_tiled_bfloat16_d_512 @subgroup PIE_HEAD_DIM=512 PIE_LANES=16 PIE_ROWS=16 PIE_TILED=1
+// pie:instantiate sdpa_paged_tiled_lse_bfloat16_d_64 @subgroup PIE_HEAD_DIM=64 PIE_LANES=16 PIE_ROWS=16 PIE_TILED=1 PIE_LSE=1
+// pie:instantiate sdpa_paged_tiled_lse_bfloat16_d_128 @subgroup PIE_HEAD_DIM=128 PIE_LANES=16 PIE_ROWS=16 PIE_TILED=1 PIE_LSE=1
+// pie:instantiate sdpa_paged_tiled_lse_bfloat16_d_256 @subgroup PIE_HEAD_DIM=256 PIE_LANES=16 PIE_ROWS=16 PIE_TILED=1 PIE_LSE=1
+// pie:instantiate sdpa_paged_tiled_lse_bfloat16_d_512 @subgroup PIE_HEAD_DIM=512 PIE_LANES=16 PIE_ROWS=16 PIE_TILED=1 PIE_LSE=1

@@ -648,7 +648,10 @@ mod tests {
             panic!("the block is what refused, not {refused}")
         };
         assert_eq!(component.at, At::Grid(0), "{refused}");
-        assert_eq!(component.law, Law::Const(4), "the grid the new capture wants");
+        assert_eq!(
+            component.law,
+            Law::Const(4),
+            "the grid the new capture wants"
+        );
     }
-
 }

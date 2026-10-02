@@ -74,15 +74,15 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     let window = ctx.stage();
 
     let warped = match head_dim {
-        64 => {
-            Some("::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32(64), false>")
-        }
-        128 => {
-            Some("::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32(128), false>")
-        }
-        256 => {
-            Some("::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32(256), false>")
-        }
+        64 => Some(
+            "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32(64), false>",
+        ),
+        128 => Some(
+            "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32(128), false>",
+        ),
+        256 => Some(
+            "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv_warp<::pie::i32(256), false>",
+        ),
         _ => None,
     };
     if let Some(instantiation) = warped {

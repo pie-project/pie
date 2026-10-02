@@ -3,6 +3,10 @@
 mod common;
 
 use common::{Gpu, Lcg, from_bf16, to_bf16};
+use dtype::Dtype;
+use kernels_cuda::Tensor;
+use kernels_cuda::elemwise::norm::add_bias;
+use kernels_cuda::linear::gemm::{matmul, matmul_bias};
 use kernels_cuda::linear::skinny::{Epilogue, ROWS, covers, skinny_bf16};
 
 fn round(v: f32) -> f32 {
@@ -30,8 +34,10 @@ fn check(epilogue: Epilogue, m: usize, n: usize, k: usize) {
     let a_at = gpu.up(&a_raw);
     let y_at = gpu.up(&y_raw);
     let ctx = gpu.ctx();
-    skinny_bf16(&ctx, w_at, a_at, y_at, m as i32, n as i32, k as i32, epilogue)
-        .unwrap_or_else(|e| panic!("{epilogue:?} m={m} n={n} k={k}: {e}"));
+    skinny_bf16(
+        &ctx, w_at, a_at, y_at, m as i32, n as i32, k as i32, epilogue,
+    )
+    .unwrap_or_else(|e| panic!("{epilogue:?} m={m} n={n} k={k}: {e}"));
     gpu.sync();
     let got: Vec<u16> = gpu.down(y_at, tall * n);
 
@@ -52,7 +58,10 @@ fn check(epilogue: Epilogue, m: usize, n: usize, k: usize) {
                     let g = round(dot(r, c));
                     let u = round(dot(r, n + c));
                     let v = gelu_tanh(g) * u;
-                    (v, noise(g) * u.abs() + noise(u) * g.abs() + v.abs() * (1.0 / 64.0) + 1e-3)
+                    (
+                        v,
+                        noise(g) * u.abs() + noise(u) * g.abs() + v.abs() * (1.0 / 64.0) + 1e-3,
+                    )
                 }
             };
             let g = from_bf16(got[r * n + c]);
@@ -62,13 +71,18 @@ fn check(epilogue: Epilogue, m: usize, n: usize, k: usize) {
             );
         }
     }
-    assert_eq!(&got[m * n..], &y_raw[m * n..], "{epilogue:?} m={m} n={n} k={k}: the row past m moved");
+    assert_eq!(
+        &got[m * n..],
+        &y_raw[m * n..],
+        "{epilogue:?} m={m} n={n} k={k}: the row past m moved"
+    );
 }
 
 #[test]
 fn the_skinny_gemm_lands_the_dot_and_its_epilogue_every_case() {
     the_plain_projection_answers_the_dot_at_one_ragged_and_full_rows();
     the_softcap_epilogue_lands_the_capped_logit();
+    a_folded_bias_lands_the_bits_of_the_add_after_the_projection();
     the_geglu_epilogue_lands_the_gated_product();
     a_shape_the_block_does_not_divide_is_refused_without_firing();
 }
@@ -78,6 +92,29 @@ fn the_plain_projection_answers_the_dot_at_one_ragged_and_full_rows() {
         check(Epilogue::Store, m, 192, 128);
     }
     check(Epilogue::Store, 64, 640, 2560);
+}
+
+fn a_folded_bias_lands_the_bits_of_the_add_after_the_projection() {
+    for (m, n, k) in [(1, 512, 256), (1, 4104, 256), (3, 512, 256)] {
+        let mut lcg = Lcg::seeded(0x7b ^ n as u64);
+        let (w_raw, _) = lcg.row(n * k);
+        let (a_raw, _) = lcg.row(m * k);
+        let (b_raw, _) = lcg.row(n);
+        let mut gpu = Gpu::open();
+        let w = Tensor::new(gpu.up(&w_raw), n as u32, k as u32, Dtype::Bf16);
+        let a = Tensor::new(gpu.up(&a_raw), m as u32, k as u32, Dtype::Bf16);
+        let b = Tensor::new(gpu.up(&b_raw), 1, n as u32, Dtype::Bf16);
+        let mut fused = Tensor::new(gpu.zeros(m * n * 2), m as u32, n as u32, Dtype::Bf16);
+        let mut apart = Tensor::new(gpu.zeros(m * n * 2), m as u32, n as u32, Dtype::Bf16);
+        let ctx = gpu.ctx();
+        matmul_bias(&ctx, a, w, b, &mut fused).expect("the biased projection fires");
+        matmul(&ctx, a, w, &mut apart).expect("the projection fires");
+        add_bias(&ctx, b, &mut apart).expect("the add fires");
+        gpu.sync();
+        let got: Vec<u16> = gpu.down(fused.ptr, m * n);
+        let want: Vec<u16> = gpu.down(apart.ptr, m * n);
+        assert_eq!(got, want, "m={m} n={n} k={k}");
+    }
 }
 
 fn the_softcap_epilogue_lands_the_capped_logit() {
@@ -94,10 +131,22 @@ fn the_geglu_epilogue_lands_the_gated_product() {
 }
 
 fn a_shape_the_block_does_not_divide_is_refused_without_firing() {
-    assert!(!covers(1, 96, 128, Epilogue::Store), "n=96 is not whole 64s");
-    assert!(!covers(65, 64, 128, Epilogue::Store), "m=65 is past the tile");
-    assert!(!covers(1, 64, 192, Epilogue::Store), "k=192 is not whole 128s");
-    assert!(!covers(1, 48, 128, Epilogue::Geglu), "I=48 is not whole 32s");
+    assert!(
+        !covers(1, 96, 128, Epilogue::Store),
+        "n=96 is not whole 64s"
+    );
+    assert!(
+        !covers(65, 64, 128, Epilogue::Store),
+        "m=65 is past the tile"
+    );
+    assert!(
+        !covers(1, 64, 192, Epilogue::Store),
+        "k=192 is not whole 128s"
+    );
+    assert!(
+        !covers(1, 48, 128, Epilogue::Geglu),
+        "I=48 is not whole 32s"
+    );
     assert!(covers(64, 32, 128, Epilogue::Geglu));
     let mut gpu = Gpu::open();
     let w = gpu.up(&vec![0u16; 96 * 128]);

@@ -1,4 +1,4 @@
 [toolchain]
 channel = "1.98.1"
 components = ["rustfmt", "clippy"]
-targets = ["wasm32-wasip2", "aarch64-apple-darwin"]
+targets = ["wasm32-wasip2", "aarch64-apple-darwin", "wasm32-unknown-unknown"]

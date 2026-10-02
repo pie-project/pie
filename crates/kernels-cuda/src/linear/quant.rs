@@ -1,7 +1,9 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{
+    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
+};
 use crate::linear::gemm;
 use crate::linear::moe::GroupSeat;
 use crate::tensor::Tensor;
@@ -12,6 +14,10 @@ const BLOCK: u32 = 256;
 
 const WARP: u32 = 32;
 
+/// The bf16 tile a plane is decoded into before the dense gemm reads it:
+/// one a stream, the size of the widest plane fired on it, since the decode
+/// and the gemm are consecutive on the stream. Keyed by region it was one a
+/// region, the whole model in bf16 across a load.
 const DECODED_WEIGHT: &str = "linear.quant.decoded_weight";
 
 fn route_rows(rows: u32, width: u32) -> Launch {
@@ -62,6 +68,22 @@ impl OffsetKind {
             Self::PreConst => "a constant pre-offset arm (`s·(c − 2^(bits−1))`)",
         }
     }
+}
+
+/// Takes this stream's decoded-weight tile at `bytes` now, so the first
+/// fire that decodes a plane finds it and no capture ever has to grow it —
+/// a load whose bodies are held to nothing arms no body at load, and its
+/// first fire is a capture.
+pub fn warm_decoded_weight(ctx: &Ctx, bytes: u64) -> Result<(), Error> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    ctx.scratch_stream(
+        "linear.matmul",
+        DECODED_WEIGHT,
+        usize::try_from(bytes).unwrap_or(usize::MAX),
+    )
+    .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -152,7 +174,10 @@ fn affine(
         (OffsetKind::Post | OffsetKind::PreInt | OffsetKind::PreReal, None) => {
             return Err(refuse(
                 op,
-                format!("{} was declared with no offset plane to read", offset.spelling()),
+                format!(
+                    "{} was declared with no offset plane to read",
+                    offset.spelling()
+                ),
             ));
         }
         _ => {}
@@ -298,7 +323,10 @@ pub fn decoded_plane(
     if codes.rows != n {
         return Err(refuse(
             op,
-            format!("the code plane holds {} rows and the entry states {n}", codes.rows),
+            format!(
+                "the code plane holds {} rows and the entry states {n}",
+                codes.rows
+            ),
         ));
     }
     let bits: u32 = if codes.width == k {
@@ -310,7 +338,10 @@ pub fn decoded_plane(
     } else {
         return Err(refuse(
             op,
-            format!("a {}-byte code row stores a {k}-wide row at neither two, four nor eight bits", codes.width),
+            format!(
+                "a {}-byte code row stores a {k}-wide row at neither two, four nor eight bits",
+                codes.width
+            ),
         ));
     };
     let groups = scales.width / 2;
@@ -322,7 +353,7 @@ pub fn decoded_plane(
     }
     let group = k / groups;
     let bytes = (n as usize).saturating_mul(k as usize).saturating_mul(2);
-    let tile = ctx.scratch(op, DECODED_WEIGHT, bytes)? as usize as u64;
+    let tile = ctx.scratch_stream(op, DECODED_WEIGHT, bytes)? as usize as u64;
     let words = extent(op, u64::from(n) * u64::from(k) / u64::from(32 / bits))?;
     ctx.fire(
         op,
@@ -364,7 +395,10 @@ pub fn decode_into(
     if codes.rows != n {
         return Err(refuse(
             op,
-            format!("the code plane holds {} rows and the entry states {n}", codes.rows),
+            format!(
+                "the code plane holds {} rows and the entry states {n}",
+                codes.rows
+            ),
         ));
     }
     let bits: u32 = if codes.width == k {
@@ -376,7 +410,10 @@ pub fn decode_into(
     } else {
         return Err(refuse(
             op,
-            format!("a {}-byte code row stores a {k}-wide row at neither two, four nor eight bits", codes.width),
+            format!(
+                "a {}-byte code row stores a {k}-wide row at neither two, four nor eight bits",
+                codes.width
+            ),
         ));
     };
     let groups = scales.width / 2;
@@ -490,7 +527,7 @@ fn dense_affine_via_dense(
         return Ok(());
     }
     let bytes = (n as usize).saturating_mul(k as usize).saturating_mul(2);
-    let tile = ctx.scratch(op, DECODED_WEIGHT, bytes)? as usize as u64;
+    let tile = ctx.scratch_stream(op, DECODED_WEIGHT, bytes)? as usize as u64;
     let words = extent(op, u64::from(n) * u64::from(k) / u64::from(32 / bits))?;
     ctx.fire(
         op,
@@ -512,7 +549,7 @@ fn dense_affine_via_dense(
             stated(op, k)?.arg(),
         ],
     )?;
-    gemm::act_x_wt(ctx, op, act, Tensor::new(tile, n, k, Dtype::Bf16), y)
+    gemm::act_x_wt(ctx, op, act, Tensor::new(tile, n, k, Dtype::Bf16), None, y)
 }
 
 pub fn cast_fp32_to(ctx: &Ctx, src: Tensor, dst: &mut Tensor) -> Result<(), Error> {

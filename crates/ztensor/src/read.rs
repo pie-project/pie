@@ -175,8 +175,22 @@ impl Options {
 
     pub fn open(self, path: impl AsRef<Path>) -> Result<Source> {
         let path = path.as_ref();
-        let vocab = self.vocabulary_arc();
         let root = self.open_store(path, "zt")?;
+        self.open_root(path, root)
+    }
+
+    pub fn from_memory(
+        self,
+        name: impl AsRef<Path>,
+        bytes: impl Into<crate::memfs::Chunks>,
+    ) -> Result<Source> {
+        let name = name.as_ref();
+        let root = Store::from_memory(name, bytes, "zt");
+        self.open_root(name, root)
+    }
+
+    fn open_root(self, path: &Path, root: Store) -> Result<Source> {
+        let vocab = self.vocabulary_arc();
         let parsed = validate::store(&root, &vocab)?;
         let root = root.with_occupied(parsed.occupied);
 
@@ -334,6 +348,13 @@ impl Source {
 
     pub fn open_all(paths: &[impl AsRef<Path>]) -> Result<Source> {
         Options::default().open_all(paths)
+    }
+
+    pub fn from_memory(
+        name: impl AsRef<Path>,
+        bytes: impl Into<crate::memfs::Chunks>,
+    ) -> Result<Source> {
+        Options::default().from_memory(name, bytes)
     }
 
     pub fn options() -> Options {
@@ -558,7 +579,10 @@ impl<'a> Tensor<'a> {
 
     fn mappable(&self) -> Option<Location> {
         let at = self.addressable()?;
-        self.src.store(at.store).is_mapped().then_some(at)
+        self.src
+            .store(at.store)
+            .is_contiguous(at.offset, at.len)
+            .then_some(at)
     }
 
     fn evictable(&self) -> Option<Location> {
@@ -594,8 +618,12 @@ impl<'a> Tensor<'a> {
 
     pub fn map(&self) -> Result<&'a [u8]> {
         let Some(at) = self.mappable() else {
-            let detail = if self.addressable().is_some() {
-                "its file was opened without mapping".to_string()
+            let detail = if let Some(at) = self.addressable() {
+                if self.src.store(at.store).is_mapped() {
+                    "it lies across two chunks of a memory mount".to_string()
+                } else {
+                    "its file was opened without mapping".to_string()
+                }
             } else {
                 format!("its bytes are {}", self.shape_of_payload())
             };
@@ -604,11 +632,10 @@ impl<'a> Tensor<'a> {
                 self.name
             )));
         };
-        Ok(self
-            .src
-            .store(at.store)
-            .slice(at.offset, at.len)?
-            .expect("mappable stores are mapped"))
+        match self.src.store(at.store).slice(at.offset, at.len)? {
+            Some(Cow::Borrowed(bytes)) => Ok(bytes),
+            _ => unreachable!("a contiguous window of a mapped store is borrowed"),
+        }
     }
 
     pub fn bytes(&self) -> Result<Cow<'a, [u8]>> {
@@ -616,7 +643,7 @@ impl<'a> Tensor<'a> {
             Payload::At(at) => {
                 let store = self.src.store(at.store);
                 match store.slice(at.offset, at.len)? {
-                    Some(slice) => Ok(Cow::Borrowed(slice)),
+                    Some(slice) => Ok(slice),
                     None => Ok(Cow::Owned(store.read(at.offset, at.len)?)),
                 }
             }
@@ -718,6 +745,8 @@ impl<'a> Tensor<'a> {
                 self.name,
                 if !cfg!(unix) {
                     "dropping page cache is a unix facility"
+                } else if self.store().is_memory() {
+                    "its bytes are an in-memory mount, not a page cache"
                 } else if self.mappable().is_some() {
                     "it shares an OS page with another blob"
                 } else {

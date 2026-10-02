@@ -85,6 +85,19 @@ pub enum Attention {
         sm_scale: f32,
         o: ValueId,
     },
+    MaskedLse {
+        q: ValueId,
+        plan: ValueId,
+        mask: ValueId,
+        cache: ValueId,
+        window: Option<u32>,
+        head_dim: u32,
+        kv_heads: u32,
+        causal: bool,
+        sm_scale: f32,
+        o: ValueId,
+        lse: ValueId,
+    },
     Dense {
         q: ValueId,
         k: ValueId,
@@ -126,6 +139,29 @@ pub enum Attention {
         sm_scale: f32,
         o: ValueId,
         lse: ValueId,
+    },
+    DecodeSelected {
+        q: ValueId,
+        plan: ValueId,
+        selection: ValueId,
+        cache: ValueId,
+        window: Option<u32>,
+        head_dim: u32,
+        sm_scale: f32,
+        ratio: u32,
+        o: ValueId,
+    },
+    PrefillSelected {
+        q: ValueId,
+        plan: ValueId,
+        selection: ValueId,
+        cache: ValueId,
+        window: Option<u32>,
+        head_dim: u32,
+        kv_heads: u32,
+        sm_scale: f32,
+        ratio: u32,
+        o: ValueId,
     },
     Sink {
         o: ValueId,
@@ -392,7 +428,7 @@ pub enum Attention {
     },
     IndexTopk {
         q: ValueId,
-        weights: ValueId,
+        weights: Option<ValueId>,
         keys: ValueId,
         heads: u32,
         head_dim: u32,
@@ -405,6 +441,14 @@ pub enum Attention {
         keys: ValueId,
         write_page: ValueId,
         write_offset: ValueId,
+    },
+    IndexBlockMean {
+        boundary_pos: ValueId,
+        boundary_req: ValueId,
+        keys: ValueId,
+        head_dim: u32,
+        ratio: u32,
+        entries: ValueId,
     },
 
     PoolBoundaryDecode {
@@ -484,6 +528,9 @@ pub enum Attention {
         primes: Vec<u64>,
         offsets: Vec<u64>,
         heads_per_ngram: u32,
+        /// An i64 table the ids are mapped through before hashing (Engram's
+        /// tokenizer-compressed ids); the window keeps raw ids.
+        map: Option<ValueId>,
         ngram_ids: ValueId,
     },
     PleNgramIdsChunked {
@@ -494,6 +541,7 @@ pub enum Attention {
         primes: Vec<u64>,
         offsets: Vec<u64>,
         heads_per_ngram: u32,
+        map: Option<ValueId>,
         ngram_ids: ValueId,
     },
 }
@@ -535,6 +583,13 @@ impl Operands for Attention {
                 mask,
                 cache,
                 ..
+            }
+            | Self::MaskedLse {
+                q,
+                plan,
+                mask,
+                cache,
+                ..
             } => sink.extend([*q, *plan, *mask, *cache]),
             Self::Dense {
                 q, k, v, segments, ..
@@ -559,6 +614,20 @@ impl Operands for Attention {
             }
             Self::DecodeLse { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
             Self::PrefillLse { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
+            Self::DecodeSelected {
+                q,
+                plan,
+                selection,
+                cache,
+                ..
+            }
+            | Self::PrefillSelected {
+                q,
+                plan,
+                selection,
+                cache,
+                ..
+            } => sink.extend([*q, *plan, *selection, *cache]),
             Self::DecodeRel {
                 q,
                 plan,
@@ -755,7 +824,16 @@ impl Operands for Attention {
             Self::IndexRope { q, positions, .. } => sink.extend([*q, *positions]),
             Self::IndexTopk {
                 q, weights, keys, ..
-            } => sink.extend([*q, *weights, *keys]),
+            } => {
+                sink.extend([*q, *keys]);
+                sink.extend(weights.iter().copied());
+            }
+            Self::IndexBlockMean {
+                boundary_pos,
+                boundary_req,
+                keys,
+                ..
+            } => sink.extend([*boundary_pos, *boundary_req, *keys]),
             Self::IndexKvAppend {
                 k,
                 keys,
@@ -834,8 +912,15 @@ impl Operands for Attention {
             } => {
                 sink.extend([*q, *positions, *request_of_token, *selection, *entries]);
             }
-            Self::PleNgramIds { ids, state, .. } => sink.extend([*ids, *state]),
-            Self::PleNgramIdsChunked { ids, state, .. } => sink.extend([*ids, *state]),
+            Self::PleNgramIds {
+                ids, state, map, ..
+            }
+            | Self::PleNgramIdsChunked {
+                ids, state, map, ..
+            } => {
+                sink.extend([*ids, *state]);
+                sink.extend(*map);
+            }
         }
     }
     fn outputs(&self, sink: &mut Vec<ValueId>) {
@@ -845,10 +930,12 @@ impl Operands for Attention {
             Self::Decode { o, .. } => sink.push(*o),
             Self::Prefill { o, .. } => sink.push(*o),
             Self::Masked { o, .. } => sink.push(*o),
+            Self::MaskedLse { o, lse, .. } => sink.extend([*o, *lse]),
             Self::Dense { o, .. } => sink.push(*o),
             Self::Ragged { o, .. } => sink.push(*o),
             Self::DecodeLse { o, lse, .. } => sink.extend([*o, *lse]),
             Self::PrefillLse { o, lse, .. } => sink.extend([*o, *lse]),
+            Self::DecodeSelected { o, .. } | Self::PrefillSelected { o, .. } => sink.push(*o),
             Self::DecodeRel { o, .. } => sink.push(*o),
             Self::PrefillRel { o, .. } => sink.push(*o),
             Self::Sink { o_out, .. } => sink.push(*o_out),
@@ -881,6 +968,7 @@ impl Operands for Attention {
             Self::IndexLayernormRope { k_out, .. } => sink.push(*k_out),
             Self::IndexRope { q_out, .. } => sink.push(*q_out),
             Self::IndexTopk { selection, .. } => sink.push(*selection),
+            Self::IndexBlockMean { entries, .. } => sink.push(*entries),
             Self::IndexKvAppend { .. } => {}
             Self::PoolBoundaryDecode {
                 boundary_pos,
@@ -914,10 +1002,12 @@ impl Operands for Attention {
             Self::Decode { .. } => {}
             Self::Prefill { .. } => {}
             Self::Masked { .. } => {}
+            Self::MaskedLse { .. } => {}
             Self::Dense { .. } => {}
             Self::Ragged { .. } => {}
             Self::DecodeLse { .. } => {}
             Self::PrefillLse { .. } => {}
+            Self::DecodeSelected { .. } | Self::PrefillSelected { .. } => {}
             Self::DecodeRel { .. } => {}
             Self::PrefillRel { .. } => {}
             Self::Sink { o_out, o, .. } => sink.push((*o_out, *o)),
@@ -950,6 +1040,7 @@ impl Operands for Attention {
             Self::IndexLayernormRope { k_out, k, .. } => sink.push((*k_out, *k)),
             Self::IndexRope { q_out, q, .. } => sink.push((*q_out, *q)),
             Self::IndexTopk { .. } => {}
+            Self::IndexBlockMean { .. } => {}
             Self::IndexKvAppend { .. } => {}
             Self::PoolBoundaryDecode { .. } => {}
             Self::PoolBoundaryPrefill { .. } => {}
@@ -969,10 +1060,13 @@ impl Operands for Attention {
             Self::Decode { .. } => "attention.decode",
             Self::Prefill { .. } => "attention.prefill",
             Self::Masked { .. } => "attention.masked",
+            Self::MaskedLse { .. } => "attention.masked_lse",
             Self::Dense { .. } => "attention.dense",
             Self::Ragged { .. } => "attention.ragged",
             Self::DecodeLse { .. } => "attention.decode_lse",
             Self::PrefillLse { .. } => "attention.prefill_lse",
+            Self::DecodeSelected { .. } => "attention.decode_selected",
+            Self::PrefillSelected { .. } => "attention.prefill_selected",
             Self::DecodeRel { .. } => "attention.decode_rel",
             Self::PrefillRel { .. } => "attention.prefill_rel",
             Self::Sink { .. } => "attention.sink",
@@ -1005,6 +1099,7 @@ impl Operands for Attention {
             Self::IndexLayernormRope { .. } => "attention.index_layernorm_rope",
             Self::IndexRope { .. } => "attention.index_rope",
             Self::IndexTopk { .. } => "attention.index_topk",
+            Self::IndexBlockMean { .. } => "attention.index_block_mean",
             Self::IndexKvAppend { .. } => "attention.index_kv_append",
             Self::PoolBoundaryDecode { .. } => "attention.pool_boundary_decode",
             Self::PoolBoundaryPrefill { .. } => "attention.pool_boundary_prefill",

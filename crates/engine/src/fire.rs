@@ -93,6 +93,15 @@ pub struct KvDelta {
     pub pages: Vec<u32>,
     #[serde(default)]
     pub translation: Vec<u32>,
+    /// The ids of the lane's pages in the windowed kv spaces, aligned with
+    /// `translation` when it is stated and with `pages` otherwise; 0 is the
+    /// null page a page wholly behind the window reads.
+    #[serde(default)]
+    pub window: Vec<u32>,
+    /// Windowed pages copied `(src, dst)` before the fire runs, beside the
+    /// full pages the fire's pre-launch copy moves.
+    #[serde(default)]
+    pub window_copies: Vec<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +111,19 @@ pub enum Readout {
     Rows(Vec<u32>),
     None,
 }
+
+/// A structured attention mask over a lane's rows: `classes[row]` in
+/// `0..count`, or -1 for a row that attends and is attended by every row;
+/// `table[q * count + kv] != 0` lets a q-class row attend a kv-class row.
+/// Every lane of one attention group states the same table.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AttnClasses {
+    pub classes: Vec<i32>,
+    pub table: Vec<u8>,
+    pub count: u32,
+}
+
+pub const ATTN_CLASSES_MAX: u32 = 64;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lane {
@@ -124,6 +146,10 @@ pub struct Lane {
     pub rs: RsVerb,
     #[serde(default)]
     pub rs_reset: RsReset,
+    /// The recurrent-state row the runtime's rs store assigned this lane, when
+    /// it binds one; otherwise the state rides the seat.
+    #[serde(default)]
+    pub rs_slot: Option<u32>,
     #[serde(default)]
     pub channels: Vec<Ticket>,
     pub readout: Readout,
@@ -139,6 +165,8 @@ pub struct Lane {
     pub ports: Vec<PortFeed>,
     #[serde(default)]
     pub kv_less: bool,
+    #[serde(default)]
+    pub attn_classes: Option<AttnClasses>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]

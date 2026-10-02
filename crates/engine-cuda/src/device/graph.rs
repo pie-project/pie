@@ -420,11 +420,7 @@ impl Event {
             unsafe {
                 crate::device::ctx::check(
                     "cudaStreamWaitEvent",
-                    cudarc::runtime::sys::cudaStreamWaitEvent(
-                        stream.cast(),
-                        self.raw.cast(),
-                        0,
-                    ),
+                    cudarc::runtime::sys::cudaStreamWaitEvent(stream.cast(), self.raw.cast(), 0),
                 )
             }
         }

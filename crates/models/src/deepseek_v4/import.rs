@@ -1,8 +1,8 @@
-use checkpoint::contract::{Expr, ModelContract, TensorType};
+use checkpoint::contract::{Expr, ModelContract, TensorContract, TensorType};
 use model_dsl::{Dtype, Weight};
 
 use super::model::{Gate, GateUp, Layer, Mlp, Model};
-use checkpoint_dsl::{Builder, Error, encoding};
+use checkpoint_dsl::{Builder, Error, encoding, extents, scaling};
 use model_dsl::Platform;
 
 type ImportArm<S> = fn(&S, &ztensor::Source, Platform) -> Result<ModelContract, Error>;
@@ -14,15 +14,22 @@ impl Model {
         platform: Platform,
     ) -> Result<ModelContract, Error> {
         let mut refusals: Vec<String> = Vec::new();
-        let arms: [(&str, ImportArm<Self>); 4] = [
-            (
-                "an artifact with an `--aux` overlay",
-                Self::import_from_own_with_aux,
-            ),
-            ("flash mlx", Self::import_from_mlx),
-            ("huggingface", Self::import_from_huggingface),
-            ("gguf", Self::import_from_gguf),
-        ];
+        let arms: &[(&str, ImportArm<Self>)] = if self.hyper.single_pass {
+            &[
+                ("a DeepSeek-V4.1 checkpoint", Self::import_from_v41),
+                ("a DeepSeek-V4.1 MLX checkpoint", Self::import_from_v41_mlx),
+            ]
+        } else {
+            &[
+                (
+                    "an artifact with an `--aux` overlay",
+                    Self::import_from_own_with_aux,
+                ),
+                ("flash mlx", Self::import_from_mlx),
+                ("huggingface", Self::import_from_huggingface),
+                ("gguf", Self::import_from_gguf),
+            ]
+        };
         for (what, arm) in arms {
             match arm(self, src, platform) {
                 Ok(contract) => return Ok(contract),
@@ -171,6 +178,230 @@ impl Model {
             reads.push(Read::One(&mtp.norm, "aux.norm.weight".into()));
         }
         reads
+    }
+
+    /// DeepSeek-V4.1-Flash in its per-expert release layout: the trunk
+    /// under `layers.{l}.` with `embed.weight`, `head.weight` and `norm.weight`
+    /// at the top, routed experts as per-expert `ffn.experts.{e}.w1/w3/w2`
+    /// planes. Every plane is read at whatever representation the file
+    /// stores — bf16, MLX affine codes, or MXFP4 codes beside e8m0 `.scale`
+    /// exponents for the experts — into the row's declared one. Engram needs
+    /// `engram.token_map`, the tokenizer-compressed id of every token, which
+    /// `scripts/bench/engram_token_map.py` writes beside the checkpoint.
+    pub fn import_from_v41(
+        &self,
+        src: &ztensor::Source,
+        platform: Platform,
+    ) -> Result<ModelContract, Error> {
+        self.import_from_v41_layout(src, platform, false)
+    }
+
+    pub fn import_from_v41_mlx(
+        &self,
+        src: &ztensor::Source,
+        platform: Platform,
+    ) -> Result<ModelContract, Error> {
+        if src
+            .get("model.layers.0.ffn.switch_mlp.gate_proj.weight")
+            .is_none()
+        {
+            return Err(Error::Illegible {
+                name: "dsv4".to_string(),
+                detail: "no stacked MLX V4.1 expert bank in model.layers".to_string(),
+            });
+        }
+        self.import_from_v41_layout(src, platform, true)
+    }
+
+    fn import_from_v41_layout(
+        &self,
+        src: &ztensor::Source,
+        platform: Platform,
+        mlx: bool,
+    ) -> Result<ModelContract, Error> {
+        let mut b = Builder::new(src, self.tp, platform);
+        b.read(
+            &self.embed,
+            if mlx {
+                "model.embed_tokens.weight"
+            } else {
+                "embed.weight"
+            },
+        )?;
+        if let Some(head) = &self.head {
+            b.read(head, if mlx { "lm_head.weight" } else { "head.weight" })?;
+        }
+        b.read(
+            &self.final_norm,
+            if mlx {
+                "model.norm.weight"
+            } else {
+                "norm.weight"
+            },
+        )?;
+        if let Some(map) = &self.token_map {
+            if src.get("engram.token_map").is_none() {
+                return Err(Error::Illegible {
+                    name: map.name.clone(),
+                    detail: "Engram hashes tokenizer-compressed ids, and this checkpoint \
+                             carries no `engram.token_map`; write it beside the weights \
+                             with `scripts/bench/engram_token_map.py` first"
+                        .to_string(),
+                });
+            }
+            b.read(map, "engram.token_map")?;
+        }
+
+        for (l, w) in self.layers.iter().enumerate() {
+            let n = |s: &str| {
+                if mlx {
+                    format!("model.layers.{l}.{s}")
+                } else {
+                    format!("layers.{l}.{s}")
+                }
+            };
+            let at = &w.attn;
+
+            for (mix, tag) in [(&w.attn_mix, "attn"), (&w.mlp_mix, "ffn")] {
+                let name = |plane: &str| {
+                    if mlx {
+                        n(&format!("{tag}_hc.{plane}"))
+                    } else {
+                        n(&format!("hc_{tag}_{plane}"))
+                    }
+                };
+                b.read(&mix.scale, name("scale"))?;
+                b.read(&mix.base, name("base"))?;
+                if let Some(dynamic) = &mix.dynamic {
+                    b.read(dynamic, name("fn"))?;
+                }
+            }
+            if let Some(norm) = &w.attn_norm {
+                b.read(norm, n("attn_norm.weight"))?;
+            }
+            if let Some(norm) = &w.mlp_norm {
+                b.read(norm, n("ffn_norm.weight"))?;
+            }
+
+            b.read(&at.q_down, n("attn.wq_a.weight"))?;
+            b.read(&at.q_norm, n("attn.q_norm.weight"))?;
+            b.read(&at.q_up, n("attn.wq_b.weight"))?;
+            b.read(&at.kv_down, n("attn.wkv.weight"))?;
+            b.read(&at.kv_norm, n("attn.kv_norm.weight"))?;
+            b.read(&at.o_down, n("attn.wo_a.weight"))?;
+            b.read(&at.o_up, n("attn.wo_b.weight"))?;
+            b.read(&at.sink, n("attn.attn_sink"))?;
+
+            if let Some(p) = &at.pool
+                && let Some(c) = &p.compressor
+            {
+                b.read(&c.wkv, n("attn.compressor.wkv.weight"))?;
+                if let Some(wgate) = &c.wgate {
+                    b.read(wgate, n("attn.compressor.wgate.weight"))?;
+                }
+                b.read(&c.norm, n("attn.compressor.norm.weight"))?;
+            }
+            if let Some(ix) = &at.indexer {
+                b.read(&ix.wq_b, n("attn.indexer.wq_b.weight"))?;
+                b.read(&ix.weights_proj, n("attn.indexer.weights_proj.weight"))?;
+                if let Some(wk) = &ix.wk {
+                    b.read(wk, n("attn.indexer.wk.weight"))?;
+                }
+                if let Some(k_norm) = &ix.k_norm {
+                    b.read(k_norm, n("attn.indexer.k_norm.weight"))?;
+                }
+            }
+
+            let Mlp::MoeFlash {
+                router,
+                gate,
+                gate_up,
+                down,
+                shared_gate_up,
+                shared_down,
+                experts,
+                ..
+            } = &w.mlp
+            else {
+                return Err(Error::Illegible {
+                    name: "dsv4".to_string(),
+                    detail: "every V4.1 layer is a DeepSeekMoE block".to_string(),
+                });
+            };
+            b.read(router, n("ffn.gate.weight"))?;
+            match gate {
+                Gate::Bias { bias } => b.read(
+                    bias,
+                    n(if mlx {
+                        "ffn.gate.e_score_correction_bias"
+                    } else {
+                        "ffn.gate.bias"
+                    }),
+                )?,
+                Gate::Hash { .. } => {
+                    return Err(Error::Illegible {
+                        name: "dsv4".to_string(),
+                        detail: "V4.1 routes by bias-corrected scores on every layer".to_string(),
+                    });
+                }
+            }
+            let expert = |e: u32, leg: &str| n(&format!("ffn.experts.{e}.{leg}.weight"));
+            match gate_up {
+                GateUp::Split { gate, up } => {
+                    if mlx {
+                        b.read(gate, n("ffn.switch_mlp.gate_proj.weight"))?;
+                        b.read(up, n("ffn.switch_mlp.up_proj.weight"))?;
+                    } else {
+                        read_bank(&mut b, src, gate, (0..*experts).map(|e| expert(e, "w1")))?;
+                        read_bank(&mut b, src, up, (0..*experts).map(|e| expert(e, "w3")))?;
+                    }
+                }
+                GateUp::Fused(_) => {
+                    return Err(Error::Illegible {
+                        name: "dsv4".to_string(),
+                        detail: "V4.1 keeps its routed gate and up legs apart".to_string(),
+                    });
+                }
+            }
+            if mlx {
+                b.read(down, n("ffn.switch_mlp.down_proj.weight"))?;
+            } else {
+                read_bank(&mut b, src, down, (0..*experts).map(|e| expert(e, "w2")))?;
+            }
+            b.read_concat(
+                shared_gate_up,
+                [
+                    n(if mlx {
+                        "ffn.shared_experts.gate_proj.weight"
+                    } else {
+                        "ffn.shared_experts.w1.weight"
+                    }),
+                    n(if mlx {
+                        "ffn.shared_experts.up_proj.weight"
+                    } else {
+                        "ffn.shared_experts.w3.weight"
+                    }),
+                ],
+            )?;
+            b.read(
+                shared_down,
+                n(if mlx {
+                    "ffn.shared_experts.down_proj.weight"
+                } else {
+                    "ffn.shared_experts.w2.weight"
+                }),
+            )?;
+
+            if let Some(e) = &w.engram {
+                b.read(&e.table, n("engram.embed.weight"))?;
+                b.read(&e.wkv, n("engram.wkv.weight"))?;
+                // The gate's normalisations carry `weight + 1`.
+                b.read_over(&e.q_weight, n("engram.q_weight"), |x| x.bias(-1.0))?;
+                b.read_over(&e.k_weight, n("engram.k_weight"), |x| x.bias(-1.0))?;
+            }
+        }
+
+        Ok(b.build())
     }
 
     pub fn import_from_huggingface(
@@ -339,6 +570,91 @@ impl Model {
     }
 }
 
+/// A routed bank `[experts, rows, cols]` from one plane per expert, at
+/// whatever representation the file stores them: bf16 rows are stacked,
+/// MLX affine trios are stacked by the affine reader, and MXFP4 codes
+/// (`w.weight` u8 nibble pairs beside `w.scale` e8m0 exponents, as DeepSeek
+/// stores its fp4 experts) are stacked with their exponents.
+fn read_bank(
+    b: &mut Builder<'_>,
+    src: &ztensor::Source,
+    w: &Weight,
+    parts: impl Iterator<Item = String>,
+) -> Result<(), Error> {
+    let parts: Vec<String> = parts.collect();
+    match w.dtype {
+        Dtype::Mxfp4 => {
+            let rows = i64::try_from(w.dim(1)).expect("a bank row count inside i64");
+            let cols = i64::try_from(w.dim(2)).expect("a bank column count inside i64");
+            let mut codes = Vec::with_capacity(parts.len());
+            let mut scales = Vec::with_capacity(parts.len());
+            for part in &parts {
+                let stem = part.strip_suffix(".weight").unwrap_or(part);
+                let scale = format!("{stem}.scale");
+                if src.get(&scale).is_none() {
+                    return Err(Error::Illegible {
+                        name: w.name.clone(),
+                        detail: format!(
+                            "`{part}` is read as MXFP4 codes, whose exponents are stored \
+                             beside it as `{scale}`, and the checkpoint holds none"
+                        ),
+                    });
+                }
+                codes.push(
+                    Expr::src(part.clone())
+                        .transmute(TensorType::new(vec![1, rows, cols], encoding(Dtype::Mxfp4))),
+                );
+                scales.push(Expr::src(scale).transmute(TensorType::new(
+                    vec![1, rows, cols / 32],
+                    encoding(Dtype::E8m0),
+                )));
+            }
+            let pairing = scaling(w);
+            let counted = checkpoint_dsl::divided(
+                &extents(w),
+                pairing.channel_axis,
+                pairing.group_size,
+                &w.name,
+            );
+            b.extend([
+                TensorContract::inferred(
+                    w.name.clone(),
+                    Expr::concat(0, codes),
+                    encoding(Dtype::Mxfp4),
+                ),
+                TensorContract::new(
+                    model_dsl::scales_name(&w.name),
+                    Expr::concat(0, scales),
+                    counted,
+                    encoding(Dtype::E8m0),
+                )
+                .scaling(pairing),
+            ]);
+            Ok(())
+        }
+        Dtype::U4g64
+        | Dtype::U8g64
+        | Dtype::U4g32
+        | Dtype::U2g32
+        | Dtype::U2g64
+        | Dtype::U2g128 => b.read_stack(w, parts.into_iter().map(|part| vec![part])),
+        _ => {
+            let rows = w.dim(1);
+            let cols = w.dim(2);
+            b.read_expr(
+                w,
+                Expr::concat(
+                    0,
+                    parts
+                        .into_iter()
+                        .map(|part| one_bank_row(w.dtype, part, rows, cols))
+                        .collect(),
+                ),
+            )
+        }
+    }
+}
+
 enum Read<'w> {
     One(&'w Weight, String),
     Concat(&'w Weight, u8, Vec<String>),
@@ -372,8 +688,12 @@ fn layer_reads<'w>(w: &'w Layer, n: &dyn Fn(&str) -> String, reads: &mut Vec<Rea
         && let Some(c) = &pool.compressor
     {
         reads.push(Read::One(&c.wkv, n("attn.compressor.wkv.weight")));
-        reads.push(Read::One(&c.wgate, n("attn.compressor.wgate.weight")));
-        reads.push(Read::One(&c.ape, n("attn.compressor.ape")));
+        if let Some(wgate) = &c.wgate {
+            reads.push(Read::One(wgate, n("attn.compressor.wgate.weight")));
+        }
+        if let Some(ape) = &c.ape {
+            reads.push(Read::One(ape, n("attn.compressor.ape")));
+        }
         reads.push(Read::One(&c.norm, n("attn.compressor.norm.weight")));
     }
     if let Some(ix) = &at.indexer {
@@ -382,22 +702,16 @@ fn layer_reads<'w>(w: &'w Layer, n: &dyn Fn(&str) -> String, reads: &mut Vec<Rea
             &ix.weights_proj,
             n("attn.indexer.weights_proj.weight"),
         ));
-        reads.push(Read::One(
-            &ix.compressor.wkv,
-            n("attn.indexer.compressor.wkv.weight"),
-        ));
-        reads.push(Read::One(
-            &ix.compressor.wgate,
-            n("attn.indexer.compressor.wgate.weight"),
-        ));
-        reads.push(Read::One(
-            &ix.compressor.ape,
-            n("attn.indexer.compressor.ape"),
-        ));
-        reads.push(Read::One(
-            &ix.compressor.norm,
-            n("attn.indexer.compressor.norm.weight"),
-        ));
+        if let Some(c) = &ix.compressor {
+            reads.push(Read::One(&c.wkv, n("attn.indexer.compressor.wkv.weight")));
+            if let Some(wgate) = &c.wgate {
+                reads.push(Read::One(wgate, n("attn.indexer.compressor.wgate.weight")));
+            }
+            if let Some(ape) = &c.ape {
+                reads.push(Read::One(ape, n("attn.indexer.compressor.ape")));
+            }
+            reads.push(Read::One(&c.norm, n("attn.indexer.compressor.norm.weight")));
+        }
     }
 
     if let Mlp::MoeFlash {
@@ -467,4 +781,74 @@ fn one_bank_row(dtype: Dtype, from: String, rows: u64, cols: u64) -> Expr {
 
 fn slab(expr: Expr, shape: Vec<i64>, encoding: checkpoint::types::Encoding) -> Expr {
     expr.transmute(TensorType::new(shape, encoding))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+
+    use ztensor::provide::{Catalog, Entry, Location, Store, StoreId};
+
+    use super::*;
+    use crate::deepseek_v4::model::Routed;
+
+    #[test]
+    fn single_pass_import_reads_stacked_mlx_experts() {
+        let mut model = Model::flash41_mini(
+            Dtype::Bf16,
+            Routed::split(Dtype::Bf16),
+            Dtype::Bf16,
+            Dtype::Bf16,
+            1,
+        );
+        model.layers.truncate(1);
+        model.token_map = None;
+
+        let path =
+            std::env::temp_dir().join(format!("dsv41_mlx_import_{}.bin", std::process::id()));
+        let mut catalog = Catalog::new();
+        let mut offset = 0;
+        for (weight, name) in model.mlx_planes() {
+            let mut shape = weight.shape.clone();
+            if name.contains("ffn.shared_experts.gate_proj.")
+                || name.contains("ffn.shared_experts.up_proj.")
+            {
+                shape[0] /= 2;
+            }
+            let width = if weight.dtype == Dtype::F32 { 4 } else { 2 };
+            let len = shape.iter().product::<u64>() * width;
+            catalog.insert(
+                name,
+                Entry::leaf(
+                    shape,
+                    if weight.dtype == Dtype::F32 {
+                        ztensor::Leaf::F32
+                    } else {
+                        ztensor::Leaf::BF16
+                    },
+                    Location {
+                        store: StoreId(0),
+                        offset,
+                        len,
+                    },
+                ),
+            );
+            offset += len;
+        }
+        let file = File::create(&path).unwrap();
+        file.set_len(offset).unwrap();
+        drop(file);
+        let store = Store::index(&path, "safetensors").unwrap();
+        let src = ztensor::Source::from_parts(vec![store], catalog).unwrap();
+
+        let contract = model.import(&src, Platform::Cuda).unwrap();
+        assert!(contract.tensors.iter().any(|tensor| {
+            tensor.name == model.layers[0].mlp_mix.base.name
+                && matches!(&tensor.expr, Expr::Src(name) if name == "model.layers.0.ffn_hc.base")
+        }));
+        assert!(contract.tensors.iter().any(|tensor| {
+            matches!(&tensor.expr, Expr::Src(name) if name == "model.layers.0.ffn.switch_mlp.down_proj.weight")
+        }));
+        std::fs::remove_file(path).unwrap();
+    }
 }

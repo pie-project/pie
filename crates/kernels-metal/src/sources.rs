@@ -5,6 +5,26 @@ macro_rules! source_root {
 }
 pub const SOURCES: &[(&str, &str)] = &[
     (
+        "common/mpp.metal",
+        include_str!(concat!(source_root!(), "/common/mpp.metal")),
+    ),
+    (
+        "attn/q8_write.metal",
+        include_str!(concat!(source_root!(), "/attn/q8_write.metal")),
+    ),
+    (
+        "attn/q8_decode.metal",
+        include_str!(concat!(source_root!(), "/attn/q8_decode.metal")),
+    ),
+    (
+        "attn/q8_mpp.metal",
+        include_str!(concat!(source_root!(), "/attn/q8_mpp.metal")),
+    ),
+    (
+        "attn/q8_split.metal",
+        include_str!(concat!(source_root!(), "/attn/q8_split.metal")),
+    ),
+    (
         "attn/attn_sink.metal",
         include_str!(concat!(source_root!(), "/attn/attn_sink.metal")),
     ),
@@ -91,6 +111,10 @@ pub const SOURCES: &[(&str, &str)] = &[
     (
         "attn/ssm_gdn_core.metal",
         include_str!(concat!(source_root!(), "/attn/ssm_gdn_core.metal")),
+    ),
+    (
+        "attn/ssm_gdn_staged.metal",
+        include_str!("../kernels/attn/ssm_gdn_staged.metal"),
     ),
     (
         "attn/ssm_gdn_scan.metal",
@@ -275,6 +299,10 @@ pub const SOURCES: &[(&str, &str)] = &[
     (
         "linear/quant_qmm_t.metal",
         include_str!(concat!(source_root!(), "/linear/quant_qmm_t.metal")),
+    ),
+    (
+        "linear/quant_qmm_mpp.metal",
+        include_str!(concat!(source_root!(), "/linear/quant_qmm_mpp.metal")),
     ),
     (
         "linear/quant_qmv.metal",

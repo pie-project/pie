@@ -1,0 +1,14 @@
+"""Run all inferlet E2E tests.
+
+Usage::
+
+    uv run python tests/examples/run_all.py --model Qwen/Qwen3-0.6B --device cuda:0
+    uv run python tests/examples/run_all.py --engine vulkan \
+        --model mlx-community/Qwen3-0.6B-4bit
+"""
+from conftest import run_tests
+from test_curated import tests
+from test_twins import tests as twin_tests
+
+if __name__ == "__main__":
+    run_tests(tests() + twin_tests(), description="Curated Inferlet E2E Tests")

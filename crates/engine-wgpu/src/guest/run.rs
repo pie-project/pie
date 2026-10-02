@@ -107,14 +107,19 @@ impl<'a> OnDevice<'a> {
 
         self.session.flush(&mut frame, at)?;
         self.session.dispatch(&frame, at)?;
+        let mut locals = Vec::with_capacity(wanted.len());
         for &global in wanted {
             if let Some(local) = local_of(package, at, global)? {
-                self.session.read_back(&mut frame, at, local)?;
+                locals.push(local);
             }
         }
-        frame.commit()?;
+        self.session
+            .read_back(self.device, &mut frame, at, &locals)?;
+        let pending = frame.commit_async(None)?;
+        self.session.collect(at)?;
+        pending.wait()?;
 
-        if let Some(code) = self.session.status()? {
+        if let Some(code) = self.session.status(at)? {
             self.session.clear_status()?;
             return Err(Fault::Program {
                 at: "guest::run",
@@ -150,6 +155,14 @@ impl<'a> OnDevice<'a> {
                 .span(at, local)
                 .expect("a wanted value has a span");
             let raw = self.session.taken(at, local)?;
+            tracing::trace!(
+                stage = at,
+                global,
+                ?dtype,
+                bytes = raw.len(),
+                head = ?&raw[..raw.len().min(16)],
+                "guest value taken"
+            );
             vals[global as usize] = from_heap(&raw, dtype, held);
         }
         self.ran.push(at);

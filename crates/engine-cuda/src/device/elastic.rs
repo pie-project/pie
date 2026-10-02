@@ -59,6 +59,7 @@ pub struct PhysicalPool {
     handle_bytes: u64,
     budget_pages: u64,
     hard_pages: u64,
+    pledged_pages: u64,
     held_pages: u64,
     committed_pages: u64,
     high_water_pages: u64,
@@ -85,6 +86,7 @@ impl PhysicalPool {
                 handle_bytes,
                 budget_pages: pages,
                 hard_pages: pages,
+                pledged_pages: 0,
                 held_pages: 0,
                 committed_pages: 0,
                 high_water_pages: 0,
@@ -107,6 +109,7 @@ impl PhysicalPool {
             handle_bytes: MAP_UNIT_BYTES,
             budget_pages: pages,
             hard_pages: pages,
+            pledged_pages: 0,
             held_pages: 0,
             committed_pages: 0,
             high_water_pages: 0,
@@ -137,6 +140,11 @@ impl PhysicalPool {
     #[must_use]
     pub const fn map_unit_bytes(&self) -> u64 {
         self.handle_bytes
+    }
+
+    #[must_use]
+    pub const fn granularity(&self) -> u64 {
+        self.granularity
     }
 
     pub fn spare_bytes(&self, reserve: u64) -> Result<u64> {
@@ -172,9 +180,16 @@ impl PhysicalPool {
         self.handle_bytes
     }
 
+    /// What the pool can still take: the budget past what is committed and
+    /// what is promised.
+    #[must_use]
+    pub const fn spare_pages(&self) -> u64 {
+        self.budget_pages
+            .saturating_sub(self.committed_pages + self.held_pages)
+    }
+
     pub fn try_reserve(&mut self, pages: u64) -> bool {
-        let charged = self.committed_pages + self.held_pages;
-        if pages > self.budget_pages.saturating_sub(charged.min(self.budget_pages)) {
+        if pages > self.spare_pages() {
             return false;
         }
         self.held_pages += pages;
@@ -196,6 +211,20 @@ impl PhysicalPool {
         self.committed_pages -= self.committed_pages.min(pages);
     }
 
+    /// Pledges the pool `pages` whatever the device reports free from here
+    /// on. A fit declares a watermark from what the card has left, and the
+    /// runtime admits frames against that watermark; what a fire allocates
+    /// beside the pool afterwards (a program's scratch, a kernel's slab)
+    /// comes out of the safety floor the budget held back, not out of the
+    /// pages the fit already promised, so a recalibration that finds the
+    /// room taken does not refuse a frame inside the pledge. Past it the
+    /// device's word stands.
+    pub fn pledge(&mut self, pages: u64) {
+        self.pledged_pages = pages;
+        self.budget_pages = self.budget_pages.max(pages);
+        self.hard_pages = self.hard_pages.max(self.budget_pages);
+    }
+
     pub fn recalibrate(&mut self) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
@@ -207,11 +236,18 @@ impl PhysicalPool {
             crate::device::ctx::check("cudaMemGetInfo", asked)?;
             let available =
                 budget_bytes(free as u64, total as u64, self.utilization) / LOGICAL_PAGE_BYTES;
-            let charged = self.committed_pages + self.held_pages;
-            self.budget_pages = charged.saturating_add(available).max(charged);
-            self.hard_pages = self.hard_pages.max(self.budget_pages);
+            self.recalibrate_to(available);
         }
         Ok(())
+    }
+
+    /// The budget as the device states it: what is charged plus the
+    /// `available` pages under the ceiling, and never under the pledge.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    fn recalibrate_to(&mut self, available: u64) {
+        let charged = self.committed_pages + self.held_pages;
+        self.budget_pages = charged.saturating_add(available).max(self.pledged_pages);
+        self.hard_pages = self.hard_pages.max(self.budget_pages);
     }
 
     fn acquire_handle(&self, bytes: u64) -> Result<u64> {
@@ -223,7 +259,8 @@ impl PhysicalPool {
             let mut handle: dr::CUmemGenericAllocationHandle = 0;
             // SAFETY: `handle` and `prop` are live locals; the handle is
             // released exactly once, by `release_handle`.
-            let made = unsafe { dr::cuMemCreate(&raw mut handle, bytes as usize, &raw const prop, 0) };
+            let made =
+                unsafe { dr::cuMemCreate(&raw mut handle, bytes as usize, &raw const prop, 0) };
             said("cuMemCreate", made)?;
             Ok(handle)
         }
@@ -284,16 +321,24 @@ impl Want {
     }
 }
 
+/// The unit an arena of `max_bytes` maps in: a 256th of it, held between the
+/// driver's granularity and the pool's handle size, so a small arena is
+/// backed in small pieces and a large one in few handles.
+#[must_use]
+pub fn map_unit_for(max_bytes: u64, granularity: u64, handle_bytes: u64) -> u64 {
+    let ceiling = align_up(max_bytes, granularity).max(granularity);
+    align_up(
+        (max_bytes / HANDLES_PER_ARENA)
+            .clamp(granularity, handle_bytes)
+            .min(ceiling),
+        granularity,
+    )
+    .max(granularity)
+}
+
 impl Arena {
     pub fn reserve(pool: &PhysicalPool, max_bytes: u64, label: &'static str) -> Result<Arena> {
-        let ceiling = align_up(max_bytes, pool.granularity).max(pool.granularity);
-        let map_unit = align_up(
-            (max_bytes / HANDLES_PER_ARENA)
-                .clamp(pool.granularity, pool.handle_bytes)
-                .min(ceiling),
-            pool.granularity,
-        )
-        .max(pool.granularity);
+        let map_unit = map_unit_for(max_bytes, pool.granularity, pool.handle_bytes);
         let virtual_bytes = align_up(max_bytes, map_unit);
         if virtual_bytes == 0 {
             return Ok(Arena {
@@ -351,6 +396,11 @@ impl Arena {
     #[must_use]
     pub const fn max_bytes(&self) -> u64 {
         self.max_bytes
+    }
+
+    #[must_use]
+    pub const fn map_unit(&self) -> u64 {
+        self.map_unit
     }
 
     #[must_use]
@@ -601,9 +651,12 @@ pub struct Target<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Commit {
     Committed,
+    /// The growth this commit would map, and the pages the pool had left
+    /// for it: a refusal is the first past the second, never the footprint
+    /// against the whole budget.
     Exhausted {
-        required: u64,
-        budget: u64,
+        growth: u64,
+        spare: u64,
     },
     Impossible {
         required: u64,
@@ -633,16 +686,19 @@ pub fn commit_atomically(pool: &mut PhysicalPool, targets: &mut [Target<'_>]) ->
     }
     if !pool.try_reserve(growth) {
         return Ok(Commit::Exhausted {
-            required,
-            budget: pool.budget_pages(),
+            growth,
+            spare: pool.spare_pages(),
         });
     }
     let was: Vec<(Vec<usize>, usize)> = targets
         .iter()
         .zip(&wanted)
         .map(|(target, units)| {
-            let fresh: Vec<usize> =
-                units.iter().copied().filter(|&u| target.arena.unbacked(u)).collect();
+            let fresh: Vec<usize> = units
+                .iter()
+                .copied()
+                .filter(|&u| target.arena.unbacked(u))
+                .collect();
             (fresh, target.arena.cached.len())
         })
         .collect();
@@ -659,6 +715,43 @@ pub fn commit_atomically(pool: &mut PhysicalPool, targets: &mut [Target<'_>]) ->
     }
     pool.mark_committed(growth);
     Ok(Commit::Committed)
+}
+
+/// `bytes` on `device` that every device in `readers` may load and store,
+/// without turning on peer access for the whole device: that maps every
+/// later allocation into the peers, and freeing one then waits on a peer
+/// that may be spinning in a collective (#745). Held for the process's life.
+#[cfg(feature = "cuda")]
+pub fn shared(device: i32, readers: &[i32], bytes: u64) -> Result<u64> {
+    use cudarc::driver::sys as dr;
+
+    let granularity = allocation_granularity(device)?;
+    let bytes = align_up(bytes, granularity) as usize;
+    let prop = allocation_prop(device);
+    let mut handle: dr::CUmemGenericAllocationHandle = 0;
+    let mut base: dr::CUdeviceptr = 0;
+    let mut readers = readers.to_vec();
+    readers.sort_unstable();
+    readers.dedup();
+    let descs: Vec<dr::CUmemAccessDesc> = readers.iter().map(|&d| access_desc(d)).collect();
+    // SAFETY: live locals as out-parameters; the range is mapped to the
+    // handle just made, and neither is released.
+    unsafe {
+        said(
+            "cuMemCreate",
+            dr::cuMemCreate(&raw mut handle, bytes, &raw const prop, 0),
+        )?;
+        said(
+            "cuMemAddressReserve",
+            dr::cuMemAddressReserve(&raw mut base, bytes, granularity as usize, 0, 0),
+        )?;
+        said("cuMemMap", dr::cuMemMap(base, bytes, 0, handle, 0))?;
+        said(
+            "cuMemSetAccess",
+            dr::cuMemSetAccess(base, bytes, descs.as_ptr(), descs.len()),
+        )?;
+    }
+    Ok(base)
 }
 
 #[cfg(feature = "cuda")]
@@ -721,7 +814,55 @@ mod tests {
     #[test]
     fn elastic_every_case() {
         a_promise_charges_the_budget_before_it_is_a_mapping();
+        a_pledge_outlives_what_the_device_reports_free();
         a_partial_page_is_a_whole_page();
+    }
+
+    fn a_pledge_outlives_what_the_device_reports_free() {
+        // Issue #672: the fit declared the pool from what the card had left
+        // and the runtime admitted a c64 frame against it, then a fire took
+        // room beside the pool and the recalibration under the frame's
+        // commit budgeted only what was free, refusing the growth as
+        // retryable past static admission.
+        let mut pool = PhysicalPool::stated(100 * LOGICAL_PAGE_BYTES);
+        pool.pledge(90);
+        assert_eq!(
+            pool.budget_pages(),
+            100,
+            "a pledge under the budget changes nothing"
+        );
+        assert!(pool.try_reserve(40));
+        pool.mark_committed(40);
+
+        pool.recalibrate_to(20);
+        assert_eq!(
+            pool.budget_pages(),
+            90,
+            "the device says 60; the pledge stands"
+        );
+        assert_eq!(pool.spare_pages(), 50);
+        assert!(
+            pool.try_reserve(50),
+            "the frame inside the pledge is admitted"
+        );
+        pool.mark_committed(50);
+        assert_eq!(pool.spare_pages(), 0);
+        assert!(!pool.try_reserve(1), "and the pledge is where it ends");
+
+        pool.recalibrate_to(30);
+        assert_eq!(
+            pool.budget_pages(),
+            120,
+            "past the pledge the device's word stands"
+        );
+        assert_eq!(pool.spare_pages(), 30);
+
+        let mut unpledged = PhysicalPool::stated(100 * LOGICAL_PAGE_BYTES);
+        assert!(unpledged.try_reserve(40));
+        unpledged.mark_committed(40);
+        unpledged.recalibrate_to(20);
+        assert_eq!(unpledged.budget_pages(), 60);
+        assert!(!unpledged.try_reserve(50), "as it was without one");
     }
 
     fn a_promise_charges_the_budget_before_it_is_a_mapping() {
@@ -743,5 +884,4 @@ mod tests {
         assert_eq!(pages_for_bytes(LOGICAL_PAGE_BYTES), 1);
         assert_eq!(pages_for_bytes(LOGICAL_PAGE_BYTES + 1), 2);
     }
-
 }

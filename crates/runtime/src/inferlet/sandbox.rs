@@ -11,6 +11,7 @@ pub struct InstancePolicy {
     pub(crate) network: NetworkPolicy,
 }
 
+#[cfg(test)]
 impl InstancePolicy {
     pub(crate) fn deny_all() -> Self {
         Self {

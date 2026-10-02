@@ -152,6 +152,88 @@ fn serving_artifact_every_case() {
     an_artifact_for_another_shell_is_refused_naming_the_field();
     a_tp1_artifact_stripped_of_its_serving_key_is_an_ordinary_checkpoint();
     every_weight_carries_a_layout_ztensor_itself_defines();
+    a_mounted_artifact_is_served_and_verified_out_of_memory();
+    a_chunked_mount_is_verified_across_its_seams();
+}
+
+fn a_chunked_mount_is_verified_across_its_seams() {
+    let fixture = Fixture::blocked("chunked", emit::SERVING_ALIGN);
+    let bytes = std::fs::read(&fixture.path).unwrap();
+    let fake = Path::new("/nowhere/on/this/machine/qwen--qwen3-30b-a3b.qwen_3.cuda-tp1.mxfp4.zt");
+    let parts: Vec<std::sync::Arc<[u8]>> = bytes.chunks(100_003).map(Into::into).collect();
+    assert!(parts.len() > 4, "{} chunks", parts.len());
+    ztensor::memfs::mount_chunks(fake, parts);
+
+    let artifact = Artifact::open(fake).unwrap();
+    assert!(artifact.source().store(ztensor::StoreId(0)).is_memory());
+    assert_eq!(artifact.mapped_len(), bytes.len() as u64);
+    assert_eq!(artifact.stamp(), &stamp());
+    assert_eq!(&*artifact.object_bytes("embed").unwrap(), fixture.embed);
+    assert_eq!(
+        &*artifact.object_bytes("layer.0.norm").unwrap(),
+        fixture.norm
+    );
+    let err = artifact.object("embed").unwrap_err().to_string();
+    assert!(err.contains("two chunks"), "{err}");
+    assert!(artifact.plane("embed").is_err());
+    artifact.verify_all().unwrap();
+    assert_eq!(serve::stamp_of(fake).unwrap(), Some(stamp()));
+    assert_eq!(serve::read_head(fake).unwrap().0, stamp());
+    assert_eq!(
+        checkpoint::file::zt::artifact_identity(fake).unwrap(),
+        checkpoint::file::zt::artifact_identity(&fixture.path).unwrap()
+    );
+
+    let mut rotten = bytes.clone();
+    let blob = &artifact.manifest().objects["embed"].blob;
+    rotten[(blob.offset + blob.length - 5) as usize] ^= 0xa5;
+    let parts: Vec<std::sync::Arc<[u8]>> = rotten.chunks(100_003).map(Into::into).collect();
+    ztensor::memfs::mount_chunks(fake, parts);
+    let err = Artifact::open(fake)
+        .unwrap()
+        .verify(&["embed"])
+        .unwrap_err();
+    assert!(err.to_string().contains("embed"), "{err}");
+
+    ztensor::memfs::unmount(fake);
+    assert!(Artifact::open(fake).is_err());
+}
+
+fn a_mounted_artifact_is_served_and_verified_out_of_memory() {
+    let fixture = Fixture::blocked("mounted", emit::SERVING_ALIGN);
+    let bytes = std::fs::read(&fixture.path).unwrap();
+    let fake = Path::new("/nowhere/on/this/machine/qwen--qwen3-30b-a3b.qwen_3.cuda-tp1.mxfp4.zt");
+    ztensor::memfs::mount(fake, std::sync::Arc::from(bytes.as_slice()));
+
+    let artifact = Artifact::open(fake).unwrap();
+    assert!(artifact.source().store(ztensor::StoreId(0)).is_memory());
+    assert_eq!(artifact.mapped_len(), bytes.len() as u64);
+    assert_eq!(artifact.stamp(), &stamp());
+    assert_eq!(artifact.plane("embed").unwrap(), fixture.embed);
+    assert_eq!(
+        artifact.plane("layer.0.expert_down_bank.scales").unwrap(),
+        fixture.scales,
+    );
+    artifact.verify_all().unwrap();
+    assert_eq!(serve::stamp_of(fake).unwrap(), Some(stamp()));
+    assert_eq!(serve::read_head(fake).unwrap().0, stamp());
+    assert_eq!(
+        checkpoint::file::zt::artifact_identity(fake).unwrap(),
+        checkpoint::file::zt::artifact_identity(&fixture.path).unwrap()
+    );
+
+    let mut rotten = bytes.clone();
+    let blob = &artifact.manifest().objects["layer.0.norm"].blob;
+    rotten[(blob.offset + 5) as usize] ^= 0xa5;
+    ztensor::memfs::mount(fake, std::sync::Arc::from(rotten.as_slice()));
+    let err = Artifact::open(fake)
+        .unwrap()
+        .verify(&["layer.0.norm"])
+        .unwrap_err();
+    assert!(err.to_string().contains("layer.0.norm"), "{err}");
+
+    ztensor::memfs::unmount(fake);
+    assert!(Artifact::open(fake).is_err());
 }
 
 fn every_plane_reads_back_as_the_bytes_that_were_written() {

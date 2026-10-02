@@ -42,6 +42,7 @@ pub enum BackendKind {
     Metal,
     Vulkan,
     Wgpu,
+    Xla,
     Unknown,
 }
 

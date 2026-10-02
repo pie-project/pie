@@ -302,6 +302,18 @@ fn the_hadamard_transform_agrees() {
         !hadamard_check_faults(512, 512),
         "block 512 with a matching last dim must pass validation"
     );
+
+    // Dtype guard: the sign diagonal rides the activation's element, so signs
+    // whose dtype differs from the activation are a validation fault caught by
+    // `model_ir::check` before the kernel would reject them at launch.
+    assert!(
+        hadamard_sign_dtype_faults(Dtype::F32, Dtype::Bf16),
+        "a Bf16 sign diagonal over an F32 activation must fail model-ir validation"
+    );
+    assert!(
+        !hadamard_sign_dtype_faults(Dtype::F32, Dtype::F32),
+        "a sign diagonal matching the activation's dtype must pass validation"
+    );
 }
 
 /// Build a one-node trace `x_out = hadamard(x, block)` with `x` of shape
@@ -348,5 +360,58 @@ fn hadamard_check_faults(d: u64, block: u32) -> bool {
         Err(faults) => faults
             .iter()
             .any(|f| matches!(f, model_ir::Fault::HadamardBlock { .. })),
+    }
+}
+
+/// Build a one-node trace `x_out = hadamard(x, 128, signs)` with an `act`-typed
+/// activation and a `sign`-typed sign diagonal, both a whole number of blocks
+/// wide, and report whether `model_ir::check` flags a `HadamardSignDtype` fault.
+fn hadamard_sign_dtype_faults(act: Dtype, sign: Dtype) -> bool {
+    use model_ir::{Def, Dim, Guard, Node, Platform, RuntimeInput, Trace, Ty, ValueDecl, ValueId};
+
+    let shape = vec![Dim::Tokens, Dim::Const(128)];
+    let x_ty = Ty::Tensor {
+        shape: shape.clone(),
+        dtype: act,
+    };
+    let sign_ty = Ty::Tensor { shape, dtype: sign };
+    let trace = Trace {
+        name: String::from("hadamard_sign_dtype_probe"),
+        platform: Platform::Metal,
+        params: Vec::new(),
+        caches: Vec::new(),
+        values: vec![
+            ValueDecl {
+                def: Def::Input(RuntimeInput::Tokens),
+                ty: x_ty.clone(),
+            },
+            ValueDecl {
+                def: Def::Input(RuntimeInput::Tokens),
+                ty: sign_ty,
+            },
+            ValueDecl {
+                def: Def::Op(0),
+                ty: x_ty,
+            },
+        ],
+        nodes: vec![Node {
+            op: Operation::Elementwise(Elementwise::Hadamard {
+                x: ValueId(0),
+                x_out: ValueId(2),
+                block: 128,
+                signs: Some(ValueId(1)),
+            }),
+            guard: Guard::Always,
+            layer: None,
+        }],
+        seams: Vec::new(),
+        drafter: None,
+    };
+
+    match model_ir::check(&trace) {
+        Ok(()) => false,
+        Err(faults) => faults
+            .iter()
+            .any(|f| matches!(f, model_ir::Fault::HadamardSignDtype { .. })),
     }
 }

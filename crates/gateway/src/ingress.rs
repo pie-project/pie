@@ -1,3 +1,4 @@
+pub mod compat;
 pub mod http;
 pub mod identity;
 pub mod ws;
@@ -10,8 +11,15 @@ use axum::{
 use crate::GatewayState;
 
 pub fn router(state: GatewayState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/v1/generate", post(http::generate)) // REST + SSE, one-shot
         .route("/v1/ws", get(ws::ws)) // WebSocket, multi-turn
+        .route("/v1/models", get(compat::models));
+    // The API-compatible routes: each a relay to one built-in inferlet.
+    compat::ROUTES
+        .iter()
+        .fold(router, |router, (path, inferlet)| {
+            router.route(path, compat::route(inferlet))
+        })
         .with_state(state)
 }

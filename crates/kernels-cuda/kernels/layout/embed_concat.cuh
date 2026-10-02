@@ -55,6 +55,7 @@ __global__ void embed_concat_mlxu4(
     int width,
     int group,
     int vocab,
+    int offset,
     const EmbedTableBases* __restrict__ bases,
     unsigned int* __restrict__ hits,
     const u32* __restrict__ win)
@@ -86,7 +87,7 @@ __global__ void embed_concat_mlxu4(
     const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
     const long long at = (row * heads + h) * (long long)width + w;
 
-    const int id = ids[row * heads + h];
+    const int id = ids[row * heads + h] - offset;
     if (id < 0 || id >= vocab) {
         y[at] = Elem<T>::from_f32(0.f);
         return;
@@ -113,6 +114,7 @@ __global__ void embed_concat_mlxu8(
     int width,
     int group,
     int vocab,
+    int offset,
     const EmbedTableBases* __restrict__ bases,
     unsigned int* __restrict__ hits,
     const u32* __restrict__ win)
@@ -144,7 +146,7 @@ __global__ void embed_concat_mlxu8(
     const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
     const long long at = (row * heads + h) * (long long)width + w;
 
-    const int id = ids[row * heads + h];
+    const int id = ids[row * heads + h] - offset;
     if (id < 0 || id >= vocab) {
         y[at] = Elem<T>::from_f32(0.f);
         return;

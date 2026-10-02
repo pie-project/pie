@@ -728,8 +728,12 @@ impl Context {
         }
     }
 
+    /// What the working set has left now: less this process's allocations
+    /// and, where the driver reports a budget, what other processes hold of
+    /// the device-local heap.
     #[must_use]
-    pub fn used(&self) -> u64 {
+    pub fn left(&self) -> u64 {
+        let mut used = self.core.allocated.load(Ordering::Relaxed);
         if self.core.features.memory_budget {
             let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
             let mut props = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
@@ -738,20 +742,19 @@ impl Context {
                     .instance
                     .get_physical_device_memory_properties2(self.core.physical, &mut props);
             }
-            let heaps = self.core.memory.memory_heap_count as usize;
-            let local = (0..heaps)
-                .filter(|&i| {
-                    self.core.memory.memory_heaps[i]
-                        .flags
-                        .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-                })
-                .map(|i| budget.heap_usage[i])
-                .max();
-            if let Some(used) = local {
-                return used;
+            let heaps =
+                &self.core.memory.memory_heaps[..self.core.memory.memory_heap_count as usize];
+            if let Some((i, heap)) = heaps
+                .iter()
+                .enumerate()
+                .filter(|(_, heap)| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+                .max_by_key(|(_, heap)| heap.size)
+            {
+                let free = budget.heap_budget[i].saturating_sub(budget.heap_usage[i]);
+                used = heap.size.saturating_sub(free);
             }
         }
-        self.core.allocated.load(Ordering::Relaxed)
+        self.working_set.saturating_sub(used)
     }
 
     pub fn bind_thread(&self) -> Result<()> {
@@ -1099,12 +1102,34 @@ impl Frame {
         into_at: u64,
         len: u64,
     ) -> Result<()> {
-        if len == 0 {
+        self.copy_regions(source, into, &[(source_at, into_at, len)])
+    }
+
+    /// Copies each `(source_at, into_at, len)` region of `source` into
+    /// `into` under one pair of barriers; a host-mapped `into` is made
+    /// visible to the host once the frame's fence signals.
+    pub fn copy_regions(
+        &mut self,
+        source: &Buffer,
+        into: &Buffer,
+        regions: &[(u64, u64, u64)],
+    ) -> Result<()> {
+        let regions: Vec<vk::BufferCopy> = regions
+            .iter()
+            .filter(|&&(_, _, len)| len > 0)
+            .map(|&(source_at, into_at, len)| {
+                source.span(source_at, len)?;
+                into.span(into_at, len)?;
+                Ok(vk::BufferCopy::default()
+                    .src_offset(source_at)
+                    .dst_offset(into_at)
+                    .size(len))
+            })
+            .collect::<Result<_>>()?;
+        if regions.is_empty() {
             return Ok(());
         }
-        source.span(source_at, len)?;
-        into.span(into_at, len)?;
-        let (source, into) = (source.slab(), into.slab());
+        let (read_back, source, into) = (into.is_host(), source.slab(), into.slab());
         let d = &self.inner.core.device;
         let cmd = self.inner.cmd;
         unsafe {
@@ -1120,22 +1145,21 @@ impl Frame {
                 &[],
                 &[],
             );
-            d.cmd_copy_buffer(
-                cmd,
-                source.buffer,
-                into.buffer,
-                &[vk::BufferCopy::default()
-                    .src_offset(source_at)
-                    .dst_offset(into_at)
-                    .size(len)],
-            );
+            d.cmd_copy_buffer(cmd, source.buffer, into.buffer, &regions);
+            let (host_stage, host_read) = if read_back {
+                (vk::PipelineStageFlags::HOST, vk::AccessFlags::HOST_READ)
+            } else {
+                (vk::PipelineStageFlags::empty(), vk::AccessFlags::empty())
+            };
             let after = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+                .dst_access_mask(
+                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | host_read,
+                );
             d.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | host_stage,
                 vk::DependencyFlags::empty(),
                 &[after],
                 &[],

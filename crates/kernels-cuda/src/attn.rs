@@ -14,6 +14,8 @@ pub mod plan;
 
 pub mod pool;
 
+pub mod selected;
+
 pub mod sched;
 
 pub mod sched_decode;
@@ -184,7 +186,13 @@ fn fa2_decode(
             fa2::decode(ctx, op, point(arm), &params)?;
         }
         Some(rel) => {
-            rel_table(op, &rel.bias, q.data.rows, plan.shape.num_q_heads, rel.extent)?;
+            rel_table(
+                op,
+                &rel.bias,
+                q.data.rows,
+                plan.shape.num_q_heads,
+                rel.extent,
+            )?;
             let arm = fa2::decode_rel_arm(plan.full_attention_variant(), window_left);
             let params = DecodeRelParams {
                 base: params,
@@ -266,7 +274,13 @@ fn fa2_prefill(
                     "the relative-bias arm is causal and takes no custom mask",
                 ));
             }
-            rel_table(op, &rel.bias, q.data.rows, plan.shape.num_q_heads, rel.extent)?;
+            rel_table(
+                op,
+                &rel.bias,
+                q.data.rows,
+                plan.shape.num_q_heads,
+                rel.extent,
+            )?;
             let arm = fa2::prefill_rel_arm(plan.full_attention_variant(), window_left);
             let params = PrefillRelParams {
                 base: params,
@@ -299,7 +313,9 @@ pub fn decode(
 ) -> Result<(), Error> {
     const OP: &str = "attention.decode";
     plan.accepts(OP, head_dim, window)?;
-    fa2_decode(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None)
+    fa2_decode(
+        ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -316,7 +332,19 @@ pub fn decode_lse(
 ) -> Result<(), Error> {
     const OP: &str = "attention.decode_lse";
     plan.accepts(OP, head_dim, window)?;
-    fa2_decode(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, Some(lse), None)
+    fa2_decode(
+        ctx,
+        OP,
+        q,
+        plan,
+        pool,
+        window,
+        head_dim,
+        sm_scale,
+        o,
+        Some(lse),
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -333,7 +361,9 @@ pub fn prefill(
 ) -> Result<(), Error> {
     const OP: &str = "attention.prefill";
     plan.accepts(OP, head_dim, Some(kv_heads), window)?;
-    fa2_prefill(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None, None)
+    fa2_prefill(
+        ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None, None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -404,6 +434,44 @@ pub fn masked(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn masked_lse(
+    ctx: &Ctx,
+    q: RaggedTensor,
+    plan: &PrefillPlan,
+    mask: Tensor,
+    pool: &KvPool,
+    window: Option<u32>,
+    head_dim: u32,
+    sm_scale: f32,
+    o: &mut Tensor,
+    lse: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.masked_lse";
+    debug_assert_eq!(mask.dtype, Dtype::U8, "`{OP}` reads packed u8 mask bits");
+    plan.accepts(OP, head_dim, None, window)?;
+    let Some(mask_indptr) = plan.mask_indptr else {
+        return Err(refuse(
+            OP,
+            "no mask span table rides this prefill plan; the engine binds one at plan build",
+        ));
+    };
+    fa2_prefill(
+        ctx,
+        OP,
+        q,
+        plan,
+        pool,
+        window,
+        head_dim,
+        sm_scale,
+        o,
+        Some(lse),
+        Some((mask, mask_indptr)),
+        None,
+    )
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RelBias {
     pub bias: Tensor,
@@ -412,9 +480,21 @@ pub struct RelBias {
     pub log_alpha: f32,
 }
 
-fn rel_table(op: &'static str, bias: &Tensor, rows: u32, heads: u32, extent: u32) -> Result<(), Error> {
+fn rel_table(
+    op: &'static str,
+    bias: &Tensor,
+    rows: u32,
+    heads: u32,
+    extent: u32,
+) -> Result<(), Error> {
     if bias.dtype != Dtype::F32 {
-        return Err(refuse(op, format!("the relative-bias table is {:?}, and the score adds f32", bias.dtype)));
+        return Err(refuse(
+            op,
+            format!(
+                "the relative-bias table is {:?}, and the score adds f32",
+                bias.dtype
+            ),
+        ));
     }
     let width = u64::from(heads) * u64::from(extent);
     if bias.rows != rows || u64::from(bias.width) != width {
@@ -443,7 +523,19 @@ pub fn decode_rel(
 ) -> Result<(), Error> {
     const OP: &str = "attention.decode_rel";
     plan.accepts(OP, head_dim, window)?;
-    fa2_decode(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, Some(rel))
+    fa2_decode(
+        ctx,
+        OP,
+        q,
+        plan,
+        pool,
+        window,
+        head_dim,
+        sm_scale,
+        o,
+        None,
+        Some(rel),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -461,7 +553,20 @@ pub fn prefill_rel(
 ) -> Result<(), Error> {
     const OP: &str = "attention.prefill_rel";
     plan.accepts(OP, head_dim, Some(kv_heads), window)?;
-    fa2_prefill(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None, Some(rel))
+    fa2_prefill(
+        ctx,
+        OP,
+        q,
+        plan,
+        pool,
+        window,
+        head_dim,
+        sm_scale,
+        o,
+        None,
+        None,
+        Some(rel),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -657,16 +762,31 @@ pub fn res_blend(
         ));
     }
     let plane_bytes = u64::from(y.rows) * u64::from(y.width) * 2;
-    for pair in blocks.windows(2) {
-        if pair[1].ptr != pair[0].ptr.wrapping_add(plane_bytes) {
-            return Err(refuse(
+    let stacked = blocks
+        .windows(2)
+        .all(|pair| pair[1].ptr == pair[0].ptr.wrapping_add(plane_bytes));
+    // The kernel walks `blocks + (j * rows + t) * hidden`. The planner does not
+    // place the closed blocks side by side (they are residual snapshots taken
+    // layers apart), so scattered ones are staged into one stacked scratch.
+    let first = if stacked {
+        blocks.first().map_or(prefix.ptr, |b| b.ptr)
+    } else {
+        let span = usize::try_from(plane_bytes)
+            .ok()
+            .and_then(|p| p.checked_mul(blocks.len()))
+            .ok_or_else(|| refuse(OP, "the stacked blocks do not fit a usize"))?;
+        let stack = ctx.scratch(OP, "elemwise.res_blend_blocks", span)? as usize as u64;
+        for (j, block) in blocks.iter().enumerate() {
+            stage_plane(
+                ctx,
                 OP,
-                "the candidate blocks do not land as stacked planes; the kernel walks \
-                 `blocks + (j * rows + t) * hidden` and cannot gather scattered slots",
-            ));
+                stack + j as u64 * plane_bytes,
+                block.ptr,
+                plane_bytes,
+            )?;
         }
-    }
-    let first = blocks.first().map_or(prefix.ptr, |b| b.ptr);
+        stack
+    };
     ctx.fire(
         OP,
         Fire::at(
@@ -687,4 +807,37 @@ pub fn res_blend(
             ctx.stage(),
         ],
     )
+}
+
+/// One device-to-device plane copy on the context's stream.
+fn stage_plane(ctx: &Ctx, op: &'static str, dst: u64, src: u64, bytes: u64) -> Result<(), Error> {
+    #[cfg(feature = "cuda")]
+    {
+        use cudarc::runtime::sys as rt;
+
+        let code = unsafe {
+            rt::cudaMemcpyAsync(
+                dst as usize as *mut core::ffi::c_void,
+                src as usize as *const core::ffi::c_void,
+                usize::try_from(bytes).map_err(|_| refuse(op, "a plane wider than usize"))?,
+                rt::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                ctx.stream().cast(),
+            )
+        };
+        if code != rt::cudaError::cudaSuccess {
+            return Err(refuse(
+                op,
+                format!(
+                    "`cudaMemcpyAsync` answered {} stacking a block",
+                    code as i32
+                ),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (ctx, dst, src, bytes);
+        Err(crate::jit::runtimeless(op))
+    }
 }

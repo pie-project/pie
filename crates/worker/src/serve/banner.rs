@@ -67,7 +67,3 @@ impl StartupBanner {
         out
     }
 }
-
-pub(super) fn ready_line(url: &str) -> String {
-    format!("✓ Server ready at {url}")
-}

@@ -180,7 +180,11 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
                     fire.patch_classes().lanes_of(&region.mask),
                     "and its lane count is images",
                 );
-                assert_eq!(window.span(), window.on(RowAxis::Patches), "one axis, one window");
+                assert_eq!(
+                    window.span(),
+                    window.on(RowAxis::Patches),
+                    "one axis, one window"
+                );
             }
             RowAxis::Tokens => {
                 trunks += 1;
@@ -253,7 +257,11 @@ fn a_fire_with_no_image_gets_the_token_windows_it_always_had() {
             assert_eq!(a.span(), b.span(), "region {at}'s token window moved");
             assert_eq!(a.indptr_host, b.indptr_host);
         }
-        assert_eq!(a.on(RowAxis::Patches).rows, 0, "region {at} found patch rows in a text fire");
+        assert_eq!(
+            a.on(RowAxis::Patches).rows,
+            0,
+            "region {at} found patch rows in a text fire"
+        );
     }
     assert_eq!(plain.patch_rows(), 0);
     assert_eq!(mixed.patch_rows(), 128);

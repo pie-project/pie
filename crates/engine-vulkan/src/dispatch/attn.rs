@@ -173,6 +173,52 @@ impl Run<'_> {
                 &kernels_vulkan::tuning::current(),
             ),
 
+            Attention::DecodeSelected {
+                q,
+                plan,
+                selection,
+                cache,
+                window,
+                head_dim,
+                sm_scale,
+                ratio,
+                o,
+            } => attn::decode_selected(
+                self.ctx(),
+                self.tensor(*q),
+                self.decode_plan(*plan),
+                self.tensor(*selection),
+                self.pool(*cache),
+                *window,
+                *head_dim,
+                *sm_scale,
+                *ratio,
+                self.tensor(*o),
+            ),
+            Attention::PrefillSelected {
+                q,
+                plan,
+                selection,
+                cache,
+                window,
+                head_dim,
+                kv_heads,
+                sm_scale,
+                ratio,
+                o,
+            } => attn::prefill_selected(
+                self.ctx(),
+                self.ragged(*q),
+                self.prefill_plan(*plan),
+                self.tensor(*selection),
+                self.pool(*cache),
+                *window,
+                *head_dim,
+                *kv_heads,
+                *sm_scale,
+                *ratio,
+                self.tensor(*o),
+            ),
             Attention::Dense {
                 q,
                 k,
@@ -192,6 +238,7 @@ impl Run<'_> {
                 self.tensor(*o),
             ),
             Attention::Masked { causal: false, .. }
+            | Attention::MaskedLse { causal: false, .. }
             | Attention::BlockDynConv { .. }
             | Attention::SelectorWalk { .. }
             | Attention::Ragged { .. } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
@@ -222,6 +269,32 @@ impl Run<'_> {
                 *head_dim,
                 *sm_scale,
                 self.tensor(*o),
+                self.requests(),
+                &kernels_vulkan::tuning::current(),
+            ),
+            Attention::MaskedLse {
+                q,
+                plan,
+                mask,
+                cache,
+                window,
+                head_dim,
+                kv_heads: _,
+                causal: _,
+                sm_scale,
+                o,
+                lse,
+            } => attn::arbiter::masked_lse(
+                self.ctx(),
+                self.ragged(*q),
+                self.prefill_plan(*plan),
+                self.cut_rows(self.tensor(*mask)),
+                self.pool(*cache),
+                *window,
+                *head_dim,
+                *sm_scale,
+                self.tensor(*o),
+                self.tensor(*lse),
                 self.requests(),
                 &kernels_vulkan::tuning::current(),
             ),
@@ -584,8 +657,13 @@ impl Run<'_> {
                 primes,
                 offsets,
                 heads_per_ngram,
+                map,
                 ngram_ids,
             } => {
+                if map.is_some() {
+                    // Engram's id map is not carried by this backend's hasher yet.
+                    return Err(kernels_vulkan::Error::Unsupported { op: op.name() });
+                }
                 let Some(hash) = self.ple_hash(mults, primes, offsets) else {
                     return Err(kernels_vulkan::Error::Unsupported { op: op.name() });
                 };
@@ -610,8 +688,13 @@ impl Run<'_> {
                 primes,
                 offsets,
                 heads_per_ngram,
+                map,
                 ngram_ids,
             } => {
+                if map.is_some() {
+                    // Engram's id map is not carried by this backend's hasher yet.
+                    return Err(kernels_vulkan::Error::Unsupported { op: op.name() });
+                }
                 let Some(hash) = self.ple_hash(mults, primes, offsets) else {
                     return Err(kernels_vulkan::Error::Unsupported { op: op.name() });
                 };
@@ -975,7 +1058,7 @@ impl Run<'_> {
                 attn::index::topk(
                     self.ctx(),
                     self.tensor(*q),
-                    self.tensor(*weights),
+                    weights.map(|w| self.tensor(w)),
                     self.pool(*keys),
                     self.cut_rows(positions),
                     self.cut_rows(request_of_token),
@@ -1000,6 +1083,22 @@ impl Run<'_> {
                 self.tensor(*write_offset),
             ),
 
+            Attention::IndexBlockMean {
+                boundary_pos,
+                boundary_req,
+                keys,
+                head_dim,
+                ratio,
+                entries,
+            } => attn::index::block_mean(
+                self.ctx(),
+                self.tensor(*boundary_pos),
+                self.tensor(*boundary_req),
+                self.pool(*keys),
+                *head_dim,
+                *ratio,
+                self.tensor(*entries),
+            ),
             Attention::PoolBoundaryDecode {
                 positions,
                 row_valid,
@@ -1010,6 +1109,7 @@ impl Run<'_> {
             } => attn::pool::boundary_decode(
                 self.ctx(),
                 self.tensor(*positions),
+                self.cut_rows(self.bindings().tables.request_of_token),
                 self.tensor(*row_valid),
                 *ratio,
                 self.tensor(*boundary_pos),
@@ -1026,6 +1126,7 @@ impl Run<'_> {
             } => attn::pool::boundary_prefill(
                 self.ctx(),
                 self.ragged(*positions),
+                self.cut_rows(self.bindings().tables.request_of_token),
                 self.tensor(*row_valid),
                 *ratio,
                 self.tensor(*boundary_pos),

@@ -19,13 +19,25 @@ fn softmax_epilogue() -> TraceContainer {
             dtype: Dtype::F32,
         },
         Op::ReduceMax(0),
-        Op::Reshape { value: 1, shape: Shape::matrix(ROWS, 1) },
-        Op::Broadcast { value: 2, shape: Shape::matrix(ROWS, VOCAB) },
+        Op::Reshape {
+            value: 1,
+            shape: Shape::matrix(ROWS, 1),
+        },
+        Op::Broadcast {
+            value: 2,
+            shape: Shape::matrix(ROWS, VOCAB),
+        },
         Op::Sub(0, 3),
         Op::Exp(4),
         Op::ReduceSum(5),
-        Op::Reshape { value: 6, shape: Shape::matrix(ROWS, 1) },
-        Op::Broadcast { value: 7, shape: Shape::matrix(ROWS, VOCAB) },
+        Op::Reshape {
+            value: 6,
+            shape: Shape::matrix(ROWS, 1),
+        },
+        Op::Broadcast {
+            value: 7,
+            shape: Shape::matrix(ROWS, VOCAB),
+        },
         Op::Div(5, 8),
         Op::ChanPut { chan: 0, value: 9 },
     ];
@@ -40,13 +52,19 @@ fn softmax_epilogue() -> TraceContainer {
         names: Vec::new(),
         channels: vec![probs_out],
         ports: Vec::new(),
-        stages: vec![StageProgram { stage: Stage::Epilogue, ops }],
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops,
+        }],
         externs: Vec::new(),
     }
 }
 
 fn package() -> LaunchPackage {
-    let profile = ModelProfile { vocab: VOCAB, ..ModelProfile::dummy() };
+    let profile = ModelProfile {
+        vocab: VOCAB,
+        ..ModelProfile::dummy()
+    };
     let bound = bind(softmax_epilogue(), profile).expect("the softmax epilogue binds");
     let stages = compile_bound(&bound);
     eta_compiler::codegen::launch::build(&bound, &stages)

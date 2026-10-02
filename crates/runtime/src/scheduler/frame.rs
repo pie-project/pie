@@ -1,7 +1,8 @@
+use crate::rt::Instant;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::stats::SchedulerStats;
 use crate::scheduler::ProcessId;

@@ -220,10 +220,7 @@ fn fire_at(fixture: &Fixture, tokens: u32) -> engine_cuda::Result<(Vec<Vec<f32>>
     Ok((rows, start.elapsed().as_secs_f64() * 1e3))
 }
 
-fn fire_at_ungrouped(
-    fixture: &Fixture,
-    tokens: u32,
-) -> engine_cuda::Result<(Vec<Vec<f32>>, f64)> {
+fn fire_at_ungrouped(fixture: &Fixture, tokens: u32) -> engine_cuda::Result<(Vec<Vec<f32>>, f64)> {
     unsafe { std::env::set_var("PIE_NO_MOE_GROUP", "1") };
     let answer = fire_at(fixture, tokens);
     unsafe { std::env::remove_var("PIE_NO_MOE_GROUP") };

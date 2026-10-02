@@ -1,14 +1,18 @@
-
+//#include "common/bf16.inc.wgsl"
+//#include "common/affine.inc.wgsl"
+//#if defined(PIE_SUBGROUP)
+//#include "common/subgroup.inc.wgsl"
+//#endif
 
 const PIE_LANES = 32u;
-
+//#if defined(PIE_SUBGROUP)
 
 const PIE_ROWS_PER_HALF = 2u;
 const PIE_HALVES = 4u;
-
+//#else
 const PIE_ROWS_PER_HALF = 4u;
 const PIE_HALVES = 2u;
-
+//#endif
 
 @group(0) @binding(0) var<storage, read> w: array<u32>;
 @group(0) @binding(1) var<storage, read> scales: array<u32>;
@@ -22,12 +26,13 @@ struct Params {
 }
 @group(0) @binding(5) var<uniform> params: Params;
 
+//#if defined(PIE_SUBGROUP)
 const PIE_XS_WORDS = 4096u;
 var<workgroup> xs_shared: array<u32, PIE_XS_WORDS>;
 var<workgroup> xs_staged: u32;
-
+//#else
 var<workgroup> partials: array<f32, 256>;
-
+//#endif
 
 @compute @workgroup_size(32, PIE_HALVES, 1)
 fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) local: vec3<u32>) {
@@ -41,6 +46,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     let wpr = k / cpw;
     let gpr = k / u32(PIE_GROUP);
 
+//#if defined(PIE_SUBGROUP)
 
     let x_words = (k + 1u) >> 1u;
     let x_base = vec * k;
@@ -54,7 +60,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
         xs_staged = select(0u, 1u, staged);
     }
     workgroupBarrier();
-
+//#endif
     var acc = array<f32, PIE_ROWS_PER_HALF>();
     for (var j = lid; j < wpr; j = j + PIE_LANES) {
         let kb = j * cpw;
@@ -63,16 +69,16 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
         var xsum = 0.0;
         for (var i = 0u; i < cpw; i = i + 1u) {
             let e = vec * k + kb + i;
-
+//#if defined(PIE_SUBGROUP)
             var v = 0.0;
             if (xs_staged == 1u) {
                 v = pie_bf16_at(xs_shared[(kb + i) >> 1u], kb + i);
             } else {
                 v = pie_bf16_at(x[e >> 1u], e);
             }
-
+//#else
             let v = pie_bf16_at(x[e >> 1u], e);
-
+//#endif
             xw[i] = v;
             xsum = xsum + v;
         }
@@ -92,7 +98,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
             }
         }
     }
-
+//#if defined(PIE_SUBGROUP)
 
     for (var r = 0u; r < PIE_ROWS_PER_HALF; r = r + 1u) {
         acc[r] = pie_subgroup_sum32(acc[r]);
@@ -105,7 +111,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
             }
         }
     }
-
+//#else
     for (var r = 0u; r < PIE_ROWS_PER_HALF; r = r + 1u) {
         partials[(ly * PIE_ROWS_PER_HALF + r) * PIE_LANES + lid] = acc[r];
     }
@@ -129,6 +135,24 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
             }
         }
     }
-
+//#endif
 }
 
+// pie:instantiate affine_qmv_bf16_gs_32_b_2 PIE_GROUP=32 PIE_BITS=2
+// pie:instantiate affine_qmv_bf16_gs_32_b_4 PIE_GROUP=32 PIE_BITS=4
+// pie:instantiate affine_qmv_bf16_gs_32_b_8 PIE_GROUP=32 PIE_BITS=8
+// pie:instantiate affine_qmv_bf16_gs_64_b_2 PIE_GROUP=64 PIE_BITS=2
+// pie:instantiate affine_qmv_bf16_gs_64_b_4 PIE_GROUP=64 PIE_BITS=4
+// pie:instantiate affine_qmv_bf16_gs_64_b_8 PIE_GROUP=64 PIE_BITS=8
+// pie:instantiate affine_qmv_bf16_gs_128_b_2 PIE_GROUP=128 PIE_BITS=2
+// pie:instantiate affine_qmv_bf16_gs_128_b_4 PIE_GROUP=128 PIE_BITS=4
+// pie:instantiate affine_qmv_bf16_gs_128_b_8 PIE_GROUP=128 PIE_BITS=8
+// pie:instantiate affine_qmv_bf16_gs_32_b_2 @subgroup PIE_GROUP=32 PIE_BITS=2
+// pie:instantiate affine_qmv_bf16_gs_32_b_4 @subgroup PIE_GROUP=32 PIE_BITS=4
+// pie:instantiate affine_qmv_bf16_gs_32_b_8 @subgroup PIE_GROUP=32 PIE_BITS=8
+// pie:instantiate affine_qmv_bf16_gs_64_b_2 @subgroup PIE_GROUP=64 PIE_BITS=2
+// pie:instantiate affine_qmv_bf16_gs_64_b_4 @subgroup PIE_GROUP=64 PIE_BITS=4
+// pie:instantiate affine_qmv_bf16_gs_64_b_8 @subgroup PIE_GROUP=64 PIE_BITS=8
+// pie:instantiate affine_qmv_bf16_gs_128_b_2 @subgroup PIE_GROUP=128 PIE_BITS=2
+// pie:instantiate affine_qmv_bf16_gs_128_b_4 @subgroup PIE_GROUP=128 PIE_BITS=4
+// pie:instantiate affine_qmv_bf16_gs_128_b_8 @subgroup PIE_GROUP=128 PIE_BITS=8

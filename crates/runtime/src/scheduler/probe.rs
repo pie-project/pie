@@ -97,7 +97,7 @@ pub struct PostDispatchProbes {
 #[macro_export]
 macro_rules! probe_fire {
     ($target:expr, $body:expr) => {{
-        let __probe_start = ::std::time::Instant::now();
+        let __probe_start = $crate::rt::Instant::now();
         let __probe_result = $body;
         $target.fetch_add(
             __probe_start.elapsed().as_micros() as u64,
@@ -156,7 +156,7 @@ pub fn host_submit() -> &'static HostSubmitProbes {
 #[derive(Clone, Copy, Debug)]
 pub struct ProbeClock {
     #[cfg(feature = "profile-fire")]
-    began: std::time::Instant,
+    began: crate::rt::Instant,
 }
 
 impl ProbeClock {
@@ -164,7 +164,7 @@ impl ProbeClock {
     pub fn start() -> Self {
         Self {
             #[cfg(feature = "profile-fire")]
-            began: std::time::Instant::now(),
+            began: crate::rt::Instant::now(),
         }
     }
 

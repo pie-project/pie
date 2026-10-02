@@ -6,25 +6,32 @@ fn carries_a_head(sku: &str) -> bool {
 }
 
 fn masked_arms(trace: &Trace) -> usize {
-    trace.nodes
+    trace
+        .nodes
         .iter()
-        .filter(|node| matches!(node.op, Operation::Attention(Attention::Masked { .. })))
+        .filter(|node| {
+            matches!(
+                node.op,
+                Operation::Attention(Attention::Masked { .. } | Attention::MaskedLse { .. })
+            )
+        })
         .count()
 }
 
 #[test]
 fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
-    const DECLARE: [&str; 7] = [
+    const DECLARE: [&str; 8] = [
         "gemma4-",
         "diffusiongemma-",
+        "gptoss-",
         "hunyuanimage3-",
         "muse-glimmer-",
         "qwen35-",
         "qwen36-",
         "qwen38-",
     ];
-    const GAPPED: [&str; 4] = ["dsv4-", "glm5-", "gptoss-", "kimik3-"];
-    const MASKLESS_RIG: &str = "gptoss-20b-u4g64-mxfp4-kv-bf16";
+    const GAPPED: [&str; 3] = ["dsv4-", "glm5-", "kimik3-"];
+    const MASKLESS_RIG: &str = "glm5-a12b-bf16-kv-bf16";
 
     let mut declaring: Vec<(String, usize)> = Vec::new();
     let mut maskless: Vec<String> = Vec::new();
@@ -87,14 +94,8 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
     );
 }
 
-mod maskless {
-    
-}
+mod maskless {}
 
-mod devgeo {
-    
-}
+mod devgeo {}
 
-mod gemma {
-    
-}
+mod gemma {}

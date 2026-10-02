@@ -14,7 +14,7 @@ use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, L
 use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
-use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
+use engine::transfer::{KvCopy, MemoryDomain, StateCopy, StateDirection};
 use eta_ir::registry::{GeometryClass, ModelProfile, Port, PortMask};
 use eta_ir::types::Dtype;
 use model_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder, VoxelLadder};
@@ -528,11 +528,21 @@ intended for diagnostics, not serving",
                 .boot
                 .comm
                 .as_ref()
-                .map_or(core::ptr::null_mut(), |comm| comm.raw()),
+                .map_or(core::ptr::null(), Arc::as_ptr),
         })
         .map_err(fault)?;
 
         shell.mount_adapters(self.boot.adapter_dir.clone());
+        let host_kv_pages = shell
+            .seat_host_kv(residency.host_kv_budget, self.boot.world.size)
+            .map_err(fault)?;
+        let disk_kv_pages = shell
+            .seat_disk_kv(
+                residency.disk_kv_budget,
+                residency.disk_kv_dir.as_deref(),
+                self.boot.world,
+            )
+            .map_err(fault)?;
 
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
@@ -573,11 +583,21 @@ intended for diagnostics, not serving",
                     .unwrap_or(0),
                 elastic_page_bytes,
                 elastic_budget_pages,
+                window_pages: paging.window.map_or(0, |_| {
+                    u32::try_from(paging.window_pages()).unwrap_or(u32::MAX)
+                }),
+                window_tokens: paging.window.map_or(0, |window| window.tokens),
+                host_kv_pages,
+                host_window_pages: shell.host_window_pages(),
+                host_state_slots: shell.host_state_slots(),
+                disk_kv_pages,
             },
             limits: FireLimits {
-                max_lanes: budgets.max_lanes,
-                max_tokens: budgets.max_tokens,
-                max_page_refs: paging.pages_per_slot.saturating_mul(budgets.max_lanes),
+                max_lanes: shell.budget().max_lanes,
+                max_tokens: shell.budget().max_tokens,
+                max_page_refs: paging
+                    .pages_per_slot
+                    .saturating_mul(shell.budget().max_lanes),
                 max_context: paging.context(),
             },
             profile,
@@ -587,8 +607,8 @@ intended for diagnostics, not serving",
             geometry: GeometryClass::DeviceGeometry,
             kv_copy: KvCopyDomains {
                 device_to_device: true,
-                device_to_host: false,
-                host_to_device: false,
+                device_to_host: host_kv_pages > 0,
+                host_to_device: host_kv_pages > 0,
                 host_to_host: false,
             },
             kv_handle: None,
@@ -859,27 +879,57 @@ intended for diagnostics, not serving",
             }
         }
         let shell = self.loaded_mut()?;
-        for move_ in &copy.moves {
-            shell
-                .copy_state(move_.src_slot_id, move_.dst_slot_id)
-                .map_err(fault)?;
-        }
-        Ok(())
+        let to_host = match copy.direction {
+            StateDirection::DeviceToDevice => {
+                for move_ in &copy.moves {
+                    shell
+                        .copy_state(move_.src_slot_id, move_.dst_slot_id)
+                        .map_err(fault)?;
+                }
+                return Ok(());
+            }
+            StateDirection::DeviceToHost => true,
+            StateDirection::HostToDevice => false,
+        };
+        let moves: Vec<(u32, u32)> = copy
+            .moves
+            .iter()
+            .map(|m| {
+                if to_host {
+                    (m.src_slot_id, m.dst_slot_id)
+                } else {
+                    (m.dst_slot_id, m.src_slot_id)
+                }
+            })
+            .collect();
+        shell.copy_state_host(to_host, &moves).map_err(fault)
     }
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
-        let ordinal = self
-            .caps
-            .as_ref()
-            .map(|caps| caps.device.domain)
-            .and_then(MemoryDomain::ordinal);
-        let served = matches!(
-            (copy.src, copy.dst),
-            (MemoryDomain::CudaDevice(src), MemoryDomain::CudaDevice(dst))
-                if Some(src) == ordinal && Some(dst) == ordinal
-        );
-        if !served {
+        let device = self.caps.as_ref().map(|caps| caps.device.domain);
+        if let Some((tier, out, pages, slots)) = device.and_then(|device| copy.tier_move(device)) {
+            // The windowed pairs are stated in the copy's direction; the pool
+            // takes them as (device, host).
+            let windowed: Vec<(u32, u32)> = copy
+                .windowed
+                .iter()
+                .map(|&(src, dst)| if out { (src, dst) } else { (dst, src) })
+                .collect();
+            if tier == MemoryDomain::LocalDisk && !windowed.is_empty() {
+                return Err(Error::Unsupported {
+                    verb: "windowed kv pages to or from disk",
+                    engine: "cuda",
+                });
+            }
+            let shell = self.loaded_mut()?;
+            return match tier {
+                MemoryDomain::LocalDisk => shell.spill_kv(out, pages, slots),
+                _ => shell.swap_kv(out, pages, slots, &windowed),
+            }
+            .map_err(fault);
+        }
+        if device.is_none_or(|device| copy.src != device || copy.dst != device) {
             return Err(Error::Unsupported {
                 verb: kv_copy_direction(copy.src, copy.dst),
                 engine: "cuda",
@@ -944,9 +994,10 @@ intended for diagnostics, not serving",
                 )));
             }
         }
-        self.loaded_mut()?.copy_kv(&moves).map_err(fault)
+        self.loaded_mut()?
+            .copy_kv(&moves, !copy.moves.is_empty())
+            .map_err(fault)
     }
-
 }
 
 impl Cuda {
@@ -1012,6 +1063,8 @@ impl Cuda {
                     held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
                     kv_less: lane.kv_less,
                     translation: &lane.kv.translation,
+                    window: &lane.kv.window,
+                    window_copies: &lane.kv.window_copies,
                     mask: lane.mask.as_ref(),
                     adapter: lane_adapters[at].or(lane.adapter),
                     drafts: lane.drafts,
@@ -1020,6 +1073,7 @@ impl Cuda {
                     self_cond: lane.self_cond.as_ref(),
                     rs: lane.rs.clone(),
                     rs_reset: lane.rs_reset,
+                    rs_slot: lane.rs_slot,
                     readout: match &lane.readout {
                         Readout::Rows(rows) => Some(rows.as_slice()),
                         Readout::Last | Readout::None => None,
@@ -1028,6 +1082,7 @@ impl Cuda {
                     group: lane.group,
                     peer: lane.peer,
                     ports: &lane.ports,
+                    attn_classes: lane.attn_classes.as_ref(),
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;

@@ -38,10 +38,15 @@ pub fn walk(
     if first > 1 {
         return Err(refuse(
             OP,
-            format!("the first slot row is {first}; a span's anchor is row 0 and its first mask row 1"),
+            format!(
+                "the first slot row is {first}; a span's anchor is row 0 and its first mask row 1"
+            ),
         ));
     }
-    if cand.data.dtype != Dtype::I32 || cand.indptr.dtype != Dtype::I32 || tokens.dtype != Dtype::I32 {
+    if cand.data.dtype != Dtype::I32
+        || cand.indptr.dtype != Dtype::I32
+        || tokens.dtype != Dtype::I32
+    {
         return Err(refuse(OP, "the candidates, the CSR and the tokens are i32"));
     }
     if unary.dtype != Dtype::F32 || picks.dtype != Dtype::I32 {
@@ -49,11 +54,19 @@ pub fn walk(
     }
     let lanes = match cand.indptr.rows.checked_sub(1) {
         Some(lanes) if lanes > 0 => lanes,
-        _ => return Err(refuse(OP, "the request CSR this fire names spans no request")),
+        _ => {
+            return Err(refuse(
+                OP,
+                "the request CSR this fire names spans no request",
+            ));
+        }
     };
     let k = nonzero(OP, "candidates a slot", cand.data.width)?;
     if k > MAX_K {
-        return Err(refuse(OP, format!("{k} candidates a slot; the walk lanes out at {MAX_K}")));
+        return Err(refuse(
+            OP,
+            format!("{k} candidates a slot; the walk lanes out at {MAX_K}"),
+        ));
     }
     let rank = nonzero(OP, "the codebooks' rank", pred.width)?;
     if succ.width != rank || hp.is_some_and(|h| h.width != rank) {
@@ -70,23 +83,33 @@ pub fn walk(
     if pred.rows != succ.rows {
         return Err(refuse(
             OP,
-            format!("the codebooks disagree on the vocabulary: {} against {} rows", pred.rows, succ.rows),
+            format!(
+                "the codebooks disagree on the vocabulary: {} against {} rows",
+                pred.rows, succ.rows
+            ),
         ));
     }
     let vocab = nonzero(OP, "the codebooks' vocabulary", pred.rows)?;
     if unary.rows != cand.data.rows || unary.width != k {
-        return Err(refuse(OP, "the unary logits are not one row of `k` per candidate row"));
+        return Err(refuse(
+            OP,
+            "the unary logits are not one row of `k` per candidate row",
+        ));
     }
     if picks.rows != cand.data.rows
         || tokens.rows != cand.data.rows
         || hp.is_some_and(|h| h.rows != cand.data.rows)
     {
-        return Err(refuse(OP, "hp, tokens and picks carry one row per candidate row"));
+        return Err(refuse(
+            OP,
+            "hp, tokens and picks carry one row per candidate row",
+        ));
     }
     let hp_arg = hp.map_or_else(|| pred.arg(), |h| h.arg());
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::selector_walk<::pie::bf16>").apply(Launch::per_row(lanes, THREADS)),
+        Fire::at(FILE, "::pie::attn::selector_walk<::pie::bf16>")
+            .apply(Launch::per_row(lanes, THREADS)),
         &[
             cand.data.arg(),
             cand.indptr.arg(),

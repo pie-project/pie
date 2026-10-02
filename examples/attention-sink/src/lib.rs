@@ -1,0 +1,318 @@
+//! Generates with attention sinks and a sliding recent-token window.
+//!
+//! The prompt is prefilled once with normal causal attention. During decoding,
+//! each query attends to the first `sink_size` positions and the most recent
+//! `window_size` positions. Masked KV pages remain allocated in this example.
+//!
+//! Runs on both pass kinds. On a hybrid model the sink/window mask is a mask
+//! over the ATTENTION layers only — that is what `kv-geometry.mask` means on
+//! `pie:inferlet/forward-hybrid`, and the recurrent layers fold every token as
+//! usual. There is nothing to emulate there: a recurrence has no key it can
+//! decline to read.
+
+use inferlet::chat;
+use inferlet::eta::hybrid::prelude::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+struct Input {
+    #[serde(default = "default_prompt")]
+    prompt: String,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+    #[serde(default = "default_sink_size")]
+    sink_size: u32,
+    #[serde(default = "default_window_size")]
+    window_size: u32,
+}
+
+fn default_prompt() -> String {
+    "Tell me a long story about a cat.".into()
+}
+
+fn default_max_tokens() -> usize {
+    512
+}
+
+fn default_sink_size() -> u32 {
+    4
+}
+
+fn default_window_size() -> u32 {
+    64
+}
+
+/// The report every KV-policy program here answers with (`tova-attention`,
+/// `snapkv-eviction`, ...): the text, the counts, and what the policy did.
+/// `scripts/bench/pie_bench.py` reads `count`; a bare string is not a reply
+/// it can parse.
+#[derive(Serialize)]
+struct Output {
+    sampler: &'static str,
+    /// The continuation, greedily decoded.
+    text: String,
+    /// How many tokens it is.
+    count: usize,
+    /// Prompt tokens, chat-templated.
+    prompt_len: u32,
+    /// Leading positions every decode query may see.
+    sink_size: u32,
+    /// Recent positions a decode query may see (the input, floored at 1).
+    window_size: u32,
+    /// KV positions live at the last fire: the prompt plus every token fed
+    /// back.
+    kv_len: u32,
+    /// Keys the last fire's query could see, counted from the same rule that
+    /// built the first decode row (the rows after it evolve on the device).
+    /// The prefill is causal and sees the whole prompt; a decode row sees at
+    /// most `sink_size + window_size`.
+    visible_kv: u32,
+}
+
+fn host_sink_window_mask(pool_len: u32, query: u32, sink: u32, window: u32) -> Vec<bool> {
+    (0..pool_len)
+        .map(|key| key <= query && (key < sink || key.saturating_add(window) > query))
+        .collect()
+}
+
+/// The report after `fires` decode fires over an `n`-token prompt.
+fn report(generated: &[u32], n: u32, sink: u32, window: u32, fires: u32) -> Result<Output> {
+    let kv_len = n + fires;
+    let visible_kv = if fires == 0 {
+        n
+    } else {
+        host_sink_window_mask(kv_len, kv_len - 1, sink, window)
+            .iter()
+            .filter(|visible| **visible)
+            .count() as u32
+    };
+    Ok(Output {
+        sampler: "attention-sink",
+        text: model::decode(generated)?,
+        count: generated.len(),
+        prompt_len: n,
+        sink_size: sink,
+        window_size: window,
+        kv_len,
+        visible_kv,
+    })
+}
+
+#[inferlet::main]
+async fn main(input: Input) -> Result<Output> {
+    let sink = input.sink_size;
+    let window = input.window_size.max(1);
+    // **THE PAGE SIZE IS THE ENGINE'S, NOT A LITERAL.** This file carried
+    // `const page_t: u32 = 16` and every `w_slot`/`w_off` it derived was
+    // wrong on a model whose pages are any other width: the writes land in
+    // the wrong page at the wrong offset, the reads pull cells nothing wrote,
+    // and the pass answers fluent-looking garbage rather than failing — which
+    // is exactly what `_attends_prompt` in the curated suite exists to catch.
+    // `sliding-window-attention`, structurally this file's twin, reads it and
+    // passes.
+    let page_t = model::kv_page_size();
+
+    let mut prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
+    prompt.extend(chat::cue());
+    if prompt.is_empty() {
+        prompt.push(0);
+    }
+    let n = prompt.len() as u32;
+    if input.max_tokens == 0 {
+        return Ok(Output {
+            sampler: "attention-sink",
+            text: String::new(),
+            count: 0,
+            prompt_len: n,
+            sink_size: sink,
+            window_size: window,
+            kv_len: 0,
+            visible_kv: 0,
+        });
+    }
+    let stop_tokens = chat::stop_tokens();
+    let pool_pages = (n + input.max_tokens as u32 + 2).div_ceil(page_t);
+    let pool_len = pool_pages * page_t;
+
+    let ws = WorkingSet::new();
+    // One recurrent working set for this one sequence on a hybrid model (the
+    // engine requires one per request row); none on a pure-attention one. It
+    // is bound by EVERY pass of the sequence — prefill and decode alike.
+    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
+        model::ForwardKind::Attention => Vec::new(),
+        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
+        model::ForwardKind::Recurrent => {
+            return Err(
+                "this program has no recurrent-only path (an attention sink needs attention)"
+                    .into(),
+            );
+        }
+        model::ForwardKind::Diffusion => {
+            return Err(
+                "this program decodes a token at a time; a diffusion model wants a canvas loop"
+                    .into(),
+            );
+        }
+    };
+    let slots = ws
+        .reserve(pool_pages)
+        .context("reserve attention-sink KV")?;
+    let pool_ids = slots.ids().to_vec();
+
+    // The prompt is prefilled in `prefill_chunks` spans: one pass over it
+    // is refused once it outgrows the engine's `max_embed_length()`.
+    let pipeline = Pipeline::new();
+    let mut first = 0u32;
+    for (base, end) in prefill_chunks(n, None) {
+        let len = end - base;
+        let tokens = Channel::from_iter(
+            prompt[base as usize..end as usize]
+                .iter()
+                .map(|&t| t as i32),
+        );
+        let embed_indptr = Channel::from([0u32, len]);
+        let positions = Channel::from_iter(base..end);
+        let slots = Channel::from_iter((base..end).map(|p| pool_ids[(p / page_t) as usize]));
+        let offsets = Channel::from_iter((base..end).map(|p| p % page_t));
+        let klen = Channel::from([end]);
+        let pages = Channel::from(pool_ids.clone());
+        // The page CSR is the wire's source of truth for kv_len: the engine
+        // derives `kv_len = (page_count-1)*page_t + last_page_len`, so the
+        // count must track `kv_len` exactly.
+        let page_indptr = Channel::from([0u32, end.div_ceil(page_t)]);
+        let causal = Channel::from_shaped(
+            [len, pool_len],
+            (base..end)
+                .flat_map(|query| (0..pool_len).map(move |key| key <= query))
+                .collect::<Vec<_>>(),
+        );
+        let first_out = Channel::new([1], dtype::i32).named("first_token");
+
+        let prefill = ForwardPass::new();
+        prefill.embed(&tokens, &embed_indptr)?;
+        prefill.attention(
+            Some(KvBinding {
+                working_set: &ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: ..,
+                    kv_len: &klen,
+                    pages: &pages,
+                    page_indptr: &page_indptr,
+                    w_slot: &slots,
+                    w_off: &offsets,
+                    positions: &positions,
+                    mask: Some(&causal),
+                },
+            }),
+            &rs_ws,
+            RsGeometry {
+                fold_len: None,
+                buffer: 0..0,
+            },
+        )?;
+        prefill.epilogue(move || {
+            first_out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
+        });
+        prefill
+            .submit(&pipeline)
+            .with_context(|| format!("attention-sink prefill @{base}"))?;
+        first = first_out.take_host::<i32>().await? as u32;
+    }
+
+    let mut generated = Vec::with_capacity(input.max_tokens);
+    if !stop_tokens.contains(&first) {
+        generated.push(first);
+    }
+    if generated.len() >= input.max_tokens || stop_tokens.contains(&first) {
+        pipeline.close();
+        return report(&generated, n, sink, window, 0);
+    }
+
+    let token_in = Channel::from([first as i32]).named("token_in");
+    let position = Channel::from([n]).named("position");
+    let fill = Channel::from([n + 1]).named("fill");
+    let klen = Channel::from([n + 1]).named("klen");
+    let write_slot = Channel::from([pool_ids[(n / page_t) as usize]]);
+    let write_offset = Channel::from([n % page_t]);
+    let mask = Channel::from_shaped(
+        [1, pool_len],
+        host_sink_window_mask(pool_len, n, sink, window),
+    );
+    let pages = Channel::from(pool_ids.clone());
+    let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_t)]);
+    let pool_ids_input = Channel::from(pool_ids.clone()).named("pool_ids");
+    let token_out = Channel::new([1], dtype::i32)
+        .capacity(channel_capacity() as u32)
+        .named("token_out");
+
+    let decode = ForwardPass::new();
+    let decode_indptr = Channel::from([0u32, 1]).named("decode_indptr");
+    decode.embed(&token_in, &decode_indptr)?;
+    decode.attention(
+        Some(KvBinding {
+            working_set: &ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &klen,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &write_slot,
+                w_off: &write_offset,
+                positions: &position,
+                mask: Some(&mask),
+            },
+        }),
+        &rs_ws,
+        RsGeometry {
+            fold_len: None,
+            buffer: 0..0,
+        },
+    )?;
+    decode.epilogue(move || {
+        let base = fill.take();
+        let ids = pool_ids_input.take();
+        let token = reshape(reduce_argmax(intrinsics::logits()), [1]);
+        let next_mask = reshape(
+            sink_window_mask(&base, pool_len, sink, window),
+            [1, pool_len],
+        );
+        let logical_slot = &base / page_t;
+        let next = &base + 1u32;
+
+        // Device-resolved geometry is loop-carried: the host never drains
+        // these rings, so every fire's values are re-put here.
+        token_in.put(&token);
+        token_out.put(&token);
+        position.put(&base);
+        fill.put(&next);
+        klen.put(&next);
+        write_slot.put(gather(&ids, &logical_slot));
+        write_offset.put(&base % page_t);
+        mask.put(&next_mask);
+        pages.put(reshape(&ids, [pool_pages]));
+        let page_count = next.div_ceil(page_t);
+        page_indptr.put(indptr(1, &page_count));
+        pool_ids_input.put(&ids);
+    });
+
+    let budget = input.max_tokens.saturating_sub(generated.len());
+    // Decode fires whose token came back — a stop token's fire wrote its KV
+    // position like any other, so it counts toward `kv_len`.
+    let mut fires = 0u32;
+    run_ahead(&pipeline, &decode, budget, async || {
+        let token = token_out.take_host::<i32>().await? as u32;
+        fires += 1;
+        if stop_tokens.contains(&token) {
+            return Ok(ControlFlow::Break(()));
+        }
+        generated.push(token);
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
+    // Any fire still in flight after an early stop is left untaken; close
+    // releases the scheduler wait-set and reclaims them.
+    pipeline.close();
+    report(&generated, n, sink, window, fires)
+}
