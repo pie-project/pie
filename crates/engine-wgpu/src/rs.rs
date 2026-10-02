@@ -284,16 +284,22 @@ impl Buffers {
             plane_at.push(at);
             at += u64::from(page_tokens) * plane.row_bytes;
         }
-        let page_bytes = at.next_multiple_of(256);
-        let slots = paging.slots.max(1);
-        let bytes = page_bytes.saturating_mul(u64::from(slots));
         Ok(Buffers {
-            slab: Buffer::zeroed(device, bytes.max(256))?,
+            slab: Buffer::zeroed(device, Buffers::bytes_at(layout, paging))?,
             page_tokens,
-            slots,
-            page_bytes,
+            slots: paging.slots.max(1),
+            page_bytes: at.next_multiple_of(256),
             plane_at,
         })
+    }
+
+    /// The slab at `paging`: one buffered page of every plane a state slot.
+    #[must_use]
+    pub fn bytes_at(layout: &Layout, paging: Paging) -> u64 {
+        (u64::from(paging.page_size.max(1)) * layout.token_bytes)
+            .next_multiple_of(256)
+            .saturating_mul(u64::from(paging.slots.max(1)))
+            .max(256)
     }
 
     #[must_use]

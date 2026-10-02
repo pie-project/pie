@@ -59,10 +59,27 @@ pub fn register_model(kv_page_size: u32, num_kv_pages: &[usize], num_slots: &[us
         num_kv_pages,
         &vec![0; num_kv_pages.len()],
         &vec![0; num_kv_pages.len()],
-        num_slots,
-        &vec![0; num_kv_pages.len()],
+        &num_slots
+            .iter()
+            .map(|&slots| StatePool {
+                slots: slots as u32,
+                ..StatePool::default()
+            })
+            .collect::<Vec<_>>(),
         &vec![0; num_kv_pages.len()],
     )
+}
+
+/// One engine's recurrent-state pool: device and host slots, or, for a
+/// model with a window, the window its state is read through and the
+/// device and host pages of the ring that holds it instead.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StatePool {
+    pub slots: u32,
+    pub host_slots: u32,
+    pub window_tokens: u32,
+    pub window_pages: u32,
+    pub host_window_pages: u32,
 }
 
 pub fn register_model_with_swap(
@@ -70,8 +87,7 @@ pub fn register_model_with_swap(
     num_kv_pages: &[usize],
     num_host_pages: &[usize],
     num_disk_pages: &[u32],
-    num_slots: &[usize],
-    num_host_slots: &[usize],
+    state: &[StatePool],
     max_context: &[usize],
 ) -> usize {
     let stores: Vec<Option<Stores>> = (0..num_kv_pages.len())
@@ -82,12 +98,24 @@ pub fn register_model_with_swap(
                 num_disk_pages.get(d).copied().unwrap_or(0),
                 rand::random::<[u8; 32]>(),
             )));
-            let slots = num_slots.get(d).copied().unwrap_or(0) as u32;
-            let host_slots = num_host_slots.get(d).copied().unwrap_or(0) as u32;
+            let pool = state.get(d).copied().unwrap_or_default();
+            let slots = pool.slots;
             let max_context = max_context.get(d).copied().unwrap_or(0);
+            let rs = if pool.window_tokens > 0 {
+                RsStore::new_ring(
+                    crate::store::rs::RingGeometry {
+                        tokens: pool.window_tokens,
+                        page_size: kv_page_size,
+                    },
+                    pool.window_pages,
+                    pool.host_window_pages,
+                )
+            } else {
+                RsStore::new_with_host(slots, pool.host_slots)
+            };
             Some(Stores {
                 kv,
-                rs: Arc::new(Mutex::new(RsStore::new_with_host(slots, host_slots))),
+                rs: Arc::new(Mutex::new(rs)),
                 seats: Arc::new(Mutex::new(SeatBook::new(slots))),
                 seats_freed: Arc::new(tokio::sync::Notify::new()),
                 kv_page_size,

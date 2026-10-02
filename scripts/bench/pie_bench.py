@@ -806,6 +806,24 @@ async def run(args: argparse.Namespace):
                 ),
             }
 
+        # A request preempted to the FIFO queue is waiting its turn, not hung:
+        # `--request-timeout` bounds the time no request of the run heard back.
+        heard = [time.perf_counter()]
+
+        async def recv(proc):
+            while True:
+                idle = time.perf_counter() - heard[0]
+                try:
+                    event = await asyncio.wait_for(
+                        proc.recv(), timeout=max(0.0, args.request_timeout - idle)
+                    )
+                except asyncio.TimeoutError:
+                    if time.perf_counter() - heard[0] >= args.request_timeout:
+                        raise
+                    continue
+                heard[0] = time.perf_counter()
+                return event
+
         async def launch_one(i: int, *, max_tokens: int | None = None):
             if max_tokens is None:
                 max_tokens = request_max_tokens(args, i)
@@ -826,6 +844,7 @@ async def run(args: argparse.Namespace):
             )
             try:
                 proc = await client.launch_process(pkg, input=inp)
+                heard[0] = time.perf_counter()
                 return i, start, proc, client_send_s
             except Exception as e:
                 return RequestResult(False, time.perf_counter() - start, 0, error=f"{type(e).__name__}: {e}")
@@ -836,13 +855,9 @@ async def run(args: argparse.Namespace):
             i, start, proc, client_send_s = launched
             ttft_s: float | None = None
             first_arrival_s: float | None = None
-            # `--request-timeout` bounds a running request's silence; until its
-            # first event the request may still be queued at the server
-            timeout = None
             try:
                 while True:
-                    ev, msg = await asyncio.wait_for(proc.recv(), timeout=timeout)
-                    timeout = args.request_timeout
+                    ev, msg = await recv(proc)
                     if ev == Event.Message and str(msg) == "t0":
                         # Launch-inclusive first-token stamp (see inferlet's
                         # report_timing contract).
@@ -964,13 +979,12 @@ async def run(args: argparse.Namespace):
             if prompt_token_ids is not None:
                 inp["prompt_tokens_batch"] = [prompt_token_ids[i] for i in indices]
             start = time.perf_counter()
-            timeout = None
             try:
                 proc = await client.launch_process(pkg, input=inp)
+                heard[0] = time.perf_counter()
                 if args.defer_start:
                     while True:
-                        ev, msg = await asyncio.wait_for(proc.recv(), timeout=timeout)
-                        timeout = args.request_timeout
+                        ev, msg = await recv(proc)
                         if ev == Event.Message and str(msg) == "ready":
                             break
                         if ev == Event.Return:
@@ -988,8 +1002,7 @@ async def run(args: argparse.Namespace):
                     start = time.perf_counter()
                     await proc.signal("start")
                 while True:
-                    ev, msg = await asyncio.wait_for(proc.recv(), timeout=timeout)
-                    timeout = args.request_timeout
+                    ev, msg = await recv(proc)
                     if ev == Event.Return:
                         obj = json.loads(msg)
                         if first_output_text[0] is None:
@@ -1052,33 +1065,27 @@ async def run(args: argparse.Namespace):
                 *(launch_one(i, max_tokens=max_tokens) for i in indices)
             )
             if args.defer_start and args.mode == "tput":
-                ready: list[tuple[int, Any]] = []
-                failed: list[RequestResult] = []
-                for item in launched:
+                # read every request at once, so the ones still queued do not
+                # leave the others' `ready` unheard on the run's clock
+                async def await_ready(item):
                     if isinstance(item, RequestResult):
-                        failed.append(item)
-                        continue
+                        return item
                     i, _start, proc, _client_send_s = item
-                    timeout = None
                     try:
                         while True:
-                            ev, msg = await asyncio.wait_for(proc.recv(), timeout=timeout)
-                            timeout = args.request_timeout
+                            ev, msg = await recv(proc)
                             if ev == Event.Message and str(msg) == "ready":
-                                ready.append((i, proc))
-                                break
+                                return i, proc
                             if ev == Event.Return:
-                                failed.append(
-                                    RequestResult(False, 0.0, 0, error="returned before start")
-                                )
-                                break
+                                return RequestResult(False, 0.0, 0, error="returned before start")
                             if ev == Event.Error:
-                                failed.append(RequestResult(False, 0.0, 0, error=str(msg)))
-                                break
+                                return RequestResult(False, 0.0, 0, error=str(msg))
                     except Exception as e:
-                        failed.append(
-                            RequestResult(False, 0.0, 0, error=f"{type(e).__name__}: {e}")
-                        )
+                        return RequestResult(False, 0.0, 0, error=f"{type(e).__name__}: {e}")
+
+                waited = await asyncio.gather(*(await_ready(item) for item in launched))
+                ready = [w for w in waited if not isinstance(w, RequestResult)]
+                failed = [w for w in waited if isinstance(w, RequestResult)]
                 start = time.perf_counter()
                 await asyncio.gather(*(proc.signal("start") for _i, proc in ready))
                 deferred = [
