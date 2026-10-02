@@ -207,13 +207,25 @@ pub(super) fn validate_bound_encodings(program: &mut LoadPlan) -> Result<usize> 
 
 fn binds_block(backend: BackendKind, scheme: QuantScheme) -> bool {
     match backend {
-        BackendKind::Cuda | BackendKind::Vulkan | BackendKind::Wgpu | BackendKind::Xla => matches!(
+        BackendKind::Cuda | BackendKind::Wgpu | BackendKind::Xla => matches!(
             scheme,
             QuantScheme::GgufQ2K
                 | QuantScheme::GgufQ3K
                 | QuantScheme::GgufQ4K
                 | QuantScheme::GgufQ5K
                 | QuantScheme::GgufQ6K
+        ),
+        // Vulkan reads the Gguf K-quants and the PTQ1_0 ternary block in-dot
+        // (the decode-in-dot kernel `quant/ptq1_0.slang`), so its inline-scale
+        // bank binds directly rather than decoding.
+        BackendKind::Vulkan => matches!(
+            scheme,
+            QuantScheme::GgufQ2K
+                | QuantScheme::GgufQ3K
+                | QuantScheme::GgufQ4K
+                | QuantScheme::GgufQ5K
+                | QuantScheme::GgufQ6K
+                | QuantScheme::Ptq1_0
         ),
         // Metal reads the PTQ1_0 ternary block as stored (the M1b decode-in-dot
         // kernel), so its inline-scale bank binds directly rather than decoding.
