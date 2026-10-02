@@ -24,6 +24,11 @@ fn an_apple10_gpu_reads_a_prompt_through_mpp() {
         apple10.sdpa_mpp,
         "and its prompt rows attend through the MPP matmul too"
     );
+    assert_eq!(
+        (apple10.gdn_scan_lanes, apple10.gdn_scan_rows),
+        (8, 2),
+        "and its recurrent scan takes the staged shape, which is twice as fast there"
+    );
     let apple8 = tuned(8, true);
     assert!(
         apple8.sdpa_mpp && !apple8.qmm_mpp,
