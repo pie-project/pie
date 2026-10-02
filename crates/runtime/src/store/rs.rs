@@ -86,6 +86,8 @@ pub enum RsError {
     OutOfSlots { requested: usize, available: usize },
     #[error("rs slot grant mismatch: required {required}, granted {granted}")]
     GrantMismatch { required: usize, granted: usize },
+    #[error("rs working set has no folded state to index")]
+    NothingToIndex,
 }
 
 pub const RS_TRANSLATION_UNMAPPED: u32 = u32::MAX;
@@ -141,12 +143,20 @@ struct RsEntry {
     window_phase: bool,
 }
 
+struct RsSnapshot {
+    ws: RsWorkingSetId,
+    stamp: u64,
+}
+
 pub struct RsStore {
     pool: Pool<RsSlotId>,
     refs: HashMap<RsSlotId, u32>,
     working_sets: GenMap<RsWsMarker, RsEntry>,
     seq: u64,
     outstanding: BTreeSet<u64>,
+    snapshots: HashMap<Vec<u8>, RsSnapshot>,
+    snapshot_clock: u64,
+    max_snapshots: usize,
 }
 
 impl RsStore {
@@ -157,7 +167,83 @@ impl RsStore {
             working_sets: GenMap::new(),
             seq: 0,
             outstanding: BTreeSet::new(),
+            snapshots: HashMap::new(),
+            snapshot_clock: 0,
+            max_snapshots: ((capacity / 4) as usize).max(1),
         }
+    }
+
+    pub fn update_index(&mut self, key: Vec<u8>, ws: RsWorkingSetId) -> Result<(), RsError> {
+        if self.entry(ws)?.folded.is_none() {
+            return Err(RsError::NothingToIndex);
+        }
+        let snapshot = self.fork(ws)?;
+        self.snapshot_clock += 1;
+        let stamp = self.snapshot_clock;
+        let epoch = self.seq;
+        if let Some(old) = self.snapshots.insert(key, RsSnapshot { ws: snapshot, stamp }) {
+            self.release_working_set(old.ws, epoch);
+        }
+        while self.snapshots.len() > self.max_snapshots {
+            if self.evict_oldest_snapshot() == 0 {
+                break;
+            }
+        }
+        self.retire_idle();
+        Ok(())
+    }
+
+    pub fn from_index(&mut self, key: &[u8]) -> Result<Option<RsWorkingSetId>, RsError> {
+        let Some(snapshot) = self.snapshots.get_mut(key) else {
+            return Ok(None);
+        };
+        self.snapshot_clock += 1;
+        snapshot.stamp = self.snapshot_clock;
+        let source = snapshot.ws;
+        self.fork(source).map(Some)
+    }
+
+    pub fn remove_index(&mut self, key: &[u8]) -> bool {
+        let Some(snapshot) = self.snapshots.remove(key) else {
+            return false;
+        };
+        let epoch = self.seq;
+        self.release_working_set(snapshot.ws, epoch);
+        self.retire_idle();
+        true
+    }
+
+    pub fn snapshot_count(&self) -> usize {
+        self.snapshots.len()
+    }
+
+    fn evict_oldest_snapshot(&mut self) -> usize {
+        let Some(key) = self
+            .snapshots
+            .iter()
+            .min_by_key(|(_, snapshot)| snapshot.stamp)
+            .map(|(key, _)| key.clone())
+        else {
+            return 0;
+        };
+        let snapshot = self.snapshots.remove(&key).expect("key just found");
+        let epoch = self.seq;
+        self.release_working_set(snapshot.ws, epoch);
+        1
+    }
+
+    fn alloc_slots(&mut self, count: usize) -> Option<Vec<RsSlotId>> {
+        if let Some(slots) = self.pool.try_alloc_n(count) {
+            return Some(slots);
+        }
+        while !self.snapshots.is_empty() {
+            self.evict_oldest_snapshot();
+            self.retire_idle();
+            if let Some(slots) = self.pool.try_alloc_n(count) {
+                return Some(slots);
+            }
+        }
+        None
     }
 
     pub fn current_epoch(&self) -> u64 {
@@ -531,7 +617,7 @@ impl RsStore {
                 }
                 granted.drain(..need).collect()
             }
-            None => self.pool.try_alloc_n(need).ok_or(RsError::OutOfSlots {
+            None => self.alloc_slots(need).ok_or(RsError::OutOfSlots {
                 requested: need,
                 available: self.pool.available(),
             })?,
@@ -801,7 +887,7 @@ impl RsStore {
     }
 
     pub fn reserve_slots(&mut self, count: usize) -> Option<Vec<RsSlotId>> {
-        self.pool.try_alloc_n(count)
+        self.alloc_slots(count)
     }
 
     pub fn release_slot_reservation(&mut self, slots: Vec<RsSlotId>) {

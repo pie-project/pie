@@ -67,6 +67,7 @@ const TAIL: &str = r#"
 # frame_size               = 2     # guest contract: the submit depth is
 # frame_dispatch_depth     = 2     # derived from it, not a key of its own
 # max_concurrent_processes = 64    # omit: from the engine's max_forward_requests
+# admission_wait           = "90s" # a launch queues this long for headroom, then is refused
 
 [sandbox]
 # The box an inferlet runs in: its walls, and its size.

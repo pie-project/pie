@@ -820,6 +820,12 @@ impl Lane {
                         Ok(program_id) => bind.binding.program = program_id,
                         Err(error) => {
                             tracing::error!(
+                                dbg_hash = plan.program_hash,
+                                dbg_stages = plan.launch.stages.len(),
+                                dbg_plans = plan.launch.plans.len(),
+                                dbg_values = plan.launch.values.len(),
+                                dbg_channels = plan.launch.channels.len(),
+                                dbg_ptir = plan.reference_ptir.len(),
                                 ?error,
                                 "register_program refused; rolling the bind's channels back"
                             );

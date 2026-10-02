@@ -76,6 +76,11 @@ interface working-set {
         // from-index remain valid. Returns false when the key is absent.
         remove-index: static func(key: list<u8>) -> result<bool, error>;
 
+        // First-hit lookup over `keys` in the order given: the position of
+        // the first key with a live index, and a working set over its
+        // mapping. One host call stands in for a from-index probe per key.
+        find-index: static func(keys: list<list<u8>>) -> result<option<tuple<u32, kv-working-set>>, error>;
+
         // Remove `ranges` (pre-discard indexes, applied atomically) from the
         // mapping, ordered on `on`. Suffix indexes shift; no tombstone
         // remains. Rejected when an interior range on a shared path would
@@ -115,6 +120,23 @@ interface working-set {
     // slab copies the relevant object before mutation.
     resource rs-working-set {
         constructor();
+
+        // Retain a copy-on-write snapshot of the folded recurrent state under
+        // `key`, which the working set's owner may then outlive. Keys are
+        // opaque bytes scoped to the active model/engine store. The snapshot
+        // holds a state slot, so the runtime evicts the least recently used
+        // one whenever a fire or reservation would otherwise starve. The
+        // working set must have no in-flight fire and some folded state.
+        update-index: func(key: list<u8>) -> result<_, error>;
+
+        // Exact best-effort lookup. A missing or pressure-evicted key returns
+        // none. The returned working set shares the snapshot's folded state
+        // and copies it on its first write.
+        from-index: static func(key: list<u8>) -> result<option<rs-working-set>, error>;
+
+        // Remove only the named snapshot. Working sets already returned by
+        // from-index remain valid. Returns false when the key is absent.
+        remove-index: static func(key: list<u8>) -> result<bool, error>;
 
         // Current number of buffered page slots.
         buffer-size: func() -> u32;

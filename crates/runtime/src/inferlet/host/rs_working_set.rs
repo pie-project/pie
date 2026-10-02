@@ -28,6 +28,50 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         Ok(self.ctx().table.push(ws)?)
     }
 
+    async fn update_index(
+        &mut self,
+        this: Resource<RsWorkingSet>,
+        key: Vec<u8>,
+    ) -> Result<Result<(), String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        let ws = self.ctx().table.get(&this)?.clone();
+        let stores = store_registry::get(ws.model, ws.engine);
+        let result = stores.rs.lock().unwrap().update_index(key, ws.id);
+        Ok(result.map_err(|e| e.to_string()))
+    }
+
+    async fn from_index(
+        &mut self,
+        key: Vec<u8>,
+    ) -> Result<Result<Option<Resource<RsWorkingSet>>, String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        let model = 0;
+        let caps = crate::model::model().rs_caps();
+        let geom = RsGeometry {
+            state_size: caps.state_size,
+            buffer_page_tokens: caps.buffer_page_size,
+            fold_granularity: caps.fold_granularity,
+        };
+        let stores = store_registry::get(model, 0);
+        let found = stores.rs.lock().unwrap().from_index(&key);
+        match found {
+            Ok(Some(id)) => {
+                let ws = RsWorkingSet::new(model, 0, id, geom);
+                self.register_rs_working_set(model, 0, id);
+                Ok(Ok(Some(self.ctx().table.push(ws)?)))
+            }
+            Ok(None) => Ok(Ok(None)),
+            Err(e) => Ok(Err(e.to_string())),
+        }
+    }
+
+    async fn remove_index(&mut self, key: Vec<u8>) -> Result<Result<bool, String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        let stores = store_registry::get(0, 0);
+        let removed = stores.rs.lock().unwrap().remove_index(&key);
+        Ok(Ok(removed))
+    }
+
     async fn buffer_size(&mut self, this: Resource<RsWorkingSet>) -> Result<u32> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();

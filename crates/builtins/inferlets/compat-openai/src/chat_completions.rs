@@ -370,7 +370,7 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
                 "created": ids.created,
                 "model": ids.model,
                 "choices": [],
-                "usage": usage(outcome.prompt_tokens, outcome.completion_tokens),
+                "usage": usage(outcome.prompt_tokens, outcome.completion_tokens, outcome.cached_tokens),
             }));
         }
         emit::send_raw("[DONE]");
@@ -403,7 +403,7 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
         "created": ids.created,
         "model": ids.model,
         "choices": [{"index": 0, "message": message, "finish_reason": finish_reason(outcome.finish), "logprobs": null}],
-        "usage": usage(outcome.prompt_tokens, outcome.completion_tokens),
+        "usage": usage(outcome.prompt_tokens, outcome.completion_tokens, outcome.cached_tokens),
     })
     .to_string())
 }

@@ -19,7 +19,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
 use worker_api::Request;
 
-use crate::admission::AdmissionDecision;
+use crate::admission::{AdmissionConfig, AdmissionDecision};
 use crate::blob::{BlobStore, GatewayOriginStore};
 use crate::route::RoutingHandle;
 use crate::session::{AdmitReject, DispatchFail, Sessions, TurnRouter};
@@ -36,6 +36,8 @@ pub struct Config {
     pub worker_listen: SocketAddr,
     #[serde(default = "default_controller")]
     pub controller: String,
+    #[serde(default = "default_admission_wait_ms")]
+    pub admission_wait_ms: u64,
 }
 
 fn default_listen() -> SocketAddr {
@@ -47,6 +49,9 @@ fn default_worker_listen() -> SocketAddr {
 fn default_controller() -> String {
     "127.0.0.1:7000".to_string()
 }
+fn default_admission_wait_ms() -> u64 {
+    90_000
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -54,6 +59,7 @@ impl Default for Config {
             listen: default_listen(),
             worker_listen: default_worker_listen(),
             controller: default_controller(),
+            admission_wait_ms: default_admission_wait_ms(),
         }
     }
 }
@@ -82,7 +88,7 @@ struct RouteBackend {
 #[async_trait::async_trait]
 impl TurnRouter for RouteBackend {
     async fn admit(&self, req: &Request) -> std::result::Result<(), AdmitReject> {
-        match self.routing.admit(req) {
+        match self.routing.admit(req).await {
             AdmissionDecision::Admit => Ok(()),
             AdmissionDecision::Reject(reason) => Err(AdmitReject(reason.to_string())),
         }
@@ -193,7 +199,11 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
     let routing_rx = control.routing_watch();
 
     let workers = WorkerRegistry::new();
-    let routing = RoutingHandle::new(routing_rx, workers.connected_watch());
+    let routing =
+        RoutingHandle::new(routing_rx, workers.connected_watch()).with_admission(AdmissionConfig {
+            wait: std::time::Duration::from_millis(config.admission_wait_ms),
+            ..AdmissionConfig::default()
+        });
     let sessions = Sessions::new(Arc::new(RouteBackend {
         routing: routing.clone(),
         workers: workers.clone(),

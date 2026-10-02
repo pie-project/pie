@@ -25,6 +25,7 @@ pub fn derive_standalone(
 ) -> Result<(controller::Config, gateway::Config, worker::Config)> {
     let worker = worker::Config::parse(combined).context("parsing config")?;
     let controller = controller::Config::parse("").context("controller defaults")?;
-    let gateway = gateway::Config::parse("").context("gateway defaults")?;
+    let mut gateway = gateway::Config::parse("").context("gateway defaults")?;
+    gateway.admission_wait_ms = worker.runtime.admission_wait.as_micros() / 1000;
     Ok((controller, gateway, worker))
 }

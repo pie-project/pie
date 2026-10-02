@@ -62,6 +62,7 @@ impl Default for CudaNativeEngineOptions {
 pub struct MetalEngineOptions {
     pub kv_page_size: u32,
     pub total_pages: u32,
+    pub host_swap_pages: Option<u32>,
     pub max_forward_tokens: u32,
     pub max_forward_requests: u32,
     pub max_model_len: Option<u32>,
@@ -80,6 +81,7 @@ impl Default for MetalEngineOptions {
         Self {
             kv_page_size: 32,
             total_pages: 1024,
+            host_swap_pages: None,
             max_forward_tokens: 10240,
             max_forward_requests: 512,
             max_model_len: None,

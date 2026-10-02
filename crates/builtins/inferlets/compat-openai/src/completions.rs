@@ -176,7 +176,7 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
         if parsed.include_usage {
             emit::send(&json!({
                 "id": ids.id, "object": "text_completion", "created": ids.created, "model": ids.model,
-                "choices": [], "usage": usage(outcome.prompt_tokens, outcome.completion_tokens),
+                "choices": [], "usage": usage(outcome.prompt_tokens, outcome.completion_tokens, outcome.cached_tokens),
             }));
         }
         emit::send_raw("[DONE]");
@@ -193,7 +193,7 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
         "created": ids.created,
         "model": ids.model,
         "choices": [{"index": 0, "text": text, "logprobs": null, "finish_reason": finish_reason(outcome.finish)}],
-        "usage": usage(outcome.prompt_tokens, outcome.completion_tokens),
+        "usage": usage(outcome.prompt_tokens, outcome.completion_tokens, outcome.cached_tokens),
     })
     .to_string())
 }

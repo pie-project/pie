@@ -124,6 +124,27 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         }
     }
 
+    async fn find_index(
+        &mut self,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<Result<Option<(u32, Resource<KvWorkingSet>)>, String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        let stores = store_registry::get(0, 0);
+        let prepared = crate::store::kv::PreparedWorkingSet::new();
+        let found = store_registry::with_kv_lock(&stores.kv, "host-working-set", move |kv| {
+            kv.find_index(&keys, prepared)
+        });
+        match found {
+            Ok(Some((position, id))) => {
+                let ws = KvWorkingSet::new(0, 0, id, stores.kv_page_size);
+                self.register_kv_working_set(&ws);
+                Ok(Ok(Some((position as u32, self.ctx().table.push(ws)?))))
+            }
+            Ok(None) => Ok(Ok(None)),
+            Err(error) => Ok(Err(error.to_string())),
+        }
+    }
+
     async fn remove_index(&mut self, key: Vec<u8>) -> Result<Result<bool, String>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let stores = store_registry::get(0, 0);

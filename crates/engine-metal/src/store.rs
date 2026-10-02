@@ -658,6 +658,86 @@ mod tests {
         a_copied_slot_reads_back_as_its_source();
         a_slot_past_the_pool_is_a_ceiling();
         an_attention_only_plan_answers_ok();
+        a_page_parked_past_the_device_pool_restores_byte_for_byte();
+    }
+
+    fn kv_pools(device: &Context, pages: u32, page_size: u32, cell_elems: u32) -> Pools {
+        let cell = u64::from(cell_elems) * u64::from(elem_size(STATE_DTYPE));
+        let plane = u64::from(pages) * u64::from(page_size) * cell;
+        Pools {
+            slabs: vec![Buffer::zeroed(device, plane).expect("a kv slab")],
+            shapes: vec![Shape::Kv {
+                space: 0,
+                head_dim: cell_elems,
+                kv_heads: 1,
+                dtype: STATE_DTYPE,
+                plane_bytes: plane,
+                values_at: 0,
+                values_width: 0,
+                values_bytes: plane,
+            }],
+            paging: Paging {
+                page_size,
+                pages_per_slot: 1,
+                slots: 1,
+                pages: u64::from(pages),
+            },
+            watermark: engine::frame::Demand::ZERO,
+        }
+    }
+
+    fn a_page_parked_past_the_device_pool_restores_byte_for_byte() {
+        let Some(device) = device() else { return };
+        const DEVICE_PAGES: u32 = 4;
+        const SWAP_PAGES: u32 = 4;
+        const PAGE: u32 = 8;
+        const CELL: u32 = 16;
+        let mut pools = kv_pools(&device, DEVICE_PAGES + SWAP_PAGES, PAGE, CELL);
+        let page_bytes = u64::from(PAGE) * u64::from(CELL) * u64::from(elem_size(STATE_DTYPE));
+        let pattern: Vec<u8> = (0..page_bytes)
+            .map(|at| (at as u8).wrapping_mul(13).wrapping_add(5))
+            .collect();
+        pools.slabs[0]
+            .write(page_bytes, &pattern)
+            .expect("device page 1 written");
+        let bystander = vec![0xCD; page_bytes as usize];
+        pools.slabs[0]
+            .write(2 * page_bytes, &bystander)
+            .expect("device page 2 written");
+
+        let park = [Move {
+            src_page: 1,
+            src_token: 0,
+            dst_page: DEVICE_PAGES + 3,
+            dst_token: 0,
+            tokens: PAGE,
+        }];
+        let mut frame = device.frame().expect("a frame");
+        pools.copy_kv(&mut frame, &park).expect("parked");
+        frame.commit().expect("the blit lands");
+
+        let wipe = vec![0u8; page_bytes as usize];
+        pools.slabs[0].write(page_bytes, &wipe).expect("wiped");
+
+        let restore = [Move {
+            src_page: DEVICE_PAGES + 3,
+            src_token: 0,
+            dst_page: 0,
+            dst_token: 0,
+            tokens: PAGE,
+        }];
+        let mut frame = device.frame().expect("a frame");
+        pools.copy_kv(&mut frame, &restore).expect("restored");
+        frame.commit().expect("the blit lands");
+
+        let mut back = vec![0u8; page_bytes as usize];
+        pools.slabs[0].read(0, &mut back).expect("device page 0");
+        assert_eq!(back, pattern);
+        pools.slabs[0]
+            .read(2 * page_bytes, &mut back)
+            .expect("device page 2");
+        assert_eq!(back, bystander);
+        assert_eq!(pools.watermark().kv_pages, DEVICE_PAGES + 4);
     }
 
     fn a_copied_slot_reads_back_as_its_source() {

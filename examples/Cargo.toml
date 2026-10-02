@@ -7,7 +7,7 @@ members = [
     "beam-search",
     "cacheback-speculative-decoding",
     "dflash-block-acceptance",
-    "chat-completion", "image-captioning",
+    "chat-completion", "agent-session", "image-captioning",
     "consensus-decoding",
     "constrained-speculative-decoding",
     "contrastive-decoding",

@@ -354,6 +354,22 @@ impl KvStore {
         Ok(Some(ws))
     }
 
+    pub fn find_index(
+        &mut self,
+        keys: &[Vec<u8>],
+        prepared: PreparedWorkingSet,
+    ) -> Result<Option<(usize, WorkingSetId)>, KvStoreError> {
+        for (position, key) in keys.iter().enumerate() {
+            Self::validate_index_key(key)?;
+            if self.indexes.contains_key(key) {
+                return Ok(self
+                    .from_index(key, prepared)?
+                    .map(|ws| (position, ws)));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn remove_index(&mut self, key: &[u8]) -> Result<(bool, usize), KvStoreError> {
         Self::validate_index_key(key)?;
         let Some(entry) = self.indexes.remove(key) else {

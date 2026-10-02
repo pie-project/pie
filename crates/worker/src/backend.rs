@@ -414,8 +414,9 @@ pub(crate) fn create_engine_backend(
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         EngineOptions::Metal(opts) => {
             let mut boot_doc = format!(
-                "[metal]\ngpu_mem_utilization = {:?}\n",
-                opts.gpu_mem_utilization
+                "[metal]\ngpu_mem_utilization = {:?}\nhost_swap_pages = {}\n",
+                opts.gpu_mem_utilization,
+                opts.host_swap_pages.unwrap_or(opts.total_pages)
             );
             if let Some(words) = opts.diagnostics.as_deref() {
                 boot_doc.push_str(&format!(

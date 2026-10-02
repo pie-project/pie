@@ -34,6 +34,7 @@ pub struct Outcome {
     pub stop_sequence: Option<String>,
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
+    pub cached_tokens: usize,
     pub content: String,
     pub reasoning: String,
     pub tool_calls: Vec<ToolCall>,
@@ -127,7 +128,7 @@ pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, 
             }
         }
     };
-    let sampled = generate(
+    let generation = generate(
         &prompt,
         req.sampling,
         req.max_tokens,
@@ -158,7 +159,8 @@ pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, 
         finish,
         stop_sequence: out.stop_hit.and_then(|i| req.stop.get(i).cloned()),
         prompt_tokens: prompt.len(),
-        completion_tokens: sampled,
+        completion_tokens: generation.sampled,
+        cached_tokens: generation.cached,
         content: out.content,
         reasoning: demux.reasoning_text,
         tool_calls: demux.tool_calls,

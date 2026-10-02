@@ -14,7 +14,7 @@ use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, L
 use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
-use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
+use engine::transfer::{KvCopy, KvMove, MemoryDomain, StateCopy};
 use eta_ir::registry::{GeometryClass, ModelProfile, Port, PortMask};
 use eta_ir::types::Dtype;
 use model_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
@@ -32,6 +32,7 @@ pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, S
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceBoot {
     pub gpu_mem_utilization: f64,
+    pub host_swap_pages: u32,
     pub adapter_dir: Option<std::path::PathBuf>,
 }
 
@@ -39,6 +40,7 @@ impl Default for DeviceBoot {
     fn default() -> DeviceBoot {
         DeviceBoot {
             gpu_mem_utilization: crate::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
+            host_swap_pages: 0,
             adapter_dir: None,
         }
     }
@@ -445,7 +447,7 @@ impl Engine for Metal {
                 budgets.page_size,
                 budgets.max_context,
                 budgets.slots,
-                u64::from(budgets.pages),
+                u64::from(budgets.pages) + u64::from(self.boot.host_swap_pages),
             )
             .map_err(|error| fault(Fault::from(error)))?;
             let kv_pool = crate::store::pool_demand(&trace, paging).map_err(fault)?;
@@ -506,7 +508,7 @@ impl Engine for Metal {
             page_size: budgets.page_size,
             context: budgets.max_context,
             slots: budgets.slots,
-            pages: budgets.pages,
+            pages: budgets.pages.saturating_add(self.boot.host_swap_pages),
             runahead: engine::runahead::Runahead::of(frames_in_flight),
             residency: residency_plan,
         })
@@ -539,8 +541,9 @@ impl Engine for Metal {
                 codegen_backend: Some("metal".to_string()),
             },
             pools: PoolFacts {
-                kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
+                kv_pages: budgets.pages,
                 kv_page_size: paging.page_size,
+                host_pages: self.boot.host_swap_pages,
                 state_slots: if state_rows { paging.slots } else { 0 },
                 state_slot_bytes: shell.state_slot_bytes(),
                 adapter_banks: shell
@@ -565,8 +568,8 @@ impl Engine for Metal {
             geometry: GeometryClass::DeviceGeometry,
             kv_copy: KvCopyDomains {
                 device_to_device: true,
-                device_to_host: false,
-                host_to_device: false,
+                device_to_host: self.boot.host_swap_pages > 0,
+                host_to_device: self.boot.host_swap_pages > 0,
                 host_to_host: false,
             },
             kv_handle: None,
@@ -833,18 +836,57 @@ impl Engine for Metal {
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
-        let served = self
-            .caps
-            .as_ref()
-            .is_some_and(|caps| copy.src == caps.device.domain && copy.dst == caps.device.domain);
+        let (device, device_pages, host_pages) = match self.caps.as_ref() {
+            Some(caps) => (caps.device.domain, caps.pools.kv_pages, caps.pools.host_pages),
+            None => (MemoryDomain::MetalShared, 0, 0),
+        };
+        let reads_host = copy.src == MemoryDomain::HostPinned;
+        let writes_host = copy.dst == MemoryDomain::HostPinned;
+        let served = match (reads_host, writes_host) {
+            (false, false) => copy.src == device && copy.dst == device,
+            (true, false) => host_pages > 0 && copy.dst == device,
+            (false, true) => host_pages > 0 && copy.src == device,
+            (true, true) => false,
+        };
         if !served {
             return Err(Error::Unsupported {
                 verb: kv_copy_direction(copy.src, copy.dst),
                 engine: "metal",
             });
         }
+        let rebase = |ids: &[u32], host: bool| -> EngineResult<Vec<u32>> {
+            ids.iter()
+                .map(|&id| {
+                    if !host {
+                        return Ok(id);
+                    }
+                    if id >= host_pages {
+                        return Err(Error::Invalid(format!(
+                            "host swap page {id} is past the {host_pages} this load reserved"
+                        )));
+                    }
+                    Ok(device_pages + id)
+                })
+                .collect()
+        };
+        let place = |id: u32, host: bool| if host { device_pages + id } else { id };
+        let device_copy = KvCopy {
+            src: device,
+            dst: device,
+            src_page_ids: rebase(&copy.src_page_ids, reads_host)?,
+            dst_page_ids: rebase(&copy.dst_page_ids, writes_host)?,
+            moves: copy
+                .moves
+                .iter()
+                .map(|cell| KvMove {
+                    src_page_id: place(cell.src_page_id, reads_host),
+                    dst_page_id: place(cell.dst_page_id, writes_host),
+                    ..*cell
+                })
+                .collect(),
+        };
         let page_size = self.loaded_mut()?.paging().page_size;
-        let moves = crate::store::Move::plan(copy, page_size).map_err(Error::Invalid)?;
+        let moves = crate::store::Move::plan(&device_copy, page_size).map_err(Error::Invalid)?;
         self.loaded_mut()?.copy_kv(&moves).map_err(fault)
     }
 

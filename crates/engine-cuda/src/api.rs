@@ -561,6 +561,7 @@ intended for diagnostics, not serving",
                 codegen_backend: Some("cuda".to_string()),
             },
             pools: PoolFacts {
+                host_pages: 0,
                 kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
                 kv_page_size: paging.page_size,
                 state_slots: if state_rows { paging.slots } else { 0 },

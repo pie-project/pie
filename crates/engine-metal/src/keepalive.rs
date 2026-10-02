@@ -17,6 +17,12 @@ const LINGER_MS: u64 = 250;
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 const DEFAULT_ITERS: u32 = 20_000;
 
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+const BEAT_MS: u64 = 400;
+
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+const HOLD_MS: u64 = 180_000;
+
 impl KeepAlive {
     #[must_use]
     pub fn wanted() -> bool {
@@ -62,13 +68,71 @@ impl KeepAlive {
             .name("pie-metal-keepalive".to_string())
             .spawn(move || {
                 let carry = carry;
+                let mut beat = 0u64;
                 loop {
                     if stop_t.load(Ordering::Relaxed) {
                         break;
                     }
                     let now = epoch.elapsed().as_millis() as u64;
                     let last = last_t.load(Ordering::Relaxed);
-                    if now.saturating_sub(last) > LINGER_MS {
+                    let idle = now.saturating_sub(last);
+                    if idle > LINGER_MS {
+                        if idle <= HOLD_MS && now.saturating_sub(beat) >= BEAT_MS {
+                            beat = now;
+                            let held = objc2::rc::autoreleasepool(|_| {
+                                let Some(buffer) = carry.queue.commandBuffer() else {
+                                    return false;
+                                };
+                                let Some(encoder) = buffer.computeCommandEncoder() else {
+                                    return false;
+                                };
+                                for large in crate::device::ctx::large_buffers() {
+                                    let resource: &objc2::runtime::ProtocolObject<
+                                        dyn objc2_metal::MTLResource,
+                                    > = objc2::runtime::ProtocolObject::from_ref(&*large);
+                                    encoder.useResource_usage(
+                                        resource,
+                                        objc2_metal::MTLResourceUsage::Read,
+                                    );
+                                }
+                                let once: u32 = 1;
+                                encoder.setComputePipelineState(&carry.pipeline);
+                                // SAFETY: the sink buffer outlives the command buffer (it is
+                                // owned by this thread's `carry`), and `once` is copied out
+                                // by `setBytes:` before the call returns.
+                                unsafe {
+                                    encoder.setBuffer_offset_atIndex(
+                                        Some(&**carry.sink.slab()),
+                                        0,
+                                        0,
+                                    );
+                                    encoder.setBytes_length_atIndex(
+                                        std::ptr::NonNull::from(&once).cast(),
+                                        size_of::<u32>(),
+                                        1,
+                                    );
+                                }
+                                let one = objc2_metal::MTLSize {
+                                    width: 1,
+                                    height: 1,
+                                    depth: 1,
+                                };
+                                let tg = objc2_metal::MTLSize {
+                                    width: 32,
+                                    height: 1,
+                                    depth: 1,
+                                };
+                                encoder.dispatchThreadgroups_threadsPerThreadgroup(one, tg);
+                                encoder.endEncoding();
+                                buffer.commit();
+                                buffer.waitUntilCompleted();
+                                true
+                            });
+                            if !held {
+                                break;
+                            }
+                            continue;
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(2));
                         continue;
                     }

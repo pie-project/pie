@@ -766,6 +766,12 @@ pub struct RuntimeConfig {
     /// engine's `max_forward_requests`, which is what fills a batch.
     #[serde(default)]
     pub max_concurrent_processes: Option<usize>,
+    /// How long a launch waits in the gateway's admission queue for KV or lane
+    /// headroom before it is refused as saturated. Waiters are served in
+    /// arrival order and woken as soon as a worker reports headroom. `"0s"`
+    /// refuses at once, as a saturated pool did before the queue.
+    #[serde(default = "default_admission_wait")]
+    pub admission_wait: Duration,
 }
 
 impl Default for RuntimeConfig {
@@ -776,6 +782,7 @@ impl Default for RuntimeConfig {
             frame_size: default_frame_size(),
             frame_dispatch_depth: default_frame_dispatch_depth(),
             max_concurrent_processes: None,
+            admission_wait: default_admission_wait(),
         }
     }
 }
@@ -832,6 +839,10 @@ fn default_submit_deadline() -> Duration {
 
 fn default_silence_timeout() -> Duration {
     Duration::from_secs(30)
+}
+
+fn default_admission_wait() -> Duration {
+    Duration::from_secs(90)
 }
 
 fn default_frame_size() -> u32 {

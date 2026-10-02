@@ -15,6 +15,40 @@ use objc2_metal::{
 
 static RESERVATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+#[cfg(target_vendor = "apple")]
+const LARGE_FLOOR: usize = 1 << 20;
+
+#[cfg(target_vendor = "apple")]
+struct Large(objc2::rc::Weak<ProtocolObject<dyn objc2_metal::MTLBuffer>>);
+
+// SAFETY: a weak reference to a Metal buffer is only ever upgraded to a
+// retained buffer, and Metal buffers are documented thread-safe.
+#[cfg(target_vendor = "apple")]
+unsafe impl Send for Large {}
+
+#[cfg(target_vendor = "apple")]
+static LARGE: std::sync::Mutex<Vec<Large>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(target_vendor = "apple")]
+fn remember(buffer: &Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>) {
+    use objc2_metal::MTLBuffer as _;
+    if buffer.length() < LARGE_FLOOR {
+        return;
+    }
+    if let Ok(mut list) = LARGE.lock() {
+        list.retain(|entry| entry.0.load().is_some());
+        list.push(Large(objc2::rc::Weak::from_retained(buffer)));
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+pub(crate) fn large_buffers() -> Vec<Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>> {
+    LARGE
+        .lock()
+        .map(|list| list.iter().filter_map(|entry| entry.0.load()).collect())
+        .unwrap_or_default()
+}
+
 #[must_use]
 pub fn reservations() -> u64 {
     RESERVATIONS.load(std::sync::atomic::Ordering::Relaxed)
@@ -192,12 +226,15 @@ impl Context {
                 need: bytes,
                 have: self.max_buffer,
             })?;
-            self.device
+            let buffer = self
+                .device
                 .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
                 .ok_or(Fault::Device {
                     call: "newBufferWithLength:options:",
                     why: format!("the device declined {bytes} bytes of shared storage"),
-                })
+                })?;
+            remember(&buffer);
+            Ok(buffer)
         }
         #[cfg(not(target_vendor = "apple"))]
         {
@@ -224,7 +261,7 @@ impl Context {
         // SAFETY: the caller's contract is exactly this call's — an aligned
         // live mapping of `span` readable bytes that outlives the buffer —
         // and a nil deallocator is what leaves the pages theirs.
-        unsafe {
+        let buffer = unsafe {
             self.device
                 .newBufferWithBytesNoCopy_length_options_deallocator(
                     at.cast::<std::ffi::c_void>(),
@@ -235,8 +272,10 @@ impl Context {
                 .ok_or(Fault::Device {
                     call: "newBufferWithBytesNoCopy:length:options:deallocator:",
                     why: format!("the device declined a zero-copy wrap of {bytes} bytes"),
-                })
-        }
+                })?
+        };
+        remember(&buffer);
+        Ok(buffer)
     }
 
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]

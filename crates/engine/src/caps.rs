@@ -36,6 +36,8 @@ pub struct FireLimits {
 pub struct PoolFacts {
     pub kv_pages: u32,
     pub kv_page_size: u32,
+    #[serde(default)]
+    pub host_pages: u32,
     pub state_slots: u32,
     pub state_slot_bytes: u64,
     pub adapter_banks: u32,

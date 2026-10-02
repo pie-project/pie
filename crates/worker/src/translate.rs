@@ -88,7 +88,7 @@ fn build_model(
             let backend_kind = g.backend.kind().to_string();
             runtime::bootstrap::EngineConfig {
                 total_pages: g.caps.pools.kv_pages as usize,
-                cpu_pages: 0,
+                cpu_pages: g.caps.pools.host_pages as usize,
                 kv_copy: g.caps.kv_copy,
                 backend_kind,
                 rs_cache_required: g.caps.pools.state_slots != 0,

@@ -3,6 +3,16 @@
 version = 4
 
 [[package]]
+name = "agent-session"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "inferlet",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -361,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "inferlet"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "inferlet-macros",
  "pie-eta-dsl",
@@ -372,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "inferlet-macros"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "quote",
  "syn",
@@ -504,18 +514,18 @@ dependencies = [
 
 [[package]]
 name = "pie-dtype"
-version = "0.5.2"
+version = "0.5.4"
 
 [[package]]
 name = "pie-eta-dsl"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "pie-eta-ir",
 ]
 
 [[package]]
 name = "pie-eta-ir"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "pie-dtype",
 ]

@@ -111,6 +111,7 @@ impl pie::inferlet::session::Host for ProcessCtx {
 
     async fn receive_blocking(&mut self) -> Result<Option<String>> {
         let process_id = self.id();
+        let _idle = IdleScope::enter(process_id);
         crate::server::inbox::receive(process_id.to_string())
             .await
             .with_context(|| format!("session.receive-blocking failed for process {process_id}"))
@@ -137,9 +138,25 @@ impl pie::inferlet::session::Host for ProcessCtx {
     }
 }
 
+struct IdleScope(uuid::Uuid);
+
+impl IdleScope {
+    fn enter(pid: uuid::Uuid) -> IdleScope {
+        crate::planner::set_process_idle(pid, true);
+        IdleScope(pid)
+    }
+}
+
+impl Drop for IdleScope {
+    fn drop(&mut self) {
+        crate::planner::set_process_idle(self.0, false);
+    }
+}
+
 impl pie::inferlet::session::HostWithStore<ProcessCtx> for HasSelf<ProcessCtx> {
     async fn receive(accessor: &Accessor<ProcessCtx, Self>) -> Result<Option<String>> {
         let process_id = accessor.with(|mut access| access.get().id());
+        let _idle = IdleScope::enter(process_id);
         crate::server::inbox::receive(process_id.to_string())
             .await
             .with_context(|| format!("session.receive failed for process {process_id}"))

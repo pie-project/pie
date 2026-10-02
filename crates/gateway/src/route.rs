@@ -7,7 +7,7 @@ use ids::WorkerId;
 use tokio::sync::watch;
 use worker_api::{Accepted, Request};
 
-use crate::admission::{AdmissionConfig, AdmissionDecision, admit};
+use crate::admission::{AdmissionConfig, AdmissionDecision, AdmissionQueue};
 
 pub type AffinityKey = u64;
 
@@ -58,6 +58,7 @@ pub struct RoutingHandle {
     routing: watch::Receiver<RoutingTable>,
     connected: watch::Receiver<Arc<HashSet<WorkerId>>>,
     admission: AdmissionConfig,
+    queue: AdmissionQueue,
 }
 
 impl RoutingHandle {
@@ -69,6 +70,7 @@ impl RoutingHandle {
             routing,
             connected,
             admission: AdmissionConfig::default(),
+            queue: AdmissionQueue::new(),
         }
     }
 
@@ -82,14 +84,15 @@ impl RoutingHandle {
     // client whose first frame is one of those (installing its program, or
     // reaping the processes that saturated the pool) must not find its
     // session refused and its socket closed for a pool another session fills.
-    pub fn admit(&self, req: &Request) -> AdmissionDecision {
+    pub async fn admit(&self, req: &Request) -> AdmissionDecision {
         if !matches!(
             &req.message,
             client_api::ClientMessage::LaunchProcess { .. }
         ) {
             return AdmissionDecision::Admit;
         }
-        admit(&self.routing.borrow(), &self.admission)
+        let mut routing = self.routing.clone();
+        self.queue.admit(&mut routing, &self.admission).await
     }
 
     pub fn select_worker(&self, affinity: Option<AffinityKey>) -> Vec<WorkerId> {
@@ -342,13 +345,17 @@ mod tests {
         RoutingHandle::new(rr, cr)
     }
 
-    #[test]
-    fn process_control_survives_resource_saturation_but_launches_do_not() {
+    #[tokio::test]
+    async fn process_control_survives_resource_saturation_but_launches_do_not() {
         for (kv, inflight) in [(255, 0), (0, 256)] {
             let h = handle_with(
                 table(vec![worker(1, "m", Health::Healthy, kv, inflight)]),
                 &[1],
-            );
+            )
+            .with_admission(AdmissionConfig {
+                wait: std::time::Duration::ZERO,
+                ..AdmissionConfig::default()
+            });
             let mut request = req();
             for message in [
                 ClientMessage::ListProcesses { corr_id: 1 },
@@ -364,7 +371,7 @@ mod tests {
                 req().message,
             ] {
                 request.message = message;
-                assert_eq!(h.admit(&request), AdmissionDecision::Admit);
+                assert_eq!(h.admit(&request).await, AdmissionDecision::Admit);
             }
             request.message = ClientMessage::LaunchProcess {
                 corr_id: 1,
@@ -372,7 +379,10 @@ mod tests {
                 input: String::new(),
                 capture_outputs: false,
             };
-            assert!(matches!(h.admit(&request), AdmissionDecision::Reject(_)));
+            assert!(matches!(
+                h.admit(&request).await,
+                AdmissionDecision::Reject(_)
+            ));
         }
     }
 
@@ -386,7 +396,7 @@ mod tests {
             };
             let mut request = req();
             request.message = ClientMessage::ListProcesses { corr_id: 1 };
-            assert_eq!(h.admit(&request), AdmissionDecision::Admit);
+            assert_eq!(h.admit(&request).await, AdmissionDecision::Admit);
             assert_eq!(
                 h.dispatch_with_retry(&reg, &request, None)
                     .await

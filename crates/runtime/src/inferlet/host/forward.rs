@@ -1849,6 +1849,15 @@ impl ProcessCtx {
                 reference_ptir: prog.bytes.clone(),
                 ..Default::default()
             };
+            if program_registration.launch.stages.is_empty() {
+                tracing::error!(
+                    dbg_hash = prog.hash,
+                    dbg_container_stages = prog.bound.container.stages.len(),
+                    dbg_compiled = prog.compiled_stages.len(),
+                    dbg_ptir = prog.bytes.len(),
+                    "dbg: empty launch at forward bind"
+                );
+            }
             let pricing_rows = prog.pricing.rows;
             let mut instance_seeds = Vec::new();
             let mut seed_values = Vec::new();

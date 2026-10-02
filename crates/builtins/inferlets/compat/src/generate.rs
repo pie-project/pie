@@ -19,6 +19,14 @@ use inferlet::eta::hybrid::prelude::*;
 use inferlet::grammar::Matcher;
 use inferlet::mask::unpack_mask;
 
+use crate::prefix::{self, Prefix};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Generation {
+    pub sampled: usize,
+    pub cached: usize,
+}
+
 /// Sampling parameters. The defaults are the OpenAI defaults: temperature 1,
 /// no truncation, no penalties.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -150,14 +158,14 @@ pub async fn generate(
     max_tokens: usize,
     matcher: Option<&Matcher>,
     on_token: &mut dyn FnMut(u32) -> ControlFlow<()>,
-) -> Result<usize> {
+) -> Result<Generation> {
     sampling.validate()?;
     if max_tokens == 0 {
-        return Ok(0);
+        return Ok(Generation::default());
     }
-    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
-        model::ForwardKind::Attention => Vec::new(),
-        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
+    let hybrid = match model::pass_kind() {
+        model::ForwardKind::Attention => false,
+        model::ForwardKind::Hybrid => true,
         model::ForwardKind::Recurrent => {
             return Err("this program has no recurrent-only path (it needs a KV cache)".into());
         }
@@ -172,9 +180,24 @@ pub async fn generate(
     let page_t = kv_page_size();
     let n = prompt.len() as u32;
     let pool_pages = (n + max_tokens as u32 + 2).div_ceil(page_t);
-    let ws = WorkingSet::new();
-    let slots = ws.reserve(pool_pages).context("reserve KV pages")?;
-    let pool_ids = slots.ids().to_vec();
+    let prefix = Prefix::new(prompt, page_t);
+    let (ws, rs_ws, base0) = match prefix.find(hybrid) {
+        Some(hit) => (hit.kv, hit.rs.into_iter().collect::<Vec<_>>(), hit.tokens),
+        None => (
+            WorkingSet::new(),
+            if hybrid {
+                vec![RsWorkingSet::new()]
+            } else {
+                Vec::new()
+            },
+            0,
+        ),
+    };
+    let have = ws.page_len();
+    if pool_pages > have {
+        ws.reserve(pool_pages - have).context("reserve KV pages")?;
+    }
+    let pool_ids: Vec<u32> = (0..pool_pages).collect();
     let pipe = Pipeline::new();
 
     let penalized = sampling.penalized();
@@ -192,7 +215,9 @@ pub async fn generate(
 
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let mut g0 = 0i32;
-    for (k, &(base, end)) in prefill_chunks(n, None).iter().enumerate() {
+    let chunk_plan = prefix::spans(base0, n, page_t, prefill_chunk_hint() as u32);
+    let last_chunk = chunk_plan.len() - 1;
+    for (k, &(base, end)) in chunk_plan.iter().enumerate() {
         let len = end - base;
         let toks = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
         let embed_indptr = Channel::from([0u32, len]).named("embed_indptr_p");
@@ -203,7 +228,7 @@ pub async fn generate(
         let klen = Channel::from([end]).named("klen_p");
         let pages = Channel::from(pool_ids.clone()).named("pages_p");
         let page_indptr = Channel::from([0u32, end.div_ceil(page_t)]).named("pidx_p");
-        let rng = Channel::from([sampling.seed, k as u32]).named("rng_p");
+        let rng = Channel::from([sampling.seed, 0u32]).named("rng_p");
         let hist = penalized.then(|| {
             (
                 Channel::from(vec![0.0f32; vocab as usize]).named("counts_p"),
@@ -220,7 +245,7 @@ pub async fn generate(
                 working_set: &ws,
                 geometry: KvGeometry {
                     readable_pages: ..,
-                    writable_pages: ..,
+                    writable_pages: (base0 / page_t)..,
                     kv_len: &klen,
                     pages: &pages,
                     page_indptr: &page_indptr,
@@ -258,6 +283,9 @@ pub async fn generate(
             .take_host::<i32>()
             .await
             .with_context(|| format!("prefill drain @{base}"))?;
+        if k < last_chunk {
+            prefix.publish(end / page_t, &ws, &rs_ws, &pipe);
+        }
     }
 
     let mut sampled = 1usize;
@@ -271,7 +299,10 @@ pub async fn generate(
         || matcher.is_some_and(|m| m.is_terminated())
     {
         pipe.close();
-        return Ok(sampled);
+        return Ok(Generation {
+            sampled,
+            cached: base0 as usize,
+        });
     }
 
     let slot_n = pool_ids[(n / page_t) as usize];
@@ -397,5 +428,8 @@ pub async fn generate(
         }
     }
     pipe.close();
-    Ok(sampled)
+    Ok(Generation {
+        sampled,
+        cached: base0 as usize,
+    })
 }

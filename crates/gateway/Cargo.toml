@@ -39,6 +39,7 @@ anyhow = "1"
 tracing = "0.1"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 
 [lints]

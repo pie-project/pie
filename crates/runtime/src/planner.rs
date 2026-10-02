@@ -388,6 +388,7 @@ struct Victim {
     pid: ProcessId,
     seq: u64,
     e6_fresh: bool,
+    idle: bool,
 }
 
 struct VictimSet {
@@ -400,11 +401,9 @@ struct VictimSet {
 
 impl VictimSet {
     fn preferred(&self) -> Vec<(ProcessId, u64)> {
-        self.members
-            .iter()
-            .filter(|v| v.e6_fresh)
-            .map(|v| (v.pid, v.seq))
-            .collect()
+        let idle = self.members.iter().filter(|v| v.idle);
+        let fresh = self.members.iter().filter(|v| !v.idle && v.e6_fresh);
+        idle.chain(fresh).map(|v| (v.pid, v.seq)).collect()
     }
 }
 
@@ -421,6 +420,8 @@ struct Proc {
     state: Residency,
     restore_retried: bool,
     progressed: bool,
+    idle: bool,
+    idle_evicted: bool,
     admitted: bool,
     signal: Arc<Notify>,
     resident: Arc<AtomicBool>,
@@ -433,6 +434,8 @@ impl Proc {
             state: Residency::Resident,
             restore_retried: false,
             progressed: true,
+            idle: false,
+            idle_evicted: false,
             admitted: false,
             signal: Arc::new(Notify::new()),
             resident: Arc::new(AtomicBool::new(true)),
@@ -539,6 +542,7 @@ impl Inner {
 
     fn unmet_head(&self) -> Option<(EntryKey, &Waiter)> {
         let mut oldest_restore: Option<EntryKey> = None;
+        let mut resuming_restore: Option<EntryKey> = None;
         let mut allocation: Option<EntryKey> = None;
         for (&key, waiter) in &self.queue {
             if !waiter.is_unmet() {
@@ -546,17 +550,26 @@ impl Inner {
             }
             match &waiter.kind {
                 WaitKind::Allocation { .. } => {
-                    allocation = Some(key);
-                    break;
+                    if allocation.is_none() {
+                        allocation = Some(key);
+                    }
                 }
                 WaitKind::Restore { .. } => {
                     oldest_restore.get_or_insert(key);
+                    if resuming_restore.is_none()
+                        && self.procs.get(&waiter.pid).is_some_and(|proc| proc.idle_evicted)
+                    {
+                        resuming_restore = Some(key);
+                    }
                 }
             }
         }
-        let head = match (allocation, oldest_restore) {
+        let head = match (allocation, resuming_restore.or(oldest_restore)) {
             (Some(allocation), Some(restore)) => {
-                if restore < allocation && (self.fleet_stalled() || self.eviction_unfundable()) {
+                let resuming = resuming_restore == Some(restore);
+                if resuming
+                    || (restore < allocation && (self.fleet_stalled() || self.eviction_unfundable()))
+                {
                     restore
                 } else {
                     allocation
@@ -864,6 +877,40 @@ impl ResidencyPlanner {
 
     pub fn spawn_seq(&self, pid: ProcessId) -> Option<u64> {
         self.lock_inner().procs.get(&pid).map(|proc| proc.seq)
+    }
+
+    pub fn set_idle(self: &Arc<Self>, pid: ProcessId, idle: bool) {
+        let wake_evicted = self.with_inner(|inner| {
+            let (seq, evicted_idle) = {
+                let proc = inner.procs.get_mut(&pid)?;
+                if proc.idle == idle {
+                    return None;
+                }
+                proc.idle = idle;
+                (
+                    proc.seq,
+                    !idle && proc.state == Residency::Evicted && proc.idle_evicted,
+                )
+            };
+            if evicted_idle {
+                let key = (seq, inner.next_id);
+                inner.next_id += 1;
+                inner.queue.insert(
+                    key,
+                    Waiter {
+                        pid,
+                        kind: WaitKind::Restore { demand: 0 },
+                    },
+                );
+            }
+            Some(evicted_idle)
+        });
+        let Some(wake_evicted) = wake_evicted else {
+            return;
+        };
+        if wake_evicted || (idle && self.waiters.load(Ordering::Acquire) != 0) {
+            self.poke();
+        }
     }
 
     pub fn note_admitted(&self, pid: ProcessId) {
@@ -1290,13 +1337,18 @@ impl ResidencyPlanner {
                 };
                 let is_restore = matches!(waiter.kind, WaitKind::Restore { .. });
                 let pid = waiter.pid;
+                let resuming = is_restore
+                    && inner
+                        .procs
+                        .get(&pid)
+                        .is_some_and(|proc| proc.idle_evicted);
                 let demand = match &waiter.kind {
                     WaitKind::Allocation { demand, .. } => Some(*demand),
                     WaitKind::Restore { .. } => None,
                 };
                 let missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
                 if missing > 0 {
-                    let fund_by_eviction = !is_restore || inner.fleet_stalled();
+                    let fund_by_eviction = !is_restore || resuming || inner.fleet_stalled();
                     return Step::Absorb {
                         count: missing,
                         fund_by_eviction,
@@ -1309,6 +1361,7 @@ impl ResidencyPlanner {
                     },
                     None => {
                         if rotation_damping_enabled()
+                            && !resuming
                             && inner.completion_credit == 0
                             && !inner.fleet_stalled()
                         {
@@ -1449,6 +1502,7 @@ impl ResidencyPlanner {
                             return Board::Replan;
                         }
                         proc.state = Residency::Restoring;
+                        proc.idle_evicted = false;
                         inner.queue.remove(&key);
                         Board::Go(inner.accum.donate(swapped as usize))
                     });
@@ -1717,12 +1771,14 @@ impl ResidencyPlanner {
                 return None;
             }
             let head_seq = head.0;
+            let waiting: HashSet<ProcessId> = inner.queue.values().map(|w| w.pid).collect();
             let members = inner
                 .procs
                 .iter()
                 .filter(|(pid, proc)| {
                     proc.admitted
-                        && proc.seq > head_seq
+                        && (proc.idle || (proc.seq > head_seq && waiting.contains(*pid)))
+                        && *pid != &waiter.pid
                         && proc.state == Residency::Resident
                         && !inner.host_swap_blocked.contains(*pid)
                         && !inner.prepare_blocked.contains(*pid)
@@ -1731,6 +1787,7 @@ impl ResidencyPlanner {
                     pid: *pid,
                     seq: proc.seq,
                     e6_fresh: proc.progressed,
+                    idle: proc.idle,
                 })
                 .collect();
             Some(VictimSet {
@@ -1762,12 +1819,12 @@ impl ResidencyPlanner {
                     continue;
                 };
                 if proc.state != Residency::Resident
-                    || proc.seq <= head_seq
-                    || (!proc.progressed && !e6_relaxed)
+                    || (!proc.idle && (proc.seq <= head_seq || (!proc.progressed && !e6_relaxed)))
                 {
                     continue;
                 }
                 proc.state = Residency::Evicting;
+                proc.idle_evicted = proc.idle;
                 inner.evicting.insert(pid, EvictionMark { pages: expected });
                 spawned.push(pid);
                 for waiter in inner.queue.values_mut().filter(|w| w.pid == pid) {
@@ -2219,6 +2276,9 @@ impl ResidencyPlanner {
             };
             debug_assert_eq!(proc.state, Residency::Evicting);
             proc.state = Residency::Evicted;
+            if proc.idle && proc.idle_evicted {
+                return;
+            }
             let key = (proc.seq, inner.next_id);
             inner.next_id += 1;
             inner.queue.insert(
@@ -2690,6 +2750,16 @@ pub fn planner_for(model: usize, engine: usize) -> Option<Arc<ResidencyPlanner>>
         .unwrap()
         .get(&(model, engine))
         .cloned()
+}
+
+pub fn set_process_idle(pid: ProcessId, idle: bool) {
+    let planners: Vec<Arc<ResidencyPlanner>> = PLANNERS
+        .get()
+        .map(|map| map.read().unwrap().values().cloned().collect())
+        .unwrap_or_default();
+    for planner in planners {
+        planner.set_idle(pid, idle);
+    }
 }
 
 pub fn planner() -> Option<&'static Arc<ResidencyPlanner>> {

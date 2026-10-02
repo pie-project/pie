@@ -10,6 +10,7 @@ pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Metal, Str
     Ok(Metal::new(
         DeviceBoot {
             gpu_mem_utilization: gpu_mem_utilization(&doc),
+            host_swap_pages: host_swap_pages(&doc),
             adapter_dir: adapter_dir(&doc),
         },
         contract_for,
@@ -49,6 +50,15 @@ fn gpu_mem_utilization(doc: &toml::Table) -> f64 {
         .and_then(toml::Value::as_float)
         .filter(|fraction| fraction.is_finite() && *fraction > 0.0 && *fraction <= 1.0)
         .unwrap_or(crate::store::accounting::DEFAULT_GPU_MEM_UTILIZATION)
+}
+
+fn host_swap_pages(doc: &toml::Table) -> u32 {
+    doc.get("metal")
+        .and_then(toml::Value::as_table)
+        .and_then(|metal| metal.get("host_swap_pages"))
+        .and_then(toml::Value::as_integer)
+        .and_then(|pages| u32::try_from(pages).ok())
+        .unwrap_or(0)
 }
 
 fn tuning(doc: &toml::Table) {
@@ -113,6 +123,7 @@ mod tests {
         a_boot_document_that_says_nothing_about_this_engine_still_opens();
         a_boot_document_that_is_not_toml_is_refused_at_the_door();
         the_diagnostics_word_list_is_read_or_refused_by_name();
+        host_swap_pages_reads_a_count_or_stays_off();
         gpu_mem_utilization_reads_the_fraction_or_keeps_the_default();
         the_shared_adapter_directory_is_read_and_an_empty_one_is_off();
         a_tuning_table_is_advisory_and_never_a_refusal();
@@ -143,6 +154,14 @@ mod tests {
         let why = of("[metal]\ndiagnostics = 3\n").expect_err("a number is not a word list");
         assert!(why.contains("word list"), "{why}");
         assert!(open(b"[metal]\ndiagnostics = \"teir-trace\"\n", nothing).is_err());
+    }
+
+    fn host_swap_pages_reads_a_count_or_stays_off() {
+        let of = |src: &str| super::host_swap_pages(&src.parse::<toml::Table>().unwrap());
+        assert_eq!(of(""), 0);
+        assert_eq!(of("[metal]\nhost_swap_pages = 512\n"), 512);
+        assert_eq!(of("[metal]\nhost_swap_pages = -1\n"), 0);
+        assert_eq!(of("[metal]\nhost_swap_pages = \"many\"\n"), 0);
     }
 
     fn gpu_mem_utilization_reads_the_fraction_or_keeps_the_default() {

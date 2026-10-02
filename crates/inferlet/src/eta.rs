@@ -396,6 +396,11 @@ impl WorkingSet {
         KvWorkingSet::remove_index(key)
     }
 
+    pub fn find_index(keys: &[Vec<u8>]) -> Result<Option<(usize, WorkingSet)>, String> {
+        Ok(KvWorkingSet::find_index(keys)?
+            .map(|(position, kv)| (position as usize, WorkingSet { kv: Rc::new(kv) })))
+    }
+
     pub fn discard(&self, on: &Pipeline, ranges: &[PageRange]) -> Result<(), String> {
         self.kv.discard(&on.wit, ranges)
     }
@@ -508,6 +513,20 @@ impl RsWorkingSet {
         Ok(RsWorkingSet {
             rs: Rc::new(self.rs.fork(&on.wit)?),
         })
+    }
+
+    pub fn update_index(&self, key: &[u8]) -> Result<(), String> {
+        self.rs.update_index(key)
+    }
+
+    pub fn from_index(key: &[u8]) -> Result<Option<RsWorkingSet>, String> {
+        Ok(crate::working_set::RsWorkingSet::from_index(key)?.map(|rs| RsWorkingSet {
+            rs: Rc::new(rs),
+        }))
+    }
+
+    pub fn remove_index(key: &[u8]) -> Result<bool, String> {
+        crate::working_set::RsWorkingSet::remove_index(key)
     }
 }
 
