@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use ::engine::transfer::{KvMove, MemoryDomain, StateMove};
+use ::engine::transfer::{KvMove, MemoryDomain, StateDirection, StateMove};
 use anyhow::Result;
 use eta_ir::registry::GeometryClass;
 
@@ -14,6 +14,7 @@ use crate::engine::{
     ProgramId, SubmissionCompletion,
 };
 
+use super::worker::PreLaunchCopy;
 use super::{ProcessId, scheduler_handle};
 
 pub(crate) async fn register_program(
@@ -28,7 +29,7 @@ pub(crate) async fn register_channel(
     plan: ChannelRegistration,
 ) -> Result<Arc<ChannelEndpoint>> {
     let handle = scheduler_handle(engine_idx)?;
-    let result = handle.register_channel(engine_idx, plan.clone()).await;
+    let result = handle.register_channel(plan.clone()).await;
     match result {
         Ok(channel) => {
             let closer_handle = handle.clone();
@@ -48,7 +49,7 @@ pub(crate) async fn register_channels(
         return Ok(Vec::new());
     }
     let handle = scheduler_handle(engine_idx)?;
-    match handle.register_channels(engine_idx, plans.clone()).await {
+    match handle.register_channels(plans.clone()).await {
         Ok(channels) => {
             let closer_handle = handle.clone();
             let closer: crate::engine::ChannelCloser =
@@ -135,7 +136,7 @@ pub(crate) async fn register_channels_bind_classified(
         extents,
     );
     match handle
-        .register_channels_bind(pipeline_id, engine_idx, plans, program, bind)
+        .register_channels_bind(pipeline_id, plans, program, bind)
         .await
     {
         Ok((channels, bound)) => {
@@ -234,64 +235,98 @@ pub(crate) fn close_channels(engine_idx: EngineId, ids: Vec<u64>) -> Result<()> 
     scheduler_handle(engine_idx)?.close_channels(ids)
 }
 
-pub(crate) async fn copy_d2h(
-    engine_idx: EngineId,
-    gpu_phys_ids: &[u32],
-    cpu_pages: &[u32],
-) -> Result<SubmissionCompletion> {
-    scheduler_handle(engine_idx)?
-        .copy_kv(KvCopy {
-            src: super::device_domain(engine_idx),
-            dst: MemoryDomain::HostPinned,
-            src_page_ids: gpu_phys_ids.to_vec(),
-            dst_page_ids: cpu_pages.to_vec(),
-            moves: Vec::new(),
-        })
-        .await
+/// One engine copy of a residency move: whole kv pages or rs slots between
+/// the device and the tier below it, out of the device or back into it.
+#[derive(Debug, Clone)]
+pub(crate) struct TierMove {
+    pub kind: TierKind,
+    pub tier: MemoryDomain,
+    pub out: bool,
+    pub device: Vec<u32>,
+    pub slots: Vec<u32>,
 }
 
-pub(crate) fn copy_d2h_tracked(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TierKind {
+    Kv,
+    Rs,
+    /// A ring's pages, moved through the windowed kv planes.
+    Window,
+}
+
+impl TierMove {
+    pub(crate) fn label(&self) -> String {
+        let kind = match self.kind {
+            TierKind::Kv => "kv",
+            TierKind::Rs => "rs",
+            TierKind::Window => "window",
+        };
+        let way = if self.out { "to" } else { "from" };
+        format!("{kind} {way} {:?}", self.tier)
+    }
+}
+
+pub(crate) fn copy_tier_tracked(
     engine_idx: EngineId,
-    gpu_phys_ids: &[u32],
-    cpu_pages: &[u32],
+    copy: &TierMove,
 ) -> Result<super::ControlCompletion> {
-    scheduler_handle(engine_idx)?.copy_kv_tracked(KvCopy {
-        src: super::device_domain(engine_idx),
-        dst: MemoryDomain::HostPinned,
-        src_page_ids: gpu_phys_ids.to_vec(),
-        dst_page_ids: cpu_pages.to_vec(),
-        moves: Vec::new(),
-    })
-}
-
-pub(crate) async fn copy_h2d(
-    engine_idx: EngineId,
-    gpu_phys_ids: &[u32],
-    cpu_pages: &[u32],
-) -> Result<SubmissionCompletion> {
-    scheduler_handle(engine_idx)?
-        .copy_kv(KvCopy {
-            src: MemoryDomain::HostPinned,
-            dst: super::device_domain(engine_idx),
-            src_page_ids: cpu_pages.to_vec(),
-            dst_page_ids: gpu_phys_ids.to_vec(),
-            moves: Vec::new(),
-        })
-        .await
-}
-
-pub(crate) fn copy_h2d_tracked(
-    engine_idx: EngineId,
-    gpu_phys_ids: &[u32],
-    cpu_pages: &[u32],
-) -> Result<super::ControlCompletion> {
-    scheduler_handle(engine_idx)?.copy_kv_tracked(KvCopy {
-        src: MemoryDomain::HostPinned,
-        dst: super::device_domain(engine_idx),
-        src_page_ids: cpu_pages.to_vec(),
-        dst_page_ids: gpu_phys_ids.to_vec(),
-        moves: Vec::new(),
-    })
+    let plan = match copy.kind {
+        TierKind::Kv => {
+            let device = super::device_domain(engine_idx);
+            let (src, dst, src_page_ids, dst_page_ids) = if copy.out {
+                (device, copy.tier, &copy.device, &copy.slots)
+            } else {
+                (copy.tier, device, &copy.slots, &copy.device)
+            };
+            PreLaunchCopy::Kv(KvCopy {
+                src,
+                dst,
+                src_page_ids: src_page_ids.clone(),
+                dst_page_ids: dst_page_ids.clone(),
+                moves: Vec::new(),
+                windowed: Vec::new(),
+            })
+        }
+        TierKind::Window => {
+            let device = super::device_domain(engine_idx);
+            let (src, dst, from, to) = if copy.out {
+                (device, copy.tier, &copy.device, &copy.slots)
+            } else {
+                (copy.tier, device, &copy.slots, &copy.device)
+            };
+            PreLaunchCopy::Kv(KvCopy {
+                src,
+                dst,
+                src_page_ids: Vec::new(),
+                dst_page_ids: Vec::new(),
+                moves: Vec::new(),
+                windowed: from.iter().copied().zip(to.iter().copied()).collect(),
+            })
+        }
+        TierKind::Rs => {
+            let (from, to) = if copy.out {
+                (&copy.device, &copy.slots)
+            } else {
+                (&copy.slots, &copy.device)
+            };
+            let moves = from
+                .iter()
+                .zip(to)
+                .map(|(&src_slot_id, &dst_slot_id)| StateMove {
+                    src_slot_id,
+                    dst_slot_id,
+                    ..StateMove::default()
+                })
+                .collect();
+            let direction = if copy.out {
+                StateDirection::DeviceToHost
+            } else {
+                StateDirection::HostToDevice
+            };
+            PreLaunchCopy::State(StateCopy { moves, direction })
+        }
+    };
+    scheduler_handle(engine_idx)?.copy_tracked(plan)
 }
 
 pub(crate) async fn copy_d2d(
@@ -306,6 +341,7 @@ pub(crate) async fn copy_d2d(
             src_page_ids: src_phys_ids.to_vec(),
             dst_page_ids: dst_phys_ids.to_vec(),
             moves: Vec::new(),
+            windowed: Vec::new(),
         })
         .await
 }
@@ -322,6 +358,7 @@ pub(crate) async fn copy_h2h(
             src_page_ids: src_slots.to_vec(),
             dst_page_ids: dst_slots.to_vec(),
             moves: Vec::new(),
+            windowed: Vec::new(),
         })
         .await
 }
@@ -337,6 +374,7 @@ pub(crate) async fn copy_kv_cells(
             src_page_ids: Vec::new(),
             dst_page_ids: Vec::new(),
             moves: cells,
+            windowed: Vec::new(),
         })
         .await
 }
@@ -358,6 +396,9 @@ pub(crate) async fn copy_rs_d2d(
         })
         .collect();
     scheduler_handle(engine_idx)?
-        .copy_state(StateCopy { moves: slot_ranges })
+        .copy_state(StateCopy {
+            moves: slot_ranges,
+            ..StateCopy::default()
+        })
         .await
 }

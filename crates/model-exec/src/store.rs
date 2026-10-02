@@ -4,7 +4,10 @@ pub mod arena;
 pub mod check;
 pub mod kv;
 
-pub use kv::{Geometry, Paging, Reader, Seat, SpaceFacts, geometry, geometry_with, indptr};
+pub use kv::{
+    Geometry, Paging, Reader, Seat, SpaceFacts, Windowed, geometry, geometry_with, indptr,
+    window_table,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fault {

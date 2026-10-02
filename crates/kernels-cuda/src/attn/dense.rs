@@ -57,9 +57,7 @@ pub fn bidirectional(
     if num_q_heads % num_kv_heads != 0 {
         return Err(refuse(
             OP,
-            format!(
-                "{num_q_heads} query heads do not group over {num_kv_heads} kv heads"
-            ),
+            format!("{num_q_heads} query heads do not group over {num_kv_heads} kv heads"),
         ));
     }
     debug_assert!(
@@ -74,7 +72,9 @@ pub fn bidirectional(
     let images = kv::lanes_of(OP, segments)?;
     let rows = count(OP, "the patch rows this attention answers", q.rows)?;
 
-    let floats = head_width.saturating_mul(WARPS + 1).saturating_add(2 * WARPS);
+    let floats = head_width
+        .saturating_mul(WARPS + 1)
+        .saturating_add(2 * WARPS);
     let smem = floats
         .checked_mul(u32::try_from(core::mem::size_of::<f32>()).unwrap_or(4))
         .ok_or_else(|| {
@@ -88,11 +88,11 @@ pub fn bidirectional(
         OP,
         Fire::at(
             FILE,
-            symbol(&format!("::pie::attn::dense_bidirectional<{stamp}, {WARPS}>")),
+            symbol(&format!(
+                "::pie::attn::dense_bidirectional<{stamp}, {WARPS}>"
+            )),
         )
-        .apply(
-            Launch::grid([rows.unsigned_abs(), num_q_heads, 1], [BLOCK, 1, 1]).smem(smem),
-        ),
+        .apply(Launch::grid([rows.unsigned_abs(), num_q_heads, 1], [BLOCK, 1, 1]).smem(smem)),
         &[
             q.arg(),
             k.arg(),

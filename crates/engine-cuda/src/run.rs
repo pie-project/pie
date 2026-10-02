@@ -40,10 +40,7 @@ pub struct SlotTable(pub Vec<Option<Tensor>>);
 
 #[derive(Clone, Copy, Debug)]
 pub enum CachePool {
-    Kv {
-        space: u32,
-        pool: KvPool,
-    },
+    Kv { space: u32, pool: KvPool },
     Recurrent(RecurrentPool),
 }
 
@@ -274,11 +271,13 @@ impl RsSeat<'_> {
             let page = token / page_tokens;
             let in_page = token % page_tokens;
             let take = (page_tokens - in_page).min(count - done);
-            let page_slot = *pages.get(page as usize).ok_or(crate::error::Fault::Ceiling {
-                what: "rs buffer pages",
-                need: u64::from(page) + 1,
-                have: pages.len() as u64,
-            })?;
+            let page_slot = *pages
+                .get(page as usize)
+                .ok_or(crate::error::Fault::Ceiling {
+                    what: "rs buffer pages",
+                    need: u64::from(page) + 1,
+                    have: pages.len() as u64,
+                })?;
             let slab = self.buffers.row(plane, page_slot, in_page)?;
             let bytes = usize::try_from(u64::from(take) * row_bytes).unwrap_or(usize::MAX);
             crate::device::copy_d2d(stream, dst + u64::from(done) * row_bytes, slab, bytes)?;
@@ -315,6 +314,9 @@ pub struct FireBindings {
     pub lane_of_row: Tensor,
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(model_ir::Selection, crate::inputs::PackingHandles)>,
+    /// The fire's attention class table (`[count * count] u8`) when a lane
+    /// stated classes: group-packed `attention.ragged` reads it.
+    pub class_table: Option<(Tensor, u32)>,
     pub ports: Vec<PortBinding>,
 
     pub geometry: Vec<CacheGeometry>,
@@ -537,6 +539,8 @@ pub struct Run<'c> {
 
     body: Option<&'c Ctx>,
 
+    decoded: &'c [u64],
+
     copy: CopyPlan,
 
     ceilings: Ceilings<'c>,
@@ -574,6 +578,7 @@ impl<'c> Run<'c> {
             side: &[],
             stream: &place.region,
             body: None,
+            decoded: &[],
             copy: CopyPlan::default(),
             ceilings: Ceilings::default(),
             stood: Cell::new(None),
@@ -683,7 +688,11 @@ impl<'c> Run<'c> {
         }
         let lane0 = self.window().span().lane_offset as usize;
         let lanes = self.qo_indptr_host().len().saturating_sub(1);
-        seat.replays.iter().skip(lane0).take(lanes).any(|&replay| replay > 0)
+        seat.replays
+            .iter()
+            .skip(lane0)
+            .take(lanes)
+            .any(|&replay| replay > 0)
     }
 
     fn rs_ext_layout(&self, seat: &RsSeat<'_>) -> (Vec<(u32, u32, u32)>, Vec<i32>) {
@@ -710,14 +719,21 @@ impl<'c> Run<'c> {
         }
     }
 
-    fn rs_seat_and_scratch(&self, op: &'static str) -> Result<(&RsSeat<'c>, &'c RsScratch), kernels_cuda::Error> {
-        let seat = self.rs.as_ref().ok_or_else(|| kernels_cuda::Error::Backend {
-            op,
-            detail: "the extended recurrent run of a fire with no buffered plane".to_string(),
-        })?;
+    fn rs_seat_and_scratch(
+        &self,
+        op: &'static str,
+    ) -> Result<(&RsSeat<'c>, &'c RsScratch), kernels_cuda::Error> {
+        let seat = self
+            .rs
+            .as_ref()
+            .ok_or_else(|| kernels_cuda::Error::Backend {
+                op,
+                detail: "the extended recurrent run of a fire with no buffered plane".to_string(),
+            })?;
         let scratch = seat.scratch.ok_or_else(|| kernels_cuda::Error::Backend {
             op,
-            detail: "the extended recurrent run of a fire the shell grew no scratch for".to_string(),
+            detail: "the extended recurrent run of a fire the shell grew no scratch for"
+                .to_string(),
         })?;
         Ok((seat, scratch))
     }
@@ -726,8 +742,11 @@ impl<'c> Run<'c> {
         let (seat, scratch) = self.rs_seat_and_scratch(op)?;
         let (_, csr) = self.rs_ext_layout(seat);
         let bytes: Vec<u8> = csr.iter().flat_map(|n| n.to_le_bytes()).collect();
-        let at = scratch.take(bytes.len() as u64).map_err(|f| Self::rs_fault(op, f))?;
-        crate::device::stage_raw(self.ctx.stream(), at, &bytes).map_err(|f| Self::rs_fault(op, f))?;
+        let at = scratch
+            .take(bytes.len() as u64)
+            .map_err(|f| Self::rs_fault(op, f))?;
+        crate::device::stage_raw(self.ctx.stream(), at, &bytes)
+            .map_err(|f| Self::rs_fault(op, f))?;
         Ok(Tensor::new(at, csr.len() as u32, 1, model_ir::Dtype::I32))
     }
 
@@ -754,9 +773,11 @@ impl<'c> Run<'c> {
         }
         let (lanes, csr) = self.rs_ext_layout(seat);
         let rows_ext = u32::try_from(csr.last().copied().unwrap_or(0)).unwrap_or(0);
-        let elem = model_compiler::arena::elem_bytes(own.dtype).ok_or_else(|| kernels_cuda::Error::Backend {
-            op,
-            detail: format!("{:?} has no element size", own.dtype),
+        let elem = model_compiler::arena::elem_bytes(own.dtype).ok_or_else(|| {
+            kernels_cuda::Error::Backend {
+                op,
+                detail: format!("{:?} has no element size", own.dtype),
+            }
         })?;
         let row_bytes = u64::from(own.width) * elem;
         let at = scratch
@@ -769,7 +790,9 @@ impl<'c> Run<'c> {
         for (r, &(begin, replay, rows)) in lanes.iter().enumerate() {
             if replay > 0
                 && let Some(plane) = plane
-                && let Some(RsMove::Scatter { pages, at: token, .. }) = seat.lanes.get(lane0 + r)
+                && let Some(RsMove::Scatter {
+                    pages, at: token, ..
+                }) = seat.lanes.get(lane0 + r)
             {
                 if u64::from(plane.width) != u64::from(own.width) {
                     return Err(kernels_cuda::Error::Backend {
@@ -780,31 +803,53 @@ impl<'c> Run<'c> {
                         ),
                     });
                 }
-                let from = token.checked_sub(replay).ok_or_else(|| kernels_cuda::Error::Backend {
-                    op,
-                    detail: format!("lane replays {replay} buffered token(s) below buffer position {token}"),
+                let from = token.checked_sub(replay).ok_or_else(|| {
+                    kernels_cuda::Error::Backend {
+                        op,
+                        detail: format!(
+                            "lane replays {replay} buffered token(s) below buffer position {token}"
+                        ),
+                    }
                 })?;
-                seat.pages_to_rows(stream, plane, pages, from, replay, at + u64::from(begin) * row_bytes)
-                    .map_err(|f| Self::rs_fault(op, f))?;
+                seat.pages_to_rows(
+                    stream,
+                    plane,
+                    pages,
+                    from,
+                    replay,
+                    at + u64::from(begin) * row_bytes,
+                )
+                .map_err(|f| Self::rs_fault(op, f))?;
             }
             if rows > 0 {
                 let src = own.ptr + u64::from(bounds[r].max(0) as u32) * row_bytes;
                 let dst = at + u64::from(begin + replay) * row_bytes;
-                crate::device::copy_d2d(stream, dst, src, usize::try_from(u64::from(rows) * row_bytes).unwrap_or(usize::MAX))
-                    .map_err(|f| Self::rs_fault(op, f))?;
+                crate::device::copy_d2d(
+                    stream,
+                    dst,
+                    src,
+                    usize::try_from(u64::from(rows) * row_bytes).unwrap_or(usize::MAX),
+                )
+                .map_err(|f| Self::rs_fault(op, f))?;
             }
         }
         Ok(ext)
     }
 
-    pub(crate) fn rs_out(&self, op: &'static str, id: ValueId) -> Result<Tensor, kernels_cuda::Error> {
+    pub(crate) fn rs_out(
+        &self,
+        op: &'static str,
+        id: ValueId,
+    ) -> Result<Tensor, kernels_cuda::Error> {
         let (seat, scratch) = self.rs_seat_and_scratch(op)?;
         let own = self.windowed(self.tensor(id));
         let (_, csr) = self.rs_ext_layout(seat);
         let rows_ext = u32::try_from(csr.last().copied().unwrap_or(0)).unwrap_or(0);
-        let elem = model_compiler::arena::elem_bytes(own.dtype).ok_or_else(|| kernels_cuda::Error::Backend {
-            op,
-            detail: format!("{:?} has no element size", own.dtype),
+        let elem = model_compiler::arena::elem_bytes(own.dtype).ok_or_else(|| {
+            kernels_cuda::Error::Backend {
+                op,
+                detail: format!("{:?} has no element size", own.dtype),
+            }
         })?;
         let at = scratch
             .take(u64::from(rows_ext) * u64::from(own.width) * elem)
@@ -814,20 +859,39 @@ impl<'c> Run<'c> {
         Ok(ext)
     }
 
-    pub(crate) fn rs_ext_of(&self, op: &'static str, id: ValueId) -> Result<Tensor, kernels_cuda::Error> {
+    pub(crate) fn rs_ext_of(
+        &self,
+        op: &'static str,
+        id: ValueId,
+    ) -> Result<Tensor, kernels_cuda::Error> {
         let (_, scratch) = self.rs_seat_and_scratch(op)?;
-        scratch.ext.borrow().get(&id.0).copied().ok_or_else(|| kernels_cuda::Error::Backend {
-            op,
-            detail: format!("value {} was not landed extended by an earlier recurrent op of this fire", id.0),
-        })
+        scratch
+            .ext
+            .borrow()
+            .get(&id.0)
+            .copied()
+            .ok_or_else(|| kernels_cuda::Error::Backend {
+                op,
+                detail: format!(
+                    "value {} was not landed extended by an earlier recurrent op of this fire",
+                    id.0
+                ),
+            })
     }
 
-    pub(crate) fn rs_land(&self, op: &'static str, ext: Tensor, id: ValueId) -> Result<(), kernels_cuda::Error> {
+    pub(crate) fn rs_land(
+        &self,
+        op: &'static str,
+        ext: Tensor,
+        id: ValueId,
+    ) -> Result<(), kernels_cuda::Error> {
         let (seat, _) = self.rs_seat_and_scratch(op)?;
         let target = self.windowed(self.tensor(id));
-        let elem = model_compiler::arena::elem_bytes(ext.dtype).ok_or_else(|| kernels_cuda::Error::Backend {
-            op,
-            detail: format!("{:?} has no element size", ext.dtype),
+        let elem = model_compiler::arena::elem_bytes(ext.dtype).ok_or_else(|| {
+            kernels_cuda::Error::Backend {
+                op,
+                detail: format!("{:?} has no element size", ext.dtype),
+            }
         })?;
         let row_bytes = u64::from(ext.width) * elem;
         let (lanes, _) = self.rs_ext_layout(seat);
@@ -839,8 +903,13 @@ impl<'c> Run<'c> {
             }
             let src = ext.ptr + u64::from(begin + replay) * row_bytes;
             let dst = target.ptr + u64::from(bounds[r].max(0) as u32) * row_bytes;
-            crate::device::copy_d2d(stream, dst, src, usize::try_from(u64::from(rows) * row_bytes).unwrap_or(usize::MAX))
-                .map_err(|f| Self::rs_fault(op, f))?;
+            crate::device::copy_d2d(
+                stream,
+                dst,
+                src,
+                usize::try_from(u64::from(rows) * row_bytes).unwrap_or(usize::MAX),
+            )
+            .map_err(|f| Self::rs_fault(op, f))?;
         }
         Ok(())
     }
@@ -885,6 +954,28 @@ impl<'c> Run<'c> {
         self
     }
 
+    /// The decoded-weight tile each stream was warmed with at load, main
+    /// stream first; a plane wider than its tile is served by the
+    /// fused-dequant arm rather than growing it.
+    #[must_use]
+    pub fn decoded_tiles(mut self, tiles: &'c [u64]) -> Self {
+        self.decoded = tiles;
+        self
+    }
+
+    /// Whether this region's stream holds an `[n, k]` plane in bf16. A load
+    /// that warmed no tiles, and the conditional stream, decode as they did.
+    pub(crate) fn decoded_tile_holds(&self, n: u32, k: u32) -> bool {
+        let at = match self.body {
+            Some(_) if self.stream.get() == crate::window::BODY => return true,
+            _ if self.side.is_empty() => 0,
+            _ => self.stream.get() as usize,
+        };
+        self.decoded
+            .get(at)
+            .is_none_or(|tile| u64::from(n).saturating_mul(u64::from(k)).saturating_mul(2) <= *tile)
+    }
+
     pub(crate) fn ctx(&self) -> &'c Ctx {
         let ctx = match self.body {
             Some(body) if self.stream.get() == crate::window::BODY => body,
@@ -896,7 +987,9 @@ impl<'c> Run<'c> {
         };
         ctx.arm(self.here());
         ctx.arm_stage(self.live_at());
-        ctx.arm_region(self.place.region.get());
+        let region = self.place.region.get();
+        ctx.arm_region(region);
+        ctx.arm_lane(self.place.lane.get());
         ctx
     }
 
@@ -1236,6 +1329,10 @@ impl<'c> Run<'c> {
 
     pub(crate) fn fire_wide(&self, id: ValueId) -> Tensor {
         self.whole(id)
+    }
+
+    pub(crate) fn class_table(&self) -> Option<(Tensor, u32)> {
+        self.fire.class_table
     }
 
     fn whole(&self, id: ValueId) -> Tensor {
@@ -1764,17 +1861,17 @@ impl<'c> Run<'c> {
         let standing = self.reading_standing(plan);
         let carve = standing.ceiling();
         let carve_lanes = standing.lane_carve();
+        let staged = self
+            .windows
+            .qo_absolute()
+            .map_or(0, |bounds| bounds.rows.saturating_sub(1))
+            .min((seat.kv_indptr.len() as u32).saturating_sub(1))
+            .min(seat.kv_len.len() as u32);
         let ceiling: Option<(u32, u32)> = standing
             .absolute()
             .then_some(carve_lanes)
             .flatten()
             .and_then(|(before, own)| {
-                let staged = self
-                    .windows
-                    .qo_absolute()
-                    .map_or(0, |bounds| bounds.rows.saturating_sub(1))
-                    .min((seat.kv_indptr.len() as u32).saturating_sub(1))
-                    .min(seat.kv_len.len() as u32);
                 let covered = staged.checked_sub(before)?;
                 Some((before, own.min(covered)))
             })
@@ -1812,7 +1909,7 @@ impl<'c> Run<'c> {
         let shape = Shape {
             num_requests: ceiling.map_or(span.lanes, |(_, lanes)| lanes),
             lane_offset: match ceiling {
-                Some((first, _)) => first,
+                Some((_, lanes)) => staged.saturating_sub(lanes),
                 None if standing.plane() => span.lane_offset,
                 None => 0,
             },
@@ -1939,6 +2036,17 @@ impl<'c> Run<'c> {
             StructSlot::Prefill(plan) => plan.graph_capturable,
             _ => true,
         })
+    }
+
+    pub(crate) fn uncapturable_why(&self) -> Vec<String> {
+        self.structs
+            .iter()
+            .flatten()
+            .filter_map(|(_, slot)| match slot {
+                StructSlot::Prefill(plan) => plan.graph_refusal.clone(),
+                _ => None,
+            })
+            .collect()
     }
 
     pub(crate) fn put(&mut self, id: ValueId, built: StructSlot) {

@@ -85,7 +85,12 @@ fn check(bits: u32, n: usize, k: usize, rows: usize, seed: u64) {
             }
         }
     }
-    assert_eq!(bad, 0, "{bits}-bit: {bad} of {} outputs differ (worst relative error {worst:.4})", rows * n);
+    assert_eq!(
+        bad,
+        0,
+        "{bits}-bit: {bad} of {} outputs differ (worst relative error {worst:.4})",
+        rows * n
+    );
 }
 
 #[test]

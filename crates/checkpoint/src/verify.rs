@@ -243,12 +243,14 @@ fn check_files(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
                 file.id
             )));
         }
-        match std::fs::metadata(file.path) {
-            Ok(meta) if meta.len() != file.size_bytes => found.push(Violation::plan(format!(
-                "{} is {} bytes; the plan was compiled against {} bytes",
-                file.path,
-                meta.len(),
-                file.size_bytes
+        let on_disk = match ztensor::memfs::len(file.path) {
+            Some(mounted) => Ok(mounted),
+            None => std::fs::metadata(file.path).map(|meta| meta.len()),
+        };
+        match on_disk {
+            Ok(len) if len != file.size_bytes => found.push(Violation::plan(format!(
+                "{} is {len} bytes; the plan was compiled against {} bytes",
+                file.path, file.size_bytes
             ))),
             Ok(_) => {}
             Err(err) => found.push(Violation::plan(format!(

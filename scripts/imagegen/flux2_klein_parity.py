@@ -251,7 +251,6 @@ def run(args) -> None:
     if not os.path.exists(pie):
         raise SystemExit(f"{pie}: no pie binary. Build one with `cargo build -p pie --features cuda`, or pass --pie.")
     binary = wasm(args.inferlet)
-    manifest = os.path.join(args.inferlet, "Pie.toml")
     base = scratch_base(args.config)
     files_dir = os.path.join(args.out, "pie_files")
     shutil.rmtree(files_dir, ignore_errors=True)
@@ -263,7 +262,7 @@ def run(args) -> None:
         payload.append(doc["probe_latents_file"])
 
     cmd = [pie, "--config", os.path.expanduser(args.config), "run", "--path", binary,
-           "--manifest", manifest, "-o", files_dir, "--", "--case_file", "case.json",
+           "-o", files_dir, "--", "--case_file", "case.json",
            "--wait_secs", str(args.wait)]
     print(f"[run] {' '.join(cmd)}")
     before = set(os.listdir(base))
@@ -478,7 +477,7 @@ def main() -> int:
     ap.add_argument("--golden", default=DEFAULT_GOLDEN)
     ap.add_argument("--snapshot", default=DEFAULT_SNAPSHOT, help="the HF snapshot dir (glob ok)")
     ap.add_argument("--out", default="/tmp/flux2-klein-parity")
-    ap.add_argument("--inferlet", default=os.path.join(REPO, "tests/inferlets/flux2-klein-parity"))
+    ap.add_argument("--inferlet", default=os.path.join(REPO, "examples/flux2-klein-parity"))
     ap.add_argument("--config", default=None,
                     help=f"the serving config; its `[model] model` must be the artifact `{DEFAULT_SKU}` imported")
     ap.add_argument("--pie", default=None, help="the pie binary (default: PATH, else target/debug)")

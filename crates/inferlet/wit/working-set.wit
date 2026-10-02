@@ -21,7 +21,7 @@ interface working-set {
 
     // A half-open declaration [start, end) of WorkingSet-relative page
     // indexes. Unlike page-range, an absent end follows later lease growth at
-    // the storage contract. A pass using SDK-generated dense page geometry
+    // the storage contract. A pass using library-generated dense page geometry
     // must be recreated if growth exceeds its bind-time page envelope. When
     // end is present, start must not exceed it. This type is only for forward-
     // pass readable/writable declarations; reserve/discard/slice continue to
@@ -112,7 +112,10 @@ interface working-set {
     // buffered suffix of page slots. A forward pass may write buffered RS
     // state WITHOUT folding it; folding is a separate, explicit operation.
     // Fork is lazy CoW: the first fold/write on a shared folded or buffered
-    // slab copies the relevant object before mutation.
+    // slab copies the relevant object before mutation. For a window the
+    // buffered slots are the ring of its pages, taken by the fires that write
+    // them: `alloc-buffer`, `free-buffer` and `reorder-buffer` then only
+    // keep the declared count, and `discard-buffered` moves the head back.
     resource rs-working-set {
         constructor();
 
@@ -156,6 +159,22 @@ interface working-set {
         // Copy-on-write child sharing the folded state and buffered slabs,
         // ordered on `on`.
         fork: func(on: borrow<pipeline>) -> result<rs-working-set, error>;
+
+        // The kv index's twin: insert or replace `key` with a copy-on-write
+        // snapshot of this working set, as `fork` takes one. Keys are opaque
+        // bytes scoped to the active model/engine store, apart from the kv
+        // index's. The snapshot is not found until every fire writing it has
+        // settled.
+        update-index: func(key: list<u8>) -> result<_, error>;
+
+        // Exact best-effort lookup. A missing key, or one reclaimed under
+        // slot pressure, returns none. The returned working set shares the
+        // snapshot copy-on-write.
+        from-index: static func(key: list<u8>) -> result<option<rs-working-set>, error>;
+
+        // Remove only the named snapshot. Working sets already returned by
+        // from-index remain valid. Returns false when the key is absent.
+        remove-index: static func(key: list<u8>) -> result<bool, error>;
     }
 
 }

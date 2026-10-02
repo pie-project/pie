@@ -19,7 +19,7 @@ pub use encode::{
     head_grid, head_group,
 };
 pub use error::Error;
-pub use preproc::{Malformed, Variant, expand, instantiations};
+pub use preproc::{Malformed, Variant, enables_of, expand, instantiations, with_enables};
 pub use sources::{CENSUS, Expanded, Missing, SOURCES, census, source};
 pub use tensor::{Bank, KvPool, RaggedTensor, RecurrentPool, Tensor};
 pub use tuning::{DeviceInfo, DeviceTuning, Vendor};

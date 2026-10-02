@@ -810,6 +810,16 @@ impl Walk<'_, '_> {
         let span = len;
         let len = checked_usize(len)?;
         let mut out = vec![0u8; len];
+        if let Some(mounted) = ztensor::memfs::len(path) {
+            ztensor::memfs::read(path, offset, &mut out).ok_or_else(|| {
+                invalid(format!(
+                    "read {}: {offset}+{span} is outside its {mounted} mounted bytes{}",
+                    path.display(),
+                    ztensor::memfs::read_failure(path)
+                ))
+            })?;
+            return Ok(out);
+        }
         let mut file = File::options()
             .read(true)
             .write(self.consume.is_some())
@@ -1559,6 +1569,22 @@ impl Walk<'_, '_> {
                 .map_or(1, std::num::NonZero::get)
                 .min(blocks)
         };
+        let decode_run = |source: &[u8], chunk: &mut [u8]| {
+            let mut values = vec![0.0f32; elements];
+            for (block, out) in source
+                .chunks_exact(block_bytes)
+                .zip(chunk.chunks_exact_mut(out_bytes))
+            {
+                decode_gguf_block_into(scheme, block, &mut values);
+                for (value, le) in values.iter().zip(out.as_chunks_mut::<2>().0.iter_mut()) {
+                    le.copy_from_slice(&bf16::from_f32(*value).to_bits().to_le_bytes());
+                }
+            }
+        };
+        if workers <= 1 {
+            decode_run(bytes, &mut out);
+            return Ok(out);
+        }
         let per_worker = blocks.div_ceil(workers);
         std::thread::scope(|scope| {
             let mut out_rest = &mut out[..];
@@ -1568,19 +1594,7 @@ impl Walk<'_, '_> {
                 let (chunk, rest) = std::mem::take(&mut out_rest).split_at_mut(count * out_bytes);
                 out_rest = rest;
                 let source = &bytes[start * block_bytes..(start + count) * block_bytes];
-                scope.spawn(move || {
-                    let mut values = vec![0.0f32; elements];
-                    for (block, out) in source
-                        .chunks_exact(block_bytes)
-                        .zip(chunk.chunks_exact_mut(out_bytes))
-                    {
-                        decode_gguf_block_into(scheme, block, &mut values);
-                        for (value, le) in values.iter().zip(out.as_chunks_mut::<2>().0.iter_mut())
-                        {
-                            le.copy_from_slice(&bf16::from_f32(*value).to_bits().to_le_bytes());
-                        }
-                    }
-                });
+                scope.spawn(move || decode_run(source, chunk));
                 start += count;
             }
         });

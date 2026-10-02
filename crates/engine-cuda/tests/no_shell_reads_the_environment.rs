@@ -27,12 +27,7 @@ fn no_shell_reads_the_environment() {
             scanned += 1;
             for (at, line) in text.lines().enumerate() {
                 if line.contains(FORBIDDEN) && !line.trim_start().starts_with("//") {
-                    offences.push(format!(
-                        "{}:{}: {}",
-                        file.display(),
-                        at + 1,
-                        line.trim()
-                    ));
+                    offences.push(format!("{}:{}: {}", file.display(), at + 1, line.trim()));
                 }
             }
         }

@@ -91,6 +91,21 @@ impl Shell {
         p: &mut Prepared<'_>,
         slot: &SlotGuard,
     ) -> Result<(u32, Option<Readback>)> {
+        let page_size = self.pools.paging().page_size;
+        let window_copies: Vec<crate::store::Move> = p
+            .lanes
+            .iter()
+            .flat_map(|lane| lane.window_copies)
+            .map(|&(src, dst)| crate::store::Move {
+                src_page: src,
+                src_token: 0,
+                dst_page: dst,
+                dst_token: 0,
+                tokens: page_size,
+            })
+            .collect();
+        self.pools
+            .copy_kv(self.device.stream(), &[], &window_copies)?;
         let seq = self.airborne.next_seq();
         self.cache.at_step(seq);
         if p.rs.rows_ext > 0 {
@@ -98,12 +113,20 @@ impl Shell {
                 p.rs.rows_ext,
                 self.buffers.as_ref().map_or(0, Buffers::ext_row_bytes),
             );
-            if self.rs_scratch.as_ref().is_none_or(|have| (have.bytes() as u64) < need) {
+            if self
+                .rs_scratch
+                .as_ref()
+                .is_none_or(|have| (have.bytes() as u64) < need)
+            {
                 self.drain()?;
-                self.rs_scratch = Some(Buffer::zeroed(usize::try_from(need).unwrap_or(usize::MAX))?);
+                self.rs_scratch =
+                    Some(Buffer::zeroed(usize::try_from(need).unwrap_or(usize::MAX))?);
             }
         }
-        let rs_scratch = self.rs_scratch.as_ref().map(|have| (have.ptr(), have.bytes() as u64));
+        let rs_scratch = self
+            .rs_scratch
+            .as_ref()
+            .map(|have| (have.ptr(), have.bytes() as u64));
         let mut fire = FireCtx {
             device: &self.device,
             trace: &self.trace,
@@ -134,6 +157,8 @@ impl Shell {
             shifted: &self.shifted,
             schedule_readers: &self.schedule_readers,
             decoding: &self.decoding,
+            tiers: &self.tiers,
+            decoded_tiles: &self.decoded_tiles,
             seq,
         };
         super::btrace::mark("prepare_tail");
@@ -180,6 +205,8 @@ struct FireCtx<'a> {
     shifted: &'a [bool],
     schedule_readers: &'a [Option<u32>],
     decoding: &'a model_ir::ClassSet,
+    tiers: &'a record::Tiers,
+    decoded_tiles: &'a [u64],
     seq: u64,
 }
 
@@ -600,6 +627,7 @@ impl FireCtx<'_> {
             self_cond_weights: staged.self_cond.map(|(_, weights)| weights),
             lane_of_row: handles.lane_of_row,
             group_of_lane: handles.group_of_lane,
+            class_table: handles.class_table,
             packings: p
                 .packings
                 .iter()
@@ -696,12 +724,16 @@ impl FireCtx<'_> {
             &place,
         )
         .across(&side_ctx, &stream)
-        .ceilings(ceilings);
+        .ceilings(ceilings)
+        .decoded_tiles(self.decoded_tiles);
         if let Some(body) = self.device.conditional_ctx() {
             run = run.conditional(body, &stream);
         }
         let rs_scratch = (p.rs.rows_ext > 0)
-            .then(|| self.rs_scratch.map(|(ptr, bytes)| crate::run::RsScratch::new(ptr, bytes)))
+            .then(|| {
+                self.rs_scratch
+                    .map(|(ptr, bytes)| crate::run::RsScratch::new(ptr, bytes))
+            })
             .flatten();
         if p.rs.buffered
             && let Some(pool) = self.buffers
@@ -731,9 +763,11 @@ impl FireCtx<'_> {
                     lanes: forked,
                     conditionals,
                     decoding: self.decoding,
+                    tiers: self.tiers,
                     lane_ceiling: p.lane_ceiling,
                     towered: p.towered,
                     ceilings,
+                    islands: &p.islands,
                 };
 
                 self.cache.fire_body(&fire, &mut run, &place)
@@ -968,6 +1002,17 @@ impl FireCtx<'_> {
             "enqueue.epilogue",
         )?;
         super::btrace::mark("epi_reap");
+        // a tensor-parallel rank captured only its band of each layer's heads;
+        // the epilogue reads the model's planes, so the bands are gathered
+        // first (every rank fires the same frame, so every rank gathers the
+        // same lanes)
+        if let Some(slab) = self.scores {
+            for (lane, seated) in p.lanes.iter().enumerate() {
+                if seated.captures_scores {
+                    slab.gather(self.device.ctx(), lane as u32)?;
+                }
+            }
+        }
         let mut epilogues = AirborneFires::default();
         for attached in p.attachments.iter().filter(|a| a.at == Boundary::Epilogue) {
             let lane = attached.lane as usize;

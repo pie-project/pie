@@ -33,13 +33,9 @@ fn a_still_round_trips_through_png_and_raw_and_reads_back_identical() {
 
     let png = still.encode(ImageFormat::Png).expect("png");
     assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
-    let decoded = image::load_from_memory(&png).expect("decode").to_rgb8();
-    assert_eq!(decoded.dimensions(), (w, h));
-    assert_eq!(
-        decoded.into_raw(),
-        src,
-        "png is lossless, so it must be exact"
-    );
+    let (decoded, dw, dh) = media::still::decode(&png).expect("decode");
+    assert_eq!((dw, dh), (w, h));
+    assert_eq!(decoded, src, "png is lossless, so it must be exact");
 
     let webp = still.encode(ImageFormat::Webp).expect("webp");
     assert_eq!(&webp[..4], b"RIFF");

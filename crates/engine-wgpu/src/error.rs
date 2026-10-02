@@ -198,6 +198,10 @@ pub enum Fault {
         why: String,
     },
 
+    Blocking {
+        call: &'static str,
+    },
+
     Recipe(String),
 }
 
@@ -368,6 +372,11 @@ impl fmt::Display for Fault {
                  `{step}`: {why}"
             ),
 
+            Self::Blocking { call } => write!(
+                f,
+                "`{call}` would wait on the GPU, and this host never waits: a browser \
+                 answers by callback or not at all"
+            ),
             Self::Recipe(refusal) => f.write_str(refusal),
             Self::Adapter { bank, why } => write!(f, "adapter bank `{bank}`: {why}"),
             Self::Blob { path, why } => write!(f, "the shared adapter `{path}` {why}"),

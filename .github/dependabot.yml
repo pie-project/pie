@@ -1,51 +1,27 @@
 version: 2
 updates:
-  # Python dependencies
-  - package-ecosystem: "pip"
-    directory: "/runtime-backend"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
-
-  - package-ecosystem: "pip"
-    directory: "/worker"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
-
-  - package-ecosystem: "pip"
-    directory: "/sdk/client/python"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
-
-  - package-ecosystem: "pip"
-    directory: "/sdk/inferlet/tools/bakery"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
-
-  # Rust dependencies
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
 
-  # JavaScript dependencies
-  - package-ecosystem: "npm"
-    directory: "/sdk/client/javascript"
+  - package-ecosystem: "pip"
+    directories:
+      - "/python/client"
+      - "/python/inferlet"
+      - "/python/server"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
 
+  # The npm workspace: one lockfile for client, inferlet, browser and server.
   - package-ecosystem: "npm"
-    directory: "/sdk/inferlet/javascript"
+    directory: "/javascript"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
 
-  # GitHub Actions
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

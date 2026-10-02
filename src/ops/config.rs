@@ -94,6 +94,7 @@ fn list(global: &bootstrap::GlobalArgs, prefix: Option<String>) -> Result<Answer
             "metal" => Some(worker::config::EngineKind::Metal),
             "vulkan" => Some(worker::config::EngineKind::Vulkan),
             "wgpu" => Some(worker::config::EngineKind::Wgpu),
+            "xla" => Some(worker::config::EngineKind::Xla),
             _ => None,
         })
         .unwrap_or(default_engine_kind());
@@ -234,6 +235,7 @@ fn engine_kind(file: &toml::Value) -> worker::config::EngineKind {
             "metal" => Some(worker::config::EngineKind::Metal),
             "vulkan" => Some(worker::config::EngineKind::Vulkan),
             "wgpu" => Some(worker::config::EngineKind::Wgpu),
+            "xla" => Some(worker::config::EngineKind::Xla),
             _ => None,
         })
         .unwrap_or(default_engine_kind())

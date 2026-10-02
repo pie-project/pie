@@ -1,4 +1,4 @@
-
+//#include "common/bf16.inc.wgsl"
 
 const HC_MAX_MULT = 8u;
 
@@ -49,3 +49,4 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+// pie:instantiate hc_fold_bf16

@@ -1,4 +1,4 @@
-
+//#include "common/bf16.inc.wgsl"
 
 @group(0) @binding(0) var<storage, read_write> x: array<u32>;
 @group(0) @binding(1) var<storage, read> gate: array<u32>;
@@ -32,3 +32,4 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+// pie:instantiate gate_sigmoid_mul_bf16 PIE_GROUP_X=256

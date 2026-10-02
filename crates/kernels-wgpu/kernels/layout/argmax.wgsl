@@ -1,9 +1,10 @@
+//#include "common/bf16.inc.wgsl"
 
-
+//#if defined(PIE_F32)
 @group(0) @binding(0) var<storage, read> x: array<f32>;
-
+//#else
 @group(0) @binding(0) var<storage, read> x: array<u32>;
-
+//#endif
 @group(0) @binding(1) var<storage, read_write> y: array<i32>;
 
 struct Params {
@@ -17,11 +18,11 @@ var<workgroup> sh_v: array<f32, PIE_GROUP_X>;
 var<workgroup> sh_i: array<u32, PIE_GROUP_X>;
 
 fn load_x(i: u32) -> f32 {
-
+//#if defined(PIE_F32)
     return x[i];
-
+//#else
     return pie_bf16_at(x[i >> 1u], i);
-
+//#endif
 }
 
 @compute @workgroup_size(PIE_GROUP_X)
@@ -62,3 +63,5 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     }
 }
 
+// pie:instantiate argmax_rows_bf16 PIE_GROUP_X=256
+// pie:instantiate argmax_rows_f32 PIE_GROUP_X=256 PIE_F32=1

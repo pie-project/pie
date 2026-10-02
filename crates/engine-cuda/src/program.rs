@@ -16,7 +16,9 @@ use crate::error::{Fault, Result};
 
 pub use compile::{Cache, Compiled, Disk, Module, Region, Stage, Target};
 pub use endpoint::Endpoint;
-pub use launch::{ChannelShape, Cursor, Prepared, Rings, describe_values, scratch_bytes, scratch_offsets};
+pub use launch::{
+    ChannelShape, Cursor, Prepared, Rings, describe_values, scratch_bytes, scratch_offsets,
+};
 pub use ports::Envelope;
 pub use session::{Fired, Launched, Session, seeds_of};
 pub use wave::Wave;
@@ -65,7 +67,9 @@ impl Program {
                 .get(index)
                 .is_some_and(|stage| !stage.regions.is_empty());
             stages.push(if launches {
-                Some(Prepared::build(stage_plan, &shapes, extents, lanes, stream)?)
+                Some(Prepared::build(
+                    stage_plan, &shapes, extents, lanes, stream,
+                )?)
             } else {
                 None
             });
@@ -84,7 +88,10 @@ impl Plane {
         bytes: u64,
     ) -> Result<(u64, u64)> {
         let bound = self.instances.get(&instance).ok_or_else(|| {
-            Fault::program("program::plane", format!("self-conditioning feed of unbound instance {instance}"))
+            Fault::program(
+                "program::plane",
+                format!("self-conditioning feed of unbound instance {instance}"),
+            )
         })?;
         let mut out = [0u64; 2];
         for (slot, id) in [rows, weights].into_iter().enumerate() {
@@ -101,7 +108,9 @@ impl Plane {
             if width < bytes {
                 return Err(Fault::program(
                     "program::plane",
-                    format!("self-conditioning feed channel {id}'s cell holds {width} bytes; the taps want {bytes}"),
+                    format!(
+                        "self-conditioning feed channel {id}'s cell holds {width} bytes; the taps want {bytes}"
+                    ),
                 ));
             }
             out[slot] = address;
@@ -113,14 +122,21 @@ impl Plane {
 impl Plane {
     fn dense_channel(&self, instance: u64, id: u64, what: &str) -> Result<(&Bound, u32)> {
         let bound = self.instances.get(&instance).ok_or_else(|| {
-            Fault::program("program::plane", format!("{what} of unbound instance {instance}"))
-        })?;
-        let dense = bound.ids.iter().position(|&held| held == id).ok_or_else(|| {
             Fault::program(
                 "program::plane",
-                format!("{what} names channel {id}, which instance {instance} does not carry"),
+                format!("{what} of unbound instance {instance}"),
             )
         })?;
+        let dense = bound
+            .ids
+            .iter()
+            .position(|&held| held == id)
+            .ok_or_else(|| {
+                Fault::program(
+                    "program::plane",
+                    format!("{what} names channel {id}, which instance {instance} does not carry"),
+                )
+            })?;
         Ok((bound, dense as u32))
     }
 
@@ -155,6 +171,7 @@ pub struct Plane {
     staged: Vec<(u64, Extents, u64)>,
     wave: Wave,
     shadow: bool,
+    flight: u32,
 }
 
 impl Default for Plane {
@@ -176,7 +193,15 @@ impl Plane {
             staged: Vec::new(),
             wave: Wave::default(),
             shadow: false,
+            flight: u32::MAX,
         }
+    }
+
+    /// The most lanes one flight of a program carries, whatever the fire's
+    /// width: a wider group flies in several, so its scratch is held at
+    /// this width rather than at the load's lanes.
+    pub fn set_flight(&mut self, lanes: u32) {
+        self.flight = lanes.max(1);
     }
 
     pub fn set_shadow(&mut self, shadow: bool) {
@@ -356,7 +381,10 @@ impl Plane {
         let program = self.programs.get(&bound.program_id).ok_or_else(|| {
             Fault::program(
                 "program::plane",
-                format!("instance {id} names program {}, which is gone", bound.program_id),
+                format!(
+                    "instance {id} names program {}, which is gone",
+                    bound.program_id
+                ),
             )
         })?;
         Ok(program.plan.needs_mtp_drafts)
@@ -394,11 +422,7 @@ impl Plane {
     }
 
     #[must_use]
-    pub fn disagreeing_ticket(
-        &self,
-        id: u64,
-        tickets: &[engine::Ticket],
-    ) -> Option<String> {
+    pub fn disagreeing_ticket(&self, id: u64, tickets: &[engine::Ticket]) -> Option<String> {
         let bound = self.instances.get(&id)?;
         for ticket in tickets {
             let Some(dense) = bound.ids.iter().position(|held| *held == ticket.channel) else {
@@ -476,6 +500,7 @@ impl Plane {
             programs,
             instances,
             staged,
+            flight,
             ..
         } = self;
 
@@ -491,23 +516,47 @@ impl Plane {
         }
 
         for (program_id, extents, members) in groups {
-            let program = programs.get_mut(&program_id).ok_or_else(|| {
-                Fault::program(
-                    "program::plane",
-                    format!("a staged fire names program {program_id}, which is gone"),
-                )
-            })?;
-            let ceiling = program
-                .batch(extents, 1, stream)?
-                .stages
-                .iter()
-                .flatten()
-                .map(Prepared::lane_ceiling)
-                .min()
-                .unwrap_or(u32::MAX)
-                .max(1) as usize;
-            for chunk in members.chunks(ceiling) {
-                Plane::fly_one(programs, instances, program_id, extents, chunk, stream)?;
+            let mut from = 0;
+            let mut refused: Option<(usize, Fault)> = None;
+            while from < members.len() {
+                let program = programs.get_mut(&program_id).ok_or_else(|| {
+                    Fault::program(
+                        "program::plane",
+                        format!("a staged fire names program {program_id}, which is gone"),
+                    )
+                })?;
+                let ceiling = program
+                    .batch(extents, 1, stream)?
+                    .stages
+                    .iter()
+                    .flatten()
+                    .map(Prepared::lane_ceiling)
+                    .min()
+                    .unwrap_or(u32::MAX)
+                    .min(*flight)
+                    .max(1) as usize;
+                if let Some((width, fault)) = refused.take()
+                    && ceiling >= width
+                {
+                    return Err(fault);
+                }
+                let to = members.len().min(from + ceiling);
+                match Plane::fly_one(
+                    programs,
+                    instances,
+                    program_id,
+                    extents,
+                    &members[from..to],
+                    stream,
+                ) {
+                    Ok(()) => from = to,
+                    // The scratch did not fit at this width and the stage capped
+                    // its lanes under it: the same members fly again, narrower.
+                    Err(fault @ Fault::OutOfMemory { .. }) if to - from > 1 => {
+                        refused = Some((to - from, fault));
+                    }
+                    Err(fault) => return Err(fault),
+                }
             }
         }
         Ok(())

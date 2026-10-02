@@ -34,6 +34,10 @@ pub struct Buffer {
     slab: Slab,
     bytes: u64,
     keep: Option<std::sync::Arc<crate::mapping::Mapping>>,
+    /// `false` for a placement sparse buffer: it is a page table over
+    /// heaps, and `contents()` names nothing. Host access to those bytes
+    /// goes through the heaps (`device::elastic::Elastic`), not this view.
+    host: bool,
 }
 
 impl std::fmt::Debug for Buffer {
@@ -41,6 +45,7 @@ impl std::fmt::Debug for Buffer {
         f.debug_struct("Buffer")
             .field("bytes", &self.bytes)
             .field("mapped", &self.keep.is_some())
+            .field("host", &self.host)
             .finish()
     }
 }
@@ -48,6 +53,54 @@ impl std::fmt::Debug for Buffer {
 // SAFETY: `MTLBuffer` is thread-safe for retain/release, `contents`, and
 // encoder binding; `Send` only permits the one-time move onto the firing thread.
 unsafe impl Send for Buffer {}
+
+#[derive(Debug)]
+pub(crate) struct DeferredZeroBuffer {
+    buffer: Buffer,
+    initialized: std::cell::Cell<bool>,
+}
+
+impl DeferredZeroBuffer {
+    pub(crate) fn new(device: &super::Context, bytes: u64) -> Result<Self> {
+        #[cfg(target_vendor = "apple")]
+        {
+            let slab = if bytes == 0 {
+                device.empty()
+            } else {
+                device.reserve(bytes)?
+            };
+            Ok(Self {
+                buffer: Buffer {
+                    slab,
+                    bytes,
+                    keep: None,
+                    host: true,
+                },
+                initialized: std::cell::Cell::new(false),
+            })
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = (device, bytes);
+            Err(Fault::Deviceless)
+        }
+    }
+
+    pub(crate) fn get(&self) -> Result<&Buffer> {
+        if !self.initialized.get() {
+            let mut buffer = self.buffer.clone();
+            buffer.zero_span(0, buffer.bytes())?;
+            self.initialized.set(true);
+        }
+        Ok(&self.buffer)
+    }
+
+    pub(crate) fn clear(&mut self) -> Result<()> {
+        self.buffer.zero_span(0, self.buffer.bytes())?;
+        self.initialized.set(true);
+        Ok(())
+    }
+}
 
 impl Buffer {
     pub fn zeroed(device: &super::Context, bytes: u64) -> Result<Buffer> {
@@ -58,6 +111,7 @@ impl Buffer {
                     slab: device.empty(),
                     bytes: 0,
                     keep: None,
+                    host: true,
                 });
             }
             let slab = device.reserve(bytes)?;
@@ -65,6 +119,7 @@ impl Buffer {
                 slab,
                 bytes,
                 keep: None,
+                host: true,
             };
             buffer.zero_span(0, bytes)?;
             Ok(buffer)
@@ -158,6 +213,7 @@ impl Buffer {
                 slab,
                 bytes: cut.bytes(),
                 keep: Some(map),
+                host: true,
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -167,9 +223,29 @@ impl Buffer {
         }
     }
 
+    /// A binding view over a placement sparse buffer of `bytes` (its
+    /// un-rounded length). Encoders bind and blit it like any other buffer;
+    /// `read`, `write` and `zero_span` refuse it, because the sparse buffer
+    /// has no host contents of its own.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn sparse_view(slab: Slab, bytes: u64) -> Buffer {
+        Buffer {
+            slab,
+            bytes,
+            keep: None,
+            host: false,
+        }
+    }
+
     #[must_use]
     pub fn is_mapped(&self) -> bool {
         self.keep.is_some()
+    }
+
+    /// Whether `contents()` names these bytes on the host.
+    #[must_use]
+    pub fn is_host(&self) -> bool {
+        self.host
     }
 
     #[must_use]
@@ -200,6 +276,7 @@ impl Buffer {
     }
 
     fn writable(&self, step: &'static str) -> Result<()> {
+        self.hosted(step)?;
         match &self.keep {
             None => Ok(()),
             Some(map) => Err(Fault::Mapped {
@@ -208,6 +285,18 @@ impl Buffer {
                 why: "a reservation served from an artifact's own mapped pages is read-only".into(),
             }),
         }
+    }
+
+    fn hosted(&self, step: &'static str) -> Result<()> {
+        if self.host {
+            return Ok(());
+        }
+        Err(Fault::Device {
+            call: step,
+            why: "a placement sparse buffer has no host contents; its bytes live in the \
+                  heaps mapped under it"
+                .to_string(),
+        })
     }
 
     pub fn write_from_file(
@@ -356,6 +445,7 @@ impl Buffer {
     }
 
     pub fn read(&self, offset: u64, into: &mut [u8]) -> Result<()> {
+        self.hosted("read")?;
         self.span(offset, into.len() as u64)?;
         #[cfg(target_vendor = "apple")]
         {
@@ -427,4 +517,32 @@ unsafe fn pread_all(fd: std::os::fd::RawFd, dst: *mut u8, from: u64, len: u64) -
         done += got as u64;
     }
     Ok(())
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod deferred_zero_tests {
+    use super::*;
+
+    #[test]
+    fn first_access_clears_dirty_storage_but_later_access_preserves_writes() {
+        let device = crate::device::Context::bind().unwrap();
+        for bytes in [0, 1, 4096, 39731968] {
+            let mut scratch = DeferredZeroBuffer::new(&device, bytes).unwrap();
+            scratch
+                .buffer
+                .write(0, &vec![0xa5; bytes as usize])
+                .unwrap();
+            assert!(!scratch.initialized.get());
+            let mut data = vec![0xff; bytes as usize];
+            scratch.get().unwrap().read(0, &mut data).unwrap();
+            assert!(data.iter().all(|&b| b == 0));
+            let mut live = scratch.get().unwrap().clone();
+            live.write(0, &vec![0x5a; bytes as usize]).unwrap();
+            scratch.get().unwrap().read(0, &mut data).unwrap();
+            assert!(data.iter().all(|&b| b == 0x5a));
+            scratch.clear().unwrap();
+            scratch.get().unwrap().read(0, &mut data).unwrap();
+            assert!(data.iter().all(|&b| b == 0));
+        }
+    }
 }

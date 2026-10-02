@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use pie::{compose, derive, local, ops, ui};
+use pie::{compose, derive, ops, ui};
 #[derive(Parser, Debug)]
 #[command(
     name = "pie",
@@ -47,6 +47,11 @@ enum Command {
     Inferlet {
         #[command(subcommand)]
         cmd: ops::inferlet::InferletCmd,
+    },
+
+    Language {
+        #[command(subcommand)]
+        cmd: ops::language::LanguageCmd,
     },
 
     Doctor,
@@ -114,7 +119,10 @@ async fn run() -> anyhow::Result<ExitCode> {
 
         Command::Run(args) => ops::run::run(&cli.global, args, cli.diag.as_deref()).await?,
         Command::Config { cmd } => ops::config::run(cmd, &cli.global).await?,
-        Command::Inferlet { cmd } => ops::inferlet::run(cmd, &cli.global).await?,
+        Command::Inferlet { cmd } => ops::inferlet::run(cmd).await?,
+        Command::Language { cmd } => {
+            tokio::task::spawn_blocking(move || ops::language::run(cmd)).await??
+        }
     };
 
     let code = answer.code();
@@ -131,18 +139,13 @@ async fn serve(global: bootstrap::GlobalArgs, diag: Option<&str>) -> anyhow::Res
     if let Some(words) = diag {
         worker.state_diagnostics(words)?;
     }
-    let want_python = worker.sandbox.python_runtime;
-    tokio::task::spawn_blocking(move || {
-        local::py_runtime::ensure_installed_best_effort(want_python)
-    })
-    .await
-    .ok();
     let handle = compose::run_standalone(controller, gateway, worker).await?;
     tracing::info!(
         listen = %handle.listen_addr,
         worker = %handle.worker_addr,
         "pie standalone serving",
     );
+    println!("✓ Server ready at ws://{}", handle.listen_addr);
     Ok(ctx
         .run_until_signal(async move { handle.shutdown().await })
         .await)

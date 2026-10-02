@@ -15,7 +15,7 @@ const TOKENIZER_OFFLOAD_THRESHOLD: usize = 64;
 impl pie::inferlet::tokenizer::Host for ProcessCtx {
     async fn encode(&mut self, text: String) -> Result<Vec<u32>> {
         if text.len() >= TOKENIZER_OFFLOAD_THRESHOLD * 4 {
-            return Ok(tokio::task::spawn_blocking(move || model::model().tokenize(&text)).await?);
+            return Ok(crate::rt::spawn_blocking(move || model::model().tokenize(&text)).await?);
         }
         let ids = model::model().tokenize(&text);
         Ok(ids)
@@ -23,7 +23,7 @@ impl pie::inferlet::tokenizer::Host for ProcessCtx {
 
     async fn decode(&mut self, tokens: Vec<u32>) -> Result<Result<String, String>> {
         if tokens.len() >= TOKENIZER_OFFLOAD_THRESHOLD {
-            return Ok(Ok(tokio::task::spawn_blocking(move || {
+            return Ok(Ok(crate::rt::spawn_blocking(move || {
                 model::model().detokenize(&tokens)
             })
             .await?));
@@ -32,7 +32,7 @@ impl pie::inferlet::tokenizer::Host for ProcessCtx {
     }
 
     async fn vocabs(&mut self) -> Result<Vec<pie::inferlet::tokenizer::Token>> {
-        Ok(tokio::task::spawn_blocking(|| token_table(model::model().get_vocabs())).await?)
+        Ok(crate::rt::spawn_blocking(|| token_table(model::model().get_vocabs())).await?)
     }
 
     async fn token_bytes(&mut self, tokens: Vec<u32>) -> Result<Vec<Vec<u8>>> {
@@ -40,7 +40,7 @@ impl pie::inferlet::tokenizer::Host for ProcessCtx {
     }
 
     async fn tokens_with_prefix(&mut self, prefix: Vec<u8>) -> Result<Vec<u32>> {
-        Ok(tokio::task::spawn_blocking(move || model::model().tokens_with_prefix(&prefix)).await?)
+        Ok(crate::rt::spawn_blocking(move || model::model().tokens_with_prefix(&prefix)).await?)
     }
 
     async fn split_regex(&mut self) -> Result<String> {

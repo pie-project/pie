@@ -1,0 +1,18 @@
+[package]
+name = "kernels-xla"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Pure XLA kernel definitions: every entry emits StableHLO text for its op into an Emit sink. Mirrors kernels-wgpu's surface; an engine Run resolves plan ids to handles and calls these entry functions, then compiles and runs what they emitted through PJRT."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "kernels_xla"
+path = "src/lib.rs"
+
+[dependencies]
+dtype = { package = "pie-dtype", path = "../dtype" }
+
+[lints]
+workspace = true

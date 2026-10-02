@@ -362,6 +362,42 @@ __global__ void pool_state_write(
 }
 
 template <class T>
+__global__ void index_block_mean_paged(
+    const T* __restrict__ key_pages,
+    T* __restrict__ out,
+    const i32* __restrict__ boundary_pos,
+    const i32* __restrict__ boundary_req,
+    const u32* __restrict__ kv_page_indices,
+    const u32* __restrict__ kv_page_indptr,
+    int head_dim,
+    int ratio,
+    int page_size) {
+    const int c = blockIdx.x;
+    const int bpos = boundary_pos[c];
+    const int req = boundary_req[c];
+    T* orow = out + static_cast<long long>(c) * head_dim;
+
+    if (bpos < 0) {
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            orow[d] = Elem<T>::from_f32(0.f);
+        }
+        return;
+    }
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.f;
+        for (int i = 0; i < ratio; ++i) {
+            const int pos = bpos + i - (ratio - 1);
+            if (pos < 0) continue;
+            const long long slot =
+                paged_slot(kv_page_indices, kv_page_indptr, req, pos, page_size);
+            acc += Elem<T>::to_f32(key_pages[slot * head_dim + d]);
+        }
+        orow[d] = Elem<T>::from_f32(acc / static_cast<float>(ratio));
+    }
+}
+
+template <class T>
 __global__ void pool_gather_paged(
     const T* __restrict__ state_kv,
     const T* __restrict__ state_score,

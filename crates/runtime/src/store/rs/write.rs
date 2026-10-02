@@ -34,6 +34,13 @@ pub enum RsBufferTarget {
 }
 
 impl RsBufferTarget {
+    pub fn src(&self) -> Option<RsSlotId> {
+        match *self {
+            RsBufferTarget::Cow { src, .. } => Some(src),
+            _ => None,
+        }
+    }
+
     pub fn dst(&self) -> RsSlotId {
         match *self {
             RsBufferTarget::Fresh { dst, .. }

@@ -56,7 +56,9 @@ fn snapshot() -> Option<PathBuf> {
         .map(|entry| entry.path())
         .find(|path| {
             path.join("vae/config.json").is_file()
-                && path.join("vae/diffusion_pytorch_model.safetensors").is_file()
+                && path
+                    .join("vae/diffusion_pytorch_model.safetensors")
+                    .is_file()
         })
 }
 
@@ -131,7 +133,12 @@ fn word() -> u64 {
     .word()
 }
 
-fn fire(root: &PathBuf, max_voxels: u32, clip: [u32; 3], payload: &[f32]) -> (Vec<f32>, [u32; 3], f64, f64) {
+fn fire(
+    root: &PathBuf,
+    max_voxels: u32,
+    clip: [u32; 3],
+    payload: &[f32],
+) -> (Vec<f32>, [u32; 3], f64, f64) {
     let model = Model::ltx_2_5(Dtype::Bf16, 1);
     let src = checkpoint::file::diffusers::open(root)
         .unwrap_or_else(|why| panic!("{}: {why}", root.display()));
@@ -217,7 +224,9 @@ fn the_decoder_answers_the_reference_in_one_fire() {
         return;
     }
     let Some(root) = snapshot() else {
-        eprintln!("skipping the VAE parity gate: no Lightricks/LTX-2.5-Diffusers snapshot with a vae/");
+        eprintln!(
+            "skipping the VAE parity gate: no Lightricks/LTX-2.5-Diffusers snapshot with a vae/"
+        );
         return;
     };
     let Some(gold) = golden() else {
@@ -269,7 +278,10 @@ fn the_decoder_answers_the_reference_in_one_fire() {
     let per_frame: Vec<Score> = (0..frames as usize)
         .map(|f| {
             let at = f * out_plane * pixel_c;
-            score(&got[at..at + out_plane * pixel_c], &pixels[at..at + out_plane * pixel_c])
+            score(
+                &got[at..at + out_plane * pixel_c],
+                &pixels[at..at + out_plane * pixel_c],
+            )
         })
         .collect();
     for (f, s) in per_frame.iter().enumerate() {

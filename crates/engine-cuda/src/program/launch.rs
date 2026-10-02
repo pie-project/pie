@@ -1,9 +1,9 @@
 use eta_compiler::codegen::launch::{LaunchRegion, LaunchStagePlan};
 use eta_compiler::plan::{LibraryOp, RegionKind};
 use eta_exec::{
-    Extents, LANE_HEADER_BYTES, LANE_RECORD_BYTES, LaneChannelSlot, LaneHeader,
-    LaneRecord, LaneShape, Layout, Lifetime, NO_TICKET, OpParams, OpRuntime, SCRATCH_ALIGN,
-    ValueDesc, describe, layout, layout_reusing,
+    Extents, LANE_HEADER_BYTES, LANE_RECORD_BYTES, LaneChannelSlot, LaneHeader, LaneRecord,
+    LaneShape, Layout, Lifetime, NO_TICKET, OpParams, OpRuntime, SCRATCH_ALIGN, ValueDesc,
+    describe, layout, layout_reusing,
 };
 use eta_ir::Dtype;
 use eta_ir::container::HostRole;
@@ -218,7 +218,10 @@ pub struct Rings {
 }
 
 impl Rings {
-    pub fn allocate(shapes: &[ChannelShape], endpoints: Vec<Option<Arc<Endpoint>>>) -> Result<Rings> {
+    pub fn allocate(
+        shapes: &[ChannelShape],
+        endpoints: Vec<Option<Arc<Endpoint>>>,
+    ) -> Result<Rings> {
         if endpoints.len() != shapes.len() {
             return Err(Fault::program(
                 "program::launch",
@@ -255,7 +258,11 @@ impl Rings {
         let mut registry = Buffer::zeroed(full_at + slots * MAX_RING as usize)?;
         let cap1: Vec<u8> = shapes
             .iter()
-            .flat_map(|shape| u32::try_from(shape.ring()).unwrap_or(u32::MAX).to_le_bytes())
+            .flat_map(|shape| {
+                u32::try_from(shape.ring())
+                    .unwrap_or(u32::MAX)
+                    .to_le_bytes()
+            })
             .collect();
         registry.write(2 * words as u64, &cap1)?;
         let device = kernels_cuda::channel::Rings::new(
@@ -293,7 +300,10 @@ impl Rings {
         let mut full = vec![0u8; slots * MAX_RING as usize];
         for (channel, shape) in self.shapes.iter().enumerate() {
             let ring = shape.ring();
-            let cursor = cursors.get(channel).copied().unwrap_or(Cursor { head: 0, tail: 0 });
+            let cursor = cursors
+                .get(channel)
+                .copied()
+                .unwrap_or(Cursor { head: 0, tail: 0 });
             head.extend_from_slice(&((cursor.head % ring) as u32).to_le_bytes());
             tail.extend_from_slice(&((cursor.tail % ring) as u32).to_le_bytes());
             for sequence in cursor.head..cursor.tail {
@@ -471,6 +481,7 @@ pub struct Prepared {
     temporary_bytes: u32,
     region_rows: Vec<u32>,
     lanes: u32,
+    lane_cap: u32,
     filled: u32,
     bindings: Vec<u32>,
 }
@@ -746,7 +757,9 @@ fn region_rows(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Vec<u32> {
             match region.kind {
                 RegionKind::Generated => rows,
                 RegionKind::Library(LibraryOp::TopK) if selects(plan, region) => rows,
-                RegionKind::Library(LibraryOp::TopK | LibraryOp::Sort) => rows.min(ORDER_ROW_BLOCKS),
+                RegionKind::Library(LibraryOp::TopK | LibraryOp::Sort) => {
+                    rows.min(ORDER_ROW_BLOCKS)
+                }
                 RegionKind::Library(_) => 1,
             }
         })
@@ -766,7 +779,12 @@ fn selects(plan: &LaunchStagePlan, region: &LaunchRegion) -> bool {
 
 fn temporary_floor(plan: &LaunchStagePlan, descriptors: &[ValueDesc], rows: &[u32]) -> u64 {
     let align = |bytes: u64| bytes.next_multiple_of(u64::from(SCRATCH_ALIGN));
-    let widest = descriptors.iter().map(|d| u64::from(d.last)).max().unwrap_or(1).max(1);
+    let widest = descriptors
+        .iter()
+        .map(|d| u64::from(d.last))
+        .max()
+        .unwrap_or(1)
+        .max(1);
     plan.fused
         .iter()
         .zip(rows)
@@ -912,6 +930,7 @@ impl Prepared {
             temporary_bytes,
             region_rows,
             lanes: 0,
+            lane_cap: u32::MAX,
             filled: 0,
             bindings: plan.channel_bindings.clone(),
         };
@@ -923,6 +942,11 @@ impl Prepared {
         if lanes <= self.lanes {
             return Ok(());
         }
+        // The buffers the last growth outgrew were kept for the fires still
+        // reading them; freeing waits for the device, so it happens here,
+        // once per growth, rather than hoarding a generation per doubling
+        // until this batch is dropped.
+        self.retired.clear();
         let lanes = lanes
             .checked_next_power_of_two()
             .unwrap_or(lanes)
@@ -996,10 +1020,43 @@ impl Prepared {
 
         let scratch_bytes = (self.scratch_stride as usize * lanes as usize)
             .max(usize::try_from(SCRATCH_ALIGN).unwrap_or(256));
-        self.retired.push(std::mem::replace(
-            &mut self.scratch,
-            Buffer::zeroed_on(stream, scratch_bytes)?,
-        ));
+        // A program arrives after the load declared its pool, so this is the
+        // one allocation the pool's fit could only reserve for, not count.
+        // When it does not fit, the scratch this growth outgrew is freed
+        // first (the free waits for the fires reading it) and the growth is
+        // tried once more; past that the lanes are capped under this width
+        // and the wave flies narrower, and only one lane failing is final,
+        // since a frame past static admission has no retry to answer.
+        let scratch = match Buffer::zeroed_on(stream, scratch_bytes) {
+            Err(Fault::OutOfMemory { .. }) => {
+                self.scratch = Buffer::zeroed(0)?;
+                self.lanes = 0;
+                Buffer::zeroed_on(stream, scratch_bytes).map_err(|fault| match fault {
+                    Fault::OutOfMemory { need, have } if lanes > 1 => {
+                        self.lane_cap = lanes / 2;
+                        eprintln!(
+                            "engine-cuda: a guest program's scratch does not fit beside this \
+                             load at {lanes} lanes ({need} bytes wanted, {have} free); its \
+                             fires fly at most {} lanes wide",
+                            self.lane_cap
+                        );
+                        fault
+                    }
+                    Fault::OutOfMemory { need, have } => Fault::Residency(format!(
+                        "a guest program's scratch does not fit beside this load: {} bytes a \
+                         lane at {lanes} lanes wants {need}, and the device has {have} free once \
+                         the weights, the declared kv pool and everything else the load holds \
+                         are resident. Lower `[engine] max_forward_requests`, or state `[engine] \
+                         max_total_pages` under the count the load derived.",
+                        self.scratch_stride
+                    )),
+                    other => other,
+                })?
+            }
+            other => other?,
+        };
+        self.retired
+            .push(std::mem::replace(&mut self.scratch, scratch));
         self.retired.push(std::mem::replace(
             &mut self.pending,
             Buffer::zeroed_on(
@@ -1206,10 +1263,11 @@ impl Prepared {
     #[must_use]
     pub fn lane_ceiling(&self) -> u32 {
         if self.scratch_stride == 0 {
-            return u32::MAX;
+            return self.lane_cap;
         }
         u32::try_from(eta_exec::SCRATCH_MAX_BYTES / u64::from(self.scratch_stride))
             .unwrap_or(u32::MAX)
+            .min(self.lane_cap)
             .max(1)
     }
 
@@ -1233,9 +1291,7 @@ impl Prepared {
     }
 
     fn channel_slots_ptr(&self) -> u64 {
-        self.table.ptr()
-            + LANE_HEADER_BYTES
-            + u64::from(self.lanes) * LANE_RECORD_BYTES
+        self.table.ptr() + LANE_HEADER_BYTES + u64::from(self.lanes) * LANE_RECORD_BYTES
     }
 }
 
@@ -1259,8 +1315,11 @@ pub(super) fn record_bytes<T: Copy>(record: &T) -> Vec<u8> {
 pub(super) fn slice_bytes<T: Copy>(records: &[T]) -> Vec<u8> {
     // SAFETY: as `record_bytes`, over a contiguous run of them.
     unsafe {
-        std::slice::from_raw_parts(records.as_ptr().cast::<u8>(), std::mem::size_of_val(records))
-            .to_vec()
+        std::slice::from_raw_parts(
+            records.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(records),
+        )
+        .to_vec()
     }
 }
 
@@ -1380,7 +1439,7 @@ pub fn launch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn only_bool_is_packed_and_the_round_trip_is_lossless() {
         for (dtype, numel) in [
@@ -1414,5 +1473,4 @@ mod tests {
             }
         }
     }
-
 }

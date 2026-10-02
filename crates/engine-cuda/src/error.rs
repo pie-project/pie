@@ -197,7 +197,10 @@ impl fmt::Display for Fault {
                  its geometry and its payload disagree"
             ),
             Self::VoxelPayload { lane, what } => {
-                write!(f, "lane {lane} submitted clips this fire cannot seat: {what}")
+                write!(
+                    f,
+                    "lane {lane} submitted clips this fire cannot seat: {what}"
+                )
             }
             Self::Ceiling { what, need, have } => write!(
                 f,
@@ -214,11 +217,7 @@ impl fmt::Display for Fault {
                  lane's whole readable extent, because a short one masks out the tail \
                  rather than leaving it alone (a LONGER one is fine and is clipped)"
             ),
-            Self::MaskRows {
-                lane,
-                stated,
-                rows,
-            } => write!(
+            Self::MaskRows { lane, stated, rows } => write!(
                 f,
                 "lane {lane} states {stated} per-row masks and this fire feeds it \
                  {rows} token rows; `Masking::Rows` is one restriction PER query row \
@@ -395,10 +394,9 @@ impl fmt::Display for Fault {
                  fire. Bake with `fat_region_us: INFINITY` — every region \
                  always-launch, which is the correctness mechanism"
             ),
-            Self::Unbound { what } => write!(
-                f,
-                "this plan names {what}, which this shell does not bind"
-            ),
+            Self::Unbound { what } => {
+                write!(f, "this plan names {what}, which this shell does not bind")
+            }
             Self::Golden { key, why } => write!(
                 f,
                 "the golden refused this load: the body armed for {key} answers \

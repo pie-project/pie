@@ -16,13 +16,14 @@ pub mod units;
 
 pub use backend::{
     CudaNativeEngineOptions, MetalEngineOptions, VulkanEngineOptions, WgpuEngineOptions,
+    XlaEngineOptions,
 };
 pub use units::{ByteSize, Duration};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Client-facing listener, plus what pie fetches inferlets from.
+    /// Client-facing listener.
     /// OpenTelemetry export. Off by default.
     /// Batching and timeout policy. Every field has a measured default; the
     /// frame knobs are part of the guest contract.
@@ -265,10 +266,6 @@ pub struct ServerConfig {
     /// Independent of `--log-level`, which sets the tracing filter.
     #[serde(default)]
     pub verbose: bool,
-    /// Where `pie inferlet` downloads from, and where the engine fetches a
-    /// program it is asked to run but does not have.
-    #[serde(default = "default_registry")]
-    pub registry: String,
     /// Tokio worker threads. Derived from the visible CPUs, capped at 64.
     #[serde(default = "default_worker_threads")]
     pub worker_threads: usize,
@@ -283,7 +280,6 @@ impl Default for ServerConfig {
             host: default_host(),
             port: default_port(),
             verbose: false,
-            registry: default_registry(),
             worker_threads: default_worker_threads(),
             max_upload: default_max_upload(),
         }
@@ -306,9 +302,6 @@ fn default_host() -> String {
 }
 fn default_port() -> u16 {
     8080
-}
-fn default_registry() -> String {
-    "https://registry.pie-project.org/".to_string()
 }
 fn default_true() -> bool {
     true
@@ -390,16 +383,6 @@ pub struct SandboxConfig {
     /// Unused pool slots kept warm rather than torn down.
     #[serde(default = "default_warm_slots")]
     pub warm_slots: u32,
-    /// Apply the host-side snapshot optimization to Python components.
-    ///
-    /// On by default. It only affects bootstrap cost, so turning it off is a
-    /// debugging step -- it changes which wasmtime linker variant is built.
-    /// Fetch the Python WASM runtime at boot when it is missing. Python
-    /// inferlets need it; Rust inferlets do not.
-    #[serde(default = "default_true")]
-    pub python_snapshot: bool,
-    #[serde(default = "default_true")]
-    pub python_runtime: bool,
 }
 
 impl Default for SandboxConfig {
@@ -413,8 +396,6 @@ impl Default for SandboxConfig {
             max_memory: default_max_memory(),
             warm_memory: ByteSize::from_mib(0),
             warm_slots: default_warm_slots(),
-            python_snapshot: true,
-            python_runtime: true,
         }
     }
 }
@@ -496,6 +477,22 @@ pub struct ModelConfig {
     pub device_weight_budget: Option<ByteSize>,
     #[serde(default)]
     pub host_weight_budget: Option<ByteSize>,
+    /// How many pinned host bytes a preempted process's kv pages and
+    /// recurrent-state slots may be suspended into (`"32GiB"`), shared by
+    /// the tensor-parallel ranks: one rs row per device slot, then kv pages.
+    /// Omit for one device pool's worth; either is capped by the host
+    /// memory the load leaves free. `"0B"` turns host swap off, so kv
+    /// pressure restarts processes instead.
+    #[serde(default)]
+    pub host_kv_budget: Option<ByteSize>,
+    /// How many disk bytes suspended kv may spill into once host swap is
+    /// full (`"200GiB"`), shared by the ranks, each in its own preallocated
+    /// slot file under `disk_kv_path` (default `$PIE_HOME/cache/kv/<checkpoint
+    /// digest>`). `"0B"`, the default, turns the disk tier off.
+    #[serde(default)]
+    pub disk_kv_budget: Option<ByteSize>,
+    #[serde(default)]
+    pub disk_kv_path: Option<std::path::PathBuf>,
     /// **MAY A WARM BOOT DEFER THE PINNED TIER?** On (the default) T1's
     /// planes are verified where they lie in the artifact and served from
     /// there while a background thread builds the page-locked copy, so the
@@ -650,6 +647,9 @@ impl ModelConfig {
             device_weight_budget: self.device_weight_budget.map(|b| b.as_bytes()),
             host_weight_budget: self.host_weight_budget.map(|b| b.as_bytes()),
             deferred_tier: self.deferred_tier,
+            host_kv_budget: self.host_kv_budget.map(|b| b.as_bytes()),
+            disk_kv_budget: self.disk_kv_budget.map_or(0, |b| b.as_bytes()),
+            disk_kv_dir: self.disk_kv_path.clone(),
         }
     }
 
@@ -759,11 +759,6 @@ impl ModelConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
-    /// How long a client request may run before the runtime gives up on it.
-    /// The outermost of the three clocks here — bounds the answer a caller
-    /// is waiting for, distinct from `submit_deadline` and `silence_timeout`.
-    #[serde(default = "default_request_timeout")]
-    pub request_timeout: Duration,
     /// How long a pipeline hard-blocking a frame's seal may go without
     /// submitting before the runtime stops waiting for it, in microseconds.
     /// Does not fail the pipeline — the lane is dropped from the wait-set
@@ -796,7 +791,6 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            request_timeout: default_request_timeout(),
             submit_deadline: default_submit_deadline(),
             silence_timeout: default_silence_timeout(),
             frame_size: default_frame_size(),
@@ -808,10 +802,6 @@ impl Default for RuntimeConfig {
 
 impl RuntimeConfig {
     fn validate(&self) -> Result<()> {
-        ensure!(
-            self.request_timeout.as_micros() > 0,
-            "runtime.request_timeout must be > 0"
-        );
         ensure!(
             self.submit_deadline.as_micros() > 0,
             "runtime.submit_deadline must be > 0"
@@ -854,10 +844,6 @@ impl RuntimeConfig {
         }
         Ok(())
     }
-}
-
-fn default_request_timeout() -> Duration {
-    Duration::from_secs(120)
 }
 
 fn default_submit_deadline() -> Duration {
@@ -949,6 +935,17 @@ impl EngineConfig {
                 })?;
                 opts.validate()?;
             }
+            EngineKind::Xla => {
+                let opts: XlaEngineOptions = toml::Value::Table(self.options.clone())
+                    .try_into()
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "invalid [engine] options for engine type {:?}: {e}",
+                            self.kind,
+                        )
+                    })?;
+                opts.validate()?;
+            }
         }
         Ok(())
     }
@@ -972,6 +969,8 @@ pub enum EngineKind {
     /// The WebGPU shell — one binary over Vulkan, Metal, D3D12 or WebGPU,
     /// whichever the machine has.
     Wgpu,
+    /// The XLA shell: a PJRT plugin, libtpu on a TPU host.
+    Xla,
 }
 
 impl EngineKind {
@@ -981,6 +980,7 @@ impl EngineKind {
             EngineKind::Metal => "metal",
             EngineKind::Vulkan => "vulkan",
             EngineKind::Wgpu => "wgpu",
+            EngineKind::Xla => "xla",
         }
     }
 }
@@ -1068,9 +1068,11 @@ device = ["cpu"]
             ("sandbox", "wasm_max_memory_mb = 4096"),
             ("sandbox", "wasm_warm_memory_mb = 0"),
             ("server", "max_upload_mb = 256"),
-            ("runtime", "request_timeout_secs = 120"),
             ("runtime", "submit_deadline_us = 50000"),
             ("runtime", "silence_timeout_secs = 30"),
+            ("server", "registry = \"https://registry.pie-project.org/\""),
+            ("sandbox", "python_runtime = true"),
+            ("sandbox", "python_snapshot = true"),
         ] {
             let toml = format!("{MINIMAL_METAL}\n[{section}]\n{legacy}\n");
             assert!(
@@ -1146,6 +1148,7 @@ device = ["cpu"]
             (EngineKind::Metal, "metal"),
             (EngineKind::Vulkan, "vulkan"),
             (EngineKind::Wgpu, "wgpu"),
+            (EngineKind::Xla, "xla"),
         ];
         for (kind, spelled) in KINDS {
             assert_eq!(kind.as_str(), *spelled, "{kind:?} names itself");
@@ -1163,7 +1166,7 @@ device = ["cpu"]
         }
         assert_eq!(
             KINDS.len(),
-            4,
+            5,
             "an engine kind was added without a line here, so nothing checks its \
              config spelling"
         );
@@ -1178,12 +1181,19 @@ device = ["cpu"]
     }
 
     fn the_seat_count_is_stated_once_or_derived_from_the_roster() {
+        let plane = if cfg!(windows) {
+            "C:/adapters/0/a.bin"
+        } else {
+            "/adapters/0/a.bin"
+        };
         let toml = MINIMAL_METAL.replace(
             "model = \"Qwen/Qwen3-0.6B\"",
-            "model = \"Qwen/Qwen3-0.6B\"\n\n[model.adapters]\n\
-             [[model.adapters.registered]]\n\
-             id = 2\n\
-             planes = { \"layer.0.lora_a\" = \"/adapters/0/a.bin\" }\n",
+            &format!(
+                "model = \"Qwen/Qwen3-0.6B\"\n\n[model.adapters]\n\
+                 [[model.adapters.registered]]\n\
+                 id = 2\n\
+                 planes = {{ \"layer.0.lora_a\" = \"{plane}\" }}\n"
+            ),
         );
         let cfg: Config = toml::from_str(&toml).unwrap();
         cfg.validate().unwrap();
@@ -1191,7 +1201,7 @@ device = ["cpu"]
         assert_eq!(cfg.model.adapters.registered.len(), 1);
         assert_eq!(
             cfg.model.adapters.registered[0].planes["layer.0.lora_a"],
-            "/adapters/0/a.bin"
+            plane
         );
 
         let stated = toml.replace("[model.adapters]", "[model.adapters]\nseats = 8");

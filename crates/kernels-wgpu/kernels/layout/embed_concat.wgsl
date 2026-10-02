@@ -24,3 +24,4 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     out_[n * words + c] = v;
 }
 
+// pie:instantiate embed_concat_bf16

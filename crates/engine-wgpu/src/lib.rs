@@ -13,6 +13,7 @@ pub mod experts;
 
 pub mod guest;
 pub mod inputs;
+mod landing;
 pub mod mask;
 pub mod probe;
 pub mod program;
@@ -36,7 +37,9 @@ pub use api::{ContractFor, DeviceBoot, Wgpu};
 pub use arena::Arena;
 pub use blob::{Layout as AdapterLayout, Manifest as AdapterManifest, Stamp as AdapterStamp};
 pub use boot::open;
-pub use device::{Buffer, Context, Handles, Pipelines};
+#[cfg(feature = "wgpu")]
+pub use boot::{open_with_device, request_device};
+pub use device::{Buffer, Context, Handed, Handles, Pipelines};
 pub use encode::{
     Sink, host_copies, host_encode_ns, host_io, host_read_phases, host_submit_ns, host_wait_calls,
     kernel_profile, profile_shapes, profile_timing, reset_kernel_profile,

@@ -1,4 +1,7 @@
-
+//#include "common/bf16.inc.wgsl"
+//#if defined(PIE_SUBGROUP)
+//#include "common/subgroup.inc.wgsl"
+//#endif
 
 @group(0) @binding(0) var<storage, read> x: array<u32>;
 @group(0) @binding(1) var<storage, read> w: array<u32>;
@@ -28,6 +31,7 @@ fn write_pair(row: u32, col: u32, lo: f32, hi: f32) {
     out_[(row * u32(params.n) + col) >> 1u] = pie_pack_bf16(lo, hi);
 }
 
+//#if defined(PIE_GEMV)
 const PIE_KLANES = 32u;
 const PIE_NLANES = 8u;
 
@@ -52,11 +56,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
 
         let words = k >> 1u;
         var wide = 0u;
-
+//#if !defined(PIE_NARROW)
         if ((k & 1u) == 0u) {
             wide = (words / PIE_WIDE) * PIE_WIDE;
         }
-
+//#endif
         let xbase = row * words;
         let wbase = col * words;
         var wi = klane * PIE_WORDS;
@@ -75,7 +79,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
         }
     }
     let slot = clane * PIE_KLANES + klane;
-
+//#if defined(PIE_SUBGROUP)
 
     let folded = pie_subgroup_sum32(acc);
     if (klane == 0u) {
@@ -85,7 +89,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
     if (klane == 0u && (clane & 1u) == 0u) {
         write_pair(row, col, partial[clane], partial[clane + 1u]);
     }
-
+//#else
     partial[slot] = acc;
     workgroupBarrier();
     for (var step = PIE_KLANES / 2u; step > 0u; step = step >> 1u) {
@@ -97,9 +101,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
     if (klane == 0u && (clane & 1u) == 0u) {
         write_pair(row, col, partial[clane * PIE_KLANES], partial[(clane + 1u) * PIE_KLANES]);
     }
-
+//#endif
 }
-
+//#else
 
 const PIE_BN = 64u;
 const PIE_BK = 16u;
@@ -189,16 +193,16 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
         workgroupBarrier();
         for (var kk = 0u; kk < PIE_BK; kk = kk + 1u) {
             let wv = ws[kk * PIE_BN4 + tx];
-
+//#if PIE_BM == 64
             let xv = xs[kk * (PIE_BM / 4u) + ty];
             acc[0] = acc[0] + xv.x * wv;
             acc[1] = acc[1] + xv.y * wv;
             acc[2] = acc[2] + xv.z * wv;
             acc[3] = acc[3] + xv.w * wv;
-
+//#else
             let xv = xs[kk * (PIE_BM / 4u) + ty / 4u][ty & 3u];
             acc[0] = acc[0] + xv * wv;
-
+//#endif
         }
     }
     let col = tile_col + tx * 4u;
@@ -208,6 +212,12 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
         write_pair(row, col + 2u, acc[i].z, acc[i].w);
     }
 }
+//#endif
 
+// pie:instantiate dense_gemv_t_bf16 PIE_GEMV=1
+// pie:instantiate dense_gemm_t_bf16 PIE_BM=64
+// pie:instantiate dense_gemm_t16_bf16 PIE_BM=16
+// pie:instantiate dense_gemv_t_bf16 @subgroup PIE_GEMV=1
 
-
+// pie:instantiate dense_gemv_narrow_bf16 PIE_GEMV=1 PIE_NARROW=1
+// pie:instantiate dense_gemv_narrow_bf16 @subgroup PIE_GEMV=1 PIE_NARROW=1

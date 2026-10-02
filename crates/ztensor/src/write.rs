@@ -357,6 +357,8 @@ impl Writer {
                 Ok(())
             }
         })?;
+        // wasm32's stand-in `File` has nothing to close, hence the allow.
+        #[allow(clippy::drop_non_drop)]
         drop(file);
 
         if let Some(final_path) = self.publish_to.take() {

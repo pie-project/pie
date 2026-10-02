@@ -272,13 +272,27 @@ fn layer_reads<'a>(
     reads: &mut Vec<Read<'a>>,
 ) {
     match &w.mixer {
-        Mixer::Attn(a) => {
+        Mixer::Attn { attn: a, indexer } => {
             reads.push(Read::One(&a.qg_proj, n("self_attn.q_proj.weight")));
             reads.push(Read::One(&a.k_proj, n("self_attn.k_proj.weight")));
             reads.push(Read::One(&a.v_proj, n("self_attn.v_proj.weight")));
             reads.push(Read::One(&a.o_proj, n("self_attn.o_proj.weight")));
             reads.push(Read::Norm(&a.q_norm, n("self_attn.q_norm.weight")));
             reads.push(Read::Norm(&a.k_norm, n("self_attn.k_norm.weight")));
+            if let Some(ix) = indexer {
+                reads.push(Read::One(
+                    &ix.qk_proj,
+                    n("self_attn.indexer.index_qk_proj.weight"),
+                ));
+                reads.push(Read::Norm(
+                    &ix.q_norm,
+                    n("self_attn.indexer.q_layernorm.weight"),
+                ));
+                reads.push(Read::Norm(
+                    &ix.k_norm,
+                    n("self_attn.indexer.k_layernorm.weight"),
+                ));
+            }
         }
         Mixer::Gdn(g) => {
             reads.push(Read::Concat(

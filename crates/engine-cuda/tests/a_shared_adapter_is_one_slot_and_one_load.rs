@@ -14,10 +14,7 @@ fn scratch(what: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_nanos())
         .unwrap_or(0);
-    let at = std::env::temp_dir().join(format!(
-        "pie-blob-{what}-{}-{nanos}",
-        std::process::id()
-    ));
+    let at = std::env::temp_dir().join(format!("pie-blob-{what}-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&at).expect("a scratch directory");
     at
 }
@@ -129,9 +126,7 @@ fn two_instances_of_one_blob_share_one_slot_and_one_landing() {
         .expect("the second bind joins it");
     let third = adapters
         .bind(
-            Source::Shared {
-                name: "/alice-v2",
-            },
+            Source::Shared { name: "/alice-v2" },
             &seats,
             landings.land(),
         )
@@ -384,11 +379,7 @@ fn the_resolver_slices_per_layer_and_pads_per_orientation() {
                 true => source(hidden * rank + row * hidden + col),
                 false => [0, 0],
             };
-            assert_eq!(
-                &a[at..at + 2],
-                &want,
-                "A row {row} col {col} of layer 1"
-            );
+            assert_eq!(&a[at..at + 2], &want, "A row {row} col {col} of layer 1");
         }
     }
 
@@ -404,11 +395,7 @@ fn the_resolver_slices_per_layer_and_pads_per_orientation() {
                 true => source(hidden * rank + row * rank + col),
                 false => [0, 0],
             };
-            assert_eq!(
-                &b[at..at + 2],
-                &want,
-                "B row {row} col {col} of layer 1"
-            );
+            assert_eq!(&b[at..at + 2], &want, "B row {row} col {col} of layer 1");
         }
     }
 }
@@ -422,7 +409,10 @@ fn the_refusals_fire_by_name() {
         .bind(Source::Shared { name: "alice" }, &seats, landings.land())
         .expect_err("nothing is mounted")
         .to_string();
-    assert!(said.contains("no shared adapter directory mounted"), "{said}");
+    assert!(
+        said.contains("no shared adapter directory mounted"),
+        "{said}"
+    );
 
     let mount = scratch("refusals");
     write_adapter(&mount, "alice", 4, (Layout::RankMajor, Layout::OutMajor));
@@ -463,12 +453,7 @@ fn the_refusals_fire_by_name() {
     assert!(said.contains("carries 8 bytes"), "{said}");
     assert!(said.contains("want 384"), "{said}");
 
-    write_adapter(
-        &mount,
-        "flipped",
-        4,
-        (Layout::RankMajor, Layout::RankMajor),
-    );
+    write_adapter(&mount, "flipped", 4, (Layout::RankMajor, Layout::RankMajor));
     let said = adapters
         .bind(Source::Shared { name: "flipped" }, &seats, landings.land())
         .expect_err("a rank-major B")

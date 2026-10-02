@@ -257,15 +257,22 @@ pub fn topk_sigmoid_sink(
         ));
     }
     if let Some(bias) = &correction_bias {
-        debug_assert_eq!(bias.dtype, Dtype::F32, "`{OP}` reads an f32 correction bias");
+        debug_assert_eq!(
+            bias.dtype,
+            Dtype::F32,
+            "`{OP}` reads an f32 correction bias"
+        );
     }
     if let Some(scale) = &global_scale {
         debug_assert_eq!(scale.dtype, Dtype::F32, "`{OP}` reads an f32 global scale");
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::linear::moe_topk_sigmoid_sink<{t}>")))
-            .apply(rms(logits.rows)),
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::linear::moe_topk_sigmoid_sink<{t}>")),
+        )
+        .apply(rms(logits.rows)),
         &[
             logits.arg(),
             routes.arg(),
@@ -474,8 +481,8 @@ fn select_grouped(
     experts: u32,
 ) -> Result<(), Error> {
     use cudarc::cublas::sys::{
-        cublasComputeType_t, cublasContext, cublasGemmAlgo_t, cublasGemmBatchedEx,
-        cublasHandle_t, cublasOperation_t, cublasStatus_t, cudaDataType,
+        cublasComputeType_t, cublasContext, cublasGemmAlgo_t, cublasGemmBatchedEx, cublasHandle_t,
+        cublasOperation_t, cublasStatus_t, cudaDataType,
     };
 
     let (t, scalar) = match x.dtype {
@@ -494,9 +501,12 @@ fn select_grouped(
     let per_expert = fan.route_count.div_ceil(experts);
     let block = block_rows(per_expert);
     let blocks = experts + fan.route_count.div_ceil(block);
-    let rows = blocks
-        .checked_mul(block)
-        .ok_or_else(|| refuse(op, format!("{blocks} blocks of {block} rows overflow the fire")))?;
+    let rows = blocks.checked_mul(block).ok_or_else(|| {
+        refuse(
+            op,
+            format!("{blocks} blocks of {block} rows overflow the fire"),
+        )
+    })?;
 
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
@@ -509,7 +519,12 @@ fn select_grouped(
     let elem = x.dtype.bytes_ceil();
     let slab = |name: &'static str, bytes: u64| -> Result<u64, Error> {
         usize::try_from(bytes)
-            .map_err(|_| refuse(op, format!("{name} wants {bytes} bytes, past this host's usize")))
+            .map_err(|_| {
+                refuse(
+                    op,
+                    format!("{name} wants {bytes} bytes, past this host's usize"),
+                )
+            })
             .and_then(|bytes| ctx.scratch(op, name, bytes))
             .map(|ptr| ptr as usize as u64)
     };
@@ -530,9 +545,8 @@ fn select_grouped(
 
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::moe_align_decode<::pie::i32>").apply(
-            Launch::grid([1, 1, 1], [BLOCK, 1, 1]).smem((3 * experts + 34) * 4),
-        ),
+        Fire::at(FILE, "::pie::linear::moe_align_decode<::pie::i32>")
+            .apply(Launch::grid([1, 1, 1], [BLOCK, 1, 1]).smem((3 * experts + 34) * 4)),
         &[
             routes.arg(),
             ArgValue::Ptr(sorted),
@@ -763,41 +777,46 @@ fn matmul_select_mxfp4(
     const ROUTE_ORDER: &str = "moe_route_order";
     const ORDER_BLOCK: u32 = 1024;
     const EXPERT_CAP: u32 = 4096;
-    const GROUPED_FROM: u32 = 16;
+    // The grouped kernels read an expert once per batch of its routes, the
+    // by-route one once per route but at the card's streaming rate, so grouping
+    // pays only once an expert serves more than two routes on average; routes
+    // over experts is a floor on that average.
+    const GROUPED_REUSE: u32 = 2;
     const GROUPED_TILE_N: u32 = 128;
     const GROUPED_BLOCK: u32 = 256;
     const WMMA_ROUTES: u32 = 32;
 
     let experts = codes.rows.clamp(1, EXPERT_CAP);
-    let order_words = fan.route_count as usize;
-    let offsets_at = order_words.next_multiple_of(64);
-    let work_cap = fan.route_count.div_ceil(WMMA_ROUTES) + experts;
-    let work_at = (offsets_at + experts as usize + 2).next_multiple_of(64);
-    let order = ctx.scratch(
-        op,
-        ROUTE_ORDER,
-        (work_at + work_cap as usize) * core::mem::size_of::<i32>(),
-    )? as usize as u64;
-    let offsets = order + (offsets_at * core::mem::size_of::<i32>()) as u64;
-    let work = order + (work_at * core::mem::size_of::<i32>()) as u64;
-    ctx.fire(
-        op,
-        Fire::at("linear/quant.cuh", symbol("::pie::linear::moe_route_order"))
-            .apply(Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1]).smem(2 * (experts + 1) * 4)),
-        &[
-            routes.arg(),
-            ArgValue::Ptr(order),
-            ArgValue::Ptr(offsets),
-            ArgValue::Ptr(work),
-            stated(op, work_cap)?.arg(),
-            WMMA_ROUTES.arg(),
-            fan.top_k.arg(),
-            stated(op, fan.route_count)?.arg(),
-            stated(op, experts)?.arg(),
-            ctx.stage(),
-        ],
-    )?;
-    if fan.route_count >= GROUPED_FROM && std::env::var_os("PIE_NO_MXFP4_GROUP").is_none() {
+    if fan.route_count > GROUPED_REUSE * experts && std::env::var_os("PIE_NO_MXFP4_GROUP").is_none()
+    {
+        let order_words = fan.route_count as usize;
+        let offsets_at = order_words.next_multiple_of(64);
+        let work_cap = fan.route_count.div_ceil(WMMA_ROUTES) + experts;
+        let work_at = (offsets_at + experts as usize + 2).next_multiple_of(64);
+        let order = ctx.scratch(
+            op,
+            ROUTE_ORDER,
+            (work_at + work_cap as usize) * core::mem::size_of::<i32>(),
+        )? as usize as u64;
+        let offsets = order + (offsets_at * core::mem::size_of::<i32>()) as u64;
+        let work = order + (work_at * core::mem::size_of::<i32>()) as u64;
+        ctx.fire(
+            op,
+            Fire::at("linear/quant.cuh", symbol("::pie::linear::moe_route_order"))
+                .apply(Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1]).smem(2 * (experts + 1) * 4)),
+            &[
+                routes.arg(),
+                ArgValue::Ptr(order),
+                ArgValue::Ptr(offsets),
+                ArgValue::Ptr(work),
+                stated(op, work_cap)?.arg(),
+                WMMA_ROUTES.arg(),
+                fan.top_k.arg(),
+                stated(op, fan.route_count)?.arg(),
+                stated(op, experts)?.arg(),
+                ctx.stage(),
+            ],
+        )?;
         let wmma = x.dtype == Dtype::Bf16 && std::env::var_os("PIE_MXFP4_NO_WMMA").is_none();
         let entry = if wmma {
             "::pie::linear::moe_matmul_select_mxfp4_wmma".to_string()
@@ -913,9 +932,21 @@ fn matmul_select_mlxu4(
     const DECODE_BLOCK: u32 = 128;
 
     let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    debug_assert_eq!(codes.dtype, Dtype::U8, "a packed bank's planes bind as bytes");
-    debug_assert_eq!(scales.dtype, Dtype::U8, "a packed bank's planes bind as bytes");
-    debug_assert_eq!(biases.dtype, Dtype::U8, "a packed bank's planes bind as bytes");
+    debug_assert_eq!(
+        codes.dtype,
+        Dtype::U8,
+        "a packed bank's planes bind as bytes"
+    );
+    debug_assert_eq!(
+        scales.dtype,
+        Dtype::U8,
+        "a packed bank's planes bind as bytes"
+    );
+    debug_assert_eq!(
+        biases.dtype,
+        Dtype::U8,
+        "a packed bank's planes bind as bytes"
+    );
     let fan = selected(op, x, routes, y)?;
     let k = stated(op, nonzero(op, "K, the bank's contracted width", x.width)?)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
@@ -1026,7 +1057,11 @@ fn matmul_select_mlxu4(
         return ctx.fire(
             op,
             Fire::at("linear/quant.cuh", symbol(&entry)).apply(Launch::grid(
-                [if wmma { work_cap } else { experts }, y.width.div_ceil(GROUPED_TILE_N), 1],
+                [
+                    if wmma { work_cap } else { experts },
+                    y.width.div_ceil(GROUPED_TILE_N),
+                    1,
+                ],
                 [GROUPED_BLOCK, 1, 1],
             )),
             &args,

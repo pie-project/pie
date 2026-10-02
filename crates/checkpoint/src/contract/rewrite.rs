@@ -161,22 +161,30 @@ fn emit_row_shard_bank(
         parts.push(Expr::src(raw.name.clone()).slice(0, local_start, local_rows));
     }
 
+    // The bank is the compiler's own staging buffer: no plan names it, so it
+    // must never be published (an engine's sink refuses a name it does not
+    // index — "the load contract publishes `__pie.row_shard_bank.0`, which
+    // this plan does not name"). The members keep everything the author
+    // declared besides their expression and shape: a scale plane that loses
+    // its `scaling(...)` binds no quantized weight any more.
     let bank_name = format!("__pie.row_shard_bank.{group_id}");
-    new_tensors.push(TensorContract::new(
-        bank_name.clone(),
-        Expr::concat(0, parts),
-        vec![local_rows * indices.len() as i64, cols],
-        first.encoding.clone(),
-    ));
+    new_tensors.push(
+        TensorContract::new(
+            bank_name.clone(),
+            Expr::concat(0, parts),
+            vec![local_rows * indices.len() as i64, cols],
+            first.encoding.clone(),
+        )
+        .internal(),
+    );
 
     for (slot, &old_index) in indices.iter().enumerate() {
         let original = &contract.tensors[old_index];
-        new_tensors.push(TensorContract::new(
-            original.name.clone(),
-            Expr::out(bank_name.clone()).slice(0, slot as i64 * local_rows, local_rows),
-            vec![local_rows, cols],
-            original.encoding.clone(),
-        ));
+        new_tensors.push(TensorContract {
+            expr: Expr::out(bank_name.clone()).slice(0, slot as i64 * local_rows, local_rows),
+            shape: Some(vec![local_rows, cols]),
+            ..original.clone()
+        });
     }
     Ok(())
 }

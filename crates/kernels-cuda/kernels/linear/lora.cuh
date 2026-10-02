@@ -2,7 +2,6 @@
 
 #include "prelude/device.cuh"
 
-
 namespace pie::linear {
 
 [[maybe_unused]] constexpr int kLoraBlock = 256;
@@ -26,7 +25,10 @@ __global__ void lora_combine(
         row = segments[2 * seg] + (int)blockIdx.y;
     }
 
-    if (win != nullptr && row >= (int)win[0]) return;
+    if (win != nullptr) {
+        if (row >= (int)win[0]) return;
+        row += (int)win[1];
+    }
     const int adapter = routes[row];
     if (adapter < 0) return;
 

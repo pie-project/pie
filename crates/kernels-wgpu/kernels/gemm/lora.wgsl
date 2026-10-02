@@ -1,4 +1,5 @@
-
+//#include "common/bf16.inc.wgsl"
+//#include "common/reduce.inc.wgsl"
 
 const PIE_MAX_RANK = 128u;
 
@@ -16,16 +17,24 @@ struct Params {
 @group(0) @binding(5) var<uniform> params: Params;
 
 var<workgroup> waist: array<f32, PIE_MAX_RANK>;
+// Values read from storage that steer control flow around a barrier are
+// made workgroup-uniform through `workgroupUniformLoad`: Tint (Chrome's WGSL
+// front end) cannot see that every invocation reads the same word, and it
+// refuses a barrier under a branch it cannot prove uniform.
+var<workgroup> pie_uniform: vec4<i32>;
 
 @compute @workgroup_size(PIE_GROUP_X)
 fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) local: vec3<u32>) {
     let row = group.y;
-    let adapter = routes[row];
+    let lid = local.x;
+    if (lid == 0u) {
+        pie_uniform = vec4<i32>(routes[row], 0, 0, 0);
+    }
+    let adapter = workgroupUniformLoad(&pie_uniform).x;
 
     if (adapter < 0) {
         return;
     }
-    let lid = local.x;
     let in_width = u32(max(params.in_width, 0));
     let out_width = u32(max(params.out_width, 0));
     let r = min(u32(max(params.rank, 0)), PIE_MAX_RANK);
@@ -65,3 +74,4 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     }
 }
 
+// pie:instantiate lora_correct_bf16 PIE_GROUP_X=256

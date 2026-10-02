@@ -203,6 +203,7 @@ impl Pools {
                     planes,
                     dtype,
                     space,
+                    ..
                 } => {
                     let planes = split(name, planes)?;
                     let width = planes.keys;
@@ -574,8 +575,9 @@ impl engine::frame::Supply for Pools {
     }
 }
 
-pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
-    let mut bytes: u64 = 0;
+/// The slab each cache row declares at `paging`, one device reservation a row.
+pub fn pool_slabs(trace: &Trace, paging: Paging) -> Result<Vec<u64>> {
+    let mut slabs = Vec::with_capacity(trace.caches.len());
     for row in &trace.caches {
         match row {
             CacheRow::Kv {
@@ -592,12 +594,12 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
                 } else {
                     planes.keys + planes.values
                 };
-                bytes = bytes.saturating_add(cells * width * element);
+                slabs.push(cells * width * element);
             }
             CacheRow::State { name, slab, dtype } => {
                 let stride: u64 = slab.iter().product();
                 let dtype = state_dtype(*dtype);
-                bytes = bytes.saturating_add(
+                slabs.push(
                     stride
                         .saturating_mul(u64::from(paging.slots))
                         .saturating_mul(elem_bytes(name, dtype)?),
@@ -605,7 +607,7 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
             }
         }
     }
-    Ok(bytes)
+    Ok(slabs)
 }
 
 struct Planes {

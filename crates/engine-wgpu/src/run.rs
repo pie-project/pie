@@ -81,6 +81,8 @@ pub struct FireBindings {
 
     pub positions: Tensor,
 
+    pub readout_rows: Tensor,
+
     pub adapter_routes: Option<Tensor>,
 
     pub patches: Option<Tensor>,
@@ -438,7 +440,7 @@ impl<'c> Run<'c> {
         let at = id.0 as usize;
         match &self.values[at].def {
             Def::Input(RuntimeInput::Tokens) => self.fire.tokens,
-            Def::Input(RuntimeInput::ReadoutRows) => self.fire.tokens,
+            Def::Input(RuntimeInput::ReadoutRows) => self.fire.readout_rows,
             Def::Input(RuntimeInput::Positions) => self.fire.positions,
 
             Def::Input(RuntimeInput::Mask { space: _ }) => self.fire.tables.mask,

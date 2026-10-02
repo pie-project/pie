@@ -153,7 +153,7 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 o,
-            } => attn::arbiter::prefill(
+            } => attn::arbiter::prefill_with_scratch(
                 self.ctx(),
                 self.ragged(*q),
                 self.prefill_plan(*plan),
@@ -165,6 +165,53 @@ impl Run<'_> {
                 self.tensor(*o),
                 self.requests(),
                 &kernels_metal::tuning::current(),
+                &|rows, width| self.partials(rows, width),
+            ),
+            Attention::DecodeSelected {
+                q,
+                plan,
+                selection,
+                cache,
+                window,
+                head_dim,
+                sm_scale,
+                ratio,
+                o,
+            } => attn::decode_selected(
+                self.ctx(),
+                self.tensor(*q),
+                self.decode_plan(*plan),
+                self.tensor(*selection),
+                self.pool(*cache),
+                *window,
+                *head_dim,
+                *sm_scale,
+                *ratio,
+                self.tensor(*o),
+            ),
+            Attention::PrefillSelected {
+                q,
+                plan,
+                selection,
+                cache,
+                window,
+                head_dim,
+                kv_heads,
+                sm_scale,
+                ratio,
+                o,
+            } => attn::prefill_selected(
+                self.ctx(),
+                self.ragged(*q),
+                self.prefill_plan(*plan),
+                self.tensor(*selection),
+                self.pool(*cache),
+                *window,
+                *head_dim,
+                *kv_heads,
+                *sm_scale,
+                *ratio,
+                self.tensor(*o),
             ),
             Attention::Dense {
                 q,
@@ -195,7 +242,7 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 o,
-            } => attn::arbiter::masked(
+            } => attn::arbiter::masked_with_scratch(
                 self.ctx(),
                 self.ragged(*q),
                 self.prefill_plan(*plan),
@@ -206,6 +253,34 @@ impl Run<'_> {
                 *head_dim,
                 *sm_scale,
                 self.tensor(*o),
+                self.requests(),
+                &kernels_metal::tuning::current(),
+                &|rows, width| self.partials(rows, width),
+            ),
+            Attention::MaskedLse {
+                kv_heads: _,
+                causal,
+                q,
+                plan,
+                mask,
+                cache,
+                window,
+                head_dim,
+                sm_scale,
+                o,
+                lse,
+            } => attn::arbiter::masked_lse(
+                self.ctx(),
+                self.ragged(*q),
+                self.prefill_plan(*plan),
+                self.cut_rows(self.tensor(*mask)),
+                self.pool(*cache),
+                *window,
+                *causal,
+                *head_dim,
+                *sm_scale,
+                self.tensor(*o),
+                self.tensor(*lse),
                 self.requests(),
                 &kernels_metal::tuning::current(),
             ),
@@ -565,6 +640,7 @@ impl Run<'_> {
                 primes,
                 offsets,
                 heads_per_ngram,
+                map,
                 ngram_ids,
             }
             | Attention::PleNgramIdsChunked {
@@ -575,6 +651,7 @@ impl Run<'_> {
                 primes,
                 offsets,
                 heads_per_ngram,
+                map,
                 ngram_ids,
             } if self.rs_seat().is_some() => {
                 const OP: &str = "attention.ple_ngram_ids_committed";
@@ -595,6 +672,7 @@ impl Run<'_> {
                     primes,
                     offsets,
                     *heads_per_ngram,
+                    map.map(|id| self.tensor(id)),
                     self.tensor(*ngram_ids),
                 )
             }
@@ -701,6 +779,7 @@ impl Run<'_> {
                 primes,
                 offsets,
                 heads_per_ngram,
+                map,
                 ngram_ids,
             } => {
                 let Some(hash) = self.ple_hash(mults, primes, offsets) else {
@@ -716,6 +795,7 @@ impl Run<'_> {
                     primes,
                     offsets,
                     *heads_per_ngram,
+                    map.map(|id| self.tensor(id)),
                     self.tensor(*ngram_ids),
                 )
             }
@@ -727,6 +807,7 @@ impl Run<'_> {
                 primes,
                 offsets,
                 heads_per_ngram,
+                map,
                 ngram_ids,
             } => {
                 let Some(hash) = self.ple_hash(mults, primes, offsets) else {
@@ -742,6 +823,7 @@ impl Run<'_> {
                     primes,
                     offsets,
                     *heads_per_ngram,
+                    map.map(|id| self.tensor(id)),
                     self.tensor(*ngram_ids),
                 )
             }
@@ -1084,7 +1166,7 @@ impl Run<'_> {
                 attn::index::topk(
                     self.ctx(),
                     self.tensor(*q),
-                    self.tensor(*weights),
+                    weights.map(|w| self.tensor(w)),
                     self.pool(*keys),
                     self.cut_rows(positions),
                     self.cut_rows(request_of_token),
@@ -1108,6 +1190,22 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
+            Attention::IndexBlockMean {
+                boundary_pos,
+                boundary_req,
+                keys,
+                head_dim,
+                ratio,
+                entries,
+            } => attn::index::block_mean(
+                self.ctx(),
+                self.tensor(*boundary_pos),
+                self.tensor(*boundary_req),
+                self.pool(*keys),
+                *head_dim,
+                *ratio,
+                self.tensor(*entries),
+            ),
 
             Attention::PoolBoundaryDecode {
                 positions,
@@ -1119,6 +1217,7 @@ impl Run<'_> {
             } => attn::pool::boundary_decode(
                 self.ctx(),
                 self.tensor(*positions),
+                self.cut_rows(self.bindings().tables.request_of_token),
                 self.tensor(*row_valid),
                 *ratio,
                 self.tensor(*boundary_pos),
@@ -1135,6 +1234,7 @@ impl Run<'_> {
             } => attn::pool::boundary_prefill(
                 self.ctx(),
                 self.ragged(*positions),
+                self.cut_rows(self.bindings().tables.request_of_token),
                 self.tensor(*row_valid),
                 *ratio,
                 self.tensor(*boundary_pos),

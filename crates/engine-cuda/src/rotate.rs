@@ -272,7 +272,9 @@ impl Rotor {
         }
         let mut slots = Vec::with_capacity(rotation.slots as usize);
         for bytes in &rotation.slot_bytes {
-            slots.push(Buffer::zeroed(usize::try_from(*bytes).unwrap_or(usize::MAX))?);
+            slots.push(Buffer::zeroed(
+                usize::try_from(*bytes).unwrap_or(usize::MAX),
+            )?);
         }
         let mut ready = Vec::with_capacity(slots.len());
         let mut free = Vec::with_capacity(slots.len());
@@ -527,8 +529,14 @@ mod tests {
     fn rotation() -> (model_ir::Trace, Rotation) {
         let (trace, compiled, plan) = rig();
         let schedule = Schedule::of(&trace);
-        let rotation = Rotation::plan(&schedule, &compiled, &candidates(&plan), SLOT_CAP, ARENA_CAP)
-            .expect("the spilled set rotates");
+        let rotation = Rotation::plan(
+            &schedule,
+            &compiled,
+            &candidates(&plan),
+            SLOT_CAP,
+            ARENA_CAP,
+        )
+        .expect("the spilled set rotates");
         (trace, rotation)
     }
 

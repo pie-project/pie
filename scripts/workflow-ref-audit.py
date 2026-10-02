@@ -1,71 +1,15 @@
 #!/usr/bin/env python3
 """Every package, feature and target a workflow names, resolved against cargo.
 
-## Why this exists
-
-A `-p` naming a crate cargo cannot see is not a narrower gate and not a
-skip. Cargo exits before it compiles anything:
-
-    error: package ID specification `engine-wgpu` did not match any packages
-
-and so does a `--features` naming a feature no manifest declares, and so
-does a `--test` naming a target that is not in the tree. Each is a hard
-error on the FIRST step that reaches it, which means every step under it
-runs never -- and a job that dies on step one looks, in a log nobody
-opens, much like a job that had nothing to do.
-
-This tree has now paid for that three times over, all in one branch:
-
-* `-p engine-metal`, `-p engine-vulkan` and `-p engine-wgpu` appeared
-  EIGHTEEN times in `ci.yml`, including three whole jobs, after R3 put
-  all three crates in the root manifest's `exclude`.
-* `cargo check -p model --features chat|contract|chat,contract` and
-  `cargo test -p model --features contract` named three features R3
-  deleted with `model-legacy`. The same step had already been through
-  this once with a fourth name, `forward`, and was rewritten onto two
-  names that were themselves about to go.
-* `--features engine-wgpu` on `pie-gpu-tests`, `runtime`, `worker` and
-  `pie` named a feature no package in the workspace has ever declared
-  since the crate left it, and `--test shader_backends_agree` named a
-  test target that is not in `crates/kernels/tests` at all.
-* `build.yml`'s `aarch64-macos-metal` release leg built
-  `-p pie --features metal`, so an entire published artifact was
-  produced by a command that could not run.
-
-None of that was caught by anything. `scripts/ci-gate-audit.py` reads two
-steps by name and checks their `-p` lists, which is what it is for and is
-a fraction of the surface; the file that claimed to cover the rest --
-`crates/model/tests/every_cfg_names_a_real_feature.rs`, cited in `ci.yml`
-as "fails if a workflow names a package or target that does not exist" --
-was itself deleted, so the claim outlived the check by some margin.
-
-## What it checks
-
-For every `cargo` command in every `run:` body of every workflow:
-
-* each `-p`/`--package`/`--exclude` names a workspace member;
-* each `--features` entry is declared -- a bare `f` by at least one of
-  the packages the command selects, and a qualified `pkg/f` by `pkg`
-  itself whenever `pkg` is a member;
-* each `--test`/`--bench`/`--example`/`--bin` names a target of one of
-  the selected packages.
-
-`${{ matrix.… }}` values are resolved out of the job's own `strategy.
-matrix` before any of that, so `--features ${{ matrix.cuda.feature }}` is
-checked once per matrix entry rather than skipped.
-
-## What it deliberately does not check
-
-That the command PASSES. A red gate is a red build and CI reports it;
-this is only about commands that cannot start. It also says nothing about
-a step that is absent -- `ci-gate-audit.py` is the file that asks whether
-the list is complete, and this one asks whether the list resolves. Two
-questions, two files, and neither answers the other.
-
-Expressions it cannot resolve (anything but a plain `matrix.<key>` or
-`matrix.<key>.<field>`) are SKIPPED and counted, and the count is printed,
-so a workflow that drifts into unreadable interpolation says so rather
-than quietly narrowing what is covered.
+A `-p` naming a crate cargo cannot see, a `--features` no manifest declares,
+or a `--test` not in the tree is a hard error on the first step that reaches
+it, and a job that dies on step one reads much like a job that passed. For
+every `cargo` command in every `run:` body of every workflow this checks
+that `-p`/`--package`/`--exclude` name members, that `--features` entries
+are declared by a selected package (or by `pkg` for `pkg/f`), and that
+`--test`/`--bench`/`--example`/`--bin` name targets of a selected package.
+`${{ matrix.<key>[.<field>] }}` resolves against the job's own matrix;
+other expressions are skipped and counted.
 """
 
 from __future__ import annotations

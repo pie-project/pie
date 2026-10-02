@@ -513,9 +513,16 @@ impl Engine for Metal {
         .map_err(fault)?;
 
         shell.mount_adapters(self.boot.adapter_dir.clone());
+        // The device pool already is host memory, so a host tier would only
+        // move kv within the same DRAM; suspended kv goes straight to disk.
+        let disk_kv_pages = shell
+            .seat_disk_kv(residency.disk_kv_budget, residency.disk_kv_dir.as_deref())
+            .map_err(fault)?;
 
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
+        let (pool_committed_bytes, pool_high_water_bytes) = shell.pool_residency();
+        let (elastic_page_bytes, elastic_budget_pages) = shell.pool_elastic();
         let weights_warm = shell.weights_warm();
 
         let paging = shell.paging();
@@ -549,8 +556,13 @@ impl Engine for Metal {
                     .map(|&(_, adapters, _)| adapters)
                     .min()
                     .unwrap_or(0),
-                elastic_page_bytes: 0,
-                elastic_budget_pages: 0,
+                elastic_page_bytes,
+                elastic_budget_pages,
+                disk_kv_pages,
+                // The sliding rows are paged in full here: the model's window
+                // is a fact of the model, its pool is not.
+                window_tokens: model_exec::store::kv::declared_window(shell.trace()).unwrap_or(0),
+                ..PoolFacts::default()
             },
             limits: FireLimits {
                 max_lanes: budgets.max_lanes,
@@ -587,8 +599,8 @@ impl Engine for Metal {
                 arena_bytes,
                 pool_bytes,
                 input_bytes,
-                pool_committed_bytes: pool_bytes,
-                pool_high_water_bytes: pool_bytes,
+                pool_committed_bytes,
+                pool_high_water_bytes,
             },
             caps,
         })
@@ -833,11 +845,16 @@ impl Engine for Metal {
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
-        let served = self
-            .caps
-            .as_ref()
-            .is_some_and(|caps| copy.src == caps.device.domain && copy.dst == caps.device.domain);
-        if !served {
+        let device = self.caps.as_ref().map(|caps| caps.device.domain);
+        if let Some((MemoryDomain::LocalDisk, out, pages, slots)) =
+            device.and_then(|device| copy.tier_move(device))
+        {
+            return self
+                .loaded_mut()?
+                .spill_kv(out, pages, slots)
+                .map_err(fault);
+        }
+        if device.is_none_or(|device| copy.src != device || copy.dst != device) {
             return Err(Error::Unsupported {
                 verb: kv_copy_direction(copy.src, copy.dst),
                 engine: "metal",
@@ -849,6 +866,7 @@ impl Engine for Metal {
     }
 
     fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
+        copy.device_only("metal")?;
         for (at, move_) in copy.moves.iter().enumerate() {
             if move_.src_token_offset != 0 || move_.dst_token_offset != 0 {
                 return Err(Error::Invalid(format!(
@@ -997,6 +1015,12 @@ impl Metal {
             .iter()
             .enumerate()
             .map(|(at, lane)| {
+                if lane.attn_classes.is_some() {
+                    return Err(Error::Unsupported {
+                        verb: "attention classes",
+                        engine: "metal",
+                    });
+                }
                 Ok(Seated {
                     lane: Lane {
                         slot: lane.slot,
@@ -1021,6 +1045,7 @@ impl Metal {
                     translation: &lane.kv.translation,
                     rs: &lane.rs,
                     rs_reset: lane.rs_reset,
+                    rs_slot: lane.rs_slot,
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;

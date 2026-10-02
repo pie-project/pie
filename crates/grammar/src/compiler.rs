@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use lru::LruCache;
@@ -120,7 +120,7 @@ impl GrammarCompiler {
         build_grammar: impl FnOnce() -> Result<Grammar>,
     ) -> Result<Arc<CompiledGrammar>> {
         self.get_or_insert(key, || {
-            let started = Instant::now();
+            let started = crate::compiled_grammar::started_now();
             let grammar = build_grammar()?;
             self.validate_grammar(&grammar)?;
             Ok(Arc::new(CompiledGrammar::try_new(

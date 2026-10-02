@@ -4,6 +4,8 @@ pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
     pub tp: u32,
+    /// `attn_res_block_size` under `AttnRes::Every`.
+    pub res_block: u32,
 
     pub mla_heads: u32,
     pub kv_lora_rank: u32,
@@ -16,12 +18,32 @@ pub struct Model {
     pub layers: Vec<Layer>,
     pub final_norm: Weight,
     pub final_norm_eps: f32,
+    /// Where the residual stream is blended with the closed blocks.
+    pub attn_res: AttnRes,
+    /// The released model blends the whole block stack once more before the
+    /// final norm.
+    pub output_res: Option<ResBlend>,
+}
+
+/// Kimi's AttnRes: the residual stream is carried as one prefix sum per block
+/// plus the closed blocks' sums, and a sublayer reads a softmax mix of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttnRes {
+    /// The fixture's reading: blend once where a block opens, keep one
+    /// running residual.
+    AtBlockStart,
+    /// The released model: every attention and every MLP input is a blend of
+    /// the closed blocks and the current block's prefix sum, which resets
+    /// where a block opens (`attn_res_block_size`).
+    Every,
 }
 
 pub use crate::adapter::Adapters;
 
 pub struct Layer {
     pub res_blend: Option<ResBlend>,
+    /// `AttnRes::Every`: the blend before the MLP (`mlp_res_*`).
+    pub mlp_res: Option<ResBlend>,
     pub mixer: Mixer,
     pub mixer_norm: Weight,
     pub mixer_norm_eps: f32,
@@ -67,6 +89,8 @@ pub struct Kda {
     pub head_dim: u32,
     pub conv_kernel: u32,
     pub norm_eps: f32,
+    /// `gate_lower_bound`: the forget gate's floor (0 leaves it unbounded).
+    pub gate_floor: f32,
     pub qkv: Weight,
     pub conv: Weight,
     pub f_a: Weight,
@@ -93,11 +117,17 @@ pub enum Mlp {
     },
     Routed {
         router: Weight,
+        /// `e_score_correction_bias`: steers the selection, not the weights.
+        bias: Option<Weight>,
         gate_up: Weight,
         down: Weight,
         shared: Option<Shared>,
+        /// Kimi-K3's LatentMoE: the routed experts work in a narrower latent
+        /// the token is projected into and back out of.
+        latent: Option<Latent>,
         experts: u32,
         top_k: u32,
+        renorm: bool,
         routed_scaling: f32,
         inter: u32,
         beta: f32,
@@ -109,6 +139,14 @@ pub struct Shared {
     pub gate_up: Weight,
     pub down: Weight,
     pub inter: u32,
+}
+
+pub struct Latent {
+    pub width: u32,
+    pub down: Weight,
+    pub norm: Option<Weight>,
+    pub norm_eps: f32,
+    pub up: Weight,
 }
 
 struct MlaDims {
@@ -135,6 +173,11 @@ struct MoeDims {
     routed_scaling: f32,
     inter: u32,
     shared_inter: u32,
+    /// The routed experts' input width when it is not the hidden width.
+    latent: Option<u32>,
+    latent_norm: bool,
+    bias: bool,
+    renorm: bool,
 }
 
 struct Dims {
@@ -143,6 +186,8 @@ struct Dims {
     dense_layers: u32,
     full_attn_every: u32,
     res_block: u32,
+    attn_res: AttnRes,
+    gate_floor: f32,
     mla: MlaDims,
     kda: KdaDims,
     moe: MoeDims,
@@ -170,6 +215,8 @@ impl Model {
                 dense_layers: 1,
                 full_attn_every: 4,
                 res_block: 4,
+                attn_res: AttnRes::AtBlockStart,
+                gate_floor: 0.0,
                 mla: MlaDims {
                     heads: 16,
                     q_lora_rank: 768,
@@ -192,6 +239,10 @@ impl Model {
                     routed_scaling: 2.0,
                     inter: 1024,
                     shared_inter: 1024,
+                    latent: None,
+                    latent_norm: false,
+                    bias: false,
+                    renorm: false,
                 },
                 dense_inter: 5632,
                 situ_beta: 1.0,
@@ -200,6 +251,79 @@ impl Model {
                 norm_eps: 1e-5,
             },
         )
+    }
+
+    /// `moonshotai/Kimi-K3` as released: 93 layers (one dense, then KDA with
+    /// an MLA layer every fourth), 896 latent-MoE experts of which 16 route,
+    /// two shared experts, AttnRes blocks of 12.
+    pub fn k3_released(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(w, experts, kv, tp, Model::released_dims(93, 896, 12))
+    }
+
+    /// The first `layers` layers of Kimi-K3 at full width with the first
+    /// `experts` routed experts (top-16 kept), AttnRes blocks of `res_block`:
+    /// the miniature `scripts/bench/shrink_checkpoint.py` cuts with
+    /// `--layers 0-7 --experts 32 --attn-res-block-size 4`.
+    pub fn k3_mini(
+        layers: u32,
+        experts: u32,
+        res_block: u32,
+        w: Dtype,
+        bank: Dtype,
+        kv: Dtype,
+        tp: u32,
+    ) -> Model {
+        Model::new(
+            w,
+            bank,
+            kv,
+            tp,
+            Model::released_dims(layers, experts, res_block),
+        )
+    }
+
+    fn released_dims(layers: u32, experts: u32, res_block: u32) -> Dims {
+        Dims {
+            hidden: 7168,
+            layers,
+            dense_layers: 1,
+            full_attn_every: 4,
+            res_block,
+            attn_res: AttnRes::Every,
+            gate_floor: -5.0,
+            mla: MlaDims {
+                heads: 96,
+                q_lora_rank: 1536,
+                kv_lora_rank: 512,
+                qk_nope_head_dim: 128,
+                qk_rope_head_dim: 64,
+                v_head_dim: 128,
+                output_gate: true,
+            },
+            kda: KdaDims {
+                heads: 96,
+                head_dim: 128,
+                f_rank: 128,
+                conv_kernel: 4,
+                norm_eps: 1e-5,
+            },
+            moe: MoeDims {
+                experts,
+                top_k: 16.min(experts),
+                routed_scaling: 1.0,
+                inter: 3072,
+                shared_inter: 2 * 3072,
+                latent: Some(3584),
+                latent_norm: true,
+                bias: true,
+                renorm: true,
+            },
+            dense_inter: 33_792,
+            situ_beta: 4.0,
+            situ_cap: Some(25.0),
+            vocab: 163_840,
+            norm_eps: 1e-5,
+        }
     }
 
     fn new(weights: Dtype, experts: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
@@ -214,9 +338,16 @@ impl Model {
         let dense_inter = d.dense_inter / tp;
 
         let hidden = d.hidden as u64;
+        let moe_in = u64::from(d.moe.latent.unwrap_or(d.hidden));
         let full_at = |l: u32| closes_a_block(l, d.full_attn_every);
         let moe_at = |l: u32| l >= d.dense_layers;
-        let blend_at = |l: u32| l > 0 && closes_a_block(l - 1, d.res_block);
+        // Under `Every` the first layer has no closed block to blend with, so
+        // its `self_attention_res_*` planes are never read (the reference skips
+        // the blend while `block_residual` is empty).
+        let blend_at = |l: u32| match d.attn_res {
+            AttnRes::AtBlockStart => l > 0 && closes_a_block(l - 1, d.res_block),
+            AttnRes::Every => l > 0,
+        };
 
         let a = &d.mla;
         let k = &d.kda;
@@ -271,6 +402,7 @@ impl Model {
                         head_dim: k.head_dim,
                         conv_kernel: k.conv_kernel,
                         norm_eps: k.norm_eps,
+                        gate_floor: d.gate_floor,
                         qkv: Weight::sym(n("kda_qkv"), [3 * kda_width, hidden], weights)
                             .packed([kda_width, kda_width, kda_width]),
                         conv: Weight::sym(
@@ -292,7 +424,7 @@ impl Model {
                         a_log: Weight::sym(n("kda_a_log"), [kda_heads as u64], Dtype::F32)
                             .columns(),
                         gate: Weight::sym(n("kda_gate"), [kda_width, hidden], weights).columns(),
-                        o_norm: Weight::sym(n("kda_o_norm"), [k.head_dim as u64], weights),
+                        o_norm: Weight::sym(n("kda_o_norm"), [k.head_dim as u64], Dtype::F32),
                         o_norm_eps: k.norm_eps,
                         o_proj: Weight::sym(n("kda_o_proj"), [hidden, kda_width], weights).rows(),
                         conv_state: format!("conv.{l}"),
@@ -305,18 +437,34 @@ impl Model {
                     let shared_width = shared_inter as u64;
                     Mlp::Routed {
                         router: Weight::sym(n("router"), [m.experts as u64, hidden], weights),
+                        bias: m
+                            .bias
+                            .then(|| Weight::sym(n("router_bias"), [m.experts as u64], Dtype::F32)),
                         gate_up: Weight::sym(
                             n("experts_gate_up"),
-                            [m.experts as u64, 2 * inter, hidden],
+                            [m.experts as u64, 2 * inter, moe_in],
                             experts,
                         )
                         .bank([inter, inter]),
                         down: Weight::sym(
                             n("experts_down"),
-                            [m.experts as u64, hidden, inter],
+                            [m.experts as u64, moe_in, inter],
                             experts,
                         )
                         .rows(),
+                        latent: m.latent.map(|width| Latent {
+                            width,
+                            down: Weight::sym(
+                                n("latent_down"),
+                                [u64::from(width), hidden],
+                                weights,
+                            ),
+                            norm: m.latent_norm.then(|| {
+                                Weight::sym(n("latent_norm"), [u64::from(width)], weights)
+                            }),
+                            norm_eps: d.norm_eps,
+                            up: Weight::sym(n("latent_up"), [hidden, u64::from(width)], weights),
+                        }),
                         shared: (shared_inter > 0).then(|| Shared {
                             gate_up: Weight::sym(
                                 n("shared_gate_up"),
@@ -330,6 +478,7 @@ impl Model {
                         }),
                         experts: m.experts,
                         top_k: m.top_k,
+                        renorm: m.renorm,
                         routed_scaling: m.routed_scaling,
                         inter: moe_inter,
                         beta: d.situ_beta,
@@ -358,6 +507,11 @@ impl Model {
                         norm_eps: d.norm_eps,
                         proj: Weight::sym(n("res_proj"), [1, hidden], weights),
                     }),
+                    mlp_res: (d.attn_res == AttnRes::Every).then(|| ResBlend {
+                        norm: norm("mlp_res_norm", hidden),
+                        norm_eps: d.norm_eps,
+                        proj: Weight::sym(n("mlp_res_proj"), [1, hidden], weights),
+                    }),
                     mixer,
                     mixer_norm: norm("mixer_norm", hidden),
                     mixer_norm_eps: d.norm_eps,
@@ -374,6 +528,7 @@ impl Model {
             hidden: d.hidden,
             vocab: d.vocab,
             tp,
+            res_block: d.res_block,
             mla_heads,
             kv_lora_rank: a.kv_lora_rank,
             adapters: ADAPTERS,
@@ -392,7 +547,19 @@ impl Model {
             layers,
             final_norm: Weight::sym("final_norm", [hidden], weights),
             final_norm_eps: d.norm_eps,
+            attn_res: d.attn_res,
+            output_res: (d.attn_res == AttnRes::Every).then(|| ResBlend {
+                norm: Weight::sym("output_res_norm", [hidden], weights),
+                norm_eps: d.norm_eps,
+                proj: Weight::sym("output_res_proj", [1, hidden], weights),
+            }),
         }
+    }
+
+    /// Which layers open an AttnRes block (the prefix sum is pushed and reset).
+    #[must_use]
+    pub fn opens_block(&self, layer: u32) -> bool {
+        self.res_block > 0 && layer.is_multiple_of(self.res_block)
     }
 }
 

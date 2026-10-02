@@ -306,11 +306,20 @@ pub fn collapse(
     )
 }
 
-pub fn mix(ctx: &Ctx, gates: Tensor, normed: Tensor, streams: u32, y: &mut Tensor) -> Result<(), Error> {
+pub fn mix(
+    ctx: &Ctx,
+    gates: Tensor,
+    normed: Tensor,
+    streams: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
     const OP: &str = "elementwise.hc_mix";
     let t = dtype_dispatch!(OP, normed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let fan = stream_fan(OP, normed.width, y.width)?;
-    debug_assert_eq!(fan, streams, "the row's stream fan is the count the statement states");
+    debug_assert_eq!(
+        fan, streams,
+        "the row's stream fan is the count the statement states"
+    );
     debug_assert!(
         gates.rows == normed.rows && gates.width == normed.width,
         "the gate rectangle is the stream rectangle"
@@ -332,11 +341,20 @@ pub fn mix(ctx: &Ctx, gates: Tensor, normed: Tensor, streams: u32, y: &mut Tenso
     )
 }
 
-pub fn inject(ctx: &Ctx, o: Tensor, gates: Tensor, streams: u32, hyper: &mut Tensor) -> Result<(), Error> {
+pub fn inject(
+    ctx: &Ctx,
+    o: Tensor,
+    gates: Tensor,
+    streams: u32,
+    hyper: &mut Tensor,
+) -> Result<(), Error> {
     const OP: &str = "elementwise.hc_inject";
     let t = dtype_dispatch!(OP, o.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let fan = stream_fan(OP, hyper.width, o.width)?;
-    debug_assert_eq!(fan, streams, "the row's stream fan is the count the statement states");
+    debug_assert_eq!(
+        fan, streams,
+        "the row's stream fan is the count the statement states"
+    );
     debug_assert!(
         gates.rows == o.rows && gates.width == fan && hyper.rows == o.rows,
         "one gate logit per stream per row, one wide row per row"
@@ -344,8 +362,11 @@ pub fn inject(ctx: &Ctx, o: Tensor, gates: Tensor, streams: u32, hyper: &mut Ten
     nonzero(OP, "rows", o.rows)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::hc_inject<{t}, 256>")))
-            .apply(Launch::per_row(o.rows, BLOCK)),
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::elemwise::hc_inject<{t}, 256>")),
+        )
+        .apply(Launch::per_row(o.rows, BLOCK)),
         &[
             o.arg(),
             gates.arg(),
@@ -368,7 +389,10 @@ pub fn ple_gate(
     const OP: &str = "elementwise.ple_gate";
     let t = dtype_dispatch!(OP, key.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let fan = stream_fan(OP, key.width, value.width)?;
-    debug_assert_eq!(fan, streams, "the row's stream fan is the count the statement states");
+    debug_assert_eq!(
+        fan, streams,
+        "the row's stream fan is the count the statement states"
+    );
     debug_assert!(
         query.rows == key.rows && query.width == key.width,
         "the query rectangle is the key rectangle"
@@ -379,12 +403,18 @@ pub fn ple_gate(
     );
     let rows = nonzero(OP, "rows", key.rows)?;
     let blocks = rows.checked_mul(fan).ok_or_else(|| {
-        refuse(OP, format!("the grid will not launch: {rows} rows x {fan} streams"))
+        refuse(
+            OP,
+            format!("the grid will not launch: {rows} rows x {fan} streams"),
+        )
     })?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::ple_gate<{t}, 256>")))
-            .apply(Launch::per_row(blocks, BLOCK)),
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::elemwise::ple_gate<{t}, 256>")),
+        )
+        .apply(Launch::per_row(blocks, BLOCK)),
         &[
             key.arg(),
             query.arg(),

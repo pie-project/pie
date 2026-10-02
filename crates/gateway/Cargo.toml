@@ -17,7 +17,7 @@ crate-type = ["rlib"]
 ids = { path = "../ids" }
 controller-api = { path = "../controller-api" }
 worker-api = { path = "../worker-api" }
-client-api = { path = "../client-api" }
+client-api = { package = "pie-client-api", path = "../client-api" }
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.1"
 async-trait = "0.1"

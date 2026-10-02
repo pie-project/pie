@@ -22,59 +22,54 @@ const KIMI_PROFILE: TiktokenProfile = TiktokenProfile {
 };
 
 pub fn from_file(path: &Path) -> Result<Tokenizer> {
-    let (config, profile) = load_config(path)?;
+    let config_path = config_path_of(path)?;
+    let config = std::fs::read(&config_path)
+        .with_context(|| format!("reading {}", config_path.display()))?;
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    from_str(&text, &config, &path.display().to_string())
+}
+
+pub fn from_str(ranks: &str, config_json: &[u8], label: &str) -> Result<Tokenizer> {
+    let (config, profile) = parse_config(config_json, label)?;
     let mut map: HashMap<u32, Vec<u8>> = HashMap::new();
 
-    for (line_no, line) in text.lines().enumerate() {
+    for (line_no, line) in ranks.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
         let mut parts = line.split_whitespace();
-        let bytes_b64 = parts.next().ok_or_else(|| {
-            anyhow::anyhow!("{}:{}: missing token bytes", path.display(), line_no + 1)
-        })?;
+        let bytes_b64 = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("{label}:{}: missing token bytes", line_no + 1))?;
         let rank = parts
             .next()
-            .ok_or_else(|| {
-                anyhow::anyhow!("{}:{}: missing token rank", path.display(), line_no + 1)
-            })?
+            .ok_or_else(|| anyhow::anyhow!("{label}:{}: missing token rank", line_no + 1))?
             .parse::<u32>()
-            .with_context(|| format!("{}:{}: invalid token rank", path.display(), line_no + 1))?;
+            .with_context(|| format!("{label}:{}: invalid token rank", line_no + 1))?;
         if parts.next().is_some() {
             bail!(
-                "{}:{}: expected exactly token bytes and rank",
-                path.display(),
+                "{label}:{}: expected exactly token bytes and rank",
                 line_no + 1
             );
         }
-        let bytes = BASE64_STANDARD.decode(bytes_b64).with_context(|| {
-            format!(
-                "{}:{}: invalid base64 token bytes",
-                path.display(),
-                line_no + 1
-            )
-        })?;
+        let bytes = BASE64_STANDARD
+            .decode(bytes_b64)
+            .with_context(|| format!("{label}:{}: invalid base64 token bytes", line_no + 1))?;
         if map.insert(rank, bytes).is_some() {
-            bail!(
-                "{}:{}: duplicate token rank {rank}",
-                path.display(),
-                line_no + 1
-            );
+            bail!("{label}:{}: duplicate token rank {rank}", line_no + 1);
         }
     }
 
     if map.is_empty() {
-        bail!("{}: empty tiktoken rank file", path.display());
+        bail!("{label}: empty tiktoken rank file");
     }
     let base_vocab_size = u32::try_from(map.len()).context("tiktoken vocabulary too large")?;
     let max_rank = map.keys().copied().max().unwrap_or(0);
     if max_rank.checked_add(1) != Some(base_vocab_size) {
         bail!(
-            "{}: tiktoken ranks must be contiguous from 0 ({} entries, max rank {max_rank})",
-            path.display(),
+            "{label}: tiktoken ranks must be contiguous from 0 ({} entries, max rank {max_rank})",
             map.len()
         );
     }
@@ -178,15 +173,16 @@ impl TiktokenTokenizerConfig {
     }
 }
 
-fn load_config(path: &Path) -> Result<(TiktokenTokenizerConfig, TiktokenProfile)> {
+fn config_path_of(path: &Path) -> Result<std::path::PathBuf> {
     let dir = path
         .parent()
         .context("tiktoken model path has no parent directory")?;
-    let config_path = dir.join("tokenizer_config.json");
-    let data = std::fs::read(&config_path)
-        .with_context(|| format!("reading {}", config_path.display()))?;
-    let config: TiktokenTokenizerConfig = serde_json::from_slice(&data)
-        .with_context(|| format!("parsing {}", config_path.display()))?;
+    Ok(dir.join("tokenizer_config.json"))
+}
+
+fn parse_config(data: &[u8], label: &str) -> Result<(TiktokenTokenizerConfig, TiktokenProfile)> {
+    let config: TiktokenTokenizerConfig = serde_json::from_slice(data)
+        .with_context(|| format!("parsing the tokenizer_config.json beside {label}"))?;
     let implementation = config
         .auto_map
         .get("AutoTokenizer")
@@ -197,9 +193,9 @@ fn load_config(path: &Path) -> Result<(TiktokenTokenizerConfig, TiktokenProfile)
         (Some("TikTokenTokenizer"), Some("tokenization_kimi.TikTokenTokenizer")) => KIMI_PROFILE,
         _ => {
             bail!(
-                "unsupported tiktoken tokenizer in {}: rank files require a \
-                 format-specific split regex; recognized profiles: Kimi K2/K2.5",
-                config_path.display()
+                "unsupported tiktoken tokenizer in the tokenizer_config.json beside {label}: \
+                 rank files require a format-specific split regex; recognized profiles: \
+                 Kimi K2/K2.5"
             )
         }
     };

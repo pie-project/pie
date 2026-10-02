@@ -110,7 +110,10 @@ fn fire(
     if codes.width != k {
         return Err(refuse(
             op,
-            format!("a {}-byte code row does not store a {k}-wide row of e4m3 bytes", codes.width),
+            format!(
+                "a {}-byte code row does not store a {k}-wide row of e4m3 bytes",
+                codes.width
+            ),
         ));
     }
     let want = form.scale_row(k);

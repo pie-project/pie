@@ -101,13 +101,32 @@ pub(crate) fn take(
     {
         return Err(Fault::Unwarmed {
             name,
-            have: held.slabs.get(&(name, region, scope)).map_or(0, |slab| slab.bytes),
+            have: held
+                .slabs
+                .get(&(name, region, scope))
+                .map_or(0, |slab| slab.bytes),
             need: bytes,
         });
     }
     grow(held, name, region, scope, bytes)?;
     Ok(held.slabs[&(name, region, scope)].ptr)
 }
+
+#[must_use]
+pub fn census() -> Vec<(&'static str, usize)> {
+    let arenas = locked();
+    let mut by_name: HashMap<&'static str, usize> = HashMap::new();
+    for arena in arenas.values() {
+        for ((name, _, _), slab) in &arena.slabs {
+            *by_name.entry(name).or_insert(0) += slab.bytes;
+        }
+    }
+    let mut out: Vec<(&'static str, usize)> = by_name.into_iter().collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    out
+}
+
+const SLAB_GRAIN: usize = 8 << 20;
 
 fn grow(
     arena: &mut Arena,
@@ -123,12 +142,24 @@ fn grow(
     if old_bytes >= bytes {
         return Ok(());
     }
-    let want = bytes.max(old_bytes.saturating_mul(2));
+    let want = bytes.div_ceil(SLAB_GRAIN).saturating_mul(SLAB_GRAIN);
     let mut fresh: *mut c_void = core::ptr::null_mut();
 
     // SAFETY: a live local out-parameter and a byte count this caller checked
     // is non-zero.
     let code = unsafe { rt::cudaMalloc(&raw mut fresh, want) };
+    if code == rt::cudaError::cudaErrorMemoryAllocation {
+        let _ = unsafe { rt::cudaGetLastError() };
+        let (mut free, mut total) = (0usize, 0usize);
+        // SAFETY: two live locals; the call only writes them.
+        let _ = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
+        return Err(Fault::Exhausted {
+            name,
+            have: old_bytes,
+            need: want,
+            free,
+        });
+    }
     if code != rt::cudaError::cudaSuccess || fresh.is_null() {
         return Err(Fault::Device {
             call: "cudaMalloc",

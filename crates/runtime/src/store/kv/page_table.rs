@@ -44,10 +44,23 @@ impl PoolId for HostKvSlotId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DiskKvSlotId(pub u32);
+
+impl PoolId for DiskKvSlotId {
+    fn from_index(index: u32) -> Self {
+        Self(index)
+    }
+    fn index(self) -> u32 {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KvPageBacking {
     Resident(PhysicalKvPageId),
     Swapped(HostKvSlotId),
+    OnDisk(DiskKvSlotId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -521,7 +534,7 @@ impl KvPageTable {
             .into_iter()
             .filter_map(|backing| match backing {
                 KvPageBacking::Resident(id) => Some(id),
-                KvPageBacking::Swapped(_) => {
+                KvPageBacking::Swapped(_) | KvPageBacking::OnDisk(_) => {
                     debug_assert!(false, "swapped backing must be released through KvStore");
                     None
                 }
@@ -1085,7 +1098,7 @@ impl KvPageTable {
     fn resolve_id(&self, node: NodeId, local: u64) -> Option<PhysicalKvPageId> {
         match self.resolve_backing(node, local) {
             KvPageBacking::Resident(id) => Some(id),
-            KvPageBacking::Swapped(_) => None,
+            KvPageBacking::Swapped(_) | KvPageBacking::OnDisk(_) => None,
         }
     }
 
@@ -1470,7 +1483,7 @@ impl KvPageTable {
             .filter(|location| !shared_ws_set.contains(location) && !cache_only.contains(location))
             .filter_map(|location| match self.backing_at(&location).ok()? {
                 KvPageBacking::Resident(id) => Some((location, id)),
-                KvPageBacking::Swapped(_) => None,
+                KvPageBacking::Swapped(_) | KvPageBacking::OnDisk(_) => None,
             })
             .collect();
         Ok((pages, false))
@@ -1493,7 +1506,7 @@ impl KvPageTable {
             .filter(|location| !shared_ws_set.contains(location) && !cache_only.contains(location))
             .filter_map(|location| match self.backing_at(&location).ok()? {
                 KvPageBacking::Resident(id) => Some((location, id)),
-                KvPageBacking::Swapped(_) => None,
+                KvPageBacking::Swapped(_) | KvPageBacking::OnDisk(_) => None,
             })
             .collect())
     }
@@ -1568,7 +1581,7 @@ impl KvPageTable {
     pub fn swapped_pages(
         &self,
         working_sets: &HashSet<WorkingSetId>,
-    ) -> Result<Vec<(TriePageLocation, HostKvSlotId)>, KvTableError> {
+    ) -> Result<Vec<(TriePageLocation, KvPageBacking)>, KvTableError> {
         let mut locations = HashSet::new();
         for &ws in working_sets {
             locations.extend(self.working_set_locations(ws)?);
@@ -1576,8 +1589,8 @@ impl KvPageTable {
         Ok(locations
             .into_iter()
             .filter_map(|location| match self.backing_at(&location).ok()? {
-                KvPageBacking::Swapped(slot) => Some((location, slot)),
                 KvPageBacking::Resident(_) => None,
+                swapped => Some((location, swapped)),
             })
             .collect())
     }
@@ -1694,7 +1707,9 @@ impl KvPageTable {
                             (resident, swapped),
                             |(resident, swapped), backing| match backing {
                                 KvPageBacking::Resident(_) => (resident + 1, swapped),
-                                KvPageBacking::Swapped(_) => (resident, swapped + 1),
+                                KvPageBacking::Swapped(_) | KvPageBacking::OnDisk(_) => {
+                                    (resident, swapped + 1)
+                                }
                             },
                         )
                 }

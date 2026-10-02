@@ -4,7 +4,7 @@ use crate::error::Error;
 
 use crate::attn::plan::{Built, Device, Live, PrefillPlanSm90Info};
 use crate::attn::sched::{
-    AlignedAllocator, at, CostHeap, Staging, cost_function, lengths, narrow, narrow_all,
+    AlignedAllocator, CostHeap, Staging, at, cost_function, lengths, narrow, narrow_all,
     packed_causal_kv_end, spans,
 };
 use crate::jit::refuse;
@@ -74,7 +74,11 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     let qo_lens = spans(op, "qo_indptr", req.qo_indptr, batch)?;
     spans(op, "kv_indptr", req.kv_indptr, batch)?;
     let kv_lens = lengths(op, "kv length table", req.kv_len_arr, batch)?;
-    narrow(op, "batch_prefill_sm90_head_indices", i64::from(req.num_qo_heads))?;
+    narrow(
+        op,
+        "batch_prefill_sm90_head_indices",
+        i64::from(req.num_qo_heads),
+    )?;
 
     let mut lanes: Vec<Lane> = Vec::with_capacity(batch);
     for i in 0..batch {
@@ -148,7 +152,9 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
                 + cta.qo_tile_indices.len() as i64,
         );
     }
-    let total_num_works = *work_indptr.last().expect("work_indptr has num_sm + 1 entries") as usize;
+    let total_num_works = *work_indptr
+        .last()
+        .expect("work_indptr has num_sm + 1 entries") as usize;
     let work_indptr = narrow_all(op, "batch_prefill_sm90_work_indptr", &work_indptr)?;
 
     let max_total_num_works = if req.enable_cuda_graph {
@@ -193,13 +199,18 @@ pub fn plan(
 
     let works = 4 * sched.max_total_num_works;
     let mut ints = AlignedAllocator::new(op, int_bytes);
-    info.qo_tile_indices_offset = Some(ints.alloc(works, 16, "batch_prefill_sm90_qo_tile_indices")?);
+    info.qo_tile_indices_offset =
+        Some(ints.alloc(works, 16, "batch_prefill_sm90_qo_tile_indices")?);
     info.qo_indptr_offset = Some(ints.alloc(works, 16, "batch_prefill_sm90_qo_offset")?);
     info.kv_indptr_offset = Some(ints.alloc(works, 16, "batch_prefill_sm90_kv_offset")?);
     info.qo_len_offset = Some(ints.alloc(works, 16, "batch_prefill_sm90_qo_len")?);
     info.kv_len_offset = Some(ints.alloc(works, 16, "batch_prefill_sm90_kv_len")?);
     info.head_indices_offset = Some(ints.alloc(works, 16, "batch_prefill_sm90_head_indices")?);
-    info.work_indptr_offset = Some(ints.alloc(4 * (device.num_sm as usize + 1), 16, "batch_prefill_sm90_work_indptr")?);
+    info.work_indptr_offset = Some(ints.alloc(
+        4 * (device.num_sm as usize + 1),
+        16,
+        "batch_prefill_sm90_work_indptr",
+    )?);
     info.batch_indices_offset = Some(ints.alloc(works, 16, "batch_prefill_sm90_batch_indices")?);
 
     let writes: [(Option<u32>, &Vec<i32>, &'static str); 8] = [
