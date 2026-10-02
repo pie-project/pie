@@ -246,6 +246,11 @@ pub mod gguf {
         // this crate's term grammar — so it is addressed by its layout id and the
         // block geometry alone (the checkpoint side owns the ternary arithmetic).
         row("ptq1_0", 128, 28, None),
+        // PQ2_0 (Prism-private 2-bit, `g128_u2_f16_n`): 128 weights per block,
+        // 34 bytes (leading fp16 scale + `qs[32]` positional 2-bit codes) = 2.125
+        // bpw. Addressed by layout id + block geometry; the checkpoint side owns
+        // the 2-bit arithmetic (no ztensor term, like the IQ lattices and PTQ1_0).
+        row("pq2_0", 128, 34, None),
     ];
 
     pub fn row_of(name: &str) -> Option<&'static Row> {

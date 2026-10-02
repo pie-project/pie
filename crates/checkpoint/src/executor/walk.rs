@@ -656,6 +656,9 @@ fn decode_gguf_block_into(scheme: QuantScheme, block: &[u8], values: &mut [f32])
         QuantScheme::Ptq1_0 => {
             values.copy_from_slice(&crate::codec::ptq1_0::decode_block(block));
         }
+        QuantScheme::Pq2_0 => {
+            values.copy_from_slice(&crate::codec::pq2_0::decode_block(block));
+        }
         other => unreachable!("{other:?} reports no GGUF block layout"),
     }
 }
