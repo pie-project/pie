@@ -1449,8 +1449,12 @@ pub async fn run_ahead<W: PassWit>(
     if budget == 0 {
         return Ok(0);
     }
+    // A recurrent state holds one slot per posted frame and a canvas is
+    // redrawn whole, so those post one pass at a time; a window's ring
+    // takes its pages pass by pass, as kv does.
     let r = if pass.binds_device_mask()
-        || crate::model::pass_kind() != crate::model::ForwardKind::Attention
+        || crate::model::rs_state_size() > 0
+        || crate::model::pass_kind() == crate::model::ForwardKind::Diffusion
     {
         1
     } else {

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use tokio::sync::Notify;
 
-pub use grant::{AllocationGrant, Demand, KvPages, KvPool};
+pub use grant::{AllocationGrant, Demand};
 use grant::{DevicePageReservation, RsSlotReservation};
 
 use crate::store::kv::page_table::{NoReclaim, ReclaimQuote};
@@ -37,7 +37,7 @@ macro_rules! ptrace {
 pub type ProcessId = uuid::Uuid;
 
 pub trait PoolPort: Send + Sync + 'static {
-    fn device_stats(&self, pool: KvPool) -> (u32, u32);
+    fn device_stats(&self) -> (u32, u32);
     fn host_stats(&self) -> (u32, u32);
     fn disk_stats(&self) -> (u32, u32);
     fn rs_stats(&self) -> (u32, u32);
@@ -47,21 +47,18 @@ pub trait PoolPort: Send + Sync + 'static {
     fn locus(&self) -> (usize, usize);
     fn reserve_device(
         &self,
-        pool: KvPool,
         count: u32,
     ) -> Option<Vec<crate::store::kv::page_table::PhysicalKvPageId>>;
     fn reserve_device_up_to(
         &self,
-        pool: KvPool,
         count: u32,
     ) -> Vec<crate::store::kv::page_table::PhysicalKvPageId>;
-    fn release_device(
-        &self,
-        pool: KvPool,
-        pages: Vec<crate::store::kv::page_table::PhysicalKvPageId>,
-    );
+    fn release_device(&self, pages: Vec<crate::store::kv::page_table::PhysicalKvPageId>);
     fn reserve_rs(&self, count: u32) -> Option<Vec<crate::store::rs::RsSlotId>>;
     fn release_rs(&self, slots: Vec<crate::store::rs::RsSlotId>);
+    /// Drops the index snapshots sharing state with `working_sets`, so
+    /// their next write lands in place; returns how many were dropped.
+    fn yield_indexes(&self, working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize;
 }
 
 pub struct RegistryPool {
@@ -96,9 +93,9 @@ impl RegistryPool {
 }
 
 impl PoolPort for RegistryPool {
-    fn device_stats(&self, pool: KvPool) -> (u32, u32) {
+    fn device_stats(&self) -> (u32, u32) {
         self.with_kv_tagged("planner-device-stats", |kv| {
-            (kv.pool_available(pool) as u32, kv.pool_capacity(pool))
+            (kv.available_pages() as u32, kv.capacity_pages())
         })
     }
 
@@ -144,36 +141,29 @@ impl PoolPort for RegistryPool {
 
     fn reserve_device(
         &self,
-        pool: KvPool,
         count: u32,
     ) -> Option<Vec<crate::store::kv::page_table::PhysicalKvPageId>> {
         self.with_kv_tagged("planner-reserve", |kv| {
-            kv.reserve_pool_pages(pool, count as usize)
+            kv.reserve_device_pages(count as usize)
         })
     }
 
     fn reserve_device_up_to(
         &self,
-        pool: KvPool,
         count: u32,
     ) -> Vec<crate::store::kv::page_table::PhysicalKvPageId> {
         self.with_kv_tagged("planner-reserve-up-to", |kv| {
-            let take = (kv.pool_available(pool) as u32).min(count);
+            let take = (kv.available_pages() as u32).min(count);
             if take == 0 {
                 return Vec::new();
             }
-            kv.reserve_pool_pages(pool, take as usize)
-                .unwrap_or_default()
+            kv.reserve_device_pages(take as usize).unwrap_or_default()
         })
     }
 
-    fn release_device(
-        &self,
-        pool: KvPool,
-        pages: Vec<crate::store::kv::page_table::PhysicalKvPageId>,
-    ) {
+    fn release_device(&self, pages: Vec<crate::store::kv::page_table::PhysicalKvPageId>) {
         self.with_kv_tagged("planner-release", |kv| {
-            kv.release_pool_reservation(pool, pages);
+            kv.release_device_reservation(pages);
         });
     }
 
@@ -184,11 +174,17 @@ impl PoolPort for RegistryPool {
     fn release_rs(&self, slots: Vec<crate::store::rs::RsSlotId>) {
         self.with_rs(|rs| rs.release_slot_reservation(slots));
     }
+
+    fn yield_indexes(&self, working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize {
+        self.with_rs(|rs| rs.yield_indexes(working_sets))
+    }
 }
 
 pub enum Acquired {
     Granted(AllocationGrant),
     Yield,
+    /// The snapshots the demand counted were dropped; quote it again.
+    Requote,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,7 +192,6 @@ pub enum StarveCause {
     NoSwapRoom,
     NoEligibleVictim,
     NoRsSlots,
-    NoWindowedPages,
 }
 
 impl StarveCause {
@@ -213,10 +208,6 @@ impl StarveCause {
                 "every RS folded slot is held and no admitted process is still \
                  running to return one — asking for more concurrent state slots \
                  than the pool has cannot be waited out"
-            }
-            StarveCause::NoWindowedPages => {
-                "every windowed kv page is held by a window and no admitted process is \
-                 still running to move its window on"
             }
         }
     }
@@ -528,7 +519,7 @@ impl Waiter {
         }
     }
 
-    fn kv_need(&self) -> KvPages {
+    fn kv_need(&self) -> u32 {
         match &self.kind {
             WaitKind::Allocation { demand, .. } => demand.kv_pages,
             WaitKind::Restore { demand } => demand.kv_pages,
@@ -702,9 +693,9 @@ impl Inner {
         !self.host_swap_blocked.is_empty()
     }
 
-    fn burst_shortfall(&self) -> KvPages {
-        let mut supply = self.accum.lens();
-        let mut extra = KvPages::default();
+    fn burst_shortfall(&self) -> u32 {
+        let mut supply = self.accum.len() as u32;
+        let mut extra = 0u32;
         for waiter in self.queue.values() {
             if !waiter.is_unmet() {
                 continue;
@@ -715,17 +706,15 @@ impl Inner {
             if demand.rs_slots > 0 {
                 break;
             }
-            for pool in KvPool::ALL {
-                let need = demand.kv_pages[pool];
-                let covered = need.min(supply[pool]);
-                supply[pool] -= covered;
-                extra[pool] = extra[pool].saturating_add(need - covered);
-            }
+            let need = demand.kv_pages;
+            let covered = need.min(supply);
+            supply -= covered;
+            extra = extra.saturating_add(need - covered);
         }
         extra
     }
 
-    fn serve_burst(&mut self) -> Vec<(EntryKey, KvPages, Arc<Notify>)> {
+    fn serve_burst(&mut self) -> Vec<(EntryKey, u32, Arc<Notify>)> {
         let mut wake = Vec::new();
         let Some((head, waiter)) = self.unmet_head() else {
             return wake;
@@ -751,7 +740,7 @@ impl Inner {
             if demand.rs_slots > 0 {
                 break;
             }
-            if !accum.lens().covers(demand.kv_pages) {
+            if (accum.len() as u32) < demand.kv_pages {
                 break;
             }
             let kv = accum.donate(demand.kv_pages);
@@ -790,25 +779,11 @@ impl Inner {
 }
 
 enum Step {
-    Absorb {
-        pool: KvPool,
-        count: u32,
-        fund_by_eviction: bool,
-    },
-    ShortRs {
-        fund_by_eviction: bool,
-    },
-    ServeAllocation {
-        key: EntryKey,
-        demand: Demand,
-    },
-    ServeAllocationBurst {
-        extra: KvPages,
-    },
-    ServeRestore {
-        key: EntryKey,
-        pid: ProcessId,
-    },
+    Absorb { count: u32, fund_by_eviction: bool },
+    ShortRs { fund_by_eviction: bool },
+    ServeAllocation { key: EntryKey, demand: Demand },
+    ServeAllocationBurst { extra: u32 },
+    ServeRestore { key: EntryKey, pid: ProcessId },
     Release(DevicePageReservation),
     Done,
 }
@@ -894,6 +869,11 @@ impl AllocationTicket {
                     self.planner.poke();
                     return Ok(Acquired::Yield);
                 }
+                Collect::Requote => {
+                    self.collected = true;
+                    self.planner.poke();
+                    return Ok(Acquired::Requote);
+                }
                 Collect::Wait => {}
             }
             notified.await;
@@ -951,7 +931,7 @@ impl ResidencyPlanner {
         if runway == 0 {
             return;
         }
-        let (free, _) = self.port.device_stats(KvPool::Paged);
+        let (free, _) = self.port.device_stats();
         if free < runway {
             self.poke();
         }
@@ -1109,13 +1089,12 @@ impl ResidencyPlanner {
     }
 
     fn try_reserve(&self, demand: Demand) -> Option<AllocationGrant> {
-        let mut kv = DevicePageReservation::empty();
-        for pool in KvPool::ALL {
-            if demand.kv_pages[pool] > 0 {
-                let pages = self.port.reserve_device(pool, demand.kv_pages[pool])?;
-                kv.absorb(DevicePageReservation::new(pool, pages, self.port.clone()));
-            }
-        }
+        let kv = if demand.kv_pages > 0 {
+            let pages = self.port.reserve_device(demand.kv_pages)?;
+            DevicePageReservation::new(pages, self.port.clone())
+        } else {
+            DevicePageReservation::empty()
+        };
         let rs = if demand.rs_slots > 0 {
             {
                 let slots = self.port.reserve_rs(demand.rs_slots)?;
@@ -1127,11 +1106,8 @@ impl ResidencyPlanner {
         Some(AllocationGrant::new(demand, kv, rs))
     }
 
-    fn free_pages(&self) -> KvPages {
-        KvPages::new(
-            self.port.device_stats(KvPool::Paged).0,
-            self.port.device_stats(KvPool::Windowed).0,
-        )
+    fn free_pages(&self) -> u32 {
+        self.port.device_stats().0
     }
 
     pub fn lock_census(&self) -> (u64, u64, u64, u64, u64) {
@@ -1171,11 +1147,9 @@ impl ResidencyPlanner {
             let head_covered = self.with_inner(|inner| {
                 let head_shortfall = inner
                     .unmet_head()
-                    .map(|(_, waiter)| waiter.kv_need().saturating_sub(inner.accum.lens()))
+                    .map(|(_, waiter)| waiter.kv_need().saturating_sub(inner.accum.len() as u32))
                     .unwrap_or_default();
-                KvPool::ALL.into_iter().all(|pool| {
-                    free_now[pool] >= demand.kv_pages[pool].saturating_add(head_shortfall[pool])
-                })
+                free_now >= demand.kv_pages.saturating_add(head_shortfall)
             });
             if head_covered && let Some(grant) = self.try_reserve(demand) {
                 self.note_progress(pid);
@@ -1201,22 +1175,39 @@ impl ResidencyPlanner {
         if let Some(grant) = self.grant_now(pid, demand) {
             return Ok(Acquired::Granted(grant));
         }
-        for pool in KvPool::ALL {
-            let (_, kv_total) = self.port.device_stats(pool);
-            if demand.kv_pages[pool] > kv_total {
-                return Err(PlannerError::Impossible {
-                    need: demand.kv_pages[pool],
-                    total: kv_total,
-                });
-            }
+        let (_, kv_total) = self.port.device_stats();
+        if demand.kv_pages > kv_total {
+            return Err(PlannerError::Impossible {
+                need: demand.kv_pages,
+                total: kv_total,
+            });
         }
         if demand.rs_slots > 0 {
-            let (_, rs_total) = self.port.rs_stats();
+            let (rs_free, rs_total) = self.port.rs_stats();
             if demand.rs_slots > rs_total {
                 return Err(PlannerError::Impossible {
                     need: demand.rs_slots,
                     total: rs_total,
                 });
+            }
+            // A cache entry never makes live work wait: short of state, a
+            // resident process quotes again once the idle cache is dropped,
+            // or else the snapshots sharing its own state, instead of parking.
+            let resident = self.with_inner(|inner| {
+                inner.procs.get(&pid).is_some_and(|proc| {
+                    proc.state == Residency::Resident && !inner.killing.contains(&pid)
+                })
+            });
+            if demand.rs_slots > rs_free && resident {
+                // What this frees may be what an older waiter parked on.
+                if self.reclaim_idle_once() {
+                    self.pages_freed();
+                    return Ok(Acquired::Requote);
+                }
+                if self.yield_own_indexes(pid) {
+                    self.pages_freed();
+                    return Ok(Acquired::Requote);
+                }
             }
         }
         enum Parked {
@@ -1280,6 +1271,11 @@ impl ResidencyPlanner {
                             self.poke();
                             return Ok(Acquired::Yield);
                         }
+                        Collect::Requote => {
+                            registration.disarm();
+                            self.poke();
+                            return Ok(Acquired::Requote);
+                        }
                         Collect::Wait => {}
                     }
                     notified.await;
@@ -1320,11 +1316,9 @@ impl ResidencyPlanner {
             let head_covered = self.with_inner(|inner| {
                 let head_shortfall = inner
                     .unmet_head()
-                    .map(|(_, waiter)| waiter.kv_need().saturating_sub(inner.accum.lens()))
+                    .map(|(_, waiter)| waiter.kv_need().saturating_sub(inner.accum.len() as u32))
                     .unwrap_or_default();
-                KvPool::ALL.into_iter().all(|pool| {
-                    free_now[pool] >= demand.kv_pages[pool].saturating_add(head_shortfall[pool])
-                })
+                free_now >= demand.kv_pages.saturating_add(head_shortfall)
             });
             if head_covered && let Some(grant) = self.try_reserve(demand) {
                 self.note_progress(pid);
@@ -1338,14 +1332,12 @@ impl ResidencyPlanner {
             self.poke_if_runway_short();
             return Ok(Enqueued::Granted(grant));
         }
-        for pool in KvPool::ALL {
-            let (_, kv_total) = self.port.device_stats(pool);
-            if demand.kv_pages[pool] > kv_total {
-                return Err(PlannerError::Impossible {
-                    need: demand.kv_pages[pool],
-                    total: kv_total,
-                });
-            }
+        let (_, kv_total) = self.port.device_stats();
+        if demand.kv_pages > kv_total {
+            return Err(PlannerError::Impossible {
+                need: demand.kv_pages,
+                total: kv_total,
+            });
         }
         if demand.rs_slots > 0 {
             let (_, rs_total) = self.port.rs_stats();
@@ -1437,8 +1429,14 @@ impl ResidencyPlanner {
                     Collect::Ready(outcome)
                 }
                 None if *yielded => {
+                    let pid = waiter.pid;
                     inner.queue.remove(&key);
-                    Collect::Yield
+                    // A resident waiter yielded only its cache: it quotes
+                    // again, with no residency to wait for.
+                    match inner.procs.get(&pid) {
+                        Some(proc) if proc.state == Residency::Resident => Collect::Requote,
+                        _ => Collect::Yield,
+                    }
                 }
                 None => Collect::Wait,
             }
@@ -1495,7 +1493,7 @@ impl ResidencyPlanner {
             let (rs_free, _) = self.port.rs_stats();
             let step = self.with_inner(|inner| {
                 let Some((key, waiter)) = inner.unmet_head() else {
-                    if !inner.accum.lens().is_zero() && inner.queue.is_empty() {
+                    if inner.accum.len() > 0 && inner.queue.is_empty() {
                         let stranded = std::mem::take(&mut inner.accum);
                         return Step::Release(stranded);
                     }
@@ -1507,16 +1505,11 @@ impl ResidencyPlanner {
                     WaitKind::Allocation { demand, .. } => Some(*demand),
                     WaitKind::Restore { .. } => None,
                 };
-                let missing = waiter.kv_need().saturating_sub(inner.accum.lens());
-                if let Some(pool) = KvPool::ALL.into_iter().find(|&pool| missing[pool] > 0) {
-                    // A suspend moves no windowed rows, so only paged pages
-                    // are funded by eviction; windows give theirs back.
-                    let fund_by_eviction =
-                        pool == KvPool::Paged && (!is_restore || inner.fleet_stalled());
+                let missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
+                if missing > 0 {
                     return Step::Absorb {
-                        pool,
-                        count: missing[pool],
-                        fund_by_eviction,
+                        count: missing,
+                        fund_by_eviction: !is_restore || inner.fleet_stalled(),
                     };
                 }
                 // rs slots are taken whole when the head is served; a short
@@ -1554,20 +1547,14 @@ impl ResidencyPlanner {
                     return;
                 }
                 Step::Absorb {
-                    pool,
                     count,
                     fund_by_eviction,
                 } => {
-                    let pages = self.port.reserve_device_up_to(pool, count);
+                    let pages = self.port.reserve_device_up_to(count);
                     if !pages.is_empty() {
-                        let reservation =
-                            DevicePageReservation::new(pool, pages, self.port.clone());
+                        let reservation = DevicePageReservation::new(pages, self.port.clone());
                         self.with_inner(|inner| inner.accum.absorb(reservation));
                         continue;
-                    }
-                    if pool == KvPool::Windowed {
-                        self.check_starvation(StarveCause::NoWindowedPages);
-                        return;
                     }
                     if self.reclaim_idle_once() {
                         continue;
@@ -1583,6 +1570,9 @@ impl ResidencyPlanner {
                 }
                 Step::ShortRs { fund_by_eviction } => {
                     if self.reclaim_idle_once() {
+                        continue;
+                    }
+                    if self.yield_head_indexes() {
                         continue;
                     }
                     if !fund_by_eviction {
@@ -1604,7 +1594,7 @@ impl ResidencyPlanner {
                             Some((head, _)) if head == key => {}
                             _ => return ServeOutcome::Stale(rs),
                         }
-                        if !inner.accum.lens().covers(demand.kv_pages) {
+                        if (inner.accum.len() as u32) < demand.kv_pages {
                             return ServeOutcome::Stale(rs);
                         }
                         let kv = inner.accum.donate(demand.kv_pages);
@@ -1632,14 +1622,10 @@ impl ResidencyPlanner {
                     }
                 }
                 Step::ServeAllocationBurst { extra } => {
-                    for pool in KvPool::ALL {
-                        if extra[pool] == 0 {
-                            continue;
-                        }
-                        let pages = self.port.reserve_device_up_to(pool, extra[pool]);
+                    if extra > 0 {
+                        let pages = self.port.reserve_device_up_to(extra);
                         if !pages.is_empty() {
-                            let reservation =
-                                DevicePageReservation::new(pool, pages, self.port.clone());
+                            let reservation = DevicePageReservation::new(pages, self.port.clone());
                             self.with_inner(|inner| inner.accum.absorb(reservation));
                         }
                     }
@@ -1658,7 +1644,7 @@ impl ResidencyPlanner {
                 Step::ServeRestore { key, pid } => {
                     let (model, engine) = self.port.locus();
                     let need = Demand {
-                        kv_pages: KvPages::paged(swapped_page_count(pid, model, engine)),
+                        kv_pages: swapped_page_count(pid, model, engine),
                         rs_slots: swapped_rs_slot_count(pid, model, engine),
                     };
                     let stale = self.with_inner(|inner| match inner.queue.get_mut(&key) {
@@ -1683,7 +1669,7 @@ impl ResidencyPlanner {
                             Some((head, _)) if head == key => {}
                             _ => return Board::Replan,
                         }
-                        if !inner.accum.lens().covers(need.kv_pages) {
+                        if (inner.accum.len() as u32) < need.kv_pages {
                             return Board::Replan;
                         }
                         let Some(proc) = inner.procs.get_mut(&pid) else {
@@ -1785,7 +1771,7 @@ impl ResidencyPlanner {
             }
             let pages = match quote {
                 Some(ReclaimQuote::Pages(pages)) => pages,
-                Some(ReclaimQuote::Nothing(NoReclaim::Pinned | NoReclaim::Windowed)) => continue,
+                Some(ReclaimQuote::Nothing(NoReclaim::Pinned)) => continue,
                 _ => 0,
             };
             let rs_slots = if rs_slots <= room.rs_slots {
@@ -1869,7 +1855,7 @@ impl ResidencyPlanner {
                 self.check_rs_starvation(victims.head);
             } else if !unhostable.is_empty() {
                 self.check_starvation(StarveCause::NoSwapRoom);
-            } else if !self.check_hog(victims.head, victims.head_pid, KvPool::Paged) {
+            } else if !self.check_hog(victims.head, victims.head_pid) {
                 self.check_starvation(StarveCause::NoEligibleVictim);
             }
             return;
@@ -1886,7 +1872,7 @@ impl ResidencyPlanner {
         if !self.port.suspend_capable() || room.pages == 0 {
             return;
         }
-        let (free, _) = self.port.device_stats(KvPool::Paged);
+        let (free, _) = self.port.device_stats();
         let Some((deficit, members)) = self.runway_shortfall_set(runway, free) else {
             return;
         };
@@ -1911,7 +1897,7 @@ impl ResidencyPlanner {
             let expected: u32 = inner.evicting.values().map(|mark| mark.pages).sum();
             let deficit = runway
                 .saturating_sub(free)
-                .saturating_sub(inner.accum.len(KvPool::Paged) as u32 + expected);
+                .saturating_sub(inner.accum.len() as u32 + expected);
             if deficit == 0 {
                 return None;
             }
@@ -1988,11 +1974,7 @@ impl ResidencyPlanner {
 
     fn victim_set(&self) -> Option<VictimSet> {
         let runway = supply_runway_pages();
-        let runway_free = if runway > 0 {
-            self.port.device_stats(KvPool::Paged).0
-        } else {
-            0
-        };
+        let (free, _) = self.port.device_stats();
         let (rs_free, _) = self.port.rs_stats();
         self.with_inner(|inner| {
             let (head, waiter) = inner.unmet_head()?;
@@ -2001,23 +1983,25 @@ impl ResidencyPlanner {
                 .values()
                 .filter(|queued| queued.is_unmet())
                 .filter_map(|queued| match &queued.kind {
-                    WaitKind::Allocation { demand, .. } if demand.kv_pages[KvPool::Paged] == 1 => {
-                        Some(1)
-                    }
+                    WaitKind::Allocation { demand, .. } if demand.kv_pages == 1 => Some(1),
                     _ => None,
                 })
                 .sum();
-            let runway_grab = if runway > 0 && !inner.runway_round_in_flight {
-                runway.saturating_sub(runway_free)
+            let runway_target = if runway > 0 && !inner.runway_round_in_flight {
+                runway
             } else {
                 0
             };
-            let missing = waiter.kv_need()[KvPool::Paged]
-                .max(queued_quantum.saturating_add(runway_grab))
-                .saturating_sub(inner.accum.len(KvPool::Paged) as u32);
+            let runway_grab = runway_target.saturating_sub(free);
+            // What the device still has free and an eviction in flight
+            // returns is supply, not deficit, as `supply_stalled` counts it.
+            let missing = waiter
+                .kv_need()
+                .max(queued_quantum.saturating_add(runway_target))
+                .saturating_sub(inner.accum.len() as u32);
             let expected = inner.expected_reclaim();
             let deficit = Reclaim {
-                pages: missing.saturating_sub(expected.pages),
+                pages: missing.saturating_sub(expected.pages.saturating_add(free)),
                 rs_slots: waiter
                     .rs_need()
                     .saturating_sub(rs_free.saturating_add(expected.rs_slots)),
@@ -2110,10 +2094,57 @@ impl ResidencyPlanner {
         any
     }
 
+    /// Drops the index snapshots sharing `pid`'s state; true when any went.
+    fn yield_own_indexes(&self, pid: ProcessId) -> bool {
+        let (model, engine) = self.port.locus();
+        let working_sets: Vec<_> =
+            crate::inferlet::process::residency::rs_working_set_ids(pid, model, engine)
+                .into_iter()
+                .collect();
+        !working_sets.is_empty() && self.port.yield_indexes(&working_sets) > 0
+    }
+
+    /// A cache entry never makes live work wait: when the head's ask is
+    /// short of state, the snapshots sharing its state are dropped so its
+    /// write lands in place, and the head re-quotes as a yielded waiter.
+    fn yield_head_indexes(self: &Arc<Self>) -> bool {
+        let Some((key, pid)) = self.with_inner(|inner| {
+            inner
+                .unmet_head()
+                .and_then(|(key, waiter)| match waiter.kind {
+                    WaitKind::Allocation { .. } => Some((key, waiter.pid)),
+                    WaitKind::Restore { .. } => None,
+                })
+        }) else {
+            return false;
+        };
+        if !self.yield_own_indexes(pid) {
+            return false;
+        }
+        let wake = self.with_inner(|inner| {
+            let waiter = inner.queue.get_mut(&key)?;
+            let WaitKind::Allocation {
+                notify, yielded, ..
+            } = &mut waiter.kind
+            else {
+                return None;
+            };
+            *yielded = true;
+            Some(notify.clone())
+        });
+        match wake {
+            Some(notify) => {
+                notify.notify_waiters();
+                true
+            }
+            None => false,
+        }
+    }
+
     fn supply_stalled(&self) -> bool {
-        let (free, _) = self.port.device_stats(KvPool::Paged);
+        let (free, _) = self.port.device_stats();
         self.with_inner(|inner| {
-            let accum = inner.accum.len(KvPool::Paged) as u32;
+            let accum = inner.accum.len() as u32;
             if inner.kill_in_flight() {
                 return false;
             }
@@ -2132,9 +2163,7 @@ impl ResidencyPlanner {
                 .values()
                 .filter(|waiter| waiter.is_unmet())
                 .filter_map(|waiter| match &waiter.kind {
-                    WaitKind::Allocation { demand, .. } if demand.kv_pages[KvPool::Paged] == 1 => {
-                        Some(1)
-                    }
+                    WaitKind::Allocation { demand, .. } if demand.kv_pages == 1 => Some(1),
                     _ => None,
                 })
                 .sum();
@@ -2146,7 +2175,7 @@ impl ResidencyPlanner {
             free == 0
                 && inner
                     .unmet_head()
-                    .is_some_and(|(_, head)| head.kv_need()[KvPool::Paged] > accum + expected)
+                    .is_some_and(|(_, head)| head.kv_need() > accum + expected)
         })
     }
 
@@ -2176,8 +2205,7 @@ impl ResidencyPlanner {
                     let Some((head, waiter)) = inner.unmet_head() else {
                         return (None, Vec::new());
                     };
-                    let missing = waiter.kv_need()[KvPool::Paged]
-                        .saturating_sub(inner.accum.len(KvPool::Paged) as u32);
+                    let missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
                     let deficit = missing.saturating_sub(inner.expected_reclaim().pages);
                     if deficit == 0 {
                         return (None, Vec::new());
@@ -2238,24 +2266,20 @@ impl ResidencyPlanner {
     fn salvage_free_pages(&self) -> bool {
         let missing = self.with_inner(|inner| {
             let (_, head) = inner.unmet_head()?;
-            let missing = head.kv_need().saturating_sub(inner.accum.lens());
-            (!missing.is_zero()).then_some(missing)
+            let missing = head.kv_need().saturating_sub(inner.accum.len() as u32);
+            (missing > 0).then_some(missing)
         });
         let Some(missing) = missing else {
             return false;
         };
         let mut salvaged = false;
-        for pool in KvPool::ALL {
-            if missing[pool] == 0 {
-                continue;
+        if missing > 0 {
+            let pages = self.port.reserve_device_up_to(missing);
+            if !pages.is_empty() {
+                let reservation = DevicePageReservation::new(pages, self.port.clone());
+                self.with_inner(|inner| inner.accum.absorb(reservation));
+                salvaged = true;
             }
-            let pages = self.port.reserve_device_up_to(pool, missing[pool]);
-            if pages.is_empty() {
-                continue;
-            }
-            let reservation = DevicePageReservation::new(pool, pages, self.port.clone());
-            self.with_inner(|inner| inner.accum.absorb(reservation));
-            salvaged = true;
         }
         if salvaged {
             self.stats.salvages.fetch_add(1, Ordering::Relaxed);
@@ -2266,13 +2290,13 @@ impl ResidencyPlanner {
     fn serve_from_hoard(self: &Arc<Self>) -> bool {
         let Some((key, demand)) = self.with_inner(|inner| {
             let (head_key, _) = inner.unmet_head()?;
-            let hoard = inner.accum.lens();
+            let hoard = inner.accum.len() as u32;
             inner.queue.iter().find_map(|(&key, waiter)| {
                 if key == head_key || !waiter.is_unmet() {
                     return None;
                 }
                 match &waiter.kind {
-                    WaitKind::Allocation { demand, .. } if hoard.covers(demand.kv_pages) => {
+                    WaitKind::Allocation { demand, .. } if hoard >= demand.kv_pages => {
                         Some((key, *demand))
                     }
                     _ => None,
@@ -2290,7 +2314,7 @@ impl ResidencyPlanner {
             RsSlotReservation::empty()
         };
         let outcome = self.with_inner(|inner| {
-            if !inner.accum.lens().covers(demand.kv_pages) {
+            if (inner.accum.len() as u32) < demand.kv_pages {
                 return ServeOutcome::Stale(rs);
             }
             let Some(waiter) = inner.queue.get_mut(&key) else {
@@ -2331,7 +2355,12 @@ impl ResidencyPlanner {
         if !self.is_wedged() {
             return;
         }
-        let Some(need) = self.with_inner(|inner| inner.queue.get(&key).map(Waiter::rs_need)) else {
+        let Some((pid, need)) = self.with_inner(|inner| {
+            inner
+                .queue
+                .get(&key)
+                .map(|waiter| (waiter.pid, waiter.rs_need()))
+        }) else {
             return;
         };
         let (free, total) = self.port.rs_stats();
@@ -2342,28 +2371,21 @@ impl ResidencyPlanner {
         if !self.is_wedged() {
             return;
         }
+        // What the head itself holds is not coming back while it waits, so
+        // past that the pool is too small for it; short of that, the slots
+        // are held by processes no suspend can move, and a restart frees them.
+        let (model, engine) = self.port.locus();
+        let held = held_rs_slot_count(pid, model, engine);
         let restore = self.with_inner(|inner| {
             inner
                 .queue
                 .get(&key)
-                .map(|waiter| matches!(waiter.kind, WaitKind::Restore { .. }))
+                .is_some_and(|waiter| matches!(waiter.kind, WaitKind::Restore { .. }))
         });
-        // A parked process's slots come back only through slots others give
-        // up, and when host rows cannot take theirs a restart frees them.
-        if restore == Some(true) {
+        if restore || need.saturating_add(held) <= total {
             self.check_starvation(StarveCause::NoRsSlots);
             return;
         }
-        // What the head itself holds is not coming back while it waits, so
-        // past that the pool is too small for it, not held by anyone else.
-        let held = match self.with_inner(|inner| inner.queue.get(&key).map(|waiter| waiter.pid)) {
-            Some(pid) => {
-                let (model, engine) = self.port.locus();
-                held_rs_slot_count(pid, model, engine)
-            }
-            None => return,
-        };
-        let hog = need.saturating_add(held) > total;
         let notify = self.with_inner(|inner| {
             match inner.unmet_head() {
                 Some((head, _)) if head == key => {}
@@ -2379,30 +2401,17 @@ impl ResidencyPlanner {
             if outcome.is_some() {
                 return None;
             }
-            *outcome = Some(Err(if hog {
-                PlannerError::RsHog { need, held, total }
-            } else {
-                PlannerError::Starved {
-                    need,
-                    free,
-                    total,
-                    cause: StarveCause::NoRsSlots,
-                }
-            }));
+            *outcome = Some(Err(PlannerError::RsHog { need, held, total }));
             Some(notify.clone())
         });
         if let Some(notify) = notify {
-            if hog {
-                self.stats.hog_failures.fetch_add(1, Ordering::Relaxed);
-            } else {
-                self.stats.starvations.fetch_add(1, Ordering::Relaxed);
-            }
+            self.stats.hog_failures.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 need,
                 free,
                 held,
                 total,
-                "planner: RS slot pool wedged — failing the head"
+                "planner: RS ask past the pool — failing the head"
             );
             notify.notify_waiters();
         }
@@ -2429,12 +2438,7 @@ impl ResidencyPlanner {
         if self.serve_from_hoard() {
             return;
         }
-        let pool = if cause == StarveCause::NoWindowedPages {
-            KvPool::Windowed
-        } else {
-            KvPool::Paged
-        };
-        let (free, total) = self.port.device_stats(pool);
+        let (free, total) = self.port.device_stats();
         if self.with_inner(|inner| inner.kill_in_flight()) {
             return;
         }
@@ -2442,18 +2446,22 @@ impl ResidencyPlanner {
         // it would only replay it into the same wall.
         if let Some((head, pid)) =
             self.with_inner(|inner| inner.unmet_head().map(|(k, w)| (k, w.pid)))
-            && self.check_hog(head, pid, pool)
+            && self.check_hog(head, pid)
         {
             return;
         }
-        let Some(victim_key) = self.pick_starvation_victim() else {
+        let Some(victim_key) = self.pick_starvation_victim(cause) else {
             return;
         };
+        let (rs_free, _) = self.port.rs_stats();
         let notify = self.with_inner(|inner| {
             let (_, head) = inner.unmet_head()?;
-            let pages_covered =
-                cause != StarveCause::NoRsSlots && inner.accum.lens().covers(head.kv_need());
-            if pages_covered || !inner.evicting.is_empty() {
+            // A head the pools already cover is served next, so a kill would
+            // free nothing it lacks. One short of state alone is not covered
+            // by the pages it has.
+            let servable =
+                (inner.accum.len() as u32) >= head.kv_need() && rs_free >= head.rs_need();
+            if servable || !inner.evicting.is_empty() {
                 return None;
             }
             let victim = inner.queue.get_mut(&victim_key)?;
@@ -2471,7 +2479,7 @@ impl ResidencyPlanner {
                 return None;
             }
             *outcome = Some(Err(PlannerError::Starved {
-                need: demand.kv_pages[pool],
+                need: demand.kv_pages,
                 free,
                 total,
                 cause,
@@ -2503,7 +2511,7 @@ impl ResidencyPlanner {
         }
     }
 
-    fn pick_starvation_victim(&self) -> Option<EntryKey> {
+    fn pick_starvation_victim(&self, cause: StarveCause) -> Option<EntryKey> {
         let candidates: Vec<(EntryKey, ProcessId)> = self.with_inner(|inner| {
             inner
                 .queue
@@ -2532,12 +2540,12 @@ impl ResidencyPlanner {
             let pids: Vec<ProcessId> = selected.iter().map(|(_, pid)| *pid).collect();
             let quotes =
                 crate::inferlet::process::residency::kv_reclaim_quotes(&pids, model, engine, 1);
-            for ((key, _), quote) in selected.iter().zip(quotes) {
-                // A window holder is no suspend candidate, but a restart frees it.
-                let holds = match quote {
-                    Some(ReclaimQuote::Pages(pages)) => pages > 0,
-                    Some(ReclaimQuote::Nothing(NoReclaim::Windowed)) => true,
-                    _ => false,
+            for ((key, pid), quote) in selected.iter().zip(quotes) {
+                // A restart frees what the stall lacks: pages, or the state
+                // slots (windows included) a stuck restore waits on.
+                let holds = match cause {
+                    StarveCause::NoRsSlots => held_rs_slot_count(*pid, model, engine) > 0,
+                    _ => matches!(quote, Some(ReclaimQuote::Pages(pages)) if pages > 0),
                 };
                 if holds {
                     if restartable_only {
@@ -2551,7 +2559,7 @@ impl ResidencyPlanner {
         first_holder.or(fallback)
     }
 
-    fn check_hog(self: &Arc<Self>, head_key: EntryKey, head_pid: ProcessId, pool: KvPool) -> bool {
+    fn check_hog(self: &Arc<Self>, head_key: EntryKey, head_pid: ProcessId) -> bool {
         let transfers_in_flight = self.with_inner(|inner| {
             !inner.evicting.is_empty()
                 || inner
@@ -2563,13 +2571,8 @@ impl ResidencyPlanner {
             return false;
         }
         let (model, engine) = self.port.locus();
-        let held = match pool {
-            KvPool::Paged => held_page_count(head_pid, model, engine),
-            KvPool::Windowed => {
-                kv_page_count(head_pid, model, engine, |kv, ws| kv.held_window_pages(ws))
-            }
-        };
-        let (_, total) = self.port.device_stats(pool);
+        let held = held_page_count(head_pid, model, engine);
+        let (_, total) = self.port.device_stats();
         let notify = self.with_inner(|inner| {
             let waiter = inner.queue.get_mut(&head_key)?;
             let WaitKind::Allocation {
@@ -2581,7 +2584,7 @@ impl ResidencyPlanner {
             else {
                 return None;
             };
-            let need = demand.kv_pages[pool];
+            let need = demand.kv_pages;
             if outcome.is_some() || need.saturating_add(held) <= total {
                 return None;
             }
@@ -2612,7 +2615,7 @@ impl ResidencyPlanner {
                     pid,
                     kind: WaitKind::Restore {
                         demand: Demand {
-                            kv_pages: KvPages::paged(freed),
+                            kv_pages: freed,
                             rs_slots: rs_freed,
                         },
                     },
@@ -2776,7 +2779,7 @@ impl ResidencyPlanner {
 
     /// Counts one engine copy of a residency move and, for kv, its time.
     pub(crate) fn record_tier_copy(&self, copy: &crate::scheduler::TierMove, elapsed: Duration) {
-        use crate::scheduler::TierKind::{Kv, Rs};
+        use crate::scheduler::TierKind::{Kv, Rs, Window};
         use ::engine::transfer::MemoryDomain::LocalDisk;
         let stats = &self.stats;
         let (count, us) = match (copy.kind, copy.tier, copy.out) {
@@ -2784,8 +2787,8 @@ impl ResidencyPlanner {
             (Kv, LocalDisk, false) => (&stats.disk_read_pages, Some(&stats.disk_read_us)),
             (Kv, _, true) => (&stats.d2h_pages, Some(&stats.d2h_copy_us)),
             (Kv, _, false) => (&stats.h2d_pages, Some(&stats.h2d_copy_us)),
-            (Rs, _, true) => (&stats.d2h_rs_slots, None),
-            (Rs, _, false) => (&stats.h2d_rs_slots, None),
+            (Rs | Window, _, true) => (&stats.d2h_rs_slots, None),
+            (Rs | Window, _, false) => (&stats.h2d_rs_slots, None),
         };
         count.fetch_add(copy.device.len() as u64, Ordering::Relaxed);
         if let Some(us) = us {
@@ -2794,7 +2797,7 @@ impl ResidencyPlanner {
     }
 
     pub fn diagnostics(&self) -> PlannerDiagnostics {
-        let (device_pages_free, device_pages_total) = self.port.device_stats(KvPool::Paged);
+        let (device_pages_free, device_pages_total) = self.port.device_stats();
         let (host_slots_free, host_slots_total) = self.port.host_stats();
         let (disk_slots_free, disk_slots_total) = self.port.disk_stats();
         let (rs_slots_free, rs_slots_total) = self.port.rs_stats();
@@ -2809,13 +2812,13 @@ impl ResidencyPlanner {
                     WaitKind::Allocation { .. } => "allocation",
                     WaitKind::Restore { .. } => "restore",
                 },
-                pages: waiter.kv_need()[KvPool::Paged],
+                pages: waiter.kv_need(),
                 rs_slots: waiter.rs_need(),
             })
             .collect();
         let (unmet_head_pages, unmet_head_kind) = match inner.unmet_head() {
             Some((_, waiter)) => (
-                waiter.kv_need()[KvPool::Paged],
+                waiter.kv_need(),
                 match &waiter.kind {
                     WaitKind::Allocation { .. } => "allocation",
                     WaitKind::Restore { .. } => "restore",
@@ -2839,7 +2842,7 @@ impl ResidencyPlanner {
                         if key.0 <= head || !waiter.is_unmet() {
                             continue;
                         }
-                        let need = waiter.kv_need()[KvPool::Paged];
+                        let need = waiter.kv_need();
                         if need <= budget {
                             budget -= need;
                             entries += 1;
@@ -2872,7 +2875,7 @@ impl ResidencyPlanner {
             proc_states[slot] += 1;
             admitted_procs += u32::from(proc.admitted);
         }
-        let accumulation = inner.accum.len(KvPool::Paged) as u32;
+        let accumulation = inner.accum.len() as u32;
         drop(inner);
         let (model, engine) = self.port.locus();
         let runners = runner_ids
@@ -2954,11 +2957,9 @@ impl ResidencyPlanner {
                                 Some(Err(_)) => "err",
                             }
                         ),
-                        WaitKind::Restore { demand } => format!(
-                            "restore kv={} rs={}",
-                            demand.kv_pages[KvPool::Paged],
-                            demand.rs_slots
-                        ),
+                        WaitKind::Restore { demand } => {
+                            format!("restore kv={} rs={}", demand.kv_pages, demand.rs_slots)
+                        }
                     };
                     format!("{key:?} pid={} {kind}", waiter.pid)
                 })
@@ -2976,10 +2977,7 @@ impl ResidencyPlanner {
                 f64::from(total.saturating_sub(free)) / f64::from(total)
             }
         };
-        let device = KvPool::ALL
-            .into_iter()
-            .map(|pool| ratio(self.port.device_stats(pool)))
-            .fold(0.0, f64::max);
+        let device = ratio(self.port.device_stats());
         let mut bucket = (device.max(ratio((swap_free, swap_total))) * 255.0).round() as u8;
         if self.nonresident.load(Ordering::Acquire) != 0
             || self.waiters.load(Ordering::Acquire) != 0
@@ -2993,6 +2991,7 @@ impl ResidencyPlanner {
 enum Collect {
     Ready(Result<AllocationGrant, PlannerError>),
     Yield,
+    Requote,
     Wait,
 }
 
@@ -3052,16 +3051,11 @@ fn held_rs_slot_count(pid: ProcessId, model: usize, engine: usize) -> u32 {
 }
 
 fn swapped_rs_slot_count(pid: ProcessId, model: usize, engine: usize) -> u32 {
-    rs_slot_count(pid, model, engine, crate::store::rs::RsStore::swapped_slots)
+    rs_slot_count(pid, model, engine, |rs, ws| rs.swapped_slots(ws))
 }
 
 fn suspendable_rs_slot_count(pid: ProcessId, model: usize, engine: usize) -> u32 {
-    rs_slot_count(
-        pid,
-        model,
-        engine,
-        crate::store::rs::RsStore::suspendable_slots,
-    )
+    rs_slot_count(pid, model, engine, |rs, ws| rs.suspendable_slots(ws))
 }
 
 fn rs_slot_count(
@@ -3162,7 +3156,7 @@ mod service_order_tests {
                 pid,
                 kind: WaitKind::Allocation {
                     demand: Demand {
-                        kv_pages: KvPages::paged(kv_pages),
+                        kv_pages,
                         rs_slots: 0,
                     },
                     notify: Arc::new(Notify::new()),
@@ -3180,7 +3174,7 @@ mod service_order_tests {
                 pid,
                 kind: WaitKind::Restore {
                     demand: Demand {
-                        kv_pages: KvPages::paged(pages),
+                        kv_pages: pages,
                         rs_slots: 0,
                     },
                 },
@@ -3338,11 +3332,8 @@ mod starvation_race_tests {
     }
 
     impl PoolPort for RacePool {
-        fn device_stats(&self, pool: KvPool) -> (u32, u32) {
-            match pool {
-                KvPool::Paged => (self.free.lock().len() as u32, self.total),
-                KvPool::Windowed => (0, 0),
-            }
+        fn device_stats(&self) -> (u32, u32) {
+            (self.free.lock().len() as u32, self.total)
         }
         fn host_stats(&self) -> (u32, u32) {
             (self.host, self.host_total)
@@ -3366,7 +3357,7 @@ mod starvation_race_tests {
         fn locus(&self) -> (usize, usize) {
             (self.rs_model.unwrap_or(0), 0)
         }
-        fn reserve_device(&self, _: KvPool, count: u32) -> Option<Vec<PhysicalKvPageId>> {
+        fn reserve_device(&self, count: u32) -> Option<Vec<PhysicalKvPageId>> {
             let mut free = self.free.lock();
             if (free.len() as u32) < count {
                 return None;
@@ -3374,7 +3365,7 @@ mod starvation_race_tests {
             let at = free.len() - count as usize;
             Some(free.split_off(at))
         }
-        fn reserve_device_up_to(&self, _: KvPool, count: u32) -> Vec<PhysicalKvPageId> {
+        fn reserve_device_up_to(&self, count: u32) -> Vec<PhysicalKvPageId> {
             self.pulls.lock().push(count);
             if self
                 .stall
@@ -3388,7 +3379,7 @@ mod starvation_race_tests {
             let at = free.len() - take;
             free.split_off(at)
         }
-        fn release_device(&self, _: KvPool, pages: Vec<PhysicalKvPageId>) {
+        fn release_device(&self, pages: Vec<PhysicalKvPageId>) {
             self.free.lock().extend(pages);
         }
         fn reserve_rs(&self, count: u32) -> Option<Vec<crate::store::rs::RsSlotId>> {
@@ -3397,6 +3388,10 @@ mod starvation_race_tests {
         }
         fn release_rs(&self, slots: Vec<crate::store::rs::RsSlotId>) {
             self.with_rs(|rs| rs.release_slot_reservation(slots));
+        }
+        fn yield_indexes(&self, working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize {
+            self.with_rs(|rs| rs.yield_indexes(working_sets))
+                .unwrap_or(0)
         }
     }
 
@@ -3431,6 +3426,122 @@ mod starvation_race_tests {
     }
 
     #[test]
+    fn a_head_short_of_state_beside_free_pages_is_funded_by_eviction() {
+        // The head lacks a state slot while the device has kv pages to
+        // spare: the pages a queued decode step asks for are supply, not a
+        // deficit the eviction planner should defer on.
+        let model = crate::store::registry::register_model(16, &[64], &[2]);
+        let stores = crate::store::registry::get(model, 0);
+        {
+            let mut rs = stores.rs.lock().unwrap();
+            let ws = rs.create_working_set(crate::store::rs::RsGeometry {
+                state_size: 64,
+                buffer_page_tokens: 4,
+                fold_granularity: 1,
+            });
+            let folded = rs.prepare_write(ws, true, None).unwrap();
+            let published = rs.publish_prepared(folded).unwrap();
+            rs.settle(published);
+        }
+        let pool = Arc::new(RacePool {
+            rs_model: Some(model),
+            ..RacePool::new(64)
+        });
+        pool.refill_after_stall(64, 0);
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+        let (head, younger) = (ProcessId::new_v4(), ProcessId::new_v4());
+        for pid in [head, younger] {
+            planner.register(pid);
+            planner.note_admitted(pid);
+        }
+        planner.with_inner(|inner| {
+            for (pid, kv_pages, rs_slots) in [(head, 0, 2), (younger, 1, 0)] {
+                let key = (inner.procs[&pid].seq, inner.next_id);
+                inner.next_id += 1;
+                inner.queue.insert(
+                    key,
+                    Waiter {
+                        pid,
+                        kind: WaitKind::Allocation {
+                            demand: Demand { kv_pages, rs_slots },
+                            notify: Arc::new(Notify::new()),
+                            outcome: None,
+                            yielded: false,
+                        },
+                    },
+                );
+            }
+        });
+        let victims = planner.victim_set().expect("the head is short");
+        assert_eq!(
+            victims.deficit,
+            Reclaim {
+                pages: 0,
+                rs_slots: 1
+            }
+        );
+        assert_eq!(victims.members.len(), 1);
+        assert_eq!(victims.members[0].pid, younger);
+    }
+
+    #[test]
+    fn a_wedged_head_short_of_state_alone_still_reclaims_by_restart() {
+        // The head asks for a state slot and no pages: the pages it has
+        // do not cover it, so a stalled fleet with nothing to evict reclaims
+        // the youngest ask rather than waiting on a serve that cannot come.
+        let model = crate::store::registry::register_model(16, &[64], &[2]);
+        let stores = crate::store::registry::get(model, 0);
+        let held = stores.rs.lock().unwrap().reserve_slots(2).unwrap();
+        let pool = Arc::new(RacePool {
+            rs_model: Some(model),
+            ..RacePool::new(8)
+        });
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+        let (head, younger) = (ProcessId::new_v4(), ProcessId::new_v4());
+        let mut keys = Vec::new();
+        planner.with_inner(|inner| {
+            for (pid, kv_pages, rs_slots) in [(head, 0, 1), (younger, 1, 0)] {
+                let seq = inner.next_seq;
+                inner.next_seq += 1;
+                let mut proc = Proc::new(seq);
+                proc.admitted = true;
+                inner.procs.insert(pid, proc);
+                let key = (seq, inner.next_id);
+                inner.next_id += 1;
+                keys.push(key);
+                inner.queue.insert(
+                    key,
+                    Waiter {
+                        pid,
+                        kind: WaitKind::Allocation {
+                            demand: Demand { kv_pages, rs_slots },
+                            notify: Arc::new(Notify::new()),
+                            outcome: None,
+                            yielded: false,
+                        },
+                    },
+                );
+            }
+        });
+        assert!(planner.is_wedged());
+        planner.check_starvation(StarveCause::NoEligibleVictim);
+        planner.with_inner(|inner| {
+            assert!(matches!(
+                inner.queue[&keys[0]].kind,
+                WaitKind::Allocation { outcome: None, .. }
+            ));
+            assert!(matches!(
+                inner.queue[&keys[1]].kind,
+                WaitKind::Allocation {
+                    outcome: Some(Err(PlannerError::Starved { .. })),
+                    ..
+                }
+            ));
+        });
+        stores.rs.lock().unwrap().release_slot_reservation(held);
+    }
+
+    #[test]
     fn a_burst_serves_exactly_the_fundable_prefix_in_one_pass() {
         let pool = Arc::new(RacePool::new(64));
         let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
@@ -3440,7 +3551,7 @@ mod starvation_race_tests {
         planner.note_admitted(holder);
 
         let demand = Demand {
-            kv_pages: KvPages::paged(1),
+            kv_pages: 1,
             rs_slots: 0,
         };
         let pids: Vec<ProcessId> = (0..6)
@@ -3547,7 +3658,7 @@ mod starvation_race_tests {
                 head,
                 head,
                 Demand {
-                    kv_pages: KvPages::paged(1),
+                    kv_pages: 1,
                     rs_slots: 0,
                 },
             )
@@ -3611,7 +3722,7 @@ mod starvation_race_tests {
         }
 
         let demand = Demand {
-            kv_pages: KvPages::paged(1),
+            kv_pages: 1,
             rs_slots: 0,
         };
         let p = planner.clone();
@@ -3716,7 +3827,7 @@ mod starvation_race_tests {
                 pid,
                 pid,
                 Demand {
-                    kv_pages: KvPages::paged(0),
+                    kv_pages: 0,
                     rs_slots: 1,
                 },
             )
@@ -3736,20 +3847,92 @@ mod starvation_race_tests {
         );
     }
 
+    /// A ring model's store: a window of 32 tokens over 16-token pages,
+    /// 8 windowed page ids of which 0 is the null page.
+    fn ring_model() -> usize {
+        crate::store::registry::register_model_with_swap(
+            16,
+            &[64],
+            &[0],
+            &[0],
+            &[crate::store::registry::StatePool {
+                window_tokens: 32,
+                window_pages: 8,
+                ..Default::default()
+            }],
+            &[0],
+        )
+    }
+
+    /// The pages a fire of `rows` tokens from `held` writes, and how it
+    /// moves its ring when it commits them all.
+    fn ring_fire(held: u32, rows: u32) -> (Vec<u32>, crate::store::rs::RingAdvance) {
+        let end = held + rows;
+        (
+            (held / 16..=(end - 1) / 16).collect(),
+            crate::store::rs::RingAdvance {
+                positioned: true,
+                settled: held,
+                fold: Some(u32::MAX),
+                commit_end: end,
+                head: Some(end),
+            },
+        )
+    }
+
+    fn ring_demand(
+        stores: &crate::store::registry::Stores,
+        ws: crate::store::rs::RsWorkingSetId,
+        held: u32,
+        rows: u32,
+    ) -> Demand {
+        let (pages, _) = ring_fire(held, rows);
+        let pages = stores.rs.lock().unwrap().ring_demand(ws, &pages).unwrap();
+        Demand {
+            kv_pages: 0,
+            rs_slots: pages as u32,
+        }
+    }
+
+    /// Fires from the grant; the published write is settled unless `hold`.
+    fn ring_write(
+        stores: &crate::store::registry::Stores,
+        ws: crate::store::rs::RsWorkingSetId,
+        held: u32,
+        rows: u32,
+        mut grant: AllocationGrant,
+        hold: bool,
+    ) -> Option<crate::store::rs::write::RsPublished> {
+        let (pages, advance) = ring_fire(held, rows);
+        let mut rs = stores.rs.lock().unwrap();
+        let prepared = rs
+            .prepare_ring(ws, &pages, Some(grant.lend_rs()))
+            .expect("the grant covers the claim");
+        let published = rs.publish_prepared(prepared).unwrap();
+        rs.ring_advance(ws, advance, &(0..64).collect::<Vec<u32>>());
+        if hold {
+            return Some(published);
+        }
+        rs.settle(published);
+        None
+    }
+
     // #699: a fire short of windowed pages parks in the planner like a
     // kv-short one, and is served once another sequence's window moves on
-    // and the pages behind it retire.
+    // and the pages behind it retire, which the fire that read them settles.
     #[tokio::test(flavor = "current_thread")]
     async fn a_fire_short_of_windowed_pages_waits_for_a_window_to_move_on() {
-        use crate::store::kv::window::WindowLane;
-        use crate::store::registry::with_kv_lock;
-
-        let model = crate::store::registry::register_model(16, &[64], &[0]);
+        let model = ring_model();
         let stores = crate::store::registry::get(model, 0);
-        let (a, b) = with_kv_lock(&stores.kv, "test", |kv| {
-            kv.set_window(32, 16, 8);
-            (kv.create_working_set(), kv.create_working_set())
-        });
+        let geom = crate::store::rs::RsGeometry {
+            state_size: 0,
+            buffer_page_tokens: 16,
+            fold_granularity: 1,
+        };
+        let (a, b) = {
+            let mut rs = stores.rs.lock().unwrap();
+            (rs.create_working_set(geom), rs.create_working_set(geom))
+        };
         let planner = Arc::new(ResidencyPlanner::new(Arc::new(RegistryPool::new(
             model, 0, false,
         ))));
@@ -3758,42 +3941,24 @@ mod starvation_race_tests {
             planner.register(pid);
             planner.note_admitted(pid);
         }
-        let pages: Vec<u32> = (0..8).collect();
-        let demand = |ws, held: u32, rows: u32| {
-            with_kv_lock(&stores.kv, "test", |kv| {
-                let end = u64::from((held + rows).div_ceil(16));
-                let grow = end.saturating_sub(kv.page_len(ws).unwrap());
-                kv.reserve(ws, grow).unwrap();
-                let lane = WindowLane::of(&pages, held, rows, 32, 16);
-                let windowed = kv.window_demand(ws, &[lane], 0..0).unwrap();
-                kv.ensure_backed(ws, end).unwrap();
-                Demand {
-                    kv_pages: KvPages::new(0, windowed),
-                    rs_slots: 0,
-                }
-            })
-        };
-        let fire = |ws, held: u32, rows: u32, mut grant: AllocationGrant| {
-            with_kv_lock(&stores.kv, "test", |kv| {
-                let epoch = kv.open_epoch();
-                let lane = WindowLane::of(&pages, held, rows, 32, 16);
-                let granted = grant.lend_kv(KvPool::Windowed);
-                kv.claim_window(ws, &[lane], &[], granted, epoch)
-                    .expect("a windowed pool")
-                    .expect("the grant covers the claim");
-                kv.settle(epoch, Vec::new(), true);
-            });
-        };
         let granted = |acquired: Result<Acquired, PlannerError>| match acquired {
             Ok(Acquired::Granted(grant)) => grant,
             _ => panic!("a grant"),
         };
 
-        let prefill = demand(a, 0, 96);
-        assert_eq!(prefill.kv_pages[KvPool::Windowed], 6);
-        fire(a, 0, 96, granted(planner.acquire(pa, pa, prefill).await));
+        let prefill = ring_demand(&stores, a, 0, 96);
+        assert_eq!(prefill.rs_slots, 6);
+        let in_flight = ring_write(
+            &stores,
+            a,
+            0,
+            96,
+            granted(planner.acquire(pa, pa, prefill).await),
+            true,
+        );
 
-        let short = demand(b, 0, 32);
+        let short = ring_demand(&stores, b, 0, 64);
+        assert_eq!(short.rs_slots, 4);
         let p = planner.clone();
         let parked = crate::rt::spawn(async move { p.acquire(pb, pb, short).await });
         for _ in 0..50 {
@@ -3801,16 +3966,12 @@ mod starvation_race_tests {
         }
         assert!(
             !parked.is_finished(),
-            "two pages asked, one free: the fire parks"
+            "four pages asked, one free: the fire parks"
         );
 
-        let decode = demand(a, 96, 1);
-        assert_eq!(
-            decode.kv_pages[KvPool::Windowed],
-            1,
-            "the window moved past four pages and gives them back"
-        );
-        fire(a, 96, 1, granted(planner.acquire(pa, pa, decode).await));
+        // The prefill committed 96 tokens: the four pages behind its window
+        // retire once it settles.
+        stores.rs.lock().unwrap().settle(in_flight.unwrap());
         planner.pages_freed();
         for _ in 0..50 {
             if parked.is_finished() {
@@ -3823,8 +3984,8 @@ mod starvation_race_tests {
             "the retired pages serve the parked fire"
         );
         let grant = granted(parked.await.expect("the parked task"));
-        assert_eq!(grant.remaining_kv(KvPool::Windowed), 2);
-        fire(b, 0, 32, grant);
+        assert_eq!(grant.remaining_rs(), 4);
+        ring_write(&stores, b, 0, 64, grant, false);
     }
 
     // A lone sequence is served by the pages its own window moved past,
@@ -3833,57 +3994,40 @@ mod starvation_race_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_lone_window_is_served_by_what_it_moved_past_or_told_it_never_fits() {
         use crate::inferlet::process::residency::{ProcessResidency, register_residency};
-        use crate::store::kv::window::WindowLane;
-        use crate::store::registry::with_kv_lock;
 
-        let model = crate::store::registry::register_model(16, &[64], &[0]);
+        let model = ring_model();
         let stores = crate::store::registry::get(model, 0);
-        let ws = with_kv_lock(&stores.kv, "test", |kv| {
-            kv.set_window(32, 16, 8);
-            kv.create_working_set()
-        });
-        let handle = crate::store::kv::working_set::KvWorkingSet::new(model, 0, ws, 16);
+        let ws = stores
+            .rs
+            .lock()
+            .unwrap()
+            .create_working_set(crate::store::rs::RsGeometry {
+                state_size: 0,
+                buffer_page_tokens: 16,
+                fold_granularity: 1,
+            });
         let pid = ProcessId::new_v4();
         let residency = Arc::new(std::sync::Mutex::new(ProcessResidency::default()));
         residency
             .lock()
             .unwrap()
-            .kv_working_sets
-            .insert((model, 0, ws), handle.suspend_handle());
+            .rs_working_sets
+            .insert((model, 0, ws));
         register_residency(pid, Arc::downgrade(&residency));
         let planner = Arc::new(ResidencyPlanner::new(Arc::new(RegistryPool::new(
             model, 0, false,
         ))));
         planner.register(pid);
         planner.note_admitted(pid);
-        let pages: Vec<u32> = (0..16).collect();
         let fire = |held: u32, rows: u32| {
             let planner = planner.clone();
-            let (stores, pages) = (stores.clone(), pages.clone());
+            let stores = stores.clone();
             async move {
-                let demand = with_kv_lock(&stores.kv, "test", |kv| {
-                    let end = u64::from((held + rows).div_ceil(16));
-                    kv.reserve(ws, end.saturating_sub(kv.page_len(ws).unwrap()))
-                        .unwrap();
-                    let lane = WindowLane::of(&pages, held, rows, 32, 16);
-                    let windowed = kv.window_demand(ws, &[lane], 0..0).unwrap();
-                    kv.ensure_backed(ws, end).unwrap();
-                    Demand {
-                        kv_pages: KvPages::new(0, windowed),
-                        rs_slots: 0,
-                    }
-                });
-                let Acquired::Granted(mut grant) = planner.acquire(pid, pid, demand).await? else {
+                let demand = ring_demand(&stores, ws, held, rows);
+                let Acquired::Granted(grant) = planner.acquire(pid, pid, demand).await? else {
                     panic!("a resident process is never yielded");
                 };
-                with_kv_lock(&stores.kv, "test", |kv| {
-                    let epoch = kv.open_epoch();
-                    let lane = WindowLane::of(&pages, held, rows, 32, 16);
-                    kv.claim_window(ws, &[lane], &[], grant.lend_kv(KvPool::Windowed), epoch)
-                        .expect("a windowed pool")
-                        .expect("the grant covers the claim");
-                    kv.settle(epoch, Vec::new(), true);
-                });
+                ring_write(&stores, ws, held, rows, grant, false);
                 Ok::<(), PlannerError>(())
             }
         };
@@ -3891,14 +4035,14 @@ mod starvation_race_tests {
         fire(0, 96).await.expect("six of seven pages");
         fire(96, 64)
             .await
-            .expect("four fresh pages, four given back behind the window");
+            .expect("four fresh pages, four retired behind the window");
         let error = fire(160, 96)
             .await
             .expect_err("six fresh beside the two it keeps");
         assert!(
             matches!(
                 error,
-                PlannerError::Hog {
+                PlannerError::RsHog {
                     need: 6,
                     held: 2,
                     total: 7
@@ -3906,6 +4050,5 @@ mod starvation_race_tests {
             ),
             "{error}"
         );
-        drop(handle);
     }
 }

@@ -1153,6 +1153,16 @@ pub struct RsCaps {
     pub state_size: u64,
     pub buffer_page_size: u32,
     pub fold_granularity: u32,
+    /// The window the model's state is read through, when it is one:
+    /// its bounded half is then a ring of windowed kv pages, not a slot.
+    pub window_tokens: u32,
+}
+
+impl RsCaps {
+    /// The model has a bounded half beside its kv: a folded state or a window.
+    pub fn has_state(&self) -> bool {
+        self.state_size > 0 || self.window_tokens > 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1302,6 +1312,20 @@ impl Model {
 
     pub fn rs_caps(&self) -> RsCaps {
         self.rs_caps
+    }
+
+    /// What a forward pass of the model is: kv, a bounded state, both, or
+    /// a canvas.
+    pub fn pass_kind(&self) -> crate::pipeline::instance::PassKind {
+        use crate::pipeline::instance::PassKind;
+        if self.diffusion().is_some() {
+            return PassKind::Diffusion;
+        }
+        match (self.kv_page_size > 0, self.rs_caps.has_state()) {
+            (_, false) => PassKind::Attention,
+            (true, true) => PassKind::Hybrid,
+            (false, true) => PassKind::Recurrent,
+        }
     }
 
     pub fn eta_caps(&self) -> EtaCaps {

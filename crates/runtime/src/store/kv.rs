@@ -3,7 +3,6 @@
 pub mod hash;
 pub mod page_table;
 pub mod project;
-pub mod window;
 pub mod working_set;
 pub mod write;
 
@@ -18,12 +17,10 @@ use ::engine::transfer::MemoryDomain;
 use hash::Hash256;
 use page_table::{
     DiskKvSlotId, HostKvSlotId, IndexedWorkingSet, KvPageBacking, KvPageTable, KvTableError,
-    NoReclaim, NodeId, PhysicalKvPageId, PublishedPage, ReclaimQuote, TriePageLocation,
-    WorkingSetId,
+    NodeId, PhysicalKvPageId, PublishedPage, ReclaimQuote, TriePageLocation, WorkingSetId,
 };
 use write::{KvPreparedWrite, PageCommit, PreparedTarget};
 
-use crate::planner::KvPool;
 use crate::store::pool::Pool;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -223,7 +220,6 @@ pub struct KvStore {
     seq: u64,
     in_flight: u64,
     outstanding: std::collections::BTreeSet<u64>,
-    window: Option<window::WindowPool>,
 }
 
 #[cfg(test)]
@@ -281,179 +277,6 @@ impl KvStore {
             seq: 0,
             in_flight: 0,
             outstanding: std::collections::BTreeSet::new(),
-            window: None,
-        }
-    }
-
-    /// Gives the store the engine's windowed kv pool: `pages` ids, 0 the
-    /// null page, for rows read through a window of `tokens`.
-    pub fn set_window(&mut self, tokens: u32, page_size: u32, pages: u32) {
-        self.window =
-            (tokens > 0 && pages > 1).then(|| window::WindowPool::new(tokens, page_size, pages));
-    }
-
-    #[must_use]
-    pub fn window(&self) -> Option<&window::WindowPool> {
-        self.window.as_ref()
-    }
-
-    #[must_use]
-    pub fn pool_available(&self, pool: KvPool) -> usize {
-        match pool {
-            KvPool::Paged => self.pool.available(),
-            KvPool::Windowed => self
-                .window
-                .as_ref()
-                .map_or(0, window::WindowPool::available),
-        }
-    }
-
-    #[must_use]
-    pub fn pool_capacity(&self, pool: KvPool) -> u32 {
-        match pool {
-            KvPool::Paged => self.pool.capacity(),
-            KvPool::Windowed => self.window.as_ref().map_or(0, window::WindowPool::capacity),
-        }
-    }
-
-    pub fn reserve_pool_pages(
-        &mut self,
-        pool: KvPool,
-        count: usize,
-    ) -> Option<Vec<PhysicalKvPageId>> {
-        match pool {
-            KvPool::Paged => self.reserve_device_pages(count),
-            KvPool::Windowed => self.window.as_mut()?.reserve(count),
-        }
-    }
-
-    pub fn release_pool_reservation(&mut self, pool: KvPool, pages: Vec<PhysicalKvPageId>) {
-        match pool {
-            KvPool::Paged => self.release_device_reservation(pages),
-            KvPool::Windowed => {
-                if let Some(window) = self.window.as_mut() {
-                    window.release_reserved(pages);
-                }
-            }
-        }
-    }
-
-    /// Opens an epoch for a fire that prepares no kv write but reads
-    /// windowed pages, so the pages it reads are not handed out again
-    /// until it settles.
-    pub fn open_epoch(&mut self) -> u64 {
-        self.seq += 1;
-        self.in_flight += 1;
-        self.outstanding.insert(self.seq);
-        self.seq
-    }
-
-    /// The windowed pages `ws`'s next fire must take fresh: those its
-    /// `lanes` (in the working set's own page indices) read that have none
-    /// yet, will be backed anew, or are rewritten from a shared page in
-    /// `writes`. The pages its last claim holds behind every lane's window
-    /// are given back first, so the demand is what the fire will hold less
-    /// what it gives back.
-    pub fn window_demand(
-        &mut self,
-        ws: WorkingSetId,
-        lanes: &[window::WindowLane<'_>],
-        writes: std::ops::Range<u64>,
-    ) -> Result<u32, KvStoreError> {
-        if self.window.is_none() {
-            return Ok(0);
-        }
-        let mapped = self.table.mapped_len(ws)?;
-        let mut shared = false;
-        for index in writes.start..writes.end.min(mapped) {
-            shared |= !self.privately_writable(ws, index)?;
-        }
-        let table = self.flat_table(ws)?.1.to_vec();
-        let pool = self.window.as_mut().expect("checked above");
-        let mut keep = HashSet::new();
-        let mut fresh = HashSet::new();
-        for lane in lanes {
-            for &index in &lane.pages[lane.first..lane.end] {
-                let index = u64::from(index);
-                match table.get(index as usize) {
-                    Some(&page) => {
-                        keep.insert(page);
-                        if !pool.backs(page) || (shared && writes.contains(&index)) {
-                            fresh.insert(index);
-                        }
-                    }
-                    None => {
-                        fresh.insert(index);
-                    }
-                }
-            }
-        }
-        pool.keep(&window::Holder::Ws(ws), &keep);
-        // What no fire in flight reads is free now: a lone sequence settles
-        // before it asks, so no later settle would retire it.
-        self.retire_idle();
-        Ok(u32::try_from(fresh.len()).unwrap_or(u32::MAX))
-    }
-
-    /// Claims the windowed pages `ws`'s lanes (in its own page indices)
-    /// read in the fire of `epoch`, from `granted`; see `WindowPool::claim`.
-    /// `None` when the model has no windowed space.
-    pub fn claim_window(
-        &mut self,
-        ws: WorkingSetId,
-        lanes: &[window::WindowLane<'_>],
-        copies: &[(u32, u32)],
-        granted: &mut Vec<PhysicalKvPageId>,
-        epoch: u64,
-    ) -> Option<Result<window::Claimed, window::ClaimError>> {
-        self.window.as_ref()?;
-        let table = match self.flat_table(ws) {
-            Ok((_, table)) => table.to_vec(),
-            Err(error) => return Some(Err(window::ClaimError::Rewound(error.to_string()))),
-        };
-        let physical: Option<Vec<Vec<u32>>> = lanes
-            .iter()
-            .map(|lane| {
-                let read = lane.first..lane.end;
-                lane.pages
-                    .iter()
-                    .enumerate()
-                    .map(|(at, &index)| match read.contains(&at) {
-                        true => table.get(index as usize).map(|page| page.0),
-                        false => Some(0),
-                    })
-                    .collect()
-            })
-            .collect();
-        let Some(physical) = physical else {
-            return Some(Err(window::ClaimError::Rewound(format!(
-                "a lane reads a kv page past the working set's {} mapped page(s)",
-                table.len()
-            ))));
-        };
-        let lanes: Vec<window::WindowLane<'_>> = lanes
-            .iter()
-            .zip(&physical)
-            .map(|(lane, pages)| window::WindowLane {
-                pages,
-                first: lane.first,
-                end: lane.end,
-                fresh_from: lane.fresh_from,
-            })
-            .collect();
-        let pool = self.window.as_mut()?;
-        Some(pool.claim(window::Holder::Ws(ws), &lanes, copies, granted, epoch))
-    }
-
-    fn share_window(&mut self, from: window::Holder, to: window::Holder) {
-        if let Some(pool) = self.window.as_mut() {
-            pool.share(&from, to);
-        }
-    }
-
-    fn release_window(&mut self, holder: &window::Holder) {
-        if let Some(pool) = self.window.as_mut() {
-            pool.release(holder);
         }
     }
 
@@ -475,9 +298,6 @@ impl KvStore {
             return;
         };
         self.pool.retire_through(through);
-        if let Some(pool) = self.window.as_mut() {
-            pool.retire_through(through);
-        }
     }
 
     pub fn create_working_set(&mut self) -> WorkingSetId {
@@ -521,16 +341,10 @@ impl KvStore {
         if let Some(root) = snapshot.terminal {
             self.table.lease_cache_root(root);
         }
-        let windowed = self.pool_available(KvPool::Windowed);
-        self.share_window(window::Holder::Ws(ws), window::Holder::Index(key.clone()));
         let replaced = self.indexes.insert(key, KvIndexEntry { snapshot });
-        let freed = replaced.map_or(0, |entry| {
+        Ok(replaced.map_or(0, |entry| {
             self.release_index_entry(entry, self.current_epoch())
-        });
-        Ok(freed
-            + self
-                .pool_available(KvPool::Windowed)
-                .saturating_sub(windowed))
+        }))
     }
 
     #[allow(
@@ -552,7 +366,6 @@ impl KvStore {
             return Ok(None);
         };
         let ws = self.table.from_index_snapshot(entry.snapshot);
-        self.share_window(window::Holder::Index(key.to_vec()), window::Holder::Ws(ws));
         self.flat.insert(ws, prepared.entry);
         self.refresh_flat(ws);
         Ok(Some(ws))
@@ -563,17 +376,8 @@ impl KvStore {
         let Some(entry) = self.indexes.remove(key) else {
             return Ok((false, 0));
         };
-        let windowed = self.pool_available(KvPool::Windowed);
-        self.release_window(&window::Holder::Index(key.to_vec()));
         let epoch = self.current_epoch();
-        let freed = self.release_index_entry(entry, epoch);
-        Ok((
-            true,
-            freed
-                + self
-                    .pool_available(KvPool::Windowed)
-                    .saturating_sub(windowed),
-        ))
+        Ok((true, self.release_index_entry(entry, epoch)))
     }
 
     pub fn fork(
@@ -582,7 +386,6 @@ impl KvStore {
         prepared: PreparedWorkingSet,
     ) -> Result<WorkingSetId, KvStoreError> {
         let child = self.table.fork(ws)?;
-        self.share_window(window::Holder::Ws(ws), window::Holder::Ws(child));
         self.flat.insert(child, prepared.entry);
         self.refresh_flat(child);
         Ok(child)
@@ -597,7 +400,6 @@ impl KvStore {
         let parent_mapped = self.table.mapped_len(ws)?;
         let parent_chain = self.table.chain_state(ws)?;
         let child = self.table.slice(ws, range.clone())?;
-        self.share_window(window::Holder::Ws(ws), window::Holder::Ws(child));
         if range.start == 0 && range.end == parent_mapped {
             self.table.set_chain_state(child, parent_chain)?;
         } else {
@@ -610,45 +412,6 @@ impl KvStore {
 
     pub fn reserve(&mut self, ws: WorkingSetId, pages: u64) -> Result<Range<u64>, KvStoreError> {
         Ok(self.table.reserve(ws, pages)?)
-    }
-
-    pub fn ensure_backed(&mut self, ws: WorkingSetId, end: u64) -> Result<usize, KvStoreError> {
-        let page_len = self.table.page_len(ws)?;
-        if end > page_len {
-            return Err(KvStoreError::BadWriteSet {
-                reason: "backing frontier exceeds the logical reservation",
-            });
-        }
-        let mapped = self.table.mapped_len(ws)?;
-        if end <= mapped {
-            return Ok(0);
-        }
-        let count = usize::try_from(end - mapped).map_err(|_| KvStoreError::OutOfPages {
-            requested: usize::MAX,
-            available: self.pool.available(),
-        })?;
-        let allocated = self
-            .pool
-            .try_alloc_n(count)
-            .ok_or(KvStoreError::OutOfPages {
-                requested: count,
-                available: self.pool.available(),
-            })?;
-        let published = allocated
-            .iter()
-            .copied()
-            .map(|id| PublishedPage {
-                id,
-                token_hashes: Vec::new(),
-                page_hash: None,
-            })
-            .collect();
-        if let Err(error) = self.table.publish_appended(ws, published) {
-            self.pool.release_reserved(allocated);
-            return Err(error.into());
-        }
-        self.invalidate_flat(ws);
-        Ok(count)
     }
 
     pub fn backing_demand(&self, ws: WorkingSetId, end: u64) -> Result<usize, KvStoreError> {
@@ -801,7 +564,6 @@ impl KvStore {
     fn release_working_set_now(&mut self, ws: WorkingSetId, epoch: u64) {
         let freed = self.table.release_working_set_backings(ws);
         self.recycle_backings(freed, epoch);
-        self.release_window(&window::Holder::Ws(ws));
         self.flat.remove(&ws);
     }
 
@@ -1373,15 +1135,7 @@ impl KvStore {
         groups: &[HashSet<WorkingSetId>],
         budget: u32,
     ) -> Vec<ReclaimQuote> {
-        let mut quotes = self.table.reclaim_quotes(groups, budget);
-        // A suspend moves no windowed rows, and their pages are keyed to the
-        // kv pages it would recycle, so a window holder stays resident.
-        for (quote, group) in quotes.iter_mut().zip(groups) {
-            if self.held_window_pages(group) > 0 {
-                *quote = ReclaimQuote::Nothing(NoReclaim::Windowed);
-            }
-        }
-        quotes
+        self.table.reclaim_quotes(groups, budget)
     }
 
     pub fn reserve_device_pages(&mut self, count: usize) -> Option<Vec<PhysicalKvPageId>> {
@@ -1396,11 +1150,6 @@ impl KvStore {
         &mut self,
         working_sets: &HashSet<WorkingSetId>,
     ) -> Result<KvSuspendPrepare, KvStoreError> {
-        if self.held_window_pages(working_sets) > 0 {
-            return Ok(KvSuspendPrepare::Deferred(
-                SuspendDisposition::NothingReclaimable,
-            ));
-        }
         let (pages, pinned) = self.table.private_resident_pages(working_sets)?;
         if pinned {
             return Ok(KvSuspendPrepare::Deferred(
@@ -1543,17 +1292,6 @@ impl KvStore {
         working_sets: &HashSet<WorkingSetId>,
     ) -> Result<usize, KvStoreError> {
         Ok(self.table.held_pages(working_sets)?)
-    }
-
-    /// The windowed pages `working_sets`' windows hold.
-    #[must_use]
-    pub fn held_window_pages(&self, working_sets: &HashSet<WorkingSetId>) -> usize {
-        self.window.as_ref().map_or(0, |pool| {
-            working_sets
-                .iter()
-                .map(|&ws| pool.held(&window::Holder::Ws(ws)))
-                .sum()
-        })
     }
 
     pub fn prepare_restore(

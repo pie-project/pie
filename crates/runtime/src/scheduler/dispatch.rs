@@ -250,6 +250,8 @@ pub(crate) struct TierMove {
 pub(crate) enum TierKind {
     Kv,
     Rs,
+    /// A ring's pages, moved through the windowed kv planes.
+    Window,
 }
 
 impl TierMove {
@@ -257,6 +259,7 @@ impl TierMove {
         let kind = match self.kind {
             TierKind::Kv => "kv",
             TierKind::Rs => "rs",
+            TierKind::Window => "window",
         };
         let way = if self.out { "to" } else { "from" };
         format!("{kind} {way} {:?}", self.tier)
@@ -281,6 +284,23 @@ pub(crate) fn copy_tier_tracked(
                 src_page_ids: src_page_ids.clone(),
                 dst_page_ids: dst_page_ids.clone(),
                 moves: Vec::new(),
+                windowed: Vec::new(),
+            })
+        }
+        TierKind::Window => {
+            let device = super::device_domain(engine_idx);
+            let (src, dst, from, to) = if copy.out {
+                (device, copy.tier, &copy.device, &copy.slots)
+            } else {
+                (copy.tier, device, &copy.slots, &copy.device)
+            };
+            PreLaunchCopy::Kv(KvCopy {
+                src,
+                dst,
+                src_page_ids: Vec::new(),
+                dst_page_ids: Vec::new(),
+                moves: Vec::new(),
+                windowed: from.iter().copied().zip(to.iter().copied()).collect(),
             })
         }
         TierKind::Rs => {
@@ -321,6 +341,7 @@ pub(crate) async fn copy_d2d(
             src_page_ids: src_phys_ids.to_vec(),
             dst_page_ids: dst_phys_ids.to_vec(),
             moves: Vec::new(),
+            windowed: Vec::new(),
         })
         .await
 }
@@ -337,6 +358,7 @@ pub(crate) async fn copy_h2h(
             src_page_ids: src_slots.to_vec(),
             dst_page_ids: dst_slots.to_vec(),
             moves: Vec::new(),
+            windowed: Vec::new(),
         })
         .await
 }
@@ -352,6 +374,7 @@ pub(crate) async fn copy_kv_cells(
             src_page_ids: Vec::new(),
             dst_page_ids: Vec::new(),
             moves: cells,
+            windowed: Vec::new(),
         })
         .await
 }
