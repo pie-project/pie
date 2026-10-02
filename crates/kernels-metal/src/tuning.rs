@@ -111,6 +111,7 @@ impl DeviceTuning {
             8 => {
                 t.qmm_min_batch = 8;
                 t.qmm_min_batch_moe = 12;
+                t.sdpa_mpp = true;
             }
             _ => {}
         }

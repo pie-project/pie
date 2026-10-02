@@ -23,11 +23,16 @@ fn an_apple10_gpu_reads_a_prompt_through_mpp() {
         apple10.sdpa_mpp,
         "and its prompt rows attend through the MPP matmul too"
     );
-    for older in [0, 7, 8, 9] {
-        let older = tuned(older);
+    let apple8 = tuned(8);
+    assert!(
+        apple8.sdpa_mpp && !apple8.qmm_mpp,
+        "an Apple8 GPU attends through MPP and keeps the tiled matmul, which is faster there"
+    );
+    for unmeasured in [0, 7, 9] {
+        let unmeasured = tuned(unmeasured);
         assert!(
-            !older.qmm_mpp && !older.sdpa_mpp,
-            "an older family keeps the kernels it was measured on"
+            !unmeasured.qmm_mpp && !unmeasured.sdpa_mpp,
+            "a family nobody measured keeps the kernels it had"
         );
     }
 }
