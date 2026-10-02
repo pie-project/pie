@@ -20,6 +20,16 @@ const PTQ1_0_QMV: &str = "ptq1_0_qmv_bfloat16";
 /// Weights per PTQ1_0 block; the scale is INLINE per block (single plane).
 const PTQ1_0_BLOCK: u32 = 128;
 
+/// The PQ2_0 positional-2-bit decode-in-dot kernel (`Dtype::Pq2_0`,
+/// `g128_u2_f16_n`).
+const PQ2_0_FILE: &str = "linear/quant_pq2_0.metal";
+
+/// Production qmv entrypoint: bf16 activation in, bf16 out.
+const PQ2_0_QMV: &str = "pq2_0_qmv_bfloat16";
+
+/// Weights per PQ2_0 block; the scale is INLINE per block (single plane).
+const PQ2_0_BLOCK: u32 = 128;
+
 const QMV_ROWS_FILE: &str = "linear/quant_qmv_rows.metal";
 
 const QMV_ROWS_STAMP: &str = "PIE_STAMP_qmv_rows";
@@ -550,6 +560,16 @@ pub fn act_x_wt(
         }
         return ptq1_0_matmul(ctx, op, act, w, y, rows, columns, contraction);
     }
+    // PQ2_0 is the 2-bit sibling: a single-plane inline-scale quaternary bank
+    // (the fp16 scale leads each 34-byte block), so it has no `scales`/`biases`
+    // plane to pair either. Route it to its own decode-in-dot kernel.
+    if w.codes.dtype == Dtype::Pq2_0 {
+        let (rows, columns, contraction) = extent(op, act, y)?;
+        if rows == 0 {
+            return Ok(());
+        }
+        return pq2_0_matmul(ctx, op, act, w, y, rows, columns, contraction);
+    }
     let Some(biases) = w.biases else {
         return Err(refuse(
             op,
@@ -776,6 +796,42 @@ fn ptq1_0_matmul(
     let k = stated(op, contraction)?;
     ctx.fire(
         Fire::at(PTQ1_0_FILE, PTQ1_0_QMV).apply(Grid::of(qmv_grid(op, m, n)?, QMV_GROUP)),
+        &[w.codes.arg(), act.arg(), y.arg_mut(), k.arg(), n.arg()],
+    )
+}
+
+/// Serve a PQ2_0 (positional 2-bit, `g128_u2_f16_n`) projection with the
+/// decode-in-dot kernel. Like PTQ1_0 the bank is single-plane: `w.codes` carries
+/// the 34-byte blocks with their inline leading fp16 scale, and
+/// `w.scales`/`w.biases` are unused (the loader aliases `scales` at the codes
+/// plane and this path never reads it). One kernel walks every row count `m`;
+/// decode is small and matrix-vector shaped, the path pie's `qwen_3 d27b` decode
+/// takes.
+#[allow(clippy::too_many_arguments)]
+fn pq2_0_matmul(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    act: Tensor,
+    w: Bank,
+    y: Tensor,
+    rows: u32,
+    columns: u32,
+    contraction: u32,
+) -> Result<(), Error> {
+    if !contraction.is_multiple_of(PQ2_0_BLOCK) {
+        return Err(refuse(
+            op,
+            format!(
+                "the contraction is {contraction}, not a whole number of {PQ2_0_BLOCK}-weight \
+                 2-bit blocks: a PQ2_0 row is `ceil(K/{PQ2_0_BLOCK}) * 34` bytes and the \
+                 kernel reads one 34-byte block per {PQ2_0_BLOCK} contracted weights"
+            ),
+        ));
+    }
+    let (m, n) = (stated(op, rows)?, stated(op, columns)?);
+    let k = stated(op, contraction)?;
+    ctx.fire(
+        Fire::at(PQ2_0_FILE, PQ2_0_QMV).apply(Grid::of(qmv_grid(op, m, n)?, QMV_GROUP)),
         &[w.codes.arg(), act.arg(), y.arg_mut(), k.arg(), n.arg()],
     )
 }

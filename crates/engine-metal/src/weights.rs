@@ -235,6 +235,16 @@ impl Weights {
                     group: 128,
                     bits: 2,
                 }),
+                // PQ2_0 is the same single-inline-plane shape (the fp16 scale leads
+                // each 34-byte block), served by its own decode-in-dot kernel which
+                // keys off `codes.dtype == Pq2_0` and never reads scales/group/bits.
+                None if place.dtype == Dtype::Pq2_0 => WeightRow::Planes(kernels_metal::Bank {
+                    codes: dense(place)?,
+                    scales: dense(place)?,
+                    biases: None,
+                    group: 128,
+                    bits: 2,
+                }),
                 None => WeightRow::Dense(dense(place)?),
             }));
         }
@@ -689,6 +699,10 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
                 // 28-byte block (`qs[24]` + `qh[2]` + inline fp16 scale), so a
                 // K-wide row is `ceil(K/128) * 28` bytes across a single plane.
                 Dtype::Ptq1_0 => rows.saturating_mul(width.div_ceil(128).saturating_mul(28)),
+                // PQ2_0 is the 2-bit sibling: each 128-weight row-segment is a
+                // 34-byte block (leading fp16 scale + `qs[32]` positional 2-bit
+                // codes), so a K-wide row is `ceil(K/128) * 34` bytes, single plane.
+                Dtype::Pq2_0 => rows.saturating_mul(width.div_ceil(128).saturating_mul(34)),
                 other => {
                     let element =
                         model_compiler::arena::elem_bytes(other).ok_or_else(|| Fault::Param {
@@ -1016,6 +1030,16 @@ fn warm(
             // and never touches `scales`/`group`/`bits`, so the codes plane doubles
             // as the (unused) scales placeholder.
             None if param.dtype == Dtype::Ptq1_0 => WeightRow::Planes(kernels_metal::Bank {
+                codes: row(index)?,
+                scales: row(index)?,
+                biases: None,
+                group: 128,
+                bits: 2,
+            }),
+            // PQ2_0: the same single-inline-plane 2-bit bank (leading fp16 scale
+            // per 34-byte block). Resolves as a quantized bank so the matmul routes
+            // it to the PQ2_0 decode-in-dot kernel, not as dense bf16.
+            None if param.dtype == Dtype::Pq2_0 => WeightRow::Planes(kernels_metal::Bank {
                 codes: row(index)?,
                 scales: row(index)?,
                 biases: None,
