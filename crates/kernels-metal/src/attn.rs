@@ -72,6 +72,29 @@ const SDPA_TILED_LSE: [&str; 4] = [
     "sdpa_paged_tiled_lse_bfloat16_d_512",
 ];
 
+// C2c — the packed 4-bit KV reads. A packed kv head is one whole head_dim-block,
+// so the codec block IS the head_dim; the read shaders are stamped per head_dim
+// (mirroring the bf16 SDPA widths) and the dispatch selects by the pool's head
+// width. The widths stamped for the packed path:
+const SDPA_KV_U4_WIDTHS: [u32; 2] = [128, 256];
+
+// C2c-1 — the packed 4-bit KV decode read, per head_dim.
+const SDPA_DECODE_KV_U4: [&str; 2] = [
+    "sdpa_paged_decode_kv_u4_bfloat16_d_128",
+    "sdpa_paged_decode_kv_u4_bfloat16_d_256",
+];
+
+// C2c-2 — the packed 4-bit KV tiled read (prefill / masked) and its lse variant
+// (prefill_lse), per head_dim.
+const SDPA_TILED_KV_U4: [&str; 2] = [
+    "sdpa_paged_tiled_kv_u4_bfloat16_d_128",
+    "sdpa_paged_tiled_kv_u4_bfloat16_d_256",
+];
+const SDPA_TILED_LSE_KV_U4: [&str; 2] = [
+    "sdpa_paged_tiled_lse_kv_u4_bfloat16_d_128",
+    "sdpa_paged_tiled_lse_kv_u4_bfloat16_d_256",
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodePlan {
     pub positions: Tensor,
@@ -397,9 +420,26 @@ fn vector(
         );
     }
     let shape = Paged::of(op, q, pool, window, causal, head_dim)?;
-    let entry = match lse {
-        None => SDPA_DECODE[shape.at],
-        Some(_) => SDPA_DECODE_LSE[head_point(op, head_dim, &SDPA_LSE_WIDTHS)?],
+    // The read kernel is chosen by the POOL's dtype — the first KV-dtype dispatch
+    // axis, mirroring how `append_paged` branches its write on `pool.keys.dtype`.
+    // A bf16 pool takes the element-indexed decode; a packed KvU4 pool takes the
+    // dequantizing decode (C2c-1), which exists only as the plain d=256 decode.
+    let entry = match pool.keys.dtype {
+        Dtype::Bf16 => match lse {
+            None => SDPA_DECODE[shape.at],
+            Some(_) => SDPA_DECODE_LSE[head_point(op, head_dim, &SDPA_LSE_WIDTHS)?],
+        },
+        Dtype::KvU4 => {
+            if lse.is_some() {
+                return Err(refuse(
+                    op,
+                    "the packed 4-bit KV cache has no log-sum-exp decode; C2c-1 stamps only the \
+                     plain dequantizing read",
+                ));
+            }
+            SDPA_DECODE_KV_U4[head_point(op, head_dim, &SDPA_KV_U4_WIDTHS)?]
+        }
+        other => return Err(Error::DtypeUnsupported { op, dtype: other }),
     };
     let mut args = vec![
         q.arg(),
@@ -623,9 +663,25 @@ fn tiled(
         );
     }
     let shape = Paged::of(op, q, pool, window, causal, head_dim)?;
-    let entry = match lse {
-        None => SDPA_TILED[shape.at],
-        Some(_) => SDPA_TILED_LSE[head_point(op, head_dim, &SDPA_LSE_WIDTHS)?],
+    // The tiled read kernel is chosen by the POOL's dtype — the same KV-dtype
+    // dispatch axis C2c-1 added to `vector()` and C2b added to `append_paged`.
+    // A bf16 pool takes the element-indexed tiled read; a packed KvU4 pool takes
+    // the dequantizing tiled read (C2c-2), which — unlike the decode read — DOES
+    // carry an lse variant, so prefill / masked / prefill_lse are all covered.
+    // It exists only at d = 256 (a packed kv head is one whole 256-block).
+    let entry = match pool.keys.dtype {
+        Dtype::Bf16 => match lse {
+            None => SDPA_TILED[shape.at],
+            Some(_) => SDPA_TILED_LSE[head_point(op, head_dim, &SDPA_LSE_WIDTHS)?],
+        },
+        Dtype::KvU4 => {
+            let at = head_point(op, head_dim, &SDPA_KV_U4_WIDTHS)?;
+            match lse {
+                None => SDPA_TILED_KV_U4[at],
+                Some(_) => SDPA_TILED_LSE_KV_U4[at],
+            }
+        }
+        other => return Err(Error::DtypeUnsupported { op, dtype: other }),
     };
     let mut args = vec![
         q.arg(),
@@ -886,7 +942,6 @@ fn append_paged(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    let entry = dtype_dispatch!(op, k.dtype, { Bf16 => "kv_append_paged_bfloat16" });
     if pool.page_size <= 0 {
         return Err(refuse(op, "the kv page size is zero"));
     }
@@ -899,6 +954,35 @@ fn append_paged(
         "the write tables are u32: one destination page and one in-page slot per lane"
     );
     let (head_dim, heads) = head_split(op, pool, k.width)?;
+    // The write kernel is chosen by the POOL's dtype, not the incoming
+    // activation's: a bf16 pool copies element-for-element, a packed KvU4 pool
+    // quantizes the incoming bf16 head into the 130-byte v1 block. The arg
+    // vector is identical for both — only the entry point and, for the packed
+    // path, the 256-block head constraint differ.
+    let entry = match pool.keys.dtype {
+        Dtype::Bf16 => dtype_dispatch!(op, k.dtype, { Bf16 => "kv_append_paged_bfloat16" }),
+        Dtype::KvU4 => {
+            // The packed KV codec packs one whole head (an N-block, N == head_dim)
+            // per threadgroup; the write shader is stamped per head_dim. Select it
+            // from the pool's head_dim, refusing a width with no stamped block.
+            dtype_dispatch!(op, k.dtype, { Bf16 => () });
+            match head_dim {
+                128 => "kv_append_paged_pack_sym4_bfloat16_d_128",
+                256 => "kv_append_paged_pack_sym4_bfloat16_d_256",
+                other => {
+                    return Err(refuse(
+                        op,
+                        format!(
+                            "the packed KV codec has no write shader stamped at head width \
+                             {other}; it packs whole {:?}-element heads",
+                            crate::linear::kv_codec::BLOCKS
+                        ),
+                    ));
+                }
+            }
+        }
+        other => return Err(Error::DtypeUnsupported { op, dtype: other }),
+    };
     let lanes = head_grid(op, head_dim, heads, k.rows)?;
     let q8 = q8::enabled(pool, head_dim);
     let (file, entry, grid) = if q8 {

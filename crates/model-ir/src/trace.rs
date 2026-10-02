@@ -90,6 +90,14 @@ pub enum CacheRow {
         space: u32,
         #[serde(default)]
         window: Option<u32>,
+        /// The attention head_dim this cache stores. It is the packing block of
+        /// the `KvU4` codec (a head packs to `head_dim/2 + 2` bytes), so the
+        /// pre-facts demand estimate needs it to size a packed cache exactly at
+        /// any head_dim rather than falling back to the codec's 256 anchor.
+        /// `#[serde(default)]` keeps traces serialized before this field
+        /// readable (they deserialize to 0, which reproduces the old anchor).
+        #[serde(default)]
+        head_dim: u32,
     },
     State {
         name: String,

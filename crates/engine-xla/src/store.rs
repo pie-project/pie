@@ -289,6 +289,7 @@ impl Pools {
                     dtype,
                     space,
                     window,
+                    ..
                 } => {
                     let split = split(name, declared)?;
                     let windowed = windowed_row(paging, *window);
