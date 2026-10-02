@@ -694,8 +694,6 @@ fn mpp_point(
     biased: bool,
     y: Tensor,
     tile: u32,
-    padded: u32,
-    scratch: &RoutedScratch,
     tuning: &crate::DeviceTuning,
 ) -> Option<(u32, u32, u32)> {
     let m = tile.min(32);
@@ -707,10 +705,7 @@ fn mpp_point(
         && bank.group == 64
         && bank.scales.dtype == Dtype::Bf16
         && x.width.is_multiple_of(64)
-        && y.width.is_multiple_of(n)
-        && scratch.sums.dtype == Dtype::F32
-        && u64::from(scratch.sums.rows) * u64::from(scratch.sums.width)
-            >= u64::from(padded) * u64::from(x.width / 64);
+        && y.width.is_multiple_of(n);
     fits.then_some((m, n, simdgroups))
 }
 
@@ -788,7 +783,11 @@ pub fn matmul_select_batched(
         let bound = pairs.saturating_add(touched.saturating_mul(tile - 1));
         bound.div_ceil(tile) * tile
     };
-    let mpp = mpp_point(x, bank, bias.is_some(), y, tile, padded, &scratch, tuning);
+    let sums = scratch.sums;
+    let sums_fit = sums.dtype == Dtype::F32
+        && u64::from(sums.rows) * u64::from(sums.width)
+            >= u64::from(padded) * u64::from(x.width / 64);
+    let mpp = mpp_point(x, bank, bias.is_some(), y, tile, tuning).filter(|_| sums_fit);
     let point = match mpp {
         Some(_) => None,
         None => match batched_point(op, bank, bias.is_some(), tile, bn, fp16)? {
