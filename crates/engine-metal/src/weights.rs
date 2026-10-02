@@ -501,6 +501,35 @@ impl Weights {
                 self.decoded.push(buffer);
                 continue;
             }
+            // PQ2_0 positional-2-bit is the ternary's 2-bit sibling: also no
+            // native MPP layout, so on Apple10 it packs whenever `qmm_mpp` is
+            // set. We DECODE the 34-byte PQ2_0 blocks onto the SAME affine MPP
+            // packed layout (code=code 0..3, scale=d, bias=-d) via
+            // `pq2_0_qmm_mpp_pack_bank`, so the existing `affine_qmm_mpp` PACKED
+            // kernel serves it unchanged. Gate/size identical to PTQ1_0.
+            if bank.codes.dtype == Dtype::Pq2_0 {
+                if n % 256 != 0 || k % 128 != 0 {
+                    continue;
+                }
+                let work = n.checked_mul(k / 8).ok_or_else(|| {
+                    Fault::Residency("MPP packed bank exceeds the dispatch grid limit".into())
+                })?;
+                let bytes =
+                    u64::from(n) * u64::from(k) / 2 + u64::from(n) * u64::from(k / 64) * 4;
+                let buffer = Buffer::zeroed(device, bytes)?;
+                let packed = Tensor::new(handles.bind(&buffer, 0, bytes)?, n, k, Dtype::U4g64);
+                let frame = device.frame()?;
+                let sink = Sink::new(device, &frame, &pipelines, handles);
+                sink.fire(
+                    Fire::at("linear/quant_qmm_mpp.metal", "pq2_0_qmm_mpp_pack_bank")
+                        .apply(Grid::of([work, 1, 1], [256, 1, 1])),
+                    &[bank.codes.arg(), packed.arg_mut(), k.arg(), n.arg()],
+                )?;
+                frame.commit()?;
+                bank.mpp_codes = Some(packed);
+                self.decoded.push(buffer);
+                continue;
+            }
             // Affine packing keeps its own `qmm_mpp_packed` requirement — on
             // Apple10 (packed=false) affine stays on the native MPP layout, so
             // affine behavior is unchanged.

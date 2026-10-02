@@ -610,6 +610,27 @@ pub fn act_x_wt(
         if rows == 0 {
             return Ok(());
         }
+        // A packed PQ2_0 bank decodes onto the affine MPP packed layout
+        // (code=code 0..3, scale=d, bias=-d), layout-identical to a packed
+        // PTQ1_0/affine bank, so the prefill fast-path is the exact affine MPP
+        // packed fire against a pseudo-affine (g64, 4-bit) bank. In packed mode
+        // the scales/biases ARGS are ignored (the kernel reads the factors from
+        // the packed buffer), so any bound tensor serves — reuse the packed
+        // handle. Small/odd shapes fall through to the QMV decoder.
+        if let Some(packed) = w.mpp_codes {
+            let pseudo = Bank {
+                codes: w.codes,
+                mpp_codes: w.mpp_codes,
+                scales: packed,
+                biases: Some(packed),
+                group: 64,
+                bits: 4,
+            };
+            if mpp_prefill(ctx, op, act, pseudo, y, &scratch, capacity_rows, rows, columns, contraction)?
+            {
+                return Ok(());
+            }
+        }
         return pq2_0_matmul(
             ctx,
             op,

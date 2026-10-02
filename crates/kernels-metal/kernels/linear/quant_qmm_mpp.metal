@@ -38,6 +38,75 @@ kernel void qmm_mpp_pack_bank(const device uint *codes [[buffer(0)]],
   }
 }
 
+// --- PQ2_0 positional-2-bit -> affine MPP packed front-end -----------------
+//
+// PQ2_0 reconstructs a weight as `w = (code - 1) * d`, code in {0,1,2,3}, with
+// one fp16 scale `d` per 128-weight block. That is algebraically the affine MPP
+// accumulate `total = sum(code*x)*scale + sum(x)*bias` with code=code (0..3,
+// still fits uint4b), scale=d, bias=-d — identical in form to PTQ1_0 (code just
+// ranges 0..3 instead of 0..2). So we DECODE each 34-byte PQ2_0 block into the
+// exact affine `qmm_mpp_pack_bank` layout (uint4b codes + per-64-group bf16
+// scale/bias) and the existing `affine_qmm_mpp` PACKED kernel runs unchanged.
+//
+// PQ2_0 is SIMPLER than PTQ1_0: no base-3 {16,8}+qh staging. Block = 34 bytes:
+// the fp16 `d` LEADS at bytes 0-1 (not a trailing one), then `qs[32]` at byte
+// offset 2; element `e` lives in byte `2 + e/4` at bit offset `(e%4)*2`,
+// `code = (qs[2+e/4] >> ((e%4)*2)) & 3`, natural element order 0..127.
+// (Authoritative: `quant_pq2_0.metal` `pq2_0_block_dot`.) Everything else —
+// grid, packed layout, 64-group->block mapping, nibble/lane order, factors — is
+// identical to `ptq1_0_qmm_mpp_pack_bank` below.
+
+#define PQ2_0_BLOCK_BYTES 34
+#define PQ2_0_QS_OFFSET 2
+
+// The positional 2-bit code (0..3) for natural block element `e` of a 34-byte
+// block, mirroring `quant_pq2_0.metal` `pq2_0_block_dot` / the host oracle
+// `checkpoint::codec::pq2_0::decode_block`: element `e` -> byte `2 + e/4`, bits
+// `(e%4)*2`. No pow3, no staging.
+inline int pq2_0_block_code(const device uint8_t *blk, int e) {
+  return (int(blk[PQ2_0_QS_OFFSET + e / 4]) >> ((e % 4) * 2)) & 0x3;
+}
+
+// Decode a native PQ2_0 bank (`columns` rows x `width` contraction, each row
+// `ceil(width/128)*34` bytes) into the affine MPP packed layout. One thread per
+// output uint (8 uint4b codes = 8 lanes of a 64-group), matching the grid shape
+// of `qmm_mpp_pack_bank` / `ptq1_0_qmm_mpp_pack_bank`.
+kernel void pq2_0_qmm_mpp_pack_bank(const device uint8_t *codes [[buffer(0)]],
+                                    device uint *packed [[buffer(1)]],
+                                    constant uint &width [[buffer(2)]],
+                                    constant uint &columns [[buffer(3)]],
+                                    uint word [[thread_position_in_grid]]) {
+  ulong words = ulong(columns) * width / 8;
+  if (word >= words)
+    return;
+  uint groups = width / 64;
+  uint column = word / (width / 8);
+  uint group = (word % (width / 8)) / 8;
+  uint local = word % 8; // which of the group's 8 uints this thread fills
+  ulong parameter = (ulong(column / 256) * groups + group) * 256 + column % 256;
+
+  uint row_bytes = (width / 128) * PQ2_0_BLOCK_BYTES;
+  uint block_half = group % 2; // 0 -> block elements [0,64), 1 -> [64,128)
+  const device uint8_t *blk =
+      codes + ulong(column) * row_bytes + ulong(group / 2) * PQ2_0_BLOCK_BYTES;
+
+  uint value = 0;
+  for (uint i = 0; i < 8; i++) {
+    uint lane = local * 8 + i;
+    int code = pq2_0_block_code(blk, int(block_half * 64 + lane));
+    value |= (uint(code) & 0xf) << (i * 4);
+  }
+  packed[parameter * 8 + local] = value;
+
+  if (local == 0) {
+    ushort dbits = ushort(uint(blk[0]) | (uint(blk[1]) << 8));
+    float d = float(as_type<half>(dbits));
+    device bfloat *factors = reinterpret_cast<device bfloat *>(packed + words);
+    factors[parameter] = bfloat(d);
+    factors[ulong(columns) * groups + parameter] = bfloat(-d);
+  }
+}
+
 // --- PTQ1_0 ternary -> affine MPP packed front-end -------------------------
 //
 // PTQ1_0 reconstructs a weight as `w = (trit - 1) * d`, trit in {0,1,2}, with
