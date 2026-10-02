@@ -14,6 +14,8 @@ pub fn default_config_content() -> Result<String> {
         Some(flavor::Flavor::Wgpu) => Some(WGPU_ENGINE_BLOCK),
         #[cfg(feature = "xla")]
         Some(flavor::Flavor::Xla) => Some(XLA_ENGINE_BLOCK),
+        #[cfg(feature = "cerebras")]
+        Some(flavor::Flavor::Cerebras) => Some(CEREBRAS_ENGINE_BLOCK),
         #[allow(unreachable_patterns)]
         _ => None,
     };
@@ -21,8 +23,8 @@ pub fn default_config_content() -> Result<String> {
         bail!(
             "this pie binary carries no engine, so there is no `[engine]` \
              section to write and the config would not parse. Rebuild with \
-             `--features cuda`, `--features vulkan`, `--features wgpu`, `--features xla`, or, \
-             on Apple hardware, `--features metal`."
+             `--features cuda`, `--features vulkan`, `--features wgpu`, `--features xla`, \
+             `--features cerebras`, or, on Apple hardware, `--features metal`."
         );
     };
     let model_block: &str = DEFAULT_MODEL_BLOCK;
@@ -192,6 +194,24 @@ mem_utilization = 0.90      # of device memory: weights, kv pool, state pool
 # max_state_slots      = 256    # recurrent-state seats (hybrid models)
 "#;
 
+#[cfg(any(feature = "cerebras", test))]
+const CEREBRAS_ENGINE_BLOCK: &str = r#"
+[engine]
+# Which keys are valid here depends on `type`: the common ones below, plus
+# whatever the named engine accepts. The cerebras shell drives one wafer:
+# the fabric simulator, or a CS system named by cmaddr.
+type = "cerebras"
+device = ["cerebras:0"]
+activation_dtype = "bfloat16"
+target = "wse3"             # the wafer generation: "wse2" or "wse3"
+num_threads = 16            # host threads for the simulator and staging
+# cmaddr               = "10.0.0.1:9000"  # omit to run the fabric simulator
+# max_total_pages      = 4096   # omit for the engine's own default
+# max_forward_tokens   = 64
+# max_forward_requests = 4
+# max_state_slots      = 4      # recurrent-state seats (hybrid models)
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,6 +222,7 @@ mod tests {
         the_vulkan_block_states_only_keys_the_engine_declares();
         the_wgpu_block_states_only_keys_the_engine_declares();
         the_xla_block_states_only_keys_the_engine_declares();
+        the_cerebras_block_states_only_keys_the_engine_declares();
         a_binary_with_an_engine_writes_a_config_that_parses();
         it_names_the_engine_this_binary_actually_has();
     }
@@ -226,6 +247,11 @@ mod tests {
         worker::Config::parse(&content).expect("the xla template must parse");
     }
 
+    fn the_cerebras_block_states_only_keys_the_engine_declares() {
+        let content = format!("{HEADER}{DEFAULT_MODEL_BLOCK}{CEREBRAS_ENGINE_BLOCK}{TAIL}");
+        worker::Config::parse(&content).expect("the cerebras template must parse");
+    }
+
     fn a_binary_with_an_engine_writes_a_config_that_parses() {
         let Ok(content) = default_config_content() else {
             return;
@@ -245,6 +271,8 @@ mod tests {
             Some(flavor::Flavor::Wgpu) => Some("wgpu"),
             #[cfg(feature = "xla")]
             Some(flavor::Flavor::Xla) => Some("xla"),
+            #[cfg(feature = "cerebras")]
+            Some(flavor::Flavor::Cerebras) => Some("cerebras"),
             #[allow(unreachable_patterns)]
             _ => None,
         };

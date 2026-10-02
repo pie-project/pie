@@ -35,6 +35,7 @@ pub mod open {
         feature = "vulkan",
         feature = "wgpu",
         feature = "xla",
+        feature = "cerebras",
         all(feature = "metal", target_vendor = "apple")
     ))]
     use super::{EngineBox, Result};
@@ -85,6 +86,14 @@ pub mod open {
     #[cfg(feature = "xla")]
     pub fn xla(config_bytes: &[u8]) -> Result<EngineBox> {
         engine_xla::open(config_bytes, crate::engine::load::contract_for)
+            .map(|engine| engine.with_classify(|name| models::sku(name).map(|sku| sku.classify)))
+            .map(|engine| Box::new(engine) as EngineBox)
+            .map_err(::anyhow::Error::msg)
+    }
+
+    #[cfg(feature = "cerebras")]
+    pub fn cerebras(config_bytes: &[u8]) -> Result<EngineBox> {
+        engine_cerebras::open(config_bytes, crate::engine::load::contract_for)
             .map(|engine| engine.with_classify(|name| models::sku(name).map(|sku| sku.classify)))
             .map(|engine| Box::new(engine) as EngineBox)
             .map_err(::anyhow::Error::msg)

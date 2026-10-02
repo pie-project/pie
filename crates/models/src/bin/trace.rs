@@ -4,13 +4,14 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let sku = args
         .next()
-        .expect("usage: trace <sku> [cuda|metal|wgpu|vulkan|xla]");
+        .expect("usage: trace <sku> [cuda|metal|wgpu|vulkan|xla|cerebras]");
     let platform = match args.next().as_deref() {
         None | Some("cuda") => Platform::Cuda,
         Some("metal") => Platform::Metal,
         Some("wgpu") => Platform::Wgpu,
         Some("vulkan") => Platform::Vulkan,
         Some("xla") => Platform::Xla,
+        Some("cerebras") => Platform::Cerebras,
         Some(other) => panic!("unknown platform `{other}`"),
     };
     let row = models::sku(&sku).unwrap_or_else(|| {

@@ -58,6 +58,7 @@ engine-vulkan = { path = "../engine-vulkan", optional = true }
 
 engine-wgpu = { path = "../engine-wgpu", optional = true }
 engine-xla = { path = "../engine-xla", optional = true }
+engine-cerebras = { path = "../engine-cerebras", optional = true }
 wgpu = { version = "30", default-features = false, features = ["wgsl"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -130,6 +131,7 @@ metal = ["dep:engine-metal"]
 vulkan = ["dep:engine-vulkan", "engine-vulkan/vulkan"]
 wgpu = ["dep:engine-wgpu", "engine-wgpu/wgpu", "dep:wgpu"]
 xla = ["dep:engine-xla"]
+cerebras = ["dep:engine-cerebras"]
 profile-fire = []
 
 [dev-dependencies]

@@ -52,6 +52,8 @@ members = [
     "crates/engine-wgpu",
     "crates/kernels-xla",
     "crates/engine-xla",
+    "crates/kernels-cerebras",
+    "crates/engine-cerebras",
     "crates/web-std",
     "crates/browser",
 
@@ -94,6 +96,8 @@ default-members = [
     "crates/engine-wgpu",
     "crates/kernels-xla",
     "crates/engine-xla",
+    "crates/kernels-cerebras",
+    "crates/engine-cerebras",
     "crates/eta-ir",
     "crates/eta-dsl",
     "crates/eta-compiler",
@@ -143,6 +147,7 @@ metal = ["worker/metal"]
 vulkan = ["worker/vulkan"]
 wgpu = ["worker/wgpu"]
 xla = ["worker/xla"]
+cerebras = ["worker/cerebras"]
 profile-fire = ["worker/profile-fire"]
 
 [dependencies]

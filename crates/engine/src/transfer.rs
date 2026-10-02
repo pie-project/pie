@@ -12,6 +12,7 @@ pub enum MemoryDomain {
     VulkanDevice(u32),
     WgpuDevice(u32),
     XlaDevice(u32),
+    CerebrasDevice(u32),
     /// The engine's own slot file, one kv page per slot.
     LocalDisk,
 }
@@ -24,7 +25,8 @@ impl MemoryDomain {
             | MemoryDomain::RocmDevice(ordinal)
             | MemoryDomain::VulkanDevice(ordinal)
             | MemoryDomain::WgpuDevice(ordinal)
-            | MemoryDomain::XlaDevice(ordinal) => Some(ordinal),
+            | MemoryDomain::XlaDevice(ordinal)
+            | MemoryDomain::CerebrasDevice(ordinal) => Some(ordinal),
             MemoryDomain::HostPinned
             | MemoryDomain::MetalShared
             | MemoryDomain::MetalPrivate

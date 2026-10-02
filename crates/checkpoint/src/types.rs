@@ -43,6 +43,7 @@ pub enum BackendKind {
     Vulkan,
     Wgpu,
     Xla,
+    Cerebras,
     Unknown,
 }
 

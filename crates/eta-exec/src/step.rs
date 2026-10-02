@@ -214,7 +214,27 @@ fn exec_stage(
     vals: &mut [Value],
     runner: &mut dyn StageRunner,
 ) -> Result<()> {
-    let stage = &plan.package.stages[sp.stage_index];
+    let roots = prepare_stage(inst, plan, sp, inputs, overlay, vals, &|id| {
+        runner.binds(id)
+    })?;
+    let wanted = wanted_of(plan, sp);
+    runner.run(plan, sp, &roots, &wanted, vals)?;
+    finish_stage(plan, sp, overlay, vals);
+    Ok(())
+}
+
+/// Resolves the stage's roots into `vals` (constants, channel reads and
+/// takes through the overlay, intrinsics from `inputs` unless `binds` says
+/// the runner binds them itself) and returns their ids.
+fn prepare_stage(
+    inst: &InterpInstance,
+    plan: &ExecPlan,
+    sp: &StagePlan,
+    inputs: &PassInputs,
+    overlay: &mut Overlay,
+    vals: &mut [Value],
+    binds: &dyn Fn(Option<IntrinsicId>) -> bool,
+) -> Result<Vec<u32>> {
     let mut roots = Vec::new();
     for &id in &sp.value_ids {
         if sp.op_by_result.contains_key(&id) {
@@ -225,7 +245,7 @@ fn exec_stage(
             ValueOrigin::Const => const_root_value(root),
             ValueOrigin::ChannelTake => overlay.take(inst, root.channel),
             ValueOrigin::ChannelRead => overlay.resolve(inst, root.channel),
-            ValueOrigin::Intrinsic if runner.binds(root.intrinsic) => Value::F32(Vec::new()),
+            ValueOrigin::Intrinsic if binds(root.intrinsic) => Value::F32(Vec::new()),
             ValueOrigin::Intrinsic => {
                 bind_intrinsic(root.intrinsic, shape_numel(&root.shape), inputs)?
             }
@@ -239,15 +259,170 @@ fn exec_stage(
         vals[id as usize] = cell;
         roots.push(id);
     }
-    let wanted: Vec<u32> = stage.puts.iter().map(|put| put.value).collect();
-    runner.run(plan, sp, &roots, &wanted, vals)?;
-    for put in &stage.puts {
+    Ok(roots)
+}
+
+fn wanted_of(plan: &ExecPlan, sp: &StagePlan) -> Vec<u32> {
+    plan.package.stages[sp.stage_index]
+        .puts
+        .iter()
+        .map(|put| put.value)
+        .collect()
+}
+
+/// Records the stage's puts in the overlay (they land at commit).
+fn finish_stage(plan: &ExecPlan, sp: &StagePlan, overlay: &mut Overlay, vals: &[Value]) {
+    for put in &plan.package.stages[sp.stage_index].puts {
         overlay
             .pending
             .insert(put.channel, vals[put.value as usize].clone());
         overlay.put[put.channel as usize] = true;
     }
-    Ok(())
+}
+
+/// Runs the stages of several instances of one program in lockstep: every
+/// stage once, for every lane that is still stepping (a device program
+/// carrying the lanes as rows, say).
+pub trait BatchRunner {
+    /// Computes stage `sp` for `lanes`, the instances still stepping (each
+    /// with its index in the batch and its values: roots resolved, puts to
+    /// be written). An error faults every lane.
+    fn run(&mut self, plan: &ExecPlan, sp: &StagePlan, lanes: &mut [Lane<'_>]) -> Result<()>;
+
+    /// Whether the runner binds intrinsic `id` for lane `lane` itself.
+    fn binds(&self, _lane: usize, _id: Option<IntrinsicId>) -> bool {
+        false
+    }
+}
+
+/// One lane of a `BatchRunner`'s stage: the instance's index in the batch
+/// and its values.
+pub struct Lane<'v> {
+    pub index: usize,
+    pub vals: &'v mut [Value],
+}
+
+/// One pass of each of `insts` (instances of `plan`) with the stages run in
+/// lockstep by `runner`: lane `l` of a stage's batch is `insts[l]` while
+/// that instance is still stepping. A blocked or poisoned instance leaves
+/// the batch before its first stage, a faulted one when it faults; the
+/// others step on. Returns each instance's outcome, in order.
+#[must_use]
+pub fn step_many(
+    insts: &mut [&mut InterpInstance],
+    plan: &ExecPlan,
+    inputs: &PassInputs,
+    runner: &mut dyn BatchRunner,
+) -> Vec<StepOutcome> {
+    let n = insts.len();
+    let mut outcomes: Vec<Option<StepOutcome>> = vec![None; n];
+    for (l, inst) in insts.iter().enumerate() {
+        if inst.poisoned {
+            outcomes[l] = Some(StepOutcome::Faulted("instance is poisoned".to_string()));
+            continue;
+        }
+        for (channel, ring) in inst.channels.iter().enumerate() {
+            let readiness = plan.package.channels.get(channel).and_then(|c| c.readiness);
+            let ready = match readiness {
+                Some(Direction::NeedsFull) => !ring.is_empty(),
+                Some(Direction::NeedsEmpty) => !ring.is_full(),
+                None => true,
+            };
+            if !ready {
+                outcomes[l] = Some(StepOutcome::Blocked(channel as u32));
+                break;
+            }
+        }
+    }
+    let mut overlays: Vec<Overlay> = insts
+        .iter()
+        .map(|inst| Overlay::new(inst.channels.len()))
+        .collect();
+    let mut vals: Vec<Vec<Value>> = (0..n)
+        .map(|_| vec![Value::F32(vec![]); plan.package.values.len()])
+        .collect();
+    fn fault(
+        outcomes: &mut [Option<StepOutcome>],
+        insts: &mut [&mut InterpInstance],
+        l: usize,
+        why: String,
+    ) {
+        insts[l].poisoned = true;
+        outcomes[l] = Some(StepOutcome::Faulted(why));
+    }
+    for kind in [Stage::Prologue, Stage::Epilogue] {
+        if kind == Stage::Epilogue {
+            for (l, inst) in insts.iter().enumerate() {
+                if outcomes[l].is_some() {
+                    continue;
+                }
+                for port in &plan.package.ports {
+                    if port.is_const {
+                        continue;
+                    }
+                    if port_consumes(port.port) {
+                        let _ = overlays[l].take(inst, port.channel);
+                    }
+                }
+            }
+        }
+        for sp in &plan.stages {
+            if plan.package.stages[sp.stage_index].stage != kind {
+                continue;
+            }
+            for l in 0..n {
+                if outcomes[l].is_some() {
+                    continue;
+                }
+                let prepared = prepare_stage(
+                    insts[l],
+                    plan,
+                    sp,
+                    inputs,
+                    &mut overlays[l],
+                    &mut vals[l],
+                    &|id| runner.binds(l, id),
+                );
+                if let Err(why) = prepared {
+                    fault(&mut outcomes, insts, l, why.to_string());
+                }
+            }
+            let mut lanes: Vec<Lane<'_>> = vals
+                .iter_mut()
+                .enumerate()
+                .filter(|(l, _)| outcomes[*l].is_none())
+                .map(|(index, v)| Lane {
+                    index,
+                    vals: v.as_mut_slice(),
+                })
+                .collect();
+            if lanes.is_empty() {
+                break;
+            }
+            if let Err(why) = runner.run(plan, sp, &mut lanes) {
+                for l in 0..n {
+                    if outcomes[l].is_none() {
+                        fault(&mut outcomes, insts, l, why.to_string());
+                    }
+                }
+                break;
+            }
+            for l in 0..n {
+                if outcomes[l].is_none() {
+                    finish_stage(plan, sp, &mut overlays[l], &vals[l]);
+                }
+            }
+        }
+    }
+    for l in 0..n {
+        if outcomes[l].is_none() {
+            outcomes[l] = Some(commit(insts[l], &overlays[l]));
+        }
+    }
+    outcomes
+        .into_iter()
+        .map(|o| o.unwrap_or(StepOutcome::Committed))
+        .collect()
 }
 
 fn const_root_value(root: &eta_compiler::codegen::launch::LaunchValue) -> Value {

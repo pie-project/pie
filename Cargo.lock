@@ -1644,6 +1644,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-cerebras"
+version = "0.5.4"
+dependencies = [
+ "blake3",
+ "checkpoint",
+ "checkpoint-dsl",
+ "engine",
+ "eta-compiler",
+ "eta-exec",
+ "kernels-cerebras",
+ "libc",
+ "libloading 0.9.0",
+ "model-compiler",
+ "model-dsl",
+ "model-exec",
+ "model-ir",
+ "models",
+ "pie-dtype",
+ "pie-eta-ir",
+ "serde_json",
+ "tempfile",
+ "tokenizer",
+ "toml 1.1.4+spec-1.1.0",
+ "tracing",
+ "ztensor",
+ "ztensor-compat",
+]
+
+[[package]]
 name = "engine-cuda"
 version = "0.5.4"
 dependencies = [
@@ -2784,6 +2813,13 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "kernels-cerebras"
+version = "0.5.4"
+dependencies = [
+ "pie-dtype",
 ]
 
 [[package]]
@@ -4605,6 +4641,7 @@ dependencies = [
  "crossbeam",
  "dashmap",
  "engine",
+ "engine-cerebras",
  "engine-cuda",
  "engine-metal",
  "engine-vulkan",

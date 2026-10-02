@@ -19,6 +19,7 @@ metal = ["runtime/metal"]
 vulkan = ["runtime/vulkan"]
 wgpu = ["runtime/wgpu"]
 xla = ["runtime/xla"]
+cerebras = ["runtime/cerebras"]
 nixl = ["dep:transport", "transport/nixl"]
 
 profile-fire = ["runtime/profile-fire"]

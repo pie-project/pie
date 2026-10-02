@@ -1,0 +1,39 @@
+[package]
+name = "engine-cerebras"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "The Cerebras engine: a pure-Rust host driver for the Cerebras SDK runtime (libsdkruntime, dlopened at runtime) that will answer every Dispatch* trait by compiling kernels-cerebras CSL programs with cslc and running them on the WSE simulator or a CS system."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "engine_cerebras"
+path = "src/lib.rs"
+
+[dependencies]
+dtype = { package = "pie-dtype", path = "../dtype" }
+kernels-cerebras = { path = "../kernels-cerebras" }
+libloading = "0.9"
+libc = "0.2"
+serde_json = "1"
+tempfile = "3"
+toml = "1.1"
+model-ir = { path = "../model-ir" }
+engine = { path = "../engine" }
+model-exec = { path = "../model-exec" }
+model-compiler = { path = "../model-compiler" }
+eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
+eta-exec = { path = "../eta-exec" }
+eta-compiler = { path = "../eta-compiler" }
+checkpoint = { path = "../checkpoint" }
+tracing = "0.1"
+blake3 = "1"
+
+[dev-dependencies]
+checkpoint-dsl = { path = "../checkpoint-dsl" }
+models = { path = "../models" }
+model-dsl = { path = "../model-dsl" }
+tokenizer = { path = "../tokenizer" }
+ztensor-compat = { workspace = true }
+ztensor = { workspace = true }

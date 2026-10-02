@@ -15,8 +15,8 @@ pub mod schema;
 pub mod units;
 
 pub use backend::{
-    CudaNativeEngineOptions, MetalEngineOptions, VulkanEngineOptions, WgpuEngineOptions,
-    XlaEngineOptions,
+    CerebrasEngineOptions, CudaNativeEngineOptions, MetalEngineOptions, VulkanEngineOptions,
+    WgpuEngineOptions, XlaEngineOptions,
 };
 pub use units::{ByteSize, Duration};
 
@@ -946,6 +946,17 @@ impl EngineConfig {
                     })?;
                 opts.validate()?;
             }
+            EngineKind::Cerebras => {
+                let opts: CerebrasEngineOptions = toml::Value::Table(self.options.clone())
+                    .try_into()
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "invalid [engine] options for engine type {:?}: {e}",
+                            self.kind,
+                        )
+                    })?;
+                opts.validate()?;
+            }
         }
         Ok(())
     }
@@ -971,6 +982,8 @@ pub enum EngineKind {
     Wgpu,
     /// The XLA shell: a PJRT plugin, libtpu on a TPU host.
     Xla,
+    /// The Cerebras shell: the fabric simulator or a CS system reached by cmaddr.
+    Cerebras,
 }
 
 impl EngineKind {
@@ -981,6 +994,7 @@ impl EngineKind {
             EngineKind::Vulkan => "vulkan",
             EngineKind::Wgpu => "wgpu",
             EngineKind::Xla => "xla",
+            EngineKind::Cerebras => "cerebras",
         }
     }
 }
@@ -1149,6 +1163,7 @@ device = ["cpu"]
             (EngineKind::Vulkan, "vulkan"),
             (EngineKind::Wgpu, "wgpu"),
             (EngineKind::Xla, "xla"),
+            (EngineKind::Cerebras, "cerebras"),
         ];
         for (kind, spelled) in KINDS {
             assert_eq!(kind.as_str(), *spelled, "{kind:?} names itself");
@@ -1166,7 +1181,7 @@ device = ["cpu"]
         }
         assert_eq!(
             KINDS.len(),
-            5,
+            6,
             "an engine kind was added without a line here, so nothing checks its \
              config spelling"
         );

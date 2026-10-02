@@ -572,6 +572,39 @@ impl Model {
         }
     }
 
+    /// A pico model for backend bring-up on a single Cerebras PE: every
+    /// weight, pool and activation of a fire fits one PE's memory. Not a
+    /// catalog SKU.
+    pub fn pico(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(
+            w,
+            kv,
+            tp,
+            Dims {
+                hidden: 16,
+                layers: 2,
+                attn_every: 2,
+                q_heads: 1,
+                kv_heads: 1,
+                head_dim: 8,
+                rotary_dim: 4,
+                theta: 10_000.0,
+                k_heads: 1,
+                v_heads: 1,
+                k_dim: 8,
+                v_dim: 8,
+                conv_kernel: 4,
+                mlp: MlpDims::Dense { inter: 32 },
+                vocab: 32,
+                tied: true,
+                norm_eps: 1e-6,
+                tower: None,
+                draft: None,
+                dflash_head: None,
+            },
+        )
+    }
+
     pub fn tiny(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(
             w,

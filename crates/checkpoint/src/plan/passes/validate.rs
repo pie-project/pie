@@ -207,7 +207,11 @@ pub(super) fn validate_bound_encodings(program: &mut LoadPlan) -> Result<usize> 
 
 fn binds_block(backend: BackendKind, scheme: QuantScheme) -> bool {
     match backend {
-        BackendKind::Cuda | BackendKind::Vulkan | BackendKind::Wgpu | BackendKind::Xla => matches!(
+        BackendKind::Cuda
+        | BackendKind::Vulkan
+        | BackendKind::Wgpu
+        | BackendKind::Xla
+        | BackendKind::Cerebras => matches!(
             scheme,
             QuantScheme::GgufQ2K
                 | QuantScheme::GgufQ3K

@@ -142,6 +142,17 @@ pub fn this_box() -> Option<Platform> {
     {
         return Some(Platform::Xla);
     }
+    #[cfg(all(
+        not(feature = "cuda"),
+        not(all(feature = "metal", target_vendor = "apple")),
+        not(feature = "vulkan"),
+        not(feature = "wgpu"),
+        not(feature = "xla"),
+        feature = "cerebras"
+    ))]
+    {
+        return Some(Platform::Cerebras);
+    }
     #[allow(unreachable_code)]
     None
 }
@@ -178,6 +189,7 @@ fn backend_of(platform: Platform) -> checkpoint::types::BackendKind {
         Platform::Vulkan => checkpoint::types::BackendKind::Vulkan,
         Platform::Wgpu => checkpoint::types::BackendKind::Wgpu,
         Platform::Xla => checkpoint::types::BackendKind::Xla,
+        Platform::Cerebras => checkpoint::types::BackendKind::Cerebras,
         Platform::Cuda => checkpoint::types::BackendKind::Cuda,
     }
 }

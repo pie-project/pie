@@ -21,6 +21,8 @@ pub const WGPU_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_SCALE | TILE_MAP_DE
 
 pub const XLA_TILE_MAP_MASK: u32 = WGPU_TILE_MAP_MASK;
 
+pub const CEREBRAS_TILE_MAP_MASK: u32 = WGPU_TILE_MAP_MASK;
+
 pub const HOST_TILE_MAP_MASK: u32 =
     TILE_MAP_CAST | TILE_MAP_REBLOCK | TILE_MAP_SCALE | TILE_MAP_BIAS | TILE_MAP_UNARY;
 
@@ -34,6 +36,7 @@ pub fn compilable_tile_maps(backend: BackendKind) -> u32 {
         BackendKind::Vulkan => VULKAN_TILE_MAP_MASK,
         BackendKind::Wgpu => WGPU_TILE_MAP_MASK,
         BackendKind::Xla => XLA_TILE_MAP_MASK,
+        BackendKind::Cerebras => CEREBRAS_TILE_MAP_MASK,
         BackendKind::Unknown => HOST_TILE_MAP_MASK,
     }
 }
@@ -95,6 +98,7 @@ fn lower_tile_map(facts: &TileMapFacts, target: &StorageTarget) -> TileLowering 
         | BackendKind::Vulkan
         | BackendKind::Wgpu
         | BackendKind::Xla
+        | BackendKind::Cerebras
         | BackendKind::Unknown => TileLowering::default(),
     }
 }

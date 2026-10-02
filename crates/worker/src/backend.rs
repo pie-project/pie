@@ -12,6 +12,8 @@ use runtime::engine::backend::{
 
 use crate::backend::flavor::Flavor;
 use crate::config;
+#[cfg(feature = "cerebras")]
+use crate::config::CerebrasEngineOptions;
 #[cfg(any(feature = "cuda", test))]
 use crate::config::CudaNativeEngineOptions;
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
@@ -35,6 +37,8 @@ pub enum EngineOptions {
     Wgpu(WgpuEngineOptions),
     #[cfg(feature = "xla")]
     Xla(XlaEngineOptions),
+    #[cfg(feature = "cerebras")]
+    Cerebras(CerebrasEngineOptions),
 }
 
 impl EngineOptions {
@@ -50,11 +54,14 @@ impl EngineOptions {
             EngineOptions::Wgpu(_) => Flavor::Wgpu,
             #[cfg(feature = "xla")]
             EngineOptions::Xla(_) => Flavor::Xla,
+            #[cfg(feature = "cerebras")]
+            EngineOptions::Cerebras(_) => Flavor::Cerebras,
             #[cfg(not(any(
                 feature = "cuda",
                 feature = "vulkan",
                 feature = "wgpu",
                 feature = "xla",
+                feature = "cerebras",
                 all(feature = "metal", target_vendor = "apple")
             )))]
             _ => unreachable!("`EngineOptions` has no variants in this build"),
@@ -406,6 +413,7 @@ pub(crate) fn create_engine_backend(
             feature = "vulkan",
             feature = "wgpu",
             feature = "xla",
+            feature = "cerebras",
             all(feature = "metal", target_vendor = "apple")
         )))]
         _ => unreachable!("`EngineOptions` has no variants in this build"),
@@ -581,6 +589,43 @@ pub(crate) fn create_engine_backend(
                     max_clips: None,
                 },
                 model_ir::Platform::Xla,
+            )
+        }
+        #[cfg(feature = "cerebras")]
+        EngineOptions::Cerebras(opts) => {
+            let mut boot_doc = format!(
+                "[cerebras]\ntarget = {:?}\nnum_threads = {}\n",
+                opts.target, opts.num_threads,
+            );
+            if let Some(cmaddr) = &opts.cmaddr {
+                boot_doc.push_str(&format!(
+                    "cmaddr = {}\n",
+                    toml::Value::String(cmaddr.clone())
+                ));
+            }
+            let backend = runtime::engine::backend::open::cerebras(boot_doc.as_bytes())?;
+            let defaults = engine::Budgets::default();
+            (
+                backend,
+                engine::Budgets {
+                    max_lanes: opts.max_forward_requests.max(1),
+                    max_tokens: opts.max_forward_tokens.max(1),
+                    buckets: Vec::new(),
+                    max_adapters: adapters.seats(),
+                    page_size: defaults.page_size,
+                    max_context: opts
+                        .max_model_len
+                        .filter(|&len| len > 0)
+                        .unwrap_or(defaults.max_context)
+                        .max(defaults.page_size),
+                    slots: opts.max_state_slots.unwrap_or(4).max(1),
+                    pages: opts.max_total_pages.unwrap_or(defaults.pages).max(1),
+                    max_patches: patch_ceilings.0,
+                    max_images: patch_ceilings.1,
+                    max_voxels: None,
+                    max_clips: None,
+                },
+                model_ir::Platform::Cerebras,
             )
         }
     };
@@ -789,6 +834,16 @@ pub(crate) fn build_options(m: &config::ModelConfig, flavor: Flavor) -> Result<E
                 .try_into()
                 .map_err(|e| anyhow!("[engine] options for {:?}: {e}", m.name))?;
             Ok(EngineOptions::Xla(x))
+        }
+        #[cfg(feature = "cerebras")]
+        Flavor::Cerebras => {
+            let c: CerebrasEngineOptions = m
+                .engine
+                .options
+                .clone()
+                .try_into()
+                .map_err(|e| anyhow!("[engine] options for {:?}: {e}", m.name))?;
+            Ok(EngineOptions::Cerebras(c))
         }
     }
 }
