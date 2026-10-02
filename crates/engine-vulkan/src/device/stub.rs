@@ -53,6 +53,11 @@ impl Context {
     }
 
     #[must_use]
+    pub fn left(&self) -> u64 {
+        match self.never {}
+    }
+
+    #[must_use]
     pub fn cores(&self) -> u32 {
         match self.never {}
     }

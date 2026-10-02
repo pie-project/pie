@@ -48,14 +48,16 @@ interface model {
     // every new model family would break guests. This enum is closed over
     // STATE SEMANTICS, so it does not grow with the model zoo.
     //
-    // This is also the ONE place the linear/recurrent class is asked about.
-    // `!= attention` means the model carries a fused recurrent state that
-    // folds tokens IRREVERSIBLY (linear-attention / SSM: Qwen3.5 GDN,
-    // Nemotron-H Mamba2), as opposed to pure attention whose KV is per-token
-    // and reversibly discardable. That in turn pins the speculative-commit
-    // CONTRACT — FOLD-COMMIT (fold only the accepted prefix, holding the
-    // uncertain tail in the RS buffer; folding is runtime-managed in-forward)
-    // vs KV-SLOT DISCARD — so a spec-decode loop can stay model-agnostic.
+    // This is also the ONE place the bounded-state class is asked about.
+    // `!= attention` means the model carries, beside or instead of its KV, a
+    // bounded state reusable only as a snapshot: a recurrent state that folds
+    // tokens IRREVERSIBLY (linear-attention / SSM: Qwen3.5 GDN, Nemotron-H
+    // Mamba2) or a sliding window (Gemma-4's windowed layers), as opposed to
+    // pure attention whose KV is per-token and reversibly discardable. That
+    // in turn pins the speculative-commit CONTRACT — FOLD-COMMIT (fold only
+    // the accepted prefix, holding the uncertain tail in the RS buffer;
+    // folding is runtime-managed in-forward) vs KV-SLOT DISCARD — so a
+    // spec-decode loop can stay model-agnostic.
     // Do not re-derive the class from `rs-state-size() > 0`: that is a
     // byte-accounting accident that happens to agree.
     enum forward-kind {
@@ -63,7 +65,7 @@ interface model {
         attention,
         // Irreversibly folded recurrent state only   -> `forward-recurrent`
         recurrent,
-        // Both attention and recurrent layers        -> `forward-hybrid`
+        // KV plus a bounded state (recurrent or a window) -> `forward-hybrid`
         hybrid,
         // Paged KV plus a canvas the model denoises in place, one trunk
         // read causally or bidirectionally per pass -> `forward-diffusion`
@@ -413,10 +415,11 @@ interface model {
     // can size working sets and validate fold lengths before allocating.
 
     // Size in bytes of one folded recurrent-state object. 0 if the model has
-    // no recurrent state (pure attention).
+    // no recurrent state (pure attention, or a window, whose state is pages).
     rs-state-size: func() -> u64;
 
-    // Tokens per buffered RS page. 0 if the model has no recurrent state.
+    // Tokens per buffered RS page; for a window, the kv page size. 0 if the
+    // model has no bounded state.
     rs-buffer-page-size: func() -> u32;
 
     // Fold granularity in tokens: an RS fold of `n` tokens requires `n` to

@@ -65,8 +65,6 @@ pub struct Boot<'a> {
     pub handed: Option<crate::device::Handed>,
 }
 
-const DEVICE_HEADROOM: u64 = 2 << 30;
-
 const PATCH_ROUTE_DROP: i32 = -1;
 
 fn declared_width(trace: &Trace, want: RuntimeInput) -> u64 {
@@ -407,7 +405,7 @@ impl Shell {
             }
         }
 
-        let paging = Paging::of(
+        let asked = Paging::of(
             boot.page_size,
             boot.context,
             boot.slots,
@@ -415,10 +413,41 @@ impl Shell {
         )?;
         let handles = Handles::new();
 
+        // The pool's page and slot counts are ceilings: it is fitted to what
+        // the weights and the working set leave, each slab within one device
+        // reservation, and the weights are held only to leave it one sequence.
+        let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
+        let pool_at = |pages: u64, slots: u32| -> Result<u64> {
+            let paging = Paging {
+                pages,
+                slots,
+                ..asked
+            };
+            let slabs = crate::store::pool_slabs(&boot.trace, paging)?;
+            if slabs.iter().any(|slab| *slab > device.max_buffer()) {
+                return Ok(u64::MAX);
+            }
+            Ok(slabs
+                .iter()
+                .fold(0u64, |sum, slab| sum.saturating_add(*slab))
+                .saturating_add(
+                    rs_layout
+                        .as_ref()
+                        .map_or(0, |layout| crate::rs::Buffers::bytes_at(layout, paging)),
+                )
+                .saturating_add(crate::scratch::pool_bytes(&boot.trace, paging)))
+        };
+        let one_slot = u64::from(asked.pages_per_slot).min(asked.pages());
+        let least = Paging {
+            pages: one_slot,
+            slots: engine::fit::least_state_slots(1).min(asked.slots),
+            ..asked
+        };
+
+        let arena = Arena::reserve(&device, &compiled.arena)?;
         let device_cap = device
-            .working_set()
-            .saturating_sub(crate::store::pool_demand(&boot.trace, paging)?)
-            .saturating_sub(DEVICE_HEADROOM);
+            .left()
+            .saturating_sub(pool_at(least.pages, least.slots)?);
         let mut weights = Weights::resident(
             &device,
             &handles,
@@ -434,22 +463,13 @@ impl Shell {
 
         handles.seal();
 
-        let arena = Arena::reserve(&device, &compiled.arena)?;
-        let pools = Pools::reserve(&device, &boot.trace, paging, &facts)?;
-
-        let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
-        let rs_buffers = match &rs_layout {
-            Some(layout) => Some(crate::rs::Buffers::reserve(&device, layout, paging)?),
-            None => None,
-        };
-
-        let scratch = Scratch::reserve(
+        let mut scratch = Scratch::reserve(
             &device,
             &boot.trace,
             weights.table(),
             &compiled,
             &budgets,
-            paging,
+            least,
         )?;
         let spaces = boot
             .trace
@@ -520,7 +540,7 @@ impl Shell {
                 Inputs::reserve(
                     &device,
                     &boot.budget,
-                    paging,
+                    asked,
                     spaces,
                     compiled.classes.classes.len(),
                     gathers,
@@ -717,6 +737,59 @@ impl Shell {
             .map(|seat| Buffer::with(&device, seat.bytes(), crate::device::Memory::Readback))
             .collect::<Result<Vec<_>>>()?;
 
+        let room = device
+            .left()
+            .saturating_add(crate::scratch::pool_bytes(&boot.trace, least));
+        let (pages, slots) = engine::fit::pool_within(
+            asked.pages(),
+            asked.slots,
+            one_slot,
+            room,
+            |pages, slots| pool_at(pages, slots).unwrap_or(u64::MAX),
+        )
+        .ok_or_else(|| {
+            Fault::Residency(format!(
+                "the device does not hold this deployment: with the weights ({} bytes) and the \
+                 working set down, {room} bytes of `[engine] gpu_mem_utilization` are left for \
+                 the cache rows, and one sequence at the declared context needs {}. Lower \
+                 `[engine] max_model_len`, raise `[engine] gpu_mem_utilization`, state a \
+                 `[model] device_weight_budget`, or free what else holds the device.",
+                weights.bytes(),
+                pool_at(least.pages, least.slots).unwrap_or(u64::MAX),
+            ))
+        })?;
+        tracing::info!(
+            pages,
+            slots,
+            asked_pages = asked.pages(),
+            asked_slots = asked.slots,
+            room,
+            "the cache pool is fitted to what the weights and the working set leave"
+        );
+        let paging = Paging {
+            pages,
+            slots,
+            ..asked
+        };
+        if crate::scratch::pool_bytes(&boot.trace, paging)
+            > crate::scratch::pool_bytes(&boot.trace, least)
+        {
+            drop(scratch);
+            scratch = Scratch::reserve(
+                &device,
+                &boot.trace,
+                weights.table(),
+                &compiled,
+                &budgets,
+                paging,
+            )?;
+        }
+        let pools = Pools::reserve(&device, &boot.trace, paging, &facts)?;
+        let rs_buffers = match &rs_layout {
+            Some(layout) => Some(crate::rs::Buffers::reserve(&device, layout, paging)?),
+            None => None,
+        };
+
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let adapter_slots = crate::adapter::Slots::new(weights.adapter_seats());
 
@@ -766,7 +839,7 @@ impl Shell {
             adapters: adapter_slots,
 
             blobs: crate::blob::Store::new(),
-            held: vec![0; boot.slots as usize],
+            held: vec![0; slots as usize],
             rs_layout,
             rs_buffers,
             rs_scratch: None,

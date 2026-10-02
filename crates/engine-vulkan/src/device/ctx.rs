@@ -728,8 +728,12 @@ impl Context {
         }
     }
 
+    /// What the working set has left now: less this process's allocations
+    /// and, where the driver reports a budget, what other processes hold of
+    /// the device-local heap.
     #[must_use]
-    pub fn used(&self) -> u64 {
+    pub fn left(&self) -> u64 {
+        let mut used = self.core.allocated.load(Ordering::Relaxed);
         if self.core.features.memory_budget {
             let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
             let mut props = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
@@ -738,20 +742,19 @@ impl Context {
                     .instance
                     .get_physical_device_memory_properties2(self.core.physical, &mut props);
             }
-            let heaps = self.core.memory.memory_heap_count as usize;
-            let local = (0..heaps)
-                .filter(|&i| {
-                    self.core.memory.memory_heaps[i]
-                        .flags
-                        .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-                })
-                .map(|i| budget.heap_usage[i])
-                .max();
-            if let Some(used) = local {
-                return used;
+            let heaps =
+                &self.core.memory.memory_heaps[..self.core.memory.memory_heap_count as usize];
+            if let Some((i, heap)) = heaps
+                .iter()
+                .enumerate()
+                .filter(|(_, heap)| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+                .max_by_key(|(_, heap)| heap.size)
+            {
+                let free = budget.heap_budget[i].saturating_sub(budget.heap_usage[i]);
+                used = heap.size.saturating_sub(free);
             }
         }
-        self.core.allocated.load(Ordering::Relaxed)
+        self.working_set.saturating_sub(used)
     }
 
     pub fn bind_thread(&self) -> Result<()> {
