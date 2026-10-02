@@ -600,7 +600,8 @@ pub fn elem_bytes(dtype: Dtype) -> Option<u64> {
         | Dtype::E4m3row
         | Dtype::E4m3tile128
         | Dtype::U2g128
-        | Dtype::Ptq1_0 => None,
+        | Dtype::Ptq1_0
+        | Dtype::Pq2_0 => None,
     }
 }
 
