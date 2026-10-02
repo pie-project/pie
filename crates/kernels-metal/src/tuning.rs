@@ -109,6 +109,8 @@ impl DeviceTuning {
                 t.qmm_mpp = true;
                 t.qmm_mpp_packed = false;
                 t.sdpa_mpp = true;
+                t.gdn_scan_lanes = 8;
+                t.gdn_scan_rows = 2;
             }
             9 => {
                 t.qmm_bn_crossover_tg = 96;
