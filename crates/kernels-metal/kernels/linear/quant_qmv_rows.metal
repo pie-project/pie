@@ -217,7 +217,14 @@ METAL_FUNC void qmv_rows_impl(
             pack, s, b, xb, roff, result);
       } else {
 
-#pragma clang loop unroll(full)
+// Bounding this row loop's unroll dodges a clang/Metal register-allocation
+// miscompile: at p=2 (values_per_thread=16, ~28 live result[row][r]
+// accumulators) a full unroll of the 7-trip loop corrupts the r=0
+// accumulator. This is a back-end register-pressure bug, not source UB --
+// unroll_count(4) and a simdgroup_barrier(mem_none) both make it correct.
+// The p=1 rungs (R in {2,3}) trip fewer than 4 times, so unroll_count(4)
+// still fully unrolls them: that hot path is byte-for-byte unchanged.
+#pragma clang loop unroll_count(4)
       for (int r = 0; r < R; r++) {
         U sum = load_vector<T, U, values_per_thread, bits>(xb + roff[r], x_thread);
         for (int row = 0; row < results_per_simdgroup; row++) {
