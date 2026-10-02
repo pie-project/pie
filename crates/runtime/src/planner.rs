@@ -475,6 +475,10 @@ struct Proc {
     respawn: bool,
     signal: Arc<Notify>,
     resident: Arc<AtomicBool>,
+    /// Waiting on its client: a victim for anyone, however old it is.
+    idle: bool,
+    /// What an idle eviction freed; it asks for it back only once it wakes.
+    parked: Option<Demand>,
 }
 
 impl Proc {
@@ -488,6 +492,8 @@ impl Proc {
             respawn: false,
             signal: Arc::new(Notify::new()),
             resident: Arc::new(AtomicBool::new(true)),
+            idle: false,
+            parked: None,
         }
     }
 }
@@ -637,7 +643,9 @@ impl Inner {
         self.procs
             .iter()
             .filter(|(pid, proc)| {
-                proc.state != Residency::Resident || proc.respawn || self.killing.contains(pid)
+                (proc.state != Residency::Resident && proc.parked.is_none())
+                    || proc.respawn
+                    || self.killing.contains(pid)
             })
             .map(|(_, proc)| proc.seq)
             .min()
@@ -771,7 +779,7 @@ impl Inner {
             }
         }
         self.procs.iter().all(|(pid, proc)| match proc.state {
-            Residency::Resident => !proc.admitted || parked.contains(pid),
+            Residency::Resident => !proc.admitted || proc.idle || parked.contains(pid),
             Residency::Evicting | Residency::Restoring => false,
             Residency::Evicted => true,
         })
@@ -1026,6 +1034,31 @@ impl ResidencyPlanner {
                 None => return,
             }
         }
+    }
+
+    /// Marks `pid` as waiting on its client, or as awake again. Waking a
+    /// parked process queues its restore, ahead of its next fire.
+    pub fn set_idle(self: &Arc<Self>, pid: ProcessId, idle: bool) {
+        self.with_inner(|inner| {
+            let Some(proc) = inner.procs.get_mut(&pid) else {
+                return;
+            };
+            proc.idle = idle;
+            let seq = proc.seq;
+            let parked = if idle { None } else { proc.parked.take() };
+            if let Some(demand) = parked {
+                let key = (seq, inner.next_id);
+                inner.next_id += 1;
+                inner.queue.insert(
+                    key,
+                    Waiter {
+                        pid,
+                        kind: WaitKind::Restore { demand },
+                    },
+                );
+            }
+        });
+        self.poke();
     }
 
     pub fn note_admitted(&self, pid: ProcessId) {
@@ -2015,7 +2048,7 @@ impl ResidencyPlanner {
                 .iter()
                 .filter(|(pid, proc)| {
                     proc.admitted
-                        && proc.seq > head_seq
+                        && (proc.seq > head_seq || proc.idle)
                         && proc.state == Residency::Resident
                         && !inner.host_swap_blocked.contains(*pid)
                         && !inner.prepare_blocked.contains(*pid)
@@ -2023,7 +2056,7 @@ impl ResidencyPlanner {
                 .map(|(pid, proc)| Victim {
                     pid: *pid,
                     seq: proc.seq,
-                    e6_fresh: proc.progressed,
+                    e6_fresh: proc.progressed || proc.idle,
                 })
                 .collect();
             Some(VictimSet {
@@ -2055,8 +2088,8 @@ impl ResidencyPlanner {
                     continue;
                 };
                 if proc.state != Residency::Resident
-                    || proc.seq <= head_seq
-                    || (!proc.progressed && !e6_relaxed)
+                    || (proc.seq <= head_seq && !proc.idle)
+                    || (!proc.progressed && !proc.idle && !e6_relaxed)
                 {
                     continue;
                 }
@@ -2222,7 +2255,7 @@ impl ResidencyPlanner {
                         .zip(&rs_quotes)
                         .filter_map(|((pid, quote), &rs_slots)| {
                             let proc = inner.procs.get(pid)?;
-                            if proc.seq <= head_seq
+                            if (proc.seq <= head_seq && !proc.idle)
                                 || proc.state != Residency::Resident
                                 || inner.host_swap_blocked.contains(pid)
                                 || inner.prepare_blocked.contains(pid)
@@ -2607,6 +2640,13 @@ impl ResidencyPlanner {
             };
             debug_assert_eq!(proc.state, Residency::Evicting);
             proc.state = Residency::Evicted;
+            if proc.idle {
+                proc.parked = Some(Demand {
+                    kv_pages: freed,
+                    rs_slots: rs_freed,
+                });
+                return;
+            }
             let key = (proc.seq, inner.next_id);
             inner.next_id += 1;
             inner.queue.insert(
@@ -3700,6 +3740,44 @@ mod starvation_race_tests {
         assert_eq!(planner.diagnostics().host_swap_unblocks_total, 1);
 
         head_task.abort();
+    }
+
+    #[test]
+    fn an_idle_eviction_asks_for_its_pages_back_only_on_waking() {
+        let planner = Arc::new(ResidencyPlanner::new(
+            Arc::new(RacePool::new(4)) as Arc<dyn PoolPort>
+        ));
+        let agent = ProcessId::new_v4();
+        planner.register(agent);
+        planner.note_admitted(agent);
+        assert!(!planner.with_inner(|inner| inner.fleet_stalled()));
+
+        planner.set_idle(agent, true);
+        assert!(
+            planner.with_inner(|inner| inner.fleet_stalled()),
+            "a resident waiting on its client does not keep the fleet running"
+        );
+
+        planner
+            .with_inner(|inner| inner.procs.get_mut(&agent).unwrap().state = Residency::Evicting);
+        planner.report_evicted(agent, 3, 0);
+        assert!(
+            planner.diagnostics().queue.is_empty(),
+            "an idle eviction queues no restore"
+        );
+
+        planner.set_idle(agent, false);
+        let restores = planner.with_inner(|inner| {
+            inner
+                .queue
+                .values()
+                .map(|w| match w.kind {
+                    WaitKind::Restore { demand } if w.pid == agent => demand.kv_pages,
+                    _ => 0,
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(restores, vec![3], "waking asks for what the eviction freed");
     }
 
     #[tokio::test(flavor = "current_thread")]

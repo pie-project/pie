@@ -8,6 +8,20 @@ use anyhow::{Context, Result};
 use wasmtime::component::{Accessor, HasSelf, Resource};
 use wasmtime_wasi::WasiView;
 
+/// Runs `wait` with the process marked idle: a process waiting on its client
+/// is the one whose KV the planner may move off the device first.
+async fn idle_while<T>(pid: crate::inferlet::ProcessId, wait: impl Future<Output = T>) -> T {
+    let planner = crate::planner::planner();
+    if let Some(planner) = planner {
+        planner.set_idle(pid, true);
+    }
+    let out = wait.await;
+    if let Some(planner) = planner {
+        planner.set_idle(pid, false);
+    }
+    out
+}
+
 fn suggested_name(name: &str, extension: &str) -> String {
     let base = name
         .rsplit(['/', '\\'])
@@ -111,8 +125,12 @@ impl pie::inferlet::session::Host for ProcessCtx {
 
     async fn receive_blocking(&mut self) -> Result<Option<String>> {
         let process_id = self.id();
-        crate::server::inbox::receive(process_id.to_string())
-            .await
+        let message = idle_while(
+            process_id,
+            crate::server::inbox::receive(process_id.to_string()),
+        )
+        .await;
+        message
             .with_context(|| format!("session.receive-blocking failed for process {process_id}"))
             .map(Some)
     }
@@ -140,8 +158,12 @@ impl pie::inferlet::session::Host for ProcessCtx {
 impl pie::inferlet::session::HostWithStore<ProcessCtx> for HasSelf<ProcessCtx> {
     async fn receive(accessor: &Accessor<ProcessCtx, Self>) -> Result<Option<String>> {
         let process_id = accessor.with(|mut access| access.get().id());
-        crate::server::inbox::receive(process_id.to_string())
-            .await
+        let message = idle_while(
+            process_id,
+            crate::server::inbox::receive(process_id.to_string()),
+        )
+        .await;
+        message
             .with_context(|| format!("session.receive failed for process {process_id}"))
             .map(Some)
     }
