@@ -398,4 +398,38 @@ fn the_bonsai_27b_serves_ptq1_0_and_matches_the_fork_oracle() {
         );
     }
     eprintln!("bonsai: SERVED — pie reaches ĠParis (id 11751), end to end on Metal");
+
+    // Optional: a long (>=24-token) prefill whose last-token logits are dumped,
+    // for an MPP-vs-native self-consistency check on the REAL Bonsai weights.
+    // The 5-token oracle prefill above is too short to trip the Apple10 MPP
+    // prefill gate (rows < 8), so it only exercises the PACK; a 25-token prefill
+    // trips it and runs the actual ternary MPP matmul. Tuning is a process-wide
+    // OnceLock (can't toggle in-process), so run this test twice and diff the
+    // dumps: once with PIE_BONSAI_MPP=1 (MPP path) and once without (native QMV).
+    // Equal logits (cosine ~1) prove the MPP matmul is quality-neutral end to
+    // end on the real weights.
+    if let Some(dump) = std::env::var_os("PIE_BONSAI_LONG_DUMP") {
+        let long: Vec<u32> = PROMPT_IDS.iter().copied().cycle().take(25).collect();
+        shell
+            .open(0)
+            .expect("reopen the slot (KV reset) for the long prefill");
+        let word = Facts::of(&Request::new(long.len() as u32, false)).word();
+        let out = shell
+            .fire(&[Lane {
+                slot: 0,
+                word,
+                tokens: &long,
+            }])
+            .expect("the long Bonsai prefill fires");
+        let logits = &out[0];
+        assert_eq!(logits.len(), VOCAB, "the long readout is one vocab-wide row");
+        let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(&dump, &bytes).expect("write the long-prefill logit dump");
+        eprintln!(
+            "bonsai: long prefill ({} tokens) argmax id {} — dumped {} logits to {dump:?}",
+            long.len(),
+            argmax(logits),
+            logits.len(),
+        );
+    }
 }
