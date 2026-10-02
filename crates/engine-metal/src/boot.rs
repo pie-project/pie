@@ -86,6 +86,7 @@ fn tuning(doc: &toml::Table) {
         qmm_wide_range: flag("qmm_wide_range"),
         fp16_qmm: flag("fp16_qmm"),
         qmm_mpp: flag("qmm_mpp"),
+        qmm_mpp_packed: flag("qmm_mpp_packed"),
         sdpa_tile_min_rows_per_request: int("sdpa_tile_min_rows_per_request"),
         sdpa_mma: flag("sdpa_mma"),
         sdpa_mpp: flag("sdpa_mpp"),

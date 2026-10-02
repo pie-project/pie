@@ -419,7 +419,7 @@ impl Weights {
         use crate::encode::Sink;
         use kernels_metal::encode::{Arg, Encode, Fire, Grid};
         let tuned = kernels_metal::tuning::current();
-        if !tuned.qmm_mpp {
+        if !tuned.qmm_mpp || !tuned.qmm_mpp_packed {
             return Ok(());
         }
         if self.tier.is_some() || self.rows.is_some() {

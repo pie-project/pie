@@ -46,6 +46,8 @@ pub struct DeviceTuning {
 
     pub qmm_mpp: bool,
 
+    pub qmm_mpp_packed: bool,
+
     pub sdpa_tile_min_rows_per_request: u32,
 
     pub sdpa_mma: bool,
@@ -78,6 +80,7 @@ impl Default for DeviceTuning {
             qmm_wide_range: false,
             fp16_qmm: true,
             qmm_mpp: false,
+            qmm_mpp_packed: true,
             sdpa_tile_min_rows_per_request: 32,
             sdpa_mma: true,
             sdpa_mpp: false,
@@ -97,6 +100,10 @@ impl DeviceTuning {
     pub fn of(info: DeviceInfo) -> Self {
         let mut t = Self::default();
         match info.apple_family {
+            10 => {
+                t.qmm_mpp = true;
+                t.qmm_mpp_packed = false;
+            }
             9 => {
                 t.qmm_bn_crossover_tg = 96;
             }
@@ -126,6 +133,7 @@ impl DeviceTuning {
             qmm_wide_range,
             fp16_qmm,
             qmm_mpp,
+            qmm_mpp_packed,
             sdpa_tile_min_rows_per_request,
             sdpa_mma,
             sdpa_mpp,
@@ -169,6 +177,7 @@ pub struct Overrides {
     pub qmm_wide_range: Option<bool>,
     pub fp16_qmm: Option<bool>,
     pub qmm_mpp: Option<bool>,
+    pub qmm_mpp_packed: Option<bool>,
     pub sdpa_tile_min_rows_per_request: Option<u32>,
     pub sdpa_mma: Option<bool>,
     pub sdpa_mpp: Option<bool>,
