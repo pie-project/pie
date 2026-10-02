@@ -1,8 +1,22 @@
-use crate::encode::{Arg, Ctx, Fire, dtype_dispatch, nonzero, refuse};
+use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise, nonzero, refuse};
 use crate::error::Error;
 use crate::tensor::Tensor;
 
 const FILE: &str = "elemwise/hadamard.slang";
+
+/// Out-of-place elementwise sum `z[i] = x[i] + y[i]` over a flat rectangle. A
+/// 1:1 analog of `kernels_metal::elemwise::pointwise::add`; it mirrors
+/// `elemwise::norm::residual_add` but lands in a third buffer instead of
+/// accumulating in place.
+pub fn add(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> {
+    const OP: &str = "elementwise.add";
+    let entry = dtype_dispatch!(OP, z.dtype, { Bf16 => "add_bf16" });
+    let lanes = elementwise(OP, z.width, z.rows)?;
+    ctx.fire(
+        Fire::at("elemwise/add.slang", entry).apply(Grid::of(lanes, [GROUP, 1, 1])),
+        &[x.arg(), y.arg(), z.arg_mut(), lanes[0].arg()],
+    )
+}
 
 /// Threads per workgroup; one workgroup owns one N-block. Matches the
 /// `PIE_GROUP_X` the `hadamard.slang` variants are compiled with.

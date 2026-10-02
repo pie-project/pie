@@ -114,6 +114,13 @@ impl Run<'_> {
                 signs.as_ref().map(|s| self.tensor(*s)),
             ),
 
+            Elementwise::Add { x, y, z } => elemwise::pointwise::add(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*y),
+                self.tensor(*z),
+            ),
+
             Elementwise::LayernormNoScale { .. }
             | Elementwise::RmsnormResidualAdd { .. }
             | Elementwise::EmbedScaleAdd { .. }
@@ -127,7 +134,6 @@ impl Run<'_> {
             | Elementwise::Gelu { .. }
             | Elementwise::Tanh { .. }
             | Elementwise::Mul { .. }
-            | Elementwise::Add { .. }
             | Elementwise::RopeAxes { .. }
             | Elementwise::GateSigmoidMulHeads { .. } => {
                 Err(kernels_vulkan::Error::Unsupported { op: op.name() })
