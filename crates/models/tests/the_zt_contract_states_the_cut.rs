@@ -95,7 +95,8 @@ fn state(writer: &mut ztensor::Writer, param: &Param) {
         | Dtype::I3g16k
         | Dtype::U4g32k
         | Dtype::U5g32k
-        | Dtype::I6g16k => panic!(
+        | Dtype::I6g16k
+        | Dtype::KvU4 => panic!(
             "`{}` is declared `{}`, which this fixture does not state; a \
              stored block wants its own bytes and no SKU declares one yet",
             param.name, param.dtype,

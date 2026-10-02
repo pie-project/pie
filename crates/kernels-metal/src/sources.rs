@@ -249,6 +249,10 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/linear/gemm_dense.metal")),
     ),
     (
+        "linear/kv_codec.metal",
+        include_str!(concat!(source_root!(), "/linear/kv_codec.metal")),
+    ),
+    (
         "linear/lane_gemm.metal",
         include_str!(concat!(source_root!(), "/linear/lane_gemm.metal")),
     ),

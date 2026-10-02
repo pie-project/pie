@@ -45,6 +45,7 @@ impl HybridSpec {
         space: KvSpace,
         name: impl Into<String>,
         planes: impl IntoIterator<Item = u64>,
+        head_dim: u32,
     ) {
         let dtype = *self
             .dtypes
@@ -55,6 +56,7 @@ impl HybridSpec {
             planes: planes.into_iter().collect(),
             dtype,
             space: space.0,
+            head_dim,
         });
     }
 
