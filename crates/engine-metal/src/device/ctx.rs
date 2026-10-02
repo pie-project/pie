@@ -113,6 +113,7 @@ impl Context {
             kernels_metal::tuning::describe(kernels_metal::DeviceInfo {
                 apple_family: family(&device),
                 gpu_core_count: 0,
+                metal4: device.supportsFamily(MTLGPUFamily::Metal4),
             });
             let working_set = device.recommendedMaxWorkingSetSize();
             let max_buffer = device.maxBufferLength() as u64;

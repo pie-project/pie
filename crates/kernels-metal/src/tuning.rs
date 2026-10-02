@@ -5,6 +5,10 @@ pub struct DeviceInfo {
     pub apple_family: u32,
 
     pub gpu_core_count: u32,
+
+    /// Whether the device compiles Metal 4 shaders: the MPP kernels include its header, so
+    /// a family alone does not say they will build.
+    pub metal4: bool,
 }
 
 impl DeviceInfo {
@@ -22,6 +26,7 @@ impl DeviceInfo {
         Self {
             apple_family: family,
             gpu_core_count: 0,
+            metal4: false,
         }
     }
 }
@@ -114,6 +119,10 @@ impl DeviceTuning {
                 t.sdpa_mpp = true;
             }
             _ => {}
+        }
+        if !info.metal4 {
+            t.qmm_mpp = false;
+            t.sdpa_mpp = false;
         }
         t
     }
