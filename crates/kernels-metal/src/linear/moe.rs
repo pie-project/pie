@@ -681,6 +681,37 @@ pub struct RoutedScratch {
     pub x: Tensor,
 
     pub y: Tensor,
+
+    /// One f32 per sorted row and 64-wide activation group: what the MPP matmul folds the
+    /// zero points through.
+    pub sums: Tensor,
+}
+
+/// The MPP point of a routed matmul, as `(row tile, column tile, simdgroups)`.
+fn mpp_point(
+    x: Tensor,
+    bank: Bank,
+    biased: bool,
+    y: Tensor,
+    tile: u32,
+    padded: u32,
+    scratch: &RoutedScratch,
+    tuning: &crate::DeviceTuning,
+) -> Option<(u32, u32, u32)> {
+    let m = tile.min(32);
+    let (n, simdgroups) = if m == 8 { (64, 2) } else { (128, 4) };
+    let fits = tuning.qmm_mpp
+        && !biased
+        && bank.affine()
+        && bank.bits == 4
+        && bank.group == 64
+        && bank.scales.dtype == Dtype::Bf16
+        && x.width.is_multiple_of(64)
+        && y.width.is_multiple_of(n)
+        && scratch.sums.dtype == Dtype::F32
+        && u64::from(scratch.sums.rows) * u64::from(scratch.sums.width)
+            >= u64::from(padded) * u64::from(x.width / 64);
+    fits.then_some((m, n, simdgroups))
 }
 
 fn batched_point(
@@ -752,13 +783,18 @@ pub fn matmul_select_batched(
     if tile == MOE_TILE_ROWS[0] && !(fp16 && bank.affine() && bank.bits == 4 && bank.group == 64) {
         tile = MOE_TILE_ROWS[1];
     }
-    let Some(point) = batched_point(op, bank, bias.is_some(), tile, bn, fp16)? else {
-        return Ok(false);
-    };
     let padded = {
         let touched = pairs.min(experts);
         let bound = pairs.saturating_add(touched.saturating_mul(tile - 1));
         bound.div_ceil(tile) * tile
+    };
+    let mpp = mpp_point(x, bank, bias.is_some(), y, tile, padded, &scratch, tuning);
+    let point = match mpp {
+        Some(_) => None,
+        None => match batched_point(op, bank, bias.is_some(), tile, bn, fp16)? {
+            Some(point) => Some(point),
+            None => return Ok(false),
+        },
     };
     debug_assert!(
         scratch.x.rows >= padded && scratch.y.rows >= padded,
@@ -801,39 +837,72 @@ pub fn matmul_select_batched(
         ],
     )?;
 
-    let mut args = vec![
-        bank.codes.arg(),
-        bank.scales.arg(),
-        zero_points(ctx, bank)?,
-        scratch.x.arg(),
-        scratch.y.arg_mut(),
-        stated(op, x.width)?.arg(),
-        stated(op, y.width)?.arg(),
-    ];
-    args.push(match bias {
-        Some(bias) => bias.arg(),
-        None => ctx.absent()?,
-    });
-    for _ in 8..12 {
-        args.push(ctx.absent()?);
-    }
-    args.push(scratch.tile_expert.arg());
-    ctx.fire(
-        Fire::at(QMM_FILE, point.entry)
-            .stamp(point.stamp)
-            .apply(Grid::of(
-                crate::linear::quant::qmm_grid(
-                    op,
-                    stated(op, y.width)?,
-                    stated(op, bn)?,
-                    stated(op, padded)?,
-                    stated(op, tile)?,
-                    1,
-                )?,
-                crate::linear::quant::qmm_group(stated(op, tile)?),
+    if let Some((m, n, simdgroups)) = mpp {
+        const FILE: &str = "linear/quant_qmm_mpp.metal";
+        let k = stated(op, x.width)?;
+        ctx.fire(
+            Fire::at(FILE, "qmm_mpp_input_sums")
+                .apply(Grid::of([32 * (x.width / 64), padded, 1], [32, 4, 1])),
+            &[scratch.x.arg(), scratch.sums.arg_mut(), k.arg(), m.arg()],
+        )?;
+        let entry = crate::linear::quant::symbol(&format!(
+            "affine_qmm_mpp_routed_m{m}_n{n}_s{simdgroups}_t{tile}"
+        ));
+        let stamp = crate::linear::quant::symbol(&format!(
+            "PIE_MPP_ROUTED_POINT(\"{entry}\",{m},{n},{simdgroups},{tile})"
+        ));
+        ctx.fire(
+            Fire::at(FILE, entry).stamp(stamp).apply(Grid::of(
+                [32 * simdgroups * (y.width / n), padded / m, 1],
+                [32 * simdgroups, 1, 1],
             )),
-        &args,
-    )?;
+            &[
+                bank.codes.arg(),
+                bank.scales.arg(),
+                zero_points(ctx, bank)?,
+                scratch.x.arg(),
+                scratch.y.arg_mut(),
+                k.arg(),
+                stated(op, y.width)?.arg(),
+                scratch.sums.arg(),
+                scratch.tile_expert.arg(),
+            ],
+        )?;
+    } else if let Some(point) = point {
+        let mut args = vec![
+            bank.codes.arg(),
+            bank.scales.arg(),
+            zero_points(ctx, bank)?,
+            scratch.x.arg(),
+            scratch.y.arg_mut(),
+            stated(op, x.width)?.arg(),
+            stated(op, y.width)?.arg(),
+        ];
+        args.push(match bias {
+            Some(bias) => bias.arg(),
+            None => ctx.absent()?,
+        });
+        for _ in 8..12 {
+            args.push(ctx.absent()?);
+        }
+        args.push(scratch.tile_expert.arg());
+        ctx.fire(
+            Fire::at(QMM_FILE, point.entry)
+                .stamp(point.stamp)
+                .apply(Grid::of(
+                    crate::linear::quant::qmm_grid(
+                        op,
+                        stated(op, y.width)?,
+                        stated(op, bn)?,
+                        stated(op, padded)?,
+                        stated(op, tile)?,
+                        1,
+                    )?,
+                    crate::linear::quant::qmm_group(stated(op, tile)?),
+                )),
+            &args,
+        )?;
+    }
 
     ctx.fire(
         Fire::at(ROUTE_FILE, "route_scatter").apply(route_rows(op, y.width, pairs)?),
