@@ -103,6 +103,7 @@ impl DeviceTuning {
             10 => {
                 t.qmm_mpp = true;
                 t.qmm_mpp_packed = false;
+                t.sdpa_mpp = true;
             }
             9 => {
                 t.qmm_bn_crossover_tg = 96;

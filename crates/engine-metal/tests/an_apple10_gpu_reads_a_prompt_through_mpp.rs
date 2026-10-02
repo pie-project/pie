@@ -9,20 +9,25 @@ fn tuned(apple_family: u32) -> DeviceTuning {
 }
 
 #[test]
-fn an_apple10_gpu_multiplies_prompt_rows_through_mpp() {
+fn an_apple10_gpu_reads_a_prompt_through_mpp() {
     let apple10 = tuned(10);
     assert!(
         apple10.qmm_mpp,
-        "an Apple10 GPU reads a prompt through the MPP matmul"
+        "an Apple10 GPU multiplies prompt rows through the MPP matmul"
     );
     assert!(
         !apple10.qmm_mpp_packed,
         "and over the bank as it lies, so the weight tier is not held twice"
     );
+    assert!(
+        apple10.sdpa_mpp,
+        "and its prompt rows attend through the MPP matmul too"
+    );
     for older in [0, 7, 8, 9] {
+        let older = tuned(older);
         assert!(
-            !tuned(older).qmm_mpp,
-            "family {older} keeps the tiled matmul it was measured on"
+            !older.qmm_mpp && !older.sdpa_mpp,
+            "an older family keeps the kernels it was measured on"
         );
     }
 }

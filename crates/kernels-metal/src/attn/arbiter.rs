@@ -147,6 +147,22 @@ fn arbitrate(
             lse,
         );
     }
+    if tuning.sdpa_mpp && super::q8::mpp_fits(q, pool, head_dim, causal, lse.is_some()) {
+        return super::q8::attention(
+            ctx,
+            op,
+            q,
+            pool,
+            &as_decode(plan, mask),
+            window,
+            causal,
+            head_dim,
+            sm_scale,
+            o,
+            lse,
+            true,
+        );
+    }
     if causal && should_mma(head_dim, lse.is_some(), tuning) {
         return mma(
             ctx, op, q, pool, plan, mask, window, head_dim, sm_scale, o, lse,
