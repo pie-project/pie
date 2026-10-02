@@ -30,6 +30,28 @@ const PQ2_0_QMV: &str = "pq2_0_qmv_bfloat16";
 /// Weights per PQ2_0 block; the scale is INLINE per block (single plane).
 const PQ2_0_BLOCK: u32 = 128;
 
+/// Contraction tile the PQ2_0 GEMM-tiled qmm walks per step (a quarter of a
+/// 128-weight block; four steps cross one block and its inline fp16 scale).
+const PQ2_0_QMM_BK: i32 = 32;
+
+/// Prefill row count at or above which PQ2_0 routes to the tiled qmm instead of
+/// the qmv. Below it the per-row cost of qmv wins (no tile fill / store
+/// overhead); at/above it, amortising each decoded weight tile across BM rows is
+/// a large win. Measured crossover on an M-series GPU (see the prefill bench).
+const PQ2_0_QMM_MIN_BATCH: i32 = 16;
+
+/// A tiled PQ2_0 qmm axis point. `entry` names the stamped specialisation; the
+/// `stamp` mints `pq2_0_qmm_t<bm, 32, bn>` under that name on demand.
+pub fn pq2_0_qmm_point(op: &'static str, bm: i32, bn: i32) -> Result<Point, Error> {
+    check(op, &ROW_TILES, bm, "row tile")?;
+    check(op, &TILES, bn, "column tile")?;
+    let entry = symbol(&format!("pq2_0_qmm_t_bm_{bm}_bn_{bn}"));
+    Ok(Point {
+        entry,
+        stamp: symbol(&format!("PIE_STAMP_pq2_0_qmm(\"{entry}\", {bm}, {bn})")),
+    })
+}
+
 const QMV_ROWS_FILE: &str = "linear/quant_qmv_rows.metal";
 
 const QMV_ROWS_STAMP: &str = "PIE_STAMP_qmv_rows";
@@ -568,7 +590,17 @@ pub fn act_x_wt(
         if rows == 0 {
             return Ok(());
         }
-        return pq2_0_matmul(ctx, op, act, w, y, rows, columns, contraction);
+        return pq2_0_matmul(
+            ctx,
+            op,
+            act,
+            w,
+            y,
+            rows,
+            columns,
+            contraction,
+            capacity_rows,
+        );
     }
     let Some(biases) = w.biases else {
         return Err(refuse(
@@ -817,6 +849,7 @@ fn pq2_0_matmul(
     rows: u32,
     columns: u32,
     contraction: u32,
+    capacity_rows: u32,
 ) -> Result<(), Error> {
     if !contraction.is_multiple_of(PQ2_0_BLOCK) {
         return Err(refuse(
@@ -830,6 +863,25 @@ fn pq2_0_matmul(
     }
     let (m, n) = (stated(op, rows)?, stated(op, columns)?);
     let k = stated(op, contraction)?;
+    // Prefill: amortise each decoded weight tile across BM activation rows with
+    // the GEMM-tiled qmm. The tile must divide the padded rows (the shader reads
+    // M from the grid) and the columns (`store_result` writes a whole BM x BN
+    // tile), and the padded rows must fit the allocated capacity so the pad rows
+    // land in-bounds. K is a whole number of 128-blocks, so K % BK(32) == 0.
+    let capacity = i32::try_from(capacity_rows).unwrap_or(i32::MAX);
+    if m >= PQ2_0_QMM_MIN_BATCH
+        && k % PQ2_0_QMM_BK == 0
+        && let Some((bm, padded)) = mb_block(m, capacity)
+        && let Some(bn) = TILES.iter().copied().find(|bn| n % bn == 0)
+    {
+        let point = pq2_0_qmm_point(op, bm, bn)?;
+        return ctx.fire(
+            Fire::at(PQ2_0_FILE, point.entry)
+                .stamp(point.stamp)
+                .apply(Grid::of(qmm_grid(op, n, bn, padded, bm, 1)?, qmm_group(bm))),
+            &[w.codes.arg(), act.arg(), y.arg_mut(), k.arg(), n.arg()],
+        );
+    }
     ctx.fire(
         Fire::at(PQ2_0_FILE, PQ2_0_QMV).apply(Grid::of(qmv_grid(op, m, n)?, QMV_GROUP)),
         &[w.codes.arg(), act.arg(), y.arg_mut(), k.arg(), n.arg()],
