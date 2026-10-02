@@ -1,4 +1,4 @@
-
+//#include "common/bf16.inc.wgsl"
 
 const PIE_LANES = 32u;
 const PIE_SLICES = 2u;
@@ -41,7 +41,8 @@ fn e4m3_to_f32(byte_: u32) -> f32 {
     if (exp == 0) {
         mag = f32(mant) * 0.001953125;
     } else if (exp == 0xf && mant == 0x7) {
-        mag = bitcast<f32>(0x7fc00000u);
+        var nan_bits = 0x7fc00000u;
+        mag = bitcast<f32>(nan_bits);
     } else {
         mag = (1.0 + f32(mant) * 0.125) * bitcast<f32>(u32((exp - 7 + 127) << 23u));
     }
@@ -104,3 +105,4 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     }
 }
 
+// pie:instantiate nvfp4_qmv_bf16

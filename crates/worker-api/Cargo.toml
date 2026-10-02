@@ -13,7 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 ids = { path = "../ids" }
-client-api = { path = "../client-api" }
+client-api = { package = "pie-client-api", path = "../client-api" }
 controller-api = { path = "../controller-api" }
 tarpc = { version = "0.37", features = ["serde1", "tokio1"] }
 serde = { version = "1.0", features = ["derive"] }

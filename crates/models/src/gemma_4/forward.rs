@@ -83,14 +83,15 @@ impl ForwardHybrid for Model {
         let mut c = HybridSpec::new();
 
         let kv = c.kv_space(self.kv);
+        let sliding = c.windowed_kv_space(self.kv, self.sliding.window);
         for w in &self.layers {
             if let AttnBanks::Owned { .. } = &w.attn.banks {
-                let (head_dim, kv_heads) = match w.attn.reading {
-                    Reading::Sliding => (self.sliding.head_dim, self.sliding.kv_heads),
-                    Reading::Global => (self.global.head_dim, self.global.kv_heads),
+                let (space, head_dim, kv_heads) = match w.attn.reading {
+                    Reading::Sliding => (sliding, self.sliding.head_dim, self.sliding.kv_heads),
+                    Reading::Global => (kv, self.global.head_dim, self.global.kv_heads),
                 };
                 let plane = kv_heads as u64 * head_dim as u64;
-                c.kv(kv, w.attn.kv.clone(), [plane, plane]);
+                c.kv(space, w.attn.kv.clone(), [plane, plane]);
             }
         }
         if let Some(a) = &self.draft {

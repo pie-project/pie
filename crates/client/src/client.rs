@@ -341,12 +341,8 @@ impl Client {
         }
     }
 
-    pub async fn check_program(
-        &self,
-        inferlet: &str,
-        wasm_path: Option<&Path>,
-        manifest_path: Option<&Path>,
-    ) -> Result<bool> {
+    /// Whether the server holds `name@version`.
+    pub async fn check_program(&self, inferlet: &str) -> Result<bool> {
         use regex::Regex;
         use std::sync::LazyLock;
 
@@ -359,30 +355,10 @@ impl Client {
                 inferlet
             )
         })?;
-        let name = caps[1].to_string();
-        let version = caps[2].to_string();
-
-        let (wasm_hash, manifest_hash) = match (wasm_path, manifest_path) {
-            (Some(wasm_p), Some(manifest_p)) => {
-                let wasm_bytes = fs::read(wasm_p)
-                    .with_context(|| format!("Failed to read WASM file: {:?}", wasm_p))?;
-                let manifest_content = fs::read_to_string(manifest_p)
-                    .with_context(|| format!("Failed to read manifest file: {:?}", manifest_p))?;
-                (
-                    Some(hash_blob(&wasm_bytes)),
-                    Some(hash_blob(manifest_content.as_bytes())),
-                )
-            }
-            (None, None) => (None, None),
-            _ => anyhow::bail!("wasm_path and manifest_path must both be provided or both be None"),
-        };
-
         let msg = ClientMessage::CheckProgram {
             corr_id: 0,
-            name,
-            version,
-            wasm_hash,
-            manifest_hash,
+            name: caps[1].to_string(),
+            version: caps[2].to_string(),
         };
         let (ok, result) = self.send_msg_and_wait(msg).await?;
         if ok {
@@ -392,27 +368,29 @@ impl Client {
         }
     }
 
-    pub async fn program_exists(
-        &self,
-        inferlet: &str,
-        wasm_path: Option<&Path>,
-        manifest_path: Option<&Path>,
-    ) -> Result<bool> {
-        self.check_program(inferlet, wasm_path, manifest_path).await
-    }
-
     pub async fn add_program(
         &self,
-        wasm_path: &Path,
-        manifest_path: &Path,
+        path: &Path,
+        version: Option<&str>,
         force_overwrite: bool,
-    ) -> Result<()> {
-        let blob = fs::read(wasm_path)
-            .with_context(|| format!("Failed to read WASM file: {:?}", wasm_path))?;
-        let manifest = fs::read_to_string(manifest_path)
-            .with_context(|| format!("Failed to read manifest file: {:?}", manifest_path))?;
+    ) -> Result<String> {
+        let blob = fs::read(path).with_context(|| format!("Failed to read {:?}", path))?;
+        let file = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .with_context(|| format!("{:?} has no file name", path))?;
+        self.add_program_bytes(&blob, file, version, force_overwrite)
+            .await
+    }
 
-        let program_hash = hash_blob(&blob);
+    pub async fn add_program_bytes(
+        &self,
+        blob: &[u8],
+        file: &str,
+        version: Option<&str>,
+        force_overwrite: bool,
+    ) -> Result<String> {
+        let program_hash = hash_blob(blob);
         let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
         let (tx, rx) = oneshot::channel();
         self.inner.pending_requests.insert(*corr_id_guard, tx);
@@ -430,7 +408,8 @@ impl Client {
             let msg = ClientMessage::AddProgram {
                 corr_id: *corr_id_guard,
                 program_hash: program_hash.clone(),
-                manifest: manifest.to_string(),
+                file: file.to_string(),
+                version: version.map(str::to_string),
                 force_overwrite,
                 chunk_index,
                 total_chunks,
@@ -443,7 +422,7 @@ impl Client {
 
         let (ok, result) = rx.await?;
         if ok {
-            Ok(())
+            Ok(result)
         } else {
             anyhow::bail!("Program install failed: {}", result)
         }

@@ -1,1 +1,0 @@
-# Templates package for bakery

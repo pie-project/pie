@@ -467,6 +467,16 @@ mod tests {
         planes_of_u4g64();
         planes_align_and_nest();
         content_rules();
+        leaf_parse_bounds();
+    }
+
+    fn leaf_parse_bounds() {
+        for s in ["u1", "u8", "u64", "i1", "i8", "i64", "f16", "e2m1", "bool"] {
+            assert_eq!(Leaf::parse(s).unwrap().to_string(), s);
+        }
+        for s in ["", "u0", "u65", "i0", "i65", "u04", "ux", "x8", "u"] {
+            assert!(Leaf::parse(s).is_none(), "{s:?} parsed");
+        }
     }
 
     fn round_trips_and_is_canonical() {

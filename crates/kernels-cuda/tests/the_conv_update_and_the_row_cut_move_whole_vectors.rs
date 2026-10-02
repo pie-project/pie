@@ -11,12 +11,35 @@ use kernels_cuda::tensor::{RecurrentPool, Tensor};
 #[test]
 fn the_conv_update_and_the_row_cut_move_whole_vectors_every_case() {
     the_conv_update_convolves_the_window_and_shifts_it();
+    the_conv_update_leaves_the_window_when_the_fire_buffers_its_rows();
+    the_conv_update_shifts_the_window_where_the_fire_folds();
+    the_conv_update_leaves_the_window_on_the_per_channel_arm_too();
     the_row_cut_lands_both_halves();
     the_row_cut_lands_both_halves_past_the_grid_y_ceiling();
 }
 
 fn the_conv_update_convolves_the_window_and_shifts_it() {
-    let (rows, channels, k) = (3u32, 64usize, 4u32);
+    conv_update(true, None, 64);
+}
+
+/// A speculative window buffers its rows unfolded: the step answers the
+/// convolution and leaves every lane's window where it found it, so a
+/// rejected draft has nothing to roll back.
+fn the_conv_update_leaves_the_window_when_the_fire_buffers_its_rows() {
+    conv_update(false, None, 64);
+}
+
+fn the_conv_update_shifts_the_window_where_the_fire_folds() {
+    conv_update(true, Some([1, 0, 1]), 64);
+}
+
+/// A channel count off the eight-wide vector takes the per-channel arm.
+fn the_conv_update_leaves_the_window_on_the_per_channel_arm_too() {
+    conv_update(false, Some([0, 1, 1]), 60);
+}
+
+fn conv_update(write_state: bool, mask: Option<[u8; 3]>, channels: usize) {
+    let (rows, k) = (3u32, 4u32);
     let slot_of: [i32; 3] = [1, 3, 0];
     let stride = (k as usize) * channels;
     let mut lcg = Lcg::seeded(0xc0);
@@ -29,6 +52,7 @@ fn the_conv_update_convolves_the_window_and_shifts_it() {
     let w_at = gpu.up(&w_raw);
     let slab_at = gpu.up(&slab_raw);
     let slots_at = gpu.up(&slot_of);
+    let mask_at = mask.map(|lanes| gpu.up(&lanes));
     let y_at = gpu.zeros(rows as usize * channels * 2);
     let pool = RecurrentPool {
         slab: Tensor::ABSENT,
@@ -36,8 +60,8 @@ fn the_conv_update_convolves_the_window_and_shifts_it() {
         slot_stride_elems: 0,
         conv_slab: Tensor::new(slab_at, 4, stride as u32, Dtype::Bf16),
         conv_stride: stride as i64,
-        write_state: true,
-        write_state_mask: Tensor::ABSENT,
+        write_state,
+        write_state_mask: mask_at.map_or(Tensor::ABSENT, |at| Tensor::new(at, rows, 1, Dtype::U8)),
         commit_len: Tensor::ABSENT,
         begin_at: Tensor::ABSENT,
         fused_decay: false,
@@ -60,6 +84,7 @@ fn the_conv_update_convolves_the_window_and_shifts_it() {
     let mut want = slab.clone();
     for r in 0..rows as usize {
         let state = &mut want[slot_of[r] as usize * stride..(slot_of[r] as usize + 1) * stride];
+        let folds = write_state && mask.is_none_or(|lanes| lanes[r] != 0);
         for c in 0..channels {
             let mut acc = 0f32;
             for t in 0..k as usize {
@@ -76,6 +101,9 @@ fn the_conv_update_convolves_the_window_and_shifts_it() {
                 close(got, silu),
                 "row {r} channel {c}: {got} against {silu}"
             );
+            if !folds {
+                continue;
+            }
             for t in 0..k as usize - 1 {
                 state[t * channels + c] = state[(t + 1) * channels + c];
             }
@@ -85,7 +113,7 @@ fn the_conv_update_convolves_the_window_and_shifts_it() {
     for (at, (&got, &want)) in got_slab.iter().zip(&want).enumerate() {
         assert!(
             close(from_bf16(got), want),
-            "window element {at}: {} against {want}",
+            "window element {at} (write_state {write_state}, mask {mask:?}): {} against {want}",
             from_bf16(got)
         );
     }

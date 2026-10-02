@@ -25,3 +25,4 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     out_[n * words + c] = table[row * words + c];
 }
 
+// pie:instantiate embed_bf16

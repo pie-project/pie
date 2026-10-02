@@ -19,7 +19,7 @@ pub use descriptor::{
     VOXEL_LANE_BYTES,
 };
 pub use fallback::{Serve, answers as fallback_answers, fragmentable, max_runs};
-pub use packing::{LaneFacts, Packed, group_of_lane, groups_of, pack};
+pub use packing::{LaneFacts, Packed, group_of_lane, groups_of, pack, pack_with_classes};
 pub use sink::{EagerSink, EventId, Sink};
 pub use walk::{Filter, Phases, Regions, Units, walk, walk_phases, walk_regions};
 

@@ -61,8 +61,8 @@ impl DevicePageReservation {
         self.pages.append(&mut other.pages);
     }
 
-    pub(super) fn donate(&mut self, count: usize) -> DevicePageReservation {
-        let n = count.min(self.pages.len());
+    pub(super) fn donate(&mut self, count: u32) -> DevicePageReservation {
+        let n = (count as usize).min(self.pages.len());
         DevicePageReservation {
             pages: self.pages.drain(..n).collect(),
             port: self.port.clone(),
@@ -76,11 +76,12 @@ impl DevicePageReservation {
 
 impl Drop for DevicePageReservation {
     fn drop(&mut self) {
-        if self.pages.is_empty() {
+        let Some(port) = self.port.take() else {
             return;
-        }
-        if let Some(port) = self.port.take() {
-            port.release_device(std::mem::take(&mut self.pages));
+        };
+        let pages = std::mem::take(&mut self.pages);
+        if !pages.is_empty() {
+            port.release_device(pages);
         }
     }
 }
@@ -111,6 +112,10 @@ impl RsSlotReservation {
             slots: Vec::new(),
             port: None,
         }
+    }
+
+    pub(super) fn lend(&mut self) -> &mut Vec<RsSlotId> {
+        &mut self.slots
     }
 }
 
@@ -150,7 +155,7 @@ impl AllocationGrant {
     }
 
     pub fn remaining_kv(&self) -> usize {
-        self.kv.pages.len()
+        self.kv.len()
     }
 
     pub fn remaining_rs(&self) -> usize {
@@ -158,7 +163,7 @@ impl AllocationGrant {
     }
 
     pub fn lend_kv(&mut self) -> &mut Vec<PhysicalKvPageId> {
-        &mut self.kv.pages
+        self.kv.lend()
     }
 
     pub fn lend_rs(&mut self) -> &mut Vec<RsSlotId> {

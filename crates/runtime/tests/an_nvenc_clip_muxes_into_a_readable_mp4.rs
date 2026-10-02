@@ -1,6 +1,6 @@
 #![cfg(feature = "cuda")]
 
-use runtime::codec::mp4;
+use media::mp4;
 use runtime::inferlet::{Frames, ImageFormat};
 
 fn moving_gradient(w: u32, h: u32, n: u32) -> Vec<u8> {

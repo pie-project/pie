@@ -60,7 +60,8 @@ fn the_dynamic_conv_mixes_each_row_with_the_one_before_it() {
                             break;
                         }
                         let at = side * taps + k;
-                        let coef = base[at * channels + c] + coeff[row * coeff_width + at * groups + g];
+                        let coef =
+                            base[at * channels + c] + coeff[row * coeff_width + at * groups + g];
                         want += coef * x[(begin + t - k) * channels + c];
                     }
                     let got = from_bf16(got[row * channels + c]);

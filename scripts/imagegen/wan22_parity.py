@@ -257,14 +257,13 @@ def run(args) -> None:
             f"`cargo build -p pie --features cuda`, or pass --pie."
         )
     binary = wasm(args.inferlet)
-    manifest = os.path.join(args.inferlet, "Pie.toml")
     scratch = scratch_dir(args.config)
     for b, case in enumerate(paths):
         out = os.path.join(args.out, f"pie{suffix(args)}_{b}.json")
         cmd = [pie]
         if args.config:
             cmd += ["--config", args.config]
-        cmd += ["run", "--path", binary, "--manifest", manifest, "--"]
+        cmd += ["run", "--path", binary, "--"]
         text = ""
         if args.case_file:
             if scratch and os.path.abspath(scratch) != os.path.abspath(args.out):
@@ -397,7 +396,7 @@ def main() -> int:
     ap.add_argument("--variant", choices=sorted(ROWS), default="d128")
     ap.add_argument("--pertoken", action="store_true",
                     help="the miniatures' TI2V per-token-timestep forward: two video lanes")
-    ap.add_argument("--inferlet", default=os.path.join(REPO, "tests/inferlets/wan2-parity"))
+    ap.add_argument("--inferlet", default=os.path.join(REPO, "examples/wan2-parity"))
     ap.add_argument("--config", default=None,
                     help="the serving config; its `[model] model` must be the imported row")
     ap.add_argument("--pie", default=None, help="the pie binary (default: PATH, else target/debug)")

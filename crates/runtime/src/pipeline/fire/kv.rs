@@ -52,6 +52,10 @@ impl KvTxn {
     pub fn mapping_version(&self) -> u64 {
         self.mapping_version
     }
+
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
 }
 
 fn build_translation(

@@ -151,6 +151,7 @@ pub struct PrefillPlan {
     pub window: Option<u32>,
     pub causal: bool,
     pub graph_capturable: bool,
+    pub graph_refusal: Option<String>,
     pub mask_indptr: Option<Tensor>,
     pub device: Device,
 }
@@ -170,16 +171,17 @@ impl PrefillPlan {
     ) -> Result<(), Error> {
         planned_head_dim(op, self.shape.head_dim, head_dim)?;
         if let Some(kv_heads) = kv_heads
-            && self.shape.num_kv_heads != kv_heads {
-                return Err(refuse(
-                    op,
-                    format!(
-                        "the stated kv head count {kv_heads} is not the {} this fire's \
+            && self.shape.num_kv_heads != kv_heads
+        {
+            return Err(refuse(
+                op,
+                format!(
+                    "the stated kv head count {kv_heads} is not the {} this fire's \
                          prefill schedule was planned at",
-                        self.shape.num_kv_heads
-                    ),
-                ));
-            }
+                    self.shape.num_kv_heads
+                ),
+            ));
+        }
         if self.window != window {
             return Err(refuse(
                 op,
@@ -245,7 +247,12 @@ pub struct MlaPlan {
 
 impl MlaPlan {
     pub fn stage(&self, ctx: &Ctx) -> Result<(), Error> {
-        upload(ctx, "attention.mla_plan", &self.int_upload, self.workspace.int_ptr)
+        upload(
+            ctx,
+            "attention.mla_plan",
+            &self.int_upload,
+            self.workspace.int_ptr,
+        )
     }
 }
 
@@ -428,17 +435,22 @@ pub fn plan_prefill(
         window_left: window.map(|w| w - 1),
     };
 
-    let (built, capturable) =
+    let (built, capturable, graph_refusal) =
         match sched_prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes) {
-            Ok(built) => (built, enable_cuda_graph),
-            Err(_) if enable_cuda_graph => {
+            Ok(built) => (built, enable_cuda_graph, None),
+            Err(declined) if enable_cuda_graph => {
                 let req = sched_prefill::Request {
                     enable_cuda_graph: false,
                     ..req
                 };
-                let built =
-                    sched_prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes)?;
-                (built, false)
+                let built = sched_prefill::plan(
+                    OP,
+                    &req,
+                    device,
+                    workspace.int_bytes,
+                    workspace.float_bytes,
+                )?;
+                (built, false, Some(declined.to_string()))
             }
             Err(declined) => return Err(declined),
         };
@@ -466,12 +478,15 @@ pub fn plan_prefill(
         window,
         causal,
         graph_capturable: capturable,
+        graph_refusal,
         mask_indptr,
         device: *device,
     })
 }
 
-pub use crate::attn::sched_prefill::graph_padding as prefill_graph_padding;
+pub use crate::attn::sched_prefill::{
+    graph_padding as prefill_graph_padding, partial_rows as prefill_partial_rows,
+};
 
 #[allow(clippy::too_many_arguments)]
 pub fn plan_prefill_sm90(

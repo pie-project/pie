@@ -125,7 +125,7 @@ impl Scratch {
             images: u64::from(budgets.max_images()),
             voxels: u64::from(budgets.max_voxels()),
             clips: u64::from(budgets.max_clips()),
-            readouts: u64::from(budget.max_tokens),
+            readouts: model_compiler::arena::readouts_ceiling(budget),
         };
         let of = |id: ValueId| rect(map, id, ceiling);
         let banked = |id: ValueId| match trace.values.get(id.0 as usize).map(|v| &v.def) {
@@ -404,6 +404,16 @@ impl Scratch {
 
 const fn compressor_coff(ratio: u32) -> u64 {
     if ratio == 4 { 2 } else { 1 }
+}
+
+/// What the pool-gather rooms take at `paging`: a state and a score row a
+/// pooled cell, so they grow with the pool as its slabs do.
+#[must_use]
+pub fn pool_bytes(trace: &Trace, paging: Paging) -> u64 {
+    pool_state(trace, paging)
+        .iter()
+        .map(|(_, cells, width)| 2 * cells * width * Dtype::Bf16.bytes_ceil())
+        .sum()
 }
 
 fn pool_state(trace: &Trace, paging: Paging) -> Vec<(u32, u64, u64)> {

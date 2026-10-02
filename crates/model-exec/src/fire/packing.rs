@@ -21,6 +21,8 @@ pub struct Packed {
     pub permutation: Vec<i32>,
     pub reference_start: Vec<i32>,
     pub references: Vec<u32>,
+    /// One attention class per packed row (-1 where the lane states none).
+    pub attn_class: Vec<i32>,
 }
 
 #[must_use]
@@ -67,6 +69,19 @@ pub fn pack(
     group_of_lane: &[i32],
     fire_rows: u32,
 ) -> Result<Packed, Fault> {
+    pack_with_classes(select, lanes, facts, group_of_lane, fire_rows, &[])
+}
+
+/// `pack`, with `classes[source]` the attention classes a source lane
+/// states (one per row), packed beside the reference tags.
+pub fn pack_with_classes(
+    select: Selection,
+    lanes: &[LaneRow],
+    facts: &[LaneFacts],
+    group_of_lane: &[i32],
+    fire_rows: u32,
+    classes: &[Option<&[i32]>],
+) -> Result<Packed, Fault> {
     let groups = groups_of(group_of_lane) as usize;
     let mut chosen: Vec<(i32, u8, usize)> = lanes
         .iter()
@@ -104,6 +119,7 @@ pub fn pack(
     let mut group_indptr = vec![0i32; groups + 1];
     let mut lane_indptr = Vec::with_capacity(chosen.len() + 1);
     let mut reference_tag = vec![-1i32; fire_rows as usize];
+    let mut attn_class = vec![-1i32; fire_rows as usize];
     let mut permutation = vec![-1i32; fire_rows as usize];
     let mut reference_start = vec![0i32; groups];
     let mut references = vec![0u32; groups];
@@ -128,11 +144,16 @@ pub fn pack(
                 reference_start[g] = (packed - group_first[g]) as i32;
             }
         }
+        let stated = classes.get(row.source as usize).copied().flatten();
         for j in 0..row.rows {
             let fire_row = row.row_offset + j;
             let here = (packed + j) as usize;
             permutation[here] = fire_row as i32;
             reference_tag[here] = if reference { at as i32 } else { -1 };
+            attn_class[here] = stated
+                .and_then(|c| c.get(j as usize))
+                .copied()
+                .unwrap_or(-1);
         }
         packed += row.rows;
         lane_indptr.push(packed as i32);
@@ -165,6 +186,7 @@ pub fn pack(
         permutation,
         reference_start,
         references,
+        attn_class,
     })
 }
 

@@ -121,6 +121,7 @@ pub struct ForwardBindings {
     pub group: Option<u32>,
     pub peer: Option<u32>,
     pub ports: Vec<PortBinding>,
+    pub attn_classes: Option<::engine::fire::AttnClasses>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,6 +153,7 @@ pub struct LaneFacts {
     pub group: Option<u32>,
     pub peer: Option<u32>,
     pub ports: Vec<::engine::fire::PortFeed>,
+    pub attn_classes: Option<::engine::fire::AttnClasses>,
 }
 
 impl LaneFacts {
@@ -162,6 +164,7 @@ impl LaneFacts {
             lane.group = self.group;
             lane.peer = self.peer;
             lane.ports = self.ports.clone();
+            lane.attn_classes = self.attn_classes.clone();
         }
     }
 }

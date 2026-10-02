@@ -1,8 +1,8 @@
-use crate::codec::{mp4, still, wav, y4m};
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 use crate::inferlet::host::pie::inferlet::frames::{AudioFormat, ImageFormat};
 use anyhow::Result;
+use media::{mp4, still, wav, y4m};
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
@@ -195,7 +195,7 @@ impl Frames {
 
     #[cfg(feature = "cuda")]
     fn mp4_h264(&self, rgb: &[u8]) -> Result<Vec<u8>, String> {
-        let pictures = crate::codec::nvenc::encode_h264(
+        let pictures = media::nvenc::encode_h264(
             rgb,
             self.width,
             self.height,

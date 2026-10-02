@@ -39,8 +39,8 @@ fn a_qkv_split_reaches_every_row_of_a_tall_fire() {
     let mut first_wrong = None;
     for n in 0..TALL as usize {
         let row = &packed[n * stride..(n + 1) * stride];
-        let q_ok = q_out[n * q_width as usize..(n + 1) * q_width as usize]
-            == row[..q_width as usize];
+        let q_ok =
+            q_out[n * q_width as usize..(n + 1) * q_width as usize] == row[..q_width as usize];
         let k_ok = k_out[n * kv_width as usize..(n + 1) * kv_width as usize]
             == row[q_width as usize..(q_width + kv_width) as usize];
         let v_ok = v_out[n * kv_width as usize..(n + 1) * kv_width as usize]

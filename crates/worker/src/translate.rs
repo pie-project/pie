@@ -17,7 +17,7 @@ pub fn build(
     }
 
     let pie_home = bootstrap::paths::pie_home();
-    let cache_dir = pie_home.join("programs");
+    let cache_dir = bootstrap::paths::inferlets_dir();
     let log_dir = Some(pie_home.join("logs"));
 
     let model = build_model(&user.model, &user.runtime, engines, metadata)?;
@@ -26,9 +26,16 @@ pub fn build(
         host: user.server.host.clone(),
         port: user.server.port,
         cache_dir,
+        builtin_programs: builtins::all()
+            .iter()
+            .map(|b| runtime::bootstrap::BuiltinProgram {
+                name: b.name,
+                version: b.version,
+                component: b.component,
+            })
+            .collect(),
         verbose: user.server.verbose,
         log_dir,
-        registry_url: user.server.registry.clone(),
         telemetry: runtime::bootstrap::TelemetryConfig {
             enabled: user.telemetry.enabled,
             endpoint: user.telemetry.endpoint.clone(),
@@ -45,12 +52,12 @@ pub fn build(
             allow_network: user.sandbox.allow_network,
             network_allowed_hosts: user.sandbox.network_allowed_hosts.clone(),
             max_upload_mb: user.server.max_upload.as_mib() as usize,
-            py_runtime_dir: pie_home.join("py-runtime"),
+            languages_dir: bootstrap::paths::languages_dir(),
+            compile_cache_dir: Some(bootstrap::paths::compile_cache_dir()),
         },
         model,
         skip_tracing: true,
         max_concurrent_processes: user.runtime.max_concurrent_processes,
-        python_snapshot: user.sandbox.python_snapshot,
     })
 }
 
@@ -81,12 +88,17 @@ fn build_model(
             let backend_kind = g.backend.kind().to_string();
             runtime::bootstrap::EngineConfig {
                 total_pages: g.caps.pools.kv_pages as usize,
-                cpu_pages: 0,
+                window_pages: g.caps.pools.window_pages,
+                window_tokens: g.caps.pools.window_tokens,
+                cpu_pages: g.caps.pools.host_kv_pages as usize,
+                cpu_window_pages: g.caps.pools.host_window_pages,
+                disk_pages: g.caps.pools.disk_kv_pages,
                 kv_copy: g.caps.kv_copy,
                 backend_kind,
                 rs_cache_required: g.caps.pools.state_slots != 0,
                 rs_cache_slots: g.caps.pools.state_slots as usize,
                 rs_cache_slot_bytes: g.caps.pools.state_slot_bytes,
+                rs_host_slots: g.caps.pools.host_state_slots as usize,
                 has_mtp_logits: g.caps.profile.has_mtp_logits,
                 mtp_depth: g.caps.profile.mtp_depth,
                 draft_block: g.caps.profile.draft_block,
@@ -118,7 +130,6 @@ fn build_model(
         metadata,
         engines,
         scheduler: runtime::bootstrap::SchedulerConfig {
-            request_timeout_secs: runtime.request_timeout.as_secs(),
             submit_deadline_us: runtime.submit_deadline.as_micros(),
             silence_timeout_secs: runtime.silence_timeout.as_secs(),
             frame_size: runtime.frame_size,

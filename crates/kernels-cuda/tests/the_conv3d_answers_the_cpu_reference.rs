@@ -125,7 +125,8 @@ fn k3(stride: u32, pad: [u32; 3], causal_t: bool, time_pad: TimePad) -> Conv3d {
     Conv3d {
         k: [3, 3, 3],
         stride: [stride; 3],
-        pad,        pad_back: pad,
+        pad,
+        pad_back: pad,
         causal_t,
         time_pad,
     }

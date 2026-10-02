@@ -1,28 +1,3 @@
-use image::DynamicImage;
-
-pub fn decode_gif_frames(bytes: &[u8]) -> Result<Vec<(DynamicImage, f32)>, String> {
-    use image::AnimationDecoder;
-    use image::codecs::gif::GifDecoder;
-    let decoder =
-        GifDecoder::new(std::io::Cursor::new(bytes)).map_err(|e| format!("gif decode: {e}"))?;
-    let frames = decoder
-        .into_frames()
-        .collect_frames()
-        .map_err(|e| format!("gif frames: {e}"))?;
-    if frames.is_empty() {
-        return Err("gif has no frames".into());
-    }
-    let mut out = Vec::with_capacity(frames.len());
-    let mut t_ms = 0.0f32;
-    for f in frames {
-        let (num, den) = f.delay().numer_denom_ms();
-        let frame_ms = num as f32 / den as f32;
-        out.push((DynamicImage::ImageRgba8(f.into_buffer()), t_ms / 1000.0));
-        t_ms += frame_ms;
-    }
-    Ok(out)
-}
-
 #[must_use]
 pub fn audio_arch_supported(arch: &str) -> bool {
     arch.eq_ignore_ascii_case("gemma4")

@@ -12,11 +12,12 @@ categories = ["wasm"]
 include = ["src/**/*", "wit/**/*"]
 
 [dependencies]
-wit-bindgen = { version = "0.59.0", features = ["async-spawn"] }
-inferlet-macros = { version = "0.5.0", path = "../inferlet-macros" }
+blake3 = { version = "1.8.5", default-features = false }
+wit-bindgen = { version = "0.62.0", features = ["async-spawn"] }
+inferlet-macros = { version = "0.5.4", path = "../inferlet-macros" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-eta-dsl = { path = "../eta-dsl" }
+eta-dsl = { package = "pie-eta-dsl", version = "0.5.4", path = "../eta-dsl" }
 
 [lints]
 workspace = true

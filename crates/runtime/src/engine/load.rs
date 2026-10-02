@@ -132,6 +132,16 @@ pub fn this_box() -> Option<Platform> {
     {
         return Some(Platform::Wgpu);
     }
+    #[cfg(all(
+        not(feature = "cuda"),
+        not(all(feature = "metal", target_vendor = "apple")),
+        not(feature = "vulkan"),
+        not(feature = "wgpu"),
+        feature = "xla"
+    ))]
+    {
+        return Some(Platform::Xla);
+    }
     #[allow(unreachable_code)]
     None
 }
@@ -167,6 +177,7 @@ fn backend_of(platform: Platform) -> checkpoint::types::BackendKind {
         Platform::Metal => checkpoint::types::BackendKind::Metal,
         Platform::Vulkan => checkpoint::types::BackendKind::Vulkan,
         Platform::Wgpu => checkpoint::types::BackendKind::Wgpu,
+        Platform::Xla => checkpoint::types::BackendKind::Xla,
         Platform::Cuda => checkpoint::types::BackendKind::Cuda,
     }
 }
@@ -284,6 +295,17 @@ pub fn contract_for(
                     trace.name
                 )
             });
+    }
+    if sku.recipe.tp > 1 {
+        // an import states the whole checkpoint; the ranks of a tensor-parallel
+        // group band their shares out of a stamped artifact at load (own_contract),
+        // so a raw snapshot cannot be served at tp > 1 directly
+        return Err(format!(
+            "{:?} is a {}-rank row and {checkpoint:?} is an unconverted checkpoint: the ranks \
+             band their shares out of a stamped artifact, so convert it first (`pie model import` \
+             with the 1-rank row) and serve the artifact",
+            trace.name, sku.recipe.tp
+        ));
     }
     sku.contract(&source, trace.platform).map_err(|error| {
         format!(

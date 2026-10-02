@@ -164,7 +164,12 @@ impl Run<'_> {
                 }
                 Ok(())
             }
-            Layout::GatherRows { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
+            Layout::GatherRows { x, rows, y } => layout::gather_rows(
+                self.ctx(),
+                self.uncut(*x),
+                self.tensor(*rows),
+                self.tensor(*y),
+            ),
             Layout::Select {
                 table,
                 layer,

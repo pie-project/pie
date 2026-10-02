@@ -10,6 +10,8 @@ pub enum Flavor {
     Vulkan,
     #[cfg(feature = "wgpu")]
     Wgpu,
+    #[cfg(feature = "xla")]
+    Xla,
 }
 
 impl Flavor {
@@ -23,6 +25,8 @@ impl Flavor {
             Flavor::Vulkan => "vulkan",
             #[cfg(feature = "wgpu")]
             Flavor::Wgpu => "wgpu",
+            #[cfg(feature = "xla")]
+            Flavor::Xla => "xla",
         }
     }
 
@@ -72,6 +76,16 @@ impl Flavor {
                     Err(missing_feature_msg("wgpu", "wgpu"))
                 }
             }
+            EngineKind::Xla => {
+                #[cfg(feature = "xla")]
+                {
+                    Ok(Flavor::Xla)
+                }
+                #[cfg(not(feature = "xla"))]
+                {
+                    Err(missing_feature_msg("xla", "xla"))
+                }
+            }
         }
     }
 }
@@ -91,7 +105,8 @@ fn non_apple_msg() -> String {
     feature = "cuda",
     feature = "metal",
     feature = "vulkan",
-    feature = "wgpu"
+    feature = "wgpu",
+    feature = "xla"
 )))]
 fn missing_feature_msg(toml_type: &str, feature: &str) -> String {
     format!(
@@ -113,6 +128,7 @@ pub fn compiled_summary() -> String {
             feature = "cuda",
             feature = "vulkan",
             feature = "wgpu",
+            feature = "xla",
             all(feature = "metal", target_vendor = "apple")
         )),
         allow(unused_mut, reason = "the pushes below are feature-gated")
@@ -126,10 +142,12 @@ pub fn compiled_summary() -> String {
     out.push("vulkan");
     #[cfg(feature = "wgpu")]
     out.push("wgpu");
+    #[cfg(feature = "xla")]
+    out.push("xla");
     out.join(", ")
 }
 
-pub fn compiled_embedded() -> [(&'static str, bool); 4] {
+pub fn compiled_embedded() -> [(&'static str, bool); 5] {
     [
         ("cuda_native", cfg!(feature = "cuda")),
         (
@@ -138,6 +156,7 @@ pub fn compiled_embedded() -> [(&'static str, bool); 4] {
         ),
         ("vulkan", cfg!(feature = "vulkan")),
         ("wgpu", cfg!(feature = "wgpu")),
+        ("xla", cfg!(feature = "xla")),
     ]
 }
 
@@ -151,6 +170,8 @@ pub fn default_flavor() -> Option<Flavor> {
         runtime::engine::load::Platform::Vulkan => Some(Flavor::Vulkan),
         #[cfg(feature = "wgpu")]
         runtime::engine::load::Platform::Wgpu => Some(Flavor::Wgpu),
+        #[cfg(feature = "xla")]
+        runtime::engine::load::Platform::Xla => Some(Flavor::Xla),
         #[allow(unreachable_patterns)]
         _ => None,
     }

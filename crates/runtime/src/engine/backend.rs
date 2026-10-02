@@ -34,6 +34,7 @@ pub mod open {
         feature = "cuda",
         feature = "vulkan",
         feature = "wgpu",
+        feature = "xla",
         all(feature = "metal", target_vendor = "apple")
     ))]
     use super::{EngineBox, Result};
@@ -79,6 +80,32 @@ pub mod open {
         engine_wgpu::open(config_bytes, crate::engine::load::contract_for)
             .map(|engine| Box::new(engine) as EngineBox)
             .map_err(::anyhow::Error::msg)
+    }
+
+    #[cfg(feature = "xla")]
+    pub fn xla(config_bytes: &[u8]) -> Result<EngineBox> {
+        engine_xla::open(config_bytes, crate::engine::load::contract_for)
+            .map(|engine| engine.with_classify(|name| models::sku(name).map(|sku| sku.classify)))
+            .map(|engine| Box::new(engine) as EngineBox)
+            .map_err(::anyhow::Error::msg)
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn wgpu_on_device(
+        config_bytes: &[u8],
+        adapter: wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+    ) -> Result<EngineBox> {
+        engine_wgpu::open_with_device(
+            config_bytes,
+            crate::engine::load::contract_for,
+            adapter,
+            device,
+            queue,
+        )
+        .map(|engine| Box::new(engine) as EngineBox)
+        .map_err(::anyhow::Error::msg)
     }
 }
 

@@ -44,6 +44,29 @@ fn requests(op: &'static str, x: RaggedTensor) -> Result<u32, Error> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum StagePlanes {
+    Step,
+    Chunk,
+}
+
+impl StagePlanes {
+    const fn names(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            StagePlanes::Step => (
+                "attn.ssm_gdn_step_qk",
+                "attn.ssm_gdn_step_v",
+                "attn.ssm_gdn_step_gates",
+            ),
+            StagePlanes::Chunk => (
+                "attn.ssm_gdn_chunk_qk",
+                "attn.ssm_gdn_chunk_v",
+                "attn.ssm_gdn_chunk_gates",
+            ),
+        }
+    }
+}
+
 fn plane(ctx: &Ctx, op: &'static str, name: &'static str, elems: u64) -> Result<u64, Error> {
     let bytes = elems.checked_mul(u64::from(FLOAT)).ok_or_else(|| {
         refuse(
@@ -53,7 +76,7 @@ fn plane(ctx: &Ctx, op: &'static str, name: &'static str, elems: u64) -> Result<
     })?;
     let bytes = usize::try_from(bytes)
         .map_err(|_| refuse(op, format!("{bytes} staging bytes do not fit this host")))?;
-    Ok(ctx.scratch(op, name, bytes)? as u64)
+    Ok(ctx.scratch_shared(op, name, bytes)? as u64)
 }
 
 fn seated(
@@ -147,7 +170,17 @@ pub fn causal_conv1d(
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.ssm_causal_conv1d";
-    conv1d_update(ctx, OP, x, weight, state, conv_width, dilation, y, ConvOut::Silu)
+    conv1d_update(
+        ctx,
+        OP,
+        x,
+        weight,
+        state,
+        conv_width,
+        dilation,
+        y,
+        ConvOut::Silu,
+    )
 }
 
 pub fn short_conv(
@@ -159,7 +192,17 @@ pub fn short_conv(
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.short_conv";
-    conv1d_update(ctx, OP, x, weight, state, conv_width, 1, y, ConvOut::Residual)
+    conv1d_update(
+        ctx,
+        OP,
+        x,
+        weight,
+        state,
+        conv_width,
+        1,
+        y,
+        ConvOut::Residual,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -182,7 +225,7 @@ fn conv1d_update(
         op,
         state,
         "ssm_causal_conv1d_update_batched",
-        false,
+        true,
         false,
         false,
     )?;
@@ -227,7 +270,11 @@ fn conv1d_update(
             Launch::grid([channels.div_ceil(BLOCK), rows, 1], [BLOCK, 1, 1]),
         )
     };
-    args.push(ctx.stage());
+    args.extend([
+        state.write_state.arg(),
+        state.write_state_mask.arg(),
+        ctx.stage(),
+    ]);
     ctx.fire(op, Fire::at(FILE, entrypoint).apply(launch), &args)
 }
 
@@ -241,7 +288,17 @@ pub fn causal_conv1d_chunked(
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.ssm_causal_conv1d_chunked";
-    conv1d_chunked(ctx, OP, x, weight, state, conv_width, dilation, y, ConvOut::Silu)
+    conv1d_chunked(
+        ctx,
+        OP,
+        x,
+        weight,
+        state,
+        conv_width,
+        dilation,
+        y,
+        ConvOut::Silu,
+    )
 }
 
 pub fn short_conv_chunked(
@@ -253,7 +310,17 @@ pub fn short_conv_chunked(
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.short_conv_chunked";
-    conv1d_chunked(ctx, OP, x, weight, state, conv_width, 1, y, ConvOut::Residual)
+    conv1d_chunked(
+        ctx,
+        OP,
+        x,
+        weight,
+        state,
+        conv_width,
+        1,
+        y,
+        ConvOut::Residual,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -268,10 +335,10 @@ fn conv1d_chunked(
     y: &mut Tensor,
     out: ConvOut,
 ) -> Result<(), Error> {
-
     const CHANNEL_TILE_FROM: u32 = 8;
 
     const TILE_BLOCK: u32 = 128;
+    const CONV_TT: u32 = 32;
 
     const PER_CHANNEL_BLOCK: u32 = 64;
 
@@ -279,8 +346,32 @@ fn conv1d_chunked(
     let (channels, c, k) = conv_extents(op, x.data, y, conv_width)?;
     let dil = stated(op, nonzero(op, "the conv's dilation", dilation)?)?;
     let lanes = requests(op, x)?;
-    seated(op, state, "ssm_causal_conv1d_chunked_batched", true, true, true)?;
-    let (entrypoint, launch) = if lanes >= CHANNEL_TILE_FROM {
+    seated(
+        op,
+        state,
+        "ssm_causal_conv1d_chunked_batched",
+        true,
+        true,
+        true,
+    )?;
+    let reach = (conv_width.saturating_sub(1)).saturating_mul(dilation);
+    let row_tiled = reach <= CONV_TT;
+    let (entrypoint, launch) = if row_tiled {
+        (
+            symbol(&format!(
+                "::pie::attn::ssm_causal_conv1d_chunked_batched_row_tile{}",
+                out.args()
+            )),
+            Launch::grid(
+                [
+                    channels.div_ceil(TILE_BLOCK),
+                    x.data.rows.div_ceil(CONV_TT).max(1),
+                    1,
+                ],
+                [TILE_BLOCK, 1, 1],
+            ),
+        )
+    } else if lanes >= CHANNEL_TILE_FROM {
         (
             symbol(&format!(
                 "::pie::attn::ssm_causal_conv1d_chunked_batched_channel_tile{}",
@@ -320,6 +411,36 @@ fn conv1d_chunked(
             state.commit_len.arg(),
             state.begin_at.arg(),
             ctx.stage(),
+            stated(op, lanes)?.arg(),
+        ],
+    )?;
+    if !row_tiled || !state.write_state {
+        return Ok(());
+    }
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            symbol("::pie::attn::ssm_causal_conv1d_state_commit<::pie::bf16>"),
+        )
+        .apply(Launch::grid(
+            [channels.div_ceil(TILE_BLOCK), lanes, 1],
+            [TILE_BLOCK, 1, 1],
+        )),
+        &[
+            x.data.arg(),
+            state.conv_slab.arg(),
+            state.slot_ids.arg(),
+            x.indptr.arg(),
+            state.conv_stride.arg(),
+            c.arg(),
+            k.arg(),
+            dil.arg(),
+            state.write_state_mask.arg(),
+            state.commit_len.arg(),
+            state.begin_at.arg(),
+            ctx.stage(),
+            stated(op, lanes)?.arg(),
         ],
     )
 }
@@ -445,14 +566,16 @@ impl Delta {
         op: &'static str,
         qkv: Tensor,
         gates: Tensor,
+        planes: StagePlanes,
     ) -> Result<DeltaStaged, Error> {
         let key = self.elems(self.k_heads, self.k_dim);
         let val = self.elems(self.v_heads, self.v_dim);
         let decay = self.elems(self.v_heads, 1);
 
-        let qk = plane(ctx, op, "attn.ssm_gdn_chunk_qk", 2 * key)?;
-        let v = plane(ctx, op, "attn.ssm_gdn_chunk_v", val)?;
-        let gb = plane(ctx, op, "attn.ssm_gdn_chunk_gates", 2 * decay)?;
+        let (qk_name, v_name, gates_name) = planes.names();
+        let qk = plane(ctx, op, qk_name, 2 * key)?;
+        let v = plane(ctx, op, v_name, val)?;
+        let gb = plane(ctx, op, gates_name, 2 * decay)?;
         let staged = DeltaStaged {
             q_norm: qk,
             k_norm: qk + key * u64::from(FLOAT),
@@ -524,11 +647,18 @@ pub fn gated_delta(
     debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` reads an f32 decay row");
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
-    seated(OP, state, "ssm_gated_delta_step_batched_gqa", false, false, false)?;
+    seated(
+        OP,
+        state,
+        "ssm_gated_delta_step_batched_gqa",
+        true,
+        false,
+        false,
+    )?;
     if fused_fits(&shape, state) {
         return shape.decode_fused(ctx, OP, qkv, gates, state, y);
     }
-    let staged = shape.stage(ctx, OP, qkv, gates)?;
+    let staged = shape.stage(ctx, OP, qkv, gates, StagePlanes::Step)?;
 
     let (entrypoint, launch) = if v_dim == SMEM_ARM_WIDTH && k_dim == SMEM_ARM_WIDTH {
         (
@@ -559,6 +689,8 @@ pub fn gated_delta(
             stated(OP, v_heads)?.arg(),
             stated(OP, k_dim)?.arg(),
             stated(OP, v_dim)?.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
             ctx.stage(),
         ],
     )
@@ -609,10 +741,187 @@ impl Delta {
                 stated(op, self.v_dim)?.arg(),
                 stated(op, self.conv_dim)?.arg(),
                 q_scale.arg(),
+                state.write_state.arg(),
+                state.write_state_mask.arg(),
                 ctx.stage(),
             ],
         )
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gated_delta_chunked_fla(
+    ctx: &Ctx,
+    op: &'static str,
+    shape: &Delta,
+    staged: &DeltaStaged,
+    qkv: RaggedTensor,
+    state: &RecurrentPool,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const CH: u32 = 64;
+    const BVT: u32 = 16;
+    const BLOCK: u32 = 256;
+    let lanes = requests(op, qkv)?;
+    seated(op, state, "ssm_gdn_chunk", true, true, true)?;
+    let (k_dim, v_dim, v_heads, k_heads) = (shape.k_dim, shape.v_dim, shape.v_heads, shape.k_heads);
+    let slots = shape.n.div_ceil(CH) + lanes;
+    let padded = Delta {
+        n: shape.n + CH,
+        ..*shape
+    };
+    let per_slot = |heads: u32, width: u32| u64::from(slots) * u64::from(heads) * u64::from(width);
+    let gcum = plane(ctx, op, "attn.ssm_gdn_chunk_gcum", shape.elems(v_heads, 1))?;
+    let qb = plane_bf16(
+        ctx,
+        op,
+        "attn.ssm_gdn_chunk_qb",
+        padded.elems(k_heads, k_dim),
+    )?;
+    let kb = plane_bf16(
+        ctx,
+        op,
+        "attn.ssm_gdn_chunk_kb",
+        padded.elems(k_heads, k_dim),
+    )?;
+    let kt = plane_bf16(
+        ctx,
+        op,
+        "attn.ssm_gdn_chunk_kt",
+        per_slot(k_heads, k_dim * CH),
+    )?;
+    let w = plane_bf16(
+        ctx,
+        op,
+        "attn.ssm_gdn_chunk_w",
+        padded.elems(v_heads, k_dim),
+    )?;
+    let u = plane_bf16(
+        ctx,
+        op,
+        "attn.ssm_gdn_chunk_u",
+        padded.elems(v_heads, v_dim),
+    )?;
+    let vnt = plane_bf16(
+        ctx,
+        op,
+        "attn.ssm_gdn_chunk_vnt",
+        per_slot(v_heads, v_dim * CH),
+    )?;
+    let hct = plane_bf16(
+        ctx,
+        op,
+        "attn.ssm_gdn_chunk_hct",
+        per_slot(v_heads, v_dim * k_dim),
+    )?;
+    let wu_smem = CH * CH * FLOAT + CH * k_dim * 2 + CH * CH * 2 + 4 * CH * FLOAT;
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::attn::ssm_gdn_chunk_wu<128, 128>")
+            .apply(Launch::grid([slots, v_heads, 1], [BLOCK, 1, 1]).smem(wu_smem)),
+        &[
+            ArgValue::Ptr(staged.q_norm),
+            ArgValue::Ptr(staged.k_norm),
+            ArgValue::Ptr(staged.v),
+            ArgValue::Ptr(staged.g_log),
+            ArgValue::Ptr(staged.beta),
+            state.slot_ids.arg(),
+            qkv.indptr.arg(),
+            state.commit_len.arg(),
+            state.begin_at.arg(),
+            ArgValue::Ptr(gcum),
+            ArgValue::Ptr(qb),
+            ArgValue::Ptr(kb),
+            ArgValue::Ptr(kt),
+            ArgValue::Ptr(w),
+            ArgValue::Ptr(u),
+            stated(op, lanes)?.arg(),
+            stated(op, k_heads)?.arg(),
+            stated(op, v_heads)?.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            "::pie::attn::ssm_gdn_chunk_h<::pie::attn::state_bf16, 128, 128, 16>",
+        )
+        .apply(Launch::grid(
+            [lanes * v_heads * (v_dim / BVT), 1, 1],
+            [BLOCK, 1, 1],
+        )),
+        &[
+            ArgValue::Ptr(gcum),
+            ArgValue::Ptr(kt),
+            ArgValue::Ptr(w),
+            ArgValue::Ptr(u),
+            ArgValue::Ptr(vnt),
+            ArgValue::Ptr(hct),
+            state.slab.arg(),
+            state.slot_ids.arg(),
+            qkv.indptr.arg(),
+            state.slot_stride_elems.arg(),
+            state.commit_len.arg(),
+            state.begin_at.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            stated(op, lanes)?.arg(),
+            stated(op, k_heads)?.arg(),
+            stated(op, v_heads)?.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::attn::ssm_gdn_chunk_o<128, 128, 16>")
+            .apply(Launch::grid([slots, v_heads, 1], [BLOCK, 1, 1])),
+        &[
+            ArgValue::Ptr(gcum),
+            ArgValue::Ptr(qb),
+            ArgValue::Ptr(kb),
+            ArgValue::Ptr(vnt),
+            ArgValue::Ptr(hct),
+            state.slot_ids.arg(),
+            qkv.indptr.arg(),
+            state.commit_len.arg(),
+            state.begin_at.arg(),
+            y.arg(),
+            stated(op, lanes)?.arg(),
+            stated(op, k_heads)?.arg(),
+            stated(op, v_heads)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+fn plane_bf16(ctx: &Ctx, op: &'static str, name: &'static str, elems: u64) -> Result<u64, Error> {
+    let bytes = usize::try_from(elems.saturating_mul(2))
+        .map_err(|_| refuse(op, format!("{elems} bf16 elements do not fit this host")))?;
+    Ok(ctx.scratch_shared(op, name, bytes)? as u64)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_chunked_serial(
+    ctx: &Ctx,
+    qkv: RaggedTensor,
+    z: Tensor,
+    gates: Tensor,
+    state: &RecurrentPool,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    SERIAL_SCAN.with(|flag| flag.set(true));
+    let out = gated_delta_chunked(ctx, qkv, z, gates, state, k_heads, v_heads, k_dim, v_dim, y);
+    SERIAL_SCAN.with(|flag| flag.set(false));
+    out
+}
+
+thread_local! {
+    static SERIAL_SCAN: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -644,10 +953,19 @@ pub fn gated_delta_chunked(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv.data, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let lanes = requests(OP, qkv)?;
-    let staged = shape.stage(ctx, OP, qkv.data, gates)?;
-
+    let staged = shape.stage(ctx, OP, qkv.data, gates, StagePlanes::Chunk)?;
+    if k_dim == BK_MAX_FLA && v_dim == BV_FLA && !SERIAL_SCAN.with(core::cell::Cell::get) {
+        return gated_delta_chunked_fla(ctx, OP, &shape, &staged, qkv, state, y);
+    }
     if k_dim <= BK_MAX_FLA && v_dim.is_multiple_of(BV_FLA) {
-        seated(OP, state, "ssm_gated_delta_chunked_batched_fla", true, true, true)?;
+        seated(
+            OP,
+            state,
+            "ssm_gated_delta_chunked_batched_fla",
+            true,
+            true,
+            true,
+        )?;
         return ctx.fire(
             OP,
             Fire::at(
@@ -724,7 +1042,14 @@ pub fn gated_delta_chunked(
         );
     }
 
-    seated(OP, state, "ssm_gated_delta_chunked_batched", false, false, false)?;
+    seated(
+        OP,
+        state,
+        "ssm_gated_delta_chunked_batched",
+        false,
+        false,
+        false,
+    )?;
     let (q_norm, k_norm) = if v_heads == k_heads {
         (staged.q_norm, staged.k_norm)
     } else {
@@ -734,8 +1059,11 @@ pub fn gated_delta_chunked(
         for (src, dst) in [(staged.q_norm, q), (staged.k_norm, k)] {
             ctx.fire(
                 OP,
-                Fire::at(FILE, "::pie::attn::repeat_interleave_heads_fp32<::pie::attn::f32>")
-                    .apply(Launch::grid([shape.n, v_heads, 1], [BLOCK, 1, 1])),
+                Fire::at(
+                    FILE,
+                    "::pie::attn::repeat_interleave_heads_fp32<::pie::attn::f32>",
+                )
+                .apply(Launch::grid([shape.n, v_heads, 1], [BLOCK, 1, 1])),
                 &[
                     ArgValue::Ptr(src),
                     ArgValue::Ptr(dst),
@@ -834,6 +1162,29 @@ impl Kda {
             head_dim,
             width,
         })
+    }
+
+    /// The scan walks each head's `D x D` state in place, so a fire in which
+    /// some row may not fold its boundary (no fold asked, or a predicate
+    /// naming the lanes that do) gets a working copy per row and head; a
+    /// fire that folds everywhere walks the slots themselves.
+    fn work(
+        self,
+        ctx: &Ctx,
+        op: &'static str,
+        state: &RecurrentPool,
+        rows: u32,
+    ) -> Result<u64, Error> {
+        if state.write_state && state.write_state_mask.is_absent() {
+            return Ok(0);
+        }
+        let cells = u64::from(self.head_dim) * u64::from(self.head_dim);
+        plane(
+            ctx,
+            op,
+            "attn.ssm_kda_work",
+            u64::from(rows) * u64::from(self.heads) * cells,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -941,8 +1292,9 @@ pub fn kda_step(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Kda::of(OP, mixed, f, b, y, heads, head_dim)?;
     f32_state(OP, state)?;
-    seated(OP, state, "ssm_kda_step_batched", false, false, false)?;
+    seated(OP, state, "ssm_kda_step_batched", true, false, false)?;
     let staged = shape.stage(ctx, OP, mixed, f, b, dt_bias, a_log, norm_eps, gate_floor)?;
+    let work = shape.work(ctx, OP, state, shape.n)?;
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::attn::ssm_kda_step_batched").apply(
@@ -961,6 +1313,9 @@ pub fn kda_step(
             y.arg(),
             stated(OP, shape.heads)?.arg(),
             stated(OP, shape.head_dim)?.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            ArgValue::Ptr(work),
             ctx.stage(),
         ],
     )
@@ -992,8 +1347,11 @@ pub fn kda_chunked(
     let shape = Kda::of(OP, mixed.data, f, b, y, heads, head_dim)?;
     let lanes = requests(OP, mixed)?;
     f32_state(OP, state)?;
-    seated(OP, state, "ssm_kda_chunked_batched", false, false, false)?;
-    let staged = shape.stage(ctx, OP, mixed.data, f, b, dt_bias, a_log, norm_eps, gate_floor)?;
+    seated(OP, state, "ssm_kda_chunked_batched", true, true, true)?;
+    let staged = shape.stage(
+        ctx, OP, mixed.data, f, b, dt_bias, a_log, norm_eps, gate_floor,
+    )?;
+    let work = shape.work(ctx, OP, state, lanes)?;
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::attn::ssm_kda_chunked_batched").apply(
@@ -1016,6 +1374,11 @@ pub fn kda_chunked(
             y.arg(),
             stated(OP, shape.heads)?.arg(),
             stated(OP, shape.head_dim)?.arg(),
+            state.write_state.arg(),
+            state.commit_len.arg(),
+            state.write_state_mask.arg(),
+            state.begin_at.arg(),
+            ArgValue::Ptr(work),
             ctx.stage(),
         ],
     )

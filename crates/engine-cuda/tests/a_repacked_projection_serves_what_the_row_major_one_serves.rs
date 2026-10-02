@@ -239,8 +239,8 @@ fn affine_tensor(writer: &mut ztensor::Writer, name: &str, rows: usize, arm: Arm
     assert_eq!(codes.len(), stated * HIDDEN as usize / 2);
     assert_eq!(scales.len(), stated * groups * 2);
 
-    let term = ztensor::Term::parse(&format!("g{GROUP}_u4_bf16_b_bf16"))
-        .expect("the affine term parses");
+    let term =
+        ztensor::Term::parse(&format!("g{GROUP}_u4_bf16_b_bf16")).expect("the affine term parses");
     let shape = vec![stated as u64, HIDDEN];
     let blob = canonical_blob(&term, &shape, [&codes, &scales, &biases]);
     writer
@@ -261,7 +261,9 @@ fn affine_tensor(writer: &mut ztensor::Writer, name: &str, rows: usize, arm: Arm
 fn canonical_blob(term: &ztensor::Term, shape: &[u64], planes: [&Vec<u8>; 3]) -> Vec<u8> {
     let laid = term.planes(shape).expect("the term lays out this shape");
     assert_eq!(laid.len(), planes.len());
-    let total = term.canonical_size(shape).expect("the term sizes this shape");
+    let total = term
+        .canonical_size(shape)
+        .expect("the term sizes this shape");
     let mut blob = vec![0u8; total as usize];
     for (plane, bytes) in laid.iter().zip(planes) {
         assert_eq!(plane.len as usize, bytes.len(), "plane `{}`", plane.path);

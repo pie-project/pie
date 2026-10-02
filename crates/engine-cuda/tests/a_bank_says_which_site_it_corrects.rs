@@ -138,7 +138,10 @@ fn a_site_the_shell_cannot_serve_is_refused_by_name() {
         .planes("typo", &sited())
         .expect_err("`mixer` is not a site");
     let said = why.to_string();
-    assert!(said.contains("mixer"), "names the word it was given: {said}");
+    assert!(
+        said.contains("mixer"),
+        "names the word it was given: {said}"
+    );
     assert!(said.contains("`gate_up`"), "and the vocabulary: {said}");
 
     write_adapter(&mount, "elsewhere", 2, Some("q"));
@@ -146,7 +149,10 @@ fn a_site_the_shell_cannot_serve_is_refused_by_name() {
         .planes("elsewhere", &sited())
         .expect_err("`q` is not a site these banks correct");
     let said = why.to_string();
-    assert!(said.contains("site `q`"), "names the site asked for: {said}");
+    assert!(
+        said.contains("site `q`"),
+        "names the site asked for: {said}"
+    );
     assert!(
         said.contains("layer.0.o.lora_a"),
         "and the banks this load declares: {said}"

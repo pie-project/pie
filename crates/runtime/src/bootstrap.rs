@@ -1,17 +1,23 @@
-use anyhow::{Context, Result, ensure};
+#[cfg(not(target_arch = "wasm32"))]
+use anyhow::Context;
+use anyhow::{Result, ensure};
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(not(target_arch = "wasm32"))]
 use tracing_subscriber::layer::SubscriberExt;
+#[cfg(not(target_arch = "wasm32"))]
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::engine;
 use crate::inferlet::sandbox::{FsPolicy, NetworkPolicy};
-use crate::inferlet::{linker, process, program, python};
+use crate::inferlet::{linker, process, program};
 use crate::model::{self, ModelMetadata};
 use crate::server;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::telemetry;
 
 static RUNTIME_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -61,15 +67,24 @@ pub struct Config {
     pub host: String,
     pub port: u16,
     pub cache_dir: PathBuf,
+    /// The built-in inferlets: registered at boot beside whatever
+    /// `cache_dir` holds, each shadowed by a copy of its own name and
+    /// version installed there.
+    pub builtin_programs: Vec<BuiltinProgram>,
     pub verbose: bool,
     pub log_dir: Option<PathBuf>,
-    pub registry_url: String,
     pub telemetry: TelemetryConfig,
     pub runtime: RuntimeConfig,
     pub model: ModelConfig,
     pub skip_tracing: bool,
     pub max_concurrent_processes: Option<usize>,
-    pub python_snapshot: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BuiltinProgram {
+    pub name: &'static str,
+    pub version: &'static str,
+    pub component: &'static [u8],
 }
 
 #[derive(Debug, Clone)]
@@ -88,7 +103,11 @@ pub struct RuntimeConfig {
     pub network_allowed_hosts: Vec<String>,
 
     pub max_upload_mb: usize,
-    pub py_runtime_dir: PathBuf,
+    /// Where the `<language>.wasm` language components live.
+    pub languages_dir: PathBuf,
+    /// Where wasmtime caches compiled code across boots; `None` compiles
+    /// every component on every boot.
+    pub compile_cache_dir: Option<PathBuf>,
 }
 
 pub struct ModelConfig {
@@ -103,12 +122,17 @@ pub struct ModelConfig {
 
 pub struct EngineConfig {
     pub total_pages: usize,
+    pub window_pages: u32,
+    pub window_tokens: u32,
     pub cpu_pages: usize,
+    pub cpu_window_pages: u32,
+    pub disk_pages: u32,
     pub kv_copy: ::engine::caps::KvCopyDomains,
     pub backend_kind: String,
     pub rs_cache_required: bool,
     pub rs_cache_slots: usize,
     pub rs_cache_slot_bytes: u64,
+    pub rs_host_slots: usize,
     pub has_mtp_logits: bool,
     pub mtp_depth: u32,
     pub draft_block: u32,
@@ -127,7 +151,6 @@ pub struct EngineConfig {
 
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
-    pub request_timeout_secs: u64,
     pub submit_deadline_us: u64,
     pub silence_timeout_secs: u64,
     pub frame_size: u32,
@@ -161,6 +184,7 @@ pub async fn bootstrap(config: Config) -> Result<BootstrapHandle> {
     bootstrap_inner(config).await
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn bootstrap_with_listener(
     config: Config,
     _listener: tokio::net::TcpListener,
@@ -177,17 +201,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     }
     let wasm_engine = init_wasmtime(&config.runtime);
 
-    python::runtime::init(
-        &wasm_engine,
-        &config.runtime.py_runtime_dir,
-        config.python_snapshot,
-    );
-
     program::spawn(
         &wasm_engine,
-        config.registry_url.clone(),
         config.cache_dir.clone(),
-    );
+        config.runtime.languages_dir.clone(),
+        &config.builtin_programs,
+    )?;
 
     let fs_policy = FsPolicy {
         allow: config.runtime.allow_fs,
@@ -252,12 +271,16 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 
     let rs_caps = {
         let d0 = engine_configs.first();
-        let is_rs = d0.map(|d| d.rs_cache_slots > 0).unwrap_or(false);
-        model::RsCaps {
+        let mut caps = model::RsCaps {
             state_size: d0.map(|d| d.rs_cache_slot_bytes).unwrap_or(0),
-            buffer_page_size: if is_rs { kv_page_size as u32 } else { 0 },
+            buffer_page_size: 0,
             fold_granularity: 1,
+            window_tokens: d0.map_or(0, |d| d.window_tokens),
+        };
+        if caps.has_state() {
+            caps.buffer_page_size = kv_page_size as u32;
         }
+        caps
     };
     let eta_caps = model::EtaCaps {
         has_lora: !engine_configs.is_empty() && engine_configs.iter().all(|d| d.has_lora),
@@ -296,14 +319,24 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 
     let arena_kv_pages: Vec<usize> = engine_configs.iter().map(|d| d.total_pages).collect();
     let arena_cpu_pages: Vec<usize> = engine_configs.iter().map(|d| d.cpu_pages).collect();
-    let arena_rs_slots: Vec<usize> = engine_configs.iter().map(|d| d.rs_cache_slots).collect();
+    let arena_disk_pages: Vec<u32> = engine_configs.iter().map(|d| d.disk_pages).collect();
+    let arena_state: Vec<crate::store::registry::StatePool> = engine_configs
+        .iter()
+        .map(|d| crate::store::registry::StatePool {
+            slots: d.rs_cache_slots as u32,
+            host_slots: d.rs_host_slots as u32,
+            window_tokens: d.window_tokens,
+            window_pages: d.window_pages,
+            host_window_pages: d.cpu_window_pages,
+        })
+        .collect();
     let arena_max_context: Vec<usize> = engine_configs
         .iter()
         .map(|d| d.limits.max_context)
         .collect();
     let kv_swap_capable = engine_configs
         .first()
-        .is_some_and(|d| d.kv_copy.device_to_host && d.kv_copy.host_to_device);
+        .is_some_and(|d| d.cpu_pages > 0 || d.disk_pages > 0);
     let engine_count = engine_configs.len();
     let engines: Vec<usize> = engine_configs
         .into_iter()
@@ -325,7 +358,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         kv_page_size as u32,
         &arena_kv_pages,
         &arena_cpu_pages,
-        &arena_rs_slots,
+        &arena_disk_pages,
+        &arena_state,
         &arena_max_context,
     );
 
@@ -342,8 +376,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .filter(|ms| *ms > 0)
         && let Some(planner) = crate::planner::planner_for(arena_model_idx, 0)
     {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(period));
+        crate::rt::spawn(async move {
+            let mut interval = crate::rt::time::interval(std::time::Duration::from_millis(period));
             loop {
                 interval.tick().await;
                 let d = planner.diagnostics();
@@ -359,7 +393,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                      hogs={} starved={} restarted={} salvaged={} swapfull={}/{} e6_relax={} rshort={} \
                      runway={}/{} \
                      lock_n={} lock_wait_ms={} lock_hold_ms={} lock_wmax_us={} lock_hmax_us={} \
-                     d2h_pages={} h2d_pages={} d2h_ms={} h2d_ms={} \
+                     d2h_pages={} h2d_pages={} d2h_rs={} h2d_rs={} d2h_ms={} h2d_ms={} \
+                     disk_free={}/{} disk_w_pages={} disk_r_pages={} disk_w_ms={} disk_r_ms={} \
                      resident={} evicting={} evicted={} restoring={} admitted={} \
                      runners=[{}]",
                     d.queue.len(),
@@ -401,8 +436,16 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     lk_hmax,
                     d.d2h_pages_total,
                     d.h2d_pages_total,
+                    d.d2h_rs_slots_total,
+                    d.h2d_rs_slots_total,
                     d.d2h_copy_us_total / 1000,
                     d.h2d_copy_us_total / 1000,
+                    d.disk_slots_free,
+                    d.disk_slots_total,
+                    d.disk_write_pages_total,
+                    d.disk_read_pages_total,
+                    d.disk_write_us_total / 1000,
+                    d.disk_read_us_total / 1000,
                     d.proc_states[0],
                     d.proc_states[1],
                     d.proc_states[2],
@@ -427,12 +470,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     ));
     crate::scheduler::set_frame_size(scheduler.frame_size as usize);
     crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
-    let scheduler_shutdown = crate::scheduler::spawn(
-        &engines,
-        kv_page_size as u32,
-        scheduler.request_timeout_secs,
-    )
-    .await?;
+    let scheduler_shutdown = crate::scheduler::spawn(&engines, kv_page_size as u32).await?;
     active_guard.disarm();
     Ok(BootstrapHandle {
         port: bound_port,
@@ -445,6 +483,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 }
 
 fn verify_config(config: &Config) -> Result<()> {
+    #[cfg(not(target_arch = "wasm32"))]
     fs::create_dir_all(&config.cache_dir)
         .with_context(|| format!("Could not create cache dir: {:?}", config.cache_dir))?;
 
@@ -480,10 +519,34 @@ fn verify_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 const CORE_RESOURCES_PER_COMPONENT: u32 = 16;
 
+#[cfg(target_arch = "wasm32")]
+fn init_wasmtime(_runtime: &RuntimeConfig) -> wasmtime::Engine {
+    let mut wasm_config = wasmtime::Config::default();
+    wasmtime_web::configure(&mut wasm_config).expect("configure wasmtime for the browser");
+    wasm_config.wasm_component_model_async(true);
+    wasmtime::Engine::new(&wasm_config).unwrap()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     let mut wasm_config = wasmtime::Config::default();
+
+    if let Some(dir) = &runtime.compile_cache_dir {
+        let mut cache_config = wasmtime::CacheConfig::new();
+        cache_config.with_directory(dir);
+        match wasmtime::Cache::new(cache_config) {
+            Ok(cache) => {
+                wasm_config.cache(Some(cache));
+            }
+            Err(error) => tracing::warn!(
+                "compile cache at {} unavailable, every component compiles on this boot: {error:#}",
+                dir.display()
+            ),
+        }
+    }
 
     let mut pooling_config = wasmtime::PoolingAllocationConfig::default();
     pooling_config.total_component_instances(runtime.wasm_max_instances);
@@ -513,6 +576,16 @@ fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     wasmtime::Engine::new(&wasm_config).unwrap()
 }
 
+#[cfg(target_arch = "wasm32")]
+fn init_tracing(
+    _log_dir: &Option<PathBuf>,
+    _verbose: bool,
+    _telemetry_config: &TelemetryConfig,
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn init_tracing(
     log_dir: &Option<PathBuf>,
     verbose: bool,
@@ -537,7 +610,6 @@ fn init_tracing(
     } else {
         None
     };
-
     let otel_layer = if telemetry_config.enabled {
         telemetry::init_otel_layer(&telemetry_config.endpoint, &telemetry_config.service_name)
     } else {

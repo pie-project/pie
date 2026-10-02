@@ -49,6 +49,7 @@ fn current_device() -> i32 {
 struct Call {
     act: u64,
     w: u64,
+    bias: u64,
     y: u64,
     m: i32,
     n: i32,
@@ -86,17 +87,26 @@ pub(crate) fn act_x_wt(
     op: &'static str,
     act: u64,
     w: u64,
+    bias: u64,
     y: u64,
     m: i32,
     n: i32,
     k: i32,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     if m <= 0 || n <= 0 || k <= 0 {
-        return Ok(());
+        return Ok(false);
     }
     let handle: cublasHandle_t = ctx.cublas(op)?.cast::<cublasContext>();
     let stream = ctx.stream();
-    let call = Call { act, w, y, m, n, k };
+    let call = Call {
+        act,
+        w,
+        bias,
+        y,
+        m,
+        n,
+        k,
+    };
     let capturing = capture_status(stream);
     let (plan, tactic, lt_handle, want) = with_device(|device| {
         let plan = device.plan_for(call);
@@ -104,7 +114,7 @@ pub(crate) fn act_x_wt(
             .and_then(|status| device.tactic_for(handle, stream, plan.as_deref(), call, status));
         (plan, tactic, device.lt.handle, device.lt.workspace_bytes)
     });
-    let (ws, ws_bytes) = match ctx.scratch(op, LT_WORKSPACE, want) {
+    let (ws, ws_bytes) = match ctx.scratch_shared(op, LT_WORKSPACE, want) {
         Ok(ws) if !ws.is_null() => (ws, want),
         _ => (std::ptr::null_mut(), 0),
     };
@@ -125,12 +135,12 @@ pub(crate) fn act_x_wt(
             ws_bytes,
         )
     {
-        return Ok(());
+        return Ok(tactic == Tactic::Gemv && bias != 0);
     }
     clear_error();
 
-    if m == 1 && gemv_bf16(&unsafe { Ctx::on(stream) }, w, act, y, n, k).is_ok() {
-        return Ok(());
+    if m == 1 && gemv_bf16(&unsafe { Ctx::on(stream) }, w, act, bias, y, n, k).is_ok() {
+        return Ok(bias != 0);
     }
     if gemm_ex(
         handle,
@@ -138,11 +148,11 @@ pub(crate) fn act_x_wt(
         cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
     ) == cublasStatus_t::CUBLAS_STATUS_SUCCESS
     {
-        return Ok(());
+        return Ok(false);
     }
     let status = gemm_ex(handle, call, cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT);
     if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-        return Ok(());
+        return Ok(false);
     }
     if let Some(plan) = plan {
         for heuristic in &plan.heuristics {
@@ -155,7 +165,7 @@ pub(crate) fn act_x_wt(
                 ws,
                 ws_bytes,
             ) {
-                return Ok(());
+                return Ok(false);
             }
         }
     }
@@ -185,6 +195,7 @@ fn run_tactic(
                     &unsafe { Ctx::on(stream) },
                     call.w,
                     call.act,
+                    call.bias,
                     call.y,
                     call.n,
                     call.k,
@@ -544,7 +555,13 @@ impl Device {
         if let Some(plan) = self.plans.get(&(m, n, k)) {
             return Some(Arc::clone(plan));
         }
-        let plan = Arc::new(build_lt_plan(self.lt.handle, self.lt.workspace_bytes, m, n, k)?);
+        let plan = Arc::new(build_lt_plan(
+            self.lt.handle,
+            self.lt.workspace_bytes,
+            m,
+            n,
+            k,
+        )?);
         self.plans.insert((m, n, k), Arc::clone(&plan));
         Some(plan)
     }
@@ -775,6 +792,7 @@ impl TuneArena {
     ) -> Option<f32> {
         let bench = Call {
             act: self.act.addr() as u64,
+            bias: 0,
             y: self.y.addr() as u64,
             ..call
         };
@@ -804,9 +822,12 @@ impl TuneArena {
         let mut graph: cudaGraph_t = std::ptr::null_mut();
         let mut exec: cudaGraphExec_t = std::ptr::null_mut();
         let captured = unsafe {
-            cudaStreamBeginCapture(stream, cudaStreamCaptureMode::cudaStreamCaptureModeThreadLocal)
-                == cudaError::cudaSuccess
-                && cudaMemsetAsync(self.flush, 0, self.flush_bytes, stream) == cudaError::cudaSuccess
+            cudaStreamBeginCapture(
+                stream,
+                cudaStreamCaptureMode::cudaStreamCaptureModeThreadLocal,
+            ) == cudaError::cudaSuccess
+                && cudaMemsetAsync(self.flush, 0, self.flush_bytes, stream)
+                    == cudaError::cudaSuccess
                 && cudaEventRecordWithFlags(self.start, stream, cudaEventRecordExternal)
                     == cudaError::cudaSuccess
                 && fire()

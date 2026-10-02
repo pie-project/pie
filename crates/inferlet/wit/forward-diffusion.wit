@@ -148,6 +148,16 @@ interface forward-diffusion {
         /// no velocity refuses the whole program at bind.
         peer: func(group: u32) -> result<_, error>;
 
+        /// A structured attention mask over this pass's rows, applied to the
+        /// reading's group-packed attention: `classes` names one class in
+        /// `0..count` per row (or -1: the row attends, and is attended by,
+        /// every row); `table[q * count + kv]` non-zero lets a q-class row
+        /// attend a kv-class row. `count` is at most 64. Every lane of one
+        /// attention group states the same table; rows of lanes that state
+        /// nothing are class -1. Regional prompting, attention coupling and
+        /// cross-frame restriction are all one table. Set before `program`.
+        attention-classes: func(classes: list<s32>, table: list<u8>, count: u32) -> result<_, error>;
+
         /// The reading. REQUIRED: a diffusion pass with no mode is not
         /// submittable, because neither reading is a default the host may
         /// pick for the guest. Set before `program`; a pass keeps one mode

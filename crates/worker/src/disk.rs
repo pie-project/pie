@@ -4,6 +4,15 @@ pub fn engine_cache_dir() -> PathBuf {
     bootstrap::paths::pie_home().join("cache")
 }
 
+/// Where a load's kv slot files live when the config names no path: one
+/// directory per checkpoint digest, so no two models share one.
+pub fn kv_dir(snapshot_dir: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let digest = crate::weights::model_artifact_digest(snapshot_dir)?;
+    Ok(engine_cache_dir()
+        .join("kv")
+        .join(blake3::Hash::from(digest).to_hex().as_str()))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reclaim {
     Safe,
@@ -33,18 +42,19 @@ pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
             keep: &[],
         },
         Entry {
-            name: "programs",
-            path: home.join("programs"),
-            what: "Inferlet programs fetched from the registry. Re-fetched on \
-                   demand.",
+            name: "inferlets",
+            path: bootstrap::paths::inferlets_dir(),
+            what: "Installed inferlets. Deleting one means `pie inferlet \
+                   install` again; the built-in ones need no install.",
             reclaim: Reclaim::Safe,
             keep: &[],
         },
         Entry {
-            name: "py-runtime",
-            path: home.join("py-runtime"),
-            what: "The embedded Python-WASM runtime. Re-provisioned by the \
-                   next `pie serve`.",
+            name: "languages",
+            path: bootstrap::paths::languages_dir(),
+            what: "The language components script inferlets run under \
+                   (`python.wasm`, `javascript.wasm`). `pie language install` \
+                   puts one back from a release archive.",
             reclaim: Reclaim::Safe,
             keep: &[],
         },

@@ -170,6 +170,27 @@ pub struct FireRows {
     pub readouts: u64,
 }
 
+pub const READOUTS_PER_LANE: u64 = 16;
+
+/// A readout plane whose row is at most this wide (a velocity or hidden
+/// export) is carved for every token; a wider one (vocab-wide logits) for
+/// `READOUTS_PER_LANE` rows a lane.
+pub const NARROW_READOUT_ROW_BYTES: u64 = 64 << 10;
+
+#[must_use]
+pub fn readouts_ceiling(budget: &crate::Budget) -> u64 {
+    (u64::from(budget.max_lanes) * READOUTS_PER_LANE).min(u64::from(budget.max_tokens))
+}
+
+#[must_use]
+pub fn readout_rows(width: u64, elem: u64, budget: &crate::Budget) -> u64 {
+    if width.saturating_mul(elem) <= NARROW_READOUT_ROW_BYTES {
+        u64::from(budget.max_tokens)
+    } else {
+        readouts_ceiling(budget)
+    }
+}
+
 impl FireRows {
     #[must_use]
     pub fn text_only(tokens: u64, lanes: u64) -> FireRows {
@@ -193,7 +214,7 @@ impl FireRows {
             images: u64::from(budgets.max_images()),
             voxels: u64::from(budgets.max_voxels()),
             clips: u64::from(budgets.max_clips()),
-            readouts: u64::from(budgets.tokens.max_tokens),
+            readouts: readouts_ceiling(&budgets.tokens),
         }
     }
 }
@@ -336,6 +357,8 @@ pub struct ArenaMap {
     pub bytes: u64,
 }
 
+pub type LiveSlot = (ValueId, Span, u64, u64);
+
 impl ArenaMap {
     #[must_use]
     pub fn root(&self, value: ValueId) -> ValueId {
@@ -460,7 +483,67 @@ impl ArenaMap {
         most
     }
 
-    fn live(&self) -> Vec<(ValueId, Span, u64, u64)> {
+    /// The rows one fire may read out through `value`'s plane.
+    #[must_use]
+    pub fn readout_ceiling_of(&self, value: ValueId) -> Option<u64> {
+        match self.placements.get(self.root(value).0 as usize)? {
+            Placement::Arena {
+                bytes,
+                rows: RowExpr::Readouts,
+                width,
+                dtype,
+                ..
+            } => Some(bytes / width.saturating_mul(elem_bytes(*dtype)?).max(1)),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn prefix_for(&self, readouts: u64) -> u64 {
+        self.placements
+            .iter()
+            .map(|slot| match slot {
+                Placement::Arena {
+                    offset,
+                    bytes,
+                    rows: RowExpr::Readouts,
+                    width,
+                    dtype,
+                } => {
+                    let used = readouts
+                        .saturating_mul(*width)
+                        .saturating_mul(elem_bytes(*dtype).unwrap_or(0));
+                    offset + used.min(*bytes)
+                }
+                Placement::Arena { offset, bytes, .. } => offset + bytes,
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[must_use]
+    pub fn peak(&self) -> (u32, Vec<LiveSlot>) {
+        let live = self.live();
+        let end = live.iter().map(|(_, s, _, _)| s.last).max().unwrap_or(0);
+        let mut best: (u32, u64, Vec<LiveSlot>) = (0, 0, Vec::new());
+        for at in 0..=end {
+            let here: Vec<LiveSlot> = live
+                .iter()
+                .filter(|(_, span, _, _)| span.first <= at && at <= span.last)
+                .copied()
+                .collect();
+            let total: u64 = here.iter().map(|(_, _, _, bytes)| align(*bytes)).sum();
+            if total > best.1 {
+                best = (at, total, here);
+            }
+        }
+        let mut slots = best.2;
+        slots.sort_by_key(|slot| core::cmp::Reverse(slot.3));
+        (best.0, slots)
+    }
+
+    fn live(&self) -> Vec<LiveSlot> {
         self.placements
             .iter()
             .enumerate()
@@ -527,10 +610,13 @@ fn rectangles(trace: &Trace, budgets: &Budgets) -> Result<Vec<Placement>, Error>
                             value,
                             why: Unrectangled::PackedElement,
                         })?;
+                        let carved = match rows {
+                            RowExpr::Readouts => readout_rows(width, elem, &budgets.tokens),
+                            _ => rows.max(budgets),
+                        };
                         Ok(Placement::Arena {
                             offset: 0,
-                            bytes: rows
-                                .max(budgets)
+                            bytes: carved
                                 .checked_mul(width)
                                 .and_then(|bytes| bytes.checked_mul(elem))
                                 .ok_or(Error::Unrectangled {
@@ -871,8 +957,19 @@ fn place(
             (align(slot.bytes()), span, id)
         })
         .collect();
+    let reads_out = |id: usize| {
+        matches!(
+            placements[id],
+            Placement::Arena {
+                rows: RowExpr::Readouts,
+                ..
+            }
+        )
+    };
     order.sort_by(|a, b| {
-        b.0.cmp(&a.0)
+        reads_out(a.2)
+            .cmp(&reads_out(b.2))
+            .then(b.0.cmp(&a.0))
             .then(a.1.first.cmp(&b.1.first))
             .then(a.2.cmp(&b.2))
     });

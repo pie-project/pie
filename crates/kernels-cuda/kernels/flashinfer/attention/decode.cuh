@@ -1,18 +1,5 @@
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 #ifndef FLASHINFER_DECODE_CUH_
 #define FLASHINFER_DECODE_CUH_
 #include <cooperative_groups.h>
@@ -20,7 +7,6 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
-
 
 #include "../cp_async.cuh"
 #include "../math.cuh"
@@ -39,23 +25,6 @@ using cp_async::PrefetchMode;
 using cp_async::SharedMemFillMode;
 
 namespace {
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 template <PosEncodingMode pos_encoding_mode, uint32_t vec_size, uint32_t bdx, uint32_t tile_size,
           typename AttentionVariant, typename Params, typename T>
@@ -113,18 +82,6 @@ __device__ __forceinline__ void compute_qk(
   }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
 template <uint32_t vec_size, uint32_t bdx, uint32_t tile_size, typename T>
 __device__ __forceinline__ void update_local_state(const T* smem, const float* s,
                                                    uint32_t compute_stage_idx,
@@ -139,14 +96,6 @@ __device__ __forceinline__ void update_local_state(const T* smem, const float* s
     }
   }
 }
-
-
-
-
-
-
-
-
 
 template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant>
 __device__ __forceinline__ void sync_state(AttentionVariant variant, state_t<vec_size>& st,
@@ -185,26 +134,6 @@ __device__ __forceinline__ void sync_state(AttentionVariant variant, state_t<vec
 }
 
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 template <PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
           uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
@@ -356,28 +285,6 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
   }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
           uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
           typename Params>
@@ -414,6 +321,16 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   const uint32_t chunk_start = partition_kv ? kv_tile_idx * max_chunk_size : 0;
   const uint32_t chunk_end =
       partition_kv ? min((kv_tile_idx + 1) * max_chunk_size, kv_len) : kv_len;
+  if (partition_kv && chunk_start >= kv_len) {
+    if (tz == 0) {
+      state_t<vec_size> empty;
+      empty.o.cast_store(o + (bx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
+      if (lse != nullptr) {
+        lse[bx * num_qo_heads + qo_head_idx] = empty.get_lse();
+      }
+    }
+    return;
+  }
   const uint32_t chunk_size = chunk_end - chunk_start;
 
   AttentionVariant variant(params, batch_idx, smem);
@@ -601,10 +518,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params
                                     bdx, bdy, bdz, AttentionVariant>(params, smem);
 }
 
-
-
-
-
 constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeof_dtype) {
   if (group_size == 8U) {
     if (sizeof_dtype == 1U) {
@@ -616,7 +529,6 @@ constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeo
     return 128U;
   }
 }
-
 
 template <uint32_t vec_size_ckv, uint32_t vec_size_kpe, uint32_t bdx, uint32_t tile_size,
           typename AttentionVariant, typename Params, typename T>
@@ -883,7 +795,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
-
 
 }
 

@@ -1,4 +1,4 @@
-
+//#include "common/bf16.inc.wgsl"
 
 const PIE_STRIPS = 8u;
 const PIE_LANES = 32u;
@@ -189,3 +189,6 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     }
 }
 
+// pie:instantiate attn_score_capture_bfloat16_d_64 PIE_HEAD_DIM_MAX=64
+// pie:instantiate attn_score_capture_bfloat16_d_128 PIE_HEAD_DIM_MAX=128
+// pie:instantiate attn_score_capture_bfloat16_d_256 PIE_HEAD_DIM_MAX=256

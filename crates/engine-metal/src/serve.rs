@@ -162,6 +162,7 @@ pub struct Seated<'a> {
     pub readout: Option<&'a [u32]>,
     pub rs: &'a engine::fire::RsVerb,
     pub rs_reset: engine::fire::RsReset,
+    pub rs_slot: Option<u32>,
     pub captures_scores: bool,
     pub translation: &'a [u32],
 }
@@ -187,6 +188,7 @@ impl<'a> Seated<'a> {
             translation: &[],
             rs: &FOLD,
             rs_reset: engine::fire::RsReset::Inferred,
+            rs_slot: None,
         }
     }
 
@@ -371,7 +373,7 @@ impl Shell {
                 matches!(
                     boot.trace.nodes.get(node as usize).map(|node| &node.op),
                     Some(model_ir::Operation::Attention(
-                        model_ir::Attention::Masked { .. }
+                        model_ir::Attention::Masked { .. } | model_ir::Attention::MaskedLse { .. }
                     ))
                 )
             });
@@ -508,6 +510,7 @@ impl Shell {
         )?;
         weights.decode_absorbed(&device, &handles, &boot.trace)?;
         weights.relabel_conv_weights(&device, &handles, &boot.trace)?;
+        weights.repack_mpp(&device, &handles, &boot.trace)?;
         handles.seal();
 
         {
@@ -515,12 +518,12 @@ impl Shell {
             let acct = crate::store::accounting::Accounting::with_scratch(
                 device.working_set(),
                 crate::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
-                boot.residency.device_demand(),
+                weights.bytes(),
                 compiled.arena.bytes,
                 kv_pool,
             );
             acct.admit(
-                Some(boot.residency.device_demand()),
+                Some(weights.bytes()),
                 crate::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
             )?;
             let source = boot.residency.source_bytes();
@@ -803,19 +806,7 @@ impl Shell {
             .find(|seam| seam.seam == DRAFTS_SEAM)
             .and_then(|seam| seam.values.first().copied());
         let (out_width, readout_bytes, readout_dtype, drafts_plane) = {
-            let carved = arena.slots(
-                &handles,
-                &compiled.arena,
-                FireRows {
-                    tokens: u64::from(boot.budget.max_tokens),
-                    lanes: u64::from(boot.budget.max_lanes),
-                    patches: u64::from(budgets.max_patches()),
-                    images: u64::from(budgets.max_images()),
-                    voxels: u64::from(budgets.max_voxels()),
-                    clips: u64::from(budgets.max_clips()),
-                    readouts: u64::from(boot.budget.max_tokens),
-                },
-            )?;
+            let carved = arena.slots(&handles, &compiled.arena, FireRows::ceilings(&budgets))?;
             let logits = carved.0[readout_value.0 as usize].ok_or_else(|| Fault::Unbound {
                 what: format!(
                     "value {}, the `{readout_seam:?}` readout seam, which the carve gave no \
@@ -1021,6 +1012,19 @@ impl Shell {
         Ok(())
     }
 
+    /// Opens `budget` bytes of disk kv pages under `dir`, if any.
+    pub fn seat_disk_kv(&mut self, budget: u64, dir: Option<&std::path::Path>) -> Result<u32> {
+        match dir.filter(|_| budget > 0) {
+            Some(dir) => self.pools.seat_disk(dir, budget),
+            None => Ok(0),
+        }
+    }
+
+    pub fn spill_kv(&mut self, to_disk: bool, pages: &[u32], slots: &[u32]) -> Result<()> {
+        self.drain()?;
+        self.pools.spill_kv(to_disk, pages, slots)
+    }
+
     pub fn copy_state(&mut self, moves: &[(u32, u32)]) -> Result<()> {
         if moves.is_empty() || !self.pools.has_state() {
             return Ok(());
@@ -1182,6 +1186,32 @@ impl Shell {
     #[must_use]
     pub fn weights_residue(&self) -> (usize, u64) {
         self.weights.residue()
+    }
+
+    /// The kv pool's bytes with memory behind them now, and the most that
+    /// ever had at once. Both equal the pool for a fixed pool.
+    #[must_use]
+    pub fn pool_residency(&self) -> (u64, u64) {
+        (self.pools.committed_bytes(), self.pools.high_water_bytes())
+    }
+
+    /// The elastic pool's reporting unit and its budget in that unit; both
+    /// zero for a fixed pool.
+    #[must_use]
+    pub fn pool_elastic(&self) -> (u64, u64) {
+        (
+            self.pools.elastic_page_bytes(),
+            self.pools.elastic_budget_pages(),
+        )
+    }
+
+    /// Lower the kv pool's watermark to `hint` and hand back the memory
+    /// above it. Drains every frame first, because an unmapped page under
+    /// a running kernel is a fault; a fixed pool only lowers the watermark.
+    pub fn release_kv(&mut self, hint: Demand) -> Result<()> {
+        self.drain()?;
+        Supply::trim(&mut self.pools, hint);
+        self.pools.release()
     }
 
     #[must_use]
@@ -2628,7 +2658,7 @@ impl Shell {
                 engine::fire::RsReset::Held => false,
             };
             if fresh {
-                beginning.push(lane.slot);
+                beginning.push(seated.rs_slot.unwrap_or(lane.slot));
             }
             seats.push(Seat {
                 slot: lane.slot,
@@ -2691,7 +2721,7 @@ impl Shell {
                     .map_or(-1, |id| i32::try_from(id).unwrap_or(-1));
                 adapter_routes.extend(std::iter::repeat_n(id, row.rows as usize));
             }
-            slot_ids.push(lane.slot as i32);
+            slot_ids.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
             let at_lane = slot_ids.len() as i32 - 1;
             if !matches!(seated.rs, engine::fire::RsVerb::Fold) {
                 if self.rs_layout.is_none() {
@@ -2764,7 +2794,7 @@ impl Shell {
                     }
                     for _ in 0..rows_here {
                         request_of_token.push(at_lane);
-                        slot_of_row.push(lane.slot as i32);
+                        slot_of_row.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
                     }
                 }
                 None => {
@@ -2775,7 +2805,7 @@ impl Shell {
                             None => narrow(u64::from(have) + at as u64),
                         });
                         request_of_token.push(at_lane);
-                        slot_of_row.push(lane.slot as i32);
+                        slot_of_row.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
                     }
                     writes.extend(std::iter::repeat_n(None, rows_here));
                 }
@@ -2811,9 +2841,9 @@ impl Shell {
                 .chain(std::iter::once(written))
                 .max()
                 .map_or(0, |pages| u32::try_from(pages).unwrap_or(u32::MAX)),
-            state_slots: seats
+            state_slots: slot_ids
                 .iter()
-                .map(|seat| seat.slot.saturating_add(1))
+                .map(|&row| (row as u32).saturating_add(1))
                 .max()
                 .unwrap_or(0),
             workspace: 0,
@@ -3253,6 +3283,7 @@ impl Shell {
 
         let mut readout_first: Vec<u32>;
         let mut readout_count: Vec<u32>;
+        let mut readout_indptr = vec![0u32];
         let readout_rows: Vec<i32> = {
             let mut placed: Vec<(u32, u32, usize)> = composition
                 .lanes()
@@ -3280,10 +3311,19 @@ impl Shell {
                     }
                     table.push(i32::try_from(row_offset + row).unwrap_or(0));
                 }
+                readout_indptr.push(table.len() as u32);
             }
             table
         };
 
+        let readouts_ceiling = model_compiler::arena::readouts_ceiling(&self.budgets.tokens);
+        if readout_rows.len() as u64 > readouts_ceiling {
+            return Err(Fault::Ceiling {
+                what: "rows one fire reads logits for (READOUTS_PER_LANE per lane)",
+                need: readout_rows.len() as u64,
+                have: readouts_ceiling,
+            });
+        }
         let bound = self.inputs[arm].write(
             &self.handles,
             &crate::inputs::Fire {
@@ -3361,6 +3401,7 @@ impl Shell {
             positions: bound.positions,
             adapter_routes: bound.adapter_routes,
             readout_rows: bound.readout_rows,
+            readout_indptr,
             nan_flags: match self.nan_flags.as_ref() {
                 Some(plane) => {
                     let words = self.trace.values.len() as u32 + 1;

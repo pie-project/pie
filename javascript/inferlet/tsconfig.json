@@ -1,0 +1,149 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": [
+      "ES2022",
+      "ESNext.Disposable",
+      "DOM"
+    ],
+    "declaration": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "paths": {
+      "pie:inferlet/channel": [
+        "./src/bindings/interfaces/pie-inferlet-channel.js"
+      ],
+      "pie:inferlet/channel@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-channel.js"
+      ],
+      "pie:inferlet/chat": [
+        "./src/bindings/interfaces/pie-inferlet-chat.js"
+      ],
+      "pie:inferlet/chat@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-chat.js"
+      ],
+      "pie:inferlet/forward": [
+        "./src/bindings/interfaces/pie-inferlet-forward.js"
+      ],
+      "pie:inferlet/forward-diffusion": [
+        "./src/bindings/interfaces/pie-inferlet-forward-diffusion.js"
+      ],
+      "pie:inferlet/forward-diffusion@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-forward-diffusion.js"
+      ],
+      "pie:inferlet/forward-hybrid": [
+        "./src/bindings/interfaces/pie-inferlet-forward-hybrid.js"
+      ],
+      "pie:inferlet/forward-hybrid@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-forward-hybrid.js"
+      ],
+      "pie:inferlet/forward-recurrent": [
+        "./src/bindings/interfaces/pie-inferlet-forward-recurrent.js"
+      ],
+      "pie:inferlet/forward-recurrent@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-forward-recurrent.js"
+      ],
+      "pie:inferlet/forward@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-forward.js"
+      ],
+      "pie:inferlet/frames": [
+        "./src/bindings/interfaces/pie-inferlet-frames.js"
+      ],
+      "pie:inferlet/frames@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-frames.js"
+      ],
+      "pie:inferlet/grammar": [
+        "./src/bindings/interfaces/pie-inferlet-grammar.js"
+      ],
+      "pie:inferlet/grammar@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-grammar.js"
+      ],
+      "pie:inferlet/media": [
+        "./src/bindings/interfaces/pie-inferlet-media.js"
+      ],
+      "pie:inferlet/media@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-media.js"
+      ],
+      "pie:inferlet/model": [
+        "./src/bindings/interfaces/pie-inferlet-model.js"
+      ],
+      "pie:inferlet/model@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-model.js"
+      ],
+      "pie:inferlet/pipeline": [
+        "./src/bindings/interfaces/pie-inferlet-pipeline.js"
+      ],
+      "pie:inferlet/pipeline@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-pipeline.js"
+      ],
+      "pie:inferlet/reasoning": [
+        "./src/bindings/interfaces/pie-inferlet-reasoning.js"
+      ],
+      "pie:inferlet/reasoning@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-reasoning.js"
+      ],
+      "pie:inferlet/run": [
+        "./src/bindings/interfaces/pie-inferlet-run.js"
+      ],
+      "pie:inferlet/run@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-run.js"
+      ],
+      "pie:inferlet/session": [
+        "./src/bindings/interfaces/pie-inferlet-session.js"
+      ],
+      "pie:inferlet/session@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-session.js"
+      ],
+      "pie:inferlet/speech": [
+        "./src/bindings/interfaces/pie-inferlet-speech.js"
+      ],
+      "pie:inferlet/speech@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-speech.js"
+      ],
+      "pie:inferlet/system": [
+        "./src/bindings/interfaces/pie-inferlet-system.js"
+      ],
+      "pie:inferlet/system@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-system.js"
+      ],
+      "pie:inferlet/tokenizer": [
+        "./src/bindings/interfaces/pie-inferlet-tokenizer.js"
+      ],
+      "pie:inferlet/tokenizer@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-tokenizer.js"
+      ],
+      "pie:inferlet/tools": [
+        "./src/bindings/interfaces/pie-inferlet-tools.js"
+      ],
+      "pie:inferlet/tools@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-tools.js"
+      ],
+      "pie:inferlet/types": [
+        "./src/bindings/interfaces/pie-inferlet-types.js"
+      ],
+      "pie:inferlet/types@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-types.js"
+      ],
+      "pie:inferlet/working-set": [
+        "./src/bindings/interfaces/pie-inferlet-working-set.js"
+      ],
+      "pie:inferlet/working-set@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-working-set.js"
+      ]
+    }
+  },
+  "include": [
+    "src/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/__tests__"
+  ]
+}

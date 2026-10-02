@@ -1,5 +1,6 @@
 mod error;
 pub mod format;
+pub mod memfs;
 pub mod provide;
 pub mod read;
 pub mod vocab;

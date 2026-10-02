@@ -1,5 +1,5 @@
 use models::media::{Budget, EncodedSpan, Fault, Grid, VisionFrontEnd};
-use runtime::inferlet::media_codec as decode;
+use runtime::inferlet::media_decode as decode;
 use runtime::inferlet::span_digest;
 
 fn encode_png(

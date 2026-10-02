@@ -1,4 +1,4 @@
-
+//#include "common/bf16.inc.wgsl"
 
 @group(0) @binding(0) var<storage, read> ba: array<u32>;
 @group(0) @binding(1) var<storage, read> a_log: array<f32>;
@@ -30,3 +30,4 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     gates[row + vh + h] = 1.0 / (1.0 + exp(-bv));
 }
 
+// pie:instantiate gdn_ba_gates_bf16 PIE_GROUP_X=256

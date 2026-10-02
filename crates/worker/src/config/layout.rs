@@ -144,8 +144,8 @@ mod tests {
     #[test]
     fn a_key_reads_back_as_the_path_the_file_spells_it() {
         assert_eq!(
-            to_file_path("runtime.request_timeout"),
-            "runtime.request_timeout"
+            to_file_path("runtime.submit_deadline"),
+            "runtime.submit_deadline"
         );
         assert_eq!(
             to_file_path("sandbox.allow_network"),

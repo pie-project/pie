@@ -1,5 +1,7 @@
+//#include "common/bf16.inc.wgsl"
+//#include "common/reduce.inc.wgsl"
 
-
+//#if defined(PIE_MLA_LATENTS)
 
 @group(0) @binding(0) var<storage, read> kv_a: array<u32>;
 @group(0) @binding(1) var<storage, read> norm_weight: array<u32>;
@@ -41,6 +43,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     }
 }
 
+//#elif defined(PIE_MLA_SPLIT_Q)
 
 @group(0) @binding(0) var<storage, read> q_b: array<u32>;
 @group(0) @binding(1) var<storage, read_write> q_nope: array<u32>;
@@ -71,6 +74,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+//#elif defined(PIE_MLA_KV_APPEND)
 
 @group(0) @binding(0) var<storage, read> kv_c: array<u32>;
 @group(0) @binding(1) var<storage, read> k_pe: array<u32>;
@@ -108,6 +112,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+//#elif defined(PIE_MLA_ABSORB_Q)
 
 @group(0) @binding(0) var<storage, read> q_nope: array<u32>;
 @group(0) @binding(1) var<storage, read> kv_b: array<u32>;
@@ -145,6 +150,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     q_latent[u32((t * params.heads + h) * params.rank + i) >> 1u] = pie_pack_bf16(acc0, acc1);
 }
 
+//#elif defined(PIE_MLA_ABSORB_OUT)
 
 @group(0) @binding(0) var<storage, read> latent: array<u32>;
 @group(0) @binding(1) var<storage, read> kv_b: array<u32>;
@@ -184,6 +190,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     out_[u32((t * params.heads + h) * params.v_dim + j) >> 1u] = pie_pack_bf16(acc0, acc1);
 }
 
+//#else
 
 const PIE_MLA_LANES = 32u;
 const PIE_MAX_CKV_PAIRS = 8u;
@@ -198,24 +205,24 @@ const PIE_MAX_KPE_PAIRS = 2u;
 @group(0) @binding(6) var<storage, read> req_of_token: array<i32>;
 @group(0) @binding(7) var<storage, read> kv_page_indices: array<u32>;
 @group(0) @binding(8) var<storage, read> kv_page_indptr: array<u32>;
-
+//#if defined(PIE_SELECTED)
 @group(0) @binding(9) var<storage, read> selection: array<i32>;
-
+//#endif
 struct Params {
     page_size: i32,
     heads: i32,
     ckv: i32,
     kpe: i32,
     sm_scale: f32,
-
+//#if defined(PIE_SELECTED)
     top_k: i32,
-
+//#endif
 }
-
+//#if defined(PIE_SELECTED)
 @group(0) @binding(10) var<uniform> params: Params;
-
+//#else
 @group(0) @binding(9) var<uniform> params: Params;
-
+//#endif
 
 var<workgroup> pie_mla_fold: array<f32, PIE_MLA_LANES>;
 var<workgroup> pie_mla_steps: i32;
@@ -284,24 +291,24 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     var lsum = 0.0;
 
     if (lane == 0u) {
-
+//#if defined(PIE_SELECTED)
         pie_mla_steps = params.top_k;
-
+//#else
         pie_mla_steps = j_end;
-
+//#endif
     }
     workgroupBarrier();
     let steps = workgroupUniformLoad(&pie_mla_steps);
-
+//#if defined(PIE_SELECTED)
     let srow = row * u32(params.top_k);
-
+//#endif
     for (var n = 0; n < steps; n = n + 1) {
         var j = n;
         var live = true;
-
+//#if defined(PIE_SELECTED)
         j = selection[srow + u32(n)];
         live = j >= 0 && j < j_end;
-
+//#endif
         var kv: array<f32, 16>;
         var pd = 0.0;
         if (live) {
@@ -352,5 +359,12 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
         out_[o_base + lane + p * PIE_MLA_LANES] = pie_pack_bf16(acc[2u * p] * inv, acc[2u * p + 1u] * inv);
     }
 }
+//#endif
 
-
+// pie:instantiate mla_latents_bf16 PIE_MLA_LATENTS=1 PIE_GROUP_X=256
+// pie:instantiate mla_split_q_b_bf16 PIE_MLA_SPLIT_Q=1 PIE_GROUP_X=256
+// pie:instantiate mla_kv_append_bf16 PIE_MLA_KV_APPEND=1 PIE_GROUP_X=256
+// pie:instantiate mla_absorb_q_bf16 PIE_MLA_ABSORB_Q=1 PIE_GROUP_X=64
+// pie:instantiate mla_absorb_out_bf16 PIE_MLA_ABSORB_OUT=1 PIE_GROUP_X=64
+// pie:instantiate mla_naive_paged_bf16
+// pie:instantiate mla_naive_paged_selected_bf16 PIE_SELECTED=1

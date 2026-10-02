@@ -1,10 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-const TREES: [(&str, &str); 2] = [
-    ("kernels", "kernels"),
-    ("shim", "shim"),
-];
+const TREES: [(&str, &str); 2] = [("kernels", "kernels"), ("shim", "shim")];
 
 const UPSTREAM_ROOTS: [&str; 1] = ["flashinfer"];
 

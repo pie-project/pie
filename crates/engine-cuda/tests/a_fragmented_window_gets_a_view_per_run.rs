@@ -1,5 +1,5 @@
 use engine_cuda::window::Windows;
-use model_compiler::{CompiledModel, Budget, DeviceProfile, compile};
+use model_compiler::{Budget, CompiledModel, DeviceProfile, compile};
 use model_dsl::Platform;
 use model_exec::fire::{WindowTable, fallback};
 use model_ir::Trace;
@@ -22,7 +22,9 @@ fn budget() -> Budget {
 }
 
 fn sku() -> (Trace, CompiledModel) {
-    let trace = models::sku(SKU).unwrap_or_else(|| panic!("`{SKU}` is in the catalog")).trace;
+    let trace = models::sku(SKU)
+        .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"))
+        .trace;
     let trace = trace(Platform::Cuda);
     let compiled = compile(&trace, &budget(), &DeviceProfile::default())
         .unwrap_or_else(|refusal| panic!("`{SKU}` bakes: {refusal:?}"));
@@ -65,7 +67,10 @@ fn a_window_p4_promised_whole_is_still_a_bake_integrity_refusal() {
                 && ascending.span(&region.mask).is_err()
         })
         .expect("some seated window is not an interval of the ascending order");
-    assert_eq!(fallback::bound(&compiled, model_ir::RowAxis::Tokens, &seated.mask), 1);
+    assert_eq!(
+        fallback::bound(&compiled, model_ir::RowAxis::Tokens, &seated.mask),
+        1
+    );
 
     let refusal = Windows::of(
         &plan,

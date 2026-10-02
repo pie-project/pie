@@ -71,7 +71,10 @@ fn the_short_conv_adds_the_input_back_and_shifts_the_window() {
             }
             let expect = acc + x[r * channels + c];
             let got = from_bf16(got_y[r * channels + c]);
-            assert!(close(got, expect), "row {r} channel {c}: {got} against {expect}");
+            assert!(
+                close(got, expect),
+                "row {r} channel {c}: {got} against {expect}"
+            );
             for t in 0..k as usize - 1 {
                 state[t * channels + c] = state[(t + 1) * channels + c];
             }
@@ -135,7 +138,9 @@ fn the_sink_router_normalizes_the_picks_with_the_sinks() {
     let fan = (top_k + sink) as usize;
     let mut lcg = Lcg::seeded(0x3c);
     let (l_raw, l) = lcg.row(rows as usize * width);
-    let bias: Vec<f32> = (0..experts).map(|e| 0.25 * f32::from(u8::try_from(e % 4).unwrap()) - 0.3).collect();
+    let bias: Vec<f32> = (0..experts)
+        .map(|e| 0.25 * f32::from(u8::try_from(e % 4).unwrap()) - 0.3)
+        .collect();
     let scale: [f32; 1] = [1.375];
     let route_scale = 8.0f32;
 
@@ -169,7 +174,9 @@ fn the_sink_router_normalizes_the_picks_with_the_sinks() {
         let sigma: Vec<f32> = logits.iter().map(|&z| 1.0 / (1.0 + (-z).exp())).collect();
         let mut order: Vec<usize> = (0..experts as usize).collect();
         order.sort_by(|&a, &b| {
-            (sigma[b] + bias[b]).partial_cmp(&(sigma[a] + bias[a])).expect("finite scores")
+            (sigma[b] + bias[b])
+                .partial_cmp(&(sigma[a] + bias[a]))
+                .expect("finite scores")
         });
         let picks = &order[..top_k as usize];
         let mut chosen: Vec<usize> = picks.to_vec();

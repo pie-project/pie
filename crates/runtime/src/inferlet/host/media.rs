@@ -239,7 +239,7 @@ impl pie::inferlet::media::HostVideo for ProcessCtx {
             Ok(fe) => fe,
             Err(fault) => return Ok(Err(fault.to_string())),
         };
-        let decoded = match multimodal::decode_gif_frames(&bytes) {
+        let mut decoded = match media::gif::frames(&bytes) {
             Ok(f) => f,
             Err(e) => return Ok(Err(Fault::Decode(e).to_string())),
         };
@@ -248,10 +248,9 @@ impl pie::inferlet::media::HostVideo for ProcessCtx {
         let mut frames = Vec::with_capacity(sel.len());
         let mut timestamps = Vec::with_capacity(sel.len());
         for &i in &sel {
-            let (img, ts) = &decoded[i];
-            let rgb = img.to_rgb8();
-            let (fw, fh) = (rgb.width(), rgb.height());
-            let frame = match Rgb8::new(fh, fw, rgb.into_raw()) {
+            let picture = &mut decoded[i];
+            let (height, width, timestamp) = (picture.height, picture.width, picture.timestamp);
+            let frame = match Rgb8::new(height, width, std::mem::take(&mut picture.rgb)) {
                 Ok(frame) => frame,
                 Err(fault) => return Ok(Err(fault.to_string())),
             };
@@ -266,7 +265,7 @@ impl pie::inferlet::media::HostVideo for ProcessCtx {
             frames.push(Image {
                 span: Arc::new(span),
             });
-            timestamps.push(*ts);
+            timestamps.push(timestamp);
         }
         let video = Video { frames, timestamps };
         Ok(Ok(self.ctx().table.push(video)?))

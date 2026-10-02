@@ -75,6 +75,21 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         #input_fn
 
+        const __PIE_PACKAGE_TEXT: &str =
+            concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION"));
+        #[used]
+        #[unsafe(link_section = "pie.package")]
+        static __PIE_PACKAGE: [u8; __PIE_PACKAGE_TEXT.len()] = {
+            let text = __PIE_PACKAGE_TEXT.as_bytes();
+            let mut bytes = [0u8; __PIE_PACKAGE_TEXT.len()];
+            let mut i = 0;
+            while i < bytes.len() {
+                bytes[i] = text[i];
+                i += 1;
+            }
+            bytes
+        };
+
         struct __PieMain;
 
         impl ::inferlet::exports::pie::inferlet::run::Guest for __PieMain {

@@ -1,9 +1,9 @@
 use bytes::Bytes;
-use client::message::ServerMessage;
+use client_api::message::ServerMessage;
 
 use crate::inferlet::process;
 use crate::inferlet::program;
-use crate::inferlet::{Manifest, ProcessId, ProgramName};
+use crate::inferlet::{ProcessId, ProgramName};
 use crate::model;
 
 use super::data_transfer::{ChunkResult, InFlightUpload};
@@ -26,7 +26,7 @@ impl Session {
 
     pub(super) async fn handle_query(&mut self, corr_id: u32, subject: String, _record: String) {
         match subject.as_str() {
-            client::message::QUERY_MODEL_STATUS => {
+            client_api::message::QUERY_MODEL_STATUS => {
                 let mut stats = serde_json::Map::new();
 
                 {
@@ -333,7 +333,7 @@ impl Session {
                     false,
                     format!(
                         "unknown query subject {subject:?} (known: {})",
-                        client::message::QUERY_MODEL_STATUS
+                        client_api::message::QUERY_MODEL_STATUS
                     ),
                 )
                 .await
@@ -368,7 +368,8 @@ impl Session {
         &mut self,
         corr_id: u32,
         program_hash: String,
-        manifest: String,
+        file: String,
+        version: Option<String>,
         force_overwrite: bool,
         chunk_index: usize,
         total_chunks: usize,
@@ -394,7 +395,8 @@ impl Session {
                 key.clone(),
                 InFlightUpload::new(
                     total_chunks,
-                    manifest,
+                    file,
+                    version,
                     force_overwrite,
                     self.state.max_upload_bytes,
                 ),
@@ -412,7 +414,8 @@ impl Session {
             }
             ChunkResult::Complete {
                 buffer,
-                manifest: manifest_str,
+                file,
+                version,
                 force_overwrite,
             } => {
                 drop(inflight);
@@ -431,30 +434,16 @@ impl Session {
                     return;
                 }
 
-                let manifest = match Manifest::parse(&manifest_str) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        self.send_response(corr_id, false, format!("Invalid manifest: {}", e))
-                            .await;
-                        return;
-                    }
-                };
-                let program_name = manifest.program_name();
-
-                match program::add(buffer, manifest, force_overwrite).await {
-                    Ok(()) => {
+                match program::add(buffer, &file, version.as_deref(), force_overwrite).await {
+                    Ok(program_name) => {
                         if force_overwrite {
                             self.installed_programs.remove(&program_name);
                         }
                         match program::install(&program_name).await {
                             Ok(()) => {
-                                self.installed_programs.insert(program_name);
-                                self.send_response(
-                                    corr_id,
-                                    true,
-                                    "Program installed successfully".to_string(),
-                                )
-                                .await;
+                                self.installed_programs.insert(program_name.clone());
+                                self.send_response(corr_id, true, program_name.to_string())
+                                    .await;
                             }
                             Err(e) => {
                                 self.send_response(corr_id, false, e.to_string()).await;
@@ -478,11 +467,28 @@ impl Session {
         input: String,
         capture_outputs: bool,
     ) {
-        let program_name = match ProgramName::parse(&inferlet) {
-            Ok(p) => p,
-            Err(e) => {
-                self.send_response(corr_id, false, e.to_string()).await;
-                return;
+        // A bare `name` is its newest installed version: how the gateway's
+        // fixed routes reach the built-in inferlets.
+        let program_name = if inferlet.contains('@') {
+            match ProgramName::parse(&inferlet) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.send_response(corr_id, false, e.to_string()).await;
+                    return;
+                }
+            }
+        } else {
+            match program::newest(&inferlet).await {
+                Some(p) => p,
+                None => {
+                    self.send_response(
+                        corr_id,
+                        false,
+                        format!("no program named '{inferlet}' is installed"),
+                    )
+                    .await;
+                    return;
+                }
             }
         };
 
@@ -492,6 +498,18 @@ impl Session {
                 return;
             }
             self.installed_programs.insert(program_name.clone());
+        }
+
+        if crate::store::registry::all_for_model(0).is_empty() {
+            self.send_response(
+                corr_id,
+                false,
+                "no engine is serving this model, so nothing can run a forward pass; \
+                 boot with an engine to launch programs"
+                    .to_string(),
+            )
+            .await;
+            return;
         }
 
         let client_id = if capture_outputs { Some(self.id) } else { None };
@@ -506,6 +524,7 @@ impl Session {
             Ok(process_id) => {
                 if capture_outputs {
                     self.attached_processes.push(process_id);
+                    self.launched_processes.insert(process_id);
                     self.send_response(corr_id, true, process_id.to_string())
                         .await;
                 } else {
@@ -658,6 +677,7 @@ impl Session {
                 InFlightUpload::new(
                     total_chunks,
                     String::new(),
+                    None,
                     false,
                     self.state.max_upload_bytes,
                 ),
@@ -703,11 +723,14 @@ impl Session {
         name: Option<String>,
     ) {
         let file_hash = blake3::hash(&data).to_hex().to_string();
-        let total_chunks = data.len().div_ceil(client::message::CHUNK_SIZE_BYTES);
+        let total_chunks = data.len().div_ceil(client_api::message::CHUNK_SIZE_BYTES);
 
         let uuid_str = process_id.to_string();
 
-        for (i, chunk) in data.chunks(client::message::CHUNK_SIZE_BYTES).enumerate() {
+        for (i, chunk) in data
+            .chunks(client_api::message::CHUNK_SIZE_BYTES)
+            .enumerate()
+        {
             self.send(ServerMessage::File {
                 process_id: uuid_str.clone(),
                 file_hash: file_hash.clone(),

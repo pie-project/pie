@@ -63,8 +63,6 @@ pub struct Boot<'a> {
     pub residency: engine::load::Residency,
 }
 
-const DEVICE_HEADROOM: u64 = 2 << 30;
-
 const PATCH_ROUTE_DROP: i32 = -1;
 
 fn declared_width(trace: &Trace, want: RuntimeInput) -> u64 {
@@ -178,6 +176,8 @@ pub struct Seated<'a> {
 
     pub rs_reset: engine::fire::RsReset,
 
+    pub rs_slot: Option<u32>,
+
     pub captures_scores: bool,
 
     pub translation: &'a [u32],
@@ -199,6 +199,7 @@ impl<'a> Seated<'a> {
             translation: &[],
             rs: &FOLD,
             rs_reset: engine::fire::RsReset::Inferred,
+            rs_slot: None,
         }
     }
 
@@ -302,6 +303,8 @@ pub struct Shell {
 
     states_mrope: bool,
 
+    gathers_readout: bool,
+
     copies: bool,
 
     last: FireCost,
@@ -363,7 +366,7 @@ impl Shell {
                 matches!(
                     boot.trace.nodes.get(node as usize).map(|node| &node.op),
                     Some(model_ir::Operation::Attention(
-                        model_ir::Attention::Masked { .. }
+                        model_ir::Attention::Masked { .. } | model_ir::Attention::MaskedLse { .. }
                     ))
                 )
             });
@@ -391,7 +394,7 @@ impl Shell {
             }
         }
 
-        let paging = Paging::of(
+        let asked = Paging::of(
             boot.page_size,
             boot.context,
             boot.slots,
@@ -399,10 +402,35 @@ impl Shell {
         )?;
         let handles = Handles::new();
 
+        // The pool's page and slot counts are ceilings: it is fitted to what
+        // the weights and the working set leave, and the weights are held
+        // only to leave it one sequence.
+        let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
+        let pool_at = |pages: u64, slots: u32| -> Result<u64> {
+            let paging = Paging {
+                pages,
+                slots,
+                ..asked
+            };
+            Ok(crate::store::pool_demand(&boot.trace, paging)?
+                .saturating_add(
+                    rs_layout
+                        .as_ref()
+                        .map_or(0, |layout| crate::rs::Buffers::bytes_at(layout, paging)),
+                )
+                .saturating_add(crate::scratch::pool_bytes(&boot.trace, paging)))
+        };
+        let one_slot = u64::from(asked.pages_per_slot).min(asked.pages());
+        let least = Paging {
+            pages: one_slot,
+            slots: engine::fit::least_state_slots(1).min(asked.slots),
+            ..asked
+        };
+
+        let arena = Arena::reserve(&device, &compiled.arena)?;
         let device_cap = device
-            .working_set()
-            .saturating_sub(crate::store::pool_demand(&boot.trace, paging)?)
-            .saturating_sub(DEVICE_HEADROOM);
+            .left()
+            .saturating_sub(pool_at(least.pages, least.slots)?);
         let mut weights = Weights::resident(
             &device,
             &handles,
@@ -418,22 +446,13 @@ impl Shell {
 
         handles.seal();
 
-        let arena = Arena::reserve(&device, &compiled.arena)?;
-        let pools = Pools::reserve(&device, &boot.trace, paging, &facts)?;
-
-        let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
-        let rs_buffers = match &rs_layout {
-            Some(layout) => Some(crate::rs::Buffers::reserve(&device, layout, paging)?),
-            None => None,
-        };
-
-        let scratch = Scratch::reserve(
+        let mut scratch = Scratch::reserve(
             &device,
             &boot.trace,
             weights.table(),
             &compiled,
             &budgets,
-            paging,
+            least,
         )?;
         let spaces = boot
             .trace
@@ -478,6 +497,11 @@ impl Shell {
         });
 
         let states_mrope = declared_width(&boot.trace, RuntimeInput::MropePositions) > 0;
+        let gathers_readout = boot
+            .trace
+            .values
+            .iter()
+            .any(|decl| matches!(&decl.def, model_ir::Def::Input(RuntimeInput::ReadoutRows)));
         if declared_width(&boot.trace, RuntimeInput::SelfCondRows) > 0 {
             return Err(Fault::Program {
                 at: "serve::load",
@@ -499,7 +523,7 @@ impl Shell {
                 Inputs::reserve(
                     &device,
                     &boot.budget,
-                    paging,
+                    asked,
                     spaces,
                     compiled.classes.classes.len(),
                     gathers,
@@ -593,7 +617,7 @@ impl Shell {
                     images: u64::from(budgets.max_images()),
                     voxels: u64::from(budgets.max_voxels()),
                     clips: u64::from(budgets.max_clips()),
-                    readouts: u64::from(boot.budget.max_tokens),
+                    readouts: model_compiler::arena::readouts_ceiling(&boot.budget),
                 },
             )?;
             let logits = carved.0[out.0 as usize].ok_or_else(|| Fault::Unbound {
@@ -687,6 +711,59 @@ impl Shell {
             Vec::new()
         };
 
+        let room = device
+            .left()
+            .saturating_add(crate::scratch::pool_bytes(&boot.trace, least));
+        let (pages, slots) = engine::fit::pool_within(
+            asked.pages(),
+            asked.slots,
+            one_slot,
+            room,
+            |pages, slots| pool_at(pages, slots).unwrap_or(u64::MAX),
+        )
+        .ok_or_else(|| {
+            Fault::Residency(format!(
+                "the device does not hold this deployment: with the weights ({} bytes) and the \
+                 working set down, {room} bytes of `[engine] gpu_mem_utilization` are left for \
+                 the cache rows, and one sequence at the declared context needs {}. Lower \
+                 `[engine] max_model_len`, raise `[engine] gpu_mem_utilization`, state a \
+                 `[model] device_weight_budget`, or free what else holds the device.",
+                weights.bytes(),
+                pool_at(least.pages, least.slots).unwrap_or(u64::MAX),
+            ))
+        })?;
+        tracing::info!(
+            pages,
+            slots,
+            asked_pages = asked.pages(),
+            asked_slots = asked.slots,
+            room,
+            "the cache pool is fitted to what the weights and the working set leave"
+        );
+        let paging = Paging {
+            pages,
+            slots,
+            ..asked
+        };
+        if crate::scratch::pool_bytes(&boot.trace, paging)
+            > crate::scratch::pool_bytes(&boot.trace, least)
+        {
+            drop(scratch);
+            scratch = Scratch::reserve(
+                &device,
+                &boot.trace,
+                weights.table(),
+                &compiled,
+                &budgets,
+                paging,
+            )?;
+        }
+        let pools = Pools::reserve(&device, &boot.trace, paging, &facts)?;
+        let rs_buffers = match &rs_layout {
+            Some(layout) => Some(crate::rs::Buffers::reserve(&device, layout, paging)?),
+            None => None,
+        };
+
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let adapter_slots = crate::adapter::Slots::new(weights.adapter_seats());
 
@@ -725,6 +802,7 @@ impl Shell {
             patch_fold,
             drops_patch_rows,
             states_mrope,
+            gathers_readout,
             facts,
             spaces,
 
@@ -736,7 +814,7 @@ impl Shell {
             adapters: adapter_slots,
 
             blobs: crate::blob::Store::new(),
-            held: vec![0; boot.slots as usize],
+            held: vec![0; slots as usize],
             rs_layout,
             rs_buffers,
             rs_scratch: None,
@@ -777,6 +855,18 @@ impl Shell {
 
         self.grafted = Some(frame.commit_async(None)?);
         Ok(())
+    }
+
+    /// Opens the slot file under `dir` with `budget` bytes of kv pages.
+    pub fn seat_disk_kv(&mut self, budget: u64, dir: Option<&Path>) -> Result<u32> {
+        if let Some(dir) = dir.filter(|_| budget > 0) {
+            self.pools.seat_disk(&self.device, dir, budget)?;
+        }
+        Ok(self.pools.disk_pages())
+    }
+
+    pub fn spill_kv(&mut self, to_disk: bool, device: &[u32], disk: &[u32]) -> Result<()> {
+        self.pools.spill_kv(&self.device, to_disk, device, disk)
     }
 
     pub fn copy_state(&mut self, src: u32, dst: u32) -> Result<()> {
@@ -1448,7 +1538,7 @@ impl Shell {
                 engine::fire::RsReset::Held => false,
             };
             if fresh {
-                beginning.push(lane.slot);
+                beginning.push(seated.rs_slot.unwrap_or(lane.slot));
             }
             seats.push(Seat {
                 slot: lane.slot,
@@ -1511,7 +1601,7 @@ impl Shell {
                     runs_capture_arm,
                 });
             }
-            slot_ids.push(lane.slot as i32);
+            slot_ids.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
             let at_lane = slot_ids.len() as i32 - 1;
 
             if !matches!(seated.rs, engine::fire::RsVerb::Fold) {
@@ -1549,7 +1639,7 @@ impl Shell {
                             None => narrow(u64::from(have) + at as u64),
                         });
                         request_of_token.push(at_lane);
-                        slot_of_row.push(lane.slot as i32);
+                        slot_of_row.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
                     }
                     writes.extend(std::iter::repeat_n(None, rows_here));
                 }
@@ -1585,9 +1675,9 @@ impl Shell {
                 .chain(std::iter::once(written))
                 .max()
                 .map_or(0, |pages| u32::try_from(pages).unwrap_or(u32::MAX)),
-            state_slots: seats
+            state_slots: slot_ids
                 .iter()
-                .map(|seat| seat.slot.saturating_add(1))
+                .map(|&row| (row as u32).saturating_add(1))
                 .max()
                 .unwrap_or(0),
 
@@ -1783,11 +1873,13 @@ impl Shell {
             }
         }
 
+        let (readout_rows, readout_layout) = readout_table(&composition, lanes)?;
         let bound = self.inputs[arm].write(
             &self.handles,
             &crate::inputs::Fire {
                 tokens: &tokens,
                 positions: &positions,
+                readout_rows: &readout_rows,
                 windows: &boundaries,
                 slot_ids: &slot_ids,
                 slot_of_row: &slot_of_row,
@@ -1810,6 +1902,15 @@ impl Shell {
         )?;
         windows.bind(&self.handles, bound.windows)?;
 
+        let readouts = u64::from(lane_count).max(readout_rows.len() as u64);
+        let readouts_ceiling = model_compiler::arena::readouts_ceiling(&self.budgets.tokens);
+        if readouts > readouts_ceiling {
+            return Err(Fault::Ceiling {
+                what: "rows one fire reads logits for (READOUTS_PER_LANE per lane)",
+                need: readouts,
+                have: readouts_ceiling,
+            });
+        }
         let slots = self.arena.slots(
             &self.handles,
             &self.compiled.arena,
@@ -1820,7 +1921,7 @@ impl Shell {
                 images: u64::from(composition.images()),
                 voxels: u64::from(composition.voxel_rows()),
                 clips: u64::from(composition.clips()),
-                readouts: u64::from(lane_count),
+                readouts,
             },
         )?;
         let caches = self.pools.table(
@@ -1848,6 +1949,7 @@ impl Shell {
         let bindings = FireBindings {
             tokens: bound.tokens,
             positions: bound.positions,
+            readout_rows: bound.readout_rows,
 
             adapter_routes: bound.adapter_routes,
 
@@ -1908,7 +2010,8 @@ impl Shell {
             lanes,
             done,
             arm,
-            composition,
+            readout_rows,
+            readout_layout,
             descriptor,
             seats,
             tables,
@@ -2020,7 +2123,8 @@ pub struct Prepared<'a> {
     done: Option<Done>,
 
     arm: usize,
-    composition: Composition,
+    readout_rows: Vec<i32>,
+    readout_layout: Vec<(u32, u32)>,
     descriptor: FireDescriptor,
     seats: Vec<Seat>,
 
@@ -2065,6 +2169,45 @@ pub struct Landed {
 }
 
 pub const READOUT_ROWS_PER_LANE: u32 = 8;
+
+type ReadoutTable = (Vec<i32>, Vec<(u32, u32)>);
+
+fn readout_table(composition: &Composition, lanes: &[Seated<'_>]) -> Result<ReadoutTable> {
+    let mut table: Vec<i32> = Vec::with_capacity(lanes.len());
+    let mut layout: Vec<(u32, u32)> = vec![(0, 0); lanes.len()];
+    for row in composition.lanes() {
+        if row.rows == 0 {
+            continue;
+        }
+        let source = row.source as usize;
+        let named = lanes.get(source).and_then(|seated| seated.readout);
+        let picks: Vec<u32> = match named {
+            Some(list) if !list.is_empty() => {
+                for &at in list {
+                    if at >= row.rows {
+                        return Err(Fault::Ceiling {
+                            what: "rows in the lane a readout names",
+                            need: u64::from(at) + 1,
+                            have: u64::from(row.rows),
+                        });
+                    }
+                }
+                list.iter().map(|&at| row.row_offset + at).collect()
+            }
+            _ => vec![row.row_offset + row.rows - 1],
+        };
+        layout[source] = (
+            u32::try_from(table.len()).unwrap_or(u32::MAX),
+            u32::try_from(picks.len()).unwrap_or(u32::MAX),
+        );
+        table.extend(
+            picks
+                .iter()
+                .map(|&at| i32::try_from(at).unwrap_or(i32::MAX)),
+        );
+    }
+    Ok((table, layout))
+}
 
 fn readout_rows(max_lanes: u32) -> u32 {
     max_lanes
@@ -2215,59 +2358,36 @@ impl engine::frame::Shell for Shell {
         };
 
         let seat_rows = self.readout[prepared.arm].bytes() / (width * 2).max(1);
-        let mut layout: Vec<(u32, u32)> = vec![(0, 0); prepared.lanes.len()];
-        let mut cursor: u64 = 0;
-        for row in prepared.composition.lanes() {
-            let source = row.source as usize;
-            if row.rows == 0 {
-                continue;
-            }
-            let named = prepared.lanes.get(source).and_then(|seated| seated.readout);
-            let picks: Vec<u32> = match named {
-                Some(list) if !list.is_empty() => {
-                    for &at in list {
-                        if at >= row.rows {
-                            return Err(Fault::Ceiling {
-                                what: "rows in the lane a readout names",
-                                need: u64::from(at) + 1,
-                                have: u64::from(row.rows),
-                            });
-                        }
-                    }
-                    list.iter().map(|&at| row.row_offset + at).collect()
-                }
-                _ => vec![row.row_offset + row.rows - 1],
+        if prepared.readout_rows.len() as u64 > seat_rows {
+            return Err(Fault::Ceiling {
+                what: "readout rows in one step",
+                need: prepared.readout_rows.len() as u64,
+                have: seat_rows,
+            });
+        }
+        let layout = prepared.readout_layout.clone();
+        for (cursor, &token_row) in prepared.readout_rows.iter().enumerate() {
+            let cursor = cursor as u64;
+            let at = if self.gathers_readout {
+                cursor
+            } else {
+                u64::try_from(token_row).unwrap_or(0)
             };
-            let need = cursor + picks.len() as u64;
-            if need > seat_rows {
-                return Err(Fault::Ceiling {
-                    what: "readout rows in one step",
-                    need,
-                    have: seat_rows,
-                });
-            }
-            layout[source] = (
-                u32::try_from(cursor).unwrap_or(u32::MAX),
-                u32::try_from(picks.len()).unwrap_or(u32::MAX),
-            );
-            for at in picks {
+            frame.copy(
+                self.arena.store(),
+                base + at * width * 2,
+                &self.readout[prepared.arm],
+                cursor * width * 2,
+                width * 2,
+            )?;
+            if let Some((draft_base, seat)) = draft.as_ref() {
                 frame.copy(
                     self.arena.store(),
-                    base + u64::from(at) * width * 2,
-                    &self.readout[prepared.arm],
-                    cursor * width * 2,
-                    width * 2,
+                    draft_base + at * u64::from(self.mtp_width) * 2,
+                    seat,
+                    cursor * u64::from(self.mtp_width) * 2,
+                    u64::from(self.mtp_width) * 2,
                 )?;
-                if let Some((draft_base, seat)) = draft.as_ref() {
-                    frame.copy(
-                        self.arena.store(),
-                        draft_base + u64::from(at) * u64::from(self.mtp_width) * 2,
-                        seat,
-                        cursor * u64::from(self.mtp_width) * 2,
-                        u64::from(self.mtp_width) * 2,
-                    )?;
-                }
-                cursor += 1;
             }
         }
 

@@ -67,6 +67,11 @@ pub struct Context {
     working_set: u64,
     max_buffer: u64,
     cores: u32,
+    /// The Metal 4 mapping side, opened on first use: most loads never map a
+    /// tile, and a second command queue is a scheduler context in the
+    /// driver. `None` inside once opened means the device is not Metal 4.
+    #[cfg(target_vendor = "apple")]
+    sparse: std::cell::OnceCell<Option<std::sync::Arc<super::sparse::Sparse>>>,
 }
 
 // SAFETY: `MTLDevice` and `MTLCommandQueue` are documented thread-safe.
@@ -118,6 +123,7 @@ impl Context {
                 working_set,
                 max_buffer,
                 cores: 32,
+                sparse: std::cell::OnceCell::new(),
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -255,6 +261,31 @@ impl Context {
     #[cfg(target_vendor = "apple")]
     pub(crate) fn device(&self) -> &ProtocolObject<dyn MTLDevice> {
         &self.device
+    }
+
+    /// Whether this device can map sparse buffer tiles: `MTLGPUFamilyMetal4`.
+    #[must_use]
+    pub fn supports_elastic(&self) -> bool {
+        #[cfg(target_vendor = "apple")]
+        {
+            super::sparse::Sparse::supported(&self.device)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            false
+        }
+    }
+
+    /// The mapping side, opened on first ask; `None` when the device is not
+    /// Metal 4. Its residency set is attached to this context's frame queue.
+    #[cfg(target_vendor = "apple")]
+    pub fn sparse(&self) -> Result<Option<std::sync::Arc<super::sparse::Sparse>>> {
+        if let Some(opened) = self.sparse.get() {
+            return Ok(opened.clone());
+        }
+        let opened = super::sparse::Sparse::open(&self.device, &self.queue)?;
+        let _ = self.sparse.set(opened.clone());
+        Ok(opened)
     }
 
     pub fn frame(&self) -> Result<Frame> {
@@ -399,6 +430,21 @@ impl Frame {
         {
             Err(Fault::Deviceless)
         }
+    }
+
+    /// Blit `len` bytes from `source_at` of `source` to `into_at` of
+    /// `into`, both spans checked against their buffers first.
+    pub fn copy_span(
+        &mut self,
+        source: &super::Buffer,
+        source_at: u64,
+        into: &super::Buffer,
+        into_at: u64,
+        len: u64,
+    ) -> Result<()> {
+        source.span(source_at, len)?;
+        into.span(into_at, len)?;
+        self.copy(source.slab(), source_at, into.slab(), into_at, len)
     }
 
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]

@@ -108,7 +108,7 @@ interface media {
     // A host-side handle to a decoded + sampled video clip. The host demuxes an
     // animated container (e.g. GIF), uniformly samples up to `max-frames`
     // frames, and sizes each frame at the model's per-frame soft-token budget.
-    // Each frame is an ordinary `image` span; the SDK splices them in order.
+    // Each frame is an ordinary `image` span; the inferlet library splices them in order.
     resource video {
 
         // Encoded animated container (e.g. GIF). The host decodes every frame,

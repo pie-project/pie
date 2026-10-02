@@ -53,7 +53,7 @@ DEFAULT_GOLDEN = os.path.join(
 )
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
-INFERLET = os.path.join(REPO, "tests/inferlets/zimage-vae-parity")
+INFERLET = os.path.join(REPO, "examples/zimage-vae-parity")
 
 COS_TOL = 0.999
 ABS_TOL = 0.05
@@ -178,11 +178,10 @@ def run(args) -> None:
             f"`cargo build -p pie --features cuda`, or pass --pie."
         )
     binary = wasm()
-    manifest = os.path.join(INFERLET, "Pie.toml")
     cmd = [pie]
     if args.config:
         cmd += ["--config", os.path.expanduser(args.config)]
-    cmd += ["run", "--path", binary, "--manifest", manifest]
+    cmd += ["run", "--path", binary]
     if args.png_dir:
         os.makedirs(args.png_dir, exist_ok=True)
         cmd += ["-o", args.png_dir]

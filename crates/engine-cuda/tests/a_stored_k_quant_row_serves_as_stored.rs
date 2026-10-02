@@ -47,7 +47,6 @@ impl Micro {
             head: Weight::sym("lm_head", [u64::from(VOCAB), HIDDEN], head),
         }
     }
-
 }
 
 impl ForwardHybrid for Micro {

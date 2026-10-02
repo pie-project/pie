@@ -131,6 +131,7 @@ impl ForwardHybrid for Model {
         }
 
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.final_norm_eps);
+        let x = ops::layout::gather_rows(&x, &inputs.readout_rows());
         let logits = ops::linear::lm_head(&x, &m.head);
         if m.head.dim(0) < u64::from(m.vocab) {
             ops::collective::all_gather(&logits, m.tp)
@@ -254,5 +255,5 @@ fn index_select(x: &Value, q_a: &Value, inputs: &Input<Facts>, ix: &Indexer) -> 
         ix.theta,
     );
     let weights = ops::linear::matmul(q_a, &ix.weights_proj);
-    ops::attn::index_topk(&q, &weights, keys, ix.heads, ix.head_dim, ix.top_k, 1)
+    ops::attn::index_topk(&q, Some(&weights), keys, ix.heads, ix.head_dim, ix.top_k, 1)
 }

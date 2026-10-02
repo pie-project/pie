@@ -2,8 +2,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated,
-    symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,
 };
 use crate::tensor::Tensor;
 
@@ -86,41 +85,42 @@ pub fn embed_vocab_shard(
     dtype_dispatch!(OP, table.dtype, { Bf16 => () });
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
     debug_assert_eq!(ids.rows, y.rows, "the ids handed over are the rows landed");
-    let comm = ctx.comm(OP)?;
     let local = nonzero(OP, "this rank's band of the embedding table", table.rows)?;
     let hidden = stated(OP, nonzero(OP, "the embedded row's width", y.width)?)?;
     let rows = nonzero(OP, "rows", y.rows)?;
+    let rank = comm_rank(ctx, OP)?;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::layout::embed_vocab_shard<::pie::bf16>")
+            .apply(Launch::grid([rows, 1, 1], [BLOCK, 1, 1])),
+        &[
+            ids.arg(),
+            table.arg(),
+            y.arg(),
+            hidden.arg(),
+            stated(OP, local)?.arg(),
+            stated(OP, rank.saturating_mul(local))?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
 
+pub(crate) fn comm_rank(ctx: &Ctx, op: &'static str) -> Result<u32, Error> {
+    let comm = ctx.comm(op)?;
     #[cfg(feature = "cuda")]
     {
-        let rank = {
-            use cudarc::nccl::sys as nccl;
-            let mut rank: i32 = 0;
-            // SAFETY: `comm` is the live communicator this context fires its
-            // collectives on; the out-parameter is a stack i32.
-            let code = unsafe { nccl::ncclCommUserRank(comm.cast(), &mut rank) };
-            crate::collective::answered(OP, "ncclCommUserRank", code)?;
-            u32::try_from(rank).unwrap_or(0)
-        };
-        ctx.fire(
-            OP,
-            Fire::at(FILE, "::pie::layout::embed_vocab_shard<::pie::bf16>")
-                .apply(Launch::grid([rows, 1, 1], [BLOCK, 1, 1])),
-            &[
-                ids.arg(),
-                table.arg(),
-                y.arg(),
-                hidden.arg(),
-                stated(OP, local)?.arg(),
-                stated(OP, rank.saturating_mul(local))?.arg(),
-                ctx.stage(),
-            ],
-        )
+        use cudarc::nccl::sys as nccl;
+        let mut rank: i32 = 0;
+        // SAFETY: `comm` is the live communicator this context fires its
+        // collectives on; the out-parameter is a stack i32.
+        let code = unsafe { nccl::ncclCommUserRank(comm.cast(), &mut rank) };
+        crate::collective::answered(op, "ncclCommUserRank", code)?;
+        Ok(u32::try_from(rank).unwrap_or(0))
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (comm, local, hidden, rows, ids, table, y);
-        Err(crate::jit::runtimeless(OP))
+        let _ = comm;
+        Err(crate::jit::runtimeless(op))
     }
 }
 
@@ -634,14 +634,20 @@ pub fn argmax(ctx: &Ctx, x: Tensor, column: u32, y: &mut Tensor) -> Result<(), E
     if column >= y.width {
         return Err(refuse(
             OP,
-            format!("column {column} is outside the {}-wide plane it writes", y.width),
+            format!(
+                "column {column} is outside the {}-wide plane it writes",
+                y.width
+            ),
         ));
     }
     debug_assert_eq!(x.rows, y.rows, "an argmax lands one entry per row");
     ctx.fire(
         OP,
-        Fire::at(TOPK_FILE, symbol(&format!("::pie::layout::argmax_rows<{t}>")))
-            .apply(Launch::per_row(rows, THREADS)),
+        Fire::at(
+            TOPK_FILE,
+            symbol(&format!("::pie::layout::argmax_rows<{t}>")),
+        )
+        .apply(Launch::per_row(rows, THREADS)),
         &[
             x.arg(),
             y.arg(),
@@ -679,15 +685,24 @@ pub fn topk(
     let rows = nonzero(OP, "rows", x.rows)?;
     nonzero(OP, "width", x.width)?;
     if values.rows != rows || values.width != k || values.dtype != Dtype::F32 {
-        return Err(refuse(OP, format!("the values plane is not [{rows}, {k}] f32")));
+        return Err(refuse(
+            OP,
+            format!("the values plane is not [{rows}, {k}] f32"),
+        ));
     }
     if indices.rows != rows || indices.width != k || indices.dtype != Dtype::I32 {
-        return Err(refuse(OP, format!("the indices plane is not [{rows}, {k}] i32")));
+        return Err(refuse(
+            OP,
+            format!("the indices plane is not [{rows}, {k}] i32"),
+        ));
     }
     ctx.fire(
         OP,
-        Fire::at(TOPK_FILE, symbol(&format!("::pie::layout::topk_rows<{t}, {k}>")))
-            .apply(Launch::per_row(rows, TOPK_THREADS)),
+        Fire::at(
+            TOPK_FILE,
+            symbol(&format!("::pie::layout::topk_rows<{t}, {k}>")),
+        )
+        .apply(Launch::per_row(rows, TOPK_THREADS)),
         &[
             x.arg(),
             values.arg(),

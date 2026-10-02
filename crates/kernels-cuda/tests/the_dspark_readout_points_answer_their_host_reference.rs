@@ -87,7 +87,11 @@ fn the_argmax_lands_the_lowest_tied_column_and_skips_a_nan() {
     for r in 0..rows {
         let want = host_topk(&x[r * width..(r + 1) * width], 1)[0].1;
         for column in 0..depth {
-            assert_eq!(got[r * depth + column], want as i32, "row {r} column {column}");
+            assert_eq!(
+                got[r * depth + column],
+                want as i32,
+                "row {r} column {column}"
+            );
         }
     }
     assert_eq!(got[4 * depth], 2999, "the one finite entry of the NaN row");
@@ -137,11 +141,17 @@ fn the_topk_is_sorted_with_ties_to_the_lower_column() {
                 let want = host_topk(&x[r * width..(r + 1) * width], k);
                 for j in 0..k {
                     assert_eq!(
-                        got_i[r * k + j], want[j].1 as i32,
+                        got_i[r * k + j],
+                        want[j].1 as i32,
                         "{dtype:?} k={k} row {r} rank {j}: index (values {} against {})",
-                        got_v[r * k + j], want[j].0
+                        got_v[r * k + j],
+                        want[j].0
                     );
-                    assert_eq!(got_v[r * k + j], want[j].0, "{dtype:?} k={k} row {r} rank {j}: value");
+                    assert_eq!(
+                        got_v[r * k + j],
+                        want[j].0,
+                        "{dtype:?} k={k} row {r} rank {j}: value"
+                    );
                 }
             }
         }
@@ -156,9 +166,13 @@ fn the_selector_walk_follows_the_best_successor_from_the_anchor() {
     let (pred_raw, pred) = lcg.row(vocab * rank);
     let (succ_raw, succ) = lcg.row(vocab * rank);
     let (hp_raw, hp) = lcg.row(rows * rank);
-    let cand: Vec<i32> = (0..rows * k).map(|i| ((i * 37 + 11) % vocab) as i32).collect();
+    let cand: Vec<i32> = (0..rows * k)
+        .map(|i| ((i * 37 + 11) % vocab) as i32)
+        .collect();
     let tokens: Vec<i32> = (0..rows).map(|r| ((r * 13 + 5) % vocab) as i32).collect();
-    let unary: Vec<f32> = (0..rows * k).map(|_| (lcg.unit() * 4.0).floor() * 0.25).collect();
+    let unary: Vec<f32> = (0..rows * k)
+        .map(|_| (lcg.unit() * 4.0).floor() * 0.25)
+        .collect();
 
     let mut gpu = Gpu::open();
     let cand_at = gpu.up(&cand);
@@ -194,7 +208,11 @@ fn the_selector_walk_follows_the_best_successor_from_the_anchor() {
             let (begin, end) = (indptr[lane] as usize, indptr[lane + 1] as usize);
             let mut prev = tokens[begin] as usize;
             if first == 1 {
-                assert_eq!(got[begin], cand[begin * k], "hp={with_hp} first={first}: the anchor's pick is its first candidate");
+                assert_eq!(
+                    got[begin],
+                    cand[begin * k],
+                    "hp={with_hp} first={first}: the anchor's pick is its first candidate"
+                );
             }
             for row in begin + first as usize..end {
                 let mut best = 0usize;
@@ -205,7 +223,11 @@ fn the_selector_walk_follows_the_best_successor_from_the_anchor() {
                     for d in 0..rank {
                         let a = pred[prev * rank + d];
                         let b = succ[cid * rank + d];
-                        dot += if with_hp { a * hp[row * rank + d] * b } else { a * b };
+                        dot += if with_hp {
+                            a * hp[row * rank + d] * b
+                        } else {
+                            a * b
+                        };
                     }
                     let s = unary[row * k + c] + dot;
                     if c == 0 || s > best_v {
@@ -223,7 +245,11 @@ fn the_selector_walk_follows_the_best_successor_from_the_anchor() {
                     for d in 0..rank {
                         let a = pred[prev * rank + d];
                         let b = succ[cid * rank + d];
-                        dot += if with_hp { a * hp[row * rank + d] * b } else { a * b };
+                        dot += if with_hp {
+                            a * hp[row * rank + d] * b
+                        } else {
+                            a * b
+                        };
                     }
                     let s = unary[row * k + c] + dot;
                     assert!(

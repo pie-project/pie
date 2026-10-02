@@ -87,13 +87,25 @@ impl CompiledGrammar {
     }
 }
 
+// `Instant::now` panics on wasm32, so the deadline is never armed there.
+pub(crate) fn started_now() -> Option<Instant> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Some(Instant::now())
+    }
+}
+
 impl CompiledGrammar {
     pub fn new(grammar: &Grammar, tokenizer_info: &Arc<Tokenizer>) -> Self {
         Self::try_new(
             grammar,
             tokenizer_info,
             &GrammarLimits::default(),
-            Instant::now(),
+            started_now(),
         )
         .expect("grammar exceeds default compilation limits")
     }
@@ -102,9 +114,9 @@ impl CompiledGrammar {
         grammar: &Grammar,
         tokenizer_info: &Arc<Tokenizer>,
         limits: &GrammarLimits,
-        started: Instant,
+        started: Option<Instant>,
     ) -> Result<Self> {
-        let deadline = started.checked_add(limits.max_compile_duration);
+        let deadline = started.and_then(|started| started.checked_add(limits.max_compile_duration));
         check_deadline(deadline)?;
         let vocab_size = tokenizer_info.vocab_size();
         let normalized = Arc::new(normalize_grammar(grammar));

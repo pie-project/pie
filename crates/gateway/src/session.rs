@@ -83,6 +83,8 @@ pub trait TurnRouter: Send + Sync + 'static {
 
     async fn cancel(&self, worker: WorkerId, req: ReqId);
 
+    async fn end_session(&self, session: SessionId);
+
     fn connected(&self) -> watch::Receiver<Arc<HashSet<WorkerId>>>;
 }
 
@@ -92,6 +94,7 @@ struct TurnState {
     affinity: Option<u64>,
     emitted: bool,
     sink: mpsc::Sender<Tokens>,
+    open: Arc<AtomicBool>,
 }
 
 struct Inner {
@@ -106,11 +109,12 @@ struct Inner {
 
 impl Inner {
     async fn run_turn(
-        &self,
+        self: &Arc<Self>,
         session: SessionId,
         tenant: &TenantId,
         input: TurnInput,
         affinity: Option<u64>,
+        open: &Arc<AtomicBool>,
     ) -> Result<(ReqId, TokenRx), SessionError> {
         let req_id = ReqId(self.next_req.fetch_add(1, Ordering::Relaxed));
         let request = Request {
@@ -122,10 +126,22 @@ impl Inner {
             message: input.message,
         };
 
-        self.router
-            .admit(&request)
-            .await
-            .map_err(|r| SessionError::Admission(r.0))?;
+        if let Err(r) = self.router.admit(&request).await {
+            // The client hears each refusal under its own id; the server log
+            // hears the first and then every doubling, so a pool that admits
+            // nothing for minutes leaves a trace without a line per launch.
+            static REFUSED: AtomicU64 = AtomicU64::new(0);
+            let refused = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+            if refused.is_power_of_two() {
+                tracing::warn!(
+                    tenant = %tenant,
+                    refused,
+                    "turn refused at admission: {}",
+                    r.0
+                );
+            }
+            return Err(SessionError::Admission(r.0));
+        }
 
         let (tx, rx) = mpsc::channel(self.pipe_cap);
         {
@@ -138,23 +154,61 @@ impl Inner {
                     affinity,
                     emitted: false,
                     sink: tx,
+                    open: open.clone(),
                 },
             );
         }
 
-        match self.router.dispatch(&request, affinity).await {
-            Ok(worker) => {
-                let mut turns = self.turns.lock().unwrap();
-                if let Some(turn) = turns.get_mut(&req_id) {
-                    turn.worker = Some(worker);
-                }
-                Ok((req_id, TokenRx { rx }))
-            }
+        // On a task of its own so a caller dropped mid-dispatch still learns
+        // where the turn landed, and `dispatch` can cancel it there.
+        let inner = self.clone();
+        let open = open.clone();
+        match tokio::spawn(async move { inner.dispatch(req_id, &request, affinity, &open).await })
+            .await
+        {
+            Ok(Ok(_)) => Ok((req_id, TokenRx { rx })),
+            _ => Err(SessionError::NoWorker),
+        }
+    }
+
+    /// Dispatches a turn and binds it to the worker that took it. A turn
+    /// aborted meanwhile, or whose receiver is gone, is cancelled there, and
+    /// its session ended there too once closed, since the dispatch reopened it.
+    async fn dispatch(
+        &self,
+        req_id: ReqId,
+        request: &Request,
+        affinity: Option<u64>,
+        open: &AtomicBool,
+    ) -> Result<WorkerId, DispatchFail> {
+        let worker = match self.router.dispatch(request, affinity).await {
+            Ok(worker) => worker,
             Err(DispatchFail) => {
                 self.turns.lock().unwrap().remove(&req_id);
-                Err(SessionError::NoWorker)
+                return Err(DispatchFail);
+            }
+        };
+        let bound = {
+            let mut turns = self.turns.lock().unwrap();
+            match turns.get_mut(&req_id) {
+                Some(turn) if !turn.sink.is_closed() => {
+                    turn.worker = Some(worker);
+                    true
+                }
+                Some(_) => {
+                    turns.remove(&req_id);
+                    false
+                }
+                None => false,
+            }
+        };
+        if !bound {
+            self.router.cancel(worker, req_id).await;
+            if !open.load(Ordering::Acquire) {
+                self.router.end_session(request.session).await;
             }
         }
+        Ok(worker)
     }
 
     fn abort_turn(&self, req_id: ReqId) -> Option<WorkerId> {
@@ -205,25 +259,24 @@ impl Sessions {
             Affinity::Sticky => Some(session.0),
         };
         self.inner.live.fetch_add(1, Ordering::Relaxed);
-        let (req_id, rx) = match self
-            .inner
-            .run_turn(session, &ident.tenant, first, affinity_key)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                self.inner.live.fetch_sub(1, Ordering::Relaxed);
-                return Err(e);
-            }
-        };
+        // Made before the first turn so a create dropped mid-dispatch still
+        // releases its count and ends the session.
         let handle = SessionHandle {
             inner: self.inner.clone(),
             session,
             tenant: ident.tenant,
             affinity_key,
-            current: Mutex::new(vec![req_id]),
+            current: Mutex::new(Vec::new()),
+            open: Arc::new(AtomicBool::new(true)),
         };
-        Ok((handle, rx))
+        match handle.turn(first).await {
+            Ok(rx) => Ok((handle, rx)),
+            Err(e) => {
+                // Nothing reached a worker, so there is no session to end.
+                handle.open.store(false, Ordering::Release);
+                Err(e)
+            }
+        }
     }
 
     pub async fn feed(&self, req_id: ReqId, chunk: Tokens) -> worker_api::Control {
@@ -264,26 +317,16 @@ impl Sessions {
             match turns.get_mut(&req_id) {
                 Some(turn) => {
                     turn.worker = None;
-                    Some((turn.request.clone(), turn.affinity))
+                    Some((turn.request.clone(), turn.affinity, turn.open.clone()))
                 }
                 None => None,
             }
         };
-        let Some((request, affinity)) = entry else {
+        let Some((request, affinity, open)) = entry else {
             return;
         };
         tokio::spawn(async move {
-            match inner.router.dispatch(&request, affinity).await {
-                Ok(worker) => {
-                    let mut turns = inner.turns.lock().unwrap();
-                    if let Some(turn) = turns.get_mut(&req_id) {
-                        turn.worker = Some(worker);
-                    }
-                }
-                Err(DispatchFail) => {
-                    inner.turns.lock().unwrap().remove(&req_id);
-                }
-            }
+            let _ = inner.dispatch(req_id, &request, affinity, &open).await;
         });
     }
 
@@ -310,13 +353,20 @@ pub struct SessionHandle {
     tenant: TenantId,
     affinity_key: Option<u64>,
     current: Mutex<Vec<ReqId>>,
+    open: Arc<AtomicBool>,
 }
 
 impl SessionHandle {
     pub async fn turn(&self, next: TurnInput) -> Result<TokenRx, SessionError> {
         let (req_id, rx) = self
             .inner
-            .run_turn(self.session, &self.tenant, next, self.affinity_key)
+            .run_turn(
+                self.session,
+                &self.tenant,
+                next,
+                self.affinity_key,
+                &self.open,
+            )
             .await?;
         self.current.lock().unwrap().push(req_id);
         Ok(rx)
@@ -333,6 +383,9 @@ impl SessionHandle {
 
     pub async fn close(&self) {
         self.cancel().await;
+        if self.open.swap(false, Ordering::AcqRel) {
+            self.inner.router.end_session(self.session).await;
+        }
     }
 
     pub fn id(&self) -> SessionId {
@@ -350,6 +403,11 @@ impl Drop for SessionHandle {
                 tokio::spawn(async move { router.cancel(worker, req_id).await });
             }
         }
+        if self.open.swap(false, Ordering::AcqRel) {
+            let router = self.inner.router.clone();
+            let session = self.session;
+            tokio::spawn(async move { router.end_session(session).await });
+        }
     }
 }
 
@@ -362,16 +420,24 @@ fn spawn_drop_watcher(inner: Arc<Inner>) {
             }
             let live: Arc<HashSet<WorkerId>> = connected.borrow_and_update().clone();
 
-            let affected: Vec<(ReqId, bool, Request, Option<u64>)> = {
+            let affected: Vec<_> = {
                 let turns = inner.turns.lock().unwrap();
                 turns
                     .iter()
                     .filter(|(_, t)| t.worker.is_some_and(|w| !live.contains(&w)))
-                    .map(|(id, t)| (*id, t.emitted, t.request.clone(), t.affinity))
+                    .map(|(id, t)| {
+                        (
+                            *id,
+                            t.emitted,
+                            t.request.clone(),
+                            t.affinity,
+                            t.open.clone(),
+                        )
+                    })
                     .collect()
             };
 
-            for (req_id, emitted, request, affinity) in affected {
+            for (req_id, emitted, request, affinity, open) in affected {
                 if emitted {
                     inner.turns.lock().unwrap().remove(&req_id);
                     continue;
@@ -383,17 +449,7 @@ fn spawn_drop_watcher(inner: Arc<Inner>) {
                         None => continue,
                     }
                 }
-                match inner.router.dispatch(&request, affinity).await {
-                    Ok(worker) => {
-                        let mut turns = inner.turns.lock().unwrap();
-                        if let Some(turn) = turns.get_mut(&req_id) {
-                            turn.worker = Some(worker);
-                        }
-                    }
-                    Err(DispatchFail) => {
-                        inner.turns.lock().unwrap().remove(&req_id);
-                    }
-                }
+                let _ = inner.dispatch(req_id, &request, affinity, &open).await;
             }
         }
     });
@@ -411,6 +467,10 @@ mod tests {
         dispatched: Mutex<Vec<ReqId>>,
         affinities: Mutex<Vec<Option<u64>>>,
         cancels: Mutex<Vec<(WorkerId, ReqId)>>,
+        ended: Mutex<Vec<SessionId>>,
+        held: AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
         _connected_tx: watch::Sender<Arc<HashSet<WorkerId>>>,
         connected_rx: watch::Receiver<Arc<HashSet<WorkerId>>>,
     }
@@ -425,6 +485,10 @@ mod tests {
                 dispatched: Mutex::new(Vec::new()),
                 affinities: Mutex::new(Vec::new()),
                 cancels: Mutex::new(Vec::new()),
+                ended: Mutex::new(Vec::new()),
+                held: AtomicBool::new(false),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
                 _connected_tx: tx,
                 connected_rx: rx,
             })
@@ -447,6 +511,10 @@ mod tests {
         ) -> Result<WorkerId, DispatchFail> {
             self.dispatched.lock().unwrap().push(req.req_id);
             self.affinities.lock().unwrap().push(affinity);
+            if self.held.load(Ordering::Acquire) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
             match *self.dispatch_worker.lock().unwrap() {
                 Some(w) => Ok(w),
                 None => Err(DispatchFail),
@@ -454,6 +522,9 @@ mod tests {
         }
         async fn cancel(&self, worker: WorkerId, req: ReqId) {
             self.cancels.lock().unwrap().push((worker, req));
+        }
+        async fn end_session(&self, session: SessionId) {
+            self.ended.lock().unwrap().push(session);
         }
         fn connected(&self) -> watch::Receiver<Arc<HashSet<WorkerId>>> {
             self.connected_rx.clone()
@@ -524,10 +595,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closing_a_session_ends_it_on_the_worker() {
+        let router = MockRouter::new(Some(WorkerId(3)));
+        let sessions = Sessions::new(router.clone());
+        let (handle, _rx) = sessions
+            .create(ident(), input(), Affinity::Sticky)
+            .await
+            .unwrap();
+        let session = handle.id();
+        handle.close().await;
+        assert!(router.ended.lock().unwrap().contains(&session));
+    }
+
+    #[tokio::test]
     async fn no_worker_surfaces() {
         let router = MockRouter::new(None);
         let sessions = Sessions::new(router);
         let res = sessions.create(ident(), input(), Affinity::Sticky).await;
         assert!(matches!(res, Err(SessionError::NoWorker)));
+    }
+
+    async fn settle() {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_dispatches_are_cancelled_where_they_land() {
+        let router = MockRouter::new(Some(WorkerId(7)));
+        let sessions = Sessions::new(router.clone());
+        router.held.store(true, Ordering::Release);
+
+        let create = tokio::spawn({
+            let sessions = sessions.clone();
+            async move { sessions.create(ident(), input(), Affinity::Sticky).await }
+        });
+        router.entered.notified().await;
+        create.abort();
+        let _ = create.await;
+        router.release.notify_one();
+        settle().await;
+        assert_eq!(
+            *router.cancels.lock().unwrap(),
+            vec![(WorkerId(7), ReqId(0))]
+        );
+        assert!(router.ended.lock().unwrap().contains(&SessionId(0)));
+        assert_eq!(sessions.live(), 0);
+
+        router.held.store(false, Ordering::Release);
+        let (handle, _rx) = sessions
+            .create(ident(), input(), Affinity::Sticky)
+            .await
+            .unwrap();
+        router.held.store(true, Ordering::Release);
+        {
+            let mut turn = Box::pin(handle.turn(input()));
+            tokio::select! {
+                _ = router.entered.notified() => {}
+                _ = &mut turn => panic!("turn dispatched while held"),
+            }
+        }
+        router.release.notify_one();
+        settle().await;
+        assert!(
+            router
+                .cancels
+                .lock()
+                .unwrap()
+                .contains(&(WorkerId(7), ReqId(2)))
+        );
+        assert!(!sessions.inner.turns.lock().unwrap().contains_key(&ReqId(2)));
+        assert!(!router.ended.lock().unwrap().contains(&handle.id()));
     }
 }

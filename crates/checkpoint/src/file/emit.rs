@@ -336,6 +336,11 @@ fn available_bytes(directory: &Path) -> Result<u64, Error> {
     Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 
+#[cfg(not(any(unix, windows)))]
+fn available_bytes(_directory: &Path) -> Result<u64, Error> {
+    Ok(0)
+}
+
 #[cfg(windows)]
 fn available_bytes(directory: &Path) -> Result<u64, Error> {
     use std::os::windows::ffi::OsStrExt;
