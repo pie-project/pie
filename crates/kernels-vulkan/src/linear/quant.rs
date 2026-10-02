@@ -3,12 +3,32 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+use dtype::Dtype;
+
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, refuse, stated};
 use crate::error::Error;
 use crate::tensor::{Bank, Tensor};
 
 const QMM_FILE: &str = "quant/qmm_t.slang";
 const QMV_FILE: &str = "quant/qmv.slang";
+
+/// The PTQ1_0 ternary decode-in-dot kernel (`Dtype::Ptq1_0`, `g128_t3_f16_n`).
+const PTQ1_0_FILE: &str = "quant/ptq1_0.slang";
+
+/// Production qmv entrypoint: bf16 activation in, bf16 out.
+const PTQ1_0_QMV: &str = "ptq1_0_qmv_bfloat16";
+
+/// Bit-exact read-back entrypoint: bf16 activation in, f32 out (the oracle test).
+const PTQ1_0_QMV_F32: &str = "ptq1_0_qmv_bfloat16_f32";
+
+/// Weights per PTQ1_0 block; the scale is INLINE per block (single plane).
+const PTQ1_0_BLOCK: u32 = 128;
+
+/// Output rows a PTQ1_0 workgroup owns (`PIE_RLANES`); 32 lanes split the
+/// K-blocks of each row and a groupshared tree reduces them.
+const PTQ1_0_RLANES: u32 = 8;
+
+const PTQ1_0_GROUP: [u32; 3] = [32, 8, 1];
 
 const GROUPS: [i32; 3] = [32, 64, 128];
 
@@ -365,6 +385,17 @@ pub fn act_x_wt(
     let _ = scratch;
     dtype_dispatch!(op, act.dtype, { Bf16 => () });
 
+    // PTQ1_0 is a single-plane inline-scale ternary bank: the fp16 scale lives
+    // inside each 28-byte block, so there is no `scales`/`biases` plane to pair.
+    // Route it to its own decode-in-dot kernel before the affine 3-plane checks.
+    if w.codes.dtype == Dtype::Ptq1_0 {
+        let (rows, columns, contraction) = extent(op, act, y)?;
+        if rows == 0 {
+            return Ok(());
+        }
+        return ptq1_0_matmul(ctx, op, act, w, y, rows, columns, contraction);
+    }
+
     let Some(biases) = w.biases else {
         return Err(refuse(
             op,
@@ -471,6 +502,55 @@ pub fn act_x_wt(
             n.arg(),
             m.arg(),
         ],
+    )
+}
+
+/// Serve a PTQ1_0 (ternary, `g128_t3_f16_n`) projection with the decode-in-dot
+/// kernel. The bank is single-plane: `w.codes` carries the 28-byte blocks with
+/// their inline fp16 scale, and `w.scales`/`w.biases` are unused (the loader
+/// leaves `scales` aliased at the codes plane and this path never reads it). One
+/// workgroup owns `PTQ1_0_RLANES` output rows for one activation vector; its 32
+/// lanes split that row's K-blocks and a groupshared tree reduces them. A bf16
+/// output selects the production entrypoint; an f32 output selects the
+/// bit-exact read-back entrypoint.
+fn ptq1_0_matmul(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    act: Tensor,
+    w: Bank,
+    y: Tensor,
+    rows: u32,
+    columns: u32,
+    contraction: u32,
+) -> Result<(), Error> {
+    if !contraction.is_multiple_of(PTQ1_0_BLOCK) {
+        return Err(refuse(
+            op,
+            format!(
+                "the contraction is {contraction}, not a whole number of {PTQ1_0_BLOCK}-weight \
+                 ternary blocks: a PTQ1_0 row is `ceil(K/{PTQ1_0_BLOCK}) * 28` bytes and the \
+                 kernel reads one 28-byte block per {PTQ1_0_BLOCK} contracted weights"
+            ),
+        ));
+    }
+    let entry = match y.dtype {
+        Dtype::Bf16 => PTQ1_0_QMV,
+        Dtype::F32 => PTQ1_0_QMV_F32,
+        other => {
+            return Err(Error::DtypeUnsupported { op, dtype: other });
+        }
+    };
+    // `rows` is the batch of activation vectors (`vecs`); `columns` is the
+    // output vector size; `contraction` is K.
+    let (m, n) = (stated(op, rows)?, stated(op, columns)?);
+    let k = stated(op, contraction)?;
+    ctx.fire(
+        Fire::at(PTQ1_0_FILE, entry)
+            .groups([columns.div_ceil(PTQ1_0_RLANES), rows, 1])
+            .group(PTQ1_0_GROUP),
+        // Buffers fill bindings 0..2; the scalars fill `Push { out_vec_size,
+        // in_vec_size, vecs }` in order.
+        &[w.codes.arg(), act.arg(), y.arg_mut(), n.arg(), k.arg(), m.arg()],
     )
 }
 
