@@ -826,6 +826,9 @@ impl Run<'_> {
                 self.tensor(*comb_mix),
                 self.tensor(*y),
             ),
+            // The XLA backend has no Hadamard/FWHT kernel; report it as
+            // unsupported, the same way the wgpu and vulkan backends do.
+            Elementwise::Hadamard { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
         }
     }
 }

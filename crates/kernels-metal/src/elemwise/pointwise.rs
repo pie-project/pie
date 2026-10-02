@@ -86,6 +86,97 @@ pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
     activation(ctx, OP, entry, x, o)
 }
 
+/// The entrypoint and threads-per-block for a butterfly FWHT of a given block
+/// size and element type. Blocks up to 256 ride one simdgroup (32 threads);
+/// 512 and 1024 ride a 256-thread threadgroup.
+fn fwht_point(
+    op: &'static str,
+    block: u32,
+    dtype: dtype::Dtype,
+) -> Result<(&'static str, u32), Error> {
+    Ok(match (block, dtype) {
+        (64, dtype::Dtype::Bf16) => ("fwht_simd_bfloat16_n_64", 32),
+        (64, dtype::Dtype::F32) => ("fwht_simd_float32_n_64", 32),
+        (128, dtype::Dtype::Bf16) => ("fwht_simd_bfloat16_n_128", 32),
+        (128, dtype::Dtype::F32) => ("fwht_simd_float32_n_128", 32),
+        (256, dtype::Dtype::Bf16) => ("fwht_simd_bfloat16_n_256", 32),
+        (256, dtype::Dtype::F32) => ("fwht_simd_float32_n_256", 32),
+        (512, dtype::Dtype::Bf16) => ("fwht_tg_bfloat16_n_512", 256),
+        (512, dtype::Dtype::F32) => ("fwht_tg_float32_n_512", 256),
+        (1024, dtype::Dtype::Bf16) => ("fwht_tg_bfloat16_n_1024", 256),
+        (1024, dtype::Dtype::F32) => ("fwht_tg_float32_n_1024", 256),
+        (64 | 128 | 256 | 512 | 1024, other) => {
+            return Err(Error::DtypeUnsupported { op, dtype: other });
+        }
+        (other, _) => {
+            return Err(refuse(
+                op,
+                format!(
+                    "block {other} is not a supported Hadamard size; the butterfly turns \
+                     64, 128, 256, 512 and 1024-vectors"
+                ),
+            ));
+        }
+    })
+}
+
+/// A blockwise butterfly FWHT over the last dim, in place. The row width must
+/// be a multiple of `block`; each contiguous `block`-vector is turned by the
+/// normalized Sylvester Hadamard matrix. When `signs` is `Some`, its ±1 entries
+/// multiply the activation on load, before the butterfly (the Randomized
+/// Hadamard `H·S`); the sign vector repeats block-wise if wider than `block`.
+pub fn hadamard(ctx: &Ctx<'_>, x: Tensor, block: u32, signs: Option<Tensor>) -> Result<(), Error> {
+    const OP: &str = "elementwise.hadamard";
+    let (entry, threads) = fwht_point(OP, block, x.dtype)?;
+    if !x.width.is_multiple_of(block) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the row width {} is not a multiple of {block}; the block Hadamard turns \
+                 contiguous {block}-vectors",
+                x.width
+            ),
+        ));
+    }
+    if let Some(s) = signs {
+        if s.dtype != x.dtype {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the sign diagonal is {:?} and the activation is {:?}; the signs ride the \
+                     activation's element",
+                    s.dtype, x.dtype
+                ),
+            ));
+        }
+        let signs_width = u64::from(s.rows) * u64::from(s.width);
+        if !signs_width.is_multiple_of(u64::from(block)) {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the sign diagonal holds {signs_width} entries, which is not a multiple of \
+                     {block}; it repeats block-wise"
+                ),
+            ));
+        }
+    }
+    let total = u64::from(nonzero(OP, "width", x.width)?) * u64::from(nonzero(OP, "rows", x.rows)?);
+    let nblocks = u32::try_from(total / u64::from(block))
+        .map_err(|_| refuse(OP, format!("{total} elements will not launch")))?;
+    let lanes = nblocks
+        .checked_mul(threads)
+        .ok_or_else(|| refuse(OP, format!("{nblocks} blocks will not launch")))?;
+    let signs_width = signs.map_or(0, |s| s.rows * s.width);
+    let signs_arg = match signs {
+        Some(s) => s.arg(),
+        None => ctx.absent()?,
+    };
+    ctx.fire(
+        Fire::at(FILE, entry).apply(Grid::of([lanes, 1, 1], [threads, 1, 1])),
+        &[x.arg_mut(), signs_arg, signs_width.arg()],
+    )
+}
+
 #[allow(clippy::neg_cmp_op_on_partial_ord)]
 pub fn clamp(ctx: &Ctx<'_>, lo: f32, hi: f32, x: Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.clamp";

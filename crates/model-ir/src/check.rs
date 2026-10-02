@@ -163,6 +163,37 @@ pub enum Fault {
         want: Dtype,
         ty: Ty,
     },
+    HadamardBlock {
+        node: usize,
+        op: &'static str,
+        id: ValueId,
+        block: u32,
+        last: Option<Dim>,
+        why: HadamardWhy,
+    },
+    HadamardSignDtype {
+        node: usize,
+        op: &'static str,
+        x: ValueId,
+        signs: ValueId,
+        act: Dtype,
+        sign: Dtype,
+    },
+}
+
+/// The smallest and largest Hadamard block the Metal butterfly instantiates.
+pub const HADAMARD_MIN: u32 = 64;
+pub const HADAMARD_MAX: u32 = 1024;
+
+/// Which Hadamard invariant a [`Fault::HadamardBlock`] flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HadamardWhy {
+    /// The block size is not a power of two in the supported span.
+    Block,
+    /// The activation's last dim is not a whole number of blocks.
+    Width,
+    /// The sign diagonal's last dim is not a whole number of blocks.
+    Signs,
 }
 
 pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
@@ -306,6 +337,75 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
                     ty: decl.ty.clone(),
                     def: DefKind::of(&decl.def),
                 });
+            }
+        }
+
+        if let Operation::Elementwise(Elementwise::Hadamard {
+            x, block, signs, ..
+        }) = &node.op
+        {
+            let block = *block;
+            // The block must be a power of two in the kernel's supported span.
+            if !block.is_power_of_two() || !(HADAMARD_MIN..=HADAMARD_MAX).contains(&block) {
+                faults.push(Fault::HadamardBlock {
+                    node: j,
+                    op,
+                    id: *x,
+                    block,
+                    last: None,
+                    why: HadamardWhy::Block,
+                });
+            } else {
+                // The transformed row's last dim must tile into whole blocks.
+                if in_range(*x)
+                    && let Ty::Tensor { shape, .. } = &trace.values[x.0 as usize].ty
+                {
+                    let last = shape.last().copied();
+                    if !matches!(last, Some(Dim::Const(d)) if d % u64::from(block) == 0) {
+                        faults.push(Fault::HadamardBlock {
+                            node: j,
+                            op,
+                            id: *x,
+                            block,
+                            last,
+                            why: HadamardWhy::Width,
+                        });
+                    }
+                }
+                // A present sign diagonal repeats block-wise, so its own last
+                // dim must itself be a whole number of blocks.
+                if let Some(s) = signs
+                    && in_range(*s)
+                    && let Ty::Tensor { shape, dtype: sign } = &trace.values[s.0 as usize].ty
+                {
+                    let last = shape.last().copied();
+                    if !matches!(last, Some(Dim::Const(d)) if d % u64::from(block) == 0) {
+                        faults.push(Fault::HadamardBlock {
+                            node: j,
+                            op,
+                            id: *s,
+                            block,
+                            last,
+                            why: HadamardWhy::Signs,
+                        });
+                    }
+                    // The signs multiply the activation on load, so the kernel
+                    // reads both through one element; mismatched dtypes are
+                    // rejected here rather than at launch.
+                    if in_range(*x)
+                        && let Ty::Tensor { dtype: act, .. } = &trace.values[x.0 as usize].ty
+                        && act != sign
+                    {
+                        faults.push(Fault::HadamardSignDtype {
+                            node: j,
+                            op,
+                            x: *x,
+                            signs: *s,
+                            act: *act,
+                            sign: *sign,
+                        });
+                    }
+                }
             }
         }
     }
@@ -728,6 +828,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Elementwise::Silu { .. }
             | Elementwise::Gelu { .. }
             | Elementwise::Tanh { .. }
+            | Elementwise::Hadamard { .. }
             | Elementwise::Mul { .. }
             | Elementwise::Add { .. } => &[],
         },
@@ -1118,6 +1219,51 @@ impl Display for Fault {
                     V(*id),
                     N(*want),
                     T(ty)
+                )
+            }
+            Fault::HadamardBlock {
+                node,
+                op,
+                id,
+                block,
+                last,
+                why,
+            } => match why {
+                HadamardWhy::Block => write!(
+                    f,
+                    "node {node} ({op}): a Hadamard block of {block} is not a power of two in \
+                     [{HADAMARD_MIN}, {HADAMARD_MAX}]; the butterfly turns 64, 128, 256, 512 \
+                     and 1024-vectors",
+                ),
+                HadamardWhy::Width => write!(
+                    f,
+                    "node {node} ({op}): {} has last dim {last:?}, but a Hadamard block of \
+                     {block} needs a last dim that is a multiple of {block}",
+                    V(*id)
+                ),
+                HadamardWhy::Signs => write!(
+                    f,
+                    "node {node} ({op}): the sign diagonal {} has last dim {last:?}, but it \
+                     repeats block-wise and so needs a last dim that is a multiple of {block}",
+                    V(*id)
+                ),
+            },
+            Fault::HadamardSignDtype {
+                node,
+                op,
+                x,
+                signs,
+                act,
+                sign,
+            } => {
+                write!(
+                    f,
+                    "node {node} ({op}): the sign diagonal {} is {}, but the activation {} it \
+                     rides is {}; the signs multiply on the activation's element",
+                    V(*signs),
+                    N(*sign),
+                    V(*x),
+                    N(*act)
                 )
             }
         }

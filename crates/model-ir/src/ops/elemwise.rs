@@ -405,6 +405,12 @@ pub enum Elementwise {
         x: ValueId,
         x_out: ValueId,
     },
+    Hadamard {
+        x: ValueId,
+        x_out: ValueId,
+        block: u32,
+        signs: Option<ValueId>,
+    },
     Mul {
         x: ValueId,
         y: ValueId,
@@ -631,6 +637,12 @@ impl Operands for Elementwise {
             Self::Silu { x, .. } => sink.push(*x),
             Self::Gelu { x, .. } => sink.push(*x),
             Self::Tanh { x, .. } => sink.push(*x),
+            Self::Hadamard { x, signs, .. } => {
+                sink.push(*x);
+                if let Some(s) = signs {
+                    sink.push(*s);
+                }
+            }
             Self::Mul { x, y, .. } => sink.extend([*x, *y]),
             Self::Add { x, y, .. } => sink.extend([*x, *y]),
             Self::RopeAxes { x, positions, .. } => sink.extend([*x, *positions]),
@@ -723,6 +735,7 @@ impl Operands for Elementwise {
             Self::Silu { x_out, .. } => sink.push(*x_out),
             Self::Gelu { x_out, .. } => sink.push(*x_out),
             Self::Tanh { x_out, .. } => sink.push(*x_out),
+            Self::Hadamard { x_out, .. } => sink.push(*x_out),
             Self::Mul { z, .. } => sink.push(*z),
             Self::Add { z, .. } => sink.push(*z),
             Self::RopeAxes { x_out, .. } => sink.push(*x_out),
@@ -794,6 +807,7 @@ impl Operands for Elementwise {
             Self::Silu { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::Gelu { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::Tanh { x_out, x, .. } => sink.push((*x_out, *x)),
+            Self::Hadamard { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::Mul { .. } => {}
             Self::Add { .. } => {}
             Self::RopeAxes { x_out, x, .. } => sink.push((*x_out, *x)),
@@ -851,6 +865,7 @@ impl Operands for Elementwise {
             Self::Silu { .. } => "elementwise.silu",
             Self::Gelu { .. } => "elementwise.gelu",
             Self::Tanh { .. } => "elementwise.tanh",
+            Self::Hadamard { .. } => "elementwise.hadamard",
             Self::Mul { .. } => "elementwise.mul",
             Self::Add { .. } => "elementwise.add",
             Self::RopeAxes { .. } => "elementwise.rope_axes",
