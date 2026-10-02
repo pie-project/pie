@@ -15,6 +15,20 @@ pub fn enabled(pool: &KvPool, dim: u32) -> bool {
         && u64::from(pool.keys.width) == pool.seq_stride
 }
 
+/// Whether the MPP kernel serves these rows over a pool stored as it was written.
+pub(super) fn mpp_fits(q: Tensor, pool: &KvPool, dim: u32, causal: bool, lse: bool) -> bool {
+    causal
+        && !lse
+        && q.rows >= 32
+        && matches!(dim, 128 | 256)
+        && pool.page_size == 32
+        && pool.keys.dtype == Dtype::Bf16
+        && pool.values.dtype == Dtype::Bf16
+        && pool.head_stride == u64::from(dim)
+        && pool.keys.width == pool.values.width
+        && u64::from(pool.keys.width) == pool.seq_stride
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn attention(
     ctx: &Ctx<'_>,
@@ -31,6 +45,7 @@ pub(super) fn attention(
     allow_mpp: bool,
 ) -> Result<(), Error> {
     let shape = Paged::of(op, q, pool, window, causal, dim)?;
+    let q8 = enabled(pool, dim);
     let mpp = allow_mpp
         && causal
         && lse.is_none()
@@ -49,9 +64,12 @@ pub(super) fn attention(
         "q8_vector_gqa_2"
     } else {
         match (mpp, lse.is_some(), dim) {
-            (true, _, 128) => "q8_mpp_d128",
-            (true, _, 256) if q.rows >= 512 => "q8_visit_direct",
-            (true, _, 256) => "q8_mpp_d256",
+            (true, _, 128) if q8 => "q8_mpp_d128",
+            (true, _, 256) if q8 && q.rows >= 512 => "q8_visit_direct",
+            (true, _, 256) if q8 => "q8_mpp_d256",
+            (true, _, 128) => "sdpa_mpp_d128",
+            (true, _, 256) if q.rows >= 512 => "sdpa_visit_direct",
+            (true, _, 256) => "sdpa_mpp_d256",
             (_, false, 64) => "q8_decode_bfloat16_d_64",
             (_, false, 128) => "q8_decode_bfloat16_d_128",
             (_, false, 256) => "q8_decode_bfloat16_d_256",
