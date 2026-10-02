@@ -208,6 +208,21 @@ fn the_bonsai_27b_serves_ptq1_0_and_matches_the_fork_oracle() {
         eprintln!("bonsai: no Metal device; skipping the serve");
         return;
     }
+    // With `PIE_BONSAI_MPP=1` force the Apple10 MPP prefill fast-path on: the
+    // load then packs every PTQ1_0 bank onto the affine MPP layout (exercising
+    // `repack_mpp`'s ternary branch on the real 27B weights), and the serve
+    // still reproduces the fork oracle — the real-model quality-neutral +
+    // no-OOM integration check for the ternary MPP path. Default (unset) leaves
+    // the serve on its native decode path, unchanged.
+    if std::env::var_os("PIE_BONSAI_MPP").is_some() {
+        assert!(kernels_metal::tuning::override_with(
+            kernels_metal::tuning::Overrides {
+                qmm_mpp: Some(true),
+                ..Default::default()
+            }
+        ));
+        eprintln!("bonsai: PIE_BONSAI_MPP set — Apple10 ternary MPP prefill forced on");
+    }
     let Some(gguf) = gguf_path() else {
         eprintln!("bonsai: BONSAI_GGUF unset or missing; skipping the real-file serve");
         return;

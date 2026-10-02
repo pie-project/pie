@@ -548,6 +548,26 @@ pub fn act_x_wt(
         if rows == 0 {
             return Ok(());
         }
+        // A packed ternary bank decodes onto the affine MPP packed layout
+        // (code=trit, scale=d, bias=-d), so the prefill fast-path is the exact
+        // affine MPP packed fire against a pseudo-affine (g64, 4-bit) bank. In
+        // packed mode the scales/biases ARGS are ignored (the kernel reads the
+        // factors from the packed buffer), so any bound tensor serves — reuse
+        // the packed handle. Small/odd shapes fall through to the QMV decoder.
+        if let Some(packed) = w.mpp_codes {
+            let pseudo = Bank {
+                codes: w.codes,
+                mpp_codes: w.mpp_codes,
+                scales: packed,
+                biases: Some(packed),
+                group: 64,
+                bits: 4,
+            };
+            if mpp_prefill(ctx, op, act, pseudo, y, &scratch, capacity_rows, rows, columns, contraction)?
+            {
+                return Ok(());
+            }
+        }
         return ptq1_0_matmul(ctx, op, act, w, y, rows, columns, contraction);
     }
     let Some(biases) = w.biases else {
@@ -583,131 +603,10 @@ pub fn act_x_wt(
         stated(op, columns)?,
         stated(op, contraction)?,
     );
-    let tuned = crate::tuning::current();
-    let bm = match rows {
-        1..=8 => 8,
-        9..=16 => 16,
-        17..=24 => 24,
-        _ => 32,
-    };
-    let bn = if bm == 8 { 64 } else { 128 };
-    if tuned.qmm_mpp
-        && bits == 4
-        && group == 64
-        && rows >= 8
-        && columns % bn == 0
-        && (rows > 16 || columns >= 1024)
-    {
-        let padded = rows.div_ceil(bm) * bm;
-        if padded <= capacity_rows
-            && let Some(staged) = (scratch.precast)(padded, contraction)
-        {
-            const FILE: &str = "linear/quant_qmm_mpp.metal";
-            let aux = Tensor::new(staged.buf, padded, contraction / 64, dtype::Dtype::F32);
-            ctx.fire(
-                Fire::at(FILE, "qmm_mpp_input_sums")
-                    .apply(Grid::of([32 * (contraction / 64), padded, 1], [32, 4, 1])),
-                &[act.arg(), aux.arg_mut(), k.arg(), bm.arg()],
-            )?;
-            let partitions = if rows > 32 { 2u32 } else { 4u32 };
-            let partial = if (rows <= 32 || (rows <= 64 && columns <= 8192))
-                && columns <= 65536
-                && contraction % 256 == 0
-            {
-                (scratch.partials)(padded * partitions, columns)
-            } else {
-                None
-            };
-            let split = if partial.is_some() { partitions } else { 1u32 };
-            let packed = w.mpp_codes.is_some();
-            let local = bm == 8 && packed && split == 4;
-            let simdgroups = if bm == 8 { 2 } else { 4 };
-            let pipeline = !local && rows <= 16 && columns <= 8192;
-            let linear_mode = if rows >= 1024 && split == 1 && packed {
-                16
-            } else {
-                -1
-            };
-            let kind = if packed { "packed" } else { "native" };
-            let index = if packed
-                && rows >= 1024
-                && split == 1
-                && [
-                    (padded, contraction),
-                    (padded, columns),
-                    (contraction, columns),
-                ]
-                .iter()
-                .all(|&(a, b)| a.checked_mul(b).is_some())
-            {
-                "uint"
-            } else {
-                "ulong"
-            };
-            let groups_per_tg = simdgroups * if local { split } else { 1 };
-            let entry = symbol(&format!(
-                "affine_qmm_mpp_{kind}_m{bm}_n{bn}_s{simdgroups}_k{split}_p{pipeline}_l{local}_g{}_{index}",
-                linear_mode + 1
-            ));
-            let stamp = symbol(&format!(
-                "PIE_MPP_POINT(\"{entry}\",{bm},{bn},{simdgroups},{packed},false,{split},{pipeline},{local},{linear_mode},{index})"
-            ));
-            ctx.fire(
-                Fire::at(FILE, entry).stamp(stamp).apply(Grid::of(
-                    [
-                        32 * groups_per_tg
-                            * (columns / bn)
-                            * if linear_mode >= 0 { padded / bm } else { 1 },
-                        if linear_mode >= 0 { 1 } else { padded / bm },
-                        if local { 1 } else { split },
-                    ],
-                    [32 * groups_per_tg, 1, 1],
-                )),
-                &[
-                    if packed {
-                        w.mpp_codes.unwrap().arg()
-                    } else {
-                        w.codes.arg()
-                    },
-                    w.scales.arg(),
-                    biases.arg(),
-                    act.arg(),
-                    if local {
-                        y.arg_mut()
-                    } else {
-                        partial.unwrap_or(y).arg_mut()
-                    },
-                    k.arg(),
-                    n.arg(),
-                    aux.arg(),
-                    (if local { rows } else { padded } as i32).arg(),
-                ],
-            )?;
-            if local {
-                return Ok(());
-            }
-            if let Some(partial) = partial {
-                let stride = (padded * columns) as i32;
-                let mut args = vec![ctx.absent()?; 4];
-                args.extend([
-                    y.arg_mut(),
-                    ctx.absent()?,
-                    n.arg(),
-                    ctx.absent()?,
-                    partial.arg(),
-                    ctx.absent()?,
-                    stride.arg(),
-                    (split as i32).arg(),
-                ]);
-                return ctx.fire(
-                    Fire::at(QMM_FILE, SPLITK_REDUCE)
-                        .apply(Grid::of([columns, rows, 1], [256, 1, 1])),
-                    &args,
-                );
-            }
-            return Ok(());
-        }
+    if mpp_prefill(ctx, op, act, w, y, &scratch, capacity_rows, rows, columns, contraction)? {
+        return Ok(());
     }
+    let tuned = crate::tuning::current();
     let fp16 = tuned.fp16_gemm_format(w.bits, w.group);
     let min_batch = if bits == 2 {
         QMM_MIN_BATCH_2BIT
@@ -867,6 +766,161 @@ pub fn act_x_wt(
             n.arg(),
         ],
     )
+}
+
+/// The Apple10 MPP prefill fast-path: the GEMM-shaped `affine_qmm_mpp` fire for
+/// a group-64, 4-bit affine bank. Returns `Ok(true)` when it fired (the caller
+/// is done) and `Ok(false)` when the shape/capacity preconditions do not hold
+/// (the caller falls back to the QMM/QMV points). Both the affine dispatch and
+/// the ternary (PTQ1_0) dispatch call this so kernel selection stays in one
+/// place: a packed ternary bank is layout-identical to a packed affine one
+/// (code=trit, scale=d, bias=-d), so every `kind`/`index`/`linear_mode` choice
+/// applies unchanged.
+#[allow(clippy::too_many_arguments)]
+fn mpp_prefill(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    act: Tensor,
+    w: Bank,
+    y: Tensor,
+    scratch: &Scratch<'_>,
+    capacity_rows: u32,
+    rows: u32,
+    columns: u32,
+    contraction: u32,
+) -> Result<bool, Error> {
+    let tuned = crate::tuning::current();
+    let bm = match rows {
+        1..=8 => 8,
+        9..=16 => 16,
+        17..=24 => 24,
+        _ => 32,
+    };
+    let bn = if bm == 8 { 64 } else { 128 };
+    if !(tuned.qmm_mpp
+        && w.bits == 4
+        && w.group == 64
+        && rows >= 8
+        && columns % bn == 0
+        && (rows > 16 || columns >= 1024))
+    {
+        return Ok(false);
+    }
+    let Some(biases) = w.biases else {
+        return Ok(false);
+    };
+    let (n, k) = (stated(op, columns)?, stated(op, contraction)?);
+    let padded = rows.div_ceil(bm) * bm;
+    if padded > capacity_rows {
+        return Ok(false);
+    }
+    let Some(staged) = (scratch.precast)(padded, contraction) else {
+        return Ok(false);
+    };
+    const FILE: &str = "linear/quant_qmm_mpp.metal";
+    let aux = Tensor::new(staged.buf, padded, contraction / 64, dtype::Dtype::F32);
+    ctx.fire(
+        Fire::at(FILE, "qmm_mpp_input_sums")
+            .apply(Grid::of([32 * (contraction / 64), padded, 1], [32, 4, 1])),
+        &[act.arg(), aux.arg_mut(), k.arg(), bm.arg()],
+    )?;
+    let partitions = if rows > 32 { 2u32 } else { 4u32 };
+    let partial = if (rows <= 32 || (rows <= 64 && columns <= 8192))
+        && columns <= 65536
+        && contraction % 256 == 0
+    {
+        (scratch.partials)(padded * partitions, columns)
+    } else {
+        None
+    };
+    let split = if partial.is_some() { partitions } else { 1u32 };
+    let packed = w.mpp_codes.is_some();
+    let local = bm == 8 && packed && split == 4;
+    let simdgroups = if bm == 8 { 2 } else { 4 };
+    let pipeline = !local && rows <= 16 && columns <= 8192;
+    let linear_mode = if rows >= 1024 && split == 1 && packed {
+        16
+    } else {
+        -1
+    };
+    let kind = if packed { "packed" } else { "native" };
+    let index = if packed
+        && rows >= 1024
+        && split == 1
+        && [
+            (padded, contraction),
+            (padded, columns),
+            (contraction, columns),
+        ]
+        .iter()
+        .all(|&(a, b)| a.checked_mul(b).is_some())
+    {
+        "uint"
+    } else {
+        "ulong"
+    };
+    let groups_per_tg = simdgroups * if local { split } else { 1 };
+    let entry = symbol(&format!(
+        "affine_qmm_mpp_{kind}_m{bm}_n{bn}_s{simdgroups}_k{split}_p{pipeline}_l{local}_g{}_{index}",
+        linear_mode + 1
+    ));
+    let stamp = symbol(&format!(
+        "PIE_MPP_POINT(\"{entry}\",{bm},{bn},{simdgroups},{packed},false,{split},{pipeline},{local},{linear_mode},{index})"
+    ));
+    ctx.fire(
+        Fire::at(FILE, entry).stamp(stamp).apply(Grid::of(
+            [
+                32 * groups_per_tg
+                    * (columns / bn)
+                    * if linear_mode >= 0 { padded / bm } else { 1 },
+                if linear_mode >= 0 { 1 } else { padded / bm },
+                if local { 1 } else { split },
+            ],
+            [32 * groups_per_tg, 1, 1],
+        )),
+        &[
+            if packed {
+                w.mpp_codes.unwrap().arg()
+            } else {
+                w.codes.arg()
+            },
+            w.scales.arg(),
+            biases.arg(),
+            act.arg(),
+            if local {
+                y.arg_mut()
+            } else {
+                partial.unwrap_or(y).arg_mut()
+            },
+            k.arg(),
+            n.arg(),
+            aux.arg(),
+            (if local { rows } else { padded } as i32).arg(),
+        ],
+    )?;
+    if local {
+        return Ok(true);
+    }
+    if let Some(partial) = partial {
+        let stride = (padded * columns) as i32;
+        let mut args = vec![ctx.absent()?; 4];
+        args.extend([
+            y.arg_mut(),
+            ctx.absent()?,
+            n.arg(),
+            ctx.absent()?,
+            partial.arg(),
+            ctx.absent()?,
+            stride.arg(),
+            (split as i32).arg(),
+        ]);
+        ctx.fire(
+            Fire::at(QMM_FILE, SPLITK_REDUCE).apply(Grid::of([columns, rows, 1], [256, 1, 1])),
+            &args,
+        )?;
+        return Ok(true);
+    }
+    Ok(true)
 }
 
 /// Serve a PTQ1_0 (ternary, `g128_t3_f16_n`) projection with the decode-in-dot

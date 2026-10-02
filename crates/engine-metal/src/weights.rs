@@ -434,7 +434,7 @@ impl Weights {
         use crate::encode::Sink;
         use kernels_metal::encode::{Arg, Encode, Fire, Grid};
         let tuned = kernels_metal::tuning::current();
-        if !tuned.qmm_mpp || !tuned.qmm_mpp_packed {
+        if !tuned.qmm_mpp {
             return Ok(());
         }
         if self.tier.is_some() || self.rows.is_some() {
@@ -461,6 +461,41 @@ impl Weights {
                 continue;
             };
             let (n, k) = (bank.codes.rows, bank.codes.width);
+            // PTQ1_0 ternary has NO native MPP layout, so on Apple10 it must
+            // always pack (gated on `qmm_mpp` alone). We DECODE the 28-byte
+            // ternary blocks onto the affine MPP packed layout (code=trit,
+            // scale=d, bias=-d) so the existing `affine_qmm_mpp` PACKED kernel
+            // serves it unchanged. `bank.codes` is kept for the decode/QMV path
+            // (decode-time and non-prefill shapes).
+            if bank.codes.dtype == Dtype::Ptq1_0 {
+                if n % 256 != 0 || k % 128 != 0 {
+                    continue;
+                }
+                let work = n.checked_mul(k / 8).ok_or_else(|| {
+                    Fault::Residency("MPP packed bank exceeds the dispatch grid limit".into())
+                })?;
+                let bytes =
+                    u64::from(n) * u64::from(k) / 2 + u64::from(n) * u64::from(k / 64) * 4;
+                let buffer = Buffer::zeroed(device, bytes)?;
+                let packed = Tensor::new(handles.bind(&buffer, 0, bytes)?, n, k, Dtype::U4g64);
+                let frame = device.frame()?;
+                let sink = Sink::new(device, &frame, &pipelines, handles);
+                sink.fire(
+                    Fire::at("linear/quant_qmm_mpp.metal", "ptq1_0_qmm_mpp_pack_bank")
+                        .apply(Grid::of([work, 1, 1], [256, 1, 1])),
+                    &[bank.codes.arg(), packed.arg_mut(), k.arg(), n.arg()],
+                )?;
+                frame.commit()?;
+                bank.mpp_codes = Some(packed);
+                self.decoded.push(buffer);
+                continue;
+            }
+            // Affine packing keeps its own `qmm_mpp_packed` requirement — on
+            // Apple10 (packed=false) affine stays on the native MPP layout, so
+            // affine behavior is unchanged.
+            if !tuned.qmm_mpp_packed {
+                continue;
+            }
             if bank.bits != 4 || bank.group != 64 || n % 256 != 0 || k % 64 != 0 {
                 continue;
             }

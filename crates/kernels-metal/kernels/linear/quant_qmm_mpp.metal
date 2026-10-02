@@ -38,6 +38,87 @@ kernel void qmm_mpp_pack_bank(const device uint *codes [[buffer(0)]],
   }
 }
 
+// --- PTQ1_0 ternary -> affine MPP packed front-end -------------------------
+//
+// PTQ1_0 reconstructs a weight as `w = (trit - 1) * d`, trit in {0,1,2}, with
+// one fp16 scale `d` per 128-weight block. That is algebraically the affine MPP
+// accumulate `total = sum(code*x)*scale + sum(x)*bias` with code=trit (0,1,2),
+// scale=d, bias=-d. So we DECODE each 28-byte PTQ1_0 block into the exact affine
+// `qmm_mpp_pack_bank` layout (uint4b codes + per-64-group bf16 scale/bias) and
+// the existing `affine_qmm_mpp` PACKED kernel runs unchanged and bit-exactly.
+//
+// A 128-weight block spans two consecutive 64-groups (g, g+1); both get the same
+// d (scale) and -d (bias), so the sum over the two 64-groups equals the sum over
+// the 128 block. The block's natural element order 0..127 (the fork's {16,8}+qh
+// staging) is mirrored here exactly; 64-group g owns block g/2, half g%2, i.e.
+// block elements [64*(g%2) .. 64*(g%2)+64), and lane l of the group is block
+// element 64*(g%2)+l -> uint l/8, nibble (l%8)*4 (the affine lane order).
+
+#define PTQ1_0_BLOCK_BYTES 28
+
+constant int ptq1_0_pow3[5] = {1, 3, 9, 27, 81};
+
+// One base-3 trit (0,1,2) for natural block element `e` of a 28-byte block,
+// mirroring `quant_ptq1_0.metal` / `checkpoint::codec::ptq1_0::decode_block`:
+// `q = (byte * 3^n) & 0xff; trit = (q*3) >> 8`, with the {16,8}+qh staging.
+inline int ptq1_0_block_trit(const device uint8_t *blk, int e) {
+  int byte_idx, n;
+  if (e < 80) { // qs chunk A: bytes 0..15, 5 trit-slots, natural elements 0..79
+    n = e / 16;
+    byte_idx = e % 16;
+  } else if (e < 120) { // qs chunk B: bytes 16..23, elements 80..119
+    int e2 = e - 80;
+    n = e2 / 8;
+    byte_idx = 16 + (e2 % 8);
+  } else { // qh tail: bytes 24..25, 4 trit-slots, elements 120..127
+    int e3 = e - 120;
+    n = e3 / 2;
+    byte_idx = 24 + (e3 % 2);
+  }
+  int q = (int(blk[byte_idx]) * ptq1_0_pow3[n]) & 0xff;
+  return (q * 3) >> 8;
+}
+
+// Decode a native PTQ1_0 bank (`columns` rows x `width` contraction, each row
+// `ceil(width/128)*28` bytes) into the affine MPP packed layout. One thread per
+// output uint (8 uint4b codes = 8 lanes of a 64-group), matching the grid shape
+// of `qmm_mpp_pack_bank`.
+kernel void ptq1_0_qmm_mpp_pack_bank(const device uint8_t *codes [[buffer(0)]],
+                                     device uint *packed [[buffer(1)]],
+                                     constant uint &width [[buffer(2)]],
+                                     constant uint &columns [[buffer(3)]],
+                                     uint word [[thread_position_in_grid]]) {
+  ulong words = ulong(columns) * width / 8;
+  if (word >= words)
+    return;
+  uint groups = width / 64;
+  uint column = word / (width / 8);
+  uint group = (word % (width / 8)) / 8;
+  uint local = word % 8; // which of the group's 8 uints this thread fills
+  ulong parameter = (ulong(column / 256) * groups + group) * 256 + column % 256;
+
+  uint row_bytes = (width / 128) * PTQ1_0_BLOCK_BYTES;
+  uint block_half = group % 2; // 0 -> block elements [0,64), 1 -> [64,128)
+  const device uint8_t *blk =
+      codes + ulong(column) * row_bytes + ulong(group / 2) * PTQ1_0_BLOCK_BYTES;
+
+  uint value = 0;
+  for (uint i = 0; i < 8; i++) {
+    uint lane = local * 8 + i;
+    int trit = ptq1_0_block_trit(blk, int(block_half * 64 + lane));
+    value |= (uint(trit) & 0xf) << (i * 4);
+  }
+  packed[parameter * 8 + local] = value;
+
+  if (local == 0) {
+    ushort dbits = ushort(uint(blk[26]) | (uint(blk[27]) << 8));
+    float d = float(as_type<half>(dbits));
+    device bfloat *factors = reinterpret_cast<device bfloat *>(packed + words);
+    factors[parameter] = bfloat(d);
+    factors[ulong(columns) * groups + parameter] = bfloat(-d);
+  }
+}
+
 #include "../common/mpp.metal"
 
 template <int M, int N, int S, bool PACKED, bool RELAXED, int PARTS, bool PAIRED, bool LOCAL,
