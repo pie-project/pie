@@ -1,6 +1,6 @@
 #![cfg(target_vendor = "apple")]
 
-//! C1 — the correctness invariant for wiring the Hadamard KV rotation into the
+//! the correctness invariant for wiring the Hadamard KV rotation into the
 //! qwen_3 attention (see `crates/models/src/qwen_3/forward.rs::attn_mixer`).
 //!
 //! The claim, plainly: turning Q/K/V by a per-head orthonormal Hadamard before
@@ -18,7 +18,7 @@
 //! The harness builds a tiny dense, attention-only qwen_3 text (`micro_text`)
 //! with deterministic synthetic weights written as a real safetensors file, then
 //! runs the full Metal forward twice — once with `rotate_kv=false` (the shipped
-//! path) and once with `rotate_kv=true` (the C1 path) — over the SAME weights,
+//! path) and once with `rotate_kv=true` — over the SAME weights,
 //! and compares the returned logits row by row. It mirrors the load/fire harness
 //! in `a_buffered_fold_is_the_fold_it_replaces.rs`.
 
@@ -393,6 +393,6 @@ fn the_kv_rotation_is_the_unrotated_forward() {
     }
     let _ = std::fs::remove_dir_all(&f32_dir);
 
-    eprintln!("=== C1 invariant holds: rotate_kv on == off within the bf16 rounding floor ===");
+    eprintln!("=== invariant holds: rotate_kv on == off within the bf16 rounding floor ===");
     let _ = std::fs::remove_dir_all(&dir);
 }
