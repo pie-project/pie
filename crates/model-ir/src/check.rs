@@ -171,6 +171,14 @@ pub enum Fault {
         last: Option<Dim>,
         why: HadamardWhy,
     },
+    HadamardSignDtype {
+        node: usize,
+        op: &'static str,
+        x: ValueId,
+        signs: ValueId,
+        act: Dtype,
+        sign: Dtype,
+    },
 }
 
 /// The smallest and largest Hadamard block the Metal butterfly instantiates.
@@ -368,7 +376,7 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
                 // dim must itself be a whole number of blocks.
                 if let Some(s) = signs
                     && in_range(*s)
-                    && let Ty::Tensor { shape, .. } = &trace.values[s.0 as usize].ty
+                    && let Ty::Tensor { shape, dtype: sign } = &trace.values[s.0 as usize].ty
                 {
                     let last = shape.last().copied();
                     if !matches!(last, Some(Dim::Const(d)) if d % u64::from(block) == 0) {
@@ -379,6 +387,22 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
                             block,
                             last,
                             why: HadamardWhy::Signs,
+                        });
+                    }
+                    // The signs multiply the activation on load, so the kernel
+                    // reads both through one element; mismatched dtypes are
+                    // rejected here rather than at launch.
+                    if in_range(*x)
+                        && let Ty::Tensor { dtype: act, .. } = &trace.values[x.0 as usize].ty
+                        && act != sign
+                    {
+                        faults.push(Fault::HadamardSignDtype {
+                            node: j,
+                            op,
+                            x: *x,
+                            signs: *s,
+                            act: *act,
+                            sign: *sign,
                         });
                     }
                 }
@@ -1215,6 +1239,24 @@ impl Display for Fault {
                     V(*id)
                 ),
             },
+            Fault::HadamardSignDtype {
+                node,
+                op,
+                x,
+                signs,
+                act,
+                sign,
+            } => {
+                write!(
+                    f,
+                    "node {node} ({op}): the sign diagonal {} is {}, but the activation {} it \
+                     rides is {}; the signs multiply on the activation's element",
+                    V(*signs),
+                    N(*sign),
+                    V(*x),
+                    N(*act)
+                )
+            }
         }
     }
 }
