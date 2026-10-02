@@ -63,10 +63,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         let ws = self.ctx().table.get(&this)?.clone();
         let stores = store_registry::get(ws.model, ws.engine);
         let mut rs = stores.rs.lock().unwrap();
-        let epoch = rs.current_epoch();
-        let out = rs
-            .free_buffer(ws.id, &indices, epoch)
-            .map_err(|e| e.to_string());
+        let out = rs.free_buffer(ws.id, &indices).map_err(|e| e.to_string());
         rs.retire_idle();
         Ok(out)
     }

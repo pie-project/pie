@@ -10,6 +10,7 @@ fn copy(src_pages: &[u32], dst_pages: &[u32], moves: Vec<KvMove>) -> KvCopy {
         src_page_ids: src_pages.to_vec(),
         dst_page_ids: dst_pages.to_vec(),
         moves,
+        windowed: Vec::new(),
     }
 }
 

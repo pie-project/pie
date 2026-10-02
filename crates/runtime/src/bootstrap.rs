@@ -125,6 +125,7 @@ pub struct EngineConfig {
     pub window_pages: u32,
     pub window_tokens: u32,
     pub cpu_pages: usize,
+    pub cpu_window_pages: u32,
     pub disk_pages: u32,
     pub kv_copy: ::engine::caps::KvCopyDomains,
     pub backend_kind: String,
@@ -270,12 +271,16 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 
     let rs_caps = {
         let d0 = engine_configs.first();
-        let is_rs = d0.map(|d| d.rs_cache_slots > 0).unwrap_or(false);
-        model::RsCaps {
+        let mut caps = model::RsCaps {
             state_size: d0.map(|d| d.rs_cache_slot_bytes).unwrap_or(0),
-            buffer_page_size: if is_rs { kv_page_size as u32 } else { 0 },
+            buffer_page_size: 0,
             fold_granularity: 1,
+            window_tokens: d0.map_or(0, |d| d.window_tokens),
+        };
+        if caps.has_state() {
+            caps.buffer_page_size = kv_page_size as u32;
         }
+        caps
     };
     let eta_caps = model::EtaCaps {
         has_lora: !engine_configs.is_empty() && engine_configs.iter().all(|d| d.has_lora),
@@ -315,11 +320,15 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let arena_kv_pages: Vec<usize> = engine_configs.iter().map(|d| d.total_pages).collect();
     let arena_cpu_pages: Vec<usize> = engine_configs.iter().map(|d| d.cpu_pages).collect();
     let arena_disk_pages: Vec<u32> = engine_configs.iter().map(|d| d.disk_pages).collect();
-    let arena_rs_slots: Vec<usize> = engine_configs.iter().map(|d| d.rs_cache_slots).collect();
-    let arena_rs_host_slots: Vec<usize> = engine_configs.iter().map(|d| d.rs_host_slots).collect();
-    let arena_windows: Vec<(u32, u32)> = engine_configs
+    let arena_state: Vec<crate::store::registry::StatePool> = engine_configs
         .iter()
-        .map(|d| (d.window_tokens, d.window_pages))
+        .map(|d| crate::store::registry::StatePool {
+            slots: d.rs_cache_slots as u32,
+            host_slots: d.rs_host_slots as u32,
+            window_tokens: d.window_tokens,
+            window_pages: d.window_pages,
+            host_window_pages: d.cpu_window_pages,
+        })
         .collect();
     let arena_max_context: Vec<usize> = engine_configs
         .iter()
@@ -350,16 +359,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         &arena_kv_pages,
         &arena_cpu_pages,
         &arena_disk_pages,
-        &arena_rs_slots,
-        &arena_rs_host_slots,
+        &arena_state,
         &arena_max_context,
     );
-    for (engine, &(tokens, pages)) in arena_windows.iter().enumerate() {
-        crate::store::registry::get(arena_model_idx, engine)
-            .kv
-            .lock()
-            .set_window(tokens, kv_page_size as u32, pages);
-    }
 
     crate::planner::init_planner(
         arena_model_idx,

@@ -146,6 +146,10 @@ pub struct KvCopy {
     pub src_page_ids: Vec<u32>,
     pub dst_page_ids: Vec<u32>,
     pub moves: Vec<KvMove>,
+    /// Windowed kv pages `(src, dst)` moved in the copy's direction, in the
+    /// windowed planes' own page ids: a ring's pages parking on the host.
+    #[serde(default)]
+    pub windowed: Vec<(u32, u32)>,
 }
 
 impl Default for KvCopy {
@@ -156,6 +160,7 @@ impl Default for KvCopy {
             src_page_ids: Vec::new(),
             dst_page_ids: Vec::new(),
             moves: Vec::new(),
+            windowed: Vec::new(),
         }
     }
 }

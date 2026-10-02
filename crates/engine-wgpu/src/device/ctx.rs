@@ -635,9 +635,11 @@ impl Context {
         }
     }
 
+    /// What the working set has left now, less this process's allocations.
     #[must_use]
-    pub fn used(&self) -> u64 {
-        self.core.allocated.load(Ordering::Relaxed)
+    pub fn left(&self) -> u64 {
+        self.working_set
+            .saturating_sub(self.core.allocated.load(Ordering::Relaxed))
     }
 
     pub fn bind_thread(&self) -> Result<()> {
