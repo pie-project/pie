@@ -816,3 +816,65 @@ fn the_quantized_skus_match_the_reference() {
         ppl_gate(sku, &gguf);
     }
 }
+
+/// Real-weights MPP-vs-native self-consistency (a lead verification, NOT a CI
+/// gate — it only runs when `PIE_MPP_SELFCHECK=<sku name>` is set). With
+/// `PIE_BONSAI_MPP=1` it forces the Apple10 ternary MPP prefill path on; without
+/// it the native decode-in-dot QMV serves. Tuning is a process-wide `OnceLock`,
+/// so run this test twice — FILTERED BY NAME so no other test resolves tuning
+/// first — once with `PIE_BONSAI_MPP=1` and once without, each dumping the
+/// 25-token prefill's last-token logits to `PIE_MPP_DUMP`, then diff the dumps.
+/// A 25-token prefill trips the MPP gate (rows >= 8) where the 5-token oracle
+/// prompt does not, so this exercises the actual MPP matmul on the real weights.
+#[test]
+fn the_mpp_prefill_matches_native_on_real_weights() {
+    let Some(which) = std::env::var_os("PIE_MPP_SELFCHECK") else {
+        eprintln!("PIE_MPP_SELFCHECK unset; skipping the MPP self-consistency check");
+        return;
+    };
+    if !engine_metal::device::present() {
+        eprintln!("no Metal device; skipping the MPP self-consistency check");
+        return;
+    }
+    if std::env::var_os("PIE_BONSAI_MPP").is_some() {
+        assert!(kernels_metal::tuning::override_with(
+            kernels_metal::tuning::Overrides {
+                qmm_mpp: Some(true),
+                ..Default::default()
+            }
+        ));
+        eprintln!("MPP self-check: Apple10 ternary MPP prefill FORCED ON");
+    }
+    let which = which.to_string_lossy().into_owned();
+    let Some(sku) = SKUS.iter().find(|s| s.name == which) else {
+        panic!(
+            "PIE_MPP_SELFCHECK={which} names no SKU; known: {:?}",
+            SKUS.iter().map(|s| s.name).collect::<Vec<_>>()
+        );
+    };
+    let Some(gguf) = gguf_path(sku) else {
+        eprintln!(
+            "[{}] {} unset or missing; skipping the real-weights self-check",
+            sku.name, sku.gguf_env
+        );
+        return;
+    };
+    let long: Vec<u32> = PROMPT_IDS.iter().copied().cycle().take(25).collect();
+    let logits = serve_logits(sku, &gguf, &long).expect("the long prefill serves");
+    assert_eq!(logits.len(), VOCAB, "one vocab-wide readout");
+    eprintln!(
+        "MPP self-check [{}]: long prefill ({} tokens) argmax id {}",
+        sku.name,
+        long.len(),
+        argmax(&logits)
+    );
+    if let Some(dump) = std::env::var_os("PIE_MPP_DUMP") {
+        let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(&dump, &bytes).expect("write the MPP self-check logit dump");
+        eprintln!(
+            "MPP self-check [{}]: dumped {} logits to {dump:?}",
+            sku.name,
+            logits.len()
+        );
+    }
+}
