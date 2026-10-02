@@ -613,6 +613,14 @@ impl Run<'_> {
                 )
             }
             None => match self.maybe_stored(*w) {
+                // The single-plane ternary bank decodes in its own dot; the
+                // K-quant kernel reads a different block geometry.
+                Some(block) if block.dtype == Dtype::Ptq1_0 => linear::ptq1_0::matmul(
+                    self.ctx(),
+                    self.tensor(*act),
+                    block,
+                    &mut self.tensor(*y),
+                ),
                 Some(block) => linear::kquant::matmul(
                     self.ctx(),
                     self.tensor(*act),
@@ -657,6 +665,14 @@ impl Run<'_> {
                 )
             }
             None => match self.maybe_stored(*w) {
+                // The single-plane ternary bank decodes in its own dot; the
+                // K-quant kernel reads a different block geometry.
+                Some(block) if block.dtype == Dtype::Ptq1_0 => linear::ptq1_0::lm_head(
+                    self.ctx(),
+                    self.tensor(*act),
+                    block,
+                    &mut self.tensor(*y),
+                ),
                 Some(block) => linear::kquant::lm_head(
                     self.ctx(),
                     self.tensor(*act),
