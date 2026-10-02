@@ -78,7 +78,7 @@ per-channel FP8 (`F8_E4M3` + `F32` scales) and per-channel INT8 (`I8` + `F32`
 scales), from a BF16/F16/F32 operand or from an FP8 block-scaled checkpoint
 whose `_scale_inv` factors are applied first — each the bit-for-bit port of the
 corresponding CUDA kernel, encoded row-parallel across cores (AVX2 where the
-CPU has it). See `tests/golden/contracts/convert_bf16_to_mxfp4.json` for the
+CPU has it). See `tests/golden/contracts/gpt_oss_native_mxfp4.json` for the
 smallest example.
 
 What the plan language refuses, deliberately: `Repack` (a device kernel layout
