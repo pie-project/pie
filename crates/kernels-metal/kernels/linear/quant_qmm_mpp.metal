@@ -151,3 +151,64 @@ affine_qmm_mpp(const device uchar *weights [[buffer(0)]], const device bfloat *s
       const device uchar *, const device bfloat *, const device bfloat *, const device bfloat *,   \
       device bfloat *, constant int &, constant int &, const device float *, constant int &,       \
       uint3, uint);
+
+// The routed twin of the in-place kernel: a row tile belongs to one expert, whose bank lies
+// `expert * columns` rows into the planes, and a tile no expert claimed is left unwritten.
+template <int M, int N, int S, int TILE>
+[[kernel]] void
+affine_qmm_mpp_routed(const device uchar *weights [[buffer(0)]],
+                      const device bfloat *scales [[buffer(1)]],
+                      const device bfloat *biases [[buffer(2)]],
+                      const device bfloat *input [[buffer(3)]],
+                      device bfloat *output [[buffer(4)]], constant int &width [[buffer(5)]],
+                      constant int &columns [[buffer(6)]], const device float *sums [[buffer(7)]],
+                      const device int *tile_expert [[buffer(8)]],
+                      uint3 position [[threadgroup_position_in_grid]]) {
+  const uint column_tile = position.x, row_tile = position.y;
+  const int expert = tile_expert[row_tile * M / TILE];
+  if (expert < 0)
+    return;
+  const int groups = width / 64;
+  const uint row = row_tile * M;
+  const ulong column = ulong(expert) * columns + column_tile * N;
+  auto activations = tensor(const_cast<device bfloat *>(input) + ulong(row) * width,
+                            dextents<int, 2>{width, M}, array<int, 2>{1, width});
+  auto weight_view = [&](uint group) {
+    return tensor<device uint4b_format, dextents<int, 2>, tensor_inline>(
+        const_cast<device uchar *>(weights) + column * (width / 2) + ulong(group) * 32,
+        dextents<int, 2>{64, N}, array<int, 2>{1, width});
+  };
+  constexpr auto descriptor = matmul2d_descriptor(M, N, 64, false, true, false);
+  matmul2d<descriptor, execution_simdgroups<S>> multiply;
+  auto a = activations.template slice<64, M>(0, 0);
+  auto b = weight_view(0).template slice<64, N>(0, 0);
+  auto total =
+      multiply.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
+  const ulong valid_mask = mpp_valid_mask(total);
+  mpp_for_each(total, valid_mask, [&](ushort i) __attribute__((always_inline)) { total[i] = 0; });
+  for (uint group = 0; group < uint(groups); ++group) {
+    decltype(total) result;
+    auto lhs = activations.template slice<64, M>(group * 64, 0);
+    auto rhs = weight_view(group).template slice<64, N>(0, 0);
+    multiply.run(lhs, rhs, result);
+    mpp_for_each(total, valid_mask, [&](ushort i) __attribute__((always_inline)) {
+      auto at = total.get_multidimensional_index(i);
+      const ulong parameter = (column + at[0]) * groups + group;
+      const ulong sum = ulong(row_tile) * M * groups + group * M + at[1];
+      total[i] += result[i] * float(scales[parameter]) + sums[sum] * float(biases[parameter]);
+    });
+  }
+  auto converted =
+      multiply.template get_destination_cooperative_tensor<decltype(a), decltype(b), bfloat>();
+  mpp_for_each(total, valid_mask,
+               [&](ushort i) __attribute__((always_inline)) { converted[i] = bfloat(total[i]); });
+  auto destination = tensor(output + ulong(row) * columns + column_tile * N,
+                            dextents<int, 2>{columns, M}, array<int, 2>{1, columns});
+  converted.store(destination.template slice<N, M>(0, 0));
+}
+
+#define PIE_MPP_ROUTED_POINT(name, m, n, s, tile)                                                  \
+  template [[host_name(name)]] [[kernel]] void affine_qmm_mpp_routed<m, n, s, tile>(               \
+      const device uchar *, const device bfloat *, const device bfloat *, const device bfloat *,   \
+      device bfloat *, constant int &, constant int &, const device float *, const device int *,   \
+      uint3);
