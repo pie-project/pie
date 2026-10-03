@@ -436,6 +436,16 @@ impl Model {
                     // σ reorders those 48 rows when v-grouped. The leg order has one
                     // source of truth in `in_ba_legs` (Bug B shipped them alpha-first).
                     match spelled(src, [n("ssm_beta_alpha.weight")]) {
+                        Ok(fused) if v_grouped => {
+                            // Fused `[beta; alpha]` under v-grouping: σ-reorder each
+                            // half (beta = rows 0..heads, alpha = rows heads..2·heads),
+                            // mirroring the split legs' `sigma(0, 1)` and the qkvz path,
+                            // so the gates pair with the right heads.
+                            let mut idx = sigma(0, 1);
+                            let heads = idx.len() as i64;
+                            idx.extend(sigma(0, 1).into_iter().map(|i| heads + i));
+                            b.read_expr(&g.in_ba, Expr::src(fused).gather(0, idx))?;
+                        }
                         Ok(fused) => b.read(&g.in_ba, fused)?,
                         Err(_) if v_grouped => {
                             let [beta, alpha] = in_ba_legs(l);

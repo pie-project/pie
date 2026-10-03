@@ -782,6 +782,10 @@ impl Model {
     /// declared in the activation compute dtype (`bf16`). Every rotated site in
     /// the forward keys its diagonal by input width off [`BonsaiSigns`].
     pub fn d27b_bonsai(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        // Bonsai's 1024-block Hadamard FFN rotation and full-width sign banks
+        // have no sharded contract: per-shard widths would not divide 1024 and
+        // tracing fails. Reject tp > 1 up front with a clear message.
+        assert_eq!(tp, 1, "d27b_bonsai does not support tensor parallelism");
         let mut m = Model::new(w, kv, tp, Model::d27b_dims(None, None));
         let dt = crate::dense(w);
         // The real Ternary-Bonsai GGUF stores the GDN `ssm_beta`/`ssm_alpha`
