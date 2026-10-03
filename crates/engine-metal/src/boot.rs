@@ -71,6 +71,7 @@ fn tuning(doc: &toml::Table) {
     let described = kernels_metal::DeviceInfo {
         apple_family: int("apple_family").unwrap_or_default(),
         gpu_core_count: int("gpu_core_count").unwrap_or_default(),
+        metal4: flag("metal4").unwrap_or_default(),
     };
     if described != kernels_metal::DeviceInfo::default() {
         kernels_metal::tuning::describe(described);

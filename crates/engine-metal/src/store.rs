@@ -229,32 +229,16 @@ impl Move {
     }
 }
 
-/// How the pool holds its memory.
+/// How the pool holds its memory: every Metal 4 device gets the elastic
+/// pool, and a device that cannot map sparse buffer tiles keeps the fixed
+/// allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backing {
-    /// Every plane allocated whole at load: the fallback for a device
-    /// without Metal 4, which cannot map sparse buffer tiles.
+    /// Every plane allocated whole at load.
     Fixed,
     /// Every plane a placement sparse buffer, mapped up to the watermark a
-    /// frame commits and released back down on `release`. What every Metal
-    /// 4 device gets.
+    /// frame commits and released back down on `release`.
     Elastic,
-}
-
-impl Backing {
-    /// The pool a load asks for: elastic, unless `PIE_METAL_ELASTIC_KV=0`
-    /// (or `false`/`off`/`no`) in the environment says fixed. That switch
-    /// exists to price the two against each other and to turn the sparse
-    /// path off in the field without a rebuild; it is not a configuration
-    /// knob, and nothing else reads it. A device without Metal 4 gets a
-    /// fixed pool whatever this answers.
-    #[must_use]
-    pub fn preferred() -> Backing {
-        match std::env::var("PIE_METAL_ELASTIC_KV") {
-            Ok(word) if matches!(word.trim(), "0" | "false" | "off" | "no") => Backing::Fixed,
-            _ => Backing::Elastic,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -295,10 +279,7 @@ impl Pools {
         let rows = Pools::plan(trace, paging, facts)?;
 
         #[cfg(target_vendor = "apple")]
-        let sparse = match Backing::preferred() {
-            Backing::Elastic => device.sparse()?,
-            Backing::Fixed => None,
-        };
+        let sparse = device.sparse()?;
 
         let arena = {
             #[cfg(target_vendor = "apple")]
