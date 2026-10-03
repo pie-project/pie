@@ -253,7 +253,7 @@ fn every_pq2_0_prefill_row_answers_the_native_pq2_0_dot() {
                 } else {
                     bf16(
                         (f32::from(noise(
-                            u64::from(row) * u64::from(k) + u64::from(at) ^ 0xABCD,
+                            (u64::from(row) * u64::from(k) + u64::from(at)) ^ 0xABCD,
                         )) - 127.0)
                             * 0.0197,
                     )
