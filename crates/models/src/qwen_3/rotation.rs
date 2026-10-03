@@ -227,7 +227,10 @@ pub fn decode_signs(attributes: Option<&Value>) -> Result<BTreeMap<u32, SignVect
         .get(BLOCK_SIZE_KEY)
         .ok_or(SignError::Missing(BLOCK_SIZE_KEY))?
         .as_u64()
-        .filter(|&b| b > 0)
+        // Explicit mode only makes sense for the canonical Hadamard block (1024):
+        // the kernel, the sign widths, and the width-divisibility check below all
+        // assume it. Reject any other declared block size rather than accept it.
+        .filter(|&b| b == 1024)
         .ok_or(SignError::Malformed(BLOCK_SIZE_KEY))?;
 
     let widths = attrs
