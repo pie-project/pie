@@ -519,7 +519,7 @@ pub fn qmv_grid(op: &'static str, vecs: i32, out_vec_size: i32) -> Result<[u32; 
     Ok([x, out_vec_size.unsigned_abs().div_ceil(4), 1])
 }
 
-fn symbol(name: &str) -> &'static str {
+pub(crate) fn symbol(name: &str) -> &'static str {
     static INTERNED: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
     let mut map = INTERNED
         .get_or_init(|| Mutex::new(HashMap::new()))
