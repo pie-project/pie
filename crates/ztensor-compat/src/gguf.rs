@@ -44,6 +44,9 @@ fn type_name(id: u32) -> Result<&'static str> {
         29 => "iq1_m",
         30 => "bf16",
         39 => "mxfp4",
+        // Prism-private ternary block (Ternary-Bonsai-2-27B-PTQ1_0). 142 (PQ2_0)
+        // is deliberately left unmapped — that is M2.
+        143 => "ptq1_0",
         other => {
             return Err(Error::Unsupported(format!(
                 "gguf tensor type id {other} has no registered projection"
