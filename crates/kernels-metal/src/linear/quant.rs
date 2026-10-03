@@ -905,7 +905,7 @@ fn mpp_prefill(
         && w.bits == 4
         && w.group == 64
         && rows >= 8
-        && columns % bn == 0
+        && columns.is_multiple_of(bn)
         && (rows > 16 || columns >= 1024))
     {
         return Ok(false);
@@ -931,7 +931,7 @@ fn mpp_prefill(
     let partitions = if rows > 32 { 2u32 } else { 4u32 };
     let partial = if (rows <= 32 || (rows <= 64 && columns <= 8192))
         && columns <= 65536
-        && contraction % 256 == 0
+        && contraction.is_multiple_of(256)
     {
         (scratch.partials)(padded * partitions, columns)
     } else {
