@@ -215,9 +215,10 @@ fn binds_block(backend: BackendKind, scheme: QuantScheme) -> bool {
                 | QuantScheme::GgufQ5K
                 | QuantScheme::GgufQ6K
         ),
-        // Metal reads the PTQ1_0 ternary block as stored (the M1b decode-in-dot
-        // kernel), so its inline-scale bank binds directly rather than decoding.
-        BackendKind::Metal => matches!(scheme, QuantScheme::Ptq1_0),
+        // Metal reads the Prism blocks as stored (the decode-in-dot kernels:
+        // PTQ1_0 ternary M1b, PQ2_0 2-bit M2b), so their inline-scale banks bind
+        // directly rather than decoding.
+        BackendKind::Metal => matches!(scheme, QuantScheme::Ptq1_0 | QuantScheme::Pq2_0),
         BackendKind::Unknown => false,
     }
 }
