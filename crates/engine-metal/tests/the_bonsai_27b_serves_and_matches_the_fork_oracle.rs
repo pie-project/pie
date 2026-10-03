@@ -426,7 +426,11 @@ fn the_bonsai_27b_serves_ptq1_0_and_matches_the_fork_oracle() {
             }])
             .expect("the long Bonsai prefill fires");
         let logits = &out[0];
-        assert_eq!(logits.len(), VOCAB, "the long readout is one vocab-wide row");
+        assert_eq!(
+            logits.len(),
+            VOCAB,
+            "the long readout is one vocab-wide row"
+        );
         let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
         std::fs::write(&dump, &bytes).expect("write the long-prefill logit dump");
         eprintln!(
