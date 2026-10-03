@@ -79,6 +79,7 @@ struct Routed {
     inv: Room,
     x: Room,
     y: Room,
+    sums: Room,
 }
 
 #[derive(Debug)]
@@ -210,6 +211,7 @@ impl Scratch {
                 inv: Room::lay(&mut at, 1, pairs, Dtype::I32),
                 x: Room::lay(&mut at, sorted, routed_k, Dtype::Bf16),
                 y: Room::lay(&mut at, sorted, routed_n, Dtype::Bf16),
+                sums: Room::lay(&mut at, sorted, routed_k.div_ceil(64), Dtype::F32),
             }
         });
 
@@ -250,7 +252,7 @@ impl Scratch {
         let union = precast
             .map_or(0, |r| r.at + r.bytes())
             .max(partials.map_or(0, |r| r.at + r.bytes()))
-            .max(routed.map_or(0, |r| r.y.at + r.y.bytes()))
+            .max(routed.map_or(0, |r| r.sums.at + r.sums.bytes()))
             .max(index.map_or(0, |r| r.at + r.bytes()))
             .max(spatial.map_or(0, |r| r.at + r.bytes()));
         let copy = copy_ceiling(trace, compiled, budget).map(|bytes| CopyRoom {
@@ -417,6 +419,7 @@ impl Scratch {
                 inv: r.inv.bind(handles, &self.plane)?,
                 x: r.x.bind(handles, &self.plane)?,
                 y: r.y.bind(handles, &self.plane)?,
+                sums: r.sums.bind(handles, &self.plane)?,
             })
         };
         Some(mint())
