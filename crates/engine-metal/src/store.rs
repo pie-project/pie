@@ -337,6 +337,7 @@ impl Pools {
                     planes,
                     dtype,
                     space,
+                    head_dim: trace_head_dim,
                     ..
                 } => {
                     let planes = split(name, planes)?;
@@ -359,11 +360,22 @@ impl Pools {
                             });
                         }
                     }
-                    let head_dim = restated.map_or(width, |seat| u64::from(seat.head_dim));
-                    let kv_heads = restated.map_or(1, |seat| u64::from(seat.kv_heads));
-                    // The packed KV block is the head_dim; pass it so KvU4 planes
-                    // are sized per head (only known when consumers stated a seat).
-                    let block = restated.map(|seat| seat.head_dim);
+                    // Per-head geometry: a restated seat is authoritative; else fall
+                    // back to the trace row's own head_dim (matching `pool_demand`), so
+                    // KvU4 planes size per head at ANY head_dim rather than from the
+                    // 256 anchor, and `plan`/`reserve` agree with the demand estimate.
+                    // A pre-field trace (head_dim 0) leaves it unknown: `row_stride`
+                    // uses the format anchor and `table` the whole-row width, as before.
+                    let row_head_dim = (*trace_head_dim != 0).then_some(*trace_head_dim);
+                    let head_dim = restated
+                        .map(|seat| u64::from(seat.head_dim))
+                        .or(row_head_dim.map(u64::from))
+                        .unwrap_or(width);
+                    let kv_heads = restated
+                        .map(|seat| u64::from(seat.kv_heads))
+                        .or(row_head_dim.map(|d| width / u64::from(d)))
+                        .unwrap_or(1);
+                    let block = restated.map(|seat| seat.head_dim).or(row_head_dim);
                     let cells = paging.pages() * u64::from(paging.page_size);
                     let plane = cells * row_stride(name, *dtype, width, block)?;
                     let values_bytes = if planes.values == 0 {

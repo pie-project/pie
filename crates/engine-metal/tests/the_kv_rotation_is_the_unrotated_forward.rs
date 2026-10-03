@@ -384,6 +384,17 @@ fn the_kv_rotation_is_the_unrotated_forward() {
             );
         }
         (off, on) => {
+            // Both paths refusing f32 is legitimate — the Metal forward may not run
+            // this text end-to-end in f32. But exactly one loading is an asymmetry
+            // between the rotated and unrotated f32 forwards, a rotation-specific
+            // defect we must not swallow as "not reached".
+            assert!(
+                off.is_err() && on.is_err(),
+                "f32 load is asymmetric (off_ok={}, on_ok={}): the rotated and unrotated \
+                 forwards disagree on whether f32 is supported",
+                off.is_ok(),
+                on.is_ok(),
+            );
             let why = off.err().or_else(|| on.err()).unwrap_or_default();
             eprintln!(
                 "[f32 ] not reached: the Metal forward does not run this text end-to-end in f32 \
