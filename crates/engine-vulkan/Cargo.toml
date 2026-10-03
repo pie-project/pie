@@ -48,3 +48,13 @@ ash = { version = "0.38", default-features = false, features = [
 [features]
 default = []
 vulkan = ["dep:ash", "dep:naga", "kernels-vulkan/native"]
+
+[dev-dependencies]
+checkpoint-dsl = { path = "../checkpoint-dsl" }
+models = { path = "../models" }
+model-dsl = { path = "../model-dsl" }
+tokenizer = { path = "../tokenizer" }
+serde_json = "1"
+ztensor = { workspace = true }
+ztensor-compat = { workspace = true }
+eta-dsl = { package = "pie-eta-dsl", path = "../eta-dsl" }
