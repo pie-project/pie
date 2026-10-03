@@ -29,15 +29,11 @@
 //! Env:
 //! * `BONSAI_GGUF` — the real PTQ1_0 GGUF (required): import + sign metadata.
 //! * `BONSAI_ZT`   — served `.zt` cache (optional; defaults beside the GGUF).
-//! * `PPL_IDS`     — raw little-endian u32 token-id stream (optional; defaults to
-//!                   the committed `tests/bonsai/ppl_ids.bin`, the first 2048
-//!                   WikiText-2-test ids = 4×512).
+//! * `PPL_IDS`     — raw little-endian u32 token-id stream (optional; defaults to the committed `tests/bonsai/ppl_ids.bin`, the first 2048 WikiText-2-test ids = 4×512).
 //! * `PPL_CTX`     — chunk length / context (default 512).
 //! * `PPL_CHUNKS`  — number of chunks to score (default: all ids / ctx).
 //! * `PPL_FIRST`   — first scored position within a chunk (default ctx/2).
-//! * `FORK_PPL`    — the fork's reported PPL over these chunks (optional; defaults
-//!                   to 7.9468, the regenerated `prism`-fork reference for the
-//!                   committed ids). The delta is asserted within `PPL_TOL`.
+//! * `FORK_PPL`    — the fork's reported PPL over these chunks (optional; defaults to 7.9468, the regenerated `prism`-fork reference for the committed ids). The delta is asserted within `PPL_TOL`.
 //! * `PPL_TOL`     — allowed relative |pie-fork|/fork (default 0.03 = 3%).
 
 use std::collections::{BTreeMap, BTreeSet};
