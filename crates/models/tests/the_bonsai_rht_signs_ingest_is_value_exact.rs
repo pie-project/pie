@@ -190,7 +190,9 @@ fn a_real_gguf_reader_parses_and_decodes_a_synthetic_sign_table() {
     std::fs::write(&path, &bytes).unwrap();
 
     let src = ztensor_compat::index(&path).expect("the real gguf reader opens it");
-    let signs = rotation::signs_from_gguf(&src).expect("decode over Source::attributes");
+    // The generic decoder handles any positive block (small here for readability);
+    // this exercises the file -> reader -> attributes -> decode_signs plumbing.
+    let signs = rotation::decode_signs(src.attributes()).expect("decode over Source::attributes");
 
     assert_eq!(signs.len(), 2);
     assert_eq!(signs[&4].signs, vec![1, -1, -1, 1]);
@@ -201,6 +203,14 @@ fn a_real_gguf_reader_parses_and_decodes_a_synthetic_sign_table() {
     assert_eq!(
         names,
         vec!["prism.hadamard.signs.4", "prism.hadamard.signs.8"]
+    );
+
+    // The Bonsai ingest wrapper additionally pins explicit-mode signs to the
+    // canonical 1024-wide Hadamard block, so this non-1024 synthetic table is
+    // rejected there even though the generic decoder accepts it above.
+    assert!(
+        rotation::signs_from_gguf(&src).is_err(),
+        "signs_from_gguf rejects a non-1024 block size"
     );
 
     std::fs::remove_dir_all(&dir).ok();
