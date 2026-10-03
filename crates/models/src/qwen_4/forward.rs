@@ -72,7 +72,7 @@ impl ForwardHybrid for Model {
         for w in &self.layers {
             match &w.mixer {
                 Mixer::Attn { attn, indexer } => {
-                    c.kv(kv, attn.kv.clone(), [plane, plane]);
+                    c.kv(kv, attn.kv.clone(), [plane, plane], self.head_dim);
                     if let Some(ix) = indexer {
                         // One row holds both the raw indexer keys and, at every block's
                         // closing cell, the mean that stands for the block: `pool_kv_append`
@@ -81,7 +81,12 @@ impl ForwardHybrid for Model {
                         // which never includes (b+1)r-1, and within a fire the appends run
                         // before the mean, which runs before the write-back.
                         let index = c.kv_space(self.kv);
-                        c.kv(index, ix.keys.clone(), [u64::from(ix.head_dim)]);
+                        c.kv(
+                            index,
+                            ix.keys.clone(),
+                            [u64::from(ix.head_dim)],
+                            ix.head_dim,
+                        );
                     }
                 }
                 Mixer::Gdn(g) => {
@@ -100,7 +105,7 @@ impl ForwardHybrid for Model {
             }
         }
         if self.mtp.is_some() {
-            c.kv(kv, "kv.mtp".to_string(), [plane, plane]);
+            c.kv(kv, "kv.mtp".to_string(), [plane, plane], self.head_dim);
         }
         if let Some(p) = &self.ple {
             let wide = u64::from(self.streams) * u64::from(self.hidden);

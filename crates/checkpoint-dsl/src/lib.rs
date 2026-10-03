@@ -280,8 +280,8 @@ fn claim(w: &Weight, tp: u32) -> Claim {
         Dtype::U2g16k | Dtype::I3g16k | Dtype::U4g32k | Dtype::U5g32k | Dtype::I6g16k => {
             (encoding(w.dtype), None)
         }
-        Dtype::E2m1 => panic!(
-            "`Dtype::E2m1` names a kv-page quantization scheme, not a stored \
+        Dtype::E2m1 | Dtype::KvU4 => panic!(
+            "this dtype names a kv-page quantization scheme, not a stored \
              weight plane; no load contract declares one"
         ),
         Dtype::Nvfp4 | Dtype::E4m3row | Dtype::E4m3tile128 => panic!(
@@ -1659,8 +1659,8 @@ pub fn encoding(dtype: Dtype) -> Encoding {
             group_size: 128,
             channel_axis: None,
         }),
-        Dtype::E2m1 => panic!(
-            "`Dtype::E2m1` names a kv-page quantization scheme, not a stored \
+        Dtype::E2m1 | Dtype::KvU4 => panic!(
+            "this dtype names a kv-page quantization scheme, not a stored \
              weight plane; no load contract declares one"
         ),
         Dtype::Nvfp4 | Dtype::E4m3row | Dtype::E4m3tile128 => panic!(

@@ -10,6 +10,12 @@ pub struct Model {
     pub kv_heads: u32,
     pub head_dim: u32,
 
+    /// C1 incoherence-processing gate. When true, `attn_mixer` (and `mtp_attn`)
+    /// rotate Q/K/V by a per-head Hadamard so the KV cache is written in the
+    /// rotated basis; the attention output is rotated once more to undo V's turn.
+    /// Default false — every shipped SKU is byte-unchanged. See `forward.rs`.
+    pub rotate_kv: bool,
+
     pub adapters: Adapters,
 
     pub kv: Dtype,
@@ -383,6 +389,7 @@ struct Dims {
     tower: Option<TowerDims>,
     draft: Option<Recipe>,
     dflash_head: Option<&'static dflash::Head>,
+    rotate_kv: bool,
 }
 
 impl Model {
@@ -430,6 +437,7 @@ impl Model {
             tower: None,
             draft: None,
             dflash_head: None,
+            rotate_kv: false,
         }
     }
 
@@ -482,8 +490,74 @@ impl Model {
                 tower: None,
                 draft: None,
                 dflash_head: None,
+                rotate_kv: false,
             },
         )
+    }
+
+    /// A tiny dense, attention-only text (no GDN, no MoE, no tower, no draft),
+    /// used by the C1 Hadamard-rotation invariant test. `rotate_kv` selects the
+    /// plain path (`false`) or the KV-rotated path (`true`); the two share every
+    /// weight, so a forward run under each is the on-vs-off comparison. The
+    /// partial rope (rotary_dim < head_dim) is deliberate — it exercises the
+    /// hazard that the block-256-style Hadamard mixes the whole head including
+    /// the RoPE'd sub-block, which is exact only because Q and K turn together.
+    pub fn micro_text(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(w, kv, tp, Model::micro_text_dims(false))
+    }
+
+    pub fn micro_text_rotated(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(w, kv, tp, Model::micro_text_dims(true))
+    }
+
+    /// The C2d rotated + packed-4-bit KV SKU. Same tiny attention-only text as
+    /// `micro_text`, but at a `head_dim` the packed `KvU4` codec serves (128 or
+    /// 256 — the two blocks the write/read kernels ship) and with the rotation
+    /// gated on. Pair it with `kv = Dtype::KvU4` to serve a rotated 4-bit KV
+    /// cache end to end (the product), or with `kv = Dtype::Bf16` for the
+    /// rotation-only intermediate that must reproduce C1's rounding floor. The
+    /// partial rope (`rotary_dim < head_dim`) is kept so the whole-head Hadamard
+    /// still mixes the RoPE'd sub-block. Shipped SKUs are byte-unchanged — this
+    /// is the only path that sets `rotate_kv = true` outside the C1 test config.
+    pub fn micro_text_rotated_hd(w: Dtype, kv: Dtype, tp: u32, head_dim: u32) -> Model {
+        Model::new(w, kv, tp, Model::micro_text_dims_hd(true, head_dim))
+    }
+
+    /// The plain-path counterpart of `micro_text_rotated_hd` at the same
+    /// `head_dim`: `rotate_kv = false`, so it shares every weight with the
+    /// rotated SKU and serves as the un-rotated ground-truth baseline.
+    pub fn micro_text_hd(w: Dtype, kv: Dtype, tp: u32, head_dim: u32) -> Model {
+        Model::new(w, kv, tp, Model::micro_text_dims_hd(false, head_dim))
+    }
+
+    fn micro_text_dims(rotate_kv: bool) -> Dims {
+        Model::micro_text_dims_hd(rotate_kv, 64)
+    }
+
+    fn micro_text_dims_hd(rotate_kv: bool, head_dim: u32) -> Dims {
+        Dims {
+            hidden: 128,
+            layers: 2,
+            attn_every: 1,
+            q_heads: 4,
+            kv_heads: 2,
+            head_dim,
+            rotary_dim: 16,
+            theta: 10_000_000.0,
+            k_heads: 4,
+            v_heads: 4,
+            k_dim: head_dim,
+            v_dim: head_dim,
+            conv_kernel: 4,
+            mlp: MlpDims::Dense { inter: 256 },
+            vocab: 256,
+            tied: true,
+            norm_eps: 1e-6,
+            tower: None,
+            draft: None,
+            dflash_head: None,
+            rotate_kv,
+        }
     }
 
     pub fn a3b_uncached_bank(w: Dtype, kv: Dtype, tp: u32) -> Model {
@@ -517,6 +591,7 @@ impl Model {
                 tower: None,
                 draft: None,
                 dflash_head: None,
+                rotate_kv: false,
             },
         )
     }
@@ -569,6 +644,7 @@ impl Model {
             tower,
             draft,
             dflash_head: None,
+            rotate_kv: false,
         }
     }
 
@@ -598,6 +674,7 @@ impl Model {
                 tower: None,
                 draft: None,
                 dflash_head: None,
+                rotate_kv: false,
             },
         )
     }
@@ -628,6 +705,7 @@ impl Model {
                 tower: None,
                 draft: None,
                 dflash_head: None,
+                rotate_kv: false,
             },
         )
     }
@@ -658,6 +736,7 @@ impl Model {
                 tower: None,
                 draft: None,
                 dflash_head: None,
+                rotate_kv: false,
             },
         )
     }
@@ -688,6 +767,7 @@ impl Model {
                 tower: None,
                 draft: None,
                 dflash_head: None,
+                rotate_kv: false,
             },
         )
     }
@@ -726,6 +806,7 @@ impl Model {
                 tower: None,
                 draft: None,
                 dflash_head: None,
+                rotate_kv: false,
             }
         }
     }
@@ -790,6 +871,7 @@ impl Model {
                 Recipe::DSpark => Some(&QWEN38_27B_DSPARK),
                 Recipe::Mtp | Recipe::Eagle => None,
             }),
+            rotate_kv: false,
         }
     }
 
@@ -1028,6 +1110,7 @@ impl Model {
             q_heads,
             kv_heads,
             head_dim: d.head_dim,
+            rotate_kv: d.rotate_kv,
             adapters: ADAPTERS,
             kv,
             embed: Weight::sym("embed", [d.vocab as u64, hidden], w),

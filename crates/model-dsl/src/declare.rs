@@ -224,7 +224,7 @@ impl Weight {
                     },
                 ]
             }
-            Dtype::Nvfp4 | Dtype::E4m3row | Dtype::E4m3tile128 => panic!(
+            Dtype::Nvfp4 | Dtype::E4m3row | Dtype::E4m3tile128 | Dtype::KvU4 => panic!(
                 "`{}`: {} is served but not yet a weight representation a \
                  model text declares",
                 self.name, self.dtype
@@ -379,6 +379,7 @@ pub fn compute_dtype(dtype: Dtype) -> Option<Dtype> {
         | Dtype::I16
         | Dtype::U64
         | Dtype::U16
+        | Dtype::KvU4
         | Dtype::Bool => None,
     }
 }
