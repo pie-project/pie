@@ -83,7 +83,10 @@ fn i32_bytes(v: &[i32]) -> Vec<u8> {
 fn close(got: f32, want: f64, at: &str) {
     let tol = (1.0 / 128.0) * want.abs().max(1.0);
     let delta = (f64::from(got) - want).abs();
-    assert!(delta <= tol, "{at}: got {got}, want {want} (|Δ| = {delta}, tol {tol})");
+    assert!(
+        delta <= tol,
+        "{at}: got {got}, want {want} (|Δ| = {delta}, tol {tol})"
+    );
 }
 
 /// Bind a buffer of pre-encoded bytes and mint a tensor over it. The returned
@@ -126,7 +129,14 @@ fn the_add_op_agrees() {
     let bytes = n * 2;
     let (_xbuf, x) = upload(&device, &handles, &xb, rows, width, Dtype::Bf16);
     let (_ybuf, y) = upload(&device, &handles, &yb, rows, width, Dtype::Bf16);
-    let (zbuf, z) = upload(&device, &handles, &vec![0u8; bytes as usize], rows, width, Dtype::Bf16);
+    let (zbuf, z) = upload(
+        &device,
+        &handles,
+        &vec![0u8; bytes as usize],
+        rows,
+        width,
+        Dtype::Bf16,
+    );
     let zhandle = z.buf;
 
     {
@@ -278,6 +288,7 @@ fn rope_reference(
     // Mirror the kernel's f32 base exactly.
     let base = f64::from(theta.log2());
     let mut out = data.to_vec();
+    #[allow(clippy::needless_range_loop)]
     for r in 0..rows as usize {
         let pos = f64::from(positions[r]);
         for h in 0..heads as usize {

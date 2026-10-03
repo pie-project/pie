@@ -550,7 +550,14 @@ fn ptq1_0_matmul(
             .group(PTQ1_0_GROUP),
         // Buffers fill bindings 0..2; the scalars fill `Push { out_vec_size,
         // in_vec_size, vecs }` in order.
-        &[w.codes.arg(), act.arg(), y.arg_mut(), n.arg(), k.arg(), m.arg()],
+        &[
+            w.codes.arg(),
+            act.arg(),
+            y.arg_mut(),
+            n.arg(),
+            k.arg(),
+            m.arg(),
+        ],
     )
 }
 

@@ -1,4 +1,3 @@
-
 //! REAL quality eval of pie-served Ternary-Bonsai-2-27B (PTQ1_0): token-level
 //! perplexity (mean NLL) over a held-out corpus, compared to the fork.
 //!
@@ -32,8 +31,7 @@
 //! * `PPL_CTX`     — chunk length / context (default 512).
 //! * `PPL_CHUNKS`  — number of chunks to score (default: all ids / ctx).
 //! * `PPL_FIRST`   — first scored position within a chunk (default ctx/2).
-//! * `FORK_PPL`    — the fork's reported PPL over these chunks (optional; when
-//!                   set, the delta is asserted within `PPL_TOL` relative).
+//! * `FORK_PPL`    — the fork's reported PPL over these chunks (optional; when set, the delta is asserted within `PPL_TOL` relative).
 //! * `PPL_TOL`     — allowed relative |pie-fork|/fork (default 0.03 = 3%).
 
 use std::collections::{BTreeMap, BTreeSet};

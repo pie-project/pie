@@ -263,15 +263,13 @@ impl Weights {
                 // as bf16. The decode-in-dot kernel keys off `codes.dtype ==
                 // Ptq1_0` and never touches `scales`/`group`/`bits`, so the codes
                 // plane doubles as the (unused) scales placeholder.
-                None if place.dtype == Dtype::Ptq1_0 => {
-                    WeightRow::Planes(kernels_vulkan::Bank {
-                        codes: dense(place, at)?,
-                        scales: dense(place, at)?,
-                        biases: None,
-                        group: 128,
-                        bits: 2,
-                    })
-                }
+                None if place.dtype == Dtype::Ptq1_0 => WeightRow::Planes(kernels_vulkan::Bank {
+                    codes: dense(place, at)?,
+                    scales: dense(place, at)?,
+                    biases: None,
+                    group: 128,
+                    bits: 2,
+                }),
                 None => WeightRow::Dense(dense(place, at)?),
             }));
         }

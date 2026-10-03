@@ -1,4 +1,3 @@
-
 //! SERVE Ternary-Bonsai-2-27B (PTQ1_0) on Vulkan end to end and validate the
 //! final logits against the fork oracle (argmax id 11751 `ĠParis`).
 //!

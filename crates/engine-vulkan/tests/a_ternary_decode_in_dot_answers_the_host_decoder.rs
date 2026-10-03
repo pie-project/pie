@@ -54,6 +54,7 @@ fn noise(at: u64) -> u8 {
 /// Fire the f32-out ternary qmv directly, mirroring `quant::ptq1_0_matmul`'s
 /// launch geometry: one workgroup owns `PTQ1_0_RLANES` output rows for one
 /// activation vector; push constants are `{out_vec_size=n, in_vec_size=k, vecs=m}`.
+#[allow(clippy::too_many_arguments)]
 fn fire_f32(
     device: &Context,
     handles: &Handles,
