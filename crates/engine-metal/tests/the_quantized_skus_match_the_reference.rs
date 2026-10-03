@@ -252,8 +252,14 @@ fn oracle_logits(sku: &Sku) -> Option<Vec<f32>> {
 }
 
 /// The reference-scored corpus id stream, from `corpus_ids_env` (raw LE u32).
+/// Defaults to the committed `tests/bonsai/ppl_ids.bin` (the fork's own 2048-id
+/// WikiText-2 stream, add_bos=false) so the ppl gate is self-contained whenever a
+/// SKU's GGUF is present; `corpus_ids_env` overrides it with another stream.
 fn corpus_ids(sku: &Sku) -> Option<Vec<u32>> {
-    let p = PathBuf::from(std::env::var_os(sku.corpus_ids_env)?);
+    let p = match std::env::var_os(sku.corpus_ids_env) {
+        Some(p) => PathBuf::from(p),
+        None => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/bonsai/ppl_ids.bin"),
+    };
     let bytes = std::fs::read(&p).ok()?;
     assert_eq!(
         bytes.len() % 4,
@@ -654,7 +660,7 @@ fn oracle_gate(sku: &Sku, gguf: &Path) {
 fn ppl_gate(sku: &Sku, gguf: &Path) {
     let Some(ids) = corpus_ids(sku) else {
         eprintln!(
-            "[{}] {} unset or missing; ppl gate skipped (nothing to score)",
+            "[{}] no corpus ids (committed fixture missing and {} unset); ppl gate skipped",
             sku.name, sku.corpus_ids_env
         );
         return;
