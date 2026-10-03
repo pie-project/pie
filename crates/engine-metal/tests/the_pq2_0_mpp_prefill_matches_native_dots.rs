@@ -251,9 +251,12 @@ fn every_pq2_0_prefill_row_answers_the_native_pq2_0_dot() {
                 if exact {
                     (((row * 17 + at * 3) % 29) as i32 - 14) as f32 / 16.0
                 } else {
-                    bf16((f32::from(noise(u64::from(row) * u64::from(k) + u64::from(at) ^ 0xABCD))
-                        - 127.0)
-                        * 0.0197)
+                    bf16(
+                        (f32::from(noise(
+                            u64::from(row) * u64::from(k) + u64::from(at) ^ 0xABCD,
+                        )) - 127.0)
+                            * 0.0197,
+                    )
                 }
             };
 
@@ -266,7 +269,8 @@ fn every_pq2_0_prefill_row_answers_the_native_pq2_0_dot() {
                 if k <= 512 && m == 2048 {
                     continue;
                 }
-                let fires_mpp = m >= 8 && (m > 16 || n >= 1024) && n % (if m <= 8 { 64 } else { 128 }) == 0;
+                let fires_mpp =
+                    m >= 8 && (m > 16 || n >= 1024) && n % (if m <= 8 { 64 } else { 128 }) == 0;
                 if !fires_mpp {
                     continue;
                 }
@@ -355,8 +359,7 @@ fn every_pq2_0_prefill_row_answers_the_native_pq2_0_dot() {
                             absolute += term.abs();
                         }
                         let offset = ((row * n + col) * 2) as usize;
-                        let actual =
-                            u16::from_le_bytes([got[offset], got[offset + 1]]);
+                        let actual = u16::from_le_bytes([got[offset], got[offset + 1]]);
                         let actual_f32 = f32::from_bits(u32::from(actual) << 16);
                         if exact {
                             let rounded = bf16_bits(want as f32);

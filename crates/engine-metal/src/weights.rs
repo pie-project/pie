@@ -485,8 +485,7 @@ impl Weights {
                 let work = n.checked_mul(k / 8).ok_or_else(|| {
                     Fault::Residency("MPP packed bank exceeds the dispatch grid limit".into())
                 })?;
-                let bytes =
-                    u64::from(n) * u64::from(k) / 2 + u64::from(n) * u64::from(k / 64) * 4;
+                let bytes = u64::from(n) * u64::from(k) / 2 + u64::from(n) * u64::from(k / 64) * 4;
                 let buffer = Buffer::zeroed(device, bytes)?;
                 let packed = Tensor::new(handles.bind(&buffer, 0, bytes)?, n, k, Dtype::U4g64);
                 let frame = device.frame()?;
@@ -514,8 +513,7 @@ impl Weights {
                 let work = n.checked_mul(k / 8).ok_or_else(|| {
                     Fault::Residency("MPP packed bank exceeds the dispatch grid limit".into())
                 })?;
-                let bytes =
-                    u64::from(n) * u64::from(k) / 2 + u64::from(n) * u64::from(k / 64) * 4;
+                let bytes = u64::from(n) * u64::from(k) / 2 + u64::from(n) * u64::from(k / 64) * 4;
                 let buffer = Buffer::zeroed(device, bytes)?;
                 let packed = Tensor::new(handles.bind(&buffer, 0, bytes)?, n, k, Dtype::U4g64);
                 let frame = device.frame()?;

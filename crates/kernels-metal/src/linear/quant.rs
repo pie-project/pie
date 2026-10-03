@@ -595,8 +595,18 @@ pub fn act_x_wt(
                 group: 64,
                 bits: 4,
             };
-            if mpp_prefill(ctx, op, act, pseudo, y, &scratch, capacity_rows, rows, columns, contraction)?
-            {
+            if mpp_prefill(
+                ctx,
+                op,
+                act,
+                pseudo,
+                y,
+                &scratch,
+                capacity_rows,
+                rows,
+                columns,
+                contraction,
+            )? {
                 return Ok(());
             }
         }
@@ -626,8 +636,18 @@ pub fn act_x_wt(
                 group: 64,
                 bits: 4,
             };
-            if mpp_prefill(ctx, op, act, pseudo, y, &scratch, capacity_rows, rows, columns, contraction)?
-            {
+            if mpp_prefill(
+                ctx,
+                op,
+                act,
+                pseudo,
+                y,
+                &scratch,
+                capacity_rows,
+                rows,
+                columns,
+                contraction,
+            )? {
                 return Ok(());
             }
         }
@@ -676,7 +696,18 @@ pub fn act_x_wt(
         stated(op, columns)?,
         stated(op, contraction)?,
     );
-    if mpp_prefill(ctx, op, act, w, y, &scratch, capacity_rows, rows, columns, contraction)? {
+    if mpp_prefill(
+        ctx,
+        op,
+        act,
+        w,
+        y,
+        &scratch,
+        capacity_rows,
+        rows,
+        columns,
+        contraction,
+    )? {
         return Ok(());
     }
     let tuned = crate::tuning::current();
