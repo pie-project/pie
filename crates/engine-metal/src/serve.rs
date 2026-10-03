@@ -162,6 +162,7 @@ pub struct Seated<'a> {
     pub readout: Option<&'a [u32]>,
     pub rs: &'a engine::fire::RsVerb,
     pub rs_reset: engine::fire::RsReset,
+    pub rs_slot: Option<u32>,
     pub captures_scores: bool,
     pub translation: &'a [u32],
 }
@@ -187,6 +188,7 @@ impl<'a> Seated<'a> {
             translation: &[],
             rs: &FOLD,
             rs_reset: engine::fire::RsReset::Inferred,
+            rs_slot: None,
         }
     }
 
@@ -1015,6 +1017,13 @@ impl Shell {
         }
         let mut frame = self.device.frame()?;
         self.pools.copy_state(&mut frame, moves)?;
+        for &(src, dst) in moves {
+            if let Some(&carried) = self.held.get(src as usize)
+                && let Some(slot) = self.held.get_mut(dst as usize)
+            {
+                *slot = carried;
+            }
+        }
         self.grafted = Some(frame.commit_async(None)?);
         Ok(())
     }
@@ -2616,7 +2625,7 @@ impl Shell {
                 engine::fire::RsReset::Held => false,
             };
             if fresh {
-                beginning.push(lane.slot);
+                beginning.push(seated.rs_slot.unwrap_or(lane.slot));
             }
             seats.push(Seat {
                 slot: lane.slot,
@@ -2679,7 +2688,7 @@ impl Shell {
                     .map_or(-1, |id| i32::try_from(id).unwrap_or(-1));
                 adapter_routes.extend(std::iter::repeat_n(id, row.rows as usize));
             }
-            slot_ids.push(lane.slot as i32);
+            slot_ids.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
             let at_lane = slot_ids.len() as i32 - 1;
             if !matches!(seated.rs, engine::fire::RsVerb::Fold) {
                 if self.rs_layout.is_none() {
@@ -2752,7 +2761,7 @@ impl Shell {
                     }
                     for _ in 0..rows_here {
                         request_of_token.push(at_lane);
-                        slot_of_row.push(lane.slot as i32);
+                        slot_of_row.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
                     }
                 }
                 None => {
@@ -2763,7 +2772,7 @@ impl Shell {
                             None => narrow(u64::from(have) + at as u64),
                         });
                         request_of_token.push(at_lane);
-                        slot_of_row.push(lane.slot as i32);
+                        slot_of_row.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
                     }
                     writes.extend(std::iter::repeat_n(None, rows_here));
                 }
@@ -2799,9 +2808,9 @@ impl Shell {
                 .chain(std::iter::once(written))
                 .max()
                 .map_or(0, |pages| u32::try_from(pages).unwrap_or(u32::MAX)),
-            state_slots: seats
+            state_slots: slot_ids
                 .iter()
-                .map(|seat| seat.slot.saturating_add(1))
+                .map(|&row| (row as u32).saturating_add(1))
                 .max()
                 .unwrap_or(0),
             workspace: 0,

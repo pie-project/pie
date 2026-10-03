@@ -56,7 +56,7 @@ impl Prefix {
                     rs: None,
                 });
             }
-            if let Ok(Some(rs)) = RsWorkingSet::from_index(&candidates[position]).map(|_| Some(RsWorkingSet::new())) {
+            if let Ok(Some(rs)) = RsWorkingSet::from_index(&candidates[position]) {
                 return Some(Hit {
                     tokens: pages * self.page_t,
                     kv,

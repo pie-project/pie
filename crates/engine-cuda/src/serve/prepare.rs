@@ -808,7 +808,7 @@ impl FrameShell for Shell {
                 RsReset::Held => false,
             };
             if begins {
-                fresh.push(lane.slot);
+                fresh.push(seated.rs_slot.unwrap_or(lane.slot));
             }
             seats.push(Seat {
                 slot: lane.slot,
@@ -838,7 +838,7 @@ impl FrameShell for Shell {
                 rows: row.rows,
                 bidirectional: seated.bidirectional,
             });
-            slot_ids.push(lane.slot as i32);
+            slot_ids.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
             let fire_lane = rs_moves.len();
             rs_order[row.source as usize] = fire_lane as u32;
             let port = envelope_of[source].and_then(|(held, _)| resolved[held].fold_len.as_deref());
@@ -1154,9 +1154,9 @@ impl FrameShell for Shell {
                     .max()
                     .map_or(0, |pages| u32::try_from(pages).unwrap_or(u32::MAX))
             },
-            state_slots: seats
+            state_slots: slot_ids
                 .iter()
-                .map(|seat| seat.slot.saturating_add(1))
+                .map(|&row| (row as u32).saturating_add(1))
                 .max()
                 .unwrap_or(0),
             workspace: 0,

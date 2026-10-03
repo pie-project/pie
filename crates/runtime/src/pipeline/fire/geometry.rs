@@ -527,6 +527,7 @@ impl ReqGeometry {
                     self_cond: None,
                     rs: ::engine::RsVerb::Fold,
                     rs_reset: ::engine::RsReset::Inferred,
+                    rs_slot: None,
                     channels: Vec::new(),
                     readout: match readout.as_slice() {
                         [] => ::engine::Readout::None,

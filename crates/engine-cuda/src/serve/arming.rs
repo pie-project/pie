@@ -523,6 +523,7 @@ impl Shell {
                 readout: None,
                 rs: RsVerb::Fold,
                 rs_reset: RsReset::Inferred,
+                rs_slot: None,
                 stream: lane.stream,
                 group: None,
                 peer: None,

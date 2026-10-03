@@ -137,6 +137,10 @@ pub struct Lane {
     pub rs: RsVerb,
     #[serde(default)]
     pub rs_reset: RsReset,
+    /// The recurrent-state row the runtime's rs store assigned this lane, when
+    /// it binds one; otherwise the state rides the seat.
+    #[serde(default)]
+    pub rs_slot: Option<u32>,
     #[serde(default)]
     pub channels: Vec<Ticket>,
     pub readout: Readout,
