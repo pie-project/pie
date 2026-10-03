@@ -3017,7 +3017,24 @@ impl ResidencyPlanner {
                 f64::from(total.saturating_sub(free)) / f64::from(total)
             }
         };
-        let device = ratio(self.port.device_stats());
+        // Pages an idle process holds are headroom: the next demand evicts
+        // them first. Counted as pressure, they would hold a launch at the
+        // gateway that no fire is left to free them for.
+        let idle: Vec<ProcessId> = self.with_inner(|inner| {
+            inner
+                .procs
+                .iter()
+                .filter(|(_, proc)| proc.idle && proc.state == Residency::Resident)
+                .map(|(pid, _)| *pid)
+                .collect()
+        });
+        let (model, engine) = self.port.locus();
+        let reclaimable: u32 = idle
+            .into_iter()
+            .map(|pid| held_page_count(pid, model, engine))
+            .sum();
+        let (free, total) = self.port.device_stats();
+        let device = ratio((free.saturating_add(reclaimable).min(total), total));
         let mut bucket = (device.max(ratio((swap_free, swap_total))) * 255.0).round() as u8;
         if self.nonresident.load(Ordering::Acquire) != 0
             || self.waiters.load(Ordering::Acquire) != 0
