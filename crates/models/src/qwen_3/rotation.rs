@@ -197,7 +197,23 @@ impl std::error::Error for SignError {}
 /// keyed by input width. Convenience wrapper over [`decode_signs`] reading the
 /// source's top-level metadata.
 pub fn signs_from_gguf(src: &ztensor::Source) -> Result<BTreeMap<u32, SignVector>, SignError> {
-    decode_signs(src.attributes())
+    let attrs = src.attributes();
+    // The Bonsai RHT is defined on the canonical 1024-wide Hadamard block. The
+    // generic `decode_signs` accepts any positive block (it is reused for smaller
+    // test geometries); here, at the real GGUF ingest, pin explicit-mode signs to
+    // 1024 so a checkpoint declaring a block the serving kernels never use is
+    // rejected rather than silently decoded.
+    if let Some(attrs) = attrs {
+        let explicit = attrs
+            .get(SIGN_MODE_KEY)
+            .and_then(|m| m.as_text())
+            .is_none_or(|m| m == "explicit");
+        let block = attrs.get(BLOCK_SIZE_KEY).and_then(|b| b.as_u64());
+        if explicit && block.is_some_and(|b| b != 1024) {
+            return Err(SignError::Malformed(BLOCK_SIZE_KEY));
+        }
+    }
+    decode_signs(attrs)
 }
 
 /// Decode the sign diagonals from a GGUF's top-level metadata map, reproducing
@@ -227,10 +243,7 @@ pub fn decode_signs(attributes: Option<&Value>) -> Result<BTreeMap<u32, SignVect
         .get(BLOCK_SIZE_KEY)
         .ok_or(SignError::Missing(BLOCK_SIZE_KEY))?
         .as_u64()
-        // Explicit mode only makes sense for the canonical Hadamard block (1024):
-        // the kernel, the sign widths, and the width-divisibility check below all
-        // assume it. Reject any other declared block size rather than accept it.
-        .filter(|&b| b == 1024)
+        .filter(|&b| b > 0)
         .ok_or(SignError::Malformed(BLOCK_SIZE_KEY))?;
 
     let widths = attrs
