@@ -1617,16 +1617,21 @@ impl<'c> Run<'c> {
                 | model_ir::Dtype::U4g32k
                 | model_ir::Dtype::U5g32k
                 | model_ir::Dtype::I6g16k
+                | model_ir::Dtype::Ptq1_0
         ) {
             return None;
         }
         let seated = self.cut(id, handle);
-        Some(Tensor::new(
-            seated.ptr,
-            seated.rows,
-            seated.width,
-            model_ir::Dtype::U8,
-        ))
+        // A K-quant plane binds to its decode-in-dot kernel as raw bytes; the
+        // single-plane PTQ1_0 bank keeps its dtype so the matmul dispatch routes
+        // it to its own ternary kernel, not the K-quant one (a different block
+        // geometry). Its fp16 scale is inline, so there is no plane to pair.
+        let dtype = if handle.dtype == model_ir::Dtype::Ptq1_0 {
+            model_ir::Dtype::Ptq1_0
+        } else {
+            model_ir::Dtype::U8
+        };
+        Some(Tensor::new(seated.ptr, seated.rows, seated.width, dtype))
     }
 
     pub(crate) fn planes(&self, id: ValueId) -> (Tensor, Tensor, Option<Tensor>, GroupSeat) {

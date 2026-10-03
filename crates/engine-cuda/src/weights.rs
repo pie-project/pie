@@ -132,6 +132,11 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
                 Dtype::U2g16k | Dtype::I3g16k | Dtype::U4g32k | Dtype::U5g32k | Dtype::I6g16k => {
                     rows.saturating_mul(width)
                 }
+                // PTQ1_0 keeps its logical K-wide shape; a row is block-
+                // interleaved as `ceil(K/128) * 28` bytes (`qs[24]` + `qh[2]` +
+                // inline fp16 scale) across a single plane. Mirror the Metal
+                // engine's `plane_bytes`.
+                Dtype::Ptq1_0 => rows.saturating_mul(width.div_ceil(128).saturating_mul(28)),
                 other => {
                     let element =
                         model_compiler::arena::elem_bytes(other).ok_or_else(|| Fault::Param {
@@ -1149,6 +1154,8 @@ fn packed(
         Dtype::U4g64 | Dtype::U4g32 | Dtype::U4g64tiled => place.width.div_ceil(2),
         Dtype::U2g32 | Dtype::U2g64 | Dtype::U2g128 => place.width.div_ceil(4),
         Dtype::U8g64 => place.width,
+        // PTQ1_0 is block-interleaved: a K-wide row is `ceil(K/128) * 28` bytes.
+        Dtype::Ptq1_0 => place.width.div_ceil(128).saturating_mul(28),
         other => model_compiler::arena::elem_bytes(other)
             .and_then(|element| u32::try_from(element).ok())
             .map(|element| place.width.saturating_mul(element))

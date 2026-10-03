@@ -25,6 +25,8 @@ pub mod kquant;
 
 pub mod nvfp4;
 
+pub mod ptq1_0;
+
 pub mod quant;
 
 pub mod tiled;
