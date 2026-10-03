@@ -66,9 +66,13 @@ const PROMPT_IDS: [u32; 5] = [760, 6511, 314, 9338, 369];
 const ORACLE_ARGMAX: u32 = 11751;
 const VOCAB: usize = 248_320;
 
-/// The fork oracle's top-8 (id, logit), frozen from the committed fixture
-/// (`scratchpad/bonsai_oracle_fixture.json`). The rank order is what the serve
-/// must reproduce; the logit values anchor the atol.
+/// The fork oracle's top-8 (id, logit), frozen inline as the committed anchor —
+/// the PrismML-Eng llama.cpp fork (branch `prism`) decoding `PROMPT_IDS`, the
+/// ground truth this Metal serve reproduces. The full 248320-wide fork logit
+/// vector (`ORACLE_DUMP`, sha256 77050215…097b) feeds the cosine check
+/// out-of-band; this rank order + the logit values are the self-contained
+/// committed anchor (argmax and top-8 set here; the atol on the values when the
+/// dump is present). No scratch file is read — the dump is env-gated below.
 const ORACLE_TOP8: [(u32, f32); 8] = [
     (11751, 14.73272),
     (303, 10.61042),
