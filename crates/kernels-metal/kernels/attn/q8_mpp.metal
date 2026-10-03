@@ -3,10 +3,12 @@
 using namespace metal;
 using namespace mpp::tensor_ops;
 #include "../common/mpp.metal"
-template <int D, bool DIRECT>
+// KV is int8_t over a q8 pool, whose cells carry their own scale, and bfloat over a pool
+// stored as it was written.
+template <int D, bool DIRECT, typename KV>
 kernel void
-q8_mpp(const device bfloat *q [[buffer(0)]], const device int8_t *keys [[buffer(1)]],
-       const device int8_t *values [[buffer(2)]], device bfloat *out [[buffer(3)]],
+q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]],
+       const device KV *values [[buffer(2)]], device bfloat *out [[buffer(3)]],
        constant int &gqa [[buffer(4)]], const device int *positions [[buffer(5)]],
        const device int *owners [[buffer(6)]], const device uint *pages [[buffer(7)]],
        const device uint *ptr [[buffer(8)]], constant int &page_size [[buffer(9)]],
@@ -18,6 +20,8 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device int8_t *keys [[buffer(
        uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
        uint sg [[simdgroup_index_in_threadgroup]]) {
   constexpr int M = 32, N = 32, SG = 8;
+  constexpr bool Q8 = sizeof(KV) == 1;
+  constexpr int W = Q8 ? 2 * D : D;
   const int head = tile.x, heads = grid.x, kv = head / gqa, row0 = tile.y * M;
   threadgroup bfloat qs[DIRECT ? 1 : M * D];
   threadgroup float scores[M * N], maxima[M], totals[M], factors[M];
@@ -43,8 +47,8 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device int8_t *keys [[buffer(
   }();
   auto score_view = tensor(scores, extents<int, N, M>{}, array<int, 2>{1, N});
   auto p = tensor(probs, extents<int, N, M>{}, array<int, 2>{1, N});
-  auto v0 = tensor(const_cast<device int8_t *>(values), dextents<int, 2>{D, N},
-                   array<int, 2>{1, kv_heads * 2 * D});
+  auto v0 = tensor(const_cast<device KV *>(values), dextents<int, 2>{D, N},
+                   array<int, 2>{1, kv_heads * W});
   constexpr auto qkd = matmul2d_descriptor(M, N, D, false, true, false);
   constexpr auto pvd = matmul2d_descriptor(M, D, N, false, false, false);
   matmul2d<qkd, execution_simdgroups<SG>> qkop;
@@ -68,15 +72,15 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device int8_t *keys [[buffer(
     }
     for (int base = (first / N) * N; base <= last; base += N) {
       const uint physical = pages[ptr[req] + base / N];
-      const ulong offset = (ulong(physical) * N * kv_heads + kv) * 2 * D;
-      auto b = tensor(const_cast<device int8_t *>(keys) + offset, dextents<int, 2>{D, N},
-                      array<int, 2>{1, kv_heads * 2 * D});
+      const ulong offset = (ulong(physical) * N * kv_heads + kv) * W;
+      auto b = tensor(const_cast<device KV *>(keys) + offset, dextents<int, 2>{D, N},
+                      array<int, 2>{1, kv_heads * W});
       auto score =
           qkop.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
       qkop.run(a, b, score);
       score.store(score_view);
-      auto v = tensor(const_cast<device int8_t *>(values) + offset, dextents<int, 2>{D, N},
-                      array<int, 2>{1, kv_heads * 2 * D});
+      auto v = tensor(const_cast<device KV *>(values) + offset, dextents<int, 2>{D, N},
+                      array<int, 2>{1, kv_heads * W});
       threadgroup_barrier(mem_flags::mem_threadgroup);
       for (uint r = sg; r < M; r += SG) {
         const int row = row0 + r, pos = row < rows ? positions[row] : 0, kpos = base + lane;
@@ -84,9 +88,12 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device int8_t *keys [[buffer(
                     (enabled[row] == 2 || kpos <= pos) && (window <= 0 || kpos >= pos - window + 1);
         if (keep && enabled[row])
           keep = uint(kpos) < mask_stride && mask[ulong(row) * mask_stride + kpos] != 0;
-        const ulong cell = offset + ulong(lane) * kv_heads * 2 * D;
-        const float ks = *reinterpret_cast<const device float *>(keys + cell + D);
-        const float vs = *reinterpret_cast<const device float *>(values + cell + D);
+        const ulong cell = offset + ulong(lane) * kv_heads * W;
+        float ks = 1, vs = 1;
+        if constexpr (Q8) {
+          ks = *reinterpret_cast<const device float *>(keys + cell + D);
+          vs = *reinterpret_cast<const device float *>(values + cell + D);
+        }
         const float s = keep ? scores[r * N + lane] * scale * ks : -1e30f;
         const float newmax = max(maxima[r], simd_max(s));
         const float factor = totals[r] > 0 ? fast::exp(maxima[r] - newmax) : 0;
@@ -119,13 +126,16 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device int8_t *keys [[buffer(
   });
 }
 
-#define Q8_MPP(DIM, DIRECT, NAME)                                                                  \
-  template [[host_name(NAME)]] kernel void q8_mpp<DIM, DIRECT>(                                    \
-      const device bfloat *, const device int8_t *, const device int8_t *, device bfloat *,        \
+#define Q8_MPP(DIM, DIRECT, KV, NAME)                                                              \
+  template [[host_name(NAME)]] kernel void q8_mpp<DIM, DIRECT, KV>(                                \
+      const device bfloat *, const device KV *, const device KV *, device bfloat *,                \
       constant int &, const device int *, const device int *, const device uint *,                 \
       const device uint *, constant int &, constant int &, constant float &, const device uchar *, \
       constant uint &, const device uchar *, constant int &, const device bfloat *,                \
       constant int &, uint2, uint2, uint, uint, uint);
-Q8_MPP(128, false, "q8_mpp_d128")
-Q8_MPP(256, false, "q8_mpp_d256")
-Q8_MPP(256, true, "q8_visit_direct")
+Q8_MPP(128, false, int8_t, "q8_mpp_d128")
+Q8_MPP(256, false, int8_t, "q8_mpp_d256")
+Q8_MPP(256, true, int8_t, "q8_visit_direct")
+Q8_MPP(128, false, bfloat, "sdpa_mpp_d128")
+Q8_MPP(256, false, bfloat, "sdpa_mpp_d256")
+Q8_MPP(256, true, bfloat, "sdpa_visit_direct")
