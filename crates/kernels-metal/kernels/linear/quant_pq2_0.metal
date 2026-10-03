@@ -150,9 +150,16 @@ inline constexpr int pq2_0_qmm_wm() {
 }
 
 // The vendored `mlx_steel_transforms.metal` carries an MXFP4 block loader that
-// references these helpers; `quant_qmm_t.metal` defines them before the same
-// include. We do not use that loader, but the header must compile, so define
-// them here too (verbatim from `quant_qmm_t.metal`).
+// references these helpers as free symbols; every TU that includes the header
+// must define them first. We do not use that loader, but the header must
+// compile, so define them here too. This block is duplicated VERBATIM across the
+// sibling quant kernels that pull in the steel transforms (`quant_qmm_t.metal` —
+// the canonical copy — plus `quant_qmv.metal`, `gemm_dense.metal`,
+// `quant_transcode.metal`); keep all copies identical. Each `.metal` is resolved
+// into its own TU (see `kernels-metal/src/sources.rs`), so these are NOT one
+// shared definition — a shared include would have to be wired into all of them
+// and verified on-device (the steel headers compile at runtime, not in
+// `cargo check`). Left duplicated deliberately; see the hygiene report.
 constant float kMxfp4Lut[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
                                 -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 inline float mxfp4_lo(uint8_t byte) { return kMxfp4Lut[byte & 0xf]; }
