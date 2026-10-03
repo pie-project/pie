@@ -29,12 +29,15 @@
 //! Env:
 //! * `BONSAI_GGUF` — the real PTQ1_0 GGUF (required): import + sign metadata.
 //! * `BONSAI_ZT`   — served `.zt` cache (optional; defaults beside the GGUF).
-//! * `PPL_IDS`     — raw little-endian u32 token-id stream (required to score).
+//! * `PPL_IDS`     — raw little-endian u32 token-id stream (optional; defaults to
+//!                   the committed `tests/bonsai/ppl_ids.bin`, the first 2048
+//!                   WikiText-2-test ids = 4×512).
 //! * `PPL_CTX`     — chunk length / context (default 512).
 //! * `PPL_CHUNKS`  — number of chunks to score (default: all ids / ctx).
 //! * `PPL_FIRST`   — first scored position within a chunk (default ctx/2).
-//! * `FORK_PPL`    — the fork's reported PPL over these chunks (optional; when
-//!                   set, the delta is asserted within `PPL_TOL` relative).
+//! * `FORK_PPL`    — the fork's reported PPL over these chunks (optional; defaults
+//!                   to 7.9468, the regenerated `prism`-fork reference for the
+//!                   committed ids). The delta is asserted within `PPL_TOL`.
 //! * `PPL_TOL`     — allowed relative |pie-fork|/fork (default 0.03 = 3%).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -74,7 +77,12 @@ fn env_usize(key: &str, default: usize) -> usize {
 }
 
 fn read_ids() -> Option<Vec<u32>> {
-    let p = PathBuf::from(std::env::var_os("PPL_IDS")?);
+    // Default to the committed 2048-id fixture (WikiText-2 test, the fork's own
+    // tokenization, add_bos=false); `PPL_IDS` overrides it with another stream.
+    let p = match std::env::var_os("PPL_IDS") {
+        Some(p) => PathBuf::from(p),
+        None => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/bonsai/ppl_ids.bin"),
+    };
     let bytes = std::fs::read(&p).ok()?;
     assert_eq!(bytes.len() % 4, 0, "PPL_IDS is a little-endian u32 stream");
     Some(
@@ -157,7 +165,7 @@ fn the_bonsai_27b_perplexity_matches_the_fork() {
         return;
     };
     let Some(ids) = read_ids() else {
-        eprintln!("ppl: PPL_IDS unset or missing; skipping (nothing to score)");
+        eprintln!("ppl: no token ids (committed fixture missing and PPL_IDS unset); skipping");
         return;
     };
 
@@ -307,26 +315,30 @@ fn the_bonsai_27b_perplexity_matches_the_fork() {
         started.elapsed().as_secs_f64(),
     );
 
-    if let Ok(fork) = std::env::var("FORK_PPL") {
-        let fork: f64 = fork.parse().expect("FORK_PPL is a number");
-        let tol: f64 = std::env::var("PPL_TOL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.03);
-        let rel = (ppl - fork).abs() / fork;
-        eprintln!(
-            "ppl: FORK PPL = {fork:.4}  pie PPL = {ppl:.4}  delta = {:+.4} ({:+.2}%)  tol = {:.1}%",
-            ppl - fork,
-            100.0 * (ppl - fork) / fork,
-            100.0 * tol,
-        );
-        assert!(
-            rel <= tol,
-            "pie ppl {ppl:.4} vs fork ppl {fork:.4} is {:.2}% off (> {:.1}% tol) — \
-             a quality divergence the oracle match missed",
-            100.0 * rel,
-            100.0 * tol,
-        );
-    }
+    // The fork reference over the same 4 chunks, regenerated on the serving pod
+    // (PrismML llama.cpp@prism, WikiText-2 test, n_ctx=512, add_bos=false).
+    // `FORK_PPL` overrides it; `PPL_TOL` overrides the relative tolerance.
+    let fork: f64 = std::env::var("FORK_PPL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7.9468);
+    let tol: f64 = std::env::var("PPL_TOL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.03);
+    let rel = (ppl - fork).abs() / fork;
+    eprintln!(
+        "ppl: FORK PPL = {fork:.4}  pie PPL = {ppl:.4}  delta = {:+.4} ({:+.2}%)  tol = {:.1}%",
+        ppl - fork,
+        100.0 * (ppl - fork) / fork,
+        100.0 * tol,
+    );
+    assert!(
+        rel <= tol,
+        "pie ppl {ppl:.4} vs fork ppl {fork:.4} is {:.2}% off (> {:.1}% tol) — \
+         a quality divergence the oracle match missed",
+        100.0 * rel,
+        100.0 * tol,
+    );
     assert!(count > 0 && ppl.is_finite(), "scored a finite ppl");
 }
