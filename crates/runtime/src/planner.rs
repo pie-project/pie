@@ -1036,6 +1036,29 @@ impl ResidencyPlanner {
         }
     }
 
+    /// Queues the restore of a parked `pid` because a message for it is on
+    /// its way. It stays idle until it reads the message, so a process
+    /// restored early remains the first victim and never pins pages.
+    pub fn wake(self: &Arc<Self>, pid: ProcessId) {
+        let queued = self.with_inner(|inner| {
+            let proc = inner.procs.get_mut(&pid)?;
+            let demand = proc.parked.take()?;
+            let key = (proc.seq, inner.next_id);
+            inner.next_id += 1;
+            inner.queue.insert(
+                key,
+                Waiter {
+                    pid,
+                    kind: WaitKind::Restore { demand },
+                },
+            );
+            Some(())
+        });
+        if queued.is_some() {
+            self.poke();
+        }
+    }
+
     /// Marks `pid` as waiting on its client, or as awake again. Waking a
     /// parked process queues its restore, ahead of its next fire.
     pub fn set_idle(self: &Arc<Self>, pid: ProcessId, idle: bool) {
@@ -3183,6 +3206,14 @@ pub fn planner_for(model: usize, engine: usize) -> Option<Arc<ResidencyPlanner>>
         .cloned()
 }
 
+/// A message for `pid` is on its way: if it was parked, its restore starts
+/// now rather than when it reads the message.
+pub fn wake(pid: ProcessId) {
+    if let Some(planner) = planner() {
+        planner.wake(pid);
+    }
+}
+
 pub fn planner() -> Option<&'static Arc<ResidencyPlanner>> {
     PRIMARY.get()
 }
@@ -3757,6 +3788,50 @@ mod starvation_race_tests {
         assert_eq!(planner.diagnostics().host_swap_unblocks_total, 1);
 
         head_task.abort();
+    }
+
+    #[test]
+    fn a_wake_restores_a_parked_process_that_stays_idle() {
+        let planner = Arc::new(ResidencyPlanner::new(
+            Arc::new(RacePool::new(4)) as Arc<dyn PoolPort>
+        ));
+        let agent = ProcessId::new_v4();
+        planner.register(agent);
+        planner.note_admitted(agent);
+        planner.set_idle(agent, true);
+        planner
+            .with_inner(|inner| inner.procs.get_mut(&agent).unwrap().state = Residency::Evicting);
+        planner.report_evicted(agent, 3, 0);
+        assert!(planner.diagnostics().queue.is_empty());
+
+        planner.wake(agent);
+        let (idle, restores) = planner.with_inner(|inner| {
+            let restores = inner
+                .queue
+                .values()
+                .map(|w| match w.kind {
+                    WaitKind::Restore { demand } if w.pid == agent => demand.kv_pages,
+                    _ => 0,
+                })
+                .collect::<Vec<_>>();
+            (inner.procs[&agent].idle, restores)
+        });
+        assert_eq!(
+            restores,
+            vec![3],
+            "a message on its way restores what it parked"
+        );
+        assert!(
+            idle,
+            "and it stays idle, the first victim, until it reads the message"
+        );
+
+        planner.wake(agent);
+        assert_eq!(
+            planner.diagnostics().queue.len(),
+            1,
+            "a second wake queues nothing more"
+        );
     }
 
     #[test]
