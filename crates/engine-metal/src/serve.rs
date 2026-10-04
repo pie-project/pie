@@ -56,6 +56,9 @@ pub struct Boot<'a> {
     pub pages: u32,
     pub runahead: Runahead,
     pub residency: Plan,
+    /// `[metal] gpu_mem_utilization`: the share of the device's working set
+    /// this load may wire.
+    pub gpu_mem_utilization: f64,
 }
 
 const PATCH_ROUTE_DROP: i32 = -1;
@@ -517,15 +520,12 @@ impl Shell {
             let kv_pool = crate::store::pool_demand(&boot.trace, paging)?;
             let acct = crate::store::accounting::Accounting::with_scratch(
                 device.working_set(),
-                crate::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
+                boot.gpu_mem_utilization,
                 weights.bytes(),
                 compiled.arena.bytes,
                 kv_pool,
             );
-            acct.admit(
-                Some(weights.bytes()),
-                crate::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
-            )?;
+            acct.admit(Some(weights.bytes()), boot.gpu_mem_utilization)?;
             let source = boot.residency.source_bytes();
             let ram = Context::physical_memory();
             let wired = acct.weights + acct.scratch + acct.minimum + acct.floor;
