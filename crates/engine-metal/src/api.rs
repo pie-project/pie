@@ -509,6 +509,7 @@ impl Engine for Metal {
             pages: budgets.pages,
             runahead: engine::runahead::Runahead::of(frames_in_flight),
             residency: residency_plan,
+            gpu_mem_utilization: self.boot.gpu_mem_utilization,
         })
         .map_err(fault)?;
 
