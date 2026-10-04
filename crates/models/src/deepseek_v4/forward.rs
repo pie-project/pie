@@ -545,7 +545,11 @@ fn sublayer_input<'m>(
     let normed = ops::elemwise::hc_rmsnorm_f32(streams, hy.norm_eps);
     let mixes = match &mix.dynamic {
         Some(dynamic) => ops::elemwise::hc_project(&normed, dynamic, hy.streams),
-        None => normed,
+        None => {
+            let mix_hc = u32::try_from(mix.base.dim(0)).expect("mix_hc fits u32");
+            let (head, _) = ops::layout::split_rows(&normed, mix_hc);
+            head
+        }
     };
     let (_, post_mix, comb_mix) = ops::elemwise::hc_gates(
         &mixes,
@@ -929,7 +933,11 @@ fn gate(streams: &Value, mix: &Mix, hy: &Hyper) -> (Value, Value, Value) {
     let normed = ops::elemwise::hc_rmsnorm_f32(streams, hy.norm_eps);
     let mixes = match &mix.dynamic {
         Some(dynamic) => ops::elemwise::hc_project(&normed, dynamic, hy.streams),
-        None => normed,
+        None => {
+            let mix_hc = u32::try_from(mix.base.dim(0)).expect("mix_hc fits u32");
+            let (head, _) = ops::layout::split_rows(&normed, mix_hc);
+            head
+        }
     };
     ops::elemwise::hc_gates(
         &mixes,
