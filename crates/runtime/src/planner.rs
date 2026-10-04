@@ -1025,6 +1025,13 @@ impl ResidencyPlanner {
                 if inner.preempted_floor().is_none_or(|floor| seq <= floor) {
                     return None;
                 }
+                if let Some((who, proc)) = inner.procs.iter().filter(|(pid, proc)| {
+                    (proc.state != Residency::Resident && proc.parked.is_none()) || proc.respawn || inner.killing.contains(pid)
+                }).min_by_key(|(_, proc)| proc.seq) {
+                    eprintln!("ADMITDBG waiting seq {seq}: floor proc {who} seq {} state {:?} parked {} idle {} respawn {} killing {} queued {}",
+                        proc.seq, proc.state, proc.parked.is_some(), proc.idle, proc.respawn, inner.killing.contains(who),
+                        inner.queue.values().filter(|w| w.pid == *who).count());
+                }
                 let notify = Arc::new(Notify::new());
                 inner.admitting.insert((seq, pid), notify.clone());
                 Some(notify)

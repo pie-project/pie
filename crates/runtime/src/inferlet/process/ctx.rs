@@ -275,6 +275,19 @@ impl ProcessCtx {
         self.prewarm_permit = None;
     }
 
+    /// Gives back the process's seats while it waits on its client: an idle
+    /// process neither fires nor binds, the planner moves its state off the
+    /// device first, and holding its seats would keep a new process from
+    /// starting. Its next fire takes them again (`ensure_execution_admitted`).
+    pub(crate) fn yield_execution(&mut self) {
+        if self.execution_permit.take().is_some() {
+            crate::scheduler::worker::notify_execution_slot_released(self.id);
+        }
+        self.execution_admitted = false;
+        super::release_bind_permit(self.bind_permit.take());
+        self.bind_admitted = false;
+    }
+
     pub(crate) fn admission_wait_us(&self) -> u64 {
         self.admission_wait_us
     }

@@ -125,6 +125,7 @@ impl pie::inferlet::session::Host for ProcessCtx {
 
     async fn receive_blocking(&mut self) -> Result<Option<String>> {
         let process_id = self.id();
+        self.yield_execution();
         let message = idle_while(
             process_id,
             crate::server::inbox::receive(process_id.to_string()),
@@ -157,7 +158,11 @@ impl pie::inferlet::session::Host for ProcessCtx {
 
 impl pie::inferlet::session::HostWithStore<ProcessCtx> for HasSelf<ProcessCtx> {
     async fn receive(accessor: &Accessor<ProcessCtx, Self>) -> Result<Option<String>> {
-        let process_id = accessor.with(|mut access| access.get().id());
+        let process_id = accessor.with(|mut access| {
+            let ctx = access.get();
+            ctx.yield_execution();
+            ctx.id()
+        });
         let message = idle_while(
             process_id,
             crate::server::inbox::receive(process_id.to_string()),
