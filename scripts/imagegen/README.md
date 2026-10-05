@@ -1,7 +1,7 @@
 # `scripts/imagegen` — verification harness for the image/video generation effort
 
 Reference implementations, golden dumps and a diff tool for the milestones in
-[`.wiki/imagegen/design.md`](../../.wiki/imagegen/design.md) (D15 = verification,
+`imagegen/design.md`, which lives in the wiki (D15 = verification,
 §4 = milestone order).  **Nothing here touches the Rust tree.**  Everything is
 Python that produces *reference numbers*; the pie side reproduces them.
 
