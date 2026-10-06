@@ -450,8 +450,10 @@ impl Run<'_> {
         let keep = plan.split.keep;
         let x = self.tensor(act);
         let out = self.tensor(y);
-        let packed_gpu = kernels_metal::Tensor {
-            width: keep * 2,
+        // The gate rows land in `packed`'s scratch and the up rows beside it;
+        // `h` takes the GPU's columns of the activation.
+        let gate = kernels_metal::Tensor {
+            width: keep,
             ..self.tensor(packed)
         };
         let h_gpu = kernels_metal::Tensor {
@@ -466,15 +468,17 @@ impl Run<'_> {
             precast: &precast,
             partials: &partials,
         };
+        let rows = self.capacity(act);
         linear::quant::matmul(
             self.ctx(),
             x,
-            plan.split.gate_up,
-            packed_gpu,
+            plan.split.gate,
+            gate,
             scratch(),
-            self.capacity(act).min(self.capacity(packed)),
+            rows.min(self.capacity(packed)),
         )?;
-        linear::mlp::swiglu(self.ctx(), packed_gpu, keep, h_gpu)?;
+        linear::quant::matmul(self.ctx(), x, plan.split.up, plan.up_rows, scratch(), rows)?;
+        linear::mlp::swiglu_clamp_split(self.ctx(), gate, plan.up_rows, f32::MAX, h_gpu)?;
         linear::quant::matmul(
             self.ctx(),
             h_gpu,

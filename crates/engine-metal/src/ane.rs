@@ -9,8 +9,12 @@
 //! Neural Engine's half in.
 //!
 //! Short fires (decode, small prompts) keep the whole MLP on the GPU. After a
-//! CoreML failure or a non-finite result the layer is rerun on the CPU, so the
-//! fire stays correct, and the split stops for the rest of the load.
+//! CoreML failure or a non-finite result the layer's Neural Engine half is
+//! rerun on the GPU, so the fire stays correct, and the split stops for the
+//! rest of the load.
+//!
+//! The GPU reads its gate and up rows straight out of the model's own banks;
+//! only its columns of `down`, which cut across every row, are copied.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -43,11 +47,13 @@ const PROGRAMS_PER_LAYER: usize = 2;
 /// on that job (a fire that was encoded but never committed).
 const STAGE_TIMEOUT_MS: u64 = 60_000;
 
-/// The GPU's half of one layer's MLP: `gate_up` holds the gate and up rows
-/// `[0, keep)`, `down` the columns `[0, keep)`.
+/// The GPU's half of one layer's MLP: `gate` and `up` are views of rows
+/// `[0, keep)` of the model's gate and up planes, `down` a copy of its
+/// columns `[0, keep)`.
 #[derive(Clone, Copy)]
 pub struct Split {
-    pub gate_up: Bank,
+    pub gate: Bank,
+    pub up: Bank,
     pub down: Bank,
     pub keep: u32,
 }
@@ -55,6 +61,8 @@ pub struct Split {
 /// One layer's split for one fire, handed to the dispatch.
 pub struct Plan {
     pub split: Split,
+    /// Scratch for the up projection's rows, beside `packed`'s gate rows.
+    pub up_rows: Tensor,
     pub staged: Tensor,
     pub other: Tensor,
     pub stage: u32,
@@ -94,6 +102,7 @@ struct Meta {
 struct Ane {
     splits: BTreeMap<u32, Split>,
     max_rows: u32,
+    up_rows: Tensor,
     staged: Tensor,
     other: Tensor,
     #[cfg(target_vendor = "apple")]
@@ -133,12 +142,15 @@ impl Drop for Live {
     }
 }
 
-/// `PIE_ANE` names the directory `build.py` wrote, or is `1` to find one
-/// under `~/.cache/pie/ane` whose shapes match this model.
+/// On unless `PIE_ANE=0`. `PIE_ANE` may name the directory `build.py`
+/// wrote; otherwise the newest build under `~/.cache/pie/ane` whose shapes
+/// match this model is used, and with none the MLP stays on the GPU.
 fn requested() -> Option<String> {
-    std::env::var("PIE_ANE")
-        .ok()
-        .filter(|v| !v.is_empty() && v != "0")
+    match std::env::var("PIE_ANE") {
+        Ok(v) if v == "0" => None,
+        Ok(v) if !v.is_empty() => Some(v),
+        _ => Some("1".to_string()),
+    }
 }
 
 fn find(hidden: u32, inter: u32, asked: &str) -> Option<(PathBuf, Meta)> {
@@ -208,6 +220,31 @@ fn mlps(trace: &model_ir::Trace) -> Vec<(u32, u32, u32, u32)> {
             _ => None,
         })
         .collect()
+}
+
+/// A view of rows `[start, start + rows)` of every plane of a bank: the
+/// planes are row-major, so it is the same buffer from a later offset.
+fn rows_of(handles: &Handles, bank: &Bank, start: u32, rows: u32) -> Result<Bank> {
+    let plane = |t: Tensor, unit_bits: u32| -> Result<Tensor> {
+        let row = u64::from(t.width) * u64::from(unit_bits) / 8;
+        let buf = if start == 0 {
+            t.buf
+        } else {
+            handles.cut(t.buf, row * u64::from(start), row * u64::from(rows))?
+        };
+        Ok(Tensor::new(buf, rows, t.width, t.dtype))
+    };
+    Ok(Bank {
+        codes: plane(bank.codes, bank.bits)?,
+        mpp_codes: None,
+        scales: plane(bank.scales, 16)?,
+        biases: match bank.biases {
+            Some(b) => Some(plane(b, 16)?),
+            None => None,
+        },
+        group: bank.group,
+        bits: bank.bits,
+    })
 }
 
 /// Copies `rows` row ranges of each plane of an affine 4-bit bank into a
@@ -317,14 +354,8 @@ pub fn load(
         if gu.bits != 4 || dn.bits != 4 || gu.codes.dtype != Dtype::U4g64 || keep % gu.group != 0 {
             continue;
         }
-        let mut gate_up = carve(
-            device,
-            handles,
-            &gu,
-            &[(0, keep), (inter, keep)],
-            gu.codes.width,
-            &mut buffers,
-        )?;
+        let gate = rows_of(handles, &gu, 0, keep)?;
+        let up = rows_of(handles, &gu, inter, keep)?;
         let mut down = carve(
             device,
             handles,
@@ -333,12 +364,12 @@ pub fn load(
             keep,
             &mut buffers,
         )?;
-        gate_up.mpp_codes = crate::weights::mpp_pack(device, handles, &gate_up, &mut buffers)?;
         down.mpp_codes = crate::weights::mpp_pack(device, handles, &down, &mut buffers)?;
         splits.insert(
             layer,
             Split {
-                gate_up,
+                gate,
+                up,
                 down,
                 keep,
             },
@@ -352,6 +383,15 @@ pub fn load(
         return Ok(());
     }
 
+    let up_bytes = u64::from(max_rows) * u64::from(keep) * 2;
+    let up_buf = Buffer::zeroed(device, up_bytes)?;
+    let up_rows = Tensor::new(
+        handles.bind(&up_buf, 0, up_bytes)?,
+        max_rows,
+        keep,
+        Dtype::Bf16,
+    );
+    buffers.push(up_buf);
     let bytes = u64::from(max_rows) * u64::from(hidden) * 2;
     let staged_buf = Buffer::zeroed(device, bytes)?;
     let other_buf = Buffer::zeroed(device, bytes)?;
@@ -412,6 +452,7 @@ pub fn load(
         let _ = ANE.set(Ane {
             splits,
             max_rows,
+            up_rows,
             staged,
             other,
             event,
@@ -447,6 +488,10 @@ pub fn plan(layer: u32, rows: u32) -> Option<Plan> {
     let (stage, done) = (base + 1, base + 2);
     Some(Plan {
         split,
+        up_rows: Tensor {
+            rows,
+            ..ane.up_rows
+        },
         staged: Tensor { rows, ..ane.staged },
         other: Tensor { rows, ..ane.other },
         stage: u32::try_from(stage).ok()?,
@@ -530,7 +575,7 @@ mod coreml {
 
     pub enum Units {
         NeuralEngine,
-        Cpu,
+        Gpu,
     }
 
     pub struct Model(*mut c_void);
@@ -554,7 +599,7 @@ mod coreml {
             let mut err = [0 as c_char; 512];
             let units = match units {
                 Units::NeuralEngine => 0,
-                Units::Cpu => 1,
+                Units::Gpu => 2,
             };
             // SAFETY: both strings are NUL-terminated and `err` holds `cap` bytes.
             let model = unsafe {
@@ -720,13 +765,13 @@ impl Worker {
             }
             if let Err(why) = ran {
                 eprintln!(
-                    "PIE_ANE: layer {} failed on the Neural Engine ({why}); rerunning it on the CPU \
+                    "PIE_ANE: layer {} failed on the Neural Engine ({why}); rerunning it on the GPU \
                      and stopping the split",
                     job.layer
                 );
                 self.off.store(true, Ordering::Release);
-                if let Err(why) = self.on_cpu(job, &input_name, &output_name, &mut host) {
-                    eprintln!("PIE_ANE: layer {} failed on the CPU too: {why}", job.layer);
+                if let Err(why) = self.on_gpu(job, &input_name, &output_name, &mut host) {
+                    eprintln!("PIE_ANE: layer {} failed on the GPU too: {why}", job.layer);
                 }
             }
             event.setSignaledValue(job.done);
@@ -789,7 +834,7 @@ impl Worker {
         Ok(())
     }
 
-    fn on_cpu(
+    fn on_gpu(
         &self,
         job: Job,
         input: &CString,
@@ -801,7 +846,7 @@ impl Worker {
             let model = coreml::Model::load(
                 &self.path(job.layer),
                 &format!("t{bucket}"),
-                coreml::Units::Cpu,
+                coreml::Units::Gpu,
             )?;
             models.insert((job.layer, bucket), model);
         }

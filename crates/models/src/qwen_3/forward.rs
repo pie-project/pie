@@ -26,10 +26,23 @@ fn rot_take(x: &Value, signs: &Weight) -> Value {
     ops::elemwise::hadamard_signed(x, BONSAI_BLOCK, signs)
 }
 
-/// `PIE_ANE` asks the backend to split each dense MLP between the GPU and
-/// the Neural Engine on long prefills (the backend falls back to the GPU).
+/// Dense MLPs are left for the backend to split between the GPU and the
+/// Neural Engine on long prefills: on macOS, unless `PIE_ANE=0`, and only
+/// once `scripts/ane/build.py` has written a build (or `PIE_ANE` names one).
 fn ane_mlp() -> bool {
-    std::env::var("PIE_ANE").is_ok_and(|v| v != "0" && !v.is_empty())
+    match std::env::var("PIE_ANE") {
+        Ok(v) if v == "0" => false,
+        Ok(v) if !v.is_empty() && v != "1" => true,
+        _ => {
+            cfg!(target_os = "macos")
+                && std::env::var_os("HOME").is_some_and(|home| {
+                    std::path::Path::new(&home)
+                        .join(".cache/pie/ane")
+                        .read_dir()
+                        .is_ok_and(|mut builds| builds.next().is_some())
+                })
+        }
+    }
 }
 
 pub struct Facts {
