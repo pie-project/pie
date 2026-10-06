@@ -152,6 +152,13 @@ impl QuantSpec {
             | QuantScheme::GgufIq2S
             | QuantScheme::GgufIq3Xxs
             | QuantScheme::GgufIq3S => return None,
+
+            // The ternary block's algebraic shape (group 128, T3, fp16 gain). This
+            // is the DTYPE crate's `Fmt` — which has a `T3` code — and is used to
+            // match `Dtype::Ptq1_0.repr()` in `spec_of_term`. It does NOT round-trip
+            // through a ztensor term (that grammar has no ternary), so `term_of`
+            // leaves the served block untyped and self-contained, like the lattices.
+            QuantScheme::Ptq1_0 => *Dtype::Ptq1_0.repr(),
         })
     }
 
@@ -196,6 +203,7 @@ const GGUF: &[(QuantScheme, &str)] = &[
     (QuantScheme::GgufIq2S, "iq2_s"),
     (QuantScheme::GgufIq3Xxs, "iq3_xxs"),
     (QuantScheme::GgufIq3S, "iq3_s"),
+    (QuantScheme::Ptq1_0, "ptq1_0"),
 ];
 
 #[must_use]

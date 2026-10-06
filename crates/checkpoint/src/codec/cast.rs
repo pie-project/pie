@@ -55,7 +55,8 @@ pub fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, Error> {
                 | DType::I6g16k
                 | DType::E4m3row
                 | DType::E4m3tile128
-                | DType::U2g128 => {
+                | DType::U2g128
+                | DType::Ptq1_0 => {
                     return Err(invalid("host Cast does not implement the sub-byte codes"));
                 }
                 DType::U8g64 => {
@@ -108,7 +109,8 @@ pub fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, Error> {
             | DType::I6g16k
             | DType::E4m3row
             | DType::E4m3tile128
-            | DType::U2g128 => {
+            | DType::U2g128
+            | DType::Ptq1_0 => {
                 return Err(invalid("host Cast does not implement the sub-byte codes"));
             }
             DType::U8g64 => {

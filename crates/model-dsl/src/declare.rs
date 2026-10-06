@@ -275,6 +275,38 @@ impl Weight {
                     dtype: self.dtype,
                 }]
             }
+            Dtype::Ptq1_0 => {
+                // Unlike the k-quant block families above, PTQ1_0 keeps its
+                // LOGICAL shape in the trace plane, exactly as the affine codes
+                // plane does. The engine's `plane_bytes`/`places` reserve
+                // `rows * row_bytes(k)` FROM the logical width, and the matmul
+                // contracts over the logical `k` — so the plane must carry `k`,
+                // not the packed byte count (packing it here would both double the
+                // reserved bytes and shrink the contraction to the byte width).
+                // Validate the contracted axis is a whole number of 128-wide
+                // ternary blocks (a row cut mid-block owns a partial 28-byte block
+                // it cannot fill).
+                let (&k, _) = self
+                    .shape
+                    .split_last()
+                    .expect("a PTQ1_0 bank's logical shape ends in its contracted axis");
+                let k = u32::try_from(k).unwrap_or_else(|_| {
+                    panic!("`{}` contracts over {k}, which is no row width", self.name)
+                });
+                assert!(
+                    self.dtype.row_bytes(k).is_some(),
+                    "`{}` is `{}` contracting over {k}, which is not a whole number of \
+                     the format's {:?} — a row cut mid-block owns a factor it cannot fill",
+                    self.name,
+                    self.dtype,
+                    self.dtype.quantum(),
+                );
+                vec![BankPlane {
+                    suffix: "",
+                    shape: self.shape.clone(),
+                    dtype: self.dtype,
+                }]
+            }
         }
     }
 }
@@ -366,7 +398,8 @@ pub fn compute_dtype(dtype: Dtype) -> Option<Dtype> {
         | Dtype::U5g32k
         | Dtype::I6g16k
         | Dtype::E4m3row
-        | Dtype::E4m3tile128 => Some(Dtype::Bf16),
+        | Dtype::E4m3tile128
+        | Dtype::Ptq1_0 => Some(Dtype::Bf16),
         Dtype::I64 => Some(Dtype::I64),
         Dtype::I32
         | Dtype::U32
