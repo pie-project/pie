@@ -4,6 +4,8 @@ pub mod binary;
 
 pub mod clip;
 
+pub mod fwht;
+
 pub mod gate;
 
 pub mod hc;
