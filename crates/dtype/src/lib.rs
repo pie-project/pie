@@ -47,10 +47,11 @@ pub enum Dtype {
     E4m3row,
     E4m3tile128,
     Ptq1_0,
+    Pq2_0,
 }
 
 impl Dtype {
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 34] = [
         Self::F32,
         Self::F16,
         Self::Bf16,
@@ -84,6 +85,7 @@ impl Dtype {
         Self::E4m3row,
         Self::E4m3tile128,
         Self::Ptq1_0,
+        Self::Pq2_0,
     ];
 
     #[must_use]
@@ -234,6 +236,16 @@ impl Dtype {
                 gain: &F16,
                 offset: None,
             },
+            // Prism-private 2-bit, block 128: positional 2-bit codes + one fp16
+            // scale per 128 weights, no offset. 34 B/block = 2.125 bpw. Unlike
+            // Ptq1_0's base-3 staging, the generic plane model is exact here
+            // (`u2` plane = 32 B, `f16` scale plane = 2 B), so no size overrides.
+            Self::Pq2_0 => &Fmt::Q {
+                g: Group::N(128),
+                elem: Elem::U(2),
+                gain: &F16,
+                offset: None,
+            },
         }
     }
 
@@ -273,6 +285,7 @@ impl Dtype {
             Self::E4m3row => "gr_e4m3_f32_n",
             Self::E4m3tile128 => "g128x128_e4m3_f32_n",
             Self::Ptq1_0 => "g128_t3_f16_n",
+            Self::Pq2_0 => "g128_u2_f16_n",
         }
     }
 
@@ -408,6 +421,12 @@ pub const PTQ1_0_BLOCK: u32 = 128;
 /// On-disk bytes per PTQ1_0 block: `qs[24]` + `qh[2]` + fp16 scale = 28 (1.75 bpw).
 pub const PTQ1_0_BLOCK_BYTES: u64 = 28;
 
+/// Weights per PQ2_0 block (`Dtype::Pq2_0`).
+pub const PQ2_0_BLOCK: u32 = 128;
+
+/// On-disk bytes per PQ2_0 block: fp16 scale + `qs[32]` (2 bits/weight) = 34 (2.125 bpw).
+pub const PQ2_0_BLOCK_BYTES: u64 = 34;
+
 #[cfg(feature = "serde")]
 impl serde::Serialize for Dtype {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -471,6 +490,35 @@ mod tests {
         // Exactly 1.75 bpw (the generic plane model would say 1.725).
         assert_eq!(Ptq1_0.bpw(4096), Some(1.75));
         assert_eq!(Ptq1_0.bpw(0), None);
+    }
+
+    #[test]
+    fn pq2_0_sizes_match_the_block_layout() {
+        use super::Dtype::Pq2_0;
+        // Spelling + repr identify the 2-bit group-128 fp16 codec (fp16 scale, no
+        // offset, positional codes). Distinct from U2g128 (`g128_u2_bf16_b_bf16`).
+        assert_eq!(Pq2_0.spelling(), "g128_u2_f16_n");
+        assert_eq!(Dtype::of_fmt(Pq2_0.repr()), Some(Pq2_0));
+        // One block = 34 bytes = 2.125 bpw, a K-wide row is ceil(K/128)*34. Unlike
+        // Ptq1_0, the generic plane model is exact (u2 plane 32 B + f16 scale 2 B),
+        // so `Dtype::row_bytes`/`bpw` fall straight through to it. Verified against
+        // real Ternary-Bonsai-2-27B-PQ2_0.gguf rows:
+        //   token_embd (K=5120) -> 1360 B/row; ffn_down (K=17408) -> 4624 B/row.
+        assert_eq!(Pq2_0.row_bytes(128), Some(34));
+        assert_eq!(Pq2_0.row_bytes(256), Some(68));
+        assert_eq!(Pq2_0.row_bytes(5120), Some(1360));
+        assert_eq!(Pq2_0.row_bytes(17408), Some(4624));
+        assert_eq!(Pq2_0.row_bytes(12288), Some(3264));
+        // Sub-block widths are rejected (the 128-group is the quantum).
+        assert_eq!(Pq2_0.row_bytes(64), None);
+        assert_eq!(Pq2_0.row_bytes(0), None);
+        // Exactly 2.125 bpw (34*8/128).
+        assert_eq!(Pq2_0.bpw(4096), Some(2.125));
+        assert_eq!(Pq2_0.bpw(0), None);
+        // The code is a whole-bit 2-bit element (so `bits`/`bytes_ceil` are sane,
+        // unlike Ptq1_0's base-3 T3 code which panics there).
+        assert_eq!(Pq2_0.bits(), 2);
+        assert_eq!(Pq2_0.bytes_ceil(), 1);
     }
 
     fn repr_is_injective_and_of_fmt_inverts_it() {

@@ -159,6 +159,12 @@ impl QuantSpec {
             // through a ztensor term (that grammar has no ternary), so `term_of`
             // leaves the served block untyped and self-contained, like the lattices.
             QuantScheme::Ptq1_0 => *Dtype::Ptq1_0.repr(),
+
+            // The 2-bit block's algebraic shape (group 128, U2, fp16 gain). Like
+            // PTQ1_0 this is the DTYPE crate's `Fmt` used to match
+            // `Dtype::Pq2_0.repr()` in `spec_of_term`; it is self-contained and
+            // carries no ztensor term, so `term_of` leaves the served block untyped.
+            QuantScheme::Pq2_0 => *Dtype::Pq2_0.repr(),
         })
     }
 
@@ -204,6 +210,7 @@ const GGUF: &[(QuantScheme, &str)] = &[
     (QuantScheme::GgufIq3Xxs, "iq3_xxs"),
     (QuantScheme::GgufIq3S, "iq3_s"),
     (QuantScheme::Ptq1_0, "ptq1_0"),
+    (QuantScheme::Pq2_0, "pq2_0"),
 ];
 
 #[must_use]
