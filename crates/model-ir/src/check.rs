@@ -738,6 +738,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Linear::Matmul { .. }
             | Linear::LmHead { .. }
             | Linear::MlpSwiglu { .. }
+            | Linear::MlpAne { .. }
             | Linear::MlpSwigluClamp { .. }
             | Linear::MlpSwigluClampAlpha { .. }
             | Linear::MlpSwigluClampSplit { .. }

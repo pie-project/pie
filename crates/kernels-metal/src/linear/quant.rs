@@ -576,6 +576,16 @@ pub fn act_x_wt(
             ),
         ));
     }
+    let stride = w.codes.width;
+    let leading = stride != contraction;
+    if leading && (stride < contraction || w.mpp_codes.is_some() || w.bits != 4) {
+        return Err(refuse(
+            op,
+            format!(
+                "a {stride}-wide bank cannot be read by its leading {contraction} columns here"
+            ),
+        ));
+    }
     let group = stated(op, w.group)?;
     let bits = stated(op, w.bits)?;
     let (m, n, k) = (
@@ -681,6 +691,7 @@ pub fn act_x_wt(
                     n.arg(),
                     aux.arg(),
                     (if local { rows } else { padded } as i32).arg(),
+                    stated(op, stride)?.arg(),
                 ],
             )?;
             if local {
@@ -707,6 +718,12 @@ pub fn act_x_wt(
             }
             return Ok(());
         }
+    }
+    if leading {
+        return Err(refuse(
+            op,
+            "a bank read by its leading columns needs the MPP point, which this shape or device does not take",
+        ));
     }
     let fp16 = tuned.fp16_gemm_format(w.bits, w.group);
     let min_batch = if bits == 2 {

@@ -114,6 +114,32 @@ impl Run<'_> {
             Linear::MlpGeluTanh { x, y } => {
                 linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), self.tensor(*y))
             }
+            Linear::MlpAne {
+                act,
+                gate_up,
+                down,
+                intermediate,
+                packed,
+                h,
+                y,
+                ..
+            } => {
+                self.linear(&Linear::Matmul {
+                    act: *act,
+                    w: *gate_up,
+                    y: *packed,
+                })?;
+                self.linear(&Linear::MlpSwiglu {
+                    packed: *packed,
+                    intermediate: *intermediate,
+                    y: *h,
+                })?;
+                self.linear(&Linear::Matmul {
+                    act: *h,
+                    w: *down,
+                    y: *y,
+                })
+            }
             // The fused forms take one dense weight; a quantized weight is
             // the plain matmul followed by the epilogue, as engine-cuda does.
             Linear::MatmulGeglu {

@@ -42,6 +42,33 @@ pub fn mlp_swiglu(packed: &Value, intermediate: u32) -> Value {
     y
 }
 
+pub fn mlp_ane(
+    act: &Value,
+    gate_up: &Weight,
+    down: &Weight,
+    intermediate: u32,
+    layer: u32,
+) -> Value {
+    let r = act.rec();
+    let packed = r.fresh(tensor(act.rows(), gate_up.dim(0), act.dtype()));
+    let h = r.fresh(tensor(act.rows(), intermediate, act.dtype()));
+    let y = r.fresh(tensor(act.rows(), down.dim(0), act.dtype()));
+    r.push(
+        Linear::MlpAne {
+            act: act.id(),
+            gate_up: r.weight(gate_up),
+            down: r.weight(down),
+            intermediate,
+            layer,
+            packed: packed.id(),
+            h: h.id(),
+            y: y.id(),
+        },
+        &[act],
+    );
+    y
+}
+
 pub fn mlp_swiglu_clamp(packed: &Value, intermediate: u32, limit: f32) -> Value {
     let r = packed.rec();
     let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));

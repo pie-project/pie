@@ -223,6 +223,24 @@ impl Buffer {
         }
     }
 
+    /// # Safety
+    /// `at` is a page-aligned, host-visible allocation of `bytes` bytes that
+    /// outlives every use of the buffer.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) unsafe fn foreign(
+        device: &super::Context,
+        at: std::ptr::NonNull<u8>,
+        bytes: u64,
+    ) -> Result<Buffer> {
+        let slab = unsafe { device.no_copy(at, bytes as usize) }?;
+        Ok(Buffer {
+            slab,
+            bytes,
+            keep: None,
+            host: true,
+        })
+    }
+
     /// A binding view over a placement sparse buffer of `bytes` (its
     /// un-rounded length). Encoders bind and blit it like any other buffer;
     /// `read`, `write` and `zero_span` refuse it, because the sparse buffer

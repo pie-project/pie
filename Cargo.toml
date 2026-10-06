@@ -44,6 +44,7 @@ members = [
     "crates/media",
     "crates/kernels-cuda",
     "crates/kernels-metal",
+    "crates/ane",
     "crates/engine-cuda",
     "crates/engine-metal",
     "crates/kernels-vulkan",

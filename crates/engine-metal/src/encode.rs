@@ -41,6 +41,7 @@ pub struct Sink<'a> {
     pipelines: &'a Pipelines,
     handles: &'a Handles,
     cuts: Option<Cuts<'a>>,
+    ane: Option<&'a crate::ane::Ane>,
 }
 
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
@@ -105,6 +106,7 @@ impl<'a> Sink<'a> {
             pipelines,
             handles,
             cuts: None,
+            ane: None,
         }
     }
 
@@ -122,7 +124,14 @@ impl<'a> Sink<'a> {
             pipelines,
             handles,
             cuts: Some(cuts),
+            ane: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_ane(mut self, ane: Option<&'a crate::ane::Ane>) -> Self {
+        self.ane = ane;
+        self
     }
 
     #[must_use]
@@ -259,6 +268,20 @@ impl<'a> Sink<'a> {
         Ok(())
     }
 
+    #[cfg(target_vendor = "apple")]
+    fn fence(&self, fire: Fire, stamp: u64, signal: bool) -> Result<(), Error> {
+        let event = self.ane.map(crate::ane::Ane::event).ok_or_else(|| {
+            Sink::refuse(
+                fire,
+                Fault::Unbound {
+                    what: "the Neural Engine event, which this load never made".to_string(),
+                },
+            )
+        })?;
+        self.with_frame(|frame| frame.fence(event, stamp, signal))
+            .map_err(|fault| Sink::refuse(fire, fault))
+    }
+
     fn refuse(fire: Fire, fault: Fault) -> Error {
         Error::Backend {
             op: fire.entrypoint,
@@ -355,7 +378,7 @@ impl Encode for Sink<'_> {
                     let encoder = own.encoder();
                     encoder.setComputePipelineState(&pipeline);
                     for (at, arg) in args.iter().enumerate() {
-                        self.bind(encoder, fire, at, *arg)?;
+                        self.bind(&encoder, fire, at, *arg)?;
                     }
                     let lanes = MTLSize {
                         width: fire.lanes[0].max(1) as usize,
@@ -377,11 +400,17 @@ impl Encode for Sink<'_> {
                 record_kernel(&profile_key(fire.entrypoint, args), seconds);
                 return Ok(());
             }
+            let fence = (fire.file == kernels_metal::linear::ane::FILE)
+                .then(|| kernels_metal::linear::ane::fence_of(fire.entrypoint, args))
+                .flatten();
+            if let Some((stamp, false)) = fence {
+                self.fence(fire, stamp, false)?;
+            }
             self.with_frame(|frame| {
                 let encoder = frame.encoder();
                 encoder.setComputePipelineState(&pipeline);
                 for (at, arg) in args.iter().enumerate() {
-                    self.bind(encoder, fire, at, *arg)?;
+                    self.bind(&encoder, fire, at, *arg)?;
                 }
                 let lanes = MTLSize {
                     width: fire.lanes[0].max(1) as usize,
@@ -400,6 +429,9 @@ impl Encode for Sink<'_> {
                 encoder.dispatchThreads_threadsPerThreadgroup(lanes, group);
                 Ok(())
             })?;
+            if let Some((stamp, true)) = fence {
+                self.fence(fire, stamp, true)?;
+            }
             if profiling()
                 && let Held::Owned(cell) = &self.frame
             {
