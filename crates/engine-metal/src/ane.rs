@@ -13,8 +13,9 @@
 //! rerun on the GPU, so the fire stays correct, and the split stops for the
 //! rest of the load.
 //!
-//! The GPU reads its gate and up rows straight out of the model's own banks;
-//! only its columns of `down`, which cut across every row, are copied.
+//! The GPU reads its gate and up rows straight out of the model's own banks,
+//! and its columns of `down` as the leading columns of `down`'s rows where the
+//! MPP matmul runs (they are copied out on devices without it).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -48,8 +49,8 @@ const PROGRAMS_PER_LAYER: usize = 2;
 const STAGE_TIMEOUT_MS: u64 = 60_000;
 
 /// The GPU's half of one layer's MLP: `gate` and `up` are views of rows
-/// `[0, keep)` of the model's gate and up planes, `down` a copy of its
-/// columns `[0, keep)`.
+/// `[0, keep)` of the model's gate and up planes; `down` is read by its
+/// columns `[0, keep)`, in place or from a copy.
 #[derive(Clone, Copy)]
 pub struct Split {
     pub gate: Bank,
@@ -356,15 +357,25 @@ pub fn load(
         }
         let gate = rows_of(handles, &gu, 0, keep)?;
         let up = rows_of(handles, &gu, inter, keep)?;
-        let mut down = carve(
-            device,
-            handles,
-            &dn,
-            &[(0, dn.codes.rows)],
-            keep,
-            &mut buffers,
-        )?;
-        down.mpp_codes = crate::weights::mpp_pack(device, handles, &down, &mut buffers)?;
+        // The MPP matmul reads a row's leading columns in place; elsewhere
+        // the GPU's columns of `down` are copied out.
+        let down = if kernels_metal::tuning::current().qmm_mpp {
+            Bank {
+                mpp_codes: None,
+                ..dn
+            }
+        } else {
+            let mut down = carve(
+                device,
+                handles,
+                &dn,
+                &[(0, dn.codes.rows)],
+                keep,
+                &mut buffers,
+            )?;
+            down.mpp_codes = crate::weights::mpp_pack(device, handles, &down, &mut buffers)?;
+            down
+        };
         splits.insert(
             layer,
             Split {
