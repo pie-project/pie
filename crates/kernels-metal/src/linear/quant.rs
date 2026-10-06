@@ -20,6 +20,38 @@ const PTQ1_0_QMV: &str = "ptq1_0_qmv_bfloat16";
 /// Weights per PTQ1_0 block; the scale is INLINE per block (single plane).
 const PTQ1_0_BLOCK: u32 = 128;
 
+/// The PQ2_0 positional-2-bit decode-in-dot kernel (`Dtype::Pq2_0`,
+/// `g128_u2_f16_n`).
+const PQ2_0_FILE: &str = "linear/quant_pq2_0.metal";
+
+/// Production qmv entrypoint: bf16 activation in, bf16 out.
+const PQ2_0_QMV: &str = "pq2_0_qmv_bfloat16";
+
+/// Weights per PQ2_0 block; the scale is INLINE per block (single plane).
+const PQ2_0_BLOCK: u32 = 128;
+
+/// Contraction tile the PQ2_0 GEMM-tiled qmm walks per step (a quarter of a
+/// 128-weight block; four steps cross one block and its inline fp16 scale).
+const PQ2_0_QMM_BK: i32 = 32;
+
+/// Prefill row count at or above which PQ2_0 routes to the tiled qmm instead of
+/// the qmv. Below it the per-row cost of qmv wins (no tile fill / store
+/// overhead); at/above it, amortising each decoded weight tile across BM rows is
+/// a large win. Measured crossover on an M-series GPU (see the prefill bench).
+const PQ2_0_QMM_MIN_BATCH: i32 = 16;
+
+/// A tiled PQ2_0 qmm axis point. `entry` names the stamped specialisation; the
+/// `stamp` mints `pq2_0_qmm_t<bm, 32, bn>` under that name on demand.
+pub fn pq2_0_qmm_point(op: &'static str, bm: i32, bn: i32) -> Result<Point, Error> {
+    check(op, &ROW_TILES, bm, "row tile")?;
+    check(op, &TILES, bn, "column tile")?;
+    let entry = symbol(&format!("pq2_0_qmm_t_bm_{bm}_bn_{bn}"));
+    Ok(Point {
+        entry,
+        stamp: symbol(&format!("PIE_STAMP_pq2_0_qmm(\"{entry}\", {bm}, {bn})")),
+    })
+}
+
 const QMV_ROWS_FILE: &str = "linear/quant_qmv_rows.metal";
 
 const QMV_ROWS_STAMP: &str = "PIE_STAMP_qmv_rows";
@@ -550,6 +582,26 @@ pub fn act_x_wt(
         }
         return ptq1_0_matmul(ctx, op, act, w, y, rows, columns, contraction);
     }
+    // PQ2_0 is the 2-bit sibling: a single-plane inline-scale quaternary bank
+    // (the fp16 scale leads each 34-byte block), so it has no `scales`/`biases`
+    // plane to pair either. Route it to its own decode-in-dot kernel.
+    if w.codes.dtype == Dtype::Pq2_0 {
+        let (rows, columns, contraction) = extent(op, act, y)?;
+        if rows == 0 {
+            return Ok(());
+        }
+        return pq2_0_matmul(
+            ctx,
+            op,
+            act,
+            w,
+            y,
+            rows,
+            columns,
+            contraction,
+            capacity_rows,
+        );
+    }
     let Some(biases) = w.biases else {
         return Err(refuse(
             op,
@@ -900,6 +952,62 @@ fn ptq1_0_matmul(
     let k = stated(op, contraction)?;
     ctx.fire(
         Fire::at(PTQ1_0_FILE, PTQ1_0_QMV).apply(Grid::of(qmv_grid(op, m, n)?, QMV_GROUP)),
+        &[w.codes.arg(), act.arg(), y.arg_mut(), k.arg(), n.arg()],
+    )
+}
+
+/// Serve a PQ2_0 (positional 2-bit, `g128_u2_f16_n`) projection with the
+/// decode-in-dot kernel. Like PTQ1_0 the bank is single-plane: `w.codes` carries
+/// the 34-byte blocks with their inline leading fp16 scale, and
+/// `w.scales`/`w.biases` are unused (the loader aliases `scales` at the codes
+/// plane and this path never reads it). One kernel walks every row count `m`;
+/// decode is small and matrix-vector shaped, the path pie's `qwen_3 d27b` decode
+/// takes.
+#[allow(clippy::too_many_arguments)]
+fn pq2_0_matmul(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    act: Tensor,
+    w: Bank,
+    y: Tensor,
+    rows: u32,
+    columns: u32,
+    contraction: u32,
+    capacity_rows: u32,
+) -> Result<(), Error> {
+    if !contraction.is_multiple_of(PQ2_0_BLOCK) {
+        return Err(refuse(
+            op,
+            format!(
+                "the contraction is {contraction}, not a whole number of {PQ2_0_BLOCK}-weight \
+                 2-bit blocks: a PQ2_0 row is `ceil(K/{PQ2_0_BLOCK}) * 34` bytes and the \
+                 kernel reads one 34-byte block per {PQ2_0_BLOCK} contracted weights"
+            ),
+        ));
+    }
+    let (m, n) = (stated(op, rows)?, stated(op, columns)?);
+    let k = stated(op, contraction)?;
+    // Prefill: amortise each decoded weight tile across BM activation rows with
+    // the GEMM-tiled qmm. The tile must divide the padded rows (the shader reads
+    // M from the grid) and the columns (`store_result` writes a whole BM x BN
+    // tile), and the padded rows must fit the allocated capacity so the pad rows
+    // land in-bounds. K is a whole number of 128-blocks, so K % BK(32) == 0.
+    let capacity = i32::try_from(capacity_rows).unwrap_or(i32::MAX);
+    if m >= PQ2_0_QMM_MIN_BATCH
+        && k % PQ2_0_QMM_BK == 0
+        && let Some((bm, padded)) = mb_block(m, capacity)
+        && let Some(bn) = TILES.iter().copied().find(|bn| n % bn == 0)
+    {
+        let point = pq2_0_qmm_point(op, bm, bn)?;
+        return ctx.fire(
+            Fire::at(PQ2_0_FILE, point.entry)
+                .stamp(point.stamp)
+                .apply(Grid::of(qmm_grid(op, n, bn, padded, bm, 1)?, qmm_group(bm))),
+            &[w.codes.arg(), act.arg(), y.arg_mut(), k.arg(), n.arg()],
+        );
+    }
+    ctx.fire(
+        Fire::at(PQ2_0_FILE, PQ2_0_QMV).apply(Grid::of(qmv_grid(op, m, n)?, QMV_GROUP)),
         &[w.codes.arg(), act.arg(), y.arg_mut(), k.arg(), n.arg()],
     )
 }

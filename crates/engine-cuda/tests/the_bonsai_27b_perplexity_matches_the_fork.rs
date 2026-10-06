@@ -1,5 +1,3 @@
-#![cfg(target_vendor = "apple")]
-
 //! REAL quality eval of pie-served Ternary-Bonsai-2-27B (PTQ1_0): token-level
 //! perplexity (mean NLL) over a held-out corpus, compared to the fork.
 //!
@@ -29,11 +27,15 @@
 //! Env:
 //! * `BONSAI_GGUF` — the real PTQ1_0 GGUF (required): import + sign metadata.
 //! * `BONSAI_ZT`   — served `.zt` cache (optional; defaults beside the GGUF).
-//! * `PPL_IDS`     — raw little-endian u32 token-id stream (optional; defaults to the committed `tests/bonsai/ppl_ids.bin`, the first 2048 WikiText-2-test ids = 4×512).
+//! * `PPL_IDS`     — raw little-endian u32 token-id stream (optional; defaults to
+//!                   the committed `tests/bonsai/ppl_ids.bin`, the first 2048
+//!                   WikiText-2-test ids = 4×512).
 //! * `PPL_CTX`     — chunk length / context (default 512).
 //! * `PPL_CHUNKS`  — number of chunks to score (default: all ids / ctx).
 //! * `PPL_FIRST`   — first scored position within a chunk (default ctx/2).
-//! * `FORK_PPL`    — the fork's reported PPL over these chunks (optional; defaults to 7.9468, the regenerated `prism`-fork reference for the committed ids). The delta is asserted within `PPL_TOL`.
+//! * `FORK_PPL`    — the fork's reported PPL over these chunks (optional; defaults
+//!                   to 7.9468, the regenerated `prism`-fork reference for the
+//!                   committed ids). The delta is asserted within `PPL_TOL`.
 //! * `PPL_TOL`     — allowed relative |pie-fork|/fork (default 0.03 = 3%).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -44,13 +46,20 @@ use checkpoint::file::read::parse_metadata;
 use checkpoint::file::write::Writer;
 use checkpoint::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 
-use engine_metal::weights::AdapterPlane;
-use engine_metal::{Boot, Lane, Shell};
+use engine_cuda::experts::{Budgets, Plan};
+use engine_cuda::weights::AdapterPlane;
+use engine_cuda::{Boot, Graphs, Knobs, Lane, Shell, World};
 use model_compiler::Budget;
 use model_dsl::{Classify, Dtype, Platform, Request, trace_hybrid};
 use models::qwen_3::forward::Facts;
 use models::qwen_3::model::Model;
 use models::qwen_3::rotation::{self, BONSAI_SIGN_WIDTHS};
+
+/// The d27b-bonsai fact word for a prefill of `len` tokens — the same `Facts`
+/// classifier the serve reads per fire, handed to the shell at load.
+fn classify(request: &Request) -> u64 {
+    Facts::of(request).word()
+}
 
 fn gguf_path() -> Option<PathBuf> {
     let p = std::env::var_os("BONSAI_GGUF")?;
@@ -102,7 +111,7 @@ fn import_zt(gguf: &Path, out: &Path) {
     let src = ztensor_compat::index(gguf).expect("open the GGUF as a source");
     let model = Model::d27b_bonsai(Dtype::Ptq1_0, Dtype::Bf16, 1);
     let contract = model
-        .import_from_gguf(&src, Platform::Metal)
+        .import_from_gguf(&src, Platform::Cuda)
         .expect("the d27b_bonsai contract reads every plane of the Bonsai GGUF");
     drop(src);
 
@@ -152,8 +161,8 @@ fn nll_of(logits: &[f32], target: u32) -> f64 {
 
 #[test]
 fn the_bonsai_27b_perplexity_matches_the_fork() {
-    if !engine_metal::device::present() {
-        eprintln!("ppl: no Metal device; skipping");
+    if !engine_cuda::device::present() {
+        eprintln!("ppl: no CUDA device; skipping");
         return;
     }
     let Some(gguf) = gguf_path() else {
@@ -187,20 +196,23 @@ fn the_bonsai_27b_perplexity_matches_the_fork() {
 
     // Serve setup — identical to the oracle test.
     let model = Model::d27b_bonsai(Dtype::Ptq1_0, Dtype::Bf16, 1);
-    let trace = trace_hybrid("d27b-bonsai", &model, Platform::Metal);
+    let trace = trace_hybrid("d27b-bonsai", &model, Platform::Cuda);
     let src = ztensor_compat::index(&zt).expect("open the served artifact");
-    let contract = checkpoint_dsl::own_contract(&src, &trace.params, 1, Platform::Metal)
+    let contract = checkpoint_dsl::own_contract(&src, &trace.params, 1, Platform::Cuda)
         .expect("the artifact holds every checkpoint plane the trace reads");
     drop(src);
-    let planes =
-        engine_metal::weights::attachments(&trace, &contract, &zt).expect("pair the banks");
-    let residency = engine_metal::experts::Plan::of(&trace, &planes, None)
+
+    let target = StorageTarget::for_backend(checkpoint::types::BackendKind::Cuda, 0, 1);
+    let prospect =
+        engine_cuda::weights::prospect(&trace, &contract, &zt, target).expect("pair the banks");
+    let residency = Plan::of(&trace, &prospect.planes, Budgets::uncapped())
         .expect("full residency (the 6 GB PTQ1_0 model fits)");
 
     let context = n_ctx as u32;
     let page_size = 16u32;
     let shell = Shell::load(Boot {
-        trace: trace.clone(),
+        classify,
+        trace,
         contract: &contract,
         checkpoint: &zt,
         budget: Budget::new(1, context),
@@ -211,13 +223,27 @@ fn the_bonsai_27b_perplexity_matches_the_fork() {
         context,
         slots: 1,
         pages: context.div_ceil(page_size),
+        ordinal: 0,
+        graphs: Graphs::Off,
+        knobs: Knobs::default(),
+        cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         residency,
+        deferred_tier: false,
+        world: World::default(),
+        comm: core::ptr::null_mut(),
     });
     let mut shell = match shell {
         Ok(shell) => shell,
-        Err(engine_metal::Fault::Residency(said)) => {
+        Err(engine_cuda::Fault::Residency(said)) => {
             eprintln!("ppl: this machine cannot hold the 27B model — {said}; skipping");
+            return;
+        }
+        Err(engine_cuda::Fault::OutOfMemory { need, have }) => {
+            eprintln!(
+                "ppl: this card cannot hold the 27B model — wanted {need} bytes, had \
+                 {have}; skipping"
+            );
             return;
         }
         Err(other) => panic!("the Bonsai shell loads: {other}"),

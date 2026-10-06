@@ -44,8 +44,9 @@ fn type_name(id: u32) -> Result<&'static str> {
         29 => "iq1_m",
         30 => "bf16",
         39 => "mxfp4",
-        // Prism-private ternary block (Ternary-Bonsai-2-27B-PTQ1_0). 142 (PQ2_0)
-        // is deliberately left unmapped — that is M2.
+        // Prism-private blocks (Ternary-Bonsai-2-27B): 142 is PQ2_0 (positional
+        // 2-bit, 2.125 bpw), 143 is PTQ1_0 (ternary, 1.75 bpw).
+        142 => "pq2_0",
         143 => "ptq1_0",
         other => {
             return Err(Error::Unsupported(format!(

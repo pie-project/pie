@@ -277,14 +277,15 @@ fn claim(w: &Weight, tp: u32) -> Claim {
         | Dtype::U64
         | Dtype::U16
         | Dtype::Bool => (encoding(w.dtype), None),
-        // Self-contained blocks (K-quants and PTQ1_0): one inline plane, no
+        // Self-contained blocks (K-quants, PTQ1_0, PQ2_0): one inline plane, no
         // separate scales/biases — the block carries its own scale.
         Dtype::U2g16k
         | Dtype::I3g16k
         | Dtype::U4g32k
         | Dtype::U5g32k
         | Dtype::I6g16k
-        | Dtype::Ptq1_0 => (encoding(w.dtype), None),
+        | Dtype::Ptq1_0
+        | Dtype::Pq2_0 => (encoding(w.dtype), None),
         Dtype::E2m1 => panic!(
             "`Dtype::E2m1` names a kv-page quantization scheme, not a stored \
              weight plane; no load contract declares one"
@@ -1693,14 +1694,16 @@ pub fn encoding(dtype: Dtype) -> Encoding {
             "a {:?} weight is served but no load contract declares one",
             dtype
         ),
-        // PTQ1_0 joins the self-contained block family: its `g128_t3_f16_n` term
-        // resolves to `QuantScheme::Ptq1_0` (ternary, one inline fp16 scale).
+        // PTQ1_0 and PQ2_0 join the self-contained block family: their
+        // `g128_t3_f16_n` / `g128_u2_f16_n` terms resolve to `QuantScheme::Ptq1_0`
+        // / `QuantScheme::Pq2_0` (one inline fp16 scale, no companion planes).
         Dtype::U2g16k
         | Dtype::I3g16k
         | Dtype::U4g32k
         | Dtype::U5g32k
         | Dtype::I6g16k
-        | Dtype::Ptq1_0 => {
+        | Dtype::Ptq1_0
+        | Dtype::Pq2_0 => {
             Encoding::Quant(checkpoint::spec_of_term(dtype.repr()).unwrap_or_else(|| {
                 panic!(
                     "`{dtype}` is not the arithmetic of any self-contained scheme this \

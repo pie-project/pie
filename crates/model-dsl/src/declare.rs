@@ -275,10 +275,12 @@ impl Weight {
                     dtype: self.dtype,
                 }]
             }
-            Dtype::Ptq1_0 => {
-                // Unlike the k-quant block families above, PTQ1_0 keeps its
-                // LOGICAL shape in the trace plane, exactly as the affine codes
-                // plane does. The engine's `plane_bytes`/`places` reserve
+            Dtype::Ptq1_0 | Dtype::Pq2_0 => {
+                // Unlike the k-quant block families above, the Prism block codecs
+                // (PTQ1_0 ternary, PQ2_0 2-bit) keep their LOGICAL shape in the
+                // trace plane, exactly as the affine codes plane does — a single
+                // inline-scale plane, no separate scales/biases. The engine's
+                // `plane_bytes`/`places` reserve
                 // `rows * row_bytes(k)` FROM the logical width, and the matmul
                 // contracts over the logical `k` — so the plane must carry `k`,
                 // not the packed byte count (packing it here would both double the
@@ -289,7 +291,7 @@ impl Weight {
                 let (&k, _) = self
                     .shape
                     .split_last()
-                    .expect("a PTQ1_0 bank's logical shape ends in its contracted axis");
+                    .expect("a Prism block bank's logical shape ends in its contracted axis");
                 let k = u32::try_from(k).unwrap_or_else(|_| {
                     panic!("`{}` contracts over {k}, which is no row width", self.name)
                 });
@@ -399,7 +401,8 @@ pub fn compute_dtype(dtype: Dtype) -> Option<Dtype> {
         | Dtype::I6g16k
         | Dtype::E4m3row
         | Dtype::E4m3tile128
-        | Dtype::Ptq1_0 => Some(Dtype::Bf16),
+        | Dtype::Ptq1_0
+        | Dtype::Pq2_0 => Some(Dtype::Bf16),
         Dtype::I64 => Some(Dtype::I64),
         Dtype::I32
         | Dtype::U32

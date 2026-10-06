@@ -4,6 +4,7 @@ pub mod fp8;
 pub mod int4;
 pub mod mlx;
 pub mod mxfp4;
+pub mod pq2_0;
 pub mod ptq1_0;
 pub mod rows;
 

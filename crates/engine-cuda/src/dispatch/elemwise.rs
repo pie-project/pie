@@ -728,7 +728,17 @@ impl Run<'_> {
             Elementwise::Tanh { x, x_out: _ } => {
                 elemwise::activation::tanh(self.ctx(), self.tensor(*x), &mut self.tensor(*x))
             }
-            Elementwise::Hadamard { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+            Elementwise::Hadamard {
+                x,
+                x_out: _,
+                block,
+                signs,
+            } => elemwise::fwht::hadamard(
+                self.ctx(),
+                &mut self.tensor(*x),
+                *block,
+                signs.map(|s| self.tensor(s)),
+            ),
             Elementwise::Mul { x, y, z } => elemwise::binary::mul(
                 self.ctx(),
                 self.tensor(*x),
