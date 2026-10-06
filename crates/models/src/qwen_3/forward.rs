@@ -3,9 +3,28 @@ use model_dsl::{
     Request, Value, Weight, ops, seam,
 };
 
-use super::model::{Attn, DRAFT_DEPTH, Gdn, Head, Mixer, Mlp, Model, Tower};
+use super::model::{Attn, BonsaiSigns, DRAFT_DEPTH, Gdn, Head, Mixer, Mlp, Model, Tower};
 
 const MROPE_SECTIONS: [u32; 3] = [11, 11, 10];
+
+/// The Bonsai online-Hadamard block: the fork's shared `prism.hadamard.1024`
+/// normalized Sylvester–Walsh matrix (oracle §2). Every rotated width — 5120,
+/// 6144, 17408 — is a whole multiple of it.
+const BONSAI_BLOCK: u32 = 1024;
+
+/// The forward RHT applied to a rotated projection's INPUT: `H·(S·x)`, on a COPY
+/// of `x`. The Hadamard folds in place and `x` is still live — a sibling
+/// un-rotated projection (`in_ba`, `attn_v`), the LoRA correction, or the
+/// residual all read the unrotated residual — so the copy is load-bearing.
+fn rot_copy(x: &Value, signs: &Weight) -> Value {
+    ops::elemwise::hadamard_signed(&ops::elemwise::copy(x), BONSAI_BLOCK, signs)
+}
+
+/// The forward RHT `H·(S·x)` consuming `x` (no copy) — for an activation that is
+/// dead after the rotated matmul (a gated attention output, a swiglu residue).
+fn rot_take(x: &Value, signs: &Weight) -> Value {
+    ops::elemwise::hadamard_signed(x, BONSAI_BLOCK, signs)
+}
 
 pub struct Facts {
     pub qo_one: bool,
@@ -141,6 +160,22 @@ impl ForwardHybrid for Model {
         let ids = inputs.tokens();
         let mut y = ops::layout::embed(&ids, &m.embed, m.vocab);
 
+        // Bonsai token-embedding INVERSE-after-lookup (oracle §6): the stored
+        // `token_embd` rows are ROTATED (`H·S·true`), so the residual stream needs
+        // `true = S·(H·row)`. This is the inverse order `S·H` — the sign AFTER the
+        // butterfly — not the forward `H·S` that `hadamard_signed` emits. With `H`
+        // symmetric-orthonormal (`H·H = I`) and `S` a ±1 involution,
+        //     S·H = H·(H·S·H),   so   S·H·y = H( H·S( H·y ) ),
+        // i.e. three FWHT passes over the existing op (plain H, then `H·S`, then
+        // plain H). No signs-after-butterfly kernel is needed; the paired plain
+        // passes cancel to the exact inverse. The fork spells this as
+        // GET_ROWS → H-matmul → MUL(signs.5120); this reproduces its value.
+        if let Some(b) = &m.bonsai {
+            let hy = ops::elemwise::hadamard_plain(&y, BONSAI_BLOCK);
+            let hshy = ops::elemwise::hadamard_signed(&hy, BONSAI_BLOCK, &b.hidden);
+            y = ops::elemwise::hadamard_plain(&hshy, BONSAI_BLOCK);
+        }
+
         if let Some(t) = &towered {
             let (imaged, _) = y.split(&Facts::media());
             y = ops::layout::scatter_live_rows(t, &inputs.patch_routes(), &imaged).everywhere();
@@ -162,7 +197,7 @@ impl ForwardHybrid for Model {
                 Mixer::Attn(a) => {
                     attn_mixer(&x, &inputs, m, &plan_m, &plan_d, &plan_p, &plan_s, &mask, a)
                 }
-                Mixer::Gdn(g) => gdn_mixer(&x, &inputs, g),
+                Mixer::Gdn(g) => gdn_mixer(&x, &inputs, g, m.bonsai.as_ref()),
             };
             let o = if m.tp > 1 {
                 ops::collective::all_reduce(&o)
@@ -182,10 +217,29 @@ impl ForwardHybrid for Model {
                     gate_up,
                     down,
                     inter,
-                } => ops::linear::matmul(
-                    &ops::linear::mlp_swiglu(&ops::linear::matmul(&x, gate_up), *inter),
-                    down,
-                ),
+                } => {
+                    // Bonsai: `ffn_gate`+`ffn_up` share the residual input (5120),
+                    // rotated once; `ffn_down` rotates the swiglu intermediate
+                    // (17408). (oracle §6)
+                    let gx;
+                    let gate_in: &Value = match &m.bonsai {
+                        Some(b) => {
+                            gx = rot_copy(&x, &b.hidden);
+                            &gx
+                        }
+                        None => &x,
+                    };
+                    let h = ops::linear::mlp_swiglu(&ops::linear::matmul(gate_in, gate_up), *inter);
+                    let hx;
+                    let down_in: &Value = match &m.bonsai {
+                        Some(b) => {
+                            hx = rot_take(&h, &b.ffn_down);
+                            &hx
+                        }
+                        None => &h,
+                    };
+                    ops::linear::matmul(down_in, down)
+                }
                 Mlp::Routed {
                     router,
                     gate_up,
@@ -253,7 +307,20 @@ impl ForwardHybrid for Model {
         };
 
         let x = ops::layout::gather_rows(&x, &inputs.readout_rows());
-        let logits = ops::linear::lm_head(&x, head);
+        // Bonsai output head (oracle §6): `result_norm` is rotated (5120) before
+        // the (rotated) `output.weight` matmul: MUL(signs.5120) → H → MUL_MAT.
+        // Rotating the gathered readout rows equals rotating pre-gather (the RHT
+        // is per-row over the hidden dim). Copy: `x` is still read by the MTP
+        // path below.
+        let hx;
+        let head_in: &Value = match &m.bonsai {
+            Some(b) => {
+                hx = rot_copy(&x, &b.hidden);
+                &hx
+            }
+            None => &x,
+        };
+        let logits = ops::linear::lm_head(head_in, head);
         let logits = if head_banded(m, head) {
             ops::collective::all_gather(&logits, m.tp)
         } else {
@@ -440,9 +507,21 @@ fn attn_mixer(
     let write_page = inputs.write_page(&a.kv);
     let write_offset = inputs.write_offset(&a.kv);
     let d = m.head_dim;
-    let (q, gate) = ops::layout::split_q_gate(&ops::linear::matmul(x, &a.qg_proj), d);
-    let k = ops::linear::matmul(x, &a.k_proj);
-    let v = ops::linear::matmul(x, &a.v_proj);
+    // Bonsai (full-attention layers): `attn_q` (fused q+gate), `attn_k`, and
+    // `attn_v` all rotate on the residual input (5120), sharing one rotated copy
+    // — the fork builds q, k, AND v from the same Hadamard-rotated input. The
+    // unrotated `x` still feeds the LoRA correction (adapters are not rotated).
+    let rx;
+    let qkv_in: &Value = match m.bonsai.as_ref() {
+        Some(b) => {
+            rx = rot_copy(x, &b.hidden);
+            &rx
+        }
+        None => x,
+    };
+    let (q, gate) = ops::layout::split_q_gate(&ops::linear::matmul(qkv_in, &a.qg_proj), d);
+    let k = ops::linear::matmul(qkv_in, &a.k_proj);
+    let v = ops::linear::matmul(qkv_in, &a.v_proj);
     seam::at(seam::ATTN_QV, &[&q, &v]);
     let q = ops::elemwise::rmsnorm_per_head_plus_one(&q, &a.q_norm, d, a.q_norm_eps);
     let k = ops::elemwise::rmsnorm_per_head_plus_one(&k, &a.k_norm, d, a.k_norm_eps);
@@ -491,7 +570,17 @@ fn attn_mixer(
     } else {
         o
     };
-    ops::linear::matmul(&ops::elemwise::gate_sigmoid_mul(&o, &gate), &a.o_proj)
+    // Bonsai `attn_output` (o-proj): the gated attention output has width
+    // `q_heads·head_dim` = 6144, so it rotates with the SAME diagonal as `ssm_out`
+    // (`signs.6144`) — and, unlike `ssm_out`, with NO v-head reorder (oracle node
+    // `node_275`: MUL(attn_gated, signs.6144) → H → MUL_MAT). The gated output is
+    // dead after, so consume it.
+    let gated = ops::elemwise::gate_sigmoid_mul(&o, &gate);
+    let o_in = match m.bonsai.as_ref() {
+        Some(b) => rot_take(&gated, &b.ssm),
+        None => gated,
+    };
+    ops::linear::matmul(&o_in, &a.o_proj)
 }
 
 fn mtp_attn(
@@ -541,10 +630,21 @@ fn mtp_attn(
     ops::linear::matmul(&ops::elemwise::gate_sigmoid_mul(&o, &gate), &a.o_proj)
 }
 
-fn gdn_mixer(x: &Value, inputs: &Input<Facts>, g: &Gdn) -> Value {
+fn gdn_mixer(x: &Value, inputs: &Input<Facts>, g: &Gdn, bonsai: Option<&BonsaiSigns>) -> Value {
     let conv_state = inputs.state(&g.conv_state);
     let delta_state = inputs.state(&g.delta_state);
-    let qkvz = ops::linear::matmul(x, &g.in_qkvz);
+    // Bonsai: `in_qkvz` (fused attn_qkv + attn_gate z) rotates on the residual
+    // input (5120); `in_ba` (ssm_beta/alpha) does NOT rotate (oracle §6). One
+    // rotated copy feeds `in_qkvz`; `in_ba` reads the unrotated `x`.
+    let rx;
+    let qkvz_in: &Value = match bonsai {
+        Some(b) => {
+            rx = rot_copy(x, &b.hidden);
+            &rx
+        }
+        None => x,
+    };
+    let qkvz = ops::linear::matmul(qkvz_in, &g.in_qkvz);
     let ba = ops::linear::matmul(x, &g.in_ba);
     seam::at(seam::RECURRENT, &[&qkvz]);
     let width = Gdn::qkv_width(g.k_heads, g.v_heads, g.k_dim, g.v_dim);
@@ -588,7 +688,22 @@ fn gdn_mixer(x: &Value, inputs: &Input<Facts>, g: &Gdn) -> Value {
 
     let o =
         ops::elemwise::rmsnorm_gated(&o, &z, &g.norm, g.v_dim, g.norm_eps, GateActivation::Silu);
-    ops::linear::matmul(&o, &g.out_proj)
+    // Bonsai `ssm_out` (width 6144, `signs.6144`): sign→H rotation-undo, then the
+    // block-canonical `out_proj`.
+    //
+    // The fork reorders the GDN output's v-heads before the sign→H (oracle §6,
+    // `gdn_v_grouped=true`): `final_output{6144}` → reshape{128,16,3} →
+    // PERMUTE(0,2,1,3)→{128,3,16} → MUL(signs.6144) → H → MUL_MAT(ssm_out). The
+    // tiled→block permute is folded into the weights at IMPORT (the GDN scan's
+    // v-head-indexed inputs are reordered when `gdn_v_grouped` is set), so pie's
+    // block-pairing scan already emits block-ordered heads — the same order the
+    // fork's reordered sign→H and the block-canonical `out_proj` expect. No
+    // output-side reorder here; the shared GDN scan kernel stays untouched.
+    let o_in = match bonsai {
+        Some(b) => rot_take(&o, &b.ssm),
+        None => o,
+    };
+    ops::linear::matmul(&o_in, &g.out_proj)
 }
 
 fn head_banded(m: &Model, head: &Weight) -> bool {

@@ -277,9 +277,14 @@ fn claim(w: &Weight, tp: u32) -> Claim {
         | Dtype::U64
         | Dtype::U16
         | Dtype::Bool => (encoding(w.dtype), None),
-        Dtype::U2g16k | Dtype::I3g16k | Dtype::U4g32k | Dtype::U5g32k | Dtype::I6g16k => {
-            (encoding(w.dtype), None)
-        }
+        // Self-contained blocks (K-quants and PTQ1_0): one inline plane, no
+        // separate scales/biases — the block carries its own scale.
+        Dtype::U2g16k
+        | Dtype::I3g16k
+        | Dtype::U4g32k
+        | Dtype::U5g32k
+        | Dtype::I6g16k
+        | Dtype::Ptq1_0 => (encoding(w.dtype), None),
         Dtype::E2m1 | Dtype::KvU4 => panic!(
             "this dtype names a kv-page quantization scheme, not a stored \
              weight plane; no load contract declares one"
@@ -343,6 +348,11 @@ fn resolve(src: &ztensor::Source, claim: Claim) -> Result<Vec<TensorContract>, E
 }
 fn declare(src: &ztensor::Source, w: &Weight, expr: Expr) -> Result<TensorContract, Error> {
     let want = match encoding(w.dtype) {
+        // A self-contained block (K-quants, PTQ1_0) already carries its grouping
+        // in the payload; it takes no channel axis. Leaving it ungrouped lets its
+        // `want` compare EQUAL to the stored spec so `ladder` copies it through
+        // unchanged (no decode, no re-encode) instead of forcing a conversion.
+        Encoding::Quant(spec) if spec.scheme.is_self_contained() => Encoding::Quant(spec),
         Encoding::Quant(_) => grouped(w),
         raw => raw,
     };
@@ -578,6 +588,13 @@ fn planes(
         return Ok(vec![copy(src, w, from)?]);
     }
     if stored_block(src, &from)? && matches!(encoding(w.dtype), Encoding::Quant(_)) {
+        // Native pass-through: the file already holds this exact self-contained
+        // scheme (e.g. a PTQ1_0 ternary block served as-is). Keep the raw block
+        // bytes — no decode to fp, no re-encode. `ladder` copies the source expr
+        // through unchanged because stored == want.
+        if stored_encoding(src, &from)? == encoding(w.dtype) {
+            return Ok(vec![copy(src, w, from)?]);
+        }
         if placed_road_covers(w) {
             let parts = [from];
             return placed_from_encode(w, |canon| reencoded_from_block(src, canon, &parts));
@@ -620,6 +637,15 @@ fn planes_fused(
         Ok::<bool, Error>(all && stored_block(src, part)?)
     })? && matches!(encoding(w.dtype), Encoding::Quant(_))
     {
+        // Native pass-through of fused self-contained blocks: when every leg is
+        // already stored as exactly the declared scheme (e.g. PTQ1_0), concatenate
+        // the raw block bytes along the row axis — no decode, no re-encode.
+        let want = encoding(w.dtype);
+        if parts.iter().try_fold(true, |all, part| {
+            Ok::<bool, Error>(all && stored_encoding(src, part)? == want)
+        })? {
+            return Ok(vec![fused(src, w, parts)?]);
+        }
         if placed_road_covers(w) {
             return placed_from_encode(w, |canon| reencoded_from_block(src, canon, &parts));
         }
@@ -1667,7 +1693,14 @@ pub fn encoding(dtype: Dtype) -> Encoding {
             "a {:?} weight is served but no load contract declares one",
             dtype
         ),
-        Dtype::U2g16k | Dtype::I3g16k | Dtype::U4g32k | Dtype::U5g32k | Dtype::I6g16k => {
+        // PTQ1_0 joins the self-contained block family: its `g128_t3_f16_n` term
+        // resolves to `QuantScheme::Ptq1_0` (ternary, one inline fp16 scale).
+        Dtype::U2g16k
+        | Dtype::I3g16k
+        | Dtype::U4g32k
+        | Dtype::U5g32k
+        | Dtype::I6g16k
+        | Dtype::Ptq1_0 => {
             Encoding::Quant(checkpoint::spec_of_term(dtype.repr()).unwrap_or_else(|| {
                 panic!(
                     "`{dtype}` is not the arithmetic of any self-contained scheme this \

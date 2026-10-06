@@ -7,8 +7,8 @@ extern crate std;
 mod repr;
 
 pub use repr::{
-    Elem, Fmt, G64_U4_F16_Z_F16, G128_U4_F16_Z_U4, GT_T3_F16_N, Group, MAX_PLANES, Mangled, Off,
-    PlaneWidths, Quantum, spells,
+    Elem, Fmt, G64_U4_F16_Z_F16, G128_T3_F16_N, G128_U4_F16_Z_U4, GT_T3_F16_N, Group, MAX_PLANES,
+    Mangled, Off, PlaneWidths, Quantum, spells,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -46,11 +46,12 @@ pub enum Dtype {
     I6g16k,
     E4m3row,
     E4m3tile128,
+    Ptq1_0,
     KvU4,
 }
 
 impl Dtype {
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 34] = [
         Self::F32,
         Self::F16,
         Self::Bf16,
@@ -83,6 +84,7 @@ impl Dtype {
         Self::I6g16k,
         Self::E4m3row,
         Self::E4m3tile128,
+        Self::Ptq1_0,
         Self::KvU4,
     ];
 
@@ -226,6 +228,14 @@ impl Dtype {
                 gain: &F32,
                 offset: None,
             },
+            // Prism-private ternary, block 128: base-3 trit codes + one fp16 scale
+            // per 128 weights, no offset. 28 B/block = 1.75 bpw.
+            Self::Ptq1_0 => &Fmt::Q {
+                g: Group::N(128),
+                elem: Elem::T3,
+                gain: &F16,
+                offset: None,
+            },
             // C2b — the LOCKED v1 KV codec format as a first-class Dtype: 4-bit
             // symmetric (a kernel convention over U(4) nibbles, offset-binary
             // q+8), one whole 256-block per group, one inline fp16 scale, no
@@ -275,6 +285,7 @@ impl Dtype {
             Self::I6g16k => "g16_i6_g16_i8_f16_n_n",
             Self::E4m3row => "gr_e4m3_f32_n",
             Self::E4m3tile128 => "g128x128_e4m3_f32_n",
+            Self::Ptq1_0 => "g128_t3_f16_n",
             Self::KvU4 => "g256_u4_f16_n",
         }
     }
@@ -337,6 +348,15 @@ impl Dtype {
 
     #[must_use]
     pub fn bpw(self, k: u32) -> Option<f64> {
+        if matches!(self, Self::Ptq1_0) {
+            // The 28-byte block is 1.75 bpw exactly (see `row_bytes`); the generic
+            // plane model under-counts it as 1.725, so answer from the block.
+            return if k == 0 {
+                None
+            } else {
+                Some(PTQ1_0_BLOCK_BYTES as f64 * 8.0 / PTQ1_0_BLOCK as f64)
+            };
+        }
         self.repr().bpw(k)
     }
 
@@ -347,6 +367,20 @@ impl Dtype {
 
     #[must_use]
     pub fn row_bytes(self, k: u32) -> Option<u64> {
+        if matches!(self, Self::Ptq1_0) {
+            // PTQ1_0 is a block-INTERLEAVED GGUF type: each 128-weight block is
+            // `qs[24]` (120 elems @5 trits/byte) + `qh[2]` (8 elems @4 trits/byte)
+            // + a trailing fp16 scale = 28 bytes, byte-padded per block. The generic
+            // `Elem::T3` plane packs trits as one contiguous 5-per-byte stream and
+            // cannot express the `qh` sub-packing or the per-block padding, so it
+            // under-counts (e.g. 1104 vs 1120 B for a 5120-wide row). Answer from the
+            // real block geometry instead. Confirmed against the real GGUF: a K-wide
+            // row is exactly `ceil(K/128) * 28` bytes.
+            if k == 0 || !k.is_multiple_of(PTQ1_0_BLOCK) {
+                return None;
+            }
+            return Some(u64::from(k / PTQ1_0_BLOCK) * PTQ1_0_BLOCK_BYTES);
+        }
         self.repr().row_bytes(k)
     }
 
@@ -381,6 +415,12 @@ pub const TILED_STEP: u32 = 64;
 pub const SCALES: &str = ".scales";
 
 pub const BIASES: &str = ".biases";
+
+/// Weights per PTQ1_0 block (`Dtype::Ptq1_0`).
+pub const PTQ1_0_BLOCK: u32 = 128;
+
+/// On-disk bytes per PTQ1_0 block: `qs[24]` + `qh[2]` + fp16 scale = 28 (1.75 bpw).
+pub const PTQ1_0_BLOCK_BYTES: u64 = 28;
 
 #[cfg(feature = "serde")]
 impl serde::Serialize for Dtype {
@@ -423,6 +463,28 @@ mod tests {
     fn lib_every_case() {
         repr_is_injective_and_of_fmt_inverts_it();
         canonical_is_total_and_lands_on_an_unplaced_sibling();
+    }
+
+    #[test]
+    fn ptq1_0_sizes_match_the_block_padded_gguf_layout() {
+        use super::Dtype::Ptq1_0;
+        // Spelling + repr identify the ternary group-128 fp16 codec.
+        assert_eq!(Ptq1_0.spelling(), "g128_t3_f16_n");
+        assert_eq!(Dtype::of_fmt(Ptq1_0.repr()), Some(Ptq1_0));
+        // One block = 28 bytes = 1.75 bpw, and a K-wide row is ceil(K/128)*28 —
+        // verified against real Ternary-Bonsai-2-27B-PTQ1_0.gguf rows:
+        //   token_embd (K=5120) -> 1120 B/row; ffn_down (K=17408) -> 3808 B/row.
+        assert_eq!(Ptq1_0.row_bytes(128), Some(28));
+        assert_eq!(Ptq1_0.row_bytes(256), Some(56));
+        assert_eq!(Ptq1_0.row_bytes(5120), Some(1120));
+        assert_eq!(Ptq1_0.row_bytes(17408), Some(3808));
+        assert_eq!(Ptq1_0.row_bytes(12288), Some(2688));
+        // Sub-block widths are rejected (the 128-group is the quantum).
+        assert_eq!(Ptq1_0.row_bytes(64), None);
+        assert_eq!(Ptq1_0.row_bytes(0), None);
+        // Exactly 1.75 bpw (the generic plane model would say 1.725).
+        assert_eq!(Ptq1_0.bpw(4096), Some(1.75));
+        assert_eq!(Ptq1_0.bpw(0), None);
     }
 
     fn repr_is_injective_and_of_fmt_inverts_it() {

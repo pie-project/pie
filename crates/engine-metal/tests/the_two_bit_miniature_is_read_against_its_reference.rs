@@ -89,6 +89,7 @@ fn load(checkpoint: &Path, context: u32) -> Shell {
         slots: 4,
         pages: 4 * context / 16,
         runahead: engine::runahead::Runahead::F1,
+        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
         residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the 2-bit shell loads");

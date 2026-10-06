@@ -240,6 +240,12 @@ pub mod gguf {
         row("iq4_nl", 32, 18, None),
         row("iq4_xs", 256, 136, None),
         row("mxfp4", 32, 17, Some("g32_e2m1_e8m0_n")),
+        // PTQ1_0 (Prism-private ternary, `g128_t3_f16_n`): 128 weights per block,
+        // 28 bytes (`qs[24]` + `qh[2]` + fp16 scale) = 1.75 bpw. Like the IQ
+        // lattices it carries no ztensor term — the ternary `t3` code is not in
+        // this crate's term grammar — so it is addressed by its layout id and the
+        // block geometry alone (the checkpoint side owns the ternary arithmetic).
+        row("ptq1_0", 128, 28, None),
     ];
 
     pub fn row_of(name: &str) -> Option<&'static Row> {

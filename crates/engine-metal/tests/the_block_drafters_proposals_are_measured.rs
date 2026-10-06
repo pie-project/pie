@@ -80,6 +80,7 @@ fn the_target_keeps_a_measured_prefix_of_every_block() {
         slots: 4,
         pages: 4 * 512 / 16,
         runahead: engine::runahead::Runahead::F1,
+        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
         residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the block drafter's shell loads");
