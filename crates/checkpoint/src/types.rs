@@ -76,6 +76,10 @@ pub enum QuantScheme {
     GgufIq2S,
     GgufIq3Xxs,
     GgufIq3S,
+    /// Prism-private ternary block (`g128_t3_f16_n`, ggml type 143): 128 trits
+    /// per block, one inline fp16 scale, no separate scales/biases plane. Served
+    /// natively (decode-in-dot) rather than decoded-then-re-encoded.
+    Ptq1_0,
 }
 
 impl QuantScheme {
@@ -93,6 +97,8 @@ impl QuantScheme {
             | Self::GgufMxfp4
             | Self::Int4B8 => 4,
             Self::GgufQ2K | Self::GgufIq2Xxs | Self::GgufIq2Xs | Self::GgufIq2S => 2,
+            // Ternary is ~1.6 bpw; the block rounds it to 2 for the bits field.
+            Self::Ptq1_0 => 2,
             Self::GgufQ3K | Self::GgufIq3Xxs | Self::GgufIq3S => 3,
             Self::GgufQ5_0 | Self::GgufQ5_1 | Self::GgufQ5K => 5,
             Self::GgufQ6K => 6,
@@ -129,6 +135,7 @@ impl QuantScheme {
             | Self::GgufIq4Xs
             | Self::GgufMxfp4 => 32,
             Self::GgufQ2K | Self::GgufQ3K | Self::GgufQ6K => 16,
+            Self::Ptq1_0 => 128,
             Self::GgufIq2Xxs
             | Self::GgufIq2Xs
             | Self::GgufIq2S

@@ -972,6 +972,31 @@ pub fn hadamard_plain(x: &Value, block: u32) -> Value {
     hadamard(x, block, None)
 }
 
+/// The Randomized Hadamard `H·(S·x)` with the ±1 sign diagonal `S` supplied as a
+/// parameter bank (a registered/checkpoint [`Weight`]) rather than a live value.
+/// The signs multiply the activation BEFORE the butterfly, matching the fork's
+/// `MUL(input, prism.hadamard.signs.<W>)` → `MUL_MAT(prism.hadamard.<block>, …)`
+/// chain exactly. The sign bank's element type must equal the activation's
+/// compute dtype (`±1` is exact in both `bf16` and `f32`).
+pub fn hadamard_signed(x: &Value, block: u32, signs: &Weight) -> Value {
+    let r = x.rec();
+    // A parameter bank is resolved from the op's `ValueId` field (as `matmul`
+    // and `scale` resolve their weights) — it has no producer, so it does not
+    // ride the `ins` scheduling list.
+    let signs_id = r.weight(signs);
+    let x_out = r.fresh(x.ty().clone());
+    r.push(
+        Elementwise::Hadamard {
+            x: x.id(),
+            x_out: x_out.id(),
+            block,
+            signs: Some(signs_id),
+        },
+        &[x],
+    );
+    x_out
+}
+
 pub fn mul(x: &Value, y: &Value) -> Value {
     let r = x.rec();
     assert_eq!(x.ty(), y.ty(), "a product's operands share a type");
