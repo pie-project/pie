@@ -215,7 +215,10 @@ fn binds_block(backend: BackendKind, scheme: QuantScheme) -> bool {
                 | QuantScheme::GgufQ5K
                 | QuantScheme::GgufQ6K
         ),
-        BackendKind::Metal | BackendKind::Unknown => false,
+        // Metal reads the PTQ1_0 ternary block as stored (the M1b decode-in-dot
+        // kernel), so its inline-scale bank binds directly rather than decoding.
+        BackendKind::Metal => matches!(scheme, QuantScheme::Ptq1_0),
+        BackendKind::Unknown => false,
     }
 }
 

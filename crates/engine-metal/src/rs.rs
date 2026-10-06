@@ -266,7 +266,15 @@ pub struct Buffers {
 }
 
 impl Buffers {
-    pub fn reserve(device: &Context, layout: &Layout, paging: Paging) -> Result<Buffers> {
+    /// The bytes `reserve` takes for `layout` at `paging`: the load's memory
+    /// check counts them before anything is allocated.
+    #[must_use]
+    pub fn demand(layout: &Layout, paging: Paging) -> u64 {
+        Self::geometry(layout, paging).2.max(256)
+    }
+
+    /// Each plane's offset in a slot, one slot's bytes, and the slab's.
+    fn geometry(layout: &Layout, paging: Paging) -> (Vec<u64>, u64, u64) {
         let page_tokens = paging.page_size.max(1);
         let mut plane_at = Vec::with_capacity(layout.planes.len());
         let mut at = 0u64;
@@ -275,8 +283,14 @@ impl Buffers {
             at += u64::from(page_tokens) * plane.row_bytes;
         }
         let page_bytes = at.next_multiple_of(256);
+        let bytes = page_bytes.saturating_mul(u64::from(paging.slots.max(1)));
+        (plane_at, page_bytes, bytes)
+    }
+
+    pub fn reserve(device: &Context, layout: &Layout, paging: Paging) -> Result<Buffers> {
+        let page_tokens = paging.page_size.max(1);
+        let (plane_at, page_bytes, bytes) = Self::geometry(layout, paging);
         let slots = paging.slots.max(1);
-        let bytes = page_bytes.saturating_mul(u64::from(slots));
         Ok(Buffers {
             slab: Buffer::zeroed(device, bytes.max(256))?,
             page_tokens,

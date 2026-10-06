@@ -222,6 +222,21 @@ impl Weights {
                     group: pairing.group,
                     bits: pairing.bits,
                 }),
+                // PTQ1_0 is a single-inline-plane ternary codec (its fp16 scale
+                // lives inside each 28-byte block), so it pairs with no separate
+                // `.scales`/`.biases` plane — but it must still resolve as a
+                // quantized BANK, or the matmul dispatch reads its ternary bytes as
+                // bf16. The decode-in-dot kernel keys off `codes.dtype == Ptq1_0`
+                // and never touches `scales`/`group`/`bits`, so the codes plane
+                // doubles as the (unused) scales placeholder.
+                None if place.dtype == Dtype::Ptq1_0 => WeightRow::Planes(kernels_metal::Bank {
+                    codes: dense(place)?,
+                    scales: dense(place)?,
+                    biases: None,
+                    group: 128,
+                    bits: 2,
+                    mpp_codes: None,
+                }),
                 None => WeightRow::Dense(dense(place)?),
             }));
         }
@@ -740,6 +755,10 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
                     rows.saturating_mul(width).div_ceil(4)
                 }
                 Dtype::U8g64 => rows.saturating_mul(width),
+                // PTQ1_0 is block-interleaved: each 128-weight row-segment is a
+                // 28-byte block (`qs[24]` + `qh[2]` + inline fp16 scale), so a
+                // K-wide row is `ceil(K/128) * 28` bytes across a single plane.
+                Dtype::Ptq1_0 => rows.saturating_mul(width.div_ceil(128).saturating_mul(28)),
                 other => {
                     let element =
                         model_compiler::arena::elem_bytes(other).ok_or_else(|| Fault::Param {
@@ -1051,7 +1070,7 @@ fn warm(
     };
     let mut table = Vec::with_capacity(places.len());
     for (index, param) in trace.params.iter().enumerate() {
-        table.push(Some(match pairings.get(param.name.as_str()) {
+        let entry = match pairings.get(param.name.as_str()) {
             Some(pairing) => WeightRow::Planes(kernels_metal::Bank {
                 mpp_codes: None,
                 codes: row(index)?,
@@ -1060,8 +1079,24 @@ fn warm(
                 group: pairing.group,
                 bits: pairing.bits,
             }),
+            // PTQ1_0 is a single-inline-plane ternary codec: the fp16 scale lives
+            // INSIDE each 28-byte block, so it pairs with no `.scales`/`.biases`
+            // plane. It must still resolve as a quantized BANK (not a dense plane),
+            // or the matmul dispatch mistakes the ternary bytes for bf16 and reads
+            // garbage. The decode-in-dot kernel keys off `codes.dtype == Ptq1_0`
+            // and never touches `scales`/`group`/`bits`, so the codes plane doubles
+            // as the (unused) scales placeholder.
+            None if param.dtype == Dtype::Ptq1_0 => WeightRow::Planes(kernels_metal::Bank {
+                codes: row(index)?,
+                scales: row(index)?,
+                biases: None,
+                group: 128,
+                bits: 2,
+                mpp_codes: None,
+            }),
             None => WeightRow::Dense(row(index)?),
-        }));
+        };
+        table.push(Some(entry));
     }
     let seated: Vec<u64> = seats
         .iter()

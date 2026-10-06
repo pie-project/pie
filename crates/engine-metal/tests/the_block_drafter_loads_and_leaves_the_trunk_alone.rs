@@ -139,6 +139,7 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
         slots: 4,
         pages: 4 * 512 / 16,
         runahead: engine::runahead::Runahead::F1,
+        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
         residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the block drafter's shell loads");
@@ -186,6 +187,7 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
         slots: 4,
         pages: 4 * 512 / 16,
         runahead: engine::runahead::Runahead::F1,
+        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
         residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the plain shell loads");
@@ -259,6 +261,7 @@ fn a_draft_block_fires_and_the_drafter_answers_it() {
         slots: 4,
         pages: 4 * 512 / 16,
         runahead: engine::runahead::Runahead::F1,
+        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
         residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the block drafter's shell loads");
