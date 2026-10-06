@@ -8,6 +8,20 @@ use anyhow::{Context, Result};
 use wasmtime::component::{Accessor, HasSelf, Resource};
 use wasmtime_wasi::WasiView;
 
+/// Runs `wait` with the process marked idle: a process waiting on its client
+/// is the one whose KV the planner may move off the device first.
+async fn idle_while<T>(pid: crate::inferlet::ProcessId, wait: impl Future<Output = T>) -> T {
+    let planner = crate::planner::planner();
+    if let Some(planner) = planner {
+        planner.set_idle(pid, true);
+    }
+    let out = wait.await;
+    if let Some(planner) = planner {
+        planner.set_idle(pid, false);
+    }
+    out
+}
+
 fn suggested_name(name: &str, extension: &str) -> String {
     let base = name
         .rsplit(['/', '\\'])
@@ -45,6 +59,22 @@ async fn stream_out(ctx: &mut ProcessCtx, bytes: Vec<u8>, name: String) -> Resul
 }
 
 impl pie::inferlet::session::Host for ProcessCtx {
+    async fn send_to(&mut self, process: String, message: String) -> Result<Result<(), String>> {
+        let Ok(target) = process.parse::<crate::inferlet::ProcessId>() else {
+            return Ok(Err(format!("send-to: {process} is not a process id")));
+        };
+        let target = process::resolve(target);
+        let owner = process::get_client_id(self.id()).await.ok().flatten();
+        if owner.is_none() || process::get_client_id(target).await.ok().flatten() != owner {
+            return Ok(Err(format!("send-to: no process {process} of this client")));
+        }
+        crate::planner::wake(target);
+        if let Err(err) = server::inbox::send(target.to_string(), message) {
+            return Ok(Err(format!("send-to: {err}")));
+        }
+        Ok(Ok(()))
+    }
+
     async fn send(&mut self, message: String) -> Result<()> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let process_id = self.id();
@@ -111,8 +141,12 @@ impl pie::inferlet::session::Host for ProcessCtx {
 
     async fn receive_blocking(&mut self) -> Result<Option<String>> {
         let process_id = self.id();
-        crate::server::inbox::receive(process_id.to_string())
-            .await
+        let message = idle_while(
+            process_id,
+            crate::server::inbox::receive(process_id.to_string()),
+        )
+        .await;
+        message
             .with_context(|| format!("session.receive-blocking failed for process {process_id}"))
             .map(Some)
     }
@@ -140,8 +174,12 @@ impl pie::inferlet::session::Host for ProcessCtx {
 impl pie::inferlet::session::HostWithStore<ProcessCtx> for HasSelf<ProcessCtx> {
     async fn receive(accessor: &Accessor<ProcessCtx, Self>) -> Result<Option<String>> {
         let process_id = accessor.with(|mut access| access.get().id());
-        crate::server::inbox::receive(process_id.to_string())
-            .await
+        let message = idle_while(
+            process_id,
+            crate::server::inbox::receive(process_id.to_string()),
+        )
+        .await;
+        message
             .with_context(|| format!("session.receive failed for process {process_id}"))
             .map(Some)
     }
