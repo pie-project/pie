@@ -26,6 +26,12 @@ fn rot_take(x: &Value, signs: &Weight) -> Value {
     ops::elemwise::hadamard_signed(x, BONSAI_BLOCK, signs)
 }
 
+/// `PIE_ANE` asks the backend to split each dense MLP between the GPU and
+/// the Neural Engine on long prefills (the backend falls back to the GPU).
+fn ane_mlp() -> bool {
+    std::env::var("PIE_ANE").is_ok_and(|v| v != "0" && !v.is_empty())
+}
+
 pub struct Facts {
     pub qo_one: bool,
     pub has_adapter: bool,
@@ -221,24 +227,29 @@ impl ForwardHybrid for Model {
                     // Bonsai: `ffn_gate`+`ffn_up` share the residual input (5120),
                     // rotated once; `ffn_down` rotates the swiglu intermediate
                     // (17408). (oracle §6)
-                    let gx;
-                    let gate_in: &Value = match &m.bonsai {
-                        Some(b) => {
-                            gx = rot_copy(&x, &b.hidden);
-                            &gx
-                        }
-                        None => &x,
-                    };
-                    let h = ops::linear::mlp_swiglu(&ops::linear::matmul(gate_in, gate_up), *inter);
-                    let hx;
-                    let down_in: &Value = match &m.bonsai {
-                        Some(b) => {
-                            hx = rot_take(&h, &b.ffn_down);
-                            &hx
-                        }
-                        None => &h,
-                    };
-                    ops::linear::matmul(down_in, down)
+                    if m.bonsai.is_none() && ane_mlp() {
+                        ops::linear::mlp_ane(&x, gate_up, down, *inter, l)
+                    } else {
+                        let gx;
+                        let gate_in: &Value = match &m.bonsai {
+                            Some(b) => {
+                                gx = rot_copy(&x, &b.hidden);
+                                &gx
+                            }
+                            None => &x,
+                        };
+                        let h =
+                            ops::linear::mlp_swiglu(&ops::linear::matmul(gate_in, gate_up), *inter);
+                        let hx;
+                        let down_in: &Value = match &m.bonsai {
+                            Some(b) => {
+                                hx = rot_take(&h, &b.ffn_down);
+                                &hx
+                            }
+                            None => &h,
+                        };
+                        ops::linear::matmul(down_in, down)
+                    }
                 }
                 Mlp::Routed {
                     router,

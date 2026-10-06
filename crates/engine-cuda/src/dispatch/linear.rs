@@ -73,6 +73,9 @@ impl Run<'_> {
                 }
                 None => self.row_major_lm_head(act, w, y),
             },
+            Linear::MlpAne { .. } => Err(kernels_cuda::Error::Unsupported {
+                op: "linear.mlp_ane",
+            }),
             Linear::MatmulGeglu {
                 act,
                 w,

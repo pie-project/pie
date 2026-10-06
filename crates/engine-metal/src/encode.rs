@@ -259,6 +259,22 @@ impl<'a> Sink<'a> {
         Ok(())
     }
 
+    /// Signals (or waits for) the Neural Engine split's event at `stamp`
+    /// between this fire and its neighbours.
+    #[cfg(target_vendor = "apple")]
+    fn fence(&self, fire: Fire, stamp: u64, signal: bool) -> Result<(), Error> {
+        let event = crate::ane::event().ok_or_else(|| {
+            Sink::refuse(
+                fire,
+                Fault::Unbound {
+                    what: "the Neural Engine event, which this load never made".to_string(),
+                },
+            )
+        })?;
+        self.with_frame(|frame| frame.fence(event, stamp, signal))
+            .map_err(|fault| Sink::refuse(fire, fault))
+    }
+
     fn refuse(fire: Fire, fault: Fault) -> Error {
         Error::Backend {
             op: fire.entrypoint,
@@ -377,6 +393,17 @@ impl Encode for Sink<'_> {
                 record_kernel(&profile_key(fire.entrypoint, args), seconds);
                 return Ok(());
             }
+            let fence = (fire.file == kernels_metal::linear::ane::FILE)
+                .then(|| match args.get(3) {
+                    Some(ArgValue::U32(stamp)) => Some(u64::from(*stamp)),
+                    _ => None,
+                })
+                .flatten();
+            if let Some(stamp) = fence
+                && fire.entrypoint == kernels_metal::linear::ane::JOIN
+            {
+                self.fence(fire, stamp, false)?;
+            }
             self.with_frame(|frame| {
                 let encoder = frame.encoder();
                 encoder.setComputePipelineState(&pipeline);
@@ -400,6 +427,11 @@ impl Encode for Sink<'_> {
                 encoder.dispatchThreads_threadsPerThreadgroup(lanes, group);
                 Ok(())
             })?;
+            if let Some(stamp) = fence
+                && fire.entrypoint == kernels_metal::linear::ane::STAGE
+            {
+                self.fence(fire, stamp, true)?;
+            }
             if profiling()
                 && let Held::Owned(cell) = &self.frame
             {

@@ -10,6 +10,7 @@
 
 pub mod abi;
 pub mod adapter;
+pub mod ane;
 pub mod api;
 pub mod arena;
 pub mod blob;

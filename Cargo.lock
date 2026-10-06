@@ -1676,6 +1676,7 @@ name = "engine-metal"
 version = "0.5.4"
 dependencies = [
  "block2",
+ "cc",
  "checkpoint",
  "checkpoint-dsl",
  "engine",

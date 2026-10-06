@@ -514,6 +514,7 @@ impl Shell {
         weights.decode_absorbed(&device, &handles, &boot.trace)?;
         weights.relabel_conv_weights(&device, &handles, &boot.trace)?;
         weights.repack_mpp(&device, &handles, &boot.trace)?;
+        crate::ane::load(&device, &handles, &boot.trace, &mut weights)?;
         handles.seal();
 
         {
@@ -4167,6 +4168,7 @@ impl engine::frame::Shell for Shell {
             }
             walked
         } else {
+            let _live = crate::ane::Live::enter();
             self.walk_once(&prepared, Mode::Encode)?
         };
         fire_trace(|| "forward-encoded".to_string());

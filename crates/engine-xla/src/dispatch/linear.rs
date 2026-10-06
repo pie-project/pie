@@ -114,6 +114,7 @@ impl Run<'_> {
             Linear::MlpGeluTanh { x, y } => {
                 linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), self.tensor(*y))
             }
+            Linear::MlpAne { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             // The fused forms take one dense weight; a quantized weight is
             // the plain matmul followed by the epilogue, as engine-cuda does.
             Linear::MatmulGeglu {

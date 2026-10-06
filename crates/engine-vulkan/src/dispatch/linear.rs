@@ -121,7 +121,8 @@ impl Run<'_> {
             Linear::MlpGeluTanh { x, y } => {
                 linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), self.tensor(*y))
             }
-            Linear::MatmulGeglu { .. }
+            Linear::MlpAne { .. }
+            | Linear::MatmulGeglu { .. }
             | Linear::LmHeadSoftcap { .. }
             | Linear::MatmulBias { .. }
             | Linear::RelBias { .. }

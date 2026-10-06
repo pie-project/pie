@@ -301,8 +301,8 @@ impl Context {
                 why: "the command buffer would not open a compute pass".to_string(),
             })?;
             Ok(Frame {
-                buffer,
-                encoder: Some(encoder),
+                buffer: std::cell::UnsafeCell::new(buffer),
+                encoder: std::cell::UnsafeCell::new(Some(encoder)),
                 blit: None,
             })
         }
@@ -315,12 +315,12 @@ impl Context {
 
 pub struct Frame {
     #[cfg(target_vendor = "apple")]
-    buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    buffer: std::cell::UnsafeCell<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     #[cfg(not(target_vendor = "apple"))]
     #[allow(dead_code)]
     buffer: (),
     #[cfg(target_vendor = "apple")]
-    encoder: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
+    encoder: std::cell::UnsafeCell<Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>>,
     #[cfg(not(target_vendor = "apple"))]
     encoder: Option<()>,
     #[cfg(target_vendor = "apple")]
@@ -336,15 +336,23 @@ unsafe impl Send for Frame {}
 
 impl Frame {
     #[cfg(target_vendor = "apple")]
+    fn buffer(&self) -> &ProtocolObject<dyn MTLCommandBuffer> {
+        // SAFETY: only `fence` swaps the command buffer, between dispatches,
+        // when no borrow from here is alive.
+        unsafe { &*self.buffer.get() }
+    }
+
+    #[cfg(target_vendor = "apple")]
     pub(crate) fn encoder(&self) -> &ProtocolObject<dyn MTLComputeCommandEncoder> {
-        self.encoder
-            .as_deref()
+        // SAFETY: the pass is only swapped by `&mut self` methods or by
+        // `fence`, which runs between dispatches when no borrow is alive.
+        unsafe { (*self.encoder.get()).as_deref() }
             .expect("the pass is open until `commit` closes it")
     }
 
     #[cfg(target_vendor = "apple")]
     fn end_pass(&mut self) {
-        if let Some(encoder) = self.encoder.take() {
+        if let Some(encoder) = self.encoder.get_mut().take() {
             encoder.endEncoding();
         }
         if let Some(blit) = self.blit.take() {
@@ -355,12 +363,62 @@ impl Frame {
     #[cfg(target_vendor = "apple")]
     pub(crate) fn next_pass(&mut self) -> Result<&ProtocolObject<dyn MTLComputeCommandEncoder>> {
         self.end_pass();
-        let encoder = self.buffer.computeCommandEncoder().ok_or(Fault::Device {
+        let encoder = self.buffer().computeCommandEncoder().ok_or(Fault::Device {
             call: "computeCommandEncoder",
             why: "the command buffer would not open a second compute pass".to_string(),
         })?;
-        self.encoder = Some(encoder);
-        Ok(self.encoder.as_deref().expect("just opened"))
+        *self.encoder.get_mut() = Some(encoder);
+        Ok(self.encoder.get_mut().as_deref().expect("just opened"))
+    }
+
+    /// Closes the open compute pass, has the command buffer signal `event`
+    /// at `value` there (or wait for it, when `signal` is false), and opens
+    /// the next pass. Takes `&self` so an encoder holding a borrowed frame
+    /// can fence between two of its dispatches.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn fence(
+        &self,
+        event: &ProtocolObject<dyn objc2_metal::MTLEvent>,
+        value: u64,
+        signal: bool,
+    ) -> Result<()> {
+        if self.blit.is_some() {
+            return Err(Fault::Device {
+                call: "fence",
+                why: "a blit pass is open where a compute pass was expected".to_string(),
+            });
+        }
+        // SAFETY: a frame is encoded on one thread, and every borrow `encoder`
+        // or `buffer` hands out ends with the dispatch that took it, before
+        // this runs.
+        let pass = unsafe { &mut *self.encoder.get() };
+        if let Some(encoder) = pass.take() {
+            encoder.endEncoding();
+        }
+        // A signal or wait in the middle of a command buffer is honoured only
+        // where the driver cuts it, which can hold the work between them back;
+        // so each fence closes the command buffer and opens the next one.
+        let next = self
+            .buffer()
+            .commandQueue()
+            .commandBuffer()
+            .ok_or(Fault::Device {
+                call: "commandBuffer",
+                why: "the queue would not open a command buffer after a fence".to_string(),
+            })?;
+        if signal {
+            self.buffer().encodeSignalEvent_value(event, value);
+        } else {
+            next.encodeWaitForEvent_value(event, value);
+        }
+        self.buffer().commit();
+        // SAFETY: as above; the committed buffer is retained by the queue.
+        unsafe { *self.buffer.get() = next };
+        *pass = Some(self.buffer().computeCommandEncoder().ok_or(Fault::Device {
+            call: "computeCommandEncoder",
+            why: "the command buffer would not reopen a compute pass after a fence".to_string(),
+        })?);
+        Ok(())
     }
 
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
@@ -373,10 +431,10 @@ impl Frame {
                 return Ok(());
             }
             if self.blit.is_none() {
-                if let Some(encoder) = self.encoder.take() {
+                if let Some(encoder) = self.encoder.get_mut().take() {
                     encoder.endEncoding();
                 }
-                self.blit = Some(self.buffer.blitCommandEncoder().ok_or(Fault::Device {
+                self.blit = Some(self.buffer().blitCommandEncoder().ok_or(Fault::Device {
                     call: "blitCommandEncoder",
                     why: "the command buffer would not open a blit pass".to_string(),
                 })?);
@@ -411,10 +469,10 @@ impl Frame {
                 return Ok(());
             }
             if self.blit.is_none() {
-                if let Some(encoder) = self.encoder.take() {
+                if let Some(encoder) = self.encoder.get_mut().take() {
                     encoder.endEncoding();
                 }
-                self.blit = Some(self.buffer.blitCommandEncoder().ok_or(Fault::Device {
+                self.blit = Some(self.buffer().blitCommandEncoder().ok_or(Fault::Device {
                     call: "blitCommandEncoder",
                     why: "the command buffer would not open a blit pass".to_string(),
                 })?);
@@ -463,10 +521,10 @@ impl Frame {
                 return Ok(());
             }
             if self.blit.is_none() {
-                if let Some(encoder) = self.encoder.take() {
+                if let Some(encoder) = self.encoder.get_mut().take() {
                     encoder.endEncoding();
                 }
-                self.blit = Some(self.buffer.blitCommandEncoder().ok_or(Fault::Device {
+                self.blit = Some(self.buffer().blitCommandEncoder().ok_or(Fault::Device {
                     call: "blitCommandEncoder",
                     why: "the command buffer would not open a blit pass".to_string(),
                 })?);
@@ -496,9 +554,9 @@ impl Frame {
         #[cfg(target_vendor = "apple")]
         {
             self.end_pass();
-            self.buffer.commit();
-            self.buffer.waitUntilCompleted();
-            if let Some(error) = self.buffer.error() {
+            self.buffer().commit();
+            self.buffer().waitUntilCompleted();
+            if let Some(error) = self.buffer().error() {
                 return Err(Fault::Device {
                     call: "waitUntilCompleted",
                     why: error.localizedDescription().to_string(),
@@ -517,15 +575,15 @@ impl Frame {
         #[cfg(target_vendor = "apple")]
         {
             self.end_pass();
-            self.buffer.commit();
-            self.buffer.waitUntilCompleted();
-            if let Some(error) = self.buffer.error() {
+            self.buffer().commit();
+            self.buffer().waitUntilCompleted();
+            if let Some(error) = self.buffer().error() {
                 return Err(Fault::Device {
                     call: "waitUntilCompleted",
                     why: error.localizedDescription().to_string(),
                 });
             }
-            Ok(self.buffer.GPUEndTime() - self.buffer.GPUStartTime())
+            Ok(self.buffer().GPUEndTime() - self.buffer().GPUStartTime())
         }
         #[cfg(not(target_vendor = "apple"))]
         {
@@ -560,13 +618,13 @@ impl Frame {
                 // `RcBlock` may be dropped at the end of this scope; the
                 // closure owns everything it touches and is `Send`.
                 unsafe {
-                    self.buffer
+                    self.buffer()
                         .addCompletedHandler(block2::RcBlock::as_ptr(&handler));
                 }
             }
-            self.buffer.commit();
+            self.buffer().commit();
             Ok(Pending {
-                buffer: self.buffer.clone(),
+                buffer: unsafe { (*self.buffer.get()).clone() },
             })
         }
         #[cfg(not(target_vendor = "apple"))]

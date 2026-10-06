@@ -53,6 +53,19 @@ pub enum Linear {
         intermediate: u32,
         y: ValueId,
     },
+    /// A dense SwiGLU MLP whose intermediate axis a backend may split
+    /// between the GPU and a second engine (the Neural Engine on Apple).
+    /// `packed` and `h` are scratch planes the backend writes on the way to `y`.
+    MlpAne {
+        act: ValueId,
+        gate_up: ValueId,
+        down: ValueId,
+        intermediate: u32,
+        layer: u32,
+        packed: ValueId,
+        h: ValueId,
+        y: ValueId,
+    },
     MatmulGeglu {
         act: ValueId,
         w: ValueId,
@@ -227,6 +240,9 @@ impl Operands for Linear {
             Self::MlpGegluTanh { gate, up, .. } => sink.extend([*gate, *up]),
             Self::MlpGeluTanh { x, .. } => sink.push(*x),
             Self::MlpGegluTanhPacked { packed, .. } => sink.push(*packed),
+            Self::MlpAne {
+                act, gate_up, down, ..
+            } => sink.extend([*act, *gate_up, *down]),
             Self::MatmulGeglu { act, w, .. } | Self::LmHeadSoftcap { act, w, .. } => {
                 sink.extend([*act, *w]);
             }
@@ -326,6 +342,7 @@ impl Operands for Linear {
             Self::MlpGeluTanh { y, .. } => sink.push(*y),
             Self::MlpGegluTanhPacked { y, .. } => sink.push(*y),
             Self::MatmulGeglu { packed, y, .. } => sink.extend([*packed, *y]),
+            Self::MlpAne { packed, h, y, .. } => sink.extend([*packed, *h, *y]),
             Self::LmHeadSoftcap { y, y_out, .. } => sink.extend([*y, *y_out]),
             Self::MatmulBias { y, y_out, .. } => sink.extend([*y, *y_out]),
             Self::MlpSitu { y, .. } => sink.push(*y),
@@ -371,6 +388,7 @@ impl Operands for Linear {
             Self::Matmul { .. }
             | Self::LmHead { .. }
             | Self::MlpSwiglu { .. }
+            | Self::MlpAne { .. }
             | Self::MlpSwigluClamp { .. }
             | Self::MlpSwigluClampAlpha { .. }
             | Self::MlpSwigluClampSplit { .. }
@@ -402,6 +420,7 @@ impl Operands for Linear {
             Self::Matmul { .. } => "linear.matmul",
             Self::LmHead { .. } => "linear.lm_head",
             Self::MlpSwiglu { .. } => "linear.mlp_swiglu",
+            Self::MlpAne { .. } => "linear.mlp_ane",
             Self::MlpSwigluClamp { .. } => "linear.mlp_swiglu_clamp",
             Self::MlpSwigluClampAlpha { .. } => "linear.mlp_swiglu_clamp_alpha",
             Self::MlpSwigluClampSplit { .. } => "linear.mlp_swiglu_clamp_split",

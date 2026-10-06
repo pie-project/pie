@@ -1,3 +1,4 @@
+pub mod ane;
 pub mod gemm;
 
 pub mod lane_gemm;

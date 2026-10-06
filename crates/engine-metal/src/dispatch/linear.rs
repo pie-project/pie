@@ -43,6 +43,35 @@ impl Run<'_> {
                     self.tensor(*y),
                 ),
             },
+            Linear::MlpAne {
+                act,
+                gate_up,
+                down,
+                intermediate,
+                layer,
+                packed,
+                h,
+                y,
+            } => match crate::ane::plan(*layer, self.tensor(*act).rows) {
+                Some(plan) => self.mlp_split(&plan, *act, *packed, *h, *y),
+                None => {
+                    self.linear(&Linear::Matmul {
+                        act: *act,
+                        w: *gate_up,
+                        y: *packed,
+                    })?;
+                    self.linear(&Linear::MlpSwiglu {
+                        packed: *packed,
+                        intermediate: *intermediate,
+                        y: *h,
+                    })?;
+                    self.linear(&Linear::Matmul {
+                        act: *h,
+                        w: *down,
+                        y: *y,
+                    })
+                }
+            },
             Linear::LmHead { act, w, y } => match self.banked(*w) {
                 Some(bank) => linear::quant::lm_head(
                     self.ctx(),
@@ -404,5 +433,56 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
         }
+    }
+}
+
+impl Run<'_> {
+    /// The GPU's columns of a split MLP, bracketed by the stage that hands
+    /// the Neural Engine its input and the join that adds its output back.
+    fn mlp_split(
+        &self,
+        plan: &crate::ane::Plan,
+        act: model_ir::ValueId,
+        packed: model_ir::ValueId,
+        h: model_ir::ValueId,
+        y: model_ir::ValueId,
+    ) -> Result<(), kernels_metal::Error> {
+        let keep = plan.split.keep;
+        let x = self.tensor(act);
+        let out = self.tensor(y);
+        let packed_gpu = kernels_metal::Tensor {
+            width: keep * 2,
+            ..self.tensor(packed)
+        };
+        let h_gpu = kernels_metal::Tensor {
+            width: keep,
+            ..self.tensor(h)
+        };
+        linear::ane::stage(self.ctx(), x, plan.staged, plan.stage)?;
+        plan.submit();
+        let precast = |rows, contraction| self.precast(rows, contraction);
+        let partials = |rows, width| self.partials(rows, width);
+        let scratch = || linear::quant::Scratch {
+            precast: &precast,
+            partials: &partials,
+        };
+        linear::quant::matmul(
+            self.ctx(),
+            x,
+            plan.split.gate_up,
+            packed_gpu,
+            scratch(),
+            self.capacity(act).min(self.capacity(packed)),
+        )?;
+        linear::mlp::swiglu(self.ctx(), packed_gpu, keep, h_gpu)?;
+        linear::quant::matmul(
+            self.ctx(),
+            h_gpu,
+            plan.split.down,
+            out,
+            scratch(),
+            self.capacity(h).min(self.capacity(y)),
+        )?;
+        linear::ane::join(self.ctx(), out, plan.other, plan.done)
     }
 }
