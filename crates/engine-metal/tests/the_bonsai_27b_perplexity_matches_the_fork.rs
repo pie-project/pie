@@ -213,6 +213,7 @@ fn the_bonsai_27b_perplexity_matches_the_fork() {
         pages: context.div_ceil(page_size),
         runahead: engine::runahead::Runahead::F1,
         residency,
+        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
     });
     let mut shell = match shell {
         Ok(shell) => shell,

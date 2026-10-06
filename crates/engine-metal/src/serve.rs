@@ -255,6 +255,8 @@ pub struct Shell {
     trace: Trace,
     compiled: CompiledModel,
     budgets: Budgets,
+    ane: Option<crate::ane::Ane>,
+    rollback: Option<Buffer>,
     weights: Weights,
     arena: Arena,
     pools: Pools,
@@ -514,6 +516,11 @@ impl Shell {
         weights.decode_absorbed(&device, &handles, &boot.trace)?;
         weights.relabel_conv_weights(&device, &handles, &boot.trace)?;
         weights.repack_mpp(&device, &handles, &boot.trace)?;
+        let ane =
+            crate::ane::load(&device, &handles, &boot.trace, &weights).unwrap_or_else(|why| {
+                eprintln!("PIE_ANE: staying on the GPU: {why}");
+                None
+            });
         handles.seal();
 
         {
@@ -933,6 +940,8 @@ impl Shell {
             trace: boot.trace,
             compiled,
             budgets,
+            ane,
+            rollback: None,
             weights,
             arena,
             pools,
@@ -3487,7 +3496,11 @@ impl Shell {
             },
         };
 
+        let mut state_slots: Vec<u32> = slot_ids.iter().map(|&slot| slot as u32).collect();
+        state_slots.sort_unstable();
+        state_slots.dedup();
         Ok(Prepared {
+            state_slots,
             lanes,
             self_cond_feeds,
             port_feeds,
@@ -3694,6 +3707,63 @@ impl Shell {
         Ok(())
     }
 
+    fn spare_state(&mut self, slots: usize) -> Result<Option<Buffer>> {
+        let bytes = slots as u64 * self.pools.state_slot_bytes();
+        if bytes == 0 {
+            return Ok(None);
+        }
+        if self
+            .rollback
+            .as_ref()
+            .is_none_or(|spare| spare.bytes() < bytes)
+        {
+            self.rollback = Some(Buffer::zeroed(&self.device, bytes)?);
+        }
+        Ok(self.rollback.clone())
+    }
+
+    fn walk_split(&mut self, p: &Prepared<'_>) -> Result<Walked> {
+        let Some(planned) = self
+            .ane
+            .as_ref()
+            .filter(|ane| ane.may_split(p.descriptor.rows))
+            .map(crate::ane::Ane::planned)
+        else {
+            return self.walk_once(p, Mode::Encode);
+        };
+        let spare = self.spare_state(p.state_slots.len())?;
+        if let Some(spare) = &spare {
+            let mut frame = self.device.frame()?;
+            self.pools.save_state(&mut frame, &p.state_slots, spare)?;
+            frame.commit_async(None)?;
+        }
+        let verdict = self.ane.as_ref().and_then(crate::ane::Ane::verdict);
+        let mut walked = self.walk_once(p, Mode::Encode)?;
+        if self.ane.as_ref().map(crate::ane::Ane::planned) == Some(planned) {
+            return Ok(walked);
+        }
+        walked
+            .frame
+            .take()
+            .expect("the encoding mode opened a frame")
+            .commit()?;
+        if verdict.as_ref().and_then(|verdict| verdict()).is_none() {
+            walked.frame = Some(self.device.frame()?);
+            return Ok(walked);
+        }
+        eprintln!(
+            "PIE_ANE: reran a prefill step of {} rows on the GPU after the Neural Engine failed",
+            p.descriptor.rows
+        );
+        if let Some(spare) = &spare {
+            let mut frame = self.device.frame()?;
+            self.pools
+                .restore_state(&mut frame, &p.state_slots, spare)?;
+            frame.commit_async(None)?;
+        }
+        self.walk_once(p, Mode::Encode)
+    }
+
     fn walk_once(&self, p: &Prepared<'_>, mode: Mode) -> Result<Walked> {
         let place = At::new();
         let mut frame = match mode {
@@ -3711,12 +3781,15 @@ impl Shell {
             self.land_merges(frame, p)?;
         }
         let sink = match mode {
-            Mode::Encode => Encoded::Live(Sink::new(
-                &self.device,
-                frame.as_ref().expect("the encoding mode opened a frame"),
-                &self.pipelines,
-                &self.handles,
-            )),
+            Mode::Encode => Encoded::Live(
+                Sink::new(
+                    &self.device,
+                    frame.as_ref().expect("the encoding mode opened a frame"),
+                    &self.pipelines,
+                    &self.handles,
+                )
+                .with_ane(self.ane.as_ref()),
+            ),
             Mode::Record | Mode::Replay => {
                 Encoded::Taped(Tape::new(&self.handles, &place, &p.windows))
             }
@@ -3745,7 +3818,8 @@ impl Shell {
                 &p.windows,
                 &place,
                 &self.scratch,
-            );
+            )
+            .with_ane(self.ane.as_ref().filter(|_| matches!(mode, Mode::Encode)));
             walk(
                 &self.trace,
                 &self.compiled,
@@ -4057,6 +4131,7 @@ pub struct Prepared<'a> {
     caches: CacheTable,
     bindings: FireBindings,
     demand: Demand,
+    state_slots: Vec<u32>,
 }
 
 impl PreparedPhase for Prepared<'_> {
@@ -4167,7 +4242,7 @@ impl engine::frame::Shell for Shell {
             }
             walked
         } else {
-            self.walk_once(&prepared, Mode::Encode)?
+            self.walk_split(&prepared)?
         };
         fire_trace(|| "forward-encoded".to_string());
         let profile = crate::encode::kernel_profile();
@@ -4308,8 +4383,10 @@ impl engine::frame::Shell for Shell {
         let seq = self.airborne.enter();
         let counts = self.airborne.clone();
         let done = prepared.done.take();
+        let verdict = self.ane.as_ref().and_then(crate::ane::Ane::verdict);
         let pending = frame.commit_async(Some(Box::new(move |refused: Option<String>| {
             counts.leave();
+            let refused = refused.or_else(|| verdict.as_ref().and_then(|verdict| verdict()));
             if let Some(done) = done.as_ref() {
                 let outcome = match &refused {
                     None => engine::StepOutcome::Committed,

@@ -30,6 +30,7 @@ checkpoint = { path = "../checkpoint" }
 libc = "0.2"
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
+ane = { path = "../ane" }
 objc2 = "0.6"
 block2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = [

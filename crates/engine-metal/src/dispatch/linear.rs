@@ -43,6 +43,39 @@ impl Run<'_> {
                     self.tensor(*y),
                 ),
             },
+            Linear::MlpAne {
+                act,
+                gate_up,
+                down,
+                intermediate,
+                layer,
+                packed,
+                h,
+                y,
+            } => match self
+                .ane()
+                .and_then(|ane| Some((ane, ane.plan(*layer, self.tensor(*act).rows)?)))
+                .filter(|(_, plan)| self.split_fits(plan, *act, *h, *y))
+            {
+                Some((ane, plan)) => self.mlp_split(ane, &plan, *act, *packed, *h, *y),
+                None => {
+                    self.linear(&Linear::Matmul {
+                        act: *act,
+                        w: *gate_up,
+                        y: *packed,
+                    })?;
+                    self.linear(&Linear::MlpSwiglu {
+                        packed: *packed,
+                        intermediate: *intermediate,
+                        y: *h,
+                    })?;
+                    self.linear(&Linear::Matmul {
+                        act: *h,
+                        w: *down,
+                        y: *y,
+                    })
+                }
+            },
             Linear::LmHead { act, w, y } => match self.banked(*w) {
                 Some(bank) => linear::quant::lm_head(
                     self.ctx(),
@@ -404,5 +437,72 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
         }
+    }
+}
+
+impl Run<'_> {
+    fn split_fits(
+        &self,
+        plan: &crate::ane::Plan,
+        act: model_ir::ValueId,
+        h: model_ir::ValueId,
+        y: model_ir::ValueId,
+    ) -> bool {
+        let padded = plan.rows.div_ceil(32) * 32;
+        padded
+            <= self
+                .capacity(act)
+                .min(self.capacity(h))
+                .min(self.capacity(y))
+            && self.precast(padded, plan.split.keep).is_some()
+    }
+
+    fn mlp_split(
+        &self,
+        ane: &crate::ane::Ane,
+        plan: &crate::ane::Plan,
+        act: model_ir::ValueId,
+        packed: model_ir::ValueId,
+        h: model_ir::ValueId,
+        y: model_ir::ValueId,
+    ) -> Result<(), kernels_metal::Error> {
+        let keep = plan.split.keep;
+        let x = self.tensor(act);
+        let out = self.tensor(y);
+        let gate = kernels_metal::Tensor {
+            width: keep,
+            ..self.tensor(packed)
+        };
+        let h_gpu = kernels_metal::Tensor {
+            width: keep,
+            ..self.tensor(h)
+        };
+        ane.before(self.ctx(), plan, x)?;
+        let precast = |rows, contraction| self.precast(rows, contraction);
+        let partials = |rows, width| self.partials(rows, width);
+        let scratch = || linear::quant::Scratch {
+            precast: &precast,
+            partials: &partials,
+        };
+        let rows = self.capacity(act);
+        linear::quant::matmul(
+            self.ctx(),
+            x,
+            plan.split.gate,
+            gate,
+            scratch(),
+            rows.min(self.capacity(packed)),
+        )?;
+        linear::quant::matmul(self.ctx(), x, plan.split.up, plan.up_rows, scratch(), rows)?;
+        linear::mlp::swiglu_clamp_split(self.ctx(), gate, plan.up_rows, f32::MAX, h_gpu)?;
+        linear::quant::matmul(
+            self.ctx(),
+            h_gpu,
+            plan.split.down,
+            out,
+            scratch(),
+            self.capacity(h).min(self.capacity(y)),
+        )?;
+        ane.after(self.ctx(), plan, out)
     }
 }

@@ -47,7 +47,8 @@ affine_qmm_mpp(const device uchar *weights [[buffer(0)]], const device bfloat *s
                const device bfloat *biases [[buffer(2)]], const device bfloat *input [[buffer(3)]],
                device bfloat *output [[buffer(4)]], constant int &width [[buffer(5)]],
                constant int &columns [[buffer(6)]], const device float *sums [[buffer(7)]],
-               constant int &rows [[buffer(8)]], uint3 position [[threadgroup_position_in_grid]],
+               constant int &rows [[buffer(8)]], constant int &stride [[buffer(9)]],
+               uint3 position [[threadgroup_position_in_grid]],
                uint thread_id [[thread_index_in_threadgroup]]) {
   uint row_tile = position.y, column_tile = position.x;
   if constexpr (ROW_GROUP == 0) {
@@ -61,6 +62,7 @@ affine_qmm_mpp(const device uchar *weights [[buffer(0)]], const device bfloat *s
     column_tile = (position.x % span) / count;
   }
   const int groups = width / 64;
+  const int row_groups = PACKED ? groups : stride / 64;
   const uint row = row_tile * M, column = column_tile * N;
   const uint part = LOCAL ? thread_id / (S * 32) : position.z;
   if constexpr (PACKED) {
@@ -68,14 +70,14 @@ affine_qmm_mpp(const device uchar *weights [[buffer(0)]], const device bfloat *s
     biases = scales + Index(columns) * groups;
   }
   const Index weight_base = PACKED ? Index(column / 256) * groups * 8192 + (column % 256) * 32
-                                   : Index(column) * (width / 2);
+                                   : Index(column) * (stride / 2);
   auto activations = tensor(const_cast<device bfloat *>(input) + Index(row) * width,
                             dextents<int, 2>{width, M}, array<int, 2>{1, width});
   auto weight_view = [&](uint group) {
     Index offset = weight_base + Index(group) * (PACKED ? 8192 : 32);
     return tensor<device uint4b_format, dextents<int, 2>, tensor_inline>(
         const_cast<device uchar *>(weights) + offset, dextents<int, 2>{64, N},
-        array<int, 2>{1, PACKED ? 64 : width});
+        array<int, 2>{1, PACKED ? 64 : stride});
   };
   constexpr auto descriptor = matmul2d_descriptor(M, N, 64, false, true, RELAXED);
   matmul2d<descriptor, execution_simdgroups<S>> multiply;
@@ -94,7 +96,7 @@ affine_qmm_mpp(const device uchar *weights [[buffer(0)]], const device bfloat *s
     mpp_for_each(total, valid_mask, [&](ushort i) __attribute__((always_inline)) {
       auto at = total.get_multidimensional_index(i);
       Index parameter = PACKED ? (Index(column / 256) * groups + group) * 256 + column % 256 + at[0]
-                               : Index(column + at[0]) * groups + group;
+                               : Index(column + at[0]) * row_groups + group;
       Index sum = Index(row_tile) * M * groups + group * M + at[1];
       total[i] += result[i] * float(scales[parameter]) + sums[sum] * float(biases[parameter]);
     });
@@ -150,7 +152,7 @@ affine_qmm_mpp(const device uchar *weights [[buffer(0)]], const device bfloat *s
   affine_qmm_mpp<m, n, s, packed, relaxed, parts, paired, local, grid, index>(                     \
       const device uchar *, const device bfloat *, const device bfloat *, const device bfloat *,   \
       device bfloat *, constant int &, constant int &, const device float *, constant int &,       \
-      uint3, uint);
+      constant int &, uint3, uint);
 
 // The routed twin of the in-place kernel: a row tile belongs to one expert, whose bank lies
 // `expert * columns` rows into the planes, and a tile no expert claimed is left unwritten.

@@ -765,6 +765,48 @@ impl Pools {
         Ok(())
     }
 
+    pub fn save_state(&self, frame: &mut Frame, slots: &[u32], into: &Buffer) -> Result<()> {
+        self.move_state(frame, slots, into, true)
+    }
+
+    pub fn restore_state(&self, frame: &mut Frame, slots: &[u32], from: &Buffer) -> Result<()> {
+        self.move_state(frame, slots, from, false)
+    }
+
+    fn move_state(
+        &self,
+        frame: &mut Frame,
+        slots: &[u32],
+        spare: &Buffer,
+        save: bool,
+    ) -> Result<()> {
+        let mut at = 0u64;
+        for &slot in slots {
+            for shape in &self.shapes {
+                let Shape::State {
+                    stride,
+                    dtype,
+                    plane,
+                } = *shape
+                else {
+                    continue;
+                };
+                let bytes = stride * u64::from(elem_size(dtype));
+                let slab = self.planes[plane].buffer();
+                let from = u64::from(slot) * bytes;
+                slab.span(from, bytes)?;
+                spare.span(at, bytes)?;
+                if save {
+                    frame.copy(slab.slab(), from, spare.slab(), at, bytes)?;
+                } else {
+                    frame.copy(spare.slab(), at, slab.slab(), from, bytes)?;
+                }
+                at += bytes;
+            }
+        }
+        Ok(())
+    }
+
     pub fn copy_state(&mut self, frame: &mut Frame, moves: &[(u32, u32)]) -> Result<()> {
         if moves.is_empty() || !self.has_state() {
             return Ok(());

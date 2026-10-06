@@ -430,9 +430,6 @@ impl Weights {
     }
 
     pub fn repack_mpp(&mut self, device: &Context, handles: &Handles, trace: &Trace) -> Result<()> {
-        use crate::device::Pipelines;
-        use crate::encode::Sink;
-        use kernels_metal::encode::{Arg, Encode, Fire, Grid};
         let tuned = kernels_metal::tuning::current();
         if !tuned.qmm_mpp || !tuned.qmm_mpp_packed {
             return Ok(());
@@ -443,16 +440,23 @@ impl Weights {
             ));
         }
         let mut dense = vec![false; trace.params.len()];
-        for node in &trace.nodes {
-            if let model_ir::Operation::Linear(
-                model_ir::Linear::Matmul { w, .. } | model_ir::Linear::LmHead { w, .. },
-            ) = &node.op
-                && let model_ir::Def::Weight(at) = trace.values[w.0 as usize].def
-            {
+        let mut mark = |w: &model_ir::ValueId| {
+            if let model_ir::Def::Weight(at) = trace.values[w.0 as usize].def {
                 dense[at as usize] = true;
             }
+        };
+        for node in &trace.nodes {
+            match &node.op {
+                model_ir::Operation::Linear(
+                    model_ir::Linear::Matmul { w, .. } | model_ir::Linear::LmHead { w, .. },
+                ) => mark(w),
+                model_ir::Operation::Linear(model_ir::Linear::MlpAne { gate_up, down, .. }) => {
+                    mark(gate_up);
+                    mark(down);
+                }
+                _ => {}
+            }
         }
-        let pipelines = Pipelines::new();
         for ((param, row), used) in trace.params.iter().zip(&mut self.table.0).zip(dense) {
             if !used || param.source != ParamSource::Checkpoint {
                 continue;
@@ -460,37 +464,7 @@ impl Weights {
             let Some(WeightRow::Planes(bank)) = row else {
                 continue;
             };
-            let (n, k) = (bank.codes.rows, bank.codes.width);
-            if bank.bits != 4 || bank.group != 64 || n % 256 != 0 || k % 64 != 0 {
-                continue;
-            }
-            let Some(biases) = bank.biases else { continue };
-            if bank.scales.dtype != Dtype::Bf16 || biases.dtype != Dtype::Bf16 {
-                continue;
-            }
-            let work = n.checked_mul(k / 8).ok_or_else(|| {
-                Fault::Residency("MPP packed bank exceeds the dispatch grid limit".into())
-            })?;
-            let bytes = u64::from(n) * u64::from(k) / 2 + u64::from(n) * u64::from(k / 64) * 4;
-            let buffer = Buffer::zeroed(device, bytes)?;
-            let packed = Tensor::new(handles.bind(&buffer, 0, bytes)?, n, k, Dtype::U4g64);
-            let frame = device.frame()?;
-            let sink = Sink::new(device, &frame, &pipelines, handles);
-            sink.fire(
-                Fire::at("linear/quant_qmm_mpp.metal", "qmm_mpp_pack_bank")
-                    .apply(Grid::of([work, 1, 1], [256, 1, 1])),
-                &[
-                    bank.codes.arg(),
-                    bank.scales.arg(),
-                    biases.arg(),
-                    packed.arg_mut(),
-                    k.arg(),
-                    n.arg(),
-                ],
-            )?;
-            frame.commit()?;
-            bank.mpp_codes = Some(packed);
-            self.decoded.push(buffer);
+            bank.mpp_codes = mpp_pack(device, handles, bank, &mut self.decoded)?;
         }
         Ok(())
     }
@@ -1277,6 +1251,55 @@ impl TensorSink for Landing<'_> {
         self.landed[at] = true;
         Ok(())
     }
+}
+
+pub fn mpp_pack(
+    device: &Context,
+    handles: &Handles,
+    bank: &kernels_metal::Bank,
+    keep: &mut Vec<Buffer>,
+) -> Result<Option<Tensor>> {
+    use crate::device::Pipelines;
+    use crate::encode::Sink;
+    use kernels_metal::encode::{Arg, Encode, Fire, Grid};
+    let tuned = kernels_metal::tuning::current();
+    if !tuned.qmm_mpp || !tuned.qmm_mpp_packed {
+        return Ok(None);
+    }
+    let (n, k) = (bank.codes.rows, bank.codes.width);
+    if bank.bits != 4 || bank.group != 64 || n % 256 != 0 || k % 64 != 0 {
+        return Ok(None);
+    }
+    let Some(biases) = bank.biases else {
+        return Ok(None);
+    };
+    if bank.scales.dtype != Dtype::Bf16 || biases.dtype != Dtype::Bf16 {
+        return Ok(None);
+    }
+    let work = n.checked_mul(k / 8).ok_or_else(|| {
+        Fault::Residency("MPP packed bank exceeds the dispatch grid limit".into())
+    })?;
+    let bytes = u64::from(n) * u64::from(k) / 2 + u64::from(n) * u64::from(k / 64) * 4;
+    let buffer = Buffer::zeroed(device, bytes)?;
+    let packed = Tensor::new(handles.bind(&buffer, 0, bytes)?, n, k, Dtype::U4g64);
+    let pipelines = Pipelines::new();
+    let frame = device.frame()?;
+    let sink = Sink::new(device, &frame, &pipelines, handles);
+    sink.fire(
+        Fire::at("linear/quant_qmm_mpp.metal", "qmm_mpp_pack_bank")
+            .apply(Grid::of([work, 1, 1], [256, 1, 1])),
+        &[
+            bank.codes.arg(),
+            bank.scales.arg(),
+            biases.arg(),
+            packed.arg_mut(),
+            k.arg(),
+            n.arg(),
+        ],
+    )?;
+    frame.commit()?;
+    keep.push(buffer);
+    Ok(Some(packed))
 }
 
 #[cfg(test)]
