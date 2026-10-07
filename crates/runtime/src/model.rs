@@ -366,6 +366,7 @@ fn compiled_tokenizer(metadata: &ModelMetadata) -> Option<Result<Tokenizer>> {
     })())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn register(
     name: String,
     model_id: &str,

@@ -17,8 +17,6 @@ use super::model::{
     VIDEO_FEATURES, VIDEO_SHIFT, modality, port, timestep_slot,
 };
 
-pub const STREAM_BASE: u8 = 0;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Readings {
     pub text: Option<u8>,

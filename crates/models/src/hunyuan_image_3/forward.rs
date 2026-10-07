@@ -16,8 +16,6 @@ use super::model::{
     T_SCALE, TRAIN_STEPS, port,
 };
 
-pub const STREAM_BASE: u8 = 0;
-
 pub const QO_ONE: u8 = 8;
 
 pub const ENCODE: u8 = 0;

@@ -1,6 +1,7 @@
 use poem_dsl::fact;
 use poem_dsl::{
     Dtype, ForwardHybrid, GateActivation, HybridSpec, Input, MropeForm, Value, Weight, ops, seam,
+    switch,
 };
 
 use super::model::{Attn, BonsaiSigns, DRAFT_DEPTH, Gdn, Head, Mixer, Mlp, Model, Tower};
@@ -69,15 +70,13 @@ impl ForwardHybrid for Model {
     fn forward(&self, inputs: Input) -> Value {
         let m = self;
 
-        let classes = [fact::has(fact::Mask), fact::scores(), fact::single_token()];
-        let (_, trunk_inputs) = match &m.dflash {
-            Some(_) => (
-                inputs.on(fact::block_draft()),
-                inputs.on(!fact::block_draft()),
-            ),
-            None => (inputs.clone(), inputs.clone()),
+        // A drafted block's rows run the drafter, not the trunk's attention.
+        let trunk_inputs = match &m.dflash {
+            Some(_) => inputs.on(!fact::block_draft()),
+            None => inputs.clone(),
         };
-        let ([input_m, input_s, input_d], input_p) = trunk_inputs.partition(classes.clone());
+        let ([input_m, input_s, input_d], input_p) =
+            trunk_inputs.partition([fact::has(fact::Mask), fact::scores(), fact::single_token()]);
         let plan_m = ops::attn::plan_prefill(&input_m, m.q_heads, m.kv_heads, m.head_dim, None);
         let plan_d = ops::attn::plan_decode(&input_d, m.q_heads, m.kv_heads, m.head_dim, None);
         let plan_p = ops::attn::plan_prefill(&input_p, m.q_heads, m.kv_heads, m.head_dim, None);
@@ -437,18 +436,22 @@ fn attn_mixer(
     ops::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
     seam::at(seam::ATTN_Q, &[&q]);
 
-    let ([mq, sq, dq], p) =
-        q.partition([fact::has(fact::Mask), fact::scores(), fact::single_token()]);
-    let (so, lse) = ops::attn::prefill_lse(&sq, plan_s, pages, None, d, m.kv_heads, a.sm_scale);
-    seam::at(seam::SCORES, &[&lse]);
-    let o = Value::merge(vec![
-        ops::attn::masked(
-            &mq, plan_m, mask, pages, None, d, m.kv_heads, true, a.sm_scale,
-        ),
-        so,
-        ops::attn::decode(&dq, plan_d, pages, None, d, a.sm_scale),
-        ops::attn::prefill(&p, plan_p, pages, None, d, m.kv_heads, a.sm_scale),
-    ]);
+    let o = switch(&q)
+        .case(fact::has(fact::Mask), |q| {
+            ops::attn::masked(
+                q, plan_m, mask, pages, None, d, m.kv_heads, true, a.sm_scale,
+            )
+        })
+        .case(fact::scores(), |q| {
+            let (o, lse) =
+                ops::attn::prefill_lse(q, plan_s, pages, None, d, m.kv_heads, a.sm_scale);
+            seam::at(seam::SCORES, &[&lse]);
+            o
+        })
+        .case(fact::single_token(), |q| {
+            ops::attn::decode(q, plan_d, pages, None, d, a.sm_scale)
+        })
+        .otherwise(|q| ops::attn::prefill(q, plan_p, pages, None, d, m.kv_heads, a.sm_scale));
     seam::at(seam::ATTN_OUT, &[&o]);
     // C1: undo V's turn. With V cached as V·H, each head's output is
     // O = P·(V·H) = (P·V)·H = O_true·H, so one more Hadamard (H·H = I) recovers
@@ -529,43 +532,42 @@ fn gdn_mixer(x: &Value, inputs: &Input, g: &Gdn, bonsai: Option<&BonsaiSigns>) -
     let ba = ops::linear::matmul(x, &g.in_ba);
     seam::at(seam::RECURRENT, &[&qkvz]);
     let width = Gdn::qkv_width(g.k_heads, g.v_heads, g.k_dim, g.v_dim);
-    let one = fact::single_token();
-    let (qkvz_d, qkvz_p) = (qkvz.on(one.clone()), qkvz.on(!one.clone()));
-    let (ba_d, ba_p) = (ba.on(one.clone()), ba.on(!one.clone()));
-    let (core_d, z_d) = {
-        let (qkv, z) = ops::layout::split_rows(&qkvz_d, width);
-        let qkv = ops::attn::ssm_causal_conv1d(&qkv, &g.conv, conv_state, g.conv_kernel);
-        let gates = ops::attn::ssm_gdn_prep(&ba_d, &g.dt_bias, &g.a_log);
-        let core = ops::attn::ssm_gated_delta(
-            &qkv,
-            &z,
-            &gates,
-            delta_state,
-            g.k_heads,
-            g.v_heads,
-            g.k_dim,
-            g.v_dim,
-        );
-        (core, z)
-    };
-    let (core_p, z_p) = {
-        let (qkv, z) = ops::layout::split_rows(&qkvz_p, width);
-        let qkv = ops::attn::ssm_causal_conv1d_chunked(&qkv, &g.conv, conv_state, g.conv_kernel);
-        let gates = ops::attn::ssm_gdn_prep(&ba_p, &g.dt_bias, &g.a_log);
-        let core = ops::attn::ssm_gated_delta_chunked(
-            &qkv,
-            &z,
-            &gates,
-            delta_state,
-            g.k_heads,
-            g.v_heads,
-            g.k_dim,
-            g.v_dim,
-        );
-        (core, z)
-    };
-    let o = Value::merge(vec![core_d, core_p]);
-    let z = Value::merge(vec![z_d, z_p]);
+    // One token walks the recurrence a step; a prompt walks it in chunks.
+    let (o, z) = switch(&qkvz)
+        .case(fact::single_token(), |qkvz| {
+            let (qkv, z) = ops::layout::split_rows(qkvz, width);
+            let qkv = ops::attn::ssm_causal_conv1d(&qkv, &g.conv, conv_state, g.conv_kernel);
+            let gates = ops::attn::ssm_gdn_prep(&ba.on(fact::single_token()), &g.dt_bias, &g.a_log);
+            let core = ops::attn::ssm_gated_delta(
+                &qkv,
+                &z,
+                &gates,
+                delta_state,
+                g.k_heads,
+                g.v_heads,
+                g.k_dim,
+                g.v_dim,
+            );
+            (core, z)
+        })
+        .otherwise(|qkvz| {
+            let (qkv, z) = ops::layout::split_rows(qkvz, width);
+            let qkv =
+                ops::attn::ssm_causal_conv1d_chunked(&qkv, &g.conv, conv_state, g.conv_kernel);
+            let gates =
+                ops::attn::ssm_gdn_prep(&ba.on(!fact::single_token()), &g.dt_bias, &g.a_log);
+            let core = ops::attn::ssm_gated_delta_chunked(
+                &qkv,
+                &z,
+                &gates,
+                delta_state,
+                g.k_heads,
+                g.v_heads,
+                g.k_dim,
+                g.v_dim,
+            );
+            (core, z)
+        });
 
     let o =
         ops::elemwise::rmsnorm_gated(&o, &z, &g.norm, g.v_dim, g.norm_eps, GateActivation::Silu);

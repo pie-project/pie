@@ -532,7 +532,6 @@ impl Arm for (Value, Value, Value) {
 /// Branches the rows of `x`: each case computes over the rows it is the
 /// first to hold for, and the arms are joined into one result over all of
 /// them.
-#[must_use]
 pub fn switch<T: Arm>(x: &Value) -> Switch<'_, T> {
     Switch {
         x,

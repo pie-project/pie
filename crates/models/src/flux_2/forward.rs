@@ -16,8 +16,6 @@ use super::model::{
     TOKEN_COMPRESSION, TRAIN_STEPS, TextEncoder, port,
 };
 
-pub const STREAM_BASE: u8 = 0;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Readings {
     pub text: Option<u8>,

@@ -30,11 +30,6 @@ impl Stream {
     }
 
     #[must_use]
-    pub fn word(self, base: u8) -> u64 {
-        1u64 << (base + self.code())
-    }
-
-    #[must_use]
     pub fn name(self) -> &'static str {
         match self {
             Stream::Text => "text",
@@ -259,7 +254,6 @@ mod tests {
         assert_eq!(r.choice("stream"), Some("audio"));
         for stream in Stream::ALL {
             assert_eq!(Stream::from_code(stream.code()), Some(stream));
-            assert_eq!(stream.word(8), 1 << (8 + stream.code()));
         }
         assert_eq!(Stream::from_code(6), None);
     }

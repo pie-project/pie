@@ -19,8 +19,6 @@ use super::model::{
     VAE_SPATIAL_COMPRESSION, VAE_TEMPORAL_COMPRESSION, VAE_Z, Vae, VaeEncoder, port,
 };
 
-pub const STREAM_BASE: u8 = 0;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Readings {
     pub text: Option<u8>,

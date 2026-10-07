@@ -15,10 +15,6 @@ use super::model::{
     TIMESTEP_MAX_PERIOD, TIMESTEP_SCALE, port,
 };
 
-pub const STREAM_BASE: u8 = 0;
-
-pub const DENOISE_BIT: u8 = 6;
-
 pub const DENOISE_READING: u8 = 0;
 
 pub struct Tap;

@@ -18,8 +18,6 @@ use super::model::{
     VAE_TEMPORAL_COMPRESSION, VAE_Z, Vae, VaeConv, VaeResnet, port,
 };
 
-pub const STREAM_BASE: u8 = 0;
-
 pub const DENOISE: u8 = 0;
 pub const REFINE_VIDEO: u8 = 1;
 pub const REFINE_AUDIO: u8 = 2;
