@@ -21,7 +21,7 @@ use eta_ir::op::Op;
 use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use eta_ir::validate::bind;
-use model_dsl::{
+use poem_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Trace, Value, Weight,
     ops, seam, trace_hybrid,
 };
@@ -50,7 +50,7 @@ pub fn classify(request: &Request) -> u64 {
     NoFacts::of(request).word()
 }
 
-pub fn classify_for(_: &str) -> Option<model_ir::ClassifyFn> {
+pub fn classify_for(_: &str) -> Option<poem_ir::ClassifyFn> {
     Some(classify)
 }
 

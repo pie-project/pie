@@ -7,7 +7,7 @@ use engine_metal::encode::Sink;
 use kernels_metal::encode::{Arg, Encode, Fire, Grid};
 use kernels_metal::linear::quant;
 use kernels_metal::{Bank, Tensor};
-use model_ir::Dtype;
+use poem_ir::Dtype;
 
 const QMM_FILE: &str = "linear/quant_qmm_t.metal";
 

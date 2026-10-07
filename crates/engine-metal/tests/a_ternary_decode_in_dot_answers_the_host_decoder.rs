@@ -27,7 +27,7 @@ use engine_metal::encode::Sink;
 use kernels_metal::encode::{Arg, Encode, Fire, Grid};
 use kernels_metal::linear::quant;
 use kernels_metal::{Bank, Tensor};
-use model_ir::Dtype;
+use poem_ir::Dtype;
 
 // The M1a oracle: `ForkBlock { tensor, block_index, bytes: [u8;28], expect_bits:
 // [u32;128] }` and `FORK_BLOCKS`, generated from the real GGUF + the fork dequant.

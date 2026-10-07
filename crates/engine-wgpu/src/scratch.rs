@@ -1,9 +1,9 @@
 use kernels_wgpu::Tensor;
 use kernels_wgpu::attn::ple;
 use kernels_wgpu::linear::moe::{self, RoutedScratch};
-use model_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
-use model_exec::store::arena::rect;
-use model_ir::{Attention, Def, Dim, Dtype, Linear, Operation, Trace, Ty, ValueId};
+use poem_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
+use poem_exec::store::arena::rect;
+use poem_ir::{Attention, Def, Dim, Dtype, Linear, Operation, Trace, Ty, ValueId};
 
 use crate::store::kv::Paging;
 
@@ -125,7 +125,7 @@ impl Scratch {
             images: u64::from(budgets.max_images()),
             voxels: u64::from(budgets.max_voxels()),
             clips: u64::from(budgets.max_clips()),
-            readouts: model_compiler::arena::readouts_ceiling(budget),
+            readouts: poem_compiler::arena::readouts_ceiling(budget),
         };
         let of = |id: ValueId| rect(map, id, ceiling);
         let banked = |id: ValueId| match trace.values.get(id.0 as usize).map(|v| &v.def) {

@@ -23,7 +23,7 @@ use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::elemwise::pointwise;
-use model_ir::{Dtype, Elementwise, Operation};
+use poem_ir::{Dtype, Elementwise, Operation};
 
 fn noise(at: u64) -> u32 {
     let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5E5E_1234_9ABC_DEF0;
@@ -284,11 +284,11 @@ fn the_hadamard_transform_agrees() {
     }
 
     // Shape guard: a last dim that is not a multiple of `block`, and a
-    // non-power-of-two `block`, are validation faults caught by `model_ir::check`
+    // non-power-of-two `block`, are validation faults caught by `poem_ir::check`
     // before any kernel runs.
     assert!(
         hadamard_check_faults(100, 128),
-        "last dim 100 (not a multiple of 128) must fail model-ir validation"
+        "last dim 100 (not a multiple of 128) must fail poem-ir validation"
     );
     assert!(
         !hadamard_check_faults(256, 128),
@@ -296,7 +296,7 @@ fn the_hadamard_transform_agrees() {
     );
     assert!(
         hadamard_check_faults(768, 96),
-        "block 96 is not a power of two and must fail model-ir validation"
+        "block 96 is not a power of two and must fail poem-ir validation"
     );
     assert!(
         !hadamard_check_faults(512, 512),
@@ -305,10 +305,10 @@ fn the_hadamard_transform_agrees() {
 
     // Dtype guard: the sign diagonal rides the activation's element, so signs
     // whose dtype differs from the activation are a validation fault caught by
-    // `model_ir::check` before the kernel would reject them at launch.
+    // `poem_ir::check` before the kernel would reject them at launch.
     assert!(
         hadamard_sign_dtype_faults(Dtype::F32, Dtype::Bf16),
-        "a Bf16 sign diagonal over an F32 activation must fail model-ir validation"
+        "a Bf16 sign diagonal over an F32 activation must fail poem-ir validation"
     );
     assert!(
         !hadamard_sign_dtype_faults(Dtype::F32, Dtype::F32),
@@ -317,10 +317,10 @@ fn the_hadamard_transform_agrees() {
 }
 
 /// Build a one-node trace `x_out = hadamard(x, block)` with `x` of shape
-/// `[tokens, d]` and report whether `model_ir::check` flags a `HadamardBlock`
+/// `[tokens, d]` and report whether `poem_ir::check` flags a `HadamardBlock`
 /// fault for it.
 fn hadamard_check_faults(d: u64, block: u32) -> bool {
-    use model_ir::{Def, Dim, Guard, Node, Platform, RuntimeInput, Trace, Ty, ValueDecl, ValueId};
+    use poem_ir::{Def, Dim, Guard, Node, Platform, RuntimeInput, Trace, Ty, ValueDecl, ValueId};
 
     let ty = Ty::Tensor {
         shape: vec![Dim::Tokens, Dim::Const(d)],
@@ -355,19 +355,19 @@ fn hadamard_check_faults(d: u64, block: u32) -> bool {
         drafter: None,
     };
 
-    match model_ir::check(&trace) {
+    match poem_ir::check(&trace) {
         Ok(()) => false,
         Err(faults) => faults
             .iter()
-            .any(|f| matches!(f, model_ir::Fault::HadamardBlock { .. })),
+            .any(|f| matches!(f, poem_ir::Fault::HadamardBlock { .. })),
     }
 }
 
 /// Build a one-node trace `x_out = hadamard(x, 128, signs)` with an `act`-typed
 /// activation and a `sign`-typed sign diagonal, both a whole number of blocks
-/// wide, and report whether `model_ir::check` flags a `HadamardSignDtype` fault.
+/// wide, and report whether `poem_ir::check` flags a `HadamardSignDtype` fault.
 fn hadamard_sign_dtype_faults(act: Dtype, sign: Dtype) -> bool {
-    use model_ir::{Def, Dim, Guard, Node, Platform, RuntimeInput, Trace, Ty, ValueDecl, ValueId};
+    use poem_ir::{Def, Dim, Guard, Node, Platform, RuntimeInput, Trace, Ty, ValueDecl, ValueId};
 
     let shape = vec![Dim::Tokens, Dim::Const(128)];
     let x_ty = Ty::Tensor {
@@ -408,10 +408,10 @@ fn hadamard_sign_dtype_faults(act: Dtype, sign: Dtype) -> bool {
         drafter: None,
     };
 
-    match model_ir::check(&trace) {
+    match poem_ir::check(&trace) {
         Ok(()) => false,
         Err(faults) => faults
             .iter()
-            .any(|f| matches!(f, model_ir::Fault::HadamardSignDtype { .. })),
+            .any(|f| matches!(f, poem_ir::Fault::HadamardSignDtype { .. })),
     }
 }

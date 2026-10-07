@@ -7,7 +7,7 @@ mod common_dit;
 
 use common_dit::{Lcg, Rig, StreamFacts, WIDTH, Weights, assert_close, attach, bf, lane};
 use engine::fire::{LaneStream, PortKind};
-use model_dsl::{
+use poem_dsl::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Stream, Trace, Value, Weight,
     ops, seam, trace_hybrid,
 };

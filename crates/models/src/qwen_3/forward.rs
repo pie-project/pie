@@ -1,4 +1,4 @@
-use model_dsl::{
+use poem_dsl::{
     Classify, Dtype, ForwardHybrid, GateActivation, HybridSpec, Input, MropeForm, Predicate,
     Request, Value, Weight, ops, seam,
 };

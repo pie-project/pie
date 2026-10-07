@@ -1,7 +1,7 @@
 use kernels_cuda::Tensor;
 use kernels_cuda::attn::plan::{Device, Workspace, prefill_graph_padding, prefill_partial_rows};
-use model_compiler::Budget;
-use model_ir::{Dtype, StructKind};
+use poem_compiler::Budget;
+use poem_ir::{Dtype, StructKind};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -207,7 +207,7 @@ impl PortSeat {
 
     #[must_use]
     pub fn row_bytes(&self) -> u64 {
-        u64::from(self.width) * model_compiler::arena::elem_bytes(self.dtype).unwrap_or(0)
+        u64::from(self.width) * poem_compiler::arena::elem_bytes(self.dtype).unwrap_or(0)
     }
 }
 
@@ -1040,7 +1040,7 @@ impl Inputs {
         } else {
             (payload.len() as u64 / at.seat.row_bytes) as u32
         };
-        let width = model_compiler::arena::elem_bytes(at.seat.dtype)
+        let width = poem_compiler::arena::elem_bytes(at.seat.dtype)
             .filter(|element| *element > 0)
             .map_or(0, |element| (at.seat.row_bytes / element) as u32);
         Ok(PatchHandles {

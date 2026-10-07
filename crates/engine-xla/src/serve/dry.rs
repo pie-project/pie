@@ -13,7 +13,7 @@
 //! over the voxel axis one clip, a class that lands media one image.
 
 use engine::fire::{Mask, Masking};
-use model_ir::{ClassifyFn, Request, Stream};
+use poem_ir::{ClassifyFn, Request, Stream};
 
 use super::{Lane, Media, PATCH_ROUTE_DROP, Seated, Shell};
 use crate::dit::{Clips, PortCell, SelfCond};
@@ -37,7 +37,7 @@ pub struct Probe {
 /// Every request shape the arming pass enumerates (engine-cuda
 /// `exports::landing_requests`), by the class it lands in.
 #[must_use]
-pub fn landing(classify: ClassifyFn, classes: &model_ir::ClassTable) -> Vec<Vec<Request>> {
+pub fn landing(classify: ClassifyFn, classes: &poem_ir::ClassTable) -> Vec<Vec<Request>> {
     let mut landing = vec![Vec::new(); classes.classes.len()];
     for reading in 0..8u8 {
         for stream in Stream::ALL {
@@ -281,7 +281,7 @@ impl Shell {
                 let p = patch.unwrap_or([1, 1, 1]);
                 let b = [p[0], 2 * p[1], 2 * p[2]];
                 let voxels = (b[0] * b[1] * b[2]) as usize;
-                let elem = model_compiler::arena::elem_bytes(dtype).unwrap_or(2) as usize;
+                let elem = poem_compiler::arena::elem_bytes(dtype).unwrap_or(2) as usize;
                 let payload = match dit.dry_voxel_width(class).or(widths.first().copied()) {
                     Some(w) => vec![0u8; voxels * w as usize * elem],
                     None => Vec::new(),
@@ -349,10 +349,10 @@ impl Shell {
     fn dry_voxel_class(&self, class: usize) -> bool {
         self.dry_class_runs(class, |trace, op| {
             let mut inputs = Vec::new();
-            model_ir::Operands::inputs(op, &mut inputs);
+            poem_ir::Operands::inputs(op, &mut inputs);
             inputs.iter().any(|v| {
-                matches!(&trace.values[v.0 as usize].ty, model_ir::Ty::Tensor { shape, .. }
-                    if shape.first().and_then(|dim| dim.axis()) == Some(model_ir::RowAxis::Voxels))
+                matches!(&trace.values[v.0 as usize].ty, poem_ir::Ty::Tensor { shape, .. }
+                    if shape.first().and_then(|dim| dim.axis()) == Some(poem_ir::RowAxis::Voxels))
             })
         })
     }
@@ -366,7 +366,7 @@ impl Shell {
     fn dry_class_runs(
         &self,
         class: usize,
-        pick: impl Fn(&model_ir::Trace, &model_ir::Operation) -> bool,
+        pick: impl Fn(&poem_ir::Trace, &poem_ir::Operation) -> bool,
     ) -> bool {
         self.compiled.template().iter().any(|region| {
             region.mask.contains(class)
@@ -381,7 +381,7 @@ impl Shell {
     fn dry_media(&self, rows: u32) -> Option<OwnedMedia> {
         let seat = self.patch_seat?;
         let fold = self.patch_fold.max(1);
-        let patches = (model_compiler::PATCH_LATTICE_FLOOR / fold).max(1) * fold;
+        let patches = (poem_compiler::PATCH_LATTICE_FLOOR / fold).max(1) * fold;
         let n = patches as usize;
         let live = n / fold as usize;
         let mut routes = vec![

@@ -157,7 +157,7 @@ impl Residency {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoadRequest {
-    pub trace: model_ir::Trace,
+    pub trace: poem_ir::Trace,
     pub checkpoint: Checkpoint,
     pub budgets: Budgets,
     #[serde(default)]

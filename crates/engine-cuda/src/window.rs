@@ -3,17 +3,17 @@ use std::cell::Cell;
 use crate::device::conditional::Kind;
 use crate::device::graph::Event;
 use kernels_cuda::Tensor;
-use model_compiler::{CompiledModel, Lowering, Phase, Region};
-use model_exec::fire::{EventId, MaskSpan, Sink, WindowTable, fallback};
-use model_exec::store::check::{self, rebase};
-use model_ir::{Def, Dim, Dtype, GeomKind, Operands, Operation, RuntimeInput, Trace, Ty};
+use poem_compiler::{CompiledModel, Lowering, Phase, Region};
+use poem_exec::fire::{EventId, MaskSpan, Sink, WindowTable, fallback};
+use poem_exec::store::check::{self, rebase};
+use poem_ir::{Def, Dim, Dtype, GeomKind, Operands, Operation, RuntimeInput, Trace, Ty};
 
 use crate::error::{Fault, Result};
 use crate::store::kv::Geometry;
 
 #[derive(Debug, Clone)]
 pub struct Window {
-    pub spans: model_ir::PerAxis<MaskSpan>,
+    pub spans: poem_ir::PerAxis<MaskSpan>,
     pub indptr_host: Vec<i32>,
     pub indptr: Tensor,
 
@@ -32,13 +32,13 @@ pub enum WindowShape {
 
 impl Window {
     #[must_use]
-    pub fn on(&self, axis: model_ir::RowAxis) -> MaskSpan {
+    pub fn on(&self, axis: poem_ir::RowAxis) -> MaskSpan {
         self.spans[axis]
     }
 
     #[must_use]
     pub fn span(&self) -> MaskSpan {
-        self.spans[model_ir::RowAxis::PRIMARY]
+        self.spans[poem_ir::RowAxis::PRIMARY]
     }
 
     #[must_use]
@@ -218,7 +218,7 @@ pub struct Windows {
     windows: Vec<Window>,
     runs: Vec<u32>,
     of_region: Vec<(u32, u32)>,
-    axes: Vec<model_ir::RowAxis>,
+    axes: Vec<poem_ir::RowAxis>,
     slots: Slots,
 
     live_words: Vec<u32>,
@@ -231,7 +231,7 @@ pub struct Windows {
 }
 
 fn copyable(trace: &Trace, region: &Region) -> bool {
-    let mut operands: Vec<model_ir::ValueId> = Vec::new();
+    let mut operands: Vec<poem_ir::ValueId> = Vec::new();
     for node in region.nodes.clone() {
         let Some(node) = trace.nodes.get(node as usize) else {
             return false;
@@ -259,7 +259,7 @@ fn copyable(trace: &Trace, region: &Region) -> bool {
         match &decl.def {
             Def::Cache(c) => matches!(
                 trace.caches.get(*c as usize),
-                Some(model_ir::CacheRow::Kv { .. })
+                Some(poem_ir::CacheRow::Kv { .. })
             ),
             Def::Input(RuntimeInput::Geometry { kind, .. }) => matches!(
                 kind,
@@ -288,7 +288,7 @@ impl Windows {
     pub fn of(
         trace: &Trace,
         compiled: &CompiledModel,
-        tables: model_ir::PerAxis<&WindowTable>,
+        tables: poem_ir::PerAxis<&WindowTable>,
         indptr_host: &[i32],
         copies: Copies<'_>,
         slots: Slots,
@@ -296,7 +296,7 @@ impl Windows {
         let mut windows: Vec<Window> = Vec::new();
         let mut runs: Vec<u32> = Vec::with_capacity(compiled.template().len());
         let mut of_region: Vec<(u32, u32)> = Vec::with_capacity(compiled.template().len());
-        let mut axes: Vec<model_ir::RowAxis> = Vec::with_capacity(compiled.template().len());
+        let mut axes: Vec<poem_ir::RowAxis> = Vec::with_capacity(compiled.template().len());
         let mut spans: Vec<MaskSpan> = Vec::new();
         let segment_cap = fallback::max_runs(compiled);
 
@@ -304,7 +304,7 @@ impl Windows {
             let axis = compiled.axis_of(at);
             axes.push(axis);
             tables[axis].spans_into(&region.mask, &mut spans);
-            let patch = match tables[model_ir::RowAxis::Patches].span(&region.mask) {
+            let patch = match tables[poem_ir::RowAxis::Patches].span(&region.mask) {
                 Ok(span) => span.unwrap_or_default(),
                 Err(runs) => {
                     return Err(Fault::Fragmented {
@@ -314,7 +314,7 @@ impl Windows {
                     });
                 }
             };
-            let voxel = match tables[model_ir::RowAxis::Voxels].span(&region.mask) {
+            let voxel = match tables[poem_ir::RowAxis::Voxels].span(&region.mask) {
                 Ok(span) => span.unwrap_or_default(),
                 Err(runs) => {
                     return Err(Fault::Fragmented {
@@ -359,8 +359,8 @@ impl Windows {
                 && copyable(trace, region)
             {
                 let mut gathered = gather_of(&spans, indptr_host, copies.spaces);
-                gathered.spans[model_ir::RowAxis::Patches] = patch;
-                gathered.spans[model_ir::RowAxis::Voxels] = voxel;
+                gathered.spans[poem_ir::RowAxis::Patches] = patch;
+                gathered.spans[poem_ir::RowAxis::Voxels] = voxel;
                 seats(slots, &gathered)?;
                 of_region.push((runs.len() as u32, 1));
                 runs.push(insert(&mut windows, gathered));
@@ -370,10 +370,10 @@ impl Windows {
             of_region.push((runs.len() as u32, spans.len() as u32));
             for &span in &spans {
                 let window = Window {
-                    spans: model_ir::PerAxis::new([span, patch, voxel]),
+                    spans: poem_ir::PerAxis::new([span, patch, voxel]),
                     indptr_host: match axis {
-                        model_ir::RowAxis::Tokens => rebase(indptr_host, span)?,
-                        model_ir::RowAxis::Patches | model_ir::RowAxis::Voxels => Vec::new(),
+                        poem_ir::RowAxis::Tokens => rebase(indptr_host, span)?,
+                        poem_ir::RowAxis::Patches | poem_ir::RowAxis::Voxels => Vec::new(),
                     },
                     indptr: Tensor::new(0, 0, 1, Dtype::I32),
                     gathered: None,
@@ -621,7 +621,7 @@ impl Windows {
         (0..self.of_region.len() as u32).all(|region| {
             self.admit_axes(
                 region,
-                model_ir::PerAxis::new([rows, 0, 0]),
+                poem_ir::PerAxis::new([rows, 0, 0]),
                 shifted,
                 lane_shifted,
             ) == Admit::Captured
@@ -630,13 +630,13 @@ impl Windows {
 
     #[must_use]
     pub fn admits(&self, rows: u32, shifted: &[bool], lane_shifted: &[bool]) -> Vec<Admit> {
-        self.admits_axes(model_ir::PerAxis::new([rows, 0, 0]), shifted, lane_shifted)
+        self.admits_axes(poem_ir::PerAxis::new([rows, 0, 0]), shifted, lane_shifted)
     }
 
     #[must_use]
     pub fn admits_axes(
         &self,
-        totals: model_ir::PerAxis<u32>,
+        totals: poem_ir::PerAxis<u32>,
         shifted: &[bool],
         lane_shifted: &[bool],
     ) -> Vec<Admit> {
@@ -646,22 +646,22 @@ impl Windows {
     }
 
     #[must_use]
-    pub fn axis_of(&self, region: u32) -> model_ir::RowAxis {
+    pub fn axis_of(&self, region: u32) -> poem_ir::RowAxis {
         self.axes
             .get(region as usize)
             .copied()
-            .unwrap_or(model_ir::RowAxis::Tokens)
+            .unwrap_or(poem_ir::RowAxis::Tokens)
     }
 
     #[must_use]
     fn admit_axes(
         &self,
         region: u32,
-        totals: model_ir::PerAxis<u32>,
+        totals: poem_ir::PerAxis<u32>,
         shifted: &[bool],
         lane_shifted: &[bool],
     ) -> Admit {
-        if self.axis_of(region) == model_ir::RowAxis::Voxels {
+        if self.axis_of(region) == poem_ir::RowAxis::Voxels {
             return Admit::Island;
         }
         let moves = shifted.get(region as usize).copied().unwrap_or(false);
@@ -813,7 +813,7 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], spaces: &[Geometry]) -> Win
         .collect();
 
     Window {
-        spans: model_ir::PerAxis::new([
+        spans: poem_ir::PerAxis::new([
             MaskSpan {
                 row_offset: 0,
                 rows: rows_host.len() as u32,
@@ -1217,13 +1217,13 @@ impl Sink for Cursor<'_> {
 mod tests {
     use super::*;
 
-    use model_ir::ClassSet;
+    use poem_ir::ClassSet;
 
     fn conditional() -> Region {
         Region {
             nodes: 0..26,
             mask: ClassSet::of([0]),
-            phase: model_compiler::Phase::Capture,
+            phase: poem_compiler::Phase::Capture,
             lowering: Lowering::If,
             stream: 0,
             wait: Vec::new(),
@@ -1267,7 +1267,7 @@ mod tests {
 
     fn plain(row_offset: u32, rows: u32) -> Window {
         Window {
-            spans: model_ir::PerAxis::new([
+            spans: poem_ir::PerAxis::new([
                 MaskSpan {
                     row_offset,
                     rows,
@@ -1307,7 +1307,7 @@ mod tests {
                 table.windows.push(window.clone());
             }
             table.of_region.push((start, region.len() as u32));
-            table.axes.push(model_ir::RowAxis::Tokens);
+            table.axes.push(poem_ir::RowAxis::Tokens);
         }
         table.fill_live();
         table
@@ -1345,7 +1345,7 @@ mod tests {
 
     fn bounded(span: MaskSpan) -> Window {
         Window {
-            spans: model_ir::PerAxis::new([span, MaskSpan::default(), MaskSpan::default()]),
+            spans: poem_ir::PerAxis::new([span, MaskSpan::default(), MaskSpan::default()]),
             indptr_host: (0..=span.lanes as i32).collect(),
             ..plain(0, 0)
         }

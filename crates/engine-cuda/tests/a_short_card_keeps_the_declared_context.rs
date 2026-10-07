@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use engine_cuda::{Boot, Knobs, Shell};
-use model_compiler::Budget;
-use model_dsl::Platform;
+use poem_compiler::Budget;
+use poem_dsl::Platform;
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 

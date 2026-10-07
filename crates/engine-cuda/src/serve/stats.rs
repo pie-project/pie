@@ -1,5 +1,5 @@
-use model_compiler::{Budget, CompiledModel};
-use model_ir::Trace;
+use poem_compiler::{Budget, CompiledModel};
+use poem_ir::Trace;
 
 use super::{FireCost, Graphs, Shell};
 use crate::error::Result;
@@ -97,12 +97,12 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn patch_element(&self) -> Option<model_ir::Dtype> {
+    pub fn patch_element(&self) -> Option<poem_ir::Dtype> {
         self.patch_seat.map(|seat| seat.dtype)
     }
 
     #[must_use]
-    pub fn voxel_element(&self) -> Option<model_ir::Dtype> {
+    pub fn voxel_element(&self) -> Option<poem_ir::Dtype> {
         self.voxels.as_ref().map(|store| store.seat().dtype)
     }
 

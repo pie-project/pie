@@ -1,13 +1,13 @@
 use core::ffi::c_void;
 use core::fmt;
 
-use model_exec::law::Refuse;
+use poem_exec::law::Refuse;
 
 use crate::device::graph::Graph;
 use crate::device::nodes::{self, Node, Param, Walked};
 use crate::error::Result;
 
-pub use model_exec::law::{At, Component, Law};
+pub use poem_exec::law::{At, Component, Law};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Topology {

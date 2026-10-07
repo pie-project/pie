@@ -1,8 +1,8 @@
 use core::cell::Cell;
 use core::ffi::c_void;
 
-use model_compiler::CompiledModel;
-use model_compiler::prefetch::Schedule;
+use poem_compiler::CompiledModel;
+use poem_compiler::prefetch::Schedule;
 
 use crate::device::alloc::Buffer;
 use crate::device::graph::Event;
@@ -476,15 +476,15 @@ fn copy_in(stream: *mut c_void, dst: u64, src: *const u8, bytes: u64) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use model_compiler::{Budget, Budgets, DeviceProfile, compile_axes};
-    use model_dsl::Platform;
+    use poem_compiler::{Budget, Budgets, DeviceProfile, compile_axes};
+    use poem_dsl::Platform;
 
     use super::*;
     use crate::experts::{Budgets as Tiers, Plan};
 
     const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
-    fn rig() -> (model_ir::Trace, model_compiler::CompiledModel, Plan) {
+    fn rig() -> (poem_ir::Trace, poem_compiler::CompiledModel, Plan) {
         let trace = (models::sku(SKU).expect("the catalog ships the SKU").trace)(Platform::Cuda);
         let compiled = compile_axes(
             &trace,
@@ -526,7 +526,7 @@ mod tests {
     }
 
     #[cfg(not(feature = "cuda"))]
-    fn rotation() -> (model_ir::Trace, Rotation) {
+    fn rotation() -> (poem_ir::Trace, Rotation) {
         let (trace, compiled, plan) = rig();
         let schedule = Schedule::of(&trace);
         let rotation = Rotation::plan(

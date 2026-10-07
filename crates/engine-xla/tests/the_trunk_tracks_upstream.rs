@@ -22,8 +22,8 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use engine_xla::{Boot, DeviceBoot, Lane, Shell};
-use model_compiler::Budget;
-use model_dsl::{Operands, Platform, Request};
+use poem_compiler::Budget;
+use poem_dsl::{Operands, Platform, Request};
 
 /// The `image-captioning` inferlet's text turns without the picture.
 const PROMPT: [u32; 37] = [
@@ -143,7 +143,7 @@ fn the_first_logits_track_upstream() {
             .sku
             .name
             .contains("vision")
-            .then(|| model_compiler::PatchLadder::new(256, 1)),
+            .then(|| poem_compiler::PatchLadder::new(256, 1)),
     })
     .expect("the shell loads");
     shell.probe(probes);

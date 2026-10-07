@@ -49,7 +49,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use model_dsl::{Dtype, Weight};
+use poem_dsl::{Dtype, Weight};
 use ztensor::format::cbor::Value;
 
 /// GGUF metadata key: the Hadamard block size (the sign widths must divide it).
@@ -366,7 +366,7 @@ fn as_i64(v: &Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model_ir::ParamSource;
+    use poem_ir::ParamSource;
     use ztensor::format::cbor;
 
     /// Build a `sign_values`-style CBOR int array (GGUF `int32` encoding: `Nint`

@@ -26,7 +26,7 @@ impl Ballot {
         let vote: f32 = if mine { 1.0 } else { 0.0 };
         let sum = (|| -> Result<f32> {
             slip.write(0, &vote.to_le_bytes())?;
-            let mut wire = kernels_cuda::Tensor::new(slip.ptr(), 1, 1, model_ir::Dtype::F32);
+            let mut wire = kernels_cuda::Tensor::new(slip.ptr(), 1, 1, poem_ir::Dtype::F32);
             kernels_cuda::collective::all_reduce(device.ctx(), &mut wire)
                 .map_err(crate::error::kernel)?;
             device.synchronize()?;
@@ -188,7 +188,7 @@ struct Deployment {
     prefilling: Vec<usize>,
     media: Vec<usize>,
     wide: Vec<usize>,
-    decoding: model_ir::ClassSet,
+    decoding: poem_ir::ClassSet,
     seats: u32,
     context: u32,
     max_lanes: u32,
@@ -488,7 +488,7 @@ impl Shell {
             .collect()
     }
 
-    fn representative(&self, class: usize, rows: u32, wants_media: bool) -> model_ir::Request {
+    fn representative(&self, class: usize, rows: u32, wants_media: bool) -> poem_ir::Request {
         let landing = &self.landing[class];
         landing
             .iter()
@@ -1148,7 +1148,7 @@ impl Shell {
                                         .and_then(|region| {
                                             self.trace.nodes.get(region.nodes.start as usize)
                                         })
-                                        .map_or("?", |node| model_ir::Operands::name(&node.op))
+                                        .map_or("?", |node| poem_ir::Operands::name(&node.op))
                                 })
                                 .collect();
                             format!("{from}..{upto}:{}", ops.join("+"))

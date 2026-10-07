@@ -27,9 +27,9 @@ pub mod z_image;
 use std::sync::LazyLock;
 
 use checkpoint::contract::ModelContract;
-use model_dsl::Dtype;
+use poem_dsl::Dtype;
 
-pub use model_dsl::{ClassifyFn, Platform, Request, Stream, biases_name, scales_name};
+pub use poem_dsl::{ClassifyFn, Platform, Request, Stream, biases_name, scales_name};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Recipe {
@@ -64,7 +64,7 @@ pub fn word(dtype: Dtype) -> String {
 pub struct Sku {
     pub name: String,
     pub recipe: Recipe,
-    pub trace: model_dsl::TraceFn,
+    pub trace: poem_dsl::TraceFn,
     pub classify: ClassifyFn,
     pub import: ImportFn,
     pub template:
@@ -226,7 +226,7 @@ macro_rules! skus {
                     $trace(&RECIPE.name(), &($m)(RECIPE.tp), platform)
                 },
                 classify: |request: &$crate::Request| {
-                    model_dsl::word_of(|| ($m)(RECIPE.tp), request)
+                    poem_dsl::word_of(|| ($m)(RECIPE.tp), request)
                 },
                 import: |src: &ztensor::Source, tp: u32, platform: $crate::Platform| {
                     ($m)(tp).import(src, platform)
@@ -285,7 +285,7 @@ pub fn fits<'a>(
 }
 
 pub(crate) fn dense(banks: Dtype) -> Dtype {
-    model_dsl::compute_dtype(banks)
+    poem_dsl::compute_dtype(banks)
         .unwrap_or_else(|| panic!("`{banks:?}` is not a weight representation a family declares"))
 }
 

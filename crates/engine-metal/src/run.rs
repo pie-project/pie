@@ -3,7 +3,7 @@ use kernels_metal::linear::moe::RoutedScratch;
 use kernels_metal::{
     Bank, Ctx, DecodePlan, KvPool, PrefillPlan, RaggedTensor, RecurrentPool, Tensor,
 };
-use model_ir::{Def, Dim, GeomKind, Node, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
+use poem_ir::{Def, Dim, GeomKind, Node, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
 
 use crate::device::Handles;
 use crate::dispatch::copy::CopyPlan;
@@ -103,7 +103,7 @@ pub struct FireBindings {
     pub self_cond_weights: Option<Tensor>,
 
     pub group_of_lane: Option<Tensor>,
-    pub packings: Vec<(model_ir::Selection, crate::inputs::PackingHandles)>,
+    pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
 
     pub ports: Vec<(engine::fire::PortKind, u8, Tensor)>,
 
@@ -270,7 +270,7 @@ impl<'c> Run<'c> {
             })
     }
 
-    fn packing(&self, at: usize, select: model_ir::Selection) -> crate::inputs::PackingHandles {
+    fn packing(&self, at: usize, select: poem_ir::Selection) -> crate::inputs::PackingHandles {
         self.fire
             .packings
             .iter()
@@ -333,7 +333,7 @@ impl<'c> Run<'c> {
             return handle;
         }
         let stride = u64::from(handle.width)
-            * model_compiler::arena::elem_bytes(handle.dtype).unwrap_or_else(|| {
+            * poem_compiler::arena::elem_bytes(handle.dtype).unwrap_or_else(|| {
                 panic!(
                     "a {:?} rectangle has no element size and so no row to step by",
                     handle.dtype
@@ -426,7 +426,7 @@ impl<'c> Run<'c> {
                     self.copy.region,
                     self.place.region.get(),
                     "value {at} is being resolved inside a copied region whose gather \
-                     has not run; `model_exec::fire::walk` brackets a copied region's \
+                     has not run; `poem_exec::fire::walk` brackets a copied region's \
                      nodes and this is what says the bracket was lost",
                 );
                 let Some(key) = self.address(handle.buf) else {

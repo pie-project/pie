@@ -1,4 +1,4 @@
-use model_dsl::{Dtype, Weight};
+use poem_dsl::{Dtype, Weight};
 
 pub use crate::adapter::Adapters;
 

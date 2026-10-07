@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use engine::fire::{FoldLen, RsVerb};
-use model_ir::{Attention, Def, Dim, Dtype, Operation, Trace, Ty, ValueId};
+use poem_ir::{Attention, Def, Dim, Dtype, Operation, Trace, Ty, ValueId};
 
 use crate::error::{Fault, Result};
 
@@ -78,7 +78,7 @@ fn row_of(trace: &Trace, id: ValueId) -> Result<(u32, Dtype, u64)> {
             _ => 1,
         })
         .product();
-    let element = model_compiler::arena::elem_bytes(*dtype).ok_or_else(|| Fault::Unbound {
+    let element = poem_compiler::arena::elem_bytes(*dtype).ok_or_else(|| Fault::Unbound {
         what: format!("value {}, whose element {dtype:?} has no size", id.0),
     })?;
     Ok((

@@ -9,7 +9,7 @@
 use kernels_xla::{
     Bank, Ctx, DecodePlan, KvPool, PrefillPlan, RaggedTensor, RecurrentPool, Tensor,
 };
-use model_ir::{Def, Dim, Dtype, GeomKind, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
+use poem_ir::{Def, Dim, Dtype, GeomKind, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
 
 use crate::store::{CachePool, CacheTable};
 use crate::trace::Handles;
@@ -62,7 +62,7 @@ pub struct PatchBindings {
     pub embed_weights: Option<Tensor>,
 }
 
-/// One packing of a fire's rows by attention group (`model_exec::fire::pack`),
+/// One packing of a fire's rows by attention group (`poem_exec::fire::pack`),
 /// for the selection of lanes a plan's grouped attention reads.
 #[derive(Clone, Copy, Debug)]
 pub struct PackingBindings {
@@ -93,7 +93,7 @@ pub struct DitBindings {
     pub self_cond_rows: Option<Tensor>,
     pub self_cond_weights: Option<Tensor>,
     pub group_of_lane: Option<Tensor>,
-    pub packings: Vec<(model_ir::Selection, PackingBindings)>,
+    pub packings: Vec<(poem_ir::Selection, PackingBindings)>,
     pub ports: Vec<PortBinding>,
     /// The fire's attention class table (`count x count` u8) and its count,
     /// when a lane states classes.
@@ -525,7 +525,7 @@ impl<'c> Run<'c> {
         let missing = |what: &str| -> ! {
             panic!("value {at} reads {which:?} ({what}), which this fire staged none of")
         };
-        let packing = |select: model_ir::Selection| -> PackingBindings {
+        let packing = |select: poem_ir::Selection| -> PackingBindings {
             dit.packings
                 .iter()
                 .find(|(have, _)| *have == select)
@@ -729,4 +729,4 @@ impl<'c> Run<'c> {
     }
 }
 
-impl model_exec::fire::fallback::Serve for Run<'_> {}
+impl poem_exec::fire::fallback::Serve for Run<'_> {}

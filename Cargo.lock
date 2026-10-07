@@ -579,7 +579,7 @@ name = "checkpoint-dsl"
 version = "0.5.4"
 dependencies = [
  "checkpoint",
- "model-dsl",
+ "pie-poem-dsl",
  "tempfile",
  "ztensor",
 ]
@@ -1635,8 +1635,8 @@ name = "engine"
 version = "0.5.4"
 dependencies = [
  "eta-compiler",
- "model-ir",
  "pie-eta-ir",
+ "pie-poem-ir",
  "rustix",
  "serde",
  "serde_json",
@@ -1656,12 +1656,12 @@ dependencies = [
  "kernels-cuda",
  "libc",
  "memmap2",
- "model-compiler",
- "model-dsl",
- "model-exec",
- "model-ir",
  "models",
  "pie-eta-ir",
+ "pie-poem-compiler",
+ "pie-poem-dsl",
+ "pie-poem-exec",
+ "pie-poem-ir",
  "serde_json",
  "tempfile",
  "tokenizer",
@@ -1683,16 +1683,16 @@ dependencies = [
  "eta-exec",
  "kernels-metal",
  "libc",
- "model-compiler",
- "model-dsl",
- "model-exec",
- "model-ir",
  "models",
  "objc2",
  "objc2-foundation",
  "objc2-metal",
  "pie-eta-dsl",
  "pie-eta-ir",
+ "pie-poem-compiler",
+ "pie-poem-dsl",
+ "pie-poem-exec",
+ "pie-poem-ir",
  "serde_json",
  "tokenizer",
  "toml 1.1.4+spec-1.1.0",
@@ -1712,11 +1712,11 @@ dependencies = [
  "kernels-vulkan",
  "libc",
  "memmap2",
- "model-compiler",
- "model-exec",
- "model-ir",
  "naga",
  "pie-eta-ir",
+ "pie-poem-compiler",
+ "pie-poem-exec",
+ "pie-poem-ir",
  "toml 1.1.4+spec-1.1.0",
  "tracing",
 ]
@@ -1733,11 +1733,11 @@ dependencies = [
  "kernels-wgpu",
  "libc",
  "memmap2",
- "model-compiler",
- "model-exec",
- "model-ir",
  "naga",
  "pie-eta-ir",
+ "pie-poem-compiler",
+ "pie-poem-exec",
+ "pie-poem-ir",
  "toml 1.1.4+spec-1.1.0",
  "tracing",
  "web-std",
@@ -1757,13 +1757,13 @@ dependencies = [
  "kernels-xla",
  "libc",
  "libloading 0.9.0",
- "model-compiler",
- "model-dsl",
- "model-exec",
- "model-ir",
  "models",
  "pie-dtype",
  "pie-eta-ir",
+ "pie-poem-compiler",
+ "pie-poem-dsl",
+ "pie-poem-exec",
+ "pie-poem-ir",
  "prost",
  "serde_json",
  "tokenizer",
@@ -3084,50 +3084,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "model-compiler"
-version = "0.5.4"
-dependencies = [
- "model-dsl",
- "model-ir",
- "models",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "model-dsl"
-version = "0.5.4"
-dependencies = [
- "model-ir",
-]
-
-[[package]]
-name = "model-exec"
-version = "0.5.4"
-dependencies = [
- "model-compiler",
- "model-dsl",
- "model-ir",
- "models",
-]
-
-[[package]]
-name = "model-ir"
-version = "0.5.4"
-dependencies = [
- "pie-dtype",
- "serde",
-]
-
-[[package]]
 name = "models"
 version = "0.5.4"
 dependencies = [
  "chat-template",
  "checkpoint",
  "checkpoint-dsl",
- "model-compiler",
- "model-dsl",
- "model-ir",
+ "pie-poem-compiler",
+ "pie-poem-dsl",
+ "pie-poem-ir",
  "serde_json",
  "tokenizer",
  "ztensor",
@@ -3785,9 +3750,9 @@ dependencies = [
  "getrandom 0.3.4",
  "getrandom 0.4.3",
  "js-sys",
- "model-ir",
  "models",
  "pie-client-api",
+ "pie-poem-ir",
  "rmp-serde",
  "runtime",
  "serde",
@@ -3856,6 +3821,41 @@ dependencies = [
 
 [[package]]
 name = "pie-eta-ir"
+version = "0.5.4"
+dependencies = [
+ "pie-dtype",
+ "serde",
+]
+
+[[package]]
+name = "pie-poem-compiler"
+version = "0.5.4"
+dependencies = [
+ "models",
+ "pie-poem-dsl",
+ "pie-poem-ir",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pie-poem-dsl"
+version = "0.5.4"
+dependencies = [
+ "pie-poem-ir",
+]
+
+[[package]]
+name = "pie-poem-exec"
+version = "0.5.4"
+dependencies = [
+ "models",
+ "pie-poem-compiler",
+ "pie-poem-dsl",
+ "pie-poem-ir",
+]
+
+[[package]]
+name = "pie-poem-ir"
 version = "0.5.4"
 dependencies = [
  "pie-dtype",
@@ -4621,7 +4621,6 @@ dependencies = [
  "ipnet",
  "lru",
  "media",
- "model-ir",
  "models",
  "opentelemetry 0.32.0",
  "opentelemetry-otlp",
@@ -4629,6 +4628,7 @@ dependencies = [
  "parking_lot",
  "pie-client-api",
  "pie-eta-ir",
+ "pie-poem-ir",
  "rand 0.10.2",
  "rustc-hash 2.1.3",
  "serde",
@@ -7318,10 +7318,10 @@ dependencies = [
  "futures",
  "ids",
  "mimalloc",
- "model-ir",
  "models",
  "pie-client",
  "pie-client-api",
+ "pie-poem-ir",
  "reqwest",
  "rmp-serde",
  "runtime",

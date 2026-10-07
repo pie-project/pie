@@ -1,10 +1,10 @@
 use checkpoint::contract::{Expr, ModelContract, TensorContract, TensorType};
 use checkpoint::types::Encoding;
-use model_dsl::{Dtype, Shard, Weight};
+use poem_dsl::{Dtype, Shard, Weight};
 
 use super::model::{Kda, Mixer, Mla, Mlp, Model};
 use checkpoint_dsl::{Builder, Error, encoding, extents, scaling};
-use model_dsl::Platform;
+use poem_dsl::Platform;
 
 const HF_EMBED: &str = "language_model.model.embed_tokens.weight";
 
@@ -418,7 +418,7 @@ fn packed_bank(
     b.extend([
         TensorContract::inferred(w.name.clone(), codes, encoding(Dtype::Mxfp4)),
         TensorContract::new(
-            model_dsl::scales_name(&w.name),
+            poem_dsl::scales_name(&w.name),
             scales,
             counted,
             encoding(Dtype::E8m0),

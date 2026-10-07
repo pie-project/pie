@@ -21,7 +21,7 @@ use engine_metal::run::CachePool;
 use engine_metal::store::kv::{Facts, Paging, SpaceFacts};
 use engine_metal::store::{Move, Pools, Seats, SpaceSeat};
 use kernels_metal::Tensor;
-use model_ir::{CacheRow, Dtype, Platform, Trace};
+use poem_ir::{CacheRow, Dtype, Platform, Trace};
 
 const HEADS: usize = 2; // kv_heads
 const PAGE_SIZE: u32 = 8;

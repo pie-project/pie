@@ -1,4 +1,4 @@
-use model_dsl::Platform;
+use poem_dsl::Platform;
 
 fn main() {
     let mut args = std::env::args().skip(1);

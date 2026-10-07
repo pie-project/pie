@@ -3,7 +3,7 @@ name = "models"
 version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "The model catalog of the menlo stack: each model is a declaration (weights, dims, cache spaces) plus a forward pass written in model-dsl, an import contract saying how a checkpoint's bytes become its weights, and a chat template saying how a turn of conversation is written and read back."
+description = "The model catalog of the menlo stack: each model is a declaration (weights, dims, cache spaces) plus a forward pass written in poem-dsl, an import contract saying how a checkpoint's bytes become its weights, and a chat template saying how a turn of conversation is written and read back."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -14,8 +14,8 @@ path = "src/lib.rs"
 
 [dependencies]
 chat-template = { path = "../chat-template" }
-model-dsl = { path = "../model-dsl" }
-model-ir = { path = "../model-ir" }
+poem-dsl = { package = "pie-poem-dsl", path = "../poem-dsl" }
+poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 checkpoint = { path = "../checkpoint" }
 checkpoint-dsl = { path = "../checkpoint-dsl" }
 serde_json = "1"
@@ -23,8 +23,8 @@ tokenizer = { path = "../tokenizer" }
 ztensor = { workspace = true }
 
 [dev-dependencies]
-model-compiler = { path = "../model-compiler" }
-model-ir = { path = "../model-ir" }
+poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
+poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 ztensor-compat = { workspace = true }
 
 [lints]

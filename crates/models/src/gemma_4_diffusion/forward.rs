@@ -1,4 +1,4 @@
-use model_dsl::{ForwardHybrid, HybridSpec, Input, Value};
+use poem_dsl::{ForwardHybrid, HybridSpec, Input, Value};
 
 pub use crate::gemma_4::forward::Facts;
 

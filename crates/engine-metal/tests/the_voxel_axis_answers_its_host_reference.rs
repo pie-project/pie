@@ -4,7 +4,7 @@ use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::spatial::{attn, conv, norm, resample, rule};
-use model_ir::Dtype;
+use poem_ir::Dtype;
 
 type Case = (
     rule::GridRule,

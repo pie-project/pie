@@ -7,7 +7,7 @@ use common_dit::{
 };
 use engine::Engine;
 use engine::fire::LaneStream;
-use model_dsl::{
+use poem_dsl::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Stream, Trace, Value, Weight,
     ops, seam, trace_hybrid,
 };

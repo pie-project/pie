@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use engine_cuda::experts::{Budgets, Plan};
 use engine_cuda::{Boot, Graphs, Knobs, Lane, Shell, World};
-use model_compiler::Budget;
-use model_dsl::{Platform, Request};
+use poem_compiler::Budget;
+use poem_dsl::{Platform, Request};
 
 fn argmax(logits: &[f32]) -> u32 {
     let mut best = 0usize;

@@ -3,7 +3,7 @@ use checkpoint::contract::{Expr, ModelContract, TensorType, UnaryOp};
 use super::model::{Head, Mixer, Mlp, Model};
 use super::rotation;
 use checkpoint_dsl::{Builder, Error, extents};
-use model_dsl::Platform;
+use poem_dsl::Platform;
 
 #[derive(Clone, Copy)]
 enum Layout {
@@ -714,7 +714,7 @@ mod tests {
         use checkpoint::file::read::parse_metadata;
         use checkpoint::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
         use checkpoint_dsl::Builder;
-        use model_dsl::{Dtype, Platform, Weight};
+        use poem_dsl::{Dtype, Platform, Weight};
 
         // Tiny GDN geometry: 2 v-heads, hidden 4. `in_ba` is `[2*v_heads, hidden]`,
         // its first `v_heads` rows beta, its last `v_heads` rows alpha.

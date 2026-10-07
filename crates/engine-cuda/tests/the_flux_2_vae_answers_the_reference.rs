@@ -5,11 +5,11 @@ use std::time::Instant;
 
 use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
-use model_compiler::{Budget, VoxelLadder};
-use model_dsl::{Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, trace_hybrid};
 use models::flux_2::forward::Facts;
 use models::flux_2::model::{IN_CHANNELS, Model};
 use models::flux_2::vae;
+use poem_compiler::{Budget, VoxelLadder};
+use poem_dsl::{Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, trace_hybrid};
 
 struct OneArm {
     model: Model,
@@ -119,7 +119,7 @@ fn fire(
     drop(src);
     let contract = &contract;
     let word =
-        Facts::of(&model_dsl::Request::new(1, false).on_stream(model_dsl::Stream::Image)).word();
+        Facts::of(&poem_dsl::Request::new(1, false).on_stream(poem_dsl::Stream::Image)).word();
     let started = Instant::now();
     let mut shell = Shell::load(Boot {
         classify: |request| Facts::of(request).word(),

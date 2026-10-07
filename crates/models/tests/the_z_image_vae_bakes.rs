@@ -3,11 +3,11 @@ use std::path::PathBuf;
 
 use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{Expr, Partition, TensorType};
-use model_dsl::{Classify, Def, Dim, Dtype, Operation, Platform, Request, Stream, Trace, Ty, seam};
-use model_ir::{GridRule, ParamLayout, Seam, Spatial};
 use models::z_image::forward::Facts;
 use models::z_image::{model, vae};
 use models::{PortKind, ReadoutKind};
+use poem_dsl::{Classify, Def, Dim, Dtype, Operation, Platform, Request, Stream, Trace, Ty, seam};
+use poem_ir::{GridRule, ParamLayout, Seam, Spatial};
 
 const TURBO: &str = "z-image-turbo-bf16-kv-bf16";
 const MINI: &str = "z-image-mini-bf16-kv-bf16";
@@ -88,7 +88,7 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
         !trace(MINI)
             .values
             .iter()
-            .any(|v| matches!(v.def, Def::Input(model_dsl::RuntimeInput::Voxels { .. }))),
+            .any(|v| matches!(v.def, Def::Input(poem_dsl::RuntimeInput::Voxels { .. }))),
         "and reads no voxel port"
     );
 }
@@ -100,7 +100,7 @@ fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
         .iter()
         .filter_map(|v| match (&v.def, &v.ty) {
             (
-                Def::Input(model_dsl::RuntimeInput::Voxels { port, channels }),
+                Def::Input(poem_dsl::RuntimeInput::Voxels { port, channels }),
                 Ty::Tensor { dtype, .. },
             ) => Some((*port, *channels, format!("{dtype:?}"))),
             _ => None,
@@ -253,7 +253,7 @@ fn the_shapes_are_the_flux_vaes() {
 
 fn each_vae_lane_has_a_class_of_its_own() {
     let plan = trace(TURBO);
-    let classes = model_dsl::resolve_classes(&plan).expect("every merge resolves");
+    let classes = poem_dsl::resolve_classes(&plan).expect("every merge resolves");
     let facts = row(TURBO).generative.as_ref().expect("facts");
     let class_of = |name: &str, stream: Stream| {
         let r = reading(facts, name);
@@ -278,25 +278,25 @@ fn each_vae_lane_has_a_class_of_its_own() {
 
 fn the_plan_bakes_against_a_voxel_ladder() {
     let plan = trace(TURBO);
-    let budget = model_compiler::Budget {
+    let budget = poem_compiler::Budget {
         max_lanes: 16,
         max_tokens: 4096,
         buckets: vec![1024, 4096],
         max_adapters: 0,
     };
-    let budgets = model_compiler::Budgets::of(budget)
-        .with_voxels(model_compiler::VoxelLadder::new(64 * 64, 1));
+    let budgets =
+        poem_compiler::Budgets::of(budget).with_voxels(poem_compiler::VoxelLadder::new(64 * 64, 1));
     let compiled =
-        model_compiler::compile_axes(&plan, &budgets, &model_compiler::DeviceProfile::default())
+        poem_compiler::compile_axes(&plan, &budgets, &poem_compiler::DeviceProfile::default())
             .unwrap_or_else(|why| panic!("does not bake: {why}"));
     assert!(compiled.voxels.is_some(), "the voxel axis has its own plan");
     let tiled: usize = compiled.regions.iter().map(|r| r.nodes.len()).sum();
     assert_eq!(tiled, plan.nodes.len(), "the regions tile the nodes once");
     assert!(
-        !model_compiler::compile(
+        !poem_compiler::compile(
             &plan,
             &budgets.tokens,
-            &model_compiler::DeviceProfile::default()
+            &poem_compiler::DeviceProfile::default()
         )
         .is_ok(),
         "and against no voxel ladder the plan is refused, not sized at zero"

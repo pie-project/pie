@@ -1,7 +1,7 @@
 //! Values the model text rows by `Tokens` on a readout-rowed path.
 //!
 //! A few plan builders state their outputs' rows as `Tokens` (or
-//! `TokensTimes(k)`) whatever their inputs' rows are (model-dsl's MoE
+//! `TokensTimes(k)`) whatever their inputs' rows are (poem-dsl's MoE
 //! routers and routed matmuls), so an MTP head that runs over `Readouts`
 //! rows feeds token-rowed routing tables, expert rows and sums into its
 //! readout-rowed residual. A GPU engine never notices: its buffers are sized
@@ -12,7 +12,7 @@
 //! chain carries through) and its handle is cut to the fire's readout rows
 //! (`Run::cut`): `k` of them for `TokensTimes(k)`.
 
-use model_ir::{Def, Dim, Operands, Trace, Ty, ValueId};
+use poem_ir::{Def, Dim, Operands, Trace, Ty, ValueId};
 
 fn lead(trace: &Trace, v: ValueId) -> Option<Dim> {
     match &trace.values.get(v.0 as usize)?.ty {

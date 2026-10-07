@@ -1,7 +1,7 @@
 use kernels_wgpu::Tensor;
-use model_compiler::{ArenaMap, FireRows};
-use model_exec::store::arena::rect;
-use model_ir::ValueId;
+use poem_compiler::{ArenaMap, FireRows};
+use poem_exec::store::arena::rect;
+use poem_ir::ValueId;
 
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
@@ -87,7 +87,7 @@ pub fn capacities(map: &ArenaMap) -> Vec<u32> {
     (0..map.placements.len())
         .map(|at| {
             let root = map.root(ValueId(at as u32));
-            let Some(model_compiler::Placement::Arena {
+            let Some(poem_compiler::Placement::Arena {
                 bytes,
                 width,
                 dtype,
@@ -96,7 +96,7 @@ pub fn capacities(map: &ArenaMap) -> Vec<u32> {
             else {
                 return 0;
             };
-            let row = width.saturating_mul(model_compiler::arena::elem_bytes(*dtype).unwrap_or(0));
+            let row = width.saturating_mul(poem_compiler::arena::elem_bytes(*dtype).unwrap_or(0));
             if row == 0 {
                 return 0;
             }

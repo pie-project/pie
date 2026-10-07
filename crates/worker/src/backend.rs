@@ -206,7 +206,7 @@ fn land(
     snapshot_dir: &Path,
     budgets: engine::Budgets,
     residency: engine::Residency,
-    platform: model_ir::Platform,
+    platform: poem_ir::Platform,
     component: crate::executor::ModelComponent,
     frames_in_flight: u8,
     sku: Option<&str>,
@@ -327,17 +327,15 @@ pub(crate) fn create_engine_backend_group(
     let sku = match sku {
         Some(named) => Some(named),
         None if ranks > 1 => {
-            let base = runtime::engine::load::identify(snapshot_dir, model_ir::Platform::Cuda)?;
+            let base = runtime::engine::load::identify(snapshot_dir, poem_ir::Platform::Cuda)?;
             widened = format!("{base}-tp{ranks}");
-            runtime::engine::load::trace(&widened, model_ir::Platform::Cuda).with_context(
-                || {
-                    format!(
-                        "{snapshot_dir:?} is `{base}`, and this build ships no {ranks}-rank \
+            runtime::engine::load::trace(&widened, poem_ir::Platform::Cuda).with_context(|| {
+                format!(
+                    "{snapshot_dir:?} is `{base}`, and this build ships no {ranks}-rank \
                          row for it (`{widened}`); add one to the catalog or serve it on \
                          one device"
-                    )
-                },
-            )?;
+                )
+            })?;
             Some(widened.as_str())
         }
         None => None,
@@ -354,7 +352,7 @@ pub(crate) fn create_engine_backend_group(
         snapshot_dir,
         cuda_budgets(opts, adapters.seats(), patch_ceilings, voxel_ceilings),
         residency,
-        model_ir::Platform::Cuda,
+        poem_ir::Platform::Cuda,
         component,
         frames_in_flight,
         sku,
@@ -399,7 +397,7 @@ pub(crate) fn create_engine_backend(
     let (mut backend, budgets, platform): (
         runtime::engine::EngineBox,
         engine::Budgets,
-        model_ir::Platform,
+        poem_ir::Platform,
     ) = match options {
         #[cfg(not(any(
             feature = "cuda",
@@ -419,7 +417,7 @@ pub(crate) fn create_engine_backend(
             (
                 backend,
                 cuda_budgets(opts, adapters.seats(), patch_ceilings, voxel_ceilings),
-                model_ir::Platform::Cuda,
+                poem_ir::Platform::Cuda,
             )
         }
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
@@ -466,7 +464,7 @@ pub(crate) fn create_engine_backend(
                     max_voxels: None,
                     max_clips: None,
                 },
-                model_ir::Platform::Metal,
+                poem_ir::Platform::Metal,
             )
         }
         #[cfg(feature = "vulkan")]
@@ -499,7 +497,7 @@ pub(crate) fn create_engine_backend(
                     max_voxels: None,
                     max_clips: None,
                 },
-                model_ir::Platform::Vulkan,
+                poem_ir::Platform::Vulkan,
             )
         }
         #[cfg(feature = "wgpu")]
@@ -543,7 +541,7 @@ pub(crate) fn create_engine_backend(
                     max_voxels: None,
                     max_clips: None,
                 },
-                model_ir::Platform::Wgpu,
+                poem_ir::Platform::Wgpu,
             )
         }
         #[cfg(feature = "xla")]
@@ -580,7 +578,7 @@ pub(crate) fn create_engine_backend(
                     max_voxels: None,
                     max_clips: None,
                 },
-                model_ir::Platform::Xla,
+                poem_ir::Platform::Xla,
             )
         }
     };

@@ -1,8 +1,8 @@
 use kernels_xla::{Tensor, elemwise};
-use model_exec::{DispatchElementwise, KernelError};
-use model_ir::{Elementwise, ModulateForm, MropeForm, NormKind, RopeForm, ValueId};
+use poem_exec::{DispatchElementwise, KernelError};
+use poem_ir::{Elementwise, ModulateForm, MropeForm, NormKind, RopeForm, ValueId};
 
-use model_ir::Operands;
+use poem_ir::Operands;
 
 use crate::run::Run;
 
@@ -482,7 +482,7 @@ impl Run<'_> {
                 self.tensor(*weight),
                 *head_dim,
                 *eps,
-                matches!(act, model_ir::GateActivation::Sigmoid),
+                matches!(act, poem_ir::GateActivation::Sigmoid),
                 self.tensor(*y),
             ),
             Elementwise::RmsnormGatedBy {
@@ -838,7 +838,7 @@ impl Run<'_> {
     /// one by one, so they need not be stacked planes.
     fn stacked_blocks(
         &self,
-        blocks: &[model_ir::ValueId],
+        blocks: &[poem_ir::ValueId],
         y: Tensor,
     ) -> Result<Vec<Tensor>, kernels_xla::Error> {
         let _ = y;

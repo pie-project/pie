@@ -1,8 +1,8 @@
 use engine_cuda::window::Windows;
-use model_compiler::{Budget, CompiledModel, DeviceProfile, compile};
-use model_dsl::Platform;
-use model_exec::fire::{WindowTable, fallback};
-use model_ir::Trace;
+use poem_compiler::{Budget, CompiledModel, DeviceProfile, compile};
+use poem_dsl::Platform;
+use poem_exec::fire::{WindowTable, fallback};
+use poem_ir::Trace;
 
 fn test_slots() -> engine_cuda::window::Slots {
     engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 2, 512)
@@ -50,7 +50,7 @@ fn a_window_p4_promised_whole_is_still_a_bake_integrity_refusal() {
     let count = compiled.classes.classes.len();
     let ascending = WindowTable::new(
         (0..count)
-            .map(|at| model_exec::fire::ClassWindow {
+            .map(|at| poem_exec::fire::ClassWindow {
                 row_offset: at as u32,
                 rows: 1,
                 lane_offset: at as u32,
@@ -63,19 +63,19 @@ fn a_window_p4_promised_whole_is_still_a_bake_integrity_refusal() {
         .template()
         .iter()
         .find(|region| {
-            fallback::promised(&compiled, model_ir::RowAxis::Tokens, region)
+            fallback::promised(&compiled, poem_ir::RowAxis::Tokens, region)
                 && ascending.span(&region.mask).is_err()
         })
         .expect("some seated window is not an interval of the ascending order");
     assert_eq!(
-        fallback::bound(&compiled, model_ir::RowAxis::Tokens, &seated.mask),
+        fallback::bound(&compiled, poem_ir::RowAxis::Tokens, &seated.mask),
         1
     );
 
     let refusal = Windows::of(
         &plan,
         &compiled,
-        model_ir::PerAxis::new([&ascending, &WindowTable::default(), &WindowTable::default()]),
+        poem_ir::PerAxis::new([&ascending, &WindowTable::default(), &WindowTable::default()]),
         &indptr(&vec![1; count]),
         engine_cuda::window::Copies::off(),
         test_slots(),

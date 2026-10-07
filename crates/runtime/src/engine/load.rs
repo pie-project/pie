@@ -8,7 +8,7 @@ use checkpoint::file::serve::stamp_of;
 use checkpoint::file::zt;
 use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
 
-pub use model_ir::{Platform, Trace};
+pub use poem_ir::{Platform, Trace};
 
 pub fn trace(sku: &str, platform: Platform) -> Result<Trace> {
     let sku = models::sku(sku).ok_or_else(|| anyhow!("{}", no_such_sku(sku)))?;

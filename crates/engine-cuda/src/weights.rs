@@ -14,7 +14,7 @@ use checkpoint::types::{ScaleForm, TensorId};
 use kernels_cuda::Tensor;
 use kernels_cuda::linear::moe::GroupSeat;
 use kernels_cuda::linear::quant::OffsetKind;
-use model_ir::{Dtype, ParamSource, Trace};
+use poem_ir::{Dtype, ParamSource, Trace};
 
 use crate::device::Buffer;
 use crate::error::{Fault, Result};
@@ -40,7 +40,7 @@ pub struct Weights {
     decoded: Vec<Buffer>,
 }
 
-fn decodes_at_load(param: &model_ir::Param) -> bool {
+fn decodes_at_load(param: &poem_ir::Param) -> bool {
     param.dtype == Dtype::U8g64 && param.shape.len() == 2
 }
 
@@ -100,7 +100,7 @@ fn banks(trace: &Trace, places: &[Place]) -> BTreeMap<String, Bank> {
                     slot,
                     rows,
                     cols,
-                    elem: model_compiler::arena::elem_bytes(param.dtype).unwrap_or(0),
+                    elem: poem_compiler::arena::elem_bytes(param.dtype).unwrap_or(0),
                 },
             )
         })
@@ -134,7 +134,7 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
                 }
                 other => {
                     let element =
-                        model_compiler::arena::elem_bytes(other).ok_or_else(|| Fault::Param {
+                        poem_compiler::arena::elem_bytes(other).ok_or_else(|| Fault::Param {
                             name: param.name.clone(),
                             why: "is declared in a packed storage element that has no \
                                   element size",
@@ -927,7 +927,7 @@ impl Weights {
     pub fn rotate(
         &mut self,
         trace: &Trace,
-        compiled: &model_compiler::CompiledModel,
+        compiled: &poem_compiler::CompiledModel,
     ) -> Result<bool> {
         let Some(tier) = self.experts.as_ref() else {
             return Ok(false);
@@ -946,7 +946,7 @@ impl Weights {
         if candidates.is_empty() {
             return Ok(false);
         }
-        let schedule = model_compiler::prefetch::Schedule::of(trace);
+        let schedule = poem_compiler::prefetch::Schedule::of(trace);
         let rotation = match crate::rotate::Rotation::plan(
             &schedule,
             compiled,
@@ -1149,7 +1149,7 @@ fn packed(
         Dtype::U4g64 | Dtype::U4g32 | Dtype::U4g64tiled => place.width.div_ceil(2),
         Dtype::U2g32 | Dtype::U2g64 | Dtype::U2g128 => place.width.div_ceil(4),
         Dtype::U8g64 => place.width,
-        other => model_compiler::arena::elem_bytes(other)
+        other => poem_compiler::arena::elem_bytes(other)
             .and_then(|element| u32::try_from(element).ok())
             .map(|element| place.width.saturating_mul(element))
             .ok_or_else(|| Fault::Param {
@@ -1278,7 +1278,7 @@ impl TensorSink for Landing<'_> {
 
 #[cfg(test)]
 mod tests {
-    use model_dsl::Platform;
+    use poem_dsl::Platform;
 
     use super::*;
 

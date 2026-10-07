@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use model_ir::{Def, Linear, Operation, ParamSource, Trace, ValueId};
+use poem_ir::{Def, Linear, Operation, ParamSource, Trace, ValueId};
 
 use crate::device::graph::Event;
 use crate::device::{Buffer, Pinned, copy_any};
@@ -275,7 +275,7 @@ impl Ranking {
                 routed: false,
             });
         }
-        let schedule = model_compiler::prefetch::Schedule::of(trace);
+        let schedule = poem_compiler::prefetch::Schedule::of(trace);
         let rank: BTreeMap<usize, usize> = schedule
             .order()
             .into_iter()
@@ -1886,7 +1886,7 @@ fn pinned_address_of(seat: &Seat, expert: u32) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use model_dsl::Platform;
+    use poem_dsl::Platform;
 
     use super::*;
 
@@ -1915,9 +1915,9 @@ mod tests {
             .params
             .iter()
             .enumerate()
-            .filter(|(_, param)| param.dtype == model_ir::Dtype::Mxfp4)
+            .filter(|(_, param)| param.dtype == poem_ir::Dtype::Mxfp4)
             .map(|(codes, param)| {
-                let scales = model_dsl::scales_name(&param.name);
+                let scales = poem_dsl::scales_name(&param.name);
                 let scales = *at
                     .get(scales.as_str())
                     .unwrap_or_else(|| panic!("`{}` declares no scales plane", param.name));

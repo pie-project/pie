@@ -335,8 +335,8 @@ pub(crate) fn lower(
         abi.len() as u32,
         abi.axes.len() as u32,
         classes as u32,
-        model_exec::fire::MAGIC,
-        model_exec::fire::ABI_VERSION,
+        poem_exec::fire::MAGIC,
+        poem_exec::fire::ABI_VERSION,
     );
     let mut handle = Buffer::zeroed(device, 8)?;
     handle.write(0, &resource_id(icb.gpuResourceID()).to_ne_bytes())?;

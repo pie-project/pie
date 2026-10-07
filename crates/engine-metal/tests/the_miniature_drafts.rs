@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use engine_metal::{Boot, Lane, Shell};
-use model_compiler::Budget;
-use model_dsl::{Classify, Platform, Request};
+use poem_compiler::Budget;
+use poem_dsl::{Classify, Platform, Request};
 
 const SKU: &str = "dsv4-flash-mtp-u4g64-u2g64-mxfp4-kv-bf16";
 const PROMPT: &[u32] = &[0, 671, 6102, 294, 8760, 344, 270, 4593, 294];

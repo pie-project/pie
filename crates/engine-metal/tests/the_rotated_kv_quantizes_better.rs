@@ -27,7 +27,7 @@ use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::elemwise::pointwise;
-use model_ir::Dtype;
+use poem_ir::Dtype;
 
 /// Deterministic integer hash (same mixer as the sibling Hadamard test), so the
 /// data is reproducible run to run with no RNG state.

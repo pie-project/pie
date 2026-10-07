@@ -1,12 +1,12 @@
 use checkpoint::contract::{Expr, ModelContract, TensorContract, TensorType};
 use checkpoint::types::{DType, Encoding};
-use model_dsl::{Dtype, Weight};
+use poem_dsl::{Dtype, Weight};
 
 use super::model::Model;
 use checkpoint_dsl::{
     Builder, Error, divided, encoding, extents, grouped, scaling, stored_encoding,
 };
-use model_dsl::Platform;
+use poem_dsl::Platform;
 
 const BANK_ROWS: u8 = 1;
 
@@ -201,7 +201,7 @@ fn banked_split(
     Ok(vec![
         TensorContract::inferred(w.name.clone(), joined(code_legs), codes.encoding),
         TensorContract::new(
-            model_dsl::scales_name(&w.name),
+            poem_dsl::scales_name(&w.name),
             joined(scale_legs),
             scaled.shape,
             scaled.encoding,
@@ -243,7 +243,7 @@ fn bank_planes(
             codes.encoding,
         ),
         TensorContract::new(
-            model_dsl::scales_name(&w.name),
+            poem_dsl::scales_name(&w.name),
             lay(Expr::src(scales).transmute(scaled.clone())),
             scaled.shape,
             scaled.encoding,

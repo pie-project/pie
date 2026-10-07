@@ -1,6 +1,6 @@
 use kernels_wgpu::linear;
-use model_exec::{DispatchLinear, KernelError};
-use model_ir::{Linear, Operands};
+use poem_exec::{DispatchLinear, KernelError};
+use poem_ir::{Linear, Operands};
 
 use crate::run::Run;
 

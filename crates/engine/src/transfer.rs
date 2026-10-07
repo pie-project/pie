@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use model_ir::Dtype;
+use poem_ir::Dtype;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MemoryDomain {

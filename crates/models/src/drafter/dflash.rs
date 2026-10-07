@@ -1,6 +1,6 @@
 use checkpoint::contract::{Expr, TensorType};
 use checkpoint_dsl::{Builder, Error, extents};
-use model_dsl::{
+use poem_dsl::{
     BlockDrafter, Dtype, HybridSpec, Input, KvSpace, Predicate, Value, Weight, ops, seam,
 };
 

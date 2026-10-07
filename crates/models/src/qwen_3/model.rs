@@ -1,5 +1,5 @@
 use crate::drafter::dflash::{self, DFlash};
-use model_dsl::{Dtype, Weight};
+use poem_dsl::{Dtype, Weight};
 
 pub struct Model {
     pub hidden: u32,
@@ -40,7 +40,7 @@ pub struct Model {
 }
 
 /// The three width-keyed RHT sign diagonals `S` (registered param banks) the
-/// Bonsai forward feeds to [`model_dsl::ops::elemwise::hadamard_signed`]. Chosen
+/// Bonsai forward feeds to [`poem_dsl::ops::elemwise::hadamard_signed`]. Chosen
 /// per site by the rotated weight's INPUT width, exactly as the fork selects by
 /// `weight->ne[0]` (oracle §6):
 ///

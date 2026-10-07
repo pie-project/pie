@@ -1,9 +1,9 @@
 use engine_cuda::window::{Copies, Windows};
-use model_compiler::{Budget, CompiledModel, DeviceProfile, FamilyCosts, compile};
-use model_dsl::Platform;
-use model_exec::fire::{Lane, compose};
+use poem_compiler::{Budget, CompiledModel, DeviceProfile, FamilyCosts, compile};
+use poem_dsl::Platform;
+use poem_exec::fire::{Lane, compose};
 
-use model_ir::Trace;
+use poem_ir::Trace;
 
 fn test_slots() -> engine_cuda::window::Slots {
     engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 2, 512)
@@ -76,7 +76,7 @@ fn the_segment_lists_are_staged_beside_the_boundaries_in_the_one_copy() {
     let mut windows = Windows::of(
         &plan,
         &grouped,
-        model_ir::PerAxis::new([fire.classes(), fire.patch_classes(), fire.voxel_classes()]),
+        poem_ir::PerAxis::new([fire.classes(), fire.patch_classes(), fire.voxel_classes()]),
         &indptr(&rows),
         Copies::off(),
         test_slots(),

@@ -16,7 +16,7 @@ use crate::tensor::Tensor;
 /// What masks or biases a ragged attention besides its segments.
 #[derive(Clone, Copy, Debug)]
 pub enum RaggedMask {
-    /// Segments only (model_ir `None` and `GroupBlockDiagonal`).
+    /// Segments only (poem_ir `None` and `GroupBlockDiagonal`).
     Segments,
     /// A row with tag `t >= 0` reads only keys tagged `t`; a negative tag
     /// reads its whole segment. One i32 per query row / key row.

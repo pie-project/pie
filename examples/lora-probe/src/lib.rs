@@ -85,7 +85,7 @@ struct Input {
     surface: String,
     /// `"lowrank"` (the served form) or `"scale"` (IA3's two-argument
     /// spelling). The scale form is REFUSED by the engine by name —
-    /// `model-ir` declares no `AdapterScale` op for a bank to be read by — so
+    /// `poem-ir` declares no `AdapterScale` op for a bank to be read by — so
     /// this exists to make that refusal reachable from a guest.
     #[serde(default = "default_form")]
     form: String,

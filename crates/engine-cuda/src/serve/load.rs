@@ -1,4 +1,4 @@
-use model_compiler::{Budget, Budgets, CompiledModel, DeviceProfile};
+use poem_compiler::{Budget, Budgets, CompiledModel, DeviceProfile};
 
 use crate::arena::Arena;
 use crate::device::Context;
@@ -49,21 +49,19 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     } else {
         Vec::new()
     };
-    boot.trace = model_ir::fuse::residual_norm(boot.trace.clone());
+    boot.trace = poem_ir::fuse::residual_norm(boot.trace.clone());
     if boot.knobs.diagnostics.fuse_chains {
-        boot.trace = model_ir::fuse::residual_chains(boot.trace.clone());
-        boot.trace = model_ir::fuse::gemm_epilogues(boot.trace.clone());
-        boot.trace = model_ir::fuse::modulation(boot.trace.clone());
-        boot.trace = model_ir::fuse::q_norm_rope(boot.trace.clone());
-        boot.trace = model_ir::fuse::embed_select(boot.trace.clone());
+        boot.trace = poem_ir::fuse::residual_chains(boot.trace.clone());
+        boot.trace = poem_ir::fuse::gemm_epilogues(boot.trace.clone());
+        boot.trace = poem_ir::fuse::modulation(boot.trace.clone());
+        boot.trace = poem_ir::fuse::q_norm_rope(boot.trace.clone());
+        boot.trace = poem_ir::fuse::embed_select(boot.trace.clone());
     }
     if boot.knobs.diagnostics.trace_census {
         let mut census: std::collections::BTreeMap<&'static str, usize> =
             std::collections::BTreeMap::new();
         for node in &boot.trace.nodes {
-            *census
-                .entry(model_ir::Operands::name(&node.op))
-                .or_insert(0) += 1;
+            *census.entry(poem_ir::Operands::name(&node.op)).or_insert(0) += 1;
         }
         eprintln!(
             "[trace-census] {} nodes: {census:?}",
@@ -119,8 +117,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             })
             .unwrap_or(u64::MAX);
         let budget = budget_at(tokens);
-        let Ok(compiled) =
-            model_compiler::compile_axes(&boot.trace, &budgets_at(&budget), &profile)
+        let Ok(compiled) = poem_compiler::compile_axes(&boot.trace, &budgets_at(&budget), &profile)
         else {
             return u64::MAX;
         };
@@ -150,7 +147,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         boot.budget = budget_at(tokens);
     }
     let budgets = budgets_at(&boot.budget);
-    let compiled = model_compiler::compile_axes(&boot.trace, &budgets, &profile)?;
+    let compiled = poem_compiler::compile_axes(&boot.trace, &budgets, &profile)?;
     if boot.knobs.diagnostics.arm_trace {
         let mut streams: std::collections::BTreeMap<u32, Vec<String>> =
             std::collections::BTreeMap::new();
@@ -159,7 +156,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 .trace
                 .nodes
                 .get(region.nodes.start as usize)
-                .map_or("?", |node| model_ir::Operands::name(&node.op));
+                .map_or("?", |node| poem_ir::Operands::name(&node.op));
             if op.starts_with("attention.") {
                 streams.entry(region.stream).or_default().push(format!(
                     "r{at}:{}:{:?}",
@@ -193,13 +190,13 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         );
         for (value, span, offset, bytes) in slots.iter().take(16) {
             let what = match &boot.trace.values[value.0 as usize].def {
-                model_ir::Def::Op(node) => {
-                    model_ir::Operands::name(&boot.trace.nodes[*node as usize].op).to_string()
+                poem_ir::Def::Op(node) => {
+                    poem_ir::Operands::name(&boot.trace.nodes[*node as usize].op).to_string()
                 }
                 other => format!("{other:?}").chars().take(20).collect(),
             };
             let rows = match &compiled.arena.placements[value.0 as usize] {
-                model_compiler::arena::Placement::Arena {
+                poem_compiler::arena::Placement::Arena {
                     rows, width, dtype, ..
                 } => format!("{rows:?} x {width} {dtype:?}"),
                 _ => String::new(),
@@ -251,7 +248,7 @@ fn refit(
         Some(out) => kv::width_of(&boot.trace, out)?.saturating_mul(4),
         None => 0,
     };
-    let score_values: Vec<model_ir::ValueId> =
+    let score_values: Vec<poem_ir::ValueId> =
         exports.scores.iter().map(|export| export.value).collect();
     let score_heads = score_heads(&boot.trace, &exports);
     let (asked_lanes, asked_tokens) = (boot.budget.max_lanes, boot.budget.max_tokens);
@@ -289,7 +286,7 @@ fn refit(
     let working_at = |lanes: u32, tokens: u32, scoped: bool| -> u64 {
         let budget = budget_at(lanes, tokens);
         let lanes = budget.max_lanes;
-        let Ok(compiled) = model_compiler::compile_axes(&boot.trace, &budgets_at(&budget), profile)
+        let Ok(compiled) = poem_compiler::compile_axes(&boot.trace, &budgets_at(&budget), profile)
         else {
             return u64::MAX;
         };
@@ -391,22 +388,22 @@ fn refit(
     );
     boot.budget = budget_at(lanes, tokens);
     let budgets = budgets_at(&boot.budget);
-    let compiled = model_compiler::compile_axes(&boot.trace, &budgets, profile)?;
+    let compiled = poem_compiler::compile_axes(&boot.trace, &budgets, profile)?;
     let planes = decoded_weight_planes(&boot.trace, &compiled, table);
     Ok((compiled, budgets, tiles_of(&planes, scoped)))
 }
 
 /// The query heads a score export carries per layer, zero when none is.
-fn score_heads(trace: &model_ir::Trace, exports: &Exports) -> u32 {
+fn score_heads(trace: &poem_ir::Trace, exports: &Exports) -> u32 {
     exports
         .scores
         .first()
         .and_then(|export| match &trace.values[export.value.0 as usize].ty {
-            model_ir::Ty::Tensor { shape, .. } => shape.get(1).and_then(|dim| match dim {
-                model_ir::Dim::Const(heads) => u32::try_from(*heads).ok(),
+            poem_ir::Ty::Tensor { shape, .. } => shape.get(1).and_then(|dim| match dim {
+                poem_ir::Dim::Const(heads) => u32::try_from(*heads).ok(),
                 _ => None,
             }),
-            model_ir::Ty::Struct(_) => None,
+            poem_ir::Ty::Struct(_) => None,
         })
         .unwrap_or(0)
 }
@@ -434,7 +431,7 @@ impl Shell {
         let decode_dense = landing_requests(boot.classify, &compiled.classes)
             .iter()
             .flatten()
-            .any(model_ir::Request::denoise);
+            .any(poem_ir::Request::denoise);
         let decoded_dense = if decode_dense {
             crate::weights::decoded_dense_bytes(&boot.trace)
         } else {
@@ -495,9 +492,9 @@ impl Shell {
         let mut wants_switch = false;
         for region in &compiled.regions {
             match region.lowering {
-                model_compiler::Lowering::AlwaysLaunch => {}
-                model_compiler::Lowering::If => wants_if = true,
-                model_compiler::Lowering::Switch { .. } => wants_switch = true,
+                poem_compiler::Lowering::AlwaysLaunch => {}
+                poem_compiler::Lowering::If => wants_if = true,
+                poem_compiler::Lowering::Switch { .. } => wants_switch = true,
             }
         }
         if wants_if || wants_switch {
@@ -561,7 +558,7 @@ impl Shell {
                     !requests.is_empty()
                         && requests.iter().all(|request| {
                             !request.denoise()
-                                && request.stream() == model_ir::Stream::Text
+                                && request.stream() == poem_ir::Stream::Text
                                 && request.reading() == 0
                         })
                         && !feeds
@@ -618,16 +615,16 @@ impl Shell {
             .caches
             .iter()
             .filter_map(|row| match row {
-                model_ir::CacheRow::Kv { space, .. } => Some(*space as usize + 1),
-                model_ir::CacheRow::State { .. } => None,
+                poem_ir::CacheRow::Kv { space, .. } => Some(*space as usize + 1),
+                poem_ir::CacheRow::State { .. } => None,
             })
             .max()
             .unwrap_or(0);
         let patch_seat = boot.patches.as_ref().and_then(|ladder| {
             boot.trace.values.iter().find_map(|decl| {
                 let (
-                    model_ir::Def::Input(model_ir::RuntimeInput::Patches),
-                    model_ir::Ty::Tensor { shape, dtype },
+                    poem_ir::Def::Input(poem_ir::RuntimeInput::Patches),
+                    poem_ir::Ty::Tensor { shape, dtype },
                 ) = (&decl.def, &decl.ty)
                 else {
                     return None;
@@ -636,38 +633,38 @@ impl Shell {
                     .iter()
                     .skip(1)
                     .map(|dim| match dim {
-                        model_ir::Dim::Const(n) => *n,
+                        poem_ir::Dim::Const(n) => *n,
                         _ => 1,
                     })
                     .product();
-                let element = model_compiler::arena::elem_bytes(*dtype).unwrap_or(0);
+                let element = poem_compiler::arena::elem_bytes(*dtype).unwrap_or(0);
                 Some(crate::inputs::PatchSeat {
                     rows: u64::from(ladder.max_patches),
                     row_bytes: width * element,
                     images: u64::from(ladder.max_images),
                     dtype: *dtype,
-                    embed_taps: declared_width(&boot.trace, model_ir::RuntimeInput::PatchEmbedRows),
+                    embed_taps: declared_width(&boot.trace, poem_ir::RuntimeInput::PatchEmbedRows),
                     embed_weights: declared_width(
                         &boot.trace,
-                        model_ir::RuntimeInput::PatchEmbedWeights,
+                        poem_ir::RuntimeInput::PatchEmbedWeights,
                     ) > 0,
                 })
             })
         });
         let self_cond_taps = u32::try_from(declared_width(
             &boot.trace,
-            model_ir::RuntimeInput::SelfCondRows,
+            poem_ir::RuntimeInput::SelfCondRows,
         ))
         .unwrap_or(u32::MAX);
         let mrope_seat = boot.trace.values.iter().any(|decl| {
             matches!(
                 decl.def,
-                model_ir::Def::Input(model_ir::RuntimeInput::MropePositions)
+                poem_ir::Def::Input(poem_ir::RuntimeInput::MropePositions)
             )
         });
         let patch_fold = patch_fold(&boot.trace);
         let voxels = match boot.voxels.as_ref() {
-            Some(ladder) if compiled.order_for(model_ir::RowAxis::Voxels).is_some() => Some(
+            Some(ladder) if compiled.order_for(poem_ir::RowAxis::Voxels).is_some() => Some(
                 crate::voxels::Store::reserve(crate::voxels::Seat::of(&boot.trace, ladder))?,
             ),
             _ => None,
@@ -675,7 +672,7 @@ impl Shell {
         let drops_patch_rows = boot.trace.nodes.iter().any(|node| {
             matches!(
                 node.op,
-                model_ir::Operation::Layout(model_ir::Layout::ScatterLiveRows { .. })
+                poem_ir::Operation::Layout(poem_ir::Layout::ScatterLiveRows { .. })
             )
         });
         if let Some(value) = feeds.unlanded.first() {
@@ -701,8 +698,8 @@ impl Shell {
             &facts,
             compiled.classes.classes.len(),
             compiled.template().len(),
-            model_exec::fire::max_runs(&compiled),
-            model_exec::fire::fragmentable(&compiled),
+            poem_exec::fire::max_runs(&compiled),
+            poem_exec::fire::fragmentable(&compiled),
             device.device(),
             boot.runahead,
             patch_seat,
@@ -717,7 +714,7 @@ impl Shell {
         let exports = Exports::of(&boot.trace, &compiled)?;
 
         let score_heads = score_heads(&boot.trace, &exports);
-        let score_values: Vec<model_ir::ValueId> =
+        let score_values: Vec<poem_ir::ValueId> =
             exports.scores.iter().map(|export| export.value).collect();
         let scores = crate::scores::Scores::reserve(
             &score_values,
@@ -742,7 +739,7 @@ impl Shell {
         )?;
         let adapter_seats = weights.adapter_seats();
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
-        let compiled_towered = compiled.order_for(model_ir::RowAxis::Patches).is_some();
+        let compiled_towered = compiled.order_for(poem_ir::RowAxis::Patches).is_some();
         let mut shell = Shell {
             device,
             accounting,
@@ -1075,18 +1072,18 @@ struct DecodedPlanes {
 /// plane has its own kernels. A linear's plane is fired at the rows its
 /// output lands. Index 0 is the main stream, `n` the `n`th side stream.
 fn decoded_weight_planes(
-    trace: &model_ir::Trace,
+    trace: &poem_ir::Trace,
     compiled: &CompiledModel,
     table: &crate::run::WeightTable,
 ) -> Vec<DecodedPlanes> {
-    use model_ir::Operands;
+    use poem_ir::Operands;
 
-    let plane_bytes = |id: model_ir::ValueId| -> Option<u64> {
+    let plane_bytes = |id: poem_ir::ValueId| -> Option<u64> {
         let decl = trace.values.get(id.0 as usize)?;
-        let model_ir::Def::Weight(w) = &decl.def else {
+        let poem_ir::Def::Weight(w) = &decl.def else {
             return None;
         };
-        let model_ir::Ty::Tensor { shape, .. } = &decl.ty else {
+        let poem_ir::Ty::Tensor { shape, .. } = &decl.ty else {
             return None;
         };
         table
@@ -1106,17 +1103,17 @@ fn decoded_weight_planes(
             shape
                 .iter()
                 .map(|dim| match dim {
-                    model_ir::Dim::Const(n) => *n,
+                    poem_ir::Dim::Const(n) => *n,
                     _ => 1,
                 })
                 .fold(2u64, u64::saturating_mul),
         )
     };
-    let token_rows = |id: model_ir::ValueId| -> bool {
+    let token_rows = |id: poem_ir::ValueId| -> bool {
         let Some(decl) = trace.values.get(id.0 as usize) else {
             return false;
         };
-        let model_ir::Ty::Tensor { shape, .. } = &decl.ty else {
+        let poem_ir::Ty::Tensor { shape, .. } = &decl.ty else {
             return false;
         };
         matches!(
@@ -1124,14 +1121,14 @@ fn decoded_weight_planes(
             Some(dim) if dim.axis().is_some()
                 && !matches!(
                     dim,
-                    model_ir::Dim::Lanes | model_ir::Dim::LanesPlus(_) | model_ir::Dim::Readouts
+                    poem_ir::Dim::Lanes | poem_ir::Dim::LanesPlus(_) | poem_ir::Dim::Readouts
                 )
         )
     };
     let mut planes: Vec<DecodedPlanes> =
         vec![DecodedPlanes::default(); compiled.streams.streams.max(1) as usize];
-    let mut inputs: Vec<model_ir::ValueId> = Vec::new();
-    let mut outputs: Vec<model_ir::ValueId> = Vec::new();
+    let mut inputs: Vec<poem_ir::ValueId> = Vec::new();
+    let mut outputs: Vec<poem_ir::ValueId> = Vec::new();
     for region in compiled.template() {
         let Some(slot) = planes.get_mut(region.stream as usize) else {
             continue;
@@ -1141,12 +1138,12 @@ fn decoded_weight_planes(
                 continue;
             };
             let at_tokens = match &node.op {
-                model_ir::Operation::Linear(_) => {
+                poem_ir::Operation::Linear(_) => {
                     outputs.clear();
                     node.op.outputs(&mut outputs);
                     outputs.iter().any(|id| token_rows(*id))
                 }
-                model_ir::Operation::Attention(_) => true,
+                poem_ir::Operation::Attention(_) => true,
                 _ => continue,
             };
             inputs.clear();
@@ -1164,12 +1161,12 @@ fn decoded_weight_planes(
     planes
 }
 
-fn declared_width(trace: &model_ir::Trace, which: model_ir::RuntimeInput) -> u64 {
+fn declared_width(trace: &poem_ir::Trace, which: poem_ir::RuntimeInput) -> u64 {
     trace
         .values
         .iter()
         .find_map(|decl| {
-            let (model_ir::Def::Input(named), model_ir::Ty::Tensor { shape, .. }) =
+            let (poem_ir::Def::Input(named), poem_ir::Ty::Tensor { shape, .. }) =
                 (&decl.def, &decl.ty)
             else {
                 return None;
@@ -1182,7 +1179,7 @@ fn declared_width(trace: &model_ir::Trace, which: model_ir::RuntimeInput) -> u64
                     .iter()
                     .skip(1)
                     .map(|dim| match dim {
-                        model_ir::Dim::Const(n) => *n,
+                        poem_ir::Dim::Const(n) => *n,
                         _ => 1,
                     })
                     .product(),
@@ -1191,13 +1188,13 @@ fn declared_width(trace: &model_ir::Trace, which: model_ir::RuntimeInput) -> u64
         .unwrap_or(0)
 }
 
-fn patch_fold(trace: &model_ir::Trace) -> u32 {
+fn patch_fold(trace: &poem_ir::Trace) -> u32 {
     trace
         .nodes
         .iter()
         .filter_map(|node| match &node.op {
-            model_ir::Operation::Layout(
-                model_ir::Layout::MergeRows { side, .. } | model_ir::Layout::PoolRows { side, .. },
+            poem_ir::Operation::Layout(
+                poem_ir::Layout::MergeRows { side, .. } | poem_ir::Layout::PoolRows { side, .. },
             ) => Some(side.saturating_mul(*side)),
             _ => None,
         })
@@ -1205,7 +1202,7 @@ fn patch_fold(trace: &model_ir::Trace) -> u32 {
         .max(1)
 }
 
-fn adapter_fact(classes: &model_ir::ClassTable, corrected: &model_ir::ClassSet) -> Option<u32> {
+fn adapter_fact(classes: &poem_ir::ClassTable, corrected: &poem_ir::ClassSet) -> Option<u32> {
     classes.adapter_fact(corrected)
 }
 

@@ -2,7 +2,7 @@
 
 use engine_cuda::device::{Buffer, Context};
 use kernels_cuda::{Ctx, Tensor, collective};
-use model_ir::Dtype;
+use poem_ir::Dtype;
 
 fn bf16(v: f32) -> [u8; 2] {
     let bits = v.to_bits();

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use model_ir::Operands;
-use model_ir::Platform;
+use poem_ir::Operands;
+use poem_ir::Platform;
 
 const PLATFORM: Platform = Platform::Metal;
 

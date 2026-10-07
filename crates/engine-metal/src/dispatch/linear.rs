@@ -1,6 +1,6 @@
 use kernels_metal::linear;
-use model_exec::{DispatchLinear, KernelError};
-use model_ir::{Linear, Operands};
+use poem_exec::{DispatchLinear, KernelError};
+use poem_ir::{Linear, Operands};
 
 use crate::run::Run;
 
@@ -14,7 +14,7 @@ impl Run<'_> {
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_metal::Error> {
         match op {
             Linear::Matmul { act, w, y }
-                if self.tensor(*act).dtype == model_ir::Dtype::F32 && self.banked(*w).is_none() =>
+                if self.tensor(*act).dtype == poem_ir::Dtype::F32 && self.banked(*w).is_none() =>
             {
                 linear::lane_gemm::act_x_wt(
                     self.ctx(),

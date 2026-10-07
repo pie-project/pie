@@ -1,6 +1,6 @@
 use kernels_metal::layout;
-use model_exec::{DispatchLayout, KernelError};
-use model_ir::Layout;
+use poem_exec::{DispatchLayout, KernelError};
+use poem_ir::Layout;
 
 use crate::run::Run;
 

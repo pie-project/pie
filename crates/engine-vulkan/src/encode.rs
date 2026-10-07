@@ -263,7 +263,7 @@ impl Encode for Sink<'_> {
             rank: comm.rank(),
             world: comm.world(),
 
-            band: kernels_vulkan::Tensor::new(band, 1, 0, model_ir::Dtype::Bf16),
+            band: kernels_vulkan::Tensor::new(band, 1, 0, poem_ir::Dtype::Bf16),
             slot_bytes,
         })
     }

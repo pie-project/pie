@@ -1,4 +1,4 @@
-use model_dsl::{Dtype, Weight};
+use poem_dsl::{Dtype, Weight};
 
 pub struct Model {
     pub hidden: u32,

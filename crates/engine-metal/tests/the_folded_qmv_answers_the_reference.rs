@@ -25,7 +25,7 @@ use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::encode::{Arg, Encode, Fire, Grid};
 use kernels_metal::linear::quant;
-use model_ir::Dtype;
+use poem_ir::Dtype;
 
 const K: u32 = 2048; // contraction; a multiple of every group size and pack width
 const N: u32 = 256; // output columns

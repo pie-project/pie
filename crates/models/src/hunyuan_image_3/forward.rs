@@ -1,5 +1,5 @@
-use model_dsl::ops::spatial;
-use model_dsl::{
+use poem_dsl::ops::spatial;
+use poem_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Predicate, Request,
     RopeForm, Stream, Value, Weight, ops, seam,
 };

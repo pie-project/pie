@@ -259,7 +259,7 @@ export interface CanvasShape {
  * A lane's stream — which of the model's rectangles its rows belong to
  * (design D2: a lane is one request's rows of ONE stream; a request
  * with text and image rows submits one pass per stream, both in one
- * attention group). Codes agree with `model_ir::Stream`.
+ * attention group). Codes agree with `poem_ir::Stream`.
  * # Variants
  * 
  * ## `"text"`

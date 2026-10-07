@@ -2,8 +2,8 @@ use kernels_cuda::Tensor;
 use kernels_cuda::linear;
 use kernels_cuda::linear::moe::GroupSeat;
 use kernels_cuda::linear::quant::OffsetKind;
-use model_exec::{DispatchLinear, KernelError};
-use model_ir::{Dtype, Linear, ValueId};
+use poem_exec::{DispatchLinear, KernelError};
+use poem_ir::{Dtype, Linear, ValueId};
 
 use crate::run::Run;
 

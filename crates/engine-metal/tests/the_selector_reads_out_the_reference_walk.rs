@@ -6,7 +6,7 @@ use kernels_metal::Tensor;
 use kernels_metal::attn::selector;
 use kernels_metal::layout;
 use kernels_metal::tensor::RaggedTensor;
-use model_ir::Dtype;
+use poem_ir::Dtype;
 
 const K: u32 = 16;
 const RANK: u32 = 256;

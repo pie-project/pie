@@ -1,6 +1,6 @@
 use kernels_metal::Tensor;
-use model_compiler::Budget;
-use model_ir::Dtype;
+use poem_compiler::Budget;
+use poem_ir::Dtype;
 
 use crate::device::{Buffer, Context};
 use crate::error::{Fault, Result};
@@ -37,7 +37,7 @@ impl PortSeat {
 
     #[must_use]
     pub fn row_bytes(&self) -> u64 {
-        u64::from(self.width) * model_compiler::arena::elem_bytes(self.dtype).unwrap_or(0)
+        u64::from(self.width) * poem_compiler::arena::elem_bytes(self.dtype).unwrap_or(0)
     }
 }
 
@@ -369,7 +369,7 @@ impl Inputs {
             })
             .collect();
         let voxels = voxel.map(|seat| {
-            let element = model_compiler::arena::elem_bytes(seat.dtype).unwrap_or(2);
+            let element = poem_compiler::arena::elem_bytes(seat.dtype).unwrap_or(2);
             VoxelAt {
                 payload: take(seat.rows * seat.channels * element),
                 grid: take(seat.clips * 4 * 4),
@@ -595,7 +595,7 @@ impl Inputs {
                 }
                 let taps = u32::try_from(seat.embed_taps).unwrap_or(u32::MAX).max(1);
                 let rows32 = u32::try_from(rows).unwrap_or(u32::MAX);
-                let element = model_compiler::arena::elem_bytes(seat.dtype).unwrap_or(1);
+                let element = poem_compiler::arena::elem_bytes(seat.dtype).unwrap_or(1);
                 let width = u32::try_from(seat.row_bytes.checked_div(element).unwrap_or(0))
                     .unwrap_or(u32::MAX);
                 Some(PatchHandles {
@@ -799,7 +799,7 @@ impl Inputs {
             }
             (Some(staged), Some(at)) => {
                 let seat = at.seat;
-                let element = model_compiler::arena::elem_bytes(seat.dtype).unwrap_or(2);
+                let element = poem_compiler::arena::elem_bytes(seat.dtype).unwrap_or(2);
                 let clips = (staged.grid.len() / 4) as u64;
                 for (what, have, ceiling) in [
                     ("voxel clips", clips, seat.clips),

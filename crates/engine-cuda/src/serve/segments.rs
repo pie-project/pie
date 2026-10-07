@@ -14,7 +14,7 @@ impl Shell {
         &mut self,
         key: &record::BodyKey,
         windows: &Windows,
-        totals: model_ir::PerAxis<u32>,
+        totals: poem_ir::PerAxis<u32>,
         copies: bool,
     ) -> (std::sync::Arc<[crate::window::Admit]>, bool) {
         let held = self

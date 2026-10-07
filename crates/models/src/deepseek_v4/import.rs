@@ -1,9 +1,9 @@
 use checkpoint::contract::{Expr, ModelContract, TensorContract, TensorType};
-use model_dsl::{Dtype, Weight};
+use poem_dsl::{Dtype, Weight};
 
 use super::model::{Gate, GateUp, Layer, Mlp, Model};
 use checkpoint_dsl::{Builder, Error, encoding, extents, scaling};
-use model_dsl::Platform;
+use poem_dsl::Platform;
 
 type ImportArm<S> = fn(&S, &ztensor::Source, Platform) -> Result<ModelContract, Error>;
 
@@ -623,7 +623,7 @@ fn read_bank(
                     encoding(Dtype::Mxfp4),
                 ),
                 TensorContract::new(
-                    model_dsl::scales_name(&w.name),
+                    poem_dsl::scales_name(&w.name),
                     Expr::concat(0, scales),
                     counted,
                     encoding(Dtype::E8m0),

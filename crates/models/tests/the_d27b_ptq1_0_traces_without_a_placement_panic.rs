@@ -9,8 +9,8 @@
 //! dividing the logical dim. This guards both the plain `d27b` and the Bonsai
 //! `d27b_bonsai` instances tracing clean in `Ptq1_0`.
 
-use model_dsl::{Dtype, Platform, trace_hybrid};
 use models::qwen_3::model::Model;
+use poem_dsl::{Dtype, Platform, trace_hybrid};
 
 #[test]
 fn a_ptq1_0_d27b_traces_and_places_without_panicking() {

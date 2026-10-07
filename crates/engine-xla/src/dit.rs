@@ -11,9 +11,9 @@
 
 use engine::fire::{PortKind, ReadoutSeam};
 use kernels_xla::{Emit, Tensor};
-use model_compiler::{CompiledModel, VoxelLadder};
-use model_exec::fire::{Composition, LaneFacts, LaneRow};
-use model_ir::{
+use poem_compiler::{CompiledModel, VoxelLadder};
+use poem_exec::fire::{Composition, LaneFacts, LaneRow};
+use poem_ir::{
     ClassSet, Def, Dtype, GeomKind, Operands, RuntimeInput, Selection, Trace, Ty, ValueId,
 };
 
@@ -23,9 +23,9 @@ use crate::run::{DitBindings, PackingBindings, PortBinding};
 use crate::trace::Handles;
 
 /// The seams a denoiser or a decoder exports instead of logits.
-const VELOCITY_SEAM: &str = model_compiler::FLOAT_READOUT_SEAMS[0];
-const HIDDEN_SEAM: &str = model_compiler::FLOAT_READOUT_SEAMS[1];
-const PIXELS_SEAM: &str = model_compiler::EXPORT_SEAMS[6];
+const VELOCITY_SEAM: &str = poem_compiler::FLOAT_READOUT_SEAMS[0];
+const HIDDEN_SEAM: &str = poem_compiler::FLOAT_READOUT_SEAMS[1];
+const PIXELS_SEAM: &str = poem_compiler::EXPORT_SEAMS[6];
 
 /// A lane's clips on the voxel axis: one `[t, h, w]` box per clip and, when
 /// the host feeds the voxel port, one port row per voxel in the port's
@@ -80,7 +80,7 @@ pub fn voxel_ladder(
     const DERIVED_VOXEL_CEILING: u32 = 65_536;
     let declares_voxels = trace.values.iter().any(|decl| {
         matches!(&decl.ty, Ty::Tensor { shape, .. }
-            if shape.first().and_then(|dim| dim.axis()) == Some(model_ir::RowAxis::Voxels))
+            if shape.first().and_then(|dim| dim.axis()) == Some(poem_ir::RowAxis::Voxels))
     });
     if !declares_voxels {
         return None;
@@ -215,7 +215,7 @@ fn width_of(trace: &Trace, value: ValueId) -> u32 {
             .iter()
             .skip(1)
             .map(|dim| match dim {
-                model_ir::Dim::Const(n) => *n,
+                poem_ir::Dim::Const(n) => *n,
                 _ => 1,
             })
             .product::<u64>()
@@ -228,7 +228,7 @@ fn width_of(trace: &Trace, value: ValueId) -> u32 {
 fn classes_where(
     trace: &Trace,
     compiled: &CompiledModel,
-    touches: impl Fn(&model_ir::Operation) -> bool,
+    touches: impl Fn(&poem_ir::Operation) -> bool,
 ) -> ClassSet {
     let nodes: Vec<u32> = trace
         .nodes
@@ -783,7 +783,7 @@ impl Dit {
                     )
                 })
                 .collect();
-            let mut groups = model_exec::fire::group_of_lane(lanes, &facts);
+            let mut groups = poem_exec::fire::group_of_lane(lanes, &facts);
             groups.resize(lane_count as usize, -1);
             staged.bindings.group_of_lane = Some(inputs.i32s(handles, &groups, 1));
             let lane_classes: Vec<Option<&[i32]>> = feeds
@@ -799,7 +799,7 @@ impl Dit {
                 key.push_str(&format!("ct{count};"));
             }
             for &select in &self.selections {
-                let packed = model_exec::fire::pack_with_classes(
+                let packed = poem_exec::fire::pack_with_classes(
                     select,
                     lanes,
                     &facts,
@@ -807,7 +807,7 @@ impl Dit {
                     rows,
                     &lane_classes,
                 )
-                .map_err(model_exec::Error::Fire)?;
+                .map_err(poem_exec::Error::Fire)?;
                 let lane_table = |table: &[i32]| -> Vec<i32> {
                     let mut out = table.to_vec();
                     let last = table.last().copied().unwrap_or(0);
@@ -929,7 +929,7 @@ impl Dit {
         let lanes = composition.lanes();
         let clips_total = composition.clips() as usize;
         let voxels_total = composition.voxel_rows() as usize;
-        let elem = model_compiler::arena::elem_bytes(seat.dtype).unwrap_or(0) as usize;
+        let elem = poem_compiler::arena::elem_bytes(seat.dtype).unwrap_or(0) as usize;
         let mut channels = 0u32;
         for row in lanes {
             let Some(shot) = feeds.get(row.source as usize).and_then(|feed| feed.clips) else {
