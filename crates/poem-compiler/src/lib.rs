@@ -8,7 +8,9 @@ pub mod lowering;
 mod pq;
 pub mod prefetch;
 mod region;
+pub mod shard;
 pub mod stream;
+mod tree;
 pub mod unit;
 
 #[cfg(test)]

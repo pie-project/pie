@@ -569,6 +569,7 @@ mod tests {
                         name: "state".to_string(),
                         slab: vec![1],
                         dtype: crate::Dtype::Bf16,
+                        shard: crate::trace::Shard::Replicated,
                     }],
                     values: Vec::new(),
                     nodes: Vec::new(),

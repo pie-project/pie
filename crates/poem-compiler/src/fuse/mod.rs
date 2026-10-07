@@ -7,7 +7,6 @@
 
 mod rules;
 mod search;
-mod tree;
 
 use std::sync::LazyLock;
 
@@ -78,7 +77,7 @@ impl Match<'_> {
         }
     }
 
-    fn attr(&self, name: &str) -> Option<&tree::Tree> {
+    fn attr(&self, name: &str) -> Option<&crate::tree::Tree> {
         let at = self
             .shape
             .template
@@ -91,7 +90,7 @@ impl Match<'_> {
     #[must_use]
     pub fn f32(&self, name: &str) -> f32 {
         match self.attr(name) {
-            Some(tree::Tree::F32(bits)) => f32::from_bits(*bits),
+            Some(crate::tree::Tree::F32(bits)) => f32::from_bits(*bits),
             other => panic!("`{name}` binds {other:?}, not an f32"),
         }
     }
@@ -105,7 +104,7 @@ impl Match<'_> {
     #[must_use]
     pub fn get_u32(&self, name: &str) -> Option<u32> {
         match self.attr(name)? {
-            tree::Tree::Int(n) => u32::try_from(*n).ok(),
+            crate::tree::Tree::Int(n) => u32::try_from(*n).ok(),
             _ => None,
         }
     }

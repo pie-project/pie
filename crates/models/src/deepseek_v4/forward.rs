@@ -63,7 +63,8 @@ impl ForwardHybrid for Model {
         let kv = c.kv_space(self.kv);
         for w in &self.layers {
             let at = &w.attn;
-            c.kv(kv, at.kv.clone(), [at.kv_down.dim(0)], self.head_dim);
+            c.kv(kv, at.kv.clone(), [at.kv_down.dim(0)], self.head_dim)
+                .heads();
             if let Some(p) = &at.pool
                 && p.owner
             {
@@ -91,7 +92,8 @@ impl ForwardHybrid for Model {
                 mtp.block.attn.kv.clone(),
                 [mtp.block.attn.kv_down.dim(0)],
                 self.head_dim,
-            );
+            )
+            .heads();
         }
         c
     }

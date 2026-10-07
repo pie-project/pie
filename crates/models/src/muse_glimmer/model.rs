@@ -178,7 +178,7 @@ impl Model {
             output_multiplier: d.output_multiplier,
             embed: Weight::sym("embed", [u64::from(d.vocab), hidden], w),
             lm_head: {
-                let banded = tp > 1 && std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
+                let banded = std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
                 let rows = if banded {
                     u64::from(d.vocab / tp)
                 } else {

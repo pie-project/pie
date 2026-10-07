@@ -30,6 +30,32 @@ pub fn of(op: &Operation) -> Tree {
         .expect("an op serializes to a tree of its fields")
 }
 
+/// The op a tree was taken from.
+#[must_use]
+pub fn op(tree: Tree) -> Operation {
+    Operation::deserialize(De(tree)).expect("a tree read back is the op it was taken from")
+}
+
+/// The fields of the struct an op's family and variant wrap.
+pub fn fields_mut(tree: &mut Tree) -> &mut Vec<(&'static str, Tree)> {
+    match tree {
+        Tree::Variant(_, inner) => fields_mut(inner),
+        Tree::Struct(fields) => fields,
+        other => panic!("{other:?} is not an op's fields"),
+    }
+}
+
+/// The values a field holds, through an `Option` or a list.
+#[must_use]
+pub fn ids(tree: &Tree) -> Vec<ValueId> {
+    match tree {
+        Tree::Id(id) => vec![ValueId(*id)],
+        Tree::Some(inner) => ids(inner),
+        Tree::Seq(items) => items.iter().flat_map(ids).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// `op` with every value renumbered by `f`.
 #[must_use]
 pub fn remap(op: &Operation, f: &impl Fn(ValueId) -> ValueId) -> Operation {

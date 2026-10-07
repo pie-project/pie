@@ -55,13 +55,15 @@ impl ForwardHybrid for Model {
                         k.conv_state.clone(),
                         [k.conv_kernel as u64, 3 * width],
                         Dtype::Bf16,
-                    );
+                    )
+                    .split(1);
                     // the KDA recurrence keeps its state in f32 on every backend
                     c.state(
                         k.delta_state.clone(),
                         [k.heads as u64, k.head_dim as u64, k.head_dim as u64],
                         Dtype::F32,
-                    );
+                    )
+                    .split(0);
                 }
             }
         }

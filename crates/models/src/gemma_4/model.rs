@@ -870,7 +870,7 @@ impl Model {
             }
         });
 
-        let banded = tp > 1 && !d.self_cond && std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
+        let banded = !d.self_cond && std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
         let vocab_rows = if banded {
             (d.vocab / tp) as u64
         } else {

@@ -315,16 +315,16 @@ impl TextEncoder {
                 let n = |s: &str| format!("te.layer.{l}.{s}");
                 TeLayer {
                     attn_norm: Weight::sym(n("attn_norm"), [hidden], dense),
-                    q: Weight::sym(n("q"), [u64::from(q_heads) * hd, hidden], banks),
-                    k: Weight::sym(n("k"), [u64::from(kv_heads) * hd, hidden], banks),
-                    v: Weight::sym(n("v"), [u64::from(kv_heads) * hd, hidden], banks),
-                    o: Weight::sym(n("o"), [hidden, u64::from(q_heads) * hd], banks),
+                    q: Weight::sym(n("q"), [u64::from(q_heads) * hd, hidden], banks).columns(),
+                    k: Weight::sym(n("k"), [u64::from(kv_heads) * hd, hidden], banks).columns(),
+                    v: Weight::sym(n("v"), [u64::from(kv_heads) * hd, hidden], banks).columns(),
+                    o: Weight::sym(n("o"), [hidden, u64::from(q_heads) * hd], banks).rows(),
                     q_norm: Weight::sym(n("q_norm"), [hd], dense),
                     k_norm: Weight::sym(n("k_norm"), [hd], dense),
                     mlp_norm: Weight::sym(n("mlp_norm"), [hidden], dense),
                     gate_up: Weight::sym(n("gate_up"), [2 * inter, hidden], banks)
                         .packed([inter, inter]),
-                    down: Weight::sym(n("down"), [hidden, inter], banks),
+                    down: Weight::sym(n("down"), [hidden, inter], banks).rows(),
                     kv: format!("te.kv.{l}"),
                 }
             })

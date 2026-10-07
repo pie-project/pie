@@ -1183,7 +1183,7 @@ impl Model {
             head: if d.tied {
                 Head::Tied
             } else {
-                let banded = tp > 1 && std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
+                let banded = std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
                 let rows = if banded {
                     (d.vocab / tp) as u64
                 } else {

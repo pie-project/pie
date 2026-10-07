@@ -17,13 +17,13 @@ fn readouts(trace: &Trace, v: ValueId) -> bool {
 #[test]
 fn a_banded_head_gathers_the_logits_it_holds_a_band_of_every_case() {
     a_banded_head_gathers_the_logits_it_holds_a_band_of();
-    a_single_rank_bands_nothing_and_gathers_nothing();
+    a_single_rank_gathers_nothing();
 }
 
 fn a_banded_head_gathers_the_logits_it_holds_a_band_of() {
     let mut faults = Vec::new();
 
-    for row in models::skus() {
+    for row in models::skus().filter(|row| row.recipe.tp > 1) {
         let trace = (row.trace)(Platform::Cuda);
 
         let gathered: Vec<ValueId> = trace
@@ -66,7 +66,7 @@ fn a_banded_head_gathers_the_logits_it_holds_a_band_of() {
     assert!(faults.is_empty(), "\n{}\n", faults.join("\n"));
 }
 
-fn a_single_rank_bands_nothing_and_gathers_nothing() {
+fn a_single_rank_gathers_nothing() {
     let mut faults = Vec::new();
 
     for row in models::skus() {
@@ -74,18 +74,6 @@ fn a_single_rank_bands_nothing_and_gathers_nothing() {
             continue;
         }
         let trace = (row.trace)(Platform::Cuda);
-
-        if let Some(cut) = trace
-            .params
-            .iter()
-            .find(|p| matches!(p.shard, Shard::Cut { axis: 0, .. }) && p.name.contains("head"))
-        {
-            faults.push(format!(
-                "`{}` ships one rank and cuts `{}` on the vocabulary axis; there is \
-                 no second rank to hold the other band",
-                row.name, cut.name,
-            ));
-        }
 
         let gathers = trace
             .nodes

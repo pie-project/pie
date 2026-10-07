@@ -60,7 +60,8 @@ impl ForwardHybrid for Model {
         let kv = c.kv_space(self.kv);
         let plane = self.kv_heads as u64 * self.head_dim as u64;
         for w in &self.layers {
-            c.kv(kv, w.attn.kv.clone(), [plane, plane], self.head_dim);
+            c.kv(kv, w.attn.kv.clone(), [plane, plane], self.head_dim)
+                .heads();
         }
         if let Some(d) = &self.dflash {
             d.declare_caches(&mut c, kv);

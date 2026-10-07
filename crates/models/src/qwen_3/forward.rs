@@ -107,7 +107,8 @@ impl ForwardHybrid for Model {
         for w in &self.layers {
             match &w.mixer {
                 Mixer::Attn(a) => {
-                    c.kv(kv, a.kv.clone(), [plane, plane], self.head_dim);
+                    c.kv(kv, a.kv.clone(), [plane, plane], self.head_dim)
+                        .heads();
                 }
 
                 Mixer::Gdn(g) => {
@@ -116,18 +117,21 @@ impl ForwardHybrid for Model {
                         g.conv_state.clone(),
                         [g.conv_kernel as u64, conv_ch],
                         Dtype::Bf16,
-                    );
+                    )
+                    .split(1);
                     c.state(
                         g.delta_state.clone(),
                         [g.v_heads as u64, g.k_dim as u64, g.v_dim as u64],
                         Dtype::Bf16,
-                    );
+                    )
+                    .split(0);
                 }
             }
         }
         if let Some(mtp) = &self.mtp {
             let a = &mtp.attn;
-            c.kv(kv, a.kv.clone(), [plane, plane], self.head_dim);
+            c.kv(kv, a.kv.clone(), [plane, plane], self.head_dim)
+                .heads();
         }
         if let Some(dflash) = &self.dflash {
             dflash.declare_caches(&mut c, kv);

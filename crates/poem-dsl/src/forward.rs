@@ -1,7 +1,8 @@
 use std::marker::PhantomData;
 
 use poem_ir::{
-    CacheRow, Dim, Dtype, GeomKind, Guard, Platform, RuntimeInput, Selection, Trace, Ty, ValueId,
+    CacheRow, Dim, Dtype, GeomKind, Guard, Platform, RuntimeInput, Selection, Shard, Trace, Ty,
+    ValueId,
 };
 
 use crate::record::{Recorder, Refine, SplitSpec, Value};
@@ -53,7 +54,7 @@ impl HybridSpec {
         name: impl Into<String>,
         planes: impl IntoIterator<Item = u64>,
         head_dim: u32,
-    ) {
+    ) -> DeclaredCache<'_> {
         let (dtype, window) = *self
             .dtypes
             .get(space.0 as usize)
@@ -65,7 +66,9 @@ impl HybridSpec {
             space: space.0,
             window,
             head_dim,
+            shard: Shard::Replicated,
         });
+        DeclaredCache(self.rows.last_mut().expect("a row was just pushed"))
     }
 
     pub fn state(
@@ -73,12 +76,44 @@ impl HybridSpec {
         name: impl Into<String>,
         slab: impl IntoIterator<Item = u64>,
         dtype: Dtype,
-    ) {
+    ) -> DeclaredCache<'_> {
         self.rows.push(CacheRow::State {
             name: name.into(),
             slab: slab.into_iter().collect(),
             dtype,
+            shard: Shard::Replicated,
         });
+        DeclaredCache(self.rows.last_mut().expect("a row was just pushed"))
+    }
+}
+
+/// A cache row just declared, to state how tensor-parallel ranks split it.
+pub struct DeclaredCache<'a>(&'a mut CacheRow);
+
+impl DeclaredCache<'_> {
+    /// The kv row's planes hold heads, which the ranks split between them.
+    pub fn heads(self) {
+        let CacheRow::Kv { planes, shard, .. } = self.0 else {
+            panic!("only a kv row holds heads");
+        };
+        *shard = Shard::Cut {
+            axis: 0,
+            segments: planes.clone(),
+        };
+    }
+
+    /// The state row's slab is split between the ranks along `axis`.
+    pub fn split(self, axis: u32) {
+        let CacheRow::State { slab, shard, .. } = self.0 else {
+            panic!("only a state row has a slab to split");
+        };
+        let extent = *slab
+            .get(axis as usize)
+            .unwrap_or_else(|| panic!("a slab of {slab:?} has no axis {axis}"));
+        *shard = Shard::Cut {
+            axis,
+            segments: vec![extent],
+        };
     }
 }
 

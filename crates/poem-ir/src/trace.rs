@@ -46,10 +46,14 @@ impl Platform {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Shard {
+    #[default]
     Replicated,
-    Cut { axis: u32, segments: Vec<u64> },
+    Cut {
+        axis: u32,
+        segments: Vec<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -98,11 +102,18 @@ pub enum CacheRow {
         /// readable (they deserialize to 0, which reproduces the old anchor).
         #[serde(default)]
         head_dim: u32,
+        /// `Cut { axis: 0, .. }` when every plane holds heads the ranks
+        /// split between them.
+        #[serde(default)]
+        shard: Shard,
     },
     State {
         name: String,
         slab: Vec<u64>,
         dtype: Dtype,
+        /// The slab axis the ranks split between them, if any.
+        #[serde(default)]
+        shard: Shard,
     },
 }
 

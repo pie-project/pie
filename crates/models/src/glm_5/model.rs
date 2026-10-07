@@ -286,7 +286,7 @@ impl Model {
             kv_dtype: kv,
             embed: Weight::sym("embed", [d.vocab as u64, hidden], w),
             head: {
-                let banded = tp > 1 && std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
+                let banded = std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
                 let rows = if banded {
                     u64::from(d.vocab / tp)
                 } else {

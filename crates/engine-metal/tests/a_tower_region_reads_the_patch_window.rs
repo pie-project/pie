@@ -41,6 +41,7 @@ impl Build {
                     name: "state".to_string(),
                     slab: vec![1],
                     dtype: Dtype::Bf16,
+                    shard: poem_ir::Shard::Replicated,
                 }],
                 values: Vec::new(),
                 nodes: Vec::new(),

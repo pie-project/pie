@@ -91,12 +91,14 @@ impl ForwardHybrid for Model {
                     Reading::Global => (kv, self.global.head_dim, self.global.kv_heads),
                 };
                 let plane = kv_heads as u64 * head_dim as u64;
-                c.kv(space, w.attn.kv.clone(), [plane, plane], head_dim);
+                c.kv(space, w.attn.kv.clone(), [plane, plane], head_dim)
+                    .heads();
             }
         }
         if let Some(a) = &self.draft {
             let plane = self.global.kv_heads as u64 * self.global.head_dim as u64;
-            c.kv(kv, a.attn.kv.clone(), [plane, plane], self.global.head_dim);
+            c.kv(kv, a.attn.kv.clone(), [plane, plane], self.global.head_dim)
+                .heads();
         }
         if let Some(d) = &self.dflash {
             d.declare_caches(&mut c, kv);

@@ -6,8 +6,8 @@ use std::collections::BTreeSet;
 use poem_dsl::pattern::{Attr, Template};
 use poem_ir::{Def, Node, Operands, Operation, Trace, ValueId};
 
-use super::tree::{self, Tree};
 use super::{Match, Rule};
+use crate::tree::{self, Tree};
 
 const UNCLAIMED: u32 = u32::MAX;
 
