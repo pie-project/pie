@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use engine::fire::{FoldLen, RsReset, RsVerb};
 use engine_metal::serve::Seated;
 use engine_metal::{Boot, Lane, Shell};
-use model_compiler::Budget;
-use model_dsl::{Classify, Dtype, Platform, Request};
+use poem_compiler::Budget;
+use poem_dsl::{Classify, Dtype, Platform, Request};
 
 const WINDOW: usize = 6;
 
@@ -37,7 +37,7 @@ fn ready() -> Option<Shell> {
         return None;
     };
     let micro = models::qwen_4::model::Model::flash_micro(Dtype::Bf16, Dtype::Bf16, 1);
-    let trace = model_dsl::trace_hybrid("qwen4-micro", &micro, Platform::Metal);
+    let trace = poem_dsl::trace_hybrid("qwen4-micro", &micro, Platform::Metal);
     let source =
         ztensor_compat::index(fixture.join("model.safetensors")).expect("the fixture opens");
     let contract = micro

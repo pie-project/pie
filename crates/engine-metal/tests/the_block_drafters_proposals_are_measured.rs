@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use engine::fire::{Mask, Masking};
 use engine_metal::{Boot, Lane, Seated, Shell};
-use model_compiler::Budget;
-use model_dsl::{Classify, Platform, Request};
+use poem_compiler::Budget;
+use poem_dsl::{Classify, Platform, Request};
 
 const SKU: &str = "qwen36-27b-dflash-u4g64-kv-bf16";
 

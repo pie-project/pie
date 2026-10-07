@@ -1,5 +1,5 @@
-use model_exec::{DispatchCustomCuda, KernelError};
-use model_ir::{CustomCuda, Operands};
+use poem_exec::{DispatchCustomCuda, KernelError};
+use poem_ir::{CustomCuda, Operands};
 
 use crate::run::Run;
 
@@ -9,14 +9,14 @@ impl DispatchCustomCuda for Run<'_> {
     }
 }
 
-impl model_exec::DispatchSpatial for Run<'_> {
-    fn dispatch(&mut self, op: &model_ir::Spatial) -> Result<(), KernelError> {
+impl poem_exec::DispatchSpatial for Run<'_> {
+    fn dispatch(&mut self, op: &poem_ir::Spatial) -> Result<(), KernelError> {
         Err(KernelError::Unsupported { op: op.name() })
     }
 }
 
-impl model_exec::DispatchProbe for Run<'_> {
-    fn probe(&mut self, node: &model_ir::Node) {
+impl poem_exec::DispatchProbe for Run<'_> {
+    fn probe(&mut self, node: &poem_ir::Node) {
         use std::io::Write;
         let Some(dir) = crate::probe::dir() else {
             return;
@@ -37,12 +37,12 @@ impl model_exec::DispatchProbe for Run<'_> {
             let Some(decl) = self.values().get(id.0 as usize) else {
                 continue;
             };
-            let model_ir::Ty::Tensor { dtype, .. } = &decl.ty else {
+            let poem_ir::Ty::Tensor { dtype, .. } = &decl.ty else {
                 continue;
             };
             let elem: u64 = match dtype {
-                model_ir::Dtype::Bf16 | model_ir::Dtype::F16 => 2,
-                model_ir::Dtype::F32 | model_ir::Dtype::I32 | model_ir::Dtype::U32 => 4,
+                poem_ir::Dtype::Bf16 | poem_ir::Dtype::F16 => 2,
+                poem_ir::Dtype::F32 | poem_ir::Dtype::I32 | poem_ir::Dtype::U32 => 4,
                 _ => continue,
             };
             let t = self.tensor(id);

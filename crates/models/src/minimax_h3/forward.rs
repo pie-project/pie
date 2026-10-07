@@ -1,4 +1,4 @@
-use model_dsl::{
+use poem_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Predicate, RaggedMask,
     Request, RopeForm, Stream, Value, Weight, ops, seam,
 };

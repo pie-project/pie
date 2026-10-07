@@ -1,6 +1,6 @@
 use kernels_vulkan::layout;
-use model_exec::{DispatchLayout, KernelError};
-use model_ir::{Layout, Operands};
+use poem_exec::{DispatchLayout, KernelError};
+use poem_ir::{Layout, Operands};
 
 use crate::run::Run;
 

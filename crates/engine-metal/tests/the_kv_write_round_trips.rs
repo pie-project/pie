@@ -27,7 +27,7 @@ use engine_metal::store::kv::Paging;
 use engine_metal::store::pool_demand;
 use kernels_metal::attn;
 use kernels_metal::{KvPool, Tensor};
-use model_ir::{CacheRow, Dtype, Platform, Trace};
+use poem_ir::{CacheRow, Dtype, Platform, Trace};
 
 /// Packed bytes for one head at codec block `block`: `block/2` nibble bytes plus
 /// one inline fp16 scale (130 at block 256, 66 at 128).

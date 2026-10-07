@@ -1,4 +1,4 @@
-use model_dsl::{Dtype, Weight};
+use poem_dsl::{Dtype, Weight};
 
 pub const TRAIN_STEPS: u32 = 1000;
 pub const FLOW_SHIFT: f32 = 3.0;

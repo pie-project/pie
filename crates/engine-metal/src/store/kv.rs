@@ -1,21 +1,21 @@
-use model_ir::{Trace, ValueId};
+use poem_ir::{Trace, ValueId};
 
 use crate::error::{Fault, Result};
 
-pub use model_exec::store::kv::{
+pub use poem_exec::store::kv::{
     Geometry, Paging, Reader, Seat, SpaceFacts, indptr, reads, row_of, space_of,
 };
 
 pub fn geometry(paging: &Paging, seats: &[Seat]) -> Result<Geometry> {
-    Ok(model_exec::store::kv::geometry(paging, seats)?)
+    Ok(poem_exec::store::kv::geometry(paging, seats)?)
 }
 
 pub fn geometry_with(paging: &Paging, seats: &[Seat], tables: &[&[u32]]) -> Result<Geometry> {
-    Ok(model_exec::store::kv::geometry_with(paging, seats, tables)?)
+    Ok(poem_exec::store::kv::geometry_with(paging, seats, tables)?)
 }
 
 pub fn width_of(trace: &Trace, value: ValueId) -> Result<u64> {
-    Ok(model_exec::store::kv::width_of(trace, value)?)
+    Ok(poem_exec::store::kv::width_of(trace, value)?)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

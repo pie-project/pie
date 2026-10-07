@@ -5,7 +5,7 @@ pub mod template;
 pub mod tokenizer;
 
 use model::Model;
-use model_dsl::Dtype;
+use poem_dsl::Dtype;
 
 pub const ARCH: &str = "mini_dit";
 
@@ -17,7 +17,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::Bf16],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
             |tp: u32| Model::mini(Dtype::Bf16, tp).tapped(forward::Tap::from_env()),
@@ -27,7 +27,7 @@ pub fn skus() -> Vec<crate::Sku> {
             2,
             [Dtype::Bf16],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
             |tp: u32| Model::mini(Dtype::Bf16, tp).tapped(forward::Tap::from_env()),
@@ -37,7 +37,7 @@ pub fn skus() -> Vec<crate::Sku> {
             4,
             [Dtype::Bf16],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
             |tp: u32| Model::mini(Dtype::Bf16, tp).tapped(forward::Tap::from_env()),

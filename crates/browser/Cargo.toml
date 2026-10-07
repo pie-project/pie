@@ -16,7 +16,7 @@ path = "src/lib.rs"
 runtime = { path = "../runtime", features = ["wgpu"] }
 engine-wgpu = { path = "../engine-wgpu", features = ["wgpu"] }
 engine = { path = "../engine" }
-model-ir = { path = "../model-ir" }
+poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 models = { path = "../models" }
 checkpoint = { path = "../checkpoint", default-features = false }
 tokenizer = { path = "../tokenizer" }

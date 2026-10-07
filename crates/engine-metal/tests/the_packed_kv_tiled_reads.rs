@@ -25,7 +25,7 @@ use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::attn::{self, PrefillPlan};
 use kernels_metal::{KvPool, RaggedTensor, Tensor};
-use model_ir::Dtype;
+use poem_ir::Dtype;
 
 const KV_HEADS: usize = 2;
 const Q_HEADS: usize = 4; // gqa = 2

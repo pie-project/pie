@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use model_ir::{Attention, Def, Operation, Trace};
+use poem_ir::{Attention, Def, Operation, Trace};
 
 pub(crate) fn absorbed_weights(trace: &Trace) -> BTreeSet<usize> {
     let mut rows = BTreeSet::new();
@@ -18,18 +18,18 @@ pub(crate) fn absorbed_weights(trace: &Trace) -> BTreeSet<usize> {
 }
 
 pub(crate) fn lane_axis_weights(trace: &Trace) -> BTreeSet<usize> {
-    let f32_rows = |value: model_ir::ValueId| {
+    let f32_rows = |value: poem_ir::ValueId| {
         matches!(
             trace.values.get(value.0 as usize).map(|v| &v.ty),
-            Some(model_ir::Ty::Tensor {
-                dtype: model_ir::Dtype::F32,
+            Some(poem_ir::Ty::Tensor {
+                dtype: poem_ir::Dtype::F32,
                 ..
             })
         )
     };
     let mut rows = BTreeSet::new();
     for node in &trace.nodes {
-        let Operation::Linear(model_ir::Linear::Matmul { act, w, .. }) = &node.op else {
+        let Operation::Linear(poem_ir::Linear::Matmul { act, w, .. }) = &node.op else {
             continue;
         };
         if !f32_rows(*act) {

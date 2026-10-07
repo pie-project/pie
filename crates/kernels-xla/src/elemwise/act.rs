@@ -98,7 +98,7 @@ pub fn mul(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> 
 
 // ------------------------------------------------------------- modulation
 
-/// How a modulation vector bends a row (model_ir `ModulateForm`).
+/// How a modulation vector bends a row (poem_ir `ModulateForm`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Form {
     /// `x·(1 + m[:w]) + m[w:2w]`
@@ -118,7 +118,7 @@ impl Form {
     }
 }
 
-/// The scale-free norm a fused modulation runs first (model_ir `NormKind`).
+/// The scale-free norm a fused modulation runs first (poem_ir `NormKind`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NormKind {
     Layernorm { eps: f32 },
@@ -506,7 +506,7 @@ pub fn relative_bucket_bias(
 
 // ------------------------------------------------------------ multi-axis rope
 
-/// How a multi-axis rotation lays its pairs (model_ir `RopeForm`).
+/// How a multi-axis rotation lays its pairs (poem_ir `RopeForm`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RopeForm {
     Interleaved,

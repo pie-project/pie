@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use model_ir::{Attention, Def, Operation, Trace};
+use poem_ir::{Attention, Def, Operation, Trace};
 
 pub(crate) fn absorbed_weights(trace: &Trace) -> BTreeSet<usize> {
     let mut rows = BTreeSet::new();

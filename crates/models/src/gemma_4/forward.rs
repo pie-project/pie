@@ -1,4 +1,4 @@
-use model_dsl::{
+use poem_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, MropeForm, Platform, Predicate, Request,
     Value, ValueId, Weight, ops, seam,
 };
@@ -274,7 +274,7 @@ impl ForwardHybrid for Model {
                     k_norm,
                     k_norm_eps,
                 } => {
-                    if model_dsl::platform() == Platform::Cuda && *k_norm_eps == at.q_norm_eps {
+                    if poem_dsl::platform() == Platform::Cuda && *k_norm_eps == at.q_norm_eps {
                         let (fast_x, rest_x) = normed.split(&fused);
                         let (fast_pos, rest_pos) = positions.split(&fused);
                         let qf = ops::custom::qkv_fused_qknorm_rope_vnorm_write(

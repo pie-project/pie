@@ -17,8 +17,8 @@ use engine::program::{
 use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
 use eta_ir::registry::{GeometryClass, ModelProfile, Port, PortMask};
 use eta_ir::types::Dtype;
-use model_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
-use model_ir::Trace;
+use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
+use poem_ir::Trace;
 
 use crate::error::Fault;
 use crate::experts;
@@ -207,8 +207,8 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
     const DERIVED_PATCH_CEILING: u32 = 4096;
 
     let declares_patches = trace.values.iter().any(|decl| {
-        matches!(&decl.ty, model_ir::Ty::Tensor { shape, .. }
-            if shape.first().and_then(|dim| dim.axis()) == Some(model_ir::RowAxis::Patches))
+        matches!(&decl.ty, poem_ir::Ty::Tensor { shape, .. }
+            if shape.first().and_then(|dim| dim.axis()) == Some(poem_ir::RowAxis::Patches))
     });
     if !declares_patches {
         return None;
@@ -236,18 +236,18 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
 }
 
 #[must_use]
-pub fn voxel_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<model_compiler::VoxelLadder> {
+pub fn voxel_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<poem_compiler::VoxelLadder> {
     const DERIVED_VOXEL_CEILING: u32 = 65_536;
 
     let declares_voxels = trace.values.iter().any(|decl| {
-        matches!(&decl.ty, model_ir::Ty::Tensor { shape, .. }
-            if shape.first().and_then(|dim| dim.axis()) == Some(model_ir::RowAxis::Voxels))
+        matches!(&decl.ty, poem_ir::Ty::Tensor { shape, .. }
+            if shape.first().and_then(|dim| dim.axis()) == Some(poem_ir::RowAxis::Voxels))
     });
     if !declares_voxels {
         return None;
     }
     let max_voxels = budgets.max_voxels.unwrap_or(DERIVED_VOXEL_CEILING).max(1);
-    Some(model_compiler::VoxelLadder {
+    Some(poem_compiler::VoxelLadder {
         max_voxels,
         buckets: Vec::new(),
         max_clips: budgets
@@ -259,14 +259,14 @@ pub fn voxel_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<model_compil
 
 fn patch_bytes(
     patches: &[f32],
-    element: model_ir::Dtype,
+    element: poem_ir::Dtype,
 ) -> std::result::Result<Vec<u8>, &'static str> {
     match element {
-        model_ir::Dtype::Bf16 => Ok(patches
+        poem_ir::Dtype::Bf16 => Ok(patches
             .iter()
             .flat_map(|&v| bf16_bits(v).to_le_bytes())
             .collect()),
-        model_ir::Dtype::F32 => Ok(patches.iter().flat_map(|&v| v.to_le_bytes()).collect()),
+        poem_ir::Dtype::F32 => Ok(patches.iter().flat_map(|&v| v.to_le_bytes()).collect()),
         _ => Err(
             "a media submission against a plan whose activation element is neither \
                   `bf16` nor `f32`, which is the pair every tower in this catalog computes in",
@@ -276,14 +276,14 @@ fn patch_bytes(
 
 fn voxel_bytes(
     payload: &[f32],
-    element: model_ir::Dtype,
+    element: poem_ir::Dtype,
 ) -> std::result::Result<Vec<u8>, &'static str> {
     match element {
-        model_ir::Dtype::Bf16 => Ok(payload
+        poem_ir::Dtype::Bf16 => Ok(payload
             .iter()
             .flat_map(|&v| bf16_bits(v).to_le_bytes())
             .collect()),
-        model_ir::Dtype::F32 => Ok(payload.iter().flat_map(|&v| v.to_le_bytes()).collect()),
+        poem_ir::Dtype::F32 => Ok(payload.iter().flat_map(|&v| v.to_le_bytes()).collect()),
         _ => Err(
             "a voxel submission against a plan whose voxel element is neither `bf16` \
                   nor `f32`, which is the pair every VAE in this catalog computes in",
@@ -531,7 +531,7 @@ impl Engine for Metal {
             .trace()
             .caches
             .iter()
-            .any(|row| matches!(row, model_ir::CacheRow::State { .. }));
+            .any(|row| matches!(row, poem_ir::CacheRow::State { .. }));
         let profile = profile(&shell, &budgets)?;
 
         let caps = Capabilities {
@@ -562,7 +562,7 @@ impl Engine for Metal {
                 disk_kv_pages,
                 // The sliding rows are paged in full here: the model's window
                 // is a fact of the model, its pool is not.
-                window_tokens: model_exec::store::kv::declared_window(shell.trace()).unwrap_or(0),
+                window_tokens: poem_exec::store::kv::declared_window(shell.trace()).unwrap_or(0),
                 ..PoolFacts::default()
             },
             limits: FireLimits {
@@ -905,8 +905,8 @@ impl Metal {
         let mut staged: Vec<Vec<u8>> = Vec::new();
         if !submission.media.is_empty() {
             let Some(element) = self.loaded()?.patch_element() else {
-                return Err(fault(crate::error::Fault::from(model_exec::Error::Fire(
-                    model_exec::fire::Fault::Towerless {
+                return Err(fault(crate::error::Fault::from(poem_exec::Error::Fire(
+                    poem_exec::fire::Fault::Towerless {
                         lane: submission.media[0].lane,
                     },
                 ))));
@@ -932,7 +932,7 @@ impl Metal {
         let voxel_element = self
             .loaded()?
             .voxel_element()
-            .unwrap_or(model_ir::Dtype::Bf16);
+            .unwrap_or(poem_ir::Dtype::Bf16);
         for row in &submission.voxels {
             voxel_payloads.push(voxel_bytes(&row.payload, voxel_element).map_err(|why| {
                 Error::Unsupported {

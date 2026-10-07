@@ -1,8 +1,8 @@
-use model_dsl::{
+use poem_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, ops,
     trace_hybrid,
 };
-use model_ir::Trace;
+use poem_ir::Trace;
 
 const VOCAB: u32 = 1024;
 
@@ -90,7 +90,7 @@ fn a_stored_declaration_interns_one_byte_rectangle() {
     assert_eq!(plane_of(&decoded, "proj").dtype, Dtype::Bf16);
 }
 
-fn plane_of<'a>(trace: &'a Trace, name: &str) -> &'a model_ir::Param {
+fn plane_of<'a>(trace: &'a Trace, name: &str) -> &'a poem_ir::Param {
     trace
         .params
         .iter()

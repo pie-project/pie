@@ -3,7 +3,7 @@ use checkpoint::types::Encoding;
 
 use super::model::{Mlp, Model};
 use checkpoint_dsl::{Builder, Error, encoding};
-use model_dsl::Platform;
+use poem_dsl::Platform;
 
 impl Model {
     pub fn import(

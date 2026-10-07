@@ -1,5 +1,5 @@
-use model_dsl::Platform;
-use model_ir::{Attention, Operation, Trace};
+use poem_dsl::Platform;
+use poem_ir::{Attention, Operation, Trace};
 
 fn carries_a_head(sku: &str) -> bool {
     models::published::PUBLISHED.iter().any(|p| p.sku == sku)

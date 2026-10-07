@@ -2,7 +2,7 @@
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::{DecodePlan, KvPool, PrefillPlan, RaggedTensor, Tensor, attn};
-use model_ir::Dtype;
+use poem_ir::Dtype;
 fn bf(x: f32) -> f32 {
     let b = x.to_bits();
     f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff0000)

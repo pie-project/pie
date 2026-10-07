@@ -1,13 +1,13 @@
 use engine_cuda::record::{BodyKey, Tiers};
 use engine_cuda::window::{Copies, Windows};
-use model_compiler::{Budget, CompiledModel, DeviceProfile, compile};
-use model_exec::fire::{Composition, Lane, compose};
-use model_ir::ops::Elementwise;
+use poem_compiler::{Budget, CompiledModel, DeviceProfile, compile};
+use poem_exec::fire::{Composition, Lane, compose};
+use poem_ir::ops::Elementwise;
 
 fn test_slots() -> engine_cuda::window::Slots {
     engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 4, 4096)
 }
-use model_ir::{
+use poem_ir::{
     CacheRow, Def, Dim, Dtype, Guard, Node, Operands, Platform, RuntimeInput, Seam, Trace, Ty,
     ValueDecl, ValueId,
 };
@@ -18,8 +18,8 @@ fn budget() -> Budget {
     Budget::new(4, 64)
 }
 
-fn no_decode_class() -> model_ir::ClassSet {
-    model_ir::ClassSet::default()
+fn no_decode_class() -> poem_ir::ClassSet {
+    poem_ir::ClassSet::default()
 }
 
 const LANES: u32 = 4;
@@ -138,7 +138,7 @@ fn windows(trace: &Trace, compiled: &CompiledModel, fire: &Composition) -> Windo
     Windows::of(
         trace,
         compiled,
-        model_ir::PerAxis::new([fire.classes(), fire.patch_classes(), fire.voxel_classes()]),
+        poem_ir::PerAxis::new([fire.classes(), fire.patch_classes(), fire.voxel_classes()]),
         &boundaries(fire),
         Copies::off(),
         test_slots(),
@@ -261,7 +261,7 @@ fn the_gate_the_narrow_reading_refuses_is_one_the_wide_reading_admits() {
 
 fn plain() -> Tiers {
     Tiers {
-        plain: model_ir::ClassSet::of(0..8usize),
+        plain: poem_ir::ClassSet::of(0..8usize),
         wide: Box::new([]),
     }
 }

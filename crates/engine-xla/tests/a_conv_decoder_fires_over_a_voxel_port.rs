@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 
 use engine_xla::serve::{Clips, Seated};
 use engine_xla::{Boot, DeviceBoot, Lane, Shell};
-use model_compiler::{Budget, VoxelLadder};
-use model_dsl::ops::spatial::{self, Conv};
-use model_dsl::{
+use poem_compiler::{Budget, VoxelLadder};
+use poem_dsl::ops::spatial::{self, Conv};
+use poem_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, seam,
     trace_hybrid,
 };
@@ -563,7 +563,7 @@ impl ForwardHybrid for Causal {
             &g,
             &self.conv,
             Some(&self.bias),
-            Conv::same3().causal(model_ir::TimePad::Zero),
+            Conv::same3().causal(poem_ir::TimePad::Zero),
             Some(cache),
         );
         seam::at(seam::PIXELS, &[&y, &g1]);

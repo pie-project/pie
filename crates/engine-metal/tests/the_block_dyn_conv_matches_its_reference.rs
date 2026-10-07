@@ -5,7 +5,7 @@ use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::attn::dynconv;
 use kernels_metal::tensor::RaggedTensor;
-use model_ir::Dtype;
+use poem_ir::Dtype;
 
 const CHANNELS: u32 = 96;
 const GROUP: u32 = 16;

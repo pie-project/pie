@@ -1,7 +1,7 @@
 use kernels_cuda::spatial;
 use kernels_cuda::tensor::Tensor;
-use model_exec::{DispatchSpatial, KernelError};
-use model_ir::{GridRule, Spatial, TimePad, VoxelSegment};
+use poem_exec::{DispatchSpatial, KernelError};
+use poem_ir::{GridRule, Spatial, TimePad, VoxelSegment};
 
 use crate::run::Run;
 

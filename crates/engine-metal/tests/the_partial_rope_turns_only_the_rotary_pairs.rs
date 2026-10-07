@@ -11,7 +11,7 @@ use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::elemwise::rope;
-use model_ir::Dtype;
+use poem_ir::Dtype;
 
 fn noise(at: u64) -> u32 {
     let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5E5E_1234_9ABC_DEF0;

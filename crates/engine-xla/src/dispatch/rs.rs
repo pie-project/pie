@@ -6,7 +6,7 @@
 
 use kernels_xla::attn::ssm::Committed;
 use kernels_xla::{Error, Tensor};
-use model_ir::ValueId;
+use poem_ir::ValueId;
 
 use crate::rs::{Seat, WindowInputs};
 use crate::run::Run;
@@ -25,7 +25,7 @@ impl Run<'_> {
             })
     }
 
-    fn rs_temp(&self, rows: u32, width: u32, dtype: model_ir::Dtype) -> Tensor {
+    fn rs_temp(&self, rows: u32, width: u32, dtype: poem_ir::Dtype) -> Tensor {
         self.handles().root(Root {
             source: Source::Temp,
             dtype,

@@ -1,6 +1,6 @@
 use kernels_vulkan::attn;
-use model_exec::{DispatchAttention, KernelError};
-use model_ir::{Attention, Operands, StructKind};
+use poem_exec::{DispatchAttention, KernelError};
+use poem_ir::{Attention, Operands, StructKind};
 
 use crate::run::{Run, StructSlot};
 
@@ -18,14 +18,14 @@ impl Run<'_> {
     #[allow(clippy::too_many_arguments)]
     fn capture_scores(
         &mut self,
-        q: model_ir::ValueId,
-        plan: model_ir::ValueId,
-        cache: model_ir::ValueId,
+        q: poem_ir::ValueId,
+        plan: poem_ir::ValueId,
+        cache: poem_ir::ValueId,
         window: Option<u32>,
         head_dim: u32,
         kv_heads: u32,
         sm_scale: f32,
-        lse: model_ir::ValueId,
+        lse: poem_ir::ValueId,
     ) -> Result<(), kernels_vulkan::Error> {
         let Some(seat) = self.score_seat() else {
             return Ok(());

@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use model_dsl::{
-    Attention, Classify, Def, Elementwise, Linear, Operation, Platform, Request, RopeForm,
-    RuntimeInput, Stream, Trace, seam,
-};
 use models::hunyuan_image_3::forward::{DENOISE, ENCODE, Facts, IMAGE_IN, IMAGE_OUT};
 use models::hunyuan_image_3::model::{self, Dims};
 use models::{PortKind, ReadoutKind, ScheduleKind};
+use poem_dsl::{
+    Attention, Classify, Def, Elementwise, Linear, Operation, Platform, Request, RopeForm,
+    RuntimeInput, Stream, Trace, seam,
+};
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
 
@@ -195,7 +195,7 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
 fn each_lane_the_facts_list_classifies_into_its_own_class() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
-        let classes = model_dsl::resolve_classes(&plan)
+        let classes = poem_dsl::resolve_classes(&plan)
             .unwrap_or_else(|why| panic!("{sku}: a merge does not resolve: {why:?}"));
         let facts = row(sku).generative.as_ref().expect("generative facts");
         let catalog = row(sku);
@@ -452,8 +452,8 @@ fn validate(facts: &models::Generative) {
     }
 }
 
-fn budget() -> model_compiler::Budget {
-    model_compiler::Budget {
+fn budget() -> poem_compiler::Budget {
+    poem_compiler::Budget {
         max_lanes: 8,
         max_tokens: 8192,
         buckets: vec![64, 1024, 8192],
@@ -465,12 +465,12 @@ fn every_row_bakes_on_every_platform_at_its_own_rank() {
     for platform in PLATFORMS {
         for sku in ROWS {
             let plan = trace(sku, platform);
-            let budgets = model_compiler::Budgets::of(budget())
-                .with_voxels(model_compiler::VoxelLadder::new(8192, 4));
-            let compiled = model_compiler::compile_axes(
+            let budgets = poem_compiler::Budgets::of(budget())
+                .with_voxels(poem_compiler::VoxelLadder::new(8192, 4));
+            let compiled = poem_compiler::compile_axes(
                 &plan,
                 &budgets,
-                &model_compiler::DeviceProfile::default(),
+                &poem_compiler::DeviceProfile::default(),
             )
             .unwrap_or_else(|why| panic!("{platform:?}: `{sku}` does not bake: {why}"));
             let tiled: usize = compiled.regions.iter().map(|r| r.nodes.len()).sum();

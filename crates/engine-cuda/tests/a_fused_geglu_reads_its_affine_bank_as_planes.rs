@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 
 use checkpoint::contract::ModelContract;
 use engine_cuda::{Boot, Diagnostics, Graphs, Knobs, Lane, Shell};
-use model_compiler::Budget;
-use model_dsl::{
+use poem_compiler::Budget;
+use poem_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, ops,
     trace_hybrid,
 };
-use model_ir::{Linear, Operation, Trace};
+use poem_ir::{Linear, Operation, Trace};
 
 const VOCAB: u32 = 1000;
 const HIDDEN: u64 = 512;
@@ -240,7 +240,7 @@ fn a_fused_geglu_reads_its_affine_bank_as_planes() {
     }
     let fixture = fixture();
 
-    let fused = model_ir::fuse::gemm_epilogues(fixture.trace.clone());
+    let fused = poem_ir::fuse::gemm_epilogues(fixture.trace.clone());
     assert!(
         fused
             .nodes

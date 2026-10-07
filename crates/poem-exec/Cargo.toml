@@ -1,0 +1,25 @@
+[package]
+name = "pie-poem-exec"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "The model forward substrate, in Rust: lane composition, the fire descriptor, the artifact walk, the paged kv geometry and the seat law. Device-free — the CUDA and Metal shells both read it."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+publish = false
+
+[lib]
+name = "poem_exec"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
+
+poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
+
+[dev-dependencies]
+models = { path = "../models" }
+poem-dsl = { package = "pie-poem-dsl", path = "../poem-dsl" }

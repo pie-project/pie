@@ -9,8 +9,8 @@
 mod common;
 
 use engine_xla::{Boot, DeviceBoot, Lane, Seated, Shell};
-use model_compiler::Budget;
-use model_dsl::{Platform, Request};
+use poem_compiler::Budget;
+use poem_dsl::{Platform, Request};
 
 const PAGE: u32 = 16;
 const CONTEXT: u32 = 2048;
@@ -185,8 +185,8 @@ fn a_windowed_pool_answers_what_full_pages_do() {
         .caches
         .iter()
         .filter_map(|row| match row {
-            model_ir::CacheRow::Kv { window, .. } => *window,
-            model_ir::CacheRow::State { .. } => None,
+            poem_ir::CacheRow::Kv { window, .. } => *window,
+            poem_ir::CacheRow::State { .. } => None,
         })
         .max();
     let Some(window) = window else {

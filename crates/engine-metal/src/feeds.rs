@@ -1,4 +1,4 @@
-use model_ir::{ClassSet, Def, GeomKind, RuntimeInput, Selection, Trace, Ty, ValueId};
+use poem_ir::{ClassSet, Def, GeomKind, RuntimeInput, Selection, Trace, Ty, ValueId};
 
 use crate::inputs::PortSeat;
 
@@ -26,7 +26,7 @@ impl Feeds {
             .collect()
     }
 
-    pub(crate) fn of(trace: &Trace, compiled: &model_compiler::CompiledModel) -> Feeds {
+    pub(crate) fn of(trace: &Trace, compiled: &poem_compiler::CompiledModel) -> Feeds {
         let mut feeds = Feeds::default();
         for (at, decl) in trace.values.iter().enumerate() {
             let Def::Input(input) = &decl.def else {
@@ -149,10 +149,10 @@ impl Feeds {
 
 pub(crate) fn writer_classes(
     trace: &Trace,
-    compiled: &model_compiler::CompiledModel,
+    compiled: &poem_compiler::CompiledModel,
     value: ValueId,
 ) -> ClassSet {
-    use model_ir::Operands as _;
+    use poem_ir::Operands as _;
     if let Some(Def::Merge(arms)) = trace.values.get(value.0 as usize).map(|decl| &decl.def) {
         let mut classes = ClassSet::default();
         for (arm, _) in arms {
@@ -185,10 +185,10 @@ pub(crate) fn writer_classes(
 
 fn reader_classes(
     trace: &Trace,
-    compiled: &model_compiler::CompiledModel,
+    compiled: &poem_compiler::CompiledModel,
     value: ValueId,
 ) -> ClassSet {
-    use model_ir::Operands as _;
+    use poem_ir::Operands as _;
     let mut inputs: Vec<ValueId> = Vec::new();
     let mut readers: Vec<u32> = Vec::new();
     for (at, node) in trace.nodes.iter().enumerate() {

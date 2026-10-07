@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use model_exec::law::fit;
+use poem_exec::law::fit;
 
 use crate::error::{Fault, Result};
 use crate::record::{Arg, Point, Recording, Slot};
 
-pub use model_exec::law::fit::{MAX_NUMERATOR_SCALE, MAX_TILE};
-pub use model_exec::law::{At, Axis, Law, Recipe};
+pub use poem_exec::law::fit::{MAX_NUMERATOR_SCALE, MAX_TILE};
+pub use poem_exec::law::{At, Axis, Law, Recipe};
 
 #[derive(Clone, Debug)]
 pub struct Arm {

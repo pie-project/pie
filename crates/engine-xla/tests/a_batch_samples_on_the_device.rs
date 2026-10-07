@@ -25,8 +25,8 @@ use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceCon
 use eta_ir::op::{IntrinsicId, Op};
 use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
 use eta_ir::types::{Dtype, Literal, Predicate, RngKind, Shape};
-use model_compiler::Budget;
-use model_dsl::{Platform, Request};
+use poem_compiler::Budget;
+use poem_dsl::{Platform, Request};
 
 const RNG: u32 = 0;
 const COUNTS: u32 = 1;

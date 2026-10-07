@@ -25,10 +25,10 @@
 use std::path::Path;
 
 use engine_metal::{Boot, Lane, Shell};
-use model_compiler::Budget;
-use model_dsl::{Classify, Dtype, Platform, Request};
-use model_ir::{Elementwise, Operation};
 use models::qwen_3::model::Model;
+use poem_compiler::Budget;
+use poem_dsl::{Classify, Dtype, Platform, Request};
+use poem_ir::{Elementwise, Operation};
 
 // ---- the micro_text shape (must match `Model::micro_text_dims`) --------------
 const HIDDEN: usize = 128;
@@ -182,7 +182,7 @@ fn word(query_len: u32) -> u64 {
     models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
 }
 
-fn hadamards(trace: &model_ir::Trace) -> usize {
+fn hadamards(trace: &poem_ir::Trace) -> usize {
     trace
         .nodes
         .iter()
@@ -199,7 +199,7 @@ fn try_load(dir: &Path, w: Dtype, rotate: bool) -> Result<Shell, String> {
     } else {
         Model::micro_text(w, Dtype::Bf16, 1)
     };
-    let trace = model_dsl::trace_hybrid("qwen3-micro-text", &model, Platform::Metal);
+    let trace = poem_dsl::trace_hybrid("qwen3-micro-text", &model, Platform::Metal);
     let source = ztensor_compat::index(dir.join("model.safetensors")).map_err(|e| e.to_string())?;
     let contract = model
         .import(&source, Platform::Metal)
@@ -286,12 +286,12 @@ fn the_kv_rotation_is_the_unrotated_forward() {
     // ---- Non-regression / structural check (no device needed): the default
     // path emits NOT ONE Hadamard, so every shipped SKU is byte-unchanged; the
     // rotated path emits exactly four per attention layer (q, k, v, o).
-    let off_trace = model_dsl::trace_hybrid(
+    let off_trace = poem_dsl::trace_hybrid(
         "qwen3-micro-text",
         &Model::micro_text(Dtype::Bf16, Dtype::Bf16, 1),
         Platform::Metal,
     );
-    let on_trace = model_dsl::trace_hybrid(
+    let on_trace = poem_dsl::trace_hybrid(
         "qwen3-micro-text",
         &Model::micro_text_rotated(Dtype::Bf16, Dtype::Bf16, 1),
         Platform::Metal,

@@ -1,5 +1,5 @@
 use kernels_cuda::Tensor;
-use model_ir::ValueId;
+use poem_ir::ValueId;
 
 use crate::api::World;
 use crate::device::Buffer;
@@ -108,7 +108,7 @@ impl Scores {
             self.store.ptr(),
             self.lanes.saturating_mul(self.layout.planes),
             KV_MAX,
-            model_ir::Dtype::F32,
+            poem_ir::Dtype::F32,
         )
     }
 
@@ -162,13 +162,13 @@ impl Scores {
                     base + u64::from(*mine) * row,
                     1,
                     band.saturating_mul(KV_MAX),
-                    model_ir::Dtype::F32,
+                    poem_ir::Dtype::F32,
                 );
                 let mut whole = Tensor::new(
                     base + u64::from(block) * row,
                     1,
                     self.layout.heads.saturating_mul(KV_MAX),
-                    model_ir::Dtype::F32,
+                    poem_ir::Dtype::F32,
                 );
                 kernels_cuda::collective::all_gather(ctx, send, &mut whole)?;
             }
@@ -230,13 +230,13 @@ impl ScoreSeat {
 mod tests {
     use super::*;
 
-    const SCORES_SEAM: &str = model_compiler::EXPORT_SEAMS[2];
+    const SCORES_SEAM: &str = poem_compiler::EXPORT_SEAMS[2];
 
     /// What `serve::load` hands `Scores::reserve` for a SKU: the `scores`
     /// exports in seam order and the query heads of the first one's rectangle.
     fn exported(sku: &str) -> (Vec<ValueId>, u32) {
         let row = models::sku(sku).unwrap_or_else(|| panic!("{sku} is in the catalog"));
-        let trace = (row.trace)(model_ir::Platform::Cuda);
+        let trace = (row.trace)(poem_ir::Platform::Cuda);
         let exports: Vec<ValueId> = trace
             .seams
             .iter()
@@ -246,11 +246,11 @@ mod tests {
         let heads = exports
             .first()
             .and_then(|value| match &trace.values[value.0 as usize].ty {
-                model_ir::Ty::Tensor { shape, .. } => shape.get(1).and_then(|dim| match dim {
-                    model_ir::Dim::Const(heads) => u32::try_from(*heads).ok(),
+                poem_ir::Ty::Tensor { shape, .. } => shape.get(1).and_then(|dim| match dim {
+                    poem_ir::Dim::Const(heads) => u32::try_from(*heads).ok(),
                     _ => None,
                 }),
-                model_ir::Ty::Struct(_) => None,
+                poem_ir::Ty::Struct(_) => None,
             })
             .unwrap_or(0);
         (exports, heads)

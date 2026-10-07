@@ -1,5 +1,5 @@
 use kernels_wgpu::Tensor;
-use model_ir::{Dtype, ValueId};
+use poem_ir::{Dtype, ValueId};
 
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};

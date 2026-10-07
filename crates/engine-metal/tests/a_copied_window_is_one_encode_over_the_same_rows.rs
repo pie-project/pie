@@ -1,8 +1,8 @@
 use engine_metal::window::{Copies, Windows};
-use model_compiler::{Budget, CompiledModel, DeviceProfile, Fallback, compile};
-use model_exec::fire::{ClassWindow, WindowTable};
-use model_exec::store::kv::Geometry;
-use model_ir::{ClassSet, Platform, Trace};
+use poem_compiler::{Budget, CompiledModel, DeviceProfile, Fallback, compile};
+use poem_exec::fire::{ClassWindow, WindowTable};
+use poem_exec::store::kv::Geometry;
+use poem_ir::{ClassSet, Platform, Trace};
 
 const SERVED: &str = "qwen35-d0.8b";
 

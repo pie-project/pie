@@ -12,7 +12,7 @@ use checkpoint::serving::Stamp;
 use checkpoint::types::{BackendKind, ScaleForm, TensorId};
 use engine::load::{Residency, Tiers};
 use kernels_vulkan::Tensor;
-use model_ir::{Dtype, ParamSource, Trace};
+use poem_ir::{Dtype, ParamSource, Trace};
 
 use crate::device::alloc::Memory;
 use crate::device::{Buffer, Context, Handles};
@@ -79,7 +79,7 @@ fn banks(trace: &Trace, places: &[Place]) -> BTreeMap<String, Bank> {
                     slot,
                     rows,
                     cols,
-                    elem: model_compiler::arena::elem_bytes(param.dtype).unwrap_or(0),
+                    elem: poem_compiler::arena::elem_bytes(param.dtype).unwrap_or(0),
                 },
             )
         })
@@ -611,7 +611,7 @@ pub(crate) fn readable_plane_orders(trace: &Trace) -> Result<()> {
                   this shell has no reader for: its qmm and qmv arms index an affine bank \
                   row-major and would answer nonsense off a relaid plane. The order is \
                   `kernels_cuda::linear::tiled`'s, and a model text reaches it only by asking \
-                  for it: `model_dsl::place` resolves a placed dtype against the platform the \
+                  for it: `poem_dsl::place` resolves a placed dtype against the platform the \
                   declaration is read for, and this platform's answer is the canonical \
                   row-major sibling. So either this plane came out of an artifact converted \
                   FOR the cuda shell — convert it again on this box, or serve it there — or a \
@@ -669,7 +669,7 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
                 Dtype::U8g64 => rows.saturating_mul(width),
                 other => {
                     let element =
-                        model_compiler::arena::elem_bytes(other).ok_or_else(|| Fault::Param {
+                        poem_compiler::arena::elem_bytes(other).ok_or_else(|| Fault::Param {
                             name: param.name.clone(),
                             why: "is declared in a packed storage element that has no element \
                                   size",

@@ -2,7 +2,7 @@ const SKU: &str = "qwen38-flash-next-full-u4g64-u2g128-kv-bf16";
 
 #[test]
 fn the_full_row_emits_the_gather_the_planner_keys_on() {
-    use model_dsl::{Attention, Def, Layout, Operation, Platform};
+    use poem_dsl::{Attention, Def, Layout, Operation, Platform};
 
     let trace = (models::sku(SKU)
         .expect("this build ships the full 2-bit row")

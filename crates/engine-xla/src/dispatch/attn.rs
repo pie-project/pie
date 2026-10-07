@@ -1,6 +1,6 @@
 use kernels_xla::attn;
-use model_exec::{DispatchAttention, KernelError};
-use model_ir::{Attention, Operands, StructKind};
+use poem_exec::{DispatchAttention, KernelError};
+use poem_ir::{Attention, Operands, StructKind};
 
 use crate::run::{Run, StructSlot};
 
@@ -211,11 +211,11 @@ impl Run<'_> {
                 let mask = match mask {
                     // A lane's attention class table (engine-cuda's ragged
                     // `ClassTable` arm): each packed row's class, the table.
-                    model_ir::RaggedMask::None | model_ir::RaggedMask::GroupBlockDiagonal
+                    poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal
                         if self.class_table().is_some() =>
                     {
                         let (table, count) = self.class_table().expect("checked above");
-                        let classes_of = |id: model_ir::ValueId, what: &str| {
+                        let classes_of = |id: poem_ir::ValueId, what: &str| {
                             self.packed_classes(id)
                                 .ok_or_else(|| kernels_xla::Error::Backend {
                                     op: "attention.ragged",
@@ -233,8 +233,8 @@ impl Run<'_> {
                             count,
                         }
                     }
-                    model_ir::RaggedMask::ReferenceSelfOnly { .. }
-                    | model_ir::RaggedMask::RelativeBias { .. }
+                    poem_ir::RaggedMask::ReferenceSelfOnly { .. }
+                    | poem_ir::RaggedMask::RelativeBias { .. }
                         if self.class_table().is_some() =>
                     {
                         return Err(kernels_xla::Error::Backend {
@@ -245,16 +245,16 @@ impl Run<'_> {
                                 .to_string(),
                         });
                     }
-                    model_ir::RaggedMask::None | model_ir::RaggedMask::GroupBlockDiagonal => {
+                    poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal => {
                         attn::ragged::RaggedMask::Segments
                     }
-                    model_ir::RaggedMask::ReferenceSelfOnly { q_tags, kv_tags } => {
+                    poem_ir::RaggedMask::ReferenceSelfOnly { q_tags, kv_tags } => {
                         attn::ragged::RaggedMask::ReferenceTags {
                             q_tags: self.tensor(*q_tags),
                             kv_tags: self.tensor(*kv_tags),
                         }
                     }
-                    model_ir::RaggedMask::RelativeBias { table, max_len } => {
+                    poem_ir::RaggedMask::RelativeBias { table, max_len } => {
                         attn::ragged::RaggedMask::RelativeBias {
                             table: self.tensor(*table),
                             max_len: *max_len,
@@ -1397,7 +1397,7 @@ impl Run<'_> {
     pub(crate) fn first_rows(
         &self,
         t: kernels_xla::Tensor,
-        like: model_ir::ValueId,
+        like: poem_ir::ValueId,
     ) -> kernels_xla::Tensor {
         let rows = self.tensor(like).rows;
         if t.rows > rows {
@@ -1413,13 +1413,13 @@ impl Run<'_> {
     pub(crate) fn dense_or_decoded(
         &self,
         op: &'static str,
-        w: model_ir::ValueId,
+        w: poem_ir::ValueId,
         n: u32,
         k: u32,
     ) -> Result<kernels_xla::Tensor, kernels_xla::Error> {
         match self.banked(w) {
             Some(bank) => {
-                let out = self.temp(n, k, model_ir::Dtype::Bf16);
+                let out = self.temp(n, k, poem_ir::Dtype::Bf16);
                 kernels_xla::linear::decode::decoded_plane(self.ctx(), op, bank, out)?;
                 Ok(out)
             }

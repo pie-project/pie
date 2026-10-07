@@ -3,11 +3,11 @@ use std::marker::PhantomData;
 use std::path::Path;
 
 use checkpoint::contract::ModelContract;
-use model_compiler::{
+use poem_compiler::{
     Budget, Budgets, CompiledModel, DeviceProfile, FireRows, PatchLadder, compile_axes,
 };
-use model_exec::fire::{Composition, Filter, FireDescriptor, Lane as FireLane, compose_axes, walk};
-use model_ir::{Dtype, Layout, Operation, RuntimeInput, Trace, Ty, ValueId};
+use poem_exec::fire::{Composition, Filter, FireDescriptor, Lane as FireLane, compose_axes, walk};
+use poem_ir::{Dtype, Layout, Operation, RuntimeInput, Trace, Ty, ValueId};
 
 use crate::arena::Arena;
 use crate::device::ctx::Frame;
@@ -27,13 +27,13 @@ use engine::fire::{Boundary, Masking};
 use engine::frame::{Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase, Supply};
 use engine::runahead::Runahead;
 
-const OUT_SEAM: &str = model_compiler::EXPORT_SEAMS[0];
+const OUT_SEAM: &str = poem_compiler::EXPORT_SEAMS[0];
 
-const MTP_SEAM: &str = model_compiler::EXPORT_SEAMS[1];
+const MTP_SEAM: &str = poem_compiler::EXPORT_SEAMS[1];
 
-const SCORES_SEAM: &str = model_compiler::EXPORT_SEAMS[2];
+const SCORES_SEAM: &str = poem_compiler::EXPORT_SEAMS[2];
 
-const DRAFTS_SEAM: &str = model_compiler::EXPORT_SEAMS[3];
+const DRAFTS_SEAM: &str = poem_compiler::EXPORT_SEAMS[3];
 
 pub struct Boot<'a> {
     pub trace: Trace,
@@ -70,7 +70,7 @@ fn declared_width(trace: &Trace, want: RuntimeInput) -> u64 {
         .values
         .iter()
         .find_map(|decl| {
-            let (model_ir::Def::Input(input), Ty::Tensor { shape, .. }) = (&decl.def, &decl.ty)
+            let (poem_ir::Def::Input(input), Ty::Tensor { shape, .. }) = (&decl.def, &decl.ty)
             else {
                 return None;
             };
@@ -82,7 +82,7 @@ fn declared_width(trace: &Trace, want: RuntimeInput) -> u64 {
                     .iter()
                     .skip(1)
                     .map(|dim| match dim {
-                        model_ir::Dim::Const(n) => *n,
+                        poem_ir::Dim::Const(n) => *n,
                         _ => 1,
                     })
                     .product(),
@@ -236,7 +236,7 @@ pub struct FireCost {
     pub copied: u32,
 }
 
-fn adapter_fact(classes: &model_ir::ClassTable, corrected: &model_ir::ClassSet) -> Option<u32> {
+fn adapter_fact(classes: &poem_ir::ClassTable, corrected: &poem_ir::ClassSet) -> Option<u32> {
     classes.adapter_fact(corrected)
 }
 
@@ -309,9 +309,9 @@ pub struct Shell {
 
     last: FireCost,
 
-    masked: model_ir::ClassSet,
+    masked: poem_ir::ClassSet,
 
-    corrected: model_ir::ClassSet,
+    corrected: poem_ir::ClassSet,
 
     adapter_fact: Option<u32>,
 
@@ -329,7 +329,7 @@ pub struct Shell {
 
     scores: Option<crate::scores::Scores>,
 
-    capturing: model_ir::ClassSet,
+    capturing: poem_ir::ClassSet,
 
     out: ValueId,
 
@@ -360,13 +360,13 @@ impl Shell {
 
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
 
-        let mut masked = model_ir::ClassSet::default();
+        let mut masked = poem_ir::ClassSet::default();
         for region in compiled.template() {
             let runs_masked = region.nodes.clone().any(|node| {
                 matches!(
                     boot.trace.nodes.get(node as usize).map(|node| &node.op),
-                    Some(model_ir::Operation::Attention(
-                        model_ir::Attention::Masked { .. } | model_ir::Attention::MaskedLse { .. }
+                    Some(poem_ir::Operation::Attention(
+                        poem_ir::Attention::Masked { .. } | poem_ir::Attention::MaskedLse { .. }
                     ))
                 )
             });
@@ -377,13 +377,13 @@ impl Shell {
             }
         }
 
-        let mut corrected = model_ir::ClassSet::default();
+        let mut corrected = poem_ir::ClassSet::default();
         for region in compiled.template() {
             let runs_correction = region.nodes.clone().any(|node| {
                 matches!(
                     boot.trace.nodes.get(node as usize).map(|node| &node.op),
-                    Some(model_ir::Operation::Linear(
-                        model_ir::Linear::LoraCorrect { .. }
+                    Some(poem_ir::Operation::Linear(
+                        poem_ir::Linear::LoraCorrect { .. }
                     ))
                 )
             });
@@ -459,8 +459,8 @@ impl Shell {
             .caches
             .iter()
             .filter_map(|row| match row {
-                model_ir::CacheRow::Kv { space, .. } => Some(*space as usize + 1),
-                model_ir::CacheRow::State { .. } => None,
+                poem_ir::CacheRow::Kv { space, .. } => Some(*space as usize + 1),
+                poem_ir::CacheRow::State { .. } => None,
             })
             .max()
             .unwrap_or(0);
@@ -471,7 +471,7 @@ impl Shell {
 
         let patch_seat = boot.patches.as_ref().and_then(|ladder| {
             boot.trace.values.iter().find_map(|decl| {
-                let (model_ir::Def::Input(RuntimeInput::Patches), Ty::Tensor { shape, dtype }) =
+                let (poem_ir::Def::Input(RuntimeInput::Patches), Ty::Tensor { shape, dtype }) =
                     (&decl.def, &decl.ty)
                 else {
                     return None;
@@ -480,11 +480,11 @@ impl Shell {
                     .iter()
                     .skip(1)
                     .map(|dim| match dim {
-                        model_ir::Dim::Const(n) => *n,
+                        poem_ir::Dim::Const(n) => *n,
                         _ => 1,
                     })
                     .product();
-                let element = model_compiler::arena::elem_bytes(*dtype).unwrap_or(0);
+                let element = poem_compiler::arena::elem_bytes(*dtype).unwrap_or(0);
                 Some(crate::inputs::PatchSeat {
                     rows: u64::from(ladder.max_patches),
                     row_bytes: width * element,
@@ -501,7 +501,7 @@ impl Shell {
             .trace
             .values
             .iter()
-            .any(|decl| matches!(&decl.def, model_ir::Def::Input(RuntimeInput::ReadoutRows)));
+            .any(|decl| matches!(&decl.def, poem_ir::Def::Input(RuntimeInput::ReadoutRows)));
         if declared_width(&boot.trace, RuntimeInput::SelfCondRows) > 0 {
             return Err(Fault::Program {
                 at: "serve::load",
@@ -566,9 +566,9 @@ impl Shell {
             .flat_map(|seam| seam.values.iter().copied())
             .collect();
 
-        let mut capturing = model_ir::ClassSet::default();
+        let mut capturing = poem_ir::ClassSet::default();
         {
-            use model_ir::Operands;
+            use poem_ir::Operands;
             let mut outputs: Vec<ValueId> = Vec::new();
             let writers: Vec<u32> = boot
                 .trace
@@ -593,11 +593,11 @@ impl Shell {
         let score_heads = score_values
             .first()
             .and_then(|value| match &boot.trace.values[value.0 as usize].ty {
-                model_ir::Ty::Tensor { shape, .. } => shape.get(1).and_then(|dim| match dim {
-                    model_ir::Dim::Const(heads) => u32::try_from(*heads).ok(),
+                poem_ir::Ty::Tensor { shape, .. } => shape.get(1).and_then(|dim| match dim {
+                    poem_ir::Dim::Const(heads) => u32::try_from(*heads).ok(),
                     _ => None,
                 }),
-                model_ir::Ty::Struct(_) => None,
+                poem_ir::Ty::Struct(_) => None,
             })
             .unwrap_or(0);
         let scores = crate::scores::Scores::reserve(
@@ -617,7 +617,7 @@ impl Shell {
                     images: u64::from(budgets.max_images()),
                     voxels: u64::from(budgets.max_voxels()),
                     clips: u64::from(budgets.max_clips()),
-                    readouts: model_compiler::arena::readouts_ceiling(&boot.budget),
+                    readouts: poem_compiler::arena::readouts_ceiling(&boot.budget),
                 },
             )?;
             let logits = carved.0[out.0 as usize].ok_or_else(|| Fault::Unbound {
@@ -1377,8 +1377,8 @@ impl Shell {
         let mut media_of: Vec<Option<&Media<'_>>> = vec![None; lanes.len()];
         for shot in media {
             let Some(seat) = self.patch_seat else {
-                return Err(Fault::from(model_exec::Error::Fire(
-                    model_exec::fire::Fault::Towerless { lane: shot.lane },
+                return Err(Fault::from(poem_exec::Error::Fire(
+                    poem_exec::fire::Fault::Towerless { lane: shot.lane },
                 )));
             };
             let at = shot.lane as usize;
@@ -1454,8 +1454,8 @@ impl Shell {
             if let Some((j, &route)) = shot.routes.iter().enumerate().find(|&(_, &route)| {
                 !(drop && route == PATCH_ROUTE_DROP) && (route < 0 || route as u32 >= rows_here32)
             }) {
-                return Err(Fault::from(model_exec::Error::Fire(
-                    model_exec::fire::Fault::PatchRoute {
+                return Err(Fault::from(poem_exec::Error::Fire(
+                    poem_exec::fire::Fault::PatchRoute {
                         at: j as u32,
                         route,
                         rows: rows_here32,
@@ -1903,7 +1903,7 @@ impl Shell {
         windows.bind(&self.handles, bound.windows)?;
 
         let readouts = u64::from(lane_count).max(readout_rows.len() as u64);
-        let readouts_ceiling = model_compiler::arena::readouts_ceiling(&self.budgets.tokens);
+        let readouts_ceiling = poem_compiler::arena::readouts_ceiling(&self.budgets.tokens);
         if readouts > readouts_ceiling {
             return Err(Fault::Ceiling {
                 what: "rows one fire reads logits for (READOUTS_PER_LANE per lane)",

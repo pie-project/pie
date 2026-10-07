@@ -1,8 +1,8 @@
 use kernels_xla::collective;
-use model_exec::{DispatchCollective, KernelError};
-use model_ir::Collective;
+use poem_exec::{DispatchCollective, KernelError};
+use poem_ir::Collective;
 
-use model_ir::Operands;
+use poem_ir::Operands;
 
 use crate::run::Run;
 

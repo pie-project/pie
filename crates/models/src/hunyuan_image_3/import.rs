@@ -1,7 +1,7 @@
 use checkpoint::contract::{Expr, ModelContract, TensorContract, TensorType};
 use checkpoint::types::Encoding;
 use checkpoint_dsl::{Builder, Error, encoding, extents, stored_encoding};
-use model_dsl::{Platform, Weight};
+use poem_dsl::{Platform, Weight};
 
 use super::model::{Conv, Embedder, GroupNorm, Linear, Model, ResBlock};
 

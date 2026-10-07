@@ -14,7 +14,7 @@ use checkpoint::plan::{LoadPlan, StorageTarget, compile, compile_streaming};
 use checkpoint::serving::{self, Stamp};
 use checkpoint::types::{BackendKind, ScaleForm, TensorId};
 use kernels_metal::Tensor;
-use model_ir::{Dtype, ParamSource, Trace};
+use poem_ir::{Dtype, ParamSource, Trace};
 
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
@@ -89,7 +89,7 @@ fn banks(trace: &Trace, places: &[Place], seat: impl Fn(usize) -> u64) -> BTreeM
                     slot,
                     rows,
                     cols,
-                    elem: model_compiler::arena::elem_bytes(param.dtype).unwrap_or(0),
+                    elem: poem_compiler::arena::elem_bytes(param.dtype).unwrap_or(0),
                 },
             )
         })
@@ -380,7 +380,7 @@ impl Weights {
         trace: &Trace,
     ) -> Result<()> {
         for (at, param) in trace.params.iter().enumerate() {
-            let model_ir::ParamLayout::ConvTapsMajor { c_in, taps } = param.layout else {
+            let poem_ir::ParamLayout::ConvTapsMajor { c_in, taps } = param.layout else {
                 continue;
             };
             let Some(Some(WeightRow::Dense(plane))) = self.table.0.get(at).copied() else {
@@ -444,10 +444,10 @@ impl Weights {
         }
         let mut dense = vec![false; trace.params.len()];
         for node in &trace.nodes {
-            if let model_ir::Operation::Linear(
-                model_ir::Linear::Matmul { w, .. } | model_ir::Linear::LmHead { w, .. },
+            if let poem_ir::Operation::Linear(
+                poem_ir::Linear::Matmul { w, .. } | poem_ir::Linear::LmHead { w, .. },
             ) = &node.op
-                && let model_ir::Def::Weight(at) = trace.values[w.0 as usize].def
+                && let poem_ir::Def::Weight(at) = trace.values[w.0 as usize].def
             {
                 dense[at as usize] = true;
             }
@@ -703,7 +703,7 @@ pub(crate) fn readable_plane_orders(trace: &Trace) -> Result<()> {
                   this shell has no reader for: its qmm and qmv arms index an affine bank \
                   row-major and would answer nonsense off a relaid plane. The order is \
                   `kernels_cuda::linear::tiled`'s, and a model text reaches it only by asking \
-                  for it: `model_dsl::place` resolves a placed dtype against the platform the \
+                  for it: `poem_dsl::place` resolves a placed dtype against the platform the \
                   declaration is read for, and this platform's answer is the canonical \
                   row-major sibling. So either this plane came out of an artifact converted \
                   FOR the cuda shell — convert it again on this box, or serve it there — or a \
@@ -761,7 +761,7 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
                 Dtype::Ptq1_0 => rows.saturating_mul(width.div_ceil(128).saturating_mul(28)),
                 other => {
                     let element =
-                        model_compiler::arena::elem_bytes(other).ok_or_else(|| Fault::Param {
+                        poem_compiler::arena::elem_bytes(other).ok_or_else(|| Fault::Param {
                             name: param.name.clone(),
                             why: "is declared in a packed storage element that has no element \
                                   size",
@@ -1283,7 +1283,7 @@ impl TensorSink for Landing<'_> {
 mod tests {
     use checkpoint::contract::Expr;
     use checkpoint::types::{DType, Encoding};
-    use model_ir::Platform;
+    use poem_ir::Platform;
 
     use super::*;
 

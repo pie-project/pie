@@ -3,7 +3,7 @@ pub mod kv;
 
 use engine::transfer::KvCopy;
 use kernels_metal::{KvPool, RecurrentPool, Tensor};
-use model_ir::{CacheRow, Dtype, Trace};
+use poem_ir::{CacheRow, Dtype, Trace};
 
 use crate::device::ctx::Frame;
 use crate::device::elastic;
@@ -12,14 +12,14 @@ use crate::error::{Fault, Result};
 use crate::run::{CachePool, CacheTable};
 use crate::store::kv::{Facts, Paging};
 
-impl From<model_exec::store::Fault> for Fault {
-    fn from(fault: model_exec::store::Fault) -> Fault {
+impl From<poem_exec::store::Fault> for Fault {
+    fn from(fault: poem_exec::store::Fault) -> Fault {
         match fault {
-            model_exec::store::Fault::Ceiling { what, need, have } => {
+            poem_exec::store::Fault::Ceiling { what, need, have } => {
                 Fault::Ceiling { what, need, have }
             }
-            model_exec::store::Fault::Unbound { what } => Fault::Unbound { what },
-            model_exec::store::Fault::Straddled {
+            poem_exec::store::Fault::Unbound { what } => Fault::Unbound { what },
+            poem_exec::store::Fault::Straddled {
                 value,
                 node,
                 planned,
@@ -1080,7 +1080,7 @@ fn slot_file(error: std::io::Error) -> Fault {
 }
 
 fn elem_bytes(name: &str, dtype: Dtype) -> Result<u64> {
-    model_compiler::arena::elem_bytes(dtype).ok_or_else(|| Fault::Unbound {
+    poem_compiler::arena::elem_bytes(dtype).ok_or_else(|| Fault::Unbound {
         what: format!("cache `{name}`, stored as {dtype:?}, which has no element size"),
     })
 }
@@ -1106,7 +1106,7 @@ fn elem_bytes(name: &str, dtype: Dtype) -> Result<u64> {
 /// route through it so a packed plane is contiguous, whole-slot cells that a
 /// byte-blit can move.
 fn row_stride(name: &str, dtype: Dtype, width: u64, head_dim: Option<u32>) -> Result<u64> {
-    if let Some(element) = model_compiler::arena::elem_bytes(dtype) {
+    if let Some(element) = poem_compiler::arena::elem_bytes(dtype) {
         return Ok(width * element);
     }
     // KvU4 sizes per head_dim-block when the head geometry is known.
@@ -1139,7 +1139,7 @@ fn row_stride(name: &str, dtype: Dtype, width: u64, head_dim: Option<u32>) -> Re
 }
 
 fn elem_size(dtype: Dtype) -> u32 {
-    model_compiler::arena::elem_bytes(dtype).unwrap_or(1) as u32
+    poem_compiler::arena::elem_bytes(dtype).unwrap_or(1) as u32
 }
 
 fn narrow(n: u64) -> i32 {

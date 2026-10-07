@@ -1,9 +1,9 @@
-use model_dsl::{
+use poem_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, ops, seam,
 };
 
 use super::model::{Hyper, Indexer, Kda, Mix, Mixer, Mla, Mlp, Model, Tower};
-use model_dsl::MropeForm;
+use poem_dsl::MropeForm;
 
 #[derive(Clone, Copy)]
 enum Arms {

@@ -19,10 +19,10 @@ libc = "0.2"
 prost = { version = "0.14", default-features = false, features = ["derive", "std"] }
 
 toml = "1.1"
-model-ir = { path = "../model-ir" }
+poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 engine = { path = "../engine" }
-model-exec = { path = "../model-exec" }
-model-compiler = { path = "../model-compiler" }
+poem-exec = { package = "pie-poem-exec", path = "../poem-exec" }
+poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
 eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
 eta-exec = { path = "../eta-exec" }
 eta-compiler = { path = "../eta-compiler" }
@@ -34,7 +34,7 @@ serde_json = "1"
 [dev-dependencies]
 checkpoint-dsl = { path = "../checkpoint-dsl" }
 models = { path = "../models" }
-model-dsl = { path = "../model-dsl" }
+poem-dsl = { package = "pie-poem-dsl", path = "../poem-dsl" }
 tokenizer = { path = "../tokenizer" }
 serde_json = "1"
 ztensor-compat = { workspace = true }

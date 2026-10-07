@@ -120,11 +120,11 @@ impl Shell {
         let mut raw = Vec::new();
         for lane in 0..lanes {
             let logits = readback.lanes[lane].map_or_else(
-                || kernels_cuda::Tensor::new(0, 0, 0, model_ir::Dtype::Bf16),
+                || kernels_cuda::Tensor::new(0, 0, 0, poem_ir::Dtype::Bf16),
                 |(_, plane)| plane,
             );
             let width = logits.width as usize;
-            let element = if logits.dtype == model_ir::Dtype::F32 {
+            let element = if logits.dtype == poem_ir::Dtype::F32 {
                 4
             } else {
                 2
@@ -216,7 +216,7 @@ impl Shell {
                 .map(|w| i32::from_le_bytes([w[0], w[1], w[2], w[3]]))
                 .collect();
             let channels = seat.plane.width as usize;
-            let element = model_compiler::arena::elem_bytes(seat.plane.dtype).unwrap_or(0) as usize;
+            let element = poem_compiler::arena::elem_bytes(seat.plane.dtype).unwrap_or(0) as usize;
             let mut raw: Vec<u8> = Vec::new();
             for (&(first, count), answer) in seat.lane_clips.iter().zip(pixels.iter_mut()) {
                 let mut values = Vec::new();
@@ -234,7 +234,7 @@ impl Shell {
                         &mut raw,
                     )?;
                     match seat.plane.dtype {
-                        model_ir::Dtype::F32 => values.extend(
+                        poem_ir::Dtype::F32 => values.extend(
                             raw.chunks_exact(4)
                                 .map(|w| f32::from_le_bytes([w[0], w[1], w[2], w[3]])),
                         ),

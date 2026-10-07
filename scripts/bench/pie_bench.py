@@ -276,7 +276,7 @@ def build_config(args: argparse.Namespace):
             engine_options["max_total_pages"] = args.total_pages
         # Pin the forward layout only on explicit request: an unasked-for pin
         # collapses the planner's lattice to a guess. Needed when the planner
-        # reports "no viable crates/model-compiler/KV layout fits budget", which a large
+        # reports "no viable crates/poem-compiler/KV layout fits budget", which a large
         # dense checkpoint can provoke by leaving too little room for the
         # prefill width the planner would otherwise pick.
         if args.max_forward_tokens != PIE_MAX_FORWARD_TOKENS_DEFAULT:

@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 
 use engine_xla::DeviceBoot;
 use engine_xla::serve::{Boot, Shell};
-use model_compiler::Budget;
-use model_dsl::Platform;
+use poem_compiler::Budget;
+use poem_dsl::Platform;
 
 const PREFILL: u32 = 24;
 
@@ -105,7 +105,7 @@ fn one(
             trace
                 .params
                 .iter()
-                .any(|p| p.source == model_ir::ParamSource::Registered),
+                .any(|p| p.source == poem_ir::ParamSource::Registered),
         ),
         page_size: 16,
         max_context: 512,
@@ -183,8 +183,8 @@ fn one(
     ))
 }
 
-fn dtype_bits(dtype: model_dsl::Dtype) -> u32 {
-    use model_dsl::Dtype as D;
+fn dtype_bits(dtype: poem_dsl::Dtype) -> u32 {
+    use poem_dsl::Dtype as D;
     match dtype {
         D::F32 | D::I32 | D::U32 => 32,
         D::I64 | D::U64 => 64,

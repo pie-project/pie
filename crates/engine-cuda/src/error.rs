@@ -1,6 +1,6 @@
 use std::fmt;
 
-use model_exec::KernelError;
+use poem_exec::KernelError;
 
 pub type Result<T> = std::result::Result<T, Fault>;
 
@@ -13,11 +13,11 @@ pub enum Fault {
         code: i32,
     },
 
-    Bake(model_compiler::Error),
+    Bake(poem_compiler::Error),
 
     Load(checkpoint::error::Error),
 
-    Fire(model_exec::Error),
+    Fire(poem_exec::Error),
 
     Fragmented {
         region: u32,
@@ -411,8 +411,8 @@ impl fmt::Display for Fault {
 
 impl std::error::Error for Fault {}
 
-impl From<model_compiler::Error> for Fault {
-    fn from(refusal: model_compiler::Error) -> Fault {
+impl From<poem_compiler::Error> for Fault {
+    fn from(refusal: poem_compiler::Error) -> Fault {
         Fault::Bake(refusal)
     }
 }
@@ -423,8 +423,8 @@ impl From<checkpoint::error::Error> for Fault {
     }
 }
 
-impl From<model_exec::Error> for Fault {
-    fn from(error: model_exec::Error) -> Fault {
+impl From<poem_exec::Error> for Fault {
+    fn from(error: poem_exec::Error) -> Fault {
         Fault::Fire(error)
     }
 }
@@ -450,9 +450,9 @@ impl From<eta_exec::Error> for Fault {
     }
 }
 
-impl From<model_exec::KernelError> for Fault {
-    fn from(error: model_exec::KernelError) -> Fault {
-        Fault::Fire(model_exec::Error::Kernel(error))
+impl From<poem_exec::KernelError> for Fault {
+    fn from(error: poem_exec::KernelError) -> Fault {
+        Fault::Fire(poem_exec::Error::Kernel(error))
     }
 }
 

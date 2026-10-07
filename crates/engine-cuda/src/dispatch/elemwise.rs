@@ -1,6 +1,6 @@
 use kernels_cuda::{Tensor, elemwise};
-use model_exec::{DispatchElementwise, KernelError};
-use model_ir::{Elementwise, ModulateForm, MropeForm, NormKind, Operands, RopeForm};
+use poem_exec::{DispatchElementwise, KernelError};
+use poem_ir::{Elementwise, ModulateForm, MropeForm, NormKind, Operands, RopeForm};
 
 use crate::run::Run;
 
@@ -174,7 +174,7 @@ impl Run<'_> {
                 self.tensor(*weight),
                 *head_dim,
                 *eps,
-                matches!(act, model_ir::GateActivation::Sigmoid),
+                matches!(act, poem_ir::GateActivation::Sigmoid),
                 &mut self.tensor(*y),
             ),
             Elementwise::RmsnormGatedBy {

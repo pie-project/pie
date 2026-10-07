@@ -1,6 +1,6 @@
 use std::fmt;
 
-use model_exec::KernelError;
+use poem_exec::KernelError;
 
 #[derive(Debug)]
 pub enum Fault {
@@ -48,11 +48,11 @@ pub enum Fault {
         want: u64,
     },
 
-    Bake(model_compiler::Error),
+    Bake(poem_compiler::Error),
 
     Load(checkpoint::error::Error),
 
-    Fire(model_exec::Error),
+    Fire(poem_exec::Error),
 
     Param {
         name: String,
@@ -409,8 +409,8 @@ impl fmt::Display for Fault {
 
 impl std::error::Error for Fault {}
 
-impl From<model_compiler::Error> for Fault {
-    fn from(refusal: model_compiler::Error) -> Self {
+impl From<poem_compiler::Error> for Fault {
+    fn from(refusal: poem_compiler::Error) -> Self {
         Self::Bake(refusal)
     }
 }
@@ -421,15 +421,15 @@ impl From<checkpoint::error::Error> for Fault {
     }
 }
 
-impl From<model_exec::Error> for Fault {
-    fn from(error: model_exec::Error) -> Self {
+impl From<poem_exec::Error> for Fault {
+    fn from(error: poem_exec::Error) -> Self {
         Self::Fire(error)
     }
 }
 
-impl From<model_exec::KernelError> for Fault {
-    fn from(error: model_exec::KernelError) -> Self {
-        Self::Fire(model_exec::Error::from(error))
+impl From<poem_exec::KernelError> for Fault {
+    fn from(error: poem_exec::KernelError) -> Self {
+        Self::Fire(poem_exec::Error::from(error))
     }
 }
 

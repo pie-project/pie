@@ -1,6 +1,6 @@
 use kernels_cuda::custom;
-use model_exec::{DispatchCustomCuda, KernelError};
-use model_ir::CustomCuda;
+use poem_exec::{DispatchCustomCuda, KernelError};
+use poem_ir::CustomCuda;
 
 use crate::run::Run;
 
@@ -49,35 +49,35 @@ impl Run<'_> {
     }
 }
 
-impl model_exec::DispatchProbe for Run<'_> {
-    fn probe(&mut self, node: &model_ir::Node) {
-        use model_ir::Operands;
+impl poem_exec::DispatchProbe for Run<'_> {
+    fn probe(&mut self, node: &poem_ir::Node) {
+        use poem_ir::Operands;
         let tag = crate::record::PTR_TAG.load(std::sync::atomic::Ordering::Relaxed);
         if tag != 0 {
             let mut ins = Vec::new();
             let mut outs = Vec::new();
             node.op.inputs(&mut ins);
             node.op.outputs(&mut outs);
-            let show = |run: &Self, ids: &[model_ir::ValueId]| -> String {
+            let show = |run: &Self, ids: &[poem_ir::ValueId]| -> String {
                 ids.iter()
                     .map(|id| {
                         let Some(decl) = run.values().get(id.0 as usize) else {
                             return format!("{}:?", id.0);
                         };
                         match &decl.def {
-                            model_ir::Def::Op(_)
-                            | model_ir::Def::Merge(_)
-                            | model_ir::Def::Weight(_)
+                            poem_ir::Def::Op(_)
+                            | poem_ir::Def::Merge(_)
+                            | poem_ir::Def::Weight(_)
                                 if run.resolvable(*id) =>
                             {
                                 let t = run.tensor(*id);
                                 format!("{}:{:#x}/{}x{}", id.0, t.ptr, t.rows, t.width)
                             }
-                            model_ir::Def::Op(_) | model_ir::Def::Merge(_) => {
+                            poem_ir::Def::Op(_) | poem_ir::Def::Merge(_) => {
                                 format!("{}:unslotted", id.0)
                             }
-                            model_ir::Def::Weight(_) => format!("{}:planes", id.0),
-                            model_ir::Def::Input(kind) => {
+                            poem_ir::Def::Weight(_) => format!("{}:planes", id.0),
+                            poem_ir::Def::Input(kind) => {
                                 let t = run.tensor(*id);
                                 let short = format!("{kind:?}").replace(' ', "");
                                 format!(
@@ -116,12 +116,12 @@ impl model_exec::DispatchProbe for Run<'_> {
             let Some(decl) = self.values().get(id.0 as usize) else {
                 continue;
             };
-            let model_ir::Ty::Tensor { dtype, .. } = &decl.ty else {
+            let poem_ir::Ty::Tensor { dtype, .. } = &decl.ty else {
                 continue;
             };
             let elem: usize = match dtype {
-                model_ir::Dtype::Bf16 | model_ir::Dtype::F16 => 2,
-                model_ir::Dtype::F32 => 4,
+                poem_ir::Dtype::Bf16 | poem_ir::Dtype::F16 => 2,
+                poem_ir::Dtype::F32 => 4,
                 _ => continue,
             };
             let t = self.tensor(id);
@@ -137,10 +137,10 @@ impl model_exec::DispatchProbe for Run<'_> {
                 continue;
             }
             let bad = match dtype {
-                model_ir::Dtype::F32 => host
+                poem_ir::Dtype::F32 => host
                     .chunks_exact(4)
                     .position(|c| !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_finite()),
-                model_ir::Dtype::Bf16 => host
+                poem_ir::Dtype::Bf16 => host
                     .chunks_exact(2)
                     .position(|c| (u16::from_le_bytes([c[0], c[1]]) & 0x7f80) == 0x7f80),
                 _ => host

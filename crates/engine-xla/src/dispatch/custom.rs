@@ -1,8 +1,8 @@
 use kernels_xla::spatial;
-use model_exec::{DispatchCustomCuda, DispatchProbe, DispatchSpatial, KernelError};
-use model_ir::{CustomCuda, GridRule, Spatial, TimePad, VoxelSegment};
+use poem_exec::{DispatchCustomCuda, DispatchProbe, DispatchSpatial, KernelError};
+use poem_ir::{CustomCuda, GridRule, Spatial, TimePad, VoxelSegment};
 
-use model_ir::Operands;
+use poem_ir::Operands;
 
 use crate::run::Run;
 
@@ -24,7 +24,7 @@ impl DispatchSpatial for Run<'_> {
 /// the arena reuses its root for later values, so reading it at the end of
 /// the program would read somebody else.
 impl DispatchProbe for Run<'_> {
-    fn probe(&mut self, node: &model_ir::Node) {
+    fn probe(&mut self, node: &poem_ir::Node) {
         if self.probes().is_empty() {
             return;
         }

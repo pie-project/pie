@@ -6,7 +6,7 @@ use kernels_metal::Tensor;
 use kernels_metal::attn::ssm::{self, Committed};
 use kernels_metal::encode::{Arg, Encode, Fire, Grid};
 use kernels_metal::tensor::{RaggedTensor, RecurrentPool};
-use model_ir::Dtype;
+use poem_ir::Dtype;
 
 const K_HEADS: u32 = 16;
 const V_HEADS: u32 = 48;

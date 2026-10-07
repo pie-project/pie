@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use kernels_metal::Tensor;
-use model_compiler::CompiledModel;
-use model_exec::fire::MaskSpan;
-use model_ir::{Def, Linear, Operands, Operation, Trace, ValueId};
+use poem_compiler::CompiledModel;
+use poem_exec::fire::MaskSpan;
+use poem_ir::{Def, Linear, Operands, Operation, Trace, ValueId};
 
 use crate::device::{Buffer, Handles};
 use crate::error::{Fault, Result};

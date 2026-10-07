@@ -17,8 +17,8 @@ use engine::program::{
 use engine::transfer::{KvCopy, MemoryDomain, StateCopy, StateDirection};
 use eta_ir::registry::{GeometryClass, ModelProfile, Port, PortMask};
 use eta_ir::types::Dtype;
-use model_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder, VoxelLadder};
-use model_ir::Trace;
+use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder, VoxelLadder};
+use poem_ir::Trace;
 
 use crate::error::Fault;
 use crate::program::Session as ProgramSession;
@@ -26,7 +26,7 @@ use crate::serve::{Attached, Boot, Graphs, Knobs, Lane, Seated, Shell};
 
 pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, String>;
 
-pub type ClassifyFor = fn(&str) -> Option<model_ir::ClassifyFn>;
+pub type ClassifyFor = fn(&str) -> Option<poem_ir::ClassifyFn>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct World {
@@ -298,8 +298,8 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
     const DERIVED_PATCH_CEILING: u32 = 4096;
 
     let declares_patches = trace.values.iter().any(|decl| {
-        matches!(&decl.ty, model_ir::Ty::Tensor { shape, .. }
-            if shape.first().and_then(|dim| dim.axis()) == Some(model_ir::RowAxis::Patches))
+        matches!(&decl.ty, poem_ir::Ty::Tensor { shape, .. }
+            if shape.first().and_then(|dim| dim.axis()) == Some(poem_ir::RowAxis::Patches))
     });
     if !declares_patches {
         return None;
@@ -331,8 +331,8 @@ pub fn voxel_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<VoxelLadder>
     const DERIVED_VOXEL_CEILING: u32 = 65_536;
 
     let declares_voxels = trace.values.iter().any(|decl| {
-        matches!(&decl.ty, model_ir::Ty::Tensor { shape, .. }
-            if shape.first().and_then(|dim| dim.axis()) == Some(model_ir::RowAxis::Voxels))
+        matches!(&decl.ty, poem_ir::Ty::Tensor { shape, .. }
+            if shape.first().and_then(|dim| dim.axis()) == Some(poem_ir::RowAxis::Voxels))
     });
     if !declares_voxels {
         return None;
@@ -460,9 +460,9 @@ impl Engine for Cuda {
             ordinal,
             frames_in_flight,
         } = request;
-        let trace = model_ir::fuse::residual_norm(trace);
+        let trace = poem_ir::fuse::residual_norm(trace);
         let trace = if self.boot.knobs.diagnostics.fuse_chains {
-            model_ir::fuse::residual_chains(trace)
+            poem_ir::fuse::residual_chains(trace)
         } else {
             trace
         };
@@ -555,7 +555,7 @@ intended for diagnostics, not serving",
             .trace()
             .caches
             .iter()
-            .any(|row| matches!(row, model_ir::CacheRow::State { .. }));
+            .any(|row| matches!(row, poem_ir::CacheRow::State { .. }));
         let profile = profile(&shell, &budgets)?;
 
         let caps = Capabilities {
@@ -1116,8 +1116,8 @@ impl Cuda {
         let mut staged: Vec<Vec<u8>> = Vec::new();
         if !submission.media.is_empty() {
             let Some(element) = shell.patch_element() else {
-                return Err(fault(crate::error::Fault::from(model_exec::Error::Fire(
-                    model_exec::fire::Fault::Towerless {
+                return Err(fault(crate::error::Fault::from(poem_exec::Error::Fire(
+                    poem_exec::fire::Fault::Towerless {
                         lane: submission.media[0].lane,
                     },
                 ))));
@@ -1135,8 +1135,8 @@ impl Cuda {
         let mut voxel_bytes: Vec<Vec<u8>> = Vec::new();
         if !submission.voxels.is_empty() {
             let Some(element) = shell.voxel_element() else {
-                return Err(fault(crate::error::Fault::from(model_exec::Error::Fire(
-                    model_exec::fire::Fault::Vaeless {
+                return Err(fault(crate::error::Fault::from(poem_exec::Error::Fire(
+                    poem_exec::fire::Fault::Vaeless {
                         lane: submission.voxels[0].lane,
                     },
                 ))));
@@ -1213,14 +1213,14 @@ impl Cuda {
 
 fn patch_bytes(
     patches: &[f32],
-    element: model_ir::Dtype,
+    element: poem_ir::Dtype,
 ) -> std::result::Result<Vec<u8>, &'static str> {
     match element {
-        model_ir::Dtype::Bf16 => Ok(patches
+        poem_ir::Dtype::Bf16 => Ok(patches
             .iter()
             .flat_map(|&v| crate::adapter::bf16_bits(v).to_le_bytes())
             .collect()),
-        model_ir::Dtype::F32 => Ok(patches.iter().flat_map(|&v| v.to_le_bytes()).collect()),
+        poem_ir::Dtype::F32 => Ok(patches.iter().flat_map(|&v| v.to_le_bytes()).collect()),
         _ => Err(
             "a media submission against a plan whose activation element is neither \
                   `bf16` nor `f32`, which is the pair every tower in this catalog computes in",
@@ -1325,13 +1325,13 @@ unsafe impl Sync for Cuda {}
 mod tests {
     use super::patch_ladder;
     use engine::load::Budgets as LoadBudgets;
-    use model_compiler::PATCH_LATTICE_FLOOR;
-    use model_ir::{Def, Dim, Dtype, RuntimeInput, Trace, Ty, ValueDecl};
+    use poem_compiler::PATCH_LATTICE_FLOOR;
+    use poem_ir::{Def, Dim, Dtype, RuntimeInput, Trace, Ty, ValueDecl};
 
     fn trace_with(shape: Vec<Dim>) -> Trace {
         Trace {
             name: "gate".into(),
-            platform: model_ir::Platform::Cuda,
+            platform: poem_ir::Platform::Cuda,
             params: Vec::new(),
             caches: Vec::new(),
             values: vec![ValueDecl {

@@ -1,31 +1,31 @@
-use model_compiler::CompiledModel;
-use model_ir::{Operands, Trace, ValueId};
+use poem_compiler::CompiledModel;
+use poem_ir::{Operands, Trace, ValueId};
 
 use crate::error::{Fault, Result};
 
-pub(crate) const OUT_SEAM: &str = model_compiler::EXPORT_SEAMS[0];
-pub(crate) const MTP_SEAM: &str = model_compiler::EXPORT_SEAMS[1];
-pub(crate) const SCORES_SEAM: &str = model_compiler::EXPORT_SEAMS[2];
-pub(crate) const FLOAT_READOUT_SEAMS: [&str; 3] = model_compiler::FLOAT_READOUT_SEAMS;
-pub(crate) const PIXELS_SEAM: &str = model_compiler::EXPORT_SEAMS[6];
-pub(crate) const DRAFTS_SEAM: &str = model_compiler::EXPORT_SEAMS[3];
+pub(crate) const OUT_SEAM: &str = poem_compiler::EXPORT_SEAMS[0];
+pub(crate) const MTP_SEAM: &str = poem_compiler::EXPORT_SEAMS[1];
+pub(crate) const SCORES_SEAM: &str = poem_compiler::EXPORT_SEAMS[2];
+pub(crate) const FLOAT_READOUT_SEAMS: [&str; 3] = poem_compiler::FLOAT_READOUT_SEAMS;
+pub(crate) const PIXELS_SEAM: &str = poem_compiler::EXPORT_SEAMS[6];
+pub(crate) const DRAFTS_SEAM: &str = poem_compiler::EXPORT_SEAMS[3];
 
 #[derive(Debug, Clone)]
 pub struct Export {
     pub value: ValueId,
     pub layer: u32,
-    pub classes: model_ir::ClassSet,
+    pub classes: poem_ir::ClassSet,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct Exports {
-    pub(crate) out_classes: model_ir::ClassSet,
+    pub(crate) out_classes: poem_ir::ClassSet,
     pub(crate) out: Option<ValueId>,
     pub(crate) mtp: Option<Export>,
     pub(crate) drafts: Option<Export>,
     pub(crate) drafts_depth: u32,
     pub(crate) scores: Vec<Export>,
-    pub(crate) capturing: model_ir::ClassSet,
+    pub(crate) capturing: poem_ir::ClassSet,
     pub(crate) velocity: Option<Export>,
     pub(crate) hidden: Vec<Export>,
     pub(crate) pixels: Vec<(Export, ValueId)>,
@@ -160,12 +160,11 @@ impl Exports {
         let drafts = named(DRAFTS_SEAM).into_iter().next();
         let drafts_depth = match &drafts {
             Some(export) => {
-                let width =
-                    model_exec::store::kv::width_of(trace, export.value).map_err(|why| {
-                        Fault::Unbound {
-                            what: format!("the `{DRAFTS_SEAM}` export's width: {why}"),
-                        }
-                    })?;
+                let width = poem_exec::store::kv::width_of(trace, export.value).map_err(|why| {
+                    Fault::Unbound {
+                        what: format!("the `{DRAFTS_SEAM}` export's width: {why}"),
+                    }
+                })?;
                 match u32::try_from(width) {
                     Ok(depth) if depth > 0 => depth,
                     _ => {
@@ -177,7 +176,7 @@ impl Exports {
             }
             None => 0,
         };
-        let mut capturing = model_ir::ClassSet::default();
+        let mut capturing = poem_ir::ClassSet::default();
         for export in &scores {
             for class in export.classes.iter() {
                 capturing.insert(class);
@@ -200,7 +199,7 @@ impl Exports {
             })
             .collect();
         Ok(Exports {
-            out_classes: out.map_or_else(model_ir::ClassSet::default, |out| {
+            out_classes: out.map_or_else(poem_ir::ClassSet::default, |out| {
                 writer_classes(trace, compiled, out)
             }),
             out,
@@ -216,11 +215,11 @@ impl Exports {
     }
 }
 
-fn writer_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> model_ir::ClassSet {
-    if let Some(model_ir::Def::Merge(arms)) =
+fn writer_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> poem_ir::ClassSet {
+    if let Some(poem_ir::Def::Merge(arms)) =
         trace.values.get(value.0 as usize).map(|decl| &decl.def)
     {
-        let mut classes = model_ir::ClassSet::default();
+        let mut classes = poem_ir::ClassSet::default();
         for (arm, _) in arms {
             for class in writer_classes(trace, compiled, *arm).iter() {
                 classes.insert(class);
@@ -237,7 +236,7 @@ fn writer_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> mo
             writers.push(u32::try_from(at).unwrap_or(u32::MAX));
         }
     }
-    let mut classes = model_ir::ClassSet::default();
+    let mut classes = poem_ir::ClassSet::default();
     for region in compiled.template() {
         if !region.nodes.clone().any(|node| writers.contains(&node)) {
             continue;
@@ -250,34 +249,34 @@ fn writer_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> mo
 }
 
 #[must_use]
-pub(crate) fn masked_classes(trace: &Trace, compiled: &CompiledModel) -> model_ir::ClassSet {
+pub(crate) fn masked_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
     classes_running(trace, compiled, |op| {
         matches!(
             op,
-            model_ir::Operation::Attention(
-                model_ir::Attention::Masked { .. } | model_ir::Attention::MaskedLse { .. }
+            poem_ir::Operation::Attention(
+                poem_ir::Attention::Masked { .. } | poem_ir::Attention::MaskedLse { .. }
             )
         )
     })
 }
 
 #[must_use]
-pub(crate) fn corrected_classes(trace: &Trace, compiled: &CompiledModel) -> model_ir::ClassSet {
+pub(crate) fn corrected_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
     classes_running(trace, compiled, |op| {
         matches!(
             op,
-            model_ir::Operation::Linear(model_ir::Linear::LoraCorrect { .. })
+            poem_ir::Operation::Linear(poem_ir::Linear::LoraCorrect { .. })
         )
     })
 }
 
 #[must_use]
-pub(crate) fn media_classes(trace: &Trace, compiled: &CompiledModel) -> model_ir::ClassSet {
+pub(crate) fn media_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
     classes_running(trace, compiled, |op| {
         matches!(
             op,
-            model_ir::Operation::Layout(
-                model_ir::Layout::ScatterRows { .. } | model_ir::Layout::ScatterLiveRows { .. }
+            poem_ir::Operation::Layout(
+                poem_ir::Layout::ScatterRows { .. } | poem_ir::Layout::ScatterLiveRows { .. }
             )
         )
     })
@@ -287,15 +286,15 @@ const READINGS: u8 = 8;
 
 #[must_use]
 pub(crate) fn landing_requests(
-    classify: model_ir::ClassifyFn,
-    classes: &model_ir::ClassTable,
-) -> Vec<Vec<model_ir::Request>> {
+    classify: poem_ir::ClassifyFn,
+    classes: &poem_ir::ClassTable,
+) -> Vec<Vec<poem_ir::Request>> {
     let mut landing = vec![Vec::new(); classes.classes.len()];
     for reading in 0..READINGS {
-        for stream in model_ir::Stream::ALL {
+        for stream in poem_ir::Stream::ALL {
             for bits in 0..128u32 {
                 let request =
-                    model_ir::Request::new(if bits & 1 == 0 { 1 } else { 2 }, bits & 2 != 0)
+                    poem_ir::Request::new(if bits & 1 == 0 { 1 } else { 2 }, bits & 2 != 0)
                         .adapted(bits & 4 != 0)
                         .drafting(bits & 8 != 0)
                         .capturing_scores(bits & 16 != 0)
@@ -316,7 +315,7 @@ pub(crate) fn landing_requests(
     landing
 }
 
-fn request_flags(request: &model_ir::Request) -> u32 {
+fn request_flags(request: &poem_ir::Request) -> u32 {
     u32::from(request.query_len() != 1)
         + u32::from(request.has_custom_mask())
         + u32::from(request.has_adapter())
@@ -324,13 +323,13 @@ fn request_flags(request: &model_ir::Request) -> u32 {
         + u32::from(request.captures_scores())
         + u32::from(request.has_media())
         + u32::from(request.denoise())
-        + u32::from(request.stream() != model_ir::Stream::Text)
+        + u32::from(request.stream() != poem_ir::Stream::Text)
         + u32::from(request.reading() != 0)
 }
 
 #[must_use]
-pub(crate) fn plain_of(landing: &[Vec<model_ir::Request>]) -> model_ir::ClassSet {
-    model_ir::ClassSet::of(
+pub(crate) fn plain_of(landing: &[Vec<poem_ir::Request>]) -> poem_ir::ClassSet {
+    poem_ir::ClassSet::of(
         landing
             .iter()
             .enumerate()
@@ -344,8 +343,8 @@ pub(crate) fn plain_of(landing: &[Vec<model_ir::Request>]) -> model_ir::ClassSet
 }
 
 #[must_use]
-pub(crate) fn decoding_of(landing: &[Vec<model_ir::Request>]) -> model_ir::ClassSet {
-    model_ir::ClassSet::of(
+pub(crate) fn decoding_of(landing: &[Vec<poem_ir::Request>]) -> poem_ir::ClassSet {
+    poem_ir::ClassSet::of(
         landing
             .iter()
             .enumerate()
@@ -364,7 +363,7 @@ pub(crate) fn regions_shifting(trace: &Trace, compiled: &CompiledModel) -> Vec<b
         .map(|region| {
             region.nodes.clone().all(|node| {
                 trace.nodes.get(node as usize).is_some_and(|node| {
-                    let name = model_ir::Operands::name(&node.op);
+                    let name = poem_ir::Operands::name(&node.op);
                     crate::shifted(name) || crate::PLANNED.contains(&name)
                 })
             })
@@ -401,19 +400,19 @@ fn lane_shifting_node(trace: &Trace, node: u32) -> bool {
         let Some(decl) = trace.values.get(id.0 as usize) else {
             return false;
         };
-        if matches!(&decl.def, model_ir::Def::Cache(_)) {
+        if matches!(&decl.def, poem_ir::Def::Cache(_)) {
             return false;
         }
-        let model_ir::Ty::Tensor { shape, .. } = &decl.ty else {
+        let poem_ir::Ty::Tensor { shape, .. } = &decl.ty else {
             return true;
         };
         !matches!(
             shape.first(),
             Some(
-                model_ir::Dim::Lanes
-                    | model_ir::Dim::LanesPlus(_)
-                    | model_ir::Dim::Images
-                    | model_ir::Dim::ImagesPlus(_)
+                poem_ir::Dim::Lanes
+                    | poem_ir::Dim::LanesPlus(_)
+                    | poem_ir::Dim::Images
+                    | poem_ir::Dim::ImagesPlus(_)
             )
         )
     })
@@ -422,9 +421,9 @@ fn lane_shifting_node(trace: &Trace, node: u32) -> bool {
 fn classes_running(
     trace: &Trace,
     compiled: &CompiledModel,
-    wanted: impl Fn(&model_ir::Operation) -> bool,
-) -> model_ir::ClassSet {
-    let mut classes = model_ir::ClassSet::default();
+    wanted: impl Fn(&poem_ir::Operation) -> bool,
+) -> poem_ir::ClassSet {
+    let mut classes = poem_ir::ClassSet::default();
     for region in compiled.template() {
         let runs = region.nodes.clone().any(|node| {
             trace
@@ -443,8 +442,8 @@ fn classes_running(
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Feeds {
-    pub(crate) ports: Vec<(crate::inputs::PortSeat, model_ir::ClassSet)>,
-    pub(crate) selections: Vec<model_ir::Selection>,
+    pub(crate) ports: Vec<(crate::inputs::PortSeat, poem_ir::ClassSet)>,
+    pub(crate) selections: Vec<poem_ir::Selection>,
     pub(crate) merged: Vec<MergedPort>,
     pub(crate) unlanded: Vec<ValueId>,
 }
@@ -453,13 +452,13 @@ pub(crate) struct Feeds {
 pub(crate) struct MergedPort {
     pub(crate) merge: ValueId,
     pub(crate) seat: crate::inputs::PortSeat,
-    pub(crate) select: model_ir::Selection,
+    pub(crate) select: poem_ir::Selection,
 }
 
 impl Feeds {
     #[must_use]
     pub(crate) fn of(trace: &Trace, compiled: &CompiledModel) -> Feeds {
-        use model_ir::{Def, GeomKind, RuntimeInput, Ty};
+        use poem_ir::{Def, GeomKind, RuntimeInput, Ty};
         let mut feeds = Feeds::default();
         for (at, decl) in trace.values.iter().enumerate() {
             let Def::Input(input) = &decl.def else {
@@ -561,7 +560,7 @@ impl Feeds {
                         seat.kind == kind && seat.port == port
                     })
                     .map(|(seat, _)| *seat);
-                let (Some(seat), Some(select)) = (seat, model_ir::Selection::of(guard)) else {
+                let (Some(seat), Some(select)) = (seat, poem_ir::Selection::of(guard)) else {
                     feeds.unlanded.push(ValueId(at as u32));
                     continue;
                 };
@@ -598,7 +597,7 @@ impl Feeds {
     }
 }
 
-fn reader_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> model_ir::ClassSet {
+fn reader_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> poem_ir::ClassSet {
     let mut inputs: Vec<ValueId> = Vec::new();
     let mut readers: Vec<u32> = Vec::new();
     for (at, node) in trace.nodes.iter().enumerate() {
@@ -608,7 +607,7 @@ fn reader_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> mo
             readers.push(u32::try_from(at).unwrap_or(u32::MAX));
         }
     }
-    let mut classes = model_ir::ClassSet::default();
+    let mut classes = poem_ir::ClassSet::default();
     for region in compiled.template() {
         if !region.nodes.clone().any(|node| readers.contains(&node)) {
             continue;
@@ -636,7 +635,7 @@ pub(crate) fn schedule_streams(trace: &Trace, compiled: &CompiledModel) -> Vec<O
                 if !trace
                     .values
                     .get(at)
-                    .is_some_and(|decl| matches!(decl.ty, model_ir::Ty::Struct(_)))
+                    .is_some_and(|decl| matches!(decl.ty, poem_ir::Ty::Struct(_)))
                 {
                     continue;
                 }
@@ -677,7 +676,7 @@ pub(crate) fn regions_launching_schedules(
                 if !trace
                     .values
                     .get(at)
-                    .is_some_and(|decl| matches!(decl.ty, model_ir::Ty::Struct(_)))
+                    .is_some_and(|decl| matches!(decl.ty, poem_ir::Ty::Struct(_)))
                 {
                     continue;
                 }

@@ -3,7 +3,7 @@ pub mod import;
 pub mod model;
 
 use model::{Mix, Model};
-use model_dsl::Dtype;
+use poem_dsl::Dtype;
 
 use crate::qwen_3::{template, tokenizer};
 
@@ -16,7 +16,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U4g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38,
             |tp: u32| Model::flash(Dtype::U4g64, Dtype::Bf16, tp),
@@ -26,7 +26,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U4g64, Dtype::U2g128],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38,
             |tp: u32| Model::flash_mix_mtp(Mix::MIXED_2BIT, Dtype::Bf16, tp),
@@ -36,7 +36,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U4g64, Dtype::U2g128],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38,
             |tp: u32| Model::flash_mix(Mix::MIXED_2BIT, Dtype::Bf16, tp),
@@ -46,7 +46,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U4g64, Dtype::U2g128],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38,
             |tp: u32| Model::flash_mini(Mix::MIXED_2BIT, Dtype::Bf16, tp),
@@ -56,7 +56,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::Bf16],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38,
             |tp: u32| Model::flash(Dtype::Bf16, Dtype::Bf16, tp),
@@ -66,7 +66,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U4g64, Dtype::U2g128],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38_VISION,
             |tp: u32| Model::flash_mix_mtp_vision(Mix::MIXED_2BIT, Dtype::Bf16, tp),
@@ -76,7 +76,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U4g64, Dtype::U2g128],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38_VISION,
             |tp: u32| Model::flash_mix_vision(Mix::MIXED_2BIT, Dtype::Bf16, tp),

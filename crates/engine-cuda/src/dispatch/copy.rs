@@ -1,8 +1,8 @@
 use kernels_cuda::{Tensor, layout};
-use model_compiler::Region;
-use model_exec::KernelError;
-use model_exec::fire::Serve;
-use model_ir::{Def, Dim, Operands, Operation, Ty, ValueId};
+use poem_compiler::Region;
+use poem_exec::KernelError;
+use poem_exec::fire::Serve;
+use poem_ir::{Def, Dim, Operands, Operation, Ty, ValueId};
 
 use crate::run::Run;
 
@@ -44,7 +44,7 @@ impl CopyPlan {
 }
 
 fn row_bytes(handle: Tensor) -> u64 {
-    u64::from(handle.width) * model_compiler::arena::elem_bytes(handle.dtype).unwrap_or(0)
+    u64::from(handle.width) * poem_compiler::arena::elem_bytes(handle.dtype).unwrap_or(0)
 }
 
 fn align(at: u64) -> u64 {

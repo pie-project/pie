@@ -1,5 +1,5 @@
-use model_dsl::ops::spatial::{self, Conv};
-use model_dsl::{Dtype, Input, Value, Weight, ops, seam};
+use poem_dsl::ops::spatial::{self, Conv};
+use poem_dsl::{Dtype, Input, Value, Weight, ops, seam};
 
 use super::forward::Facts;
 use super::model::{IN_CHANNELS, Linear, PACK, VAE_CHANNELS, port};

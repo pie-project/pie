@@ -1,14 +1,14 @@
 use engine_cuda::window::{Copies, Windows};
-use model_compiler::{
+use poem_compiler::{
     Budget, Budgets, CompiledModel, DeviceProfile, PatchLadder, RowAxis, compile_axes,
 };
-use model_exec::fire::{FireDescriptor, Lane, compose_axes};
-use model_ir::ops::Elementwise;
+use poem_exec::fire::{FireDescriptor, Lane, compose_axes};
+use poem_ir::ops::Elementwise;
 
 fn test_slots() -> engine_cuda::window::Slots {
     engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 4, 4096)
 }
-use model_ir::{
+use poem_ir::{
     CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RuntimeInput, Seam, Trace, Ty, ValueDecl,
     ValueId,
 };
@@ -155,7 +155,7 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
     let windows = Windows::of(
         &trace,
         &compiled,
-        model_ir::PerAxis::new([fire.classes(), fire.patch_classes(), fire.voxel_classes()]),
+        poem_ir::PerAxis::new([fire.classes(), fire.patch_classes(), fire.voxel_classes()]),
         &indptr(&[5, 3, 4]),
         Copies::off(),
         test_slots(),
@@ -236,11 +236,11 @@ fn a_fire_with_no_image_gets_the_token_windows_it_always_had() {
     let mixed = compose_axes(&compiled, &budgets, &carried).expect("composes");
     let boundaries = indptr(&[5, 3, 4]);
 
-    let of = |fire: &model_exec::fire::Composition| {
+    let of = |fire: &poem_exec::fire::Composition| {
         Windows::of(
             &trace,
             &compiled,
-            model_ir::PerAxis::new([fire.classes(), fire.patch_classes(), fire.voxel_classes()]),
+            poem_ir::PerAxis::new([fire.classes(), fire.patch_classes(), fire.voxel_classes()]),
             &boundaries,
             Copies::off(),
             test_slots(),

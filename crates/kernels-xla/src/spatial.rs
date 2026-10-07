@@ -1,4 +1,4 @@
-//! Voxel ops over per-clip lane tables (model_ir `Spatial`). Reference:
+//! Voxel ops over per-clip lane tables (poem_ir `Spatial`). Reference:
 //! kernels-cuda `spatial::*` (`kernels/spatial/*.cuh`), whose module surface
 //! (`spatial::conv3d`, `spatial::group_norm`, …) these entries mirror.
 //!
@@ -28,7 +28,7 @@ use crate::tensor::Tensor;
 
 // ------------------------------------------------------------------ types
 
-/// How a derived table maps each clip's box (`model_ir::GridRule`).
+/// How a derived table maps each clip's box (`poem_ir::GridRule`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GridRule {
     Conv {
@@ -100,7 +100,7 @@ impl Conv3d {
 }
 
 /// Which keys a spatial attention row sees: its whole clip, or its block of
-/// `n` frames (`model_ir::VoxelSegment`).
+/// `n` frames (`poem_ir::VoxelSegment`).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Segment {
     #[default]
@@ -1014,7 +1014,7 @@ pub fn cache_gather(
 /// Writes each clip's last `frames` frames into its slot of the slab: frame
 /// `f` of the block is the clip's frame `t - frames + f`, or, for a clip
 /// shorter than the block, frame `f + t` of `cache` (the block read before
-/// this fire). kernels-cuda `spatial::cache_store`; `model_ir`'s
+/// this fire). kernels-cuda `spatial::cache_store`; `poem_ir`'s
 /// `CacheStore` passes the input as both `x` and `cache`, as CUDA does.
 pub fn cache_store(
     ctx: &Ctx<'_>,

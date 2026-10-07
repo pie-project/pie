@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use checkpoint::contract::ModelContract;
-use model_dsl::Platform;
+use poem_dsl::Platform;
 
 pub struct Model {
     pub checkpoint: PathBuf,

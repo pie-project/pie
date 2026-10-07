@@ -19,7 +19,7 @@
 //! text classes; they share pages, since what they write is never read. The
 //! slots they touch are opened again afterwards.
 
-use model_ir::{ClassifyFn, Request};
+use poem_ir::{ClassifyFn, Request};
 
 use super::{Lane, PAD_ROOM, PAGE_FLOOR, Seated, Shell};
 use crate::error::Result;

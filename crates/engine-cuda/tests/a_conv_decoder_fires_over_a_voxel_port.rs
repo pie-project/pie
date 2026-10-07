@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 
 use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
-use model_compiler::{Budget, VoxelLadder};
-use model_dsl::ops::spatial::{self, Conv};
-use model_dsl::{
+use poem_compiler::{Budget, VoxelLadder};
+use poem_dsl::ops::spatial::{self, Conv};
+use poem_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, seam,
     trace_hybrid,
 };
@@ -358,7 +358,7 @@ fn scratch() -> PathBuf {
     dir
 }
 
-fn classify(_: &model_ir::Request) -> u64 {
+fn classify(_: &poem_ir::Request) -> u64 {
     0
 }
 
@@ -544,7 +544,7 @@ impl ForwardHybrid for Causal {
             &g,
             &self.conv,
             Some(&self.bias),
-            Conv::same3().causal(model_ir::TimePad::Zero),
+            Conv::same3().causal(poem_ir::TimePad::Zero),
             Some(cache),
         );
         seam::at(seam::PIXELS, &[&y, &g1]);

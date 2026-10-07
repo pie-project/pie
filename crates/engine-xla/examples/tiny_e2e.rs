@@ -21,8 +21,8 @@ use std::time::Instant;
 
 use engine_xla::DeviceBoot;
 use engine_xla::serve::{Boot, Lane, Shell};
-use model_compiler::Budget;
-use model_dsl::{Dtype, ParamSource, Platform, Request, Weight};
+use poem_compiler::Budget;
+use poem_dsl::{Dtype, ParamSource, Platform, Request, Weight};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -70,7 +70,7 @@ fn main() {
 
 fn run(
     sku: &models::Sku,
-    trace: model_dsl::Trace,
+    trace: poem_dsl::Trace,
     contract: &checkpoint::contract::ModelContract,
     path: &Path,
 ) -> Result<String, String> {
@@ -160,15 +160,15 @@ fn agree(shell: &mut Shell, sku: &models::Sku) -> Result<String, String> {
     let probing = std::env::var_os("PIE_E2E_PROBE").is_some();
     if probing {
         let trace = shell.trace();
-        let values: Vec<model_ir::ValueId> = trace
+        let values: Vec<poem_ir::ValueId> = trace
             .values
             .iter()
             .enumerate()
             .filter(|(_, d)| {
-                matches!(d.def, model_ir::Def::Op(_))
-                    && matches!(&d.ty, model_ir::Ty::Tensor { shape, .. } if shape.first() == Some(&model_ir::Dim::Tokens))
+                matches!(d.def, poem_ir::Def::Op(_))
+                    && matches!(&d.ty, poem_ir::Ty::Tensor { shape, .. } if shape.first() == Some(&poem_ir::Dim::Tokens))
             })
-            .map(|(at, _)| model_ir::ValueId(at as u32))
+            .map(|(at, _)| poem_ir::ValueId(at as u32))
             .collect();
         shell.probe(values);
     }
@@ -225,10 +225,10 @@ fn agree(shell: &mut Shell, sku: &models::Sku) -> Result<String, String> {
             let b = &plane[..w];
             let c = correlation(a, b);
             let node = match shell.trace().values[value.0 as usize].def {
-                model_ir::Def::Op(n) => n as usize,
+                poem_ir::Def::Op(n) => n as usize,
                 _ => 0,
             };
-            let op = model_ir::Operands::name(&shell.trace().nodes[node].op);
+            let op = poem_ir::Operands::name(&shell.trace().nodes[node].op);
             if c < 0.999 && shown < 12 {
                 eprintln!(
                     "  probe: value {} (node {node} `{op}`, layer {:?}): corr {c:.6}",
@@ -304,7 +304,7 @@ fn correlation(a: &[f32], b: &[f32]) -> f64 {
 }
 
 /// Every checkpoint param at small random values; answers the bytes written.
-fn write_random(trace: &model_dsl::Trace, path: &Path) -> u64 {
+fn write_random(trace: &poem_dsl::Trace, path: &Path) -> u64 {
     let quantized = |d: Dtype| {
         matches!(
             d,
@@ -327,7 +327,7 @@ fn write_random(trace: &model_dsl::Trace, path: &Path) -> u64 {
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
     let mut total = 0u64;
     // A canonical container takes its tensors in name order.
-    let mut params: Vec<&model_dsl::Param> = trace.params.iter().collect();
+    let mut params: Vec<&poem_dsl::Param> = trace.params.iter().collect();
     params.sort_by(|a, b| a.name.cmp(&b.name));
     for param in params {
         if param.source != ParamSource::Checkpoint || companions.contains(&param.name) {

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use model_ir::Operands;
-use model_ir::Platform;
+use poem_ir::Operands;
+use poem_ir::Platform;
 
 const PLATFORM: Platform = Platform::Cuda;
 
@@ -21,11 +21,11 @@ const REFUSED: &[Refusal] = &[Refusal {
     needle: "op: \"attention.pool_lse_selected\"",
 }];
 
-fn refuses_split_mrope(op: &model_ir::ops::Operation) -> bool {
+fn refuses_split_mrope(op: &poem_ir::ops::Operation) -> bool {
     matches!(
         op,
-        model_ir::ops::Operation::Elementwise(model_ir::ops::Elementwise::RopeMrope {
-            form: model_ir::ops::MropeForm::Split,
+        poem_ir::ops::Operation::Elementwise(poem_ir::ops::Elementwise::RopeMrope {
+            form: poem_ir::ops::MropeForm::Split,
             ..
         })
     )

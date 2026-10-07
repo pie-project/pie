@@ -2,7 +2,7 @@ pub mod kv;
 
 use engine::transfer::KvCopy;
 use kernels_wgpu::{KvPool, RecurrentPool, Tensor};
-use model_ir::{CacheRow, Dtype, Trace};
+use poem_ir::{CacheRow, Dtype, Trace};
 
 use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context, Handles};
@@ -10,14 +10,14 @@ use crate::error::{Fault, Result};
 use crate::run::{CachePool, CacheTable};
 use crate::store::kv::{Facts, Paging};
 
-impl From<model_exec::store::Fault> for Fault {
-    fn from(fault: model_exec::store::Fault) -> Fault {
+impl From<poem_exec::store::Fault> for Fault {
+    fn from(fault: poem_exec::store::Fault) -> Fault {
         match fault {
-            model_exec::store::Fault::Ceiling { what, need, have } => {
+            poem_exec::store::Fault::Ceiling { what, need, have } => {
                 Fault::Ceiling { what, need, have }
             }
-            model_exec::store::Fault::Unbound { what } => Fault::Unbound { what },
-            model_exec::store::Fault::Straddled {
+            poem_exec::store::Fault::Unbound { what } => Fault::Unbound { what },
+            poem_exec::store::Fault::Straddled {
                 value,
                 node,
                 planned,
@@ -640,13 +640,13 @@ fn split(name: &str, planes: &[u64]) -> Result<Planes> {
 }
 
 fn elem_bytes(name: &str, dtype: Dtype) -> Result<u64> {
-    model_compiler::arena::elem_bytes(dtype).ok_or_else(|| Fault::Unbound {
+    poem_compiler::arena::elem_bytes(dtype).ok_or_else(|| Fault::Unbound {
         what: format!("cache `{name}`, stored as {dtype:?}, which has no element size"),
     })
 }
 
 fn elem_size(dtype: Dtype) -> u32 {
-    model_compiler::arena::elem_bytes(dtype).unwrap_or(1) as u32
+    poem_compiler::arena::elem_bytes(dtype).unwrap_or(1) as u32
 }
 
 fn narrow(n: u64) -> i32 {

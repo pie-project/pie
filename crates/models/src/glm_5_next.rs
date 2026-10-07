@@ -6,7 +6,7 @@ pub mod template;
 pub mod tokenizer;
 
 use model::Model;
-use model_dsl::Dtype;
+use poem_dsl::Dtype;
 
 pub fn skus() -> Vec<crate::Sku> {
     crate::skus![
@@ -15,7 +15,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U8g64, Dtype::U2g64, Dtype::U4g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
             |tp: u32| Model::flash_mtp(Dtype::U8g64, Dtype::U2g64, Dtype::U4g64, Dtype::Bf16, tp),
@@ -25,7 +25,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U4g64, Dtype::U4g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
             |tp: u32| Model::flash_mini(8, 32, Dtype::U4g64, Dtype::U4g64, Dtype::Bf16, tp),
@@ -35,7 +35,7 @@ pub fn skus() -> Vec<crate::Sku> {
             2,
             [Dtype::U4g64, Dtype::U4g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
             |tp: u32| Model::flash_mini(8, 32, Dtype::U4g64, Dtype::U4g64, Dtype::Bf16, tp),
@@ -45,7 +45,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U8g64, Dtype::U2g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
             |tp: u32| Model::flash(Dtype::U8g64, Dtype::U2g64, Dtype::Bf16, tp),
@@ -55,7 +55,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U8g64, Dtype::U2g64, Dtype::U4g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT_VISION,
             |tp: u32| {
@@ -67,7 +67,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U8g64, Dtype::U2g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT_VISION,
             |tp: u32| Model::flash_vision(Dtype::U8g64, Dtype::U2g64, Dtype::Bf16, tp),
@@ -77,7 +77,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U4g64, Dtype::U2g64, Dtype::U4g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT_VISION,
             |tp: u32| {

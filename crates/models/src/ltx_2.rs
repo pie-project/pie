@@ -5,7 +5,7 @@ pub mod template;
 pub mod tokenizer;
 
 use model::Model;
-use model_dsl::Dtype;
+use poem_dsl::Dtype;
 
 pub const ARCH: &str = "ltx_2";
 
@@ -16,7 +16,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::Bf16],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
             |tp: u32| Model::ltx_2_5(Dtype::Bf16, tp),
@@ -26,7 +26,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U4g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
             |tp: u32| Model::ltx_2_5(Dtype::U4g64, tp),
@@ -36,7 +36,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::Bf16],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
             |tp: u32| Model::mini(Dtype::Bf16, tp),

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use model_ir::{Attention, Dim, Dtype, Operands, Operation, Trace, Ty, ValueId};
+use poem_ir::{Attention, Dim, Dtype, Operands, Operation, Trace, Ty, ValueId};
 
 use crate::device::Buffer;
 use crate::device::elastic::Arena;
@@ -92,7 +92,7 @@ fn ext_row_bytes(trace: &Trace) -> Result<u64> {
         let Some(Dim::Const(width)) = shape.last() else {
             return Err(unsized_plane("an extended-run operand", id));
         };
-        let elem = model_compiler::arena::elem_bytes(*dtype).ok_or_else(|| Fault::Unbound {
+        let elem = poem_compiler::arena::elem_bytes(*dtype).ok_or_else(|| Fault::Unbound {
             what: format!("value {} has a dtype with no element size", id.0),
         })?;
         Ok(*width * elem)
@@ -541,7 +541,7 @@ impl Predicate {
 
 #[cfg(test)]
 mod tests {
-    use model_ir::{Def, Guard, Node, Platform, ValueDecl};
+    use poem_ir::{Def, Guard, Node, Platform, ValueDecl};
 
     use super::*;
 

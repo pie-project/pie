@@ -4,8 +4,8 @@ use std::cell::RefCell;
 use kernels_metal::Tensor;
 use kernels_metal::{ArgValue, Encode, Error, Fire};
 #[cfg(target_vendor = "apple")]
-use model_exec::fire::MaskSpan;
-use model_ir::ValueId;
+use poem_exec::fire::MaskSpan;
+use poem_ir::ValueId;
 
 use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context, Handles, Pipelines, handles::NIL};
