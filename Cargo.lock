@@ -71,6 +71,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ane"
+version = "0.5.4"
+dependencies = [
+ "cc",
+ "libc",
+ "objc2",
+ "objc2-metal",
+]
+
+[[package]]
 name = "anes"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
