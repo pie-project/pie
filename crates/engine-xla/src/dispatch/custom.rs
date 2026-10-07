@@ -1,15 +1,21 @@
 use kernels_xla::spatial;
-use poem_exec::{DispatchCustomCuda, DispatchProbe, DispatchSpatial, KernelError};
-use poem_ir::{CustomCuda, GridRule, Spatial, TimePad, VoxelSegment};
+use poem_exec::{DispatchFused, DispatchProbe, DispatchSpatial, KernelError};
+use poem_ir::{Fused, GridRule, Spatial, TimePad, VoxelSegment};
 
 use poem_ir::Operands;
 
 use crate::run::Run;
 
-impl DispatchCustomCuda for Run<'_> {
-    fn dispatch(&mut self, op: &CustomCuda) -> Result<(), KernelError> {
+impl DispatchFused for Run<'_> {
+    fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         self.ctx().scope(op.name());
-        Err(KernelError::Unsupported { op: op.name() })
+        match op {
+            Fused::MatmulGeglu { .. } | Fused::LmHeadSoftcap { .. } | Fused::MatmulBias { .. } => {
+                self.fused_linear(op)
+            }
+            _ => self.fused_elementwise(op),
+        }
+        .map_err(crate::error::kernel)
     }
 }
 

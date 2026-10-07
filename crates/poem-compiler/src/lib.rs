@@ -2,6 +2,7 @@ pub mod arena;
 pub mod budget;
 pub mod compiled;
 pub mod error;
+pub mod fuse;
 pub mod layout;
 pub mod lowering;
 mod pq;

@@ -15,7 +15,7 @@ use checkpoint::plan::{LoadPlan, StorageTarget, compile_streaming};
 use checkpoint::serving::Stamp;
 use checkpoint::types::{BackendKind, ScaleForm, TensorId};
 use kernels_xla::{Bank, Tensor};
-use poem_ir::{Dtype, ParamSource, Trace};
+use poem_ir::{Dtype, Fused, ParamSource, Trace};
 
 use crate::device::Device;
 use crate::error::{Fault, Result};
@@ -590,12 +590,11 @@ fn gemm_only(
         inputs.clear();
         node.op.inputs(&mut inputs);
         let w = match &node.op {
-            Operation::Linear(
-                Linear::Matmul { w, .. }
-                | Linear::LmHead { w, .. }
-                | Linear::MatmulBias { w, .. }
-                | Linear::MatmulGeglu { w, .. }
-                | Linear::LmHeadSoftcap { w, .. },
+            Operation::Linear(Linear::Matmul { w, .. } | Linear::LmHead { w, .. })
+            | Operation::Fused(
+                Fused::MatmulBias { w, .. }
+                | Fused::MatmulGeglu { w, .. }
+                | Fused::LmHeadSoftcap { w, .. },
             ) => Some(*w),
             _ => None,
         };

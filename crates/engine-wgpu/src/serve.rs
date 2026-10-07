@@ -349,7 +349,11 @@ pub struct Shell {
 }
 
 impl Shell {
-    pub fn load(mut boot: Boot<'_>) -> Result<Shell> {
+    pub fn load(boot: Boot<'_>) -> Result<Shell> {
+        let mut boot = Boot {
+            trace: poem_compiler::fuse::fuse(boot.trace, &crate::FUSED),
+            ..boot
+        };
         let device = match boot.handed.take() {
             Some(handed) => Context::adopt(boot.device, handed)?,
             None => Context::bind(boot.device)?,

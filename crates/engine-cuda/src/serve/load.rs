@@ -49,14 +49,12 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     } else {
         Vec::new()
     };
-    boot.trace = poem_ir::fuse::residual_norm(boot.trace.clone());
-    if boot.knobs.diagnostics.fuse_chains {
-        boot.trace = poem_ir::fuse::residual_chains(boot.trace.clone());
-        boot.trace = poem_ir::fuse::gemm_epilogues(boot.trace.clone());
-        boot.trace = poem_ir::fuse::modulation(boot.trace.clone());
-        boot.trace = poem_ir::fuse::q_norm_rope(boot.trace.clone());
-        boot.trace = poem_ir::fuse::embed_select(boot.trace.clone());
-    }
+    let kernels: &[&str] = if boot.knobs.diagnostics.fuse_chains {
+        &crate::FUSED
+    } else {
+        &crate::UNCHAINED
+    };
+    boot.trace = poem_compiler::fuse::fuse(boot.trace.clone(), kernels);
     if boot.knobs.diagnostics.trace_census {
         let mut census: std::collections::BTreeMap<&'static str, usize> =
             std::collections::BTreeMap::new();

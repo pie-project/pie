@@ -5,7 +5,7 @@ pub use classes::{fact_width, resolve_classes};
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 
-use crate::ops::{Attention, CustomCuda, Elementwise, Layout, Linear, RaggedMask, Spatial};
+use crate::ops::{Attention, Elementwise, Fused, Layout, Linear, RaggedMask, Spatial};
 use crate::{Def, Dim, Dtype, Operands, Operation, StructKind, Trace, Ty, ValueId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -744,9 +744,6 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Linear::MlpGegluTanh { .. }
             | Linear::MlpGeluTanh { .. }
             | Linear::MlpGegluTanhPacked { .. }
-            | Linear::MatmulGeglu { .. }
-            | Linear::LmHeadSoftcap { .. }
-            | Linear::MatmulBias { .. }
             | Linear::MlpSitu { .. }
             | Linear::MoeSigmoidGateAdd { .. } => &[],
         },
@@ -762,29 +759,17 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Elementwise::Modulate {
                 lane_of_row: Some(_),
                 ..
-            }
-            | Elementwise::NormModulate {
-                lane_of_row: Some(_),
-                ..
             } => &[(In(2), I32)],
             Elementwise::GatedResidualAdd {
                 lane_of_row: Some(_),
                 ..
             } => &[(In(3), I32)],
-            Elementwise::GatedResidualNormModulate {
-                lane_of_row: Some(_),
-                ..
-            } => &[(In(4), I32)],
             Elementwise::Sinusoid { .. } => &[(In(0), F32), (Out(0), F32)],
             Elementwise::RelativeBucketBias { .. } => &[(Out(0), F32)],
-            Elementwise::RmsnormRopePartialQ { .. } => &[(In(2), I32)],
             Elementwise::HcRmsnormF32 { .. } => &[(Out(0), F32)],
             Elementwise::HcProject { .. } => &[(In(0), F32), (In(1), F32), (Out(0), F32)],
             Elementwise::HcGates { .. } => &[(In(0), F32), (Out(1), F32), (Out(2), F32)],
             Elementwise::HcCollapse { .. } => &[(In(0), F32), (In(2), F32), (In(3), F32)],
-            Elementwise::EmbedScaleAdd { .. } | Elementwise::EmbedScaleAddSelect { .. } => {
-                &[(In(0), I32)]
-            }
             Elementwise::Rmsnorm { .. }
             | Elementwise::RmsnormPerHead { .. }
             | Elementwise::RmsnormPlusOne { .. }
@@ -797,8 +782,6 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Elementwise::RmsnormGated { .. }
             | Elementwise::RmsnormGatedBy { .. }
             | Elementwise::ResidualAdd { .. }
-            | Elementwise::ResidualAddRmsnorm { .. }
-            | Elementwise::RmsnormResidualAdd { .. }
             | Elementwise::AddBias { .. }
             | Elementwise::Standardize { .. }
             | Elementwise::MulScalar { .. }
@@ -816,13 +799,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Elementwise::Modulate {
                 lane_of_row: None, ..
             }
-            | Elementwise::NormModulate {
-                lane_of_row: None, ..
-            }
             | Elementwise::GatedResidualAdd {
-                lane_of_row: None, ..
-            }
-            | Elementwise::GatedResidualNormModulate {
                 lane_of_row: None, ..
             }
             | Elementwise::Silu { .. }
@@ -847,10 +824,31 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Layout::TopK { .. } => &[(Out(0), F32), (Out(1), I32)],
             Layout::PackRows { .. } | Layout::UnpackRows { .. } => &[(In(1), I32)],
         },
-        Operation::CustomCuda(op) => match op {
-            CustomCuda::QkvFusedQknormRopeVnormWrite { .. } => {
+        Operation::Fused(op) => match op {
+            Fused::NormModulate {
+                lane_of_row: Some(_),
+                ..
+            } => &[(In(2), I32)],
+            Fused::GatedResidualNormModulate {
+                lane_of_row: Some(_),
+                ..
+            } => &[(In(4), I32)],
+            Fused::RmsnormRopePartialQ { .. } => &[(In(2), I32)],
+            Fused::EmbedScaleAdd { .. } | Fused::EmbedScaleAddSelect { .. } => &[(In(0), I32)],
+            Fused::QkvFusedQknormRopeVnormWrite { .. } => {
                 &[(In(1), I32), (In(4), CACHE), (In(5), I32), (In(6), I32)]
             }
+            Fused::ResidualAddRmsnorm { .. }
+            | Fused::RmsnormResidualAdd { .. }
+            | Fused::NormModulate {
+                lane_of_row: None, ..
+            }
+            | Fused::GatedResidualNormModulate {
+                lane_of_row: None, ..
+            }
+            | Fused::MatmulGeglu { .. }
+            | Fused::LmHeadSoftcap { .. }
+            | Fused::MatmulBias { .. } => &[],
         },
         Operation::Collective(_) => &[],
         Operation::Spatial(op) => match op {

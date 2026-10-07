@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::marker::PhantomData;
 
 use poem_ir::{
@@ -89,42 +88,16 @@ pub trait ForwardHybrid {
     fn forward(&self, inputs: Input<Self::Facts>) -> Value;
 }
 
-thread_local! {
-    static TRACING: Cell<Option<Platform>> = const { Cell::new(None) };
-}
-
-#[must_use]
-pub fn platform() -> Platform {
-    TRACING
-        .with(|tracing| tracing.get())
-        .expect("no trace is being taken")
-}
-
 pub fn trace_hybrid<M: ForwardHybrid>(name: &str, m: &M, platform: Platform) -> Trace {
     let caches = m.caches();
     let rec = Recorder::new(name, platform, caches.rows.clone());
     rec.seam(seam::IN.name, &[]);
-    TRACING.with(|tracing| {
-        assert!(
-            tracing.get().is_none(),
-            "a trace is already being taken on this thread",
-        );
-        tracing.set(Some(platform));
-    });
-    struct Tracing;
-    impl Drop for Tracing {
-        fn drop(&mut self) {
-            TRACING.with(|tracing| tracing.set(None));
-        }
-    }
-    let tracing = Tracing;
     let logits = m.forward(Input {
         rec: rec.clone(),
         caches,
         over: Guard::Always,
         _facts: PhantomData,
     });
-    drop(tracing);
     let float_readout = seam::FLOAT_READOUTS
         .iter()
         .any(|name| rec.seamed(name, &logits));

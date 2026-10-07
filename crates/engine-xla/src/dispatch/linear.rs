@@ -1,6 +1,6 @@
 use kernels_xla::linear;
 use poem_exec::{DispatchLinear, KernelError};
-use poem_ir::{Linear, Operands};
+use poem_ir::{Fused, Linear, Operands};
 
 use crate::run::Run;
 
@@ -16,6 +16,92 @@ impl Run<'_> {
     /// block format).
     fn dense_weight(&self, w: poem_ir::ValueId) -> bool {
         self.banked(w).is_none() && self.maybe_stored(w).is_none()
+    }
+
+    pub(super) fn fused_linear(&mut self, op: &Fused) -> Result<(), kernels_xla::Error> {
+        match op {
+            // The fused forms take one dense weight; a quantized weight is
+            // the plain matmul followed by the epilogue, as engine-cuda does.
+            Fused::MatmulGeglu {
+                act,
+                w,
+                intermediate,
+                packed,
+                y,
+            } => {
+                if self.dense_weight(*w) {
+                    return linear::gemm::matmul_geglu(
+                        self.ctx(),
+                        self.tensor(*act),
+                        self.tensor(*w),
+                        *intermediate,
+                        self.tensor(*packed),
+                        self.tensor(*y),
+                    );
+                }
+                self.linear(&Linear::Matmul {
+                    act: *act,
+                    w: *w,
+                    y: *packed,
+                })?;
+                self.linear(&Linear::MlpGegluTanhPacked {
+                    packed: *packed,
+                    intermediate: *intermediate,
+                    y: *y,
+                })
+            }
+            Fused::MatmulBias {
+                act,
+                w,
+                bias,
+                y,
+                y_out: _,
+            } => {
+                if self.dense_weight(*w) {
+                    return linear::gemm::matmul_bias(
+                        self.ctx(),
+                        self.tensor(*act),
+                        self.tensor(*w),
+                        self.tensor(*bias),
+                        self.tensor(*y),
+                    );
+                }
+                self.linear(&Linear::Matmul {
+                    act: *act,
+                    w: *w,
+                    y: *y,
+                })?;
+                kernels_xla::elemwise::norm::add_bias(
+                    self.ctx(),
+                    self.tensor(*bias),
+                    self.tensor(*y),
+                )
+            }
+            Fused::LmHeadSoftcap {
+                act,
+                w,
+                cap,
+                y,
+                y_out: _,
+            } => {
+                if self.dense_weight(*w) {
+                    return linear::gemm::lm_head_softcap(
+                        self.ctx(),
+                        self.tensor(*act),
+                        self.tensor(*w),
+                        *cap,
+                        self.tensor(*y),
+                    );
+                }
+                self.linear(&Linear::LmHead {
+                    act: *act,
+                    w: *w,
+                    y: *y,
+                })?;
+                kernels_xla::attn::logit_softcap(self.ctx(), self.tensor(*y), *cap)
+            }
+            _ => Err(kernels_xla::Error::Unsupported { op: op.name() }),
+        }
     }
 
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_xla::Error> {
@@ -113,86 +199,6 @@ impl Run<'_> {
             ),
             Linear::MlpGeluTanh { x, y } => {
                 linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), self.tensor(*y))
-            }
-            // The fused forms take one dense weight; a quantized weight is
-            // the plain matmul followed by the epilogue, as engine-cuda does.
-            Linear::MatmulGeglu {
-                act,
-                w,
-                intermediate,
-                packed,
-                y,
-            } => {
-                if self.dense_weight(*w) {
-                    return linear::gemm::matmul_geglu(
-                        self.ctx(),
-                        self.tensor(*act),
-                        self.tensor(*w),
-                        *intermediate,
-                        self.tensor(*packed),
-                        self.tensor(*y),
-                    );
-                }
-                self.linear(&Linear::Matmul {
-                    act: *act,
-                    w: *w,
-                    y: *packed,
-                })?;
-                self.linear(&Linear::MlpGegluTanhPacked {
-                    packed: *packed,
-                    intermediate: *intermediate,
-                    y: *y,
-                })
-            }
-            Linear::MatmulBias {
-                act,
-                w,
-                bias,
-                y,
-                y_out: _,
-            } => {
-                if self.dense_weight(*w) {
-                    return linear::gemm::matmul_bias(
-                        self.ctx(),
-                        self.tensor(*act),
-                        self.tensor(*w),
-                        self.tensor(*bias),
-                        self.tensor(*y),
-                    );
-                }
-                self.linear(&Linear::Matmul {
-                    act: *act,
-                    w: *w,
-                    y: *y,
-                })?;
-                kernels_xla::elemwise::norm::add_bias(
-                    self.ctx(),
-                    self.tensor(*bias),
-                    self.tensor(*y),
-                )
-            }
-            Linear::LmHeadSoftcap {
-                act,
-                w,
-                cap,
-                y,
-                y_out: _,
-            } => {
-                if self.dense_weight(*w) {
-                    return linear::gemm::lm_head_softcap(
-                        self.ctx(),
-                        self.tensor(*act),
-                        self.tensor(*w),
-                        *cap,
-                        self.tensor(*y),
-                    );
-                }
-                self.linear(&Linear::LmHead {
-                    act: *act,
-                    w: *w,
-                    y: *y,
-                })?;
-                kernels_xla::attn::logit_softcap(self.ctx(), self.tensor(*y), *cap)
             }
             Linear::RelBias {
                 x,

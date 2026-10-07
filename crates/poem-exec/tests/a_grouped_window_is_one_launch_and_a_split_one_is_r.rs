@@ -4,13 +4,12 @@ use poem_compiler::{Budget, CompiledModel, DeviceProfile, FamilyCosts, Lowering,
 use poem_dsl::Platform;
 use poem_exec::KernelError;
 use poem_exec::dispatch::{
-    DispatchAttention, DispatchCollective, DispatchCustomCuda, DispatchElementwise, DispatchLayout,
+    DispatchAttention, DispatchCollective, DispatchElementwise, DispatchFused, DispatchLayout,
     DispatchLinear, DispatchSpatial,
 };
 use poem_exec::fire::{EventId, Filter, FireDescriptor, Lane, Sink, compose, walk};
 use poem_ir::{
-    Attention, Collective, CustomCuda, Elementwise, Layout, Linear, Operands, Operation, Spatial,
-    Trace,
+    Attention, Collective, Elementwise, Fused, Layout, Linear, Operands, Operation, Spatial, Trace,
 };
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
@@ -130,7 +129,7 @@ fn payload(op: &Operation) -> usize {
         Operation::Elementwise(op) => address(op),
         Operation::Layout(op) => address(op),
         Operation::Collective(op) => address(op),
-        Operation::CustomCuda(op) => address(op),
+        Operation::Fused(op) => address(op),
         Operation::Spatial(op) => address(op),
     }
 }
@@ -162,8 +161,8 @@ impl DispatchCollective for MockDispatch {
         self.note(op)
     }
 }
-impl DispatchCustomCuda for MockDispatch {
-    fn dispatch(&mut self, op: &CustomCuda) -> Result<(), KernelError> {
+impl DispatchFused for MockDispatch {
+    fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         self.note(op)
     }
 }

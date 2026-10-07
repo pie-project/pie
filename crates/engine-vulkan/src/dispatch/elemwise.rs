@@ -1,6 +1,6 @@
 use kernels_vulkan::{Error, Tensor, elemwise};
 use poem_exec::{DispatchElementwise, KernelError};
-use poem_ir::{Elementwise, MropeForm, Operands};
+use poem_ir::{Elementwise, Fused, MropeForm, Operands};
 
 use crate::run::Run;
 
@@ -11,6 +11,35 @@ impl DispatchElementwise for Run<'_> {
 }
 
 impl Run<'_> {
+    pub(super) fn fused_elementwise(&mut self, op: &Fused) -> Result<(), kernels_vulkan::Error> {
+        match op {
+            Fused::ResidualAddRmsnorm {
+                x,
+                y,
+                y_out: _,
+                weight,
+                plus_one,
+                eps,
+                out,
+            } => {
+                elemwise::norm::residual_add(self.ctx(), self.tensor(*x), self.tensor(*y))?;
+                let norm = if *plus_one {
+                    elemwise::norm::rmsnorm_plus_one
+                } else {
+                    elemwise::norm::rmsnorm
+                };
+                norm(
+                    self.ctx(),
+                    self.tensor(*y),
+                    self.tensor(*weight),
+                    *eps,
+                    self.tensor(*out),
+                )
+            }
+            _ => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
+        }
+    }
+
     fn elementwise(&mut self, op: &Elementwise) -> Result<(), kernels_vulkan::Error> {
         match op {
             Elementwise::Rmsnorm { x, weight, eps, y } => elemwise::norm::rmsnorm(
@@ -103,12 +132,8 @@ impl Run<'_> {
             ),
 
             Elementwise::LayernormNoScale { .. }
-            | Elementwise::RmsnormResidualAdd { .. }
-            | Elementwise::EmbedScaleAdd { .. }
             | Elementwise::Modulate { .. }
             | Elementwise::GatedResidualAdd { .. }
-            | Elementwise::NormModulate { .. }
-            | Elementwise::GatedResidualNormModulate { .. }
             | Elementwise::Sinusoid { .. }
             | Elementwise::RelativeBucketBias { .. }
             | Elementwise::Silu { .. }
@@ -119,9 +144,6 @@ impl Run<'_> {
             | Elementwise::Add { .. }
             | Elementwise::RopeAxes { .. }
             | Elementwise::GateSigmoidMulHeads { .. } => {
-                Err(kernels_vulkan::Error::Unsupported { op: op.name() })
-            }
-            Elementwise::EmbedScaleAddSelect { .. } | Elementwise::RmsnormRopePartialQ { .. } => {
                 Err(kernels_vulkan::Error::Unsupported { op: op.name() })
             }
 
@@ -218,29 +240,6 @@ impl Run<'_> {
             ),
             Elementwise::ResidualAdd { x, y, y_out: _ } => {
                 elemwise::norm::residual_add(self.ctx(), self.tensor(*x), self.tensor(*y))
-            }
-            Elementwise::ResidualAddRmsnorm {
-                x,
-                y,
-                y_out: _,
-                weight,
-                plus_one,
-                eps,
-                out,
-            } => {
-                elemwise::norm::residual_add(self.ctx(), self.tensor(*x), self.tensor(*y))?;
-                let norm = if *plus_one {
-                    elemwise::norm::rmsnorm_plus_one
-                } else {
-                    elemwise::norm::rmsnorm
-                };
-                norm(
-                    self.ctx(),
-                    self.tensor(*y),
-                    self.tensor(*weight),
-                    *eps,
-                    self.tensor(*out),
-                )
             }
             Elementwise::AddBias {
                 bias,

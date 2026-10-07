@@ -1,5 +1,4 @@
 pub mod check;
-pub mod fuse;
 pub mod guard;
 pub mod operands;
 pub mod ops;
@@ -14,7 +13,7 @@ pub use check::{Fault, check, checked};
 pub use guard::Guard;
 pub use operands::Operands;
 pub use ops::{
-    Attention, Collective, CustomCuda, Elementwise, GateActivation, GridRule, Layout, Linear,
+    Attention, Collective, Elementwise, Fused, GateActivation, GridRule, Layout, Linear,
     ModulateForm, MropeForm, NormKind, Operation, RaggedMask, RopeForm, Spatial, TimePad,
     VoxelSegment,
 };

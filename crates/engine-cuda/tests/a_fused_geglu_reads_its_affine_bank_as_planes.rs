@@ -9,7 +9,7 @@ use poem_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, ops,
     trace_hybrid,
 };
-use poem_ir::{Linear, Operation, Trace};
+use poem_ir::{Fused, Operation, Trace};
 
 const VOCAB: u32 = 1000;
 const HIDDEN: u64 = 512;
@@ -240,12 +240,12 @@ fn a_fused_geglu_reads_its_affine_bank_as_planes() {
     }
     let fixture = fixture();
 
-    let fused = poem_ir::fuse::gemm_epilogues(fixture.trace.clone());
+    let fused = poem_compiler::fuse::fuse(fixture.trace.clone(), &["linear.matmul_geglu"]);
     assert!(
         fused
             .nodes
             .iter()
-            .any(|node| matches!(node.op, Operation::Linear(Linear::MatmulGeglu { .. }))),
+            .any(|node| matches!(node.op, Operation::Fused(Fused::MatmulGeglu { .. }))),
         "the gate-up matmul and the geglu over it fold into one epilogue, or this fires \
          nothing the row-major arm does not"
     );

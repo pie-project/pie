@@ -4,6 +4,7 @@ pub mod declare;
 pub mod facts;
 pub mod forward;
 pub mod ops;
+pub mod pattern;
 mod record;
 
 pub use declare::*;
@@ -15,7 +16,7 @@ pub use poem_ir::{
     ParamSource, Platform, RaggedMask, RopeForm, RuntimeInput, Selection, Shard, Stream, Trace, Ty,
     ValueId, VoxelSegment, resolve_classes,
 };
-pub use record::{Recorder, Refine, SplitSpec, Value};
+pub use record::{Primitive, Recorder, Refine, SplitSpec, Value};
 
 pub type TraceFn = fn(Platform) -> Trace;
 

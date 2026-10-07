@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 
 use crate::check::V;
-use crate::ops::{Attention, CustomCuda, Layout, Spatial};
+use crate::ops::{Attention, Fused, Layout, Spatial};
 use crate::{Def, Guard, Operands, Operation, Trace, ValueId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,9 +456,7 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::PoolLse { .. }
             | Attention::PoolLseSelected { .. } => false,
         },
-        Operation::CustomCuda(op) => match op {
-            CustomCuda::QkvFusedQknormRopeVnormWrite { .. } => true,
-        },
+        Operation::Fused(op) => matches!(op, Fused::QkvFusedQknormRopeVnormWrite { .. }),
         Operation::Spatial(op) => match op {
             Spatial::Conv3d { cache, .. } => cache.is_some(),
             Spatial::CacheStore { .. } => true,

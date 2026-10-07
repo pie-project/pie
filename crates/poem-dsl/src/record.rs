@@ -12,6 +12,32 @@ use crate::facts::Predicate;
 
 const UNCLAIMED: u32 = u32::MAX;
 
+/// An op a model may write: every family but `Fused`, which only the compiler
+/// forms from these.
+pub trait Primitive: Into<Operation> + sealed::Sealed {}
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+macro_rules! primitive {
+    ($($family:ty),+) => {
+        $(
+            impl sealed::Sealed for $family {}
+            impl Primitive for $family {}
+        )+
+    };
+}
+
+primitive!(
+    poem_ir::Attention,
+    poem_ir::Linear,
+    poem_ir::Elementwise,
+    poem_ir::Layout,
+    poem_ir::Collective,
+    poem_ir::Spatial
+);
+
 #[derive(Clone)]
 pub struct Recorder {
     inner: Rc<RefCell<Trace>>,
@@ -52,7 +78,7 @@ impl Recorder {
         }
     }
 
-    pub fn push(&self, op: impl Into<Operation>, ins: &[&Value]) {
+    pub fn push(&self, op: impl Primitive, ins: &[&Value]) {
         let op = op.into();
         let cond = if joins_arms(&op) {
             join(ins)
@@ -216,6 +242,16 @@ impl Recorder {
             panic!("{msg}");
         }
         plan
+    }
+
+    pub(crate) fn declare_cache(&self, row: CacheRow) {
+        self.inner.borrow_mut().caches.push(row);
+    }
+
+    pub(crate) fn finish_unchecked(self) -> Trace {
+        Rc::try_unwrap(self.inner)
+            .unwrap_or_else(|_| panic!("a Value outlived its trace"))
+            .into_inner()
     }
 
     fn guard(&self, id: ValueId) -> Guard {

@@ -3834,6 +3834,7 @@ dependencies = [
  "models",
  "pie-poem-dsl",
  "pie-poem-ir",
+ "serde",
  "thiserror 2.0.20",
 ]
 

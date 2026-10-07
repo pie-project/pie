@@ -342,6 +342,10 @@ pub struct Shell {
 
 impl Shell {
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
+        let boot = Boot {
+            trace: poem_compiler::fuse::fuse(boot.trace, &crate::FUSED),
+            ..boot
+        };
         let device = Context::bind(boot.device)?;
 
         let profile = boot.profile.unwrap_or(DeviceProfile {

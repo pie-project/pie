@@ -1,6 +1,6 @@
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, MropeForm, Platform, Predicate, Request,
-    Value, ValueId, Weight, ops, seam,
+    Classify, Dtype, ForwardHybrid, HybridSpec, Input, MropeForm, Predicate, Request, Value,
+    ValueId, Weight, ops, seam,
 };
 
 use super::model::{Attn, AttnBanks, Clippable, Draft, Model, Reading, Tower};
@@ -108,7 +108,6 @@ impl ForwardHybrid for Model {
         let m = self;
 
         let qo_one = Facts::qo_one();
-        let fused = qo_one.clone() & !Facts::masked();
 
         let classes = [
             Facts::masked(),
@@ -273,61 +272,19 @@ impl ForwardHybrid for Model {
                     qkv,
                     k_norm,
                     k_norm_eps,
-                } => {
-                    if poem_dsl::platform() == Platform::Cuda && *k_norm_eps == at.q_norm_eps {
-                        let (fast_x, rest_x) = normed.split(&fused);
-                        let (fast_pos, rest_pos) = positions.split(&fused);
-                        let qf = ops::custom::qkv_fused_qknorm_rope_vnorm_write(
-                            &ops::linear::matmul(&fast_x, qkv),
-                            &at.q_norm,
-                            at.q_norm_eps,
-                            k_norm,
-                            *k_norm_eps,
-                            kv_heads,
-                            d,
-                            pages,
-                            &inputs.write_page(&at.kv),
-                            &inputs.write_offset(&at.kv),
-                            match at.reading {
-                                Reading::Global => m.global.theta,
-                                Reading::Sliding => m.sliding.theta,
-                            },
-                            match at.reading {
-                                Reading::Global => m.global.rotary_dim,
-                                Reading::Sliding => d,
-                            },
-                            &fast_pos,
-                        );
-                        let qr = qkv_unfused(
-                            &rest_x,
-                            &rest_pos,
-                            &inputs,
-                            m,
-                            at,
-                            d,
-                            kv_heads,
-                            qkv,
-                            k_norm,
-                            *k_norm_eps,
-                            pages,
-                        );
-                        Value::merge(vec![qf, qr])
-                    } else {
-                        qkv_unfused(
-                            &normed,
-                            &positions,
-                            &inputs,
-                            m,
-                            at,
-                            d,
-                            kv_heads,
-                            qkv,
-                            k_norm,
-                            *k_norm_eps,
-                            pages,
-                        )
-                    }
-                }
+                } => qkv_unfused(
+                    &normed,
+                    &positions,
+                    &inputs,
+                    m,
+                    at,
+                    d,
+                    kv_heads,
+                    qkv,
+                    k_norm,
+                    *k_norm_eps,
+                    pages,
+                ),
             };
 
             seam::at(seam::ATTN_Q, &[&q]);

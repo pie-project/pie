@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 
 use crate::dispatch::{
-    DispatchAttention, DispatchCollective, DispatchCustomCuda, DispatchElementwise, DispatchLayout,
+    DispatchAttention, DispatchCollective, DispatchElementwise, DispatchFused, DispatchLayout,
     DispatchLinear, DispatchSpatial,
 };
 use crate::error::KernelError;
 use poem_compiler::{Lowering, Region};
 use poem_ir::ops::{Attention, Collective, Elementwise};
 use poem_ir::{
-    CacheRow, CustomCuda, Def, Dim, Dtype, Guard, Layout, Linear, Node, Operands, Operation,
-    Platform, RuntimeInput, Seam, Spatial, StructKind, Trace, Ty, ValueDecl, ValueId,
+    CacheRow, Def, Dim, Dtype, Fused, Guard, Layout, Linear, Node, Operands, Operation, Platform,
+    RuntimeInput, Seam, Spatial, StructKind, Trace, Ty, ValueDecl, ValueId,
 };
 
 use crate::fire::sink::{EventId, Sink};
@@ -215,7 +215,7 @@ fn payload(op: &Operation) -> usize {
         Operation::Elementwise(op) => address(op),
         Operation::Layout(op) => address(op),
         Operation::Collective(op) => address(op),
-        Operation::CustomCuda(op) => address(op),
+        Operation::Fused(op) => address(op),
         Operation::Spatial(op) => address(op),
     }
 }
@@ -250,8 +250,8 @@ impl DispatchCollective for MockDispatch<'_> {
     }
 }
 
-impl DispatchCustomCuda for MockDispatch<'_> {
-    fn dispatch(&mut self, op: &CustomCuda) -> Result<(), KernelError> {
+impl DispatchFused for MockDispatch<'_> {
+    fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         self.note(op)
     }
 }

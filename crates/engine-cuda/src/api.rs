@@ -460,13 +460,6 @@ impl Engine for Cuda {
             ordinal,
             frames_in_flight,
         } = request;
-        let trace = poem_ir::fuse::residual_norm(trace);
-        let trace = if self.boot.knobs.diagnostics.fuse_chains {
-            poem_ir::fuse::residual_chains(trace)
-        } else {
-            trace
-        };
-
         if !self.boot.graphs.records() {
             eprintln!(
                 "engine-cuda: serving without CUDA graph capture ([engine] graphs = \
