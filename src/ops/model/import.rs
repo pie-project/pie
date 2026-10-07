@@ -31,7 +31,7 @@ pub struct ImportArgs {
     #[arg(long, value_name = "NAME", conflicts_with = "aux")]
     pub drafter: Option<String>,
     #[arg(long, value_name = "NAME")]
-    pub sku: Option<String>,
+    pub deployment: Option<String>,
     #[arg(long)]
     pub out: Option<PathBuf>,
     #[arg(long)]
@@ -80,7 +80,7 @@ pub fn run(mut args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate
                 args.source,
                 if known.is_empty() {
                     "this build knows no head for that target — pass the head with `--aux` and \
-                     the row with `--sku`"
+                     the deployment with `--deployment`"
                         .to_string()
                 } else {
                     format!("it knows {}", known.join(", "))
@@ -88,12 +88,13 @@ pub fn run(mut args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate
             );
         };
         args.aux = Some(published.head.to_string());
-        if args.sku.is_none() {
-            args.sku = Some(published.sku.to_string());
+        if args.deployment.is_none() {
+            args.deployment = Some(published.deployment.to_string());
         }
     }
-    if let Some(name) = args.sku.as_deref() {
-        runtime::engine::load::row_named(name).map_err(|why| anyhow!("--sku {name}: {why:#}"))?;
+    if let Some(name) = args.deployment.as_deref() {
+        runtime::engine::load::row_named(name)
+            .map_err(|why| anyhow!("--deployment {name}: {why:#}"))?;
     }
     let mut source = resolve_source(&args.source)?;
     if consuming_marker(&source.path).is_file() {
@@ -167,7 +168,12 @@ pub fn run(mut args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate
     }
     let platform = engine_or_refuse()?;
     if out_file.exists() && !args.force {
-        if let Some(reason) = staleness(&out_file, platform, &source.origin, args.sku.as_deref()) {
+        if let Some(reason) = staleness(
+            &out_file,
+            platform,
+            &source.origin,
+            args.deployment.as_deref(),
+        ) {
             println!(
                 "{}: rebuilding {} ({reason})",
                 source.name,
@@ -201,13 +207,14 @@ pub fn run(mut args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate
         merge_metadata(&mut metadata, overlay.metadata.clone());
     }
     let metadata = metadata;
-    let (sku, contract) = choose_row(
-        args.sku.as_deref(),
+    let (sku_name, contract) = choose_row(
+        args.deployment.as_deref(),
         &opened,
         &metadata,
         platform,
         &source.path,
     )?;
+    let sku = sku_name.as_str();
     drop(opened);
     refuse_a_decode_of_packed_codes(sku, &contract, &metadata)?;
     let attributes = gguf_attributes(&source, &metadata);
@@ -539,13 +546,14 @@ fn overlay_onto_artifact(
         .with_context(|| "merge the overlay into the artifact's name space")?;
     merge_metadata(&mut metadata, overlay.metadata.clone());
     let metadata = metadata;
-    let (sku, contract) = choose_row(
-        args.sku.as_deref(),
+    let (sku_name, contract) = choose_row(
+        args.deployment.as_deref(),
         &opened,
         &metadata,
         platform,
         &base_file,
     )?;
+    let sku = sku_name.as_str();
     drop(opened);
     if sku == before.sku {
         bail!(
@@ -1410,17 +1418,18 @@ fn choose_row(
     metadata: &Metadata,
     platform: Platform,
     checkpoint: &Path,
-) -> Result<(&'static str, ModelContract)> {
+) -> Result<(String, ModelContract)> {
     let Some(name) = named else {
         return runtime::engine::load::conversion_contract(opened, metadata, platform)
+            .map(|(name, contract)| (name.to_string(), contract))
             .ok_or_else(|| refuse_a_source_no_sku_in_this_build_claims(checkpoint));
     };
     runtime::engine::load::conversion_contract_named(opened, metadata, platform, name).map_err(
         |why| {
             anyhow!(
-                "--sku {name}: {why:#}\n\
-                 This import converts for the row named and for no other; drop `--sku` to \
-                 convert {} for the first row whose contract fits it.",
+                "--deployment {name}: {why:#}\n\
+                 This import converts for the deployment named and for no other; drop \
+                 `--deployment` to convert {} for the first one whose contract fits it.",
                 crate::ui::short_path(checkpoint),
             )
         },
@@ -1663,7 +1672,7 @@ fn staleness(
     };
     if let Some(asked) = asked.filter(|asked| *asked != stamp.sku) {
         return Some(format!(
-            "it serves `{}` and `--sku {asked}` was asked for",
+            "it serves `{}` and `--deployment {asked}` was asked for",
             stamp.sku
         ));
     }
@@ -2262,18 +2271,21 @@ mod tests {
         }
 
         let plain = Just::parse_from(["pie", "google/gemma-4-E4B-it"]).args;
-        assert_eq!(plain.sku, None, "no flag is no override");
+        assert_eq!(plain.deployment, None, "no flag is no override");
 
         let named = Just::parse_from([
             "pie",
             "google/gemma-4-E4B-it",
-            "--sku",
+            "--deployment",
             "gemma4-e4b-vision-bf16-kv-bf16",
         ])
         .args;
-        assert_eq!(named.sku.as_deref(), Some("gemma4-e4b-vision-bf16-kv-bf16"));
+        assert_eq!(
+            named.deployment.as_deref(),
+            Some("gemma4-e4b-vision-bf16-kv-bf16")
+        );
 
-        assert!(Just::try_parse_from(["pie", "google/gemma-4-E4B-it", "--sku"]).is_err());
+        assert!(Just::try_parse_from(["pie", "google/gemma-4-E4B-it", "--deployment"]).is_err());
     }
 
     fn an_unknown_row_name_is_refused_with_the_catalog() {
@@ -2324,7 +2336,7 @@ mod tests {
                 .expect_err("the named row does not read this checkpoint")
         );
         assert!(
-            why.contains(asked) && why.contains("--sku"),
+            why.contains(asked) && why.contains("--deployment"),
             "the refusal names the row that was asked for, and the flag that \
              asked for it: {why}"
         );

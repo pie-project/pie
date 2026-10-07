@@ -79,7 +79,7 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
         return (false, "no engine".to_string());
     };
     match runtime::engine::load::identify(&snap, platform) {
-        Ok(sku) => (true, sku.to_string()),
+        Ok(deployment) => (true, deployment.to_string()),
         Err(_) if pipeline => (false, "(no row)".to_string()),
         Err(_) => (false, "no SKU".to_string()),
     }
@@ -106,7 +106,7 @@ struct DeadWeight {
 struct Artifact {
     name: String,
     address: String,
-    sku: Option<String>,
+    deployment: Option<String>,
     backend: Option<String>,
     root: std::path::PathBuf,
     shards: usize,
@@ -157,9 +157,9 @@ impl crate::ui::Report for ModelList {
                 0 => String::new(),
                 n => format!(" +{n}"),
             };
-            let landing = match (&artifact.sku, &artifact.backend) {
-                (Some(sku), Some(backend)) => format!("{sku} · {backend}"),
-                (Some(sku), None) => sku.clone(),
+            let landing = match (&artifact.deployment, &artifact.backend) {
+                (Some(deployment), Some(backend)) => format!("{deployment} · {backend}"),
+                (Some(deployment), None) => deployment.clone(),
                 _ => "unstamped".to_string(),
             };
             let from = artifact
@@ -247,7 +247,7 @@ impl crate::ui::Report for ModelList {
                 "  {}",
                 palette.dim(
                     "The row shown is the one an import picks by itself; `pie model import \
-                     <repo> --sku <NAME>` imports as another (`--sku '?'` lists every row this \
+                     <repo> --deployment <NAME>` imports as another (`--deployment '?'` lists every row this \
                      build ships)."
                 )
             );
@@ -326,9 +326,9 @@ fn list() -> Result<Answer> {
                         runtime_quant: r.runtime_quant.clone(),
                     })
                     .collect(),
-                generative: facts::of(e.sku.as_deref()),
+                generative: facts::of(e.deployment.as_deref()),
                 name: e.name,
-                sku: e.sku,
+                deployment: e.deployment,
                 backend: e.backend,
                 root: e.root,
                 bytes: e.bytes,
@@ -368,7 +368,7 @@ fn one(name: &str) -> Result<crate::local::store::Entry> {
 fn info(name: String) -> Result<Answer> {
     let entry = one(&name)?;
     Ok(Answer::report(ModelInfo {
-        sku: entry.sku.clone(),
+        deployment: entry.deployment.clone(),
         backend: entry.backend.clone(),
         address: entry.address().to_string(),
         shards: entry.shards(),
@@ -381,7 +381,7 @@ fn info(name: String) -> Result<Answer> {
                 runtime_quant: r.runtime_quant.clone(),
             })
             .collect(),
-        generative: facts::of(entry.sku.as_deref()),
+        generative: facts::of(entry.deployment.as_deref()),
         name: entry.name,
         root: entry.root,
         files: entry.files,
@@ -396,7 +396,7 @@ fn info(name: String) -> Result<Answer> {
 pub struct ModelInfo {
     name: String,
     address: String,
-    sku: Option<String>,
+    deployment: Option<String>,
     backend: Option<String>,
     root: std::path::PathBuf,
     files: Vec<std::path::PathBuf>,
@@ -417,8 +417,8 @@ impl crate::ui::Report for ModelInfo {
         if self.address != self.name {
             row("model", self.name.clone());
         }
-        if let Some(sku) = &self.sku {
-            row("sku", sku.clone());
+        if let Some(deployment) = &self.deployment {
+            row("deployment", deployment.clone());
         }
         if let Some(backend) = &self.backend {
             row("backend", backend.clone());
@@ -542,12 +542,12 @@ impl crate::ui::Report for ModelInfo {
             }
         }
 
-        if let Some(sku) = &self.sku {
+        if let Some(deployment) = &self.deployment {
             println!(
                 "  {}",
                 palette.dim(format!(
-                    "imported as `{sku}`; `pie model import <source> --sku <NAME>` imports \
-                     the same source as another row (`--sku '?'` lists every row this build \
+                    "imported as `{deployment}`; `pie model import <source> --deployment <NAME>` imports \
+                     the same source as another row (`--deployment '?'` lists every row this build \
                      ships)."
                 ))
             );

@@ -12,7 +12,7 @@ into an `.npz` under the golden's own key names, and diffs the two with
     python flux2_parity.py case  --out /tmp/flux2-parity
 
     # 2. run it (the config's `[model] model` is the imported artifact:
-    #    `pie model import $PIE_IMAGEGEN_GOLDEN/flux2/ --sku flux2-mini-bf16-kv-bf16`)
+    #    `pie model import $PIE_IMAGEGEN_GOLDEN/flux2/ --deployment flux2-mini-bf16-kv-bf16`)
     python flux2_parity.py run   --out /tmp/flux2-parity --config ~/.pie/config.flux2-mini.toml
 
     # 3. the pie-side npz, then the diff

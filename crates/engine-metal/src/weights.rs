@@ -1340,7 +1340,7 @@ mod tests {
     }
 
     fn the_store_is_laid_out_aligned_disjoint_and_in_plan_order() {
-        let trace = models::sku("qwen35-d0.8b-bf16-kv-bf16")
+        let trace = models::deployment("qwen35-d0.8b-bf16-kv-bf16")
             .expect("the catalog ships the SKU")
             .trace(Platform::Metal);
         let places = places(&trace, &Plan::default(), &gather::Plan::default())

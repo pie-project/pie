@@ -10,8 +10,8 @@ use poem_ir::{GridRule, Spatial, TimePad};
 const FLAGSHIP: &str = "ltx25-bf16-kv-bf16";
 const MINI: &str = "ltx25-mini-bf16-kv-bf16";
 
-fn row(sku: &str) -> &'static models::Sku {
-    models::sku(sku).unwrap_or_else(|| panic!("this build ships no `{sku}`"))
+fn row(sku: &str) -> &'static models::Deployment {
+    models::deployment(sku).unwrap_or_else(|| panic!("this build ships no `{sku}`"))
 }
 
 fn trace(sku: &str) -> Trace {

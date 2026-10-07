@@ -42,8 +42,8 @@ fn main() {
     }
     std::panic::set_hook(Box::new(|_| {}));
     let mut tally = [0usize; 3];
-    for sku in models::skus() {
-        if sku.recipe.tp != 1 {
+    for sku in models::deployments() {
+        if sku.deploy.tp != 1 {
             continue;
         }
         if !filters.is_empty() && !filters.iter().any(|f| sku.name.contains(f.as_str())) {
@@ -83,7 +83,7 @@ fn main() {
 }
 
 fn one(
-    sku: &models::Sku,
+    sku: &models::Deployment,
     compile: bool,
     lean: bool,
     verbose: bool,

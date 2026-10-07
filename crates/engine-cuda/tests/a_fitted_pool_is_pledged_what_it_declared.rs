@@ -80,7 +80,7 @@ fn a_fitted_pool_is_pledged_what_it_declared() {
         eprintln!("{checkpoint:?} holds no tensor container");
         return;
     };
-    let sku = models::sku(SKU).expect("the catalog ships the SKU");
+    let sku = models::deployment(SKU).expect("the catalog ships the SKU");
     let trace = sku.trace(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
     let contract = sku

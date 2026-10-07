@@ -150,11 +150,11 @@ fn state_every_sku() -> Vec<Stated> {
     let dir = scratch();
     let mut out = Vec::new();
 
-    for row in models::skus() {
+    for row in models::deployments() {
         if !by_load(row) {
             continue;
         }
-        let (name, tp) = (row.name.as_str(), row.recipe.tp);
+        let (name, tp) = (row.name.as_str(), row.deploy.tp);
         let trace = row.trace(Platform::Cuda);
         let path = dir.join(format!("{name}.zt"));
         write_checkpoint(&path, &trace.params);
@@ -202,8 +202,8 @@ fn nodes(expr: &Expr, wanted: &dyn Fn(&Expr) -> bool) -> usize {
     found
 }
 
-fn by_load(row: &models::Sku) -> bool {
-    row.recipe
+fn by_load(row: &models::Deployment) -> bool {
+    row.deploy
         .weights
         .iter()
         .all(|w| matches!(w, Dtype::Bf16 | Dtype::Mxfp4))
@@ -373,8 +373,8 @@ fn a_bank_the_checkpoint_ships_unquantized_is_cast_on_the_way_in() {
     let dir = scratch();
     let mut faults = Vec::new();
 
-    for row in models::skus() {
-        let (name, tp) = (row.name.as_str(), row.recipe.tp);
+    for row in models::deployments() {
+        let (name, tp) = (row.name.as_str(), row.deploy.tp);
         if !name.starts_with("kimik3") {
             continue;
         }

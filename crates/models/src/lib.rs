@@ -32,40 +32,24 @@ use poem_dsl::Dtype;
 
 pub use poem_dsl::{ClassifyFn, Platform, Request, Stream, biases_name, scales_name};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Recipe {
-    pub text: &'static str,
-    pub weights: &'static [Dtype],
-    pub kv: Dtype,
-    pub tp: u32,
-}
-
-impl Recipe {
-    #[must_use]
-    pub fn name(&self) -> String {
-        let mut name = self.text.to_string();
-        for dtype in self.weights {
-            name.push('-');
-            name.push_str(&word(*dtype));
-        }
-        name.push_str("-kv-");
-        name.push_str(&word(self.kv));
-        if self.tp > 1 {
-            name.push_str(&format!("-tp{}", self.tp));
-        }
-        name
-    }
-}
-
 #[must_use]
 pub fn word(dtype: Dtype) -> String {
     format!("{dtype:?}").to_lowercase()
 }
 
-/// A catalog row: one deployment of one model, under the name it is served by.
-pub struct Sku {
+/// The dtype `word` spells, the inverse of [`word`].
+#[must_use]
+pub fn dtype_of(word: &str) -> Option<Dtype> {
+    Dtype::ALL
+        .iter()
+        .copied()
+        .find(|dtype| self::word(*dtype) == word)
+}
+
+/// One deployment of one model, under the name it is served by.
+#[derive(Clone)]
+pub struct Deployment {
     pub name: String,
-    pub recipe: Recipe,
     pub entry: &'static catalog::Entry,
     pub deploy: catalog::Deploy,
     pub classify: ClassifyFn,
@@ -197,11 +181,11 @@ pub struct Diffusion {
     pub self_cond_taps: u32,
 }
 
-impl Sku {
-    fn of(entry: &'static catalog::Entry, recipe: Recipe, deploy: catalog::Deploy) -> Sku {
-        Sku {
-            name: recipe.name(),
-            recipe,
+impl Deployment {
+    #[must_use]
+    pub fn of(entry: &'static catalog::Entry, deploy: catalog::Deploy) -> Deployment {
+        Deployment {
+            name: entry.name(&deploy),
             entry,
             classify: entry.classify,
             template: entry.template,
@@ -212,11 +196,27 @@ impl Sku {
         }
     }
 
-    /// The trace each of the row's ranks runs.
+    /// The deployment `name` spells.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Deployment> {
+        catalog::parse(name).map(|(entry, deploy)| Deployment::of(entry, deploy))
+    }
+
+    /// Whether the model serves this deployment on `platform`.
+    pub fn check(&self, platform: Platform) -> Result<(), catalog::Refused> {
+        self.entry.check(&self.deploy, platform)
+    }
+
+    /// The trace each of the deployment's ranks runs.
+    pub fn try_trace(&self, platform: Platform) -> Result<poem_ir::Trace, catalog::Refused> {
+        self.entry.trace(&self.deploy, platform)
+    }
+
+    /// The trace each of the deployment's ranks runs, for a deployment the
+    /// catalog lists, which always builds.
     #[must_use]
     pub fn trace(&self, platform: Platform) -> poem_ir::Trace {
-        (self.entry.trace)(&self.name, &self.deploy, platform)
-            .map(|trace| split(&self.recipe, trace))
+        self.try_trace(platform)
             .unwrap_or_else(|why| panic!("`{}` does not build: {why}", self.name))
     }
 
@@ -227,17 +227,6 @@ impl Sku {
     ) -> Result<ModelContract, checkpoint_dsl::Error> {
         (self.entry.import)(&self.deploy, src, platform)
     }
-}
-
-/// The trace one of `recipe`'s ranks runs.
-#[must_use]
-pub fn split(recipe: &Recipe, trace: poem_ir::Trace) -> poem_ir::Trace {
-    poem_compiler::shard::shard(trace, recipe.tp).unwrap_or_else(|why| {
-        panic!(
-            "`{}` ships a row its model does not split into: {why}",
-            recipe.name()
-        )
-    })
 }
 
 /// An import reads a whole checkpoint, which one rank of a split row does not
@@ -288,8 +277,9 @@ pub fn entry(id: &str) -> Option<&'static catalog::Entry> {
     entries().find(|entry| entry.id == id)
 }
 
-/// Every row, family by family in the order each family lists them.
-static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
+/// Every deployment the catalog lists, family by family in the order each
+/// family lists them.
+static DEPLOYMENTS: LazyLock<Vec<Deployment>> = LazyLock::new(|| {
     FAMILIES
         .iter()
         .flat_map(|family| {
@@ -299,27 +289,43 @@ static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
                 .collect();
             rows.sort_by_key(|(_, row)| row.seq);
             rows.into_iter()
-                .map(|(entry, row)| Sku::of(entry, row.recipe, row.deploy.clone()))
+                .map(|(entry, row)| Deployment::of(entry, row.deploy.clone()))
         })
         .collect()
 });
 
-pub fn skus() -> impl Iterator<Item = &'static Sku> {
-    SKUS.iter()
+/// Every deployment the catalog lists, fixtures' included.
+pub fn deployments() -> impl Iterator<Item = &'static Deployment> {
+    DEPLOYMENTS.iter()
 }
 
+/// The deployment the catalog lists under `name`.
 #[must_use]
-pub fn sku(name: &str) -> Option<&'static Sku> {
-    skus().find(|sku| sku.name == name)
+pub fn deployment(name: &str) -> Option<&'static Deployment> {
+    deployments().find(|deployment| deployment.name == name)
 }
 
 pub fn fits<'a>(
     src: &'a ztensor::Source,
     platform: Platform,
-) -> impl Iterator<Item = (&'static Sku, Result<ModelContract, checkpoint_dsl::Error>)> + 'a {
-    skus()
-        .filter(|sku| sku.recipe.tp == 1)
-        .map(move |sku| (sku, sku.contract(src, platform)))
+) -> impl Iterator<
+    Item = (
+        &'static Deployment,
+        Result<ModelContract, checkpoint_dsl::Error>,
+    ),
+> + 'a {
+    let mut candidates: Vec<&'static Deployment> = deployments()
+        .filter(|d| d.deploy.tp == 1 && !d.entry.fixture)
+        .collect();
+    // A checkpoint is served with every part and drafter it carries unless a
+    // config leaves them off, so the richest deployment that fits is tried
+    // first; the catalog's order breaks ties.
+    candidates.sort_by_key(|d| {
+        std::cmp::Reverse(d.deploy.parts.len() + usize::from(d.deploy.drafter.is_some()))
+    });
+    candidates
+        .into_iter()
+        .map(move |d| (d, d.contract(src, platform)))
 }
 
 pub(crate) fn dense(banks: Dtype) -> Dtype {
@@ -337,7 +343,7 @@ pub fn identify(src: &ztensor::Source, platform: Platform) -> Result<&'static st
                     &sku.name,
                     format!(
                         "reads this checkpoint only by re-quantizing `{plane}` from the form \
-                         it is stored in; a second quantization is taken by `--sku`, not by \
+                         it is stored in; a second quantization is taken by `--deployment`, not by \
                          identification"
                     ),
                 )),

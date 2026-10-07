@@ -13,8 +13,8 @@ fn main() {
         Some("xla") => Platform::Xla,
         Some(other) => panic!("unknown platform `{other}`"),
     };
-    let row = models::sku(&sku).unwrap_or_else(|| {
-        let names: Vec<&str> = models::skus().map(|row| row.name.as_str()).collect();
+    let row = models::deployment(&sku).unwrap_or_else(|| {
+        let names: Vec<&str> = models::deployments().map(|row| row.name.as_str()).collect();
         panic!("`{sku}` is not a catalog row; rows: {names:#?}")
     });
     let plan = row.trace(platform);

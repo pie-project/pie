@@ -18,7 +18,7 @@ fn count(trace: &poem_dsl::Trace, wanted: impl Fn(&Operation) -> bool) -> usize 
 // eviction programs (`attn_score`).
 #[test]
 fn every_gpt_oss_row_declares_a_masked_arm_and_exports_its_scores() {
-    let rows: Vec<_> = models::skus()
+    let rows: Vec<_> = models::deployments()
         .filter(|row| row.name.starts_with("gptoss-"))
         .collect();
     assert!(!rows.is_empty(), "this build ships no gpt-oss row");

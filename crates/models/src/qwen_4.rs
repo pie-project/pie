@@ -39,12 +39,12 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 }
             },
             rows: [
-                (0, "qwen38-flash-next", 1, [U4g64], Bf16, [], None),
-                (1, "qwen38-flash-next-full-mtp", 1, [U4g64, U2g128], Bf16, [], Some(Drafter::Mtp)),
-                (2, "qwen38-flash-next-full", 1, [U4g64, U2g128], Bf16, [], None),
-                (4, "qwen38-flash-next", 1, [Bf16], Bf16, [], None),
-                (5, "qwen38-flash-next-full-mtp-vision", 1, [U4g64, U2g128], Bf16, [Vision], Some(Drafter::Mtp)),
-                (6, "qwen38-flash-next-full-vision", 1, [U4g64, U2g128], Bf16, [Vision], None),
+                (0, 1, [U4g64], Bf16, [], None),
+                (1, 1, [U4g64, U2g128], Bf16, [], Some(Drafter::Mtp)),
+                (2, 1, [U4g64, U2g128], Bf16, [], None),
+                (4, 1, [Bf16], Bf16, [], None),
+                (5, 1, [U4g64, U2g128], Bf16, [Vision], Some(Drafter::Mtp)),
+                (6, 1, [U4g64, U2g128], Bf16, [Vision], None),
             ],
         },
         crate::entry! {
@@ -62,7 +62,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                     _ => Err(Refused::unsupported("qwen38-flash-next-mini", d)),
                 }
             },
-            rows: [(3, "qwen38-flash-next", 1, [U4g64, U2g128], Bf16, [], None)],
+            rows: [(3, 1, [U4g64, U2g128], Bf16, [], None)],
         },
     ]
 }

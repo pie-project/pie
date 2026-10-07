@@ -1891,13 +1891,13 @@ mod tests {
     use super::*;
 
     fn a3b() -> Trace {
-        models::sku("qwen35-a3b-bf16-kv-bf16")
+        models::deployment("qwen35-a3b-bf16-kv-bf16")
             .expect("the catalog ships the SKU")
             .trace(Platform::Cuda)
     }
 
     fn gpt_oss() -> Trace {
-        models::sku("gptoss-20b-bf16-mxfp4-kv-bf16")
+        models::deployment("gptoss-20b-bf16-mxfp4-kv-bf16")
             .expect("the catalog ships the SKU")
             .trace(Platform::Cuda)
     }

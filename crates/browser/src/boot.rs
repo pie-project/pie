@@ -9,7 +9,6 @@ use runtime::model::ModelMetadata;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BootConfig {
-    pub sku: Option<String>,
     pub engine: bool,
     pub max_forward_tokens: u32,
     pub max_forward_requests: u32,
@@ -29,7 +28,6 @@ pub struct BootConfig {
 impl Default for BootConfig {
     fn default() -> Self {
         BootConfig {
-            sku: None,
             engine: true,
             max_forward_tokens: 512,
             max_forward_requests: 8,
@@ -62,7 +60,7 @@ impl BootConfig {
 #[derive(Debug, Clone, Serialize)]
 pub struct BootSummary {
     pub model: String,
-    pub sku: String,
+    pub deployment: String,
     pub trace: String,
     pub weight_bytes: u64,
     pub kv_pages: u32,
@@ -209,22 +207,22 @@ fn load(
             (vec![engine], summary, model_id, page)
         }
         None => {
-            let sku = checkpoint::file::serve::stamp_of(artifact)?
+            let deployment = checkpoint::file::serve::stamp_of(artifact)?
                 .map(|stamp| stamp.sku)
                 .ok_or_else(|| anyhow!("{} carries no serving stamp", artifact.display()))?;
             (
                 Vec::new(),
                 BootSummary {
                     model: model_name.to_string(),
-                    sku: sku.clone(),
-                    trace: sku.clone(),
+                    deployment: deployment.clone(),
+                    trace: deployment.clone(),
                     weight_bytes: 0,
                     kv_pages: 0,
                     kv_page_size: 16,
                     max_lanes: 0,
                     max_tokens: 0,
                 },
-                sku,
+                deployment,
                 16,
             )
         }
@@ -287,7 +285,7 @@ fn load_engine(
     let mut backend = crate::engine::open(config, device)?;
     let frames_in_flight = u8::try_from(config.frame_dispatch_depth.max(1)).unwrap_or(u8::MAX);
     let request = runtime::engine::load::request_of(
-        config.sku.as_deref(),
+        &runtime::engine::load::Overrides::default(),
         artifact,
         poem_ir::Platform::Wgpu,
         budgets,
@@ -295,8 +293,8 @@ fn load_engine(
         -1,
         frames_in_flight,
     )?;
-    let sku = request.trace.name.clone();
-    tracing::info!(sku, "loading weights");
+    let deployment = request.trace.name.clone();
+    tracing::info!(deployment, "loading weights");
     let loaded = backend.load(request).map_err(anyhow::Error::from)?;
     tracing::info!(
         weight_bytes = loaded.facts.weight_bytes,
@@ -307,7 +305,7 @@ fn load_engine(
     let caps = loaded.caps;
     let summary = BootSummary {
         model: model_name.to_string(),
-        sku: sku.clone(),
+        deployment,
         trace: loaded.facts.trace_name.clone(),
         weight_bytes: loaded.facts.weight_bytes,
         kv_pages: caps.pools.kv_pages,

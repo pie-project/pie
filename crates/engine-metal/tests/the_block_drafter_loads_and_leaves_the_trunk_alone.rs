@@ -118,7 +118,7 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
         eprintln!("not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/models)");
         return;
     };
-    let sku = models::sku(SKU).expect("the catalog ships the block-drafter row");
+    let sku = models::deployment(SKU).expect("the catalog ships the block-drafter row");
     let trace = sku.trace(Platform::Metal);
     let source = ztensor_compat::index(&artifact).expect("the artifact opens");
     let contract = checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Metal)
@@ -167,7 +167,7 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
         );
         return;
     };
-    let plain_sku = models::sku(PLAIN_SKU).expect("the catalog ships the plain row");
+    let plain_sku = models::deployment(PLAIN_SKU).expect("the catalog ships the plain row");
     let plain_trace = plain_sku.trace(Platform::Metal);
     let plain_source = ztensor_compat::index(&plain_artifact).expect("the artifact opens");
     let plain_contract =
@@ -242,7 +242,7 @@ fn a_draft_block_fires_and_the_drafter_answers_it() {
         eprintln!("not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/models)");
         return;
     };
-    let sku = models::sku(SKU).expect("the catalog ships the block-drafter row");
+    let sku = models::deployment(SKU).expect("the catalog ships the block-drafter row");
     let trace = sku.trace(Platform::Metal);
     let source = ztensor_compat::index(&artifact).expect("the artifact opens");
     let contract = checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Metal)

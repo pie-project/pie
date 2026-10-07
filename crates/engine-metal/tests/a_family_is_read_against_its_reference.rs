@@ -64,13 +64,14 @@ fn every_probe_is_dumped() {
             let stamp = checkpoint::file::serve::stamp_of(&artifact)
                 .expect("the artifact reads")
                 .expect("the artifact carries a serving stamp");
-            let sku = models::sku(&stamp.sku).unwrap_or_else(|| panic!("no SKU {}", stamp.sku));
+            let sku =
+                models::deployment(&stamp.sku).unwrap_or_else(|| panic!("no SKU {}", stamp.sku));
             let trace = sku.trace(Platform::Metal);
             let source = ztensor_compat::index(&artifact).expect("the artifact opens");
             let contract = checkpoint_dsl::own_contract(
                 &source,
                 &trace.params,
-                sku.recipe.tp,
+                sku.deploy.tp,
                 Platform::Metal,
             )
             .unwrap_or_else(|why| panic!("the artifact holds every plane of {}: {why}", sku.name));
@@ -80,7 +81,7 @@ fn every_probe_is_dumped() {
             let snapshot = PathBuf::from(snapshot);
             let name = std::env::var("PIE_PARITY_SKU")
                 .expect("PIE_PARITY_SKU names the row that reads the snapshot");
-            let sku = models::sku(&name).unwrap_or_else(|| panic!("no SKU {name}"));
+            let sku = models::deployment(&name).unwrap_or_else(|| panic!("no SKU {name}"));
             let mut shards: Vec<PathBuf> = if snapshot.is_dir() {
                 std::fs::read_dir(&snapshot)
                     .expect("the snapshot lists")

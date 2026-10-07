@@ -60,7 +60,7 @@ fn the_miniature_lands_its_derived_planes() {
     let dir = stage(&fixture);
     let src = ztensor_compat::open(dir.join("model.safetensors")).unwrap();
     let metadata = parse_metadata(&dir).unwrap();
-    let row = models::sku(MINI).expect("the catalog ships the miniature");
+    let row = models::deployment(MINI).expect("the catalog ships the miniature");
     let contract = row
         .contract(&src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the miniature does not read its fixture: {why}"));

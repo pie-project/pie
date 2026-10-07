@@ -22,7 +22,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
             diffusion: None,
             generative: Some(Model::generative),
             build: |d| -> Model { Ok(Model::ti2v_5b(d.dtype()?)) },
-            rows: [(0, "wan22-ti2v-5b", 1, [Bf16], Bf16, [], None), (1, "wan22-ti2v-5b", 1, [U4g64], Bf16, [], None)],
+            rows: [(0, 1, [Bf16], Bf16, [], None), (1, 1, [U4g64], Bf16, [], None)],
         },
         crate::entry! {
             id: "wan22-mini-d128",
@@ -34,7 +34,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
             diffusion: None,
             generative: Some(Model::generative),
             build: |d| -> Model { Ok(Model::mini_d128(d.dtype()?)) },
-            rows: [(2, "wan22-mini-d128", 1, [Bf16], Bf16, [], None)],
+            rows: [(2, 1, [Bf16], Bf16, [], None)],
         },
         crate::entry! {
             id: "wan22-mini-nano",
@@ -46,7 +46,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
             diffusion: None,
             generative: Some(Model::generative),
             build: |d| -> Model { Ok(Model::mini_nano(d.dtype()?)) },
-            rows: [(3, "wan22-mini-nano", 1, [Bf16], Bf16, [], None)],
+            rows: [(3, 1, [Bf16], Bf16, [], None)],
         },
     ]
 }

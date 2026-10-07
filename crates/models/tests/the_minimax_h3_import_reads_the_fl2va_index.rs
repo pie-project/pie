@@ -330,7 +330,7 @@ fn the_flagship_reads_a_synthetic_partition_at_the_counts_its_cuts_imply() {
     tensors.extend(prefixed("te.", text_encoder(model::TE_DEPTH)));
     let src = synthetic(&dir, &tensors);
 
-    let row = models::sku(FLAGSHIP).expect("the catalog ships the flagship");
+    let row = models::deployment(FLAGSHIP).expect("the catalog ships the flagship");
     let contract = row
         .contract(&src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the flagship does not read a synthetic partition: {why}"));
@@ -367,12 +367,12 @@ fn the_flagship_reads_a_synthetic_partition_at_the_counts_its_cuts_imply() {
 fn the_flagship_refuses_a_bare_transformer() {
     let dir = scratch();
     let src = synthetic(&dir, &transformer(&Dims::mini()));
-    let row = models::sku(FLAGSHIP).expect("the catalog ships the flagship");
+    let row = models::deployment(FLAGSHIP).expect("the catalog ships the flagship");
     assert!(
         row.contract(&src, Platform::Cuda).is_err(),
         "the flagship read a bare 128-wide transformer with no encoder"
     );
-    let mini = models::sku(MINI).expect("the catalog ships the miniature");
+    let mini = models::deployment(MINI).expect("the catalog ships the miniature");
     let contract = mini
         .contract(&src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the miniature does not read its own state_dict: {why}"));
@@ -500,7 +500,7 @@ fn the_miniature_reads_its_golden_fixture() {
             "`{name}`"
         );
     }
-    let row = models::sku(MINI).expect("the catalog ships the miniature");
+    let row = models::deployment(MINI).expect("the catalog ships the miniature");
     let contract = row
         .contract(&src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the miniature does not read its own fixture: {why}"));

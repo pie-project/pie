@@ -12,8 +12,8 @@ use poem_ir::{GridRule, ParamLayout, Seam, Spatial};
 const KLEIN: &str = "flux2-klein-4b-bf16-kv-bf16";
 const MINI: &str = "flux2-mini-bf16-kv-bf16";
 
-fn row(sku: &str) -> &'static models::Sku {
-    models::sku(sku).unwrap_or_else(|| panic!("this build ships no `{sku}`"))
+fn row(sku: &str) -> &'static models::Deployment {
+    models::deployment(sku).unwrap_or_else(|| panic!("this build ships no `{sku}`"))
 }
 
 fn trace(sku: &str) -> Trace {

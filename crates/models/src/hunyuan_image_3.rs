@@ -37,9 +37,9 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 }
             },
             rows: [
-                (0, "hunyuanimage3-80b-a13b", 1, [Bf16, U8g64], Bf16, [], None),
-                (1, "hunyuanimage3-80b-a13b", 4, [Bf16, U8g64], Bf16, [], None),
-                (2, "hunyuanimage3-80b-a13b", 4, [Bf16, U4g64], Bf16, [], None),
+                (0, 1, [Bf16, U8g64], Bf16, [], None),
+                (1, 4, [Bf16, U8g64], Bf16, [], None),
+                (2, 4, [Bf16, U4g64], Bf16, [], None),
             ],
         },
         crate::entry! {
@@ -52,7 +52,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
             diffusion: Some(diffusion),
             generative: Some(Model::generative),
             build: |d| -> Model { Ok(Model::mini(d.dtype()?, d.kv)) },
-            rows: [(3, "hunyuanimage3-mini", 1, [Bf16], Bf16, [], None)],
+            rows: [(3, 1, [Bf16], Bf16, [], None)],
         },
     ]
 }

@@ -30,7 +30,7 @@ echo "== inferlets (wasm32-wasip2)"
 (cd examples && cargo build -q --release --target wasm32-wasip2 -p text-completion -p naive-baseline -p sort-probe)
 
 echo "== import"
-"$pie" model import "$work/snapshot" --sku qwen35-tiny-u4g64-kv-bf16 --keep-source
+"$pie" model import "$work/snapshot" --deployment qwen35-tiny-u4g64-kv-bf16 --keep-source
 
 case "$engine" in
   wgpu)   engine_toml=$'type = "wgpu"\nbackends = "vulkan"\ndevice = ["wgpu:0"]' ;;

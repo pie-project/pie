@@ -5,7 +5,7 @@ use poem_ir::{Fault, Platform};
 #[test]
 fn every_split_row_reads_what_it_makes_in_order() {
     let mut broken = Vec::new();
-    for sku in models::skus().filter(|sku| sku.recipe.tp > 1) {
+    for sku in models::deployments().filter(|sku| sku.deploy.tp > 1) {
         for platform in [Platform::Cuda, Platform::Metal] {
             let Err(faults) = poem_ir::check(&sku.trace(platform)) else {
                 continue;
@@ -35,7 +35,8 @@ fn every_split_row_reads_what_it_makes_in_order() {
 /// once, right after it, and nothing else is added.
 #[test]
 fn a_split_row_reduces_each_projection_once() {
-    let sku = models::sku("qwen35-d0.8b-bf16-kv-bf16-tp2").expect("the catalog ships the row");
+    let sku =
+        models::deployment("qwen35-d0.8b-bf16-kv-bf16-tp2").expect("the catalog ships the row");
     let trace = sku.trace(Platform::Cuda);
     let count = |op: &str| {
         trace
@@ -54,7 +55,7 @@ fn a_split_row_reduces_each_projection_once() {
         0,
         "the 0.8b row ties no vocab-split head"
     );
-    let whole = models::sku("qwen35-d0.8b-bf16-kv-bf16")
+    let whole = models::deployment("qwen35-d0.8b-bf16-kv-bf16")
         .expect("the one-rank row")
         .trace(Platform::Cuda);
     assert_eq!(trace.nodes.len(), whole.nodes.len() + 48);

@@ -23,9 +23,9 @@ const PLATFORMS: [Platform; 4] = [
     Platform::Vulkan,
 ];
 
-fn row(sku: &str) -> &'static models::Sku {
-    models::sku(sku).unwrap_or_else(|| {
-        let names: Vec<&str> = models::skus().map(|row| row.name.as_str()).collect();
+fn row(sku: &str) -> &'static models::Deployment {
+    models::deployment(sku).unwrap_or_else(|| {
+        let names: Vec<&str> = models::deployments().map(|row| row.name.as_str()).collect();
         panic!("this build ships no `{sku}`; rows are {names:#?}")
     })
 }
@@ -43,7 +43,7 @@ fn dims(sku: &str) -> Dims {
 }
 
 fn ranks(sku: &str) -> u32 {
-    row(sku).recipe.tp
+    row(sku).deploy.tp
 }
 
 #[test]
@@ -352,7 +352,7 @@ fn the_mixture_is_a_renormalised_top_k_over_the_whole_bank_beside_a_shared_exper
         }
         assert_eq!(routers, d.layers as usize, "{sku}: one router a layer");
         assert_eq!(selects, 2 * d.layers as usize, "{sku}: gate_up and down");
-        let quantized = row(sku).recipe.weights.len() > 1;
+        let quantized = row(sku).deploy.weights.len() > 1;
         assert_eq!(
             quant > 0,
             quantized,

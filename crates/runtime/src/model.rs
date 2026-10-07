@@ -23,817 +23,295 @@ pub struct Row {
 
 pub const ROWS: &[Row] = &[
     Row {
-        id: "dsv4-base-bf16-kv-bf16",
+        id: "dsv4-base",
         layers: 6,
         vocab: 129_280,
         arch: "deepseek_v4",
     },
     Row {
-        id: "dsv4-flash-bf16-kv-bf16",
+        id: "dsv4-flash",
         layers: 43,
         vocab: 129_280,
         arch: "deepseek_v4",
     },
     Row {
-        id: "dsv4-flash-bf16-kv-bf16-tp2",
-        layers: 43,
-        vocab: 129_280,
-        arch: "deepseek_v4",
-    },
-    Row {
-        id: "dsv4-flash-u4g64-u2g64-kv-bf16",
+        id: "dsv4-flash-mini",
         layers: 5,
         vocab: 129_280,
         arch: "deepseek_v4",
     },
     Row {
-        id: "dsv4-flash-u4g64-u2g64-kv-bf16-tp2",
-        layers: 5,
-        vocab: 129_280,
-        arch: "deepseek_v4",
-    },
-    Row {
-        id: "dsv41-flash-u4g64-kv-bf16",
+        id: "dsv41-flash",
         layers: 40,
         vocab: 129_280,
         arch: "deepseek_v4",
     },
     Row {
-        id: "dsv41-flash-bf16-mxfp4-kv-bf16",
-        layers: 40,
-        vocab: 129_280,
-        arch: "deepseek_v4",
-    },
-    Row {
-        id: "dsv41-flash-mini-bf16-mxfp4-kv-bf16",
+        id: "dsv41-flash-mini",
         layers: 8,
         vocab: 129_280,
         arch: "deepseek_v4",
     },
     Row {
-        id: "dsv4-flash-mini-bf16-kv-bf16",
-        layers: 5,
-        vocab: 129_280,
-        arch: "deepseek_v4",
-    },
-    Row {
-        id: "dsv4-flash-mtp-u4g64-u2g64-mxfp4-kv-bf16",
-        layers: 5,
-        vocab: 129_280,
-        arch: "deepseek_v4",
-    },
-    Row {
-        id: "dsv4-flash-full-mtp-u4g64-u2g64-mxfp4-kv-bf16",
-        layers: 43,
-        vocab: 129_280,
-        arch: "deepseek_v4",
-    },
-    Row {
-        id: "dsv4-flash-full-u4g64-u2g64-kv-bf16",
-        layers: 43,
-        vocab: 129_280,
-        arch: "deepseek_v4",
-    },
-    Row {
-        id: "gemma4-e4b-bf16-kv-bf16",
+        id: "gemma4-e4b",
         layers: 42,
         vocab: 262_144,
         arch: "gemma4",
     },
     Row {
-        id: "gemma4-e4b-bf16-kv-bf16-tp2",
-        layers: 42,
-        vocab: 262_144,
-        arch: "gemma4",
-    },
-    Row {
-        id: "gemma4-e4b-eagle-bf16-kv-bf16",
-        layers: 42,
-        vocab: 262_144,
-        arch: "gemma4",
-    },
-    Row {
-        id: "gemma4-e4b-vision-bf16-kv-bf16",
-        layers: 42,
-        vocab: 262_144,
-        arch: "gemma4",
-    },
-    Row {
-        id: "diffusiongemma-26b-a4b-u4g64-kv-bf16",
+        id: "diffusiongemma-26b-a4b",
         layers: 30,
         vocab: 262_144,
         arch: "diffusion_gemma",
     },
     Row {
-        id: "diffusiongemma-26b-a4b-u8g64-kv-bf16",
-        layers: 30,
-        vocab: 262_144,
-        arch: "diffusion_gemma",
-    },
-    Row {
-        id: "diffusiongemma-26b-a4b-u8g64-u4g64-kv-bf16",
-        layers: 30,
-        vocab: 262_144,
-        arch: "diffusion_gemma",
-    },
-    Row {
-        id: "diffusiongemma-26b-a4b-u4g64-u8g64-kv-bf16",
-        layers: 30,
-        vocab: 262_144,
-        arch: "diffusion_gemma",
-    },
-    Row {
-        id: "diffusiongemma-26b-a4b-u8g64-u4g64-u4g64-kv-bf16",
-        layers: 30,
-        vocab: 262_144,
-        arch: "diffusion_gemma",
-    },
-    Row {
-        id: "diffusiongemma-26b-a4b-bf16-u4g64-kv-bf16",
-        layers: 30,
-        vocab: 262_144,
-        arch: "diffusion_gemma",
-    },
-    Row {
-        id: "gemma4-26b-a4b-u4g64-kv-bf16",
+        id: "gemma4-26b-a4b",
         layers: 30,
         vocab: 262_144,
         arch: "gemma4",
     },
     Row {
-        id: "gemma4-26b-a4b-mtp-u4g64-kv-bf16",
-        layers: 30,
-        vocab: 262_144,
-        arch: "gemma4",
-    },
-    Row {
-        id: "gemma4-26b-a4b-dflash-u4g64-kv-bf16",
-        layers: 30,
-        vocab: 262_144,
-        arch: "gemma4",
-    },
-    Row {
-        id: "gemma4-26b-a4b-vision-u4g64-kv-bf16",
-        layers: 30,
-        vocab: 262_144,
-        arch: "gemma4",
-    },
-    Row {
-        id: "gemma4-31b-bf16-kv-bf16",
+        id: "gemma4-31b",
         layers: 60,
         vocab: 262_144,
         arch: "gemma4",
     },
     Row {
-        id: "gemma4-31b-mtp-u4g64-kv-bf16",
-        layers: 60,
-        vocab: 262_144,
-        arch: "gemma4",
-    },
-    Row {
-        id: "gemma4-31b-u4g64-kv-bf16",
-        layers: 60,
-        vocab: 262_144,
-        arch: "gemma4",
-    },
-    Row {
-        id: "gemma4-31b-u4g64-kv-bf16-tp2",
-        layers: 60,
-        vocab: 262_144,
-        arch: "gemma4",
-    },
-    Row {
-        id: "gemma4-31b-vision-u4g64-kv-bf16",
-        layers: 60,
-        vocab: 262_144,
-        arch: "gemma4",
-    },
-    Row {
-        id: "gemma4-31b-bf16-kv-bf16-tp2",
-        layers: 60,
-        vocab: 262_144,
-        arch: "gemma4",
-    },
-    Row {
-        id: "glm5-a12b-bf16-kv-bf16",
+        id: "glm5-a12b",
         layers: 46,
         vocab: 151_552,
         arch: "glm_moe_dsa",
     },
     Row {
-        id: "glm5-a12b-bf16-kv-bf16-tp2",
-        layers: 46,
-        vocab: 151_552,
-        arch: "glm_moe_dsa",
-    },
-    Row {
-        id: "glm53-flash-mini-u4g64-u4g64-kv-bf16",
+        id: "glm53-flash-mini",
         layers: 8,
         vocab: 154_880,
         arch: "glm5_next",
     },
     Row {
-        id: "glm53-flash-mini-u4g64-u4g64-kv-bf16-tp2",
-        layers: 8,
-        vocab: 154_880,
-        arch: "glm5_next",
-    },
-    Row {
-        id: "glm53-flash-mtp-u8g64-u2g64-u4g64-kv-bf16",
+        id: "glm53-flash",
         layers: 45,
         vocab: 154_880,
         arch: "glm5_next",
     },
     Row {
-        id: "glm53-flash-mtp-vision-u8g64-u2g64-u4g64-kv-bf16",
-        layers: 45,
-        vocab: 154_880,
-        arch: "glm5_next",
-    },
-    Row {
-        id: "glm53-flash-vision-u8g64-u2g64-kv-bf16",
-        layers: 45,
-        vocab: 154_880,
-        arch: "glm5_next",
-    },
-    Row {
-        id: "glm53-flash-u8g64-u2g64-kv-bf16",
-        layers: 45,
-        vocab: 154_880,
-        arch: "glm5_next",
-    },
-    Row {
-        id: "glm53-flash-mtp-vision-u4g64-u2g64-u4g64-kv-bf16",
-        layers: 45,
-        vocab: 154_880,
-        arch: "glm5_next",
-    },
-    Row {
-        id: "gptoss-20b-bf16-mxfp4-kv-bf16",
+        id: "gptoss-20b",
         layers: 24,
         vocab: 201_088,
         arch: "gptoss",
     },
     Row {
-        id: "gptoss-20b-bf16-mxfp4-kv-bf16-tp2",
-        layers: 24,
-        vocab: 201_088,
-        arch: "gptoss",
-    },
-    Row {
-        id: "gptoss-20b-u4g64-mxfp4-kv-bf16",
-        layers: 24,
-        vocab: 201_088,
-        arch: "gptoss",
-    },
-    Row {
-        id: "gptoss-20b-u4g64-mxfp4-kv-bf16-tp2",
-        layers: 24,
-        vocab: 201_088,
-        arch: "gptoss",
-    },
-    Row {
-        id: "gptoss-20b-dflash-u4g64-mxfp4-kv-bf16",
-        layers: 24,
-        vocab: 201_088,
-        arch: "gptoss",
-    },
-    Row {
-        id: "gptoss-20b-mini-bf16-mxfp4-kv-bf16",
+        id: "gptoss-20b-mini",
         layers: 5,
         vocab: 201_088,
         arch: "gptoss",
     },
     Row {
-        id: "gptoss-20b-mini-bf16-mxfp4-kv-bf16-tp2",
-        layers: 5,
-        vocab: 201_088,
-        arch: "gptoss",
-    },
-    Row {
-        id: "gptoss-120b-bf16-mxfp4-kv-bf16",
+        id: "gptoss-120b",
         layers: 36,
         vocab: 201_088,
         arch: "gptoss",
     },
     Row {
-        id: "gptoss-120b-bf16-mxfp4-kv-bf16-tp2",
-        layers: 36,
-        vocab: 201_088,
-        arch: "gptoss",
-    },
-    Row {
-        id: "kimik3-mini-bf16-mxfp4-kv-bf16",
+        id: "kimik3-mini",
         layers: 8,
         vocab: 163_840,
         arch: "kimi_k3",
     },
     Row {
-        id: "kimik3-mini-bf16-mxfp4-kv-bf16-tp2",
+        id: "kimik3",
         layers: 8,
         vocab: 163_840,
         arch: "kimi_k3",
     },
     Row {
-        id: "kimik3-bf16-mxfp4-kv-bf16",
-        layers: 8,
-        vocab: 163_840,
-        arch: "kimi_k3",
-    },
-    Row {
-        id: "kimik3-bf16-mxfp4-kv-bf16-tp2",
-        layers: 8,
-        vocab: 163_840,
-        arch: "kimi_k3",
-    },
-    Row {
-        id: "qwen36-27b-bf16-kv-bf16",
+        id: "qwen36-27b",
         layers: 64,
         vocab: 248_320,
         arch: "qwen3_5",
     },
     Row {
-        id: "qwen36-27b-bf16-kv-bf16-tp2",
+        id: "qwen38-27b",
         layers: 64,
         vocab: 248_320,
         arch: "qwen3_5",
     },
     Row {
-        id: "qwen38-27b-bf16-kv-bf16",
-        layers: 64,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen38-27b-bf16-kv-bf16-tp2",
-        layers: 64,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen36-27b-mtp-u4g64-kv-bf16",
-        layers: 64,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen36-27b-dflash-u4g64-kv-bf16",
-        layers: 64,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen36-27b-u4g64-kv-bf16",
-        layers: 64,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen36-27b-u4g64-kv-bf16-tp2",
-        layers: 64,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen38-27b-dflash2-u4g64-kv-bf16",
-        layers: 64,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen38-27b-dspark-u4g64-kv-bf16",
-        layers: 64,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen38-27b-mtp-u4g64-kv-bf16",
-        layers: 64,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen38-27b-u4g64-kv-bf16",
-        layers: 64,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen38-27b-u4g64-kv-bf16-tp2",
-        layers: 64,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen36-35b-a3b-mtp-u4g64-kv-bf16",
+        id: "qwen36-35b-a3b",
         layers: 40,
         vocab: 248_320,
         arch: "qwen3_5",
     },
     Row {
-        id: "qwen36-35b-a3b-dflash-u4g64-kv-bf16",
-        layers: 40,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen36-35b-a3b-u4g64-kv-bf16",
-        layers: 40,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen36-35b-a3b-u4g64-kv-bf16-tp2",
-        layers: 40,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen36-35b-a3b-mini-u4g64-kv-bf16",
+        id: "qwen36-35b-a3b-mini",
         layers: 5,
         vocab: 248_320,
         arch: "qwen3_5",
     },
     Row {
-        id: "qwen36-35b-a3b-mini-u4g64-kv-bf16-tp2",
+        id: "qwen36-35b-a3b-mini64",
         layers: 5,
         vocab: 248_320,
         arch: "qwen3_5",
     },
     Row {
-        id: "qwen36-35b-a3b-mini64-u4g64-kv-bf16",
-        layers: 5,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen35-d0.8b-u4g64-kv-bf16",
+        id: "qwen35-d0.8b",
         layers: 24,
         vocab: 248_320,
         arch: "qwen3_5",
     },
     Row {
-        id: "qwen35-d0.8b-u4g64-kv-bf16-tp2",
-        layers: 24,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen35-tiny-u4g64-kv-bf16",
+        id: "qwen35-tiny",
         layers: 4,
         vocab: 248_320,
         arch: "qwen3_5",
     },
     Row {
-        id: "qwen35-d2b-u4g64-kv-bf16",
+        id: "qwen35-d2b",
         layers: 24,
         vocab: 248_320,
         arch: "qwen3_5",
     },
     Row {
-        id: "qwen35-d2b-u4g64-kv-bf16-tp2",
-        layers: 24,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen35-d4b-u4g64-kv-bf16",
+        id: "qwen35-d4b",
         layers: 32,
         vocab: 248_320,
         arch: "qwen3_5",
     },
     Row {
-        id: "qwen35-d4b-u4g64-kv-bf16-tp2",
+        id: "qwen35-d9b",
         layers: 32,
         vocab: 248_320,
         arch: "qwen3_5",
     },
     Row {
-        id: "qwen35-d9b-u4g64-kv-bf16",
-        layers: 32,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen35-d9b-u4g64-kv-bf16-tp2",
-        layers: 32,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen35-d9b-dflash-u4g64-kv-bf16",
-        layers: 32,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen35-a3b-bf16-kv-bf16",
+        id: "qwen35-a3b",
         layers: 40,
         vocab: 248_320,
         arch: "qwen3_5",
     },
     Row {
-        id: "qwen35-a3b-bf16-kv-bf16-tp2",
-        layers: 40,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen38-flash-next-u4g64-kv-bf16",
+        id: "qwen38-flash-next",
         layers: 48,
         vocab: 248_320,
         arch: "qwen4_exp",
     },
     Row {
-        id: "qwen38-flash-next-bf16-kv-bf16",
-        layers: 48,
-        vocab: 248_320,
-        arch: "qwen4_exp",
-    },
-    Row {
-        id: "qwen38-flash-next-u4g64-u2g128-kv-bf16",
+        id: "qwen38-flash-next-mini",
         layers: 4,
         vocab: 248_320,
         arch: "qwen4_exp",
     },
     Row {
-        id: "qwen38-flash-next-full-u4g64-u2g128-kv-bf16",
-        layers: 48,
-        vocab: 248_320,
-        arch: "qwen4_exp",
-    },
-    Row {
-        id: "qwen38-flash-next-full-mtp-u4g64-u2g128-kv-bf16",
-        layers: 48,
-        vocab: 248_320,
-        arch: "qwen4_exp",
-    },
-    Row {
-        id: "qwen38-flash-next-full-mtp-vision-u4g64-u2g128-kv-bf16",
-        layers: 48,
-        vocab: 248_320,
-        arch: "qwen4_exp",
-    },
-    Row {
-        id: "qwen38-flash-next-full-vision-u4g64-u2g128-kv-bf16",
-        layers: 48,
-        vocab: 248_320,
-        arch: "qwen4_exp",
-    },
-    Row {
-        id: "qwen35-d3b-bf16-kv-bf16",
+        id: "qwen35-d3b",
         layers: 24,
         vocab: 151_936,
         arch: "qwen3_5",
     },
     Row {
-        id: "qwen35-d3b-bf16-kv-bf16-tp2",
-        layers: 24,
-        vocab: 151_936,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen35-d0.8b-bf16-kv-bf16",
-        layers: 24,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen35-d0.8b-bf16-kv-bf16-tp2",
-        layers: 24,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen35-d0.8b-vision-eagle-bf16-kv-bf16",
-        layers: 24,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen35-d0.8b-vision-bf16-kv-bf16",
-        layers: 24,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen35-d0.8b-vision-u4g64-kv-bf16",
-        layers: 24,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen36-27b-vision-bf16-kv-bf16",
-        layers: 64,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen36-27b-vision-u4g64-kv-bf16",
-        layers: 64,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen38-27b-vision-bf16-kv-bf16",
-        layers: 64,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen38-27b-vision-u4g64-kv-bf16",
-        layers: 64,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen35-d0.8b-eagle-bf16-kv-bf16",
-        layers: 24,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "z-image-turbo-bf16-kv-bf16",
+        id: "z-image-turbo",
         layers: 35,
         vocab: 151_936,
         arch: "z_image",
     },
     Row {
-        id: "z-image-turbo-u4g64-kv-bf16",
-        layers: 35,
-        vocab: 151_936,
-        arch: "z_image",
-    },
-    Row {
-        id: "z-image-mini-bf16-kv-bf16",
+        id: "z-image-mini",
         layers: 6,
         vocab: 0,
         arch: "z_image",
     },
     Row {
-        id: "flux2-klein-4b-bf16-kv-bf16",
+        id: "flux2-klein-4b",
         layers: 27,
         vocab: 151_936,
         arch: "flux_2",
     },
     Row {
-        id: "flux2-klein-4b-u4g64-kv-bf16",
-        layers: 27,
-        vocab: 151_936,
-        arch: "flux_2",
-    },
-    Row {
-        id: "flux2-mini-bf16-kv-bf16",
+        id: "flux2-mini",
         layers: 4,
         vocab: 0,
         arch: "flux_2",
     },
     Row {
-        id: "hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16",
+        id: "hunyuanimage3-80b-a13b",
         layers: 32,
         vocab: 133_120,
         arch: "hunyuan_image_3_moe",
     },
     Row {
-        id: "hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16-tp4",
-        layers: 32,
-        vocab: 133_120,
-        arch: "hunyuan_image_3_moe",
-    },
-    Row {
-        id: "hunyuanimage3-80b-a13b-bf16-u4g64-kv-bf16-tp4",
-        layers: 32,
-        vocab: 133_120,
-        arch: "hunyuan_image_3_moe",
-    },
-    Row {
-        id: "hunyuanimage3-mini-bf16-kv-bf16",
+        id: "hunyuanimage3-mini",
         layers: 2,
         vocab: 133_120,
         arch: "hunyuan_image_3_moe",
     },
     Row {
-        id: "minimax-h3-fl2va-bf16-kv-bf16",
+        id: "minimax-h3-fl2va",
         layers: 50,
         vocab: 151_936,
         arch: "minimax_h3",
     },
     Row {
-        id: "minimax-h3-fl2va-bf16-kv-bf16-tp2",
-        layers: 50,
-        vocab: 151_936,
-        arch: "minimax_h3",
-    },
-    Row {
-        id: "minimax-h3-fl2va-bf16-kv-bf16-tp4",
-        layers: 50,
-        vocab: 151_936,
-        arch: "minimax_h3",
-    },
-    Row {
-        id: "minimax-h3-mini-bf16-kv-bf16",
+        id: "minimax-h3-mini",
         layers: 3,
         vocab: 0,
         arch: "minimax_h3",
     },
     Row {
-        id: "wan22-ti2v-5b-bf16-kv-bf16",
+        id: "wan22-ti2v-5b",
         layers: 24,
         vocab: 256_384,
         arch: "wan_2",
     },
     Row {
-        id: "wan22-ti2v-5b-u4g64-kv-bf16",
-        layers: 24,
-        vocab: 256_384,
-        arch: "wan_2",
-    },
-    Row {
-        id: "wan22-mini-d128-bf16-kv-bf16",
+        id: "wan22-mini-d128",
         layers: 2,
         vocab: 0,
         arch: "wan_2",
     },
     Row {
-        id: "wan22-mini-nano-bf16-kv-bf16",
+        id: "wan22-mini-nano",
         layers: 2,
         vocab: 0,
         arch: "wan_2",
     },
     Row {
-        id: "ltx25-bf16-kv-bf16",
+        id: "ltx25",
         layers: 48,
         vocab: 0,
         arch: "ltx_2",
     },
     Row {
-        id: "ltx25-u4g64-kv-bf16",
-        layers: 48,
-        vocab: 0,
-        arch: "ltx_2",
-    },
-    Row {
-        id: "ltx25-mini-bf16-kv-bf16",
+        id: "ltx25-mini",
         layers: 2,
         vocab: 0,
         arch: "ltx_2",
     },
     Row {
-        id: "mini-dit-bf16-kv-bf16",
+        id: "mini-dit",
         layers: 3,
         vocab: 0,
         arch: "mini_dit",
     },
     Row {
-        id: "mini-dit-bf16-kv-bf16-tp2",
-        layers: 3,
-        vocab: 0,
-        arch: "mini_dit",
-    },
-    Row {
-        id: "mini-dit-bf16-kv-bf16-tp4",
-        layers: 3,
-        vocab: 0,
-        arch: "mini_dit",
-    },
-    Row {
-        id: "muse-glimmer-30b-bf16-kv-bf16",
+        id: "muse-glimmer-30b",
         layers: 52,
         vocab: 202_048,
         arch: "muse_glimmer",
     },
     Row {
-        id: "muse-glimmer-30b-bf16-kv-bf16-tp2",
-        layers: 52,
-        vocab: 202_048,
-        arch: "muse_glimmer",
-    },
-    Row {
-        id: "muse-glimmer-30b-u4g64-kv-bf16",
-        layers: 52,
-        vocab: 202_048,
-        arch: "muse_glimmer",
-    },
-    Row {
-        id: "muse-glimmer-30b-u4g64-kv-bf16-tp2",
-        layers: 52,
-        vocab: 202_048,
-        arch: "muse_glimmer",
-    },
-    Row {
-        id: "muse-glimmer-30b-mini-l8-bf16-kv-bf16",
+        id: "muse-glimmer-30b-mini-l8",
         layers: 8,
         vocab: 202_048,
         arch: "muse_glimmer",
     },
     Row {
-        id: "inkling-bf16-kv-bf16",
+        id: "inkling",
         layers: 66,
         vocab: 200_058,
         arch: "inkling",
     },
     Row {
-        id: "inkling-mini-l7-e8-bf16-kv-bf16",
+        id: "inkling-mini-l7-e8",
         layers: 7,
         vocab: 200_058,
         arch: "inkling",
@@ -888,16 +366,6 @@ fn compiled_tokenizer(metadata: &ModelMetadata) -> Option<Result<Tokenizer>> {
     })())
 }
 
-fn loaded_row(model_id: &str) -> Result<&'static Row> {
-    row(model_id).ok_or_else(|| {
-        anyhow!(
-            "the engine loaded {model_id:?}, which this build's model catalog \
-             does not contain; nearest ids: {:?}",
-            nearest_ids(model_id, 3)
-        )
-    })
-}
-
 pub fn register(
     name: String,
     model_id: &str,
@@ -907,7 +375,20 @@ pub fn register(
     tokenizer_path: PathBuf,
     metadata: &ModelMetadata,
 ) -> Result<()> {
-    let row = loaded_row(model_id)?;
+    let deployment = models::Deployment::parse(model_id).ok_or_else(|| {
+        anyhow!(
+            "the engine loaded {model_id:?}, which names no model of this build's \
+             catalog; nearest ids: {:?}",
+            nearest_ids(model_id, 3)
+        )
+    })?;
+    let row = row(deployment.entry.id).ok_or_else(|| {
+        anyhow!(
+            "this build serves `{}` but `runtime::model::ROWS` states no depth or \
+             vocabulary for it",
+            deployment.entry.id
+        )
+    })?;
     let num_layers = row.layers;
     let vocab_size = row.vocab;
     let tokenizer = match compiled_tokenizer(metadata) {
@@ -915,46 +396,17 @@ pub fn register(
         None => Tokenizer::from_file(&tokenizer_path)?,
     };
     let tokenizer = Arc::new(tokenizer);
-    match models::tokenizer::contract_of(row.id) {
-        Some(contract) => contract
-            .verify(&tokenizer)
-            .map_err(|fault| anyhow!("`{}` refuses this artifact's tokenizer: {fault}", row.id))?,
-        None => {
-            return Err(anyhow!(
-                "this build serves {:?} but ships no tokenizer contract for \
-                 it; `models::tokenizer::contracts()` has no row under that \
-                 SKU",
-                row.id
-            ));
-        }
-    }
-    let instruct = match models::template::template_of(row.id) {
-        Some(make) => make(tokenizer.clone()),
-        None => {
-            return Err(anyhow!(
-                "this build serves {:?} but ships no chat template for it; \
-                 `models::template::templates()` has no row under that SKU",
-                row.id
-            ));
-        }
-    };
-
-    let catalog_row = models::sku(row.id).ok_or_else(|| {
-        anyhow!(
-            "this build serves {:?} but its model catalog states no classifier \
-             for it; a lane's fact word cannot be computed",
-            row.id
-        )
-    })?;
-    let classify = catalog_row.classify;
-    let diffusion = catalog_row.diffusion;
-    let generative = catalog_row.generative.clone();
+    deployment
+        .tokenizer
+        .verify(&tokenizer)
+        .map_err(|fault| anyhow!("`{model_id}` refuses this artifact's tokenizer: {fault}"))?;
+    let instruct = (deployment.template)(tokenizer.clone());
+    let classify = deployment.classify;
+    let diffusion = deployment.diffusion;
+    let generative = deployment.generative.clone();
     if let Some(generative) = &generative {
         validate_generative(generative).map_err(|fault| {
-            anyhow!(
-                "`{}` states generative facts this runtime refuses: {fault}",
-                row.id
-            )
+            anyhow!("`{model_id}` states generative facts this runtime refuses: {fault}")
         })?;
     }
 

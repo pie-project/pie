@@ -36,8 +36,8 @@ Two modes, one per row:
     python zimage_parity.py all     --out /tmp/zimage-parity [--turbo]
 
 `run` needs the config's `[model] model` to be the row's artifact (`pie model
-import <golden dir> --sku z-image-mini-bf16-kv-bf16`, or the Z-Image-Turbo
-snapshot under `--sku z-image-turbo-bf16-kv-bf16`), and — for a case too large
+import <golden dir> --deployment z-image-mini-bf16-kv-bf16`, or the Z-Image-Turbo
+snapshot under `--deployment z-image-turbo-bf16-kv-bf16`), and — for a case too large
 for argv — `[sandbox] allow_fs = true` with `fs_scratch_dir` equal to `--out`,
 since the case is then read as `/scratch/<name>` inside the sandbox.
 

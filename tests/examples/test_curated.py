@@ -934,7 +934,7 @@ async def test_lora_probe(client, args):
 # as a skip -- and the run that means to exercise the door names the row:
 #
 #     tests/examples/test_curated.py --model Qwen/Qwen3.5-0.8B \
-#         --sku qwen35-d0.8b-vision-bf16-kv-bf16
+#         --deployment qwen35-d0.8b-vision-bf16-kv-bf16
 TOWERLESS = ("no patch axis", "Towerless", "NoVisionFrontEnd")
 
 
@@ -1103,7 +1103,7 @@ async def test_greedy_decoding_is_the_same_alone_and_in_a_crowd(client, args):
 # refuses by name and `test_latent_probe` reports a skip — the correct answer
 # for that load. The run that exercises the door names the mini-DiT row:
 #
-#     tests/examples/test_latent_probe.py --model <mini-dit> --sku mini-dit-...
+#     tests/examples/test_latent_probe.py --model <mini-dit> --deployment mini-dit-...
 #
 # REQUIRES MODEL: mini-dit.
 from test_latent_probe import test_latent_probe_closes_the_loop  # noqa: E402

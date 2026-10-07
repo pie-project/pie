@@ -107,7 +107,7 @@ mod tests {
     const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
     fn compiled() -> (poem_ir::Trace, poem_compiler::CompiledModel) {
-        let trace = models::sku(SKU)
+        let trace = models::deployment(SKU)
             .expect("the catalog ships the smoke's SKU")
             .trace(Platform::Cuda);
         let compiled = compile(&trace, &Budget::new(4, 64), &DeviceProfile::default())

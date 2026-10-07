@@ -76,8 +76,8 @@ pub fn entries() -> Vec<Entry> {
                 }
             },
             rows: [
-                (0, "dsv41-flash", 1, [U4g64], Bf16, [], None),
-                (1, "dsv41-flash", 1, [Bf16, Mxfp4], Bf16, [], None),
+                (0, 1, [U4g64], Bf16, [], None),
+                (1, 1, [Bf16, Mxfp4], Bf16, [], None),
             ],
         },
         crate::entry! {
@@ -95,7 +95,7 @@ pub fn entries() -> Vec<Entry> {
                     _ => Err(Refused::unsupported("dsv41-flash-mini", d)),
                 }
             },
-            rows: [(2, "dsv41-flash-mini", 1, [Bf16, Mxfp4], Bf16, [], None)],
+            rows: [(2, 1, [Bf16, Mxfp4], Bf16, [], None)],
         },
         crate::entry! {
             id: "dsv4-flash",
@@ -119,10 +119,10 @@ pub fn entries() -> Vec<Entry> {
                 }
             },
             rows: [
-                (3, "dsv4-flash-full-mtp", 1, [U4g64, U2g64, Mxfp4], Bf16, [], Some(Drafter::Mtp)),
-                (5, "dsv4-flash-full", 1, [U4g64, U2g64], Bf16, [], None),
-                (10, "dsv4-flash", 1, [Bf16], Bf16, [], None),
-                (11, "dsv4-flash", 2, [Bf16], Bf16, [], None),
+                (3, 1, [U4g64, U2g64, Mxfp4], Bf16, [], Some(Drafter::Mtp)),
+                (5, 1, [U4g64, U2g64], Bf16, [], None),
+                (10, 1, [Bf16], Bf16, [], None),
+                (11, 2, [Bf16], Bf16, [], None),
             ],
         },
         crate::entry! {
@@ -147,10 +147,10 @@ pub fn entries() -> Vec<Entry> {
                 }
             },
             rows: [
-                (4, "dsv4-flash-mtp", 1, [U4g64, U2g64, Mxfp4], Bf16, [], Some(Drafter::Mtp)),
-                (6, "dsv4-flash", 1, [U4g64, U2g64], Bf16, [], None),
-                (7, "dsv4-flash", 2, [U4g64, U2g64], Bf16, [], None),
-                (8, "dsv4-flash-mini", 1, [Bf16], Bf16, [], None),
+                (4, 1, [U4g64, U2g64, Mxfp4], Bf16, [], Some(Drafter::Mtp)),
+                (6, 1, [U4g64, U2g64], Bf16, [], None),
+                (7, 2, [U4g64, U2g64], Bf16, [], None),
+                (8, 1, [Bf16], Bf16, [], None),
             ],
         },
         crate::entry! {
@@ -168,7 +168,7 @@ pub fn entries() -> Vec<Entry> {
                     _ => Err(Refused::unsupported("dsv4-base", d)),
                 }
             },
-            rows: [(9, "dsv4-base", 1, [Bf16], Bf16, [], None)],
+            rows: [(9, 1, [Bf16], Bf16, [], None)],
         },
     ]
 }

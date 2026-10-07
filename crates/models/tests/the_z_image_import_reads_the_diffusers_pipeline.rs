@@ -298,7 +298,7 @@ fn type_checks(contract: &ModelContract, src: &ztensor::Source) {
 }
 
 fn check_turbo(src: &ztensor::Source, index: &BTreeSet<String>) {
-    let row = models::sku(TURBO).expect("the catalog ships the flagship");
+    let row = models::deployment(TURBO).expect("the catalog ships the flagship");
     let contract = row
         .contract(src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the flagship does not read this checkpoint: {why}"));
@@ -358,7 +358,7 @@ fn check_turbo(src: &ztensor::Source, index: &BTreeSet<String>) {
 }
 
 fn check_mini(src: &ztensor::Source, index: &BTreeSet<String>) {
-    let row = models::sku(MINI).expect("the catalog ships the miniature");
+    let row = models::deployment(MINI).expect("the catalog ships the miniature");
     let contract = row
         .contract(src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the miniature does not read its checkpoint: {why}"));
@@ -421,7 +421,7 @@ fn neither_row_serves_the_other_rows_checkpoint() {
     let dir = scratch();
     let turbo = prefixed("dit.", transformer(&Dims::turbo(), Leaf::F32));
     let src = synthetic(&dir, &turbo);
-    let mini = models::sku(MINI).unwrap();
+    let mini = models::deployment(MINI).unwrap();
     let contract = mini
         .contract(&src, Platform::Cuda)
         .expect("the names are there; a raw read is not shape-checked at build");
@@ -447,7 +447,7 @@ fn neither_row_serves_the_other_rows_checkpoint() {
     );
     let bare = transformer(&Dims::mini(), Leaf::F32);
     let src = synthetic(&dir, &bare);
-    let flagship = models::sku(TURBO).unwrap();
+    let flagship = models::deployment(TURBO).unwrap();
     assert!(
         flagship.contract(&src, Platform::Cuda).is_err(),
         "the flagship read a bare 256-wide transformer with no encoder"
@@ -510,7 +510,7 @@ fn the_derived_planes_are_stated_through_internal_steps() {
     let dir = scratch();
     let tensors = prefixed("dit.", transformer(&Dims::mini(), Leaf::F32));
     let src = synthetic(&dir, &tensors);
-    let row = models::sku(MINI).unwrap();
+    let row = models::deployment(MINI).unwrap();
     let contract = row.contract(&src, Platform::Cuda).unwrap();
     let named = |name: &str| {
         contract

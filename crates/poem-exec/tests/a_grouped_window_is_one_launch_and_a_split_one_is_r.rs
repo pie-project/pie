@@ -28,7 +28,7 @@ fn budget() -> Budget {
 }
 
 fn trace() -> Trace {
-    models::sku(SKU)
+    models::deployment(SKU)
         .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"))
         .trace(Platform::Cuda)
 }

@@ -67,8 +67,13 @@ class EngineConfig:
 class ModelConfig:
     name: str = "default"
     hf_repo: str = ""
-    # Which SKU of the checkpoint to serve; None lets the load identify one.
-    sku: Optional[str] = None
+    # What the deployment changes about the one its checkpoint states:
+    # the precision it expects ("u4g64", "u4g64+u2g64"), the kv dtype, the
+    # parts left off ("vision") and the drafter ("mtp", or "none").
+    precision: Optional[str] = None
+    kv: Optional[str] = None
+    off: list[str] = field(default_factory=list)
+    drafter: Optional[str] = None
     weight_dtype: Optional[str] = None
     # Sizes with a unit ("20GiB"); omit for uncapped.
     device_weight_budget: Optional[str] = None
@@ -110,9 +115,11 @@ class Config:
 
         m = self.model
         model: dict = {"name": m.name, "model": m.hf_repo}
-        for name in ("sku", "weight_dtype", "device_weight_budget", "host_weight_budget",
+        for name in ("precision", "kv", "drafter", "weight_dtype", "device_weight_budget", "host_weight_budget",
                      "host_kv_budget", "disk_kv_budget", "disk_kv_path"):
             put(model, name, getattr(m, name))
+        if m.off:
+            model["off"] = list(m.off)
 
         engine: dict = {"type": m.engine.type, "device": m.engine.device}
         put(engine, "tensor_parallel_size", m.engine.tensor_parallel_size)

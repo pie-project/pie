@@ -23,7 +23,7 @@ fn a_banded_head_gathers_the_logits_it_holds_a_band_of_every_case() {
 fn a_banded_head_gathers_the_logits_it_holds_a_band_of() {
     let mut faults = Vec::new();
 
-    for row in models::skus().filter(|row| row.recipe.tp > 1) {
+    for row in models::deployments().filter(|row| row.deploy.tp > 1) {
         let trace = row.trace(Platform::Cuda);
 
         let gathered: Vec<ValueId> = trace
@@ -69,8 +69,8 @@ fn a_banded_head_gathers_the_logits_it_holds_a_band_of() {
 fn a_single_rank_gathers_nothing() {
     let mut faults = Vec::new();
 
-    for row in models::skus() {
-        if row.recipe.tp > 1 {
+    for row in models::deployments() {
+        if row.deploy.tp > 1 {
             continue;
         }
         let trace = row.trace(Platform::Cuda);

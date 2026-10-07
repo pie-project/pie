@@ -217,7 +217,7 @@ fn expected_dit_reads(prefix: &str, d: &Dims, flagship: bool) -> BTreeMap<String
 }
 
 fn check_mini(src: &ztensor::Source, prefix: &str) {
-    let row = models::sku(MINI).expect("the catalog ships the miniature");
+    let row = models::deployment(MINI).expect("the catalog ships the miniature");
     let contract = row
         .contract(src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the miniature does not read its checkpoint: {why}"));
@@ -253,14 +253,14 @@ fn neither_row_serves_the_other_rows_checkpoint() {
     let dir = scratch();
     let bare = transformer(&Dims::mini(), Leaf::F32);
     let src = synthetic(&dir, &bare);
-    let flagship = models::sku(KLEIN).unwrap();
+    let flagship = models::deployment(KLEIN).unwrap();
     assert!(
         flagship.contract(&src, Platform::Cuda).is_err(),
         "the flagship read a bare 256-wide transformer with no encoder"
     );
     let klein = prefixed("dit.", transformer(&Dims::klein_4b(), Leaf::BF16));
     let src = synthetic(&dir, &klein);
-    let mini = models::sku(MINI).unwrap();
+    let mini = models::deployment(MINI).unwrap();
     assert!(
         mini.contract(&src, Platform::Cuda).is_err(),
         "the miniature wants a guidance embedder the flagship's transformer lacks"
@@ -313,7 +313,7 @@ fn the_flagship_reads_the_real_snapshot() {
         "the synthetic transformer and the snapshot's are one list"
     );
 
-    let row = models::sku(KLEIN).expect("the catalog ships the flagship");
+    let row = models::deployment(KLEIN).expect("the catalog ships the flagship");
     let contract = row
         .contract(&src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the flagship does not read this checkpoint: {why}"));

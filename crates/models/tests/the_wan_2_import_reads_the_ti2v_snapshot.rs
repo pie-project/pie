@@ -336,7 +336,7 @@ fn expected_dit_reads(prefix: &str, d: &Dims) -> BTreeMap<String, usize> {
 }
 
 fn check_mini(sku: &str, d: &Dims, src: &ztensor::Source, prefix: &str) {
-    let row = models::sku(sku).expect("the catalog ships the miniature");
+    let row = models::deployment(sku).expect("the catalog ships the miniature");
     let contract = row
         .contract(src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("`{sku}` does not read its checkpoint: {why}"));
@@ -374,7 +374,7 @@ fn the_flagship_refuses_a_bare_miniature() {
     let dir = scratch();
     let bare = transformer(&Dims::mini_d128(), Leaf::F32);
     let src = synthetic(&dir, &bare);
-    let flagship = models::sku(TI2V).unwrap();
+    let flagship = models::deployment(TI2V).unwrap();
     assert!(
         flagship.contract(&src, Platform::Cuda).is_err(),
         "the flagship read a bare 256-wide transformer with no encoder"
@@ -440,7 +440,7 @@ fn the_flagship_reads_the_real_snapshot() {
         assert_eq!(real.shape(), shape.as_slice(), "`{name}`");
     }
 
-    let row = models::sku(TI2V).expect("the catalog ships the flagship");
+    let row = models::deployment(TI2V).expect("the catalog ships the flagship");
     let contract = row
         .contract(&src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the flagship does not read this checkpoint: {why}"));

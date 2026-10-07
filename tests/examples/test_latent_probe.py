@@ -15,7 +15,7 @@ correct answer for that load, reported as a skip. The run that means to
 exercise the door names the mini-DiT row (the family lands in a later round):
 
     tests/examples/test_latent_probe.py --model <mini-dit checkpoint> \\
-        --sku mini-dit-bf16-kv-bf16
+        --deployment mini-dit-bf16-kv-bf16
 
 Run from the repo root with PYTHONPATH=python/server/python.
 """

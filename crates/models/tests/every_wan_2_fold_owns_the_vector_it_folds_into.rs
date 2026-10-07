@@ -14,7 +14,7 @@ const PLATFORMS: [Platform; 4] = [
 ];
 
 fn trace(sku: &str, platform: Platform) -> Trace {
-    let row = models::sku(sku).unwrap_or_else(|| panic!("this build ships no `{sku}`"));
+    let row = models::deployment(sku).unwrap_or_else(|| panic!("this build ships no `{sku}`"));
     row.trace(platform)
 }
 

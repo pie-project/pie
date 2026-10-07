@@ -177,9 +177,9 @@ fn an_import_that_will_prepare_refuses_a_source_no_sku_claims() {
         pie::ops::model::import::ImportArgs {
             source: staging.path().to_string_lossy().into_owned(),
             aux: None,
-            // No `--sku`: this is the first-fits-wins path, and the point of
+            // No `--deployment`: this is the first-fits-wins path, and the point of
             // the test is that nothing fits.
-            sku: None,
+            deployment: None,
             out: Some(artifact.clone()),
             dry_run: false,
             force: false,

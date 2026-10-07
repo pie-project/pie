@@ -10,25 +10,99 @@ use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
 
 pub use poem_ir::{Platform, Trace};
 
-pub fn trace(sku: &str, platform: Platform) -> Result<Trace> {
-    let sku = models::sku(sku).ok_or_else(|| anyhow!("{}", no_such_sku(sku)))?;
-    Ok(sku.trace(platform))
+/// The deployment `name` spells.
+pub fn deployment(name: &str) -> Result<models::Deployment> {
+    models::Deployment::parse(name).ok_or_else(|| anyhow!("{}", no_such_deployment(name)))
 }
 
-pub fn classify(sku: &str) -> Result<models::ClassifyFn> {
-    models::sku(sku)
-        .map(|sku| sku.classify)
-        .ok_or_else(|| anyhow!("{}", no_such_sku(sku)))
+/// The trace each rank of the deployment `name` runs.
+pub fn trace(name: &str, platform: Platform) -> Result<Trace> {
+    deployment(name)?
+        .try_trace(platform)
+        .map_err(|why| anyhow!("`{name}` does not serve on {platform:?}: {why}"))
 }
 
-fn no_such_sku(sku: &str) -> String {
+pub fn classify(name: &str) -> Result<models::ClassifyFn> {
+    deployment(name).map(|deployment| deployment.classify)
+}
+
+fn no_such_deployment(name: &str) -> String {
     format!(
-        "this build ships no SKU named {sku:?}; it ships:\n  {}",
-        models::skus()
-            .map(|sku| sku.name.as_str())
+        "{name:?} names no deployment of a model this build ships; it lists:\n  {}",
+        models::deployments()
+            .filter(|deployment| !deployment.entry.fixture)
+            .map(|deployment| deployment.name.as_str())
             .collect::<Vec<_>>()
             .join("\n  ")
     )
+}
+
+/// What a deployment config changes about the deployment its checkpoint
+/// states: a checkpoint fixes the model, the precision its weights are stored
+/// at and the parts and drafter it carries; a config may leave parts off,
+/// serve without the drafter, store the kv at another dtype, and split across
+/// ranks.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Overrides {
+    /// The precision the config expects; a checkpoint stored at another is
+    /// refused rather than re-quantized.
+    pub precision: Option<Vec<poem_ir::Dtype>>,
+    pub kv: Option<poem_ir::Dtype>,
+    pub off: Vec<models::catalog::Part>,
+    /// `Some(None)` serves without the checkpoint's drafter.
+    pub drafter: Option<Option<models::catalog::Drafter>>,
+    pub tp: Option<u32>,
+}
+
+/// The deployment `base` becomes under `overrides`, checked on `platform`.
+pub fn compose(base: &str, overrides: &Overrides, platform: Platform) -> Result<String> {
+    let base = deployment(base)?;
+    let mut deploy = base.deploy.clone();
+    if let Some(precision) = &overrides.precision
+        && *precision != deploy.weights
+    {
+        return Err(anyhow!(
+            "`{}` stores its weights at {:?} and the config asks for {precision:?}; import \
+             the checkpoint at that precision to serve it",
+            base.name,
+            deploy.weights
+        ));
+    }
+    if let Some(kv) = overrides.kv {
+        deploy.kv = kv;
+    }
+    for part in &overrides.off {
+        if !deploy.parts.contains(part) {
+            return Err(anyhow!(
+                "the config leaves {part:?} off and `{}` carries none",
+                base.name
+            ));
+        }
+        deploy.parts.retain(|have| have != part);
+    }
+    match overrides.drafter {
+        None => {}
+        Some(None) => deploy.drafter = None,
+        Some(Some(drafter)) if deploy.drafter == Some(drafter) => {}
+        Some(Some(drafter)) => {
+            return Err(anyhow!(
+                "the config drafts with {drafter:?} and `{}` carries {}; import the \
+                 checkpoint with that drafter to serve it",
+                base.name,
+                deploy
+                    .drafter
+                    .map_or("no drafter".to_string(), |have| format!("{have:?}"))
+            ));
+        }
+    }
+    if let Some(tp) = overrides.tp {
+        deploy.tp = tp;
+    }
+    let composed = models::Deployment::of(base.entry, deploy);
+    composed
+        .check(platform)
+        .map_err(|why| anyhow!("`{}` does not serve on {platform:?}: {why}", composed.name))?;
+    Ok(composed.name)
 }
 
 pub fn open_source(checkpoint: &Path) -> Result<ztensor::Source> {
@@ -77,7 +151,7 @@ fn containers(checkpoint: &Path) -> Result<Vec<PathBuf>> {
     Ok(found)
 }
 
-pub fn identify(checkpoint: &Path, platform: Platform) -> Result<&'static str> {
+pub fn identify(checkpoint: &Path, platform: Platform) -> Result<String> {
     if stamp_of(checkpoint)?.is_some() {
         return verify_artifact(checkpoint, platform);
     }
@@ -95,7 +169,7 @@ pub fn identify(checkpoint: &Path, platform: Platform) -> Result<&'static str> {
             }
         };
         match checkpoint::plan::compile(&metadata, &contract, target.clone()) {
-            Ok(_) => return Ok(&sku.name),
+            Ok(_) => return Ok(sku.name.clone()),
             Err(why) => misses.push(format!("{}: {why}", sku.name)),
         }
     }
@@ -146,20 +220,19 @@ pub fn this_box() -> Option<Platform> {
     None
 }
 
-pub fn verify_artifact(artifact: &Path, platform: Platform) -> Result<&'static str> {
+pub fn verify_artifact(artifact: &Path, platform: Platform) -> Result<String> {
     let stamp =
         stamp_of(artifact)?.ok_or_else(|| anyhow!("{artifact:?} carries no serving stamp"))?;
-    let sku = models::sku(&stamp.sku).ok_or_else(|| {
-        anyhow!(
-            "{artifact:?} was imported for `{}`; {}",
-            stamp.sku,
-            no_such_sku(&stamp.sku)
+    let sku = deployment(&stamp.sku).with_context(|| {
+        format!(
+            "{artifact:?} was imported as `{}`; import it again with this build",
+            stamp.sku
         )
     })?;
     let trace = sku.trace(platform);
     let source = open_source(artifact)?;
     let metadata = checkpoint_metadata(artifact)?;
-    let contract = checkpoint_dsl::own_contract(&source, &trace.params, sku.recipe.tp, platform)
+    let contract = checkpoint_dsl::own_contract(&source, &trace.params, sku.deploy.tp, platform)
         .map_err(|why| {
             anyhow!(
                 "{artifact:?} does not hold every plane of `{}`: {why}",
@@ -169,7 +242,7 @@ pub fn verify_artifact(artifact: &Path, platform: Platform) -> Result<&'static s
     let target = checkpoint::plan::StorageTarget::for_backend(backend_of(platform), 0, 1);
     checkpoint::plan::compile(&metadata, &contract, target)
         .map_err(|why| anyhow!("{artifact:?} does not land as `{}`: {why}", sku.name))?;
-    Ok(&sku.name)
+    Ok(sku.name)
 }
 
 fn backend_of(platform: Platform) -> checkpoint::types::BackendKind {
@@ -237,12 +310,8 @@ fn convert_target() -> checkpoint::plan::StorageTarget {
     }
 }
 
-pub fn row_named(name: &str) -> Result<&'static str> {
-    Ok(&catalog_row(name)?.name)
-}
-
-fn catalog_row(name: &str) -> Result<&'static models::Sku> {
-    models::sku(name).ok_or_else(|| anyhow!("{}", no_such_sku(name)))
+pub fn row_named(name: &str) -> Result<String> {
+    Ok(deployment(name)?.name)
 }
 
 pub fn conversion_contract_named(
@@ -250,8 +319,8 @@ pub fn conversion_contract_named(
     metadata: &Metadata,
     platform: Platform,
     name: &str,
-) -> Result<(&'static str, ModelContract)> {
-    let sku = catalog_row(name)?;
+) -> Result<(String, ModelContract)> {
+    let sku = deployment(name)?;
     let contract = sku
         .contract(source, platform)
         .map_err(|why| anyhow!("`{}` does not read this checkpoint: {why}", sku.name))?;
@@ -261,7 +330,7 @@ pub fn conversion_contract_named(
             sku.name
         )
     })?;
-    Ok((&sku.name, contract))
+    Ok((sku.name, contract))
 }
 
 pub fn checkpoint_metadata(checkpoint: &Path) -> Result<Metadata> {
@@ -280,15 +349,15 @@ pub fn contract_for(
     let stamped = stamp_of(checkpoint)
         .map_err(|error| format!("{error:#}"))?
         .is_some();
-    let sku = models::sku(&trace.name).ok_or_else(|| {
+    let sku = models::Deployment::parse(&trace.name).ok_or_else(|| {
         format!(
-            "this build ships no SKU named {:?}, so a checkpoint's tensors cannot be \
-             mapped onto its params",
+            "{:?} names no deployment of a model this build ships, so a checkpoint's \
+             tensors cannot be mapped onto its params",
             trace.name
         )
     })?;
     if stamped {
-        return checkpoint_dsl::own_contract(&source, &trace.params, sku.recipe.tp, trace.platform)
+        return checkpoint_dsl::own_contract(&source, &trace.params, sku.deploy.tp, trace.platform)
             .map_err(|error| {
                 format!(
                     "{checkpoint:?} does not hold every plane of {:?}: {error}",
@@ -296,15 +365,15 @@ pub fn contract_for(
                 )
             });
     }
-    if sku.recipe.tp > 1 {
+    if sku.deploy.tp > 1 {
         // an import states the whole checkpoint; the ranks of a tensor-parallel
         // group band their shares out of a stamped artifact at load (own_contract),
         // so a raw snapshot cannot be served at tp > 1 directly
         return Err(format!(
             "{:?} is a {}-rank row and {checkpoint:?} is an unconverted checkpoint: the ranks \
-             band their shares out of a stamped artifact, so convert it first (`pie model import` \
-             with the 1-rank row) and serve the artifact",
-            trace.name, sku.recipe.tp
+             band their shares out of a stamped artifact, so convert it first (`pie model \
+             import`) and serve the artifact",
+            trace.name, sku.deploy.tp
         ));
     }
     sku.contract(&source, trace.platform).map_err(|error| {
@@ -324,7 +393,7 @@ pub fn request(
     frames_in_flight: u8,
 ) -> Result<LoadRequest> {
     request_of(
-        None,
+        &Overrides::default(),
         checkpoint,
         platform,
         budgets,
@@ -334,8 +403,10 @@ pub fn request(
     )
 }
 
+/// The load of the deployment `checkpoint` states, under the config's
+/// `overrides`.
 pub fn request_of(
-    sku: Option<&str>,
+    overrides: &Overrides,
     checkpoint: &Path,
     platform: Platform,
     budgets: Budgets,
@@ -343,19 +414,11 @@ pub fn request_of(
     ordinal: i32,
     frames_in_flight: u8,
 ) -> Result<LoadRequest> {
-    let sku = match sku {
-        Some(named) => {
-            tracing::info!(sku = named, ?checkpoint, "serving the sku the config named");
-            named.to_string()
-        }
-        None => {
-            let found = identify(checkpoint, platform)?;
-            tracing::info!(sku = found, ?checkpoint, "identified");
-            found.to_string()
-        }
-    };
+    let base = identify(checkpoint, platform)?;
+    let name = compose(&base, overrides, platform)?;
+    tracing::info!(deployment = name, identified = base, ?checkpoint, "serving");
     Ok(LoadRequest {
-        trace: trace(&sku, platform)?,
+        trace: trace(&name, platform)?,
         checkpoint: Checkpoint::Path(checkpoint.to_path_buf()),
         budgets,
         residency,
@@ -442,7 +505,7 @@ mod tests {
             why.contains("gemma4-vision"),
             "the refusal names what was asked for: {why}"
         );
-        let ships = models::skus()
+        let ships = models::deployments()
             .next()
             .expect("a catalog of at least one row");
         assert!(
@@ -458,8 +521,8 @@ mod tests {
         let source = ztensor::Source::open(&path).expect("open the checkpoint");
         let metadata = checkpoint_metadata(&path).expect("read the checkpoint");
 
-        let row = models::skus()
-            .find(|sku| sku.recipe.tp == 1)
+        let row = models::deployments()
+            .find(|sku| sku.deploy.tp == 1)
             .expect("a one-rank row");
         let why = conversion_contract_named(&source, &metadata, Platform::Cuda, &row.name)
             .expect_err("no row reads a checkpoint of one stranger")
@@ -490,7 +553,7 @@ mod tests {
             "glm53-flash-u8g64-u2g64-kv-bf16",
         ] {
             assert!(
-                models::sku(name).is_some(),
+                models::deployment(name).is_some(),
                 "`{name}` is the row this override exists to reach, and the \
                  catalog no longer ships it under that name"
             );

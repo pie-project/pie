@@ -254,7 +254,7 @@ fn load_model_engines(
             &m.model,
             weights::Want {
                 backend: Some(flavor.as_str()),
-                sku: m.sku.as_deref(),
+                overrides: Some(&m.overrides()?),
             },
         )
         .with_context(|| format!("resolving the model for {:?}", m.name))?;
@@ -675,7 +675,7 @@ fn create_engine_group(
                 m.residency(),
                 m.patch_ceilings(),
                 m.voxel_ceilings(),
-                m.sku.as_deref(),
+                &m.overrides()?,
             )
             .with_context(|| {
                 format!(
@@ -710,7 +710,7 @@ fn create_engine_group(
         m.residency(),
         m.patch_ceilings(),
         m.voxel_ceilings(),
-        m.sku.as_deref(),
+        &m.overrides()?,
     )
     .with_context(|| format!("creating engine for model {:?} group {group_idx}", m.name,))
 }

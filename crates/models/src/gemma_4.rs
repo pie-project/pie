@@ -32,10 +32,10 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 }
             },
             rows: [
-                (0, "gemma4-26b-a4b-dflash", 1, [U4g64], Bf16, [], Some(Drafter::DFlash)),
-                (1, "gemma4-26b-a4b-mtp", 1, [U4g64], Bf16, [], Some(Drafter::Mtp)),
-                (2, "gemma4-26b-a4b", 1, [U4g64], Bf16, [], None),
-                (17, "gemma4-26b-a4b-vision", 1, [U4g64], Bf16, [Vision], None),
+                (0, 1, [U4g64], Bf16, [], Some(Drafter::DFlash)),
+                (1, 1, [U4g64], Bf16, [], Some(Drafter::Mtp)),
+                (2, 1, [U4g64], Bf16, [], None),
+                (17, 1, [U4g64], Bf16, [Vision], None),
             ],
         },
         crate::entry! {
@@ -57,12 +57,12 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 }
             },
             rows: [
-                (3, "gemma4-31b-mtp", 1, [U4g64], Bf16, [], Some(Drafter::Mtp)),
-                (4, "gemma4-31b", 1, [U4g64], Bf16, [], None),
-                (5, "gemma4-31b", 2, [U4g64], Bf16, [], None),
-                (9, "gemma4-31b", 1, [Bf16], Bf16, [], None),
-                (10, "gemma4-31b", 2, [Bf16], Bf16, [], None),
-                (18, "gemma4-31b-vision", 1, [U4g64], Bf16, [Vision], None),
+                (3, 1, [U4g64], Bf16, [], Some(Drafter::Mtp)),
+                (4, 1, [U4g64], Bf16, [], None),
+                (5, 2, [U4g64], Bf16, [], None),
+                (9, 1, [Bf16], Bf16, [], None),
+                (10, 2, [Bf16], Bf16, [], None),
+                (18, 1, [U4g64], Bf16, [Vision], None),
             ],
         },
         crate::entry! {
@@ -84,10 +84,10 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 }
             },
             rows: [
-                (6, "gemma4-e4b-eagle", 1, [Bf16], Bf16, [], Some(Drafter::Eagle)),
-                (7, "gemma4-e4b", 1, [Bf16], Bf16, [], None),
-                (8, "gemma4-e4b", 2, [Bf16], Bf16, [], None),
-                (16, "gemma4-e4b-vision", 1, [Bf16], Bf16, [Vision], None),
+                (6, 1, [Bf16], Bf16, [], Some(Drafter::Eagle)),
+                (7, 1, [Bf16], Bf16, [], None),
+                (8, 2, [Bf16], Bf16, [], None),
+                (16, 1, [Bf16], Bf16, [Vision], None),
             ],
         },
         crate::entry! {
@@ -103,7 +103,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 Ok(Model::e4b_mini(1, d.dtype()?, d.kv))
             },
             rows: [
-                (11, "gemma4-e4b-mini-l1", 1, [Bf16], Bf16, [], None),
+                (11, 1, [Bf16], Bf16, [], None),
             ],
         },
         crate::entry! {
@@ -119,7 +119,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 Ok(Model::e4b_mini(6, d.dtype()?, d.kv))
             },
             rows: [
-                (12, "gemma4-e4b-mini-l6", 1, [Bf16], Bf16, [], None),
+                (12, 1, [Bf16], Bf16, [], None),
             ],
         },
         crate::entry! {
@@ -135,7 +135,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 Ok(Model::e4b_mini(24, d.dtype()?, d.kv))
             },
             rows: [
-                (13, "gemma4-e4b-mini-l24", 1, [Bf16], Bf16, [], None),
+                (13, 1, [Bf16], Bf16, [], None),
             ],
         },
         crate::entry! {
@@ -151,7 +151,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 Ok(Model::e4b_mini(30, d.dtype()?, d.kv))
             },
             rows: [
-                (14, "gemma4-e4b-mini-l30", 1, [Bf16], Bf16, [], None),
+                (14, 1, [Bf16], Bf16, [], None),
             ],
         },
         crate::entry! {
@@ -167,7 +167,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 Ok(Model::e4b_mini(36, d.dtype()?, d.kv))
             },
             rows: [
-                (15, "gemma4-e4b-mini-l36", 1, [Bf16], Bf16, [], None),
+                (15, 1, [Bf16], Bf16, [], None),
             ],
         },
     ]
@@ -181,7 +181,7 @@ mod tests {
     // rate follows SM clock rather than bandwidth (an A100 decodes 31b at half an L40S).
     #[test]
     fn a_u4_trunk_projection_decodes_on_the_tiled_arm() {
-        let sku = crate::sku("gemma4-31b-u4g64-kv-bf16").expect("the 31b u4 row ships");
+        let sku = crate::deployment("gemma4-31b-u4g64-kv-bf16").expect("the 31b u4 row ships");
         let trace = sku.trace(Platform::Cuda);
         let mut row_major = Vec::new();
         for node in &trace.nodes {

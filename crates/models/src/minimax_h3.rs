@@ -23,9 +23,9 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
             generative: Some(Model::generative),
             build: |d| -> Model { Ok(Model::fl2va(d.dtype()?)) },
             rows: [
-                (0, "minimax-h3-fl2va", 1, [Bf16], Bf16, [], None),
-                (1, "minimax-h3-fl2va", 2, [Bf16], Bf16, [], None),
-                (2, "minimax-h3-fl2va", 4, [Bf16], Bf16, [], None),
+                (0, 1, [Bf16], Bf16, [], None),
+                (1, 2, [Bf16], Bf16, [], None),
+                (2, 4, [Bf16], Bf16, [], None),
             ],
         },
         crate::entry! {
@@ -38,7 +38,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
             diffusion: None,
             generative: Some(Model::generative),
             build: |d| -> Model { Ok(Model::mini(d.dtype()?)) },
-            rows: [(3, "minimax-h3-mini", 1, [Bf16], Bf16, [], None)],
+            rows: [(3, 1, [Bf16], Bf16, [], None)],
         },
     ]
 }

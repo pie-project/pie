@@ -235,7 +235,7 @@ mod tests {
     /// What `serve::load` hands `Scores::reserve` for a SKU: the `scores`
     /// exports in seam order and the query heads of the first one's rectangle.
     fn exported(sku: &str) -> (Vec<ValueId>, u32) {
-        let row = models::sku(sku).unwrap_or_else(|| panic!("{sku} is in the catalog"));
+        let row = models::deployment(sku).unwrap_or_else(|| panic!("{sku} is in the catalog"));
         let trace = row.trace(poem_ir::Platform::Cuda);
         let exports: Vec<ValueId> = trace
             .seams
@@ -283,11 +283,11 @@ mod tests {
 
     #[test]
     fn every_tp2_row_that_exports_scores_seats_its_tp1_planes() {
-        for row in models::skus().filter(|sku| sku.recipe.tp == 2) {
+        for row in models::deployments().filter(|sku| sku.deploy.tp == 2) {
             let Some(single) = row.name.strip_suffix("-tp2") else {
                 continue;
             };
-            if models::sku(single).is_none() {
+            if models::deployment(single).is_none() {
                 continue;
             }
             let (one, heads_one) = exported(single);

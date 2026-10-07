@@ -61,7 +61,7 @@ fn the_target_keeps_a_measured_prefix_of_every_block() {
         eprintln!("not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/models)");
         return;
     };
-    let sku = models::sku(SKU).expect("the catalog ships the block-drafter row");
+    let sku = models::deployment(SKU).expect("the catalog ships the block-drafter row");
     let trace = sku.trace(Platform::Metal);
     let source = ztensor_compat::index(&artifact).expect("the artifact opens");
     let contract = checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Metal)

@@ -29,7 +29,7 @@ fn the_miniature_reads_the_golden_and_rearranges_where_the_study_says() {
         return;
     }
     let src = ztensor_compat::open(&path).unwrap_or_else(|why| panic!("{}: {why}", path.display()));
-    let row = models::sku(MINI).expect("this build ships the miniature");
+    let row = models::deployment(MINI).expect("this build ships the miniature");
     let contract = row
         .contract(&src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the miniature does not read its own golden: {why}"));

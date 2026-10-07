@@ -96,7 +96,29 @@ fn store_dir() -> PathBuf {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Want<'a> {
     pub backend: Option<&'a str>,
-    pub sku: Option<&'a str>,
+    /// The config's precision and drafter pick between artifacts of one
+    /// model and backend.
+    pub overrides: Option<&'a runtime::engine::load::Overrides>,
+}
+
+impl Want<'_> {
+    /// Whether the artifact stamped `deployment` serves what the config asks.
+    fn serves(&self, deployment: &str) -> bool {
+        let Some(overrides) = self.overrides else {
+            return true;
+        };
+        let Some(stamped) = models::Deployment::parse(deployment) else {
+            return false;
+        };
+        overrides
+            .precision
+            .as_ref()
+            .is_none_or(|precision| *precision == stamped.deploy.weights)
+            && match overrides.drafter {
+                Some(Some(drafter)) => stamped.deploy.drafter == Some(drafter),
+                _ => true,
+            }
+    }
 }
 
 fn archive_in(store: &Path, name: &str, want: Want<'_>) -> Result<Option<PathBuf>> {
@@ -154,11 +176,8 @@ fn pick(dir: &Path, found: Vec<PathBuf>, want: Want<'_>) -> Result<Option<PathBu
     if let Some(backend) = want.backend {
         wanted.retain(|(_, parsed)| parsed.as_ref().is_some_and(|it| it.backend == backend));
     }
-    if wanted.len() > 1
-        && let Some(sku) = want.sku
-    {
-        let sku = checkpoint::serving::slugify(sku);
-        wanted.retain(|(_, parsed)| parsed.as_ref().is_some_and(|it| it.sku == sku));
+    if wanted.len() > 1 && want.overrides.is_some() {
+        wanted.retain(|(_, parsed)| parsed.as_ref().is_some_and(|it| want.serves(&it.sku)));
     }
     if let [(path, _)] = wanted[..] {
         return Ok(Some(path.clone()));
@@ -170,17 +189,17 @@ fn pick(dir: &Path, found: Vec<PathBuf>, want: Want<'_>) -> Result<Option<PathBu
         .map(|stem| format!("`{}`", stem.to_string_lossy()))
         .collect::<Vec<_>>()
         .join(", ");
-    let asked = match (want.backend, want.sku) {
-        (Some(backend), Some(sku)) => {
-            format!(" and none of them is `{sku}` for {backend}")
+    let asked = match (want.backend, want.overrides) {
+        (Some(backend), Some(_)) => {
+            format!(" and not one of them serves the config's precision and drafter on {backend}")
         }
         (Some(backend), None) => format!(" and {} of them are for {backend}", wanted.len()),
         _ => String::new(),
     };
     bail!(
         "{} holds {} artifacts of one model{asked}. Name the one to serve in \
-         `[model] model` — {candidates} — or state `[model] sku` to pick \
-         between rows of one backend.",
+         `[model] model` — {candidates} — or state `[model] precision` or \
+         `[model] drafter` to pick between artifacts of one backend.",
         dir.display(),
         named.len(),
     )
@@ -344,7 +363,7 @@ mod tests {
         an_artifact_path_resolves_to_itself();
         a_store_name_finds_the_name_a_stamped_import_wrote();
         a_store_name_naming_two_shells_resolves_to_the_one_this_build_hosts();
-        two_rows_of_one_backend_are_told_apart_by_the_stated_sku();
+        two_artifacts_of_one_backend_are_told_apart_by_the_config();
         an_artifact_hands_over_its_compiled_metadata();
         every_model_form_produces_the_checkpoints_config();
         a_snapshot_without_a_config_says_so();
@@ -393,7 +412,7 @@ mod tests {
                     "glm",
                     Want {
                         backend: Some(backend),
-                        sku: None
+                        overrides: None
                     }
                 )
                 .unwrap()
@@ -408,7 +427,7 @@ mod tests {
             "glm",
             Want {
                 backend: Some("metal"),
-                sku: None,
+                overrides: None,
             },
         )
         .unwrap_err()
@@ -428,7 +447,7 @@ mod tests {
                 "glm.glm53-flash-u8g64-u2g64-kv-bf16.vulkan",
                 Want {
                     backend: Some("cuda"),
-                    sku: None
+                    overrides: None
                 }
             )
             .unwrap(),
@@ -437,26 +456,36 @@ mod tests {
         );
     }
 
-    fn two_rows_of_one_backend_are_told_apart_by_the_stated_sku() {
+    fn two_artifacts_of_one_backend_are_told_apart_by_the_config() {
+        use models::catalog::Drafter;
+        use runtime::engine::load::Overrides;
         let store = tempfile::tempdir().unwrap();
         let store = store.path();
         let model = store.join("glm");
         std::fs::create_dir_all(&model).unwrap();
         let plain = model.join("glm.glm53-flash-u8g64-u2g64-kv-bf16.vulkan.zt");
-        let mtp = model.join("glm.glm53-flash-mtp-u8g64-u2g64-kv-bf16.vulkan.zt");
+        let mtp = model.join("glm.glm53-flash-mtp-u8g64-u2g64-u4g64-kv-bf16.vulkan.zt");
         std::fs::write(&plain, b"stand-in").unwrap();
         std::fs::write(&mtp, b"stand-in").unwrap();
 
-        let want = |sku| Want {
+        let drafting = Overrides {
+            drafter: Some(Some(Drafter::Mtp)),
+            ..Overrides::default()
+        };
+        let plain_precision = Overrides {
+            precision: Some(vec![poem_ir::Dtype::U8g64, poem_ir::Dtype::U2g64]),
+            ..Overrides::default()
+        };
+        let want = |overrides| Want {
             backend: Some("vulkan"),
-            sku: Some(sku),
+            overrides: Some(overrides),
         };
         assert_eq!(
-            archive_in(store, "glm", want("glm53-flash-mtp-u8g64-u2g64-kv-bf16")).unwrap(),
+            archive_in(store, "glm", want(&drafting)).unwrap(),
             Some(mtp)
         );
         assert_eq!(
-            archive_in(store, "glm", want("GLM53-Flash-u8g64-u2g64-kv-bf16")).unwrap(),
+            archive_in(store, "glm", want(&plain_precision)).unwrap(),
             Some(plain)
         );
         let why = archive_in(
@@ -464,12 +493,12 @@ mod tests {
             "glm",
             Want {
                 backend: Some("vulkan"),
-                sku: None,
+                overrides: None,
             },
         )
         .unwrap_err()
         .to_string();
-        assert!(why.contains("[model] sku"), "{why}");
+        assert!(why.contains("[model] precision"), "{why}");
     }
 
     fn artifact(dir: &Path, config: &[u8], whole_tokenizer: bool) -> Model {

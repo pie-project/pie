@@ -8,7 +8,7 @@ use engine_metal::{Boot, Lane, Shell};
 use poem_compiler::Budget;
 use poem_dsl::{Classify, Platform, Request};
 
-const SKU: &str = "dsv4-flash-u4g64-u2g64-kv-bf16";
+const SKU: &str = "dsv4-flash-mini-u4g64-u2g64-kv-bf16";
 const REPO: &str = "models--mlx-community--DeepSeek-V4-Flash-2bit-DQ";
 
 const REFERENCE: &str = "tests/dsv4-parity/reference.json";
@@ -65,12 +65,12 @@ fn argmax(logits: &[f32]) -> u32 {
 }
 
 fn load(checkpoint: &Path, context: u32) -> Shell {
-    let trace = models::sku(SKU)
+    let trace = models::deployment(SKU)
         .expect("the catalog ships the 2-bit SKU")
         .trace(Platform::Metal);
     let container = container(checkpoint).expect("the snapshot holds a tensor container");
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-    let contract = models::sku(SKU)
+    let contract = models::deployment(SKU)
         .expect("the catalog ships an import for the SKU")
         .contract(&source, Platform::Metal)
         .expect("the 2-bit SKU's import contract fits the real DQ checkpoint");

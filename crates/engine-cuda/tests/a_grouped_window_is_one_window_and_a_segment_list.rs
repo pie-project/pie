@@ -40,7 +40,7 @@ fn arms() -> (DeviceProfile, DeviceProfile) {
 }
 
 fn sku() -> (Trace, CompiledModel, CompiledModel) {
-    let trace = models::sku(SKU)
+    let trace = models::deployment(SKU)
         .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"))
         .trace(Platform::Cuda);
     let (split, grouped) = arms();

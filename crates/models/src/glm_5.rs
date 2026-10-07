@@ -19,6 +19,6 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
         diffusion: None,
         generative: None,
         build: |d| -> Model { let w = d.dtype()?; Ok(Model::a12b(w, w, d.kv)) },
-        rows: [(0, "glm5-a12b", 1, [Bf16], Bf16, [], None), (1, "glm5-a12b", 2, [Bf16], Bf16, [], None)],
+        rows: [(0, 1, [Bf16], Bf16, [], None), (1, 2, [Bf16], Bf16, [], None)],
     }]
 }

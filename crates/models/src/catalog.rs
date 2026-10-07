@@ -8,7 +8,7 @@ use std::sync::Arc;
 use checkpoint::contract::ModelContract;
 use poem_dsl::{ClassifyFn, Dtype, Platform, Trace};
 
-use crate::{Diffusion, Generative, Recipe, template, tokenizer};
+use crate::{Diffusion, Generative, template, tokenizer};
 
 /// A part a checkpoint may carry besides the text trunk, which a deployment
 /// may leave off.
@@ -95,14 +95,13 @@ pub struct Entry {
     pub tokenizer: &'static tokenizer::Contract,
     pub diffusion: fn(&Deploy) -> Option<Diffusion>,
     pub generative: fn(&Deploy) -> Option<Generative>,
-    /// The deployments the catalog has always named, by the row name each
-    /// was served under, with each row's place in its family's list.
+    /// The deployments the catalog lists for this model, with each one's
+    /// place in its family's list (identification tries them in that order).
     pub rows: Vec<Row>,
 }
 
 pub struct Row {
     pub seq: u32,
-    pub recipe: Recipe,
     pub deploy: Deploy,
 }
 
@@ -137,21 +136,20 @@ impl Entry {
         poem_compiler::shard::shard(trace, deploy.tp).map_err(|why| Refused(why.to_string()))
     }
 
-    /// The name a deployment of this model is served under: the row the
-    /// catalog has always called it, or one spelled the same way.
+    /// The name a deployment of this model is served under:
+    /// `{id}[-{part}…][-{drafter}]-{weights…}-kv-{kv}[-tp{n}]`.
     #[must_use]
     pub fn name(&self, deploy: &Deploy) -> String {
-        if let Some(row) = self.rows.iter().find(|row| row.deploy == *deploy) {
-            return row.recipe.name();
-        }
         let mut name = self.id.to_string();
-        for part in &deploy.parts {
+        let mut parts = deploy.parts.clone();
+        parts.sort_unstable();
+        for part in parts {
             name.push('-');
-            name.push_str(&format!("{part:?}").to_lowercase());
+            name.push_str(part.word());
         }
         if let Some(drafter) = deploy.drafter {
             name.push('-');
-            name.push_str(&format!("{drafter:?}").to_lowercase());
+            name.push_str(drafter.word());
         }
         for dtype in &deploy.weights {
             name.push('-');
@@ -164,6 +162,101 @@ impl Entry {
         }
         name
     }
+
+    /// The deployment `rest` names, `rest` being a name with this model's id
+    /// and its dash taken off the front.
+    fn parse(&self, rest: &str) -> Option<Deploy> {
+        let mut words = rest.split('-').peekable();
+        let mut parts = Vec::new();
+        while let Some(part) = words.peek().and_then(|w| Part::of(w)) {
+            parts.push(part);
+            words.next();
+        }
+        let drafter = words.peek().and_then(|w| Drafter::of(w));
+        if drafter.is_some() {
+            words.next();
+        }
+        let mut weights = Vec::new();
+        loop {
+            let word = words.next()?;
+            if word == "kv" {
+                break;
+            }
+            weights.push(crate::dtype_of(word)?);
+        }
+        let kv = crate::dtype_of(words.next()?)?;
+        let tp = match words.next() {
+            None => 1,
+            Some(word) => word.strip_prefix("tp")?.parse().ok().filter(|tp| *tp > 1)?,
+        };
+        if words.next().is_some() || weights.is_empty() {
+            return None;
+        }
+        Some(Deploy {
+            weights,
+            kv,
+            tp,
+            parts,
+            drafter,
+        })
+    }
+}
+
+impl Part {
+    const ALL: [Part; 2] = [Part::Vision, Part::SelfCond];
+
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Part::Vision => "vision",
+            Part::SelfCond => "selfcond",
+        }
+    }
+
+    #[must_use]
+    pub fn of(word: &str) -> Option<Part> {
+        Part::ALL.into_iter().find(|part| part.word() == word)
+    }
+}
+
+impl Drafter {
+    const ALL: [Drafter; 5] = [
+        Drafter::Mtp,
+        Drafter::DFlash,
+        Drafter::DFlash2,
+        Drafter::DSpark,
+        Drafter::Eagle,
+    ];
+
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Drafter::Mtp => "mtp",
+            Drafter::DFlash => "dflash",
+            Drafter::DFlash2 => "dflash2",
+            Drafter::DSpark => "dspark",
+            Drafter::Eagle => "eagle",
+        }
+    }
+
+    #[must_use]
+    pub fn of(word: &str) -> Option<Drafter> {
+        Drafter::ALL
+            .into_iter()
+            .find(|drafter| drafter.word() == word)
+    }
+}
+
+/// The model and deployment `name` spells, if any model of the catalog is
+/// the one it names.
+#[must_use]
+pub fn parse(name: &str) -> Option<(&'static Entry, Deploy)> {
+    let mut entries: Vec<&'static Entry> = crate::entries().collect();
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.id.len()));
+    entries.into_iter().find_map(|entry| {
+        let rest = name.strip_prefix(entry.id)?.strip_prefix('-')?;
+        entry.parse(rest).map(|deploy| (entry, deploy))
+    })
 }
 
 /// A catalog entry: its id, parts, drafters and family hooks, the function
@@ -180,7 +273,7 @@ macro_rules! entry {
         diffusion: $diffusion:expr,
         generative: $generative:expr,
         build: |$d:ident| -> $model:ty $body:block,
-        rows: [ $( ($seq:literal, $text:literal, $tp:literal, [$($w:expr),+ $(,)?], $kv:expr, [$($rpart:ident),* $(,)?], $rdrafter:expr $(,)?) ),* $(,)? ] $(,)?
+        rows: [ $( ($seq:literal, $tp:literal, [$($w:expr),+ $(,)?], $kv:expr, [$($rpart:ident),* $(,)?], $rdrafter:expr $(,)?) ),* $(,)? ] $(,)?
     ) => {{
         fn build($d: &$crate::catalog::Deploy) -> Result<$model, $crate::catalog::Refused> $body
         $crate::catalog::Entry {
@@ -218,12 +311,6 @@ macro_rules! entry {
             },
             rows: vec![ $( $crate::catalog::Row {
                 seq: $seq,
-                recipe: $crate::Recipe {
-                    text: $text,
-                    weights: &[$($w),+],
-                    kv: $kv,
-                    tp: $tp,
-                },
                 deploy: $crate::catalog::Deploy {
                     weights: vec![$($w),+],
                     kv: $kv,

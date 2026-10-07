@@ -18,9 +18,9 @@ const PLATFORMS: [Platform; 4] = [
     Platform::Vulkan,
 ];
 
-fn row(sku: &str) -> &'static models::Sku {
-    models::sku(sku).unwrap_or_else(|| {
-        let names: Vec<&str> = models::skus().map(|row| row.name.as_str()).collect();
+fn row(sku: &str) -> &'static models::Deployment {
+    models::deployment(sku).unwrap_or_else(|| {
+        let names: Vec<&str> = models::deployments().map(|row| row.name.as_str()).collect();
         panic!("this build ships no `{sku}`; rows are {names:#?}")
     })
 }

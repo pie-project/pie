@@ -9,7 +9,7 @@ use poem_compiler::Budget;
 use poem_dsl::{Classify, Platform, Request};
 use poem_ir::Trace;
 
-const SKU: &str = "dsv4-flash-full-mtp-u4g64-u2g64-mxfp4-kv-bf16";
+const SKU: &str = "dsv4-flash-mtp-u4g64-u2g64-mxfp4-kv-bf16";
 
 const REPO: &str = "models--mlx-community--DeepSeek-V4-Flash-2bit-DQ";
 
@@ -149,7 +149,7 @@ struct Read {
 }
 
 fn read(artifact: &Path) -> Read {
-    let trace = models::sku(SKU)
+    let trace = models::deployment(SKU)
         .expect("the catalog ships the full 2-bit row")
         .trace(Platform::Metal);
     let source = ztensor_compat::index(artifact).expect("the artifact opens");

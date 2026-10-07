@@ -55,12 +55,13 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
     # rather than reporting thirty-nine failures. The CUDA engines take the
     # unquantised release as it is, which is why this default is what it is.
     parser.add_argument("--model", default=parser_default_model(), help="HuggingFace model ID")
-    # WHICH ROW OF THAT CHECKPOINT (`[model] sku`). A vision artifact fits its
-    # family's text row and its own, and the load identifies the cheap one
-    # first -- deliberately, because a two-unit load stands the fold down. A
-    # suite that wants the tower names the row.
-    parser.add_argument("--sku", default=None,
-                        help="Catalog SKU to serve (default: identify one from the checkpoint)")
+    # WHAT TO LEAVE OFF (`[model] off`). A vision artifact serves its tower by
+    # default; a suite that wants the text trunk alone (a one-unit load keeps
+    # the fold up) leaves `vision` off.
+    parser.add_argument("--off", default=None,
+                        help="Comma-separated parts to leave unloaded (e.g. vision)")
+    parser.add_argument("--drafter", default=None,
+                        help="Drafter to serve with (mtp, dflash, ...; none to serve without)")
     parser.add_argument("--max-total-pages", type=int, default=None,
                         help="[model.engine.options] total_pages: cap the KV page pool "
                              "(a dsv4 page carries every layer's index-key and compressor "
@@ -406,7 +407,8 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
         model=ModelConfig(
             name="default",
             hf_repo=args.model,
-            sku=args.sku,
+            off=[p for p in (args.off or "").split(",") if p],
+            drafter=args.drafter,
             device_weight_budget=args.device_weight_budget,
             # `kv_pages` retired from the schema (6d3189654): the worker
             # refuses the key by name, so the flag is not forwarded.

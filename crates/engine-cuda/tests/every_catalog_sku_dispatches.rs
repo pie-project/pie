@@ -50,19 +50,19 @@ const CANNOT_SERVE: &[(&str, &[&str])] = &[
         &["attention.pool_lse_selected"],
     ),
     (
+        "dsv4-flash-mini-u4g64-u2g64-kv-bf16",
+        &["attention.pool_lse_selected"],
+    ),
+    (
         "dsv4-flash-u4g64-u2g64-kv-bf16",
         &["attention.pool_lse_selected"],
     ),
     (
-        "dsv4-flash-full-u4g64-u2g64-kv-bf16",
+        "dsv4-flash-mini-mtp-u4g64-u2g64-mxfp4-kv-bf16",
         &["attention.pool_lse_selected"],
     ),
     (
         "dsv4-flash-mtp-u4g64-u2g64-mxfp4-kv-bf16",
-        &["attention.pool_lse_selected"],
-    ),
-    (
-        "dsv4-flash-full-mtp-u4g64-u2g64-mxfp4-kv-bf16",
         &["attention.pool_lse_selected"],
     ),
     ("gemma4-26b-a4b-vision-u4g64-kv-bf16", &[SPLIT_MROPE]),
@@ -71,7 +71,7 @@ const CANNOT_SERVE: &[(&str, &[&str])] = &[
 ];
 
 fn ops_of(sku: &str) -> BTreeSet<String> {
-    let row = models::sku(sku).expect("the row is in the catalog");
+    let row = models::deployment(sku).expect("the row is in the catalog");
     row.trace(PLATFORM)
         .nodes
         .iter()
@@ -104,7 +104,7 @@ static SPLIT_MROPE_REFUSAL: Refusal = Refusal {
 fn stopped() -> BTreeMap<String, BTreeSet<String>> {
     let refused = refused();
     let mut stopped = BTreeMap::new();
-    for row in models::skus() {
+    for row in models::deployments() {
         let blocked: BTreeSet<String> = ops_of(&row.name)
             .into_iter()
             .filter(|op| refused.contains_key(op.as_str()))
@@ -158,7 +158,7 @@ fn no_exemption_outlives_its_reason() {
     let mut stale = Vec::new();
 
     for (sku, stoppers) in CANNOT_SERVE {
-        if models::sku(sku).is_none() {
+        if models::deployment(sku).is_none() {
             stale.push(format!("{sku} is exempted but is not a catalog row"));
             continue;
         }
@@ -213,7 +213,7 @@ fn every_refusal_is_still_carried() {
 
 fn every_catalog_sku_traces() {
     let mut empty = Vec::new();
-    for row in models::skus() {
+    for row in models::deployments() {
         let trace = row.trace(PLATFORM);
         if trace.nodes.is_empty() {
             empty.push(row.name.clone());
@@ -232,13 +232,16 @@ fn every_catalog_sku_traces() {
 fn report() {
     let refused = refused();
     let mut named: BTreeMap<String, usize> = BTreeMap::new();
-    for row in models::skus() {
+    for row in models::deployments() {
         for op in ops_of(&row.name) {
             *named.entry(op).or_default() += 1;
         }
     }
 
-    println!("{SHELL} on {PLATFORM:?}: {} rows", models::skus().count());
+    println!(
+        "{SHELL} on {PLATFORM:?}: {} rows",
+        models::deployments().count()
+    );
     println!("\n== ops named by the catalog ({}) ==", named.len());
     for (op, rows) in &named {
         let mark = if refused.contains_key(op.as_str()) {
@@ -251,7 +254,7 @@ fn report() {
 
     let stopped = stopped();
     println!("\n== per row ==");
-    for row in models::skus() {
+    for row in models::deployments() {
         let ops = ops_of(&row.name);
         let verdict = match stopped.get(&row.name) {
             None => "serves".to_string(),
@@ -268,7 +271,7 @@ fn report() {
     }
     println!(
         "\n{} of {} rows serve",
-        models::skus().count() - stopped.len(),
-        models::skus().count()
+        models::deployments().count() - stopped.len(),
+        models::deployments().count()
     );
 }

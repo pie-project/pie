@@ -36,11 +36,11 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 }
             },
             rows: [
-                (0, "glm53-flash-mtp", 1, [U8g64, U2g64, U4g64], Bf16, [], Some(Drafter::Mtp)),
-                (3, "glm53-flash", 1, [U8g64, U2g64], Bf16, [], None),
-                (4, "glm53-flash-mtp-vision", 1, [U8g64, U2g64, U4g64], Bf16, [Vision], Some(Drafter::Mtp)),
-                (5, "glm53-flash-vision", 1, [U8g64, U2g64], Bf16, [Vision], None),
-                (6, "glm53-flash-mtp-vision", 1, [U4g64, U2g64, U4g64], Bf16, [Vision], Some(Drafter::Mtp)),
+                (0, 1, [U8g64, U2g64, U4g64], Bf16, [], Some(Drafter::Mtp)),
+                (3, 1, [U8g64, U2g64], Bf16, [], None),
+                (4, 1, [U8g64, U2g64, U4g64], Bf16, [Vision], Some(Drafter::Mtp)),
+                (5, 1, [U8g64, U2g64], Bf16, [Vision], None),
+                (6, 1, [U4g64, U2g64, U4g64], Bf16, [Vision], Some(Drafter::Mtp)),
             ],
         },
         crate::entry! {
@@ -59,8 +59,8 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 }
             },
             rows: [
-                (1, "glm53-flash-mini", 1, [U4g64, U4g64], Bf16, [], None),
-                (2, "glm53-flash-mini", 2, [U4g64, U4g64], Bf16, [], None),
+                (1, 1, [U4g64, U4g64], Bf16, [], None),
+                (2, 2, [U4g64, U4g64], Bf16, [], None),
             ],
         },
     ]

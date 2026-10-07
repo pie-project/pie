@@ -14,7 +14,7 @@ const SKU: &str = "gemma4-e4b-mini-l6-bf16-kv-bf16";
 const CHUNK: u32 = 256;
 
 fn logits(trace: Trace, path: &Path, prompt: &[u32], decodes: u32) -> Vec<Vec<f32>> {
-    let sku = models::sku(SKU).expect("the catalog ships the mini gemma");
+    let sku = models::deployment(SKU).expect("the catalog ships the mini gemma");
     let contract = contract_for(&trace, path).expect("the random planes fit the trace");
     let mut shell = Shell::load(Boot {
         voxels: None,
@@ -69,7 +69,7 @@ fn a_windowed_row_reads_what_the_full_row_reads() {
         eprintln!("no CUDA device: skipping");
         return;
     }
-    let windowed = models::sku(SKU)
+    let windowed = models::deployment(SKU)
         .expect("the mini gemma")
         .trace(Platform::Cuda);
     assert!(

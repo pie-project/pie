@@ -9,7 +9,7 @@ the other half: it turns the golden's *inputs* into the case JSON the
 
     # 0. the artifact (once)
     pie model import /root/.cache/pie-imagegen/golden/hy3 \\
-        --sku hunyuanimage3-mini-bf16-kv-bf16
+        --deployment hunyuanimage3-mini-bf16-kv-bf16
 
     # 1. the case the inferlet reads
     python hy3_parity.py case --out /tmp/hy3-parity

@@ -49,7 +49,7 @@ fn admits(trace: &Trace, compiled: &CompiledModel, at: usize, profile: &DevicePr
 fn every_conditional_region_clears_every_gate_and_every_other_one_does_not() {
     let mut wrong: Vec<String> = Vec::new();
 
-    for row in models::skus() {
+    for row in models::deployments() {
         let sku = row.name.as_str();
         for platform in PLATFORMS {
             let trace = row.trace(platform);

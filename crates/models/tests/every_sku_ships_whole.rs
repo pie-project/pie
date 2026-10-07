@@ -18,8 +18,8 @@ fn every_sku_ships_whole_every_case() {
 fn a_sku_name_states_the_world_its_row_ships() {
     let mut faults = Vec::new();
 
-    for row in models::skus() {
-        let (sku, tp) = (row.name.as_str(), row.recipe.tp);
+    for row in models::deployments() {
+        let (sku, tp) = (row.name.as_str(), row.deploy.tp);
         let named = match sku.rsplit_once("-tp") {
             Some((_, ranks)) => ranks.parse::<u32>().unwrap_or_else(|why| {
                 panic!("`{sku}` ends in a world of `{ranks}` ranks, which is no number: {why}")
@@ -51,8 +51,8 @@ fn every_import_row_reads_the_checkpoint_it_is_handed() {
 
     let mut faults = Vec::new();
     let mut sharded = 0usize;
-    for row in models::skus() {
-        let (sku, tp) = (row.name.as_str(), row.recipe.tp);
+    for row in models::deployments() {
+        let (sku, tp) = (row.name.as_str(), row.deploy.tp);
         let refusal = match row.contract(&src, poem_dsl::Platform::Cuda) {
             Ok(_) => {
                 faults.push(format!(
@@ -129,8 +129,8 @@ fn write_a_checkpoint_of_one_stranger(path: &Path) {
 
 fn the_block_drafters_plan_is_whole() {
     use poem_dsl::Platform;
-    let row = models::skus()
-        .find(|row| row.recipe.text == "qwen36-27b-dflash")
+    let row = models::deployments()
+        .find(|row| row.name.starts_with("qwen36-27b-dflash-"))
         .expect("this build ships the block-drafter row");
     for platform in [Platform::Metal, Platform::Cuda] {
         let trace = row.trace(platform);
@@ -148,8 +148,8 @@ fn the_block_drafters_plan_is_whole() {
 
 fn the_dflash2_plan_is_whole_and_convolves() {
     use poem_dsl::Platform;
-    let row = models::skus()
-        .find(|row| row.recipe.text == "qwen38-27b-dflash2")
+    let row = models::deployments()
+        .find(|row| row.name.starts_with("qwen38-27b-dflash2-"))
         .expect("this build ships the DFlash2 row");
     for platform in [Platform::Metal, Platform::Cuda] {
         let trace = row.trace(platform);
@@ -207,8 +207,8 @@ fn the_dflash2_plan_is_whole_and_convolves() {
 
 fn the_v1_text_states_a_bidirectional_block_of_sixteen() {
     use poem_dsl::Platform;
-    let row = models::skus()
-        .find(|row| row.recipe.text == "qwen36-27b-dflash")
+    let row = models::deployments()
+        .find(|row| row.name.starts_with("qwen36-27b-dflash-"))
         .expect("this build ships the block-drafter row");
     let trace = row.trace(Platform::Metal);
     let facts = trace.drafter.expect("the v1 text states its block drafter");
@@ -216,8 +216,8 @@ fn the_v1_text_states_a_bidirectional_block_of_sixteen() {
         (facts.rows, facts.mask_token, facts.bidirectional),
         (16, 248_070, true)
     );
-    let a3b = models::skus()
-        .find(|row| row.recipe.text == "qwen36-35b-a3b-dflash")
+    let a3b = models::deployments()
+        .find(|row| row.name.starts_with("qwen36-35b-a3b-dflash-"))
         .expect("this build ships the A3B block-drafter row");
     let facts = a3b
         .trace(Platform::Metal)
@@ -232,9 +232,12 @@ fn the_v1_text_states_a_bidirectional_block_of_sixteen() {
         ),
         (16, 248_077, true, 1)
     );
-    let plain = models::skus()
+    let plain = models::deployments()
         .find(|row| {
-            row.recipe.text == "qwen38-27b" && row.recipe.weights.contains(&poem_dsl::Dtype::U4g64)
+            row.entry.id == "qwen38-27b"
+                && row.deploy.drafter.is_none()
+                && row.deploy.parts.is_empty()
+                && row.deploy.weights.contains(&poem_dsl::Dtype::U4g64)
         })
         .expect("the plain row");
     assert!(plain.trace(Platform::Metal).drafter.is_none());
@@ -242,8 +245,8 @@ fn the_v1_text_states_a_bidirectional_block_of_sixteen() {
 
 fn the_dspark_plan_is_whole_and_walks_a_bigram() {
     use poem_dsl::Platform;
-    let row = models::skus()
-        .find(|row| row.recipe.text == "qwen38-27b-dspark")
+    let row = models::deployments()
+        .find(|row| row.name.starts_with("qwen38-27b-dspark-"))
         .expect("this build ships the DSpark row");
     let trace = row.trace(Platform::Metal);
     let count = |pred: &dyn Fn(&poem_dsl::Operation) -> bool| {
@@ -295,8 +298,8 @@ fn the_dspark_plan_is_whole_and_walks_a_bigram() {
 
 fn gemma_carries_the_block_drafter_too() {
     use poem_dsl::Platform;
-    let row = models::skus()
-        .find(|row| row.recipe.text == "gemma4-26b-a4b-dflash")
+    let row = models::deployments()
+        .find(|row| row.name.starts_with("gemma4-26b-a4b-dflash-"))
         .expect("this build ships gemma's DFlash row");
     let trace = row.trace(Platform::Metal);
     let facts = trace
@@ -325,16 +328,20 @@ fn gemma_carries_the_block_drafter_too() {
         bidirectional, 1,
         "the head's full layer is the one non-causal read"
     );
-    let plain = models::skus()
-        .find(|row| row.recipe.text == "gemma4-26b-a4b")
+    let plain = models::deployments()
+        .find(|row| {
+            row.entry.id == "gemma4-26b-a4b"
+                && row.deploy.drafter.is_none()
+                && row.deploy.parts.is_empty()
+        })
         .expect("the plain row");
     assert!(plain.trace(Platform::Metal).drafter.is_none());
 }
 
 fn gpt_oss_carries_the_block_drafter_too() {
     use poem_dsl::Platform;
-    let row = models::skus()
-        .find(|row| row.recipe.text == "gptoss-20b-dflash")
+    let row = models::deployments()
+        .find(|row| row.name.starts_with("gptoss-20b-dflash-"))
         .expect("this build ships gpt-oss's DFlash row");
     let trace = row.trace(Platform::Metal);
     let facts = trace

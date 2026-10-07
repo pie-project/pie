@@ -25,9 +25,9 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
         generative: Some(generative),
         build: |d| -> Model { Ok(Model::mini(d.dtype()?).tapped(forward::Tap::from_env())) },
         rows: [
-            (0, "mini-dit", 1, [Bf16], Bf16, [], None),
-            (1, "mini-dit", 2, [Bf16], Bf16, [], None),
-            (2, "mini-dit", 4, [Bf16], Bf16, [], None),
+            (0, 1, [Bf16], Bf16, [], None),
+            (1, 2, [Bf16], Bf16, [], None),
+            (2, 4, [Bf16], Bf16, [], None),
         ],
     }]
 }
