@@ -11,6 +11,14 @@ const PROMPT_A: &[u32] = &[0, 671, 6102, 294, 8760, 344, 270, 4593, 294];
 const PROMPT_B: &[u32] = &[0, 1357, 14, 982, 295, 811, 671];
 const STEPS: usize = 10;
 
+/// The facts the deployment `sku` classifies its lanes by.
+fn facts_of(sku: &str) -> poem_ir::Facts {
+    models::deployment(sku)
+        .expect("the catalog ships the row")
+        .trace(Platform::Metal)
+        .facts
+}
+
 fn artifact() -> Option<PathBuf> {
     let path = std::env::var("PIE_DSV4_MTP_ARTIFACT")
         .map(PathBuf::from)
@@ -19,7 +27,7 @@ fn artifact() -> Option<PathBuf> {
 }
 
 fn word(query_len: u32, drafts: bool) -> u64 {
-    models::deepseek_v4::forward::Facts::of(&Request::new(query_len, false).drafting(drafts)).word()
+    facts_of(SKU).word(&Request::new(query_len, false).drafting(drafts))
 }
 
 fn argmax(logits: &[f32]) -> u32 {

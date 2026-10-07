@@ -183,7 +183,13 @@ fn synth_fixture(dir: &Path, head_dim: usize) {
 }
 
 fn word(query_len: u32) -> u64 {
-    models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+    poem_dsl::trace_hybrid(
+        "qwen3-micro-text",
+        &Model::micro_text(Dtype::Bf16, Dtype::Bf16, 1),
+        Platform::Metal,
+    )
+    .facts
+    .word(&Request::new(query_len, false))
 }
 
 /// Which SKU to load: the plain baseline, or the rotated path at a given KV dtype.

@@ -15,6 +15,14 @@ const REFERENCE: &str = "tests/dsv4-parity/reference.json";
 
 const NEAR_TIE: f32 = 0.5;
 
+/// The facts the deployment `sku` classifies its lanes by.
+fn facts_of(sku: &str) -> poem_ir::Facts {
+    models::deployment(sku)
+        .expect("the catalog ships the row")
+        .trace(Platform::Metal)
+        .facts
+}
+
 fn snapshot() -> Option<PathBuf> {
     if let Ok(stated) = std::env::var("PIE_U2_SNAPSHOT") {
         let path = PathBuf::from(stated);
@@ -51,7 +59,7 @@ fn container(snapshot: &Path) -> Option<PathBuf> {
 }
 
 fn word(query_len: u32) -> u64 {
-    models::deepseek_v4::forward::Facts::of(&Request::new(query_len, false)).word()
+    facts_of(SKU).word(&Request::new(query_len, false))
 }
 
 fn argmax(logits: &[f32]) -> u32 {

@@ -241,6 +241,9 @@ impl Recorder {
         let plan = Rc::try_unwrap(self.inner)
             .unwrap_or_else(|_| panic!("a Value outlived its trace"))
             .into_inner();
+        if let Some(why) = unguarded_read(&plan) {
+            panic!("`{}` did not trace to a valid plan: {why}", plan.name);
+        }
         if let Err(faults) = poem_ir::check(&plan) {
             let mut msg = format!("`{}` did not trace to a valid plan:", plan.name);
             for fault in &faults {
@@ -273,6 +276,37 @@ impl Recorder {
             _ => Guard::Always,
         }
     }
+}
+
+/// A node reading a buffer a lane may not carry, on rows whose lanes are not
+/// known to carry it. Which rows carry a mask or adapter routes is a builtin
+/// fact; a custom fact an inferlet sets says nothing about them, so a kernel
+/// reading one runs only where its builtin holds.
+fn unguarded_read(plan: &Trace) -> Option<String> {
+    let mut ins = Vec::new();
+    for (j, node) in plan.nodes.iter().enumerate() {
+        ins.clear();
+        node.op.inputs(&mut ins);
+        for id in &ins {
+            let (builtin, what) = match &plan.values[id.0 as usize].def {
+                Def::Input(RuntimeInput::Mask { .. }) => {
+                    (poem_ir::Builtin::Masked, "fact::has(fact::Mask)")
+                }
+                Def::Input(RuntimeInput::AdapterRoutes) => {
+                    (poem_ir::Builtin::Adapted, "fact::has(fact::Adapter)")
+                }
+                _ => continue,
+            };
+            if !plan.facts.implies(&node.guard, builtin) {
+                return Some(format!(
+                    "node {j} ({}) reads {builtin:?} input on rows {what} does not hold \
+                     for; branch onto those rows with it first",
+                    node.op.name()
+                ));
+            }
+        }
+    }
+    None
 }
 
 fn intern(
@@ -605,8 +639,9 @@ fn restated(shard: &Shard, logical: &[u64], plane: &[u64], name: &str) -> Shard 
     }
 }
 
+/// Whether two values' rows are one set of rows, written alike or not.
 fn compatible(a: &Guard, b: &Guard) -> bool {
-    matches!(a, Guard::Always) || matches!(b, Guard::Always) || a == b
+    matches!(a, Guard::Always) || matches!(b, Guard::Always) || a == b || a.equivalent(b)
 }
 
 fn joins_arms(op: &Operation) -> bool {

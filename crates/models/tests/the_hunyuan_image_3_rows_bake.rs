@@ -219,7 +219,9 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
             )))
             .collect();
         for (name, reading, stream, rows) in lanes {
-            let request = Request::new(rows, false)
+            // A denoise lane attends its canvas through the mask its inferlet
+            // sends with it.
+            let request = Request::new(rows, reading == DENOISE)
                 .on_stream(stream)
                 .in_reading(reading_name(reading));
             let w = plan.facts.word(&request);

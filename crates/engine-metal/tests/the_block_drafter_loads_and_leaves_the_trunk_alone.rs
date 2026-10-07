@@ -13,6 +13,14 @@ const PLAIN_SKU: &str = "qwen36-27b-mtp-u4g64-kv-bf16";
 const PROMPT: &[u32] = &[9707, 11, 847, 829, 374, 264, 1602, 2613, 3364];
 const STEPS: usize = 4;
 
+/// The facts the deployment `sku` classifies its lanes by.
+fn facts_of(sku: &str) -> poem_ir::Facts {
+    models::deployment(sku)
+        .expect("the catalog ships the row")
+        .trace(Platform::Metal)
+        .facts
+}
+
 fn artifact() -> Option<PathBuf> {
     if let Ok(named) = std::env::var("PIE_DFLASH_ARTIFACT") {
         let path = PathBuf::from(shellexpand(&named));
@@ -51,7 +59,7 @@ fn shellexpand(path: &str) -> String {
 }
 
 fn word(query_len: u32, drafts: bool) -> u64 {
-    models::qwen_3::forward::Facts::of(&Request::new(query_len, false).drafting(drafts)).word()
+    facts_of(SKU).word(&Request::new(query_len, false).drafting(drafts))
 }
 
 fn argmax(logits: &[f32]) -> u32 {
@@ -191,9 +199,7 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
         residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the plain shell loads");
-    let plain_word = |len: u32| {
-        models::qwen_3::forward::Facts::of(&Request::new(len, false).drafting(false)).word()
-    };
+    let plain_word = |len: u32| facts_of(PLAIN_SKU).word(&Request::new(len, false).drafting(false));
     plain_shell.open(0).expect("the slot opens");
     let mut plain_tokens = Vec::with_capacity(STEPS + 1);
     let got = plain_shell
@@ -283,10 +289,7 @@ fn a_draft_block_fires_and_the_drafter_answers_it() {
     let masking = all_visible(extent);
     let mut seat = Seated::of(Lane {
         slot: 0,
-        word: models::qwen_3::forward::Facts::of(
-            &Request::new(block as u32, true).drafting_a_block(true),
-        )
-        .word(),
+        word: facts_of(SKU).word(&Request::new(block as u32, true).drafting_a_block(true)),
         tokens: &tokens,
     });
     seat.mask = Some(&masking);

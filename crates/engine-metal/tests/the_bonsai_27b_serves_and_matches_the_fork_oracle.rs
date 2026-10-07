@@ -56,7 +56,6 @@ use checkpoint::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 
 use engine_metal::weights::AdapterPlane;
 use engine_metal::{Boot, Lane, Shell};
-use models::qwen_3::forward::Facts;
 use models::qwen_3::model::Model;
 use models::qwen_3::rotation::{self, BONSAI_SIGN_WIDTHS};
 use poem_compiler::Budget;
@@ -304,7 +303,13 @@ fn the_bonsai_27b_serves_ptq1_0_and_matches_the_fork_oracle() {
     // Fire the exact fork prompt (no BOS, greedy readout of the last token) as a
     // single chunked prefill.
     shell.open(0).expect("the slot opens");
-    let word = Facts::of(&Request::new(PROMPT_IDS.len() as u32, false)).word();
+    let word = trace_hybrid(
+        "d27b-bonsai",
+        &Model::d27b_bonsai(Dtype::Ptq1_0, Dtype::Bf16, 1),
+        Platform::Metal,
+    )
+    .facts
+    .word(&Request::new(PROMPT_IDS.len() as u32, false));
     let out = shell
         .fire(&[Lane {
             slot: 0,

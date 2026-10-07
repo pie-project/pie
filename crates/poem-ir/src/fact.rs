@@ -101,6 +101,30 @@ impl Facts {
         })
     }
 
+    /// Whether every row `guard` holds for is one `builtin` holds for.
+    #[must_use]
+    pub fn implies(&self, guard: &Guard, builtin: Builtin) -> bool {
+        let Some(bit) = self
+            .table
+            .iter()
+            .position(|fact| *fact == Fact::Builtin(builtin))
+        else {
+            return false;
+        };
+        let mut bits = guard.referenced_bits();
+        bits.push(bit as u8);
+        bits.sort_unstable();
+        bits.dedup();
+        (0..1u64 << bits.len()).all(|pick| {
+            let word = bits
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| pick & (1 << k) != 0)
+                .fold(0u64, |word, (_, b)| word | (1 << b));
+            !guard.holds(word) || word & (1 << bit) != 0
+        })
+    }
+
     /// The word a request's rows are classified by.
     #[must_use]
     pub fn word(&self, request: &Request) -> u64 {

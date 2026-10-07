@@ -13,6 +13,14 @@ const SKU: &str = "dsv4-flash-mtp-u4g64-u2g64-mxfp4-kv-bf16";
 
 const REPO: &str = "models--mlx-community--DeepSeek-V4-Flash-2bit-DQ";
 
+/// The facts the deployment `sku` classifies its lanes by.
+fn facts_of(sku: &str) -> poem_ir::Facts {
+    models::deployment(sku)
+        .expect("the catalog ships the row")
+        .trace(Platform::Metal)
+        .facts
+}
+
 fn seats() -> u32 {
     std::env::var("PIE_U2_FULL_SEATS")
         .ok()
@@ -226,7 +234,7 @@ fn finite_and_spread(logits: &[f32], what: &str) {
 }
 
 fn word(len: u32) -> u64 {
-    models::deepseek_v4::forward::Facts::of(&Request::new(len, false)).word()
+    facts_of(SKU).word(&Request::new(len, false))
 }
 
 struct Run {

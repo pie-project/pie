@@ -22,7 +22,13 @@ fn fixture() -> Option<PathBuf> {
 }
 
 fn word(query_len: u32) -> u64 {
-    models::qwen_4::forward::Facts::of(&Request::new(query_len, false)).word()
+    poem_dsl::trace_hybrid(
+        "qwen4-micro",
+        &models::qwen_4::model::Model::flash_micro(Dtype::Bf16, Dtype::Bf16, 1),
+        Platform::Metal,
+    )
+    .facts
+    .word(&Request::new(query_len, false))
 }
 
 fn ready() -> Option<Shell> {

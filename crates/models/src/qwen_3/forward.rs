@@ -72,7 +72,7 @@ impl ForwardHybrid for Model {
 
         // A drafted block's rows run the drafter, not the trunk's attention.
         let trunk_inputs = match &m.dflash {
-            Some(_) => inputs.on(!fact::block_draft()),
+            Some(dflash) => inputs.on(!dflash.block_rows()),
             None => inputs.clone(),
         };
         let ([input_m, input_s, input_d], input_p) =
@@ -110,8 +110,8 @@ impl ForwardHybrid for Model {
         }
 
         let (h_block, mut y) = match &m.dflash {
-            Some(_) => {
-                let (block, rest) = (y.on(fact::block_draft()), y.on(!fact::block_draft()));
+            Some(dflash) => {
+                let (block, rest) = (y.on(dflash.block_rows()), y.on(!dflash.block_rows()));
                 (Some(block), rest)
             }
             None => (None, y),
@@ -218,7 +218,7 @@ impl ForwardHybrid for Model {
         let (x, hb) = match (&m.dflash, h_block) {
             (Some(d), Some(block)) => {
                 let fused = fused.as_ref().expect("a block drafter tapped the trunk");
-                let hb = d.arm(&inputs, fused, &block, &mask, &fact::block_draft());
+                let hb = d.arm(&inputs, fused, &block, &mask, &d.block_rows());
                 (Value::merge(vec![hb.clone(), x]), Some(hb))
             }
             _ => (x, None),
@@ -241,7 +241,7 @@ impl ForwardHybrid for Model {
         let logits = ops::linear::lm_head(head_in, head);
 
         if let Some(d) = &m.dflash {
-            d.plant_readout(&logits, &inputs, hb.as_ref(), &fact::block_draft());
+            d.plant_readout(&logits, &inputs, hb.as_ref(), &d.block_rows());
         }
 
         if let Some(mtp) = &m.mtp {

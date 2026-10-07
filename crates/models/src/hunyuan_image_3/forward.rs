@@ -147,9 +147,15 @@ impl ForwardHybrid for Model {
         // The encoder and the denoiser share the trunk: the canvas rows are
         // the denoise reading's, the text rows the encoder's.
         let trunk_rows = inputs.on(!fact::reading("image.in") & !fact::reading("image.out"));
-        let canvas_rows = trunk_rows.on(fact::reading("denoise"));
+        let canvas_rows = trunk_rows.on(on_canvas());
         trunk(&trunk_rows, &canvas_rows, self)
     }
+}
+
+/// The canvas rows: the denoise reading's, with the mask the canvas attends
+/// through. A denoise lane sent without one reads as text.
+fn on_canvas() -> poem_dsl::Predicate {
+    fact::reading("denoise") & fact::has(fact::Mask)
 }
 
 fn linear(w: &Linear, x: &Value) -> Value {
@@ -167,7 +173,7 @@ fn trunk(all: &Input, den: &Input, m: &Model) -> Value {
     let d: &Dims = &m.dims;
     let hd = d.head_dim;
     let sm = d.sm_scale();
-    let classes = [fact::reading("denoise"), fact::single_token()];
+    let classes = [on_canvas(), fact::single_token()];
     let ([canvas_in, ar_decode], ar_prefill) = all.partition(classes.clone());
 
     let plan_den = ops::attn::plan_prefill(&canvas_in, m.q_heads, m.kv_heads, hd, None);
@@ -178,7 +184,7 @@ fn trunk(all: &Input, den: &Input, m: &Model) -> Value {
     let positions = all.axis_positions(port::POSITIONS, ROPE_AXES);
     let ids = all.tokens();
     let y = ops::layout::embed(&ids, &m.embed, d.vocab);
-    let encoded = y.on(!fact::reading("denoise"));
+    let encoded = y.on(!on_canvas());
     let mut y = Value::merge(vec![canvas_rows(den, m), encoded]);
 
     for (l, w) in all.walk_layers(&m.layers) {
@@ -228,12 +234,9 @@ fn trunk(all: &Input, den: &Input, m: &Model) -> Value {
         y = ops::elemwise::residual_add(&f, &y);
     }
 
-    let (canvas, text) = (
-        y.on(fact::reading("denoise")),
-        y.on(!fact::reading("denoise")),
-    );
+    let (canvas, text) = (y.on(on_canvas()), y.on(!on_canvas()));
     seam::at(seam::HIDDEN, &[&canvas]);
-    let text_in = all.on(!fact::reading("denoise"));
+    let text_in = all.on(!on_canvas());
     let x = ops::elemwise::rmsnorm(&text, &m.final_norm, NORM_EPS);
     let x = ops::layout::gather_rows(&x, &text_in.readout_rows());
     let logits = ops::linear::lm_head(&x, &m.head);

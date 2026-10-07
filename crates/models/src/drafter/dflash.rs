@@ -255,6 +255,25 @@ impl DFlash {
         });
     }
 
+    /// Whether a block of this drafter attends through the lane's mask: one
+    /// with no window attends every row the mask shows it, both ways.
+    #[must_use]
+    pub fn reads_a_mask(&self) -> bool {
+        self.blocks.iter().any(|b| b.window.is_none())
+    }
+
+    /// The rows of a drafted block. A drafter whose attention reads the mask
+    /// drafts only rows that carry one; the runtime stamps the whole extent on
+    /// a block lane its inferlet sent without.
+    #[must_use]
+    pub fn block_rows(&self) -> Predicate {
+        if self.reads_a_mask() {
+            poem_dsl::fact::block_draft() & poem_dsl::fact::has(poem_dsl::fact::Mask)
+        } else {
+            poem_dsl::fact::block_draft()
+        }
+    }
+
     pub fn arm(
         &self,
         inputs: &Input,
@@ -353,7 +372,7 @@ impl DFlash {
         logits.rec().block_drafter(BlockDrafter {
             rows: self.block,
             mask_token: self.mask_token,
-            bidirectional: self.blocks.iter().any(|b| b.window.is_none()),
+            bidirectional: self.reads_a_mask(),
             proposals_from: self.proposals_from,
         });
         let dlogits = logits.on(block_draft.clone());

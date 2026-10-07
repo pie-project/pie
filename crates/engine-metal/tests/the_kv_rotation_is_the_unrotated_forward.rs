@@ -179,7 +179,13 @@ fn synth_fixture(dir: &Path) {
 }
 
 fn word(query_len: u32) -> u64 {
-    models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+    poem_dsl::trace_hybrid(
+        "qwen3-micro-text",
+        &Model::micro_text(Dtype::Bf16, Dtype::Bf16, 1),
+        Platform::Metal,
+    )
+    .facts
+    .word(&Request::new(query_len, false))
 }
 
 fn hadamards(trace: &poem_ir::Trace) -> usize {

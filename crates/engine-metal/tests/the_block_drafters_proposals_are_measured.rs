@@ -24,6 +24,14 @@ const PROMPTS: &[(&str, &[u32])] = &[
     ),
 ];
 
+/// The facts the deployment `sku` classifies its lanes by.
+fn facts_of(sku: &str) -> poem_ir::Facts {
+    models::deployment(sku)
+        .expect("the catalog ships the row")
+        .trace(Platform::Metal)
+        .facts
+}
+
 fn artifact() -> Option<PathBuf> {
     if let Ok(named) = std::env::var("PIE_DFLASH_ARTIFACT") {
         let path = PathBuf::from(named.replace('~', &std::env::var("HOME").unwrap_or_default()));
@@ -87,13 +95,8 @@ fn the_target_keeps_a_measured_prefix_of_every_block() {
 
     let block = models::qwen_3::model::QWEN36_27B_DFLASH.block as usize;
     let mask_token = models::qwen_3::model::QWEN36_27B_DFLASH.mask_token;
-    let drafting = |len: u32| {
-        models::qwen_3::forward::Facts::of(&Request::new(len, false).drafting(true)).word()
-    };
-    let block_word = models::qwen_3::forward::Facts::of(
-        &Request::new(block as u32, true).drafting_a_block(true),
-    )
-    .word();
+    let drafting = |len: u32| facts_of(SKU).word(&Request::new(len, false).drafting(true));
+    let block_word = facts_of(SKU).word(&Request::new(block as u32, true).drafting_a_block(true));
 
     const ANCHORS: usize = 4;
 

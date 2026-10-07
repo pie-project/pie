@@ -23,9 +23,9 @@ impl ForwardHybrid for Model {
 
         let mask = inputs.mask();
         let (_, trunk_inputs) = match &m.dflash {
-            Some(_) => (
-                inputs.on(fact::block_draft()),
-                inputs.on(!fact::block_draft()),
+            Some(dflash) => (
+                inputs.on(dflash.block_rows()),
+                inputs.on(!dflash.block_rows()),
             ),
             None => (inputs.clone(), inputs.clone()),
         };
@@ -51,8 +51,8 @@ impl ForwardHybrid for Model {
         let ids = inputs.tokens();
         let y = ops::layout::embed(&ids, &m.embed, m.vocab);
         let (h_block, mut y) = match &m.dflash {
-            Some(_) => {
-                let (block, rest) = (y.on(fact::block_draft()), y.on(!fact::block_draft()));
+            Some(dflash) => {
+                let (block, rest) = (y.on(dflash.block_rows()), y.on(!dflash.block_rows()));
                 (Some(block), rest)
             }
             None => (None, y),
@@ -192,7 +192,7 @@ impl ForwardHybrid for Model {
         let (x, hb) = match (&m.dflash, h_block) {
             (Some(dr), Some(block)) => {
                 let tapped = tapped.as_ref().expect("a block drafter tapped the trunk");
-                let hb = dr.arm(&inputs, tapped, &block, &mask, &fact::block_draft());
+                let hb = dr.arm(&inputs, tapped, &block, &mask, &dr.block_rows());
                 (Value::merge(vec![hb.clone(), x]), Some(hb))
             }
             _ => (x, None),
@@ -200,7 +200,7 @@ impl ForwardHybrid for Model {
         let x = ops::layout::gather_rows(&x, &inputs.readout_rows());
         let logits = ops::linear::lm_head(&x, &m.head);
         if let Some(dr) = &m.dflash {
-            dr.plant_readout(&logits, &inputs, hb.as_ref(), &fact::block_draft());
+            dr.plant_readout(&logits, &inputs, hb.as_ref(), &dr.block_rows());
         }
         logits
     }

@@ -46,7 +46,6 @@ use checkpoint::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 
 use engine_metal::weights::AdapterPlane;
 use engine_metal::{Boot, Lane, Shell};
-use models::qwen_3::forward::Facts;
 use models::qwen_3::model::Model;
 use models::qwen_3::rotation::{self, BONSAI_SIGN_WIDTHS};
 use poem_compiler::Budget;
@@ -136,7 +135,13 @@ fn import_zt(gguf: &Path, out: &Path) {
 }
 
 fn word(len: usize) -> u64 {
-    Facts::of(&Request::new(len as u32, false)).word()
+    trace_hybrid(
+        "d27b-bonsai",
+        &Model::d27b_bonsai(Dtype::Ptq1_0, Dtype::Bf16, 1),
+        Platform::Metal,
+    )
+    .facts
+    .word(&Request::new(len as u32, false))
 }
 
 /// -log softmax(logits)[target], numerically stable (full-vocab, as the fork).
