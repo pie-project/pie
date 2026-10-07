@@ -127,6 +127,16 @@ pub fn skus() -> Vec<crate::Sku> {
             flash_u2g64,
         ),
         (
+            "dsv4-flash",
+            2,
+            [Dtype::U4g64, Dtype::U2g64],
+            Dtype::Bf16,
+            poem_dsl::trace_hybrid,
+            template::r1,
+            &tokenizer::CONTRACT,
+            flash_u2g64,
+        ),
+        (
             "dsv4-flash-mini",
             1,
             [Dtype::Bf16],
@@ -154,6 +164,16 @@ pub fn skus() -> Vec<crate::Sku> {
         (
             "dsv4-flash",
             1,
+            [Dtype::Bf16],
+            Dtype::Bf16,
+            poem_dsl::trace_hybrid,
+            template::r1,
+            &tokenizer::CONTRACT,
+            || Model::flash(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16),
+        ),
+        (
+            "dsv4-flash",
+            2,
             [Dtype::Bf16],
             Dtype::Bf16,
             poem_dsl::trace_hybrid,

@@ -930,7 +930,7 @@ impl Model {
                     kv_down: Weight::sym(n("kv_down"), [kv_latent, hidden], weights),
                     kv_norm: norm("kv_norm", kv_latent),
                     kv_norm_eps: d.norm_eps,
-                    o_down: Weight::sym(n("o_down"), [o_out, hidden], weights),
+                    o_down: Weight::sym(n("o_down"), [o_out, hidden], weights).columns(),
                     o_up: Weight::sym(n("o_up"), [hidden, o_out], weights).rows(),
                     o_groups: d.o_groups,
                     sink: Weight::sym(n("attn_sink"), [heads as u64], dense).columns(),

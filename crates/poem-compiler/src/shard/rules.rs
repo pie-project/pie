@@ -37,6 +37,9 @@ enum Rule {
     /// A row norm, which needs the whole row unless its weight is split
     /// with it: then each rank norms its own share.
     Norm,
+    /// Group indices for a grouped matmul, which reads no value: they are
+    /// a rank's share of the groups when the row it groups is split.
+    Groups,
 }
 
 const HEAD_OPS: &[(&str, &[&str], &[&str], bool)] = &[
@@ -102,6 +105,15 @@ const HEAD_OPS: &[(&str, &[&str], &[&str], bool)] = &[
         false,
     ),
     ("linear.mlp_situ", &["packed"], &["intermediate"], false),
+    ("linear.mlp_swiglu_clamp_split", &["gate", "up"], &[], false),
+    ("linear.mlp_geglu_tanh", &["gate", "up"], &[], false),
+    ("linear.mlp_gelu_tanh", &["x"], &[], false),
+    (
+        "linear.matmul_grouped",
+        &["x", "routes"],
+        &["groups"],
+        false,
+    ),
     ("attention.decode", &["q"], &[], true),
     ("attention.prefill", &["q"], &["kv_heads"], true),
     ("attention.decode_lse", &["q"], &[], true),
@@ -168,6 +180,20 @@ const HEAD_OPS: &[(&str, &[&str], &[&str], bool)] = &[
     ),
 ];
 
+/// Attention that reads kv a model may keep whole on every rank while it
+/// splits the query heads (one kv head shared by all of them): its kv head
+/// count is a rank's share only when the cache is split.
+const KV_READERS: &[&str] = &[
+    "attention.decode",
+    "attention.prefill",
+    "attention.decode_lse",
+    "attention.prefill_lse",
+    "attention.masked",
+    "attention.masked_lse",
+    "attention.decode_selected",
+    "attention.prefill_selected",
+];
+
 fn rule(name: &str) -> Rule {
     match name {
         "linear.matmul" | "linear.lm_head" => Rule::Contract {
@@ -199,6 +225,7 @@ fn rule(name: &str) -> Rule {
         },
         "attention.mla_plan" => Rule::Plan { scale: &["heads"] },
         "elementwise.rmsnorm" | "elementwise.rmsnorm_plus_one" => Rule::Norm,
+        "linear.group_routes" => Rule::Groups,
         _ => HEAD_OPS.iter().find(|(n, ..)| *n == name).map_or(
             Rule::Whole,
             |(_, follow, scale, cache)| Rule::Heads {
@@ -227,7 +254,13 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
         Rule::Plan { scale } => {
             at.whole_except(pass, &[])?;
             at.check_state(pass, false, false)?;
-            at.scale(pass, scale)?;
+            let split_kv = outs.iter().any(|plan| pass.planned_kv_split(*plan));
+            let scale: Vec<&str> = scale
+                .iter()
+                .copied()
+                .filter(|f| *f != "kv_heads" || split_kv)
+                .collect();
+            at.scale(pass, &scale)?;
             vec![Dist::Whole; outs.len()]
         }
         Rule::Lookup { table } => {
@@ -260,6 +293,17 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
                         at.name
                     ));
                 }
+            }
+        }
+        Rule::Groups => {
+            let grouped = outs.iter().any(|routes| pass.grouped_row_split(*routes));
+            if grouped {
+                at.scale(pass, &["groups"])?;
+                outs.iter()
+                    .map(|o| Dist::Split(vec![pass.width(*o).unwrap_or(0)]))
+                    .collect()
+            } else {
+                vec![Dist::Whole; outs.len()]
             }
         }
         Rule::Linear { follow } => {
@@ -296,8 +340,9 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
                     held => {
                         return Err(format!(
                             "`{}` contracts a weight split along its input with an \
-                             activation held {held:?}",
-                            at.name
+                             activation held {held:?}, made by `{}`",
+                            at.name,
+                            pass.maker(a)
                         ));
                     }
                 },
@@ -332,7 +377,13 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
             }
             at.check_state(pass, split, cache)?;
             if split {
-                at.scale(pass, scale)?;
+                let whole_kv = KV_READERS.contains(&at.name) && !at.reads_split_cache(pass);
+                let scale: Vec<&str> = scale
+                    .iter()
+                    .copied()
+                    .filter(|f| *f != "kv_heads" || !whole_kv)
+                    .collect();
+                at.scale(pass, &scale)?;
                 let first = at.all_of(follow)[0];
                 let (width, Dist::Split(segments)) = (pass.width(first), &held[0]) else {
                     unreachable!("a split op follows a split value");
@@ -416,7 +467,9 @@ impl At {
     }
 
     /// An op on whole values reads no weight the ranks split, and a cache it
-    /// reads is split exactly when its values are and it `wants` one.
+    /// reads is split exactly when its values are and it `wants` one, but
+    /// for attention whose split query heads share a kv head every rank keeps
+    /// whole.
     fn check_state(&self, pass: &Pass, split: bool, wants: bool) -> Result<(), String> {
         let mut ins = Vec::new();
         tree::op(self.tree.clone()).inputs(&mut ins);
@@ -424,8 +477,10 @@ impl At {
             if !split && pass.weight_cut(v).is_some() {
                 return Err(format!("`{}` reads a weight the ranks split", self.name));
             }
+            let reader = KV_READERS.contains(&self.name);
             if let Some(cut) = pass.cache_split(v)
                 && cut != (split && wants)
+                && !(split && !cut && reader)
             {
                 return Err(format!(
                     "`{}` reads a cache {} while its values are {}",
@@ -440,6 +495,12 @@ impl At {
             }
         }
         Ok(())
+    }
+
+    fn reads_split_cache(&self, pass: &Pass) -> bool {
+        let mut ins = Vec::new();
+        tree::op(self.tree.clone()).inputs(&mut ins);
+        ins.into_iter().any(|v| pass.cache_split(v) == Some(true))
     }
 
     fn scale(&mut self, pass: &Pass, names: &[&str]) -> Result<(), String> {

@@ -139,6 +139,38 @@ impl Pass {
         }
     }
 
+    /// Whether the attention reading `plan` reads a cache the ranks split.
+    fn planned_kv_split(&self, plan: ValueId) -> bool {
+        let mut ins = Vec::new();
+        self.trace.nodes.iter().any(|node| {
+            ins.clear();
+            node.op.inputs(&mut ins);
+            ins.contains(&plan) && ins.iter().any(|v| self.cache_split(*v) == Some(true))
+        })
+    }
+
+    /// Whether a grouped matmul reading `routes` groups a row the ranks split.
+    fn grouped_row_split(&self, routes: ValueId) -> bool {
+        self.trace.nodes.iter().any(|node| match &node.op {
+            Operation::Linear(poem_ir::Linear::MatmulGrouped { x, routes: r, .. }) => {
+                *r == routes && matches!(self.dist(*x), Ok(Dist::Split(_)))
+            }
+            _ => false,
+        })
+    }
+
+    /// The op that makes `v`, for an error to name.
+    fn maker(&self, v: ValueId) -> &'static str {
+        match self.trace.values[v.0 as usize].def {
+            Def::Op(i) => self
+                .trace
+                .nodes
+                .get(i as usize)
+                .map_or("?", |node| node.op.name()),
+            _ => "no op",
+        }
+    }
+
     fn is_weight(&self, v: ValueId) -> bool {
         matches!(self.trace.values[v.0 as usize].def, Def::Weight(_))
     }

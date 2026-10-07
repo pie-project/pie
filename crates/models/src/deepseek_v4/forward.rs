@@ -63,8 +63,10 @@ impl ForwardHybrid for Model {
         let kv = c.kv_space(self.kv);
         for w in &self.layers {
             let at = &w.attn;
-            c.kv(kv, at.kv.clone(), [at.kv_down.dim(0)], self.head_dim)
-                .heads();
+            let row = c.kv(kv, at.kv.clone(), [at.kv_down.dim(0)], self.head_dim);
+            if split_heads(&at.kv_down) {
+                row.heads();
+            }
             if let Some(p) = &at.pool
                 && p.owner
             {
@@ -87,13 +89,15 @@ impl ForwardHybrid for Model {
             }
         }
         if let Some(mtp) = &self.mtp {
-            c.kv(
+            let row = c.kv(
                 kv,
                 mtp.block.attn.kv.clone(),
                 [mtp.block.attn.kv_down.dim(0)],
                 self.head_dim,
-            )
-            .heads();
+            );
+            if split_heads(&mtp.block.attn.kv_down) {
+                row.heads();
+            }
         }
         c
     }
@@ -958,4 +962,10 @@ fn boundaries(positions: &Value, row_valid: &Value, ratio: u32) -> (Value, Value
         Value::merge(vec![dreq, preq]),
         Value::merge(vec![drope, prope]),
     )
+}
+
+/// A kv row holds heads the ranks split when its projection is split; a
+/// single latent every query head reads stays whole on each rank.
+fn split_heads(kv_down: &Weight) -> bool {
+    matches!(kv_down.shard, poem_dsl::Shard::Cut { .. })
 }
