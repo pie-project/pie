@@ -209,42 +209,10 @@ impl Sku {
 pub type ImportFn =
     fn(&ztensor::Source, u32, Platform) -> Result<ModelContract, checkpoint_dsl::Error>;
 
+/// Catalog rows. A model is written at its whole size; a row's trace is the
+/// one each of its `tp` ranks runs, split by the compiler.
 #[macro_export]
 macro_rules! skus {
-    ($( ($text:literal, $tp:literal, [$($w:expr),+ $(,)?], $kv:expr, $trace:path, $template:expr, $tokenizer:expr, $m:expr $(,)?) ),+ $(,)?) => {
-        vec![ $( {
-            const RECIPE: $crate::Recipe = $crate::Recipe {
-                text: $text,
-                weights: &[$($w),+],
-                kv: $kv,
-                tp: $tp,
-            };
-            $crate::Sku {
-                name: RECIPE.name(),
-                recipe: RECIPE,
-                trace: |platform: $crate::Platform| {
-                    $trace(&RECIPE.name(), &($m)(RECIPE.tp), platform)
-                },
-                classify: |request: &$crate::Request| {
-                    poem_dsl::word_of(|| ($m)(RECIPE.tp), request)
-                },
-                import: |src: &ztensor::Source, tp: u32, platform: $crate::Platform| {
-                    ($m)(tp).import(src, platform)
-                },
-                template: $template,
-                tokenizer: $tokenizer,
-                diffusion: None,
-                generative: None,
-            }
-        } ),+ ]
-    };
-}
-
-/// A row whose model is written at its whole size: the trace is the one each
-/// of its `tp` ranks runs, split by the compiler, and the model is built
-/// without a rank count.
-#[macro_export]
-macro_rules! split_skus {
     ($( ($text:literal, $tp:literal, [$($w:expr),+ $(,)?], $kv:expr, $trace:path, $template:expr, $tokenizer:expr, $m:expr $(,)?) ),+ $(,)?) => {
         vec![ $( {
             const RECIPE: $crate::Recipe = $crate::Recipe {

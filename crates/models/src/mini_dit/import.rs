@@ -32,7 +32,7 @@ impl Model {
         platform: Platform,
         layout: Layout,
     ) -> Result<ModelContract, Error> {
-        let mut b = Builder::new(src, self.tp, platform);
+        let mut b = Builder::new(src, 1, platform);
         let at = |tail: &str| layout.at(tail);
 
         biased(&mut b, &self.x_embed, &at("x_embedder"))?;

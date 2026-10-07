@@ -20,7 +20,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::mini(Dtype::Bf16, tp).tapped(forward::Tap::from_env()),
+            || Model::mini(Dtype::Bf16).tapped(forward::Tap::from_env()),
         ),
         (
             "mini-dit",
@@ -30,7 +30,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::mini(Dtype::Bf16, tp).tapped(forward::Tap::from_env()),
+            || Model::mini(Dtype::Bf16).tapped(forward::Tap::from_env()),
         ),
         (
             "mini-dit",
@@ -40,7 +40,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::mini(Dtype::Bf16, tp).tapped(forward::Tap::from_env()),
+            || Model::mini(Dtype::Bf16).tapped(forward::Tap::from_env()),
         ),
     ];
     for row in &mut rows {

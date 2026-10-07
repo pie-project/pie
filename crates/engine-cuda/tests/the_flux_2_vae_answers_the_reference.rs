@@ -102,7 +102,7 @@ fn fire(
     clip: [u32; 3],
     payload: &[f32],
 ) -> (Vec<f32>, Vec<[u32; 3]>, f64, f64) {
-    let model = Model::klein_4b(Dtype::Bf16, 1);
+    let model = Model::klein_4b(Dtype::Bf16);
     let arm = OneArm { model, decode };
     let trace = trace_hybrid(
         if decode {

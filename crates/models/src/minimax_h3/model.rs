@@ -90,12 +90,12 @@ pub struct Dims {
 
 impl Dims {
     #[must_use]
-    pub const fn h3(tp: u32) -> Dims {
+    pub const fn h3() -> Dims {
         Dims {
             dim: 5376,
-            heads: 56 / tp,
+            heads: 56,
             head_dim: HEAD_DIM,
-            inter: 14336 / tp,
+            inter: 14336,
             blocks: 50,
             refiners: 2,
             text_dim: TE_HIDDEN,
@@ -303,13 +303,13 @@ pub struct TextEncoder {
 }
 
 impl TextEncoder {
-    fn qwen3_vl_32b(banks: Dtype, tp: u32) -> TextEncoder {
+    fn qwen3_vl_32b(banks: Dtype) -> TextEncoder {
         let dense = crate::dense(banks);
         let hidden = u64::from(TE_HIDDEN);
         let hd = u64::from(TE_HEAD_DIM);
-        let inter = u64::from(TE_INTER / tp);
-        let q_heads = TE_Q_HEADS / tp;
-        let kv_heads = TE_KV_HEADS / tp;
+        let inter = u64::from(TE_INTER);
+        let q_heads = TE_Q_HEADS;
+        let kv_heads = TE_KV_HEADS;
         let layers = (0..TE_LAYERS)
             .map(|l| {
                 let n = |s: &str| format!("te.layer.{l}.{s}");
@@ -335,7 +335,7 @@ impl TextEncoder {
             q_heads,
             kv_heads,
             head_dim: TE_HEAD_DIM,
-            inter: TE_INTER / tp,
+            inter: TE_INTER,
             theta: TE_THETA,
             eps: TE_EPS,
             sm_scale: (TE_HEAD_DIM as f32).sqrt().recip(),
@@ -346,7 +346,6 @@ impl TextEncoder {
 }
 
 pub struct Model {
-    pub tp: u32,
     pub banks: Dtype,
     pub kv: Dtype,
     pub dims: Dims,
@@ -356,25 +355,16 @@ pub struct Model {
 
 impl Model {
     #[must_use]
-    pub fn fl2va(banks: Dtype, tp: u32) -> Model {
-        Model::new(
-            banks,
-            tp,
-            Dims::h3(tp),
-            Some(TextEncoder::qwen3_vl_32b(banks, tp)),
-        )
+    pub fn fl2va(banks: Dtype) -> Model {
+        Model::new(banks, Dims::h3(), Some(TextEncoder::qwen3_vl_32b(banks)))
     }
 
     #[must_use]
-    pub fn mini(banks: Dtype, tp: u32) -> Model {
-        Model::new(banks, tp, Dims::mini(), None)
+    pub fn mini(banks: Dtype) -> Model {
+        Model::new(banks, Dims::mini(), None)
     }
 
-    fn new(banks: Dtype, tp: u32, d: Dims, te: Option<TextEncoder>) -> Model {
-        assert!(
-            matches!(tp, 1 | 2 | 4),
-            "tp {tp} is not a world this text ships"
-        );
+    fn new(banks: Dtype, d: Dims, te: Option<TextEncoder>) -> Model {
         assert_eq!(
             d.rotary_dim() % 2,
             0,
@@ -422,7 +412,6 @@ impl Model {
             audio_out: Linear::at("dit.audio_out", u64::from(AUDIO_CHANNELS), dim, banks),
         };
         Model {
-            tp,
             banks,
             kv: Dtype::Bf16,
             dims: d,

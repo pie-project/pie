@@ -3,7 +3,6 @@ use poem_dsl::{Dtype, Weight};
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
-    pub tp: u32,
     /// `attn_res_block_size` under `AttnRes::Every`.
     pub res_block: u32,
 
@@ -203,12 +202,11 @@ fn closes_a_block(l: u32, every: u32) -> bool {
 }
 
 impl Model {
-    pub fn k3(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn k3(w: Dtype, experts: Dtype, kv: Dtype) -> Model {
         Model::new(
             w,
             experts,
             kv,
-            tp,
             Dims {
                 hidden: 2048,
                 layers: 8,
@@ -256,8 +254,8 @@ impl Model {
     /// `moonshotai/Kimi-K3` as released: 93 layers (one dense, then KDA with
     /// an MLA layer every fourth), 896 latent-MoE experts of which 16 route,
     /// two shared experts, AttnRes blocks of 12.
-    pub fn k3_released(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, experts, kv, tp, Model::released_dims(93, 896, 12))
+    pub fn k3_released(w: Dtype, experts: Dtype, kv: Dtype) -> Model {
+        Model::new(w, experts, kv, Model::released_dims(93, 896, 12))
     }
 
     /// The first `layers` layers of Kimi-K3 at full width with the first
@@ -271,13 +269,11 @@ impl Model {
         w: Dtype,
         bank: Dtype,
         kv: Dtype,
-        tp: u32,
     ) -> Model {
         Model::new(
             w,
             bank,
             kv,
-            tp,
             Model::released_dims(layers, experts, res_block),
         )
     }
@@ -326,16 +322,12 @@ impl Model {
         }
     }
 
-    fn new(weights: Dtype, experts: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
-        assert!(
-            matches!(tp, 1 | 2 | 4 | 8),
-            "tp {tp} is not a world this catalog ships"
-        );
-        let mla_heads = d.mla.heads / tp;
-        let kda_heads = d.kda.heads / tp;
-        let moe_inter = d.moe.inter / tp;
-        let shared_inter = d.moe.shared_inter / tp;
-        let dense_inter = d.dense_inter / tp;
+    fn new(weights: Dtype, experts: Dtype, kv: Dtype, d: Dims) -> Model {
+        let mla_heads = d.mla.heads;
+        let kda_heads = d.kda.heads;
+        let moe_inter = d.moe.inter;
+        let shared_inter = d.moe.shared_inter;
+        let dense_inter = d.dense_inter;
 
         let hidden = d.hidden as u64;
         let moe_in = u64::from(d.moe.latent.unwrap_or(d.hidden));
@@ -527,7 +519,6 @@ impl Model {
         Model {
             hidden: d.hidden,
             vocab: d.vocab,
-            tp,
             res_block: d.res_block,
             mla_heads,
             kv_lora_rank: a.kv_lora_rank,
@@ -536,11 +527,7 @@ impl Model {
             embed: Weight::sym("embed", [d.vocab as u64, hidden], weights),
             head: {
                 let banded = std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
-                let rows = if banded {
-                    u64::from(d.vocab / tp)
-                } else {
-                    u64::from(d.vocab)
-                };
+                let rows = u64::from(d.vocab);
                 let bank = Weight::sym("lm_head", [rows, hidden], weights);
                 if banded { bank.packed([rows]) } else { bank }
             },

@@ -6,7 +6,6 @@ pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
     pub head_rows: u32,
-    pub tp: u32,
 
     pub heads: u32,
     pub head_dim: u32,
@@ -115,16 +114,16 @@ struct Dims {
 }
 
 impl Model {
-    pub fn full(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, kv, tp, Model::dims())
+    pub fn full(w: Dtype, kv: Dtype) -> Model {
+        Model::new(w, kv, Model::dims())
     }
 
-    pub fn mini(layers: u32, experts: u32, w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn mini(layers: u32, experts: u32, w: Dtype, kv: Dtype) -> Model {
         let mut d = Model::dims();
         d.layers = layers;
         d.experts = experts;
         d.top_k = d.top_k.min(experts);
-        Model::new(w, kv, tp, d)
+        Model::new(w, kv, d)
     }
 
     fn dims() -> Dims {
@@ -156,17 +155,13 @@ impl Model {
         }
     }
 
-    fn new(w: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
-        assert!(
-            matches!(tp, 1 | 2 | 4 | 8),
-            "tp {tp} is not a world this catalog ships"
-        );
+    fn new(w: Dtype, kv: Dtype, d: Dims) -> Model {
         let dense = crate::dense(w);
         let proj = match w {
             Dtype::U4g64 => Dtype::U4g64tiled,
             other => other,
         };
-        let heads = d.heads / tp;
+        let heads = d.heads;
         let hidden = u64::from(d.hidden);
         let hd = u64::from(d.head_dim);
         let q_w = u64::from(heads) * hd;
@@ -181,24 +176,24 @@ impl Model {
                     crate::adapter::banks(&format!("layer.{l}"), ADAPTERS, hidden, dense);
                 let global = (l + 1) % d.global_every == 0;
                 let (reading, kv_heads, extent) = if global {
-                    (Reading::Global, d.global_kv_heads / tp, d.global_extent)
+                    (Reading::Global, d.global_kv_heads, d.global_extent)
                 } else {
-                    (Reading::Local, d.local_kv_heads / tp, d.window)
+                    (Reading::Local, d.local_kv_heads, d.window)
                 };
                 let kv_w = u64::from(kv_heads) * hd;
                 let conv =
                     |s: &str, channels: u64| Weight::sym(n(s), [channels, kw], dense).columns();
                 let mlp = if l < d.dense_layers {
-                    let iw = u64::from(d.dense_inter / tp);
+                    let iw = u64::from(d.dense_inter);
                     Mlp::Dense {
                         gate_up: Weight::sym(n("gate_up"), [2 * iw, hidden], proj).packed([iw, iw]),
-                        inter: d.dense_inter / tp,
+                        inter: d.dense_inter,
                         down: Weight::sym(n("down"), [hidden, iw], proj).rows(),
                         scale: vec("mlp_scale", 1),
                     }
                 } else {
                     let bank = u64::from(d.experts + d.sink);
-                    let mi = u64::from(d.moe_inter / tp);
+                    let mi = u64::from(d.moe_inter);
                     Mlp::Routed {
                         router: Weight::sym(n("router"), [bank, hidden], proj),
                         bias: Weight::sym(n("router_bias"), [u64::from(d.experts)], Dtype::F32),
@@ -209,7 +204,7 @@ impl Model {
                         experts: d.experts,
                         top_k: d.top_k,
                         sink: d.sink,
-                        inter: d.moe_inter / tp,
+                        inter: d.moe_inter,
                         scaling: d.route_scale,
                     }
                 };
@@ -251,7 +246,6 @@ impl Model {
             hidden: d.hidden,
             vocab: d.vocab,
             head_rows: d.head_rows,
-            tp,
             heads,
             head_dim: d.head_dim,
             d_rel: d.d_rel,

@@ -17,7 +17,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::a12b(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::a12b(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16),
         ),
         (
             "glm5-a12b",
@@ -27,7 +27,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::a12b(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::a12b(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16),
         ),
     ]
 }

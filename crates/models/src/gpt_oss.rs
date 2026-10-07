@@ -17,7 +17,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::gpt_oss,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::b20_dflash(Dtype::U4g64, Dtype::Mxfp4, Dtype::Bf16, tp),
+            || Model::b20_dflash(Dtype::U4g64, Dtype::Mxfp4, Dtype::Bf16),
         ),
         (
             "gptoss-20b",
@@ -27,7 +27,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::gpt_oss,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::b20(Dtype::U4g64, Dtype::Mxfp4, Dtype::Bf16, tp),
+            || Model::b20(Dtype::U4g64, Dtype::Mxfp4, Dtype::Bf16),
         ),
         (
             "gptoss-20b",
@@ -37,7 +37,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::gpt_oss,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::b20(Dtype::U4g64, Dtype::Mxfp4, Dtype::Bf16, tp),
+            || Model::b20(Dtype::U4g64, Dtype::Mxfp4, Dtype::Bf16),
         ),
         (
             "gptoss-20b",
@@ -47,7 +47,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::gpt_oss,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::b20(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, tp),
+            || Model::b20(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16),
         ),
         (
             "gptoss-20b",
@@ -57,7 +57,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::gpt_oss,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::b20(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, tp),
+            || Model::b20(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16),
         ),
         (
             "gptoss-20b-mini",
@@ -67,7 +67,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::gpt_oss,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::b20_mini(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, tp),
+            || Model::b20_mini(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16),
         ),
         (
             "gptoss-20b-mini",
@@ -77,7 +77,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::gpt_oss,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::b20_mini(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, tp),
+            || Model::b20_mini(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16),
         ),
         (
             "gptoss-120b",
@@ -87,7 +87,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::gpt_oss,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::b120(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, tp),
+            || Model::b120(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16),
         ),
         (
             "gptoss-120b",
@@ -97,7 +97,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::gpt_oss,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::b120(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, tp),
+            || Model::b120(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16),
         ),
     ]
 }

@@ -164,11 +164,6 @@ impl ForwardHybrid for Model {
             ]);
             seam::at(seam::ATTN_OUT, &[&a]);
             let o = ops::linear::matmul(&a, &w.o_proj);
-            let o = if m.tp > 1 {
-                ops::collective::all_reduce(&o)
-            } else {
-                o
-            };
             let o = {
                 let (adapted, _) = o.split(&Facts::has_adapter());
                 let (px, _) = x.split(&Facts::has_adapter());
@@ -187,11 +182,6 @@ impl ForwardHybrid for Model {
                 } => {
                     let act = ops::linear::mlp_swiglu(&ops::linear::matmul(&x, gate_up), *inter);
                     let f = ops::linear::matmul(&act, down);
-                    let f = if m.tp > 1 {
-                        ops::collective::all_reduce(&f)
-                    } else {
-                        f
-                    };
                     ops::elemwise::scale(scale, &f)
                 }
                 Mlp::Routed {
@@ -224,12 +214,7 @@ impl ForwardHybrid for Model {
                         }
                     };
                     let hidden = ops::linear::mlp_swiglu(&select(&x, gate_up), *inter);
-                    let routed = ops::linear::moe_weighted_sum(&select(&hidden, down), &weights);
-                    if m.tp > 1 {
-                        ops::collective::all_reduce(&routed)
-                    } else {
-                        routed
-                    }
+                    ops::linear::moe_weighted_sum(&select(&hidden, down), &weights)
                 }
             };
             let f = conv(&f, &w.mlp_conv, &w.mlp_state, &inputs, m);

@@ -78,7 +78,7 @@ impl Model {
             name: "vae".to_string(),
             detail: "this row declares no VAE".to_string(),
         })?;
-        let mut b = Builder::new(src, self.tp, platform);
+        let mut b = Builder::new(src, 1, platform);
         vae(&mut b, src, v, Layout::Diffusers)?;
         Ok(b.build())
     }
@@ -89,7 +89,7 @@ impl Model {
         platform: Platform,
         layout: Layout,
     ) -> Result<ModelContract, Error> {
-        let mut b = Builder::new(src, self.tp, platform);
+        let mut b = Builder::new(src, 1, platform);
         dit(&mut b, src, &self.dit, self.dims.dim, layout)?;
         if let Some(te) = &self.te {
             text_encoder(&mut b, src, te, layout)?;

@@ -602,7 +602,6 @@ impl Vae {
 }
 
 pub struct Model {
-    pub tp: u32,
     pub banks: Dtype,
     pub dims: Dims,
     pub dit: Dit,
@@ -612,20 +611,16 @@ pub struct Model {
 
 impl Model {
     #[must_use]
-    pub fn ltx_2_5(banks: Dtype, tp: u32) -> Model {
-        Model::new(banks, tp, Dims::ltx_2_5(), Some(Vae::ltx_2_5(Dtype::Bf16)))
+    pub fn ltx_2_5(banks: Dtype) -> Model {
+        Model::new(banks, Dims::ltx_2_5(), Some(Vae::ltx_2_5(Dtype::Bf16)))
     }
 
     #[must_use]
-    pub fn mini(banks: Dtype, tp: u32) -> Model {
-        Model::new(banks, tp, Dims::mini(), None)
+    pub fn mini(banks: Dtype) -> Model {
+        Model::new(banks, Dims::mini(), None)
     }
 
-    fn new(banks: Dtype, tp: u32, d: Dims, vae: Option<Vae>) -> Model {
-        assert_eq!(
-            tp, 1,
-            "this text ships one-rank rows; tp {tp} is not a world it states"
-        );
+    fn new(banks: Dtype, d: Dims, vae: Option<Vae>) -> Model {
         assert_eq!(
             d.rope_dims().iter().sum::<u32>() + 2 * rope_pad(d.dim(), ROPE_AXES),
             d.dim(),
@@ -655,7 +650,6 @@ impl Model {
             assert_eq!(d.channels, VAE_Z, "the latent is the VAE's");
         }
         Model {
-            tp,
             banks,
             dims: d,
             dit,

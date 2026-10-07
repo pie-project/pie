@@ -10,7 +10,7 @@ use model::Model;
 use poem_dsl::Dtype;
 
 pub fn skus() -> Vec<crate::Sku> {
-    crate::split_skus![
+    crate::skus![
         (
             "qwen36-27b-mtp",
             1,

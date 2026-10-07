@@ -161,7 +161,7 @@ impl Encoder {
 }
 
 fn load(artifact: &PathBuf, max_voxels: u32) -> (Encoder, f64) {
-    let model = Model::ti2v_5b(Dtype::Bf16, 1);
+    let model = Model::ti2v_5b(Dtype::Bf16);
     let codes = model.readings();
     let (head, rest) = (
         codes.vae_encode_head.expect("the head arm"),

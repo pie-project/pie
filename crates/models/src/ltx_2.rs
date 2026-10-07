@@ -19,7 +19,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::ltx_2_5(Dtype::Bf16, tp),
+            || Model::ltx_2_5(Dtype::Bf16),
         ),
         (
             "ltx25",
@@ -29,7 +29,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::ltx_2_5(Dtype::U4g64, tp),
+            || Model::ltx_2_5(Dtype::U4g64),
         ),
         (
             "ltx25-mini",
@@ -39,13 +39,13 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::mini(Dtype::Bf16, tp),
+            || Model::mini(Dtype::Bf16),
         ),
     ];
     for row in &mut rows {
         let model = match row.recipe.text {
-            "ltx25" => Model::ltx_2_5(Dtype::Bf16, 1),
-            "ltx25-mini" => Model::mini(Dtype::Bf16, 1),
+            "ltx25" => Model::ltx_2_5(Dtype::Bf16),
+            "ltx25-mini" => Model::mini(Dtype::Bf16),
             other => unreachable!("no ltx_2 row is called `{other}`"),
         };
         row.generative = Some(model.generative());

@@ -11,7 +11,6 @@ pub struct Trunk {
     pub norm_eps: f32,
     pub weights: Dtype,
     pub dense: Dtype,
-    pub tp: u32,
 }
 
 pub struct DFlash {
@@ -116,7 +115,7 @@ pub enum Readout {
 impl DFlash {
     #[must_use]
     pub fn declare(head: &'static Head, prefix: &str, trunk: &Trunk) -> DFlash {
-        let (hidden, w, dense, tp) = (trunk.hidden, trunk.weights, trunk.dense, trunk.tp);
+        let (hidden, w, dense) = (trunk.hidden, trunk.weights, trunk.dense);
         let n = |s: &str| format!("{prefix}.{s}");
         let conv = |l: u32, which: &str| {
             head.conv.map(|c| DynConv {
@@ -138,9 +137,9 @@ impl DFlash {
                 group: c.group,
             })
         };
-        let (dq, dkv, dhd) = (head.q_heads / tp, head.kv_heads / tp, head.head_dim);
+        let (dq, dkv, dhd) = (head.q_heads, head.kv_heads, head.head_dim);
         let hd = u64::from(dhd);
-        let inter = head.inter / tp;
+        let inter = head.inter;
         let codebook =
             |s: &str, rank: u32| Weight::sym(n(s), [trunk.vocab, u64::from(rank)], dense);
         DFlash {

@@ -217,7 +217,6 @@ pub struct Layer {
 }
 
 pub struct Model {
-    pub tp: u32,
     pub banks: Dtype,
     pub expert_banks: Dtype,
     pub kv_dtype: Dtype,
@@ -240,20 +239,16 @@ pub struct Model {
 
 impl Model {
     #[must_use]
-    pub fn flagship(banks: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(banks, experts, kv, tp, Dims::flagship())
+    pub fn flagship(banks: Dtype, experts: Dtype, kv: Dtype) -> Model {
+        Model::new(banks, experts, kv, Dims::flagship())
     }
 
     #[must_use]
-    pub fn mini(banks: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(banks, banks, kv, tp, Dims::mini())
+    pub fn mini(banks: Dtype, kv: Dtype) -> Model {
+        Model::new(banks, banks, kv, Dims::mini())
     }
 
-    fn new(banks: Dtype, expert_banks: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
-        assert!(
-            matches!(tp, 1 | 2 | 4 | 8),
-            "tp {tp} is not a world this catalog ships"
-        );
+    fn new(banks: Dtype, expert_banks: Dtype, kv: Dtype, d: Dims) -> Model {
         assert!(
             d.head_dim.is_multiple_of(4),
             "the 2-D rope splits a head into two even blocks; {} is not a multiple of 4",
@@ -269,14 +264,10 @@ impl Model {
             d.head_hidden.is_multiple_of(GN_GROUPS) && d.hidden.is_multiple_of(GN_GROUPS),
             "the image head group-norms {GN_GROUPS} ways"
         );
-        let q_heads = d.q_heads / tp;
-        let kv_heads = d.kv_heads / tp;
-        let moe_inter = d.moe_inter / tp;
-        let shared_inter = d.shared_inter / tp;
-        assert!(
-            q_heads > 0 && kv_heads > 0 && moe_inter > 0,
-            "tp {tp} cuts this row past its heads and experts"
-        );
+        let q_heads = d.q_heads;
+        let kv_heads = d.kv_heads;
+        let moe_inter = d.moe_inter;
+        let shared_inter = d.shared_inter;
 
         let dense = crate::dense(banks);
         let hidden = u64::from(d.hidden);
@@ -321,7 +312,6 @@ impl Model {
 
         let hw = d.head_hidden;
         Model {
-            tp,
             banks,
             expert_banks,
             kv_dtype: kv,

@@ -5,7 +5,6 @@ use crate::drafter::dflash::{self, DFlash};
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
-    pub tp: u32,
 
     pub q_heads: u32,
     pub kv_heads: u32,
@@ -117,8 +116,8 @@ pub const GPTOSS_20B_DFLASH: dflash::Head = dflash::Head {
 };
 
 impl Model {
-    pub fn b20_dflash(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
-        let mut m = Model::b20(w, experts, kv, tp);
+    pub fn b20_dflash(w: Dtype, experts: Dtype, kv: Dtype) -> Model {
+        let mut m = Model::b20(w, experts, kv);
         let dense = crate::dense(w);
         m.dflash = Some(DFlash::declare(
             &GPTOSS_20B_DFLASH,
@@ -129,25 +128,24 @@ impl Model {
                 norm_eps: m.final_norm_eps,
                 weights: w,
                 dense,
-                tp,
             },
         ));
         m
     }
 
-    pub fn b20(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, experts, kv, tp, Model::b20_dims())
+    pub fn b20(w: Dtype, experts: Dtype, kv: Dtype) -> Model {
+        Model::new(w, experts, kv, Model::b20_dims())
     }
 
     /// The five-layer, sixteen-expert carve of gpt-oss-20b that
     /// `scripts/bench/shrink_checkpoint.py --layers 0-4 --experts 16` writes:
     /// every width is the 20B's, so every kernel sees production shapes on a
     /// single small GPU. The same convention as `qwen_3::Model::a3b_mini`.
-    pub fn b20_mini(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn b20_mini(w: Dtype, experts: Dtype, kv: Dtype) -> Model {
         let mut d = Model::b20_dims();
         d.layers = 5;
         d.experts = 16;
-        Model::new(w, experts, kv, tp, d)
+        Model::new(w, experts, kv, d)
     }
 
     fn b20_dims() -> Dims {
@@ -174,12 +172,11 @@ impl Model {
         }
     }
 
-    pub fn b120(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn b120(w: Dtype, experts: Dtype, kv: Dtype) -> Model {
         Model::new(
             w,
             experts,
             kv,
-            tp,
             Dims {
                 hidden: 2880,
                 layers: 36,
@@ -204,14 +201,10 @@ impl Model {
         )
     }
 
-    fn new(weights: Dtype, experts: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
-        assert!(
-            matches!(tp, 1 | 2 | 4 | 8),
-            "tp {tp} is not a world this catalog ships"
-        );
-        let q_heads = d.q_heads / tp;
-        let kv_heads = d.kv_heads / tp;
-        let inter = d.inter / tp;
+    fn new(weights: Dtype, experts: Dtype, kv: Dtype, d: Dims) -> Model {
+        let q_heads = d.q_heads;
+        let kv_heads = d.kv_heads;
+        let inter = d.inter;
 
         let dense = crate::dense(weights);
         let router = match weights {
@@ -298,7 +291,6 @@ impl Model {
         Model {
             hidden: d.hidden,
             vocab: d.vocab,
-            tp,
             q_heads,
             kv_heads,
             adapters: ADAPTERS,
@@ -308,11 +300,7 @@ impl Model {
             embed: Weight::sym("embed", [d.vocab as u64, hidden], weights),
             head: {
                 let banded = std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
-                let rows = if banded {
-                    u64::from(d.vocab / tp)
-                } else {
-                    u64::from(d.vocab)
-                };
+                let rows = u64::from(d.vocab);
                 let bank = Weight::sym("lm_head", [rows, hidden], weights);
                 if banded { bank.packed([rows]) } else { bank }
             },

@@ -74,7 +74,7 @@ impl Model {
         platform: Platform,
         layout: Layout,
     ) -> Result<ModelContract, Error> {
-        let mut b = Builder::new(src, self.tp, platform);
+        let mut b = Builder::new(src, 1, platform);
         dit(&mut b, src, &self.dit, &self.dims, layout)?;
         if let Some(te) = &self.te {
             text_encoder(&mut b, te, layout)?;

@@ -3,7 +3,6 @@ use poem_dsl::{Dtype, Weight};
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
-    pub tp: u32,
 
     pub act: Dtype,
 
@@ -255,28 +254,21 @@ struct Dims {
 }
 
 impl Model {
-    pub fn flash(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, experts, None, false, kv, tp, Model::flash_dims())
+    pub fn flash(w: Dtype, experts: Dtype, kv: Dtype) -> Model {
+        Model::new(w, experts, None, false, kv, Model::flash_dims())
     }
 
-    pub fn flash_vision(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, experts, None, true, kv, tp, Model::flash_dims())
+    pub fn flash_vision(w: Dtype, experts: Dtype, kv: Dtype) -> Model {
+        Model::new(w, experts, None, true, kv, Model::flash_dims())
     }
 
-    pub fn flash_mtp_vision(
-        w: Dtype,
-        experts: Dtype,
-        head_experts: Dtype,
-        kv: Dtype,
-        tp: u32,
-    ) -> Model {
+    pub fn flash_mtp_vision(w: Dtype, experts: Dtype, head_experts: Dtype, kv: Dtype) -> Model {
         Model::new(
             w,
             experts,
             Some(head_experts),
             true,
             kv,
-            tp,
             Model::flash_dims(),
         )
     }
@@ -285,29 +277,21 @@ impl Model {
     /// `experts` routed experts (top-k unchanged): a performance delegate cut
     /// by `scripts/bench/shrink_checkpoint.py` (`glm5_next_mlx`). Eight layers
     /// hold every layer kind: three dense KDA, DSA + MoE, three KDA + MoE, DSA.
-    pub fn flash_mini(
-        layers: u32,
-        experts: u32,
-        w: Dtype,
-        bank: Dtype,
-        kv: Dtype,
-        tp: u32,
-    ) -> Model {
+    pub fn flash_mini(layers: u32, experts: u32, w: Dtype, bank: Dtype, kv: Dtype) -> Model {
         let mut d = Model::flash_dims();
         d.layers = layers;
         d.moe.experts = experts;
         d.moe.top_k = d.moe.top_k.min(experts);
-        Model::new(w, bank, None, false, kv, tp, d)
+        Model::new(w, bank, None, false, kv, d)
     }
 
-    pub fn flash_mtp(w: Dtype, experts: Dtype, head_experts: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn flash_mtp(w: Dtype, experts: Dtype, head_experts: Dtype, kv: Dtype) -> Model {
         Model::new(
             w,
             experts,
             Some(head_experts),
             false,
             kv,
-            tp,
             Model::flash_dims(),
         )
     }
@@ -362,20 +346,15 @@ impl Model {
         draft: Option<Dtype>,
         vision: bool,
         kv: Dtype,
-        tp: u32,
         d: Dims,
     ) -> Model {
-        assert!(
-            matches!(tp, 1 | 2 | 4 | 8),
-            "tp {tp} is not a world this catalog ships"
-        );
         let dense = crate::dense(weights);
 
-        let mla_heads = d.mla.heads / tp;
-        let kda_heads = d.kda.heads / tp;
-        let dense_inter = d.dense_inter / tp;
-        let moe_inter = d.moe.inter / tp;
-        let shared_inter = d.moe.shared_inter / tp;
+        let mla_heads = d.mla.heads;
+        let kda_heads = d.kda.heads;
+        let dense_inter = d.dense_inter;
+        let moe_inter = d.moe.inter;
+        let shared_inter = d.moe.shared_inter;
 
         let hidden = d.hidden as u64;
         let streams = d.streams as u64;
@@ -592,7 +571,6 @@ impl Model {
         Model {
             hidden: d.hidden,
             vocab: d.vocab,
-            tp,
             act: dense,
             heads: mla_heads,
             kv_lora_rank: a.kv_lora_rank,

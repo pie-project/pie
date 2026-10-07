@@ -247,7 +247,6 @@ impl TextEncoder {
 }
 
 pub struct Model {
-    pub tp: u32,
     pub banks: Dtype,
     pub kv: Dtype,
     pub dims: Dims,
@@ -259,10 +258,9 @@ pub struct Model {
 
 impl Model {
     #[must_use]
-    pub fn turbo(banks: Dtype, tp: u32) -> Model {
+    pub fn turbo(banks: Dtype) -> Model {
         Model::new(
             banks,
-            tp,
             Dims::turbo(),
             Some(TextEncoder::qwen3_4b(banks)),
             Some(super::vae::Vae::flux(Dtype::Bf16)),
@@ -271,22 +269,17 @@ impl Model {
     }
 
     #[must_use]
-    pub fn mini(banks: Dtype, tp: u32) -> Model {
-        Model::new(banks, tp, Dims::mini(), None, None, 3.0)
+    pub fn mini(banks: Dtype) -> Model {
+        Model::new(banks, Dims::mini(), None, None, 3.0)
     }
 
     fn new(
         banks: Dtype,
-        tp: u32,
         d: Dims,
         te: Option<TextEncoder>,
         vae: Option<super::vae::Vae>,
         shift: f32,
     ) -> Model {
-        assert_eq!(
-            tp, 1,
-            "this text ships one-rank rows; tp {tp} is not a world it states"
-        );
         assert_eq!(
             d.rope_dims.iter().sum::<u32>(),
             d.head_dim,
@@ -320,7 +313,6 @@ impl Model {
             final_linear: Linear::at("dit.final", PATCH_FEATURES, dim, banks),
         };
         Model {
-            tp,
             banks,
             kv: Dtype::Bf16,
             dims: d,

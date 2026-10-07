@@ -15,7 +15,7 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        let mut b = Builder::new(src, self.tp, platform);
+        let mut b = Builder::new(src, 1, platform);
         dit(&mut b, src, &self.dit, &self.dims)?;
         connector(&mut b, &self.connectors.0, "video", self.dims.caption)?;
         connector(&mut b, &self.connectors.1, "audio", self.dims.caption)?;
@@ -34,7 +34,7 @@ impl Model {
             name: "vae".to_string(),
             detail: "this row declares no VAE".to_string(),
         })?;
-        let mut b = Builder::new(src, self.tp, platform);
+        let mut b = Builder::new(src, 1, platform);
         vae(&mut b, src, v)?;
         Ok(b.build())
     }

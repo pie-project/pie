@@ -71,11 +71,6 @@ impl ForwardHybrid for Model {
         for (_, w) in inputs.walk_layers(&m.layers) {
             let x = ops::elemwise::rmsnorm(&y, &w.attn_norm, w.attn_norm_eps);
             let o = latent_attention(&x, &inputs, &plan, m, &w.attn);
-            let o = if m.tp > 1 {
-                ops::collective::all_reduce(&o)
-            } else {
-                o
-            };
             let o = {
                 let (adapted, _) = o.split(&Facts::has_adapter());
                 let (px, _) = x.split(&Facts::has_adapter());
@@ -128,22 +123,12 @@ impl ForwardHybrid for Model {
                     }
                 }
             };
-            let f = if m.tp > 1 {
-                ops::collective::all_reduce(&f)
-            } else {
-                f
-            };
             y = ops::elemwise::residual_add(&f, &y);
         }
 
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.final_norm_eps);
         let x = ops::layout::gather_rows(&x, &inputs.readout_rows());
-        let logits = ops::linear::lm_head(&x, &m.head);
-        if m.head.dim(0) < u64::from(m.vocab) {
-            ops::collective::all_gather(&logits, m.tp)
-        } else {
-            logits
-        }
+        ops::linear::lm_head(&x, &m.head)
     }
 }
 

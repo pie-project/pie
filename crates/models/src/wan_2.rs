@@ -19,7 +19,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::ti2v_5b(Dtype::Bf16, tp),
+            || Model::ti2v_5b(Dtype::Bf16),
         ),
         (
             "wan22-ti2v-5b",
@@ -29,7 +29,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::ti2v_5b(Dtype::U4g64, tp),
+            || Model::ti2v_5b(Dtype::U4g64),
         ),
         (
             "wan22-mini-d128",
@@ -39,7 +39,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::mini_d128(Dtype::Bf16, tp),
+            || Model::mini_d128(Dtype::Bf16),
         ),
         (
             "wan22-mini-nano",
@@ -49,14 +49,14 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::mini_nano(Dtype::Bf16, tp),
+            || Model::mini_nano(Dtype::Bf16),
         ),
     ];
     for row in &mut rows {
         let model = match row.recipe.text {
-            "wan22-ti2v-5b" => Model::ti2v_5b(Dtype::Bf16, 1),
-            "wan22-mini-d128" => Model::mini_d128(Dtype::Bf16, 1),
-            "wan22-mini-nano" => Model::mini_nano(Dtype::Bf16, 1),
+            "wan22-ti2v-5b" => Model::ti2v_5b(Dtype::Bf16),
+            "wan22-mini-d128" => Model::mini_d128(Dtype::Bf16),
+            "wan22-mini-nano" => Model::mini_nano(Dtype::Bf16),
             other => unreachable!("no wan_2 row is called `{other}`"),
         };
         row.generative = Some(model.generative());

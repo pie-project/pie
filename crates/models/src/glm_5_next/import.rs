@@ -103,7 +103,7 @@ impl Model {
         new: &str,
     ) -> Result<ModelContract, Error> {
         let mut b = Land {
-            b: Builder::new(src, self.tp, platform),
+            b: Builder::new(src, 1, platform),
             from,
         };
         b.read(

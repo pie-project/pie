@@ -244,7 +244,7 @@ fn each_stream_of_the_denoise_reading_classifies_into_its_own_class() {
         let plan = trace(sku, Platform::Cuda);
         let classes = poem_dsl::resolve_classes(&plan).expect("every merge resolves");
         let row = row(sku);
-        let codes = models::flux_2::model::Model::mini(Dtype::Bf16, 1).readings();
+        let codes = models::flux_2::model::Model::mini(Dtype::Bf16).readings();
         let denoise = if sku == KLEIN { 1 } else { codes.denoise };
 
         let mut seen = Vec::new();
@@ -264,12 +264,12 @@ fn each_stream_of_the_denoise_reading_classifies_into_its_own_class() {
             "{sku}: two streams share a class: {seen:?}"
         );
     }
-    let mini = models::flux_2::model::Model::mini(Dtype::Bf16, 1).readings();
+    let mini = models::flux_2::model::Model::mini(Dtype::Bf16).readings();
     assert_eq!(
         (mini.text, mini.denoise, mini.vae_decode, mini.vae_encode),
         (None, 0, None, None)
     );
-    let klein = models::flux_2::model::Model::klein_4b(Dtype::Bf16, 1).readings();
+    let klein = models::flux_2::model::Model::klein_4b(Dtype::Bf16).readings();
     assert_eq!(
         (
             klein.text,

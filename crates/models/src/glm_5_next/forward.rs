@@ -140,11 +140,6 @@ impl ForwardHybrid for Model {
                 Mixer::Mla(a) => mla_mixer(&x, &inputs, &plan, &positions, m, a, Arms::Split),
                 Mixer::Kda(k) => kda_mixer(&x, &inputs, k),
             };
-            let o = if m.tp > 1 {
-                ops::collective::all_reduce(&o)
-            } else {
-                o
-            };
             let o = {
                 let (adapted, _) = o.split(&Facts::has_adapter());
                 let (px, _) = x.split(&Facts::has_adapter());
@@ -156,11 +151,6 @@ impl ForwardHybrid for Model {
             let x = ops::elemwise::rmsnorm(&x, &w.mlp_norm, w.mlp_norm_eps);
             let hint = predict_next(&streams, m.layers.get(l as usize + 1), hy);
             let f = mlp(&x, &w.mlp, hint.as_ref());
-            let f = if m.tp > 1 {
-                ops::collective::all_reduce(&f)
-            } else {
-                f
-            };
             streams = ops::elemwise::hc_fold(&f, &streams, &post_mix, &comb_mix);
         }
 
@@ -196,19 +186,9 @@ impl ForwardHybrid for Model {
                 );
                 let x = ops::elemwise::rmsnorm(&fused, &mtp.mixer_norm, mtp.mixer_norm_eps);
                 let o = mla_mixer(&x, &input_mtp, &plan_mtp, &dpos, m, &mtp.attn, Arms::Whole);
-                let o = if m.tp > 1 {
-                    ops::collective::all_reduce(&o)
-                } else {
-                    o
-                };
                 let r = ops::elemwise::residual_add(&o, &fused);
                 let x = ops::elemwise::rmsnorm(&r, &mtp.mlp_norm, mtp.mlp_norm_eps);
                 let f = mlp(&x, &mtp.mlp, None);
-                let f = if m.tp > 1 {
-                    ops::collective::all_reduce(&f)
-                } else {
-                    f
-                };
                 let r = ops::elemwise::residual_add(&f, &r);
                 let read = ops::elemwise::rmsnorm(&r, &mtp.norm, mtp.norm_eps);
                 let draft = ops::linear::lm_head(&read, &m.head);

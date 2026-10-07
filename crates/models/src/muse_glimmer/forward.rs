@@ -160,11 +160,6 @@ impl ForwardHybrid for Model {
 
             let gate = ops::linear::matmul(&normed, &w.gate);
             let o = ops::linear::matmul(&ops::elemwise::gate_sigmoid_mul(&a, &gate), &w.o_proj);
-            let o = if m.tp > 1 {
-                ops::collective::all_reduce(&o)
-            } else {
-                o
-            };
             let o = {
                 let (adapted, _) = o.split(&Facts::has_adapter());
                 let (px, _) = normed.split(&Facts::has_adapter());
@@ -178,11 +173,6 @@ impl ForwardHybrid for Model {
             let mlp_in = ops::elemwise::rmsnorm_plus_one(&y, &w.pre_ffw_norm, w.pre_ffw_norm_eps);
             let act = ops::linear::mlp_swiglu(&ops::linear::matmul(&mlp_in, &w.gate_up), w.inter);
             let f = ops::linear::matmul(&act, &w.down);
-            let f = if m.tp > 1 {
-                ops::collective::all_reduce(&f)
-            } else {
-                f
-            };
             y = ops::elemwise::residual_add(
                 &ops::elemwise::rmsnorm_plus_one(&f, &w.post_ffw_norm, w.post_ffw_norm_eps),
                 &y,
@@ -192,11 +182,6 @@ impl ForwardHybrid for Model {
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.final_norm_eps) * m.output_multiplier;
         let x = ops::layout::gather_rows(&x, &inputs.readout_rows());
         let logits = ops::linear::lm_head(&x, &m.lm_head);
-        let logits = if m.lm_head.dim(0) < u64::from(m.vocab) {
-            ops::collective::all_gather(&logits, m.tp)
-        } else {
-            logits
-        };
         ops::attn::logit_softcap(&logits, m.softcap)
     }
 }

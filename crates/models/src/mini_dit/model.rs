@@ -80,9 +80,9 @@ pub struct SelfAttn {
 }
 
 impl SelfAttn {
-    fn at(prefix: &str, banks: Dtype, tp: u32) -> SelfAttn {
+    fn at(prefix: &str, banks: Dtype) -> SelfAttn {
         let dense = crate::dense(banks);
-        let mine = HIDDEN / tp;
+        let mine = HIDDEN;
         let seams = [u64::from(mine); 3];
         SelfAttn {
             qkv: Linear::at(&format!("{prefix}.qkv"), 3 * mine, HIDDEN, banks).packed(seams),
@@ -102,9 +102,9 @@ pub struct CrossAttn {
 }
 
 impl CrossAttn {
-    fn at(prefix: &str, banks: Dtype, tp: u32) -> CrossAttn {
+    fn at(prefix: &str, banks: Dtype) -> CrossAttn {
         let dense = crate::dense(banks);
-        let mine = HIDDEN / tp;
+        let mine = HIDDEN;
         CrossAttn {
             q: Linear::at(&format!("{prefix}.q"), mine, HIDDEN, banks).columns(),
             kv: Linear::at(&format!("{prefix}.kv"), 2 * mine, CONTEXT_WIDTH, banks)
@@ -122,9 +122,9 @@ pub struct Swiglu {
 }
 
 impl Swiglu {
-    fn at(prefix: &str, banks: Dtype, tp: u32) -> Swiglu {
+    fn at(prefix: &str, banks: Dtype) -> Swiglu {
         let name = format!("{prefix}.gate_up");
-        let mine = INTER / tp;
+        let mine = INTER;
         let seams = [u64::from(mine), u64::from(mine)];
         Swiglu {
             gate_up: Linear {
@@ -155,11 +155,11 @@ pub struct Side {
 }
 
 impl Side {
-    fn at(prefix: &str, banks: Dtype, tp: u32) -> Side {
+    fn at(prefix: &str, banks: Dtype) -> Side {
         Side {
             ada: Linear::at(&format!("{prefix}.ada"), MOD_SLICES * HIDDEN, HIDDEN, banks),
-            attn: SelfAttn::at(&format!("{prefix}.attn"), banks, tp),
-            mlp: Swiglu::at(&format!("{prefix}.mlp"), banks, tp),
+            attn: SelfAttn::at(&format!("{prefix}.attn"), banks),
+            mlp: Swiglu::at(&format!("{prefix}.mlp"), banks),
         }
     }
 }
@@ -180,7 +180,6 @@ pub struct Cross {
 }
 
 pub struct Model {
-    pub tp: u32,
     pub banks: Dtype,
     pub x_embed: Linear,
     pub single: Single,
@@ -193,33 +192,28 @@ pub struct Model {
 
 impl Model {
     #[must_use]
-    pub fn mini(banks: Dtype, tp: u32) -> Model {
-        assert!(
-            matches!(tp, 1 | 2 | 4),
-            "tp {tp} does not divide mini-dit's {HEADS} heads"
-        );
+    pub fn mini(banks: Dtype) -> Model {
         let dense = crate::dense(banks);
         Model {
-            tp,
             banks,
             x_embed: Linear::at("x_embed", HIDDEN, PATCH_FEATURES, banks),
             single: Single {
                 ada: Linear::at("single.ada", MOD_SLICES * HIDDEN, HIDDEN, banks),
-                attn: SelfAttn::at("single.attn", banks, tp),
-                mlp: Swiglu::at("single.mlp", banks, tp),
+                attn: SelfAttn::at("single.attn", banks),
+                mlp: Swiglu::at("single.mlp", banks),
             },
             double: Double {
-                img: Side::at("double.img", banks, tp),
-                txt: Side::at("double.txt", banks, tp),
+                img: Side::at("double.img", banks),
+                txt: Side::at("double.txt", banks),
             },
             cross: Cross {
                 mod_table: Weight::sym("cross.mod_table", [u64::from(MOD_SLICES * HIDDEN)], dense),
                 ada: Linear::at("cross.ada", MOD_SLICES * HIDDEN, HIDDEN, banks),
-                self_attn: SelfAttn::at("cross.self", banks, tp),
+                self_attn: SelfAttn::at("cross.self", banks),
                 norm: Weight::sym("cross.norm", [u64::from(HIDDEN)], dense),
                 norm_bias: Weight::sym("cross.norm.bias", [u64::from(HIDDEN)], dense),
-                cross: CrossAttn::at("cross.x", banks, tp),
-                mlp: Swiglu::at("cross.mlp", banks, tp),
+                cross: CrossAttn::at("cross.x", banks),
+                mlp: Swiglu::at("cross.mlp", banks),
             },
             final_ada: Linear::at("final.ada", 2 * HIDDEN, HIDDEN, banks),
             final_proj: Linear::at("final.proj", PATCH_FEATURES, HIDDEN, banks),

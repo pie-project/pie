@@ -29,12 +29,6 @@ pub const ROWS: &[Row] = &[
         arch: "deepseek_v4",
     },
     Row {
-        id: "dsv4-base-bf16-kv-bf16-tp2",
-        layers: 6,
-        vocab: 129_280,
-        arch: "deepseek_v4",
-    },
-    Row {
         id: "dsv4-flash-bf16-kv-bf16",
         layers: 43,
         vocab: 129_280,

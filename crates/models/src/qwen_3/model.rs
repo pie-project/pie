@@ -1142,7 +1142,6 @@ impl Model {
                     norm_eps: d.norm_eps,
                     weights: w,
                     dense,
-                    tp: 1,
                 },
             )
         });

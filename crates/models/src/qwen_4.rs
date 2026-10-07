@@ -19,7 +19,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38,
-            |tp: u32| Model::flash(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::flash(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen38-flash-next-full-mtp",
@@ -29,7 +29,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38,
-            |tp: u32| Model::flash_mix_mtp(Mix::MIXED_2BIT, Dtype::Bf16, tp),
+            || Model::flash_mix_mtp(Mix::MIXED_2BIT, Dtype::Bf16),
         ),
         (
             "qwen38-flash-next-full",
@@ -39,7 +39,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38,
-            |tp: u32| Model::flash_mix(Mix::MIXED_2BIT, Dtype::Bf16, tp),
+            || Model::flash_mix(Mix::MIXED_2BIT, Dtype::Bf16),
         ),
         (
             "qwen38-flash-next",
@@ -49,7 +49,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38,
-            |tp: u32| Model::flash_mini(Mix::MIXED_2BIT, Dtype::Bf16, tp),
+            || Model::flash_mini(Mix::MIXED_2BIT, Dtype::Bf16),
         ),
         (
             "qwen38-flash-next",
@@ -59,7 +59,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38,
-            |tp: u32| Model::flash(Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::flash(Dtype::Bf16, Dtype::Bf16),
         ),
         (
             "qwen38-flash-next-full-mtp-vision",
@@ -69,7 +69,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38_VISION,
-            |tp: u32| Model::flash_mix_mtp_vision(Mix::MIXED_2BIT, Dtype::Bf16, tp),
+            || Model::flash_mix_mtp_vision(Mix::MIXED_2BIT, Dtype::Bf16),
         ),
         (
             "qwen38-flash-next-full-vision",
@@ -79,7 +79,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38_VISION,
-            |tp: u32| Model::flash_mix_vision(Mix::MIXED_2BIT, Dtype::Bf16, tp),
+            || Model::flash_mix_vision(Mix::MIXED_2BIT, Dtype::Bf16),
         ),
     ]
 }

@@ -549,6 +549,6 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
     velocity
 }
 
-const _: () = assert!(Dims::h3(1).text_dim == TE_HIDDEN);
+const _: () = assert!(Dims::h3().text_dim == TE_HIDDEN);
 const _: () = assert!(TE_MAX_TOKENS > 0);
 const _: () = assert!(CONDITION_TIMESTEP > 0.0);

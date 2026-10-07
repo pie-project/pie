@@ -48,7 +48,6 @@ const REFUSED: &[Refusal] = &[
 ];
 
 const CANNOT_SERVE: &[(&str, &[&str])] = &[
-    ("dsv4-base-bf16-kv-bf16-tp2", &["collective.all_reduce"]),
     (
         "kimik3-mini-bf16-mxfp4-kv-bf16-tp2",
         &["collective.all_gather", "collective.all_reduce"],

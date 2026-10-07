@@ -139,7 +139,7 @@ fn fire(
     clip: [u32; 3],
     payload: &[f32],
 ) -> (Vec<f32>, [u32; 3], f64, f64) {
-    let model = Model::ltx_2_5(Dtype::Bf16, 1);
+    let model = Model::ltx_2_5(Dtype::Bf16);
     let src = checkpoint::file::diffusers::open(root)
         .unwrap_or_else(|why| panic!("{}: {why}", root.display()));
     let mut contract = model

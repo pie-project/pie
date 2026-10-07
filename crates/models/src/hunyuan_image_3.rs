@@ -19,7 +19,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::flagship(Dtype::Bf16, Dtype::U8g64, Dtype::Bf16, tp),
+            || Model::flagship(Dtype::Bf16, Dtype::U8g64, Dtype::Bf16),
         ),
         (
             "hunyuanimage3-80b-a13b",
@@ -29,7 +29,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::flagship(Dtype::Bf16, Dtype::U8g64, Dtype::Bf16, tp),
+            || Model::flagship(Dtype::Bf16, Dtype::U8g64, Dtype::Bf16),
         ),
         (
             "hunyuanimage3-80b-a13b",
@@ -39,7 +39,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::flagship(Dtype::Bf16, Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::flagship(Dtype::Bf16, Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "hunyuanimage3-mini",
@@ -49,15 +49,15 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::mini(Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::mini(Dtype::Bf16, Dtype::Bf16),
         ),
     ];
     for row in &mut rows {
         let model = match row.recipe.text {
             "hunyuanimage3-80b-a13b" => {
-                Model::flagship(Dtype::Bf16, row.recipe.weights[1], Dtype::Bf16, 1)
+                Model::flagship(Dtype::Bf16, row.recipe.weights[1], Dtype::Bf16)
             }
-            "hunyuanimage3-mini" => Model::mini(Dtype::Bf16, Dtype::Bf16, 1),
+            "hunyuanimage3-mini" => Model::mini(Dtype::Bf16, Dtype::Bf16),
             other => unreachable!("no hunyuan_image_3 row is called `{other}`"),
         };
         row.diffusion = Some(crate::Diffusion {

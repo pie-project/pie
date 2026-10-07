@@ -456,11 +456,6 @@ fn layer<'m>(
     } else {
         ops::linear::matmul(&o, &at.o_down)
     };
-    let o = if m.tp > 1 {
-        ops::collective::all_reduce(&o)
-    } else {
-        o
-    };
     let o = ops::linear::matmul(&o, &at.o_up);
     let o = {
         let (adapted, _) = o.split(&Facts::has_adapter());
@@ -475,11 +470,6 @@ fn layer<'m>(
         None => x,
     };
     let f = mlp(&x, ids, &w.mlp, &streams, next, hy);
-    let f = if m.tp > 1 {
-        ops::collective::all_reduce(&f)
-    } else {
-        f
-    };
     ops::elemwise::hc_fold(&f, &streams, &post_mix, &comb_mix)
 }
 

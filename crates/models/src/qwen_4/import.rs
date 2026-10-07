@@ -85,7 +85,7 @@ impl Model {
         platform: Platform,
         layout: Layout,
     ) -> Result<ModelContract, Error> {
-        let mut b = Builder::new(src, self.tp, platform);
+        let mut b = Builder::new(src, 1, platform);
         for read in self.reads(layout) {
             match read {
                 Read::One(w, name) => b.read(w, name)?,

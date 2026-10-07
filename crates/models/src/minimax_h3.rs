@@ -19,7 +19,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::fl2va(Dtype::Bf16, tp),
+            || Model::fl2va(Dtype::Bf16),
         ),
         (
             "minimax-h3-fl2va",
@@ -29,7 +29,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::fl2va(Dtype::Bf16, tp),
+            || Model::fl2va(Dtype::Bf16),
         ),
         (
             "minimax-h3-fl2va",
@@ -39,7 +39,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::fl2va(Dtype::Bf16, tp),
+            || Model::fl2va(Dtype::Bf16),
         ),
         (
             "minimax-h3-mini",
@@ -49,13 +49,13 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::mini(Dtype::Bf16, tp),
+            || Model::mini(Dtype::Bf16),
         ),
     ];
     for row in &mut rows {
         let model = match row.recipe.text {
-            "minimax-h3-fl2va" => Model::fl2va(Dtype::Bf16, row.recipe.tp),
-            "minimax-h3-mini" => Model::mini(Dtype::Bf16, row.recipe.tp),
+            "minimax-h3-fl2va" => Model::fl2va(Dtype::Bf16),
+            "minimax-h3-mini" => Model::mini(Dtype::Bf16),
             other => unreachable!("no minimax_h3 row is called `{other}`"),
         };
         row.generative = Some(model.generative());

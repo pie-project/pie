@@ -38,7 +38,7 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        let mut b = Builder::new(src, self.tp, platform);
+        let mut b = Builder::new(src, 1, platform);
         b.read(&self.embed, HF_EMBED)?;
         b.read(&self.final_norm, "language_model.model.norm.weight")?;
         b.read(&self.head, "language_model.lm_head.weight")?;
@@ -151,7 +151,7 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        let mut b = Builder::new(src, self.tp, platform);
+        let mut b = Builder::new(src, 1, platform);
         b.read(&self.embed, GGUF_EMBED)?;
         b.read(&self.final_norm, "output_norm.weight")?;
         b.read(&self.head, "output.weight")?;

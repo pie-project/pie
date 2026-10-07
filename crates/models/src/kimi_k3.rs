@@ -17,7 +17,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct3,
             &tokenizer::CONTRACT3,
-            |tp: u32| Model::k3_mini(8, 32, 4, Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, tp),
+            || Model::k3_mini(8, 32, 4, Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16),
         ),
         (
             "kimik3-mini",
@@ -27,7 +27,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct3,
             &tokenizer::CONTRACT3,
-            |tp: u32| Model::k3_mini(8, 32, 4, Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, tp),
+            || Model::k3_mini(8, 32, 4, Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16),
         ),
         (
             "kimik3",
@@ -37,7 +37,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::k3(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, tp),
+            || Model::k3(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16),
         ),
         (
             "kimik3",
@@ -47,7 +47,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::k3(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, tp),
+            || Model::k3(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16),
         ),
     ]
 }

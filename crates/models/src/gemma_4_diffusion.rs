@@ -10,7 +10,7 @@ use crate::gemma_4::{template, tokenizer};
 pub const ARCH: &str = "diffusion_gemma";
 
 pub fn skus() -> Vec<crate::Sku> {
-    let mut rows = crate::split_skus![
+    let mut rows = crate::skus![
         (
             "diffusiongemma-26b-a4b",
             1,

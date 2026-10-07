@@ -107,7 +107,7 @@ fn the_miniature_reads_the_golden_and_rearranges_where_the_study_says() {
         "a constant reads no checkpoint tensor"
     );
 
-    let model = Model::mini(Dtype::Bf16, Dtype::Bf16, 1);
+    let model = Model::mini(Dtype::Bf16, Dtype::Bf16);
     assert_eq!(model.dims, d);
     assert_eq!(model.layers.len(), layers);
 }

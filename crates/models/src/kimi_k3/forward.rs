@@ -113,11 +113,6 @@ impl ForwardHybrid for Model {
                 Mixer::Mla(a) => mla_mixer(&x, &inputs, &plan, m, a),
                 Mixer::Kda(k) => kda_mixer(&x, &inputs, k),
             };
-            let o = if m.tp > 1 {
-                ops::collective::all_reduce(&o)
-            } else {
-                o
-            };
             let o = {
                 let (adapted, _) = o.split(&Facts::has_adapter());
                 let (px, _) = x.split(&Facts::has_adapter());
@@ -222,11 +217,6 @@ impl ForwardHybrid for Model {
                     }
                 }
             };
-            let f = if m.tp > 1 {
-                ops::collective::all_reduce(&f)
-            } else {
-                f
-            };
             y = ops::elemwise::residual_add(&f, &y);
         }
 
@@ -238,12 +228,7 @@ impl ForwardHybrid for Model {
         };
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.final_norm_eps);
         let x = ops::layout::gather_rows(&x, &inputs.readout_rows());
-        let logits = ops::linear::lm_head(&x, &m.head);
-        if m.head.dim(0) < u64::from(m.vocab) {
-            ops::collective::all_gather(&logits, m.tp)
-        } else {
-            logits
-        }
+        ops::linear::lm_head(&x, &m.head)
     }
 }
 

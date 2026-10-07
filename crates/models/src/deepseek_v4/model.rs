@@ -4,7 +4,6 @@ use poem_dsl::{Dtype, Weight};
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
-    pub tp: u32,
 
     pub act: Dtype,
 
@@ -487,12 +486,11 @@ struct Dims41 {
 }
 
 impl Model {
-    pub fn base(w: Dtype, act: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn base(w: Dtype, act: Dtype, kv: Dtype) -> Model {
         Model::new(
             w,
             act,
             kv,
-            tp,
             Dims {
                 hidden: 2048,
                 layers: 6,
@@ -522,41 +520,34 @@ impl Model {
         )
     }
 
-    pub fn flash(w: Dtype, act: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::flash_mixed(w, Routed::uniform(w), act, kv, tp)
+    pub fn flash(w: Dtype, act: Dtype, kv: Dtype) -> Model {
+        Model::flash_mixed(w, Routed::uniform(w), act, kv)
     }
 
-    pub fn flash_mixed(w: Dtype, routed: Routed, act: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new_flash(
-            w,
-            routed,
-            act,
-            kv,
-            tp,
-            Model::flash_dims(43, &FLASH_RATIOS, 3),
-        )
+    pub fn flash_mixed(w: Dtype, routed: Routed, act: Dtype, kv: Dtype) -> Model {
+        Model::new_flash(w, routed, act, kv, Model::flash_dims(43, &FLASH_RATIOS, 3))
     }
 
-    pub fn flash_mixed_mtp(w: Dtype, routed: Routed, act: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn flash_mixed_mtp(w: Dtype, routed: Routed, act: Dtype, kv: Dtype) -> Model {
         let mut d = Model::flash_dims(43, &FLASH_RATIOS, 3);
         d.draft = true;
-        Model::new_flash(w, routed, act, kv, tp, d)
+        Model::new_flash(w, routed, act, kv, d)
     }
 
-    pub fn flash_mini_mtp(w: Dtype, routed: Routed, act: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn flash_mini_mtp(w: Dtype, routed: Routed, act: Dtype, kv: Dtype) -> Model {
         let mut d = Model::flash_dims(5, &FLASH_MICRO_RATIOS, 3);
         d.experts = 16;
         d.draft = true;
-        Model::new_flash(w, routed, act, kv, tp, d)
+        Model::new_flash(w, routed, act, kv, d)
     }
 
-    pub fn flash_mini(w: Dtype, routed: Routed, act: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn flash_mini(w: Dtype, routed: Routed, act: Dtype, kv: Dtype) -> Model {
         let mut d = Model::flash_dims(5, &FLASH_MICRO_RATIOS, 3);
         d.experts = 16;
-        Model::new_flash(w, routed, act, kv, tp, d)
+        Model::new_flash(w, routed, act, kv, d)
     }
 
-    pub fn flash_micro(w: Dtype, act: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn flash_micro(w: Dtype, act: Dtype, kv: Dtype) -> Model {
         let mut d = Model::flash_dims(5, &FLASH_MICRO_RATIOS, 3);
         d.hidden = 256;
         d.heads = 8;
@@ -573,20 +564,20 @@ impl Model {
         d.shared_inter = 64;
         d.experts = 16;
         d.vocab = 512;
-        Model::new_flash(w, Routed::uniform(w), act, kv, tp, d)
+        Model::new_flash(w, Routed::uniform(w), act, kv, d)
     }
 
     /// DeepSeek-V4.1-Flash as released: 40 layers, 384 routed experts.
-    pub fn flash41(w: Dtype, routed: Routed, act: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new_flash41(w, routed, act, kv, tp, Model::dims41(V41_PLAN))
+    pub fn flash41(w: Dtype, routed: Routed, act: Dtype, kv: Dtype) -> Model {
+        Model::new_flash41(w, routed, act, kv, Model::dims41(V41_PLAN))
     }
 
     /// The eight-layer, sixteen-expert miniature of DeepSeek-V4.1-Flash.
-    pub fn flash41_mini(w: Dtype, routed: Routed, act: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn flash41_mini(w: Dtype, routed: Routed, act: Dtype, kv: Dtype) -> Model {
         let mut d = Model::dims41(V41_MINI_PLAN);
         d.experts = V41_MINI_EXPERTS;
         d.engram.base_vocab = V41_MINI_ENGRAM_BASE;
-        Model::new_flash41(w, routed, act, kv, tp, d)
+        Model::new_flash41(w, routed, act, kv, d)
     }
 
     fn dims41(plan: Plan41) -> Dims41 {
@@ -679,15 +670,10 @@ impl Model {
         }
     }
 
-    fn new(weights: Dtype, act: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
-        assert!(
-            matches!(tp, 1 | 2 | 4 | 8),
-            "tp {tp} is not a world this catalog ships"
-        );
-
-        let heads = d.heads / tp;
-        let dense_inter = d.dense_inter / tp;
-        let moe_inter = d.moe_inter / tp;
+    fn new(weights: Dtype, act: Dtype, kv: Dtype, d: Dims) -> Model {
+        let heads = d.heads;
+        let dense_inter = d.dense_inter;
+        let moe_inter = d.moe_inter;
 
         let hidden = d.hidden as u64;
         let streams = d.streams as u64;
@@ -792,7 +778,6 @@ impl Model {
         Model {
             hidden: d.hidden,
             vocab: d.vocab,
-            tp,
             act,
             heads,
             head_dim: d.head_dim,
@@ -818,24 +803,12 @@ impl Model {
         }
     }
 
-    fn new_flash(
-        weights: Dtype,
-        routed: Routed,
-        act: Dtype,
-        kv: Dtype,
-        tp: u32,
-        d: FlashDims,
-    ) -> Model {
-        assert!(
-            matches!(tp, 1 | 2 | 4 | 8),
-            "tp {tp} is not a world this catalog ships"
-        );
-
+    fn new_flash(weights: Dtype, routed: Routed, act: Dtype, kv: Dtype, d: FlashDims) -> Model {
         let dense = crate::dense(weights);
 
-        let heads = d.heads / tp;
-        let moe_inter = d.moe_inter / tp;
-        let shared_inter = d.shared_inter / tp;
+        let heads = d.heads;
+        let moe_inter = d.moe_inter;
+        let shared_inter = d.shared_inter;
 
         let hidden = d.hidden as u64;
         let streams = d.streams as u64;
@@ -1085,7 +1058,6 @@ impl Model {
         Model {
             hidden: d.hidden,
             vocab: d.vocab,
-            tp,
             act,
             heads,
             head_dim: d.head_dim,
@@ -1115,18 +1087,7 @@ impl Model {
         }
     }
 
-    fn new_flash41(
-        weights: Dtype,
-        routed: Routed,
-        act: Dtype,
-        kv: Dtype,
-        tp: u32,
-        d: Dims41,
-    ) -> Model {
-        assert!(
-            matches!(tp, 1 | 2 | 4 | 8),
-            "tp {tp} is not a world this catalog ships"
-        );
+    fn new_flash41(weights: Dtype, routed: Routed, act: Dtype, kv: Dtype, d: Dims41) -> Model {
         let plan = d.plan;
         assert_eq!(
             plan.ratios.len(),
@@ -1136,9 +1097,9 @@ impl Model {
 
         let dense = crate::dense(weights);
 
-        let heads = d.heads / tp;
-        let moe_inter = d.moe_inter / tp;
-        let shared_inter = d.shared_inter / tp;
+        let heads = d.heads;
+        let moe_inter = d.moe_inter;
+        let shared_inter = d.shared_inter;
 
         let hidden = d.hidden as u64;
         let streams = d.streams as u64;
@@ -1344,7 +1305,6 @@ impl Model {
         Model {
             hidden: d.hidden,
             vocab: d.vocab,
-            tp,
             act,
             heads,
             head_dim: d.head_dim,
@@ -1500,7 +1460,6 @@ mod tests {
             Routed::split(Dtype::Mxfp4),
             Dtype::Bf16,
             Dtype::Bf16,
-            1,
         );
         let at = |l: usize| &m.layers[l].attn;
         assert_eq!(at(3).pool.as_ref().unwrap().entries, "pool.2");

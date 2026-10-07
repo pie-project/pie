@@ -710,7 +710,6 @@ impl Vae {
 }
 
 pub struct Model {
-    pub tp: u32,
     pub banks: Dtype,
     pub dims: Dims,
     pub dit: Dit,
@@ -721,10 +720,9 @@ pub struct Model {
 
 impl Model {
     #[must_use]
-    pub fn ti2v_5b(banks: Dtype, tp: u32) -> Model {
+    pub fn ti2v_5b(banks: Dtype) -> Model {
         Model::new(
             banks,
-            tp,
             Dims::ti2v_5b(),
             Some(TextEncoder::umt5_xxl(banks)),
             Some(Vae::wan22(Dtype::Bf16)),
@@ -733,27 +731,16 @@ impl Model {
     }
 
     #[must_use]
-    pub fn mini_d128(banks: Dtype, tp: u32) -> Model {
-        Model::new(banks, tp, Dims::mini_d128(), None, None, SHIFT_TI2V)
+    pub fn mini_d128(banks: Dtype) -> Model {
+        Model::new(banks, Dims::mini_d128(), None, None, SHIFT_TI2V)
     }
 
     #[must_use]
-    pub fn mini_nano(banks: Dtype, tp: u32) -> Model {
-        Model::new(banks, tp, Dims::mini_nano(), None, None, SHIFT_TI2V)
+    pub fn mini_nano(banks: Dtype) -> Model {
+        Model::new(banks, Dims::mini_nano(), None, None, SHIFT_TI2V)
     }
 
-    fn new(
-        banks: Dtype,
-        tp: u32,
-        d: Dims,
-        te: Option<TextEncoder>,
-        vae: Option<Vae>,
-        shift: f32,
-    ) -> Model {
-        assert_eq!(
-            tp, 1,
-            "this text ships one-rank rows; tp {tp} is not a world it states"
-        );
+    fn new(banks: Dtype, d: Dims, te: Option<TextEncoder>, vae: Option<Vae>, shift: f32) -> Model {
         assert_eq!(
             d.heads * d.head_dim,
             d.dim,
@@ -784,7 +771,6 @@ impl Model {
             proj_out: Linear::at("dit.proj_out", d.patch_out(), dim, banks),
         };
         Model {
-            tp,
             banks,
             dims: d,
             dit,

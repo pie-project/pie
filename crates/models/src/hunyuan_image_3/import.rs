@@ -11,7 +11,7 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        let mut b = Builder::new(src, self.tp, platform);
+        let mut b = Builder::new(src, 1, platform);
         let d = &self.dims;
 
         b.read(&self.embed, "model.wte.weight")?;

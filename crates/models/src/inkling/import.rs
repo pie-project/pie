@@ -21,7 +21,7 @@ impl Model {
         platform: Platform,
     ) -> Result<ModelContract, Error> {
         let at = |leaf: &str| format!("{TRUNK}{leaf}");
-        let mut b = Builder::new(src, self.tp, platform);
+        let mut b = Builder::new(src, 1, platform);
         b.read(&self.embed, at("embed.weight"))?;
         b.read(&self.embed_norm, at("embed_norm.weight"))?;
         b.read(&self.final_norm, at("norm.weight"))?;

@@ -18,7 +18,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::flash_mtp(Dtype::U8g64, Dtype::U2g64, Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::flash_mtp(Dtype::U8g64, Dtype::U2g64, Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "glm53-flash-mini",
@@ -28,7 +28,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::flash_mini(8, 32, Dtype::U4g64, Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::flash_mini(8, 32, Dtype::U4g64, Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "glm53-flash-mini",
@@ -38,7 +38,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::flash_mini(8, 32, Dtype::U4g64, Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::flash_mini(8, 32, Dtype::U4g64, Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "glm53-flash",
@@ -48,7 +48,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::flash(Dtype::U8g64, Dtype::U2g64, Dtype::Bf16, tp),
+            || Model::flash(Dtype::U8g64, Dtype::U2g64, Dtype::Bf16),
         ),
         (
             "glm53-flash-mtp-vision",
@@ -58,9 +58,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT_VISION,
-            |tp: u32| {
-                Model::flash_mtp_vision(Dtype::U8g64, Dtype::U2g64, Dtype::U4g64, Dtype::Bf16, tp)
-            },
+            || { Model::flash_mtp_vision(Dtype::U8g64, Dtype::U2g64, Dtype::U4g64, Dtype::Bf16) },
         ),
         (
             "glm53-flash-vision",
@@ -70,7 +68,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT_VISION,
-            |tp: u32| Model::flash_vision(Dtype::U8g64, Dtype::U2g64, Dtype::Bf16, tp),
+            || Model::flash_vision(Dtype::U8g64, Dtype::U2g64, Dtype::Bf16),
         ),
         (
             "glm53-flash-mtp-vision",
@@ -80,9 +78,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT_VISION,
-            |tp: u32| {
-                Model::flash_mtp_vision(Dtype::U4g64, Dtype::U2g64, Dtype::U4g64, Dtype::Bf16, tp)
-            },
+            || { Model::flash_mtp_vision(Dtype::U4g64, Dtype::U2g64, Dtype::U4g64, Dtype::Bf16) },
         ),
     ]
 }

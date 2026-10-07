@@ -5,7 +5,6 @@ pub use crate::qwen_3::model::{Attn, Gdn, Merger, Mlp, Tower, TowerBlock};
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
-    pub tp: u32,
 
     pub q_heads: u32,
     pub kv_heads: u32,
@@ -234,22 +233,22 @@ impl Mix {
 }
 
 impl Model {
-    pub fn flash(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::flash_mix(Mix::of(w), kv, tp)
+    pub fn flash(w: Dtype, kv: Dtype) -> Model {
+        Model::flash_mix(Mix::of(w), kv)
     }
 
-    pub fn flash_mix(mix: Mix, kv: Dtype, tp: u32) -> Model {
-        Model::new(mix, kv, tp, Model::flash_dims())
+    pub fn flash_mix(mix: Mix, kv: Dtype) -> Model {
+        Model::new(mix, kv, Model::flash_dims())
     }
 
-    pub fn flash_mini(mix: Mix, kv: Dtype, tp: u32) -> Model {
+    pub fn flash_mini(mix: Mix, kv: Dtype) -> Model {
         let mut d = Model::flash_dims();
         d.layers = 4;
         d.moe.experts = 16;
         let ple = d.ple.as_mut().expect("the flash dims carry a PLE");
         ple.base_vocab = 1_250_000;
         ple.split_parts = 8;
-        Model::new(mix, kv, tp, d)
+        Model::new(mix, kv, d)
     }
 
     fn flash_dims() -> Dims {
@@ -299,27 +298,27 @@ impl Model {
         }
     }
 
-    pub fn flash_mix_mtp(mix: Mix, kv: Dtype, tp: u32) -> Model {
+    pub fn flash_mix_mtp(mix: Mix, kv: Dtype) -> Model {
         let mut d = Model::flash_dims();
         d.draft = true;
-        Model::new(mix, kv, tp, d)
+        Model::new(mix, kv, d)
     }
 
-    pub fn flash_mix_vision(mix: Mix, kv: Dtype, tp: u32) -> Model {
+    pub fn flash_mix_vision(mix: Mix, kv: Dtype) -> Model {
         let mut d = Model::flash_dims();
         d.tower = Some(TowerDims::flash_next());
-        Model::new(mix, kv, tp, d)
+        Model::new(mix, kv, d)
     }
 
-    pub fn flash_mix_mtp_vision(mix: Mix, kv: Dtype, tp: u32) -> Model {
+    pub fn flash_mix_mtp_vision(mix: Mix, kv: Dtype) -> Model {
         let mut d = Model::flash_dims();
         d.draft = true;
         d.tower = Some(TowerDims::flash_next());
-        Model::new(mix, kv, tp, d)
+        Model::new(mix, kv, d)
     }
 
-    pub fn flash_micro(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(Mix::of(w), kv, tp, Model::flash_micro_dims())
+    pub fn flash_micro(w: Dtype, kv: Dtype) -> Model {
+        Model::new(Mix::of(w), kv, Model::flash_micro_dims())
     }
 
     fn flash_micro_dims() -> Dims {
@@ -369,8 +368,7 @@ impl Model {
         }
     }
 
-    fn new(mix: Mix, kv: Dtype, tp: u32, d: Dims) -> Model {
-        assert!(tp == 1, "the first qwen4 texts are whole-checkpoint texts");
+    fn new(mix: Mix, kv: Dtype, d: Dims) -> Model {
         let dense = mix.dense();
         let Mix {
             embed: embed_w,
@@ -383,8 +381,8 @@ impl Model {
         } = mix;
         let hidden = u64::from(d.hidden);
         let sh = u64::from(d.streams) * hidden;
-        let q_heads = d.q_heads / tp;
-        let kv_heads = d.kv_heads / tp;
+        let q_heads = d.q_heads;
+        let kv_heads = d.kv_heads;
         let attn_at = |l: u32| l % d.attn_every == d.attn_every - 1;
 
         let residual = |prefix: &str, inject: bool| Residual {
@@ -458,8 +456,8 @@ impl Model {
                     };
                     Mixer::Attn { attn, indexer }
                 } else {
-                    let k_heads = d.k_heads / tp;
-                    let v_heads = d.v_heads / tp;
+                    let k_heads = d.k_heads;
+                    let v_heads = d.v_heads;
                     let k_w = u64::from(k_heads) * u64::from(d.k_dim);
                     let v_w = u64::from(v_heads) * u64::from(d.v_dim);
                     let qkv = u64::from(Gdn::qkv_width(k_heads, v_heads, d.k_dim, d.v_dim));
@@ -484,8 +482,8 @@ impl Model {
                         delta_state: delta_name,
                     })
                 };
-                let inter = d.moe.inter / tp;
-                let shared_inter = d.moe.shared_inter / tp;
+                let inter = d.moe.inter;
+                let shared_inter = d.moe.shared_inter;
                 Layer {
                     mixer,
                     attn_res: residual(&n("attn_res"), true),
@@ -656,7 +654,6 @@ impl Model {
         Model {
             hidden: d.hidden,
             vocab: d.vocab,
-            tp,
             q_heads,
             kv_heads,
             head_dim: d.head_dim,
@@ -732,7 +729,7 @@ mod tests {
 
     #[test]
     fn the_hash_constants_are_the_checkpoints_own() {
-        let m = Model::flash(Dtype::Bf16, Dtype::Bf16, 1);
+        let m = Model::flash(Dtype::Bf16, Dtype::Bf16);
         let p = m.ple.expect("flash carries the PLE");
         assert_eq!(
             p.mults,

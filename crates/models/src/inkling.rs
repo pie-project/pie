@@ -17,7 +17,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::inkling,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::full(Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::full(Dtype::Bf16, Dtype::Bf16),
         ),
         (
             "inkling-mini-l7-e8",
@@ -27,7 +27,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::inkling,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::mini(7, 8, Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::mini(7, 8, Dtype::Bf16, Dtype::Bf16),
         ),
     ]
 }

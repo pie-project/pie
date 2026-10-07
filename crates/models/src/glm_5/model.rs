@@ -3,7 +3,6 @@ use poem_dsl::{Dtype, Weight};
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
-    pub tp: u32,
 
     pub heads: u32,
     pub kv_lora_rank: u32,
@@ -121,12 +120,11 @@ struct Dims {
 }
 
 impl Model {
-    pub fn a12b(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn a12b(w: Dtype, experts: Dtype, kv: Dtype) -> Model {
         Model::new(
             w,
             experts,
             kv,
-            tp,
             Dims {
                 hidden: 4096,
                 layers: 46,
@@ -156,15 +154,11 @@ impl Model {
         )
     }
 
-    fn new(w: Dtype, experts: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
-        assert!(
-            matches!(tp, 1 | 2 | 4 | 8),
-            "tp {tp} is not a world this catalog ships"
-        );
-        let heads = d.heads / tp;
-        let dense_inter = d.dense_inter / tp;
-        let moe_inter = d.moe.inter / tp;
-        let shared_inter = d.moe.shared_inter / tp;
+    fn new(w: Dtype, experts: Dtype, kv: Dtype, d: Dims) -> Model {
+        let heads = d.heads;
+        let dense_inter = d.dense_inter;
+        let moe_inter = d.moe.inter;
+        let shared_inter = d.moe.shared_inter;
 
         let hidden = d.hidden as u64;
         let q_lora = d.q_lora_rank as u64;
@@ -279,7 +273,6 @@ impl Model {
         Model {
             hidden: d.hidden,
             vocab: d.vocab,
-            tp,
             heads,
             kv_lora_rank: d.kv_lora_rank,
             adapters: ADAPTERS,
@@ -287,11 +280,7 @@ impl Model {
             embed: Weight::sym("embed", [d.vocab as u64, hidden], w),
             head: {
                 let banded = std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
-                let rows = if banded {
-                    u64::from(d.vocab / tp)
-                } else {
-                    u64::from(d.vocab)
-                };
+                let rows = u64::from(d.vocab);
                 let bank = Weight::sym("lm_head", [rows, hidden], w);
                 if banded { bank.packed([rows]) } else { bank }
             },

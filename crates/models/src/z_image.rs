@@ -20,7 +20,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::turbo(Dtype::Bf16, tp),
+            || Model::turbo(Dtype::Bf16),
         ),
         (
             "z-image-turbo",
@@ -30,7 +30,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::turbo(Dtype::U4g64, tp),
+            || Model::turbo(Dtype::U4g64),
         ),
         (
             "z-image-mini",
@@ -40,13 +40,13 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::instruct,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::mini(Dtype::Bf16, tp),
+            || Model::mini(Dtype::Bf16),
         ),
     ];
     for row in &mut rows {
         let model = match row.recipe.text {
-            "z-image-turbo" => Model::turbo(Dtype::Bf16, 1),
-            "z-image-mini" => Model::mini(Dtype::Bf16, 1),
+            "z-image-turbo" => Model::turbo(Dtype::Bf16),
+            "z-image-mini" => Model::mini(Dtype::Bf16),
             other => unreachable!("no z-image row is called `{other}`"),
         };
         row.generative = Some(model.generative());

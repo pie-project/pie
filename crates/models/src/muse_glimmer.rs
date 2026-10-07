@@ -17,7 +17,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::muse_glimmer,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::b30(Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::b30(Dtype::Bf16, Dtype::Bf16),
         ),
         (
             "muse-glimmer-30b",
@@ -27,7 +27,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::muse_glimmer,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::b30(Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::b30(Dtype::Bf16, Dtype::Bf16),
         ),
         (
             "muse-glimmer-30b",
@@ -37,7 +37,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::muse_glimmer,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::b30(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::b30(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "muse-glimmer-30b",
@@ -47,7 +47,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::muse_glimmer,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::b30(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::b30(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "muse-glimmer-30b-mini-l8",
@@ -57,7 +57,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::muse_glimmer,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::b30_mini(8, Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::b30_mini(8, Dtype::Bf16, Dtype::Bf16),
         ),
     ]
 }

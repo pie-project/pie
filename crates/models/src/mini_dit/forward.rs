@@ -280,9 +280,9 @@ impl ForwardHybrid for Model {
         );
         tap!(m, "b1.joint_attn_heads", &o);
         let (o_txt, o_img) = o.split(&Facts::text());
-        let ta = linear_reduced(m, &m.double.txt.attn.out, &o_txt);
+        let ta = linear(&m.double.txt.attn.out, &o_txt);
         tap!(m, "b1.txt_attn_out", &ta);
-        let ia = linear_reduced(m, &m.double.img.attn.out, &o_img);
+        let ia = linear(&m.double.img.attn.out, &o_img);
         tap!(m, "b1.img_attn_out", &ia);
         let txt = ops::elemwise::gated_residual_add(&txt, &txt_mod.1, &ta, Some(&lanes));
         tap!(m, "b1.txt_after_attn", &txt);
@@ -334,7 +334,7 @@ impl ForwardHybrid for Model {
             RMS_EPS,
         );
         tap!(m, "b2.cross_q", &cq);
-        let (ck, cv) = context_kv(m, &ctx_rows, &m.cross.cross);
+        let (ck, cv) = context_kv(&ctx_rows, &m.cross.cross);
         let ctx_perm = ctx.row_permutation();
         let ctx_csr = ctx.group_indptr();
         let ca = ops::attn::ragged(
@@ -349,7 +349,7 @@ impl ForwardHybrid for Model {
         );
         let ca = ops::layout::unpack_rows(&ca, &img_perm);
         tap!(m, "b2.cross_attn_heads", &ca);
-        let ca = linear_reduced(m, &m.cross.cross.out, &ca);
+        let ca = linear(&m.cross.cross.out, &ca);
         tap!(m, "b2.cross_attn_out", &ca);
         let x = ops::elemwise::residual_add(&ca, &x);
         tap!(m, "b2.x_after_cross", &x);
@@ -380,20 +380,6 @@ impl ForwardHybrid for Model {
 
 fn linear(w: &Linear, x: &Value) -> Value {
     ops::elemwise::add_bias(&w.bias, &ops::linear::matmul(x, &w.w))
-}
-
-fn linear_reduced(model: &Model, w: &Linear, x: &Value) -> Value {
-    let y = ops::linear::matmul(x, &w.w);
-    let y = if model.tp > 1 {
-        ops::collective::all_reduce(&y)
-    } else {
-        y
-    };
-    ops::elemwise::add_bias(&w.bias, &y)
-}
-
-fn local(model: &Model, width: u32) -> u32 {
-    width / model.tp
 }
 
 fn adaln6(m: &Value) -> (Value, Value, Value, Value) {
@@ -458,8 +444,8 @@ fn heads(
     tap_at(model, stem, "norm1_out", &h)?;
     let (q, k, v) = ops::layout::split_qkv(
         &linear(&attn.qkv, &h),
-        local(model, super::model::HIDDEN),
-        local(model, super::model::HIDDEN),
+        super::model::HIDDEN,
+        super::model::HIDDEN,
     );
     let hp = if stem == "b2" { "self_" } else { "" };
     tap_at(model, stem, &format!("{hp}q_raw"), &q)?;
@@ -522,7 +508,7 @@ fn attn_sublayer(
         ("attn_heads", "attn_out")
     };
     tap_at(model, stem, heads_key, &o)?;
-    let o = linear_reduced(model, &attn.out, &o);
+    let o = linear(&attn.out, &o);
     tap_at(model, stem, out_key, &o)?;
     Ok(ops::elemwise::gated_residual_add(x, gate, &o, Some(lanes)))
 }
@@ -549,14 +535,14 @@ fn mlp_sublayer(
         "norm2_out"
     };
     tap_at(model, stem, norm_key, &h)?;
-    let h = ops::linear::mlp_swiglu(&linear(&mlp.gate_up, &h), local(model, INTER));
-    let y = linear_reduced(model, &mlp.down, &h);
+    let h = ops::linear::mlp_swiglu(&linear(&mlp.gate_up, &h), INTER);
+    let y = linear(&mlp.down, &h);
     tap_at(model, stem, "mlp_out", &y)?;
     Ok(ops::elemwise::gated_residual_add(x, gate, &y, Some(lanes)))
 }
 
-fn context_kv(model: &Model, c: &Value, cross: &CrossAttn) -> (Value, Value) {
-    let (k, v) = ops::layout::split_rows(&linear(&cross.kv, c), local(model, super::model::HIDDEN));
+fn context_kv(c: &Value, cross: &CrossAttn) -> (Value, Value) {
+    let (k, v) = ops::layout::split_rows(&linear(&cross.kv, c), super::model::HIDDEN);
     (
         ops::elemwise::rmsnorm_per_head(&k, &cross.k_norm, HEAD_DIM, RMS_EPS),
         v,

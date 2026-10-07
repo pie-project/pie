@@ -32,7 +32,7 @@ fn trace(sku: &str, platform: Platform) -> Trace {
 
 fn dims(sku: &str) -> Dims {
     match sku {
-        FLAGSHIP => Dims::h3(1),
+        FLAGSHIP => Dims::h3(),
         MINI => Dims::mini(),
         other => panic!("no dims for `{other}`"),
     }
@@ -332,12 +332,12 @@ fn the_trunk_turns_three_neox_axes_and_the_refiner_turns_nothing() {
 fn the_modality_gather_is_three_weight_blocks_and_one_column_slice() {
     for sku in ROWS {
         let d = dims(sku);
-        let banks = model::Model::mini(Dtype::Bf16, 1);
+        let banks = model::Model::mini(Dtype::Bf16);
         let _ = banks;
         let m = if is_flagship(sku) {
-            model::Model::fl2va(Dtype::Bf16, 1)
+            model::Model::fl2va(Dtype::Bf16)
         } else {
-            model::Model::mini(Dtype::Bf16, 1)
+            model::Model::mini(Dtype::Bf16)
         };
         for (i, block) in m.dit.blocks.iter().enumerate() {
             assert_eq!(
@@ -411,9 +411,7 @@ fn every_row_bakes_on_every_platform() {
 fn the_sharded_worlds_trace_and_bake() {
     for tp in [2u32, 4] {
         let sku = format!("minimax-h3-fl2va-bf16-kv-bf16-tp{tp}");
-        let d = Dims::h3(tp);
-        assert_eq!(d.heads * tp, Dims::h3(1).heads, "tp {tp}: the heads divide");
-        assert_eq!(d.inter * tp, Dims::h3(1).inter, "tp {tp}: the MLP divides");
+        let d = Dims::h3();
         let plan = trace(&sku, Platform::Cuda);
         assert_eq!(
             plan.caches.len(),
@@ -422,11 +420,11 @@ fn the_sharded_worlds_trace_and_bake() {
         );
         poem_compiler::compile(&plan, &budget(), &poem_compiler::DeviceProfile::default())
             .unwrap_or_else(|why| panic!("`{sku}` does not bake: {why}"));
-        let m = model::Model::fl2va(Dtype::Bf16, tp);
+        let m = model::Model::fl2va(Dtype::Bf16);
         for bank in &m.dit.blocks[0].adaln {
             assert_eq!(
                 bank.w.shape,
-                vec![u64::from(Dims::h3(1).adaln_width()), u64::from(d.t_dim)],
+                vec![u64::from(Dims::h3().adaln_width()), u64::from(d.t_dim)],
                 "tp {tp}: the modulation bank is replicated, not cut"
             );
         }

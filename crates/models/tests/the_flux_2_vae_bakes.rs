@@ -368,7 +368,7 @@ fn the_import_reads_every_vae_tensor_of_the_real_snapshot_once() {
     };
     let src = checkpoint::file::diffusers::open(&root)
         .unwrap_or_else(|why| panic!("{}: {why}", root.display()));
-    let contract = model::Model::klein_4b(Dtype::Bf16, 1)
+    let contract = model::Model::klein_4b(Dtype::Bf16)
         .import_vae(&src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the VAE does not read this snapshot: {why}"));
 

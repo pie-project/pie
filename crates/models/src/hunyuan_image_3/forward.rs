@@ -273,11 +273,6 @@ fn trunk(all: &Input<Facts>, den: &Input<Facts>, m: &Model) -> Value {
             ops::attn::prefill(&pq, &plan_pre, pages, None, hd, m.kv_heads, sm),
         ]);
         let o = ops::linear::matmul(&a, &w.o_proj);
-        let o = if m.tp > 1 {
-            ops::collective::all_reduce(&o)
-        } else {
-            o
-        };
         y = if l == 0 {
             ops::elemwise::add(&o, &y)
         } else {
@@ -286,11 +281,6 @@ fn trunk(all: &Input<Facts>, den: &Input<Facts>, m: &Model) -> Value {
 
         let n = ops::elemwise::rmsnorm(&y, &w.mlp_norm, NORM_EPS);
         let f = moe(&n, w, m);
-        let f = if m.tp > 1 {
-            ops::collective::all_reduce(&f)
-        } else {
-            f
-        };
         y = ops::elemwise::residual_add(&f, &y);
     }
 

@@ -275,7 +275,6 @@ impl TextEncoder {
 }
 
 pub struct Model {
-    pub tp: u32,
     pub banks: Dtype,
     pub kv: Dtype,
     pub dims: Dims,
@@ -286,11 +285,10 @@ pub struct Model {
 
 impl Model {
     #[must_use]
-    pub fn klein_4b(banks: Dtype, tp: u32) -> Model {
+    pub fn klein_4b(banks: Dtype) -> Model {
         let d = Dims::klein_4b();
         Model::new(
             banks,
-            tp,
             d,
             Some(TextEncoder::qwen3_4b(&d, banks)),
             Some(super::vae::Vae::flux2(Dtype::Bf16)),
@@ -298,21 +296,11 @@ impl Model {
     }
 
     #[must_use]
-    pub fn mini(banks: Dtype, tp: u32) -> Model {
-        Model::new(banks, tp, Dims::mini(), None, None)
+    pub fn mini(banks: Dtype) -> Model {
+        Model::new(banks, Dims::mini(), None, None)
     }
 
-    fn new(
-        banks: Dtype,
-        tp: u32,
-        d: Dims,
-        te: Option<TextEncoder>,
-        vae: Option<super::vae::Vae>,
-    ) -> Model {
-        assert_eq!(
-            tp, 1,
-            "this text ships one-rank rows; tp {tp} is not a world it states"
-        );
+    fn new(banks: Dtype, d: Dims, te: Option<TextEncoder>, vae: Option<super::vae::Vae>) -> Model {
         assert_eq!(
             d.heads * HEAD_DIM,
             d.dim,
@@ -361,7 +349,6 @@ impl Model {
             proj_out: Weight::sym("dit.proj_out", [u64::from(IN_CHANNELS), dim], banks),
         };
         Model {
-            tp,
             banks,
             kv: Dtype::Bf16,
             dims: d,

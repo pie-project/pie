@@ -325,7 +325,7 @@ fn the_minimax_h3_import_reads_the_fl2va_index_every_case() {
 
 fn the_flagship_reads_a_synthetic_partition_at_the_counts_its_cuts_imply() {
     let dir = scratch();
-    let d = Dims::h3(1);
+    let d = Dims::h3();
     let mut tensors = prefixed("dit.", transformer(&d));
     tensors.extend(prefixed("te.", text_encoder(model::TE_DEPTH)));
     let src = synthetic(&dir, &tensors);
@@ -428,7 +428,7 @@ fn the_flagships_names_are_the_partitions_index() {
         eprintln!("skipping: the partition's transformer has no shard index yet");
         return;
     };
-    let d = Dims::h3(1);
+    let d = Dims::h3();
     let synthesized: BTreeSet<String> =
         transformer(&d).into_iter().map(|(name, ..)| name).collect();
     assert_eq!(

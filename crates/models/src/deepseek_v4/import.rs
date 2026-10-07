@@ -60,7 +60,7 @@ impl Model {
             });
         }
         let is_aux = |name: &str| name.starts_with("aux.");
-        let mut b = Builder::new(src, self.tp, platform);
+        let mut b = Builder::new(src, 1, platform);
         for read in self.mlx_reads() {
             match read {
                 Read::One(w, name) if is_aux(&name) => b.read(w, name)?,
@@ -92,7 +92,7 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        let mut b = Builder::new(src, self.tp, platform);
+        let mut b = Builder::new(src, 1, platform);
         for read in self.mlx_reads() {
             match read {
                 Read::One(w, name) => b.read(w, name)?,
@@ -219,7 +219,7 @@ impl Model {
         platform: Platform,
         mlx: bool,
     ) -> Result<ModelContract, Error> {
-        let mut b = Builder::new(src, self.tp, platform);
+        let mut b = Builder::new(src, 1, platform);
         b.read(
             &self.embed,
             if mlx {
@@ -417,7 +417,7 @@ impl Model {
                     .to_string(),
             });
         }
-        let mut b = Builder::new(src, self.tp, platform);
+        let mut b = Builder::new(src, 1, platform);
         b.read(&self.embed, "model.embed_tokens.weight")?;
         b.read(&self.final_norm, "model.norm.weight")?;
 
@@ -511,7 +511,7 @@ impl Model {
                     .to_string(),
             });
         }
-        let mut b = Builder::new(src, self.tp, platform);
+        let mut b = Builder::new(src, 1, platform);
         b.read(&self.embed, "token_embd.weight")?;
         b.read(&self.final_norm, "output_norm.weight")?;
 
@@ -799,7 +799,6 @@ mod tests {
             Routed::split(Dtype::Bf16),
             Dtype::Bf16,
             Dtype::Bf16,
-            1,
         );
         model.layers.truncate(1);
         model.token_map = None;

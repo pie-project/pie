@@ -5,7 +5,6 @@ pub use crate::adapter::Adapters;
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
-    pub tp: u32,
 
     pub q_heads: u32,
     pub kv_heads: u32,
@@ -76,14 +75,14 @@ struct Dims {
 }
 
 impl Model {
-    pub fn b30(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, kv, tp, Model::b30_dims())
+    pub fn b30(w: Dtype, kv: Dtype) -> Model {
+        Model::new(w, kv, Model::b30_dims())
     }
 
-    pub fn b30_mini(layers: u32, w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn b30_mini(layers: u32, w: Dtype, kv: Dtype) -> Model {
         let mut d = Model::b30_dims();
         d.layers = layers;
-        Model::new(w, kv, tp, d)
+        Model::new(w, kv, d)
     }
 
     fn b30_dims() -> Dims {
@@ -106,19 +105,15 @@ impl Model {
         }
     }
 
-    fn new(w: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
-        assert!(
-            matches!(tp, 1 | 2),
-            "tp {tp} is not a world this catalog ships (two kv heads divide two ways)"
-        );
+    fn new(w: Dtype, kv: Dtype, d: Dims) -> Model {
         let dense = crate::dense(w);
         let proj = match w {
             Dtype::U4g64 => Dtype::U4g64tiled,
             other => other,
         };
-        let q_heads = d.q_heads / tp;
-        let kv_heads = d.kv_heads / tp;
-        let intermediate = d.intermediate / tp;
+        let q_heads = d.q_heads;
+        let kv_heads = d.kv_heads;
+        let intermediate = d.intermediate;
 
         let hidden = u64::from(d.hidden);
         let hd = u64::from(d.head_dim);
@@ -164,7 +159,6 @@ impl Model {
         Model {
             hidden: d.hidden,
             vocab: d.vocab,
-            tp,
             q_heads,
             kv_heads,
             head_dim: d.head_dim,
@@ -179,11 +173,7 @@ impl Model {
             embed: Weight::sym("embed", [u64::from(d.vocab), hidden], w),
             lm_head: {
                 let banded = std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
-                let rows = if banded {
-                    u64::from(d.vocab / tp)
-                } else {
-                    u64::from(d.vocab)
-                };
+                let rows = u64::from(d.vocab);
                 let bank = Weight::sym("lm_head", [rows, hidden], proj);
                 if banded { bank.packed([rows]) } else { bank }
             },

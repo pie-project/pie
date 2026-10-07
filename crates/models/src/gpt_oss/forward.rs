@@ -204,11 +204,6 @@ impl ForwardHybrid for Model {
             seam::at(seam::ATTN_OUT, &[&a]);
 
             let o = ops::linear::matmul(&a, &at.o_proj);
-            let o = if m.tp > 1 {
-                ops::collective::all_reduce(&o)
-            } else {
-                o
-            };
             let o = ops::elemwise::add_bias(&at.o_bias, &o);
             let o = {
                 let (adapted, _) = o.split(&Facts::has_adapter());
@@ -239,11 +234,6 @@ impl ForwardHybrid for Model {
             );
             let routed = ops::linear::moe_matmul_select_quant(&act, &e.down, &routes, e.top_k);
             let f = ops::linear::moe_weighted_sum(&routed, &weights);
-            let f = if m.tp > 1 {
-                ops::collective::all_reduce(&f)
-            } else {
-                f
-            };
             let f = ops::linear::moe_bias_sum(&f, &e.down_bias, &routes, &weights);
             y = ops::elemwise::residual_add(&f, &y);
             if let Some(dr) = &m.dflash {
@@ -262,11 +252,6 @@ impl ForwardHybrid for Model {
         };
         let x = ops::layout::gather_rows(&x, &inputs.readout_rows());
         let logits = ops::linear::lm_head(&x, &m.head);
-        let logits = if m.head.dim(0) < u64::from(m.vocab) {
-            ops::collective::all_gather(&logits, m.tp)
-        } else {
-            logits
-        };
         if let Some(dr) = &m.dflash {
             dr.plant_readout(&logits, &inputs, hb.as_ref(), &Facts::block_draft());
         }

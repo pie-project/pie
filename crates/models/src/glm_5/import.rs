@@ -20,7 +20,7 @@ impl Model {
         platform: Platform,
     ) -> Result<ModelContract, Error> {
         let hidden = i64::from(self.hidden);
-        let mut b = Builder::new(src, self.tp, platform);
+        let mut b = Builder::new(src, 1, platform);
         b.read(&self.embed, "model.embed_tokens.weight")?;
         b.read(&self.final_norm, "model.norm.weight")?;
         b.read(&self.head, "lm_head.weight")?;
