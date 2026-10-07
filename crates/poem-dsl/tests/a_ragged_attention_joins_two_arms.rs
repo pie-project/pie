@@ -1,19 +1,17 @@
 mod common;
 
-use common::{CrossAttention, HEAD_DIM, StreamFacts};
+use common::{CrossAttention, HEAD_DIM};
+use poem_dsl::fact;
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, Request, Selection,
-    Stream, Value, Weight, ops, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, Request, Selection, Stream,
+    Value, Weight, ops, trace_hybrid,
 };
 use poem_ir::{Attention, Def, GeomKind, Guard, Layout, Operation, RuntimeInput};
 
+/// The guard `p` stands for in the cross-attention plan.
 fn cond_of(p: &Predicate) -> Guard {
-    match p {
-        Predicate::Fact { bit } => Guard::Fact(*bit),
-        Predicate::Not(a) => Guard::not(cond_of(a)),
-        Predicate::And(a, b) => Guard::and(cond_of(a), cond_of(b)),
-        Predicate::Rest => unreachable!(),
-    }
+    let trace = trace_hybrid("cross", &CrossAttention, Platform::Cuda);
+    p.guard(&mut trace.facts.clone())
 }
 
 #[test]
@@ -27,10 +25,10 @@ fn queries_off_one_arm_and_keys_off_another_trace_under_the_or_of_both() {
     let trace = trace_hybrid("cross", &CrossAttention, Platform::Cuda);
     assert!(trace.caches.is_empty(), "a denoiser declares no kv space");
 
-    let audio = cond_of(&StreamFacts::on(Stream::Audio));
+    let audio = cond_of(&fact::stream(Stream::Audio));
     let video = Guard::and(
         Guard::not(audio.clone()),
-        cond_of(&StreamFacts::on(Stream::Video)),
+        cond_of(&fact::stream(Stream::Video)),
     );
 
     let (at, ragged) = trace
@@ -101,12 +99,14 @@ fn queries_off_one_arm_and_keys_off_another_trace_under_the_or_of_both() {
 struct TwoArmsIntoOneAdd;
 
 impl ForwardHybrid for TwoArmsIntoOneAdd {
-    type Facts = StreamFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<StreamFacts>) -> Value {
-        let (audio, video) = inputs.split(&StreamFacts::on(Stream::Audio));
+    fn forward(&self, inputs: Input) -> Value {
+        let (audio, video) = (
+            inputs.on(fact::stream(Stream::Audio)),
+            inputs.on(!fact::stream(Stream::Audio)),
+        );
         let w = Weight::sym("w", [8, 8], Dtype::Bf16);
         let a = ops::linear::matmul(&audio.latents(0, 8, Dtype::Bf16), &w);
         let b = ops::linear::matmul(&video.latents(0, 8, Dtype::Bf16), &w);
@@ -132,12 +132,15 @@ fn every_other_op_still_refuses_two_arms() {
 }
 
 fn a_lanes_stream_is_its_fact_word() {
-    let word = StreamFacts::of(&Request::new(16, false).on_stream(Stream::Video)).word();
-    assert!(cond_of(&StreamFacts::on(Stream::Video)).holds(word));
-    assert!(!cond_of(&StreamFacts::on(Stream::Audio)).holds(word));
-    let text = StreamFacts::of(&Request::new(16, false)).word();
-    assert!(
-        cond_of(&StreamFacts::on(Stream::Text)).holds(text),
+    let trace = trace_hybrid("cross", &CrossAttention, Platform::Cuda);
+    let word = trace
+        .facts
+        .word(&Request::new(16, false).on_stream(Stream::Video));
+    assert!(cond_of(&fact::stream(Stream::Video)).holds(word));
+    assert!(!cond_of(&fact::stream(Stream::Audio)).holds(word));
+    assert_eq!(
+        Request::new(16, false).stream(),
+        Stream::Text,
         "text is the default"
     );
 }

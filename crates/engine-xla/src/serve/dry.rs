@@ -13,7 +13,7 @@
 //! over the voxel axis one clip, a class that lands media one image.
 
 use engine::fire::{Mask, Masking};
-use poem_ir::{ClassifyFn, Request, Stream};
+use poem_ir::{Facts, Request, Stream};
 
 use super::{Lane, Media, PATCH_ROUTE_DROP, Seated, Shell};
 use crate::dit::{Clips, PortCell, SelfCond};
@@ -37,9 +37,12 @@ pub struct Probe {
 /// Every request shape the arming pass enumerates (engine-cuda
 /// `exports::landing_requests`), by the class it lands in.
 #[must_use]
-pub fn landing(classify: ClassifyFn, classes: &poem_ir::ClassTable) -> Vec<Vec<Request>> {
+pub fn landing(facts: &Facts, classes: &poem_ir::ClassTable) -> Vec<Vec<Request>> {
     let mut landing = vec![Vec::new(); classes.classes.len()];
-    for reading in 0..8u8 {
+    let readings: Vec<Option<&str>> = std::iter::once(None)
+        .chain(facts.values("reading").map(Some))
+        .collect();
+    for reading in readings {
         for stream in Stream::ALL {
             for bits in 0..256u32 {
                 let request = Request::new(if bits & 1 == 0 { 1 } else { 2 }, bits & 2 != 0)
@@ -49,9 +52,12 @@ pub fn landing(classify: ClassifyFn, classes: &poem_ir::ClassTable) -> Vec<Vec<R
                     .with_media(bits & 32 != 0)
                     .denoising(bits & 64 != 0)
                     .drafting_a_block(bits & 128 != 0)
-                    .on_stream(stream)
-                    .in_reading(reading);
-                let word = classify(&request) & classes.mask;
+                    .on_stream(stream);
+                let request = match reading {
+                    Some(name) => request.in_reading(name),
+                    None => request,
+                };
+                let word = facts.word(&request) & classes.mask;
                 if let Some(class) = classes.class_of(word) {
                     landing[class].push(request);
                 }
@@ -68,7 +74,7 @@ pub fn landing(classify: ClassifyFn, classes: &poem_ir::ClassTable) -> Vec<Vec<R
                 + u32::from(r.denoise())
                 + u32::from(r.drafts_a_block())
                 + u32::from(r.stream() != Stream::Text)
-                + u32::from(r.reading() != 0)
+                + u32::from(r.reading().is_some())
         });
     }
     landing
@@ -110,13 +116,9 @@ impl Shell {
     ///
     /// `lean` skips the classes that run a custom-mask, adapter or score
     /// capture arm (a compile check keeps the device briefly).
-    pub fn synthetic_fires(
-        &mut self,
-        classify: ClassifyFn,
-        prefill: u32,
-        lean: bool,
-    ) -> Vec<Probe> {
-        let landing = landing(classify, &self.compiled_model().classes);
+    pub fn synthetic_fires(&mut self, prefill: u32, lean: bool) -> Vec<Probe> {
+        let facts = self.trace().facts.clone();
+        let landing = landing(&facts, &self.compiled_model().classes);
         let mut probes = Vec::new();
         for (class, requests) in landing.iter().enumerate() {
             if lean
@@ -147,7 +149,7 @@ impl Shell {
             }
             for (request, rows, lanes) in shapes {
                 let before = self.device().dry_texts().len();
-                let fired = self.dry_fire(class, request, classify(&request), rows, lanes);
+                let fired = self.dry_fire(class, request, facts.word(&request), rows, lanes);
                 let finite = match (&fired, self.device().is_dry()) {
                     (Ok(fired), false) => {
                         let values = fired

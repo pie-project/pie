@@ -22,42 +22,22 @@ use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use eta_ir::validate::bind;
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, RaggedMask, Request, Trace, Value,
-    Weight, ops, seam, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, RaggedMask, Trace, Value, Weight, ops, seam,
+    trace_hybrid,
 };
 
 const HEADS: u32 = 4;
 const RANKS: usize = 4;
-
-struct NoFacts;
-
-impl Classify for NoFacts {
-    fn of(_: &Request) -> NoFacts {
-        NoFacts
-    }
-    fn word(&self) -> u64 {
-        0
-    }
-}
-
-fn classify(_: &Request) -> u64 {
-    0
-}
-
-fn classify_for(_: &str) -> Option<poem_ir::ClassifyFn> {
-    Some(classify)
-}
 
 struct Sharded {
     tp: u32,
 }
 
 impl ForwardHybrid for Sharded {
-    type Facts = NoFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let mine = u64::from(HEADS * HEAD_DIM / self.tp);
         let x = inputs.latents(0, WIDTH, Dtype::Bf16);
         let h = ops::elemwise::layernorm_no_scale(&x, 1e-6);
@@ -233,8 +213,7 @@ fn four_ranks_land_what_one_rank_lands() {
             ..engine_cuda::DeviceBoot::default()
         })
         .collect();
-    let mut group =
-        engine_cuda::open_group(boots, contract_for, classify_for).expect("the group opens");
+    let mut group = engine_cuda::open_group(boots, contract_for).expect("the group opens");
     let loaded = group
         .load(LoadRequest {
             trace: plan,

@@ -142,6 +142,9 @@ pub struct Trace {
     pub seams: Vec<Seam>,
     #[serde(default)]
     pub drafter: Option<BlockDrafter>,
+    /// The facts the trace's guards branch on, and the bits each takes.
+    #[serde(default)]
+    pub facts: crate::Facts,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -426,7 +426,7 @@ impl Shell {
             crate::store::window_of(&boot.trace)?,
             boot.budget.max_tokens,
         );
-        let decode_dense = landing_requests(boot.classify, &compiled.classes)
+        let decode_dense = landing_requests(&boot.trace.facts, &compiled.classes)
             .iter()
             .flatten()
             .any(poem_ir::Request::denoise);
@@ -541,7 +541,7 @@ impl Shell {
         crate::window::no_grouped_window_is_also_a_prepare_window(&compiled)?;
         let masked = masked_classes(&boot.trace, &compiled);
         let corrected = corrected_classes(&boot.trace, &compiled);
-        let landing = landing_requests(boot.classify, &compiled.classes);
+        let landing = landing_requests(&boot.trace.facts, &compiled.classes);
         let decoding = decoding_of(&landing);
         let feeds = Feeds::of(&boot.trace, &compiled);
         // A wide body is captured from representative lanes and keyed by the
@@ -557,7 +557,7 @@ impl Shell {
                         && requests.iter().all(|request| {
                             !request.denoise()
                                 && request.stream() == poem_ir::Stream::Text
-                                && request.reading() == 0
+                                && request.reading().is_none()
                         })
                         && !feeds
                             .ports
@@ -769,7 +769,6 @@ impl Shell {
             decoding,
             tiers,
             landing,
-            classify: boot.classify,
             armed: None,
             media,
             shifted,

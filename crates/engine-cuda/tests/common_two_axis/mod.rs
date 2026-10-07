@@ -21,10 +21,11 @@ use eta_ir::op::{IntrinsicId, Op};
 use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use eta_ir::validate::bind;
+use poem_dsl::fact;
 use poem_dsl::ops::spatial::{self, Conv};
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Predicate,
-    RaggedMask, Request, RopeForm, Trace, Value, Weight, ops, seam, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, RaggedMask, Request, RopeForm,
+    Trace, Value, Weight, ops, seam, trace_hybrid,
 };
 
 pub const WIDTH: u32 = 32;
@@ -37,48 +38,42 @@ pub const C_OUT: u32 = 4;
 pub const TAPS: u32 = 27;
 pub const NAME: &str = "two-axis-mini";
 pub const VAE_READING: u8 = 1;
-const VAE_BIT: u8 = 0;
 
-pub struct Facts(bool);
-
-impl Facts {
-    #[must_use]
-    pub fn is_vae() -> Predicate {
-        Predicate::fact(VAE_BIT)
-    }
-}
-
-impl Classify for Facts {
-    fn of(r: &Request) -> Facts {
-        Facts(r.reading() & 1 == 1)
-    }
-    fn word(&self) -> u64 {
-        u64::from(self.0)
-    }
+thread_local! {
+    /// The facts of the trace this thread's rig loaded, which its lanes are
+    /// worded by.
+    static FACTS: std::cell::RefCell<poem_ir::Facts> = std::cell::RefCell::default();
 }
 
 pub fn classify(request: &Request) -> u64 {
-    Facts::of(request).word()
+    FACTS.with(|facts| facts.borrow().word(request))
 }
 
-pub fn classify_for(_: &str) -> Option<poem_ir::ClassifyFn> {
-    Some(classify)
+fn remember(trace: &Trace) {
+    FACTS.with(|facts| *facts.borrow_mut() = trace.facts.clone());
 }
 
 #[must_use]
 pub fn word(reading: u8) -> u64 {
-    classify(&Request::new(1, false).in_reading(reading))
+    let request = Request::new(1, false);
+    if reading == VAE_READING {
+        classify(&request.in_reading("vae"))
+    } else {
+        classify(&request)
+    }
 }
 
 pub struct TwoAxis;
 
 impl ForwardHybrid for TwoAxis {
-    type Facts = Facts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<Facts>) -> Value {
-        let (vae, dit) = inputs.split(&Facts::is_vae());
+    fn forward(&self, inputs: Input) -> Value {
+        let (vae, dit) = (
+            inputs.on(fact::reading("vae")),
+            inputs.on(!fact::reading("vae")),
+        );
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
@@ -381,15 +376,15 @@ impl Rig {
     pub fn load(weights: &Weights, max_tokens: u32, buckets: Vec<u32>, max_voxels: u32) -> Rig {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let path = weights.write(dir.path());
-        let mut engine = engine_cuda::open(
-            engine_cuda::DeviceBoot::default(),
-            contract_for,
-            classify_for,
-        )
-        .expect("the engine opens");
+        let mut engine = engine_cuda::open(engine_cuda::DeviceBoot::default(), contract_for)
+            .expect("the engine opens");
         let loaded = engine
             .load(LoadRequest {
-                trace: trace(),
+                trace: {
+                    let trace = trace();
+                    remember(&trace);
+                    trace
+                },
                 checkpoint: Checkpoint::Path(path),
                 budgets: Budgets {
                     max_lanes: 4,

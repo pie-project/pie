@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use checkpoint::contract::ModelContract;
-use poem_dsl::{ClassifyFn, Dtype, Platform, Trace};
+use poem_dsl::{Dtype, Platform, Trace};
 
 use crate::{Diffusion, Generative, template, tokenizer};
 
@@ -94,7 +94,6 @@ pub struct Entry {
     pub drafters: &'static [Drafter],
     pub trace: TraceFn,
     pub import: ImportFn,
-    pub classify: ClassifyFn,
     pub template: TemplateFn,
     pub tokenizer: &'static tokenizer::Contract,
     pub diffusion: fn(&Deploy) -> Option<Diffusion>,
@@ -296,12 +295,6 @@ macro_rules! entry {
                         detail: why.to_string(),
                     })?
                     .import(src, platform)
-            },
-            classify: |request| {
-                poem_dsl::word_of(
-                    || -> $model { unreachable!("a classifier reads the facts' type only") },
-                    request,
-                )
             },
             template: $template,
             tokenizer: $tokenizer,

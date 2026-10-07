@@ -1,40 +1,9 @@
-use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, ops, seam,
-};
+use poem_dsl::fact;
+use poem_dsl::{Dtype, ForwardHybrid, HybridSpec, Input, Value, ops, seam};
 
 use super::model::{AttnRes, Kda, Mixer, Mla, Mlp, Model};
 
-pub struct Facts {
-    pub qo_one: bool,
-    pub has_adapter: bool,
-}
-
-impl Facts {
-    pub fn qo_one() -> Predicate {
-        Predicate::fact(0)
-    }
-
-    pub fn has_adapter() -> Predicate {
-        Predicate::fact(1)
-    }
-}
-
-impl Classify for Facts {
-    fn of(r: &Request) -> Facts {
-        Facts {
-            qo_one: r.query_len() == 1,
-            has_adapter: r.has_adapter(),
-        }
-    }
-
-    fn word(&self) -> u64 {
-        u64::from(self.qo_one) | (u64::from(self.has_adapter) << 1)
-    }
-}
-
 impl ForwardHybrid for Model {
-    type Facts = Facts;
-
     fn caches(&self) -> HybridSpec {
         let mut c = HybridSpec::new();
         let kv = c.kv_space(self.kv);
@@ -70,10 +39,13 @@ impl ForwardHybrid for Model {
         c
     }
 
-    fn forward(&self, inputs: Input<Facts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let m = self;
 
-        let (input_d, input_p) = inputs.split(&Facts::qo_one());
+        let (input_d, input_p) = (
+            inputs.on(fact::single_token()),
+            inputs.on(!fact::single_token()),
+        );
         let plan = [
             ops::attn::mla_plan(&input_d, m.mla_heads, m.kv_lora_rank),
             ops::attn::mla_plan(&input_p, m.mla_heads, m.kv_lora_rank),
@@ -114,8 +86,8 @@ impl ForwardHybrid for Model {
                 Mixer::Kda(k) => kda_mixer(&x, &inputs, k),
             };
             let o = {
-                let (adapted, _) = o.split(&Facts::has_adapter());
-                let (px, _) = x.split(&Facts::has_adapter());
+                let adapted = o.on(fact::has(fact::Adapter));
+                let px = x.on(fact::has(fact::Adapter));
                 ops::linear::lora_correct(&px, &w.lora_a, &w.lora_b, &routes, &adapted)
             };
             y = if fresh {
@@ -232,7 +204,7 @@ impl ForwardHybrid for Model {
     }
 }
 
-fn mla_mixer(x: &Value, inputs: &Input<Facts>, plan: &[Value; 2], m: &Model, a: &Mla) -> Value {
+fn mla_mixer(x: &Value, inputs: &Input, plan: &[Value; 2], m: &Model, a: &Mla) -> Value {
     let pages = inputs.kv(&a.kv);
     let write_page = inputs.write_page(&a.kv);
     let write_offset = inputs.write_offset(&a.kv);
@@ -262,9 +234,9 @@ fn mla_mixer(x: &Value, inputs: &Input<Facts>, plan: &[Value; 2], m: &Model, a: 
     );
     seam::at(seam::ATTN_Q, &[&q]);
 
-    let one = Facts::qo_one();
-    let (dq, p) = q.split(&one);
-    let (dpe, ppe) = q_pe.split(&one);
+    let one = fact::single_token();
+    let (dq, p) = (q.on(one.clone()), q.on(!one.clone()));
+    let (dpe, ppe) = (q_pe.on(one.clone()), q_pe.on(!one.clone()));
     let latent = Value::merge(vec![
         ops::attn::mla_decode(
             &dq,
@@ -301,7 +273,7 @@ fn mla_mixer(x: &Value, inputs: &Input<Facts>, plan: &[Value; 2], m: &Model, a: 
     ops::linear::matmul(&o, &a.o_proj)
 }
 
-fn kda_mixer(x: &Value, inputs: &Input<Facts>, k: &Kda) -> Value {
+fn kda_mixer(x: &Value, inputs: &Input, k: &Kda) -> Value {
     let conv = inputs.state(&k.conv_state);
     let delta = inputs.state(&k.delta_state);
     let qkv = ops::linear::matmul(x, &k.qkv);
@@ -309,10 +281,10 @@ fn kda_mixer(x: &Value, inputs: &Input<Facts>, k: &Kda) -> Value {
     let b = ops::linear::matmul(x, &k.b);
     seam::at(seam::RECURRENT, &[&qkv]);
 
-    let one = Facts::qo_one();
-    let (qkv_d, qkv_p) = qkv.split(&one);
-    let (f_d, f_p) = f.split(&one);
-    let (b_d, b_p) = b.split(&one);
+    let one = fact::single_token();
+    let (qkv_d, qkv_p) = (qkv.on(one.clone()), qkv.on(!one.clone()));
+    let (f_d, f_p) = (f.on(one.clone()), f.on(!one.clone()));
+    let (b_d, b_p) = (b.on(one.clone()), b.on(!one.clone()));
     let core = Value::merge(vec![
         {
             let mixed = ops::attn::ssm_causal_conv1d(&qkv_d, &k.conv, conv, k.conv_kernel);

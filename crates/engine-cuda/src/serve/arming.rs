@@ -415,7 +415,7 @@ impl Shell {
                 let request = self.representative(class, rows, wants_media);
                 Synthetic {
                     stream: request.stream().code(),
-                    word: (self.classify)(&request),
+                    word: self.trace.facts.word(&request),
                     tokens: vec![0u32; rows as usize],
                     mask: request
                         .has_custom_mask()

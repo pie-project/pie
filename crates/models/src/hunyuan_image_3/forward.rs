@@ -1,7 +1,8 @@
+use poem_dsl::fact;
 use poem_dsl::ops::spatial;
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Predicate, Request,
-    RopeForm, Stream, Value, Weight, ops, seam,
+    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, RopeForm, Stream, Value,
+    Weight, ops, seam,
 };
 
 use crate::{
@@ -17,8 +18,6 @@ use super::model::{
 
 pub const STREAM_BASE: u8 = 0;
 
-pub const READING_LO: u8 = 6;
-pub const READING_HI: u8 = 7;
 pub const QO_ONE: u8 = 8;
 
 pub const ENCODE: u8 = 0;
@@ -132,58 +131,7 @@ impl Model {
     }
 }
 
-pub struct Facts {
-    pub stream: Stream,
-    pub reading: u8,
-    pub qo_one: bool,
-}
-
-impl Facts {
-    #[must_use]
-    pub fn text() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Text)
-    }
-
-    #[must_use]
-    pub fn image() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Image)
-    }
-
-    #[must_use]
-    pub fn reading_lo() -> Predicate {
-        Predicate::fact(READING_LO)
-    }
-
-    #[must_use]
-    pub fn reading_hi() -> Predicate {
-        Predicate::fact(READING_HI)
-    }
-
-    #[must_use]
-    pub fn qo_one() -> Predicate {
-        Predicate::fact(QO_ONE)
-    }
-}
-
-impl Classify for Facts {
-    fn of(r: &Request) -> Facts {
-        Facts {
-            stream: r.stream(),
-            reading: r.reading() & 3,
-            qo_one: r.query_len() == 1,
-        }
-    }
-
-    fn word(&self) -> u64 {
-        self.stream.word(STREAM_BASE)
-            | (u64::from(self.reading & 3) << READING_LO)
-            | (u64::from(self.qo_one) << QO_ONE)
-    }
-}
-
 impl ForwardHybrid for Model {
-    type Facts = Facts;
-
     fn caches(&self) -> HybridSpec {
         let mut c = HybridSpec::new();
         let kv = c.kv_space(self.kv_dtype);
@@ -195,16 +143,14 @@ impl ForwardHybrid for Model {
         c
     }
 
-    fn forward(&self, inputs: Input<Facts>) -> Value {
-        let (hi, lo) = inputs.split(&Facts::reading_hi());
-        let (image_out_arm, image_in_arm) = hi.split(&Facts::reading_lo());
-        let (denoise_arm, encode_arm) = lo.split(&Facts::reading_lo());
-
-        image_in(&image_in_arm, self);
-        image_out(&image_out_arm, self);
-
-        let _ = &encode_arm;
-        trunk(&lo, &denoise_arm, self)
+    fn forward(&self, inputs: Input) -> Value {
+        inputs.reading("image.in", |rows| image_in(rows, self));
+        inputs.reading("image.out", |rows| image_out(rows, self));
+        // The encoder and the denoiser share the trunk: the canvas rows are
+        // the denoise reading's, the text rows the encoder's.
+        let trunk_rows = inputs.on(!fact::reading("image.in") & !fact::reading("image.out"));
+        let canvas_rows = trunk_rows.on(fact::reading("denoise"));
+        trunk(&trunk_rows, &canvas_rows, self)
     }
 }
 
@@ -219,12 +165,12 @@ fn embedder(e: &Embedder, t_freq: &Value) -> Value {
     )
 }
 
-fn trunk(all: &Input<Facts>, den: &Input<Facts>, m: &Model) -> Value {
+fn trunk(all: &Input, den: &Input, m: &Model) -> Value {
     let d: &Dims = &m.dims;
     let hd = d.head_dim;
     let sm = d.sm_scale();
-    let classes = [Facts::reading_lo(), Facts::qo_one(), Predicate::rest()];
-    let [canvas_in, ar_decode, ar_prefill] = all.split(classes.clone());
+    let classes = [fact::reading("denoise"), fact::single_token()];
+    let ([canvas_in, ar_decode], ar_prefill) = all.partition(classes.clone());
 
     let plan_den = ops::attn::plan_prefill(&canvas_in, m.q_heads, m.kv_heads, hd, None);
     let plan_dec = ops::attn::plan_decode(&ar_decode, m.q_heads, m.kv_heads, hd, None);
@@ -234,7 +180,7 @@ fn trunk(all: &Input<Facts>, den: &Input<Facts>, m: &Model) -> Value {
     let positions = all.axis_positions(port::POSITIONS, ROPE_AXES);
     let ids = all.tokens();
     let y = ops::layout::embed(&ids, &m.embed, d.vocab);
-    let (_, encoded) = y.split(&Facts::reading_lo());
+    let encoded = y.on(!fact::reading("denoise"));
     let mut y = Value::merge(vec![canvas_rows(den, m), encoded]);
 
     for (l, w) in all.walk_layers(&m.layers) {
@@ -264,7 +210,7 @@ fn trunk(all: &Input<Facts>, den: &Input<Facts>, m: &Model) -> Value {
             &all.write_offset(&w.kv),
         );
 
-        let [dq, aq, pq] = q.split(classes.clone());
+        let ([dq, aq], pq) = q.partition(classes.clone());
         let a = Value::merge(vec![
             ops::attn::masked(
                 &dq, &plan_den, &mask, pages, None, hd, m.kv_heads, false, sm,
@@ -284,9 +230,12 @@ fn trunk(all: &Input<Facts>, den: &Input<Facts>, m: &Model) -> Value {
         y = ops::elemwise::residual_add(&f, &y);
     }
 
-    let (canvas, text) = y.split(&Facts::reading_lo());
+    let (canvas, text) = (
+        y.on(fact::reading("denoise")),
+        y.on(!fact::reading("denoise")),
+    );
     seam::at(seam::HIDDEN, &[&canvas]);
-    let (_, text_in) = all.split(&Facts::reading_lo());
+    let text_in = all.on(!fact::reading("denoise"));
     let x = ops::elemwise::rmsnorm(&text, &m.final_norm, NORM_EPS);
     let x = ops::layout::gather_rows(&x, &text_in.readout_rows());
     let logits = ops::linear::lm_head(&x, &m.head);
@@ -314,7 +263,7 @@ fn moe(x: &Value, w: &super::model::Layer, m: &Model) -> Value {
     ops::elemwise::residual_add(&shared, &routed)
 }
 
-fn canvas_rows(arm: &Input<Facts>, m: &Model) -> Value {
+fn canvas_rows(arm: &Input, m: &Model) -> Value {
     let d = &m.dims;
     let u = arm.latents(port::ROWS, d.hidden, Dtype::Bf16);
     let flag = arm.latents(port::SPECIAL, 1, Dtype::Bf16);
@@ -369,7 +318,7 @@ fn resblock(x: &Value, g: &Value, r: &ResBlock, temb: &Value) -> Value {
     ops::elemwise::add(&skip, &h)
 }
 
-fn image_in(arm: &Input<Facts>, m: &Model) {
+fn image_in(arm: &Input, m: &Model) {
     let g = arm.grid();
     let clip = arm.voxels(
         port::LATENT_VOXELS,
@@ -383,7 +332,7 @@ fn image_in(arm: &Input<Facts>, m: &Model) {
     seam::at(seam::PIXELS, &[&x, &g1]);
 }
 
-fn image_out(arm: &Input<Facts>, m: &Model) {
+fn image_out(arm: &Input, m: &Model) {
     let g = arm.grid();
     let clip = arm.voxels(port::ROW_VOXELS, m.dims.hidden + T_FREQ_DIM, Dtype::Bf16);
     let (rows, freqs) = ops::layout::split_rows(&clip, m.dims.hidden);

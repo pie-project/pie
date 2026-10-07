@@ -5,11 +5,10 @@ use std::time::Instant;
 
 use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
-use models::z_image::forward::Facts;
 use models::z_image::model::Model;
 use models::z_image::vae;
 use poem_compiler::{Budget, VoxelLadder};
-use poem_dsl::{Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, trace_hybrid};
+use poem_dsl::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, trace_hybrid};
 
 struct OneArm {
     model: Model,
@@ -17,11 +16,10 @@ struct OneArm {
 }
 
 impl ForwardHybrid for OneArm {
-    type Facts = Facts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<Facts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let v = self
             .model
             .vae
@@ -146,11 +144,11 @@ fn fire(
         keep.extend(more);
     }
     contract.tensors.retain(|t| keep.contains(&t.name));
-    let word =
-        Facts::of(&poem_dsl::Request::new(1, false).on_stream(poem_dsl::Stream::Image)).word();
+    let word = trace
+        .facts
+        .word(&poem_dsl::Request::new(1, false).on_stream(poem_dsl::Stream::Image));
     let started = Instant::now();
     let mut shell = Shell::load(Boot {
-        classify: |request| Facts::of(request).word(),
         trace,
         contract: &contract,
         checkpoint: root,

@@ -1,40 +1,9 @@
-use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, Weight, ops, seam,
-};
+use poem_dsl::fact;
+use poem_dsl::{Dtype, ForwardHybrid, HybridSpec, Input, Value, Weight, ops, seam};
 
 use super::model::{Layer, Mlp, Model, Reading};
 
-pub struct Facts {
-    pub qo_one: bool,
-    pub has_adapter: bool,
-}
-
-impl Facts {
-    pub fn qo_one() -> Predicate {
-        Predicate::fact(0)
-    }
-
-    pub fn has_adapter() -> Predicate {
-        Predicate::fact(1)
-    }
-}
-
-impl Classify for Facts {
-    fn of(r: &Request) -> Facts {
-        Facts {
-            qo_one: r.query_len() == 1,
-            has_adapter: r.has_adapter(),
-        }
-    }
-
-    fn word(&self) -> u64 {
-        u64::from(self.qo_one) | (u64::from(self.has_adapter) << 1)
-    }
-}
-
 impl ForwardHybrid for Model {
-    type Facts = Facts;
-
     fn caches(&self) -> HybridSpec {
         let mut c = HybridSpec::new();
         let kv = c.kv_space(self.kv);
@@ -54,12 +23,12 @@ impl ForwardHybrid for Model {
         c
     }
 
-    fn forward(&self, inputs: Input<Facts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let m = self;
         let d = m.head_dim;
-        let one = Facts::qo_one();
+        let one = fact::single_token();
 
-        let (input_d, input_p) = inputs.split(&one);
+        let (input_d, input_p) = (inputs.on(one.clone()), inputs.on(!one.clone()));
         let geometry = [
             (
                 m.layers
@@ -125,8 +94,8 @@ impl ForwardHybrid for Model {
             seam::at(seam::ATTN_Q, &[&q]);
 
             let bias = ops::linear::rel_bias(&r, &w.rel_proj, m.heads, m.d_rel, w.extent);
-            let (dq, pq) = q.split(&one);
-            let (db, pb) = bias.split(&one);
+            let (dq, pq) = (q.on(one.clone()), q.on(!one.clone()));
+            let (db, pb) = (bias.on(one.clone()), bias.on(!one.clone()));
             let plan_d = plan_d[reading]
                 .as_ref()
                 .expect("a layer of this reading built its plan");
@@ -165,8 +134,8 @@ impl ForwardHybrid for Model {
             seam::at(seam::ATTN_OUT, &[&a]);
             let o = ops::linear::matmul(&a, &w.o_proj);
             let o = {
-                let (adapted, _) = o.split(&Facts::has_adapter());
-                let (px, _) = x.split(&Facts::has_adapter());
+                let adapted = o.on(fact::has(fact::Adapter));
+                let px = x.on(fact::has(fact::Adapter));
                 ops::linear::lora_correct(&px, &w.lora_a, &w.lora_b, &routes, &adapted)
             };
             let o = conv(&o, &w.attn_conv, &w.attn_state, &inputs, m);
@@ -233,9 +202,9 @@ impl Layer {
     }
 }
 
-fn conv(v: &Value, weight: &Weight, state: &str, inputs: &Input<Facts>, m: &Model) -> Value {
+fn conv(v: &Value, weight: &Weight, state: &str, inputs: &Input, m: &Model) -> Value {
     let slab = inputs.state(state);
-    let (vd, vp) = v.split(&Facts::qo_one());
+    let (vd, vp) = (v.on(fact::single_token()), v.on(!fact::single_token()));
     Value::merge(vec![
         ops::attn::short_conv(&vd, weight, slab, m.conv_width),
         ops::attn::short_conv_chunked(&vp, weight, slab, m.conv_width),

@@ -1,26 +1,13 @@
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, Request, Stream, Value,
-    Weight, ops, seam, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, Stream, Value, Weight, ops, seam,
+    trace_hybrid,
 };
 use poem_ir::{Elementwise, Operands, Operation, Trace, ValueId};
 
 const WIDTH: u32 = 64;
 const BLOCKS: usize = 3;
-const STREAM_BASE: u8 = 0;
-
-struct Streams(Stream);
-
-impl Classify for Streams {
-    fn of(r: &Request) -> Streams {
-        Streams(r.stream())
-    }
-    fn word(&self) -> u64 {
-        self.0.word(STREAM_BASE)
-    }
-}
-
 fn text() -> Predicate {
-    Predicate::stream(STREAM_BASE, Stream::Text)
+    poem_dsl::fact::stream(Stream::Text)
 }
 
 struct Stack {
@@ -28,11 +15,10 @@ struct Stack {
 }
 
 impl ForwardHybrid for Stack {
-    type Facts = Streams;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<Streams>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let x = inputs.latents(0, WIDTH, Dtype::Bf16);
         let lanes = inputs.request_of_token();
         let t = inputs.lane_vector(0, 1);
@@ -57,13 +43,12 @@ impl ForwardHybrid for Stack {
 struct TwoArms;
 
 impl ForwardHybrid for TwoArms {
-    type Facts = Streams;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<Streams>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let x = inputs.latents(0, WIDTH, Dtype::Bf16);
-        let (txt, img) = x.split(&text());
+        let (txt, img) = (x.on(text()), x.on(!text()));
         let bias = Weight::sym("bias", [u64::from(WIDTH)], Dtype::Bf16);
         let other = Weight::sym("other", [u64::from(WIDTH)], Dtype::Bf16);
         let txt = ops::elemwise::add_bias(&bias, &txt);

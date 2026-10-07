@@ -107,7 +107,8 @@ fn every_probe_is_dumped() {
         }
     };
     let trace = sku.trace(Platform::Metal);
-    let word = |query_len: u32| (sku.classify)(&Request::new(query_len, false));
+    let facts = sku.trace(models::Platform::Metal).facts;
+    let word = |query_len: u32| facts.word(&Request::new(query_len, false));
 
     let booted = Instant::now();
     let mut shell = Shell::load(Boot {

@@ -1,25 +1,9 @@
+use poem_dsl::fact;
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, RaggedMask, Request,
-    Stream, Value, Weight, ops, seam, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, RaggedMask, Request, Stream, Value, Weight,
+    ops, seam, trace_hybrid,
 };
 use poem_ir::{Layout, Operation};
-
-struct StreamFacts(Stream);
-
-impl StreamFacts {
-    fn on(stream: Stream) -> Predicate {
-        Predicate::stream(0, stream)
-    }
-}
-
-impl Classify for StreamFacts {
-    fn of(r: &Request) -> StreamFacts {
-        StreamFacts(r.stream())
-    }
-    fn word(&self) -> u64 {
-        self.0.word(0)
-    }
-}
 
 const WIDTH: u32 = 32;
 const HEAD_DIM: u32 = 8;
@@ -27,12 +11,14 @@ const HEAD_DIM: u32 = 8;
 struct LastJointBlock;
 
 impl ForwardHybrid for LastJointBlock {
-    type Facts = StreamFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<StreamFacts>) -> Value {
-        let (txt, img) = inputs.split(&StreamFacts::on(Stream::Text));
+    fn forward(&self, inputs: Input) -> Value {
+        let (txt, img) = (
+            inputs.on(fact::stream(Stream::Text)),
+            inputs.on(!fact::stream(Stream::Text)),
+        );
         let w = |name: &str| Weight::sym(name, [u64::from(WIDTH), u64::from(WIDTH)], Dtype::Bf16);
         let x_txt = txt.latents(0, WIDTH, Dtype::Bf16);
         let x_img = img.latents(1, WIDTH, Dtype::Bf16);
@@ -58,7 +44,7 @@ impl ForwardHybrid for LastJointBlock {
             RaggedMask::GroupBlockDiagonal,
         );
         let o = ops::layout::unpack_rows(&o, &perm);
-        let (_, o_img) = o.split(&StreamFacts::on(Stream::Text));
+        let o_img = o.on(!fact::stream(Stream::Text));
         let out = ops::linear::matmul(&o_img, &w("img.o"));
         seam::at(seam::VELOCITY, &[&out]);
         out
@@ -70,10 +56,20 @@ fn the_pack_and_unpack_of_a_head_only_block_are_demanded_in_both_streams() {
     let trace = trace_hybrid("last_joint", &LastJointBlock, Platform::Cuda);
     let classes = poem_dsl::resolve_classes(&trace).expect("every merge resolves");
     let text = classes
-        .class_of(StreamFacts(Stream::Text).word() & classes.mask)
+        .class_of(
+            trace
+                .facts
+                .word(&Request::new(1, false).on_stream(Stream::Text))
+                & classes.mask,
+        )
         .expect("a text lane has a class");
     let image = classes
-        .class_of(StreamFacts(Stream::Image).word() & classes.mask)
+        .class_of(
+            trace
+                .facts
+                .word(&Request::new(1, false).on_stream(Stream::Image))
+                & classes.mask,
+        )
         .expect("an image lane has a class");
     assert_ne!(text, image, "the two streams are two classes");
 

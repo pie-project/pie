@@ -143,7 +143,7 @@ fn one(
         compile,
     )
     .map_err(|fault| format!("load: {fault}"))?;
-    let probes = shell.synthetic_fires(sku.classify, PREFILL, lean);
+    let probes = shell.synthetic_fires(PREFILL, lean);
     if let Some(dir) = dump {
         let _ = std::fs::create_dir_all(dir);
         for (n, text) in shell.device().dry_texts().iter().enumerate() {

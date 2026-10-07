@@ -6,8 +6,7 @@ use checkpoint::contract::ModelContract;
 use engine_cuda::{Boot, Diagnostics, Graphs, Knobs, Lane, Shell};
 use poem_compiler::Budget;
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, ops,
-    trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, trace_hybrid,
 };
 use poem_ir::{Fused, Operation, Trace};
 
@@ -17,21 +16,6 @@ const INTER: u32 = 256;
 const GROUP: usize = 64;
 const PAGE: u32 = 16;
 const TOKENS: u32 = 8;
-
-struct NoFacts;
-
-impl Classify for NoFacts {
-    fn of(_: &Request) -> NoFacts {
-        NoFacts
-    }
-    fn word(&self) -> u64 {
-        0
-    }
-}
-
-fn classify(_: &Request) -> u64 {
-    0
-}
 
 struct Micro {
     embed: Weight,
@@ -52,13 +36,11 @@ impl Micro {
 }
 
 impl ForwardHybrid for Micro {
-    type Facts = NoFacts;
-
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let x = ops::layout::embed(&inputs.tokens(), &self.embed, VOCAB);
         let act =
             ops::linear::mlp_geglu_tanh_packed(&ops::linear::matmul(&x, &self.gate_up), INTER);
@@ -200,7 +182,6 @@ fn fixture() -> Fixture {
 fn fire(fixture: &Fixture, knobs: Knobs) -> engine_cuda::Result<Vec<f32>> {
     let ceiling = TOKENS.next_multiple_of(PAGE);
     let mut shell = Shell::load(Boot {
-        classify,
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
         checkpoint: &fixture.container,

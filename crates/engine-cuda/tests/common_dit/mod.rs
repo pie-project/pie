@@ -20,9 +20,10 @@ use eta_ir::op::{IntrinsicId, Op};
 use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use eta_ir::validate::bind;
+use poem_dsl::fact;
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Predicate,
-    RaggedMask, Request, RopeForm, Stream, Trace, Value, Weight, ops, seam, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, RaggedMask, Request, RopeForm,
+    Stream, Trace, Value, Weight, ops, seam, trace_hybrid,
 };
 
 pub const WIDTH: u32 = 32;
@@ -32,40 +33,31 @@ pub const SM_SCALE: f32 = 0.125;
 pub const THETA: f32 = 10_000.0;
 pub const NAME: &str = "dit-mini";
 
-pub struct StreamFacts(Stream);
-
-impl StreamFacts {
-    pub fn on(stream: Stream) -> Predicate {
-        Predicate::stream(0, stream)
-    }
-}
-
-impl Classify for StreamFacts {
-    fn of(r: &Request) -> StreamFacts {
-        StreamFacts(r.stream())
-    }
-    fn word(&self) -> u64 {
-        self.0.word(0)
-    }
+thread_local! {
+    /// The facts of the trace this thread's rig loaded, which its lanes are
+    /// worded by.
+    static FACTS: std::cell::RefCell<poem_ir::Facts> = std::cell::RefCell::default();
 }
 
 pub fn classify(request: &Request) -> u64 {
-    StreamFacts::of(request).word()
+    FACTS.with(|facts| facts.borrow().word(request))
 }
 
-pub fn classify_for(_: &str) -> Option<poem_ir::ClassifyFn> {
-    Some(classify)
+fn remember(trace: &Trace) {
+    FACTS.with(|facts| *facts.borrow_mut() = trace.facts.clone());
 }
 
 pub struct DoubleBlock;
 
 impl ForwardHybrid for DoubleBlock {
-    type Facts = StreamFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<StreamFacts>) -> Value {
-        let (txt, img) = inputs.split(&StreamFacts::on(Stream::Text));
+    fn forward(&self, inputs: Input) -> Value {
+        let (txt, img) = (
+            inputs.on(fact::stream(Stream::Text)),
+            inputs.on(!fact::stream(Stream::Text)),
+        );
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
@@ -128,7 +120,10 @@ impl ForwardHybrid for DoubleBlock {
             RaggedMask::GroupBlockDiagonal,
         );
         let o = ops::layout::unpack_rows(&o, &perm);
-        let (o_txt, o_img) = o.split(&StreamFacts::on(Stream::Text));
+        let (o_txt, o_img) = (
+            o.on(fact::stream(Stream::Text)),
+            o.on(!fact::stream(Stream::Text)),
+        );
         let y_txt = ops::linear::matmul(&o_txt, &w("txt.o", WIDTH, HEAD_DIM));
         let y_img = ops::linear::matmul(&o_img, &w("img.o", WIDTH, HEAD_DIM));
         let r_txt = ops::elemwise::residual_add(&x_txt, &y_txt);
@@ -469,11 +464,13 @@ impl Rig {
         let path = weights.write(dir.path());
         let mut boot = engine_cuda::DeviceBoot::default();
         boot.knobs.recording = recording;
-        let mut engine =
-            engine_cuda::open(boot, contract_for, classify_for).expect("the engine opens");
+        let mut engine = engine_cuda::open(boot, contract_for).expect("the engine opens");
         let loaded = engine
             .load(LoadRequest {
-                trace: plan,
+                trace: {
+                    remember(&plan);
+                    plan
+                },
                 checkpoint: Checkpoint::Path(path.clone()),
                 budgets: Budgets {
                     max_lanes: 8,

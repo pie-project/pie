@@ -1,19 +1,7 @@
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, ops,
-    trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, trace_hybrid,
 };
 use poem_ir::{Dim, Layout, Operation, Trace, Ty};
-
-struct NoFacts;
-
-impl Classify for NoFacts {
-    fn of(_: &Request) -> NoFacts {
-        NoFacts
-    }
-    fn word(&self) -> u64 {
-        0
-    }
-}
 
 #[derive(Clone, Copy)]
 enum Axis {
@@ -39,13 +27,11 @@ const VOCAB: u32 = 2304;
 const TAPS: u32 = 4;
 
 impl ForwardHybrid for OneGather {
-    type Facts = NoFacts;
-
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let table = Weight::sym("pos_embed", [u64::from(VOCAB), HIDDEN], Dtype::Bf16);
         let taps = match self.gather {
             Gather::Plain => 1,

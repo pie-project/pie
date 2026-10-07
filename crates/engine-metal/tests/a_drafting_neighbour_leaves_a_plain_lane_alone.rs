@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use engine_metal::{Boot, Lane, Shell};
 use poem_compiler::Budget;
-use poem_dsl::{Classify, Platform, Request};
+use poem_dsl::{Platform, Request};
 
 const SKU: &str = "dsv4-flash-mini-mtp-u4g64-u2g64-mxfp4-kv-bf16";
 const PROMPT_A: &[u32] = &[0, 671, 6102, 294, 8760, 344, 270, 4593, 294];

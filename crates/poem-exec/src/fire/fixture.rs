@@ -34,6 +34,7 @@ impl Build {
     pub(crate) fn new() -> Build {
         Build {
             trace: Trace {
+                facts: Default::default(),
                 name: "hand-built".to_string(),
                 platform: Platform::Cuda,
                 params: Vec::new(),

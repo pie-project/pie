@@ -34,10 +34,8 @@ fn every_armed_body_answers_its_eager_walk() {
     };
     let sku = models::deployment(SKU).expect("the catalog ships the mini-dit row");
     let trace = sku.trace(Platform::Cuda);
-    let mut engine = engine_cuda::open(engine_cuda::DeviceBoot::default(), contract_for, |name| {
-        models::deployment(name).map(|sku| sku.classify)
-    })
-    .expect("the engine opens");
+    let mut engine = engine_cuda::open(engine_cuda::DeviceBoot::default(), contract_for)
+        .expect("the engine opens");
     let loaded = engine
         .load(LoadRequest {
             trace,

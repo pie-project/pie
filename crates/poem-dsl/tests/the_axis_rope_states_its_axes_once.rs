@@ -1,19 +1,7 @@
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, RopeForm, Value, ops,
-    seam, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, RopeForm, Value, ops, seam, trace_hybrid,
 };
 use poem_ir::{Def, Dim, Elementwise, Operands, Operation, RuntimeInput, Ty};
-
-struct NoFacts;
-
-impl Classify for NoFacts {
-    fn of(_: &Request) -> NoFacts {
-        NoFacts
-    }
-    fn word(&self) -> u64 {
-        0
-    }
-}
 
 struct OneRope {
     axes: u8,
@@ -26,11 +14,10 @@ struct OneRope {
 const HEADS: u32 = 2;
 
 impl ForwardHybrid for OneRope {
-    type Facts = NoFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let q = inputs.latents(0, HEADS * self.head_dim, Dtype::Bf16);
         let positions = inputs.axis_positions(0, self.axes);
         let q = ops::elemwise::rope_axes(

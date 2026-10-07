@@ -41,9 +41,11 @@ fn container(snapshot: &Path) -> Option<PathBuf> {
 }
 
 fn word(query_len: u32) -> u64 {
-    (models::deployment(SKU)
+    models::deployment(SKU)
         .expect("the catalog ships the SKU")
-        .classify)(&Request::new(query_len, false))
+        .trace(models::Platform::Cuda)
+        .facts
+        .word(&Request::new(query_len, false))
 }
 
 fn ready(what: &str) -> Option<Shell> {
@@ -73,7 +75,6 @@ fn ready(what: &str) -> Option<Shell> {
     let shell = Shell::load(Boot {
         voxels: None,
         deferred_tier: false,
-        classify: sku.classify,
         residency: engine_cuda::experts::Plan::default(),
         trace,
         contract: &contract,

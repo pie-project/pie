@@ -339,6 +339,7 @@ fn load_engine(
         has_attn_score: caps.profile.has_attn_score,
         has_lora: caps.profile.has_lora,
         device_geometry_port_mask: caps.ports,
+        facts: caps.facts.clone(),
         limits: runtime::engine::SchedulerLimits {
             max_forward_requests: caps.limits.max_lanes as usize,
             max_forward_tokens: caps.limits.max_tokens as usize,

@@ -1,8 +1,8 @@
 use super::*;
 use crate::forward::Input;
 
-pub fn plan_decode<F>(
-    inputs: &Input<F>,
+pub fn plan_decode(
+    inputs: &Input,
     q_heads: u32,
     kv_heads: u32,
     head_dim: u32,
@@ -31,8 +31,8 @@ pub fn plan_decode<F>(
     plan
 }
 
-pub fn plan_prefill<F>(
-    inputs: &Input<F>,
+pub fn plan_prefill(
+    inputs: &Input,
     q_heads: u32,
     kv_heads: u32,
     head_dim: u32,
@@ -811,7 +811,7 @@ pub fn ssm_kda_chunked(
     y
 }
 
-pub fn mla_plan<F>(inputs: &Input<F>, heads: u32, kv_lora_rank: u32) -> Value {
+pub fn mla_plan(inputs: &Input, heads: u32, kv_lora_rank: u32) -> Value {
     let kv_indptr = inputs.kv_indptr();
     let kv_indices = inputs.kv_indices();
     let last_page_len = inputs.last_page_len();

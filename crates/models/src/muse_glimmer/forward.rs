@@ -1,53 +1,9 @@
-use poem_dsl::{Classify, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, ops, seam};
+use poem_dsl::fact;
+use poem_dsl::{ForwardHybrid, HybridSpec, Input, Value, ops, seam};
 
 use super::model::{Model, Reading};
 
-pub struct Facts {
-    pub qo_one: bool,
-    pub masked: bool,
-    pub has_adapter: bool,
-    pub captures_scores: bool,
-}
-
-impl Facts {
-    pub fn qo_one() -> Predicate {
-        Predicate::fact(0)
-    }
-
-    pub fn masked() -> Predicate {
-        Predicate::fact(1)
-    }
-
-    pub fn has_adapter() -> Predicate {
-        Predicate::fact(2)
-    }
-
-    pub fn captures_scores() -> Predicate {
-        Predicate::fact(3)
-    }
-}
-
-impl Classify for Facts {
-    fn of(r: &Request) -> Facts {
-        Facts {
-            qo_one: r.query_len() == 1,
-            masked: r.has_custom_mask(),
-            has_adapter: r.has_adapter(),
-            captures_scores: r.captures_scores(),
-        }
-    }
-
-    fn word(&self) -> u64 {
-        u64::from(self.qo_one)
-            | (u64::from(self.masked) << 1)
-            | (u64::from(self.has_adapter) << 2)
-            | (u64::from(self.captures_scores) << 3)
-    }
-}
-
 impl ForwardHybrid for Model {
-    type Facts = Facts;
-
     fn caches(&self) -> HybridSpec {
         let mut c = HybridSpec::new();
         let kv = c.kv_space(self.kv);
@@ -59,19 +15,14 @@ impl ForwardHybrid for Model {
         c
     }
 
-    fn forward(&self, inputs: Input<Facts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let m = self;
         let d = m.head_dim;
 
         let windows = [Some(m.window), None];
-        let classes = [
-            Facts::masked(),
-            Facts::captures_scores(),
-            Facts::qo_one(),
-            Predicate::rest(),
-        ];
-        let [input_m, input_s, input_d, input_p] = inputs.split(classes.clone());
-        let plans = |input: &Input<Facts>, decode: bool| {
+        let classes = [fact::has(fact::Mask), fact::scores(), fact::single_token()];
+        let ([input_m, input_s, input_d], input_p) = inputs.partition(classes.clone());
+        let plans = |input: &Input, decode: bool| {
             windows.map(|win| {
                 if decode {
                     ops::attn::plan_decode(input, m.q_heads, m.kv_heads, d, win)
@@ -121,7 +72,7 @@ impl ForwardHybrid for Model {
             );
             seam::at(seam::ATTN_Q, &[&q]);
 
-            let [mq, sq, dq, p] = q.split(classes.clone());
+            let ([mq, sq, dq], p) = q.partition(classes.clone());
             let so = match w.reading {
                 Reading::Sliding => {
                     ops::attn::prefill(&sq, &plan_s[reading], pages, win, d, m.kv_heads, m.sm_scale)
@@ -161,8 +112,8 @@ impl ForwardHybrid for Model {
             let gate = ops::linear::matmul(&normed, &w.gate);
             let o = ops::linear::matmul(&ops::elemwise::gate_sigmoid_mul(&a, &gate), &w.o_proj);
             let o = {
-                let (adapted, _) = o.split(&Facts::has_adapter());
-                let (px, _) = normed.split(&Facts::has_adapter());
+                let adapted = o.on(fact::has(fact::Adapter));
+                let px = normed.on(fact::has(fact::Adapter));
                 ops::linear::lora_correct(&px, &w.lora_a, &w.lora_b, &routes, &adapted)
             };
 

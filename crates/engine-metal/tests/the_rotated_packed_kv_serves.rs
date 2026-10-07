@@ -37,7 +37,7 @@ use engine_metal::store::pool_demand;
 use engine_metal::{Boot, Lane, Shell};
 use models::qwen_3::model::Model;
 use poem_compiler::Budget;
-use poem_dsl::{Classify, Dtype, Platform, Request};
+use poem_dsl::{Dtype, Platform, Request};
 
 // ---- the micro_text shape (head_dim is the free axis this test sweeps) -------
 const HIDDEN: usize = 128;

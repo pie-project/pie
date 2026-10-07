@@ -5,11 +5,10 @@ use std::time::Instant;
 
 use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
-use models::flux_2::forward::Facts;
 use models::flux_2::model::{IN_CHANNELS, Model};
 use models::flux_2::vae;
 use poem_compiler::{Budget, VoxelLadder};
-use poem_dsl::{Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, trace_hybrid};
+use poem_dsl::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, trace_hybrid};
 
 struct OneArm {
     model: Model,
@@ -17,11 +16,10 @@ struct OneArm {
 }
 
 impl ForwardHybrid for OneArm {
-    type Facts = Facts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<Facts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let v = self
             .model
             .vae
@@ -118,11 +116,11 @@ fn fire(
         .unwrap_or_else(|why| panic!("the artifact does not hold this arm's planes: {why}"));
     drop(src);
     let contract = &contract;
-    let word =
-        Facts::of(&poem_dsl::Request::new(1, false).on_stream(poem_dsl::Stream::Image)).word();
+    let word = trace
+        .facts
+        .word(&poem_dsl::Request::new(1, false).on_stream(poem_dsl::Stream::Image));
     let started = Instant::now();
     let mut shell = Shell::load(Boot {
-        classify: |request| Facts::of(request).word(),
         trace,
         contract,
         checkpoint: root,

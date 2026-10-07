@@ -1,28 +1,13 @@
-use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, ops, seam,
-    trace_hybrid,
-};
+use poem_dsl::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, ops, seam, trace_hybrid};
 use poem_ir::{Def, Dim, Layout, Operands, Operation, RuntimeInput, Selection, Ty};
-
-struct NoFacts;
-
-impl Classify for NoFacts {
-    fn of(_: &Request) -> NoFacts {
-        NoFacts
-    }
-    fn word(&self) -> u64 {
-        0
-    }
-}
 
 struct PackThenUnpack;
 
 impl ForwardHybrid for PackThenUnpack {
-    type Facts = NoFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let x = inputs.latents(0, 24, Dtype::Bf16);
         let perm = inputs.row_permutation();
         let packed = ops::layout::pack_rows(&x, &perm);

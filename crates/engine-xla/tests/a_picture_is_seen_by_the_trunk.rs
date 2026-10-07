@@ -229,8 +229,8 @@ fn a_solid_square_is_named_by_its_colour() {
         return;
     }
     let trace = m.sku.trace(Platform::Xla);
-    let classify = m.sku.classify;
-    let word = |len: u32, media: bool| classify(&Request::new(len, false).with_media(media));
+    let facts = m.sku.trace(models::Platform::Xla).facts;
+    let word = |len: u32, media: bool| facts.word(&Request::new(len, false).with_media(media));
 
     // The first patch rows (embedding plus position table) and the tower's
     // output, which the trunk's scatter lands onto the pad rows.

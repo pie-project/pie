@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use models::hunyuan_image_3::forward::{DENOISE, ENCODE, Facts, IMAGE_IN, IMAGE_OUT};
+use models::hunyuan_image_3::forward::{DENOISE, ENCODE, IMAGE_IN, IMAGE_OUT};
 use models::hunyuan_image_3::model::{self, Dims};
 use models::{PortKind, ReadoutKind, ScheduleKind};
 use poem_dsl::{
-    Attention, Classify, Def, Elementwise, Linear, Operation, Platform, Request, RopeForm,
-    RuntimeInput, Stream, Trace, seam,
+    Attention, Def, Elementwise, Linear, Operation, Platform, Request, RopeForm, RuntimeInput,
+    Stream, Trace, seam,
 };
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
@@ -198,7 +198,7 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
         let classes = poem_dsl::resolve_classes(&plan)
             .unwrap_or_else(|why| panic!("{sku}: a merge does not resolve: {why:?}"));
         let facts = row(sku).generative.as_ref().expect("generative facts");
-        let catalog = row(sku);
+        let _catalog = row(sku);
         let mut seen: Vec<(String, usize)> = Vec::new();
         let lanes: Vec<(String, u8, Stream, u32)> = facts
             .readings
@@ -221,9 +221,8 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
         for (name, reading, stream, rows) in lanes {
             let request = Request::new(rows, false)
                 .on_stream(stream)
-                .in_reading(reading);
-            let w = (catalog.classify)(&request);
-            assert_eq!(w, Facts::of(&request).word(), "{sku} {name}");
+                .in_reading(reading_name(reading));
+            let w = plan.facts.word(&request);
             let class = classes
                 .class_of(w & classes.mask)
                 .unwrap_or_else(|| panic!("{sku}: `{name}` has no class"));
@@ -499,5 +498,16 @@ fn every_row_bakes_on_every_platform_at_its_own_rank() {
             0
         };
         assert_eq!(reduces, want, "{sku}: one all-reduce per cut projection");
+    }
+}
+
+/// The name of the reading the forward's code `reading` stands for.
+fn reading_name(reading: u8) -> &'static str {
+    match reading {
+        ENCODE => "encode",
+        DENOISE => "denoise",
+        IMAGE_IN => "image.in",
+        IMAGE_OUT => "image.out",
+        other => panic!("no reading has code {other}"),
     }
 }

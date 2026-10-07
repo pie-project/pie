@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use models::minimax_h3::forward::Facts;
 use models::minimax_h3::model::{self, Dims};
 use models::{PortKind, ReadoutKind, ScheduleKind};
 use poem_dsl::{
-    Attention, Classify, Def, Dim, Dtype, Elementwise, Operation, Platform, RaggedMask, Request,
-    RopeForm, RuntimeInput, Stream, Trace, Ty, seam,
+    Attention, Def, Dim, Dtype, Elementwise, Operation, Platform, RaggedMask, Request, RopeForm,
+    RuntimeInput, Stream, Trace, Ty, seam,
 };
 
 const FLAGSHIP: &str = "minimax-h3-fl2va-bf16-kv-bf16";
@@ -221,16 +220,11 @@ fn every_lane_the_facts_list_lands_in_a_class_where_the_merges_resolve() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
         let classes = poem_dsl::resolve_classes(&plan).expect("every merge resolves");
-        let catalog = row(sku);
+        let _catalog = row(sku);
         let mut seen: Vec<((&str, Stream), usize)> = Vec::new();
-        for (name, index, stream) in lanes(sku) {
-            let request = Request::new(4, false).on_stream(stream).in_reading(index);
-            let word = (catalog.classify)(&request);
-            assert_eq!(
-                word,
-                Facts::of(&request).word(),
-                "`{sku}` {name}/{stream:?}"
-            );
+        for (name, _index, stream) in lanes(sku) {
+            let request = Request::new(4, false).on_stream(stream).in_reading(name);
+            let word = plan.facts.word(&request);
             let class = classes
                 .class_of(word & classes.mask)
                 .unwrap_or_else(|| panic!("`{sku}`: a {name}/{stream:?} lane has no class"));

@@ -8,7 +8,8 @@ pub mod pattern;
 mod record;
 
 pub use declare::*;
-pub use facts::*;
+pub use facts as fact;
+pub use facts::Predicate;
 pub use forward::*;
 pub use poem_ir::{
     Attention, BlockDrafter, CacheRow, Collective, Def, Dim, Dtype, Elementwise, GateActivation,
@@ -16,26 +17,9 @@ pub use poem_ir::{
     ParamSource, Platform, RaggedMask, RopeForm, RuntimeInput, Selection, Shard, Stream, Trace, Ty,
     ValueId, VoxelSegment, resolve_classes,
 };
-pub use record::{Primitive, Recorder, Refine, SplitSpec, Value};
+pub use record::{Arm, Primitive, Recorder, Refine, Switch, Value, switch};
 
 pub type TraceFn = fn(Platform) -> Trace;
-
-pub use poem_ir::ClassifyFn;
-
-#[macro_export]
-macro_rules! catalog {
-    ($( ($name:literal, $tp:literal, $trace:path, $m:expr $(,)?) ),+ $(,)?) => {
-        &[ $( (
-            $name,
-            $tp,
-            (|platform| {
-                let model = $m;
-                $trace($name, &model, platform)
-            }) as _,
-            (|request: &$crate::Request| $crate::word_of(|| $m, request)) as _,
-        ) ),+ ]
-    };
-}
 
 pub mod seam {
 

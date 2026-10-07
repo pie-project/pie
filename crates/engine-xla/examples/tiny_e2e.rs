@@ -107,7 +107,7 @@ fn run(
     let loaded = t0.elapsed().as_secs_f64();
 
     let t1 = Instant::now();
-    let probes = shell.synthetic_fires(sku.classify, 24, true);
+    let probes = shell.synthetic_fires(24, true);
     let fired = t1.elapsed().as_secs_f64();
     let mut fires = 0;
     for p in &probes {
@@ -145,7 +145,8 @@ fn run(
 
 /// Prefill against a token-by-token walk of the same prompt.
 fn agree(shell: &mut Shell, sku: &models::Deployment) -> Result<String, String> {
-    let word = |query_len: u32| (sku.classify)(&Request::new(query_len, false));
+    let facts = sku.trace(models::Platform::Xla).facts;
+    let word = |query_len: u32| facts.word(&Request::new(query_len, false));
     let vocab = shell.out_width();
     let mut lcg = 0x2545_f491_4f6c_dd1du64;
     let prompt: Vec<u32> = (0..12)

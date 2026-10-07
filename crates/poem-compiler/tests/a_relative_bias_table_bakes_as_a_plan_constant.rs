@@ -1,22 +1,8 @@
 mod common;
 
 use poem_compiler::Placement;
-use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Request, Value, Weight, ops, seam,
-    trace_hybrid,
-};
+use poem_dsl::{Dtype, ForwardHybrid, HybridSpec, Input, Value, Weight, ops, seam, trace_hybrid};
 use poem_ir::{Attention, Elementwise, Operation, RaggedMask};
-
-struct NoFacts;
-
-impl Classify for NoFacts {
-    fn of(_: &Request) -> NoFacts {
-        NoFacts
-    }
-    fn word(&self) -> u64 {
-        0
-    }
-}
 
 const WIDTH: u32 = 64;
 const HEADS: u32 = 4;
@@ -28,11 +14,10 @@ const NUM_BUCKETS: u32 = 32;
 struct Encoder;
 
 impl ForwardHybrid for Encoder {
-    type Facts = NoFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };

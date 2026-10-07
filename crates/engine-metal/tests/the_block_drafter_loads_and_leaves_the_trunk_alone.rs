@@ -6,7 +6,7 @@ use std::time::Instant;
 use engine::fire::{Mask, Masking};
 use engine_metal::{Boot, Lane, Seated, Shell};
 use poem_compiler::Budget;
-use poem_dsl::{Classify, Platform, Request};
+use poem_dsl::{Platform, Request};
 
 const SKU: &str = "qwen36-27b-dflash-u4g64-kv-bf16";
 const PLAIN_SKU: &str = "qwen36-27b-mtp-u4g64-kv-bf16";

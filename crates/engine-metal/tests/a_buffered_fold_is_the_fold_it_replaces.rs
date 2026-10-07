@@ -6,7 +6,7 @@ use engine::fire::{FoldLen, RsReset, RsVerb};
 use engine_metal::serve::Seated;
 use engine_metal::{Boot, Lane, Shell};
 use poem_compiler::Budget;
-use poem_dsl::{Classify, Dtype, Platform, Request};
+use poem_dsl::{Dtype, Platform, Request};
 
 const WINDOW: usize = 6;
 

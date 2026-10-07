@@ -29,7 +29,8 @@ fn a_prompt_is_answered_and_its_decode_agrees_with_its_prefill() {
     };
     let (checkpoint, sku, contract) = (m.checkpoint.clone(), m.sku, &m.contract);
     let trace = sku.trace(Platform::Xla);
-    let word = |query_len: u32| (sku.classify)(&Request::new(query_len, false));
+    let facts = sku.trace(models::Platform::Xla).facts;
+    let word = |query_len: u32| facts.word(&Request::new(query_len, false));
     let context = 512;
 
     let _device = engine_xla::bench::lock_device();

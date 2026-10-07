@@ -1,7 +1,6 @@
 use poem_dsl::ops::spatial::{self, Conv};
 use poem_dsl::{Dtype, Input, Value, Weight, ops, seam};
 
-use super::forward::Facts;
 use super::model::{CHANNELS, Linear, port};
 
 pub const SCALING_FACTOR: f32 = 0.3611;
@@ -203,7 +202,7 @@ impl Vae {
     }
 }
 
-pub fn decode(arm: &Input<Facts>, vae: &Vae) -> Value {
+pub fn decode(arm: &Input, vae: &Vae) -> Value {
     let d = &vae.decoder;
     let mut grid = arm.grid();
     let z = arm.voxels(port::VOXELS, CHANNELS, Dtype::Bf16);
@@ -230,7 +229,7 @@ pub fn decode(arm: &Input<Facts>, vae: &Vae) -> Value {
     y
 }
 
-pub fn encode(arm: &Input<Facts>, vae: &Vae) -> Value {
+pub fn encode(arm: &Input, vae: &Vae) -> Value {
     let e = &vae.encoder;
     let mut grid = arm.grid();
     let x = arm.voxels(port::PIXEL_VOXELS, RGB, Dtype::Bf16);

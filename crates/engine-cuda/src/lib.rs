@@ -66,7 +66,7 @@ pub fn lane_shifted(op: &str) -> bool {
     kernels_cuda::seat::reads(op) == Reads::RowsAndLanes
 }
 
-pub use api::{ClassifyFor, ContractFor, Cuda, DeviceBoot, World};
+pub use api::{ContractFor, Cuda, DeviceBoot, World};
 pub use boot::{open, ordinal_of};
 pub use error::{Fault, Result};
 pub use group::{Group, open_group};

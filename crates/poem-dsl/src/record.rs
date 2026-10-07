@@ -57,6 +57,7 @@ impl Recorder {
                 nodes: Vec::new(),
                 drafter: None,
                 seams: Vec::new(),
+                facts: poem_ir::Facts::default(),
             })),
             at: Rc::new(Cell::new(None)),
         }
@@ -221,6 +222,13 @@ impl Recorder {
             .any(|seam| seam.seam == name && seam.values.contains(&value.id))
     }
 
+    /// The guard over the rows `predicate` holds for, its facts given bits
+    /// in the order the trace first reads them.
+    #[must_use]
+    pub fn guard_of(&self, predicate: &Predicate) -> Guard {
+        predicate.guard(&mut self.inner.borrow_mut().facts)
+    }
+
     pub fn enter(&self, layer: u32) {
         self.at.set(Some(layer));
     }
@@ -371,10 +379,22 @@ impl Value {
         }
     }
 
-    pub fn split<S: SplitSpec>(&self, spec: S) -> S::Arms<Value> {
-        spec.arms(self)
+    /// The rows of this value `predicate` holds for.
+    #[must_use]
+    pub fn on(&self, predicate: Predicate) -> Value {
+        self.refined(self.rec.guard_of(&predicate))
     }
 
+    /// This value's rows parted by `cases`: each arm is the rows the first
+    /// case to hold for them names, and the last is the rows none holds for.
+    #[must_use]
+    pub fn partition<const N: usize>(&self, cases: [Predicate; N]) -> ([Value; N], Value) {
+        partition(self, &self.rec, cases)
+    }
+
+    /// Joins arms computed over disjoint rows into one value over all of
+    /// them. [`switch`] is the form a branch takes; this is for arms a
+    /// program carries apart over a longer span.
     #[must_use]
     pub fn merge(arms: Vec<Value>) -> Value {
         assert!(arms.len() >= 2, "a merge wants at least two arms");
@@ -460,37 +480,94 @@ pub trait Refine: Sized {
     fn refined(&self, cond: Guard) -> Self;
 }
 
-pub trait SplitSpec {
-    type Arms<T>;
-    fn arms<T: Refine>(self, of: &T) -> Self::Arms<T>;
+pub(crate) fn partition<T: Refine, const N: usize>(
+    of: &T,
+    rec: &Recorder,
+    cases: [Predicate; N],
+) -> ([T; N], T) {
+    let mut rest = Guard::Always;
+    let arms = cases.map(|case| {
+        let holds = rec.guard_of(&case);
+        let mine = Guard::and(rest.clone(), holds.clone());
+        rest = Guard::and(rest.clone(), Guard::not(holds));
+        of.refined(mine)
+    });
+    (arms, of.refined(rest))
 }
 
-impl SplitSpec for &Predicate {
-    type Arms<T> = (T, T);
+/// What a [`switch`] arm computes: a value, or several, each joined across
+/// the arms.
+pub trait Arm: Sized {
+    fn join(arms: Vec<Self>) -> Self;
+}
 
-    fn arms<T: Refine>(self, of: &T) -> (T, T) {
-        let c = cond_of(self);
-        (of.refined(c.clone()), of.refined(Guard::not(c)))
+impl Arm for Value {
+    fn join(mut arms: Vec<Value>) -> Value {
+        if arms.len() == 1 {
+            return arms.remove(0);
+        }
+        Value::merge(arms)
     }
 }
 
-impl<const N: usize> SplitSpec for [Predicate; N] {
-    type Arms<T> = [T; N];
+impl Arm for (Value, Value) {
+    fn join(arms: Vec<(Value, Value)>) -> (Value, Value) {
+        let (a, b) = arms.into_iter().unzip();
+        (Value::join(a), Value::join(b))
+    }
+}
 
-    fn arms<T: Refine>(self, of: &T) -> [T; N] {
-        let mut not_prior = Guard::Always;
-        self.each_ref().map(|p| {
-            let mine = match p {
-                Predicate::Rest => not_prior.clone(),
-                p => {
-                    let c = cond_of(p);
-                    let mine = Guard::and(not_prior.clone(), c.clone());
-                    not_prior = Guard::and(not_prior.clone(), Guard::not(c));
-                    mine
-                }
-            };
-            of.refined(mine)
-        })
+impl Arm for (Value, Value, Value) {
+    fn join(arms: Vec<(Value, Value, Value)>) -> (Value, Value, Value) {
+        let (mut a, mut b, mut c) = (Vec::new(), Vec::new(), Vec::new());
+        for (x, y, z) in arms {
+            a.push(x);
+            b.push(y);
+            c.push(z);
+        }
+        (Value::join(a), Value::join(b), Value::join(c))
+    }
+}
+
+/// Branches the rows of `x`: each case computes over the rows it is the
+/// first to hold for, and the arms are joined into one result over all of
+/// them.
+#[must_use]
+pub fn switch<T: Arm>(x: &Value) -> Switch<'_, T> {
+    Switch {
+        x,
+        rest: Guard::Always,
+        arms: Vec::new(),
+    }
+}
+
+#[must_use = "a switch computes nothing until it is ended"]
+pub struct Switch<'a, T> {
+    x: &'a Value,
+    rest: Guard,
+    arms: Vec<T>,
+}
+
+impl<T: Arm> Switch<'_, T> {
+    /// The rows `predicate` is the first case to hold for.
+    pub fn case(mut self, predicate: Predicate, arm: impl FnOnce(&Value) -> T) -> Self {
+        let holds = self.x.rec.guard_of(&predicate);
+        let rows = self.x.refined(Guard::and(self.rest.clone(), holds.clone()));
+        self.rest = Guard::and(self.rest.clone(), Guard::not(holds));
+        self.arms.push(arm(&rows));
+        self
+    }
+
+    /// The rows no case holds for, and the joined result.
+    pub fn otherwise(mut self, arm: impl FnOnce(&Value) -> T) -> T {
+        let rows = self.x.refined(self.rest.clone());
+        self.arms.push(arm(&rows));
+        T::join(self.arms)
+    }
+
+    /// The joined result, rows no case holds for computing nothing.
+    pub fn end(self) -> T {
+        T::join(self.arms)
     }
 }
 
@@ -526,15 +603,6 @@ fn restated(shard: &Shard, logical: &[u64], plane: &[u64], name: &str) -> Shard 
                 s / block
             })
             .collect(),
-    }
-}
-
-fn cond_of(p: &Predicate) -> Guard {
-    match p {
-        Predicate::Fact { bit } => Guard::Fact(*bit),
-        Predicate::Not(a) => Guard::not(cond_of(a)),
-        Predicate::And(a, b) => Guard::and(cond_of(a), cond_of(b)),
-        Predicate::Rest => panic!("Predicate::rest() belongs only in an n-way split"),
     }
 }
 

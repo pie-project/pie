@@ -1,24 +1,13 @@
-use std::marker::PhantomData;
-
 use poem_ir::{
     CacheRow, Dim, Dtype, GeomKind, Guard, Platform, RuntimeInput, Selection, Shard, Trace, Ty,
     ValueId,
 };
 
-use crate::record::{Recorder, Refine, SplitSpec, Value};
+use crate::facts::Predicate;
+use crate::record::{Recorder, Refine, Value};
 use crate::seam;
 
 pub use poem_ir::Request;
-
-pub trait Classify: Sized {
-    fn of(r: &Request) -> Self;
-    fn word(&self) -> u64;
-}
-
-#[must_use]
-pub fn word_of<M: ForwardHybrid>(_model: impl FnOnce() -> M, r: &Request) -> u64 {
-    <M::Facts as Classify>::of(r).word()
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KvSpace(pub u32);
@@ -118,9 +107,8 @@ impl DeclaredCache<'_> {
 }
 
 pub trait ForwardHybrid {
-    type Facts: Classify;
     fn caches(&self) -> HybridSpec;
-    fn forward(&self, inputs: Input<Self::Facts>) -> Value;
+    fn forward(&self, inputs: Input) -> Value;
 }
 
 pub fn trace_hybrid<M: ForwardHybrid>(name: &str, m: &M, platform: Platform) -> Trace {
@@ -131,7 +119,6 @@ pub fn trace_hybrid<M: ForwardHybrid>(name: &str, m: &M, platform: Platform) -> 
         rec: rec.clone(),
         caches,
         over: Guard::Always,
-        _facts: PhantomData,
     });
     let float_readout = seam::FLOAT_READOUTS
         .iter()
@@ -169,43 +156,45 @@ impl<T> Drop for Layers<'_, T> {
     }
 }
 
-pub struct Input<F> {
+#[derive(Clone)]
+pub struct Input {
     rec: Recorder,
     caches: HybridSpec,
     over: Guard,
-    _facts: PhantomData<F>,
 }
 
-impl<F> Clone for Input<F> {
-    fn clone(&self) -> Input<F> {
-        Input {
-            rec: self.rec.clone(),
-            caches: self.caches.clone(),
-            over: self.over.clone(),
-            _facts: PhantomData,
-        }
-    }
-}
-
-impl<F> Refine for Input<F> {
-    fn refined(&self, cond: Guard) -> Input<F> {
+impl Refine for Input {
+    fn refined(&self, cond: Guard) -> Input {
         Input {
             rec: self.rec.clone(),
             caches: self.caches.clone(),
             over: Guard::narrow(self.over.clone(), cond),
-            _facts: PhantomData,
         }
     }
 }
 
-impl<F> Input<F> {
+impl Input {
     #[must_use]
     pub fn recorder(&self) -> &Recorder {
         &self.rec
     }
 
-    pub fn split<S: SplitSpec>(&self, spec: S) -> S::Arms<Input<F>> {
-        spec.arms(self)
+    /// The rows `predicate` holds for.
+    #[must_use]
+    pub fn on(&self, predicate: Predicate) -> Input {
+        self.refined(self.rec.guard_of(&predicate))
+    }
+
+    /// The rows parted by `cases`, as [`Value::partition`] parts a value's.
+    #[must_use]
+    pub fn partition<const N: usize>(&self, cases: [Predicate; N]) -> ([Input; N], Input) {
+        crate::record::partition(self, &self.rec, cases)
+    }
+
+    /// The reading `name`: what `read` computes over the rows of passes that
+    /// run it.
+    pub fn reading<T>(&self, name: &str, read: impl FnOnce(&Input) -> T) -> T {
+        read(&self.on(crate::facts::reading(name)))
     }
 
     #[must_use]

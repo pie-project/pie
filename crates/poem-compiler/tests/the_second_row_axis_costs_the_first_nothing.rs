@@ -70,6 +70,7 @@ fn tower_and_trunk() -> Trace {
     }
 
     Trace {
+        facts: Default::default(),
         name: "tower-and-trunk".to_string(),
         platform: poem_ir::Platform::Cuda,
         params: Vec::<Param>::new(),

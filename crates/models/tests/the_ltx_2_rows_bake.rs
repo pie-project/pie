@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use models::ltx_2::forward::{DENOISE, Facts, REFINE_AUDIO, REFINE_VIDEO, VAE_DECODE};
+use models::ltx_2::forward::{DENOISE, REFINE_AUDIO, REFINE_VIDEO, VAE_DECODE};
 use models::ltx_2::model::{self, Dims};
 use models::{PortKind, ReadoutKind, ScheduleKind};
 use poem_dsl::{
-    Attention, Classify, Def, Dim, Dtype, Elementwise, GeomKind, Operands, Operation, Platform,
-    RaggedMask, Request, RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
+    Attention, Def, Dim, Dtype, Elementwise, GeomKind, Operands, Operation, Platform, RaggedMask,
+    Request, RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
 };
 
 const FLAGSHIP: &str = "ltx25-bf16-kv-bf16";
@@ -38,9 +38,9 @@ fn dims(sku: &str) -> Dims {
     }
 }
 
-fn word(reading: u8, stream: Stream) -> u64 {
+fn word(plan: &Trace, reading: &str, stream: Stream) -> u64 {
     let request = Request::new(4, false).on_stream(stream).in_reading(reading);
-    Facts::of(&request).word()
+    plan.facts.word(&request)
 }
 
 #[test]
@@ -232,15 +232,14 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
         let classes = poem_dsl::resolve_classes(&plan)
             .unwrap_or_else(|why| panic!("{sku}: a merge does not resolve: {why:?}"));
         let facts = row(sku).generative.as_ref().expect("facts");
-        let catalog = row(sku);
+        let _catalog = row(sku);
         let mut seen: Vec<((&str, Stream), usize)> = Vec::new();
         for reading in &facts.readings {
             for &stream in &reading.streams {
                 let request = Request::new(4, false)
                     .on_stream(stream)
-                    .in_reading(reading.index);
-                let w = (catalog.classify)(&request);
-                assert_eq!(w, Facts::of(&request).word(), "{sku} {stream:?}");
+                    .in_reading(reading.name);
+                let w = plan.facts.word(&request);
                 let class = classes
                     .class_of(w & classes.mask)
                     .unwrap_or_else(|| panic!("{sku}: `{}`/{stream:?} has no class", reading.name));
@@ -278,12 +277,12 @@ fn the_attentions_pair_as_the_architecture_says() {
                 other => panic!("{sku}: a ragged CSR that is not an indptr: {other:?}"),
             }
         };
-        let video = word(DENOISE, Stream::Video);
-        let audio = word(DENOISE, Stream::Audio);
-        let ctx = word(DENOISE, Stream::Context);
-        let actx = word(DENOISE, Stream::Reference);
-        let refine_v = word(REFINE_VIDEO, Stream::Text);
-        let refine_a = word(REFINE_AUDIO, Stream::Text);
+        let video = word(&plan, "denoise", Stream::Video);
+        let audio = word(&plan, "denoise", Stream::Audio);
+        let ctx = word(&plan, "denoise", Stream::Context);
+        let actx = word(&plan, "denoise", Stream::Reference);
+        let refine_v = word(&plan, "refine.video", Stream::Text);
+        let refine_a = word(&plan, "refine.audio", Stream::Text);
 
         let mut pairs: BTreeMap<(&str, &str), usize> = BTreeMap::new();
         let mut connector_reads = 0usize;

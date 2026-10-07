@@ -101,8 +101,8 @@ fn the_first_logits_track_upstream() {
         return;
     }
     let trace = m.sku.trace(Platform::Xla);
-    let classify = m.sku.classify;
-    let word = |len: u32| classify(&Request::new(len, false));
+    let facts = m.sku.trace(models::Platform::Xla).facts;
+    let word = |len: u32| facts.word(&Request::new(len, false));
 
     let wanted: Vec<String> = std::env::var("PIE_XLA_TRUNK_OPS")
         .unwrap_or_else(|_| "elementwise.residual_add".into())

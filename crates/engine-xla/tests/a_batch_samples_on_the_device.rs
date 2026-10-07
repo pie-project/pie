@@ -225,7 +225,8 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(12);
     let sku = m.sku;
-    let word = |query_len: u32| (sku.classify)(&Request::new(query_len, false));
+    let facts = sku.trace(models::Platform::Xla).facts;
+    let word = |query_len: u32| facts.word(&Request::new(query_len, false));
     let context = 512;
     let _device = engine_xla::bench::lock_device();
     let mut shell = Shell::load(Boot {

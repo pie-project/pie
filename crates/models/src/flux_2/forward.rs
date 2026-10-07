@@ -1,6 +1,7 @@
+use poem_dsl::fact;
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Predicate, RaggedMask,
-    Request, RopeForm, Stream, Value, Weight, ops, seam,
+    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, RaggedMask, RopeForm, Stream, Value,
+    Weight, ops, seam,
 };
 
 use crate::{
@@ -16,9 +17,6 @@ use super::model::{
 };
 
 pub const STREAM_BASE: u8 = 0;
-
-pub const READING_LO: u8 = 6;
-pub const READING_HI: u8 = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Readings {
@@ -220,54 +218,7 @@ pub fn sigmas(image_rows: u32, steps: u32) -> Vec<f32> {
         .collect()
 }
 
-pub struct Facts {
-    pub stream: Stream,
-    pub reading: u8,
-}
-
-impl Facts {
-    #[must_use]
-    pub fn text() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Text)
-    }
-
-    #[must_use]
-    pub fn image() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Image)
-    }
-
-    #[must_use]
-    pub fn reference() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Reference)
-    }
-
-    #[must_use]
-    pub fn reading_lo() -> Predicate {
-        Predicate::fact(READING_LO)
-    }
-
-    #[must_use]
-    pub fn reading_hi() -> Predicate {
-        Predicate::fact(READING_HI)
-    }
-}
-
-impl Classify for Facts {
-    fn of(r: &Request) -> Facts {
-        Facts {
-            stream: r.stream(),
-            reading: r.reading() & 3,
-        }
-    }
-
-    fn word(&self) -> u64 {
-        self.stream.word(STREAM_BASE) | (u64::from(self.reading & 3) << READING_LO)
-    }
-}
-
 impl ForwardHybrid for Model {
-    type Facts = Facts;
-
     fn caches(&self) -> HybridSpec {
         let mut c = HybridSpec::new();
         if let Some(te) = &self.te {
@@ -281,23 +232,14 @@ impl ForwardHybrid for Model {
         c
     }
 
-    fn forward(&self, inputs: Input<Facts>) -> Value {
-        let codes = self.readings();
-        let (hi, lo) = inputs.split(&Facts::reading_hi());
-        let (c3, c2) = hi.split(&Facts::reading_lo());
-        let (c1, c0) = lo.split(&Facts::reading_lo());
-        let arms = [c0, c1, c2, c3];
-        let arm = |code: u8| &arms[usize::from(code)];
-
-        if let (Some(code), Some(te)) = (codes.text, &self.te) {
-            text_encode(arm(code), te);
+    fn forward(&self, inputs: Input) -> Value {
+        if let Some(te) = &self.te {
+            inputs.reading("text", |text| text_encode(text, te));
         }
-        let velocity = denoise(arm(codes.denoise), self);
-        if let (Some(decode), Some(encode), Some(vae)) =
-            (codes.vae_decode, codes.vae_encode, &self.vae)
-        {
-            super::vae::decode(arm(decode), vae);
-            super::vae::encode(arm(encode), vae);
+        let velocity = inputs.reading("denoise", |rows| denoise(rows, self));
+        if let Some(vae) = &self.vae {
+            inputs.reading("vae.decode", |rows| super::vae::decode(rows, vae));
+            inputs.reading("vae.encode", |rows| super::vae::encode(rows, vae));
         }
         velocity
     }
@@ -310,7 +252,7 @@ pub fn te_tap() -> Option<u32> {
     std::env::var("PIE_FLUX2_TE_TAP").ok()?.parse().ok()
 }
 
-fn text_encode(arm: &Input<Facts>, te: &TextEncoder) {
+fn text_encode(arm: &Input, te: &TextEncoder) {
     let plan = ops::attn::plan_prefill(arm, te.q_heads, te.kv_heads, te.head_dim, None);
     let ids = arm.tokens();
     let positions = arm.positions();
@@ -481,12 +423,15 @@ fn ff_sublayer(x: &Value, ff: &Swiglu, m: &Mod, inter: u32, lanes: &Value) -> Va
     )
 }
 
-fn denoise(arm: &Input<Facts>, m: &Model) -> Value {
+fn denoise(arm: &Input, m: &Model) -> Value {
     let d = &m.dims;
     let dit: &Dit = &m.dit;
     let dim = d.dim;
 
-    let (txt_in, img_in) = arm.split(&Facts::text());
+    let (txt_in, img_in) = (
+        arm.on(fact::stream(Stream::Text)),
+        arm.on(!fact::stream(Stream::Text)),
+    );
 
     let lanes = arm.request_of_token();
     let positions = arm.axis_positions(port::POSITIONS, ROPE_AXES);
@@ -518,14 +463,20 @@ fn denoise(arm: &Input<Facts>, m: &Model) -> Value {
         None => temb,
     };
     let stemb = ops::elemwise::silu(&temb);
-    let (mod_txt, _) = ops::linear::matmul(&stemb, &dit.mod_txt).split(&Facts::text());
-    let (_, mod_img) = ops::linear::matmul(&stemb, &dit.mod_img).split(&Facts::text());
+    let mod_txt = ops::linear::matmul(&stemb, &dit.mod_txt).on(fact::stream(Stream::Text));
+    let mod_img = ops::linear::matmul(&stemb, &dit.mod_img).on(!fact::stream(Stream::Text));
     let mod_txt = adaln6(&mod_txt, dim);
     let mod_img = adaln6(&mod_img, dim);
     let mod_single = adaln3(&ops::linear::matmul(&stemb, &dit.mod_single), dim);
     let mod_out = ops::linear::matmul(&stemb, &dit.norm_out);
-    let (lanes_txt, lanes_img) = lanes.split(&Facts::text());
-    let (pos_txt, pos_img) = positions.split(&Facts::text());
+    let (lanes_txt, lanes_img) = (
+        lanes.on(fact::stream(Stream::Text)),
+        lanes.on(!fact::stream(Stream::Text)),
+    );
+    let (pos_txt, pos_img) = (
+        positions.on(fact::stream(Stream::Text)),
+        positions.on(!fact::stream(Stream::Text)),
+    );
 
     let mut txt = match &dit.context_embed {
         Some(w) => ops::linear::matmul(&txt_in.context(port::CONTEXT, d.context_in), w),
@@ -563,7 +514,10 @@ fn denoise(arm: &Input<Facts>, m: &Model) -> Value {
             &Value::merge(vec![tv, iv]),
             &joint,
         );
-        let (o_txt, o_img) = o.split(&Facts::text());
+        let (o_txt, o_img) = (
+            o.on(fact::stream(Stream::Text)),
+            o.on(!fact::stream(Stream::Text)),
+        );
         txt = ops::elemwise::gated_residual_add(
             &txt,
             &mod_txt.attn.gate,
@@ -602,10 +556,18 @@ fn denoise(arm: &Input<Facts>, m: &Model) -> Value {
         );
     }
 
-    let (_, img_all) = x.split(&Facts::text());
-    let (target, _refs) = img_all.split(&Facts::image());
-    let (mod_out, _) = mod_out.split(&Facts::text()).1.split(&Facts::image());
-    let (lanes_target, _) = lanes_img.split(&Facts::image());
+    let img_all = x.on(!fact::stream(Stream::Text));
+    let (target, _refs) = (
+        img_all.on(fact::stream(Stream::Image)),
+        img_all.on(!fact::stream(Stream::Image)),
+    );
+    let mod_out = (
+        mod_out.on(fact::stream(Stream::Text)),
+        mod_out.on(!fact::stream(Stream::Text)),
+    )
+        .1
+        .on(fact::stream(Stream::Image));
+    let lanes_target = lanes_img.on(fact::stream(Stream::Image));
     let h = norm_modulate(&target, &mod_out, &lanes_target);
     let velocity = ops::linear::matmul(&h, &dit.proj_out);
     seam::at(seam::VELOCITY, &[&velocity]);

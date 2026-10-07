@@ -1,6 +1,7 @@
+use poem_dsl::fact;
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Predicate, RaggedMask,
-    Request, RopeForm, Stream, Value, Weight, ops, seam,
+    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, RaggedMask, RopeForm, Stream, Value,
+    Weight, ops, seam,
 };
 
 use crate::{
@@ -16,10 +17,6 @@ use super::model::{
 use super::model::{CHANNELS, PATCH, SPATIAL_COMPRESSION};
 
 pub const STREAM_BASE: u8 = 0;
-
-pub const READING_LO: u8 = 6;
-pub const READING_MID: u8 = 7;
-pub const READING_HI: u8 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Readings {
@@ -236,59 +233,7 @@ impl Tap {
     }
 }
 
-pub struct Facts {
-    pub stream: Stream,
-    pub reading: u8,
-}
-
-impl Facts {
-    #[must_use]
-    pub fn text() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Text)
-    }
-
-    #[must_use]
-    pub fn image() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Image)
-    }
-
-    #[must_use]
-    pub fn context() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Context)
-    }
-
-    #[must_use]
-    pub fn reading_lo() -> Predicate {
-        Predicate::fact(READING_LO)
-    }
-
-    #[must_use]
-    pub fn reading_mid() -> Predicate {
-        Predicate::fact(READING_MID)
-    }
-
-    #[must_use]
-    pub fn reading_hi() -> Predicate {
-        Predicate::fact(READING_HI)
-    }
-}
-
-impl Classify for Facts {
-    fn of(r: &Request) -> Facts {
-        Facts {
-            stream: r.stream(),
-            reading: r.reading() & 7,
-        }
-    }
-
-    fn word(&self) -> u64 {
-        self.stream.word(STREAM_BASE) | (u64::from(self.reading & 7) << READING_LO)
-    }
-}
-
 impl ForwardHybrid for Model {
-    type Facts = Facts;
-
     fn caches(&self) -> HybridSpec {
         let mut c = HybridSpec::new();
         if let Some(te) = &self.te {
@@ -302,34 +247,21 @@ impl ForwardHybrid for Model {
         c
     }
 
-    fn forward(&self, inputs: Input<Facts>) -> Value {
-        let codes = self.readings();
-        let (hi, lo) = inputs.split(&Facts::reading_hi());
-        let (hi_mid, hi_low) = hi.split(&Facts::reading_mid());
-        let (lo_mid, lo_low) = lo.split(&Facts::reading_mid());
-        let (c7, c6) = hi_mid.split(&Facts::reading_lo());
-        let (c5, c4) = hi_low.split(&Facts::reading_lo());
-        let (c3, c2) = lo_mid.split(&Facts::reading_lo());
-        let (c1, c0) = lo_low.split(&Facts::reading_lo());
-        let arms = [c0, c1, c2, c3, c4, c5, c6, c7];
-        let arm = |code: u8| &arms[usize::from(code)];
-
-        if let (Some(code), Some(te)) = (codes.text, &self.te) {
-            text_encode(arm(code), te);
+    fn forward(&self, inputs: Input) -> Value {
+        if let Some(te) = &self.te {
+            inputs.reading("text", |text| text_encode(text, te));
         }
-        refine(arm(codes.refine), &self.dims, &self.dit);
-        let velocity = denoise(arm(codes.denoise), &self.dims, &self.dit);
-        if let (Some(decode), Some(encode), Some(vae)) =
-            (codes.vae_decode, codes.vae_encode, &self.vae)
-        {
-            super::vae::decode(arm(decode), vae);
-            super::vae::encode(arm(encode), vae);
+        inputs.reading("refine", |rows| refine(rows, &self.dims, &self.dit));
+        let velocity = inputs.reading("denoise", |rows| denoise(rows, &self.dims, &self.dit));
+        if let Some(vae) = &self.vae {
+            inputs.reading("vae.decode", |rows| super::vae::decode(rows, vae));
+            inputs.reading("vae.encode", |rows| super::vae::encode(rows, vae));
         }
         velocity
     }
 }
 
-fn text_encode(arm: &Input<Facts>, te: &TextEncoder) {
+fn text_encode(arm: &Input, te: &TextEncoder) {
     let plan = ops::attn::plan_prefill(arm, te.q_heads, te.kv_heads, te.head_dim, None);
     let ids = arm.tokens();
     let positions = arm.positions();
@@ -376,7 +308,7 @@ fn text_encode(arm: &Input<Facts>, te: &TextEncoder) {
     }
 }
 
-fn refine(arm: &Input<Facts>, d: &Dims, m: &Dit) {
+fn refine(arm: &Input, d: &Dims, m: &Dit) {
     let c = arm.context(port::CAPTION, d.cap_width);
     let c = ops::elemwise::rmsnorm(&c, &m.cap_norm, NORM_EPS);
     let c = linear(&m.cap_embed, &c);
@@ -401,8 +333,11 @@ fn refine(arm: &Input<Facts>, d: &Dims, m: &Dit) {
     }
 }
 
-fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
-    let (img, ctx) = arm.split(&Facts::image());
+fn denoise(arm: &Input, d: &Dims, m: &Dit) -> Value {
+    let (img, ctx) = (
+        arm.on(fact::stream(Stream::Image)),
+        arm.on(!fact::stream(Stream::Image)),
+    );
 
     let lanes = arm.request_of_token();
     let positions = arm.axis_positions(port::POSITIONS, ROPE_AXES);
@@ -420,9 +355,9 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
     let temb = linear(&m.t_mlp1, &ops::elemwise::silu(&linear(&m.t_mlp0, &temb)));
     debug_assert_eq!(temb.width(), u64::from(ADALN_DIM));
 
-    let (img_lanes, _) = lanes.split(&Facts::image());
-    let (img_positions, _) = positions.split(&Facts::image());
-    let (temb_img, _) = temb.split(&Facts::image());
+    let img_lanes = lanes.on(fact::stream(Stream::Image));
+    let img_positions = positions.on(fact::stream(Stream::Image));
+    let temb_img = temb.on(fact::stream(Stream::Image));
     let own = Geom {
         positions: img_positions,
         perm: img.row_permutation(),
@@ -488,7 +423,10 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
         );
         u = run_block(&u, block, Some((&mods, &lanes)), d, &joint);
         if tap == format!("layer{l}") {
-            let (ui, ci) = u.split(&Facts::image());
+            let (ui, ci) = (
+                u.on(fact::stream(Stream::Image)),
+                u.on(!fact::stream(Stream::Image)),
+            );
             let both = Value::merge(vec![ui, ci]);
             seam::at(seam::VELOCITY, &[&both]);
             return both;
@@ -496,8 +434,8 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
     }
 
     let scale = linear(&m.final_ada, &ops::elemwise::silu(&temb));
-    let (scale_img, _) = scale.split(&Facts::image());
-    let (ui, _) = u.split(&Facts::image());
+    let scale_img = scale.on(fact::stream(Stream::Image));
+    let ui = u.on(fact::stream(Stream::Image));
 
     let h = ops::elemwise::modulate(
         &ops::elemwise::layernorm_no_scale(&ui, FINAL_LN_EPS),

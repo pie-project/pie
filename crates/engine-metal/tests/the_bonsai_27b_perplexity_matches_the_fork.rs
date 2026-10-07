@@ -50,7 +50,7 @@ use models::qwen_3::forward::Facts;
 use models::qwen_3::model::Model;
 use models::qwen_3::rotation::{self, BONSAI_SIGN_WIDTHS};
 use poem_compiler::Budget;
-use poem_dsl::{Classify, Dtype, Platform, Request, trace_hybrid};
+use poem_dsl::{Dtype, Platform, Request, trace_hybrid};
 
 fn gguf_path() -> Option<PathBuf> {
     let p = std::env::var_os("BONSAI_GGUF")?;

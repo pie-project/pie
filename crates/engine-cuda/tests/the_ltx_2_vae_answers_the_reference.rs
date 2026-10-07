@@ -5,12 +5,11 @@ use std::time::Instant;
 
 use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
-use models::ltx_2::forward::{Facts, VAE_DECODE, vae_decode};
+use models::ltx_2::forward::vae_decode;
 use models::ltx_2::model::{Model, VAE_RGB, VAE_Z};
 use poem_compiler::{Budget, VoxelLadder};
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Stream, Value,
-    trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Stream, Value, trace_hybrid,
 };
 
 struct VaeOnly {
@@ -18,23 +17,17 @@ struct VaeOnly {
 }
 
 impl ForwardHybrid for VaeOnly {
-    type Facts = Facts;
-
     fn caches(&self) -> HybridSpec {
         self.model.caches()
     }
 
-    fn forward(&self, inputs: Input<Facts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let vae = self
             .model
             .vae
             .as_ref()
             .expect("the flagship carries the VAE");
-        let (hi, lo) = inputs.split(&Facts::reading_hi());
-        let (c3, c2) = hi.split(&Facts::reading_lo());
-        let (c1, c0) = lo.split(&Facts::reading_lo());
-        let arms = [c0, c1, c2, c3];
-        vae_decode(&arms[usize::from(VAE_DECODE)], vae)
+        inputs.reading("vae.decode", |rows| vae_decode(rows, vae))
     }
 }
 
@@ -124,13 +117,12 @@ fn boxed(shapes: &serde_json::Value, key: &str) -> ([u32; 3], usize) {
     )
 }
 
-fn word() -> u64 {
-    Facts::of(
+fn word(facts: &poem_ir::Facts) -> u64 {
+    facts.word(
         &Request::new(1, false)
             .on_stream(Stream::Video)
-            .in_reading(VAE_DECODE),
+            .in_reading("vae.decode"),
     )
-    .word()
 }
 
 fn fire(
@@ -166,7 +158,6 @@ fn fire(
     contract.tensors.retain(|t| keep.contains(&t.name));
     let started = Instant::now();
     let mut shell = Shell::load(Boot {
-        classify: |request| Facts::of(request).word(),
         trace,
         contract: &contract,
         checkpoint: root,
@@ -197,7 +188,7 @@ fn fire(
     let tokens = [0u32];
     let lanes = [Seated::of(Lane {
         slot: 0,
-        word: word(),
+        word: word(&shell.trace().facts),
         tokens: &tokens,
     })];
     let bytes = bf16_bytes(payload);

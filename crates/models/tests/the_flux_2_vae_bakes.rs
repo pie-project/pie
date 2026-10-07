@@ -3,10 +3,9 @@ use std::path::PathBuf;
 
 use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{Expr, Partition, TensorType};
-use models::flux_2::forward::Facts;
 use models::flux_2::{model, vae};
 use models::{PortKind, ReadoutKind};
-use poem_dsl::{Classify, Def, Dim, Dtype, Operation, Platform, Request, Stream, Trace, Ty, seam};
+use poem_dsl::{Def, Dim, Dtype, Operation, Platform, Request, Stream, Trace, Ty, seam};
 use poem_ir::{GridRule, ParamLayout, Seam, Spatial};
 
 const KLEIN: &str = "flux2-klein-4b-bf16-kv-bf16";
@@ -281,8 +280,8 @@ fn each_vae_lane_has_a_class_of_its_own() {
     let facts = row(KLEIN).generative.as_ref().expect("facts");
     let class_of = |name: &str, stream: Stream| {
         let r = reading(facts, name);
-        let request = Request::new(4, false).on_stream(stream).in_reading(r.index);
-        let word = Facts::of(&request).word();
+        let request = Request::new(4, false).on_stream(stream).in_reading(r.name);
+        let word = plan.facts.word(&request);
         classes
             .class_of(word & classes.mask)
             .unwrap_or_else(|| panic!("a {name} lane has no class"))

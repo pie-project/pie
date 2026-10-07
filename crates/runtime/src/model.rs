@@ -369,6 +369,7 @@ fn compiled_tokenizer(metadata: &ModelMetadata) -> Option<Result<Tokenizer>> {
 pub fn register(
     name: String,
     model_id: &str,
+    facts: poem_ir::Facts,
     kv_page_size: u32,
     rs: RsCaps,
     eta: EtaCaps,
@@ -401,7 +402,6 @@ pub fn register(
         .verify(&tokenizer)
         .map_err(|fault| anyhow!("`{model_id}` refuses this artifact's tokenizer: {fault}"))?;
     let instruct = (deployment.template)(tokenizer.clone());
-    let classify = deployment.classify;
     let diffusion = deployment.diffusion;
     let generative = deployment.generative.clone();
     if let Some(generative) = &generative {
@@ -414,7 +414,7 @@ pub fn register(
         name,
         arch_name: row.arch,
         instruct,
-        classify,
+        facts,
         kv_page_size,
         rs_caps: rs,
         eta_caps: eta,
@@ -594,7 +594,7 @@ pub struct Model {
     name: String,
     arch_name: &'static str,
     instruct: Arc<dyn Instruct>,
-    classify: models::ClassifyFn,
+    facts: poem_ir::Facts,
     kv_page_size: u32,
     rs_caps: RsCaps,
     eta_caps: EtaCaps,
@@ -726,17 +726,19 @@ impl Model {
         stream: models::Stream,
         reading: u8,
     ) -> u64 {
-        (self.classify)(
-            &models::Request::new(query_len, custom_mask)
-                .adapted(adapter)
-                .drafting(drafts)
-                .capturing_scores(captures_scores)
-                .with_media(media)
-                .drafting_a_block(block_draft)
-                .denoising(denoise)
-                .on_stream(stream)
-                .in_reading(reading),
-        )
+        let request = models::Request::new(query_len, custom_mask)
+            .adapted(adapter)
+            .drafting(drafts)
+            .capturing_scores(captures_scores)
+            .with_media(media)
+            .drafting_a_block(block_draft)
+            .denoising(denoise)
+            .on_stream(stream);
+        let request = match self.readings().get(usize::from(reading)) {
+            Some(fact) => request.in_reading(fact.name),
+            None => request,
+        };
+        self.facts.word(&request)
     }
 
     pub fn diffusion(&self) -> Option<models::Diffusion> {

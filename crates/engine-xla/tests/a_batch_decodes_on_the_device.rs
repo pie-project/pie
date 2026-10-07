@@ -21,7 +21,8 @@ fn decode_step_time_by_batch_width() {
         return;
     };
     let sku = m.sku;
-    let word = |query_len: u32| (sku.classify)(&Request::new(query_len, false));
+    let facts = sku.trace(models::Platform::Xla).facts;
+    let word = |query_len: u32| facts.word(&Request::new(query_len, false));
     let widths: Vec<u32> = std::env::var("PIE_XLA_BENCH_WIDTHS")
         .ok()
         .map(|s| s.split(',').filter_map(|w| w.parse().ok()).collect())

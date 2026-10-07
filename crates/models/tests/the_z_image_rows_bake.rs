@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use models::z_image::forward::Facts;
 use models::z_image::model::{self, Dims};
 use models::{PortKind, ReadoutKind, ScheduleKind};
 use poem_dsl::{
-    Attention, Classify, Def, Dim, Dtype, Elementwise, GeomKind, Operation, Platform, Request,
-    RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
+    Attention, Def, Dim, Dtype, Elementwise, GeomKind, Operation, Platform, Request, RopeForm,
+    RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
 };
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
@@ -40,10 +39,6 @@ fn dims(sku: &str) -> Dims {
     }
 }
 
-fn codes(sku: &str) -> (u8, u8, u8) {
-    if sku == TURBO { (0, 1, 2) } else { (0, 0, 1) }
-}
-
 fn lanes(sku: &str) -> Vec<(&'static str, u8, Stream)> {
     let facts = row(sku)
         .generative
@@ -61,9 +56,9 @@ fn lanes(sku: &str) -> Vec<(&'static str, u8, Stream)> {
         .collect()
 }
 
-fn word(reading: u8, stream: Stream) -> u64 {
+fn word(plan: &Trace, reading: &str, stream: Stream) -> u64 {
     let request = Request::new(4, false).on_stream(stream).in_reading(reading);
-    Facts::of(&request).word()
+    plan.facts.word(&request)
 }
 
 #[test]
@@ -288,12 +283,11 @@ fn every_declared_lane_classifies_into_its_own_class_where_every_merge_resolves(
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
         let classes = poem_dsl::resolve_classes(&plan).expect("every merge resolves");
-        let catalog = row(sku);
+        let _catalog = row(sku);
         let mut seen: Vec<((&str, Stream), usize)> = Vec::new();
-        for (name, index, stream) in lanes(sku) {
-            let request = Request::new(4, false).on_stream(stream).in_reading(index);
-            let word = (catalog.classify)(&request);
-            assert_eq!(word, Facts::of(&request).word(), "{sku} {name} {stream:?}");
+        for (name, _index, stream) in lanes(sku) {
+            let request = Request::new(4, false).on_stream(stream).in_reading(name);
+            let word = plan.facts.word(&request);
             let class = classes
                 .class_of(word & classes.mask)
                 .unwrap_or_else(|| panic!("{sku}: a {name}/{stream:?} lane has no class"));
@@ -351,13 +345,13 @@ fn the_refiners_attend_within_a_lane_and_the_trunk_within_the_group() {
             "{sku}"
         );
 
-        let (text, refine, denoise) = codes(sku);
+        let (text, refine, denoise) = ("text", "refine", "denoise");
         let (_, joint, _) = ragged.iter().find(|(kind, _, _)| *kind == "group").unwrap();
-        assert!(joint.holds(word(denoise, Stream::Image)));
-        assert!(joint.holds(word(denoise, Stream::Context)));
-        assert!(!joint.holds(word(refine, Stream::Context)));
+        assert!(joint.holds(word(&plan, denoise, Stream::Image)));
+        assert!(joint.holds(word(&plan, denoise, Stream::Context)));
+        assert!(!joint.holds(word(&plan, refine, Stream::Context)));
         if sku == TURBO {
-            assert!(!joint.holds(word(text, Stream::Text)));
+            assert!(!joint.holds(word(&plan, text, Stream::Text)));
         }
         let mut lane_selects: Vec<Selection> = Vec::new();
         for (_, select, _) in ragged.iter().filter(|(kind, _, _)| *kind == "lane") {
@@ -367,14 +361,14 @@ fn the_refiners_attend_within_a_lane_and_the_trunk_within_the_group() {
         }
         assert_eq!(lane_selects.len(), 2, "{sku}: two refiner selections");
         assert!(lane_selects.iter().any(|s| {
-            s.holds(word(refine, Stream::Context))
-                && !s.holds(word(denoise, Stream::Image))
-                && !s.holds(word(denoise, Stream::Context))
+            s.holds(word(&plan, refine, Stream::Context))
+                && !s.holds(word(&plan, denoise, Stream::Image))
+                && !s.holds(word(&plan, denoise, Stream::Context))
         }));
         assert!(lane_selects.iter().any(|s| {
-            s.holds(word(denoise, Stream::Image))
-                && !s.holds(word(denoise, Stream::Context))
-                && !s.holds(word(refine, Stream::Context))
+            s.holds(word(&plan, denoise, Stream::Image))
+                && !s.holds(word(&plan, denoise, Stream::Context))
+                && !s.holds(word(&plan, refine, Stream::Context))
         }));
 
         let prefills = plan

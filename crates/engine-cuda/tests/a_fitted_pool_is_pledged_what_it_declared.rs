@@ -91,7 +91,6 @@ fn a_fitted_pool_is_pledged_what_it_declared() {
     let mut shell = Shell::load(Boot {
         voxels: None,
         deferred_tier: false,
-        classify: sku.classify,
         residency: engine_cuda::experts::Plan::default(),
         trace,
         contract: &contract,
@@ -159,7 +158,10 @@ fn a_fitted_pool_is_pledged_what_it_declared() {
     let readout: Vec<u32> = (0..rows).collect();
     let lane = Lane {
         slot: 0,
-        word: (sku.classify)(&Request::new(rows, false)),
+        word: sku
+            .trace(models::Platform::Cuda)
+            .facts
+            .word(&Request::new(rows, false)),
         tokens: &tokens,
     };
     let verify = Seated {

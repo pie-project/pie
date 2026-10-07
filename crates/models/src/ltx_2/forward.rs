@@ -1,7 +1,8 @@
+use poem_dsl::fact;
 use poem_dsl::ops::spatial;
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Predicate, RaggedMask,
-    Request, RopeForm, Stream, Value, Weight, ops, seam,
+    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, RaggedMask, RopeForm, Stream, Value,
+    Weight, ops, seam,
 };
 
 use crate::{
@@ -18,9 +19,6 @@ use super::model::{
 };
 
 pub const STREAM_BASE: u8 = 0;
-
-pub const READING_LO: u8 = 6;
-pub const READING_HI: u8 = 7;
 
 pub const DENOISE: u8 = 0;
 pub const REFINE_VIDEO: u8 = 1;
@@ -185,91 +183,32 @@ impl Model {
     }
 }
 
-pub struct Facts {
-    pub stream: Stream,
-    pub reading: u8,
-}
-
-impl Facts {
-    #[must_use]
-    pub fn video() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Video)
-    }
-
-    #[must_use]
-    pub fn audio() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Audio)
-    }
-
-    #[must_use]
-    pub fn context() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Context)
-    }
-
-    #[must_use]
-    pub fn audio_context() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Reference)
-    }
-
-    #[must_use]
-    pub fn text() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Text)
-    }
-
-    #[must_use]
-    pub fn reading_lo() -> Predicate {
-        Predicate::fact(READING_LO)
-    }
-
-    #[must_use]
-    pub fn reading_hi() -> Predicate {
-        Predicate::fact(READING_HI)
-    }
-}
-
-impl Classify for Facts {
-    fn of(r: &Request) -> Facts {
-        Facts {
-            stream: r.stream(),
-            reading: r.reading() & 3,
-        }
-    }
-
-    fn word(&self) -> u64 {
-        self.stream.word(STREAM_BASE) | (u64::from(self.reading & 3) << READING_LO)
-    }
-}
-
 impl ForwardHybrid for Model {
-    type Facts = Facts;
-
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input<Facts>) -> Value {
-        let (hi, lo) = inputs.split(&Facts::reading_hi());
-        let (c3, c2) = hi.split(&Facts::reading_lo());
-        let (c1, c0) = lo.split(&Facts::reading_lo());
-        let arms = [c0, c1, c2, c3];
-        let arm = |code: u8| &arms[usize::from(code)];
-
-        let velocity = denoise(arm(DENOISE), self);
+    fn forward(&self, inputs: Input) -> Value {
+        let velocity = inputs.reading("denoise", |rows| denoise(rows, self));
         let (text_in, caption) = (self.dims.text_in(), self.dims.caption);
-        refine(
-            arm(REFINE_VIDEO),
-            &self.connectors.0,
-            text_in,
-            self.connectors.0.rescale(caption),
-        );
-        refine(
-            arm(REFINE_AUDIO),
-            &self.connectors.1,
-            text_in,
-            self.connectors.1.rescale(caption),
-        );
+        inputs.reading("refine.video", |rows| {
+            refine(
+                rows,
+                &self.connectors.0,
+                text_in,
+                self.connectors.0.rescale(caption),
+            )
+        });
+        inputs.reading("refine.audio", |rows| {
+            refine(
+                rows,
+                &self.connectors.1,
+                text_in,
+                self.connectors.1.rescale(caption),
+            )
+        });
         if let Some(vae) = &self.vae {
-            let _ = vae_decode(arm(VAE_DECODE), vae);
+            let _ = inputs.reading("vae.decode", |rows| vae_decode(rows, vae));
         }
         velocity
     }
@@ -555,13 +494,22 @@ fn block(
     (xv, xa)
 }
 
-fn denoise(arm: &Input<Facts>, m: &Model) -> Value {
+fn denoise(arm: &Input, m: &Model) -> Value {
     let d = &m.dims;
     let dit: &Dit = &m.dit;
 
-    let (ctx, rest) = arm.split(&Facts::context());
-    let (actx, media) = rest.split(&Facts::audio_context());
-    let (vid, aud) = media.split(&Facts::video());
+    let (ctx, rest) = (
+        arm.on(fact::stream(Stream::Context)),
+        arm.on(!fact::stream(Stream::Context)),
+    );
+    let (actx, media) = (
+        rest.on(fact::stream(Stream::Reference)),
+        rest.on(!fact::stream(Stream::Reference)),
+    );
+    let (vid, aud) = (
+        media.on(fact::stream(Stream::Video)),
+        media.on(!fact::stream(Stream::Video)),
+    );
 
     let vg = Geom {
         lanes: vid.request_of_token(),
@@ -634,7 +582,7 @@ fn denoise(arm: &Input<Facts>, m: &Model) -> Value {
     velocity
 }
 
-fn refine(arm: &Input<Facts>, conn: &Connector, text_in: u32, rescale: f32) {
+fn refine(arm: &Input, conn: &Connector, text_in: u32, rescale: f32) {
     let g = Geom {
         lanes: arm.request_of_token(),
         positions: arm.axis_positions(port::TIME_POSITIONS, 1),
@@ -684,7 +632,7 @@ fn resnet(x: &Value, g: &Value, r: &VaeResnet) -> Value {
     ops::elemwise::add(x, &h)
 }
 
-pub fn vae_decode(arm: &Input<Facts>, vae: &Vae) -> Value {
+pub fn vae_decode(arm: &Input, vae: &Vae) -> Value {
     let mut g = arm.grid();
     let z = arm.voxels(port::VOXELS, VAE_Z, Dtype::Bf16);
     let z = ops::elemwise::mul_scalar(0.5, &ops::elemwise::add(&z, &z));

@@ -7,8 +7,7 @@ use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
 use poem_compiler::{Budget, VoxelLadder};
 use poem_dsl::ops::spatial::{self, Conv};
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, seam,
-    trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, seam, trace_hybrid,
 };
 
 const C_IN: usize = 8;
@@ -19,17 +18,6 @@ const TAPS: usize = 27;
 const EPS: f32 = 1e-6;
 
 const BOXES: [[usize; 3]; 2] = [[2, 4, 6], [1, 3, 5]];
-
-struct NoFacts;
-
-impl Classify for NoFacts {
-    fn of(_: &Request) -> NoFacts {
-        NoFacts
-    }
-    fn word(&self) -> u64 {
-        0
-    }
-}
 
 struct Decoder {
     conv1: Weight,
@@ -67,11 +55,10 @@ impl Decoder {
 }
 
 impl ForwardHybrid for Decoder {
-    type Facts = NoFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let g = inputs.grid();
         let x = inputs.voxels(0, C_IN as u32, Dtype::Bf16);
         let (h, g1) = spatial::conv3d(&x, &g, &self.conv1, Some(&self.b1), Conv::same3(), None);
@@ -358,10 +345,6 @@ fn scratch() -> PathBuf {
     dir
 }
 
-fn classify(_: &poem_ir::Request) -> u64 {
-    0
-}
-
 #[test]
 fn a_conv_decoder_fires_over_a_voxel_port_every_case() {
     the_decoder_answers_the_reference_for_two_clips_of_different_boxes();
@@ -392,7 +375,6 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
 
     let max_voxels: u32 = BOXES.iter().map(|b| voxels(*b) as u32).sum::<u32>() + 8;
     let mut shell = Shell::load(Boot {
-        classify,
         trace,
         contract: &contract,
         checkpoint: &container,
@@ -525,7 +507,6 @@ impl Causal {
 }
 
 impl ForwardHybrid for Causal {
-    type Facts = NoFacts;
     fn caches(&self) -> HybridSpec {
         let mut spec = HybridSpec::new();
         spec.state(
@@ -535,7 +516,7 @@ impl ForwardHybrid for Causal {
         );
         spec
     }
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let g = inputs.grid();
         let x = inputs.voxels(0, C_IN as u32, Dtype::Bf16);
         let cache = inputs.state("conv.cache");
@@ -672,7 +653,6 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
     };
     drop(source);
     let mut shell = Shell::load(Boot {
-        classify,
         trace,
         contract: &contract,
         checkpoint: &container,

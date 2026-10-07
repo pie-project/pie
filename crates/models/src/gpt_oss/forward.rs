@@ -1,60 +1,9 @@
-use poem_dsl::{Classify, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, ops, seam};
+use poem_dsl::fact;
+use poem_dsl::{ForwardHybrid, HybridSpec, Input, Value, ops, seam};
 
 use super::model::{Model, Reading};
 
-pub struct Facts {
-    pub qo_one: bool,
-    pub has_adapter: bool,
-    pub block_draft: bool,
-    pub captures_scores: bool,
-    pub masked: bool,
-}
-
-impl Facts {
-    pub fn qo_one() -> Predicate {
-        Predicate::fact(0)
-    }
-
-    pub fn has_adapter() -> Predicate {
-        Predicate::fact(1)
-    }
-
-    pub fn block_draft() -> Predicate {
-        Predicate::fact(2)
-    }
-
-    pub fn captures_scores() -> Predicate {
-        Predicate::fact(3)
-    }
-
-    pub fn masked() -> Predicate {
-        Predicate::fact(4)
-    }
-}
-
-impl Classify for Facts {
-    fn of(r: &Request) -> Facts {
-        Facts {
-            qo_one: r.query_len() == 1,
-            has_adapter: r.has_adapter(),
-            block_draft: r.drafts_a_block(),
-            captures_scores: r.captures_scores(),
-            masked: r.has_custom_mask(),
-        }
-    }
-
-    fn word(&self) -> u64 {
-        u64::from(self.qo_one)
-            | (u64::from(self.has_adapter) << 1)
-            | (u64::from(self.block_draft) << 2)
-            | (u64::from(self.captures_scores) << 3)
-            | (u64::from(self.masked) << 4)
-    }
-}
-
 impl ForwardHybrid for Model {
-    type Facts = Facts;
-
     fn caches(&self) -> HybridSpec {
         let mut c = HybridSpec::new();
         let kv = c.kv_space(self.kv);
@@ -69,22 +18,20 @@ impl ForwardHybrid for Model {
         c
     }
 
-    fn forward(&self, inputs: Input<Facts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let m = self;
 
         let mask = inputs.mask();
         let (_, trunk_inputs) = match &m.dflash {
-            Some(_) => inputs.split(&Facts::block_draft()),
+            Some(_) => (
+                inputs.on(fact::block_draft()),
+                inputs.on(!fact::block_draft()),
+            ),
             None => (inputs.clone(), inputs.clone()),
         };
         let positions = trunk_inputs.positions();
-        let classes = [
-            Facts::masked(),
-            Facts::captures_scores(),
-            Facts::qo_one(),
-            Predicate::rest(),
-        ];
-        let [input_m, input_s, input_d, input_p] = trunk_inputs.split(classes.clone());
+        let classes = [fact::has(fact::Mask), fact::scores(), fact::single_token()];
+        let ([input_m, input_s, input_d], input_p) = trunk_inputs.partition(classes.clone());
         let plan_m = [
             ops::attn::plan_prefill(&input_m, m.q_heads, m.kv_heads, m.head_dim, Some(m.window)),
             ops::attn::plan_prefill(&input_m, m.q_heads, m.kv_heads, m.head_dim, None),
@@ -105,7 +52,7 @@ impl ForwardHybrid for Model {
         let y = ops::layout::embed(&ids, &m.embed, m.vocab);
         let (h_block, mut y) = match &m.dflash {
             Some(_) => {
-                let (block, rest) = y.split(&Facts::block_draft());
+                let (block, rest) = (y.on(fact::block_draft()), y.on(!fact::block_draft()));
                 (Some(block), rest)
             }
             None => (None, y),
@@ -146,7 +93,7 @@ impl ForwardHybrid for Model {
                 Reading::Windowed => Some(m.window),
                 Reading::Full => None,
             };
-            let [mq, sq, dq, p] = q.split(classes.clone());
+            let ([mq, sq, dq], p) = q.partition(classes.clone());
             let a = Value::merge(vec![
                 {
                     let (o, lse) = ops::attn::masked_lse(
@@ -206,8 +153,8 @@ impl ForwardHybrid for Model {
             let o = ops::linear::matmul(&a, &at.o_proj);
             let o = ops::elemwise::add_bias(&at.o_bias, &o);
             let o = {
-                let (adapted, _) = o.split(&Facts::has_adapter());
-                let (px, _) = x.split(&Facts::has_adapter());
+                let adapted = o.on(fact::has(fact::Adapter));
+                let px = x.on(fact::has(fact::Adapter));
                 ops::linear::lora_correct(&px, &w.lora_a, &w.lora_b, &routes, &adapted)
             };
             y = ops::elemwise::residual_add(&o, &y);
@@ -245,7 +192,7 @@ impl ForwardHybrid for Model {
         let (x, hb) = match (&m.dflash, h_block) {
             (Some(dr), Some(block)) => {
                 let tapped = tapped.as_ref().expect("a block drafter tapped the trunk");
-                let hb = dr.arm(&inputs, tapped, &block, &mask, &Facts::block_draft());
+                let hb = dr.arm(&inputs, tapped, &block, &mask, &fact::block_draft());
                 (Value::merge(vec![hb.clone(), x]), Some(hb))
             }
             _ => (x, None),
@@ -253,7 +200,7 @@ impl ForwardHybrid for Model {
         let x = ops::layout::gather_rows(&x, &inputs.readout_rows());
         let logits = ops::linear::lm_head(&x, &m.head);
         if let Some(dr) = &m.dflash {
-            dr.plant_readout(&logits, &inputs, hb.as_ref(), &Facts::block_draft());
+            dr.plant_readout(&logits, &inputs, hb.as_ref(), &fact::block_draft());
         }
         logits
     }

@@ -1,11 +1,11 @@
 use std::collections::BTreeSet;
 
-use models::flux_2::forward::{self, Facts};
+use models::flux_2::forward;
 use models::flux_2::model;
 use models::{PortKind, ReadoutKind};
 use poem_dsl::{
-    Attention, Classify, Def, Dim, Dtype, Elementwise, GeomKind, Operands, Operation, Platform,
-    Request, RopeForm, RuntimeInput, Stream, Trace, Ty, ValueId, seam,
+    Attention, Def, Dim, Dtype, Elementwise, GeomKind, Operands, Operation, Platform, Request,
+    RopeForm, RuntimeInput, Stream, Trace, Ty, ValueId, seam,
 };
 
 const KLEIN: &str = "flux2-klein-4b-bf16-kv-bf16";
@@ -243,15 +243,14 @@ fn each_stream_of_the_denoise_reading_classifies_into_its_own_class() {
     for sku in [KLEIN, MINI] {
         let plan = trace(sku, Platform::Cuda);
         let classes = poem_dsl::resolve_classes(&plan).expect("every merge resolves");
-        let row = row(sku);
-        let codes = models::flux_2::model::Model::mini(Dtype::Bf16).readings();
-        let denoise = if sku == KLEIN { 1 } else { codes.denoise };
+        let _row = row(sku);
 
         let mut seen = Vec::new();
         for stream in [Stream::Text, Stream::Image, Stream::Reference] {
-            let request = Request::new(1, false).on_stream(stream).in_reading(denoise);
-            let word = (row.classify)(&request);
-            assert_eq!(word, Facts::of(&request).word(), "{sku} {stream:?}");
+            let request = Request::new(1, false)
+                .on_stream(stream)
+                .in_reading("denoise");
+            let word = plan.facts.word(&request);
             let class = classes
                 .class_of(word & classes.mask)
                 .unwrap_or_else(|| panic!("{sku}: a {stream:?} lane has no class"));
@@ -321,9 +320,12 @@ fn every_ragged_read_is_self_paired_over_the_group_csr() {
         else {
             panic!("{sku}: the joint CSR is not a group indptr");
         };
-        let denoise = if sku == KLEIN { 1 } else { 0 };
         let word = |stream: Stream| {
-            Facts::of(&Request::new(1, false).on_stream(stream).in_reading(denoise)).word()
+            plan.facts.word(
+                &Request::new(1, false)
+                    .on_stream(stream)
+                    .in_reading("denoise"),
+            )
         };
         for stream in [Stream::Text, Stream::Image, Stream::Reference] {
             assert!(
@@ -331,7 +333,7 @@ fn every_ragged_read_is_self_paired_over_the_group_csr() {
                 "{sku}: {stream:?} is in the joint group"
             );
         }
-        let text_reading = Facts::of(&Request::new(1, false).in_reading(0)).word();
+        let text_reading = plan.facts.word(&Request::new(1, false).in_reading("text"));
         if sku == KLEIN {
             assert!(
                 !select.holds(text_reading),

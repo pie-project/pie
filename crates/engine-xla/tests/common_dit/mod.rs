@@ -31,10 +31,11 @@ use eta_ir::op::Op;
 use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use eta_ir::validate::bind;
+use poem_dsl::fact;
 use poem_dsl::ops::spatial::{self, Conv};
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Predicate,
-    RaggedMask, Request, RopeForm, Stream, Trace, Value, Weight, ops, seam, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, RaggedMask, Request, RopeForm,
+    Stream, Trace, Value, Weight, ops, seam, trace_hybrid,
 };
 
 pub const WIDTH: u32 = 32;
@@ -82,36 +83,31 @@ pub fn device() -> Option<engine_xla::bench::DeviceLock> {
 
 // ------------------------------------------------------------ the DiT block
 
-pub struct StreamFacts(Stream);
-
-impl StreamFacts {
-    pub fn on(stream: Stream) -> Predicate {
-        Predicate::stream(0, stream)
-    }
-}
-
-impl Classify for StreamFacts {
-    fn of(r: &Request) -> StreamFacts {
-        StreamFacts(r.stream())
-    }
-    fn word(&self) -> u64 {
-        self.0.word(0)
-    }
+thread_local! {
+    /// The facts of the trace this thread's rig loaded, which its lanes are
+    /// worded by.
+    static FACTS: std::cell::RefCell<poem_ir::Facts> = std::cell::RefCell::default();
 }
 
 pub fn classify(request: &Request) -> u64 {
-    StreamFacts::of(request).word()
+    FACTS.with(|facts| facts.borrow().word(request))
+}
+
+fn remember(trace: &Trace) {
+    FACTS.with(|facts| *facts.borrow_mut() = trace.facts.clone());
 }
 
 pub struct DoubleBlock;
 
 impl ForwardHybrid for DoubleBlock {
-    type Facts = StreamFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<StreamFacts>) -> Value {
-        let (txt, img) = inputs.split(&StreamFacts::on(Stream::Text));
+    fn forward(&self, inputs: Input) -> Value {
+        let (txt, img) = (
+            inputs.on(fact::stream(Stream::Text)),
+            inputs.on(!fact::stream(Stream::Text)),
+        );
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
@@ -174,7 +170,10 @@ impl ForwardHybrid for DoubleBlock {
             RaggedMask::GroupBlockDiagonal,
         );
         let o = ops::layout::unpack_rows(&o, &perm);
-        let (o_txt, o_img) = o.split(&StreamFacts::on(Stream::Text));
+        let (o_txt, o_img) = (
+            o.on(fact::stream(Stream::Text)),
+            o.on(!fact::stream(Stream::Text)),
+        );
         let y_txt = ops::linear::matmul(&o_txt, &w("txt.o", WIDTH, HEAD_DIM));
         let y_img = ops::linear::matmul(&o_img, &w("img.o", WIDTH, HEAD_DIM));
         let r_txt = ops::elemwise::residual_add(&x_txt, &y_txt);
@@ -191,37 +190,29 @@ pub fn trace() -> Trace {
 
 // ------------------------------------------------------------ the two-axis plan
 
-pub struct VaeFacts(bool);
-
-impl VaeFacts {
-    pub fn is_vae() -> Predicate {
-        Predicate::fact(0)
-    }
-}
-
-impl Classify for VaeFacts {
-    fn of(r: &Request) -> VaeFacts {
-        VaeFacts(r.reading() & 1 == 1)
-    }
-    fn word(&self) -> u64 {
-        u64::from(self.0)
-    }
-}
-
+/// The word of a lane of the two-axis plan running `reading` (1 is the VAE).
 #[must_use]
 pub fn vae_word(reading: u8) -> u64 {
-    VaeFacts::of(&Request::new(1, false).in_reading(reading)).word()
+    let request = Request::new(1, false);
+    let request = if reading == VAE_READING {
+        request.in_reading("vae")
+    } else {
+        request
+    };
+    two_axis().facts.word(&request)
 }
 
 pub struct TwoAxis;
 
 impl ForwardHybrid for TwoAxis {
-    type Facts = VaeFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<VaeFacts>) -> Value {
-        let (vae, dit) = inputs.split(&VaeFacts::is_vae());
+    fn forward(&self, inputs: Input) -> Value {
+        let (vae, dit) = (
+            inputs.on(fact::reading("vae")),
+            inputs.on(!fact::reading("vae")),
+        );
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
@@ -602,7 +593,10 @@ impl Rig {
         let mut engine = Xla::new(DeviceBoot::default(), contract_for);
         let loaded = engine
             .load(LoadRequest {
-                trace: plan,
+                trace: {
+                    remember(&plan);
+                    plan
+                },
                 checkpoint: Checkpoint::Path(path),
                 budgets: Budgets {
                     max_lanes: 8,

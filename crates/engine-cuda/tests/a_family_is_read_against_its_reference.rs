@@ -104,7 +104,8 @@ fn every_probe_is_dumped() {
         }
     };
     let trace = sku.trace(Platform::Cuda);
-    let word = |query_len: u32| (sku.classify)(&Request::new(query_len, false));
+    let facts = sku.trace(models::Platform::Cuda).facts;
+    let word = |query_len: u32| facts.word(&Request::new(query_len, false));
     let budget = |key: &str| -> Option<u64> {
         let text = std::env::var(key).ok()?;
         let text = text.trim();
@@ -138,7 +139,6 @@ fn every_probe_is_dumped() {
     let mut shell = Shell::load(Boot {
         voxels: None,
         deferred_tier: false,
-        classify: sku.classify,
         trace,
         contract: &contract,
         checkpoint: &snapshot,

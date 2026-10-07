@@ -4,21 +4,9 @@ use poem_compiler::{
 };
 use poem_dsl::ops::spatial::{self, Conv};
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, ops, seam,
-    trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, seam, trace_hybrid,
 };
 use poem_ir::{Operands, Trace};
-
-struct NoFacts;
-
-impl Classify for NoFacts {
-    fn of(_: &Request) -> NoFacts {
-        NoFacts
-    }
-    fn word(&self) -> u64 {
-        0
-    }
-}
 
 const C: u32 = 8;
 
@@ -34,11 +22,10 @@ fn plane(name: &str, c: u32) -> Weight {
 struct Encoder;
 
 impl ForwardHybrid for Encoder {
-    type Facts = NoFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let g = inputs.grid();
         let x = inputs.voxels(0, C, Dtype::Bf16);
         let (h, g1) = spatial::conv3d(&x, &g, &conv("conv", C, C), None, Conv::same3(), None);
@@ -61,11 +48,10 @@ impl ForwardHybrid for Encoder {
 struct Decoder;
 
 impl ForwardHybrid for Decoder {
-    type Facts = NoFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let latents = inputs.latents(0, C * 4, Dtype::Bf16);
         let w = Weight::sym("proj", [u64::from(C) * 4, u64::from(C) * 4], Dtype::Bf16);
         let tokens = ops::linear::matmul(&latents, &w);

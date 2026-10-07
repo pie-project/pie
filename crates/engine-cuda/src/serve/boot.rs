@@ -148,7 +148,6 @@ pub const DEFAULT_GPU_MEM_UTILIZATION: f64 = 0.90;
 pub const DEFAULT_BODIES_MEGABYTES: u32 = 4096;
 
 pub struct Boot<'a> {
-    pub classify: poem_ir::ClassifyFn,
     pub trace: Trace,
     pub contract: &'a ModelContract,
     pub checkpoint: &'a Path,

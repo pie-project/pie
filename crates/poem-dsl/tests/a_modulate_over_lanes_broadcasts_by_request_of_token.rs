@@ -1,19 +1,8 @@
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Request, Value,
-    Weight, ops, seam, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Value, Weight, ops, seam,
+    trace_hybrid,
 };
 use poem_ir::{Def, Dim, Elementwise, GeomKind, Operation, RuntimeInput, Ty};
-
-struct NoFacts;
-
-impl Classify for NoFacts {
-    fn of(_: &Request) -> NoFacts {
-        NoFacts
-    }
-    fn word(&self) -> u64 {
-        0
-    }
-}
 
 const WIDTH: u32 = 64;
 const FREQ: u32 = 32;
@@ -27,11 +16,10 @@ enum By {
 struct AdaLn(By);
 
 impl ForwardHybrid for AdaLn {
-    type Facts = NoFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let x = inputs.latents(0, WIDTH, Dtype::Bf16);
         let ada = Weight::sym("ada", [2 * u64::from(WIDTH), u64::from(FREQ)], Dtype::Bf16);
         let gate = Weight::sym("gate", [u64::from(WIDTH), u64::from(FREQ)], Dtype::Bf16);
@@ -218,11 +206,10 @@ fn a_per_token_vector_names_no_lane_map() {
 struct WrongWidth;
 
 impl ForwardHybrid for WrongWidth {
-    type Facts = NoFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let x = inputs.latents(0, WIDTH, Dtype::Bf16);
         let m = inputs.lane_vector(0, WIDTH);
         ops::elemwise::modulate(

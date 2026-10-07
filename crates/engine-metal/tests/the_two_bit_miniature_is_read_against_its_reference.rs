@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use engine_metal::{Boot, Lane, Shell};
 use poem_compiler::Budget;
-use poem_dsl::{Classify, Platform, Request};
+use poem_dsl::{Platform, Request};
 
 const SKU: &str = "dsv4-flash-mini-u4g64-u2g64-kv-bf16";
 const REPO: &str = "models--mlx-community--DeepSeek-V4-Flash-2bit-DQ";

@@ -26,8 +26,6 @@ use crate::serve::{Attached, Boot, Graphs, Knobs, Lane, Seated, Shell};
 
 pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, String>;
 
-pub type ClassifyFor = fn(&str) -> Option<poem_ir::ClassifyFn>;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct World {
     pub rank: u32,
@@ -73,7 +71,6 @@ struct PendingStep {
 pub struct Cuda {
     boot: DeviceBoot,
     contract_for: ContractFor,
-    classify_for: ClassifyFor,
     shell: Option<Shell>,
     caps: Option<Capabilities>,
     next_fire: FireId,
@@ -86,12 +83,11 @@ pub struct Cuda {
 
 impl Cuda {
     #[must_use]
-    pub fn new(boot: DeviceBoot, contract_for: ContractFor, classify_for: ClassifyFor) -> Cuda {
+    pub fn new(boot: DeviceBoot, contract_for: ContractFor) -> Cuda {
         crate::serve::diag::publish(&boot.knobs.diagnostics);
         Cuda {
             boot,
             contract_for,
-            classify_for,
             shell: None,
             caps: None,
             next_fire: 1,
@@ -486,14 +482,7 @@ intended for diagnostics, not serving",
 
         let patches = patch_ladder(&trace, &budgets);
         let voxels = voxel_ladder(&trace, &budgets);
-        let classify = (self.classify_for)(&trace.name).ok_or_else(|| {
-            Error::Load(format!(
-                "this build ships no classifier for {:?}",
-                trace.name
-            ))
-        })?;
         let mut shell = Shell::load(Boot {
-            classify,
             trace,
             contract: &contract,
             checkpoint: &path,
@@ -609,6 +598,7 @@ intended for diagnostics, not serving",
             device_channel_commit: true,
             rs_verbs: true,
             bidirectional_attention: true,
+            facts: shell.trace().facts.clone(),
         };
 
         self.shell = Some(shell);
@@ -1323,6 +1313,7 @@ mod tests {
 
     fn trace_with(shape: Vec<Dim>) -> Trace {
         Trace {
+            facts: Default::default(),
             name: "gate".into(),
             platform: poem_ir::Platform::Cuda,
             params: Vec::new(),

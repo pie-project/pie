@@ -282,15 +282,16 @@ pub(crate) fn media_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir:
     })
 }
 
-const READINGS: u8 = 8;
-
 #[must_use]
 pub(crate) fn landing_requests(
-    classify: poem_ir::ClassifyFn,
+    facts: &poem_ir::Facts,
     classes: &poem_ir::ClassTable,
 ) -> Vec<Vec<poem_ir::Request>> {
     let mut landing = vec![Vec::new(); classes.classes.len()];
-    for reading in 0..READINGS {
+    let readings: Vec<Option<&str>> = std::iter::once(None)
+        .chain(facts.values("reading").map(Some))
+        .collect();
+    for reading in readings {
         for stream in poem_ir::Stream::ALL {
             for bits in 0..128u32 {
                 let request =
@@ -300,9 +301,12 @@ pub(crate) fn landing_requests(
                         .capturing_scores(bits & 16 != 0)
                         .with_media(bits & 32 != 0)
                         .denoising(bits & 64 != 0)
-                        .on_stream(stream)
-                        .in_reading(reading);
-                let word = classify(&request) & classes.mask;
+                        .on_stream(stream);
+                let request = match reading {
+                    Some(name) => request.in_reading(name),
+                    None => request,
+                };
+                let word = facts.word(&request) & classes.mask;
                 if let Some(class) = classes.class_of(word) {
                     landing[class].push(request);
                 }
@@ -324,7 +328,7 @@ fn request_flags(request: &poem_ir::Request) -> u32 {
         + u32::from(request.has_media())
         + u32::from(request.denoise())
         + u32::from(request.stream() != poem_ir::Stream::Text)
-        + u32::from(request.reading() != 0)
+        + u32::from(request.reading().is_some())
 }
 
 #[must_use]

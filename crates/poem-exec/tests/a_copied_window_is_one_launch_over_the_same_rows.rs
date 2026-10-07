@@ -171,11 +171,55 @@ fn sku() -> (Trace, CompiledModel) {
     (trace, compiled)
 }
 
+/// Three one-row lanes of three classes whose composition leaves some window
+/// in pieces, each piece one the table copies at the fire's bucket.
 fn fragmenting(compiled: &CompiledModel) -> Vec<Lane> {
-    [0usize, 4, 5]
-        .iter()
-        .map(|&class| Lane::new(compiled.classes.classes[class].word(), 1))
-        .collect()
+    let n = compiled.classes.classes.len();
+    let lanes = |picked: [usize; 3]| -> Vec<Lane> {
+        picked
+            .iter()
+            .map(|&class| Lane::new(compiled.classes.classes[class].word(), 1))
+            .collect()
+    };
+    for a in 0..n {
+        for b in 0..n {
+            for c in 0..n {
+                if a == b || b == c || a == c {
+                    continue;
+                }
+                let picked = lanes([a, b, c]);
+                let Ok(composition) = compose(compiled, &budget(), &picked) else {
+                    continue;
+                };
+                let Some(bucket) = budget()
+                    .buckets
+                    .iter()
+                    .position(|&rows| rows == composition.bucket())
+                else {
+                    continue;
+                };
+                let descriptor = FireDescriptor::of(&composition);
+                let fragmented: Vec<&Region> = compiled
+                    .template()
+                    .iter()
+                    .filter(|region| descriptor.spans(&region.mask).len() > 1)
+                    .collect();
+                if !fragmented.is_empty()
+                    && fragmented.iter().all(|region| {
+                        fallback::copies(
+                            compiled,
+                            poem_ir::RowAxis::Tokens,
+                            &region.mask,
+                            bucket as u32,
+                        )
+                    })
+                {
+                    return picked;
+                }
+            }
+        }
+    }
+    panic!("no three classes of `{SKU}` leave a window in pieces")
 }
 
 fn fire(
@@ -212,9 +256,9 @@ fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
 
     let composition = compose(&compiled, &budget(), &lanes).expect("three lanes compose");
     assert_eq!(
-        composition.present(),
-        [4, 0, 5],
-        "class 0 stands between 4 and 5"
+        composition.present().len(),
+        3,
+        "three classes stand in the fire"
     );
     let bucket = budget()
         .buckets

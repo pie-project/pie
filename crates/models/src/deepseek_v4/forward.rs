@@ -1,43 +1,7 @@
-use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, ValueId, Weight,
-    ops, seam,
-};
+use poem_dsl::fact;
+use poem_dsl::{Dtype, ForwardHybrid, HybridSpec, Input, Value, ValueId, Weight, ops, seam};
 
 use super::model::{Engram, Gate, GateUp, Hyper, Indexer, Mix, Mlp, Model, Pool, Selection};
-
-pub struct Facts {
-    pub qo_one: bool,
-    pub has_adapter: bool,
-    pub drafts: bool,
-}
-
-impl Facts {
-    pub fn qo_one() -> Predicate {
-        Predicate::fact(0)
-    }
-
-    pub fn has_adapter() -> Predicate {
-        Predicate::fact(1)
-    }
-
-    pub fn drafts() -> Predicate {
-        Predicate::fact(2)
-    }
-}
-
-impl Classify for Facts {
-    fn of(r: &Request) -> Facts {
-        Facts {
-            qo_one: r.query_len() == 1,
-            has_adapter: r.has_adapter(),
-            drafts: r.drafts(),
-        }
-    }
-
-    fn word(&self) -> u64 {
-        u64::from(self.qo_one) | (u64::from(self.has_adapter) << 1) | (u64::from(self.drafts) << 2)
-    }
-}
 
 /// What one sub-block hands the next under V4.1: the mixing coefficients it
 /// predicted (Single-Pass mHC reads the residual once, so a sub-block's input
@@ -55,8 +19,6 @@ struct PrevMix<'m> {
 }
 
 impl ForwardHybrid for Model {
-    type Facts = Facts;
-
     fn caches(&self) -> HybridSpec {
         let mut c = HybridSpec::new();
 
@@ -102,7 +64,7 @@ impl ForwardHybrid for Model {
         c
     }
 
-    fn forward(&self, inputs: Input<Facts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let m = self;
         let hy = &m.hyper;
 
@@ -171,13 +133,13 @@ impl ForwardHybrid for Model {
         };
 
         if let (Some(mtp), Some(head)) = (&m.mtp, &m.head) {
-            let (input_mtp, _) = inputs.split(&Facts::drafts());
+            let input_mtp = inputs.on(fact::drafts());
             let plan_mtp =
                 ops::attn::plan_prefill(&input_mtp, m.heads, kv_heads, m.head_dim, Some(m.window));
-            let (dstreams, _) =
-                ops::layout::gather_rows(&streams, &inputs.readout_rows()).split(&Facts::drafts());
-            let (dpos, _) = positions.split(&Facts::drafts());
-            let (dlogits, _) = logits.split(&Facts::drafts());
+            let dstreams =
+                ops::layout::gather_rows(&streams, &inputs.readout_rows()).on(fact::drafts());
+            let dpos = positions.on(fact::drafts());
+            let dlogits = logits.on(fact::drafts());
 
             let mut token = ops::layout::argmax(&[&dlogits]);
             let mut hidden = dstreams;
@@ -239,7 +201,7 @@ impl ForwardHybrid for Model {
 #[allow(clippy::too_many_arguments)]
 fn layer<'m>(
     m: &'m Model,
-    inputs: &Input<Facts>,
+    inputs: &Input,
     plan_p: &Value,
     positions: &Value,
     adapter_routes: &Value,
@@ -462,8 +424,8 @@ fn layer<'m>(
     };
     let o = ops::linear::matmul(&o, &at.o_up);
     let o = {
-        let (adapted, _) = o.split(&Facts::has_adapter());
-        let (px, _) = x.split(&Facts::has_adapter());
+        let adapted = o.on(fact::has(fact::Adapter));
+        let px = x.on(fact::has(fact::Adapter));
         ops::linear::lora_correct(&px, &w.lora_a, &w.lora_b, adapter_routes, &adapted)
     };
     let streams = ops::elemwise::hc_fold(&o, streams, &post_mix, &comb_mix);
@@ -600,13 +562,13 @@ fn premix(streams: &Value, prev: Option<&PrevMix<'_>>, m: &Model) -> Value {
 /// into one key per residual stream and a shared value; every stream adds the
 /// value under a gate that is a normalised dot product of the stream against
 /// its key (signed square root, then sigmoid).
-fn engram(streams: &Value, ids: &Value, inputs: &Input<Facts>, m: &Model, e: &Engram) -> Value {
+fn engram(streams: &Value, ids: &Value, inputs: &Input, m: &Model, e: &Engram) -> Value {
     let hy = &m.hyper;
     let state = inputs.state(&e.ids_state);
     let map = m.token_map.as_ref();
 
-    let one = Facts::qo_one();
-    let (ids_d, ids_p) = ids.split(&one);
+    let one = fact::single_token();
+    let (ids_d, ids_p) = (ids.on(one.clone()), ids.on(!one.clone()));
     let grams = Value::merge(vec![
         ops::attn::ple_ngram_ids(
             &ids_d,
@@ -954,7 +916,10 @@ fn gate(streams: &Value, mix: &Mix, hy: &Hyper) -> (Value, Value, Value) {
 }
 
 fn boundaries(positions: &Value, row_valid: &Value, ratio: u32) -> (Value, Value, Value) {
-    let (one, many) = positions.split(&Facts::qo_one());
+    let (one, many) = (
+        positions.on(fact::single_token()),
+        positions.on(!fact::single_token()),
+    );
     let (dpos, dreq, drope) = ops::attn::pool_boundary_decode(&one, row_valid, ratio);
     let (ppos, preq, prope) = ops::attn::pool_boundary_prefill(&many, row_valid, ratio);
     (

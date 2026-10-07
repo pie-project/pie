@@ -30,6 +30,7 @@ impl Build {
     fn new() -> Build {
         Build {
             trace: Trace {
+                facts: Default::default(),
                 name: "hand-built decoder".to_string(),
                 platform: Platform::Cuda,
                 params: Vec::new(),

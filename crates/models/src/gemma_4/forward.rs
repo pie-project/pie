@@ -1,84 +1,11 @@
+use poem_dsl::fact;
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, MropeForm, Predicate, Request, Value,
-    ValueId, Weight, ops, seam,
+    Dtype, ForwardHybrid, HybridSpec, Input, MropeForm, Value, ValueId, Weight, ops, seam,
 };
 
 use super::model::{Attn, AttnBanks, Clippable, Draft, Model, Reading, Tower};
 
-pub struct Facts {
-    pub qo_one: bool,
-    pub masked: bool,
-    pub has_adapter: bool,
-    pub media: bool,
-    pub drafts: bool,
-    pub captures_scores: bool,
-    pub block_draft: bool,
-    pub denoise: bool,
-}
-
-impl Facts {
-    pub fn qo_one() -> Predicate {
-        Predicate::fact(0)
-    }
-
-    pub fn masked() -> Predicate {
-        Predicate::fact(1)
-    }
-
-    pub fn has_adapter() -> Predicate {
-        Predicate::fact(2)
-    }
-
-    pub fn media() -> Predicate {
-        Predicate::fact(3)
-    }
-
-    pub fn drafts() -> Predicate {
-        Predicate::fact(4)
-    }
-
-    pub fn captures_scores() -> Predicate {
-        Predicate::fact(5)
-    }
-
-    pub fn block_draft() -> Predicate {
-        Predicate::fact(6)
-    }
-
-    pub fn denoise() -> Predicate {
-        Predicate::fact(7)
-    }
-}
-
-impl Classify for Facts {
-    fn of(r: &Request) -> Facts {
-        Facts {
-            qo_one: r.query_len() == 1,
-            masked: r.has_custom_mask(),
-            has_adapter: r.has_adapter(),
-            media: r.has_media(),
-            drafts: r.drafts(),
-            captures_scores: r.captures_scores(),
-            block_draft: r.drafts_a_block(),
-            denoise: r.denoise(),
-        }
-    }
-
-    fn word(&self) -> u64 {
-        u64::from(self.qo_one)
-            | (u64::from(self.masked) << 1)
-            | (u64::from(self.has_adapter) << 2)
-            | (u64::from(self.media) << 3)
-            | (u64::from(self.drafts) << 4)
-            | (u64::from(self.captures_scores) << 5)
-            | (u64::from(self.block_draft) << 6)
-            | (u64::from(self.denoise) << 7)
-    }
-}
-
 impl ForwardHybrid for Model {
-    type Facts = Facts;
-
     fn caches(&self) -> HybridSpec {
         let mut c = HybridSpec::new();
 
@@ -106,22 +33,20 @@ impl ForwardHybrid for Model {
         c
     }
 
-    fn forward(&self, inputs: Input<Facts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let m = self;
 
-        let qo_one = Facts::qo_one();
+        let qo_one = fact::single_token();
 
-        let classes = [
-            Facts::masked(),
-            Facts::captures_scores(),
-            qo_one.clone(),
-            Predicate::rest(),
-        ];
+        let classes = [fact::has(fact::Mask), fact::scores(), qo_one.clone()];
         let (_, trunk_inputs) = match &m.dflash {
-            Some(_) => inputs.split(&Facts::block_draft()),
+            Some(_) => (
+                inputs.on(fact::block_draft()),
+                inputs.on(!fact::block_draft()),
+            ),
             None => (inputs.clone(), inputs.clone()),
         };
-        let [input_m, input_s, input_d, input_p] = trunk_inputs.split(classes.clone());
+        let ([input_m, input_s, input_d], input_p) = trunk_inputs.partition(classes.clone());
         let positions = trunk_inputs.positions();
         let plan_m = [
             ops::attn::plan_prefill(
@@ -196,13 +121,13 @@ impl ForwardHybrid for Model {
         let mut y = embedded * (m.hidden as f32).sqrt();
 
         if let Some(t) = &towered {
-            let (imaged, _) = y.split(&Facts::media());
+            let imaged = y.on(fact::has(fact::Media));
             y = ops::layout::scatter_live_rows(t, &inputs.patch_routes(), &imaged).everywhere();
         }
 
         if let Some(sc) = &m.self_cond {
-            let (den, enc) = y.split(&Facts::denoise());
-            let (input_den, _) = inputs.split(&Facts::denoise());
+            let (den, enc) = (y.on(fact::bidirectional()), y.on(!fact::bidirectional()));
+            let input_den = inputs.on(fact::bidirectional());
             let soft = ops::layout::embed_weighted(
                 &input_den.self_cond_rows(sc.taps),
                 &input_den.self_cond_weights(sc.taps),
@@ -224,7 +149,7 @@ impl ForwardHybrid for Model {
         }
         let (h_block, mut y) = match &m.dflash {
             Some(_) => {
-                let (block, rest) = y.split(&Facts::block_draft());
+                let (block, rest) = (y.on(fact::block_draft()), y.on(!fact::block_draft()));
                 (Some(block), rest)
             }
             None => (None, y),
@@ -281,7 +206,7 @@ impl ForwardHybrid for Model {
 
             seam::at(seam::ATTN_Q, &[&q]);
 
-            let [mq, sq, dq, p] = q.split(classes.clone());
+            let ([mq, sq, dq], p) = q.partition(classes.clone());
             let so = match at.reading {
                 Reading::Sliding => ops::attn::prefill(
                     &sq,
@@ -340,8 +265,8 @@ impl ForwardHybrid for Model {
             seam::at(seam::ATTN_OUT, &[&a]);
             let o = ops::linear::matmul(&a, &w.o_proj);
             let o = {
-                let (adapted, _) = o.split(&Facts::has_adapter());
-                let (px, _) = normed.split(&Facts::has_adapter());
+                let adapted = o.on(fact::has(fact::Adapter));
+                let px = normed.on(fact::has(fact::Adapter));
                 ops::linear::lora_correct(&px, &w.lora_a, &w.lora_b, &routes, &adapted)
             };
 
@@ -416,7 +341,7 @@ impl ForwardHybrid for Model {
         let (x, hb) = match (&m.dflash, h_block) {
             (Some(d), Some(block)) => {
                 let tapped = tapped.as_ref().expect("a block drafter tapped the trunk");
-                let hb = d.arm(&inputs, tapped, &block, &mask, &Facts::block_draft());
+                let hb = d.arm(&inputs, tapped, &block, &mask, &fact::block_draft());
                 (Value::merge(vec![hb.clone(), x]), Some(hb))
             }
             _ => (x, None),
@@ -429,11 +354,11 @@ impl ForwardHybrid for Model {
             logits
         };
         if let Some(d) = &m.dflash {
-            d.plant_readout(&logits, &inputs, hb.as_ref(), &Facts::block_draft());
+            d.plant_readout(&logits, &inputs, hb.as_ref(), &fact::block_draft());
         }
 
         if let Some(a) = &m.draft {
-            let (input_draft, _) = inputs.split(&Facts::drafts());
+            let input_draft = inputs.on(fact::drafts());
             let plan_draft = ops::attn::plan_prefill(
                 &input_draft,
                 m.q_heads,
@@ -441,8 +366,8 @@ impl ForwardHybrid for Model {
                 m.global.head_dim,
                 None,
             );
-            let (dx, _) = x.split(&Facts::drafts());
-            let (dlogits, _) = logits.split(&Facts::drafts());
+            let dx = x.on(fact::drafts());
+            let dlogits = logits.on(fact::drafts());
             let chosen = ops::layout::argmax(&[&dlogits]);
 
             let e = ops::layout::embed(&chosen, &m.embed, m.vocab);
@@ -482,8 +407,8 @@ impl ForwardHybrid for Model {
         }
 
         if let Some(a) = &m.assistant {
-            let (input_draft, _) = inputs.split(&Facts::drafts());
-            let (dpos, _) = positions.split(&Facts::drafts());
+            let input_draft = inputs.on(fact::drafts());
+            let dpos = positions.on(fact::drafts());
             let plans = [
                 ops::attn::plan_prefill(
                     &input_draft,
@@ -500,8 +425,8 @@ impl ForwardHybrid for Model {
                     None,
                 ),
             ];
-            let (dx, _) = x.split(&Facts::drafts());
-            let (dlogits, _) = logits.split(&Facts::drafts());
+            let dx = x.on(fact::drafts());
+            let dlogits = logits.on(fact::drafts());
             let mut token = ops::layout::argmax(&[&dlogits]);
             let mut hidden = dx;
             let mut chain: Vec<Value> = Vec::with_capacity(a.depth as usize);
@@ -571,7 +496,7 @@ impl ForwardHybrid for Model {
     }
 }
 
-fn draft_attn(x: &Value, inputs: &Input<Facts>, m: &Model, plan: &Value, a: &Draft) -> Value {
+fn draft_attn(x: &Value, inputs: &Input, m: &Model, plan: &Value, a: &Draft) -> Value {
     let at = &a.attn;
     let d = m.global.head_dim;
     let pages = inputs.kv(&at.kv);
@@ -608,7 +533,7 @@ fn clipped(x: &Value, c: &Clippable) -> Value {
     ops::elemwise::clamp_learned(&ops::linear::matmul(&held, &c.bank), &k.out_lo, &k.out_hi)
 }
 
-fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
+fn tower(inputs: &Input, t: &Tower) -> Value {
     let d = t.head_dim;
     let x = inputs.patches(t.patch_width);
     let segments = inputs.patch_segments();
@@ -665,7 +590,7 @@ fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
 fn qkv_unfused(
     x: &Value,
     pos: &Value,
-    inputs: &Input<Facts>,
+    inputs: &Input,
     m: &Model,
     at: &Attn,
     d: u32,

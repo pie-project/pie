@@ -19,7 +19,6 @@ fn logits(trace: Trace, path: &Path, prompt: &[u32], decodes: u32) -> Vec<Vec<f3
     let mut shell = Shell::load(Boot {
         voxels: None,
         deferred_tier: false,
-        classify: sku.classify,
         residency: engine_cuda::experts::Plan::default(),
         trace,
         contract: &contract,
@@ -42,7 +41,8 @@ fn logits(trace: Trace, path: &Path, prompt: &[u32], decodes: u32) -> Vec<Vec<f3
     .expect("the shell loads");
     shell.open(0).expect("the slot opens");
     let mut fire = |tokens: &[u32]| {
-        let word = (sku.classify)(&Request::new(tokens.len() as u32, false));
+        let facts = sku.trace(models::Platform::Cuda).facts;
+        let word = facts.word(&Request::new(tokens.len() as u32, false));
         let rows = shell
             .fire(&[Lane {
                 slot: 0,

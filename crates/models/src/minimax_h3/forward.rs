@@ -1,6 +1,7 @@
+use poem_dsl::fact;
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Predicate, RaggedMask,
-    Request, RopeForm, Stream, Value, Weight, ops, seam,
+    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, RaggedMask, RopeForm, Stream, Value,
+    Weight, ops, seam,
 };
 
 use crate::{
@@ -17,9 +18,6 @@ use super::model::{
 };
 
 pub const STREAM_BASE: u8 = 0;
-
-pub const READING_LO: u8 = 6;
-pub const READING_HI: u8 = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Readings {
@@ -192,54 +190,7 @@ pub fn shifted_sigmas(shift: f32, steps: u32) -> Vec<f32> {
         .collect()
 }
 
-pub struct Facts {
-    pub stream: Stream,
-    pub reading: u8,
-}
-
-impl Facts {
-    #[must_use]
-    pub fn text() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Text)
-    }
-
-    #[must_use]
-    pub fn video() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Video)
-    }
-
-    #[must_use]
-    pub fn audio() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Audio)
-    }
-
-    #[must_use]
-    pub fn reading_lo() -> Predicate {
-        Predicate::fact(READING_LO)
-    }
-
-    #[must_use]
-    pub fn reading_hi() -> Predicate {
-        Predicate::fact(READING_HI)
-    }
-}
-
-impl Classify for Facts {
-    fn of(r: &Request) -> Facts {
-        Facts {
-            stream: r.stream(),
-            reading: r.reading() & 3,
-        }
-    }
-
-    fn word(&self) -> u64 {
-        self.stream.word(STREAM_BASE) | (u64::from(self.reading & 3) << READING_LO)
-    }
-}
-
 impl ForwardHybrid for Model {
-    type Facts = Facts;
-
     fn caches(&self) -> HybridSpec {
         let mut c = HybridSpec::new();
         if let Some(te) = &self.te {
@@ -253,23 +204,16 @@ impl ForwardHybrid for Model {
         c
     }
 
-    fn forward(&self, inputs: Input<Facts>) -> Value {
-        let codes = self.readings();
-        let (hi, lo) = inputs.split(&Facts::reading_hi());
-        let (c3, c2) = hi.split(&Facts::reading_lo());
-        let (c1, c0) = lo.split(&Facts::reading_lo());
-        let arms = [c0, c1, c2, c3];
-        let arm = |code: u8| &arms[usize::from(code)];
-
-        if let (Some(code), Some(te)) = (codes.text, &self.te) {
-            text_encode(arm(code), te);
+    fn forward(&self, inputs: Input) -> Value {
+        if let Some(te) = &self.te {
+            inputs.reading("text", |text| text_encode(text, te));
         }
-        refine(arm(codes.refine), &self.dims, &self.dit);
-        denoise(arm(codes.denoise), &self.dims, &self.dit)
+        inputs.reading("refine", |rows| refine(rows, &self.dims, &self.dit));
+        inputs.reading("denoise", |rows| denoise(rows, &self.dims, &self.dit))
     }
 }
 
-fn text_encode(arm: &Input<Facts>, te: &TextEncoder) {
+fn text_encode(arm: &Input, te: &TextEncoder) {
     let plan = ops::attn::plan_prefill(arm, te.q_heads, te.kv_heads, te.head_dim, None);
     let ids = arm.tokens();
     let positions = arm.positions();
@@ -368,7 +312,7 @@ fn mlp(x: &Value, m: &Mlp, d: &Dims) -> Value {
     )
 }
 
-fn refine(arm: &Input<Facts>, d: &Dims, m: &Dit) {
+fn refine(arm: &Input, d: &Dims, m: &Dit) {
     let mut x = linear(&m.condition, &arm.context(port::CAPTION, d.text_dim));
     let geom = Geom {
         perm: arm.row_permutation(),
@@ -427,7 +371,7 @@ fn column(v: &Value, slot: u32, total: u32) -> Value {
 }
 
 struct Side {
-    arm: Input<Facts>,
+    arm: Input,
     stream: Stream,
     stemb: Value,
 }
@@ -438,10 +382,19 @@ impl Side {
     }
 }
 
-fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
-    let (text, rest) = arm.split(&Facts::text());
-    let (video, rest) = rest.split(&Facts::video());
-    let (audio, reference) = rest.split(&Facts::audio());
+fn denoise(arm: &Input, d: &Dims, m: &Dit) -> Value {
+    let (text, rest) = (
+        arm.on(fact::stream(Stream::Text)),
+        arm.on(!fact::stream(Stream::Text)),
+    );
+    let (video, rest) = (
+        rest.on(fact::stream(Stream::Video)),
+        rest.on(!fact::stream(Stream::Video)),
+    );
+    let (audio, reference) = (
+        rest.on(fact::stream(Stream::Audio)),
+        rest.on(!fact::stream(Stream::Audio)),
+    );
 
     let lanes = arm.request_of_token();
     let positions = arm.axis_positions(port::POSITIONS, ROPE_AXES);
@@ -451,7 +404,7 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
         mask: RaggedMask::GroupBlockDiagonal,
     };
 
-    let side = |arm: Input<Facts>, stream: Stream| {
+    let side = |arm: Input, stream: Stream| {
         let t = column(
             &arm.lane_vector(port::TIMESTEP, TIMESTEP_SLOTS),
             timestep_slot(stream),
@@ -539,9 +492,12 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
         Some(&lanes),
         ModulateForm::ScaleShift,
     );
-    let (_, rest) = h.split(&Facts::text());
-    let (h_video, rest) = rest.split(&Facts::video());
-    let (h_audio, _) = rest.split(&Facts::audio());
+    let rest = h.on(!fact::stream(Stream::Text));
+    let (h_video, rest) = (
+        rest.on(fact::stream(Stream::Video)),
+        rest.on(!fact::stream(Stream::Video)),
+    );
+    let h_audio = rest.on(fact::stream(Stream::Audio));
     let velocity = linear(&m.video_out, &h_video);
     seam::at(seam::VELOCITY, &[&velocity]);
     let audio_velocity = linear(&m.audio_out, &h_audio);

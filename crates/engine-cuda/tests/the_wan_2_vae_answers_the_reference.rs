@@ -5,12 +5,10 @@ use std::time::Instant;
 
 use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
-use models::wan_2::forward::Facts;
 use models::wan_2::model::Model;
 use poem_compiler::{Budget, VoxelLadder};
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Stream, Value,
-    trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Stream, Value, trace_hybrid,
 };
 
 struct VaeOnly {
@@ -18,31 +16,22 @@ struct VaeOnly {
 }
 
 impl ForwardHybrid for VaeOnly {
-    type Facts = Facts;
-
     fn caches(&self) -> HybridSpec {
         self.model.caches()
     }
 
-    fn forward(&self, inputs: Input<Facts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let vae = self
             .model
             .vae
             .as_ref()
             .expect("the flagship carries the VAE");
-        let codes = self.model.readings();
-        let (top, bot) = inputs.split(&Facts::reading_top());
-        let (t_hi, t_lo) = top.split(&Facts::reading_hi());
-        let (b_hi, b_lo) = bot.split(&Facts::reading_hi());
-        let (c7, c6) = t_hi.split(&Facts::reading_lo());
-        let (c5, c4) = t_lo.split(&Facts::reading_lo());
-        let (c3, c2) = b_hi.split(&Facts::reading_lo());
-        let (c1, c0) = b_lo.split(&Facts::reading_lo());
-        let arms = [c0, c1, c2, c3, c4, c5, c6, c7];
-        let head = codes.vae_decode_head.expect("the head arm's code");
-        let rest = codes.vae_decode.expect("the later-frames arm's code");
-        let _ = models::wan_2::forward::vae_decode(&arms[usize::from(head)], vae, true);
-        models::wan_2::forward::vae_decode(&arms[usize::from(rest)], vae, false)
+        let _ = inputs.reading("vae.decode.head", |rows| {
+            models::wan_2::forward::vae_decode(rows, vae, true)
+        });
+        inputs.reading("vae.decode", |rows| {
+            models::wan_2::forward::vae_decode(rows, vae, false)
+        })
     }
 }
 
@@ -115,28 +104,30 @@ fn boxed(shapes: &serde_json::Value, key: &str) -> ([u32; 3], usize) {
     )
 }
 
-fn word(reading: u8) -> u64 {
-    Facts::of(
+fn word(facts: &poem_ir::Facts, reading: &str) -> u64 {
+    facts.word(
         &Request::new(1, false)
             .on_stream(Stream::Video)
             .in_reading(reading),
     )
-    .word()
 }
 
 struct Decoder {
     shell: Shell,
-    head: u8,
-    rest: u8,
+    facts: poem_ir::Facts,
 }
 
 impl Decoder {
     fn frame(&mut self, first: bool, clip: [u32; 3], payload: &[f32]) -> (Vec<f32>, [u32; 3]) {
-        let reading = if first { self.head } else { self.rest };
+        let reading = if first {
+            "vae.decode.head"
+        } else {
+            "vae.decode"
+        };
         let tokens = [0u32];
         let lanes = [Seated::of(Lane {
             slot: 0,
-            word: word(reading),
+            word: word(&self.facts, reading),
             tokens: &tokens,
         })];
         let bytes = bf16_bytes(payload);
@@ -162,11 +153,6 @@ impl Decoder {
 
 fn load(artifact: &PathBuf, max_voxels: u32) -> (Decoder, f64) {
     let model = Model::ti2v_5b(Dtype::Bf16);
-    let codes = model.readings();
-    let (head, rest) = (
-        codes.vae_decode_head.expect("the head arm"),
-        codes.vae_decode.expect("the later arm"),
-    );
     let arm = VaeOnly { model };
     let trace = trace_hybrid("wan22-vae-decode", &arm, Platform::Cuda);
     let src = ztensor::Source::open(artifact)
@@ -181,8 +167,7 @@ fn load(artifact: &PathBuf, max_voxels: u32) -> (Decoder, f64) {
     drop(src);
     let started = Instant::now();
     let mut shell = Shell::load(Boot {
-        classify: |request| Facts::of(request).word(),
-        trace,
+        trace: trace.clone(),
         contract: &contract,
         checkpoint: artifact,
         budget: Budget::new(2, 16),
@@ -209,7 +194,13 @@ fn load(artifact: &PathBuf, max_voxels: u32) -> (Decoder, f64) {
     .unwrap_or_else(|why| panic!("the VAE decoder does not load: {why}"));
     let load_s = started.elapsed().as_secs_f64();
     shell.open(0).expect("slot 0 opens");
-    (Decoder { shell, head, rest }, load_s)
+    (
+        Decoder {
+            shell,
+            facts: trace.facts,
+        },
+        load_s,
+    )
 }
 
 #[test]

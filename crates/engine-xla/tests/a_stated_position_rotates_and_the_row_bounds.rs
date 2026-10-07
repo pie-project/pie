@@ -34,8 +34,8 @@ fn a_prompt_stated_ahead_of_its_rows_reads_what_it_reads_at_them() {
         return;
     };
     let trace = m.sku.trace(Platform::Xla);
-    let classify = m.sku.classify;
-    let word = |len: u32| classify(&Request::new(len, false));
+    let facts = m.sku.trace(models::Platform::Xla).facts;
+    let word = |len: u32| facts.word(&Request::new(len, false));
     let prompt =
         common::tokenizer(&m).encode("The capital of France is Paris, and the capital of Italy is");
 

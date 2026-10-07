@@ -1,19 +1,7 @@
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, ops, seam,
-    trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, seam, trace_hybrid,
 };
 use poem_ir::{Attention, Def, Dim, Elementwise, Guard, Operands, Operation, RaggedMask, Ty};
-
-struct NoFacts;
-
-impl Classify for NoFacts {
-    fn of(_: &Request) -> NoFacts {
-        NoFacts
-    }
-    fn word(&self) -> u64 {
-        0
-    }
-}
 
 const WIDTH: u32 = 64;
 const HEADS: u32 = 4;
@@ -27,11 +15,10 @@ const MAX_DISTANCE: f32 = 128.0;
 struct Encoder;
 
 impl ForwardHybrid for Encoder {
-    type Facts = NoFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
@@ -212,11 +199,10 @@ fn refusal(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
 fn a_table_that_disagrees_with_its_max_len_or_is_not_f32_is_refused() {
     struct Misshapen(u32, Dtype);
     impl ForwardHybrid for Misshapen {
-        type Facts = NoFacts;
         fn caches(&self) -> HybridSpec {
             HybridSpec::new()
         }
-        fn forward(&self, inputs: Input<NoFacts>) -> Value {
+        fn forward(&self, inputs: Input) -> Value {
             let x = inputs.latents(0, HEADS * HEAD_DIM, Dtype::Bf16);
             let table = inputs.recorder().fresh(Ty::Tensor {
                 shape: vec![Dim::Const(u64::from(HEADS)), Dim::Const(u64::from(self.0))],

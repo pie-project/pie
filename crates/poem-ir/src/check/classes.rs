@@ -562,6 +562,7 @@ mod tests {
         fn new() -> Build {
             Build {
                 trace: Trace {
+                    facts: Default::default(),
                     name: "hand-built".to_string(),
                     platform: crate::Platform::Cuda,
                     params: Vec::new(),

@@ -1,18 +1,6 @@
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, ops, seam,
-    trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, seam, trace_hybrid,
 };
-
-struct NoFacts;
-
-impl Classify for NoFacts {
-    fn of(_: &Request) -> NoFacts {
-        NoFacts
-    }
-    fn word(&self) -> u64 {
-        0
-    }
-}
 
 #[derive(Clone, Copy)]
 enum Plants {
@@ -25,11 +13,10 @@ enum Plants {
 struct Readout(Plants);
 
 impl ForwardHybrid for Readout {
-    type Facts = NoFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let x = inputs.latents(0, 16, Dtype::Bf16);
         let w = Weight::sym("w", [16, 16], Dtype::Bf16);
         let layers = [(); 2];

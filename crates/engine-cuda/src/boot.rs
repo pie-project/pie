@@ -1,10 +1,6 @@
-use crate::api::{ClassifyFor, ContractFor, Cuda, DeviceBoot};
+use crate::api::{ContractFor, Cuda, DeviceBoot};
 
-pub fn open(
-    boot: DeviceBoot,
-    contract_for: ContractFor,
-    classify_for: ClassifyFor,
-) -> Result<Cuda, String> {
+pub fn open(boot: DeviceBoot, contract_for: ContractFor) -> Result<Cuda, String> {
     let fraction = boot.knobs.gpu_mem_utilization;
     if !fraction.is_finite() || fraction <= 0.0 || fraction > 1.0 {
         return Err(format!(
@@ -15,7 +11,7 @@ pub fn open(
              reached a shell at all."
         ));
     }
-    Ok(Cuda::new(boot, contract_for, classify_for))
+    Ok(Cuda::new(boot, contract_for))
 }
 
 #[must_use]

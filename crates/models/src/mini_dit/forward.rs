@@ -1,6 +1,7 @@
+use poem_dsl::fact;
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Predicate, RaggedMask,
-    Request, RopeForm, Stream, Value, Weight, ops, seam,
+    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, RaggedMask, RopeForm, Stream, Value,
+    Weight, ops, seam,
 };
 
 use crate::{
@@ -122,46 +123,6 @@ fn denoise_reading(tap: Option<&str>) -> ReadingFact {
     }
 }
 
-pub struct Facts {
-    pub stream: Stream,
-    pub denoise: bool,
-}
-
-impl Facts {
-    #[must_use]
-    pub fn text() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Text)
-    }
-
-    #[must_use]
-    pub fn image() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Image)
-    }
-
-    #[must_use]
-    pub fn context() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Context)
-    }
-
-    #[must_use]
-    pub fn denoise() -> Predicate {
-        Predicate::fact(DENOISE_BIT)
-    }
-}
-
-impl Classify for Facts {
-    fn of(r: &Request) -> Facts {
-        Facts {
-            stream: r.stream(),
-            denoise: r.reading() == DENOISE_READING,
-        }
-    }
-
-    fn word(&self) -> u64 {
-        self.stream.word(STREAM_BASE) | (u64::from(self.denoise) << DENOISE_BIT)
-    }
-}
-
 macro_rules! tap {
     ($m:expr, $key:literal, $v:expr) => {
         if let Some(v) = tapped($m, "", $key, $v) {
@@ -180,17 +141,21 @@ macro_rules! unwrap_tap {
 }
 
 impl ForwardHybrid for Model {
-    type Facts = Facts;
-
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input<Facts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let m = self;
 
-        let (ctx, joint) = inputs.split(&Facts::context());
-        let (txt_in, img_in) = joint.split(&Facts::text());
+        let (ctx, joint) = (
+            inputs.on(fact::stream(Stream::Context)),
+            inputs.on(!fact::stream(Stream::Context)),
+        );
+        let (txt_in, img_in) = (
+            joint.on(fact::stream(Stream::Text)),
+            joint.on(!fact::stream(Stream::Text)),
+        );
 
         let lanes = inputs.request_of_token();
         let positions = inputs.axis_positions(port::POSITIONS, ROPE_AXES);
@@ -248,7 +213,10 @@ impl ForwardHybrid for Model {
         ));
         tap!(m, "b0.out", &x);
 
-        let (txt, img) = x.split(&Facts::text());
+        let (txt, img) = (
+            x.on(fact::stream(Stream::Text)),
+            x.on(!fact::stream(Stream::Text)),
+        );
         let (txt_mod, img_mod) = (
             adaln6(&linear(&m.double.txt.ada, &temb)),
             adaln6(&linear(&m.double.img.ada, &temb)),
@@ -279,7 +247,10 @@ impl ForwardHybrid for Model {
             &joint_csr,
         );
         tap!(m, "b1.joint_attn_heads", &o);
-        let (o_txt, o_img) = o.split(&Facts::text());
+        let (o_txt, o_img) = (
+            o.on(fact::stream(Stream::Text)),
+            o.on(!fact::stream(Stream::Text)),
+        );
         let ta = linear(&m.double.txt.attn.out, &o_txt);
         tap!(m, "b1.txt_attn_out", &ta);
         let ia = linear(&m.double.img.attn.out, &o_img);

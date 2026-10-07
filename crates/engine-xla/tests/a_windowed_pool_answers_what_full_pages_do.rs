@@ -84,7 +84,8 @@ fn answer(m: &common::Model, prompt: &[u32], full_windows: bool) -> Answer {
         }
     }
     let sku = m.sku;
-    let word = |rows: u32| (sku.classify)(&Request::new(rows, false));
+    let facts = sku.trace(models::Platform::Xla).facts;
+    let word = |rows: u32| facts.word(&Request::new(rows, false));
     let mut shell = Shell::load(Boot {
         trace: sku.trace(Platform::Xla),
         contract: &m.contract,

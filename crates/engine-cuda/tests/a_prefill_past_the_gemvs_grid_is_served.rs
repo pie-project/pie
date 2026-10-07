@@ -24,7 +24,6 @@ const PAGE: u32 = 16;
 struct Text {
     name: &'static str,
     build: fn() -> models::qwen_3::model::Model,
-    classify: poem_ir::ClassifyFn,
     word: fn(u32) -> u64,
     ceiling: u32,
 }
@@ -32,27 +31,24 @@ struct Text {
 fn micro() -> models::qwen_3::model::Model {
     models::qwen_3::model::Model::a3b_micro(Dtype::Bf16, Dtype::Bf16)
 }
-fn micro_classify(request: &Request) -> u64 {
-    poem_dsl::word_of(micro, request)
-}
 fn micro_word(len: u32) -> u64 {
-    poem_dsl::word_of(micro, &Request::new(len, false))
+    poem_dsl::trace_hybrid("a3b_micro", &micro(), Platform::Cuda)
+        .facts
+        .word(&Request::new(len, false))
 }
 
 fn uncached() -> models::qwen_3::model::Model {
     models::qwen_3::model::Model::a3b_uncached_bank(Dtype::Bf16, Dtype::Bf16)
 }
-fn uncached_classify(request: &Request) -> u64 {
-    poem_dsl::word_of(uncached, request)
-}
 fn uncached_word(len: u32) -> u64 {
-    poem_dsl::word_of(uncached, &Request::new(len, false))
+    poem_dsl::trace_hybrid("a3b_uncached_bank", &uncached(), Platform::Cuda)
+        .facts
+        .word(&Request::new(len, false))
 }
 
 const MICRO: Text = Text {
     name: "a3b_micro",
     build: micro,
-    classify: micro_classify,
     word: micro_word,
     ceiling: WIDE,
 };
@@ -60,7 +56,6 @@ const MICRO: Text = Text {
 const UNCACHED: Text = Text {
     name: "a3b_uncached_bank",
     build: uncached,
-    classify: uncached_classify,
     word: uncached_word,
     ceiling: BOTH,
 };
@@ -176,7 +171,6 @@ fn fixture(text: Text) -> Fixture {
 
 fn load(fixture: &Fixture) -> engine_cuda::Result<Shell> {
     Shell::load(Boot {
-        classify: fixture.text.classify,
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
         checkpoint: &fixture.container,

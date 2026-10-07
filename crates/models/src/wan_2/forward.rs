@@ -1,7 +1,8 @@
+use poem_dsl::fact;
 use poem_dsl::ops::spatial;
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Predicate, RaggedMask,
-    Request, RopeForm, Stream, Value, Weight, ops, seam,
+    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, RaggedMask, RopeForm, Stream, Value,
+    Weight, ops, seam,
 };
 use poem_ir::{TimePad, VoxelSegment};
 
@@ -19,11 +20,6 @@ use super::model::{
 };
 
 pub const STREAM_BASE: u8 = 0;
-
-pub const READING_LO: u8 = 6;
-pub const READING_HI: u8 = 7;
-pub const READING_TOP: u8 = 8;
-const READING_MASK: u8 = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Readings {
@@ -187,59 +183,7 @@ impl Model {
     }
 }
 
-pub struct Facts {
-    pub stream: Stream,
-    pub reading: u8,
-}
-
-impl Facts {
-    #[must_use]
-    pub fn text() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Text)
-    }
-
-    #[must_use]
-    pub fn video() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Video)
-    }
-
-    #[must_use]
-    pub fn context() -> Predicate {
-        Predicate::stream(STREAM_BASE, Stream::Context)
-    }
-
-    #[must_use]
-    pub fn reading_lo() -> Predicate {
-        Predicate::fact(READING_LO)
-    }
-
-    #[must_use]
-    pub fn reading_hi() -> Predicate {
-        Predicate::fact(READING_HI)
-    }
-
-    #[must_use]
-    pub fn reading_top() -> Predicate {
-        Predicate::fact(READING_TOP)
-    }
-}
-
-impl Classify for Facts {
-    fn of(r: &Request) -> Facts {
-        Facts {
-            stream: r.stream(),
-            reading: r.reading() & READING_MASK,
-        }
-    }
-
-    fn word(&self) -> u64 {
-        self.stream.word(STREAM_BASE) | (u64::from(self.reading & READING_MASK) << READING_LO)
-    }
-}
-
 impl ForwardHybrid for Model {
-    type Facts = Facts;
-
     fn caches(&self) -> HybridSpec {
         let mut c = HybridSpec::new();
         if let Some(vae) = &self.vae {
@@ -251,39 +195,22 @@ impl ForwardHybrid for Model {
         c
     }
 
-    fn forward(&self, inputs: Input<Facts>) -> Value {
-        let codes = self.readings();
-        let (top, bot) = inputs.split(&Facts::reading_top());
-        let (t_hi, t_lo) = top.split(&Facts::reading_hi());
-        let (b_hi, b_lo) = bot.split(&Facts::reading_hi());
-        let (c7, c6) = t_hi.split(&Facts::reading_lo());
-        let (c5, c4) = t_lo.split(&Facts::reading_lo());
-        let (c3, c2) = b_hi.split(&Facts::reading_lo());
-        let (c1, c0) = b_lo.split(&Facts::reading_lo());
-        let arms = [c0, c1, c2, c3, c4, c5, c6, c7];
-        let arm = |code: u8| &arms[usize::from(code)];
-
-        if let (Some(code), Some(te)) = (codes.text, &self.te) {
-            text_encode(arm(code), te);
+    fn forward(&self, inputs: Input) -> Value {
+        if let Some(te) = &self.te {
+            inputs.reading("text", |text| text_encode(text, te));
         }
-        let velocity = denoise(arm(codes.denoise), self);
-        if let (Some(head), Some(rest), Some(vae)) =
-            (codes.vae_decode_head, codes.vae_decode, &self.vae)
-        {
-            let _ = vae_decode(arm(head), vae, true);
-            let _ = vae_decode(arm(rest), vae, false);
-        }
-        if let (Some(head), Some(rest), Some(vae)) =
-            (codes.vae_encode_head, codes.vae_encode, &self.vae)
-        {
-            let _ = vae_encode(arm(head), &vae.enc, true);
-            let _ = vae_encode(arm(rest), &vae.enc, false);
+        let velocity = inputs.reading("denoise", |rows| denoise(rows, self));
+        if let Some(vae) = &self.vae {
+            let _ = inputs.reading("vae.decode.head", |rows| vae_decode(rows, vae, true));
+            let _ = inputs.reading("vae.decode", |rows| vae_decode(rows, vae, false));
+            let _ = inputs.reading("vae.encode.head", |rows| vae_encode(rows, &vae.enc, true));
+            let _ = inputs.reading("vae.encode", |rows| vae_encode(rows, &vae.enc, false));
         }
         velocity
     }
 }
 
-fn text_encode(arm: &Input<Facts>, te: &TextEncoder) {
+fn text_encode(arm: &Input, te: &TextEncoder) {
     let ids = arm.tokens();
     let perm = arm.row_permutation();
     let csr = arm.lane_indptr();
@@ -438,11 +365,14 @@ fn block(
     ops::elemwise::gated_residual_add(&x, &m.ffn_gate, &f, Some(&vg.lanes))
 }
 
-fn denoise(arm: &Input<Facts>, m: &Model) -> Value {
+fn denoise(arm: &Input, m: &Model) -> Value {
     let d = &m.dims;
     let dit: &Dit = &m.dit;
 
-    let (ctx, vid) = arm.split(&Facts::context());
+    let (ctx, vid) = (
+        arm.on(fact::stream(Stream::Context)),
+        arm.on(!fact::stream(Stream::Context)),
+    );
     let vg = VideoGeom {
         lanes: vid.request_of_token(),
         positions: vid.axis_positions(port::POSITIONS, ROPE_AXES),
@@ -485,7 +415,7 @@ fn denoise(arm: &Input<Facts>, m: &Model) -> Value {
     velocity
 }
 
-fn conv(x: &Value, g: &Value, c: &Conv, arm: &Input<Facts>) -> (Value, Value) {
+fn conv(x: &Value, g: &Value, c: &Conv, arm: &Input) -> (Value, Value) {
     let shape = spatial::Conv::conv3d(c.k, [1, 1, 1], [0, c.k[1] / 2, c.k[2] / 2]);
     let (shape, cache) = match &c.cache {
         Some(name) => (shape.causal(TimePad::Zero), Some(arm.state(name))),
@@ -498,7 +428,7 @@ fn norm_silu(x: &Value, gain: &Weight) -> Value {
     ops::elemwise::silu(&ops::elemwise::rmsnorm(x, gain, VAE_EPS))
 }
 
-fn resnet(x: &Value, g: &Value, r: &Resnet, arm: &Input<Facts>) -> Value {
+fn resnet(x: &Value, g: &Value, r: &Resnet, arm: &Input) -> Value {
     let h = norm_silu(x, &r.norm1);
     let (h, _) = conv(&h, g, &r.conv1, arm);
     let h = norm_silu(&h, &r.norm2);
@@ -525,7 +455,7 @@ fn mid_attention(x: &Value, g: &Value, a: &MidAttention) -> Value {
     ops::elemwise::add(x, &linear(&a.proj, &o))
 }
 
-pub fn vae_decode(arm: &Input<Facts>, vae: &Vae, first: bool) -> Value {
+pub fn vae_decode(arm: &Input, vae: &Vae, first: bool) -> Value {
     let g0 = arm.grid();
     let z = arm.voxels(port::VOXELS, VAE_Z, Dtype::Bf16);
     let z = ops::elemwise::mul_scalar(0.5, &ops::elemwise::add(&z, &z));
@@ -583,7 +513,7 @@ fn downsample2d(x: &Value, g: &Value, c: &Conv) -> (Value, Value) {
     spatial::conv3d(x, g, &c.w, Some(&c.bias), shape, None)
 }
 
-fn downsample_time(x: &Value, g: &Value, c: &Conv, arm: &Input<Facts>) -> (Value, Value) {
+fn downsample_time(x: &Value, g: &Value, c: &Conv, arm: &Input) -> (Value, Value) {
     let name = c.cache.as_ref().expect("the time conv keeps a frame cache");
     let shape = spatial::Conv {
         k: c.k,
@@ -596,7 +526,7 @@ fn downsample_time(x: &Value, g: &Value, c: &Conv, arm: &Input<Facts>) -> (Value
     spatial::conv3d(x, g, &c.w, Some(&c.bias), shape, Some(arm.state(name)))
 }
 
-pub fn vae_encode(arm: &Input<Facts>, e: &VaeEncoder, first: bool) -> Value {
+pub fn vae_encode(arm: &Input, e: &VaeEncoder, first: bool) -> Value {
     let g0 = arm.grid();
     let px = arm.voxels(port::PIXEL_VOXELS, VAE_RGB, Dtype::Bf16);
     let (x, g) = spatial::pixel_unshuffle(&px, &g0, [1, VAE_PATCH, VAE_PATCH]);

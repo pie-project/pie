@@ -22,8 +22,8 @@ use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use eta_ir::validate::bind;
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Trace, Value, Weight,
-    ops, seam, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Trace, Value, Weight, ops, seam,
+    trace_hybrid,
 };
 
 pub const WIDTH: u32 = 32;
@@ -35,33 +35,27 @@ pub const MAX_DISTANCE: f32 = 128.0;
 pub const SM_SCALE: f32 = 0.125;
 pub const NAME: &str = "encoder-mini";
 
-pub struct NoFacts;
-
-impl Classify for NoFacts {
-    fn of(_: &Request) -> NoFacts {
-        NoFacts
-    }
-    fn word(&self) -> u64 {
-        0
-    }
+thread_local! {
+    /// The facts of the trace this thread's rig loaded, which its lanes are
+    /// worded by.
+    static FACTS: std::cell::RefCell<poem_ir::Facts> = std::cell::RefCell::default();
 }
 
 pub fn classify(request: &Request) -> u64 {
-    NoFacts::of(request).word()
+    FACTS.with(|facts| facts.borrow().word(request))
 }
 
-pub fn classify_for(_: &str) -> Option<poem_ir::ClassifyFn> {
-    Some(classify)
+fn remember(trace: &Trace) {
+    FACTS.with(|facts| *facts.borrow_mut() = trace.facts.clone());
 }
 
 pub struct EncoderLayer;
 
 impl ForwardHybrid for EncoderLayer {
-    type Facts = NoFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
@@ -326,11 +320,14 @@ impl Rig {
             graphs,
             ..engine_cuda::DeviceBoot::default()
         };
-        let mut engine =
-            engine_cuda::open(boot, contract_for, classify_for).expect("the engine opens");
+        let mut engine = engine_cuda::open(boot, contract_for).expect("the engine opens");
         let loaded = engine
             .load(LoadRequest {
-                trace: trace(),
+                trace: {
+                    let trace = trace();
+                    remember(&trace);
+                    trace
+                },
                 checkpoint: Checkpoint::Path(path.clone()),
                 budgets: Budgets {
                     max_lanes: 8,

@@ -1,6 +1,6 @@
+use poem_dsl::fact;
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, GateActivation, HybridSpec, Input, MropeForm, Predicate,
-    Request, Value, Weight, ops, seam,
+    Dtype, ForwardHybrid, GateActivation, HybridSpec, Input, MropeForm, Value, Weight, ops, seam,
 };
 
 use super::model::{Attn, BonsaiSigns, DRAFT_DEPTH, Gdn, Head, Mixer, Mlp, Model, Tower};
@@ -26,80 +26,7 @@ fn rot_take(x: &Value, signs: &Weight) -> Value {
     ops::elemwise::hadamard_signed(x, BONSAI_BLOCK, signs)
 }
 
-pub struct Facts {
-    pub qo_one: bool,
-    pub has_adapter: bool,
-    pub drafts: bool,
-    pub captures_scores: bool,
-    pub masked: bool,
-    pub media: bool,
-    pub block_draft: bool,
-}
-
-impl Facts {
-    #[must_use]
-    pub fn qo_one() -> Predicate {
-        Predicate::fact(0)
-    }
-
-    #[must_use]
-    pub fn has_adapter() -> Predicate {
-        Predicate::fact(1)
-    }
-
-    #[must_use]
-    pub fn drafts() -> Predicate {
-        Predicate::fact(2)
-    }
-
-    #[must_use]
-    pub fn captures_scores() -> Predicate {
-        Predicate::fact(3)
-    }
-
-    #[must_use]
-    pub fn masked() -> Predicate {
-        Predicate::fact(4)
-    }
-
-    #[must_use]
-    pub fn media() -> Predicate {
-        Predicate::fact(5)
-    }
-
-    #[must_use]
-    pub fn block_draft() -> Predicate {
-        Predicate::fact(6)
-    }
-}
-
-impl Classify for Facts {
-    fn of(r: &Request) -> Facts {
-        Facts {
-            qo_one: r.query_len() == 1,
-            has_adapter: r.has_adapter(),
-            drafts: r.drafts(),
-            captures_scores: r.captures_scores(),
-            masked: r.has_custom_mask(),
-            media: r.has_media(),
-            block_draft: r.drafts_a_block(),
-        }
-    }
-
-    fn word(&self) -> u64 {
-        u64::from(self.qo_one)
-            | (u64::from(self.has_adapter) << 1)
-            | (u64::from(self.drafts) << 2)
-            | (u64::from(self.captures_scores) << 3)
-            | (u64::from(self.masked) << 4)
-            | (u64::from(self.media) << 5)
-            | (u64::from(self.block_draft) << 6)
-    }
-}
-
 impl ForwardHybrid for Model {
-    type Facts = Facts;
-
     fn caches(&self) -> HybridSpec {
         let mut c = HybridSpec::new();
         let kv = c.kv_space(self.kv);
@@ -139,20 +66,18 @@ impl ForwardHybrid for Model {
         c
     }
 
-    fn forward(&self, inputs: Input<Facts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let m = self;
 
-        let classes = [
-            Facts::masked(),
-            Facts::captures_scores(),
-            Facts::qo_one(),
-            Predicate::rest(),
-        ];
+        let classes = [fact::has(fact::Mask), fact::scores(), fact::single_token()];
         let (_, trunk_inputs) = match &m.dflash {
-            Some(_) => inputs.split(&Facts::block_draft()),
+            Some(_) => (
+                inputs.on(fact::block_draft()),
+                inputs.on(!fact::block_draft()),
+            ),
             None => (inputs.clone(), inputs.clone()),
         };
-        let [input_m, input_s, input_d, input_p] = trunk_inputs.split(classes);
+        let ([input_m, input_s, input_d], input_p) = trunk_inputs.partition(classes.clone());
         let plan_m = ops::attn::plan_prefill(&input_m, m.q_heads, m.kv_heads, m.head_dim, None);
         let plan_d = ops::attn::plan_decode(&input_d, m.q_heads, m.kv_heads, m.head_dim, None);
         let plan_p = ops::attn::plan_prefill(&input_p, m.q_heads, m.kv_heads, m.head_dim, None);
@@ -181,13 +106,13 @@ impl ForwardHybrid for Model {
         }
 
         if let Some(t) = &towered {
-            let (imaged, _) = y.split(&Facts::media());
+            let imaged = y.on(fact::has(fact::Media));
             y = ops::layout::scatter_live_rows(t, &inputs.patch_routes(), &imaged).everywhere();
         }
 
         let (h_block, mut y) = match &m.dflash {
             Some(_) => {
-                let (block, rest) = y.split(&Facts::block_draft());
+                let (block, rest) = (y.on(fact::block_draft()), y.on(!fact::block_draft()));
                 (Some(block), rest)
             }
             None => (None, y),
@@ -204,8 +129,8 @@ impl ForwardHybrid for Model {
                 Mixer::Gdn(g) => gdn_mixer(&x, &inputs, g, m.bonsai.as_ref()),
             };
             let o = {
-                let (adapted, _) = o.split(&Facts::has_adapter());
-                let (px, _) = x.split(&Facts::has_adapter());
+                let adapted = o.on(fact::has(fact::Adapter));
+                let px = x.on(fact::has(fact::Adapter));
                 ops::linear::lora_correct(&px, &w.lora_a, &w.lora_b, &routes, &adapted)
             };
             y = ops::elemwise::residual_add(&o, &y);
@@ -294,7 +219,7 @@ impl ForwardHybrid for Model {
         let (x, hb) = match (&m.dflash, h_block) {
             (Some(d), Some(block)) => {
                 let fused = fused.as_ref().expect("a block drafter tapped the trunk");
-                let hb = d.arm(&inputs, fused, &block, &mask, &Facts::block_draft());
+                let hb = d.arm(&inputs, fused, &block, &mask, &fact::block_draft());
                 (Value::merge(vec![hb.clone(), x]), Some(hb))
             }
             _ => (x, None),
@@ -317,15 +242,15 @@ impl ForwardHybrid for Model {
         let logits = ops::linear::lm_head(head_in, head);
 
         if let Some(d) = &m.dflash {
-            d.plant_readout(&logits, &inputs, hb.as_ref(), &Facts::block_draft());
+            d.plant_readout(&logits, &inputs, hb.as_ref(), &fact::block_draft());
         }
 
         if let Some(mtp) = &m.mtp {
-            let (input_mtp, _) = inputs.split(&Facts::drafts());
+            let input_mtp = inputs.on(fact::drafts());
             let plan_mtp =
                 ops::attn::plan_prefill(&input_mtp, m.q_heads, m.kv_heads, m.head_dim, None);
-            let (dx, _) = x.split(&Facts::drafts());
-            let (dlogits, _) = logits.split(&Facts::drafts());
+            let dx = x.on(fact::drafts());
+            let dlogits = logits.on(fact::drafts());
             let mut chosen = ops::layout::argmax(&[&dlogits]);
             let mut hidden = dx;
             let mut chain: Vec<Value> = Vec::with_capacity(DRAFT_DEPTH as usize);
@@ -383,14 +308,7 @@ impl ForwardHybrid for Model {
     }
 }
 
-fn rotate(
-    q: &Value,
-    k: &Value,
-    inputs: &Input<Facts>,
-    m: &Model,
-    a: &Attn,
-    d: u32,
-) -> (Value, Value) {
+fn rotate(q: &Value, k: &Value, inputs: &Input, m: &Model, a: &Attn, d: u32) -> (Value, Value) {
     match &m.tower {
         None => ops::elemwise::rope_partial(q, k, &inputs.positions(), a.rotary_dim, d, a.theta),
         Some(_) => ops::elemwise::rope_mrope(
@@ -406,7 +324,7 @@ fn rotate(
     }
 }
 
-fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
+fn tower(inputs: &Input, t: &Tower) -> Value {
     let d = t.head_dim;
     let x = inputs.patches(t.patch_width);
     let segments = inputs.patch_segments();
@@ -468,7 +386,7 @@ fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
 #[allow(clippy::too_many_arguments)]
 fn attn_mixer(
     x: &Value,
-    inputs: &Input<Facts>,
+    inputs: &Input,
     m: &Model,
     plan_m: &Value,
     plan_d: &Value,
@@ -519,12 +437,8 @@ fn attn_mixer(
     ops::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
     seam::at(seam::ATTN_Q, &[&q]);
 
-    let [mq, sq, dq, p] = q.split([
-        Facts::masked(),
-        Facts::captures_scores(),
-        Facts::qo_one(),
-        Predicate::rest(),
-    ]);
+    let ([mq, sq, dq], p) =
+        q.partition([fact::has(fact::Mask), fact::scores(), fact::single_token()]);
     let (so, lse) = ops::attn::prefill_lse(&sq, plan_s, pages, None, d, m.kv_heads, a.sm_scale);
     seam::at(seam::SCORES, &[&lse]);
     let o = Value::merge(vec![
@@ -557,14 +471,7 @@ fn attn_mixer(
     ops::linear::matmul(&o_in, &a.o_proj)
 }
 
-fn mtp_attn(
-    x: &Value,
-    inputs: &Input<Facts>,
-    m: &Model,
-    plan: &Value,
-    a: &Attn,
-    chain: bool,
-) -> Value {
+fn mtp_attn(x: &Value, inputs: &Input, m: &Model, plan: &Value, a: &Attn, chain: bool) -> Value {
     let pages = inputs.kv(&a.kv);
     let write_page = inputs.write_page(&a.kv);
     let write_offset = inputs.write_offset(&a.kv);
@@ -604,7 +511,7 @@ fn mtp_attn(
     ops::linear::matmul(&ops::elemwise::gate_sigmoid_mul(&o, &gate), &a.o_proj)
 }
 
-fn gdn_mixer(x: &Value, inputs: &Input<Facts>, g: &Gdn, bonsai: Option<&BonsaiSigns>) -> Value {
+fn gdn_mixer(x: &Value, inputs: &Input, g: &Gdn, bonsai: Option<&BonsaiSigns>) -> Value {
     let conv_state = inputs.state(&g.conv_state);
     let delta_state = inputs.state(&g.delta_state);
     // Bonsai: `in_qkvz` (fused attn_qkv + attn_gate z) rotates on the residual
@@ -622,9 +529,9 @@ fn gdn_mixer(x: &Value, inputs: &Input<Facts>, g: &Gdn, bonsai: Option<&BonsaiSi
     let ba = ops::linear::matmul(x, &g.in_ba);
     seam::at(seam::RECURRENT, &[&qkvz]);
     let width = Gdn::qkv_width(g.k_heads, g.v_heads, g.k_dim, g.v_dim);
-    let one = Facts::qo_one();
-    let (qkvz_d, qkvz_p) = qkvz.split(&one);
-    let (ba_d, ba_p) = ba.split(&one);
+    let one = fact::single_token();
+    let (qkvz_d, qkvz_p) = (qkvz.on(one.clone()), qkvz.on(!one.clone()));
+    let (ba_d, ba_p) = (ba.on(one.clone()), ba.on(!one.clone()));
     let (core_d, z_d) = {
         let (qkv, z) = ops::layout::split_rows(&qkvz_d, width);
         let qkv = ops::attn::ssm_causal_conv1d(&qkv, &g.conv, conv_state, g.conv_kernel);

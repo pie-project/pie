@@ -473,6 +473,7 @@ impl Engine for Vulkan {
             device_channel_commit: false,
             rs_verbs: shell.serves_rs_verbs(),
             bidirectional_attention: false,
+            facts: shell.trace().facts.clone(),
         };
 
         self.shell = Some(shell);

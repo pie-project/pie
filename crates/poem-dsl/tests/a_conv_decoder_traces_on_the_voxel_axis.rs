@@ -1,20 +1,8 @@
 use poem_dsl::ops::spatial::{self, Conv};
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, seam,
-    trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, seam, trace_hybrid,
 };
 use poem_ir::{Dim, Operands, ParamLayout, Ty};
-
-struct NoFacts;
-
-impl Classify for NoFacts {
-    fn of(_: &Request) -> NoFacts {
-        NoFacts
-    }
-    fn word(&self) -> u64 {
-        0
-    }
-}
 
 const C_IN: u32 = 8;
 const C_MID: u32 = 16;
@@ -53,11 +41,10 @@ impl Decoder {
 }
 
 impl ForwardHybrid for Decoder {
-    type Facts = NoFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let g = inputs.grid();
         let x = inputs.voxels(0, C_IN, Dtype::Bf16);
         let (h, g1) = spatial::conv3d(&x, &g, &self.conv1, Some(&self.b1), Conv::same3(), None);
@@ -155,11 +142,10 @@ fn the_decoder_traces_and_its_grids_are_values() {
 struct Patchifier;
 
 impl ForwardHybrid for Patchifier {
-    type Facts = NoFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let g = inputs.grid();
         let x = inputs.voxels(0, C_IN, Dtype::Bf16);
         let tg = inputs.token_grid([1, 2, 2]);
@@ -192,11 +178,10 @@ fn the_patchify_pair_crosses_the_axis_and_back() {
 struct NaturalWeight;
 
 impl ForwardHybrid for NaturalWeight {
-    type Facts = NoFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let g = inputs.grid();
         let x = inputs.voxels(0, C_IN, Dtype::Bf16);
         let w = Weight::sym(

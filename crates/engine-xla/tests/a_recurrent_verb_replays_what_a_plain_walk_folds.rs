@@ -27,7 +27,8 @@ fn a_replayed_buffer_folds_to_the_plain_walk() {
         eprintln!("not asked: set PIE_XLA_SNAPSHOT + PIE_XLA_SKU or PIE_XLA_ARTIFACT");
         return;
     };
-    let word = |q: u32| (m.sku.classify)(&Request::new(q, false));
+    let facts = m.sku.trace(models::Platform::Xla).facts;
+    let word = |q: u32| facts.word(&Request::new(q, false));
     let context = 256;
     let _device = engine_xla::bench::lock_device();
     let mut shell = Shell::load(Boot {

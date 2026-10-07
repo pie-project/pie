@@ -255,9 +255,9 @@ impl DFlash {
         });
     }
 
-    pub fn arm<F>(
+    pub fn arm(
         &self,
-        inputs: &Input<F>,
+        inputs: &Input,
         fused: &Value,
         h_block: &Value,
         mask: &Value,
@@ -265,7 +265,7 @@ impl DFlash {
     ) -> Value {
         let d = self;
         let h_ctx = ops::elemwise::rmsnorm_plus_one(fused, &d.hidden_norm, d.hidden_norm_eps);
-        let (_, ctx_positions) = inputs.positions().split(block_draft);
+        let ctx_positions = inputs.positions().on(!block_draft.clone());
         for b in &d.blocks {
             let a = &b.attn;
             let hd = a.head_dim;
@@ -282,8 +282,8 @@ impl DFlash {
             );
         }
 
-        let (input_block, _) = inputs.split(block_draft);
-        let (block_positions, _) = inputs.positions().split(block_draft);
+        let input_block = inputs.on(block_draft.clone());
+        let block_positions = inputs.positions().on(block_draft.clone());
         let mut h = h_block.clone();
         for b in &d.blocks {
             let a = &b.attn;
@@ -343,10 +343,10 @@ impl DFlash {
         ops::elemwise::rmsnorm_plus_one(&h, &d.norm, d.norm_eps)
     }
 
-    pub fn plant_readout<F>(
+    pub fn plant_readout(
         &self,
         logits: &Value,
-        inputs: &Input<F>,
+        inputs: &Input,
         hb: Option<&Value>,
         block_draft: &Predicate,
     ) {
@@ -356,7 +356,7 @@ impl DFlash {
             bidirectional: self.blocks.iter().any(|b| b.window.is_none()),
             proposals_from: self.proposals_from,
         });
-        let (dlogits, _) = logits.split(block_draft);
+        let dlogits = logits.on(block_draft.clone());
         seam::at(seam::MTP, &[&dlogits]);
         let picks = match (&self.selector, hb) {
             (Some(sel), Some(hb)) => {
@@ -365,7 +365,7 @@ impl DFlash {
                     .hidden_projection
                     .as_ref()
                     .map(|proj| ops::linear::matmul(hb, proj));
-                let (toks, _) = inputs.tokens().split(block_draft);
+                let toks = inputs.tokens().on(block_draft.clone());
                 ops::attn::selector_walk(
                     &cand,
                     &unary,

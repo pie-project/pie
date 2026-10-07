@@ -27,7 +27,7 @@ use std::path::Path;
 use engine_metal::{Boot, Lane, Shell};
 use models::qwen_3::model::Model;
 use poem_compiler::Budget;
-use poem_dsl::{Classify, Dtype, Platform, Request};
+use poem_dsl::{Dtype, Platform, Request};
 use poem_ir::{Elementwise, Operation};
 
 // ---- the micro_text shape (must match `Model::micro_text_dims`) --------------

@@ -111,6 +111,7 @@ fn build_model(
                 has_attn_score: g.caps.profile.has_attn_score,
                 has_lora: g.caps.profile.has_lora,
                 device_geometry_port_mask: g.caps.ports,
+                facts: g.caps.facts.clone(),
                 limits: runtime::engine::SchedulerLimits {
                     max_forward_requests: g.caps.limits.max_lanes as usize,
                     max_forward_tokens: g.caps.limits.max_tokens as usize,

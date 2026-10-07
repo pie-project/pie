@@ -1,6 +1,5 @@
-use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, ops, seam,
-};
+use poem_dsl::fact;
+use poem_dsl::{Dtype, ForwardHybrid, HybridSpec, Input, Value, ops, seam};
 
 use super::model::{Hyper, Indexer, Kda, Mix, Mixer, Mla, Mlp, Model, Tower};
 use poem_dsl::MropeForm;
@@ -11,52 +10,7 @@ enum Arms {
     Whole,
 }
 
-pub struct Facts {
-    pub qo_one: bool,
-    pub has_adapter: bool,
-    pub drafts: bool,
-    pub media: bool,
-}
-
-impl Facts {
-    pub fn qo_one() -> Predicate {
-        Predicate::fact(0)
-    }
-
-    pub fn has_adapter() -> Predicate {
-        Predicate::fact(1)
-    }
-
-    pub fn drafts() -> Predicate {
-        Predicate::fact(2)
-    }
-
-    pub fn media() -> Predicate {
-        Predicate::fact(3)
-    }
-}
-
-impl Classify for Facts {
-    fn of(r: &Request) -> Facts {
-        Facts {
-            qo_one: r.query_len() == 1,
-            has_adapter: r.has_adapter(),
-            drafts: r.drafts(),
-            media: r.has_media(),
-        }
-    }
-
-    fn word(&self) -> u64 {
-        u64::from(self.qo_one)
-            | (u64::from(self.has_adapter) << 1)
-            | (u64::from(self.drafts) << 2)
-            | (u64::from(self.media) << 3)
-    }
-}
-
 impl ForwardHybrid for Model {
-    type Facts = Facts;
-
     fn caches(&self) -> HybridSpec {
         let mut c = HybridSpec::new();
         let kv = c.kv_space(self.kv);
@@ -112,11 +66,14 @@ impl ForwardHybrid for Model {
         c
     }
 
-    fn forward(&self, inputs: Input<Facts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let m = self;
         let hy = &m.hyper;
 
-        let (input_d, input_p) = inputs.split(&Facts::qo_one());
+        let (input_d, input_p) = (
+            inputs.on(fact::single_token()),
+            inputs.on(!fact::single_token()),
+        );
         let plan = [
             ops::attn::mla_plan(&input_d, m.heads, m.kv_lora_rank),
             ops::attn::mla_plan(&input_p, m.heads, m.kv_lora_rank),
@@ -126,7 +83,7 @@ impl ForwardHybrid for Model {
         let ids = inputs.tokens();
         let mut narrow = ops::layout::embed(&ids, &m.embed, m.vocab);
         if let Some(t) = &towered {
-            let (imaged, _) = narrow.split(&Facts::media());
+            let imaged = narrow.on(fact::has(fact::Media));
             narrow =
                 ops::layout::scatter_live_rows(t, &inputs.patch_routes(), &imaged).everywhere();
         }
@@ -141,8 +98,8 @@ impl ForwardHybrid for Model {
                 Mixer::Kda(k) => kda_mixer(&x, &inputs, k),
             };
             let o = {
-                let (adapted, _) = o.split(&Facts::has_adapter());
-                let (px, _) = x.split(&Facts::has_adapter());
+                let adapted = o.on(fact::has(fact::Adapter));
+                let px = x.on(fact::has(fact::Adapter));
                 ops::linear::lora_correct(&px, &w.lora_a, &w.lora_b, &routes, &adapted)
             };
             streams = ops::elemwise::hc_fold(&o, &streams, &post_mix, &comb_mix);
@@ -167,12 +124,12 @@ impl ForwardHybrid for Model {
         let logits = ops::linear::lm_head(&x, &m.head);
 
         if let Some(mtp) = &m.mtp {
-            let (input_mtp, _) = inputs.split(&Facts::drafts());
+            let input_mtp = inputs.on(fact::drafts());
             let plan_one = ops::attn::mla_plan(&input_mtp, m.heads, m.kv_lora_rank);
             let plan_mtp = [plan_one.clone(), plan_one];
-            let (dy, _) = y.split(&Facts::drafts());
-            let (dpos, _) = positions.split(&Facts::drafts());
-            let (dlogits, _) = logits.split(&Facts::drafts());
+            let dy = y.on(fact::drafts());
+            let dpos = positions.on(fact::drafts());
+            let dlogits = logits.on(fact::drafts());
             let mut token = ops::layout::argmax(&[&dlogits]);
             let mut hidden = dy;
             let mut chain: Vec<Value> = Vec::with_capacity(mtp.depth as usize);
@@ -283,7 +240,7 @@ fn mlp(x: &Value, mlp: &Mlp, hint: Option<&Value>) -> Value {
 
 fn mla_mixer(
     x: &Value,
-    inputs: &Input<Facts>,
+    inputs: &Input,
     plan: &[Value; 2],
     positions: &Value,
     m: &Model,
@@ -319,10 +276,10 @@ fn mla_mixer(
 
     let scored = match arms {
         Arms::Split => {
-            let one = Facts::qo_one();
-            let (dq, pq) = q.split(&one);
-            let (dpe, ppe) = q_pe.split(&one);
-            let (d_sel, p_sel) = selection.split(&one);
+            let one = fact::single_token();
+            let (dq, pq) = (q.on(one.clone()), q.on(!one.clone()));
+            let (dpe, ppe) = (q_pe.on(one.clone()), q_pe.on(!one.clone()));
+            let (d_sel, p_sel) = (selection.on(one.clone()), selection.on(!one.clone()));
             Value::merge(vec![
                 ops::attn::mla_decode_selected(
                     &dq,
@@ -373,7 +330,7 @@ fn mla_mixer(
 fn index_select(
     x: &Value,
     q_a: &Value,
-    inputs: &Input<Facts>,
+    inputs: &Input,
     positions: &Value,
     act: Dtype,
     ix: &Indexer,
@@ -445,7 +402,10 @@ fn boundaries(
     if let Arms::Whole = arms {
         return ops::attn::pool_boundary_prefill(positions, row_valid, ratio);
     }
-    let (one, many) = positions.split(&Facts::qo_one());
+    let (one, many) = (
+        positions.on(fact::single_token()),
+        positions.on(!fact::single_token()),
+    );
     let (dpos, dreq, drope) = ops::attn::pool_boundary_decode(&one, row_valid, ratio);
     let (ppos, preq, prope) = ops::attn::pool_boundary_prefill(&many, row_valid, ratio);
     (
@@ -455,7 +415,7 @@ fn boundaries(
     )
 }
 
-fn kda_mixer(x: &Value, inputs: &Input<Facts>, k: &Kda) -> Value {
+fn kda_mixer(x: &Value, inputs: &Input, k: &Kda) -> Value {
     let conv = inputs.state(&k.conv_state);
     let delta = inputs.state(&k.delta_state);
     let qkv = ops::linear::matmul(x, &k.qkv);
@@ -463,10 +423,10 @@ fn kda_mixer(x: &Value, inputs: &Input<Facts>, k: &Kda) -> Value {
     let b = ops::linear::matmul(x, &k.b);
     seam::at(seam::RECURRENT, &[&qkv]);
 
-    let one = Facts::qo_one();
-    let (qkv_d, qkv_p) = qkv.split(&one);
-    let (f_d, f_p) = f.split(&one);
-    let (b_d, b_p) = b.split(&one);
+    let one = fact::single_token();
+    let (qkv_d, qkv_p) = (qkv.on(one.clone()), qkv.on(!one.clone()));
+    let (f_d, f_p) = (f.on(one.clone()), f.on(!one.clone()));
+    let (b_d, b_p) = (b.on(one.clone()), b.on(!one.clone()));
     let core = Value::merge(vec![
         {
             let mixed = ops::attn::ssm_causal_conv1d(&qkv_d, &k.conv, conv, k.conv_kernel);
@@ -505,7 +465,7 @@ fn kda_mixer(x: &Value, inputs: &Input<Facts>, k: &Kda) -> Value {
     ops::linear::matmul(&o, &k.o_proj)
 }
 
-fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
+fn tower(inputs: &Input, t: &Tower) -> Value {
     let d = t.head_dim;
     let x = inputs.patches(t.patch_width);
     let segments = inputs.patch_segments();

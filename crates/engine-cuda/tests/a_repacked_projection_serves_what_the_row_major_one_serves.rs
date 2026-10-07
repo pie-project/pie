@@ -2,25 +2,13 @@ use std::path::{Path, PathBuf};
 
 use checkpoint::contract::ModelContract;
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, ops,
-    trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, trace_hybrid,
 };
 use poem_ir::{TILED_BAND, TILED_STEP, Trace};
 
 const VOCAB: u32 = 1000;
 
 const HIDDEN: u64 = 512;
-
-struct NoFacts;
-
-impl Classify for NoFacts {
-    fn of(_: &Request) -> NoFacts {
-        NoFacts
-    }
-    fn word(&self) -> u64 {
-        0
-    }
-}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Arm {
@@ -64,13 +52,11 @@ impl Micro {
 }
 
 impl ForwardHybrid for Micro {
-    type Facts = NoFacts;
-
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let x = ops::layout::embed(&inputs.tokens(), &self.embed, VOCAB);
         let h = ops::linear::matmul(&x, &self.proj);
         ops::linear::lm_head(&h, &self.head)

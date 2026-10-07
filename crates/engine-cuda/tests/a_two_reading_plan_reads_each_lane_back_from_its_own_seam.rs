@@ -2,15 +2,14 @@
 
 mod common_dit;
 
-use common_dit::{
-    Lcg, NAME, Rig, StreamFacts, WIDTH, Weights, assert_close, attach, bf, frame, lane,
-};
+use common_dit::{Lcg, NAME, Rig, WIDTH, Weights, assert_close, attach, bf, frame, lane};
 use engine::Engine;
 use engine::fire::{LaneStream, PortKind, ReadoutSeam};
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
 use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype as EtaDtype, Shape};
+use poem_dsl::fact;
 use poem_dsl::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Stream, Trace, Value, Weight,
     ops, seam, trace_hybrid,
@@ -24,12 +23,14 @@ const EMB_SCALE: f32 = 0.75;
 struct TwoReadings;
 
 impl ForwardHybrid for TwoReadings {
-    type Facts = StreamFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<StreamFacts>) -> Value {
-        let (txt, img) = inputs.split(&StreamFacts::on(Stream::Text));
+    fn forward(&self, inputs: Input) -> Value {
+        let (txt, img) = (
+            inputs.on(fact::stream(Stream::Text)),
+            inputs.on(!fact::stream(Stream::Text)),
+        );
         let x_txt = txt.latents(0, WIDTH, Dtype::Bf16);
         let enc = Weight::sym("enc", [u64::from(HIDDEN), u64::from(WIDTH)], Dtype::Bf16);
         let h = ops::linear::matmul(&x_txt, &enc);

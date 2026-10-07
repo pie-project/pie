@@ -1,30 +1,110 @@
+//! The facts a program branches its rows on.
+//!
+//! A builtin fact is one the runtime derives from what a lane carries, so an
+//! inferlet cannot state it apart from the buffers a kernel reads under it. A
+//! custom fact is one the program names and an inferlet sets; the names here
+//! are the ones every family shares.
+
 use std::ops::{BitAnd, Not};
 
-use poem_ir::Stream;
+use poem_ir::{Builtin, Guard, Stream};
+
+pub use poem_ir::Builtin::{Adapted as Adapter, Masked as Mask, Media};
+
+/// The flag an inferlet sets on rows whose drafts it reads.
+pub const DRAFTS: &str = "drafts";
+/// The flag an inferlet sets on the rows of a drafted block.
+pub const BLOCK_DRAFT: &str = "block_draft";
+/// The flag an inferlet sets on rows whose attention scores it reads.
+pub const SCORES: &str = "scores";
+/// The flag an inferlet sets on rows that attend both ways.
+pub const BIDIRECTIONAL: &str = "bidirectional";
+/// The choice of the stream a lane's rows join.
+pub const STREAM: &str = "stream";
+/// The choice of the reading a pass runs.
+pub const READING: &str = "reading";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Predicate {
-    Fact { bit: u8 },
+    Builtin(Builtin),
+    Flag(String),
+    Choice(String, String),
     Not(Box<Predicate>),
     And(Box<Predicate>, Box<Predicate>),
-    Rest,
 }
 
 impl Predicate {
-    #[must_use]
-    pub fn fact(bit: u8) -> Predicate {
-        Predicate::Fact { bit }
+    /// The guard over the rows this predicate holds for, its facts given bits
+    /// in `facts` if it does not hold them yet.
+    pub fn guard(&self, facts: &mut poem_ir::Facts) -> Guard {
+        match self {
+            Predicate::Builtin(builtin) => facts.builtin(*builtin),
+            Predicate::Flag(name) => facts.flag(name),
+            Predicate::Choice(name, value) => facts.choice(name, value),
+            Predicate::Not(a) => Guard::not(a.guard(facts)),
+            Predicate::And(a, b) => Guard::and(a.guard(facts), b.guard(facts)),
+        }
     }
+}
 
-    #[must_use]
-    pub fn rest() -> Predicate {
-        Predicate::Rest
-    }
+/// The rows whose lane carries `what`.
+#[must_use]
+pub fn has(what: Builtin) -> Predicate {
+    assert!(
+        what != Builtin::SingleToken,
+        "a single token is a count, not a buffer; it is `single_token()`"
+    );
+    Predicate::Builtin(what)
+}
 
-    #[must_use]
-    pub fn stream(base: u8, stream: Stream) -> Predicate {
-        Predicate::fact(base + stream.code())
-    }
+/// The rows of lanes that query one token.
+#[must_use]
+pub fn single_token() -> Predicate {
+    Predicate::Builtin(Builtin::SingleToken)
+}
+
+/// The rows whose inferlet turned the flag `name` on.
+#[must_use]
+pub fn flag(name: &str) -> Predicate {
+    Predicate::Flag(name.to_string())
+}
+
+/// The rows whose inferlet set the choice `name` to `value`.
+#[must_use]
+pub fn choice(name: &str, value: &str) -> Predicate {
+    Predicate::Choice(name.to_string(), value.to_string())
+}
+
+#[must_use]
+pub fn drafts() -> Predicate {
+    flag(DRAFTS)
+}
+
+#[must_use]
+pub fn block_draft() -> Predicate {
+    flag(BLOCK_DRAFT)
+}
+
+#[must_use]
+pub fn scores() -> Predicate {
+    flag(SCORES)
+}
+
+#[must_use]
+pub fn bidirectional() -> Predicate {
+    flag(BIDIRECTIONAL)
+}
+
+/// The rows of the stream `stream`.
+#[must_use]
+pub fn stream(stream: Stream) -> Predicate {
+    choice(STREAM, stream.name())
+}
+
+/// The rows of the reading `name`.
+#[must_use]
+pub fn reading(name: &str) -> Predicate {
+    choice(READING, name)
 }
 
 impl BitAnd for Predicate {

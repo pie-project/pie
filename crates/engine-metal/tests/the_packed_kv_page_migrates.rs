@@ -173,6 +173,7 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
     // One packed KV cache row, a key half and a value half, each `width` wide,
     // carrying the head_dim so the store sizes it per head.
     let trace = Trace {
+        facts: Default::default(),
         name: String::from("kv_migrate_probe"),
         platform: Platform::Metal,
         params: Vec::new(),

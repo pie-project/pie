@@ -1,70 +1,13 @@
+use poem_dsl::fact;
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, GateActivation, HybridSpec, Input, MropeForm, Predicate,
-    Request, Value, ops, seam,
+    Dtype, ForwardHybrid, GateActivation, HybridSpec, Input, MropeForm, Value, ops, seam,
 };
 
 use super::model::{Attn, Gdn, Indexer, Mixer, Mlp, Model, Ple, Residual, Tower};
 
 const MROPE_SECTIONS: [u32; 3] = [11, 11, 10];
 
-pub struct Facts {
-    pub qo_one: bool,
-    pub captures_scores: bool,
-    pub masked: bool,
-    pub drafts: bool,
-    pub media: bool,
-}
-
-impl Facts {
-    #[must_use]
-    pub fn qo_one() -> Predicate {
-        Predicate::fact(0)
-    }
-
-    #[must_use]
-    pub fn captures_scores() -> Predicate {
-        Predicate::fact(1)
-    }
-
-    #[must_use]
-    pub fn masked() -> Predicate {
-        Predicate::fact(2)
-    }
-
-    #[must_use]
-    pub fn drafts() -> Predicate {
-        Predicate::fact(3)
-    }
-
-    #[must_use]
-    pub fn media() -> Predicate {
-        Predicate::fact(4)
-    }
-}
-
-impl Classify for Facts {
-    fn of(r: &Request) -> Facts {
-        Facts {
-            qo_one: r.query_len() == 1,
-            captures_scores: r.captures_scores(),
-            masked: r.has_custom_mask(),
-            drafts: r.drafts(),
-            media: r.has_media(),
-        }
-    }
-
-    fn word(&self) -> u64 {
-        u64::from(self.qo_one)
-            | (u64::from(self.captures_scores) << 1)
-            | (u64::from(self.masked) << 2)
-            | (u64::from(self.drafts) << 3)
-            | (u64::from(self.media) << 4)
-    }
-}
-
 impl ForwardHybrid for Model {
-    type Facts = Facts;
-
     fn caches(&self) -> HybridSpec {
         let mut c = HybridSpec::new();
         let kv = c.kv_space(self.kv);
@@ -123,16 +66,11 @@ impl ForwardHybrid for Model {
         c
     }
 
-    fn forward(&self, inputs: Input<Facts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let m = self;
 
-        let classes = [
-            Facts::masked(),
-            Facts::captures_scores(),
-            Facts::qo_one(),
-            Predicate::rest(),
-        ];
-        let [input_m, input_s, input_d, input_p] = inputs.split(classes);
+        let classes = [fact::has(fact::Mask), fact::scores(), fact::single_token()];
+        let ([input_m, input_s, input_d], input_p) = inputs.partition(classes.clone());
         let plan_m = ops::attn::plan_prefill(&input_m, m.q_heads, m.kv_heads, m.head_dim, None);
         let plan_d = ops::attn::plan_decode(&input_d, m.q_heads, m.kv_heads, m.head_dim, None);
         let plan_p = ops::attn::plan_prefill(&input_p, m.q_heads, m.kv_heads, m.head_dim, None);
@@ -144,7 +82,7 @@ impl ForwardHybrid for Model {
         let ids = inputs.tokens();
         let mut narrow = ops::layout::embed(&ids, &m.embed, m.vocab);
         if let Some(t) = &towered {
-            let (imaged, _) = narrow.split(&Facts::media());
+            let imaged = narrow.on(fact::has(fact::Media));
             narrow =
                 ops::layout::scatter_live_rows(t, &inputs.patch_routes(), &imaged).everywhere();
         }
@@ -184,12 +122,12 @@ impl ForwardHybrid for Model {
         let logits = ops::linear::lm_head(&x, &m.head);
 
         if let Some(mtp) = &m.mtp {
-            let (input_mtp, _) = inputs.split(&Facts::drafts());
+            let input_mtp = inputs.on(fact::drafts());
             let plan_mtp =
                 ops::attn::plan_prefill(&input_mtp, m.q_heads, m.kv_heads, m.head_dim, None);
-            let (dy, _) = y.split(&Facts::drafts());
-            let (dpos, _) = rotation_positions(&inputs, m).split(&Facts::drafts());
-            let (dlogits, _) = logits.split(&Facts::drafts());
+            let dy = y.on(fact::drafts());
+            let dpos = rotation_positions(&inputs, m).on(fact::drafts());
+            let dlogits = logits.on(fact::drafts());
 
             let w = &mtp.block;
             let Mixer::Attn { attn: a, .. } = &w.mixer else {
@@ -240,7 +178,7 @@ impl ForwardHybrid for Model {
 #[allow(clippy::too_many_arguments)]
 fn mtp_attn(
     x: &Value,
-    inputs: &Input<Facts>,
+    inputs: &Input,
     m: &Model,
     plan: &Value,
     positions: &Value,
@@ -286,12 +224,12 @@ fn inject(o: &Value, normed: &Value, res: &Residual, m: &Model, y: &Value) -> Va
     ops::elemwise::hc_inject(o, &gates, m.streams, y)
 }
 
-fn ple(y: &Value, ids: &Value, inputs: &Input<Facts>, m: &Model, p: &Ple) -> Value {
+fn ple(y: &Value, ids: &Value, inputs: &Input, m: &Model, p: &Ple) -> Value {
     let ids_state = inputs.state(&p.ids_state);
     let conv_state = inputs.state(&p.conv_state);
 
-    let one = Facts::qo_one();
-    let (ids_d, ids_p) = ids.split(&one);
+    let one = fact::single_token();
+    let (ids_d, ids_p) = (ids.on(one.clone()), ids.on(!one.clone()));
     let grams = Value::merge(vec![
         ops::attn::ple_ngram_ids(
             &ids_d,
@@ -331,7 +269,7 @@ fn ple(y: &Value, ids: &Value, inputs: &Input<Facts>, m: &Model, p: &Ple) -> Val
     let gated = ops::elemwise::ple_gate(&key, &query, &value, m.streams);
 
     let normed = ops::elemwise::rmsnorm_grouped_plus_one(&gated, &p.norm_conv, m.hidden, p.eps);
-    let (normed_d, normed_p) = normed.split(&one);
+    let (normed_d, normed_p) = (normed.on(one.clone()), normed.on(!one.clone()));
     let conv = Value::merge(vec![
         ops::attn::ssm_causal_conv1d_dilated(
             &normed_d,
@@ -351,7 +289,7 @@ fn ple(y: &Value, ids: &Value, inputs: &Input<Facts>, m: &Model, p: &Ple) -> Val
     ops::elemwise::residual_add(&conv, &gated)
 }
 
-fn rotation_positions(inputs: &Input<Facts>, m: &Model) -> Value {
+fn rotation_positions(inputs: &Input, m: &Model) -> Value {
     match &m.tower {
         None => inputs.positions(),
         Some(_) => inputs.mrope_positions(),
@@ -374,7 +312,7 @@ fn rotate(q: &Value, k: &Value, positions: &Value, m: &Model, a: &Attn, d: u32) 
     }
 }
 
-fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
+fn tower(inputs: &Input, t: &Tower) -> Value {
     let d = t.head_dim;
     let x = inputs.patches(t.patch_width);
     let segments = inputs.patch_segments();
@@ -433,7 +371,10 @@ fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
 }
 
 fn boundaries(positions: &Value, row_valid: &Value, ratio: u32) -> (Value, Value, Value) {
-    let (one, many) = positions.split(&Facts::qo_one());
+    let (one, many) = (
+        positions.on(fact::single_token()),
+        positions.on(!fact::single_token()),
+    );
     let (dpos, dreq, drope) = ops::attn::pool_boundary_decode(&one, row_valid, ratio);
     let (ppos, preq, prope) = ops::attn::pool_boundary_prefill(&many, row_valid, ratio);
     (
@@ -443,7 +384,7 @@ fn boundaries(positions: &Value, row_valid: &Value, ratio: u32) -> (Value, Value
     )
 }
 
-fn qsa_select(x: &Value, inputs: &Input<Facts>, m: &Model, a: &Attn, ix: &Indexer) -> Value {
+fn qsa_select(x: &Value, inputs: &Input, m: &Model, a: &Attn, ix: &Indexer) -> Value {
     let keys = inputs.kv(&ix.keys);
     let write_page = inputs.write_page(&ix.keys);
     let write_offset = inputs.write_offset(&ix.keys);
@@ -467,7 +408,7 @@ fn qsa_select(x: &Value, inputs: &Input<Facts>, m: &Model, a: &Attn, ix: &Indexe
 #[allow(clippy::too_many_arguments)]
 fn attn_mixer(
     x: &Value,
-    inputs: &Input<Facts>,
+    inputs: &Input,
     m: &Model,
     plan_m: &Value,
     plan_d: &Value,
@@ -491,20 +432,13 @@ fn attn_mixer(
     ops::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
     seam::at(seam::ATTN_Q, &[&q]);
 
-    let classes = || {
-        [
-            Facts::masked(),
-            Facts::captures_scores(),
-            Facts::qo_one(),
-            Predicate::rest(),
-        ]
-    };
-    let [mq, sq, dq, p] = q.split(classes());
+    let classes = || [fact::has(fact::Mask), fact::scores(), fact::single_token()];
+    let ([mq, sq, dq], p) = q.partition(classes());
     let (so, lse) = ops::attn::prefill_lse(&sq, plan_s, pages, None, d, m.kv_heads, a.sm_scale);
     seam::at(seam::SCORES, &[&lse]);
     let (od, op) = match ix.map(|ix| (ix, qsa_select(x, inputs, m, a, ix))) {
         Some((ix, selection)) => {
-            let [_, _, d_sel, p_sel] = selection.split(classes());
+            let ([_, _, d_sel], p_sel) = selection.partition(classes());
             (
                 ops::attn::decode_selected(
                     &dq, plan_d, &d_sel, pages, None, d, a.sm_scale, ix.ratio,
@@ -531,16 +465,16 @@ fn attn_mixer(
     ops::linear::matmul(&ops::elemwise::gate_sigmoid_mul(&o, &gate), &a.o_proj)
 }
 
-fn gdn_mixer(x: &Value, inputs: &Input<Facts>, g: &Gdn) -> Value {
+fn gdn_mixer(x: &Value, inputs: &Input, g: &Gdn) -> Value {
     let conv_state = inputs.state(&g.conv_state);
     let delta_state = inputs.state(&g.delta_state);
     let qkvz = ops::linear::matmul(x, &g.in_qkvz);
     let ba = ops::linear::matmul(x, &g.in_ba);
     seam::at(seam::RECURRENT, &[&qkvz]);
     let width = Gdn::qkv_width(g.k_heads, g.v_heads, g.k_dim, g.v_dim);
-    let one = Facts::qo_one();
-    let (qkvz_d, qkvz_p) = qkvz.split(&one);
-    let (ba_d, ba_p) = ba.split(&one);
+    let one = fact::single_token();
+    let (qkvz_d, qkvz_p) = (qkvz.on(one.clone()), qkvz.on(!one.clone()));
+    let (ba_d, ba_p) = (ba.on(one.clone()), ba.on(!one.clone()));
     let (core_d, z_d) = {
         let (qkv, z) = ops::layout::split_rows(&qkvz_d, width);
         let qkv = ops::attn::ssm_causal_conv1d(&qkv, &g.conv, conv_state, g.conv_kernel);

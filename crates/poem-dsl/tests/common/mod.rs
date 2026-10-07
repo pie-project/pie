@@ -1,30 +1,9 @@
 #![allow(dead_code)]
 
+use poem_dsl::fact;
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Predicate, RaggedMask, Request, Stream,
-    Value, Weight, ops, seam,
+    Dtype, ForwardHybrid, HybridSpec, Input, RaggedMask, Stream, Value, Weight, ops, seam,
 };
-
-pub const STREAM_BASE: u8 = 0;
-
-pub struct StreamFacts {
-    pub stream: Stream,
-}
-
-impl StreamFacts {
-    pub fn on(stream: Stream) -> Predicate {
-        Predicate::stream(STREAM_BASE, stream)
-    }
-}
-
-impl Classify for StreamFacts {
-    fn of(r: &Request) -> StreamFacts {
-        StreamFacts { stream: r.stream() }
-    }
-    fn word(&self) -> u64 {
-        self.stream.word(STREAM_BASE)
-    }
-}
 
 pub const AUDIO_WIDTH: u32 = 32;
 pub const VIDEO_WIDTH: u32 = 48;
@@ -34,18 +13,13 @@ pub const HEADS: u64 = 4;
 pub struct CrossAttention;
 
 impl ForwardHybrid for CrossAttention {
-    type Facts = StreamFacts;
-
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input<StreamFacts>) -> Value {
-        let [audio, video, _rest] = inputs.split([
-            StreamFacts::on(Stream::Audio),
-            StreamFacts::on(Stream::Video),
-            Predicate::rest(),
-        ]);
+    fn forward(&self, inputs: Input) -> Value {
+        let ([audio, video], _rest) =
+            inputs.partition([fact::stream(Stream::Audio), fact::stream(Stream::Video)]);
         let wq = Weight::sym(
             "audio.q",
             [HEADS * u64::from(HEAD_DIM), u64::from(AUDIO_WIDTH)],

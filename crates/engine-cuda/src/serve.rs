@@ -80,7 +80,6 @@ pub struct Shell {
     tiers: record::Tiers,
     landing: Vec<Vec<poem_ir::Request>>,
     armed: Option<Armed>,
-    classify: poem_ir::ClassifyFn,
     media: poem_ir::ClassSet,
     shifted: Vec<bool>,
     lane_shifted: Vec<bool>,

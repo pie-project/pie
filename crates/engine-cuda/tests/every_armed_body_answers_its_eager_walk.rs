@@ -65,7 +65,6 @@ fn ready(what: &str) -> Option<Shell> {
     let shell = Shell::load(Boot {
         voxels: None,
         deferred_tier: false,
-        classify: sku.classify,
         residency: engine_cuda::experts::Plan::default(),
         trace,
         contract: &contract,

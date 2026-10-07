@@ -1,12 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use models::wan_2::forward::Facts;
 use models::wan_2::model::{self, Dims};
 use models::{PortKind, ReadoutKind, ScheduleKind};
 use poem_dsl::{
-    Attention, CacheRow, Classify, Def, Dim, Dtype, Elementwise, GeomKind, Operands, Operation,
-    Platform, RaggedMask, Request, RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId,
-    seam,
+    Attention, CacheRow, Def, Dim, Dtype, Elementwise, GeomKind, Operands, Operation, Platform,
+    RaggedMask, Request, RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
 };
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
@@ -47,17 +45,9 @@ fn is_flagship(sku: &str) -> bool {
     sku == TI2V
 }
 
-fn codes(sku: &str) -> (Option<u8>, u8) {
-    if is_flagship(sku) {
-        (Some(0), 1)
-    } else {
-        (None, 0)
-    }
-}
-
-fn word(reading: u8, stream: Stream) -> u64 {
+fn word(plan: &Trace, reading: &str, stream: Stream) -> u64 {
     let request = Request::new(4, false).on_stream(stream).in_reading(reading);
-    Facts::of(&request).word()
+    plan.facts.word(&request)
 }
 
 #[test]
@@ -246,15 +236,14 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
         let classes = poem_dsl::resolve_classes(&plan)
             .unwrap_or_else(|why| panic!("{sku}: a merge does not resolve: {why:?}"));
         let facts = row(sku).generative.as_ref().expect("facts");
-        let catalog = row(sku);
+        let _catalog = row(sku);
         let mut seen: Vec<((&str, Stream), usize)> = Vec::new();
         for reading in &facts.readings {
             for &stream in &reading.streams {
                 let request = Request::new(4, false)
                     .on_stream(stream)
-                    .in_reading(reading.index);
-                let w = (catalog.classify)(&request);
-                assert_eq!(w, Facts::of(&request).word(), "{sku} {stream:?}");
+                    .in_reading(reading.name);
+                let w = plan.facts.word(&request);
                 let class = classes
                     .class_of(w & classes.mask)
                     .unwrap_or_else(|| panic!("{sku}: `{}`/{stream:?} has no class", reading.name));
@@ -276,7 +265,7 @@ fn the_attentions_pair_as_the_architecture_says() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
         let d = dims(sku);
-        let (text, denoise) = codes(sku);
+        let (text, denoise) = (is_flagship(sku).then_some("text"), "denoise");
         let selection_of = |id: ValueId| -> (Selection, &'static str) {
             match &plan.values[id.0 as usize].def {
                 Def::Input(RuntimeInput::Geometry {
@@ -290,8 +279,8 @@ fn the_attentions_pair_as_the_architecture_says() {
                 other => panic!("{sku}: a ragged CSR that is not an indptr: {other:?}"),
             }
         };
-        let video = word(denoise, Stream::Video);
-        let context = word(denoise, Stream::Context);
+        let video = word(&plan, denoise, Stream::Video);
+        let context = word(&plan, denoise, Stream::Context);
         let (mut self_paired, mut crossed, mut encoder) = (0usize, 0usize, 0usize);
         for node in &plan.nodes {
             let Operation::Attention(Attention::Ragged {
@@ -315,7 +304,7 @@ fn the_attentions_pair_as_the_architecture_says() {
                     assert_eq!(kind, "lane", "the encoder attends its own lane");
                     assert_eq!(q_indptr, kv_indptr);
                     let text = text.expect("only the flagship has an encoder");
-                    assert!(select.holds(word(text, Stream::Text)));
+                    assert!(select.holds(word(&plan, text, Stream::Text)));
                     assert!(!select.holds(video));
                 }
                 RaggedMask::GroupBlockDiagonal => {
@@ -338,7 +327,7 @@ fn the_attentions_pair_as_the_architecture_says() {
                         });
                         assert!(spans.holds(video) && spans.holds(context));
                         if let Some(text) = text {
-                            assert!(!spans.holds(word(text, Stream::Text)));
+                            assert!(!spans.holds(word(&plan, text, Stream::Text)));
                         }
                     }
                 }

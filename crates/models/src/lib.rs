@@ -30,7 +30,7 @@ use std::sync::LazyLock;
 use checkpoint::contract::ModelContract;
 use poem_dsl::Dtype;
 
-pub use poem_dsl::{ClassifyFn, Platform, Request, Stream, biases_name, scales_name};
+pub use poem_dsl::{Platform, Request, Stream, biases_name, scales_name};
 
 #[must_use]
 pub fn word(dtype: Dtype) -> String {
@@ -52,7 +52,6 @@ pub struct Deployment {
     pub name: String,
     pub entry: &'static catalog::Entry,
     pub deploy: catalog::Deploy,
-    pub classify: ClassifyFn,
     pub template: catalog::TemplateFn,
     pub tokenizer: &'static tokenizer::Contract,
     pub diffusion: Option<Diffusion>,
@@ -187,7 +186,6 @@ impl Deployment {
         Deployment {
             name: entry.name(&deploy),
             entry,
-            classify: entry.classify,
             template: entry.template,
             tokenizer: entry.tokenizer,
             diffusion: (entry.diffusion)(&deploy),

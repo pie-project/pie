@@ -22,10 +22,6 @@ pub fn trace(name: &str, platform: Platform) -> Result<Trace> {
         .map_err(|why| anyhow!("`{name}` does not serve on {platform:?}: {why}"))
 }
 
-pub fn classify(name: &str) -> Result<models::ClassifyFn> {
-    deployment(name).map(|deployment| deployment.classify)
-}
-
 fn no_such_deployment(name: &str) -> String {
     format!(
         "{name:?} names no deployment of a model this build ships; it lists:\n  {}",

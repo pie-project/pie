@@ -1,38 +1,9 @@
-use poem_dsl::{Classify, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, ops, seam};
+use poem_dsl::fact;
+use poem_dsl::{ForwardHybrid, HybridSpec, Input, Value, ops, seam};
 
 use super::model::{Attn, Indexer, Mlp, Model};
 
-pub struct Facts {
-    pub qo_one: bool,
-    pub has_adapter: bool,
-}
-
-impl Facts {
-    pub fn qo_one() -> Predicate {
-        Predicate::fact(0)
-    }
-
-    pub fn has_adapter() -> Predicate {
-        Predicate::fact(1)
-    }
-}
-
-impl Classify for Facts {
-    fn of(r: &Request) -> Facts {
-        Facts {
-            qo_one: r.query_len() == 1,
-            has_adapter: r.has_adapter(),
-        }
-    }
-
-    fn word(&self) -> u64 {
-        u64::from(self.qo_one) | (u64::from(self.has_adapter) << 1)
-    }
-}
-
 impl ForwardHybrid for Model {
-    type Facts = Facts;
-
     fn caches(&self) -> HybridSpec {
         let mut c = HybridSpec::new();
 
@@ -56,10 +27,13 @@ impl ForwardHybrid for Model {
         c
     }
 
-    fn forward(&self, inputs: Input<Facts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let m = self;
 
-        let (input_d, input_p) = inputs.split(&Facts::qo_one());
+        let (input_d, input_p) = (
+            inputs.on(fact::single_token()),
+            inputs.on(!fact::single_token()),
+        );
         let plan = [
             ops::attn::mla_plan(&input_d, m.heads, m.kv_lora_rank),
             ops::attn::mla_plan(&input_p, m.heads, m.kv_lora_rank),
@@ -72,8 +46,8 @@ impl ForwardHybrid for Model {
             let x = ops::elemwise::rmsnorm(&y, &w.attn_norm, w.attn_norm_eps);
             let o = latent_attention(&x, &inputs, &plan, m, &w.attn);
             let o = {
-                let (adapted, _) = o.split(&Facts::has_adapter());
-                let (px, _) = x.split(&Facts::has_adapter());
+                let adapted = o.on(fact::has(fact::Adapter));
+                let px = x.on(fact::has(fact::Adapter));
                 ops::linear::lora_correct(&px, &w.lora_a, &w.lora_b, &routes, &adapted)
             };
             y = ops::elemwise::residual_add(&o, &y);
@@ -132,13 +106,7 @@ impl ForwardHybrid for Model {
     }
 }
 
-fn latent_attention(
-    x: &Value,
-    inputs: &Input<Facts>,
-    plan: &[Value; 2],
-    m: &Model,
-    a: &Attn,
-) -> Value {
+fn latent_attention(x: &Value, inputs: &Input, plan: &[Value; 2], m: &Model, a: &Attn) -> Value {
     let pages = inputs.kv(&a.kv);
     let positions = inputs.positions();
     let write_page = inputs.write_page(&a.kv);
@@ -183,10 +151,10 @@ fn latent_attention(
     );
     seam::at(seam::ATTN_Q, &[&q]);
 
-    let one = Facts::qo_one();
-    let (dq, pq) = q.split(&one);
-    let (dpe, ppe) = q_pe.split(&one);
-    let (d_sel, p_sel) = selection.split(&one);
+    let one = fact::single_token();
+    let (dq, pq) = (q.on(one.clone()), q.on(!one.clone()));
+    let (dpe, ppe) = (q_pe.on(one.clone()), q_pe.on(!one.clone()));
+    let (d_sel, p_sel) = (selection.on(one.clone()), selection.on(!one.clone()));
     let scored = Value::merge(vec![
         ops::attn::mla_decode_selected(
             &dq,
@@ -222,7 +190,7 @@ fn latent_attention(
     ops::linear::matmul(&v, &a.o_proj)
 }
 
-fn index_select(x: &Value, q_a: &Value, inputs: &Input<Facts>, ix: &Indexer) -> Value {
+fn index_select(x: &Value, q_a: &Value, inputs: &Input, ix: &Indexer) -> Value {
     let keys = inputs.kv(&ix.keys);
     let positions = inputs.positions();
     let write_page = inputs.write_page(&ix.keys);

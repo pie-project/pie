@@ -19,8 +19,8 @@ use eta_ir::op::{IntrinsicId, Op};
 use eta_ir::registry::{GeometryClass, Port, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Trace, Value, Weight,
-    ops, seam, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Trace, Value, Weight, ops, seam,
+    trace_hybrid,
 };
 
 const VOCAB: u32 = 64;
@@ -34,22 +34,9 @@ const BEAMS: u32 = 2;
 /// Pages per beam: the shared prompt's page, then the beam's own.
 const PAGES: u32 = 2;
 
-struct NoFacts;
-
-impl Classify for NoFacts {
-    fn of(_: &Request) -> NoFacts {
-        NoFacts
-    }
-    fn word(&self) -> u64 {
-        0
-    }
-}
-
 struct Tiny;
 
 impl ForwardHybrid for Tiny {
-    type Facts = NoFacts;
-
     fn caches(&self) -> HybridSpec {
         let mut spec = HybridSpec::new();
         let space = spec.kv_space(Dtype::Bf16);
@@ -58,7 +45,7 @@ impl ForwardHybrid for Tiny {
         spec
     }
 
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };

@@ -502,6 +502,7 @@ impl Engine for Wgpu {
             device_channel_commit: true,
             rs_verbs: shell.serves_rs_verbs(),
             bidirectional_attention: false,
+            facts: shell.trace().facts.clone(),
         };
 
         self.shell = Some(shell);

@@ -43,10 +43,6 @@ use crate::serve::{Boot, Lane, Seated, Shell};
 
 pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, String>;
 
-/// The request classifier of a trace's model, by trace name (engine-cuda's
-/// `ClassifyFor`): what the warm ladder words its synthetic lanes with.
-pub type ClassifyFor = fn(&str) -> Option<poem_ir::ClassifyFn>;
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceBoot {
     /// The PJRT plugin; `None` finds one (`PIE_XLA_PLUGIN`,
@@ -81,7 +77,6 @@ pub struct Xla {
     programs: crate::program::Plane,
     boot: DeviceBoot,
     contract_for: ContractFor,
-    classify_for: Option<ClassifyFor>,
     shell: Option<Shell>,
     caps: Option<Capabilities>,
     next_fire: FireId,
@@ -112,7 +107,6 @@ impl Xla {
         Xla {
             boot,
             contract_for,
-            classify_for: None,
             shell: None,
             caps: None,
             next_fire: 1,
@@ -122,14 +116,6 @@ impl Xla {
             adapters: BTreeMap::new(),
             pending: None,
         }
-    }
-
-    /// Names the classifier the warm ladder (`PIE_XLA_PREWARM=1`) words its
-    /// lanes with.
-    #[must_use]
-    pub fn with_classify(mut self, classify_for: ClassifyFor) -> Xla {
-        self.classify_for = Some(classify_for);
-        self
     }
 
     #[must_use]
@@ -414,10 +400,8 @@ impl Engine for Xla {
         )
         .map_err(fault)?;
         let mut shell = shell;
-        if std::env::var("PIE_XLA_PREWARM").is_ok_and(|v| v == "1")
-            && let Some(classify) = self.classify_for.and_then(|of| of(&shell.trace().name))
-        {
-            shell.prewarm(classify).map_err(fault)?;
+        if std::env::var("PIE_XLA_PREWARM").is_ok_and(|v| v == "1") {
+            shell.prewarm().map_err(fault)?;
         }
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, pool_bytes) = shell.footprint();
@@ -472,6 +456,7 @@ impl Engine for Xla {
             device_channel_commit: true,
             rs_verbs: shell.serves_rs_verbs(),
             bidirectional_attention: true,
+            facts: shell.trace().facts.clone(),
         };
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
