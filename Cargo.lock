@@ -1706,6 +1706,7 @@ version = "0.5.4"
 dependencies = [
  "ash",
  "checkpoint",
+ "checkpoint-dsl",
  "engine",
  "eta-compiler",
  "eta-exec",
@@ -1713,12 +1714,19 @@ dependencies = [
  "libc",
  "memmap2",
  "model-compiler",
+ "model-dsl",
  "model-exec",
  "model-ir",
+ "models",
  "naga",
+ "pie-eta-dsl",
  "pie-eta-ir",
+ "serde_json",
+ "tokenizer",
  "toml 1.1.4+spec-1.1.0",
  "tracing",
+ "ztensor",
+ "ztensor-compat",
 ]
 
 [[package]]

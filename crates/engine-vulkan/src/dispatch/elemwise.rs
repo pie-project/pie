@@ -102,6 +102,25 @@ impl Run<'_> {
                 self.tensor(*x),
             ),
 
+            Elementwise::Hadamard {
+                x,
+                x_out: _,
+                block,
+                signs,
+            } => elemwise::pointwise::hadamard(
+                self.ctx(),
+                self.tensor(*x),
+                *block,
+                signs.as_ref().map(|s| self.tensor(*s)),
+            ),
+
+            Elementwise::Add { x, y, z } => elemwise::pointwise::add(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*y),
+                self.tensor(*z),
+            ),
+
             Elementwise::LayernormNoScale { .. }
             | Elementwise::RmsnormResidualAdd { .. }
             | Elementwise::EmbedScaleAdd { .. }
@@ -114,9 +133,7 @@ impl Run<'_> {
             | Elementwise::Silu { .. }
             | Elementwise::Gelu { .. }
             | Elementwise::Tanh { .. }
-            | Elementwise::Hadamard { .. }
             | Elementwise::Mul { .. }
-            | Elementwise::Add { .. }
             | Elementwise::RopeAxes { .. }
             | Elementwise::GateSigmoidMulHeads { .. } => {
                 Err(kernels_vulkan::Error::Unsupported { op: op.name() })

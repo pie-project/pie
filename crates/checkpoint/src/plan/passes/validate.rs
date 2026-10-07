@@ -207,10 +207,11 @@ pub(super) fn validate_bound_encodings(program: &mut LoadPlan) -> Result<usize> 
 
 fn binds_block(backend: BackendKind, scheme: QuantScheme) -> bool {
     match backend {
-        // CUDA reads the K-quant stored blocks and, like Metal, the PTQ1_0
-        // ternary block as stored (the decode-in-dot kernel), so its inline-scale
-        // bank binds directly rather than decoding.
-        BackendKind::Cuda => matches!(
+        // CUDA and Vulkan read the K-quant stored blocks and, like Metal, the
+        // PTQ1_0 ternary block as stored (the decode-in-dot kernels; on Vulkan
+        // `quant/ptq1_0.slang`), so their inline-scale banks bind directly
+        // rather than decoding.
+        BackendKind::Cuda | BackendKind::Vulkan => matches!(
             scheme,
             QuantScheme::GgufQ2K
                 | QuantScheme::GgufQ3K
@@ -219,7 +220,7 @@ fn binds_block(backend: BackendKind, scheme: QuantScheme) -> bool {
                 | QuantScheme::GgufQ6K
                 | QuantScheme::Ptq1_0
         ),
-        BackendKind::Vulkan | BackendKind::Wgpu | BackendKind::Xla => matches!(
+        BackendKind::Wgpu | BackendKind::Xla => matches!(
             scheme,
             QuantScheme::GgufQ2K
                 | QuantScheme::GgufQ3K
@@ -395,17 +396,17 @@ mod tests {
     fn validate_every_case() {
         the_k_quants_bind_on_every_backend_with_a_stored_block_point();
         the_small_blocks_and_the_lattices_bind_nowhere();
-        the_ptq1_0_block_binds_on_cuda_and_metal_only();
+        the_ptq1_0_block_binds_on_cuda_vulkan_and_metal_only();
     }
 
-    fn the_ptq1_0_block_binds_on_cuda_and_metal_only() {
-        for backend in [BackendKind::Cuda, BackendKind::Metal] {
+    fn the_ptq1_0_block_binds_on_cuda_vulkan_and_metal_only() {
+        for backend in [BackendKind::Cuda, BackendKind::Vulkan, BackendKind::Metal] {
             assert!(
                 binds_block(backend, QuantScheme::Ptq1_0),
                 "{backend:?} has a PTQ1_0 decode-in-dot kernel and binds it as stored"
             );
         }
-        for backend in [BackendKind::Vulkan, BackendKind::Wgpu, BackendKind::Xla] {
+        for backend in [BackendKind::Wgpu, BackendKind::Xla] {
             assert!(
                 !binds_block(backend, QuantScheme::Ptq1_0),
                 "{backend:?} has no PTQ1_0 kernel and must decode it"
