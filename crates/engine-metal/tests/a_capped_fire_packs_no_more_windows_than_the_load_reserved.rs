@@ -9,13 +9,13 @@ use engine_metal::Fault;
 use engine_metal::inputs::window_ints;
 use engine_metal::store::kv::Paging;
 use engine_metal::window::{Copies, Windows, gathers};
-use model_compiler::{Budget, CompiledModel, DeviceProfile, compile};
-use model_exec::fire::{ClassWindow, WindowTable, fallback, max_runs};
-use model_ir::{ClassSet, Platform, RowAxis, Trace};
+use poem_compiler::{Budget, CompiledModel, DeviceProfile, compile};
+use poem_exec::fire::{ClassWindow, WindowTable, fallback, max_runs};
+use poem_ir::{ClassSet, Platform, RowAxis, Trace};
 
 const SERVED: &str = "qwen35-d0.8b-u4g64-kv-bf16";
 
-/// Every rung at or above `model_compiler`'s copy/split crossover — 512 rows
+/// Every rung at or above `poem_compiler`'s copy/split crossover — 512 rows
 /// scaled by this profile's 132 SMs over the 82 they were measured on, so
 /// 825. Below it the bake writes `Fallback::Copy` rows, and one gathered mask
 /// buys the reservation `3 * rows + ...` ints of slack no cut here could

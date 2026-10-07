@@ -2,7 +2,7 @@ pub mod kv;
 pub mod rs;
 
 use kernels_cuda::{KvPool, RecurrentPool, Tensor};
-use model_ir::{Attention, CacheRow, Def, Dtype, Operands, Operation, Trace};
+use poem_ir::{Attention, CacheRow, Def, Dtype, Operands, Operation, Trace};
 
 use crate::device::elastic::{self, Arena, Commit, PhysicalPool};
 use crate::error::{Fault, Result};
@@ -11,14 +11,14 @@ use crate::settle::Airborne;
 use crate::store::kv::{Facts, Paging};
 pub use engine::fit::{least_state_slots, pages_within, state_slots_within};
 
-impl From<model_exec::store::Fault> for Fault {
-    fn from(fault: model_exec::store::Fault) -> Fault {
+impl From<poem_exec::store::Fault> for Fault {
+    fn from(fault: poem_exec::store::Fault) -> Fault {
         match fault {
-            model_exec::store::Fault::Ceiling { what, need, have } => {
+            poem_exec::store::Fault::Ceiling { what, need, have } => {
                 Fault::Ceiling { what, need, have }
             }
-            model_exec::store::Fault::Unbound { what } => Fault::Unbound { what },
-            model_exec::store::Fault::Straddled {
+            poem_exec::store::Fault::Unbound { what } => Fault::Unbound { what },
+            poem_exec::store::Fault::Straddled {
                 value,
                 node,
                 planned,
@@ -468,6 +468,7 @@ impl Pools {
                     dtype,
                     space,
                     window,
+                    ..
                 } => {
                     let element = elem_bytes(name, *dtype)?;
                     let windowed = window.is_some() && paging.window.is_some();
@@ -1783,13 +1784,13 @@ fn refuse(pool: &PhysicalPool, outcome: Commit) -> Fault {
 }
 
 fn elem_bytes(name: &str, dtype: Dtype) -> Result<u64> {
-    model_compiler::arena::elem_bytes(dtype).ok_or_else(|| Fault::Unbound {
+    poem_compiler::arena::elem_bytes(dtype).ok_or_else(|| Fault::Unbound {
         what: format!("cache `{name}`, stored as {dtype:?}, which has no element size"),
     })
 }
 
 fn elem_size(dtype: Dtype) -> u32 {
-    model_compiler::arena::elem_bytes(dtype).unwrap_or(1) as u32
+    poem_compiler::arena::elem_bytes(dtype).unwrap_or(1) as u32
 }
 
 fn narrow_pages(pages: u64) -> u32 {

@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 
 WASM_CRATES=(pie-browser runtime engine-wgpu kernels-wgpu web-std wasmtime-web
   checkpoint checkpoint-dsl ztensor ztensor-compat tokenizer grammar chat-template
-  models model-ir model-dsl model-compiler engine model-exec pie-eta-ir pie-eta-dsl eta-compiler
+  models pie-poem-ir pie-poem-dsl pie-poem-compiler engine pie-poem-exec pie-eta-ir pie-eta-dsl eta-compiler
   eta-exec waker ids pie-dtype pie-client-api)
 NATIVE_CRATES=(pie-browser runtime engine-wgpu kernels-wgpu web-std wasmtime-web)
 

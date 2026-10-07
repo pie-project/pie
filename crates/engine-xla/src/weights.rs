@@ -15,7 +15,7 @@ use checkpoint::plan::{LoadPlan, StorageTarget, compile_streaming};
 use checkpoint::serving::Stamp;
 use checkpoint::types::{BackendKind, ScaleForm, TensorId};
 use kernels_xla::{Bank, Tensor};
-use model_ir::{Dtype, ParamSource, Trace};
+use poem_ir::{Dtype, ParamSource, Trace};
 
 use crate::device::Device;
 use crate::error::{Fault, Result};
@@ -107,7 +107,7 @@ pub(crate) fn plane_bytes(name: &str, dtype: Dtype, shape: &[u64]) -> Result<u64
     if let Some(per_row) = packed_row_bytes(dtype, width) {
         return Ok(rows.saturating_mul(per_row));
     }
-    let element = model_compiler::arena::elem_bytes(dtype).ok_or_else(|| Fault::Param {
+    let element = poem_compiler::arena::elem_bytes(dtype).ok_or_else(|| Fault::Param {
         name: name.to_string(),
         why: "is declared in a packed storage element that has no element size",
     })?;
@@ -188,7 +188,7 @@ impl Weights {
                     sizes[at] / u64::from(adapters)
                 };
                 let (rows, cols) = rectangle(p.shape.get(1..).unwrap_or(&[]));
-                let elem = model_compiler::arena::elem_bytes(p.dtype).unwrap_or(0);
+                let elem = poem_compiler::arena::elem_bytes(p.dtype).unwrap_or(0);
                 (at, (adapters, slot, rows, cols, elem))
             })
             .collect();
@@ -575,12 +575,12 @@ fn gemm_only(
     trace: &Trace,
     banks: &std::collections::BTreeSet<usize>,
 ) -> std::collections::BTreeSet<usize> {
-    use model_ir::{Def, Linear, Operands, Operation};
+    use poem_ir::{Def, Linear, Operands, Operation};
     let mut out = std::collections::BTreeSet::new();
     if std::env::var("PIE_XLA_WEIGHT_T").is_ok_and(|v| v == "0") {
         return out;
     }
-    let param_of = |v: model_ir::ValueId| match trace.values.get(v.0 as usize).map(|d| &d.def) {
+    let param_of = |v: poem_ir::ValueId| match trace.values.get(v.0 as usize).map(|d| &d.def) {
         Some(Def::Weight(p)) => Some(*p as usize),
         _ => None,
     };
@@ -670,12 +670,12 @@ fn gather_only(
     trace: &Trace,
     codes: &std::collections::BTreeSet<usize>,
 ) -> std::collections::BTreeSet<usize> {
-    use model_ir::{Def, Layout, Operands, Operation};
+    use poem_ir::{Def, Layout, Operands, Operation};
     let mut out = std::collections::BTreeSet::new();
     if std::env::var_os("PIE_XLA_EMBED_CODES").is_some_and(|v| v != "0") {
         return out;
     }
-    let param_of = |v: model_ir::ValueId| match trace.values.get(v.0 as usize).map(|d| &d.def) {
+    let param_of = |v: poem_ir::ValueId| match trace.values.get(v.0 as usize).map(|d| &d.def) {
         Some(Def::Weight(p)) => Some(*p as usize),
         _ => None,
     };
@@ -831,7 +831,7 @@ impl Landing<'_> {
                 dtype
             };
             let mut padded = bytes.to_vec();
-            let elem = model_compiler::arena::elem_bytes(dtype).unwrap_or(1) as u64;
+            let elem = poem_compiler::arena::elem_bytes(dtype).unwrap_or(1) as u64;
             padded.resize((rows * fold_width * elem) as usize, 0);
             self.buffers[at] = Some(self.device.upload(
                 dtype,
@@ -921,7 +921,7 @@ impl Weights {
             .collect::<Result<_>>()?;
         let mut pairings: BTreeMap<usize, Pairing> = BTreeMap::new();
         for (at, param) in trace.params.iter().enumerate() {
-            let Some(&scales) = index.get(model_dsl_scales(&param.name).as_str()) else {
+            let Some(&scales) = index.get(poem_dsl_scales(&param.name).as_str()) else {
                 continue;
             };
             if trace.params[scales].dtype == param.dtype && param.dtype == Dtype::Bf16 {
@@ -942,7 +942,7 @@ impl Weights {
                 at,
                 Pairing {
                     scales,
-                    biases: index.get(model_dsl_biases(&param.name).as_str()).copied(),
+                    biases: index.get(poem_dsl_biases(&param.name).as_str()).copied(),
                     group,
                     bits,
                 },
@@ -1007,7 +1007,7 @@ impl Weights {
                         },
                         rows,
                         cols,
-                        elem: model_compiler::arena::elem_bytes(param.dtype).unwrap_or(0),
+                        elem: poem_compiler::arena::elem_bytes(param.dtype).unwrap_or(0),
                         host: Vec::new(),
                     },
                 );
@@ -1057,10 +1057,10 @@ impl Weights {
     }
 }
 
-fn model_dsl_scales(of: &str) -> String {
+fn poem_dsl_scales(of: &str) -> String {
     format!("{of}{}", dtype::SCALES)
 }
 
-fn model_dsl_biases(of: &str) -> String {
+fn poem_dsl_biases(of: &str) -> String {
     format!("{of}{}", dtype::BIASES)
 }

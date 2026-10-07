@@ -1,6 +1,6 @@
 use kernels_wgpu::attn::ssm::Committed;
 use kernels_wgpu::{Error, Tensor, layout};
-use model_ir::ValueId;
+use poem_ir::ValueId;
 
 use crate::rs::Seat;
 use crate::run::Run;
@@ -56,8 +56,8 @@ impl Run<'_> {
             .map_err(|fault| Self::kernel(fault, op))?;
         layout::copy_words(
             self.ctx(),
-            Tensor::new(src, 1, 1, model_ir::Dtype::U32),
-            Tensor::new(dst, 1, 1, model_ir::Dtype::U32),
+            Tensor::new(src, 1, 1, poem_ir::Dtype::U32),
+            Tensor::new(dst, 1, 1, poem_ir::Dtype::U32),
             bytes,
         )
     }
@@ -190,7 +190,7 @@ impl Run<'_> {
     ) -> Result<(), Error> {
         let target = self.tensor(dest);
         let row_bytes = u64::from(ext.width)
-            * model_compiler::arena::elem_bytes(ext.dtype).ok_or_else(|| Error::Backend {
+            * poem_compiler::arena::elem_bytes(ext.dtype).ok_or_else(|| Error::Backend {
                 op,
                 detail: format!("{:?} has no element size", ext.dtype),
             })?;

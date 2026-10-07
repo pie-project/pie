@@ -13,7 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 checkpoint = { path = "../checkpoint" }
-model-dsl = { path = "../model-dsl" }
+poem-dsl = { package = "pie-poem-dsl", path = "../poem-dsl" }
 ztensor = { workspace = true }
 
 [dev-dependencies]

@@ -1,4 +1,4 @@
-use model_dsl::{Dtype, Weight};
+use poem_dsl::{Dtype, Weight};
 
 pub const IN_CHANNELS: u32 = 128;
 pub const VAE_CHANNELS: u32 = 32;

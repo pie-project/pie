@@ -26,10 +26,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use model_dsl::{
+use models::qwen_3::model::Model;
+use poem_dsl::{
     Def, Dtype, Elementwise, Linear, Operation, Platform, Trace, ValueId, trace_hybrid,
 };
-use models::qwen_3::model::Model;
 
 /// The width of the sign bank a Hadamard node references, or `None` for a plain
 /// (unsigned) Hadamard. Resolves the `signs` value to its registered param name
@@ -189,7 +189,7 @@ fn the_bonsai_flag_declares_three_width_keyed_sign_banks() {
         // Declared in the activation compute dtype (bf16 for the Ptq1_0 serve),
         // as the Metal Hadamard kernel binds `signs.dtype == activation.dtype`.
         assert_eq!(w.dtype, Dtype::Bf16);
-        assert!(matches!(w.source, model_dsl::ParamSource::Registered));
+        assert!(matches!(w.source, poem_dsl::ParamSource::Registered));
     }
 }
 

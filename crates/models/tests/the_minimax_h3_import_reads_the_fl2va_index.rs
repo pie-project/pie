@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{ModelContract, Partition, TensorType};
 use checkpoint::plan::StorageTarget;
-use model_dsl::Platform;
 use models::minimax_h3::model::{self, Dims};
+use poem_dsl::Platform;
 use ztensor::Leaf;
 use ztensor::provide::{Catalog, Entry, Location, Store, StoreId};
 

@@ -1,6 +1,6 @@
 use kernels_metal::{Tensor, elemwise};
-use model_exec::{DispatchElementwise, KernelError};
-use model_ir::{Elementwise, ModulateForm, MropeForm, Operands, RopeForm};
+use poem_exec::{DispatchElementwise, KernelError};
+use poem_ir::{Elementwise, ModulateForm, MropeForm, Operands, RopeForm};
 
 use crate::run::Run;
 
@@ -332,7 +332,7 @@ impl Run<'_> {
                 self.tensor(*weight),
                 *head_dim,
                 *eps,
-                matches!(act, model_ir::GateActivation::Sigmoid),
+                matches!(act, poem_ir::GateActivation::Sigmoid),
                 self.tensor(*y),
             ),
             Elementwise::RmsnormGatedBy {
@@ -409,7 +409,7 @@ impl Run<'_> {
                     });
                 };
                 let elem = u64::from(first.width)
-                    * model_compiler::arena::elem_bytes(first.dtype).unwrap_or(2);
+                    * poem_compiler::arena::elem_bytes(first.dtype).unwrap_or(2);
                 let plane_bytes = u64::from(first.rows) * elem;
                 let mut want = self.handles().get(first.buf).map(|row| row.offset());
                 for plane in &planes {

@@ -5,9 +5,9 @@ use std::time::Instant;
 
 use engine_metal::experts::{Attachments, Plan};
 use engine_metal::{Boot, Lane, Shell};
-use model_compiler::Budget;
-use model_dsl::{Classify, Platform, Request};
-use model_ir::Trace;
+use poem_compiler::Budget;
+use poem_dsl::{Classify, Platform, Request};
+use poem_ir::Trace;
 
 const SKU: &str = "dsv4-flash-full-mtp-u4g64-u2g64-mxfp4-kv-bf16";
 

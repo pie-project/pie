@@ -1,12 +1,12 @@
 use std::collections::BTreeSet;
 
-use model_dsl::{
-    Attention, Classify, Def, Dim, Dtype, Elementwise, GeomKind, Operands, Operation, Platform,
-    Request, RopeForm, RuntimeInput, Stream, Trace, Ty, ValueId, seam,
-};
 use models::flux_2::forward::{self, Facts};
 use models::flux_2::model;
 use models::{PortKind, ReadoutKind};
+use poem_dsl::{
+    Attention, Classify, Def, Dim, Dtype, Elementwise, GeomKind, Operands, Operation, Platform,
+    Request, RopeForm, RuntimeInput, Stream, Trace, Ty, ValueId, seam,
+};
 
 const KLEIN: &str = "flux2-klein-4b-bf16-kv-bf16";
 const MINI: &str = "flux2-mini-bf16-kv-bf16";
@@ -242,7 +242,7 @@ fn the_denoise_ports_are_the_ones_the_facts_declare() {
 fn each_stream_of_the_denoise_reading_classifies_into_its_own_class() {
     for sku in [KLEIN, MINI] {
         let plan = trace(sku, Platform::Cuda);
-        let classes = model_dsl::resolve_classes(&plan).expect("every merge resolves");
+        let classes = poem_dsl::resolve_classes(&plan).expect("every merge resolves");
         let row = row(sku);
         let codes = models::flux_2::model::Model::mini(Dtype::Bf16, 1).readings();
         let denoise = if sku == KLEIN { 1 } else { codes.denoise };
@@ -397,8 +397,8 @@ fn every_rope_turns_four_axes_of_the_whole_head_interleaved() {
     );
 }
 
-fn budget() -> model_compiler::Budget {
-    model_compiler::Budget {
+fn budget() -> poem_compiler::Budget {
+    poem_compiler::Budget {
         max_lanes: 64,
         max_tokens: 4096,
         buckets: vec![64, 256, 1024, 4096],
@@ -410,12 +410,12 @@ fn both_rows_bake_on_every_platform_under_a_voxel_ladder() {
     for platform in PLATFORMS {
         for sku in [KLEIN, MINI] {
             let plan = trace(sku, platform);
-            let budgets = model_compiler::Budgets::of(budget())
-                .with_voxels(model_compiler::VoxelLadder::new(4096, 4));
-            let compiled = model_compiler::compile_axes(
+            let budgets = poem_compiler::Budgets::of(budget())
+                .with_voxels(poem_compiler::VoxelLadder::new(4096, 4));
+            let compiled = poem_compiler::compile_axes(
                 &plan,
                 &budgets,
-                &model_compiler::DeviceProfile::default(),
+                &poem_compiler::DeviceProfile::default(),
             )
             .unwrap_or_else(|why| panic!("{platform:?}: `{sku}` does not bake: {why}"));
             let tiled: usize = compiled.regions.iter().map(|r| r.nodes.len()).sum();
@@ -431,13 +431,13 @@ fn both_rows_bake_on_every_platform_under_a_voxel_ladder() {
             );
         }
     }
-    let refused = model_compiler::compile(
+    let refused = poem_compiler::compile(
         &trace(KLEIN, Platform::Cuda),
         &budget(),
-        &model_compiler::DeviceProfile::default(),
+        &poem_compiler::DeviceProfile::default(),
     );
     assert!(
-        matches!(refused, Err(model_compiler::Error::Unsized { .. })),
+        matches!(refused, Err(poem_compiler::Error::Unsized { .. })),
         "the flagship bakes against no voxel ladder: {refused:?}"
     );
 }

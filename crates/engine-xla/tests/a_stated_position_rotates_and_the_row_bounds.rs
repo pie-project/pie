@@ -15,8 +15,8 @@
 mod common;
 
 use engine_xla::{Boot, DeviceBoot, Lane, Seated, Shell};
-use model_compiler::{Budget, PatchLadder};
-use model_dsl::{Platform, Request};
+use poem_compiler::{Budget, PatchLadder};
+use poem_dsl::{Platform, Request};
 
 const SHIFT: u32 = 100;
 

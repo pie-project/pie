@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use engine::fire::{FoldLen, RsReset, RsVerb};
 use engine_cuda::{Boot, Lane, Seated, Shell};
-use model_compiler::Budget;
-use model_dsl::{Platform, Request};
+use poem_compiler::Budget;
+use poem_dsl::{Platform, Request};
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 

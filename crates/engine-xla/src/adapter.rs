@@ -198,7 +198,7 @@ pub fn sink_of(package: &LaunchPackage) -> Result<Option<Sink>> {
             return Err(refuse(
                 "is the SCALE form (`adapter_scale`, two arguments): IA3 and DoRA's \
                  second half multiply an already-materialised output by a per-channel \
-                 vector, and `model-ir` declares no `AdapterScale` op for a bank to be \
+                 vector, and `poem-ir` declares no `AdapterScale` op for a bank to be \
                  read by. This shell seats the low-rank form only, so accepting the \
                  scale would land weights nothing reads — refused rather than ignored"
                     .to_string(),

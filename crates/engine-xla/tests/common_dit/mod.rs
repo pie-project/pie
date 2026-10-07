@@ -31,8 +31,8 @@ use eta_ir::op::Op;
 use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use eta_ir::validate::bind;
-use model_dsl::ops::spatial::{self, Conv};
-use model_dsl::{
+use poem_dsl::ops::spatial::{self, Conv};
+use poem_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Predicate,
     RaggedMask, Request, RopeForm, Stream, Trace, Value, Weight, ops, seam, trace_hybrid,
 };

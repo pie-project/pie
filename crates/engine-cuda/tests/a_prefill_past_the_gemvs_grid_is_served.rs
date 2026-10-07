@@ -5,9 +5,9 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use checkpoint::contract::ModelContract;
 use engine_cuda::{Boot, Graphs, Lane, Shell};
-use model_compiler::Budget;
-use model_dsl::{Dtype, Platform, Request};
-use model_ir::{ParamSource, Trace};
+use poem_compiler::Budget;
+use poem_dsl::{Dtype, Platform, Request};
+use poem_ir::{ParamSource, Trace};
 
 const TOP_K: u32 = 4;
 const WIDE: u32 = 16_400;
@@ -24,7 +24,7 @@ const PAGE: u32 = 16;
 struct Text {
     name: &'static str,
     build: fn() -> models::qwen_3::model::Model,
-    classify: model_ir::ClassifyFn,
+    classify: poem_ir::ClassifyFn,
     word: fn(u32) -> u64,
     ceiling: u32,
 }
@@ -33,20 +33,20 @@ fn micro() -> models::qwen_3::model::Model {
     models::qwen_3::model::Model::a3b_micro(Dtype::Bf16, Dtype::Bf16, 1)
 }
 fn micro_classify(request: &Request) -> u64 {
-    model_dsl::word_of(micro, request)
+    poem_dsl::word_of(micro, request)
 }
 fn micro_word(len: u32) -> u64 {
-    model_dsl::word_of(micro, &Request::new(len, false))
+    poem_dsl::word_of(micro, &Request::new(len, false))
 }
 
 fn uncached() -> models::qwen_3::model::Model {
     models::qwen_3::model::Model::a3b_uncached_bank(Dtype::Bf16, Dtype::Bf16, 1)
 }
 fn uncached_classify(request: &Request) -> u64 {
-    model_dsl::word_of(uncached, request)
+    poem_dsl::word_of(uncached, request)
 }
 fn uncached_word(len: u32) -> u64 {
-    model_dsl::word_of(uncached, &Request::new(len, false))
+    poem_dsl::word_of(uncached, &Request::new(len, false))
 }
 
 const MICRO: Text = Text {
@@ -157,7 +157,7 @@ struct Fixture {
 
 fn fixture(text: Text) -> Fixture {
     let m = (text.build)();
-    let trace = model_dsl::trace_hybrid(text.name, &m, Platform::Cuda);
+    let trace = poem_dsl::trace_hybrid(text.name, &m, Platform::Cuda);
     let dir = scratch(text.name);
     let container = dir.0.join("micro.zt");
     write_checkpoint(&container, &trace);

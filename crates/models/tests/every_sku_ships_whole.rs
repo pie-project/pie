@@ -53,7 +53,7 @@ fn every_import_row_reads_the_checkpoint_it_is_handed() {
     let mut sharded = 0usize;
     for row in models::skus() {
         let (sku, tp) = (row.name.as_str(), row.recipe.tp);
-        let refusal = match row.contract(&src, model_dsl::Platform::Cuda) {
+        let refusal = match row.contract(&src, poem_dsl::Platform::Cuda) {
             Ok(_) => {
                 faults.push(format!(
                     "`{sku}` states a whole contract over a checkpoint holding \
@@ -128,7 +128,7 @@ fn write_a_checkpoint_of_one_stranger(path: &Path) {
 }
 
 fn the_block_drafters_plan_is_whole() {
-    use model_dsl::Platform;
+    use poem_dsl::Platform;
     let row = models::skus()
         .find(|row| row.recipe.text == "qwen36-27b-dflash")
         .expect("this build ships the block-drafter row");
@@ -147,7 +147,7 @@ fn the_block_drafters_plan_is_whole() {
 }
 
 fn the_dflash2_plan_is_whole_and_convolves() {
-    use model_dsl::Platform;
+    use poem_dsl::Platform;
     let row = models::skus()
         .find(|row| row.recipe.text == "qwen38-27b-dflash2")
         .expect("this build ships the DFlash2 row");
@@ -159,7 +159,7 @@ fn the_dflash2_plan_is_whole_and_convolves() {
             .filter(|n| {
                 matches!(
                     &n.op,
-                    model_dsl::Operation::Attention(model_dsl::Attention::BlockDynConv { .. })
+                    poem_dsl::Operation::Attention(poem_dsl::Attention::BlockDynConv { .. })
                 )
             })
             .count();
@@ -173,7 +173,7 @@ fn the_dflash2_plan_is_whole_and_convolves() {
             .filter(|n| {
                 matches!(
                     &n.op,
-                    model_dsl::Operation::Attention(model_dsl::Attention::SelectorWalk { .. })
+                    poem_dsl::Operation::Attention(poem_dsl::Attention::SelectorWalk { .. })
                 )
             })
             .count();
@@ -183,7 +183,7 @@ fn the_dflash2_plan_is_whole_and_convolves() {
             .filter(|n| {
                 matches!(
                     &n.op,
-                    model_dsl::Operation::Layout(model_dsl::Layout::TopK { .. })
+                    poem_dsl::Operation::Layout(poem_dsl::Layout::TopK { .. })
                 )
             })
             .count();
@@ -206,7 +206,7 @@ fn the_dflash2_plan_is_whole_and_convolves() {
 }
 
 fn the_v1_text_states_a_bidirectional_block_of_sixteen() {
-    use model_dsl::Platform;
+    use poem_dsl::Platform;
     let row = models::skus()
         .find(|row| row.recipe.text == "qwen36-27b-dflash")
         .expect("this build ships the block-drafter row");
@@ -233,32 +233,32 @@ fn the_v1_text_states_a_bidirectional_block_of_sixteen() {
     );
     let plain = models::skus()
         .find(|row| {
-            row.recipe.text == "qwen38-27b" && row.recipe.weights.contains(&model_dsl::Dtype::U4g64)
+            row.recipe.text == "qwen38-27b" && row.recipe.weights.contains(&poem_dsl::Dtype::U4g64)
         })
         .expect("the plain row");
     assert!((plain.trace)(Platform::Metal).drafter.is_none());
 }
 
 fn the_dspark_plan_is_whole_and_walks_a_bigram() {
-    use model_dsl::Platform;
+    use poem_dsl::Platform;
     let row = models::skus()
         .find(|row| row.recipe.text == "qwen38-27b-dspark")
         .expect("this build ships the DSpark row");
     let trace = (row.trace)(Platform::Metal);
-    let count = |pred: &dyn Fn(&model_dsl::Operation) -> bool| {
+    let count = |pred: &dyn Fn(&poem_dsl::Operation) -> bool| {
         trace.nodes.iter().filter(|n| pred(&n.op)).count()
     };
     assert_eq!(
         count(&|op| matches!(
             op,
-            model_dsl::Operation::Attention(model_dsl::Attention::BlockDynConv { .. })
+            poem_dsl::Operation::Attention(poem_dsl::Attention::BlockDynConv { .. })
         )),
         0
     );
     assert_eq!(
         count(&|op| matches!(
             op,
-            model_dsl::Operation::Layout(model_dsl::Layout::TopK { .. })
+            poem_dsl::Operation::Layout(poem_dsl::Layout::TopK { .. })
         )),
         1
     );
@@ -266,10 +266,8 @@ fn the_dspark_plan_is_whole_and_walks_a_bigram() {
         .nodes
         .iter()
         .filter_map(|n| match &n.op {
-            model_dsl::Operation::Attention(model_dsl::Attention::SelectorWalk {
-                hp,
-                first,
-                ..
+            poem_dsl::Operation::Attention(poem_dsl::Attention::SelectorWalk {
+                hp, first, ..
             }) => Some((*hp, *first)),
             _ => None,
         })
@@ -295,7 +293,7 @@ fn the_dspark_plan_is_whole_and_walks_a_bigram() {
 }
 
 fn gemma_carries_the_block_drafter_too() {
-    use model_dsl::Platform;
+    use poem_dsl::Platform;
     let row = models::skus()
         .find(|row| row.recipe.text == "gemma4-26b-a4b-dflash")
         .expect("this build ships gemma's DFlash row");
@@ -318,7 +316,7 @@ fn gemma_carries_the_block_drafter_too() {
         .filter(|n| {
             matches!(
                 &n.op,
-                model_dsl::Operation::Attention(model_dsl::Attention::Masked { causal: false, .. })
+                poem_dsl::Operation::Attention(poem_dsl::Attention::Masked { causal: false, .. })
             )
         })
         .count();
@@ -333,7 +331,7 @@ fn gemma_carries_the_block_drafter_too() {
 }
 
 fn gpt_oss_carries_the_block_drafter_too() {
-    use model_dsl::Platform;
+    use poem_dsl::Platform;
     let row = models::skus()
         .find(|row| row.recipe.text == "gptoss-20b-dflash")
         .expect("this build ships gpt-oss's DFlash row");
@@ -356,7 +354,7 @@ fn gpt_oss_carries_the_block_drafter_too() {
         .filter(|n| {
             matches!(
                 &n.op,
-                model_dsl::Operation::Attention(model_dsl::Attention::Masked { causal: false, .. })
+                poem_dsl::Operation::Attention(poem_dsl::Attention::Masked { causal: false, .. })
             )
         })
         .count();

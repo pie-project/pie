@@ -4,7 +4,7 @@ use std::ffi::c_void;
 use cudarc::runtime::sys as rt;
 use kernels_cuda::linear::quant;
 use kernels_cuda::{Ctx, Tensor};
-use model_ir::Dtype;
+use poem_ir::Dtype;
 
 use checkpoint::error::Error;
 use checkpoint::executor::arena::{ArenaBacking, TileMapOp};

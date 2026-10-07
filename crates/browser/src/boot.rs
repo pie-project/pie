@@ -289,7 +289,7 @@ fn load_engine(
     let request = runtime::engine::load::request_of(
         config.sku.as_deref(),
         artifact,
-        model_ir::Platform::Wgpu,
+        poem_ir::Platform::Wgpu,
         budgets,
         residency,
         -1,

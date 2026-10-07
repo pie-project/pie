@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use checkpoint::file::serve::Artifact;
 use checkpoint::serving::{DigestAlgorithm, Digesting};
-use model_ir::Trace;
+use poem_ir::Trace;
 
 #[derive(Clone)]
 pub struct Serving {
@@ -381,16 +381,16 @@ mod tests {
     fn trace(names: &[&str]) -> Trace {
         Trace {
             name: "qwen_3".to_string(),
-            platform: model_ir::Platform::Cuda,
+            platform: poem_ir::Platform::Cuda,
             params: names
                 .iter()
-                .map(|name| model_ir::Param {
+                .map(|name| poem_ir::Param {
                     name: (*name).to_string(),
                     shape: vec![4096],
-                    shard: model_ir::Shard::Replicated,
-                    dtype: model_ir::Dtype::U8,
-                    source: model_ir::ParamSource::default(),
-                    layout: model_ir::ParamLayout::default(),
+                    shard: poem_ir::Shard::Replicated,
+                    dtype: poem_ir::Dtype::U8,
+                    source: poem_ir::ParamSource::default(),
+                    layout: poem_ir::ParamLayout::default(),
                 })
                 .collect(),
             caches: Vec::new(),

@@ -1,7 +1,7 @@
 use kernels_cuda::Tensor;
-use model_compiler::ArenaMap;
-use model_exec::store::arena::rect;
-use model_ir::ValueId;
+use poem_compiler::ArenaMap;
+use poem_exec::store::arena::rect;
+use poem_ir::ValueId;
 
 use crate::device::elastic;
 use crate::error::{Fault, Result};
@@ -42,7 +42,7 @@ impl Arena {
     }
 
     #[must_use]
-    pub fn slots(&self, map: &ArenaMap, rows: model_compiler::FireRows) -> SlotTable {
+    pub fn slots(&self, map: &ArenaMap, rows: poem_compiler::FireRows) -> SlotTable {
         carve(self.base(), map, rows)
     }
 
@@ -85,7 +85,7 @@ impl Arena {
 }
 
 #[must_use]
-pub fn carve(base: u64, map: &ArenaMap, rows: model_compiler::FireRows) -> SlotTable {
+pub fn carve(base: u64, map: &ArenaMap, rows: poem_compiler::FireRows) -> SlotTable {
     let mut cells: Vec<Option<Tensor>> = Vec::with_capacity(map.placements.len());
     for value in 0..map.placements.len() {
         let value = ValueId(value as u32);
@@ -99,14 +99,14 @@ pub fn carve(base: u64, map: &ArenaMap, rows: model_compiler::FireRows) -> SlotT
 
 #[cfg(test)]
 mod tests {
-    use model_compiler::{Budget, DeviceProfile, compile};
-    use model_dsl::Platform;
+    use poem_compiler::{Budget, DeviceProfile, compile};
+    use poem_dsl::Platform;
 
     use super::*;
 
     const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
-    fn compiled() -> (model_ir::Trace, model_compiler::CompiledModel) {
+    fn compiled() -> (poem_ir::Trace, poem_compiler::CompiledModel) {
         let trace = models::sku(SKU)
             .expect("the catalog ships the smoke's SKU")
             .trace;
@@ -122,11 +122,11 @@ mod tests {
         let slots = carve(
             0,
             &compiled.arena,
-            model_compiler::FireRows::text_only(64, 4),
+            poem_compiler::FireRows::text_only(64, 4),
         );
         for handle in slots.0.iter().flatten() {
             let end = handle.ptr
-                + handle.elements() * model_compiler::arena::elem_bytes(handle.dtype).unwrap_or(0);
+                + handle.elements() * poem_compiler::arena::elem_bytes(handle.dtype).unwrap_or(0);
             assert!(
                 end <= compiled.arena.bytes,
                 "a rectangle ending at {end} in an arena of {} bytes",

@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
-use model_compiler::CompiledModel;
-use model_exec::fire::{
+use poem_compiler::CompiledModel;
+use poem_exec::fire::{
     FireDescriptor, MaskSpan, Phases, Regions, Units, WindowTable, walk_phases, walk_regions,
 };
-use model_ir::Trace;
+use poem_ir::Trace;
 
 use crate::device::graph::{Graph, GraphExec};
 use crate::error::Result;
@@ -21,7 +21,7 @@ pub struct Fire<'a> {
     pub stream: *mut core::ffi::c_void,
     pub lanes: Option<Lanes<'a>>,
     pub conditionals: Option<crate::window::Conditionals<'a>>,
-    pub decoding: &'a model_ir::ClassSet,
+    pub decoding: &'a poem_ir::ClassSet,
     pub tiers: &'a Tiers,
     pub towered: bool,
     pub lane_ceiling: u32,
@@ -224,7 +224,7 @@ fn welds(compiled: &CompiledModel) -> Vec<Vec<u32>> {
     let template = compiled.template();
     let mut welds: Vec<Vec<u32>> = Vec::new();
 
-    let mut pending: Vec<model_compiler::EventId> = Vec::new();
+    let mut pending: Vec<poem_compiler::EventId> = Vec::new();
     let mut opened: Option<u32> = None;
     for (index, region) in template.iter().enumerate() {
         let at = index as u32;
@@ -246,7 +246,7 @@ fn welds(compiled: &CompiledModel) -> Vec<Vec<u32>> {
     }
 
     for (index, region) in template.iter().enumerate() {
-        if let model_compiler::Lowering::Switch { arm: 0, arms, .. } = region.lowering {
+        if let poem_compiler::Lowering::Switch { arm: 0, arms, .. } = region.lowering {
             let from = index as u32;
             let upto = from
                 .saturating_add(u32::from(arms))
@@ -255,11 +255,11 @@ fn welds(compiled: &CompiledModel) -> Vec<Vec<u32>> {
         }
     }
 
-    let mut planned: Vec<(&model_ir::ClassSet, u32)> = Vec::new();
+    let mut planned: Vec<(&poem_ir::ClassSet, u32)> = Vec::new();
     for (at, region) in template
         .iter()
         .enumerate()
-        .filter(|(_, region)| region.phase == model_compiler::Phase::Prepare)
+        .filter(|(_, region)| region.phase == poem_compiler::Phase::Prepare)
     {
         let unit = compiled.unit_of(at);
         if !planned
@@ -290,10 +290,10 @@ pub fn cuts(
     let template = compiled.template();
     let table = widen(compiled, admits);
     if table.iter().any(|admit| *admit == Admit::Island) {
-        let mut seen: Vec<(&model_ir::ClassSet, Admit)> = Vec::new();
+        let mut seen: Vec<(&poem_ir::ClassSet, Admit)> = Vec::new();
         for (index, region) in template.iter().enumerate() {
             let planned = template.iter().any(|other| {
-                other.phase == model_compiler::Phase::Prepare && other.mask == region.mask
+                other.phase == poem_compiler::Phase::Prepare && other.mask == region.mask
             });
             if !planned {
                 continue;
@@ -312,7 +312,7 @@ pub fn cuts(
     }
 
     let mut cuts: Vec<Stretch> = Vec::new();
-    let mut pending: Vec<model_compiler::EventId> = Vec::new();
+    let mut pending: Vec<poem_compiler::EventId> = Vec::new();
     for (index, region) in template.iter().enumerate() {
         let at = index as u32;
         let unit = compiled.unit_of(index);
@@ -331,7 +331,7 @@ pub fn cuts(
                 }
                 if matches!(
                     region.lowering,
-                    model_compiler::Lowering::Switch { arm, .. } if arm != 0
+                    poem_compiler::Lowering::Switch { arm, .. } if arm != 0
                 ) {
                     return Err(Uncut::Bracket { region: at });
                 }
@@ -361,7 +361,7 @@ pub const MAX_BODIES: usize = 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tiers {
-    pub plain: model_ir::ClassSet,
+    pub plain: poem_ir::ClassSet,
     pub wide: Box<[u32]>,
 }
 
@@ -383,7 +383,7 @@ impl BodyKey {
     pub fn of(
         classes: &WindowTable,
         bucket: u32,
-        decoding: &model_ir::ClassSet,
+        decoding: &poem_ir::ClassSet,
         lane_ceiling: u32,
         tiers: &Tiers,
     ) -> BodyKey {
@@ -399,7 +399,7 @@ impl BodyKey {
     pub fn of_axes(
         classes: &WindowTable,
         bucket: u32,
-        decoding: &model_ir::ClassSet,
+        decoding: &poem_ir::ClassSet,
         lane_ceiling: u32,
         tiers: &Tiers,
         patch: Option<(&WindowTable, u32)>,
@@ -453,7 +453,7 @@ impl Ladder {
     pub fn of(
         classes: &WindowTable,
         bucket: u32,
-        decoding: &model_ir::ClassSet,
+        decoding: &poem_ir::ClassSet,
         lane_ceiling: u32,
         tiers: &Tiers,
     ) -> Ladder {
@@ -479,12 +479,7 @@ impl Ladder {
     }
 
     #[must_use]
-    pub fn rung(
-        class: usize,
-        bucket: u32,
-        decoding: &model_ir::ClassSet,
-        lane_ceiling: u32,
-    ) -> u32 {
+    pub fn rung(class: usize, bucket: u32, decoding: &poem_ir::ClassSet, lane_ceiling: u32) -> u32 {
         if decoding.contains(class) {
             lane_ceiling.min(bucket)
         } else {
@@ -573,7 +568,7 @@ impl core::fmt::Display for AxisKey {
 
 #[derive(Clone, Copy)]
 pub struct Carve<'a> {
-    pub per_axis: model_ir::PerAxis<Option<AxisCarve<'a>>>,
+    pub per_axis: poem_ir::PerAxis<Option<AxisCarve<'a>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -585,7 +580,7 @@ pub struct AxisCarve<'a> {
 
 impl<'a> Carve<'a> {
     #[must_use]
-    pub fn on(&self, axis: model_ir::RowAxis) -> Option<AxisCarve<'a>> {
+    pub fn on(&self, axis: poem_ir::RowAxis) -> Option<AxisCarve<'a>> {
         self.per_axis[axis]
     }
 }
@@ -850,13 +845,13 @@ impl Bodies {
         crate::serve::btrace::mark("settle");
         let shape = run.schedule_shape();
         let mut key = BodyKey::of_axes(
-            at.descriptor.table(model_ir::RowAxis::Tokens),
+            at.descriptor.table(poem_ir::RowAxis::Tokens),
             at.descriptor.bucket,
             at.decoding,
             at.lane_ceiling,
             at.tiers,
             at.towered.then_some((
-                at.descriptor.table(model_ir::RowAxis::Patches),
+                at.descriptor.table(poem_ir::RowAxis::Patches),
                 at.descriptor.patch_bucket,
             )),
         );
@@ -1028,7 +1023,7 @@ impl Bodies {
                     at.compiled
                         .template()
                         .get(at_region as usize)
-                        .is_some_and(|region| region.phase == model_compiler::Phase::Prepare)
+                        .is_some_and(|region| region.phase == poem_compiler::Phase::Prepare)
                 });
                 if prepare_only {
                     continue;
@@ -1367,17 +1362,17 @@ impl core::fmt::Debug for Bodies {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model_exec::fire::ClassWindow;
+    use poem_exec::fire::ClassWindow;
 
     const LANES: u32 = 4;
 
-    fn prefill_only() -> model_ir::ClassSet {
-        model_ir::ClassSet::default()
+    fn prefill_only() -> poem_ir::ClassSet {
+        poem_ir::ClassSet::default()
     }
 
     fn plain_tiers() -> Tiers {
         Tiers {
-            plain: model_ir::ClassSet::of(0..8usize),
+            plain: poem_ir::ClassSet::of(0..8usize),
             wide: Box::new([]),
         }
     }
@@ -1435,7 +1430,7 @@ mod tests {
     }
 
     fn a_rung_is_the_keys_own_ceiling_and_arming_computes_the_same_one() {
-        let decoding = model_ir::ClassSet::of([0usize]);
+        let decoding = poem_ir::ClassSet::of([0usize]);
         let fired = BodyKey::of(&table(&[(3, 3)]), 8, &decoding, LANES, &plain_tiers());
         assert_eq!(
             fired.to_string(),

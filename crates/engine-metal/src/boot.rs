@@ -106,7 +106,7 @@ mod tests {
     use super::*;
 
     fn nothing(
-        _trace: &model_ir::Trace,
+        _trace: &poem_ir::Trace,
         _path: &std::path::Path,
     ) -> Result<checkpoint::contract::ModelContract, String> {
         Err("this door never loads".to_string())

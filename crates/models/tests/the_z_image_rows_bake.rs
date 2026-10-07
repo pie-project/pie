@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use model_dsl::{
-    Attention, Classify, Def, Dim, Dtype, Elementwise, GeomKind, Operation, Platform, Request,
-    RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
-};
 use models::z_image::forward::Facts;
 use models::z_image::model::{self, Dims};
 use models::{PortKind, ReadoutKind, ScheduleKind};
+use poem_dsl::{
+    Attention, Classify, Def, Dim, Dtype, Elementwise, GeomKind, Operation, Platform, Request,
+    RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
+};
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
 
@@ -287,7 +287,7 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
 fn every_declared_lane_classifies_into_its_own_class_where_every_merge_resolves() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
-        let classes = model_dsl::resolve_classes(&plan).expect("every merge resolves");
+        let classes = poem_dsl::resolve_classes(&plan).expect("every merge resolves");
         let catalog = row(sku);
         let mut seen: Vec<((&str, Stream), usize)> = Vec::new();
         for (name, index, stream) in lanes(sku) {
@@ -475,7 +475,7 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
             match lane_of_row {
                 Some(lanes) => {
                     lane_scales += 1;
-                    assert_eq!(*form, model_dsl::ModulateForm::Scale);
+                    assert_eq!(*form, poem_dsl::ModulateForm::Scale);
                     assert_eq!(
                         ty(*m),
                         Ty::Tensor {
@@ -493,7 +493,7 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
                 }
                 None => {
                     row_pads += 1;
-                    assert_eq!(*form, model_dsl::ModulateForm::ScaleShift);
+                    assert_eq!(*form, poem_dsl::ModulateForm::ScaleShift);
                     assert_eq!(
                         ty(*m),
                         Ty::Tensor {
@@ -517,7 +517,7 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
                 continue;
             }
             let mut pairs = Vec::new();
-            model_dsl::Operands::aliases(&node.op, &mut pairs);
+            poem_dsl::Operands::aliases(&node.op, &mut pairs);
             assert_eq!(pairs.len(), 1, "a gated fold is in place on its residual");
             folds += 1;
         }
@@ -530,7 +530,7 @@ fn every_row_bakes() {
         for platform in [Platform::Cuda, Platform::Metal] {
             let plan = trace(sku, platform);
             let max_tokens = if sku == TURBO { 8192 } else { 4096 };
-            let budget = model_compiler::Budget {
+            let budget = poem_compiler::Budget {
                 max_lanes: 64,
                 max_tokens,
                 buckets: (0..=13)
@@ -539,12 +539,12 @@ fn every_row_bakes() {
                     .collect(),
                 max_adapters: 0,
             };
-            let budgets = model_compiler::Budgets::of(budget)
-                .with_voxels(model_compiler::VoxelLadder::new(4096, 4));
-            let compiled = model_compiler::compile_axes(
+            let budgets = poem_compiler::Budgets::of(budget)
+                .with_voxels(poem_compiler::VoxelLadder::new(4096, 4));
+            let compiled = poem_compiler::compile_axes(
                 &plan,
                 &budgets,
-                &model_compiler::DeviceProfile::default(),
+                &poem_compiler::DeviceProfile::default(),
             )
             .unwrap_or_else(|why| panic!("{sku} {platform:?}: does not bake: {why}"));
             assert!(

@@ -24,9 +24,9 @@ use engine::fire::LayerScores;
 use engine::frame::{
     Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase, Shell as FrameShell, Supply,
 };
-use model_compiler::{Budget, Budgets, CompiledModel};
-use model_exec::fire::{Composition, FireDescriptor};
-use model_ir::Trace;
+use poem_compiler::{Budget, Budgets, CompiledModel};
+use poem_exec::fire::{Composition, FireDescriptor};
+use poem_ir::Trace;
 
 use crate::arena::Arena;
 use crate::device::Context;
@@ -73,15 +73,15 @@ pub struct Shell {
     inputs: Inputs,
     facts: kv::Facts,
     spaces: usize,
-    masked: model_ir::ClassSet,
+    masked: poem_ir::ClassSet,
     feeds: crate::exports::Feeds,
-    corrected: model_ir::ClassSet,
-    decoding: model_ir::ClassSet,
+    corrected: poem_ir::ClassSet,
+    decoding: poem_ir::ClassSet,
     tiers: record::Tiers,
-    landing: Vec<Vec<model_ir::Request>>,
+    landing: Vec<Vec<poem_ir::Request>>,
     armed: Option<Armed>,
-    classify: model_ir::ClassifyFn,
-    media: model_ir::ClassSet,
+    classify: poem_ir::ClassifyFn,
+    media: poem_ir::ClassSet,
     shifted: Vec<bool>,
     lane_shifted: Vec<bool>,
     schedule_readers: Vec<Option<u32>>,
@@ -518,7 +518,7 @@ pub(crate) struct VoxelFeedPlan {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MergeLand {
-    pub(crate) merge: model_ir::ValueId,
+    pub(crate) merge: poem_ir::ValueId,
     pub(crate) seat: crate::inputs::PortSeat,
     pub(crate) first: u32,
     pub(crate) rows: u32,
@@ -544,7 +544,7 @@ pub struct Prepared<'a> {
     self_cond_rows: Vec<i32>,
     self_cond_weights: Vec<f32>,
     self_cond_feeds: Vec<(usize, usize, u64, u64, u64)>,
-    packings: Vec<model_exec::fire::Packed>,
+    packings: Vec<poem_exec::fire::Packed>,
     port_feeds: Vec<PortFeedPlan>,
     voxel_feeds: Vec<VoxelFeedPlan>,
     merge_lands: Vec<MergeLand>,

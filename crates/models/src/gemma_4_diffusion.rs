@@ -3,7 +3,7 @@ pub mod import;
 pub mod model;
 
 use model::Model;
-use model_dsl::Dtype;
+use poem_dsl::Dtype;
 
 use crate::gemma_4::{template, tokenizer};
 
@@ -16,7 +16,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U4g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::a4b(Dtype::U4g64, Dtype::Bf16, tp),
@@ -26,7 +26,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U8g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::a4b(Dtype::U8g64, Dtype::Bf16, tp),
@@ -36,7 +36,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U8g64, Dtype::U4g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::a4b_experts(Dtype::U8g64, Dtype::U4g64, Dtype::Bf16, tp),
@@ -46,7 +46,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U4g64, Dtype::U8g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::a4b_experts(Dtype::U4g64, Dtype::U8g64, Dtype::Bf16, tp),
@@ -56,7 +56,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U8g64, Dtype::U4g64, Dtype::U4g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::a4b_experts_self_cond(
@@ -72,7 +72,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::Bf16, Dtype::U4g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::a4b_experts(Dtype::Bf16, Dtype::U4g64, Dtype::Bf16, tp),

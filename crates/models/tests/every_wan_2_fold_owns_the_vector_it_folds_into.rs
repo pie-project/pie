@@ -1,4 +1,4 @@
-use model_dsl::{Operands, Platform, Trace, ValueId};
+use poem_dsl::{Operands, Platform, Trace, ValueId};
 
 const ROWS: [&str; 3] = [
     "wan22-ti2v-5b-bf16-kv-bf16",

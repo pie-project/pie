@@ -1,4 +1,4 @@
-use model_dsl::{
+use poem_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, MropeForm, Platform, Predicate, Request,
     Value, ValueId, Weight, ops, seam,
 };
@@ -91,12 +91,12 @@ impl ForwardHybrid for Model {
                     Reading::Global => (kv, self.global.head_dim, self.global.kv_heads),
                 };
                 let plane = kv_heads as u64 * head_dim as u64;
-                c.kv(space, w.attn.kv.clone(), [plane, plane]);
+                c.kv(space, w.attn.kv.clone(), [plane, plane], head_dim);
             }
         }
         if let Some(a) = &self.draft {
             let plane = self.global.kv_heads as u64 * self.global.head_dim as u64;
-            c.kv(kv, a.attn.kv.clone(), [plane, plane]);
+            c.kv(kv, a.attn.kv.clone(), [plane, plane], self.global.head_dim);
         }
         if let Some(d) = &self.dflash {
             d.declare_caches(&mut c, kv);
@@ -274,7 +274,7 @@ impl ForwardHybrid for Model {
                     k_norm,
                     k_norm_eps,
                 } => {
-                    if model_dsl::platform() == Platform::Cuda && *k_norm_eps == at.q_norm_eps {
+                    if poem_dsl::platform() == Platform::Cuda && *k_norm_eps == at.q_norm_eps {
                         let (fast_x, rest_x) = normed.split(&fused);
                         let (fast_pos, rest_pos) = positions.split(&fused);
                         let qf = ops::custom::qkv_fused_qknorm_rope_vnorm_write(

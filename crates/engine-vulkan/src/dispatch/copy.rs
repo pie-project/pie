@@ -1,8 +1,8 @@
 use kernels_vulkan::{Tensor, layout};
-use model_compiler::Region;
-use model_exec::KernelError;
-use model_exec::fire::Serve;
-use model_ir::{Def, Dim, Ty, ValueId};
+use poem_compiler::Region;
+use poem_exec::KernelError;
+use poem_exec::fire::Serve;
+use poem_ir::{Def, Dim, Ty, ValueId};
 
 use crate::run::Run;
 
@@ -186,7 +186,7 @@ impl Serve for Run<'_> {
             self.staged_copy().region,
             self.at_region(),
             "region {} is being scattered and the seated copy plan is another \
-             region's; `model_exec::fire::walk` brackets a copied region's nodes with \
+             region's; `poem_exec::fire::walk` brackets a copied region's nodes with \
              the pair and this is what says the bracket was lost",
             region.nodes.start
         );

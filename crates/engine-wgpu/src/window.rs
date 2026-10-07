@@ -1,11 +1,11 @@
 use std::cell::Cell;
 
 use kernels_wgpu::Tensor;
-use model_compiler::{CompiledModel, Lowering, Region};
-use model_exec::fire::{EventId, MaskSpan, Sink, WindowTable, fallback};
-use model_exec::store::check::{self, rebase};
-use model_exec::store::kv::Geometry;
-use model_ir::{Def, Dim, Dtype, GeomKind, Operands, Operation, RuntimeInput, Trace, Ty};
+use poem_compiler::{CompiledModel, Lowering, Region};
+use poem_exec::fire::{EventId, MaskSpan, Sink, WindowTable, fallback};
+use poem_exec::store::check::{self, rebase};
+use poem_exec::store::kv::Geometry;
+use poem_ir::{Def, Dim, Dtype, GeomKind, Operands, Operation, RuntimeInput, Trace, Ty};
 
 use crate::device::Handles;
 use crate::device::handles::NIL;
@@ -101,11 +101,11 @@ pub struct Windows {
 }
 
 pub(crate) fn operands(
-    nodes: &[model_ir::Node],
+    nodes: &[poem_ir::Node],
     region: &Region,
-) -> Option<(Vec<model_ir::ValueId>, Vec<model_ir::ValueId>)> {
-    let mut ins: Vec<model_ir::ValueId> = Vec::new();
-    let mut outs: Vec<model_ir::ValueId> = Vec::new();
+) -> Option<(Vec<poem_ir::ValueId>, Vec<poem_ir::ValueId>)> {
+    let mut ins: Vec<poem_ir::ValueId> = Vec::new();
+    let mut outs: Vec<poem_ir::ValueId> = Vec::new();
     for node in region.nodes.clone() {
         let node = nodes.get(node as usize)?;
         macro_rules! collect {
@@ -138,7 +138,7 @@ pub(crate) fn copyable(trace: &Trace, region: &Region) -> bool {
         match &decl.def {
             Def::Cache(c) => matches!(
                 trace.caches.get(*c as usize),
-                Some(model_ir::CacheRow::Kv { .. })
+                Some(poem_ir::CacheRow::Kv { .. })
             ),
 
             Def::Input(RuntimeInput::Geometry { kind, .. }) => matches!(
@@ -171,7 +171,7 @@ pub(crate) fn copyable(trace: &Trace, region: &Region) -> bool {
 pub(crate) fn copyable_mask(
     trace: &Trace,
     compiled: &CompiledModel,
-    mask: &model_ir::ClassSet,
+    mask: &poem_ir::ClassSet,
 ) -> bool {
     compiled
         .template()
@@ -182,10 +182,10 @@ pub(crate) fn copyable_mask(
 
 #[must_use]
 pub fn gathers(trace: &Trace, compiled: &CompiledModel) -> usize {
-    let mut masks: Vec<&model_ir::ClassSet> = Vec::new();
+    let mut masks: Vec<&poem_ir::ClassSet> = Vec::new();
     for region in compiled.template() {
         let owed = compiled.fallback.rows.iter().any(|row| {
-            region.nodes.contains(&row.node) && row.fallback == model_compiler::Fallback::Copy
+            region.nodes.contains(&row.node) && row.fallback == poem_compiler::Fallback::Copy
         });
         if !owed || masks.contains(&&region.mask) {
             continue;
@@ -319,9 +319,9 @@ impl Windows {
         for (at, region) in compiled.template().iter().enumerate() {
             let axis = compiled.axis_of(at);
             match axis {
-                model_ir::RowAxis::Tokens => classes.spans_into(&region.mask, &mut spans),
-                model_ir::RowAxis::Patches => patches.spans_into(&region.mask, &mut spans),
-                model_ir::RowAxis::Voxels => spans.clear(),
+                poem_ir::RowAxis::Tokens => classes.spans_into(&region.mask, &mut spans),
+                poem_ir::RowAxis::Patches => patches.spans_into(&region.mask, &mut spans),
+                poem_ir::RowAxis::Voxels => spans.clear(),
             }
 
             let patch = match patches.span(&region.mask) {
@@ -368,12 +368,12 @@ impl Windows {
             let (capped, passes) = if cap > 0 && max_passes > 1 {
                 (
                     false,
-                    model_exec::fire::pass_spans(&mut spans, cap, max_passes),
+                    poem_exec::fire::pass_spans(&mut spans, cap, max_passes),
                 )
             } else {
                 let capped = cap > 0 && spans.iter().any(|span| span.rows > cap);
                 if capped {
-                    model_exec::fire::chunk_spans(&mut spans, cap);
+                    poem_exec::fire::chunk_spans(&mut spans, cap);
                 }
                 (capped, 1)
             };
@@ -382,9 +382,9 @@ impl Windows {
                 let window = Window {
                     span,
                     indptr_host: match axis {
-                        model_ir::RowAxis::Tokens if capped => vec![0, span.rows as i32],
-                        model_ir::RowAxis::Tokens => rebase(indptr_host, span)?,
-                        model_ir::RowAxis::Patches | model_ir::RowAxis::Voxels => Vec::new(),
+                        poem_ir::RowAxis::Tokens if capped => vec![0, span.rows as i32],
+                        poem_ir::RowAxis::Tokens => rebase(indptr_host, span)?,
+                        poem_ir::RowAxis::Patches | poem_ir::RowAxis::Voxels => Vec::new(),
                     },
                     indptr: Tensor::new(NIL, 0, 1, Dtype::I32),
                     gathered: None,

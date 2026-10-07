@@ -1,27 +1,27 @@
-use model_ir::{Attention, Operands, Operation, StructKind, Trace, Ty, ValueId};
+use poem_ir::{Attention, Operands, Operation, StructKind, Trace, Ty, ValueId};
 
 use crate::error::{Fault, Result};
 
-pub use model_exec::store::kv::{
+pub use poem_exec::store::kv::{
     Geometry, Paging, Reader, Seat, SpaceFacts, indptr, pad_indptr, reads, row_of, space_of,
 };
 
 pub fn geometry(paging: &Paging, seats: &[Seat]) -> Result<Geometry> {
-    Ok(model_exec::store::kv::geometry(paging, seats)?)
+    Ok(poem_exec::store::kv::geometry(paging, seats)?)
 }
 
 pub fn geometry_with(paging: &Paging, seats: &[Seat], tables: &[&[u32]]) -> Result<Geometry> {
-    Ok(model_exec::store::kv::geometry_with(paging, seats, tables)?)
+    Ok(poem_exec::store::kv::geometry_with(paging, seats, tables)?)
 }
 
 pub fn window_table(paging: &Paging, seat: &Seat, table: &[u32], ids: &[u32]) -> Result<Vec<u32>> {
-    Ok(model_exec::store::kv::window_table(
+    Ok(poem_exec::store::kv::window_table(
         paging, seat, table, ids,
     )?)
 }
 
 pub fn width_of(trace: &Trace, value: ValueId) -> Result<u64> {
-    Ok(model_exec::store::kv::width_of(trace, value)?)
+    Ok(poem_exec::store::kv::width_of(trace, value)?)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -326,7 +326,7 @@ mod tests {
         let trace = models::sku("qwen35-d0.8b-bf16-kv-bf16")
             .expect("the catalog ships the smoke's SKU")
             .trace;
-        let plan = trace(model_dsl::Platform::Cuda);
+        let plan = trace(poem_dsl::Platform::Cuda);
         let facts = probe(&plan).expect("a hybrid SKU's caches read");
 
         let stated: Vec<SpaceFacts> = facts.rows.iter().flatten().copied().collect();
@@ -374,7 +374,7 @@ mod tests {
         let states = plan
             .caches
             .iter()
-            .filter(|row| matches!(row, model_ir::CacheRow::State { .. }))
+            .filter(|row| matches!(row, poem_ir::CacheRow::State { .. }))
             .count();
         assert_eq!(
             states, 36,

@@ -1,6 +1,6 @@
 use engine::fire::{Boundary, FoldLen, Masking, RsReset, RsVerb};
 use engine::frame::{Demand, Shell as FrameShell};
-use model_exec::fire::{FireDescriptor, Lane as FireLane, compose_axes};
+use poem_exec::fire::{FireDescriptor, Lane as FireLane, compose_axes};
 
 use crate::error::{Fault, Result};
 use crate::record;
@@ -16,7 +16,7 @@ use super::{
 const WINDOWS_MEMO: usize = 8;
 
 pub(super) struct WindowsMemo {
-    tables: [model_exec::fire::WindowTable; 3],
+    tables: [poem_exec::fire::WindowTable; 3],
     indptr_host: Vec<i32>,
     bucket: u32,
     copies: bool,
@@ -351,8 +351,8 @@ impl FrameShell for Shell {
             if let Some((j, &route)) = shot.routes.iter().enumerate().find(|&(_, &route)| {
                 !(drop && route == PATCH_ROUTE_DROP) && (route < 0 || route as u32 >= rows)
             }) {
-                return Err(Fault::from(model_exec::Error::Fire(
-                    model_exec::fire::Fault::PatchRoute {
+                return Err(Fault::from(poem_exec::Error::Fire(
+                    poem_exec::fire::Fault::PatchRoute {
                         at: j as u32,
                         route,
                         rows,
@@ -434,11 +434,11 @@ impl FrameShell for Shell {
                     .compiled
                     .arena
                     .readout_ceiling_of(seam.value)
-                    .unwrap_or_else(|| model_compiler::arena::readouts_ceiling(&self.budget)),
-                None => model_compiler::arena::readouts_ceiling(&self.budget),
+                    .unwrap_or_else(|| poem_compiler::arena::readouts_ceiling(&self.budget)),
+                None => poem_compiler::arena::readouts_ceiling(&self.budget),
             })
             .min()
-            .unwrap_or_else(|| model_compiler::arena::readouts_ceiling(&self.budget));
+            .unwrap_or_else(|| poem_compiler::arena::readouts_ceiling(&self.budget));
         let readout_extent = readout_extent(
             composition.rows(),
             if self.pad {
@@ -457,9 +457,9 @@ impl FrameShell for Shell {
         }
         let descriptor = FireDescriptor::of(&composition);
 
-        let lane_facts: Vec<model_exec::fire::LaneFacts> = lanes
+        let lane_facts: Vec<poem_exec::fire::LaneFacts> = lanes
             .iter()
-            .map(|seated| model_exec::fire::LaneFacts {
+            .map(|seated| poem_exec::fire::LaneFacts {
                 stream: seated.stream,
                 group: seated.group,
             })
@@ -472,10 +472,10 @@ impl FrameShell for Shell {
         let (group_of_lane, packings) = if self.feeds.selections.is_empty() {
             (Vec::new(), Vec::new())
         } else {
-            let groups = model_exec::fire::group_of_lane(composition.lanes(), &lane_facts);
+            let groups = poem_exec::fire::group_of_lane(composition.lanes(), &lane_facts);
             let mut packings = Vec::with_capacity(self.feeds.selections.len());
             for &select in &self.feeds.selections {
-                let packed = model_exec::fire::pack_with_classes(
+                let packed = poem_exec::fire::pack_with_classes(
                     select,
                     composition.lanes(),
                     &lane_facts,
@@ -483,7 +483,7 @@ impl FrameShell for Shell {
                     composition.rows(),
                     &lane_classes,
                 )
-                .map_err(model_exec::Error::Fire)?;
+                .map_err(poem_exec::Error::Fire)?;
                 packings.push(packed);
             }
             (groups, packings)
@@ -590,8 +590,7 @@ impl FrameShell for Shell {
                 let bytes = u64::from(rows) * seat.row_bytes();
                 let f32_bytes = u64::from(rows) * u64::from(seat.width) * 4;
                 let cell = self.programs.feed_cell_bytes(instance, feed.channel)?;
-                let cast =
-                    cell != bytes && seat.dtype == model_ir::Dtype::Bf16 && cell == f32_bytes;
+                let cast = cell != bytes && seat.dtype == poem_ir::Dtype::Bf16 && cell == f32_bytes;
                 if cell != bytes && !cast {
                     return Err(Fault::program(
                         "serve::ports",
@@ -1295,8 +1294,8 @@ impl FrameShell for Shell {
             .position(|&rows| rows == composition.bucket())
             .unwrap_or(0) as u32;
         let lane_ceiling = self.lane_ceiling();
-        let token_axis = composition.axis(model_ir::RowAxis::Tokens);
-        let patches = composition.axis(model_ir::RowAxis::Patches);
+        let token_axis = composition.axis(poem_ir::RowAxis::Tokens);
+        let patches = composition.axis(poem_ir::RowAxis::Patches);
         let key = record::BodyKey::of_axes(
             &token_axis.classes,
             token_axis.bucket,
@@ -1312,9 +1311,9 @@ impl FrameShell for Shell {
                 .iter()
                 .all(|(class, _)| !self.masked.contains(*class as usize));
         let class_tables = [
-            composition.table(model_ir::RowAxis::Tokens),
-            composition.table(model_ir::RowAxis::Patches),
-            composition.table(model_ir::RowAxis::Voxels),
+            composition.table(poem_ir::RowAxis::Tokens),
+            composition.table(poem_ir::RowAxis::Patches),
+            composition.table(poem_ir::RowAxis::Voxels),
         ];
         let held = self.windows_memo.iter().position(|memo| {
             memo.bucket == bucket
@@ -1333,7 +1332,7 @@ impl FrameShell for Shell {
                 let windows = Windows::of(
                     &self.trace,
                     &self.compiled,
-                    model_ir::PerAxis::new([class_tables[0], class_tables[1], class_tables[2]]),
+                    poem_ir::PerAxis::new([class_tables[0], class_tables[1], class_tables[2]]),
                     &indptr_host,
                     crate::window::Copies {
                         bucket,
@@ -1374,7 +1373,7 @@ impl FrameShell for Shell {
         let staged = crate::mask::stage(&masks)?;
         super::btrace::mark("mask");
 
-        let totals = model_ir::PerAxis::from_fn(|axis| composition.axis(axis).rows);
+        let totals = poem_ir::PerAxis::from_fn(|axis| composition.axis(axis).rows);
         // The widened table, as `segmentation` holds it: what a body was
         // recorded under is what it replays under.
         let key = key.with_islands(&record::widen(
@@ -1719,7 +1718,7 @@ impl Shell {
     /// lane agrees on, checked against each lane's rows, or none.
     fn class_table_of<'a>(
         &self,
-        rows: &[model_exec::fire::LaneRow],
+        rows: &[poem_exec::fire::LaneRow],
         lanes: &[super::lanes::Seated<'a>],
     ) -> Result<Option<&'a engine::fire::AttnClasses>> {
         let mut table: Option<&'a engine::fire::AttnClasses> = None;

@@ -1,6 +1,6 @@
-use model_compiler::VoxelLadder;
-use model_exec::fire::LaneRow;
-use model_ir::Dtype;
+use poem_compiler::VoxelLadder;
+use poem_exec::fire::LaneRow;
+use poem_ir::Dtype;
 
 use crate::device::Buffer;
 use crate::error::{Fault, Result};
@@ -18,7 +18,7 @@ pub struct Seat {
 
 impl Seat {
     fn elem_bytes(&self) -> u64 {
-        model_compiler::arena::elem_bytes(self.dtype).unwrap_or(0)
+        poem_compiler::arena::elem_bytes(self.dtype).unwrap_or(0)
     }
 
     fn row_bytes(&self) -> u64 {
@@ -26,7 +26,7 @@ impl Seat {
     }
 
     #[must_use]
-    pub fn of(trace: &model_ir::Trace, ladder: &VoxelLadder) -> Seat {
+    pub fn of(trace: &poem_ir::Trace, ladder: &VoxelLadder) -> Seat {
         let mut channels = 0u32;
         let mut widths: Vec<u32> = Vec::new();
         let mut dtype = Dtype::Bf16;
@@ -34,8 +34,8 @@ impl Seat {
         for decl in &trace.values {
             match (&decl.def, &decl.ty) {
                 (
-                    model_ir::Def::Input(model_ir::RuntimeInput::Voxels { channels: c, .. }),
-                    model_ir::Ty::Tensor { dtype: d, .. },
+                    poem_ir::Def::Input(poem_ir::RuntimeInput::Voxels { channels: c, .. }),
+                    poem_ir::Ty::Tensor { dtype: d, .. },
                 ) => {
                     channels = channels.max(*c);
                     if !widths.contains(c) {
@@ -43,7 +43,7 @@ impl Seat {
                     }
                     dtype = *d;
                 }
-                (model_ir::Def::Input(model_ir::RuntimeInput::TokenGrid { p }), _) => {
+                (poem_ir::Def::Input(poem_ir::RuntimeInput::TokenGrid { p }), _) => {
                     token_patch = Some(*p);
                 }
                 _ => {}
@@ -314,11 +314,11 @@ impl Store {
 
 #[must_use]
 pub(crate) fn host_grid(
-    trace: &model_ir::Trace,
+    trace: &poem_ir::Trace,
     port_grid: &[i32],
-    grid: model_ir::ValueId,
+    grid: poem_ir::ValueId,
 ) -> Option<Vec<i32>> {
-    use model_ir::{Def, Operation, RuntimeInput, Spatial};
+    use poem_ir::{Def, Operation, RuntimeInput, Spatial};
 
     let mut rules = Vec::new();
     let mut at = grid;
@@ -367,11 +367,11 @@ pub fn port_bytes(values: &[f32], element: Dtype) -> std::result::Result<Vec<u8>
 
 pub(crate) fn relabel_conv_weights(
     device: &crate::device::Context,
-    trace: &model_ir::Trace,
+    trace: &poem_ir::Trace,
     weights: &crate::run::WeightTable,
 ) -> Result<()> {
     for (at, param) in trace.params.iter().enumerate() {
-        let model_ir::ParamLayout::ConvTapsMajor { c_in, taps } = param.layout else {
+        let poem_ir::ParamLayout::ConvTapsMajor { c_in, taps } = param.layout else {
             continue;
         };
         let Some(crate::run::WeightRow::Dense(handle)) = weights.0.get(at).copied().flatten()

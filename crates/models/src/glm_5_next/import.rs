@@ -1,5 +1,5 @@
 use checkpoint::contract::{Expr, ModelContract, TensorType};
-use model_dsl::{Platform, Shard, Weight};
+use poem_dsl::{Platform, Shard, Weight};
 
 use super::model::{Indexer, Kda, Mixer, Mla, Mlp, Model, Tower};
 use checkpoint_dsl::{Builder, Error};
@@ -358,7 +358,7 @@ fn kda(
     b.read_expr(&k.dt_bias, || {
         Ok(Expr::src(n("self_attn.dt_bias")).transmute(TensorType::new(
             vec![extent(u64::from(k.heads)), extent(u64::from(k.head_dim))],
-            checkpoint_dsl::encoding(model_dsl::Dtype::F32),
+            checkpoint_dsl::encoding(poem_dsl::Dtype::F32),
         )))
     })?;
     b.read(&k.a_log, n("self_attn.A_log"))?;

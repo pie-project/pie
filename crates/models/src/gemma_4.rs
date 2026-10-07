@@ -6,7 +6,7 @@ pub mod template;
 pub mod tokenizer;
 
 use model::Model;
-use model_dsl::Dtype;
+use poem_dsl::Dtype;
 
 pub fn skus() -> Vec<crate::Sku> {
     crate::skus![
@@ -15,7 +15,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U4g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::a4b_dflash(Dtype::U4g64, Dtype::Bf16, tp),
@@ -25,7 +25,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U4g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::a4b_mtp(Dtype::U4g64, Dtype::Bf16, tp),
@@ -35,7 +35,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U4g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::a4b(Dtype::U4g64, Dtype::Bf16, tp),
@@ -45,7 +45,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U4g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::b31_mtp(Dtype::U4g64, Dtype::Bf16, tp),
@@ -55,7 +55,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U4g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::b31(Dtype::U4g64, Dtype::Bf16, tp),
@@ -65,7 +65,7 @@ pub fn skus() -> Vec<crate::Sku> {
             2,
             [Dtype::U4g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::b31(Dtype::U4g64, Dtype::Bf16, tp),
@@ -75,7 +75,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::Bf16],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::e4b_eagle(Dtype::Bf16, Dtype::Bf16, tp),
@@ -85,7 +85,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::Bf16],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::e4b(Dtype::Bf16, Dtype::Bf16, tp),
@@ -95,7 +95,7 @@ pub fn skus() -> Vec<crate::Sku> {
             2,
             [Dtype::Bf16],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::e4b(Dtype::Bf16, Dtype::Bf16, tp),
@@ -105,7 +105,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::Bf16],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::b31(Dtype::Bf16, Dtype::Bf16, tp),
@@ -115,7 +115,7 @@ pub fn skus() -> Vec<crate::Sku> {
             2,
             [Dtype::Bf16],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::b31(Dtype::Bf16, Dtype::Bf16, tp),
@@ -125,7 +125,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::Bf16],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::e4b_mini(1, Dtype::Bf16, Dtype::Bf16, tp),
@@ -135,7 +135,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::Bf16],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::e4b_mini(6, Dtype::Bf16, Dtype::Bf16, tp),
@@ -145,7 +145,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::Bf16],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::e4b_mini(24, Dtype::Bf16, Dtype::Bf16, tp),
@@ -155,7 +155,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::Bf16],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::e4b_mini(30, Dtype::Bf16, Dtype::Bf16, tp),
@@ -165,7 +165,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::Bf16],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
             |tp: u32| Model::e4b_mini(36, Dtype::Bf16, Dtype::Bf16, tp),
@@ -175,7 +175,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::Bf16],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT_VISION,
             |tp: u32| Model::e4b_vision(Dtype::Bf16, Dtype::Bf16, tp),
@@ -185,7 +185,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U4g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT_VISION,
             |tp: u32| Model::a4b_vision(Dtype::U4g64, Dtype::Bf16, tp),
@@ -195,7 +195,7 @@ pub fn skus() -> Vec<crate::Sku> {
             1,
             [Dtype::U4g64],
             Dtype::Bf16,
-            model_dsl::trace_hybrid,
+            poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT_VISION,
             |tp: u32| Model::b31_vision(Dtype::U4g64, Dtype::Bf16, tp),
@@ -205,7 +205,7 @@ pub fn skus() -> Vec<crate::Sku> {
 
 #[cfg(test)]
 mod tests {
-    use model_ir::{Def, Dtype, Linear, Operation, Platform};
+    use poem_ir::{Def, Dtype, Linear, Operation, Platform};
 
     // A row-major u4 plane decodes through the scalar `matmul_affine` arm, whose
     // rate follows SM clock rather than bandwidth (an A100 decodes 31b at half an L40S).

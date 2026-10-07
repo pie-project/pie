@@ -1,4 +1,4 @@
-use model_dsl::{
+use poem_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, ops, seam,
 };
 
@@ -45,6 +45,7 @@ impl ForwardHybrid for Model {
                         kv,
                         a.kv.clone(),
                         [self.kv_lora_rank as u64, a.qk_rope_head_dim as u64],
+                        a.qk_rope_head_dim,
                     );
                 }
 

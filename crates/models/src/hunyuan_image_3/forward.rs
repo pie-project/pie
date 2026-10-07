@@ -1,5 +1,5 @@
-use model_dsl::ops::spatial;
-use model_dsl::{
+use poem_dsl::ops::spatial;
+use poem_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Predicate, Request,
     RopeForm, Stream, Value, Weight, ops, seam,
 };
@@ -189,7 +189,7 @@ impl ForwardHybrid for Model {
         let kv = c.kv_space(self.kv_dtype);
         let plane = u64::from(self.kv_width());
         for w in &self.layers {
-            c.kv(kv, w.kv.clone(), [plane, plane]);
+            c.kv(kv, w.kv.clone(), [plane, plane], self.dims.head_dim);
         }
         c
     }

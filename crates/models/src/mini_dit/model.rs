@@ -1,4 +1,4 @@
-use model_dsl::{Dtype, Weight};
+use poem_dsl::{Dtype, Weight};
 
 pub const HIDDEN: u32 = 256;
 pub const HEADS: u32 = 4;

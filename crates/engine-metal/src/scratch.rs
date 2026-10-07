@@ -2,9 +2,9 @@ use kernels_metal::Tensor;
 use kernels_metal::attn::ple;
 use kernels_metal::linear::moe::{self, RoutedScratch};
 use kernels_metal::linear::quant;
-use model_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
-use model_exec::store::arena::rect;
-use model_ir::{Attention, Def, Dim, Dtype, Linear, Operation, Trace, Ty, ValueId};
+use poem_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
+use poem_exec::store::arena::rect;
+use poem_ir::{Attention, Def, Dim, Dtype, Linear, Operation, Trace, Ty, ValueId};
 
 use crate::store::kv::Paging;
 
@@ -237,7 +237,7 @@ impl Scratch {
             .nodes
             .iter()
             .filter_map(|node| match &node.op {
-                Operation::Spatial(model_ir::Spatial::GroupNorm { groups, .. }) => Some(*groups),
+                Operation::Spatial(poem_ir::Spatial::GroupNorm { groups, .. }) => Some(*groups),
                 _ => None,
             })
             .max()

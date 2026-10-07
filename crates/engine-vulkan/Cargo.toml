@@ -16,14 +16,14 @@ memmap2 = "0.9"
 
 toml = "1.1"
 
-model-ir = { path = "../model-ir" }
+poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 
 kernels-vulkan = { path = "../kernels-vulkan" }
 
 engine = { path = "../engine" }
 
-model-exec = { path = "../model-exec" }
-model-compiler = { path = "../model-compiler" }
+poem-exec = { package = "pie-poem-exec", path = "../poem-exec" }
+poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
 
 eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
 

@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use checkpoint::contract::ModelContract;
-use model_dsl::{
+use poem_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, ops,
     trace_hybrid,
 };
-use model_ir::{TILED_BAND, TILED_STEP, Trace};
+use poem_ir::{TILED_BAND, TILED_STEP, Trace};
 
 const VOCAB: u32 = 1000;
 
@@ -54,7 +54,7 @@ impl Micro {
     }
 
     fn load(&self, src: &ztensor::Source) -> ModelContract {
-        let mut b = checkpoint_dsl::Builder::new(src, 1, model_dsl::Platform::Cuda);
+        let mut b = checkpoint_dsl::Builder::new(src, 1, poem_dsl::Platform::Cuda);
         for w in [&self.embed, &self.proj, &self.head] {
             b.read_own(w)
                 .unwrap_or_else(|why| panic!("`{}`: {why}", w.name));

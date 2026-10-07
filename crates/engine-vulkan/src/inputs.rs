@@ -1,6 +1,6 @@
 use kernels_vulkan::Tensor;
-use model_compiler::Budget;
-use model_ir::Dtype;
+use poem_compiler::Budget;
+use poem_ir::Dtype;
 
 use crate::device::{Buffer, Context};
 use crate::error::{Fault, Result};
@@ -443,7 +443,7 @@ impl Inputs {
                 }
                 let taps = u32::try_from(seat.embed_taps).unwrap_or(u32::MAX).max(1);
                 let rows32 = u32::try_from(rows).unwrap_or(u32::MAX);
-                let element = model_compiler::arena::elem_bytes(seat.dtype).unwrap_or(1);
+                let element = poem_compiler::arena::elem_bytes(seat.dtype).unwrap_or(1);
                 let width = u32::try_from(seat.row_bytes.checked_div(element).unwrap_or(0))
                     .unwrap_or(u32::MAX);
                 Some(PatchHandles {

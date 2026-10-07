@@ -1,10 +1,10 @@
 use engine_cuda::experts::{Attachments, Budgets, Plan};
-use model_dsl::{Dtype, Platform};
-use model_ir::Trace;
+use poem_dsl::{Dtype, Platform};
+use poem_ir::Trace;
 
 fn micro() -> (models::qwen_3::model::Model, Trace) {
     let m = models::qwen_3::model::Model::a3b_micro(Dtype::Bf16, Dtype::Bf16, 1);
-    let trace = model_dsl::trace_hybrid("qwen35-a3b-micro", &m, Platform::Cuda);
+    let trace = poem_dsl::trace_hybrid("qwen35-a3b-micro", &m, Platform::Cuda);
     (m, trace)
 }
 

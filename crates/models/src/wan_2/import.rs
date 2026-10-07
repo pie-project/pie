@@ -1,6 +1,6 @@
 use checkpoint::contract::{Expr, ModelContract, TensorType};
 use checkpoint_dsl::{Builder, Error, extents, stored_encoding};
-use model_dsl::{Platform, Weight};
+use poem_dsl::{Platform, Weight};
 
 use super::model::{
     Block, Conv, Dims, Dit, Downsampler, HEAD_SLICES, Linear, MOD_SLICES, Model, Resnet,

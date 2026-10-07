@@ -6,9 +6,9 @@ use std::path::Path;
 
 use common_encoder::{Weights, contract_for};
 use engine_cuda::{Boot, Lane, Shell};
-use model_compiler::Budget;
-use model_dsl::{Platform, Request};
-use model_ir::{CacheRow, Trace};
+use poem_compiler::Budget;
+use poem_dsl::{Platform, Request};
+use poem_ir::{CacheRow, Trace};
 
 const SKU: &str = "gemma4-e4b-mini-l6-bf16-kv-bf16";
 const CHUNK: u32 = 256;

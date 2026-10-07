@@ -40,15 +40,15 @@ use checkpoint::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 use checkpoint::types::{BackendKind, Encoding, QuantScheme, TensorDecl, Visibility};
 
 use checkpoint_dsl::Builder;
-use model_dsl::{Dtype, ParamSource, Platform, Shard, Weight};
-use model_ir::ParamLayout;
+use poem_dsl::{Dtype, ParamSource, Platform, Shard, Weight};
+use poem_ir::ParamLayout;
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::encode::{Arg, Encode, Fire, Grid};
 use kernels_metal::linear::quant;
-use model_ir::Dtype as IrDtype;
+use poem_ir::Dtype as IrDtype;
 
 // The M1a oracle: `ForkBlock { tensor, block_index, bytes: [u8;28], .. }` +
 // `FORK_BLOCKS`, real blocks from the GGUF plus synthetic edge cases.

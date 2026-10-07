@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use checkpoint::contract::ModelContract;
 use engine::Engine;
 use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
-use model_dsl::{Platform, Trace};
+use poem_dsl::{Platform, Trace};
 
 const SKU: &str = "mini-dit-bf16-kv-bf16";
 

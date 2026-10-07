@@ -124,7 +124,7 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
     # A suite whose plan bakes a CONDITIONAL region cannot be served by the
     # cuda shell's recorded path — `cudaGraphSetConditional` wants an rdc +
     # cudadevrt link stage this crate does not have — and the MTP draft head is
-    # the catalog's one conditional (`model-compiler`'s
+    # the catalog's one conditional (`poem-compiler`'s
     # `which_skus_get_a_conditional`: "the MTP head and nothing else"). Eager
     # is slow and correct, so a gate about a draft head can ask for it and say
     # in its own header that it did.

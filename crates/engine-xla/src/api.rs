@@ -35,8 +35,8 @@ use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, Pro
 use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
 use eta_ir::registry::{GeometryClass, ModelProfile, PortMask};
 use eta_ir::types::Dtype;
-use model_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder};
-use model_ir::Trace;
+use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder};
+use poem_ir::Trace;
 
 use crate::error::Fault;
 use crate::serve::{Boot, Lane, Seated, Shell};
@@ -45,7 +45,7 @@ pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, S
 
 /// The request classifier of a trace's model, by trace name (engine-cuda's
 /// `ClassifyFor`): what the warm ladder words its synthetic lanes with.
-pub type ClassifyFor = fn(&str) -> Option<model_ir::ClassifyFn>;
+pub type ClassifyFor = fn(&str) -> Option<poem_ir::ClassifyFn>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceBoot {
@@ -228,8 +228,8 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
     const DERIVED_PATCH_CEILING: u32 = 4096;
 
     let declares_patches = trace.values.iter().any(|decl| {
-        matches!(&decl.ty, model_ir::Ty::Tensor { shape, .. }
-            if shape.first().and_then(|dim| dim.axis()) == Some(model_ir::RowAxis::Patches))
+        matches!(&decl.ty, poem_ir::Ty::Tensor { shape, .. }
+            if shape.first().and_then(|dim| dim.axis()) == Some(poem_ir::RowAxis::Patches))
     });
     if !declares_patches {
         return None;
@@ -258,14 +258,14 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
 
 fn patch_bytes(
     patches: &[f32],
-    element: model_ir::Dtype,
+    element: poem_ir::Dtype,
 ) -> std::result::Result<Vec<u8>, &'static str> {
     match element {
-        model_ir::Dtype::Bf16 => Ok(patches
+        poem_ir::Dtype::Bf16 => Ok(patches
             .iter()
             .flat_map(|&v| bf16_bits(v).to_le_bytes())
             .collect()),
-        model_ir::Dtype::F32 => Ok(patches.iter().flat_map(|&v| v.to_le_bytes()).collect()),
+        poem_ir::Dtype::F32 => Ok(patches.iter().flat_map(|&v| v.to_le_bytes()).collect()),
         _ => Err(
             "a media submission against a plan whose activation element is neither \
                   `bf16` nor `f32`, which is the pair every tower in this catalog computes in",
@@ -1042,8 +1042,8 @@ impl Xla {
         let mut staged: Vec<Vec<u8>> = Vec::new();
         if !submission.media.is_empty() {
             let Some(element) = self.shell.as_ref().and_then(Shell::patch_element) else {
-                return Err(fault(Fault::from(model_exec::Error::Fire(
-                    model_exec::fire::Fault::Towerless {
+                return Err(fault(Fault::from(poem_exec::Error::Fire(
+                    poem_exec::fire::Fault::Towerless {
                         lane: submission.media[0].lane,
                     },
                 ))));

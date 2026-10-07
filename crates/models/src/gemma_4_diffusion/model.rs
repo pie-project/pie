@@ -1,4 +1,4 @@
-use model_dsl::Dtype;
+use poem_dsl::Dtype;
 
 use crate::gemma_4;
 

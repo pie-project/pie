@@ -3,8 +3,8 @@ use checkpoint::contract::{Expr, ModelContract};
 use super::model::{Layer, Mixer, Mlp, Model};
 use crate::qwen_3::import::{flattened, squeezed};
 use checkpoint_dsl::{Builder, Error, extents};
-use model_dsl::Platform;
-use model_dsl::Weight;
+use poem_dsl::Platform;
+use poem_dsl::Weight;
 
 #[derive(Clone, Copy)]
 enum Layout {
@@ -394,7 +394,7 @@ enum Read<'a> {
 
 fn shard_count(p: &super::model::Ple) -> usize {
     match &p.table.shard {
-        model_dsl::Shard::Cut { segments, .. } => segments.len(),
-        model_dsl::Shard::Replicated => 1,
+        poem_dsl::Shard::Cut { segments, .. } => segments.len(),
+        poem_dsl::Shard::Replicated => 1,
     }
 }

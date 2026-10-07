@@ -31,7 +31,7 @@ controller-api = { path = "../controller-api" }
 worker-api = { path = "../worker-api" }
 
 engine = { path = "../engine" }
-model-ir = { path = "../model-ir" }
+poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 transport = { path = "../transport", optional = true }
 ids = { path = "../ids" }
 client-api = { package = "pie-client-api", path = "../client-api" }

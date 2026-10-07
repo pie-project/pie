@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use model_dsl::{
-    Attention, Classify, Def, Dim, Dtype, Elementwise, Operation, Platform, RaggedMask, Request,
-    RopeForm, RuntimeInput, Stream, Trace, Ty, seam,
-};
 use models::minimax_h3::forward::Facts;
 use models::minimax_h3::model::{self, Dims};
 use models::{PortKind, ReadoutKind, ScheduleKind};
+use poem_dsl::{
+    Attention, Classify, Def, Dim, Dtype, Elementwise, Operation, Platform, RaggedMask, Request,
+    RopeForm, RuntimeInput, Stream, Trace, Ty, seam,
+};
 
 const FLAGSHIP: &str = "minimax-h3-fl2va-bf16-kv-bf16";
 const MINI: &str = "minimax-h3-mini-bf16-kv-bf16";
@@ -220,7 +220,7 @@ fn lanes(sku: &str) -> Vec<(&'static str, u8, Stream)> {
 fn every_lane_the_facts_list_lands_in_a_class_where_the_merges_resolve() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
-        let classes = model_dsl::resolve_classes(&plan).expect("every merge resolves");
+        let classes = poem_dsl::resolve_classes(&plan).expect("every merge resolves");
         let catalog = row(sku);
         let mut seen: Vec<((&str, Stream), usize)> = Vec::new();
         for (name, index, stream) in lanes(sku) {
@@ -382,8 +382,8 @@ fn the_modality_gather_is_three_weight_blocks_and_one_column_slice() {
     }
 }
 
-fn budget() -> model_compiler::Budget {
-    model_compiler::Budget {
+fn budget() -> poem_compiler::Budget {
+    poem_compiler::Budget {
         max_lanes: 64,
         max_tokens: 4096,
         buckets: vec![64, 256, 1024, 4096],
@@ -395,12 +395,9 @@ fn every_row_bakes_on_every_platform() {
     for platform in PLATFORMS {
         for sku in ROWS {
             let plan = trace(sku, platform);
-            let compiled = model_compiler::compile(
-                &plan,
-                &budget(),
-                &model_compiler::DeviceProfile::default(),
-            )
-            .unwrap_or_else(|why| panic!("{platform:?}: `{sku}` does not bake: {why}"));
+            let compiled =
+                poem_compiler::compile(&plan, &budget(), &poem_compiler::DeviceProfile::default())
+                    .unwrap_or_else(|why| panic!("{platform:?}: `{sku}` does not bake: {why}"));
             let tiled: usize = compiled.regions.iter().map(|r| r.nodes.len()).sum();
             assert_eq!(
                 tiled,
@@ -423,7 +420,7 @@ fn the_sharded_worlds_trace_and_bake() {
             model::TE_LAYERS as usize,
             "tp {tp}: one kv row per encoder layer"
         );
-        model_compiler::compile(&plan, &budget(), &model_compiler::DeviceProfile::default())
+        poem_compiler::compile(&plan, &budget(), &poem_compiler::DeviceProfile::default())
             .unwrap_or_else(|why| panic!("`{sku}` does not bake: {why}"));
         let m = model::Model::fl2va(Dtype::Bf16, tp);
         for bank in &m.dit.blocks[0].adaln {

@@ -13,18 +13,18 @@ path = "src/lib.rs"
 
 [dependencies]
 toml = "1.1"
-model-ir = { path = "../model-ir" }
+poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 kernels-metal = { path = "../kernels-metal" }
 
 engine = { path = "../engine" }
 
-model-exec = { path = "../model-exec" }
+poem-exec = { package = "pie-poem-exec", path = "../poem-exec" }
 
 eta-exec = { path = "../eta-exec" }
 
 eta-compiler = { path = "../eta-compiler" }
 eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
-model-compiler = { path = "../model-compiler" }
+poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
 checkpoint = { path = "../checkpoint" }
 
 libc = "0.2"
@@ -71,7 +71,7 @@ objc2-metal = { version = "0.3", default-features = false, features = [
 [dev-dependencies]
 checkpoint-dsl = { path = "../checkpoint-dsl" }
 models = { path = "../models" }
-model-dsl = { path = "../model-dsl" }
+poem-dsl = { package = "pie-poem-dsl", path = "../poem-dsl" }
 tokenizer = { path = "../tokenizer" }
 serde_json = "1"
 ztensor = { workspace = true }

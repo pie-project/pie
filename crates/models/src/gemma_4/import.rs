@@ -4,7 +4,7 @@ use super::model::{AttnBanks, Model};
 use checkpoint::contract::TensorType;
 
 use checkpoint_dsl::{Builder, Error, extents};
-use model_dsl::Platform;
+use poem_dsl::Platform;
 
 #[derive(Clone, Copy)]
 pub(crate) enum Layout {

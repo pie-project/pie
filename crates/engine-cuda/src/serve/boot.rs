@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use checkpoint::contract::ModelContract;
-use model_compiler::{Budget, DeviceProfile};
-use model_ir::Trace;
+use poem_compiler::{Budget, DeviceProfile};
+use poem_ir::Trace;
 
 use super::diag::Diagnostics;
 
@@ -148,13 +148,13 @@ pub const DEFAULT_GPU_MEM_UTILIZATION: f64 = 0.90;
 pub const DEFAULT_BODIES_MEGABYTES: u32 = 4096;
 
 pub struct Boot<'a> {
-    pub classify: model_ir::ClassifyFn,
+    pub classify: poem_ir::ClassifyFn,
     pub trace: Trace,
     pub contract: &'a ModelContract,
     pub checkpoint: &'a Path,
     pub budget: Budget,
-    pub patches: Option<model_compiler::PatchLadder>,
-    pub voxels: Option<model_compiler::VoxelLadder>,
+    pub patches: Option<poem_compiler::PatchLadder>,
+    pub voxels: Option<poem_compiler::VoxelLadder>,
     pub profile: Option<DeviceProfile>,
     pub page_size: u32,
     pub context: u32,

@@ -1,4 +1,4 @@
-use model_dsl::{Dtype, Stream, Weight};
+use poem_dsl::{Dtype, Stream, Weight};
 
 pub const LATENT_CHANNELS: u32 = 24;
 pub const AUDIO_CHANNELS: u32 = 32;

@@ -6,8 +6,8 @@ use kernels_cuda::attn::plan::{
 use kernels_cuda::linear::lora::Segments;
 use kernels_cuda::linear::moe::{ExpertTable, GroupSeat};
 use kernels_cuda::{Ctx, KvPool, Pad, RaggedTensor, RecurrentPool, Tensor};
-use model_exec::fire::MaskSpan;
-use model_ir::{Def, Dim, GeomKind, Node, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
+use poem_exec::fire::MaskSpan;
+use poem_ir::{Def, Dim, GeomKind, Node, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
 
 use crate::dispatch::copy::CopyPlan;
 use crate::record::Carve;
@@ -192,7 +192,7 @@ impl RsSeat<'_> {
         rows: Tensor,
     ) -> crate::error::Result<()> {
         let page_tokens = self.buffers.page_tokens();
-        let elem = model_compiler::arena::elem_bytes(crate::store::rs::PLANE_DTYPE)
+        let elem = poem_compiler::arena::elem_bytes(crate::store::rs::PLANE_DTYPE)
             .expect("the buffered planes are bf16, which has an element size");
         if u64::from(rows.width) != plane.width {
             return Err(crate::error::Fault::Unbound {
@@ -262,7 +262,7 @@ impl RsSeat<'_> {
         dst: u64,
     ) -> crate::error::Result<()> {
         let page_tokens = self.buffers.page_tokens();
-        let elem = model_compiler::arena::elem_bytes(crate::store::rs::PLANE_DTYPE)
+        let elem = poem_compiler::arena::elem_bytes(crate::store::rs::PLANE_DTYPE)
             .expect("the buffered planes are bf16, which has an element size");
         let row_bytes = plane.width * elem;
         let mut done = 0u32;
@@ -313,7 +313,7 @@ pub struct FireBindings {
 
     pub lane_of_row: Tensor,
     pub group_of_lane: Option<Tensor>,
-    pub packings: Vec<(model_ir::Selection, crate::inputs::PackingHandles)>,
+    pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
     /// The fire's attention class table (`[count * count] u8`) when a lane
     /// stated classes: group-packed `attention.ragged` reads it.
     pub class_table: Option<(Tensor, u32)>,
@@ -355,7 +355,7 @@ pub enum StructSlot {
 
 #[derive(Clone, Copy, Default)]
 pub struct Ceilings<'c> {
-    pub pads: model_ir::PerAxis<Pad>,
+    pub pads: poem_ir::PerAxis<Pad>,
 
     pub bodied: bool,
 
@@ -369,7 +369,7 @@ pub struct Ceilings<'c> {
 }
 
 impl<'c> Ceilings<'c> {
-    fn pad_on(&self, axis: model_ir::RowAxis) -> Pad {
+    fn pad_on(&self, axis: poem_ir::RowAxis) -> Pad {
         self.pads[axis]
     }
 
@@ -405,7 +405,7 @@ enum Held {
 impl Standing {
     fn of(
         window: &Window,
-        axis: model_ir::RowAxis,
+        axis: poem_ir::RowAxis,
         pad: Pad,
         captured: bool,
         moves: bool,
@@ -747,7 +747,7 @@ impl<'c> Run<'c> {
             .map_err(|f| Self::rs_fault(op, f))?;
         crate::device::stage_raw(self.ctx.stream(), at, &bytes)
             .map_err(|f| Self::rs_fault(op, f))?;
-        Ok(Tensor::new(at, csr.len() as u32, 1, model_ir::Dtype::I32))
+        Ok(Tensor::new(at, csr.len() as u32, 1, poem_ir::Dtype::I32))
     }
 
     pub(crate) fn rs_extend(
@@ -773,7 +773,7 @@ impl<'c> Run<'c> {
         }
         let (lanes, csr) = self.rs_ext_layout(seat);
         let rows_ext = u32::try_from(csr.last().copied().unwrap_or(0)).unwrap_or(0);
-        let elem = model_compiler::arena::elem_bytes(own.dtype).ok_or_else(|| {
+        let elem = poem_compiler::arena::elem_bytes(own.dtype).ok_or_else(|| {
             kernels_cuda::Error::Backend {
                 op,
                 detail: format!("{:?} has no element size", own.dtype),
@@ -845,7 +845,7 @@ impl<'c> Run<'c> {
         let own = self.windowed(self.tensor(id));
         let (_, csr) = self.rs_ext_layout(seat);
         let rows_ext = u32::try_from(csr.last().copied().unwrap_or(0)).unwrap_or(0);
-        let elem = model_compiler::arena::elem_bytes(own.dtype).ok_or_else(|| {
+        let elem = poem_compiler::arena::elem_bytes(own.dtype).ok_or_else(|| {
             kernels_cuda::Error::Backend {
                 op,
                 detail: format!("{:?} has no element size", own.dtype),
@@ -887,7 +887,7 @@ impl<'c> Run<'c> {
     ) -> Result<(), kernels_cuda::Error> {
         let (seat, _) = self.rs_seat_and_scratch(op)?;
         let target = self.windowed(self.tensor(id));
-        let elem = model_compiler::arena::elem_bytes(ext.dtype).ok_or_else(|| {
+        let elem = poem_compiler::arena::elem_bytes(ext.dtype).ok_or_else(|| {
             kernels_cuda::Error::Backend {
                 op,
                 detail: format!("{:?} has no element size", ext.dtype),
@@ -1161,7 +1161,7 @@ impl<'c> Run<'c> {
         let span = seated.on(axis);
 
         let row = |times: u32| {
-            let primary = axis == model_ir::RowAxis::PRIMARY;
+            let primary = axis == poem_ir::RowAxis::PRIMARY;
             let extent = if primary { rows } else { span.rows };
             let offset = if primary && plane { 0 } else { span.row_offset };
             (offset * times, extent * times)
@@ -1187,7 +1187,7 @@ impl<'c> Run<'c> {
             return handle;
         }
         let stride = u64::from(handle.width)
-            * model_compiler::arena::elem_bytes(handle.dtype).unwrap_or_else(|| {
+            * poem_compiler::arena::elem_bytes(handle.dtype).unwrap_or_else(|| {
                 panic!(
                     "value {at} is stored as {:?}, which has no element size and so no \
                      row to step by",
@@ -1230,7 +1230,7 @@ impl<'c> Run<'c> {
                     self.copy.region,
                     self.place.region.get(),
                     "value {at} is being resolved inside a copied region whose gather \
-                     has not run; `model_exec::fire::walk` brackets a copied region's \
+                     has not run; `poem_exec::fire::walk` brackets a copied region's \
                      nodes and this is what says the bracket was lost",
                 );
                 self.copy.tight(handle.ptr).unwrap_or_else(|| {
@@ -1248,7 +1248,7 @@ impl<'c> Run<'c> {
     pub(crate) fn packing(
         &self,
         at: usize,
-        select: model_ir::Selection,
+        select: poem_ir::Selection,
     ) -> crate::inputs::PackingHandles {
         self.fire
             .packings
@@ -1282,7 +1282,7 @@ impl<'c> Run<'c> {
     }
 
     pub(crate) fn read_elsewhere(&self, normed: ValueId) -> bool {
-        use model_ir::Operands as _;
+        use poem_ir::Operands as _;
         let mut inputs: Vec<ValueId> = Vec::new();
         self.nodes.iter().any(|node| {
             inputs.clear();
@@ -1612,11 +1612,11 @@ impl<'c> Run<'c> {
         };
         if !matches!(
             handle.dtype,
-            model_ir::Dtype::U2g16k
-                | model_ir::Dtype::I3g16k
-                | model_ir::Dtype::U4g32k
-                | model_ir::Dtype::U5g32k
-                | model_ir::Dtype::I6g16k
+            poem_ir::Dtype::U2g16k
+                | poem_ir::Dtype::I3g16k
+                | poem_ir::Dtype::U4g32k
+                | poem_ir::Dtype::U5g32k
+                | poem_ir::Dtype::I6g16k
         ) {
             return None;
         }
@@ -1625,7 +1625,7 @@ impl<'c> Run<'c> {
             seated.ptr,
             seated.rows,
             seated.width,
-            model_ir::Dtype::U8,
+            poem_ir::Dtype::U8,
         ))
     }
 
@@ -2109,7 +2109,7 @@ fn skip(handle: Tensor, skip: u32, keep: u32) -> Tensor {
         return handle;
     }
     let stride = u64::from(handle.width)
-        * model_compiler::arena::elem_bytes(handle.dtype).unwrap_or_else(|| {
+        * poem_compiler::arena::elem_bytes(handle.dtype).unwrap_or_else(|| {
             panic!(
                 "a {:?} table has no element size and so no row to step by",
                 handle.dtype

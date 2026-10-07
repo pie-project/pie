@@ -17,7 +17,7 @@ pub mod kv;
 use engine::transfer::KvCopy;
 use kernels_xla::hlo::Elem;
 use kernels_xla::{KvPool, RecurrentPool, Tensor};
-use model_ir::{CacheRow, Dtype, Trace};
+use poem_ir::{CacheRow, Dtype, Trace};
 
 /// Source and destination rows of a pool copy.
 type Moves = (Vec<i64>, Vec<i64>);
@@ -30,14 +30,14 @@ use kernels_xla::Emit;
 
 use crate::trace::{Handles, Root, Source, Tracer};
 
-impl From<model_exec::store::Fault> for Fault {
-    fn from(fault: model_exec::store::Fault) -> Fault {
+impl From<poem_exec::store::Fault> for Fault {
+    fn from(fault: poem_exec::store::Fault) -> Fault {
         match fault {
-            model_exec::store::Fault::Ceiling { what, need, have } => {
+            poem_exec::store::Fault::Ceiling { what, need, have } => {
                 Fault::Ceiling { what, need, have }
             }
-            model_exec::store::Fault::Unbound { what } => Fault::Unbound { what },
-            model_exec::store::Fault::Straddled {
+            poem_exec::store::Fault::Unbound { what } => Fault::Unbound { what },
+            poem_exec::store::Fault::Straddled {
                 value,
                 node,
                 planned,
@@ -196,7 +196,7 @@ pub fn window_of(trace: &Trace) -> Result<Option<u32>> {
         let Some(read) = kv::reads(&node.op) else {
             continue;
         };
-        let Some(model_ir::Def::Cache(row)) =
+        let Some(poem_ir::Def::Cache(row)) =
             trace.values.get(read.cache.0 as usize).map(|v| &v.def)
         else {
             continue;
@@ -212,7 +212,7 @@ pub fn window_of(trace: &Trace) -> Result<Option<u32>> {
                 what: format!(
                     "cache `{name}`, which holds a window of {held} tokens while `{}` reads \
                      it through {:?}",
-                    model_ir::Operands::name(&node.op),
+                    poem_ir::Operands::name(&node.op),
                     read.window
                 ),
             });
@@ -289,6 +289,7 @@ impl Pools {
                     dtype,
                     space,
                     window,
+                    ..
                 } => {
                     let split = split(name, declared)?;
                     let windowed = windowed_row(paging, *window);
@@ -481,7 +482,7 @@ impl Pools {
             .iter()
             .map(|shape| match shape {
                 Shape::State { stride, dtype } => {
-                    stride * model_compiler::arena::elem_bytes(*dtype).unwrap_or(4)
+                    stride * poem_compiler::arena::elem_bytes(*dtype).unwrap_or(4)
                 }
                 Shape::Kv { .. } => 0,
             })
@@ -782,7 +783,7 @@ impl engine::frame::Supply for Pools {
 fn compressor_spaces(trace: &Trace) -> Vec<(u32, u64)> {
     let mut spaces: Vec<(u32, u64)> = Vec::new();
     for node in &trace.nodes {
-        let model_ir::Operation::Attention(model_ir::Attention::PoolGather {
+        let poem_ir::Operation::Attention(poem_ir::Attention::PoolGather {
             pages,
             head_dim,
             ratio,
@@ -791,7 +792,7 @@ fn compressor_spaces(trace: &Trace) -> Vec<(u32, u64)> {
         else {
             continue;
         };
-        let Some(model_ir::Def::Cache(space)) = trace.values.get(pages.0 as usize).map(|v| &v.def)
+        let Some(poem_ir::Def::Cache(space)) = trace.values.get(pages.0 as usize).map(|v| &v.def)
         else {
             continue;
         };
@@ -837,7 +838,7 @@ fn split(name: &str, planes: &[u64]) -> Result<Split> {
 }
 
 fn elem_bytes(name: &str, dtype: Dtype) -> Result<u64> {
-    model_compiler::arena::elem_bytes(dtype).ok_or_else(|| Fault::Unbound {
+    poem_compiler::arena::elem_bytes(dtype).ok_or_else(|| Fault::Unbound {
         what: format!("cache `{name}` in {dtype:?}, which has no element size"),
     })
 }

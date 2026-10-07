@@ -1,4 +1,4 @@
-use model_dsl::{
+use poem_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Predicate, RaggedMask,
     Request, RopeForm, Stream, Value, Weight, ops, seam,
 };
@@ -246,7 +246,7 @@ impl ForwardHybrid for Model {
             let kv = c.kv_space(self.kv);
             let plane = u64::from(te.kv_heads) * u64::from(te.head_dim);
             for layer in &te.layers {
-                c.kv(kv, layer.kv.clone(), [plane, plane]);
+                c.kv(kv, layer.kv.clone(), [plane, plane], te.head_dim);
             }
         }
         c

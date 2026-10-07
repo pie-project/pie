@@ -1,6 +1,6 @@
 use kernels_wgpu::collective;
-use model_exec::{DispatchCollective, KernelError};
-use model_ir::Collective;
+use poem_exec::{DispatchCollective, KernelError};
+use poem_ir::Collective;
 
 use crate::run::Run;
 

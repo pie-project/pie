@@ -56,11 +56,11 @@ use checkpoint::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 
 use engine_metal::weights::AdapterPlane;
 use engine_metal::{Boot, Lane, Shell};
-use model_compiler::Budget;
-use model_dsl::{Classify, Dtype, Platform, Request, trace_hybrid};
 use models::qwen_3::forward::Facts;
 use models::qwen_3::model::Model;
 use models::qwen_3::rotation::{self, BONSAI_SIGN_WIDTHS};
+use poem_compiler::Budget;
+use poem_dsl::{Classify, Dtype, Platform, Request, trace_hybrid};
 
 const PROMPT_IDS: [u32; 5] = [760, 6511, 314, 9338, 369];
 const ORACLE_ARGMAX: u32 = 11751;

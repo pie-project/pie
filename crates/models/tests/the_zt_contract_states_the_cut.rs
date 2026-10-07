@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use checkpoint::contract::{Expr, ModelContract, TensorContract, Visibility};
-use model_dsl::{Dtype, Param, ParamSource, Platform, Shard};
+use poem_dsl::{Dtype, Param, ParamSource, Platform, Shard};
 
 const GROUP: u64 = 32;
 
@@ -96,7 +96,8 @@ fn state(writer: &mut ztensor::Writer, param: &Param) {
         | Dtype::U4g32k
         | Dtype::U5g32k
         | Dtype::I6g16k
-        | Dtype::Ptq1_0 => panic!(
+        | Dtype::Ptq1_0
+        | Dtype::KvU4 => panic!(
             "`{}` is declared `{}`, which this fixture does not state; a \
              stored block wants its own bytes and no SKU declares one yet",
             param.name, param.dtype,
@@ -162,7 +163,7 @@ fn state_every_sku() -> Vec<Stated> {
             panic!("`{name}`: the checkpoint just written does not open again: {why}")
         });
         let contract =
-            checkpoint_dsl::own_contract(&src, &trace.params, tp, model_dsl::Platform::Cuda)
+            checkpoint_dsl::own_contract(&src, &trace.params, tp, poem_dsl::Platform::Cuda)
                 .unwrap_or_else(|why| {
                     panic!(
                         "`{name}` refuses a checkpoint that states its own plan, plane for \
@@ -384,7 +385,7 @@ fn a_bank_the_checkpoint_ships_unquantized_is_cast_on_the_way_in() {
         let src = ztensor::Source::open(&path)
             .unwrap_or_else(|why| panic!("`{name}`: {} does not open: {why}", path.display()));
         let contract =
-            checkpoint_dsl::own_contract(&src, &trace.params, tp, model_dsl::Platform::Cuda)
+            checkpoint_dsl::own_contract(&src, &trace.params, tp, poem_dsl::Platform::Cuda)
                 .unwrap_or_else(|why| {
                     panic!(
                         "`{name}` refuses a checkpoint that ships its banks unquantized, \

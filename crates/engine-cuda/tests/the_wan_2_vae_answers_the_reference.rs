@@ -5,13 +5,13 @@ use std::time::Instant;
 
 use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
-use model_compiler::{Budget, VoxelLadder};
-use model_dsl::{
+use models::wan_2::forward::Facts;
+use models::wan_2::model::Model;
+use poem_compiler::{Budget, VoxelLadder};
+use poem_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Stream, Value,
     trace_hybrid,
 };
-use models::wan_2::forward::Facts;
-use models::wan_2::model::Model;
 
 struct VaeOnly {
     model: Model,

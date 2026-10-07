@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use checkpoint::plan::{LoadPlan, StorageInstr};
 use engine::load::{Residency, Tiers};
-use model_ir::{Def, Linear, Operation, Trace, ValueId};
+use poem_ir::{Def, Linear, Operation, Trace, ValueId};
 
 use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context, Handles};
@@ -440,7 +440,7 @@ impl Seats {
             self.routes_handle,
             routes.rows,
             routes.width,
-            model_ir::Dtype::I32,
+            poem_ir::Dtype::I32,
         )
     }
 
@@ -733,17 +733,15 @@ fn record_copy(
 }
 
 #[must_use]
-pub fn row_bytes(dtype: model_ir::Dtype, width: u32) -> u64 {
+pub fn row_bytes(dtype: poem_ir::Dtype, width: u32) -> u64 {
     let width = u64::from(width);
     match dtype {
-        model_ir::Dtype::Mxfp4 | model_ir::Dtype::U8g64 => width,
-        model_ir::Dtype::U4g64 | model_ir::Dtype::U4g32 | model_ir::Dtype::U4g64tiled => {
+        poem_ir::Dtype::Mxfp4 | poem_ir::Dtype::U8g64 => width,
+        poem_ir::Dtype::U4g64 | poem_ir::Dtype::U4g32 | poem_ir::Dtype::U4g64tiled => {
             width.div_ceil(2)
         }
-        model_ir::Dtype::U2g32 | model_ir::Dtype::U2g64 | model_ir::Dtype::U2g128 => {
-            width.div_ceil(4)
-        }
-        other => width.saturating_mul(model_compiler::arena::elem_bytes(other).unwrap_or(0)),
+        poem_ir::Dtype::U2g32 | poem_ir::Dtype::U2g64 | poem_ir::Dtype::U2g128 => width.div_ceil(4),
+        other => width.saturating_mul(poem_compiler::arena::elem_bytes(other).unwrap_or(0)),
     }
 }
 
@@ -772,17 +770,17 @@ impl Plan {
         let mut gathered = BTreeMap::new();
         let mut rows_per_token = 0u32;
         for node in &trace.nodes {
-            if let Operation::Layout(model_ir::Layout::EmbedConcat { ids, table, .. }) = &node.op
+            if let Operation::Layout(poem_ir::Layout::EmbedConcat { ids, table, .. }) = &node.op
                 && let Ok(at) = weight_of(trace, *table)
             {
                 gathered.insert(at, ids.0);
             }
 
             if let Operation::Attention(
-                model_ir::Attention::PleNgramIds {
+                poem_ir::Attention::PleNgramIds {
                     heads_per_ngram, ..
                 }
-                | model_ir::Attention::PleNgramIdsChunked {
+                | poem_ir::Attention::PleNgramIdsChunked {
                     heads_per_ngram, ..
                 },
             ) = &node.op

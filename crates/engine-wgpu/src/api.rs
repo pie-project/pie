@@ -15,8 +15,8 @@ use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, Pro
 use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
 use eta_ir::registry::{GeometryClass, ModelProfile, PortMask};
 use eta_ir::types::Dtype;
-use model_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
-use model_ir::Trace;
+use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
+use poem_ir::Trace;
 
 use crate::error::Fault;
 use crate::serve::{Boot, Landed, Lane, Seated, Shell, StepView};
@@ -243,8 +243,8 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
     const DERIVED_PATCH_CEILING: u32 = 4096;
 
     let declares_patches = trace.values.iter().any(|decl| {
-        matches!(&decl.ty, model_ir::Ty::Tensor { shape, .. }
-            if shape.first().and_then(|dim| dim.axis()) == Some(model_ir::RowAxis::Patches))
+        matches!(&decl.ty, poem_ir::Ty::Tensor { shape, .. }
+            if shape.first().and_then(|dim| dim.axis()) == Some(poem_ir::RowAxis::Patches))
     });
     if !declares_patches {
         return None;
@@ -273,14 +273,14 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
 
 fn patch_bytes(
     patches: &[f32],
-    element: model_ir::Dtype,
+    element: poem_ir::Dtype,
 ) -> std::result::Result<Vec<u8>, &'static str> {
     match element {
-        model_ir::Dtype::Bf16 => Ok(patches
+        poem_ir::Dtype::Bf16 => Ok(patches
             .iter()
             .flat_map(|&v| bf16_bits(v).to_le_bytes())
             .collect()),
-        model_ir::Dtype::F32 => Ok(patches.iter().flat_map(|&v| v.to_le_bytes()).collect()),
+        poem_ir::Dtype::F32 => Ok(patches.iter().flat_map(|&v| v.to_le_bytes()).collect()),
         _ => Err(
             "a media submission against a plan whose activation element is neither \
                   `bf16` nor `f32`, which is the pair every tower in this catalog computes in",
@@ -448,7 +448,7 @@ impl Engine for Wgpu {
             .trace()
             .caches
             .iter()
-            .any(|row| matches!(row, model_ir::CacheRow::State { .. }));
+            .any(|row| matches!(row, poem_ir::CacheRow::State { .. }));
         let profile = profile(&shell, &budgets)?;
 
         let caps = Capabilities {
@@ -821,8 +821,8 @@ impl Wgpu {
         let mut staged: Vec<Vec<u8>> = Vec::new();
         if !submission.media.is_empty() {
             let Some(element) = self.loaded()?.patch_element() else {
-                return Err(fault(crate::error::Fault::from(model_exec::Error::Fire(
-                    model_exec::fire::Fault::Towerless {
+                return Err(fault(crate::error::Fault::from(poem_exec::Error::Fire(
+                    poem_exec::fire::Fault::Towerless {
                         lane: submission.media[0].lane,
                     },
                 ))));

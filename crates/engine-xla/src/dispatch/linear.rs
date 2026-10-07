@@ -1,6 +1,6 @@
 use kernels_xla::linear;
-use model_exec::{DispatchLinear, KernelError};
-use model_ir::{Linear, Operands};
+use poem_exec::{DispatchLinear, KernelError};
+use poem_ir::{Linear, Operands};
 
 use crate::run::Run;
 
@@ -14,7 +14,7 @@ impl DispatchLinear for Run<'_> {
 impl Run<'_> {
     /// Whether weight `w` is one dense plane (not a bank, not a K-quant
     /// block format).
-    fn dense_weight(&self, w: model_ir::ValueId) -> bool {
+    fn dense_weight(&self, w: poem_ir::ValueId) -> bool {
         self.banked(w).is_none() && self.maybe_stored(w).is_none()
     }
 

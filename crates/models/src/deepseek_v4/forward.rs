@@ -1,4 +1,4 @@
-use model_dsl::{
+use poem_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, ValueId, Weight,
     ops, seam,
 };
@@ -63,18 +63,23 @@ impl ForwardHybrid for Model {
         let kv = c.kv_space(self.kv);
         for w in &self.layers {
             let at = &w.attn;
-            c.kv(kv, at.kv.clone(), [at.kv_down.dim(0)]);
+            c.kv(kv, at.kv.clone(), [at.kv_down.dim(0)], self.head_dim);
             if let Some(p) = &at.pool
                 && p.owner
             {
                 let pool = c.kv_space(self.kv);
-                c.kv(pool, p.entries.clone(), [self.head_dim as u64]);
+                c.kv(
+                    pool,
+                    p.entries.clone(),
+                    [self.head_dim as u64],
+                    self.head_dim,
+                );
             }
             if let Some(ix) = &at.indexer
                 && ix.owns_keys
             {
                 let index = c.kv_space(self.kv);
-                c.kv(index, ix.keys.clone(), [ix.head_dim as u64]);
+                c.kv(index, ix.keys.clone(), [ix.head_dim as u64], ix.head_dim);
             }
             if let Some(e) = &w.engram {
                 c.state(e.ids_state.clone(), [u64::from(e.ngram) - 1], Dtype::I32);
@@ -85,6 +90,7 @@ impl ForwardHybrid for Model {
                 kv,
                 mtp.block.attn.kv.clone(),
                 [mtp.block.attn.kv_down.dim(0)],
+                self.head_dim,
             );
         }
         c
@@ -545,7 +551,11 @@ fn sublayer_input<'m>(
     let normed = ops::elemwise::hc_rmsnorm_f32(streams, hy.norm_eps);
     let mixes = match &mix.dynamic {
         Some(dynamic) => ops::elemwise::hc_project(&normed, dynamic, hy.streams),
-        None => normed,
+        None => {
+            let mix_hc = u32::try_from(mix.base.dim(0)).expect("mix_hc fits u32");
+            let (head, _) = ops::layout::split_rows(&normed, mix_hc);
+            head
+        }
     };
     let (_, post_mix, comb_mix) = ops::elemwise::hc_gates(
         &mixes,
@@ -929,7 +939,11 @@ fn gate(streams: &Value, mix: &Mix, hy: &Hyper) -> (Value, Value, Value) {
     let normed = ops::elemwise::hc_rmsnorm_f32(streams, hy.norm_eps);
     let mixes = match &mix.dynamic {
         Some(dynamic) => ops::elemwise::hc_project(&normed, dynamic, hy.streams),
-        None => normed,
+        None => {
+            let mix_hc = u32::try_from(mix.base.dim(0)).expect("mix_hc fits u32");
+            let (head, _) = ops::layout::split_rows(&normed, mix_hc);
+            head
+        }
     };
     ops::elemwise::hc_gates(
         &mixes,

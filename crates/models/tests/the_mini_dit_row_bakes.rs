@@ -1,12 +1,12 @@
 use std::collections::BTreeSet;
 
-use model_dsl::{
-    Attention, Classify, Def, Dim, Dtype, Elementwise, GeomKind, Guard, Operands, Operation,
-    Platform, Request, RopeForm, RuntimeInput, Stream, Trace, Ty, ValueId, seam,
-};
 use models::mini_dit::forward::Facts;
 use models::mini_dit::model;
 use models::{PortKind, ReadoutKind};
+use poem_dsl::{
+    Attention, Classify, Def, Dim, Dtype, Elementwise, GeomKind, Guard, Operands, Operation,
+    Platform, Request, RopeForm, RuntimeInput, Stream, Trace, Ty, ValueId, seam,
+};
 
 const SKU: &str = "mini-dit-bf16-kv-bf16";
 
@@ -125,7 +125,7 @@ fn the_row_reads_exactly_the_five_ports_it_declares() {
 
 fn each_stream_classifies_into_its_own_class_and_every_merge_resolves() {
     let plan = trace(Platform::Cuda);
-    let classes = model_dsl::resolve_classes(&plan).expect("every merge resolves");
+    let classes = poem_dsl::resolve_classes(&plan).expect("every merge resolves");
     let row = models::sku(SKU).expect("the row is in the catalog");
 
     let mut seen = Vec::new();
@@ -281,7 +281,7 @@ fn every_rope_turns_three_axes_of_the_whole_head_interleaved() {
 fn the_plan_bakes_on_every_platform() {
     for platform in PLATFORMS {
         let plan = trace(platform);
-        let budget = model_compiler::Budget {
+        let budget = poem_compiler::Budget {
             max_lanes: 256,
             max_tokens: 8192,
             buckets: vec![
@@ -290,7 +290,7 @@ fn the_plan_bakes_on_every_platform() {
             max_adapters: 0,
         };
         let compiled =
-            model_compiler::compile(&plan, &budget, &model_compiler::DeviceProfile::default())
+            poem_compiler::compile(&plan, &budget, &poem_compiler::DeviceProfile::default())
                 .unwrap_or_else(|why| {
                     panic!("{platform:?}: the mini-dit plan does not bake: {why}")
                 });

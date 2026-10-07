@@ -1,5 +1,5 @@
-use model_exec::{DispatchCustomCuda, KernelError};
-use model_ir::{CustomCuda, Operands};
+use poem_exec::{DispatchCustomCuda, KernelError};
+use poem_ir::{CustomCuda, Operands};
 
 use crate::run::Run;
 
@@ -9,22 +9,22 @@ impl DispatchCustomCuda for Run<'_> {
     }
 }
 
-impl model_exec::DispatchSpatial for Run<'_> {
-    fn dispatch(&mut self, op: &model_ir::Spatial) -> Result<(), KernelError> {
+impl poem_exec::DispatchSpatial for Run<'_> {
+    fn dispatch(&mut self, op: &poem_ir::Spatial) -> Result<(), KernelError> {
         self.spatial(op).map_err(crate::error::kernel)
     }
 }
 
 impl Run<'_> {
-    fn spatial(&mut self, op: &model_ir::Spatial) -> Result<(), kernels_metal::Error> {
+    fn spatial(&mut self, op: &poem_ir::Spatial) -> Result<(), kernels_metal::Error> {
         use kernels_metal::spatial;
-        use model_ir::Spatial;
+        use poem_ir::Spatial;
         match op {
             Spatial::Grid { grid, rule, y } => spatial::rule::derive_grid(
                 self.ctx(),
                 self.tensor(*grid),
                 match *rule {
-                    model_ir::GridRule::Conv {
+                    poem_ir::GridRule::Conv {
                         k,
                         stride,
                         pad,
@@ -37,18 +37,18 @@ impl Run<'_> {
                         pad_back,
                         causal_t,
                     },
-                    model_ir::GridRule::Upsample {
+                    poem_ir::GridRule::Upsample {
                         factor,
                         keep_first_frame,
                     } => spatial::rule::GridRule::Upsample {
                         factor,
                         keep_first_frame,
                     },
-                    model_ir::GridRule::Shuffle { r, trim_t } => {
+                    poem_ir::GridRule::Shuffle { r, trim_t } => {
                         spatial::rule::GridRule::Shuffle { r, trim_t }
                     }
-                    model_ir::GridRule::Unshuffle { r } => spatial::rule::GridRule::Unshuffle { r },
-                    model_ir::GridRule::AvgDown { factor } => {
+                    poem_ir::GridRule::Unshuffle { r } => spatial::rule::GridRule::Unshuffle { r },
+                    poem_ir::GridRule::AvgDown { factor } => {
                         spatial::rule::GridRule::AvgDown { factor }
                     }
                 },
@@ -88,8 +88,8 @@ impl Run<'_> {
                         pad_back: *pad_back,
                         causal_t: *causal_t,
                         time_pad: match time_pad {
-                            model_ir::TimePad::Zero => spatial::conv::TimePad::Zero,
-                            model_ir::TimePad::Replicate => spatial::conv::TimePad::Replicate,
+                            poem_ir::TimePad::Zero => spatial::conv::TimePad::Zero,
+                            poem_ir::TimePad::Replicate => spatial::conv::TimePad::Replicate,
                         },
                     },
                     self.tensor(*y_grid),
@@ -145,8 +145,8 @@ impl Run<'_> {
                 self.tensor(*v),
                 self.tensor(*grid),
                 match segment {
-                    model_ir::VoxelSegment::Clip => spatial::attn::Segment::Clip,
-                    model_ir::VoxelSegment::Frames(n) => spatial::attn::Segment::Frames(*n),
+                    poem_ir::VoxelSegment::Clip => spatial::attn::Segment::Clip,
+                    poem_ir::VoxelSegment::Frames(n) => spatial::attn::Segment::Frames(*n),
                 },
                 *sm_scale,
                 self.tensor(*y),
@@ -238,16 +238,16 @@ impl Run<'_> {
     }
 }
 
-impl model_exec::DispatchProbe for Run<'_> {
-    fn probe(&mut self, node: &model_ir::Node) {
-        use model_ir::Operands as _;
+impl poem_exec::DispatchProbe for Run<'_> {
+    fn probe(&mut self, node: &poem_ir::Node) {
+        use poem_ir::Operands as _;
         if !crate::diag::on().nan_check {
             return;
         }
         let Some(flags) = self.bindings().nan_flags else {
             return;
         };
-        let mut outs: Vec<model_ir::ValueId> = Vec::new();
+        let mut outs: Vec<poem_ir::ValueId> = Vec::new();
         node.op.outputs(&mut outs);
         for id in outs {
             if !self.resolvable(id) {
@@ -256,7 +256,7 @@ impl model_exec::DispatchProbe for Run<'_> {
             let t = self.tensor(id);
             if !matches!(
                 t.dtype,
-                model_ir::Dtype::F32 | model_ir::Dtype::Bf16 | model_ir::Dtype::F16
+                poem_ir::Dtype::F32 | poem_ir::Dtype::Bf16 | poem_ir::Dtype::F16
             ) {
                 continue;
             }

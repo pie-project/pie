@@ -1,9 +1,9 @@
 use std::cell::Cell;
 
 use kernels_cuda::attn::plan::Shape;
-use model_compiler::{Budget, CompiledModel};
-use model_exec::fire::{Filter, walk};
-use model_ir::{Dtype, Trace};
+use poem_compiler::{Budget, CompiledModel};
+use poem_exec::fire::{Filter, walk};
+use poem_ir::{Dtype, Trace};
 
 use engine::fire::Boundary;
 
@@ -204,7 +204,7 @@ struct FireCtx<'a> {
     scores: Option<&'a Scores>,
     shifted: &'a [bool],
     schedule_readers: &'a [Option<u32>],
-    decoding: &'a model_ir::ClassSet,
+    decoding: &'a poem_ir::ClassSet,
     tiers: &'a record::Tiers,
     decoded_tiles: &'a [u64],
     seq: u64,
@@ -467,7 +467,7 @@ impl FireCtx<'_> {
         };
         let slots = self.arena.slots(
             &self.compiled.arena,
-            model_compiler::FireRows {
+            poem_compiler::FireRows {
                 tokens: carve_rows,
                 lanes: carve_lanes,
                 patches: carve_patches,
@@ -691,20 +691,20 @@ impl FireCtx<'_> {
             bucket: p.composition.voxel_rows(),
         };
         let ceilings = Ceilings {
-            pads: model_ir::PerAxis::new([armed, armed_patches, armed_voxels]),
+            pads: poem_ir::PerAxis::new([armed, armed_patches, armed_voxels]),
             bodied: p.bodied,
             shifted: self.shifted,
             admits: p.admits.as_ref(),
             readers: self.schedule_readers,
             carve: p.bodied.then(|| record::Carve {
-                per_axis: model_ir::PerAxis::new([
+                per_axis: poem_ir::PerAxis::new([
                     Some(record::AxisCarve {
-                        classes: p.composition.table(model_ir::RowAxis::Tokens),
+                        classes: p.composition.table(poem_ir::RowAxis::Tokens),
                         ladder: &p.ladder,
                         lane_ceiling: Some(p.lane_ceiling),
                     }),
                     p.patch_ladder.as_ref().map(|ladder| record::AxisCarve {
-                        classes: p.composition.table(model_ir::RowAxis::Patches),
+                        classes: p.composition.table(poem_ir::RowAxis::Patches),
                         ladder,
                         lane_ceiling: None,
                     }),
@@ -837,7 +837,7 @@ impl FireCtx<'_> {
             .map(|class| class as usize);
         let pixels = match self.exports.pixels_for(voxel_class) {
             Some((plane, grid)) if p.composition.voxel_rows() > 0 => {
-                let rect = |id: model_ir::ValueId, what: &str| {
+                let rect = |id: poem_ir::ValueId, what: &str| {
                     slots.0[id.0 as usize].ok_or_else(|| Fault::Unbound {
                         what: format!(
                             "value {}, the pixels seam's {what}, which the carve gave no rectangle",
@@ -897,7 +897,7 @@ impl FireCtx<'_> {
             lane_rows[lane] = count;
             last_row[lane] = first + count.saturating_sub(1);
         }
-        let plane_of = |value: model_ir::ValueId, what: &str| -> Result<kernels_cuda::Tensor> {
+        let plane_of = |value: poem_ir::ValueId, what: &str| -> Result<kernels_cuda::Tensor> {
             let plane = slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
                 what: format!(
                     "value {}, the {what} export, which the carve gave no rectangle",

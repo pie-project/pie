@@ -1,11 +1,11 @@
 use engine_metal::window::{Copies, Windows};
-use model_compiler::{
+use poem_compiler::{
     Budget, Budgets, CompiledModel, DeviceProfile, PatchLadder, RowAxis, compile_axes,
 };
-use model_exec::fire::{FireDescriptor, Lane, compose_axes};
-use model_exec::store::arena::rect;
-use model_ir::ops::Elementwise;
-use model_ir::{
+use poem_exec::fire::{FireDescriptor, Lane, compose_axes};
+use poem_exec::store::arena::rect;
+use poem_ir::ops::Elementwise;
+use poem_ir::{
     CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RuntimeInput, Seam, Trace, Ty, ValueDecl,
     ValueId,
 };
@@ -237,7 +237,7 @@ fn a_fire_with_no_image_gets_the_token_windows_it_always_had() {
     let mixed = compose_axes(&compiled, &budgets, &carried).expect("composes");
     let boundaries = indptr(&[5, 3, 4]);
 
-    let of = |fire: &model_exec::fire::Composition| {
+    let of = |fire: &poem_exec::fire::Composition| {
         Windows::of(
             &trace,
             &compiled,
@@ -294,7 +294,7 @@ fn a_patch_rectangle_is_carved_at_the_compositions_own_patch_rows() {
     let honest = rect(
         &compiled.arena,
         pixels,
-        model_compiler::FireRows {
+        poem_compiler::FireRows {
             tokens: u64::from(fire.rows()),
             lanes: u64::from(fire.lane_count()),
             patches: u64::from(fire.patch_rows()),
@@ -315,7 +315,7 @@ fn a_patch_rectangle_is_carved_at_the_compositions_own_patch_rows() {
     let text_only = rect(
         &compiled.arena,
         pixels,
-        model_compiler::FireRows::text_only(u64::from(fire.rows()), u64::from(fire.lane_count())),
+        poem_compiler::FireRows::text_only(u64::from(fire.rows()), u64::from(fire.lane_count())),
     )
     .expect("it is carved either way — which is the point");
     assert_eq!(

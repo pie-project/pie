@@ -1,8 +1,8 @@
 use kernels_xla::layout;
-use model_exec::{DispatchLayout, KernelError};
-use model_ir::Layout;
+use poem_exec::{DispatchLayout, KernelError};
+use poem_ir::Layout;
 
-use model_ir::Operands;
+use poem_ir::Operands;
 
 use crate::run::Run;
 

@@ -3,7 +3,7 @@ use checkpoint::types::{
     Axis, DType, Encoding, QuantGranularity, QuantScheme, QuantSpec, RepackLayout, ScaleForm,
     TILED_BAND,
 };
-use model_dsl::{Dtype, Platform, Shard, Weight};
+use poem_dsl::{Dtype, Platform, Shard, Weight};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -179,7 +179,7 @@ impl<'a> Builder<'a> {
 
 pub fn own_contract(
     src: &ztensor::Source,
-    params: &[model_dsl::Param],
+    params: &[poem_dsl::Param],
     tp: u32,
     platform: Platform,
 ) -> Result<ModelContract, Error> {
@@ -188,14 +188,14 @@ pub fn own_contract(
         .filter(|param| matches!(claim_kind(param.dtype), Kind::Packed))
         .flat_map(|param| {
             [
-                model_dsl::scales_name(&param.name),
-                model_dsl::biases_name(&param.name),
+                poem_dsl::scales_name(&param.name),
+                poem_dsl::biases_name(&param.name),
             ]
         })
         .collect();
     let mut b = Builder::new(src, tp, platform);
     for param in params {
-        if param.source != model_dsl::ParamSource::Checkpoint || companions.contains(&param.name) {
+        if param.source != poem_dsl::ParamSource::Checkpoint || companions.contains(&param.name) {
             continue;
         }
         b.read_own(&Weight::of_plane(param))?;
@@ -285,8 +285,8 @@ fn claim(w: &Weight, tp: u32) -> Claim {
         | Dtype::U5g32k
         | Dtype::I6g16k
         | Dtype::Ptq1_0 => (encoding(w.dtype), None),
-        Dtype::E2m1 => panic!(
-            "`Dtype::E2m1` names a kv-page quantization scheme, not a stored \
+        Dtype::E2m1 | Dtype::KvU4 => panic!(
+            "this dtype names a kv-page quantization scheme, not a stored \
              weight plane; no load contract declares one"
         ),
         Dtype::Nvfp4 | Dtype::E4m3row | Dtype::E4m3tile128 => panic!(
@@ -537,15 +537,15 @@ fn placed_from_encode(
     ));
     out.push(
         relabel(
-            model_dsl::scales_name(&w.name),
-            model_dsl::scales_name(&canon_name),
+            poem_dsl::scales_name(&w.name),
+            poem_dsl::scales_name(&canon_name),
         )
         .scaling(pairing),
     );
     out.push(
         relabel(
-            model_dsl::biases_name(&w.name),
-            model_dsl::biases_name(&canon_name),
+            poem_dsl::biases_name(&w.name),
+            poem_dsl::biases_name(&canon_name),
         )
         .offsetting(w.name.clone()),
     );
@@ -695,8 +695,8 @@ fn affine_planes(
         let unpacked = unpacked_extents(src, w, part)?;
         legs.push(unpacked.clone());
         codes.push(Expr::src(part.clone()).transmute(TensorType::new(unpacked, grouped(w))));
-        scales.push(model_dsl::scales_name(stem));
-        biases.push(model_dsl::biases_name(stem));
+        scales.push(poem_dsl::scales_name(stem));
+        biases.push(poem_dsl::biases_name(stem));
     }
     holds_the_declared_rectangle(w, axis, &legs)?;
     let pairing = scaling(w);
@@ -710,13 +710,13 @@ fn affine_planes(
         TensorContract::inferred(w.name.clone(), joined(axis, codes), grouped(w)),
         factors(
             src,
-            model_dsl::scales_name(&w.name),
+            poem_dsl::scales_name(&w.name),
             &scales,
             counted.clone(),
             axis,
         )?
         .scaling(pairing),
-        factors(src, model_dsl::biases_name(&w.name), &biases, counted, axis)?
+        factors(src, poem_dsl::biases_name(&w.name), &biases, counted, axis)?
             .offsetting(w.name.clone()),
     ])
 }
@@ -796,8 +796,8 @@ fn affine_reencoded(
         legs.push(unpacked.clone());
         codes
             .push(Expr::src(part.clone()).transmute(TensorType::new(unpacked, grouped(&stored_w))));
-        scales.push(model_dsl::scales_name(stem));
-        biases.push(model_dsl::biases_name(stem));
+        scales.push(poem_dsl::scales_name(stem));
+        biases.push(poem_dsl::biases_name(stem));
     }
     holds_the_declared_rectangle(w, axis, &legs)?;
     let pairing = scaling(&stored_w);
@@ -846,7 +846,7 @@ fn stored_mlx_codes(src: &ztensor::Source, name: &str) -> Result<bool, Error> {
     };
     Ok(
         matches!(stored_encoding(src, name)?, Encoding::Raw(DType::U32))
-            && src.get(&model_dsl::scales_name(stem)).is_some(),
+            && src.get(&poem_dsl::scales_name(stem)).is_some(),
     )
 }
 
@@ -886,7 +886,7 @@ fn affine_decoded(
         ))
     })?;
     let words = last(&from)?;
-    let scale_groups = last(&model_dsl::scales_name(&stem))?;
+    let scale_groups = last(&poem_dsl::scales_name(&stem))?;
     if words <= 0
         || k % words != 0
         || 32 % (k / words) != 0
@@ -941,7 +941,7 @@ fn affine_decoded(
         factors(
             src,
             stored_scales.clone(),
-            &[model_dsl::scales_name(stem)],
+            &[poem_dsl::scales_name(stem)],
             counted.clone(),
             0,
         )?
@@ -949,7 +949,7 @@ fn affine_decoded(
         factors(
             src,
             stored_biases.clone(),
-            &[model_dsl::biases_name(stem)],
+            &[poem_dsl::biases_name(stem)],
             counted,
             0,
         )?
@@ -1067,8 +1067,8 @@ fn affine_stacked(
             }
             row_codes.push(Expr::src(part.clone()).transmute(TensorType::new(leg, grouped(w))));
             for (name, into) in [
-                (model_dsl::scales_name(stem), &mut row_scales),
-                (model_dsl::biases_name(stem), &mut row_biases),
+                (poem_dsl::scales_name(stem), &mut row_scales),
+                (poem_dsl::biases_name(stem), &mut row_biases),
             ] {
                 let stored = stored_encoding(src, &name)?;
                 match &factor_stored {
@@ -1109,8 +1109,8 @@ fn affine_stacked(
     }
     let stored = factor_stored.expect("a row names its factors");
     let want = encoding(Dtype::Bf16);
-    let scales_name = model_dsl::scales_name(&w.name);
-    let biases_name = model_dsl::biases_name(&w.name);
+    let scales_name = poem_dsl::scales_name(&w.name);
+    let biases_name = poem_dsl::biases_name(&w.name);
     let scales = ladder(&scales_name, joined(0, scales), &stored, &want)?;
     let biases = ladder(&biases_name, joined(0, biases), &stored, &want)?;
     Ok(vec![
@@ -1141,7 +1141,7 @@ fn mx_planes(
                 ),
             })?;
         let unpacked = unpacked_extents(src, w, part)?;
-        let scale = model_dsl::scales_name(stem);
+        let scale = poem_dsl::scales_name(stem);
         let stored = stored_encoding(src, &scale)?;
         if stored != Encoding::Raw(DType::U8) {
             return Err(Error::Illegible {
@@ -1167,7 +1167,7 @@ fn mx_planes(
     Ok(vec![
         TensorContract::inferred(w.name.clone(), joined(axis, codes), grouped(w)),
         TensorContract::new(
-            model_dsl::scales_name(&w.name),
+            poem_dsl::scales_name(&w.name),
             joined(axis, scales),
             counted,
             encoding(Dtype::E8m0),
@@ -1210,8 +1210,8 @@ fn tiled_planes(
         let unpacked = unpacked_extents(src, w, part)?;
         legs.push(unpacked.clone());
         codes.push(Expr::src(part.clone()).transmute(TensorType::new(unpacked, grouped(w))));
-        scales.push(model_dsl::scales_name(stem));
-        biases.push(model_dsl::biases_name(stem));
+        scales.push(poem_dsl::scales_name(stem));
+        biases.push(poem_dsl::biases_name(stem));
     }
     holds_the_declared_rectangle(w, axis, &legs)?;
     let pairing = scaling(w);
@@ -1230,7 +1230,7 @@ fn tiled_planes(
         ),
         relaid(
             src,
-            model_dsl::scales_name(&w.name),
+            poem_dsl::scales_name(&w.name),
             &scales,
             counted.clone(),
             axis,
@@ -1239,7 +1239,7 @@ fn tiled_planes(
         .scaling(pairing),
         relaid(
             src,
-            model_dsl::biases_name(&w.name),
+            poem_dsl::biases_name(&w.name),
             &biases,
             counted.clone(),
             axis,
@@ -1374,11 +1374,11 @@ fn interned(
     };
     match pairing.form {
         ScaleForm::RawE8M0 => {
-            vec![plane(model_dsl::scales_name(of), Dtype::E8m0, declared).scaling(pairing)]
+            vec![plane(poem_dsl::scales_name(of), Dtype::E8m0, declared).scaling(pairing)]
         }
         ScaleForm::Bf16AffineFactors => vec![
-            plane(model_dsl::scales_name(of), Dtype::Bf16, declared.clone()).scaling(pairing),
-            plane(model_dsl::biases_name(of), Dtype::Bf16, declared).offsetting(of),
+            plane(poem_dsl::scales_name(of), Dtype::Bf16, declared.clone()).scaling(pairing),
+            plane(poem_dsl::biases_name(of), Dtype::Bf16, declared).offsetting(of),
         ],
         other => panic!(
             "`{of}` pairs its codes with {other:?} scales, and no family here \
@@ -1685,8 +1685,8 @@ pub fn encoding(dtype: Dtype) -> Encoding {
             group_size: 128,
             channel_axis: None,
         }),
-        Dtype::E2m1 => panic!(
-            "`Dtype::E2m1` names a kv-page quantization scheme, not a stored \
+        Dtype::E2m1 | Dtype::KvU4 => panic!(
+            "this dtype names a kv-page quantization scheme, not a stored \
              weight plane; no load contract declares one"
         ),
         Dtype::Nvfp4 | Dtype::E4m3row | Dtype::E4m3tile128 => panic!(
@@ -1716,7 +1716,7 @@ pub fn encoding(dtype: Dtype) -> Encoding {
 mod tests {
     use super::*;
     use checkpoint::types::Visibility;
-    use model_dsl::Weight;
+    use poem_dsl::Weight;
 
     const ROWS: u64 = 32;
     const K: u64 = 128;
