@@ -1,11 +1,12 @@
 //! The slot file an engine suspends kv pages into below host memory: one
-//! per rank, preallocated and locked, one kv page per fixed slot, written
-//! and read around the page cache where the filesystem allows it.
+//! per rank, locked, one kv page per fixed slot, written and read around the
+//! page cache where the filesystem allows it. Preallocated where blocks are
+//! written in place; removed when the engine lets go of it.
 
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Slot offsets and lengths are multiples of this, as direct I/O asks.
 pub const ALIGN: usize = 4096;
@@ -13,6 +14,7 @@ pub const ALIGN: usize = 4096;
 #[derive(Debug)]
 pub struct SlotFile {
     file: File,
+    path: PathBuf,
     stride: usize,
     slots: u32,
 }
@@ -40,6 +42,10 @@ impl SlotFile {
         })?;
         let len = u64::from(slots) * stride as u64;
         file.set_len(len)?;
+        // APFS copies on write: a page written lands in new blocks and the
+        // preallocated ones stay reserved, so preallocating there doubles
+        // the file's footprint instead of guaranteeing it.
+        #[cfg(not(target_vendor = "apple"))]
         if let Err(error) =
             rustix::fs::fallocate(&file, rustix::fs::FallocateFlags::empty(), 0, len)
             && error != rustix::io::Errno::OPNOTSUPP
@@ -48,6 +54,7 @@ impl SlotFile {
         }
         Ok(Some(Self {
             file,
+            path,
             stride,
             slots,
         }))
@@ -127,6 +134,14 @@ fn open_direct(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// What a slot file holds means nothing once the engine that wrote it lets
+/// go, so it does not outlive the engine on disk.
+impl Drop for SlotFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// A heap buffer of `len` bytes that starts on an `ALIGN` boundary: the
 /// stage one page goes through on an engine whose kv lives in host memory.
 #[derive(Debug, Default)]
@@ -176,6 +191,30 @@ mod tests {
         assert_eq!(back.as_slice(), stage.as_slice());
         assert!(file.read(4, back.as_mut_slice()).is_err());
         drop(file);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rewriting_every_slot_keeps_the_file_within_its_budget_and_dropping_it_removes_it() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("pie-slot-budget-{}", std::process::id()));
+        let path = dir.join("r0.kv");
+        let budget = 64 * 8192;
+        let file = SlotFile::open(&dir, 0, 8192, budget).unwrap().unwrap();
+        let used = || std::fs::metadata(&path).unwrap().blocks() * 512;
+        let stage = Aligned::zeroed(file.stride());
+        for _ in 0..3 {
+            for slot in 0..file.slots() {
+                file.write(slot, stage.as_slice()).unwrap();
+            }
+            assert!(
+                used() <= budget,
+                "{} bytes on disk for a budget of {budget}",
+                used()
+            );
+        }
+        drop(file);
+        assert!(!path.exists(), "the slot file outlived its engine");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
