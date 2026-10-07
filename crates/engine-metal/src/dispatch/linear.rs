@@ -13,6 +13,7 @@ impl DispatchLinear for Run<'_> {
 impl Run<'_> {
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_metal::Error> {
         match op {
+            Linear::MlpAne { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Linear::Matmul { act, w, y }
                 if self.tensor(*act).dtype == poem_ir::Dtype::F32 && self.banked(*w).is_none() =>
             {
