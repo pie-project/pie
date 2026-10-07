@@ -5,7 +5,6 @@ use crate::drafter::dflash::{self, DFlash};
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
-    pub tp: u32,
 
     pub q_heads: u32,
     pub sliding: Sliding,
@@ -354,16 +353,16 @@ struct MoeDims {
 }
 
 impl Model {
-    pub fn e4b(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, kv, tp, Model::e4b_dims())
+    pub fn e4b(w: Dtype, kv: Dtype) -> Model {
+        Model::new(w, kv, Model::e4b_dims())
     }
 
-    pub fn e4b_mini(layers: u32, w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn e4b_mini(layers: u32, w: Dtype, kv: Dtype) -> Model {
         let mut d = Model::e4b_dims();
         let owned = d.layers - d.shared_tail.unwrap_or(0);
         d.layers = layers;
         d.shared_tail = (layers > owned).then(|| layers - owned);
-        Model::new(w, kv, tp, d)
+        Model::new(w, kv, d)
     }
 
     fn e4b_dims() -> Dims {
@@ -397,32 +396,32 @@ impl Model {
         }
     }
 
-    pub fn e4b_vision(w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn e4b_vision(w: Dtype, kv: Dtype) -> Model {
         let mut d = Model::e4b_dims();
         d.tower = Some(TowerDims::e4b());
-        Model::new(w, kv, tp, d)
+        Model::new(w, kv, d)
     }
 
-    pub fn e4b_eagle(w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn e4b_eagle(w: Dtype, kv: Dtype) -> Model {
         let mut d = Model::e4b_dims();
         d.draft = true;
-        Model::new(w, kv, tp, d)
+        Model::new(w, kv, d)
     }
 
-    pub fn b31_mtp(w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn b31_mtp(w: Dtype, kv: Dtype) -> Model {
         let mut d = Model::b31_dims();
         d.assistant = true;
-        Model::new(w, kv, tp, d)
+        Model::new(w, kv, d)
     }
 
-    pub fn b31(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, kv, tp, Model::b31_dims())
+    pub fn b31(w: Dtype, kv: Dtype) -> Model {
+        Model::new(w, kv, Model::b31_dims())
     }
 
-    pub fn b31_vision(w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn b31_vision(w: Dtype, kv: Dtype) -> Model {
         let mut d = Model::b31_dims();
         d.tower = Some(TowerDims::wide(d.hidden));
-        Model::new(w, kv, tp, d)
+        Model::new(w, kv, d)
     }
 
     fn b31_dims() -> Dims {
@@ -456,49 +455,43 @@ impl Model {
         }
     }
 
-    pub fn a4b(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, kv, tp, Model::a4b_dims())
+    pub fn a4b(w: Dtype, kv: Dtype) -> Model {
+        Model::new(w, kv, Model::a4b_dims())
     }
 
-    pub fn a4b_diffusion(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::a4b_diffusion_experts(w, w, kv, tp)
+    pub fn a4b_diffusion(w: Dtype, kv: Dtype) -> Model {
+        Model::a4b_diffusion_experts(w, w, kv)
     }
 
-    pub fn a4b_diffusion_experts(w: Dtype, xw: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn a4b_diffusion_experts(w: Dtype, xw: Dtype, kv: Dtype) -> Model {
         let mut d = Model::a4b_dims();
         d.self_cond = true;
-        Model::new_with_experts(w, xw, kv, tp, d)
+        Model::new_with_experts(w, xw, kv, d)
     }
 
-    pub fn a4b_diffusion_experts_self_cond(
-        w: Dtype,
-        xw: Dtype,
-        sw: Dtype,
-        kv: Dtype,
-        tp: u32,
-    ) -> Model {
+    pub fn a4b_diffusion_experts_self_cond(w: Dtype, xw: Dtype, sw: Dtype, kv: Dtype) -> Model {
         let mut d = Model::a4b_dims();
         d.self_cond = true;
         d.self_cond_w = Some(sw);
-        Model::new_with_experts(w, xw, kv, tp, d)
+        Model::new_with_experts(w, xw, kv, d)
     }
 
-    pub fn a4b_mtp(w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn a4b_mtp(w: Dtype, kv: Dtype) -> Model {
         let mut d = Model::a4b_dims();
         d.assistant = true;
-        Model::new(w, kv, tp, d)
+        Model::new(w, kv, d)
     }
 
-    pub fn a4b_dflash(w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn a4b_dflash(w: Dtype, kv: Dtype) -> Model {
         let mut d = Model::a4b_dims();
         d.dflash = Some(&GEMMA4_26B_A4B_DFLASH);
-        Model::new(w, kv, tp, d)
+        Model::new(w, kv, d)
     }
 
-    pub fn a4b_vision(w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn a4b_vision(w: Dtype, kv: Dtype) -> Model {
         let mut d = Model::a4b_dims();
         d.tower = Some(TowerDims::wide(d.hidden));
-        Model::new(w, kv, tp, d)
+        Model::new(w, kv, d)
     }
 
     fn a4b_dims() -> Dims {
@@ -536,35 +529,11 @@ impl Model {
         }
     }
 
-    fn new(w: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
-        Model::new_with_experts(w, w, kv, tp, d)
+    fn new(w: Dtype, kv: Dtype, d: Dims) -> Model {
+        Model::new_with_experts(w, w, kv, d)
     }
 
-    fn new_with_experts(w: Dtype, xw: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
-        assert!(
-            matches!(tp, 1 | 2 | 4 | 8),
-            "tp {tp} is not a world this catalog ships"
-        );
-        for (count, what) in [
-            (d.q_heads, "query heads"),
-            (d.kv_heads, "sliding KV heads"),
-            (d.global_kv_heads, "global KV heads"),
-            (d.intermediate, "the intermediate"),
-        ] {
-            assert!(
-                count.is_multiple_of(tp),
-                "tp {tp} does not divide this text's {count} {what}; a gemma-4 \
-                 row is cut by heads and by the intermediate, and every count \
-                 it cuts must divide the rank count"
-            );
-        }
-        if let Some(moe) = d.moe {
-            assert!(
-                moe.inter.is_multiple_of(tp),
-                "tp {tp} does not divide the routed experts' {} intermediate",
-                moe.inter
-            );
-        }
+    fn new_with_experts(w: Dtype, xw: Dtype, kv: Dtype, d: Dims) -> Model {
         let dense = crate::dense(w);
         let gate = match w {
             Dtype::U4g64 => Dtype::U8g64,
@@ -574,10 +543,10 @@ impl Model {
             Dtype::U4g64 => Dtype::U4g64tiled,
             other => other,
         };
-        let q_heads = d.q_heads / tp;
-        let kv_heads = d.kv_heads / tp;
-        let global_kv_heads = d.global_kv_heads / tp;
-        let intermediate = d.intermediate / tp;
+        let q_heads = d.q_heads;
+        let kv_heads = d.kv_heads;
+        let global_kv_heads = d.global_kv_heads;
+        let intermediate = d.intermediate;
 
         let hidden = d.hidden as u64;
         let full_at = |l: u32| l % d.full_every == d.full_every - 1;
@@ -671,7 +640,7 @@ impl Model {
                     lora_a,
                     lora_b,
                     moe: d.moe.map(|m| {
-                        let mi = (m.inter / tp) as u64;
+                        let mi = m.inter as u64;
                         Moe {
                             router_norm: norm("router_norm", hidden),
                             router_norm_eps: d.norm_eps,
@@ -702,7 +671,7 @@ impl Model {
                             .rows(),
                             experts: m.experts,
                             top_k: m.top_k,
-                            inter: m.inter / tp,
+                            inter: m.inter,
                         }
                     }),
                 }
@@ -813,7 +782,6 @@ impl Model {
         });
 
         let assistant = d.assistant.then(|| {
-            assert_eq!(tp, 1, "the assistant head is written for one rank");
             let last = |want_full: bool| {
                 (0..d.layers)
                     .rev()
@@ -871,16 +839,11 @@ impl Model {
         });
 
         let banded = !d.self_cond && std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
-        let vocab_rows = if banded {
-            (d.vocab / tp) as u64
-        } else {
-            d.vocab as u64
-        };
+        let vocab_rows = d.vocab as u64;
 
         Model {
             hidden: d.hidden,
             vocab: d.vocab,
-            tp,
             q_heads,
             sliding,
             global,
@@ -951,7 +914,7 @@ impl Model {
                         norm_eps: d.norm_eps,
                         weights: w,
                         dense,
-                        tp,
+                        tp: 1,
                     },
                 )
             }),

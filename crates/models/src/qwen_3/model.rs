@@ -4,7 +4,6 @@ use poem_dsl::{Dtype, Weight};
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
-    pub tp: u32,
 
     pub q_heads: u32,
     pub kv_heads: u32,
@@ -419,21 +418,21 @@ struct Dims {
 }
 
 impl Model {
-    pub fn a3b(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, kv, tp, Model::a3b_dims())
+    pub fn a3b(w: Dtype, kv: Dtype) -> Model {
+        Model::new(w, kv, Model::a3b_dims())
     }
 
-    pub fn a3b_mtp(w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn a3b_mtp(w: Dtype, kv: Dtype) -> Model {
         let mut d = Model::a3b_dims();
         d.draft = Some(Recipe::Mtp);
-        Model::new(w, kv, tp, d)
+        Model::new(w, kv, d)
     }
 
-    pub fn a3b_dflash(w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn a3b_dflash(w: Dtype, kv: Dtype) -> Model {
         let mut d = Model::a3b_dims();
         d.draft = Some(Recipe::DFlash);
         d.dflash_head = Some(&QWEN36_35B_A3B_DFLASH);
-        Model::new(w, kv, tp, d)
+        Model::new(w, kv, d)
     }
 
     fn a3b_dims() -> Dims {
@@ -467,12 +466,12 @@ impl Model {
         }
     }
 
-    pub fn a3b_mini(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, kv, tp, Model::a3b_mini_dims(16))
+    pub fn a3b_mini(w: Dtype, kv: Dtype) -> Model {
+        Model::new(w, kv, Model::a3b_mini_dims(16))
     }
 
-    pub fn a3b_mini64(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, kv, tp, Model::a3b_mini_dims(64))
+    pub fn a3b_mini64(w: Dtype, kv: Dtype) -> Model {
+        Model::new(w, kv, Model::a3b_mini_dims(64))
     }
 
     fn a3b_mini_dims(experts: u32) -> Dims {
@@ -485,11 +484,10 @@ impl Model {
         d
     }
 
-    pub fn a3b_micro(w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn a3b_micro(w: Dtype, kv: Dtype) -> Model {
         Model::new(
             w,
             kv,
-            tp,
             Dims {
                 hidden: 512,
                 layers: 4,
@@ -528,12 +526,12 @@ impl Model {
     /// partial rope (rotary_dim < head_dim) is deliberate — it exercises the
     /// hazard that the block-256-style Hadamard mixes the whole head including
     /// the RoPE'd sub-block, which is exact only because Q and K turn together.
-    pub fn micro_text(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, kv, tp, Model::micro_text_dims(false))
+    pub fn micro_text(w: Dtype, kv: Dtype) -> Model {
+        Model::new(w, kv, Model::micro_text_dims(false))
     }
 
-    pub fn micro_text_rotated(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, kv, tp, Model::micro_text_dims(true))
+    pub fn micro_text_rotated(w: Dtype, kv: Dtype) -> Model {
+        Model::new(w, kv, Model::micro_text_dims(true))
     }
 
     /// The C2d rotated + packed-4-bit KV SKU. Same tiny attention-only text as
@@ -545,15 +543,15 @@ impl Model {
     /// partial rope (`rotary_dim < head_dim`) is kept so the whole-head Hadamard
     /// still mixes the RoPE'd sub-block. Shipped SKUs are byte-unchanged — this
     /// is the only path that sets `rotate_kv = true` outside the C1 test config.
-    pub fn micro_text_rotated_hd(w: Dtype, kv: Dtype, tp: u32, head_dim: u32) -> Model {
-        Model::new(w, kv, tp, Model::micro_text_dims_hd(true, head_dim))
+    pub fn micro_text_rotated_hd(w: Dtype, kv: Dtype, head_dim: u32) -> Model {
+        Model::new(w, kv, Model::micro_text_dims_hd(true, head_dim))
     }
 
     /// The plain-path counterpart of `micro_text_rotated_hd` at the same
     /// `head_dim`: `rotate_kv = false`, so it shares every weight with the
     /// rotated SKU and serves as the un-rotated ground-truth baseline.
-    pub fn micro_text_hd(w: Dtype, kv: Dtype, tp: u32, head_dim: u32) -> Model {
-        Model::new(w, kv, tp, Model::micro_text_dims_hd(false, head_dim))
+    pub fn micro_text_hd(w: Dtype, kv: Dtype, head_dim: u32) -> Model {
+        Model::new(w, kv, Model::micro_text_dims_hd(false, head_dim))
     }
 
     fn micro_text_dims(rotate_kv: bool) -> Dims {
@@ -586,11 +584,10 @@ impl Model {
         }
     }
 
-    pub fn a3b_uncached_bank(w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn a3b_uncached_bank(w: Dtype, kv: Dtype) -> Model {
         Model::new(
             w,
             kv,
-            tp,
             Dims {
                 hidden: 2048,
                 layers: 1,
@@ -622,28 +619,22 @@ impl Model {
         )
     }
 
-    pub fn d0_8b(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, kv, tp, Model::d0_8b_dims(None, None))
+    pub fn d0_8b(w: Dtype, kv: Dtype) -> Model {
+        Model::new(w, kv, Model::d0_8b_dims(None, None))
     }
 
-    pub fn d0_8b_eagle(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, kv, tp, Model::d0_8b_dims(None, Some(Recipe::Eagle)))
+    pub fn d0_8b_eagle(w: Dtype, kv: Dtype) -> Model {
+        Model::new(w, kv, Model::d0_8b_dims(None, Some(Recipe::Eagle)))
     }
 
-    pub fn d0_8b_vision(w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn d0_8b_vision(w: Dtype, kv: Dtype) -> Model {
+        Model::new(w, kv, Model::d0_8b_dims(Some(TowerDims::qwen35()), None))
+    }
+
+    pub fn d0_8b_vision_eagle(w: Dtype, kv: Dtype) -> Model {
         Model::new(
             w,
             kv,
-            tp,
-            Model::d0_8b_dims(Some(TowerDims::qwen35()), None),
-        )
-    }
-
-    pub fn d0_8b_vision_eagle(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(
-            w,
-            kv,
-            tp,
             Model::d0_8b_dims(Some(TowerDims::qwen35()), Some(Recipe::Eagle)),
         )
     }
@@ -674,11 +665,10 @@ impl Model {
         }
     }
 
-    pub fn tiny(w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn tiny(w: Dtype, kv: Dtype) -> Model {
         Model::new(
             w,
             kv,
-            tp,
             Dims {
                 hidden: 256,
                 layers: 4,
@@ -705,11 +695,10 @@ impl Model {
         )
     }
 
-    pub fn d3b(w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn d3b(w: Dtype, kv: Dtype) -> Model {
         Model::new(
             w,
             kv,
-            tp,
             Dims {
                 hidden: 2048,
                 layers: 24,
@@ -736,11 +725,10 @@ impl Model {
         )
     }
 
-    pub fn d2b(w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn d2b(w: Dtype, kv: Dtype) -> Model {
         Model::new(
             w,
             kv,
-            tp,
             Dims {
                 hidden: 2048,
                 layers: 24,
@@ -767,11 +755,10 @@ impl Model {
         )
     }
 
-    pub fn d4b(w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn d4b(w: Dtype, kv: Dtype) -> Model {
         Model::new(
             w,
             kv,
-            tp,
             Dims {
                 hidden: 2560,
                 layers: 32,
@@ -798,15 +785,15 @@ impl Model {
         )
     }
 
-    pub fn d9b(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, kv, tp, Model::d9b_dims())
+    pub fn d9b(w: Dtype, kv: Dtype) -> Model {
+        Model::new(w, kv, Model::d9b_dims())
     }
 
-    pub fn d9b_dflash(w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn d9b_dflash(w: Dtype, kv: Dtype) -> Model {
         let mut d = Model::d9b_dims();
         d.draft = Some(Recipe::DFlash);
         d.dflash_head = Some(&QWEN35_9B_DFLASH);
-        Model::new(w, kv, tp, d)
+        Model::new(w, kv, d)
     }
 
     fn d9b_dims() -> Dims {
@@ -837,24 +824,24 @@ impl Model {
         }
     }
 
-    pub fn d27b(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, kv, tp, Model::d27b_dims(None, Some(Recipe::Mtp)))
+    pub fn d27b(w: Dtype, kv: Dtype) -> Model {
+        Model::new(w, kv, Model::d27b_dims(None, Some(Recipe::Mtp)))
     }
 
-    pub fn d27b_dflash(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, kv, tp, Model::d27b_dims(None, Some(Recipe::DFlash)))
+    pub fn d27b_dflash(w: Dtype, kv: Dtype) -> Model {
+        Model::new(w, kv, Model::d27b_dims(None, Some(Recipe::DFlash)))
     }
 
-    pub fn d27b_dflash2(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, kv, tp, Model::d27b_dims(None, Some(Recipe::DFlash2)))
+    pub fn d27b_dflash2(w: Dtype, kv: Dtype) -> Model {
+        Model::new(w, kv, Model::d27b_dims(None, Some(Recipe::DFlash2)))
     }
 
-    pub fn d27b_dspark(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, kv, tp, Model::d27b_dims(None, Some(Recipe::DSpark)))
+    pub fn d27b_dspark(w: Dtype, kv: Dtype) -> Model {
+        Model::new(w, kv, Model::d27b_dims(None, Some(Recipe::DSpark)))
     }
 
-    pub fn d27b_undrafted(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, kv, tp, Model::d27b_dims(None, None))
+    pub fn d27b_undrafted(w: Dtype, kv: Dtype) -> Model {
+        Model::new(w, kv, Model::d27b_dims(None, None))
     }
 
     /// The 27B Ternary-Bonsai serve instance (M3c): a `d27b` trunk (no MTP/vision
@@ -862,12 +849,8 @@ impl Model {
     /// `w` is `Dtype::Ptq1_0` for the real native GGUF; the sign banks are
     /// declared in the activation compute dtype (`bf16`). Every rotated site in
     /// the forward keys its diagonal by input width off [`BonsaiSigns`].
-    pub fn d27b_bonsai(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        // Bonsai's 1024-block Hadamard FFN rotation and full-width sign banks
-        // have no sharded contract: per-shard widths would not divide 1024 and
-        // tracing fails. Reject tp > 1 up front with a clear message.
-        assert_eq!(tp, 1, "d27b_bonsai does not support tensor parallelism");
-        let mut m = Model::new(w, kv, tp, Model::d27b_dims(None, None));
+    pub fn d27b_bonsai(w: Dtype, kv: Dtype) -> Model {
+        let mut m = Model::new(w, kv, Model::d27b_dims(None, None));
         let dt = crate::dense(w);
         // The real Ternary-Bonsai GGUF stores the GDN `ssm_beta`/`ssm_alpha`
         // projections (which fuse into `in_ba`) in bf16, NOT ternary — only the
@@ -897,17 +880,16 @@ impl Model {
         m
     }
 
-    pub fn d27b_vision(w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn d27b_vision(w: Dtype, kv: Dtype) -> Model {
         Model::new(
             w,
             kv,
-            tp,
             Model::d27b_dims(Some(TowerDims::qwen36()), Some(Recipe::Mtp)),
         )
     }
 
-    pub fn d27b_vision_undrafted(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, kv, tp, Model::d27b_dims(Some(TowerDims::qwen36()), None))
+    pub fn d27b_vision_undrafted(w: Dtype, kv: Dtype) -> Model {
+        Model::new(w, kv, Model::d27b_dims(Some(TowerDims::qwen36()), None))
     }
 
     fn d27b_dims(tower: Option<TowerDims>, draft: Option<Recipe>) -> Dims {
@@ -941,11 +923,7 @@ impl Model {
         }
     }
 
-    fn new(w: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
-        assert!(
-            matches!(tp, 1 | 2 | 4 | 8),
-            "tp {tp} is not a world this catalog ships"
-        );
+    fn new(w: Dtype, kv: Dtype, d: Dims) -> Model {
         let dense = crate::dense(w);
         let gate = match w {
             Dtype::U4g64 => Dtype::U8g64,
@@ -955,10 +933,10 @@ impl Model {
             Dtype::U4g64 => Dtype::U4g64tiled,
             other => other,
         };
-        let q_heads = d.q_heads / tp;
-        let kv_heads = d.kv_heads / tp;
-        let k_heads = d.k_heads / tp;
-        let v_heads = d.v_heads / tp;
+        let q_heads = d.q_heads;
+        let kv_heads = d.kv_heads;
+        let k_heads = d.k_heads;
+        let v_heads = d.v_heads;
         let hidden = d.hidden as u64;
         let attn_at = |l: u32| l % d.attn_every == d.attn_every - 1;
 
@@ -1005,11 +983,11 @@ impl Model {
                 };
                 let mlp = match &d.mlp {
                     MlpDims::Dense { inter } => {
-                        dense_mlp(proj, hidden, inter / tp, &format!("layer.{l}"))
+                        dense_mlp(proj, hidden, *inter, &format!("layer.{l}"))
                     }
                     MlpDims::Routed(m) => {
-                        let inter = m.inter / tp;
-                        let shared_inter = m.shared_inter / tp;
+                        let inter = m.inter;
+                        let shared_inter = m.shared_inter;
                         Mlp::Routed {
                             router: Weight::sym(n("router"), [m.experts as u64, hidden], gate),
 
@@ -1127,7 +1105,7 @@ impl Model {
             let inter = match &d.mlp {
                 MlpDims::Dense { inter } => *inter,
                 MlpDims::Routed(m) => m.inter,
-            } / tp;
+            };
             let p = recipe.prefix();
             let n = |s: &str| format!("{p}.{s}");
             Mtp {
@@ -1164,7 +1142,7 @@ impl Model {
                     norm_eps: d.norm_eps,
                     weights: w,
                     dense,
-                    tp,
+                    tp: 1,
                 },
             )
         });
@@ -1172,7 +1150,6 @@ impl Model {
         Model {
             hidden: d.hidden,
             vocab: d.vocab,
-            tp,
             q_heads,
             kv_heads,
             head_dim: d.head_dim,
@@ -1184,13 +1161,8 @@ impl Model {
                 Head::Tied
             } else {
                 let banded = std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
-                let rows = if banded {
-                    (d.vocab / tp) as u64
-                } else {
-                    d.vocab as u64
-                };
-                let bank = Weight::sym("lm_head", [rows, hidden], w);
-                Head::Bank(if banded { bank.packed([rows]) } else { bank })
+                let bank = Weight::sym("lm_head", [d.vocab as u64, hidden], w);
+                Head::Bank(if banded { bank.columns() } else { bank })
             },
             layers,
             final_norm: Weight::sym("final_norm", [hidden], dense),

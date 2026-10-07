@@ -240,6 +240,67 @@ macro_rules! skus {
     };
 }
 
+/// A row whose model is written at its whole size: the trace is the one each
+/// of its `tp` ranks runs, split by the compiler, and the model is built
+/// without a rank count.
+#[macro_export]
+macro_rules! split_skus {
+    ($( ($text:literal, $tp:literal, [$($w:expr),+ $(,)?], $kv:expr, $trace:path, $template:expr, $tokenizer:expr, $m:expr $(,)?) ),+ $(,)?) => {
+        vec![ $( {
+            const RECIPE: $crate::Recipe = $crate::Recipe {
+                text: $text,
+                weights: &[$($w),+],
+                kv: $kv,
+                tp: $tp,
+            };
+            $crate::Sku {
+                name: RECIPE.name(),
+                recipe: RECIPE,
+                trace: |platform: $crate::Platform| {
+                    $crate::split(&RECIPE, $trace(&RECIPE.name(), &($m)(), platform))
+                },
+                classify: |request: &$crate::Request| {
+                    poem_dsl::word_of(|| ($m)(), request)
+                },
+                import: |src: &ztensor::Source, tp: u32, platform: $crate::Platform| {
+                    $crate::whole(tp)?;
+                    ($m)().import(src, platform)
+                },
+                template: $template,
+                tokenizer: $tokenizer,
+                diffusion: None,
+                generative: None,
+            }
+        } ),+ ]
+    };
+}
+
+/// The trace one of `recipe`'s ranks runs.
+#[must_use]
+pub fn split(recipe: &Recipe, trace: poem_ir::Trace) -> poem_ir::Trace {
+    poem_compiler::shard::shard(trace, recipe.tp).unwrap_or_else(|why| {
+        panic!(
+            "`{}` ships a row its model does not split into: {why}",
+            recipe.name()
+        )
+    })
+}
+
+/// An import reads a whole checkpoint, which one rank of a split row does not
+/// land: its share is banded out of a stamped artifact instead.
+pub fn whole(tp: u32) -> Result<(), checkpoint_dsl::Error> {
+    if tp == 1 {
+        return Ok(());
+    }
+    Err(checkpoint_dsl::Error::Illegible {
+        name: String::new(),
+        detail: format!(
+            "an import states the WHOLE checkpoint and this contract is built for {tp} \
+             ranks; nothing has banded the file it is reading"
+        ),
+    })
+}
+
 static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
     [
         deepseek_v4::skus(),

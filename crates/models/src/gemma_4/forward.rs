@@ -193,11 +193,6 @@ impl ForwardHybrid for Model {
 
         let ids = inputs.tokens();
         let embedded = ops::layout::embed(&ids, &m.embed, m.vocab);
-        let embedded = if embed_banded(m) {
-            ops::collective::all_reduce(&embedded)
-        } else {
-            embedded
-        };
         let mut y = embedded * (m.hidden as f32).sqrt();
 
         if let Some(t) = &towered {
@@ -220,11 +215,6 @@ impl ForwardHybrid for Model {
                 sc.inter,
             );
             let signal = ops::linear::matmul(&act, &sc.down);
-            let signal = if m.tp > 1 {
-                ops::collective::all_reduce(&signal)
-            } else {
-                signal
-            };
             let den = ops::elemwise::rmsnorm_no_scale(
                 &ops::elemwise::residual_add(&den, &signal),
                 m.hidden,
@@ -349,11 +339,6 @@ impl ForwardHybrid for Model {
             ]);
             seam::at(seam::ATTN_OUT, &[&a]);
             let o = ops::linear::matmul(&a, &w.o_proj);
-            let o = if m.tp > 1 {
-                ops::collective::all_reduce(&o)
-            } else {
-                o
-            };
             let o = {
                 let (adapted, _) = o.split(&Facts::has_adapter());
                 let (px, _) = normed.split(&Facts::has_adapter());
@@ -371,11 +356,6 @@ impl ForwardHybrid for Model {
                 w.inter,
             );
             let f = ops::linear::matmul(&act, &w.down);
-            let f = if m.tp > 1 {
-                ops::collective::all_reduce(&f)
-            } else {
-                f
-            };
             let f = match &w.moe {
                 None => f,
                 Some(x) => {
@@ -401,11 +381,6 @@ impl ForwardHybrid for Model {
                     let hidden =
                         ops::linear::mlp_geglu_tanh_packed(&select(&moe_in, &x.gate_up), x.inter);
                     let routed = ops::linear::moe_weighted_sum(&select(&hidden, &x.down), &weights);
-                    let routed = if m.tp > 1 {
-                        ops::collective::all_reduce(&routed)
-                    } else {
-                        routed
-                    };
                     let h2 =
                         ops::elemwise::rmsnorm(&routed, &x.post_ffw_norm_2, x.post_ffw_norm_2_eps);
                     ops::elemwise::residual_add(&h1, &h2)
@@ -448,11 +423,6 @@ impl ForwardHybrid for Model {
         };
         let x = ops::layout::gather_rows(&x, &inputs.readout_rows());
         let logits = ops::linear::lm_head(&x, &m.embed);
-        let logits = if embed_banded(m) {
-            ops::collective::all_gather(&logits, m.tp)
-        } else {
-            logits
-        };
         let logits = if let Some(cap) = m.softcap {
             ops::attn::logit_softcap(&logits, cap)
         } else {
@@ -476,11 +446,6 @@ impl ForwardHybrid for Model {
             let chosen = ops::layout::argmax(&[&dlogits]);
 
             let e = ops::layout::embed(&chosen, &m.embed, m.vocab);
-            let e = if embed_banded(m) {
-                ops::collective::all_reduce(&e)
-            } else {
-                e
-            };
             let e = e * (m.hidden as f32).sqrt();
             let mut dy = ops::elemwise::residual_add(
                 &ops::linear::matmul(&e, &a.fc_embed),
@@ -489,11 +454,6 @@ impl ForwardHybrid for Model {
 
             let normed = ops::elemwise::rmsnorm(&dy, &a.attn_norm, a.norm_eps);
             let o = draft_attn(&normed, &inputs, m, &plan_draft, a);
-            let o = if m.tp > 1 {
-                ops::collective::all_reduce(&o)
-            } else {
-                o
-            };
             dy = ops::elemwise::residual_add(
                 &ops::elemwise::rmsnorm(&o, &a.post_attn_norm, a.norm_eps),
                 &dy,
@@ -504,11 +464,6 @@ impl ForwardHybrid for Model {
                 a.inter,
             );
             let f = ops::linear::matmul(&act, &a.down);
-            let f = if m.tp > 1 {
-                ops::collective::all_reduce(&f)
-            } else {
-                f
-            };
             dy = ops::elemwise::residual_add(
                 &ops::elemwise::rmsnorm(&f, &a.post_ffw_norm, a.norm_eps),
                 &dy,
@@ -518,11 +473,6 @@ impl ForwardHybrid for Model {
                 &ops::elemwise::rmsnorm(&dy, &m.final_norm, m.final_norm_eps),
                 &m.embed,
             );
-            let draft = if embed_banded(m) {
-                ops::collective::all_gather(&draft, m.tp)
-            } else {
-                draft
-            };
             let draft = match m.softcap {
                 Some(cap) => ops::attn::logit_softcap(&draft, cap),
                 None => draft,
@@ -557,11 +507,6 @@ impl ForwardHybrid for Model {
             let mut chain: Vec<Value> = Vec::with_capacity(a.depth as usize);
             for step in 0..a.depth {
                 let e = ops::layout::embed(&token, &m.embed, m.vocab);
-                let e = if embed_banded(m) {
-                    ops::collective::all_reduce(&e)
-                } else {
-                    e
-                };
                 let e = e * (m.hidden as f32).sqrt();
                 let mut y = ops::elemwise::residual_add(
                     &ops::linear::matmul(&e, &a.pre_embed),
@@ -624,10 +569,6 @@ impl ForwardHybrid for Model {
 
         logits
     }
-}
-
-fn embed_banded(m: &Model) -> bool {
-    m.embed.dim(0) < u64::from(m.vocab)
 }
 
 fn draft_attn(x: &Value, inputs: &Input<Facts>, m: &Model, plan: &Value, a: &Draft) -> Value {

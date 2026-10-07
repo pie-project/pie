@@ -16,14 +16,14 @@ use poem_dsl::{Dtype, Platform, trace_hybrid};
 fn a_ptq1_0_d27b_traces_and_places_without_panicking() {
     let plain = trace_hybrid(
         "d27b",
-        &Model::d27b_undrafted(Dtype::Ptq1_0, Dtype::Bf16, 1),
+        &Model::d27b_undrafted(Dtype::Ptq1_0, Dtype::Bf16),
         Platform::Metal,
     );
     assert!(plain.nodes.len() > 100, "the d27b Ptq1_0 forward traced");
 
     let bonsai = trace_hybrid(
         "d27b-bonsai",
-        &Model::d27b_bonsai(Dtype::Ptq1_0, Dtype::Bf16, 1),
+        &Model::d27b_bonsai(Dtype::Ptq1_0, Dtype::Bf16),
         Platform::Metal,
     );
     // The Bonsai instance adds the online-Hadamard rotation-undo at every rotated

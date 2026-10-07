@@ -10,7 +10,7 @@ use model::Model;
 use poem_dsl::Dtype;
 
 pub fn skus() -> Vec<crate::Sku> {
-    crate::skus![
+    crate::split_skus![
         (
             "qwen36-27b-mtp",
             1,
@@ -19,7 +19,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::d27b(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::d27b(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen36-27b-dflash",
@@ -29,7 +29,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::d27b_dflash(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::d27b_dflash(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen36-27b",
@@ -39,7 +39,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::d27b_undrafted(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::d27b_undrafted(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen36-27b",
@@ -49,7 +49,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::d27b_undrafted(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::d27b_undrafted(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen35-tiny",
@@ -59,7 +59,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::tiny(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::tiny(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen35-d0.8b",
@@ -69,7 +69,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::d0_8b(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::d0_8b(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen35-d0.8b",
@@ -79,7 +79,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::d0_8b(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::d0_8b(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen35-d2b",
@@ -89,7 +89,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::d2b(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::d2b(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen35-d2b",
@@ -99,7 +99,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::d2b(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::d2b(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen35-d4b",
@@ -109,7 +109,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::d4b(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::d4b(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen35-d4b",
@@ -119,7 +119,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::d4b(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::d4b(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen35-d9b-dflash",
@@ -129,7 +129,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::d9b_dflash(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::d9b_dflash(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen35-d9b",
@@ -139,7 +139,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::d9b(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::d9b(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen35-d9b",
@@ -149,7 +149,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::d9b(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::d9b(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen36-35b-a3b-dflash",
@@ -159,7 +159,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::a3b_dflash(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::a3b_dflash(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen36-35b-a3b-mtp",
@@ -169,7 +169,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::a3b_mtp(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::a3b_mtp(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen36-35b-a3b",
@@ -179,7 +179,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::a3b(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::a3b(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen36-35b-a3b",
@@ -189,7 +189,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::a3b(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::a3b(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen36-35b-a3b-mini",
@@ -199,7 +199,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::a3b_mini(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::a3b_mini(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen36-35b-a3b-mini",
@@ -209,7 +209,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::a3b_mini(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::a3b_mini(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen36-35b-a3b-mini64",
@@ -219,7 +219,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::a3b_mini64(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::a3b_mini64(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen36-27b",
@@ -229,7 +229,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::d27b(Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::d27b(Dtype::Bf16, Dtype::Bf16),
         ),
         (
             "qwen36-27b",
@@ -239,7 +239,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::d27b(Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::d27b(Dtype::Bf16, Dtype::Bf16),
         ),
         (
             "qwen38-27b",
@@ -249,7 +249,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38,
-            |tp: u32| Model::d27b(Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::d27b(Dtype::Bf16, Dtype::Bf16),
         ),
         (
             "qwen38-27b",
@@ -259,7 +259,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38,
-            |tp: u32| Model::d27b(Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::d27b(Dtype::Bf16, Dtype::Bf16),
         ),
         (
             "qwen38-27b-dflash2",
@@ -269,7 +269,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38,
-            |tp: u32| Model::d27b_dflash2(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::d27b_dflash2(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen38-27b-dspark",
@@ -279,7 +279,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38,
-            |tp: u32| Model::d27b_dspark(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::d27b_dspark(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen38-27b-mtp",
@@ -289,7 +289,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38,
-            |tp: u32| Model::d27b(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::d27b(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen38-27b",
@@ -299,7 +299,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38,
-            |tp: u32| Model::d27b_undrafted(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::d27b_undrafted(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen38-27b",
@@ -309,7 +309,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38,
-            |tp: u32| Model::d27b_undrafted(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::d27b_undrafted(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen35-a3b",
@@ -319,7 +319,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::a3b(Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::a3b(Dtype::Bf16, Dtype::Bf16),
         ),
         (
             "qwen35-d3b",
@@ -329,7 +329,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::d3b(Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::d3b(Dtype::Bf16, Dtype::Bf16),
         ),
         (
             "qwen35-d3b",
@@ -339,7 +339,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::d3b(Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::d3b(Dtype::Bf16, Dtype::Bf16),
         ),
         (
             "qwen35-d0.8b-eagle",
@@ -349,7 +349,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::d0_8b_eagle(Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::d0_8b_eagle(Dtype::Bf16, Dtype::Bf16),
         ),
         (
             "qwen35-d0.8b",
@@ -359,7 +359,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::d0_8b(Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::d0_8b(Dtype::Bf16, Dtype::Bf16),
         ),
         (
             "qwen35-d0.8b",
@@ -369,7 +369,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::d0_8b(Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::d0_8b(Dtype::Bf16, Dtype::Bf16),
         ),
         (
             "qwen35-a3b",
@@ -379,7 +379,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::a3b(Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::a3b(Dtype::Bf16, Dtype::Bf16),
         ),
         (
             "qwen35-d0.8b-vision-eagle",
@@ -389,7 +389,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT_VISION,
-            |tp: u32| Model::d0_8b_vision_eagle(Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::d0_8b_vision_eagle(Dtype::Bf16, Dtype::Bf16),
         ),
         (
             "qwen36-27b-vision",
@@ -399,7 +399,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT_VISION,
-            |tp: u32| Model::d27b_vision_undrafted(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::d27b_vision_undrafted(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen36-27b-vision",
@@ -409,7 +409,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT_VISION,
-            |tp: u32| Model::d27b_vision(Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::d27b_vision(Dtype::Bf16, Dtype::Bf16),
         ),
         (
             "qwen38-27b-vision",
@@ -419,7 +419,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38_VISION,
-            |tp: u32| Model::d27b_vision_undrafted(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::d27b_vision_undrafted(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen38-27b-vision",
@@ -429,7 +429,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38_VISION,
-            |tp: u32| Model::d27b_vision(Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::d27b_vision(Dtype::Bf16, Dtype::Bf16),
         ),
         (
             "qwen35-d0.8b-vision",
@@ -439,7 +439,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT_VISION,
-            |tp: u32| Model::d0_8b_vision(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::d0_8b_vision(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "qwen35-d0.8b-vision",
@@ -449,7 +449,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::chatml,
             &tokenizer::CONTRACT_VISION,
-            |tp: u32| Model::d0_8b_vision(Dtype::Bf16, Dtype::Bf16, tp),
+            || Model::d0_8b_vision(Dtype::Bf16, Dtype::Bf16),
         ),
     ]
 }

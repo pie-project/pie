@@ -30,7 +30,7 @@ struct Text {
 }
 
 fn micro() -> models::qwen_3::model::Model {
-    models::qwen_3::model::Model::a3b_micro(Dtype::Bf16, Dtype::Bf16, 1)
+    models::qwen_3::model::Model::a3b_micro(Dtype::Bf16, Dtype::Bf16)
 }
 fn micro_classify(request: &Request) -> u64 {
     poem_dsl::word_of(micro, request)
@@ -40,7 +40,7 @@ fn micro_word(len: u32) -> u64 {
 }
 
 fn uncached() -> models::qwen_3::model::Model {
-    models::qwen_3::model::Model::a3b_uncached_bank(Dtype::Bf16, Dtype::Bf16, 1)
+    models::qwen_3::model::Model::a3b_uncached_bank(Dtype::Bf16, Dtype::Bf16)
 }
 fn uncached_classify(request: &Request) -> u64 {
     poem_dsl::word_of(uncached, request)

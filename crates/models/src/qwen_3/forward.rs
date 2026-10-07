@@ -203,11 +203,6 @@ impl ForwardHybrid for Model {
                 }
                 Mixer::Gdn(g) => gdn_mixer(&x, &inputs, g, m.bonsai.as_ref()),
             };
-            let o = if m.tp > 1 {
-                ops::collective::all_reduce(&o)
-            } else {
-                o
-            };
             let o = {
                 let (adapted, _) = o.split(&Facts::has_adapter());
                 let (px, _) = x.split(&Facts::has_adapter());
@@ -284,11 +279,6 @@ impl ForwardHybrid for Model {
                     )
                 }
             };
-            let f = if m.tp > 1 {
-                ops::collective::all_reduce(&f)
-            } else {
-                f
-            };
             y = ops::elemwise::residual_add(&f, &y);
             if let Some(d) = &m.dflash {
                 d.tap(l, &y, &mut fused);
@@ -325,11 +315,6 @@ impl ForwardHybrid for Model {
             None => &x,
         };
         let logits = ops::linear::lm_head(head_in, head);
-        let logits = if head_banded(m, head) {
-            ops::collective::all_gather(&logits, m.tp)
-        } else {
-            logits
-        };
 
         if let Some(d) = &m.dflash {
             d.plant_readout(&logits, &inputs, hb.as_ref(), &Facts::block_draft());
@@ -361,11 +346,6 @@ impl ForwardHybrid for Model {
                 let a = &mtp.attn;
                 let nx = ops::elemwise::rmsnorm_plus_one(&dy, &mtp.mixer_norm, mtp.mixer_norm_eps);
                 let o = mtp_attn(&nx, &inputs, m, &plan_mtp, a, step > 0);
-                let o = if m.tp > 1 {
-                    ops::collective::all_reduce(&o)
-                } else {
-                    o
-                };
                 dy = ops::elemwise::residual_add(&o, &dy);
 
                 let nx = ops::elemwise::rmsnorm_plus_one(&dy, &mtp.mlp_norm, mtp.mlp_norm_eps);
@@ -381,11 +361,6 @@ impl ForwardHybrid for Model {
                     &ops::linear::mlp_swiglu(&ops::linear::matmul(&nx, gate_up), *inter),
                     down,
                 );
-                let f = if m.tp > 1 {
-                    ops::collective::all_reduce(&f)
-                } else {
-                    f
-                };
                 dy = ops::elemwise::residual_add(&f, &dy);
 
                 let read = match &mtp.norm {
@@ -393,11 +368,6 @@ impl ForwardHybrid for Model {
                     None => dy.clone(),
                 };
                 let draft = ops::linear::lm_head(&read, head);
-                let draft = if head_banded(m, head) {
-                    ops::collective::all_gather(&draft, m.tp)
-                } else {
-                    draft
-                };
                 if step == 0 {
                     seam::at(seam::MTP, &[&draft]);
                 }
@@ -708,8 +678,4 @@ fn gdn_mixer(x: &Value, inputs: &Input<Facts>, g: &Gdn, bonsai: Option<&BonsaiSi
         None => o,
     };
     ops::linear::matmul(&o_in, &g.out_proj)
-}
-
-fn head_banded(m: &Model, head: &Weight) -> bool {
-    head.dim(0) < u64::from(m.vocab)
 }

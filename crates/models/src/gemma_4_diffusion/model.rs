@@ -11,21 +11,21 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn a4b(w: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn a4b(w: Dtype, kv: Dtype) -> Model {
         Model {
-            trunk: gemma_4::model::Model::a4b_diffusion(w, kv, tp),
+            trunk: gemma_4::model::Model::a4b_diffusion(w, kv),
         }
     }
 
-    pub fn a4b_experts(w: Dtype, xw: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn a4b_experts(w: Dtype, xw: Dtype, kv: Dtype) -> Model {
         Model {
-            trunk: gemma_4::model::Model::a4b_diffusion_experts(w, xw, kv, tp),
+            trunk: gemma_4::model::Model::a4b_diffusion_experts(w, xw, kv),
         }
     }
 
-    pub fn a4b_experts_self_cond(w: Dtype, xw: Dtype, sw: Dtype, kv: Dtype, tp: u32) -> Model {
+    pub fn a4b_experts_self_cond(w: Dtype, xw: Dtype, sw: Dtype, kv: Dtype) -> Model {
         Model {
-            trunk: gemma_4::model::Model::a4b_diffusion_experts_self_cond(w, xw, sw, kv, tp),
+            trunk: gemma_4::model::Model::a4b_diffusion_experts_self_cond(w, xw, sw, kv),
         }
     }
 }

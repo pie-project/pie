@@ -10,7 +10,7 @@ use crate::gemma_4::{template, tokenizer};
 pub const ARCH: &str = "diffusion_gemma";
 
 pub fn skus() -> Vec<crate::Sku> {
-    let mut rows = crate::skus![
+    let mut rows = crate::split_skus![
         (
             "diffusiongemma-26b-a4b",
             1,
@@ -19,7 +19,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::a4b(Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::a4b(Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "diffusiongemma-26b-a4b",
@@ -29,7 +29,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::a4b(Dtype::U8g64, Dtype::Bf16, tp),
+            || Model::a4b(Dtype::U8g64, Dtype::Bf16),
         ),
         (
             "diffusiongemma-26b-a4b",
@@ -39,7 +39,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::a4b_experts(Dtype::U8g64, Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::a4b_experts(Dtype::U8g64, Dtype::U4g64, Dtype::Bf16),
         ),
         (
             "diffusiongemma-26b-a4b",
@@ -49,7 +49,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::a4b_experts(Dtype::U4g64, Dtype::U8g64, Dtype::Bf16, tp),
+            || Model::a4b_experts(Dtype::U4g64, Dtype::U8g64, Dtype::Bf16),
         ),
         (
             "diffusiongemma-26b-a4b",
@@ -59,13 +59,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::a4b_experts_self_cond(
-                Dtype::U8g64,
-                Dtype::U4g64,
-                Dtype::U4g64,
-                Dtype::Bf16,
-                tp,
-            ),
+            || Model::a4b_experts_self_cond(Dtype::U8g64, Dtype::U4g64, Dtype::U4g64, Dtype::Bf16,),
         ),
         (
             "diffusiongemma-26b-a4b",
@@ -75,7 +69,7 @@ pub fn skus() -> Vec<crate::Sku> {
             poem_dsl::trace_hybrid,
             template::gemma4,
             &tokenizer::CONTRACT,
-            |tp: u32| Model::a4b_experts(Dtype::Bf16, Dtype::U4g64, Dtype::Bf16, tp),
+            || Model::a4b_experts(Dtype::Bf16, Dtype::U4g64, Dtype::Bf16),
         ),
     ];
     for row in &mut rows {

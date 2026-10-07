@@ -91,7 +91,7 @@ fn the_bonsai_forward_wires_the_hadamard_rotation_every_case() {
 fn the_attention_q_k_v_share_the_one_rotated_input() {
     let trace = trace_hybrid(
         "d27b-bonsai",
-        &Model::d27b_bonsai(Dtype::Bf16, Dtype::Bf16, 1),
+        &Model::d27b_bonsai(Dtype::Bf16, Dtype::Bf16),
         Platform::Metal,
     );
 
@@ -166,13 +166,13 @@ fn the_attention_q_k_v_share_the_one_rotated_input() {
 }
 
 fn the_bonsai_flag_declares_three_width_keyed_sign_banks() {
-    let plain = Model::d27b_undrafted(Dtype::Bf16, Dtype::Bf16, 1);
+    let plain = Model::d27b_undrafted(Dtype::Bf16, Dtype::Bf16);
     assert!(
         plain.bonsai.is_none(),
         "a plain d27b arms no rotation — the flag must default off",
     );
 
-    let b = Model::d27b_bonsai(Dtype::Ptq1_0, Dtype::Bf16, 1);
+    let b = Model::d27b_bonsai(Dtype::Ptq1_0, Dtype::Bf16);
     let signs = b
         .bonsai
         .as_ref()
@@ -197,7 +197,7 @@ fn a_non_bonsai_d27b_wires_no_hadamard_on_any_platform() {
     for platform in [Platform::Metal, Platform::Cuda] {
         let trace = trace_hybrid(
             "d27b",
-            &Model::d27b_undrafted(Dtype::Bf16, Dtype::Bf16, 1),
+            &Model::d27b_undrafted(Dtype::Bf16, Dtype::Bf16),
             platform,
         );
         let (total, ..) = tally(&trace);
@@ -223,7 +223,7 @@ fn a_non_bonsai_d27b_wires_no_hadamard_on_any_platform() {
 fn the_bonsai_forward_rotates_every_site_by_input_width() {
     let trace = trace_hybrid(
         "d27b-bonsai",
-        &Model::d27b_bonsai(Dtype::Bf16, Dtype::Bf16, 1),
+        &Model::d27b_bonsai(Dtype::Bf16, Dtype::Bf16),
         Platform::Metal,
     );
     let (total, signed, (w5120, w6144, w17408)) = tally(&trace);

@@ -103,7 +103,7 @@ impl Model {
         platform: Platform,
         layout: Layout,
     ) -> Result<ModelContract, Error> {
-        let mut b = Builder::new(src, self.tp, platform);
+        let mut b = Builder::new(src, 1, platform);
         b.read(&self.embed, layout.embed())?;
         b.read(&self.final_norm, layout.at("norm.weight"))?;
 
@@ -392,7 +392,7 @@ impl Model {
                     .to_string(),
             });
         }
-        let mut b = Builder::new(src, self.tp, platform);
+        let mut b = Builder::new(src, 1, platform);
         b.read(&self.embed, "token_embd.weight")?;
         b.read(&self.final_norm, "output_norm.weight")?;
 

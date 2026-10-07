@@ -120,7 +120,7 @@ impl Model {
             }
         };
 
-        let mut b = Builder::new(src, self.tp, platform);
+        let mut b = Builder::new(src, 1, platform);
         b.read(&self.embed, layout.embed())?;
         b.read_expr(&self.final_norm, norm(layout.norm().to_string()))?;
 
@@ -361,7 +361,7 @@ impl Model {
         // block-stored GGUF, left untouched.
         let v_grouped = rotation::gdn_v_grouped(src);
 
-        let mut b = Builder::new(src, self.tp, platform);
+        let mut b = Builder::new(src, 1, platform);
         b.read(&self.embed, "token_embd.weight")?;
         b.read_over(&self.final_norm, "output_norm.weight", minus_one)?;
 

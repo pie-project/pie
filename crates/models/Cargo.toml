@@ -14,6 +14,7 @@ path = "src/lib.rs"
 
 [dependencies]
 chat-template = { path = "../chat-template" }
+poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
 poem-dsl = { package = "pie-poem-dsl", path = "../poem-dsl" }
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 checkpoint = { path = "../checkpoint" }
@@ -23,7 +24,6 @@ tokenizer = { path = "../tokenizer" }
 ztensor = { workspace = true }
 
 [dev-dependencies]
-poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 ztensor-compat = { workspace = true }
 

@@ -3,7 +3,7 @@ use poem_dsl::{Dtype, Platform};
 use poem_ir::Trace;
 
 fn micro() -> (models::qwen_3::model::Model, Trace) {
-    let m = models::qwen_3::model::Model::a3b_micro(Dtype::Bf16, Dtype::Bf16, 1);
+    let m = models::qwen_3::model::Model::a3b_micro(Dtype::Bf16, Dtype::Bf16);
     let trace = poem_dsl::trace_hybrid("qwen35-a3b-micro", &m, Platform::Cuda);
     (m, trace)
 }
