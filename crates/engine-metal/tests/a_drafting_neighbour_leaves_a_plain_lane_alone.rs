@@ -34,7 +34,7 @@ fn argmax(logits: &[f32]) -> u32 {
 
 fn load(artifact: &PathBuf) -> Shell {
     let sku = models::sku(SKU).expect("the catalog ships the drafting mini row");
-    let trace = (sku.trace)(Platform::Metal);
+    let trace = sku.trace(Platform::Metal);
     let source = ztensor_compat::index(artifact).expect("the artifact opens");
     let contract = checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Metal)
         .unwrap_or_else(|why| panic!("the artifact holds every plane of {SKU}: {why}"));

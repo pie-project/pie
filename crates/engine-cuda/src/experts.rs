@@ -1891,17 +1891,15 @@ mod tests {
     use super::*;
 
     fn a3b() -> Trace {
-        let trace = models::sku("qwen35-a3b-bf16-kv-bf16")
+        models::sku("qwen35-a3b-bf16-kv-bf16")
             .expect("the catalog ships the SKU")
-            .trace;
-        trace(Platform::Cuda)
+            .trace(Platform::Cuda)
     }
 
     fn gpt_oss() -> Trace {
-        let trace = models::sku("gptoss-20b-bf16-mxfp4-kv-bf16")
+        models::sku("gptoss-20b-bf16-mxfp4-kv-bf16")
             .expect("the catalog ships the SKU")
-            .trace;
-        trace(Platform::Cuda)
+            .trace(Platform::Cuda)
     }
 
     fn scales_of(trace: &Trace) -> Attachments {

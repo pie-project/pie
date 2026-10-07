@@ -7,57 +7,32 @@ pub mod tokenizer;
 use model::Model;
 use poem_dsl::Dtype;
 
-pub fn skus() -> Vec<crate::Sku> {
-    crate::skus![
-        (
-            "muse-glimmer-30b",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::muse_glimmer,
-            &tokenizer::CONTRACT,
-            || Model::b30(Dtype::Bf16, Dtype::Bf16),
-        ),
-        (
-            "muse-glimmer-30b",
-            2,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::muse_glimmer,
-            &tokenizer::CONTRACT,
-            || Model::b30(Dtype::Bf16, Dtype::Bf16),
-        ),
-        (
-            "muse-glimmer-30b",
-            1,
-            [Dtype::U4g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::muse_glimmer,
-            &tokenizer::CONTRACT,
-            || Model::b30(Dtype::U4g64, Dtype::Bf16),
-        ),
-        (
-            "muse-glimmer-30b",
-            2,
-            [Dtype::U4g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::muse_glimmer,
-            &tokenizer::CONTRACT,
-            || Model::b30(Dtype::U4g64, Dtype::Bf16),
-        ),
-        (
-            "muse-glimmer-30b-mini-l8",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::muse_glimmer,
-            &tokenizer::CONTRACT,
-            || Model::b30_mini(8, Dtype::Bf16, Dtype::Bf16),
-        ),
+pub fn entries() -> Vec<crate::catalog::Entry> {
+    use Dtype::{Bf16, U4g64};
+    vec![
+        crate::entry! {
+            id: "muse-glimmer-30b",
+            fixture: false,
+            parts: [],
+            drafters: [],
+            template: template::muse_glimmer,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: None,
+            build: |d| -> Model { Ok(Model::b30(d.dtype()?, d.kv)) },
+            rows: [(0, "muse-glimmer-30b", 1, [Bf16], Bf16, [], None), (1, "muse-glimmer-30b", 2, [Bf16], Bf16, [], None), (2, "muse-glimmer-30b", 1, [U4g64], Bf16, [], None), (3, "muse-glimmer-30b", 2, [U4g64], Bf16, [], None)],
+        },
+        crate::entry! {
+            id: "muse-glimmer-30b-mini-l8",
+            fixture: true,
+            parts: [],
+            drafters: [],
+            template: template::muse_glimmer,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: None,
+            build: |d| -> Model { Ok(Model::b30_mini(8, d.dtype()?, d.kv)) },
+            rows: [(4, "muse-glimmer-30b-mini-l8", 1, [Bf16], Bf16, [], None)],
+        },
     ]
 }

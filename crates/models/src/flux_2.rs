@@ -10,46 +10,32 @@ use poem_dsl::Dtype;
 
 pub const ARCH: &str = "flux_2";
 
-pub fn skus() -> Vec<crate::Sku> {
-    let mut rows = crate::skus![
-        (
-            "flux2-klein-4b",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::klein_4b(Dtype::Bf16),
-        ),
-        (
-            "flux2-klein-4b",
-            1,
-            [Dtype::U4g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::klein_4b(Dtype::U4g64),
-        ),
-        (
-            "flux2-mini",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::mini(Dtype::Bf16),
-        ),
-    ];
-    for row in &mut rows {
-        let model = match row.recipe.text {
-            "flux2-klein-4b" => Model::klein_4b(Dtype::Bf16),
-            "flux2-mini" => Model::mini(Dtype::Bf16),
-            other => unreachable!("no flux_2 row is called `{other}`"),
-        };
-        row.generative = Some(model.generative());
-    }
-    rows
+pub fn entries() -> Vec<crate::catalog::Entry> {
+    use Dtype::{Bf16, U4g64};
+    vec![
+        crate::entry! {
+            id: "flux2-klein-4b",
+            fixture: false,
+            parts: [],
+            drafters: [],
+            template: template::instruct,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: Some(Model::generative),
+            build: |d| -> Model { Ok(Model::klein_4b(d.dtype()?)) },
+            rows: [(0, "flux2-klein-4b", 1, [Bf16], Bf16, [], None), (1, "flux2-klein-4b", 1, [U4g64], Bf16, [], None)],
+        },
+        crate::entry! {
+            id: "flux2-mini",
+            fixture: true,
+            parts: [],
+            drafters: [],
+            template: template::instruct,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: Some(Model::generative),
+            build: |d| -> Model { Ok(Model::mini(d.dtype()?)) },
+            rows: [(2, "flux2-mini", 1, [Bf16], Bf16, [], None)],
+        },
+    ]
 }

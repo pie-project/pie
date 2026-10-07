@@ -64,7 +64,7 @@ fn every_probe_is_dumped() {
                 .expect("the artifact reads")
                 .expect("the artifact carries a serving stamp");
             let sku = models::sku(&stamp.sku).unwrap_or_else(|| panic!("no SKU {}", stamp.sku));
-            let trace = (sku.trace)(Platform::Cuda);
+            let trace = sku.trace(Platform::Cuda);
             let source = ztensor_compat::index(&artifact).expect("the artifact opens");
             let contract =
                 checkpoint_dsl::own_contract(&source, &trace.params, sku.recipe.tp, Platform::Cuda)
@@ -102,7 +102,7 @@ fn every_probe_is_dumped() {
             return;
         }
     };
-    let trace = (sku.trace)(Platform::Cuda);
+    let trace = sku.trace(Platform::Cuda);
     let word = |query_len: u32| (sku.classify)(&Request::new(query_len, false));
     let budget = |key: &str| -> Option<u64> {
         let text = std::env::var(key).ok()?;

@@ -30,8 +30,7 @@ fn baked() -> (Trace, CompiledModel) {
     let trace = models::skus()
         .find(|row| row.name.starts_with(SERVED))
         .unwrap_or_else(|| panic!("the catalog no longer names a {SERVED} text"))
-        .trace;
-    let trace = trace(Platform::Metal);
+        .trace(Platform::Metal);
     let compiled = compile(&trace, &budget(), &profile()).expect("the served text bakes");
     (trace, compiled)
 }

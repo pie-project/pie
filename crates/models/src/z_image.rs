@@ -10,46 +10,32 @@ use poem_dsl::Dtype;
 
 pub const ARCH: &str = "z_image";
 
-pub fn skus() -> Vec<crate::Sku> {
-    let mut rows = crate::skus![
-        (
-            "z-image-turbo",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::turbo(Dtype::Bf16),
-        ),
-        (
-            "z-image-turbo",
-            1,
-            [Dtype::U4g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::turbo(Dtype::U4g64),
-        ),
-        (
-            "z-image-mini",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::mini(Dtype::Bf16),
-        ),
-    ];
-    for row in &mut rows {
-        let model = match row.recipe.text {
-            "z-image-turbo" => Model::turbo(Dtype::Bf16),
-            "z-image-mini" => Model::mini(Dtype::Bf16),
-            other => unreachable!("no z-image row is called `{other}`"),
-        };
-        row.generative = Some(model.generative());
-    }
-    rows
+pub fn entries() -> Vec<crate::catalog::Entry> {
+    use Dtype::{Bf16, U4g64};
+    vec![
+        crate::entry! {
+            id: "z-image-turbo",
+            fixture: false,
+            parts: [],
+            drafters: [],
+            template: template::instruct,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: Some(Model::generative),
+            build: |d| -> Model { Ok(Model::turbo(d.dtype()?)) },
+            rows: [(0, "z-image-turbo", 1, [Bf16], Bf16, [], None), (1, "z-image-turbo", 1, [U4g64], Bf16, [], None)],
+        },
+        crate::entry! {
+            id: "z-image-mini",
+            fixture: true,
+            parts: [],
+            drafters: [],
+            template: template::instruct,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: Some(Model::generative),
+            build: |d| -> Model { Ok(Model::mini(d.dtype()?)) },
+            rows: [(2, "z-image-mini", 1, [Bf16], Bf16, [], None)],
+        },
+    ]
 }

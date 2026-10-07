@@ -149,9 +149,9 @@ struct Read {
 }
 
 fn read(artifact: &Path) -> Read {
-    let trace = (models::sku(SKU)
+    let trace = models::sku(SKU)
         .expect("the catalog ships the full 2-bit row")
-        .trace)(Platform::Metal);
+        .trace(Platform::Metal);
     let source = ztensor_compat::index(artifact).expect("the artifact opens");
     let contract = checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Metal)
         .unwrap_or_else(|why| panic!("the artifact holds every plane of {SKU}: {why}"));

@@ -12,7 +12,7 @@ fn every_out_seam_holds_one_row_per_readout() {
     let mut seen = 0usize;
 
     for row in models::skus() {
-        let trace = (row.trace)(Platform::Cuda);
+        let trace = row.trace(Platform::Cuda);
         for out in trace.seams.iter().filter(|s| s.seam == seam::OUT.name) {
             for value in &out.values {
                 seen += 1;

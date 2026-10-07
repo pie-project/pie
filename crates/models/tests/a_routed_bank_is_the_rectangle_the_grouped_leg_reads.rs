@@ -23,7 +23,7 @@ fn a_routed_bank_is_the_rectangle_the_grouped_leg_reads() {
     let mut checked = 0usize;
 
     for row in models::skus() {
-        let trace = (row.trace)(Platform::Cuda);
+        let trace = row.trace(Platform::Cuda);
         for node in &trace.nodes {
             let Operation::Linear(Linear::MoeMatmulSelect { x, bank, y, .. }) = &node.op else {
                 continue;

@@ -15,7 +15,7 @@ fn row(sku: &str) -> &'static models::Sku {
 }
 
 fn trace(sku: &str) -> Trace {
-    (row(sku).trace)(Platform::Cuda)
+    row(sku).trace(Platform::Cuda)
 }
 
 #[test]

@@ -7,6 +7,8 @@ pub mod tokenizer;
 use model::{Model, Routed};
 use poem_dsl::Dtype;
 
+use crate::catalog::{Drafter, Entry, Refused};
+
 pub fn flash_u2g64() -> Model {
     Model::flash_mini(Dtype::U4g64, Routed::DQ_2BIT, Dtype::Bf16, Dtype::Bf16)
 }
@@ -54,132 +56,119 @@ pub fn flash41_mini_mxfp4() -> Model {
     )
 }
 
-pub fn skus() -> Vec<crate::Sku> {
-    crate::skus![
-        (
-            "dsv41-flash",
-            1,
-            [Dtype::U4g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::r1,
-            &tokenizer::CONTRACT,
-            flash41_u4g64,
-        ),
-        (
-            "dsv41-flash",
-            1,
-            [Dtype::Bf16, Dtype::Mxfp4],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::r1,
-            &tokenizer::CONTRACT,
-            flash41_mxfp4,
-        ),
-        (
-            "dsv41-flash-mini",
-            1,
-            [Dtype::Bf16, Dtype::Mxfp4],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::r1,
-            &tokenizer::CONTRACT,
-            flash41_mini_mxfp4,
-        ),
-        (
-            "dsv4-flash-full-mtp",
-            1,
-            [Dtype::U4g64, Dtype::U2g64, Dtype::Mxfp4],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::r1,
-            &tokenizer::CONTRACT,
-            flash_u2g64_full_mtp,
-        ),
-        (
-            "dsv4-flash-mtp",
-            1,
-            [Dtype::U4g64, Dtype::U2g64, Dtype::Mxfp4],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::r1,
-            &tokenizer::CONTRACT,
-            flash_u2g64_mtp,
-        ),
-        (
-            "dsv4-flash-full",
-            1,
-            [Dtype::U4g64, Dtype::U2g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::r1,
-            &tokenizer::CONTRACT,
-            flash_u2g64_full,
-        ),
-        (
-            "dsv4-flash",
-            1,
-            [Dtype::U4g64, Dtype::U2g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::r1,
-            &tokenizer::CONTRACT,
-            flash_u2g64,
-        ),
-        (
-            "dsv4-flash",
-            2,
-            [Dtype::U4g64, Dtype::U2g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::r1,
-            &tokenizer::CONTRACT,
-            flash_u2g64,
-        ),
-        (
-            "dsv4-flash-mini",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::r1,
-            &tokenizer::CONTRACT,
-            || Model::flash_mini(
-                Dtype::Bf16,
-                Routed::uniform(Dtype::Bf16),
-                Dtype::Bf16,
-                Dtype::Bf16
-            ),
-        ),
-        (
-            "dsv4-base",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::r1,
-            &tokenizer::CONTRACT,
-            || Model::base(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16),
-        ),
-        (
-            "dsv4-flash",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::r1,
-            &tokenizer::CONTRACT,
-            || Model::flash(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16),
-        ),
-        (
-            "dsv4-flash",
-            2,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::r1,
-            &tokenizer::CONTRACT,
-            || Model::flash(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16),
-        ),
+pub fn entries() -> Vec<Entry> {
+    use Dtype::{Bf16, Mxfp4, U2g64, U4g64};
+    vec![
+        crate::entry! {
+            id: "dsv41-flash",
+            fixture: false,
+            parts: [],
+            drafters: [],
+            template: template::r1,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: None,
+            build: |d| -> Model {
+                match d.weights[..] {
+                    [U4g64] => Ok(Model::flash41(U4g64, Routed::split(U4g64), Bf16, d.kv)),
+                    [Bf16, Mxfp4] => Ok(Model::flash41(Bf16, Routed::split(Mxfp4), Bf16, d.kv)),
+                    _ => Err(Refused::unsupported("dsv41-flash", d)),
+                }
+            },
+            rows: [
+                (0, "dsv41-flash", 1, [U4g64], Bf16, [], None),
+                (1, "dsv41-flash", 1, [Bf16, Mxfp4], Bf16, [], None),
+            ],
+        },
+        crate::entry! {
+            id: "dsv41-flash-mini",
+            fixture: true,
+            parts: [],
+            drafters: [],
+            template: template::r1,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: None,
+            build: |d| -> Model {
+                match d.weights[..] {
+                    [Bf16, Mxfp4] => Ok(Model::flash41_mini(Bf16, Routed::split(Mxfp4), Bf16, d.kv)),
+                    _ => Err(Refused::unsupported("dsv41-flash-mini", d)),
+                }
+            },
+            rows: [(2, "dsv41-flash-mini", 1, [Bf16, Mxfp4], Bf16, [], None)],
+        },
+        crate::entry! {
+            id: "dsv4-flash",
+            fixture: false,
+            parts: [],
+            drafters: [Mtp],
+            template: template::r1,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: None,
+            build: |d| -> Model {
+                match (&d.weights[..], d.drafter) {
+                    ([Bf16], None) => Ok(Model::flash(Bf16, Bf16, d.kv)),
+                    ([U4g64, U2g64], None) => {
+                        Ok(Model::flash_mixed(U4g64, Routed::DQ_2BIT_FULL, Bf16, d.kv))
+                    }
+                    ([U4g64, U2g64, Mxfp4], Some(Drafter::Mtp)) => {
+                        Ok(Model::flash_mixed_mtp(U4g64, Routed::DQ_2BIT_FULL, Bf16, d.kv))
+                    }
+                    _ => Err(Refused::unsupported("dsv4-flash", d)),
+                }
+            },
+            rows: [
+                (3, "dsv4-flash-full-mtp", 1, [U4g64, U2g64, Mxfp4], Bf16, [], Some(Drafter::Mtp)),
+                (5, "dsv4-flash-full", 1, [U4g64, U2g64], Bf16, [], None),
+                (10, "dsv4-flash", 1, [Bf16], Bf16, [], None),
+                (11, "dsv4-flash", 2, [Bf16], Bf16, [], None),
+            ],
+        },
+        crate::entry! {
+            id: "dsv4-flash-mini",
+            fixture: true,
+            parts: [],
+            drafters: [Mtp],
+            template: template::r1,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: None,
+            build: |d| -> Model {
+                match (&d.weights[..], d.drafter) {
+                    ([Bf16], None) => Ok(Model::flash_mini(Bf16, Routed::uniform(Bf16), Bf16, d.kv)),
+                    ([U4g64, U2g64], None) => {
+                        Ok(Model::flash_mini(U4g64, Routed::DQ_2BIT, Bf16, d.kv))
+                    }
+                    ([U4g64, U2g64, Mxfp4], Some(Drafter::Mtp)) => {
+                        Ok(Model::flash_mini_mtp(U4g64, Routed::DQ_2BIT, Bf16, d.kv))
+                    }
+                    _ => Err(Refused::unsupported("dsv4-flash-mini", d)),
+                }
+            },
+            rows: [
+                (4, "dsv4-flash-mtp", 1, [U4g64, U2g64, Mxfp4], Bf16, [], Some(Drafter::Mtp)),
+                (6, "dsv4-flash", 1, [U4g64, U2g64], Bf16, [], None),
+                (7, "dsv4-flash", 2, [U4g64, U2g64], Bf16, [], None),
+                (8, "dsv4-flash-mini", 1, [Bf16], Bf16, [], None),
+            ],
+        },
+        crate::entry! {
+            id: "dsv4-base",
+            fixture: true,
+            parts: [],
+            drafters: [],
+            template: template::r1,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: None,
+            build: |d| -> Model {
+                match d.weights[..] {
+                    [Bf16] => Ok(Model::base(Bf16, Bf16, d.kv)),
+                    _ => Err(Refused::unsupported("dsv4-base", d)),
+                }
+            },
+            rows: [(9, "dsv4-base", 1, [Bf16], Bf16, [], None)],
+        },
     ]
 }

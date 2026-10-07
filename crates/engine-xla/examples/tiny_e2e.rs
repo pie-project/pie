@@ -31,7 +31,7 @@ fn main() {
     let sku = models::sku(&name)
         .or_else(|| models::skus().find(|s| s.name.starts_with(&name)))
         .unwrap_or_else(|| panic!("no SKU `{name}`"));
-    let trace = (sku.trace)(Platform::Xla);
+    let trace = sku.trace(Platform::Xla);
     let dir = PathBuf::from("/dev/shm/pie-xla-e2e");
     std::fs::create_dir_all(&dir).expect("the scratch directory");
     let path = dir.join(format!("{}.zt", sku.name));

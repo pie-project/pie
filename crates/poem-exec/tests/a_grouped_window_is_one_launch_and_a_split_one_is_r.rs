@@ -28,10 +28,9 @@ fn budget() -> Budget {
 }
 
 fn trace() -> Trace {
-    let trace = models::sku(SKU)
+    models::sku(SKU)
         .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"))
-        .trace;
-    trace(Platform::Cuda)
+        .trace(Platform::Cuda)
 }
 
 fn bake(trace: &Trace, profile: &DeviceProfile) -> CompiledModel {

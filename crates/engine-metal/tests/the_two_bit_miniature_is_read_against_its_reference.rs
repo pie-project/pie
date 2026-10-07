@@ -65,9 +65,9 @@ fn argmax(logits: &[f32]) -> u32 {
 }
 
 fn load(checkpoint: &Path, context: u32) -> Shell {
-    let trace = (models::sku(SKU)
+    let trace = models::sku(SKU)
         .expect("the catalog ships the 2-bit SKU")
-        .trace)(Platform::Metal);
+        .trace(Platform::Metal);
     let container = container(checkpoint).expect("the snapshot holds a tensor container");
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
     let contract = models::sku(SKU)

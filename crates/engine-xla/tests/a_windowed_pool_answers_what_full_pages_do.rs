@@ -86,7 +86,7 @@ fn answer(m: &common::Model, prompt: &[u32], full_windows: bool) -> Answer {
     let sku = m.sku;
     let word = |rows: u32| (sku.classify)(&Request::new(rows, false));
     let mut shell = Shell::load(Boot {
-        trace: (sku.trace)(Platform::Xla),
+        trace: sku.trace(Platform::Xla),
         contract: &m.contract,
         checkpoint: &m.checkpoint,
         budget: Budget::new(4, 2 * CHUNK as u32),
@@ -180,7 +180,7 @@ fn a_windowed_pool_answers_what_full_pages_do() {
         eprintln!("not asked: set PIE_XLA_ARTIFACT (a model with windowed kv rows)");
         return;
     };
-    let trace = (m.sku.trace)(Platform::Xla);
+    let trace = m.sku.trace(Platform::Xla);
     let window = trace
         .caches
         .iter()

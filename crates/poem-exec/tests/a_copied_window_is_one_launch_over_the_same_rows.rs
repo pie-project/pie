@@ -164,9 +164,8 @@ impl Sink for Runs {
 
 fn sku() -> (Trace, CompiledModel) {
     let trace = models::sku(SKU)
-        .map(|row| row.trace)
-        .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"));
-    let trace = trace(Platform::Cuda);
+        .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"))
+        .trace(Platform::Cuda);
     let compiled = compile(&trace, &budget(), &DeviceProfile::default())
         .unwrap_or_else(|refusal| panic!("`{SKU}` bakes: {refusal:?}"));
     (trace, compiled)

@@ -72,7 +72,7 @@ const CANNOT_SERVE: &[(&str, &[&str])] = &[
 
 fn ops_of(sku: &str) -> BTreeSet<String> {
     let row = models::sku(sku).expect("the row is in the catalog");
-    (row.trace)(PLATFORM)
+    row.trace(PLATFORM)
         .nodes
         .iter()
         .map(|node| {
@@ -214,7 +214,7 @@ fn every_refusal_is_still_carried() {
 fn every_catalog_sku_traces() {
     let mut empty = Vec::new();
     for row in models::skus() {
-        let trace = (row.trace)(PLATFORM);
+        let trace = row.trace(PLATFORM);
         if trace.nodes.is_empty() {
             empty.push(row.name.clone());
         }

@@ -28,7 +28,7 @@ fn a_prompt_is_answered_and_its_decode_agrees_with_its_prefill() {
         return;
     };
     let (checkpoint, sku, contract) = (m.checkpoint.clone(), m.sku, &m.contract);
-    let trace = (sku.trace)(Platform::Xla);
+    let trace = sku.trace(Platform::Xla);
     let word = |query_len: u32| (sku.classify)(&Request::new(query_len, false));
     let context = 512;
 

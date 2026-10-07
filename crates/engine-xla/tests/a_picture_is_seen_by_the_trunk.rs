@@ -228,7 +228,7 @@ fn a_solid_square_is_named_by_its_colour() {
         eprintln!("not asked: {} carries no image tower", m.sku.name);
         return;
     }
-    let trace = (m.sku.trace)(Platform::Xla);
+    let trace = m.sku.trace(Platform::Xla);
     let classify = m.sku.classify;
     let word = |len: u32, media: bool| classify(&Request::new(len, false).with_media(media));
 

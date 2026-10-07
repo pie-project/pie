@@ -210,7 +210,7 @@ fn a_non_bonsai_d27b_wires_no_hadamard_on_any_platform() {
     // The whole shipped catalog stays Hadamard-free (the flag lives only on the
     // test-level Bonsai instance).
     for row in models::skus() {
-        let trace = (row.trace)(Platform::Metal);
+        let trace = row.trace(Platform::Metal);
         let (total, ..) = tally(&trace);
         assert_eq!(
             total, 0,

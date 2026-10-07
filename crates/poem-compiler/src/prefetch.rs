@@ -247,10 +247,9 @@ mod tests {
     use super::*;
 
     fn d0_8b() -> Trace {
-        let trace = models::sku("qwen35-d0.8b-bf16-kv-bf16")
+        models::sku("qwen35-d0.8b-bf16-kv-bf16")
             .expect("the catalog ships it")
-            .trace;
-        trace(Platform::Cuda)
+            .trace(Platform::Cuda)
     }
 
     #[test]

@@ -24,7 +24,7 @@ fn every_gpt_oss_row_declares_a_masked_arm_and_exports_its_scores() {
     assert!(!rows.is_empty(), "this build ships no gpt-oss row");
     for row in rows {
         for platform in PLATFORMS {
-            let trace = (row.trace)(platform);
+            let trace = row.trace(platform);
             let sinks = count(&trace, |op| {
                 matches!(op, Operation::Attention(Attention::Sink { .. }))
             });

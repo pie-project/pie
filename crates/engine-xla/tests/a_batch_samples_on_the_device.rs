@@ -229,7 +229,7 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
     let context = 512;
     let _device = engine_xla::bench::lock_device();
     let mut shell = Shell::load(Boot {
-        trace: (sku.trace)(Platform::Xla),
+        trace: sku.trace(Platform::Xla),
         contract: &m.contract,
         checkpoint: &m.checkpoint,
         budget: Budget::new(lanes, 1024),

@@ -24,8 +24,7 @@ fn budget() -> Budget {
 fn sku() -> (Trace, CompiledModel) {
     let trace = models::sku(SKU)
         .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"))
-        .trace;
-    let trace = trace(Platform::Cuda);
+        .trace(Platform::Cuda);
     let compiled = compile(&trace, &budget(), &DeviceProfile::default())
         .unwrap_or_else(|refusal| panic!("`{SKU}` bakes: {refusal:?}"));
     assert!(

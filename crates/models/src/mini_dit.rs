@@ -9,42 +9,25 @@ use poem_dsl::Dtype;
 
 pub const ARCH: &str = "mini_dit";
 
-pub fn skus() -> Vec<crate::Sku> {
-    let tap = forward::Tap::from_env();
-    let mut rows = crate::skus![
-        (
-            "mini-dit",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::mini(Dtype::Bf16).tapped(forward::Tap::from_env()),
-        ),
-        (
-            "mini-dit",
-            2,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::mini(Dtype::Bf16).tapped(forward::Tap::from_env()),
-        ),
-        (
-            "mini-dit",
-            4,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::mini(Dtype::Bf16).tapped(forward::Tap::from_env()),
-        ),
-    ];
-    for row in &mut rows {
-        row.generative = Some(forward::generative(tap.as_deref()));
+pub fn entries() -> Vec<crate::catalog::Entry> {
+    use Dtype::Bf16;
+    fn generative(_: &Model) -> crate::Generative {
+        forward::generative(forward::Tap::from_env().as_deref())
     }
-    rows
+    vec![crate::entry! {
+        id: "mini-dit",
+        fixture: true,
+        parts: [],
+        drafters: [],
+        template: template::instruct,
+        tokenizer: &tokenizer::CONTRACT,
+        diffusion: None,
+        generative: Some(generative),
+        build: |d| -> Model { Ok(Model::mini(d.dtype()?).tapped(forward::Tap::from_env())) },
+        rows: [
+            (0, "mini-dit", 1, [Bf16], Bf16, [], None),
+            (1, "mini-dit", 2, [Bf16], Bf16, [], None),
+            (2, "mini-dit", 4, [Bf16], Bf16, [], None),
+        ],
+    }]
 }

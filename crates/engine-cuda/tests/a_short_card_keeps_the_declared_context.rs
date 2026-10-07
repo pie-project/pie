@@ -59,7 +59,7 @@ fn a_short_card_keeps_the_declared_context() {
         return;
     };
     let sku = models::sku(SKU).expect("the catalog ships the SKU");
-    let trace = (sku.trace)(Platform::Cuda);
+    let trace = sku.trace(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
     let contract = sku
         .contract(&source, Platform::Cuda)

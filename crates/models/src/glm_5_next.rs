@@ -8,77 +8,60 @@ pub mod tokenizer;
 use model::Model;
 use poem_dsl::Dtype;
 
-pub fn skus() -> Vec<crate::Sku> {
-    crate::skus![
-        (
-            "glm53-flash-mtp",
-            1,
-            [Dtype::U8g64, Dtype::U2g64, Dtype::U4g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::flash_mtp(Dtype::U8g64, Dtype::U2g64, Dtype::U4g64, Dtype::Bf16),
-        ),
-        (
-            "glm53-flash-mini",
-            1,
-            [Dtype::U4g64, Dtype::U4g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::flash_mini(8, 32, Dtype::U4g64, Dtype::U4g64, Dtype::Bf16),
-        ),
-        (
-            "glm53-flash-mini",
-            2,
-            [Dtype::U4g64, Dtype::U4g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::flash_mini(8, 32, Dtype::U4g64, Dtype::U4g64, Dtype::Bf16),
-        ),
-        (
-            "glm53-flash",
-            1,
-            [Dtype::U8g64, Dtype::U2g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::flash(Dtype::U8g64, Dtype::U2g64, Dtype::Bf16),
-        ),
-        (
-            "glm53-flash-mtp-vision",
-            1,
-            [Dtype::U8g64, Dtype::U2g64, Dtype::U4g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT_VISION,
-            || { Model::flash_mtp_vision(Dtype::U8g64, Dtype::U2g64, Dtype::U4g64, Dtype::Bf16) },
-        ),
-        (
-            "glm53-flash-vision",
-            1,
-            [Dtype::U8g64, Dtype::U2g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT_VISION,
-            || Model::flash_vision(Dtype::U8g64, Dtype::U2g64, Dtype::Bf16),
-        ),
-        (
-            "glm53-flash-mtp-vision",
-            1,
-            [Dtype::U4g64, Dtype::U2g64, Dtype::U4g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT_VISION,
-            || { Model::flash_mtp_vision(Dtype::U4g64, Dtype::U2g64, Dtype::U4g64, Dtype::Bf16) },
-        ),
+pub fn entries() -> Vec<crate::catalog::Entry> {
+    use crate::catalog::{Drafter, Refused};
+    use Dtype::{Bf16, U2g64, U4g64, U8g64};
+    vec![
+        crate::entry! {
+            id: "glm53-flash",
+            fixture: false,
+            parts: [Vision],
+            drafters: [Mtp],
+            template: template::instruct,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: None,
+            build: |d| -> Model {
+                let vision = d.has(crate::catalog::Part::Vision);
+                match (&d.weights[..], d.drafter, vision) {
+                    ([w, experts], None, false) => Ok(Model::flash(*w, *experts, d.kv)),
+                    ([w, experts], None, true) => Ok(Model::flash_vision(*w, *experts, d.kv)),
+                    ([w, experts, mtp], Some(Drafter::Mtp), false) => {
+                        Ok(Model::flash_mtp(*w, *experts, *mtp, d.kv))
+                    }
+                    ([w, experts, mtp], Some(Drafter::Mtp), true) => {
+                        Ok(Model::flash_mtp_vision(*w, *experts, *mtp, d.kv))
+                    }
+                    _ => Err(Refused::unsupported("glm53-flash", d)),
+                }
+            },
+            rows: [
+                (0, "glm53-flash-mtp", 1, [U8g64, U2g64, U4g64], Bf16, [], Some(Drafter::Mtp)),
+                (3, "glm53-flash", 1, [U8g64, U2g64], Bf16, [], None),
+                (4, "glm53-flash-mtp-vision", 1, [U8g64, U2g64, U4g64], Bf16, [Vision], Some(Drafter::Mtp)),
+                (5, "glm53-flash-vision", 1, [U8g64, U2g64], Bf16, [Vision], None),
+                (6, "glm53-flash-mtp-vision", 1, [U4g64, U2g64, U4g64], Bf16, [Vision], Some(Drafter::Mtp)),
+            ],
+        },
+        crate::entry! {
+            id: "glm53-flash-mini",
+            fixture: true,
+            parts: [],
+            drafters: [],
+            template: template::instruct,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: None,
+            build: |d| -> Model {
+                match d.weights[..] {
+                    [w, experts] => Ok(Model::flash_mini(8, 32, w, experts, d.kv)),
+                    _ => Err(Refused::unsupported("glm53-flash-mini", d)),
+                }
+            },
+            rows: [
+                (1, "glm53-flash-mini", 1, [U4g64, U4g64], Bf16, [], None),
+                (2, "glm53-flash-mini", 2, [U4g64, U4g64], Bf16, [], None),
+            ],
+        },
     ]
 }

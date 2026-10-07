@@ -8,198 +8,168 @@ pub mod tokenizer;
 use model::Model;
 use poem_dsl::Dtype;
 
-pub fn skus() -> Vec<crate::Sku> {
-    crate::skus![
-        (
-            "gemma4-26b-a4b-dflash",
-            1,
-            [Dtype::U4g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::gemma4,
-            &tokenizer::CONTRACT,
-            || Model::a4b_dflash(Dtype::U4g64, Dtype::Bf16),
-        ),
-        (
-            "gemma4-26b-a4b-mtp",
-            1,
-            [Dtype::U4g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::gemma4,
-            &tokenizer::CONTRACT,
-            || Model::a4b_mtp(Dtype::U4g64, Dtype::Bf16),
-        ),
-        (
-            "gemma4-26b-a4b",
-            1,
-            [Dtype::U4g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::gemma4,
-            &tokenizer::CONTRACT,
-            || Model::a4b(Dtype::U4g64, Dtype::Bf16),
-        ),
-        (
-            "gemma4-31b-mtp",
-            1,
-            [Dtype::U4g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::gemma4,
-            &tokenizer::CONTRACT,
-            || Model::b31_mtp(Dtype::U4g64, Dtype::Bf16),
-        ),
-        (
-            "gemma4-31b",
-            1,
-            [Dtype::U4g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::gemma4,
-            &tokenizer::CONTRACT,
-            || Model::b31(Dtype::U4g64, Dtype::Bf16),
-        ),
-        (
-            "gemma4-31b",
-            2,
-            [Dtype::U4g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::gemma4,
-            &tokenizer::CONTRACT,
-            || Model::b31(Dtype::U4g64, Dtype::Bf16),
-        ),
-        (
-            "gemma4-e4b-eagle",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::gemma4,
-            &tokenizer::CONTRACT,
-            || Model::e4b_eagle(Dtype::Bf16, Dtype::Bf16),
-        ),
-        (
-            "gemma4-e4b",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::gemma4,
-            &tokenizer::CONTRACT,
-            || Model::e4b(Dtype::Bf16, Dtype::Bf16),
-        ),
-        (
-            "gemma4-e4b",
-            2,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::gemma4,
-            &tokenizer::CONTRACT,
-            || Model::e4b(Dtype::Bf16, Dtype::Bf16),
-        ),
-        (
-            "gemma4-31b",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::gemma4,
-            &tokenizer::CONTRACT,
-            || Model::b31(Dtype::Bf16, Dtype::Bf16),
-        ),
-        (
-            "gemma4-31b",
-            2,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::gemma4,
-            &tokenizer::CONTRACT,
-            || Model::b31(Dtype::Bf16, Dtype::Bf16),
-        ),
-        (
-            "gemma4-e4b-mini-l1",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::gemma4,
-            &tokenizer::CONTRACT,
-            || Model::e4b_mini(1, Dtype::Bf16, Dtype::Bf16),
-        ),
-        (
-            "gemma4-e4b-mini-l6",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::gemma4,
-            &tokenizer::CONTRACT,
-            || Model::e4b_mini(6, Dtype::Bf16, Dtype::Bf16),
-        ),
-        (
-            "gemma4-e4b-mini-l24",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::gemma4,
-            &tokenizer::CONTRACT,
-            || Model::e4b_mini(24, Dtype::Bf16, Dtype::Bf16),
-        ),
-        (
-            "gemma4-e4b-mini-l30",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::gemma4,
-            &tokenizer::CONTRACT,
-            || Model::e4b_mini(30, Dtype::Bf16, Dtype::Bf16),
-        ),
-        (
-            "gemma4-e4b-mini-l36",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::gemma4,
-            &tokenizer::CONTRACT,
-            || Model::e4b_mini(36, Dtype::Bf16, Dtype::Bf16),
-        ),
-        (
-            "gemma4-e4b-vision",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::gemma4,
-            &tokenizer::CONTRACT_VISION,
-            || Model::e4b_vision(Dtype::Bf16, Dtype::Bf16),
-        ),
-        (
-            "gemma4-26b-a4b-vision",
-            1,
-            [Dtype::U4g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::gemma4,
-            &tokenizer::CONTRACT_VISION,
-            || Model::a4b_vision(Dtype::U4g64, Dtype::Bf16),
-        ),
-        (
-            "gemma4-31b-vision",
-            1,
-            [Dtype::U4g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::gemma4,
-            &tokenizer::CONTRACT_VISION,
-            || Model::b31_vision(Dtype::U4g64, Dtype::Bf16),
-        ),
+pub fn entries() -> Vec<crate::catalog::Entry> {
+    use crate::catalog::{Drafter, Part, Refused};
+    use Dtype::{Bf16, U4g64};
+    vec![
+        crate::entry! {
+            id: "gemma4-26b-a4b",
+            fixture: false,
+            parts: [Vision],
+            drafters: [Mtp, DFlash],
+            template: template::gemma4,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: None,
+            build: |d| -> Model {
+                let w = d.dtype()?;
+                match (d.has(Part::Vision), d.drafter) {
+                    (false, None) => Ok(Model::a4b(w, d.kv)),
+                    (false, Some(Drafter::Mtp)) => Ok(Model::a4b_mtp(w, d.kv)),
+                    (false, Some(Drafter::DFlash)) => Ok(Model::a4b_dflash(w, d.kv)),
+                    (true, None) => Ok(Model::a4b_vision(w, d.kv)),
+                    _ => Err(Refused::unsupported("gemma4-26b-a4b", d)),
+                }
+            },
+            rows: [
+                (0, "gemma4-26b-a4b-dflash", 1, [U4g64], Bf16, [], Some(Drafter::DFlash)),
+                (1, "gemma4-26b-a4b-mtp", 1, [U4g64], Bf16, [], Some(Drafter::Mtp)),
+                (2, "gemma4-26b-a4b", 1, [U4g64], Bf16, [], None),
+                (17, "gemma4-26b-a4b-vision", 1, [U4g64], Bf16, [Vision], None),
+            ],
+        },
+        crate::entry! {
+            id: "gemma4-31b",
+            fixture: false,
+            parts: [Vision],
+            drafters: [Mtp],
+            template: template::gemma4,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: None,
+            build: |d| -> Model {
+                let w = d.dtype()?;
+                match (d.has(Part::Vision), d.drafter) {
+                    (false, None) => Ok(Model::b31(w, d.kv)),
+                    (false, Some(Drafter::Mtp)) => Ok(Model::b31_mtp(w, d.kv)),
+                    (true, None) => Ok(Model::b31_vision(w, d.kv)),
+                    _ => Err(Refused::unsupported("gemma4-31b", d)),
+                }
+            },
+            rows: [
+                (3, "gemma4-31b-mtp", 1, [U4g64], Bf16, [], Some(Drafter::Mtp)),
+                (4, "gemma4-31b", 1, [U4g64], Bf16, [], None),
+                (5, "gemma4-31b", 2, [U4g64], Bf16, [], None),
+                (9, "gemma4-31b", 1, [Bf16], Bf16, [], None),
+                (10, "gemma4-31b", 2, [Bf16], Bf16, [], None),
+                (18, "gemma4-31b-vision", 1, [U4g64], Bf16, [Vision], None),
+            ],
+        },
+        crate::entry! {
+            id: "gemma4-e4b",
+            fixture: false,
+            parts: [Vision],
+            drafters: [Eagle],
+            template: template::gemma4,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: None,
+            build: |d| -> Model {
+                let w = d.dtype()?;
+                match (d.has(Part::Vision), d.drafter) {
+                    (false, None) => Ok(Model::e4b(w, d.kv)),
+                    (false, Some(Drafter::Eagle)) => Ok(Model::e4b_eagle(w, d.kv)),
+                    (true, None) => Ok(Model::e4b_vision(w, d.kv)),
+                    _ => Err(Refused::unsupported("gemma4-e4b", d)),
+                }
+            },
+            rows: [
+                (6, "gemma4-e4b-eagle", 1, [Bf16], Bf16, [], Some(Drafter::Eagle)),
+                (7, "gemma4-e4b", 1, [Bf16], Bf16, [], None),
+                (8, "gemma4-e4b", 2, [Bf16], Bf16, [], None),
+                (16, "gemma4-e4b-vision", 1, [Bf16], Bf16, [Vision], None),
+            ],
+        },
+        crate::entry! {
+            id: "gemma4-e4b-mini-l1",
+            fixture: true,
+            parts: [],
+            drafters: [],
+            template: template::gemma4,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: None,
+            build: |d| -> Model {
+                Ok(Model::e4b_mini(1, d.dtype()?, d.kv))
+            },
+            rows: [
+                (11, "gemma4-e4b-mini-l1", 1, [Bf16], Bf16, [], None),
+            ],
+        },
+        crate::entry! {
+            id: "gemma4-e4b-mini-l6",
+            fixture: true,
+            parts: [],
+            drafters: [],
+            template: template::gemma4,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: None,
+            build: |d| -> Model {
+                Ok(Model::e4b_mini(6, d.dtype()?, d.kv))
+            },
+            rows: [
+                (12, "gemma4-e4b-mini-l6", 1, [Bf16], Bf16, [], None),
+            ],
+        },
+        crate::entry! {
+            id: "gemma4-e4b-mini-l24",
+            fixture: true,
+            parts: [],
+            drafters: [],
+            template: template::gemma4,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: None,
+            build: |d| -> Model {
+                Ok(Model::e4b_mini(24, d.dtype()?, d.kv))
+            },
+            rows: [
+                (13, "gemma4-e4b-mini-l24", 1, [Bf16], Bf16, [], None),
+            ],
+        },
+        crate::entry! {
+            id: "gemma4-e4b-mini-l30",
+            fixture: true,
+            parts: [],
+            drafters: [],
+            template: template::gemma4,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: None,
+            build: |d| -> Model {
+                Ok(Model::e4b_mini(30, d.dtype()?, d.kv))
+            },
+            rows: [
+                (14, "gemma4-e4b-mini-l30", 1, [Bf16], Bf16, [], None),
+            ],
+        },
+        crate::entry! {
+            id: "gemma4-e4b-mini-l36",
+            fixture: true,
+            parts: [],
+            drafters: [],
+            template: template::gemma4,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: None,
+            build: |d| -> Model {
+                Ok(Model::e4b_mini(36, d.dtype()?, d.kv))
+            },
+            rows: [
+                (15, "gemma4-e4b-mini-l36", 1, [Bf16], Bf16, [], None),
+            ],
+        },
     ]
 }
 
@@ -212,7 +182,7 @@ mod tests {
     #[test]
     fn a_u4_trunk_projection_decodes_on_the_tiled_arm() {
         let sku = crate::sku("gemma4-31b-u4g64-kv-bf16").expect("the 31b u4 row ships");
-        let trace = (sku.trace)(Platform::Cuda);
+        let trace = sku.trace(Platform::Cuda);
         let mut row_major = Vec::new();
         for node in &trace.nodes {
             let Operation::Linear(Linear::Matmul { w, .. }) = &node.op else {

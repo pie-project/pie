@@ -30,7 +30,7 @@ fn decode_step_time_by_batch_width() {
     let context = 1024;
     let _device = engine_xla::bench::lock_device();
     let mut shell = Shell::load(Boot {
-        trace: (sku.trace)(Platform::Xla),
+        trace: sku.trace(Platform::Xla),
         contract: &m.contract,
         checkpoint: &m.checkpoint,
         budget: Budget::new(most, 2048),

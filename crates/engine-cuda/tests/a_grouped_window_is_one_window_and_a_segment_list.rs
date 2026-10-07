@@ -42,8 +42,7 @@ fn arms() -> (DeviceProfile, DeviceProfile) {
 fn sku() -> (Trace, CompiledModel, CompiledModel) {
     let trace = models::sku(SKU)
         .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"))
-        .trace;
-    let trace = trace(Platform::Cuda);
+        .trace(Platform::Cuda);
     let (split, grouped) = arms();
     let split = compile(&trace, &budget(), &split).expect("the split arm bakes");
     let grouped = compile(&trace, &budget(), &grouped).expect("the grouped arm bakes");

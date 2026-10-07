@@ -9,57 +9,44 @@ use poem_dsl::Dtype;
 
 pub const ARCH: &str = "wan_2";
 
-pub fn skus() -> Vec<crate::Sku> {
-    let mut rows = crate::skus![
-        (
-            "wan22-ti2v-5b",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::ti2v_5b(Dtype::Bf16),
-        ),
-        (
-            "wan22-ti2v-5b",
-            1,
-            [Dtype::U4g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::ti2v_5b(Dtype::U4g64),
-        ),
-        (
-            "wan22-mini-d128",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::mini_d128(Dtype::Bf16),
-        ),
-        (
-            "wan22-mini-nano",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::mini_nano(Dtype::Bf16),
-        ),
-    ];
-    for row in &mut rows {
-        let model = match row.recipe.text {
-            "wan22-ti2v-5b" => Model::ti2v_5b(Dtype::Bf16),
-            "wan22-mini-d128" => Model::mini_d128(Dtype::Bf16),
-            "wan22-mini-nano" => Model::mini_nano(Dtype::Bf16),
-            other => unreachable!("no wan_2 row is called `{other}`"),
-        };
-        row.generative = Some(model.generative());
-    }
-    rows
+pub fn entries() -> Vec<crate::catalog::Entry> {
+    use Dtype::{Bf16, U4g64};
+    vec![
+        crate::entry! {
+            id: "wan22-ti2v-5b",
+            fixture: false,
+            parts: [],
+            drafters: [],
+            template: template::instruct,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: Some(Model::generative),
+            build: |d| -> Model { Ok(Model::ti2v_5b(d.dtype()?)) },
+            rows: [(0, "wan22-ti2v-5b", 1, [Bf16], Bf16, [], None), (1, "wan22-ti2v-5b", 1, [U4g64], Bf16, [], None)],
+        },
+        crate::entry! {
+            id: "wan22-mini-d128",
+            fixture: true,
+            parts: [],
+            drafters: [],
+            template: template::instruct,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: Some(Model::generative),
+            build: |d| -> Model { Ok(Model::mini_d128(d.dtype()?)) },
+            rows: [(2, "wan22-mini-d128", 1, [Bf16], Bf16, [], None)],
+        },
+        crate::entry! {
+            id: "wan22-mini-nano",
+            fixture: true,
+            parts: [],
+            drafters: [],
+            template: template::instruct,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: Some(Model::generative),
+            build: |d| -> Model { Ok(Model::mini_nano(d.dtype()?)) },
+            rows: [(3, "wan22-mini-nano", 1, [Bf16], Bf16, [], None)],
+        },
+    ]
 }

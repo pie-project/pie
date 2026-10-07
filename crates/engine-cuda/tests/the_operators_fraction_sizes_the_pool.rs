@@ -105,9 +105,9 @@ fn a_sliding_row_holds_its_window_and_not_the_context() {
     // 901120 bytes a token: 31373393920 for one sequence at 34816 cells.
     const GLOBAL: u64 = 10 * 2 * 4 * 512 * 2;
     const SLIDING: u64 = 50 * 2 * 16 * 256 * 2;
-    let trace = (models::sku("gemma4-31b-u4g64-kv-bf16")
+    let trace = models::sku("gemma4-31b-u4g64-kv-bf16")
         .expect("the catalog ships gemma-4-31b")
-        .trace)(poem_dsl::Platform::Cuda);
+        .trace(poem_dsl::Platform::Cuda);
     let window = window_of(&trace).expect("every sliding read looks through the window");
     assert_eq!(window, Some(1024));
     let at = |context: u32| {

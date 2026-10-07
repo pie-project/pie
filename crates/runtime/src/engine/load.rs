@@ -12,7 +12,7 @@ pub use poem_ir::{Platform, Trace};
 
 pub fn trace(sku: &str, platform: Platform) -> Result<Trace> {
     let sku = models::sku(sku).ok_or_else(|| anyhow!("{}", no_such_sku(sku)))?;
-    Ok((sku.trace)(platform))
+    Ok(sku.trace(platform))
 }
 
 pub fn classify(sku: &str) -> Result<models::ClassifyFn> {
@@ -156,7 +156,7 @@ pub fn verify_artifact(artifact: &Path, platform: Platform) -> Result<&'static s
             no_such_sku(&stamp.sku)
         )
     })?;
-    let trace = (sku.trace)(platform);
+    let trace = sku.trace(platform);
     let source = open_source(artifact)?;
     let metadata = checkpoint_metadata(artifact)?;
     let contract = checkpoint_dsl::own_contract(&source, &trace.params, sku.recipe.tp, platform)

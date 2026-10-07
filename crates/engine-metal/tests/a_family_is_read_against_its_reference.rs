@@ -65,7 +65,7 @@ fn every_probe_is_dumped() {
                 .expect("the artifact reads")
                 .expect("the artifact carries a serving stamp");
             let sku = models::sku(&stamp.sku).unwrap_or_else(|| panic!("no SKU {}", stamp.sku));
-            let trace = (sku.trace)(Platform::Metal);
+            let trace = sku.trace(Platform::Metal);
             let source = ztensor_compat::index(&artifact).expect("the artifact opens");
             let contract = checkpoint_dsl::own_contract(
                 &source,
@@ -105,7 +105,7 @@ fn every_probe_is_dumped() {
             return;
         }
     };
-    let trace = (sku.trace)(Platform::Metal);
+    let trace = sku.trace(Platform::Metal);
     let word = |query_len: u32| (sku.classify)(&Request::new(query_len, false));
 
     let booted = Instant::now();

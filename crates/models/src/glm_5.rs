@@ -7,27 +7,18 @@ pub mod tokenizer;
 use model::Model;
 use poem_dsl::Dtype;
 
-pub fn skus() -> Vec<crate::Sku> {
-    crate::skus![
-        (
-            "glm5-a12b",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::a12b(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16),
-        ),
-        (
-            "glm5-a12b",
-            2,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::a12b(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16),
-        ),
-    ]
+pub fn entries() -> Vec<crate::catalog::Entry> {
+    use Dtype::Bf16;
+    vec![crate::entry! {
+        id: "glm5-a12b",
+        fixture: false,
+        parts: [],
+        drafters: [],
+        template: template::instruct,
+        tokenizer: &tokenizer::CONTRACT,
+        diffusion: None,
+        generative: None,
+        build: |d| -> Model { let w = d.dtype()?; Ok(Model::a12b(w, w, d.kv)) },
+        rows: [(0, "glm5-a12b", 1, [Bf16], Bf16, [], None), (1, "glm5-a12b", 2, [Bf16], Bf16, [], None)],
+    }]
 }

@@ -27,7 +27,7 @@ fn row(sku: &str) -> &'static models::Sku {
 }
 
 fn trace(sku: &str, platform: Platform) -> Trace {
-    (row(sku).trace)(platform)
+    row(sku).trace(platform)
 }
 
 fn dims(sku: &str) -> Dims {

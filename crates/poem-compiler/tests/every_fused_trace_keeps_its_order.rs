@@ -8,7 +8,7 @@ fn every_fused_trace_keeps_its_order() {
     let mut broken = Vec::new();
     for sku in models::skus() {
         for platform in [Platform::Cuda, Platform::Metal] {
-            let fused = poem_compiler::fuse::fuse((sku.trace)(platform), &kernels);
+            let fused = poem_compiler::fuse::fuse(sku.trace(platform), &kernels);
             let Err(faults) = poem_ir::check(&fused) else {
                 continue;
             };
@@ -38,7 +38,7 @@ fn every_fused_trace_keeps_its_order() {
 #[test]
 fn gemma_4_writes_its_kv_through_the_fused_kernel() {
     let sku = models::sku("gemma4-31b-bf16-kv-bf16").expect("the catalog states gemma4-31b");
-    let trace = (sku.trace)(Platform::Cuda);
+    let trace = sku.trace(Platform::Cuda);
     let count = |t: &poem_ir::Trace, op: &str| {
         t.nodes
             .iter()

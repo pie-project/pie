@@ -33,7 +33,7 @@ fn a_prompt_stated_ahead_of_its_rows_reads_what_it_reads_at_them() {
         eprintln!("not asked: set PIE_XLA_ARTIFACT or PIE_XLA_SNAPSHOT + PIE_XLA_SKU");
         return;
     };
-    let trace = (m.sku.trace)(Platform::Xla);
+    let trace = m.sku.trace(Platform::Xla);
     let classify = m.sku.classify;
     let word = |len: u32| classify(&Request::new(len, false));
     let prompt =

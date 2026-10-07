@@ -9,56 +9,36 @@ use poem_dsl::Dtype;
 
 pub const ARCH: &str = "minimax_h3";
 
-pub fn skus() -> Vec<crate::Sku> {
-    let mut rows = crate::skus![
-        (
-            "minimax-h3-fl2va",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::fl2va(Dtype::Bf16),
-        ),
-        (
-            "minimax-h3-fl2va",
-            2,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::fl2va(Dtype::Bf16),
-        ),
-        (
-            "minimax-h3-fl2va",
-            4,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::fl2va(Dtype::Bf16),
-        ),
-        (
-            "minimax-h3-mini",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::mini(Dtype::Bf16),
-        ),
-    ];
-    for row in &mut rows {
-        let model = match row.recipe.text {
-            "minimax-h3-fl2va" => Model::fl2va(Dtype::Bf16),
-            "minimax-h3-mini" => Model::mini(Dtype::Bf16),
-            other => unreachable!("no minimax_h3 row is called `{other}`"),
-        };
-        row.generative = Some(model.generative());
-    }
-    rows
+pub fn entries() -> Vec<crate::catalog::Entry> {
+    use Dtype::Bf16;
+    vec![
+        crate::entry! {
+            id: "minimax-h3-fl2va",
+            fixture: false,
+            parts: [],
+            drafters: [],
+            template: template::instruct,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: Some(Model::generative),
+            build: |d| -> Model { Ok(Model::fl2va(d.dtype()?)) },
+            rows: [
+                (0, "minimax-h3-fl2va", 1, [Bf16], Bf16, [], None),
+                (1, "minimax-h3-fl2va", 2, [Bf16], Bf16, [], None),
+                (2, "minimax-h3-fl2va", 4, [Bf16], Bf16, [], None),
+            ],
+        },
+        crate::entry! {
+            id: "minimax-h3-mini",
+            fixture: true,
+            parts: [],
+            drafters: [],
+            template: template::instruct,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: Some(Model::generative),
+            build: |d| -> Model { Ok(Model::mini(d.dtype()?)) },
+            rows: [(3, "minimax-h3-mini", 1, [Bf16], Bf16, [], None)],
+        },
+    ]
 }

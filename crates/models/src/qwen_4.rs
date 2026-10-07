@@ -9,77 +9,60 @@ use crate::qwen_3::{template, tokenizer};
 
 pub const ARCH: &str = "qwen4_exp";
 
-pub fn skus() -> Vec<crate::Sku> {
-    crate::skus![
-        (
-            "qwen38-flash-next",
-            1,
-            [Dtype::U4g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::chatml_interleaved,
-            &tokenizer::CONTRACT_38,
-            || Model::flash(Dtype::U4g64, Dtype::Bf16),
-        ),
-        (
-            "qwen38-flash-next-full-mtp",
-            1,
-            [Dtype::U4g64, Dtype::U2g128],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::chatml_interleaved,
-            &tokenizer::CONTRACT_38,
-            || Model::flash_mix_mtp(Mix::MIXED_2BIT, Dtype::Bf16),
-        ),
-        (
-            "qwen38-flash-next-full",
-            1,
-            [Dtype::U4g64, Dtype::U2g128],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::chatml_interleaved,
-            &tokenizer::CONTRACT_38,
-            || Model::flash_mix(Mix::MIXED_2BIT, Dtype::Bf16),
-        ),
-        (
-            "qwen38-flash-next",
-            1,
-            [Dtype::U4g64, Dtype::U2g128],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::chatml_interleaved,
-            &tokenizer::CONTRACT_38,
-            || Model::flash_mini(Mix::MIXED_2BIT, Dtype::Bf16),
-        ),
-        (
-            "qwen38-flash-next",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::chatml_interleaved,
-            &tokenizer::CONTRACT_38,
-            || Model::flash(Dtype::Bf16, Dtype::Bf16),
-        ),
-        (
-            "qwen38-flash-next-full-mtp-vision",
-            1,
-            [Dtype::U4g64, Dtype::U2g128],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::chatml_interleaved,
-            &tokenizer::CONTRACT_38_VISION,
-            || Model::flash_mix_mtp_vision(Mix::MIXED_2BIT, Dtype::Bf16),
-        ),
-        (
-            "qwen38-flash-next-full-vision",
-            1,
-            [Dtype::U4g64, Dtype::U2g128],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::chatml_interleaved,
-            &tokenizer::CONTRACT_38_VISION,
-            || Model::flash_mix_vision(Mix::MIXED_2BIT, Dtype::Bf16),
-        ),
+pub fn entries() -> Vec<crate::catalog::Entry> {
+    use crate::catalog::{Drafter, Part, Refused};
+    use Dtype::{Bf16, U2g128, U4g64};
+    vec![
+        crate::entry! {
+            id: "qwen38-flash-next",
+            fixture: false,
+            parts: [Vision],
+            drafters: [Mtp],
+            template: template::chatml_interleaved,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: None,
+            build: |d| -> Model {
+                let vision = d.has(Part::Vision);
+                let mtp = d.drafts_with(Drafter::Mtp);
+                match (&d.weights[..], vision, mtp, d.drafter) {
+                    ([w], false, false, None) => Ok(Model::flash(*w, d.kv)),
+                    ([U4g64, U2g128], false, false, None) => Ok(Model::flash_mix(Mix::MIXED_2BIT, d.kv)),
+                    ([U4g64, U2g128], false, true, _) => Ok(Model::flash_mix_mtp(Mix::MIXED_2BIT, d.kv)),
+                    ([U4g64, U2g128], true, false, None) => {
+                        Ok(Model::flash_mix_vision(Mix::MIXED_2BIT, d.kv))
+                    }
+                    ([U4g64, U2g128], true, true, _) => {
+                        Ok(Model::flash_mix_mtp_vision(Mix::MIXED_2BIT, d.kv))
+                    }
+                    _ => Err(Refused::unsupported("qwen38-flash-next", d)),
+                }
+            },
+            rows: [
+                (0, "qwen38-flash-next", 1, [U4g64], Bf16, [], None),
+                (1, "qwen38-flash-next-full-mtp", 1, [U4g64, U2g128], Bf16, [], Some(Drafter::Mtp)),
+                (2, "qwen38-flash-next-full", 1, [U4g64, U2g128], Bf16, [], None),
+                (4, "qwen38-flash-next", 1, [Bf16], Bf16, [], None),
+                (5, "qwen38-flash-next-full-mtp-vision", 1, [U4g64, U2g128], Bf16, [Vision], Some(Drafter::Mtp)),
+                (6, "qwen38-flash-next-full-vision", 1, [U4g64, U2g128], Bf16, [Vision], None),
+            ],
+        },
+        crate::entry! {
+            id: "qwen38-flash-next-mini",
+            fixture: true,
+            parts: [],
+            drafters: [],
+            template: template::chatml_interleaved,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: None,
+            build: |d| -> Model {
+                match d.weights[..] {
+                    [U4g64, U2g128] => Ok(Model::flash_mini(Mix::MIXED_2BIT, d.kv)),
+                    _ => Err(Refused::unsupported("qwen38-flash-next-mini", d)),
+                }
+            },
+            rows: [(3, "qwen38-flash-next", 1, [U4g64, U2g128], Bf16, [], None)],
+        },
     ]
 }

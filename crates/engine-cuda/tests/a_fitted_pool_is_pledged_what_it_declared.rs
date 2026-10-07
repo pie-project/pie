@@ -81,7 +81,7 @@ fn a_fitted_pool_is_pledged_what_it_declared() {
         return;
     };
     let sku = models::sku(SKU).expect("the catalog ships the SKU");
-    let trace = (sku.trace)(Platform::Cuda);
+    let trace = sku.trace(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
     let contract = sku
         .contract(&source, Platform::Cuda)

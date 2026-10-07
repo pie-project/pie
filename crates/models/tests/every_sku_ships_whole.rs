@@ -133,7 +133,7 @@ fn the_block_drafters_plan_is_whole() {
         .find(|row| row.recipe.text == "qwen36-27b-dflash")
         .expect("this build ships the block-drafter row");
     for platform in [Platform::Metal, Platform::Cuda] {
-        let trace = (row.trace)(platform);
+        let trace = row.trace(platform);
         assert!(
             !trace.nodes.is_empty(),
             "{platform:?}: the drafter's plan is empty"
@@ -152,7 +152,7 @@ fn the_dflash2_plan_is_whole_and_convolves() {
         .find(|row| row.recipe.text == "qwen38-27b-dflash2")
         .expect("this build ships the DFlash2 row");
     for platform in [Platform::Metal, Platform::Cuda] {
-        let trace = (row.trace)(platform);
+        let trace = row.trace(platform);
         let convs = trace
             .nodes
             .iter()
@@ -210,7 +210,7 @@ fn the_v1_text_states_a_bidirectional_block_of_sixteen() {
     let row = models::skus()
         .find(|row| row.recipe.text == "qwen36-27b-dflash")
         .expect("this build ships the block-drafter row");
-    let trace = (row.trace)(Platform::Metal);
+    let trace = row.trace(Platform::Metal);
     let facts = trace.drafter.expect("the v1 text states its block drafter");
     assert_eq!(
         (facts.rows, facts.mask_token, facts.bidirectional),
@@ -219,7 +219,8 @@ fn the_v1_text_states_a_bidirectional_block_of_sixteen() {
     let a3b = models::skus()
         .find(|row| row.recipe.text == "qwen36-35b-a3b-dflash")
         .expect("this build ships the A3B block-drafter row");
-    let facts = (a3b.trace)(Platform::Metal)
+    let facts = a3b
+        .trace(Platform::Metal)
         .drafter
         .expect("the A3B text states its block drafter");
     assert_eq!(
@@ -236,7 +237,7 @@ fn the_v1_text_states_a_bidirectional_block_of_sixteen() {
             row.recipe.text == "qwen38-27b" && row.recipe.weights.contains(&poem_dsl::Dtype::U4g64)
         })
         .expect("the plain row");
-    assert!((plain.trace)(Platform::Metal).drafter.is_none());
+    assert!(plain.trace(Platform::Metal).drafter.is_none());
 }
 
 fn the_dspark_plan_is_whole_and_walks_a_bigram() {
@@ -244,7 +245,7 @@ fn the_dspark_plan_is_whole_and_walks_a_bigram() {
     let row = models::skus()
         .find(|row| row.recipe.text == "qwen38-27b-dspark")
         .expect("this build ships the DSpark row");
-    let trace = (row.trace)(Platform::Metal);
+    let trace = row.trace(Platform::Metal);
     let count = |pred: &dyn Fn(&poem_dsl::Operation) -> bool| {
         trace.nodes.iter().filter(|n| pred(&n.op)).count()
     };
@@ -297,7 +298,7 @@ fn gemma_carries_the_block_drafter_too() {
     let row = models::skus()
         .find(|row| row.recipe.text == "gemma4-26b-a4b-dflash")
         .expect("this build ships gemma's DFlash row");
-    let trace = (row.trace)(Platform::Metal);
+    let trace = row.trace(Platform::Metal);
     let facts = trace
         .drafter
         .expect("gemma's text states its block drafter");
@@ -327,7 +328,7 @@ fn gemma_carries_the_block_drafter_too() {
     let plain = models::skus()
         .find(|row| row.recipe.text == "gemma4-26b-a4b")
         .expect("the plain row");
-    assert!((plain.trace)(Platform::Metal).drafter.is_none());
+    assert!(plain.trace(Platform::Metal).drafter.is_none());
 }
 
 fn gpt_oss_carries_the_block_drafter_too() {
@@ -335,7 +336,7 @@ fn gpt_oss_carries_the_block_drafter_too() {
     let row = models::skus()
         .find(|row| row.recipe.text == "gptoss-20b-dflash")
         .expect("this build ships gpt-oss's DFlash row");
-    let trace = (row.trace)(Platform::Metal);
+    let trace = row.trace(Platform::Metal);
     let facts = trace
         .drafter
         .expect("gpt-oss's text states its block drafter");

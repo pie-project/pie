@@ -236,7 +236,7 @@ mod tests {
     /// exports in seam order and the query heads of the first one's rectangle.
     fn exported(sku: &str) -> (Vec<ValueId>, u32) {
         let row = models::sku(sku).unwrap_or_else(|| panic!("{sku} is in the catalog"));
-        let trace = (row.trace)(poem_ir::Platform::Cuda);
+        let trace = row.trace(poem_ir::Platform::Cuda);
         let exports: Vec<ValueId> = trace
             .seams
             .iter()

@@ -22,7 +22,7 @@ fn trace(platform: Platform) -> Trace {
         let names: Vec<&str> = models::skus().map(|row| row.name.as_str()).collect();
         panic!("this build ships no `{SKU}`; rows are {names:#?}")
     });
-    (row.trace)(platform)
+    row.trace(platform)
 }
 
 #[test]

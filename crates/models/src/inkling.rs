@@ -7,27 +7,32 @@ pub mod tokenizer;
 use model::Model;
 use poem_dsl::Dtype;
 
-pub fn skus() -> Vec<crate::Sku> {
-    crate::skus![
-        (
-            "inkling",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::inkling,
-            &tokenizer::CONTRACT,
-            || Model::full(Dtype::Bf16, Dtype::Bf16),
-        ),
-        (
-            "inkling-mini-l7-e8",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::inkling,
-            &tokenizer::CONTRACT,
-            || Model::mini(7, 8, Dtype::Bf16, Dtype::Bf16),
-        ),
+pub fn entries() -> Vec<crate::catalog::Entry> {
+    use Dtype::Bf16;
+    vec![
+        crate::entry! {
+            id: "inkling",
+            fixture: false,
+            parts: [],
+            drafters: [],
+            template: template::inkling,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: None,
+            build: |d| -> Model { Ok(Model::full(d.dtype()?, d.kv)) },
+            rows: [(0, "inkling", 1, [Bf16], Bf16, [], None)],
+        },
+        crate::entry! {
+            id: "inkling-mini-l7-e8",
+            fixture: true,
+            parts: [],
+            drafters: [],
+            template: template::inkling,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: None,
+            build: |d| -> Model { Ok(Model::mini(7, 8, d.dtype()?, d.kv)) },
+            rows: [(1, "inkling-mini-l7-e8", 1, [Bf16], Bf16, [], None)],
+        },
     ]
 }

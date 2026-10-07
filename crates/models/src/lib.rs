@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod catalog;
 pub mod deepseek_v4;
 pub mod drafter;
 pub mod flux_2;
@@ -61,14 +62,14 @@ pub fn word(dtype: Dtype) -> String {
     format!("{dtype:?}").to_lowercase()
 }
 
+/// A catalog row: one deployment of one model, under the name it is served by.
 pub struct Sku {
     pub name: String,
     pub recipe: Recipe,
-    pub trace: poem_dsl::TraceFn,
+    pub entry: &'static catalog::Entry,
+    pub deploy: catalog::Deploy,
     pub classify: ClassifyFn,
-    pub import: ImportFn,
-    pub template:
-        fn(std::sync::Arc<::tokenizer::Tokenizer>) -> std::sync::Arc<dyn template::Instruct>,
+    pub template: catalog::TemplateFn,
     pub tokenizer: &'static tokenizer::Contract,
     pub diffusion: Option<Diffusion>,
     pub generative: Option<Generative>,
@@ -197,50 +198,35 @@ pub struct Diffusion {
 }
 
 impl Sku {
+    fn of(entry: &'static catalog::Entry, recipe: Recipe, deploy: catalog::Deploy) -> Sku {
+        Sku {
+            name: recipe.name(),
+            recipe,
+            entry,
+            classify: entry.classify,
+            template: entry.template,
+            tokenizer: entry.tokenizer,
+            diffusion: (entry.diffusion)(&deploy),
+            generative: (entry.generative)(&deploy),
+            deploy,
+        }
+    }
+
+    /// The trace each of the row's ranks runs.
+    #[must_use]
+    pub fn trace(&self, platform: Platform) -> poem_ir::Trace {
+        (self.entry.trace)(&self.name, &self.deploy, platform)
+            .map(|trace| split(&self.recipe, trace))
+            .unwrap_or_else(|why| panic!("`{}` does not build: {why}", self.name))
+    }
+
     pub fn contract(
         &self,
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, checkpoint_dsl::Error> {
-        (self.import)(src, self.recipe.tp, platform)
+        (self.entry.import)(&self.deploy, src, platform)
     }
-}
-
-pub type ImportFn =
-    fn(&ztensor::Source, u32, Platform) -> Result<ModelContract, checkpoint_dsl::Error>;
-
-/// Catalog rows. A model is written at its whole size; a row's trace is the
-/// one each of its `tp` ranks runs, split by the compiler.
-#[macro_export]
-macro_rules! skus {
-    ($( ($text:literal, $tp:literal, [$($w:expr),+ $(,)?], $kv:expr, $trace:path, $template:expr, $tokenizer:expr, $m:expr $(,)?) ),+ $(,)?) => {
-        vec![ $( {
-            const RECIPE: $crate::Recipe = $crate::Recipe {
-                text: $text,
-                weights: &[$($w),+],
-                kv: $kv,
-                tp: $tp,
-            };
-            $crate::Sku {
-                name: RECIPE.name(),
-                recipe: RECIPE,
-                trace: |platform: $crate::Platform| {
-                    $crate::split(&RECIPE, $trace(&RECIPE.name(), &($m)(), platform))
-                },
-                classify: |request: &$crate::Request| {
-                    poem_dsl::word_of(|| ($m)(), request)
-                },
-                import: |src: &ztensor::Source, tp: u32, platform: $crate::Platform| {
-                    $crate::whole(tp)?;
-                    ($m)().import(src, platform)
-                },
-                template: $template,
-                tokenizer: $tokenizer,
-                diffusion: None,
-                generative: None,
-            }
-        } ),+ ]
-    };
 }
 
 /// The trace one of `recipe`'s ranks runs.
@@ -269,30 +255,53 @@ pub fn whole(tp: u32) -> Result<(), checkpoint_dsl::Error> {
     })
 }
 
-static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
-    [
-        deepseek_v4::skus(),
-        flux_2::skus(),
-        gemma_4::skus(),
-        gemma_4_diffusion::skus(),
-        glm_5::skus(),
-        glm_5_next::skus(),
-        gpt_oss::skus(),
-        hunyuan_image_3::skus(),
-        inkling::skus(),
-        kimi_k3::skus(),
-        muse_glimmer::skus(),
-        qwen_3::skus(),
-        qwen_4::skus(),
-        z_image::skus(),
-        wan_2::skus(),
-        minimax_h3::skus(),
-        ltx_2::skus(),
-        mini_dit::skus(),
+static FAMILIES: LazyLock<Vec<Vec<catalog::Entry>>> = LazyLock::new(|| {
+    vec![
+        deepseek_v4::entries(),
+        flux_2::entries(),
+        gemma_4::entries(),
+        gemma_4_diffusion::entries(),
+        glm_5::entries(),
+        glm_5_next::entries(),
+        gpt_oss::entries(),
+        hunyuan_image_3::entries(),
+        inkling::entries(),
+        kimi_k3::entries(),
+        muse_glimmer::entries(),
+        qwen_3::entries(),
+        qwen_4::entries(),
+        z_image::entries(),
+        wan_2::entries(),
+        minimax_h3::entries(),
+        ltx_2::entries(),
+        mini_dit::entries(),
     ]
-    .into_iter()
-    .flatten()
-    .collect()
+});
+
+/// Every model of the catalog, published and fixture alike.
+pub fn entries() -> impl Iterator<Item = &'static catalog::Entry> {
+    FAMILIES.iter().flatten()
+}
+
+#[must_use]
+pub fn entry(id: &str) -> Option<&'static catalog::Entry> {
+    entries().find(|entry| entry.id == id)
+}
+
+/// Every row, family by family in the order each family lists them.
+static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
+    FAMILIES
+        .iter()
+        .flat_map(|family| {
+            let mut rows: Vec<(&'static catalog::Entry, &catalog::Row)> = family
+                .iter()
+                .flat_map(|entry| entry.rows.iter().map(move |row| (entry, row)))
+                .collect();
+            rows.sort_by_key(|(_, row)| row.seq);
+            rows.into_iter()
+                .map(|(entry, row)| Sku::of(entry, row.recipe, row.deploy.clone()))
+        })
+        .collect()
 });
 
 pub fn skus() -> impl Iterator<Item = &'static Sku> {

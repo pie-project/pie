@@ -69,7 +69,9 @@ fn a_windowed_row_reads_what_the_full_row_reads() {
         eprintln!("no CUDA device: skipping");
         return;
     }
-    let windowed = (models::sku(SKU).expect("the mini gemma").trace)(Platform::Cuda);
+    let windowed = models::sku(SKU)
+        .expect("the mini gemma")
+        .trace(Platform::Cuda);
     assert!(
         windowed.caches.iter().any(|row| matches!(
             row,

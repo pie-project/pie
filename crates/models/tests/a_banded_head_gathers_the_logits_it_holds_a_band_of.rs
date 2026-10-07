@@ -24,7 +24,7 @@ fn a_banded_head_gathers_the_logits_it_holds_a_band_of() {
     let mut faults = Vec::new();
 
     for row in models::skus().filter(|row| row.recipe.tp > 1) {
-        let trace = (row.trace)(Platform::Cuda);
+        let trace = row.trace(Platform::Cuda);
 
         let gathered: Vec<ValueId> = trace
             .nodes
@@ -73,7 +73,7 @@ fn a_single_rank_gathers_nothing() {
         if row.recipe.tp > 1 {
             continue;
         }
-        let trace = (row.trace)(Platform::Cuda);
+        let trace = row.trace(Platform::Cuda);
 
         let gathers = trace
             .nodes

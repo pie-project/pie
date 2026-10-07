@@ -89,7 +89,7 @@ fn one(
     verbose: bool,
     dump: Option<&Path>,
 ) -> Result<String, String> {
-    let trace = (sku.trace)(Platform::Xla);
+    let trace = sku.trace(Platform::Xla);
     let weights: u64 = trace
         .params
         .iter()

@@ -4,9 +4,9 @@ const SKU: &str = "qwen38-flash-next-full-u4g64-u2g128-kv-bf16";
 fn the_full_row_emits_the_gather_the_planner_keys_on() {
     use poem_dsl::{Attention, Def, Layout, Operation, Platform};
 
-    let trace = (models::sku(SKU)
+    let trace = models::sku(SKU)
         .expect("this build ships the full 2-bit row")
-        .trace)(Platform::Metal);
+        .trace(Platform::Metal);
 
     let mut heads: Vec<usize> = Vec::new();
     let mut tables: Vec<(String, Vec<u64>)> = Vec::new();

@@ -27,7 +27,7 @@ pub fn model() -> Option<Model> {
                 .expect("the artifact reads")
                 .expect("the artifact carries a serving stamp");
             let sku = models::sku(&stamp.sku).unwrap_or_else(|| panic!("no SKU {}", stamp.sku));
-            let trace = (sku.trace)(Platform::Xla);
+            let trace = sku.trace(Platform::Xla);
             let source = ztensor_compat::index(&artifact).expect("the artifact opens");
             let contract =
                 checkpoint_dsl::own_contract(&source, &trace.params, sku.recipe.tp, Platform::Xla)

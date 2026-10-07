@@ -155,7 +155,7 @@ fn state_every_sku() -> Vec<Stated> {
             continue;
         }
         let (name, tp) = (row.name.as_str(), row.recipe.tp);
-        let trace = (row.trace)(Platform::Cuda);
+        let trace = row.trace(Platform::Cuda);
         let path = dir.join(format!("{name}.zt"));
         write_checkpoint(&path, &trace.params);
 
@@ -374,11 +374,11 @@ fn a_bank_the_checkpoint_ships_unquantized_is_cast_on_the_way_in() {
     let mut faults = Vec::new();
 
     for row in models::skus() {
-        let (name, tp, trace) = (row.name.as_str(), row.recipe.tp, row.trace);
+        let (name, tp) = (row.name.as_str(), row.recipe.tp);
         if !name.starts_with("kimik3") {
             continue;
         }
-        let trace = trace(Platform::Cuda);
+        let trace = row.trace(Platform::Cuda);
         let path = dir.join(format!("{name}-unquantized.zt"));
         write_unquantized_checkpoint(&path, &trace.params);
 

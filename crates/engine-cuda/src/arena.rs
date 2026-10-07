@@ -109,8 +109,7 @@ mod tests {
     fn compiled() -> (poem_ir::Trace, poem_compiler::CompiledModel) {
         let trace = models::sku(SKU)
             .expect("the catalog ships the smoke's SKU")
-            .trace;
-        let trace = trace(Platform::Cuda);
+            .trace(Platform::Cuda);
         let compiled = compile(&trace, &Budget::new(4, 64), &DeviceProfile::default())
             .expect("the smoke's SKU bakes");
         (trace, compiled)

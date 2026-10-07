@@ -9,46 +9,32 @@ use poem_dsl::Dtype;
 
 pub const ARCH: &str = "ltx_2";
 
-pub fn skus() -> Vec<crate::Sku> {
-    let mut rows = crate::skus![
-        (
-            "ltx25",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::ltx_2_5(Dtype::Bf16),
-        ),
-        (
-            "ltx25",
-            1,
-            [Dtype::U4g64],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::ltx_2_5(Dtype::U4g64),
-        ),
-        (
-            "ltx25-mini",
-            1,
-            [Dtype::Bf16],
-            Dtype::Bf16,
-            poem_dsl::trace_hybrid,
-            template::instruct,
-            &tokenizer::CONTRACT,
-            || Model::mini(Dtype::Bf16),
-        ),
-    ];
-    for row in &mut rows {
-        let model = match row.recipe.text {
-            "ltx25" => Model::ltx_2_5(Dtype::Bf16),
-            "ltx25-mini" => Model::mini(Dtype::Bf16),
-            other => unreachable!("no ltx_2 row is called `{other}`"),
-        };
-        row.generative = Some(model.generative());
-    }
-    rows
+pub fn entries() -> Vec<crate::catalog::Entry> {
+    use Dtype::{Bf16, U4g64};
+    vec![
+        crate::entry! {
+            id: "ltx25",
+            fixture: false,
+            parts: [],
+            drafters: [],
+            template: template::instruct,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: Some(Model::generative),
+            build: |d| -> Model { Ok(Model::ltx_2_5(d.dtype()?)) },
+            rows: [(0, "ltx25", 1, [Bf16], Bf16, [], None), (1, "ltx25", 1, [U4g64], Bf16, [], None)],
+        },
+        crate::entry! {
+            id: "ltx25-mini",
+            fixture: true,
+            parts: [],
+            drafters: [],
+            template: template::instruct,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: None,
+            generative: Some(Model::generative),
+            build: |d| -> Model { Ok(Model::mini(d.dtype()?)) },
+            rows: [(2, "ltx25-mini", 1, [Bf16], Bf16, [], None)],
+        },
+    ]
 }

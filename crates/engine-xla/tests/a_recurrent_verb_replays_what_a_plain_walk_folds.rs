@@ -31,7 +31,7 @@ fn a_replayed_buffer_folds_to_the_plain_walk() {
     let context = 256;
     let _device = engine_xla::bench::lock_device();
     let mut shell = Shell::load(Boot {
-        trace: (m.sku.trace)(Platform::Xla),
+        trace: m.sku.trace(Platform::Xla),
         contract: &m.contract,
         checkpoint: &m.checkpoint,
         budget: Budget::new(4, context),

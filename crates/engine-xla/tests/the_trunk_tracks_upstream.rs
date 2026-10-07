@@ -100,7 +100,7 @@ fn the_first_logits_track_upstream() {
         eprintln!("not asked: {} is not Qwen3.5-0.8B", m.sku.name);
         return;
     }
-    let trace = (m.sku.trace)(Platform::Xla);
+    let trace = m.sku.trace(Platform::Xla);
     let classify = m.sku.classify;
     let word = |len: u32| classify(&Request::new(len, false));
 

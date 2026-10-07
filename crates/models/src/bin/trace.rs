@@ -17,6 +17,6 @@ fn main() {
         let names: Vec<&str> = models::skus().map(|row| row.name.as_str()).collect();
         panic!("`{sku}` is not a catalog row; rows: {names:#?}")
     });
-    let plan = (row.trace)(platform);
+    let plan = row.trace(platform);
     println!("{}", serde_json::to_string_pretty(&plan).unwrap());
 }

@@ -33,7 +33,7 @@ fn every_armed_body_answers_its_eager_walk() {
         return;
     };
     let sku = models::sku(SKU).expect("the catalog ships the mini-dit row");
-    let trace = (sku.trace)(Platform::Cuda);
+    let trace = sku.trace(Platform::Cuda);
     let mut engine = engine_cuda::open(engine_cuda::DeviceBoot::default(), contract_for, |name| {
         models::sku(name).map(|sku| sku.classify)
     })
