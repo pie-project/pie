@@ -1,6 +1,8 @@
 #[cfg(target_vendor = "apple")]
 pub mod ffn;
 #[cfg(target_vendor = "apple")]
+pub mod handoff;
+#[cfg(target_vendor = "apple")]
 pub mod private;
 
 pub fn enabled() -> bool {
