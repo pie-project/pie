@@ -18,7 +18,7 @@ fn every_sku_ships_whole_every_case() {
 fn a_sku_name_states_the_world_its_row_ships() {
     let mut faults = Vec::new();
 
-    for row in models::deployments() {
+    for row in models::deployments().chain(models::splits()) {
         let (sku, tp) = (row.name.as_str(), row.deploy.tp);
         let named = match sku.rsplit_once("-tp") {
             Some((_, ranks)) => ranks.parse::<u32>().unwrap_or_else(|why| {
@@ -51,7 +51,7 @@ fn every_import_row_reads_the_checkpoint_it_is_handed() {
 
     let mut faults = Vec::new();
     let mut sharded = 0usize;
-    for row in models::deployments() {
+    for row in models::deployments().chain(models::splits()) {
         let (sku, tp) = (row.name.as_str(), row.deploy.tp);
         let refusal = match row.contract(&src, poem_dsl::Platform::Cuda) {
             Ok(_) => {

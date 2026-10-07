@@ -15,7 +15,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
     vec![
         crate::entry! {
             id: "qwen38-flash-next",
-            fixture: false,
+            mini: false,
             parts: [Vision],
             drafters: [Mtp],
             template: template::chatml_interleaved,
@@ -39,17 +39,17 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 }
             },
             rows: [
-                (0, 1, [U4g64], Bf16, [], None),
-                (1, 1, [U4g64, U2g128], Bf16, [], Some(Drafter::Mtp)),
-                (2, 1, [U4g64, U2g128], Bf16, [], None),
-                (4, 1, [Bf16], Bf16, [], None),
-                (5, 1, [U4g64, U2g128], Bf16, [Vision], Some(Drafter::Mtp)),
-                (6, 1, [U4g64, U2g128], Bf16, [Vision], None),
+                (0, [U4g64], Bf16, [], None),
+                (1, [U4g64, U2g128], Bf16, [], Some(Drafter::Mtp)),
+                (2, [U4g64, U2g128], Bf16, [], None),
+                (4, [Bf16], Bf16, [], None),
+                (5, [U4g64, U2g128], Bf16, [Vision], Some(Drafter::Mtp)),
+                (6, [U4g64, U2g128], Bf16, [Vision], None),
             ],
         },
         crate::entry! {
             id: "qwen38-flash-next-mini",
-            fixture: true,
+            mini: true,
             parts: [],
             drafters: [],
             template: template::chatml_interleaved,
@@ -62,7 +62,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                     _ => Err(Refused::unsupported("qwen38-flash-next-mini", d)),
                 }
             },
-            rows: [(3, 1, [U4g64, U2g128], Bf16, [], None)],
+            rows: [(3, [U4g64, U2g128], Bf16, [], None)],
         },
     ]
 }

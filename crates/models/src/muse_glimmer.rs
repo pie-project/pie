@@ -12,7 +12,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
     vec![
         crate::entry! {
             id: "muse-glimmer-30b",
-            fixture: false,
+            mini: false,
             parts: [],
             drafters: [],
             template: template::muse_glimmer,
@@ -20,11 +20,11 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
             diffusion: None,
             generative: None,
             build: |d| -> Model { Ok(Model::b30(d.dtype()?, d.kv)) },
-            rows: [(0, 1, [Bf16], Bf16, [], None), (1, 2, [Bf16], Bf16, [], None), (2, 1, [U4g64], Bf16, [], None), (3, 2, [U4g64], Bf16, [], None)],
+            rows: [(0, [Bf16], Bf16, [], None), (2, [U4g64], Bf16, [], None)],
         },
         crate::entry! {
             id: "muse-glimmer-30b-mini-l8",
-            fixture: true,
+            mini: true,
             parts: [],
             drafters: [],
             template: template::muse_glimmer,
@@ -32,7 +32,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
             diffusion: None,
             generative: None,
             build: |d| -> Model { Ok(Model::b30_mini(8, d.dtype()?, d.kv)) },
-            rows: [(4, 1, [Bf16], Bf16, [], None)],
+            rows: [(4, [Bf16], Bf16, [], None)],
         },
     ]
 }

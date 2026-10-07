@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn every_tp2_row_that_exports_scores_seats_its_tp1_planes() {
-        for row in models::deployments().filter(|sku| sku.deploy.tp == 2) {
+        for row in models::splits().filter(|sku| sku.deploy.tp == 2) {
             let Some(single) = row.name.strip_suffix("-tp2") else {
                 continue;
             };

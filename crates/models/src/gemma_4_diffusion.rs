@@ -20,7 +20,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
     }
     vec![crate::entry! {
         id: "diffusiongemma-26b-a4b",
-        fixture: false,
+        mini: false,
         parts: [SelfCond],
         drafters: [],
         template: template::gemma4,
@@ -39,12 +39,12 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
             }
         },
         rows: [
-            (0, 1, [U4g64], Bf16, [], None),
-            (1, 1, [U8g64], Bf16, [], None),
-            (2, 1, [U8g64, U4g64], Bf16, [], None),
-            (3, 1, [U4g64, U8g64], Bf16, [], None),
-            (4, 1, [U8g64, U4g64, U4g64], Bf16, [SelfCond], None),
-            (5, 1, [Bf16, U4g64], Bf16, [], None),
+            (0, [U4g64], Bf16, [], None),
+            (1, [U8g64], Bf16, [], None),
+            (2, [U8g64, U4g64], Bf16, [], None),
+            (3, [U4g64, U8g64], Bf16, [], None),
+            (4, [U8g64, U4g64, U4g64], Bf16, [SelfCond], None),
+            (5, [Bf16, U4g64], Bf16, [], None),
         ],
     }]
 }

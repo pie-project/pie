@@ -14,7 +14,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
     vec![
         crate::entry! {
             id: "glm53-flash",
-            fixture: false,
+            mini: false,
             parts: [Vision],
             drafters: [Mtp],
             template: template::instruct,
@@ -36,16 +36,16 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 }
             },
             rows: [
-                (0, 1, [U8g64, U2g64, U4g64], Bf16, [], Some(Drafter::Mtp)),
-                (3, 1, [U8g64, U2g64], Bf16, [], None),
-                (4, 1, [U8g64, U2g64, U4g64], Bf16, [Vision], Some(Drafter::Mtp)),
-                (5, 1, [U8g64, U2g64], Bf16, [Vision], None),
-                (6, 1, [U4g64, U2g64, U4g64], Bf16, [Vision], Some(Drafter::Mtp)),
+                (0, [U8g64, U2g64, U4g64], Bf16, [], Some(Drafter::Mtp)),
+                (3, [U8g64, U2g64], Bf16, [], None),
+                (4, [U8g64, U2g64, U4g64], Bf16, [Vision], Some(Drafter::Mtp)),
+                (5, [U8g64, U2g64], Bf16, [Vision], None),
+                (6, [U4g64, U2g64, U4g64], Bf16, [Vision], Some(Drafter::Mtp)),
             ],
         },
         crate::entry! {
             id: "glm53-flash-mini",
-            fixture: true,
+            mini: true,
             parts: [],
             drafters: [],
             template: template::instruct,
@@ -59,8 +59,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 }
             },
             rows: [
-                (1, 1, [U4g64, U4g64], Bf16, [], None),
-                (2, 2, [U4g64, U4g64], Bf16, [], None),
+                (1, [U4g64, U4g64], Bf16, [], None),
             ],
         },
     ]

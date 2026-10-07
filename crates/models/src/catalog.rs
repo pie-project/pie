@@ -84,8 +84,12 @@ pub type TemplateFn = fn(Arc<::tokenizer::Tokenizer>) -> Arc<dyn template::Instr
 /// One model of the catalog.
 pub struct Entry {
     pub id: &'static str,
-    /// A cut-down model the tests trace and serve, not a published one.
-    pub fixture: bool,
+    /// A miniature: a published model's widths at fewer layers or experts,
+    /// cut from its checkpoint, which kernel bring-up, parity and tuning
+    /// serve at production shapes on one device. It serves like any model;
+    /// identification tries it after every whole one, since it reads a
+    /// prefix of its whole model's planes.
+    pub mini: bool,
     pub parts: &'static [Part],
     pub drafters: &'static [Drafter],
     pub trace: TraceFn,
@@ -265,7 +269,7 @@ pub fn parse(name: &str) -> Option<(&'static Entry, Deploy)> {
 macro_rules! entry {
     (
         id: $id:literal,
-        fixture: $fixture:literal,
+        mini: $mini:literal,
         parts: [$($part:ident),* $(,)?],
         drafters: [$($drafter:ident),* $(,)?],
         template: $template:expr,
@@ -273,12 +277,12 @@ macro_rules! entry {
         diffusion: $diffusion:expr,
         generative: $generative:expr,
         build: |$d:ident| -> $model:ty $body:block,
-        rows: [ $( ($seq:literal, $tp:literal, [$($w:expr),+ $(,)?], $kv:expr, [$($rpart:ident),* $(,)?], $rdrafter:expr $(,)?) ),* $(,)? ] $(,)?
+        rows: [ $( ($seq:literal, [$($w:expr),+ $(,)?], $kv:expr, [$($rpart:ident),* $(,)?], $rdrafter:expr $(,)?) ),* $(,)? ] $(,)?
     ) => {{
         fn build($d: &$crate::catalog::Deploy) -> Result<$model, $crate::catalog::Refused> $body
         $crate::catalog::Entry {
             id: $id,
-            fixture: $fixture,
+            mini: $mini,
             parts: &[$($crate::catalog::Part::$part),*],
             drafters: &[$($crate::catalog::Drafter::$drafter),*],
             trace: |name, deploy, platform| {
@@ -314,7 +318,7 @@ macro_rules! entry {
                 deploy: $crate::catalog::Deploy {
                     weights: vec![$($w),+],
                     kv: $kv,
-                    tp: $tp,
+                    tp: 1,
                     parts: vec![$($crate::catalog::Part::$rpart),*],
                     drafter: $rdrafter,
                 },

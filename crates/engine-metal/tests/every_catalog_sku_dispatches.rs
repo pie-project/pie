@@ -34,12 +34,6 @@ const REFUSED: &[Refusal] = &[
         needle: "op: \"collective.reduce_scatter\"",
     },
     Refusal {
-        op: "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
-        why: "a CUDA-only fusion; engine-vulkan refuses it too",
-        file: "src/dispatch/custom.rs",
-        needle: "Err(KernelError::Unsupported { op: op.name() })",
-    },
-    Refusal {
         op: "spatial.patchify",
         why: "voxels to patch tokens has no arm here; no catalog row reaches it",
         file: "src/dispatch/custom.rs",
@@ -47,107 +41,7 @@ const REFUSED: &[Refusal] = &[
     },
 ];
 
-const CANNOT_SERVE: &[(&str, &[&str])] = &[
-    (
-        "kimik3-mini-bf16-mxfp4-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
-    (
-        "glm53-flash-mini-u4g64-u4g64-kv-bf16-tp2",
-        &["collective.all_reduce"],
-    ),
-    (
-        "gptoss-20b-mini-bf16-mxfp4-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
-    (
-        "qwen36-35b-a3b-mini-u4g64-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
-    (
-        "qwen36-35b-a3b-u4g64-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
-    (
-        "qwen36-27b-u4g64-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
-    (
-        "qwen36-27b-mtp-bf16-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
-    (
-        "qwen38-27b-u4g64-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
-    (
-        "qwen38-27b-mtp-bf16-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
-    ("qwen35-d0.8b-bf16-kv-bf16-tp2", &["collective.all_reduce"]),
-    ("qwen35-d0.8b-u4g64-kv-bf16-tp2", &["collective.all_reduce"]),
-    ("qwen35-d2b-u4g64-kv-bf16-tp2", &["collective.all_reduce"]),
-    ("qwen35-d4b-u4g64-kv-bf16-tp2", &["collective.all_reduce"]),
-    (
-        "qwen35-d9b-u4g64-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
-    ("qwen35-d3b-bf16-kv-bf16-tp2", &["collective.all_reduce"]),
-    (
-        "gemma4-e4b-bf16-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
-    (
-        "gemma4-31b-bf16-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
-    (
-        "gemma4-31b-u4g64-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
-    (
-        "glm5-a12b-bf16-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
-    (
-        "gptoss-120b-bf16-mxfp4-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
-    (
-        "gptoss-20b-u4g64-mxfp4-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
-    (
-        "gptoss-20b-bf16-mxfp4-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
-    (
-        "qwen35-a3b-bf16-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
-    (
-        "muse-glimmer-30b-bf16-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
-    (
-        "muse-glimmer-30b-u4g64-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
-    (
-        "kimik3-bf16-mxfp4-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
-    (
-        "hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16-tp4",
-        &["collective.all_reduce"],
-    ),
-    (
-        "hunyuanimage3-80b-a13b-bf16-u4g64-kv-bf16-tp4",
-        &["collective.all_reduce"],
-    ),
-    ("mini-dit-bf16-kv-bf16-tp2", &["collective.all_reduce"]),
-    ("mini-dit-bf16-kv-bf16-tp4", &["collective.all_reduce"]),
-];
+const CANNOT_SERVE: &[(&str, &[&str])] = &[];
 
 fn ops_of(sku: &str) -> BTreeSet<String> {
     let row = models::deployment(sku).expect("the row is in the catalog");
@@ -191,7 +85,7 @@ fn every_catalog_sku_dispatches() {
 
     let unlisted: Vec<String> = stopped()
         .into_iter()
-        .filter(|(sku, _)| !exempt.contains_key(sku.as_str()))
+        .filter(|(sku, _)| !exempt.contains_key(one_rank(sku)))
         .map(|(sku, ops)| {
             let ops: Vec<&str> = ops.iter().map(String::as_str).collect();
             format!(
@@ -212,6 +106,14 @@ fn every_catalog_sku_dispatches() {
         unlisted.len(),
         unlisted.join("\n  ")
     );
+}
+
+/// The one-rank deployment `sku` splits: a split is stopped by what stops the
+/// deployment it splits, so it is exempted under that one's name.
+fn one_rank(sku: &str) -> &str {
+    sku.rsplit_once("-tp")
+        .filter(|(_, ranks)| ranks.parse::<u32>().is_ok())
+        .map_or(sku, |(whole, _)| whole)
 }
 
 fn no_exemption_outlives_its_reason() {

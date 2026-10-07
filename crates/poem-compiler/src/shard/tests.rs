@@ -5,7 +5,7 @@ use poem_ir::{Fault, Platform};
 #[test]
 fn every_split_row_reads_what_it_makes_in_order() {
     let mut broken = Vec::new();
-    for sku in models::deployments().filter(|sku| sku.deploy.tp > 1) {
+    for sku in models::splits() {
         for platform in [Platform::Cuda, Platform::Metal] {
             let Err(faults) = poem_ir::check(&sku.trace(platform)) else {
                 continue;

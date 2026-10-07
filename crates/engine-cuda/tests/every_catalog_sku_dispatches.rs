@@ -104,7 +104,7 @@ static SPLIT_MROPE_REFUSAL: Refusal = Refusal {
 fn stopped() -> BTreeMap<String, BTreeSet<String>> {
     let refused = refused();
     let mut stopped = BTreeMap::new();
-    for row in models::deployments() {
+    for row in models::deployments().chain(models::splits()) {
         let blocked: BTreeSet<String> = ops_of(&row.name)
             .into_iter()
             .filter(|op| refused.contains_key(op.as_str()))
@@ -130,7 +130,7 @@ fn every_catalog_sku_dispatches() {
 
     let unlisted: Vec<String> = stopped()
         .into_iter()
-        .filter(|(sku, _)| !exempt.contains_key(sku.as_str()))
+        .filter(|(sku, _)| !exempt.contains_key(one_rank(sku)))
         .map(|(sku, ops)| {
             let ops: Vec<&str> = ops.iter().map(String::as_str).collect();
             format!(
@@ -151,6 +151,14 @@ fn every_catalog_sku_dispatches() {
         unlisted.len(),
         unlisted.join("\n  ")
     );
+}
+
+/// The one-rank deployment `sku` splits: a split is stopped by what stops the
+/// deployment it splits, so it is exempted under that one's name.
+fn one_rank(sku: &str) -> &str {
+    sku.rsplit_once("-tp")
+        .filter(|(_, ranks)| ranks.parse::<u32>().is_ok())
+        .map_or(sku, |(whole, _)| whole)
 }
 
 fn no_exemption_outlives_its_reason() {
@@ -213,7 +221,7 @@ fn every_refusal_is_still_carried() {
 
 fn every_catalog_sku_traces() {
     let mut empty = Vec::new();
-    for row in models::deployments() {
+    for row in models::deployments().chain(models::splits()) {
         let trace = row.trace(PLATFORM);
         if trace.nodes.is_empty() {
             empty.push(row.name.clone());
@@ -232,7 +240,7 @@ fn every_catalog_sku_traces() {
 fn report() {
     let refused = refused();
     let mut named: BTreeMap<String, usize> = BTreeMap::new();
-    for row in models::deployments() {
+    for row in models::deployments().chain(models::splits()) {
         for op in ops_of(&row.name) {
             *named.entry(op).or_default() += 1;
         }
@@ -240,7 +248,7 @@ fn report() {
 
     println!(
         "{SHELL} on {PLATFORM:?}: {} rows",
-        models::deployments().count()
+        models::deployments().chain(models::splits()).count()
     );
     println!("\n== ops named by the catalog ({}) ==", named.len());
     for (op, rows) in &named {
@@ -254,7 +262,7 @@ fn report() {
 
     let stopped = stopped();
     println!("\n== per row ==");
-    for row in models::deployments() {
+    for row in models::deployments().chain(models::splits()) {
         let ops = ops_of(&row.name);
         let verdict = match stopped.get(&row.name) {
             None => "serves".to_string(),
@@ -271,7 +279,7 @@ fn report() {
     }
     println!(
         "\n{} of {} rows serve",
-        models::deployments().count() - stopped.len(),
-        models::deployments().count()
+        models::deployments().chain(models::splits()).count() - stopped.len(),
+        models::deployments().chain(models::splits()).count()
     );
 }

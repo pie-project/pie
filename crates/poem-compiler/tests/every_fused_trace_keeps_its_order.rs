@@ -6,7 +6,7 @@ use poem_ir::{Fault, Platform};
 fn every_fused_trace_keeps_its_order() {
     let kernels: Vec<&str> = poem_compiler::fuse::kernels().collect();
     let mut broken = Vec::new();
-    for sku in models::deployments() {
+    for sku in models::deployments().chain(models::splits()) {
         for platform in [Platform::Cuda, Platform::Metal] {
             let fused = poem_compiler::fuse::fuse(sku.trace(platform), &kernels);
             let Err(faults) = poem_ir::check(&fused) else {

@@ -22,7 +22,7 @@ fn a_routed_bank_is_the_rectangle_the_grouped_leg_reads() {
     let mut faults = Vec::new();
     let mut checked = 0usize;
 
-    for row in models::deployments() {
+    for row in models::deployments().chain(models::splits()) {
         let trace = row.trace(Platform::Cuda);
         for node in &trace.nodes {
             let Operation::Linear(Linear::MoeMatmulSelect { x, bank, y, .. }) = &node.op else {

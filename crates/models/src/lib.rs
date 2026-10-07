@@ -267,7 +267,7 @@ static FAMILIES: LazyLock<Vec<Vec<catalog::Entry>>> = LazyLock::new(|| {
     ]
 });
 
-/// Every model of the catalog, published and fixture alike.
+/// Every model of the catalog, whole and miniature alike.
 pub fn entries() -> impl Iterator<Item = &'static catalog::Entry> {
     FAMILIES.iter().flatten()
 }
@@ -294,15 +294,46 @@ static DEPLOYMENTS: LazyLock<Vec<Deployment>> = LazyLock::new(|| {
         .collect()
 });
 
-/// Every deployment the catalog lists, fixtures' included.
+/// Every deployment the catalog lists, miniatures' included. Each runs on
+/// one rank; [`splits`] are the same deployments across more.
 pub fn deployments() -> impl Iterator<Item = &'static Deployment> {
     DEPLOYMENTS.iter()
 }
 
-/// The deployment the catalog lists under `name`.
+/// The rank counts [`splits`] tries each listed deployment at.
+pub const RANKS: [u32; 3] = [2, 4, 8];
+
+/// Every listed deployment at every count of [`RANKS`] its model splits it
+/// across, a deployment the compiler's sharding pass refuses left out.
+static SPLITS: LazyLock<Vec<Deployment>> = LazyLock::new(|| {
+    DEPLOYMENTS
+        .iter()
+        .flat_map(|whole| {
+            RANKS.into_iter().filter_map(|tp| {
+                let deploy = catalog::Deploy {
+                    tp,
+                    ..whole.deploy.clone()
+                };
+                let split = Deployment::of(whole.entry, deploy);
+                split.check(Platform::Cuda).is_ok().then_some(split)
+            })
+        })
+        .collect()
+});
+
+/// Every listed deployment split across the ranks of [`RANKS`] it splits
+/// across.
+pub fn splits() -> impl Iterator<Item = &'static Deployment> {
+    SPLITS.iter()
+}
+
+/// The deployment `name` names: one the catalog lists, or one of its
+/// [`splits`].
 #[must_use]
 pub fn deployment(name: &str) -> Option<&'static Deployment> {
-    deployments().find(|deployment| deployment.name == name)
+    deployments()
+        .find(|deployment| deployment.name == name)
+        .or_else(|| splits().find(|deployment| deployment.name == name))
 }
 
 pub fn fits<'a>(
@@ -314,14 +345,17 @@ pub fn fits<'a>(
         Result<ModelContract, checkpoint_dsl::Error>,
     ),
 > + 'a {
-    let mut candidates: Vec<&'static Deployment> = deployments()
-        .filter(|d| d.deploy.tp == 1 && !d.entry.fixture)
-        .collect();
-    // A checkpoint is served with every part and drafter it carries unless a
-    // config leaves them off, so the richest deployment that fits is tried
-    // first; the catalog's order breaks ties.
+    let mut candidates: Vec<&'static Deployment> = deployments().collect();
+    // A miniature reads a prefix of its whole model's planes and would claim
+    // the whole checkpoint too, so whole models are tried first. A checkpoint is
+    // served with every part and drafter it carries unless a config leaves
+    // them off, so the richest deployment that fits is tried first; the
+    // catalog's order breaks ties.
     candidates.sort_by_key(|d| {
-        std::cmp::Reverse(d.deploy.parts.len() + usize::from(d.deploy.drafter.is_some()))
+        (
+            d.entry.mini,
+            std::cmp::Reverse(d.deploy.parts.len() + usize::from(d.deploy.drafter.is_some())),
+        )
     });
     candidates
         .into_iter()

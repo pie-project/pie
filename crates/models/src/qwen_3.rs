@@ -15,7 +15,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
     vec![
         crate::entry! {
             id: "qwen36-27b",
-            fixture: false,
+            mini: false,
             parts: [Vision],
             drafters: [Mtp, DFlash],
             template: template::chatml,
@@ -34,19 +34,17 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 }
             },
             rows: [
-                (0, 1, [U4g64], Bf16, [], Some(Drafter::Mtp)),
-                (1, 1, [U4g64], Bf16, [], Some(Drafter::DFlash)),
-                (2, 1, [U4g64], Bf16, [], None),
-                (3, 2, [U4g64], Bf16, [], None),
-                (21, 1, [Bf16], Bf16, [], Some(Drafter::Mtp)),
-                (22, 2, [Bf16], Bf16, [], Some(Drafter::Mtp)),
-                (38, 1, [U4g64], Bf16, [Vision], None),
-                (39, 1, [Bf16], Bf16, [Vision], Some(Drafter::Mtp)),
+                (0, [U4g64], Bf16, [], Some(Drafter::Mtp)),
+                (1, [U4g64], Bf16, [], Some(Drafter::DFlash)),
+                (2, [U4g64], Bf16, [], None),
+                (21, [Bf16], Bf16, [], Some(Drafter::Mtp)),
+                (38, [U4g64], Bf16, [Vision], None),
+                (39, [Bf16], Bf16, [Vision], Some(Drafter::Mtp)),
             ],
         },
         crate::entry! {
             id: "qwen38-27b",
-            fixture: false,
+            mini: false,
             parts: [Vision],
             drafters: [Mtp, DFlash2, DSpark],
             template: template::chatml_interleaved,
@@ -66,20 +64,18 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 }
             },
             rows: [
-                (23, 1, [Bf16], Bf16, [], Some(Drafter::Mtp)),
-                (24, 2, [Bf16], Bf16, [], Some(Drafter::Mtp)),
-                (25, 1, [U4g64], Bf16, [], Some(Drafter::DFlash2)),
-                (26, 1, [U4g64], Bf16, [], Some(Drafter::DSpark)),
-                (27, 1, [U4g64], Bf16, [], Some(Drafter::Mtp)),
-                (28, 1, [U4g64], Bf16, [], None),
-                (29, 2, [U4g64], Bf16, [], None),
-                (40, 1, [U4g64], Bf16, [Vision], None),
-                (41, 1, [Bf16], Bf16, [Vision], Some(Drafter::Mtp)),
+                (23, [Bf16], Bf16, [], Some(Drafter::Mtp)),
+                (25, [U4g64], Bf16, [], Some(Drafter::DFlash2)),
+                (26, [U4g64], Bf16, [], Some(Drafter::DSpark)),
+                (27, [U4g64], Bf16, [], Some(Drafter::Mtp)),
+                (28, [U4g64], Bf16, [], None),
+                (40, [U4g64], Bf16, [Vision], None),
+                (41, [Bf16], Bf16, [Vision], Some(Drafter::Mtp)),
             ],
         },
         crate::entry! {
             id: "qwen35-d0.8b",
-            fixture: false,
+            mini: false,
             parts: [Vision],
             drafters: [Eagle],
             template: template::chatml,
@@ -97,19 +93,17 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 }
             },
             rows: [
-                (5, 1, [U4g64], Bf16, [], None),
-                (6, 2, [U4g64], Bf16, [], None),
-                (33, 1, [Bf16], Bf16, [], Some(Drafter::Eagle)),
-                (34, 1, [Bf16], Bf16, [], None),
-                (35, 2, [Bf16], Bf16, [], None),
-                (37, 1, [Bf16], Bf16, [Vision], Some(Drafter::Eagle)),
-                (42, 1, [U4g64], Bf16, [Vision], None),
-                (43, 1, [Bf16], Bf16, [Vision], None),
+                (5, [U4g64], Bf16, [], None),
+                (33, [Bf16], Bf16, [], Some(Drafter::Eagle)),
+                (34, [Bf16], Bf16, [], None),
+                (37, [Bf16], Bf16, [Vision], Some(Drafter::Eagle)),
+                (42, [U4g64], Bf16, [Vision], None),
+                (43, [Bf16], Bf16, [Vision], None),
             ],
         },
         crate::entry! {
             id: "qwen35-d2b",
-            fixture: false,
+            mini: false,
             parts: [],
             drafters: [],
             template: template::chatml,
@@ -120,13 +114,12 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 Ok(Model::d2b(d.dtype()?, d.kv))
             },
             rows: [
-                (7, 1, [U4g64], Bf16, [], None),
-                (8, 2, [U4g64], Bf16, [], None),
+                (7, [U4g64], Bf16, [], None),
             ],
         },
         crate::entry! {
             id: "qwen35-d3b",
-            fixture: false,
+            mini: false,
             parts: [],
             drafters: [],
             template: template::chatml,
@@ -137,13 +130,12 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 Ok(Model::d3b(d.dtype()?, d.kv))
             },
             rows: [
-                (31, 1, [Bf16], Bf16, [], None),
-                (32, 2, [Bf16], Bf16, [], None),
+                (31, [Bf16], Bf16, [], None),
             ],
         },
         crate::entry! {
             id: "qwen35-d4b",
-            fixture: false,
+            mini: false,
             parts: [],
             drafters: [],
             template: template::chatml,
@@ -154,13 +146,12 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 Ok(Model::d4b(d.dtype()?, d.kv))
             },
             rows: [
-                (9, 1, [U4g64], Bf16, [], None),
-                (10, 2, [U4g64], Bf16, [], None),
+                (9, [U4g64], Bf16, [], None),
             ],
         },
         crate::entry! {
             id: "qwen35-a3b",
-            fixture: false,
+            mini: false,
             parts: [],
             drafters: [],
             template: template::chatml,
@@ -171,13 +162,12 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 Ok(Model::a3b(d.dtype()?, d.kv))
             },
             rows: [
-                (30, 1, [Bf16], Bf16, [], None),
-                (36, 2, [Bf16], Bf16, [], None),
+                (30, [Bf16], Bf16, [], None),
             ],
         },
         crate::entry! {
             id: "qwen35-d9b",
-            fixture: false,
+            mini: false,
             parts: [],
             drafters: [DFlash],
             template: template::chatml,
@@ -193,14 +183,13 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 }
             },
             rows: [
-                (11, 1, [U4g64], Bf16, [], Some(Drafter::DFlash)),
-                (12, 1, [U4g64], Bf16, [], None),
-                (13, 2, [U4g64], Bf16, [], None),
+                (11, [U4g64], Bf16, [], Some(Drafter::DFlash)),
+                (12, [U4g64], Bf16, [], None),
             ],
         },
         crate::entry! {
             id: "qwen36-35b-a3b",
-            fixture: false,
+            mini: false,
             parts: [],
             drafters: [Mtp, DFlash],
             template: template::chatml,
@@ -217,15 +206,14 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 }
             },
             rows: [
-                (14, 1, [U4g64], Bf16, [], Some(Drafter::DFlash)),
-                (15, 1, [U4g64], Bf16, [], Some(Drafter::Mtp)),
-                (16, 1, [U4g64], Bf16, [], None),
-                (17, 2, [U4g64], Bf16, [], None),
+                (14, [U4g64], Bf16, [], Some(Drafter::DFlash)),
+                (15, [U4g64], Bf16, [], Some(Drafter::Mtp)),
+                (16, [U4g64], Bf16, [], None),
             ],
         },
         crate::entry! {
             id: "qwen35-tiny",
-            fixture: true,
+            mini: true,
             parts: [],
             drafters: [],
             template: template::chatml,
@@ -236,12 +224,12 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 Ok(Model::tiny(d.dtype()?, d.kv))
             },
             rows: [
-                (4, 1, [U4g64], Bf16, [], None),
+                (4, [U4g64], Bf16, [], None),
             ],
         },
         crate::entry! {
             id: "qwen36-35b-a3b-mini",
-            fixture: true,
+            mini: true,
             parts: [],
             drafters: [],
             template: template::chatml,
@@ -252,13 +240,12 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 Ok(Model::a3b_mini(d.dtype()?, d.kv))
             },
             rows: [
-                (18, 1, [U4g64], Bf16, [], None),
-                (19, 2, [U4g64], Bf16, [], None),
+                (18, [U4g64], Bf16, [], None),
             ],
         },
         crate::entry! {
             id: "qwen36-35b-a3b-mini64",
-            fixture: true,
+            mini: true,
             parts: [],
             drafters: [],
             template: template::chatml,
@@ -269,7 +256,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 Ok(Model::a3b_mini64(d.dtype()?, d.kv))
             },
             rows: [
-                (20, 1, [U4g64], Bf16, [], None),
+                (20, [U4g64], Bf16, [], None),
             ],
         },
     ]

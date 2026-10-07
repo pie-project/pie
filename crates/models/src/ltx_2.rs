@@ -14,7 +14,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
     vec![
         crate::entry! {
             id: "ltx25",
-            fixture: false,
+            mini: false,
             parts: [],
             drafters: [],
             template: template::instruct,
@@ -22,11 +22,11 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
             diffusion: None,
             generative: Some(Model::generative),
             build: |d| -> Model { Ok(Model::ltx_2_5(d.dtype()?)) },
-            rows: [(0, 1, [Bf16], Bf16, [], None), (1, 1, [U4g64], Bf16, [], None)],
+            rows: [(0, [Bf16], Bf16, [], None), (1, [U4g64], Bf16, [], None)],
         },
         crate::entry! {
             id: "ltx25-mini",
-            fixture: true,
+            mini: true,
             parts: [],
             drafters: [],
             template: template::instruct,
@@ -34,7 +34,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
             diffusion: None,
             generative: Some(Model::generative),
             build: |d| -> Model { Ok(Model::mini(d.dtype()?)) },
-            rows: [(2, 1, [Bf16], Bf16, [], None)],
+            rows: [(2, [Bf16], Bf16, [], None)],
         },
     ]
 }

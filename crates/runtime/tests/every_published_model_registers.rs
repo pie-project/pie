@@ -4,7 +4,7 @@
 #[test]
 fn every_published_model_registers() {
     let missing: Vec<&str> = models::entries()
-        .filter(|entry| !entry.fixture)
+        .filter(|entry| !entry.mini)
         .map(|entry| entry.id)
         .filter(|id| runtime::model::row(id).is_none())
         .collect();

@@ -14,7 +14,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
     vec![
         crate::entry! {
             id: "gemma4-26b-a4b",
-            fixture: false,
+            mini: false,
             parts: [Vision],
             drafters: [Mtp, DFlash],
             template: template::gemma4,
@@ -32,15 +32,15 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 }
             },
             rows: [
-                (0, 1, [U4g64], Bf16, [], Some(Drafter::DFlash)),
-                (1, 1, [U4g64], Bf16, [], Some(Drafter::Mtp)),
-                (2, 1, [U4g64], Bf16, [], None),
-                (17, 1, [U4g64], Bf16, [Vision], None),
+                (0, [U4g64], Bf16, [], Some(Drafter::DFlash)),
+                (1, [U4g64], Bf16, [], Some(Drafter::Mtp)),
+                (2, [U4g64], Bf16, [], None),
+                (17, [U4g64], Bf16, [Vision], None),
             ],
         },
         crate::entry! {
             id: "gemma4-31b",
-            fixture: false,
+            mini: false,
             parts: [Vision],
             drafters: [Mtp],
             template: template::gemma4,
@@ -57,17 +57,15 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 }
             },
             rows: [
-                (3, 1, [U4g64], Bf16, [], Some(Drafter::Mtp)),
-                (4, 1, [U4g64], Bf16, [], None),
-                (5, 2, [U4g64], Bf16, [], None),
-                (9, 1, [Bf16], Bf16, [], None),
-                (10, 2, [Bf16], Bf16, [], None),
-                (18, 1, [U4g64], Bf16, [Vision], None),
+                (3, [U4g64], Bf16, [], Some(Drafter::Mtp)),
+                (4, [U4g64], Bf16, [], None),
+                (9, [Bf16], Bf16, [], None),
+                (18, [U4g64], Bf16, [Vision], None),
             ],
         },
         crate::entry! {
             id: "gemma4-e4b",
-            fixture: false,
+            mini: false,
             parts: [Vision],
             drafters: [Eagle],
             template: template::gemma4,
@@ -84,15 +82,14 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 }
             },
             rows: [
-                (6, 1, [Bf16], Bf16, [], Some(Drafter::Eagle)),
-                (7, 1, [Bf16], Bf16, [], None),
-                (8, 2, [Bf16], Bf16, [], None),
-                (16, 1, [Bf16], Bf16, [Vision], None),
+                (6, [Bf16], Bf16, [], Some(Drafter::Eagle)),
+                (7, [Bf16], Bf16, [], None),
+                (16, [Bf16], Bf16, [Vision], None),
             ],
         },
         crate::entry! {
             id: "gemma4-e4b-mini-l1",
-            fixture: true,
+            mini: true,
             parts: [],
             drafters: [],
             template: template::gemma4,
@@ -103,12 +100,12 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 Ok(Model::e4b_mini(1, d.dtype()?, d.kv))
             },
             rows: [
-                (11, 1, [Bf16], Bf16, [], None),
+                (11, [Bf16], Bf16, [], None),
             ],
         },
         crate::entry! {
             id: "gemma4-e4b-mini-l6",
-            fixture: true,
+            mini: true,
             parts: [],
             drafters: [],
             template: template::gemma4,
@@ -119,12 +116,12 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 Ok(Model::e4b_mini(6, d.dtype()?, d.kv))
             },
             rows: [
-                (12, 1, [Bf16], Bf16, [], None),
+                (12, [Bf16], Bf16, [], None),
             ],
         },
         crate::entry! {
             id: "gemma4-e4b-mini-l24",
-            fixture: true,
+            mini: true,
             parts: [],
             drafters: [],
             template: template::gemma4,
@@ -135,12 +132,12 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 Ok(Model::e4b_mini(24, d.dtype()?, d.kv))
             },
             rows: [
-                (13, 1, [Bf16], Bf16, [], None),
+                (13, [Bf16], Bf16, [], None),
             ],
         },
         crate::entry! {
             id: "gemma4-e4b-mini-l30",
-            fixture: true,
+            mini: true,
             parts: [],
             drafters: [],
             template: template::gemma4,
@@ -151,12 +148,12 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 Ok(Model::e4b_mini(30, d.dtype()?, d.kv))
             },
             rows: [
-                (14, 1, [Bf16], Bf16, [], None),
+                (14, [Bf16], Bf16, [], None),
             ],
         },
         crate::entry! {
             id: "gemma4-e4b-mini-l36",
-            fixture: true,
+            mini: true,
             parts: [],
             drafters: [],
             template: template::gemma4,
@@ -167,7 +164,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 Ok(Model::e4b_mini(36, d.dtype()?, d.kv))
             },
             rows: [
-                (15, 1, [Bf16], Bf16, [], None),
+                (15, [Bf16], Bf16, [], None),
             ],
         },
     ]

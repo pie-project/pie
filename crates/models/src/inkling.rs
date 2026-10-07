@@ -12,7 +12,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
     vec![
         crate::entry! {
             id: "inkling",
-            fixture: false,
+            mini: false,
             parts: [],
             drafters: [],
             template: template::inkling,
@@ -20,11 +20,11 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
             diffusion: None,
             generative: None,
             build: |d| -> Model { Ok(Model::full(d.dtype()?, d.kv)) },
-            rows: [(0, 1, [Bf16], Bf16, [], None)],
+            rows: [(0, [Bf16], Bf16, [], None)],
         },
         crate::entry! {
             id: "inkling-mini-l7-e8",
-            fixture: true,
+            mini: true,
             parts: [],
             drafters: [],
             template: template::inkling,
@@ -32,7 +32,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
             diffusion: None,
             generative: None,
             build: |d| -> Model { Ok(Model::mini(7, 8, d.dtype()?, d.kv)) },
-            rows: [(1, 1, [Bf16], Bf16, [], None)],
+            rows: [(1, [Bf16], Bf16, [], None)],
         },
     ]
 }

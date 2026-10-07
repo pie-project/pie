@@ -150,7 +150,7 @@ fn state_every_sku() -> Vec<Stated> {
     let dir = scratch();
     let mut out = Vec::new();
 
-    for row in models::deployments() {
+    for row in models::deployments().chain(models::splits()) {
         if !by_load(row) {
             continue;
         }
@@ -373,7 +373,7 @@ fn a_bank_the_checkpoint_ships_unquantized_is_cast_on_the_way_in() {
     let dir = scratch();
     let mut faults = Vec::new();
 
-    for row in models::deployments() {
+    for row in models::deployments().chain(models::splits()) {
         let (name, tp) = (row.name.as_str(), row.deploy.tp);
         if !name.starts_with("kimik3") {
             continue;

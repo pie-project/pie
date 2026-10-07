@@ -23,7 +23,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
     vec![
         crate::entry! {
             id: "hunyuanimage3-80b-a13b",
-            fixture: false,
+            mini: false,
             parts: [],
             drafters: [],
             template: template::instruct,
@@ -37,14 +37,13 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
                 }
             },
             rows: [
-                (0, 1, [Bf16, U8g64], Bf16, [], None),
-                (1, 4, [Bf16, U8g64], Bf16, [], None),
-                (2, 4, [Bf16, U4g64], Bf16, [], None),
+                (0, [Bf16, U8g64], Bf16, [], None),
+                (2, [Bf16, U4g64], Bf16, [], None),
             ],
         },
         crate::entry! {
             id: "hunyuanimage3-mini",
-            fixture: true,
+            mini: true,
             parts: [],
             drafters: [],
             template: template::instruct,
@@ -52,7 +51,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
             diffusion: Some(diffusion),
             generative: Some(Model::generative),
             build: |d| -> Model { Ok(Model::mini(d.dtype()?, d.kv)) },
-            rows: [(3, 1, [Bf16], Bf16, [], None)],
+            rows: [(3, [Bf16], Bf16, [], None)],
         },
     ]
 }

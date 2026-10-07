@@ -37,7 +37,7 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
 
     let mut declaring: Vec<(String, usize)> = Vec::new();
     let mut maskless: Vec<String> = Vec::new();
-    for row in models::deployments() {
+    for row in models::deployments().chain(models::splits()) {
         let sku = row.name.as_str();
         let arms = masked_arms(&row.trace(Platform::Cuda));
         if arms > 0 {

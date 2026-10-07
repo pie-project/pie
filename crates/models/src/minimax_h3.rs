@@ -14,7 +14,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
     vec![
         crate::entry! {
             id: "minimax-h3-fl2va",
-            fixture: false,
+            mini: false,
             parts: [],
             drafters: [],
             template: template::instruct,
@@ -23,14 +23,12 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
             generative: Some(Model::generative),
             build: |d| -> Model { Ok(Model::fl2va(d.dtype()?)) },
             rows: [
-                (0, 1, [Bf16], Bf16, [], None),
-                (1, 2, [Bf16], Bf16, [], None),
-                (2, 4, [Bf16], Bf16, [], None),
+                (0, [Bf16], Bf16, [], None),
             ],
         },
         crate::entry! {
             id: "minimax-h3-mini",
-            fixture: true,
+            mini: true,
             parts: [],
             drafters: [],
             template: template::instruct,
@@ -38,7 +36,7 @@ pub fn entries() -> Vec<crate::catalog::Entry> {
             diffusion: None,
             generative: Some(Model::generative),
             build: |d| -> Model { Ok(Model::mini(d.dtype()?)) },
-            rows: [(3, 1, [Bf16], Bf16, [], None)],
+            rows: [(3, [Bf16], Bf16, [], None)],
         },
     ]
 }

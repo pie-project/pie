@@ -30,7 +30,6 @@ fn no_such_deployment(name: &str) -> String {
     format!(
         "{name:?} names no deployment of a model this build ships; it lists:\n  {}",
         models::deployments()
-            .filter(|deployment| !deployment.entry.fixture)
             .map(|deployment| deployment.name.as_str())
             .collect::<Vec<_>>()
             .join("\n  ")
@@ -521,9 +520,7 @@ mod tests {
         let source = ztensor::Source::open(&path).expect("open the checkpoint");
         let metadata = checkpoint_metadata(&path).expect("read the checkpoint");
 
-        let row = models::deployments()
-            .find(|sku| sku.deploy.tp == 1)
-            .expect("a one-rank row");
+        let row = models::deployments().next().expect("a one-rank row");
         let why = conversion_contract_named(&source, &metadata, Platform::Cuda, &row.name)
             .expect_err("no row reads a checkpoint of one stranger")
             .to_string();
