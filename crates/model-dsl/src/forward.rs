@@ -53,6 +53,7 @@ impl HybridSpec {
         space: KvSpace,
         name: impl Into<String>,
         planes: impl IntoIterator<Item = u64>,
+        head_dim: u32,
     ) {
         let (dtype, window) = *self
             .dtypes
@@ -64,6 +65,7 @@ impl HybridSpec {
             dtype,
             space: space.0,
             window,
+            head_dim,
         });
     }
 

@@ -47,10 +47,11 @@ pub enum Dtype {
     E4m3row,
     E4m3tile128,
     Ptq1_0,
+    KvU4,
 }
 
 impl Dtype {
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 34] = [
         Self::F32,
         Self::F16,
         Self::Bf16,
@@ -84,6 +85,7 @@ impl Dtype {
         Self::E4m3row,
         Self::E4m3tile128,
         Self::Ptq1_0,
+        Self::KvU4,
     ];
 
     #[must_use]
@@ -234,6 +236,17 @@ impl Dtype {
                 gain: &F16,
                 offset: None,
             },
+            // C2b — the LOCKED v1 KV codec format as a first-class Dtype: 4-bit
+            // symmetric (a kernel convention over U(4) nibbles, offset-binary
+            // q+8), one whole 256-block per group, one inline fp16 scale, no
+            // bias. `repr().row_bytes(256)` == 128 nibble bytes + 2 scale bytes
+            // == 130, and the quantum is 256 (no partial block).
+            Self::KvU4 => &Fmt::Q {
+                g: Group::N(256),
+                elem: Elem::U(4),
+                gain: &F16,
+                offset: None,
+            },
         }
     }
 
@@ -273,6 +286,7 @@ impl Dtype {
             Self::E4m3row => "gr_e4m3_f32_n",
             Self::E4m3tile128 => "g128x128_e4m3_f32_n",
             Self::Ptq1_0 => "g128_t3_f16_n",
+            Self::KvU4 => "g256_u4_f16_n",
         }
     }
 

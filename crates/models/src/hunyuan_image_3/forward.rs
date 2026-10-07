@@ -189,7 +189,7 @@ impl ForwardHybrid for Model {
         let kv = c.kv_space(self.kv_dtype);
         let plane = u64::from(self.kv_width());
         for w in &self.layers {
-            c.kv(kv, w.kv.clone(), [plane, plane]);
+            c.kv(kv, w.kv.clone(), [plane, plane], self.dims.head_dim);
         }
         c
     }

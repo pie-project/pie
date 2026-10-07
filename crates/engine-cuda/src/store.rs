@@ -468,6 +468,7 @@ impl Pools {
                     dtype,
                     space,
                     window,
+                    ..
                 } => {
                     let element = elem_bytes(name, *dtype)?;
                     let windowed = window.is_some() && paging.window.is_some();

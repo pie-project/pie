@@ -42,7 +42,7 @@ impl ForwardHybrid for Model {
         let taps = u64::from(self.conv_width);
         for w in &self.layers {
             let plane = u64::from(w.kv_heads) * u64::from(self.head_dim);
-            c.kv(kv, w.kv.clone(), [plane, plane]);
+            c.kv(kv, w.kv.clone(), [plane, plane], self.head_dim);
             c.state(w.k_state.clone(), [taps, plane], Dtype::Bf16);
             c.state(w.v_state.clone(), [taps, plane], Dtype::Bf16);
             c.state(w.attn_state.clone(), [taps, hidden], Dtype::Bf16);
