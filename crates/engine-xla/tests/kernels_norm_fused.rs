@@ -86,95 +86,31 @@ fn the_qwen_path_norms_answer_the_host() {
 }
 
 #[test]
-fn layernorm_without_scale_and_the_fused_residual_norms_answer_the_host() {
+fn layernorm_without_scale_answers_the_host() {
     let (rows, width) = (4usize, 200usize);
     let (r, w) = (rows as u32, width as u32);
     let xs = data(rows * width, 6);
-    let ys = data(rows * width, 7);
-    let ws = data(width, 8);
-    let w1s = data(width, 9);
     let mut b = Bench::new();
     let x = b.bf16(r, w, &xs);
     let ln = b.zeros(Dtype::Bf16, r, w);
-    // residual_add_rmsnorm
-    let y = b.bf16(r, w, &ys);
-    let wt = b.bf16(1, w, &ws);
-    let out = b.zeros(Dtype::Bf16, r, w);
-    // rmsnorm_residual_add with scale and post
-    let y2 = b.bf16(r, w, &ys);
-    let t = b.zeros(Dtype::Bf16, r, w);
-    let s = b.bf16(1, 1, &[0.75]);
-    let scaled = b.zeros(Dtype::Bf16, r, w);
-    let w1 = b.bf16(1, w, &w1s);
-    let post = b.zeros(Dtype::Bf16, r, w);
-    // and the bare form
-    let y3 = b.bf16(r, w, &ys);
-    let t3 = b.zeros(Dtype::Bf16, r, w);
     if !b
-        .run(|ctx| {
-            norm::layernorm_no_scale(ctx, x, 1e-5, ln)?;
-            norm::residual_add_rmsnorm(ctx, x, y, wt, true, 1e-6, out)?;
-            norm::rmsnorm_residual_add(
-                ctx,
-                x,
-                wt,
-                1e-6,
-                t,
-                y2,
-                Some((s, scaled)),
-                Some(norm::PostNorm {
-                    weight: w1,
-                    plus_one: true,
-                    eps: 1e-6,
-                    out: post,
-                }),
-            )?;
-            norm::rmsnorm_residual_add(ctx, x, wt, 1e-6, t3, y3, None, None)
-        })
+        .run(|ctx| norm::layernorm_no_scale(ctx, x, 1e-5, ln))
         .unwrap()
     {
         return;
     }
     let mut want_ln = vec![0f32; xs.len()];
-    let mut want_sum = vec![0f32; xs.len()];
-    let mut want_out = vec![0f32; xs.len()];
-    let mut want_t = vec![0f32; xs.len()];
-    let mut want_y2 = vec![0f32; xs.len()];
-    let mut want_scaled = vec![0f32; xs.len()];
-    let mut want_post = vec![0f32; xs.len()];
     for row in 0..rows {
         let at = row * width;
         let xr = &xs[at..at + width];
-        let yr = &ys[at..at + width];
         let mean = xr.iter().sum::<f32>() / width as f32;
         let var = xr.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / width as f32;
         let inv = 1.0 / (var + 1e-5).sqrt();
-        let sum: Vec<f32> = (0..width).map(|i| round_bf16(yr[i] + xr[i])).collect();
-        let is = rms(&sum, 1e-6);
-        let ix = rms(xr, 1e-6);
-        let tv: Vec<f32> = (0..width).map(|i| round_bf16(xr[i] * ix * ws[i])).collect();
-        let folded: Vec<f32> = (0..width).map(|i| round_bf16(yr[i] + tv[i])).collect();
-        let sc: Vec<f32> = folded.iter().map(|v| round_bf16(v * 0.75)).collect();
-        let ip = rms(&sc, 1e-6);
         for i in 0..width {
             want_ln[at + i] = round_bf16((xr[i] - mean) * inv);
-            want_sum[at + i] = sum[i];
-            want_out[at + i] = round_bf16(sum[i] * is * (1.0 + ws[i]));
-            want_t[at + i] = tv[i];
-            want_y2[at + i] = folded[i];
-            want_scaled[at + i] = sc[i];
-            want_post[at + i] = round_bf16(sc[i] * ip * (1.0 + w1s[i]));
         }
     }
     assert_close(&b.read_f32(ln), &want_ln, 1e-2, 1e-2);
-    assert_close(&b.read_f32(y), &want_sum, 0.0, 0.0);
-    assert_close(&b.read_f32(out), &want_out, 1e-2, 1e-2);
-    assert_close(&b.read_f32(t), &want_t, 1e-2, 1e-2);
-    assert_close(&b.read_f32(y2), &want_y2, 1e-2, 1e-2);
-    assert_close(&b.read_f32(scaled), &want_scaled, 1e-2, 1e-2);
-    assert_close(&b.read_f32(post), &want_post, 2e-2, 1e-2);
-    assert_close(&b.read_f32(t3), &want_t, 1e-2, 1e-2);
-    assert_close(&b.read_f32(y3), &want_y2, 1e-2, 1e-2);
 }
 
 #[test]

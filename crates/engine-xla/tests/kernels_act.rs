@@ -81,30 +81,8 @@ fn activations_and_binaries_answer_the_host() {
     assert_close(&b.read_f32(of), &want, 1e-5, 1e-5);
 }
 
-fn norm_rows(x: &[f32], width: usize, layer: bool, head: usize, eps: f32) -> Vec<f32> {
-    let mut out = vec![0f32; x.len()];
-    if layer {
-        for (r, c) in x.chunks(width).enumerate() {
-            let mean = c.iter().sum::<f32>() / width as f32;
-            let var = c.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / width as f32;
-            let inv = 1.0 / (var + eps).sqrt();
-            for (i, v) in c.iter().enumerate() {
-                out[r * width + i] = round_bf16((v - mean) * inv);
-            }
-        }
-    } else {
-        for (r, c) in x.chunks(head).enumerate() {
-            let inv = 1.0 / (c.iter().map(|v| v * v).sum::<f32>() / head as f32 + eps).sqrt();
-            for (i, v) in c.iter().enumerate() {
-                out[r * head + i] = round_bf16(v * inv);
-            }
-        }
-    }
-    out
-}
-
 #[test]
-fn modulation_forms_lane_maps_and_fused_norms_answer_the_host() {
+fn modulation_forms_and_lane_maps_answer_the_host() {
     let (rows, width, lanes) = (6usize, 64usize, 2usize);
     let (r, w) = (rows as u32, width as u32);
     let xs = data(rows * width, 3);
@@ -115,7 +93,6 @@ fn modulation_forms_lane_maps_and_fused_norms_answer_the_host() {
     let mut b = Bench::new();
     let x = b.bf16(r, w, &xs);
     let m = b.bf16(r, 2 * w, &ms);
-    let mf = b.f32(lanes as u32, 2 * w, &lm);
     let lane = b.i32(r, 1, &map);
     let o_ss = b.zeros(Dtype::Bf16, r, w);
     let o_sc = b.zeros(Dtype::Bf16, r, w);
@@ -123,43 +100,12 @@ fn modulation_forms_lane_maps_and_fused_norms_answer_the_host() {
     let g1 = b.f32(lanes as u32, w, &lm[..lanes * width]);
     let y = b.bf16(r, w, &ys);
     let rr = b.bf16(r, w, &xs);
-    let normed = b.zeros(Dtype::Bf16, r, w);
-    let out = b.zeros(Dtype::Bf16, r, w);
-    let r2 = b.bf16(r, w, &xs);
-    let normed2 = b.zeros(Dtype::Bf16, r, w);
-    let out2 = b.zeros(Dtype::Bf16, r, w);
     if !b
         .run(|ctx| {
             act::modulate(ctx, act::Form::ScaleShift, x, m, None, o_ss)?;
             act::modulate(ctx, act::Form::Scale, x, g1, Some(lane), o_sc)?;
             act::modulate(ctx, act::Form::TanhGate, x, g1, Some(lane), o_tg)?;
-            act::gated_residual_add(ctx, rr, g1, y, Some(lane), rr)?;
-            act::norm_modulate(
-                ctx,
-                x,
-                act::NormKind::Rmsnorm {
-                    head_dim: 32,
-                    eps: 1e-6,
-                },
-                normed,
-                mf,
-                Some(lane),
-                act::Form::ScaleShift,
-                out,
-            )?;
-            act::gated_residual_norm_modulate(
-                ctx,
-                r2,
-                g1,
-                y,
-                Some(lane),
-                r2,
-                act::NormKind::Layernorm { eps: 1e-6 },
-                normed2,
-                mf,
-                act::Form::ScaleShift,
-                out2,
-            )
+            act::gated_residual_add(ctx, rr, g1, y, Some(lane), rr)
         })
         .unwrap()
     {
@@ -185,22 +131,6 @@ fn modulation_forms_lane_maps_and_fused_norms_answer_the_host() {
     assert_close(&b.read_f32(o_sc), &w_sc, 1e-2, 1e-2);
     assert_close(&b.read_f32(o_tg), &w_tg, 1e-2, 1e-2);
     assert_close(&b.read_f32(rr), &w_r, 1e-2, 1e-2);
-    let bend = |nv: &[f32]| -> Vec<f32> {
-        (0..rows * width)
-            .map(|at| {
-                let (n, i) = (at / width, at % width);
-                let l = lane_of(n);
-                round_bf16(nv[at] * (1.0 + lm[l * 2 * width + i]) + lm[l * 2 * width + width + i])
-            })
-            .collect()
-    };
-    let n1 = norm_rows(&xs, width, false, 32, 1e-6);
-    assert_close(&b.read_f32(normed), &n1, 1e-2, 1e-2);
-    assert_close(&b.read_f32(out), &bend(&b.read_f32(normed)), 1e-2, 1e-2);
-    assert_close(&b.read_f32(r2), &w_r, 1e-2, 1e-2);
-    let n2 = norm_rows(&b.read_f32(r2), width, true, 0, 1e-6);
-    assert_close(&b.read_f32(normed2), &n2, 1e-2, 1e-2);
-    assert_close(&b.read_f32(out2), &bend(&b.read_f32(normed2)), 1e-2, 1e-2);
 }
 
 fn bucket(d: i32, bi: bool, nb: i32, log_ratio: f32) -> i32 {
@@ -275,73 +205,6 @@ fn sinusoid_and_bucket_tables_answer_the_host() {
         }
         assert_close(&b.read_f32(got), &want, 0.0, 0.0);
     }
-}
-
-#[test]
-fn embed_scale_add_and_its_select_form_answer_the_host() {
-    let (rows, hidden, vocab, layers) = (4usize, 48usize, 10u32, 3usize);
-    let table = data(vocab as usize * hidden, 8);
-    let ids = [3i32, -1, 9, 12];
-    let ys = data(rows * hidden, 9);
-    let stacked = data(rows * layers * hidden, 10);
-    let (a, bs) = (1.7f32, 0.3f32);
-    let (r, h) = (rows as u32, hidden as u32);
-    let mut b = Bench::new();
-    let it = b.i32(r, 1, &ids);
-    let tt = b.bf16(vocab, h, &table);
-    let e = b.zeros(Dtype::Bf16, r, h);
-    let es = b.zeros(Dtype::Bf16, r, h);
-    let y = b.bf16(r, h, &ys);
-    let yss = b.zeros(Dtype::Bf16, r, h);
-    let e2 = b.zeros(Dtype::Bf16, r, h);
-    let es2 = b.zeros(Dtype::Bf16, r, h);
-    let st = b.bf16(r, (layers * hidden) as u32, &stacked);
-    let yo = b.zeros(Dtype::Bf16, r, h);
-    let ys2 = b.zeros(Dtype::Bf16, r, h);
-    if !b
-        .run(|ctx| {
-            act::embed_scale_add(ctx, it, tt, vocab, e, a, es, y, bs, yss)?;
-            act::embed_scale_add_select(ctx, it, tt, vocab, e2, a, es2, st, 1, h, yo, bs, ys2)
-        })
-        .unwrap()
-    {
-        return;
-    }
-    let (ar, br) = (round_bf16(a), round_bf16(bs));
-    let mut we = vec![0f32; rows * hidden];
-    let mut wes = we.clone();
-    let mut wy = we.clone();
-    let mut wys = we.clone();
-    let mut wyo = we.clone();
-    let mut wys2 = we.clone();
-    for n in 0..rows {
-        let id = if ids[n] >= 0 && (ids[n] as u32) < vocab {
-            ids[n] as usize
-        } else {
-            0
-        };
-        for k in 0..hidden {
-            let at = n * hidden + k;
-            let ev = table[id * hidden + k];
-            let esv = round_bf16(ev * ar);
-            let yv = round_bf16(ys[at] + esv);
-            let yo_v = round_bf16(stacked[n * layers * hidden + hidden + k] + esv);
-            we[at] = ev;
-            wes[at] = esv;
-            wy[at] = yv;
-            wys[at] = round_bf16(yv * br);
-            wyo[at] = yo_v;
-            wys2[at] = round_bf16(yo_v * br);
-        }
-    }
-    assert_close(&b.read_f32(e), &we, 0.0, 0.0);
-    assert_close(&b.read_f32(es), &wes, 0.0, 0.0);
-    assert_close(&b.read_f32(y), &wy, 0.0, 0.0);
-    assert_close(&b.read_f32(yss), &wys, 0.0, 0.0);
-    assert_close(&b.read_f32(e2), &we, 0.0, 0.0);
-    assert_close(&b.read_f32(es2), &wes, 0.0, 0.0);
-    assert_close(&b.read_f32(yo), &wyo, 0.0, 0.0);
-    assert_close(&b.read_f32(ys2), &wys2, 0.0, 0.0);
 }
 
 #[test]

@@ -9,13 +9,7 @@ use crate::run::Run;
 impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         self.ctx().scope(op.name());
-        match op {
-            Fused::MatmulGeglu { .. } | Fused::LmHeadSoftcap { .. } | Fused::MatmulBias { .. } => {
-                self.fused_linear(op)
-            }
-            _ => self.fused_elementwise(op),
-        }
-        .map_err(crate::error::kernel)
+        Err(KernelError::Unsupported { op: op.name() })
     }
 }
 

@@ -5,7 +5,7 @@ use crate::run::Run;
 
 impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
-        self.fused_elementwise(op).map_err(crate::error::kernel)
+        Err(KernelError::Unsupported { op: op.name() })
     }
 }
 
