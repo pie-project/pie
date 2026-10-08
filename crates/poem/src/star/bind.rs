@@ -591,6 +591,31 @@ pub(crate) fn wholes(builder: &mut starlark::environment::GlobalsBuilder) {
         })))
     }
 
+    /// A conv stated whole: kernel `k`, `stride`, `pad` before and
+    /// `pad_back` after each (t, h, w) axis, `causal_t` reading only past
+    /// frames, its time padded by `time_pad` ("zero" or "replicate").
+    fn conv3d<'v>(
+        #[starlark(require = named)] k: Star<'v>,
+        #[starlark(require = named)] stride: Star<'v>,
+        #[starlark(require = named)] pad: Star<'v>,
+        #[starlark(require = named)] pad_back: Star<'v>,
+        #[starlark(require = named, default = false)] causal_t: bool,
+        #[starlark(require = named, default = "zero")] time_pad: &str,
+    ) -> anyhow::Result<Whole> {
+        Ok(Whole(Held::Conv(Conv {
+            k: <[u32; 3]>::arg(Some(k))?,
+            stride: <[u32; 3]>::arg(Some(stride))?,
+            pad: <[u32; 3]>::arg(Some(pad))?,
+            pad_back: <[u32; 3]>::arg(Some(pad_back))?,
+            causal_t,
+            time_pad: match time_pad {
+                "zero" => poem_ir::ops::spatial::TimePad::Zero,
+                "replicate" => poem_ir::ops::spatial::TimePad::Replicate,
+                other => anyhow::bail!("a conv pads time with zero or replicate, not {other}"),
+            },
+        })))
+    }
+
     /// The grid rule a conv steps its grid by.
     fn grid_rule(#[starlark(require = pos)] conv: Star<'_>) -> anyhow::Result<Whole> {
         Ok(Whole(Held::Grid(Conv::arg(Some(conv))?.rule())))

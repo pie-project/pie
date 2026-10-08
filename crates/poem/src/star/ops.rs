@@ -3,7 +3,6 @@
 //!
 //! Every op and `Input` method a package can spell the arguments and
 //! result of. Not bound:
-//! `elemwise::relative_bucket_bias`
 
 use crate::ops;
 use crate::star::bind::spelled::*;
@@ -2321,6 +2320,39 @@ pub(crate) static OPS: &[Op] = &[
                 heap,
                 dsl("elemwise.sinusoid", || {
                     ops::elemwise::sinusoid(&t, dim, max_period, flip_sin_cos, scale)
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "elemwise",
+        name: "relative_bucket_bias",
+        params: &[
+            "r",
+            "embedding",
+            "max_len",
+            "num_buckets",
+            "max_distance",
+            "bidirectional",
+        ],
+        call: |a, heap| {
+            let r: Input = a.next()?;
+            let embedding: Weight = a.next()?;
+            let max_len: u32 = a.next()?;
+            let num_buckets: u32 = a.next()?;
+            let max_distance: f32 = a.next()?;
+            let bidirectional: bool = a.next()?;
+            result(
+                heap,
+                dsl("elemwise.relative_bucket_bias", || {
+                    ops::elemwise::relative_bucket_bias(
+                        r.recorder(),
+                        &embedding,
+                        max_len,
+                        num_buckets,
+                        max_distance,
+                        bidirectional,
+                    )
                 })?,
             )
         },

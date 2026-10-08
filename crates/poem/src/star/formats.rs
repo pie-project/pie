@@ -126,6 +126,20 @@ impl<'v> StarlarkValue<'v> for EncodingValue {
             .downcast_ref::<EncodingValue>()
             .is_some_and(|other| other.0 == self.0))
     }
+
+    /// `raw`: the dtype of plain values, or `None` for a quantized
+    /// encoding.
+    fn get_attr(&self, attribute: &str, heap: starlark::values::Heap<'v>) -> Option<Value<'v>> {
+        match (attribute, &self.0) {
+            ("raw", Encoding::Raw(dtype)) => Some(heap.alloc(DtypeValue(*dtype))),
+            ("raw", _) => Some(Value::new_none()),
+            _ => None,
+        }
+    }
+
+    fn has_attr(&self, attribute: &str, _heap: starlark::values::Heap<'v>) -> bool {
+        attribute == "raw"
+    }
 }
 
 /// A checkpoint attribute as Starlark spells it.

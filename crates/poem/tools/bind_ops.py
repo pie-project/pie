@@ -47,6 +47,8 @@ PARAMS = {
     "&str": ("String", "&{}"),
     "u8": ("u8", "{}"),
     "impl Into<u64>": ("u64", "{}"),
+    # An op that records outside any value takes the rows whose trace it is.
+    "&Recorder": ("Input", "{}.recorder()"),
 }
 RESULTS = {"Value", "(Value, Value)", "(Value, Value, Value)", "()", "RaggedMask", "ValueId"}
 
