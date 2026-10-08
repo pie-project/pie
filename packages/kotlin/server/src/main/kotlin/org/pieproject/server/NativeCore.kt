@@ -1,6 +1,5 @@
 package org.pieproject.server
 
-/** libpie_server.so (`core/`): failures throw `PieException.Server`. */
 internal object NativeCore {
     init {
         System.loadLibrary("pie_server")

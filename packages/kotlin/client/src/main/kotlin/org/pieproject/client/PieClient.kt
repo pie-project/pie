@@ -2,6 +2,7 @@ package org.pieproject.client
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -11,6 +12,9 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.consumeAsFlow
 import kotlinx.coroutines.flow.filterIsInstance
 import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onCompletion
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
@@ -27,7 +31,8 @@ public class PieClient private constructor(private val transport: PieTransport) 
     /** Events that arrived before their process's launch response. */
     private val early = HashMap<String, MutableList<ServerFrame.ProcessEvent>>()
     private var failure: Throwable? = null
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default + CoroutineExceptionHandler { _, _ -> })
 
     public companion object {
         /** Connects to a `pie serve` at `ws://host:port`. */
@@ -37,16 +42,12 @@ public class PieClient private constructor(private val transport: PieTransport) 
         /** Speaks the protocol over [transport]; returns once the server answers a ping. */
         public suspend fun connect(transport: PieTransport): PieClient {
             val client = PieClient(transport)
-            client.scope.launch {
-                try {
-                    transport.frames.collect(client::receive)
-                    client.fail(PieException.ConnectionClosed())
-                } catch (error: CancellationException) {
-                    throw error
-                } catch (error: Throwable) {
-                    client.fail(error)
+            transport.frames
+                .onEach(client::receive)
+                .onCompletion { cause ->
+                    if (cause !is CancellationException) client.fail(cause ?: PieException.ConnectionClosed())
                 }
-            }
+                .launchIn(client.scope)
             try {
                 client.ping()
             } catch (error: Throwable) {
@@ -68,8 +69,12 @@ public class PieClient private constructor(private val transport: PieTransport) 
     }
 
     /** Launches an installed inferlet (`name` or `name@version`); [input] is encoded as the JSON its `main` receives. */
-    public suspend inline fun <reified T> launch(inferlet: String, input: T, captureOutputs: Boolean = true): PieProcess =
-        launch(inferlet, Json.encodeToJsonElement(input), captureOutputs)
+    public suspend inline fun <reified T> launch(
+        inferlet: String,
+        input: T,
+        captureOutputs: Boolean = true,
+        json: Json = Json,
+    ): PieProcess = launch(inferlet, json.encodeToJsonElement(input), captureOutputs)
 
     /** Launches an inferlet with [input] as its JSON input. */
     public suspend fun launch(
@@ -80,7 +85,7 @@ public class PieClient private constructor(private val transport: PieTransport) 
         val id = request(ClientFrame.Launch(inferlet, input.toString(), captureOutputs))
         val events = Channel<PieProcess.Event>(Channel.UNLIMITED)
         events.invokeOnClose { cause ->
-            if (cause is CancellationException) scope.launch { runCatching { terminate(id) } }
+            if (cause is CancellationException) scope.launch { terminate(id) }
         }
         synchronized(lock) {
             processes[id] = events
@@ -98,7 +103,6 @@ public class PieClient private constructor(private val transport: PieTransport) 
         request(ClientFrame.Terminate(processId))
     }
 
-    /** Sends [frame] and waits for its response; the response's slot exists before the send. */
     private suspend fun request(frame: ClientFrame): String {
         val answer = CompletableDeferred<String>()
         val id = synchronized(lock) {
@@ -116,7 +120,11 @@ public class PieClient private constructor(private val transport: PieTransport) 
     }
 
     private fun receive(data: ByteArray) {
-        val frame = runCatching { ServerFrame.decode(data) }.getOrNull() ?: return
+        val frame = try {
+            ServerFrame.decode(data)
+        } catch (_: Exception) {
+            return
+        }
         synchronized(lock) {
             when (frame) {
                 is ServerFrame.Response -> pending.remove(frame.correlationId)?.let {
@@ -129,7 +137,6 @@ public class PieClient private constructor(private val transport: PieTransport) 
         }
     }
 
-    /** Called with [lock] held. */
     private fun deliver(frame: ServerFrame.ProcessEvent) {
         val events = processes[frame.processId] ?: return
         when (frame.event) {

@@ -1,7 +1,6 @@
 package org.pieproject.client
 
 public sealed class PieException(message: String) : Exception(message) {
-    /** The connection or session is closed. */
     public class ConnectionClosed : PieException("The connection is closed.")
 
     /** The server refused a request (an unknown inferlet, a bad input, ...). */

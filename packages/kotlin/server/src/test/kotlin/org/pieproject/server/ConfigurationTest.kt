@@ -16,13 +16,13 @@ class ConfigurationTest {
                 "gpu_mem_utilization", "max_total_pages", "max_forward_tokens", "max_forward_requests",
                 "max_state_slots", "max_model_len", "sandbox_memory_mb", "max_concurrent_processes", "sku",
             ),
-            encoded(PieServer.Configuration(sku = "qwen35-d0.8b-u4g64-kv-bf16")).keys,
+            encoded(PieServer.Configuration().apply { sku = "qwen35-d0.8b-u4g64-kv-bf16" }).keys,
         )
     }
 
     @Test
     fun leavesUnsetOptionsOut() {
-        val config = encoded(PieServer.Configuration(maxConcurrentProcesses = null))
+        val config = encoded(PieServer.Configuration().apply { maxConcurrentProcesses = null })
         assertNull(config["max_concurrent_processes"])
         assertNull(config["sku"])
     }

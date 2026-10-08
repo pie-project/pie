@@ -22,7 +22,7 @@ val server = PieServer.start(
     model = File(context.filesDir, "qwen.vulkan.zt"),
     home = File(context.cacheDir, "pie"),
     languages = listOf(PieServer.Language.python),
-)
+) { maxModelLength = 8192 }                       // PieServer.Configuration, sized for a phone by default
 val client = server.connect()                     // frames never leave the process
 val name = server.install(File(context.filesDir, "main.py"))
 client.launch(name, Prompt("Hi!")).events.collect { event ->

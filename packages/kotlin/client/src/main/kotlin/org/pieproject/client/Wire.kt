@@ -2,8 +2,8 @@ package org.pieproject.client
 
 import org.msgpack.core.MessagePack
 import org.msgpack.value.Value
+import org.msgpack.value.ValueFactory
 
-/** crates/client-api's frames, as far as this client speaks them. */
 internal sealed interface ClientFrame {
     data object Ping : ClientFrame
     data class Launch(val inferlet: String, val input: String, val captureOutputs: Boolean) : ClientFrame
@@ -11,29 +11,23 @@ internal sealed interface ClientFrame {
     data class Terminate(val processId: String) : ClientFrame
 
     fun encoded(correlationId: Int): ByteArray {
-        val id = correlationId.toUInt().toLong()
-        val fields: List<Pair<String, Any>> = when (this) {
-            Ping -> listOf("type" to "ping", "corr_id" to id)
-            is Launch -> listOf(
-                "type" to "launch_process", "corr_id" to id, "inferlet" to inferlet,
-                "input" to input, "capture_outputs" to captureOutputs,
+        val id = ValueFactory.newInteger(correlationId.toUInt().toLong())
+        val fields = when (this) {
+            Ping -> mapOf("type" to string("ping"), "corr_id" to id)
+            is Launch -> mapOf(
+                "type" to string("launch_process"), "corr_id" to id, "inferlet" to string(inferlet),
+                "input" to string(input), "capture_outputs" to ValueFactory.newBoolean(captureOutputs),
             )
-            is Signal -> listOf("type" to "signal_process", "process_id" to processId, "message" to message)
-            is Terminate -> listOf("type" to "terminate_process", "corr_id" to id, "process_id" to processId)
+            is Signal -> mapOf(
+                "type" to string("signal_process"), "process_id" to string(processId), "message" to string(message),
+            )
+            is Terminate -> mapOf("type" to string("terminate_process"), "corr_id" to id, "process_id" to string(processId))
         }
-        val packer = MessagePack.newDefaultBufferPacker()
-        packer.packMapHeader(fields.size)
-        for ((key, value) in fields) {
-            packer.packString(key)
-            when (value) {
-                is String -> packer.packString(value)
-                is Long -> packer.packLong(value)
-                is Boolean -> packer.packBoolean(value)
-                else -> error("unencodable $value")
-            }
-        }
-        return packer.toByteArray()
+        val map = ValueFactory.newMap(fields.mapKeys { (key, _) -> string(key) })
+        return MessagePack.newDefaultBufferPacker().apply { packValue(map) }.toByteArray()
     }
+
+    private fun string(value: String): Value = ValueFactory.newString(value)
 }
 
 internal sealed interface ServerFrame {

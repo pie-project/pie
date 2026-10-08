@@ -177,7 +177,6 @@ pub extern "system" fn Java_org_pieproject_server_NativeCore_sendFrame(
     });
 }
 
-/// Up to `max` server frames, waiting at most `max_wait_ms` for the first.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_pieproject_server_NativeCore_recvFrames(
     mut env: JNIEnv,
