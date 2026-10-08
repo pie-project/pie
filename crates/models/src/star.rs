@@ -137,3 +137,31 @@ fn family(package: &'static poem::star::Package) -> Vec<Entry> {
 pub fn families() -> Vec<Vec<Entry>> {
     packages().iter().map(family).collect()
 }
+
+/// The package holding the model `id` with `forward` appended to its
+/// `forward.star` in place of the forward it states, which stays as
+/// `whole_forward`: a part of a model traced alone, by its own functions.
+pub fn with_forward(id: &str, forward: &str) -> Result<poem::star::Package, String> {
+    let package = package_of(id).ok_or_else(|| format!("no package holds `{id}`"))?;
+    let prefix = format!("{}files/", poem::star::ATTRIBUTE);
+    let files: Vec<(String, String)> = package
+        .attributes()
+        .into_iter()
+        .filter_map(|(key, source)| {
+            let file = key.strip_prefix(&prefix)?.to_string();
+            let source = if file == "forward.star" {
+                source.replace("def forward(m, inputs):", "def whole_forward(m, inputs):")
+                    + "\n"
+                    + forward
+            } else {
+                source
+            };
+            Some((file, source))
+        })
+        .collect();
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(f, s)| (f.as_str(), s.as_str()))
+        .collect();
+    poem::star::Package::new(package.name(), &files).map_err(|why| format!("{why:#}"))
+}

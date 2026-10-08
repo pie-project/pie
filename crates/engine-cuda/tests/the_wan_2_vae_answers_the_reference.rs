@@ -5,34 +5,29 @@ use std::time::Instant;
 
 use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
-use models::wan_2::model::Model;
-use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Stream, Value, trace_hybrid,
-};
+use poem::{Dtype, Platform, Request, Stream, Trace};
 use poem_compiler::{Budget, VoxelLadder};
 
-struct VaeOnly {
-    model: Model,
-}
+/// The VAE's decode readings alone, by the package's own functions.
+const VAE_ONLY: &str = r#"
+def forward(m, inputs):
+    inputs.reading("vae.decode.head", lambda rows: vae_decode(rows, m.vae, True))
+    return inputs.reading("vae.decode", lambda rows: vae_decode(rows, m.vae, False))
+"#;
 
-impl ForwardHybrid for VaeOnly {
-    fn caches(&self) -> HybridSpec {
-        self.model.caches()
-    }
-
-    fn forward(&self, inputs: Input) -> Value {
-        let vae = self
-            .model
-            .vae
-            .as_ref()
-            .expect("the flagship carries the VAE");
-        let _ = inputs.reading("vae.decode.head", |rows| {
-            models::wan_2::forward::vae_decode(rows, vae, true)
-        });
-        inputs.reading("vae.decode", |rows| {
-            models::wan_2::forward::vae_decode(rows, vae, false)
-        })
-    }
+fn vae_only() -> Trace {
+    let package = models::star::with_forward("wan22-ti2v-5b", VAE_ONLY)
+        .unwrap_or_else(|why| panic!("the VAE-only package: {why}"));
+    let deploy = poem::star::Deploy {
+        weights: vec![Dtype::Bf16],
+        kv: Dtype::Bf16,
+        tp: 1,
+        parts: vec![],
+        drafter: None,
+    };
+    package
+        .trace("wan22-ti2v-5b", &deploy, "wan22-vae-decode", Platform::Cuda)
+        .unwrap_or_else(|why| panic!("the VAE-only plan: {why:#}"))
 }
 
 fn artifact() -> Option<PathBuf> {
@@ -152,9 +147,7 @@ impl Decoder {
 }
 
 fn load(artifact: &PathBuf, max_voxels: u32) -> (Decoder, f64) {
-    let model = Model::ti2v_5b(Dtype::Bf16);
-    let arm = VaeOnly { model };
-    let trace = trace_hybrid("wan22-vae-decode", &arm, Platform::Cuda);
+    let trace = vae_only();
     let src = ztensor::Source::open(artifact)
         .unwrap_or_else(|why| panic!("{}: {why}", artifact.display()));
     let contract = poem::import::own_contract(&src, &trace.params, 1, Platform::Cuda)
