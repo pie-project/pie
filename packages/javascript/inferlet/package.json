@@ -19,7 +19,7 @@
     "derive-wit": "node scripts/derive-js-wit.mjs"
   },
   "devDependencies": {
-    "@bytecodealliance/componentize-js": "^0.22.0",
+    "@bytecodealliance/componentize-js": "^0.23.0",
     "@bytecodealliance/jco": "^1.34.0",
     "acorn": "^8.18.0",
     "esbuild": "^0.28.2",
