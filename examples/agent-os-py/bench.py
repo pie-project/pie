@@ -173,6 +173,9 @@ CONFIGS = {
     "council4x2": {"name": "council", "n": 4, "j": 2},
     "council4x3": {"name": "council", "n": 4, "j": 3},
     "council3x3": {"name": "council", "n": 3, "j": 3},
+    "adaptive-lean": {"name": "adaptive", "w0": 2, "step": 1, "wmax": 6, "delta": 0.15, "judge": False, "giveup": 3},
+    "adaptive-w8": {"name": "adaptive", "w0": 2, "step": 1, "wmax": 8, "delta": 0.15, "judge": False},
+    "adaptive-w6": {"name": "adaptive", "w0": 2, "step": 1, "wmax": 6, "delta": 0.15, "judge": False},
     "adaptive": {"name": "adaptive", "w0": 2, "step": 2, "wmax": 12, "delta": 0.08, "judge": True, "judge_at": 8},
     "adaptive-nojudge": {"name": "adaptive", "w0": 2, "step": 2, "wmax": 12, "delta": 0.08, "judge": False},
 }
