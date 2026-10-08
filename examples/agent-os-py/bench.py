@@ -96,18 +96,22 @@ def load_math(levels, n, offset=0):
 
 
 def run(label, problems, policy, budget_per_problem=None, max_new=320, max_rows=32, temperature=0.7,
-        seed=17, trace=True, stream=False, timeout=7200, solver_sys=None, state_slots=192, engine=None):
+        seed=17, trace=True, stream=False, timeout=7200, solver_sys=None, state_slots=192, engine=None, model_name=None, arena_pages=None):
     cfg = {"mode": "solve", "problems": problems, "policy": policy, "max_new": max_new, "max_rows": max_rows,
            "temperature": temperature, "seed": seed, "trace": trace, "stream": stream, "state_slots": state_slots}
     if budget_per_problem:
         cfg["budget_per_problem"] = budget_per_problem
     if solver_sys:
         cfg["solver_sys"] = solver_sys
+    if arena_pages:
+        cfg["arena_pages"] = arena_pages
     # never start on a machine that is already under pressure
     start_free = free_pct()
     if start_free is not None and 100 - start_free > MemGuard.RESUME_AT_USED:
         raise RuntimeError(f"{label}: {100 - start_free}% of memory in use; refusing to start (limit {MemGuard.RESUME_AT_USED}%)")
     conf = open(os.path.join(HERE, "agentos.toml")).read()
+    if model_name:
+        conf = re.sub(r'(?m)^model = ".*"$', f'model = "{model_name}"', conf)
     over = {"max_state_slots": state_slots, **(engine or {})}
     for k, v in over.items():
         conf = re.sub(rf"(?m)^{k}\s*=.*$", "", conf)
@@ -169,8 +173,8 @@ CONFIGS = {
     "council4x2": {"name": "council", "n": 4, "j": 2},
     "council4x3": {"name": "council", "n": 4, "j": 3},
     "council3x3": {"name": "council", "n": 3, "j": 3},
-    "adaptive": {"name": "adaptive", "w0": 3, "step": 3, "wmax": 15, "delta": 0.08, "judge": True},
-    "adaptive-nojudge": {"name": "adaptive", "w0": 3, "step": 3, "wmax": 15, "delta": 0.08, "judge": False},
+    "adaptive": {"name": "adaptive", "w0": 2, "step": 2, "wmax": 12, "delta": 0.08, "judge": True, "judge_at": 8},
+    "adaptive-nojudge": {"name": "adaptive", "w0": 2, "step": 2, "wmax": 12, "delta": 0.08, "judge": False},
 }
 
 if __name__ == "__main__":
@@ -184,11 +188,16 @@ if __name__ == "__main__":
     ap.add_argument("--max-rows", type=int, default=32)
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--tag", default="run")
+    ap.add_argument("--arena-pages", type=int, default=None)
+    ap.add_argument("--state-slots", type=int, default=192)
+    ap.add_argument("--engine", action="append", default=[], help="engine override key=value (repeatable)")
+    ap.add_argument("--model", default=None, help="HF id of an imported model, e.g. Qwen/Qwen3.5-4B")
     a = ap.parse_args()
     probs = load_math([int(x) for x in a.levels.split(",")], a.n, a.offset)
     print(f"{len(probs)} problems, levels {a.levels}")
     for name in a.configs.split(","):
         pol = CONFIGS[name]
         r = run(f"{a.tag}-{name}", probs, pol, budget_per_problem=a.budget if pol["name"] == "adaptive" else None,
-                max_new=a.max_new, max_rows=a.max_rows, temperature=a.temperature)
+                max_new=a.max_new, max_rows=a.max_rows, temperature=a.temperature, model_name=a.model,
+                arena_pages=a.arena_pages, state_slots=a.state_slots, engine=dict(kv.split("=", 1) for kv in a.engine) or None)
         print(row(name, r), flush=True)
