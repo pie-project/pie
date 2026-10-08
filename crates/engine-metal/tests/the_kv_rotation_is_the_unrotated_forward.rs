@@ -219,6 +219,7 @@ fn try_load(dir: &Path, w: Dtype, rotate: bool) -> Result<Shell, String> {
         pages: 4 * 128 / 16,
         runahead: engine::runahead::Runahead::F1,
         residency: engine_metal::ResidencyPlan::default(),
+        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
     })
     .map_err(|e| e.to_string())
 }
