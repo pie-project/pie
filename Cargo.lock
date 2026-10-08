@@ -3885,7 +3885,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pie-server-swift"
+name = "pie-swift-core"
 version = "0.5.4"
 dependencies = [
  "anyhow",

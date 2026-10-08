@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Builds server/ (the Rust core) for every Apple slice and bundles them, with
-# include/pie_server.h as the PieServerCore module, into
+# Builds core/ (the Rust core) for every Apple slice and bundles them, with
+# core/include/pie_server.h as the PieServerCore module, into
 # build/PieServerCore.xcframework, which Package.swift links.
 #
 #   ./build-xcframework.sh [release|dev]
@@ -22,13 +22,13 @@ slices=(aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin)
 for triple in "${slices[@]}"; do
   echo "== $triple ($profile)"
   rustup target add "$triple" >/dev/null
-  (cd "$root" && CARGO_TARGET_DIR="$root/target-apple" cargo build --target "$triple" -p pie-server-swift $flag)
+  (cd "$root" && CARGO_TARGET_DIR="$root/target-apple" cargo build --target "$triple" -p pie-swift-core $flag)
 done
 
 headers="build/headers"
 rm -rf "$headers" build/PieServerCore.xcframework
 mkdir -p "$headers"
-cp server/include/pie_server.h "$headers/"
+cp core/include/pie_server.h "$headers/"
 cat > "$headers/module.modulemap" <<'MAP'
 module PieServerCore {
     header "pie_server.h"

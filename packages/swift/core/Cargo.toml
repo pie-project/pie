@@ -1,5 +1,5 @@
 [package]
-name = "pie-server-swift"
+name = "pie-swift-core"
 version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
