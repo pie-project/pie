@@ -14,3 +14,8 @@ DEPLOYMENTS = [
     deployment("gptoss-20b-mini", weights = [dtype.bf16, dtype.mxfp4], kv = dtype.bf16),
     deployment("gptoss-120b", weights = [dtype.bf16, dtype.mxfp4], kv = dtype.bf16),
 ]
+
+# The drafter published apart from the model it drafts for.
+PUBLISHED = [
+    published(target = "mlx-community/gpt-oss-20b-MXFP4-Q4", head = "z-lab/gpt-oss-20b-DFlash", drafter = "dflash", deployment = "gptoss-20b-dflash-u4g64-mxfp4-kv-bf16"),
+]

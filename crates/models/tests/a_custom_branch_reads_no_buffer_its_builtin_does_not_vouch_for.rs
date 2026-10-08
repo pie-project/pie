@@ -2,7 +2,6 @@
 //! carry it: an inferlet sets a custom fact, so a branch on one alone says
 //! nothing about which lanes hold adapter routes or a mask.
 
-use models::adapter::{Adapters, banks};
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, Value, Weight, fact, ops, switch,
     trace_hybrid,
@@ -22,7 +21,7 @@ impl ForwardHybrid for Probe {
     fn forward(&self, inputs: Input) -> Value {
         let x = inputs.latents(0, WIDTH as u32, Dtype::Bf16);
         let y = ops::linear::matmul(&x, &Weight::sym("w", [WIDTH, WIDTH], Dtype::Bf16));
-        let (a, b) = banks("w", Adapters { slots: 2, rank: 8 }, WIDTH, Dtype::Bf16);
+        let (a, b) = banks("w", 2, 8, WIDTH, Dtype::Bf16);
         let routes = inputs.adapter_routes();
         switch(&y)
             .case((self.rows)(), |y| {
@@ -55,4 +54,19 @@ fn a_custom_branch_reads_no_buffer_its_builtin_does_not_vouch_for() {
     traces(|| fact::scores() & fact::has(fact::Adapter))
         .expect("the flag narrowed to the lanes that carry routes reads them");
     traces(|| fact::has(fact::Adapter)).expect("so does the builtin alone");
+}
+
+/// A layer's two LoRA banks under `prefix`: `slots` adapters of `rank` over
+/// a `hidden`-wide residual, registered by the host.
+fn banks(
+    prefix: &str,
+    slots: u64,
+    rank: u64,
+    hidden: u64,
+    dense: Dtype,
+) -> (poem::Weight, poem::Weight) {
+    (
+        poem::Weight::sym(format!("{prefix}.lora_a"), [slots, rank, hidden], dense).registered(),
+        poem::Weight::sym(format!("{prefix}.lora_b"), [slots, hidden, rank], dense).registered(),
+    )
 }

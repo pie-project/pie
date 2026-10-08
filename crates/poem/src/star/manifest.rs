@@ -76,12 +76,44 @@ impl fmt::Display for Listed {
 #[starlark_value(type = "deployment")]
 impl<'v> StarlarkValue<'v> for Listed {}
 
-/// What a package states of itself: its models, and the deployments it
-/// lists, in the order an import tries them.
+/// A drafter published apart from the model it drafts for: its `head`
+/// repository drafts as `drafter` for the `target` repository, served as the
+/// listed `deployment`.
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    ProvidesStaticType,
+    NoSerialize,
+    StarlarkPagableUnsupported,
+    Allocative,
+)]
+pub struct Published {
+    pub target: String,
+    pub head: String,
+    pub drafter: String,
+    pub deployment: String,
+}
+
+starlark_simple_value!(Published);
+
+impl fmt::Display for Published {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "published({:?}, {:?})", self.target, self.head)
+    }
+}
+
+#[starlark_value(type = "published")]
+impl<'v> StarlarkValue<'v> for Published {}
+
+/// What a package states of itself: its models, the deployments it lists, in
+/// the order an import tries them, and the drafters published for them.
 #[derive(Clone, Debug, Default)]
 pub struct Manifest {
     pub models: Vec<Model>,
     pub deployments: Vec<(String, Deploy)>,
+    pub published: Vec<Published>,
 }
 
 impl Manifest {
@@ -130,6 +162,30 @@ impl Manifest {
                 manifest
                     .deployments
                     .push((listed.model.clone(), listed.deploy.clone()));
+            }
+            if frozen.get("PUBLISHED").is_ok() {
+                for value in list("PUBLISHED")? {
+                    let published = value.downcast_ref::<Published>().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "`{package}/package.star`: `PUBLISHED` holds {}, not a published \
+                             drafter",
+                            value.get_type()
+                        )
+                    })?;
+                    let listed = manifest.deployments.iter().any(|(id, d)| {
+                        manifest
+                            .model(id)
+                            .is_some_and(|m| m.name(d) == published.deployment)
+                    });
+                    if !listed {
+                        anyhow::bail!(
+                            "`{package}/package.star` publishes a drafter for `{}`, which it \
+                             lists no deployment of",
+                            published.deployment
+                        );
+                    }
+                    manifest.published.push(published.clone());
+                }
             }
             Ok(manifest)
         })
@@ -265,6 +321,22 @@ pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
             drafters: drafters.items,
             template,
             tokenizer,
+        })
+    }
+
+    /// A drafter published apart from its model: `head` drafts as `drafter`
+    /// for `target`, served as the listed `deployment`.
+    fn published(
+        #[starlark(require = named)] target: String,
+        #[starlark(require = named)] head: String,
+        #[starlark(require = named)] drafter: String,
+        #[starlark(require = named)] deployment: String,
+    ) -> anyhow::Result<Published> {
+        Ok(Published {
+            target,
+            head,
+            drafter,
+            deployment,
         })
     }
 

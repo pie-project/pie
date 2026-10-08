@@ -42,3 +42,8 @@ DEPLOYMENTS = [
     deployment("diffusiongemma-26b-a4b", weights = [dtype.u8g64, U4, U4], kv = BF, parts = ["selfcond"]),
     deployment("diffusiongemma-26b-a4b", weights = [BF, U4], kv = BF),
 ]
+
+# The drafter published apart from the model it drafts for.
+PUBLISHED = [
+    published(target = "mlx-community/gemma-4-26b-a4b-it-4bit", head = "z-lab/gemma-4-26B-A4B-it-DFlash", drafter = "dflash", deployment = "gemma4-26b-a4b-dflash-u4g64-kv-bf16"),
+]

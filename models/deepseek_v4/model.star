@@ -3,16 +3,10 @@
 # hyper-connections, DeepSeekMoE experts; V4.1-Flash adds Compressed Sparse
 # Attention 2 (cross-layer KV and index reuse), Single-Pass mHC and Engram.
 
-ADAPTERS = struct(slots = 8, rank = 16)
+load("//lib/adapters/model.star", "banks")
 
 DRAFT_DEPTH = 1
 DRAFT_EXPERTS = 256
-
-def banks(prefix, hidden, dense):
-    return (
-        weight(prefix + ".lora_a", [ADAPTERS.slots, ADAPTERS.rank, hidden], dense).registered(),
-        weight(prefix + ".lora_b", [ADAPTERS.slots, hidden, ADAPTERS.rank], dense).registered(),
-    )
 
 def routed(gate, up, down, split, gate_at = []):
     return struct(gate = gate, up = up, down = down, split = split, gate_at = gate_at)
@@ -333,7 +327,6 @@ def flash(w, r, act, kv, d):
         mtp = mtp,
         token_map = None,
     )
-
 
 # ---------------------------------------------------------------------------
 # V4.1-Flash: Causal Encoder-Decoder over CSA2 with cross-layer KV and index

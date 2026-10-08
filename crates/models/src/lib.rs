@@ -1,7 +1,5 @@
-pub mod adapter;
 pub mod catalog;
 pub mod deepseek_v4;
-pub mod drafter;
 pub mod flux_2;
 pub mod gemma_4;
 pub mod glm_5;
@@ -218,11 +216,6 @@ pub fn fits<'a>(
     candidates
         .into_iter()
         .map(move |d| (d, d.contract(src, platform)))
-}
-
-pub(crate) fn dense(banks: Dtype) -> Dtype {
-    poem::compute_dtype(banks)
-        .unwrap_or_else(|| panic!("`{banks:?}` is not a weight representation a family declares"))
 }
 
 pub fn identify(src: &ztensor::Source, platform: Platform) -> Result<&'static str, Unmatched> {

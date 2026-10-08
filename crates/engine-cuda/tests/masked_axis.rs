@@ -2,9 +2,7 @@ use poem::Platform;
 use poem_ir::{Attention, Operation, Trace};
 
 fn carries_a_head(sku: &str) -> bool {
-    models::published::PUBLISHED
-        .iter()
-        .any(|p| p.deployment == sku)
+    models::published::all().any(|p| p.deployment == sku)
 }
 
 fn masked_arms(trace: &Trace) -> usize {

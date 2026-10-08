@@ -71,3 +71,12 @@ DEPLOYMENTS = [
     row("qwen35-d0.8b", U4, None, ["vision"]),
     row("qwen35-d0.8b", BF, None, ["vision"]),
 ]
+
+# The drafters published apart from the models they draft for.
+PUBLISHED = [
+    published(target = "mlx-community/Qwen3.6-27B-4bit", head = "z-lab/Qwen3.6-27B-DFlash", drafter = "dflash", deployment = "qwen36-27b-dflash-u4g64-kv-bf16"),
+    published(target = "mlx-community/Qwen3.8-27B-4bit", head = "z-lab/Qwen3.8-27B-DFlash2", drafter = "dflash2", deployment = "qwen38-27b-dflash2-u4g64-kv-bf16"),
+    published(target = "mlx-community/Qwen3.8-27B-4bit", head = "DimInfer/Qwen3.8-27B-Dspark-v1", drafter = "dspark", deployment = "qwen38-27b-dspark-u4g64-kv-bf16"),
+    published(target = "mlx-community/Qwen3.6-35B-A3B-4bit", head = "z-lab/Qwen3.6-35B-A3B-DFlash", drafter = "dflash", deployment = "qwen36-35b-a3b-dflash-u4g64-kv-bf16"),
+    published(target = "mlx-community/Qwen3.5-9B-4bit", head = "z-lab/Qwen3.5-9B-DFlash", drafter = "dflash", deployment = "qwen35-d9b-dflash-u4g64-kv-bf16"),
+]
