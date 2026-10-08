@@ -138,25 +138,30 @@ pub fn families() -> Vec<Vec<Entry>> {
     packages().iter().map(family).collect()
 }
 
-/// The package holding the model `id` with `forward` appended to its
-/// `forward.star` in place of the forward it states, which stays as
-/// `whole_forward`: a part of a model traced alone, by its own functions.
-pub fn with_forward(id: &str, forward: &str) -> Result<poem::star::Package, String> {
+/// The package holding the model `id` with `source` appended to its `file`,
+/// stating `function` in place of the one the file states, which stays as
+/// `whole_<function>`: a part of a model traced or read alone, by the
+/// package's own functions.
+pub fn replacing(
+    id: &str,
+    file: &str,
+    function: &str,
+    source: &str,
+) -> Result<poem::star::Package, String> {
     let package = package_of(id).ok_or_else(|| format!("no package holds `{id}`"))?;
     let prefix = format!("{}files/", poem::star::ATTRIBUTE);
+    let stated = format!("def {function}(");
     let files: Vec<(String, String)> = package
         .attributes()
         .into_iter()
-        .filter_map(|(key, source)| {
-            let file = key.strip_prefix(&prefix)?.to_string();
-            let source = if file == "forward.star" {
-                source.replace("def forward(m, inputs):", "def whole_forward(m, inputs):")
-                    + "\n"
-                    + forward
+        .filter_map(|(key, text)| {
+            let name = key.strip_prefix(&prefix)?.to_string();
+            let text = if name == file {
+                text.replace(&stated, &format!("def whole_{function}(")) + "\n" + source
             } else {
-                source
+                text
             };
-            Some((file, source))
+            Some((name, text))
         })
         .collect();
     let files: Vec<(&str, &str)> = files

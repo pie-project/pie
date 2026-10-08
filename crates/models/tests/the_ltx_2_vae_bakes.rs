@@ -1,8 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use models::ltx_2::forward::VAE_DECODE;
-use models::ltx_2::model::{self, Model};
+use model::VAE_DECODE;
 use models::{PortKind, ReadoutKind};
 use poem::{Def, Dtype, Operation, Platform, RuntimeInput, Trace};
 use poem_ir::{GridRule, Spatial, TimePad};
@@ -181,9 +180,7 @@ fn the_import_reads_every_decoder_tensor_of_the_real_snapshot_once() {
     };
     let src = checkpoint::file::diffusers::open(&root)
         .unwrap_or_else(|why| panic!("{}: {why}", root.display()));
-    let contract = Model::ltx_2_5(Dtype::Bf16)
-        .import_vae(&src, Platform::Cuda)
-        .unwrap_or_else(|why| panic!("the VAE does not read this snapshot: {why}"));
+    let contract = import_vae(&src);
 
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for tensor in &contract.tensors {
@@ -218,4 +215,209 @@ fn the_import_reads_every_decoder_tensor_of_the_real_snapshot_once() {
         .map(|t| t.name.as_str())
         .collect();
     assert_eq!(stated, vec!["vae.zero"]);
+}
+
+/// The VAE's reads alone, by the package's own functions.
+const VAE_FORMATS: &str = r#"
+def formats(m):
+    return [format("vae", read = lambda reads: vae(reads, m.vae))]
+"#;
+
+fn import_vae(src: &ztensor::Source) -> checkpoint::contract::ModelContract {
+    let package = models::star::replacing("ltx25", "formats.star", "formats", VAE_FORMATS)
+        .unwrap_or_else(|why| panic!("the VAE-only package: {why}"));
+    package
+        .import("ltx25", &flagship(), src, Platform::Cuda)
+        .unwrap_or_else(|why| panic!("the VAE does not read this snapshot: {why}"))
+}
+
+fn flagship() -> poem::star::Deploy {
+    poem::star::Deploy {
+        weights: vec![Dtype::Bf16],
+        kv: Dtype::Bf16,
+        tp: 1,
+        parts: vec![],
+        drafter: None,
+    }
+}
+
+/// The widths and constants ltx_2's package declares.
+#[allow(dead_code)]
+mod model {
+    pub const PATCH_T: u32 = 1;
+    pub const PATCH_H: u32 = 1;
+    pub const PATCH_W: u32 = 1;
+
+    pub const VAE_SPATIAL_COMPRESSION: u32 = 32;
+    pub const VAE_TEMPORAL_COMPRESSION: u32 = 8;
+    pub const VAE_Z: u32 = 128;
+
+    pub const VAE_RGB: u32 = 3;
+    pub const VAE_PATCH: u32 = 4;
+    pub const VAE_EPS: f32 = 1e-8;
+    pub const VAE_DECODER_DIMS: [u32; 5] = [1024, 512, 512, 256, 128];
+    pub const VAE_MID_RESNETS: u32 = 2;
+    pub const VAE_UP_RESNETS: [u32; 4] = [2, 4, 6, 4];
+    pub const VAE_UP_STRIDES: [[u32; 3]; 4] = [[2, 2, 2], [2, 2, 2], [2, 1, 1], [1, 2, 2]];
+
+    pub const T_FREQ_DIM: u32 = 256;
+    pub const T_MAX_PERIOD: f32 = 10_000.0;
+    pub const T_FLIP_SIN_COS: bool = true;
+    pub const T_SCALE: f32 = 1.0;
+
+    pub const NORM_EPS: f32 = 1e-6;
+
+    pub const ROPE_THETA: f32 = 10_000.0;
+    pub const ROPE_MAX_POS: [f32; 3] = [20.0, 2048.0, 2048.0];
+    pub const AUDIO_ROPE_MAX_POS: f32 = 20.0;
+    pub const CROSS_ROPE_MAX_POS: f32 = 20.0;
+    pub const ROPE_AXES: u8 = 3;
+    pub const AUDIO_ROPE_AXES: u8 = 1;
+
+    pub const VIDEO_SCALE: [f32; 3] = [8.0, 32.0, 32.0];
+    pub const AUDIO_SCALE: f32 = 4.0;
+    pub const CAUSAL_OFFSET: f32 = 1.0;
+    pub const AUDIO_SAMPLING_RATE: f32 = 16_000.0;
+    pub const AUDIO_HOP: f32 = 160.0;
+
+    pub const GATE_SCALE: f32 = 2.0;
+
+    pub const MOD_SLICES: u32 = 9;
+    pub const AV_SS_SLICES: u32 = 4;
+    pub const AV_GATE_SLICES: u32 = 1;
+    pub const PROMPT_SLICES: u32 = 2;
+    pub const HEAD_SLICES: u32 = 2;
+
+    pub const AV_GATE_TIMESTEP_SCALE: f32 = 1.0;
+
+    pub const TRAIN_STEPS: u32 = 1000;
+    pub const DISTILLED_SIGMAS: [f32; 8] = [
+        1.0, 0.993_75, 0.987_5, 0.981_25, 0.975, 0.909_375, 0.725, 0.421_875,
+    ];
+    pub const STAGE2_SIGMAS: [f32; 3] = [0.909_375, 0.725, 0.421_875];
+
+    pub const TEXT_LAYERS: u32 = 49;
+    pub const TEXT_LEN: u32 = 1024;
+    pub const CONN_REGISTERS: u32 = 128;
+    pub const CONN_ROPE_BASE: f32 = 4096.0;
+    pub const CONN_FF_MULT: u32 = 4;
+
+    pub mod port {
+        pub const LATENTS: u8 = 0;
+        pub const CONTEXT: u8 = 0;
+        pub const AUDIO_CONTEXT: u8 = 1;
+        pub const TEXT: u8 = 1;
+        pub const TIMESTEP: u8 = 0;
+        pub const POSITIONS: u8 = 0;
+        pub const TIME_POSITIONS: u8 = 1;
+        pub const VOXELS: u8 = 0;
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Dims {
+        pub layers: u32,
+        pub heads: u32,
+        pub head_dim: u32,
+        pub audio_heads: u32,
+        pub audio_head_dim: u32,
+        pub channels: u32,
+        pub cross_dim: u32,
+        pub audio_cross_dim: u32,
+        pub ff_mult: u32,
+        pub caption: u32,
+        pub conn_layers: u32,
+    }
+
+    impl Dims {
+        #[must_use]
+        pub const fn ltx_2_5() -> Dims {
+            Dims {
+                layers: 48,
+                heads: 32,
+                head_dim: 128,
+                audio_heads: 32,
+                audio_head_dim: 64,
+                channels: 128,
+                cross_dim: 4096,
+                audio_cross_dim: 2048,
+                ff_mult: 4,
+                caption: 3840,
+                conn_layers: 8,
+            }
+        }
+
+        #[must_use]
+        pub const fn mini() -> Dims {
+            Dims {
+                layers: 2,
+                heads: 2,
+                head_dim: 128,
+                audio_heads: 2,
+                audio_head_dim: 64,
+                channels: 128,
+                cross_dim: 256,
+                audio_cross_dim: 128,
+                ff_mult: 4,
+                caption: 16,
+                conn_layers: 1,
+            }
+        }
+
+        #[must_use]
+        pub const fn dim(&self) -> u32 {
+            self.heads * self.head_dim
+        }
+
+        #[must_use]
+        pub const fn audio_dim(&self) -> u32 {
+            self.audio_heads * self.audio_head_dim
+        }
+
+        #[must_use]
+        pub const fn av_inner(&self) -> u32 {
+            self.audio_heads * self.audio_head_dim
+        }
+
+        #[must_use]
+        pub const fn text_in(&self) -> u32 {
+            self.caption * TEXT_LAYERS
+        }
+
+        #[must_use]
+        pub fn sm_scale(&self) -> f32 {
+            (self.head_dim as f32).sqrt().recip()
+        }
+
+        #[must_use]
+        pub fn audio_sm_scale(&self) -> f32 {
+            (self.audio_head_dim as f32).sqrt().recip()
+        }
+
+        #[must_use]
+        pub const fn rope_dims(&self) -> [u32; 4] {
+            let f = self.dim() / (2 * ROPE_AXES as u32);
+            [2 * f, 2 * f, 2 * f, 0]
+        }
+
+        #[must_use]
+        pub const fn audio_rope_dims(&self) -> [u32; 4] {
+            [self.audio_dim(), 0, 0, 0]
+        }
+
+        #[must_use]
+        pub const fn av_rope_dims(&self) -> [u32; 4] {
+            [self.av_inner(), 0, 0, 0]
+        }
+    }
+
+    #[must_use]
+    pub const fn rope_pad(dim: u32, axes: u8) -> u32 {
+        let axes = axes as u32;
+        dim / 2 - axes * (dim / (2 * axes))
+    }
+
+    pub const DENOISE: u8 = 0;
+    pub const REFINE_VIDEO: u8 = 1;
+    pub const REFINE_AUDIO: u8 = 2;
+    pub const VAE_DECODE: u8 = 3;
 }

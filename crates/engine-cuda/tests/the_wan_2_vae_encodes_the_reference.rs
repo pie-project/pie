@@ -16,7 +16,7 @@ def forward(m, inputs):
 "#;
 
 fn vae_only() -> Trace {
-    let package = models::star::with_forward("wan22-ti2v-5b", VAE_ONLY)
+    let package = models::star::replacing("wan22-ti2v-5b", "forward.star", "forward", VAE_ONLY)
         .unwrap_or_else(|why| panic!("the VAE-only package: {why}"));
     let deploy = poem::star::Deploy {
         weights: vec![Dtype::Bf16],

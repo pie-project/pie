@@ -25,6 +25,7 @@ pub fn named(name: &str) -> Option<&'static Contract> {
         "kimi_k3" => Some(&crate::kimi_k3::tokenizer::CONTRACT),
         "flux_2" => Some(&crate::flux_2::tokenizer::CONTRACT),
         "z_image" => Some(&crate::z_image::tokenizer::CONTRACT),
+        "ltx_2" => Some(&crate::ltx_2::tokenizer::CONTRACT),
         "wan_2" => Some(&crate::wan_2::tokenizer::CONTRACT),
         "mini_dit" => Some(&crate::mini_dit::tokenizer::CONTRACT),
         "gpt_oss" => Some(&crate::gpt_oss::tokenizer::CONTRACT),

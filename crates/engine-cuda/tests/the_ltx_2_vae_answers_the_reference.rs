@@ -5,29 +5,47 @@ use std::time::Instant;
 
 use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
-use models::ltx_2::forward::vae_decode;
-use models::ltx_2::model::{Model, VAE_RGB, VAE_Z};
-use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Stream, Value, trace_hybrid,
-};
+use poem::{Dtype, Platform, Request, Stream, Trace};
+
+/// The widths ltx_2's package declares.
+const VAE_RGB: u32 = 3;
+const VAE_Z: u32 = 128;
 use poem_compiler::{Budget, VoxelLadder};
 
-struct VaeOnly {
-    model: Model,
+/// The VAE's decode reading alone, by the package's own functions.
+const VAE_ONLY: &str = r#"
+def forward(m, inputs):
+    return inputs.reading("vae.decode", lambda rows: vae_decode(rows, m.vae))
+"#;
+
+fn vae_only() -> Trace {
+    models::star::replacing("ltx25", "forward.star", "forward", VAE_ONLY)
+        .unwrap_or_else(|why| panic!("the VAE-only package: {why}"))
+        .trace("ltx25", &flagship(), "ltx25-vae-decode", Platform::Cuda)
+        .unwrap_or_else(|why| panic!("the VAE-only plan: {why:#}"))
 }
 
-impl ForwardHybrid for VaeOnly {
-    fn caches(&self) -> HybridSpec {
-        self.model.caches()
-    }
+/// The VAE's reads alone, by the package's own functions.
+const VAE_FORMATS: &str = r#"
+def formats(m):
+    return [format("vae", read = lambda reads: vae(reads, m.vae))]
+"#;
 
-    fn forward(&self, inputs: Input) -> Value {
-        let vae = self
-            .model
-            .vae
-            .as_ref()
-            .expect("the flagship carries the VAE");
-        inputs.reading("vae.decode", |rows| vae_decode(rows, vae))
+fn import_vae(src: &ztensor::Source) -> checkpoint::contract::ModelContract {
+    let package = models::star::replacing("ltx25", "formats.star", "formats", VAE_FORMATS)
+        .unwrap_or_else(|why| panic!("the VAE-only package: {why}"));
+    package
+        .import("ltx25", &flagship(), src, Platform::Cuda)
+        .unwrap_or_else(|why| panic!("the VAE does not read this snapshot: {why}"))
+}
+
+fn flagship() -> poem::star::Deploy {
+    poem::star::Deploy {
+        weights: vec![Dtype::Bf16],
+        kv: Dtype::Bf16,
+        tp: 1,
+        parts: vec![],
+        drafter: None,
     }
 }
 
@@ -131,15 +149,11 @@ fn fire(
     clip: [u32; 3],
     payload: &[f32],
 ) -> (Vec<f32>, [u32; 3], f64, f64) {
-    let model = Model::ltx_2_5(Dtype::Bf16);
     let src = checkpoint::file::diffusers::open(root)
         .unwrap_or_else(|why| panic!("{}: {why}", root.display()));
-    let mut contract = model
-        .import_vae(&src, Platform::Cuda)
-        .unwrap_or_else(|why| panic!("the VAE does not read the snapshot: {why}"));
+    let mut contract = import_vae(&src);
     drop(src);
-    let arm = VaeOnly { model };
-    let trace = trace_hybrid("ltx25-vae-decode", &arm, Platform::Cuda);
+    let trace = vae_only();
     let mut keep: std::collections::BTreeSet<String> =
         trace.params.iter().map(|p| p.name.clone()).collect();
     loop {
