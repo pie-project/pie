@@ -51,7 +51,8 @@ well; `tests/browser` drives them directly.
   8 GiB; a large model with the default pools is refused ("raise the device
   weight budget") — pass `device_memory_mb = 20480` (or a smaller
   `max_total_pages`) in the boot config. `BootConfig` in
-  `crates/browser/src/boot.rs` lists the keys.
+  `crates/runtime/src/embed.rs` lists the keys, plus `device_memory_mb` and
+  `power_preference` for the WebGPU engine.
 - Rust, JavaScript and Python inferlets run. Not available in a tab: MoE
   host-tier expert streaming, Python inferlet snapshots, telemetry, and
   outbound HTTP or files from inferlets (the WASI interfaces link, a call
