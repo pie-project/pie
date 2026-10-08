@@ -38,7 +38,7 @@ from common import (
     visible_cuda_devices,
 )
 
-SERVER_PY = ROOT / "python" / "server" / "python"
+SERVER_PY = ROOT / "packages" / "python" / "server" / "python"
 if str(SERVER_PY) not in sys.path:
     sys.path.insert(0, str(SERVER_PY))
 
@@ -149,7 +149,7 @@ def embedded_engine_identity() -> dict[str, str]:
     # staleness guard was watching one file and any newer `.so` passed it.
     source_roots = [
         ROOT / "crates",
-        ROOT / "python" / "server" / "src",
+        ROOT / "packages" / "python" / "server" / "src",
     ]
     # `engine-metal` is only in the dependency list on Apple-Silicon builds
     # (packages/python/server/Cargo.toml), so on Linux its sources cannot have gone

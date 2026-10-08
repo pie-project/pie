@@ -35,7 +35,7 @@ for language in "${languages[@]}"; do
   rm -rf "$stage"
   mkdir -p "$stage/languages"
   echo "== $language"
-  "$root/$language/inferlet/language/build.sh" "$stage/languages/$language.wasm"
+  "$root/packages/$language/inferlet/language/build.sh" "$stage/languages/$language.wasm"
   tar -C "$stage" -czf "$out/pie-language-$language.tar.gz" languages
   cp "$stage/languages/$language.wasm" "$root/packages/javascript/language-$language/$language.wasm"
   cp "$stage/languages/$language.wasm" "$root/packages/python/language-$language/src/pie_language_$language/$language.wasm"

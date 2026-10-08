@@ -42,7 +42,7 @@ from common import (
     summarize,
 )
 
-SERVER_PY = ROOT / "python" / "server" / "python"
+SERVER_PY = ROOT / "packages" / "python" / "server" / "python"
 if str(SERVER_PY) not in sys.path:
     sys.path.insert(0, str(SERVER_PY))
 

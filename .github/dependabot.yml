@@ -8,16 +8,16 @@ updates:
 
   - package-ecosystem: "pip"
     directories:
-      - "/python/client"
-      - "/python/inferlet"
-      - "/python/server"
+      - "/packages/python/client"
+      - "/packages/python/inferlet"
+      - "/packages/python/server"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
 
   # The npm workspace: one lockfile for client, inferlet, browser and server.
   - package-ecosystem: "npm"
-    directory: "/javascript"
+    directory: "/packages/javascript"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
