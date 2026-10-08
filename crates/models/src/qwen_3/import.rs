@@ -4,6 +4,7 @@ use super::model::{Head, Mixer, Mlp, Model};
 use super::rotation;
 use checkpoint_dsl::format::{Format, Stated, attribute, attribute_text, config, has, read_one};
 use checkpoint_dsl::{Builder, Error, extents};
+use checkpoint_dsl::extent;
 use poem_dsl::Platform;
 
 #[derive(Clone, Copy)]
@@ -664,10 +665,6 @@ pub(crate) fn squeezed(src: &ztensor::Source, from: String) -> Result<Expr, Erro
         vec![extent(channels), extent(kernel)],
         stored,
     )))
-}
-
-fn extent(of: u64) -> i64 {
-    i64::try_from(of).expect("an extent no i64 holds")
 }
 
 #[cfg(test)]

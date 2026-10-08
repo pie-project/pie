@@ -1,10 +1,11 @@
 use checkpoint::contract::{Expr, ModelContract, TensorContract, TensorType};
 use checkpoint::types::Encoding;
-use poem_dsl::{Dtype, Shard, Weight};
+use poem_dsl::{Dtype, Weight};
 
 use super::model::{Kda, Mixer, Mla, Mlp, Model};
 use checkpoint_dsl::format::{Format, has, read_one};
 use checkpoint_dsl::{Builder, Error, encoding, extents, scaling};
+use checkpoint_dsl::{axis_byte, cut_axis, squeezed};
 use poem_dsl::Platform;
 
 const HF_EMBED: &str = "language_model.model.embed_tokens.weight";
@@ -232,7 +233,7 @@ impl Model {
             &k.conv,
             (|| -> Result<Expr, Error> {
                 Ok(Expr::concat(
-                    as_axis(cut_axis(&k.conv), &k.conv.name),
+                    axis_byte(cut_axis(&k.conv), &k.conv.name),
                     vec![
                         squeezed(src, at(l, "self_attn.q_conv1d.weight"))?,
                         squeezed(src, at(l, "self_attn.k_conv1d.weight"))?,
@@ -321,37 +322,6 @@ impl Model {
         let stack = TensorType::raw(lifted(w, cut_axis(w)), read);
         b.read_expr(w, Expr::concat(0, legs).transmute(stack))
     }
-}
-
-fn squeezed(src: &ztensor::Source, from: String) -> Result<Expr, Error> {
-    let Some(tensor) = src.get(&from) else {
-        return Err(Error::Missing(from));
-    };
-    let illegible = |why: &dyn std::fmt::Display| Error::Illegible {
-        name: from.clone(),
-        detail: why.to_string(),
-    };
-    let shape = tensor.shape();
-    let [channels, 1, kernel] = *shape else {
-        return Err(illegible(&format!(
-            "a depthwise convolution bank is stored [channels, 1, kernel] and \
-             this one is stored {shape:?}"
-        )));
-    };
-    let stored = checkpoint::file::encoding_of(&tensor).map_err(|why| illegible(&why))?;
-    Ok(Expr::src(from).transmute(TensorType::new(
-        vec![extent(channels), extent(kernel)],
-        stored,
-    )))
-}
-
-fn extent(of: u64) -> i64 {
-    i64::try_from(of).expect("an extent no i64 holds")
-}
-
-fn as_axis(axis: usize, name: &str) -> u8 {
-    u8::try_from(axis)
-        .unwrap_or_else(|_| panic!("`{name}` is packed on axis {axis}, which is no axis"))
 }
 
 fn at(l: usize, leaf: &str) -> String {
@@ -448,11 +418,4 @@ fn lifted(w: &Weight, axis: usize) -> Vec<i64> {
     });
     *dim = -1;
     dims
-}
-
-fn cut_axis(w: &Weight) -> usize {
-    match &w.shard {
-        Shard::Replicated => panic!("`{}` is replicated and has no cut axis", w.name),
-        Shard::Cut { axis, .. } => usize::try_from(*axis).expect("an axis inside a shape"),
-    }
 }

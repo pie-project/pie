@@ -1714,6 +1714,46 @@ pub fn encoding(dtype: Dtype) -> Encoding {
     }
 }
 
+/// A depthwise convolution bank stored `[channels, 1, kernel]`, read as
+/// `[channels, kernel]`.
+pub fn squeezed(src: &ztensor::Source, from: String) -> Result<Expr, Error> {
+    let Some(tensor) = src.get(&from) else {
+        return Err(Error::Missing(from));
+    };
+    let illegible = |why: &dyn std::fmt::Display| Error::Illegible {
+        name: from.clone(),
+        detail: why.to_string(),
+    };
+    let shape = tensor.shape();
+    let [channels, 1, kernel] = *shape else {
+        return Err(illegible(&format!(
+            "a depthwise convolution bank is stored [channels, 1, kernel] and \
+             this one is stored {shape:?}"
+        )));
+    };
+    let stored = checkpoint::file::encoding_of(&tensor).map_err(|why| illegible(&why))?;
+    Ok(Expr::src(from).transmute(TensorType::new(
+        vec![extent(channels), extent(kernel)],
+        stored,
+    )))
+}
+/// An axis as the byte a contract names it by.
+pub fn axis_byte(axis: usize, name: &str) -> u8 {
+    u8::try_from(axis)
+        .unwrap_or_else(|_| panic!("`{name}` is packed on axis {axis}, which is no axis"))
+}
+/// The axis tensor-parallel ranks cut `w` along.
+pub fn cut_axis(w: &Weight) -> usize {
+    match &w.shard {
+        Shard::Replicated => panic!("`{}` is replicated and has no cut axis", w.name),
+        Shard::Cut { axis, .. } => usize::try_from(*axis).expect("an axis inside a shape"),
+    }
+}
+/// An extent as a contract states it.
+pub fn extent(of: u64) -> i64 {
+    i64::try_from(of).expect("an extent no i64 holds")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
