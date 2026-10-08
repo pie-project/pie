@@ -725,20 +725,6 @@ pub(crate) fn formats(builder: &mut GlobalsBuilder) {
         })
     }
 
-    /// A tensor the contract carries itself: `values` in `shape`, stored as
-    /// raw `dtype`, each rounded to it; `name` names it in a refusal.
-    fn constant(
-        #[starlark(require = pos)] name: &str,
-        #[starlark(require = pos)] values: UnpackList<UnpackFloat>,
-        #[starlark(require = pos)] shape: UnpackList<i64>,
-        #[starlark(require = pos)] dtype: &DtypeValue,
-    ) -> anyhow::Result<ExprValue> {
-        let values: Vec<f32> = values.items.iter().map(|v| v.0 as f32).collect();
-        crate::import::constant(name, &values, shape.items, dtype.0)
-            .map(ExprValue)
-            .map_err(|why| anyhow::anyhow!("{why}"))
-    }
-
     /// How a weight of `dtype` is stored.
     fn encoding(#[starlark(require = pos)] dtype: &DtypeValue) -> anyhow::Result<EncodingValue> {
         Ok(EncodingValue(crate::import::encoding(dtype.0)))
