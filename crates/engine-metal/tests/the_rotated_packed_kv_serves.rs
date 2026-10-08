@@ -35,7 +35,7 @@ use std::path::Path;
 use engine_metal::store::kv::Paging;
 use engine_metal::store::pool_demand;
 use engine_metal::{Boot, Lane, Shell};
-use models::qwen_3::model::Model;
+use models::star::{import_of, trace_of};
 use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
 
@@ -183,9 +183,10 @@ fn synth_fixture(dir: &Path, head_dim: usize) {
 }
 
 fn word(query_len: u32) -> u64 {
-    poem::trace_hybrid(
+    trace_of(
         "qwen3-micro-text",
-        &Model::micro_text(Dtype::Bf16, Dtype::Bf16, 1),
+        Dtype::Bf16,
+        Dtype::Bf16,
         Platform::Metal,
     )
     .facts
@@ -203,21 +204,27 @@ enum Sku {
     RotatedU4,
 }
 
-fn model_of(sku: Sku, head_dim: u32) -> Model {
+/// The package's model `sku` names at `head_dim`, and its kv dtype.
+fn model_of(sku: Sku, head_dim: u32) -> (String, Dtype) {
     match sku {
-        Sku::PlainBf16 => Model::micro_text_hd(Dtype::Bf16, Dtype::Bf16, 1, head_dim),
-        Sku::RotatedBf16 => Model::micro_text_rotated_hd(Dtype::Bf16, Dtype::Bf16, 1, head_dim),
-        Sku::RotatedU4 => Model::micro_text_rotated_hd(Dtype::Bf16, Dtype::KvU4, 1, head_dim),
+        Sku::PlainBf16 => (format!("qwen3-micro-text-hd{head_dim}"), Dtype::Bf16),
+        Sku::RotatedBf16 => (
+            format!("qwen3-micro-text-hd{head_dim}-rotated"),
+            Dtype::Bf16,
+        ),
+        Sku::RotatedU4 => (
+            format!("qwen3-micro-text-hd{head_dim}-rotated"),
+            Dtype::KvU4,
+        ),
     }
 }
 
 fn load(dir: &Path, sku: Sku, head_dim: u32) -> Shell {
-    let model = model_of(sku, head_dim);
-    let trace = poem::trace_hybrid("qwen3-micro-text", &model, Platform::Metal);
+    let (id, kv) = model_of(sku, head_dim);
+    let trace = trace_of(&id, Dtype::Bf16, kv, Platform::Metal);
     let source = ztensor_compat::index(dir.join("model.safetensors")).expect("the fixture indexes");
-    let contract = model
-        .import(&source, Platform::Metal)
-        .expect("the fixture imports");
+    let contract =
+        import_of(&id, Dtype::Bf16, kv, &source, Platform::Metal).expect("the fixture imports");
     drop(source);
     Shell::load(Boot {
         voxels: None,
@@ -300,8 +307,8 @@ fn argmaxes(rows: &[Vec<f32>]) -> Vec<usize> {
 /// the allocation layer — the same `row_stride` fork `reserve` uses — so the
 /// number is what the pool would allocate, not a hand estimate.
 fn kv_cache_bytes(sku: Sku, head_dim: u32, paging: Paging) -> u64 {
-    let model = model_of(sku, head_dim);
-    let trace = poem::trace_hybrid("qwen3-micro-text", &model, Platform::Metal);
+    let (id, kv) = model_of(sku, head_dim);
+    let trace = trace_of(&id, Dtype::Bf16, kv, Platform::Metal);
     pool_demand(&trace, paging).expect("the KV cache sizes")
 }
 

@@ -28,6 +28,7 @@ pub fn template_of(name: &str) -> Option<TemplateFn> {
 #[must_use]
 pub fn named(name: &str) -> Option<TemplateFn> {
     match name {
+        "qwen_3" => Some(crate::qwen_3::template::chatml),
         "gemma_4" => Some(crate::gemma_4::template::gemma4),
         "minimax_h3" => Some(crate::minimax_h3::template::instruct),
         "hunyuan_image_3" => Some(crate::hunyuan_image_3::template::instruct),

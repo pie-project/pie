@@ -250,6 +250,7 @@ fn a_draft_block_fires_and_the_drafter_answers_it() {
     };
     let sku = models::deployment(SKU).expect("the catalog ships the block-drafter row");
     let trace = sku.trace(Platform::Metal);
+    let drafter = trace.drafter.expect("the row states its block drafter");
     let source = ztensor_compat::index(&artifact).expect("the artifact opens");
     let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Metal)
         .expect("the artifact holds every plane");
@@ -282,8 +283,8 @@ fn a_draft_block_fires_and_the_drafter_answers_it() {
         .expect("the prefill fires");
     let anchor = argmax(&seeded[0]);
 
-    let block = models::qwen_3::model::QWEN36_27B_DFLASH.block as usize;
-    let mut tokens = vec![models::qwen_3::model::QWEN36_27B_DFLASH.mask_token; block];
+    let block = drafter.rows as usize;
+    let mut tokens = vec![drafter.mask_token; block];
     tokens[0] = anchor;
     let extent = PROMPT.len() as u64 + block as u64;
     let masking = all_visible(extent);

@@ -23,39 +23,34 @@ fn serialized() -> MutexGuard<'static, ()> {
 const PAGE: u32 = 16;
 struct Text {
     name: &'static str,
-    build: fn() -> models::qwen_3::model::Model,
     word: fn(u32) -> u64,
     ceiling: u32,
 }
 
-fn micro() -> models::qwen_3::model::Model {
-    models::qwen_3::model::Model::a3b_micro(Dtype::Bf16, Dtype::Bf16)
+fn traced(id: &str) -> Trace {
+    models::star::trace_of(id, Dtype::Bf16, Dtype::Bf16, Platform::Cuda)
 }
+
 fn micro_word(len: u32) -> u64 {
-    poem::trace_hybrid("a3b_micro", &micro(), Platform::Cuda)
+    traced("qwen3-a3b-micro")
         .facts
         .word(&Request::new(len, false))
 }
 
-fn uncached() -> models::qwen_3::model::Model {
-    models::qwen_3::model::Model::a3b_uncached_bank(Dtype::Bf16, Dtype::Bf16)
-}
 fn uncached_word(len: u32) -> u64 {
-    poem::trace_hybrid("a3b_uncached_bank", &uncached(), Platform::Cuda)
+    traced("qwen3-a3b-uncached-bank")
         .facts
         .word(&Request::new(len, false))
 }
 
 const MICRO: Text = Text {
-    name: "a3b_micro",
-    build: micro,
+    name: "qwen3-a3b-micro",
     word: micro_word,
     ceiling: WIDE,
 };
 
 const UNCACHED: Text = Text {
-    name: "a3b_uncached_bank",
-    build: uncached,
+    name: "qwen3-a3b-uncached-bank",
     word: uncached_word,
     ceiling: BOTH,
 };
@@ -151,8 +146,7 @@ struct Fixture {
 }
 
 fn fixture(text: Text) -> Fixture {
-    let m = (text.build)();
-    let trace = poem::trace_hybrid(text.name, &m, Platform::Cuda);
+    let trace = traced(text.name);
     let dir = scratch(text.name);
     let container = dir.0.join("micro.zt");
     write_checkpoint(&container, &trace);

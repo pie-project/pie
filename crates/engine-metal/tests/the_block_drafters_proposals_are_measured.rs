@@ -71,6 +71,7 @@ fn the_target_keeps_a_measured_prefix_of_every_block() {
     };
     let sku = models::deployment(SKU).expect("the catalog ships the block-drafter row");
     let trace = sku.trace(Platform::Metal);
+    let drafter = trace.drafter.expect("the row states its block drafter");
     let source = ztensor_compat::index(&artifact).expect("the artifact opens");
     let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Metal)
         .expect("the artifact holds every plane");
@@ -93,8 +94,8 @@ fn the_target_keeps_a_measured_prefix_of_every_block() {
     })
     .expect("the block drafter's shell loads");
 
-    let block = models::qwen_3::model::QWEN36_27B_DFLASH.block as usize;
-    let mask_token = models::qwen_3::model::QWEN36_27B_DFLASH.mask_token;
+    let block = drafter.rows as usize;
+    let mask_token = drafter.mask_token;
     let drafting = |len: u32| facts_of(SKU).word(&Request::new(len, false).drafting(true));
     let block_word = facts_of(SKU).word(&Request::new(block as u32, true).drafting_a_block(true));
 

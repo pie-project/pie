@@ -125,10 +125,7 @@ pub fn whole(tp: u32) -> Result<(), poem::import::Error> {
 }
 
 static FAMILIES: LazyLock<Vec<Vec<catalog::Entry>>> = LazyLock::new(|| {
-    let mut families = vec![
-        deepseek_v4::entries(),
-        qwen_3::entries(),
-    ];
+    let mut families = vec![deepseek_v4::entries()];
     families.extend(star::families());
     families
 });

@@ -170,3 +170,45 @@ pub fn replacing(
         .collect();
     poem::star::Package::new(package.name(), &files).map_err(|why| format!("{why:#}"))
 }
+
+/// The trace of the model `id`, listed or not, at weights `w` and kv `kv`
+/// on one rank, named `id`: the small geometries the engines' tests serve.
+#[must_use]
+pub fn trace_of(
+    id: &str,
+    w: poem::Dtype,
+    kv: poem::Dtype,
+    platform: poem::Platform,
+) -> poem::Trace {
+    let package = package_of(id).unwrap_or_else(|| panic!("no package holds `{id}`"));
+    let deploy = poem::star::Deploy {
+        weights: vec![w],
+        kv,
+        tp: 1,
+        parts: Vec::new(),
+        drafter: None,
+    };
+    package
+        .trace(id, &deploy, id, platform)
+        .unwrap_or_else(|why| panic!("`{id}` does not trace: {why:#}"))
+}
+
+/// The contract reading `src` into the model `id`, listed or not, at weights
+/// `w` and kv `kv` on one rank.
+pub fn import_of(
+    id: &str,
+    w: poem::Dtype,
+    kv: poem::Dtype,
+    src: &ztensor::Source,
+    platform: poem::Platform,
+) -> Result<checkpoint::contract::ModelContract, poem::import::Error> {
+    let package = package_of(id).unwrap_or_else(|| panic!("no package holds `{id}`"));
+    let deploy = poem::star::Deploy {
+        weights: vec![w],
+        kv,
+        tp: 1,
+        parts: Vec::new(),
+        drafter: None,
+    };
+    package.import(id, &deploy, src, platform)
+}

@@ -3,7 +3,7 @@
 //! SERVE Ternary-Bonsai-2-27B (PTQ1_0) on Metal end to end and validate the
 //! final logits against the fork oracle (argmax id 11751 `ĠParis`).
 //!
-//! The whole serve pipeline runs — import, load, sign binding, PTQ1_0 ternary
+//! The whole serve pipeline runs — import, load, PTQ1_0 ternary
 //! matmuls, and the online-Hadamard rotation-undo — and the readout reproduces
 //! the fork's logits. Two Bonsai-GGUF-specific import facts are load-bearing:
 //! (A) the GDN v-heads are stored TILED ("v-grouped"), so every v-head-indexed
@@ -25,16 +25,16 @@
 //!
 //! This is a guarded, real-file test (the 6 GB GGUF is out of git). It:
 //!   1. imports the real Bonsai GGUF -> a served `.zt` artifact through the
-//!      model-aware `import_from_gguf` contract (PTQ1_0 weights pass through, the
-//!      norms fold `-1`, the fused GDN/attn projections concat, and — when
-//!      `gdn_v_grouped` is set — the GDN v-heads reorder tiled→block) — cached so
-//!      the 6 GB decode runs once;
-//!   2. builds the `d27b_bonsai` PTQ1_0 forward trace (the online Hadamard
-//!      rotation-undo at every rotated site; the v-head reorder is folded into
-//!      the weights at import, not the trace);
-//!   3. loads it on the Metal engine (`Shell::load`) and binds the three RHT sign
-//!      diagonals decoded from the GGUF metadata into the Registered sign banks
-//!      via the `register_adapter` path;
+//!      `qwen36-27b-bonsai` package's GGUF format (PTQ1_0 weights pass through,
+//!      the norms fold `-1`, the fused GDN/attn projections concat, the GDN
+//!      v-heads reorder tiled→block when `gdn_v_grouped` is set, and the three
+//!      RHT sign diagonals are decoded from the GGUF metadata into constants the
+//!      artifact carries) — cached so the 6 GB decode runs once (an artifact
+//!      cached before the signs rode in it must be imported again);
+//!   2. builds the `qwen36-27b-bonsai` PTQ1_0 forward trace (the online
+//!      Hadamard rotation-undo at every rotated site; the v-head reorder is
+//!      folded into the weights at import, not the trace);
+//!   3. loads it on the Metal engine (`Shell::load`);
 //!   4. fires the exact fork prompt token ids `[760,6511,314,9338,369]` and
 //!      compares the readout logits to the oracle.
 //!
@@ -54,11 +54,9 @@ use checkpoint::file::read::parse_metadata;
 use checkpoint::file::write::Writer;
 use checkpoint::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 
-use engine_metal::weights::AdapterPlane;
 use engine_metal::{Boot, Lane, Shell};
-use models::qwen_3::model::Model;
-use models::qwen_3::rotation::{self, BONSAI_SIGN_WIDTHS};
-use poem::{Dtype, Platform, Request, trace_hybrid};
+use models::star::{import_of, trace_of};
+use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
 
 const PROMPT_IDS: [u32; 5] = [760, 6511, 314, 9338, 369];
@@ -106,10 +104,14 @@ fn import_zt(gguf: &Path, out: &Path) {
     eprintln!("bonsai: importing {gguf:?} -> {out:?} (one-time 6 GB decode)");
     let metadata = parse_metadata(gguf).expect("parse the GGUF metadata");
     let src = ztensor_compat::index(gguf).expect("open the GGUF as a source");
-    let model = Model::d27b_bonsai(Dtype::Ptq1_0, Dtype::Bf16, 1);
-    let contract = model
-        .import_from_gguf(&src, Platform::Metal)
-        .expect("the d27b_bonsai contract reads every plane of the Bonsai GGUF");
+    let contract = import_of(
+        "qwen36-27b-bonsai",
+        Dtype::Ptq1_0,
+        Dtype::Bf16,
+        &src,
+        Platform::Metal,
+    )
+    .expect("the d27b_bonsai contract reads every plane of the Bonsai GGUF");
     drop(src);
 
     let target = StorageTarget {
@@ -219,11 +221,15 @@ fn the_bonsai_27b_serves_ptq1_0_and_matches_the_fork_oracle() {
     import_zt(&gguf, &zt);
 
     // The forward trace: d27b_bonsai in PTQ1_0, the rotation-undo armed.
-    let model = Model::d27b_bonsai(Dtype::Ptq1_0, Dtype::Bf16, 1);
-    let trace = trace_hybrid("d27b-bonsai", &model, Platform::Metal);
+    let trace = trace_of(
+        "qwen36-27b-bonsai",
+        Dtype::Ptq1_0,
+        Dtype::Bf16,
+        Platform::Metal,
+    );
 
-    // The serve contract reconstructed from the artifact's own planes (Registered
-    // sign banks are skipped — they are host-provided below).
+    // The serve contract reconstructed from the artifact's own planes (the sign
+    // diagonals among them).
     let src = ztensor_compat::index(&zt).expect("open the served artifact");
     let contract = poem::import::own_contract(&src, &trace.params, 1, Platform::Metal)
         .expect("the artifact holds every checkpoint plane the trace reads");
@@ -265,48 +271,16 @@ fn the_bonsai_27b_serves_ptq1_0_and_matches_the_fork_oracle() {
         shell.weight_windows()
     );
 
-    // Bind the three RHT sign diagonals into the Registered banks.
-    let signs = rotation::signs_from_gguf(
-        &ztensor_compat::index(&gguf).expect("reopen the GGUF for its sign metadata"),
-    )
-    .expect("decode the Bonsai sign diagonals");
-    let sign_bytes: Vec<(String, Vec<u8>)> = BONSAI_SIGN_WIDTHS
-        .iter()
-        .map(|&w| {
-            let sv = signs
-                .get(&w)
-                .unwrap_or_else(|| panic!("the GGUF carries no sign width {w}"));
-            (rotation::sign_param_name(w), sv.to_bf16_le_bytes())
-        })
-        .collect();
-    let declared: BTreeSet<String> = shell.bank_seats().into_iter().map(|s| s.name).collect();
-    let mut bound = 0usize;
-    for (name, bytes) in &sign_bytes {
-        if !declared.contains(name) {
-            continue;
-        }
-        shell
-            .register_adapter(
-                0,
-                &[AdapterPlane {
-                    bank: name.as_str(),
-                    bytes: bytes.as_slice(),
-                }],
-            )
-            .unwrap_or_else(|why| panic!("bind the sign bank `{name}`: {why}"));
-        bound += 1;
-    }
-    eprintln!(
-        "bonsai: bound {bound} sign banks (of {} declared)",
-        declared.len()
-    );
+    // The three RHT sign diagonals ride in the artifact, decoded from the
+    // GGUF's metadata at import: nothing binds them at load.
 
     // Fire the exact fork prompt (no BOS, greedy readout of the last token) as a
     // single chunked prefill.
     shell.open(0).expect("the slot opens");
-    let word = trace_hybrid(
-        "d27b-bonsai",
-        &Model::d27b_bonsai(Dtype::Ptq1_0, Dtype::Bf16, 1),
+    let word = trace_of(
+        "qwen36-27b-bonsai",
+        Dtype::Ptq1_0,
+        Dtype::Bf16,
         Platform::Metal,
     )
     .facts
