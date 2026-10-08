@@ -217,7 +217,15 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         &config.runtime.network_allowed_hosts,
     )?;
 
-    linker::spawn(&wasm_engine, fs_policy, network_policy);
+    linker::spawn(
+        &wasm_engine,
+        fs_policy,
+        network_policy,
+        config
+            .runtime
+            .wasm_max_memory_mb
+            .saturating_mul(1024 * 1024),
+    );
     let max_upload_bytes = config.runtime.max_upload_mb.saturating_mul(1024 * 1024);
     server::init(max_upload_bytes);
     let bound_port = config.port;
@@ -519,7 +527,7 @@ fn verify_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
 const CORE_RESOURCES_PER_COMPONENT: u32 = 16;
 
 #[cfg(target_arch = "wasm32")]
@@ -548,6 +556,25 @@ fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
         }
     }
 
+    configure_execution(&mut wasm_config, runtime);
+    wasmtime::Engine::new(&wasm_config).unwrap()
+}
+
+/// iOS gives an app no executable memory: inferlets run as Pulley bytecode,
+/// with memories allocated on demand.
+#[cfg(target_os = "ios")]
+fn configure_execution(wasm_config: &mut wasmtime::Config, _runtime: &RuntimeConfig) {
+    wasm_config
+        .target("pulley64")
+        .expect("pulley64 is compiled in on iOS");
+    wasm_config.signals_based_traps(false);
+    wasm_config.memory_reservation(0);
+    wasm_config.memory_guard_size(0);
+    wasm_config.memory_init_cow(false);
+}
+
+#[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
+fn configure_execution(wasm_config: &mut wasmtime::Config, runtime: &RuntimeConfig) {
     let mut pooling_config = wasmtime::PoolingAllocationConfig::default();
     pooling_config.total_component_instances(runtime.wasm_max_instances);
     pooling_config.total_memories(runtime.wasm_max_instances);
@@ -572,8 +599,6 @@ fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     wasm_config.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(
         pooling_config,
     ));
-
-    wasmtime::Engine::new(&wasm_config).unwrap()
 }
 
 #[cfg(target_arch = "wasm32")]
