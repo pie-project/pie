@@ -466,6 +466,24 @@ fn facts(builder: &mut GlobalsBuilder) {
         Ok(PredicateValue(fact::bidirectional()))
     }
 
+    /// The rows of the stream `name` (text, image, video, audio, context,
+    /// reference).
+    fn stream(#[starlark(require = pos)] name: &str) -> anyhow::Result<PredicateValue> {
+        let stream = crate::Stream::ALL
+            .into_iter()
+            .find(|s| format!("{s:?}").eq_ignore_ascii_case(name))
+            .ok_or_else(|| anyhow::anyhow!("no stream is called `{name}`"))?;
+        Ok(PredicateValue(fact::stream(stream)))
+    }
+
+    /// The rows whose inferlet chose `value` for the choice `name`.
+    fn choice(
+        #[starlark(require = pos)] name: &str,
+        #[starlark(require = pos)] value: &str,
+    ) -> anyhow::Result<PredicateValue> {
+        Ok(PredicateValue(fact::choice(name, value)))
+    }
+
     /// The rows of the reading `name`.
     fn reading(#[starlark(require = pos)] name: &str) -> anyhow::Result<PredicateValue> {
         Ok(PredicateValue(fact::reading(name)))

@@ -70,6 +70,58 @@ impl Package {
             .map_err(error)
     }
 
+    /// What `id`'s deployment `deploy` states of itself as a generative
+    /// model, if its `model.star` states it (`generative(m)`).
+    pub fn generative(
+        &self,
+        id: &str,
+        deploy: &Deploy,
+    ) -> anyhow::Result<Option<crate::generative::Generative>> {
+        self.stated(
+            id,
+            deploy,
+            "generative",
+            crate::star::generative::generative_of,
+        )
+    }
+
+    /// The canvas `id`'s deployment `deploy` denoises as a text diffusion
+    /// model, if its `model.star` states one (`diffusion(m)`).
+    pub fn diffusion(
+        &self,
+        id: &str,
+        deploy: &Deploy,
+    ) -> anyhow::Result<Option<crate::generative::Diffusion>> {
+        self.stated(
+            id,
+            deploy,
+            "diffusion",
+            crate::star::generative::diffusion_of,
+        )
+    }
+
+    fn stated<T>(
+        &self,
+        id: &str,
+        deploy: &Deploy,
+        function: &str,
+        of: fn(Star<'_>) -> anyhow::Result<T>,
+    ) -> anyhow::Result<Option<T>> {
+        let Ok(stating) = self.module("model.star")?.get(function) else {
+            return Ok(None);
+        };
+        Module::with_temp_heap(|module| {
+            let mut eval = Evaluator::new(&module);
+            let m = self.layout(id, deploy, &module, &mut eval)?;
+            let stating = stating.add_to_heap(module.heap());
+            let stated = eval.eval_function(stating, &[m], &[]).map_err(error)?;
+            if stated.is_none() {
+                return Ok(None);
+            }
+            of(stated).map(Some)
+        })
+    }
+
     /// The trace of `id`'s deployment `deploy`, named `name`, on `platform`.
     pub fn trace(
         &self,

@@ -51,8 +51,12 @@ impl Stage {
         static LIB: LazyLock<Globals> = LazyLock::new(|| base().build());
         static MANIFEST: LazyLock<Globals> =
             LazyLock::new(|| base().with(crate::star::manifest::manifest).build());
-        static LAYOUT: LazyLock<Globals> =
-            LazyLock::new(|| base().with(crate::star::layout::layout).build());
+        static LAYOUT: LazyLock<Globals> = LazyLock::new(|| {
+            base()
+                .with(crate::star::layout::layout)
+                .with(crate::star::generative::generative)
+                .build()
+        });
         static FORWARD: LazyLock<Globals> = LazyLock::new(|| {
             base()
                 .with(crate::star::forward::forward)

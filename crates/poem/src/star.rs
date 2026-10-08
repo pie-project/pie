@@ -7,6 +7,7 @@
 mod bind;
 mod formats;
 mod forward;
+mod generative;
 mod layout;
 mod manifest;
 mod ops;
@@ -14,6 +15,7 @@ mod package;
 mod run;
 pub mod values;
 
+pub use layout::with_env;
 pub use manifest::{Manifest, Model};
 pub use package::{API, ATTRIBUTE, LIBRARY, Package, Stage};
 pub use run::Deploy;

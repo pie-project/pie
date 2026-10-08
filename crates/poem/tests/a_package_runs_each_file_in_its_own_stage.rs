@@ -146,7 +146,10 @@ def read_out(m, x):
     let layout = "load(\"//lib/head/forward.star\", \"read_out\")\n".to_string() + MODEL;
     let why = Package::new(
         "toy",
-        &[("model.star", &layout), ("//lib/head/forward.star", library)],
+        &[
+            ("model.star", &layout),
+            ("//lib/head/forward.star", library),
+        ],
     )
     .err()
     .map(|e| format!("{e:#}"))

@@ -564,6 +564,29 @@ pub(crate) fn wholes(builder: &mut starlark::environment::GlobalsBuilder) {
         Ok(Whole(Held::Conv(conv)))
     }
 
+    /// A ragged attention's mask that lets each row attend only rows of its
+    /// own group.
+    fn group_block_diagonal() -> anyhow::Result<Whole> {
+        Ok(Whole(Held::Mask(RaggedMask::GroupBlockDiagonal)))
+    }
+
+    /// A ragged attention's mask that masks nothing.
+    fn unmasked() -> anyhow::Result<Whole> {
+        Ok(Whole(Held::Mask(RaggedMask::None)))
+    }
+
+    /// A ragged attention's mask under which a reference row attends only
+    /// the rows of its own reference, by the tags `q_tags` and `kv_tags`.
+    fn reference_self_only<'v>(
+        #[starlark(require = pos)] q_tags: Star<'v>,
+        #[starlark(require = pos)] kv_tags: Star<'v>,
+    ) -> anyhow::Result<Whole> {
+        Ok(Whole(Held::Mask(RaggedMask::ReferenceSelfOnly {
+            q_tags: Value::arg(Some(q_tags))?.id(),
+            kv_tags: Value::arg(Some(kv_tags))?.id(),
+        })))
+    }
+
     /// The grid rule a conv steps its grid by.
     fn grid_rule(#[starlark(require = pos)] conv: Star<'_>) -> anyhow::Result<Whole> {
         Ok(Whole(Held::Grid(Conv::arg(Some(conv))?.rule())))
