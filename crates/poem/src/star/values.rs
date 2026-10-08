@@ -119,6 +119,16 @@ fn weight_methods(builder: &mut MethodsBuilder) {
         Ok(this.0.name.clone())
     }
 
+    /// The axis tensor-parallel ranks cut the weight along, or `None` if
+    /// every rank holds it whole.
+    #[starlark(attribute)]
+    fn cut_axis(this: &WeightValue) -> anyhow::Result<NoneOr<u32>> {
+        Ok(match &this.0.shard {
+            crate::Shard::Cut { axis, .. } => NoneOr::Other(*axis),
+            crate::Shard::Replicated => NoneOr::None,
+        })
+    }
+
     #[starlark(attribute)]
     fn shape(this: &WeightValue) -> anyhow::Result<Vec<u64>> {
         Ok(this.0.shape.clone())

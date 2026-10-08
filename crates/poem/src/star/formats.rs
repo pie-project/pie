@@ -744,6 +744,14 @@ pub(crate) fn formats(builder: &mut GlobalsBuilder) {
         Ok(EncodingValue(crate::import::encoding(dtype.0)))
     }
 
+    /// The dtype the values of `encoding` are, quantized or not.
+    fn logical(#[starlark(require = pos)] encoding: &EncodingValue) -> anyhow::Result<DtypeValue> {
+        Ok(DtypeValue(match &encoding.0 {
+            Encoding::Raw(dtype) => *dtype,
+            Encoding::Quant(spec) => spec.logical_dtype,
+        }))
+    }
+
     /// Plain values of `dtype`, one after another.
     fn raw(#[starlark(require = pos)] dtype: &DtypeValue) -> anyhow::Result<EncodingValue> {
         Ok(EncodingValue(Encoding::Raw(dtype.0)))
