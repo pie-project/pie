@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use checkpoint::contract::ModelContract;
@@ -101,49 +101,8 @@ pub fn compose(base: &str, overrides: &Overrides, platform: Platform) -> Result<
 }
 
 pub fn open_source(checkpoint: &Path) -> Result<ztensor::Source> {
-    if checkpoint::file::diffusers::is_pipeline(checkpoint) {
-        return checkpoint::file::diffusers::open(checkpoint)
-            .with_context(|| format!("open the diffusers pipeline {checkpoint:?}"));
-    }
-    let containers = containers(checkpoint)?;
-    if let [container] = containers.as_slice() {
-        return ztensor_compat::index(container)
-            .or_else(|_| ztensor::Source::open(container))
-            .with_context(|| format!("open {container:?} as a tensor container"));
-    }
-    ztensor_compat::index_all(&containers)
-        .or_else(|_| ztensor::Source::open_all(&containers))
-        .with_context(|| {
-            format!(
-                "open the {} containers under {checkpoint:?} as one tensor name space",
-                containers.len()
-            )
-        })
-}
-
-fn containers(checkpoint: &Path) -> Result<Vec<PathBuf>> {
-    if !checkpoint.is_dir() {
-        return Ok(vec![checkpoint.to_path_buf()]);
-    }
-    let root = checkpoint.join("model.zt");
-    if root.is_file() {
-        return Ok(vec![root]);
-    }
-    let mut found: Vec<PathBuf> = std::fs::read_dir(checkpoint)
-        .with_context(|| format!("read the checkpoint directory {checkpoint:?}"))?
-        .filter_map(|entry| {
-            let path = entry.ok()?.path();
-            let name = path.file_name()?.to_str()?;
-            (name.ends_with(".safetensors") || name.ends_with(".zt")).then_some(path)
-        })
-        .collect();
-    found.sort();
-    if found.is_empty() {
-        return Err(anyhow!(
-            "{checkpoint:?} holds no `.safetensors` and no `.zt` container"
-        ));
-    }
-    Ok(found)
+    checkpoint::file::snapshot::open(checkpoint)
+        .with_context(|| format!("open the checkpoint {checkpoint:?}"))
 }
 
 pub fn identify(checkpoint: &Path, platform: Platform) -> Result<String> {

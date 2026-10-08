@@ -1,3 +1,5 @@
+pub mod format;
+
 use checkpoint::contract::{Expr, ModelContract, Scales, TensorContract, TensorType};
 use checkpoint::types::{
     Axis, DType, Encoding, QuantGranularity, QuantScheme, QuantSpec, RepackLayout, ScaleForm,

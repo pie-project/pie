@@ -2,6 +2,7 @@ use checkpoint::contract::{Expr, ModelContract, TensorType};
 use poem_dsl::{Platform, Shard, Weight};
 
 use super::model::{Indexer, Kda, Mixer, Mla, Mlp, Model, Tower};
+use checkpoint_dsl::format::{Format, has, read_one};
 use checkpoint_dsl::{Builder, Error};
 
 const HEAD: &str = "model.language_model.layers.45.";
@@ -62,13 +63,25 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        let overlaid = |name: &str| src.get(&format!("aux.{name}")).is_some();
-        if (self.mtp.is_some() && overlaid(&format!("{HEAD}enorm.weight")))
-            || (self.tower.is_some() && overlaid(&format!("{VISUAL}post_layernorm.weight")))
-        {
-            return self.import_from_own_with_aux(src, platform);
-        }
-        self.import_from_mlx(src, platform)
+        let overlaid = |src: &ztensor::Source| {
+            let at = |name: &str| has(src, &format!("aux.{name}"));
+            (self.mtp.is_some() && at(&format!("{HEAD}enorm.weight")))
+                || (self.tower.is_some() && at(&format!("{VISUAL}post_layernorm.weight")))
+        };
+        read_one(
+            "glm_5_next",
+            src,
+            vec![
+                Format::new("an artifact with an `--aux` overlay", overlaid, || {
+                    self.import_from_own_with_aux(src, platform)
+                }),
+                Format::new(
+                    "mlx",
+                    move |src| !overlaid(src),
+                    || self.import_from_mlx(src, platform),
+                ),
+            ],
+        )
     }
 
     pub fn import_from_mlx(

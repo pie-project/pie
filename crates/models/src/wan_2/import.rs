@@ -1,4 +1,5 @@
 use checkpoint::contract::{Expr, ModelContract, TensorType};
+use checkpoint_dsl::format::{Format, read_one};
 use checkpoint_dsl::{Builder, Error, extents, stored_encoding};
 use poem_dsl::{Platform, Weight};
 
@@ -48,24 +49,20 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        let mut refusals: Vec<String> = Vec::new();
-        let layouts: &[Layout] = match (&self.te, &self.vae) {
-            (None, None) => &[Layout::Bare, Layout::Diffusers],
-            _ => &[Layout::Diffusers],
-        };
-        for layout in layouts {
-            match self.import_from(src, platform, *layout) {
-                Ok(contract) => return Ok(contract),
-                Err(why) => refusals.push(format!("as {}, {why}", layout.spelling())),
-            }
+        // A pipeline's components ride under their prefixes; a bare
+        // transformer file holds the denoiser's names as they are.
+        let pipeline = |src: &ztensor::Source| src.names().any(|name| name.starts_with("dit."));
+        let mut formats = vec![Format::new(Layout::Diffusers.spelling(), pipeline, || {
+            self.import_from(src, platform, Layout::Diffusers)
+        })];
+        if self.te.is_none() && self.vae.is_none() {
+            formats.push(Format::new(
+                Layout::Bare.spelling(),
+                move |src| !pipeline(src),
+                || self.import_from(src, platform, Layout::Bare),
+            ));
         }
-        Err(Error::Illegible {
-            name: "wan_2".to_string(),
-            detail: format!(
-                "no reading of this checkpoint lands every plane this family declares — {}",
-                refusals.join("; ")
-            ),
-        })
+        read_one("wan_2", src, formats)
     }
 
     fn import_from(

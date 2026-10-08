@@ -2,6 +2,7 @@ use checkpoint::contract::{Expr, ModelContract, TensorType, UnaryOp};
 
 use super::model::{Head, Mixer, Mlp, Model};
 use super::rotation;
+use checkpoint_dsl::format::{Format, Stated, attribute, attribute_text, config, has, read_one};
 use checkpoint_dsl::{Builder, Error, extents};
 use poem_dsl::Platform;
 
@@ -68,32 +69,71 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        let mut refusals: Vec<String> = Vec::new();
-        let mut attempt = |what: &str, built: Result<ModelContract, Error>| match built {
-            Ok(contract) => Some(contract),
-            Err(why) => {
-                refusals.push(format!("as {what}, {why}"));
-                None
-            }
-        };
-        for layout in [Layout::Transformers, Layout::Mlx] {
-            if let Some(contract) = attempt(
-                layout.spelling(),
-                self.import_from_safetensors(src, platform, layout),
-            ) {
-                return Ok(contract);
-            }
+        let arch = attribute_text(src, "general.architecture")
+            .unwrap_or_default()
+            .to_string();
+        read_one(
+            "qwen_3",
+            src,
+            vec![
+                Format::new(
+                    Layout::Transformers.spelling(),
+                    |src| has(src, Layout::Transformers.embed()),
+                    || self.import_from_safetensors(src, platform, Layout::Transformers),
+                )
+                .stating(self.configured("text_config.")),
+                Format::new(
+                    Layout::Mlx.spelling(),
+                    |src| has(src, Layout::Mlx.embed()),
+                    || self.import_from_safetensors(src, platform, Layout::Mlx),
+                )
+                .stating(self.configured("text_config.")),
+                Format::new(
+                    "gguf",
+                    |src| attribute_text(src, "general.architecture").is_some(),
+                    || self.import_from_gguf(src, platform),
+                )
+                .stating(self.attributed(&arch)),
+            ],
+        )
+    }
+
+    /// The shape a transformers configuration states of this model, its text
+    /// model's keys under `at`.
+    fn configured(&self, at: &str) -> Vec<Stated> {
+        let mut states = vec![
+            config(format!("{at}hidden_size"), self.hidden),
+            config(format!("{at}vocab_size"), self.vocab),
+            config(format!("{at}num_attention_heads"), self.q_heads),
+            config(format!("{at}num_key_value_heads"), self.kv_heads),
+            config(format!("{at}head_dim"), self.head_dim),
+            config(format!("{at}num_hidden_layers"), self.layers.len() as u32).or_deeper(),
+            config(format!("{at}rms_norm_eps"), self.final_norm_eps),
+        ];
+        if let Some(theta) = self.theta() {
+            states.push(config(format!("{at}rope_parameters.rope_theta"), theta));
         }
-        if let Some(contract) = attempt("gguf", self.import_from_gguf(src, platform)) {
-            return Ok(contract);
+        states
+    }
+
+    /// The shape a GGUF's metadata states of this model, under `arch`.
+    fn attributed(&self, arch: &str) -> Vec<Stated> {
+        let mut states = vec![
+            attribute(format!("{arch}.embedding_length"), self.hidden),
+            attribute(format!("{arch}.block_count"), self.layers.len() as u32).or_deeper(),
+            attribute(format!("{arch}.attention.head_count"), self.q_heads),
+            attribute(format!("{arch}.attention.head_count_kv"), self.kv_heads),
+        ];
+        if let Some(theta) = self.theta() {
+            states.push(attribute(format!("{arch}.rope.freq_base"), theta));
         }
-        Err(Error::Illegible {
-            name: "qwen_3".to_string(),
-            detail: format!(
-                "no reading of this file lands every plane this family \
-                 declares — {}",
-                refusals.join("; "),
-            ),
+        states
+    }
+
+    fn theta(&self) -> Option<f32> {
+        self.layers.iter().find_map(|layer| match &layer.mixer {
+            Mixer::Attn(a) => Some(a.theta),
+            Mixer::Gdn(_) => None,
         })
     }
 

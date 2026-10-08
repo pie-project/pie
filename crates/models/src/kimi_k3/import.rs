@@ -3,6 +3,7 @@ use checkpoint::types::Encoding;
 use poem_dsl::{Dtype, Shard, Weight};
 
 use super::model::{Kda, Mixer, Mla, Mlp, Model};
+use checkpoint_dsl::format::{Format, has, read_one};
 use checkpoint_dsl::{Builder, Error, encoding, extents, scaling};
 use poem_dsl::Platform;
 
@@ -16,21 +17,22 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        let huggingface = match self.import_from_huggingface(src, platform) {
-            Ok(contract) => return Ok(contract),
-            Err(why) => why,
-        };
-        let gguf = match self.import_from_gguf(src, platform) {
-            Ok(contract) => return Ok(contract),
-            Err(why) => why,
-        };
-        Err(Error::Illegible {
-            name: "kimi_k3".to_string(),
-            detail: format!(
-                "no reading of this file lands every plane this family \
-                 declares — as huggingface, {huggingface}; as gguf, {gguf}"
-            ),
-        })
+        read_one(
+            "kimi_k3",
+            src,
+            vec![
+                Format::new(
+                    "huggingface",
+                    |src| !has(src, GGUF_EMBED),
+                    || self.import_from_huggingface(src, platform),
+                ),
+                Format::new(
+                    "gguf",
+                    |src| has(src, GGUF_EMBED),
+                    || self.import_from_gguf(src, platform),
+                ),
+            ],
+        )
     }
 
     pub fn import_from_huggingface(

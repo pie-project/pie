@@ -3,6 +3,7 @@ use checkpoint::contract::{Expr, ModelContract};
 use super::model::{AttnBanks, Model};
 use checkpoint::contract::TensorType;
 
+use checkpoint_dsl::format::{Format, Stated, attribute, attribute_text, config, has, read_one};
 use checkpoint_dsl::{Builder, Error, extents};
 use poem_dsl::Platform;
 
@@ -57,28 +58,70 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        let mut refusals: Vec<String> = Vec::new();
-        for (what, layout) in [
-            ("transformers", Layout::Transformers),
-            ("mlx_lm", Layout::Mlx),
-        ] {
-            match self.import_from_safetensors(src, platform, layout) {
-                Ok(contract) => return Ok(contract),
-                Err(why) => refusals.push(format!("as {what}, {why}")),
-            }
-        }
-        match self.import_from_gguf(src, platform) {
-            Ok(contract) => return Ok(contract),
-            Err(why) => refusals.push(format!("as gguf, {why}")),
-        }
-        Err(Error::Illegible {
-            name: "gemma4".to_string(),
-            detail: format!(
-                "no reading of this file lands every plane this family \
-                 declares — {}",
-                refusals.join("; "),
+        let arch = attribute_text(src, "general.architecture")
+            .unwrap_or_default()
+            .to_string();
+        read_one(
+            "gemma4",
+            src,
+            vec![
+                Format::new(
+                    "transformers",
+                    |src| has(src, &Layout::Transformers.embed()),
+                    || self.import_from_safetensors(src, platform, Layout::Transformers),
+                )
+                .stating(self.configured("text_config.")),
+                Format::new(
+                    "mlx_lm",
+                    |src| has(src, &Layout::Mlx.embed()),
+                    || self.import_from_safetensors(src, platform, Layout::Mlx),
+                )
+                .stating(self.configured("text_config.")),
+                Format::new(
+                    "gguf",
+                    |src| attribute_text(src, "general.architecture").is_some(),
+                    || self.import_from_gguf(src, platform),
+                )
+                .stating(self.attributed(&arch)),
+            ],
+        )
+    }
+
+    /// The shape a transformers configuration states of this model, its text
+    /// model's keys under `at`.
+    fn configured(&self, at: &str) -> Vec<Stated> {
+        vec![
+            config(format!("{at}hidden_size"), self.hidden),
+            config(format!("{at}vocab_size"), self.vocab),
+            config(format!("{at}num_attention_heads"), self.q_heads),
+            config(format!("{at}num_key_value_heads"), self.sliding.kv_heads),
+            config(format!("{at}head_dim"), self.sliding.head_dim),
+            config(format!("{at}global_head_dim"), self.global.head_dim),
+            config(format!("{at}num_hidden_layers"), self.layers.len() as u32).or_deeper(),
+            config(format!("{at}rms_norm_eps"), self.final_norm_eps),
+            config(format!("{at}sliding_window"), self.sliding.window),
+            config(
+                format!("{at}rope_parameters.sliding_attention.rope_theta"),
+                self.sliding.theta,
             ),
-        })
+            config(
+                format!("{at}rope_parameters.full_attention.rope_theta"),
+                self.global.theta,
+            ),
+        ]
+    }
+
+    /// The shape a GGUF's metadata states of this model, under `arch`.
+    fn attributed(&self, arch: &str) -> Vec<Stated> {
+        vec![
+            attribute(format!("{arch}.embedding_length"), self.hidden),
+            attribute(format!("{arch}.block_count"), self.layers.len() as u32).or_deeper(),
+            attribute(format!("{arch}.attention.head_count"), self.q_heads),
+            attribute(
+                format!("{arch}.attention.sliding_window"),
+                self.sliding.window,
+            ),
+        ]
     }
 
     pub fn import_from_huggingface(

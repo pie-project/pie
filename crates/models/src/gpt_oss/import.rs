@@ -3,6 +3,7 @@ use checkpoint::types::{DType, Encoding};
 use poem_dsl::{Dtype, Weight};
 
 use super::model::Model;
+use checkpoint_dsl::format::{Format, Stated, config, read_one};
 use checkpoint_dsl::{
     Builder, Error, divided, encoding, extents, grouped, scaling, stored_encoding,
 };
@@ -31,24 +32,47 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        let mut refusals: Vec<String> = Vec::new();
-        for (what, layout) in [
-            ("transformers", Layout::Transformers),
-            ("mlx_lm", Layout::Mlx),
-        ] {
-            match self.import_from(src, platform, layout) {
-                Ok(contract) => return Ok(contract),
-                Err(why) => refusals.push(format!("as {what}, {why}")),
+        // The two spellings share every name; the expert codes say which one a
+        // checkpoint is, bytes under transformers and words under mlx_lm.
+        let codes = |want: DType| {
+            move |src: &ztensor::Source| {
+                stored_encoding(src, "model.layers.0.mlp.experts.gate_up_proj_blocks")
+                    .is_ok_and(|stored| stored == Encoding::Raw(want))
             }
+        };
+        read_one(
+            "gpt_oss",
+            src,
+            vec![
+                Format::new("transformers", codes(Layout::Transformers.codes()), || {
+                    self.import_from(src, platform, Layout::Transformers)
+                })
+                .stating(self.configured()),
+                Format::new("mlx_lm", codes(Layout::Mlx.codes()), || {
+                    self.import_from(src, platform, Layout::Mlx)
+                })
+                .stating(self.configured()),
+            ],
+        )
+    }
+
+    /// The shape a transformers configuration states of this model.
+    fn configured(&self) -> Vec<Stated> {
+        let mut states = vec![
+            config("hidden_size", self.hidden),
+            config("vocab_size", self.vocab),
+            config("num_attention_heads", self.q_heads),
+            config("num_key_value_heads", self.kv_heads),
+            config("head_dim", self.head_dim),
+            config("num_hidden_layers", self.layers.len() as u32).or_deeper(),
+            config("rms_norm_eps", self.final_norm_eps),
+            config("sliding_window", self.window),
+        ];
+        if let Some(layer) = self.layers.first() {
+            states.push(config("num_local_experts", layer.mlp.experts).or_deeper());
+            states.push(config("rope_theta", layer.attn.theta));
         }
-        Err(Error::Illegible {
-            name: "gpt_oss".to_string(),
-            detail: format!(
-                "no reading of this file lands every plane this family \
-                 declares — {}",
-                refusals.join("; "),
-            ),
-        })
+        states
     }
 
     fn import_from(

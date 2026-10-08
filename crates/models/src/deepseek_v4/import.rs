@@ -2,10 +2,9 @@ use checkpoint::contract::{Expr, ModelContract, TensorContract, TensorType};
 use poem_dsl::{Dtype, Weight};
 
 use super::model::{Gate, GateUp, Layer, Mlp, Model};
+use checkpoint_dsl::format::{Format, has, read_one};
 use checkpoint_dsl::{Builder, Error, encoding, extents, scaling};
 use poem_dsl::Platform;
-
-type ImportArm<S> = fn(&S, &ztensor::Source, Platform) -> Result<ModelContract, Error>;
 
 impl Model {
     pub fn import(
@@ -13,37 +12,38 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        let mut refusals: Vec<String> = Vec::new();
-        let arms: &[(&str, ImportArm<Self>)] = if self.hyper.single_pass {
-            &[
-                ("a DeepSeek-V4.1 checkpoint", Self::import_from_v41),
-                ("a DeepSeek-V4.1 MLX checkpoint", Self::import_from_v41_mlx),
+        // The flash spellings share their names (an `--aux` overlay rides
+        // beside either), so a reading is what tells them apart.
+        let formats = if self.hyper.single_pass {
+            vec![
+                Format::new(
+                    "a DeepSeek-V4.1 checkpoint",
+                    |src| has(src, "embed.weight"),
+                    || self.import_from_v41(src, platform),
+                ),
+                Format::new(
+                    "a DeepSeek-V4.1 MLX checkpoint",
+                    |src| has(src, "model.layers.0.ffn.switch_mlp.gate_proj.weight"),
+                    || self.import_from_v41_mlx(src, platform),
+                ),
             ]
         } else {
-            &[
-                (
-                    "an artifact with an `--aux` overlay",
-                    Self::import_from_own_with_aux,
+            vec![
+                Format::reading("an artifact with an `--aux` overlay", || {
+                    self.import_from_own_with_aux(src, platform)
+                }),
+                Format::reading("flash mlx", || self.import_from_mlx(src, platform)),
+                Format::reading("huggingface", || {
+                    self.import_from_huggingface(src, platform)
+                }),
+                Format::new(
+                    "gguf",
+                    |src| has(src, "token_embd.weight"),
+                    || self.import_from_gguf(src, platform),
                 ),
-                ("flash mlx", Self::import_from_mlx),
-                ("huggingface", Self::import_from_huggingface),
-                ("gguf", Self::import_from_gguf),
             ]
         };
-        for (what, arm) in arms {
-            match arm(self, src, platform) {
-                Ok(contract) => return Ok(contract),
-                Err(why) => refusals.push(format!("as {what}, {why}")),
-            }
-        }
-        Err(Error::Illegible {
-            name: "dsv4".to_string(),
-            detail: format!(
-                "no reading of this file lands every plane this family \
-                 declares — {}",
-                refusals.join("; "),
-            ),
-        })
+        read_one("dsv4", src, formats)
     }
 
     pub fn import_from_own_with_aux(

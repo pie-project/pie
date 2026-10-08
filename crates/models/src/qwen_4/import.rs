@@ -2,6 +2,7 @@ use checkpoint::contract::{Expr, ModelContract};
 
 use super::model::{Layer, Mixer, Mlp, Model};
 use crate::qwen_3::import::{flattened, squeezed};
+use checkpoint_dsl::format::{Format, has, read_one};
 use checkpoint_dsl::{Builder, Error, extents};
 use poem_dsl::Platform;
 use poem_dsl::Weight;
@@ -59,24 +60,22 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        let mut refusals: Vec<String> = Vec::new();
-        for (what, layout) in [
-            ("transformers", Layout::Transformers),
-            ("mlx_lm", Layout::Mlx),
-        ] {
-            match self.import_from_safetensors(src, platform, layout) {
-                Ok(contract) => return Ok(contract),
-                Err(why) => refusals.push(format!("as {what}, {why}")),
-            }
-        }
-        Err(Error::Illegible {
-            name: "qwen4".to_string(),
-            detail: format!(
-                "no reading of this file lands every plane this family \
-                 declares — {}",
-                refusals.join("; "),
-            ),
-        })
+        read_one(
+            "qwen4",
+            src,
+            vec![
+                Format::new(
+                    "transformers",
+                    |src| has(src, Layout::Transformers.embed()),
+                    || self.import_from_safetensors(src, platform, Layout::Transformers),
+                ),
+                Format::new(
+                    "mlx_lm",
+                    |src| has(src, Layout::Mlx.embed()),
+                    || self.import_from_safetensors(src, platform, Layout::Mlx),
+                ),
+            ],
+        )
     }
 
     fn import_from_safetensors(
