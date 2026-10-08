@@ -1,6 +1,6 @@
 # Pie for Swift
 
-Two libraries:
+Libraries:
 
 - **`PieClient`** speaks pie's client protocol (MessagePack frames,
   crates/client-api). It talks to a remote `pie serve` over WebSocket, or to
@@ -9,6 +9,15 @@ Two libraries:
   engine and the inferlet sandbox in-process, booted through
   `runtime::embed` (the same path the browser build uses). Inferlets run
   under wasmtime's Pulley interpreter on iOS, where an app may not JIT.
+- **`PieLanguagePython`**, **`PieLanguageJavaScript`** add the components
+  script inferlets (`x.py`, `x.js`) run in:
+
+  ```swift
+  import PieLanguagePython
+
+  let server = try await PieServer.start(model: model, languages: [.python])
+  let name = try await server.install(contentsOf: Bundle.main.url(forResource: "main", withExtension: "py")!)
+  ```
 
 ```swift
 import PieServer
@@ -52,8 +61,10 @@ lanes, the share of the GPU working set), sized for a phone by default.
 
 ```bash
 ./build-xcframework.sh        # the Rust core → build/PieServerCore.xcframework (iOS, iOS simulator, macOS; arm64)
+../../scripts/build-languages.sh                      # the language components → Sources/PieLanguage*/Resources
 swift test                                            # protocol and configuration, no GPU
 swift run -c release pie-smoke <model.zt> "prompt"   # end to end on a Mac (or ws://host:port)
+PIE_SCRIPT=../../examples/quickstart-py/main.py swift run -c release pie-smoke <model.zt> "prompt"
 ```
 
 `core/` is the Rust core (`pie-swift-core`, a workspace member) behind
@@ -66,4 +77,5 @@ swift run -c release pie-smoke <model.zt> "prompt"   # end to end on a Mac (or w
 - In the iOS simulator an app builds and runs, but the engine refuses to boot:
   the simulator's GPU shares no memory with the host. Inference needs a device.
 - Linking `PieServer` adds about 57 MB to an app's executable (about 16 MB
-  compressed); the model ships or downloads separately.
+  compressed); the Python component adds about 38 MB (14 MB compressed); the
+  model ships or downloads separately.

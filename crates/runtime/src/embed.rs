@@ -13,6 +13,11 @@ use crate::engine::EngineBox;
 use crate::model::ModelMetadata;
 use crate::server::ClientId;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod server;
+#[cfg(not(target_arch = "wasm32"))]
+pub use server::Server;
+
 /// What an embedding host boots with; `gpu_mem_utilization` goes into the
 /// host's engine boot document.
 #[derive(Debug, Clone, Deserialize)]

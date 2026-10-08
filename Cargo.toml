@@ -55,6 +55,7 @@ members = [
     "crates/web-std",
     "packages/javascript/server-web",
     "packages/swift/core",
+    "packages/kotlin/core",
 
     "packages/python/server",
     "packages/javascript/server",
