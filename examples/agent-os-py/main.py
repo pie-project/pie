@@ -830,7 +830,8 @@ class Supervisor:
             weight = 1.5 if lane.kind == "judge" else 1.0
             p.vote(lane.answer, weight)
             kill_lane(self.arena, lane, lane.why_done)
-            self.log(p, "DONE", lane.why_done, lane=lane.id, kind=lane.kind, tokens=len(lane.toks), answer=lane.answer)
+            self.log(p, "DONE", lane.why_done, lane=lane.id, kind=lane.kind, tokens=len(lane.toks), answer=lane.answer,
+                     **({"tail": lane.text[-240:]} if lane.why_done != "answered" else {}))
 
     async def run(self):
         idle = 0

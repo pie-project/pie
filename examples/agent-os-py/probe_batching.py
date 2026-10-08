@@ -162,7 +162,9 @@ async def main(input: dict) -> dict:
     widths = [int(x) for x in str(input.get("widths", "1,4,8,16")).split(",")]
     temperature = float(input.get("temperature", 0.0))
     hybrid = model.pass_kind() != ForwardKind.ATTENTION
-    prompt = list(chat.system_user("You are a careful math tutor.", "Janet has 3 apples and buys 5 more, then gives 2 away. How many are left? Think step by step.")) + list(chat.cue())
+    pad = int(input.get("pad", 0))   # filler sentences, to probe long shared contexts
+    filler = " The sky is blue and the grass is green." * pad
+    prompt = list(chat.system_user("You are a careful math tutor." + filler, "Janet has 3 apples and buys 5 more, then gives 2 away. How many are left? Think step by step.")) + list(chat.cue())
     P = (len(prompt) - 1) // PS            # shared, page-aligned prefix pages
     pre = P * PS
     suffix = prompt[pre:]                    # >=1 tokens each lane feeds itself

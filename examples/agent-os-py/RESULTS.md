@@ -114,3 +114,19 @@ questions do not, and no reward signal exists for a controller to learn from.
    are exact and free here, so a controller could branch where the model is uncertain. That needs a
    per-wave entropy or value signal from the epilogue, which this version does not compute.
 4. **More problems per strategy** (hundreds) to resolve the 2-point effects the simulator suggests.
+
+## 7. Profile: what stops a clear win (measured)
+
+- **Not the engine's decode loop.** A wave is one device loop, so host overhead is small. Per-step cost on the
+  0.8B model is ~7 ms at 1 row, ~13 at 8 and ~27 at 32 (short context); on 4B it is 38 ms at 1 row and 98 at 16.
+  Batching already buys ~6x over running the rows one by one. What is left is weight-read bandwidth on a base M5.
+  Context length costs little (32 rows: 1,390 tok/s at 48 tokens, 990 at 2,000; `probe_batching.py --pad`).
+- **Statistics, not speed, is the limit.** 80-problem runs have +-5 points. A 16-problem test of "2 agents with a
+  2,560-token cap" looked like a big win (11/16, the same as 4 agents at cap 1,024, with 35% fewer tokens). On 48
+  problems it did not hold: 2 agents at cap 2,560 get 60.4% at 2,309 tokens, while 4 agents at cap 1,024 get 66.7%
+  at 2,788. A small sample fooled me; the larger one corrected it.
+- **Where tokens go on 4B.** 39% of lanes hit the 1,024 cap without an answer and use 58% of all tokens. Raising the
+  cap to 2,560 leaves 23-26% unfinished (they are long explorations, not loops) and helps only ~2-4 points.
+- **Paired bootstrap over problems on the recorded 4B lanes:** consensus-driven widening (cap 8, give up after 3)
+  beats fixed 4 by +1.9 points (90% CI +0.6 to +3.3) for +175 tokens, and ties fixed 5 (+0.5, CI -0.4 to +1.4) with
+  511 fewer tokens. A real but small edge, resampled from 15 lanes per problem, not yet confirmed on the engine.
