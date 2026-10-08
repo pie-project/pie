@@ -5,32 +5,40 @@ use std::time::Instant;
 
 use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
-use models::flux_2::model::{IN_CHANNELS, Model};
-use models::flux_2::vae;
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, trace_hybrid};
+use poem::Platform;
+use poem::star::Package;
 use poem_compiler::{Budget, VoxelLadder};
 
-struct OneArm {
-    model: Model,
-    decode: bool,
-}
+const ROW: &str = "flux2-klein-4b-bf16-kv-bf16";
+const IN_CHANNELS: u32 = 128;
+const TOKEN_COMPRESSION: u32 = 16;
 
-impl ForwardHybrid for OneArm {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
-    }
-    fn forward(&self, inputs: Input) -> Value {
-        let v = self
-            .model
-            .vae
-            .as_ref()
-            .expect("the flagship carries the VAE");
-        if self.decode {
-            vae::decode(&inputs, v)
-        } else {
-            vae::encode(&inputs, v)
+/// The flagship's package with a forward that runs one of its VAE's
+/// readings alone, over every row, and holds no caches.
+fn one_arm(decode: bool) -> Package {
+    let package = models::star::package_of("flux2-klein-4b").expect("FLUX.2 is a package");
+    let files_at = format!("{}files/", poem::star::ATTRIBUTE);
+    let mut files: Vec<(String, String)> = package
+        .attributes()
+        .into_iter()
+        .filter_map(|(key, source)| Some((key.strip_prefix(&files_at)?.to_string(), source)))
+        .collect();
+    for (file, source) in &mut files {
+        if file == "forward.star" {
+            *source = source
+                .replace("def caches(m, c):", "def every_cache(m, c):")
+                .replace("def forward(m, inputs):", "def every_reading(m, inputs):")
+                + &format!(
+                    "\ndef caches(m, c):\n    pass\n\ndef forward(m, inputs):\n    return {}(inputs, m.vae)\n",
+                    if decode { "decode" } else { "encode" }
+                );
         }
     }
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(f, s)| (f.as_str(), s.as_str()))
+        .collect();
+    Package::new(package.name(), &files).unwrap_or_else(|why| panic!("{why:#}"))
 }
 
 fn artifact() -> Option<PathBuf> {
@@ -100,17 +108,19 @@ fn fire(
     clip: [u32; 3],
     payload: &[f32],
 ) -> (Vec<f32>, Vec<[u32; 3]>, f64, f64) {
-    let model = Model::klein_4b(Dtype::Bf16);
-    let arm = OneArm { model, decode };
-    let trace = trace_hybrid(
-        if decode {
-            "flux2-vae-decode"
-        } else {
-            "flux2-vae-encode"
-        },
-        &arm,
-        Platform::Cuda,
-    );
+    let row = models::deployment(ROW).expect("the flagship row");
+    let trace = one_arm(decode)
+        .trace(
+            row.entry.id,
+            &models::star::deploy(&row.deploy),
+            if decode {
+                "flux2-vae-decode"
+            } else {
+                "flux2-vae-encode"
+            },
+            Platform::Cuda,
+        )
+        .unwrap_or_else(|why| panic!("{why:#}"));
     let src = ztensor::Source::open(root).unwrap_or_else(|why| panic!("{}: {why}", root.display()));
     let contract = poem::import::own_contract(&src, &trace.params, 1, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the artifact does not hold this arm's planes: {why}"));
@@ -213,7 +223,7 @@ fn the_vae_decodes_and_encodes_the_golden_clip() {
     assert_eq!(mean.len(), voxels(mean_box) * width);
     assert_eq!(
         pixel_box[1],
-        latent_box[1] * models::flux_2::model::TOKEN_COMPRESSION,
+        latent_box[1] * TOKEN_COMPRESSION,
         "one token is 16 pixels a side"
     );
 

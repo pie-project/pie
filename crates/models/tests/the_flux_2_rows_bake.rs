@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 
-use models::flux_2::forward;
-use models::flux_2::model;
+mod flux_2_dims;
+
+use flux_2_dims as forward;
+use flux_2_dims as model;
 use models::{PortKind, ReadoutKind};
 use poem::{
     Attention, Def, Dim, Dtype, Elementwise, GeomKind, Operands, Operation, Platform, Request,
@@ -263,21 +265,8 @@ fn each_stream_of_the_denoise_reading_classifies_into_its_own_class() {
             "{sku}: two streams share a class: {seen:?}"
         );
     }
-    let mini = models::flux_2::model::Model::mini(Dtype::Bf16).readings();
-    assert_eq!(
-        (mini.text, mini.denoise, mini.vae_decode, mini.vae_encode),
-        (None, 0, None, None)
-    );
-    let klein = models::flux_2::model::Model::klein_4b(Dtype::Bf16).readings();
-    assert_eq!(
-        (
-            klein.text,
-            klein.denoise,
-            klein.vae_decode,
-            klein.vae_encode
-        ),
-        (Some(0), 1, Some(2), Some(3))
-    );
+    assert_eq!(model::readings(MINI), (None, 0, None, None));
+    assert_eq!(model::readings(KLEIN), (Some(0), 1, Some(2), Some(3)));
 }
 
 fn every_ragged_read_is_self_paired_over_the_group_csr() {

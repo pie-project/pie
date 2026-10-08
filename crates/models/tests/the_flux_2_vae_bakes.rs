@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{Expr, Partition, TensorType};
-use models::flux_2::{model, vae};
+mod flux_2_dims;
+
+use flux_2_dims::{self as model, vae};
 use models::{PortKind, ReadoutKind};
 use poem::{Def, Dim, Dtype, Operation, Platform, Request, Stream, Trace, Ty, seam};
 use poem_ir::{GridRule, ParamLayout, Seam, Spatial};
@@ -367,9 +369,11 @@ fn the_import_reads_every_vae_tensor_of_the_real_snapshot_once() {
     };
     let src = checkpoint::file::diffusers::open(&root)
         .unwrap_or_else(|why| panic!("{}: {why}", root.display()));
-    let contract = model::Model::klein_4b(Dtype::Bf16)
-        .import_vae(&src, Platform::Cuda)
-        .unwrap_or_else(|why| panic!("the VAE does not read this snapshot: {why}"));
+    let mut contract = models::deployment("flux2-klein-4b-bf16-kv-bf16")
+        .expect("the klein row")
+        .contract(&src, Platform::Cuda)
+        .unwrap_or_else(|why| panic!("the pipeline does not read this snapshot: {why}"));
+    contract.tensors.retain(|t| t.name.starts_with("vae."));
 
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for tensor in &contract.tensors {

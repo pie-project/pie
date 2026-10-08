@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{ModelContract, Partition, TensorType};
 use checkpoint::plan::StorageTarget;
-use models::flux_2::model::{self, Dims};
+mod flux_2_dims;
+
+use flux_2_dims::{self as model, Dims};
 use poem::Platform;
 use ztensor::Leaf;
 use ztensor::provide::{Catalog, Entry, Location, Store, StoreId};
