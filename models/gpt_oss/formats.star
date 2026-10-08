@@ -1,0 +1,138 @@
+# How a gpt-oss checkpoint is laid out. transformers and mlx_lm share every
+# name; the experts' codes tell them apart, bytes under transformers and
+# words under mlx_lm.
+
+load("//lib/dflash/formats.star", "bind_aux")
+
+PROBE = "model.layers.0.mlp.experts.gate_up_proj_blocks"
+TRANSFORMERS = dtype.u8
+MLX = dtype.u32
+BANK_ROWS = 1
+
+def formats(m):
+    codes = lambda want: lambda checkpoint: has(PROBE) and stored(PROBE) == raw(want)
+    return [
+        format(
+            "transformers",
+            recognizes = codes(TRANSFORMERS),
+            read = lambda reads: read(m, reads, TRANSFORMERS),
+            states = configured(m),
+        ),
+        format(
+            "mlx_lm",
+            recognizes = codes(MLX),
+            read = lambda reads: read(m, reads, MLX),
+            states = configured(m),
+        ),
+    ]
+
+def configured(m):
+    """The shape a transformers configuration states of this model."""
+    states = [
+        config("hidden_size", m.hidden),
+        config("vocab_size", m.vocab),
+        config("num_attention_heads", m.q_heads),
+        config("num_key_value_heads", m.kv_heads),
+        config("head_dim", m.head_dim),
+        config("num_hidden_layers", len(m.layers), or_deeper = True),
+        config("rms_norm_eps", m.final_norm_eps),
+        config("sliding_window", m.window),
+    ]
+    if m.layers:
+        states.append(config("num_local_experts", m.layers[0].mlp.experts, or_deeper = True))
+        states.append(config("rope_theta", m.layers[0].attn.theta))
+    return states
+
+def read(m, reads, codes):
+    reads.read(m.embed, "model.embed_tokens.weight")
+    reads.read(m.final_norm, "model.norm.weight")
+    reads.read(m.head, "lm_head.weight")
+    for l, layer in enumerate(m.layers):
+        ck = lambda what: "model.layers.{}.{}".format(l, what)
+        attn = layer.attn
+        mlp = layer.mlp
+        reads.read(layer.attn_norm, ck("input_layernorm.weight"))
+        reads.read(layer.mlp_norm, ck("post_attention_layernorm.weight"))
+        reads.read(attn.q_proj, ck("self_attn.q_proj.weight"))
+        reads.read(attn.q_bias, ck("self_attn.q_proj.bias"))
+        reads.read(attn.k_proj, ck("self_attn.k_proj.weight"))
+        reads.read(attn.k_bias, ck("self_attn.k_proj.bias"))
+        reads.read(attn.v_proj, ck("self_attn.v_proj.weight"))
+        reads.read(attn.v_bias, ck("self_attn.v_proj.bias"))
+        reads.read(attn.o_proj, ck("self_attn.o_proj.weight"))
+        reads.read(attn.o_bias, ck("self_attn.o_proj.bias"))
+        reads.read(attn.sinks, ck("self_attn.sinks"))
+        reads.read(mlp.router, ck("mlp.router.weight"))
+        reads.read(mlp.router_bias, ck("mlp.router.bias"))
+        if codes == TRANSFORMERS:
+            rows = mlp.inter
+            reads.extend(bank_planes(
+                mlp.gate_up,
+                ck("mlp.experts.gate_up_proj_blocks"),
+                ck("mlp.experts.gate_up_proj_scales"),
+                codes,
+                lambda e: deinterleaved(e, rows),
+            ))
+            reads.read_expr(mlp.gate_up_bias, deinterleaved(src(ck("mlp.experts.gate_up_proj_bias")), rows))
+            reads.extend(bank_planes(
+                mlp.down,
+                ck("mlp.experts.down_proj_blocks"),
+                ck("mlp.experts.down_proj_scales"),
+                codes,
+                lambda e: e,
+            ))
+            reads.read(mlp.down_bias, ck("mlp.experts.down_proj_bias"))
+        else:
+            reads.extend(banked_split(mlp.gate_up, [ck("mlp.experts.gate_proj"), ck("mlp.experts.up_proj")], codes))
+            reads.read_concat(mlp.gate_up_bias, [ck("mlp.experts.gate_proj.bias"), ck("mlp.experts.up_proj.bias")])
+            reads.extend(banked_split(mlp.down, [ck("mlp.experts.down_proj")], codes))
+            reads.read(mlp.down_bias, ck("mlp.experts.down_proj.bias"))
+    if m.dflash != None:
+        bind_aux(m.dflash, reads, lambda name: src(name).bias(-1.0))
+
+def stored_as(w, plane, want):
+    if stored(plane) != raw(want):
+        fail("`{}`: `{}` is stored {}, and this spelling of the bank carries it as raw {}".format(
+            w.name, plane, stored(plane), want))
+
+def bank_planes(w, blocks, scales, codes, lay):
+    stored_as(w, blocks, codes)
+    stored_as(w, scales, dtype.u8)
+    e8m0 = encoding(dtype.e8m0)
+    return [
+        tensor(w.name, lay(src(blocks).transmute(w.shape, grouped(w))), grouped(w)),
+        tensor(
+            scales_name(w.name),
+            lay(src(scales).transmute(scales_shape(w), e8m0)),
+            e8m0,
+            shape = scales_shape(w),
+            scaling = w,
+        ),
+    ]
+
+def banked_split(w, stems, codes):
+    legs = len(stems)
+
+    def leg(whole):
+        cut = list(whole)
+        cut[BANK_ROWS] = cut[BANK_ROWS] // legs
+        return cut
+
+    e8m0 = encoding(dtype.e8m0)
+    code_legs = []
+    scale_legs = []
+    for stem in stems:
+        weight_ = stem + ".weight"
+        scales = stem + ".scales"
+        stored_as(w, weight_, codes)
+        stored_as(w, scales, dtype.u8)
+        code_legs.append(src(weight_).transmute(leg(w.shape), grouped(w)))
+        scale_legs.append(src(scales).transmute(leg(scales_shape(w)), e8m0))
+    joined = lambda legs: legs[0] if len(legs) == 1 else concat(BANK_ROWS, legs)
+    return [
+        tensor(w.name, joined(code_legs), grouped(w)),
+        tensor(scales_name(w.name), joined(scale_legs), e8m0, shape = scales_shape(w), scaling = w),
+    ]
+
+def deinterleaved(e, rows):
+    return concat(BANK_ROWS, [e.stride(BANK_ROWS, 0, rows, 2), e.stride(BANK_ROWS, 1, rows, 2)])

@@ -28,6 +28,7 @@ pub fn template_of(name: &str) -> Option<TemplateFn> {
 #[must_use]
 pub fn named(name: &str) -> Option<TemplateFn> {
     match name {
+        "gpt_oss" => Some(crate::gpt_oss::template::gpt_oss),
         "inkling" => Some(crate::inkling::template::inkling),
         "glm_5" => Some(crate::glm_5::template::instruct),
         "muse_glimmer" => Some(crate::muse_glimmer::template::muse_glimmer),
