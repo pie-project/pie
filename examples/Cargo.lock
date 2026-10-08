@@ -888,6 +888,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
+name = "voice-chat"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "wan2-parity"
 version = "0.1.0"
 dependencies = [

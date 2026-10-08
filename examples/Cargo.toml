@@ -63,6 +63,7 @@ members = [
     "text-completion-bench",
     "token-healing",
     "top-a-sampling",
+    "voice-chat",
     "xtc-sampling",
 ]
 
