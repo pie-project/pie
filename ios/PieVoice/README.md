@@ -67,8 +67,8 @@ which re-sign it with your own Apple ID. Same 7-day refresh rule.
   build: `results/dev-20261008-iphone16pro-qwen3.5-0.8b-run{1,2}.jsonl`
   (5-turn scripted conversation, `-PieBenchmark 1`). Engine boot plus a
   warm-up turn 0.3 s and 0.6 s; time to first token 0.11-0.25 s; decode
-  59-72 tok/s after the first turn; reused prompt tokens 64 → 256 by turn
-  5; peak footprint 977 / 981 MiB. `bench-report.py <file>` prints the
+  59-72 tok/s after the first turn; reused prompt tokens 64 → 256 (run 1)
+  and 64 → 192 (run 2) by turn 5; peak footprint 977 / 981 MiB. `bench-report.py <file>` prints the
   table. `results/dev-20260921-iphone16pro-qwen3-0.6b.jsonl` is the Pie
   0.4 ggml-CPU run with Qwen3-0.6B, kept for comparison. `bench-ladder.sh`
   lists the 2B and 4B rungs but only the 0.8B rung has been deployed.

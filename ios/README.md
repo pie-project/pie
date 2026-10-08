@@ -29,8 +29,9 @@ Measured on the phone (iOS 26.1), 5-turn scripted conversation, two runs
 engine boot + warm-up turn 0.3 s / 0.6 s; time to first token 0.11-0.25 s;
 decode 59-72 tok/s after the first turn (36 and 62 tok/s on turn 1, the
 first run paying for kernel warm-up); prompt tokens reused from earlier
-turns 64 → 256 by turn 5, so each turn prefills only the previous reply
-plus the new question (54-101 tokens) however long the transcript grows;
+turns climbing every turn (64 → 256 by turn 5 in run 1, 64 → 192 in run
+2), so each turn prefills only the previous reply plus the new question
+(54-101 tokens) however long the transcript grows;
 peak footprint 977 / 981 MiB. Deploy with
 `bash ios/PieVoice/deploy-device.sh`.
 
