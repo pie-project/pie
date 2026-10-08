@@ -1,6 +1,6 @@
 # The browser suite
 
-Everything that runs `@pie-project/browser` (`javascript/server-web`) in a real browser.
+Everything that runs `@pie-project/browser` (`packages/javascript/server-web`) in a real browser.
 Pages are served from the repository root, so they import the package's
 `dist/` bundle by relative path.
 
@@ -11,7 +11,7 @@ PIE_HOME=~/.pie-browser pie model import Qwen/Qwen3.5-0.8B     # a wgpu build of
 ln -s ~/.pie-browser/models/Qwen--Qwen3.5-0.8B tests/browser/models
 npm install --prefix tests/browser/tools playwright@1.63.0
 npx --prefix tests/browser/tools playwright install chromium
-./javascript/server-web/build.sh
+./packages/javascript/server-web/build.sh
 ./tests/browser/tools/inferlets.sh      # the inferlets matrix.json names, beside the pages
 ```
 

@@ -49,7 +49,7 @@ chunk cannot be a 1-token sliver too short to hold the window.
 page of the whole prompt -- is the discriminator. Only a tap on the final chunk
 can put mass there; a tap on any earlier chunk reports zero for it.
 
-Run from the repo root with PYTHONPATH=python/server/python:
+Run from the repo root with PYTHONPATH=packages/python/server/python:
 
         --engine cuda_native --model <path>
 """

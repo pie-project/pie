@@ -67,13 +67,13 @@ note() { printf '%s\n' "$*" >&2; }
 # editing it, and its presence says nothing about what the inferlet library actually binds.
 py_dotted=$(
   grep -rhoE 'wit_world\.imports\.[a-z0-9_]+' \
-    "$ROOT/python/inferlet/src/inferlet" \
+    "$ROOT/packages/python/inferlet/src/inferlet" \
     --exclude-dir=bindings --exclude-dir=__pycache__ --exclude='*.pyc' 2>/dev/null \
     | sed -E 's/.*\.//' || true
 )
 py_listed=$(
   grep -rhoE 'wit_world\.imports import [a-z0-9_, ]+' \
-    "$ROOT/python/inferlet/src/inferlet" \
+    "$ROOT/packages/python/inferlet/src/inferlet" \
     --exclude-dir=bindings --exclude-dir=__pycache__ --exclude='*.pyc' 2>/dev/null \
     | sed -E 's/.*imports import //' | tr ',' '\n' \
     | sed -E 's/ +as +.*//; s/^ +//; s/ +$//' | grep -v '^$' || true
@@ -86,7 +86,7 @@ py_refs=$(printf '%s\n%s\n' "$py_dotted" "$py_listed" | grep -v '^$' | sort -u |
 # reason as Python.
 pkg_ns=$(sed -nE 's/^package ([a-z0-9]+):([a-z0-9-]+).*/\1:\2/p' "$SRC/world.wit" | head -1)
 js_refs=$(
-  grep -rhoE "['\"]${pkg_ns}/[a-z0-9-]+" "$ROOT/javascript/inferlet/src" \
+  grep -rhoE "['\"]${pkg_ns}/[a-z0-9-]+" "$ROOT/packages/javascript/inferlet/src" \
     --include='*.ts' --exclude-dir=bindings --exclude-dir=__pycache__ --exclude='*.pyc' 2>/dev/null \
     | sed -E "s|.*${pkg_ns}/||" | sort -u || true
 )
@@ -94,7 +94,7 @@ js_refs=$(
 # Anything spelled `pie:<something-else>/...` is a reference to a package that
 # does not exist -- the WIT namespace was consolidated into one package.
 js_foreign=$(
-  grep -rhoE "['\"]pie:[a-z0-9-]+/[a-z0-9-]+" "$ROOT/javascript/inferlet/src" \
+  grep -rhoE "['\"]pie:[a-z0-9-]+/[a-z0-9-]+" "$ROOT/packages/javascript/inferlet/src" \
     --include='*.ts' --exclude-dir=bindings --exclude-dir=__pycache__ --exclude='*.pyc' 2>/dev/null \
     | sed -E "s|.*(pie:[a-z0-9-]+/[a-z0-9-]+)|\1|" | grep -v "^$pkg_ns/" | sort -u || true
 )

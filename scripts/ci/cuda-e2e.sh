@@ -49,7 +49,7 @@ echo "== compat API suite"
 uv run --with openai --with anthropic --with google-genai python tests/builtins/test_compat.py --base-url "http://127.0.0.1:$port"
 
 echo "== install, replace and remove while serving"
-submit() { uv run --project python/client python scripts/ci/launch.py "ws://127.0.0.1:$port" "$1" || true; }
+submit() { uv run --project packages/python/client python scripts/ci/launch.py "ws://127.0.0.1:$port" "$1" || true; }
 wasm=$(cd examples && cargo metadata --format-version 1 --no-deps | jq -r .target_directory)/wasm32-wasip2/release
 tc=$wasm/text_completion.wasm
 nb=$wasm/naive_baseline.wasm

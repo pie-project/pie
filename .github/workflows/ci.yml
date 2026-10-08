@@ -104,14 +104,14 @@ jobs:
         with:
           python-version: '3.12'
       - name: node addon
-        working-directory: javascript
+        working-directory: packages/javascript
         run: |
           npm ci --include=dev --ignore-scripts
           bash server/build.sh dev --no-default-features
           npm test -w server
           npm pack --dry-run -w server
       - name: python wheel
-        working-directory: python/server
+        working-directory: packages/python/server
         run: |
           python -m pip install maturin
           maturin build --no-default-features --out dist
@@ -156,15 +156,15 @@ jobs:
       # and the shared goldens tie them to the real world.
       - run: |
           bash scripts/check-inferlet-interfaces.sh
-          cmp crates/eta-dsl/tests/goldens/inferlet_containers.txt python/inferlet/tests/goldens/eta_containers.txt
+          cmp crates/eta-dsl/tests/goldens/inferlet_containers.txt packages/python/inferlet/tests/goldens/eta_containers.txt
       - name: python
         run: |
-          python -m pip install pytest -e python/client
-          PYTHONPATH=python/inferlet/src python -m pytest -q python/inferlet/tests
-          python -m pytest -q python/client/tests
+          python -m pip install pytest -e packages/python/client
+          PYTHONPATH=packages/python/inferlet/src python -m pytest -q packages/python/inferlet/tests
+          python -m pytest -q packages/python/client/tests
           python -m pytest -q scripts/bench/tests
       - name: javascript
-        working-directory: javascript
+        working-directory: packages/javascript
         run: |
           npm ci --include=dev --ignore-scripts
           npm run generate-bindings -w inferlet
@@ -223,7 +223,7 @@ jobs:
           key: qwen35-tokenizer-v1
       - run: bash scripts/ci/tokenizer.sh ~/qwen35-tokenizer
       - run: npm ci --include=dev --ignore-scripts
-        working-directory: javascript
+        working-directory: packages/javascript
       - run: |
           npm install --prefix tests/browser/tools playwright@1.63.0
           npx --prefix tests/browser/tools playwright install --with-deps chromium
@@ -244,7 +244,7 @@ jobs:
           python3 scripts/tiny_qwen35.py "$RUNNER_TEMP/snapshot" --tokenizer ~/qwen35-tokenizer
           PIE_HOME="$RUNNER_TEMP/home" target/release/pie model import "$RUNNER_TEMP/snapshot" --sku qwen35-tiny-u4g64-kv-bf16 --keep-source
           mkdir -p tests/browser/models && cp "$(find "$RUNNER_TEMP/home/models" -name '*.wgpu.zt' | head -1)" tests/browser/models/tiny.wgpu.zt
-          ./javascript/server-web/build.sh release
+          ./packages/javascript/server-web/build.sh release
           for l in python javascript; do tar xzf "$RUNNER_TEMP/languages/pie-language-$l.tar.gz" -C "$RUNNER_TEMP/home"; done
           PIE_HOME="$RUNNER_TEMP/home" ./tests/browser/tools/inferlets.sh
           node tests/browser/tools/headless.mjs . "tests/browser/transport.html?n=20&model=models/tiny.wgpu.zt" --timeout 300000
@@ -278,7 +278,7 @@ jobs:
           name: languages
           path: ${{ runner.temp }}/languages
       - run: npm ci --include=dev --ignore-scripts
-        working-directory: javascript
+        working-directory: packages/javascript
       - run: PIE_TOKENIZER_DIR=$HOME/qwen35-tokenizer bash scripts/ci/lavapipe.sh
         env:
           PIE_ENGINE: wgpu
@@ -304,7 +304,7 @@ jobs:
           key: qwen35-tokenizer-v1
       - run: bash scripts/ci/tokenizer.sh ~/qwen35-tokenizer
       - run: npm ci --include=dev --ignore-scripts
-        working-directory: javascript
+        working-directory: packages/javascript
       - run: PIE_TOKENIZER_DIR=$HOME/qwen35-tokenizer bash scripts/ci/lavapipe.sh
         env:
           PIE_ENGINE: vulkan

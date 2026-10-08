@@ -26,7 +26,7 @@ jobs:
     if: inputs.package != 'pie-server'
     runs-on: ubuntu-latest
     env:
-      DIR: python/${{ inputs.package == 'pie-client' && 'client' || inputs.package == 'inferlet' && 'inferlet' || inputs.package == 'pie-language-python' && 'language-python' || 'language-javascript' }}
+      DIR: packages/python/${{ inputs.package == 'pie-client' && 'client' || inputs.package == 'inferlet' && 'inferlet' || inputs.package == 'pie-language-python' && 'language-python' || 'language-javascript' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -43,13 +43,13 @@ jobs:
       - if: startsWith(inputs.package, 'pie-language-')
         run: |
           uv tool install componentize-py
-          bash scripts/build-languages.sh target/languages "${DIR#python/language-}"
+          bash scripts/build-languages.sh target/languages "${DIR#packages/python/language-}"
       - name: tests
         run: |
           case "$DIR" in
-            python/client)      python -m pip install -e "$DIR" && python -m pytest -q "$DIR/tests" ;;
-            python/inferlet)    PYTHONPATH="$DIR/src" python -m pytest -q "$DIR/tests" ;;
-            python/language-*)  PYTHONPATH="$DIR/src" python -c "import importlib; m = importlib.import_module('pie_language_' + '${DIR#python/language-}'); assert len(m.read()) > 1_000_000, 'the component is missing'" ;;
+            packages/python/client)      python -m pip install -e "$DIR" && python -m pytest -q "$DIR/tests" ;;
+            packages/python/inferlet)    PYTHONPATH="$DIR/src" python -m pytest -q "$DIR/tests" ;;
+            packages/python/language-*)  PYTHONPATH="$DIR/src" python -c "import importlib; m = importlib.import_module('pie_language_' + '${DIR#packages/python/language-}'); assert len(m.read()) > 1_000_000, 'the component is missing'" ;;
           esac
       # The unit tests stub `wit_world`; a componentize-py build resolves every
       # WIT import against `crates/inferlet/wit` for real.
@@ -71,7 +71,7 @@ jobs:
           PY
           bash scripts/check-inferlet-interfaces.sh
           componentize-py -d crates/inferlet/wit -w inferlet componentize \
-            -p "$RUNNER_TEMP/app" -p python/inferlet/src -p python/inferlet/src/inferlet/bindings \
+            -p "$RUNNER_TEMP/app" -p packages/python/inferlet/src -p packages/python/inferlet/src/inferlet/bindings \
             app -o "$RUNNER_TEMP/app/app.wasm"
       - run: python -m build "$DIR"
       - uses: actions/upload-artifact@v6
@@ -108,14 +108,14 @@ jobs:
       - shell: bash
         run: |
           python3 -m pip install maturin
-          cd python/server
+          cd packages/python/server
           python3 -m maturin build --profile release-min --target ${{ matrix.target.triple }} \
             --no-default-features --features ${{ matrix.target.features }} --out dist \
             ${{ matrix.target.manylinux && format('--compatibility {0}', matrix.target.manylinux) || '' }}
       - uses: actions/upload-artifact@v6
         with:
           name: dist-${{ matrix.target.label }}
-          path: python/server/dist
+          path: packages/python/server/dist
           if-no-files-found: error
 
   sdist:
@@ -128,11 +128,11 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install maturin && maturin sdist --out dist
-        working-directory: python/server
+        working-directory: packages/python/server
       - uses: actions/upload-artifact@v6
         with:
           name: dist-sdist
-          path: python/server/dist
+          path: packages/python/server/dist
           if-no-files-found: error
 
   publish:
