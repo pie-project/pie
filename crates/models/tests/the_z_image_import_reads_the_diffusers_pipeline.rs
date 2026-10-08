@@ -387,7 +387,7 @@ fn the_z_image_import_reads_the_diffusers_pipeline_every_case() {
     the_miniature_reads_its_bare_state_dict_and_the_same_names_prefixed();
     neither_row_serves_the_other_rows_checkpoint();
     the_flagship_reads_the_real_snapshot();
-    the_derived_planes_are_stated_through_internal_steps();
+    the_derived_planes_are_stated_as_constants();
 }
 
 fn the_flagship_reads_a_synthetic_pipeline_shaped_like_the_snapshot() {
@@ -506,7 +506,7 @@ fn the_flagship_reads_the_real_snapshot() {
     assert_eq!(identified, TURBO);
 }
 
-fn the_derived_planes_are_stated_through_internal_steps() {
+fn the_derived_planes_are_stated_as_constants() {
     let dir = scratch();
     let tensors = prefixed("dit.", transformer(&Dims::mini(), Leaf::F32));
     let src = synthetic(&dir, &tensors);
@@ -519,18 +519,25 @@ fn the_derived_planes_are_stated_through_internal_steps() {
             .find(|t| t.name == name)
             .unwrap_or_else(|| panic!("no `{name}` in the contract"))
     };
+    let carries_a_constant = |expr: &Expr| {
+        let mut found = false;
+        expr.visit(&mut |node| found |= matches!(node, Expr::Const { .. }));
+        found
+    };
     for bank in ["dit.x_pad_mod", "dit.cap_pad_mod"] {
-        let neg = named(&format!("{bank}.neg"));
-        assert!(
-            matches!(&neg.expr, Expr::Bias { .. }),
-            "`{bank}.neg` is a biased fill"
-        );
         let bank = named(bank);
-        assert_eq!(bank.expr.outputs(), vec![format!("{}.neg", bank.name)]);
+        assert!(
+            carries_a_constant(&bank.expr),
+            "`{}`'s negative half is a constant the contract carries",
+            bank.name
+        );
         assert_eq!(bank.expr.sources().len(), 1, "the token itself, once");
     }
     let flip = named("dit.t_flip");
-    assert_eq!(flip.expr.outputs(), vec!["dit.t_flip.raw".to_string()]);
+    assert!(
+        carries_a_constant(&flip.expr),
+        "the flip is a stated constant"
+    );
     assert!(
         flip.expr.sources().is_empty(),
         "a constant reads no checkpoint tensor"

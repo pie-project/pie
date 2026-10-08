@@ -362,22 +362,13 @@ fn pad_table(b: &mut Builder, src: &ztensor::Source, w: &Weight, token: &str) ->
     };
     let shape = extents(w);
     let dim = shape[0] / 2;
-    let neg = format!("{}.neg", w.name);
-    b.push(
-        TensorContract::new(
-            neg.clone(),
-            Expr::fill(0.0, TensorType::raw(vec![dim, 1], dtype)).bias(-1.0),
-            vec![dim, 1],
-            stored,
-        )
-        .internal(),
-    );
+    let neg = vec![-1.0f32; usize::try_from(dim).expect("a pad row's width fits")];
     b.read_expr(
         w,
         Expr::concat(
             0,
             vec![
-                Expr::out(neg),
+                checkpoint_dsl::constant(&w.name, &neg, vec![dim, 1], dtype)?,
                 Expr::src(token).transmute(TensorType::raw(vec![dim, 1], dtype)),
             ],
         ),
@@ -398,21 +389,13 @@ fn constant(
             detail: format!("`{seed}` is stored {stored:?}; a constant is stated in a raw dtype"),
         });
     };
-    let raw = format!("{}.raw", w.name);
-    b.push(
-        TensorContract::new(
-            raw.clone(),
-            Expr::fill(0.0, TensorType::raw(extents(w), dtype)).bias(value),
-            extents(w),
-            stored.clone(),
-        )
-        .internal(),
-    );
+    let cells = usize::try_from(extents(w).iter().product::<i64>()).expect("a table that fits");
+    let raw = checkpoint_dsl::constant(&w.name, &vec![value; cells], extents(w), dtype)?;
     let want = checkpoint_dsl::encoding(w.dtype);
     let expr = if want == stored {
-        Expr::out(raw)
+        raw
     } else {
-        Expr::out(raw).cast(want.clone())
+        raw.cast(want.clone())
     };
     b.push(TensorContract::new(w.name.clone(), expr, extents(w), want));
     Ok(())

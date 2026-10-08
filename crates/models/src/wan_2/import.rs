@@ -432,22 +432,9 @@ fn row_of(
     };
     let shape = extents(w);
     let n = shape.iter().product::<i64>();
-    let mut parts = Vec::with_capacity(n as usize);
-    for i in 0..n {
-        let cell = format!("{}.{i}", w.name);
-        b.push(
-            checkpoint::contract::TensorContract::new(
-                cell.clone(),
-                Expr::fill(0.0, TensorType::raw(vec![1], dtype)).bias(value(i as usize)),
-                vec![1],
-                stored.clone(),
-            )
-            .internal(),
-        );
-        parts.push(Expr::out(cell));
-    }
+    let values: Vec<f32> = (0..n as usize).map(value).collect();
     let want = checkpoint_dsl::encoding(w.dtype);
-    let row = Expr::concat(0, parts);
+    let row = checkpoint_dsl::constant(&w.name, &values, vec![n], dtype)?;
     let row = if want == stored {
         row
     } else {

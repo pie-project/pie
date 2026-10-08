@@ -164,6 +164,7 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
             infer_slice(&ty, *axis, 0, *len)
         }
         Expr::Fill { value, ty } => infer_fill(*value, ty),
+        Expr::Const { ty, bytes } => infer_const(ty, bytes),
         Expr::Slice {
             src,
             axis,
@@ -637,6 +638,26 @@ fn infer_fill(value: u32, ty: &TensorType) -> Result<TensorType, Error> {
             "Fill of {} as {dtype:?} is not a run of zero bytes, which is all \
              the zeroing can write",
             f32::from_bits(value)
+        )));
+    }
+    Ok(ty.clone())
+}
+
+fn infer_const(ty: &TensorType, bytes: &[u8]) -> Result<TensorType, Error> {
+    if let Some(bad) = ty.shape.iter().find(|extent| **extent < 1) {
+        return Err(Error::Contract(format!(
+            "Const shape {:?} has a non-positive extent {bad}; a constant states \
+             every extent of the bytes it carries",
+            ty.shape
+        )));
+    }
+    let want = ty.byte_size()?;
+    if bytes.len() as u64 != want {
+        return Err(Error::Contract(format!(
+            "Const of shape {:?} as {:?} is {want} bytes and carries {}",
+            ty.shape,
+            ty.encoding,
+            bytes.len()
         )));
     }
     Ok(ty.clone())

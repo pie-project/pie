@@ -17,6 +17,13 @@ pub enum Expr {
         value: u32,
         ty: TensorType,
     },
+    /// A tensor the contract carries itself: values a model derives from what
+    /// a checkpoint states rather than reads from its planes, laid out as `ty`
+    /// stores them.
+    Const {
+        ty: TensorType,
+        bytes: Vec<u8>,
+    },
     Slice {
         src: Box<Expr>,
         axis: Axis,
@@ -332,6 +339,7 @@ impl Expr {
             Expr::Src(_) => "Src",
             Expr::Out(_) => "Out",
             Expr::Fill { .. } => "Fill",
+            Expr::Const { .. } => "Const",
             Expr::Slice { .. } => "Slice",
             Expr::Stride { .. } => "Stride",
             Expr::Gather { .. } => "Gather",
@@ -352,7 +360,11 @@ impl Expr {
     pub fn is_sharded(&self) -> bool {
         match self {
             Expr::Shard { .. } => true,
-            Expr::Src(_) | Expr::Out(_) | Expr::Fill { .. } | Expr::SrcIndexed(_) => false,
+            Expr::Src(_)
+            | Expr::Out(_)
+            | Expr::Fill { .. }
+            | Expr::Const { .. }
+            | Expr::SrcIndexed(_) => false,
             Expr::Slice { src, .. }
             | Expr::Stride { src, .. }
             | Expr::Gather { src, .. }
@@ -434,6 +446,11 @@ impl Expr {
         }
     }
 
+    /// The tensor `bytes` hold, laid out as `ty` stores it.
+    pub fn constant(ty: TensorType, bytes: Vec<u8>) -> Self {
+        Expr::Const { ty, bytes }
+    }
+
     pub fn fill(value: f32, ty: TensorType) -> Self {
         Expr::Fill {
             value: value.to_bits(),
@@ -507,7 +524,11 @@ impl Expr {
 
     pub fn is_affine(&self) -> bool {
         match self {
-            Expr::Src(_) | Expr::Out(_) | Expr::Fill { .. } | Expr::SrcIndexed(_) => true,
+            Expr::Src(_)
+            | Expr::Out(_)
+            | Expr::Fill { .. }
+            | Expr::Const { .. }
+            | Expr::SrcIndexed(_) => true,
             Expr::Slice { src, .. }
             | Expr::Stride { src, .. }
             | Expr::Gather { src, .. }
@@ -549,7 +570,11 @@ impl Expr {
     pub fn visit<'a>(&'a self, seen: &mut impl FnMut(&'a Expr)) {
         seen(self);
         match self {
-            Expr::Src(_) | Expr::Out(_) | Expr::Fill { .. } | Expr::SrcIndexed(_) => {}
+            Expr::Src(_)
+            | Expr::Out(_)
+            | Expr::Fill { .. }
+            | Expr::Const { .. }
+            | Expr::SrcIndexed(_) => {}
             Expr::Slice { src, .. }
             | Expr::Stride { src, .. }
             | Expr::Gather { src, .. }
@@ -585,7 +610,11 @@ impl Expr {
     ) -> Result<Expr, Error> {
         let mut boxed = |src: Box<Expr>| -> Result<Box<Expr>, Error> { Ok(Box::new(f(*src)?)) };
         Ok(match self {
-            Expr::Src(_) | Expr::Out(_) | Expr::Fill { .. } | Expr::SrcIndexed(_) => self,
+            Expr::Src(_)
+            | Expr::Out(_)
+            | Expr::Fill { .. }
+            | Expr::Const { .. }
+            | Expr::SrcIndexed(_) => self,
             Expr::Slice {
                 src,
                 axis,

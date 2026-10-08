@@ -1498,7 +1498,7 @@ fn yields<'a>(
             .iter()
             .find(|declared| declared.name == *name)
             .map(|declared| &declared.encoding),
-        Expr::Fill { ty, .. } => Some(&ty.encoding),
+        Expr::Fill { ty, .. } | Expr::Const { ty, .. } => Some(&ty.encoding),
         Expr::Cast { to, .. } => Some(to),
         Expr::Transmute { to, .. } | Expr::Repack { to, .. } => Some(&to.encoding),
         Expr::Slice { src, .. }

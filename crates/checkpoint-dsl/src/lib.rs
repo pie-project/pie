@@ -1754,6 +1754,24 @@ pub fn extent(of: u64) -> i64 {
     i64::try_from(of).expect("an extent no i64 holds")
 }
 
+/// The tensor of `values` in `shape`, stored as raw `dtype`: a table a model
+/// states rather than reads, carried by the contract itself. Each value is
+/// rounded to `dtype` as the plan's own float transforms round theirs.
+pub fn constant(
+    name: &str,
+    values: &[f32],
+    shape: Vec<i64>,
+    dtype: checkpoint::types::DType,
+) -> Result<Expr, Error> {
+    let wide: Vec<f64> = values.iter().map(|v| f64::from(*v)).collect();
+    let bytes =
+        checkpoint::codec::cast::encode_values(&wide, dtype).map_err(|why| Error::Illegible {
+            name: name.to_string(),
+            detail: format!("a constant stated as {dtype:?}: {why}"),
+        })?;
+    Ok(Expr::constant(TensorType::raw(shape, dtype), bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
