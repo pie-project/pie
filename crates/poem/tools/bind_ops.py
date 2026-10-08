@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Writes src/star/ops.rs: a Starlark binding for every op of src/ops/*.rs
-whose parameters and result a package can spell.
+"""Writes src/star/ops.rs: a Starlark binding for every op of src/ops/*.rs,
+and every method of `Input` in src/forward.rs, whose parameters and result a
+package can spell.
 
 Run it, then `cargo fmt`, after adding or changing an op; the test
 `every_op_a_package_can_spell_is_bound` fails until it has been run.
@@ -12,7 +13,7 @@ import re
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 MODULES = ["attn", "collective", "elemwise", "layout", "linear", "spatial"]
 
-# Rust parameter type -> (the type it is unpacked as, how the op is passed it)
+# Rust parameter type -> (the type it is unpacked as, how it is passed on)
 PARAMS = {
     "&Value": ("Value", "&{}"),
     "&Weight": ("Weight", "&{}"),
@@ -43,8 +44,14 @@ PARAMS = {
     "Conv": ("Conv", "{}"),
     "VoxelSegment": ("VoxelSegment", "{}"),
     "RaggedMask": ("RaggedMask", "{}"),
+    "&str": ("String", "&{}"),
+    "u8": ("u8", "{}"),
+    "impl Into<u64>": ("u64", "{}"),
 }
-RESULTS = {"Value", "(Value, Value)", "(Value, Value, Value)", "()", "RaggedMask"}
+RESULTS = {"Value", "(Value, Value)", "(Value, Value, Value)", "()", "RaggedMask", "ValueId"}
+
+# The `Input` methods written by hand in `src/star/forward.rs`.
+BY_HAND = {"recorder", "on", "partition", "reading", "walk_layers"}
 
 
 def split(params):
@@ -61,59 +68,87 @@ def split(params):
             cur += ch
     if cur.strip():
         out.append(cur)
-    return [" ".join(p.split()) for p in out]
+    return [tuple(" ".join(p.split()).split(": ", 1)) for p in out]
 
 
 def ops():
-    pattern = re.compile(
-        r"^pub fn (\w+)\((.*?)\)\s*(?:->\s*([^{]*?))?\s*\{", re.S | re.M
-    )
+    pattern = re.compile(r"^pub fn (\w+)(<[^>]*>)?\((.*?)\)\s*(?:->\s*([^{]*?))?\s*\{", re.S | re.M)
     for module in MODULES:
         text = (ROOT / "src/ops" / f"{module}.rs").read_text()
         for m in pattern.finditer(text):
-            name, params, result = m.group(1), split(m.group(2)), (m.group(3) or "()").strip()
-            yield module, name, [tuple(p.split(": ", 1)) for p in params], result
+            yield module, m.group(1), m.group(2), split(m.group(3)), (m.group(4) or "()").strip()
+
+
+def input_methods():
+    text = (ROOT / "src/forward.rs").read_text()
+    start = text.index("impl Input {")
+    depth = 0
+    for end, ch in enumerate(text[start:], start):
+        depth += {"{": 1, "}": -1}.get(ch, 0)
+        if depth == 0 and ch == "}":
+            break
+    pattern = re.compile(
+        r"^    pub fn (\w+)(<[^>]*>)?\(&self,?(.*?)\)\s*(?:->\s*([^{]*?))?\s*\{", re.S | re.M
+    )
+    for m in pattern.finditer(text[start:end]):
+        yield "inputs", m.group(1), m.group(2), split(m.group(3)), (m.group(4) or "()").strip()
+
+
+def entry(module, name, params, call):
+    names = ", ".join(f'"{p}"' for p, _ in params)
+    takes = "".join(f"            let {p}: {PARAMS[t][0]} = a.next()?;\n" for p, t in params)
+    passes = ", ".join(PARAMS[t][1].format(p) for p, t in params)
+    return (
+        "    Op {\n"
+        f'        module: "{module}",\n'
+        f'        name: "{name}",\n'
+        f"        params: &[{names}],\n"
+        "        call: |a, heap| {\n"
+        f"{takes}"
+        f'            result(heap, dsl("{module}.{name}", || {call.format(passes=passes)})?)\n'
+        "        },\n"
+        "    },\n"
+    )
+
+
+def table(rows, skipped, call, receiver=None):
+    out = []
+    for module, name, generic, params, result in rows:
+        if module == "inputs" and name in BY_HAND:
+            continue
+        if generic or any(t not in PARAMS for _, t in params) or result not in RESULTS:
+            skipped.append(f"{module}::{name}")
+            continue
+        if receiver:
+            params = [(receiver, "&Input")] + params
+            passes = ", ".join(PARAMS[t][1].format(p) for p, t in params[1:])
+            out.append(entry(module, name, params, f"{receiver}.{name}({passes})").replace(
+                "{passes}", passes))
+        else:
+            out.append(entry(module, name, params, call.format(module=module, name=name)))
+    return out
 
 
 def main():
-    bound, skipped = [], []
-    for module, name, params, result in ops():
-        unspelled = [t for _, t in params if t not in PARAMS]
-        if unspelled or result not in RESULTS:
-            skipped.append(f"{module}::{name}")
-            continue
-        names = ", ".join(f'"{p}"' for p, _ in params)
-        takes = "".join(
-            f"        let {p}: {PARAMS[t][0]} = a.next()?;\n" for p, t in params
-        )
-        passes = ", ".join(PARAMS[t][1].format(p) for p, t in params)
-        bound.append(
-            f"    Op {{\n"
-            f'        module: "{module}",\n'
-            f'        name: "{name}",\n'
-            f"        params: &[{names}],\n"
-            f"        call: |a, heap| {{\n"
-            f"{takes}"
-            f'            result(heap, dsl("{module}.{name}", || ops::{module}::{name}({passes}))?)\n'
-            f"        }},\n"
-            f"    }},\n"
-        )
-    takes_fix = []
-    for b in bound:
-        takes_fix.append(b.replace("        let ", "            let "))
+    skipped = []
+    bound = table(ops(), skipped, "ops::{module}::{name}({{passes}})")
+    inputs = table(input_methods(), skipped, None, receiver="inputs")
     out = (
-        "//! Generated by `tools/bind_ops.py` from `src/ops/*.rs`; do not edit.\n"
+        "//! Generated by `tools/bind_ops.py` from `src/ops/*.rs` and `src/forward.rs`;\n"
+        "//! do not edit.\n"
         "//!\n"
-        "//! Every op a package can spell the arguments and result of. Not bound:\n"
+        "//! Every op and `Input` method a package can spell the arguments and\n"
+        "//! result of. Not bound:\n"
         + "".join(f"//! `{s}`\n" for s in skipped)
         + "\n"
         "use crate::ops;\n"
-        "use crate::star::bind::{Cache, Op, dsl, result};\n"
-        "use crate::star::bind::spelled::*;\n\n"
-        "pub(crate) static OPS: &[Op] = &[\n" + "".join(takes_fix) + "];\n"
+        "use crate::star::bind::spelled::*;\n"
+        "use crate::star::bind::{Cache, Op, dsl, result};\n\n"
+        "pub(crate) static OPS: &[Op] = &[\n" + "".join(bound) + "];\n\n"
+        "pub(crate) static INPUTS: &[Op] = &[\n" + "".join(inputs) + "];\n"
     )
     (ROOT / "src/star/ops.rs").write_text(out)
-    print(f"bound {len(bound)}, not bound {len(skipped)}: {', '.join(skipped)}")
+    print(f"bound {len(bound)} ops and {len(inputs)} input methods; not bound: {', '.join(skipped)}")
 
 
 if __name__ == "__main__":

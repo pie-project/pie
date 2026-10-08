@@ -179,6 +179,16 @@ impl<'v> StarlarkValue<'v> for InputHandle {
     fn get_methods() -> Option<&'static Methods> {
         Some(INPUT_METHODS_STATICS.methods())
     }
+
+    fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Star<'v>> {
+        crate::star::bind::input_method(*self, attribute, heap)
+    }
+
+    fn has_attr(&self, attribute: &str, _heap: Heap<'v>) -> bool {
+        crate::star::ops::INPUTS
+            .iter()
+            .any(|op| op.name == attribute)
+    }
 }
 
 /// A cache row a forward reads and writes.
@@ -200,56 +210,6 @@ impl<'v> StarlarkValue<'v> for CacheHandle {}
 
 #[starlark_module]
 fn input_methods(builder: &mut MethodsBuilder) {
-    fn tokens(this: &InputHandle) -> anyhow::Result<ValueHandle> {
-        let i = input_of(*this);
-        dsl("tokens", || i.tokens()).map(hold)
-    }
-
-    fn positions(this: &InputHandle) -> anyhow::Result<ValueHandle> {
-        let i = input_of(*this);
-        dsl("positions", || i.positions()).map(hold)
-    }
-
-    fn mask(this: &InputHandle) -> anyhow::Result<ValueHandle> {
-        let i = input_of(*this);
-        dsl("mask", || i.mask()).map(hold)
-    }
-
-    fn adapter_routes(this: &InputHandle) -> anyhow::Result<ValueHandle> {
-        let i = input_of(*this);
-        dsl("adapter_routes", || i.adapter_routes()).map(hold)
-    }
-
-    fn readout_rows(this: &InputHandle) -> anyhow::Result<ValueHandle> {
-        let i = input_of(*this);
-        dsl("readout_rows", || i.readout_rows()).map(hold)
-    }
-
-    /// The kv cache row `name` the caches declare.
-    fn kv(
-        this: &InputHandle,
-        #[starlark(require = pos)] name: &str,
-    ) -> anyhow::Result<CacheHandle> {
-        let i = input_of(*this);
-        dsl("kv", || i.kv(name)).map(CacheHandle)
-    }
-
-    fn write_page(
-        this: &InputHandle,
-        #[starlark(require = pos)] row: &str,
-    ) -> anyhow::Result<ValueHandle> {
-        let i = input_of(*this);
-        dsl("write_page", || i.write_page(row)).map(hold)
-    }
-
-    fn write_offset(
-        this: &InputHandle,
-        #[starlark(require = pos)] row: &str,
-    ) -> anyhow::Result<ValueHandle> {
-        let i = input_of(*this);
-        dsl("write_offset", || i.write_offset(row)).map(hold)
-    }
-
     /// The rows `fact` holds for.
     fn on(
         this: &InputHandle,
@@ -361,6 +321,27 @@ fn spec_methods(builder: &mut MethodsBuilder) {
             }
             .0)
         })
+    }
+
+    /// The state row `name`, a slab of `slab` of `dtype`; `split` cuts it
+    /// between ranks along that axis.
+    fn state(
+        #[starlark(this)] _this: &SpecHandle,
+        #[starlark(require = pos)] name: &str,
+        #[starlark(require = pos)] slab: UnpackList<u64>,
+        #[starlark(require = pos)] dtype: &DtypeValue,
+        #[starlark(require = named, default = NoneOr::None)] split: NoneOr<u32>,
+    ) -> anyhow::Result<NoneType> {
+        with(|t| {
+            let spec = t.spec.get_or_insert_with(HybridSpec::new);
+            dsl("state", || {
+                let row = spec.state(name, slab.items, dtype.0);
+                if let Some(axis) = split.into_option() {
+                    row.split(axis);
+                }
+            })
+        })?;
+        Ok(NoneType)
     }
 
     /// The kv row `name` in `space`, its planes of `planes` and heads of

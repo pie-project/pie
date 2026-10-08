@@ -120,6 +120,11 @@ fn weight_methods(builder: &mut MethodsBuilder) {
     }
 
     #[starlark(attribute)]
+    fn shape(this: &WeightValue) -> anyhow::Result<Vec<u64>> {
+        Ok(this.0.shape.clone())
+    }
+
+    #[starlark(attribute)]
     fn dtype(this: &WeightValue) -> anyhow::Result<DtypeValue> {
         Ok(DtypeValue(this.0.dtype))
     }

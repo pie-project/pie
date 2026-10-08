@@ -126,6 +126,23 @@ impl<'v> Arg<'v> for u32 {
     }
 }
 
+impl<'v> Arg<'v> for u8 {
+    fn arg(v: Option<Star<'v>>) -> anyhow::Result<Self> {
+        let n = u32::arg(v)?;
+        u8::try_from(n).map_err(|_| anyhow::anyhow!("{n} is past a u8"))
+    }
+}
+
+impl<'v> Arg<'v> for String {
+    fn arg(v: Option<Star<'v>>) -> anyhow::Result<Self> {
+        let v = given(v)?;
+        match v.unpack_str() {
+            Some(s) => Ok(s.to_string()),
+            None => wanted("text", v),
+        }
+    }
+}
+
 impl<'v> Arg<'v> for u64 {
     fn arg(v: Option<Star<'v>>) -> anyhow::Result<Self> {
         Ok(u64::from(u32::arg(v)?))
@@ -358,6 +375,12 @@ impl Result for () {
     }
 }
 
+impl Result for ValueId {
+    fn star(self, heap: Heap<'_>) -> Star<'_> {
+        heap.alloc(CacheHandle(self))
+    }
+}
+
 impl Result for RaggedMask {
     fn star(self, heap: Heap<'_>) -> Star<'_> {
         heap.alloc(Whole(Held::Mask(self)))
@@ -394,6 +417,92 @@ impl fmt::Display for OpValue {
 
 starlark_simple_value!(OpValue);
 
+/// An `Input` method, bound to the rows it is called on.
+#[derive(Clone, Copy, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative)]
+pub(crate) struct Bound(
+    #[allocative(skip)] pub(crate) &'static Op,
+    pub(crate) InputHandle,
+);
+
+impl fmt::Debug for Bound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "inputs.{}", self.0.name)
+    }
+}
+
+impl fmt::Display for Bound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "inputs.{}({})",
+            self.0.name,
+            self.0.params[1..].join(", ")
+        )
+    }
+}
+
+starlark_simple_value!(Bound);
+
+#[starlark_value(type = "bound_method")]
+impl<'v> StarlarkValue<'v> for Bound {
+    fn invoke(
+        &self,
+        _me: Star<'v>,
+        args: &Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Star<'v>> {
+        let this = eval.heap().alloc(self.1);
+        call(self.0, &self.to_string(), Some(this), args, eval)
+    }
+}
+
+/// The `Input` method `name`, bound to `this`.
+pub(crate) fn input_method<'v>(this: InputHandle, name: &str, heap: Heap<'v>) -> Option<Star<'v>> {
+    crate::star::ops::INPUTS
+        .iter()
+        .find(|op| op.name == name)
+        .map(|op| heap.alloc(Bound(op, this)))
+}
+
+/// Calls `op` with `args`, after `this` if it is a method.
+fn call<'v>(
+    op: &'static Op,
+    spelled: &str,
+    this: Option<Star<'v>>,
+    args: &Arguments<'v, '_>,
+    eval: &mut Evaluator<'v, '_, '_>,
+) -> starlark::Result<Star<'v>> {
+    let heap = eval.heap();
+    let fail = |why: String| starlark::Error::new_other(anyhow::anyhow!("{why}"));
+    let mut given: Vec<Option<Star<'v>>> = vec![None; op.params.len()];
+    let skip = usize::from(this.is_some());
+    given[..skip].copy_from_slice(&this.into_iter().map(Some).collect::<Vec<_>>());
+    for (at, v) in args.positions(heap)?.enumerate() {
+        let at = at + skip;
+        if at >= op.params.len() {
+            return Err(fail(format!(
+                "{spelled} takes {} arguments",
+                op.params.len() - skip
+            )));
+        }
+        given[at] = Some(v);
+    }
+    for (name, v) in args.names_map()? {
+        let name = name.as_str();
+        let at = op.params[skip..]
+            .iter()
+            .position(|p| *p == name)
+            .map(|at| at + skip)
+            .ok_or_else(|| fail(format!("{spelled} takes no `{name}`")))?;
+        if given[at].is_some() {
+            return Err(fail(format!("{spelled} is given `{name}` twice")));
+        }
+        given[at] = Some(v);
+    }
+    let mut args = Args { op, given, at: 0 };
+    (op.call)(&mut args, heap).map_err(starlark::Error::new_other)
+}
+
 #[starlark_value(type = "op")]
 impl<'v> StarlarkValue<'v> for OpValue {
     fn invoke(
@@ -402,30 +511,7 @@ impl<'v> StarlarkValue<'v> for OpValue {
         args: &Arguments<'v, '_>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Star<'v>> {
-        let op = self.0;
-        let heap = eval.heap();
-        let fail = |why: String| starlark::Error::new_other(anyhow::anyhow!("{why}"));
-        let mut given: Vec<Option<Star<'v>>> = vec![None; op.params.len()];
-        for (at, v) in args.positions(heap)?.enumerate() {
-            if at >= op.params.len() {
-                return Err(fail(format!("{self} takes {} arguments", op.params.len())));
-            }
-            given[at] = Some(v);
-        }
-        for (name, v) in args.names_map()? {
-            let name = name.as_str();
-            let at = op
-                .params
-                .iter()
-                .position(|p| *p == name)
-                .ok_or_else(|| fail(format!("{self} takes no `{name}`")))?;
-            if given[at].is_some() {
-                return Err(fail(format!("{self} is given `{name}` twice")));
-            }
-            given[at] = Some(v);
-        }
-        let mut args = Args { op, given, at: 0 };
-        (op.call)(&mut args, heap).map_err(starlark::Error::new_other)
+        call(self.0, &self.to_string(), None, args, eval)
     }
 }
 
@@ -544,6 +630,23 @@ mod tests {
                 if !bound && !unbound.contains(&format!("{module}::{name}").as_str()) {
                     missing.push(format!("{module}::{name}"));
                 }
+            }
+        }
+        let forward = std::fs::read_to_string(root.join("src/forward.rs")).unwrap();
+        let methods = &forward[forward.find("impl Input {").unwrap()..];
+        let methods = &methods[..methods.find("\n}\n").unwrap()];
+        let by_hand = ["recorder", "on", "partition", "reading", "walk_layers"];
+        for line in methods.lines() {
+            let Some(rest) = line.strip_prefix("    pub fn ") else {
+                continue;
+            };
+            let name = &rest[..rest.find(['(', '<']).unwrap()];
+            let bound = super::super::ops::INPUTS.iter().any(|op| op.name == name);
+            if !bound
+                && !by_hand.contains(&name)
+                && !unbound.contains(&format!("inputs::{name}").as_str())
+            {
+                missing.push(format!("Input::{name}"));
             }
         }
         assert!(

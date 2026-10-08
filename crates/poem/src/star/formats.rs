@@ -196,26 +196,55 @@ fn expr_methods(builder: &mut MethodsBuilder) {
     }
 }
 
-/// What a format's test may read of a checkpoint: its names and attributes.
+/// What a format may read of a checkpoint without reading its bytes: its
+/// tensors' names, shapes and stored encodings, and its attributes.
 pub(crate) struct Snapshot {
     names: std::collections::HashSet<String>,
+    tensors: std::collections::HashMap<String, (Vec<u64>, Result<Encoding, String>)>,
     attributes: Option<ztensor::format::cbor::Value>,
 }
 
 impl Snapshot {
     pub(crate) fn of(src: &ztensor::Source) -> Snapshot {
+        let tensors = src
+            .names()
+            .filter_map(|name| {
+                let tensor = src.get(name)?;
+                let encoding =
+                    checkpoint::file::encoding_of(&tensor).map_err(|why| why.to_string());
+                Some((name.to_string(), (tensor.shape().to_vec(), encoding)))
+            })
+            .collect();
         Snapshot {
             names: src.names().map(str::to_string).collect(),
+            tensors,
             attributes: src.attributes().cloned(),
         }
     }
 }
 
+/// A tensor a format asked of a checkpoint that does not hold it.
+pub(crate) fn missed() -> Option<String> {
+    MISSED.with(|m| m.borrow_mut().take())
+}
+
+fn tensor<R>(
+    name: &str,
+    f: impl FnOnce(&(Vec<u64>, Result<Encoding, String>)) -> R,
+) -> anyhow::Result<R> {
+    source(|src| src.tensors.get(name).map(f))?.ok_or_else(|| {
+        MISSED.with(|m| *m.borrow_mut() = Some(name.to_string()));
+        anyhow::anyhow!("the checkpoint holds no tensor `{name}`")
+    })
+}
+
 thread_local! {
     /// The reads the format reading a checkpoint states.
     pub(crate) static READS: RefCell<Vec<Read>> = const { RefCell::new(Vec::new()) };
-    /// The checkpoint a format is recognizing, while its test runs.
+    /// The checkpoint a format is recognizing or reading.
     pub(crate) static SOURCE: RefCell<Option<Snapshot>> = const { RefCell::new(None) };
+    /// The tensor a format asked for and the checkpoint does not hold.
+    static MISSED: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 fn source<R>(f: impl FnOnce(&Snapshot) -> R) -> anyhow::Result<R> {
@@ -420,6 +449,25 @@ pub(crate) fn formats(builder: &mut GlobalsBuilder) {
             ("recognizes", recognizes),
             ("states", heap.alloc(states.items)),
         ])))
+    }
+
+    /// Whether the checkpoint holds a tensor named `name`.
+    fn has(#[starlark(require = pos)] name: &str) -> anyhow::Result<bool> {
+        source(|src| src.names.contains(name))
+    }
+
+    /// The shape the checkpoint stores its tensor `name` in.
+    fn shape(#[starlark(require = pos)] name: &str) -> anyhow::Result<Vec<u64>> {
+        tensor(name, |(shape, _)| shape.clone())
+    }
+
+    /// How the checkpoint stores its tensor `name`.
+    fn stored(#[starlark(require = pos)] name: &str) -> anyhow::Result<EncodingValue> {
+        tensor(name, |(_, encoding)| encoding.clone())?
+            .map(EncodingValue)
+            .map_err(|why| {
+                anyhow::anyhow!("`{name}` is stored in terms no reader here can name ({why})")
+            })
     }
 
     /// The checkpoint's tensor `name`.

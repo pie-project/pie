@@ -274,15 +274,19 @@ impl Package {
                 let reads =
                     move || -> Result<checkpoint::contract::ModelContract, crate::import::Error> {
                         crate::star::formats::READS.with(|r| r.borrow_mut().clear());
+                        crate::star::formats::missed();
                         eval.borrow_mut()
                             .eval_function(
                                 read,
                                 &[heap.alloc(crate::star::formats::ReadsHandle)],
                                 &[],
                             )
-                            .map_err(|e| crate::import::Error::Illegible {
-                                name: said.clone(),
-                                detail: format!("{e}"),
+                            .map_err(|e| match crate::star::formats::missed() {
+                                Some(name) => crate::import::Error::Missing(name),
+                                None => crate::import::Error::Illegible {
+                                    name: said.clone(),
+                                    detail: format!("{e}"),
+                                },
                             })?;
                         let reads = crate::star::formats::READS
                             .with(|r| std::mem::take(&mut *r.borrow_mut()));
