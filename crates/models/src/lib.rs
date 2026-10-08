@@ -132,7 +132,6 @@ static FAMILIES: LazyLock<Vec<Vec<catalog::Entry>>> = LazyLock::new(|| {
         hunyuan_image_3::entries(),
         kimi_k3::entries(),
         qwen_3::entries(),
-        qwen_4::entries(),
         z_image::entries(),
         wan_2::entries(),
         minimax_h3::entries(),

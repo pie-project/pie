@@ -21,14 +21,32 @@ fn fixture() -> Option<PathBuf> {
     path.is_dir().then_some(path)
 }
 
+/// The micro model of the qwen_4 package: its widths are toys, its layers
+/// the real model's kinds.
+const MICRO: &str = "qwen38-flash-next-micro";
+
+fn package() -> &'static poem::star::Package {
+    models::star::package_of(MICRO).expect("the qwen_4 package holds its micro model")
+}
+
+fn deploy() -> poem::star::Deploy {
+    poem::star::Deploy {
+        weights: vec![Dtype::Bf16],
+        kv: Dtype::Bf16,
+        tp: 1,
+        parts: vec![],
+        drafter: None,
+    }
+}
+
+fn traced() -> poem::Trace {
+    package()
+        .trace(MICRO, &deploy(), "qwen4-micro", Platform::Metal)
+        .unwrap_or_else(|why| panic!("the micro model traces: {why:#}"))
+}
+
 fn word(query_len: u32) -> u64 {
-    poem::trace_hybrid(
-        "qwen4-micro",
-        &models::qwen_4::model::Model::flash_micro(Dtype::Bf16, Dtype::Bf16, 1),
-        Platform::Metal,
-    )
-    .facts
-    .word(&Request::new(query_len, false))
+    traced().facts.word(&Request::new(query_len, false))
 }
 
 fn ready() -> Option<Shell> {
@@ -42,12 +60,11 @@ fn ready() -> Option<Shell> {
         );
         return None;
     };
-    let micro = models::qwen_4::model::Model::flash_micro(Dtype::Bf16, Dtype::Bf16, 1);
-    let trace = poem::trace_hybrid("qwen4-micro", &micro, Platform::Metal);
+    let trace = traced();
     let source =
         ztensor_compat::index(fixture.join("model.safetensors")).expect("the fixture opens");
-    let contract = micro
-        .import(&source, Platform::Metal)
+    let contract = package()
+        .import(MICRO, &deploy(), &source, Platform::Metal)
         .expect("the micro text's import fits the fixture it was generated for");
     drop(source);
     let shell = Shell::load(Boot {

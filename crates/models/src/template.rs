@@ -33,6 +33,7 @@ pub fn named(name: &str) -> Option<TemplateFn> {
         "gpt_oss" => Some(crate::gpt_oss::template::gpt_oss),
         "inkling" => Some(crate::inkling::template::inkling),
         "glm_5" => Some(crate::glm_5::template::instruct),
+        "qwen_3_chatml_interleaved" => Some(crate::qwen_3::template::chatml_interleaved),
         "muse_glimmer" => Some(crate::muse_glimmer::template::muse_glimmer),
         _ => None,
     }
