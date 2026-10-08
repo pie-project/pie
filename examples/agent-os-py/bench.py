@@ -96,9 +96,9 @@ def load_math(levels, n, offset=0):
 
 
 def run(label, problems, policy, budget_per_problem=None, max_new=320, max_rows=32, temperature=0.7,
-        seed=17, trace=True, stream=False, timeout=7200, solver_sys=None, state_slots=96, engine=None):
+        seed=17, trace=True, stream=False, timeout=7200, solver_sys=None, state_slots=192, engine=None):
     cfg = {"mode": "solve", "problems": problems, "policy": policy, "max_new": max_new, "max_rows": max_rows,
-           "temperature": temperature, "seed": seed, "trace": trace, "stream": stream}
+           "temperature": temperature, "seed": seed, "trace": trace, "stream": stream, "state_slots": state_slots}
     if budget_per_problem:
         cfg["budget_per_problem"] = budget_per_problem
     if solver_sys:
@@ -164,6 +164,11 @@ CONFIGS = {
     "fixed4": {"name": "fixed", "n": 4},
     "fixed8": {"name": "fixed", "n": 8},
     "fixed16": {"name": "fixed", "n": 16},
+    "fixed6": {"name": "fixed", "n": 6},
+    "fixed7": {"name": "fixed", "n": 7},
+    "council4x2": {"name": "council", "n": 4, "j": 2},
+    "council4x3": {"name": "council", "n": 4, "j": 3},
+    "council3x3": {"name": "council", "n": 3, "j": 3},
     "adaptive": {"name": "adaptive", "w0": 3, "step": 3, "wmax": 15, "delta": 0.08, "judge": True},
     "adaptive-nojudge": {"name": "adaptive", "w0": 3, "step": 3, "wmax": 15, "delta": 0.08, "judge": False},
 }

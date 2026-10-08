@@ -45,6 +45,7 @@ from inferlet.eta import (
 )
 
 PS = kv_page_size()
+SLOTS_PER_RS = 2  # recurrent-state seats one RsWorkingSet holds (one per posted frame)
 WAVE = PS  # tokens per wave: exactly one KV page, so lanes stay page-aligned
 _T0 = time.perf_counter()
 
@@ -427,12 +428,52 @@ def is_looping(toks, n=24, window=520, times=4):
     return False
 
 
-def beta_leader_prob(c1, c2):
-    """P(p1 > p2) under Beta(c1+1, c2+1) for the two top answers' shares."""
-    a, b = c1 + 1, c2 + 1
-    n = a + b - 1
-    tail = sum(math.comb(n, k) for k in range(a, n + 1)) / (2 ** n)
-    return 1.0 - tail
+def _betacf(a, b, x):
+    tiny = 1e-30
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c, d = 1.0, 1.0 - qab * x / qap
+    d = 1.0 / (d if abs(d) > tiny else tiny)
+    h = d
+    for k in range(1, 200):
+        k2 = 2 * k
+        aa = k * (b - k) * x / ((qam + k2) * (a + k2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) > tiny else tiny)
+        c = 1.0 + aa / c
+        c = c if abs(c) > tiny else tiny
+        h *= d * c
+        aa = -(a + k) * (qab + k) * x / ((a + k2) * (qap + k2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) > tiny else tiny)
+        c = 1.0 + aa / c
+        c = c if abs(c) > tiny else tiny
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < 3e-12:
+            break
+    return h
+
+
+def betai(a, b, x):
+    """Regularized incomplete beta I_x(a, b)."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    ln_front = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log(1.0 - x)
+    front = math.exp(ln_front)
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * _betacf(a, b, x) / a
+    return 1.0 - front * _betacf(b, a, 1.0 - x) / b
+
+
+PRIOR = 0.3   # sparse prior: a wrong answer is rarely repeated, so a repeat is real evidence
+
+
+def leader_prob(c1, c2):
+    """P(the top answer's share beats the runner-up's), with a sparse Dirichlet prior."""
+    a, b = c1 + PRIOR, c2 + PRIOR
+    return 1.0 - betai(a, b, 0.5)
 
 
 # ============================================================================
@@ -470,7 +511,7 @@ class Problem:
             return 0.0
         c1 = r[0][1]
         c2 = r[1][1] if len(r) > 1 else 0
-        return beta_leader_prob(int(round(c1)), int(round(c2)))
+        return leader_prob(c1, c2)
 
     def vote(self, ans, weight=1.0):
         if ans is None:
@@ -482,6 +523,8 @@ class Problem:
 
 class Fixed:
     """Baseline: N independent samples, then plurality vote. N=1 is a single agent."""
+
+    one_shot = True
 
     def __init__(self, n):
         self.n = n
@@ -501,8 +544,9 @@ class Adaptive:
     and hands a split vote to a few judge lanes that share one blackboard
     prefix holding the competing candidates."""
 
-    def __init__(self, w0=3, step=3, wmax=15, delta=0.08, judge=True, judge_n=3, judge_at=9, giveup=6):
+    def __init__(self, w0=2, step=2, wmax=12, delta=0.08, judge=True, judge_n=3, judge_at=8, giveup=6, straggler=True, vmin=2):
         self.w0, self.step, self.wmax, self.delta, self.giveup = w0, step, wmax, delta, giveup
+        self.straggler, self.vmin = straggler, vmin
         self.judge, self.judge_n, self.judge_at = judge, judge_n, judge_at
         self.name = f"adaptive(w0={w0},max={wmax},d={delta}{',judge' if judge else ''})"
 
@@ -513,22 +557,57 @@ class Adaptive:
         done_n = len([l for l in p.lanes if l.done and l.kind == "solve" and l.answer is not None])
         if not p.lanes:
             return [("spawn", "solve", self.w0, f"open with {self.w0} agents")]
-        if done_n >= 3 and conf >= 1 - self.delta:
+        if self.straggler:
+            dl = sup.deadline()
+            if dl is not None:
+                for lane in p.running():
+                    if len(lane.toks) > dl:
+                        acts.append(("kill", lane, f"straggler: {len(lane.toks)} tokens with no answer, past the learned deadline of {dl} (answering lanes finish well before)"))
+                if acts and not [l for l in p.running() if len(l.toks) <= dl]:
+                    pass
+        if done_n >= self.vmin and conf >= 1 - self.delta:
             lead = tally[0]
             return [("finish", f"consensus: '{lead[0]}' has {lead[1]:g} votes, P(clear leader)={conf:.2f}>={1 - self.delta:.2f}")]
-        running = p.running()
+        killed_now = {a[1].id for a in acts if a[0] == "kill"}
+        running = [l for l in p.running() if l.id not in killed_now]
         if running:
             return acts
         if p.started >= self.giveup and not tally:
-            return [("finish", f"cut losses: {p.started} agents tried and none produced an answer; budget goes to winnable problems")]
+            return acts + [("finish", f"cut losses: {p.started} agents tried and none produced an answer; budget goes to winnable problems")]
         # everyone alive has finished and there is no consensus
         if self.judge and not p.judged and p.started >= self.judge_at and len(tally) >= 2:
-            return [("judge", self.judge_n, f"split vote after {p.started} solvers: {tally[0][0]}x{tally[0][1]:g} vs {tally[1][0]}x{tally[1][1]:g}")]
+            return acts + [("judge", self.judge_n, f"split vote after {p.started} solvers: {tally[0][0]}x{tally[0][1]:g} vs {tally[1][0]}x{tally[1][1]:g}")]
         if p.started >= self.wmax:
-            return [("finish", f"width cap {self.wmax} reached; plurality")]
+            return acts + [("finish", f"width cap {self.wmax} reached; plurality")]
         n = min(self.step, self.wmax - p.started)
         why = "no answer yet" if not tally else f"split vote ({tally[0][0]}x{tally[0][1]:g}, P={conf:.2f}): widen by {n}"
-        return [("spawn", "solve", n, why)]
+        return acts + [("spawn", "solve", n, why)]
+
+
+class Council:
+    """n independent solvers; if they do not agree, j judges read the blackboard (the
+    candidate answers) from one shared prefix. Cooperation costs one prefill, not one per agent."""
+
+    one_shot = True
+
+    def __init__(self, n=4, j=3, delta=0.08, vmin=2):
+        self.n, self.j, self.delta, self.vmin = n, j, delta, vmin
+        self.name = f"council({n}+{j})"
+
+    def decide(self, p, sup):
+        if not p.lanes:
+            return [("spawn", "solve", self.n, f"{self.n} independent solvers")]
+        if p.running():
+            return []
+        tally = p.tally()
+        done_n = len([l for l in p.lanes if l.kind == "solve" and l.answer is not None])
+        if p.judged:
+            return [("finish", "judges weighed in")]
+        if done_n >= self.vmin and p.confidence() >= 1 - self.delta:
+            return [("finish", f"solvers agree: '{tally[0][0]}' P(clear leader)={p.confidence():.2f}")]
+        if len(tally) >= 2:
+            return [("judge", self.j, f"solvers split: {tally[0][0]}x{tally[0][1]:g} vs {tally[1][0]}x{tally[1][1]:g}")]
+        return [("finish", "no usable answers" if not tally else "single answer; nothing to referee")]
 
 
 class Ledger:
@@ -546,14 +625,16 @@ class Ledger:
 
 
 class Supervisor:
-    def __init__(self, arena, problems, budget, max_rows, temperature, max_new, stream, seed):
+    def __init__(self, arena, problems, budget, max_rows, temperature, max_new, stream, seed, state_slots=0):
         self.arena, self.problems = arena, problems
+        self.state_slots = state_slots     # 0 = attention-only model, no recurrent state to count
         self.budget, self.max_rows, self.temperature = budget, max_rows, temperature
         self.max_new, self.stream, self.seed = max_new, stream, seed
         self.led = Ledger()
         self.trace = []
         self.stop = set(chat.stop_tokens())
         self.lens = []               # token lengths of finished lanes (for estimates)
+        self.ans_lens = []           # token lengths of lanes that ended with an answer
         self.wave_i = 0
 
     # ---- bookkeeping -------------------------------------------------------
@@ -563,11 +644,28 @@ class Supervisor:
             return s[len(s) // 2]
         return self.max_new * 0.6
 
+    def remaining(self, lane):
+        """Expected tokens a running lane still has to run: the median length of finished lanes
+        that went at least as far, less what it has already used."""
+        so_far = len(lane.toks)
+        longer = sorted(n for n in self.lens if n >= so_far)
+        if len(longer) >= 3:
+            return max(longer[len(longer) // 2] - so_far, 0)
+        return max(self.max_new - so_far, 0)
+
     def committed(self):
         """Decode tokens spent plus the expected tail of every lane still running."""
         est = self.est_len()
         tail = sum(max(est - len(l.toks), WAVE) for p in self.problems for l in p.running())
         return self.led.decode_tokens + tail
+
+    def deadline(self):
+        """Learned straggler deadline: a generous multiple of how long answering lanes take."""
+        if len(self.ans_lens) < 6:
+            return None
+        s = sorted(self.ans_lens)
+        q = s[min(len(s) - 1, int(len(s) * 0.85))]
+        return max(int(q * 1.3), 4 * WAVE)
 
     def mem_fit(self):
         """How many more lanes the arena can promise to carry to max_new."""
@@ -579,7 +677,16 @@ class Supervisor:
             for l in q.running():
                 promised += max(cap - (len(l.pages) - len(l.root.pages)), 0)
         room = len(self.arena.free) - promised - 24      # 24 pages of headroom for roots
-        return max(room // cap, 0)
+        fit = max(room // cap, 0)
+        if self.state_slots:
+            # every recurrent-state set (a root's, a lane's) holds SLOTS_PER_RS seats of a fixed pool
+            held = 0
+            for q in self.problems:
+                if q.finished:
+                    continue
+                held += sum(len(r.rs) for r in q.roots.values()) + sum(len(l.rs) for l in q.running())
+            fit = min(fit, max((self.state_slots - 8 - held * SLOTS_PER_RS) // SLOTS_PER_RS, 0))
+        return fit
 
     def log(self, p, action, why, **kw):
         ev = {"t": round(now(), 2), "wave": self.wave_i, "problem": p.pid if p else None, "action": action, "why": why}
@@ -612,6 +719,8 @@ class Supervisor:
             self.led.spawned += 1
             self.led.prefill_saved += root.n
         setup.close()
+        if getattr(p.policy, "one_shot", False):
+            root.rs = []      # nothing will fork from this root again: free its state seats now
         self.log(p, "SPAWN", why, lanes=made, kind=kind, shared_prefix_tokens=root.n,
                  prefill_saved=root.n * n)
 
@@ -624,10 +733,9 @@ class Supervisor:
     def finish(self, p, why):
         if p.finished:
             return
-        est = self.est_len()
         saved = 0
         for lane in p.running():
-            rem = max(est - len(lane.toks), 0)
+            rem = self.remaining(lane)
             saved += rem
             self.kill(p, lane, "problem finished", rem)
         tally = p.tally()
@@ -638,6 +746,7 @@ class Supervisor:
                  est_saved_tokens=int(saved))
         for root in p.roots.values():
             self.arena.release(root.pages)
+            root.rs = []
         p.roots = {}
 
     async def apply(self, p, acts):
@@ -645,6 +754,11 @@ class Supervisor:
             if act[0] == "finish":
                 self.finish(p, act[1])
                 return
+            if act[0] == "kill":
+                lane = act[1]
+                if not lane.done:
+                    self.kill(p, lane, act[2], self.remaining(lane))
+                continue
             if act[0] == "spawn":
                 _, rname, n, why = act
                 room = max(int((self.budget - self.committed()) // max(self.est_len(), 1)), 0)
@@ -693,7 +807,10 @@ class Supervisor:
         lane.text += model.decode(new_tokens[:cut]) if cut else ""
         hit_stop = cut < len(new_tokens)
         ans = extract(lane.text, p.kind)
-        if ans is not None and (p.kind == "mc" or last_boxed(lane.text) is not None):
+        if ans is not None and re.sub(r"[^a-z]", "", ans.lower()) in ("answer", "finalanswer", "youranswer", "x"):
+            lane.why_done = "placeholder"     # it wrote the template, not a result
+            lane.done = True
+        elif ans is not None and (p.kind == "mc" or last_boxed(lane.text) is not None):
             lane.answer = normalize(ans, p.kind)
             lane.why_done = "answered"
             lane.done = True
@@ -708,6 +825,8 @@ class Supervisor:
             lane.done = True
         if lane.done:
             self.lens.append(len(lane.toks))
+            if lane.why_done == "answered":
+                self.ans_lens.append(len(lane.toks))
             weight = 1.5 if lane.kind == "judge" else 1.0
             p.vote(lane.answer, weight)
             kill_lane(self.arena, lane, lane.why_done)
@@ -762,10 +881,13 @@ def make_policy(spec):
     kind = spec.get("name", "adaptive")
     if kind == "fixed":
         return Fixed(int(spec.get("n", 4)))
-    return Adaptive(w0=int(spec.get("w0", 3)), step=int(spec.get("step", 3)), wmax=int(spec.get("wmax", 15)),
+    if kind == "council":
+        return Council(int(spec.get("n", 4)), int(spec.get("j", 3)), float(spec.get("delta", 0.08)), int(spec.get("vmin", 2)))
+    return Adaptive(w0=int(spec.get("w0", 2)), step=int(spec.get("step", 2)), wmax=int(spec.get("wmax", 12)),
                     delta=float(spec.get("delta", 0.08)), judge=bool(spec.get("judge", True)),
-                    judge_n=int(spec.get("judge_n", 3)), judge_at=int(spec.get("judge_at", 9)),
-                    giveup=int(spec.get("giveup", 6)))
+                    judge_n=int(spec.get("judge_n", 3)), judge_at=int(spec.get("judge_at", 8)),
+                    giveup=int(spec.get("giveup", 6)), straggler=bool(spec.get("straggler", False)),
+                    vmin=int(spec.get("vmin", 2)))
 
 
 async def solve(inp):
@@ -781,7 +903,7 @@ async def solve(inp):
     budget = per_problem * len(specs)
     arena = Arena(pages)
     problems = [Problem(i, s, make_policy(pol)) for i, s in enumerate(specs)]
-    sup = Supervisor(arena, problems, budget, max_rows, temperature, max_new, bool(inp.get("stream", False)), int(inp.get("seed", 17)))
+    sup = Supervisor(arena, problems, budget, max_rows, temperature, max_new, bool(inp.get("stream", False)), int(inp.get("seed", 17)), int(inp.get("state_slots", 0)))
     t0 = time.perf_counter()
     await sup.run()
     wall = time.perf_counter() - t0
