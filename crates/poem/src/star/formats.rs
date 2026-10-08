@@ -355,6 +355,14 @@ fn source_methods(builder: &mut MethodsBuilder) {
         source(|src| src.names.contains(name))
     }
 
+    /// Whether the checkpoint holds a tensor whose name begins with `prefix`.
+    fn has_prefix(
+        #[starlark(this)] _this: &SourceHandle,
+        #[starlark(require = pos)] prefix: &str,
+    ) -> anyhow::Result<bool> {
+        source(|src| src.names.iter().any(|name| name.starts_with(prefix)))
+    }
+
     /// Whether the checkpoint holds a tensor whose name ends in `suffix`.
     fn has_suffix(
         #[starlark(this)] _this: &SourceHandle,
@@ -590,6 +598,11 @@ pub(crate) fn formats(builder: &mut GlobalsBuilder) {
     /// Whether the checkpoint holds a tensor named `name`.
     fn has(#[starlark(require = pos)] name: &str) -> anyhow::Result<bool> {
         source(|src| src.names.contains(name))
+    }
+
+    /// Whether the checkpoint holds a tensor whose name begins with `prefix`.
+    fn has_prefix(#[starlark(require = pos)] prefix: &str) -> anyhow::Result<bool> {
+        source(|src| src.names.iter().any(|name| name.starts_with(prefix)))
     }
 
     /// The shape the checkpoint stores its tensor `name` in.
