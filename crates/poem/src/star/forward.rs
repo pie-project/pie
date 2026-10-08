@@ -113,6 +113,12 @@ fn value_methods(builder: &mut MethodsBuilder) {
         dsl("everywhere", || x.everywhere()).map(hold)
     }
 
+    /// The width of this value's rows.
+    fn width(this: &ValueHandle) -> anyhow::Result<u64> {
+        let x = held(*this);
+        dsl("width", || x.width())
+    }
+
     /// The rows of this value `fact` holds for.
     fn on(
         this: &ValueHandle,

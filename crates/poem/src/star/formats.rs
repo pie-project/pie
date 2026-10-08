@@ -117,6 +117,10 @@ impl fmt::Display for EncodingValue {
 
 #[starlark_value(type = "encoding")]
 impl<'v> StarlarkValue<'v> for EncodingValue {
+    fn get_methods() -> Option<&'static Methods> {
+        Some(ENCODING_METHODS_STATICS.methods())
+    }
+
     fn equals(&self, other: Value<'v>) -> starlark::Result<bool> {
         Ok(other
             .downcast_ref::<EncodingValue>()
@@ -142,6 +146,18 @@ fn cbor<'v>(v: &ztensor::format::cbor::Value, heap: Heap<'v>) -> anyhow::Result<
         }
         other => anyhow::bail!("an attribute of {other:?} has no Starlark spelling here"),
     })
+}
+
+#[starlark_module]
+fn encoding_methods(builder: &mut MethodsBuilder) {
+    /// The dtype of plain values, or `None` for a quantized encoding.
+    #[starlark(attribute)]
+    fn raw(this: &EncodingValue) -> anyhow::Result<NoneOr<DtypeValue>> {
+        Ok(match this.0 {
+            Encoding::Raw(dtype) => NoneOr::Other(DtypeValue(dtype)),
+            _ => NoneOr::None,
+        })
+    }
 }
 
 fn tensor_of(v: Value<'_>) -> anyhow::Result<TensorContract> {
