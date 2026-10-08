@@ -15,10 +15,19 @@ use crate::Error;
 /// (`checkpoint::file::snapshot::CONFIG`).
 pub const CONFIG: &str = "config";
 
+type Recognizes<'a> = Box<dyn Fn(&ztensor::Source) -> bool + 'a>;
+
+/// A format that recognized a checkpoint: read already where reading was the
+/// test of it, or still to read.
+enum Recognized<'a, T> {
+    Read(&'static str, Result<T, Error>),
+    ToRead(Format<'a, T>),
+}
+
 /// One way a family's checkpoints are laid out.
 pub struct Format<'a, T> {
     name: &'static str,
-    recognizes: Option<Box<dyn Fn(&ztensor::Source) -> bool + 'a>>,
+    recognizes: Option<Recognizes<'a>>,
     states: Vec<Stated>,
     read: Box<dyn FnOnce() -> Result<T, Error> + 'a>,
 }
@@ -127,31 +136,22 @@ pub fn read_one<T>(
     };
     let names: Vec<&str> = formats.iter().map(|f| f.name).collect();
     let mut refusals: Vec<String> = Vec::new();
-    let mut recognized: Vec<(
-        &'static str,
-        Option<Result<T, Error>>,
-        Vec<Stated>,
-        Option<Format<'_, T>>,
-    )> = Vec::new();
+    let mut recognized: Vec<Recognized<'_, T>> = Vec::new();
     for format in formats {
         match &format.recognizes {
             Some(recognizes) => {
                 if recognizes(src) {
-                    let (name, states) = (format.name, format.states.clone());
-                    recognized.push((name, None, states, Some(format)));
+                    recognized.push(Recognized::ToRead(format));
                 }
             }
             None => {
                 let Format {
                     name, states, read, ..
                 } = format;
-                match agrees(src, &states).map_err(|detail| Error::Illegible {
-                    name: family.to_string(),
-                    detail,
-                }) {
-                    Err(why) => refusals.push(format!("as {name}, {why}")),
+                match agrees(src, &states) {
+                    Err(detail) => refusals.push(format!("as {name}, {detail}")),
                     Ok(()) => match read() {
-                        Ok(read) => recognized.push((name, Some(Ok(read)), states, None)),
+                        Ok(read) => recognized.push(Recognized::Read(name, Ok(read))),
                         Err(why) => refusals.push(format!("as {name}, {why}")),
                     },
                 }
@@ -173,18 +173,17 @@ pub fn read_one<T>(
                 )
             },
         }),
-        1 => {
-            let (name, read, states, format) = recognized.remove(0);
-            if let Some(read) = read {
-                return read;
+        1 => match recognized.remove(0) {
+            Recognized::Read(_, read) => read,
+            Recognized::ToRead(format) => {
+                agrees(src, &format.states).map_err(|detail| Error::Illegible {
+                    name: family.to_string(),
+                    detail: format!("as {}, {detail}", format.name),
+                })?;
+                let name = format.name;
+                (format.read)().map_err(|why| annotate(name, why))
             }
-            agrees(src, &states).map_err(|detail| Error::Illegible {
-                name: family.to_string(),
-                detail: format!("as {name}, {detail}"),
-            })?;
-            let format = format.expect("a recognized format that has not read is held");
-            (format.read)().map_err(|why| annotate(name, why))
-        }
+        },
         _ => Err(Error::Illegible {
             name: family.to_string(),
             detail: format!(
@@ -192,7 +191,10 @@ pub fn read_one<T>(
                  checkpoints hold",
                 recognized
                     .iter()
-                    .map(|r| r.0)
+                    .map(|r| match r {
+                        Recognized::Read(name, _) => *name,
+                        Recognized::ToRead(format) => format.name,
+                    })
                     .collect::<Vec<_>>()
                     .join(" and ")
             ),
@@ -269,4 +271,77 @@ pub fn has_suffix(src: &ztensor::Source, suffix: &str) -> bool {
 #[must_use]
 pub fn attribute_text<'s>(src: &'s ztensor::Source, key: &str) -> Option<&'s str> {
     src.attributes()?.get(key)?.as_text()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(dir: &std::path::Path, names: &[&str], layers: u64) -> ztensor::Source {
+        std::fs::create_dir_all(dir).expect("a scratch directory");
+        let path = dir.join("model.zt");
+        let mut writer = ztensor::Writer::create(&path).expect("the container opens");
+        for name in names {
+            writer
+                .add(*name, vec![2], ztensor::Leaf::BF16, &[0u8; 4])
+                .expect("the plane lands");
+        }
+        writer.finish().expect("the container closes");
+        let config = Value::Map(vec![(
+            Value::Text("num_hidden_layers".into()),
+            Value::Uint(layers),
+        )]);
+        ztensor::Source::open(&path)
+            .expect("it reads back")
+            .with_attribute(CONFIG, config)
+    }
+
+    fn formats(depth: u32) -> Vec<Format<'static, &'static str>> {
+        vec![
+            Format::new("a", |src| has(src, "a.embed"), || Ok("read as a")).stating([config(
+                "num_hidden_layers",
+                depth,
+            )
+            .or_deeper()]),
+            Format::new("b", |src| has(src, "b.embed"), || Ok("read as b")),
+        ]
+    }
+
+    fn refusal(read: Result<&str, Error>) -> String {
+        match read {
+            Err(Error::Illegible { detail, .. }) => detail,
+            other => panic!("a refusal by name, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_is_read_by_the_one_format_that_recognizes_it() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let one = source(dir.path(), &["a.embed"], 24);
+        assert_eq!(read_one("f", &one, formats(24)).unwrap(), "read as a");
+        assert_eq!(
+            read_one("f", &one, formats(6)).unwrap(),
+            "read as a",
+            "a deeper checkpoint is one a shallower model reads a prefix of"
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_no_format_or_two_recognize_is_refused() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let none = source(&dir.path().join("none"), &["c.embed"], 24);
+        assert!(refusal(read_one("f", &none, formats(24))).contains("no format of `f`"));
+
+        let both = source(&dir.path().join("both"), &["a.embed", "b.embed"], 24);
+        assert!(refusal(read_one("f", &both, formats(24))).contains("a and b all recognize"));
+    }
+
+    #[test]
+    fn a_checkpoint_stating_another_model_is_refused() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let shallow = source(dir.path(), &["a.embed"], 6);
+        let why = refusal(read_one("f", &shallow, formats(24)));
+        assert!(why.contains("`num_hidden_layers` as 6"), "{why}");
+        assert!(why.contains("built for 24 or more"), "{why}");
+    }
 }

@@ -2,9 +2,9 @@ use checkpoint::contract::{Expr, ModelContract, TensorType, UnaryOp};
 
 use super::model::{Head, Mixer, Mlp, Model};
 use super::rotation;
+use checkpoint_dsl::extent;
 use checkpoint_dsl::format::{Format, Stated, attribute, attribute_text, config, has, read_one};
 use checkpoint_dsl::{Builder, Error, extents};
-use checkpoint_dsl::extent;
 use poem_dsl::Platform;
 
 #[derive(Clone, Copy)]
