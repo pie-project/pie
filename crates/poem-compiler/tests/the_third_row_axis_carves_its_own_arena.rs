@@ -1,10 +1,10 @@
+use poem::ops::spatial::{self, Conv};
+use poem::{
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, seam, trace_hybrid,
+};
 use poem_compiler::{
     Budget, Budgets, DeviceProfile, Error, Placement, RowAxis, RowExpr, VoxelLadder, compile,
     compile_axes,
-};
-use poem_dsl::ops::spatial::{self, Conv};
-use poem_dsl::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, seam, trace_hybrid,
 };
 use poem_ir::{Operands, Trace};
 

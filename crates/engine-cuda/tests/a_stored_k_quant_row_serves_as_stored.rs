@@ -1,6 +1,4 @@
-use poem_dsl::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, trace_hybrid,
-};
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, trace_hybrid};
 use poem_ir::Trace;
 
 const VOCAB: u32 = 1024;

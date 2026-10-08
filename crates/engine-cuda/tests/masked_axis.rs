@@ -1,4 +1,4 @@
-use poem_dsl::Platform;
+use poem::Platform;
 use poem_ir::{Attention, Operation, Trace};
 
 fn carries_a_head(sku: &str) -> bool {

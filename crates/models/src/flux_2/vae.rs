@@ -1,5 +1,5 @@
-use poem_dsl::ops::spatial::{self, Conv};
-use poem_dsl::{Dtype, Input, Value, Weight, ops, seam};
+use poem::ops::spatial::{self, Conv};
+use poem::{Dtype, Input, Value, Weight, ops, seam};
 
 use super::model::{IN_CHANNELS, Linear, PACK, VAE_CHANNELS, port};
 

@@ -476,8 +476,8 @@ fn copy_in(stream: *mut c_void, dst: u64, src: *const u8, bytes: u64) -> Result<
 
 #[cfg(test)]
 mod tests {
+    use poem::Platform;
     use poem_compiler::{Budget, Budgets, DeviceProfile, compile_axes};
-    use poem_dsl::Platform;
 
     use super::*;
     use crate::experts::{Budgets as Tiers, Plan};

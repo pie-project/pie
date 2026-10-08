@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use engine_cuda::{Boot, Shell};
+use poem::Platform;
 use poem_compiler::Budget;
-use poem_dsl::Platform;
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 

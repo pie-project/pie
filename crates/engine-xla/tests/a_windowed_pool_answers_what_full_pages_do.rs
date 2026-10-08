@@ -9,8 +9,8 @@
 mod common;
 
 use engine_xla::{Boot, DeviceBoot, Lane, Seated, Shell};
+use poem::{Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Platform, Request};
 
 const PAGE: u32 = 16;
 const CONTEXT: u32 = 2048;

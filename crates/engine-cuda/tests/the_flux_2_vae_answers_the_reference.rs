@@ -7,8 +7,8 @@ use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
 use models::flux_2::model::{IN_CHANNELS, Model};
 use models::flux_2::vae;
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, trace_hybrid};
 use poem_compiler::{Budget, VoxelLadder};
-use poem_dsl::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, trace_hybrid};
 
 struct OneArm {
     model: Model,
@@ -112,13 +112,13 @@ fn fire(
         Platform::Cuda,
     );
     let src = ztensor::Source::open(root).unwrap_or_else(|why| panic!("{}: {why}", root.display()));
-    let contract = checkpoint_dsl::own_contract(&src, &trace.params, 1, Platform::Cuda)
+    let contract = poem::import::own_contract(&src, &trace.params, 1, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the artifact does not hold this arm's planes: {why}"));
     drop(src);
     let contract = &contract;
     let word = trace
         .facts
-        .word(&poem_dsl::Request::new(1, false).on_stream(poem_dsl::Stream::Image));
+        .word(&poem::Request::new(1, false).on_stream(poem::Stream::Image));
     let started = Instant::now();
     let mut shell = Shell::load(Boot {
         trace,

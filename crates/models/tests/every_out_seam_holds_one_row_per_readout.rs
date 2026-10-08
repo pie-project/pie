@@ -1,4 +1,4 @@
-use poem_dsl::{Dim, Platform, Ty, seam};
+use poem::{Dim, Platform, Ty, seam};
 
 /// The engine reads the `out` seam by readout index: a lane's rows in the
 /// readback are `readout_first..readout_first + readout_count`, counted over

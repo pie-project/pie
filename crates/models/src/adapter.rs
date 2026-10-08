@@ -1,4 +1,4 @@
-use poem_dsl::{Dtype, Weight};
+use poem::{Dtype, Weight};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Adapters {

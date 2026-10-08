@@ -1,8 +1,8 @@
 //! The fusion rules, in the order they run. A rule that forms a longer chain
 //! runs before one that forms a piece of it.
 
-use poem_dsl::ops::{attn, elemwise, layout, linear};
-use poem_dsl::pattern::{Pattern, Template, template};
+use poem::ops::{attn, elemwise, layout, linear};
+use poem::pattern::{Pattern, Template, template};
 use poem_ir::ops::elemwise::PostNorm;
 use poem_ir::{Dim, Dtype, Elementwise, Fused, ModulateForm, NormKind, Operation, Ty};
 
@@ -38,10 +38,10 @@ impl Norm {
     fn apply(
         self,
         p: &Pattern,
-        x: &poem_dsl::Value,
+        x: &poem::Value,
         weight: &'static str,
         eps: &'static str,
-    ) -> poem_dsl::Value {
+    ) -> poem::Value {
         let w = p.weight(weight, [W]);
         let eps = p.f32(eps);
         match self {
@@ -323,7 +323,7 @@ enum ScaleFree {
 impl ScaleFree {
     const BOTH: [ScaleFree; 2] = [ScaleFree::Layernorm, ScaleFree::Rmsnorm];
 
-    fn apply(self, p: &Pattern, x: &poem_dsl::Value) -> poem_dsl::Value {
+    fn apply(self, p: &Pattern, x: &poem::Value) -> poem::Value {
         match self {
             ScaleFree::Layernorm => elemwise::layernorm_no_scale(x, p.f32("eps")),
             ScaleFree::Rmsnorm => elemwise::rmsnorm_no_scale(x, p.u32("head_dim"), p.f32("eps")),
@@ -354,7 +354,7 @@ fn modulate_form(op: &Operation) -> ModulateForm {
 }
 
 /// The per-row (or, through `lanes`, per-lane) vectors a modulation reads.
-fn modulation_inputs(p: &Pattern, per_lane: bool) -> (poem_dsl::Value, Option<poem_dsl::Value>) {
+fn modulation_inputs(p: &Pattern, per_lane: bool) -> (poem::Value, Option<poem::Value>) {
     let rows = if per_lane { Dim::Lanes } else { Dim::Tokens };
     let m = p.value(
         "m",

@@ -20,8 +20,8 @@ use eta_ir::op::{IntrinsicId, Op};
 use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use eta_ir::validate::bind;
-use poem_dsl::fact;
-use poem_dsl::{
+use poem::fact;
+use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, RaggedMask, Request, RopeForm,
     Stream, Trace, Value, Weight, ops, seam, trace_hybrid,
 };
@@ -231,7 +231,7 @@ impl Weights {
 
 pub fn contract_for(trace: &Trace, path: &Path) -> Result<ModelContract, String> {
     let source = ztensor_compat::index(path).map_err(|why| why.to_string())?;
-    checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Cuda)
+    poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
         .map_err(|why| why.to_string())
 }
 

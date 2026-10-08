@@ -1,4 +1,4 @@
-use poem_dsl::{Dtype, Weight};
+use poem::{Dtype, Weight};
 
 pub use crate::qwen_3::model::{Attn, Gdn, Merger, Mlp, Tower, TowerBlock};
 

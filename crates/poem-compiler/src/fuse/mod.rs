@@ -1,7 +1,7 @@
 //! Forms a backend's fused kernels from the primitive ops a model writes.
 //!
 //! Each rule is a pattern written by example with the model-writing ops
-//! (`poem_dsl::pattern`) and the fused op that replaces a match of it. A
+//! (`poem::pattern`) and the fused op that replaces a match of it. A
 //! backend lists the fused kernels it ships; only the rules that form one of
 //! those run, and every match is replaced.
 
@@ -10,7 +10,7 @@ mod search;
 
 use std::sync::LazyLock;
 
-use poem_dsl::pattern::Template;
+use poem::pattern::Template;
 use poem_ir::{Dim, Dtype, Fused, Operation, Trace, Ty, ValueId};
 
 use search::{Binding, Shape};

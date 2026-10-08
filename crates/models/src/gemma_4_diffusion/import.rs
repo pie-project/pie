@@ -1,6 +1,6 @@
 use checkpoint::contract::ModelContract;
-use checkpoint_dsl::Error;
-use poem_dsl::Platform;
+use poem::Platform;
+use poem::import::Error;
 
 use super::model::Model;
 

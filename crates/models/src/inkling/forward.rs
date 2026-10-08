@@ -1,5 +1,5 @@
-use poem_dsl::fact;
-use poem_dsl::{Dtype, ForwardHybrid, HybridSpec, Input, Value, Weight, ops, seam};
+use poem::fact;
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Value, Weight, ops, seam};
 
 use super::model::{Layer, Mlp, Model, Reading};
 

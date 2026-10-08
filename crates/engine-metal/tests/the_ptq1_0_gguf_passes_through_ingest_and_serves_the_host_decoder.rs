@@ -12,7 +12,7 @@
 //!   2. Run it through the REAL ingest: `parse_metadata` recognises type 143 as
 //!      `Ptq1_0`, `materialize_contract` classifies it PASS-THROUGH (not decoded),
 //!      and `convert` writes the served `.zt` artifact.
-//!   3. Declare it: the same `checkpoint_dsl::Builder::read` that `qwen_3`'s GGUF
+//!   3. Declare it: the same `poem::import::Builder::read` that `qwen_3`'s GGUF
 //!      import calls, over a `Dtype::Ptq1_0` weight, must produce a PURE COPY
 //!      contract (a bare `Expr::Src`, encoding `Quant(Ptq1_0)`, no scales plane) —
 //!      proving the single-inline-plane declaration re-encodes nothing.
@@ -39,8 +39,8 @@ use checkpoint::file::write::Writer;
 use checkpoint::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 use checkpoint::types::{BackendKind, Encoding, QuantScheme, TensorDecl, Visibility};
 
-use checkpoint_dsl::Builder;
-use poem_dsl::{Dtype, ParamSource, Platform, Shard, Weight};
+use poem::import::Builder;
+use poem::{Dtype, ParamSource, Platform, Shard, Weight};
 use poem_ir::ParamLayout;
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};

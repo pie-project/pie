@@ -3,9 +3,9 @@ use checkpoint::contract::{Expr, ModelContract};
 use super::model::{AttnBanks, Model};
 use checkpoint::contract::TensorType;
 
-use checkpoint_dsl::format::{Format, Stated, attribute, attribute_text, config, has, read_one};
-use checkpoint_dsl::{Builder, Error, extents};
-use poem_dsl::Platform;
+use poem::Platform;
+use poem::import::format::{Format, Stated, attribute, attribute_text, config, has, read_one};
+use poem::import::{Builder, Error, extents};
 
 #[derive(Clone, Copy)]
 pub(crate) enum Layout {

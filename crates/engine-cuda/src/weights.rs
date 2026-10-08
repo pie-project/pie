@@ -1278,7 +1278,7 @@ impl TensorSink for Landing<'_> {
 
 #[cfg(test)]
 mod tests {
-    use poem_dsl::Platform;
+    use poem::Platform;
 
     use super::*;
 

@@ -1,7 +1,7 @@
 mod common;
 
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Value, Weight, ops, seam, trace_hybrid};
 use poem_compiler::Placement;
-use poem_dsl::{Dtype, ForwardHybrid, HybridSpec, Input, Value, Weight, ops, seam, trace_hybrid};
 use poem_ir::{Attention, Elementwise, Operation, RaggedMask};
 
 const WIDTH: u32 = 64;

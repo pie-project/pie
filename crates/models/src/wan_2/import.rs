@@ -1,7 +1,7 @@
 use checkpoint::contract::{Expr, ModelContract, TensorType};
-use checkpoint_dsl::format::{Format, read_one};
-use checkpoint_dsl::{Builder, Error, extents, stored_encoding};
-use poem_dsl::{Platform, Weight};
+use poem::import::format::{Format, read_one};
+use poem::import::{Builder, Error, extents, stored_encoding};
+use poem::{Platform, Weight};
 
 use super::model::{
     Block, Conv, Dims, Dit, Downsampler, HEAD_SLICES, Linear, MOD_SLICES, Model, Resnet,
@@ -433,8 +433,8 @@ fn row_of(
     let shape = extents(w);
     let n = shape.iter().product::<i64>();
     let values: Vec<f32> = (0..n as usize).map(value).collect();
-    let want = checkpoint_dsl::encoding(w.dtype);
-    let row = checkpoint_dsl::constant(&w.name, &values, vec![n], dtype)?;
+    let want = poem::import::encoding(w.dtype);
+    let row = poem::import::constant(&w.name, &values, vec![n], dtype)?;
     let row = if want == stored {
         row
     } else {

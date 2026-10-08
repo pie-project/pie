@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
+use poem::Platform;
 use poem_compiler::{Budget, CompiledModel, DeviceProfile, Lowering, Region, compile};
-use poem_dsl::Platform;
 use poem_exec::KernelError;
 use poem_exec::dispatch::{
     DispatchAttention, DispatchCollective, DispatchElementwise, DispatchFused, DispatchLayout,

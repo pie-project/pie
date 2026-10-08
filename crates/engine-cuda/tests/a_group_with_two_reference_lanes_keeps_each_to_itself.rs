@@ -8,8 +8,8 @@ use common_dit::{
 };
 use engine::Engine;
 use engine::fire::{LaneStream, ReadoutSeam};
-use poem_dsl::fact;
-use poem_dsl::{
+use poem::fact;
+use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, RaggedMask, RopeForm, Stream,
     Trace, Value, Weight, ops, seam, trace_hybrid,
 };
@@ -247,7 +247,7 @@ fn each_reference_lane_attends_itself_and_the_rest_see_everything() {
         };
         let mut submitted = lane(slot as u32, &handles, stream, 0);
         submitted.word = common_dit::classify(
-            &poem_dsl::Request::new(lane_host.count as u32, false).on_stream(match stream {
+            &poem::Request::new(lane_host.count as u32, false).on_stream(match stream {
                 LaneStream::Text => Stream::Text,
                 LaneStream::Reference => Stream::Reference,
                 _ => Stream::Image,

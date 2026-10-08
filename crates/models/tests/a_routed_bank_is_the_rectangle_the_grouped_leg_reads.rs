@@ -1,4 +1,4 @@
-use poem_dsl::{Def, Dim, Linear, Operation, Platform, Trace, Ty, ValueId};
+use poem::{Def, Dim, Linear, Operation, Platform, Trace, Ty, ValueId};
 
 fn width(trace: &Trace, v: ValueId) -> Option<u64> {
     match &trace.values[v.0 as usize].ty {

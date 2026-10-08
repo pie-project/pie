@@ -48,8 +48,8 @@ use engine_metal::weights::AdapterPlane;
 use engine_metal::{Boot, Lane, Shell};
 use models::qwen_3::model::Model;
 use models::qwen_3::rotation::{self, BONSAI_SIGN_WIDTHS};
+use poem::{Dtype, Platform, Request, trace_hybrid};
 use poem_compiler::Budget;
-use poem_dsl::{Dtype, Platform, Request, trace_hybrid};
 
 fn gguf_path() -> Option<PathBuf> {
     let p = std::env::var_os("BONSAI_GGUF")?;
@@ -194,7 +194,7 @@ fn the_bonsai_27b_perplexity_matches_the_fork() {
     let model = Model::d27b_bonsai(Dtype::Ptq1_0, Dtype::Bf16, 1);
     let trace = trace_hybrid("d27b-bonsai", &model, Platform::Metal);
     let src = ztensor_compat::index(&zt).expect("open the served artifact");
-    let contract = checkpoint_dsl::own_contract(&src, &trace.params, 1, Platform::Metal)
+    let contract = poem::import::own_contract(&src, &trace.params, 1, Platform::Metal)
         .expect("the artifact holds every checkpoint plane the trace reads");
     drop(src);
     let planes =

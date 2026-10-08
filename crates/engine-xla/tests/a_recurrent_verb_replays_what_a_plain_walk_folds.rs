@@ -8,8 +8,8 @@ mod common;
 
 use engine::fire::{FoldLen, RsReset, RsVerb};
 use engine_xla::{Boot, DeviceBoot, Lane, Seated, Shell};
+use poem::{Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Platform, Request};
 
 fn argmax(v: &[f32]) -> usize {
     let mut best = 0;

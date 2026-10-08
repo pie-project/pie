@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use models::flux_2::forward;
 use models::flux_2::model;
 use models::{PortKind, ReadoutKind};
-use poem_dsl::{
+use poem::{
     Attention, Def, Dim, Dtype, Elementwise, GeomKind, Operands, Operation, Platform, Request,
     RopeForm, RuntimeInput, Stream, Trace, Ty, ValueId, seam,
 };
@@ -242,7 +242,7 @@ fn the_denoise_ports_are_the_ones_the_facts_declare() {
 fn each_stream_of_the_denoise_reading_classifies_into_its_own_class() {
     for sku in [KLEIN, MINI] {
         let plan = trace(sku, Platform::Cuda);
-        let classes = poem_dsl::resolve_classes(&plan).expect("every merge resolves");
+        let classes = poem::resolve_classes(&plan).expect("every merge resolves");
         let _row = row(sku);
 
         let mut seen = Vec::new();

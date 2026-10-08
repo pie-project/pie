@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use checkpoint_dsl::Error;
+use poem::import::Error;
 
 #[test]
 fn every_sku_ships_whole_every_case() {
@@ -53,7 +53,7 @@ fn every_import_row_reads_the_checkpoint_it_is_handed() {
     let mut sharded = 0usize;
     for row in models::deployments().chain(models::splits()) {
         let (sku, tp) = (row.name.as_str(), row.deploy.tp);
-        let refusal = match row.contract(&src, poem_dsl::Platform::Cuda) {
+        let refusal = match row.contract(&src, poem::Platform::Cuda) {
             Ok(_) => {
                 faults.push(format!(
                     "`{sku}` states a whole contract over a checkpoint holding \
@@ -128,7 +128,7 @@ fn write_a_checkpoint_of_one_stranger(path: &Path) {
 }
 
 fn the_block_drafters_plan_is_whole() {
-    use poem_dsl::Platform;
+    use poem::Platform;
     let row = models::deployments()
         .find(|row| row.name.starts_with("qwen36-27b-dflash-"))
         .expect("this build ships the block-drafter row");
@@ -147,7 +147,7 @@ fn the_block_drafters_plan_is_whole() {
 }
 
 fn the_dflash2_plan_is_whole_and_convolves() {
-    use poem_dsl::Platform;
+    use poem::Platform;
     let row = models::deployments()
         .find(|row| row.name.starts_with("qwen38-27b-dflash2-"))
         .expect("this build ships the DFlash2 row");
@@ -159,7 +159,7 @@ fn the_dflash2_plan_is_whole_and_convolves() {
             .filter(|n| {
                 matches!(
                     &n.op,
-                    poem_dsl::Operation::Attention(poem_dsl::Attention::BlockDynConv { .. })
+                    poem::Operation::Attention(poem::Attention::BlockDynConv { .. })
                 )
             })
             .count();
@@ -173,19 +173,14 @@ fn the_dflash2_plan_is_whole_and_convolves() {
             .filter(|n| {
                 matches!(
                     &n.op,
-                    poem_dsl::Operation::Attention(poem_dsl::Attention::SelectorWalk { .. })
+                    poem::Operation::Attention(poem::Attention::SelectorWalk { .. })
                 )
             })
             .count();
         let topks = trace
             .nodes
             .iter()
-            .filter(|n| {
-                matches!(
-                    &n.op,
-                    poem_dsl::Operation::Layout(poem_dsl::Layout::TopK { .. })
-                )
-            })
+            .filter(|n| matches!(&n.op, poem::Operation::Layout(poem::Layout::TopK { .. })))
             .count();
         assert_eq!(
             (topks, walks),
@@ -206,7 +201,7 @@ fn the_dflash2_plan_is_whole_and_convolves() {
 }
 
 fn the_v1_text_states_a_bidirectional_block_of_sixteen() {
-    use poem_dsl::Platform;
+    use poem::Platform;
     let row = models::deployments()
         .find(|row| row.name.starts_with("qwen36-27b-dflash-"))
         .expect("this build ships the block-drafter row");
@@ -237,42 +232,39 @@ fn the_v1_text_states_a_bidirectional_block_of_sixteen() {
             row.entry.id == "qwen38-27b"
                 && row.deploy.drafter.is_none()
                 && row.deploy.parts.is_empty()
-                && row.deploy.weights.contains(&poem_dsl::Dtype::U4g64)
+                && row.deploy.weights.contains(&poem::Dtype::U4g64)
         })
         .expect("the plain row");
     assert!(plain.trace(Platform::Metal).drafter.is_none());
 }
 
 fn the_dspark_plan_is_whole_and_walks_a_bigram() {
-    use poem_dsl::Platform;
+    use poem::Platform;
     let row = models::deployments()
         .find(|row| row.name.starts_with("qwen38-27b-dspark-"))
         .expect("this build ships the DSpark row");
     let trace = row.trace(Platform::Metal);
-    let count = |pred: &dyn Fn(&poem_dsl::Operation) -> bool| {
+    let count = |pred: &dyn Fn(&poem::Operation) -> bool| {
         trace.nodes.iter().filter(|n| pred(&n.op)).count()
     };
     assert_eq!(
         count(&|op| matches!(
             op,
-            poem_dsl::Operation::Attention(poem_dsl::Attention::BlockDynConv { .. })
+            poem::Operation::Attention(poem::Attention::BlockDynConv { .. })
         )),
         0
     );
     assert_eq!(
-        count(&|op| matches!(
-            op,
-            poem_dsl::Operation::Layout(poem_dsl::Layout::TopK { .. })
-        )),
+        count(&|op| matches!(op, poem::Operation::Layout(poem::Layout::TopK { .. }))),
         1
     );
     let walks: Vec<_> = trace
         .nodes
         .iter()
         .filter_map(|n| match &n.op {
-            poem_dsl::Operation::Attention(poem_dsl::Attention::SelectorWalk {
-                hp, first, ..
-            }) => Some((*hp, *first)),
+            poem::Operation::Attention(poem::Attention::SelectorWalk { hp, first, .. }) => {
+                Some((*hp, *first))
+            }
             _ => None,
         })
         .collect();
@@ -297,7 +289,7 @@ fn the_dspark_plan_is_whole_and_walks_a_bigram() {
 }
 
 fn gemma_carries_the_block_drafter_too() {
-    use poem_dsl::Platform;
+    use poem::Platform;
     let row = models::deployments()
         .find(|row| row.name.starts_with("gemma4-26b-a4b-dflash-"))
         .expect("this build ships gemma's DFlash row");
@@ -320,7 +312,7 @@ fn gemma_carries_the_block_drafter_too() {
         .filter(|n| {
             matches!(
                 &n.op,
-                poem_dsl::Operation::Attention(poem_dsl::Attention::Masked { causal: false, .. })
+                poem::Operation::Attention(poem::Attention::Masked { causal: false, .. })
             )
         })
         .count();
@@ -339,7 +331,7 @@ fn gemma_carries_the_block_drafter_too() {
 }
 
 fn gpt_oss_carries_the_block_drafter_too() {
-    use poem_dsl::Platform;
+    use poem::Platform;
     let row = models::deployments()
         .find(|row| row.name.starts_with("gptoss-20b-dflash-"))
         .expect("this build ships gpt-oss's DFlash row");
@@ -362,7 +354,7 @@ fn gpt_oss_carries_the_block_drafter_too() {
         .filter(|n| {
             matches!(
                 &n.op,
-                poem_dsl::Operation::Attention(poem_dsl::Attention::Masked { causal: false, .. })
+                poem::Operation::Attention(poem::Attention::Masked { causal: false, .. })
             )
         })
         .count();

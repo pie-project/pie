@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use engine_cuda::experts::{Budgets, Plan};
 use engine_cuda::{Boot, Graphs, Knobs, Lane, Shell, World};
+use poem::{Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Platform, Request};
 
 fn argmax(logits: &[f32]) -> u32 {
     let mut best = 0usize;
@@ -68,7 +68,7 @@ fn every_probe_is_dumped() {
             let trace = sku.trace(Platform::Cuda);
             let source = ztensor_compat::index(&artifact).expect("the artifact opens");
             let contract =
-                checkpoint_dsl::own_contract(&source, &trace.params, sku.deploy.tp, Platform::Cuda)
+                poem::import::own_contract(&source, &trace.params, sku.deploy.tp, Platform::Cuda)
                     .unwrap_or_else(|why| {
                         panic!("the artifact holds every plane of {}: {why}", sku.name)
                     });

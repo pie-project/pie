@@ -24,8 +24,8 @@ mod common;
 
 use engine_xla::{Boot, DeviceBoot, Lane, Seated, Shell};
 use models::media::{Rgb8, VisionFrontEnd};
+use poem::{Operands, Platform, Request};
 use poem_compiler::{Budget, PatchLadder};
-use poem_dsl::{Operands, Platform, Request};
 
 /// `<|im_start|>system\nYou are a helpful assistant that describes images.<|im_end|>\n`
 const BEFORE: [u32; 14] = [

@@ -36,8 +36,8 @@ use engine_metal::store::kv::Paging;
 use engine_metal::store::pool_demand;
 use engine_metal::{Boot, Lane, Shell};
 use models::qwen_3::model::Model;
+use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Dtype, Platform, Request};
 
 // ---- the micro_text shape (head_dim is the free axis this test sweeps) -------
 const HIDDEN: usize = 128;
@@ -183,7 +183,7 @@ fn synth_fixture(dir: &Path, head_dim: usize) {
 }
 
 fn word(query_len: u32) -> u64 {
-    poem_dsl::trace_hybrid(
+    poem::trace_hybrid(
         "qwen3-micro-text",
         &Model::micro_text(Dtype::Bf16, Dtype::Bf16, 1),
         Platform::Metal,
@@ -213,7 +213,7 @@ fn model_of(sku: Sku, head_dim: u32) -> Model {
 
 fn load(dir: &Path, sku: Sku, head_dim: u32) -> Shell {
     let model = model_of(sku, head_dim);
-    let trace = poem_dsl::trace_hybrid("qwen3-micro-text", &model, Platform::Metal);
+    let trace = poem::trace_hybrid("qwen3-micro-text", &model, Platform::Metal);
     let source = ztensor_compat::index(dir.join("model.safetensors")).expect("the fixture indexes");
     let contract = model
         .import(&source, Platform::Metal)
@@ -301,7 +301,7 @@ fn argmaxes(rows: &[Vec<f32>]) -> Vec<usize> {
 /// number is what the pool would allocate, not a hand estimate.
 fn kv_cache_bytes(sku: Sku, head_dim: u32, paging: Paging) -> u64 {
     let model = model_of(sku, head_dim);
-    let trace = poem_dsl::trace_hybrid("qwen3-micro-text", &model, Platform::Metal);
+    let trace = poem::trace_hybrid("qwen3-micro-text", &model, Platform::Metal);
     pool_demand(&trace, paging).expect("the KV cache sizes")
 }
 

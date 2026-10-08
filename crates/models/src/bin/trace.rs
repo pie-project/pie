@@ -1,4 +1,4 @@
-use poem_dsl::Platform;
+use poem::Platform;
 
 fn main() {
     let mut args = std::env::args().skip(1);

@@ -7,8 +7,8 @@ use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
 use models::z_image::model::Model;
 use models::z_image::vae;
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, trace_hybrid};
 use poem_compiler::{Budget, VoxelLadder};
-use poem_dsl::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, trace_hybrid};
 
 struct OneArm {
     model: Model,
@@ -146,7 +146,7 @@ fn fire(
     contract.tensors.retain(|t| keep.contains(&t.name));
     let word = trace
         .facts
-        .word(&poem_dsl::Request::new(1, false).on_stream(poem_dsl::Stream::Image));
+        .word(&poem::Request::new(1, false).on_stream(poem::Stream::Image));
     let started = Instant::now();
     let mut shell = Shell::load(Boot {
         trace,

@@ -1886,7 +1886,7 @@ fn pinned_address_of(seat: &Seat, expert: u32) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use poem_dsl::Platform;
+    use poem::Platform;
 
     use super::*;
 
@@ -1915,7 +1915,7 @@ mod tests {
             .enumerate()
             .filter(|(_, param)| param.dtype == poem_ir::Dtype::Mxfp4)
             .map(|(codes, param)| {
-                let scales = poem_dsl::scales_name(&param.name);
+                let scales = poem::scales_name(&param.name);
                 let scales = *at
                     .get(scales.as_str())
                     .unwrap_or_else(|| panic!("`{}` declares no scales plane", param.name));

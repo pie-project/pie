@@ -1,7 +1,7 @@
 use checkpoint::contract::{Expr, ModelContract, TensorContract, TensorType};
 use checkpoint::types::Encoding;
-use checkpoint_dsl::{Builder, Error, extents, stored_encoding};
-use poem_dsl::{Platform, Weight};
+use poem::import::{Builder, Error, extents, stored_encoding};
+use poem::{Platform, Weight};
 
 use super::model::{
     AV_GATE_SLICES, AV_SS_SLICES, AdaLn, Attn, Block, Connector, Dims, Dit, Ffn, HEAD_SLICES,
@@ -121,7 +121,7 @@ fn conv_out_rows() -> Vec<i64> {
 }
 
 fn zero_row(b: &mut Builder, w: &Weight) -> Result<(), Error> {
-    let want = checkpoint_dsl::encoding(w.dtype);
+    let want = poem::import::encoding(w.dtype);
     let Encoding::Raw(dtype) = want.clone() else {
         return Err(Error::Illegible {
             name: w.name.clone(),

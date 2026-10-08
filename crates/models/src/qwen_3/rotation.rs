@@ -49,7 +49,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use poem_dsl::{Dtype, Weight};
+use poem::{Dtype, Weight};
 use ztensor::format::cbor::Value;
 
 /// GGUF metadata key: the Hadamard block size (the sign widths must divide it).

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use models::z_image::model::{self, Dims};
 use models::{PortKind, ReadoutKind, ScheduleKind};
-use poem_dsl::{
+use poem::{
     Attention, Def, Dim, Dtype, Elementwise, GeomKind, Operation, Platform, Request, RopeForm,
     RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
 };
@@ -282,7 +282,7 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
 fn every_declared_lane_classifies_into_its_own_class_where_every_merge_resolves() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
-        let classes = poem_dsl::resolve_classes(&plan).expect("every merge resolves");
+        let classes = poem::resolve_classes(&plan).expect("every merge resolves");
         let _catalog = row(sku);
         let mut seen: Vec<((&str, Stream), usize)> = Vec::new();
         for (name, _index, stream) in lanes(sku) {
@@ -469,7 +469,7 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
             match lane_of_row {
                 Some(lanes) => {
                     lane_scales += 1;
-                    assert_eq!(*form, poem_dsl::ModulateForm::Scale);
+                    assert_eq!(*form, poem::ModulateForm::Scale);
                     assert_eq!(
                         ty(*m),
                         Ty::Tensor {
@@ -487,7 +487,7 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
                 }
                 None => {
                     row_pads += 1;
-                    assert_eq!(*form, poem_dsl::ModulateForm::ScaleShift);
+                    assert_eq!(*form, poem::ModulateForm::ScaleShift);
                     assert_eq!(
                         ty(*m),
                         Ty::Tensor {
@@ -511,7 +511,7 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
                 continue;
             }
             let mut pairs = Vec::new();
-            poem_dsl::Operands::aliases(&node.op, &mut pairs);
+            poem::Operands::aliases(&node.op, &mut pairs);
             assert_eq!(pairs.len(), 1, "a gated fold is in place on its residual");
             folds += 1;
         }

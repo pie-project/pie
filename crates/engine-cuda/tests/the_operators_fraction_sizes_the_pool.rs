@@ -107,7 +107,7 @@ fn a_sliding_row_holds_its_window_and_not_the_context() {
     const SLIDING: u64 = 50 * 2 * 16 * 256 * 2;
     let trace = models::deployment("gemma4-31b-u4g64-kv-bf16")
         .expect("the catalog ships gemma-4-31b")
-        .trace(poem_dsl::Platform::Cuda);
+        .trace(poem::Platform::Cuda);
     let window = window_of(&trace).expect("every sliding read looks through the window");
     assert_eq!(window, Some(1024));
     let at = |context: u32| {

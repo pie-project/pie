@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use models::ltx_2::forward::VAE_DECODE;
 use models::ltx_2::model::{self, Model};
 use models::{PortKind, ReadoutKind};
-use poem_dsl::{Def, Dtype, Operation, Platform, RuntimeInput, Trace};
+use poem::{Def, Dtype, Operation, Platform, RuntimeInput, Trace};
 use poem_ir::{GridRule, Spatial, TimePad};
 
 const FLAGSHIP: &str = "ltx25-bf16-kv-bf16";
@@ -39,7 +39,7 @@ fn the_flagship_declares_the_decode_reading_and_the_miniature_does_not() {
         "the last code"
     );
     assert!(!decode.has_kv && !decode.takes_tokens);
-    assert_eq!(decode.streams, vec![poem_dsl::Stream::Video]);
+    assert_eq!(decode.streams, vec![poem::Stream::Video]);
     assert_eq!(decode.ports.len(), 1);
     let (index, port) = decode.port("latent").expect("the latent port");
     assert_eq!(
@@ -113,7 +113,7 @@ fn the_shapes_are_the_ltx_decoders() {
             Operation::Spatial(other) => {
                 panic!("a spatial member this decoder never states: {other:?}")
             }
-            Operation::Elementwise(poem_dsl::Elementwise::RmsnormNoScale { eps, .. }) => {
+            Operation::Elementwise(poem::Elementwise::RmsnormNoScale { eps, .. }) => {
                 rms_eps.insert(format!("{eps:e}"));
             }
             _ => {}

@@ -1,8 +1,8 @@
 use checkpoint::contract::{Expr, ModelContract, TensorContract, TensorType, UnaryOp};
 use checkpoint::types::Encoding;
-use checkpoint_dsl::format::{Format, read_one};
-use checkpoint_dsl::{Builder, Error, encoding, extents, stored_encoding};
-use poem_dsl::{Platform, Weight};
+use poem::import::format::{Format, read_one};
+use poem::import::{Builder, Error, encoding, extents, stored_encoding};
+use poem::{Platform, Weight};
 
 use super::model::{
     Attn, DOUBLE_MOD_SLICES, Dit, Model, SINGLE_MOD_SLICES, Swiglu, TE_HIDDEN, TextEncoder,

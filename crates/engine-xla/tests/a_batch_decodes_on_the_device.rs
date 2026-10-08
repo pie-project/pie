@@ -7,8 +7,8 @@ mod common;
 use std::time::Instant;
 
 use engine_xla::{Boot, DeviceBoot, Lane, Seated, Shell};
+use poem::{Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Platform, Request};
 
 #[test]
 fn decode_step_time_by_batch_width() {

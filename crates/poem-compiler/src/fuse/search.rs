@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use poem_dsl::pattern::{Attr, Template};
+use poem::pattern::{Attr, Template};
 use poem_ir::{Def, Node, Operands, Operation, Trace, ValueId};
 
 use super::{Match, Rule};

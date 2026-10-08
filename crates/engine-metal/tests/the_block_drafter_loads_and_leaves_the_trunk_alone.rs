@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use engine::fire::{Mask, Masking};
 use engine_metal::{Boot, Lane, Seated, Shell};
+use poem::{Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Platform, Request};
 
 const SKU: &str = "qwen36-27b-dflash-u4g64-kv-bf16";
 const PLAIN_SKU: &str = "qwen36-27b-mtp-u4g64-kv-bf16";
@@ -129,7 +129,7 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
     let sku = models::deployment(SKU).expect("the catalog ships the block-drafter row");
     let trace = sku.trace(Platform::Metal);
     let source = ztensor_compat::index(&artifact).expect("the artifact opens");
-    let contract = checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Metal)
+    let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Metal)
         .unwrap_or_else(|why| panic!("the artifact holds every plane of {SKU}: {why}"));
     drop(source);
 
@@ -179,7 +179,7 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
     let plain_trace = plain_sku.trace(Platform::Metal);
     let plain_source = ztensor_compat::index(&plain_artifact).expect("the artifact opens");
     let plain_contract =
-        checkpoint_dsl::own_contract(&plain_source, &plain_trace.params, 1, Platform::Metal)
+        poem::import::own_contract(&plain_source, &plain_trace.params, 1, Platform::Metal)
             .expect("the plain artifact holds every plane");
     drop(plain_source);
     let mut plain_shell = Shell::load(Boot {
@@ -251,7 +251,7 @@ fn a_draft_block_fires_and_the_drafter_answers_it() {
     let sku = models::deployment(SKU).expect("the catalog ships the block-drafter row");
     let trace = sku.trace(Platform::Metal);
     let source = ztensor_compat::index(&artifact).expect("the artifact opens");
-    let contract = checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Metal)
+    let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Metal)
         .expect("the artifact holds every plane");
     drop(source);
     let mut shell = Shell::load(Boot {

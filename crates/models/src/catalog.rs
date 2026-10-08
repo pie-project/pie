@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use checkpoint::contract::ModelContract;
-use poem_dsl::{Dtype, Platform, Trace};
+use poem::{Dtype, Platform, Trace};
 
 use crate::{Diffusion, Generative, template, tokenizer};
 
@@ -76,9 +76,14 @@ impl Refused {
     }
 }
 
-pub type TraceFn = fn(&str, &Deploy, Platform) -> Result<Trace, Refused>;
-pub type ImportFn =
-    fn(&Deploy, &ztensor::Source, Platform) -> Result<ModelContract, checkpoint_dsl::Error>;
+pub type TraceFn = Box<dyn Fn(&str, &Deploy, Platform) -> Result<Trace, Refused> + Send + Sync>;
+pub type ImportFn = Box<
+    dyn Fn(&Deploy, &ztensor::Source, Platform) -> Result<ModelContract, poem::import::Error>
+        + Send
+        + Sync,
+>;
+pub type DiffusionFn = Box<dyn Fn(&Deploy) -> Option<Diffusion> + Send + Sync>;
+pub type GenerativeFn = Box<dyn Fn(&Deploy) -> Option<Generative> + Send + Sync>;
 pub type TemplateFn = fn(Arc<::tokenizer::Tokenizer>) -> Arc<dyn template::Instruct>;
 
 /// One model of the catalog.
@@ -90,14 +95,14 @@ pub struct Entry {
     /// identification tries it after every whole one, since it reads a
     /// prefix of its whole model's planes.
     pub mini: bool,
-    pub parts: &'static [Part],
-    pub drafters: &'static [Drafter],
+    pub parts: Vec<Part>,
+    pub drafters: Vec<Drafter>,
     pub trace: TraceFn,
     pub import: ImportFn,
     pub template: TemplateFn,
     pub tokenizer: &'static tokenizer::Contract,
-    pub diffusion: fn(&Deploy) -> Option<Diffusion>,
-    pub generative: fn(&Deploy) -> Option<Generative>,
+    pub diffusion: DiffusionFn,
+    pub generative: GenerativeFn,
     /// The deployments the catalog lists for this model, with each one's
     /// place in its family's list (identification tries them in that order).
     pub rows: Vec<Row>,
@@ -282,30 +287,30 @@ macro_rules! entry {
         $crate::catalog::Entry {
             id: $id,
             mini: $mini,
-            parts: &[$($crate::catalog::Part::$part),*],
-            drafters: &[$($crate::catalog::Drafter::$drafter),*],
-            trace: |name, deploy, platform| {
-                Ok(poem_dsl::trace_hybrid(name, &build(deploy)?, platform))
-            },
-            import: |deploy, src, platform| {
+            parts: vec![$($crate::catalog::Part::$part),*],
+            drafters: vec![$($crate::catalog::Drafter::$drafter),*],
+            trace: Box::new(|name, deploy, platform| {
+                Ok(poem::trace_hybrid(name, &build(deploy)?, platform))
+            }),
+            import: Box::new(|deploy, src, platform| {
                 $crate::whole(deploy.tp)?;
                 build(deploy)
-                    .map_err(|why| checkpoint_dsl::Error::Illegible {
+                    .map_err(|why| poem::import::Error::Illegible {
                         name: $id.to_string(),
                         detail: why.to_string(),
                     })?
                     .import(src, platform)
-            },
+            }),
             template: $template,
             tokenizer: $tokenizer,
-            diffusion: |deploy| {
+            diffusion: Box::new(|deploy| {
                 let diffusion: Option<fn(&$model) -> $crate::Diffusion> = $diffusion;
                 diffusion.and_then(|f| build(deploy).ok().map(|m| f(&m)))
-            },
-            generative: |deploy| {
+            }),
+            generative: Box::new(|deploy| {
                 let generative: Option<fn(&$model) -> $crate::Generative> = $generative;
                 generative.and_then(|g| build(deploy).ok().map(|m| g(&m)))
-            },
+            }),
             rows: vec![ $( $crate::catalog::Row {
                 seq: $seq,
                 deploy: $crate::catalog::Deploy {

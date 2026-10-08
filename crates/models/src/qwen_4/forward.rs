@@ -1,7 +1,5 @@
-use poem_dsl::fact;
-use poem_dsl::{
-    Dtype, ForwardHybrid, GateActivation, HybridSpec, Input, MropeForm, Value, ops, seam,
-};
+use poem::fact;
+use poem::{Dtype, ForwardHybrid, GateActivation, HybridSpec, Input, MropeForm, Value, ops, seam};
 
 use super::model::{Attn, Gdn, Indexer, Mixer, Mlp, Model, Ple, Residual, Tower};
 
@@ -538,7 +536,7 @@ fn moe(x: &Value, mlp: &Mlp) -> Value {
         } => {
             let (routes, weights) =
                 ops::linear::moe_topk_softmax(&ops::linear::matmul(x, router), *experts, *top_k);
-            let select = |act: &Value, bank: &poem_dsl::Weight| {
+            let select = |act: &Value, bank: &poem::Weight| {
                 if matches!(bank.dtype, Dtype::Bf16 | Dtype::F16 | Dtype::F32) {
                     ops::linear::moe_matmul_select(act, bank, &routes, *top_k)
                 } else {

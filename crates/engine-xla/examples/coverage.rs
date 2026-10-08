@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 
 use engine_xla::DeviceBoot;
 use engine_xla::serve::{Boot, Shell};
+use poem::Platform;
 use poem_compiler::Budget;
-use poem_dsl::Platform;
 
 const PREFILL: u32 = 24;
 
@@ -183,8 +183,8 @@ fn one(
     ))
 }
 
-fn dtype_bits(dtype: poem_dsl::Dtype) -> u32 {
-    use poem_dsl::Dtype as D;
+fn dtype_bits(dtype: poem::Dtype) -> u32 {
+    use poem::Dtype as D;
     match dtype {
         D::F32 | D::I32 | D::U32 => 32,
         D::I64 | D::U64 => 64,

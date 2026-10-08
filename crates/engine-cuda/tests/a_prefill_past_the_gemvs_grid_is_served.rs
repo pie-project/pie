@@ -5,8 +5,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use checkpoint::contract::ModelContract;
 use engine_cuda::{Boot, Graphs, Lane, Shell};
+use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Dtype, Platform, Request};
 use poem_ir::{ParamSource, Trace};
 
 const TOP_K: u32 = 4;
@@ -32,7 +32,7 @@ fn micro() -> models::qwen_3::model::Model {
     models::qwen_3::model::Model::a3b_micro(Dtype::Bf16, Dtype::Bf16)
 }
 fn micro_word(len: u32) -> u64 {
-    poem_dsl::trace_hybrid("a3b_micro", &micro(), Platform::Cuda)
+    poem::trace_hybrid("a3b_micro", &micro(), Platform::Cuda)
         .facts
         .word(&Request::new(len, false))
 }
@@ -41,7 +41,7 @@ fn uncached() -> models::qwen_3::model::Model {
     models::qwen_3::model::Model::a3b_uncached_bank(Dtype::Bf16, Dtype::Bf16)
 }
 fn uncached_word(len: u32) -> u64 {
-    poem_dsl::trace_hybrid("a3b_uncached_bank", &uncached(), Platform::Cuda)
+    poem::trace_hybrid("a3b_uncached_bank", &uncached(), Platform::Cuda)
         .facts
         .word(&Request::new(len, false))
 }
@@ -152,12 +152,12 @@ struct Fixture {
 
 fn fixture(text: Text) -> Fixture {
     let m = (text.build)();
-    let trace = poem_dsl::trace_hybrid(text.name, &m, Platform::Cuda);
+    let trace = poem::trace_hybrid(text.name, &m, Platform::Cuda);
     let dir = scratch(text.name);
     let container = dir.0.join("micro.zt");
     write_checkpoint(&container, &trace);
     let source = ztensor::Source::open(&container).expect("the fixture opens");
-    let contract = checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Cuda)
+    let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
         .expect("a container of the plan's own planes is read by the plan's own names");
     drop(source);
     Fixture {

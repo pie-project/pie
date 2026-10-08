@@ -1,5 +1,5 @@
-use poem_dsl::ops::elemwise::Yarn;
-use poem_dsl::{Dtype, Weight};
+use poem::ops::elemwise::Yarn;
+use poem::{Dtype, Weight};
 
 pub struct Model {
     pub hidden: u32,

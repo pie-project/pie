@@ -2,8 +2,8 @@ use checkpoint::contract::{Expr, ModelContract, TensorType};
 use checkpoint::types::Encoding;
 
 use super::model::{Mlp, Model};
-use checkpoint_dsl::{Builder, Error, encoding};
-use poem_dsl::Platform;
+use poem::Platform;
+use poem::import::{Builder, Error, encoding};
 
 impl Model {
     pub fn import(

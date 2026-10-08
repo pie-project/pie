@@ -1,6 +1,6 @@
+use poem::ops::{attn, elemwise, layout, linear};
+use poem::pattern::{Pattern, template};
 use poem_compiler::fuse::fuse;
-use poem_dsl::ops::{attn, elemwise, layout, linear};
-use poem_dsl::pattern::{Pattern, template};
 use poem_ir::{Dim, Dtype, Operands, Trace, Ty};
 
 fn trace(build: impl FnOnce(&Pattern)) -> Trace {
@@ -11,7 +11,7 @@ fn ops(trace: &Trace) -> Vec<&'static str> {
     trace.nodes.iter().map(|node| node.op.name()).collect()
 }
 
-fn biased(p: &Pattern) -> poem_dsl::Value {
+fn biased(p: &Pattern) -> poem::Value {
     linear::matmul(&p.rows("act", 64), &p.weight("w", [64, 64]))
 }
 

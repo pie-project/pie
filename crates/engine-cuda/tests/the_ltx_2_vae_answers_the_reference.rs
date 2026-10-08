@@ -7,10 +7,10 @@ use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
 use models::ltx_2::forward::vae_decode;
 use models::ltx_2::model::{Model, VAE_RGB, VAE_Z};
-use poem_compiler::{Budget, VoxelLadder};
-use poem_dsl::{
+use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Stream, Value, trace_hybrid,
 };
+use poem_compiler::{Budget, VoxelLadder};
 
 struct VaeOnly {
     model: Model,

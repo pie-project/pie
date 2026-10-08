@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use checkpoint::contract::Expr;
 use models::hunyuan_image_3::model::{Dims, Model};
-use poem_dsl::{Dtype, Platform};
+use poem::{Dtype, Platform};
 
 const MINI: &str = "hunyuanimage3-mini-bf16-kv-bf16";
 

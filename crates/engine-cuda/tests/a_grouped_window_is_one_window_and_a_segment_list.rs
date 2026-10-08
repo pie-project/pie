@@ -1,6 +1,6 @@
 use engine_cuda::window::{Copies, Windows};
+use poem::Platform;
 use poem_compiler::{Budget, CompiledModel, DeviceProfile, FamilyCosts, compile};
-use poem_dsl::Platform;
 use poem_exec::fire::{Lane, compose};
 
 use poem_ir::Trace;

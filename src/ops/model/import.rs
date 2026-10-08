@@ -425,11 +425,12 @@ pub fn run(mut args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate
         _ => None,
     };
 
-    let provenance = BTreeMap::from([
+    let mut provenance = BTreeMap::from([
         (VERSION_KEY.to_string(), pie_version().to_string()),
         (SOURCE_KEY.to_string(), source.origin.clone()),
         (SOURCE_ENCODING_KEY.to_string(), source_encoding(&metadata)),
     ]);
+    provenance.extend(runtime::engine::load::package_attributes(sku)?);
     let mut writer = Writer::create_serving(&out_file, &provenance, stamp.clone())
         .map_err(|err| anyhow!("cannot write the artifact: {err}"))?;
     for group in &groups {
@@ -675,10 +676,11 @@ fn overlay_onto_artifact(
     let held = std::fs::metadata(&base_file)
         .with_context(|| format!("stat {}", base_file.display()))?
         .len();
-    let provenance = BTreeMap::from([
+    let mut provenance = BTreeMap::from([
         (VERSION_KEY.to_string(), pie_version().to_string()),
         (SOURCE_KEY.to_string(), source.origin.clone()),
     ]);
+    provenance.extend(runtime::engine::load::package_attributes(sku)?);
     let restore = |why: anyhow::Error| -> anyhow::Error {
         match std::fs::OpenOptions::new()
             .write(true)
@@ -1678,6 +1680,14 @@ fn staleness(
     }
     if runtime::engine::load::trace(&stamp.sku, platform).is_err() {
         return Some(format!("this build ships no SKU named `{}`", stamp.sku));
+    }
+    let carried = match runtime::engine::load::package_of(artifact) {
+        Ok(carried) => carried.map(|package| package.attributes()),
+        Err(err) => return Some(format!("{err:#}")),
+    };
+    let ships = runtime::engine::load::package_attributes(&stamp.sku).ok();
+    if carried.unwrap_or_default() != ships.unwrap_or_default() {
+        return Some("the model package it carries is not the one this build ships".to_string());
     }
     let wanted = checkpoint::serving::Stamp::of(&backend_word(platform), &stamp.sku);
     if let Err(mismatch) = stamp.check(&wanted) {

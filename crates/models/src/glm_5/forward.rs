@@ -1,5 +1,5 @@
-use poem_dsl::fact;
-use poem_dsl::{ForwardHybrid, HybridSpec, Input, Value, ops, seam};
+use poem::fact;
+use poem::{ForwardHybrid, HybridSpec, Input, Value, ops, seam};
 
 use super::model::{Attn, Indexer, Mlp, Model};
 

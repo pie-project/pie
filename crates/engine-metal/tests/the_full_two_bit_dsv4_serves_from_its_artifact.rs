@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use engine_metal::experts::{Attachments, Plan};
 use engine_metal::{Boot, Lane, Shell};
+use poem::{Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Platform, Request};
 use poem_ir::Trace;
 
 const SKU: &str = "dsv4-flash-mtp-u4g64-u2g64-mxfp4-kv-bf16";
@@ -161,7 +161,7 @@ fn read(artifact: &Path) -> Read {
         .expect("the catalog ships the full 2-bit row")
         .trace(Platform::Metal);
     let source = ztensor_compat::index(artifact).expect("the artifact opens");
-    let contract = checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Metal)
+    let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Metal)
         .unwrap_or_else(|why| panic!("the artifact holds every plane of {SKU}: {why}"));
     drop(source);
     let planes = engine_metal::weights::attachments(&trace, &contract, artifact)

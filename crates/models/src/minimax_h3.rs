@@ -5,7 +5,7 @@ pub mod template;
 pub mod tokenizer;
 
 use model::Model;
-use poem_dsl::Dtype;
+use poem::Dtype;
 
 pub const ARCH: &str = "minimax_h3";
 

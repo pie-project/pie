@@ -1,5 +1,5 @@
-use poem_dsl::fact;
-use poem_dsl::{
+use poem::fact;
+use poem::{
     Dtype, ForwardHybrid, GateActivation, HybridSpec, Input, MropeForm, Value, Weight, ops, seam,
     switch,
 };

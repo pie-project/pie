@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use engine_metal::{Boot, Lane, Shell};
+use poem::{Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Platform, Request};
 
 fn argmax(logits: &[f32]) -> u32 {
     let mut best = 0usize;
@@ -68,13 +68,11 @@ fn every_probe_is_dumped() {
                 models::deployment(&stamp.sku).unwrap_or_else(|| panic!("no SKU {}", stamp.sku));
             let trace = sku.trace(Platform::Metal);
             let source = ztensor_compat::index(&artifact).expect("the artifact opens");
-            let contract = checkpoint_dsl::own_contract(
-                &source,
-                &trace.params,
-                sku.deploy.tp,
-                Platform::Metal,
-            )
-            .unwrap_or_else(|why| panic!("the artifact holds every plane of {}: {why}", sku.name));
+            let contract =
+                poem::import::own_contract(&source, &trace.params, sku.deploy.tp, Platform::Metal)
+                    .unwrap_or_else(|why| {
+                        panic!("the artifact holds every plane of {}: {why}", sku.name)
+                    });
             (artifact, sku, contract)
         }
         (_, Ok(snapshot)) => {

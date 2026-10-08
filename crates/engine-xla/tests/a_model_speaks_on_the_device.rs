@@ -8,8 +8,8 @@ use std::time::Instant;
 mod common;
 
 use engine_xla::{Boot, DeviceBoot, Lane, Shell};
+use poem::{Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Platform, Request};
 
 fn argmax(logits: &[f32]) -> u32 {
     let mut best = 0usize;

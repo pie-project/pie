@@ -1,10 +1,10 @@
 use checkpoint::contract::{Expr, ModelContract, TensorContract, TensorType};
-use poem_dsl::{Dtype, Weight};
+use poem::{Dtype, Weight};
 
 use super::model::{Gate, GateUp, Layer, Mlp, Model};
-use checkpoint_dsl::format::{Format, has, read_one};
-use checkpoint_dsl::{Builder, Error, encoding, extents, scaling};
-use poem_dsl::Platform;
+use poem::Platform;
+use poem::import::format::{Format, has, read_one};
+use poem::import::{Builder, Error, encoding, extents, scaling};
 
 impl Model {
     pub fn import(
@@ -610,7 +610,7 @@ fn read_bank(
                 )));
             }
             let pairing = scaling(w);
-            let counted = checkpoint_dsl::divided(
+            let counted = poem::import::divided(
                 &extents(w),
                 pairing.channel_axis,
                 pairing.group_size,
@@ -623,7 +623,7 @@ fn read_bank(
                     encoding(Dtype::Mxfp4),
                 ),
                 TensorContract::new(
-                    poem_dsl::scales_name(&w.name),
+                    poem::scales_name(&w.name),
                     Expr::concat(0, scales),
                     counted,
                     encoding(Dtype::E8m0),

@@ -1,5 +1,5 @@
-use poem_dsl::fact;
-use poem_dsl::{Dtype, ForwardHybrid, HybridSpec, Input, Value, ValueId, Weight, ops, seam};
+use poem::fact;
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Value, ValueId, Weight, ops, seam};
 
 use super::model::{Engram, Gate, GateUp, Hyper, Indexer, Mix, Mlp, Model, Pool, Selection};
 
@@ -932,5 +932,5 @@ fn boundaries(positions: &Value, row_valid: &Value, ratio: u32) -> (Value, Value
 /// A kv row holds heads the ranks split when its projection is split; a
 /// single latent every query head reads stays whole on each rank.
 fn split_heads(kv_down: &Weight) -> bool {
-    matches!(kv_down.shard, poem_dsl::Shard::Cut { .. })
+    matches!(kv_down.shard, poem::Shard::Cut { .. })
 }

@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use checkpoint::contract::ModelContract;
-use poem_dsl::Platform;
+use poem::Platform;
 
 pub struct Model {
     pub checkpoint: PathBuf,
@@ -31,7 +31,7 @@ pub fn model() -> Option<Model> {
             let trace = sku.trace(Platform::Xla);
             let source = ztensor_compat::index(&artifact).expect("the artifact opens");
             let contract =
-                checkpoint_dsl::own_contract(&source, &trace.params, sku.deploy.tp, Platform::Xla)
+                poem::import::own_contract(&source, &trace.params, sku.deploy.tp, Platform::Xla)
                     .unwrap_or_else(|why| panic!("the artifact holds every plane: {why}"));
             Some(Model {
                 checkpoint: artifact,

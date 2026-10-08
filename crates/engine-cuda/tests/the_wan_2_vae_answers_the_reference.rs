@@ -6,10 +6,10 @@ use std::time::Instant;
 use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
 use models::wan_2::model::Model;
-use poem_compiler::{Budget, VoxelLadder};
-use poem_dsl::{
+use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Stream, Value, trace_hybrid,
 };
+use poem_compiler::{Budget, VoxelLadder};
 
 struct VaeOnly {
     model: Model,
@@ -157,7 +157,7 @@ fn load(artifact: &PathBuf, max_voxels: u32) -> (Decoder, f64) {
     let trace = trace_hybrid("wan22-vae-decode", &arm, Platform::Cuda);
     let src = ztensor::Source::open(artifact)
         .unwrap_or_else(|why| panic!("{}: {why}", artifact.display()));
-    let contract = checkpoint_dsl::own_contract(&src, &trace.params, 1, Platform::Cuda)
+    let contract = poem::import::own_contract(&src, &trace.params, 1, Platform::Cuda)
         .unwrap_or_else(|why| {
             panic!(
                 "{} does not hold every plane of the VAE plan: {why}",

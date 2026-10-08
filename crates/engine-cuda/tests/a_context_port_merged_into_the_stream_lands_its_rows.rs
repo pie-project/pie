@@ -5,8 +5,8 @@ mod common_dit;
 use common_dit::{Lcg, NAME, Rig, WIDTH, Weights, assert_close, attach, bf, frame, lane};
 use engine::Engine;
 use engine::fire::LaneStream;
-use poem_dsl::fact;
-use poem_dsl::{
+use poem::fact;
+use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Stream, Trace, Value, Weight,
     ops, seam, trace_hybrid,
 };

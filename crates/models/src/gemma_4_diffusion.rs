@@ -3,7 +3,7 @@ pub mod import;
 pub mod model;
 
 use model::Model;
-use poem_dsl::Dtype;
+use poem::Dtype;
 
 use crate::gemma_4::{template, tokenizer};
 

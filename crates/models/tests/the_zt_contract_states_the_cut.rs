@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use checkpoint::contract::{Expr, ModelContract, TensorContract, Visibility};
-use poem_dsl::{Dtype, Param, ParamSource, Platform, Shard};
+use poem::{Dtype, Param, ParamSource, Platform, Shard};
 
 const GROUP: u64 = 32;
 
@@ -162,14 +162,13 @@ fn state_every_sku() -> Vec<Stated> {
         let src = ztensor::Source::open(&path).unwrap_or_else(|why| {
             panic!("`{name}`: the checkpoint just written does not open again: {why}")
         });
-        let contract =
-            checkpoint_dsl::own_contract(&src, &trace.params, tp, poem_dsl::Platform::Cuda)
-                .unwrap_or_else(|why| {
-                    panic!(
-                        "`{name}` refuses a checkpoint that states its own plan, plane for \
+        let contract = poem::import::own_contract(&src, &trace.params, tp, poem::Platform::Cuda)
+            .unwrap_or_else(|why| {
+                panic!(
+                    "`{name}` refuses a checkpoint that states its own plan, plane for \
                  plane, in the dtypes it asked for: {why}"
-                    )
-                });
+                )
+            });
         drop(src);
         out.push(Stated {
             name,
@@ -384,14 +383,13 @@ fn a_bank_the_checkpoint_ships_unquantized_is_cast_on_the_way_in() {
 
         let src = ztensor::Source::open(&path)
             .unwrap_or_else(|why| panic!("`{name}`: {} does not open: {why}", path.display()));
-        let contract =
-            checkpoint_dsl::own_contract(&src, &trace.params, tp, poem_dsl::Platform::Cuda)
-                .unwrap_or_else(|why| {
-                    panic!(
-                        "`{name}` refuses a checkpoint that ships its banks unquantized, \
+        let contract = poem::import::own_contract(&src, &trace.params, tp, poem::Platform::Cuda)
+            .unwrap_or_else(|why| {
+                panic!(
+                    "`{name}` refuses a checkpoint that ships its banks unquantized, \
                  which is the file a runtime-quantizing SKU exists to read: {why}"
-                    )
-                });
+                )
+            });
         drop(src);
 
         let supply = published(&contract);

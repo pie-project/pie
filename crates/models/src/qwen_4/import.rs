@@ -2,10 +2,10 @@ use checkpoint::contract::{Expr, ModelContract};
 
 use super::model::{Layer, Mixer, Mlp, Model};
 use crate::qwen_3::import::{flattened, squeezed};
-use checkpoint_dsl::format::{Format, has, read_one};
-use checkpoint_dsl::{Builder, Error, extents};
-use poem_dsl::Platform;
-use poem_dsl::Weight;
+use poem::Platform;
+use poem::Weight;
+use poem::import::format::{Format, has, read_one};
+use poem::import::{Builder, Error, extents};
 
 #[derive(Clone, Copy)]
 enum Layout {
@@ -393,7 +393,7 @@ enum Read<'a> {
 
 fn shard_count(p: &super::model::Ple) -> usize {
     match &p.table.shard {
-        poem_dsl::Shard::Cut { segments, .. } => segments.len(),
-        poem_dsl::Shard::Replicated => 1,
+        poem::Shard::Cut { segments, .. } => segments.len(),
+        poem::Shard::Replicated => 1,
     }
 }

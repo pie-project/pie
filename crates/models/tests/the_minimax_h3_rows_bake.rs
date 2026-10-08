@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use models::minimax_h3::model::{self, Dims};
 use models::{PortKind, ReadoutKind, ScheduleKind};
-use poem_dsl::{
+use poem::{
     Attention, Def, Dim, Dtype, Elementwise, Operation, Platform, RaggedMask, Request, RopeForm,
     RuntimeInput, Stream, Trace, Ty, seam,
 };
@@ -219,7 +219,7 @@ fn lanes(sku: &str) -> Vec<(&'static str, u8, Stream)> {
 fn every_lane_the_facts_list_lands_in_a_class_where_the_merges_resolve() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
-        let classes = poem_dsl::resolve_classes(&plan).expect("every merge resolves");
+        let classes = poem::resolve_classes(&plan).expect("every merge resolves");
         let _catalog = row(sku);
         let mut seen: Vec<((&str, Stream), usize)> = Vec::new();
         for (name, _index, stream) in lanes(sku) {

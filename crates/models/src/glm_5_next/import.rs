@@ -1,10 +1,10 @@
 use checkpoint::contract::{Expr, ModelContract, TensorType};
-use poem_dsl::{Platform, Weight};
+use poem::{Platform, Weight};
 
 use super::model::{Indexer, Kda, Mixer, Mla, Mlp, Model, Tower};
-use checkpoint_dsl::format::{Format, has, read_one};
-use checkpoint_dsl::{Builder, Error};
-use checkpoint_dsl::{axis_byte, cut_axis, extent, squeezed};
+use poem::import::format::{Format, has, read_one};
+use poem::import::{Builder, Error};
+use poem::import::{axis_byte, cut_axis, extent, squeezed};
 
 const HEAD: &str = "model.language_model.layers.45.";
 const VISUAL: &str = "model.visual.";
@@ -372,7 +372,7 @@ fn kda(
     b.read_expr(&k.dt_bias, || {
         Ok(Expr::src(n("self_attn.dt_bias")).transmute(TensorType::new(
             vec![extent(u64::from(k.heads)), extent(u64::from(k.head_dim))],
-            checkpoint_dsl::encoding(poem_dsl::Dtype::F32),
+            poem::import::encoding(poem::Dtype::F32),
         )))
     })?;
     b.read(&k.a_log, n("self_attn.A_log"))?;

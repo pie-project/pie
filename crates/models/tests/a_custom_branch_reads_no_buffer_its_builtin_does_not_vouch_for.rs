@@ -3,7 +3,7 @@
 //! nothing about which lanes hold adapter routes or a mask.
 
 use models::adapter::{Adapters, banks};
-use poem_dsl::{
+use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, Value, Weight, fact, ops, switch,
     trace_hybrid,
 };

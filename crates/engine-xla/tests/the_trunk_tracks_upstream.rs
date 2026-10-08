@@ -22,8 +22,8 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use engine_xla::{Boot, DeviceBoot, Lane, Shell};
+use poem::{Operands, Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Operands, Platform, Request};
 
 /// The `image-captioning` inferlet's text turns without the picture.
 const PROMPT: [u32; 37] = [

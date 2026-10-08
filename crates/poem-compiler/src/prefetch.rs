@@ -242,7 +242,7 @@ fn region_of(compiled: &CompiledModel, node: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use poem_dsl::Platform;
+    use poem::Platform;
 
     use super::*;
 

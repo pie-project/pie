@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 
+use poem::Platform;
 use poem_compiler::{
     Budget, Budgets, CompiledModel, DeviceProfile, Error, PATCH_LATTICE_FLOOR, PatchLadder,
     compile_axes,
 };
-use poem_dsl::Platform;
 use poem_ir::{ParamSource, RowAxis, Trace, Ty};
 
 pub const PLATFORMS: [Platform; 4] = [

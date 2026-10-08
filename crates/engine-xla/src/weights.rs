@@ -920,7 +920,7 @@ impl Weights {
             .collect::<Result<_>>()?;
         let mut pairings: BTreeMap<usize, Pairing> = BTreeMap::new();
         for (at, param) in trace.params.iter().enumerate() {
-            let Some(&scales) = index.get(poem_dsl_scales(&param.name).as_str()) else {
+            let Some(&scales) = index.get(poem_scales(&param.name).as_str()) else {
                 continue;
             };
             if trace.params[scales].dtype == param.dtype && param.dtype == Dtype::Bf16 {
@@ -941,7 +941,7 @@ impl Weights {
                 at,
                 Pairing {
                     scales,
-                    biases: index.get(poem_dsl_biases(&param.name).as_str()).copied(),
+                    biases: index.get(poem_biases(&param.name).as_str()).copied(),
                     group,
                     bits,
                 },
@@ -1056,10 +1056,10 @@ impl Weights {
     }
 }
 
-fn poem_dsl_scales(of: &str) -> String {
+fn poem_scales(of: &str) -> String {
     format!("{of}{}", dtype::SCALES)
 }
 
-fn poem_dsl_biases(of: &str) -> String {
+fn poem_biases(of: &str) -> String {
     format!("{of}{}", dtype::BIASES)
 }

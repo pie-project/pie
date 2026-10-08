@@ -1,6 +1,6 @@
 use engine_cuda::window::Windows;
+use poem::Platform;
 use poem_compiler::{Budget, CompiledModel, DeviceProfile, compile};
-use poem_dsl::Platform;
 use poem_exec::fire::{WindowTable, fallback};
 use poem_ir::Trace;
 

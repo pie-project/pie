@@ -1,11 +1,11 @@
 mod common;
 
-use poem_compiler::Placement;
-use poem_dsl::fact;
-use poem_dsl::{
+use poem::fact;
+use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, RaggedMask, Request, Stream, Value, Weight, ops, seam,
     trace_hybrid,
 };
+use poem_compiler::Placement;
 use poem_ir::{Attention, Def, Layout, Linear, Operation, RuntimeInput};
 
 const AUDIO: u64 = 32;

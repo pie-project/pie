@@ -5,7 +5,7 @@ use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{Expr, Partition, TensorType};
 use models::flux_2::{model, vae};
 use models::{PortKind, ReadoutKind};
-use poem_dsl::{Def, Dim, Dtype, Operation, Platform, Request, Stream, Trace, Ty, seam};
+use poem::{Def, Dim, Dtype, Operation, Platform, Request, Stream, Trace, Ty, seam};
 use poem_ir::{GridRule, ParamLayout, Seam, Spatial};
 
 const KLEIN: &str = "flux2-klein-4b-bf16-kv-bf16";
@@ -98,7 +98,7 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
         !trace(MINI)
             .values
             .iter()
-            .any(|v| matches!(v.def, Def::Input(poem_dsl::RuntimeInput::Voxels { .. }))),
+            .any(|v| matches!(v.def, Def::Input(poem::RuntimeInput::Voxels { .. }))),
         "and reads no voxel port"
     );
 }
@@ -110,7 +110,7 @@ fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
         .iter()
         .filter_map(|v| match (&v.def, &v.ty) {
             (
-                Def::Input(poem_dsl::RuntimeInput::Voxels { port, channels }),
+                Def::Input(poem::RuntimeInput::Voxels { port, channels }),
                 Ty::Tensor { dtype, .. },
             ) => Some((*port, *channels, format!("{dtype:?}"))),
             _ => None,
@@ -276,7 +276,7 @@ fn the_shapes_are_the_flux2_autoencoders() {
 
 fn each_vae_lane_has_a_class_of_its_own() {
     let plan = trace(KLEIN);
-    let classes = poem_dsl::resolve_classes(&plan).expect("every merge resolves");
+    let classes = poem::resolve_classes(&plan).expect("every merge resolves");
     let facts = row(KLEIN).generative.as_ref().expect("facts");
     let class_of = |name: &str, stream: Stream| {
         let r = reading(facts, name);

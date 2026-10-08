@@ -5,7 +5,7 @@ use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{ModelContract, Partition, TensorType};
 use checkpoint::plan::StorageTarget;
 use models::flux_2::model::{self, Dims};
-use poem_dsl::Platform;
+use poem::Platform;
 use ztensor::Leaf;
 use ztensor::provide::{Catalog, Entry, Location, Store, StoreId};
 

@@ -22,4 +22,4 @@ poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 
 [dev-dependencies]
 models = { path = "../models" }
-poem-dsl = { package = "pie-poem-dsl", path = "../poem-dsl" }
+poem = { package = "pie-poem", path = "../poem" }

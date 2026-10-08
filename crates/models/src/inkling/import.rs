@@ -1,6 +1,6 @@
 use checkpoint::contract::{Expr, ModelContract, TensorType};
-use checkpoint_dsl::{Builder, Error, extents};
-use poem_dsl::Platform;
+use poem::Platform;
+use poem::import::{Builder, Error, extents};
 
 use super::model::{Mlp, Model};
 

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use models::mini_dit::forward::{Tap, generative};
 use models::mini_dit::model::{self, Model};
-use poem_dsl::{Def, Dim, Dtype, Platform, RuntimeInput, Trace, Ty, seam, trace_hybrid};
+use poem::{Def, Dim, Dtype, Platform, RuntimeInput, Trace, Ty, seam, trace_hybrid};
 
 fn traced(tap: Option<&str>) -> Trace {
     let text = Model::mini(Dtype::Bf16).tapped(tap.map(str::to_string));

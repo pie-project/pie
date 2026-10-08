@@ -39,8 +39,8 @@ pub fn rect(map: &ArenaMap, value: ValueId, rows: poem_compiler::FireRows) -> Op
 
 #[cfg(test)]
 mod tests {
+    use poem::Platform;
     use poem_compiler::{Budget, DeviceProfile, compile};
-    use poem_dsl::Platform;
     use poem_ir::{Def, Ty};
 
     use super::*;

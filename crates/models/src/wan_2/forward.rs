@@ -1,6 +1,6 @@
-use poem_dsl::fact;
-use poem_dsl::ops::spatial;
-use poem_dsl::{
+use poem::fact;
+use poem::ops::spatial;
+use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, RaggedMask, RopeForm, Stream, Value,
     Weight, ops, seam,
 };

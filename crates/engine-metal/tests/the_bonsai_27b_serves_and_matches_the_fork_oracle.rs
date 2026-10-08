@@ -58,8 +58,8 @@ use engine_metal::weights::AdapterPlane;
 use engine_metal::{Boot, Lane, Shell};
 use models::qwen_3::model::Model;
 use models::qwen_3::rotation::{self, BONSAI_SIGN_WIDTHS};
+use poem::{Dtype, Platform, Request, trace_hybrid};
 use poem_compiler::Budget;
-use poem_dsl::{Dtype, Platform, Request, trace_hybrid};
 
 const PROMPT_IDS: [u32; 5] = [760, 6511, 314, 9338, 369];
 const ORACLE_ARGMAX: u32 = 11751;
@@ -225,7 +225,7 @@ fn the_bonsai_27b_serves_ptq1_0_and_matches_the_fork_oracle() {
     // The serve contract reconstructed from the artifact's own planes (Registered
     // sign banks are skipped — they are host-provided below).
     let src = ztensor_compat::index(&zt).expect("open the served artifact");
-    let contract = checkpoint_dsl::own_contract(&src, &trace.params, 1, Platform::Metal)
+    let contract = poem::import::own_contract(&src, &trace.params, 1, Platform::Metal)
         .expect("the artifact holds every checkpoint plane the trace reads");
     drop(src);
     let planes =

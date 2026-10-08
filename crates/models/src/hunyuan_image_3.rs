@@ -7,7 +7,7 @@ pub mod tokenizer;
 use model::Model;
 
 use crate::catalog::Refused;
-use poem_dsl::Dtype;
+use poem::Dtype;
 
 pub const ARCH: &str = "hunyuan_image_3_moe";
 

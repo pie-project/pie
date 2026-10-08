@@ -23,3 +23,12 @@ pub fn templates() -> Vec<TemplateRow> {
 pub fn template_of(name: &str) -> Option<TemplateFn> {
     crate::catalog::parse(name).map(|(entry, _)| entry.template)
 }
+
+/// The template a package names `name`.
+#[must_use]
+pub fn named(name: &str) -> Option<TemplateFn> {
+    match name {
+        "muse_glimmer" => Some(crate::muse_glimmer::template::muse_glimmer),
+        _ => None,
+    }
+}

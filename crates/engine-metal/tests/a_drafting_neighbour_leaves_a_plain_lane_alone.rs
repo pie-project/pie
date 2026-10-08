@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use engine_metal::{Boot, Lane, Shell};
+use poem::{Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Platform, Request};
 
 const SKU: &str = "dsv4-flash-mini-mtp-u4g64-u2g64-mxfp4-kv-bf16";
 const PROMPT_A: &[u32] = &[0, 671, 6102, 294, 8760, 344, 270, 4593, 294];
@@ -44,7 +44,7 @@ fn load(artifact: &PathBuf) -> Shell {
     let sku = models::deployment(SKU).expect("the catalog ships the drafting mini row");
     let trace = sku.trace(Platform::Metal);
     let source = ztensor_compat::index(artifact).expect("the artifact opens");
-    let contract = checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Metal)
+    let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Metal)
         .unwrap_or_else(|why| panic!("the artifact holds every plane of {SKU}: {why}"));
     drop(source);
     Shell::load(Boot {

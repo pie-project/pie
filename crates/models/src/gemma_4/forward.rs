@@ -1,7 +1,5 @@
-use poem_dsl::fact;
-use poem_dsl::{
-    Dtype, ForwardHybrid, HybridSpec, Input, MropeForm, Value, ValueId, Weight, ops, seam,
-};
+use poem::fact;
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, MropeForm, Value, ValueId, Weight, ops, seam};
 
 use super::model::{Attn, AttnBanks, Clippable, Draft, Model, Reading, Tower};
 

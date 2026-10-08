@@ -1,5 +1,5 @@
 use models::catalog::{Deploy, Drafter, Part};
-use poem_dsl::{Dtype, Platform};
+use poem::{Dtype, Platform};
 
 /// Every catalog row is one deployment of one model: the model checks it,
 /// and names it by the row's name.

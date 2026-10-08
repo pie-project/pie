@@ -1,4 +1,4 @@
-use poem_dsl::{Dtype, Weight};
+use poem::{Dtype, Weight};
 
 pub const CHANNELS: u32 = 16;
 pub const PATCH: u32 = 2;

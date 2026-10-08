@@ -3,7 +3,7 @@ pub mod import;
 pub mod model;
 
 use model::{Mix, Model};
-use poem_dsl::Dtype;
+use poem::Dtype;
 
 use crate::qwen_3::{template, tokenizer};
 

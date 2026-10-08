@@ -1,4 +1,4 @@
-use poem_dsl::{Attention, Operation, Platform, seam};
+use poem::{Attention, Operation, Platform, seam};
 
 const PLATFORMS: [Platform; 4] = [
     Platform::Cuda,
@@ -7,7 +7,7 @@ const PLATFORMS: [Platform; 4] = [
     Platform::Vulkan,
 ];
 
-fn count(trace: &poem_dsl::Trace, wanted: impl Fn(&Operation) -> bool) -> usize {
+fn count(trace: &poem::Trace, wanted: impl Fn(&Operation) -> bool) -> usize {
     trace.nodes.iter().filter(|node| wanted(&node.op)).count()
 }
 

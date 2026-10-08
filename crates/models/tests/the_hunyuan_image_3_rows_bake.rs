@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use models::hunyuan_image_3::forward::{DENOISE, ENCODE, IMAGE_IN, IMAGE_OUT};
 use models::hunyuan_image_3::model::{self, Dims};
 use models::{PortKind, ReadoutKind, ScheduleKind};
-use poem_dsl::{
+use poem::{
     Attention, Def, Elementwise, Linear, Operation, Platform, Request, RopeForm, RuntimeInput,
     Stream, Trace, seam,
 };
@@ -195,7 +195,7 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
 fn each_lane_the_facts_list_classifies_into_its_own_class() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
-        let classes = poem_dsl::resolve_classes(&plan)
+        let classes = poem::resolve_classes(&plan)
             .unwrap_or_else(|why| panic!("{sku}: a merge does not resolve: {why:?}"));
         let facts = row(sku).generative.as_ref().expect("generative facts");
         let _catalog = row(sku);

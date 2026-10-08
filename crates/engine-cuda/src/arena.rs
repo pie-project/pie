@@ -99,8 +99,8 @@ pub fn carve(base: u64, map: &ArenaMap, rows: poem_compiler::FireRows) -> SlotTa
 
 #[cfg(test)]
 mod tests {
+    use poem::Platform;
     use poem_compiler::{Budget, DeviceProfile, compile};
-    use poem_dsl::Platform;
 
     use super::*;
 

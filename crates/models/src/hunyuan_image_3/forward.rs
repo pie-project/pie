@@ -1,6 +1,6 @@
-use poem_dsl::fact;
-use poem_dsl::ops::spatial;
-use poem_dsl::{
+use poem::fact;
+use poem::ops::spatial;
+use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, RopeForm, Stream, Value,
     Weight, ops, seam,
 };
@@ -154,7 +154,7 @@ impl ForwardHybrid for Model {
 
 /// The canvas rows: the denoise reading's, with the mask the canvas attends
 /// through. A denoise lane sent without one reads as text.
-fn on_canvas() -> poem_dsl::Predicate {
+fn on_canvas() -> poem::Predicate {
     fact::reading("denoise") & fact::has(fact::Mask)
 }
 

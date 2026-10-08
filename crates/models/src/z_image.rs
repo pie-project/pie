@@ -6,7 +6,7 @@ pub mod tokenizer;
 pub mod vae;
 
 use model::Model;
-use poem_dsl::Dtype;
+use poem::Dtype;
 
 pub const ARCH: &str = "z_image";
 

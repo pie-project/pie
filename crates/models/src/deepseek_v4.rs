@@ -5,7 +5,7 @@ pub mod template;
 pub mod tokenizer;
 
 use model::{Model, Routed};
-use poem_dsl::Dtype;
+use poem::Dtype;
 
 use crate::catalog::{Drafter, Entry, Refused};
 

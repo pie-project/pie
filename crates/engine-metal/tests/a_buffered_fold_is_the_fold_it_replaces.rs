@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use engine::fire::{FoldLen, RsReset, RsVerb};
 use engine_metal::serve::Seated;
 use engine_metal::{Boot, Lane, Shell};
+use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Dtype, Platform, Request};
 
 const WINDOW: usize = 6;
 
@@ -22,7 +22,7 @@ fn fixture() -> Option<PathBuf> {
 }
 
 fn word(query_len: u32) -> u64 {
-    poem_dsl::trace_hybrid(
+    poem::trace_hybrid(
         "qwen4-micro",
         &models::qwen_4::model::Model::flash_micro(Dtype::Bf16, Dtype::Bf16, 1),
         Platform::Metal,
@@ -43,7 +43,7 @@ fn ready() -> Option<Shell> {
         return None;
     };
     let micro = models::qwen_4::model::Model::flash_micro(Dtype::Bf16, Dtype::Bf16, 1);
-    let trace = poem_dsl::trace_hybrid("qwen4-micro", &micro, Platform::Metal);
+    let trace = poem::trace_hybrid("qwen4-micro", &micro, Platform::Metal);
     let source =
         ztensor_compat::index(fixture.join("model.safetensors")).expect("the fixture opens");
     let contract = micro

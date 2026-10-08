@@ -1,7 +1,7 @@
 use checkpoint::contract::{Expr, ModelContract, TensorContract, TensorType};
 use checkpoint::types::Encoding;
-use checkpoint_dsl::{Builder, Error, encoding, extents, stored_encoding};
-use poem_dsl::{Platform, Weight};
+use poem::import::{Builder, Error, encoding, extents, stored_encoding};
+use poem::{Platform, Weight};
 
 use super::model::{Conv, Embedder, GroupNorm, Linear, Model, ResBlock};
 
@@ -248,7 +248,7 @@ fn signs(b: &mut Builder, src: &ztensor::Source, w: &Weight, seed: &str) -> Resu
     let shape = extents(w);
     let half = usize::try_from(shape[0] / 2).expect("a sign table's half fits");
     let values: Vec<f32> = [1.0f32, -1.0].iter().flat_map(|v| vec![*v; half]).collect();
-    let joined = checkpoint_dsl::constant(&w.name, &values, vec![2 * half as i64, 1], dtype)?;
+    let joined = poem::import::constant(&w.name, &values, vec![2 * half as i64, 1], dtype)?;
     let want = encoding(w.dtype);
     let expr = if want == stored {
         joined

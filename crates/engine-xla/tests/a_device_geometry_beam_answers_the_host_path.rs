@@ -18,7 +18,7 @@ use eta_ir::container::{
 use eta_ir::op::{IntrinsicId, Op};
 use eta_ir::registry::{GeometryClass, Port, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
-use poem_dsl::{
+use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, Trace, Value, Weight, ops, seam,
     trace_hybrid,
 };

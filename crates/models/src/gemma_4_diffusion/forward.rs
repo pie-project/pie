@@ -1,4 +1,4 @@
-use poem_dsl::{ForwardHybrid, HybridSpec, Input, Value};
+use poem::{ForwardHybrid, HybridSpec, Input, Value};
 
 use super::model::Model;
 

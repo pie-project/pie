@@ -4,10 +4,8 @@ use std::path::{Path, PathBuf};
 
 use checkpoint::contract::ModelContract;
 use engine_cuda::{Boot, Diagnostics, Graphs, Knobs, Lane, Shell};
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, trace_hybrid};
 use poem_compiler::Budget;
-use poem_dsl::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, trace_hybrid,
-};
 use poem_ir::{Fused, Operation, Trace};
 
 const VOCAB: u32 = 1000;
@@ -168,7 +166,7 @@ fn fixture() -> Fixture {
     let container = dir.join("micro.zt");
     write_checkpoint(&container);
     let source = ztensor::Source::open(&container).expect("the fixture opens");
-    let contract = checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Cuda)
+    let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
         .expect("a container of the plan's own planes is read by the plan's own names");
     drop(source);
     Fixture {

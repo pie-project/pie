@@ -13,3 +13,12 @@ pub fn contracts() -> Vec<ContractRow> {
 pub fn contract_of(name: &str) -> Option<&'static Contract> {
     crate::catalog::parse(name).map(|(entry, _)| entry.tokenizer)
 }
+
+/// The tokenizer contract a package names `name`.
+#[must_use]
+pub fn named(name: &str) -> Option<&'static Contract> {
+    match name {
+        "muse_glimmer" => Some(&crate::muse_glimmer::tokenizer::CONTRACT),
+        _ => None,
+    }
+}

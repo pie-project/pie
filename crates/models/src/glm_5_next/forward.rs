@@ -1,8 +1,8 @@
-use poem_dsl::fact;
-use poem_dsl::{Dtype, ForwardHybrid, HybridSpec, Input, Value, ops, seam};
+use poem::fact;
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Value, ops, seam};
 
 use super::model::{Hyper, Indexer, Kda, Mix, Mixer, Mla, Mlp, Model, Tower};
-use poem_dsl::MropeForm;
+use poem::MropeForm;
 
 #[derive(Clone, Copy)]
 enum Arms {

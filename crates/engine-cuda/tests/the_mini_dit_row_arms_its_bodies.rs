@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use checkpoint::contract::ModelContract;
 use engine::Engine;
 use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
-use poem_dsl::{Platform, Trace};
+use poem::{Platform, Trace};
 
 const SKU: &str = "mini-dit-bf16-kv-bf16";
 
@@ -18,7 +18,7 @@ fn artifact() -> Option<PathBuf> {
 
 fn contract_for(trace: &Trace, path: &Path) -> Result<ModelContract, String> {
     let source = ztensor_compat::index(path).map_err(|why| why.to_string())?;
-    checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Cuda)
+    poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
         .map_err(|why| why.to_string())
 }
 

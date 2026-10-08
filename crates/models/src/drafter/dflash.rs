@@ -1,8 +1,6 @@
 use checkpoint::contract::{Expr, TensorType};
-use checkpoint_dsl::{Builder, Error, extents};
-use poem_dsl::{
-    BlockDrafter, Dtype, HybridSpec, Input, KvSpace, Predicate, Value, Weight, ops, seam,
-};
+use poem::import::{Builder, Error, extents};
+use poem::{BlockDrafter, Dtype, HybridSpec, Input, KvSpace, Predicate, Value, Weight, ops, seam};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Trunk {
@@ -268,9 +266,9 @@ impl DFlash {
     #[must_use]
     pub fn block_rows(&self) -> Predicate {
         if self.reads_a_mask() {
-            poem_dsl::fact::block_draft() & poem_dsl::fact::has(poem_dsl::fact::Mask)
+            poem::fact::block_draft() & poem::fact::has(poem::fact::Mask)
         } else {
-            poem_dsl::fact::block_draft()
+            poem::fact::block_draft()
         }
     }
 

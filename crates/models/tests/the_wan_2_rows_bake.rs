@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use models::wan_2::model::{self, Dims};
 use models::{PortKind, ReadoutKind, ScheduleKind};
-use poem_dsl::{
+use poem::{
     Attention, CacheRow, Def, Dim, Dtype, Elementwise, GeomKind, Operands, Operation, Platform,
     RaggedMask, Request, RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
 };
@@ -233,7 +233,7 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
 fn each_lane_the_facts_list_classifies_into_its_own_class() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
-        let classes = poem_dsl::resolve_classes(&plan)
+        let classes = poem::resolve_classes(&plan)
             .unwrap_or_else(|why| panic!("{sku}: a merge does not resolve: {why:?}"));
         let facts = row(sku).generative.as_ref().expect("facts");
         let _catalog = row(sku);

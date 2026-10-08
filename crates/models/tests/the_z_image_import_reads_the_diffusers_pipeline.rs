@@ -6,7 +6,7 @@ use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{Expr, ModelContract, TensorType};
 use checkpoint::plan::StorageTarget;
 use models::z_image::model::{self, Dims};
-use poem_dsl::Platform;
+use poem::Platform;
 use ztensor::Leaf;
 use ztensor::provide::{Catalog, Entry, Location, Store, StoreId};
 

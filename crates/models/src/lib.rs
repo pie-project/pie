@@ -29,9 +29,9 @@ pub mod z_image;
 use std::sync::LazyLock;
 
 use checkpoint::contract::ModelContract;
-use poem_dsl::Dtype;
+use poem::Dtype;
 
-pub use poem_dsl::{Platform, Request, Stream, biases_name, scales_name};
+pub use poem::{Platform, Request, Stream, biases_name, scales_name};
 
 #[must_use]
 pub fn word(dtype: Dtype) -> String {
@@ -223,18 +223,18 @@ impl Deployment {
         &self,
         src: &ztensor::Source,
         platform: Platform,
-    ) -> Result<ModelContract, checkpoint_dsl::Error> {
+    ) -> Result<ModelContract, poem::import::Error> {
         (self.entry.import)(&self.deploy, src, platform)
     }
 }
 
 /// An import reads a whole checkpoint, which one rank of a split row does not
 /// land: its share is banded out of a stamped artifact instead.
-pub fn whole(tp: u32) -> Result<(), checkpoint_dsl::Error> {
+pub fn whole(tp: u32) -> Result<(), poem::import::Error> {
     if tp == 1 {
         return Ok(());
     }
-    Err(checkpoint_dsl::Error::Illegible {
+    Err(poem::import::Error::Illegible {
         name: String::new(),
         detail: format!(
             "an import states the WHOLE checkpoint and this contract is built for {tp} \
@@ -244,7 +244,7 @@ pub fn whole(tp: u32) -> Result<(), checkpoint_dsl::Error> {
 }
 
 static FAMILIES: LazyLock<Vec<Vec<catalog::Entry>>> = LazyLock::new(|| {
-    vec![
+    let mut families = vec![
         deepseek_v4::entries(),
         flux_2::entries(),
         gemma_4::entries(),
@@ -255,7 +255,6 @@ static FAMILIES: LazyLock<Vec<Vec<catalog::Entry>>> = LazyLock::new(|| {
         hunyuan_image_3::entries(),
         inkling::entries(),
         kimi_k3::entries(),
-        muse_glimmer::entries(),
         qwen_3::entries(),
         qwen_4::entries(),
         z_image::entries(),
@@ -263,7 +262,9 @@ static FAMILIES: LazyLock<Vec<Vec<catalog::Entry>>> = LazyLock::new(|| {
         minimax_h3::entries(),
         ltx_2::entries(),
         mini_dit::entries(),
-    ]
+    ];
+    families.extend(star::families());
+    families
 });
 
 /// Every model of the catalog, whole and miniature alike.
@@ -341,7 +342,7 @@ pub fn fits<'a>(
 ) -> impl Iterator<
     Item = (
         &'static Deployment,
-        Result<ModelContract, checkpoint_dsl::Error>,
+        Result<ModelContract, poem::import::Error>,
     ),
 > + 'a {
     let mut candidates: Vec<&'static Deployment> = deployments().collect();
@@ -362,7 +363,7 @@ pub fn fits<'a>(
 }
 
 pub(crate) fn dense(banks: Dtype) -> Dtype {
-    poem_dsl::compute_dtype(banks)
+    poem::compute_dtype(banks)
         .unwrap_or_else(|| panic!("`{banks:?}` is not a weight representation a family declares"))
 }
 

@@ -1,4 +1,4 @@
-use poem_dsl::{Collective, Def, Dim, Linear, Operation, Platform, Shard, Trace, Ty, ValueId};
+use poem::{Collective, Def, Dim, Linear, Operation, Platform, Shard, Trace, Ty, ValueId};
 
 fn banded(trace: &Trace, w: ValueId) -> bool {
     match trace.values[w.0 as usize].def {

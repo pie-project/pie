@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use models::mini_dit::model;
 use models::{PortKind, ReadoutKind};
-use poem_dsl::{
+use poem::{
     Attention, Def, Dim, Dtype, Elementwise, GeomKind, Guard, Operands, Operation, Platform,
     Request, RopeForm, RuntimeInput, Stream, Trace, Ty, ValueId, seam,
 };
@@ -124,7 +124,7 @@ fn the_row_reads_exactly_the_five_ports_it_declares() {
 
 fn each_stream_classifies_into_its_own_class_and_every_merge_resolves() {
     let plan = trace(Platform::Cuda);
-    let classes = poem_dsl::resolve_classes(&plan).expect("every merge resolves");
+    let classes = poem::resolve_classes(&plan).expect("every merge resolves");
     let _row = models::deployment(SKU).expect("the row is in the catalog");
 
     let mut seen = Vec::new();

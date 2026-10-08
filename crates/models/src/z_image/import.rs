@@ -1,8 +1,8 @@
 use checkpoint::contract::{Expr, ModelContract, TensorContract, TensorType};
 use checkpoint::types::Encoding;
-use checkpoint_dsl::format::{Format, read_one};
-use checkpoint_dsl::{Builder, Error, extents, stored_encoding};
-use poem_dsl::{Platform, Weight};
+use poem::import::format::{Format, read_one};
+use poem::import::{Builder, Error, extents, stored_encoding};
+use poem::{Platform, Weight};
 
 use super::model::{Block, Dit, Linear, Model, T_FLIP, TextEncoder};
 use super::vae::{ConvW, Mid, Norm, ResBlock, SHIFT_FACTOR, Vae};
@@ -322,7 +322,7 @@ fn conv_head(
     )?;
     let bias = format!("{stem}.bias");
     let stored = stored_encoding(src, &bias)?;
-    let want = checkpoint_dsl::encoding(c.bias.dtype);
+    let want = poem::import::encoding(c.bias.dtype);
     let head = format!("{}.head", c.bias.name);
     b.push(
         TensorContract::new(
@@ -368,7 +368,7 @@ fn pad_table(b: &mut Builder, src: &ztensor::Source, w: &Weight, token: &str) ->
         Expr::concat(
             0,
             vec![
-                checkpoint_dsl::constant(&w.name, &neg, vec![dim, 1], dtype)?,
+                poem::import::constant(&w.name, &neg, vec![dim, 1], dtype)?,
                 Expr::src(token).transmute(TensorType::raw(vec![dim, 1], dtype)),
             ],
         ),
@@ -390,8 +390,8 @@ fn constant(
         });
     };
     let cells = usize::try_from(extents(w).iter().product::<i64>()).expect("a table that fits");
-    let raw = checkpoint_dsl::constant(&w.name, &vec![value; cells], extents(w), dtype)?;
-    let want = checkpoint_dsl::encoding(w.dtype);
+    let raw = poem::import::constant(&w.name, &vec![value; cells], extents(w), dtype)?;
+    let want = poem::import::encoding(w.dtype);
     let expr = if want == stored {
         raw
     } else {

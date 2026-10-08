@@ -21,8 +21,8 @@ use std::time::Instant;
 
 use engine_xla::DeviceBoot;
 use engine_xla::serve::{Boot, Lane, Shell};
+use poem::{Dtype, ParamSource, Platform, Request, Weight};
 use poem_compiler::Budget;
-use poem_dsl::{Dtype, ParamSource, Platform, Request, Weight};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -45,13 +45,13 @@ fn main() {
     );
     if std::env::var_os("PIE_E2E_WRITE_ONLY").is_some() {
         let source = ztensor_compat::index(&path).expect("the checkpoint indexes");
-        checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Xla)
+        poem::import::own_contract(&source, &trace.params, 1, Platform::Xla)
             .unwrap_or_else(|why| panic!("the random checkpoint reads: {why}"));
         println!("{}: written and read", sku.name);
         return;
     }
     let source = ztensor_compat::index(&path).expect("the checkpoint indexes");
-    let contract = checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Xla)
+    let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Xla)
         .unwrap_or_else(|why| panic!("the random checkpoint reads: {why}"));
     drop(source);
 
@@ -70,7 +70,7 @@ fn main() {
 
 fn run(
     sku: &models::Deployment,
-    trace: poem_dsl::Trace,
+    trace: poem::Trace,
     contract: &checkpoint::contract::ModelContract,
     path: &Path,
 ) -> Result<String, String> {
@@ -305,7 +305,7 @@ fn correlation(a: &[f32], b: &[f32]) -> f64 {
 }
 
 /// Every checkpoint param at small random values; answers the bytes written.
-fn write_random(trace: &poem_dsl::Trace, path: &Path) -> u64 {
+fn write_random(trace: &poem::Trace, path: &Path) -> u64 {
     let quantized = |d: Dtype| {
         matches!(
             d,
@@ -328,7 +328,7 @@ fn write_random(trace: &poem_dsl::Trace, path: &Path) -> u64 {
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
     let mut total = 0u64;
     // A canonical container takes its tensors in name order.
-    let mut params: Vec<&poem_dsl::Param> = trace.params.iter().collect();
+    let mut params: Vec<&poem::Param> = trace.params.iter().collect();
     params.sort_by(|a, b| a.name.cmp(&b.name));
     for param in params {
         if param.source != ParamSource::Checkpoint || companions.contains(&param.name) {

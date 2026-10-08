@@ -1,0 +1,27 @@
+[package]
+name = "pie-poem"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "The language a model is written in: weight declarations, the forward pass recorded over the typed IR, the import contract reading a checkpoint onto the weights, and the Starlark packages a model is written as. It names no backend and reaches no device."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "poem"
+path = "src/lib.rs"
+
+[dependencies]
+poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
+checkpoint = { path = "../checkpoint" }
+ztensor = { workspace = true }
+starlark = { git = "https://github.com/facebook/starlark-rust", rev = "2521d846099f250c8ac1eff1c8e2431f9df33c15" }
+allocative = { git = "https://github.com/facebook/buck2.git", branch = "main" }
+starlark_derive = { git = "https://github.com/facebook/starlark-rust", rev = "2521d846099f250c8ac1eff1c8e2431f9df33c15" }
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

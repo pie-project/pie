@@ -1,12 +1,12 @@
 use checkpoint::contract::{Expr, ModelContract, TensorContract, TensorType};
 use checkpoint::types::Encoding;
-use poem_dsl::{Dtype, Weight};
+use poem::{Dtype, Weight};
 
 use super::model::{Kda, Mixer, Mla, Mlp, Model};
-use checkpoint_dsl::format::{Format, has, read_one};
-use checkpoint_dsl::{Builder, Error, encoding, extents, scaling};
-use checkpoint_dsl::{axis_byte, cut_axis, squeezed};
-use poem_dsl::Platform;
+use poem::Platform;
+use poem::import::format::{Format, has, read_one};
+use poem::import::{Builder, Error, encoding, extents, scaling};
+use poem::import::{axis_byte, cut_axis, squeezed};
 
 const HF_EMBED: &str = "language_model.model.embed_tokens.weight";
 
@@ -314,7 +314,7 @@ impl Model {
         if w.dtype == Dtype::Mxfp4 && first.ends_with(".weight_packed") {
             return packed_bank(b, src, w, &names);
         }
-        let read = match checkpoint_dsl::stored_encoding(src, first)? {
+        let read = match poem::import::stored_encoding(src, first)? {
             Encoding::Raw(dtype) => dtype,
             Encoding::Quant(spec) => spec.logical_dtype,
         };
@@ -367,7 +367,7 @@ fn packed_bank(
         )));
     }
     let pairing = scaling(w);
-    let counted = checkpoint_dsl::divided(
+    let counted = poem::import::divided(
         &extents(w),
         pairing.channel_axis,
         pairing.group_size,
@@ -390,7 +390,7 @@ fn packed_bank(
     b.extend([
         TensorContract::inferred(w.name.clone(), codes, encoding(Dtype::Mxfp4)),
         TensorContract::new(
-            poem_dsl::scales_name(&w.name),
+            poem::scales_name(&w.name),
             scales,
             counted,
             encoding(Dtype::E8m0),
