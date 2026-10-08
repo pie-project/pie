@@ -63,6 +63,17 @@ impl<'a, T> Format<'a, T> {
         }
     }
 
+    /// The format's name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Reads the checkpoint as this format, whether or not it is one.
+    pub fn read(self) -> Result<T, Error> {
+        (self.read)()
+    }
+
     /// What a checkpoint of this format states of the model it holds: a
     /// checkpoint stating another value is another model's.
     #[must_use]

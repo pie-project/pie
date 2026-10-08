@@ -81,17 +81,32 @@ fn weight_methods(builder: &mut MethodsBuilder) {
     /// The weight's rows are banks a rank holds a whole of, cut into
     /// `segments` along them.
     fn packed(this: &WeightValue, segments: UnpackList<u64>) -> anyhow::Result<WeightValue> {
-        Ok(WeightValue(this.0.clone().packed(segments.items)))
+        crate::star::forward::dsl("packed", || {
+            WeightValue(this.0.clone().packed(segments.items))
+        })
+    }
+
+    /// The weight is a bank of experts, each one's rows cut into
+    /// `segments`, a rank holding a share of every expert.
+    fn bank(this: &WeightValue, segments: UnpackList<u64>) -> anyhow::Result<WeightValue> {
+        crate::star::forward::dsl("bank", || WeightValue(this.0.clone().bank(segments.items)))
+    }
+
+    /// A conv's weight, its taps major and `c_in` inputs minor.
+    fn conv_taps_major(this: &WeightValue, c_in: u32, taps: u32) -> anyhow::Result<WeightValue> {
+        crate::star::forward::dsl("conv_taps_major", || {
+            WeightValue(this.0.clone().conv_taps_major(c_in, taps))
+        })
     }
 
     /// The weight is cut along its rows between ranks.
     fn columns(this: &WeightValue) -> anyhow::Result<WeightValue> {
-        Ok(WeightValue(this.0.clone().columns()))
+        crate::star::forward::dsl("columns", || WeightValue(this.0.clone().columns()))
     }
 
     /// The weight is cut along its last axis between ranks.
     fn rows(this: &WeightValue) -> anyhow::Result<WeightValue> {
-        Ok(WeightValue(this.0.clone().rows()))
+        crate::star::forward::dsl("rows", || WeightValue(this.0.clone().rows()))
     }
 
     /// The weight is a bank the host registers, not one a checkpoint holds.

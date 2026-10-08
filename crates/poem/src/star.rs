@@ -4,10 +4,12 @@
 
 #![allow(clippy::too_many_arguments)]
 
+mod bind;
 mod formats;
 mod forward;
 mod layout;
 mod manifest;
+mod ops;
 mod package;
 mod run;
 pub mod values;

@@ -47,6 +47,33 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+thread_local! {
+    static RECORDING: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// What `f` asks of the builders it reads through, each read stated rather
+/// than performed: two imports that ask the same of every builder build the
+/// same contract of any checkpoint.
+pub fn recording<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    RECORDING.with(|r| *r.borrow_mut() = Some(Vec::new()));
+    let out = f();
+    let log = RECORDING
+        .with(|r| r.borrow_mut().take())
+        .unwrap_or_default();
+    (out, log)
+}
+
+fn recorded(what: impl FnOnce() -> String) -> bool {
+    RECORDING.with(|r| match r.borrow_mut().as_mut() {
+        Some(log) => {
+            log.push(what());
+            true
+        }
+        None => false,
+    })
+}
+
 pub struct Builder<'a> {
     src: &'a ztensor::Source,
     tp: u32,
@@ -67,6 +94,10 @@ impl<'a> Builder<'a> {
 
     pub fn read(&mut self, w: &Weight, from: impl Into<String>) -> Result<(), Error> {
         let w = &w.placed(self.platform);
+        let from = from.into();
+        if recorded(|| format!("read {w:?} {from:?}")) {
+            return Ok(());
+        }
         self.whole_checkpoint(w)?;
         let read = planes(self.src, w, from)?;
         self.tensors.extend(read);
@@ -79,6 +110,10 @@ impl<'a> Builder<'a> {
         parts: impl IntoIterator<Item = String>,
     ) -> Result<(), Error> {
         let w = &w.placed(self.platform);
+        let parts: Vec<String> = parts.into_iter().collect();
+        if recorded(|| format!("read_concat {w:?} {parts:?}")) {
+            return Ok(());
+        }
         self.whole_checkpoint(w)?;
         let read = planes_fused(self.src, w, parts)?;
         self.tensors.extend(read);
@@ -91,8 +126,12 @@ impl<'a> Builder<'a> {
         rows: impl IntoIterator<Item = Vec<String>>,
     ) -> Result<(), Error> {
         let w = &w.placed(self.platform);
+        let rows: Vec<Vec<String>> = rows.into_iter().collect();
+        if recorded(|| format!("read_stack {w:?} {rows:?}")) {
+            return Ok(());
+        }
         self.whole_checkpoint(w)?;
-        let read = affine_stacked(self.src, w, rows.into_iter().collect())?;
+        let read = affine_stacked(self.src, w, rows)?;
         self.tensors.extend(read);
         Ok(())
     }
@@ -104,19 +143,17 @@ impl<'a> Builder<'a> {
         over: impl FnOnce(Expr) -> Expr,
     ) -> Result<(), Error> {
         let w = &w.placed(self.platform);
-        self.whole_checkpoint(w)?;
         let from = from.into();
+        let over = over(Expr::src(from.clone()));
+        if recorded(|| format!("read_over {w:?} {from:?} {over:?}")) {
+            return Ok(());
+        }
+        self.whole_checkpoint(w)?;
         let want = encoding(w.dtype);
         let stored = stored_encoding(self.src, &from)?;
         let applied = format!("{}.read", w.name);
         self.tensors.push(
-            TensorContract::new(
-                applied.clone(),
-                over(Expr::src(from.clone())),
-                extents(w),
-                stored.clone(),
-            )
-            .internal(),
+            TensorContract::new(applied.clone(), over, extents(w), stored.clone()).internal(),
         );
         let adapted = ladder(&from, Expr::out(applied), &stored, &want)?;
         self.tensors.push(TensorContract::new(
@@ -130,6 +167,9 @@ impl<'a> Builder<'a> {
 
     pub fn read_expr(&mut self, w: &Weight, expr: Expr) -> Result<(), Error> {
         let w = &w.placed(self.platform);
+        if recorded(|| format!("read_expr {w:?} {expr:?}")) {
+            return Ok(());
+        }
         self.whole_checkpoint(w)?;
         let read = declare(self.src, w, expr)?;
         self.tensors.push(read);
@@ -138,16 +178,26 @@ impl<'a> Builder<'a> {
 
     pub fn read_own(&mut self, w: &Weight) -> Result<(), Error> {
         let w = &w.placed(self.platform);
+        if recorded(|| format!("read_own {w:?}")) {
+            return Ok(());
+        }
         let read = resolve(self.src, claim(w, self.tp))?;
         self.tensors.extend(read);
         Ok(())
     }
 
     pub fn push(&mut self, tensor: TensorContract) {
+        if recorded(|| format!("push {tensor:?}")) {
+            return;
+        }
         self.tensors.push(tensor);
     }
 
     pub fn extend(&mut self, tensors: impl IntoIterator<Item = TensorContract>) {
+        let tensors: Vec<TensorContract> = tensors.into_iter().collect();
+        if recorded(|| format!("extend {tensors:?}")) {
+            return;
+        }
         self.tensors.extend(tensors);
     }
 

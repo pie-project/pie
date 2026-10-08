@@ -4,6 +4,11 @@
 
 use std::cell::RefCell;
 
+use checkpoint::contract::ModelContract;
+
+/// What a format read of a checkpoint.
+pub type Read = Result<ModelContract, crate::import::Error>;
+
 use crate::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Trace, Value};
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
@@ -174,7 +179,40 @@ impl Package {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<checkpoint::contract::ModelContract, crate::import::Error> {
-        use crate::import::format::{Format, read_one};
+        let name = self.name();
+        self.formats(id, deploy, src, platform, |built| {
+            crate::import::format::read_one(name, src, built)
+        })?
+    }
+
+    /// What each format of `formats.star` reads of `src` into `id`'s
+    /// deployment `deploy`, whether or not it recognizes it, by name.
+    pub fn read_each(
+        &self,
+        id: &str,
+        deploy: &Deploy,
+        src: &ztensor::Source,
+        platform: Platform,
+    ) -> Result<Vec<(String, Read)>, crate::import::Error> {
+        self.formats(id, deploy, src, platform, |built| {
+            built
+                .into_iter()
+                .map(|format| (format.name().to_string(), format.read()))
+                .collect()
+        })
+    }
+
+    /// `then` of the formats of `formats.star`, each reading `src` into
+    /// `id`'s deployment `deploy`.
+    fn formats<R>(
+        &self,
+        id: &str,
+        deploy: &Deploy,
+        src: &ztensor::Source,
+        platform: Platform,
+        then: impl FnOnce(Vec<crate::import::format::Format<'_, ModelContract>>) -> R,
+    ) -> Result<R, crate::import::Error> {
+        use crate::import::format::Format;
 
         let illegible = |detail: String| crate::import::Error::Illegible {
             name: id.to_string(),
@@ -250,12 +288,7 @@ impl Package {
                             .with(|r| std::mem::take(&mut *r.borrow_mut()));
                         let mut b = crate::import::Builder::new(src, 1, platform);
                         for read in reads {
-                            match read {
-                                crate::star::formats::Read::One(w, from) => b.read(&w, from)?,
-                                crate::star::formats::Read::Concat(w, from) => {
-                                    b.read_concat(&w, from)?
-                                }
-                            }
+                            read.onto(&mut b)?;
                         }
                         Ok(b.build())
                     };
@@ -280,9 +313,9 @@ impl Package {
                 };
                 built.push(format.stating(states));
             }
-            let read = read_one(self.name(), src, built);
+            let read = then(built);
             crate::star::formats::SOURCE.with(|s| *s.borrow_mut() = None);
-            read
+            Ok(read)
         })
     }
 }

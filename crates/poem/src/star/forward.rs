@@ -8,13 +8,12 @@
 use std::cell::RefCell;
 use std::fmt;
 
-use crate::{HybridSpec, Input, Predicate, Value, ValueId, fact, ops};
+use crate::{HybridSpec, Input, Predicate, Value, ValueId, fact};
 use allocative::Allocative;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::{GlobalsBuilder, Methods, MethodsBuilder};
 use starlark::eval::Evaluator;
 use starlark::starlark_simple_value;
-use starlark::values::float::UnpackFloat;
 use starlark::values::list::UnpackList;
 use starlark::values::none::{NoneOr, NoneType};
 use starlark::values::{
@@ -22,7 +21,7 @@ use starlark::values::{
 };
 use starlark_derive::{starlark_module, starlark_value};
 
-use crate::star::values::{DtypeValue, PredicateValue, predicate, weight};
+use crate::star::values::{DtypeValue, PredicateValue, predicate};
 
 /// The DSL values a forward handles, by place.
 #[derive(Default)]
@@ -42,7 +41,7 @@ fn with<R>(f: impl FnOnce(&mut Trail) -> R) -> R {
 
 /// Runs `op`, a call into the DSL, turning the panic a misuse of it raises
 /// into an error the script's caller is told of.
-fn dsl<R>(what: &str, op: impl FnOnce() -> R) -> anyhow::Result<R> {
+pub(crate) fn dsl<R>(what: &str, op: impl FnOnce() -> R) -> anyhow::Result<R> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(op)).map_err(|panic| {
         let why = panic
             .downcast_ref::<String>()
@@ -171,15 +170,8 @@ pub(crate) fn hold_input(input: Input) -> InputHandle {
     })
 }
 
-fn input_of(handle: InputHandle) -> Input {
+pub(crate) fn input_of(handle: InputHandle) -> Input {
     with(|t| t.inputs[handle.0 as usize].clone())
-}
-
-fn inputs_of(value: Star<'_>) -> anyhow::Result<Input> {
-    value
-        .downcast_ref::<InputHandle>()
-        .map(|h| input_of(*h))
-        .ok_or_else(|| anyhow::anyhow!("inputs were wanted, not {}", value.get_type()))
 }
 
 #[starlark_value(type = "inputs")]
@@ -205,13 +197,6 @@ impl fmt::Display for CacheHandle {
 
 #[starlark_value(type = "cache")]
 impl<'v> StarlarkValue<'v> for CacheHandle {}
-
-fn cache_of(value: Star<'_>) -> anyhow::Result<ValueId> {
-    value
-        .downcast_ref::<CacheHandle>()
-        .map(|h| h.0)
-        .ok_or_else(|| anyhow::anyhow!("a cache was wanted, not {}", value.get_type()))
-}
 
 #[starlark_module]
 fn input_methods(builder: &mut MethodsBuilder) {
@@ -399,14 +384,6 @@ fn spec_methods(builder: &mut MethodsBuilder) {
     }
 }
 
-fn f(x: UnpackFloat) -> f32 {
-    x.0 as f32
-}
-
-fn tuple2<'v>(heap: Heap<'v>, (a, b): (Value, Value)) -> Star<'v> {
-    heap.alloc((hold(a), hold(b)))
-}
-
 #[starlark_module]
 pub(crate) fn forward(builder: &mut GlobalsBuilder) {
     /// Joins arms computed over disjoint rows into one value over all of them.
@@ -425,330 +402,27 @@ pub(crate) fn forward(builder: &mut GlobalsBuilder) {
 /// The `ops` namespace: the DSL's ops a forward writes.
 pub(crate) fn ops(builder: &mut GlobalsBuilder) {
     builder.namespace("ops", |ops| {
-        ops.namespace("attn", attn);
-        ops.namespace("elemwise", elemwise);
-        ops.namespace("layout", layout);
-        ops.namespace("linear", linear);
+        for module in [
+            "attn",
+            "collective",
+            "elemwise",
+            "layout",
+            "linear",
+            "spatial",
+        ] {
+            ops.namespace(module, |ns| {
+                for op in crate::star::ops::OPS
+                    .iter()
+                    .filter(|op| op.module == module)
+                {
+                    ns.set(op.name, crate::star::bind::OpValue(op));
+                }
+            });
+        }
     });
     builder.namespace("fact", facts);
+    crate::star::bind::wholes(builder);
     builder.namespace("seam", seams);
-}
-
-#[starlark_module]
-fn attn(builder: &mut GlobalsBuilder) {
-    fn plan_decode<'v>(
-        #[starlark(require = pos)] inputs: Star<'v>,
-        #[starlark(require = pos)] q_heads: u32,
-        #[starlark(require = pos)] kv_heads: u32,
-        #[starlark(require = pos)] head_dim: u32,
-        #[starlark(require = pos)] window: NoneOr<u32>,
-    ) -> anyhow::Result<ValueHandle> {
-        let i = inputs_of(inputs)?;
-        dsl("plan_decode", || {
-            ops::attn::plan_decode(&i, q_heads, kv_heads, head_dim, window.into_option())
-        })
-        .map(hold)
-    }
-
-    fn plan_prefill<'v>(
-        #[starlark(require = pos)] inputs: Star<'v>,
-        #[starlark(require = pos)] q_heads: u32,
-        #[starlark(require = pos)] kv_heads: u32,
-        #[starlark(require = pos)] head_dim: u32,
-        #[starlark(require = pos)] window: NoneOr<u32>,
-    ) -> anyhow::Result<ValueHandle> {
-        let i = inputs_of(inputs)?;
-        dsl("plan_prefill", || {
-            ops::attn::plan_prefill(&i, q_heads, kv_heads, head_dim, window.into_option())
-        })
-        .map(hold)
-    }
-
-    fn prefill<'v>(
-        #[starlark(require = pos)] q: Star<'v>,
-        #[starlark(require = pos)] plan: Star<'v>,
-        #[starlark(require = pos)] pages: Star<'v>,
-        #[starlark(require = pos)] window: NoneOr<u32>,
-        #[starlark(require = pos)] head_dim: u32,
-        #[starlark(require = pos)] kv_heads: u32,
-        #[starlark(require = pos)] sm_scale: UnpackFloat,
-    ) -> anyhow::Result<ValueHandle> {
-        let (q, plan, pages) = (value_of(q)?, value_of(plan)?, cache_of(pages)?);
-        dsl("prefill", || {
-            ops::attn::prefill(
-                &q,
-                &plan,
-                pages,
-                window.into_option(),
-                head_dim,
-                kv_heads,
-                f(sm_scale),
-            )
-        })
-        .map(hold)
-    }
-
-    fn prefill_lse<'v>(
-        #[starlark(require = pos)] q: Star<'v>,
-        #[starlark(require = pos)] plan: Star<'v>,
-        #[starlark(require = pos)] pages: Star<'v>,
-        #[starlark(require = pos)] window: NoneOr<u32>,
-        #[starlark(require = pos)] head_dim: u32,
-        #[starlark(require = pos)] kv_heads: u32,
-        #[starlark(require = pos)] sm_scale: UnpackFloat,
-        heap: Heap<'v>,
-    ) -> anyhow::Result<Star<'v>> {
-        let (q, plan, pages) = (value_of(q)?, value_of(plan)?, cache_of(pages)?);
-        dsl("prefill_lse", || {
-            ops::attn::prefill_lse(
-                &q,
-                &plan,
-                pages,
-                window.into_option(),
-                head_dim,
-                kv_heads,
-                f(sm_scale),
-            )
-        })
-        .map(|o| tuple2(heap, o))
-    }
-
-    fn masked<'v>(
-        #[starlark(require = pos)] q: Star<'v>,
-        #[starlark(require = pos)] plan: Star<'v>,
-        #[starlark(require = pos)] mask: Star<'v>,
-        #[starlark(require = pos)] pages: Star<'v>,
-        #[starlark(require = pos)] window: NoneOr<u32>,
-        #[starlark(require = pos)] head_dim: u32,
-        #[starlark(require = pos)] kv_heads: u32,
-        #[starlark(require = pos)] causal: bool,
-        #[starlark(require = pos)] sm_scale: UnpackFloat,
-    ) -> anyhow::Result<ValueHandle> {
-        let (q, plan, mask, pages) = (
-            value_of(q)?,
-            value_of(plan)?,
-            value_of(mask)?,
-            cache_of(pages)?,
-        );
-        dsl("masked", || {
-            ops::attn::masked(
-                &q,
-                &plan,
-                &mask,
-                pages,
-                window.into_option(),
-                head_dim,
-                kv_heads,
-                causal,
-                f(sm_scale),
-            )
-        })
-        .map(hold)
-    }
-
-    fn decode<'v>(
-        #[starlark(require = pos)] q: Star<'v>,
-        #[starlark(require = pos)] plan: Star<'v>,
-        #[starlark(require = pos)] pages: Star<'v>,
-        #[starlark(require = pos)] window: NoneOr<u32>,
-        #[starlark(require = pos)] head_dim: u32,
-        #[starlark(require = pos)] sm_scale: UnpackFloat,
-    ) -> anyhow::Result<ValueHandle> {
-        let (q, plan, pages) = (value_of(q)?, value_of(plan)?, cache_of(pages)?);
-        dsl("decode", || {
-            ops::attn::decode(
-                &q,
-                &plan,
-                pages,
-                window.into_option(),
-                head_dim,
-                f(sm_scale),
-            )
-        })
-        .map(hold)
-    }
-
-    fn kv_append<'v>(
-        #[starlark(require = pos)] k: Star<'v>,
-        #[starlark(require = pos)] v: Star<'v>,
-        #[starlark(require = pos)] pages: Star<'v>,
-        #[starlark(require = pos)] write_page: Star<'v>,
-        #[starlark(require = pos)] write_offset: Star<'v>,
-    ) -> anyhow::Result<NoneType> {
-        let (k, v, pages, page, offset) = (
-            value_of(k)?,
-            value_of(v)?,
-            cache_of(pages)?,
-            value_of(write_page)?,
-            value_of(write_offset)?,
-        );
-        dsl("kv_append", || {
-            ops::attn::kv_append(&k, &v, pages, &page, &offset)
-        })?;
-        Ok(NoneType)
-    }
-
-    fn logit_softcap<'v>(
-        #[starlark(require = pos)] x: Star<'v>,
-        #[starlark(require = pos)] cap: UnpackFloat,
-    ) -> anyhow::Result<ValueHandle> {
-        let x = value_of(x)?;
-        dsl("logit_softcap", || ops::attn::logit_softcap(&x, f(cap))).map(hold)
-    }
-}
-
-#[starlark_module]
-fn elemwise(builder: &mut GlobalsBuilder) {
-    fn rmsnorm_no_scale<'v>(
-        #[starlark(require = pos)] x: Star<'v>,
-        #[starlark(require = pos)] width: u32,
-        #[starlark(require = pos)] eps: UnpackFloat,
-    ) -> anyhow::Result<ValueHandle> {
-        let x = value_of(x)?;
-        dsl("rmsnorm_no_scale", || {
-            ops::elemwise::rmsnorm_no_scale(&x, width, f(eps))
-        })
-        .map(hold)
-    }
-
-    fn rmsnorm_plus_one<'v>(
-        #[starlark(require = pos)] x: Star<'v>,
-        #[starlark(require = pos)] w: Star<'v>,
-        #[starlark(require = pos)] eps: UnpackFloat,
-    ) -> anyhow::Result<ValueHandle> {
-        let (x, w) = (value_of(x)?, weight(w)?);
-        dsl("rmsnorm_plus_one", || {
-            ops::elemwise::rmsnorm_plus_one(&x, &w, f(eps))
-        })
-        .map(hold)
-    }
-
-    fn rmsnorm<'v>(
-        #[starlark(require = pos)] x: Star<'v>,
-        #[starlark(require = pos)] w: Star<'v>,
-        #[starlark(require = pos)] eps: UnpackFloat,
-    ) -> anyhow::Result<ValueHandle> {
-        let (x, w) = (value_of(x)?, weight(w)?);
-        dsl("rmsnorm", || ops::elemwise::rmsnorm(&x, &w, f(eps))).map(hold)
-    }
-
-    fn rope_full<'v>(
-        #[starlark(require = pos)] q: Star<'v>,
-        #[starlark(require = pos)] k: Star<'v>,
-        #[starlark(require = pos)] positions: Star<'v>,
-        #[starlark(require = pos)] head_dim: u32,
-        #[starlark(require = pos)] theta: UnpackFloat,
-        #[starlark(require = pos)] interleaved: bool,
-        heap: Heap<'v>,
-    ) -> anyhow::Result<Star<'v>> {
-        let (q, k, p) = (value_of(q)?, value_of(k)?, value_of(positions)?);
-        dsl("rope_full", || {
-            ops::elemwise::rope_full(&q, &k, &p, head_dim, f(theta), interleaved)
-        })
-        .map(|o| tuple2(heap, o))
-    }
-
-    fn residual_add<'v>(
-        #[starlark(require = pos)] x: Star<'v>,
-        #[starlark(require = pos)] y: Star<'v>,
-    ) -> anyhow::Result<ValueHandle> {
-        let (x, y) = (value_of(x)?, value_of(y)?);
-        dsl("residual_add", || ops::elemwise::residual_add(&x, &y)).map(hold)
-    }
-
-    fn gate_sigmoid_mul<'v>(
-        #[starlark(require = pos)] x: Star<'v>,
-        #[starlark(require = pos)] gate: Star<'v>,
-    ) -> anyhow::Result<ValueHandle> {
-        let (x, gate) = (value_of(x)?, value_of(gate)?);
-        dsl("gate_sigmoid_mul", || {
-            ops::elemwise::gate_sigmoid_mul(&x, &gate)
-        })
-        .map(hold)
-    }
-}
-
-#[starlark_module]
-fn layout(builder: &mut GlobalsBuilder) {
-    fn embed<'v>(
-        #[starlark(require = pos)] ids: Star<'v>,
-        #[starlark(require = pos)] table: Star<'v>,
-        #[starlark(require = pos)] vocab: u32,
-    ) -> anyhow::Result<ValueHandle> {
-        let (ids, table) = (value_of(ids)?, weight(table)?);
-        dsl("embed", || ops::layout::embed(&ids, &table, vocab)).map(hold)
-    }
-
-    fn split_qkv<'v>(
-        #[starlark(require = pos)] packed: Star<'v>,
-        #[starlark(require = pos)] q_width: u32,
-        #[starlark(require = pos)] kv_width: u32,
-        heap: Heap<'v>,
-    ) -> anyhow::Result<Star<'v>> {
-        let packed = value_of(packed)?;
-        let (q, k, v) = dsl("split_qkv", || {
-            ops::layout::split_qkv(&packed, q_width, kv_width)
-        })?;
-        Ok(heap.alloc((hold(q), hold(k), hold(v))))
-    }
-
-    fn gather_rows<'v>(
-        #[starlark(require = pos)] x: Star<'v>,
-        #[starlark(require = pos)] rows: Star<'v>,
-    ) -> anyhow::Result<ValueHandle> {
-        let (x, rows) = (value_of(x)?, value_of(rows)?);
-        dsl("gather_rows", || ops::layout::gather_rows(&x, &rows)).map(hold)
-    }
-}
-
-#[starlark_module]
-fn linear(builder: &mut GlobalsBuilder) {
-    fn matmul<'v>(
-        #[starlark(require = pos)] x: Star<'v>,
-        #[starlark(require = pos)] w: Star<'v>,
-    ) -> anyhow::Result<ValueHandle> {
-        let (x, w) = (value_of(x)?, weight(w)?);
-        dsl("matmul", || ops::linear::matmul(&x, &w)).map(hold)
-    }
-
-    fn lora_correct<'v>(
-        #[starlark(require = pos)] x: Star<'v>,
-        #[starlark(require = pos)] bank_a: Star<'v>,
-        #[starlark(require = pos)] bank_b: Star<'v>,
-        #[starlark(require = pos)] routes: Star<'v>,
-        #[starlark(require = pos)] y: Star<'v>,
-    ) -> anyhow::Result<ValueHandle> {
-        let (x, a, b, routes, y) = (
-            value_of(x)?,
-            weight(bank_a)?,
-            weight(bank_b)?,
-            value_of(routes)?,
-            value_of(y)?,
-        );
-        dsl("lora_correct", || {
-            ops::linear::lora_correct(&x, &a, &b, &routes, &y)
-        })
-        .map(hold)
-    }
-
-    fn mlp_swiglu<'v>(
-        #[starlark(require = pos)] packed: Star<'v>,
-        #[starlark(require = pos)] intermediate: u32,
-    ) -> anyhow::Result<ValueHandle> {
-        let packed = value_of(packed)?;
-        dsl("mlp_swiglu", || {
-            ops::linear::mlp_swiglu(&packed, intermediate)
-        })
-        .map(hold)
-    }
-
-    fn lm_head<'v>(
-        #[starlark(require = pos)] x: Star<'v>,
-        #[starlark(require = pos)] w: Star<'v>,
-    ) -> anyhow::Result<ValueHandle> {
-        let (x, w) = (value_of(x)?, weight(w)?);
-        dsl("lm_head", || ops::linear::lm_head(&x, &w)).map(hold)
-    }
 }
 
 #[starlark_module]
@@ -802,11 +476,18 @@ fn facts(builder: &mut GlobalsBuilder) {
 
 #[starlark_module]
 fn seams(builder: &mut GlobalsBuilder) {
-    const ATTN_Q: &str = "attn.q";
-    const ATTN_OUT: &str = "attn.out";
-    const SCORES: &str = "attn.scores";
-    const HIDDEN: &str = "hidden";
-    const VELOCITY: &str = "velocity";
+    const ATTN_Q: &str = crate::seam::ATTN_Q.name;
+    const ATTN_OUT: &str = crate::seam::ATTN_OUT.name;
+    const ATTN_QV: &str = crate::seam::ATTN_QV.name;
+    const RECURRENT: &str = crate::seam::RECURRENT.name;
+    const IN: &str = crate::seam::IN.name;
+    const OUT: &str = crate::seam::OUT.name;
+    const MTP: &str = crate::seam::MTP.name;
+    const MTP_DRAFTS: &str = crate::seam::MTP_DRAFTS.name;
+    const SCORES: &str = crate::seam::SCORES.name;
+    const VELOCITY: &str = crate::seam::VELOCITY.name;
+    const HIDDEN: &str = crate::seam::HIDDEN.name;
+    const PIXELS: &str = crate::seam::PIXELS.name;
 
     /// Plants the seam `name` over `values`.
     fn at<'v>(

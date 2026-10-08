@@ -21,12 +21,179 @@ use starlark::values::structs::AllocStruct;
 use starlark::values::{Heap, NoSerialize, StarlarkPagableUnsupported, StarlarkValue, Value};
 use starlark_derive::{starlark_module, starlark_value};
 
-use crate::star::values::weight;
+use crate::star::values::{DtypeValue, weight};
+use checkpoint::contract::{Expr, TensorType};
+use checkpoint::types::Encoding;
 
 /// One read a format states.
 pub(crate) enum Read {
     One(Weight, String),
     Concat(Weight, Vec<String>),
+    Stack(Weight, Vec<Vec<String>>),
+    Over(Weight, String, Expr),
+    Expr(Weight, Expr),
+    Own(Weight),
+}
+
+impl Read {
+    /// Lands this read on `b`.
+    pub(crate) fn onto(
+        self,
+        b: &mut crate::import::Builder<'_>,
+    ) -> Result<(), crate::import::Error> {
+        match self {
+            Read::One(w, from) => b.read(&w, from),
+            Read::Concat(w, from) => b.read_concat(&w, from),
+            Read::Stack(w, rows) => b.read_stack(&w, rows),
+            Read::Over(w, from, over) => b.read_over(&w, from, |_| over),
+            Read::Expr(w, expr) => b.read_expr(&w, expr),
+            Read::Own(w) => b.read_own(&w),
+        }
+    }
+}
+
+/// A tensor a read computes from the checkpoint's.
+#[derive(Debug, Clone, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative)]
+pub struct ExprValue(#[allocative(skip)] pub(crate) Expr);
+
+starlark_simple_value!(ExprValue);
+
+impl fmt::Display for ExprValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "expr({})", self.0.node_name())
+    }
+}
+
+#[starlark_value(type = "expr")]
+impl<'v> StarlarkValue<'v> for ExprValue {
+    fn get_methods() -> Option<&'static Methods> {
+        Some(EXPR_METHODS_STATICS.methods())
+    }
+}
+
+fn expr_of(v: Value<'_>) -> anyhow::Result<Expr> {
+    v.downcast_ref::<ExprValue>()
+        .map(|e| e.0.clone())
+        .ok_or_else(|| anyhow::anyhow!("an expr was wanted, not {}", v.get_type()))
+}
+
+/// How a tensor's bytes are stored.
+#[derive(Debug, Clone, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative)]
+pub struct EncodingValue(#[allocative(skip)] pub(crate) Encoding);
+
+starlark_simple_value!(EncodingValue);
+
+impl fmt::Display for EncodingValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+#[starlark_value(type = "encoding")]
+impl<'v> StarlarkValue<'v> for EncodingValue {}
+
+fn axis(axis: u32) -> anyhow::Result<u8> {
+    u8::try_from(axis).map_err(|_| anyhow::anyhow!("axis {axis} is past any tensor's"))
+}
+
+#[starlark_module]
+fn expr_methods(builder: &mut MethodsBuilder) {
+    /// `len` items of `axis` from `start`.
+    fn slice(
+        this: &ExprValue,
+        #[starlark(require = pos)] axis: u32,
+        #[starlark(require = pos)] start: i64,
+        #[starlark(require = pos)] len: i64,
+    ) -> anyhow::Result<ExprValue> {
+        Ok(ExprValue(this.0.clone().slice(
+            self::axis(axis)?,
+            start,
+            len,
+        )))
+    }
+
+    /// Every `stride`-th run of `len` along `axis`.
+    fn select(
+        this: &ExprValue,
+        #[starlark(require = pos)] axis: u32,
+        #[starlark(require = pos)] stride: i64,
+        #[starlark(require = pos)] len: i64,
+    ) -> anyhow::Result<ExprValue> {
+        Ok(ExprValue(this.0.clone().select(
+            self::axis(axis)?,
+            stride,
+            len,
+        )))
+    }
+
+    /// `len` items of `axis` from `start`, every `step`-th.
+    fn stride(
+        this: &ExprValue,
+        #[starlark(require = pos)] axis: u32,
+        #[starlark(require = pos)] start: i64,
+        #[starlark(require = pos)] len: i64,
+        #[starlark(require = pos)] step: i64,
+    ) -> anyhow::Result<ExprValue> {
+        Ok(ExprValue(this.0.clone().stride(
+            self::axis(axis)?,
+            start,
+            len,
+            step,
+        )))
+    }
+
+    /// The items of `axis` at `indices`.
+    fn gather(
+        this: &ExprValue,
+        #[starlark(require = pos)] axis: u32,
+        #[starlark(require = pos)] indices: UnpackList<i64>,
+    ) -> anyhow::Result<ExprValue> {
+        Ok(ExprValue(
+            this.0.clone().gather(self::axis(axis)?, indices.items),
+        ))
+    }
+
+    /// The same bytes read as `shape` (`-1` the one extent left to infer)
+    /// of `encoding`.
+    fn transmute(
+        this: &ExprValue,
+        #[starlark(require = pos)] shape: UnpackList<i64>,
+        #[starlark(require = pos)] encoding: &EncodingValue,
+    ) -> anyhow::Result<ExprValue> {
+        Ok(ExprValue(this.0.clone().transmute(TensorType::new(
+            shape.items,
+            encoding.0.clone(),
+        ))))
+    }
+
+    /// The values re-encoded as `encoding`.
+    fn cast(
+        this: &ExprValue,
+        #[starlark(require = pos)] encoding: &EncodingValue,
+    ) -> anyhow::Result<ExprValue> {
+        Ok(ExprValue(this.0.clone().cast(encoding.0.clone())))
+    }
+
+    /// The values times `factor`.
+    fn scale(
+        this: &ExprValue,
+        #[starlark(require = pos)] factor: UnpackFloat,
+    ) -> anyhow::Result<ExprValue> {
+        Ok(ExprValue(this.0.clone().scale(factor.0 as f32)))
+    }
+
+    /// The values plus `by`.
+    fn bias(
+        this: &ExprValue,
+        #[starlark(require = pos)] by: UnpackFloat,
+    ) -> anyhow::Result<ExprValue> {
+        Ok(ExprValue(this.0.clone().bias(by.0 as f32)))
+    }
+
+    /// This rank's share along `axis`.
+    fn shard(this: &ExprValue, #[starlark(require = pos)] axis: u32) -> anyhow::Result<ExprValue> {
+        Ok(ExprValue(this.0.clone().shard(self::axis(axis)?)))
+    }
 }
 
 /// What a format's test may read of a checkpoint: its names and attributes.
@@ -150,6 +317,58 @@ fn reads_methods(builder: &mut MethodsBuilder) {
         Ok(NoneType)
     }
 
+    /// `w` lands what `expr` computes.
+    fn read_expr<'v>(
+        #[starlark(this)] _this: &ReadsHandle,
+        #[starlark(require = pos)] w: Value<'v>,
+        #[starlark(require = pos)] expr: Value<'v>,
+    ) -> anyhow::Result<NoneType> {
+        let (w, expr) = (weight(w)?, expr_of(expr)?);
+        READS.with(|r| r.borrow_mut().push(Read::Expr(w, expr)));
+        Ok(NoneType)
+    }
+
+    /// `w` lands what `over(src(name))` computes of the tensor `name`, as
+    /// stored, then brought to `w`'s dtype.
+    fn read_over<'v>(
+        #[starlark(this)] _this: &ReadsHandle,
+        #[starlark(require = pos)] w: Value<'v>,
+        #[starlark(require = pos)] name: String,
+        #[starlark(require = pos)] over: Value<'v>,
+        eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let w = weight(w)?;
+        let from = eval.heap().alloc(ExprValue(Expr::src(name.clone())));
+        let expr = eval
+            .eval_function(over, &[from], &[])
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let expr = expr_of(expr)?;
+        READS.with(|r| r.borrow_mut().push(Read::Over(w, name, expr)));
+        Ok(NoneType)
+    }
+
+    /// `w` lands its rows from `rows`, each row's tensors joined.
+    fn read_stack<'v>(
+        #[starlark(this)] _this: &ReadsHandle,
+        #[starlark(require = pos)] w: Value<'v>,
+        #[starlark(require = pos)] rows: UnpackList<UnpackList<String>>,
+    ) -> anyhow::Result<NoneType> {
+        let w = weight(w)?;
+        let rows = rows.items.into_iter().map(|r| r.items).collect();
+        READS.with(|r| r.borrow_mut().push(Read::Stack(w, rows)));
+        Ok(NoneType)
+    }
+
+    /// `w` lands as an artifact of it holds it: this rank's share, by name.
+    fn read_own<'v>(
+        #[starlark(this)] _this: &ReadsHandle,
+        #[starlark(require = pos)] w: Value<'v>,
+    ) -> anyhow::Result<NoneType> {
+        let w = weight(w)?;
+        READS.with(|r| r.borrow_mut().push(Read::Own(w)));
+        Ok(NoneType)
+    }
+
     /// `w` lands the checkpoint's tensors `names`, joined along its first
     /// axis.
     fn read_concat<'v>(
@@ -201,6 +420,51 @@ pub(crate) fn formats(builder: &mut GlobalsBuilder) {
             ("recognizes", recognizes),
             ("states", heap.alloc(states.items)),
         ])))
+    }
+
+    /// The checkpoint's tensor `name`.
+    fn src(#[starlark(require = pos)] name: String) -> anyhow::Result<ExprValue> {
+        Ok(ExprValue(Expr::src(name)))
+    }
+
+    /// The contract's own tensor `name`, which another read computes.
+    fn out(#[starlark(require = pos)] name: String) -> anyhow::Result<ExprValue> {
+        Ok(ExprValue(Expr::out(name)))
+    }
+
+    /// `parts` joined along `axis`.
+    fn concat<'v>(
+        #[starlark(require = pos)] axis: u32,
+        #[starlark(require = pos)] parts: UnpackList<Value<'v>>,
+    ) -> anyhow::Result<ExprValue> {
+        let parts = parts
+            .items
+            .into_iter()
+            .map(expr_of)
+            .collect::<anyhow::Result<_>>()?;
+        Ok(ExprValue(Expr::concat(self::axis(axis)?, parts)))
+    }
+
+    /// A tensor of `shape` and `encoding` holding `value` throughout.
+    fn fill(
+        #[starlark(require = pos)] value: UnpackFloat,
+        #[starlark(require = pos)] shape: UnpackList<i64>,
+        #[starlark(require = pos)] encoding: &EncodingValue,
+    ) -> anyhow::Result<ExprValue> {
+        Ok(ExprValue(Expr::fill(
+            value.0 as f32,
+            TensorType::new(shape.items, encoding.0.clone()),
+        )))
+    }
+
+    /// How a weight of `dtype` is stored.
+    fn encoding(#[starlark(require = pos)] dtype: &DtypeValue) -> anyhow::Result<EncodingValue> {
+        Ok(EncodingValue(crate::import::encoding(dtype.0)))
+    }
+
+    /// Plain values of `dtype`, one after another.
+    fn raw(#[starlark(require = pos)] dtype: &DtypeValue) -> anyhow::Result<EncodingValue> {
+        Ok(EncodingValue(Encoding::Raw(dtype.0)))
     }
 
     /// The configuration value at `path` is `want`, or at least `want`.
