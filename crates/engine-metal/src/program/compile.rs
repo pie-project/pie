@@ -161,9 +161,7 @@ impl Module {
         source: &str,
         entry: &str,
     ) -> std::result::Result<Module, Failure> {
-        use objc2_metal::MTLCompileOptions;
-
-        let options = MTLCompileOptions::new();
+        let options = crate::device::ctx::compile_options();
         set_safe_math(&options);
         if let Some(dir) = crate::diag::on().kernel_dump.as_deref() {
             let path = dir.join(format!("{entry}.metal"));

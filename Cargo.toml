@@ -54,9 +54,10 @@ members = [
     "crates/engine-xla",
     "crates/web-std",
     "crates/browser",
+    "packages/swift/server",
 
-    "python/server",
-    "javascript/server",
+    "packages/python/server",
+    "packages/javascript/server",
 ]
 default-members = [
     "crates/bootstrap",
@@ -98,8 +99,8 @@ default-members = [
     "crates/eta-dsl",
     "crates/eta-compiler",
     "crates/inferlet-macros",
-    "python/server",
-    "javascript/server",
+    "packages/python/server",
+    "packages/javascript/server",
 ]
 exclude = [
     "examples",

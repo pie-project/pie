@@ -1,6 +1,6 @@
 name: Release npm Package
 
-# One package from the `javascript/` workspace per run. `server` and
+# One package from the `packages/javascript/` workspace per run. `server` and
 # `server-web` depend on `client` by version range: publish `client` first when
 # it changed. `server`'s addon ships as one platform package per target
 # (`optionalDependencies`), each with every engine that platform supports.
@@ -46,7 +46,7 @@ jobs:
       - uses: actions/upload-artifact@v6
         with:
           name: ${{ inputs.package }}
-          path: javascript/${{ inputs.package }}/${{ env.LANGUAGE }}.wasm
+          path: packages/javascript/${{ inputs.package }}/${{ env.LANGUAGE }}.wasm
           if-no-files-found: error
 
   web:
@@ -65,12 +65,12 @@ jobs:
       - name: wasm-bindgen-cli, at Cargo.lock's version
         run: cargo install wasm-bindgen-cli --locked --version "$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')"
       - run: npm ci --include=dev
-        working-directory: javascript
-      - run: bash javascript/server-web/build.sh min
+        working-directory: packages/javascript
+      - run: bash packages/javascript/server-web/build.sh min
       - uses: actions/upload-artifact@v6
         with:
           name: server-web-dist
-          path: javascript/server-web/dist
+          path: packages/javascript/server-web/dist
           if-no-files-found: error
 
   addon:
@@ -98,11 +98,11 @@ jobs:
       - shell: bash
         run: |
           cargo build --profile release-min --target ${{ matrix.target.triple }} -p pie-server-node --no-default-features --features ${{ matrix.target.features }}
-          cp "${CARGO_TARGET_DIR:-target}/${{ matrix.target.triple }}/release-min/${{ matrix.target.lib }}" javascript/server/npm/${{ matrix.target.npm }}/pie-server.node
+          cp "${CARGO_TARGET_DIR:-target}/${{ matrix.target.triple }}/release-min/${{ matrix.target.lib }}" packages/javascript/server/npm/${{ matrix.target.npm }}/pie-server.node
       - uses: actions/upload-artifact@v6
         with:
           name: addon-${{ matrix.target.npm }}
-          path: javascript/server/npm/${{ matrix.target.npm }}/pie-server.node
+          path: packages/javascript/server/npm/${{ matrix.target.npm }}/pie-server.node
           if-no-files-found: error
 
   publish:
@@ -125,37 +125,37 @@ jobs:
         if: inputs.package == 'server-web'
         with:
           name: server-web-dist
-          path: javascript/server-web/dist
+          path: packages/javascript/server-web/dist
       - uses: actions/download-artifact@v7
         if: inputs.package == 'server'
         with:
           pattern: addon-*
-          path: javascript/server/npm
+          path: packages/javascript/server/npm
       - uses: actions/download-artifact@v7
         if: startsWith(inputs.package, 'language-')
         with:
           name: ${{ inputs.package }}
-          path: javascript/${{ inputs.package }}
+          path: packages/javascript/${{ inputs.package }}
       - if: inputs.package == 'server'
-        run: for d in javascript/server/npm/addon-*; do mv "$d/pie-server.node" "${d/addon-/}/" && rmdir "$d"; done && ls -la javascript/server/npm/*/
+        run: for d in packages/javascript/server/npm/addon-*; do mv "$d/pie-server.node" "${d/addon-/}/" && rmdir "$d"; done && ls -la packages/javascript/server/npm/*/
       - run: npm ci --include=dev
-        working-directory: javascript
+        working-directory: packages/javascript
       # The checked-in bindings are an artifact of whatever world they were
       # last generated from; regenerate and diff.
       - if: inputs.package == 'inferlet'
-        working-directory: javascript/inferlet
+        working-directory: packages/javascript/inferlet
         run: |
           bash ../../scripts/check-inferlet-interfaces.sh
           npm run generate-bindings
           git diff --exit-code -- src/bindings tsconfig.json
       # `server-web`'s build is the artifact above; `inferlet` compiles here.
-      - working-directory: javascript
+      - working-directory: packages/javascript
         run: |
           [[ "${{ inputs.package }}" != inferlet ]] || npm run build -w inferlet
           npm test --if-present -w ${{ inputs.package }}
       - name: platform packages match the wrapper's version
         if: inputs.package == 'server'
-        working-directory: javascript/server
+        working-directory: packages/javascript/server
         run: |
           node -e '
             const w = require("./package.json");
@@ -164,13 +164,13 @@ jobs:
               if (v !== w.version || want !== w.version) { console.error(`${name}: ${v}, wrapper ${w.version} wants ${want}`); process.exit(1); }
             }'
       - name: pack
-        working-directory: javascript
+        working-directory: packages/javascript
         run: |
           npm pack -w ${{ inputs.package }}
           [[ "${{ inputs.package }}" != server ]] || for d in server/npm/*/; do (cd "$d" && npm pack); done
       - name: publish
         if: inputs.dry_run == false
-        working-directory: javascript
+        working-directory: packages/javascript
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         # Idempotent, so a rerun publishes only what is missing.

@@ -4,8 +4,8 @@
 <p>The one surface both hosts share: <code>Server.start</code>, a registered language, <code>install</code>, <code>connect</code>, <code>shutdown</code>.</p>
 <pre id="out"></pre>
 <script type="module">
-  import { Server } from "../../javascript/server-web/dist/pie.mjs";
-  import { registerLanguage } from "../../javascript/server-web/src/languages.mjs";
+  import { Server } from "../../packages/javascript/server-web/dist/pie.mjs";
+  import { registerLanguage } from "../../packages/javascript/server-web/src/languages.mjs";
 
   const out = document.getElementById("out");
   const log = (s) => { out.textContent += s + "\n"; console.log(s); };

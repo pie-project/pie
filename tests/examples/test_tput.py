@@ -14,7 +14,7 @@ neighbour rows is not fast, it is broken).
 
 Usage::
 
-    python/server/.venv/bin/python tests/examples/test_tput.py \
+    packages/python/server/.venv/bin/python tests/examples/test_tput.py \
         --model Qwen/Qwen3.5-0.8B --timeout 600
 """
 

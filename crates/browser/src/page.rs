@@ -2,7 +2,7 @@ use std::future::Future;
 
 use wasm_bindgen::prelude::*;
 
-use crate::boot::{self, BootConfig, Mount};
+use crate::boot::{self, Mount};
 
 #[link(wasm_import_module = "./platform.mjs")]
 unsafe extern "C" {
@@ -185,9 +185,9 @@ pub fn pie_range_failed(request: u32, error: String) {
 #[wasm_bindgen]
 pub fn pie_boot_lazy(config_toml: String, model_name: String, len: f64) -> js_sys::Promise {
     promise(async move {
-        let config = BootConfig::parse(&config_toml)?;
+        let (config, doc) = crate::engine::parse_config(&config_toml)?;
         let device = if config.engine {
-            Some(crate::engine::request(&config).await?)
+            Some(crate::engine::request(doc).await?)
         } else {
             None
         };
@@ -236,21 +236,17 @@ pub fn pie_close_session(session: u32) {
 
 #[wasm_bindgen]
 pub fn pie_send_frame(session: u32, frame: js_sys::Uint8Array) -> Result<(), JsError> {
-    let bytes = frame.to_vec();
-    let message: client_api::ClientMessage =
-        rmp_serde::from_slice(&bytes).map_err(|e| JsError::new(&format!("client frame: {e}")))?;
-    runtime::server::send_client_message(session, message)
+    runtime::embed::send_frame(session, &frame.to_vec())
         .map_err(|e| JsError::new(&format!("{e:#}")))
 }
 
 #[wasm_bindgen]
 pub fn pie_recv_frames(session: u32, max_wait_ms: u32, max: u32) -> js_sys::Promise {
     promise(async move {
-        let messages =
-            runtime::server::recv_messages(session, u64::from(max_wait_ms), max as usize).await?;
         let frames = js_sys::Array::new();
-        for message in &messages {
-            let bytes = rmp_serde::to_vec_named(message)?;
+        for bytes in
+            runtime::embed::recv_frames(session, u64::from(max_wait_ms), max as usize).await?
+        {
             frames.push(&js_sys::Uint8Array::from(bytes.as_slice()));
         }
         Ok(frames.into())
