@@ -1,0 +1,22 @@
+[package]
+name = "poem-star"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Starlark bindings for poem: a model package written as layout, forward and format scripts, evaluated into the trace and the import contract the Rust families state."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[dependencies]
+starlark = { git = "https://github.com/facebook/starlark-rust", rev = "2521d846099f250c8ac1eff1c8e2431f9df33c15" }
+allocative = { git = "https://github.com/facebook/buck2.git", branch = "main" }
+starlark_derive = { git = "https://github.com/facebook/starlark-rust", rev = "2521d846099f250c8ac1eff1c8e2431f9df33c15" }
+anyhow = "1"
+poem-dsl = { package = "pie-poem-dsl", path = "../poem-dsl" }
+poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
+checkpoint = { path = "../checkpoint" }
+checkpoint-dsl = { path = "../checkpoint-dsl" }
+ztensor = { workspace = true }
+
+[lints]
+workspace = true

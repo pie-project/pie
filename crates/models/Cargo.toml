@@ -17,6 +17,7 @@ chat-template = { path = "../chat-template" }
 poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
 poem-dsl = { package = "pie-poem-dsl", path = "../poem-dsl" }
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
+poem-star = { path = "../poem-star" }
 checkpoint = { path = "../checkpoint" }
 checkpoint-dsl = { path = "../checkpoint-dsl" }
 serde_json = "1"

@@ -20,13 +20,13 @@ type Recognizes<'a> = Box<dyn Fn(&ztensor::Source) -> bool + 'a>;
 /// A format that recognized a checkpoint: read already where reading was the
 /// test of it, or still to read.
 enum Recognized<'a, T> {
-    Read(&'static str, Result<T, Error>),
+    Read(String, Result<T, Error>),
     ToRead(Format<'a, T>),
 }
 
 /// One way a family's checkpoints are laid out.
 pub struct Format<'a, T> {
-    name: &'static str,
+    name: String,
     recognizes: Option<Recognizes<'a>>,
     states: Vec<Stated>,
     read: Box<dyn FnOnce() -> Result<T, Error> + 'a>,
@@ -36,12 +36,12 @@ impl<'a, T> Format<'a, T> {
     /// The format `name`: a checkpoint `recognizes` holds is one of it, and
     /// `read` reads it.
     pub fn new(
-        name: &'static str,
+        name: impl Into<String>,
         recognizes: impl Fn(&ztensor::Source) -> bool + 'a,
         read: impl FnOnce() -> Result<T, Error> + 'a,
     ) -> Format<'a, T> {
         Format {
-            name,
+            name: name.into(),
             recognizes: Some(Box::new(recognizes)),
             states: Vec::new(),
             read: Box::new(read),
@@ -52,11 +52,11 @@ impl<'a, T> Format<'a, T> {
     /// family whose formats share their names, so that reading is the only
     /// test of one. Two readings of a checkpoint still refuse it.
     pub fn reading(
-        name: &'static str,
+        name: impl Into<String>,
         read: impl FnOnce() -> Result<T, Error> + 'a,
     ) -> Format<'a, T> {
         Format {
-            name,
+            name: name.into(),
             recognizes: None,
             states: Vec::new(),
             read: Box::new(read),
@@ -134,7 +134,7 @@ pub fn read_one<T>(
         },
         other => other,
     };
-    let names: Vec<&str> = formats.iter().map(|f| f.name).collect();
+    let names: Vec<String> = formats.iter().map(|f| f.name.clone()).collect();
     let mut refusals: Vec<String> = Vec::new();
     let mut recognized: Vec<Recognized<'_, T>> = Vec::new();
     for format in formats {
@@ -181,7 +181,7 @@ pub fn read_one<T>(
                     detail: format!("as {}, {detail}", format.name),
                 })?;
                 let name = format.name;
-                (format.read)().map_err(|why| annotate(name, why))
+                (format.read)().map_err(|why| annotate(&name, why))
             }
         },
         _ => Err(Error::Illegible {
@@ -192,8 +192,8 @@ pub fn read_one<T>(
                 recognized
                     .iter()
                     .map(|r| match r {
-                        Recognized::Read(name, _) => *name,
-                        Recognized::ToRead(format) => format.name,
+                        Recognized::Read(name, _) => name.as_str(),
+                        Recognized::ToRead(format) => format.name.as_str(),
                     })
                     .collect::<Vec<_>>()
                     .join(" and ")

@@ -20,6 +20,7 @@ pub mod numpy;
 pub mod published;
 pub mod qwen_3;
 pub mod qwen_4;
+pub mod star;
 pub mod template;
 pub mod tokenizer;
 pub mod wan_2;

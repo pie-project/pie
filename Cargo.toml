@@ -38,6 +38,7 @@ members = [
     "crates/poem-ir",
     "crates/poem-dsl",
     "crates/poem-compiler",
+    "crates/poem-star",
     "crates/models",
     "crates/checkpoint-dsl",
     "crates/chat-template",

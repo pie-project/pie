@@ -1,38 +1,47 @@
-pub mod forward;
-pub mod import;
-pub mod model;
 pub mod template;
 pub mod tokenizer;
 
-use model::Model;
 use poem_dsl::Dtype;
 
-pub fn entries() -> Vec<crate::catalog::Entry> {
-    use Dtype::{Bf16, U4g64};
+use crate::catalog::{Entry, Row};
+use crate::star::{MUSE_GLIMMER, import, trace};
+
+/// One entry of the family, its layout, forward and formats those of the
+/// `muse_glimmer` package.
+macro_rules! muse {
+    ($id:literal, $mini:literal, [$( ($seq:literal, $w:expr) ),*]) => {
+        Entry {
+            id: $id,
+            mini: $mini,
+            parts: &[],
+            drafters: &[],
+            trace: |name, d, platform| trace(&MUSE_GLIMMER, $id, name, d, platform),
+            import: |d, src, platform| import(&MUSE_GLIMMER, $id, d, src, platform),
+            template: template::muse_glimmer,
+            tokenizer: &tokenizer::CONTRACT,
+            diffusion: |_| None,
+            generative: |_| None,
+            rows: vec![$(Row {
+                seq: $seq,
+                deploy: crate::catalog::Deploy {
+                    weights: vec![$w],
+                    kv: Dtype::Bf16,
+                    tp: 1,
+                    parts: vec![],
+                    drafter: None,
+                },
+            }),*],
+        }
+    };
+}
+
+pub fn entries() -> Vec<Entry> {
     vec![
-        crate::entry! {
-            id: "muse-glimmer-30b",
-            mini: false,
-            parts: [],
-            drafters: [],
-            template: template::muse_glimmer,
-            tokenizer: &tokenizer::CONTRACT,
-            diffusion: None,
-            generative: None,
-            build: |d| -> Model { Ok(Model::b30(d.dtype()?, d.kv)) },
-            rows: [(0, [Bf16], Bf16, [], None), (2, [U4g64], Bf16, [], None)],
-        },
-        crate::entry! {
-            id: "muse-glimmer-30b-mini-l8",
-            mini: true,
-            parts: [],
-            drafters: [],
-            template: template::muse_glimmer,
-            tokenizer: &tokenizer::CONTRACT,
-            diffusion: None,
-            generative: None,
-            build: |d| -> Model { Ok(Model::b30_mini(8, d.dtype()?, d.kv)) },
-            rows: [(4, [Bf16], Bf16, [], None)],
-        },
+        muse!(
+            "muse-glimmer-30b",
+            false,
+            [(0, Dtype::Bf16), (2, Dtype::U4g64)]
+        ),
+        muse!("muse-glimmer-30b-mini-l8", true, [(4, Dtype::Bf16)]),
     ]
 }
