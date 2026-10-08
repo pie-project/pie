@@ -1,5 +1,6 @@
 // swift-tools-version:6.2
-// `./build-xcframework.sh` builds the PieServerCore binary target.
+// `./build-xcframework.sh` builds the PieServerCore binary target;
+// `scripts/build-languages.sh` puts the language components in Resources/.
 
 import PackageDescription
 
@@ -9,6 +10,8 @@ let package = Package(
     products: [
         .library(name: "PieClient", targets: ["PieClient"]),
         .library(name: "PieServer", targets: ["PieServer"]),
+        .library(name: "PieLanguagePython", targets: ["PieLanguagePython"]),
+        .library(name: "PieLanguageJavaScript", targets: ["PieLanguageJavaScript"]),
     ],
     targets: [
         .binaryTarget(name: "PieServerCore", path: "build/PieServerCore.xcframework"),
@@ -22,7 +25,9 @@ let package = Package(
                 .linkedLibrary("iconv"),
             ]
         ),
-        .executableTarget(name: "pie-smoke", dependencies: ["PieServer"]),
+        .target(name: "PieLanguagePython", dependencies: ["PieServer"], resources: [.copy("Resources")]),
+        .target(name: "PieLanguageJavaScript", dependencies: ["PieServer"], resources: [.copy("Resources")]),
+        .executableTarget(name: "pie-smoke", dependencies: ["PieServer", "PieLanguagePython", "PieLanguageJavaScript"]),
         .testTarget(name: "PieClientTests", dependencies: ["PieClient"]),
         .testTarget(name: "PieServerTests", dependencies: ["PieServer"]),
     ]
