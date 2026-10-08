@@ -133,7 +133,6 @@ static FAMILIES: LazyLock<Vec<Vec<catalog::Entry>>> = LazyLock::new(|| {
         qwen_3::entries(),
         z_image::entries(),
         wan_2::entries(),
-        minimax_h3::entries(),
         ltx_2::entries(),
     ];
     families.extend(star::families());
