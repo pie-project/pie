@@ -1,7 +1,7 @@
 import Foundation
 
 /// The MessagePack subset pie's client protocol uses.
-public enum MessagePack: Equatable, Sendable {
+enum MessagePack: Equatable, Sendable {
     case null
     case bool(Bool)
     case int(Int64)
@@ -11,33 +11,33 @@ public enum MessagePack: Equatable, Sendable {
     case array([MessagePack])
     case map([String: MessagePack])
 
-    public subscript(key: String) -> MessagePack? {
+    subscript(key: String) -> MessagePack? {
         if case .map(let map) = self { return map[key] }
         return nil
     }
 
-    public var string: String? {
+    var string: String? {
         if case .string(let s) = self { return s }
         return nil
     }
 
-    public var int: Int64? {
+    var int: Int64? {
         if case .int(let i) = self { return i }
         return nil
     }
 
-    public var bool: Bool? {
+    var bool: Bool? {
         if case .bool(let b) = self { return b }
         return nil
     }
 }
 
-public struct MessagePackError: Error, CustomStringConvertible {
-    public let description: String
+struct MessagePackError: Error, CustomStringConvertible {
+    let description: String
 }
 
 extension MessagePack {
-    public func encoded() -> Data {
+    func encoded() -> Data {
         var out = Data()
         encode(into: &out)
         return out
@@ -102,7 +102,7 @@ extension MessagePack {
         }
     }
 
-    public static func decode(_ data: Data) throws -> MessagePack {
+    static func decode(_ data: Data) throws -> MessagePack {
         var reader = Reader(bytes: [UInt8](data))
         return try reader.value()
     }
