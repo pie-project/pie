@@ -372,8 +372,101 @@ fn spec_methods(builder: &mut MethodsBuilder) {
     }
 }
 
+/// A `(fact, arm)` pair, as a list or a tuple.
+fn pair<'v>(v: Star<'v>) -> anyhow::Result<(Star<'v>, Star<'v>)> {
+    let items: Vec<Star<'v>> = if let Some(list) = starlark::values::list::ListRef::from_value(v) {
+        list.iter().collect()
+    } else if let Some(tuple) = starlark::values::tuple::TupleRef::from_value(v) {
+        tuple.iter().collect()
+    } else {
+        anyhow::bail!("a switch case is a (fact, arm) pair, not {}", v.get_type());
+    };
+    match items[..] {
+        [fact, arm] => Ok((fact, arm)),
+        _ => anyhow::bail!(
+            "a switch case is a (fact, arm) pair, not {} items",
+            items.len()
+        ),
+    }
+}
+
+/// A switch arm's result: a value, or a tuple of them.
+fn arm_of(v: Star<'_>) -> anyhow::Result<Vec<Value>> {
+    if let Some(h) = v.downcast_ref::<ValueHandle>() {
+        return Ok(vec![held(*h)]);
+    }
+    let Some(tuple) = starlark::values::tuple::TupleRef::from_value(v) else {
+        anyhow::bail!(
+            "a switch arm computes a value or a tuple of them, not {}",
+            v.get_type()
+        );
+    };
+    tuple
+        .iter()
+        .map(|item| {
+            item.downcast_ref::<ValueHandle>()
+                .map(|h| held(*h))
+                .ok_or_else(|| anyhow::anyhow!("a switch arm's tuple holds {}", item.get_type()))
+        })
+        .collect()
+}
+
 #[starlark_module]
 pub(crate) fn forward(builder: &mut GlobalsBuilder) {
+    /// Branches the rows of `x`: each `(fact, arm)` of `cases` computes
+    /// `arm(rows)` over the rows it is the first to hold for, `otherwise` over
+    /// the rows none holds for, and the arms' results (a value, or a tuple of
+    /// them each) are joined over all of them.
+    fn switch<'v>(
+        #[starlark(require = pos)] x: Star<'v>,
+        #[starlark(require = pos)] cases: UnpackList<Star<'v>>,
+        #[starlark(require = named, default = NoneOr::None)] otherwise: NoneOr<Star<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Star<'v>> {
+        let x = value_of(x)?;
+        let rec = x.rec().clone();
+        let mut rest = crate::Guard::Always;
+        let mut arms: Vec<Vec<Value>> = Vec::new();
+        let call = |rows: Value, arm: Star<'v>, eval: &mut Evaluator<'v, '_, '_>| {
+            let rows = eval.heap().alloc(hold(rows));
+            let out = eval
+                .eval_function(arm, &[rows], &[])
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            arm_of(out)
+        };
+        for case in cases.items {
+            let (fact, arm) = pair(case)?;
+            let holds = rec.guard_of(&predicate(fact)?);
+            let rows = <Value as crate::Refine>::refined(
+                &x,
+                crate::Guard::and(rest.clone(), holds.clone()),
+            );
+            rest = crate::Guard::and(rest, crate::Guard::not(holds));
+            arms.push(call(rows, arm, eval)?);
+        }
+        if let NoneOr::Other(arm) = otherwise {
+            let rows = <Value as crate::Refine>::refined(&x, rest);
+            arms.push(call(rows, arm, eval)?);
+        }
+        let width = arms.first().map_or(1, Vec::len);
+        if arms.iter().any(|a| a.len() != width) {
+            anyhow::bail!("a switch's arms compute the same number of values");
+        }
+        let joined: Vec<Value> = (0..width)
+            .map(|i| {
+                let column: Vec<Value> = arms.iter().map(|a| a[i].clone()).collect();
+                dsl("switch", || <Value as crate::Arm>::join(column))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        let heap = eval.heap();
+        Ok(match &joined[..] {
+            [one] => heap.alloc(hold(one.clone())),
+            many => heap.alloc(starlark::values::tuple::AllocTuple(
+                many.iter().map(|v| hold(v.clone())).collect::<Vec<_>>(),
+            )),
+        })
+    }
+
     /// States the block drafter whose proposals `logits` reads out: blocks of
     /// `rows`, masked with `mask_token`, attending both ways if
     /// `bidirectional`, proposing from row `proposals_from` on.

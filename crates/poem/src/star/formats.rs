@@ -124,6 +124,26 @@ impl<'v> StarlarkValue<'v> for EncodingValue {
     }
 }
 
+/// A checkpoint attribute as Starlark spells it.
+fn cbor<'v>(v: &ztensor::format::cbor::Value, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
+    use ztensor::format::cbor::Value as C;
+    Ok(match v {
+        C::Bool(b) => Value::new_bool(*b),
+        C::Uint(n) => heap.alloc(*n),
+        C::Nint(n) => heap.alloc(-1 - i64::try_from(*n)?),
+        C::Float(x) => heap.alloc(*x),
+        C::Text(t) => heap.alloc(t.as_str()),
+        C::Array(items) => {
+            let items = items
+                .iter()
+                .map(|item| cbor(item, heap))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            heap.alloc(items)
+        }
+        other => anyhow::bail!("an attribute of {other:?} has no Starlark spelling here"),
+    })
+}
+
 fn tensor_of(v: Value<'_>) -> anyhow::Result<TensorContract> {
     v.downcast_ref::<TensorValue>()
         .map(|t| t.0.clone())
@@ -226,6 +246,18 @@ fn expr_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = pos)] by: UnpackFloat,
     ) -> anyhow::Result<ExprValue> {
         Ok(ExprValue(this.0.clone().bias(by.0 as f32)))
+    }
+
+    /// The values put through `op`: "neg_ln" (`ln(-x)`), "sqrt" or "rsqrt".
+    fn unary(this: &ExprValue, #[starlark(require = pos)] op: &str) -> anyhow::Result<ExprValue> {
+        use checkpoint::contract::UnaryOp;
+        let op = match op {
+            "neg_ln" => UnaryOp::NegLn,
+            "sqrt" => UnaryOp::Sqrt,
+            "rsqrt" => UnaryOp::Rsqrt,
+            other => anyhow::bail!("a unary op is neg_ln, sqrt or rsqrt, not {other:?}"),
+        };
+        Ok(ExprValue(this.0.clone().unary(op)))
     }
 
     /// This rank's share along `axis`.
@@ -511,6 +543,33 @@ pub(crate) fn formats(builder: &mut GlobalsBuilder) {
             ("recognizes", recognizes),
             ("states", heap.alloc(states.items)),
         ])))
+    }
+
+    /// The checkpoint's attribute `key` as Starlark spells it (a bool,
+    /// number, text, or a list of them), or `None`.
+    fn attribute_value<'v>(
+        #[starlark(require = pos)] key: &str,
+        heap: Heap<'v>,
+    ) -> anyhow::Result<Value<'v>> {
+        let found = source(|src| src.attributes.as_ref().and_then(|a| a.get(key)).cloned())?;
+        Ok(match found {
+            Some(v) => cbor(&v, heap)?,
+            None => Value::new_none(),
+        })
+    }
+
+    /// A tensor the contract states itself: `values` in `shape`, stored as
+    /// raw `dtype`, each value rounded to it; `name` names it in a refusal.
+    fn constant(
+        #[starlark(require = pos)] name: &str,
+        #[starlark(require = pos)] values: UnpackList<UnpackFloat>,
+        #[starlark(require = pos)] shape: UnpackList<i64>,
+        #[starlark(require = pos)] dtype: &DtypeValue,
+    ) -> anyhow::Result<ExprValue> {
+        let values: Vec<f32> = values.items.iter().map(|v| v.0 as f32).collect();
+        crate::import::constant(name, &values, shape.items, dtype.0)
+            .map(ExprValue)
+            .map_err(|why| anyhow::anyhow!("{why}"))
     }
 
     /// The checkpoint's attribute `key`, as text, or `None`.
