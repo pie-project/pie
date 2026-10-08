@@ -106,6 +106,13 @@ impl<'v> StarlarkValue<'v> for ValueHandle {
 
 #[starlark_module]
 fn value_methods(builder: &mut MethodsBuilder) {
+    /// This value over every row, the rows it was not computed on held as
+    /// they were.
+    fn everywhere(this: &ValueHandle) -> anyhow::Result<ValueHandle> {
+        let x = held(*this);
+        dsl("everywhere", || x.everywhere()).map(hold)
+    }
+
     /// The rows of this value `fact` holds for.
     fn on(
         this: &ValueHandle,

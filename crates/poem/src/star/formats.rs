@@ -513,6 +513,21 @@ pub(crate) fn formats(builder: &mut GlobalsBuilder) {
         ])))
     }
 
+    /// The checkpoint's attribute `key`, as text, or `None`.
+    fn text_attribute(#[starlark(require = pos)] key: &str) -> anyhow::Result<NoneOr<String>> {
+        source(|src| {
+            match src
+                .attributes
+                .as_ref()
+                .and_then(|a| a.get(key))
+                .and_then(|v| v.as_text())
+            {
+                Some(text) => NoneOr::Other(text.to_string()),
+                None => NoneOr::None,
+            }
+        })
+    }
+
     /// Whether the checkpoint holds a tensor named `name`.
     fn has(#[starlark(require = pos)] name: &str) -> anyhow::Result<bool> {
         source(|src| src.names.contains(name))

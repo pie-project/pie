@@ -276,6 +276,16 @@ impl Package {
             name: id.to_string(),
             detail,
         };
+        /// The checkpoint a format reads, held while this import runs.
+        struct Held;
+        impl Drop for Held {
+            fn drop(&mut self) {
+                crate::star::formats::SOURCE.with(|s| *s.borrow_mut() = None);
+            }
+        }
+        crate::star::formats::SOURCE
+            .with(|s| *s.borrow_mut() = Some(crate::star::formats::Snapshot::of(src)));
+        let _held = Held;
         Module::with_temp_heap(|module| {
             let mut eval = Evaluator::new(&module);
             let heap = module.heap();
@@ -295,8 +305,6 @@ impl Package {
                 .map_err(|e| illegible(format!("`formats` returned no list: {e}")))?
                 .collect();
 
-            crate::star::formats::SOURCE
-                .with(|s| *s.borrow_mut() = Some(crate::star::formats::Snapshot::of(src)));
             let eval = RefCell::new(eval);
             let mut built = Vec::new();
             for format in listed {
@@ -375,9 +383,7 @@ impl Package {
                 };
                 built.push(format.stating(states));
             }
-            let read = then(built);
-            crate::star::formats::SOURCE.with(|s| *s.borrow_mut() = None);
-            Ok(read)
+            Ok(then(built))
         })
     }
 }

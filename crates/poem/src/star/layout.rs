@@ -78,6 +78,15 @@ pub(crate) fn numbers(builder: &mut GlobalsBuilder) {
         Ok(f64::from(x.0 as f32))
     }
 
+    /// `x` to the power `y`, both rounded to f32 and raised in f32, as a
+    /// model's Rust spelling computes.
+    fn powf32(
+        #[starlark(require = pos)] x: UnpackFloat,
+        #[starlark(require = pos)] y: UnpackFloat,
+    ) -> anyhow::Result<f64> {
+        Ok(f64::from((x.0 as f32).powf(y.0 as f32)))
+    }
+
     fn sqrt(#[starlark(require = pos)] x: UnpackFloat) -> anyhow::Result<f64> {
         Ok(x.0.sqrt())
     }
