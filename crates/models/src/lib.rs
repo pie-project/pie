@@ -4,7 +4,6 @@ pub mod deepseek_v4;
 pub mod drafter;
 pub mod flux_2;
 pub mod gemma_4;
-pub mod gemma_4_diffusion;
 pub mod glm_5;
 pub mod glm_5_next;
 pub mod gpt_oss;
@@ -129,8 +128,6 @@ static FAMILIES: LazyLock<Vec<Vec<catalog::Entry>>> = LazyLock::new(|| {
     let mut families = vec![
         deepseek_v4::entries(),
         flux_2::entries(),
-        gemma_4::entries(),
-        gemma_4_diffusion::entries(),
         glm_5_next::entries(),
         hunyuan_image_3::entries(),
         kimi_k3::entries(),
