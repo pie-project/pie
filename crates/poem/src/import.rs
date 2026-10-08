@@ -64,6 +64,17 @@ pub fn recording<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
     (out, log)
 }
 
+/// The reads recorded so far, taken: what each of several imports run in
+/// one recording asked.
+pub fn recorded_so_far() -> Vec<String> {
+    RECORDING.with(|r| {
+        r.borrow_mut()
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    })
+}
+
 fn recorded(what: impl FnOnce() -> String) -> bool {
     RECORDING.with(|r| match r.borrow_mut().as_mut() {
         Some(log) => {

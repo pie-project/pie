@@ -22,7 +22,7 @@ use starlark::values::{Heap, NoSerialize, StarlarkPagableUnsupported, StarlarkVa
 use starlark_derive::{starlark_module, starlark_value};
 
 use crate::star::values::{DtypeValue, weight};
-use checkpoint::contract::{Expr, TensorType};
+use checkpoint::contract::{Expr, TensorContract, TensorType};
 use checkpoint::types::Encoding;
 
 /// One read a format states.
@@ -33,6 +33,8 @@ pub(crate) enum Read {
     Over(Weight, String, Expr),
     Expr(Weight, Expr),
     Own(Weight),
+    Push(TensorContract),
+    Extend(Vec<TensorContract>),
 }
 
 impl Read {
@@ -48,6 +50,14 @@ impl Read {
             Read::Over(w, from, over) => b.read_over(&w, from, |_| over),
             Read::Expr(w, expr) => b.read_expr(&w, expr),
             Read::Own(w) => b.read_own(&w),
+            Read::Push(t) => {
+                b.push(t);
+                Ok(())
+            }
+            Read::Extend(ts) => {
+                b.extend(ts);
+                Ok(())
+            }
         }
     }
 }
@@ -77,6 +87,22 @@ fn expr_of(v: Value<'_>) -> anyhow::Result<Expr> {
         .ok_or_else(|| anyhow::anyhow!("an expr was wanted, not {}", v.get_type()))
 }
 
+/// A tensor a contract states whole: its name, what computes it, its shape
+/// and encoding, and what scales it.
+#[derive(Debug, Clone, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative)]
+pub struct TensorValue(#[allocative(skip)] pub(crate) TensorContract);
+
+starlark_simple_value!(TensorValue);
+
+impl fmt::Display for TensorValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "tensor({:?})", self.0.name)
+    }
+}
+
+#[starlark_value(type = "tensor")]
+impl<'v> StarlarkValue<'v> for TensorValue {}
+
 /// How a tensor's bytes are stored.
 #[derive(Debug, Clone, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative)]
 pub struct EncodingValue(#[allocative(skip)] pub(crate) Encoding);
@@ -90,7 +116,19 @@ impl fmt::Display for EncodingValue {
 }
 
 #[starlark_value(type = "encoding")]
-impl<'v> StarlarkValue<'v> for EncodingValue {}
+impl<'v> StarlarkValue<'v> for EncodingValue {
+    fn equals(&self, other: Value<'v>) -> starlark::Result<bool> {
+        Ok(other
+            .downcast_ref::<EncodingValue>()
+            .is_some_and(|other| other.0 == self.0))
+    }
+}
+
+fn tensor_of(v: Value<'_>) -> anyhow::Result<TensorContract> {
+    v.downcast_ref::<TensorValue>()
+        .map(|t| t.0.clone())
+        .ok_or_else(|| anyhow::anyhow!("a tensor was wanted, not {}", v.get_type()))
+}
 
 fn axis(axis: u32) -> anyhow::Result<u8> {
     u8::try_from(axis).map_err(|_| anyhow::anyhow!("axis {axis} is past any tensor's"))
@@ -388,6 +426,30 @@ fn reads_methods(builder: &mut MethodsBuilder) {
         Ok(NoneType)
     }
 
+    /// The contract states `tensor` as it is.
+    fn push<'v>(
+        #[starlark(this)] _this: &ReadsHandle,
+        #[starlark(require = pos)] tensor: Value<'v>,
+    ) -> anyhow::Result<NoneType> {
+        let t = tensor_of(tensor)?;
+        READS.with(|r| r.borrow_mut().push(Read::Push(t)));
+        Ok(NoneType)
+    }
+
+    /// The contract states each of `tensors` as it is.
+    fn extend<'v>(
+        #[starlark(this)] _this: &ReadsHandle,
+        #[starlark(require = pos)] tensors: UnpackList<Value<'v>>,
+    ) -> anyhow::Result<NoneType> {
+        let ts = tensors
+            .items
+            .into_iter()
+            .map(tensor_of)
+            .collect::<anyhow::Result<_>>()?;
+        READS.with(|r| r.borrow_mut().push(Read::Extend(ts)));
+        Ok(NoneType)
+    }
+
     /// `w` lands as an artifact of it holds it: this rank's share, by name.
     fn read_own<'v>(
         #[starlark(this)] _this: &ReadsHandle,
@@ -503,6 +565,66 @@ pub(crate) fn formats(builder: &mut GlobalsBuilder) {
             value.0 as f32,
             TensorType::new(shape.items, encoding.0.clone()),
         )))
+    }
+
+    /// The tensor `name` of a contract, which `expr` computes, of `encoding`
+    /// and `shape` (inferred from `expr` if not given); `scaling` names the
+    /// quantized weight it holds the scales of, `internal` keeps it from the
+    /// artifact.
+    fn tensor<'v>(
+        #[starlark(require = pos)] name: String,
+        #[starlark(require = pos)] expr: Value<'v>,
+        #[starlark(require = pos)] encoding: &EncodingValue,
+        #[starlark(require = named, default = NoneOr::None)] shape: NoneOr<UnpackList<i64>>,
+        #[starlark(require = named, default = NoneOr::None)] scaling: NoneOr<Value<'v>>,
+        #[starlark(require = named, default = false)] internal: bool,
+    ) -> anyhow::Result<TensorValue> {
+        let expr = expr_of(expr)?;
+        let mut t = match shape.into_option() {
+            Some(shape) => TensorContract::new(name, expr, shape.items, encoding.0.clone()),
+            None => TensorContract::inferred(name, expr, encoding.0.clone()),
+        };
+        if let Some(w) = scaling.into_option() {
+            let w = weight(w)?;
+            t = t.scaling(crate::star::forward::dsl("scaling", || {
+                crate::import::scaling(&w)
+            })?);
+        }
+        if internal {
+            t = t.internal();
+        }
+        Ok(TensorValue(t))
+    }
+
+    /// How a quantized bank `w` is stored, its blocked axis named.
+    fn grouped<'v>(#[starlark(require = pos)] w: Value<'v>) -> anyhow::Result<EncodingValue> {
+        let w = weight(w)?;
+        crate::star::forward::dsl("grouped", || EncodingValue(crate::import::grouped(&w)))
+    }
+
+    /// The shape of `w`'s scales: its own, its blocked axis counted in
+    /// blocks.
+    fn scales_shape<'v>(#[starlark(require = pos)] w: Value<'v>) -> anyhow::Result<Vec<i64>> {
+        let w = weight(w)?;
+        crate::star::forward::dsl("scales_shape", || {
+            let pairing = crate::import::scaling(&w);
+            crate::import::divided(
+                &crate::import::extents(&w),
+                pairing.channel_axis,
+                pairing.group_size,
+                &w.name,
+            )
+        })
+    }
+
+    /// The name the scales of the weight `name` are held under.
+    fn scales_name(#[starlark(require = pos)] name: &str) -> anyhow::Result<String> {
+        Ok(crate::scales_name(name))
+    }
+
+    /// The name the biases of the weight `name` are held under.
+    fn biases_name(#[starlark(require = pos)] name: &str) -> anyhow::Result<String> {
+        Ok(crate::biases_name(name))
     }
 
     /// How a weight of `dtype` is stored.

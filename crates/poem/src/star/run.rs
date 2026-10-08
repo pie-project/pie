@@ -186,18 +186,24 @@ impl Package {
     }
 
     /// What each format of `formats.star` reads of `src` into `id`'s
-    /// deployment `deploy`, whether or not it recognizes it, by name.
+    /// deployment `deploy`, whether or not it recognizes it, by name; and,
+    /// recording, the reads each asked.
     pub fn read_each(
         &self,
         id: &str,
         deploy: &Deploy,
         src: &ztensor::Source,
         platform: Platform,
-    ) -> Result<Vec<(String, Read)>, crate::import::Error> {
+    ) -> Result<Vec<(String, Read, Vec<String>)>, crate::import::Error> {
         self.formats(id, deploy, src, platform, |built| {
+            crate::import::recorded_so_far();
             built
                 .into_iter()
-                .map(|format| (format.name().to_string(), format.read()))
+                .map(|format| {
+                    let name = format.name().to_string();
+                    let read = format.read();
+                    (name, read, crate::import::recorded_so_far())
+                })
                 .collect()
         })
     }

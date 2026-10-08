@@ -15,5 +15,5 @@ mod run;
 pub mod values;
 
 pub use manifest::{Manifest, Model};
-pub use package::{API, ATTRIBUTE, Package, Stage};
+pub use package::{API, ATTRIBUTE, LIBRARY, Package, Stage};
 pub use run::Deploy;

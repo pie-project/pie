@@ -29,11 +29,16 @@ pub enum Stage {
     Lib,
 }
 
+/// The prefix a library shared between packages is loaded under: a stage
+/// file of `//lib/<name>/` is evaluated in its stage, and only that stage's
+/// files may load it.
+pub const LIBRARY: &str = "//lib/";
+
 impl Stage {
     /// The stage a package file named `file` is evaluated in.
     #[must_use]
     pub fn of(file: &str) -> Stage {
-        match file {
+        match file.rsplit('/').next().unwrap_or(file) {
             "package.star" => Stage::Manifest,
             "model.star" => Stage::Layout,
             "forward.star" => Stage::Forward,
@@ -176,28 +181,28 @@ impl Package {
     }
 
     /// The package in the directory `dir`, named after it: every `.star`
-    /// file in it.
-    pub fn from_dir(dir: &std::path::Path) -> anyhow::Result<Package> {
+    /// file in it, and every library under `lib`.
+    pub fn from_dir_with(dir: &std::path::Path, lib: &std::path::Path) -> anyhow::Result<Package> {
         let name = dir
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| anyhow::anyhow!("{} names no package", dir.display()))?
             .to_string();
-        let mut files = Vec::new();
-        for entry in std::fs::read_dir(dir)? {
-            let path = entry?.path();
-            let Some(file) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if file.ends_with(".star") {
-                files.push((file.to_string(), std::fs::read_to_string(&path)?));
-            }
+        let mut files = stars(dir, "")?;
+        if lib.is_dir() {
+            files.extend(stars(lib, LIBRARY)?);
         }
         let files: Vec<(&str, &str)> = files
             .iter()
             .map(|(f, s)| (f.as_str(), s.as_str()))
             .collect();
         Package::new(&name, &files)
+    }
+
+    /// The package in the directory `dir`, named after it: every `.star`
+    /// file in it, and the libraries of `../lib` beside it.
+    pub fn from_dir(dir: &std::path::Path) -> anyhow::Result<Package> {
+        Package::from_dir_with(dir, &dir.join("../lib"))
     }
 
     /// The package's name.
@@ -242,10 +247,11 @@ fn freeze(
     loading.push(file.to_string());
     for load in ast.loads() {
         let loaded = load.module_id;
-        if Stage::of(loaded) != Stage::Lib {
+        let shared = loaded.starts_with(LIBRARY) && Stage::of(loaded) == Stage::of(file);
+        if Stage::of(loaded) != Stage::Lib && !shared {
             anyhow::bail!(
                 "`{package}/{file}` loads `{loaded}`, a stage of its own; a stage loads only \
-                 helper files"
+                 helper files and a library's files of its own stage"
             );
         }
         freeze(package, loaded, sources, modules, loading)?;
@@ -274,4 +280,21 @@ fn freeze(
     })?;
     modules.insert(file.to_string(), frozen);
     Ok(())
+}
+
+/// Every `.star` file under `dir`, named by its path below it after `prefix`.
+fn stars(dir: &std::path::Path, prefix: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let Some(file) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if path.is_dir() && !prefix.is_empty() {
+            out.extend(stars(&path, &format!("{prefix}{file}/"))?);
+        } else if file.ends_with(".star") {
+            out.push((format!("{prefix}{file}"), std::fs::read_to_string(&path)?));
+        }
+    }
+    Ok(out)
 }

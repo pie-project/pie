@@ -113,3 +113,43 @@ fn a_stage_loads_no_other_stage() {
         "{why:#}"
     );
 }
+
+#[test]
+fn a_library_is_loaded_by_the_files_of_its_own_stage() {
+    let forward = r#"
+load("//lib/head/forward.star", "read_out")
+
+def caches(m, c):
+    pass
+
+def forward(m, inputs):
+    return read_out(m, ops.layout.embed(inputs.tokens(), m.embed, 16))
+"#;
+    let library = r#"
+def read_out(m, x):
+    return ops.linear.lm_head(x, m.head)
+"#;
+    let package = Package::new(
+        "toy",
+        &[
+            ("model.star", MODEL),
+            ("forward.star", forward),
+            ("//lib/head/forward.star", library),
+        ],
+    )
+    .unwrap_or_else(|e| panic!("{e:#}"));
+    let trace = package
+        .trace("toy", &deploy(), "toy-bf16", Platform::Cuda)
+        .unwrap_or_else(|e| panic!("{e:#}"));
+    assert_eq!(trace.params.len(), 2);
+
+    let layout = "load(\"//lib/head/forward.star\", \"read_out\")\n".to_string() + MODEL;
+    let why = Package::new(
+        "toy",
+        &[("model.star", &layout), ("//lib/head/forward.star", library)],
+    )
+    .err()
+    .map(|e| format!("{e:#}"))
+    .expect("a layout loads no forward library");
+    assert!(why.contains("of its own stage"), "{why}");
+}
