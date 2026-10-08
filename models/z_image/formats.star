@@ -2,6 +2,8 @@
 # under `dit.`, `te.` and `vae.`; or, for a model of the transformer alone,
 # a bare transformer state_dict.
 
+load("//lib/reads/formats.star", "product")
+
 DIFFUSERS = "a diffusers pipeline (`dit.`/`te.` prefixes)"
 BARE = "a bare transformer state_dict"
 T_FLIP = 1000.0
@@ -24,12 +26,6 @@ def read(m, reads, layout):
         text_encoder(reads, m.te, layout)
     if m.vae != None:
         vae(reads, m.vae, layout)
-
-def product(xs):
-    out = 1
-    for x in xs:
-        out *= x
-    return out
 
 def raw_of(w, name, what):
     held = stored(name)

@@ -2,6 +2,7 @@
 # spellings, and DiffusionGemma's own.
 
 load("//lib/dflash/formats.star", "bind_aux")
+load("//lib/reads/formats.star", "flattened")
 
 LAYOUTS = {
     "transformers": struct(
@@ -71,21 +72,6 @@ def attributed(m, arch):
         attribute(arch + ".attention.head_count", m.q_heads),
         attribute(arch + ".attention.sliding_window", m.sliding.window),
     ]
-
-def product(xs):
-    out = 1
-    for x in xs:
-        out *= x
-    return out
-
-def flattened(name, w):
-    """The tensor `name` as stored, read as `w`'s shape; a single stored
-    value is read as any shape."""
-    held = shape(name)
-    if product(held) > 1 and product(held) != product(w.shape):
-        fail("`{}` is stored {} ({} elements) and the plan reads it as {} ({} elements)".format(
-            name, held, product(held), w.shape, product(w.shape)))
-    return src(name).transmute(w.shape, stored(name))
 
 def safetensors(m, reads, layout):
     at = lambda leaf: layout.trunk + leaf
@@ -158,7 +144,7 @@ def safetensors(m, reads, layout):
         t = m.tower
         v = lambda s: layout.vision + s
         reads.read(t.patch_embed, v("patch_embedder.input_proj.weight"))
-        reads.read_expr(t.pos_embed, flattened(v("patch_embedder.position_embedding_table"), t.pos_embed))
+        reads.read_expr(t.pos_embed, flattened(v("patch_embedder.position_embedding_table"), t.pos_embed.shape, broadcast = True))
         reads.read(t.projection, layout.embed_vision)
         if t.std != None:
             reads.read(t.std.bias, v("std_bias"))
@@ -192,7 +178,7 @@ def safetensors(m, reads, layout):
                         (k.out_lo, "output_min"),
                         (k.out_hi, "output_max"),
                     ]:
-                        reads.read_expr(weight_, flattened(stem + "." + suffix, weight_))
+                        reads.read_expr(weight_, flattened(stem + "." + suffix, weight_.shape, broadcast = True))
 
     if m.self_cond != None:
         sc = m.self_cond

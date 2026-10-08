@@ -2,19 +2,7 @@
 # `aux.`, as the drafter's own release spells it. `norm(name)` reads one of
 # its norms as the trunk's checkpoint states norms.
 
-def product(xs):
-    out = 1
-    for x in xs:
-        out *= x
-    return out
-
-def flattened(name, w):
-    """The tensor `name` as stored, read as `w`'s shape."""
-    held = shape(name)
-    if product(held) != product(w.shape):
-        fail("`{}` is stored {} ({} elements) and the plan reads it as {} ({} elements)".format(
-            name, held, product(held), w.shape, product(w.shape)))
-    return src(name).transmute(w.shape, stored(name))
+load("//lib/reads/formats.star", "flattened")
 
 def bind_aux(d, reads, norm):
     reads.read_expr(d.hidden_norm, norm("aux.hidden_norm.weight"))
@@ -37,7 +25,7 @@ def bind_aux(d, reads, norm):
         reads.read_expr(block.mlp_norm, norm(n("post_attention_layernorm.weight")))
         for c, which in [(block.attn_conv, "attention_conv"), (block.mlp_conv, "mlp_conv")]:
             if c != None:
-                reads.read_expr(c.base, flattened(n("{}.base_kernel".format(which)), c.base))
+                reads.read_expr(c.base, flattened(n("{}.base_kernel".format(which)), c.base.shape))
                 reads.read(c.proj, n("{}.kernel_projection.weight".format(which)))
         reads.read_concat(block.mlp.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
         reads.read(block.mlp.down, n("mlp.down_proj.weight"))

@@ -2,9 +2,8 @@
 # sliding window, YaRN rope, and routed experts with biases, their banks
 # stored as the second dtype of a deployment's weights.
 
+load("//lib/adapters/model.star", "banks")
 load("//lib/dflash/model.star", "declare", "head")
-
-ADAPTERS = struct(slots = 8, rank = 16)
 
 def dims(layers = 24, experts = 32):
     return struct(
@@ -50,12 +49,6 @@ DFLASH_20B = head(
 
 WINDOWED = 0
 FULL = 1
-
-def banks(prefix, hidden, dense):
-    return (
-        weight(prefix + ".lora_a", [ADAPTERS.slots, ADAPTERS.rank, hidden], dense).registered(),
-        weight(prefix + ".lora_b", [ADAPTERS.slots, hidden, ADAPTERS.rank], dense).registered(),
-    )
 
 def layout(id, deploy):
     if len(deploy.weights) != 2:

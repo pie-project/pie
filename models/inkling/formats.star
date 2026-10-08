@@ -1,24 +1,12 @@
 # How an Inkling checkpoint is laid out: the language model under
 # `model.llm.`, its MLPs' gate and up projections interleaved row by row.
 
+load("//lib/reads/formats.star", "flattened")
+
 TRUNK = "model.llm."
 
 def formats(m):
     return [format("huggingface", read = lambda reads: huggingface(m, reads))]
-
-def flattened(name, w):
-    """The tensor `name` as stored, read as `w`'s shape."""
-    held, want = shape(name), w.shape
-    if product(held) != product(want):
-        fail("`{}` is stored {} ({} elements) and the plan reads it as {} ({} elements)".format(
-            name, held, product(held), want, product(want)))
-    return src(name).transmute(want, stored(name))
-
-def product(xs):
-    out = 1
-    for x in xs:
-        out *= x
-    return out
 
 def huggingface(m, reads):
     at = lambda leaf: TRUNK + leaf
@@ -44,7 +32,7 @@ def huggingface(m, reads):
             (w.attn_conv, "attn_sconv.weight"),
             (w.mlp_conv, "mlp_sconv.weight"),
         ]:
-            reads.read_expr(weight, flattened(n(leaf), weight))
+            reads.read_expr(weight, flattened(n(leaf), weight.shape))
         f = w.mlp
         if not f.routed:
             w13 = src(n("mlp.w13_dn.weight"))

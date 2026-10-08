@@ -3,9 +3,8 @@
 # shared tail, per-layer embeddings (E4B), routed experts beside the dense
 # MLP (26B-A4B), a vision tower, and the drafters each pairs with.
 
+load("//lib/adapters/model.star", "banks")
 load("//lib/dflash/model.star", dflash_head = "head", dflash_declare = "declare")
-
-ADAPTERS = struct(slots = 8, rank = 16)
 
 SLIDING = 0
 GLOBAL = 1
@@ -134,12 +133,6 @@ def dims(id, deploy):
         extra["self_cond_w"] = weights[2]
         return a4b(), extra, weights[0], weights[1]
     fail("diffusiongemma-26b-a4b does not ship {}".format(deploy))
-
-def banks(prefix, hidden, dense):
-    return (
-        weight(prefix + ".lora_a", [ADAPTERS.slots, ADAPTERS.rank, hidden], dense).registered(),
-        weight(prefix + ".lora_b", [ADAPTERS.slots, hidden, ADAPTERS.rank], dense).registered(),
-    )
 
 def layout(id, deploy):
     d, extra, w, xw = dims(id, deploy)

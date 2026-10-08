@@ -1,7 +1,7 @@
 # Muse Glimmer: a dense decoder of sliding-window layers with a full-attention
 # layer every fourth, gated attention and sandwich norms.
 
-ADAPTERS = struct(slots = 8, rank = 16)
+load("//lib/adapters/model.star", "banks")
 
 def b30(layers = 52):
     return struct(
@@ -26,12 +26,6 @@ DIMS = {
     "muse-glimmer-30b": b30(),
     "muse-glimmer-30b-mini-l8": b30(layers = 8),
 }
-
-def banks(prefix, hidden, dense):
-    return (
-        weight(prefix + ".lora_a", [ADAPTERS.slots, ADAPTERS.rank, hidden], dense).registered(),
-        weight(prefix + ".lora_b", [ADAPTERS.slots, hidden, ADAPTERS.rank], dense).registered(),
-    )
 
 def layout(id, deploy):
     if len(deploy.weights) != 1:

@@ -2,7 +2,7 @@
 # fourth, one dense layer and then routed experts (in the released model a
 # latent MoE), the residual stream carried as AttnRes blocks.
 
-ADAPTERS = struct(slots = 8, rank = 16)
+load("//lib/adapters/model.star", "banks")
 
 # Where AttnRes blends the residual stream with its closed blocks.
 AT_BLOCK_START = "at_block_start"
@@ -91,12 +91,6 @@ DIMS = {
 
 def closes_a_block(l, every):
     return every > 0 and (l + 1) % every == 0
-
-def banks(prefix, hidden, dense):
-    return (
-        weight(prefix + ".lora_a", [ADAPTERS.slots, ADAPTERS.rank, hidden], dense).registered(),
-        weight(prefix + ".lora_b", [ADAPTERS.slots, hidden, ADAPTERS.rank], dense).registered(),
-    )
 
 def layout(id, deploy):
     if len(deploy.weights) != 2 or deploy.weights[0] != dtype.bf16:

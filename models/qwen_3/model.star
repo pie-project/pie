@@ -3,9 +3,8 @@
 # EAGLE draft head or a DFlash-family block drafter; Ternary-Bonsai's
 # rotation signs; and the small geometries the engines' tests serve.
 
+load("//lib/adapters/model.star", "banks")
 load("//lib/dflash/model.star", dflash_declare = "declare", dflash_head = "head", "markov", "selector")
-
-ADAPTERS = struct(slots = 8, rank = 16)
 
 # The Bonsai online-Hadamard rotation: a sign diagonal per rotated input width.
 BONSAI_WIDTHS = struct(hidden = 5120, ssm = 6144, ffn_down = 17408)
@@ -166,12 +165,6 @@ def drafted(id, deploy):
     if drafter != None:
         refuse()
     return dict(FIXED[id])
-
-def banks(prefix, hidden, dense):
-    return (
-        weight(prefix + ".lora_a", [ADAPTERS.slots, ADAPTERS.rank, hidden], dense).registered(),
-        weight(prefix + ".lora_b", [ADAPTERS.slots, hidden, ADAPTERS.rank], dense).registered(),
-    )
 
 def gated_attn(w, d, prefix, kv):
     n = lambda s: "{}.{}".format(prefix, s)

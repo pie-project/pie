@@ -4,6 +4,7 @@
 # contract carries as constants.
 
 load("//lib/dflash/formats.star", "bind_aux")
+load("//lib/reads/formats.star", "flattened", "squeezed")
 
 LAYOUTS = {
     "transformers": struct(
@@ -86,33 +87,6 @@ def attributed(m, arch):
         states.append(attribute(arch + ".rope.freq_base", theta(m)))
     return states
 
-def product(xs):
-    out = 1
-    for x in xs:
-        out *= x
-    return out
-
-def flattened(name, w):
-    """The tensor `name` as stored, read as `w`'s shape; a single stored
-    value is read as any shape."""
-    held = shape(name)
-    if product(held) > 1 and product(held) != product(w.shape):
-        fail("`{}` is stored {} ({} elements) and the plan reads it as {} ({} elements)".format(
-            name, held, product(held), w.shape, product(w.shape)))
-    return src(name).transmute(w.shape, stored(name))
-
-def squeezed(name):
-    """A depthwise convolution bank stored `[channels, 1, kernel]` or
-    `[channels, kernel, 1]`, read as `[channels, kernel]`."""
-    held = shape(name)
-    if len(held) == 3 and held[1] == 1:
-        channels, kernel = held[0], held[2]
-    elif len(held) == 3 and held[2] == 1:
-        channels, kernel = held[0], held[1]
-    else:
-        fail("`{}`: a depthwise convolution bank is stored [channels, 1, kernel] or [channels, kernel, 1] and this one is stored {}".format(name, held))
-    return src(name).transmute([channels, kernel], stored(name))
-
 def spelled(names):
     """The first of `names` the checkpoint holds, or `None`."""
     for name in names:
@@ -176,7 +150,7 @@ def safetensors(m, reads, layout):
     if m.tower != None:
         t = m.tower
         v = lambda s: layout.tower + s
-        flat = flattened(v("patch_embed.proj.weight"), t.patch_embed)
+        flat = flattened(v("patch_embed.proj.weight"), t.patch_embed.shape, broadcast = True)
         if layout.folds_the_norm_one:
             # mlx_lm stores the patch embedding channels-last.
             per = t.patch_embed.shape[1] // 3

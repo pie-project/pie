@@ -1,7 +1,7 @@
 # The weights of GLM-5: three dense layers, then routed experts with a shared
 # one; each layer's attention latent (MLA) with an indexer of its own.
 
-ADAPTERS = struct(slots = 8, rank = 16)
+load("//lib/adapters/model.star", "banks")
 
 DIMS = {
     "glm5-a12b": struct(
@@ -29,12 +29,6 @@ DIMS = {
         norm_eps = 1e-5,
     ),
 }
-
-def banks(prefix, hidden, dense):
-    return (
-        weight(prefix + ".lora_a", [ADAPTERS.slots, ADAPTERS.rank, hidden], dense).registered(),
-        weight(prefix + ".lora_b", [ADAPTERS.slots, hidden, ADAPTERS.rank], dense).registered(),
-    )
 
 def layout(id, deploy):
     if len(deploy.weights) != 1:

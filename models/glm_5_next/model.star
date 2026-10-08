@@ -3,7 +3,7 @@
 # layers and then routed experts, the residual stream carried as four
 # hyper-connected streams; an optional vision tower and MTP draft head.
 
-ADAPTERS = struct(slots = 8, rank = 16)
+load("//lib/adapters/model.star", "banks")
 
 # How many tokens the draft head proposes per step.
 DRAFT_DEPTH = 1
@@ -52,12 +52,6 @@ DIMS = {
     # three dense KDA, DSA + MoE, three KDA + MoE, DSA.
     "glm53-flash-mini": flash(layers = 8, experts = 32),
 }
-
-def banks(prefix, hidden, dense):
-    return (
-        weight(prefix + ".lora_a", [ADAPTERS.slots, ADAPTERS.rank, hidden], dense).registered(),
-        weight(prefix + ".lora_b", [ADAPTERS.slots, hidden, ADAPTERS.rank], dense).registered(),
-    )
 
 def layout(id, deploy):
     vision = "vision" in deploy.parts

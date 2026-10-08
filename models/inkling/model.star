@@ -3,7 +3,7 @@
 # values and both residual branches; two dense layers, then routed experts
 # with sink experts always taken.
 
-ADAPTERS = struct(slots = 8, rank = 16)
+load("//lib/adapters/model.star", "banks")
 
 def dims(layers = 66, experts = 256):
     return struct(
@@ -40,12 +40,6 @@ DIMS = {
 
 LOCAL = 0
 GLOBAL = 1
-
-def banks(prefix, hidden, dense):
-    return (
-        weight(prefix + ".lora_a", [ADAPTERS.slots, ADAPTERS.rank, hidden], dense).registered(),
-        weight(prefix + ".lora_b", [ADAPTERS.slots, hidden, ADAPTERS.rank], dense).registered(),
-    )
 
 def layout(id, deploy):
     if len(deploy.weights) != 1:

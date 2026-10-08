@@ -3,6 +3,8 @@
 # fold one into the norms and lay the tower's patch embedding out channel
 # last.
 
+load("//lib/reads/formats.star", "flattened", "squeezed")
+
 TRANSFORMERS = "transformers"
 MLX = "mlx_lm"
 CHANNELS = 3
@@ -33,33 +35,6 @@ def formats(m):
         ),
     ]
 
-def product(xs):
-    out = 1
-    for x in xs:
-        out *= x
-    return out
-
-def flattened(name, want):
-    """The tensor `name` as stored, read as `want`; a stored scalar is read
-    as anything."""
-    held = shape(name)
-    if product(held) > 1 and product(held) != product(want):
-        fail("`{}` is stored {} ({} elements) and the plan reads it as {} ({} elements)".format(
-            name, held, product(held), want, product(want)))
-    return src(name).transmute(want, stored(name))
-
-def squeezed(name):
-    """A depthwise convolution bank, stored [channels, 1, kernel] or
-    [channels, kernel, 1], read as [channels, kernel]."""
-    held = shape(name)
-    if len(held) == 3 and held[1] == 1:
-        channels, kernel = held[0], held[2]
-    elif len(held) == 3 and held[2] == 1:
-        channels, kernel = held[0], held[1]
-    else:
-        fail("`{}`: a depthwise convolution bank is stored [channels, 1, kernel] or [channels, kernel, 1] and this one is stored {}".format(name, held))
-    return src(name).transmute([channels, kernel], stored(name))
-
 def read(m, reads, layout):
     folds = layout == MLX
 
@@ -88,7 +63,7 @@ def read(m, reads, layout):
     if t != None:
         v = lambda leaf: tower_of(layout, leaf)
         want = t.patch_embed.shape
-        flat = flattened(v("patch_embed.proj.weight"), want)
+        flat = flattened(v("patch_embed.proj.weight"), want, broadcast = True)
         if layout == MLX:
             per = want[1] // CHANNELS
             flat = flat.gather(1, [j * CHANNELS + c for c in range(CHANNELS) for j in range(per)])
