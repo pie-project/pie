@@ -20,7 +20,7 @@
   },
   "devDependencies": {
     "@bytecodealliance/componentize-js": "^0.22.0",
-    "@bytecodealliance/jco": "^1.34.0",
+    "@bytecodealliance/jco": "^1.36.1",
     "acorn": "^8.18.0",
     "esbuild": "^0.28.2",
     "typescript": "^7.0.2",
