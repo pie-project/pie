@@ -1,11 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use models::z_image::model::{self, Dims};
+mod z_image_dims;
+
 use models::{PortKind, ReadoutKind, ScheduleKind};
 use poem::{
     Attention, Def, Dim, Dtype, Elementwise, GeomKind, Operation, Platform, Request, RopeForm,
     RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
 };
+use z_image_dims::{self as model, Dims};
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
 

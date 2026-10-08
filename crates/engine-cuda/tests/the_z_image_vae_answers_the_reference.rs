@@ -5,32 +5,38 @@ use std::time::Instant;
 
 use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
-use models::z_image::model::Model;
-use models::z_image::vae;
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, trace_hybrid};
+use poem::Platform;
+use poem::star::Package;
 use poem_compiler::{Budget, VoxelLadder};
 
-struct OneArm {
-    model: Model,
-    decode: bool,
-}
+const ROW: &str = "z-image-turbo-bf16-kv-bf16";
 
-impl ForwardHybrid for OneArm {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
-    }
-    fn forward(&self, inputs: Input) -> Value {
-        let v = self
-            .model
-            .vae
-            .as_ref()
-            .expect("the flagship carries the VAE");
-        if self.decode {
-            vae::decode(&inputs, v)
-        } else {
-            vae::encode(&inputs, v)
+/// The flagship's package with a forward that runs one of its VAE's
+/// readings alone, over every row, and holds no caches.
+fn one_arm(decode: bool) -> Package {
+    let package = models::star::package_of("z-image-turbo").expect("z-image is a package");
+    let files_at = format!("{}files/", poem::star::ATTRIBUTE);
+    let mut files: Vec<(String, String)> = package
+        .attributes()
+        .into_iter()
+        .filter_map(|(key, source)| Some((key.strip_prefix(&files_at)?.to_string(), source)))
+        .collect();
+    for (file, source) in &mut files {
+        if file == "forward.star" {
+            *source = source
+                .replace("def caches(m, c):", "def every_cache(m, c):")
+                .replace("def forward(m, inputs):", "def every_reading(m, inputs):")
+                + &format!(
+                    "\ndef caches(m, c):\n    pass\n\ndef forward(m, inputs):\n    return {}(inputs, m.vae)\n",
+                    if decode { "decode" } else { "encode" }
+                );
         }
     }
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(f, s)| (f.as_str(), s.as_str()))
+        .collect();
+    Package::new(package.name(), &files).unwrap_or_else(|why| panic!("{why:#}"))
 }
 
 fn hub() -> PathBuf {
@@ -111,23 +117,25 @@ fn fire(
     clip: [u32; 3],
     payload: &[f32],
 ) -> (Vec<f32>, Vec<[u32; 3]>, f64, f64) {
-    let model = Model::turbo(Dtype::Bf16);
+    let row = models::deployment(ROW).expect("the flagship row");
     let src = checkpoint::file::diffusers::open(root)
         .unwrap_or_else(|why| panic!("{}: {why}", root.display()));
-    let mut contract = model
-        .import_vae(&src, Platform::Cuda)
-        .unwrap_or_else(|why| panic!("the VAE does not read the snapshot: {why}"));
+    let mut contract = row
+        .contract(&src, Platform::Cuda)
+        .unwrap_or_else(|why| panic!("the pipeline does not read the snapshot: {why}"));
     drop(src);
-    let arm = OneArm { model, decode };
-    let trace = trace_hybrid(
-        if decode {
-            "z-image-vae-decode"
-        } else {
-            "z-image-vae-encode"
-        },
-        &arm,
-        Platform::Cuda,
-    );
+    let trace = one_arm(decode)
+        .trace(
+            row.entry.id,
+            &models::star::deploy(&row.deploy),
+            if decode {
+                "z-image-vae-decode"
+            } else {
+                "z-image-vae-encode"
+            },
+            Platform::Cuda,
+        )
+        .unwrap_or_else(|why| panic!("{why:#}"));
     let mut keep: std::collections::BTreeSet<String> =
         trace.params.iter().map(|p| p.name.clone()).collect();
     loop {

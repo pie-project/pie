@@ -4,8 +4,10 @@ use checkpoint::executor::Execution;
 use checkpoint::executor::sink::MemorySink;
 use checkpoint::file::read::parse_metadata;
 use checkpoint::plan::{StorageTarget, compile_streaming};
-use models::z_image::model::Dims;
+mod z_image_dims;
+
 use poem::Platform;
+use z_image_dims::Dims;
 
 const MINI: &str = "z-image-mini-bf16-kv-bf16";
 

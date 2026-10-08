@@ -129,7 +129,6 @@ static FAMILIES: LazyLock<Vec<Vec<catalog::Entry>>> = LazyLock::new(|| {
         deepseek_v4::entries(),
         flux_2::entries(),
         qwen_3::entries(),
-        z_image::entries(),
         wan_2::entries(),
         ltx_2::entries(),
     ];

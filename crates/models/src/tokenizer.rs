@@ -23,6 +23,7 @@ pub fn named(name: &str) -> Option<&'static Contract> {
         "hunyuan_image_3" => Some(&crate::hunyuan_image_3::tokenizer::CONTRACT),
         "glm_5_next" => Some(&crate::glm_5_next::tokenizer::CONTRACT),
         "kimi_k3" => Some(&crate::kimi_k3::tokenizer::CONTRACT),
+        "z_image" => Some(&crate::z_image::tokenizer::CONTRACT),
         "mini_dit" => Some(&crate::mini_dit::tokenizer::CONTRACT),
         "gpt_oss" => Some(&crate::gpt_oss::tokenizer::CONTRACT),
         "inkling" => Some(&crate::inkling::tokenizer::CONTRACT),

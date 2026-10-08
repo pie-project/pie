@@ -5,8 +5,10 @@ use checkpoint::contract::Partition;
 use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{Expr, ModelContract, TensorType};
 use checkpoint::plan::StorageTarget;
-use models::z_image::model::{self, Dims};
+mod z_image_dims;
+
 use poem::Platform;
+use z_image_dims::{self as model, Dims};
 use ztensor::Leaf;
 use ztensor::provide::{Catalog, Entry, Location, Store, StoreId};
 

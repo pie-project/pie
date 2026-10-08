@@ -34,6 +34,7 @@ pub fn named(name: &str) -> Option<TemplateFn> {
         "glm_5_next" => Some(crate::glm_5_next::template::instruct),
         "kimi_k3" => Some(crate::kimi_k3::template::instruct),
         "kimi_k3.instruct3" => Some(crate::kimi_k3::template::instruct3),
+        "z_image" => Some(crate::z_image::template::instruct),
         "mini_dit" => Some(crate::mini_dit::template::instruct),
         "gpt_oss" => Some(crate::gpt_oss::template::gpt_oss),
         "inkling" => Some(crate::inkling::template::inkling),
