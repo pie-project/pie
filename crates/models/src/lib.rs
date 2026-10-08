@@ -249,7 +249,6 @@ static FAMILIES: LazyLock<Vec<Vec<catalog::Entry>>> = LazyLock::new(|| {
         flux_2::entries(),
         gemma_4::entries(),
         gemma_4_diffusion::entries(),
-        glm_5::entries(),
         glm_5_next::entries(),
         gpt_oss::entries(),
         hunyuan_image_3::entries(),

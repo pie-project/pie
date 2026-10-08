@@ -18,6 +18,7 @@ pub fn contract_of(name: &str) -> Option<&'static Contract> {
 #[must_use]
 pub fn named(name: &str) -> Option<&'static Contract> {
     match name {
+        "glm_5" => Some(&crate::glm_5::tokenizer::CONTRACT),
         "muse_glimmer" => Some(&crate::muse_glimmer::tokenizer::CONTRACT),
         _ => None,
     }
