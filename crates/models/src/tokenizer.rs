@@ -19,6 +19,7 @@ pub fn contract_of(name: &str) -> Option<&'static Contract> {
 pub fn named(name: &str) -> Option<&'static Contract> {
     match name {
         "gemma_4" => Some(&crate::gemma_4::tokenizer::CONTRACT),
+        "hunyuan_image_3" => Some(&crate::hunyuan_image_3::tokenizer::CONTRACT),
         "mini_dit" => Some(&crate::mini_dit::tokenizer::CONTRACT),
         "gpt_oss" => Some(&crate::gpt_oss::tokenizer::CONTRACT),
         "inkling" => Some(&crate::inkling::tokenizer::CONTRACT),

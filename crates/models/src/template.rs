@@ -29,6 +29,7 @@ pub fn template_of(name: &str) -> Option<TemplateFn> {
 pub fn named(name: &str) -> Option<TemplateFn> {
     match name {
         "gemma_4" => Some(crate::gemma_4::template::gemma4),
+        "hunyuan_image_3" => Some(crate::hunyuan_image_3::template::instruct),
         "mini_dit" => Some(crate::mini_dit::template::instruct),
         "gpt_oss" => Some(crate::gpt_oss::template::gpt_oss),
         "inkling" => Some(crate::inkling::template::inkling),
