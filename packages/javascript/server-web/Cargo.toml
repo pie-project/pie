@@ -3,22 +3,22 @@ name = "pie-browser"
 version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "pie in a browser tab: the runtime, the WebGPU engine and the Pulley-interpreted inferlet sandbox compiled to wasm32, driven by the page through a handful of exports. The client protocol is the same ClientMessage/ServerMessage the WebSocket carries natively, as JSON."
+description = "pie in a browser tab: the runtime, the WebGPU engine and the Pulley-interpreted inferlet sandbox compiled to wasm32, driven by the page through a handful of exports. Sessions carry the same MessagePack frames as `pie serve`'s WebSocket."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
 [lib]
 name = "pie_browser"
 crate-type = ["cdylib", "rlib"]
-path = "src/lib.rs"
+path = "rust/lib.rs"
 
 [dependencies]
-runtime = { path = "../runtime", features = ["wgpu"] }
-engine-wgpu = { path = "../engine-wgpu", features = ["wgpu"] }
-poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
+runtime = { path = "../../../crates/runtime", features = ["wgpu"] }
+engine-wgpu = { path = "../../../crates/engine-wgpu", features = ["wgpu"] }
+poem-ir = { package = "pie-poem-ir", path = "../../../crates/poem-ir" }
 ztensor = { workspace = true }
-web-std = { path = "../web-std" }
-wasmtime-web = { path = "../wasmtime-web" }
+web-std = { path = "../../../crates/web-std" }
+wasmtime-web = { path = "../../../crates/wasmtime-web" }
 anyhow = "1.0"
 serde_json = "1.0"
 toml = "1.1"
