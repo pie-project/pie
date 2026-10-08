@@ -67,7 +67,7 @@ cargo install wasm-bindgen-cli --version 0.2.128 --locked   # must match Cargo.l
 ./packages/javascript/server-web/build.sh          # release; `min` for the 23 MB shipping build, `dev` for debug
 ```
 
-`build.sh` builds `crates/browser`, runs wasm-bindgen into `pkg/`, and bundles
+`build.sh` builds the crate in `rust/`, runs wasm-bindgen into `pkg/`, and bundles
 `src/` with esbuild into `dist/` (`npm run bundle`). The package's own
 dependencies are installed on the first run. Tests, benchmarks and CI gates
 live under `tests/browser` (see its README).
@@ -76,7 +76,7 @@ live under `tests/browser` (see its README).
 
 | piece | what it does |
 |---|---|
-| `crates/browser` | The wasm-bindgen host: boot, install, sessions speaking the MessagePack frames `pie serve`'s WebSocket carries, `pie_tick`. |
+| `rust/` (crate `pie-browser`) | The wasm-bindgen host: boot, install, sessions speaking the MessagePack frames `pie serve`'s WebSocket carries, `pie_tick`. |
 | `crates/wasmtime-web` | wasmtime in a tab: heap-backed "virtual memory", TLS slots, fibers implemented by the page's JSPI glue (`src/platform.mjs`), and the WASI host for the inferlet's imports (cli, io, clocks, random; 0.2 linked by hand, the 0.3 clocks from `crates/inferlet/wit`). The 0.2 filesystem and http interfaces a JavaScript or Python guest runtime imports regardless are stubbed per component, so they link and only a call fails. |
 | `crates/web-std` | The executor the page ticks, timers over `performance.now()`, crossbeam-shaped channels, and green threads on fibers. The runtime's scheduler and engine lanes run on those unchanged; `crates/runtime`'s `rt` facade names it on wasm32. |
 | `crates/engine-wgpu` | The same engine on both hosts, written for the browser: no GPU wait blocks, every step lands by callback, guests run from the landing. What differs by host sits in `device/host.rs`. |

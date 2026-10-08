@@ -53,7 +53,7 @@ members = [
     "crates/kernels-xla",
     "crates/engine-xla",
     "crates/web-std",
-    "crates/browser",
+    "packages/javascript/server-web",
     "packages/swift/core",
 
     "packages/python/server",
