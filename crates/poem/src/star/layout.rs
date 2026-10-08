@@ -90,6 +90,15 @@ pub(crate) fn numbers(builder: &mut GlobalsBuilder) {
     fn sqrt(#[starlark(require = pos)] x: UnpackFloat) -> anyhow::Result<f64> {
         Ok(x.0.sqrt())
     }
+
+    fn exp(#[starlark(require = pos)] x: UnpackFloat) -> anyhow::Result<f64> {
+        Ok(x.0.exp())
+    }
+
+    /// `x` rounded to an f32, its exponential as an f32 computes it.
+    fn expf(#[starlark(require = pos)] x: UnpackFloat) -> anyhow::Result<f64> {
+        Ok(f64::from((x.0 as f32).exp()))
+    }
 }
 
 /// The `dtype` namespace: every dtype, by the name the catalog spells it.
