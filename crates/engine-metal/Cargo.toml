@@ -37,6 +37,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSString",
     "NSError",
     "NSRange",
+    "NSProcessInfo",
 ] }
 objc2-metal = { version = "0.3", default-features = false, features = [
     "std",

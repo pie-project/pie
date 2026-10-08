@@ -149,8 +149,9 @@ impl Pipelines {
             flat.push('\n');
         }
         let source = super::ctx::nsstring(&flat);
+        let options = super::ctx::compile_options();
         let library = device
-            .newLibraryWithSource_options_error(&source, None)
+            .newLibraryWithSource_options_error(&source, Some(&options))
             .map_err(|error| Fault::Shader {
                 file: fire.file,
                 entrypoint: fire.entrypoint,
