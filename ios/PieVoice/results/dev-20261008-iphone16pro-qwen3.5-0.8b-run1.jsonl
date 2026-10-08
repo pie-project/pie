@@ -1,0 +1,8 @@
+{"model":"Qwen3.5-0.8B","device":"device:iPhone17,1","footprint_mb_baseline":15.219650268554688,"event":"start","engine":"Qwen3.5-0.8B · Metal · inferlets on wasmtime Pulley"}
+{"event":"warmup","seconds":0.30106997489929199,"footprint_mb":654.29857635498047}
+{"ttft_s":0.25032007694244385,"total_s":1.949766993522644,"event":"turn","reused":0,"footprint_mb":714.09549713134766,"prefill":87,"utterance":"What is one good reason to run a language model on a phone instead of in the cloud?","note":"","decode_tps":35.89403081959771,"chars":310,"prompt":87,"generated":61,"turn":1}
+{"ttft_s":0.19811201095581055,"total_s":0.6619030237197876,"event":"turn","reused":64,"footprint_mb":784.47056579589844,"prefill":101,"utterance":"Can you say that more simply?","note":"","decode_tps":66.840450001940596,"chars":147,"prompt":165,"generated":31,"turn":2}
+{"ttft_s":0.14635193347930908,"total_s":0.62580692768096924,"event":"turn","reused":128,"footprint_mb":849.31436157226562,"prefill":87,"utterance":"What is the hardest part of doing that?","note":"","decode_tps":68.828149459467525,"chars":160,"prompt":215,"generated":33,"turn":3}
+{"prefill":76,"total_s":1.0892699956893921,"prompt":268,"footprint_mb":913.689453125,"ttft_s":0.18297302722930908,"event":"turn","chars":313,"reused":192,"note":"","utterance":"Give me one example of where that would matter.","generated":65,"turn":4,"decode_tps":71.720420857683649}
+{"prefill":96,"total_s":1.0612039566040039,"prompt":352,"footprint_mb":976.54887390136719,"ttft_s":0.1320040225982666,"event":"turn","chars":313,"reused":256,"note":"","utterance":"How would you explain that to someone new?","generated":65,"turn":5,"decode_tps":69.952652406880887}
+{"model":"Qwen3.5-0.8B","event":"done","peak_footprint_mb":976.54887390136719}

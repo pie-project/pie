@@ -1,0 +1,4 @@
+# Share the repository's target dir: every Pie crate is already compiled
+# there for aarch64-apple-ios, and the app's build scripts look there.
+[build]
+target-dir = "../../target"

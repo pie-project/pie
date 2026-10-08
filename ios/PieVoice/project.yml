@@ -4,11 +4,12 @@
 #   cd ios/PieVoice && xcodegen
 #   open PieVoice.xcodeproj   → select your team under Signing → Run
 #
-# Prerequisites, built from the repo root:
+# Prerequisites, built from the repo root (deploy-device.sh does all of it):
 #   (cd ios/pie-shim && cargo build --release --target aarch64-apple-ios)      # device
 #   (cd ios/pie-shim && cargo build --release --target aarch64-apple-ios-sim)  # simulator
-#   (cd inferlets/voice-chat && cargo build --release --target wasm32-wasip2)
-#   model at target/qwen3-gguf/Qwen3-0.6B-Q4_K_M.gguf
+#   (cd examples && cargo build --release --target wasm32-wasip2 -p voice-chat)
+#   model artifact directory at Resources/models/Qwen--Qwen3.5-0.8B/
+#     (copied from $PIE_HOME/models after `pie model import Qwen/Qwen3.5-0.8B`)
 #   bash ios/voice-app/make-samples.sh ios/PieVoice/Resources
 name: PieVoice
 options:
@@ -24,11 +25,9 @@ targets:
     sources:
       - path: ../voice-app/Sources
       # Individual files land at the bundle root; the model keeps its
-      # qwen3-gguf/ directory via a folder reference — matching the layout
-      # build-app.sh assembles and the paths PieRuntimeConfig expects.
+      # models/<name>/ directory via a folder reference — the layout
+      # PieRuntimeConfig expects, and the one a Pie store uses.
       - path: Resources/voice_chat.wasm
-        buildPhase: resources
-      - path: Resources/voice-chat-Pie.toml
         buildPhase: resources
       - path: Resources/sample-question-1.wav
         buildPhase: resources
@@ -36,7 +35,7 @@ targets:
         buildPhase: resources
       - path: Resources/sample-question-3.wav
         buildPhase: resources
-      - path: Resources/qwen3-gguf
+      - path: Resources/models
         type: folder
         buildPhase: resources
     settings:
@@ -45,10 +44,11 @@ targets:
         INFOPLIST_FILE: Info.plist
         SWIFT_VERSION: "5.9"
         IPHONEOS_DEPLOYMENT_TARGET: "17.0"
-        # The Rust shim staticlib: per-SDK search path picks the device or
-        # simulator build automatically.
-        LIBRARY_SEARCH_PATHS[sdk=iphoneos*]: $(SRCROOT)/../pie-shim/target/aarch64-apple-ios/release
-        LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]: $(SRCROOT)/../pie-shim/target/aarch64-apple-ios-sim/release
+        # The Rust shim staticlib, built into the repository target
+        # directory: per-SDK search path picks the device or simulator
+        # build automatically.
+        LIBRARY_SEARCH_PATHS[sdk=iphoneos*]: $(SRCROOT)/../../target/aarch64-apple-ios/release
+        LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]: $(SRCROOT)/../../target/aarch64-apple-ios-sim/release
         OTHER_LDFLAGS: >-
           -lpie_ios_shim -lresolv -lc++
           -Xlinker -U -Xlinker _SCDynamicStoreCopyComputerName
@@ -63,6 +63,6 @@ targets:
       - sdk: Security.framework
       - sdk: CoreFoundation.framework
       - sdk: SystemConfiguration.framework
-      - sdk: Accelerate.framework
+      - sdk: Metal.framework
       - sdk: AVFoundation.framework
       - sdk: Speech.framework

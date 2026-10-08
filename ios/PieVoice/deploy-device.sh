@@ -6,10 +6,23 @@
 #   bash ios/PieVoice/deploy-device.sh --no-rust  # skip the cargo steps (Swift-only change)
 #   bash ios/PieVoice/deploy-device.sh --log      # just pull the on-device console log
 #
+# What it builds and stages (Pie 0.5):
+#   - the engine shim, ios/pie-shim, for arm64 iOS into the repository
+#     target directory (target/aarch64-apple-ios/release/libpie_ios_shim.a,
+#     where project.yml links it from)
+#   - the voice-chat inferlet from the examples workspace (wasm32-wasip2),
+#     copied to Resources/voice_chat.wasm
+#   - the model artifact directory, copied from a Pie store into
+#     Resources/models/Qwen--Qwen3.5-0.8B/ (one .zt file; import it on the
+#     Mac first with `pie model import Qwen/Qwen3.5-0.8B`)
+#
 # Environment overrides:
 #   DEVELOPMENT_TEAM  Apple team id      (default: Aarush's Personal Team)
 #   DEVICE            CoreDevice id/UDID (default: the first connected iPhone)
-#   CONFIGURATION     Release | Debug    (default: Release — Debug ggml is ~1 tok/s)
+#   CONFIGURATION     Release | Debug    (default: Release)
+#   PIE_STORE         Pie home holding models/ (default: $PIE_HOME, else
+#                     ~/random/pie-05-home)
+#   MODEL_DIR         the artifact directory itself, overriding PIE_STORE
 #
 # Why re-sign every time: a free Apple ID's provisioning profile lasts 7 days.
 # Each run mints a fresh one, so "it worked last week" never becomes "the app
@@ -23,8 +36,11 @@ TEAM=${DEVELOPMENT_TEAM:-JQ8RG44463}
 CONFIGURATION=${CONFIGURATION:-Release}
 DERIVED="$HERE/build/DerivedData"
 APP="$DERIVED/Build/Products/$CONFIGURATION-iphoneos/PieVoice.app"
-MODELS_DIR=${MODELS_DIR:-$HOME/random/pie-models}
-BUNDLED_MODEL=Qwen3-0.6B-Q4_K_M.gguf
+PIE_STORE=${PIE_STORE:-${PIE_HOME:-$HOME/random/pie-05-home}}
+BUNDLED_MODEL=Qwen--Qwen3.5-0.8B
+MODEL_DIR=${MODEL_DIR:-$PIE_STORE/models/$BUNDLED_MODEL}
+SHIM_LIB="$ROOT/target/aarch64-apple-ios/release/libpie_ios_shim.a"
+WASM="$ROOT/examples/target/wasm32-wasip2/release/voice_chat.wasm"
 LOG_LOCAL="$HERE/build/pie-console.log"
 
 DO_RUST=1
@@ -33,7 +49,7 @@ for arg in "$@"; do
   case "$arg" in
     --no-rust) DO_RUST=0 ;;
     --log) ONLY_LOG=1 ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
   esac
 done
@@ -130,39 +146,52 @@ wait_for_device
 # ── 2. Rust: engine shim for the device + the inferlet ───────────────────────
 if [ $DO_RUST -eq 1 ]; then
   bold "Building the Pie engine shim for arm64 iOS (incremental)"
-  rustup target list --installed | grep -q '^aarch64-apple-ios$' || rustup target add aarch64-apple-ios
-  rustup target list --installed | grep -q '^wasm32-wasip2$'     || rustup target add wasm32-wasip2
-  ( cd "$ROOT/ios/pie-shim" && cargo build --release --target aarch64-apple-ios 2>&1 | tail -3 ) \
+  # rust-toolchain.toml pins the toolchain, so the target checks run from
+  # inside the repo to hit the pinned one rather than the default.
+  ( cd "$ROOT" && rustup target list --installed | grep -q '^aarch64-apple-ios$' ) \
+    || ( cd "$ROOT" && rustup target add aarch64-apple-ios )
+  ( cd "$ROOT" && rustup target list --installed | grep -q '^wasm32-wasip2$' ) \
+    || ( cd "$ROOT" && rustup target add wasm32-wasip2 )
+  # The shim is its own cargo workspace; pinning the target directory keeps
+  # the staticlib where project.yml links it from, whatever the crate's
+  # own settings say.
+  ( cd "$ROOT/ios/pie-shim" \
+      && CARGO_TARGET_DIR="$ROOT/target" cargo build --release --target aarch64-apple-ios 2>&1 | tail -3 ) \
     || die "cargo build of ios/pie-shim failed"
-  [ -f "$ROOT/ios/pie-shim/target/aarch64-apple-ios/release/libpie_ios_shim.a" ] \
-    || die "shim staticlib missing after build"
+  [ -f "$SHIM_LIB" ] || die "shim staticlib missing after build: $SHIM_LIB"
 
   bold "Building the voice-chat inferlet (wasm32-wasip2)"
-  ( cd "$ROOT/inferlets/voice-chat" && cargo build --release --target wasm32-wasip2 2>&1 | tail -2 ) \
-    || die "cargo build of inferlets/voice-chat failed"
+  ( cd "$ROOT/examples" && cargo build --release --target wasm32-wasip2 -p voice-chat 2>&1 | tail -2 ) \
+    || die "cargo build of examples/voice-chat failed"
+  [ -f "$WASM" ] || die "inferlet component missing after build: $WASM"
   mkdir -p "$HERE/Resources"
-  cp "$ROOT/inferlets/voice-chat/target/wasm32-wasip2/release/voice_chat.wasm" "$HERE/Resources/"
-  cp "$ROOT/inferlets/voice-chat/Pie.toml" "$HERE/Resources/voice-chat-Pie.toml"
+  cp "$WASM" "$HERE/Resources/voice_chat.wasm"
 fi
 
 # ── 3. Bundle contents ───────────────────────────────────────────────────────
 bold "Checking bundle resources"
-mkdir -p "$HERE/Resources/qwen3-gguf"
-if [ ! -f "$HERE/Resources/qwen3-gguf/$BUNDLED_MODEL" ]; then
-  for src in "$ROOT/target/qwen3-gguf/$BUNDLED_MODEL" "$MODELS_DIR/$BUNDLED_MODEL"; do
-    if [ -f "$src" ]; then
-      echo "staging model from $src"
-      ln -f "$src" "$HERE/Resources/qwen3-gguf/$BUNDLED_MODEL" 2>/dev/null \
-        || cp "$src" "$HERE/Resources/qwen3-gguf/$BUNDLED_MODEL"
-      break
-    fi
+STAGED_MODEL="$HERE/Resources/models/$BUNDLED_MODEL"
+if ! ls "$STAGED_MODEL"/*.zt >/dev/null 2>&1; then
+  ls "$MODEL_DIR"/*.zt >/dev/null 2>&1 \
+    || die "no .zt artifact in $MODEL_DIR — import the model on this Mac first: pie model import Qwen/Qwen3.5-0.8B (or point MODEL_DIR at an imported artifact directory)"
+  echo "staging model from $MODEL_DIR"
+  mkdir -p "$STAGED_MODEL"
+  # Every file of the artifact directory: a sharded artifact is a root
+  # plus numbered shards, and the engine expects them side by side.
+  # Hard-link when possible — a copy per deploy is pure waste.
+  for src in "$MODEL_DIR"/*; do
+    [ -f "$src" ] || continue
+    ln -f "$src" "$STAGED_MODEL/$(basename "$src")" 2>/dev/null \
+      || cp "$src" "$STAGED_MODEL/$(basename "$src")"
   done
 fi
-[ -f "$HERE/Resources/qwen3-gguf/$BUNDLED_MODEL" ] || die "model $BUNDLED_MODEL not found (looked in target/qwen3-gguf and $MODELS_DIR)"
+ls "$STAGED_MODEL"/*.zt >/dev/null 2>&1 || die "model artifact missing from $STAGED_MODEL"
 [ -f "$HERE/Resources/voice_chat.wasm" ] || die "Resources/voice_chat.wasm missing — run without --no-rust once"
 [ -f "$HERE/Resources/sample-question-1.wav" ] || bash "$ROOT/ios/voice-app/make-samples.sh" "$HERE/Resources"
-for f in voice_chat.wasm voice-chat-Pie.toml "qwen3-gguf/$BUNDLED_MODEL" sample-question-1.wav; do
-  printf '  %-40s %s\n' "$f" "$(du -h "$HERE/Resources/$f" | cut -f1)"
+# Absolute paths: the script is run from the repository root, so a glob
+# relative to Resources/ would never match.
+for f in "$HERE/Resources/voice_chat.wasm" "$HERE/Resources/sample-question-1.wav" "$STAGED_MODEL"/*.zt; do
+  printf '  %-64s %s\n' "${f#"$HERE/Resources/"}" "$(du -h "$f" | cut -f1)"
 done
 
 # ── 4. Xcode project + signed build ──────────────────────────────────────────
@@ -217,7 +246,19 @@ launches_before=0
 if pull_log; then launches_before=$(grep -c '=== PieVoice launch' "$LOG_LOCAL" || true); fi
 
 bold "Launching"
-out=$(xcrun devicectl device process launch --terminate-existing --device "$DEVICE_ID" "$BUNDLE" 2>&1); rc=$?
+# The first launch straight after an install can be refused with a
+# "Security" error while iOS is still registering the app; the same
+# launch succeeds a few seconds later, so one retry comes before giving up.
+for attempt in 1 2; do
+  out=$(xcrun devicectl device process launch --terminate-existing --device "$DEVICE_ID" "$BUNDLE" 2>&1); rc=$?
+  [ $rc -eq 0 ] && break
+  if [ $attempt -eq 1 ] && grep -q 'BSErrorCodeDescription = Security' <<<"$out"; then
+    echo "launch refused while the install settles; retrying in 5 s"
+    sleep 5
+    continue
+  fi
+  break
+done
 if [ $rc -ne 0 ]; then
   echo "$out" | tail -5
   die "launch failed (exit $rc). Unlock the phone; if it says the developer is not trusted, open Settings > General > VPN & Device Management and trust the certificate, then re-run."
@@ -243,7 +284,7 @@ echo
 case "$verdict" in
   READY)
     printf '\033[32mREADY\033[0m — the engine booted and the model is loaded. Talk to it.\n'
-    grep -E '^\[launch\]|\[wasmtime\]|\[warmup\]' "$LOG_LOCAL.last" | tail -6 ;;
+    grep -E '^\[launch\]|\[warmup\]' "$LOG_LOCAL.last" | tail -6 ;;
   FAILED)
     printf '\033[31mENGINE FAILED\033[0m on the phone. Log of the last launch:\n'
     tail -40 "$LOG_LOCAL.last" ;;

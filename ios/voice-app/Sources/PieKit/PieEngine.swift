@@ -22,12 +22,13 @@ final class PieEngine: ConversationBackend {
         didWarmUp = true
         print("[warmup] engine boot starting")
         // Boots the engine and loads the model weights by running a
-        // single-token turn. The snapshot it leaves behind is discarded:
-        // the first real turn starts fresh and overwrites it.
+        // single-token turn on a throwaway session, so whatever state it
+        // leaves in the engine is never resumed by the real conversation.
         do {
             _ = try await run(
-                text: "hello",
-                startingFresh: true,
+                utterance: "hello",
+                history: [],
+                session: PieRuntimeConfig.warmUpSessionName,
                 maxTokens: 1,
                 onDelta: { _ in }
             )
@@ -35,21 +36,26 @@ final class PieEngine: ConversationBackend {
             return nil
         } catch {
             // Swallowing this is how a boot failure turns into a silent
-            // forever-spinner. Surface it.
-            print("[warmup] engine boot FAILED: \(error)")
+            // forever-spinner. Surface it. Both failures that can land
+            // here (a missing artifact, a "PIE ERROR" from the shim) carry
+            // their message in `errorDescription`; interpolating the error
+            // itself would show the enum case and payload instead.
+            let message = error.localizedDescription
+            print("[warmup] engine boot FAILED: \(message)")
             didWarmUp = false
-            return String(describing: error)
+            return message
         }
     }
 
     func reply(
         to utterance: String,
-        startingFresh: Bool,
+        history: [ChatMessage],
         onDelta: @escaping (String) -> Void
     ) async throws -> (text: String, stats: TurnStats) {
         try await run(
-            text: utterance,
-            startingFresh: startingFresh,
+            utterance: utterance,
+            history: history,
+            session: PieRuntimeConfig.sessionName,
             maxTokens: PieRuntimeConfig.maxTokensPerTurn,
             onDelta: onDelta
         )
@@ -58,15 +64,17 @@ final class PieEngine: ConversationBackend {
     // MARK: - Invocation
 
     private func run(
-        text: String,
-        startingFresh: Bool,
+        utterance: String,
+        history: [ChatMessage],
+        session: String,
         maxTokens: Int,
         onDelta: @escaping (String) -> Void
     ) async throws -> (text: String, stats: TurnStats) {
         let inferlet = PieRuntimeConfig.voiceChat
         let input = Self.inputJSON(
-            text: text,
-            startingFresh: startingFresh,
+            utterance: utterance,
+            history: history,
+            session: session,
             maxTokens: maxTokens
         )
 
@@ -83,8 +91,7 @@ final class PieEngine: ConversationBackend {
                     let result = PieBridge.runStreaming(
                         configPath: config,
                         wasmPath: inferlet.wasmPath,
-                        manifestPath: inferlet.manifestPath,
-                        inferletId: inferlet.id,
+                        version: inferlet.version,
                         inputJSON: input,
                         onDelta: onDelta
                     )
@@ -104,29 +111,39 @@ final class PieEngine: ConversationBackend {
 
     // MARK: - Wire format
 
+    /// The inferlet takes the whole transcript every turn: the voice
+    /// system prompt, the history, then the new utterance. What it can
+    /// serve from cached state is its own accounting, returned in stats.
     private static func inputJSON(
-        text: String,
-        startingFresh: Bool,
+        utterance: String,
+        history: [ChatMessage],
+        session: String,
         maxTokens: Int
     ) -> String {
+        var messages: [[String: String]] = [
+            ["role": "system", "content": PieRuntimeConfig.systemPrompt],
+        ]
+        messages += history.map { ["role": $0.role.rawValue, "content": $0.content] }
+        messages.append(["role": "user", "content": utterance])
+
         let payload: [String: Any] = [
-            "text": text,
-            "session": PieRuntimeConfig.sessionName,
-            "reset": startingFresh,
+            "messages": messages,
+            "session": session,
             "max_tokens": maxTokens,
             "temperature": PieRuntimeConfig.temperature,
             "top_p": PieRuntimeConfig.topP,
+            "think": PieRuntimeConfig.think,
         ]
         guard
             let data = try? JSONSerialization.data(withJSONObject: payload),
             let json = String(data: data, encoding: .utf8)
         else {
-            return "{\"text\":\"\"}"
+            return "{\"messages\":[]}"
         }
         return json
     }
 
-    /// The inferlet returns its reply and KV accounting as JSON so the
+    /// The inferlet returns its reply and token accounting as JSON so the
     /// numbers never land on the spoken stdout channel.
     private static func parse(_ result: String, elapsed: TimeInterval) -> (text: String, stats: TurnStats) {
         var stats = TurnStats()
@@ -141,6 +158,7 @@ final class PieEngine: ConversationBackend {
             return (result.trimmingCharacters(in: .whitespacesAndNewlines), stats)
         }
 
+        stats.promptTokens = object["prompt_tokens"] as? Int ?? 0
         stats.reused = object["reused"] as? Int ?? 0
         stats.newPrefill = object["new_prefill"] as? Int ?? 0
         stats.generated = object["generated"] as? Int ?? 0

@@ -2,9 +2,13 @@ import Foundation
 
 /// What one generated turn cost, as reported by the backend.
 ///
-/// `reused` is the point of the whole exercise: tokens of conversation
-/// that did not have to be prefilled again this turn.
+/// `reused` is the point of the whole exercise: prompt tokens the engine
+/// served from the KV state it kept from earlier turns, so they did not
+/// have to be prefilled again.
 struct TurnStats {
+    /// Everything the model was shown this turn: system prompt, the
+    /// transcript so far, and the new utterance.
+    var promptTokens: Int = 0
     var reused: Int = 0
     var newPrefill: Int = 0
     var generated: Int = 0
@@ -32,9 +36,10 @@ enum ConversationError: LocalizedError {
 
 /// The language model, seen from the conversation layer.
 ///
-/// Deliberately says nothing about Pie, inferlets, wasm, or GGUF: the
-/// controller and the views are written against this protocol only, so
-/// the serving stack can be replaced or upgraded without touching them.
+/// Deliberately says nothing about Pie, inferlets, wasm, or model
+/// artifacts: the controller and the views are written against this
+/// protocol only, so the serving stack can be replaced or upgraded
+/// without touching them.
 protocol ConversationBackend: AnyObject {
     /// One-line description of what is actually serving, for the UI.
     var engineDescription: String { get }
@@ -46,15 +51,22 @@ protocol ConversationBackend: AnyObject {
 
     /// Generates a reply to one utterance.
     ///
+    /// The backend keeps no conversation of its own: whatever it should
+    /// remember arrives in `history`, and an empty history is a fresh
+    /// conversation. Whether earlier turns are served from cached state
+    /// or prefilled again is the backend's business and shows up in the
+    /// returned stats.
+    ///
     /// - Parameters:
     ///   - utterance: what the user just said.
-    ///   - startingFresh: discard any prior conversation state first.
+    ///   - history: the transcript before this utterance, oldest first,
+    ///     alternating user and assistant.
     ///   - onDelta: speakable text, as it is produced. May be called on
     ///     any thread.
     /// - Returns: the complete reply and what the turn cost.
     func reply(
         to utterance: String,
-        startingFresh: Bool,
+        history: [ChatMessage],
         onDelta: @escaping (String) -> Void
     ) async throws -> (text: String, stats: TurnStats)
 }

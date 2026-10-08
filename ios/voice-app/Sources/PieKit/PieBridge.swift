@@ -2,7 +2,8 @@ import Foundation
 
 // The C ABI exported by libpie_ios_shim.a (ios/pie-shim). Declared with
 // @_silgen_name so the app needs no bridging header or module map — the
-// staticlib is linked directly by build-app.sh.
+// staticlib is linked straight from the repository target directory by
+// project.yml.
 //
 // Nothing above this file should reference these symbols.
 
@@ -10,8 +11,7 @@ import Foundation
 private func pie_ios_run_stream(
     _ configPath: UnsafePointer<CChar>,
     _ wasmPath: UnsafePointer<CChar>,
-    _ manifestPath: UnsafePointer<CChar>,
-    _ inferletId: UnsafePointer<CChar>,
+    _ version: UnsafePointer<CChar>?,
     _ inputJson: UnsafePointer<CChar>,
     _ cb: @convention(c) (UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Void,
     _ ctx: UnsafeMutableRawPointer?
@@ -32,14 +32,18 @@ enum PieBridge {
     /// thread. `onDelta` fires for each stdout chunk the inferlet emits.
     /// Returns the inferlet's return value.
     ///
+    /// The first call boots the engine from the config at `configPath`
+    /// and keeps it warm for the life of the process; the wasm at
+    /// `wasmPath` is installed once per process on its first use, so
+    /// passing the same paths every turn costs nothing after the first.
+    ///
     /// Blocking is deliberate: the shim owns a tokio runtime and the
     /// engine is process-global, so the caller decides the concurrency
     /// policy. `PieEngine` runs this on a serial background queue.
     static func runStreaming(
         configPath: String,
         wasmPath: String,
-        manifestPath: String,
-        inferletId: String,
+        version: String?,
         inputJSON: String,
         onDelta: @escaping (String) -> Void
     ) -> String {
@@ -54,9 +58,16 @@ enum PieBridge {
             sink.onDelta(String(cString: chunk))
         }
 
-        guard let raw = pie_ios_run_stream(
-            configPath, wasmPath, manifestPath, inferletId, inputJSON, trampoline, ctx
-        ) else {
+        // The version is the one nullable argument: Swift bridges a
+        // String to a C string implicitly, but not an Optional one, so
+        // the two cases are spelled out.
+        let raw: UnsafeMutablePointer<CChar>?
+        if let version {
+            raw = pie_ios_run_stream(configPath, wasmPath, version, inputJSON, trampoline, ctx)
+        } else {
+            raw = pie_ios_run_stream(configPath, wasmPath, nil, inputJSON, trampoline, ctx)
+        }
+        guard let raw else {
             return "PIE ERROR: shim returned null"
         }
         defer { pie_ios_free(raw) }

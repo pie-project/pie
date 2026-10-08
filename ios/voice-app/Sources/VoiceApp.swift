@@ -57,8 +57,8 @@ final class AppComposition: ObservableObject {
 ///
 /// On a physical device there is no attached console, and devicectl's
 /// console capture has proven unreliable — so everything the engine
-/// prints (ggml load markers, wasmtime allocator choice, Rust panics)
-/// goes to `Documents/pie-console.log`, which can be pulled off the
+/// prints (boot and weight-load markers, sandbox pool sizing, Rust
+/// panics) goes to `Documents/pie-console.log`, which can be pulled off the
 /// phone afterwards. It is what caught the 4 TB address-space panic
 /// that no Swift `catch` could ever see.
 enum ConsoleMirror {
@@ -119,7 +119,7 @@ enum LaunchDiagnostics {
             info.activeProcessorCount,
             largestReservableGB()
         ))
-        print("[launch] model=\(PieRuntimeConfig.selected.fileName) present=\(PieRuntimeConfig.selected.isPresent)")
+        print("[launch] model=\(PieRuntimeConfig.selected.directory) artifact=\(PieRuntimeConfig.selected.artifactPath ?? "missing")")
     }
 
     /// Largest single PROT_NONE reservation the kernel will grant, found

@@ -11,8 +11,9 @@ import Foundation
 /// What it measures, per turn:
 ///   - `ttft_s`      time from request to the first token reaching the app
 ///   - `decode_tps`  generated tokens ÷ time spent generating after TTFT
+///   - `prompt`      tokens the model was shown this turn
 ///   - `prefill`     tokens the engine had to prefill this turn
-///   - `reused`      conversation tokens served from the KV snapshot
+///   - `reused`      prompt tokens served from the engine's cached state
 ///   - `footprint_mb` physical memory footprint — the figure jetsam judges
 enum BenchmarkRunner {
 
@@ -21,7 +22,7 @@ enum BenchmarkRunner {
     }
 
     /// Turns to run. Defaults to five: turn 1 is a fresh conversation, and
-    /// 2–5 exercise the KV-reuse path as history grows.
+    /// 2–5 exercise the KV-reuse path as the transcript grows.
     private static var turnCount: Int {
         let n = UserDefaults.standard.integer(forKey: "PieBenchmarkTurns")
         return n > 0 ? n : 5
@@ -50,21 +51,22 @@ enum BenchmarkRunner {
         return Double(info.phys_footprint) / 1_048_576
     }
 
-    /// Removes every model in Documents except the one this run wants.
+    /// Removes every model directory in Documents/models except the one
+    /// this run wants.
     ///
-    /// The ladder pushes one multi-gigabyte model per rung; without this a
-    /// device accumulates all of them (~8 GB) in the app container. Gated
-    /// behind an explicit flag so running benchmark mode by hand never
-    /// deletes anything unexpectedly — only the driver passes it.
-    private static func pruneOtherModels(keeping keepFile: String) {
+    /// The ladder pushes one multi-gigabyte artifact per rung; without this
+    /// a device accumulates all of them in the app container. Gated behind
+    /// an explicit flag so running benchmark mode by hand never deletes
+    /// anything unexpectedly — only the driver passes it.
+    private static func pruneOtherModels(keeping keepDirectory: String) {
         guard UserDefaults.standard.string(forKey: "PieBenchPruneModels") == "1" else { return }
         let fm = FileManager.default
-        let dir = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("qwen3-gguf")
-        guard let entries = try? fm.contentsOfDirectory(atPath: dir.path) else { return }
-        for name in entries where name != keepFile && name.hasSuffix(".gguf") {
-            try? fm.removeItem(at: dir.appendingPathComponent(name))
-            emit(["event": "pruned_model", "file": name])
+        let models = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("models")
+        guard let entries = try? fm.contentsOfDirectory(atPath: models.path) else { return }
+        for name in entries where name != keepDirectory && !name.hasPrefix(".") {
+            try? fm.removeItem(at: models.appendingPathComponent(name))
+            emit(["event": "pruned_model", "directory": name])
         }
     }
 
@@ -80,19 +82,19 @@ enum BenchmarkRunner {
     static func run(backend: ConversationBackend) {
         Task.detached(priority: .userInitiated) {
             let device = await deviceDescription()
-            if let requested = PieRuntimeConfig.requestedModelFile {
+            if let requested = PieRuntimeConfig.requestedModelDirectory {
                 pruneOtherModels(keeping: requested)
             }
 
             // A silently-substituted model would produce a table of numbers
             // attributed to the wrong weights. Refuse rather than mislead.
-            if let requested = PieRuntimeConfig.requestedModelFile,
-               requested != PieRuntimeConfig.selected.fileName {
+            if let requested = PieRuntimeConfig.requestedModelDirectory,
+               requested != PieRuntimeConfig.selected.directory {
                 emit([
                     "event": "model_mismatch",
                     "requested": requested,
-                    "loaded": PieRuntimeConfig.selected.fileName,
-                    "available": PieRuntimeConfig.available.map(\.fileName),
+                    "loaded": PieRuntimeConfig.selected.directory,
+                    "available": PieRuntimeConfig.available.map(\.directory),
                 ])
                 try? await Task.sleep(nanoseconds: 300_000_000)
                 exit(2)
@@ -119,6 +121,9 @@ enum BenchmarkRunner {
             ])
 
             var peak = footprintMB()
+            // The backend is stateless: the pass carries the transcript
+            // itself, exactly as the conversation controller would.
+            var history: [ChatMessage] = []
 
             for index in 0..<turnCount {
                 let utterance = script[index % script.count]
@@ -128,10 +133,12 @@ enum BenchmarkRunner {
                 do {
                     let result = try await backend.reply(
                         to: utterance,
-                        startingFresh: index == 0
+                        history: history
                     ) { _ in
                         if firstTokenAt == nil { firstTokenAt = Date() }
                     }
+                    history.append(ChatMessage(role: .user, content: utterance))
+                    history.append(ChatMessage(role: .assistant, content: result.text))
 
                     let ttft = (firstTokenAt ?? Date()).timeIntervalSince(started)
                     let total = -started.timeIntervalSinceNow
@@ -146,6 +153,7 @@ enum BenchmarkRunner {
                         "event": "turn",
                         "turn": index + 1,
                         "utterance": utterance,
+                        "prompt": result.stats.promptTokens,
                         "reused": result.stats.reused,
                         "prefill": result.stats.newPrefill,
                         "generated": result.stats.generated,

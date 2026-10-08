@@ -54,9 +54,20 @@ final class ConversationController: ObservableObject {
     private let output: VoiceOutput
     private let chunker = SentenceChunker()
 
-    /// The next turn should discard whatever conversation state the
-    /// backend is holding.
+    /// The next turn starts a fresh conversation. The backend keeps no
+    /// transcript of its own — it is handed the conversation with every
+    /// utterance — so "fresh" means the app stops sending what came
+    /// before: the earlier turns stay on screen, the model no longer
+    /// sees them.
     private var needsFreshSession = true
+
+    /// Index into `turns` of the first turn the backend is told about. A
+    /// fresh session moves it past everything already on screen.
+    private var transcriptStart = 0
+
+    /// Shown in place of a reply that generated nothing sayable. Never
+    /// sent back to the model as if it had said it.
+    private static let emptyReplyPlaceholder = "(no speakable reply)"
 
     /// A backend that falls back to a slower path usually falls back on
     /// every turn. Worth saying once; repeating it down the whole
@@ -198,6 +209,7 @@ final class ConversationController: ObservableObject {
         output.cancel()
         chunker.reset()
         turns = []
+        transcriptStart = 0
         partialTranscript = ""
         lastStats = nil
         needsFreshSession = true
@@ -260,12 +272,13 @@ final class ConversationController: ObservableObject {
     private func handle(utterance: String) {
         partialTranscript = ""
         inputLevel = 0
+        if needsFreshSession { transcriptStart = turns.count }
+        let history = transcriptHistory()
         turns.append(Turn(speaker: .user, text: utterance))
         turns.append(Turn(speaker: .assistant, text: "", isStreaming: true))
         state = .thinking
         chunker.reset()
 
-        let startingFresh = needsFreshSession
         let turnID = UUID()
         activeTurnID = turnID
 
@@ -273,7 +286,7 @@ final class ConversationController: ObservableObject {
             do {
                 let result = try await backend.reply(
                     to: utterance,
-                    startingFresh: startingFresh
+                    history: history
                 ) { [weak self] delta in
                     // Arrives on the backend's own thread.
                     DispatchQueue.main.async { self?.consume(delta: delta, for: turnID) }
@@ -289,6 +302,16 @@ final class ConversationController: ObservableObject {
                 }
             }
         }
+    }
+
+    /// The conversation the backend is handed with the next utterance:
+    /// every finished turn since the session started, oldest first. The
+    /// empty-reply placeholder is left out — it is for the person reading
+    /// the screen, not something the model said.
+    private func transcriptHistory() -> [ChatMessage] {
+        turns.dropFirst(transcriptStart)
+            .filter { !$0.isStreaming && !$0.text.isEmpty && $0.text != Self.emptyReplyPlaceholder }
+            .map(\.message)
     }
 
     /// One chunk of generated text: shown immediately, spoken a sentence
@@ -331,7 +354,7 @@ final class ConversationController: ObservableObject {
             // A turn that generated tokens but produced nothing sayable
             // is a real failure mode worth seeing, not a blank bubble.
             if turns[index].text.isEmpty {
-                turns[index].text = "(no speakable reply)"
+                turns[index].text = Self.emptyReplyPlaceholder
             }
             turns[index].stats = stats
             turns[index].isStreaming = false
@@ -352,9 +375,10 @@ final class ConversationController: ObservableObject {
         if let index = turns.indices.last, turns[index].speaker == .assistant {
             turns.remove(at: index)
         }
-        // The conversation's KV snapshot may be in an unknown state after
-        // a failed turn; start the next one from scratch rather than
-        // resuming into whatever was left behind.
+        // A turn can fail because of what the transcript has grown into
+        // (a prompt past the engine's ceiling, a stalled turn); the next
+        // one starts from a clean slate rather than resending the same
+        // payload.
         needsFreshSession = true
         state = .failed(error.localizedDescription)
     }

@@ -4,18 +4,28 @@
 #   bash bench-ladder.sh sim  <simulator-udid>
 #   bash bench-ladder.sh dev  <device-udid>
 #
-# Installs the app once, then for each model: pushes the GGUF into the app's
-# Documents container, launches in benchmark mode, and captures the
-# PIEBENCH json lines. Results land in results/<target>-<timestamp>.jsonl
+# The app must already be installed (deploy-device.sh for a phone; Xcode or
+# simctl for the Simulator). For each rung: pushes the model's artifact
+# directory into the app's Documents/models container, launches in
+# benchmark mode pinned to that rung, and captures the PIEBENCH json lines.
+# Results land in results/<target>-<timestamp>.jsonl.
 #
-# Device runs need the app signed and installed (Xcode: pick your team, Run).
+# Pie 0.5 ladder. A model is a directory under $PIE_STORE/models, named as
+# `pie model list` prints it and holding one .zt artifact. Import each rung
+# on the Mac first; a rung that is not imported is skipped:
+#     pie model import Qwen/Qwen3.5-0.8B     # bundled by deploy-device.sh
+#     pie model import Qwen/Qwen3.5-2B
+#     pie model import Qwen/Qwen3.5-4B
+# Only the 0.8B rung has been through the 0.5 deploy path so far; the 2B
+# and 4B entries are the intended ladder, not measured ones.
 set -uo pipefail
 
 MODE=${1:?usage: bench-ladder.sh sim|dev <udid>}
 UDID=${2:?missing udid}
 BUNDLE=org.pie-project.voice
-MODELS_DIR=${MODELS_DIR:-/Users/aarushkandukoori/random/pie-models}
-BUNDLED_MODEL=${BUNDLED_MODEL:-Qwen3-0.6B-Q4_K_M.gguf}
+PIE_STORE=${PIE_STORE:-${PIE_HOME:-$HOME/random/pie-05-home}}
+BUNDLED_MODEL=${BUNDLED_MODEL:-Qwen--Qwen3.5-0.8B}
+LADDER=${LADDER:-"Qwen--Qwen3.5-0.8B Qwen--Qwen3.5-2B Qwen--Qwen3.5-4B"}
 TURNS=${TURNS:-5}
 OUT_DIR="$(dirname "$0")/results"
 mkdir -p "$OUT_DIR"
@@ -34,30 +44,38 @@ container_docs() {
   fi
 }
 
-push_model() {  # $1 = filename
-  local src="$MODELS_DIR/$1"
-  [ -f "$src" ] || { echo "skip $1 (not downloaded)"; return 1; }
+push_model() {  # $1 = artifact directory name
+  local src="$PIE_STORE/models/$1"
+  ls "$src"/*.zt >/dev/null 2>&1 || { echo "skip $1 (not imported under $PIE_STORE/models)"; return 1; }
+  # Every file of the directory: a sharded artifact is a root plus
+  # numbered shards and the engine expects them side by side.
   if [ "$MODE" = sim ]; then
     local docs; docs=$(container_docs) || return 1
-    mkdir -p "$docs/qwen3-gguf"
-    # Hardlink when possible: a 4.7 GB copy per rung is pure waste.
-    ln -f "$src" "$docs/qwen3-gguf/$1" 2>/dev/null || cp "$src" "$docs/qwen3-gguf/$1"
+    mkdir -p "$docs/models/$1"
+    for f in "$src"/*; do
+      [ -f "$f" ] || continue
+      # Hardlink when possible: a multi-gigabyte copy per rung is pure waste.
+      ln -f "$f" "$docs/models/$1/$(basename "$f")" 2>/dev/null || cp "$f" "$docs/models/$1/$(basename "$f")"
+    done
   else
-    xcrun devicectl device copy to --device "$UDID" --domain-type appDataContainer \
-      --domain-identifier "$BUNDLE" --source "$src" \
-      --destination "Documents/qwen3-gguf/$1" >/dev/null 2>&1 || {
-        echo "copy failed for $1"; return 1; }
+    for f in "$src"/*; do
+      [ -f "$f" ] || continue
+      xcrun devicectl device copy to --device "$UDID" --domain-type appDataContainer \
+        --domain-identifier "$BUNDLE" --source "$f" \
+        --destination "Documents/models/$1/$(basename "$f")" >/dev/null 2>&1 || {
+          echo "copy failed for $1/$(basename "$f")"; return 1; }
+    done
   fi
 }
 
 clear_models() {
   if [ "$MODE" = sim ]; then
     local docs; docs=$(container_docs) || return 0
-    rm -rf "$docs/qwen3-gguf"
+    rm -rf "$docs/models"
   fi
 }
 
-run_bench() {  # $1 = label  $2 = model filename
+run_bench() {  # $1 = label  $2 = artifact directory name
   local log; log=$(mktemp)
   if [ "$MODE" = sim ]; then
     xcrun simctl terminate "$UDID" "$BUNDLE" >/dev/null 2>&1
@@ -69,7 +87,8 @@ run_bench() {  # $1 = label  $2 = model filename
       "$BUNDLE" -PieBenchmark 1 -PieBenchmarkTurns "$TURNS" -PieModel "$2" -PieBenchPruneModels 1 >"$log" 2>&1 &
   fi
   local pid=$!
-  # Wait for a terminal record, the process dying, or 15 minutes (8B is slow).
+  # Wait for a terminal record, the process dying, or 15 minutes (the
+  # largest rung is slow).
   local waited=0 died=0
   while [ $waited -lt 900 ]; do
     grep -qE '"event":"(done|model_mismatch)"' "$log" && break
@@ -83,7 +102,7 @@ run_bench() {  # $1 = label  $2 = model filename
   if [ $died -eq 1 ] && ! grep -q '"event":"done"' "$log"; then
     local turns; turns=$(grep -c '"event":"turn"' "$log")
     echo "  !! process died after $turns turn(s) — recording as did_not_fit"
-    printf '{"event":"did_not_fit","model_file":"%s","turns_completed":%s,"waited_s":%s}\n' \
+    printf '{"event":"did_not_fit","model_dir":"%s","turns_completed":%s,"waited_s":%s}\n' \
       "$2" "$turns" "$waited" >> "$OUT"
   fi
   grep '^PIEBENCH ' "$log" | sed 's/^PIEBENCH //' >> "$OUT"
@@ -92,7 +111,7 @@ run_bench() {  # $1 = label  $2 = model filename
   rm -f "$log"
 }
 
-for MODEL in Qwen3-0.6B-Q4_K_M.gguf Qwen3-1.7B-Q4_K_M.gguf Qwen3-4B-Q4_K_M.gguf Qwen3-8B-Q4_K_M.gguf; do
+for MODEL in $LADDER; do
   say "$MODEL"
   clear_models
   if [ "$MODEL" != "$BUNDLED_MODEL" ]; then
