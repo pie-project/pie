@@ -87,6 +87,50 @@ pub(crate) fn numbers(builder: &mut GlobalsBuilder) {
         Ok(f64::from((x.0 as f32).powf(y.0 as f32)))
     }
 
+    /// `numpy.random.default_rng(seed).integers(0, high, size)`, bit for bit
+    /// (`high` past 2^32).
+    fn numpy_integers(
+        #[starlark(require = pos)] seed: i64,
+        #[starlark(require = pos)] high: i64,
+        #[starlark(require = pos)] size: u32,
+    ) -> anyhow::Result<Vec<i64>> {
+        let seed = u128::try_from(seed).map_err(|_| anyhow::anyhow!("a negative seed {seed}"))?;
+        let high = u64::try_from(high).map_err(|_| anyhow::anyhow!("a negative bound {high}"))?;
+        if high <= 1 << 32 {
+            anyhow::bail!("a bound of {high} is drawn by NumPy's 32-bit sampler, not this one");
+        }
+        let draws = crate::numpy::Generator::seeded(seed).integers(high, size as usize);
+        draws
+            .into_iter()
+            .map(|d| i64::try_from(d).map_err(|_| anyhow::anyhow!("a draw past i64")))
+            .collect()
+    }
+
+    /// The least prime greater than `n`.
+    fn prime_after(#[starlark(require = pos)] n: i64) -> anyhow::Result<i64> {
+        let is_prime = |v: i64| {
+            if v < 2 {
+                return false;
+            }
+            if v % 2 == 0 {
+                return v == 2;
+            }
+            let mut d = 3;
+            while d * d <= v {
+                if v % d == 0 {
+                    return false;
+                }
+                d += 2;
+            }
+            true
+        };
+        let mut candidate = n + 1;
+        while !is_prime(candidate) {
+            candidate += 1;
+        }
+        Ok(candidate)
+    }
+
     fn sqrt(#[starlark(require = pos)] x: UnpackFloat) -> anyhow::Result<f64> {
         Ok(x.0.sqrt())
     }

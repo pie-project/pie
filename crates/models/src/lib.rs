@@ -15,7 +15,6 @@ pub mod media;
 pub mod mini_dit;
 pub mod minimax_h3;
 pub mod muse_glimmer;
-pub mod numpy;
 pub mod published;
 pub mod qwen_3;
 pub mod qwen_4;

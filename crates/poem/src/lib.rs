@@ -5,6 +5,7 @@ pub mod facts;
 pub mod forward;
 pub mod generative;
 pub mod import;
+pub mod numpy;
 pub mod ops;
 pub mod pattern;
 mod record;

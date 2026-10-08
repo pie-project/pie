@@ -1378,7 +1378,7 @@ fn engram_hash_constants(
     }
     let layer = u64::from(engram_layers[which]);
     let bound = ((i64::MAX as u64) / e.compressed_vocab.max(1) / 2).max(1);
-    let mut rng = crate::numpy::Generator::seeded(u128::from(10_007 * layer));
+    let mut rng = poem::numpy::Generator::seeded(u128::from(10_007 * layer));
     let mults = rng
         .integers(bound, e.ngram as usize)
         .into_iter()
