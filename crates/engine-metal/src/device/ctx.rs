@@ -670,6 +670,26 @@ pub(crate) fn threadgroup(
     }
 }
 
+/// Without a stated version a library compiles as the default of the SDK the
+/// app linked against, which can predate the MSL 4.0 some kernels need, so
+/// name 4.0 wherever the OS has it (26 on both macOS and iOS).
+#[cfg(target_vendor = "apple")]
+pub(crate) fn compile_options() -> Retained<objc2_metal::MTLCompileOptions> {
+    use objc2_foundation::{NSOperatingSystemVersion, NSProcessInfo};
+
+    let options = objc2_metal::MTLCompileOptions::new();
+    let msl4 =
+        NSProcessInfo::processInfo().isOperatingSystemAtLeastVersion(NSOperatingSystemVersion {
+            majorVersion: 26,
+            minorVersion: 0,
+            patchVersion: 0,
+        });
+    if msl4 {
+        options.setLanguageVersion(objc2_metal::MTLLanguageVersion::Version4_0);
+    }
+    options
+}
+
 #[cfg(target_vendor = "apple")]
 pub(crate) fn nsstring(text: &str) -> Retained<NSString> {
     NSString::from_str(text)

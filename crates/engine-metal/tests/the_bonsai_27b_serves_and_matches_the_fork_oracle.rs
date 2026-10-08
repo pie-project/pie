@@ -249,6 +249,7 @@ fn the_bonsai_27b_serves_ptq1_0_and_matches_the_fork_oracle() {
         pages: context / page_size,
         runahead: engine::runahead::Runahead::F1,
         residency,
+        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
     });
     let mut shell = match shell {
         Ok(shell) => shell,

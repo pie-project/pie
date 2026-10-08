@@ -15,19 +15,12 @@ path = "src/lib.rs"
 [dependencies]
 runtime = { path = "../runtime", features = ["wgpu"] }
 engine-wgpu = { path = "../engine-wgpu", features = ["wgpu"] }
-engine = { path = "../engine" }
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
-models = { path = "../models" }
-checkpoint = { path = "../checkpoint", default-features = false }
-tokenizer = { path = "../tokenizer" }
 ztensor = { workspace = true }
-client-api = { package = "pie-client-api", path = "../client-api" }
 web-std = { path = "../web-std" }
 wasmtime-web = { path = "../wasmtime-web" }
 anyhow = "1.0"
-serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-rmp-serde = "1.3"
 toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

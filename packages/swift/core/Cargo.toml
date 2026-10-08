@@ -1,0 +1,32 @@
+[package]
+name = "pie-swift-core"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "The C core of the Swift `PieServer`: the runtime and the Metal engine in-process through runtime::embed, behind include/pie_server.h."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "pie_server"
+crate-type = ["staticlib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+runtime = { path = "../../../crates/runtime", features = ["metal"] }
+poem-ir = { package = "pie-poem-ir", path = "../../../crates/poem-ir" }
+builtins = { path = "../../../crates/builtins" }
+serde_json = "1"
+anyhow = "1.0"
+tracing = "0.1"
+tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "allow"
+
+[lints.clippy]
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"

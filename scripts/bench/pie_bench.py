@@ -38,7 +38,7 @@ from common import (
     visible_cuda_devices,
 )
 
-SERVER_PY = ROOT / "python" / "server" / "python"
+SERVER_PY = ROOT / "packages" / "python" / "server" / "python"
 if str(SERVER_PY) not in sys.path:
     sys.path.insert(0, str(SERVER_PY))
 
@@ -119,7 +119,7 @@ def bench_inferlet_wasm(inferlet_dir: str | None) -> Path:
             "cargo build --target wasm32-wasip2 --release"
         )
     # The wasm is a build OUTPUT with no staleness guard of its own (the engine
-    # guard below covers only crates and python/server sources), so
+    # guard below covers only crates and packages/python/server sources), so
     # an edited inferlet silently benches the previous build. Refuse instead.
     newest_src = max(
         (p.stat().st_mtime_ns for p in (inferlet_dir / "src").rglob("*.rs")),
@@ -149,10 +149,10 @@ def embedded_engine_identity() -> dict[str, str]:
     # staleness guard was watching one file and any newer `.so` passed it.
     source_roots = [
         ROOT / "crates",
-        ROOT / "python" / "server" / "src",
+        ROOT / "packages" / "python" / "server" / "src",
     ]
     # `engine-metal` is only in the dependency list on Apple-Silicon builds
-    # (python/server/Cargo.toml), so on Linux its sources cannot have gone
+    # (packages/python/server/Cargo.toml), so on Linux its sources cannot have gone
     # into this .so. Counting them makes an origin/dev pull that touched only
     # the Metal engine look like a stale CUDA engine.
     skip_roots = () if sys.platform == "darwin" else (ROOT / "crates" / "engine-metal",)
@@ -181,7 +181,7 @@ def embedded_engine_identity() -> dict[str, str]:
         raise RuntimeError(
             f"embedded engine {engine_path} is older than {newest_source}; "
             "rebuild with PIE_COMPILER_LAUNCHER=env CARGO_BUILD_JOBS=2 "
-            "CMAKE_BUILD_PARALLEL_LEVEL=2 uv --project python/server sync "
+            "CMAKE_BUILD_PARALLEL_LEVEL=2 uv --project packages/python/server sync "
             "--reinstall-package pie-server"
         )
     digest = hashlib.sha256()

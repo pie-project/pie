@@ -15,8 +15,12 @@ use super::sandbox::{FsPolicy, InstancePolicy, NetworkPolicy};
 
 static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
-pub fn spawn(engine: &Engine, fs: FsPolicy, network: NetworkPolicy) {
-    let policy = InstancePolicy { fs, network };
+pub fn spawn(engine: &Engine, fs: FsPolicy, network: NetworkPolicy, memory_limit: usize) {
+    let policy = InstancePolicy {
+        fs,
+        network,
+        memory_limit,
+    };
     SERVICE
         .spawn(|| Linker::new(engine, policy))
         .expect("linker already spawned");
@@ -169,6 +173,7 @@ impl Linker {
         let process_ctx =
             ProcessCtx::new(process_id, username, output, &policy, main.script).await?;
         let mut store = Store::new(&engine, process_ctx);
+        store.limiter(|ctx| ctx.limits());
 
         let base_linker = Self::base_linker(&engine, &policy, &base_linker_cache).await?;
 

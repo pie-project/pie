@@ -6,8 +6,8 @@
 #   pie-language-python.tar.gz          languages/python.wasm
 #   pie-language-javascript.tar.gz      languages/javascript.wasm
 #
-# and the same wasm into the packages that ship it: javascript/language-*
-# (npm) and python/language-*/src/pie_language_* (PyPI).
+# and the same wasm into the packages that ship it: packages/javascript/language-*
+# (npm) and packages/python/language-*/src/pie_language_* (PyPI).
 #
 #   scripts/build-languages.sh [OUT_DIR] [LANGUAGE...]
 #     OUT_DIR     where the archives go        (default: target/languages)
@@ -35,10 +35,10 @@ for language in "${languages[@]}"; do
   rm -rf "$stage"
   mkdir -p "$stage/languages"
   echo "== $language"
-  "$root/$language/inferlet/language/build.sh" "$stage/languages/$language.wasm"
+  "$root/packages/$language/inferlet/language/build.sh" "$stage/languages/$language.wasm"
   tar -C "$stage" -czf "$out/pie-language-$language.tar.gz" languages
-  cp "$stage/languages/$language.wasm" "$root/javascript/language-$language/$language.wasm"
-  cp "$stage/languages/$language.wasm" "$root/python/language-$language/src/pie_language_$language/$language.wasm"
+  cp "$stage/languages/$language.wasm" "$root/packages/javascript/language-$language/$language.wasm"
+  cp "$stage/languages/$language.wasm" "$root/packages/python/language-$language/src/pie_language_$language/$language.wasm"
   rm -rf "$stage"
   echo "== $out/pie-language-$language.tar.gz ($(du -h "$out/pie-language-$language.tar.gz" | cut -f1))"
 done

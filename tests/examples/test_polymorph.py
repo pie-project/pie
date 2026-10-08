@@ -10,7 +10,7 @@ correctness gate, because a batcher that corrupts a neighbours' rows shows up
 exactly there.
 
 Usage::
-    python/server/.venv/bin/python tests/examples/test_polymorph.py
+    packages/python/server/.venv/bin/python tests/examples/test_polymorph.py
     ... --model Qwen/Qwen3-0.6B --timeout 300
 """
 

@@ -90,7 +90,7 @@ if [ -n "${PIE_LANGUAGES_DIR:-}" ]; then
   "$pie" inferlet install examples/text-completion-py/main.py
   "$pie" inferlet install examples/text-completion-js/index.js
   for name in text-completion-py text-completion-js; do
-    uv run --project python/client python scripts/ci/launch.py "$ws" "$name" | tee /dev/stderr | grep -q '^ok' || exit 1
+    uv run --project packages/python/client python scripts/ci/launch.py "$ws" "$name" | tee /dev/stderr | grep -q '^ok' || exit 1
   done
 fi
 

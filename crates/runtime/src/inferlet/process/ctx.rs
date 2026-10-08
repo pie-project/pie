@@ -54,6 +54,7 @@ pub struct ProcessCtx {
     execution_admitted: bool,
     admission_wait_us: u64,
     residency_flag: Option<Arc<AtomicBool>>,
+    limits: wasmtime::StoreLimits,
 }
 
 impl Drop for ProcessCtx {
@@ -226,7 +227,14 @@ impl ProcessCtx {
             execution_admitted: false,
             admission_wait_us: 0,
             residency_flag: None,
+            limits: wasmtime::StoreLimitsBuilder::new()
+                .memory_size(policy.memory_limit)
+                .build(),
         })
+    }
+
+    pub(crate) fn limits(&mut self) -> &mut wasmtime::StoreLimits {
+        &mut self.limits
     }
 
     pub fn id(&self) -> ProcessId {
