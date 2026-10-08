@@ -123,11 +123,7 @@ pub fn whole(tp: u32) -> Result<(), poem::import::Error> {
     })
 }
 
-static FAMILIES: LazyLock<Vec<Vec<catalog::Entry>>> = LazyLock::new(|| {
-    let mut families = vec![deepseek_v4::entries()];
-    families.extend(star::families());
-    families
-});
+static FAMILIES: LazyLock<Vec<Vec<catalog::Entry>>> = LazyLock::new(star::families);
 
 /// Every model of the catalog, whole and miniature alike.
 pub fn entries() -> impl Iterator<Item = &'static catalog::Entry> {

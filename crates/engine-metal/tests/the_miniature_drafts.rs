@@ -127,7 +127,7 @@ fn the_draft_head_fires_and_the_trunk_is_unchanged() {
     );
     assert_eq!(
         shell.mtp_depth(),
-        models::deepseek_v4::model::DRAFT_DEPTH,
+        1, // the depth models/deepseek_v4 drafts its MTP chain to
         "the load's token plane is as deep as the text chains"
     );
 
