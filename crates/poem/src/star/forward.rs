@@ -122,6 +122,12 @@ fn value_methods(builder: &mut MethodsBuilder) {
         dsl("on", || x.on(p)).map(hold)
     }
 
+    /// This value over every row, whatever rows it was computed over.
+    fn everywhere(this: &ValueHandle) -> anyhow::Result<ValueHandle> {
+        let x = held(*this);
+        dsl("everywhere", || x.everywhere()).map(hold)
+    }
+
     /// This value's rows parted by `cases`: each arm the rows the first case
     /// to hold names, and the rest.
     fn partition<'v>(

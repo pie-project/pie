@@ -145,7 +145,11 @@ impl<'v> Arg<'v> for String {
 
 impl<'v> Arg<'v> for u64 {
     fn arg(v: Option<Star<'v>>) -> anyhow::Result<Self> {
-        Ok(u64::from(u32::arg(v)?))
+        let v = given(v)?;
+        match <i64 as starlark::values::UnpackValue>::unpack_value(v) {
+            Ok(Some(n)) => u64::try_from(n).map_err(|_| anyhow::anyhow!("{n} is negative")),
+            _ => wanted("a count", v),
+        }
     }
 }
 
