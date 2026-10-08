@@ -1,0 +1,23 @@
+[package]
+name = "pie-ios-shim"
+version = "0.1.0"
+edition = "2021"
+description = "C-ABI staticlib embedding the Pie engine for iOS apps"
+license = "Apache-2.0"
+
+[lib]
+name = "pie_ios_shim"
+crate-type = ["staticlib"]
+
+[dependencies]
+# driver-portable: the ggml-backed driver (CPU-only on iOS for now).
+# The Rust dummy driver stays linked either way; dispatch is runtime
+# config (`[model.driver] type = ...`).
+pie-server = { path = "../../server", features = ["driver-portable"] }
+pie-client = { path = "../../client/rust" }
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+
+# Standalone crate: opt out of the parent cargo workspace (which excludes
+# wasm-target and auxiliary crates explicitly).
+[workspace]

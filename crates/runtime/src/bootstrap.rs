@@ -548,32 +548,130 @@ fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
         }
     }
 
+    #[cfg(not(target_os = "ios"))]
+    {
+        let mut pooling_config = wasmtime::PoolingAllocationConfig::default();
+        pooling_config.total_component_instances(runtime.wasm_max_instances);
+        pooling_config.total_memories(runtime.wasm_max_instances);
+        pooling_config.total_stacks(runtime.wasm_max_instances);
+        pooling_config.max_core_instances_per_component(CORE_RESOURCES_PER_COMPONENT);
+        pooling_config.max_tables_per_component(CORE_RESOURCES_PER_COMPONENT);
+        pooling_config.total_core_instances(
+            runtime
+                .wasm_max_instances
+                .saturating_mul(CORE_RESOURCES_PER_COMPONENT),
+        );
+        pooling_config.total_tables(
+            runtime
+                .wasm_max_instances
+                .saturating_mul(CORE_RESOURCES_PER_COMPONENT),
+        );
+        pooling_config.max_memory_size(runtime.wasm_max_memory_mb.saturating_mul(1024 * 1024));
+        pooling_config
+            .linear_memory_keep_resident(runtime.wasm_warm_memory_mb.saturating_mul(1024 * 1024));
+        pooling_config.max_unused_warm_slots(runtime.wasm_warm_slots);
+
+        wasm_config.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(
+            pooling_config,
+        ));
+
+        wasmtime::Engine::new(&wasm_config).unwrap()
+    }
+
+    #[cfg(target_os = "ios")]
+    {
+        init_wasmtime_ios(runtime, wasm_config)
+    }
+}
+
+/// Builds the engine within an iPhone's address-space budget.
+///
+/// iOS forbids writable+executable pages, so Cranelift's native code can
+/// never run there: inferlets execute on wasmtime's Pulley interpreter, where
+/// wasm is just data. Inferlets are control-plane code (the FLOPs live in the
+/// engine), so the interpreter tax stays off the hot path.
+///
+/// Without the `extended-virtual-addressing` entitlement iOS grants a process
+/// only a few GiB of virtual address space (5.2 GiB measured on an iPhone 16
+/// Pro as the largest single reservation). The desktop pooling path reserves
+/// `wasm_max_instances` x (4 GiB + guard) of linear memory up front, which
+/// `Engine::new` cannot get on a phone (ENOMEM). iOS workloads are a few
+/// concurrent inferlets, so slots are capped at 4 and each reserves at most
+/// 256 MiB; that keeps the pool's instantiation-latency benefit at a cost the
+/// address space can absorb. If even that reservation is refused the engine
+/// falls back to on-demand allocation instead of panicking.
+#[cfg(target_os = "ios")]
+fn init_wasmtime_ios(
+    runtime: &RuntimeConfig,
+    mut wasm_config: wasmtime::Config,
+) -> wasmtime::Engine {
+    const MIB: u64 = 1024 * 1024;
+
+    // `Config::target` only parses the triple, so this cannot fail for a
+    // literal. The `pulley` cargo feature (see Cargo.toml) is what lets the
+    // engine run pulley64 code on an aarch64 host: without it the first
+    // component compile or load fails the native-host compatibility check,
+    // and stores would pick the native executor.
+    wasm_config
+        .target("pulley64")
+        .expect("\"pulley64\" is a valid target triple");
+
+    // Reservation per linear memory, sized from the configured sandbox cap.
+    // The pooling allocator requires `max_memory_size <= memory_reservation`,
+    // so the cap is lowered when it exceeds the 256 MiB ceiling but never
+    // raised to the 64 MiB floor: a smaller cap simply leaves part of the
+    // slot unused.
+    let max_memory = (runtime.wasm_max_memory_mb as u64).saturating_mul(MIB);
+    let reservation = max_memory.clamp(64 * MIB, 256 * MIB);
+    if max_memory > reservation {
+        tracing::info!(
+            "sandbox max_memory lowered from {} MiB to {} MiB to fit the iOS address space",
+            max_memory / MIB,
+            reservation / MIB
+        );
+    }
+    let max_memory = max_memory.min(reservation);
+    let slots = runtime.wasm_max_instances.clamp(1, 4);
+
+    // Applies to both allocators. Pulley is an interpreter: every linear
+    // memory access is bounds-checked explicitly, so guard pages are never
+    // consulted and would only be dead address space.
+    wasm_config.memory_reservation(reservation);
+    wasm_config.memory_guard_size(0);
+    wasm_config.memory_reservation_for_growth(64 * MIB);
+
     let mut pooling_config = wasmtime::PoolingAllocationConfig::default();
-    pooling_config.total_component_instances(runtime.wasm_max_instances);
-    pooling_config.total_memories(runtime.wasm_max_instances);
-    pooling_config.total_stacks(runtime.wasm_max_instances);
+    // Linear memories are the address-space cost, so they get `slots`. Core
+    // instances and tables are cheap, and a wasip2 component brings several
+    // core modules (main module + adapter shims) per inferlet, so they get
+    // the same per-component headroom as the desktop path. There is no GC
+    // heap pool to size: this crate builds wasmtime without the `gc` feature.
+    pooling_config.total_component_instances(slots);
+    pooling_config.total_memories(slots);
+    pooling_config.total_stacks(slots);
     pooling_config.max_core_instances_per_component(CORE_RESOURCES_PER_COMPONENT);
     pooling_config.max_tables_per_component(CORE_RESOURCES_PER_COMPONENT);
-    pooling_config.total_core_instances(
-        runtime
-            .wasm_max_instances
-            .saturating_mul(CORE_RESOURCES_PER_COMPONENT),
-    );
-    pooling_config.total_tables(
-        runtime
-            .wasm_max_instances
-            .saturating_mul(CORE_RESOURCES_PER_COMPONENT),
-    );
-    pooling_config.max_memory_size(runtime.wasm_max_memory_mb.saturating_mul(1024 * 1024));
-    pooling_config
-        .linear_memory_keep_resident(runtime.wasm_warm_memory_mb.saturating_mul(1024 * 1024));
-    pooling_config.max_unused_warm_slots(runtime.wasm_warm_slots);
+    pooling_config.total_core_instances(slots.saturating_mul(CORE_RESOURCES_PER_COMPONENT));
+    pooling_config.total_tables(slots.saturating_mul(CORE_RESOURCES_PER_COMPONENT));
+    pooling_config.max_memory_size(max_memory as usize);
+    pooling_config.max_unused_warm_slots(runtime.wasm_warm_slots.min(slots));
 
-    wasm_config.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(
+    let mut pooled = wasm_config.clone();
+    pooled.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(
         pooling_config,
     ));
-
-    wasmtime::Engine::new(&wasm_config).unwrap()
+    match wasmtime::Engine::new(&pooled) {
+        Ok(engine) => engine,
+        Err(error) => {
+            tracing::warn!(
+                "pooling allocator unavailable ({slots} slot(s) x {} MiB), inferlets allocate on demand: {error:#}",
+                reservation / MIB
+            );
+            wasm_config.allocation_strategy(wasmtime::InstanceAllocationStrategy::OnDemand);
+            wasmtime::Engine::new(&wasm_config)
+                .expect("wasmtime engine could not be created on iOS")
+        }
+    }
 }
 
 #[cfg(target_arch = "wasm32")]

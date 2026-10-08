@@ -94,6 +94,12 @@ wasmtime-wasi-http = { version = "48.0.1", default-features = false, features = 
     "default-send-request",
 ] }
 
+# iOS forbids writable+executable pages, so Cranelift's native code cannot run
+# there; inferlets execute on wasmtime's Pulley interpreter instead. Cargo
+# unifies this entry with the one above on that target only.
+[target.'cfg(target_os = "ios")'.dependencies]
+wasmtime = { version = "48.0.1", default-features = false, features = ["pulley"] }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { version = "1.53", default-features = false, features = ["sync", "macros"] }
 web-std = { path = "../web-std" }

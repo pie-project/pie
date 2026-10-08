@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>PieVoice</string>
+    <key>CFBundleIdentifier</key>
+    <string>org.pie-project.voice</string>
+    <key>CFBundleName</key>
+    <string>PieVoice</string>
+    <key>CFBundleDisplayName</key>
+    <string>Pie Voice</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <key>UIDeviceFamily</key>
+    <array>
+        <integer>1</integer>
+        <integer>2</integer>
+    </array>
+    <key>MinimumOSVersion</key>
+    <string>26.0</string>
+    <key>UILaunchScreen</key>
+    <dict/>
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+    </array>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Pie Voice listens to your question so the on-device model can answer it. Audio is transcribed on this device.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Speech recognition turns what you say into text for the on-device model. On devices that support it, this runs locally and your speech is not sent anywhere.</string>
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>audio</string>
+    </array>
+</dict>
+</plist>

@@ -1,0 +1,6 @@
+{"model":"Qwen3-0.6B Q4_K_M","event":"start","engine":"Qwen3-0.6B Q4_K_M · ggml (CPU) · inferlets on wasmtime Pulley","device":"device:iPhone17,1","footprint_mb_baseline":15.079025268554688}
+{"event":"warmup","seconds":0.974761962890625,"footprint_mb":1009.3307418823242}
+{"event":"turn","ttft_s":0.56676101684570312,"reused":0,"turn":1,"generated":22,"prefill":83,"total_s":0.91799211502075195,"decode_tps":62.636822634183424,"chars":115,"footprint_mb":1021.6119918823242,"note":"","utterance":"What is one good reason to run a language model on a phone instead of in the cloud?"}
+{"prefill":19,"turn":2,"ttft_s":0.17003703117370605,"note":"take failed, opened instead: take: insufficient GPU pages (got 0, need 1)","decode_tps":60.251858236368484,"total_s":0.51857399940490723,"event":"turn","utterance":"Can you say that more simply?","reused":107,"generated":21,"footprint_mb":1025.1432418823242,"chars":105}
+{"ttft_s":0.19223594665527344,"utterance":"What is the hardest part of doing that?","total_s":0.53783392906188965,"event":"turn","reused":149,"turn":3,"prefill":21,"footprint_mb":1028.6744918823242,"generated":20,"decode_tps":57.870708216313695,"chars":104,"note":"take failed, opened instead: take: insufficient GPU pages (got 0, need 1)"}
+{"peak_footprint_mb":1028.6744918823242,"event":"done","model":"Qwen3-0.6B Q4_K_M"}

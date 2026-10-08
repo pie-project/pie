@@ -1,0 +1,68 @@
+# XcodeGen spec for the PieVoice iOS app (physical devices + Simulator).
+#
+#   brew install xcodegen
+#   cd ios/PieVoice && xcodegen
+#   open PieVoice.xcodeproj   → select your team under Signing → Run
+#
+# Prerequisites, built from the repo root:
+#   (cd ios/pie-shim && cargo build --release --target aarch64-apple-ios)      # device
+#   (cd ios/pie-shim && cargo build --release --target aarch64-apple-ios-sim)  # simulator
+#   (cd inferlets/voice-chat && cargo build --release --target wasm32-wasip2)
+#   model at target/qwen3-gguf/Qwen3-0.6B-Q4_K_M.gguf
+#   bash ios/voice-app/make-samples.sh ios/PieVoice/Resources
+name: PieVoice
+options:
+  bundleIdPrefix: org.pie-project
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+targets:
+  PieVoice:
+    type: application
+    platform: iOS
+    sources:
+      - path: ../voice-app/Sources
+      # Individual files land at the bundle root; the model keeps its
+      # qwen3-gguf/ directory via a folder reference — matching the layout
+      # build-app.sh assembles and the paths PieRuntimeConfig expects.
+      - path: Resources/voice_chat.wasm
+        buildPhase: resources
+      - path: Resources/voice-chat-Pie.toml
+        buildPhase: resources
+      - path: Resources/sample-question-1.wav
+        buildPhase: resources
+      - path: Resources/sample-question-2.wav
+        buildPhase: resources
+      - path: Resources/sample-question-3.wav
+        buildPhase: resources
+      - path: Resources/qwen3-gguf
+        type: folder
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.pie-project.voice
+        INFOPLIST_FILE: Info.plist
+        SWIFT_VERSION: "5.9"
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        # The Rust shim staticlib: per-SDK search path picks the device or
+        # simulator build automatically.
+        LIBRARY_SEARCH_PATHS[sdk=iphoneos*]: $(SRCROOT)/../pie-shim/target/aarch64-apple-ios/release
+        LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]: $(SRCROOT)/../pie-shim/target/aarch64-apple-ios-sim/release
+        OTHER_LDFLAGS: >-
+          -lpie_ios_shim -lresolv -lc++
+          -Xlinker -U -Xlinker _SCDynamicStoreCopyComputerName
+        CODE_SIGN_STYLE: Automatic
+        # Aarush's Personal Team (free Apple ID). Another developer
+        # overrides it with `xcodegen` after editing this line, or passes
+        # DEVELOPMENT_TEAM=<id> to xcodebuild / deploy-device.sh.
+        DEVELOPMENT_TEAM: JQ8RG44463
+        CODE_SIGN_IDENTITY: "Apple Development"
+        TARGETED_DEVICE_FAMILY: "1,2"
+    dependencies:
+      - sdk: Security.framework
+      - sdk: CoreFoundation.framework
+      - sdk: SystemConfiguration.framework
+      - sdk: Accelerate.framework
+      - sdk: AVFoundation.framework
+      - sdk: Speech.framework
