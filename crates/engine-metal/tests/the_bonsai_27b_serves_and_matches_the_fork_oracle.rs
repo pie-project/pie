@@ -240,6 +240,7 @@ fn the_bonsai_27b_serves_ptq1_0_and_matches_the_fork_oracle() {
         trace: trace.clone(),
         contract: &contract,
         checkpoint: &zt,
+        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
         budget: Budget::new(1, context),
         patches: None,
         voxels: None,

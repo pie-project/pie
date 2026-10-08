@@ -26,6 +26,14 @@ fn rot_take(x: &Value, signs: &Weight) -> Value {
     ops::elemwise::hadamard_signed(x, BONSAI_BLOCK, signs)
 }
 
+fn ane_mlp() -> bool {
+    poem_dsl::forward::platform() == poem_ir::Platform::Metal
+        && !matches!(
+            std::env::var("PIE_ANE").as_deref(),
+            Ok("0" | "off" | "false")
+        )
+}
+
 pub struct Facts {
     pub qo_one: bool,
     pub has_adapter: bool,
@@ -213,6 +221,18 @@ impl ForwardHybrid for Model {
 
             let x = ops::elemwise::rmsnorm_plus_one(&y, &w.mlp_norm, w.mlp_norm_eps);
             let f = match &w.mlp {
+                Mlp::Dense {
+                    gate_up,
+                    down,
+                    inter,
+                } if m.bonsai.is_none() && ane_mlp() => {
+                    let (decode, prefill) = x.split(&Facts::qo_one());
+                    let h = ops::linear::mlp_swiglu(&ops::linear::matmul(&decode, gate_up), *inter);
+                    Value::merge(vec![
+                        ops::linear::matmul(&h, down),
+                        ops::linear::mlp_ane(&prefill, gate_up, down, *inter, l),
+                    ])
+                }
                 Mlp::Dense {
                     gate_up,
                     down,

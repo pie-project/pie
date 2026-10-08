@@ -20,6 +20,7 @@ impl Run<'_> {
 
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_xla::Error> {
         match op {
+            Linear::MlpAne { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Linear::Matmul { act, w, y } => match self.banked(*w) {
                 Some(bank) => {
                     linear::quant::matmul(self.ctx(), self.tensor(*act), bank, self.tensor(*y))

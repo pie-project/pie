@@ -218,6 +218,7 @@ fn load(dir: &Path, sku: Sku, head_dim: u32) -> Shell {
         trace,
         contract: &contract,
         checkpoint: dir,
+        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
         budget: Budget::new(4, 128),
         patches: None,
         profile: None,

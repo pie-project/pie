@@ -18,6 +18,7 @@ impl DispatchLinear for Run<'_> {
 impl Run<'_> {
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_cuda::Error> {
         match op {
+            Linear::MlpAne { .. } => Err(kernels_cuda::Error::Unsupported { op: "linear.mlp_ane" }),
             Linear::Matmul { act, w, y } if self.tensor(*act).dtype == Dtype::F32 => {
                 let weight = self.dense_or_decoded(
                     "linear.matmul",
