@@ -1,0 +1,330 @@
+# The forward of GLM-5.3-Flash: hyper-connected streams gated into each
+# sublayer and folded back, the MoE router hinted by the next layer's; the
+# vision tower's patches scattered into the embedded rows; and the MTP head
+# drafting from the trunk's last hidden rows.
+
+# How many experts the next layer's router is predicted to take.
+PREDICT_K = 16
+
+def caches(m, c):
+    kv = c.kv_space(m.kv)
+    for w in m.layers:
+        a = w.mixer
+        if w.mixer_kind == "mla":
+            index = c.kv_space(m.kv)
+            c.kv(kv, a.kv, [m.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
+            c.kv(index, a.indexer.keys, [a.indexer.head_dim], a.indexer.head_dim)
+        else:
+            width = a.heads * a.head_dim
+            c.state(a.conv_state, [a.conv_kernel, 3 * width], dtype.bf16, split = 1)
+            c.state(a.delta_state, [a.heads, a.head_dim, a.head_dim], dtype.f32, split = 0)
+    if m.mtp != None:
+        a = m.mtp.attn
+        index = c.kv_space(m.kv)
+        c.kv(kv, a.kv, [m.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
+        c.kv(index, a.indexer.keys, [a.indexer.head_dim], a.indexer.head_dim)
+
+def forward(m, inputs):
+    hy = m.hyper
+    one = fact.single_token()
+    input_d, input_p = inputs.on(one), inputs.on(~one)
+    plan = [
+        ops.attn.mla_plan(input_d, m.heads, m.kv_lora_rank),
+        ops.attn.mla_plan(input_p, m.heads, m.kv_lora_rank),
+    ]
+    positions = inputs.positions()
+    towered = tower(inputs, m.tower) if m.tower != None else None
+    narrow = ops.layout.embed(inputs.tokens(), m.embed, m.vocab)
+    if towered != None:
+        imaged = narrow.on(fact.has(fact.Media))
+        narrow = ops.layout.scatter_live_rows(towered, inputs.patch_routes(), imaged).everywhere()
+    streams = ops.elemwise.hc_expand(narrow, hy.streams)
+    routes = inputs.adapter_routes()
+
+    def block(l, w, streams):
+        x, post_mix, comb_mix = gate(streams, w.attn_mix, hy)
+        x = ops.elemwise.rmsnorm(x, w.mixer_norm, w.mixer_norm_eps)
+        if w.mixer_kind == "mla":
+            o = mla_mixer(x, inputs, plan, positions, m, w.mixer, True)
+        else:
+            o = kda_mixer(x, inputs, w.mixer)
+        adapted = fact.has(fact.Adapter)
+        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        streams = ops.elemwise.hc_fold(o, streams, post_mix, comb_mix)
+
+        x, post_mix, comb_mix = gate(streams, w.mlp_mix, hy)
+        x = ops.elemwise.rmsnorm(x, w.mlp_norm, w.mlp_norm_eps)
+        following = m.layers[l + 1] if l + 1 < len(m.layers) else None
+        hint = predict_next(streams, following, hy)
+        f = mlp(x, w.mlp, hint)
+        return ops.elemwise.hc_fold(f, streams, post_mix, comb_mix)
+
+    streams = inputs.fold_layers(m.layers, streams, block)
+
+    y, rest = ops.layout.split_rows(streams, m.hidden)
+    for _ in range(1, hy.streams - 1):
+        stream, more = ops.layout.split_rows(rest, m.hidden)
+        y = ops.elemwise.residual_add(stream, y)
+        rest = more
+    y = ops.elemwise.residual_add(rest, y)
+
+    y = ops.layout.gather_rows(y, inputs.readout_rows())
+    x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
+    logits = ops.linear.lm_head(x, m.head)
+
+    mtp = m.mtp
+    if mtp != None:
+        input_mtp = inputs.on(fact.drafts())
+        plan_one = ops.attn.mla_plan(input_mtp, m.heads, m.kv_lora_rank)
+        plan_mtp = [plan_one, plan_one]
+        dy = y.on(fact.drafts())
+        dpos = positions.on(fact.drafts())
+        dlogits = logits.on(fact.drafts())
+        token = ops.layout.argmax([dlogits])
+        hidden = dy
+        chain = []
+        for step in range(mtp.depth):
+            e = ops.layout.embed(token, m.embed, m.vocab)
+            e = ops.elemwise.rmsnorm(e, mtp.enorm, mtp.norm_eps)
+            h = ops.elemwise.rmsnorm(hidden, mtp.hnorm, mtp.norm_eps)
+            fused = ops.elemwise.residual_add(
+                ops.linear.matmul(e, mtp.e_proj),
+                ops.linear.matmul(h, mtp.h_proj),
+            )
+            x = ops.elemwise.rmsnorm(fused, mtp.mixer_norm, mtp.mixer_norm_eps)
+            o = mla_mixer(x, input_mtp, plan_mtp, dpos, m, mtp.attn, False)
+            r = ops.elemwise.residual_add(o, fused)
+            x = ops.elemwise.rmsnorm(r, mtp.mlp_norm, mtp.mlp_norm_eps)
+            f = mlp(x, mtp.mlp, None)
+            r = ops.elemwise.residual_add(f, r)
+            read = ops.elemwise.rmsnorm(r, mtp.norm, mtp.norm_eps)
+            draft = ops.linear.lm_head(read, m.head)
+            if step == 0:
+                seam.at(seam.MTP, [draft])
+            token = ops.layout.argmax([draft])
+            hidden = r
+            chain.append(draft)
+        seam.at(seam.MTP_DRAFTS, [ops.layout.argmax(chain)])
+    return logits
+
+def predict_next(streams, following, hy):
+    if following == None or not following.mlp.routed:
+        return None
+    f = following.mlp
+    px, _, _ = gate(streams, following.mlp_mix, hy)
+    px = ops.elemwise.rmsnorm(px, following.mlp_norm, following.mlp_norm_eps)
+    logits = ops.linear.matmul(px, f.router)
+    return ops.linear.moe_predict_route(logits, f.bias, f.experts, PREDICT_K)
+
+def mlp(x, f, hint):
+    if not f.routed:
+        return ops.linear.matmul(
+            ops.linear.mlp_swiglu_clamp(ops.linear.matmul(x, f.gate_up), f.inter, f.limit),
+            f.down,
+        )
+    routes, weights = ops.linear.moe_topk_sigmoid_biased_hinted(
+        ops.linear.matmul(x, f.router),
+        f.bias,
+        f.experts,
+        f.top_k,
+        f.renorm,
+        f.scaling,
+        hint,
+    )
+    packed = ops.linear.moe_matmul_select_quant(x, f.gate_up, routes, f.top_k)
+    act = ops.linear.mlp_swiglu_clamp(packed, f.inter, f.limit)
+    routed = ops.linear.moe_weighted_sum(
+        ops.linear.moe_matmul_select_quant(act, f.down, routes, f.top_k),
+        weights,
+    )
+    s = f.shared
+    if s == None:
+        return routed
+    act = ops.linear.mlp_swiglu_clamp(ops.linear.matmul(x, s.gate_up), s.inter, f.limit)
+    return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
+
+def mla_mixer(x, inputs, plan, positions, m, a, split):
+    """Latent attention over the keys the indexer picks: its rows split into
+    decode and prefill arms, or read whole (the draft head's)."""
+    pages = inputs.kv(a.kv)
+    write_page = inputs.write_page(a.kv)
+    write_offset = inputs.write_offset(a.kv)
+
+    q_a = ops.linear.matmul(x, a.q_a_proj)
+    q_a = ops.elemwise.rmsnorm(q_a, a.q_a_norm, a.q_a_norm_eps)
+    q_b = ops.linear.matmul(q_a, a.q_b_proj)
+    kv_a = ops.linear.matmul(x, a.kv_a_proj)
+    seam.at(seam.ATTN_QV, [q_b, kv_a])
+
+    selection = index_select(x, q_a, inputs, positions, m.act, a.indexer, split)
+
+    kv_c, k_pe = ops.attn.mla_latents(kv_a, a.kv_a_norm, a.kv_a_norm_eps, m.kv_lora_rank)
+    ops.attn.mla_kv_append(kv_c, k_pe, pages, write_page, write_offset)
+
+    q_nope, q_pe = ops.attn.mla_split_q_b(q_b, m.heads, a.qk_nope_head_dim, a.qk_rope_head_dim)
+    q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, m.heads, m.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
+    seam.at(seam.ATTN_Q, [q])
+
+    if split:
+        one = fact.single_token()
+        scored = merge([
+            ops.attn.mla_decode_selected(
+                q.on(one),
+                plan[0],
+                q_pe.on(one),
+                selection.on(one),
+                pages,
+                m.heads,
+                m.kv_lora_rank,
+                a.sm_scale,
+            ),
+            ops.attn.mla_prefill_selected(
+                q.on(~one),
+                plan[1],
+                q_pe.on(~one),
+                selection.on(~one),
+                pages,
+                m.heads,
+                m.kv_lora_rank,
+                a.sm_scale,
+            ),
+        ])
+    else:
+        scored = ops.attn.mla_prefill_selected(q, plan[1], q_pe, selection, pages, m.heads, m.kv_lora_rank, a.sm_scale)
+
+    v = ops.attn.mla_absorb_out(scored, a.kv_b_proj, m.heads, m.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
+    seam.at(seam.ATTN_OUT, [v])
+    return ops.linear.matmul(v, a.o_proj)
+
+def index_select(x, q_a, inputs, positions, act, ix, split):
+    keys = inputs.kv(ix.keys)
+    write_page = inputs.write_page(ix.keys)
+    write_offset = inputs.write_offset(ix.keys)
+    row_valid = inputs.row_valid()
+
+    state_kv = ops.attn.index_layernorm_rope(
+        ops.linear.matmul(x, ix.wk),
+        positions,
+        ix.k_norm,
+        ix.k_norm_eps,
+        ix.k_norm_bias,
+        ix.rope_dim,
+        ix.theta,
+    )
+    state_score = ops.linear.matmul(x, ix.kpool_gate)
+    ops.attn.pool_state_write(state_kv, state_score, keys, write_page, write_offset, ix.head_dim, ix.kpool)
+
+    bpos, breq, _ = boundaries(positions, row_valid, ix.kpool, split)
+    k = ops.attn.pool_gather(bpos, breq, keys, ix.kpool_ape, ix.head_dim, ix.kpool, act)
+    ops.attn.pool_kv_append(k, bpos, breq, keys, write_page, write_offset)
+
+    q = ops.attn.index_rope(
+        ops.linear.matmul(q_a, ix.wq_b),
+        positions,
+        ix.heads,
+        ix.head_dim,
+        ix.rope_dim,
+        ix.theta,
+    )
+    weights = ops.linear.matmul(x, ix.weights_proj)
+    return ops.attn.index_topk(q, weights, keys, ix.heads, ix.head_dim, ix.top_k, ix.kpool)
+
+def boundaries(positions, row_valid, ratio, split):
+    if not split:
+        return ops.attn.pool_boundary_prefill(positions, row_valid, ratio)
+    one = fact.single_token()
+    dpos, dreq, drope = ops.attn.pool_boundary_decode(positions.on(one), row_valid, ratio)
+    ppos, preq, prope = ops.attn.pool_boundary_prefill(positions.on(~one), row_valid, ratio)
+    return (merge([dpos, ppos]), merge([dreq, preq]), merge([drope, prope]))
+
+def kda_mixer(x, inputs, k):
+    conv = inputs.state(k.conv_state)
+    delta = inputs.state(k.delta_state)
+    qkv = ops.linear.matmul(x, k.qkv)
+    f = ops.linear.matmul(ops.linear.matmul(x, k.f_a), k.f_b)
+    b = ops.linear.matmul(x, k.b)
+    seam.at(seam.RECURRENT, [qkv])
+
+    one = fact.single_token()
+    step = ops.attn.ssm_kda_step(
+        ops.attn.ssm_causal_conv1d(qkv.on(one), k.conv, conv, k.conv_kernel),
+        f.on(one),
+        b.on(one),
+        k.dt_bias,
+        k.a_log,
+        delta,
+        k.heads,
+        k.head_dim,
+        k.norm_eps,
+        k.gate_floor,
+    )
+    chunked = ops.attn.ssm_kda_chunked(
+        ops.attn.ssm_causal_conv1d_chunked(qkv.on(~one), k.conv, conv, k.conv_kernel),
+        f.on(~one),
+        b.on(~one),
+        k.dt_bias,
+        k.a_log,
+        delta,
+        k.heads,
+        k.head_dim,
+        k.norm_eps,
+        k.gate_floor,
+    )
+    core = merge([step, chunked])
+
+    g = ops.linear.matmul(ops.linear.matmul(x, k.g_a), k.g_b)
+    o = ops.elemwise.rmsnorm_gated_by(core, g, k.o_norm, k.heads, k.o_norm_eps)
+    return ops.linear.matmul(o, k.o_proj)
+
+def tower(inputs, t):
+    d = t.head_dim
+    x = inputs.patches(t.patch_width)
+    segments = inputs.patch_segments()
+    grid = inputs.patch_positions()
+    y = ops.elemwise.add_bias(t.patch_embed_bias, ops.linear.matmul(x, t.patch_embed))
+    for b in t.blocks:
+        n = ops.elemwise.rmsnorm(y, b.norm1, t.norm_eps)
+        q, k, v = ops.layout.split_qkv(
+            ops.elemwise.add_bias(b.qkv_bias, ops.linear.matmul(n, b.qkv)),
+            t.hidden,
+            t.hidden,
+        )
+        q = ops.elemwise.rmsnorm_per_head(q, b.q_norm, d, t.norm_eps)
+        k = ops.elemwise.rmsnorm_per_head(k, b.k_norm, d, t.norm_eps)
+        q, k = ops.elemwise.rope_mrope(q, k, grid, [0, d // 4, d // 4], "blocked", d, d, t.theta)
+        o = ops.attn.dense(q, k, v, segments, d, t.sm_scale)
+        y = ops.elemwise.residual_add(
+            ops.elemwise.add_bias(b.proj_bias, ops.linear.matmul(o, b.proj)),
+            y,
+        )
+        n = ops.elemwise.rmsnorm(y, b.norm2, t.norm_eps)
+        h = ops.elemwise.add_bias(b.gate_up_bias, ops.linear.matmul(n, b.gate_up))
+        a = ops.linear.mlp_swiglu_clamp(h, t.inter, t.limit)
+        y = ops.elemwise.residual_add(
+            ops.elemwise.add_bias(b.down_bias, ops.linear.matmul(a, b.down)),
+            y,
+        )
+    y = ops.elemwise.rmsnorm(y, t.post_norm, t.norm_eps)
+    folded = ops.layout.merge_rows(y, t.merge)
+    y = ops.elemwise.add_bias(t.downsample_bias, ops.linear.matmul(folded, t.downsample))
+    mg = t.merger
+    p = ops.linear.matmul(y, mg.proj)
+    n = ops.elemwise.layernorm(p, mg.norm, mg.norm_bias, t.norm_eps)
+    g = ops.linear.mlp_gelu_tanh(n)
+    h = ops.linear.matmul(g, mg.gate_up)
+    a = ops.linear.mlp_swiglu_clamp(h, t.merger_inter, t.limit)
+    return ops.linear.matmul(a, mg.down)
+
+def gate(streams, mix, hy):
+    normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
+    mixes = ops.elemwise.hc_project(normed, mix.dynamic, hy.streams)
+    return ops.elemwise.hc_gates(
+        mixes,
+        streams,
+        mix.scale,
+        mix.base,
+        hy.streams,
+        hy.gate_eps,
+        hy.alpha,
+        hy.sinkhorn,
+    )

@@ -128,7 +128,6 @@ static FAMILIES: LazyLock<Vec<Vec<catalog::Entry>>> = LazyLock::new(|| {
     let mut families = vec![
         deepseek_v4::entries(),
         flux_2::entries(),
-        glm_5_next::entries(),
         qwen_3::entries(),
         z_image::entries(),
         wan_2::entries(),
