@@ -226,6 +226,7 @@ fn load(dir: &Path, sku: Sku, head_dim: u32) -> Shell {
         slots: 4,
         pages: 4 * 128 / 16,
         runahead: engine::runahead::Runahead::F1,
+        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
         residency: engine_metal::ResidencyPlan::default(),
         gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
     })
