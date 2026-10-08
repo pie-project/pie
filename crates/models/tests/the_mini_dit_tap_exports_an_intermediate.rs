@@ -1,12 +1,26 @@
 use std::collections::BTreeSet;
 
-use models::mini_dit::forward::{Tap, generative};
-use models::mini_dit::model::{self, Model};
-use poem::{Def, Dim, Dtype, Platform, RuntimeInput, Trace, Ty, seam, trace_hybrid};
+use poem::{Def, Dim, Platform, RuntimeInput, Trace, Ty, seam};
+
+const TAP: &str = "PIE_MINI_DIT_TAP";
+
+/// The widths mini-dit's package declares.
+mod model {
+    pub const HIDDEN: u32 = 256;
+    pub const PATCH_FEATURES: u32 = 64;
+}
+
+fn row() -> &'static models::Deployment {
+    models::deployment("mini-dit-bf16-kv-bf16").expect("the mini-dit row")
+}
 
 fn traced(tap: Option<&str>) -> Trace {
-    let text = Model::mini(Dtype::Bf16).tapped(tap.map(str::to_string));
-    trace_hybrid("mini-dit", &text, Platform::Cuda)
+    poem::star::with_env(&[(TAP, tap)], || row().trace(Platform::Cuda))
+}
+
+fn generative(tap: Option<&str>) -> models::Generative {
+    poem::star::with_env(&[(TAP, tap)], || (row().entry.generative)(&row().deploy))
+        .expect("mini-dit is generative")
 }
 
 fn velocity_width(plan: &Trace) -> u64 {
@@ -73,7 +87,6 @@ fn a_tap_moves_the_velocity_seam_to_the_intermediate_at_its_width() {
         (Some("b0.norm1_out"), model::HIDDEN),
         (Some("final.tokens"), model::PATCH_FEATURES),
     ] {
-        assert_eq!(Tap::width(tap), width, "Tap::width({tap:?})");
         assert_eq!(
             generative(tap).readings[0].readout_width,
             width,

@@ -117,8 +117,16 @@ fn family(package: &'static poem::star::Package) -> Vec<Entry> {
                 tokenizer: crate::tokenizer::named(&model.tokenizer).unwrap_or_else(|| {
                     fail(format!("`{id}` names no tokenizer `{}`", model.tokenizer))
                 }),
-                diffusion: Box::new(|_| None),
-                generative: Box::new(|_| None),
+                diffusion: Box::new(move |d| {
+                    package
+                        .diffusion(id, &deploy(d))
+                        .unwrap_or_else(|why| panic!("`{id}` states no canvas: {why:#}"))
+                }),
+                generative: Box::new(move |d| {
+                    package
+                        .generative(id, &deploy(d))
+                        .unwrap_or_else(|why| panic!("`{id}` states no generative facts: {why:#}"))
+                }),
                 rows,
             }
         })

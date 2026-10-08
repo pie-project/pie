@@ -28,6 +28,7 @@ pub fn template_of(name: &str) -> Option<TemplateFn> {
 #[must_use]
 pub fn named(name: &str) -> Option<TemplateFn> {
     match name {
+        "mini_dit" => Some(crate::mini_dit::template::instruct),
         "gpt_oss" => Some(crate::gpt_oss::template::gpt_oss),
         "inkling" => Some(crate::inkling::template::inkling),
         "glm_5" => Some(crate::glm_5::template::instruct),
