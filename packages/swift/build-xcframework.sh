@@ -16,9 +16,9 @@ case "$profile" in
 esac
 
 # Package.swift's platforms, for the C dependencies too.
-export IPHONEOS_DEPLOYMENT_TARGET=26.0 MACOSX_DEPLOYMENT_TARGET=26.0
+export IPHONEOS_DEPLOYMENT_TARGET=26.0 IPHONESIMULATOR_DEPLOYMENT_TARGET=26.0 MACOSX_DEPLOYMENT_TARGET=26.0
 
-slices=(aarch64-apple-ios aarch64-apple-darwin)
+slices=(aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin)
 for triple in "${slices[@]}"; do
   echo "== $triple ($profile)"
   rustup target add "$triple" >/dev/null

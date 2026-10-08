@@ -44,7 +44,7 @@ lanes, the share of the GPU working set), sized for a phone by default.
 ## Build
 
 ```bash
-./build-xcframework.sh        # the Rust core → build/PieServerCore.xcframework (ios-arm64, macos-arm64)
+./build-xcframework.sh        # the Rust core → build/PieServerCore.xcframework (iOS, iOS simulator, macOS; arm64)
 swift run -c release pie-smoke <model.zt> "prompt"   # end to end on a Mac
 ```
 
@@ -55,4 +55,7 @@ swift run -c release pie-smoke <model.zt> "prompt"   # end to end on a Mac
 
 - The runtime boots once per process. `shutdown()` releases the engine and
   its memory, but the app cannot start another server afterwards.
-- No simulator slice yet.
+- In the iOS simulator an app builds and runs, but the engine refuses to boot:
+  the simulator's GPU shares no memory with the host. Inference needs a device.
+- Linking `PieServer` adds about 57 MB to an app's executable (about 16 MB
+  compressed); the model ships or downloads separately.
