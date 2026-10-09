@@ -80,14 +80,6 @@ pub struct Entry {
     pub vocab: u32,
     pub diffusion: DiffusionFn,
     pub generative: GenerativeFn,
-    /// The deployments the catalog lists for this model, with each one's
-    /// place in its family's list (identification tries them in that order).
-    pub rows: Vec<Row>,
-}
-
-pub struct Row {
-    pub seq: u32,
-    pub deploy: Deploy,
 }
 
 impl Entry {
@@ -109,10 +101,7 @@ impl Entry {
         if deploy.tp == 0 {
             return Err(Refused("a deployment runs on at least one rank".into()));
         }
-        let trace = (self.trace)(&self.name(deploy), deploy, platform)?;
-        poem_compiler::shard::shard(trace, deploy.tp)
-            .map(|_| ())
-            .map_err(|why| Refused(why.to_string()))
+        self.trace(deploy, platform).map(drop)
     }
 
     /// The trace each rank of `deploy` runs.

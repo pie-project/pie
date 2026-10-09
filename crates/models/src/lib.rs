@@ -142,14 +142,17 @@ pub fn entry(id: &str) -> Option<&'static catalog::Entry> {
 static DEPLOYMENTS: LazyLock<Vec<Deployment>> = LazyLock::new(|| {
     FAMILIES
         .iter()
-        .flat_map(|family| {
-            let mut rows: Vec<(&'static catalog::Entry, &catalog::Row)> = family
-                .iter()
-                .flat_map(|entry| entry.rows.iter().map(move |row| (entry, row)))
-                .collect();
-            rows.sort_by_key(|(_, row)| row.seq);
-            rows.into_iter()
-                .map(|(entry, row)| Deployment::of(entry, row.deploy.clone()))
+        .zip(star::packages())
+        .flat_map(|(family, package)| {
+            package.manifest().deployments.iter().map(move |(id, d)| {
+                let entry = family
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .expect("a package lists deployments of its own models");
+                let deploy = star::catalog(d)
+                    .unwrap_or_else(|why| panic!("the package `{}`: {}", package.name(), why.0));
+                Deployment::of(entry, deploy)
+            })
         })
         .collect()
 });

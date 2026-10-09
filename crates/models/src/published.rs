@@ -14,10 +14,7 @@ pub fn all() -> impl Iterator<Item = &'static Published> {
 /// The drafter `drafter` published for the repository `target`.
 #[must_use]
 pub fn lookup(target: &str, drafter: &str) -> Option<&'static Published> {
-    let wanted = target.to_ascii_lowercase().replace("--", "/");
-    all().find(|p| {
-        p.drafter.eq_ignore_ascii_case(drafter) && p.target.to_ascii_lowercase() == wanted
-    })
+    for_target(target).find(|p| p.drafter.eq_ignore_ascii_case(drafter))
 }
 
 /// Every drafter published for the repository `target`.

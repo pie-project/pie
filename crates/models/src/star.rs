@@ -4,7 +4,7 @@
 
 use std::sync::LazyLock;
 
-use crate::catalog::{Deploy, Drafter, Entry, Part, Refused, Row};
+use crate::catalog::{Deploy, Drafter, Entry, Part, Refused};
 
 mod embedded {
     include!(concat!(env!("OUT_DIR"), "/packages.rs"));
@@ -76,16 +76,6 @@ pub fn family(package: &'static poem::star::Package) -> Vec<Entry> {
         .iter()
         .map(|model| {
             let id = model.id.as_str();
-            let rows = manifest
-                .deployments
-                .iter()
-                .enumerate()
-                .filter(|(_, (of, _))| of == id)
-                .map(|(seq, (_, d))| Row {
-                    seq: seq as u32,
-                    deploy: catalog(d).unwrap_or_else(|why| fail(why.0)),
-                })
-                .collect();
             Entry {
                 id,
                 mini: model.mini,
@@ -135,7 +125,6 @@ pub fn family(package: &'static poem::star::Package) -> Vec<Entry> {
                         .generative(id, &deploy(d))
                         .unwrap_or_else(|why| panic!("`{id}` states no generative facts: {why:#}"))
                 }),
-                rows,
             }
         })
         .collect()
@@ -179,6 +168,19 @@ pub fn replacing(
     poem::star::Package::new(package.name(), &files).map_err(|why| format!("{why:#}"))
 }
 
+/// A deployment at weights `w` and kv `kv` on one rank, with no part or
+/// drafter.
+#[must_use]
+pub fn one_rank(w: poem::Dtype, kv: poem::Dtype) -> poem::star::Deploy {
+    poem::star::Deploy {
+        weights: vec![w],
+        kv,
+        tp: 1,
+        parts: Vec::new(),
+        drafter: None,
+    }
+}
+
 /// The trace of the model `id`, listed or not, at weights `w` and kv `kv`
 /// on one rank, named `id`: the small geometries the engines' tests serve.
 #[must_use]
@@ -189,13 +191,7 @@ pub fn trace_of(
     platform: poem::Platform,
 ) -> poem::Trace {
     let package = package_of(id).unwrap_or_else(|| panic!("no package holds `{id}`"));
-    let deploy = poem::star::Deploy {
-        weights: vec![w],
-        kv,
-        tp: 1,
-        parts: Vec::new(),
-        drafter: None,
-    };
+    let deploy = one_rank(w, kv);
     package
         .trace(id, &deploy, id, platform)
         .unwrap_or_else(|why| panic!("`{id}` does not trace: {why:#}"))
@@ -211,12 +207,6 @@ pub fn import_of(
     platform: poem::Platform,
 ) -> Result<checkpoint::contract::ModelContract, poem::import::Error> {
     let package = package_of(id).unwrap_or_else(|| panic!("no package holds `{id}`"));
-    let deploy = poem::star::Deploy {
-        weights: vec![w],
-        kv,
-        tp: 1,
-        parts: Vec::new(),
-        drafter: None,
-    };
+    let deploy = one_rank(w, kv);
     package.import(id, &deploy, src, platform)
 }
