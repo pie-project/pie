@@ -328,7 +328,7 @@ class Chat:
         self.exit_armed = True
         self.exit_key = key
         event.app.invalidate()
-        asyncio.get_running_loop().call_later(1.0, self.disarm_exit)
+        asyncio.get_running_loop().call_later(0.75, self.disarm_exit)
 
     def disarm_exit(self) -> None:
         self.exit_armed = False
