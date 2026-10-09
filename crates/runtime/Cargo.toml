@@ -47,7 +47,7 @@ media = { path = "../media" }
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
 blake3 = "1.8"
-fancy-regex = "0.18.0"
+fancy-regex = "0.19.2"
 async-trait = "0.1.91"
 wasm-metadata = "0.254.0"
 rustc-hash = "2.1"
