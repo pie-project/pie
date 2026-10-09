@@ -117,26 +117,34 @@ class EngineBackend:
         self.history.append({"role": "assistant", "content": "".join(pieces)})
 
 
-# The pie-slice mascot: 'c' cream, 'f' filling, 'k' crust, '.' empty. Two pixel rows
-# share one terminal row, drawn with half-block characters.
-MASCOT_GRID = [
-    ".....cc.....",
-    "...cccccc...",
-    "..cccccccc..",
-    ".ffffffffff.",
-    ".ffffffffff.",
-    ".ffffffffff.",
-    ".kkkkkkkkkk.",
-    "............",
+# The mascot is a pixel cat drawn with half-block characters: two pixel rows per text line.
+MASCOT_PALETTE = {"K": (24, 24, 28), "o": (245, 140, 40), "d": (205, 100, 22), "p": (250, 182, 170)}
+MASCOT_ROWS = [
+    ".K............K.",
+    ".KK..........KK.",
+    ".KoK........KoK.",
+    ".KpoK......KopK.",
+    ".KppoKKKKKKoppK.",
+    ".KooooooooooooK.",
+    ".KooooooooooooK.",
+    ".KooKKooooKKooK.",
+    ".KooKKooooKKooK.",
+    "KKooooooooooooKK",
+    ".KoooooKKoooooK.",
+    "KKooooKooKooooKK",
+    ".KooooooooooooK.",
+    "..KooooooooooK..",
+    "..KoddooooddoK..",
+    "..KKKKKKKKKKKK..",
 ]
-MASCOT_COLORS = {"c": "#f4f4f4", "f": "#dc5f5a", "k": "#b8864f"}
 
 
 def mascot_rows() -> list[list[tuple[str, str]]]:
     """Return the mascot as rows of styled text fragments, two pixel rows per line."""
-    colors = MASCOT_COLORS
+    colors = {k: f"#{r:02x}{g:02x}{b:02x}" for k, (r, g, b) in MASCOT_PALETTE.items()}
     lines = []
-    for top, bottom in zip(MASCOT_GRID[0::2], MASCOT_GRID[1::2]):
+    rows = MASCOT_ROWS
+    for top, bottom in zip(rows[0::2], rows[1::2]):
         fragments = []
         for t, b in zip(top, bottom):
             if t in colors and b in colors:
