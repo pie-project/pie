@@ -74,7 +74,7 @@ pub async fn run_standalone(
     mut gateway: gateway::Config,
     worker: crate::Config,
 ) -> Result<StandaloneHandle> {
-    bootstrap::install_crypto_provider();
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let handle = controller::embed(controller);
     let control = EmbeddedControl(handle.clone());

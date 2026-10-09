@@ -91,14 +91,14 @@ impl crate::ui::Report for DoctorReport {
     }
 }
 
-pub fn run(global: &bootstrap::GlobalArgs) -> Result<crate::ui::Answer> {
+pub fn run(global: &crate::process::GlobalArgs) -> Result<crate::ui::Answer> {
     let mut warnings = 0usize;
     let mut passes = 0usize;
     let mut failures = 0usize;
 
     let mut sections: Vec<(&'static str, Checks)> = Vec::new();
 
-    let (path, origin) = bootstrap::cli_config_path(global);
+    let (path, origin) = crate::process::cli_config_path(global);
 
     let mut system = vec![check_platform()];
     system.extend(Language::ALL.into_iter().map(check_language));
@@ -161,9 +161,9 @@ pub fn run(global: &bootstrap::GlobalArgs) -> Result<crate::ui::Answer> {
     })
 }
 
-fn check_config(path: &Path, origin: bootstrap::Origin) -> Checks {
+fn check_config(path: &Path, origin: crate::process::Origin) -> Checks {
     if !path.exists() {
-        return if origin == bootstrap::Origin::Default {
+        return if origin == crate::process::Origin::Default {
             vec![(
                 "config".into(),
                 format!(
@@ -276,7 +276,7 @@ fn absent_because(name: &str) -> String {
 
 /// The newest version of `name` installed under the inferlets directory.
 fn installed_version(name: &str) -> Option<String> {
-    let mut repo = Repository::new(bootstrap::paths::inferlets_dir());
+    let mut repo = Repository::new(worker::paths::inferlets_dir());
     repo.refresh();
     repo.newest(name).map(|program| program.version)
 }
@@ -291,7 +291,7 @@ fn check_builtin_inferlets() -> Checks {
         .collect();
     programs.sort_unstable();
     programs.dedup();
-    let inferlets_dir = crate::ui::short_path(&bootstrap::paths::inferlets_dir());
+    let inferlets_dir = crate::ui::short_path(&worker::paths::inferlets_dir());
     programs
         .into_iter()
         .map(|name| {

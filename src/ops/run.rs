@@ -261,11 +261,11 @@ fn plan_local(path: &Path) -> Result<Plan> {
 }
 
 pub async fn run(
-    global: &bootstrap::GlobalArgs,
+    global: &crate::process::GlobalArgs,
     args: RunArgs,
     diag: Option<&str>,
 ) -> Result<crate::ui::Answer> {
-    let (cfg_path, origin) = bootstrap::cli_config_path(global);
+    let (cfg_path, origin) = crate::process::cli_config_path(global);
     let content = std::fs::read_to_string(&cfg_path).with_context(|| {
         format!(
             "no config file at {} ({}); `pie config init` writes one",

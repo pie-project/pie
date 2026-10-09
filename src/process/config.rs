@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use crate::{BootSpec, GlobalArgs, paths};
+use super::{BootSpec, GlobalArgs};
+use worker::paths;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {

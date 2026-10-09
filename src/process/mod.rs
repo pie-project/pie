@@ -1,3 +1,13 @@
+//! The process skeleton every pie binary shares: the global flags, the
+//! config file a role reads, tracing and `/metrics`, signals and panics.
+
+mod config;
+mod lifecycle;
+mod observe;
+pub mod report;
+
+pub use config::{Origin, cli_config_path};
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::process::ExitCode;
@@ -93,7 +103,7 @@ impl Ctx {
     }
 
     pub async fn run_until_signal(self, shutdown: impl Future<Output = ()>) -> ExitCode {
-        crate::lifecycle::wait_for_signal().await;
+        lifecycle::wait_for_signal().await;
         tracing::info!("{}: shutdown signal received, draining", self.name);
         shutdown.await;
         tracing::info!("{}: stopped cleanly", self.name);
@@ -102,8 +112,8 @@ impl Ctx {
 }
 
 fn init_observability(log_level: &str) {
-    crate::observe::init_tracing(log_level);
-    crate::lifecycle::install_panic_hook();
+    observe::init_tracing(log_level);
+    lifecycle::install_panic_hook();
     install_crypto_provider();
 }
 
@@ -119,7 +129,7 @@ pub fn init_cli(global: &GlobalArgs) -> Result<()> {
 pub fn init(spec: BootSpec, global: GlobalArgs) -> Result<Ctx> {
     init_observability(&global.log_level);
 
-    let config = crate::config::source(&spec, &global)?;
+    let config = config::source(&spec, &global)?;
 
     let metrics_addr: Option<SocketAddr> =
         match global.metrics_addr.as_deref().or(spec.default_metrics_addr) {
@@ -131,10 +141,10 @@ pub fn init(spec: BootSpec, global: GlobalArgs) -> Result<Ctx> {
         };
 
     if let Some(addr) = metrics_addr {
-        crate::observe::spawn_metrics(addr, Instant::now(), spec.name, spec.version)?;
+        observe::spawn_metrics(addr, Instant::now(), spec.name, spec.version)?;
     }
 
-    crate::lifecycle::banner(spec.name, spec.version, metrics_addr);
+    lifecycle::banner(spec.name, spec.version, metrics_addr);
 
     Ok(Ctx {
         config,
@@ -203,7 +213,7 @@ mod tests {
             log_level: "info".into(),
             metrics_addr: None,
         };
-        assert_eq!(crate::config::source(&spec, &present).unwrap(), "key = 1\n");
+        assert_eq!(config::source(&spec, &present).unwrap(), "key = 1\n");
         std::fs::remove_file(&path).ok();
 
         let missing = GlobalArgs {
@@ -211,6 +221,6 @@ mod tests {
             log_level: "info".into(),
             metrics_addr: None,
         };
-        assert!(crate::config::source(&spec, &missing).is_err());
+        assert!(config::source(&spec, &missing).is_err());
     }
 }

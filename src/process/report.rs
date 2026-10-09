@@ -1,7 +1,8 @@
 use std::fmt;
 use std::net::SocketAddr;
 
-use crate::{BootSpec, GlobalArgs, config, paths};
+use super::{BootSpec, GlobalArgs, config};
+use worker::paths;
 
 #[derive(Debug, Clone)]
 pub struct Setting {

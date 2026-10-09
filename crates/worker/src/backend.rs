@@ -188,7 +188,7 @@ fn device_boot(
 
 #[cfg(feature = "cuda")]
 fn dump_device_boot(boot: &DeviceBoot, group_id: usize, rank: Option<usize>) {
-    let dir = bootstrap::paths::pie_home().join("logs");
+    let dir = crate::paths::pie_home().join("logs");
     let name = match rank {
         Some(rank) => format!("engine-boot-g{group_id}-r{rank}.txt"),
         None => format!("engine-boot-g{group_id}.txt"),

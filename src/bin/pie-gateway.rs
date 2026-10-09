@@ -7,7 +7,7 @@ use clap::Parser;
 #[command(name = "pie-gateway", version)]
 struct Cli {
     #[command(flatten)]
-    global: bootstrap::GlobalArgs,
+    global: pie::process::GlobalArgs,
 
     #[arg(long)]
     listen: Option<SocketAddr>,
@@ -22,8 +22,8 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
-    let ctx = bootstrap::init(
-        bootstrap::BootSpec::gateway().version(env!("CARGO_PKG_VERSION")),
+    let ctx = pie::process::init(
+        pie::process::BootSpec::gateway().version(env!("CARGO_PKG_VERSION")),
         cli.global,
     )?;
 

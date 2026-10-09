@@ -89,7 +89,7 @@ impl ui::Report for CacheReport {
 
 fn list() -> Result<Answer> {
     let entries = disk::entries(Some(crate::local::hf::resolve_cache_dir()));
-    let home = bootstrap::paths::pie_home();
+    let home = worker::paths::pie_home();
 
     let measured: Vec<(disk::Entry, bool, u64)> = entries
         .into_iter()

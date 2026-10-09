@@ -56,7 +56,7 @@ pub struct Config {
 
 impl Config {
     pub fn home(&self) -> PathBuf {
-        self.home.clone().unwrap_or_else(bootstrap::paths::pie_home)
+        self.home.clone().unwrap_or_else(crate::paths::pie_home)
     }
 
     /// Parse the operator's file into a validated [`Config`].

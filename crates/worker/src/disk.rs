@@ -30,7 +30,7 @@ pub struct Entry {
 }
 
 pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
-    let home = bootstrap::paths::pie_home();
+    let home = crate::paths::pie_home();
     let mut entries = vec![
         Entry {
             name: "engine",
@@ -43,7 +43,7 @@ pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
         },
         Entry {
             name: "inferlets",
-            path: bootstrap::paths::inferlets_dir(),
+            path: crate::paths::inferlets_dir(),
             what: "Installed inferlets. Deleting one means `pie inferlet \
                    install` again; the built-in ones need no install.",
             reclaim: Reclaim::Safe,
@@ -51,7 +51,7 @@ pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
         },
         Entry {
             name: "languages",
-            path: bootstrap::paths::languages_dir(),
+            path: crate::paths::languages_dir(),
             what: "The language components script inferlets run under \
                    (`python.wasm`, `javascript.wasm`). `pie language install` \
                    puts one back from a release archive.",

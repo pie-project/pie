@@ -1,7 +1,6 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/bootstrap",
     "crates/builtins",
     "crates/runtime",
     "crates/controller",
@@ -61,7 +60,6 @@ members = [
     "packages/javascript/server",
 ]
 default-members = [
-    "crates/bootstrap",
     "crates/builtins",
     "crates/runtime",
     "crates/controller",
@@ -138,6 +136,10 @@ path = "src/bin/pie-gateway.rs"
 name = "pie-worker"
 path = "src/bin/pie-worker.rs"
 
+[[bin]]
+name = "pie-env"
+path = "src/bin/pie-env.rs"
+
 [features]
 default = []
 cuda = ["worker/cuda"]
@@ -148,7 +150,8 @@ xla = ["worker/xla"]
 profile-fire = ["worker/profile-fire"]
 
 [dependencies]
-bootstrap = { path = "crates/bootstrap" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 controller = { path = "crates/controller" }
 gateway = { path = "crates/gateway" }
 builtins = { path = "crates/builtins" }

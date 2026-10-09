@@ -166,7 +166,7 @@ fn an_import_that_will_prepare_refuses_a_source_no_sku_claims() {
     let store = tempfile::tempdir().expect("store");
     let artifact = store.path().join("converted.zt");
 
-    let global = bootstrap::GlobalArgs {
+    let global = pie::process::GlobalArgs {
         config: None,
         log_level: "info".into(),
         metrics_addr: None,

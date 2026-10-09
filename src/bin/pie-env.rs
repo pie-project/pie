@@ -1,8 +1,8 @@
 use std::process::ExitCode;
 
-use bootstrap::report::Resolved;
-use bootstrap::{BootSpec, GlobalArgs};
 use clap::{Parser, ValueEnum};
+use pie::process::report::Resolved;
+use pie::process::{BootSpec, GlobalArgs};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum Field {
@@ -48,7 +48,7 @@ fn main() -> ExitCode {
     };
     let resolved: Vec<Resolved> = specs
         .iter()
-        .map(|spec| bootstrap::report::resolve(spec, &cli.global))
+        .map(|spec| pie::process::report::resolve(spec, &cli.global))
         .collect();
 
     match cli.field {

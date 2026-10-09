@@ -50,7 +50,7 @@ pub struct RemoveArgs {
 /// Where the components live: `$PIE_HOME/languages/<language>.wasm`, which
 /// is also where install.sh puts them.
 pub(crate) fn dir() -> PathBuf {
-    bootstrap::paths::pie_home().join("languages")
+    worker::paths::pie_home().join("languages")
 }
 
 pub(crate) fn path(language: Language) -> PathBuf {
