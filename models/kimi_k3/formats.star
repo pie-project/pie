@@ -1,6 +1,7 @@
 # How a Kimi-K3 checkpoint is laid out: transformers' names under
 # `language_model.`, or llama.cpp's GGUF names.
 
+load("//lib/kda/formats.star", kda_conv = "conv", kda_gate = "gate", kda_qkv = "qkv")
 load("//lib/mla/formats.star", "named")
 
 GGUF_EMBED = "token_embd.weight"
@@ -27,14 +28,6 @@ def lifted(w):
     dims[w.cut_axis] = -1
     return dims
 
-def squeezed(name):
-    """A depthwise convolution bank stored `[channels, 1, kernel]`, read as
-    `[channels, kernel]`."""
-    held = shape(name)
-    if len(held) != 3 or held[1] != 1:
-        fail("`{}`: a depthwise convolution bank is stored [channels, 1, kernel] and this one is stored {}".format(name, held))
-    return src(name).transmute([held[0], held[2]], stored(name))
-
 def huggingface(m, reads):
     reads.read(m.embed, "language_model.model.embed_tokens.weight")
     reads.read(m.final_norm, "language_model.model.norm.weight")
@@ -52,7 +45,7 @@ def huggingface(m, reads):
             for a, name in named(w.mixer, lambda leaf: at(l, leaf)):
                 reads.read(a, name)
         else:
-            kda(reads, l, w.mixer)
+            kda(reads, lambda leaf: at(l, leaf), w.mixer)
         f = w.mlp
         if not f.routed:
             reads.read_concat(f.gate_up, [at(l, "mlp.gate_proj.weight"), at(l, "mlp.up_proj.weight")])
@@ -93,40 +86,33 @@ def huggingface(m, reads):
         reads.read(r.norm, "language_model.model.output_attn_res_norm.weight")
         reads.read(r.proj, "language_model.model.output_attn_res_proj.weight")
 
-def kda(reads, l, k):
-    reads.read_concat(k.qkv, [
-        at(l, "self_attn.q_proj.weight"),
-        at(l, "self_attn.k_proj.weight"),
-        at(l, "self_attn.v_proj.weight"),
-    ])
-    reads.read_expr(k.conv, concat(k.conv.cut_axis, [
-        squeezed(at(l, "self_attn.q_conv1d.weight")),
-        squeezed(at(l, "self_attn.k_conv1d.weight")),
-        squeezed(at(l, "self_attn.v_conv1d.weight")),
-    ]))
-    reads.read(k.f_a, at(l, "self_attn.f_a_proj.weight"))
-    reads.read(k.f_b, at(l, "self_attn.f_b_proj.weight"))
-    reads.read(k.b, at(l, "self_attn.b_proj.weight"))
+def kda(reads, n, k):
+    reads.read_concat(k.qkv, kda_qkv(n))
+    reads.read_expr(k.conv, kda_conv(k, n))
+    reads.read(k.f_a, n("self_attn.f_a_proj.weight"))
+    reads.read(k.f_b, n("self_attn.f_b_proj.weight"))
+    reads.read(k.b, n("self_attn.b_proj.weight"))
 
     # stored flat `[heads * head_dim]`; read as the `[heads, head_dim]` plane
-    reads.read_expr(k.dt_bias, src(at(l, "self_attn.dt_bias")).transmute(lifted(k.dt_bias), raw(dtype.f32)))
+    reads.read_expr(k.dt_bias, src(n("self_attn.dt_bias")).transmute(lifted(k.dt_bias), raw(dtype.f32)))
 
     # The released Kimi-K3 stores `A_log` as `[128]` against 96 heads; the
     # reference's KDA gate loads one entry per head, so the first `heads`
     # entries are the decays and the tail is never read.
-    a_log = at(l, "self_attn.A_log")
+    a_log = n("self_attn.A_log")
     held = 0
     if has(a_log):
         held = 1
-        for n in shape(a_log):
-            held *= n
+        for d in shape(a_log):
+            held *= d
     if held > k.heads:
         reads.read_expr(k.a_log, src(a_log).slice(0, 0, k.heads))
     else:
         reads.read(k.a_log, a_log)
-    reads.read(k.gate, at(l, "self_attn.g_proj.weight"))
-    reads.read(k.o_norm, at(l, "self_attn.o_norm.weight"))
-    reads.read(k.o_proj, at(l, "self_attn.o_proj.weight"))
+    for w, name in kda_gate(k, n):
+        reads.read(w, name)
+    reads.read(k.o_norm, n("self_attn.o_norm.weight"))
+    reads.read(k.o_proj, n("self_attn.o_proj.weight"))
 
 def expert_bank(reads, w, names):
     if w.dtype == dtype.mxfp4 and names[0].endswith(".weight_packed"):
@@ -195,7 +181,7 @@ def gguf(m, reads):
             reads.read(a.b, blk(l, "ssm_beta.weight"))
             reads.read(a.dt_bias, blk(l, "ssm_dt.bias"))
             reads.read(a.a_log, blk(l, "ssm_a"))
-            reads.read(a.gate, blk(l, "ssm_gate.weight"))
+            reads.read(a.gate[0], blk(l, "ssm_gate.weight"))
             reads.read(a.o_norm, blk(l, "ssm_norm.weight"))
             reads.read(a.o_proj, blk(l, "ssm_out.weight"))
         f = w.mlp

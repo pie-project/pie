@@ -1,6 +1,7 @@
 # The forward of Kimi-K3: each layer's mixer (MLA or KDA) and MLP read a
 # blend of the residual stream's closed AttnRes blocks.
 
+load("//lib/kda/forward.star", kda = "mixer", kda_caches = "caches")
 load("//lib/mla/forward.star", "attend", "cache", "plans")
 
 def caches(m, c):
@@ -10,11 +11,7 @@ def caches(m, c):
         if a.mla:
             cache(c, kv, a)
         else:
-            width = a.heads * a.head_dim
-            c.state(a.conv_state, [a.conv_kernel, 3 * width], dtype.bf16, split = 1)
-
-            # the KDA recurrence keeps its state in f32 on every backend
-            c.state(a.delta_state, [a.heads, a.head_dim, a.head_dim], dtype.f32, split = 0)
+            kda_caches(c, a)
 
 def opens_block(m, l):
     return m.res_block > 0 and l % m.res_block == 0
@@ -53,7 +50,7 @@ def forward(m, inputs):
         if w.mixer.mla:
             o = mla_mixer(x, inputs, plan, w.mixer)
         else:
-            o = kda_mixer(x, inputs, w.mixer)
+            o = kda(x, inputs, w.mixer)
         adapted = fact.has(fact.Adapter)
         o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
         y = o if fresh else ops.elemwise.residual_add(o, y)
@@ -127,42 +124,3 @@ def mla_mixer(x, inputs, plan, a):
     )
     ops.attn.mla_kv_append(kv_c, k_pe, pages, write_page, write_offset)
     return attend(x, q_nope, q_pe, pages, plan, a)
-
-def kda_mixer(x, inputs, k):
-    conv = inputs.state(k.conv_state)
-    delta = inputs.state(k.delta_state)
-    qkv = ops.linear.matmul(x, k.qkv)
-    f = ops.linear.matmul(ops.linear.matmul(x, k.f_a), k.f_b)
-    b = ops.linear.matmul(x, k.b)
-    seam.at(seam.RECURRENT, [qkv])
-
-    one = fact.single_token()
-    step = ops.attn.ssm_kda_step(
-        ops.attn.ssm_causal_conv1d(qkv.on(one), k.conv, conv, k.conv_kernel),
-        f.on(one),
-        b.on(one),
-        k.dt_bias,
-        k.a_log,
-        delta,
-        k.heads,
-        k.head_dim,
-        k.norm_eps,
-        k.gate_floor,
-    )
-    chunked = ops.attn.ssm_kda_chunked(
-        ops.attn.ssm_causal_conv1d_chunked(qkv.on(~one), k.conv, conv, k.conv_kernel),
-        f.on(~one),
-        b.on(~one),
-        k.dt_bias,
-        k.a_log,
-        delta,
-        k.heads,
-        k.head_dim,
-        k.norm_eps,
-        k.gate_floor,
-    )
-    core = merge([step, chunked])
-
-    g = ops.linear.matmul(x, k.gate)
-    o = ops.elemwise.rmsnorm_gated_by(core, g, k.o_norm, k.heads, k.o_norm_eps)
-    return ops.linear.matmul(o, k.o_proj)

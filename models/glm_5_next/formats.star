@@ -2,6 +2,7 @@
 # already imported, its draft head and vision tower overlaid under `aux.`
 # (`pie model import --aux`), the trunk read as the artifact holds it.
 
+load("//lib/kda/formats.star", kda_conv = "conv", kda_gate = "gate", kda_qkv = "qkv")
 load("//lib/mla/formats.star", "named")
 
 HEAD = "model.language_model.layers.45."
@@ -181,29 +182,13 @@ def mla(reads, own, n, a):
     read(reads, own, ix.kpool_ape, n("self_attn.indexer.index_kpool_compress_ape"))
     read(reads, own, ix.kpool_gate, n("self_attn.indexer.index_kpool_compress_gate"))
 
-def squeezed(name):
-    """A depthwise convolution bank stored `[channels, 1, kernel]`, read as
-    `[channels, kernel]`."""
-    held = shape(name)
-    if len(held) != 3 or held[1] != 1:
-        fail("`{}`: a depthwise convolution bank is stored [channels, 1, kernel] and this one is stored {}".format(name, held))
-    return src(name).transmute([held[0], held[2]], stored(name))
-
 def kda(reads, own, n, k):
-    read_concat(reads, own, k.qkv, [
-        n("self_attn.q_proj.weight"),
-        n("self_attn.k_proj.weight"),
-        n("self_attn.v_proj.weight"),
-    ])
-    read_expr(reads, own, k.conv, lambda: concat(k.conv.cut_axis, [
-        squeezed(n("self_attn.q_conv1d.weight")),
-        squeezed(n("self_attn.k_conv1d.weight")),
-        squeezed(n("self_attn.v_conv1d.weight")),
-    ]))
+    read_concat(reads, own, k.qkv, kda_qkv(n))
+    read_expr(reads, own, k.conv, lambda: kda_conv(k, n))
     read(reads, own, k.f_a, n("self_attn.f_a_proj.weight"))
     read(reads, own, k.f_b, n("self_attn.f_b_proj.weight"))
-    read(reads, own, k.g_a, n("self_attn.g_a_proj.weight"))
-    read(reads, own, k.g_b, n("self_attn.g_b_proj.weight"))
+    for w, name in kda_gate(k, n):
+        read(reads, own, w, name)
     read(reads, own, k.b, n("self_attn.b_proj.weight"))
     read_expr(
         reads,

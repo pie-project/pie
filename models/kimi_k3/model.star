@@ -3,6 +3,7 @@
 # latent MoE), the residual stream carried as AttnRes blocks.
 
 load("//lib/adapters/model.star", "banks")
+load("//lib/kda/model.star", kda = "mixer")
 load("//lib/mla/model.star", "attention")
 
 # Where AttnRes blends the residual stream with its closed blocks.
@@ -103,7 +104,6 @@ def layout(id, deploy):
     moe_in = d.moe.latent if d.moe.latent != None else hidden
     a = d.mla
     k = d.kda
-    kda_width = k.heads * k.head_dim
 
     def blend_at(l):
         # Under `every` the first layer has no closed block to blend with, so
@@ -135,26 +135,16 @@ def layout(id, deploy):
                 mla = True,
             )
         else:
-            mixer = struct(
-                mla = False,
-                heads = k.heads,
-                head_dim = k.head_dim,
-                conv_kernel = k.conv_kernel,
-                norm_eps = k.norm_eps,
+            mixer = kda(
+                n,
+                l,
+                k,
+                hidden,
+                weights = weights,
+                conv = weights,
+                eps = k.norm_eps,
                 gate_floor = d.gate_floor,
-                qkv = weight(n("kda_qkv"), [3 * kda_width, hidden], weights).packed([kda_width] * 3),
-                conv = weight(n("kda_conv"), [3 * kda_width, k.conv_kernel], weights).packed([kda_width] * 3),
-                f_a = weight(n("kda_f_a"), [k.f_rank, hidden], weights),
-                f_b = weight(n("kda_f_b"), [kda_width, k.f_rank], weights).columns(),
-                b = weight(n("kda_b"), [k.heads, hidden], weights).columns(),
-                dt_bias = weight(n("kda_dt_bias"), [k.heads, k.head_dim], dtype.f32).columns(),
-                a_log = weight(n("kda_a_log"), [k.heads], dtype.f32).columns(),
-                gate = weight(n("kda_gate"), [kda_width, hidden], weights).columns(),
-                o_norm = weight(n("kda_o_norm"), [k.head_dim], dtype.f32),
-                o_norm_eps = k.norm_eps,
-                o_proj = weight(n("kda_o_proj"), [hidden, kda_width], weights).rows(),
-                conv_state = "conv.{}".format(l),
-                delta_state = "delta.{}".format(l),
+                mla = False,
             )
         if l >= d.dense_layers:
             m = d.moe

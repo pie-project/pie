@@ -3,6 +3,7 @@
 # vision tower's patches scattered into the embedded rows; and the MTP head
 # drafting from the trunk's last hidden rows.
 
+load("//lib/kda/forward.star", kda = "mixer", kda_caches = "caches")
 load("//lib/mla/forward.star", "attention", "cache", "plans", "whole")
 
 # How many experts the next layer's router is predicted to take.
@@ -17,9 +18,7 @@ def caches(m, c):
             cache(c, kv, a)
             c.kv(index, a.indexer.keys, [a.indexer.head_dim], a.indexer.head_dim)
         else:
-            width = a.heads * a.head_dim
-            c.state(a.conv_state, [a.conv_kernel, 3 * width], dtype.bf16, split = 1)
-            c.state(a.delta_state, [a.heads, a.head_dim, a.head_dim], dtype.f32, split = 0)
+            kda_caches(c, a)
     if m.mtp != None:
         a = m.mtp.attn
         index = c.kv_space(m.kv)
@@ -44,7 +43,7 @@ def forward(m, inputs):
         if w.mixer_kind == "mla":
             o = mla_mixer(x, inputs, plan, positions, m.act, w.mixer)
         else:
-            o = kda_mixer(x, inputs, w.mixer)
+            o = kda(x, inputs, w.mixer)
         adapted = fact.has(fact.Adapter)
         o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
         streams = ops.elemwise.hc_fold(o, streams, post_mix, comb_mix)
@@ -186,45 +185,6 @@ def boundaries(positions, row_valid, ratio, split):
     dpos, dreq, drope = ops.attn.pool_boundary_decode(positions.on(one), row_valid, ratio)
     ppos, preq, prope = ops.attn.pool_boundary_prefill(positions.on(~one), row_valid, ratio)
     return (merge([dpos, ppos]), merge([dreq, preq]), merge([drope, prope]))
-
-def kda_mixer(x, inputs, k):
-    conv = inputs.state(k.conv_state)
-    delta = inputs.state(k.delta_state)
-    qkv = ops.linear.matmul(x, k.qkv)
-    f = ops.linear.matmul(ops.linear.matmul(x, k.f_a), k.f_b)
-    b = ops.linear.matmul(x, k.b)
-    seam.at(seam.RECURRENT, [qkv])
-
-    one = fact.single_token()
-    step = ops.attn.ssm_kda_step(
-        ops.attn.ssm_causal_conv1d(qkv.on(one), k.conv, conv, k.conv_kernel),
-        f.on(one),
-        b.on(one),
-        k.dt_bias,
-        k.a_log,
-        delta,
-        k.heads,
-        k.head_dim,
-        k.norm_eps,
-        k.gate_floor,
-    )
-    chunked = ops.attn.ssm_kda_chunked(
-        ops.attn.ssm_causal_conv1d_chunked(qkv.on(~one), k.conv, conv, k.conv_kernel),
-        f.on(~one),
-        b.on(~one),
-        k.dt_bias,
-        k.a_log,
-        delta,
-        k.heads,
-        k.head_dim,
-        k.norm_eps,
-        k.gate_floor,
-    )
-    core = merge([step, chunked])
-
-    g = ops.linear.matmul(ops.linear.matmul(x, k.g_a), k.g_b)
-    o = ops.elemwise.rmsnorm_gated_by(core, g, k.o_norm, k.heads, k.o_norm_eps)
-    return ops.linear.matmul(o, k.o_proj)
 
 def tower(inputs, t):
     d = t.head_dim

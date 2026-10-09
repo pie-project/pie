@@ -4,6 +4,7 @@
 # hyper-connected streams; an optional vision tower and MTP draft head.
 
 load("//lib/adapters/model.star", "banks")
+load("//lib/kda/model.star", kda = "mixer")
 load("//lib/mla/model.star", "attention")
 
 # How many tokens the draft head proposes per step.
@@ -73,7 +74,6 @@ def layout(id, deploy):
     hc_fan = streams * hidden
     a = d.mla
     k = d.kda
-    kda_width = k.heads * k.head_dim
     index_width = d.index_heads * d.index_head_dim
 
     def mla_at(prefix, kv, keys):
@@ -143,26 +143,16 @@ def layout(id, deploy):
             mixer_kind = "mla"
         else:
             mixer_kind = "kda"
-            mixer = struct(
-                heads = k.heads,
-                head_dim = k.head_dim,
-                conv_kernel = k.conv_kernel,
-                norm_eps = d.norm_eps,
+            mixer = kda(
+                n,
+                l,
+                k,
+                hidden,
+                weights = weights,
+                conv = dense,
+                eps = d.norm_eps,
                 gate_floor = -5.0,
-                qkv = weight(n("kda_qkv"), [3 * kda_width, hidden], weights).packed([kda_width] * 3),
-                conv = weight(n("kda_conv"), [3 * kda_width, k.conv_kernel], dense).packed([kda_width] * 3),
-                f_a = weight(n("kda_f_a"), [k.f_rank, hidden], weights),
-                f_b = weight(n("kda_f_b"), [kda_width, k.f_rank], weights).columns(),
-                g_a = weight(n("kda_g_a"), [k.f_rank, hidden], weights),
-                g_b = weight(n("kda_g_b"), [kda_width, k.f_rank], weights).columns(),
-                b = weight(n("kda_b"), [k.heads, hidden], weights).columns(),
-                dt_bias = weight(n("kda_dt_bias"), [k.heads, k.head_dim], dtype.f32).columns(),
-                a_log = weight(n("kda_a_log"), [k.heads], dtype.f32).columns(),
-                o_norm = weight(n("kda_o_norm"), [k.head_dim], dtype.f32),
-                o_norm_eps = d.norm_eps,
-                o_proj = weight(n("kda_o_proj"), [hidden, kda_width], weights).rows(),
-                conv_state = "conv.{}".format(l),
-                delta_state = "delta.{}".format(l),
+                gate_rank = k.f_rank,
             )
         if l < d.dense_layers:
             iw = d.dense_inter
