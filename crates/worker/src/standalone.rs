@@ -73,6 +73,7 @@ pub async fn run_standalone(
     controller: controller::Config,
     mut gateway: gateway::Config,
     worker: crate::Config,
+    home: &std::path::Path,
 ) -> Result<StandaloneHandle> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -96,6 +97,7 @@ pub async fn run_standalone(
 
     let worker = crate::run_with(
         worker,
+        home,
         control,
         vec![format!("tcp://{worker_addr}")],
         Some(format!("ws://{listen_addr}")),

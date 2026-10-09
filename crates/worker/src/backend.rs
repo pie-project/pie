@@ -187,8 +187,8 @@ fn device_boot(
 }
 
 #[cfg(feature = "cuda")]
-fn dump_device_boot(boot: &DeviceBoot, group_id: usize, rank: Option<usize>) {
-    let dir = crate::paths::pie_home().join("logs");
+fn dump_device_boot(home: &Path, boot: &DeviceBoot, group_id: usize, rank: Option<usize>) {
+    let dir = home.join("logs");
     let name = match rank {
         Some(rank) => format!("engine-boot-g{group_id}-r{rank}.txt"),
         None => format!("engine-boot-g{group_id}.txt"),
@@ -285,7 +285,7 @@ fn validate_snapshot_dir(snapshot_dir: &Path) -> Result<()> {
 pub(crate) fn create_engine_backend_group(
     rank_options: &[EngineOptions],
     snapshot_dir: &Path,
-    cache_dir: &Path,
+    home: &Path,
     adapter_dir: Option<&Path>,
     group_id: usize,
     component: crate::executor::ModelComponent,
@@ -296,6 +296,7 @@ pub(crate) fn create_engine_backend_group(
     voxel_ceilings: (Option<u32>, Option<u32>),
     sku: Option<&str>,
 ) -> Result<GroupEngine> {
+    let cache_dir = &crate::disk::engine_cache_dir(home);
     validate_snapshot_dir(snapshot_dir)?;
     if rank_options.is_empty() {
         return Err(anyhow!("cuda group requires at least one rank"));
@@ -314,7 +315,7 @@ pub(crate) fn create_engine_backend_group(
         };
         let boot = device_boot(opts, cache_dir, adapter_dir)?;
         if opts.verbose {
-            dump_device_boot(&boot, group_id, Some(rank));
+            dump_device_boot(home, &boot, group_id, Some(rank));
         }
         boots.push(boot);
     }
@@ -385,7 +386,7 @@ pub(crate) fn create_engine_backend_group(
 pub(crate) fn create_engine_backend(
     options: &EngineOptions,
     snapshot_dir: &Path,
-    cache_dir: &Path,
+    home: &Path,
     adapter_dir: Option<&Path>,
     group_id: usize,
     component: crate::executor::ModelComponent,
@@ -397,6 +398,7 @@ pub(crate) fn create_engine_backend(
     sku: Option<&str>,
     opened: Option<runtime::engine::EngineBox>,
 ) -> Result<GroupEngine> {
+    let cache_dir = &crate::disk::engine_cache_dir(home);
     let _ = (group_id, adapter_dir, &opened);
     validate_snapshot_dir(snapshot_dir)?;
 
@@ -417,7 +419,7 @@ pub(crate) fn create_engine_backend(
         EngineOptions::CudaNative(opts) => {
             let boot = device_boot(opts, cache_dir, adapter_dir)?;
             if opts.verbose {
-                dump_device_boot(&boot, group_id, None);
+                dump_device_boot(home, &boot, group_id, None);
             }
             let backend = runtime::engine::backend::open::cuda(boot)?;
             (

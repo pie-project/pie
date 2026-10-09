@@ -12,7 +12,7 @@ pub const ARCHIVE_FILE: &str = "archive.zt";
 pub const RUNTIME_DIR: &str = "runtime";
 
 pub fn dir() -> PathBuf {
-    worker::paths::pie_home().join("models")
+    crate::paths::pie_home().join("models")
 }
 
 pub fn model_dir(name: &str) -> PathBuf {

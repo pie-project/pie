@@ -85,7 +85,6 @@ impl Settings {
 
         config.model.sku = self.sku.clone();
         config.model.engine.options = self.engine_options(kind, home);
-        config.home = Some(home.to_path_buf());
         config.server.worker_threads = 2;
         config.server.verbose = self.verbose;
         config.server.max_upload = ByteSize::from_mib(256);

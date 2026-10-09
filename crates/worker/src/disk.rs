@@ -29,12 +29,11 @@ pub struct Entry {
     pub keep: &'static [&'static str],
 }
 
-pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
-    let home = crate::paths::pie_home();
+pub fn entries(home: &Path, hf_cache: Option<PathBuf>) -> Vec<Entry> {
     let mut entries = vec![
         Entry {
             name: "engine",
-            path: engine_cache_dir(&home),
+            path: engine_cache_dir(home),
             what: "Engine-side disk caches: compiled ETA modules, kernel \
                    cubins, GEMM autotuning results. All keyed and \
                    self-invalidating; deleting costs one cold rebuild.",
@@ -43,7 +42,7 @@ pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
         },
         Entry {
             name: "inferlets",
-            path: crate::paths::inferlets_dir(),
+            path: home.join("inferlets"),
             what: "Installed inferlets. Deleting one means `pie inferlet \
                    install` again; the built-in ones need no install.",
             reclaim: Reclaim::Safe,
@@ -51,7 +50,7 @@ pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
         },
         Entry {
             name: "languages",
-            path: crate::paths::languages_dir(),
+            path: home.join("languages"),
             what: "The language components script inferlets run under \
                    (`python.wasm`, `javascript.wasm`). `pie language install` \
                    puts one back from a release archive.",
@@ -149,7 +148,7 @@ mod tests {
 
     #[test]
     fn the_authored_files_are_never_reclaimable() {
-        for entry in entries(None) {
+        for entry in entries(Path::new("/home"), None) {
             if entry.name == "config" {
                 assert_eq!(
                     entry.reclaim,

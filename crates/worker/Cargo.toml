@@ -49,7 +49,6 @@ transport = { path = "../transport", optional = true }
 ids = { path = "../ids" }
 client-api = { package = "pie-client-api", path = "../client-api" }
 anyhow = "1.0"
-dirs = "7.0"
 controller = { path = "../controller", optional = true }
 gateway = { path = "../gateway", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"], optional = true }

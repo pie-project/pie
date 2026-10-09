@@ -104,16 +104,16 @@ fn init_tracing() {
         .try_init();
 }
 
-/// Boot from the TOML text `pie serve --config` reads. Blocks, with the
-/// GIL released, until engines are up, weights are loaded and the listener
-/// is bound.
+/// Boot from the TOML text `pie serve --config` reads, keeping the runtime's
+/// files under `home`. Blocks, with the GIL released, until engines are up,
+/// weights are loaded and the listener is bound.
 #[pyfunction]
-fn bootstrap(py: Python<'_>, toml_str: &str) -> PyResult<PyEngineHandle> {
+fn bootstrap(py: Python<'_>, toml_str: &str, home: &str) -> PyResult<PyEngineHandle> {
     init_tracing();
     let config = worker::Config::parse(toml_str)
         .map_err(|e| PyValueError::new_err(format!("config: {e:#}")))?;
     let server = py
-        .detach(|| worker::Server::serve(config))
+        .detach(|| worker::Server::serve(config, std::path::Path::new(home)))
         .map_err(|e| PyRuntimeError::new_err(format!("start: {e:#}")))?;
     let addr = server.listen_addr().expect("a served worker listens");
     Ok(PyEngineHandle {

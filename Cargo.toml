@@ -150,6 +150,7 @@ xla = ["worker/xla"]
 profile-fire = ["worker/profile-fire"]
 
 [dependencies]
+dirs = "7.0"
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 controller = { path = "crates/controller" }

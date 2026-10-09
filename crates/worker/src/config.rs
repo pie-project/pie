@@ -48,17 +48,9 @@ pub struct Config {
     pub offload: OffloadConfig,
     /// The single `[model]` table. Pie serves exactly one model.
     pub model: ModelConfig,
-    /// Where the runtime keeps its files; `None` is `$PIE_HOME` (`~/.pie`).
-    /// Set by an app embedding the worker, never by the file.
-    #[serde(skip)]
-    pub home: Option<PathBuf>,
 }
 
 impl Config {
-    pub fn home(&self) -> PathBuf {
-        self.home.clone().unwrap_or_else(crate::paths::pie_home)
-    }
-
     /// Parse the operator's file into a validated [`Config`].
     ///
     /// Pure: no file IO, no env, no clap. The file's sections are reshaped

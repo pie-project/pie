@@ -164,6 +164,7 @@ impl Task for Shutdown {
 
 pub struct Boot {
     toml: String,
+    home: String,
 }
 
 #[napi]
@@ -172,7 +173,7 @@ impl Task for Boot {
     type JsValue = Server;
 
     fn compute(&mut self) -> Result<Server> {
-        boot(&self.toml)
+        boot(&self.toml, &self.home)
     }
 
     fn resolve(&mut self, _env: Env, server: Server) -> Result<Server> {
@@ -199,11 +200,12 @@ fn failed(what: &str, error: impl std::fmt::Display) -> Error {
     Error::new(Status::GenericFailure, format!("{what}: {error}"))
 }
 
-fn boot(toml_str: &str) -> Result<Server> {
+fn boot(toml_str: &str, home: &str) -> Result<Server> {
     init_tracing();
     let config =
         worker::Config::parse(toml_str).map_err(|e| invalid("config", format!("{e:#}")))?;
-    let server = worker::Server::serve(config).map_err(|e| failed("start", format!("{e:#}")))?;
+    let server = worker::Server::serve(config, std::path::Path::new(home))
+        .map_err(|e| failed("start", format!("{e:#}")))?;
     let addr = server.listen_addr().expect("a served worker listens");
     Ok(Server {
         url: format!("ws://{addr}"),
@@ -212,19 +214,20 @@ fn boot(toml_str: &str) -> Result<Server> {
 }
 
 /// Boot from a config in the shape of `pie serve`'s config file
-/// (`{server: {port: 0}, model: {...}}`). Resolves once engines are up,
-/// weights are loaded and the listener is bound.
+/// (`{server: {port: 0}, model: {...}}`), keeping the runtime's files under
+/// `home`. Resolves once engines are up, weights are loaded and the listener
+/// is bound.
 #[napi(ts_return_type = "Promise<Server>")]
-pub fn start(config: serde_json::Value) -> Result<AsyncTask<Boot>> {
+pub fn start(config: serde_json::Value, home: String) -> Result<AsyncTask<Boot>> {
     if !config.is_object() {
         return Err(invalid("config", "must be an object (or use startToml)"));
     }
     let toml = toml::to_string(&config).map_err(|e| invalid("config", e))?;
-    Ok(AsyncTask::new(Boot { toml }))
+    Ok(AsyncTask::new(Boot { toml, home }))
 }
 
 /// Boot from the TOML text `pie serve --config` reads.
 #[napi(ts_return_type = "Promise<Server>")]
-pub fn start_toml(config: String) -> AsyncTask<Boot> {
-    AsyncTask::new(Boot { toml: config })
+pub fn start_toml(config: String, home: String) -> AsyncTask<Boot> {
+    AsyncTask::new(Boot { toml: config, home })
 }

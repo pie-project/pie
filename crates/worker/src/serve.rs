@@ -4,6 +4,7 @@ use banner::StartupBanner;
 use anyhow::{Context, Result, bail};
 use controller_api::{ControlClient, Role, WorkerInfo};
 use ids::WorkerId;
+use std::path::Path;
 
 use crate::boot::{self, LoadedPartnerMetadata};
 use crate::config;
@@ -159,7 +160,8 @@ impl ExecutorHandle {
     }
 }
 
-pub async fn run(cfg: config::Config) -> Result<WorkerHandle> {
+/// Boots the worker `cfg` describes, keeping its files under `home`.
+pub async fn run(cfg: config::Config, home: &Path) -> Result<WorkerHandle> {
     let mode = match (&cfg.cluster.controller, cfg.cluster.role) {
         (Some(controller), Some(role)) => {
             TopologyMode::distributed(role, controller.clone(), cfg.cluster.gateways.clone())?
@@ -170,12 +172,12 @@ pub async fn run(cfg: config::Config) -> Result<WorkerHandle> {
     let control_addr = topology::addr_from_host_port(&cfg.server.host, cfg.server.port);
     let coordinator = topology::connect(&mode, control_addr)?;
     if matches!(coordinator.role(), Some(Role::Prefill | Role::Encode)) {
-        let executor = boot_executor(&cfg, &coordinator).await?;
+        let executor = boot_executor(&cfg, home, &coordinator).await?;
         Ok(WorkerHandle {
             inner: WorkerKind::Executor(executor),
         })
     } else {
-        let engine = start_runtime(cfg, coordinator).await?;
+        let engine = start_runtime(cfg, home, coordinator).await?;
         Ok(WorkerHandle {
             inner: WorkerKind::Decode(engine),
         })
@@ -184,26 +186,20 @@ pub async fn run(cfg: config::Config) -> Result<WorkerHandle> {
 
 pub async fn run_with<C: ControlLink>(
     cfg: config::Config,
+    home: &Path,
     control: C,
     gateways: Vec<String>,
     client_edge: Option<String>,
 ) -> Result<WorkerHandle> {
-    let engine = start_runtime_embedded(cfg, control, gateways, client_edge).await?;
+    let engine = start_runtime_embedded(cfg, home, control, gateways, client_edge).await?;
     Ok(WorkerHandle {
         inner: WorkerKind::Decode(engine),
     })
 }
 
-pub fn build_runtime(user_cfg: &config::Config) -> Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(user_cfg.server.worker_threads)
-        .enable_all()
-        .build()
-        .context("building tokio runtime")
-}
-
 async fn boot_executor(
     user_cfg: &config::Config,
+    home: &Path,
     coordinator: &Coordinator,
 ) -> Result<ExecutorHandle> {
     let role = coordinator
@@ -221,7 +217,7 @@ async fn boot_executor(
     } else {
         crate::executor::ModelComponent::Full
     };
-    let loaded = boot::load_model_engines(user_cfg, component, None)?;
+    let loaded = boot::load_model_engines(user_cfg, home, component, None)?;
     let model_identity = if role == Role::Encode {
         loaded.encode_identity.clone()
     } else {
@@ -280,9 +276,10 @@ async fn boot_executor(
 
 pub async fn start_runtime(
     user_cfg: config::Config,
+    home: &Path,
     coordinator: Coordinator,
 ) -> Result<RuntimeHandle> {
-    let (model, booted, partner_bootstrap) = boot_decode(&user_cfg).await?;
+    let (model, booted, partner_bootstrap) = boot_decode(&user_cfg, home).await?;
     let (edge_server, control_tasks, control_plane, partners, url) =
         assemble_control_and_edge(coordinator, &user_cfg, model, partner_bootstrap).await?;
     log_serving(&user_cfg, &url);
@@ -299,11 +296,12 @@ pub async fn start_runtime(
 
 pub async fn start_runtime_embedded<C: ControlLink>(
     user_cfg: config::Config,
+    home: &Path,
     control: C,
     gateways: Vec<String>,
     client_edge: Option<String>,
 ) -> Result<RuntimeHandle> {
-    let (model, booted, partner_bootstrap) = boot_decode(&user_cfg).await?;
+    let (model, booted, partner_bootstrap) = boot_decode(&user_cfg, home).await?;
     let addr = topology::addr_from_host_port(&user_cfg.server.host, user_cfg.server.port);
     let (edge_server, control_tasks, worker_id, partners) = assemble_distributed(
         control,
@@ -330,8 +328,14 @@ pub async fn start_runtime_embedded<C: ControlLink>(
 /// Boots a decode worker on its configured engine, with offload set up.
 async fn boot_decode(
     user_cfg: &config::Config,
+    home: &Path,
 ) -> Result<(String, Embedded, Option<partner::PartnerBootstrap>)> {
-    let mut loaded = Embedded::load(user_cfg, Engine::Configured, crate::translate::builtins())?;
+    let mut loaded = Embedded::load(
+        user_cfg,
+        home,
+        Engine::Configured,
+        crate::translate::builtins(),
+    )?;
     let metadata = loaded
         .partner
         .take()

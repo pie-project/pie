@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     }
     cfg.validate()?;
 
-    let handle = worker::run(cfg).await?;
+    let handle = worker::run(cfg, &pie::paths::pie_home()).await?;
     Ok(ctx
         .run_until_signal(async move { handle.shutdown().await })
         .await)

@@ -7,7 +7,6 @@ mod boot;
 pub mod config;
 pub mod disk;
 pub mod embedded;
-pub mod paths;
 #[cfg(feature = "net")]
 pub mod serve;
 #[cfg(feature = "standalone")]

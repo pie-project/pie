@@ -216,7 +216,7 @@ fn check_config(path: &Path, origin: crate::process::Origin) -> Checks {
         backend: flavor.as_ref().ok().map(|flavor| flavor.as_str()),
         sku: worker.model.sku.as_deref(),
     };
-    match worker::weights::resolve(&worker.model.model, want, &worker.home()) {
+    match worker::weights::resolve(&worker.model.model, want, &crate::paths::pie_home()) {
         Ok(resolved) => out.push((
             "weights".into(),
             match resolved {
@@ -276,7 +276,7 @@ fn absent_because(name: &str) -> String {
 
 /// The newest version of `name` installed under the inferlets directory.
 fn installed_version(name: &str) -> Option<String> {
-    let mut repo = Repository::new(worker::paths::inferlets_dir());
+    let mut repo = Repository::new(crate::paths::inferlets_dir());
     repo.refresh();
     repo.newest(name).map(|program| program.version)
 }
@@ -291,7 +291,7 @@ fn check_builtin_inferlets() -> Checks {
         .collect();
     programs.sort_unstable();
     programs.dedup();
-    let inferlets_dir = crate::ui::short_path(&worker::paths::inferlets_dir());
+    let inferlets_dir = crate::ui::short_path(&crate::paths::inferlets_dir());
     programs
         .into_iter()
         .map(|name| {

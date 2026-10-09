@@ -371,7 +371,7 @@ pub async fn run(global: &crate::process::GlobalArgs, args: TuneArgs) -> Result<
 
     let inputs = lane_inputs(workload.fleet, workload.tokens);
     let rounds = async {
-        let pie = crate::run_standalone(controller, gateway, worker)
+        let pie = crate::run_standalone(controller, gateway, worker, &crate::paths::pie_home())
             .await
             .context("boot the engine (is something already serving on this port?)")?;
         let addr = pie.listen_addr.to_string();

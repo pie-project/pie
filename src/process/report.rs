@@ -2,7 +2,7 @@ use std::fmt;
 use std::net::SocketAddr;
 
 use super::{BootSpec, GlobalArgs, config};
-use worker::paths;
+use crate::paths;
 
 #[derive(Debug, Clone)]
 pub struct Setting {

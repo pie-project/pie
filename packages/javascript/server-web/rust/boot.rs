@@ -36,7 +36,7 @@ pub async fn boot(
             Some(device) => Engine::Opened(crate::engine::open(device)?),
             None => Engine::None,
         };
-        Embedded::load(&config, engine, Vec::new())
+        Embedded::load(&config, std::path::Path::new("/"), engine, Vec::new())
     })
     .await?;
     if let Some(stats) = ztensor::memfs::lazy_stats(&artifact) {

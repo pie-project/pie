@@ -31,12 +31,10 @@ pub(crate) struct LoadedPartnerMetadata {
 
 pub(crate) fn load_model_engines(
     user_cfg: &config::Config,
+    home: &Path,
     component: crate::executor::ModelComponent,
     mut opened: Option<runtime::engine::EngineBox>,
 ) -> Result<LoadedModelEngines> {
-    let home = user_cfg.home();
-    let engine_cache_dir = crate::disk::engine_cache_dir(&home);
-
     let (engine_groups, snapshot_dir, metadata) = {
         let m = &user_cfg.model;
         let flavor = crate::backend::flavor::resolve(m.engine.kind, &m.name)?;
@@ -71,7 +69,7 @@ pub(crate) fn load_model_engines(
                 backend: Some(flavor.as_str()),
                 sku: m.sku.as_deref(),
             },
-            &home,
+            home,
         )
         .with_context(|| format!("resolving the model for {:?}", m.name))?;
         let lifted = resolved_model
@@ -87,7 +85,7 @@ pub(crate) fn load_model_engines(
                 flavor,
                 &embedded_base_opts,
                 &snapshot_dir,
-                &engine_cache_dir,
+                home,
                 tp_degree,
                 component,
                 u8::try_from(user_cfg.runtime.frame_dispatch_depth).unwrap_or(u8::MAX),
@@ -171,12 +169,15 @@ pub struct Embedded {
 impl Embedded {
     /// The model onto `engine`, blocking: the weights land here and the
     /// runtime is not up yet; [`Loaded::start`] boots it with `builtins`.
+    /// `home` holds the runtime's files: installed inferlets, languages and
+    /// caches, and the model store.
     pub fn load(
         config: &config::Config,
+        home: &Path,
         engine: Engine,
         builtins: Vec<runtime::bootstrap::BuiltinProgram>,
     ) -> Result<Loaded> {
-        load(config, engine, builtins)
+        load(config, home, engine, builtins)
     }
 
     pub async fn shutdown(self) -> Result<()> {
@@ -212,11 +213,12 @@ impl Loaded {
 
 fn load(
     user_cfg: &config::Config,
+    home: &Path,
     engine: Engine,
     builtins: Vec<runtime::bootstrap::BuiltinProgram>,
 ) -> Result<Loaded> {
     let opened = match engine {
-        Engine::None => return load_without_engine(user_cfg, builtins),
+        Engine::None => return load_without_engine(user_cfg, home, builtins),
         Engine::Configured => None,
         Engine::Opened(engine) => Some(engine),
     };
@@ -228,7 +230,12 @@ fn load(
         kv_handle,
         engines,
         metadata,
-    } = load_model_engines(user_cfg, crate::executor::ModelComponent::Full, opened)?;
+    } = load_model_engines(
+        user_cfg,
+        home,
+        crate::executor::ModelComponent::Full,
+        opened,
+    )?;
     let hidden_size: u32 = serde_json::from_slice::<serde_json::Value>(&metadata.config)
         .ok()
         .and_then(|config| config.get("hidden_size")?.as_u64())
@@ -245,7 +252,7 @@ fn load(
         max_lanes: caps.limits.max_lanes,
         max_tokens: caps.limits.max_tokens,
     };
-    let config = translate::build(user_cfg, builtins, engines, metadata)
+    let config = translate::build(user_cfg, home, builtins, engines, metadata)
         .context("translating to bootstrap::Config")?;
     Ok(Loaded {
         model,
@@ -265,6 +272,7 @@ fn load(
 /// The runtime with no engine: the SKU comes from the artifact's serving stamp.
 fn load_without_engine(
     user_cfg: &config::Config,
+    home: &Path,
     builtins: Vec<runtime::bootstrap::BuiltinProgram>,
 ) -> Result<Loaded> {
     let m = &user_cfg.model;
@@ -272,7 +280,7 @@ fn load_without_engine(
         backend: None,
         sku: m.sku.as_deref(),
     };
-    let resolved = weights::resolve(&m.model, want, &user_cfg.home())
+    let resolved = weights::resolve(&m.model, want, home)
         .with_context(|| format!("resolving the model for {:?}", m.name))?;
     let artifact = resolved.path().to_path_buf();
     let metadata = resolved
@@ -281,7 +289,8 @@ fn load_without_engine(
     let sku = checkpoint::file::serve::stamp_of(&artifact)?
         .map(|stamp| stamp.sku)
         .ok_or_else(|| anyhow!("{} carries no serving stamp", artifact.display()))?;
-    let config = translate::build_without_engine(user_cfg, builtins, &artifact, &sku, metadata);
+    let config =
+        translate::build_without_engine(user_cfg, home, builtins, &artifact, &sku, metadata);
     Ok(Loaded {
         model: m.name.clone(),
         partner: None,
@@ -326,7 +335,7 @@ fn create_engine_group(
     flavor: Flavor,
     base_opts: &EngineOptions,
     snapshot_dir: &Path,
-    cache_dir: &Path,
+    home: &Path,
     tp_degree: usize,
     component: crate::executor::ModelComponent,
     frames_in_flight: u8,
@@ -339,7 +348,7 @@ fn create_engine_group(
             return crate::backend::create_engine_backend_group(
                 &rank_opts,
                 snapshot_dir,
-                cache_dir,
+                home,
                 m.adapter_mount().as_deref(),
                 group_idx,
                 component,
@@ -374,7 +383,7 @@ fn create_engine_group(
     crate::backend::create_engine_backend(
         &opts,
         snapshot_dir,
-        cache_dir,
+        home,
         m.adapter_mount().as_deref(),
         group_idx,
         component,

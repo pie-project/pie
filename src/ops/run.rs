@@ -294,7 +294,7 @@ pub async fn run(
     }
     println!();
 
-    let pie = crate::run_standalone(controller, gateway, worker)
+    let pie = crate::run_standalone(controller, gateway, worker, &crate::paths::pie_home())
         .await
         .context("boot the engine")?;
     let outcome = drive(

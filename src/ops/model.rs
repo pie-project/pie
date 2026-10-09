@@ -271,7 +271,7 @@ impl crate::ui::Report for ModelList {
 }
 
 fn dead_weight() -> Option<DeadWeight> {
-    let dir = worker::paths::pie_home().join("cache").join("weights");
+    let dir = crate::paths::pie_home().join("cache").join("weights");
     let mut files = 0usize;
     let mut bytes = 0u64;
     for entry in std::fs::read_dir(&dir).ok()?.filter_map(|it| it.ok()) {

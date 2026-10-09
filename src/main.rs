@@ -139,7 +139,7 @@ async fn serve(global: pie::process::GlobalArgs, diag: Option<&str>) -> anyhow::
     if let Some(words) = diag {
         worker.state_diagnostics(words)?;
     }
-    let handle = pie::run_standalone(controller, gateway, worker).await?;
+    let handle = pie::run_standalone(controller, gateway, worker, &pie::paths::pie_home()).await?;
     tracing::info!(
         listen = %handle.listen_addr,
         worker = %handle.worker_addr,

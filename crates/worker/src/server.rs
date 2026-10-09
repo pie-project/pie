@@ -32,9 +32,15 @@ enum Serving {
 }
 
 impl Server {
-    /// Boots `config` on `engine`, with the built-in inferlets; with `listen`
-    /// the gateway serves it there too. One per process.
-    pub fn start(config: Config, engine: Engine, listen: Option<SocketAddr>) -> Result<Server> {
+    /// Boots `config` on `engine`, with the built-in inferlets and its files
+    /// under `home`; with `listen` the gateway serves it there too. One per
+    /// process.
+    pub fn start(
+        config: Config,
+        home: &Path,
+        engine: Engine,
+        listen: Option<SocketAddr>,
+    ) -> Result<Server> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(config.server.worker_threads)
             .thread_stack_size(8 << 20)
@@ -43,7 +49,7 @@ impl Server {
         let (serving, summary, listen_addr) = match listen {
             None => {
                 let embedded = runtime.block_on(
-                    Embedded::load(&config, engine, crate::translate::builtins())?.start(),
+                    Embedded::load(&config, home, engine, crate::translate::builtins())?.start(),
                 )?;
                 let summary = embedded.summary.clone();
                 (Serving::Embedded(embedded), summary, None)
@@ -60,7 +66,7 @@ impl Server {
                 let controller = controller::Config::parse("")?;
                 let gateway = gateway::Config::parse("")?;
                 let handle = runtime.block_on(crate::standalone::run_standalone(
-                    controller, gateway, config,
+                    controller, gateway, config, home,
                 ))?;
                 let summary = handle.summary().clone();
                 let addr = handle.listen_addr;
@@ -92,13 +98,13 @@ impl Server {
         } else {
             Engine::None
         };
-        Server::start(settings.config(artifact, home)?, engine, listen)
+        Server::start(settings.config(artifact, home)?, home, engine, listen)
     }
 
     /// Boots `config` the way `pie serve` does: the gateway at its
     /// `[server] host:port`.
     #[cfg(feature = "standalone")]
-    pub fn serve(config: Config) -> Result<Server> {
+    pub fn serve(config: Config, home: &Path) -> Result<Server> {
         let host: std::net::IpAddr = config.server.host.parse().map_err(|_| {
             anyhow!(
                 "[server] host {:?} is not an IP address",
@@ -106,7 +112,7 @@ impl Server {
             )
         })?;
         let listen = SocketAddr::new(host, config.server.port);
-        Server::start(config, Engine::Configured, Some(listen))
+        Server::start(config, home, Engine::Configured, Some(listen))
     }
 
     /// True until [`Server::shutdown`].

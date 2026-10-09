@@ -10,6 +10,7 @@ pub const ENGINELESS_PAGE_SIZE: u32 = 16;
 
 pub fn build(
     user: &config::Config,
+    home: &Path,
     builtins: Vec<runtime::bootstrap::BuiltinProgram>,
     engines: ModelEngines,
     metadata: runtime::model::ModelMetadata,
@@ -22,12 +23,13 @@ pub fn build(
         );
     }
     let model = build_model(&user.model, &user.runtime, engines, metadata)?;
-    Ok(runtime_config(user, builtins, model))
+    Ok(runtime_config(user, home, builtins, model))
 }
 
 /// A runtime with no engine over `artifact`, keyed by its stamped `sku`.
 pub fn build_without_engine(
     user: &config::Config,
+    home: &Path,
     builtins: Vec<runtime::bootstrap::BuiltinProgram>,
     artifact: &Path,
     sku: &str,
@@ -42,7 +44,7 @@ pub fn build_without_engine(
         engines: Vec::new(),
         scheduler: scheduler(&user.runtime),
     };
-    runtime_config(user, builtins, model)
+    runtime_config(user, home, builtins, model)
 }
 
 /// Every built-in inferlet, as `pie serve` registers them.
@@ -59,10 +61,10 @@ pub fn builtins() -> Vec<runtime::bootstrap::BuiltinProgram> {
 
 fn runtime_config(
     user: &config::Config,
+    home: &Path,
     builtin_programs: Vec<runtime::bootstrap::BuiltinProgram>,
     model: runtime::bootstrap::ModelConfig,
 ) -> runtime::bootstrap::Config {
-    let home = user.home();
     runtime::bootstrap::Config {
         host: user.server.host.clone(),
         port: user.server.port,
