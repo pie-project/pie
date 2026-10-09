@@ -103,9 +103,23 @@ private final class AudioChecks {
 
     func runAll() async {
         let began = Date()
-        log.emit(["check": "begin", "pass": NSNull(), "date": ISO8601DateFormatter().string(from: began)])
+        log.emit([
+            "check": "begin", "pass": NSNull(), "date": ISO8601DateFormatter().string(from: began),
+            "app_state": AudioEngineHub.applicationState,
+        ])
 
         let engineReady = await warmUp()
+        // A launch onto a locked phone leaves the app in the background,
+        // where iOS will not let it record or take the audio, and every
+        // check after this would fail for that reason alone. Wait for the
+        // app to come to the front, and say so if it never does.
+        let inFront = await wait(upTo: 30) { AudioEngineHub.applicationState == "active" }
+        if !inFront {
+            log.emit([
+                "check": "app_state", "pass": NSNull(), "app_state": AudioEngineHub.applicationState,
+                "note": "the app was not in front (is the phone locked?); audio checks below are not meaningful",
+            ])
+        }
         let microphoneAvailability = await prepare(microphone)
         await sampleOverlap(engineReady: engineReady, microphoneReady: microphoneAvailability.isReady)
         await speechStopLatency(microphoneReady: microphoneAvailability.isReady)
@@ -122,6 +136,7 @@ private final class AudioChecks {
         log.emit([
             "check": "summary",
             "pass": !failed,
+            "app_in_front": inFront,
             "results": results,
             "seconds": Self.rounded(Date().timeIntervalSince(began)),
         ])
@@ -353,9 +368,21 @@ private final class AudioChecks {
         if witnessOn, let room {
             let speaking = witness.medianDecibels(from: audibleAt, to: stopAt) ?? room
             let reports = witness.decibels(from: stopAt, to: endAt)
-            // Quiet: back within 6 dB of the room. Late audio: speech-like
+            // Quiet: back within 6 dB of the room and staying there for
+            // 150 ms, so a gap between two words just after the stop is not
+            // taken for the end of the reply (it was, and the rest of the
+            // word then counted as late audio). What the microphone hears
+            // trails the channel by the speaker's and the microphone's own
+            // latency plus the level meter's window: about 0.17-0.19 s on an
+            // iPhone 16 Pro speaker, of which the session reports 63 ms, all
+            // of it inside the 0.35 s allowed. Late audio: speech-like
             // loudness again after that, past the reports' own spacing.
-            let quietAt = reports.first { $0.decibels < room + 6 }?.at
+            let settle: TimeInterval = 0.15
+            let quietAt = reports.first { report in
+                report.decibels < room + 6 && !reports.contains {
+                    $0.at > report.at && $0.at <= report.at.addingTimeInterval(settle) && $0.decibels >= room + 6
+                }
+            }?.at
             let late = reports.contains { $0.at > (quietAt ?? stopAt).addingTimeInterval(0.1) && $0.decibels >= room + 10 }
             let toQuiet = quietAt.map { $0.timeIntervalSince(stopAt) }
             // A route the microphone does not hear (headphones) proves
@@ -366,6 +393,14 @@ private final class AudioChecks {
             fields["microphone_heard_speech"] = heard
             fields["stop_to_microphone_quiet"] = Self.json(toQuiet)
             fields["microphone_audio_after_stop"] = late
+            // The microphone's level from stop on, so late audio can be
+            // told apart from a click, the room or the reply's tail.
+            fields["microphone_after_stop"] = witness.decibels(from: stopAt.addingTimeInterval(-0.2), to: endAt).map {
+                [Int(($0.at.timeIntervalSince(stopAt) * 1000).rounded()), Self.tenths($0.decibels)]
+            }
+            fields["cue_after_stop"] = afterStop.contains { $0.cueSounding }
+            let audio = AVAudioSession.sharedInstance()
+            fields["hardware_round_trip_ms"] = Int(((audio.outputLatency + audio.inputLatency + 2 * audio.ioBufferDuration) * 1000).rounded())
             if heard {
                 pass = pass && (toQuiet ?? .infinity) < 0.35 && !late
             }

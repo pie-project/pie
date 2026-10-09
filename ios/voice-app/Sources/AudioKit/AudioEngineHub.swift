@@ -1,6 +1,9 @@
 import AVFoundation
 import AudioToolbox
 import Foundation
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// The app's one `AVAudioEngine` and the `AVAudioSession` it runs in.
 ///
@@ -848,7 +851,12 @@ final class AudioEngineHub {
             try preferEchoCancelledInput(true, session: session)
         }
         if !sessionActive {
-            try session.setActive(true)
+            do {
+                try session.setActive(true)
+            } catch {
+                print("[audio] could not activate the session (\(Self.describeError(error))); app \(Self.applicationState)")
+                throw error
+            }
             sessionActive = true
             echoPathConfirmed = false
         }
@@ -928,6 +936,50 @@ final class AudioEngineHub {
 
     // MARK: - Interruptions and hardware changes
 
+    /// "active", "inactive" or "background", for the logs. iOS does not
+    /// let an app that is not in front start recording or take the audio
+    /// from another app, so a failed activation or an interruption in the
+    /// background (a launch onto a locked phone, say) is not the fault it
+    /// would be in the foreground. Read on the main queue.
+    static var applicationState: String {
+        #if canImport(UIKit)
+        switch UIApplication.shared.applicationState {
+        case .active: return "active"
+        case .inactive: return "inactive"
+        case .background: return "background"
+        @unknown default: return "unknown"
+        }
+        #else
+        return "n/a"
+        #endif
+    }
+
+    /// The reason the system gave for an interruption, as far as it gave one.
+    static func describeInterruption(_ note: Notification) -> String {
+        guard let raw = note.userInfo?[AVAudioSessionInterruptionReasonKey] as? UInt,
+              let reason = AVAudioSession.InterruptionReason(rawValue: raw) else {
+            return "reason not given"
+        }
+        switch reason {
+        case .default: return "reason: another session took the audio"
+        case .builtInMicMuted: return "reason: built-in microphone muted"
+        case .routeDisconnected: return "reason: route disconnected"
+        default: return "reason \(raw)"
+        }
+    }
+
+    /// An audio error with its four-character code ('!pri', '!int', 'what'),
+    /// which says more than the localized description does.
+    static func describeError(_ error: Error) -> String {
+        let ns = error as NSError
+        let code = UInt32(truncatingIfNeeded: ns.code)
+        let bytes = [24, 16, 8, 0].map { UInt8((code >> UInt32($0)) & 0xff) }
+        let fourCC = bytes.allSatisfy { (0x20...0x7e).contains($0) }
+            ? "'" + String(decoding: bytes, as: UTF8.self) + "'"
+            : String(ns.code)
+        return "\(ns.domain) \(fourCC)"
+    }
+
     @objc private func sessionInterrupted(_ note: Notification) {
         guard
             let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
@@ -935,7 +987,7 @@ final class AudioEngineHub {
         else { return }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            print("[audio] session interrupted")
+            print("[audio] session interrupted; \(Self.describeInterruption(note)), app \(Self.applicationState), other audio playing: \(AVAudioSession.sharedInstance().isOtherAudioPlaying)")
             // The system has deactivated the session and stopped the
             // engine. Nothing resumes on its own when the interruption
             // ends: the next turn or listening session reactivates.
