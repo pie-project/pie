@@ -1285,10 +1285,10 @@ mod tests {
     #[test]
     fn the_store_is_laid_out_aligned_disjoint_and_in_plan_order() {
         let trace = models::deployment("qwen35-d0.8b-bf16-kv-bf16")
-            .expect("the catalog ships the SKU")
+            .expect("the catalog ships the deployment")
             .trace(Platform::Cuda);
         let places = places(&trace, &crate::experts::Plan::default())
-            .expect("every param of a bf16 SKU has an element size");
+            .expect("every param of a bf16 deployment has an element size");
 
         assert_eq!(places.len(), trace.params.len());
         let mut end = 0u64;

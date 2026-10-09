@@ -1,7 +1,7 @@
 //! A buffered recurrent verb answers what a plain walk does: two tokens
 //! buffered without folding, then replayed ahead of a third and folded with
 //! it, leave the third's logits (and the state) where decoding the three one
-//! by one leaves them. Needs a hybrid model (PIE_XLA_SNAPSHOT + SKU or
+//! by one leaves them. Needs a hybrid model (PIE_XLA_SNAPSHOT + deployment or
 //! PIE_XLA_ARTIFACT).
 
 mod common;
@@ -24,15 +24,15 @@ fn argmax(v: &[f32]) -> usize {
 #[test]
 fn a_replayed_buffer_folds_to_the_plain_walk() {
     let Some(m) = common::model() else {
-        eprintln!("not asked: set PIE_XLA_SNAPSHOT + PIE_XLA_SKU or PIE_XLA_ARTIFACT");
+        eprintln!("not asked: set PIE_XLA_SNAPSHOT + PIE_XLA_DEPLOYMENT or PIE_XLA_ARTIFACT");
         return;
     };
-    let facts = m.sku.trace(models::Platform::Xla).facts;
+    let facts = m.deployment.trace(models::Platform::Xla).facts;
     let word = |q: u32| facts.word(&Request::new(q, false));
     let context = 256;
     let _device = engine_xla::bench::lock_device();
     let mut shell = Shell::load(Boot {
-        trace: m.sku.trace(Platform::Xla),
+        trace: m.deployment.trace(Platform::Xla),
         contract: &m.contract,
         checkpoint: &m.checkpoint,
         budget: Budget::new(4, context),

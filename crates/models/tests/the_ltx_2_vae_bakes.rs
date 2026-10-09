@@ -9,12 +9,12 @@ use poem_ir::{GridRule, Spatial, TimePad};
 const FLAGSHIP: &str = "ltx25-bf16-kv-bf16";
 const MINI: &str = "ltx25-mini-bf16-kv-bf16";
 
-fn row(sku: &str) -> &'static models::Deployment {
-    models::deployment(sku).unwrap_or_else(|| panic!("this build ships no `{sku}`"))
+fn row(deployment: &str) -> &'static models::Deployment {
+    models::deployment(deployment).unwrap_or_else(|| panic!("this build ships no `{deployment}`"))
 }
 
-fn trace(sku: &str) -> Trace {
-    row(sku).trace(Platform::Cuda)
+fn trace(deployment: &str) -> Trace {
+    row(deployment).trace(Platform::Cuda)
 }
 
 #[test]
@@ -54,15 +54,15 @@ fn the_flagship_declares_the_decode_reading_and_the_miniature_does_not() {
         mini.readings.iter().all(|r| r.name != "vae.decode"),
         "the miniature's checkpoint carries no VAE"
     );
-    for (sku, want) in [(FLAGSHIP, 1), (MINI, 0)] {
-        let voxels = trace(sku)
+    for (deployment, want) in [(FLAGSHIP, 1), (MINI, 0)] {
+        let voxels = trace(deployment)
             .values
             .iter()
             .filter(|decl| matches!(decl.def, Def::Input(RuntimeInput::Voxels { .. })))
             .count();
         assert_eq!(
             voxels, want,
-            "{sku}: the voxel port iff the row carries the VAE"
+            "{deployment}: the voxel port iff the row carries the VAE"
         );
     }
 }

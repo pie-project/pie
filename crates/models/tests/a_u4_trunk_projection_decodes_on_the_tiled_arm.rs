@@ -6,8 +6,8 @@ use poem_ir::{Def, Dtype, Linear, Operation, Platform};
 
 #[test]
 fn a_u4_trunk_projection_decodes_on_the_tiled_arm() {
-    let sku = models::deployment("gemma4-31b-u4g64-kv-bf16").expect("the 31b u4 row ships");
-    let trace = sku.trace(Platform::Cuda);
+    let deployment = models::deployment("gemma4-31b-u4g64-kv-bf16").expect("the 31b u4 row ships");
+    let trace = deployment.trace(Platform::Cuda);
     let mut row_major = Vec::new();
     for node in &trace.nodes {
         let Operation::Linear(Linear::Matmul { w, .. }) = &node.op else {

@@ -275,7 +275,7 @@ def v41(m, reads, mlx):
 
 def huggingface(m, reads):
     if m.mtp != None:
-        fail("this SKU declares a draft head, which only the flash mlx reading (with an `--aux` overlay) lands")
+        fail("this deployment declares a draft head, which only the flash mlx reading (with an `--aux` overlay) lands")
     reads.read(m.embed, "model.embed_tokens.weight")
     reads.read(m.final_norm, "model.norm.weight")
     for l, w in enumerate(m.layers):
@@ -313,11 +313,11 @@ def huggingface(m, reads):
                 for e in range(f.experts)
             ]))
         else:
-            fail("a flash SKU cannot read the deepseek-v3 huggingface layout; its artifact is the mlx one (`model.hc_head.base`)")
+            fail("a flash deployment cannot read the deepseek-v3 huggingface layout; its artifact is the mlx one (`model.hc_head.base`)")
 
 def gguf(m, reads):
     if m.mtp != None:
-        fail("this SKU declares a draft head and no gguf spelling of one is settled")
+        fail("this deployment declares a draft head and no gguf spelling of one is settled")
     reads.read(m.embed, "token_embd.weight")
     reads.read(m.final_norm, "output_norm.weight")
     for l, w in enumerate(m.layers):
@@ -345,4 +345,4 @@ def gguf(m, reads):
             reads.read_concat(f.gate_up, [n("ffn_gate_exps.weight"), n("ffn_up_exps.weight")])
             reads.read(f.down, n("ffn_down_exps.weight"))
         else:
-            fail("a flash SKU has no gguf layout")
+            fail("a flash deployment has no gguf layout")

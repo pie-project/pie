@@ -10,7 +10,7 @@
 //! `model_legacy::contract` and materialized it offline; R3 deleted the
 //! command with the contract, so their subject is gone. Nothing replaces
 //! them, and that is the point: an engine produces its weights from the
-//! checkpoint through the SKU's own import table at load, so there is no
+//! checkpoint through the deployment's own import table at load, so there is no
 //! offline rewrite left to prove anything about.
 //!
 //! The run below goes against a synthetic llama snapshot written from
@@ -160,7 +160,7 @@ fn write_snapshot(dir: &Path, dtype: &str) {
     feature = "vulkan",
     feature = "wgpu"
 ))]
-fn an_import_that_will_prepare_refuses_a_source_no_sku_claims() {
+fn an_import_that_will_prepare_refuses_a_source_no_deployment_claims() {
     let staging = tempfile::tempdir().expect("staging");
     write_snapshot(staging.path(), "F32");
     let store = tempfile::tempdir().expect("store");
@@ -200,7 +200,7 @@ fn an_import_that_will_prepare_refuses_a_source_no_sku_claims() {
     // unclaimed source has no remedy other than a build whose catalog ships
     // the row, and a sentence naming a flag that does not exist is worse than
     // one naming none.
-    for expected in ["no SKU this build ships claims", "pie model list"] {
+    for expected in ["no deployment this build ships claims", "pie model list"] {
         assert!(
             said.contains(expected),
             "the refusal has to name the source, the fact and the fix; it said {said:?}"

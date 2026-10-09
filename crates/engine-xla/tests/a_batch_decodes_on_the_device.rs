@@ -1,5 +1,5 @@
 //! Decode step time against batch width, for the bench. Asked for with
-//! `PIE_XLA_SNAPSHOT` + `PIE_XLA_SKU` (as `a_model_speaks_on_the_device`)
+//! `PIE_XLA_SNAPSHOT` + `PIE_XLA_DEPLOYMENT` (as `a_model_speaks_on_the_device`)
 //! and `PIE_XLA_BENCH=1`.
 
 mod common;
@@ -17,11 +17,11 @@ fn decode_step_time_by_batch_width() {
         return;
     }
     let Some(m) = common::model() else {
-        eprintln!("not asked: set PIE_XLA_SNAPSHOT + PIE_XLA_SKU or PIE_XLA_ARTIFACT");
+        eprintln!("not asked: set PIE_XLA_SNAPSHOT + PIE_XLA_DEPLOYMENT or PIE_XLA_ARTIFACT");
         return;
     };
-    let sku = m.sku;
-    let facts = sku.trace(models::Platform::Xla).facts;
+    let deployment = m.deployment;
+    let facts = deployment.trace(models::Platform::Xla).facts;
     let word = |query_len: u32| facts.word(&Request::new(query_len, false));
     let widths: Vec<u32> = std::env::var("PIE_XLA_BENCH_WIDTHS")
         .ok()
@@ -31,7 +31,7 @@ fn decode_step_time_by_batch_width() {
     let context = 1024;
     let _device = engine_xla::bench::lock_device();
     let mut shell = Shell::load(Boot {
-        trace: sku.trace(Platform::Xla),
+        trace: deployment.trace(Platform::Xla),
         contract: &m.contract,
         checkpoint: &m.checkpoint,
         budget: Budget::new(most, 2048),

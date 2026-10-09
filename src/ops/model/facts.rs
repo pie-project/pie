@@ -198,7 +198,7 @@ mod tests {
 
     fn a_text_row_reports_nothing_here() {
         let text = models::deployments()
-            .find(|sku| sku.generative.is_none())
+            .find(|deployment| deployment.generative.is_none())
             .expect("the catalog ships text rows");
         assert!(of(Some(&text.name)).is_none());
         assert!(of(None).is_none());

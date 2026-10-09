@@ -138,14 +138,14 @@ pub fn packaged(
     };
     let stamp =
         stamp_of(artifact)?.ok_or_else(|| anyhow!("{artifact:?} carries no serving stamp"))?;
-    let (model, base) = package.manifest().parse(&stamp.sku).ok_or_else(|| {
+    let (model, base) = package.manifest().parse(&stamp.deployment).ok_or_else(|| {
         anyhow!(
             "{artifact:?} was imported as `{}`, which its package `{}` names no deployment of",
-            stamp.sku,
+            stamp.deployment,
             package.name()
         )
     })?;
-    let deploy = composed(&stamp.sku, base, overrides)?;
+    let deploy = composed(&stamp.deployment, base, overrides)?;
     model.admits(&deploy)?;
     let name = model.name(&deploy);
     let trace = package
@@ -179,21 +179,21 @@ pub fn identify(checkpoint: &Path, platform: Platform) -> Result<String> {
     let target = checkpoint::plan::StorageTarget::for_backend(backend_of(platform), 0, 1);
 
     let mut misses: Vec<String> = Vec::new();
-    for (sku, read) in models::fits(&source, platform) {
+    for (deployment, read) in models::fits(&source, platform) {
         let contract = match read {
             Ok(contract) => contract,
             Err(why) => {
-                misses.push(format!("{}: {why}", sku.name));
+                misses.push(format!("{}: {why}", deployment.name));
                 continue;
             }
         };
         match checkpoint::plan::compile(&metadata, &contract, target.clone()) {
-            Ok(_) => return Ok(sku.name.clone()),
-            Err(why) => misses.push(format!("{}: {why}", sku.name)),
+            Ok(_) => return Ok(deployment.name.clone()),
+            Err(why) => misses.push(format!("{}: {why}", deployment.name)),
         }
     }
     Err(anyhow!(
-        "{checkpoint:?} matches no SKU this build ships:\n  {}",
+        "{checkpoint:?} matches no deployment this build ships:\n  {}",
         misses.join("\n  ")
     ))
 }
@@ -245,14 +245,14 @@ pub fn verify_artifact(artifact: &Path, platform: Platform) -> Result<String> {
     let (name, tp, trace) = match packaged(artifact, &Overrides::default(), platform)? {
         Some(served) => served,
         None => {
-            let sku = deployment(&stamp.sku).with_context(|| {
+            let deployment = deployment(&stamp.deployment).with_context(|| {
                 format!(
                     "{artifact:?} was imported as `{}`; import it again with this build",
-                    stamp.sku
+                    stamp.deployment
                 )
             })?;
-            let trace = sku.trace(platform);
-            (sku.name, sku.deploy.tp, trace)
+            let trace = deployment.trace(platform);
+            (deployment.name, deployment.deploy.tp, trace)
         }
     };
     let source = open_source(artifact)?;
@@ -283,16 +283,22 @@ pub fn conversion_contract(
 ) -> Option<(&'static str, ModelContract)> {
     let target = convert_target();
     let trace = std::env::var_os("PIE_IMPORT_TRACE").is_some_and(|v| v != "0");
-    let pinned = std::env::var("PIE_IMPORT_SKU").ok();
-    for (sku, read) in models::fits(source, platform) {
-        if pinned.as_deref().is_some_and(|name| name != sku.name) {
+    let pinned = std::env::var("PIE_IMPORT_DEPLOYMENT").ok();
+    for (deployment, read) in models::fits(source, platform) {
+        if pinned
+            .as_deref()
+            .is_some_and(|name| name != deployment.name)
+        {
             continue;
         }
         let contract = match read {
             Ok(contract) => contract,
             Err(why) => {
                 if trace {
-                    eprintln!("identify: {} does not read this source: {why}", sku.name);
+                    eprintln!(
+                        "identify: {} does not read this source: {why}",
+                        deployment.name
+                    );
                 }
                 continue;
             }
@@ -303,18 +309,18 @@ pub fn conversion_contract(
             if trace {
                 eprintln!(
                     "identify: {} reads it only by re-quantizing `{plane}`; not by identification",
-                    sku.name
+                    deployment.name
                 );
             }
             continue;
         }
         match checkpoint::plan::compile(metadata, &contract, target.clone()) {
-            Ok(_) => return Some((&sku.name, contract)),
+            Ok(_) => return Some((&deployment.name, contract)),
             Err(why) => {
                 if trace {
                     eprintln!(
                         "identify: {} reads it but does not compile: {why}",
-                        sku.name
+                        deployment.name
                     );
                 }
             }
@@ -340,17 +346,17 @@ pub fn conversion_contract_named(
     platform: Platform,
     name: &str,
 ) -> Result<(String, ModelContract)> {
-    let sku = deployment(name)?;
-    let contract = sku
+    let deployment = deployment(name)?;
+    let contract = deployment
         .contract(source, platform)
-        .map_err(|why| anyhow!("`{}` does not read this checkpoint: {why}", sku.name))?;
+        .map_err(|why| anyhow!("`{}` does not read this checkpoint: {why}", deployment.name))?;
     checkpoint::plan::compile(metadata, &contract, convert_target()).map_err(|why| {
         anyhow!(
             "`{}` reads this checkpoint but does not land on it: {why}",
-            sku.name
+            deployment.name
         )
     })?;
-    Ok((sku.name, contract))
+    Ok((deployment.name, contract))
 }
 
 pub fn checkpoint_metadata(checkpoint: &Path) -> Result<Metadata> {
@@ -387,7 +393,7 @@ pub fn contract_for(
                 )
             });
     }
-    let sku = models::Deployment::parse(&trace.name).ok_or_else(|| {
+    let deployment = models::Deployment::parse(&trace.name).ok_or_else(|| {
         format!(
             "{:?} names no deployment of a model this build ships, so a checkpoint's \
              tensors cannot be mapped onto its params",
@@ -395,15 +401,20 @@ pub fn contract_for(
         )
     })?;
     if stamped {
-        return poem::import::own_contract(&source, &trace.params, sku.deploy.tp, trace.platform)
-            .map_err(|error| {
-                format!(
-                    "{checkpoint:?} does not hold every plane of {:?}: {error}",
-                    trace.name
-                )
-            });
+        return poem::import::own_contract(
+            &source,
+            &trace.params,
+            deployment.deploy.tp,
+            trace.platform,
+        )
+        .map_err(|error| {
+            format!(
+                "{checkpoint:?} does not hold every plane of {:?}: {error}",
+                trace.name
+            )
+        });
     }
-    if sku.deploy.tp > 1 {
+    if deployment.deploy.tp > 1 {
         // an import states the whole checkpoint; the ranks of a tensor-parallel
         // group band their shares out of a stamped artifact at load (own_contract),
         // so a raw snapshot cannot be served at tp > 1 directly
@@ -411,15 +422,17 @@ pub fn contract_for(
             "{:?} is a {}-rank row and {checkpoint:?} is an unconverted checkpoint: the ranks \
              band their shares out of a stamped artifact, so convert it first (`pie model \
              import`) and serve the artifact",
-            trace.name, sku.deploy.tp
+            trace.name, deployment.deploy.tp
         ));
     }
-    sku.contract(&source, trace.platform).map_err(|error| {
-        format!(
-            "the import contract for {:?} does not fit {checkpoint:?}: {error}",
-            trace.name
-        )
-    })
+    deployment
+        .contract(&source, trace.platform)
+        .map_err(|error| {
+            format!(
+                "the import contract for {:?} does not fit {checkpoint:?}: {error}",
+                trace.name
+            )
+        })
 }
 
 pub fn request(

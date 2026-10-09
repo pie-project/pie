@@ -21,7 +21,7 @@ fn stamp() -> Stamp {
     Stamp {
         serving: serving::PROFILE.to_string(),
         backend: "cuda".to_string(),
-        sku: "qwen_3".to_string(),
+        deployment: "qwen_3".to_string(),
         layout_revision: 1,
         adapters_zeroed: true,
     }
@@ -90,7 +90,7 @@ impl Fixture {
             banked("layer.0.expert_down_bank", &self.codes, &self.scales),
             leaf("layer.0.norm", &self.norm),
             leaf("head", &self.embed),
-            leaf("__meta__/model/descriptor", b"{\"sku\":\"qwen_3\"}"),
+            leaf("__meta__/model/descriptor", b"{\"deployment\":\"qwen_3\"}"),
         ];
         emit::write(
             path,
@@ -294,7 +294,10 @@ fn the_stamp_comes_back_whole_and_a_mismatch_names_the_field() {
     };
     for (field, mismatch) in [
         (Field::Backend, wants(|it| it.backend = "metal".to_string())),
-        (Field::Sku, wants(|it| it.sku = "qwen_3-bf16".to_string())),
+        (
+            Field::Deployment,
+            wants(|it| it.deployment = "qwen_3-bf16".to_string()),
+        ),
         (Field::LayoutRevision, wants(|it| it.layout_revision = 2)),
     ] {
         assert_eq!(mismatch.field, field);
@@ -483,7 +486,7 @@ fn an_artifact_for_another_shell_is_refused_naming_the_field() {
     let sharded = Stamp::of("cuda", "qwen_3-tp2");
     assert_eq!(
         artifact.check(&sharded).unwrap_err().field,
-        serving::Field::Sku,
+        serving::Field::Deployment,
     );
 }
 

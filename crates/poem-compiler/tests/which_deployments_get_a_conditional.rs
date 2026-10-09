@@ -50,7 +50,7 @@ fn every_conditional_region_clears_every_gate_and_every_other_one_does_not() {
     let mut wrong: Vec<String> = Vec::new();
 
     for row in models::deployments().chain(models::splits()) {
-        let sku = row.name.as_str();
+        let deployment = row.name.as_str();
         for platform in PLATFORMS {
             let trace = row.trace(platform);
             for profile in [DeviceProfile::default(), forced()] {
@@ -62,7 +62,7 @@ fn every_conditional_region_clears_every_gate_and_every_other_one_does_not() {
                     let conditional = region.lowering != Lowering::AlwaysLaunch;
                     if conditional != admits(&trace, &compiled, at, &profile) {
                         wrong.push(format!(
-                            "`{sku}` as {platform:?} at fat={}: region {at} lowered \
+                            "`{deployment}` as {platform:?} at fat={}: region {at} lowered \
                              {:?} and the gates say {}",
                             profile.fat_region_us,
                             region.lowering,
@@ -71,21 +71,21 @@ fn every_conditional_region_clears_every_gate_and_every_other_one_does_not() {
                     }
                     if conditional && (region.stream != 0 || region.open.is_some()) {
                         wrong.push(format!(
-                            "`{sku}` as {platform:?}: region {at} is a conditional body \
+                            "`{deployment}` as {platform:?}: region {at} is a conditional body \
                              on stream {} — a body is single-stream (design §4)",
                             region.stream,
                         ));
                     }
                     if conditional && region.close.is_some() {
                         wrong.push(format!(
-                            "`{sku}` as {platform:?}: region {at} is a conditional body \
+                            "`{deployment}` as {platform:?}: region {at} is a conditional body \
                              that closes a fork group",
                         ));
                     }
                 }
                 if !collectives_are_never_elided(&compiled) {
                     wrong.push(format!(
-                        "`{sku}` as {platform:?}: a collective region became a \
+                        "`{deployment}` as {platform:?}: a collective region became a \
                          conditional body — decision #5",
                     ));
                 }

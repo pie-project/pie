@@ -156,7 +156,7 @@ async def test_cacheback_speculative_decoding(client, args):
         ("repetitive", "Repeat exactly: red green blue, red green blue, red green"),
         ("prose", "Explain in detail why the sky appears blue during the day."),
     ):
-        # 48, not 24: the current default SKU (qwen35-d0.8b) spends its first
+        # 48, not 24: the current default deployment (qwen35-d0.8b) spends its first
         # ~20 tokens on a `<think>` preamble where prompt-lookup drafting can
         # never hit, so a 24-token window proves the identity but starves the
         # acceptance/rejection assertions below. At 48 the run reaches
@@ -575,11 +575,11 @@ def _repo_id(model: str) -> str:
     """The HF repository id behind `--model`, which may name a repository
     (`mlx-community/gemma-4-26b-a4b-it-4bit`), a store directory
     (`~/.pie/models/mlx-community--gemma-4-26b-a4b-it-4bit`) or one stamped
-    artifact inside it (`<store-dir>/<id>.<sku>.metal.zt` — the id is the
+    artifact inside it (`<store-dir>/<id>.<deployment>.metal.zt` — the id is the
     file name up to its first dot). A store directory holding two artifacts of
     one model must be named by its artifact, and the geometry helpers below
     still want the snapshot's `config.json`; without this they read nothing
-    and the probes fall back to another SKU's numbers (24 layers, hidden 1024)."""
+    and the probes fall back to another deployment's numbers (24 layers, hidden 1024)."""
     from pathlib import Path
 
     if "/" in model and not Path(model).exists():
@@ -896,10 +896,10 @@ async def test_lora_probe(client, args):
     base = await _report(client, args, "naive-baseline", dict(fixed))
     # The probe seeds its A and B planes at the served model's geometry, and
     # its defaults are qwen35-d0.8b's (24 layers, hidden 1024): on any other
-    # SKU the engine refuses the bank by size. The guest cannot read those two
+    # deployment the engine refuses the bank by size. The guest cannot read those two
     # numbers off the engine, so this fixture reads them off the checkpoint's
     # `config.json` and passes them, as the inferlet's header says a different
-    # SKU must. The rank stays the model text's own (`Adapters { rank: 16 }`
+    # deployment must. The rank stays the model text's own (`Adapters { rank: 16 }`
     # in every family here), which is trace-known and not the fixture's to move.
     fixed = {**fixed, **_adapter_geometry(args.model)}
     zero = await _report(client, args, "lora-probe", {**fixed, "adapter_scale": 0.0})
@@ -927,7 +927,7 @@ async def test_lora_probe(client, args):
 # **THESE TWO WANT A LOAD WITH A TOWER, AND THEY SAY SO RATHER THAN FAILING.**
 # A vision checkpoint fits its family's text row AND its own, and the load
 # identifies the text row first -- deliberately, because a two-unit load stands
-# the fold down. So a census run that did not name a sku serves a trunk with no
+# the fold down. So a census run that did not name a deployment serves a trunk with no
 # patch axis, and a fire carrying spans is refused there by name
 # (`Fault::Towerless`, "this artifact declares no patch axis"). That is the
 # CORRECT answer for that load, not a failure of this gate, so it is reported

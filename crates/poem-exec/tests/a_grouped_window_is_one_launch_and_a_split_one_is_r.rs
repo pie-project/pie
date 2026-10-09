@@ -12,7 +12,7 @@ use poem_ir::{
     Attention, Collective, Elementwise, Fused, Layout, Linear, Operands, Operation, Spatial, Trace,
 };
 
-const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
+const DEPLOYMENT: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
 const CORRECTION: &str = "linear.lora_correct";
 
@@ -28,13 +28,13 @@ fn budget() -> Budget {
 }
 
 fn trace() -> Trace {
-    models::deployment(SKU)
-        .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"))
+    models::deployment(DEPLOYMENT)
+        .unwrap_or_else(|| panic!("`{DEPLOYMENT}` is in the catalog"))
         .trace(Platform::Cuda)
 }
 
 fn bake(trace: &Trace, profile: &DeviceProfile) -> CompiledModel {
-    compile(trace, &budget(), profile).unwrap_or_else(|why| panic!("`{SKU}` bakes: {why:?}"))
+    compile(trace, &budget(), profile).unwrap_or_else(|why| panic!("`{DEPLOYMENT}` bakes: {why:?}"))
 }
 
 fn split_arm() -> DeviceProfile {
@@ -222,12 +222,12 @@ fn walked(
 fn the_grouped_arm_pays_one_launch_where_the_split_arm_pays_r() {
     let trace = trace();
     let corrections = corrections(&trace);
-    assert!(!corrections.is_empty(), "the SKU states corrections");
+    assert!(!corrections.is_empty(), "the deployment states corrections");
 
     let split = bake(&trace, &split_arm());
     let grouped = bake(&trace, &grouped_arm());
     let lanes = one_lane_per_class(&split);
-    assert_eq!(lanes.len(), 12, "`{SKU}` resolves twelve classes");
+    assert_eq!(lanes.len(), 12, "`{DEPLOYMENT}` resolves twelve classes");
 
     let descriptor = fire(&split, &lanes);
     let mask = split
@@ -289,7 +289,7 @@ fn the_grouped_arm_pays_one_launch_where_the_split_arm_pays_r() {
     );
     assert!(
         compared > 0,
-        "the plan has nodes besides its corrections — `{SKU}`, twelve classes in one fire: \
+        "the plan has nodes besides its corrections — `{DEPLOYMENT}`, twelve classes in one fire: \
          adapter window = {r} intervals, correction launches {r} -> 1 per node over {} nodes",
         corrections.len(),
     );

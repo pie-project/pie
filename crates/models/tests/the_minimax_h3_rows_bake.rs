@@ -151,27 +151,27 @@ const PLATFORMS: [Platform; 4] = [
     Platform::Vulkan,
 ];
 
-fn row(sku: &str) -> &'static models::Deployment {
-    models::deployment(sku).unwrap_or_else(|| {
+fn row(deployment: &str) -> &'static models::Deployment {
+    models::deployment(deployment).unwrap_or_else(|| {
         let names: Vec<&str> = models::deployments().map(|row| row.name.as_str()).collect();
-        panic!("this build ships no `{sku}`; rows are {names:#?}")
+        panic!("this build ships no `{deployment}`; rows are {names:#?}")
     })
 }
 
-fn trace(sku: &str, platform: Platform) -> Trace {
-    row(sku).trace(platform)
+fn trace(deployment: &str, platform: Platform) -> Trace {
+    row(deployment).trace(platform)
 }
 
-fn dims(sku: &str) -> Dims {
-    match sku {
+fn dims(deployment: &str) -> Dims {
+    match deployment {
         FLAGSHIP => Dims::h3(),
         MINI => Dims::mini(),
         other => panic!("no dims for `{other}`"),
     }
 }
 
-fn is_flagship(sku: &str) -> bool {
-    sku == FLAGSHIP
+fn is_flagship(deployment: &str) -> bool {
+    deployment == FLAGSHIP
 }
 
 fn seams(plan: &Trace) -> BTreeMap<&str, usize> {
@@ -199,44 +199,44 @@ fn the_minimax_h3_rows_bake_every_case() {
 
 fn every_row_traces_on_every_platform_with_the_encoder_it_declares() {
     for platform in PLATFORMS {
-        for sku in ROWS {
-            let plan = trace(sku, platform);
+        for deployment in ROWS {
+            let plan = trace(deployment, platform);
             assert!(
                 !plan.nodes.is_empty(),
-                "{platform:?}: `{sku}` traced no node"
+                "{platform:?}: `{deployment}` traced no node"
             );
             let kv_rows = plan.caches.len();
-            let wanted = if is_flagship(sku) {
+            let wanted = if is_flagship(deployment) {
                 model::TE_LAYERS as usize
             } else {
                 0
             };
             assert_eq!(
                 kv_rows, wanted,
-                "{platform:?} `{sku}`: one kv row per encoder layer the plan runs"
+                "{platform:?} `{deployment}`: one kv row per encoder layer the plan runs"
             );
         }
     }
 }
 
 fn the_seams_are_the_two_float_readouts_and_never_logits() {
-    for sku in ROWS {
-        let plan = trace(sku, Platform::Cuda);
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
         let found = seams(&plan);
         assert!(
             !found.contains_key(seam::OUT.name),
-            "`{sku}`: no reading of this family has logits, and it planted `{}`",
+            "`{deployment}`: no reading of this family has logits, and it planted `{}`",
             seam::OUT.name
         );
         assert_eq!(
             found.get(seam::VELOCITY.name),
             Some(&1),
-            "`{sku}`: one velocity planting (the video head); found {found:?}"
+            "`{deployment}`: one velocity planting (the video head); found {found:?}"
         );
         assert_eq!(
             found.get(seam::HIDDEN.name),
-            Some(&if is_flagship(sku) { 3 } else { 2 }),
-            "`{sku}`: hidden plantings; found {found:?}"
+            Some(&if is_flagship(deployment) { 3 } else { 2 }),
+            "`{deployment}`: hidden plantings; found {found:?}"
         );
     }
 }
@@ -284,8 +284,11 @@ fn ports_read(plan: &Trace) -> BTreeSet<(u8, u8, u32)> {
 }
 
 fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
-    for sku in ROWS {
-        let facts = row(sku).generative.as_ref().expect("generative facts");
+    for deployment in ROWS {
+        let facts = row(deployment)
+            .generative
+            .as_ref()
+            .expect("generative facts");
         let declared: BTreeSet<(u8, u8, u32)> = facts
             .readings
             .iter()
@@ -296,16 +299,16 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
             })
             .collect();
         assert_eq!(
-            ports_read(&trace(sku, Platform::Cuda)),
+            ports_read(&trace(deployment, Platform::Cuda)),
             declared,
-            "`{sku}`: the trace's runtime inputs and the readings' ports"
+            "`{deployment}`: the trace's runtime inputs and the readings' ports"
         );
         for reading in &facts.readings {
             for (positional, port) in reading.ports_indexed() {
                 let (by_name, _) = reading.port(port.name).expect("a declared port by name");
                 assert_eq!(
                     by_name, positional,
-                    "`{sku}` reading `{}` port `{}`: the positional index and the stated one",
+                    "`{deployment}` reading `{}` port `{}`: the positional index and the stated one",
                     reading.name, port.name
                 );
             }
@@ -324,15 +327,22 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
             ("positions", PortKind::AxisPositions, model::port::POSITIONS),
         ] {
             let (at, fact) = denoise.port(name).unwrap_or_else(|| {
-                panic!("`{sku}`: the denoise reading declares no `{name}` port")
+                panic!("`{deployment}`: the denoise reading declares no `{name}` port")
             });
-            assert_eq!((fact.kind, at), (kind, index), "`{sku}`: port `{name}`");
+            assert_eq!(
+                (fact.kind, at),
+                (kind, index),
+                "`{deployment}`: port `{name}`"
+            );
         }
     }
 }
 
-fn lanes(sku: &str) -> Vec<(&'static str, u8, Stream)> {
-    let facts = row(sku).generative.as_ref().expect("generative facts");
+fn lanes(deployment: &str) -> Vec<(&'static str, u8, Stream)> {
+    let facts = row(deployment)
+        .generative
+        .as_ref()
+        .expect("generative facts");
     facts
         .readings
         .iter()
@@ -350,24 +360,24 @@ fn lanes(sku: &str) -> Vec<(&'static str, u8, Stream)> {
 }
 
 fn every_lane_the_facts_list_lands_in_a_class_where_the_merges_resolve() {
-    for sku in ROWS {
-        let plan = trace(sku, Platform::Cuda);
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
         let classes = poem::resolve_classes(&plan).expect("every merge resolves");
-        let _catalog = row(sku);
+        let _catalog = row(deployment);
         let mut seen: Vec<((&str, Stream), usize)> = Vec::new();
-        for (name, _index, stream) in lanes(sku) {
+        for (name, _index, stream) in lanes(deployment) {
             let request = Request::new(4, false).on_stream(stream).in_reading(name);
             let word = plan.facts.word(&request);
             let class = classes
                 .class_of(word & classes.mask)
-                .unwrap_or_else(|| panic!("`{sku}`: a {name}/{stream:?} lane has no class"));
+                .unwrap_or_else(|| panic!("`{deployment}`: a {name}/{stream:?} lane has no class"));
             seen.push(((name, stream), class));
         }
         let distinct: BTreeSet<usize> = seen.iter().map(|(_, class)| *class).collect();
         assert_eq!(
             distinct.len(),
             seen.len(),
-            "`{sku}`: two lanes share a class: {seen:?}"
+            "`{deployment}`: two lanes share a class: {seen:?}"
         );
     }
 }
@@ -383,9 +393,9 @@ fn ragged(plan: &Trace) -> Vec<RaggedMask> {
 }
 
 fn one_joint_read_per_block_and_one_lane_read_per_refiner() {
-    for sku in ROWS {
-        let d = dims(sku);
-        let plan = trace(sku, Platform::Cuda);
+    for deployment in ROWS {
+        let d = dims(deployment);
+        let plan = trace(deployment, Platform::Cuda);
         let reads = ragged(&plan);
         let joint = reads
             .iter()
@@ -397,11 +407,11 @@ fn one_joint_read_per_block_and_one_lane_read_per_refiner() {
             .count();
         assert_eq!(
             joint, d.blocks as usize,
-            "`{sku}`: one joint attention per trunk block"
+            "`{deployment}`: one joint attention per trunk block"
         );
         assert_eq!(
             lane, d.refiners as usize,
-            "`{sku}`: one lane-local attention per refiner block"
+            "`{deployment}`: one lane-local attention per refiner block"
         );
         let prefill = plan
             .nodes
@@ -410,20 +420,20 @@ fn one_joint_read_per_block_and_one_lane_read_per_refiner() {
             .count();
         assert_eq!(
             prefill,
-            if is_flagship(sku) {
+            if is_flagship(deployment) {
                 model::TE_LAYERS as usize
             } else {
                 0
             },
-            "`{sku}`: the encoder's paged prefill, one per layer it runs"
+            "`{deployment}`: the encoder's paged prefill, one per layer it runs"
         );
     }
 }
 
 fn the_trunk_turns_three_neox_axes_and_the_refiner_turns_nothing() {
-    for sku in ROWS {
-        let d = dims(sku);
-        let plan = trace(sku, Platform::Cuda);
+    for deployment in ROWS {
+        let d = dims(deployment);
+        let plan = trace(deployment, Platform::Cuda);
         let mut turns = 0usize;
         for node in &plan.nodes {
             let Operation::Elementwise(Elementwise::RopeAxes {
@@ -438,28 +448,36 @@ fn the_trunk_turns_three_neox_axes_and_the_refiner_turns_nothing() {
                 continue;
             };
             turns += 1;
-            assert_eq!(*dims, d.rope_dims(), "`{sku}`: the three axes' channels");
+            assert_eq!(
+                *dims,
+                d.rope_dims(),
+                "`{deployment}`: the three axes' channels"
+            );
             assert_eq!(
                 thetas[..3],
                 [model::ROPE_THETA; 3],
-                "`{sku}`: one base for every axis"
+                "`{deployment}`: one base for every axis"
             );
-            assert_eq!(*form, RopeForm::Neox, "`{sku}`: rotate-half pairing");
-            assert_eq!(*rotary_dim, d.rotary_dim(), "`{sku}`: the rotated span");
-            assert_eq!(*head_dim, d.head_dim, "`{sku}`: the head width");
+            assert_eq!(*form, RopeForm::Neox, "`{deployment}`: rotate-half pairing");
+            assert_eq!(
+                *rotary_dim,
+                d.rotary_dim(),
+                "`{deployment}`: the rotated span"
+            );
+            assert_eq!(*head_dim, d.head_dim, "`{deployment}`: the head width");
         }
         assert_eq!(
             turns,
             2 * d.blocks as usize,
-            "`{sku}`: only the trunk's blocks turn"
+            "`{deployment}`: only the trunk's blocks turn"
         );
     }
 }
 
 fn the_modality_gather_is_three_weight_blocks_and_one_column_slice() {
-    for sku in ROWS {
-        let d = dims(sku);
-        let plan = trace(sku, Platform::Cuda);
+    for deployment in ROWS {
+        let d = dims(deployment);
+        let plan = trace(deployment, Platform::Cuda);
         for i in 0..d.blocks {
             for which in 0..model::MODALITIES {
                 let name = format!("dit.block.{i}.adaln.{which}");
@@ -467,11 +485,11 @@ fn the_modality_gather_is_three_weight_blocks_and_one_column_slice() {
                     .params
                     .iter()
                     .find(|p| p.name == name)
-                    .unwrap_or_else(|| panic!("`{sku}` block {i}: no `{name}`"));
+                    .unwrap_or_else(|| panic!("`{deployment}` block {i}: no `{name}`"));
                 assert_eq!(
                     bank.shape,
                     vec![u64::from(d.adaln_width()), u64::from(d.t_dim)],
-                    "`{sku}` block {i} modality {which}: `[6·dim, t_dim]`"
+                    "`{deployment}` block {i} modality {which}: `[6·dim, t_dim]`"
                 );
             }
         }
@@ -487,9 +505,9 @@ fn the_modality_gather_is_three_weight_blocks_and_one_column_slice() {
         assert_eq!(
             pairs.len(),
             4,
-            "`{sku}`: the four lanes gather four different modulation vectors"
+            "`{deployment}`: the four lanes gather four different modulation vectors"
         );
-        let facts = row(sku).generative.as_ref().expect("facts");
+        let facts = row(deployment).generative.as_ref().expect("facts");
         let denoise = facts
             .readings
             .iter()
@@ -499,7 +517,7 @@ fn the_modality_gather_is_three_weight_blocks_and_one_column_slice() {
         assert_eq!(
             timestep.width,
             model::TIMESTEP_SLOTS,
-            "`{sku}`: the timestep port carries every unique timestep of the step"
+            "`{deployment}`: the timestep port carries every unique timestep of the step"
         );
     }
 }
@@ -515,16 +533,18 @@ fn budget() -> poem_compiler::Budget {
 
 fn every_row_bakes_on_every_platform() {
     for platform in PLATFORMS {
-        for sku in ROWS {
-            let plan = trace(sku, platform);
+        for deployment in ROWS {
+            let plan = trace(deployment, platform);
             let compiled =
                 poem_compiler::compile(&plan, &budget(), &poem_compiler::DeviceProfile::default())
-                    .unwrap_or_else(|why| panic!("{platform:?}: `{sku}` does not bake: {why}"));
+                    .unwrap_or_else(|why| {
+                        panic!("{platform:?}: `{deployment}` does not bake: {why}")
+                    });
             let tiled: usize = compiled.regions.iter().map(|r| r.nodes.len()).sum();
             assert_eq!(
                 tiled,
                 plan.nodes.len(),
-                "{platform:?} `{sku}`: the regions tile the node list once"
+                "{platform:?} `{deployment}`: the regions tile the node list once"
             );
         }
     }
@@ -532,16 +552,16 @@ fn every_row_bakes_on_every_platform() {
 
 fn the_sharded_worlds_trace_and_bake() {
     for tp in [2u32, 4] {
-        let sku = format!("minimax-h3-fl2va-bf16-kv-bf16-tp{tp}");
+        let deployment = format!("minimax-h3-fl2va-bf16-kv-bf16-tp{tp}");
         let d = Dims::h3();
-        let plan = trace(&sku, Platform::Cuda);
+        let plan = trace(&deployment, Platform::Cuda);
         assert_eq!(
             plan.caches.len(),
             model::TE_LAYERS as usize,
             "tp {tp}: one kv row per encoder layer"
         );
         poem_compiler::compile(&plan, &budget(), &poem_compiler::DeviceProfile::default())
-            .unwrap_or_else(|why| panic!("`{sku}` does not bake: {why}"));
+            .unwrap_or_else(|why| panic!("`{deployment}` does not bake: {why}"));
         for which in 0..model::MODALITIES {
             let name = format!("dit.block.0.adaln.{which}");
             let bank = plan
@@ -559,17 +579,17 @@ fn the_sharded_worlds_trace_and_bake() {
 }
 
 fn the_generative_facts_state_the_readings_the_latent_and_two_shifts() {
-    for sku in ROWS {
-        let facts = row(sku).generative.as_ref().expect("facts");
+    for deployment in ROWS {
+        let facts = row(deployment).generative.as_ref().expect("facts");
         for (at, reading) in facts.readings.iter().enumerate() {
             assert_eq!(
                 usize::from(reading.index),
                 at,
-                "`{sku}`: readings are dense from 0 in index order"
+                "`{deployment}`: readings are dense from 0 in index order"
             );
             assert!(
                 reading.positions.is_none(),
-                "`{sku}` reading `{}`: H3's shared audio-tick time axis is not a stated \
+                "`{deployment}` reading `{}`: H3's shared audio-tick time axis is not a stated \
                  convention",
                 reading.name
             );
@@ -577,12 +597,12 @@ fn the_generative_facts_state_the_readings_the_latent_and_two_shifts() {
         let names: Vec<&str> = facts.readings.iter().map(|r| r.name).collect();
         assert_eq!(
             names,
-            if is_flagship(sku) {
+            if is_flagship(deployment) {
                 vec!["text", "refine", "denoise"]
             } else {
                 vec!["refine", "denoise"]
             },
-            "`{sku}`: the readings a guest may name"
+            "`{deployment}`: the readings a guest may name"
         );
         let latent = facts.latent.expect("a latent space");
         assert_eq!(
@@ -595,7 +615,7 @@ fn the_generative_facts_state_the_readings_the_latent_and_two_shifts() {
                 latent.temporal_compression
             ),
             (24, 1, 2, 2, 16, 4),
-            "`{sku}`: the f16 t4 c24 latent under a (1, 2, 2) patch"
+            "`{deployment}`: the f16 t4 c24 latent under a (1, 2, 2) patch"
         );
         let schedule = facts.schedule.as_ref().expect("a schedule");
         assert_eq!(schedule.kind, ScheduleKind::Flow);
@@ -606,7 +626,7 @@ fn the_generative_facts_state_the_readings_the_latent_and_two_shifts() {
                 .iter()
                 .find(|(s, _)| *s == Stream::Video),
             Some(&(Stream::Video, model::VIDEO_SHIFT)),
-            "`{sku}`: the video grid's shift"
+            "`{deployment}`: the video grid's shift"
         );
         assert_eq!(
             schedule
@@ -614,16 +634,16 @@ fn the_generative_facts_state_the_readings_the_latent_and_two_shifts() {
                 .iter()
                 .find(|(s, _)| *s == Stream::Audio),
             Some(&(Stream::Audio, model::AUDIO_SHIFT)),
-            "`{sku}`: the audio grid's shift, run in the same evaluation"
+            "`{deployment}`: the audio grid's shift, run in the same evaluation"
         );
         assert_eq!(
             schedule.pinned_sigmas.len(),
             model::STEPS as usize - 1,
-            "`{sku}`: fifty grid points make forty-nine evaluations"
+            "`{deployment}`: fifty grid points make forty-nine evaluations"
         );
         assert!(
             schedule.pinned_sigmas.windows(2).all(|w| w[0] > w[1]),
-            "`{sku}`: the sigma grid descends"
+            "`{deployment}`: the sigma grid descends"
         );
         let denoise = facts
             .readings
@@ -636,9 +656,9 @@ fn the_generative_facts_state_the_readings_the_latent_and_two_shifts() {
 }
 
 fn the_modulation_is_a_lane_vector_and_every_gated_fold_folds_its_residual() {
-    for sku in ROWS {
-        let d = dims(sku);
-        let plan = trace(sku, Platform::Cuda);
+    for deployment in ROWS {
+        let d = dims(deployment);
+        let plan = trace(deployment, Platform::Cuda);
         let mut modulates = 0usize;
         let mut folds = 0usize;
         for node in &plan.nodes {
@@ -647,20 +667,20 @@ fn the_modulation_is_a_lane_vector_and_every_gated_fold_folds_its_residual() {
                     modulates += 1;
                     assert!(
                         lane_of_row.is_some(),
-                        "`{sku}`: H3 modulates per LANE, broadcast by request_of_token"
+                        "`{deployment}`: H3 modulates per LANE, broadcast by request_of_token"
                     );
                     let ty = &plan.values[m.0 as usize].ty;
                     assert!(
                         matches!(ty, Ty::Tensor { shape, dtype: Dtype::F32 }
                             if matches!(shape.as_slice(), [Dim::Lanes, _])),
-                        "`{sku}`: a lane-vector chain lands `[Lanes, ·]` f32, not {ty:?}"
+                        "`{deployment}`: a lane-vector chain lands `[Lanes, ·]` f32, not {ty:?}"
                     );
                 }
                 Operation::Elementwise(Elementwise::GatedResidualAdd { r, r_out, .. }) => {
                     folds += 1;
                     assert_eq!(
                         plan.values[r.0 as usize].ty, plan.values[r_out.0 as usize].ty,
-                        "`{sku}`: a gated fold answers its residual's own rectangle"
+                        "`{deployment}`: a gated fold answers its residual's own rectangle"
                     );
                 }
                 _ => {}
@@ -669,20 +689,20 @@ fn the_modulation_is_a_lane_vector_and_every_gated_fold_folds_its_residual() {
         assert_eq!(
             modulates,
             2 * d.blocks as usize + 1,
-            "`{sku}`: two modulated sublayers a block and one at the head"
+            "`{deployment}`: two modulated sublayers a block and one at the head"
         );
         assert_eq!(
             folds,
             2 * d.blocks as usize,
-            "`{sku}`: two gated folds a block"
+            "`{deployment}`: two gated folds a block"
         );
     }
 }
 
 fn the_gather_merges_four_lane_shaped_arms_back_onto_the_reading() {
-    for sku in ROWS {
-        let d = dims(sku);
-        let plan = trace(sku, Platform::Cuda);
+    for deployment in ROWS {
+        let d = dims(deployment);
+        let plan = trace(deployment, Platform::Cuda);
         let lane_merges = plan
             .values
             .iter()
@@ -696,7 +716,7 @@ fn the_gather_merges_four_lane_shaped_arms_back_onto_the_reading() {
         assert_eq!(
             lane_merges,
             d.blocks as usize + 1,
-            "`{sku}`: the four sides' modulation vectors come back as one rectangle"
+            "`{deployment}`: the four sides' modulation vectors come back as one rectangle"
         );
         let token_merges = plan
             .values
@@ -710,7 +730,7 @@ fn the_gather_merges_four_lane_shaped_arms_back_onto_the_reading() {
             .count();
         assert_eq!(
             token_merges, 1,
-            "`{sku}`: one packed row sequence, joined once"
+            "`{deployment}`: one packed row sequence, joined once"
         );
     }
 }

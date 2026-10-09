@@ -71,7 +71,7 @@
     }, (d) => d.startsWith("refused") || d.startsWith("threw"));
 
     const summary = await pie.bootLazy(modelUrl, "");
-    log(`booted ${summary.sku}`);
+    log(`booted ${summary.deployment}`);
 
     await check("boot a second time in the same tab → clear refusal", async () => {
       try {

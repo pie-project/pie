@@ -207,20 +207,20 @@ pub fn run(mut args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate
         merge_metadata(&mut metadata, overlay.metadata.clone());
     }
     let metadata = metadata;
-    let (sku_name, contract) = choose_row(
+    let (deployment_name, contract) = choose_row(
         args.deployment.as_deref(),
         &opened,
         &metadata,
         platform,
         &source.path,
     )?;
-    let sku = sku_name.as_str();
+    let deployment = deployment_name.as_str();
     drop(opened);
-    refuse_a_decode_of_packed_codes(sku, &contract, &metadata)?;
+    refuse_a_decode_of_packed_codes(deployment, &contract, &metadata)?;
     let attributes = gguf_attributes(&source, &metadata);
 
     let landing = checkpoint::plan::compile(&metadata, &contract, decode_target())
-        .map_err(|err| anyhow!("{sku}: the contract does not fit this checkpoint: {err}"))?;
+        .map_err(|err| anyhow!("{deployment}: the contract does not fit this checkpoint: {err}"))?;
     let split = split_contract(&contract, &landing, &metadata)?;
     let read: BTreeSet<&str> = contract
         .tensors
@@ -232,7 +232,7 @@ pub fn run(mut args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate
         .filter(|tensor| !read.contains(tensor.name.as_str()))
         .count();
     println!(
-        "convert: {sku} lands {} plane(s): {} copied through, {} transformed here; \
+        "convert: {deployment} lands {} plane(s): {} copied through, {} transformed here; \
          {unread} source tensor(s) no plane reads are left out",
         split.copies.len()
             + split
@@ -328,8 +328,8 @@ pub fn run(mut args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate
         .map(|raw| raw.span_bytes)
         .sum();
 
-    let stamp = checkpoint::serving::Stamp::of(&backend_word(platform), sku);
-    let trace = runtime::engine::load::trace(sku, platform)?;
+    let stamp = checkpoint::serving::Stamp::of(&backend_word(platform), deployment);
+    let trace = runtime::engine::load::trace(deployment, platform)?;
     let ranked = runtime::engine::load::sequence(&trace);
     let groups = groups_of(&landing, &trace)?;
     let entries = merge_order(
@@ -391,7 +391,7 @@ pub fn run(mut args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate
             )
         );
         return Ok(crate::ui::Answer::noop(format!(
-            "dry run: would write {} as `{sku}`",
+            "dry run: would write {} as `{deployment}`",
             crate::ui::short_path(&specialized_path(
                 &out_file,
                 &source.name,
@@ -430,7 +430,7 @@ pub fn run(mut args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate
         (SOURCE_KEY.to_string(), source.origin.clone()),
         (SOURCE_ENCODING_KEY.to_string(), source_encoding(&metadata)),
     ]);
-    provenance.extend(runtime::engine::load::package_attributes(sku)?);
+    provenance.extend(runtime::engine::load::package_attributes(deployment)?);
     let mut writer = Writer::create_serving(&out_file, &provenance, stamp.clone())
         .map_err(|err| anyhow!("cannot write the artifact: {err}"))?;
     for group in &groups {
@@ -547,30 +547,30 @@ fn overlay_onto_artifact(
         .with_context(|| "merge the overlay into the artifact's name space")?;
     merge_metadata(&mut metadata, overlay.metadata.clone());
     let metadata = metadata;
-    let (sku_name, contract) = choose_row(
+    let (deployment_name, contract) = choose_row(
         args.deployment.as_deref(),
         &opened,
         &metadata,
         platform,
         &base_file,
     )?;
-    let sku = sku_name.as_str();
+    let deployment = deployment_name.as_str();
     drop(opened);
-    if sku == before.sku {
+    if deployment == before.deployment {
         bail!(
-            "{} already serves `{sku}`; the overlay lands on a row that reads the head, and \
+            "{} already serves `{deployment}`; the overlay lands on a row that reads the head, and \
              identification chose the row it already was",
             crate::ui::short_path(&base_file)
         );
     }
-    refuse_a_decode_of_packed_codes(sku, &contract, &metadata)?;
+    refuse_a_decode_of_packed_codes(deployment, &contract, &metadata)?;
 
     let is_head = |expr: &Expr| {
         let sources = expr.sources();
         !sources.is_empty() && sources.iter().all(|name| name.starts_with(AUX_PREFIX))
     };
     let landing = checkpoint::plan::compile(&metadata, &contract, decode_target())
-        .map_err(|err| anyhow!("{sku}: the contract does not fit this artifact: {err}"))?;
+        .map_err(|err| anyhow!("{deployment}: the contract does not fit this artifact: {err}"))?;
     let split = split_contract(&contract, &landing, &metadata)?;
     let copies: Vec<Copy<'_>> = split
         .copies
@@ -600,7 +600,7 @@ fn overlay_onto_artifact(
         .filter(|tensor| !is_head(&tensor.expr))
         .count();
     println!(
-        "overlay: {sku} lands {head_planes} head plane(s) onto {} ({} copied through, {} \
+        "overlay: {deployment} lands {head_planes} head plane(s) onto {} ({} copied through, {} \
          transformed here); {trunk_planes} trunk plane(s) stay where they are",
         crate::ui::short_path(&base_file),
         copies.len(),
@@ -611,7 +611,7 @@ fn overlay_onto_artifact(
             .count(),
     );
     if head_planes == 0 {
-        bail!("the overlay contributes no plane the row `{sku}` reads");
+        bail!("the overlay contributes no plane the row `{deployment}` reads");
     }
 
     let plan = if decode.tensors.is_empty() {
@@ -629,8 +629,8 @@ fn overlay_onto_artifact(
         .map(|raw| raw.span_bytes)
         .sum();
     let copy_bytes: u64 = copies.iter().map(|copy| copy.raw.span_bytes).sum();
-    let stamp = checkpoint::serving::Stamp::of(&backend_word(platform), sku);
-    let trace = runtime::engine::load::trace(sku, platform)?;
+    let stamp = checkpoint::serving::Stamp::of(&backend_word(platform), deployment);
+    let trace = runtime::engine::load::trace(deployment, platform)?;
     let ranked = runtime::engine::load::sequence(&trace);
     let groups = groups_of(&landing, &trace)?;
     let entries = merge_order(plan.as_ref(), &copies, &[], ranked.as_deref(), &groups);
@@ -644,7 +644,7 @@ fn overlay_onto_artifact(
     });
     if args.dry_run {
         return Ok(crate::ui::Answer::noop(format!(
-            "dry run: would append {} decoded and {} copied through to {} and restamp it `{sku}`",
+            "dry run: would append {} decoded and {} copied through to {} and restamp it `{deployment}`",
             crate::ui::bytes(decode_bytes),
             crate::ui::bytes(copy_bytes),
             crate::ui::short_path(&base_file)
@@ -680,7 +680,7 @@ fn overlay_onto_artifact(
         (VERSION_KEY.to_string(), pie_version().to_string()),
         (SOURCE_KEY.to_string(), source.origin.clone()),
     ]);
-    provenance.extend(runtime::engine::load::package_attributes(sku)?);
+    provenance.extend(runtime::engine::load::package_attributes(deployment)?);
     let restore = |why: anyhow::Error| -> anyhow::Error {
         match std::fs::OpenOptions::new()
             .write(true)
@@ -749,10 +749,10 @@ fn overlay_onto_artifact(
     };
     if let Err(why) = runtime::engine::load::verify_artifact(&renamed, platform) {
         bail!(
-            "{}: the overlaid artifact does not load as `{sku}` ({why:#}); cut it back to \
+            "{}: the overlaid artifact does not load as `{deployment}` ({why:#}); cut it back to \
              {held} bytes and rename it for `{}` to restore the artifact",
             crate::ui::short_path(&renamed),
-            before.sku
+            before.deployment
         );
     }
     Ok(crate::ui::Answer::did(format!(
@@ -913,7 +913,7 @@ fn split_contract<'a>(
 }
 
 fn refuse_a_decode_of_packed_codes(
-    sku: &str,
+    deployment: &str,
     contract: &ModelContract,
     metadata: &Metadata,
 ) -> Result<()> {
@@ -923,7 +923,7 @@ fn refuse_a_decode_of_packed_codes(
         }
         if decodes_a_packed_plane(&tensor.expr, metadata, contract) {
             bail!(
-                "{sku}: `{}` decodes a plane the checkpoint stores packed, and the artifact \
+                "{deployment}: `{}` decodes a plane the checkpoint stores packed, and the artifact \
                  keeps a packed plane as stored",
                 tensor.name
             );
@@ -1424,7 +1424,7 @@ fn choose_row(
     let Some(name) = named else {
         return runtime::engine::load::conversion_contract(opened, metadata, platform)
             .map(|(name, contract)| (name.to_string(), contract))
-            .ok_or_else(|| refuse_a_source_no_sku_in_this_build_claims(checkpoint));
+            .ok_or_else(|| refuse_a_source_no_deployment_in_this_build_claims(checkpoint));
     };
     runtime::engine::load::conversion_contract_named(opened, metadata, platform, name).map_err(
         |why| {
@@ -1438,10 +1438,10 @@ fn choose_row(
     )
 }
 
-fn refuse_a_source_no_sku_in_this_build_claims(checkpoint: &Path) -> anyhow::Error {
+fn refuse_a_source_no_deployment_in_this_build_claims(checkpoint: &Path) -> anyhow::Error {
     anyhow!(
-        "{}: no SKU this build ships claims this checkpoint, so nothing here can say \
-         what its planes are. The import performs a SKU's whole landing, so the artifact \
+        "{}: no deployment this build ships claims this checkpoint, so nothing here can say \
+         what its planes are. The import performs a deployment's whole landing, so the artifact \
          would hold the source's own tensors under the source's own names — a file that \
          converts, verifies and opens, and that no boot on any box with this catalog can \
          load. `pie model list` prints what a checkpoint identifies as.",
@@ -1672,24 +1672,27 @@ fn staleness(
         Ok(None) => return Some("it carries no serving stamp".to_string()),
         Err(err) => return Some(format!("its serving stamp does not read back: {err}")),
     };
-    if let Some(asked) = asked.filter(|asked| *asked != stamp.sku) {
+    if let Some(asked) = asked.filter(|asked| *asked != stamp.deployment) {
         return Some(format!(
             "it serves `{}` and `--deployment {asked}` was asked for",
-            stamp.sku
+            stamp.deployment
         ));
     }
-    if runtime::engine::load::trace(&stamp.sku, platform).is_err() {
-        return Some(format!("this build ships no SKU named `{}`", stamp.sku));
+    if runtime::engine::load::trace(&stamp.deployment, platform).is_err() {
+        return Some(format!(
+            "this build ships no deployment named `{}`",
+            stamp.deployment
+        ));
     }
     let carried = match runtime::engine::load::package_of(artifact) {
         Ok(carried) => carried.map(|package| package.attributes()),
         Err(err) => return Some(format!("{err:#}")),
     };
-    let ships = runtime::engine::load::package_attributes(&stamp.sku).ok();
+    let ships = runtime::engine::load::package_attributes(&stamp.deployment).ok();
     if carried.unwrap_or_default() != ships.unwrap_or_default() {
         return Some("the model package it carries is not the one this build ships".to_string());
     }
-    let wanted = checkpoint::serving::Stamp::of(&backend_word(platform), &stamp.sku);
+    let wanted = checkpoint::serving::Stamp::of(&backend_word(platform), &stamp.deployment);
     if let Err(mismatch) = stamp.check(&wanted) {
         return Some(mismatch.to_string());
     }

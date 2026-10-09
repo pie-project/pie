@@ -69,7 +69,7 @@ fn a_routed_bank_is_the_rectangle_the_grouped_leg_reads() {
 
     assert!(
         checked > 0,
-        "no catalog SKU traces a routed select, so this gate proved nothing — either the \
+        "no catalog deployment traces a routed select, so this gate proved nothing — either the \
          MoE families left the catalog or the op was renamed"
     );
     assert!(faults.is_empty(), "\n{}\n", faults.join("\n"));

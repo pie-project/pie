@@ -6,7 +6,7 @@
 //! qwen attention and showed it is the un-rotated forward at the bf16 rounding
 //! floor; C2a/b/c built and unit-tested the `KvU4` codec's pack/write/read
 //! kernels in isolation. This test proves the pieces COMPOSE: a real small-model
-//! Metal forward run through the serve path, over a SKU that turns the rotation
+//! Metal forward run through the serve path, over a deployment that turns the rotation
 //! ON and stores the KV cache as the packed `KvU4` codec, against the shipped
 //! bf16-KV baseline over the SAME weights.
 //!
@@ -25,7 +25,7 @@
 //!               this tiny model would be a wiring bug, not quant noise).
 //!
 //! We ALSO measure the memory win straight from the allocation layer
-//! (`pool_demand` over each SKU's real trace): a packed head is `head_dim/2 + 2`
+//! (`pool_demand` over each deployment's real trace): a packed head is `head_dim/2 + 2`
 //! bytes vs `head_dim * 2` for bf16, so the cache is ~3.9x smaller at head_dim
 //! 256 and ~3.88x at 128. Both head_dims are exercised — they are the two blocks
 //! the `KvU4` write/read kernels ship (`SDPA_KV_U4_WIDTHS = [128, 256]`).
@@ -193,9 +193,9 @@ fn word(query_len: u32) -> u64 {
     .word(&Request::new(query_len, false))
 }
 
-/// Which SKU to load: the plain baseline, or the rotated path at a given KV dtype.
+/// Which deployment to load: the plain baseline, or the rotated path at a given KV dtype.
 #[derive(Clone, Copy)]
-enum Sku {
+enum Deployment {
     /// rotate_kv = false — the shipped ground truth.
     PlainBf16,
     /// rotate_kv = true, KV Bf16 — rotation only, no quant.
@@ -204,23 +204,23 @@ enum Sku {
     RotatedU4,
 }
 
-/// The package's model `sku` names at `head_dim`, and its kv dtype.
-fn model_of(sku: Sku, head_dim: u32) -> (String, Dtype) {
-    match sku {
-        Sku::PlainBf16 => (format!("qwen3-micro-text-hd{head_dim}"), Dtype::Bf16),
-        Sku::RotatedBf16 => (
+/// The package's model `deployment` names at `head_dim`, and its kv dtype.
+fn model_of(deployment: Deployment, head_dim: u32) -> (String, Dtype) {
+    match deployment {
+        Deployment::PlainBf16 => (format!("qwen3-micro-text-hd{head_dim}"), Dtype::Bf16),
+        Deployment::RotatedBf16 => (
             format!("qwen3-micro-text-hd{head_dim}-rotated"),
             Dtype::Bf16,
         ),
-        Sku::RotatedU4 => (
+        Deployment::RotatedU4 => (
             format!("qwen3-micro-text-hd{head_dim}-rotated"),
             Dtype::KvU4,
         ),
     }
 }
 
-fn load(dir: &Path, sku: Sku, head_dim: u32) -> Shell {
-    let (id, kv) = model_of(sku, head_dim);
+fn load(dir: &Path, deployment: Deployment, head_dim: u32) -> Shell {
+    let (id, kv) = model_of(deployment, head_dim);
     let trace = trace_of(&id, Dtype::Bf16, kv, Platform::Metal);
     let source = ztensor_compat::index(dir.join("model.safetensors")).expect("the fixture indexes");
     let contract =
@@ -302,12 +302,12 @@ fn argmaxes(rows: &[Vec<f32>]) -> Vec<usize> {
     rows.iter().map(|r| argmax(r)).collect()
 }
 
-/// KV-cache bytes the store's demand accounting reserves for `sku` at `head_dim`,
-/// summed over the SKU's real trace (both layers, key and value planes). This is
+/// KV-cache bytes the store's demand accounting reserves for `deployment` at `head_dim`,
+/// summed over the deployment's real trace (both layers, key and value planes). This is
 /// the allocation layer — the same `row_stride` fork `reserve` uses — so the
 /// number is what the pool would allocate, not a hand estimate.
-fn kv_cache_bytes(sku: Sku, head_dim: u32, paging: Paging) -> u64 {
-    let (id, kv) = model_of(sku, head_dim);
+fn kv_cache_bytes(deployment: Deployment, head_dim: u32, paging: Paging) -> u64 {
+    let (id, kv) = model_of(deployment, head_dim);
     let trace = trace_of(&id, Dtype::Bf16, kv, Platform::Metal);
     pool_demand(&trace, paging).expect("the KV cache sizes")
 }
@@ -322,12 +322,12 @@ fn the_rotated_packed_kv_serves() {
     // head_dim 256 (the shipping flagship geometry) and 128 — the two blocks the
     // packed KvU4 write/read kernels ship (SDPA_KV_U4_WIDTHS = [128, 256]). The
     // micro_text's own head_dim is 64, which the packed kernels do NOT serve, so
-    // this test uses the parameterized micro_text_*_hd SKUs at 128 and 256.
+    // this test uses the parameterized micro_text_*_hd deployments at 128 and 256.
     for &head_dim in &[256u32, 128] {
         serve_case(head_dim);
     }
     eprintln!(
-        "=== C2d: the rotated packed-4-bit KV SKU serves — argmax-identical, ~3.9x smaller cache ==="
+        "=== C2d: the rotated packed-4-bit KV deployment serves — argmax-identical, ~3.9x smaller cache ==="
     );
 }
 
@@ -338,8 +338,8 @@ fn serve_case(head_dim: u32) {
     // Any paging gives the same ratio (both dtypes scale by the same cell count);
     // we use the shell's paging so the byte figures are the ones it reserves.
     let paging = Paging::of(16, 128, 4, 4 * 128 / 16).expect("paging");
-    let bf16_bytes = kv_cache_bytes(Sku::PlainBf16, head_dim, paging);
-    let u4_bytes = kv_cache_bytes(Sku::RotatedU4, head_dim, paging);
+    let bf16_bytes = kv_cache_bytes(Deployment::PlainBf16, head_dim, paging);
+    let u4_bytes = kv_cache_bytes(Deployment::RotatedU4, head_dim, paging);
     let ratio = u4_bytes as f64 / bf16_bytes as f64;
     // packed head = head_dim/2 + 2 bytes; bf16 head = head_dim * 2 bytes.
     let want = (f64::from(head_dim) / 2.0 + 2.0) / (f64::from(head_dim) * 2.0);
@@ -366,9 +366,9 @@ fn serve_case(head_dim: u32) {
     std::fs::create_dir_all(&dir).expect("the fixture dir exists");
     synth_fixture(&dir, head_dim as usize);
 
-    let baseline = run(&mut load(&dir, Sku::PlainBf16, head_dim), 0);
-    let rot_only = run(&mut load(&dir, Sku::RotatedBf16, head_dim), 1);
-    let rot_u4 = run(&mut load(&dir, Sku::RotatedU4, head_dim), 2);
+    let baseline = run(&mut load(&dir, Deployment::PlainBf16, head_dim), 0);
+    let rot_only = run(&mut load(&dir, Deployment::RotatedBf16, head_dim), 1);
+    let rot_u4 = run(&mut load(&dir, Deployment::RotatedU4, head_dim), 2);
     let _ = std::fs::remove_dir_all(&dir);
 
     for (label, rows) in [

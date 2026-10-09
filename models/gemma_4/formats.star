@@ -246,14 +246,14 @@ def safetensors(m, reads, layout):
 
 def gguf(m, reads):
     if m.self_cond != None:
-        fail("this SKU is a block-diffusion text and no GGUF spelling of its self-conditioning block is settled; import it from the safetensors checkpoint")
+        fail("this deployment is a block-diffusion text and no GGUF spelling of its self-conditioning block is settled; import it from the safetensors checkpoint")
     if m.draft != None or m.assistant != None:
-        fail("this SKU declares an aux draft head and no GGUF spelling of one is settled; import it from the safetensors artifact")
+        fail("this deployment declares an aux draft head and no GGUF spelling of one is settled; import it from the safetensors artifact")
     if m.tower != None:
-        fail("this SKU declares a vision tower and no GGUF spelling of one is settled; import it from the safetensors checkpoint")
+        fail("this deployment declares a vision tower and no GGUF spelling of one is settled; import it from the safetensors checkpoint")
     for w in m.layers:
         if w.moe != None:
-            fail("this SKU declares a routed feedforward branch and no GGUF spelling of gemma 4's `experts.switch_glu.*` or `router.*` is settled; import it from the safetensors checkpoint")
+            fail("this deployment declares a routed feedforward branch and no GGUF spelling of gemma 4's `experts.switch_glu.*` or `router.*` is settled; import it from the safetensors checkpoint")
     reads.read(m.embed, "token_embd.weight")
     reads.read(m.final_norm, "output_norm.weight")
     for l, w in enumerate(m.layers):

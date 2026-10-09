@@ -43,8 +43,8 @@ const REFUSED: &[Refusal] = &[
 
 const CANNOT_SERVE: &[(&str, &[&str])] = &[];
 
-fn ops_of(sku: &str) -> BTreeSet<String> {
-    let row = models::deployment(sku).expect("the row is in the catalog");
+fn ops_of(deployment: &str) -> BTreeSet<String> {
+    let row = models::deployment(deployment).expect("the row is in the catalog");
     row.trace(PLATFORM)
         .nodes
         .iter()
@@ -72,24 +72,24 @@ fn stopped() -> BTreeMap<String, BTreeSet<String>> {
 }
 
 #[test]
-fn every_catalog_sku_dispatches_every_case() {
-    every_catalog_sku_dispatches();
+fn every_catalog_deployment_dispatches_every_case() {
+    every_catalog_deployment_dispatches();
     no_exemption_outlives_its_reason();
     every_refusal_is_still_carried();
-    every_catalog_sku_traces();
+    every_catalog_deployment_traces();
 }
 
-fn every_catalog_sku_dispatches() {
+fn every_catalog_deployment_dispatches() {
     let refused = refused();
     let exempt: BTreeMap<&str, &[&str]> = CANNOT_SERVE.iter().copied().collect();
 
     let unlisted: Vec<String> = stopped()
         .into_iter()
-        .filter(|(sku, _)| !exempt.contains_key(one_rank(sku)))
-        .map(|(sku, ops)| {
+        .filter(|(deployment, _)| !exempt.contains_key(one_rank(deployment)))
+        .map(|(deployment, ops)| {
             let ops: Vec<&str> = ops.iter().map(String::as_str).collect();
             format!(
-                "{sku} names {}, which {SHELL} refuses ({})",
+                "{deployment} names {}, which {SHELL} refuses ({})",
                 ops.join(" and "),
                 ops.iter()
                     .map(|op| refused[op].why)
@@ -108,31 +108,32 @@ fn every_catalog_sku_dispatches() {
     );
 }
 
-/// The one-rank deployment `sku` splits: a split is stopped by what stops the
+/// The one-rank deployment `deployment` splits: a split is stopped by what stops the
 /// deployment it splits, so it is exempted under that one's name.
-fn one_rank(sku: &str) -> &str {
-    sku.rsplit_once("-tp")
+fn one_rank(deployment: &str) -> &str {
+    deployment
+        .rsplit_once("-tp")
         .filter(|(_, ranks)| ranks.parse::<u32>().is_ok())
-        .map_or(sku, |(whole, _)| whole)
+        .map_or(deployment, |(whole, _)| whole)
 }
 
 fn no_exemption_outlives_its_reason() {
     let stopped = stopped();
     let mut stale = Vec::new();
 
-    for (sku, stoppers) in CANNOT_SERVE {
-        if models::deployment(sku).is_none() {
-            stale.push(format!("{sku} is exempted but is not a catalog row"));
+    for (deployment, stoppers) in CANNOT_SERVE {
+        if models::deployment(deployment).is_none() {
+            stale.push(format!("{deployment} is exempted but is not a catalog row"));
             continue;
         }
         let listed: BTreeSet<String> = stoppers.iter().map(|op| (*op).to_string()).collect();
-        match stopped.get(*sku) {
+        match stopped.get(*deployment) {
             Some(blocked) if *blocked == listed => {}
             Some(blocked) => stale.push(format!(
-                "{sku} is exempted over {listed:?}, but what stops it is {blocked:?}"
+                "{deployment} is exempted over {listed:?}, but what stops it is {blocked:?}"
             )),
             None => stale.push(format!(
-                "{sku} is exempted over {listed:?}, but nothing refused stops it any more — \
+                "{deployment} is exempted over {listed:?}, but nothing refused stops it any more — \
                  drop the exemption"
             )),
         }
@@ -165,7 +166,7 @@ fn every_refusal_is_still_carried() {
     assert!(gone.is_empty(), "{}", gone.join("\n  "));
 }
 
-fn every_catalog_sku_traces() {
+fn every_catalog_deployment_traces() {
     let mut empty = Vec::new();
     for row in models::deployments() {
         let trace = row.trace(PLATFORM);

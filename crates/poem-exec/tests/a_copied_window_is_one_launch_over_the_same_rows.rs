@@ -14,7 +14,7 @@ use poem_ir::{
     Attention, Collective, Elementwise, Fused, Layout, Linear, Operands, Operation, Spatial, Trace,
 };
 
-const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
+const DEPLOYMENT: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
 fn budget() -> Budget {
     Budget {
@@ -162,12 +162,12 @@ impl Sink for Runs {
     fn join(&mut self, _event: EventId) {}
 }
 
-fn sku() -> (Trace, CompiledModel) {
-    let trace = models::deployment(SKU)
-        .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"))
+fn deployment() -> (Trace, CompiledModel) {
+    let trace = models::deployment(DEPLOYMENT)
+        .unwrap_or_else(|| panic!("`{DEPLOYMENT}` is in the catalog"))
         .trace(Platform::Cuda);
     let compiled = compile(&trace, &budget(), &DeviceProfile::default())
-        .unwrap_or_else(|refusal| panic!("`{SKU}` bakes: {refusal:?}"));
+        .unwrap_or_else(|refusal| panic!("`{DEPLOYMENT}` bakes: {refusal:?}"));
     (trace, compiled)
 }
 
@@ -219,7 +219,7 @@ fn fragmenting(compiled: &CompiledModel) -> Vec<Lane> {
             }
         }
     }
-    panic!("no three classes of `{SKU}` leave a window in pieces")
+    panic!("no three classes of `{DEPLOYMENT}` leave a window in pieces")
 }
 
 fn fire(
@@ -251,7 +251,7 @@ fn a_copied_window_is_one_launch_over_the_same_rows_every_case() {
 }
 
 fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
-    let (trace, compiled) = sku();
+    let (trace, compiled) = deployment();
     let lanes = fragmenting(&compiled);
 
     let composition = compose(&compiled, &budget(), &lanes).expect("three lanes compose");
@@ -360,7 +360,7 @@ fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
 }
 
 fn the_schedule_builder_takes_the_same_answer_as_the_consumers_that_read_it() {
-    let (_, compiled) = sku();
+    let (_, compiled) = deployment();
     let lanes = fragmenting(&compiled);
     let composition = compose(&compiled, &budget(), &lanes).expect("three lanes compose");
     let bucket = budget()

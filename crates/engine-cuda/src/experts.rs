@@ -1892,13 +1892,13 @@ mod tests {
 
     fn a3b() -> Trace {
         models::deployment("qwen35-a3b-bf16-kv-bf16")
-            .expect("the catalog ships the SKU")
+            .expect("the catalog ships the deployment")
             .trace(Platform::Cuda)
     }
 
     fn gpt_oss() -> Trace {
         models::deployment("gptoss-20b-bf16-mxfp4-kv-bf16")
-            .expect("the catalog ships the SKU")
+            .expect("the catalog ships the deployment")
             .trace(Platform::Cuda)
     }
 

@@ -2,7 +2,7 @@
 //! Over a dry device (`Shell::load_dry`) they trace and run nothing (no
 //! weights land, no pool holds a buffer); over a device that runs, they run
 //! and read back (the e2e example checks what came back is finite). The coverage harness
-//! (`examples/coverage.rs`) answers with it, for each catalog SKU, whether
+//! (`examples/coverage.rs`) answers with it, for each catalog deployment, whether
 //! engine-xla emits the plan's programs, and, on a compiling dry device,
 //! whether the plugin compiles them.
 //!

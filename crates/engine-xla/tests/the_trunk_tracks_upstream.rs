@@ -96,12 +96,12 @@ fn the_first_logits_track_upstream() {
         eprintln!("not asked: set PIE_XLA_ARTIFACT to a Qwen3.5-0.8B bf16 artifact");
         return;
     };
-    if !m.sku.name.starts_with("qwen35-d0.8b") {
-        eprintln!("not asked: {} is not Qwen3.5-0.8B", m.sku.name);
+    if !m.deployment.name.starts_with("qwen35-d0.8b") {
+        eprintln!("not asked: {} is not Qwen3.5-0.8B", m.deployment.name);
         return;
     }
-    let trace = m.sku.trace(Platform::Xla);
-    let facts = m.sku.trace(models::Platform::Xla).facts;
+    let trace = m.deployment.trace(Platform::Xla);
+    let facts = m.deployment.trace(models::Platform::Xla).facts;
     let word = |len: u32| facts.word(&Request::new(len, false));
 
     let wanted: Vec<String> = std::env::var("PIE_XLA_TRUNK_OPS")
@@ -140,7 +140,7 @@ fn the_first_logits_track_upstream() {
         device: &DeviceBoot::default(),
         // A vision artifact's plan sizes its tower by the patch ladder.
         patches: m
-            .sku
+            .deployment
             .name
             .contains("vision")
             .then(|| poem_compiler::PatchLadder::new(256, 1)),
@@ -219,7 +219,7 @@ fn the_first_logits_track_upstream() {
     eprintln!(
         "{}: vs transformers f32, prefill max |Δlogit| {worst:.4} (correlation {r:.6}), \
          token by token {walked_worst:.4} ({walked_r:.6})",
-        m.sku.name
+        m.deployment.name
     );
     assert!(
         worst <= MAX_DELTA,

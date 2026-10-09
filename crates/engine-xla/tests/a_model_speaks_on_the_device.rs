@@ -1,7 +1,7 @@
 //! A whole model on the device: load a snapshot, prefill a prompt, decode
 //! greedily, and check a decode walked token by token reads what the
 //! prefill read. Asked for with `PIE_XLA_SNAPSHOT` (a Hugging Face snapshot
-//! directory) and `PIE_XLA_SKU` (the catalog row that reads it).
+//! directory) and `PIE_XLA_DEPLOYMENT` (the catalog row that reads it).
 
 use std::time::Instant;
 
@@ -24,12 +24,12 @@ fn argmax(logits: &[f32]) -> u32 {
 #[test]
 fn a_prompt_is_answered_and_its_decode_agrees_with_its_prefill() {
     let Some(m) = common::model() else {
-        eprintln!("not asked: set PIE_XLA_SNAPSHOT + PIE_XLA_SKU or PIE_XLA_ARTIFACT");
+        eprintln!("not asked: set PIE_XLA_SNAPSHOT + PIE_XLA_DEPLOYMENT or PIE_XLA_ARTIFACT");
         return;
     };
-    let (checkpoint, sku, contract) = (m.checkpoint.clone(), m.sku, &m.contract);
-    let trace = sku.trace(Platform::Xla);
-    let facts = sku.trace(models::Platform::Xla).facts;
+    let (checkpoint, deployment, contract) = (m.checkpoint.clone(), m.deployment, &m.contract);
+    let trace = deployment.trace(Platform::Xla);
+    let facts = deployment.trace(models::Platform::Xla).facts;
     let word = |query_len: u32| facts.word(&Request::new(query_len, false));
     let context = 512;
 
@@ -50,7 +50,7 @@ fn a_prompt_is_answered_and_its_decode_agrees_with_its_prefill() {
     .expect("the shell loads");
     eprintln!(
         "loaded {} on {} in {:.1}s",
-        sku.name,
+        deployment.name,
         shell.device().kind(),
         booted.elapsed().as_secs_f64()
     );

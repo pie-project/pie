@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use poem::import::Error;
 
 #[test]
-fn every_sku_ships_whole_every_case() {
-    a_sku_name_states_the_world_its_row_ships();
+fn every_deployment_ships_whole_every_case() {
+    a_deployment_name_states_the_world_its_row_ships();
     every_import_row_reads_the_checkpoint_it_is_handed();
     the_block_drafters_plan_is_whole();
     the_dflash2_plan_is_whole_and_convolves();
@@ -15,20 +15,22 @@ fn every_sku_ships_whole_every_case() {
     gpt_oss_carries_the_block_drafter_too();
 }
 
-fn a_sku_name_states_the_world_its_row_ships() {
+fn a_deployment_name_states_the_world_its_row_ships() {
     let mut faults = Vec::new();
 
     for row in models::deployments().chain(models::splits()) {
-        let (sku, tp) = (row.name.as_str(), row.deploy.tp);
-        let named = match sku.rsplit_once("-tp") {
+        let (deployment, tp) = (row.name.as_str(), row.deploy.tp);
+        let named = match deployment.rsplit_once("-tp") {
             Some((_, ranks)) => ranks.parse::<u32>().unwrap_or_else(|why| {
-                panic!("`{sku}` ends in a world of `{ranks}` ranks, which is no number: {why}")
+                panic!(
+                    "`{deployment}` ends in a world of `{ranks}` ranks, which is no number: {why}"
+                )
             }),
             None => 1,
         };
         if named != tp {
             faults.push(format!(
-                "`{sku}` names a world of {named} rank(s) and its catalog row \
+                "`{deployment}` names a world of {named} rank(s) and its catalog row \
                  ships tp {tp}; the name a runtime selects by and the world it \
                  gets are the same fact"
             ));
@@ -52,11 +54,11 @@ fn every_import_row_reads_the_checkpoint_it_is_handed() {
     let mut faults = Vec::new();
     let mut sharded = 0usize;
     for row in models::deployments().chain(models::splits()) {
-        let (sku, tp) = (row.name.as_str(), row.deploy.tp);
+        let (deployment, tp) = (row.name.as_str(), row.deploy.tp);
         let refusal = match row.contract(&src, poem::Platform::Cuda) {
             Ok(_) => {
                 faults.push(format!(
-                    "`{sku}` states a whole contract over a checkpoint holding \
+                    "`{deployment}` states a whole contract over a checkpoint holding \
                      one tensor no model reads, so its import table never asked \
                      the file what it holds"
                 ));
@@ -66,7 +68,7 @@ fn every_import_row_reads_the_checkpoint_it_is_handed() {
             Err(Error::Illegible { detail, .. }) => detail,
             Err(why @ Error::Incompatible { .. }) => {
                 faults.push(format!(
-                    "`{sku}` refuses a checkpoint that holds nothing it reads \
+                    "`{deployment}` refuses a checkpoint that holds nothing it reads \
                      with `{why}`, and a file that states none of its planes \
                      is missing them, not storing them in another \
                      representation"
@@ -77,13 +79,13 @@ fn every_import_row_reads_the_checkpoint_it_is_handed() {
         if tp > 1 {
             assert!(
                 refusal.contains("WHOLE checkpoint"),
-                "`{sku}` is built for {tp} ranks, so it should refuse at the \
+                "`{deployment}` is built for {tp} ranks, so it should refuse at the \
                  width before it reads anything, and it refused with: {refusal}"
             );
             sharded += 1;
         } else if refusal.contains("WHOLE checkpoint") {
             faults.push(format!(
-                "`{sku}` is a one-rank row and refused at the width: {refusal}"
+                "`{deployment}` is a one-rank row and refused at the width: {refusal}"
             ));
         }
     }

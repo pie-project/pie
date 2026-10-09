@@ -13,12 +13,12 @@ use poem_ir::{GridRule, ParamLayout, Seam, Spatial};
 const KLEIN: &str = "flux2-klein-4b-bf16-kv-bf16";
 const MINI: &str = "flux2-mini-bf16-kv-bf16";
 
-fn row(sku: &str) -> &'static models::Deployment {
-    models::deployment(sku).unwrap_or_else(|| panic!("this build ships no `{sku}`"))
+fn row(deployment: &str) -> &'static models::Deployment {
+    models::deployment(deployment).unwrap_or_else(|| panic!("this build ships no `{deployment}`"))
 }
 
-fn trace(sku: &str) -> Trace {
-    row(sku).trace(Platform::Cuda)
+fn trace(deployment: &str) -> Trace {
+    row(deployment).trace(Platform::Cuda)
 }
 
 fn reading<'a>(facts: &'a models::Generative, name: &str) -> &'a models::ReadingFact {

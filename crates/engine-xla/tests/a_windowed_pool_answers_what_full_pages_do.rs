@@ -3,7 +3,7 @@
 //! over a prompt longer than the window. One lane is seated by slot (the
 //! pool's ring), one is handed its pages and windowed ids as the runtime
 //! hands them: ids behind the window released to 0 and reused.
-//! Asked for with `PIE_XLA_ARTIFACT` (or `PIE_XLA_SNAPSHOT` + `PIE_XLA_SKU`)
+//! Asked for with `PIE_XLA_ARTIFACT` (or `PIE_XLA_SNAPSHOT` + `PIE_XLA_DEPLOYMENT`)
 //! naming a model with windowed kv rows (Gemma4).
 
 mod common;
@@ -83,11 +83,11 @@ fn answer(m: &common::Model, prompt: &[u32], full_windows: bool) -> Answer {
             std::env::remove_var("PIE_XLA_FULL_WINDOWS");
         }
     }
-    let sku = m.sku;
-    let facts = sku.trace(models::Platform::Xla).facts;
+    let deployment = m.deployment;
+    let facts = deployment.trace(models::Platform::Xla).facts;
     let word = |rows: u32| facts.word(&Request::new(rows, false));
     let mut shell = Shell::load(Boot {
-        trace: sku.trace(Platform::Xla),
+        trace: deployment.trace(Platform::Xla),
         contract: &m.contract,
         checkpoint: &m.checkpoint,
         budget: Budget::new(4, 2 * CHUNK as u32),
@@ -181,7 +181,7 @@ fn a_windowed_pool_answers_what_full_pages_do() {
         eprintln!("not asked: set PIE_XLA_ARTIFACT (a model with windowed kv rows)");
         return;
     };
-    let trace = m.sku.trace(Platform::Xla);
+    let trace = m.deployment.trace(Platform::Xla);
     let window = trace
         .caches
         .iter()
@@ -193,7 +193,7 @@ fn a_windowed_pool_answers_what_full_pages_do() {
     let Some(window) = window else {
         eprintln!(
             "{} declares no windowed kv rows; nothing to compare",
-            m.sku.name
+            m.deployment.name
         );
         return;
     };

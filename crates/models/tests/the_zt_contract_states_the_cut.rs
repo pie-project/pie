@@ -84,7 +84,7 @@ fn state(writer: &mut ztensor::Writer, param: &Param) {
         Dtype::I64 => raw(writer, param, ztensor::Leaf::I64, 8),
         Dtype::E5m2 | Dtype::I16 | Dtype::U64 | Dtype::U16 | Dtype::Bool => {
             panic!(
-                "`{}` is declared {:?}, which no SKU in the catalog stores",
+                "`{}` is declared {:?}, which no deployment in the catalog stores",
                 param.name, param.dtype
             )
         }
@@ -99,7 +99,7 @@ fn state(writer: &mut ztensor::Writer, param: &Param) {
         | Dtype::Ptq1_0
         | Dtype::KvU4 => panic!(
             "`{}` is declared `{}`, which this fixture does not state; a \
-             stored block wants its own bytes and no SKU declares one yet",
+             stored block wants its own bytes and no deployment declares one yet",
             param.name, param.dtype,
         ),
     }
@@ -143,10 +143,10 @@ fn block_axis(param: &Param) -> usize {
 fn stated() -> &'static [Stated] {
     static EVERY: OnceLock<Vec<Stated>> = OnceLock::new();
 
-    EVERY.get_or_init(state_every_sku)
+    EVERY.get_or_init(state_every_deployment)
 }
 
-fn state_every_sku() -> Vec<Stated> {
+fn state_every_deployment() -> Vec<Stated> {
     let dir = scratch();
     let mut out = Vec::new();
 
@@ -399,7 +399,7 @@ fn a_bank_the_checkpoint_ships_unquantized_is_cast_on_the_way_in() {
             .unwrap_or_else(|why| {
                 panic!(
                     "`{name}` refuses a checkpoint that ships its banks unquantized, \
-                 which is the file a runtime-quantizing SKU exists to read: {why}"
+                 which is the file a runtime-quantizing deployment exists to read: {why}"
                 )
             });
         drop(src);

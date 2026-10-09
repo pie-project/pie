@@ -224,12 +224,12 @@ fn a_solid_square_is_named_by_its_colour() {
         eprintln!("not asked: set PIE_XLA_ARTIFACT to a Qwen3.5 vision artifact");
         return;
     };
-    if !m.sku.name.contains("vision") {
-        eprintln!("not asked: {} carries no image tower", m.sku.name);
+    if !m.deployment.name.contains("vision") {
+        eprintln!("not asked: {} carries no image tower", m.deployment.name);
         return;
     }
-    let trace = m.sku.trace(Platform::Xla);
-    let facts = m.sku.trace(models::Platform::Xla).facts;
+    let trace = m.deployment.trace(Platform::Xla);
+    let facts = m.deployment.trace(models::Platform::Xla).facts;
     let word = |len: u32, media: bool| facts.word(&Request::new(len, false).with_media(media));
 
     // The first patch rows (embedding plus position table) and the tower's

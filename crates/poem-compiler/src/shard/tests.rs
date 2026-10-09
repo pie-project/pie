@@ -5,9 +5,9 @@ use poem_ir::{Fault, Platform};
 #[test]
 fn every_split_row_reads_what_it_makes_in_order() {
     let mut broken = Vec::new();
-    for sku in models::splits() {
+    for deployment in models::splits() {
         for platform in [Platform::Cuda, Platform::Metal] {
-            let Err(faults) = poem_ir::check(&sku.trace(platform)) else {
+            let Err(faults) = poem_ir::check(&deployment.trace(platform)) else {
                 continue;
             };
             broken.extend(
@@ -24,7 +24,7 @@ fn every_split_row_reads_what_it_makes_in_order() {
                                 | Fault::OutOfRange { .. }
                         )
                     })
-                    .map(|fault| format!("{} on {platform:?}: {fault}", sku.name)),
+                    .map(|fault| format!("{} on {platform:?}: {fault}", deployment.name)),
             );
         }
     }
@@ -35,9 +35,9 @@ fn every_split_row_reads_what_it_makes_in_order() {
 /// once, right after it, and nothing else is added.
 #[test]
 fn a_split_row_reduces_each_projection_once() {
-    let sku =
+    let deployment =
         models::deployment("qwen35-d0.8b-bf16-kv-bf16-tp2").expect("the catalog ships the row");
-    let trace = sku.trace(Platform::Cuda);
+    let trace = deployment.trace(Platform::Cuda);
     let count = |op: &str| {
         trace
             .nodes

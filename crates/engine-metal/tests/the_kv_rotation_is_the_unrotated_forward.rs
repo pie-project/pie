@@ -291,7 +291,7 @@ fn deviation(off: &[Vec<f32>], on: &[Vec<f32>]) -> (f32, f32, f32) {
 #[test]
 fn the_kv_rotation_is_the_unrotated_forward() {
     // ---- Non-regression / structural check (no device needed): the default
-    // path emits NOT ONE Hadamard, so every shipped SKU is byte-unchanged; the
+    // path emits NOT ONE Hadamard, so every shipped deployment is byte-unchanged; the
     // rotated path emits exactly four per attention layer (q, k, v, o).
     let off_trace = trace_of(
         "qwen3-micro-text",
@@ -309,7 +309,7 @@ fn the_kv_rotation_is_the_unrotated_forward() {
     eprintln!("[trace] rotate_kv=false Hadamard ops = {off_h}; rotate_kv=true = {on_h}");
     assert_eq!(
         off_h, 0,
-        "the default path must emit no Hadamard (byte-unchanged SKUs)"
+        "the default path must emit no Hadamard (byte-unchanged deployments)"
     );
     assert_eq!(
         on_h,

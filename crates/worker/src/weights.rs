@@ -177,7 +177,11 @@ fn pick(dir: &Path, found: Vec<PathBuf>, want: Want<'_>) -> Result<Option<PathBu
         wanted.retain(|(_, parsed)| parsed.as_ref().is_some_and(|it| it.backend == backend));
     }
     if wanted.len() > 1 && want.overrides.is_some() {
-        wanted.retain(|(_, parsed)| parsed.as_ref().is_some_and(|it| want.serves(&it.sku)));
+        wanted.retain(|(_, parsed)| {
+            parsed
+                .as_ref()
+                .is_some_and(|it| want.serves(&it.deployment))
+        });
     }
     if let [(path, _)] = wanted[..] {
         return Ok(Some(path.clone()));

@@ -335,15 +335,15 @@ fn expected_dit_reads(prefix: &str, d: &Dims) -> BTreeMap<String, usize> {
         .collect()
 }
 
-fn check_mini(sku: &str, d: &Dims, src: &ztensor::Source, prefix: &str) {
-    let row = models::deployment(sku).expect("the catalog ships the miniature");
+fn check_mini(deployment: &str, d: &Dims, src: &ztensor::Source, prefix: &str) {
+    let row = models::deployment(deployment).expect("the catalog ships the miniature");
     let contract = row
         .contract(src, Platform::Cuda)
-        .unwrap_or_else(|why| panic!("`{sku}` does not read its checkpoint: {why}"));
+        .unwrap_or_else(|why| panic!("`{deployment}` does not read its checkpoint: {why}"));
     assert_eq!(
         reads(&contract),
         expected_dit_reads(prefix, d),
-        "`{sku}` reads its whole state_dict at the counts the cuts imply"
+        "`{deployment}` reads its whole state_dict at the counts the cuts imply"
     );
     type_checks(&contract, src);
 }
@@ -357,13 +357,13 @@ fn the_wan_2_import_reads_the_ti2v_snapshot_every_case() {
 }
 
 fn each_miniature_reads_a_synthetic_state_dict_bare_and_prefixed() {
-    for (sku, d) in [(D128, Dims::mini_d128()), (NANO, Dims::mini_nano())] {
+    for (deployment, d) in [(D128, Dims::mini_d128()), (NANO, Dims::mini_nano())] {
         for prefix in ["", "dit."] {
             let dir = scratch();
             let tensors = prefixed(prefix, transformer(&d, Leaf::F32));
             assert_eq!(tensors.len(), 69, "the golden's config lists 69 tensors");
             let src = synthetic(&dir, &tensors);
-            check_mini(sku, &d, &src, prefix);
+            check_mini(deployment, &d, &src, prefix);
             drop(src);
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -484,7 +484,7 @@ fn golden(file: &str) -> Option<PathBuf> {
 }
 
 fn each_miniature_reads_its_golden_fixture() {
-    for (sku, d, file) in [
+    for (deployment, d, file) in [
         (D128, Dims::mini_d128(), "wan22_mini_d128.safetensors"),
         (NANO, Dims::mini_nano(), "wan22_mini_nano.safetensors"),
     ] {
@@ -499,7 +499,7 @@ fn each_miniature_reads_its_golden_fixture() {
             .into_iter()
             .map(|(name, ..)| name)
             .collect();
-        assert_eq!(index, want, "`{sku}`'s fixture is its state_dict");
+        assert_eq!(index, want, "`{deployment}`'s fixture is its state_dict");
         for (name, shape, _) in transformer(&d, Leaf::F32) {
             assert_eq!(
                 src.get(&name).unwrap().shape(),
@@ -507,7 +507,7 @@ fn each_miniature_reads_its_golden_fixture() {
                 "`{name}`"
             );
         }
-        check_mini(sku, &d, &src, "");
+        check_mini(deployment, &d, &src, "");
     }
 }
 

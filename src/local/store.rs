@@ -134,7 +134,7 @@ fn read_entry(root: &Path, name: String) -> Option<Entry> {
         name,
         qualified: qualified_name(root),
         siblings: 1,
-        deployment: stamp.as_ref().map(|stamp| stamp.sku.clone()),
+        deployment: stamp.as_ref().map(|stamp| stamp.deployment.clone()),
         backend: stamp.as_ref().map(|stamp| stamp.backend.clone()),
         dir: None,
         bytes: files

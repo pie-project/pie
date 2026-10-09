@@ -1384,28 +1384,28 @@ mod tests {
     }
 }
 
-fn width_free(sku: &str) -> &str {
-    match sku.rsplit_once("-tp") {
+fn width_free(deployment: &str) -> &str {
+    match deployment.rsplit_once("-tp") {
         Some((base, width)) if !width.is_empty() && width.bytes().all(|b| b.is_ascii_digit()) => {
             base
         }
-        _ => sku,
+        _ => deployment,
     }
 }
 
 fn refuse_an_artifact_for_another_deployment(
     path: &std::path::Path,
     backend: &str,
-    sku: &str,
+    deployment: &str,
 ) -> EngineResult<()> {
     let stamp = match checkpoint::file::serve::stamp_of(path) {
         Ok(None) => return Ok(()),
         Ok(Some(stamp)) => stamp,
         Err(why) => return Err(Error::Load(why.to_string())),
     };
-    let deployment = checkpoint::serving::Stamp::of(backend, sku);
+    let wanted = checkpoint::serving::Stamp::of(backend, deployment);
     stamp
-        .check(&deployment)
+        .check(&wanted)
         .map_err(|mismatch| Error::Load(mismatch.refuse(&path.display().to_string())))
 }
 
@@ -1416,12 +1416,12 @@ mod serving_stamp_tests {
     use checkpoint::serving::Stamp;
     use std::collections::BTreeMap;
 
-    fn artifact(dir: &std::path::Path, backend: &str, sku: &str) -> std::path::PathBuf {
-        let path = dir.join(format!("{backend}-{sku}.zt"));
+    fn artifact(dir: &std::path::Path, backend: &str, deployment: &str) -> std::path::PathBuf {
+        let path = dir.join(format!("{backend}-{deployment}.zt"));
         let bytes = vec![7u8; 8192];
         emit::write(
             &path,
-            &Stamp::of(backend, sku),
+            &Stamp::of(backend, deployment),
             &BTreeMap::new(),
             4096,
             &[Object::leaf("embed", vec![8192], ztensor::Leaf::U8, &bytes)],

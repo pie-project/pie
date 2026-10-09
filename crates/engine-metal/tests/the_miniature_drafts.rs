@@ -7,13 +7,13 @@ use engine_metal::{Boot, Lane, Shell};
 use poem::{Platform, Request};
 use poem_compiler::Budget;
 
-const SKU: &str = "dsv4-flash-mini-mtp-u4g64-u2g64-mxfp4-kv-bf16";
+const DEPLOYMENT: &str = "dsv4-flash-mini-mtp-u4g64-u2g64-mxfp4-kv-bf16";
 const PROMPT: &[u32] = &[0, 671, 6102, 294, 8760, 344, 270, 4593, 294];
 const STEPS: usize = 6;
 
-/// The facts the deployment `sku` classifies its lanes by.
-fn facts_of(sku: &str) -> poem_ir::Facts {
-    models::deployment(sku)
+/// The facts the deployment `deployment` classifies its lanes by.
+fn facts_of(deployment: &str) -> poem_ir::Facts {
+    models::deployment(deployment)
         .expect("the catalog ships the row")
         .trace(Platform::Metal)
         .facts
@@ -27,7 +27,7 @@ fn artifact() -> Option<PathBuf> {
 }
 
 fn word(query_len: u32, drafts: bool) -> u64 {
-    facts_of(SKU).word(&Request::new(query_len, false).drafting(drafts))
+    facts_of(DEPLOYMENT).word(&Request::new(query_len, false).drafting(drafts))
 }
 
 fn argmax(logits: &[f32]) -> u32 {
@@ -91,11 +91,12 @@ fn the_draft_head_fires_and_the_trunk_is_unchanged() {
         );
         return;
     };
-    let sku = models::deployment(SKU).expect("the catalog ships the drafting mini row");
-    let trace = sku.trace(Platform::Metal);
+    let deployment =
+        models::deployment(DEPLOYMENT).expect("the catalog ships the drafting mini row");
+    let trace = deployment.trace(Platform::Metal);
     let source = ztensor_compat::index(&artifact).expect("the artifact opens");
     let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Metal)
-        .unwrap_or_else(|why| panic!("the artifact holds every plane of {SKU}: {why}"));
+        .unwrap_or_else(|why| panic!("the artifact holds every plane of {DEPLOYMENT}: {why}"));
     drop(source);
 
     let booted = Instant::now();
@@ -117,7 +118,7 @@ fn the_draft_head_fires_and_the_trunk_is_unchanged() {
     })
     .expect("the drafting shell loads");
     eprintln!(
-        "loaded {SKU} in {:.1}s; drafts advertised: {}",
+        "loaded {DEPLOYMENT} in {:.1}s; drafts advertised: {}",
         booted.elapsed().as_secs_f64(),
         shell.drafts()
     );

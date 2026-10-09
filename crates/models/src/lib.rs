@@ -220,12 +220,12 @@ pub fn fits<'a>(
 
 pub fn identify(src: &ztensor::Source, platform: Platform) -> Result<&'static str, Unmatched> {
     let mut misses: Vec<(&'static str, String)> = Vec::new();
-    for (sku, read) in fits(src, platform) {
+    for (deployment, read) in fits(src, platform) {
         match read {
             Ok(contract) => match requantizes(&contract) {
-                None => return Ok(&sku.name),
+                None => return Ok(&deployment.name),
                 Some(plane) => misses.push((
-                    &sku.name,
+                    &deployment.name,
                     format!(
                         "reads this checkpoint only by re-quantizing `{plane}` from the form \
                          it is stored in; a second quantization is taken by `--deployment`, not by \
@@ -233,7 +233,7 @@ pub fn identify(src: &ztensor::Source, platform: Platform) -> Result<&'static st
                     ),
                 )),
             },
-            Err(why) => misses.push((&sku.name, why.to_string())),
+            Err(why) => misses.push((&deployment.name, why.to_string())),
         }
     }
     Err(Unmatched { misses })
@@ -258,9 +258,9 @@ pub struct Unmatched {
 
 impl std::fmt::Display for Unmatched {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "this checkpoint matches no SKU this build ships")?;
-        for (sku, why) in &self.misses {
-            write!(f, "\n  {sku}: {why}")?;
+        write!(f, "this checkpoint matches no deployment this build ships")?;
+        for (deployment, why) in &self.misses {
+            write!(f, "\n  {deployment}: {why}")?;
         }
         Ok(())
     }

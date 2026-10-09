@@ -1,8 +1,8 @@
 use poem::Platform;
 use poem_ir::{Attention, Operation, Trace};
 
-fn carries_a_head(sku: &str) -> bool {
-    models::published::all().any(|p| p.deployment == sku)
+fn carries_a_head(deployment: &str) -> bool {
+    models::published::all().any(|p| p.deployment == deployment)
 }
 
 fn masked_arms(trace: &Trace) -> usize {
@@ -36,18 +36,19 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
     let mut declaring: Vec<(String, usize)> = Vec::new();
     let mut maskless: Vec<String> = Vec::new();
     for row in models::deployments().chain(models::splits()) {
-        let sku = row.name.as_str();
+        let deployment = row.name.as_str();
         let arms = masked_arms(&row.trace(Platform::Cuda));
         if arms > 0 {
-            declaring.push((sku.to_string(), arms));
+            declaring.push((deployment.to_string(), arms));
         } else {
-            maskless.push(sku.to_string());
+            maskless.push(deployment.to_string());
         }
     }
 
     assert!(
-        declaring.iter().all(|(sku, _)| {
-            DECLARE.iter().any(|family| sku.starts_with(family)) || carries_a_head(sku)
+        declaring.iter().all(|(deployment, _)| {
+            DECLARE.iter().any(|family| deployment.starts_with(family))
+                || carries_a_head(deployment)
         }),
         "a family beyond gemma and qwen declares `attention.masked` from its \
          own text — not from an overlaid drafter head — and the device gates \
@@ -55,14 +56,16 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
     );
     assert!(
         !declaring.is_empty(),
-        "no SKU declares `attention.masked` at all, and then the axis has no \
+        "no deployment declares `attention.masked` at all, and then the axis has no \
          model text to be exercised by"
     );
 
     for family in DECLARE {
         assert!(
-            declaring.iter().any(|(sku, _)| sku.starts_with(family)),
-            "no `{family}*` SKU declares `attention.masked` any more, so the \
+            declaring
+                .iter()
+                .any(|(deployment, _)| deployment.starts_with(family)),
+            "no `{family}*` deployment declares `attention.masked` any more, so the \
              axis lost a family: {declaring:?}"
         );
     }
@@ -70,7 +73,7 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
     for family in GAPPED {
         let grew: Vec<&(String, usize)> = declaring
             .iter()
-            .filter(|(sku, _)| sku.starts_with(family) && !carries_a_head(sku))
+            .filter(|(deployment, _)| deployment.starts_with(family) && !carries_a_head(deployment))
             .collect();
         assert!(
             grew.is_empty(),
@@ -79,14 +82,16 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
              the note and the text now disagree: {grew:?}"
         );
         assert!(
-            maskless.iter().any(|sku| sku.starts_with(family)),
-            "no `{family}*` SKU is in the catalog at all, so this gate asserts \
+            maskless
+                .iter()
+                .any(|deployment| deployment.starts_with(family)),
+            "no `{family}*` deployment is in the catalog at all, so this gate asserts \
              nothing about it"
         );
     }
 
     assert!(
-        maskless.iter().any(|sku| sku == MASKLESS_RIG),
+        maskless.iter().any(|deployment| deployment == MASKLESS_RIG),
         "`{MASKLESS_RIG}` is either gone from the catalog or bakes an \
          `attention.masked` arm, and it is the artifact the maskless rig boots \
          to watch a maskless model refuse a mask — pick another row that is \

@@ -4,7 +4,7 @@ use engine_cuda::{Boot, Shell};
 use poem::Platform;
 use poem_compiler::Budget;
 
-const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
+const DEPLOYMENT: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
 const PAGE: u32 = 16;
 
@@ -54,12 +54,12 @@ fn ready(what: &str) -> Option<Shell> {
         eprintln!("skipping {what}: {checkpoint:?} holds no tensor container");
         return None;
     };
-    let sku = models::deployment(SKU).expect("the catalog ships the SKU");
-    let trace = sku.trace(Platform::Cuda);
+    let deployment = models::deployment(DEPLOYMENT).expect("the catalog ships the deployment");
+    let trace = deployment.trace(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-    let contract = sku
+    let contract = deployment
         .contract(&source, Platform::Cuda)
-        .expect("the SKU's import contract fits its own checkpoint");
+        .expect("the deployment's import contract fits its own checkpoint");
     drop(source);
 
     let shell = Shell::load(Boot {

@@ -20,7 +20,7 @@
   try {
     await loadRuntime(params);
     const summary = await pie.bootLazy(modelUrl, "");
-    log(`booted: ${summary.sku}`);
+    log(`booted: ${summary.deployment}`);
     const { program } = await installInferlet("text-completion");
     log(`installed ${program}`);
 

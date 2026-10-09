@@ -1,6 +1,6 @@
 //! M3c: the Bonsai `d27b` forward wires the online-Hadamard rotation-undo at
 //! exactly the sites the fork rotates, keyed by input width — and every
-//! non-Bonsai SKU is byte-unchanged (no Hadamard appears).
+//! non-Bonsai deployment is byte-unchanged (no Hadamard appears).
 //!
 //! This is a GRAPH-STRUCTURE oracle: it traces the real forward and counts the
 //! `elementwise.hadamard` nodes and the sign bank each one references, then

@@ -482,11 +482,11 @@ mod tests {
     use super::*;
     use crate::experts::{Budgets as Tiers, Plan};
 
-    const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
+    const DEPLOYMENT: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
     fn rig() -> (poem_ir::Trace, poem_compiler::CompiledModel, Plan) {
-        let trace = models::deployment(SKU)
-            .expect("the catalog ships the SKU")
+        let trace = models::deployment(DEPLOYMENT)
+            .expect("the catalog ships the deployment")
             .trace(Platform::Cuda);
         let compiled = compile_axes(
             &trace,

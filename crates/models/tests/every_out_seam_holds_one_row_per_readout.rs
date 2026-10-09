@@ -33,6 +33,6 @@ fn every_out_seam_holds_one_row_per_readout() {
         }
     }
 
-    assert!(seen > 0, "no catalog SKU lands an `out` seam");
+    assert!(seen > 0, "no catalog deployment lands an `out` seam");
     assert!(faults.is_empty(), "\n{}\n", faults.join("\n"));
 }

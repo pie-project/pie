@@ -297,7 +297,7 @@ into an `.npz` under the golden's own key names, and diffs the two with
 `compare.py` at the bf16 gate above.
 
 ```bash
-# the artifact the row serves (the SKU name is `<text>-<weights>-kv-<kv>`)
+# the artifact the row serves (the deployment name is `<text>-<weights>-kv-<kv>`)
 cargo build -p pie --features cuda
 pie model import "$PIE_IMAGEGEN_GOLDEN/mini-dit/" --deployment mini-dit-bf16-kv-bf16 \
     --out ~/.cache/pie-imagegen/mini-dit.zt

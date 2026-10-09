@@ -511,8 +511,8 @@ pub struct ModelConfig {
     #[serde(default = "default_deferred_tier")]
     pub deferred_tier: bool,
     /// The most patch rows one fire may carry, over every image of every lane
-    /// in it. Omit it: a vision SKU derives a ceiling from the checkpoint's
-    /// own shapes, and a text-only SKU wants no ladder at all.
+    /// in it. Omit it: a vision deployment derives a ceiling from the checkpoint's
+    /// own shapes, and a text-only deployment wants no ladder at all.
     /// The patch axis's lane ceiling: the most images one fire may carry.
     /// Omit it, as above; the default is derived from `max_patches`.
     /// The most PORT voxel rows one fire may carry on the third row axis

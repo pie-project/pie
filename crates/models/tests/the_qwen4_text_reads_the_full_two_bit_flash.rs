@@ -1,10 +1,10 @@
-const SKU: &str = "qwen38-flash-next-u4g64-u2g128-kv-bf16";
+const DEPLOYMENT: &str = "qwen38-flash-next-u4g64-u2g128-kv-bf16";
 
 #[test]
 fn the_full_row_emits_the_gather_the_planner_keys_on() {
     use poem::{Attention, Def, Layout, Operation, Platform};
 
-    let trace = models::deployment(SKU)
+    let trace = models::deployment(DEPLOYMENT)
         .expect("this build ships the full 2-bit row")
         .trace(Platform::Metal);
 

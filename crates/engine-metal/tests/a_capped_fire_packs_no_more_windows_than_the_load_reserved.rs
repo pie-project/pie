@@ -53,7 +53,7 @@ fn profile() -> DeviceProfile {
 
 /// The served text, baked for this plane at this deployment's ceilings.
 fn baked(budget: &Budget) -> (Trace, CompiledModel) {
-    // The whole SKU name, not the text it serves: a prefix match also takes
+    // The whole deployment name, not the text it serves: a prefix match also takes
     // the `-eagle` and `-vision` rows, whose names start with this text.
     let trace = models::deployment(SERVED)
         .unwrap_or_else(|| panic!("the catalog no longer ships {SERVED}"))

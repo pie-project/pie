@@ -81,7 +81,7 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
     match runtime::engine::load::identify(&snap, platform) {
         Ok(deployment) => (true, deployment.to_string()),
         Err(_) if pipeline => (false, "(no row)".to_string()),
-        Err(_) => (false, "no SKU".to_string()),
+        Err(_) => (false, "no deployment".to_string()),
     }
 }
 

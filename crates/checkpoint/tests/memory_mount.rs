@@ -19,7 +19,7 @@ fn f32_bytes(vals: &[f32]) -> Vec<u8> {
     vals.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
-const DESCRIPTOR: &[u8] = b"{\"sku\":\"probe\"}";
+const DESCRIPTOR: &[u8] = b"{\"deployment\":\"probe\"}";
 
 fn write_zt(path: &Path, wide: usize) -> (Vec<u8>, Vec<u8>) {
     let a = f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);

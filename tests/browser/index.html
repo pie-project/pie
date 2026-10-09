@@ -115,7 +115,7 @@
       log(`model from ${source}`);
       log(`booted in ${(performance.now() - t1).toFixed(0)} ms: ${JSON.stringify(summary)}`);
       log(`wasm memory: ${((await pie.memoryBytes()) / 1048576).toFixed(0)} MiB`);
-      $("boot-status").textContent = `ready: ${summary.sku ?? ""}`;
+      $("boot-status").textContent = `ready: ${summary.deployment ?? ""}`;
       $("install").disabled = false;
     } catch (e) {
       log(`boot failed: ${e.stack ?? e}`);

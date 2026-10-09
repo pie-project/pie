@@ -13,8 +13,9 @@ const PLATFORMS: [Platform; 4] = [
     Platform::Vulkan,
 ];
 
-fn trace(sku: &str, platform: Platform) -> Trace {
-    let row = models::deployment(sku).unwrap_or_else(|| panic!("this build ships no `{sku}`"));
+fn trace(deployment: &str, platform: Platform) -> Trace {
+    let row = models::deployment(deployment)
+        .unwrap_or_else(|| panic!("this build ships no `{deployment}`"));
     row.trace(platform)
 }
 
@@ -33,9 +34,9 @@ fn last_read(t: &Trace) -> Vec<Option<usize>> {
 
 #[test]
 fn every_wan_2_fold_owns_the_vector_it_folds_into() {
-    for sku in ROWS {
+    for deployment in ROWS {
         for platform in PLATFORMS {
-            let t = trace(sku, platform);
+            let t = trace(deployment, platform);
             let last = last_read(&t);
             let mut pairs = Vec::new();
             let mut folds = 0usize;
@@ -46,7 +47,7 @@ fn every_wan_2_fold_owns_the_vector_it_folds_into() {
                     folds += 1;
                     assert!(
                         last[input as usize] <= Some(j),
-                        "{sku}/{platform:?}: node {j} `{}` folds in place into v{input}, \
+                        "{deployment}/{platform:?}: node {j} `{}` folds in place into v{input}, \
                          which node {:?} reads afterwards — an in-place fold must own \
                          its operand (add to a copy, as `forward::copy_of` does)",
                         node.op.name(),
@@ -56,7 +57,7 @@ fn every_wan_2_fold_owns_the_vector_it_folds_into() {
             }
             assert!(
                 folds > 0,
-                "{sku}/{platform:?}: this plan folds nothing in place, so the claim \
+                "{deployment}/{platform:?}: this plan folds nothing in place, so the claim \
                  is vacuous and the walk above must be wrong"
             );
         }

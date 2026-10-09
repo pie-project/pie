@@ -39,7 +39,7 @@ fn every_probe_is_dumped() {
         std::env::var("PIE_PARITY_OUT"),
     ) else {
         eprintln!(
-            "not asked: set PIE_PARITY_PROBES and PIE_PARITY_OUT, and PIE_PARITY_ARTIFACT or PIE_PARITY_SNAPSHOT + PIE_PARITY_SKU"
+            "not asked: set PIE_PARITY_PROBES and PIE_PARITY_OUT, and PIE_PARITY_ARTIFACT or PIE_PARITY_SNAPSHOT + PIE_PARITY_DEPLOYMENT"
         );
         return;
     };
@@ -54,7 +54,7 @@ fn every_probe_is_dumped() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(512);
 
-    let (snapshot, sku, contract) = match (
+    let (snapshot, deployment, contract) = match (
         std::env::var("PIE_PARITY_ARTIFACT"),
         std::env::var("PIE_PARITY_SNAPSHOT"),
     ) {
@@ -63,22 +63,30 @@ fn every_probe_is_dumped() {
             let stamp = checkpoint::file::serve::stamp_of(&artifact)
                 .expect("the artifact reads")
                 .expect("the artifact carries a serving stamp");
-            let sku =
-                models::deployment(&stamp.sku).unwrap_or_else(|| panic!("no SKU {}", stamp.sku));
-            let trace = sku.trace(Platform::Cuda);
+            let deployment = models::deployment(&stamp.deployment)
+                .unwrap_or_else(|| panic!("no deployment {}", stamp.deployment));
+            let trace = deployment.trace(Platform::Cuda);
             let source = ztensor_compat::index(&artifact).expect("the artifact opens");
-            let contract =
-                poem::import::own_contract(&source, &trace.params, sku.deploy.tp, Platform::Cuda)
-                    .unwrap_or_else(|why| {
-                        panic!("the artifact holds every plane of {}: {why}", sku.name)
-                    });
-            (artifact, sku, contract)
+            let contract = poem::import::own_contract(
+                &source,
+                &trace.params,
+                deployment.deploy.tp,
+                Platform::Cuda,
+            )
+            .unwrap_or_else(|why| {
+                panic!(
+                    "the artifact holds every plane of {}: {why}",
+                    deployment.name
+                )
+            });
+            (artifact, deployment, contract)
         }
         (_, Ok(snapshot)) => {
             let snapshot = PathBuf::from(snapshot);
-            let name = std::env::var("PIE_PARITY_SKU")
-                .expect("PIE_PARITY_SKU names the row that reads the snapshot");
-            let sku = models::deployment(&name).unwrap_or_else(|| panic!("no SKU {name}"));
+            let name = std::env::var("PIE_PARITY_DEPLOYMENT")
+                .expect("PIE_PARITY_DEPLOYMENT names the row that reads the snapshot");
+            let deployment =
+                models::deployment(&name).unwrap_or_else(|| panic!("no deployment {name}"));
             let mut shards: Vec<PathBuf> = if snapshot.is_dir() {
                 std::fs::read_dir(&snapshot)
                     .expect("the snapshot lists")
@@ -93,18 +101,20 @@ fn every_probe_is_dumped() {
             };
             shards.sort();
             let source = ztensor_compat::index_all(&shards).expect("the snapshot opens");
-            let contract = sku
+            let contract = deployment
                 .contract(&source, Platform::Cuda)
                 .unwrap_or_else(|why| panic!("{name}'s import reads the snapshot: {why}"));
-            (snapshot, sku, contract)
+            (snapshot, deployment, contract)
         }
         _ => {
-            eprintln!("not asked: set PIE_PARITY_ARTIFACT or PIE_PARITY_SNAPSHOT + PIE_PARITY_SKU");
+            eprintln!(
+                "not asked: set PIE_PARITY_ARTIFACT or PIE_PARITY_SNAPSHOT + PIE_PARITY_DEPLOYMENT"
+            );
             return;
         }
     };
-    let trace = sku.trace(Platform::Cuda);
-    let facts = sku.trace(models::Platform::Cuda).facts;
+    let trace = deployment.trace(Platform::Cuda);
+    let facts = deployment.trace(models::Platform::Cuda).facts;
     let word = |query_len: u32| facts.word(&Request::new(query_len, false));
     let budget = |key: &str| -> Option<u64> {
         let text = std::env::var(key).ok()?;
@@ -161,7 +171,7 @@ fn every_probe_is_dumped() {
     .expect("the shell loads");
     eprintln!(
         "loaded {} in {:.1}s",
-        sku.name,
+        deployment.name,
         booted.elapsed().as_secs_f64()
     );
 

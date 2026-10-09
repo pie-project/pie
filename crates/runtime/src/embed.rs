@@ -144,7 +144,7 @@ pub fn load(
         }
         None => {
             let deployment = checkpoint::file::serve::stamp_of(artifact)?
-                .map(|stamp| stamp.sku)
+                .map(|stamp| stamp.deployment)
                 .ok_or_else(|| anyhow!("{} carries no serving stamp", artifact.display()))?;
             (
                 Vec::new(),

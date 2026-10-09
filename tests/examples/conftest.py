@@ -126,7 +126,7 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
     # cuda shell's recorded path — `cudaGraphSetConditional` wants an rdc +
     # cudadevrt link stage this crate does not have — and the MTP draft head is
     # the catalog's one conditional (`poem-compiler`'s
-    # `which_skus_get_a_conditional`: "the MTP head and nothing else"). Eager
+    # `which_deployments_get_a_conditional`: "the MTP head and nothing else"). Eager
     # is slow and correct, so a gate about a draft head can ask for it and say
     # in its own header that it did.
     parser.add_argument("--graphs", default=None, choices=["on", "off", "shaped"],
@@ -312,7 +312,7 @@ def parser_default_model() -> str:
 
 
 def _served_model_from_local_config() -> str | None:
-    """`[model] model` (or `sku`'s model) of the pie config a local server
+    """`[model] model` (or `deployment`'s model) of the pie config a local server
     was started from, or `None` when there is no such file."""
     import os
     import tomllib

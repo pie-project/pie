@@ -230,9 +230,9 @@ def v_head_reorder_rows(prefix, heads, width, k_heads, rep):
 
 def gguf(m, reads):
     if m.tower != None:
-        fail("this SKU declares a vision tower and no GGUF spelling of one is settled; import it from the safetensors checkpoint")
+        fail("this deployment declares a vision tower and no GGUF spelling of one is settled; import it from the safetensors checkpoint")
     if m.mtp != None:
-        fail("this SKU declares an MTP draft head and no GGUF spelling of one is settled; import it from the safetensors checkpoint")
+        fail("this deployment declares an MTP draft head and no GGUF spelling of one is settled; import it from the safetensors checkpoint")
     minus_one = lambda e: e.bias(-1.0)
     # Ternary-Bonsai's GGUF stores the GDN v-heads tiled; the reads reorder
     # every v-head-indexed tensor to the block order the scan pairs by.

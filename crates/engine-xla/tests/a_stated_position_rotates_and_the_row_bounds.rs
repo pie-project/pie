@@ -9,7 +9,7 @@
 //! fire (the causal end past the lane's capacity), and a decode stated
 //! behind its row would stop short of its own key.
 //!
-//! Asked for with `PIE_XLA_ARTIFACT` (or `PIE_XLA_SNAPSHOT` + `PIE_XLA_SKU`)
+//! Asked for with `PIE_XLA_ARTIFACT` (or `PIE_XLA_SNAPSHOT` + `PIE_XLA_DEPLOYMENT`)
 //! naming a text model.
 
 mod common;
@@ -30,11 +30,11 @@ fn worst(a: &[f32], b: &[f32]) -> f32 {
 #[test]
 fn a_prompt_stated_ahead_of_its_rows_reads_what_it_reads_at_them() {
     let Some(m) = common::model() else {
-        eprintln!("not asked: set PIE_XLA_ARTIFACT or PIE_XLA_SNAPSHOT + PIE_XLA_SKU");
+        eprintln!("not asked: set PIE_XLA_ARTIFACT or PIE_XLA_SNAPSHOT + PIE_XLA_DEPLOYMENT");
         return;
     };
-    let trace = m.sku.trace(Platform::Xla);
-    let facts = m.sku.trace(models::Platform::Xla).facts;
+    let trace = m.deployment.trace(Platform::Xla);
+    let facts = m.deployment.trace(models::Platform::Xla).facts;
     let word = |len: u32| facts.word(&Request::new(len, false));
     let prompt =
         common::tokenizer(&m).encode("The capital of France is Paris, and the capital of Italy is");
@@ -52,7 +52,7 @@ fn a_prompt_stated_ahead_of_its_rows_reads_what_it_reads_at_them() {
         pages: 2 * context / 16,
         device: &DeviceBoot::default(),
         patches: m
-            .sku
+            .deployment
             .name
             .contains("vision")
             .then(|| PatchLadder::new(256, 1)),
@@ -97,7 +97,7 @@ fn a_prompt_stated_ahead_of_its_rows_reads_what_it_reads_at_them() {
     );
     eprintln!(
         "{}: stated {SHIFT} ahead, prefill max |Δlogit| {p}, decode {d}",
-        m.sku.name
+        m.deployment.name
     );
     // Rounding only: the rotations differ in their f32 angles.
     assert!(
