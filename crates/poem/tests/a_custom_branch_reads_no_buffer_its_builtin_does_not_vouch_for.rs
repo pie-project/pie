@@ -47,7 +47,7 @@ fn a_custom_branch_reads_no_buffer_its_builtin_does_not_vouch_for() {
     let why = traces(fact::scores).expect_err("a flag alone does not vouch for adapter routes");
     assert!(why.contains("reads Adapted input"), "{why}");
     assert!(
-        why.contains("fact::has(fact::Adapter)"),
+        why.contains("fact.has(fact.Adapter)"),
         "and names the fact that would: {why}"
     );
 
