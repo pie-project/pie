@@ -154,6 +154,11 @@ const TURN_DEADLINE: Duration = Duration::from_secs(240);
 /// for its connection to close before moving on.
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
 
+/// How long the embedded controller waits for a heartbeat before it
+/// evicts a node: longer than any suspension an app comes back from (see
+/// `boot_engine`).
+const EMBEDDED_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
 /// Tracing filter when `RUST_LOG` is unset. tarpc logs every RPC at INFO,
 /// which would flood the app's log mirror of stderr.
 const DEFAULT_LOG_FILTER: &str = "info,tarpc=warn";
@@ -566,10 +571,21 @@ fn boot_engine(config_path: &str) -> Result<EngineGlobals> {
     install_tracing();
     let content = std::fs::read_to_string(config_path)
         .with_context(|| format!("reading config {config_path}"))?;
-    let (controller, gateway, mut worker) = pie::derive::derive_standalone(&content)?;
+    let (mut controller, gateway, mut worker) = pie::derive::derive_standalone(&content)?;
     // Port 0: the OS picks a free loopback port, so a port left bound by
     // an earlier process can never block the boot.
     worker.server.port = 0;
+    // The controller evicts a node whose heartbeats stop for the heartbeat
+    // timeout, and a worker it has evicted aborts the process to be
+    // restarted by its supervisor. Here the controller and the worker live
+    // in one process that iOS suspends whole whenever the app is in the
+    // background: every heartbeat stops at once, and on resume the
+    // controller's eviction tick and the worker's next heartbeat race. When
+    // the tick wins, the worker is evicted and the app dies the moment the
+    // user comes back to it. Nothing in this process can be partitioned
+    // from the rest, so eviction only ever reflects a suspension; it is
+    // pushed out of reach.
+    controller.heartbeat_timeout = EMBEDDED_HEARTBEAT_TIMEOUT;
     // The runtime a worker daemon gets (worker::serve::build_runtime),
     // sized from [server] worker_threads.
     let runtime = tokio::runtime::Builder::new_multi_thread()

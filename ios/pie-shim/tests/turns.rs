@@ -204,7 +204,14 @@ fn turns_stream_cancel_and_think() {
     // the partial reply. It must adopt the prefix the cancelled turn
     // published and answer exactly as the same transcript is answered in a
     // conversation whose first reply ran to completion.
-    let question = "Describe the city of Paris in a few sentences.";
+    // The inferlet's default system prompt asks for a sentence or two, too
+    // short to cancel partway; this one asks for a long reply, and is long
+    // enough itself that the prompt spans whole KV pages to publish.
+    let system = "You are a knowledgeable travel writer. Answer every question in \
+                  detail, in several paragraphs, covering history, geography, \
+                  culture, food and the experience of visiting, and never stop \
+                  after a single sentence.";
+    let question = "Describe the city of Paris.";
     let (spoke, partway) = mpsc::channel();
     let barged = std::thread::spawn({
         let (config, wasm) = (config.clone(), wasm.clone());
@@ -213,7 +220,7 @@ fn turns_stream_cancel_and_think() {
                 &config,
                 &wasm,
                 6,
-                &greedy("f-barged", &[("user", question)], 200),
+                &greedy("f-barged", &[("system", system), ("user", question)], 200),
                 Some((BARGE_AFTER_CHUNKS, spoke)),
             )
         }
@@ -232,13 +239,18 @@ fn turns_stream_cancel_and_think() {
         &config,
         &wasm,
         7,
-        &greedy("f-completed", &[("user", question)], 200),
+        &greedy(
+            "f-completed",
+            &[("system", system), ("user", question)],
+            200,
+        ),
         None,
     );
     completed.report("(f) the same turn, run to completion in another conversation");
     assert!(!str_field(&completed.json(), "text").is_empty());
 
     let next_turn = [
+        ("system", system),
         ("user", question),
         ("assistant", partial),
         ("user", "Which country is it the capital of?"),
@@ -266,7 +278,59 @@ fn turns_stream_cancel_and_think() {
         str_field(&after_completion, "text")
     );
 
+    // (g) Coming back after iOS suspended the app. A suspended app's
+    // threads all stop, the embedded controller's and the worker's alike,
+    // so on resume the worker's last heartbeat looks long expired, and
+    // whether the controller's eviction tick or the worker's heartbeat runs
+    // first decides whether the worker is evicted. Stopping the whole
+    // process with SIGSTOP for longer than a heartbeat timeout is the same
+    // thing on this Mac; it is done several times so the race is lost at
+    // least once, and the engine must answer after every one.
+    for round in 0..SUSPENSIONS {
+        suspend_self(SUSPENSION);
+        std::thread::sleep(AFTER_RESUME);
+        let resumed = run(
+            &config,
+            &wasm,
+            10 + round,
+            &greedy(
+                "g-resumed",
+                &[("user", "What is the capital of Italy?")],
+                40,
+            ),
+            None,
+        );
+        resumed.report("(g) the turn after a suspension");
+        assert!(!str_field(&resumed.json(), "text").is_empty());
+    }
+
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Longer than the controller's default heartbeat timeout (8 s).
+const SUSPENSION: Duration = Duration::from_secs(12);
+
+/// How many suspensions step (g) survives.
+const SUSPENSIONS: u64 = 4;
+
+/// Enough controller ticks and worker heartbeats after a resume for an
+/// eviction, had there been one, to have reached the worker.
+const AFTER_RESUME: Duration = Duration::from_secs(6);
+
+/// Stops this process for `duration`, the way iOS suspends an app in the
+/// background: a helper shell sends SIGSTOP, waits, then SIGCONT.
+fn suspend_self(duration: Duration) {
+    let pid = std::process::id();
+    let script = format!(
+        "kill -STOP {pid}; sleep {}; kill -CONT {pid}",
+        duration.as_secs()
+    );
+    let mut helper = std::process::Command::new("sh")
+        .args(["-c", &script])
+        .spawn()
+        .expect("spawn the suspension helper");
+    // Execution stops somewhere in here and resumes after `duration`.
+    helper.wait().expect("wait for the suspension helper");
 }
 
 /// Everything one turn streamed and returned.
