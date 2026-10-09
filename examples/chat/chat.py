@@ -124,7 +124,7 @@ _BODY = {2: "▐▟▙▙▙▛▌", 3: "▜██▄██▛"}  # the half blo
 # (row, column, character) for each bubble, per frame. Bubble A rises in column 8 and bubble B in
 # column 9, starting two frames later; each moves one row up per frame and then vanishes.
 _BUBBLES = [
-    [(3, 8, "▖")],
+    [(3, 8, "▘")],  # upper-left quadrant: half a character higher than before
     [(2, 8, "▖")],
     [(1, 8, "▖"), (3, 9, "▘")],
     [(0, 8, "▖"), (2, 9, "▘")],
