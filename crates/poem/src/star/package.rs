@@ -92,7 +92,7 @@ fn base() -> GlobalsBuilder {
 /// records the one its package was imported under, and a build serves it only
 /// at the same one: a package is code, and code written against other
 /// builtins does not mean what it meant.
-pub const API: u32 = 2;
+pub const API: u32 = 1;
 
 /// The attribute prefix an artifact carries its package under.
 pub const ATTRIBUTE: &str = "pie.package/";

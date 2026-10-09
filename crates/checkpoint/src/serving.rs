@@ -167,7 +167,7 @@ impl Stamp {
         Ok(Stamp {
             serving: PROFILE.to_string(),
             backend: required_text(attributes, Field::Backend)?.to_string(),
-            deployment: deployment_of(attributes)?.to_string(),
+            deployment: required_text(attributes, Field::Deployment)?.to_string(),
             layout_revision: required_uint(attributes, Field::LayoutRevision)?,
             adapters_zeroed,
         })
@@ -612,21 +612,6 @@ fn malformed(field: Field, why: &str) -> Error {
     Error::Checkpoint(format!("the serving artifact's `{PROFILE}` {field} {why}"))
 }
 
-/// The key an artifact stamped before deployments were named so states its
-/// deployment under.
-const LEGACY_DEPLOYMENT: &str = "sku";
-
-fn deployment_of(attributes: &Value) -> Result<&str, Error> {
-    match (
-        attributes.get(Field::Deployment.key()),
-        attributes.get(LEGACY_DEPLOYMENT),
-    ) {
-        (None, Some(Value::Text(it))) => Ok(it),
-        (None, Some(_)) => Err(malformed(Field::Deployment, "is not text")),
-        _ => required_text(attributes, Field::Deployment),
-    }
-}
-
 fn required_text(attributes: &Value, field: Field) -> Result<&str, Error> {
     match attributes.get(field.key()) {
         Some(Value::Text(it)) => Ok(it),
@@ -645,28 +630,4 @@ fn required_uint(attributes: &Value, field: Field) -> Result<u64, Error> {
 
 fn gcd_of(a: u64, b: u64) -> u64 {
     if b == 0 { a } else { gcd_of(b, a % b) }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// An artifact stamped before deployments were named so states its
-    /// deployment under `sku`, and still reads back as the one it serves.
-    #[test]
-    fn a_stamp_written_under_the_old_key_reads_back() {
-        let stamp = Stamp::of("cuda", "qwen35-d0.8b-bf16-kv-bf16");
-        let Value::Map(mut profile) = stamp.encode() else {
-            unreachable!("a stamp encodes as a map");
-        };
-        let Value::Map(fields) = &mut profile[0].1 else {
-            unreachable!("its profile is a map");
-        };
-        for (key, _) in fields.iter_mut() {
-            if *key == text(Field::Deployment.key()) {
-                *key = text(LEGACY_DEPLOYMENT);
-            }
-        }
-        assert_eq!(Stamp::decode(&Value::Map(profile)).unwrap(), stamp);
-    }
 }

@@ -55,7 +55,6 @@ pub enum Expr {
     Shard {
         src: Box<Expr>,
         axis: Axis,
-        #[serde(default = "one", skip_serializing_if = "is_one")]
         replicas: u32,
     },
     SrcIndexed(String),
@@ -281,15 +280,6 @@ impl Partition {
             world: self.world.max(1) / replicas,
         })
     }
-}
-
-fn one() -> u32 {
-    1
-}
-
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_one(n: &u32) -> bool {
-    *n == 1
 }
 
 impl Default for Partition {

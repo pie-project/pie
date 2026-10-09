@@ -57,7 +57,6 @@ pub enum Shard {
         /// a segment of fewer heads than ranks is copied to each rank of a
         /// group rather than cut mid-head. Empty when the ranks cut each
         /// segment evenly.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         heads: Vec<u64>,
     },
 }
