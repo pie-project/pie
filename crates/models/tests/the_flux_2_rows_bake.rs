@@ -133,7 +133,7 @@ fn the_denoise_ports_are_the_ones_the_facts_declare() {
         );
         assert_eq!(denoise.readout, ReadoutKind::Velocity);
         assert_eq!(denoise.readout_width, model::IN_CHANNELS);
-        let names: Vec<&str> = denoise.ports.iter().map(|p| p.name).collect();
+        let names: Vec<&str> = denoise.ports.iter().map(|p| p.name.as_str()).collect();
         let want: Vec<&str> = if guidance {
             vec!["latents", "context", "timestep", "guidance", "positions"]
         } else {
@@ -212,7 +212,11 @@ fn the_denoise_ports_are_the_ones_the_facts_declare() {
     }
 
     let klein = row(KLEIN).generative.as_ref().unwrap();
-    let names: Vec<(&str, u8)> = klein.readings.iter().map(|r| (r.name, r.index)).collect();
+    let names: Vec<(&str, u8)> = klein
+        .readings
+        .iter()
+        .map(|r| (r.name.as_str(), r.index))
+        .collect();
     assert_eq!(
         names,
         vec![

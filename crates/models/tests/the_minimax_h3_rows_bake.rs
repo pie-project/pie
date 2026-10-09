@@ -175,7 +175,7 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
         );
         for reading in &facts.readings {
             for (positional, port) in reading.ports_indexed() {
-                let (by_name, _) = reading.port(port.name).expect("a declared port by name");
+                let (by_name, _) = reading.port(&port.name).expect("a declared port by name");
                 assert_eq!(
                     by_name, positional,
                     "`{deployment}` reading `{}` port `{}`: the positional index and the stated one",
@@ -224,7 +224,7 @@ fn lanes(deployment: &str) -> Vec<(&'static str, u8, Stream)> {
             };
             streams
                 .into_iter()
-                .map(move |stream| (reading.name, reading.index, stream))
+                .map(move |stream| (reading.name.as_str(), reading.index, stream))
         })
         .collect()
 }
@@ -464,7 +464,7 @@ fn the_generative_facts_state_the_readings_the_latent_and_two_shifts() {
                 reading.name
             );
         }
-        let names: Vec<&str> = facts.readings.iter().map(|r| r.name).collect();
+        let names: Vec<&str> = facts.readings.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
             names,
             if is_flagship(deployment) {

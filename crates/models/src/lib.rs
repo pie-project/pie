@@ -8,10 +8,7 @@ pub mod gpt_oss;
 pub mod hunyuan_image_3;
 pub mod inkling;
 pub mod kimi_k3;
-pub mod ltx_2;
 pub mod media;
-pub mod mini_dit;
-pub mod minimax_h3;
 pub mod muse_glimmer;
 pub mod published;
 pub mod qwen_3;
@@ -20,7 +17,6 @@ pub mod star;
 pub mod template;
 pub mod tokenizer;
 pub mod wan_2;
-pub mod z_image;
 
 use std::sync::LazyLock;
 

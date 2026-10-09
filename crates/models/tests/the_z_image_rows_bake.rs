@@ -53,7 +53,7 @@ fn lanes(deployment: &str) -> Vec<(&'static str, u8, Stream)> {
             reading
                 .streams
                 .iter()
-                .map(move |stream| (reading.name, reading.index, *stream))
+                .map(move |stream| (reading.name.as_str(), reading.index, *stream))
         })
         .collect()
 }
@@ -582,7 +582,7 @@ fn every_row_bakes() {
 fn the_generative_facts_state_the_readings_the_schedule_and_the_latent_space() {
     for deployment in ROWS {
         let facts = row(deployment).generative.as_ref().expect("facts");
-        let names: Vec<&str> = facts.readings.iter().map(|r| r.name).collect();
+        let names: Vec<&str> = facts.readings.iter().map(|r| r.name.as_str()).collect();
         let want: Vec<&str> = if deployment == TURBO {
             vec!["text", "refine", "denoise", "vae.decode", "vae.encode"]
         } else {

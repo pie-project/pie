@@ -41,7 +41,7 @@ fn the_flux_2_vae_bakes_every_case() {
 
 fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
     let facts = row(KLEIN).generative.as_ref().expect("facts");
-    let names: Vec<&str> = facts.readings.iter().map(|r| r.name).collect();
+    let names: Vec<&str> = facts.readings.iter().map(|r| r.name.as_str()).collect();
     assert_eq!(names, vec!["text", "denoise", "vae.decode", "vae.encode"]);
     let decode = reading(facts, "vae.decode");
     let encode = reading(facts, "vae.encode");
@@ -55,7 +55,7 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
     }
     assert_eq!(
         (
-            decode.ports[0].name,
+            decode.ports[0].name.as_str(),
             decode.ports[0].width,
             decode.readout_width
         ),
@@ -63,7 +63,7 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
     );
     assert_eq!(
         (
-            encode.ports[0].name,
+            encode.ports[0].name.as_str(),
             encode.ports[0].width,
             encode.readout_width
         ),
@@ -282,7 +282,7 @@ fn each_vae_lane_has_a_class_of_its_own() {
     let facts = row(KLEIN).generative.as_ref().expect("facts");
     let class_of = |name: &str, stream: Stream| {
         let r = reading(facts, name);
-        let request = Request::new(4, false).on_stream(stream).in_reading(r.name);
+        let request = Request::new(4, false).on_stream(stream).in_reading(&r.name);
         let word = plan.facts.word(&request);
         classes
             .class_of(word & classes.mask)

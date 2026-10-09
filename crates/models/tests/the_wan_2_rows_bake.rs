@@ -254,12 +254,12 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
             for &stream in &reading.streams {
                 let request = Request::new(4, false)
                     .on_stream(stream)
-                    .in_reading(reading.name);
+                    .in_reading(&reading.name);
                 let w = plan.facts.word(&request);
                 let class = classes.class_of(w & classes.mask).unwrap_or_else(|| {
                     panic!("{deployment}: `{}`/{stream:?} has no class", reading.name)
                 });
-                seen.push(((reading.name, stream), class));
+                seen.push(((reading.name.as_str(), stream), class));
             }
         }
         let distinct: BTreeSet<usize> = seen.iter().map(|(_, class)| *class).collect();
@@ -467,7 +467,7 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
         for (at, reading) in facts.readings.iter().enumerate() {
             assert_eq!(usize::from(reading.index), at, "{deployment}: dense from 0");
         }
-        let names: Vec<&str> = facts.readings.iter().map(|r| r.name).collect();
+        let names: Vec<&str> = facts.readings.iter().map(|r| r.name.as_str()).collect();
         if is_flagship(deployment) {
             assert_eq!(
                 names,

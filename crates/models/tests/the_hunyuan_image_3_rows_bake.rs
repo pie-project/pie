@@ -426,7 +426,7 @@ fn both_fact_columns_state_what_the_trace_does() {
                 "{deployment}: the 2-D nesting is the family's"
             );
         }
-        let names: Vec<&str> = facts.readings.iter().map(|r| r.name).collect();
+        let names: Vec<&str> = facts.readings.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["encode", "denoise", "image.in", "image.out"]);
         let encode = &facts.readings[usize::from(ENCODE)];
         assert!(encode.has_kv && encode.takes_tokens, "{deployment}");
