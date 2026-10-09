@@ -66,7 +66,7 @@ lanes, the share of the GPU working set), sized for a phone by default.
 ## Build
 
 ```bash
-./build-xcframework.sh        # the Rust core → build/PieServerCore.xcframework (iOS, iOS simulator, macOS; arm64)
+./build-xcframework.sh        # ../c → build/PieServerCore.xcframework (iOS, iOS simulator, macOS; arm64)
 ../../scripts/build-languages.sh                      # the language components → Sources/PieLanguage*/Resources
 swift test                                            # protocol and configuration, no GPU
 swift run -c release pie-smoke <model.zt> "prompt"   # end to end on a Mac (or ws://host:port)
@@ -74,8 +74,8 @@ PIE_SCRIPT=../../examples/quickstart-py/main.py swift run -c release pie-smoke <
 PIE_LISTEN=127.0.0.1:8080 swift run -c release pie-smoke <model.zt> "prompt"   # the turn through its own gateway
 ```
 
-`core/` is the Rust core (`pie-swift-core`, a workspace member) behind
-`core/include/pie_server.h`; anything that speaks C can link it the same way.
+`PieServerCore` is `../c`, pie's C library (`libpie`, `include/pie.h`),
+built for each Apple slice: iOS, iOS simulator and macOS.
 
 ## Limits
 
