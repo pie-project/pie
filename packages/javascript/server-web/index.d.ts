@@ -56,7 +56,14 @@ export class Server {
   readonly summary: BootSummary;
   readonly url: string;
   readonly running: boolean;
-  installLanguage(language: "python" | "javascript" | string, source: Uint8Array | ArrayBuffer | URL | string): Promise<string>;
+  /** `precompiled` is the same component from `precompileComponent` (the
+   * `precompile` entry point) on this same build; it spares the first
+   * script inferlet compiling the component, which takes seconds in a tab. */
+  installLanguage(
+    language: "python" | "javascript" | string,
+    source: Uint8Array | ArrayBuffer | URL | string,
+    options?: { precompiled?: Uint8Array | ArrayBuffer | URL | string },
+  ): Promise<string>;
   install(source: Uint8Array | ArrayBuffer | URL | string, file?: string | null, version?: string | null): Promise<string>;
   connect(): Promise<PieClient>;
   memoryBytes(): Promise<number>;
