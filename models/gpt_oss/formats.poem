@@ -1,26 +1,25 @@
-# How a gpt-oss checkpoint is laid out. transformers and mlx_lm share every
-# name; the experts' codes tell them apart, bytes under transformers and
-# words under mlx_lm.
+# How a gpt-oss checkpoint is laid out. transformers banks each layer's
+# experts as `gate_up_proj_blocks` bytes; mlx_lm splits them into
+# `gate_proj`/`up_proj`/`down_proj` words.
 
 load("//lib/dflash/formats.poem", "bind_aux")
 
-PROBE = "model.layers.0.mlp.experts.gate_up_proj_blocks"
 TRANSFORMERS = dtype.u8
 MLX = dtype.u32
 BANK_ROWS = 1
 
 def formats(m):
-    codes = lambda want: lambda checkpoint: has(PROBE) and stored(PROBE) == raw(want)
+    codes = lambda probe, want: lambda checkpoint: has(probe) and stored(probe) == raw(want)
     return [
         format(
             "transformers",
-            recognizes = codes(TRANSFORMERS),
+            recognizes = codes("model.layers.0.mlp.experts.gate_up_proj_blocks", TRANSFORMERS),
             read = lambda reads: read(m, reads, TRANSFORMERS),
             states = configured(m),
         ),
         format(
             "mlx_lm",
-            recognizes = codes(MLX),
+            recognizes = codes("model.layers.0.mlp.experts.gate_proj.weight", MLX),
             read = lambda reads: read(m, reads, MLX),
             states = configured(m),
         ),
