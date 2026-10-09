@@ -31,11 +31,14 @@ def formats(m):
 # The flash mlx spelling.
 # ---------------------------------------------------------------------------
 
+# A read the mlx spelling makes: `weight` from the one tensor `names`
+# holds, or joined along `axis` from several.
+
 def one(w, name):
-    return ("one", w, 0, [name])
+    return struct(weight = w, names = [name], axis = None)
 
 def joined(w, axis, names):
-    return ("concat", w, axis, names)
+    return struct(weight = w, names = names, axis = axis)
 
 def layer_reads(w, n, reads):
     for mix, tag in [(w.attn_mix, "attn_hc"), (w.mlp_mix, "ffn_hc")]:
@@ -130,28 +133,26 @@ def concat_expr(m, w, axis, names):
     ]
     return concat(axis, parts)
 
+def land(m, reads, r):
+    if r.axis == None:
+        reads.read(r.weight, r.names[0])
+    elif r.weight.dtype in AFFINE:
+        reads.read_concat(r.weight, r.names)
+    else:
+        reads.read_expr(r.weight, concat_expr(m, r.weight, r.axis, r.names))
+
 def flash_mlx(m, reads):
-    for kind, w, axis, names in mlx_reads(m):
-        if kind == "one":
-            reads.read(w, names[0])
-        elif w.dtype in AFFINE:
-            reads.read_concat(w, names)
-        else:
-            reads.read_expr(w, concat_expr(m, w, axis, names))
+    for r in mlx_reads(m):
+        land(m, reads, r)
 
 def own_with_aux(m, reads):
     if m.mtp == None:
         fail("this row declares no draft head, so there is no overlay to land on an artifact")
-    is_aux = lambda name: name.startswith("aux.")
-    for kind, w, axis, names in mlx_reads(m):
-        if kind == "one" and is_aux(names[0]):
-            reads.read(w, names[0])
-        elif kind == "concat" and all([is_aux(n) for n in names]) and w.dtype in AFFINE:
-            reads.read_concat(w, names)
-        elif kind == "concat" and all([is_aux(n) for n in names]):
-            reads.read_expr(w, concat_expr(m, w, axis, names))
+    for r in mlx_reads(m):
+        if all([name.startswith("aux.") for name in r.names]):
+            land(m, reads, r)
         else:
-            reads.read_own(w)
+            reads.read_own(r.weight)
 
 # ---------------------------------------------------------------------------
 # V4.1-Flash.
@@ -232,7 +233,6 @@ def v41(m, reads, mlx):
             reads.read(ix.weights_proj, n("attn.indexer.weights_proj.weight"))
             if ix.wk != None:
                 reads.read(ix.wk, n("attn.indexer.wk.weight"))
-            if ix.k_norm != None:
                 reads.read(ix.k_norm, n("attn.indexer.k_norm.weight"))
 
         f = w.mlp

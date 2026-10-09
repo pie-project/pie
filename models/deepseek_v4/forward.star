@@ -23,6 +23,14 @@ def caches(m, c):
         at = m.mtp.block.attn
         c.kv(kv, at.kv, [at.kv_down.shape[0]], m.head_dim, heads = at.kv_down.cut_axis != None)
 
+# The dtype the forward computes in on every deployment.
+ACT = dtype.bf16
+
+# What a layer leaves the next: the last sublayer's input mix (under
+# Single-Pass mHC the next sublayer reads its input through it) and the
+# last selection an indexer ranked (a CSA2 Reuse Mode layer reads it).
+NO_TRAIL = struct(mix = None, selection = None)
+
 def kv_heads(m):
     if not m.layers:
         return m.heads
@@ -35,65 +43,68 @@ def forward(m, inputs):
     hy = m.hyper
     positions = inputs.positions()
     kvh = kv_heads(m)
-    plan_p = ops.attn.plan_prefill(inputs, m.heads, kvh, m.head_dim, m.window)
+    plan = ops.attn.plan_prefill(inputs, m.heads, kvh, m.head_dim, m.window)
     ids = inputs.tokens()
     streams = ops.elemwise.hc_expand(ops.layout.embed(ids, m.embed, m.vocab), hy.streams)
+    adapters = inputs.adapter_routes()
+    rows = struct(inputs = inputs, plan = plan, positions = positions, ids = ids, adapters = adapters, kv_heads = kvh)
 
-    adapter_routes = inputs.adapter_routes()
-    carry = {"mix": None, "selection": None}
-
-    def block(l, w, streams):
+    def block(l, w, carried):
+        streams, trail = carried
         if w.engram != None:
             streams = engram(streams, ids, inputs, m, w.engram)
-        nxt = m.layers[l + 1] if l + 1 < len(m.layers) else None
-        return layer(m, inputs, plan_p, positions, adapter_routes, w, nxt, streams, ids, False, carry)
+        following = m.layers[l + 1] if l + 1 < len(m.layers) else None
+        return layer(m, rows, w, streams, trail, following = following)
 
-    streams = inputs.fold_layers(m.layers, streams, block)
+    streams, trail = inputs.fold_layers(m.layers, (streams, NO_TRAIL), block)
 
     if m.hc_head != None:
         y = collapse(streams, m.hc_head, hy)
     elif hy.single_pass:
-        y = premix(streams, carry["mix"], m)
+        y = premix(streams, trail.mix, m)
     else:
         y = summed(streams, m.hidden, hy.streams)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
     x = ops.layout.gather_rows(x, inputs.readout_rows())
     logits = ops.linear.lm_head(x, m.head if m.head != None else m.embed)
-
-    if m.mtp != None and m.head != None:
-        mtp = m.mtp
-        input_mtp = inputs.on(fact.drafts())
-        plan_mtp = ops.attn.plan_prefill(input_mtp, m.heads, kvh, m.head_dim, m.window)
-        dstreams = ops.layout.gather_rows(streams, inputs.readout_rows()).on(fact.drafts())
-        dpos = positions.on(fact.drafts())
-        dlogits = logits.on(fact.drafts())
-
-        token = ops.layout.argmax([dlogits])
-        hidden = dstreams
-        chain = []
-        draft_carry = {"mix": None, "selection": None}
-        for step in range(mtp.depth):
-            e = ops.layout.embed(token, m.embed, m.vocab)
-            e = ops.elemwise.rmsnorm(e, mtp.enorm, mtp.norm_eps)
-            e = ops.elemwise.hc_expand(ops.linear.matmul(e, mtp.e_proj), hy.streams)
-            h = ops.elemwise.rmsnorm_per_head(hidden, mtp.hnorm, m.hidden, mtp.norm_eps)
-            routes = ops.linear.group_routes(h, hy.streams)
-            h = ops.linear.matmul_grouped(h, mtp.h_proj, routes, hy.streams)
-            fused = ops.elemwise.residual_add(e, h)
-
-            out = layer(m, input_mtp, plan_mtp, dpos, adapter_routes, mtp.block, None, fused, token,
-                        step > 0, draft_carry)
-            dy = collapse(out, mtp.hc_head, hy)
-            read = ops.elemwise.rmsnorm(dy, mtp.norm, mtp.norm_eps)
-            draft = ops.linear.lm_head(read, m.head)
-            if step == 0:
-                seam.at(seam.MTP, [draft])
-            token = ops.layout.argmax([draft])
-            hidden = out
-            chain.append(draft)
-        seam.at(seam.MTP_DRAFTS, [ops.layout.argmax(chain)])
-
+    if m.mtp != None:
+        draft(m, rows, streams, logits)
     return logits
+
+def draft(m, rows, streams, logits):
+    """The MTP head's drafted token, from the trunk's last streams and the
+    token its logits pick."""
+    hy = m.hyper
+    mtp = m.mtp
+    inputs = rows.inputs
+    drafted = inputs.on(fact.drafts())
+    plan = ops.attn.plan_prefill(drafted, m.heads, rows.kv_heads, m.head_dim, m.window)
+    hidden = ops.layout.gather_rows(streams, inputs.readout_rows()).on(fact.drafts())
+    positions = rows.positions.on(fact.drafts())
+    token = ops.layout.argmax([logits.on(fact.drafts())])
+
+    e = ops.layout.embed(token, m.embed, m.vocab)
+    e = ops.elemwise.rmsnorm(e, mtp.enorm, mtp.norm_eps)
+    e = ops.elemwise.hc_expand(ops.linear.matmul(e, mtp.e_proj), hy.streams)
+    h = ops.elemwise.rmsnorm_per_head(hidden, mtp.hnorm, m.hidden, mtp.norm_eps)
+    routes = ops.linear.group_routes(h, hy.streams)
+    h = ops.linear.matmul_grouped(h, mtp.h_proj, routes, hy.streams)
+    fused = ops.elemwise.residual_add(e, h)
+
+    draft_rows = struct(
+        inputs = drafted,
+        plan = plan,
+        positions = positions,
+        ids = token,
+        adapters = rows.adapters,
+        kv_heads = rows.kv_heads,
+    )
+    out, _ = layer(m, draft_rows, mtp.block, fused, NO_TRAIL)
+    y = ops.elemwise.rmsnorm(collapse(out, mtp.hc_head, hy), mtp.norm, mtp.norm_eps)
+    proposal = ops.linear.lm_head(y, m.head)
+    seam.at(seam.MTP, [proposal])
+    ops.layout.argmax([proposal])
+    seam.at(seam.MTP_DRAFTS, [ops.layout.argmax([proposal])])
 
 def rope(x, pos, rope_dim, head_dim, theta, scaling, inverse = False):
     if scaling != None:
@@ -105,16 +116,18 @@ def rope(x, pos, rope_dim, head_dim, theta, scaling, inverse = False):
         )
     return ops.elemwise.rope_partial_last_yarn(x, pos, rope_dim, head_dim, theta, True, inverse, scaling)
 
-def layer(m, inputs, plan_p, positions, adapter_routes, w, nxt, streams, ids, chain, carry):
+def layer(m, rows, w, streams, trail, following = None):
+    """The layer `w` over `rows`, given the `trail` earlier layers left it:
+    the streams it leaves and its own trail."""
     hy = m.hyper
-    kvh = kv_heads(m)
-    pos = positions
+    inputs = rows.inputs
+    pos = rows.positions
     at = w.attn
     pages = inputs.kv(at.kv)
     write_page = inputs.write_page(at.kv)
     write_offset = inputs.write_offset(at.kv)
 
-    x, post_mix, comb_mix = sublayer_input(streams, w.attn_mix, m, carry)
+    x, post_mix, comb_mix, mix = sublayer_input(streams, w.attn_mix, m, trail.mix)
     if w.attn_norm != None:
         x = ops.elemwise.rmsnorm(x, w.attn_norm, hy.norm_eps)
 
@@ -128,11 +141,11 @@ def layer(m, inputs, plan_p, positions, adapter_routes, w, nxt, streams, ids, ch
     plane = ops.linear.matmul(x, at.kv_down)
     plane = ops.elemwise.rmsnorm(plane, at.kv_norm, at.kv_norm_eps)
     plane = rope(plane, pos, at.rope_dim, m.head_dim, at.theta, at.yarn)
-    if not chain:
-        ops.attn.kv_append_shared(plane, pages, write_page, write_offset)
+    ops.attn.kv_append_shared(plane, pages, write_page, write_offset)
 
-    o, lse = ops.attn.prefill_lse(q, plan_p, pages, m.window, m.head_dim, kvh, at.sm_scale)
+    o, lse = ops.attn.prefill_lse(q, rows.plan, pages, m.window, m.head_dim, rows.kv_heads, at.sm_scale)
 
+    selection = trail.selection
     p = at.pool
     if p != None:
         entries = inputs.kv(p.entries)
@@ -141,35 +154,30 @@ def layer(m, inputs, plan_p, positions, adapter_routes, w, nxt, streams, ids, ch
         bpos, breq, brope = boundaries(pos, row_valid, p.ratio)
 
         if p.owner:
-            latent = compress(m, x, p, pages, write_page, write_offset, bpos, breq, chain)
+            latent = compress(m, x, p, pages, write_page, write_offset, bpos, breq)
             ix = at.indexer
-            if ix != None and ix.wk != None and ix.k_norm != None and ix.owns_keys and not chain:
+            if ix != None and ix.wk != None:
                 # CSA2: the index keys are a projection of the compressed
                 # latent, taken before its rotation.
                 k = ops.elemwise.rmsnorm(ops.linear.matmul(latent, ix.wk), ix.k_norm, hy.norm_eps)
                 k = rope(k, brope, ix.rope_dim, ix.head_dim, ix.theta, ix.yarn)
                 ops.attn.pool_kv_append(k, bpos, breq, inputs.kv(ix.keys), inputs.write_page(ix.keys), inputs.write_offset(ix.keys))
             pooled = rope(latent, brope, at.rope_dim, m.head_dim, at.theta, at.yarn)
-            if not chain:
-                ops.attn.pool_kv_append(pooled, bpos, breq, entries, inputs.write_page(p.entries), inputs.write_offset(p.entries))
+            ops.attn.pool_kv_append(pooled, bpos, breq, entries, inputs.write_page(p.entries), inputs.write_offset(p.entries))
 
-        selection = None
         if at.selection == "own":
             ix = at.indexer
             if ix.compressor != None:
-                s = indexer(x, q_a, ix, pos, bpos, breq, brope, inputs.kv(ix.keys),
-                            inputs.write_page(ix.keys), inputs.write_offset(ix.keys), m.act, chain)
+                picked = indexer(x, q_a, ix, pos, bpos, breq, brope, inputs.kv(ix.keys),
+                                 inputs.write_page(ix.keys), inputs.write_offset(ix.keys))
             else:
-                s = rank(x, q_a, ix, pos, inputs.kv(ix.keys), p.ratio)
-            carry["selection"] = (s, ix.top_k)
-            selection = (s, ix.top_k)
-        elif at.selection == "shared":
-            selection = carry["selection"]
-            if selection == None:
-                fail("a CSA2 Reuse Mode layer follows a layer that ranked")
-        if selection != None:
-            po, plse = ops.attn.pool_lse_selected(q, pos, request_of_token, selection[0], entries,
-                                                  p.ratio, selection[1], m.heads, m.head_dim, at.sm_scale)
+                picked = rank(x, q_a, ix, pos, inputs.kv(ix.keys), p.ratio)
+            selection = struct(picked = picked, top_k = ix.top_k)
+        elif at.selection == "shared" and selection == None:
+            fail("a CSA2 Reuse Mode layer follows a layer that ranked")
+        if at.selection != "none":
+            po, plse = ops.attn.pool_lse_selected(q, pos, request_of_token, selection.picked, entries,
+                                                  p.ratio, selection.top_k, m.heads, m.head_dim, at.sm_scale)
         else:
             po, plse = ops.attn.pool_lse(q, pos, request_of_token, entries, p.ratio, m.heads, m.head_dim, at.sm_scale)
         o, lse = ops.attn.merge_lse(o, lse, po, plse, m.heads, m.head_dim)
@@ -185,40 +193,43 @@ def layer(m, inputs, plan_p, positions, adapter_routes, w, nxt, streams, ids, ch
         o = ops.linear.matmul(o, at.o_down)
     o = ops.linear.matmul(o, at.o_up)
     adapted = fact.has(fact.Adapter)
-    o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, adapter_routes, o.on(adapted))
+    o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, rows.adapters, o.on(adapted))
     streams = ops.elemwise.hc_fold(o, streams, post_mix, comb_mix)
 
-    x, post_mix, comb_mix = sublayer_input(streams, w.mlp_mix, m, carry)
+    x, post_mix, comb_mix, mix = sublayer_input(streams, w.mlp_mix, m, mix)
     if w.mlp_norm != None:
         x = ops.elemwise.rmsnorm(x, w.mlp_norm, hy.norm_eps)
-    f = mlp(x, ids, w.mlp, streams, nxt, hy)
-    return ops.elemwise.hc_fold(f, streams, post_mix, comb_mix)
+    f = mlp(x, rows.ids, w.mlp, streams, following, hy)
+    streams = ops.elemwise.hc_fold(f, streams, post_mix, comb_mix)
+    return streams, struct(mix = mix, selection = selection)
 
-def compress(m, x, p, pages, write_page, write_offset, bpos, breq, chain):
+def compress(m, x, p, pages, write_page, write_offset, bpos, breq):
     c = p.compressor
     if c == None:
-        return ops.attn.pool_gather(bpos, breq, pages, None, m.head_dim, p.ratio, m.act)
+        return ops.attn.pool_gather(bpos, breq, pages, None, m.head_dim, p.ratio, ACT)
     if c.wgate != None:
-        if not chain:
-            state_kv = ops.linear.matmul(x, c.wkv)
-            state_score = ops.linear.matmul(x, c.wgate)
-            ops.attn.pool_state_write(state_kv, state_score, pages, write_page, write_offset, m.head_dim, p.ratio)
-        pooled = ops.attn.pool_gather(bpos, breq, pages, c.ape, m.head_dim, p.ratio, m.act)
+        state_kv = ops.linear.matmul(x, c.wkv)
+        state_score = ops.linear.matmul(x, c.wgate)
+        ops.attn.pool_state_write(state_kv, state_score, pages, write_page, write_offset, m.head_dim, p.ratio)
+        pooled = ops.attn.pool_gather(bpos, breq, pages, c.ape, m.head_dim, p.ratio, ACT)
         return ops.elemwise.rmsnorm(pooled, c.norm, c.norm_eps)
     kv = ops.linear.matmul(x, c.wkv)
     return ops.elemwise.rmsnorm(kv, c.norm, c.norm_eps)
 
-def sublayer_input(streams, mix, m, carry):
+def sublayer_input(streams, mix, m, prev):
+    """A sublayer's input read out of `streams`, the post and combine mixes
+    its output folds back with, and the mix the next sublayer reads its
+    input through: under Single-Pass mHC this one's, `prev` read here."""
     hy = m.hyper
     if not hy.single_pass:
-        return gate(streams, mix, hy)
+        x, post_mix, comb_mix = gate(streams, mix, hy)
+        return x, post_mix, comb_mix, prev
     normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
     mixed = mixes(normed, mix, hy)
     _, post_mix, comb_mix = ops.elemwise.hc_gates(mixed, streams, mix.scale, mix.base, hy.streams,
                                                   hy.gate_eps, hy.alpha, hy.sinkhorn)
-    x = premix(streams, carry["mix"], m)
-    carry["mix"] = struct(mixes = mixed, scale = mix.scale, base = mix.base)
-    return x, post_mix, comb_mix
+    x = premix(streams, prev, m)
+    return x, post_mix, comb_mix, struct(mixes = mixed, scale = mix.scale, base = mix.base)
 
 def premix(streams, prev, m):
     hy = m.hyper
@@ -248,19 +259,19 @@ def engram(streams, ids, inputs, m, e):
     gated = ops.elemwise.ple_gate(key, query, value, hy.streams)
     return ops.elemwise.residual_add(gated, streams)
 
-def predict_next(streams, nxt, hy):
-    if nxt == None:
+def predict_next(streams, following, hy):
+    if following == None:
         return None
-    f = nxt.mlp
+    f = following.mlp
     if f.kind != "moe_flash" or f.gate.kind != "bias":
         return None
     if hy.single_pass:
         # The next layer's input mix is this layer's own prediction, which is
         # not settled here: the hint would score the wrong row.
         return None
-    return predict_route(streams, hy, nxt.mlp_mix, nxt.mlp_norm, hy.norm_eps, f.router, f.gate.bias, f.experts)
+    return predict_route(streams, hy, following.mlp_mix, following.mlp_norm, hy.norm_eps, f.router, f.gate.bias, f.experts)
 
-def mlp(x, ids, f, streams, nxt, hy):
+def mlp(x, ids, f, streams, following, hy):
     if f.kind == "dense":
         return ops.linear.matmul(ops.linear.mlp_swiglu_clamp(ops.linear.matmul(x, f.gate_up), f.inter, f.limit), f.down)
     if f.kind == "routed":
@@ -270,7 +281,7 @@ def mlp(x, ids, f, streams, nxt, hy):
         act = ops.linear.mlp_swiglu_clamp(hidden, f.inter, f.limit)
         return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
     if f.gate.kind == "bias":
-        hint = predict_next(streams, nxt, hy)
+        hint = predict_next(streams, following, hy)
         routes, weights = ops.linear.moe_topk_sqrt_softplus_hinted(
             ops.linear.matmul(x, f.router), f.gate.bias, f.experts, f.top_k, f.renorm, f.scaling, hint)
     else:
@@ -294,18 +305,16 @@ def mlp(x, ids, f, streams, nxt, hy):
     routed = ops.linear.moe_weighted_sum(select(act, f.down), weights)
     return ops.elemwise.residual_add(shared, routed)
 
-def indexer(x, q_a, ix, positions, bpos, breq, brope, keys, write_page, write_offset, act, chain):
+def indexer(x, q_a, ix, positions, bpos, breq, brope, keys, write_page, write_offset):
     c = ix.compressor
     ratio = c.ape.shape[0]
-    if not chain:
-        state_kv = ops.linear.matmul(x, c.wkv)
-        state_score = ops.linear.matmul(x, c.wgate)
-        ops.attn.pool_state_write(state_kv, state_score, keys, write_page, write_offset, ix.head_dim, ratio)
-    k = ops.attn.pool_gather(bpos, breq, keys, c.ape, ix.head_dim, ratio, act)
+    state_kv = ops.linear.matmul(x, c.wkv)
+    state_score = ops.linear.matmul(x, c.wgate)
+    ops.attn.pool_state_write(state_kv, state_score, keys, write_page, write_offset, ix.head_dim, ratio)
+    k = ops.attn.pool_gather(bpos, breq, keys, c.ape, ix.head_dim, ratio, ACT)
     k = ops.elemwise.rmsnorm(k, c.norm, c.norm_eps)
     k = rope(k, brope, ix.rope_dim, ix.head_dim, ix.theta, ix.yarn)
-    if not chain:
-        ops.attn.pool_kv_append(k, bpos, breq, keys, write_page, write_offset)
+    ops.attn.pool_kv_append(k, bpos, breq, keys, write_page, write_offset)
     q = ops.linear.matmul(q_a, ix.wq_b)
     q = rope(q, positions, ix.rope_dim, ix.head_dim, ix.theta, ix.yarn)
     weights = ops.linear.matmul(x, ix.weights_proj)

@@ -6,10 +6,12 @@
 load("//lib/adapters/model.star", "banks")
 load("//lib/hyper/model.star", "head", "hyper", "mix")
 
-DRAFT_DEPTH = 1
 DRAFT_EXPERTS = 256
 
 def routed(gate, up, down, split, gate_at = []):
+    """The dtypes a layer's routed banks are stored at: `gate`, `up` and
+    `down`, the gate overridden at `dtype` on the layers `gate_at` lists as
+    `(layer, dtype)`; with `split` the gate and up banks apart."""
     return struct(gate = gate, up = up, down = down, split = split, gate_at = gate_at)
 
 def uniform(w):
@@ -21,11 +23,13 @@ def split_of(w):
 DQ_2BIT = routed(dtype.u2g32, dtype.u2g64, dtype.u2g64, True, [(4, dtype.u2g64)])
 DQ_2BIT_FULL = routed(dtype.u2g32, dtype.u2g64, dtype.u2g64, True, [(42, dtype.u2g64)])
 
-def gate_of(r, layer):
+def banks_at(r, layer):
+    """`r` as stored on `layer`."""
+    gate = r.gate
     for at, d in r.gate_at:
         if at == layer:
-            return d
-    return r.gate
+            gate = d
+    return routed(gate, r.up, r.down, r.split)
 
 # ---------------------------------------------------------------------------
 # The V4 base.
@@ -39,7 +43,7 @@ BASE = struct(
     swiglu_limit = 7.0, vocab = 129280, norm_eps = 1e-5,
 )
 
-def base(w, act, kv, d):
+def base(w, kv, d):
     hidden = d.hidden
     streams = d.streams
     q_w = d.heads * d.head_dim
@@ -109,7 +113,6 @@ def base(w, act, kv, d):
     return struct(
         hidden = hidden,
         vocab = d.vocab,
-        act = act,
         heads = d.heads,
         head_dim = d.head_dim,
         window = d.window,
@@ -147,16 +150,19 @@ def flash_dims(layers, pool, hash, experts = 256, draft = False):
         swiglu_limit = 10.0, vocab = 129280, norm_eps = 1e-6,
     )
 
-def moe_flash(n, d, experts, gate, gate_dtype, up_dtype, down_dtype, split, weights, dense):
+def moe_flash(n, d, experts, gate, banks, weights, dense):
+    """A DeepSeekMoE block of `experts` routed by `gate`, its routed banks
+    stored as `banks` says, its shared expert in `weights` and its router in
+    `dense`."""
     mi = d.moe_inter
     si = d.shared_inter
     hidden = d.hidden
-    if split:
+    if banks.split:
         half = lambda what, dt: weight(n(what), [experts, mi, hidden], dt).bank([mi])
-        gate_up = struct(fused = None, gate = half("experts_gate", gate_dtype), up = half("experts_up", up_dtype))
+        gate_up = struct(fused = None, gate = half("experts_gate", banks.gate), up = half("experts_up", banks.up))
     else:
         gate_up = struct(
-            fused = weight(n("experts_gate_up"), [experts, 2 * mi, hidden], gate_dtype).bank([mi, mi]),
+            fused = weight(n("experts_gate_up"), [experts, 2 * mi, hidden], banks.gate).bank([mi, mi]),
             gate = None,
             up = None,
         )
@@ -165,7 +171,7 @@ def moe_flash(n, d, experts, gate, gate_dtype, up_dtype, down_dtype, split, weig
         router = weight(n("gate"), [experts, hidden], dense),
         gate = gate,
         gate_up = gate_up,
-        down = weight(n("experts_down"), [experts, hidden, mi], down_dtype).rows(),
+        down = weight(n("experts_down"), [experts, hidden, mi], banks.down).rows(),
         shared_gate_up = weight(n("shared_gate_up"), [2 * si, hidden], weights).packed([si, si]),
         shared_down = weight(n("shared_down"), [hidden, si], weights).rows(),
         experts = experts,
@@ -177,7 +183,7 @@ def moe_flash(n, d, experts, gate, gate_dtype, up_dtype, down_dtype, split, weig
         scaling = d.scaling,
     )
 
-def flash(w, r, act, kv, d):
+def flash(w, r, kv, d):
     dense = compute(w)
     hidden = d.hidden
     streams = d.streams
@@ -195,7 +201,8 @@ def flash(w, r, act, kv, d):
             norm_eps = d.norm_eps,
         )
 
-    def layer_at(prefix, ratio, hash, experts, split, gate_dtype, up_dtype, down_dtype, weights, sdense, kv_name, pool_name, index_name):
+    def layer_at(prefix, key, ratio, hash, experts, routed_banks, weights, sdense):
+        """The layer named `prefix`, its caches named by `key`."""
         n = lambda s: "{}.{}".format(prefix, s)
         norm = lambda s, dim: weight(n(s), [dim], sdense)
         lora_a, lora_b = banks(prefix, hidden, sdense)
@@ -205,7 +212,7 @@ def flash(w, r, act, kv, d):
             entries = 2 * kv_latent if has_indexer else kv_latent
             pool = struct(
                 ratio = ratio,
-                entries = pool_name,
+                entries = "pool." + key,
                 compressor = compressor(n("compressor"), ratio, entries, kv_latent),
                 owner = True,
             )
@@ -224,7 +231,7 @@ def flash(w, r, act, kv, d):
                 compressor = compressor(n("indexer.compressor"), ratio, 2 * d.index_head_dim, d.index_head_dim),
                 wk = None,
                 k_norm = None,
-                keys = index_name,
+                keys = "index." + key,
                 owns_keys = True,
             )
         if hash:
@@ -251,22 +258,29 @@ def flash(w, r, act, kv, d):
                 o_up = weight(n("o_up"), [hidden, o_out], weights).rows(),
                 o_groups = d.o_groups,
                 sink = weight(n("attn_sink"), [d.heads], sdense).columns(),
-                kv = kv_name,
+                kv = "kv." + key,
                 pool = pool,
                 indexer = indexer,
                 selection = "own" if has_indexer else "none",
             ),
             mlp_mix = mix(n, "mlp_mix", streams, hidden),
-            mlp = moe_flash(n, d, experts, gate, gate_dtype, up_dtype, down_dtype, split, weights, sdense),
+            mlp = moe_flash(n, d, experts, gate, routed_banks, weights, sdense),
             lora_a = lora_a,
             lora_b = lora_b,
             engram = None,
         )
 
     layers = [
-        layer_at("layer.{}".format(l), d.pool[l], l < d.num_hash_layers, d.experts, r.split,
-                 gate_of(r, l), r.up, r.down, w, dense,
-                 "kv.{}".format(l), "pool.{}".format(l), "index.{}".format(l))
+        layer_at(
+            "layer.{}".format(l),
+            key = str(l),
+            ratio = d.pool[l],
+            hash = l < d.num_hash_layers,
+            experts = d.experts,
+            routed_banks = banks_at(r, l),
+            weights = w,
+            sdense = dense,
+        )
         for l in range(d.layers)
     ]
     mtp = None
@@ -277,17 +291,23 @@ def flash(w, r, act, kv, d):
             hnorm = weight("mtp.hnorm", [hidden], bf),
             e_proj = weight("mtp.e_proj", [hidden, hidden], bf),
             h_proj = weight("mtp.h_proj", [streams * hidden, hidden], bf),
-            block = layer_at("mtp.decoder", None, False, DRAFT_EXPERTS, True, dtype.mxfp4,
-                             dtype.mxfp4, dtype.mxfp4, bf, bf, "kv.mtp", "pool.mtp", "index.mtp"),
+            block = layer_at(
+                "mtp.decoder",
+                key = "mtp",
+                ratio = None,
+                hash = False,
+                experts = DRAFT_EXPERTS,
+                routed_banks = split_of(dtype.mxfp4),
+                weights = bf,
+                sdense = bf,
+            ),
             hc_head = head("mtp.hc_head", streams, hidden),
             norm = weight("mtp.norm", [hidden], bf),
             norm_eps = d.norm_eps,
-            depth = DRAFT_DEPTH,
         )
     return struct(
         hidden = hidden,
         vocab = d.vocab,
-        act = act,
         heads = d.heads,
         head_dim = d.head_dim,
         window = d.window,
@@ -379,7 +399,7 @@ def engram_hash_constants(e, engram_layers, which):
     mults = [v * 2 + 1 for v in numpy_integers(10007 * layer, bound, e.ngram)]
     return mults, primes, offsets
 
-def flash41(w, r, act, kv, d):
+def flash41(w, r, kv, d):
     plan = d.plan
     dense = compute(w)
     hidden = d.hidden
@@ -490,8 +510,15 @@ def flash41(w, r, act, kv, d):
                 selection = selection,
             ),
             mlp_mix = mix(n, "mlp_mix", streams, hidden),
-            mlp = moe_flash(n, d, d.experts, struct(kind = "bias", bias = weight(n("gate.bias"), [d.experts], dtype.f32)),
-                            gate_of(r, l), r.up, r.down, True, w, dense),
+            mlp = moe_flash(
+                n,
+                d,
+                d.experts,
+                gate = struct(kind = "bias", bias = weight(n("gate.bias"), [d.experts], dtype.f32)),
+                banks = banks_at(r, l),
+                weights = w,
+                dense = dense,
+            ),
             lora_a = lora_a,
             lora_b = lora_b,
             engram = engram,
@@ -500,7 +527,6 @@ def flash41(w, r, act, kv, d):
     return struct(
         hidden = hidden,
         vocab = d.vocab,
-        act = act,
         heads = d.heads,
         head_dim = d.head_dim,
         window = d.window,
@@ -524,25 +550,25 @@ def layout(id, deploy):
     kv = deploy.kv
     mtp = deploy.drafter == "mtp"
     if id == "dsv41-flash" and ws == [u4]:
-        return flash41(u4, split_of(u4), bf, kv, dims41(V41_PLAN))
+        return flash41(u4, split_of(u4), kv, dims41(V41_PLAN))
     if id == "dsv41-flash" and ws == [bf, mx]:
-        return flash41(bf, split_of(mx), bf, kv, dims41(V41_PLAN))
+        return flash41(bf, split_of(mx), kv, dims41(V41_PLAN))
     if id == "dsv41-flash-mini" and ws == [bf, mx]:
-        return flash41(bf, split_of(mx), bf, kv, dims41(V41_MINI_PLAN, experts = 16, base_vocab = 20000))
+        return flash41(bf, split_of(mx), kv, dims41(V41_MINI_PLAN, experts = 16, base_vocab = 20000))
     if id == "dsv4-flash":
         if ws == [bf] and not mtp:
-            return flash(bf, uniform(bf), bf, kv, flash_dims(43, flash_ratios(), 3))
+            return flash(bf, uniform(bf), kv, flash_dims(43, flash_ratios(), 3))
         if ws == [u4, dtype.u2g64] and not mtp:
-            return flash(u4, DQ_2BIT_FULL, bf, kv, flash_dims(43, flash_ratios(), 3))
+            return flash(u4, DQ_2BIT_FULL, kv, flash_dims(43, flash_ratios(), 3))
         if ws == [u4, dtype.u2g64, mx] and mtp:
-            return flash(u4, DQ_2BIT_FULL, bf, kv, flash_dims(43, flash_ratios(), 3, draft = True))
+            return flash(u4, DQ_2BIT_FULL, kv, flash_dims(43, flash_ratios(), 3, draft = True))
     if id == "dsv4-flash-mini":
         if ws == [bf] and not mtp:
-            return flash(bf, uniform(bf), bf, kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16))
+            return flash(bf, uniform(bf), kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16))
         if ws == [u4, dtype.u2g64] and not mtp:
-            return flash(u4, DQ_2BIT, bf, kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16))
+            return flash(u4, DQ_2BIT, kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16))
         if ws == [u4, dtype.u2g64, mx] and mtp:
-            return flash(u4, DQ_2BIT, bf, kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16, draft = True))
+            return flash(u4, DQ_2BIT, kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16, draft = True))
     if id == "dsv4-base" and ws == [bf] and not mtp:
-        return base(bf, bf, kv, BASE)
+        return base(bf, kv, BASE)
     fail("{} does not ship {}".format(id, deploy))
