@@ -1,16 +1,20 @@
 #![cfg(feature = "cuda")]
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::Instant;
 
-use engine_cuda::serve::{Clips, Seated};
-use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
-use poem::{Dtype, Platform, Request, Stream, Trace};
+pub mod common_vae;
 
-/// The widths ltx_2's package declares.
+use common_vae::{
+    Score, bf16_bytes, boxed, deploy, f32s, golden, keep_what_reads, score, shapes, snapshot,
+};
+use engine_cuda::Lane;
+use engine_cuda::serve::{Clips, Seated};
+use poem::{Platform, Request, Stream, Trace};
+
+const FLAGSHIP: &str = "ltx25-bf16-kv-bf16";
 const VAE_RGB: u32 = 3;
 const VAE_Z: u32 = 128;
-use poem_compiler::{Budget, VoxelLadder};
 
 /// The VAE's decode reading alone, by the package's own functions.
 const VAE_ONLY: &str = r#"
@@ -21,7 +25,12 @@ def forward(m, inputs):
 fn vae_only() -> Trace {
     models::star::replacing("ltx25", "forward.star", "forward", VAE_ONLY)
         .unwrap_or_else(|why| panic!("the VAE-only package: {why}"))
-        .trace("ltx25", &flagship(), "ltx25-vae-decode", Platform::Cuda)
+        .trace(
+            "ltx25",
+            &deploy(FLAGSHIP),
+            "ltx25-vae-decode",
+            Platform::Cuda,
+        )
         .unwrap_or_else(|why| panic!("the VAE-only plan: {why:#}"))
 }
 
@@ -35,116 +44,12 @@ fn import_vae(src: &ztensor::Source) -> checkpoint::contract::ModelContract {
     let package = models::star::replacing("ltx25", "formats.star", "formats", VAE_FORMATS)
         .unwrap_or_else(|why| panic!("the VAE-only package: {why}"));
     package
-        .import("ltx25", &flagship(), src, Platform::Cuda)
+        .import("ltx25", &deploy(FLAGSHIP), src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the VAE does not read this snapshot: {why}"))
 }
 
-fn flagship() -> poem::star::Deploy {
-    poem::star::Deploy {
-        weights: vec![Dtype::Bf16],
-        kv: Dtype::Bf16,
-        tp: 1,
-        parts: vec![],
-        drafter: None,
-    }
-}
-
-fn hub() -> PathBuf {
-    if let Some(hub) = std::env::var_os("HF_HUB_CACHE") {
-        return PathBuf::from(hub);
-    }
-    if let Some(home) = std::env::var_os("HF_HOME") {
-        return PathBuf::from(home).join("hub");
-    }
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/huggingface/hub")
-}
-
-fn snapshot() -> Option<PathBuf> {
-    let snapshots = hub().join("models--Lightricks--LTX-2.5-Diffusers/snapshots");
-    std::fs::read_dir(snapshots)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.join("vae/config.json").is_file()
-                && path
-                    .join("vae/diffusion_pytorch_model.safetensors")
-                    .is_file()
-        })
-}
-
-fn golden() -> Option<PathBuf> {
-    let root = std::env::var_os("PIE_IMAGEGEN_GOLDEN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/root/.cache/pie-imagegen/golden"));
-    let name = std::env::var("PIE_LTX2_VAE_GOLDEN").unwrap_or_else(|_| "ltx2_vae".to_string());
-    let dir = root.join("ltx25").join(name);
-    dir.join("shapes.json").is_file().then_some(dir)
-}
-
-fn f32s(path: &PathBuf) -> Vec<f32> {
-    let bytes = std::fs::read(path).unwrap_or_else(|why| panic!("{}: {why}", path.display()));
-    bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect()
-}
-
-fn bf16_bytes(values: &[f32]) -> Vec<u8> {
-    values
-        .iter()
-        .flat_map(|&v| {
-            let bits = v.to_bits();
-            let rounding = 0x7fff + ((bits >> 16) & 1);
-            (((bits + rounding) >> 16) as u16).to_le_bytes()
-        })
-        .collect()
-}
-
-struct Score {
-    cos: f64,
-    max_abs: f64,
-    mean_abs: f64,
-}
-
-fn score(got: &[f32], want: &[f32]) -> Score {
-    assert_eq!(got.len(), want.len(), "one value per reference value");
-    let (mut dot, mut gg, mut ww, mut max_abs, mut sum_abs) = (0f64, 0f64, 0f64, 0f64, 0f64);
-    for (g, w) in got.iter().zip(want) {
-        let (g, w) = (f64::from(*g), f64::from(*w));
-        dot += g * w;
-        gg += g * g;
-        ww += w * w;
-        let err = (g - w).abs();
-        max_abs = max_abs.max(err);
-        sum_abs += err;
-    }
-    Score {
-        cos: dot / (gg.sqrt() * ww.sqrt()).max(1e-30),
-        max_abs,
-        mean_abs: sum_abs / want.len().max(1) as f64,
-    }
-}
-
-fn boxed(shapes: &serde_json::Value, key: &str) -> ([u32; 3], usize) {
-    let at = &shapes[key];
-    let get = |name: &str| at[name].as_u64().expect("a box extent") as u32;
-    (
-        [get("t"), get("h"), get("w")],
-        at["channels"].as_u64().expect("channels") as usize,
-    )
-}
-
-fn word(facts: &poem_ir::Facts) -> u64 {
-    facts.word(
-        &Request::new(1, false)
-            .on_stream(Stream::Video)
-            .in_reading("vae.decode"),
-    )
-}
-
 fn fire(
-    root: &PathBuf,
+    root: &Path,
     max_voxels: u32,
     clip: [u32; 3],
     payload: &[f32],
@@ -154,55 +59,19 @@ fn fire(
     let mut contract = import_vae(&src);
     drop(src);
     let trace = vae_only();
-    let mut keep: std::collections::BTreeSet<String> =
-        trace.params.iter().map(|p| p.name.clone()).collect();
-    loop {
-        let more: Vec<String> = contract
-            .tensors
-            .iter()
-            .filter(|t| keep.contains(&t.name))
-            .flat_map(|t| t.expr.outputs().into_iter().map(str::to_string))
-            .filter(|name: &String| !keep.contains(name))
-            .collect();
-        if more.is_empty() {
-            break;
-        }
-        keep.extend(more);
-    }
-    contract.tensors.retain(|t| keep.contains(&t.name));
+    keep_what_reads(&mut contract, &trace);
+    let word = trace.facts.word(
+        &Request::new(1, false)
+            .on_stream(Stream::Video)
+            .in_reading("vae.decode"),
+    );
     let started = Instant::now();
-    let mut shell = Shell::load(Boot {
-        trace,
-        contract: &contract,
-        checkpoint: root,
-        budget: Budget::new(2, 16),
-        patches: None,
-        voxels: Some(VoxelLadder::new(max_voxels, 2)),
-        profile: None,
-        page_size: 16,
-        context: 64,
-        slots: 2,
-        pages: 4,
-        ordinal: 0,
-        graphs: Graphs::Off,
-        knobs: Knobs {
-            recording: Recording::Off,
-            ..Knobs::default()
-        },
-        deferred_tier: true,
-        cache_dir: None,
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-    })
-    .unwrap_or_else(|why| panic!("the VAE decoder does not load: {why}"));
+    let mut shell = common_vae::load(trace, &contract, root, max_voxels);
     let load_s = started.elapsed().as_secs_f64();
-    shell.open(0).expect("slot 0 opens");
     let tokens = [0u32];
     let lanes = [Seated::of(Lane {
         slot: 0,
-        word: word(&shell.trace().facts),
+        word,
         tokens: &tokens,
     })];
     let bytes = bf16_bytes(payload);
@@ -223,24 +92,16 @@ fn fire(
 }
 
 #[test]
+#[ignore = "needs a CUDA device, a Lightricks/LTX-2.5-Diffusers snapshot with a vae/ and the ltx2_golden.py --vae dump under PIE_IMAGEGEN_GOLDEN"]
 fn the_decoder_answers_the_reference_in_one_fire() {
-    if !engine_cuda::device::present() {
-        eprintln!("skipping the VAE parity gate: no CUDA device");
-        return;
-    }
-    let Some(root) = snapshot() else {
-        eprintln!(
-            "skipping the VAE parity gate: no Lightricks/LTX-2.5-Diffusers snapshot with a vae/"
-        );
-        return;
-    };
-    let Some(gold) = golden() else {
-        eprintln!("skipping the VAE parity gate: no ltx2_golden.py --vae dump");
-        return;
-    };
-    let shapes: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(gold.join("shapes.json")).expect("shapes.json"))
-            .expect("shapes.json parses");
+    assert!(engine_cuda::device::present(), "no CUDA device");
+    let root = snapshot(
+        "Lightricks/LTX-2.5-Diffusers",
+        &["vae/config.json", "vae/diffusion_pytorch_model.safetensors"],
+    );
+    let name = std::env::var("PIE_LTX2_VAE_GOLDEN").unwrap_or_else(|_| "ltx2_vae".to_string());
+    let gold = golden(&format!("ltx25/{name}"));
+    let shapes = shapes(&gold);
     let (latent_box, latent_c) = boxed(&shapes, "latent");
     let (pixel_box, pixel_c) = boxed(&shapes, "pixels");
     assert_eq!(latent_c, VAE_Z as usize);

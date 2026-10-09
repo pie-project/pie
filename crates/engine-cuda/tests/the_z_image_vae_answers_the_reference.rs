@@ -1,117 +1,19 @@
 #![cfg(feature = "cuda")]
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::Instant;
 
+pub mod common_vae;
+
+use common_vae::{bf16_bytes, f32s, golden, keep_what_reads, one_arm, score, snapshot};
+use engine_cuda::Lane;
 use engine_cuda::serve::{Clips, Seated};
-use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
 use poem::Platform;
-use poem::star::Package;
-use poem_compiler::{Budget, VoxelLadder};
 
 const ROW: &str = "z-image-turbo-bf16-kv-bf16";
 
-/// The flagship's package with a forward that runs one of its VAE's
-/// readings alone, over every row, and holds no caches.
-fn one_arm(decode: bool) -> Package {
-    let package = models::star::package_of("z-image-turbo").expect("z-image is a package");
-    let files_at = format!("{}files/", poem::star::ATTRIBUTE);
-    let mut files: Vec<(String, String)> = package
-        .attributes()
-        .into_iter()
-        .filter_map(|(key, source)| Some((key.strip_prefix(&files_at)?.to_string(), source)))
-        .collect();
-    for (file, source) in &mut files {
-        if file == "forward.star" {
-            *source = source
-                .replace("def caches(m, c):", "def every_cache(m, c):")
-                .replace("def forward(m, inputs):", "def every_reading(m, inputs):")
-                + &format!(
-                    "\ndef caches(m, c):\n    pass\n\ndef forward(m, inputs):\n    return {}(inputs, m.vae)\n",
-                    if decode { "decode" } else { "encode" }
-                );
-        }
-    }
-    let files: Vec<(&str, &str)> = files
-        .iter()
-        .map(|(f, s)| (f.as_str(), s.as_str()))
-        .collect();
-    Package::new(package.name(), &files).unwrap_or_else(|why| panic!("{why:#}"))
-}
-
-fn hub() -> PathBuf {
-    if let Some(dir) = std::env::var_os("HF_HUB_CACHE").filter(|v| !v.is_empty()) {
-        return PathBuf::from(dir);
-    }
-    if let Some(home) = std::env::var_os("HF_HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(home).join("hub");
-    }
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/huggingface/hub")
-}
-
-fn snapshot() -> Option<PathBuf> {
-    let snapshots = hub().join("models--Tongyi-MAI--Z-Image-Turbo/snapshots");
-    std::fs::read_dir(snapshots)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| path.join("vae/config.json").is_file())
-}
-
-fn golden() -> Option<PathBuf> {
-    let root = std::env::var_os("PIE_IMAGEGEN_GOLDEN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/root/.cache/pie-imagegen/golden"));
-    let dir = root.join("z-image/zimage_vae");
-    dir.join("shapes.json").is_file().then_some(dir)
-}
-
-fn f32s(path: &PathBuf) -> Vec<f32> {
-    let bytes = std::fs::read(path).unwrap_or_else(|why| panic!("{}: {why}", path.display()));
-    bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect()
-}
-
-fn bf16_bytes(values: &[f32]) -> Vec<u8> {
-    values
-        .iter()
-        .flat_map(|&v| {
-            let bits = v.to_bits();
-            let rounding = 0x7fff + ((bits >> 16) & 1);
-            (((bits + rounding) >> 16) as u16).to_le_bytes()
-        })
-        .collect()
-}
-
-struct Score {
-    cos: f64,
-    max_abs: f64,
-    mean_abs: f64,
-}
-
-fn score(got: &[f32], want: &[f32]) -> Score {
-    assert_eq!(got.len(), want.len(), "one value per reference value");
-    let (mut dot, mut gg, mut ww, mut max_abs, mut sum_abs) = (0f64, 0f64, 0f64, 0f64, 0f64);
-    for (g, w) in got.iter().zip(want) {
-        let (g, w) = (f64::from(*g), f64::from(*w));
-        dot += g * w;
-        gg += g * g;
-        ww += w * w;
-        let err = (g - w).abs();
-        max_abs = max_abs.max(err);
-        sum_abs += err;
-    }
-    Score {
-        cos: dot / (gg.sqrt() * ww.sqrt()).max(1e-30),
-        max_abs,
-        mean_abs: sum_abs / want.len() as f64,
-    }
-}
-
 fn fire(
-    root: &PathBuf,
+    root: &Path,
     decode: bool,
     max_voxels: u32,
     clip: [u32; 3],
@@ -124,7 +26,7 @@ fn fire(
         .contract(&src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the pipeline does not read the snapshot: {why}"));
     drop(src);
-    let trace = one_arm(decode)
+    let trace = one_arm("z-image-turbo", decode)
         .trace(
             row.entry.id,
             &models::star::deploy(&row.deploy),
@@ -136,59 +38,13 @@ fn fire(
             Platform::Cuda,
         )
         .unwrap_or_else(|why| panic!("{why:#}"));
-    let mut keep: std::collections::BTreeSet<String> =
-        trace.params.iter().map(|p| p.name.clone()).collect();
-    loop {
-        let more: Vec<String> = contract
-            .tensors
-            .iter()
-            .filter(|t| keep.contains(&t.name))
-            .flat_map(|t| t.expr.outputs().into_iter().map(str::to_string))
-            .filter(|name: &String| !keep.contains(name))
-            .collect();
-        if more.is_empty() {
-            break;
-        }
-        keep.extend(more);
-    }
-    contract.tensors.retain(|t| keep.contains(&t.name));
+    keep_what_reads(&mut contract, &trace);
     let word = trace
         .facts
         .word(&poem::Request::new(1, false).on_stream(poem::Stream::Image));
     let started = Instant::now();
-    let mut shell = Shell::load(Boot {
-        trace,
-        contract: &contract,
-        checkpoint: root,
-        budget: Budget::new(2, 16),
-        patches: None,
-        voxels: Some(VoxelLadder::new(max_voxels, 2)),
-        profile: None,
-        page_size: 16,
-        context: 64,
-        slots: 2,
-        pages: 4,
-        ordinal: 0,
-        graphs: Graphs::Off,
-        knobs: Knobs {
-            recording: Recording::Off,
-            ..Knobs::default()
-        },
-        cache_dir: None,
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        deferred_tier: true,
-        world: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-    })
-    .unwrap_or_else(|why| {
-        panic!(
-            "the VAE {} does not load: {why}",
-            if decode { "decoder" } else { "encoder" }
-        )
-    });
+    let mut shell = common_vae::load(trace, &contract, root, max_voxels);
     let load_s = started.elapsed().as_secs_f64();
-    shell.open(0).expect("slot 0 opens");
     let tokens = [0u32];
     let lanes = [Seated::of(Lane {
         slot: 0,
@@ -212,19 +68,11 @@ fn fire(
 }
 
 #[test]
+#[ignore = "needs a CUDA device, a Tongyi-MAI/Z-Image-Turbo snapshot and the zimage_golden.py --vae dump under PIE_IMAGEGEN_GOLDEN"]
 fn the_vae_decodes_and_encodes_the_golden_clip() {
-    if !engine_cuda::device::present() {
-        eprintln!("skipping the VAE parity gate: no CUDA device");
-        return;
-    }
-    let Some(root) = snapshot() else {
-        eprintln!("skipping the VAE parity gate: no Tongyi-MAI/Z-Image-Turbo snapshot");
-        return;
-    };
-    let Some(gold) = golden() else {
-        eprintln!("skipping the VAE parity gate: no zimage_golden.py --vae dump");
-        return;
-    };
+    assert!(engine_cuda::device::present(), "no CUDA device");
+    let root = snapshot("Tongyi-MAI/Z-Image-Turbo", &["vae/config.json"]);
+    let gold = golden("z-image/zimage_vae");
     let latent = f32s(&gold.join("latent.f32"));
     let pixels = f32s(&gold.join("pixels.f32"));
     let mean = f32s(&gold.join("mean.f32"));
