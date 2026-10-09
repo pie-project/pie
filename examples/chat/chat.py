@@ -292,7 +292,7 @@ class Chat:
             self.app.invalidate()
 
     async def send(self, text: str) -> None:
-        self.add("class:bold", f"❯ {text}\n")
+        self.add("class:bold", f"❯ {text}\n\n")
         self.streaming = True
         self.add("class:accent", "● ")
         try:
