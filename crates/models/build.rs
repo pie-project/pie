@@ -1,5 +1,5 @@
 //! Embeds every package under the repository's `models/`: each directory
-//! with a `package.star`, and every `.star` file in it.
+//! with a `package.poem`, and every `.poem` file in it.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -10,7 +10,7 @@ fn main() {
     let mut packages: Vec<(String, Vec<(String, String)>)> = Vec::new();
     for dir in std::fs::read_dir(&root).expect("the repository's models/") {
         let dir = dir.expect("a models/ entry").path();
-        if !dir.join("package.star").is_file() {
+        if !dir.join("package.poem").is_file() {
             continue;
         }
         println!("cargo:rerun-if-changed={}", dir.display());
@@ -19,7 +19,7 @@ fn main() {
         for file in std::fs::read_dir(&dir).expect("a package directory") {
             let path = file.expect("a package file").path();
             let file = path.file_name().unwrap().to_str().unwrap().to_string();
-            if file.ends_with(".star") {
+            if file.ends_with(".poem") {
                 println!("cargo:rerun-if-changed={}", path.display());
                 let path = path.canonicalize().expect("a package file's path");
                 files.push((file, path.display().to_string()));
@@ -60,7 +60,7 @@ fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, String)>) {
         if path.is_dir() {
             println!("cargo:rerun-if-changed={}", path.display());
             walk(&path, &format!("{prefix}{file}/"), out);
-        } else if file.ends_with(".star") {
+        } else if file.ends_with(".poem") {
             println!("cargo:rerun-if-changed={}", path.display());
             let path = path.canonicalize().expect("a library file's path");
             out.push((format!("{prefix}{file}"), path.display().to_string()));

@@ -149,7 +149,7 @@ pub fn one_arm(id: &str, decode: bool) -> Package {
         .filter_map(|(key, source)| Some((key.strip_prefix(&files_at)?.to_string(), source)))
         .collect();
     for (file, source) in &mut files {
-        if file == "forward.star" {
+        if file == "forward.poem" {
             *source = source
                 .replace("def caches(m, c):", "def every_cache(m, c):")
                 .replace("def forward(m, inputs):", "def every_reading(m, inputs):")

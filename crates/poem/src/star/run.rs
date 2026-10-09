@@ -1,6 +1,6 @@
 //! A deployment of a package traced and read: its layout evaluated, then the
-//! caches and forward of `forward.star` recorded into a trace, or the formats
-//! of `formats.star` read into a contract.
+//! caches and forward of `forward.poem` recorded into a trace, or the formats
+//! of `formats.poem` read into a contract.
 
 use std::cell::RefCell;
 
@@ -59,7 +59,7 @@ impl Package {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Star<'v>> {
         let layout = self
-            .module("model.star")?
+            .module("model.poem")?
             .get("layout")?
             .add_to_heap(module.heap());
         let heap = module.heap();
@@ -68,7 +68,7 @@ impl Package {
     }
 
     /// What `id`'s deployment `deploy` states of itself as a generative
-    /// model, if its `model.star` states it (`generative(m)`).
+    /// model, if its `model.poem` states it (`generative(m)`).
     pub fn generative(
         &self,
         id: &str,
@@ -83,7 +83,7 @@ impl Package {
     }
 
     /// The canvas `id`'s deployment `deploy` denoises as a text diffusion
-    /// model, if its `model.star` states one (`diffusion(m)`).
+    /// model, if its `model.poem` states one (`diffusion(m)`).
     pub fn diffusion(
         &self,
         id: &str,
@@ -104,7 +104,7 @@ impl Package {
         function: &str,
         of: fn(Star<'_>) -> anyhow::Result<T>,
     ) -> anyhow::Result<Option<T>> {
-        let Ok(stating) = self.module("model.star")?.get(function) else {
+        let Ok(stating) = self.module("model.poem")?.get(function) else {
             return Ok(None);
         };
         Module::with_temp_heap(|module| {
@@ -130,7 +130,7 @@ impl Package {
         Module::with_temp_heap(|module| {
             let mut eval = Evaluator::new(&module);
             let m = self.layout(id, deploy, &module, &mut eval)?;
-            let forward = self.module("forward.star")?;
+            let forward = self.module("forward.poem")?;
             let caches = forward.get("caches")?.add_to_heap(module.heap());
             let run = forward.get("forward")?.add_to_heap(module.heap());
 
@@ -215,7 +215,7 @@ impl ForwardHybrid for Model<'_, '_, '_> {
 
 impl Package {
     /// The contract that reads `src` into `id`'s deployment `deploy`, by the
-    /// one format of `formats.star` that recognizes it.
+    /// one format of `formats.poem` that recognizes it.
     pub fn import(
         &self,
         id: &str,
@@ -229,7 +229,7 @@ impl Package {
         })?
     }
 
-    /// `then` of the formats of `formats.star`, each reading `src` into
+    /// `then` of the formats of `formats.poem`, each reading `src` into
     /// `id`'s deployment `deploy`.
     fn formats<R>(
         &self,
@@ -262,7 +262,7 @@ impl Package {
                 .layout(id, deploy, &module, &mut eval)
                 .map_err(|e| illegible(format!("{e:#}")))?;
             let formats = self
-                .module("formats.star")
+                .module("formats.poem")
                 .and_then(|f| f.get("formats"))
                 .map_err(|e| illegible(format!("{e:#}")))?
                 .add_to_heap(heap);

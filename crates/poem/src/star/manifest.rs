@@ -1,4 +1,4 @@
-//! What a package states of itself in `package.star`: the models it holds and
+//! What a package states of itself in `package.poem`: the models it holds and
 //! the deployments of them it lists, each named by the grammar every
 //! deployment is named by.
 
@@ -122,17 +122,17 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    /// The manifest `package.star` states: its `MODELS` and `DEPLOYMENTS`.
+    /// The manifest `package.poem` states: its `MODELS` and `DEPLOYMENTS`.
     pub(crate) fn of(package: &str, frozen: &FrozenModule) -> anyhow::Result<Manifest> {
         Module::with_temp_heap(|module| {
             let heap = module.heap();
             let list = |name: &str| -> anyhow::Result<Vec<Value<'_>>> {
                 let value = frozen
                     .get(name)
-                    .map_err(|_| anyhow::anyhow!("`{package}/package.star` states no `{name}`"))?
+                    .map_err(|_| anyhow::anyhow!("`{package}/package.poem` states no `{name}`"))?
                     .add_to_heap(heap);
                 let items = ListRef::from_value(value).ok_or_else(|| {
-                    anyhow::anyhow!("`{package}/package.star`: `{name}` is no list")
+                    anyhow::anyhow!("`{package}/package.poem`: `{name}` is no list")
                 })?;
                 Ok(items.iter().collect())
             };
@@ -140,25 +140,25 @@ impl Manifest {
             for value in list("MODELS")? {
                 let model = value.downcast_ref::<Model>().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "`{package}/package.star`: `MODELS` holds {}, not a model",
+                        "`{package}/package.poem`: `MODELS` holds {}, not a model",
                         value.get_type()
                     )
                 })?;
                 if manifest.model(&model.id).is_some() {
-                    anyhow::bail!("`{package}/package.star` states `{}` twice", model.id);
+                    anyhow::bail!("`{package}/package.poem` states `{}` twice", model.id);
                 }
                 manifest.models.push(model.clone());
             }
             for value in list("DEPLOYMENTS")? {
                 let listed = value.downcast_ref::<Listed>().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "`{package}/package.star`: `DEPLOYMENTS` holds {}, not a deployment",
+                        "`{package}/package.poem`: `DEPLOYMENTS` holds {}, not a deployment",
                         value.get_type()
                     )
                 })?;
                 let model = manifest.model(&listed.model).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "`{package}/package.star` lists a deployment of `{}`, which it states \
+                        "`{package}/package.poem` lists a deployment of `{}`, which it states \
                          no model of",
                         listed.model
                     )
@@ -172,7 +172,7 @@ impl Manifest {
                 for value in list("PUBLISHED")? {
                     let published = value.downcast_ref::<Published>().ok_or_else(|| {
                         anyhow::anyhow!(
-                            "`{package}/package.star`: `PUBLISHED` holds {}, not a published \
+                            "`{package}/package.poem`: `PUBLISHED` holds {}, not a published \
                              drafter",
                             value.get_type()
                         )
@@ -184,7 +184,7 @@ impl Manifest {
                     });
                     if !listed {
                         anyhow::bail!(
-                            "`{package}/package.star` publishes a drafter for `{}`, which it \
+                            "`{package}/package.poem` publishes a drafter for `{}`, which it \
                              lists no deployment of",
                             published.deployment
                         );

@@ -3,7 +3,7 @@
 # tower's rows scattered into the embedding, a block-diffusion model's
 # self-conditioning, and each drafter's proposals.
 
-load("//lib/dflash/forward.star", "arm", "block_rows", "plant_readout", "tap", dflash_caches = "caches")
+load("//lib/dflash/forward.poem", "arm", "block_rows", "plant_readout", "tap", dflash_caches = "caches")
 
 SLIDING = 0
 GLOBAL = 1

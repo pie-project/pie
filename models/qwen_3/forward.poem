@@ -5,7 +5,7 @@
 # each rotated projection's input by the same Hadamard and signs; the KV-
 # rotated geometries turn their attention's q, k and v by a Hadamard.
 
-load("//lib/dflash/forward.star", "arm", "block_rows", "plant_readout", "tap", dflash_caches = "caches")
+load("//lib/dflash/forward.poem", "arm", "block_rows", "plant_readout", "tap", dflash_caches = "caches")
 
 def draft_attn(x, inputs, plan, a, head_dim, kv_heads, rope, append = True):
     """A draft head's gated attention over `plan`, rotating q and k by

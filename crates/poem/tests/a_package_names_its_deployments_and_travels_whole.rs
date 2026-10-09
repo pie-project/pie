@@ -1,4 +1,4 @@
-//! `package.star` states a package's models and the deployments it lists,
+//! `package.poem` states a package's models and the deployments it lists,
 //! each named by the one grammar every deployment is named by; and the
 //! package travels in an artifact's attributes, refused under other builtins.
 
@@ -38,9 +38,9 @@ fn toy() -> Package {
     Package::new(
         "toy",
         &[
-            ("package.star", PACKAGE),
-            ("model.star", MODEL),
-            ("forward.star", FORWARD),
+            ("package.poem", PACKAGE),
+            ("model.poem", MODEL),
+            ("forward.poem", FORWARD),
         ],
     )
     .unwrap_or_else(|e| panic!("{e:#}"))
@@ -101,7 +101,7 @@ fn a_name_parses_back_to_the_deployment_it_names() {
 #[test]
 fn a_manifest_refuses_a_deployment_its_model_cannot_serve() {
     let refused = |package: &str| {
-        Package::new("toy", &[("package.star", package)])
+        Package::new("toy", &[("package.poem", package)])
             .err()
             .map(|e| format!("{e:#}"))
             .unwrap_or_else(|| panic!("loaded:\n{package}"))

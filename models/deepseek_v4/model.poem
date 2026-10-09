@@ -3,7 +3,7 @@
 # hyper-connections, DeepSeekMoE experts; V4.1-Flash adds Compressed Sparse
 # Attention 2 (cross-layer KV and index reuse), Single-Pass mHC and Engram.
 
-load("//lib/adapters/model.star", "banks")
+load("//lib/adapters/model.poem", "banks")
 
 def hyper(streams, norm_eps, gate_eps, alpha, sinkhorn, single_pass = False):
     """The streams' shape and the constants their gates are computed with;

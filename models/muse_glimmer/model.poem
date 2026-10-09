@@ -1,7 +1,7 @@
 # Muse Glimmer: a dense decoder of sliding-window layers with a full-attention
 # layer every fourth, gated attention and sandwich norms.
 
-load("//lib/adapters/model.star", "banks")
+load("//lib/adapters/model.poem", "banks")
 
 def dims(layers = 52):
     return struct(

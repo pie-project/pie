@@ -2,8 +2,8 @@
 # sliding window, YaRN rope, and routed experts with biases, their banks
 # stored as the second dtype of a deployment's weights.
 
-load("//lib/adapters/model.star", "banks")
-load("//lib/dflash/model.star", dflash_declare = "declare", dflash_head = "head")
+load("//lib/adapters/model.poem", "banks")
+load("//lib/dflash/model.poem", dflash_declare = "declare", dflash_head = "head")
 
 def dims(layers = 24, experts = 32):
     return struct(

@@ -3,7 +3,7 @@
 # values and both residual branches; two dense layers, then routed experts
 # with sink experts always taken.
 
-load("//lib/adapters/model.star", "banks")
+load("//lib/adapters/model.poem", "banks")
 
 def dims(layers = 66, experts = 256):
     return struct(

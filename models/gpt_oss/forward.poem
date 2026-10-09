@@ -2,7 +2,7 @@
 # other layer windowed, then experts with clamped SwiGLU; and with a DFlash
 # drafter, the block it drafts.
 
-load("//lib/dflash/forward.star", "arm", "block_rows", "plant_readout", "tap", dflash_caches = "caches")
+load("//lib/dflash/forward.poem", "arm", "block_rows", "plant_readout", "tap", dflash_caches = "caches")
 
 WINDOWED = 0
 FULL = 1

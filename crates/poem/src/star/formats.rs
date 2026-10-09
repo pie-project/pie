@@ -1,7 +1,7 @@
 //! What a format may use: the names and attributes of the checkpoint it
 //! recognizes, and the reads that land its tensors on a deployment's weights.
 //!
-//! A read is stated, not performed: `formats.star` names what lands where,
+//! A read is stated, not performed: `formats.poem` names what lands where,
 //! and the builder the contract is built by performs it, refusing a missing or
 //! misshapen tensor.
 

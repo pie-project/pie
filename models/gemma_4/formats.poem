@@ -1,7 +1,7 @@
 # How a Gemma 4 checkpoint is laid out: transformers', mlx_lm's and GGUF's
 # spellings, and DiffusionGemma's own.
 
-load("//lib/dflash/formats.star", "bind_aux")
+load("//lib/dflash/formats.poem", "bind_aux")
 
 def product(xs):
     out = 1

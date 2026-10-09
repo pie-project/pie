@@ -1,7 +1,7 @@
 # The weights of GLM-5: three dense layers, then routed experts with a shared
 # one; each layer's attention latent (MLA) with an indexer of its own.
 
-load("//lib/adapters/model.star", "banks")
+load("//lib/adapters/model.poem", "banks")
 
 def attention(n, d, hidden, weights, norms, eps, kv, theta = None, gated = False, **extra):
     """The latent attention named by `n`, its projections in `weights` and

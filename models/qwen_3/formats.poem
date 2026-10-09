@@ -3,7 +3,7 @@
 # also states its rotation's sign diagonals in its metadata, which its
 # contract carries as constants.
 
-load("//lib/dflash/formats.star", "bind_aux")
+load("//lib/dflash/formats.poem", "bind_aux")
 
 # The Bonsai GGUF's rotation metadata.
 

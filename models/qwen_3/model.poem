@@ -3,8 +3,8 @@
 # EAGLE draft head or a DFlash-family block drafter; Ternary-Bonsai's
 # rotation signs; and the small geometries the engines' tests serve.
 
-load("//lib/adapters/model.star", "banks")
-load("//lib/dflash/model.star", dflash_declare = "declare", dflash_head = "head", "markov", "selector")
+load("//lib/adapters/model.poem", "banks")
+load("//lib/dflash/model.poem", dflash_declare = "declare", dflash_head = "head", "markov", "selector")
 
 # The Bonsai online-Hadamard rotation: a sign diagonal per rotated input width.
 

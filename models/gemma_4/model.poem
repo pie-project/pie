@@ -3,8 +3,8 @@
 # shared tail, per-layer embeddings (E4B), routed experts beside the dense
 # MLP (26B-A4B), a vision tower, and the drafters each pairs with.
 
-load("//lib/adapters/model.star", "banks")
-load("//lib/dflash/model.star", dflash_head = "head", dflash_declare = "declare")
+load("//lib/adapters/model.poem", "banks")
+load("//lib/dflash/model.poem", dflash_head = "head", dflash_declare = "declare")
 
 SLIDING = 0
 GLOBAL = 1

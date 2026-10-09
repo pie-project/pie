@@ -15,15 +15,15 @@ use crate::star::manifest::Manifest;
 /// What a file of a package may use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
-    /// `package.star`: the models a package holds and the deployments of
+    /// `package.poem`: the models a package holds and the deployments of
     /// them it lists.
     Manifest,
-    /// `model.star`: a deployment's dims and the weights they lay out.
+    /// `model.poem`: a deployment's dims and the weights they lay out.
     Layout,
-    /// `forward.star`: the caches a deployment holds and the forward its
+    /// `forward.poem`: the caches a deployment holds and the forward its
     /// rows run.
     Forward,
-    /// `formats.star`: the formats a deployment's checkpoints are read in.
+    /// `formats.poem`: the formats a deployment's checkpoints are read in.
     Formats,
     /// Any other file: pure helpers every stage may load.
     Lib,
@@ -39,10 +39,10 @@ impl Stage {
     #[must_use]
     pub fn of(file: &str) -> Stage {
         match file.rsplit('/').next().unwrap_or(file) {
-            "package.star" => Stage::Manifest,
-            "model.star" => Stage::Layout,
-            "forward.star" => Stage::Forward,
-            "formats.star" => Stage::Formats,
+            "package.poem" => Stage::Manifest,
+            "model.poem" => Stage::Layout,
+            "forward.poem" => Stage::Forward,
+            "formats.poem" => Stage::Formats,
             _ => Stage::Lib,
         }
     }
@@ -92,7 +92,7 @@ fn base() -> GlobalsBuilder {
 /// records the one its package was imported under, and a build serves it only
 /// at the same one: a package is code, and code written against other
 /// builtins does not mean what it meant.
-pub const API: u32 = 1;
+pub const API: u32 = 2;
 
 /// The attribute prefix an artifact carries its package under.
 pub const ATTRIBUTE: &str = "pie.package/";
@@ -113,7 +113,7 @@ impl Package {
         for file in sources.keys() {
             freeze(name, file, &sources, &mut modules, &mut Vec::new())?;
         }
-        let manifest = match modules.get("package.star") {
+        let manifest = match modules.get("package.poem") {
             Some(module) => Manifest::of(name, module)?,
             None => Manifest::default(),
         };
@@ -178,7 +178,7 @@ impl Package {
         out
     }
 
-    /// What the package states of itself in `package.star`.
+    /// What the package states of itself in `package.poem`.
     #[must_use]
     pub fn manifest(&self) -> &Manifest {
         &self.manifest

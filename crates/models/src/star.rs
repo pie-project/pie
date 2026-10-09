@@ -1,6 +1,6 @@
 //! The models written as Starlark packages: every package under the
 //! repository's `models/`, embedded, and the catalog entries its
-//! `package.star` states.
+//! `package.poem` states.
 
 use std::sync::LazyLock;
 

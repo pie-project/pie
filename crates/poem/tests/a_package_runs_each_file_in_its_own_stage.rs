@@ -29,7 +29,7 @@ fn deploy() -> Deploy {
 }
 
 fn package(model: &str, forward: &str) -> anyhow::Result<Package> {
-    Package::new("toy", &[("model.star", model), ("forward.star", forward)])
+    Package::new("toy", &[("model.poem", model), ("forward.poem", forward)])
 }
 
 #[test]
@@ -70,7 +70,7 @@ def layout(id, deploy):
     let why = format!("{why:#}");
     assert!(why.contains("Variable `ops` not found"), "{why}");
     assert!(
-        why.contains("toy/model.star:3"),
+        why.contains("toy/model.poem:3"),
         "at the line that calls one: {why}"
     );
 }
@@ -95,7 +95,7 @@ def forward(m, inputs):
         "{why}"
     );
     assert!(
-        why.contains("toy/forward.star"),
+        why.contains("toy/forward.poem"),
         "it names the script: {why}"
     );
 }
@@ -103,7 +103,7 @@ def forward(m, inputs):
 #[test]
 fn a_stage_loads_no_other_stage() {
     let forward = format!(
-        "load(\"model.star\", \"layout\")\n{CACHES}\ndef forward(m, inputs):\n    return None\n"
+        "load(\"model.poem\", \"layout\")\n{CACHES}\ndef forward(m, inputs):\n    return None\n"
     );
     let why = package(MODEL, &forward)
         .err()
@@ -117,7 +117,7 @@ fn a_stage_loads_no_other_stage() {
 #[test]
 fn a_library_is_loaded_by_the_files_of_its_own_stage() {
     let forward = r#"
-load("//lib/head/forward.star", "read_out")
+load("//lib/head/forward.poem", "read_out")
 
 def caches(m, c):
     pass
@@ -132,9 +132,9 @@ def read_out(m, x):
     let package = Package::new(
         "toy",
         &[
-            ("model.star", MODEL),
-            ("forward.star", forward),
-            ("//lib/head/forward.star", library),
+            ("model.poem", MODEL),
+            ("forward.poem", forward),
+            ("//lib/head/forward.poem", library),
         ],
     )
     .unwrap_or_else(|e| panic!("{e:#}"));
@@ -143,12 +143,12 @@ def read_out(m, x):
         .unwrap_or_else(|e| panic!("{e:#}"));
     assert_eq!(trace.params.len(), 2);
 
-    let layout = "load(\"//lib/head/forward.star\", \"read_out\")\n".to_string() + MODEL;
+    let layout = "load(\"//lib/head/forward.poem\", \"read_out\")\n".to_string() + MODEL;
     let why = Package::new(
         "toy",
         &[
-            ("model.star", &layout),
-            ("//lib/head/forward.star", library),
+            ("model.poem", &layout),
+            ("//lib/head/forward.poem", library),
         ],
     )
     .err()

@@ -320,7 +320,7 @@ so the parity walks eagerly.
 
 **Bisecting a mismatch.**  `--tap <dump key>` on `run`, `collect` and
 `compare` reads an INTERMEDIATE out in the velocity's place: `run` sets the
-family's `PIE_MINI_DIT_TAP` knob (`models/mini_dit/model.star`,
+family's `PIE_MINI_DIT_TAP` knob (`models/mini_dit/model.poem`,
 `tap`) — the plan plants its readout seam on that rectangle, so the artifact
 must be re-imported under the same environment — `collect` lays the pie rows
 out the way the golden's tensor is shaped (a `[B, H, N, DH]` head tensor is
@@ -615,7 +615,7 @@ environment, and `import sglang` needs the whole stack (starlette, orjson, …)
 this box does not have. `vendor/ltx_2/modeling.py` is a self-contained
 transcription of the reference classes — provenance at the top of the file,
 the HUGGING FACE checkpoint's module names throughout, so ONE
-`models/ltx_2/formats.star` reads both this miniature and
+`models/ltx_2/formats.poem` reads both this miniature and
 `Lightricks/LTX-2.5-Diffusers`.
 
 `--mini` writes a random-init miniature (two blocks, two heads a side at the
@@ -739,7 +739,7 @@ channel-major) and 4 keyframe rows. The four unique timesteps are
 `[0.35, 0.999, 0.62, 1.0]` — video, the pinned visual condition, audio, and the
 ref2va audio-reference slot nothing in FL2VA claims.
 
-It also **checks** the claim `models/minimax_h3/forward.star` makes
+It also **checks** the claim `models/minimax_h3/forward.poem` makes
 about the packed row order: pie's `[text | video | audio | reference]` (lanes by
 stream code) and the reference's `[text | refs | audio | video]` answer at
 cos 1.0, because the joint attention is unmasked and every row's rotary

@@ -226,7 +226,7 @@ def formats(m):
 "#;
 
 fn import_vae(src: &ztensor::Source) -> checkpoint::contract::ModelContract {
-    let package = models::star::replacing("ltx25", "formats.star", "formats", VAE_FORMATS)
+    let package = models::star::replacing("ltx25", "formats.poem", "formats", VAE_FORMATS)
         .unwrap_or_else(|why| panic!("the VAE-only package: {why}"));
     package
         .import("ltx25", &flagship(), src, Platform::Cuda)

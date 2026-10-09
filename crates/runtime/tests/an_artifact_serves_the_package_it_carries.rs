@@ -47,9 +47,9 @@ fn a_model_no_catalog_lists_serves_from_its_artifact() {
     let package = Package::new(
         "stranger",
         &[
-            ("package.star", PACKAGE),
-            ("model.star", MODEL),
-            ("forward.star", FORWARD),
+            ("package.poem", PACKAGE),
+            ("model.poem", MODEL),
+            ("forward.poem", FORWARD),
         ],
     )
     .unwrap();

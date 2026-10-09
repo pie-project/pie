@@ -2,7 +2,7 @@
 # fourth, one dense layer and then routed experts (in the released model a
 # latent MoE), the residual stream carried as AttnRes blocks.
 
-load("//lib/adapters/model.star", "banks")
+load("//lib/adapters/model.poem", "banks")
 
 # Where AttnRes blends the residual stream with its closed blocks.
 

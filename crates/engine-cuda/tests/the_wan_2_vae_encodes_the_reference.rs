@@ -18,7 +18,7 @@ def forward(m, inputs):
 "#;
 
 fn vae_only() -> Trace {
-    models::star::replacing("wan22-ti2v-5b", "forward.star", "forward", VAE_ONLY)
+    models::star::replacing("wan22-ti2v-5b", "forward.poem", "forward", VAE_ONLY)
         .unwrap_or_else(|why| panic!("the VAE-only package: {why}"))
         .trace(
             "wan22-ti2v-5b",

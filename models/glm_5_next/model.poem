@@ -3,7 +3,7 @@
 # layers and then routed experts, the residual stream carried as four
 # hyper-connected streams; an optional vision tower and MTP draft head.
 
-load("//lib/adapters/model.star", "banks")
+load("//lib/adapters/model.poem", "banks")
 
 def hyper(streams, norm_eps, gate_eps, alpha, sinkhorn, single_pass = False):
     """The streams' shape and the constants their gates are computed with;
