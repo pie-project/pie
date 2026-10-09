@@ -277,14 +277,9 @@ fn the_bonsai_27b_serves_ptq1_0_and_matches_the_fork_oracle() {
     // Fire the exact fork prompt (no BOS, greedy readout of the last token) as a
     // single chunked prefill.
     shell.open(0).expect("the slot opens");
-    let word = trace_of(
-        "qwen36-27b-bonsai",
-        Dtype::Ptq1_0,
-        Dtype::Bf16,
-        Platform::Metal,
-    )
-    .facts
-    .word(&Request::new(PROMPT_IDS.len() as u32, false));
+    let word = trace
+        .facts
+        .word(&Request::new(PROMPT_IDS.len() as u32, false));
     let out = shell
         .fire(&[Lane {
             slot: 0,

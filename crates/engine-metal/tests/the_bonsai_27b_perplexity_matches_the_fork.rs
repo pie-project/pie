@@ -136,17 +136,6 @@ fn import_zt(gguf: &Path, out: &Path) {
     writer.finish().expect("finish the artifact");
 }
 
-fn word(len: usize) -> u64 {
-    trace_of(
-        "qwen36-27b-bonsai",
-        Dtype::Ptq1_0,
-        Dtype::Bf16,
-        Platform::Metal,
-    )
-    .facts
-    .word(&Request::new(len as u32, false))
-}
-
 /// -log softmax(logits)[target], numerically stable (full-vocab, as the fork).
 fn nll_of(logits: &[f32], target: u32) -> f64 {
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -255,7 +244,7 @@ fn the_bonsai_27b_perplexity_matches_the_fork() {
         let out = shell
             .fire(&[Lane {
                 slot: 0,
-                word: word(prefill.len()),
+                word: trace.facts.word(&Request::new(prefill.len() as u32, false)),
                 tokens: prefill,
             }])
             .expect("the chunk prefill fires");
@@ -271,7 +260,7 @@ fn the_bonsai_27b_perplexity_matches_the_fork() {
             let out = shell
                 .fire(&[Lane {
                     slot: 0,
-                    word: word(1),
+                    word: trace.facts.word(&Request::new(1, false)),
                     tokens: &fed,
                 }])
                 .unwrap_or_else(|why| panic!("decode p={p} (chunk {c}) fires: {why}"));

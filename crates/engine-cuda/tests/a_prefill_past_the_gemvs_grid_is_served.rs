@@ -23,7 +23,6 @@ fn serialized() -> MutexGuard<'static, ()> {
 const PAGE: u32 = 16;
 struct Text {
     name: &'static str,
-    word: fn(u32) -> u64,
     ceiling: u32,
 }
 
@@ -31,27 +30,13 @@ fn traced(id: &str) -> Trace {
     models::star::trace_of(id, Dtype::Bf16, Dtype::Bf16, Platform::Cuda)
 }
 
-fn micro_word(len: u32) -> u64 {
-    traced("qwen3-a3b-micro")
-        .facts
-        .word(&Request::new(len, false))
-}
-
-fn uncached_word(len: u32) -> u64 {
-    traced("qwen3-a3b-uncached-bank")
-        .facts
-        .word(&Request::new(len, false))
-}
-
 const MICRO: Text = Text {
     name: "qwen3-a3b-micro",
-    word: micro_word,
     ceiling: WIDE,
 };
 
 const UNCACHED: Text = Text {
     name: "qwen3-a3b-uncached-bank",
-    word: uncached_word,
     ceiling: BOTH,
 };
 
@@ -193,7 +178,7 @@ fn fire_at(fixture: &Fixture, tokens: u32) -> engine_cuda::Result<(Vec<Vec<f32>>
     shell.open(0).expect("slot 0 opens");
     shell.open(1).expect("slot 1 opens");
     let prompt: Vec<u32> = (0..tokens).map(|t| (t * 7 + 11) % 2048).collect();
-    let word = (fixture.text.word)(tokens);
+    let word = fixture.trace.facts.word(&Request::new(tokens, false));
     shell.fire(&[Lane {
         slot: 0,
         word,

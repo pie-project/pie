@@ -31,6 +31,7 @@
 //! the `KvU4` write/read kernels ship (`SDPA_KV_U4_WIDTHS = [128, 256]`).
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use engine_metal::store::kv::Paging;
 use engine_metal::store::pool_demand;
@@ -183,14 +184,18 @@ fn synth_fixture(dir: &Path, head_dim: usize) {
 }
 
 fn word(query_len: u32) -> u64 {
-    trace_of(
-        "qwen3-micro-text",
-        Dtype::Bf16,
-        Dtype::Bf16,
-        Platform::Metal,
-    )
-    .facts
-    .word(&Request::new(query_len, false))
+    static FACTS: OnceLock<poem_ir::Facts> = OnceLock::new();
+    FACTS
+        .get_or_init(|| {
+            trace_of(
+                "qwen3-micro-text",
+                Dtype::Bf16,
+                Dtype::Bf16,
+                Platform::Metal,
+            )
+            .facts
+        })
+        .word(&Request::new(query_len, false))
 }
 
 /// Which deployment to load: the plain baseline, or the rotated path at a given KV dtype.

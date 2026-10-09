@@ -23,6 +23,7 @@
 //! in `a_buffered_fold_is_the_fold_it_replaces.rs`.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use engine_metal::{Boot, Lane, Shell};
 use models::star::{import_of, trace_of};
@@ -179,14 +180,18 @@ fn synth_fixture(dir: &Path) {
 }
 
 fn word(query_len: u32) -> u64 {
-    trace_of(
-        "qwen3-micro-text",
-        Dtype::Bf16,
-        Dtype::Bf16,
-        Platform::Metal,
-    )
-    .facts
-    .word(&Request::new(query_len, false))
+    static FACTS: OnceLock<poem_ir::Facts> = OnceLock::new();
+    FACTS
+        .get_or_init(|| {
+            trace_of(
+                "qwen3-micro-text",
+                Dtype::Bf16,
+                Dtype::Bf16,
+                Platform::Metal,
+            )
+            .facts
+        })
+        .word(&Request::new(query_len, false))
 }
 
 fn hadamards(trace: &poem_ir::Trace) -> usize {

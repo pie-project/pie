@@ -312,7 +312,7 @@ def parser_default_model() -> str:
 
 
 def _served_model_from_local_config() -> str | None:
-    """`[model] model` (or `deployment`'s model) of the pie config a local server
+    """`[model] model` of the pie config a local server
     was started from, or `None` when there is no such file."""
     import os
     import tomllib

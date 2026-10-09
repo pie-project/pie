@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use engine::fire::{FoldLen, RsReset, RsVerb};
 use engine_cuda::{Boot, Lane, Seated, Shell};
@@ -41,10 +42,14 @@ fn container(snapshot: &Path) -> Option<PathBuf> {
 }
 
 fn word(query_len: u32) -> u64 {
-    models::deployment(DEPLOYMENT)
-        .expect("the catalog ships the deployment")
-        .trace(models::Platform::Cuda)
-        .facts
+    static FACTS: OnceLock<poem_ir::Facts> = OnceLock::new();
+    FACTS
+        .get_or_init(|| {
+            models::deployment(DEPLOYMENT)
+                .expect("the catalog ships the deployment")
+                .trace(Platform::Cuda)
+                .facts
+        })
         .word(&Request::new(query_len, false))
 }
 
