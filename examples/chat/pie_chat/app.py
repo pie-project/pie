@@ -50,7 +50,7 @@ def wheel(chat: Chat):
     return handler
 
 
-_cache = {"version": None, "lines": []}
+_cache = {"key": None, "lines": []}
 RESERVED_ROWS = 5
 
 
@@ -67,7 +67,8 @@ def split_lines(pieces: list[tuple]) -> list[list[tuple]]:
 
 
 def transcript_lines(chat: Chat) -> list[list[tuple]]:
-    if _cache["version"] != chat.version:
+    key = (chat.content_version, chat.frame)
+    if _cache["key"] != key:
         handler = wheel(chat)
         pieces = banner(chat)
         for item in chat.transcript:
@@ -75,7 +76,7 @@ def transcript_lines(chat: Chat) -> list[list[tuple]]:
                 pieces.extend(render(item.text))
             else:
                 pieces.append(item)
-        _cache.update(version=chat.version, lines=split_lines([(p[0], p[1], handler) for p in pieces]))
+        _cache.update(key=key, lines=split_lines([(p[0], p[1], handler) for p in pieces]))
     return _cache["lines"]
 
 

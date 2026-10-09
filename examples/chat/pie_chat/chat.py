@@ -24,7 +24,7 @@ class Chat:
         self.app: Application | None = None
         self.frame = 0
         self.scroll_back = 0
-        self.version = 0
+        self.content_version = 0
         self.last_draw = 0.0
         self.exit_armed = False
         self.exit_key = ""
@@ -49,10 +49,13 @@ class Chat:
 
     def add(self, style: str, text: str) -> None:
         self.transcript.append((style, text))
+        self.content_changed()
+
+    def content_changed(self) -> None:
+        self.content_version += 1
         self.redraw()
 
     def redraw(self) -> None:
-        self.version += 1
         self.last_draw = time.monotonic()
         if self.app:
             self.app.invalidate()
@@ -80,6 +83,7 @@ class Chat:
         try:
             async for piece in self.backend.reply(text):
                 answer.text += piece
+                self.content_version += 1
                 self.redraw_while_streaming()
             self.add("", "\n\n")
             elapsed = round(time.monotonic() - started)
