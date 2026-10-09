@@ -117,6 +117,41 @@ class EngineBackend:
         self.history.append({"role": "assistant", "content": "".join(pieces)})
 
 
+# The pie mascot: 'o' is the pie, 'e' an eye, '.' empty. Two pixel rows share one
+# terminal row, drawn with half-block characters.
+MASCOT_GRID = [
+    "..oooo..",
+    ".oooooo.",
+    "ooeoooe.",
+    "oooo....",
+    "oooo....",
+    ".oooooo.",
+    "..oooo..",
+    "........",
+]
+PIE_COLOR = ACCENT
+EYE_COLOR = "#1c1c1e"
+
+
+def mascot_rows() -> list[list[tuple[str, str]]]:
+    """Return the mascot as rows of styled text fragments, two pixel rows per line."""
+    colors = {"o": PIE_COLOR, "e": EYE_COLOR}
+    lines = []
+    for top, bottom in zip(MASCOT_GRID[0::2], MASCOT_GRID[1::2]):
+        fragments = []
+        for t, b in zip(top, bottom):
+            if t in colors and b in colors:
+                fragments.append((f"fg:{colors[t]} bg:{colors[b]}", "▀"))
+            elif t in colors:
+                fragments.append((f"fg:{colors[t]}", "▀"))
+            elif b in colors:
+                fragments.append((f"fg:{colors[b]}", "▄"))
+            else:
+                fragments.append(("", " "))
+        lines.append(fragments)
+    return lines
+
+
 class PlaceholderBackend:
     """Stands in for the engine: streams a fixed reply, one word at a time."""
 
@@ -157,11 +192,22 @@ class Chat:
     # ---- what is drawn -------------------------------------------------
 
     def banner(self) -> list[tuple[str, str]]:
-        return [
-            ("class:banner", "✻ "), ("class:bold", "pie chat\n"),
-            ("class:dim", f"model {MODEL} · this Mac\n"),
-            ("class:dim", "Ask a question, and the answer streams in as it is written.\n\n"),
+        """The pie mascot on the left, the title and model on the right, as in the Claude logo."""
+        mascot = mascot_rows()
+        info = [
+            [("class:bold", "pie chat")],
+            [("class:dim", f"model {MODEL} · this Mac")],
+            [("class:dim", os.getcwd())],
         ]
+        pieces: list[tuple[str, str]] = []
+        for row in range(len(mascot)):
+            pieces.extend(mascot[row])
+            pieces.append(("", "   "))
+            if row < len(info):
+                pieces.extend(info[row])
+            pieces.append(("", "\n"))
+        pieces.append(("", "\n"))
+        return pieces
 
     def render_transcript(self) -> list[tuple[str, str]]:
         pieces = self.banner()
