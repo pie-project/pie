@@ -121,26 +121,30 @@ class EngineBackend:
 # per frame and vanish, then the cycle repeats. Rows are 0 (top) to 2 (bottom), columns 0 to 9.
 # The fish is drawn on a four-row canvas: row 0 is empty so the bubbles can rise above the body.
 _BODY = {2: "▐▟▙▙▙▛▌", 3: "▜██▄██▛"}  # the half block in the bottom row is the fin
-# Bubbles are always present. A new bubble appears every frame at the lowest half character
-# (the bottom-left quadrant ▖ of the bottom row) and rises one half step per frame up to the top
-# row, then the next bubble takes its place. Bubbles alternate between two columns, so each frame
-# shows eight bubbles at different heights and no two frames match. The loop is eight frames.
+# Bubbles are always present. Each one starts already shifted up by half a character: its first
+# position is the upper-left quadrant (▘) of the bottom row, never the lowest half. It then rises a
+# half step per frame to the top row and vanishes; the next bubble follows. Bubbles alternate
+# between two columns, with uneven spacing, so no two frames match. The loop is eight frames.
 _LOOP = 8
 _SPAWNS = [(0, 8), (3, 8), (6, 8), (2, 9), (5, 9)]  # (frame a bubble appears on, column)
 
 
-def _bubble_at(step):
-    """(row, character) after `step` half-character steps: 0 is the lowest half, 7 the top."""
-    row = 3 - step // 2
-    return row, ("▖" if step % 2 == 0 else "▘")
+def _bubble_at(age):
+    """(row, character) for a bubble `age` half steps old: 1 is the first position, 7 the top."""
+    if not 1 <= age <= 7:
+        return None
+    row = 3 - age // 2
+    return row, ("▖" if age % 2 == 0 else "▘")
 
 
 _BUBBLES = []
 for frame in range(_LOOP):
     bubbles = []
     for spawn_frame, column in _SPAWNS:
-        row, char = _bubble_at((frame - spawn_frame) % _LOOP)
-        bubbles.append((row, column, char))
+        placed = _bubble_at((frame - spawn_frame) % _LOOP)
+        if placed is not None:
+            row, char = placed
+            bubbles.append((row, column, char))
     _BUBBLES.append(bubbles)
 
 BODY_STYLE = "class:accent"
