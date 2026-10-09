@@ -43,10 +43,10 @@ from prompt_toolkit.styles import Style
 
 # The modes shown under the input box, cycled with Shift+Tab: (icon, label, colour)
 MODES = [
-    ("⏵⏵", "auto mode on", "#f5c542"),
+    ("⏵⏵", "auto mode on", "#ffd43b"),
     ("⏸", "manual mode on", "#9a9a9a"),
     ("⏵⏵", "accept edits on", "#a78bfa"),
-    ("⏸", "plan mode on", "#74a89e"),
+    ("⏸", "plan mode on", "#5fd0b4"),
 ]
 ACCENT = "#d97757"  # the warm orange of the demo
 DIM = "#8a8a8a"
