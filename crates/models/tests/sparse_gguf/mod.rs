@@ -1,8 +1,6 @@
 //! GGUFs that state metadata and name tensors without holding them: enough
 //! for an import run in recording mode to say what it would read.
 
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 /// A GGUF metadata value.
@@ -16,7 +14,7 @@ pub enum Kv {
 
 /// Writes a GGUF at `path` stating `kvs`, naming each of `names` as a
 /// one-value f32 tensor.
-pub fn write(path: &Path, kvs: &[(&str, Kv)], names: &[String]) {
+fn write(path: &Path, kvs: &[(&str, Kv)], names: &[String]) {
     fn s(out: &mut Vec<u8>, x: &str) {
         out.extend_from_slice(&(x.len() as u64).to_le_bytes());
         out.extend_from_slice(x.as_bytes());
