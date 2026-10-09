@@ -377,12 +377,6 @@ private struct CaptionsHeightKey: PreferenceKey {
     }
 }
 
-/// Shrinks a control slightly while pressed, without the dimming of the
-/// default style, which would wash out the orb.
-private struct PressScaleButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .scaleEffect(configuration.isPressed ? 0.95 : 1)
-            .animation(.easeOut(duration: 0.15), value: configuration.isPressed)
-    }
-}
+// The controls use the shared `PressScaleButtonStyle` (UI/Motion.swift):
+// it shrinks without the default style's dimming, which would wash out
+// the orb.

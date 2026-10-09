@@ -64,6 +64,9 @@ targets:
         DEVELOPMENT_TEAM: JQ8RG44463
         CODE_SIGN_IDENTITY: "Apple Development"
         TARGETED_DEVICE_FAMILY: "1,2"
+    scheme:
+      testTargets:
+        - PieVoiceUITests
     dependencies:
       - sdk: Security.framework
       - sdk: CoreFoundation.framework
@@ -71,3 +74,21 @@ targets:
       - sdk: Metal.framework
       - sdk: AVFoundation.framework
       - sdk: Speech.framework
+
+  # Real-touch walk through every animated interaction on the demo
+  # backend, recorded by motion-tour.sh. Simulator only.
+  PieVoiceUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: UITests
+    dependencies:
+      - target: PieVoice
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.9"
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        TEST_TARGET_NAME: PieVoice
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: JQ8RG44463

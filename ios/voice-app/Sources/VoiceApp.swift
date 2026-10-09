@@ -55,7 +55,10 @@ final class AppComposition: ObservableObject {
         speech = SpeechSynthesis()
         microphone = MicrophoneInput()
         sample = SampleQuestionInput(resources: Self.sampleResources)
-        chat = ChatController(store: store, backend: engine, speech: speech, settings: settings)
+        // `-PieDemoBackend 1` swaps in canned, paced replies so the
+        // interface can be exercised where the engine cannot run.
+        let backend: ConversationBackend = DemoBackend.isEnabled ? DemoBackend() : engine
+        chat = ChatController(store: store, backend: backend, speech: speech, settings: settings)
         // A build without the recordings simply has no sample question;
         // voice mode hides the menu item rather than failing on tap.
         voice = VoiceModeController(

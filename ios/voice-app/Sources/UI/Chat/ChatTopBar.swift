@@ -38,7 +38,7 @@ struct ChatTopBar: ViewModifier {
 
     private var sidebarButton: some View {
         Button {
-            router.isSidebarOpen = true
+            withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) { router.isSidebarOpen = true }
         } label: {
             SidebarGlyph()
                 .frame(width: 44, height: 44)
