@@ -234,7 +234,7 @@ class Chat:
         # the text starts one line below the top of the mascot, so it sits lower beside it
         info = [
             [],
-            [("class:bold", "Pie Code"), ("class:dim", f" v{ENGINE_VERSION}")],
+            [("fg:#c8cbf2 bold", "Pie Code"), ("class:dim", f" v{ENGINE_VERSION}")],
             [("class:dim", f"{MODEL_NAME} · this Mac")],
             [("class:dim", os.getcwd())],
         ]
