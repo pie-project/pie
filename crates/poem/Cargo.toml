@@ -15,13 +15,22 @@ path = "src/lib.rs"
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 checkpoint = { path = "../checkpoint" }
 ztensor = { workspace = true }
-starlark = { git = "https://github.com/facebook/starlark-rust", rev = "2521d846099f250c8ac1eff1c8e2431f9df33c15" }
-allocative = { git = "https://github.com/facebook/buck2.git", branch = "main" }
-starlark_derive = { git = "https://github.com/facebook/starlark-rust", rev = "2521d846099f250c8ac1eff1c8e2431f9df33c15" }
+starlark = "0.14.2"
+allocative = "0.3.6"
+starlark_derive = "0.14.2"
 anyhow = "1"
 
 [dev-dependencies]
 tempfile = "3"
 
-[lints]
-workspace = true
+# The workspace lints, with unsafe_code at deny rather than forbid: starlark
+# 0.14's `ProvidesStaticType` derive emits an `unsafe impl`, allowed in
+# `star` alone.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "allow"
+
+[lints.clippy]
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"

@@ -9,23 +9,14 @@ use allocative::Allocative;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::{Methods, MethodsBuilder};
 use starlark::starlark_simple_value;
+use starlark::values::ValueLike;
 use starlark::values::list::UnpackList;
 use starlark::values::none::NoneOr;
-use starlark::values::{Heap, NoSerialize, StarlarkPagableUnsupported, StarlarkValue, Value};
+use starlark::values::{Heap, NoSerialize, StarlarkValue, Value};
 use starlark_derive::{starlark_module, starlark_value};
 
 /// A dtype, spelled as the catalog's names spell it (`bf16`, `u4g64`).
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    ProvidesStaticType,
-    NoSerialize,
-    StarlarkPagableUnsupported,
-    Allocative,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct DtypeValue(#[allocative(skip)] pub Dtype);
 
 starlark_simple_value!(DtypeValue);
@@ -52,7 +43,7 @@ pub fn word(dtype: Dtype) -> String {
 }
 
 /// A weight a layout declares.
-#[derive(Debug, Clone, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative)]
+#[derive(Debug, Clone, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct WeightValue(#[allocative(skip)] pub Weight);
 
 starlark_simple_value!(WeightValue);
@@ -159,7 +150,7 @@ fn weight_methods(builder: &mut MethodsBuilder) {
 }
 
 /// The rows a forward branches onto.
-#[derive(Debug, Clone, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative)]
+#[derive(Debug, Clone, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct PredicateValue(#[allocative(skip)] pub Predicate);
 
 starlark_simple_value!(PredicateValue);

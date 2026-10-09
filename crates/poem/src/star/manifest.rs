@@ -8,11 +8,10 @@ use allocative::Allocative;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::{FrozenModule, GlobalsBuilder, Module};
 use starlark::starlark_simple_value;
+use starlark::values::ValueLike;
 use starlark::values::list::{ListRef, UnpackList};
 use starlark::values::none::NoneOr;
-use starlark::values::{
-    NoSerialize, StarlarkPagableUnsupported, StarlarkValue, UnpackValue, Value,
-};
+use starlark::values::{NoSerialize, StarlarkValue, UnpackValue, Value};
 use starlark_derive::{starlark_module, starlark_value};
 
 use crate::Dtype;
@@ -20,16 +19,7 @@ use crate::star::run::Deploy;
 use crate::star::values::{DtypeValue, word};
 
 /// One model a package holds.
-#[derive(
-    Clone,
-    Debug,
-    PartialEq,
-    Eq,
-    ProvidesStaticType,
-    NoSerialize,
-    StarlarkPagableUnsupported,
-    Allocative,
-)]
+#[derive(Clone, Debug, PartialEq, Eq, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct Model {
     pub id: String,
     /// A miniature: a published model's widths at fewer layers or experts,
@@ -63,7 +53,7 @@ impl fmt::Display for Model {
 impl<'v> StarlarkValue<'v> for Model {}
 
 /// One deployment a package lists.
-#[derive(Clone, Debug, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative)]
+#[derive(Clone, Debug, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct Listed {
     pub model: String,
     #[allocative(skip)]
@@ -84,16 +74,7 @@ impl<'v> StarlarkValue<'v> for Listed {}
 /// A drafter published apart from the model it drafts for: its `head`
 /// repository drafts as `drafter` for the `target` repository, served as the
 /// listed `deployment`.
-#[derive(
-    Clone,
-    Debug,
-    PartialEq,
-    Eq,
-    ProvidesStaticType,
-    NoSerialize,
-    StarlarkPagableUnsupported,
-    Allocative,
-)]
+#[derive(Clone, Debug, PartialEq, Eq, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct Published {
     pub target: String,
     pub head: String,
@@ -129,8 +110,8 @@ impl Manifest {
             let list = |name: &str| -> anyhow::Result<Vec<Value<'_>>> {
                 let value = frozen
                     .get(name)
-                    .map_err(|_| anyhow::anyhow!("`{package}/package.poem` states no `{name}`"))?
-                    .add_to_heap(heap);
+                    .map_err(|_| anyhow::anyhow!("`{package}/package.poem` states no `{name}`"))?;
+                let value = heap.access_owned_frozen_value(&value);
                 let items = ListRef::from_value(value).ok_or_else(|| {
                     anyhow::anyhow!("`{package}/package.poem`: `{name}` is no list")
                 })?;

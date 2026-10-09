@@ -15,11 +15,10 @@ use starlark::any::ProvidesStaticType;
 use starlark::environment::{GlobalsBuilder, Methods, MethodsBuilder};
 use starlark::eval::Evaluator;
 use starlark::starlark_simple_value;
+use starlark::values::ValueLike;
 use starlark::values::list::UnpackList;
 use starlark::values::none::{NoneOr, NoneType};
-use starlark::values::{
-    Heap, NoSerialize, StarlarkPagableUnsupported, StarlarkValue, Value as Star,
-};
+use starlark::values::{Heap, NoSerialize, StarlarkValue, Value as Star};
 use starlark_derive::{starlark_module, starlark_value};
 
 use crate::star::values::{DtypeValue, PredicateValue, predicate};
@@ -57,9 +56,7 @@ pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
 }
 
 /// A DSL value a forward holds.
-#[derive(
-    Debug, Clone, Copy, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative,
-)]
+#[derive(Debug, Clone, Copy, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct ValueHandle(pub(crate) u32);
 
 starlark_simple_value!(ValueHandle);
@@ -155,9 +152,7 @@ fn parted(x: &Value, cases: Vec<Predicate>) -> (Vec<Value>, Value) {
 }
 
 /// The rows a forward reads.
-#[derive(
-    Debug, Clone, Copy, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative,
-)]
+#[derive(Debug, Clone, Copy, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct InputHandle(pub(crate) u32);
 
 starlark_simple_value!(InputHandle);
@@ -197,9 +192,7 @@ impl<'v> StarlarkValue<'v> for InputHandle {
 }
 
 /// A cache row a forward reads and writes.
-#[derive(
-    Debug, Clone, Copy, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative,
-)]
+#[derive(Debug, Clone, Copy, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct CacheHandle(#[allocative(skip)] pub(crate) ValueId);
 
 starlark_simple_value!(CacheHandle);
@@ -284,9 +277,7 @@ fn input_methods(builder: &mut MethodsBuilder) {
 }
 
 /// The caches a forward declares, while its `caches` runs.
-#[derive(
-    Debug, Clone, Copy, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative,
-)]
+#[derive(Debug, Clone, Copy, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct SpecHandle;
 
 starlark_simple_value!(SpecHandle);

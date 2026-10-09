@@ -8,12 +8,11 @@ use allocative::Allocative;
 use starlark::any::ProvidesStaticType;
 use starlark::eval::{Arguments, Evaluator};
 use starlark::starlark_simple_value;
+use starlark::values::ValueLike;
 use starlark::values::float::StarlarkFloat;
 use starlark::values::list::ListRef;
 use starlark::values::tuple::TupleRef;
-use starlark::values::{
-    Heap, NoSerialize, StarlarkPagableUnsupported, StarlarkValue, Value as Star,
-};
+use starlark::values::{Heap, NoSerialize, StarlarkValue, Value as Star};
 use starlark_derive::{starlark_module, starlark_value};
 
 use crate::star::forward::{CacheHandle, InputHandle, ValueHandle, held, hold, input_of};
@@ -309,7 +308,7 @@ impl<'v> Arg<'v> for ModulateForm {
 
 /// A value of the DSL a package holds whole: a conv's geometry, a grid
 /// rule, a rope's yarn scaling, a ragged mask.
-#[derive(Debug, Clone, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative)]
+#[derive(Debug, Clone, ProvidesStaticType, NoSerialize, Allocative)]
 pub(crate) struct Whole(#[allocative(skip)] pub(crate) Held);
 
 #[derive(Debug, Clone)]
@@ -396,7 +395,7 @@ pub(crate) fn result<R: Result>(heap: Heap<'_>, r: R) -> anyhow::Result<Star<'_>
 }
 
 /// An op as the value a forward calls.
-#[derive(Clone, Copy, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative)]
+#[derive(Clone, Copy, ProvidesStaticType, NoSerialize, Allocative)]
 pub(crate) struct OpValue(#[allocative(skip)] pub(crate) &'static Op);
 
 impl fmt::Debug for OpValue {
@@ -420,7 +419,7 @@ impl fmt::Display for OpValue {
 starlark_simple_value!(OpValue);
 
 /// An `Input` method, bound to the rows it is called on.
-#[derive(Clone, Copy, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative)]
+#[derive(Clone, Copy, ProvidesStaticType, NoSerialize, Allocative)]
 pub(crate) struct Bound(
     #[allocative(skip)] pub(crate) &'static Op,
     pub(crate) InputHandle,

@@ -9,6 +9,10 @@ pub mod numpy;
 pub mod ops;
 pub mod pattern;
 mod record;
+#[allow(
+    unsafe_code,
+    reason = "starlark 0.14's `ProvidesStaticType` derive emits an `unsafe impl`"
+)]
 pub mod star;
 
 pub use declare::*;
