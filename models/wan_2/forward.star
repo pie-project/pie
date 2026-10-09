@@ -185,8 +185,7 @@ def mid_attention(x, g, a):
 
 def vae_decode(arm, vae, first):
     g0 = arm.grid()
-    z = arm.voxels(0, vae.z, dtype.bf16)
-    z = ops.elemwise.mul_scalar(0.5, ops.elemwise.add(z, z))
+    z = ops.elemwise.copy(arm.voxels(0, vae.z, dtype.bf16))
     z = ops.elemwise.standardize(z, vae.denorm_bias, vae.denorm_scale)
     z, g = vconv(z, g0, vae.post_quant, arm)
     x, _ = vconv(z, g, vae.conv_in, arm)

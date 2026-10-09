@@ -84,6 +84,8 @@ def denoise(arm, m):
         mask = group_block_diagonal(),
     )
 
+    # 1000 - t. An in-place op cannot write a runtime input, so `t + t`
+    # makes the value the scale owns, the scale halving it back.
     t = arm.lane_vector(0, 1)
     u = ops.elemwise.add_bias(dit.t_flip, ops.elemwise.mul_scalar(-0.5, ops.elemwise.add(t, t)))
     temb = ops.elemwise.sinusoid(u, m.t_freq_dim, T_MAX_PERIOD, True, 1.0)
@@ -223,8 +225,9 @@ def run_block(x, b, mods, m, g, tap):
 def decode(arm, m):
     grid = arm.grid()
     z = arm.voxels(0, m.channels, dtype.bf16)
-    z = ops.elemwise.add(z, z)
-    z = ops.elemwise.add_bias(m.vae.latent.shift, ops.elemwise.mul_scalar(f32(0.5 * f32(1.0 / f32(SCALING_FACTOR))), z))
+    # z / s + shift, `z + z` owned (as above) and its halving folded into 1 / s.
+    scale = f32(0.5 * f32(1.0 / f32(SCALING_FACTOR)))
+    z = ops.elemwise.add_bias(m.vae.latent.shift, ops.elemwise.mul_scalar(scale, ops.elemwise.add(z, z)))
     return vae_decode(m.vae, z, grid)
 
 def encode(arm, m):

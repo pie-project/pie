@@ -226,8 +226,7 @@ def resnet(x, g, r):
 
 def vae_decode(arm, vae):
     g = arm.grid()
-    z = arm.voxels(0, vae.z, dtype.bf16)
-    z = ops.elemwise.mul_scalar(0.5, ops.elemwise.add(z, z))
+    z = ops.elemwise.copy(arm.voxels(0, vae.z, dtype.bf16))
     z = ops.elemwise.standardize(z, vae.zero, vae.latents_std)
     z = ops.elemwise.add_bias(vae.latents_mean, z)
 

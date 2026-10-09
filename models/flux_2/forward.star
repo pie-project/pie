@@ -162,6 +162,8 @@ def decode(arm, m):
     lat = m.vae.latent
     grid = arm.grid()
     z = arm.voxels(0, m.in_channels, dtype.bf16)
+    # The standardize below folds in place, and may not write the input:
+    # a unit upsample is the decode's fresh copy of it.
     z, grid = ops.spatial.upsample_nearest(z, grid, [1, 1, 1], False)
     z = ops.elemwise.standardize(z, lat.bn_zero, lat.bn_scale)
     z = ops.elemwise.add_bias(lat.bn_mean, z)
