@@ -1,7 +1,8 @@
-#ifndef PIE_SERVER_H
-#define PIE_SERVER_H
+#ifndef PIE_H
+#define PIE_H
 
-/* pie in-process: the runtime and the Metal engine, reached through sessions
+/* pie in-process: the runtime and this build's engine (Metal on Apple, Vulkan
+   on Android, else what the library was built with), reached through sessions
    that carry the MessagePack frames of `pie serve`'s WebSocket
    (crates/client-api). Calls block; a failed call returns NULL or nonzero and
    stores a message in `*error` (when non-NULL) to free with pie_string_free.
@@ -17,7 +18,7 @@ extern "C" {
 
 typedef struct PieServer PieServer;
 
-/* Boots `artifact` (a `.metal.zt`). `config` is worker::embedded::Settings
+/* Boots `artifact` (a `.zt` for this build's engine). `config` is worker::embedded::Settings
    as TOML or JSON, or NULL; `home` is a writable directory; `listen`
    (`host:port`, or NULL) also serves pie's gateway there. One per process. */
 PieServer *pie_server_start(const char *artifact, const char *config,

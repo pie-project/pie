@@ -1,7 +1,6 @@
-//! The C core of the Swift `PieServer` (include/pie_server.h): a
-//! `worker::Server` on the Metal engine.
-#![cfg(target_vendor = "apple")]
-// Each call's safety contract is its entry in include/pie_server.h.
+//! pie's C library (include/pie.h): a `worker::Server` in the caller's
+//! process, on this build's engine.
+// Each call's safety contract is its entry in include/pie.h.
 #![allow(clippy::missing_safety_doc)]
 
 use std::ffi::{CStr, CString, c_char, c_void};

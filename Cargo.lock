@@ -3784,6 +3784,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pie-c"
+version = "0.5.4"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "tracing-subscriber",
+ "worker",
+]
+
+[[package]]
 name = "pie-client"
 version = "0.5.4"
 dependencies = [
@@ -3905,16 +3915,6 @@ version = "0.5.4"
 dependencies = [
  "pyo3",
  "toml 1.1.4+spec-1.1.0",
- "tracing-subscriber",
- "worker",
-]
-
-[[package]]
-name = "pie-swift-core"
-version = "0.5.4"
-dependencies = [
- "anyhow",
- "serde_json",
  "tracing-subscriber",
  "worker",
 ]

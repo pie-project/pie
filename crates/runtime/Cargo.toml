@@ -120,7 +120,8 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
 getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 
-[target.'cfg(target_os = "ios")'.dependencies]
+# iOS, iPadOS, visionOS, tvOS and watchOS give an app no executable memory.
+[target.'cfg(all(target_vendor = "apple", not(target_os = "macos")))'.dependencies]
 wasmtime = { version = "48.0.1", default-features = false, features = ["pulley"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]

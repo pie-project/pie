@@ -78,7 +78,11 @@ impl Settings {
         );
         let mut engine = toml::Table::new();
         engine.insert("type".into(), kind.as_str().into());
-        engine.insert("device".into(), format!("{}:0", kind.as_str()).into());
+        let device = match kind {
+            EngineKind::CudaNative => "cuda:0".to_string(),
+            kind => format!("{}:0", kind.as_str()),
+        };
+        engine.insert("device".into(), device.into());
         model.insert("engine".into(), engine.into());
         document.insert("model".into(), model.into());
         let mut config = Config::parse(&document.to_string())?;
@@ -139,10 +143,13 @@ impl Settings {
     }
 }
 
-/// The engine this build serves on: Metal on Apple, else Vulkan, else WebGPU.
+/// The engine this build serves on: Metal on Apple, else CUDA, else Vulkan,
+/// else WebGPU.
 fn native_kind() -> EngineKind {
     if cfg!(all(feature = "metal", target_vendor = "apple")) {
         EngineKind::Metal
+    } else if cfg!(feature = "cuda") {
+        EngineKind::CudaNative
     } else if cfg!(feature = "vulkan") {
         EngineKind::Vulkan
     } else {
