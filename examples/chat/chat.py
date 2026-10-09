@@ -143,7 +143,7 @@ def _frame(bubbles):
 
 
 MASCOT_FRAMES = [_frame(bubbles) for bubbles in _BUBBLES]
-FRAME_SECONDS = 0.6  # time between mascot frames
+FRAME_SECONDS = 1.2  # time between mascot frames
 
 
 def mascot_rows(frame: int = 0) -> list[list[tuple[str, str]]]:
