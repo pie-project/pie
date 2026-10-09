@@ -212,7 +212,8 @@ class Chat:
         self.streaming = False
         self.app: Application | None = None
         self.frame = 0  # which mascot frame is drawn; advanced by animate()
-        self.exit_armed = False  # set by the first Ctrl-C on an empty prompt
+        self.exit_armed = False  # set by the first Ctrl-C or Ctrl-D on an empty prompt
+        self.exit_key = ""  # which key armed the exit: "C" or "D"
 
         self.input = Buffer(multiline=False)
         self.input_window = Window(
@@ -262,7 +263,7 @@ class Chat:
 
     def status(self) -> list[tuple[str, str]]:
         if self.exit_armed:
-            hint = " Press Ctrl-C again to exit"
+            hint = f" Press Ctrl-{self.exit_key} again to exit"
         elif self.streaming:
             hint = " answering…"
         else:
@@ -306,16 +307,18 @@ class Chat:
             self.app.create_background_task(self.send(text))
         return False
 
-    def arm_or_exit(self, event) -> None:
-        if self.exit_armed:
+    def arm_or_exit(self, event, key: str) -> None:
+        if self.exit_armed and self.exit_key == key:
             event.app.exit()
             return
         self.exit_armed = True
+        self.exit_key = key
         event.app.invalidate()
         asyncio.get_running_loop().call_later(2.0, self.disarm_exit)
 
     def disarm_exit(self) -> None:
         self.exit_armed = False
+        self.exit_key = ""
         if self.app:
             self.app.invalidate()
 
@@ -338,7 +341,7 @@ class Chat:
             # second press within a couple of seconds quits. With text, it does nothing.
             if self.input.text:
                 return
-            self.arm_or_exit(event)
+            self.arm_or_exit(event, "D")
 
         @bindings.add("c-c")
         def _(event):
@@ -346,7 +349,7 @@ class Chat:
             if self.input.text:
                 self.input.reset()
                 return
-            self.arm_or_exit(event)
+            self.arm_or_exit(event, "C")
 
         self.input.accept_handler = self.on_enter
 
