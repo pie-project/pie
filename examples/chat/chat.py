@@ -172,7 +172,7 @@ class Chat:
         elif self.streaming:
             hint = " answering…"
         else:
-            hint = " Enter sends · /new starts over · Ctrl-C twice or Ctrl-D quits"
+            hint = " Enter sends · /new starts over · Ctrl-C or Ctrl-D twice quits"
         return [("class:status", hint.ljust(200))]
 
     # ---- what happens ----------------------------------------------------
@@ -212,6 +212,14 @@ class Chat:
             self.app.create_background_task(self.send(text))
         return False
 
+    def arm_or_exit(self, event) -> None:
+        if self.exit_armed:
+            event.app.exit()
+            return
+        self.exit_armed = True
+        event.app.invalidate()
+        asyncio.get_running_loop().call_later(2.0, self.disarm_exit)
+
     def disarm_exit(self) -> None:
         self.exit_armed = False
         if self.app:
@@ -224,22 +232,19 @@ class Chat:
 
         @bindings.add("c-d")
         def _(event):
-            event.app.exit()
+            # Like the Claude CLI: on an empty prompt, one press arms the exit and a
+            # second press within a couple of seconds quits. With text, it does nothing.
+            if self.input.text:
+                return
+            self.arm_or_exit(event)
 
         @bindings.add("c-c")
         def _(event):
-            # Like the Claude CLI: clear typed text first; on an empty prompt, one
-            # Ctrl-C arms the exit and a second one within a couple of seconds quits.
+            # Clears typed text first; on an empty prompt it works like Ctrl-D.
             if self.input.text:
                 self.input.reset()
                 return
-            if self.exit_armed:
-                event.app.exit()
-                return
-            self.exit_armed = True
-            event.app.invalidate()
-            loop = asyncio.get_running_loop()
-            loop.call_later(2.0, self.disarm_exit)
+            self.arm_or_exit(event)
 
         self.input.accept_handler = self.on_enter
 

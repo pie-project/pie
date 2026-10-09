@@ -15,4 +15,5 @@ Replies stream from the engine's OpenAI-compatible endpoint
 earlier turns. Flags: `--url` for another address, `--no-engine` to connect only
 (never start one), `--placeholder` to run without an engine.
 
-Enter sends a message. `/new` starts over. Ctrl-D quits.
+Enter sends a message. `/new` starts over. Ctrl-C or Ctrl-D twice quits
+(the first press shows a hint; a second within two seconds exits).
