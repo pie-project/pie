@@ -3,7 +3,7 @@
 
 load("//lib/adapters/model.star", "banks")
 
-def b30(layers = 52):
+def dims(layers = 52):
     return struct(
         hidden = 6656,
         layers = layers,
@@ -11,7 +11,7 @@ def b30(layers = 52):
         q_heads = 32,
         kv_heads = 2,
         head_dim = 128,
-        intermediate = 19968,
+        inter = 19968,
         vocab = 202048,
         window = 2048,
         theta = 500000.0,
@@ -23,8 +23,8 @@ def b30(layers = 52):
     )
 
 DIMS = {
-    "muse-glimmer-30b": b30(),
-    "muse-glimmer-30b-mini-l8": b30(layers = 8),
+    "muse-glimmer-30b": dims(),
+    "muse-glimmer-30b-mini-l8": dims(layers = 8),
 }
 
 def layout(id, deploy):
@@ -38,7 +38,7 @@ def layout(id, deploy):
     hd = d.head_dim
     q_w = d.q_heads * hd
     kv_w = d.kv_heads * hd
-    iw = d.intermediate
+    iw = d.inter
 
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
@@ -65,9 +65,7 @@ def layout(id, deploy):
             lora_b = lora_b,
         )
 
-    lm_head = weight("lm_head", [d.vocab, hidden], proj)
-    if env("PIE_NO_VOCAB_SHARD") == None:
-        lm_head = lm_head.packed([d.vocab])
+    lm_head = weight("lm_head", [d.vocab, hidden], proj).packed([d.vocab])
     return struct(
         hidden = hidden,
         vocab = d.vocab,
