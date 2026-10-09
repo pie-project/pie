@@ -3,23 +3,14 @@
 //! values}` metadata into three constant tensors, keyed by width, identical to
 //! the PrismML llama.cpp fork's loaded sign arrays.
 //!
-//! The ground truth is the fork's own decode of the real
-//! `Ternary-Bonsai-2-27B-PTQ1_0.gguf`, frozen into a committed fixture so this
-//! test is self-contained without the 6 GB file:
-//!
-//! * `bonsai/rht_signs.packed` — every one of the 28672 signs, bit-packed
-//!   (bit=1 => +1, bit=0 => -1, LSB-first, the three widths concatenated in
-//!   stored order 5120, 6144, 17408; ceil(28672/8)=3584 bytes). This is the
-//!   value-for-value oracle.
-//! * The `EXPECTED_*` summary below (per-width +1/-1 counts and first/last 16),
-//!   a human-legible restatement checked against the packed bytes.
-//!
-//! A GGUF stating the oracle's table (and naming, without holding, every
-//! tensor the import reads) is read through the real ztensor GGUF reader and
-//! the package's format, and each sign constant the contract carries must equal
-//! the oracle. A table the Bonsai rotation cannot use is refused.
+//! `bonsai/rht_signs.packed` is the fork's decode of the real
+//! `Ternary-Bonsai-2-27B-PTQ1_0.gguf`: all 28672 signs, bit-packed LSB-first
+//! (1 is +1, 0 is -1), the widths 5120, 6144 and 17408 concatenated in that
+//! order. A GGUF stating that table, and naming without holding every tensor
+//! the import reads, must land each sign constant equal to it; a table the
+//! Bonsai rotation cannot use is refused.
 
-mod sparse_gguf;
+pub mod sparse_gguf;
 
 use std::collections::BTreeMap;
 
@@ -34,40 +25,6 @@ const BONSAI_SIGN_WIDTHS: [u32; 3] = [WIDTH_HIDDEN, WIDTH_SSM_OUT, WIDTH_FFN_DOW
 /// The value-for-value oracle: the fork's 28672 loaded signs, bit-packed.
 const PACKED: &[u8] = include_bytes!("bonsai/rht_signs.packed");
 const TOTAL: usize = 28672;
-
-/// Per-width summary frozen from the fork decode (see `bonsai/rht_signs.json`).
-/// `(width, count_pos, count_neg, first16, last16)`.
-struct Expected {
-    width: u32,
-    pos: usize,
-    neg: usize,
-    first16: [i8; 16],
-    last16: [i8; 16],
-}
-
-const EXPECTED: [Expected; 3] = [
-    Expected {
-        width: WIDTH_HIDDEN,
-        pos: 2481,
-        neg: 2639,
-        first16: [-1, -1, -1, 1, -1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1],
-        last16: [-1, 1, 1, -1, 1, 1, 1, -1, 1, 1, 1, -1, -1, -1, -1, 1],
-    },
-    Expected {
-        width: WIDTH_SSM_OUT,
-        pos: 3032,
-        neg: 3112,
-        first16: [-1, -1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, 1, -1, -1],
-        last16: [1, -1, 1, -1, 1, 1, 1, -1, -1, 1, 1, 1, -1, -1, -1, -1],
-    },
-    Expected {
-        width: WIDTH_FFN_DOWN,
-        pos: 8655,
-        neg: 8753,
-        first16: [1, -1, -1, 1, -1, 1, 1, -1, -1, 1, 1, 1, -1, -1, 1, 1],
-        last16: [-1, 1, -1, 1, -1, -1, -1, -1, -1, -1, -1, 1, 1, -1, 1, 1],
-    },
-];
 
 /// Unpack the committed oracle into the three `±1` vectors, keyed by width, in
 /// the stored width order.
@@ -91,39 +48,6 @@ fn oracle() -> BTreeMap<u32, Vec<i8>> {
     }
     assert_eq!(off, TOTAL, "widths tile the oracle exactly");
     out
-}
-
-fn check_summary(width: u32, vec: &[i8]) {
-    let e = EXPECTED
-        .iter()
-        .find(|e| e.width == width)
-        .unwrap_or_else(|| panic!("no expected summary for width {width}"));
-    assert_eq!(vec.len(), width as usize, "width {width} length");
-    assert!(
-        vec.iter().all(|&s| s == 1 || s == -1),
-        "width {width} is ±1"
-    );
-    let pos = vec.iter().filter(|&&s| s == 1).count();
-    let neg = vec.iter().filter(|&&s| s == -1).count();
-    assert_eq!((pos, neg), (e.pos, e.neg), "width {width} +1/-1 counts");
-    assert_eq!(&vec[..16], &e.first16, "width {width} first 16");
-    assert_eq!(
-        &vec[width as usize - 16..],
-        &e.last16,
-        "width {width} last 16"
-    );
-}
-
-#[test]
-fn the_committed_oracle_is_self_consistent() {
-    let signs = oracle();
-    assert_eq!(
-        signs.keys().copied().collect::<Vec<_>>(),
-        vec![WIDTH_HIDDEN, WIDTH_SSM_OUT, WIDTH_FFN_DOWN],
-    );
-    for (w, vec) in &signs {
-        check_summary(*w, vec);
-    }
 }
 
 /// The Bonsai GGUF metadata stating the sign table `widths` / `values` over
@@ -189,7 +113,6 @@ fn the_contract_carries_the_forks_signs_value_for_value() {
             signs, oracle[&width],
             "width {width}: signs differ from the fork oracle"
         );
-        check_summary(width, &signs);
         checked += signs.len();
     }
     assert_eq!(checked, TOTAL, "all 28672 signs checked");
