@@ -3,20 +3,34 @@ import SwiftUI
 /// ChatGPT's temporary-chat symbol: a speech bubble with a dashed outline,
 /// filled while the open chat is temporary. SF Symbols has no dashed
 /// bubble, so it is drawn.
+///
+/// Turning it on or off swaps the two drawings the way an SF Symbol's
+/// "replace" effect does: the old one shrinks away as the new one grows
+/// in. With Reduce Motion they only crossfade.
 struct TemporaryChatGlyph: View {
     var isFilled = false
     var size: CGFloat = 20
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
-        Group {
+        ZStack {
             if isFilled {
-                SpeechBubbleShape().fill()
+                SpeechBubbleShape()
+                    .fill()
+                    .transition(replace)
             } else {
                 SpeechBubbleShape()
                     .stroke(style: StrokeStyle(lineWidth: size * 0.085, lineCap: .round, dash: [size * 0.12, size * 0.13]))
+                    .transition(replace)
             }
         }
         .frame(width: size, height: size)
+        .animation(Motion.control, value: isFilled)
+    }
+
+    private var replace: AnyTransition {
+        reduceMotion ? .opacity : .scale(scale: 0.5).combined(with: .opacity)
     }
 }
 

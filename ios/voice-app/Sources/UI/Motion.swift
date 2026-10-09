@@ -133,6 +133,9 @@ enum Haptics {
     private static let selectionGenerator = UISelectionFeedbackGenerator()
     private static let notification = UINotificationFeedbackGenerator()
     private static var lastTick: TimeInterval = 0
+    /// Set while voice mode is up: its replies stream through the same
+    /// path as typed ones, and ChatGPT's voice mode does not tick.
+    static var isStreamingSuppressed = false
 
     /// A discrete action: send, stop, copy, regenerate, a chip.
     static func tap(enabled: Bool) {
@@ -160,13 +163,24 @@ enum Haptics {
     }
 
     /// One tick of the streaming train, at most every 70 ms: called each
-    /// time new words are revealed, it reads as the phone typing.
+    /// time new words are revealed, it reads as the phone typing. Like
+    /// ChatGPT (its iOS FAQ), the train stays off in Low Power Mode and
+    /// below 20% battery, where a long reply's ticks cost real charge.
     static func streamTick(enabled: Bool) {
-        guard enabled else { return }
+        guard enabled, !isStreamingSuppressed, !streamingTicksSaveBattery else { return }
         let now = ProcessInfo.processInfo.systemUptime
         guard now - lastTick >= 0.07 else { return }
         lastTick = now
         soft.impactOccurred(intensity: 0.5)
         soft.prepare()
+    }
+
+    private static var streamingTicksSaveBattery: Bool {
+        if ProcessInfo.processInfo.isLowPowerModeEnabled { return true }
+        let device = UIDevice.current
+        if !device.isBatteryMonitoringEnabled { device.isBatteryMonitoringEnabled = true }
+        let level = device.batteryLevel
+        let charging = device.batteryState == .charging || device.batteryState == .full
+        return level >= 0 && level < 0.2 && !charging
     }
 }

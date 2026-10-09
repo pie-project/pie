@@ -43,23 +43,111 @@ struct MarkdownTable: Equatable {
 /// writes.
 ///
 /// It reads line by line and never needs a line it has not been given,
-/// so a reply parsed again after every streamed token keeps its earlier
-/// blocks as they were and only the last one grows. That is what keeps
-/// the rendering from flickering while the model writes. It is lenient
+/// so as a reply grows its earlier blocks stay as they were and only the
+/// last one changes. That is what keeps the rendering from flickering
+/// while the model writes, and what lets `parseStreaming` keep the
+/// finished blocks and parse only the last one again. It is lenient
 /// where models are sloppy: code inside a list item may be unindented,
 /// and a table may be drawn as soon as its delimiter row starts.
 enum MarkdownParser {
+    /// A finished reply, parsed once and cached.
     static func parse(_ source: String) -> [MarkdownBlock] {
         let key = source as NSString
         if let cached = cache.object(forKey: key) { return cached.blocks }
-        let lines = source
-            .replacingOccurrences(of: "\r\n", with: "\n")
-            .components(separatedBy: "\n")
-            .map(expandingLeadingTabs)
-        var parser = BlockParser(lines: lines)
+        var parser = BlockParser(lines: lines(of: source).map(\.text))
         let blocks = parser.parse()
         cache.setObject(Parsed(blocks), forKey: key)
         return blocks
+    }
+
+    /// A reply that is still streaming, parsed again for every reveal.
+    ///
+    /// Text appended later can change only the last two blocks: the last
+    /// one grows, and a last line still being written can join the block
+    /// before it (`3` becoming `3.`, the next item of a list above a blank
+    /// line). Every block before those is closed. So the closed blocks of
+    /// the previous call are kept and only the text from the start of the
+    /// second-to-last block on is parsed again, which keeps the work per
+    /// reveal from growing with the reply. Nothing here goes into the
+    /// cache of finished replies.
+    @MainActor
+    static func parseStreaming(_ source: String) -> [MarkdownBlock] {
+        var closed: [MarkdownBlock] = []
+        var resumeAt = 0
+        if let memo = streamMemo,
+           source.utf8.count >= memo.openStart,
+           source.utf8.starts(with: memo.source.utf8.prefix(memo.openStart)) {
+            closed = memo.closedBlocks
+            resumeAt = memo.openStart
+        }
+        let rest = String(Substring(source.utf8.dropFirst(resumeAt)))
+        let lines = lines(of: rest)
+        var parser = BlockParser(lines: lines.map(\.text))
+        let blocks = parser.parse()
+
+        // The last two blocks are the part the next call parses again.
+        // With no blocks yet, nothing is closed: start from the same place.
+        let open = min(2, blocks.count)
+        let openStart = open > 0 ? resumeAt + lines[parser.startLines[blocks.count - open]].start : resumeAt
+        streamMemo = StreamMemo(
+            source: source,
+            closedBlocks: closed + blocks.dropLast(open),
+            openStart: openStart
+        )
+        return closed + blocks
+    }
+
+    /// While a reply streams, its last line can be the start of something
+    /// that is not decided yet: a lone `-` or `*` (a list item, a rule,
+    /// bold text?), `#` (a heading), backticks (a code fence), or a line
+    /// starting with `|` (a table's header, drawn as plain text with its
+    /// pipes until the delimiter row under it starts). Showing those and
+    /// then redrawing them as something else flickers; this leaves them
+    /// out until the next words decide them. Finished replies are shown
+    /// whole.
+    static func withoutUndecidedEnd(_ source: String) -> String {
+        guard let lastBreak = source.lastIndex(of: "\n") else {
+            return isUndecided(source[...], previous: nil, beforePrevious: nil) ? "" : source
+        }
+        let last = source[source.index(after: lastBreak)...]
+        let head = source[..<lastBreak]
+        let previousBreak = head.lastIndex(of: "\n")
+        let previous = previousBreak.map { head[head.index(after: $0)...] } ?? head
+        let beforePrevious: Substring? = previousBreak.map { break_ in
+            let earlier = head[..<break_]
+            return earlier.lastIndex(of: "\n").map { earlier[earlier.index(after: $0)...] } ?? earlier
+        }
+        guard isUndecided(last, previous: previous, beforePrevious: beforePrevious) else { return source }
+        // A delimiter row with no dash yet hides the header above it too.
+        if isTableHeader(previous, before: beforePrevious), Line.isBareDelimiterStart(last) {
+            return String(source[..<(previousBreak ?? source.startIndex)])
+        }
+        return String(head)
+    }
+
+    private static func isUndecided(_ line: Substring, previous: Substring?, beforePrevious: Substring?) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return false }
+        if trimmed.allSatisfy({ "-*+_#`~=".contains($0) }) { return true }
+        guard trimmed.hasPrefix("|") else { return false }
+        if let previous, isTableHeader(previous, before: beforePrevious) {
+            // The delimiter row under a header: undecided only until its
+            // first dash arrives, when the table is drawn.
+            return Line.isBareDelimiterStart(line)
+        }
+        if let previous, previous.trimmingCharacters(in: .whitespaces).hasPrefix("|") {
+            // A row of a table already drawn; only a bare `|` is held.
+            return trimmed == "|"
+        }
+        // A header that has no delimiter row under it yet.
+        return true
+    }
+
+    /// A line that would be a table's header if a delimiter row followed:
+    /// it starts with a pipe and the line above it is not a table row.
+    private static func isTableHeader(_ line: Substring, before: Substring?) -> Bool {
+        guard line.trimmingCharacters(in: .whitespaces).hasPrefix("|") else { return false }
+        return !(before?.trimmingCharacters(in: .whitespaces).hasPrefix("|") ?? false)
     }
 
     private final class Parsed {
@@ -74,6 +162,34 @@ enum MarkdownParser {
         cache.countLimit = 256
         return cache
     }()
+
+    /// The previous streaming parse. Only one reply streams at a time.
+    private struct StreamMemo {
+        var source: String
+        /// The blocks before the last two.
+        var closedBlocks: [MarkdownBlock]
+        /// Where the second-to-last block starts in `source`, in UTF-8
+        /// bytes.
+        var openStart: Int
+    }
+
+    @MainActor private static var streamMemo: StreamMemo?
+
+    /// The source's lines, each with where it starts (in UTF-8 bytes, so
+    /// a streaming parse can find its place again). A `\r` before a line
+    /// break is dropped, and leading tabs are expanded.
+    private static func lines(of source: String) -> [(text: String, start: Int)] {
+        var result: [(text: String, start: Int)] = []
+        var start = 0
+        for piece in source.split(separator: "\n", omittingEmptySubsequences: false) {
+            var line = String(piece)
+            let length = line.utf8.count
+            if line.hasSuffix("\r") { line.removeLast() }
+            result.append((expandingLeadingTabs(line), start))
+            start += length + 1
+        }
+        return result
+    }
 
     /// Indentation decides list nesting, so a leading tab counts as the
     /// spaces up to the next multiple of four, as CommonMark has it.
@@ -97,6 +213,9 @@ private struct BlockParser {
     private var index = 0
     private var blocks: [MarkdownBlock] = []
     private var paragraph: [String] = []
+    private var paragraphStart = 0
+    /// The line each of `blocks` starts on.
+    private(set) var startLines: [Int] = []
 
     init(lines: [String]) {
         self.lines = lines
@@ -105,30 +224,38 @@ private struct BlockParser {
     mutating func parse() -> [MarkdownBlock] {
         while index < lines.count {
             let line = lines[index]
+            let start = index
             if Line.isBlank(line) {
                 flushParagraph()
                 index += 1
             } else if let fence = Fence(opening: line) {
                 flushParagraph()
                 parseCode(fence)
+                startLines.append(start)
             } else if let heading = Line.heading(line) {
                 flushParagraph()
                 blocks.append(.heading(level: heading.level, text: heading.text))
+                startLines.append(start)
                 index += 1
             } else if Line.isRule(line) {
                 flushParagraph()
                 blocks.append(.rule)
+                startLines.append(start)
                 index += 1
             } else if Line.isQuote(line) {
                 flushParagraph()
                 parseQuote()
+                startLines.append(start)
             } else if ListMarker(line) != nil {
                 flushParagraph()
                 parseList()
+                startLines.append(start)
             } else if let alignments = tableAlignments(headerAt: index) {
                 flushParagraph()
                 parseTable(alignments: alignments)
+                startLines.append(start)
             } else {
+                if paragraph.isEmpty { paragraphStart = index }
                 paragraph.append(line.trimmingCharacters(in: .whitespaces))
                 index += 1
             }
@@ -140,6 +267,7 @@ private struct BlockParser {
     private mutating func flushParagraph() {
         guard !paragraph.isEmpty else { return }
         blocks.append(.paragraph(paragraph.joined(separator: "\n")))
+        startLines.append(paragraphStart)
         paragraph.removeAll()
     }
 
@@ -467,6 +595,13 @@ private enum Line {
             }
         }
         return alignments + Array(repeating: .leading, count: columns - alignments.count)
+    }
+
+    /// The beginning of a table's delimiter row before its first dash: only
+    /// pipes, colons and spaces.
+    static func isBareDelimiterStart(_ line: Substring) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        return trimmed.hasPrefix("|") && trimmed.allSatisfy { "|: ".contains($0) }
     }
 
     static func padded(_ cells: [String], to count: Int) -> [String] {

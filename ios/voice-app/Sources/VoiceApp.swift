@@ -87,6 +87,9 @@ final class AppComposition: ObservableObject {
     func launch() {
         guard !didLaunch else { return }
         didLaunch = true
+        // Learns how this device hides the keyboard from the first hide
+        // of any kind, before the first send needs to know.
+        KeyboardDismissal.startListening()
 
         if BenchmarkRunner.isEnabled {
             BenchmarkRunner.run(backend: engine)

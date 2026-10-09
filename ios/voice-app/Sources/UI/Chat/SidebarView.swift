@@ -8,15 +8,39 @@ import SwiftUI
 /// deleting asks first. The rows have no swipe actions: a leftward swipe
 /// anywhere on the sidebar closes it, as in ChatGPT, and on a row it would
 /// otherwise reveal (or, swiped far enough, carry out) a delete.
+///
+/// The sidebar is always there, off screen while shut, so it watches as
+/// little as it can. Of the open chat it needs only the id (for the
+/// highlight), and `SidebarContent` compares equal unless that changed: a
+/// streamed token or a keystroke, which every observer of the chat hears
+/// about, does not regroup or redraw the history.
 struct SidebarView: View {
-    @EnvironmentObject private var store: ChatStore
     @EnvironmentObject private var chat: ChatController
+
+    var body: some View {
+        SidebarContent(chat: chat, openID: chat.conversation.id)
+            .equatable()
+    }
+}
+
+private struct SidebarContent: View, Equatable {
+    /// For its actions only; reading it here would not redraw this view.
+    let chat: ChatController
+    /// The open conversation, highlighted in the list.
+    let openID: UUID
+
+    @EnvironmentObject private var store: ChatStore
     @EnvironmentObject private var router: AppRouter
+    @EnvironmentObject private var newChat: NewChatTransition
 
     @State private var query = ""
     @State private var renaming: Conversation?
     @State private var renameText = ""
     @State private var deleting: Conversation?
+
+    static func == (lhs: SidebarContent, rhs: SidebarContent) -> Bool {
+        lhs.openID == rhs.openID
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -29,6 +53,9 @@ struct SidebarView: View {
             .scrollContentBackground(.hidden)
             .scrollDismissesKeyboard(.immediately)
             .environment(\.defaultMinListRowHeight, 36)
+            // Results and their section headers slide and fade into place
+            // as the query changes, rather than blinking.
+            .animation(Motion.content, value: query)
             Rectangle().fill(Theme.hairline).frame(height: 0.5)
             settingsRow
         }
@@ -65,10 +92,14 @@ struct SidebarView: View {
                         Image(systemName: "xmark.circle.fill")
                             .foregroundStyle(Theme.tertiaryInk)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(PressDimButtonStyle())
                     .accessibilityLabel("Clear search")
+                    .transition(.popIn())
                 }
             }
+            // The clear button pops in with the first letter and out when
+            // the field is emptied.
+            .animation(Motion.control, value: query.isEmpty)
             .padding(.horizontal, 12)
             .frame(minHeight: 40)
             .background(Theme.surfaceStrong.opacity(0.6), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -82,7 +113,7 @@ struct SidebarView: View {
                     .frame(width: 44, height: 44)
                     .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(PressDimButtonStyle())
             .accessibilityLabel("New chat")
         }
         .padding(.leading, 14)
@@ -105,8 +136,9 @@ struct SidebarView: View {
             SidebarShortcutRow(title: "Talk to Pie") {
                 Image(systemName: "waveform")
             } action: {
-                router.isSidebarOpen = false
-                router.isVoiceModePresented = true
+                // Voice mode rises once the drawer has slid shut, so the
+                // two motions do not cross.
+                router.closeSidebar { router.isVoiceModePresented = true }
             }
         }
         .listRowBackground(Color.clear)
@@ -116,7 +148,7 @@ struct SidebarView: View {
 
     @ViewBuilder
     private var history: some View {
-        let sections = ChatStore.grouped(query.isEmpty ? store.conversations : store.search(query))
+        let sections = (query.isEmpty ? store.groupedHistory() : ChatStore.grouped(store.search(query)))
             .map { HistorySection(title: $0.title, items: $0.items) }
         if sections.isEmpty && !query.isEmpty {
             Text("No chats match \u{201C}\(query)\u{201D}")
@@ -125,7 +157,7 @@ struct SidebarView: View {
                 .padding(.top, 16)
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
-                .listRowInsets(Self.rowInsets)
+                .listRowInsets(Self.headerInsets)
         }
         ForEach(sections) { section in
             Text(section.title)
@@ -136,7 +168,7 @@ struct SidebarView: View {
                 .accessibilityAddTraits(.isHeader)
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
-                .listRowInsets(Self.rowInsets)
+                .listRowInsets(Self.headerInsets)
             ForEach(section.items) { conversation in
                 conversationRow(conversation)
             }
@@ -144,10 +176,8 @@ struct SidebarView: View {
     }
 
     private func conversationRow(_ conversation: Conversation) -> some View {
-        let isOpen = conversation.id == chat.conversation.id
-        return SidebarConversationRow(conversation: conversation, isOpen: isOpen) {
-            chat.open(conversation.id)
-            router.isSidebarOpen = false
+        SidebarConversationRow(conversation: conversation, isOpen: conversation.id == openID) {
+            open(conversation)
         }
         .contextMenu {
             Button {
@@ -162,11 +192,7 @@ struct SidebarView: View {
                 Label("Delete", systemImage: "trash")
             }
         }
-        .listRowBackground(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isOpen ? Theme.accentWash : Color.clear)
-                .padding(.horizontal, 8)
-        )
+        .listRowBackground(Color.clear)
         .listRowSeparator(.hidden)
         .listRowInsets(Self.rowInsets)
     }
@@ -195,33 +221,56 @@ struct SidebarView: View {
                     .foregroundStyle(Theme.secondaryInk)
                     .accessibilityHidden(true)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 8)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressHighlightButtonStyle(cornerRadius: 12))
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
         .accessibilityLabel("Pie Voice settings")
     }
 
     // MARK: - Actions
 
-    private func startChat(temporary: Bool) {
-        chat.newChat(temporary: temporary)
+    /// ChatGPT swaps the chat behind the sidebar at once (no fade, no
+    /// scrolling) and lets the closing drawer reveal it, already at its
+    /// last message.
+    private func open(_ conversation: Conversation) {
+        var swap = Transaction()
+        swap.disablesAnimations = true
+        withTransaction(swap) {
+            chat.open(conversation.id)
+        }
         router.isSidebarOpen = false
     }
 
+    /// The chat behind fades to the greeting as the drawer closes over it.
+    private func startChat(temporary: Bool) {
+        newChat.start(chat, temporary: temporary)
+        router.isSidebarOpen = false
+    }
+
+    /// The store animates the row's new title in place.
     private func rename(_ conversation: Conversation) {
         let title = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty else { return }
         store.rename(conversation.id, to: title)
     }
 
+    /// The row collapses out of the list (the store animates it).
     private func delete(_ conversation: Conversation) {
-        store.delete(conversation.id)
-        // The controller would save the open thread again on its next
-        // change; start a fresh one instead, as ChatGPT does.
-        if conversation.id == chat.conversation.id {
-            chat.newChat()
+        guard conversation.id == chat.conversation.id else {
+            store.delete(conversation.id)
+            return
+        }
+        // The open chat: start a fresh one instead, as ChatGPT does (the
+        // controller would otherwise save the deleted thread again on its
+        // next change). The sidebar stays open, so the chat beside it
+        // visibly fades to the greeting; the delete and the swap happen
+        // together once it has faded out.
+        newChat.start(chat) {
+            store.delete(conversation.id)
         }
     }
 
@@ -229,7 +278,11 @@ struct SidebarView: View {
         Binding(get: { item.wrappedValue != nil }, set: { if !$0 { item.wrappedValue = nil } })
     }
 
-    private static let rowInsets = EdgeInsets(top: 0, leading: 20, bottom: 0, trailing: 16)
+    /// Rows run nearly edge to edge so their pressed and open highlights
+    /// are inset 8 points, as in ChatGPT; their text keeps the 20-point
+    /// margin of the section titles.
+    private static let rowInsets = EdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8)
+    private static let headerInsets = EdgeInsets(top: 0, leading: 20, bottom: 0, trailing: 16)
 }
 
 private struct HistorySection: Identifiable {

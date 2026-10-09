@@ -1,6 +1,7 @@
 import AVFoundation
 import Combine
 import Foundation
+import SwiftUI
 
 /// The voices the Settings screen offers, sorted the way a person should
 /// meet them: natural-sounding voices first, the old synthetic ones (Fred,
@@ -10,6 +11,11 @@ import Foundation
 /// The order, the legacy flag and the "Automatic" voice all come from
 /// `SpeechSynthesis`, the code that actually speaks, so what this screen
 /// says is what plays.
+///
+/// Motion: a reload publishes only when something changed, and inside
+/// `withMotion`, so a downloaded voice, the "Get a more natural voice"
+/// hint going away or a Personal Voice permission arriving eases the
+/// list into its new shape instead of snapping rows in and out.
 @MainActor
 final class VoiceCatalog: ObservableObject {
 
@@ -77,13 +83,39 @@ final class VoiceCatalog: ObservableObject {
     private var voicesDidChange: AnyCancellable?
     private var personalVoiceWait: AnyCancellable?
 
+    /// Everything a reload reads, as one value, so a reload can tell
+    /// whether anything changed before it publishes.
+    private struct Snapshot: Equatable {
+        var personalVoiceAccess: PersonalVoiceAccess
+        var natural: [Voice]
+        var legacy: [Voice]
+        var personal: [Voice]
+        var automatic: Voice?
+    }
+
+    /// The list the last catalog read. The next Settings sheet opens with
+    /// it at once, instead of enumerating every installed voice on the
+    /// main thread while its content is built, which holds back the start
+    /// of the slide up; it checks the list once the sheet is up
+    /// (`refreshIfOpenedFromCache`).
+    private static var lastSnapshot: Snapshot?
+
+    /// True when this catalog started from `lastSnapshot` and has not
+    /// re-read the voices since.
+    private var openedFromCache = false
+
     /// How long to wait for a just-allowed Personal Voice to be listed.
     /// Long enough for the notification that lists it, short enough that
     /// someone who has never made one is not left watching a spinner.
     private static let personalVoiceListingTimeout: TimeInterval = 3
 
     init() {
-        reload()
+        if let cached = Self.lastSnapshot {
+            apply(cached)
+            openedFromCache = true
+        } else {
+            apply(Self.readSnapshot())
+        }
         // Posted when a voice finishes downloading in the Settings app or a
         // Personal Voice becomes available, so the list and the hint keep
         // up without reopening the screen.
@@ -118,40 +150,105 @@ final class VoiceCatalog: ObservableObject {
     /// use it either (a deleted download, or a Personal Voice Pie may no
     /// longer use), in which case it speaks with Automatic instead.
     func voice(withID id: String) -> Voice? {
-        if let listed = (personal + natural + legacy).first(where: { $0.id == id }) {
-            return listed
+        Self.voice(withID: id, personal: personal, natural: natural, legacy: legacy, access: personalVoiceAccess)
+    }
+
+    /// Re-reads the installed voices. Publishes only when something
+    /// changed, animated, so an unchanged list (the usual case when the
+    /// app comes back to the foreground) redraws nothing.
+    func reload() {
+        openedFromCache = false
+        let snapshot = Self.readSnapshot()
+        guard snapshot != currentSnapshot else { return }
+        withMotion(Motion.content) {
+            apply(snapshot)
         }
-        // A voice chosen before the iPhone's language changed is still
-        // installed and still what speaks, though it is not listed.
-        guard let voice = AVSpeechSynthesisVoice(identifier: id) else { return nil }
-        let isPersonal = voice.voiceTraits.contains(.isPersonalVoice)
-        if isPersonal && personalVoiceAccess != .authorized { return nil }
-        return Voice(
-            id: voice.identifier,
-            name: voice.name,
-            quality: Quality(voice.quality),
-            language: voice.language,
-            isLegacy: SpeechSynthesis.isLegacyVoice(voice) || Self.isEloquence(voice.identifier),
-            isPersonal: isPersonal
+    }
+
+    /// Settings calls this once its sheet has finished sliding up: a
+    /// catalog that opened with the last list read checks it now, so a
+    /// voice downloaded while Settings was closed still shows up.
+    func refreshIfOpenedFromCache() {
+        guard openedFromCache else { return }
+        reload()
+    }
+
+    private var currentSnapshot: Snapshot {
+        Snapshot(
+            personalVoiceAccess: personalVoiceAccess,
+            natural: natural,
+            legacy: legacy,
+            personal: personal,
+            automatic: automatic
         )
     }
 
-    func reload() {
-        personalVoiceAccess = SpeechSynthesis.personalVoiceAccess
+    private func apply(_ snapshot: Snapshot) {
+        personalVoiceAccess = snapshot.personalVoiceAccess
+        natural = snapshot.natural
+        legacy = snapshot.legacy
+        personal = snapshot.personal
+        automatic = snapshot.automatic
+        Self.lastSnapshot = snapshot
+    }
+
+    private static func readSnapshot() -> Snapshot {
+        let access = SpeechSynthesis.personalVoiceAccess
 
         let available = SpeechSynthesis.availableVoices().filter { !$0.isPersonalVoice }
         let listed = available.map(Self.voice)
-        natural = listed.filter { !$0.isLegacy }
-        legacy = listed.filter(\.isLegacy).sorted { ($0.name, $0.id) < ($1.name, $1.id) }
-        personal = SpeechSynthesis.personalVoices().map(Self.voice)
+        let natural = listed.filter { !$0.isLegacy }
+        let legacy = listed.filter(\.isLegacy).sorted { ($0.name, $0.id) < ($1.name, $1.id) }
+        let personal = SpeechSynthesis.personalVoices().map(Self.voice)
 
         // `SpeechSynthesis` speaks with the first voice it does not flag as
         // legacy, in this same order, or with the system's own voice for
         // the language when there is none. Eloquence voices are shown with
         // the legacy ones here but can still be that first voice.
         let language = AVSpeechSynthesisVoice.currentLanguageCode()
-        automatic = available.first { !$0.isLegacy }.map(Self.voice)
-            ?? AVSpeechSynthesisVoice(language: language).flatMap { voice(withID: $0.identifier) }
+        let automatic = available.first { !$0.isLegacy }.map(Self.voice)
+            ?? AVSpeechSynthesisVoice(language: language).flatMap {
+                voice(withID: $0.identifier, personal: personal, natural: natural, legacy: legacy, access: access)
+            }
+
+        return Snapshot(
+            personalVoiceAccess: access,
+            natural: natural,
+            legacy: legacy,
+            personal: personal,
+            automatic: automatic
+        )
+    }
+
+    /// `voice(withID:)` against given lists, so a reload can resolve
+    /// Automatic against the lists it has just read.
+    private static func voice(
+        withID id: String,
+        personal: [Voice],
+        natural: [Voice],
+        legacy: [Voice],
+        access: PersonalVoiceAccess
+    ) -> Voice? {
+        // Searched list by list rather than through a joined array: the
+        // picker asks once per body and Settings a few times per redraw.
+        if let listed = personal.first(where: { $0.id == id })
+            ?? natural.first(where: { $0.id == id })
+            ?? legacy.first(where: { $0.id == id }) {
+            return listed
+        }
+        // A voice chosen before the iPhone's language changed is still
+        // installed and still what speaks, though it is not listed.
+        guard let voice = AVSpeechSynthesisVoice(identifier: id) else { return nil }
+        let isPersonal = voice.voiceTraits.contains(.isPersonalVoice)
+        if isPersonal && access != .authorized { return nil }
+        return Voice(
+            id: voice.identifier,
+            name: voice.name,
+            quality: Quality(voice.quality),
+            language: voice.language,
+            isLegacy: SpeechSynthesis.isLegacyVoice(voice) || isEloquence(voice.identifier),
+            isPersonal: isPersonal
+        )
     }
 
     /// Asks for Personal Voice, only ever on the user's tap. The completion
@@ -175,7 +272,11 @@ final class VoiceCatalog: ObservableObject {
     /// passes, for someone who has not made one) lets the tap still choose
     /// and preview it instead of only listing it.
     private func waitForPersonalVoice(completion: @escaping @MainActor (Voice?) -> Void) {
-        isLookingForPersonalVoice = true
+        // The "Looking for your Personal Voice" row eases in, and out
+        // below, like every other change to the list.
+        withMotion(Motion.content) {
+            isLookingForPersonalVoice = true
+        }
         let changes = NotificationCenter.default
             .publisher(for: AVSpeechSynthesizer.availableVoicesDidChangeNotification)
             .map { _ in false }
@@ -189,7 +290,9 @@ final class VoiceCatalog: ObservableObject {
                 self.reload()
                 guard timedOut || !self.personal.isEmpty else { return }
                 self.personalVoiceWait = nil
-                self.isLookingForPersonalVoice = false
+                withMotion(Motion.content) {
+                    self.isLookingForPersonalVoice = false
+                }
                 completion(self.personal.first)
             }
     }

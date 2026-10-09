@@ -62,15 +62,45 @@ final class VoiceModeController: ObservableObject {
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var isActive = false
     @Published private(set) var isMuted = false
-    /// 0...1, from the microphone.
-    @Published private(set) var inputLevel: Float = 0
-    /// 0...1, from what is being spoken.
-    @Published private(set) var outputLevel: Float = 0
-    /// What the user is saying or just said.
-    @Published private(set) var userCaption = ""
-    /// The reply as it streams.
-    @Published private(set) var assistantCaption = ""
+    /// Voice mode has started but the microphone is not ready yet: the
+    /// permission and speech-asset check is still out. The orb shows it
+    /// is connecting until then.
+    @Published private(set) var isConnecting = false
     @Published private(set) var availability: VoiceInputAvailability?
+
+    /// The microphone's and the voice's loudness. They change with every
+    /// audio buffer, 30 to 60 times a second, so they are not published:
+    /// publishing would redraw all of voice mode each time. The orb reads
+    /// them once per frame instead.
+    let levels = VoiceLevelMeter()
+    /// 0...1, from the microphone.
+    private(set) var inputLevel: Float {
+        get { levels.input }
+        set { levels.input = newValue }
+    }
+    /// 0...1, from what is being spoken.
+    private(set) var outputLevel: Float {
+        get { levels.output }
+        set { levels.output = newValue }
+    }
+
+    /// The live captions, as the captions view shows them. The reply's
+    /// changes with every word, so it lives only there: only the captions
+    /// view redraws for it.
+    let captions = VoiceCaptions()
+    /// What the user is saying or just said. Still published (the soak
+    /// test watches it); it changes a few times a second, not per word.
+    @Published private(set) var userCaption = "" {
+        didSet { captions.user = userCaption }
+    }
+    /// The reply as it streams, in whole words.
+    private(set) var assistantCaption: String {
+        get { captions.assistant }
+        set { captions.assistant = newValue }
+    }
+    /// The reply's text so far, including a word still arriving, which
+    /// `assistantCaption` leaves off until it is complete.
+    private var replyText = ""
 
     /// Bundled sample questions exist.
     var hasSampleQuestions: Bool {
@@ -225,6 +255,7 @@ final class VoiceModeController: ObservableObject {
         phase = .listening
         userCaption = ""
         assistantCaption = ""
+        replyText = ""
         inputLevel = 0
         outputLevel = 0
 
@@ -255,9 +286,15 @@ final class VoiceModeController: ObservableObject {
         if speech.isSpeaking { speech.stop() }
         isActive = false
         isMuted = false
+        isConnecting = false
         phase = .idle
         inputLevel = 0
         outputLevel = 0
+        // Cleared now rather than at the next start, so voice mode never
+        // opens showing the last visit's captions for a frame.
+        userCaption = ""
+        assistantCaption = ""
+        replyText = ""
     }
 
     /// Speaking or thinking: interrupt and listen. Listening: finish the
@@ -328,9 +365,12 @@ final class VoiceModeController: ObservableObject {
         isSamplePlaying = true
         sampleRequest += 1
         let request = sampleRequest
+        // The recording drives the orb from here, microphone or not.
+        isConnecting = false
         phase = .listening
         userCaption = ""
         assistantCaption = ""
+        replyText = ""
         inputLevel = 0
         sample.delegate = sampleRelay
 
@@ -360,10 +400,14 @@ final class VoiceModeController: ObservableObject {
     /// from the last check is not the answer now.
     private func prepareAndListen() {
         let current = visit
+        isConnecting = true
         Task {
             let availability = await microphone.prepare()
             guard isActive, visit == current else { return }
             self.availability = availability
+            // Ready or not, the check is over: the orb stops connecting
+            // and shows listening, or the failure below.
+            isConnecting = false
             if availability.isReady {
                 startMicrophone()
             } else {
@@ -403,6 +447,7 @@ final class VoiceModeController: ObservableObject {
     private func beginTurn(_ utterance: String) {
         userCaption = utterance
         assistantCaption = ""
+        replyText = ""
         switch chat.engineState {
         case .ready:
             break
@@ -440,11 +485,18 @@ final class VoiceModeController: ObservableObject {
         }
     }
 
-    /// One chunk of reply text: captioned at once, spoken a sentence at a
-    /// time so speech overlaps the rest of the generation.
+    /// One chunk of reply text: captioned as soon as it completes a word,
+    /// spoken a sentence at a time so speech overlaps the rest of the
+    /// generation.
     private func receive(_ delta: String, turn: UInt64) {
         guard activeTurn == turn else { return }
-        assistantCaption += delta
+        replyText += delta
+        // Whole words only: the caption fades each new word in, and a
+        // token is often a piece of one.
+        if let wordEnd = replyText.lastIndex(where: \.isWhitespace) {
+            let words = replyText[..<wordEnd].trimmingCharacters(in: .whitespacesAndNewlines)
+            if words != assistantCaption { assistantCaption = words }
+        }
         for sentence in chunker.push(delta) {
             speak(sentence)
         }
@@ -473,6 +525,8 @@ final class VoiceModeController: ObservableObject {
     private func finishGenerating(turn: UInt64, message: StoredMessage?) {
         guard activeTurn == turn else { return }
         isGenerating = false
+        // The last word has no space after it.
+        assistantCaption = replyText.trimmingCharacters(in: .whitespacesAndNewlines)
         if let rest = chunker.flush() {
             speak(rest)
         }
@@ -834,6 +888,7 @@ final class VoiceModeController: ObservableObject {
     fileprivate func inputDidFail(_ error: Error, from source: InputRelay.Source) {
         guard isActive else { return }
         inputLevel = 0
+        if source == .microphone { isConnecting = false }
         switch source {
         case .sample:
             guard isSamplePlaying else { return }
@@ -948,4 +1003,41 @@ private final class InputRelay: @preconcurrency SpeechInputDelegate {
     func speechInputDidFail(_ error: Error) {
         owner?.inputDidFail(error, from: source)
     }
+}
+
+/// Voice mode's two loudness levels, 0...1 (0 is -50 dB): written by the
+/// controller as each audio buffer is measured, read by the orb once per
+/// frame. A plain class rather than published state, so the levels reach
+/// the orb without redrawing anything else. Main thread only.
+@MainActor
+final class VoiceLevelMeter {
+    /// The microphone; zero while muted.
+    var input: Float = 0
+    /// The voice speaking the reply.
+    var output: Float = 0
+}
+
+/// Voice mode's live captions, kept apart from the controller's other
+/// state because they change with every word: only the captions view
+/// watches this object, so a word arriving redraws the captions and
+/// nothing else.
+@MainActor
+final class VoiceCaptions: ObservableObject {
+    /// What the user is saying or just said.
+    @Published fileprivate(set) var user = "" {
+        didSet {
+            // The user started talking again with the last reply still
+            // captioned: their words go under it, in the order said.
+            if oldValue.isEmpty, !user.isEmpty, !assistant.isEmpty { replyComesFirst = true }
+        }
+    }
+    /// The reply, in whole words.
+    @Published fileprivate(set) var assistant = "" {
+        didSet {
+            if assistant.isEmpty { replyComesFirst = false }
+        }
+    }
+    /// The reply on screen is older than the user's words: it is shown
+    /// above them rather than below.
+    @Published private(set) var replyComesFirst = false
 }

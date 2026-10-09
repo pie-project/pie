@@ -2,10 +2,17 @@ import SwiftUI
 
 /// One parsed Markdown block. Lists and quotes hold blocks of their own,
 /// so this view nests itself.
-struct MarkdownBlockView: View {
+///
+/// Equatable on its values, so while a reply streams only the block that
+/// grew is drawn again.
+struct MarkdownBlockView: View, Equatable {
     let block: MarkdownBlock
-    /// The last block of a reply that is still being written: it carries
-    /// the streaming dot and closes the spans the model has left open.
+    /// Part of a reply that is still streaming: its text fades new words
+    /// in, and a block that appears fades in.
+    var isLive = false
+    /// The last block of a reply that is still being written: it closes
+    /// the spans the model has left open, and appeared just now if it is
+    /// new.
     var isStreamingTail = false
     var listDepth = 0
 
@@ -30,21 +37,25 @@ struct MarkdownBlockView: View {
                     RoundedRectangle(cornerRadius: 1.5).fill(Theme.surfaceStrong).frame(width: 3)
                 }
         case .code(let language, let code):
-            withTrailingDot(CodeBlockView(language: language, code: code))
+            CodeBlockView(language: language, code: code, isLive: isLive, startsFresh: isStreamingTail)
         case .rule:
-            withTrailingDot(Rectangle().fill(Theme.hairline).frame(height: 1).padding(.vertical, 6))
+            Rectangle().fill(Theme.hairline).frame(height: 1).padding(.vertical, 6)
+                .modifier(FadeInWhenNew(isNew: isLive && isStreamingTail))
         case .table(let table):
-            withTrailingDot(MarkdownTableView(table: table))
+            MarkdownTableView(table: table)
+                .modifier(FadeInWhenNew(isNew: isLive && isStreamingTail))
         }
     }
 
     // MARK: - Pieces
 
-    private func inlineText(_ source: String) -> Text {
-        guard isStreamingTail else { return Text(MarkdownInline.render(source)) }
-        var attributed = MarkdownInline.render(MarkdownInline.closingOpenSpans(source))
-        attributed.append(MarkdownInline.streamingDot)
-        return Text(attributed)
+    private func inlineText(_ source: String) -> RevealText {
+        // The end of a streaming reply changes with every word: closed
+        // spans, and not cached.
+        let attributed = isStreamingTail
+            ? MarkdownInline.render(MarkdownInline.closingOpenSpans(source), cached: false)
+            : MarkdownInline.render(source)
+        return RevealText(attributed, isLive: isLive, startsFresh: isStreamingTail)
     }
 
     private func listView(_ list: MarkdownList) -> some View {
@@ -57,15 +68,19 @@ struct MarkdownBlockView: View {
                         .monospacedDigit()
                         .frame(minWidth: list.isOrdered ? 20 : 12, alignment: .trailing)
                         .accessibilityHidden(!list.isOrdered)
+                        // A new item's marker fades in with its first words.
+                        .modifier(FadeInWhenNew(isNew: isLive && isStreamingTail && isLastItem))
                     VStack(alignment: .leading, spacing: 8) {
                         MarkdownBlockView(
                             block: .paragraph(item.text),
+                            isLive: isLive,
                             isStreamingTail: isStreamingTail && isLastItem && item.children.isEmpty,
                             listDepth: listDepth
                         )
                         ForEach(Array(item.children.enumerated()), id: \.offset) { childOffset, child in
                             MarkdownBlockView(
                                 block: child,
+                                isLive: isLive,
                                 isStreamingTail: isStreamingTail && isLastItem
                                     && childOffset == item.children.count - 1,
                                 listDepth: listDepth + 1
@@ -82,22 +97,11 @@ struct MarkdownBlockView: View {
             ForEach(Array(blocks.enumerated()), id: \.offset) { offset, child in
                 MarkdownBlockView(
                     block: child,
+                    isLive: isLive,
                     isStreamingTail: isStreamingTail && offset == blocks.count - 1,
                     listDepth: listDepth
                 )
             }
-        }
-    }
-
-    @ViewBuilder
-    private func withTrailingDot<Content: View>(_ content: Content) -> some View {
-        if isStreamingTail {
-            VStack(alignment: .leading, spacing: 10) {
-                content
-                StreamingDot()
-            }
-        } else {
-            content
         }
     }
 
@@ -119,5 +123,26 @@ struct MarkdownBlockView: View {
         case 3: return .headline
         default: return .system(.subheadline, weight: .semibold)
         }
+    }
+}
+
+/// A block that appears while a reply streams (a code block's frame, a
+/// table, a rule, a list item's marker) fades in instead of popping in,
+/// as the words in it do. One that is already there when the view is
+/// built (a finished reply, an older block) just shows.
+struct FadeInWhenNew: ViewModifier {
+    @State private var isShown: Bool
+
+    init(isNew: Bool) {
+        _isShown = State(initialValue: !isNew)
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(isShown ? 1 : 0)
+            .onAppear {
+                guard !isShown else { return }
+                withAnimation(Motion.fadeIn) { isShown = true }
+            }
     }
 }

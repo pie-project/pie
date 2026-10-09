@@ -34,11 +34,17 @@ struct AttachmentSheet: View {
             importFile(result)
         }
         .fullScreenCover(isPresented: $isCameraPresented) {
-            CameraPicker { data in
+            CameraPicker { image in
                 let chat = self.chat
                 isCameraPresented = false
                 router.isAttachmentSheetPresented = false
-                Task { await chat.addPhoto(data) }
+                Task {
+                    guard let data = await CameraPicker.jpegData(from: image) else {
+                        chat.banner = "Couldn't read that photo"
+                        return
+                    }
+                    await chat.addPhoto(data)
+                }
             } onCancel: {
                 isCameraPresented = false
             }
@@ -59,7 +65,7 @@ struct AttachmentSheet: View {
                 PhotosPicker(selection: $photoItem, matching: .images, photoLibrary: .shared()) {
                     tileLabel("Photos", symbol: "photo.on.rectangle")
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(Self.tileStyle)
                 .accessibilityLabel("Photos")
                 tile("Files", symbol: "folder") { isImportingFile = true }
             }
@@ -95,6 +101,8 @@ struct AttachmentSheet: View {
                 }
             }
             .background(Theme.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            // Keeps a pressed row's highlight inside the rounded corners.
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         }
         .padding(.horizontal, 16)
         .padding(.top, 28)
@@ -146,11 +154,14 @@ struct AttachmentSheet: View {
 
     // MARK: - Pieces
 
+    /// Tiles are cards: pressed, they shrink a touch, as ChatGPT's do.
+    private static let tileStyle = PressScaleButtonStyle(pressedScale: 0.97)
+
     private func tile(_ title: String, symbol: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             tileLabel(title, symbol: symbol)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(Self.tileStyle)
         .accessibilityLabel(title)
     }
 
@@ -182,7 +193,8 @@ struct AttachmentSheet: View {
             .padding(.vertical, 10)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        // The gray pressed fill of a list row.
+        .buttonStyle(PressHighlightButtonStyle(cornerRadius: 0))
     }
 
     private func rowLabel(_ title: String, subtitle: String, symbol: String) -> some View {

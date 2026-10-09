@@ -3,74 +3,121 @@ import UIKit
 
 /// The row of small icons under a finished reply: copy, thumbs up and
 /// down, read aloud, regenerate, share.
+///
+/// Every glyph change is a symbol replace, so it morphs rather than
+/// flickers: copy becomes a checkmark for two seconds (a second copy
+/// restarts the two seconds), a thumb fills and the other thumb fades
+/// away (as in ChatGPT), and the speaker fills and its waves animate while
+/// the reply is read aloud. Each tap has a light haptic. A reply with no
+/// text (stopped before its first word) offers nothing to copy, read or
+/// share.
 struct MessageActionBar: View {
     let message: StoredMessage
     let isReadingAloud: Bool
-    let canRegenerate: Bool
     let actions: MessageActions
 
+    @Environment(\.canRegenerate) private var canRegenerate
+    @EnvironmentObject private var settings: AppSettings
     @State private var didCopy = false
+    /// Bumped by every copy, so a second tap restarts the two seconds.
+    @State private var copies = 0
 
     var body: some View {
         HStack(spacing: 0) {
-            icon(didCopy ? "checkmark" : "doc.on.doc", label: didCopy ? "Copied" : "Copy") {
-                UIPasteboard.general.string = message.text
-                didCopy = true
+            if hasText {
+                copyButton
             }
-            icon(
-                message.feedback == .good ? "hand.thumbsup.fill" : "hand.thumbsup",
-                label: "Good response",
-                isSelected: message.feedback == .good
-            ) {
-                actions.setFeedback(message.feedback == .good ? nil : .good, message.id)
+            if message.feedback != .bad {
+                thumb(.good).transition(.opacity)
             }
-            icon(
-                message.feedback == .bad ? "hand.thumbsdown.fill" : "hand.thumbsdown",
-                label: "Bad response",
-                isSelected: message.feedback == .bad
-            ) {
-                actions.setFeedback(message.feedback == .bad ? nil : .bad, message.id)
+            if message.feedback != .good {
+                thumb(.bad).transition(.opacity)
             }
-            icon(isReadingAloud ? "stop.fill" : "speaker.wave.2", label: isReadingAloud ? "Stop reading aloud" : "Read aloud") {
-                actions.toggleReadAloud(message.id)
+            if hasText {
+                readAloudButton
             }
             Menu {
-                RegenerateMenuItems { mode in actions.regenerate(message.id, mode) }
+                RegenerateMenuItems { mode in
+                    Haptics.tap(enabled: settings.haptics)
+                    actions.regenerate(message.id, mode)
+                }
             } label: {
                 glyph("arrow.clockwise")
             }
             .disabled(!canRegenerate)
             .accessibilityLabel("Regenerate")
-            ShareLink(item: message.text) {
-                glyph("square.and.arrow.up")
+            if hasText {
+                ShareLink(item: message.text) {
+                    glyph("square.and.arrow.up")
+                }
+                .buttonStyle(PressDimButtonStyle())
+                .accessibilityLabel("Share")
             }
-            .accessibilityLabel("Share")
             Spacer(minLength: 0)
         }
         .foregroundStyle(Theme.secondaryInk)
         // The 44 pt targets are wider than their glyphs; pull the first one
         // back so its glyph lines up with the reply's text.
         .padding(.leading, -13)
-        .task(id: didCopy) {
-            guard didCopy else { return }
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            didCopy = false
+        .task(id: copies) {
+            guard copies > 0 else { return }
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(Motion.control) { didCopy = false }
         }
     }
 
-    private func icon(
-        _ symbol: String,
-        label: String,
-        isSelected: Bool = false,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            glyph(symbol)
-                .foregroundStyle(isSelected ? Theme.accent : Theme.secondaryInk)
+    private var hasText: Bool {
+        !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var copyButton: some View {
+        Button {
+            UIPasteboard.general.string = message.text
+            Haptics.tap(enabled: settings.haptics)
+            withAnimation(Motion.control) { didCopy = true }
+            copies += 1
+        } label: {
+            glyph(didCopy ? "checkmark" : "doc.on.doc")
+                .contentTransition(.symbolEffect(.replace))
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(label)
+        .buttonStyle(PressDimButtonStyle())
+        .accessibilityLabel(didCopy ? "Copied" : "Copy")
+        .accessibilityIdentifier("doc.on.doc")
+    }
+
+    /// The controller animates the change, so the glyph morphs to its
+    /// filled form and the other thumb fades out (or back in).
+    private func thumb(_ kind: Feedback) -> some View {
+        let isSelected = message.feedback == kind
+        let symbol = kind == .good ? "hand.thumbsup" : "hand.thumbsdown"
+        return Button {
+            Haptics.selection(enabled: settings.haptics)
+            actions.setFeedback(isSelected ? nil : kind, message.id)
+        } label: {
+            glyph(isSelected ? symbol + ".fill" : symbol)
+                .foregroundStyle(isSelected ? Theme.accent : Theme.secondaryInk)
+                .contentTransition(.symbolEffect(.replace))
+        }
+        .buttonStyle(PressDimButtonStyle())
+        .accessibilityLabel(kind == .good ? "Good response" : "Bad response")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    /// While the reply is read aloud the speaker fills and its waves
+    /// sweep; tapping it again stops.
+    private var readAloudButton: some View {
+        Button {
+            Haptics.tap(enabled: settings.haptics)
+            actions.toggleReadAloud(message.id)
+        } label: {
+            glyph(isReadingAloud ? "speaker.wave.2.fill" : "speaker.wave.2")
+                .foregroundStyle(isReadingAloud ? Theme.accent : Theme.secondaryInk)
+                .contentTransition(.symbolEffect(.replace))
+                .symbolEffect(.variableColor.iterative, options: .repeating, isActive: isReadingAloud)
+        }
+        .buttonStyle(PressDimButtonStyle())
+        .accessibilityLabel(isReadingAloud ? "Stop reading aloud" : "Read aloud")
     }
 
     private func glyph(_ symbol: String) -> some View {

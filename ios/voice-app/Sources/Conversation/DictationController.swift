@@ -6,6 +6,11 @@ import Foundation
 /// not the user being done, so each finished utterance is kept and the
 /// next one started until the user taps done (`finish(into:)`) or cancel.
 /// A session that ends having heard nothing is left closed.
+///
+/// Opening and closing are animated here, where they happen, so the
+/// composer crossfades between its text field and the recording strip
+/// whoever opens or closes dictation (the mic, done, cancel, read-aloud,
+/// a refused permission).
 @MainActor
 final class DictationController: ObservableObject {
 
@@ -22,11 +27,26 @@ final class DictationController: ObservableObject {
             NotificationCenter.default.post(name: Self.activityDidChange, object: self)
         }
     }
-    @Published private(set) var level: Float = 0
-    @Published private(set) var transcript = ""
-    /// Seconds since dictation started.
+    /// The last microphone level, 0...1. Not published: it changes about
+    /// 30 times a second, and each publish re-rendered the whole composer.
+    /// The waveform reads `meter` once per display frame instead.
+    private(set) var level: Float = 0
+    /// What has been heard so far. Not published: nothing on screen shows
+    /// it, and it changes with every partial result.
+    private(set) var transcript = ""
+    /// Seconds since dictation started, published once a second (the clock
+    /// shows whole seconds).
     @Published private(set) var elapsed: TimeInterval = 0
     @Published private(set) var availability: VoiceInputAvailability?
+    /// The microphone stopped on its own (silence, an error); what was
+    /// heard waits for done or cancel. The waveform holds still and dims.
+    @Published private(set) var isPaused = false
+    /// Done was tapped and the last words are being transcribed (up to
+    /// `finishTimeout`); the done button shows a spinner meanwhile.
+    @Published private(set) var isFinishing = false
+
+    /// The recent loudness, for the waveform.
+    let meter = DictationLevelMeter()
 
     private let microphone: SpeechInput
 
@@ -54,20 +74,22 @@ final class DictationController: ObservableObject {
         guard !isDictating else { return }
         session += 1
         let current = session
-        isDictating = true
         committed = ""
         partial = ""
         transcript = ""
         level = 0
-        elapsed = 0
+        meter.reset()
         target = nil
+        setOpen(true)
         microphone.delegate = self
         startTicker()
 
         Task {
             let availability = await microphone.prepare()
             guard isDictating, session == current else { return }
-            self.availability = availability
+            // The composer hides the strip while dictation is known to be
+            // refused; this eases it in if permission has since been given.
+            withMotion(Motion.crossfade) { self.availability = availability }
             guard availability.isReady else {
                 reset()
                 return
@@ -80,6 +102,9 @@ final class DictationController: ObservableObject {
     func finish(into chat: ChatController) {
         guard isDictating, target == nil else { return }
         target = chat
+        isFinishing = true
+        // The clock stops at the moment done was tapped.
+        ticker?.cancel()
         guard microphone.isListening else {
             deliver()
             return
@@ -110,6 +135,10 @@ final class DictationController: ObservableObject {
     // MARK: - Session
 
     private func listen() {
+        // Only when it changes: a needless publish right after opening (the
+        // microphone is often ready within the same frame) would cancel the
+        // opening crossfade; see `setOpen(_:)`.
+        if isPaused { isPaused = false }
         microphone.delegate = self
         do {
             try microphone.start(mode: .dictation)
@@ -124,6 +153,8 @@ final class DictationController: ObservableObject {
     private func pause() {
         commit(partial)
         level = 0
+        meter.report(0)
+        isPaused = true
         ticker?.cancel()
         if target != nil { deliver() }
     }
@@ -151,17 +182,32 @@ final class DictationController: ObservableObject {
 
     private func reset() {
         session += 1
-        isDictating = false
         committed = ""
         partial = ""
         transcript = ""
         level = 0
-        elapsed = 0
         target = nil
         ticker?.cancel()
         ticker = nil
         finishDeadline?.cancel()
         finishDeadline = nil
+        setOpen(false)
+    }
+
+    /// Opens or closes dictation, with every published change of it in one
+    /// animated transaction, so the composer crossfades between the field
+    /// and the strip. All in one on purpose: measured in the Simulator, a
+    /// plain publish from this controller in the same turn (resetting the
+    /// clock, say) took the animation away and the strip appeared in a
+    /// single frame. `elapsed` is reset on opening only, so a closing clock
+    /// does not flash back to 0:00 as it fades.
+    private func setOpen(_ open: Bool) {
+        withMotion(Motion.crossfade) {
+            if open { elapsed = 0 }
+            isPaused = false
+            isFinishing = false
+            isDictating = open
+        }
     }
 
     private func startTicker() {
@@ -171,7 +217,10 @@ final class DictationController: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 250_000_000)
                 guard !Task.isCancelled, let self else { return }
-                self.elapsed = -started.timeIntervalSinceNow
+                let elapsed = -started.timeIntervalSinceNow
+                // Only when the shown second changes: each publish
+                // re-renders the composer.
+                if Int(elapsed) != Int(self.elapsed) { self.elapsed = elapsed }
             }
         }
     }
@@ -213,6 +262,7 @@ extension DictationController: @preconcurrency SpeechInputDelegate {
     func speechInputDidUpdateLevel(_ level: Float) {
         guard isDictating else { return }
         self.level = level
+        meter.report(level)
     }
 
     func speechInputDidDetectSpeechOnset() {}

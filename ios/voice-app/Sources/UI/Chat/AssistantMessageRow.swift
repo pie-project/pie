@@ -2,8 +2,14 @@ import SwiftUI
 import UIKit
 
 /// A reply: no bubble, full width, Markdown. While it is on its way it
-/// shows the pulsing dot, then "Thinking", then the text with a streaming
-/// dot; once finished, the action row and, if enabled, the engine stats.
+/// shows the pulsing dot, then "Thinking" (in thinking mode), then the
+/// text as it streams; once finished, the action row and, if enabled, the
+/// engine stats.
+///
+/// The dot sits over the row's top-left corner, where the first word (or
+/// "Thinking") will be, so each one fades out exactly where the next fades
+/// in. The controls fade in a moment after the last word, below the
+/// reply, without moving it.
 ///
 /// Equatable on its values (not its closures or binding), so the list can
 /// skip every reply but the one that is streaming.
@@ -13,7 +19,6 @@ struct AssistantMessageRow: View, Equatable {
     /// every other message.
     let livePhase: ChatController.ReplyPhase?
     let isReadingAloud: Bool
-    let canRegenerate: Bool
     let showsStats: Bool
     let actions: MessageActions
     let sheet: Binding<MessageSheet?>
@@ -22,7 +27,6 @@ struct AssistantMessageRow: View, Equatable {
         lhs.message == rhs.message
             && lhs.livePhase == rhs.livePhase
             && lhs.isReadingAloud == rhs.isReadingAloud
-            && lhs.canRegenerate == rhs.canRegenerate
             && lhs.showsStats == rhs.showsStats
     }
 
@@ -34,43 +38,60 @@ struct AssistantMessageRow: View, Equatable {
                     isThinking: isThinking,
                     thoughtSeconds: message.thoughtSeconds
                 )
+                .transition(.opacity)
             }
 
-            if message.isStreaming && message.text.isEmpty {
-                if !isThinking { PulsingDot() }
-            } else if !message.text.isEmpty {
+            if !message.text.isEmpty {
                 MarkdownView(text: message.text, isStreaming: message.isStreaming)
                     .equatable()
                     .contentShape(Rectangle())
                     .contextMenu { contextMenuItems }
-            }
-
-            if message.wasStopped {
-                Label("Stopped", systemImage: "stop.circle")
-                    .font(.footnote)
-                    .foregroundStyle(Theme.tertiaryInk)
+                    .transition(.opacity)
             }
 
             if !message.isStreaming {
-                VStack(alignment: .leading, spacing: 0) {
-                    MessageActionBar(
-                        message: message,
-                        isReadingAloud: isReadingAloud,
-                        canRegenerate: canRegenerate,
-                        actions: actions
-                    )
-                    if showsStats, let stats = message.stats {
-                        EngineStatsCaption(stats: stats)
-                    }
-                }
+                footer
+                    .transition(.asymmetric(
+                        insertion: .opacity.animation(Motion.fadeIn.delay(0.06)),
+                        removal: .opacity.animation(Motion.fadeOut)
+                    ))
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, minHeight: isWaiting ? PulsingDot.lineHeight : nil, alignment: .topLeading)
+        .overlay(alignment: .topLeading) {
+            if isWaiting {
+                PulsingDot()
+                    .transition(.asymmetric(insertion: .identity, removal: .opacity.animation(Motion.fadeOut)))
+            }
+        }
+    }
+
+    /// Sent, and nothing has come back yet.
+    private var isWaiting: Bool {
+        message.isStreaming && message.text.isEmpty && !isThinking
     }
 
     private var isThinking: Bool {
         if case .thinking = livePhase { return true }
         return false
+    }
+
+    private var footer: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if message.wasStopped {
+                Label("Stopped", systemImage: "stop.circle")
+                    .font(.footnote)
+                    .foregroundStyle(Theme.tertiaryInk)
+            }
+            MessageActionBar(
+                message: message,
+                isReadingAloud: isReadingAloud,
+                actions: actions
+            )
+            if showsStats, let stats = message.stats {
+                EngineStatsCaption(stats: stats)
+            }
+        }
     }
 
     @ViewBuilder
@@ -91,12 +112,7 @@ struct AssistantMessageRow: View, Equatable {
             } label: {
                 Label(isReadingAloud ? "Stop Reading" : "Read Aloud", systemImage: isReadingAloud ? "stop.fill" : "speaker.wave.2")
             }
-            Button {
-                actions.regenerate(message.id, nil)
-            } label: {
-                Label("Regenerate", systemImage: "arrow.clockwise")
-            }
-            .disabled(!canRegenerate)
+            RegenerateContextButton(regenerate: { actions.regenerate(message.id, nil) })
             Button {
                 actions.setFeedback(message.feedback == .good ? nil : .good, message.id)
             } label: {
@@ -108,5 +124,20 @@ struct AssistantMessageRow: View, Equatable {
                 Label("Bad response", systemImage: message.feedback == .bad ? "hand.thumbsdown.fill" : "hand.thumbsdown")
             }
         }
+    }
+}
+
+/// The context menu's Regenerate, disabled while a reply is being
+/// generated. It reads that from the environment, so the flag flipping at
+/// every send and finish does not redraw every reply in the list.
+private struct RegenerateContextButton: View {
+    let regenerate: () -> Void
+    @Environment(\.canRegenerate) private var canRegenerate
+
+    var body: some View {
+        Button(action: regenerate) {
+            Label("Regenerate", systemImage: "arrow.clockwise")
+        }
+        .disabled(!canRegenerate)
     }
 }

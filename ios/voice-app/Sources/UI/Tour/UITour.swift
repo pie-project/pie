@@ -27,6 +27,7 @@ enum UITour {
         let script = TourScript(chat: chat, voice: voice, router: router, settings: settings, store: store)
         Task { @MainActor in
             await script.run()
+            ChatStore.finishPendingWrites()
             exit(0)
         }
     }

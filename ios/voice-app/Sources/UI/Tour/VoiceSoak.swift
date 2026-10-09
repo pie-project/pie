@@ -67,6 +67,7 @@ enum VoiceSoak {
         )
         Task { @MainActor in
             await script.run()
+            ChatStore.finishPendingWrites()
             exit(0)
         }
     }

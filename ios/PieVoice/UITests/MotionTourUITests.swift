@@ -140,8 +140,13 @@ final class MotionTourUITests: XCTestCase {
         pause(1.2)
         if tapButton("label == 'Scroll to bottom'", "scroll-to-bottom") { pause(1.2) }
 
-        // Copy feedback on the finished reply.
+        // Copy feedback, thumbs and regenerate on the finished reply.
         if tapButton("identifier == 'doc.on.doc'", "copy") { pause(1.5) }
+        if tapButton("label == 'Good response'", "thumbs-up") { pause(1.2) }
+        if tapButton("label == 'Regenerate'", "regenerate-menu") {
+            pause(1.0)
+            if tapButton("label == 'Try again'", "regenerate") { pause(8.0) }
+        }
 
         // Stop a reply part way.
         if tap(field, "composer-focus-2") {
@@ -169,6 +174,10 @@ final class MotionTourUITests: XCTestCase {
 
         // New chat, then a suggestion chip.
         if tapButton("label == 'New chat'", "new-chat") { pause(1.5) }
+        if tapButton("label == 'Temporary chat'", "temporary-on") {
+            pause(1.2)
+            if tapButton("label == 'Temporary chat'", "temporary-off") { pause(1.2) }
+        }
         if tapButton("label == 'Explain a concept'", "suggestion-chip") { pause(1.5) }
         if tapButton("label == 'Send'", "send-chip", wait: 2) { pause(8.0) }
 
@@ -188,6 +197,18 @@ final class MotionTourUITests: XCTestCase {
             pause(1.2)
         }
 
+        // Sidebar: search, then open an older chat.
+        if tapButton("label == 'Open sidebar'", "sidebar-open-for-search") {
+            pause(1.0)
+            let search = app.textFields["Search"].firstMatch
+            if tap(search, "sidebar-search-focus") {
+                search.typeText("Run")
+                pause(1.2)
+                if tapButton("label == 'Clear search'", "sidebar-search-clear") { pause(1.0) }
+            }
+            if tapButton("label BEGINSWITH 'Running'", "sidebar-pick-chat") { pause(1.8) }
+        }
+
         // Dictation and voice mode.
         if tapButton("label == 'Dictate'", "dictation-start") {
             allowSystemAlert()
@@ -196,7 +217,15 @@ final class MotionTourUITests: XCTestCase {
         }
         if tapButton("label == 'Start voice mode'", "voice-enter") {
             allowSystemAlert()
-            pause(4.0)
+            pause(3.0)
+            if tapButton("label == 'More'", "voice-more-menu") {
+                pause(0.8)
+                if tapButton("label == 'Ask a sample question'", "voice-sample-question") { pause(12.0) }
+            }
+            if tapButton("label == 'Mute microphone'", "voice-mute") {
+                pause(1.2)
+                if tapButton("label == 'Unmute microphone'", "voice-unmute") { pause(1.2) }
+            }
             if tapButton("label == 'End voice mode'", "voice-leave") { pause(1.5) }
         }
 

@@ -1,6 +1,7 @@
 import SwiftUI
 
-/// One of the sidebar's fixed rows above the chat history.
+/// One of the sidebar's fixed rows above the chat history. Pressed, it
+/// shows ChatGPT's gray fill.
 struct SidebarShortcutRow<Icon: View>: View {
     let title: String
     @ViewBuilder let icon: () -> Icon
@@ -17,9 +18,10 @@ struct SidebarShortcutRow<Icon: View>: View {
                 Spacer(minLength: 0)
             }
             .foregroundStyle(Theme.ink)
+            .padding(.horizontal, 12)
             .padding(.vertical, 10)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressHighlightButtonStyle())
     }
 }

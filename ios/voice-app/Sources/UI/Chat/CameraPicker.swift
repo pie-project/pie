@@ -3,7 +3,8 @@ import UIKit
 
 /// The system camera, for the "+" sheet's Camera tile.
 struct CameraPicker: UIViewControllerRepresentable {
-    let onCapture: (Data) -> Void
+    /// The photo taken. Encode it with `jpegData(from:)`, off the main thread.
+    let onCapture: (UIImage) -> Void
     let onCancel: () -> Void
 
     /// False on a device without a camera, and in a build whose Info.plist
@@ -12,6 +13,17 @@ struct CameraPicker: UIViewControllerRepresentable {
     static var isAvailable: Bool {
         UIImagePickerController.isSourceTypeAvailable(.camera)
             && Bundle.main.object(forInfoDictionaryKey: "NSCameraUsageDescription") != nil
+    }
+
+    /// The photo as JPEG, encoded on a background queue: a 12-48 MP encode
+    /// takes a few hundred milliseconds, and on the main thread it stalled
+    /// the camera and the sheet just as they began to slide away.
+    static func jpegData(from image: UIImage) async -> Data? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: image.jpegData(compressionQuality: 0.85))
+            }
+        }
     }
 
     func makeCoordinator() -> Coordinator {
@@ -41,13 +53,11 @@ struct CameraPicker: UIViewControllerRepresentable {
             _ picker: UIImagePickerController,
             didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
         ) {
-            guard let image = info[.originalImage] as? UIImage,
-                  let data = image.jpegData(compressionQuality: 0.85)
-            else {
+            guard let image = info[.originalImage] as? UIImage else {
                 parent.onCancel()
                 return
             }
-            parent.onCapture(data)
+            parent.onCapture(image)
         }
 
         func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {

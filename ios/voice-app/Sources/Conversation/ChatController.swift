@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import SwiftUI
 
 /// The open conversation: sending, streaming, stopping, regenerating,
 /// editing, attachments, read-aloud, and the engine's boot state.
@@ -11,6 +12,18 @@ import Foundation
 /// Every reply carries a `ReplyTicket`, and every callback a reply makes
 /// is fenced by it: a reply that was stopped, or whose conversation was
 /// left, can never write into the conversation on screen afterwards.
+///
+/// Motion: the moments a person notices that change a row in place (the
+/// first words of a reply, a reply finishing or stopped, a thumbs tap,
+/// read-aloud starting) are made inside `withMotion`, so the views'
+/// transitions run. Changes that add or remove rows (a send, a regenerate,
+/// an edit) are not: the transcript glides the question to the top as they
+/// happen, and a scroll requested while its content lays out inside an
+/// animation is dropped (measured on iOS 26), so those rows animate
+/// themselves instead (see `MessageList`). Streamed text never animates
+/// through a transaction: a chat reply's text goes through a `RevealPacer`,
+/// which shows it a word at a time at most once per frame, and the
+/// transcript fades the new words in itself.
 @MainActor
 final class ChatController: ObservableObject {
 
@@ -153,6 +166,7 @@ final class ChatController: ObservableObject {
         guard case .failed(let reason) = engineState else { return }
         print("[app] quitting for a fresh engine boot after: \(reason)")
         fflush(stdout)
+        ChatStore.finishPendingWrites()
         exit(0)
     }
 
@@ -190,6 +204,7 @@ final class ChatController: ObservableObject {
             // Deleted while open: whatever it was doing has nowhere to go.
             if let reply = active {
                 backend.cancel(reply.ticket)
+                reply.stopPacing()
                 active = nil
                 phase = .idle
             }
@@ -236,6 +251,9 @@ final class ChatController: ObservableObject {
         submit(text, attachments: [])
     }
 
+    /// Not animated here: the rows animate themselves in (the bubble rises,
+    /// the pending dot appears just after it) while the list glides the
+    /// question to the top.
     private func submit(_ text: String, attachments: [Attachment]) {
         conversation.messages.append(StoredMessage(role: .user, text: text, attachments: attachments))
         conversation.updatedAt = Date()
@@ -248,17 +266,39 @@ final class ChatController: ObservableObject {
     /// confirms the cancel: the user sees it stop at once, and a question
     /// asked straight after (voice mode's barge-in) is accepted at once and
     /// simply queues behind the cancelled reply's last ~200 ms.
+    ///
+    /// A chat reply keeps exactly the text on screen: words the pacer had
+    /// not shown yet are dropped, nothing shown is taken back. The dot or
+    /// shimmer fades out and the reply's controls fade in.
     func stop() {
+        stop(animated: true)
+    }
+
+    /// `stop()`, optionally without its animation: an edit stops the reply
+    /// it is about to replace, and the transcript's glide to the edited
+    /// message must not run into an animated layout (see `MessageList`).
+    private func stop(animated: Bool) {
         guard let reply = active else { return }
         backend.cancel(reply.ticket)
+        reply.stopPacing()
         active = nil
-        phase = .idle
-        guard let index = index(of: reply.messageID) else { return }
-        conversation.messages[index].isStreaming = false
-        conversation.messages[index].wasStopped = true
-        conversation.messages[index].thoughtSeconds = reply.thoughtSeconds(endingAt: Date())
-        conversation.updatedAt = Date()
-        reply.finished = conversation.messages[index]
+        guard let index = index(of: reply.messageID) else {
+            phase = .idle
+            return
+        }
+        let settle = {
+            self.phase = .idle
+            self.conversation.messages[index].isStreaming = false
+            self.conversation.messages[index].wasStopped = true
+            self.conversation.messages[index].thoughtSeconds = reply.thoughtSeconds(endingAt: Date())
+            self.conversation.updatedAt = Date()
+            reply.finished = self.conversation.messages[index]
+        }
+        if animated {
+            withMotion(Motion.fadeIn, settle)
+        } else {
+            settle()
+        }
         save()
     }
 
@@ -269,28 +309,40 @@ final class ChatController: ObservableObject {
               let index = conversation.messages.firstIndex(where: { $0.id == messageID && $0.role == .assistant }),
               let question = conversation.messages[..<index].lastIndex(where: { $0.role == .user })
         else { return }
+        // Not animated here: the old reply fades out where it is on its
+        // own transition while the new one's pending dot pops in in its
+        // place, and the list brings the question to the top.
         conversation.messages.removeSubrange((question + 1)...)
         conversation.updatedAt = Date()
         startChatReply(mode: mode ?? self.mode)
     }
 
     /// Rewrites a user message and answers again from there; everything
-    /// after it is dropped.
+    /// after it is dropped. As in ChatGPT, an edit is answered at once: a
+    /// reply still on its way is stopped first (the edit drops it anyway).
     func edit(_ messageID: UUID, to newText: String) {
+        stop(animated: false)
         let text = newText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard engineState == .ready, !isGenerating,
               let index = conversation.messages.firstIndex(where: { $0.id == messageID && $0.role == .user }),
               !text.isEmpty || !conversation.messages[index].attachments.isEmpty
         else { return }
+        // Behind the closing sheet, and not animated here: the turns after
+        // the message fade out on their own transition, a fresh reply
+        // starts below it, and the list glides the edited message to the
+        // top.
         conversation.messages[index].text = text
         conversation.messages.removeSubrange((index + 1)...)
         conversation.updatedAt = Date()
         startChatReply(mode: mode)
     }
 
+    /// The chosen thumb fills and the other one fades away.
     func setFeedback(_ feedback: Feedback?, for messageID: UUID) {
         guard let index = index(of: messageID) else { return }
-        conversation.messages[index].feedback = feedback
+        withMotion(Motion.control) {
+            conversation.messages[index].feedback = feedback
+        }
         save()
     }
 
@@ -388,6 +440,17 @@ final class ChatController: ObservableObject {
         save()
 
         let reply = ActiveReply(messageID: placeholder.id, viaVoice: viaVoice, onText: onText)
+        if !viaVoice {
+            reply.textPacer = RevealPacer { [weak self, weak reply] shown in
+                guard let self, let reply else { return }
+                self.reveal(text: shown, of: reply)
+            }
+            reply.reasoningPacer = RevealPacer { [weak self, weak reply] shown in
+                guard let self, let reply else { return }
+                self.reveal(reasoning: shown, of: reply)
+            }
+            Haptics.prepareStreaming(enabled: settings.haptics)
+        }
         active = reply
         let session = conversation.sessionKey
         return Task { await stream(reply, session: session, prompt: prompt, options: options) }
@@ -427,50 +490,144 @@ final class ChatController: ObservableObject {
         // Stopped, or its conversation was left: already settled, or
         // nothing left to settle.
         guard active === reply else { return reply.finished }
-        active = nil
-        phase = .idle
 
         switch outcome {
         case .success(let result):
-            finish(reply, with: result)
+            // The screen may still be a few words behind the engine: they
+            // are shown within a fraction of a second and finish fading in
+            // before the reply settles, so its controls arrive after the
+            // last word. A stop meanwhile settles it instead.
+            await catchUp(reply, with: result)
+            guard active === reply else { return reply.finished }
+            reply.stopPacing()
+            active = nil
+            withMotion(Motion.fadeIn) {
+                phase = .idle
+                finish(reply, with: result)
+            }
             if !result.cancelled { nameConversationIfNeeded() }
             return reply.finished
         case .failure(let error):
+            // Keep everything that arrived before the failure.
+            reply.reasoningPacer?.flush()
+            reply.textPacer?.flush()
+            reply.stopPacing()
+            active = nil
             fail(reply, error: error)
             return nil
         }
     }
 
+    /// Shows what the screen has not caught up with yet: the end of the
+    /// reasoning at once (it is folded away by now), the end of the reply
+    /// at the quick finishing pace, then waits out the last words' fade.
+    private func catchUp(_ reply: ActiveReply, with result: ReplyResult) async {
+        guard let textPacer = reply.textPacer else { return }
+        if let reasoningPacer = reply.reasoningPacer {
+            if !result.reasoning.isEmpty, !result.cancelled {
+                reasoningPacer.catchUp(to: String(result.reasoning.drop(while: \.isWhitespace)))
+            }
+            reasoningPacer.flush()
+        }
+        if !result.cancelled {
+            textPacer.catchUp(to: String(result.text.drop(while: \.isWhitespace)))
+        }
+        guard textPacer.hasReceived else { return }
+        await textPacer.finish()
+        let fadeLeft = Self.lastWordsFade - textPacer.timeSinceLastReveal
+        guard active === reply, fadeLeft > 0 else { return }
+        try? await Task.sleep(nanoseconds: UInt64(fadeLeft * 1_000_000_000))
+    }
+
+    /// How long the last revealed words take to fade in fully; matches
+    /// `RevealText.fadeDuration`.
+    private static let lastWordsFade: TimeInterval = 0.25
+
+    /// One streamed event. A chat reply's text goes to its pacer, which
+    /// puts it on screen through `reveal(text:of:)`; voice mode's goes into
+    /// the message straight away, as it always has.
     private func apply(_ event: ReplyEvent, to reply: ActiveReply) {
         guard let index = index(of: reply.messageID) else { return }
         switch event {
         case .reasoning(var chunk):
-            if conversation.messages[index].reasoning.isEmpty {
+            let isFirst = reply.reasoningPacer.map { !$0.hasReceived }
+                ?? conversation.messages[index].reasoning.isEmpty
+            if isFirst {
                 chunk = String(chunk.drop(while: \.isWhitespace))
                 guard !chunk.isEmpty else { return }
             }
             if reply.firstReasoningAt == nil {
                 let now = Date()
                 reply.firstReasoningAt = now
-                phase = .thinking(since: now)
+                if reply.reasoningPacer == nil { phase = .thinking(since: now) }
             }
-            conversation.messages[index].reasoning += chunk
+            if let pacer = reply.reasoningPacer {
+                pacer.receive(chunk)
+            } else {
+                conversation.messages[index].reasoning += chunk
+            }
 
         case .text(var chunk):
             // Leading whitespace would show as a blank line at the top of
             // the bubble until the authoritative text replaced it.
-            if conversation.messages[index].text.isEmpty {
+            let isFirst = reply.textPacer.map { !$0.hasReceived }
+                ?? conversation.messages[index].text.isEmpty
+            if isFirst {
                 chunk = String(chunk.drop(while: \.isWhitespace))
                 guard !chunk.isEmpty else { return }
             }
             if reply.firstTextAt == nil {
                 let now = Date()
                 reply.firstTextAt = now
-                conversation.messages[index].thoughtSeconds = reply.thoughtSeconds(endingAt: now)
+                if reply.textPacer == nil {
+                    conversation.messages[index].thoughtSeconds = reply.thoughtSeconds(endingAt: now)
+                    phase = .writing
+                }
+                // Thinking is over; the rest of it is folded away anyway.
+                reply.reasoningPacer?.flush()
+            }
+            if let pacer = reply.textPacer {
+                pacer.receive(chunk)
+            } else {
+                conversation.messages[index].text += chunk
+            }
+            reply.onText?(chunk)
+        }
+    }
+
+    /// The pacer has more of a chat reply's text for the screen.
+    ///
+    /// The first words are a moment of their own: the pending dot (or the
+    /// "Thinking" shimmer) gives way to them and the phase becomes
+    /// `.writing`, animated. After that the text is set plainly; the
+    /// transcript fades each new word in itself. Each reveal is one tick
+    /// of the soft haptic train.
+    private func reveal(text shown: String, of reply: ActiveReply) {
+        guard active === reply, let index = index(of: reply.messageID) else { return }
+        if conversation.messages[index].text.isEmpty {
+            let wasThinking = phase != .waiting
+            withMotion(wasThinking ? Motion.crossfade : Motion.fadeOut) {
+                conversation.messages[index].thoughtSeconds = reply.thoughtSeconds(endingAt: reply.firstTextAt ?? Date())
+                conversation.messages[index].text = shown
                 phase = .writing
             }
-            conversation.messages[index].text += chunk
-            reply.onText?(chunk)
+        } else {
+            conversation.messages[index].text = shown
+        }
+        Haptics.streamTick(enabled: settings.haptics)
+    }
+
+    /// The pacer has more of a chat reply's reasoning. The first of it
+    /// turns the pending dot into the "Thinking" shimmer.
+    private func reveal(reasoning shown: String, of reply: ActiveReply) {
+        guard active === reply, let index = index(of: reply.messageID) else { return }
+        if conversation.messages[index].reasoning.isEmpty, phase == .waiting {
+            withMotion(Motion.crossfade) {
+                phase = .thinking(since: reply.firstReasoningAt ?? Date())
+                conversation.messages[index].reasoning = shown
+            }
+        } else {
+            conversation.messages[index].reasoning = shown
         }
     }
 
@@ -510,7 +667,10 @@ final class ChatController: ObservableObject {
         banner = reply.viaVoice
             ? "Pie couldn't answer that. Try asking again."
             : "Pie couldn't finish that reply. Tap Regenerate to try again."
-        guard let index = index(of: reply.messageID) else { return }
+        guard let index = index(of: reply.messageID) else {
+            phase = .idle
+            return
+        }
         var message = conversation.messages[index]
         message.isStreaming = false
         message.thoughtSeconds = reply.thoughtSeconds(endingAt: Date())
@@ -519,8 +679,11 @@ final class ChatController: ObservableObject {
         } else {
             message.wasStopped = true
         }
-        conversation.messages[index] = message
-        conversation.updatedAt = Date()
+        withMotion(Motion.fadeIn) {
+            phase = .idle
+            conversation.messages[index] = message
+            conversation.updatedAt = Date()
+        }
         save()
     }
 
@@ -600,7 +763,7 @@ final class ChatController: ObservableObject {
         speech.delegate = self
         speech.voiceIdentifier = settings.voiceIdentifier
         speech.rate = settings.speechRate
-        readingAloudMessageID = messageID
+        withMotion(Motion.control) { readingAloudMessageID = messageID }
 
         let chunker = SentenceChunker()
         for sentence in chunker.push(spoken) {
@@ -616,7 +779,7 @@ final class ChatController: ObservableObject {
     /// it takes the speaker over.
     func stopReadingAloud() {
         guard readingAloudMessageID != nil else { return }
-        readingAloudMessageID = nil
+        withMotion(Motion.control) { readingAloudMessageID = nil }
         speech.stop()
     }
 
@@ -682,7 +845,7 @@ extension ChatController: @preconcurrency SpeechOutputDelegate {
         // A finish that arrives after a different message has started
         // (the old one being cut off) must not clear the new one.
         guard !speech.isSpeaking else { return }
-        readingAloudMessageID = nil
+        withMotion(Motion.control) { readingAloudMessageID = nil }
     }
 
     func speechOutputLevel(_ level: Float) {}
@@ -701,6 +864,10 @@ private final class ActiveReply {
     /// The message as it was settled; what a caller awaiting the reply
     /// gets back.
     var finished: StoredMessage?
+    /// Meter a chat reply's text and reasoning onto the screen. Nil for
+    /// voice mode's turns, which are written as they arrive.
+    var textPacer: RevealPacer?
+    var reasoningPacer: RevealPacer?
 
     init(messageID: UUID, viaVoice: Bool, onText: ((String) -> Void)?) {
         self.messageID = messageID
@@ -713,5 +880,12 @@ private final class ActiveReply {
     func thoughtSeconds(endingAt end: Date) -> Double? {
         guard let start = firstReasoningAt else { return nil }
         return (firstTextAt ?? end).timeIntervalSince(start)
+    }
+
+    /// No more reveals: the screen keeps what it shows.
+    @MainActor
+    func stopPacing() {
+        textPacer?.stop()
+        reasoningPacer?.stop()
     }
 }

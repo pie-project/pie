@@ -7,44 +7,65 @@ import UIKit
 ///
 /// Talking while Pie speaks interrupts it (the microphone stays open
 /// behind the echo canceller); so does tapping the orb.
+///
+/// Motion, after ChatGPT's advanced voice mode:
+/// - entering, the orb grows in from 60% as it fades in, and the controls
+///   follow a beat later, fading in as they rise; a soft haptic marks the
+///   moment the microphone is listening;
+/// - leaving, the orb shrinks and fades and the controls fade as the cover
+///   goes;
+/// - in between, most changes come from the audio side (a reply starting,
+///   the user talking over it), not from a tap, so each piece animates its
+///   own: the orb eases between moods frame by frame (`VoiceOrb`), the
+///   status line crossfades, the mute button swaps its glyph and fill, and
+///   new caption words fade in (`VoiceCaptionsView`).
+///
+/// The orb, the status line and the captions each sit in a slot of fixed
+/// size, so nothing that changes in one of them moves the others.
 struct VoiceModeView: View {
 
     @EnvironmentObject private var voice: VoiceModeController
-    @EnvironmentObject private var chat: ChatController
     @EnvironmentObject private var settings: AppSettings
     @EnvironmentObject private var router: AppRouter
     @EnvironmentObject private var dictation: DictationController
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// "Voice settings" closes voice mode first; Settings is presented once
     /// the cover has gone, since a sheet cannot be presented while the
     /// cover is still being dismissed.
     @State private var opensSettingsAfterClose = false
-    @State private var captionsContentHeight: CGFloat = 0
+    /// The orb has grown in; false before voice mode appears and once it
+    /// is closing.
+    @State private var orbShown = false
+    /// The header, captions and controls have faded in.
+    @State private var controlsShown = false
 
-    private let captionsEnd = "captions-end"
+    /// Entering: the orb grows from 60% while fading in (ChatGPT, estimated).
+    private static let orbEntrance = Animation.smooth(duration: 0.5)
+    /// The controls follow a beat after the orb, rising 20 points.
+    private static let controlsEntrance = Animation.smooth(duration: 0.3).delay(0.1)
+    /// Leaving: a little quicker than arriving, as everything in the app.
+    private static let exit = Animation.smooth(duration: 0.35)
 
     var body: some View {
         GeometryReader { geometry in
+            // About 60% of the width, as ChatGPT's orb, unless the screen
+            // is short.
+            let diameter = min(geometry.size.width * 0.6, geometry.size.height * 0.34)
             VStack(spacing: 0) {
                 header
                     .padding(.horizontal, 20)
                     .padding(.top, 8)
+                    .opacity(controlsShown ? 1 : 0)
 
                 Spacer(minLength: 16)
-
-                if let notice = inputNotice {
-                    unavailableNotice(notice)
-                } else {
-                    orb(diameter: min(240, geometry.size.height * 0.32))
-                    statusLine
-                        .padding(.top, 32)
-                        .padding(.horizontal, 24)
-                }
-
+                stage(diameter: diameter)
                 Spacer(minLength: 16)
 
-                if settings.voiceCaptions && hasCaptions {
-                    captions(maxHeight: geometry.size.height * 0.35)
+                if settings.voiceCaptions {
+                    VoiceCaptionsView(captions: voice.captions)
+                        .frame(height: geometry.size.height * 0.24)
+                        .opacity(controlsShown ? 1 : 0)
                         .transition(.opacity)
                 }
 
@@ -52,9 +73,9 @@ struct VoiceModeView: View {
                     .padding(.horizontal, 32)
                     .padding(.top, 16)
                     .padding(.bottom, 8)
+                    .opacity(controlsShown ? 1 : 0)
+                    .offset(y: controlsShown || reduceMotion ? 0 : 20)
             }
-            .animation(.easeInOut(duration: 0.25), value: settings.voiceCaptions)
-            .animation(.easeInOut(duration: 0.25), value: hasCaptions)
         }
         .background(Theme.background.ignoresSafeArea())
         .onAppear {
@@ -65,7 +86,10 @@ struct VoiceModeView: View {
             // dictating; both share the one microphone, and the composer
             // would otherwise come back showing a dictation with no session.
             dictation.cancel()
+            VoiceHaptics.prepare(enabled: settings.haptics)
             voice.start()
+            withMotion(Self.orbEntrance) { orbShown = true }
+            withMotion(Self.controlsEntrance) { controlsShown = true }
         }
         .onDisappear {
             voice.end()
@@ -74,6 +98,16 @@ struct VoiceModeView: View {
                 opensSettingsAfterClose = false
                 DispatchQueue.main.async { router.isSettingsPresented = true }
             }
+        }
+        .onChange(of: voice.isConnecting) { wasConnecting, isConnecting in
+            // The microphone is open and listening: ChatGPT marks the
+            // moment its voice session connects with a soft tap.
+            guard wasConnecting, !isConnecting, voice.phase == .listening, !voice.isMuted else { return }
+            VoiceHaptics.connected(enabled: settings.haptics)
+        }
+        .onChange(of: isFailed) { _, failed in
+            // The notice explains a missing permission on its own.
+            if failed, inputNotice == nil { Haptics.failure(enabled: settings.haptics) }
         }
     }
 
@@ -91,13 +125,16 @@ struct VoiceModeView: View {
             }
             Spacer()
             Button {
-                settings.voiceCaptions.toggle()
+                Haptics.selection(enabled: settings.haptics)
+                setCaptions(!settings.voiceCaptions)
             } label: {
                 Image(systemName: settings.voiceCaptions ? "captions.bubble.fill" : "captions.bubble")
                     .font(.system(size: 18, weight: .medium))
+                    .contentTransition(.symbolEffect(.replace))
                     .foregroundStyle(settings.voiceCaptions ? Theme.accent : Theme.secondaryInk)
                     .frame(width: 44, height: 44)
                     .background(Circle().fill(settings.voiceCaptions ? Theme.accentWash : Theme.surface))
+                    .animation(Motion.crossfade, value: settings.voiceCaptions)
             }
             .buttonStyle(PressScaleButtonStyle())
             .accessibilityLabel("Captions")
@@ -107,60 +144,64 @@ struct VoiceModeView: View {
 
     // MARK: - Orb and status
 
-    private func orb(diameter: CGFloat) -> some View {
-        Button {
-            feedback()
+    /// The orb and, under it, the status line, or the notice when the
+    /// microphone cannot be used. The notice shrinks the orb in place
+    /// rather than swapping in a second one.
+    private func stage(diameter: CGFloat) -> some View {
+        let notice = inputNotice
+        return VStack(spacing: 28) {
+            orb(diameter: diameter, size: notice == nil ? 1 : 0.62)
+            Group {
+                if let notice {
+                    unavailableNotice(notice)
+                        .transition(.fadeRise(8))
+                } else {
+                    VoiceStatusLine()
+                        // Room for three lines, so a long failure message
+                        // never pushes the orb up.
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 66, alignment: .top)
+                        .padding(.horizontal, 24)
+                        .transition(.opacity)
+                }
+            }
+            .opacity(orbShown ? 1 : 0)
+        }
+        // The notice arrives from the permission check, not from a tap, so
+        // its change animates here.
+        .animation(Motion.reduced(Motion.content, reduceMotion), value: notice == nil)
+    }
+
+    /// `size` shrinks the orb in place (for the notice) without changing
+    /// the diameter it draws at, so its clouds and rim keep their scale.
+    private func orb(diameter: CGFloat, size: CGFloat) -> some View {
+        let entrance: CGFloat = orbShown || reduceMotion ? 1 : 0.6
+        return Button {
+            Haptics.tap(enabled: settings.haptics)
             voice.tapOrb()
         } label: {
-            VoiceOrb(
-                mood: mood,
-                inputLevel: voice.inputLevel,
-                outputLevel: voice.outputLevel,
-                diameter: diameter
-            )
-            .contentShape(Circle())
+            VoiceOrb(mood: mood, levels: voice.levels, diameter: diameter)
+                .contentShape(Circle())
         }
         .buttonStyle(PressScaleButtonStyle())
         .accessibilityLabel(orbAccessibilityLabel)
-    }
-
-    private var statusLine: some View {
-        Text(statusText)
-            .font(.callout.weight(.medium))
-            .foregroundStyle(isFailed ? Theme.destructive : Theme.secondaryInk)
-            .multilineTextAlignment(.center)
-            .lineLimit(3)
-            .contentTransition(.opacity)
-            .animation(.easeInOut(duration: 0.2), value: statusText)
-            .accessibilityAddTraits(.updatesFrequently)
+        .allowsHitTesting(size == 1)
+        .accessibilityHidden(size != 1)
+        .scaleEffect(size * entrance)
+        .opacity(orbShown ? 1 : 0)
+        .frame(width: diameter, height: diameter * size)
     }
 
     private var mood: VoiceOrb.Mood {
+        if inputNotice != nil { return .muted }
+        // Before `start()` has run and once `end()` has, the orb is on its
+        // way in or out; dim and small suits both.
+        if !voice.isActive || voice.isConnecting { return .connecting }
         switch voice.phase {
         case .failed: return .failed
         case .thinking: return .thinking
         case .speaking: return .speaking
-        case .listening: return voice.isMuted ? .muted : .listening
-        case .idle: return voice.isMuted ? .muted : .idle
-        }
-    }
-
-    private var statusText: String {
-        switch voice.phase {
-        case .failed(let message):
-            return message
-        case .speaking:
-            return voice.isMuted ? "Speaking - tap to interrupt" : "Speaking - talk or tap to interrupt"
-        case .thinking:
-            return "Thinking…"
-        case .listening:
-            return voice.isMuted ? "Mic is off" : "Listening"
-        case .idle:
-            if case .booting(let seconds) = chat.engineState {
-                return "Loading \(PieRuntimeConfig.modelDescription)… \(seconds) s"
-            }
-            if voice.isMuted { return "Mic is off" }
-            return voice.isActive ? "Starting…" : "Tap to talk"
+        case .listening, .idle: return voice.isMuted ? .muted : .listening
         }
     }
 
@@ -200,8 +241,7 @@ struct VoiceModeView: View {
     }
 
     private func unavailableNotice(_ notice: InputNotice) -> some View {
-        VStack(spacing: 20) {
-            VoiceOrb(mood: .muted, diameter: 150)
+        VStack(spacing: 18) {
             Text(notice.reason)
                 .font(.callout)
                 .foregroundStyle(Theme.secondaryInk)
@@ -212,7 +252,10 @@ struct VoiceModeView: View {
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(Theme.accent)
             }
-            Button(action: close) {
+            Button {
+                Haptics.tap(enabled: settings.haptics)
+                close()
+            } label: {
                 Text("Type instead")
                     .font(.body.weight(.semibold))
                     .foregroundStyle(Theme.onAccent)
@@ -224,82 +267,23 @@ struct VoiceModeView: View {
         }
     }
 
-    // MARK: - Captions
-
-    private var hasCaptions: Bool {
-        !voice.userCaption.isEmpty || !voice.assistantCaption.isEmpty
-    }
-
-    private func captions(maxHeight: CGFloat) -> some View {
-        let overflows = captionsContentHeight > maxHeight
-        return ScrollViewReader { reader in
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    if !voice.userCaption.isEmpty {
-                        Text(voice.userCaption)
-                            .foregroundStyle(Theme.secondaryInk)
-                    }
-                    if !voice.assistantCaption.isEmpty {
-                        Text(voice.assistantCaption)
-                            .foregroundStyle(Theme.ink)
-                    }
-                    Color.clear
-                        .frame(height: 1)
-                        .id(captionsEnd)
-                }
-                .font(.title3)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 24)
-                .padding(.top, 8)
-                .background(
-                    GeometryReader { proxy in
-                        Color.clear.preference(key: CaptionsHeightKey.self, value: proxy.size.height)
-                    }
-                )
-            }
-            .scrollIndicators(.hidden)
-            .frame(height: min(captionsContentHeight, maxHeight))
-            // Older lines fade out under the top edge once the captions
-            // are taller than their space.
-            .mask(
-                LinearGradient(
-                    stops: [
-                        .init(color: overflows ? .clear : .black, location: 0),
-                        .init(color: .black, location: overflows ? 0.18 : 0),
-                        .init(color: .black, location: 1),
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-            )
-            .onPreferenceChange(CaptionsHeightKey.self) { height in
-                captionsContentHeight = height
-            }
-            .onChange(of: voice.assistantCaption) { _, _ in
-                reader.scrollTo(captionsEnd, anchor: .bottom)
-            }
-            .onChange(of: voice.userCaption) { _, _ in
-                reader.scrollTo(captionsEnd, anchor: .bottom)
-            }
-            .onChange(of: captionsContentHeight) { _, _ in
-                reader.scrollTo(captionsEnd, anchor: .bottom)
-            }
-        }
-    }
-
     // MARK: - Controls
 
     private var controls: some View {
         HStack {
             Button {
-                feedback()
+                Haptics.tap(enabled: settings.haptics)
                 voice.toggleMute()
             } label: {
                 Image(systemName: voice.isMuted ? "mic.slash.fill" : "mic.fill")
                     .font(.system(size: 22, weight: .semibold))
+                    .contentTransition(.symbolEffect(.replace))
                     .foregroundStyle(voice.isMuted ? Theme.onAccent : Theme.ink)
                     .frame(width: 64, height: 64)
                     .background(Circle().fill(voice.isMuted ? Theme.red : Theme.surface))
+                    // Here rather than at the tap: muting also changes
+                    // when voice mode ends or the orb is tapped.
+                    .animation(Motion.crossfade, value: voice.isMuted)
             }
             .buttonStyle(PressScaleButtonStyle())
             .accessibilityLabel(voice.isMuted ? "Unmute microphone" : "Mute microphone")
@@ -311,7 +295,7 @@ struct VoiceModeView: View {
             Spacer()
 
             Button {
-                feedback()
+                Haptics.tap(enabled: settings.haptics)
                 close()
             } label: {
                 Image(systemName: "xmark")
@@ -325,16 +309,18 @@ struct VoiceModeView: View {
         }
     }
 
+    /// A system menu, so it keeps the system's own morph and feedback.
     private var moreMenu: some View {
         Menu {
             if voice.hasSampleQuestions {
                 Button {
+                    Haptics.tap(enabled: settings.haptics)
                     voice.askSampleQuestion()
                 } label: {
                     Label("Ask a sample question", systemImage: "waveform")
                 }
             }
-            Toggle(isOn: $settings.voiceCaptions) {
+            Toggle(isOn: Binding(get: { settings.voiceCaptions }, set: setCaptions)) {
                 Label("Captions", systemImage: "captions.bubble")
             }
             Button {
@@ -356,27 +342,83 @@ struct VoiceModeView: View {
 
     // MARK: - Actions
 
+    /// Captions on or off, from the header button or the menu: the
+    /// captions fade and the orb glides to its new place.
+    private func setCaptions(_ isOn: Bool) {
+        withMotion(Motion.content) { settings.voiceCaptions = isOn }
+    }
+
+    /// The conversation stops at once; the orb shrinks and fades and the
+    /// controls fade while the cover goes.
     private func close() {
         voice.end()
+        withMotion(Self.exit) {
+            orbShown = false
+            controlsShown = false
+        }
         router.isVoiceModePresented = false
     }
+}
 
-    private func feedback() {
-        guard settings.haptics else { return }
-        UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+/// The line under the orb: what voice mode is doing. A view of its own
+/// because it watches the chat controller for the model's loading
+/// progress, and that controller publishes every streamed token: only
+/// this line redraws for them, not the whole screen.
+private struct VoiceStatusLine: View {
+    @EnvironmentObject private var voice: VoiceModeController
+    @EnvironmentObject private var chat: ChatController
+
+    var body: some View {
+        Text(text)
+            .font(.callout.weight(.medium))
+            .foregroundStyle(isFailed ? Theme.destructive : Theme.secondaryInk)
+            .multilineTextAlignment(.center)
+            .lineLimit(3)
+            .contentTransition(.opacity)
+            .animation(Motion.crossfade, value: text)
+            .accessibilityAddTraits(.updatesFrequently)
+    }
+
+    private var text: String {
+        // Before `start()` and after `end()`: nothing, so the line simply
+        // fades as voice mode opens and closes.
+        guard voice.isActive else { return "" }
+        switch voice.phase {
+        case .failed(let message):
+            return message
+        case .speaking:
+            return voice.isMuted ? "Speaking - tap to interrupt" : "Speaking - talk or tap to interrupt"
+        case .thinking:
+            return "Thinking…"
+        case .listening, .idle:
+            if voice.isMuted { return "Mic is off" }
+            // A question asked before the model is up cannot be answered.
+            if case .booting(let seconds) = chat.engineState {
+                return "Loading \(PieRuntimeConfig.modelDescription)… \(seconds) s"
+            }
+            return voice.isConnecting ? "Starting…" : "Listening"
+        }
+    }
+
+    private var isFailed: Bool {
+        if case .failed = voice.phase { return true }
+        return false
     }
 }
 
-/// The content height of the captions, so their area hugs short captions
-/// and only scrolls once they outgrow it.
-private struct CaptionsHeightKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
+/// The soft tap when voice mode starts listening, like ChatGPT's when its
+/// voice session connects. Prepared on entry, so it is on time.
+@MainActor
+private enum VoiceHaptics {
+    private static let soft = UIImpactFeedbackGenerator(style: .soft)
 
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
+    static func prepare(enabled: Bool) {
+        guard enabled else { return }
+        soft.prepare()
+    }
+
+    static func connected(enabled: Bool) {
+        guard enabled else { return }
+        soft.impactOccurred(intensity: 0.9)
     }
 }
-
-// The controls use the shared `PressScaleButtonStyle` (UI/Motion.swift):
-// it shrinks without the default style's dimming, which would wash out
-// the orb.

@@ -27,7 +27,7 @@ struct EngineFailedCard: View {
                     .padding(.vertical, 9)
                     .background(Theme.accentFill, in: Capsule())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(PressScaleButtonStyle())
             .padding(.top, 2)
         }
         .padding(16)

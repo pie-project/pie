@@ -19,6 +19,17 @@ DERIVED=$HERE/build/SimDerivedData
 mkdir -p "$OUT/steps"
 rm -f "$OUT"/steps/*
 
+# One Simulator, several callers: take turns. mkdir is atomic; a lock
+# older than 20 minutes is from a run that died and is cleared.
+LOCK=$HERE/build/.motion-lock
+mkdir -p "$HERE/build"
+until mkdir "$LOCK" 2>/dev/null; do
+  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +20 2>/dev/null)" ]; then rmdir "$LOCK" 2>/dev/null; continue; fi
+  echo "waiting for another motion tour to finish..." >&2
+  sleep 10
+done
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
 ( cd "$HERE" && xcodegen --use-cache >/dev/null ) || { echo "xcodegen failed"; exit 1; }
 xcodebuild -project "$HERE/PieVoice.xcodeproj" -scheme PieVoice -configuration ${CONFIGURATION:-Release} \
   -destination "id=$SIM" -derivedDataPath "$DERIVED" ONLY_ACTIVE_ARCH=YES ARCHS=arm64 build-for-testing > "$OUT/build.log" 2>&1 \
@@ -40,7 +51,7 @@ xcodebuild -project "$HERE/PieVoice.xcodeproj" -scheme PieVoice -configuration $
 TEST_EXIT=$?
 sleep 1
 kill -INT "$REC"; wait "$REC" 2>/dev/null
-grep -E "^MOTION" "$OUT/test.log" | sed 's/^.*MOTION/MOTION/' > "$OUT/markers.txt"
+grep -E "MOTION [0-9]" "$OUT/test.log" | sed 's/^.*MOTION /MOTION /' > "$OUT/markers.txt"
 grep -h "MOTION-SKIP" "$OUT/test.log" | sort -u
 
 python3 - "$OUT" <<'PY'
@@ -50,7 +61,7 @@ start = float(open(os.path.join(out, "rec-start.txt")).read())
 marks = []
 for line in open(os.path.join(out, "markers.txt")):
     parts = line.split()
-    if len(parts) >= 3 and parts[0] == "MOTION":
+    if len(parts) >= 3 and parts[0] == "MOTION" and parts[1].replace(".", "", 1).isdigit():
         marks.append((float(parts[1]) - start, parts[2]))
 dur = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
                             os.path.join(out, "tour.mp4")], capture_output=True, text=True).stdout.strip() or 0)
@@ -66,4 +77,5 @@ for i, (t, name) in enumerate(marks):
                     "-i", os.path.join(out, "tour.mp4"), "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", base + ".mp4"])
     print("%6.2f s  %-32s %4.2f s" % (t, name, length))
 PY
-echo "test exit $TEST_EXIT; recording $OUT/tour.mp4; sheets $OUT/steps/"
+python3 "$HERE/motion-metrics.py" "$OUT" > "$OUT/metrics.txt" 2>&1
+echo "test exit $TEST_EXIT; recording $OUT/tour.mp4; sheets $OUT/steps/; metrics $OUT/metrics.txt"

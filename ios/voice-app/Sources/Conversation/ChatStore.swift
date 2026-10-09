@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 
 /// Saved conversations: one JSON file per thread under
 /// Application Support/PieVoice/chats/. Temporary conversations are never
@@ -7,13 +8,31 @@ import Foundation
 /// One file per conversation rather than one file for all of them: a save
 /// after every reply then rewrites a single small file, and a file that
 /// cannot be read costs one conversation instead of the whole history.
+///
+/// The list changes at once, on the main thread, and animated, so the
+/// sidebar slides a new chat in at the top, crossfades a rename and
+/// collapses a deleted row. The files follow on a background queue, in
+/// order: a save never costs the frame in which a send, a new chat or a
+/// switch starts its animation.
 @MainActor
 final class ChatStore: ObservableObject {
 
     /// Saved (non-temporary) conversations, most recently updated first.
-    @Published private(set) var conversations: [Conversation] = []
+    @Published private(set) var conversations: [Conversation] = [] {
+        didSet { history = nil }
+    }
 
     private let directory: URL?
+
+    /// The sidebar's sections for `conversations`, worked out once per
+    /// change to the list and per day ("Today" moves at midnight) rather
+    /// than on every redraw of the sidebar.
+    private var history: (day: Date, sections: [(title: String, items: [Conversation])])?
+
+    /// File writes and deletes, one at a time and in the order they were
+    /// asked for, so a delete can never be overtaken by an older write
+    /// that would bring the chat back.
+    private static let disk = DispatchQueue(label: "PieVoice.ChatStore.disk", qos: .utility)
 
     init() {
         directory = Self.makeDirectory()
@@ -36,9 +55,10 @@ final class ChatStore: ObservableObject {
             stored.messages[index].isStreaming = false
             stored.messages[index].wasStopped = true
         }
-        conversations.removeAll { $0.id == stored.id }
-        conversations.append(stored)
-        sort()
+        var updated = conversations.filter { $0.id != stored.id }
+        updated.append(stored)
+        updated.sort { $0.updatedAt > $1.updatedAt }
+        publish(updated)
         write(stored)
     }
 
@@ -46,14 +66,17 @@ final class ChatStore: ObservableObject {
         guard let index = conversations.firstIndex(where: { $0.id == id }) else { return }
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        conversations[index].title = trimmed
-        write(conversations[index])
+        var updated = conversations
+        updated[index].title = trimmed
+        publish(updated)
+        write(updated[index])
     }
 
     func delete(_ id: UUID) {
-        conversations.removeAll { $0.id == id }
-        if let url = fileURL(for: id) {
-            try? FileManager.default.removeItem(at: url)
+        publish(conversations.filter { $0.id != id })
+        guard let url = fileURL(for: id) else { return }
+        Self.disk.async {
+            ChatFiles.remove(url)
         }
     }
 
@@ -62,17 +85,18 @@ final class ChatStore: ObservableObject {
     /// they are still the user's chats, and this is the button that
     /// promises none are left on the phone.
     func deleteAll() {
-        conversations = []
-        guard
-            let directory,
-            let files = try? FileManager.default.contentsOfDirectory(
-                at: directory,
-                includingPropertiesForKeys: nil
-            )
-        else { return }
-        for file in files where file.pathExtension == "json" {
-            try? FileManager.default.removeItem(at: file)
+        publish([])
+        guard let directory else { return }
+        Self.disk.async {
+            ChatFiles.removeAll(in: directory)
         }
+    }
+
+    /// Waits until every write and delete asked for so far has reached the
+    /// disk. For quitting on purpose (to load another model), so a reply
+    /// saved a moment before is not lost.
+    static func finishPendingWrites() {
+        disk.sync {}
     }
 
     /// Title and message text, case-insensitive; empty query = all.
@@ -85,6 +109,15 @@ final class ChatStore: ObservableObject {
         }
     }
 
+    /// `grouped(conversations)`, kept until the list or the day changes.
+    func groupedHistory(now: Date = Date()) -> [(title: String, items: [Conversation])] {
+        let day = Calendar.current.startOfDay(for: now)
+        if let history, history.day == day { return history.sections }
+        let sections = Self.grouped(conversations, now: now)
+        history = (day: day, sections: sections)
+        return sections
+    }
+
     /// Sidebar sections in order: "Today", "Yesterday", "Previous 7 Days",
     /// "Previous 30 Days", then one per older month ("September 2026").
     /// Each section keeps the most recently updated first; empty sections
@@ -93,9 +126,6 @@ final class ChatStore: ObservableObject {
         -> [(title: String, items: [Conversation])] {
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: now)
-        let monthFormatter = DateFormatter()
-        monthFormatter.locale = Locale.current
-        monthFormatter.setLocalizedDateFormatFromTemplate("MMMMyyyy")
 
         var sections: [(title: String, items: [Conversation])] = []
         func add(_ conversation: Conversation, to title: String) {
@@ -122,10 +152,24 @@ final class ChatStore: ObservableObject {
         return sections
     }
 
+    /// Month section titles ("September 2026"). Made once: a formatter is
+    /// slow to create.
+    private static let monthFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale.autoupdatingCurrent
+        formatter.setLocalizedDateFormatFromTemplate("MMMMyyyy")
+        return formatter
+    }()
+
     // MARK: - Files
 
-    private func sort() {
-        conversations.sort { $0.updatedAt > $1.updatedAt }
+    /// Replaces the list in one change, animated, so the sidebar moves its
+    /// rows rather than redrawing them in place, and observers hear about
+    /// one change rather than one per step.
+    private func publish(_ updated: [Conversation]) {
+        withAnimation(Motion.content) {
+            conversations = updated
+        }
     }
 
     private func fileURL(for id: UUID) -> URL? {
@@ -134,19 +178,10 @@ final class ChatStore: ObservableObject {
 
     private func write(_ conversation: Conversation) {
         guard let url = fileURL(for: conversation.id) else { return }
-        do {
-            let data = try Self.encoder.encode(conversation)
-            try data.write(to: url, options: .atomic)
-        } catch {
-            print("[store] could not save conversation \(conversation.id): \(error.localizedDescription)")
+        Self.disk.async {
+            ChatFiles.write(conversation, to: url)
         }
     }
-
-    private static let encoder: JSONEncoder = {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        return encoder
-    }()
 
     private static let decoder: JSONDecoder = {
         let decoder = JSONDecoder()
@@ -201,5 +236,40 @@ final class ChatStore: ObservableObject {
             loaded.append(conversation)
         }
         return loaded.sorted { $0.updatedAt > $1.updatedAt }
+    }
+}
+
+/// The file work itself, run on `ChatStore`'s disk queue, off the main
+/// thread. The files are the same as when this ran on the main thread:
+/// the same encoding, written atomically.
+private enum ChatFiles {
+    /// Used only on the disk queue, one write at a time.
+    private static let encoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        return encoder
+    }()
+
+    static func write(_ conversation: Conversation, to url: URL) {
+        do {
+            let data = try encoder.encode(conversation)
+            try data.write(to: url, options: .atomic)
+        } catch {
+            print("[store] could not save conversation \(conversation.id): \(error.localizedDescription)")
+        }
+    }
+
+    static func remove(_ url: URL) {
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    static func removeAll(in directory: URL) {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ) else { return }
+        for file in files where file.pathExtension == "json" {
+            try? FileManager.default.removeItem(at: file)
+        }
     }
 }
