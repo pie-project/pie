@@ -119,10 +119,8 @@ class EngineBackend:
         self.history.append({"role": "assistant", "content": "".join(pieces)})
 
 
-# One random animal from mascots.py per launch, drawn small like Claude's mascot:
-# every other pixel of the 16x16 art (8x8), then two pixel rows per text line.
-MASCOT_NAME, (MASCOT_PALETTE, MASCOT_16) = random.choice(list(ANIMALS.items()))
-MASCOT_ROWS = [row[::2] for row in MASCOT_16[::2]]
+# One random animal from mascots.py per launch: a 10x8 sprite, two pixel rows per text line.
+MASCOT_NAME, (MASCOT_PALETTE, MASCOT_ROWS) = random.choice(list(ANIMALS.items()))
 
 
 def mascot_rows() -> list[list[tuple[str, str]]]:
