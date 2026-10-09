@@ -1,4 +1,5 @@
 import os
+import shutil
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.data_structures import Point
@@ -49,27 +50,52 @@ def wheel(chat: Chat):
     return handler
 
 
-_cache = {"version": None, "pieces": [], "lines": 0}
+_cache = {"version": None, "lines": []}
+RESERVED_ROWS = 5
 
 
-def transcript_pieces(chat: Chat) -> list[tuple]:
-    if _cache["version"] == chat.version:
-        return _cache["pieces"]
-    handler = wheel(chat)
-    pieces = banner(chat)
-    for item in chat.transcript:
-        if isinstance(item, Markdown):
-            pieces.extend(render(item.text))
-        else:
-            pieces.append(item)
-    result = [(piece[0], piece[1], handler) for piece in pieces]
-    _cache.update(version=chat.version, pieces=result, lines=sum(piece[1].count("\n") for piece in result))
-    return result
+def split_lines(pieces: list[tuple]) -> list[list[tuple]]:
+    lines: list[list[tuple]] = [[]]
+    for style, text, handler in pieces:
+        parts = text.split("\n")
+        for index, part in enumerate(parts):
+            if index:
+                lines.append([])
+            if part:
+                lines[-1].append((style, part, handler))
+    return lines
+
+
+def transcript_lines(chat: Chat) -> list[list[tuple]]:
+    if _cache["version"] != chat.version:
+        handler = wheel(chat)
+        pieces = banner(chat)
+        for item in chat.transcript:
+            if isinstance(item, Markdown):
+                pieces.extend(render(item.text))
+            else:
+                pieces.append(item)
+        _cache.update(version=chat.version, lines=split_lines([(p[0], p[1], handler) for p in pieces]))
+    return _cache["lines"]
+
+
+def visible_lines(chat: Chat) -> list[list[tuple]]:
+    lines = transcript_lines(chat)
+    rows = max(1, shutil.get_terminal_size((80, 24)).lines - RESERVED_ROWS)
+    end = max(0, len(lines) - chat.scroll_back)
+    return lines[max(0, end - rows):end]
+
+
+def visible_pieces(chat: Chat) -> list[tuple]:
+    pieces: list[tuple] = []
+    for line in visible_lines(chat):
+        pieces.extend(line)
+        pieces.append(("", "\n", None))
+    return pieces
 
 
 def cursor_at_end(chat: Chat) -> Point:
-    transcript_pieces(chat)
-    return Point(x=0, y=max(0, _cache["lines"] - chat.scroll_back))
+    return Point(x=0, y=max(0, len(visible_lines(chat)) - 1))
 
 
 def mode_line(chat: Chat) -> list[tuple[str, str]]:
@@ -111,7 +137,7 @@ def build(chat: Chat) -> Application:
 
     input_window = Window(content=BufferControl(buffer=chat.input), height=1, dont_extend_height=True)
     output = Window(
-        content=FormattedTextControl(lambda: transcript_pieces(chat), get_cursor_position=lambda: cursor_at_end(chat)),
+        content=FormattedTextControl(lambda: visible_pieces(chat), get_cursor_position=lambda: cursor_at_end(chat)),
         wrap_lines=True,
         always_hide_cursor=True,
     )
