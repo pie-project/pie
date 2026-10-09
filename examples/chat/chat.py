@@ -313,6 +313,31 @@ def stop_engine(engine: subprocess.Popen) -> None:
         engine.kill()
 
 
+BOLD, RESET = "\033[1m", "\033[0m"
+TRUST_MARK = Path.home() / ".config" / "pie-chat" / "trusted"
+
+
+def trust_screen() -> None:
+    """A one-time, tongue-in-cheek first-run screen. Nothing here is a real permission."""
+    if TRUST_MARK.exists():
+        return
+    print(f"{BOLD}Accessing workspace:{RESET}\n")
+    print(f"{BOLD}{os.getcwd()}{RESET}\n")
+    print("Quick safety check: is this a project you created or one you trust?\n")
+    print("This chat only sends your messages to the engine on this Mac.\n")
+    print(f"  {BOLD}1.{RESET} Yes, I trust this folder")
+    print(f"  {BOLD}2.{RESET} No, exit")
+    print(f"  {BOLD}3.{RESET} Continue, I trust it anyway: data does not leave your computer\n")
+    while True:
+        choice = input("Choose 1, 2 or 3: ").strip() or "1"
+        if choice == "2":
+            raise SystemExit(0)
+        if choice in ("1", "3"):
+            break
+    TRUST_MARK.parent.mkdir(parents=True, exist_ok=True)
+    TRUST_MARK.touch()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Terminal chat on a running pie engine.")
     parser.add_argument("--url", default="http://127.0.0.1:8080", help="address of `pie serve`")
@@ -329,6 +354,8 @@ def main() -> None:
 
     backend = PlaceholderBackend() if args.placeholder else EngineBackend(args.url)
     os.system("cls" if os.name == "nt" else "clear")  # start on a clean screen, as the Claude CLI does
+    trust_screen()
+    os.system("cls" if os.name == "nt" else "clear")
     try:
         Chat(backend).build().run()
     finally:
