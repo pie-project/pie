@@ -49,7 +49,7 @@ ztensor-compat = { workspace = true }
 blake3 = "1.8"
 fancy-regex = "0.18.0"
 async-trait = "0.1.91"
-wasm-metadata = "0.254.0"
+wasm-metadata = "0.259.0"
 rustc-hash = "2.1"
 smallvec = "1"
 lru = "0.18.1"
