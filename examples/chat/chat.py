@@ -164,7 +164,7 @@ for frame in range(_LOOP):
             bubbles.append((row, column, char))
     _BUBBLES.append(bubbles)
 
-BODY_STYLE = "fg:#dcefff"  # very light blue, to stand apart from the Claude orange
+BODY_STYLE = "fg:#c8cbf2"  # the light lavender from the reference
 BUBBLE_STYLE = "fg:#3a2a26"  # almost the background colour: the bubbles are barely visible
 
 
@@ -234,7 +234,7 @@ class Chat:
         # the text starts one line below the top of the mascot, so it sits lower beside it
         info = [
             [],
-            [("fg:#c8cbf2 bold", "Pie Code"), ("class:dim", f" v{ENGINE_VERSION}")],
+            [("class:bold", "Pie Code"), ("class:dim", f" v{ENGINE_VERSION}")],
             [("class:dim", f"{MODEL_NAME} · this Mac")],
             [("class:dim", os.getcwd())],
         ]
