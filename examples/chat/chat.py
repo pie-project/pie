@@ -121,17 +121,16 @@ class EngineBackend:
 # per frame and vanish, then the cycle repeats. Rows are 0 (top) to 2 (bottom), columns 0 to 9.
 # The fish is drawn on a four-row canvas: row 0 is empty so the bubbles can rise above the body.
 _BODY = {2: "▐▟▙▙▙▛▌", 3: "▜██▄██▛"}  # the half block in the bottom row is the fin
-# Bubbles rise half a character per frame. Each step alternates between the lower-left quadrant
-# (▖) and the upper-left quadrant (▘) of a row, so a bubble climbs smoothly. Bubble A rises in
-# column 8 and bubble B in column 9, starting two frames later; the loop is ten frames.
-_LOOP = 10
-_STEPS = 8  # half-character steps a bubble takes before it vanishes
+# Bubbles are always present. A new bubble appears every frame at the lowest half character
+# (the bottom-left quadrant ▖ of the bottom row) and rises one half step per frame up to the top
+# row, then the next bubble takes its place. Bubbles alternate between two columns, so each frame
+# shows eight bubbles at different heights and no two frames match. The loop is eight frames.
+_LOOP = 8
+_SPAWNS = [(0, 8), (3, 8), (6, 8), (2, 9), (5, 9)]  # (frame a bubble appears on, column)
 
 
 def _bubble_at(step):
-    """(row, character) of a bubble after `step` half-character steps, or None when it has vanished."""
-    if not 0 <= step < _STEPS:
-        return None
+    """(row, character) after `step` half-character steps: 0 is the lowest half, 7 the top."""
     row = 3 - step // 2
     return row, ("▖" if step % 2 == 0 else "▘")
 
@@ -139,11 +138,9 @@ def _bubble_at(step):
 _BUBBLES = []
 for frame in range(_LOOP):
     bubbles = []
-    for column, start in ((8, 0), (9, 2)):
-        placed = _bubble_at((frame - start) % _LOOP)
-        if placed is not None:
-            row, char = placed
-            bubbles.append((row, column, char))
+    for spawn_frame, column in _SPAWNS:
+        row, char = _bubble_at((frame - spawn_frame) % _LOOP)
+        bubbles.append((row, column, char))
     _BUBBLES.append(bubbles)
 
 BODY_STYLE = "class:accent"
