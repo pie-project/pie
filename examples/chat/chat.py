@@ -33,7 +33,6 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from mascots import ANIMALS
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.key_binding import KeyBindings
@@ -118,44 +117,19 @@ class EngineBackend:
         self.history.append({"role": "assistant", "content": "".join(pieces)})
 
 
-# The duck from mascots.py: a 10x8 sprite drawn with half-block characters,
-# one pixel per column and two pixel rows per text line, so the banner is 3 lines tall.
-MASCOT_NAME, (MASCOT_PALETTE, _MASCOT_ART) = "fish", ANIMALS["fish"]
-FRAME_SECONDS = 0.4
+FRAME_SECONDS = 0.3  # time between mascot frames
 
-
-def _mascot_frames(art: list[str]) -> list[list[str]]:
-    """Normal, blink and bob frames of the fish, each sampled to six pixel rows."""
-    eye_row = next(i for i, r in enumerate(art) if "d" in r)
-    eye_col = art[eye_row].index("d")
-    blink = list(art)
-    blink[eye_row] = blink[eye_row][:eye_col] + "o" + blink[eye_row][eye_col + 1:]  # the eye closes into the body colour
-    bob = ["." * len(art[0])] + art[:-1]           # the whole fish moves down one pixel row
-    frames = [art, art, blink, art, bob]
-    return [[f[round(i * 7 / 5)] for i in range(6)] for f in frames]
-
-
-MASCOT_FRAMES = _mascot_frames(_MASCOT_ART)
+MASCOT_FRAMES = [
+    ["   ▘  ▖", "▐▟▙▙▙▛▌", "▜█████▛"],
+    ["  ▖  ▘", "▐▟▙▙▙▛▌ ▖", "▜█████▛"],
+    [" ▘ ▖", "▐▟▙▙▙▛▌  ▘", "▜█████▛ ▖"],
+    ["▖  ▘", "▐▟▙▙▙▛▌ ▖", "▜█████▛  ▘"],
+]
 
 
 def mascot_rows(frame: int = 0) -> list[list[tuple[str, str]]]:
-    """Return the mascot as rows of styled text fragments, two pixel rows per line."""
-    colors = {k: f"#{r:02x}{g:02x}{b:02x}" for k, (r, g, b) in MASCOT_PALETTE.items()}
-    lines = []
-    rows = MASCOT_FRAMES[frame % len(MASCOT_FRAMES)]
-    for top, bottom in zip(rows[0::2], rows[1::2]):
-        fragments = []
-        for t, b in zip(top, bottom):
-            if t in colors and b in colors:
-                fragments.append((f"fg:{colors[t]} bg:{colors[b]}", "▀"))
-            elif t in colors:
-                fragments.append((f"fg:{colors[t]}", "▀"))
-            elif b in colors:
-                fragments.append((f"fg:{colors[b]}", "▄"))
-            else:
-                fragments.append(("", " "))
-        lines.append(fragments)
-    return lines
+    """Return the mascot frame as three rows of styled text, in the accent colour."""
+    return [[("class:accent", line)] for line in MASCOT_FRAMES[frame % len(MASCOT_FRAMES)]]
 
 
 class PlaceholderBackend:
