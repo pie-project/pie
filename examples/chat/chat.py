@@ -120,8 +120,10 @@ class EngineBackend:
 
 
 # One random animal from mascots.py per launch: a 10x8 sprite drawn with half-block characters,
-# one pixel per column and two pixel rows per text line, so the banner is 4 lines tall.
+# one pixel per column and two pixel rows per text line, so the banner is 3 lines tall.
 MASCOT_NAME, (MASCOT_PALETTE, MASCOT_ROWS) = random.choice(list(ANIMALS.items()))
+# six pixel rows (three text lines) sampled evenly from the 8 rows of each sprite
+MASCOT_ROWS = [MASCOT_ROWS[round(i * 7 / 5)] for i in range(6)]
 
 
 def mascot_rows() -> list[list[tuple[str, str]]]:
