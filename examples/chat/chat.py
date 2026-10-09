@@ -35,10 +35,8 @@ from urllib.parse import urlsplit
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
-from prompt_toolkit.filters import Condition
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
-from prompt_toolkit.layout.containers import ConditionalContainer
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.styles import Style
 
@@ -271,6 +269,9 @@ class Chat:
         return Point(x=0, y=text.count("\n"))
 
     def mode_line(self) -> list[tuple[str, str]]:
+        # while an exit is armed, the same row says how to confirm it
+        if self.exit_armed:
+            return [("class:dim", f"  Press Ctrl-{self.exit_key} again to exit")]
         icon, label, colour = MODES[self.mode]
         return [(f"fg:{colour}", f"  {icon} {label}"), ("class:dim", " (shift+tab to cycle)")]
 
@@ -380,13 +381,7 @@ class Chat:
         )
         box = HSplit([rule, VSplit([prompt, self.input_window]), rule])
         mode = Window(content=FormattedTextControl(self.mode_line), height=1)
-        # the exit hint takes its own row only while an exit is armed, so it is not always on screen
-        exit_hint = ConditionalContainer(
-            Window(content=FormattedTextControl(self.status), height=1),
-            filter=Condition(lambda: self.exit_armed),
-        )
-
-        root = HSplit([self.output, box, exit_hint, mode])
+        root = HSplit([self.output, box, mode])
         self.app = Application(
             layout=Layout(root, focused_element=self.input_window),
             key_bindings=bindings,
