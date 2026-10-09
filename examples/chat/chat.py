@@ -129,7 +129,9 @@ MASCOT_FRAMES = [
 
 def mascot_rows(frame: int = 0) -> list[list[tuple[str, str]]]:
     """Return the mascot frame as three rows of styled text, in the accent colour."""
-    return [[("class:accent", line)] for line in MASCOT_FRAMES[frame % len(MASCOT_FRAMES)]]
+    # pad every line to the widest frame, so the text beside the mascot never moves
+    width = max(len(line) for f in MASCOT_FRAMES for line in f)
+    return [[("class:accent", line.ljust(width))] for line in MASCOT_FRAMES[frame % len(MASCOT_FRAMES)]]
 
 
 class PlaceholderBackend:
