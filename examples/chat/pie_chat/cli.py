@@ -1,5 +1,4 @@
 import argparse
-import asyncio
 import os
 from urllib.parse import urlsplit
 
@@ -31,7 +30,7 @@ def main() -> None:
     os.system("cls" if os.name == "nt" else "clear")
     chat = Chat(backend)
     try:
-        build(chat).run(pre_run=lambda: asyncio.ensure_future(chat.animate()))
+        build(chat).run()
     finally:
         if engine is not None:
             stop_engine(engine)

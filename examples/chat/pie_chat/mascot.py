@@ -36,5 +36,5 @@ def frame_grid(frame: int) -> list[list[tuple[str, str]]]:
 FRAMES = [frame_grid(frame) for frame in range(LOOP)]
 
 
-def mascot_rows(frame: int) -> list[list[tuple[str, str]]]:
-    return [list(row) for row in FRAMES[frame % LOOP]]
+def mascot_rows() -> list[list[tuple[str, str]]]:
+    return [list(row) for row in FRAMES[0]]

@@ -22,7 +22,7 @@ GAP = " "
 
 
 def banner(chat: Chat) -> list[tuple[str, str]]:
-    mascot = mascot_rows(chat.frame)
+    mascot = mascot_rows()
     info = [
         [],
         [("class:bold", "Pie Code"), ("class:dim", f" v{ENGINE_VERSION}")],
