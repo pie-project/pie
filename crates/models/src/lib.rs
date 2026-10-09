@@ -1,310 +1,242 @@
-pub mod adapter;
+pub mod catalog;
 pub mod deepseek_v4;
-pub mod drafter;
 pub mod flux_2;
 pub mod gemma_4;
-pub mod gemma_4_diffusion;
 pub mod glm_5;
 pub mod glm_5_next;
 pub mod gpt_oss;
 pub mod hunyuan_image_3;
 pub mod inkling;
 pub mod kimi_k3;
-pub mod ltx_2;
 pub mod media;
-pub mod mini_dit;
-pub mod minimax_h3;
 pub mod muse_glimmer;
-pub mod numpy;
 pub mod published;
 pub mod qwen_3;
 pub mod qwen_4;
+pub mod star;
 pub mod template;
 pub mod tokenizer;
 pub mod wan_2;
-pub mod z_image;
 
 use std::sync::LazyLock;
 
 use checkpoint::contract::ModelContract;
-use poem_dsl::Dtype;
+use poem::Dtype;
 
-pub use poem_dsl::{ClassifyFn, Platform, Request, Stream, biases_name, scales_name};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Recipe {
-    pub text: &'static str,
-    pub weights: &'static [Dtype],
-    pub kv: Dtype,
-    pub tp: u32,
-}
-
-impl Recipe {
-    #[must_use]
-    pub fn name(&self) -> String {
-        let mut name = self.text.to_string();
-        for dtype in self.weights {
-            name.push('-');
-            name.push_str(&word(*dtype));
-        }
-        name.push_str("-kv-");
-        name.push_str(&word(self.kv));
-        if self.tp > 1 {
-            name.push_str(&format!("-tp{}", self.tp));
-        }
-        name
-    }
-}
+pub use poem::generative::{
+    AxisRole, Diffusion, Generative, LatentSpace, PortFact, PortKind, PositionConvention,
+    ReadingFact, ReadoutKind, ScheduleFact, ScheduleKind,
+};
+pub use poem::{Platform, Request, Stream, biases_name, scales_name};
 
 #[must_use]
 pub fn word(dtype: Dtype) -> String {
     format!("{dtype:?}").to_lowercase()
 }
 
-pub struct Sku {
+/// The dtype `word` spells, the inverse of [`word`].
+#[must_use]
+pub fn dtype_of(word: &str) -> Option<Dtype> {
+    Dtype::ALL
+        .iter()
+        .copied()
+        .find(|dtype| self::word(*dtype) == word)
+}
+
+/// One deployment of one model, under the name it is served by.
+#[derive(Clone)]
+pub struct Deployment {
     pub name: String,
-    pub recipe: Recipe,
-    pub trace: poem_dsl::TraceFn,
-    pub classify: ClassifyFn,
-    pub import: ImportFn,
-    pub template:
-        fn(std::sync::Arc<::tokenizer::Tokenizer>) -> std::sync::Arc<dyn template::Instruct>,
+    pub entry: &'static catalog::Entry,
+    pub deploy: catalog::Deploy,
+    pub template: catalog::TemplateFn,
     pub tokenizer: &'static tokenizer::Contract,
     pub diffusion: Option<Diffusion>,
     pub generative: Option<Generative>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Generative {
-    pub readings: Vec<ReadingFact>,
-    pub latent: Option<LatentSpace>,
-    pub schedule: Option<ScheduleFact>,
-    pub max_rows: u32,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ReadingFact {
-    pub name: &'static str,
-    pub index: u8,
-    pub has_kv: bool,
-    pub takes_tokens: bool,
-    pub streams: Vec<Stream>,
-    pub ports: Vec<PortFact>,
-    pub positions: Option<PositionConvention>,
-    pub readout: ReadoutKind,
-    pub readout_width: u32,
-}
-
-impl ReadingFact {
+impl Deployment {
     #[must_use]
-    pub fn port(&self, name: &str) -> Option<(u8, &PortFact)> {
-        self.ports_indexed().find(|(_, port)| port.name == name)
+    pub fn of(entry: &'static catalog::Entry, deploy: catalog::Deploy) -> Deployment {
+        Deployment {
+            name: entry.name(&deploy),
+            entry,
+            template: entry.template,
+            tokenizer: tokenizer::named(
+                entry.tokenizer,
+                deploy.parts.contains(&catalog::Part::Vision),
+            )
+            .expect("a model's package names a tokenizer for every deployment"),
+            diffusion: (entry.diffusion)(&deploy),
+            generative: (entry.generative)(&deploy),
+            deploy,
+        }
     }
 
-    pub fn ports_indexed(&self) -> impl Iterator<Item = (u8, &PortFact)> + '_ {
-        let mut seen = [0u8; 5];
-        self.ports.iter().map(move |port| {
-            let slot = match port.kind {
-                PortKind::Latents => 0,
-                PortKind::LaneVector => 1,
-                PortKind::Context => 2,
-                PortKind::AxisPositions => 3,
-                PortKind::Voxels => 4,
-            };
-            let index = port.at.unwrap_or(seen[slot]);
-            seen[slot] = index.saturating_add(1);
-            (index, port)
-        })
+    /// The deployment `name` spells.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Deployment> {
+        catalog::parse(name).map(|(entry, deploy)| Deployment::of(entry, deploy))
     }
-}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PortFact {
-    pub name: &'static str,
-    pub kind: PortKind,
-    pub width: u32,
-    pub streams: Vec<Stream>,
-    pub at: Option<u8>,
-    pub rows: Option<u32>,
-}
+    /// Whether the model serves this deployment on `platform`.
+    pub fn check(&self, platform: Platform) -> Result<(), catalog::Refused> {
+        self.entry.check(&self.deploy, platform)
+    }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PortKind {
-    Latents,
-    LaneVector,
-    Context,
-    AxisPositions,
-    Voxels,
-}
+    /// The trace each of the deployment's ranks runs.
+    pub fn try_trace(&self, platform: Platform) -> Result<poem_ir::Trace, catalog::Refused> {
+        self.entry.trace(&self.deploy, platform)
+    }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AxisRole {
-    Time,
-    Height,
-    Width,
-    Index,
-}
+    /// The trace each of the deployment's ranks runs, for a deployment the
+    /// catalog lists, which always builds.
+    #[must_use]
+    pub fn trace(&self, platform: Platform) -> poem_ir::Trace {
+        self.try_trace(platform)
+            .unwrap_or_else(|why| panic!("`{}` does not build: {why}", self.name))
+    }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PositionConvention {
-    pub axes: Vec<AxisRole>,
-    pub text_axis: u32,
-    pub text_origin: u32,
-    pub image_follows_text: bool,
-    pub reference_stride: Option<u32>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ReadoutKind {
-    Logits,
-    Velocity,
-    Hidden,
-    Pixels,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LatentSpace {
-    pub channels: u32,
-    pub patch_t: u32,
-    pub patch_h: u32,
-    pub patch_w: u32,
-    pub spatial_compression: u32,
-    pub temporal_compression: u32,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ScheduleFact {
-    pub kind: ScheduleKind,
-    pub shift: f32,
-    pub train_steps: u32,
-    pub boundary: Option<f32>,
-    pub pinned_sigmas: Vec<f32>,
-    pub stream_shifts: Vec<(Stream, f32)>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ScheduleKind {
-    Flow,
-    Epsilon,
-    V,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Diffusion {
-    pub canvas: u32,
-    pub hidden: u32,
-    pub self_cond_taps: u32,
-}
-
-impl Sku {
     pub fn contract(
         &self,
         src: &ztensor::Source,
         platform: Platform,
-    ) -> Result<ModelContract, checkpoint_dsl::Error> {
-        (self.import)(src, self.recipe.tp, platform)
+    ) -> Result<ModelContract, poem::import::Error> {
+        (self.entry.import)(&self.deploy, src, platform)
     }
 }
 
-pub type ImportFn =
-    fn(&ztensor::Source, u32, Platform) -> Result<ModelContract, checkpoint_dsl::Error>;
-
-#[macro_export]
-macro_rules! skus {
-    ($( ($text:literal, $tp:literal, [$($w:expr),+ $(,)?], $kv:expr, $trace:path, $template:expr, $tokenizer:expr, $m:expr $(,)?) ),+ $(,)?) => {
-        vec![ $( {
-            const RECIPE: $crate::Recipe = $crate::Recipe {
-                text: $text,
-                weights: &[$($w),+],
-                kv: $kv,
-                tp: $tp,
-            };
-            $crate::Sku {
-                name: RECIPE.name(),
-                recipe: RECIPE,
-                trace: |platform: $crate::Platform| {
-                    $trace(&RECIPE.name(), &($m)(RECIPE.tp), platform)
-                },
-                classify: |request: &$crate::Request| {
-                    poem_dsl::word_of(|| ($m)(RECIPE.tp), request)
-                },
-                import: |src: &ztensor::Source, tp: u32, platform: $crate::Platform| {
-                    ($m)(tp).import(src, platform)
-                },
-                template: $template,
-                tokenizer: $tokenizer,
-                diffusion: None,
-                generative: None,
-            }
-        } ),+ ]
-    };
+/// An import reads a whole checkpoint, which one rank of a split row does not
+/// land: its share is banded out of a stamped artifact instead.
+pub fn whole(tp: u32) -> Result<(), poem::import::Error> {
+    if tp == 1 {
+        return Ok(());
+    }
+    Err(poem::import::Error::Illegible {
+        name: String::new(),
+        detail: format!(
+            "an import states the WHOLE checkpoint and this contract is built for {tp} \
+             ranks; nothing has banded the file it is reading"
+        ),
+    })
 }
 
-static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
-    [
-        deepseek_v4::skus(),
-        flux_2::skus(),
-        gemma_4::skus(),
-        gemma_4_diffusion::skus(),
-        glm_5::skus(),
-        glm_5_next::skus(),
-        gpt_oss::skus(),
-        hunyuan_image_3::skus(),
-        inkling::skus(),
-        kimi_k3::skus(),
-        muse_glimmer::skus(),
-        qwen_3::skus(),
-        qwen_4::skus(),
-        z_image::skus(),
-        wan_2::skus(),
-        minimax_h3::skus(),
-        ltx_2::skus(),
-        mini_dit::skus(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
-});
+static FAMILIES: LazyLock<Vec<Vec<catalog::Entry>>> = LazyLock::new(star::families);
 
-pub fn skus() -> impl Iterator<Item = &'static Sku> {
-    SKUS.iter()
+/// Every model of the catalog, whole and miniature alike.
+pub fn entries() -> impl Iterator<Item = &'static catalog::Entry> {
+    FAMILIES.iter().flatten()
 }
 
 #[must_use]
-pub fn sku(name: &str) -> Option<&'static Sku> {
-    skus().find(|sku| sku.name == name)
+pub fn entry(id: &str) -> Option<&'static catalog::Entry> {
+    entries().find(|entry| entry.id == id)
+}
+
+/// Every deployment the catalog lists, family by family in the order each
+/// family lists them.
+static DEPLOYMENTS: LazyLock<Vec<Deployment>> = LazyLock::new(|| {
+    FAMILIES
+        .iter()
+        .zip(star::packages())
+        .flat_map(|(family, package)| {
+            package.manifest().deployments.iter().map(move |(id, d)| {
+                let entry = family
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .expect("a package lists deployments of its own models");
+                let deploy = star::catalog(d)
+                    .unwrap_or_else(|why| panic!("the package `{}`: {}", package.name(), why.0));
+                Deployment::of(entry, deploy)
+            })
+        })
+        .collect()
+});
+
+/// Every deployment the catalog lists, miniatures' included. Each runs on
+/// one rank; [`splits`] are the same deployments across more.
+pub fn deployments() -> impl Iterator<Item = &'static Deployment> {
+    DEPLOYMENTS.iter()
+}
+
+/// The rank counts [`splits`] tries each listed deployment at.
+pub const RANKS: [u32; 3] = [2, 4, 8];
+
+/// Every listed deployment at every count of [`RANKS`] its model splits it
+/// across, a deployment the compiler's sharding pass refuses left out.
+static SPLITS: LazyLock<Vec<Deployment>> = LazyLock::new(|| {
+    DEPLOYMENTS
+        .iter()
+        .flat_map(|whole| {
+            RANKS.into_iter().filter_map(|tp| {
+                let deploy = catalog::Deploy {
+                    tp,
+                    ..whole.deploy.clone()
+                };
+                let split = Deployment::of(whole.entry, deploy);
+                split.check(Platform::Cuda).is_ok().then_some(split)
+            })
+        })
+        .collect()
+});
+
+/// Every listed deployment split across the ranks of [`RANKS`] it splits
+/// across.
+pub fn splits() -> impl Iterator<Item = &'static Deployment> {
+    SPLITS.iter()
+}
+
+/// The deployment `name` names: one the catalog lists, or one of its
+/// [`splits`].
+#[must_use]
+pub fn deployment(name: &str) -> Option<&'static Deployment> {
+    deployments()
+        .find(|deployment| deployment.name == name)
+        .or_else(|| splits().find(|deployment| deployment.name == name))
 }
 
 pub fn fits<'a>(
     src: &'a ztensor::Source,
     platform: Platform,
-) -> impl Iterator<Item = (&'static Sku, Result<ModelContract, checkpoint_dsl::Error>)> + 'a {
-    skus()
-        .filter(|sku| sku.recipe.tp == 1)
-        .map(move |sku| (sku, sku.contract(src, platform)))
-}
-
-pub(crate) fn dense(banks: Dtype) -> Dtype {
-    poem_dsl::compute_dtype(banks)
-        .unwrap_or_else(|| panic!("`{banks:?}` is not a weight representation a family declares"))
+) -> impl Iterator<
+    Item = (
+        &'static Deployment,
+        Result<ModelContract, poem::import::Error>,
+    ),
+> + 'a {
+    let mut candidates: Vec<&'static Deployment> = deployments().collect();
+    // A miniature reads a prefix of its whole model's planes and would claim
+    // the whole checkpoint too, so whole models are tried first. A checkpoint is
+    // served with every part and drafter it carries unless a config leaves
+    // them off, so the richest deployment that fits is tried first; the
+    // catalog's order breaks ties.
+    candidates.sort_by_key(|d| {
+        (
+            d.entry.mini,
+            std::cmp::Reverse(d.deploy.parts.len() + usize::from(d.deploy.drafter.is_some())),
+        )
+    });
+    candidates
+        .into_iter()
+        .map(move |d| (d, d.contract(src, platform)))
 }
 
 pub fn identify(src: &ztensor::Source, platform: Platform) -> Result<&'static str, Unmatched> {
     let mut misses: Vec<(&'static str, String)> = Vec::new();
-    for (sku, read) in fits(src, platform) {
+    for (deployment, read) in fits(src, platform) {
         match read {
             Ok(contract) => match requantizes(&contract) {
-                None => return Ok(&sku.name),
+                None => return Ok(&deployment.name),
                 Some(plane) => misses.push((
-                    &sku.name,
+                    &deployment.name,
                     format!(
                         "reads this checkpoint only by re-quantizing `{plane}` from the form \
-                         it is stored in; a second quantization is taken by `--sku`, not by \
+                         it is stored in; a second quantization is taken by `--deployment`, not by \
                          identification"
                     ),
                 )),
             },
-            Err(why) => misses.push((&sku.name, why.to_string())),
+            Err(why) => misses.push((&deployment.name, why.to_string())),
         }
     }
     Err(Unmatched { misses })
@@ -329,9 +261,9 @@ pub struct Unmatched {
 
 impl std::fmt::Display for Unmatched {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "this checkpoint matches no SKU this build ships")?;
-        for (sku, why) in &self.misses {
-            write!(f, "\n  {sku}: {why}")?;
+        write!(f, "this checkpoint matches no deployment this build ships")?;
+        for (deployment, why) in &self.misses {
+            write!(f, "\n  {deployment}: {why}")?;
         }
         Ok(())
     }

@@ -1,11 +1,13 @@
 use std::collections::BTreeSet;
 
-use models::flux_2::forward::{self, Facts};
-use models::flux_2::model;
+pub mod flux_2_dims;
+
+use flux_2_dims as forward;
+use flux_2_dims as model;
 use models::{PortKind, ReadoutKind};
-use poem_dsl::{
-    Attention, Classify, Def, Dim, Dtype, Elementwise, GeomKind, Operands, Operation, Platform,
-    Request, RopeForm, RuntimeInput, Stream, Trace, Ty, ValueId, seam,
+use poem::{
+    Attention, Def, Dim, Dtype, Elementwise, GeomKind, Operands, Operation, Platform, Request,
+    RopeForm, RuntimeInput, Stream, Trace, Ty, ValueId, seam,
 };
 
 const KLEIN: &str = "flux2-klein-4b-bf16-kv-bf16";
@@ -18,15 +20,15 @@ const PLATFORMS: [Platform; 4] = [
     Platform::Vulkan,
 ];
 
-fn row(sku: &str) -> &'static models::Sku {
-    models::sku(sku).unwrap_or_else(|| {
-        let names: Vec<&str> = models::skus().map(|row| row.name.as_str()).collect();
-        panic!("this build ships no `{sku}`; rows are {names:#?}")
+fn row(deployment: &str) -> &'static models::Deployment {
+    models::deployment(deployment).unwrap_or_else(|| {
+        let names: Vec<&str> = models::deployments().map(|row| row.name.as_str()).collect();
+        panic!("this build ships no `{deployment}`; rows are {names:#?}")
     })
 }
 
-fn trace(sku: &str, platform: Platform) -> Trace {
-    (row(sku).trace)(platform)
+fn trace(deployment: &str, platform: Platform) -> Trace {
+    row(deployment).trace(platform)
 }
 
 fn seams(plan: &Trace) -> BTreeSet<&str> {
@@ -110,11 +112,11 @@ fn traced_ports(plan: &Trace) -> Vec<(PortKind, u8, u32)> {
 }
 
 fn the_denoise_ports_are_the_ones_the_facts_declare() {
-    for (sku, guidance, context_width) in [
+    for (deployment, guidance, context_width) in [
         (KLEIN, false, model::Dims::klein_4b().dim),
         (MINI, true, model::Dims::mini().context_in),
     ] {
-        let facts = row(sku)
+        let facts = row(deployment)
             .generative
             .as_ref()
             .expect("a generative row states its readings");
@@ -123,21 +125,21 @@ fn the_denoise_ports_are_the_ones_the_facts_declare() {
             .iter()
             .find(|r| r.name == "denoise")
             .expect("the denoise reading");
-        assert!(!denoise.has_kv && !denoise.takes_tokens, "{sku}");
+        assert!(!denoise.has_kv && !denoise.takes_tokens, "{deployment}");
         assert_eq!(
             denoise.streams,
             vec![Stream::Text, Stream::Image, Stream::Reference],
-            "{sku}"
+            "{deployment}"
         );
         assert_eq!(denoise.readout, ReadoutKind::Velocity);
         assert_eq!(denoise.readout_width, model::IN_CHANNELS);
-        let names: Vec<&str> = denoise.ports.iter().map(|p| p.name).collect();
+        let names: Vec<&str> = denoise.ports.iter().map(|p| p.name.as_str()).collect();
         let want: Vec<&str> = if guidance {
             vec!["latents", "context", "timestep", "guidance", "positions"]
         } else {
             vec!["latents", "context", "timestep", "positions"]
         };
-        assert_eq!(names, want, "{sku}");
+        assert_eq!(names, want, "{deployment}");
         let at = |name: &str| {
             let (index, port) = denoise.port(name).unwrap();
             (index, port.kind, port.width)
@@ -169,13 +171,13 @@ fn the_denoise_ports_are_the_ones_the_facts_declare() {
             )
         );
 
-        let plan = trace(sku, Platform::Cuda);
+        let plan = trace(deployment, Platform::Cuda);
         let mut declared: Vec<(PortKind, u8, u32)> = denoise
             .ports_indexed()
             .map(|(index, port)| (port.kind, index, port.width))
             .collect();
         declared.sort_by_key(|(kind, port, _)| (format!("{kind:?}"), *port));
-        assert_eq!(traced_ports(&plan), declared, "{sku}");
+        assert_eq!(traced_ports(&plan), declared, "{deployment}");
 
         let mut sinusoids: Vec<(u32, f32, bool, f32)> = plan
             .nodes
@@ -206,11 +208,15 @@ fn the_denoise_ports_are_the_ones_the_facts_declare() {
                 model::GUIDANCE_SCALE,
             ));
         }
-        assert_eq!(sinusoids, want, "{sku}");
+        assert_eq!(sinusoids, want, "{deployment}");
     }
 
     let klein = row(KLEIN).generative.as_ref().unwrap();
-    let names: Vec<(&str, u8)> = klein.readings.iter().map(|r| (r.name, r.index)).collect();
+    let names: Vec<(&str, u8)> = klein
+        .readings
+        .iter()
+        .map(|r| (r.name.as_str(), r.index))
+        .collect();
     assert_eq!(
         names,
         vec![
@@ -240,53 +246,39 @@ fn the_denoise_ports_are_the_ones_the_facts_declare() {
 }
 
 fn each_stream_of_the_denoise_reading_classifies_into_its_own_class() {
-    for sku in [KLEIN, MINI] {
-        let plan = trace(sku, Platform::Cuda);
-        let classes = poem_dsl::resolve_classes(&plan).expect("every merge resolves");
-        let row = row(sku);
-        let codes = models::flux_2::model::Model::mini(Dtype::Bf16, 1).readings();
-        let denoise = if sku == KLEIN { 1 } else { codes.denoise };
+    for deployment in [KLEIN, MINI] {
+        let plan = trace(deployment, Platform::Cuda);
+        let classes = poem::resolve_classes(&plan).expect("every merge resolves");
+        let _row = row(deployment);
 
         let mut seen = Vec::new();
         for stream in [Stream::Text, Stream::Image, Stream::Reference] {
-            let request = Request::new(1, false).on_stream(stream).in_reading(denoise);
-            let word = (row.classify)(&request);
-            assert_eq!(word, Facts::of(&request).word(), "{sku} {stream:?}");
+            let request = Request::new(1, false)
+                .on_stream(stream)
+                .in_reading("denoise");
+            let word = plan.facts.word(&request);
             let class = classes
                 .class_of(word & classes.mask)
-                .unwrap_or_else(|| panic!("{sku}: a {stream:?} lane has no class"));
+                .unwrap_or_else(|| panic!("{deployment}: a {stream:?} lane has no class"));
             seen.push((stream, class));
         }
         let distinct: BTreeSet<usize> = seen.iter().map(|(_, class)| *class).collect();
         assert_eq!(
             distinct.len(),
             3,
-            "{sku}: two streams share a class: {seen:?}"
+            "{deployment}: two streams share a class: {seen:?}"
         );
     }
-    let mini = models::flux_2::model::Model::mini(Dtype::Bf16, 1).readings();
-    assert_eq!(
-        (mini.text, mini.denoise, mini.vae_decode, mini.vae_encode),
-        (None, 0, None, None)
-    );
-    let klein = models::flux_2::model::Model::klein_4b(Dtype::Bf16, 1).readings();
-    assert_eq!(
-        (
-            klein.text,
-            klein.denoise,
-            klein.vae_decode,
-            klein.vae_encode
-        ),
-        (Some(0), 1, Some(2), Some(3))
-    );
+    assert_eq!(model::readings(MINI), (None, 0, None, None));
+    assert_eq!(model::readings(KLEIN), (Some(0), 1, Some(2), Some(3)));
 }
 
 fn every_ragged_read_is_self_paired_over_the_group_csr() {
-    for (sku, dims) in [
+    for (deployment, dims) in [
         (KLEIN, model::Dims::klein_4b()),
         (MINI, model::Dims::mini()),
     ] {
-        let plan = trace(sku, Platform::Cuda);
+        let plan = trace(deployment, Platform::Cuda);
         let ragged: Vec<(ValueId, ValueId, u32)> = plan
             .nodes
             .iter()
@@ -303,15 +295,15 @@ fn every_ragged_read_is_self_paired_over_the_group_csr() {
         assert_eq!(
             ragged.len(),
             (dims.double_blocks + dims.single_blocks) as usize,
-            "{sku}: one ragged read per block"
+            "{deployment}: one ragged read per block"
         );
         let csr = ragged[0].0;
         for (q, kv, head_dim) in &ragged {
-            assert_eq!(*head_dim, model::HEAD_DIM, "{sku}");
+            assert_eq!(*head_dim, model::HEAD_DIM, "{deployment}");
             assert_eq!(
                 (*q, *kv),
                 (csr, csr),
-                "{sku}: one CSR, both sides, every block"
+                "{deployment}: one CSR, both sides, every block"
             );
         }
         let Def::Input(RuntimeInput::Geometry {
@@ -319,20 +311,23 @@ fn every_ragged_read_is_self_paired_over_the_group_csr() {
             ..
         }) = &plan.values[csr.0 as usize].def
         else {
-            panic!("{sku}: the joint CSR is not a group indptr");
+            panic!("{deployment}: the joint CSR is not a group indptr");
         };
-        let denoise = if sku == KLEIN { 1 } else { 0 };
         let word = |stream: Stream| {
-            Facts::of(&Request::new(1, false).on_stream(stream).in_reading(denoise)).word()
+            plan.facts.word(
+                &Request::new(1, false)
+                    .on_stream(stream)
+                    .in_reading("denoise"),
+            )
         };
         for stream in [Stream::Text, Stream::Image, Stream::Reference] {
             assert!(
                 select.holds(word(stream)),
-                "{sku}: {stream:?} is in the joint group"
+                "{deployment}: {stream:?} is in the joint group"
             );
         }
-        let text_reading = Facts::of(&Request::new(1, false).in_reading(0)).word();
-        if sku == KLEIN {
+        let text_reading = plan.facts.word(&Request::new(1, false).in_reading("text"));
+        if deployment == KLEIN {
             assert!(
                 !select.holds(text_reading),
                 "an encoder lane is not in the joint group"
@@ -408,8 +403,8 @@ fn budget() -> poem_compiler::Budget {
 
 fn both_rows_bake_on_every_platform_under_a_voxel_ladder() {
     for platform in PLATFORMS {
-        for sku in [KLEIN, MINI] {
-            let plan = trace(sku, platform);
+        for deployment in [KLEIN, MINI] {
+            let plan = trace(deployment, platform);
             let budgets = poem_compiler::Budgets::of(budget())
                 .with_voxels(poem_compiler::VoxelLadder::new(4096, 4));
             let compiled = poem_compiler::compile_axes(
@@ -417,17 +412,17 @@ fn both_rows_bake_on_every_platform_under_a_voxel_ladder() {
                 &budgets,
                 &poem_compiler::DeviceProfile::default(),
             )
-            .unwrap_or_else(|why| panic!("{platform:?}: `{sku}` does not bake: {why}"));
+            .unwrap_or_else(|why| panic!("{platform:?}: `{deployment}` does not bake: {why}"));
             let tiled: usize = compiled.regions.iter().map(|r| r.nodes.len()).sum();
             assert_eq!(
                 tiled,
                 plan.nodes.len(),
-                "{platform:?} `{sku}`: the regions tile the node list once"
+                "{platform:?} `{deployment}`: the regions tile the node list once"
             );
             assert_eq!(
                 compiled.voxels.is_some(),
-                sku == KLEIN,
-                "{platform:?} `{sku}`: a voxel plan iff the row carries a VAE"
+                deployment == KLEIN,
+                "{platform:?} `{deployment}`: a voxel plan iff the row carries a VAE"
             );
         }
     }

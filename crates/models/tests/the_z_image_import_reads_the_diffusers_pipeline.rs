@@ -5,8 +5,10 @@ use checkpoint::contract::Partition;
 use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{Expr, ModelContract, TensorType};
 use checkpoint::plan::StorageTarget;
-use models::z_image::model::{self, Dims};
-use poem_dsl::Platform;
+pub mod z_image_dims;
+
+use poem::Platform;
+use z_image_dims::{self as model, Dims};
 use ztensor::Leaf;
 use ztensor::provide::{Catalog, Entry, Location, Store, StoreId};
 
@@ -298,7 +300,7 @@ fn type_checks(contract: &ModelContract, src: &ztensor::Source) {
 }
 
 fn check_turbo(src: &ztensor::Source, index: &BTreeSet<String>) {
-    let row = models::sku(TURBO).expect("the catalog ships the flagship");
+    let row = models::deployment(TURBO).expect("the catalog ships the flagship");
     let contract = row
         .contract(src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the flagship does not read this checkpoint: {why}"));
@@ -358,7 +360,7 @@ fn check_turbo(src: &ztensor::Source, index: &BTreeSet<String>) {
 }
 
 fn check_mini(src: &ztensor::Source, index: &BTreeSet<String>) {
-    let row = models::sku(MINI).expect("the catalog ships the miniature");
+    let row = models::deployment(MINI).expect("the catalog ships the miniature");
     let contract = row
         .contract(src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the miniature does not read its checkpoint: {why}"));
@@ -387,7 +389,7 @@ fn the_z_image_import_reads_the_diffusers_pipeline_every_case() {
     the_miniature_reads_its_bare_state_dict_and_the_same_names_prefixed();
     neither_row_serves_the_other_rows_checkpoint();
     the_flagship_reads_the_real_snapshot();
-    the_derived_planes_are_stated_through_internal_steps();
+    the_derived_planes_are_stated_as_constants();
 }
 
 fn the_flagship_reads_a_synthetic_pipeline_shaped_like_the_snapshot() {
@@ -421,7 +423,7 @@ fn neither_row_serves_the_other_rows_checkpoint() {
     let dir = scratch();
     let turbo = prefixed("dit.", transformer(&Dims::turbo(), Leaf::F32));
     let src = synthetic(&dir, &turbo);
-    let mini = models::sku(MINI).unwrap();
+    let mini = models::deployment(MINI).unwrap();
     let contract = mini
         .contract(&src, Platform::Cuda)
         .expect("the names are there; a raw read is not shape-checked at build");
@@ -447,7 +449,7 @@ fn neither_row_serves_the_other_rows_checkpoint() {
     );
     let bare = transformer(&Dims::mini(), Leaf::F32);
     let src = synthetic(&dir, &bare);
-    let flagship = models::sku(TURBO).unwrap();
+    let flagship = models::deployment(TURBO).unwrap();
     assert!(
         flagship.contract(&src, Platform::Cuda).is_err(),
         "the flagship read a bare 256-wide transformer with no encoder"
@@ -506,11 +508,11 @@ fn the_flagship_reads_the_real_snapshot() {
     assert_eq!(identified, TURBO);
 }
 
-fn the_derived_planes_are_stated_through_internal_steps() {
+fn the_derived_planes_are_stated_as_constants() {
     let dir = scratch();
     let tensors = prefixed("dit.", transformer(&Dims::mini(), Leaf::F32));
     let src = synthetic(&dir, &tensors);
-    let row = models::sku(MINI).unwrap();
+    let row = models::deployment(MINI).unwrap();
     let contract = row.contract(&src, Platform::Cuda).unwrap();
     let named = |name: &str| {
         contract
@@ -519,18 +521,25 @@ fn the_derived_planes_are_stated_through_internal_steps() {
             .find(|t| t.name == name)
             .unwrap_or_else(|| panic!("no `{name}` in the contract"))
     };
+    let carries_a_constant = |expr: &Expr| {
+        let mut found = false;
+        expr.visit(&mut |node| found |= matches!(node, Expr::Const { .. }));
+        found
+    };
     for bank in ["dit.x_pad_mod", "dit.cap_pad_mod"] {
-        let neg = named(&format!("{bank}.neg"));
-        assert!(
-            matches!(&neg.expr, Expr::Bias { .. }),
-            "`{bank}.neg` is a biased fill"
-        );
         let bank = named(bank);
-        assert_eq!(bank.expr.outputs(), vec![format!("{}.neg", bank.name)]);
+        assert!(
+            carries_a_constant(&bank.expr),
+            "`{}`'s negative half is a constant the contract carries",
+            bank.name
+        );
         assert_eq!(bank.expr.sources().len(), 1, "the token itself, once");
     }
     let flip = named("dit.t_flip");
-    assert_eq!(flip.expr.outputs(), vec!["dit.t_flip.raw".to_string()]);
+    assert!(
+        carries_a_constant(&flip.expr),
+        "the flip is a stated constant"
+    );
     assert!(
         flip.expr.sources().is_empty(),
         "a constant reads no checkpoint tensor"

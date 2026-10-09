@@ -1,25 +1,45 @@
 use kernels_cuda::custom;
-use poem_exec::{DispatchCustomCuda, KernelError};
-use poem_ir::CustomCuda;
+use poem_exec::{DispatchFused, KernelError};
+use poem_ir::{Fused, Operands};
 
 use crate::run::Run;
 
-impl DispatchCustomCuda for Run<'_> {
-    fn dispatch(&mut self, op: &CustomCuda) -> Result<(), KernelError> {
-        self.custom_cuda(op).map_err(crate::error::kernel)
+impl DispatchFused for Run<'_> {
+    fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
+        match op {
+            Fused::QkvFusedQknormRopeVnormWrite { .. } => self.custom_cuda(op),
+            Fused::MatmulGeglu { .. } | Fused::LmHeadSoftcap { .. } | Fused::MatmulBias { .. } => {
+                self.fused_linear(op)
+            }
+            Fused::ResidualAddRmsnorm { .. }
+            | Fused::RmsnormResidualAdd { .. }
+            | Fused::EmbedScaleAdd { .. }
+            | Fused::EmbedScaleAddSelect { .. }
+            | Fused::RmsnormRopePartialQ { .. }
+            | Fused::NormModulate { .. }
+            | Fused::GatedResidualNormModulate { .. } => {
+                let mut outputs = Vec::new();
+                op.outputs(&mut outputs);
+                if outputs.first().is_some_and(|out| self.lane_shaped(*out)) {
+                    self.unseated(|| self.fused_elementwise(op))
+                } else {
+                    self.fused_elementwise(op)
+                }
+            }
+        }
+        .map_err(crate::error::kernel)
     }
 }
 
 impl Run<'_> {
-    fn custom_cuda(&mut self, op: &CustomCuda) -> Result<(), kernels_cuda::Error> {
+    fn custom_cuda(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
         match op {
-            CustomCuda::QkvFusedQknormRopeVnormWrite {
+            Fused::QkvFusedQknormRopeVnormWrite {
                 packed,
                 positions,
                 q_norm_weight,
-                q_norm_eps,
                 k_norm_weight,
-                k_norm_eps,
+                eps,
                 cache,
                 write_page,
                 write_offset,
@@ -33,9 +53,8 @@ impl Run<'_> {
                 self.tensor(*packed),
                 self.tensor(*positions),
                 self.tensor(*q_norm_weight),
-                *q_norm_eps,
                 self.tensor(*k_norm_weight),
-                *k_norm_eps,
+                *eps,
                 &self.pool(*cache),
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
@@ -45,6 +64,7 @@ impl Run<'_> {
                 *rotary_dim,
                 &mut self.tensor(*q),
             ),
+            _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
         }
     }
 }

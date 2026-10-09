@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 use controller_api::Role;
 pub use engine::runahead::Runahead;
 use serde::{Deserialize, Serialize};
@@ -70,7 +70,7 @@ impl Config {
         })?;
         let reshaped = crate::config::layout::reshape(file)?;
         let s = &toml::to_string(&reshaped).map_err(|e| anyhow::anyhow!("reshape config: {e}"))?;
-        let mut cfg: Config = toml::from_str(s).map_err(|e| {
+        let cfg: Config = toml::from_str(s).map_err(|e| {
             if s.contains("[[model]]") {
                 anyhow::anyhow!(
                     "parse config: {e}\n\
@@ -81,7 +81,6 @@ impl Config {
                 anyhow::anyhow!("parse config: {e}")
             }
         })?;
-        cfg.model.resolve_drafter()?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -436,18 +435,24 @@ pub struct ModelConfig {
     /// What to serve: a store name (`Qwen--Qwen3-0.6B`, as `pie model list`
     /// prints it) or a path to a `.zt` artifact. See `weights::resolve`.
     pub model: String,
-    /// Which SKU of that checkpoint to serve, or omit to let the load identify
-    /// one — the cheapest row whose contract and plan fit the checkpoint.
-    /// Which published draft head to serve `model` with, by its short name
-    /// (`dflash`, `dflash2`): `sku` looked up in the catalog's table of
-    /// published heads (`models::published::PUBLISHED`) for the target `model`
-    /// names, so a deployment says which drafter it wants rather than which
-    /// row spells it. The artifact must already carry the head — `pie model
-    /// import <target> --drafter <name>` is what puts it there. Refused when
-    /// `model` is a path (the table keys on repository ids) or names a target
-    /// the table lacks; `sku` beside it must agree.
+    /// The weight precision to serve (`bf16`, `u4g64`, or a mixed recipe's
+    /// banks joined with `+`, as `u4g64+u2g64`). The checkpoint stores its own
+    /// and is served at it; stating one picks between artifacts of one model
+    /// and refuses a checkpoint stored at another. Omit to serve what is
+    /// stored.
     #[serde(default)]
-    pub sku: Option<String>,
+    pub precision: Option<String>,
+    /// The dtype the kv cache is kept at. Omit for the model's default.
+    #[serde(default)]
+    pub kv: Option<String>,
+    /// Parts of the checkpoint to leave unloaded (`vision`, `selfcond`).
+    #[serde(default)]
+    pub off: Vec<String>,
+    /// The drafter to serve with (`mtp`, `dflash`, `dflash2`, `dspark`,
+    /// `eagle`), or `none` to serve without the checkpoint's. The artifact
+    /// must carry it — `pie model import <target> --drafter <name>` is what
+    /// adds a published head. Omit to serve with whatever the checkpoint
+    /// carries.
     #[serde(default)]
     pub drafter: Option<String>,
     /// Which backend runs the model, on what devices.
@@ -506,8 +511,8 @@ pub struct ModelConfig {
     #[serde(default = "default_deferred_tier")]
     pub deferred_tier: bool,
     /// The most patch rows one fire may carry, over every image of every lane
-    /// in it. Omit it: a vision SKU derives a ceiling from the checkpoint's
-    /// own shapes, and a text-only SKU wants no ladder at all.
+    /// in it. Omit it: a vision deployment derives a ceiling from the checkpoint's
+    /// own shapes, and a text-only deployment wants no ladder at all.
     /// The patch axis's lane ceiling: the most images one fire may carry.
     /// Omit it, as above; the default is derived from `max_patches`.
     /// The most PORT voxel rows one fire may carry on the third row axis
@@ -663,47 +668,44 @@ impl ModelConfig {
         (self.max_voxels, self.max_clips)
     }
 
-    /// Resolve `[model] drafter` into `[model] sku` through the published
-    /// heads table. Called once at load, before validation.
+    /// What this config changes about the deployment its checkpoint states.
     ///
     /// # Errors
     ///
-    /// A `model` the table cannot key (a path), a name it does not know for
-    /// this target, or a `sku` that names another row.
-    pub fn resolve_drafter(&mut self) -> Result<()> {
-        let Some(drafter) = self.drafter.as_deref() else {
-            return Ok(());
+    /// A precision, kv dtype, part or drafter word this build does not know.
+    pub fn overrides(&self) -> Result<runtime::engine::load::Overrides> {
+        let dtype = |word: &str, field: &str| {
+            models::dtype_of(word.trim())
+                .ok_or_else(|| anyhow::anyhow!("model.{field} = {word:?} names no dtype"))
         };
-        let target = self.model.trim();
-        ensure!(
-            !target.contains('/') || !target.ends_with(".zt"),
-            "model.drafter = {drafter:?} needs model.model to name the target repository \
-             (as `pie model list` prints it), not an artifact path {target:?}; name the row \
-             with model.sku instead"
-        );
-        let Some(published) = models::published::lookup(target, drafter) else {
-            let known: Vec<&str> = models::published::for_target(target)
-                .map(|p| p.drafter)
-                .collect();
-            bail!(
-                "model.drafter = {drafter:?}: no published head of that name for {target:?} in this \
-                 build{}",
-                if known.is_empty() {
-                    "; it knows none for that target — name the row with model.sku".to_string()
-                } else {
-                    format!("; it knows {known:?}")
-                }
-            );
+        let precision = self
+            .precision
+            .as_deref()
+            .map(|words| words.split('+').map(|w| dtype(w, "precision")).collect())
+            .transpose()?;
+        let kv = self.kv.as_deref().map(|w| dtype(w, "kv")).transpose()?;
+        let off = self
+            .off
+            .iter()
+            .map(|word| {
+                models::catalog::Part::of(word.trim())
+                    .ok_or_else(|| anyhow::anyhow!("model.off names {word:?}, no part a model has"))
+            })
+            .collect::<Result<_>>()?;
+        let drafter = match self.drafter.as_deref().map(str::trim) {
+            None => None,
+            Some("none") => Some(None),
+            Some(word) => Some(Some(models::catalog::Drafter::of(word).ok_or_else(
+                || anyhow::anyhow!("model.drafter = {word:?} names no drafter"),
+            )?)),
         };
-        match &self.sku {
-            Some(sku) if sku != published.sku => bail!(
-                "model.sku = {sku:?} and model.drafter = {drafter:?} name different rows (the \
-                 drafter's is {:?}); state one of them",
-                published.sku
-            ),
-            _ => self.sku = Some(published.sku.to_string()),
-        }
-        Ok(())
+        Ok(runtime::engine::load::Overrides {
+            precision,
+            kv,
+            off,
+            drafter,
+            tp: None,
+        })
     }
 
     fn validate(&self) -> Result<()> {
@@ -716,6 +718,7 @@ impl ModelConfig {
             "model.model must name a stored artifact or a path to one \
              (`pie model list` shows what is available)"
         );
+        self.overrides()?;
         self.engine.validate()?;
         ensure!(
             self.weight_cache_dir.is_empty() || Path::new(&self.weight_cache_dir).is_absolute(),

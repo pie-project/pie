@@ -70,6 +70,7 @@ fn tower_and_trunk() -> Trace {
     }
 
     Trace {
+        facts: Default::default(),
         name: "tower-and-trunk".to_string(),
         platform: poem_ir::Platform::Cuda,
         params: Vec::<Param>::new(),
@@ -77,6 +78,7 @@ fn tower_and_trunk() -> Trace {
             name: "state".to_string(),
             slab: vec![1],
             dtype: Dtype::Bf16,
+            shard: poem_ir::Shard::Replicated,
         }],
         values,
         nodes,

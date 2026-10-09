@@ -1,4 +1,4 @@
-//! Loading a model for a device test from `PIE_XLA_SNAPSHOT` + `PIE_XLA_SKU`
+//! Loading a model for a device test from `PIE_XLA_SNAPSHOT` + `PIE_XLA_DEPLOYMENT`
 //! (a Hugging Face snapshot) or `PIE_XLA_ARTIFACT` (an imported `.zt`).
 
 #![allow(dead_code)]
@@ -6,11 +6,11 @@
 use std::path::PathBuf;
 
 use checkpoint::contract::ModelContract;
-use poem_dsl::Platform;
+use poem::Platform;
 
 pub struct Model {
     pub checkpoint: PathBuf,
-    pub sku: &'static models::Sku,
+    pub deployment: &'static models::Deployment,
     pub contract: ModelContract,
     pub tokenizer: Option<PathBuf>,
 }
@@ -19,22 +19,27 @@ pub fn model() -> Option<Model> {
     match (
         std::env::var("PIE_XLA_ARTIFACT"),
         std::env::var("PIE_XLA_SNAPSHOT"),
-        std::env::var("PIE_XLA_SKU"),
+        std::env::var("PIE_XLA_DEPLOYMENT"),
     ) {
         (Ok(artifact), snapshot, _) => {
             let artifact = PathBuf::from(artifact);
             let stamp = checkpoint::file::serve::stamp_of(&artifact)
                 .expect("the artifact reads")
                 .expect("the artifact carries a serving stamp");
-            let sku = models::sku(&stamp.sku).unwrap_or_else(|| panic!("no SKU {}", stamp.sku));
-            let trace = (sku.trace)(Platform::Xla);
+            let deployment = models::deployment(&stamp.deployment)
+                .unwrap_or_else(|| panic!("no deployment {}", stamp.deployment));
+            let trace = deployment.trace(Platform::Xla);
             let source = ztensor_compat::index(&artifact).expect("the artifact opens");
-            let contract =
-                checkpoint_dsl::own_contract(&source, &trace.params, sku.recipe.tp, Platform::Xla)
-                    .unwrap_or_else(|why| panic!("the artifact holds every plane: {why}"));
+            let contract = poem::import::own_contract(
+                &source,
+                &trace.params,
+                deployment.deploy.tp,
+                Platform::Xla,
+            )
+            .unwrap_or_else(|why| panic!("the artifact holds every plane: {why}"));
             Some(Model {
                 checkpoint: artifact,
-                sku,
+                deployment,
                 contract,
                 tokenizer: snapshot
                     .ok()
@@ -43,7 +48,8 @@ pub fn model() -> Option<Model> {
         }
         (_, Ok(snapshot), Ok(name)) => {
             let snapshot = PathBuf::from(snapshot);
-            let sku = models::sku(&name).unwrap_or_else(|| panic!("no SKU {name}"));
+            let deployment =
+                models::deployment(&name).unwrap_or_else(|| panic!("no deployment {name}"));
             let mut shards: Vec<PathBuf> = std::fs::read_dir(&snapshot)
                 .expect("the snapshot lists")
                 .filter_map(|e| {
@@ -53,13 +59,13 @@ pub fn model() -> Option<Model> {
                 .collect();
             shards.sort();
             let source = ztensor_compat::index_all(&shards).expect("the snapshot opens");
-            let contract = sku
+            let contract = deployment
                 .contract(&source, Platform::Xla)
                 .unwrap_or_else(|why| panic!("{name}'s import reads the snapshot: {why}"));
             Some(Model {
                 tokenizer: Some(snapshot.join("tokenizer.json")),
                 checkpoint: snapshot,
-                sku,
+                deployment,
                 contract,
             })
         }

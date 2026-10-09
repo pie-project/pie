@@ -1,21 +1,20 @@
 use std::collections::HashMap;
 
+use poem::Platform;
 use poem_compiler::{Budget, CompiledModel, DeviceProfile, Lowering, Region, compile};
-use poem_dsl::Platform;
 use poem_exec::KernelError;
 use poem_exec::dispatch::{
-    DispatchAttention, DispatchCollective, DispatchCustomCuda, DispatchElementwise, DispatchLayout,
+    DispatchAttention, DispatchCollective, DispatchElementwise, DispatchFused, DispatchLayout,
     DispatchLinear, DispatchSpatial,
 };
 use poem_exec::fire::{
     EventId, Filter, FireDescriptor, Lane, Serve, Sink, compose, fallback, walk,
 };
 use poem_ir::{
-    Attention, Collective, CustomCuda, Elementwise, Layout, Linear, Operands, Operation, Spatial,
-    Trace,
+    Attention, Collective, Elementwise, Fused, Layout, Linear, Operands, Operation, Spatial, Trace,
 };
 
-const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
+const DEPLOYMENT: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
 fn budget() -> Budget {
     Budget {
@@ -79,7 +78,7 @@ fn payload(op: &Operation) -> usize {
         Operation::Elementwise(op) => address(op),
         Operation::Layout(op) => address(op),
         Operation::Collective(op) => address(op),
-        Operation::CustomCuda(op) => address(op),
+        Operation::Fused(op) => address(op),
         Operation::Spatial(op) => address(op),
     }
 }
@@ -109,8 +108,8 @@ impl DispatchCollective for MockDispatch {
         self.note(op)
     }
 }
-impl DispatchCustomCuda for MockDispatch {
-    fn dispatch(&mut self, op: &CustomCuda) -> Result<(), KernelError> {
+impl DispatchFused for MockDispatch {
+    fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         self.note(op)
     }
 }
@@ -163,21 +162,64 @@ impl Sink for Runs {
     fn join(&mut self, _event: EventId) {}
 }
 
-fn sku() -> (Trace, CompiledModel) {
-    let trace = models::sku(SKU)
-        .map(|row| row.trace)
-        .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"));
-    let trace = trace(Platform::Cuda);
+fn deployment() -> (Trace, CompiledModel) {
+    let trace = models::deployment(DEPLOYMENT)
+        .unwrap_or_else(|| panic!("`{DEPLOYMENT}` is in the catalog"))
+        .trace(Platform::Cuda);
     let compiled = compile(&trace, &budget(), &DeviceProfile::default())
-        .unwrap_or_else(|refusal| panic!("`{SKU}` bakes: {refusal:?}"));
+        .unwrap_or_else(|refusal| panic!("`{DEPLOYMENT}` bakes: {refusal:?}"));
     (trace, compiled)
 }
 
+/// Three one-row lanes of three classes whose composition leaves some window
+/// in pieces, each piece one the table copies at the fire's bucket.
 fn fragmenting(compiled: &CompiledModel) -> Vec<Lane> {
-    [0usize, 4, 5]
-        .iter()
-        .map(|&class| Lane::new(compiled.classes.classes[class].word(), 1))
-        .collect()
+    let n = compiled.classes.classes.len();
+    let lanes = |picked: [usize; 3]| -> Vec<Lane> {
+        picked
+            .iter()
+            .map(|&class| Lane::new(compiled.classes.classes[class].word(), 1))
+            .collect()
+    };
+    for a in 0..n {
+        for b in 0..n {
+            for c in 0..n {
+                if a == b || b == c || a == c {
+                    continue;
+                }
+                let picked = lanes([a, b, c]);
+                let Ok(composition) = compose(compiled, &budget(), &picked) else {
+                    continue;
+                };
+                let Some(bucket) = budget()
+                    .buckets
+                    .iter()
+                    .position(|&rows| rows == composition.bucket())
+                else {
+                    continue;
+                };
+                let descriptor = FireDescriptor::of(&composition);
+                let fragmented: Vec<&Region> = compiled
+                    .template()
+                    .iter()
+                    .filter(|region| descriptor.spans(&region.mask).len() > 1)
+                    .collect();
+                if !fragmented.is_empty()
+                    && fragmented.iter().all(|region| {
+                        fallback::copies(
+                            compiled,
+                            poem_ir::RowAxis::Tokens,
+                            &region.mask,
+                            bucket as u32,
+                        )
+                    })
+                {
+                    return picked;
+                }
+            }
+        }
+    }
+    panic!("no three classes of `{DEPLOYMENT}` leave a window in pieces")
 }
 
 fn fire(
@@ -209,14 +251,14 @@ fn a_copied_window_is_one_launch_over_the_same_rows_every_case() {
 }
 
 fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
-    let (trace, compiled) = sku();
+    let (trace, compiled) = deployment();
     let lanes = fragmenting(&compiled);
 
     let composition = compose(&compiled, &budget(), &lanes).expect("three lanes compose");
     assert_eq!(
-        composition.present(),
-        [4, 0, 5],
-        "class 0 stands between 4 and 5"
+        composition.present().len(),
+        3,
+        "three classes stand in the fire"
     );
     let bucket = budget()
         .buckets
@@ -318,7 +360,7 @@ fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
 }
 
 fn the_schedule_builder_takes_the_same_answer_as_the_consumers_that_read_it() {
-    let (_, compiled) = sku();
+    let (_, compiled) = deployment();
     let lanes = fragmenting(&compiled);
     let composition = compose(&compiled, &budget(), &lanes).expect("three lanes compose");
     let bucket = budget()

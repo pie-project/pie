@@ -13,7 +13,7 @@ use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, Pro
 use engine::transfer::{KvCopy, KvHandle, StateCopy};
 use eta_ir::container::HostRole;
 
-use crate::api::{ClassifyFor, ContractFor, Cuda, DeviceBoot, World};
+use crate::api::{ContractFor, Cuda, DeviceBoot, World};
 use crate::comm::{Comm, Id};
 
 const INIT_WAIT: Duration = Duration::from_secs(120);
@@ -78,11 +78,7 @@ impl Poison {
     }
 }
 
-pub fn open_group(
-    boots: Vec<DeviceBoot>,
-    contract_for: ContractFor,
-    classify_for: ClassifyFor,
-) -> Result<Group, String> {
+pub fn open_group(boots: Vec<DeviceBoot>, contract_for: ContractFor) -> Result<Group, String> {
     let size = boots.len();
     if size < 2 {
         return Err(format!(
@@ -162,11 +158,7 @@ pub fn open_group(
         boot.comm = Some(Arc::clone(&comm));
         ordinals.push(boot.ordinal);
         held.push(comm);
-        ranks.push(Arc::new(Mutex::new(crate::boot::open(
-            boot,
-            contract_for,
-            classify_for,
-        )?)));
+        ranks.push(Arc::new(Mutex::new(crate::boot::open(boot, contract_for)?)));
     }
     let facts = ranks[0]
         .lock()

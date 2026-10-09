@@ -4,8 +4,10 @@ use checkpoint::executor::Execution;
 use checkpoint::executor::sink::MemorySink;
 use checkpoint::file::read::parse_metadata;
 use checkpoint::plan::{StorageTarget, compile_streaming};
-use models::z_image::model::Dims;
-use poem_dsl::Platform;
+pub mod z_image_dims;
+
+use poem::Platform;
+use z_image_dims::Dims;
 
 const MINI: &str = "z-image-mini-bf16-kv-bf16";
 
@@ -60,7 +62,7 @@ fn the_miniature_lands_its_derived_planes() {
     let dir = stage(&fixture);
     let src = ztensor_compat::open(dir.join("model.safetensors")).unwrap();
     let metadata = parse_metadata(&dir).unwrap();
-    let row = models::sku(MINI).expect("the catalog ships the miniature");
+    let row = models::deployment(MINI).expect("the catalog ships the miniature");
     let contract = row
         .contract(&src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the miniature does not read its fixture: {why}"));

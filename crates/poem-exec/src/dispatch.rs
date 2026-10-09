@@ -1,5 +1,5 @@
 use poem_ir::{
-    Attention, Collective, CustomCuda, Elementwise, Layout, Linear, Node, Operation, Spatial,
+    Attention, Collective, Elementwise, Fused, Layout, Linear, Node, Operation, Spatial,
 };
 
 use crate::error::KernelError;
@@ -24,8 +24,8 @@ pub trait DispatchCollective {
     fn dispatch(&mut self, op: &Collective) -> Result<(), KernelError>;
 }
 
-pub trait DispatchCustomCuda {
-    fn dispatch(&mut self, op: &CustomCuda) -> Result<(), KernelError>;
+pub trait DispatchFused {
+    fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError>;
 }
 
 pub trait DispatchSpatial {
@@ -42,7 +42,7 @@ pub trait Dispatch:
     + DispatchElementwise
     + DispatchLayout
     + DispatchCollective
-    + DispatchCustomCuda
+    + DispatchFused
     + DispatchSpatial
     + DispatchProbe
 {
@@ -53,7 +53,7 @@ pub trait Dispatch:
             Operation::Elementwise(op) => DispatchElementwise::dispatch(self, op),
             Operation::Layout(op) => DispatchLayout::dispatch(self, op),
             Operation::Collective(op) => DispatchCollective::dispatch(self, op),
-            Operation::CustomCuda(op) => DispatchCustomCuda::dispatch(self, op),
+            Operation::Fused(op) => DispatchFused::dispatch(self, op),
             Operation::Spatial(op) => DispatchSpatial::dispatch(self, op),
         };
         if outcome.is_ok() {
@@ -69,7 +69,7 @@ impl<T> Dispatch for T where
         + DispatchElementwise
         + DispatchLayout
         + DispatchCollective
-        + DispatchCustomCuda
+        + DispatchFused
         + DispatchSpatial
         + DispatchProbe
 {

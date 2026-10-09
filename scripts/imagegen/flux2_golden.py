@@ -20,7 +20,7 @@ Outputs -> $PIE_IMAGEGEN_GOLDEN/flux2/
                        row-per-voxel `[h*w, C]` layout pie's voxel axis reads,
                        plus shapes.json -- what the Rust parity gate loads
 
-klein-4B is the distilled SKU: 4 steps, `guidance_embeds: false` in its transformer
+klein-4B is the distilled deployment: 4 steps, `guidance_embeds: false` in its transformer
 config, so no guidance embedding is fed.  Text encoder is Qwen3 (not Mistral) and
 `text_encoder_out_layers = (9, 18, 27)` -> joint_attention_dim 7680 = 3 x 2560.
 """

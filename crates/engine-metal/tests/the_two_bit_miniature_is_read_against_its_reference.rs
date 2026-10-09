@@ -5,15 +5,23 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use engine_metal::{Boot, Lane, Shell};
+use poem::{Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Classify, Platform, Request};
 
-const SKU: &str = "dsv4-flash-u4g64-u2g64-kv-bf16";
+const DEPLOYMENT: &str = "dsv4-flash-mini-u4g64-u2g64-kv-bf16";
 const REPO: &str = "models--mlx-community--DeepSeek-V4-Flash-2bit-DQ";
 
 const REFERENCE: &str = "tests/dsv4-parity/reference.json";
 
 const NEAR_TIE: f32 = 0.5;
+
+/// The facts the deployment `deployment` classifies its lanes by.
+fn facts_of(deployment: &str) -> poem_ir::Facts {
+    models::deployment(deployment)
+        .expect("the catalog ships the row")
+        .trace(Platform::Metal)
+        .facts
+}
 
 fn snapshot() -> Option<PathBuf> {
     if let Ok(stated) = std::env::var("PIE_U2_SNAPSHOT") {
@@ -51,7 +59,7 @@ fn container(snapshot: &Path) -> Option<PathBuf> {
 }
 
 fn word(query_len: u32) -> u64 {
-    models::deepseek_v4::forward::Facts::of(&Request::new(query_len, false)).word()
+    facts_of(DEPLOYMENT).word(&Request::new(query_len, false))
 }
 
 fn argmax(logits: &[f32]) -> u32 {
@@ -65,15 +73,15 @@ fn argmax(logits: &[f32]) -> u32 {
 }
 
 fn load(checkpoint: &Path, context: u32) -> Shell {
-    let trace = (models::sku(SKU)
-        .expect("the catalog ships the 2-bit SKU")
-        .trace)(Platform::Metal);
+    let trace = models::deployment(DEPLOYMENT)
+        .expect("the catalog ships the 2-bit deployment")
+        .trace(Platform::Metal);
     let container = container(checkpoint).expect("the snapshot holds a tensor container");
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-    let contract = models::sku(SKU)
-        .expect("the catalog ships an import for the SKU")
+    let contract = models::deployment(DEPLOYMENT)
+        .expect("the catalog ships an import for the deployment")
         .contract(&source, Platform::Metal)
-        .expect("the 2-bit SKU's import contract fits the real DQ checkpoint");
+        .expect("the 2-bit deployment's import contract fits the real DQ checkpoint");
     drop(source);
     let booted = Instant::now();
     let shell = Shell::load(Boot {
@@ -94,7 +102,7 @@ fn load(checkpoint: &Path, context: u32) -> Shell {
     })
     .expect("the 2-bit shell loads");
     eprintln!(
-        "loaded {SKU} on {} in {:.1}s",
+        "loaded {DEPLOYMENT} on {} in {:.1}s",
         shell.device_name(),
         booted.elapsed().as_secs_f64()
     );

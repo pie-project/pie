@@ -24,8 +24,8 @@ mod common;
 
 use engine_xla::{Boot, DeviceBoot, Lane, Seated, Shell};
 use models::media::{Rgb8, VisionFrontEnd};
+use poem::{Operands, Platform, Request};
 use poem_compiler::{Budget, PatchLadder};
-use poem_dsl::{Operands, Platform, Request};
 
 /// `<|im_start|>system\nYou are a helpful assistant that describes images.<|im_end|>\n`
 const BEFORE: [u32; 14] = [
@@ -224,13 +224,13 @@ fn a_solid_square_is_named_by_its_colour() {
         eprintln!("not asked: set PIE_XLA_ARTIFACT to a Qwen3.5 vision artifact");
         return;
     };
-    if !m.sku.name.contains("vision") {
-        eprintln!("not asked: {} carries no image tower", m.sku.name);
+    if !m.deployment.name.contains("vision") {
+        eprintln!("not asked: {} carries no image tower", m.deployment.name);
         return;
     }
-    let trace = (m.sku.trace)(Platform::Xla);
-    let classify = m.sku.classify;
-    let word = |len: u32, media: bool| classify(&Request::new(len, false).with_media(media));
+    let trace = m.deployment.trace(Platform::Xla);
+    let facts = m.deployment.trace(models::Platform::Xla).facts;
+    let word = |len: u32, media: bool| facts.word(&Request::new(len, false).with_media(media));
 
     // The first patch rows (embedding plus position table) and the tower's
     // output, which the trunk's scatter lands onto the pad rows.

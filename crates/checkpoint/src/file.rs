@@ -3,6 +3,7 @@ pub mod emit;
 pub mod meta;
 pub mod read;
 pub mod serve;
+pub mod snapshot;
 pub mod write;
 pub mod zt;
 

@@ -6,20 +6,19 @@ use std::path::Path;
 
 use common_encoder::{Weights, contract_for};
 use engine_cuda::{Boot, Lane, Shell};
+use poem::{Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Platform, Request};
 use poem_ir::{CacheRow, Trace};
 
-const SKU: &str = "gemma4-e4b-mini-l6-bf16-kv-bf16";
+const DEPLOYMENT: &str = "gemma4-e4b-mini-l6-bf16-kv-bf16";
 const CHUNK: u32 = 256;
 
 fn logits(trace: Trace, path: &Path, prompt: &[u32], decodes: u32) -> Vec<Vec<f32>> {
-    let sku = models::sku(SKU).expect("the catalog ships the mini gemma");
+    let deployment = models::deployment(DEPLOYMENT).expect("the catalog ships the mini gemma");
     let contract = contract_for(&trace, path).expect("the random planes fit the trace");
     let mut shell = Shell::load(Boot {
         voxels: None,
         deferred_tier: false,
-        classify: sku.classify,
         residency: engine_cuda::experts::Plan::default(),
         trace,
         contract: &contract,
@@ -42,7 +41,8 @@ fn logits(trace: Trace, path: &Path, prompt: &[u32], decodes: u32) -> Vec<Vec<f3
     .expect("the shell loads");
     shell.open(0).expect("the slot opens");
     let mut fire = |tokens: &[u32]| {
-        let word = (sku.classify)(&Request::new(tokens.len() as u32, false));
+        let facts = deployment.trace(models::Platform::Cuda).facts;
+        let word = facts.word(&Request::new(tokens.len() as u32, false));
         let rows = shell
             .fire(&[Lane {
                 slot: 0,
@@ -69,7 +69,9 @@ fn a_windowed_row_reads_what_the_full_row_reads() {
         eprintln!("no CUDA device: skipping");
         return;
     }
-    let windowed = (models::sku(SKU).expect("the mini gemma").trace)(Platform::Cuda);
+    let windowed = models::deployment(DEPLOYMENT)
+        .expect("the mini gemma")
+        .trace(Platform::Cuda);
     assert!(
         windowed.caches.iter().any(|row| matches!(
             row,

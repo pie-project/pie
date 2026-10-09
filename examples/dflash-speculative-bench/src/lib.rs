@@ -153,17 +153,17 @@
 //!
 //! # AT EIGHT CONCURRENT THE LOOP LOSES, AND IT IS NOT THE DRAFTER
 //!
-//! `tput --num-requests 32 --concurrency 8 --max-tokens 64`, dflash SKU:
+//! `tput --num-requests 32 --concurrency 8 --max-tokens 64`, dflash deployment:
 //!
 //! ```text
-//! text-completion-bench, mtp SKU      47.67 tok/s
-//! text-completion-bench, dflash SKU   46.27          the ctx arm costs 3%
+//! text-completion-bench, mtp deployment      47.67 tok/s
+//! text-completion-bench, dflash deployment   46.27          the ctx arm costs 3%
 //! this loop, --baseline               23.52          the STRUCTURE costs 49%
 //! this loop, auto width               18.32   0.78x
 //! ```
 //!
 //! **The drafter's context arm is nearly free even at concurrency** — three
-//! percent against the plain SKU through the same plain inferlet — so the
+//! percent against the plain deployment through the same plain inferlet — so the
 //! half that is missing is this loop's own shape: it awaits a host readback
 //! every round, and a wave waits on its straggler lane, so eight
 //! host-in-the-loop guests each put a turnaround on the critical path.
@@ -406,7 +406,7 @@
 //!
 //! # The recurrence is a fold, not a cell
 //!
-//! This SKU is hybrid, so a verify fire that folded its rows would fold the
+//! This deployment is hybrid, so a verify fire that folded its rows would fold the
 //! REJECTED ones too and no `kv_len` could take them back —
 //! `rs-speculative-decoding`'s header is the argument in full. So the verify
 //! window is BUFFERED (`fold-len` leaves it unfolded), the rejected tail is
@@ -861,7 +861,7 @@ impl Gate {
     ///
     /// **DROPPING THE SIXTEEN RUNG IS A WASH, AND IT STAYS FOR A HEAD THAT
     /// CAN REACH IT.** `heads.py` prices sixteen below eight on every prompt
-    /// for the head this SKU carries, which suggested cutting the top rung.
+    /// for the head this deployment carries, which suggested cutting the top rung.
     /// Measured end to end with rungs `[4, 8]`: counting 1.87x against 1.88x,
     /// prose 1.42x against 1.38x, code 1.78x against 1.82x, capitals 1.33x
     /// against 1.32x — the same mean to two places, because the ladder
@@ -1179,7 +1179,7 @@ const MASK_TOKEN: i32 = 248_070;
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
     if model::mtp_depth() == 0 && input.drafter != "ngram" {
-        return Err("this SKU ships no draft head".into());
+        return Err("this deployment ships no draft head".into());
     }
     // **THE HEAD'S FACTS COME OFF THE LOAD.** The block the head was trained
     // at, its mask token and whether its block sees itself are advertised by

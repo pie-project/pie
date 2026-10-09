@@ -4,7 +4,7 @@
 //! A recurrence is a FOLD, not an addressed cell: once a token's activations
 //! are folded into the state there is no cell to overwrite when a verifier
 //! rejects the token. `mtp-speculative-decoding`'s header says why that
-//! makes it RED on a hybrid SKU. This program is the shape that is not: the
+//! makes it RED on a hybrid deployment. This program is the shape that is not: the
 //! verify window is BUFFERED (`rs-geometry.fold-len` leaves it unfolded), the
 //! rejected tail is forgotten on the host (`rs-working-set.discard-buffered`),
 //! and the NEXT window's fire folds the accepted prefix while buffering its
@@ -35,7 +35,7 @@
 //! `draft = "ngram"` (default) is prompt-lookup: the longest suffix of the
 //! committed text that recurs earlier in it proposes what followed it
 //! (`cacheback-speculative-decoding`'s drafter). It needs nothing of the model
-//! and is what makes this program runnable on a SKU that ships no draft head.
+//! and is what makes this program runnable on a deployment that ships no draft head.
 //! `draft = "mtp"` reads the model's own draft chains (`mtp_drafts`: one
 //! `[depth]` argmax chain per verify row) in the verify fire's epilogue, as
 //! `mtp-speculative-decoding` does, and continues with the chain at the row
@@ -288,7 +288,7 @@ async fn main(input: Input) -> Result<Output> {
     }
     let mtp = input.draft == "mtp";
     if mtp && model::mtp_depth() == 0 {
-        return Err("this SKU ships no draft head (mtp_depth = 0); use --draft ngram".into());
+        return Err("this deployment ships no draft head (mtp_depth = 0); use --draft ngram".into());
     }
     // The head drafts `depth` tokens past a row and no more.
     let k = if mtp { k.min(model::mtp_depth()) } else { k };

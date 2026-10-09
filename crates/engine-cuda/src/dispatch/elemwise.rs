@@ -1,6 +1,6 @@
 use kernels_cuda::{Tensor, elemwise};
 use poem_exec::{DispatchElementwise, KernelError};
-use poem_ir::{Elementwise, ModulateForm, MropeForm, NormKind, Operands, RopeForm};
+use poem_ir::{Elementwise, Fused, ModulateForm, MropeForm, NormKind, Operands, RopeForm};
 
 use crate::run::Run;
 
@@ -63,6 +63,229 @@ impl Run<'_> {
             ModulateForm::TanhGate => {
                 elemwise::modulate::tanh_gate(self.ctx(), x, m, lane_of_row, y)
             }
+        }
+    }
+
+    pub(super) fn fused_elementwise(&self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        match op {
+            Fused::ResidualAddRmsnorm {
+                x,
+                y,
+                y_out: _,
+                weight,
+                plus_one,
+                eps,
+                out,
+            } => elemwise::norm::residual_add_rmsnorm(
+                self.ctx(),
+                self.tensor(*x),
+                &mut self.tensor(*y),
+                self.tensor(*weight),
+                *plus_one,
+                *eps,
+                &mut self.tensor(*out),
+            ),
+            Fused::RmsnormResidualAdd {
+                x,
+                weight,
+                eps,
+                t,
+                y,
+                y_out: _,
+                scale,
+                post,
+            } => {
+                let mut scaled = scale.map(|(_, scaled)| self.tensor(scaled));
+                let mut out = post.as_ref().map(|post| self.tensor(post.out));
+                elemwise::norm::rmsnorm_residual_add(
+                    self.ctx(),
+                    self.tensor(*x),
+                    self.tensor(*weight),
+                    *eps,
+                    &mut self.tensor(*t),
+                    &mut self.tensor(*y),
+                    match (scale, scaled.as_mut()) {
+                        (Some((s, _)), Some(scaled)) => Some((self.tensor(*s), scaled)),
+                        _ => None,
+                    },
+                    match (post, out.as_mut()) {
+                        (Some(post), Some(out)) => Some(elemwise::norm::PostNorm {
+                            weight: self.tensor(post.weight),
+                            plus_one: post.plus_one,
+                            eps: post.eps,
+                            out,
+                        }),
+                        _ => None,
+                    },
+                )
+            }
+            Fused::EmbedScaleAdd {
+                ids,
+                table,
+                vocab,
+                e,
+                embed_scale,
+                e_scaled,
+                y,
+                y_out: _,
+                out_scale,
+                y_scaled,
+            } => kernels_cuda::layout::embed_scale_add(
+                self.ctx(),
+                self.tensor(*ids),
+                self.tensor(*table),
+                *vocab,
+                &mut self.tensor(*e),
+                *embed_scale,
+                &mut self.tensor(*e_scaled),
+                &mut self.tensor(*y),
+                *out_scale,
+                &mut self.tensor(*y_scaled),
+            ),
+            Fused::EmbedScaleAddSelect {
+                ids,
+                table,
+                vocab,
+                e,
+                embed_scale,
+                e_scaled,
+                stacked,
+                layer,
+                width,
+                y_out,
+                out_scale,
+                y_scaled,
+            } => kernels_cuda::layout::embed_scale_add_select(
+                self.ctx(),
+                self.tensor(*ids),
+                self.tensor(*table),
+                *vocab,
+                &mut self.tensor(*e),
+                *embed_scale,
+                &mut self.tensor(*e_scaled),
+                self.tensor(*stacked),
+                *layer,
+                *width,
+                &mut self.tensor(*y_out),
+                *out_scale,
+                &mut self.tensor(*y_scaled),
+            ),
+            Fused::RmsnormRopePartialQ {
+                x,
+                weight,
+                head_dim,
+                eps,
+                positions,
+                rotary_dim,
+                theta,
+                y,
+                q_out: _,
+            } => elemwise::rope::rmsnorm_rope_partial_q(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*weight),
+                *head_dim,
+                *eps,
+                self.tensor(*positions),
+                *rotary_dim,
+                *theta,
+                &mut self.tensor(*y),
+            ),
+            Fused::NormModulate {
+                x,
+                norm,
+                normed,
+                m,
+                lane_of_row,
+                form,
+                y,
+            } => {
+                let x_t = self.tensor(*x);
+                let lanes = lane_of_row.map(|lanes| self.tensor(lanes));
+                match (fused_norm(*norm, x_t.width), form) {
+                    (Some(kernel_norm), ModulateForm::ScaleShift) => {
+                        elemwise::modulate::norm_modulate(
+                            self.ctx(),
+                            x_t,
+                            self.tensor(*m),
+                            lanes,
+                            kernel_norm,
+                            &mut self.tensor(*y),
+                        )?;
+                        if self.read_elsewhere(*normed) {
+                            self.scale_free_norm(*norm, x_t, &mut self.tensor(*normed))?;
+                        }
+                        Ok(())
+                    }
+                    _ => {
+                        self.scale_free_norm(*norm, x_t, &mut self.tensor(*normed))?;
+                        self.modulate(
+                            *form,
+                            self.tensor(*normed),
+                            self.tensor(*m),
+                            lanes,
+                            &mut self.tensor(*y),
+                        )
+                    }
+                }
+            }
+            Fused::GatedResidualNormModulate {
+                r,
+                g,
+                y,
+                lane_of_row,
+                r_out: _,
+                norm,
+                normed,
+                m,
+                form,
+                out,
+            } => {
+                let r_t = self.tensor(*r);
+                let lanes = lane_of_row.map(|lanes| self.tensor(lanes));
+                match (fused_norm(*norm, r_t.width), form) {
+                    (Some(kernel_norm), ModulateForm::ScaleShift) => {
+                        elemwise::modulate::gated_residual_norm_modulate(
+                            self.ctx(),
+                            r_t,
+                            self.tensor(*g),
+                            self.tensor(*y),
+                            self.tensor(*m),
+                            lanes,
+                            kernel_norm,
+                            &mut self.tensor(*r),
+                            &mut self.tensor(*out),
+                        )?;
+                        if self.read_elsewhere(*normed) {
+                            self.scale_free_norm(
+                                *norm,
+                                self.tensor(*r),
+                                &mut self.tensor(*normed),
+                            )?;
+                        }
+                        Ok(())
+                    }
+                    _ => {
+                        elemwise::modulate::gated_residual_add(
+                            self.ctx(),
+                            r_t,
+                            self.tensor(*g),
+                            self.tensor(*y),
+                            lanes,
+                            &mut self.tensor(*r),
+                        )?;
+                        self.scale_free_norm(*norm, self.tensor(*r), &mut self.tensor(*normed))?;
+                        self.modulate(
+                            *form,
+                            self.tensor(*normed),
+                            self.tensor(*m),
+                            lanes,
+                            &mut self.tensor(*out),
+                        )
+                    }
+                }
+            }
+            _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
         }
     }
 
@@ -196,23 +419,6 @@ impl Run<'_> {
             Elementwise::ResidualAdd { x, y, y_out: _ } => {
                 elemwise::norm::residual_add(self.ctx(), self.tensor(*x), &mut self.tensor(*y))
             }
-            Elementwise::ResidualAddRmsnorm {
-                x,
-                y,
-                y_out: _,
-                weight,
-                plus_one,
-                eps,
-                out,
-            } => elemwise::norm::residual_add_rmsnorm(
-                self.ctx(),
-                self.tensor(*x),
-                &mut self.tensor(*y),
-                self.tensor(*weight),
-                *plus_one,
-                *eps,
-                &mut self.tensor(*out),
-            ),
             Elementwise::AddBias {
                 bias,
                 out,
@@ -228,91 +434,6 @@ impl Run<'_> {
                 self.tensor(*bias),
                 self.tensor(*scale),
                 &mut self.tensor(*x),
-            ),
-            Elementwise::RmsnormResidualAdd {
-                x,
-                weight,
-                eps,
-                t,
-                y,
-                y_out: _,
-                scale,
-                post,
-            } => {
-                let mut scaled = scale.map(|(_, scaled)| self.tensor(scaled));
-                let mut out = post.as_ref().map(|post| self.tensor(post.out));
-                elemwise::norm::rmsnorm_residual_add(
-                    self.ctx(),
-                    self.tensor(*x),
-                    self.tensor(*weight),
-                    *eps,
-                    &mut self.tensor(*t),
-                    &mut self.tensor(*y),
-                    match (scale, scaled.as_mut()) {
-                        (Some((s, _)), Some(scaled)) => Some((self.tensor(*s), scaled)),
-                        _ => None,
-                    },
-                    match (post, out.as_mut()) {
-                        (Some(post), Some(out)) => Some(elemwise::norm::PostNorm {
-                            weight: self.tensor(post.weight),
-                            plus_one: post.plus_one,
-                            eps: post.eps,
-                            out,
-                        }),
-                        _ => None,
-                    },
-                )
-            }
-            Elementwise::EmbedScaleAdd {
-                ids,
-                table,
-                vocab,
-                e,
-                embed_scale,
-                e_scaled,
-                y,
-                y_out: _,
-                out_scale,
-                y_scaled,
-            } => kernels_cuda::layout::embed_scale_add(
-                self.ctx(),
-                self.tensor(*ids),
-                self.tensor(*table),
-                *vocab,
-                &mut self.tensor(*e),
-                *embed_scale,
-                &mut self.tensor(*e_scaled),
-                &mut self.tensor(*y),
-                *out_scale,
-                &mut self.tensor(*y_scaled),
-            ),
-            Elementwise::EmbedScaleAddSelect {
-                ids,
-                table,
-                vocab,
-                e,
-                embed_scale,
-                e_scaled,
-                stacked,
-                layer,
-                width,
-                y_out,
-                out_scale,
-                y_scaled,
-            } => kernels_cuda::layout::embed_scale_add_select(
-                self.ctx(),
-                self.tensor(*ids),
-                self.tensor(*table),
-                *vocab,
-                &mut self.tensor(*e),
-                *embed_scale,
-                &mut self.tensor(*e_scaled),
-                self.tensor(*stacked),
-                *layer,
-                *width,
-                &mut self.tensor(*y_out),
-                *out_scale,
-                &mut self.tensor(*y_scaled),
             ),
             Elementwise::MulScalar { s, x, x_out: _ } => {
                 elemwise::norm::mul_scalar(self.ctx(), *s, &mut self.tensor(*x))
@@ -418,27 +539,6 @@ impl Run<'_> {
                 *rotary_dim,
                 *head_dim,
                 *theta,
-            ),
-            Elementwise::RmsnormRopePartialQ {
-                x,
-                weight,
-                head_dim,
-                eps,
-                positions,
-                rotary_dim,
-                theta,
-                y,
-                q_out: _,
-            } => elemwise::rope::rmsnorm_rope_partial_q(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                *head_dim,
-                *eps,
-                self.tensor(*positions),
-                *rotary_dim,
-                *theta,
-                &mut self.tensor(*y),
             ),
             Elementwise::RopePartialLast {
                 q,
@@ -585,100 +685,6 @@ impl Run<'_> {
                 lane_of_row.map(|lanes| self.tensor(lanes)),
                 &mut self.tensor(*r),
             ),
-            Elementwise::NormModulate {
-                x,
-                norm,
-                normed,
-                m,
-                lane_of_row,
-                form,
-                y,
-            } => {
-                let x_t = self.tensor(*x);
-                let lanes = lane_of_row.map(|lanes| self.tensor(lanes));
-                match (fused_norm(*norm, x_t.width), form) {
-                    (Some(kernel_norm), ModulateForm::ScaleShift) => {
-                        elemwise::modulate::norm_modulate(
-                            self.ctx(),
-                            x_t,
-                            self.tensor(*m),
-                            lanes,
-                            kernel_norm,
-                            &mut self.tensor(*y),
-                        )?;
-                        if self.read_elsewhere(*normed) {
-                            self.scale_free_norm(*norm, x_t, &mut self.tensor(*normed))?;
-                        }
-                        Ok(())
-                    }
-                    _ => {
-                        self.scale_free_norm(*norm, x_t, &mut self.tensor(*normed))?;
-                        self.modulate(
-                            *form,
-                            self.tensor(*normed),
-                            self.tensor(*m),
-                            lanes,
-                            &mut self.tensor(*y),
-                        )
-                    }
-                }
-            }
-            Elementwise::GatedResidualNormModulate {
-                r,
-                g,
-                y,
-                lane_of_row,
-                r_out: _,
-                norm,
-                normed,
-                m,
-                form,
-                out,
-            } => {
-                let r_t = self.tensor(*r);
-                let lanes = lane_of_row.map(|lanes| self.tensor(lanes));
-                match (fused_norm(*norm, r_t.width), form) {
-                    (Some(kernel_norm), ModulateForm::ScaleShift) => {
-                        elemwise::modulate::gated_residual_norm_modulate(
-                            self.ctx(),
-                            r_t,
-                            self.tensor(*g),
-                            self.tensor(*y),
-                            self.tensor(*m),
-                            lanes,
-                            kernel_norm,
-                            &mut self.tensor(*r),
-                            &mut self.tensor(*out),
-                        )?;
-                        if self.read_elsewhere(*normed) {
-                            self.scale_free_norm(
-                                *norm,
-                                self.tensor(*r),
-                                &mut self.tensor(*normed),
-                            )?;
-                        }
-                        Ok(())
-                    }
-                    _ => {
-                        elemwise::modulate::gated_residual_add(
-                            self.ctx(),
-                            r_t,
-                            self.tensor(*g),
-                            self.tensor(*y),
-                            lanes,
-                            &mut self.tensor(*r),
-                        )?;
-                        self.scale_free_norm(*norm, self.tensor(*r), &mut self.tensor(*normed))?;
-                        self.modulate(
-                            *form,
-                            self.tensor(*normed),
-                            self.tensor(*m),
-                            lanes,
-                            &mut self.tensor(*out),
-                        )
-                    }
-                }
-            }
             Elementwise::Sinusoid {
                 t,
                 dim,

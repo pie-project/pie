@@ -21,9 +21,9 @@ use eta_ir::op::Op;
 use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use eta_ir::validate::bind;
-use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Trace, Value, Weight,
-    ops, seam, trace_hybrid,
+use poem::{
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Trace, Value, Weight, ops, seam,
+    trace_hybrid,
 };
 
 pub const WIDTH: u32 = 32;
@@ -35,33 +35,13 @@ pub const MAX_DISTANCE: f32 = 128.0;
 pub const SM_SCALE: f32 = 0.125;
 pub const NAME: &str = "encoder-mini";
 
-pub struct NoFacts;
-
-impl Classify for NoFacts {
-    fn of(_: &Request) -> NoFacts {
-        NoFacts
-    }
-    fn word(&self) -> u64 {
-        0
-    }
-}
-
-pub fn classify(request: &Request) -> u64 {
-    NoFacts::of(request).word()
-}
-
-pub fn classify_for(_: &str) -> Option<poem_ir::ClassifyFn> {
-    Some(classify)
-}
-
 pub struct EncoderLayer;
 
 impl ForwardHybrid for EncoderLayer {
-    type Facts = NoFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
@@ -198,7 +178,7 @@ impl Weights {
 
 pub fn contract_for(trace: &Trace, path: &Path) -> Result<ModelContract, String> {
     let source = ztensor_compat::index(path).map_err(|why| why.to_string())?;
-    checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Cuda)
+    poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
         .map_err(|why| why.to_string())
 }
 
@@ -313,6 +293,7 @@ pub struct LaneHandles {
 pub struct Rig {
     pub engine: engine_cuda::Cuda,
     pub loaded: Loaded,
+    pub facts: poem_ir::Facts,
     pub programs: BTreeMap<u32, u64>,
     next_channel: u64,
     _dir: tempfile::TempDir,
@@ -326,11 +307,12 @@ impl Rig {
             graphs,
             ..engine_cuda::DeviceBoot::default()
         };
-        let mut engine =
-            engine_cuda::open(boot, contract_for, classify_for).expect("the engine opens");
+        let mut engine = engine_cuda::open(boot, contract_for).expect("the engine opens");
+        let trace = trace();
+        let facts = trace.facts.clone();
         let loaded = engine
             .load(LoadRequest {
-                trace: trace(),
+                trace,
                 checkpoint: Checkpoint::Path(path.clone()),
                 budgets: Budgets {
                     max_lanes: 8,
@@ -354,6 +336,7 @@ impl Rig {
         Rig {
             engine,
             loaded,
+            facts,
             programs: BTreeMap::new(),
             next_channel: 1,
             _dir: dir,
@@ -444,10 +427,10 @@ impl Rig {
     }
 }
 
-pub fn lane(slot: u32, handles: &LaneHandles, group: u32) -> Lane {
+pub fn lane(rig: &Rig, slot: u32, handles: &LaneHandles, group: u32) -> Lane {
     Lane {
         slot,
-        word: classify(&Request::new(handles.rows, false)),
+        word: rig.facts.word(&Request::new(handles.rows, false)),
         tokens: vec![0; handles.rows as usize],
         readout: Readout::Rows((0..handles.rows).collect()),
         stream: LaneStream::Text,

@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use checkpoint::contract::{Expr, ModelContract, TensorContract, Visibility};
-use poem_dsl::{Dtype, Param, ParamSource, Platform, Shard};
+use poem::{Dtype, Param, ParamSource, Platform, Shard};
 
 const GROUP: u64 = 32;
 
@@ -84,7 +84,7 @@ fn state(writer: &mut ztensor::Writer, param: &Param) {
         Dtype::I64 => raw(writer, param, ztensor::Leaf::I64, 8),
         Dtype::E5m2 | Dtype::I16 | Dtype::U64 | Dtype::U16 | Dtype::Bool => {
             panic!(
-                "`{}` is declared {:?}, which no SKU in the catalog stores",
+                "`{}` is declared {:?}, which no deployment in the catalog stores",
                 param.name, param.dtype
             )
         }
@@ -99,7 +99,7 @@ fn state(writer: &mut ztensor::Writer, param: &Param) {
         | Dtype::Ptq1_0
         | Dtype::KvU4 => panic!(
             "`{}` is declared `{}`, which this fixture does not state; a \
-             stored block wants its own bytes and no SKU declares one yet",
+             stored block wants its own bytes and no deployment declares one yet",
             param.name, param.dtype,
         ),
     }
@@ -143,33 +143,32 @@ fn block_axis(param: &Param) -> usize {
 fn stated() -> &'static [Stated] {
     static EVERY: OnceLock<Vec<Stated>> = OnceLock::new();
 
-    EVERY.get_or_init(state_every_sku)
+    EVERY.get_or_init(state_every_deployment)
 }
 
-fn state_every_sku() -> Vec<Stated> {
+fn state_every_deployment() -> Vec<Stated> {
     let dir = scratch();
     let mut out = Vec::new();
 
-    for row in models::skus() {
+    for row in models::deployments().chain(models::splits()) {
         if !by_load(row) {
             continue;
         }
-        let (name, tp) = (row.name.as_str(), row.recipe.tp);
-        let trace = (row.trace)(Platform::Cuda);
+        let (name, tp) = (row.name.as_str(), row.deploy.tp);
+        let trace = row.trace(Platform::Cuda);
         let path = dir.join(format!("{name}.zt"));
         write_checkpoint(&path, &trace.params);
 
         let src = ztensor::Source::open(&path).unwrap_or_else(|why| {
             panic!("`{name}`: the checkpoint just written does not open again: {why}")
         });
-        let contract =
-            checkpoint_dsl::own_contract(&src, &trace.params, tp, poem_dsl::Platform::Cuda)
-                .unwrap_or_else(|why| {
-                    panic!(
-                        "`{name}` refuses a checkpoint that states its own plan, plane for \
+        let contract = poem::import::own_contract(&src, &trace.params, tp, poem::Platform::Cuda)
+            .unwrap_or_else(|why| {
+                panic!(
+                    "`{name}` refuses a checkpoint that states its own plan, plane for \
                  plane, in the dtypes it asked for: {why}"
-                    )
-                });
+                )
+            });
         drop(src);
         out.push(Stated {
             name,
@@ -202,8 +201,8 @@ fn nodes(expr: &Expr, wanted: &dyn Fn(&Expr) -> bool) -> usize {
     found
 }
 
-fn by_load(row: &models::Sku) -> bool {
-    row.recipe
+fn by_load(row: &models::Deployment) -> bool {
+    row.deploy
         .weights
         .iter()
         .all(|w| matches!(w, Dtype::Bf16 | Dtype::Mxfp4))
@@ -326,9 +325,21 @@ fn a_declared_shape_is_the_whole_tensors() {
                 .map(|(at, extent)| {
                     let extent = i64::try_from(*extent).expect("an extent no i64 holds");
                     match &param.shard {
-                        Shard::Cut { axis, .. } if *axis as usize == at => {
-                            extent * i64::from(one.tp)
-                        }
+                        // A block of heads fewer than the ranks is held whole
+                        // by each of a group of them.
+                        Shard::Cut {
+                            axis,
+                            segments,
+                            heads,
+                        } if *axis as usize == at => segments
+                            .iter()
+                            .enumerate()
+                            .map(|(i, segment)| {
+                                let parts = Shard::parts(heads.get(i).copied(), u64::from(one.tp))
+                                    .expect("a cut the sharding pass took");
+                                i64::try_from(segment * parts).expect("an extent no i64 holds")
+                            })
+                            .sum(),
                         Shard::Cut { .. } | Shard::Replicated => extent,
                     }
                 })
@@ -373,25 +384,24 @@ fn a_bank_the_checkpoint_ships_unquantized_is_cast_on_the_way_in() {
     let dir = scratch();
     let mut faults = Vec::new();
 
-    for row in models::skus() {
-        let (name, tp, trace) = (row.name.as_str(), row.recipe.tp, row.trace);
+    for row in models::deployments().chain(models::splits()) {
+        let (name, tp) = (row.name.as_str(), row.deploy.tp);
         if !name.starts_with("kimik3") {
             continue;
         }
-        let trace = trace(Platform::Cuda);
+        let trace = row.trace(Platform::Cuda);
         let path = dir.join(format!("{name}-unquantized.zt"));
         write_unquantized_checkpoint(&path, &trace.params);
 
         let src = ztensor::Source::open(&path)
             .unwrap_or_else(|why| panic!("`{name}`: {} does not open: {why}", path.display()));
-        let contract =
-            checkpoint_dsl::own_contract(&src, &trace.params, tp, poem_dsl::Platform::Cuda)
-                .unwrap_or_else(|why| {
-                    panic!(
-                        "`{name}` refuses a checkpoint that ships its banks unquantized, \
-                 which is the file a runtime-quantizing SKU exists to read: {why}"
-                    )
-                });
+        let contract = poem::import::own_contract(&src, &trace.params, tp, poem::Platform::Cuda)
+            .unwrap_or_else(|why| {
+                panic!(
+                    "`{name}` refuses a checkpoint that ships its banks unquantized, \
+                 which is the file a runtime-quantizing deployment exists to read: {why}"
+                )
+            });
         drop(src);
 
         let supply = published(&contract);

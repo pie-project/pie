@@ -1886,22 +1886,20 @@ fn pinned_address_of(seat: &Seat, expert: u32) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use poem_dsl::Platform;
+    use poem::Platform;
 
     use super::*;
 
     fn a3b() -> Trace {
-        let trace = models::sku("qwen35-a3b-bf16-kv-bf16")
-            .expect("the catalog ships the SKU")
-            .trace;
-        trace(Platform::Cuda)
+        models::deployment("qwen35-a3b-bf16-kv-bf16")
+            .expect("the catalog ships the deployment")
+            .trace(Platform::Cuda)
     }
 
     fn gpt_oss() -> Trace {
-        let trace = models::sku("gptoss-20b-bf16-mxfp4-kv-bf16")
-            .expect("the catalog ships the SKU")
-            .trace;
-        trace(Platform::Cuda)
+        models::deployment("gptoss-20b-bf16-mxfp4-kv-bf16")
+            .expect("the catalog ships the deployment")
+            .trace(Platform::Cuda)
     }
 
     fn scales_of(trace: &Trace) -> Attachments {
@@ -1917,7 +1915,7 @@ mod tests {
             .enumerate()
             .filter(|(_, param)| param.dtype == poem_ir::Dtype::Mxfp4)
             .map(|(codes, param)| {
-                let scales = poem_dsl::scales_name(&param.name);
+                let scales = poem::scales_name(&param.name);
                 let scales = *at
                     .get(scales.as_str())
                     .unwrap_or_else(|| panic!("`{}` declares no scales plane", param.name));

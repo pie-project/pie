@@ -21,10 +21,11 @@ use eta_ir::op::{IntrinsicId, Op};
 use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use eta_ir::validate::bind;
-use poem_dsl::ops::spatial::{self, Conv};
-use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Predicate,
-    RaggedMask, Request, RopeForm, Trace, Value, Weight, ops, seam, trace_hybrid,
+use poem::fact;
+use poem::ops::spatial::{self, Conv};
+use poem::{
+    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, RaggedMask, Request, RopeForm,
+    Trace, Value, Weight, ops, seam, trace_hybrid,
 };
 
 pub const WIDTH: u32 = 32;
@@ -36,49 +37,18 @@ pub const C_IN: u32 = 8;
 pub const C_OUT: u32 = 4;
 pub const TAPS: u32 = 27;
 pub const NAME: &str = "two-axis-mini";
-pub const VAE_READING: u8 = 1;
-const VAE_BIT: u8 = 0;
-
-pub struct Facts(bool);
-
-impl Facts {
-    #[must_use]
-    pub fn is_vae() -> Predicate {
-        Predicate::fact(VAE_BIT)
-    }
-}
-
-impl Classify for Facts {
-    fn of(r: &Request) -> Facts {
-        Facts(r.reading() & 1 == 1)
-    }
-    fn word(&self) -> u64 {
-        u64::from(self.0)
-    }
-}
-
-pub fn classify(request: &Request) -> u64 {
-    Facts::of(request).word()
-}
-
-pub fn classify_for(_: &str) -> Option<poem_ir::ClassifyFn> {
-    Some(classify)
-}
-
-#[must_use]
-pub fn word(reading: u8) -> u64 {
-    classify(&Request::new(1, false).in_reading(reading))
-}
 
 pub struct TwoAxis;
 
 impl ForwardHybrid for TwoAxis {
-    type Facts = Facts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<Facts>) -> Value {
-        let (vae, dit) = inputs.split(&Facts::is_vae());
+    fn forward(&self, inputs: Input) -> Value {
+        let (vae, dit) = (
+            inputs.on(fact::reading("vae")),
+            inputs.on(!fact::reading("vae")),
+        );
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
@@ -246,7 +216,7 @@ impl Weights {
 
 pub fn contract_for(trace: &Trace, path: &Path) -> Result<ModelContract, String> {
     let source = ztensor_compat::index(path).map_err(|why| why.to_string())?;
-    checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Cuda)
+    poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
         .map_err(|why| why.to_string())
 }
 
@@ -373,6 +343,7 @@ pub fn velocity_epilogue(rows: u32) -> TraceContainer {
 pub struct Rig {
     pub engine: engine_cuda::Cuda,
     pub loaded: Loaded,
+    pub facts: poem_ir::Facts,
     next_channel: u64,
     _dir: tempfile::TempDir,
 }
@@ -381,15 +352,13 @@ impl Rig {
     pub fn load(weights: &Weights, max_tokens: u32, buckets: Vec<u32>, max_voxels: u32) -> Rig {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let path = weights.write(dir.path());
-        let mut engine = engine_cuda::open(
-            engine_cuda::DeviceBoot::default(),
-            contract_for,
-            classify_for,
-        )
-        .expect("the engine opens");
+        let mut engine = engine_cuda::open(engine_cuda::DeviceBoot::default(), contract_for)
+            .expect("the engine opens");
+        let trace = trace();
+        let facts = trace.facts.clone();
         let loaded = engine
             .load(LoadRequest {
-                trace: trace(),
+                trace,
                 checkpoint: Checkpoint::Path(path),
                 budgets: Budgets {
                     max_lanes: 4,
@@ -413,6 +382,7 @@ impl Rig {
         Rig {
             engine,
             loaded,
+            facts,
             next_channel: 1,
             _dir: dir,
         }
@@ -421,6 +391,72 @@ impl Rig {
     #[must_use]
     pub fn profile(&self) -> &ModelProfile {
         &self.loaded.caps.profile
+    }
+
+    /// The word of a one-row lane running `reading`, or the plan's token
+    /// reading when `None`.
+    #[must_use]
+    pub fn word(&self, reading: Option<&str>) -> u64 {
+        let request = Request::new(1, false);
+        self.facts.word(&match reading {
+            Some(reading) => request.in_reading(reading),
+            None => request,
+        })
+    }
+
+    #[must_use]
+    pub fn vae_lane(&self, slot: u32, channel: u64) -> Lane {
+        Lane {
+            slot,
+            word: self.word(Some("vae")),
+            tokens: vec![0],
+            readout: Readout::None,
+            stream: LaneStream::Image,
+            group: None,
+            ports: vec![PortFeed {
+                kind: PortKind::Voxels,
+                port: 0,
+                channel,
+            }],
+            ..Lane::default()
+        }
+    }
+
+    #[must_use]
+    pub fn dit_lane(
+        &self,
+        slot: u32,
+        rows: u32,
+        latent: u64,
+        timestep: u64,
+        positions: u64,
+    ) -> Lane {
+        Lane {
+            slot,
+            word: self.word(None),
+            tokens: vec![0; rows as usize],
+            readout: Readout::Rows((0..rows).collect()),
+            stream: LaneStream::Image,
+            group: Some(0),
+            ports: vec![
+                PortFeed {
+                    kind: PortKind::Latents,
+                    port: 0,
+                    channel: latent,
+                },
+                PortFeed {
+                    kind: PortKind::LaneVector,
+                    port: 0,
+                    channel: timestep,
+                },
+                PortFeed {
+                    kind: PortKind::AxisPositions,
+                    port: 0,
+                    channel: positions,
+                },
+            ],
+            ..Lane::default()
+        }
     }
 
     pub fn register(&mut self, container: TraceContainer, salt: u64) -> u64 {
@@ -497,56 +533,6 @@ impl Rig {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
-    }
-}
-
-#[must_use]
-pub fn vae_lane(slot: u32, channel: u64) -> Lane {
-    Lane {
-        slot,
-        word: word(VAE_READING),
-        tokens: vec![0],
-        readout: Readout::None,
-        stream: LaneStream::Image,
-        group: None,
-        reading: VAE_READING,
-        ports: vec![PortFeed {
-            kind: PortKind::Voxels,
-            port: 0,
-            channel,
-        }],
-        ..Lane::default()
-    }
-}
-
-#[must_use]
-pub fn dit_lane(slot: u32, rows: u32, latent: u64, timestep: u64, positions: u64) -> Lane {
-    Lane {
-        slot,
-        word: word(0),
-        tokens: vec![0; rows as usize],
-        readout: Readout::Rows((0..rows).collect()),
-        stream: LaneStream::Image,
-        group: Some(0),
-        reading: 0,
-        ports: vec![
-            PortFeed {
-                kind: PortKind::Latents,
-                port: 0,
-                channel: latent,
-            },
-            PortFeed {
-                kind: PortKind::LaneVector,
-                port: 0,
-                channel: timestep,
-            },
-            PortFeed {
-                kind: PortKind::AxisPositions,
-                port: 0,
-                channel: positions,
-            },
-        ],
-        ..Lane::default()
     }
 }
 

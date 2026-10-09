@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 
 use crate::check::V;
-use crate::ops::{Attention, CustomCuda, Layout, Spatial};
+use crate::ops::{Attention, Fused, Layout, Spatial};
 use crate::{Def, Guard, Operands, Operation, Trace, ValueId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,9 +456,7 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::PoolLse { .. }
             | Attention::PoolLseSelected { .. } => false,
         },
-        Operation::CustomCuda(op) => match op {
-            CustomCuda::QkvFusedQknormRopeVnormWrite { .. } => true,
-        },
+        Operation::Fused(op) => matches!(op, Fused::QkvFusedQknormRopeVnormWrite { .. }),
         Operation::Spatial(op) => match op {
             Spatial::Conv3d { cache, .. } => cache.is_some(),
             Spatial::CacheStore { .. } => true,
@@ -564,6 +562,7 @@ mod tests {
         fn new() -> Build {
             Build {
                 trace: Trace {
+                    facts: Default::default(),
                     name: "hand-built".to_string(),
                     platform: crate::Platform::Cuda,
                     params: Vec::new(),
@@ -571,6 +570,7 @@ mod tests {
                         name: "state".to_string(),
                         slab: vec![1],
                         dtype: crate::Dtype::Bf16,
+                        shard: crate::trace::Shard::Replicated,
                     }],
                     values: Vec::new(),
                     nodes: Vec::new(),

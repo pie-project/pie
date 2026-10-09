@@ -1,8 +1,7 @@
 //! Dense projections, `y = act · wᵀ` over a row-major `[n, k]` weight: one
 //! `dot_general` per call, bf16 operands and an f32 result rounded once where
-//! it lands. The CUDA-only fused forms (`matmul_bias`, `matmul_geglu`,
-//! `lm_head_softcap`, `rel_bias`) fold their epilogue into the same f32
-//! result before the one rounding.
+//! it lands. `rel_bias` folds its epilogue into the same f32 result before
+//! the one rounding.
 //!
 //! [`project`] is the contraction every linear family here shares: the
 //! quantized families decode their planes to a dense `[n, k]` value and hand
@@ -192,109 +191,6 @@ pub fn act_x_wt(
     }
     ctx.emit(&mut |cx| {
         let out = dense_f32(cx, act, w, m)?;
-        cx.write(y, out)
-    })
-}
-
-/// `y = act · wᵀ + bias`, the bias one value per column, added to the f32
-/// result before its one rounding.
-/// Reference: kernels-cuda `linear::gemm::matmul_bias` (engine-cuda
-/// `Linear::MatmulBias`; its non-gemv tactics add the bias after the store).
-pub fn matmul_bias(
-    ctx: &Ctx<'_>,
-    act: Tensor,
-    w: Tensor,
-    bias: Tensor,
-    y: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "linear.matmul_bias";
-    let (m, n, _) = dense(OP, act, w, y)?;
-    if bias.elements() != u64::from(n) {
-        return Err(refuse(OP, "the bias is not one value per column"));
-    }
-    if m == 0 {
-        return Ok(());
-    }
-    ctx.emit(&mut |cx| {
-        let out = dense_f32(cx, act, w, m)?;
-        let b = cx.read_f32(bias)?;
-        let b = cx.reshape(b, &[i64::from(n)])?;
-        let b = cx.broadcast(b, &[i64::from(m), i64::from(n)], &[1])?;
-        let out = cx.add(out, b)?;
-        cx.write(y, out)
-    })
-}
-
-/// `y = cap · tanh((act · wᵀ) / cap)`, the cap applied to the f32 logits.
-/// Reference: kernels-cuda `linear::skinny` `Epilogue::Softcap` (fused on
-/// the accumulator) / `attn::logit_softcap` after `lm_head` (engine-cuda
-/// `Linear::LmHeadSoftcap`).
-pub fn lm_head_softcap(
-    ctx: &Ctx<'_>,
-    act: Tensor,
-    w: Tensor,
-    cap: f32,
-    y: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "linear.lm_head_softcap";
-    if !(cap.is_finite() && cap > 0.0) {
-        return Err(refuse(OP, format!("{cap} is not a logit soft cap")));
-    }
-    let (m, _, _) = dense(OP, act, w, y)?;
-    if m == 0 {
-        return Ok(());
-    }
-    ctx.emit(&mut |cx| {
-        let out = dense_f32(cx, act, w, m)?;
-        let out = softcap(cx, out, cap)?;
-        cx.write(y, out)
-    })
-}
-
-/// `cap · tanh(x / cap)`, as `attn::logit_softcap` computes it.
-pub(crate) fn softcap(cx: &mut Cx<'_>, x: Val, cap: f32) -> Result<Val, Error> {
-    let inv = 1.0f32 / cap;
-    let s = cx.scale(x, f64::from(inv))?;
-    let t = cx.tanh(s);
-    Ok(cx.scale(t, f64::from(cap))?)
-}
-
-/// `packed = act · wᵀ` (the `[gate | up]` halves, `2 · intermediate` wide),
-/// then `y = gelu_tanh(gate) · up` read back from the bf16 `packed`.
-/// Reference: engine-cuda `Linear::MatmulGeglu` (a matmul into `packed`,
-/// then `mlp::geglu_tanh_packed`).
-pub fn matmul_geglu(
-    ctx: &Ctx<'_>,
-    act: Tensor,
-    w: Tensor,
-    intermediate: u32,
-    packed: Tensor,
-    y: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "linear.matmul_geglu";
-    let (m, n, _) = dense(OP, act, w, packed)?;
-    if n != intermediate.saturating_mul(2) || y.width != intermediate || y.rows != m {
-        return Err(refuse(
-            OP,
-            format!(
-                "the weight lands {n} columns and the activation {}x{}, where the \
-                 intermediate is {intermediate}",
-                y.rows, y.width
-            ),
-        ));
-    }
-    if m == 0 {
-        return Ok(());
-    }
-    ctx.emit(&mut |cx| {
-        let out = dense_f32(cx, act, w, m)?;
-        cx.write(packed, out)?;
-        let p = cx.read_f32(packed)?;
-        let i = i64::from(intermediate);
-        let g = cx.slice_axis(p, 1, 0, i)?;
-        let u = cx.slice_axis(p, 1, i, 2 * i)?;
-        let g = cx.gelu_tanh(g)?;
-        let out = cx.mul(g, u)?;
         cx.write(y, out)
     })
 }

@@ -71,14 +71,14 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
         );
         let slot = (2 * at) as u32;
         if at == 0 {
-            lanes.push(lane(slot, &image, LaneStream::Image, at as u32));
-            lanes.push(lane(slot + 1, &text, LaneStream::Text, at as u32));
+            lanes.push(lane(&rig, slot, &image, LaneStream::Image, at as u32));
+            lanes.push(lane(&rig, slot + 1, &text, LaneStream::Text, at as u32));
             attachments.push(attach(lanes.len() as u32 - 2, &image));
             attachments.push(attach(lanes.len() as u32 - 1, &text));
             handles.push((image, text));
         } else {
-            lanes.push(lane(slot, &text, LaneStream::Text, at as u32));
-            lanes.push(lane(slot + 1, &image, LaneStream::Image, at as u32));
+            lanes.push(lane(&rig, slot, &text, LaneStream::Text, at as u32));
+            lanes.push(lane(&rig, slot + 1, &image, LaneStream::Image, at as u32));
             attachments.push(attach(lanes.len() as u32 - 2, &text));
             attachments.push(attach(lanes.len() as u32 - 1, &image));
             handles.push((text, image));

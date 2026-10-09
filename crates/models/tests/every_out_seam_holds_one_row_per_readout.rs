@@ -1,4 +1,4 @@
-use poem_dsl::{Dim, Platform, Ty, seam};
+use poem::{Dim, Platform, Ty, seam};
 
 /// The engine reads the `out` seam by readout index: a lane's rows in the
 /// readback are `readout_first..readout_first + readout_count`, counted over
@@ -11,8 +11,8 @@ fn every_out_seam_holds_one_row_per_readout() {
     let mut faults = Vec::new();
     let mut seen = 0usize;
 
-    for row in models::skus() {
-        let trace = (row.trace)(Platform::Cuda);
+    for row in models::deployments().chain(models::splits()) {
+        let trace = row.trace(Platform::Cuda);
         for out in trace.seams.iter().filter(|s| s.seam == seam::OUT.name) {
             for value in &out.values {
                 seen += 1;
@@ -33,6 +33,6 @@ fn every_out_seam_holds_one_row_per_readout() {
         }
     }
 
-    assert!(seen > 0, "no catalog SKU lands an `out` seam");
+    assert!(seen > 0, "no catalog deployment lands an `out` seam");
     assert!(faults.is_empty(), "\n{}\n", faults.join("\n"));
 }

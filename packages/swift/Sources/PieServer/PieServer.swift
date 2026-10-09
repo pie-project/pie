@@ -9,7 +9,7 @@ public final class PieServer: Sendable {
     /// What booted.
     public struct Summary: Decodable, Sendable, Equatable {
         public let model: String
-        public let sku: String
+        public let deployment: String
         public let trace: String
         public let weightBytes: Int
         public let kvPages: Int
@@ -30,8 +30,6 @@ public final class PieServer: Sendable {
         /// The cap on each inferlet's linear memory.
         public var sandboxMemoryMB = 256
         public var maxConcurrentProcesses: Int? = 4
-        /// The SKU to serve the artifact as; nil reads it from the artifact.
-        public var sku: String?
 
         public init() {}
 
@@ -44,7 +42,6 @@ public final class PieServer: Sendable {
             case maxModelLength = "max_model_len"
             case sandboxMemoryMB = "sandbox_memory_mb"
             case maxConcurrentProcesses = "max_concurrent_processes"
-            case sku
         }
     }
 

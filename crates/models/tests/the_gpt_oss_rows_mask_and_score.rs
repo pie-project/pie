@@ -1,4 +1,4 @@
-use poem_dsl::{Attention, Operation, Platform, seam};
+use poem::{Attention, Operation, Platform, seam};
 
 const PLATFORMS: [Platform; 4] = [
     Platform::Cuda,
@@ -7,7 +7,7 @@ const PLATFORMS: [Platform; 4] = [
     Platform::Vulkan,
 ];
 
-fn count(trace: &poem_dsl::Trace, wanted: impl Fn(&Operation) -> bool) -> usize {
+fn count(trace: &poem::Trace, wanted: impl Fn(&Operation) -> bool) -> usize {
     trace.nodes.iter().filter(|node| wanted(&node.op)).count()
 }
 
@@ -18,13 +18,13 @@ fn count(trace: &poem_dsl::Trace, wanted: impl Fn(&Operation) -> bool) -> usize 
 // eviction programs (`attn_score`).
 #[test]
 fn every_gpt_oss_row_declares_a_masked_arm_and_exports_its_scores() {
-    let rows: Vec<_> = models::skus()
+    let rows: Vec<_> = models::deployments()
         .filter(|row| row.name.starts_with("gptoss-"))
         .collect();
     assert!(!rows.is_empty(), "this build ships no gpt-oss row");
     for row in rows {
         for platform in PLATFORMS {
-            let trace = (row.trace)(platform);
+            let trace = row.trace(platform);
             let sinks = count(&trace, |op| {
                 matches!(op, Operation::Attention(Attention::Sink { .. }))
             });

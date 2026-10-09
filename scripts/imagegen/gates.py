@@ -691,7 +691,7 @@ def roster() -> list[Gate]:
                    (g("mini-dit", "mini_dit_euler_bf16.npz"),
                     "python scripts/imagegen/mini_dit_ref.py --euler"),
                    (a("mini-dit.zt"),
-                    f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/mini-dit/ --sku mini-dit-bf16-kv-bf16 "
+                    f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/mini-dit/ --deployment mini-dit-bf16-kv-bf16 "
                     f"--out {a('mini-dit.zt')}")],
             config=dict(port=8601, model=a("mini-dit.zt"), rows=65536, mem=0.60),
             steps=[("one step", harness("mini_dit_parity.py", "all", "--out", "{out}",
@@ -713,7 +713,7 @@ def roster() -> list[Gate]:
                  "and a three-lane one give the same lane different bf16 answers "
                  "(rel 0.0056) and a cross-fire identity is not one.",
             needs=[(a("mini-dit.zt"),
-                    f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/mini-dit/ --sku mini-dit-bf16-kv-bf16 "
+                    f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/mini-dit/ --deployment mini-dit-bf16-kv-bf16 "
                     f"--out {a('mini-dit.zt')}")],
             config=dict(port=8601, model=a("mini-dit.zt"), rows=65536, mem=0.60),
             steps=[("two scales", harness("mini_dit_parity.py", "guidance", "--out", "{out}",
@@ -734,7 +734,7 @@ def roster() -> list[Gate]:
             needs=[(g("mini-dit", "mini_dit_dpm2m_bf16.npz"),
                     "python scripts/imagegen/mini_dit_ref.py --dpm2m"),
                    (a("mini-dit.zt"),
-                    f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/mini-dit/ --sku mini-dit-bf16-kv-bf16 "
+                    f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/mini-dit/ --deployment mini-dit-bf16-kv-bf16 "
                     f"--out {a('mini-dit.zt')}")],
             config=dict(port=8601, model=a("mini-dit.zt"), rows=65536, mem=0.60),
             steps=[("four DPM++ 2M steps", harness("mini_dit_parity.py", "all", "--solver",
@@ -754,7 +754,7 @@ def roster() -> list[Gate]:
                  "group-packed `attention.ragged` with no family code involved. "
                  "Every claim is an identity within fires of one shape.",
             needs=[(a("mini-dit.zt"),
-                    f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/mini-dit/ --sku mini-dit-bf16-kv-bf16 "
+                    f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/mini-dit/ --deployment mini-dit-bf16-kv-bf16 "
                     f"--out {a('mini-dit.zt')}")],
             config=dict(port=8601, model=a("mini-dit.zt"), rows=65536, mem=0.60),
             steps=[("four modes", harness("mini_dit_parity.py", "classes", "--out", "{out}",
@@ -781,7 +781,7 @@ def roster() -> list[Gate]:
                    (g("mini-dit", "mini_dit_euler_bf16.npz"),
                     "python scripts/imagegen/mini_dit_ref.py --euler"),
                    (a("mini-dit.zt"),
-                    f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/mini-dit/ --sku mini-dit-bf16-kv-bf16 "
+                    f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/mini-dit/ --deployment mini-dit-bf16-kv-bf16 "
                     f"--out {a('mini-dit.zt')}")],
             config=dict(port=8601, model=a("mini-dit.zt"), rows=65536, mem=0.60),
             steps=[("four thresholds", harness("mini_dit_cache.py", "all", "--out", "{out}",
@@ -796,7 +796,7 @@ def roster() -> list[Gate]:
             needs=[(g("z-image", "zimage_mini.npz"), "python scripts/imagegen/zimage_golden.py --mini"),
                    (g("z-image", "zimage_mini_pad.npz"), "python scripts/imagegen/zimage_golden.py --mini-pad"),
                    (a("z-image-mini.zt"),
-                    f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/z-image/ --sku z-image-mini-bf16-kv-bf16 "
+                    f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/z-image/ --deployment z-image-mini-bf16-kv-bf16 "
                     f"--out {a('z-image-mini.zt')}")],
             config=dict(port=8602, model=a("z-image-mini.zt"), rows=65536, mem=0.60),
             steps=[("mini", harness("zimage_parity.py", "all", "--mode", "mini",
@@ -812,7 +812,7 @@ def roster() -> list[Gate]:
             expected="text 0.99999, turbo 0.9998, steps 0.9961-0.9972, PSNR 32.8-33.3 dB",
             needs=[(g("z-image", "zimage_golden.npz"), "python scripts/imagegen/zimage_golden.py --full"),
                    (a("z-image-turbo.zt"),
-                    f"{IMPORT} <Z-Image-Turbo snapshot> --sku z-image-turbo-bf16-kv-bf16 "
+                    f"{IMPORT} <Z-Image-Turbo snapshot> --deployment z-image-turbo-bf16-kv-bf16 "
                     f"--out {a('z-image-turbo.zt')}")],
             config=dict(port=8603, model=a("z-image-turbo.zt"), rows=65536, mem=0.90),
             steps=[("gate", harness("zimage_parity.py", "gate", "--out", "{out}",
@@ -827,7 +827,7 @@ def roster() -> list[Gate]:
             expected="0.99999",
             needs=[(g("flux2", "flux2_mini.npz"), "python scripts/imagegen/flux2_golden.py --mini"),
                    (a("flux2-mini.zt"),
-                    f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/flux2/ --sku flux2-mini-bf16-kv-bf16 "
+                    f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/flux2/ --deployment flux2-mini-bf16-kv-bf16 "
                     f"--out {a('flux2-mini.zt')}")],
             config=dict(port=8604, model=a("flux2-mini.zt"), rows=65536, mem=0.60),
             steps=[("one step", harness("flux2_parity.py", "all", "--out", "{out}",
@@ -841,7 +841,7 @@ def roster() -> list[Gate]:
             expected="per-step velocities >= 0.999, PSNR >= 34 dB",
             needs=[(g("flux2", "flux2_golden.npz"), "python scripts/imagegen/flux2_golden.py --full"),
                    (a("flux2-klein-4b.zt"),
-                    f"{IMPORT} <FLUX.2-klein-4B snapshot> --sku flux2-klein-4b-bf16-kv-bf16 "
+                    f"{IMPORT} <FLUX.2-klein-4B snapshot> --deployment flux2-klein-4b-bf16-kv-bf16 "
                     f"--out {a('flux2-klein-4b.zt')}")],
             config=dict(port=8605, model=a("flux2-klein-4b.zt"), rows=32768, mem=0.90),
             steps=[("all", harness("flux2_klein_parity.py", "all", "--out", "{out}",
@@ -857,7 +857,7 @@ def roster() -> list[Gate]:
             needs=[(g("flux2", "flux2_vae", "shapes.json"),
                     "python scripts/imagegen/flux2_golden.py --vae"),
                    (a("flux2-klein-4b.zt"),
-                    f"{IMPORT} <FLUX.2-klein-4B snapshot> --sku flux2-klein-4b-bf16-kv-bf16 "
+                    f"{IMPORT} <FLUX.2-klein-4B snapshot> --deployment flux2-klein-4b-bf16-kv-bf16 "
                     f"--out {a('flux2-klein-4b.zt')}")],
             config=None,
             steps=[("host gate", cargo_test("the_flux_2_vae_answers_the_reference"))],
@@ -871,7 +871,7 @@ def roster() -> list[Gate]:
             needs=[(g("z-image", "zimage_vae", "shapes.json"),
                     "python scripts/imagegen/zimage_golden.py --vae"),
                    (a("z-image-turbo.zt"),
-                    f"{IMPORT} <Z-Image-Turbo snapshot> --sku z-image-turbo-bf16-kv-bf16 "
+                    f"{IMPORT} <Z-Image-Turbo snapshot> --deployment z-image-turbo-bf16-kv-bf16 "
                     f"--out {a('z-image-turbo.zt')}")],
             config=dict(port=8606, model=a("z-image-turbo.zt"), rows=32768, mem=0.90),
             steps=[("from a guest", harness("zimage_vae_parity.py", "all", "--out", "{out}",
@@ -887,7 +887,7 @@ def roster() -> list[Gate]:
             needs=[(g("wan22", "wan22_mini.npz"), "python scripts/imagegen/wan22_golden.py --mini"),
                    (a("wan22-mini-d128.zt"),
                     f"{IMPORT} <dir with wan22_mini_d128.safetensors> "
-                    f"--sku wan22-mini-d128-bf16-kv-bf16 --out {a('wan22-mini-d128.zt')}")],
+                    f"--deployment wan22-mini-d128-bf16-kv-bf16 --out {a('wan22-mini-d128.zt')}")],
             config=dict(port=8607, model=a("wan22-mini-d128.zt"), rows=16384, mem=0.60),
             steps=[("scalar timestep", harness("wan22_parity.py", "all", "--out", "{out}",
                                                "--config", "{config}")),
@@ -903,7 +903,7 @@ def roster() -> list[Gate]:
             needs=[(g("minimax_h3", "h3_mini.npz"), "python scripts/imagegen/h3_golden.py --mini"),
                    (a("h3-mini.zt"),
                     f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/minimax_h3/ "
-                    f"--sku minimax-h3-mini-bf16-kv-bf16 --out {a('h3-mini.zt')}")],
+                    f"--deployment minimax-h3-mini-bf16-kv-bf16 --out {a('h3-mini.zt')}")],
             config=dict(port=8608, model=a("h3-mini.zt"), rows=65536, mem=0.60),
             steps=[("refine + denoise", harness("h3_parity.py", "all", "--out", "{out}",
                                                 "--config", "{config}"))],
@@ -917,7 +917,7 @@ def roster() -> list[Gate]:
             needs=[(g("hy3", "hy3_mini.npz"), "python scripts/imagegen/hy3_golden.py --mini"),
                    (g("hy3", "hy3-mini.zt"),
                     f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/hy3/artifact "
-                    f"--sku hunyuanimage3-mini-bf16-kv-bf16 --out {g('hy3', 'hy3-mini.zt')}")],
+                    f"--deployment hunyuanimage3-mini-bf16-kv-bf16 --out {g('hy3', 'hy3-mini.zt')}")],
             config=dict(port=8609, model=g("hy3", "hy3-mini.zt"), rows=32768, mem=0.30),
             steps=[("three fires + two claims", harness("hy3_parity.py", "all", "--out", "{out}",
                                                         "--config", "{config}"))],
@@ -930,7 +930,7 @@ def roster() -> list[Gate]:
             expected="cos >= 0.9999 (the harness's own gate; the README states no number)",
             needs=[(g("ltx25", "ltx2_mini.npz"), "python scripts/imagegen/ltx2_golden.py --mini"),
                    (a("ltx2-mini.zt"),
-                    f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/ltx25 --sku ltx25-mini-bf16-kv-bf16 "
+                    f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/ltx25 --deployment ltx25-mini-bf16-kv-bf16 "
                     f"--out {a('ltx2-mini.zt')}")],
             config=dict(port=8610, model=a("ltx2-mini.zt"), rows=4096, mem=0.40),
             steps=[("joint step", harness("ltx2_parity.py", "all", "--out", "{out}",
@@ -973,7 +973,7 @@ def roster() -> list[Gate]:
                     "python scripts/imagegen/wan22_golden.py --vae"),
                    (a("wan22-ti2v-5b.zt"),
                     f"{IMPORT} <Wan2.2-TI2V-5B-Diffusers snapshot, with a tokenizer.json "
-                    f"pie can compile beside it> --sku wan22-ti2v-5b-bf16-kv-bf16 "
+                    f"pie can compile beside it> --deployment wan22-ti2v-5b-bf16-kv-bf16 "
                     f"--out {a('wan22-ti2v-5b.zt')}")],
             config=dict(port=8612, model=a("wan22-ti2v-5b.zt"), rows=131072, mem=0.95,
                         timeout="1800s"),
@@ -1043,7 +1043,7 @@ def roster() -> list[Gate]:
                  "Every claim is an identity or a margin measured within this gate's "
                  "own runs, so none needs a golden.",
             needs=[(a("flux2-klein-4b.zt"),
-                    f"{IMPORT} <FLUX.2-klein-4B snapshot> --sku flux2-klein-4b-bf16-kv-bf16 "
+                    f"{IMPORT} <FLUX.2-klein-4B snapshot> --deployment flux2-klein-4b-bf16-kv-bf16 "
                     f"--out {a('flux2-klein-4b.zt')}")],
             config=dict(port=8611, model=a("flux2-klein-4b.zt"), rows=32768, mem=0.90),
             steps=[("prompt -> picture",

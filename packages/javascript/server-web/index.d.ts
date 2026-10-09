@@ -15,7 +15,7 @@ export interface LoadOptions {
 
 export interface BootSummary {
   model: string;
-  sku: string;
+  deployment: string;
   trace: string;
   weight_bytes: number;
   kv_pages: number;

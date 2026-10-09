@@ -397,6 +397,10 @@ impl Shell {
         voxels: Option<poem_compiler::VoxelLadder>,
         device: Device,
     ) -> Result<Shell> {
+        let boot = Boot {
+            trace: poem_compiler::fuse::fuse(boot.trace, &crate::FUSED),
+            ..boot
+        };
         // The row ladder every fire is padded up to (powers of two to
         // `max_tokens`, as the CUDA shell arms its graphs), and lane room
         // for the padding lanes that fill a decode up to its rung.

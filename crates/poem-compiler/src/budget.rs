@@ -206,7 +206,19 @@ impl FamilyCosts {
             poem_ir::Operation::Elementwise(_) => self.elementwise,
             poem_ir::Operation::Layout(_) => self.layout,
             poem_ir::Operation::Collective(_) => self.collective,
-            poem_ir::Operation::CustomCuda(_) => self.custom,
+            poem_ir::Operation::Fused(op) => match op {
+                poem_ir::Fused::MatmulGeglu { .. }
+                | poem_ir::Fused::LmHeadSoftcap { .. }
+                | poem_ir::Fused::MatmulBias { .. } => self.linear,
+                poem_ir::Fused::QkvFusedQknormRopeVnormWrite { .. } => self.custom,
+                poem_ir::Fused::ResidualAddRmsnorm { .. }
+                | poem_ir::Fused::RmsnormResidualAdd { .. }
+                | poem_ir::Fused::EmbedScaleAdd { .. }
+                | poem_ir::Fused::EmbedScaleAddSelect { .. }
+                | poem_ir::Fused::RmsnormRopePartialQ { .. }
+                | poem_ir::Fused::NormModulate { .. }
+                | poem_ir::Fused::GatedResidualNormModulate { .. } => self.elementwise,
+            },
             poem_ir::Operation::Spatial(_) => self.spatial,
         }
     }

@@ -1,4 +1,4 @@
-use poem_dsl::{Def, Dim, Linear, Operation, Platform, Trace, Ty, ValueId};
+use poem::{Def, Dim, Linear, Operation, Platform, Trace, Ty, ValueId};
 
 fn width(trace: &Trace, v: ValueId) -> Option<u64> {
     match &trace.values[v.0 as usize].ty {
@@ -22,8 +22,8 @@ fn a_routed_bank_is_the_rectangle_the_grouped_leg_reads() {
     let mut faults = Vec::new();
     let mut checked = 0usize;
 
-    for row in models::skus() {
-        let trace = (row.trace)(Platform::Cuda);
+    for row in models::deployments().chain(models::splits()) {
+        let trace = row.trace(Platform::Cuda);
         for node in &trace.nodes {
             let Operation::Linear(Linear::MoeMatmulSelect { x, bank, y, .. }) = &node.op else {
                 continue;
@@ -69,7 +69,7 @@ fn a_routed_bank_is_the_rectangle_the_grouped_leg_reads() {
 
     assert!(
         checked > 0,
-        "no catalog SKU traces a routed select, so this gate proved nothing — either the \
+        "no catalog deployment traces a routed select, so this gate proved nothing — either the \
          MoE families left the catalog or the op was renamed"
     );
     assert!(faults.is_empty(), "\n{}\n", faults.join("\n"));

@@ -33,7 +33,7 @@ class ServerTest {
             val client = server.connect()
             val result = client.launch(name, Prompt("The capital of France is", 8)).result()
             val text = Json.parseToJsonElement(result).jsonObject.getValue("text").jsonPrimitive.content
-            println("${server.summary.sku} at ${server.listenAddress}: $text")
+            println("${server.summary.deployment} at ${server.listenAddress}: $text")
             assertTrue(text.isNotBlank())
             assertTrue(server.listenAddress.orEmpty().substringAfterLast(':').toInt() > 0)
             client.close()

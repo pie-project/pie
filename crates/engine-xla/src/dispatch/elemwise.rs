@@ -1,6 +1,6 @@
 use kernels_xla::{Tensor, elemwise};
 use poem_exec::{DispatchElementwise, KernelError};
-use poem_ir::{Elementwise, ModulateForm, MropeForm, NormKind, RopeForm, ValueId};
+use poem_ir::{Elementwise, ModulateForm, MropeForm, RopeForm, ValueId};
 
 use poem_ir::Operands;
 
@@ -18,13 +18,6 @@ fn modulate_form(form: ModulateForm) -> elemwise::act::Form {
         ModulateForm::ScaleShift => elemwise::act::Form::ScaleShift,
         ModulateForm::Scale => elemwise::act::Form::Scale,
         ModulateForm::TanhGate => elemwise::act::Form::TanhGate,
-    }
-}
-
-fn norm_kind(norm: NormKind) -> elemwise::act::NormKind {
-    match norm {
-        NormKind::Layernorm { eps } => elemwise::act::NormKind::Layernorm { eps },
-        NormKind::Rmsnorm { head_dim, eps } => elemwise::act::NormKind::Rmsnorm { head_dim, eps },
     }
 }
 
@@ -136,81 +129,6 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
-            Elementwise::RmsnormResidualAdd {
-                x,
-                weight,
-                eps,
-                t,
-                y,
-                y_out: _,
-                scale,
-                post,
-            } => elemwise::norm::rmsnorm_residual_add(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                *eps,
-                self.tensor(*t),
-                self.tensor(*y),
-                scale.map(|(s, scaled)| (self.tensor(s), self.tensor(scaled))),
-                post.as_ref().map(|post| elemwise::norm::PostNorm {
-                    weight: self.tensor(post.weight),
-                    plus_one: post.plus_one,
-                    eps: post.eps,
-                    out: self.tensor(post.out),
-                }),
-            ),
-            Elementwise::EmbedScaleAdd {
-                ids,
-                table,
-                vocab,
-                e,
-                embed_scale,
-                e_scaled,
-                y,
-                y_out: _,
-                out_scale,
-                y_scaled,
-            } => elemwise::act::embed_scale_add(
-                self.ctx(),
-                self.tensor(*ids),
-                self.tensor(*table),
-                *vocab,
-                self.tensor(*e),
-                *embed_scale,
-                self.tensor(*e_scaled),
-                self.tensor(*y),
-                *out_scale,
-                self.tensor(*y_scaled),
-            ),
-            Elementwise::EmbedScaleAddSelect {
-                ids,
-                table,
-                vocab,
-                e,
-                embed_scale,
-                e_scaled,
-                stacked,
-                layer,
-                width,
-                y_out,
-                out_scale,
-                y_scaled,
-            } => elemwise::act::embed_scale_add_select(
-                self.ctx(),
-                self.tensor(*ids),
-                self.tensor(*table),
-                *vocab,
-                self.tensor(*e),
-                *embed_scale,
-                self.tensor(*e_scaled),
-                self.tensor(*stacked),
-                *layer,
-                *width,
-                self.tensor(*y_out),
-                *out_scale,
-                self.tensor(*y_scaled),
-            ),
             Elementwise::Modulate {
                 x,
                 m,
@@ -240,51 +158,6 @@ impl Run<'_> {
                     self.tensor(*y),
                     lane_of_row.map(|lanes| self.tensor(lanes)),
                     r,
-                )
-            }
-            Elementwise::NormModulate {
-                x,
-                norm,
-                normed,
-                m,
-                lane_of_row,
-                form,
-                y,
-            } => elemwise::act::norm_modulate(
-                self.ctx(),
-                self.tensor(*x),
-                norm_kind(*norm),
-                self.tensor(*normed),
-                self.per_lane(*m, *lane_of_row),
-                lane_of_row.map(|lanes| self.tensor(lanes)),
-                modulate_form(*form),
-                self.tensor(*y),
-            ),
-            Elementwise::GatedResidualNormModulate {
-                r,
-                g,
-                y,
-                lane_of_row,
-                r_out: _,
-                norm,
-                normed,
-                m,
-                form,
-                out,
-            } => {
-                let r = self.tensor(*r);
-                elemwise::act::gated_residual_norm_modulate(
-                    self.ctx(),
-                    r,
-                    self.per_lane(*g, *lane_of_row),
-                    self.tensor(*y),
-                    lane_of_row.map(|lanes| self.tensor(lanes)),
-                    r,
-                    norm_kind(*norm),
-                    self.tensor(*normed),
-                    self.per_lane(*m, *lane_of_row),
-                    modulate_form(*form),
-                    self.tensor(*out),
                 )
             }
             Elementwise::Sinusoid {
@@ -387,27 +260,6 @@ impl Run<'_> {
                 *head_dim,
                 *scale,
                 self.tensor(*x),
-            ),
-            Elementwise::RmsnormRopePartialQ {
-                x,
-                weight,
-                head_dim,
-                eps,
-                positions,
-                rotary_dim,
-                theta,
-                y,
-                q_out: _,
-            } => elemwise::rope::rmsnorm_rope_partial_q(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                *head_dim,
-                *eps,
-                self.tensor(*positions),
-                *rotary_dim,
-                *theta,
-                self.tensor(*y),
             ),
 
             Elementwise::RmsnormGroupedPlusOne {
@@ -514,23 +366,6 @@ impl Run<'_> {
                 };
                 elemwise::norm::residual_add(self.ctx(), x, y)
             }
-            Elementwise::ResidualAddRmsnorm {
-                x,
-                y,
-                y_out: _,
-                weight,
-                plus_one,
-                eps,
-                out,
-            } => elemwise::norm::residual_add_rmsnorm(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*y),
-                self.tensor(*weight),
-                *plus_one,
-                *eps,
-                self.tensor(*out),
-            ),
             Elementwise::AddBias {
                 bias,
                 out,

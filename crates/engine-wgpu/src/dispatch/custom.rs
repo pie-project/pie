@@ -1,10 +1,10 @@
-use poem_exec::{DispatchCustomCuda, KernelError};
-use poem_ir::{CustomCuda, Operands};
+use poem_exec::{DispatchFused, KernelError};
+use poem_ir::{Fused, Operands};
 
 use crate::run::Run;
 
-impl DispatchCustomCuda for Run<'_> {
-    fn dispatch(&mut self, op: &CustomCuda) -> Result<(), KernelError> {
+impl DispatchFused for Run<'_> {
+    fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         Err(KernelError::Unsupported { op: op.name() })
     }
 }

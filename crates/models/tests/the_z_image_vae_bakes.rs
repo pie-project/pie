@@ -3,21 +3,22 @@ use std::path::PathBuf;
 
 use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{Expr, Partition, TensorType};
-use models::z_image::forward::Facts;
-use models::z_image::{model, vae};
+pub mod z_image_dims;
+
 use models::{PortKind, ReadoutKind};
-use poem_dsl::{Classify, Def, Dim, Dtype, Operation, Platform, Request, Stream, Trace, Ty, seam};
+use poem::{Def, Dim, Dtype, Operation, Platform, Request, Stream, Trace, Ty, seam};
 use poem_ir::{GridRule, ParamLayout, Seam, Spatial};
+use z_image_dims::{self as model, vae};
 
 const TURBO: &str = "z-image-turbo-bf16-kv-bf16";
 const MINI: &str = "z-image-mini-bf16-kv-bf16";
 
-fn row(sku: &str) -> &'static models::Sku {
-    models::sku(sku).unwrap_or_else(|| panic!("this build ships no `{sku}`"))
+fn row(deployment: &str) -> &'static models::Deployment {
+    models::deployment(deployment).unwrap_or_else(|| panic!("this build ships no `{deployment}`"))
 }
 
-fn trace(sku: &str) -> Trace {
-    (row(sku).trace)(Platform::Cuda)
+fn trace(deployment: &str) -> Trace {
+    row(deployment).trace(Platform::Cuda)
 }
 
 fn reading<'a>(facts: &'a models::Generative, name: &str) -> &'a models::ReadingFact {
@@ -40,7 +41,7 @@ fn the_z_image_vae_bakes_every_case() {
 
 fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
     let facts = row(TURBO).generative.as_ref().expect("facts");
-    let names: Vec<&str> = facts.readings.iter().map(|r| r.name).collect();
+    let names: Vec<&str> = facts.readings.iter().map(|r| r.name.as_str()).collect();
     assert_eq!(
         names,
         vec!["text", "refine", "denoise", "vae.decode", "vae.encode"]
@@ -57,7 +58,7 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
     }
     assert_eq!(
         (
-            decode.ports[0].name,
+            decode.ports[0].name.as_str(),
             decode.ports[0].width,
             decode.readout_width
         ),
@@ -65,7 +66,7 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
     );
     assert_eq!(
         (
-            encode.ports[0].name,
+            encode.ports[0].name.as_str(),
             encode.ports[0].width,
             encode.readout_width
         ),
@@ -88,7 +89,7 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
         !trace(MINI)
             .values
             .iter()
-            .any(|v| matches!(v.def, Def::Input(poem_dsl::RuntimeInput::Voxels { .. }))),
+            .any(|v| matches!(v.def, Def::Input(poem::RuntimeInput::Voxels { .. }))),
         "and reads no voxel port"
     );
 }
@@ -100,7 +101,7 @@ fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
         .iter()
         .filter_map(|v| match (&v.def, &v.ty) {
             (
-                Def::Input(poem_dsl::RuntimeInput::Voxels { port, channels }),
+                Def::Input(poem::RuntimeInput::Voxels { port, channels }),
                 Ty::Tensor { dtype, .. },
             ) => Some((*port, *channels, format!("{dtype:?}"))),
             _ => None,
@@ -253,12 +254,12 @@ fn the_shapes_are_the_flux_vaes() {
 
 fn each_vae_lane_has_a_class_of_its_own() {
     let plan = trace(TURBO);
-    let classes = poem_dsl::resolve_classes(&plan).expect("every merge resolves");
+    let classes = poem::resolve_classes(&plan).expect("every merge resolves");
     let facts = row(TURBO).generative.as_ref().expect("facts");
     let class_of = |name: &str, stream: Stream| {
         let r = reading(facts, name);
-        let request = Request::new(4, false).on_stream(stream).in_reading(r.index);
-        let word = Facts::of(&request).word();
+        let request = Request::new(4, false).on_stream(stream).in_reading(&r.name);
+        let word = plan.facts.word(&request);
         classes
             .class_of(word & classes.mask)
             .unwrap_or_else(|| panic!("a {name} lane has no class"))

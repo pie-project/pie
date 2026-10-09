@@ -105,9 +105,9 @@ fn a_sliding_row_holds_its_window_and_not_the_context() {
     // 901120 bytes a token: 31373393920 for one sequence at 34816 cells.
     const GLOBAL: u64 = 10 * 2 * 4 * 512 * 2;
     const SLIDING: u64 = 50 * 2 * 16 * 256 * 2;
-    let trace = (models::sku("gemma4-31b-u4g64-kv-bf16")
+    let trace = models::deployment("gemma4-31b-u4g64-kv-bf16")
         .expect("the catalog ships gemma-4-31b")
-        .trace)(poem_dsl::Platform::Cuda);
+        .trace(poem::Platform::Cuda);
     let window = window_of(&trace).expect("every sliding read looks through the window");
     assert_eq!(window, Some(1024));
     let at = |context: u32| {
@@ -502,10 +502,7 @@ fn the_declared_pool_is_sized_to_what_the_card_hands_out() {
 }
 
 fn the_boot_carries_the_fraction_and_absence_is_the_configs_default() {
-    engine_cuda::open(boot_with(0.75), no_contract(), |name| {
-        models::sku(name).map(|sku| sku.classify)
-    })
-    .expect("a fraction in range opens");
+    engine_cuda::open(boot_with(0.75), no_contract()).expect("a fraction in range opens");
 
     assert!(
         (Knobs::default().gpu_mem_utilization - engine_cuda::DEFAULT_GPU_MEM_UTILIZATION).abs()
@@ -520,19 +517,14 @@ fn the_boot_carries_the_fraction_and_absence_is_the_configs_default() {
         "a boot that states nothing is the same answer"
     );
 
-    engine_cuda::open(boot_with(1.0), no_contract(), |name| {
-        models::sku(name).map(|sku| sku.classify)
-    })
-    .expect("the whole card opens");
+    engine_cuda::open(boot_with(1.0), no_contract()).expect("the whole card opens");
 }
 
 fn an_out_of_range_fraction_refuses_at_boot_by_the_knobs_name() {
     for fraction in [0.0, 1.5, -0.25, f64::NAN, f64::INFINITY] {
-        let refusal = engine_cuda::open(boot_with(fraction), no_contract(), |name| {
-            models::sku(name).map(|sku| sku.classify)
-        })
-        .err()
-        .unwrap_or_else(|| panic!("`{fraction}` is not a deployment"));
+        let refusal = engine_cuda::open(boot_with(fraction), no_contract())
+            .err()
+            .unwrap_or_else(|| panic!("`{fraction}` is not a deployment"));
         assert!(
             refusal.contains("gpu_mem_utilization"),
             "the refusal names the knob; got: {refusal}"

@@ -587,6 +587,7 @@ impl Engine for Metal {
             device_channel_commit: false,
             rs_verbs: shell.serves_rs_verbs(),
             bidirectional_attention: true,
+            facts: shell.trace().facts.clone(),
         };
 
         self.shell = Some(shell);

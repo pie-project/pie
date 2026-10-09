@@ -380,6 +380,7 @@ mod tests {
 
     fn trace(names: &[&str]) -> Trace {
         Trace {
+            facts: Default::default(),
             name: "qwen_3".to_string(),
             platform: poem_ir::Platform::Cuda,
             params: names

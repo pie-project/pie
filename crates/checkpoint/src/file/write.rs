@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use ztensor::format::cbor::{self, Value};
@@ -172,6 +172,13 @@ impl Writer {
                 }
             }
         }
+        // A key `family/…` written anew replaces its whole family: a file of a
+        // package rewritten without it is gone, not carried over.
+        let families: BTreeSet<&str> = metadata
+            .keys()
+            .filter_map(|key| key.rfind('/').map(|at| &key[..=at]))
+            .collect();
+        carried.retain(|key, _| !families.iter().any(|family| key.starts_with(family)));
         for (key, value) in metadata {
             carried.insert(key.clone(), value.clone());
         }

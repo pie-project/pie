@@ -1,5 +1,5 @@
 pub mod check;
-pub mod fuse;
+pub mod fact;
 pub mod guard;
 pub mod operands;
 pub mod ops;
@@ -11,14 +11,15 @@ pub use check::classes::{
     Class, ClassSet, ClassTable, Fault as ClassFault, fact_width, resolve_classes,
 };
 pub use check::{Fault, check, checked};
+pub use fact::{Builtin, Fact, Facts};
 pub use guard::Guard;
 pub use operands::Operands;
 pub use ops::{
-    Attention, Collective, CustomCuda, Elementwise, GateActivation, GridRule, Layout, Linear,
+    Attention, Collective, Elementwise, Fused, GateActivation, GridRule, Layout, Linear,
     ModulateForm, MropeForm, NormKind, Operation, RaggedMask, RopeForm, Spatial, TimePad,
     VoxelSegment,
 };
-pub use request::{ClassifyFn, Request, Stream};
+pub use request::{Request, Stream};
 pub use trace::{
     BlockDrafter, CacheRow, Node, Param, ParamLayout, ParamSource, Platform, Seam, Shard, Trace,
 };

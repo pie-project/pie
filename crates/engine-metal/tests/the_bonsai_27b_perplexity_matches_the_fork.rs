@@ -36,7 +36,7 @@
 //! * `FORK_PPL`    — the fork's reported PPL over these chunks (optional; defaults to 7.9468, the regenerated `prism`-fork reference for the committed ids). The delta is asserted within `PPL_TOL`.
 //! * `PPL_TOL`     — allowed relative |pie-fork|/fork (default 0.03 = 3%).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use checkpoint::executor::Execution;
@@ -44,13 +44,10 @@ use checkpoint::file::read::parse_metadata;
 use checkpoint::file::write::Writer;
 use checkpoint::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 
-use engine_metal::weights::AdapterPlane;
 use engine_metal::{Boot, Lane, Shell};
-use models::qwen_3::forward::Facts;
-use models::qwen_3::model::Model;
-use models::qwen_3::rotation::{self, BONSAI_SIGN_WIDTHS};
+use models::star::{import_of, trace_of};
+use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Classify, Dtype, Platform, Request, trace_hybrid};
 
 fn gguf_path() -> Option<PathBuf> {
     let p = std::env::var_os("BONSAI_GGUF")?;
@@ -100,10 +97,14 @@ fn import_zt(gguf: &Path, out: &Path) {
     eprintln!("ppl: importing {gguf:?} -> {out:?} (one-time 6 GB decode)");
     let metadata = parse_metadata(gguf).expect("parse the GGUF metadata");
     let src = ztensor_compat::index(gguf).expect("open the GGUF as a source");
-    let model = Model::d27b_bonsai(Dtype::Ptq1_0, Dtype::Bf16, 1);
-    let contract = model
-        .import_from_gguf(&src, Platform::Metal)
-        .expect("the d27b_bonsai contract reads every plane of the Bonsai GGUF");
+    let contract = import_of(
+        "qwen36-27b-bonsai",
+        Dtype::Ptq1_0,
+        Dtype::Bf16,
+        &src,
+        Platform::Metal,
+    )
+    .expect("the qwen36-27b-bonsai contract reads every plane of the Bonsai GGUF");
     drop(src);
 
     let target = StorageTarget {
@@ -133,10 +134,6 @@ fn import_zt(gguf: &Path, out: &Path) {
         writer.add_tensor(decl, bytes).expect("write the plane");
     }
     writer.finish().expect("finish the artifact");
-}
-
-fn word(len: usize) -> u64 {
-    Facts::of(&Request::new(len as u32, false)).word()
 }
 
 /// -log softmax(logits)[target], numerically stable (full-vocab, as the fork).
@@ -186,10 +183,14 @@ fn the_bonsai_27b_perplexity_matches_the_fork() {
     import_zt(&gguf, &zt);
 
     // Serve setup — identical to the oracle test.
-    let model = Model::d27b_bonsai(Dtype::Ptq1_0, Dtype::Bf16, 1);
-    let trace = trace_hybrid("d27b-bonsai", &model, Platform::Metal);
+    let trace = trace_of(
+        "qwen36-27b-bonsai",
+        Dtype::Ptq1_0,
+        Dtype::Bf16,
+        Platform::Metal,
+    );
     let src = ztensor_compat::index(&zt).expect("open the served artifact");
-    let contract = checkpoint_dsl::own_contract(&src, &trace.params, 1, Platform::Metal)
+    let contract = poem::import::own_contract(&src, &trace.params, 1, Platform::Metal)
         .expect("the artifact holds every checkpoint plane the trace reads");
     drop(src);
     let planes =
@@ -224,36 +225,6 @@ fn the_bonsai_27b_perplexity_matches_the_fork() {
         Err(other) => panic!("the Bonsai shell loads: {other}"),
     };
 
-    // Bind the three RHT sign diagonals (identical to the oracle test).
-    let signs = rotation::signs_from_gguf(
-        &ztensor_compat::index(&gguf).expect("reopen the GGUF for its sign metadata"),
-    )
-    .expect("decode the Bonsai sign diagonals");
-    let sign_bytes: Vec<(String, Vec<u8>)> = BONSAI_SIGN_WIDTHS
-        .iter()
-        .map(|&w| {
-            let sv = signs
-                .get(&w)
-                .unwrap_or_else(|| panic!("the GGUF carries no sign width {w}"));
-            (rotation::sign_param_name(w), sv.to_bf16_le_bytes())
-        })
-        .collect();
-    let declared: BTreeSet<String> = shell.bank_seats().into_iter().map(|s| s.name).collect();
-    for (name, bytes) in &sign_bytes {
-        if !declared.contains(name) {
-            continue;
-        }
-        shell
-            .register_adapter(
-                0,
-                &[AdapterPlane {
-                    bank: name.as_str(),
-                    bytes: bytes.as_slice(),
-                }],
-            )
-            .unwrap_or_else(|why| panic!("bind the sign bank `{name}`: {why}"));
-    }
-
     // Teacher-forced NLL, mirroring the fork's per-chunk window.
     let started = std::time::Instant::now();
     let mut nll = 0.0f64;
@@ -270,7 +241,7 @@ fn the_bonsai_27b_perplexity_matches_the_fork() {
         let out = shell
             .fire(&[Lane {
                 slot: 0,
-                word: word(prefill.len()),
+                word: trace.facts.word(&Request::new(prefill.len() as u32, false)),
                 tokens: prefill,
             }])
             .expect("the chunk prefill fires");
@@ -286,7 +257,7 @@ fn the_bonsai_27b_perplexity_matches_the_fork() {
             let out = shell
                 .fire(&[Lane {
                     slot: 0,
-                    word: word(1),
+                    word: trace.facts.word(&Request::new(1, false)),
                     tokens: &fed,
                 }])
                 .unwrap_or_else(|why| panic!("decode p={p} (chunk {c}) fires: {why}"));

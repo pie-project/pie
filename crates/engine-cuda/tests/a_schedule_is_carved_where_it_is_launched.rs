@@ -2,7 +2,7 @@
 
 mod common_dit;
 
-use common_dit::{Lcg, NAME, Rig, StreamFacts, WIDTH, Weights, attach, bf, frame, lane};
+use common_dit::{Lcg, NAME, Rig, WIDTH, Weights, attach, bf, frame, lane};
 use engine::Engine;
 use engine::fire::{LaneStream, ReadoutSeam};
 use engine_cuda::Recording;
@@ -10,7 +10,8 @@ use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceCon
 use eta_ir::op::{IntrinsicId, Op};
 use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype as EtaDtype, Shape};
-use poem_dsl::{
+use poem::fact;
+use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Stream, Trace, Value, Weight,
     ops, seam, trace_hybrid,
 };
@@ -26,8 +27,6 @@ const TEXT_ROWS: u32 = 6;
 struct TokensAndLatents;
 
 impl ForwardHybrid for TokensAndLatents {
-    type Facts = StreamFacts;
-
     fn caches(&self) -> HybridSpec {
         let mut spec = HybridSpec::new();
         let space = spec.kv_space(Dtype::Bf16);
@@ -36,8 +35,11 @@ impl ForwardHybrid for TokensAndLatents {
         spec
     }
 
-    fn forward(&self, inputs: Input<StreamFacts>) -> Value {
-        let (txt, img) = inputs.split(&StreamFacts::on(Stream::Text));
+    fn forward(&self, inputs: Input) -> Value {
+        let (txt, img) = (
+            inputs.on(fact::stream(Stream::Text)),
+            inputs.on(!fact::stream(Stream::Text)),
+        );
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
@@ -137,7 +139,7 @@ fn the_token_reading_fires_alone() {
         .collect();
     rig.publish(handles.instance, 0, &cell);
 
-    let mut text = lane(0, &handles, LaneStream::Text, 0);
+    let mut text = lane(&rig, 0, &handles, LaneStream::Text, 0);
     text.tokens = (0..TEXT_ROWS).map(|r| r % VOCAB).collect();
     text.ports.clear();
 

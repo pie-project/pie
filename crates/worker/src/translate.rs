@@ -26,18 +26,18 @@ pub fn build(
     Ok(runtime_config(user, home, builtins, model))
 }
 
-/// A runtime with no engine over `artifact`, keyed by its stamped `sku`.
+/// A runtime with no engine over `artifact`, keyed by its stamped `deployment`.
 pub fn build_without_engine(
     user: &config::Config,
     home: &Path,
     builtins: Vec<runtime::bootstrap::BuiltinProgram>,
     artifact: &Path,
-    sku: &str,
+    deployment: &str,
     metadata: runtime::model::ModelMetadata,
 ) -> runtime::bootstrap::Config {
     let model = runtime::bootstrap::ModelConfig {
         name: user.model.name.clone(),
-        model_id: sku.to_string(),
+        model_id: deployment.to_string(),
         kv_page_size: ENGINELESS_PAGE_SIZE as usize,
         tokenizer_path: artifact.to_path_buf(),
         metadata,
@@ -158,6 +158,7 @@ fn build_model(
                 has_attn_score: g.caps.profile.has_attn_score,
                 has_lora: g.caps.profile.has_lora,
                 device_geometry_port_mask: g.caps.ports,
+                facts: g.caps.facts.clone(),
                 limits: runtime::engine::SchedulerLimits {
                     max_forward_requests: g.caps.limits.max_lanes as usize,
                     max_forward_tokens: g.caps.limits.max_tokens as usize,

@@ -37,8 +37,9 @@ pub struct Schedule {
     pub pinned_sigmas: Vec<f32>,
 }
 
-pub fn of(sku: Option<&str>) -> Option<GenerativeFacts> {
-    let generative = models::sku(sku?)?.generative.as_ref()?;
+pub fn of(deployment: Option<&str>) -> Option<GenerativeFacts> {
+    let deployment = models::Deployment::parse(deployment?)?;
+    let generative = deployment.generative.as_ref()?;
     Some(GenerativeFacts {
         readings: generative.readings.iter().map(reading).collect(),
         latent: generative.latent.map(|l| Latent {
@@ -196,8 +197,8 @@ mod tests {
     }
 
     fn a_text_row_reports_nothing_here() {
-        let text = models::skus()
-            .find(|sku| sku.generative.is_none())
+        let text = models::deployments()
+            .find(|deployment| deployment.generative.is_none())
             .expect("the catalog ships text rows");
         assert!(of(Some(&text.name)).is_none());
         assert!(of(None).is_none());

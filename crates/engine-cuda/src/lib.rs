@@ -30,6 +30,16 @@ pub const EXCLUSIVE: [&str; 0] = [];
 
 pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
 
+/// The fused kernels this backend ships: every one the compiler forms.
+pub static FUSED: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| poem_compiler::fuse::kernels().collect());
+
+/// The fused kernels left on with `fuse-chains=off`.
+pub const UNCHAINED: [&str; 2] = [
+    "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
+    "elementwise.residual_add_rmsnorm",
+];
+
 #[must_use]
 pub fn shifted(op: &str) -> bool {
     matches!(
@@ -45,7 +55,7 @@ pub fn lane_shifted(op: &str) -> bool {
     kernels_cuda::seat::reads(op) == Reads::RowsAndLanes
 }
 
-pub use api::{ClassifyFor, ContractFor, Cuda, DeviceBoot, World};
+pub use api::{ContractFor, Cuda, DeviceBoot, World};
 pub use boot::{open, ordinal_of};
 pub use error::{Fault, Result};
 pub use group::{Group, open_group};

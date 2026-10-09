@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use engine_metal::{Boot, Lane, Shell};
+use poem::{Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Platform, Request};
 
 fn argmax(logits: &[f32]) -> u32 {
     let mut best = 0usize;
@@ -40,7 +40,7 @@ fn every_probe_is_dumped() {
         std::env::var("PIE_PARITY_OUT"),
     ) else {
         eprintln!(
-            "not asked: set PIE_PARITY_PROBES and PIE_PARITY_OUT, and PIE_PARITY_ARTIFACT or PIE_PARITY_SNAPSHOT + PIE_PARITY_SKU"
+            "not asked: set PIE_PARITY_PROBES and PIE_PARITY_OUT, and PIE_PARITY_ARTIFACT or PIE_PARITY_SNAPSHOT + PIE_PARITY_DEPLOYMENT"
         );
         return;
     };
@@ -55,7 +55,7 @@ fn every_probe_is_dumped() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(512);
 
-    let (artifact, sku, contract) = match (
+    let (artifact, deployment, contract) = match (
         std::env::var("PIE_PARITY_ARTIFACT"),
         std::env::var("PIE_PARITY_SNAPSHOT"),
     ) {
@@ -64,23 +64,30 @@ fn every_probe_is_dumped() {
             let stamp = checkpoint::file::serve::stamp_of(&artifact)
                 .expect("the artifact reads")
                 .expect("the artifact carries a serving stamp");
-            let sku = models::sku(&stamp.sku).unwrap_or_else(|| panic!("no SKU {}", stamp.sku));
-            let trace = (sku.trace)(Platform::Metal);
+            let deployment = models::deployment(&stamp.deployment)
+                .unwrap_or_else(|| panic!("no deployment {}", stamp.deployment));
+            let trace = deployment.trace(Platform::Metal);
             let source = ztensor_compat::index(&artifact).expect("the artifact opens");
-            let contract = checkpoint_dsl::own_contract(
+            let contract = poem::import::own_contract(
                 &source,
                 &trace.params,
-                sku.recipe.tp,
+                deployment.deploy.tp,
                 Platform::Metal,
             )
-            .unwrap_or_else(|why| panic!("the artifact holds every plane of {}: {why}", sku.name));
-            (artifact, sku, contract)
+            .unwrap_or_else(|why| {
+                panic!(
+                    "the artifact holds every plane of {}: {why}",
+                    deployment.name
+                )
+            });
+            (artifact, deployment, contract)
         }
         (_, Ok(snapshot)) => {
             let snapshot = PathBuf::from(snapshot);
-            let name = std::env::var("PIE_PARITY_SKU")
-                .expect("PIE_PARITY_SKU names the row that reads the snapshot");
-            let sku = models::sku(&name).unwrap_or_else(|| panic!("no SKU {name}"));
+            let name = std::env::var("PIE_PARITY_DEPLOYMENT")
+                .expect("PIE_PARITY_DEPLOYMENT names the row that reads the snapshot");
+            let deployment =
+                models::deployment(&name).unwrap_or_else(|| panic!("no deployment {name}"));
             let mut shards: Vec<PathBuf> = if snapshot.is_dir() {
                 std::fs::read_dir(&snapshot)
                     .expect("the snapshot lists")
@@ -95,18 +102,21 @@ fn every_probe_is_dumped() {
             };
             shards.sort();
             let source = ztensor_compat::index_all(&shards).expect("the snapshot opens");
-            let contract = sku
+            let contract = deployment
                 .contract(&source, Platform::Metal)
                 .unwrap_or_else(|why| panic!("{name}'s import reads the snapshot: {why}"));
-            (snapshot, sku, contract)
+            (snapshot, deployment, contract)
         }
         _ => {
-            eprintln!("not asked: set PIE_PARITY_ARTIFACT or PIE_PARITY_SNAPSHOT + PIE_PARITY_SKU");
+            eprintln!(
+                "not asked: set PIE_PARITY_ARTIFACT or PIE_PARITY_SNAPSHOT + PIE_PARITY_DEPLOYMENT"
+            );
             return;
         }
     };
-    let trace = (sku.trace)(Platform::Metal);
-    let word = |query_len: u32| (sku.classify)(&Request::new(query_len, false));
+    let trace = deployment.trace(Platform::Metal);
+    let facts = deployment.trace(models::Platform::Metal).facts;
+    let word = |query_len: u32| facts.word(&Request::new(query_len, false));
 
     let booted = Instant::now();
     let mut shell = Shell::load(Boot {
@@ -128,7 +138,7 @@ fn every_probe_is_dumped() {
     .expect("the shell loads");
     eprintln!(
         "loaded {} on {} in {:.1}s",
-        sku.name,
+        deployment.name,
         shell.device_name(),
         booted.elapsed().as_secs_f64()
     );

@@ -248,7 +248,7 @@ fn copyable(trace: &Trace, region: &Region) -> bool {
             Operation::Elementwise(op) => collect!(op),
             Operation::Layout(op) => collect!(op),
             Operation::Collective(op) => collect!(op),
-            Operation::CustomCuda(op) => collect!(op),
+            Operation::Fused(op) => collect!(op),
             Operation::Spatial(op) => collect!(op),
         }
     }

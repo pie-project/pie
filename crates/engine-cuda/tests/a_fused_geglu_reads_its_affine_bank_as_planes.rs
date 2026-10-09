@@ -4,12 +4,9 @@ use std::path::{Path, PathBuf};
 
 use checkpoint::contract::ModelContract;
 use engine_cuda::{Boot, Diagnostics, Graphs, Knobs, Lane, Shell};
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, trace_hybrid};
 use poem_compiler::Budget;
-use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, ops,
-    trace_hybrid,
-};
-use poem_ir::{Linear, Operation, Trace};
+use poem_ir::{Fused, Operation, Trace};
 
 const VOCAB: u32 = 1000;
 const HIDDEN: u64 = 512;
@@ -17,21 +14,6 @@ const INTER: u32 = 256;
 const GROUP: usize = 64;
 const PAGE: u32 = 16;
 const TOKENS: u32 = 8;
-
-struct NoFacts;
-
-impl Classify for NoFacts {
-    fn of(_: &Request) -> NoFacts {
-        NoFacts
-    }
-    fn word(&self) -> u64 {
-        0
-    }
-}
-
-fn classify(_: &Request) -> u64 {
-    0
-}
 
 struct Micro {
     embed: Weight,
@@ -52,13 +34,11 @@ impl Micro {
 }
 
 impl ForwardHybrid for Micro {
-    type Facts = NoFacts;
-
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let x = ops::layout::embed(&inputs.tokens(), &self.embed, VOCAB);
         let act =
             ops::linear::mlp_geglu_tanh_packed(&ops::linear::matmul(&x, &self.gate_up), INTER);
@@ -186,7 +166,7 @@ fn fixture() -> Fixture {
     let container = dir.join("micro.zt");
     write_checkpoint(&container);
     let source = ztensor::Source::open(&container).expect("the fixture opens");
-    let contract = checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Cuda)
+    let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
         .expect("a container of the plan's own planes is read by the plan's own names");
     drop(source);
     Fixture {
@@ -200,7 +180,6 @@ fn fixture() -> Fixture {
 fn fire(fixture: &Fixture, knobs: Knobs) -> engine_cuda::Result<Vec<f32>> {
     let ceiling = TOKENS.next_multiple_of(PAGE);
     let mut shell = Shell::load(Boot {
-        classify,
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
         checkpoint: &fixture.container,
@@ -240,12 +219,12 @@ fn a_fused_geglu_reads_its_affine_bank_as_planes() {
     }
     let fixture = fixture();
 
-    let fused = poem_ir::fuse::gemm_epilogues(fixture.trace.clone());
+    let fused = poem_compiler::fuse::fuse(fixture.trace.clone(), &["linear.matmul_geglu"]);
     assert!(
         fused
             .nodes
             .iter()
-            .any(|node| matches!(node.op, Operation::Linear(Linear::MatmulGeglu { .. }))),
+            .any(|node| matches!(node.op, Operation::Fused(Fused::MatmulGeglu { .. }))),
         "the gate-up matmul and the geglu over it fold into one epilogue, or this fires \
          nothing the row-major arm does not"
     );

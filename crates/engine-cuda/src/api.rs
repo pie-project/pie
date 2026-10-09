@@ -26,8 +26,6 @@ use crate::serve::{Attached, Boot, Graphs, Knobs, Lane, Seated, Shell};
 
 pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, String>;
 
-pub type ClassifyFor = fn(&str) -> Option<poem_ir::ClassifyFn>;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct World {
     pub rank: u32,
@@ -73,7 +71,6 @@ struct PendingStep {
 pub struct Cuda {
     boot: DeviceBoot,
     contract_for: ContractFor,
-    classify_for: ClassifyFor,
     shell: Option<Shell>,
     caps: Option<Capabilities>,
     next_fire: FireId,
@@ -86,12 +83,11 @@ pub struct Cuda {
 
 impl Cuda {
     #[must_use]
-    pub fn new(boot: DeviceBoot, contract_for: ContractFor, classify_for: ClassifyFor) -> Cuda {
+    pub fn new(boot: DeviceBoot, contract_for: ContractFor) -> Cuda {
         crate::serve::diag::publish(&boot.knobs.diagnostics);
         Cuda {
             boot,
             contract_for,
-            classify_for,
             shell: None,
             caps: None,
             next_fire: 1,
@@ -460,13 +456,6 @@ impl Engine for Cuda {
             ordinal,
             frames_in_flight,
         } = request;
-        let trace = poem_ir::fuse::residual_norm(trace);
-        let trace = if self.boot.knobs.diagnostics.fuse_chains {
-            poem_ir::fuse::residual_chains(trace)
-        } else {
-            trace
-        };
-
         if !self.boot.graphs.records() {
             eprintln!(
                 "engine-cuda: serving without CUDA graph capture ([engine] graphs = \
@@ -493,14 +482,7 @@ intended for diagnostics, not serving",
 
         let patches = patch_ladder(&trace, &budgets);
         let voxels = voxel_ladder(&trace, &budgets);
-        let classify = (self.classify_for)(&trace.name).ok_or_else(|| {
-            Error::Load(format!(
-                "this build ships no classifier for {:?}",
-                trace.name
-            ))
-        })?;
         let mut shell = Shell::load(Boot {
-            classify,
             trace,
             contract: &contract,
             checkpoint: &path,
@@ -616,6 +598,7 @@ intended for diagnostics, not serving",
             device_channel_commit: true,
             rs_verbs: true,
             bidirectional_attention: true,
+            facts: shell.trace().facts.clone(),
         };
 
         self.shell = Some(shell);
@@ -1330,6 +1313,7 @@ mod tests {
 
     fn trace_with(shape: Vec<Dim>) -> Trace {
         Trace {
+            facts: Default::default(),
             name: "gate".into(),
             platform: poem_ir::Platform::Cuda,
             params: Vec::new(),
@@ -1400,28 +1384,28 @@ mod tests {
     }
 }
 
-fn width_free(sku: &str) -> &str {
-    match sku.rsplit_once("-tp") {
+fn width_free(deployment: &str) -> &str {
+    match deployment.rsplit_once("-tp") {
         Some((base, width)) if !width.is_empty() && width.bytes().all(|b| b.is_ascii_digit()) => {
             base
         }
-        _ => sku,
+        _ => deployment,
     }
 }
 
 fn refuse_an_artifact_for_another_deployment(
     path: &std::path::Path,
     backend: &str,
-    sku: &str,
+    deployment: &str,
 ) -> EngineResult<()> {
     let stamp = match checkpoint::file::serve::stamp_of(path) {
         Ok(None) => return Ok(()),
         Ok(Some(stamp)) => stamp,
         Err(why) => return Err(Error::Load(why.to_string())),
     };
-    let deployment = checkpoint::serving::Stamp::of(backend, sku);
+    let wanted = checkpoint::serving::Stamp::of(backend, deployment);
     stamp
-        .check(&deployment)
+        .check(&wanted)
         .map_err(|mismatch| Error::Load(mismatch.refuse(&path.display().to_string())))
 }
 
@@ -1432,12 +1416,12 @@ mod serving_stamp_tests {
     use checkpoint::serving::Stamp;
     use std::collections::BTreeMap;
 
-    fn artifact(dir: &std::path::Path, backend: &str, sku: &str) -> std::path::PathBuf {
-        let path = dir.join(format!("{backend}-{sku}.zt"));
+    fn artifact(dir: &std::path::Path, backend: &str, deployment: &str) -> std::path::PathBuf {
+        let path = dir.join(format!("{backend}-{deployment}.zt"));
         let bytes = vec![7u8; 8192];
         emit::write(
             &path,
-            &Stamp::of(backend, sku),
+            &Stamp::of(backend, deployment),
             &BTreeMap::new(),
             4096,
             &[Object::leaf("embed", vec![8192], ztensor::Leaf::U8, &bytes)],

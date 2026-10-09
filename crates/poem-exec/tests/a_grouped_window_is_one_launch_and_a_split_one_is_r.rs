@@ -1,19 +1,18 @@
 use std::collections::HashMap;
 
+use poem::Platform;
 use poem_compiler::{Budget, CompiledModel, DeviceProfile, FamilyCosts, Lowering, Region, compile};
-use poem_dsl::Platform;
 use poem_exec::KernelError;
 use poem_exec::dispatch::{
-    DispatchAttention, DispatchCollective, DispatchCustomCuda, DispatchElementwise, DispatchLayout,
+    DispatchAttention, DispatchCollective, DispatchElementwise, DispatchFused, DispatchLayout,
     DispatchLinear, DispatchSpatial,
 };
 use poem_exec::fire::{EventId, Filter, FireDescriptor, Lane, Sink, compose, walk};
 use poem_ir::{
-    Attention, Collective, CustomCuda, Elementwise, Layout, Linear, Operands, Operation, Spatial,
-    Trace,
+    Attention, Collective, Elementwise, Fused, Layout, Linear, Operands, Operation, Spatial, Trace,
 };
 
-const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
+const DEPLOYMENT: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
 const CORRECTION: &str = "linear.lora_correct";
 
@@ -29,14 +28,13 @@ fn budget() -> Budget {
 }
 
 fn trace() -> Trace {
-    let trace = models::sku(SKU)
-        .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"))
-        .trace;
-    trace(Platform::Cuda)
+    models::deployment(DEPLOYMENT)
+        .unwrap_or_else(|| panic!("`{DEPLOYMENT}` is in the catalog"))
+        .trace(Platform::Cuda)
 }
 
 fn bake(trace: &Trace, profile: &DeviceProfile) -> CompiledModel {
-    compile(trace, &budget(), profile).unwrap_or_else(|why| panic!("`{SKU}` bakes: {why:?}"))
+    compile(trace, &budget(), profile).unwrap_or_else(|why| panic!("`{DEPLOYMENT}` bakes: {why:?}"))
 }
 
 fn split_arm() -> DeviceProfile {
@@ -130,7 +128,7 @@ fn payload(op: &Operation) -> usize {
         Operation::Elementwise(op) => address(op),
         Operation::Layout(op) => address(op),
         Operation::Collective(op) => address(op),
-        Operation::CustomCuda(op) => address(op),
+        Operation::Fused(op) => address(op),
         Operation::Spatial(op) => address(op),
     }
 }
@@ -162,8 +160,8 @@ impl DispatchCollective for MockDispatch {
         self.note(op)
     }
 }
-impl DispatchCustomCuda for MockDispatch {
-    fn dispatch(&mut self, op: &CustomCuda) -> Result<(), KernelError> {
+impl DispatchFused for MockDispatch {
+    fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         self.note(op)
     }
 }
@@ -224,12 +222,12 @@ fn walked(
 fn the_grouped_arm_pays_one_launch_where_the_split_arm_pays_r() {
     let trace = trace();
     let corrections = corrections(&trace);
-    assert!(!corrections.is_empty(), "the SKU states corrections");
+    assert!(!corrections.is_empty(), "the deployment states corrections");
 
     let split = bake(&trace, &split_arm());
     let grouped = bake(&trace, &grouped_arm());
     let lanes = one_lane_per_class(&split);
-    assert_eq!(lanes.len(), 12, "`{SKU}` resolves twelve classes");
+    assert_eq!(lanes.len(), 12, "`{DEPLOYMENT}` resolves twelve classes");
 
     let descriptor = fire(&split, &lanes);
     let mask = split
@@ -291,7 +289,7 @@ fn the_grouped_arm_pays_one_launch_where_the_split_arm_pays_r() {
     );
     assert!(
         compared > 0,
-        "the plan has nodes besides its corrections — `{SKU}`, twelve classes in one fire: \
+        "the plan has nodes besides its corrections — `{DEPLOYMENT}`, twelve classes in one fire: \
          adapter window = {r} intervals, correction launches {r} -> 1 per node over {} nodes",
         corrections.len(),
     );

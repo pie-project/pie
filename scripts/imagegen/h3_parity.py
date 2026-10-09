@@ -13,7 +13,7 @@ into an `.npz` under the golden's own key names, and diffs the two with
 
     # 1. import the miniature it wrote, and point a PRIVATE config at it
     pie model import $PIE_IMAGEGEN_GOLDEN/minimax_h3/h3_mini.safetensors \\
-        --sku minimax-h3-mini-bf16-kv-bf16
+        --deployment minimax-h3-mini-bf16-kv-bf16
     #    ~/.pie/config.h3-mini.toml with its own [server] port and
     #    [engine] max_model_len >= packed rows x submit depth
 

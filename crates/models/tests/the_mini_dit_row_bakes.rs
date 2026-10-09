@@ -1,14 +1,15 @@
 use std::collections::BTreeSet;
 
-use models::mini_dit::forward::Facts;
-use models::mini_dit::model;
+pub mod mini_dit_dims;
+
+use mini_dit_dims as model;
 use models::{PortKind, ReadoutKind};
-use poem_dsl::{
-    Attention, Classify, Def, Dim, Dtype, Elementwise, GeomKind, Guard, Operands, Operation,
-    Platform, Request, RopeForm, RuntimeInput, Stream, Trace, Ty, ValueId, seam,
+use poem::{
+    Attention, Def, Dim, Dtype, Elementwise, GeomKind, Guard, Operands, Operation, Platform,
+    Request, RopeForm, RuntimeInput, Stream, Trace, Ty, ValueId, seam,
 };
 
-const SKU: &str = "mini-dit-bf16-kv-bf16";
+const DEPLOYMENT: &str = "mini-dit-bf16-kv-bf16";
 
 const PLATFORMS: [Platform; 4] = [
     Platform::Cuda,
@@ -18,11 +19,11 @@ const PLATFORMS: [Platform; 4] = [
 ];
 
 fn trace(platform: Platform) -> Trace {
-    let row = models::sku(SKU).unwrap_or_else(|| {
-        let names: Vec<&str> = models::skus().map(|row| row.name.as_str()).collect();
-        panic!("this build ships no `{SKU}`; rows are {names:#?}")
+    let row = models::deployment(DEPLOYMENT).unwrap_or_else(|| {
+        let names: Vec<&str> = models::deployments().map(|row| row.name.as_str()).collect();
+        panic!("this build ships no `{DEPLOYMENT}`; rows are {names:#?}")
     });
-    (row.trace)(platform)
+    row.trace(platform)
 }
 
 #[test]
@@ -125,14 +126,13 @@ fn the_row_reads_exactly_the_five_ports_it_declares() {
 
 fn each_stream_classifies_into_its_own_class_and_every_merge_resolves() {
     let plan = trace(Platform::Cuda);
-    let classes = poem_dsl::resolve_classes(&plan).expect("every merge resolves");
-    let row = models::sku(SKU).expect("the row is in the catalog");
+    let classes = poem::resolve_classes(&plan).expect("every merge resolves");
+    let _row = models::deployment(DEPLOYMENT).expect("the row is in the catalog");
 
     let mut seen = Vec::new();
     for stream in [Stream::Text, Stream::Image, Stream::Context] {
         let request = Request::new(1, false).on_stream(stream);
-        let word = (row.classify)(&request);
-        assert_eq!(word, Facts::of(&request).word(), "{stream:?}");
+        let word = plan.facts.word(&request);
         let class = classes
             .class_of(word & classes.mask)
             .unwrap_or_else(|| panic!("a {stream:?} lane has no class"));
@@ -193,7 +193,7 @@ fn the_joint_attention_is_self_paired_and_the_cross_attention_is_not() {
         joint,
         "blocks 0 and 1 pack one sequence"
     );
-    let word = |stream: Stream| Facts::of(&Request::new(1, false).on_stream(stream)).word();
+    let word = |stream: Stream| plan.facts.word(&Request::new(1, false).on_stream(stream));
     assert!(joint.holds(word(Stream::Text)));
     assert!(joint.holds(word(Stream::Image)));
     assert!(!joint.holds(word(Stream::Context)));
@@ -363,7 +363,7 @@ fn the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk() {
 }
 
 fn the_generative_facts_are_the_ports_the_trace_reads() {
-    let row = models::sku(SKU).expect("the row is in the catalog");
+    let row = models::deployment(DEPLOYMENT).expect("the row is in the catalog");
     let facts = row
         .generative
         .as_ref()
@@ -371,7 +371,7 @@ fn the_generative_facts_are_the_ports_the_trace_reads() {
     assert_eq!(facts.readings.len(), 1, "one reading, today");
     let reading = &facts.readings[0];
     assert_eq!(reading.name, "denoise");
-    assert_eq!(reading.index, models::mini_dit::forward::DENOISE_READING);
+    assert_eq!(reading.index, model::DENOISE_READING);
     assert!(!reading.has_kv, "a denoise pass binds no kv");
     assert!(!reading.takes_tokens, "and embeds no tokens");
     assert_eq!(

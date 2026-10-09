@@ -70,9 +70,8 @@ objc2-metal = { version = "0.3", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-checkpoint-dsl = { path = "../checkpoint-dsl" }
+poem = { package = "pie-poem", path = "../poem" }
 models = { path = "../models" }
-poem-dsl = { package = "pie-poem-dsl", path = "../poem-dsl" }
 tokenizer = { path = "../tokenizer" }
 serde_json = "1"
 ztensor = { workspace = true }

@@ -12,10 +12,9 @@ seed), and the seed fire itself lands a unit-variance draw.
 **WANTS A LOAD WITH A LATENT READING, AND SAYS SO RATHER THAN FAILING.** A
 text row declares no readings, and the probe refuses it by name; that is the
 correct answer for that load, reported as a skip. The run that means to
-exercise the door names the mini-DiT row (the family lands in a later round):
+exercise the door serves the mini-DiT:
 
-    tests/examples/test_latent_probe.py --model <mini-dit checkpoint> \\
-        --sku mini-dit-bf16-kv-bf16
+    tests/examples/test_latent_probe.py --model <mini-dit checkpoint>
 
 Run from the repo root with PYTHONPATH=packages/python/server/python.
 """

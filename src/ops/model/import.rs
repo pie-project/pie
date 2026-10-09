@@ -31,7 +31,7 @@ pub struct ImportArgs {
     #[arg(long, value_name = "NAME", conflicts_with = "aux")]
     pub drafter: Option<String>,
     #[arg(long, value_name = "NAME")]
-    pub sku: Option<String>,
+    pub deployment: Option<String>,
     #[arg(long)]
     pub out: Option<PathBuf>,
     #[arg(long)]
@@ -80,7 +80,7 @@ pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<cra
                 args.source,
                 if known.is_empty() {
                     "this build knows no head for that target — pass the head with `--aux` and \
-                     the row with `--sku`"
+                     the deployment with `--deployment`"
                         .to_string()
                 } else {
                     format!("it knows {}", known.join(", "))
@@ -88,12 +88,13 @@ pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<cra
             );
         };
         args.aux = Some(published.head.to_string());
-        if args.sku.is_none() {
-            args.sku = Some(published.sku.to_string());
+        if args.deployment.is_none() {
+            args.deployment = Some(published.deployment.to_string());
         }
     }
-    if let Some(name) = args.sku.as_deref() {
-        runtime::engine::load::row_named(name).map_err(|why| anyhow!("--sku {name}: {why:#}"))?;
+    if let Some(name) = args.deployment.as_deref() {
+        runtime::engine::load::deployment(name)
+            .map_err(|why| anyhow!("--deployment {name}: {why:#}"))?;
     }
     let mut source = resolve_source(&args.source)?;
     if consuming_marker(&source.path).is_file() {
@@ -167,7 +168,12 @@ pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<cra
     }
     let platform = engine_or_refuse()?;
     if out_file.exists() && !args.force {
-        if let Some(reason) = staleness(&out_file, platform, &source.origin, args.sku.as_deref()) {
+        if let Some(reason) = staleness(
+            &out_file,
+            platform,
+            &source.origin,
+            args.deployment.as_deref(),
+        ) {
             println!(
                 "{}: rebuilding {} ({reason})",
                 source.name,
@@ -201,19 +207,20 @@ pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<cra
         merge_metadata(&mut metadata, overlay.metadata.clone());
     }
     let metadata = metadata;
-    let (sku, contract) = choose_row(
-        args.sku.as_deref(),
+    let (deployment, contract) = choose_deployment(
+        args.deployment.as_deref(),
         &opened,
         &metadata,
         platform,
         &source.path,
     )?;
+    let deployment = deployment.as_str();
     drop(opened);
-    refuse_a_decode_of_packed_codes(sku, &contract, &metadata)?;
+    refuse_a_decode_of_packed_codes(deployment, &contract, &metadata)?;
     let attributes = gguf_attributes(&source, &metadata);
 
     let landing = checkpoint::plan::compile(&metadata, &contract, decode_target())
-        .map_err(|err| anyhow!("{sku}: the contract does not fit this checkpoint: {err}"))?;
+        .map_err(|err| anyhow!("{deployment}: the contract does not fit this checkpoint: {err}"))?;
     let split = split_contract(&contract, &landing, &metadata)?;
     let read: BTreeSet<&str> = contract
         .tensors
@@ -225,7 +232,7 @@ pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<cra
         .filter(|tensor| !read.contains(tensor.name.as_str()))
         .count();
     println!(
-        "convert: {sku} lands {} plane(s): {} copied through, {} transformed here; \
+        "convert: {deployment} lands {} plane(s): {} copied through, {} transformed here; \
          {unread} source tensor(s) no plane reads are left out",
         split.copies.len()
             + split
@@ -321,8 +328,8 @@ pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<cra
         .map(|raw| raw.span_bytes)
         .sum();
 
-    let stamp = checkpoint::serving::Stamp::of(&backend_word(platform), sku);
-    let trace = runtime::engine::load::trace(sku, platform)?;
+    let stamp = checkpoint::serving::Stamp::of(&backend_word(platform), deployment);
+    let trace = runtime::engine::load::trace(deployment, platform)?;
     let ranked = runtime::engine::load::sequence(&trace);
     let groups = groups_of(&landing, &trace)?;
     let entries = merge_order(
@@ -384,7 +391,7 @@ pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<cra
             )
         );
         return Ok(crate::ui::Answer::noop(format!(
-            "dry run: would write {} as `{sku}`",
+            "dry run: would write {} as `{deployment}`",
             crate::ui::short_path(&specialized_path(
                 &out_file,
                 &source.name,
@@ -418,11 +425,12 @@ pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<cra
         _ => None,
     };
 
-    let provenance = BTreeMap::from([
+    let mut provenance = BTreeMap::from([
         (VERSION_KEY.to_string(), pie_version().to_string()),
         (SOURCE_KEY.to_string(), source.origin.clone()),
         (SOURCE_ENCODING_KEY.to_string(), source_encoding(&metadata)),
     ]);
+    provenance.extend(runtime::engine::load::package_attributes(deployment)?);
     let mut writer = Writer::create_serving(&out_file, &provenance, stamp.clone())
         .map_err(|err| anyhow!("cannot write the artifact: {err}"))?;
     for group in &groups {
@@ -539,29 +547,30 @@ fn overlay_onto_artifact(
         .with_context(|| "merge the overlay into the artifact's name space")?;
     merge_metadata(&mut metadata, overlay.metadata.clone());
     let metadata = metadata;
-    let (sku, contract) = choose_row(
-        args.sku.as_deref(),
+    let (deployment, contract) = choose_deployment(
+        args.deployment.as_deref(),
         &opened,
         &metadata,
         platform,
         &base_file,
     )?;
+    let deployment = deployment.as_str();
     drop(opened);
-    if sku == before.sku {
+    if deployment == before.deployment {
         bail!(
-            "{} already serves `{sku}`; the overlay lands on a row that reads the head, and \
-             identification chose the row it already was",
+            "{} already serves `{deployment}`; the overlay lands on a deployment that reads the head, and \
+             identification chose the one it already was",
             crate::ui::short_path(&base_file)
         );
     }
-    refuse_a_decode_of_packed_codes(sku, &contract, &metadata)?;
+    refuse_a_decode_of_packed_codes(deployment, &contract, &metadata)?;
 
     let is_head = |expr: &Expr| {
         let sources = expr.sources();
         !sources.is_empty() && sources.iter().all(|name| name.starts_with(AUX_PREFIX))
     };
     let landing = checkpoint::plan::compile(&metadata, &contract, decode_target())
-        .map_err(|err| anyhow!("{sku}: the contract does not fit this artifact: {err}"))?;
+        .map_err(|err| anyhow!("{deployment}: the contract does not fit this artifact: {err}"))?;
     let split = split_contract(&contract, &landing, &metadata)?;
     let copies: Vec<Copy<'_>> = split
         .copies
@@ -591,7 +600,7 @@ fn overlay_onto_artifact(
         .filter(|tensor| !is_head(&tensor.expr))
         .count();
     println!(
-        "overlay: {sku} lands {head_planes} head plane(s) onto {} ({} copied through, {} \
+        "overlay: {deployment} lands {head_planes} head plane(s) onto {} ({} copied through, {} \
          transformed here); {trunk_planes} trunk plane(s) stay where they are",
         crate::ui::short_path(&base_file),
         copies.len(),
@@ -602,7 +611,7 @@ fn overlay_onto_artifact(
             .count(),
     );
     if head_planes == 0 {
-        bail!("the overlay contributes no plane the row `{sku}` reads");
+        bail!("the overlay contributes no plane the deployment `{deployment}` reads");
     }
 
     let plan = if decode.tensors.is_empty() {
@@ -620,8 +629,8 @@ fn overlay_onto_artifact(
         .map(|raw| raw.span_bytes)
         .sum();
     let copy_bytes: u64 = copies.iter().map(|copy| copy.raw.span_bytes).sum();
-    let stamp = checkpoint::serving::Stamp::of(&backend_word(platform), sku);
-    let trace = runtime::engine::load::trace(sku, platform)?;
+    let stamp = checkpoint::serving::Stamp::of(&backend_word(platform), deployment);
+    let trace = runtime::engine::load::trace(deployment, platform)?;
     let ranked = runtime::engine::load::sequence(&trace);
     let groups = groups_of(&landing, &trace)?;
     let entries = merge_order(plan.as_ref(), &copies, &[], ranked.as_deref(), &groups);
@@ -635,7 +644,7 @@ fn overlay_onto_artifact(
     });
     if args.dry_run {
         return Ok(crate::ui::Answer::noop(format!(
-            "dry run: would append {} decoded and {} copied through to {} and restamp it `{sku}`",
+            "dry run: would append {} decoded and {} copied through to {} and restamp it `{deployment}`",
             crate::ui::bytes(decode_bytes),
             crate::ui::bytes(copy_bytes),
             crate::ui::short_path(&base_file)
@@ -667,10 +676,11 @@ fn overlay_onto_artifact(
     let held = std::fs::metadata(&base_file)
         .with_context(|| format!("stat {}", base_file.display()))?
         .len();
-    let provenance = BTreeMap::from([
+    let mut provenance = BTreeMap::from([
         (VERSION_KEY.to_string(), pie_version().to_string()),
         (SOURCE_KEY.to_string(), source.origin.clone()),
     ]);
+    provenance.extend(runtime::engine::load::package_attributes(deployment)?);
     let restore = |why: anyhow::Error| -> anyhow::Error {
         match std::fs::OpenOptions::new()
             .write(true)
@@ -739,10 +749,10 @@ fn overlay_onto_artifact(
     };
     if let Err(why) = runtime::engine::load::verify_artifact(&renamed, platform) {
         bail!(
-            "{}: the overlaid artifact does not load as `{sku}` ({why:#}); cut it back to \
+            "{}: the overlaid artifact does not load as `{deployment}` ({why:#}); cut it back to \
              {held} bytes and rename it for `{}` to restore the artifact",
             crate::ui::short_path(&renamed),
-            before.sku
+            before.deployment
         );
     }
     Ok(crate::ui::Answer::did(format!(
@@ -903,7 +913,7 @@ fn split_contract<'a>(
 }
 
 fn refuse_a_decode_of_packed_codes(
-    sku: &str,
+    deployment: &str,
     contract: &ModelContract,
     metadata: &Metadata,
 ) -> Result<()> {
@@ -913,7 +923,7 @@ fn refuse_a_decode_of_packed_codes(
         }
         if decodes_a_packed_plane(&tensor.expr, metadata, contract) {
             bail!(
-                "{sku}: `{}` decodes a plane the checkpoint stores packed, and the artifact \
+                "{deployment}: `{}` decodes a plane the checkpoint stores packed, and the artifact \
                  keeps a packed plane as stored",
                 tensor.name
             );
@@ -1404,33 +1414,34 @@ fn name_the_specialization(
     Ok(renamed)
 }
 
-fn choose_row(
+fn choose_deployment(
     named: Option<&str>,
     opened: &ztensor::Source,
     metadata: &Metadata,
     platform: Platform,
     checkpoint: &Path,
-) -> Result<(&'static str, ModelContract)> {
+) -> Result<(String, ModelContract)> {
     let Some(name) = named else {
         return runtime::engine::load::conversion_contract(opened, metadata, platform)
-            .ok_or_else(|| refuse_a_source_no_sku_in_this_build_claims(checkpoint));
+            .map(|(name, contract)| (name.to_string(), contract))
+            .ok_or_else(|| refuse_a_source_no_deployment_in_this_build_claims(checkpoint));
     };
     runtime::engine::load::conversion_contract_named(opened, metadata, platform, name).map_err(
         |why| {
             anyhow!(
-                "--sku {name}: {why:#}\n\
-                 This import converts for the row named and for no other; drop `--sku` to \
-                 convert {} for the first row whose contract fits it.",
+                "--deployment {name}: {why:#}\n\
+                 This import converts for the deployment named and for no other; drop \
+                 `--deployment` to convert {} for the first one whose contract fits it.",
                 crate::ui::short_path(checkpoint),
             )
         },
     )
 }
 
-fn refuse_a_source_no_sku_in_this_build_claims(checkpoint: &Path) -> anyhow::Error {
+fn refuse_a_source_no_deployment_in_this_build_claims(checkpoint: &Path) -> anyhow::Error {
     anyhow!(
-        "{}: no SKU this build ships claims this checkpoint, so nothing here can say \
-         what its planes are. The import performs a SKU's whole landing, so the artifact \
+        "{}: no deployment this build ships claims this checkpoint, so nothing here can say \
+         what its planes are. The import performs a deployment's whole landing, so the artifact \
          would hold the source's own tensors under the source's own names — a file that \
          converts, verifies and opens, and that no boot on any box with this catalog can \
          load. `pie model list` prints what a checkpoint identifies as.",
@@ -1489,7 +1500,7 @@ fn yields<'a>(
             .iter()
             .find(|declared| declared.name == *name)
             .map(|declared| &declared.encoding),
-        Expr::Fill { ty, .. } => Some(&ty.encoding),
+        Expr::Fill { ty, .. } | Expr::Const { ty, .. } => Some(&ty.encoding),
         Expr::Cast { to, .. } => Some(to),
         Expr::Transmute { to, .. } | Expr::Repack { to, .. } => Some(&to.encoding),
         Expr::Slice { src, .. }
@@ -1661,16 +1672,27 @@ fn staleness(
         Ok(None) => return Some("it carries no serving stamp".to_string()),
         Err(err) => return Some(format!("its serving stamp does not read back: {err}")),
     };
-    if let Some(asked) = asked.filter(|asked| *asked != stamp.sku) {
+    if let Some(asked) = asked.filter(|asked| *asked != stamp.deployment) {
         return Some(format!(
-            "it serves `{}` and `--sku {asked}` was asked for",
-            stamp.sku
+            "it serves `{}` and `--deployment {asked}` was asked for",
+            stamp.deployment
         ));
     }
-    if runtime::engine::load::trace(&stamp.sku, platform).is_err() {
-        return Some(format!("this build ships no SKU named `{}`", stamp.sku));
+    if runtime::engine::load::trace(&stamp.deployment, platform).is_err() {
+        return Some(format!(
+            "this build ships no deployment named `{}`",
+            stamp.deployment
+        ));
     }
-    let wanted = checkpoint::serving::Stamp::of(&backend_word(platform), &stamp.sku);
+    let carried = match runtime::engine::load::package_of(artifact) {
+        Ok(carried) => carried.map(|package| package.attributes()),
+        Err(err) => return Some(format!("{err:#}")),
+    };
+    let ships = runtime::engine::load::package_attributes(&stamp.deployment).ok();
+    if carried.unwrap_or_default() != ships.unwrap_or_default() {
+        return Some("the model package it carries is not the one this build ships".to_string());
+    }
+    let wanted = checkpoint::serving::Stamp::of(&backend_word(platform), &stamp.deployment);
     if let Err(mismatch) = stamp.check(&wanted) {
         return Some(mismatch.to_string());
     }
@@ -2101,8 +2123,8 @@ mod tests {
         a_store_archive_takes_its_name_from_its_directory();
         a_destination_that_is_the_source_is_recognized_through_a_symlink();
         the_row_override_parses_as_a_name_and_is_absent_by_default();
-        an_unknown_row_name_is_refused_with_the_catalog();
-        a_row_that_does_not_read_the_checkpoint_refuses_by_name();
+        an_unknown_deployment_name_is_refused_with_the_catalog();
+        a_deployment_that_does_not_read_the_checkpoint_refuses_by_name();
         the_chosen_row_is_in_the_filename_the_dry_run_reports();
         two_imports_beside_one_output_spool_apart();
     }
@@ -2262,32 +2284,37 @@ mod tests {
         }
 
         let plain = Just::parse_from(["pie", "google/gemma-4-E4B-it"]).args;
-        assert_eq!(plain.sku, None, "no flag is no override");
+        assert_eq!(plain.deployment, None, "no flag is no override");
 
         let named = Just::parse_from([
             "pie",
             "google/gemma-4-E4B-it",
-            "--sku",
+            "--deployment",
             "gemma4-e4b-vision-bf16-kv-bf16",
         ])
         .args;
-        assert_eq!(named.sku.as_deref(), Some("gemma4-e4b-vision-bf16-kv-bf16"));
+        assert_eq!(
+            named.deployment.as_deref(),
+            Some("gemma4-e4b-vision-bf16-kv-bf16")
+        );
 
-        assert!(Just::try_parse_from(["pie", "google/gemma-4-E4B-it", "--sku"]).is_err());
+        assert!(Just::try_parse_from(["pie", "google/gemma-4-E4B-it", "--deployment"]).is_err());
     }
 
-    fn an_unknown_row_name_is_refused_with_the_catalog() {
-        let why = runtime::engine::load::row_named("gemma4-vision")
-            .expect_err("no row carries that name")
+    fn an_unknown_deployment_name_is_refused_with_the_catalog() {
+        let why = runtime::engine::load::deployment("gemma4-vision")
+            .map(|_| ())
+            .expect_err("no deployment carries that name")
             .to_string();
         assert!(why.contains("gemma4-vision"), "{why}");
         assert!(
             why.contains("gemma4-e4b-vision-bf16-kv-bf16"),
-            "the refusal lists the rows this build ships, which is how an \
+            "the refusal lists the deployments this build ships, which is how an \
              operator finds the one they meant: {why}"
         );
-        let listed = runtime::engine::load::row_named("?")
-            .expect_err("`?` is not a row")
+        let listed = runtime::engine::load::deployment("?")
+            .map(|_| ())
+            .expect_err("`?` is not a deployment")
             .to_string();
         assert!(
             listed.contains("gemma4-e4b-vision-bf16-kv-bf16"),
@@ -2295,7 +2322,7 @@ mod tests {
         );
     }
 
-    fn a_row_that_does_not_read_the_checkpoint_refuses_by_name() {
+    fn a_deployment_that_does_not_read_the_checkpoint_refuses_by_name() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("stranger.zt");
         let mut writer = ztensor::Writer::create(&path).unwrap();
@@ -2314,18 +2341,18 @@ mod tests {
         let asked = "gemma4-e4b-vision-bf16-kv-bf16";
 
         assert!(
-            choose_row(None, &source, &metadata, Platform::Vulkan, &path).is_err(),
-            "a checkpoint of one stranger is claimed by no row"
+            choose_deployment(None, &source, &metadata, Platform::Vulkan, &path).is_err(),
+            "a checkpoint of one stranger is claimed by no deployment"
         );
 
         let why = format!(
             "{:#}",
-            choose_row(Some(asked), &source, &metadata, Platform::Vulkan, &path)
-                .expect_err("the named row does not read this checkpoint")
+            choose_deployment(Some(asked), &source, &metadata, Platform::Vulkan, &path)
+                .expect_err("the named deployment does not read this checkpoint")
         );
         assert!(
-            why.contains(asked) && why.contains("--sku"),
-            "the refusal names the row that was asked for, and the flag that \
+            why.contains(asked) && why.contains("--deployment"),
+            "the refusal names the deployment that was asked for, and the flag that \
              asked for it: {why}"
         );
         assert!(

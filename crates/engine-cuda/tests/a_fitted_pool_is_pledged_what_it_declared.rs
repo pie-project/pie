@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use engine::fire::{FoldLen, RsReset, RsVerb};
 use engine_cuda::device::elastic::budget_bytes;
 use engine_cuda::{Boot, Knobs, Lane, Seated, Shell};
+use poem::{Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Platform, Request};
 
-const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
+const DEPLOYMENT: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
 const PAGE: u32 = 16;
 const LANES: u32 = 16;
@@ -80,18 +80,17 @@ fn a_fitted_pool_is_pledged_what_it_declared() {
         eprintln!("{checkpoint:?} holds no tensor container");
         return;
     };
-    let sku = models::sku(SKU).expect("the catalog ships the SKU");
-    let trace = (sku.trace)(Platform::Cuda);
+    let deployment = models::deployment(DEPLOYMENT).expect("the catalog ships the deployment");
+    let trace = deployment.trace(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-    let contract = sku
+    let contract = deployment
         .contract(&source, Platform::Cuda)
-        .expect("the SKU's import contract fits its own checkpoint");
+        .expect("the deployment's import contract fits its own checkpoint");
     drop(source);
 
     let mut shell = Shell::load(Boot {
         voxels: None,
         deferred_tier: false,
-        classify: sku.classify,
         residency: engine_cuda::experts::Plan::default(),
         trace,
         contract: &contract,
@@ -159,7 +158,10 @@ fn a_fitted_pool_is_pledged_what_it_declared() {
     let readout: Vec<u32> = (0..rows).collect();
     let lane = Lane {
         slot: 0,
-        word: (sku.classify)(&Request::new(rows, false)),
+        word: deployment
+            .trace(models::Platform::Cuda)
+            .facts
+            .word(&Request::new(rows, false)),
         tokens: &tokens,
     };
     let verify = Seated {

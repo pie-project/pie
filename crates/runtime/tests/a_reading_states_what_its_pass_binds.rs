@@ -5,7 +5,7 @@ use runtime::model::{validate_generative, velocity_facts};
 
 fn text() -> ReadingFact {
     ReadingFact {
-        name: "text",
+        name: "text".to_string(),
         index: 0,
         has_kv: true,
         takes_tokens: true,
@@ -19,14 +19,14 @@ fn text() -> ReadingFact {
 
 fn denoise() -> ReadingFact {
     ReadingFact {
-        name: "denoise",
+        name: "denoise".to_string(),
         index: 1,
         has_kv: false,
         takes_tokens: false,
         streams: vec![Stream::Image],
         ports: vec![
             PortFact {
-                name: "latents",
+                name: "latents".to_string(),
                 kind: PortKind::Latents,
                 width: 64,
                 streams: Vec::new(),
@@ -34,7 +34,7 @@ fn denoise() -> ReadingFact {
                 rows: None,
             },
             PortFact {
-                name: "timestep",
+                name: "timestep".to_string(),
                 kind: PortKind::LaneVector,
                 width: 1,
                 streams: Vec::new(),
@@ -42,7 +42,7 @@ fn denoise() -> ReadingFact {
                 rows: None,
             },
             PortFact {
-                name: "positions",
+                name: "positions".to_string(),
                 kind: PortKind::AxisPositions,
                 width: 3,
                 streams: Vec::new(),
@@ -50,7 +50,7 @@ fn denoise() -> ReadingFact {
                 rows: None,
             },
             PortFact {
-                name: "context",
+                name: "context".to_string(),
                 kind: PortKind::Context,
                 width: 512,
                 streams: Vec::new(),
@@ -113,7 +113,7 @@ fn a_reading_resolves_its_ports_by_name_to_kind_relative_indices() {
 
     let mut two = denoise();
     two.ports.push(PortFact {
-        name: "guidance",
+        name: "guidance".to_string(),
         kind: PortKind::LaneVector,
         width: 1,
         streams: Vec::new(),
@@ -122,7 +122,10 @@ fn a_reading_resolves_its_ports_by_name_to_kind_relative_indices() {
     });
     let (index, _) = two.port("guidance").expect("declared");
     assert_eq!(index, 1, "the second lane vector is lane-vector port 1");
-    let indexed: Vec<(u8, &str)> = two.ports_indexed().map(|(i, p)| (i, p.name)).collect();
+    let indexed: Vec<(u8, &str)> = two
+        .ports_indexed()
+        .map(|(i, p)| (i, p.name.as_str()))
+        .collect();
     assert_eq!(
         indexed,
         vec![
@@ -154,7 +157,7 @@ fn duplicate_names_are_refused() {
 
     let mut twice = denoise();
     twice.ports.push(PortFact {
-        name: "latents",
+        name: "latents".to_string(),
         kind: PortKind::Latents,
         width: 64,
         streams: Vec::new(),
@@ -194,7 +197,7 @@ fn a_positions_port_carries_at_most_four_axes() {
 
 fn readings_that_disagree_on_the_velocity_width_are_refused() {
     let mut low = denoise();
-    low.name = "denoise.low";
+    low.name = "denoise.low".to_string();
     low.index = 2;
     low.readout_width = 128;
     let why = validate_generative(&family(vec![text(), denoise(), low])).unwrap_err();

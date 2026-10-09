@@ -210,7 +210,7 @@ fn land(
     platform: poem_ir::Platform,
     component: crate::executor::ModelComponent,
     frames_in_flight: u8,
-    sku: Option<&str>,
+    overrides: &runtime::engine::load::Overrides,
 ) -> Result<(engine::Loaded, String)> {
     if component != crate::executor::ModelComponent::Full {
         return Err(anyhow!(
@@ -218,8 +218,8 @@ fn land(
              does not ship"
         ));
     }
-    let mut request = runtime::engine::load::request_of(
-        sku,
+    let mut request = runtime::engine::load::request(
+        overrides,
         snapshot_dir,
         platform,
         budgets,
@@ -230,9 +230,9 @@ fn land(
     if request.residency.disk_kv_budget > 0 && request.residency.disk_kv_dir.is_none() {
         request.residency.disk_kv_dir = Some(crate::disk::kv_dir(cache_dir, snapshot_dir)?);
     }
-    let sku = request.trace.name.clone();
+    let deployment = request.trace.name.clone();
     let loaded = backend.load(request).map_err(anyhow::Error::from)?;
-    Ok((loaded, sku))
+    Ok((loaded, deployment))
 }
 
 fn register_operator_adapters(
@@ -294,7 +294,7 @@ pub(crate) fn create_engine_backend_group(
     residency: engine::Residency,
     patch_ceilings: (Option<u32>, Option<u32>),
     voxel_ceilings: (Option<u32>, Option<u32>),
-    sku: Option<&str>,
+    overrides: &runtime::engine::load::Overrides,
 ) -> Result<GroupEngine> {
     let cache_dir = &crate::disk::engine_cache_dir(home);
     validate_snapshot_dir(snapshot_dir)?;
@@ -327,22 +327,9 @@ pub(crate) fn create_engine_backend_group(
             "cuda group opened {opened} ranks for {ranks} rank configs"
         ));
     }
-    let widened;
-    let sku = match sku {
-        Some(named) => Some(named),
-        None if ranks > 1 => {
-            let base = runtime::engine::load::identify(snapshot_dir, poem_ir::Platform::Cuda)?;
-            widened = format!("{base}-tp{ranks}");
-            runtime::engine::load::trace(&widened, poem_ir::Platform::Cuda).with_context(|| {
-                format!(
-                    "{snapshot_dir:?} is `{base}`, and this build ships no {ranks}-rank \
-                         row for it (`{widened}`); add one to the catalog or serve it on \
-                         one device"
-                )
-            })?;
-            Some(widened.as_str())
-        }
-        None => None,
+    let overrides = &runtime::engine::load::Overrides {
+        tp: Some(u32::try_from(ranks).context("a rank count fits u32")?),
+        ..overrides.clone()
     };
     #[allow(
         irrefutable_let_patterns,
@@ -351,7 +338,7 @@ pub(crate) fn create_engine_backend_group(
     let EngineOptions::CudaNative(opts) = &rank_options[0] else {
         unreachable!("validated cuda options above");
     };
-    let (loaded, sku) = land(
+    let (loaded, deployment) = land(
         &mut backend,
         snapshot_dir,
         cache_dir,
@@ -360,12 +347,12 @@ pub(crate) fn create_engine_backend_group(
         poem_ir::Platform::Cuda,
         component,
         frames_in_flight,
-        sku,
+        overrides,
     )?;
     register_operator_adapters(&mut backend, adapters)?;
 
     Ok(GroupEngine {
-        sku,
+        deployment,
         caps: loaded.caps,
         facts: loaded.facts,
         snapshot_dir: snapshot_dir.to_path_buf(),
@@ -395,7 +382,7 @@ pub(crate) fn create_engine_backend(
     residency: engine::Residency,
     patch_ceilings: (Option<u32>, Option<u32>),
     voxel_ceilings: (Option<u32>, Option<u32>),
-    sku: Option<&str>,
+    overrides: &runtime::engine::load::Overrides,
     opened: Option<runtime::engine::EngineBox>,
 ) -> Result<GroupEngine> {
     let cache_dir = &crate::disk::engine_cache_dir(home);
@@ -609,7 +596,7 @@ pub(crate) fn create_engine_backend(
             reason = "`EngineOptions` has no variants in this build"
         )
     )]
-    let (loaded, sku) = land(
+    let (loaded, deployment) = land(
         &mut backend,
         snapshot_dir,
         cache_dir,
@@ -618,13 +605,13 @@ pub(crate) fn create_engine_backend(
         platform,
         component,
         frames_in_flight,
-        sku,
+        overrides,
     )?;
 
     register_operator_adapters(&mut backend, adapters)?;
 
     Ok(GroupEngine {
-        sku,
+        deployment,
         caps: loaded.caps,
         facts: loaded.facts,
         snapshot_dir: snapshot_dir.to_path_buf(),
@@ -706,7 +693,7 @@ mod tests {
 }
 
 pub struct GroupEngine {
-    pub sku: String,
+    pub deployment: String,
     pub caps: EngineCapabilities,
     pub facts: engine::LoadFacts,
     pub snapshot_dir: PathBuf,

@@ -48,7 +48,7 @@ from the app: the WebSocket and the OpenAI-compatible HTTP routes;
 ## Models
 
 `PieServer` takes a `.vulkan.zt` artifact from a Vulkan build of pie
-(`pie model import ... --sku <sku>`). The engine needs a GPU with Vulkan 1.1,
+(`pie model import ... --deployment <name>`). The engine needs a GPU with Vulkan 1.1,
 `shaderInt16` and 16-bit storage buffers.
 
 ## Build

@@ -57,29 +57,19 @@ fn silu(g: f32) -> f32 {
 }
 
 #[test]
-fn dense_projections_and_their_fused_forms_answer_the_host() {
+fn dense_projections_answer_the_host() {
     let (m, n, k) = (5usize, 10usize, 384usize);
     let xs = data(m * k, 1);
     let ws = data(n * k, 2);
-    let bias = data(n, 3);
-    let i = 6usize;
-    let gw = data(2 * i * k, 4);
     let (heads, d_rel, extent) = (3usize, 12usize, 20usize);
     let rx = data(m * heads * d_rel, 5);
     let rw = data(d_rel * extent, 6);
-    let cap = 5.0f32;
 
     let mut b = Bench::new();
     let x = b.bf16(m as u32, k as u32, &xs);
     let w = b.bf16(n as u32, k as u32, &ws);
-    let bi = b.bf16(1, n as u32, &bias);
-    let g = b.bf16(2 * i as u32, k as u32, &gw);
     let y = b.zeros(Dtype::Bf16, m as u32, n as u32);
     let head = b.zeros(Dtype::Bf16, m as u32, n as u32);
-    let biased = b.zeros(Dtype::Bf16, m as u32, n as u32);
-    let capped = b.zeros(Dtype::Bf16, m as u32, n as u32);
-    let packed = b.zeros(Dtype::Bf16, m as u32, 2 * i as u32);
-    let geglu = b.zeros(Dtype::Bf16, m as u32, i as u32);
     let rxt = b.bf16(m as u32, (heads * d_rel) as u32, &rx);
     let rwt = b.bf16(d_rel as u32, extent as u32, &rw);
     let rel = b.zeros(Dtype::F32, m as u32, (heads * extent) as u32);
@@ -87,9 +77,6 @@ fn dense_projections_and_their_fused_forms_answer_the_host() {
         .run(|ctx| {
             gemm::matmul(ctx, x, w, y)?;
             gemm::lm_head(ctx, x, w, head)?;
-            gemm::matmul_bias(ctx, x, w, bi, biased)?;
-            gemm::lm_head_softcap(ctx, x, w, cap, capped)?;
-            gemm::matmul_geglu(ctx, x, g, i as u32, packed, geglu)?;
             gemm::rel_bias(
                 ctx,
                 rxt,
@@ -107,29 +94,6 @@ fn dense_projections_and_their_fused_forms_answer_the_host() {
     let want = gemm_ref(&xs, &ws, m, n, k);
     assert_close(&b.read_f32(y), &want, 1e-2, 1e-2);
     assert_close(&b.read_f32(head), &want, 1e-2, 1e-2);
-    let want_b: Vec<f32> = want
-        .iter()
-        .enumerate()
-        .map(|(at, v)| v + bias[at % n])
-        .collect();
-    assert_close(&b.read_f32(biased), &want_b, 1e-2, 1e-2);
-    let want_c: Vec<f32> = want.iter().map(|v| cap * (v / cap).tanh()).collect();
-    assert!(
-        want.iter().any(|v| v.abs() > cap),
-        "the cap bites somewhere"
-    );
-    assert_close(&b.read_f32(capped), &want_c, 1e-2, 1e-2);
-
-    let want_p = gemm_ref(&xs, &gw, m, 2 * i, k);
-    let got_p = b.read_f32(packed);
-    assert_close(&got_p, &want_p, 1e-2, 1e-2);
-    let want_g: Vec<f32> = (0..m * i)
-        .map(|at| {
-            let (r, c) = (at / i, at % i);
-            gelu_tanh(got_p[r * 2 * i + c]) * got_p[r * 2 * i + i + c]
-        })
-        .collect();
-    assert_close(&b.read_f32(geglu), &want_g, 1e-2, 1e-2);
 
     let mut want_r = vec![0.0f32; m * heads * extent];
     for r in 0..m {

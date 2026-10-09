@@ -4,12 +4,9 @@ use std::path::{Path, PathBuf};
 
 use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
+use poem::ops::spatial::{self, Conv};
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, seam, trace_hybrid};
 use poem_compiler::{Budget, VoxelLadder};
-use poem_dsl::ops::spatial::{self, Conv};
-use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, seam,
-    trace_hybrid,
-};
 
 const C_IN: usize = 8;
 const C_MID: usize = 16;
@@ -19,17 +16,6 @@ const TAPS: usize = 27;
 const EPS: f32 = 1e-6;
 
 const BOXES: [[usize; 3]; 2] = [[2, 4, 6], [1, 3, 5]];
-
-struct NoFacts;
-
-impl Classify for NoFacts {
-    fn of(_: &Request) -> NoFacts {
-        NoFacts
-    }
-    fn word(&self) -> u64 {
-        0
-    }
-}
 
 struct Decoder {
     conv1: Weight,
@@ -67,11 +53,10 @@ impl Decoder {
 }
 
 impl ForwardHybrid for Decoder {
-    type Facts = NoFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let g = inputs.grid();
         let x = inputs.voxels(0, C_IN as u32, Dtype::Bf16);
         let (h, g1) = spatial::conv3d(&x, &g, &self.conv1, Some(&self.b1), Conv::same3(), None);
@@ -358,10 +343,6 @@ fn scratch() -> PathBuf {
     dir
 }
 
-fn classify(_: &poem_ir::Request) -> u64 {
-    0
-}
-
 #[test]
 fn a_conv_decoder_fires_over_a_voxel_port_every_case() {
     the_decoder_answers_the_reference_for_two_clips_of_different_boxes();
@@ -381,7 +362,7 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
     let trace = trace_hybrid("d8-decoder", &decoder, Platform::Cuda);
     let source = ztensor::Source::open(&container).expect("the container opens");
     let contract = {
-        let mut b = checkpoint_dsl::Builder::new(&source, 1, Platform::Cuda);
+        let mut b = poem::import::Builder::new(&source, 1, Platform::Cuda);
         for w in decoder.weights() {
             b.read_own(w)
                 .unwrap_or_else(|why| panic!("`{}`: {why}", w.name));
@@ -392,7 +373,6 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
 
     let max_voxels: u32 = BOXES.iter().map(|b| voxels(*b) as u32).sum::<u32>() + 8;
     let mut shell = Shell::load(Boot {
-        classify,
         trace,
         contract: &contract,
         checkpoint: &container,
@@ -525,7 +505,6 @@ impl Causal {
 }
 
 impl ForwardHybrid for Causal {
-    type Facts = NoFacts;
     fn caches(&self) -> HybridSpec {
         let mut spec = HybridSpec::new();
         spec.state(
@@ -535,7 +514,7 @@ impl ForwardHybrid for Causal {
         );
         spec
     }
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let g = inputs.grid();
         let x = inputs.voxels(0, C_IN as u32, Dtype::Bf16);
         let cache = inputs.state("conv.cache");
@@ -663,7 +642,7 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
     let trace = trace_hybrid("d8-causal", &causal, Platform::Cuda);
     let source = ztensor::Source::open(&container).expect("opens");
     let contract = {
-        let mut b = checkpoint_dsl::Builder::new(&source, 1, Platform::Cuda);
+        let mut b = poem::import::Builder::new(&source, 1, Platform::Cuda);
         for w in [&causal.conv, &causal.bias] {
             b.read_own(w)
                 .unwrap_or_else(|why| panic!("`{}`: {why}", w.name));
@@ -672,7 +651,6 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
     };
     drop(source);
     let mut shell = Shell::load(Boot {
-        classify,
         trace,
         contract: &contract,
         checkpoint: &container,

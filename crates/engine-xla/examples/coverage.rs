@@ -1,8 +1,8 @@
-//! Catalog coverage: for every single-device SKU (or those whose name holds
+//! Catalog coverage: for every single-device deployment (or those whose name holds
 //! one of the arguments), trace the plan for `Platform::Xla`, load it on a
 //! dry shell (no weights, no buffers) and trace each class of the plan at a
 //! prefill and a decode shape (`engine_xla::serve::dry`). Prints one line
-//! per SKU: `OK` (every fire emitted its programs), `REFUSED` (the first
+//! per deployment: `OK` (every fire emitted its programs), `REFUSED` (the first
 //! refusal), or `PANIC`.
 //!
 //! ```text
@@ -12,15 +12,15 @@
 //! `--lean` skips the classes that run a custom-mask, adapter or score
 //! capture arm. `--compile` also compiles every emitted program on the PJRT device
 //! (under the device lock, `PIE_XLA_PLUGIN`); `--dump DIR` writes each
-//! SKU's programs as `DIR/<sku>.<n>.mlir`; `-v` prints every fire.
+//! deployment's programs as `DIR/<deployment>.<n>.mlir`; `-v` prints every fire.
 
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 
 use engine_xla::DeviceBoot;
 use engine_xla::serve::{Boot, Shell};
+use poem::Platform;
 use poem_compiler::Budget;
-use poem_dsl::Platform;
 
 const PREFILL: u32 = 24;
 
@@ -42,16 +42,16 @@ fn main() {
     }
     std::panic::set_hook(Box::new(|_| {}));
     let mut tally = [0usize; 3];
-    for sku in models::skus() {
-        if sku.recipe.tp != 1 {
+    for deployment in models::deployments() {
+        if deployment.deploy.tp != 1 {
             continue;
         }
-        if !filters.is_empty() && !filters.iter().any(|f| sku.name.contains(f.as_str())) {
+        if !filters.is_empty() && !filters.iter().any(|f| deployment.name.contains(f.as_str())) {
             continue;
         }
         let started = std::time::Instant::now();
         let got = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            one(sku, compile, lean, verbose, dump.as_deref())
+            one(deployment, compile, lean, verbose, dump.as_deref())
         }));
         let secs = started.elapsed().as_secs_f64();
         let (status, detail) = match got {
@@ -73,7 +73,7 @@ fn main() {
         }] += 1;
         println!(
             "{:<58} {:<8} {:>6.1}s  {}",
-            sku.name,
+            deployment.name,
             status,
             secs,
             detail.replace('\n', " ")
@@ -83,13 +83,13 @@ fn main() {
 }
 
 fn one(
-    sku: &models::Sku,
+    deployment: &models::Deployment,
     compile: bool,
     lean: bool,
     verbose: bool,
     dump: Option<&Path>,
 ) -> Result<String, String> {
-    let trace = (sku.trace)(Platform::Xla);
+    let trace = deployment.trace(Platform::Xla);
     let weights: u64 = trace
         .params
         .iter()
@@ -143,11 +143,11 @@ fn one(
         compile,
     )
     .map_err(|fault| format!("load: {fault}"))?;
-    let probes = shell.synthetic_fires(sku.classify, PREFILL, lean);
+    let probes = shell.synthetic_fires(PREFILL, lean);
     if let Some(dir) = dump {
         let _ = std::fs::create_dir_all(dir);
         for (n, text) in shell.device().dry_texts().iter().enumerate() {
-            let _ = std::fs::write(dir.join(format!("{}.{n}.mlir", sku.name)), text);
+            let _ = std::fs::write(dir.join(format!("{}.{n}.mlir", deployment.name)), text);
         }
     }
     let texts = shell.device().dry_texts();
@@ -183,8 +183,8 @@ fn one(
     ))
 }
 
-fn dtype_bits(dtype: poem_dsl::Dtype) -> u32 {
-    use poem_dsl::Dtype as D;
+fn dtype_bits(dtype: poem::Dtype) -> u32 {
+    use poem::Dtype as D;
     match dtype {
         D::F32 | D::I32 | D::U32 => 32,
         D::I64 | D::U64 => 64,

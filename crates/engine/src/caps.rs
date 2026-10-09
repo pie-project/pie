@@ -96,6 +96,11 @@ pub struct Capabilities {
 
     #[serde(default)]
     pub bidirectional_attention: bool,
+
+    /// The facts the loaded trace's rows branch on, which a lane's word is
+    /// classified by.
+    #[serde(default)]
+    pub facts: poem_ir::Facts,
 }
 
 impl Capabilities {

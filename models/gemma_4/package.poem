@@ -1,0 +1,49 @@
+# Gemma 4: 26B-A4B (experts; with a DFlash drafter, its MTP assistant or its
+# vision tower), 31B (with its assistant or vision tower), E4B (with an EAGLE
+# head or vision tower) and E4B's miniatures; and DiffusionGemma, 26B-A4B
+# as a block-diffusion text model.
+
+MODELS = [
+    model("gemma4-26b-a4b", template = "gemma_4", tokenizer = "gemma_4", parts = ["vision"], drafters = ["mtp", "dflash"], arch = "gemma4", layers = 30, vocab = 262144),
+    model("gemma4-31b", template = "gemma_4", tokenizer = "gemma_4", parts = ["vision"], drafters = ["mtp"], arch = "gemma4", layers = 60, vocab = 262144),
+    model("gemma4-e4b", template = "gemma_4", tokenizer = "gemma_4", parts = ["vision"], drafters = ["eagle"], arch = "gemma4", layers = 42, vocab = 262144),
+    model("gemma4-e4b-mini-l1", mini = True, template = "gemma_4", tokenizer = "gemma_4", arch = "gemma4", layers = 1, vocab = 262144),
+    model("gemma4-e4b-mini-l6", mini = True, template = "gemma_4", tokenizer = "gemma_4", arch = "gemma4", layers = 6, vocab = 262144),
+    model("gemma4-e4b-mini-l24", mini = True, template = "gemma_4", tokenizer = "gemma_4", arch = "gemma4", layers = 24, vocab = 262144),
+    model("gemma4-e4b-mini-l30", mini = True, template = "gemma_4", tokenizer = "gemma_4", arch = "gemma4", layers = 30, vocab = 262144),
+    model("gemma4-e4b-mini-l36", mini = True, template = "gemma_4", tokenizer = "gemma_4", arch = "gemma4", layers = 36, vocab = 262144),
+    model("diffusiongemma-26b-a4b", template = "gemma_4", tokenizer = "gemma_4", parts = ["selfcond"], arch = "diffusion_gemma", layers = 30, vocab = 262144),
+]
+
+U4 = dtype.u4g64
+BF = dtype.bf16
+
+DEPLOYMENTS = [
+    deployment("gemma4-26b-a4b", weights = U4, kv = BF, drafter = "dflash"),
+    deployment("gemma4-26b-a4b", weights = U4, kv = BF, drafter = "mtp"),
+    deployment("gemma4-26b-a4b", weights = U4, kv = BF),
+    deployment("gemma4-31b", weights = U4, kv = BF, drafter = "mtp"),
+    deployment("gemma4-31b", weights = U4, kv = BF),
+    deployment("gemma4-e4b", weights = BF, kv = BF, drafter = "eagle"),
+    deployment("gemma4-e4b", weights = BF, kv = BF),
+    deployment("gemma4-31b", weights = BF, kv = BF),
+    deployment("gemma4-e4b-mini-l1", weights = BF, kv = BF),
+    deployment("gemma4-e4b-mini-l6", weights = BF, kv = BF),
+    deployment("gemma4-e4b-mini-l24", weights = BF, kv = BF),
+    deployment("gemma4-e4b-mini-l30", weights = BF, kv = BF),
+    deployment("gemma4-e4b-mini-l36", weights = BF, kv = BF),
+    deployment("gemma4-e4b", weights = BF, kv = BF, parts = ["vision"]),
+    deployment("gemma4-26b-a4b", weights = U4, kv = BF, parts = ["vision"]),
+    deployment("gemma4-31b", weights = U4, kv = BF, parts = ["vision"]),
+    deployment("diffusiongemma-26b-a4b", weights = U4, kv = BF),
+    deployment("diffusiongemma-26b-a4b", weights = dtype.u8g64, kv = BF),
+    deployment("diffusiongemma-26b-a4b", weights = [dtype.u8g64, U4], kv = BF),
+    deployment("diffusiongemma-26b-a4b", weights = [U4, dtype.u8g64], kv = BF),
+    deployment("diffusiongemma-26b-a4b", weights = [dtype.u8g64, U4, U4], kv = BF, parts = ["selfcond"]),
+    deployment("diffusiongemma-26b-a4b", weights = [BF, U4], kv = BF),
+]
+
+# The drafter published apart from the model it drafts for.
+PUBLISHED = [
+    published(target = "mlx-community/gemma-4-26b-a4b-it-4bit", head = "z-lab/gemma-4-26B-A4B-it-DFlash", drafter = "dflash", deployment = "gemma4-26b-a4b-dflash-u4g64-kv-bf16"),
+]

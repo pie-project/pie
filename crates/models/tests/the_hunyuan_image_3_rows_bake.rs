@@ -1,15 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use models::hunyuan_image_3::forward::{DENOISE, ENCODE, Facts, IMAGE_IN, IMAGE_OUT};
-use models::hunyuan_image_3::model::{self, Dims};
+pub mod hunyuan_image_3_dims;
+
 use models::{PortKind, ReadoutKind, ScheduleKind};
-use poem_dsl::{
-    Attention, Classify, Def, Elementwise, Linear, Operation, Platform, Request, RopeForm,
-    RuntimeInput, Stream, Trace, seam,
+use poem::{
+    Attention, Def, Elementwise, Linear, Operation, Platform, Request, RopeForm, RuntimeInput,
+    Stream, Trace, seam,
 };
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
 
+use hunyuan_image_3_dims::{self as model, DENOISE, Dims, ENCODE, IMAGE_IN, IMAGE_OUT};
 const TP1: &str = "hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16";
 const TP4: &str = "hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16-tp4";
 const TP4_U4: &str = "hunyuanimage3-80b-a13b-bf16-u4g64-kv-bf16-tp4";
@@ -23,27 +24,27 @@ const PLATFORMS: [Platform; 4] = [
     Platform::Vulkan,
 ];
 
-fn row(sku: &str) -> &'static models::Sku {
-    models::sku(sku).unwrap_or_else(|| {
-        let names: Vec<&str> = models::skus().map(|row| row.name.as_str()).collect();
-        panic!("this build ships no `{sku}`; rows are {names:#?}")
+fn row(deployment: &str) -> &'static models::Deployment {
+    models::deployment(deployment).unwrap_or_else(|| {
+        let names: Vec<&str> = models::deployments().map(|row| row.name.as_str()).collect();
+        panic!("this build ships no `{deployment}`; rows are {names:#?}")
     })
 }
 
-fn trace(sku: &str, platform: Platform) -> Trace {
-    (row(sku).trace)(platform)
+fn trace(deployment: &str, platform: Platform) -> Trace {
+    row(deployment).trace(platform)
 }
 
-fn dims(sku: &str) -> Dims {
-    if sku == MINI {
+fn dims(deployment: &str) -> Dims {
+    if deployment == MINI {
         Dims::mini()
     } else {
         Dims::flagship()
     }
 }
 
-fn ranks(sku: &str) -> u32 {
-    row(sku).recipe.tp
+fn ranks(deployment: &str) -> u32 {
+    row(deployment).deploy.tp
 }
 
 #[test]
@@ -59,15 +60,18 @@ fn the_hunyuan_image_3_rows_bake_every_case() {
 }
 
 fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
-    for sku in ROWS {
+    for deployment in ROWS {
         for platform in PLATFORMS {
-            let plan = trace(sku, platform);
-            assert!(!plan.nodes.is_empty(), "{sku} {platform:?}: an empty plan");
-            let d = dims(sku);
+            let plan = trace(deployment, platform);
+            assert!(
+                !plan.nodes.is_empty(),
+                "{deployment} {platform:?}: an empty plan"
+            );
+            let d = dims(deployment);
             assert_eq!(
                 plan.caches.len(),
                 d.layers as usize,
-                "{sku} {platform:?}: one kv row a layer and no state slab"
+                "{deployment} {platform:?}: one kv row a layer and no state slab"
             );
             let seams: BTreeMap<&str, usize> =
                 plan.seams.iter().fold(BTreeMap::new(), |mut acc, s| {
@@ -77,21 +81,21 @@ fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
             assert_eq!(
                 seams.get(seam::OUT.name),
                 Some(&1),
-                "{sku}: the AR phases read logits"
+                "{deployment}: the AR phases read logits"
             );
             assert_eq!(
                 seams.get(seam::HIDDEN.name),
                 Some(&1),
-                "{sku}: the canvas reads its trunk rows back"
+                "{deployment}: the canvas reads its trunk rows back"
             );
             assert_eq!(
                 seams.get(seam::PIXELS.name),
                 Some(&2),
-                "{sku}: one pixels seam per image-head arm"
+                "{deployment}: one pixels seam per image-head arm"
             );
             assert!(
                 !seams.contains_key(seam::VELOCITY.name),
-                "{sku}: the velocity is the `image.out` arm's PIXELS plane on the voxel axis"
+                "{deployment}: the velocity is the `image.out` arm's PIXELS plane on the voxel axis"
             );
         }
     }
@@ -116,9 +120,12 @@ fn traced_ports(plan: &Trace) -> BTreeSet<(String, u8, u32)> {
 }
 
 fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
-    for sku in ROWS {
-        let plan = trace(sku, Platform::Cuda);
-        let facts = row(sku).generative.as_ref().expect("generative facts");
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
+        let facts = row(deployment)
+            .generative
+            .as_ref()
+            .expect("generative facts");
         let mut declared: BTreeSet<(String, u8, u32)> = BTreeSet::new();
         for reading in &facts.readings {
             for (index, port) in reading.ports_indexed() {
@@ -128,19 +135,19 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
         assert_eq!(
             traced_ports(&plan),
             declared,
-            "{sku}: the facts and the trace bind one list of ports"
+            "{deployment}: the facts and the trace bind one list of ports"
         );
 
-        let d = dims(sku);
+        let d = dims(deployment);
         let denoise = facts
             .readings
             .iter()
             .find(|r| r.name == "denoise")
-            .unwrap_or_else(|| panic!("{sku} declares no `denoise`"));
+            .unwrap_or_else(|| panic!("{deployment} declares no `denoise`"));
         let at = |reading: &models::ReadingFact, name: &str| {
             let (index, port) = reading
                 .port(name)
-                .unwrap_or_else(|| panic!("{sku}: `{}` declares no `{name}`", reading.name));
+                .unwrap_or_else(|| panic!("{deployment}: `{}` declares no `{name}`", reading.name));
             (index, port.kind, port.width)
         };
         assert_eq!(
@@ -193,12 +200,15 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
 }
 
 fn each_lane_the_facts_list_classifies_into_its_own_class() {
-    for sku in ROWS {
-        let plan = trace(sku, Platform::Cuda);
-        let classes = poem_dsl::resolve_classes(&plan)
-            .unwrap_or_else(|why| panic!("{sku}: a merge does not resolve: {why:?}"));
-        let facts = row(sku).generative.as_ref().expect("generative facts");
-        let catalog = row(sku);
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
+        let classes = poem::resolve_classes(&plan)
+            .unwrap_or_else(|why| panic!("{deployment}: a merge does not resolve: {why:?}"));
+        let facts = row(deployment)
+            .generative
+            .as_ref()
+            .expect("generative facts");
+        let _catalog = row(deployment);
         let mut seen: Vec<(String, usize)> = Vec::new();
         let lanes: Vec<(String, u8, Stream, u32)> = facts
             .readings
@@ -219,30 +229,35 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
             )))
             .collect();
         for (name, reading, stream, rows) in lanes {
-            let request = Request::new(rows, false)
+            // A denoise lane attends its canvas through the mask its inferlet
+            // sends with it.
+            let request = Request::new(rows, reading == DENOISE)
                 .on_stream(stream)
-                .in_reading(reading);
-            let w = (catalog.classify)(&request);
-            assert_eq!(w, Facts::of(&request).word(), "{sku} {name}");
+                .in_reading(reading_name(reading));
+            let w = plan.facts.word(&request);
             let class = classes
                 .class_of(w & classes.mask)
-                .unwrap_or_else(|| panic!("{sku}: `{name}` has no class"));
+                .unwrap_or_else(|| panic!("{deployment}: `{name}` has no class"));
             seen.push((name, class));
         }
         let distinct: BTreeSet<usize> = seen.iter().map(|(_, class)| *class).collect();
         assert_eq!(
             distinct.len(),
             seen.len(),
-            "{sku}: two lanes share a class: {seen:?}"
+            "{deployment}: two lanes share a class: {seen:?}"
         );
-        assert_eq!(seen.len(), 5, "{sku}: four readings and the AR decode step");
+        assert_eq!(
+            seen.len(),
+            5,
+            "{deployment}: four readings and the AR decode step"
+        );
     }
 }
 
 fn every_rope_turns_the_whole_head_as_two_equal_blocks_in_the_split_form() {
-    for sku in ROWS {
-        let plan = trace(sku, Platform::Cuda);
-        let d = dims(sku);
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
+        let d = dims(deployment);
         let ropes: Vec<RopeRow> = plan
             .nodes
             .iter()
@@ -258,7 +273,11 @@ fn every_rope_turns_the_whole_head_as_two_equal_blocks_in_the_split_form() {
                 _ => continue_none(),
             })
             .collect();
-        assert_eq!(ropes.len(), 2 * d.layers as usize, "{sku}: q and k a layer");
+        assert_eq!(
+            ropes.len(),
+            2 * d.layers as usize,
+            "{deployment}: q and k a layer"
+        );
         let half = d.head_dim / 2;
         for rope in &ropes {
             assert_eq!(
@@ -270,14 +289,14 @@ fn every_rope_turns_the_whole_head_as_two_equal_blocks_in_the_split_form() {
                     d.head_dim,
                     d.head_dim
                 ),
-                "{sku}"
+                "{deployment}"
             );
         }
-        assert_eq!(d.rope_dims(), [half, half, 0, 0], "{sku}");
+        assert_eq!(d.rope_dims(), [half, half, 0, 0], "{deployment}");
         let scale = model::rope_x_scale(d.head_dim);
         assert!(
             scale < 1.0 && scale > 0.5,
-            "{sku}: the x scale is theta^(-2/d), got {scale}"
+            "{deployment}: the x scale is theta^(-2/d), got {scale}"
         );
         let neox = plan.nodes.iter().any(|node| {
             matches!(
@@ -286,7 +305,10 @@ fn every_rope_turns_the_whole_head_as_two_equal_blocks_in_the_split_form() {
                     | Operation::Elementwise(Elementwise::RopePartial { .. })
             )
         });
-        assert!(!neox, "{sku}: this family turns through `rope_axes` alone");
+        assert!(
+            !neox,
+            "{deployment}: this family turns through `rope_axes` alone"
+        );
     }
 }
 
@@ -295,9 +317,9 @@ fn continue_none<T>() -> Option<T> {
 }
 
 fn the_canvas_reads_a_bidirectional_masked_attention_over_the_frozen_prefix() {
-    for sku in ROWS {
-        let plan = trace(sku, Platform::Cuda);
-        let d = dims(sku);
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
+        let d = dims(deployment);
         let (mut masked, mut prefill, mut decode, mut appends) = (0usize, 0usize, 0usize, 0usize);
         for node in &plan.nodes {
             match &node.op {
@@ -310,7 +332,7 @@ fn the_canvas_reads_a_bidirectional_masked_attention_over_the_frozen_prefix() {
                     masked += 1;
                     assert!(
                         !causal,
-                        "{sku}: the canvas lifts the causal bound; its mask carries the shape"
+                        "{deployment}: the canvas lifts the causal bound; its mask carries the shape"
                     );
                     assert_eq!(*head_dim, d.head_dim);
                     assert!((sm_scale - d.sm_scale()).abs() < 1e-7);
@@ -322,17 +344,20 @@ fn the_canvas_reads_a_bidirectional_masked_attention_over_the_frozen_prefix() {
             }
         }
         let layers = d.layers as usize;
-        assert_eq!(masked, layers, "{sku}: one masked read a layer");
-        assert_eq!(prefill, layers, "{sku}: one causal prefill a layer");
-        assert_eq!(decode, layers, "{sku}: one AR decode a layer");
-        assert_eq!(appends, layers, "{sku}: one kv append a layer, arm-blind");
+        assert_eq!(masked, layers, "{deployment}: one masked read a layer");
+        assert_eq!(prefill, layers, "{deployment}: one causal prefill a layer");
+        assert_eq!(decode, layers, "{deployment}: one AR decode a layer");
+        assert_eq!(
+            appends, layers,
+            "{deployment}: one kv append a layer, arm-blind"
+        );
     }
 }
 
 fn the_mixture_is_a_renormalised_top_k_over_the_whole_bank_beside_a_shared_expert() {
-    for sku in ROWS {
-        let plan = trace(sku, Platform::Cuda);
-        let d = dims(sku);
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
+        let d = dims(deployment);
         let mut routers = 0usize;
         let mut selects = 0usize;
         let mut quant = 0usize;
@@ -340,7 +365,7 @@ fn the_mixture_is_a_renormalised_top_k_over_the_whole_bank_beside_a_shared_exper
             match &node.op {
                 Operation::Linear(Linear::MoeTopkSoftmax { experts, top_k, .. }) => {
                     routers += 1;
-                    assert_eq!((*experts, *top_k), (d.experts, d.top_k), "{sku}");
+                    assert_eq!((*experts, *top_k), (d.experts, d.top_k), "{deployment}");
                 }
                 Operation::Linear(Linear::MoeMatmulSelect { .. }) => selects += 1,
                 Operation::Linear(Linear::MoeMatmulSelectQuant { .. }) => {
@@ -350,60 +375,75 @@ fn the_mixture_is_a_renormalised_top_k_over_the_whole_bank_beside_a_shared_exper
                 _ => {}
             }
         }
-        assert_eq!(routers, d.layers as usize, "{sku}: one router a layer");
-        assert_eq!(selects, 2 * d.layers as usize, "{sku}: gate_up and down");
-        let quantized = row(sku).recipe.weights.len() > 1;
+        assert_eq!(
+            routers, d.layers as usize,
+            "{deployment}: one router a layer"
+        );
+        assert_eq!(
+            selects,
+            2 * d.layers as usize,
+            "{deployment}: gate_up and down"
+        );
+        let quantized = row(deployment).deploy.weights.len() > 1;
         assert_eq!(
             quant > 0,
             quantized,
-            "{sku}: the routed banks are quantized on the flagship rows alone"
+            "{deployment}: the routed banks are quantized on the flagship rows alone"
         );
         let swiglus = plan
             .nodes
             .iter()
             .filter(|node| matches!(&node.op, Operation::Linear(Linear::MlpSwiglu { .. })))
             .count();
-        assert_eq!(swiglus, 2 * d.layers as usize, "{sku}: routed and shared");
+        assert_eq!(
+            swiglus,
+            2 * d.layers as usize,
+            "{deployment}: routed and shared"
+        );
     }
 }
 
 fn both_fact_columns_state_what_the_trace_does() {
-    for sku in ROWS {
-        let catalog = row(sku);
-        let d = dims(sku);
+    for deployment in ROWS {
+        let catalog = row(deployment);
+        let d = dims(deployment);
         let canvas = catalog.diffusion.expect("a forward-diffusion row");
-        assert_eq!(canvas.hidden, d.hidden, "{sku}");
+        assert_eq!(canvas.hidden, d.hidden, "{deployment}");
         assert!(
             canvas.canvas > 0 && canvas.canvas.is_multiple_of(16),
-            "{sku}"
+            "{deployment}"
         );
         assert_eq!(
             canvas.self_cond_taps, 0,
-            "{sku}: the cross-step state is the KV cache, not a soft embedding"
+            "{deployment}: the cross-step state is the KV cache, not a soft embedding"
         );
 
         let facts = catalog.generative.as_ref().expect("generative facts");
         for (at, reading) in facts.readings.iter().enumerate() {
-            assert_eq!(usize::from(reading.index), at, "{sku}: dense from 0");
+            assert_eq!(usize::from(reading.index), at, "{deployment}: dense from 0");
             assert!(
                 reading.positions.is_none(),
-                "{sku}: the 2-D nesting is the family's"
+                "{deployment}: the 2-D nesting is the family's"
             );
         }
-        let names: Vec<&str> = facts.readings.iter().map(|r| r.name).collect();
+        let names: Vec<&str> = facts.readings.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["encode", "denoise", "image.in", "image.out"]);
         let encode = &facts.readings[usize::from(ENCODE)];
-        assert!(encode.has_kv && encode.takes_tokens, "{sku}");
+        assert!(encode.has_kv && encode.takes_tokens, "{deployment}");
         assert_eq!(encode.readout, ReadoutKind::Logits);
         assert_eq!(encode.readout_width, d.vocab);
         let denoise = &facts.readings[usize::from(DENOISE)];
         assert!(
             denoise.has_kv && denoise.takes_tokens,
-            "{sku}: the canvas is a sequence AND a float lane (design D10)"
+            "{deployment}: the canvas is a sequence AND a float lane (design D10)"
         );
         for voxel in [IMAGE_IN, IMAGE_OUT] {
             let arm = &facts.readings[usize::from(voxel)];
-            assert!(!arm.has_kv && !arm.takes_tokens, "{sku}: {}", arm.name);
+            assert!(
+                !arm.has_kv && !arm.takes_tokens,
+                "{deployment}: {}",
+                arm.name
+            );
         }
         let latent = facts.latent.expect("a latent space");
         assert_eq!(
@@ -430,9 +470,9 @@ fn both_fact_columns_state_what_the_trace_does() {
         assert_eq!(schedule.train_steps, model::TRAIN_STEPS);
         assert!(
             schedule.pinned_sigmas.is_empty(),
-            "{sku}: nothing is pinned"
+            "{deployment}: nothing is pinned"
         );
-        assert!(facts.max_rows > canvas.canvas, "{sku}");
+        assert!(facts.max_rows > canvas.canvas, "{deployment}");
         validate(facts);
     }
 }
@@ -463,8 +503,8 @@ fn budget() -> poem_compiler::Budget {
 
 fn every_row_bakes_on_every_platform_at_its_own_rank() {
     for platform in PLATFORMS {
-        for sku in ROWS {
-            let plan = trace(sku, platform);
+        for deployment in ROWS {
+            let plan = trace(deployment, platform);
             let budgets = poem_compiler::Budgets::of(budget())
                 .with_voxels(poem_compiler::VoxelLadder::new(8192, 4));
             let compiled = poem_compiler::compile_axes(
@@ -472,32 +512,46 @@ fn every_row_bakes_on_every_platform_at_its_own_rank() {
                 &budgets,
                 &poem_compiler::DeviceProfile::default(),
             )
-            .unwrap_or_else(|why| panic!("{platform:?}: `{sku}` does not bake: {why}"));
+            .unwrap_or_else(|why| panic!("{platform:?}: `{deployment}` does not bake: {why}"));
             let tiled: usize = compiled.regions.iter().map(|r| r.nodes.len()).sum();
             assert_eq!(
                 tiled,
                 plan.nodes.len(),
-                "{platform:?} `{sku}`: the regions tile the node list once"
+                "{platform:?} `{deployment}`: the regions tile the node list once"
             );
             assert!(
                 compiled.voxels.is_some(),
-                "{platform:?} `{sku}`: the image head is a voxel plan"
+                "{platform:?} `{deployment}`: the image head is a voxel plan"
             );
         }
     }
-    for sku in [TP1, TP4] {
-        let plan = trace(sku, Platform::Cuda);
-        let d = dims(sku);
+    for deployment in [TP1, TP4] {
+        let plan = trace(deployment, Platform::Cuda);
+        let d = dims(deployment);
         let reduces = plan
             .nodes
             .iter()
             .filter(|node| matches!(&node.op, Operation::Collective(_)))
             .count();
-        let want = if ranks(sku) > 1 {
+        let want = if ranks(deployment) > 1 {
             2 * d.layers as usize
         } else {
             0
         };
-        assert_eq!(reduces, want, "{sku}: one all-reduce per cut projection");
+        assert_eq!(
+            reduces, want,
+            "{deployment}: one all-reduce per cut projection"
+        );
+    }
+}
+
+/// The name of the reading the forward's code `reading` stands for.
+fn reading_name(reading: u8) -> &'static str {
+    match reading {
+        ENCODE => "encode",
+        DENOISE => "denoise",
+        IMAGE_IN => "image.in",
+        IMAGE_OUT => "image.out",
+        other => panic!("no reading has code {other}"),
     }
 }

@@ -46,10 +46,33 @@ impl Platform {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Shard {
+    #[default]
     Replicated,
-    Cut { axis: u32, segments: Vec<u64> },
+    Cut {
+        axis: u32,
+        segments: Vec<u64>,
+        /// The heads each segment holds, whole, when the model states them;
+        /// a segment of fewer heads than ranks is copied to each rank of a
+        /// group rather than cut mid-head. Empty when the ranks cut each
+        /// segment evenly.
+        heads: Vec<u64>,
+    },
+}
+
+impl Shard {
+    /// How many ways the ranks cut a segment of `heads` heads (none stated:
+    /// every rank's own share): `world`, or the head count when there are
+    /// fewer heads than ranks, each head then held by `world / heads` ranks.
+    pub fn parts(heads: Option<u64>, world: u64) -> Result<u64, String> {
+        match heads {
+            None => Ok(world),
+            Some(h) if h >= world && h.is_multiple_of(world) => Ok(world),
+            Some(h) if h > 0 && h < world && world.is_multiple_of(h) => Ok(h),
+            Some(h) => Err(format!("{h} heads do not split {world} ways")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -98,11 +121,18 @@ pub enum CacheRow {
         /// readable (they deserialize to 0, which reproduces the old anchor).
         #[serde(default)]
         head_dim: u32,
+        /// `Cut { axis: 0, .. }` when every plane holds heads the ranks
+        /// split between them.
+        #[serde(default)]
+        shard: Shard,
     },
     State {
         name: String,
         slab: Vec<u64>,
         dtype: Dtype,
+        /// The slab axis the ranks split between them, if any.
+        #[serde(default)]
+        shard: Shard,
     },
 }
 
@@ -131,6 +161,9 @@ pub struct Trace {
     pub seams: Vec<Seam>,
     #[serde(default)]
     pub drafter: Option<BlockDrafter>,
+    /// The facts the trace's guards branch on, and the bits each takes.
+    #[serde(default)]
+    pub facts: crate::Facts,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

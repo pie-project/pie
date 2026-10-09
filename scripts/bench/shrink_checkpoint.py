@@ -57,7 +57,7 @@ node (routed delta 0.078) without the delta ever crossing an expert boundary:
 at 8-of-16 the eighth-to-ninth logit gap is wider than the perturbation, so the
 routing decision never changed. Sixty-four leaves fifty-six rejected experts in
 that tail instead of eight and contracts the gap with them, which is the whole
-reason the second row exists. Both land their own SKU
+reason the second row exists. Both land their own deployment
 (`qwen36-35b-a3b-mini-u4g64-kv-bf16` and `…-mini64-…`) and both are held by
 `crates/models/tests/the_a3b_text_reads_the_routed_miniature.rs`.
 """
@@ -1133,7 +1133,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
         # **NO `keep_res`, SO THE 333-PLANE VISION TOWER IS DROPPED**, as
         # `qwen4_exp` drops its own. The reason is not size (0.83 GiB) but the
         # reader: `models::qwen_3::Model::a3b` declares `tower: None`, so the
-        # SKU this artifact has to land on opens no `vision_tower.*` plane at
+        # deployment this artifact has to land on opens no `vision_tower.*` plane at
         # all. Carrying the tower would put a third of the artifact's names
         # outside the census with nothing reading them, and the miniature is
         # here to be a bijection with the text.

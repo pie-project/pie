@@ -1,4 +1,4 @@
-//! A catalog SKU end to end on the device, over random weights: writes a
+//! A catalog deployment end to end on the device, over random weights: writes a
 //! checkpoint of every plan param at small random values (bf16 of the
 //! logical shape for a quantized bank, which the landing quantizes: affine
 //! u4g64 and mxfp4 have encoders), lands it, then
@@ -10,10 +10,10 @@
 //!   last rows (argmax, max |Δ|, correlation).
 //!
 //! ```text
-//! PIE_XLA_PLUGIN=.../libtpu.so cargo run --release -p engine-xla --example tiny_e2e -- <sku> [--keep]
+//! PIE_XLA_PLUGIN=.../libtpu.so cargo run --release -p engine-xla --example tiny_e2e -- <deployment> [--keep]
 //! ```
 //!
-//! The checkpoint goes to `/dev/shm/pie-xla-e2e/<sku>.zt` (removed unless
+//! The checkpoint goes to `/dev/shm/pie-xla-e2e/<deployment>.zt` (removed unless
 //! `--keep`). The device lock is held only while the shell is up.
 
 use std::path::{Path, PathBuf};
@@ -21,56 +21,56 @@ use std::time::Instant;
 
 use engine_xla::DeviceBoot;
 use engine_xla::serve::{Boot, Lane, Shell};
+use poem::{Dtype, ParamSource, Platform, Request, Weight};
 use poem_compiler::Budget;
-use poem_dsl::{Dtype, ParamSource, Platform, Request, Weight};
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let name = args.next().expect("usage: tiny_e2e <sku> [--keep]");
+    let name = args.next().expect("usage: tiny_e2e <deployment> [--keep]");
     let keep = args.any(|a| a == "--keep");
-    let sku = models::sku(&name)
-        .or_else(|| models::skus().find(|s| s.name.starts_with(&name)))
-        .unwrap_or_else(|| panic!("no SKU `{name}`"));
-    let trace = (sku.trace)(Platform::Xla);
+    let deployment = models::deployment(&name)
+        .or_else(|| models::deployments().find(|s| s.name.starts_with(&name)))
+        .unwrap_or_else(|| panic!("no deployment `{name}`"));
+    let trace = deployment.trace(Platform::Xla);
     let dir = PathBuf::from("/dev/shm/pie-xla-e2e");
     std::fs::create_dir_all(&dir).expect("the scratch directory");
-    let path = dir.join(format!("{}.zt", sku.name));
+    let path = dir.join(format!("{}.zt", deployment.name));
     let t0 = Instant::now();
     let bytes = write_random(&trace, &path);
     eprintln!(
         "{}: wrote {} MiB of random weights in {:.1}s",
-        sku.name,
+        deployment.name,
         bytes >> 20,
         t0.elapsed().as_secs_f64()
     );
     if std::env::var_os("PIE_E2E_WRITE_ONLY").is_some() {
         let source = ztensor_compat::index(&path).expect("the checkpoint indexes");
-        checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Xla)
+        poem::import::own_contract(&source, &trace.params, 1, Platform::Xla)
             .unwrap_or_else(|why| panic!("the random checkpoint reads: {why}"));
-        println!("{}: written and read", sku.name);
+        println!("{}: written and read", deployment.name);
         return;
     }
     let source = ztensor_compat::index(&path).expect("the checkpoint indexes");
-    let contract = checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Xla)
+    let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Xla)
         .unwrap_or_else(|why| panic!("the random checkpoint reads: {why}"));
     drop(source);
 
-    let outcome = run(sku, trace, &contract, &path);
+    let outcome = run(deployment, trace, &contract, &path);
     if !keep {
         let _ = std::fs::remove_file(&path);
     }
     match outcome {
-        Ok(line) => println!("{:<50} OK      {line}", sku.name),
+        Ok(line) => println!("{:<50} OK      {line}", deployment.name),
         Err(why) => {
-            println!("{:<50} FAILED  {why}", sku.name);
+            println!("{:<50} FAILED  {why}", deployment.name);
             std::process::exit(1);
         }
     }
 }
 
 fn run(
-    sku: &models::Sku,
-    trace: poem_dsl::Trace,
+    deployment: &models::Deployment,
+    trace: poem::Trace,
     contract: &checkpoint::contract::ModelContract,
     path: &Path,
 ) -> Result<String, String> {
@@ -107,7 +107,7 @@ fn run(
     let loaded = t0.elapsed().as_secs_f64();
 
     let t1 = Instant::now();
-    let probes = shell.synthetic_fires(sku.classify, 24, true);
+    let probes = shell.synthetic_fires(24, true);
     let fired = t1.elapsed().as_secs_f64();
     let mut fires = 0;
     for p in &probes {
@@ -129,7 +129,7 @@ fn run(
     }
     let mut line = format!("load {loaded:.1}s, {fires} synthetic fires finite ({fired:.1}s)");
     if shell.readout_seam() == engine::fire::ReadoutSeam::Logits {
-        match agree(&mut shell, sku) {
+        match agree(&mut shell, deployment) {
             Ok(said) => line.push_str(&format!("; {said}")),
             // A plan whose token lanes read float ports (positions, a
             // timestep) has no plain prompt to walk; its synthetic fires
@@ -144,8 +144,9 @@ fn run(
 }
 
 /// Prefill against a token-by-token walk of the same prompt.
-fn agree(shell: &mut Shell, sku: &models::Sku) -> Result<String, String> {
-    let word = |query_len: u32| (sku.classify)(&Request::new(query_len, false));
+fn agree(shell: &mut Shell, deployment: &models::Deployment) -> Result<String, String> {
+    let facts = deployment.trace(models::Platform::Xla).facts;
+    let word = |query_len: u32| facts.word(&Request::new(query_len, false));
     let vocab = shell.out_width();
     let mut lcg = 0x2545_f491_4f6c_dd1du64;
     let prompt: Vec<u32> = (0..12)
@@ -304,7 +305,7 @@ fn correlation(a: &[f32], b: &[f32]) -> f64 {
 }
 
 /// Every checkpoint param at small random values; answers the bytes written.
-fn write_random(trace: &poem_dsl::Trace, path: &Path) -> u64 {
+fn write_random(trace: &poem::Trace, path: &Path) -> u64 {
     let quantized = |d: Dtype| {
         matches!(
             d,
@@ -327,7 +328,7 @@ fn write_random(trace: &poem_dsl::Trace, path: &Path) -> u64 {
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
     let mut total = 0u64;
     // A canonical container takes its tensors in name order.
-    let mut params: Vec<&poem_dsl::Param> = trace.params.iter().collect();
+    let mut params: Vec<&poem::Param> = trace.params.iter().collect();
     params.sort_by(|a, b| a.name.cmp(&b.name));
     for param in params {
         if param.source != ParamSource::Checkpoint || companions.contains(&param.name) {

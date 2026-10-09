@@ -180,7 +180,7 @@ def the_store_says_what_the_row_can_do(args) -> dict:
 
     if entry.get("generative") is None:
         raise FileNotFoundError(
-            f"{entry['address']} was imported as `{entry.get('sku')}`, which is not a "
+            f"{entry['address']} was imported as `{entry.get('deployment')}`, which is not a "
             f"generative row: there is nothing to draw with"
         )
     facts = entry["generative"]

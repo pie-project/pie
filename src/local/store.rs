@@ -34,7 +34,7 @@ pub struct Entry {
     pub name: String,
     pub qualified: Option<String>,
     pub siblings: usize,
-    pub sku: Option<String>,
+    pub deployment: Option<String>,
     pub backend: Option<String>,
     pub dir: Option<PathBuf>,
     pub root: PathBuf,
@@ -134,7 +134,7 @@ fn read_entry(root: &Path, name: String) -> Option<Entry> {
         name,
         qualified: qualified_name(root),
         siblings: 1,
-        sku: stamp.as_ref().map(|stamp| stamp.sku.clone()),
+        deployment: stamp.as_ref().map(|stamp| stamp.deployment.clone()),
         backend: stamp.as_ref().map(|stamp| stamp.backend.clone()),
         dir: None,
         bytes: files
@@ -448,8 +448,8 @@ mod tests {
         assert_eq!(found[0].tensors, 1);
     }
 
-    fn serving(dir: &Path, slug: &str, sku: &str, backend: &str) -> std::path::PathBuf {
-        let stamp = checkpoint::serving::Stamp::of(backend, sku);
+    fn serving(dir: &Path, slug: &str, deployment: &str, backend: &str) -> std::path::PathBuf {
+        let stamp = checkpoint::serving::Stamp::of(backend, deployment);
         let path = dir.join(checkpoint::serving::Name::of(&stamp, slug).render());
         let mut writer = Writer::create_serving(&path, &Default::default(), stamp).unwrap();
         writer.add_tensor(&decl("w"), &vec![7u8; 32_000]).unwrap();
@@ -460,9 +460,9 @@ mod tests {
     fn a_directory_of_three_backends_is_three_entries() {
         let root = tempfile::tempdir().unwrap();
         let model = root.path().join("gemma");
-        let sku = "gemma4-e4b-bf16-kv-bf16";
+        let deployment = "gemma4-e4b-bf16-kv-bf16";
         for backend in ["cuda", "vulkan", "wgpu"] {
-            serving(&model, "gemma", sku, backend);
+            serving(&model, "gemma", deployment, backend);
         }
 
         let found = entries_in(root.path()).unwrap();
@@ -470,7 +470,11 @@ mod tests {
         for entry in &found {
             assert_eq!(entry.name, "gemma", "every one is an artifact of gemma");
             assert_eq!(entry.siblings, 3);
-            assert_eq!(entry.sku.as_deref(), Some(sku), "read off the stamp");
+            assert_eq!(
+                entry.deployment.as_deref(),
+                Some(deployment),
+                "read off the stamp"
+            );
             assert_eq!(entry.tensors, 1);
         }
         let addresses: Vec<&str> = found.iter().map(Entry::address).collect();
@@ -510,9 +514,9 @@ mod tests {
     fn a_name_resolves_exactly_or_names_what_it_could_not_choose_between() {
         let root = tempfile::tempdir().unwrap();
         let model = root.path().join("gemma");
-        let sku = "gemma4-e4b-bf16-kv-bf16";
+        let deployment = "gemma4-e4b-bf16-kv-bf16";
         for backend in ["cuda", "vulkan"] {
-            serving(&model, "gemma", sku, backend);
+            serving(&model, "gemma", deployment, backend);
         }
         serving(
             &root.path().join("qwen"),

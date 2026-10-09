@@ -3,7 +3,7 @@ use kernels_cuda::linear;
 use kernels_cuda::linear::moe::GroupSeat;
 use kernels_cuda::linear::quant::OffsetKind;
 use poem_exec::{DispatchLinear, KernelError};
-use poem_ir::{Dtype, Linear, ValueId};
+use poem_ir::{Dtype, Fused, Linear, Operands, ValueId};
 
 use crate::run::Run;
 
@@ -16,6 +16,113 @@ impl DispatchLinear for Run<'_> {
 }
 
 impl Run<'_> {
+    pub(super) fn fused_linear(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        match op {
+            Fused::MatmulGeglu {
+                act,
+                w,
+                intermediate,
+                packed,
+                y,
+            } => {
+                // The skinny leg reads the weight as one dense handle; a split-plane
+                // bank resolves only through the matmul below.
+                if self.dense_weight(*w) {
+                    let a = self.tensor(*act);
+                    let weight = self.tensor(*w);
+                    let out = self.tensor(*y);
+                    let (m, k) = (a.rows as i32, a.width as i32);
+                    let i = i32::try_from(*intermediate).unwrap_or(0);
+                    if weight.rows == 2 * *intermediate
+                        && linear::skinny::covers(m, i, k, linear::skinny::Epilogue::Geglu)
+                    {
+                        return linear::skinny::skinny_bf16(
+                            self.ctx(),
+                            weight.ptr,
+                            a.ptr,
+                            out.ptr,
+                            m,
+                            i,
+                            k,
+                            linear::skinny::Epilogue::Geglu,
+                        );
+                    }
+                }
+                self.linear(&Linear::Matmul {
+                    act: *act,
+                    w: *w,
+                    y: *packed,
+                })?;
+                self.linear(&Linear::MlpGegluTanhPacked {
+                    packed: *packed,
+                    intermediate: *intermediate,
+                    y: *y,
+                })
+            }
+            Fused::MatmulBias {
+                act,
+                w,
+                bias,
+                y,
+                y_out: _,
+            } => {
+                if self.tensor(*act).dtype == Dtype::Bf16 && self.dense_weight(*w) {
+                    return linear::gemm::matmul_bias(
+                        self.ctx(),
+                        self.tensor(*act),
+                        self.tensor(*w),
+                        self.tensor(*bias),
+                        &mut self.tensor(*y),
+                    );
+                }
+                self.linear(&Linear::Matmul {
+                    act: *act,
+                    w: *w,
+                    y: *y,
+                })?;
+                kernels_cuda::elemwise::norm::add_bias(
+                    self.ctx(),
+                    self.tensor(*bias),
+                    &mut self.tensor(*y),
+                )
+            }
+            Fused::LmHeadSoftcap {
+                act,
+                w,
+                cap,
+                y,
+                y_out: _,
+            } => {
+                if self.dense_weight(*w) {
+                    let a = self.tensor(*act);
+                    let weight = self.tensor(*w);
+                    let out = self.tensor(*y);
+                    let (m, n, k) = (a.rows as i32, weight.rows as i32, a.width as i32);
+                    let epilogue = linear::skinny::Epilogue::Softcap(*cap);
+                    if linear::skinny::covers(m, n, k, epilogue) {
+                        return linear::skinny::skinny_bf16(
+                            self.ctx(),
+                            weight.ptr,
+                            a.ptr,
+                            out.ptr,
+                            m,
+                            n,
+                            k,
+                            epilogue,
+                        );
+                    }
+                }
+                self.linear(&Linear::LmHead {
+                    act: *act,
+                    w: *w,
+                    y: *y,
+                })?;
+                kernels_cuda::attn::logit_softcap(self.ctx(), &mut self.tensor(*y), *cap)
+            }
+            _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+        }
+    }
+
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_cuda::Error> {
         match op {
             Linear::Matmul { act, w, y } if self.tensor(*act).dtype == Dtype::F32 => {
@@ -73,107 +180,6 @@ impl Run<'_> {
                 }
                 None => self.row_major_lm_head(act, w, y),
             },
-            Linear::MatmulGeglu {
-                act,
-                w,
-                intermediate,
-                packed,
-                y,
-            } => {
-                // The skinny leg reads the weight as one dense handle; a split-plane
-                // bank resolves only through the matmul below.
-                if self.dense_weight(*w) {
-                    let a = self.tensor(*act);
-                    let weight = self.tensor(*w);
-                    let out = self.tensor(*y);
-                    let (m, k) = (a.rows as i32, a.width as i32);
-                    let i = i32::try_from(*intermediate).unwrap_or(0);
-                    if weight.rows == 2 * *intermediate
-                        && linear::skinny::covers(m, i, k, linear::skinny::Epilogue::Geglu)
-                    {
-                        return linear::skinny::skinny_bf16(
-                            self.ctx(),
-                            weight.ptr,
-                            a.ptr,
-                            out.ptr,
-                            m,
-                            i,
-                            k,
-                            linear::skinny::Epilogue::Geglu,
-                        );
-                    }
-                }
-                self.linear(&Linear::Matmul {
-                    act: *act,
-                    w: *w,
-                    y: *packed,
-                })?;
-                self.linear(&Linear::MlpGegluTanhPacked {
-                    packed: *packed,
-                    intermediate: *intermediate,
-                    y: *y,
-                })
-            }
-            Linear::MatmulBias {
-                act,
-                w,
-                bias,
-                y,
-                y_out: _,
-            } => {
-                if self.tensor(*act).dtype == Dtype::Bf16 && self.dense_weight(*w) {
-                    return linear::gemm::matmul_bias(
-                        self.ctx(),
-                        self.tensor(*act),
-                        self.tensor(*w),
-                        self.tensor(*bias),
-                        &mut self.tensor(*y),
-                    );
-                }
-                self.linear(&Linear::Matmul {
-                    act: *act,
-                    w: *w,
-                    y: *y,
-                })?;
-                kernels_cuda::elemwise::norm::add_bias(
-                    self.ctx(),
-                    self.tensor(*bias),
-                    &mut self.tensor(*y),
-                )
-            }
-            Linear::LmHeadSoftcap {
-                act,
-                w,
-                cap,
-                y,
-                y_out: _,
-            } => {
-                if self.dense_weight(*w) {
-                    let a = self.tensor(*act);
-                    let weight = self.tensor(*w);
-                    let out = self.tensor(*y);
-                    let (m, n, k) = (a.rows as i32, weight.rows as i32, a.width as i32);
-                    let epilogue = linear::skinny::Epilogue::Softcap(*cap);
-                    if linear::skinny::covers(m, n, k, epilogue) {
-                        return linear::skinny::skinny_bf16(
-                            self.ctx(),
-                            weight.ptr,
-                            a.ptr,
-                            out.ptr,
-                            m,
-                            n,
-                            k,
-                            epilogue,
-                        );
-                    }
-                }
-                self.linear(&Linear::LmHead {
-                    act: *act,
-                    w: *w,
-                    y: *y,
-                })?;
-                kernels_cuda::attn::logit_softcap(self.ctx(), &mut self.tensor(*y), *cap)
-            }
             Linear::MlpSwiglu {
                 packed,
                 intermediate,

@@ -121,11 +121,7 @@ impl Run<'_> {
             Linear::MlpGeluTanh { x, y } => {
                 linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), self.tensor(*y))
             }
-            Linear::MatmulGeglu { .. }
-            | Linear::LmHeadSoftcap { .. }
-            | Linear::MatmulBias { .. }
-            | Linear::RelBias { .. }
-            | Linear::MoeTopkSigmoidSink { .. } => {
+            Linear::RelBias { .. } | Linear::MoeTopkSigmoidSink { .. } => {
                 Err(kernels_vulkan::Error::Unsupported { op: op.name() })
             }
             Linear::MlpGegluTanhPacked {

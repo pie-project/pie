@@ -103,12 +103,8 @@ impl Run<'_> {
             ),
 
             Elementwise::LayernormNoScale { .. }
-            | Elementwise::RmsnormResidualAdd { .. }
-            | Elementwise::EmbedScaleAdd { .. }
             | Elementwise::Modulate { .. }
             | Elementwise::GatedResidualAdd { .. }
-            | Elementwise::NormModulate { .. }
-            | Elementwise::GatedResidualNormModulate { .. }
             | Elementwise::Sinusoid { .. }
             | Elementwise::RelativeBucketBias { .. }
             | Elementwise::Silu { .. }
@@ -119,9 +115,6 @@ impl Run<'_> {
             | Elementwise::Add { .. }
             | Elementwise::RopeAxes { .. }
             | Elementwise::GateSigmoidMulHeads { .. } => {
-                Err(kernels_vulkan::Error::Unsupported { op: op.name() })
-            }
-            Elementwise::EmbedScaleAddSelect { .. } | Elementwise::RmsnormRopePartialQ { .. } => {
                 Err(kernels_vulkan::Error::Unsupported { op: op.name() })
             }
 
@@ -218,29 +211,6 @@ impl Run<'_> {
             ),
             Elementwise::ResidualAdd { x, y, y_out: _ } => {
                 elemwise::norm::residual_add(self.ctx(), self.tensor(*x), self.tensor(*y))
-            }
-            Elementwise::ResidualAddRmsnorm {
-                x,
-                y,
-                y_out: _,
-                weight,
-                plus_one,
-                eps,
-                out,
-            } => {
-                elemwise::norm::residual_add(self.ctx(), self.tensor(*x), self.tensor(*y))?;
-                let norm = if *plus_one {
-                    elemwise::norm::rmsnorm_plus_one
-                } else {
-                    elemwise::norm::rmsnorm
-                };
-                norm(
-                    self.ctx(),
-                    self.tensor(*y),
-                    self.tensor(*weight),
-                    *eps,
-                    self.tensor(*out),
-                )
             }
             Elementwise::AddBias {
                 bias,

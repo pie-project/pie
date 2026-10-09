@@ -246,7 +246,9 @@ pub fn one_slot_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
                     bytes = bytes.saturating_add(cells * width * element);
                 }
             }
-            CacheRow::State { name, slab, dtype } => {
+            CacheRow::State {
+                name, slab, dtype, ..
+            } => {
                 let stride: u64 = slab.iter().product();
                 bytes = bytes.saturating_add(stride * elem_bytes(name, *dtype)?);
             }
@@ -287,7 +289,10 @@ pub fn window_fire_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
 pub fn least_sequence_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
     let mut state: u64 = 0;
     for row in &trace.caches {
-        if let CacheRow::State { name, slab, dtype } = row {
+        if let CacheRow::State {
+            name, slab, dtype, ..
+        } = row
+        {
             let stride: u64 = slab.iter().product();
             state = state.saturating_add(stride * elem_bytes(name, *dtype)?);
         }
@@ -532,7 +537,9 @@ impl Pools {
                         head_stride: restated.map_or(keys_width, |seat| u64::from(seat.head_dim)),
                     });
                 }
-                CacheRow::State { name, slab, dtype } => {
+                CacheRow::State {
+                    name, slab, dtype, ..
+                } => {
                     let stride: u64 = slab.iter().product();
                     let bytes = stride * u64::from(paging.slots) * elem_bytes(name, *dtype)?;
                     rows.push(vec![Arena::reserve(

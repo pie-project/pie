@@ -432,6 +432,20 @@ impl Source {
         })
     }
 
+    /// This source with the top-level attribute `key` set to `value`, in place
+    /// of any it held.
+    #[must_use]
+    pub fn with_attribute(mut self, key: &str, value: Value) -> Source {
+        let mut entries = match self.catalog.attributes() {
+            Some(Value::Map(entries)) => entries.clone(),
+            _ => Vec::new(),
+        };
+        entries.retain(|(k, _)| k.as_text() != Some(key));
+        entries.push((Value::Text(key.to_string()), value));
+        self.catalog.set_attributes(Some(Value::Map(entries)));
+        self
+    }
+
     pub fn len(&self) -> usize {
         self.catalog.len()
     }

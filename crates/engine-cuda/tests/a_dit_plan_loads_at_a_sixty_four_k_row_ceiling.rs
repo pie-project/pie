@@ -76,8 +76,8 @@ fn the_plan_loads_at_the_ceiling_and_fires_below_the_first_rung() {
         .engine
         .submit(&frame(
             vec![
-                lane(0, &text, LaneStream::Text, 0),
-                lane(1, &image, LaneStream::Image, 0),
+                lane(&rig, 0, &text, LaneStream::Text, 0),
+                lane(&rig, 1, &image, LaneStream::Image, 0),
             ],
             vec![attach(0, &text), attach(1, &image)],
         ))

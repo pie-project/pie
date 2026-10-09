@@ -1,0 +1,700 @@
+use std::cell::{Cell, RefCell};
+use std::ops::Mul;
+use std::rc::Rc;
+
+use poem_ir::{
+    CacheRow, Def, Dim, Dtype, Guard, Node, Operands, Operation, Param, ParamLayout, ParamSource,
+    Platform, RuntimeInput, Seam, Shard, Trace, Ty, ValueDecl, ValueId,
+};
+
+use crate::declare::Weight;
+use crate::fact::Predicate;
+
+const UNCLAIMED: u32 = u32::MAX;
+
+/// An op a model may write: every family but `Fused`, which only the compiler
+/// forms from these.
+pub trait Primitive: Into<Operation> + sealed::Sealed {}
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+macro_rules! primitive {
+    ($($family:ty),+) => {
+        $(
+            impl sealed::Sealed for $family {}
+            impl Primitive for $family {}
+        )+
+    };
+}
+
+primitive!(
+    poem_ir::Attention,
+    poem_ir::Linear,
+    poem_ir::Elementwise,
+    poem_ir::Layout,
+    poem_ir::Collective,
+    poem_ir::Spatial
+);
+
+#[derive(Clone)]
+pub struct Recorder {
+    inner: Rc<RefCell<Trace>>,
+
+    at: Rc<Cell<Option<u32>>>,
+}
+
+impl Recorder {
+    pub(crate) fn new(name: &str, platform: Platform, caches: Vec<CacheRow>) -> Recorder {
+        Recorder {
+            inner: Rc::new(RefCell::new(Trace {
+                name: name.to_string(),
+                platform,
+                params: Vec::new(),
+                caches,
+                values: Vec::new(),
+                nodes: Vec::new(),
+                drafter: None,
+                seams: Vec::new(),
+                facts: poem_ir::Facts::default(),
+            })),
+            at: Rc::new(Cell::new(None)),
+        }
+    }
+
+    pub fn fresh(&self, ty: Ty) -> Value {
+        let mut p = self.inner.borrow_mut();
+        p.values.push(ValueDecl {
+            def: Def::Op(UNCLAIMED),
+            ty: ty.clone(),
+        });
+        let id = ValueId((p.values.len() - 1) as u32);
+        drop(p);
+        Value {
+            rec: self.clone(),
+            id,
+            over: None,
+            ty,
+        }
+    }
+
+    pub fn push(&self, op: impl Primitive, ins: &[&Value]) {
+        let op = op.into();
+        let cond = if joins_arms(&op) {
+            join(ins)
+        } else {
+            let mut cond = Guard::Always;
+            for v in ins {
+                let c = v.cond();
+                assert!(
+                    compatible(&cond, &c),
+                    "`{}` mixes values from different split arms",
+                    op.name(),
+                );
+                cond = meet(cond, c);
+            }
+            cond
+        };
+        let mut outs = Vec::new();
+        op.outputs(&mut outs);
+        let mut p = self.inner.borrow_mut();
+        let index = p.nodes.len() as u32;
+        for id in outs {
+            if let Some(decl) = p.values.get_mut(id.0 as usize)
+                && decl.def == Def::Op(UNCLAIMED)
+            {
+                decl.def = Def::Op(index);
+            }
+        }
+        p.nodes.push(Node {
+            op,
+            guard: cond,
+            layer: self.at.get(),
+        });
+    }
+
+    pub fn weight(&self, w: &Weight) -> ValueId {
+        let mut p = self.inner.borrow_mut();
+        let w = &w.placed(p.platform);
+        let mut first = None;
+        for plane in w.planes() {
+            let name = format!("{}{}", w.name, plane.suffix);
+            let shard = restated(&w.shard, &w.shape, &plane.shape, &name);
+            let index = intern(
+                &mut p,
+                name,
+                plane.shape,
+                shard,
+                plane.dtype,
+                w.source,
+                w.layout,
+            );
+            first.get_or_insert(index);
+        }
+        let first = first.expect("a weight stores at least one plane");
+        if let Some(seen) = p.values.iter().position(|v| v.def == Def::Weight(first)) {
+            return ValueId(seen as u32);
+        }
+        p.values.push(ValueDecl {
+            def: Def::Weight(first),
+            ty: Ty::Tensor {
+                shape: w.shape.iter().copied().map(Dim::Const).collect(),
+                dtype: w.compute_dtype(),
+            },
+        });
+        ValueId((p.values.len() - 1) as u32)
+    }
+
+    pub fn cache(&self, name: &str) -> ValueId {
+        let mut p = self.inner.borrow_mut();
+        let index = p
+            .caches
+            .iter()
+            .position(|row| cache_name(row) == name)
+            .unwrap_or_else(|| panic!("`{name}` is not a cache the model's caches() declares"))
+            as u32;
+        if let Some(seen) = p.values.iter().position(|v| v.def == Def::Cache(index)) {
+            return ValueId(seen as u32);
+        }
+        p.values.push(ValueDecl {
+            def: Def::Cache(index),
+            ty: Ty::Tensor {
+                shape: Vec::new(),
+                dtype: Dtype::U8,
+            },
+        });
+        ValueId((p.values.len() - 1) as u32)
+    }
+
+    pub fn input(&self, which: RuntimeInput, ty: Ty) -> Value {
+        let mut p = self.inner.borrow_mut();
+        let id = match p.values.iter().position(|v| v.def == Def::Input(which)) {
+            Some(seen) => {
+                assert!(
+                    p.values[seen].ty == ty,
+                    "`{which:?}` is bound twice with two types",
+                );
+                ValueId(seen as u32)
+            }
+            None => {
+                p.values.push(ValueDecl {
+                    def: Def::Input(which),
+                    ty: ty.clone(),
+                });
+                ValueId((p.values.len() - 1) as u32)
+            }
+        };
+        drop(p);
+        Value {
+            rec: self.clone(),
+            id,
+            over: None,
+            ty,
+        }
+    }
+
+    pub fn block_drafter(&self, facts: poem_ir::BlockDrafter) {
+        let mut inner = self.inner.borrow_mut();
+        match inner.drafter {
+            Some(prior) if prior != facts => {
+                panic!("the text states two block drafters: {prior:?} and then {facts:?}")
+            }
+            _ => inner.drafter = Some(facts),
+        }
+    }
+
+    pub fn seam(&self, name: &str, values: &[&Value]) {
+        let ids = values.iter().map(|v| v.id).collect();
+        self.inner.borrow_mut().seams.push(Seam {
+            seam: name.to_string(),
+            values: ids,
+            layer: self.at.get(),
+        });
+    }
+
+    #[must_use]
+    pub(crate) fn seamed(&self, name: &str, value: &Value) -> bool {
+        self.inner
+            .borrow()
+            .seams
+            .iter()
+            .any(|seam| seam.seam == name && seam.values.contains(&value.id))
+    }
+
+    /// The guard over the rows `predicate` holds for, its facts given bits
+    /// in the order the trace first reads them.
+    #[must_use]
+    pub fn guard_of(&self, predicate: &Predicate) -> Guard {
+        predicate.guard(&mut self.inner.borrow_mut().facts)
+    }
+
+    pub fn enter(&self, layer: u32) {
+        self.at.set(Some(layer));
+    }
+
+    pub fn leave(&self) {
+        self.at.set(None);
+    }
+
+    pub fn finish(self) -> Trace {
+        let plan = Rc::try_unwrap(self.inner)
+            .unwrap_or_else(|_| panic!("a Value outlived its trace"))
+            .into_inner();
+        if let Some(why) = unguarded_read(&plan) {
+            panic!("`{}` did not trace to a valid plan: {why}", plan.name);
+        }
+        if let Err(faults) = poem_ir::check(&plan) {
+            let mut msg = format!("`{}` did not trace to a valid plan:", plan.name);
+            for fault in &faults {
+                msg.push_str("\n  ");
+                msg.push_str(&fault.to_string());
+            }
+            panic!("{msg}");
+        }
+        plan
+    }
+
+    pub(crate) fn declare_cache(&self, row: CacheRow) {
+        self.inner.borrow_mut().caches.push(row);
+    }
+
+    pub(crate) fn finish_unchecked(self) -> Trace {
+        Rc::try_unwrap(self.inner)
+            .unwrap_or_else(|_| panic!("a Value outlived its trace"))
+            .into_inner()
+    }
+
+    fn guard(&self, id: ValueId) -> Guard {
+        let p = self.inner.borrow();
+        match &p.values[id.0 as usize].def {
+            Def::Op(i) => p
+                .nodes
+                .get(*i as usize)
+                .map(|n| n.guard.clone())
+                .unwrap_or(Guard::Always),
+            _ => Guard::Always,
+        }
+    }
+}
+
+/// A node reading a buffer a lane may not carry, on rows whose lanes are not
+/// known to carry it. Which rows carry a mask or adapter routes is a builtin
+/// fact; a custom fact an inferlet sets says nothing about them, so a kernel
+/// reading one runs only where its builtin holds.
+fn unguarded_read(plan: &Trace) -> Option<String> {
+    let mut ins = Vec::new();
+    for (j, node) in plan.nodes.iter().enumerate() {
+        ins.clear();
+        node.op.inputs(&mut ins);
+        for id in &ins {
+            let (builtin, what) = match &plan.values[id.0 as usize].def {
+                Def::Input(RuntimeInput::Mask { .. }) => {
+                    (poem_ir::Builtin::Masked, "fact.has(fact.Mask)")
+                }
+                Def::Input(RuntimeInput::AdapterRoutes) => {
+                    (poem_ir::Builtin::Adapted, "fact.has(fact.Adapter)")
+                }
+                _ => continue,
+            };
+            if !plan.facts.implies(&node.guard, builtin) {
+                return Some(format!(
+                    "node {j} ({}) reads {builtin:?} input on rows {what} does not hold \
+                     for; branch onto those rows with it first",
+                    node.op.name()
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn intern(
+    p: &mut Trace,
+    name: String,
+    shape: Vec<u64>,
+    shard: Shard,
+    dtype: Dtype,
+    source: ParamSource,
+    layout: ParamLayout,
+) -> u32 {
+    if let Some(i) = p.params.iter().position(|q| q.name == name) {
+        let seen = &p.params[i];
+        assert!(
+            seen.shape == shape && seen.shard == shard && seen.dtype == dtype,
+            "`{name}` is declared twice with two shapes"
+        );
+        assert!(
+            seen.source == source,
+            "`{name}` is declared twice, once from the checkpoint and once as \
+             a registered bank"
+        );
+        assert!(
+            seen.layout == layout,
+            "`{name}` is declared twice with two device layouts"
+        );
+        return i as u32;
+    }
+    p.params.push(Param {
+        name,
+        shape,
+        shard,
+        dtype,
+        source,
+        layout,
+    });
+    (p.params.len() - 1) as u32
+}
+
+pub(crate) fn cache_name(row: &CacheRow) -> &str {
+    match row {
+        CacheRow::Kv { name, .. } | CacheRow::State { name, .. } => name,
+    }
+}
+
+#[derive(Clone)]
+pub struct Value {
+    rec: Recorder,
+    id: ValueId,
+    over: Option<Guard>,
+    ty: Ty,
+}
+
+impl Value {
+    #[must_use]
+    pub fn id(&self) -> ValueId {
+        self.id
+    }
+
+    #[must_use]
+    pub fn rec(&self) -> &Recorder {
+        &self.rec
+    }
+
+    #[must_use]
+    pub fn ty(&self) -> &Ty {
+        &self.ty
+    }
+
+    #[must_use]
+    pub fn rows(&self) -> Dim {
+        let Ty::Tensor { shape, .. } = &self.ty else {
+            panic!("a struct value has no rows");
+        };
+        *shape
+            .first()
+            .unwrap_or_else(|| panic!("a rank-0 value has no rows"))
+    }
+
+    #[must_use]
+    pub fn width(&self) -> u64 {
+        let Ty::Tensor { shape, .. } = &self.ty else {
+            panic!("a struct value has no width");
+        };
+        match shape.last() {
+            Some(Dim::Const(n)) => *n,
+            Some(dim) => panic!("a value's trailing axis is {dim:?}, not the const a width needs"),
+            None => panic!("a rank-0 value has no width"),
+        }
+    }
+
+    #[must_use]
+    pub fn dtype(&self) -> Dtype {
+        let Ty::Tensor { dtype, .. } = &self.ty else {
+            panic!("a struct value has no dtype");
+        };
+        *dtype
+    }
+
+    pub(crate) fn cond(&self) -> Guard {
+        match &self.over {
+            Some(c) => c.clone(),
+            None => self.rec.guard(self.id),
+        }
+    }
+
+    /// The rows of this value `predicate` holds for.
+    #[must_use]
+    pub fn on(&self, predicate: Predicate) -> Value {
+        self.refined(self.rec.guard_of(&predicate))
+    }
+
+    /// This value's rows parted by `cases`: each arm is the rows the first
+    /// case to hold for them names, and the last is the rows none holds for.
+    #[must_use]
+    pub fn partition<const N: usize>(&self, cases: [Predicate; N]) -> ([Value; N], Value) {
+        partition(self, &self.rec, cases)
+    }
+
+    /// Joins arms computed over disjoint rows into one value over all of
+    /// them. [`switch`] is the form a branch takes; this is for arms a
+    /// program carries apart over a longer span.
+    #[must_use]
+    pub fn merge(arms: Vec<Value>) -> Value {
+        assert!(arms.len() >= 2, "a merge wants at least two arms");
+        let rec = arms[0].rec.clone();
+        let ty = arms[0].ty.clone();
+        let joined = arms.iter().map(|a| (a.id, a.cond())).collect::<Vec<_>>();
+        let cond = joined
+            .iter()
+            .skip(1)
+            .fold(joined[0].1.clone(), |c, (_, a)| Guard::or(c, a.clone()))
+            .simplified();
+        let arms: Vec<Guard> = joined.iter().map(|(_, c)| c.clone()).collect();
+        let shared = Guard::common(&arms);
+        let cond = if matches!(shared, Guard::Always) || !shared.equivalent(&cond) {
+            cond
+        } else {
+            shared
+        };
+        let mut p = rec.inner.borrow_mut();
+        p.values.push(ValueDecl {
+            def: Def::Merge(joined),
+            ty: ty.clone(),
+        });
+        let id = ValueId((p.values.len() - 1) as u32);
+        drop(p);
+        Value {
+            rec,
+            id,
+            over: Some(cond),
+            ty,
+        }
+    }
+
+    pub(crate) fn under(&self, cond: Guard) -> Value {
+        Value {
+            rec: self.rec.clone(),
+            id: self.id,
+            over: Some(cond),
+            ty: self.ty.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn everywhere(&self) -> Value {
+        Value {
+            rec: self.rec.clone(),
+            id: self.id,
+            over: Some(Guard::Always),
+            ty: self.ty.clone(),
+        }
+    }
+}
+
+impl Refine for Value {
+    fn refined(&self, cond: Guard) -> Value {
+        Value {
+            rec: self.rec.clone(),
+            id: self.id,
+            over: Some(Guard::narrow(self.cond(), cond)),
+            ty: self.ty.clone(),
+        }
+    }
+}
+
+impl Mul<f32> for Value {
+    type Output = Value;
+
+    fn mul(self, rhs: f32) -> Value {
+        let y = self.rec.fresh(self.ty.clone());
+        self.rec.push(
+            poem_ir::Elementwise::MulScalar {
+                s: rhs,
+                x: self.id,
+                x_out: y.id(),
+            },
+            &[&self],
+        );
+        y
+    }
+}
+
+pub trait Refine: Sized {
+    fn refined(&self, cond: Guard) -> Self;
+}
+
+/// Cases taken in order, each holding for the rows it is the first to hold
+/// for.
+#[derive(Default)]
+pub(crate) struct FirstMatch {
+    rest: Option<Guard>,
+}
+
+impl FirstMatch {
+    /// The rows `holds` is the first case to hold for.
+    pub(crate) fn case(&mut self, holds: Guard) -> Guard {
+        let rest = self.rest.take().unwrap_or(Guard::Always);
+        self.rest = Some(Guard::and(rest.clone(), Guard::not(holds.clone())));
+        Guard::and(rest, holds)
+    }
+
+    /// The rows no case holds for.
+    pub(crate) fn rest(self) -> Guard {
+        self.rest.unwrap_or(Guard::Always)
+    }
+}
+
+pub(crate) fn partition<T: Refine, const N: usize>(
+    of: &T,
+    rec: &Recorder,
+    cases: [Predicate; N],
+) -> ([T; N], T) {
+    let mut chain = FirstMatch::default();
+    let arms = cases.map(|case| of.refined(chain.case(rec.guard_of(&case))));
+    (arms, of.refined(chain.rest()))
+}
+
+/// What a [`switch`] arm computes: a value, or several, each joined across
+/// the arms.
+pub trait Arm: Sized {
+    fn join(arms: Vec<Self>) -> Self;
+}
+
+impl Arm for Value {
+    fn join(mut arms: Vec<Value>) -> Value {
+        if arms.len() == 1 {
+            return arms.remove(0);
+        }
+        Value::merge(arms)
+    }
+}
+
+impl Arm for (Value, Value) {
+    fn join(arms: Vec<(Value, Value)>) -> (Value, Value) {
+        let (a, b) = arms.into_iter().unzip();
+        (Value::join(a), Value::join(b))
+    }
+}
+
+impl Arm for (Value, Value, Value) {
+    fn join(arms: Vec<(Value, Value, Value)>) -> (Value, Value, Value) {
+        let (mut a, mut b, mut c) = (Vec::new(), Vec::new(), Vec::new());
+        for (x, y, z) in arms {
+            a.push(x);
+            b.push(y);
+            c.push(z);
+        }
+        (Value::join(a), Value::join(b), Value::join(c))
+    }
+}
+
+/// Branches the rows of `x`: each case computes over the rows it is the
+/// first to hold for, and the arms are joined into one result over all of
+/// them.
+pub fn switch<T: Arm>(x: &Value) -> Switch<'_, T> {
+    Switch {
+        x,
+        chain: FirstMatch::default(),
+        arms: Vec::new(),
+    }
+}
+
+#[must_use = "a switch computes nothing until it is ended"]
+pub struct Switch<'a, T> {
+    x: &'a Value,
+    chain: FirstMatch,
+    arms: Vec<T>,
+}
+
+impl<T: Arm> Switch<'_, T> {
+    /// The rows `predicate` is the first case to hold for.
+    pub fn case(mut self, predicate: Predicate, arm: impl FnOnce(&Value) -> T) -> Self {
+        let rows = self
+            .x
+            .refined(self.chain.case(self.x.rec.guard_of(&predicate)));
+        self.arms.push(arm(&rows));
+        self
+    }
+
+    /// The rows no case holds for, and the joined result.
+    pub fn otherwise(mut self, arm: impl FnOnce(&Value) -> T) -> T {
+        let rows = self.x.refined(self.chain.rest());
+        self.arms.push(arm(&rows));
+        T::join(self.arms)
+    }
+
+    /// The joined result, rows no case holds for computing nothing.
+    pub fn end(self) -> T {
+        T::join(self.arms)
+    }
+}
+
+fn restated(shard: &Shard, logical: &[u64], plane: &[u64], name: &str) -> Shard {
+    let Shard::Cut {
+        axis,
+        segments,
+        heads,
+    } = shard
+    else {
+        return Shard::Replicated;
+    };
+    let at = *axis as usize;
+    let whole = logical[at];
+    let stored = *plane.get(at).unwrap_or_else(|| {
+        panic!("`{name}` stores {plane:?} and its cut names axis {at} of {logical:?}")
+    });
+    assert_eq!(
+        logical[..at],
+        plane[..at],
+        "`{name}`: the axes before its cut are not stored verbatim",
+    );
+    assert!(
+        stored > 0 && whole.is_multiple_of(stored),
+        "`{name}`: axis {at} is {whole} logically and {stored} as stored",
+    );
+    let block = whole / stored;
+    Shard::Cut {
+        axis: *axis,
+        segments: segments
+            .iter()
+            .map(|s| {
+                assert!(
+                    s.is_multiple_of(block),
+                    "`{name}`: a segment of {s} is not a whole number of \
+                     {block}-wide blocks",
+                );
+                s / block
+            })
+            .collect(),
+        heads: heads.clone(),
+    }
+}
+
+/// Whether two values' rows are one set of rows, written alike or not.
+fn compatible(a: &Guard, b: &Guard) -> bool {
+    matches!(a, Guard::Always) || matches!(b, Guard::Always) || a == b || a.equivalent(b)
+}
+
+fn joins_arms(op: &Operation) -> bool {
+    matches!(op, Operation::Attention(poem_ir::Attention::Ragged { .. }))
+}
+
+fn join(ins: &[&Value]) -> Guard {
+    let mut distinct: Vec<Guard> = Vec::new();
+    for c in ins.iter().map(|v| v.cond()) {
+        if !matches!(c, Guard::Always) && !distinct.contains(&c) {
+            distinct.push(c);
+        }
+    }
+    let Some((first, rest)) = distinct.split_first() else {
+        return Guard::Always;
+    };
+    let joined = rest
+        .iter()
+        .fold(first.clone(), |a, b| Guard::or(a, b.clone()))
+        .simplified();
+    let shared = Guard::common(&distinct);
+    if matches!(shared, Guard::Always) || !shared.equivalent(&joined) {
+        joined
+    } else {
+        shared
+    }
+}
+
+fn meet(a: Guard, b: Guard) -> Guard {
+    match (a, b) {
+        (Guard::Always, x) | (x, Guard::Always) => x,
+        (a, _) => a,
+    }
+}

@@ -16,7 +16,6 @@ use crate::config::{ByteSize, Config, EngineKind};
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
-    pub sku: Option<String>,
     /// False boots the runtime with no engine, for programs that never run a
     /// forward pass.
     pub engine: bool,
@@ -36,7 +35,6 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            sku: None,
             engine: true,
             max_forward_tokens: 512,
             max_forward_requests: 8,
@@ -83,7 +81,6 @@ impl Settings {
         document.insert("model".into(), model.into());
         let mut config = Config::parse(&document.to_string())?;
 
-        config.model.sku = self.sku.clone();
         config.model.engine.options = self.engine_options(kind, home);
         config.server.worker_threads = 2;
         config.server.verbose = self.verbose;

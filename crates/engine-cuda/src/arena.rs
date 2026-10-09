@@ -99,20 +99,19 @@ pub fn carve(base: u64, map: &ArenaMap, rows: poem_compiler::FireRows) -> SlotTa
 
 #[cfg(test)]
 mod tests {
+    use poem::Platform;
     use poem_compiler::{Budget, DeviceProfile, compile};
-    use poem_dsl::Platform;
 
     use super::*;
 
-    const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
+    const DEPLOYMENT: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
     fn compiled() -> (poem_ir::Trace, poem_compiler::CompiledModel) {
-        let trace = models::sku(SKU)
-            .expect("the catalog ships the smoke's SKU")
-            .trace;
-        let trace = trace(Platform::Cuda);
+        let trace = models::deployment(DEPLOYMENT)
+            .expect("the catalog ships the smoke's deployment")
+            .trace(Platform::Cuda);
         let compiled = compile(&trace, &Budget::new(4, 64), &DeviceProfile::default())
-            .expect("the smoke's SKU bakes");
+            .expect("the smoke's deployment bakes");
         (trace, compiled)
     }
 

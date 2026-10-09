@@ -3,21 +3,22 @@ use std::path::PathBuf;
 
 use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{Expr, Partition, TensorType};
-use models::flux_2::forward::Facts;
-use models::flux_2::{model, vae};
+pub mod flux_2_dims;
+
+use flux_2_dims::{self as model, vae};
 use models::{PortKind, ReadoutKind};
-use poem_dsl::{Classify, Def, Dim, Dtype, Operation, Platform, Request, Stream, Trace, Ty, seam};
+use poem::{Def, Dim, Dtype, Operation, Platform, Request, Stream, Trace, Ty, seam};
 use poem_ir::{GridRule, ParamLayout, Seam, Spatial};
 
 const KLEIN: &str = "flux2-klein-4b-bf16-kv-bf16";
 const MINI: &str = "flux2-mini-bf16-kv-bf16";
 
-fn row(sku: &str) -> &'static models::Sku {
-    models::sku(sku).unwrap_or_else(|| panic!("this build ships no `{sku}`"))
+fn row(deployment: &str) -> &'static models::Deployment {
+    models::deployment(deployment).unwrap_or_else(|| panic!("this build ships no `{deployment}`"))
 }
 
-fn trace(sku: &str) -> Trace {
-    (row(sku).trace)(Platform::Cuda)
+fn trace(deployment: &str) -> Trace {
+    row(deployment).trace(Platform::Cuda)
 }
 
 fn reading<'a>(facts: &'a models::Generative, name: &str) -> &'a models::ReadingFact {
@@ -40,7 +41,7 @@ fn the_flux_2_vae_bakes_every_case() {
 
 fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
     let facts = row(KLEIN).generative.as_ref().expect("facts");
-    let names: Vec<&str> = facts.readings.iter().map(|r| r.name).collect();
+    let names: Vec<&str> = facts.readings.iter().map(|r| r.name.as_str()).collect();
     assert_eq!(names, vec!["text", "denoise", "vae.decode", "vae.encode"]);
     let decode = reading(facts, "vae.decode");
     let encode = reading(facts, "vae.encode");
@@ -54,7 +55,7 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
     }
     assert_eq!(
         (
-            decode.ports[0].name,
+            decode.ports[0].name.as_str(),
             decode.ports[0].width,
             decode.readout_width
         ),
@@ -62,7 +63,7 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
     );
     assert_eq!(
         (
-            encode.ports[0].name,
+            encode.ports[0].name.as_str(),
             encode.ports[0].width,
             encode.readout_width
         ),
@@ -99,7 +100,7 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
         !trace(MINI)
             .values
             .iter()
-            .any(|v| matches!(v.def, Def::Input(poem_dsl::RuntimeInput::Voxels { .. }))),
+            .any(|v| matches!(v.def, Def::Input(poem::RuntimeInput::Voxels { .. }))),
         "and reads no voxel port"
     );
 }
@@ -111,7 +112,7 @@ fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
         .iter()
         .filter_map(|v| match (&v.def, &v.ty) {
             (
-                Def::Input(poem_dsl::RuntimeInput::Voxels { port, channels }),
+                Def::Input(poem::RuntimeInput::Voxels { port, channels }),
                 Ty::Tensor { dtype, .. },
             ) => Some((*port, *channels, format!("{dtype:?}"))),
             _ => None,
@@ -277,12 +278,12 @@ fn the_shapes_are_the_flux2_autoencoders() {
 
 fn each_vae_lane_has_a_class_of_its_own() {
     let plan = trace(KLEIN);
-    let classes = poem_dsl::resolve_classes(&plan).expect("every merge resolves");
+    let classes = poem::resolve_classes(&plan).expect("every merge resolves");
     let facts = row(KLEIN).generative.as_ref().expect("facts");
     let class_of = |name: &str, stream: Stream| {
         let r = reading(facts, name);
-        let request = Request::new(4, false).on_stream(stream).in_reading(r.index);
-        let word = Facts::of(&request).word();
+        let request = Request::new(4, false).on_stream(stream).in_reading(&r.name);
+        let word = plan.facts.word(&request);
         classes
             .class_of(word & classes.mask)
             .unwrap_or_else(|| panic!("a {name} lane has no class"))
@@ -368,9 +369,11 @@ fn the_import_reads_every_vae_tensor_of_the_real_snapshot_once() {
     };
     let src = checkpoint::file::diffusers::open(&root)
         .unwrap_or_else(|why| panic!("{}: {why}", root.display()));
-    let contract = model::Model::klein_4b(Dtype::Bf16, 1)
-        .import_vae(&src, Platform::Cuda)
-        .unwrap_or_else(|why| panic!("the VAE does not read this snapshot: {why}"));
+    let mut contract = models::deployment("flux2-klein-4b-bf16-kv-bf16")
+        .expect("the klein row")
+        .contract(&src, Platform::Cuda)
+        .unwrap_or_else(|why| panic!("the pipeline does not read this snapshot: {why}"));
+    contract.tensors.retain(|t| t.name.starts_with("vae."));
 
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for tensor in &contract.tensors {

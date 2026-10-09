@@ -5,16 +5,16 @@ use crate::value::ValueId;
 
 pub mod attn;
 pub mod collective;
-pub mod custom_cuda;
 pub mod elemwise;
+pub mod fused;
 pub mod layout;
 pub mod linear;
 pub mod spatial;
 
 pub use attn::{Attention, RaggedMask};
 pub use collective::Collective;
-pub use custom_cuda::CustomCuda;
-pub use elemwise::{Elementwise, GateActivation, ModulateForm, MropeForm, NormKind, RopeForm};
+pub use elemwise::{Elementwise, GateActivation, ModulateForm, MropeForm, RopeForm};
+pub use fused::{Fused, NormKind};
 pub use layout::Layout;
 pub use linear::Linear;
 pub use spatial::{GridRule, Spatial, TimePad, VoxelSegment};
@@ -26,7 +26,7 @@ pub enum Operation {
     Elementwise(Elementwise),
     Layout(Layout),
     Collective(Collective),
-    CustomCuda(CustomCuda),
+    Fused(Fused),
     Spatial(Spatial),
 }
 
@@ -38,7 +38,7 @@ impl Operation {
             Self::Elementwise(op) => op,
             Self::Layout(op) => op,
             Self::Collective(op) => op,
-            Self::CustomCuda(op) => op,
+            Self::Fused(op) => op,
             Self::Spatial(op) => op,
         }
     }
@@ -84,9 +84,9 @@ impl From<Collective> for Operation {
         Self::Collective(op)
     }
 }
-impl From<CustomCuda> for Operation {
-    fn from(op: CustomCuda) -> Self {
-        Self::CustomCuda(op)
+impl From<Fused> for Operation {
+    fn from(op: Fused) -> Self {
+        Self::Fused(op)
     }
 }
 impl From<Spatial> for Operation {

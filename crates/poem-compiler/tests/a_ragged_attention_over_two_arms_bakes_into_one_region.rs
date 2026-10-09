@@ -1,28 +1,12 @@
 mod common;
 
-use poem_compiler::Placement;
-use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Predicate, RaggedMask, Request, Stream,
-    Value, Weight, ops, seam, trace_hybrid,
+use poem::fact;
+use poem::{
+    Dtype, ForwardHybrid, HybridSpec, Input, RaggedMask, Request, Stream, Value, Weight, ops, seam,
+    trace_hybrid,
 };
+use poem_compiler::Placement;
 use poem_ir::{Attention, Def, Layout, Linear, Operation, RuntimeInput};
-
-struct StreamFacts(Stream);
-
-impl StreamFacts {
-    fn on(stream: Stream) -> Predicate {
-        Predicate::stream(0, stream)
-    }
-}
-
-impl Classify for StreamFacts {
-    fn of(r: &Request) -> StreamFacts {
-        StreamFacts(r.stream())
-    }
-    fn word(&self) -> u64 {
-        self.0.word(0)
-    }
-}
 
 const AUDIO: u64 = 32;
 const VIDEO: u64 = 48;
@@ -32,16 +16,12 @@ const HEADS: u64 = 4;
 struct CrossAttention;
 
 impl ForwardHybrid for CrossAttention {
-    type Facts = StreamFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<StreamFacts>) -> Value {
-        let [audio, video, _rest] = inputs.split([
-            StreamFacts::on(Stream::Audio),
-            StreamFacts::on(Stream::Video),
-            Predicate::rest(),
-        ]);
+    fn forward(&self, inputs: Input) -> Value {
+        let ([audio, video], _rest) =
+            inputs.partition([fact::stream(Stream::Audio), fact::stream(Stream::Video)]);
         let inner = HEADS * u64::from(HEAD_DIM);
         let wq = Weight::sym("audio.q", [inner, AUDIO], Dtype::Bf16);
         let wk = Weight::sym("video.k", [inner, VIDEO], Dtype::Bf16);
@@ -83,11 +63,21 @@ fn the_join_is_the_attentions_alone_and_the_velocity_lives_to_the_end() {
 
         let audio_class = compiled
             .classes
-            .class_of(StreamFacts(Stream::Audio).word() & compiled.classes.mask)
+            .class_of(
+                trace
+                    .facts
+                    .word(&Request::new(1, false).on_stream(Stream::Audio))
+                    & compiled.classes.mask,
+            )
             .expect("an audio lane has a class");
         let video_class = compiled
             .classes
-            .class_of(StreamFacts(Stream::Video).word() & compiled.classes.mask)
+            .class_of(
+                trace
+                    .facts
+                    .word(&Request::new(1, false).on_stream(Stream::Video))
+                    & compiled.classes.mask,
+            )
             .expect("a video lane has a class");
         assert_ne!(audio_class, video_class);
 

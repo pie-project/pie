@@ -41,7 +41,8 @@ tokenizer = { path = "../tokenizer" }
 grammar = { path = "../grammar" }
 models = { path = "../models" }
 checkpoint = { path = "../checkpoint", default-features = false }
-checkpoint-dsl = { path = "../checkpoint-dsl" }
+poem = { package = "pie-poem", path = "../poem" }
+poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
 media = { path = "../media" }
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }

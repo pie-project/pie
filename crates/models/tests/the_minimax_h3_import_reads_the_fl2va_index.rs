@@ -1,11 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+pub mod minimax_h3_dims;
+
 use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{ModelContract, Partition, TensorType};
 use checkpoint::plan::StorageTarget;
-use models::minimax_h3::model::{self, Dims};
-use poem_dsl::Platform;
+use minimax_h3_dims::{self as model, Dims};
+use poem::Platform;
 use ztensor::Leaf;
 use ztensor::provide::{Catalog, Entry, Location, Store, StoreId};
 
@@ -325,12 +327,12 @@ fn the_minimax_h3_import_reads_the_fl2va_index_every_case() {
 
 fn the_flagship_reads_a_synthetic_partition_at_the_counts_its_cuts_imply() {
     let dir = scratch();
-    let d = Dims::h3(1);
+    let d = Dims::h3();
     let mut tensors = prefixed("dit.", transformer(&d));
     tensors.extend(prefixed("te.", text_encoder(model::TE_DEPTH)));
     let src = synthetic(&dir, &tensors);
 
-    let row = models::sku(FLAGSHIP).expect("the catalog ships the flagship");
+    let row = models::deployment(FLAGSHIP).expect("the catalog ships the flagship");
     let contract = row
         .contract(&src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the flagship does not read a synthetic partition: {why}"));
@@ -367,12 +369,12 @@ fn the_flagship_reads_a_synthetic_partition_at_the_counts_its_cuts_imply() {
 fn the_flagship_refuses_a_bare_transformer() {
     let dir = scratch();
     let src = synthetic(&dir, &transformer(&Dims::mini()));
-    let row = models::sku(FLAGSHIP).expect("the catalog ships the flagship");
+    let row = models::deployment(FLAGSHIP).expect("the catalog ships the flagship");
     assert!(
         row.contract(&src, Platform::Cuda).is_err(),
         "the flagship read a bare 128-wide transformer with no encoder"
     );
-    let mini = models::sku(MINI).expect("the catalog ships the miniature");
+    let mini = models::deployment(MINI).expect("the catalog ships the miniature");
     let contract = mini
         .contract(&src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the miniature does not read its own state_dict: {why}"));
@@ -428,7 +430,7 @@ fn the_flagships_names_are_the_partitions_index() {
         eprintln!("skipping: the partition's transformer has no shard index yet");
         return;
     };
-    let d = Dims::h3(1);
+    let d = Dims::h3();
     let synthesized: BTreeSet<String> =
         transformer(&d).into_iter().map(|(name, ..)| name).collect();
     assert_eq!(
@@ -500,7 +502,7 @@ fn the_miniature_reads_its_golden_fixture() {
             "`{name}`"
         );
     }
-    let row = models::sku(MINI).expect("the catalog ships the miniature");
+    let row = models::deployment(MINI).expect("the catalog ships the miniature");
     let contract = row
         .contract(&src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the miniature does not read its own fixture: {why}"));

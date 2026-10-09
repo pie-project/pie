@@ -596,6 +596,7 @@ mod tests {
 
     fn plan(values: Vec<ValueDecl>, nodes: Vec<Operation>) -> Trace {
         Trace {
+            facts: Default::default(),
             name: "rs".to_string(),
             platform: Platform::Cuda,
             params: Vec::new(),

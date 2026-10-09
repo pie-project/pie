@@ -146,6 +146,8 @@ pub struct EngineConfig {
     pub has_lora: bool,
     pub device_geometry_port_mask: eta_ir::registry::PortMask,
     pub limits: crate::engine::SchedulerLimits,
+    /// The facts the engine's trace branches on.
+    pub facts: poem_ir::Facts,
     pub engine_backend: crate::engine::EngineBox,
 }
 
@@ -315,9 +317,22 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         has_attn_page_mask: !engine_configs.is_empty()
             && engine_configs.iter().all(|d| d.has_attn_page_mask),
     };
+    let facts = engine_configs
+        .first()
+        .map(|engine| engine.facts.clone())
+        .unwrap_or_default();
+    if let Some(other) = engine_configs.iter().find(|engine| engine.facts != facts) {
+        anyhow::bail!(
+            "the engines of one model classify requests by different facts ({:?} and {:?}); \
+             they run different traces",
+            facts.table,
+            other.facts.table
+        );
+    }
     model::register(
         name.clone(),
         &model_id,
+        facts,
         kv_page_size as u32,
         rs_caps,
         eta_caps,

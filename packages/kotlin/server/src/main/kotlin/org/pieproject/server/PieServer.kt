@@ -24,7 +24,7 @@ public class PieServer private constructor(private val handle: Long) : AutoClose
     @Serializable
     public class Summary internal constructor(
         public val model: String,
-        public val sku: String,
+        public val deployment: String,
         public val trace: String,
         @SerialName("weight_bytes") public val weightBytes: Long,
         @SerialName("kv_pages") public val kvPages: Int,
@@ -47,9 +47,6 @@ public class PieServer private constructor(private val handle: Long) : AutoClose
         /** The cap on each inferlet's linear memory. */
         @SerialName("sandbox_memory_mb") public var sandboxMemoryMB: Int = 256
         @SerialName("max_concurrent_processes") public var maxConcurrentProcesses: Int? = 4
-
-        /** The SKU to serve the artifact as; null reads it from the artifact. */
-        public var sku: String? = null
     }
 
     /**

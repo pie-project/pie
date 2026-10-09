@@ -57,7 +57,7 @@ pie produces; the shaders compile on the device at boot, so an artifact
 imported on a Mac loads on an iPhone:
 
 ```bash
-pie model import Qwen/Qwen3.5-0.8B --sku qwen35-d0.8b-u4g64-kv-bf16   # 441 MB, 4-bit
+pie model import Qwen/Qwen3.5-0.8B --deployment qwen35-d0.8b-u4g64-kv-bf16   # 441 MB, 4-bit
 ```
 
 `PieServer.Configuration` holds the engine budgets (KV pages, forward tokens and

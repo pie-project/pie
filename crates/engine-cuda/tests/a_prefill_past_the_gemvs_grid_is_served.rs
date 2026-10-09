@@ -5,8 +5,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use checkpoint::contract::ModelContract;
 use engine_cuda::{Boot, Graphs, Lane, Shell};
+use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Dtype, Platform, Request};
 use poem_ir::{ParamSource, Trace};
 
 const TOP_K: u32 = 4;
@@ -23,45 +23,20 @@ fn serialized() -> MutexGuard<'static, ()> {
 const PAGE: u32 = 16;
 struct Text {
     name: &'static str,
-    build: fn() -> models::qwen_3::model::Model,
-    classify: poem_ir::ClassifyFn,
-    word: fn(u32) -> u64,
     ceiling: u32,
 }
 
-fn micro() -> models::qwen_3::model::Model {
-    models::qwen_3::model::Model::a3b_micro(Dtype::Bf16, Dtype::Bf16, 1)
-}
-fn micro_classify(request: &Request) -> u64 {
-    poem_dsl::word_of(micro, request)
-}
-fn micro_word(len: u32) -> u64 {
-    poem_dsl::word_of(micro, &Request::new(len, false))
-}
-
-fn uncached() -> models::qwen_3::model::Model {
-    models::qwen_3::model::Model::a3b_uncached_bank(Dtype::Bf16, Dtype::Bf16, 1)
-}
-fn uncached_classify(request: &Request) -> u64 {
-    poem_dsl::word_of(uncached, request)
-}
-fn uncached_word(len: u32) -> u64 {
-    poem_dsl::word_of(uncached, &Request::new(len, false))
+fn traced(id: &str) -> Trace {
+    models::star::trace_of(id, Dtype::Bf16, Dtype::Bf16, Platform::Cuda)
 }
 
 const MICRO: Text = Text {
-    name: "a3b_micro",
-    build: micro,
-    classify: micro_classify,
-    word: micro_word,
+    name: "qwen3-a3b-micro",
     ceiling: WIDE,
 };
 
 const UNCACHED: Text = Text {
-    name: "a3b_uncached_bank",
-    build: uncached,
-    classify: uncached_classify,
-    word: uncached_word,
+    name: "qwen3-a3b-uncached-bank",
     ceiling: BOTH,
 };
 
@@ -156,13 +131,12 @@ struct Fixture {
 }
 
 fn fixture(text: Text) -> Fixture {
-    let m = (text.build)();
-    let trace = poem_dsl::trace_hybrid(text.name, &m, Platform::Cuda);
+    let trace = traced(text.name);
     let dir = scratch(text.name);
     let container = dir.0.join("micro.zt");
     write_checkpoint(&container, &trace);
     let source = ztensor::Source::open(&container).expect("the fixture opens");
-    let contract = checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Cuda)
+    let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
         .expect("a container of the plan's own planes is read by the plan's own names");
     drop(source);
     Fixture {
@@ -176,7 +150,6 @@ fn fixture(text: Text) -> Fixture {
 
 fn load(fixture: &Fixture) -> engine_cuda::Result<Shell> {
     Shell::load(Boot {
-        classify: fixture.text.classify,
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
         checkpoint: &fixture.container,
@@ -205,7 +178,7 @@ fn fire_at(fixture: &Fixture, tokens: u32) -> engine_cuda::Result<(Vec<Vec<f32>>
     shell.open(0).expect("slot 0 opens");
     shell.open(1).expect("slot 1 opens");
     let prompt: Vec<u32> = (0..tokens).map(|t| (t * 7 + 11) % 2048).collect();
-    let word = (fixture.text.word)(tokens);
+    let word = fixture.trace.facts.word(&Request::new(tokens, false));
     shell.fire(&[Lane {
         slot: 0,
         word,

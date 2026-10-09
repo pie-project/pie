@@ -212,9 +212,10 @@ fn check_config(path: &Path, origin: crate::args::Origin) -> Checks {
         Status::Pass,
     )];
     let flavor = worker::backend::flavor::resolve(worker.model.engine.kind, &worker.model.name);
+    let overrides = worker.model.overrides().ok();
     let want = worker::weights::Want {
         backend: flavor.as_ref().ok().map(|flavor| flavor.as_str()),
-        sku: worker.model.sku.as_deref(),
+        overrides: overrides.as_ref(),
     };
     match worker::weights::resolve(&worker.model.model, want, &crate::paths::pie_home()) {
         Ok(resolved) => out.push((

@@ -11,7 +11,7 @@ pub(crate) const OBSERVE: u32 = 32;
 
 /// Where a load's score planes sit inside a lane's block. A program declares
 /// `layers * heads` planes, layer-major and head-minor, over the WHOLE model's
-/// query heads: the number it reads off the SKU, not off a rank. A
+/// query heads: the number it reads off the deployment, not off a rank. A
 /// tensor-parallel rank's trace exports only its own band of heads per layer,
 /// so the block is laid out at the model's width and each rank writes its band
 /// at `layer * heads + rank * band` — the same plane it would have at tp 1 —
@@ -232,11 +232,12 @@ mod tests {
 
     const SCORES_SEAM: &str = poem_compiler::EXPORT_SEAMS[2];
 
-    /// What `serve::load` hands `Scores::reserve` for a SKU: the `scores`
+    /// What `serve::load` hands `Scores::reserve` for a deployment: the `scores`
     /// exports in seam order and the query heads of the first one's rectangle.
-    fn exported(sku: &str) -> (Vec<ValueId>, u32) {
-        let row = models::sku(sku).unwrap_or_else(|| panic!("{sku} is in the catalog"));
-        let trace = (row.trace)(poem_ir::Platform::Cuda);
+    fn exported(deployment: &str) -> (Vec<ValueId>, u32) {
+        let row = models::deployment(deployment)
+            .unwrap_or_else(|| panic!("{deployment} is in the catalog"));
+        let trace = row.trace(poem_ir::Platform::Cuda);
         let exports: Vec<ValueId> = trace
             .seams
             .iter()
@@ -283,11 +284,11 @@ mod tests {
 
     #[test]
     fn every_tp2_row_that_exports_scores_seats_its_tp1_planes() {
-        for row in models::skus().filter(|sku| sku.recipe.tp == 2) {
+        for row in models::splits().filter(|deployment| deployment.deploy.tp == 2) {
             let Some(single) = row.name.strip_suffix("-tp2") else {
                 continue;
             };
-            if models::sku(single).is_none() {
+            if models::deployment(single).is_none() {
                 continue;
             }
             let (one, heads_one) = exported(single);

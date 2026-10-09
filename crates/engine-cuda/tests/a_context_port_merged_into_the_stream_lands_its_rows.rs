@@ -2,12 +2,11 @@
 
 mod common_dit;
 
-use common_dit::{
-    Lcg, NAME, Rig, StreamFacts, WIDTH, Weights, assert_close, attach, bf, frame, lane,
-};
+use common_dit::{Lcg, NAME, Rig, WIDTH, Weights, assert_close, attach, bf, frame, lane};
 use engine::Engine;
 use engine::fire::LaneStream;
-use poem_dsl::{
+use poem::fact;
+use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Stream, Trace, Value, Weight,
     ops, seam, trace_hybrid,
 };
@@ -17,12 +16,14 @@ const FREQ: u32 = 16;
 struct MergedBlock;
 
 impl ForwardHybrid for MergedBlock {
-    type Facts = StreamFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<StreamFacts>) -> Value {
-        let (txt, img) = inputs.split(&StreamFacts::on(Stream::Text));
+    fn forward(&self, inputs: Input) -> Value {
+        let (txt, img) = (
+            inputs.on(fact::stream(Stream::Text)),
+            inputs.on(!fact::stream(Stream::Text)),
+        );
         let x_txt = txt.context(0, WIDTH);
         let embed = Weight::sym("embed", [u64::from(WIDTH), u64::from(WIDTH)], Dtype::Bf16);
         let x_img = ops::linear::matmul(&img.latents(0, WIDTH, Dtype::Bf16), &embed);
@@ -132,13 +133,13 @@ fn the_merged_context_rows_and_the_f32_lane_chain_land_the_reference() {
             rig.publish(handles.instance, 2, &vec![0.0; rows * 2]);
         }
         let slot = 2 * req;
-        let mut text_lane = lane(slot, &t, LaneStream::Text, req);
+        let mut text_lane = lane(&rig, slot, &t, LaneStream::Text, req);
         for feed in &mut text_lane.ports {
             if feed.kind == engine::fire::PortKind::Latents {
                 feed.kind = engine::fire::PortKind::Context;
             }
         }
-        let mut image_lane = lane(slot + 1, &i, LaneStream::Image, req);
+        let mut image_lane = lane(&rig, slot + 1, &i, LaneStream::Image, req);
         for feed in &mut image_lane.ports {
             if feed.kind == engine::fire::PortKind::Latents {
                 feed.port = 0;

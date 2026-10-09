@@ -4,10 +4,10 @@ use std::path::PathBuf;
 
 use engine::fire::{Mask, Masking};
 use engine_metal::{Boot, Lane, Seated, Shell};
+use poem::{Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Classify, Platform, Request};
 
-const SKU: &str = "qwen36-27b-dflash-u4g64-kv-bf16";
+const DEPLOYMENT: &str = "qwen36-27b-dflash-u4g64-kv-bf16";
 
 const PROMPTS: &[(&str, &[u32])] = &[
     (
@@ -24,6 +24,14 @@ const PROMPTS: &[(&str, &[u32])] = &[
     ),
 ];
 
+/// The facts the deployment `deployment` classifies its lanes by.
+fn facts_of(deployment: &str) -> poem_ir::Facts {
+    models::deployment(deployment)
+        .expect("the catalog ships the row")
+        .trace(Platform::Metal)
+        .facts
+}
+
 fn artifact() -> Option<PathBuf> {
     if let Ok(named) = std::env::var("PIE_DFLASH_ARTIFACT") {
         let path = PathBuf::from(named.replace('~', &std::env::var("HOME").unwrap_or_default()));
@@ -33,7 +41,7 @@ fn artifact() -> Option<PathBuf> {
     for entry in std::fs::read_dir(store).ok()?.flatten() {
         for file in std::fs::read_dir(entry.path()).ok()?.flatten() {
             let name = file.file_name().to_string_lossy().into_owned();
-            if name.contains(SKU) && name.ends_with(".zt") {
+            if name.contains(DEPLOYMENT) && name.ends_with(".zt") {
                 return Some(file.path());
             }
         }
@@ -61,10 +69,12 @@ fn the_target_keeps_a_measured_prefix_of_every_block() {
         eprintln!("not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/models)");
         return;
     };
-    let sku = models::sku(SKU).expect("the catalog ships the block-drafter row");
-    let trace = (sku.trace)(Platform::Metal);
+    let deployment =
+        models::deployment(DEPLOYMENT).expect("the catalog ships the block-drafter row");
+    let trace = deployment.trace(Platform::Metal);
+    let drafter = trace.drafter.expect("the row states its block drafter");
     let source = ztensor_compat::index(&artifact).expect("the artifact opens");
-    let contract = checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Metal)
+    let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Metal)
         .expect("the artifact holds every plane");
     drop(source);
     let mut shell = Shell::load(Boot {
@@ -85,15 +95,11 @@ fn the_target_keeps_a_measured_prefix_of_every_block() {
     })
     .expect("the block drafter's shell loads");
 
-    let block = models::qwen_3::model::QWEN36_27B_DFLASH.block as usize;
-    let mask_token = models::qwen_3::model::QWEN36_27B_DFLASH.mask_token;
-    let drafting = |len: u32| {
-        models::qwen_3::forward::Facts::of(&Request::new(len, false).drafting(true)).word()
-    };
-    let block_word = models::qwen_3::forward::Facts::of(
-        &Request::new(block as u32, true).drafting_a_block(true),
-    )
-    .word();
+    let block = drafter.rows as usize;
+    let mask_token = drafter.mask_token;
+    let drafting = |len: u32| facts_of(DEPLOYMENT).word(&Request::new(len, false).drafting(true));
+    let block_word =
+        facts_of(DEPLOYMENT).word(&Request::new(block as u32, true).drafting_a_block(true));
 
     const ANCHORS: usize = 4;
 

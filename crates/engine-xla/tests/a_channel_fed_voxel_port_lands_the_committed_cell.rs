@@ -7,8 +7,8 @@
 mod common_dit;
 
 use common_dit::{
-    C_IN, C_OUT, Lcg, Rig, VAE_READING, WIDTH, Weights, assert_close, attach, bf, carrier,
-    condition, conv_reference, matmul, modulation, two_axis, vae_word,
+    C_IN, C_OUT, Lcg, Rig, WIDTH, Weights, assert_close, attach, bf, carrier, condition,
+    conv_reference, matmul, modulation, two_axis,
 };
 use engine::fire::{Lane, LaneStream, PortFeed, PortKind, Readout, ReadoutSeam, StepVoxels};
 use eta_ir::container::HostRole;
@@ -20,14 +20,13 @@ const fn voxels() -> u32 {
     CLIP[0] * CLIP[1] * CLIP[2]
 }
 
-fn vae_lane(slot: u32, channel: Option<u64>) -> Lane {
+fn vae_lane(rig: &Rig, slot: u32, channel: Option<u64>) -> Lane {
     Lane {
         slot,
-        word: vae_word(VAE_READING),
+        word: rig.word(Some("vae")),
         tokens: vec![0],
         readout: Readout::None,
         stream: LaneStream::Image,
-        reading: VAE_READING,
         ports: channel
             .map(|channel| PortFeed {
                 kind: PortKind::Voxels,
@@ -74,7 +73,7 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
     let fire = |rig: &mut Rig, clip: &[f32]| -> (Vec<f32>, Vec<[u32; 3]>) {
         rig.publish(instance, 0, clip);
         let readouts = rig.fire(
-            vec![vae_lane(0, Some(cell))],
+            vec![vae_lane(rig, 0, Some(cell))],
             vec![attach(0, instance)],
             vec![StepVoxels {
                 lane: 0,
@@ -116,7 +115,7 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
 
     // The step's own payload feeds a lane that names no channel.
     let readouts = rig.fire(
-        vec![vae_lane(1, None)],
+        vec![vae_lane(&rig, 1, None)],
         Vec::new(),
         vec![StepVoxels {
             lane: 0,
@@ -145,7 +144,7 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
     rig.publish(dit_instance, 1, &[timestep]);
     let lane = Lane {
         slot: 2,
-        word: vae_word(0),
+        word: rig.word(None),
         tokens: vec![0; rows as usize],
         readout: Readout::Rows((0..rows).collect()),
         stream: LaneStream::Image,

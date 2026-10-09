@@ -1,21 +1,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use models::ltx_2::forward::VAE_DECODE;
-use models::ltx_2::model::{self, Model};
+pub mod ltx_2_dims;
+
+use ltx_2_dims::{self as model, VAE_DECODE};
 use models::{PortKind, ReadoutKind};
-use poem_dsl::{Def, Dtype, Operation, Platform, RuntimeInput, Trace};
+use poem::{Def, Dtype, Operation, Platform, RuntimeInput, Trace};
 use poem_ir::{GridRule, Spatial, TimePad};
 
 const FLAGSHIP: &str = "ltx25-bf16-kv-bf16";
 const MINI: &str = "ltx25-mini-bf16-kv-bf16";
 
-fn row(sku: &str) -> &'static models::Sku {
-    models::sku(sku).unwrap_or_else(|| panic!("this build ships no `{sku}`"))
+fn row(deployment: &str) -> &'static models::Deployment {
+    models::deployment(deployment).unwrap_or_else(|| panic!("this build ships no `{deployment}`"))
 }
 
-fn trace(sku: &str) -> Trace {
-    (row(sku).trace)(Platform::Cuda)
+fn trace(deployment: &str) -> Trace {
+    row(deployment).trace(Platform::Cuda)
 }
 
 #[test]
@@ -39,7 +40,7 @@ fn the_flagship_declares_the_decode_reading_and_the_miniature_does_not() {
         "the last code"
     );
     assert!(!decode.has_kv && !decode.takes_tokens);
-    assert_eq!(decode.streams, vec![poem_dsl::Stream::Video]);
+    assert_eq!(decode.streams, vec![poem::Stream::Video]);
     assert_eq!(decode.ports.len(), 1);
     let (index, port) = decode.port("latent").expect("the latent port");
     assert_eq!(
@@ -55,15 +56,15 @@ fn the_flagship_declares_the_decode_reading_and_the_miniature_does_not() {
         mini.readings.iter().all(|r| r.name != "vae.decode"),
         "the miniature's checkpoint carries no VAE"
     );
-    for (sku, want) in [(FLAGSHIP, 1), (MINI, 0)] {
-        let voxels = trace(sku)
+    for (deployment, want) in [(FLAGSHIP, 1), (MINI, 0)] {
+        let voxels = trace(deployment)
             .values
             .iter()
             .filter(|decl| matches!(decl.def, Def::Input(RuntimeInput::Voxels { .. })))
             .count();
         assert_eq!(
             voxels, want,
-            "{sku}: the voxel port iff the row carries the VAE"
+            "{deployment}: the voxel port iff the row carries the VAE"
         );
     }
 }
@@ -113,7 +114,7 @@ fn the_shapes_are_the_ltx_decoders() {
             Operation::Spatial(other) => {
                 panic!("a spatial member this decoder never states: {other:?}")
             }
-            Operation::Elementwise(poem_dsl::Elementwise::RmsnormNoScale { eps, .. }) => {
+            Operation::Elementwise(poem::Elementwise::RmsnormNoScale { eps, .. }) => {
                 rms_eps.insert(format!("{eps:e}"));
             }
             _ => {}
@@ -181,9 +182,7 @@ fn the_import_reads_every_decoder_tensor_of_the_real_snapshot_once() {
     };
     let src = checkpoint::file::diffusers::open(&root)
         .unwrap_or_else(|why| panic!("{}: {why}", root.display()));
-    let contract = Model::ltx_2_5(Dtype::Bf16, 1)
-        .import_vae(&src, Platform::Cuda)
-        .unwrap_or_else(|why| panic!("the VAE does not read this snapshot: {why}"));
+    let contract = import_vae(&src);
 
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for tensor in &contract.tensors {
@@ -218,4 +217,28 @@ fn the_import_reads_every_decoder_tensor_of_the_real_snapshot_once() {
         .map(|t| t.name.as_str())
         .collect();
     assert_eq!(stated, vec!["vae.zero"]);
+}
+
+/// The VAE's reads alone, by the package's own functions.
+const VAE_FORMATS: &str = r#"
+def formats(m):
+    return [format("vae", read = lambda reads: vae(reads, m.vae))]
+"#;
+
+fn import_vae(src: &ztensor::Source) -> checkpoint::contract::ModelContract {
+    let package = models::star::replacing("ltx25", "formats.poem", "formats", VAE_FORMATS)
+        .unwrap_or_else(|why| panic!("the VAE-only package: {why}"));
+    package
+        .import("ltx25", &flagship(), src, Platform::Cuda)
+        .unwrap_or_else(|why| panic!("the VAE does not read this snapshot: {why}"))
+}
+
+fn flagship() -> poem::star::Deploy {
+    poem::star::Deploy {
+        weights: vec![Dtype::Bf16],
+        kv: Dtype::Bf16,
+        tp: 1,
+        parts: vec![],
+        drafter: None,
+    }
 }

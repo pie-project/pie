@@ -12,9 +12,8 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     packed: Tensor,
     positions: Tensor,
     q_norm_weight: Tensor,
-    q_norm_eps: f32,
     k_norm_weight: Tensor,
-    k_norm_eps: f32,
+    eps: f32,
     pool: &KvPool,
     write_page: Tensor,
     write_offset: Tensor,
@@ -34,13 +33,6 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
 
     dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
     debug_assert_eq!(positions.dtype, Dtype::I32, "`{OP}` reads i32 positions");
-    if q_norm_eps != k_norm_eps {
-        return Err(refuse(
-            OP,
-            "two head-norm epsilons on a fused write: the kernel applies one to both \
-             norms, so serving this would normalise k at q's epsilon",
-        ));
-    }
     if rotary_dim == 0 || rotary_dim > head_dim || !rotary_dim.is_multiple_of(2) {
         return Err(refuse(
             OP,
@@ -115,7 +107,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
                 pool.page_size.arg(),
                 hnd_layout.arg(),
                 theta.arg(),
-                q_norm_eps.arg(),
+                eps.arg(),
                 rotary.arg(),
             ],
         );
@@ -149,7 +141,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
             pool.page_size.arg(),
             hnd_layout.arg(),
             theta.arg(),
-            q_norm_eps.arg(),
+            eps.arg(),
             rotary.arg(),
         ],
     )

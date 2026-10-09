@@ -15,7 +15,7 @@
   try {
     await loadRuntime(params);
     const summary = await pie.bootLazy(modelUrl, params.get("config") ?? "");
-    log(`booted ${summary.sku}`);
+    log(`booted ${summary.deployment}`);
     const list = (await (await fetch("matrix.json")).json()).filter((e) => !only || only.includes(e.id));
     let failures = 0;
     for (const entry of list) {

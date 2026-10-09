@@ -12,14 +12,6 @@ pub struct Yarn {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PostNorm {
-    pub weight: ValueId,
-    pub plus_one: bool,
-    pub eps: f32,
-    pub out: ValueId,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Elementwise {
     Rmsnorm {
         x: ValueId,
@@ -106,51 +98,6 @@ pub enum Elementwise {
         y: ValueId,
         y_out: ValueId,
     },
-    ResidualAddRmsnorm {
-        x: ValueId,
-        y: ValueId,
-        y_out: ValueId,
-        weight: ValueId,
-        plus_one: bool,
-        eps: f32,
-        out: ValueId,
-    },
-    RmsnormResidualAdd {
-        x: ValueId,
-        weight: ValueId,
-        eps: f32,
-        t: ValueId,
-        y: ValueId,
-        y_out: ValueId,
-        scale: Option<(ValueId, ValueId)>,
-        post: Option<PostNorm>,
-    },
-    EmbedScaleAdd {
-        ids: ValueId,
-        table: ValueId,
-        vocab: u32,
-        e: ValueId,
-        embed_scale: f32,
-        e_scaled: ValueId,
-        y: ValueId,
-        y_out: ValueId,
-        out_scale: f32,
-        y_scaled: ValueId,
-    },
-    EmbedScaleAddSelect {
-        ids: ValueId,
-        table: ValueId,
-        vocab: u32,
-        e: ValueId,
-        embed_scale: f32,
-        e_scaled: ValueId,
-        stacked: ValueId,
-        layer: u32,
-        width: u32,
-        y_out: ValueId,
-        out_scale: f32,
-        y_scaled: ValueId,
-    },
     AddBias {
         bias: ValueId,
         out: ValueId,
@@ -223,17 +170,6 @@ pub enum Elementwise {
         rotary_dim: u32,
         head_dim: u32,
         theta: f32,
-        q_out: ValueId,
-    },
-    RmsnormRopePartialQ {
-        x: ValueId,
-        weight: ValueId,
-        head_dim: u32,
-        eps: f32,
-        positions: ValueId,
-        rotary_dim: u32,
-        theta: f32,
-        y: ValueId,
         q_out: ValueId,
     },
     RopePartialLast {
@@ -355,27 +291,6 @@ pub enum Elementwise {
         lane_of_row: Option<ValueId>,
         r_out: ValueId,
     },
-    NormModulate {
-        x: ValueId,
-        norm: NormKind,
-        normed: ValueId,
-        m: ValueId,
-        lane_of_row: Option<ValueId>,
-        form: ModulateForm,
-        y: ValueId,
-    },
-    GatedResidualNormModulate {
-        r: ValueId,
-        g: ValueId,
-        y: ValueId,
-        lane_of_row: Option<ValueId>,
-        r_out: ValueId,
-        norm: NormKind,
-        normed: ValueId,
-        m: ValueId,
-        form: ModulateForm,
-        out: ValueId,
-    },
     Sinusoid {
         t: ValueId,
         dim: u32,
@@ -450,12 +365,6 @@ impl ModulateForm {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum NormKind {
-    Layernorm { eps: f32 },
-    Rmsnorm { head_dim: u32, eps: f32 },
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RopeForm {
     Interleaved,
@@ -499,30 +408,6 @@ impl Operands for Elementwise {
                 x, gate, weight, ..
             } => sink.extend([*x, *gate, *weight]),
             Self::ResidualAdd { x, y, .. } => sink.extend([*x, *y]),
-            Self::ResidualAddRmsnorm { x, y, weight, .. } => sink.extend([*x, *y, *weight]),
-            Self::RmsnormResidualAdd {
-                x,
-                weight,
-                y,
-                scale,
-                post,
-                ..
-            } => {
-                sink.extend([*x, *weight, *y]);
-                if let Some((s, _)) = scale {
-                    sink.push(*s);
-                }
-                if let Some(post) = post {
-                    sink.push(post.weight);
-                }
-            }
-            Self::EmbedScaleAdd { ids, table, y, .. } => sink.extend([*ids, *table, *y]),
-            Self::EmbedScaleAddSelect {
-                ids,
-                table,
-                stacked,
-                ..
-            } => sink.extend([*ids, *table, *stacked]),
             Self::AddBias { bias, out, .. } => sink.extend([*bias, *out]),
             Self::Standardize { x, bias, scale, .. } => sink.extend([*x, *bias, *scale]),
             Self::MulScalar { x, .. } => sink.push(*x),
@@ -550,12 +435,6 @@ impl Operands for Elementwise {
                 q, k, positions, ..
             } => sink.extend([*q, *k, *positions]),
             Self::RopePartialQ { q, positions, .. } => sink.extend([*q, *positions]),
-            Self::RmsnormRopePartialQ {
-                x,
-                weight,
-                positions,
-                ..
-            } => sink.extend([*x, *weight, *positions]),
             Self::RopePartialLast { q, positions, .. } => sink.extend([*q, *positions]),
             Self::RopeYarn {
                 q, k, positions, ..
@@ -615,23 +494,6 @@ impl Operands for Elementwise {
                 sink.extend([*r, *g, *y]);
                 sink.extend(*lane_of_row);
             }
-            Self::NormModulate {
-                x, m, lane_of_row, ..
-            } => {
-                sink.extend([*x, *m]);
-                sink.extend(*lane_of_row);
-            }
-            Self::GatedResidualNormModulate {
-                r,
-                g,
-                y,
-                m,
-                lane_of_row,
-                ..
-            } => {
-                sink.extend([*r, *g, *y, *m]);
-                sink.extend(*lane_of_row);
-            }
             Self::Sinusoid { t, .. } => sink.push(*t),
             Self::RelativeBucketBias { embedding, .. } => sink.push(*embedding),
             Self::Silu { x, .. } => sink.push(*x),
@@ -663,36 +525,6 @@ impl Operands for Elementwise {
             Self::RmsnormGated { y, .. } => sink.push(*y),
             Self::RmsnormGatedBy { y, .. } => sink.push(*y),
             Self::ResidualAdd { y_out, .. } => sink.push(*y_out),
-            Self::ResidualAddRmsnorm { y_out, out, .. } => sink.extend([*y_out, *out]),
-            Self::RmsnormResidualAdd {
-                t,
-                y_out,
-                scale,
-                post,
-                ..
-            } => {
-                sink.extend([*t, *y_out]);
-                if let Some((_, scaled)) = scale {
-                    sink.push(*scaled);
-                }
-                if let Some(post) = post {
-                    sink.push(post.out);
-                }
-            }
-            Self::EmbedScaleAdd {
-                e,
-                e_scaled,
-                y_out,
-                y_scaled,
-                ..
-            } => sink.extend([*e, *e_scaled, *y_out, *y_scaled]),
-            Self::EmbedScaleAddSelect {
-                e,
-                e_scaled,
-                y_out,
-                y_scaled,
-                ..
-            } => sink.extend([*e, *e_scaled, *y_out, *y_scaled]),
             Self::AddBias { out_out, .. } => sink.push(*out_out),
             Self::Standardize { x_out, .. } => sink.push(*x_out),
             Self::MulScalar { x_out, .. } => sink.push(*x_out),
@@ -703,7 +535,6 @@ impl Operands for Elementwise {
             Self::RopePartial { q_out, k_out, .. } => sink.extend([*q_out, *k_out]),
             Self::RopeMrope { q_out, k_out, .. } => sink.extend([*q_out, *k_out]),
             Self::RopePartialQ { q_out, .. } => sink.push(*q_out),
-            Self::RmsnormRopePartialQ { y, q_out, .. } => sink.extend([*y, *q_out]),
             Self::RopePartialLast { q_out, .. } => sink.push(*q_out),
             Self::RopeYarn { q_out, k_out, .. } => sink.extend([*q_out, *k_out]),
             Self::GateSigmoidMul { x_out, .. } => sink.push(*x_out),
@@ -724,12 +555,6 @@ impl Operands for Elementwise {
             Self::PleGate { y, .. } => sink.push(*y),
             Self::Modulate { y, .. } => sink.push(*y),
             Self::GatedResidualAdd { r_out, .. } => sink.push(*r_out),
-            Self::NormModulate { normed, y, .. } => sink.extend([*normed, *y]),
-            Self::GatedResidualNormModulate {
-                r_out, normed, out, ..
-            } => {
-                sink.extend([*r_out, *normed, *out]);
-            }
             Self::Sinusoid { y, .. } => sink.push(*y),
             Self::RelativeBucketBias { y, .. } => sink.push(*y),
             Self::Silu { x_out, .. } => sink.push(*x_out),
@@ -756,10 +581,6 @@ impl Operands for Elementwise {
             Self::RmsnormGated { .. } => {}
             Self::RmsnormGatedBy { .. } => {}
             Self::ResidualAdd { y_out, y, .. } => sink.push((*y_out, *y)),
-            Self::ResidualAddRmsnorm { y_out, y, .. } => sink.push((*y_out, *y)),
-            Self::RmsnormResidualAdd { y_out, y, .. } => sink.push((*y_out, *y)),
-            Self::EmbedScaleAdd { y_out, y, .. } => sink.push((*y_out, *y)),
-            Self::EmbedScaleAddSelect { .. } => {}
             Self::AddBias { out_out, out, .. } => sink.push((*out_out, *out)),
             Self::Standardize { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::MulScalar { x_out, x, .. } => sink.push((*x_out, *x)),
@@ -780,7 +601,6 @@ impl Operands for Elementwise {
                 sink.extend([(*q_out, *q), (*k_out, *k)]);
             }
             Self::RopePartialQ { q_out, q, .. } => sink.push((*q_out, *q)),
-            Self::RmsnormRopePartialQ { q_out, y, .. } => sink.push((*q_out, *y)),
             Self::RopePartialLast { q_out, q, .. } => sink.push((*q_out, *q)),
             Self::RopeYarn {
                 q_out, q, k_out, k, ..
@@ -800,8 +620,6 @@ impl Operands for Elementwise {
             Self::PleGate { .. } => {}
             Self::Modulate { .. } => {}
             Self::GatedResidualAdd { r_out, r, .. } => sink.push((*r_out, *r)),
-            Self::NormModulate { .. } => {}
-            Self::GatedResidualNormModulate { r_out, r, .. } => sink.push((*r_out, *r)),
             Self::Sinusoid { .. } => {}
             Self::RelativeBucketBias { .. } => {}
             Self::Silu { x_out, x, .. } => sink.push((*x_out, *x)),
@@ -828,10 +646,6 @@ impl Operands for Elementwise {
             Self::RmsnormGated { .. } => "elementwise.rmsnorm_gated",
             Self::RmsnormGatedBy { .. } => "elementwise.rmsnorm_gated_by",
             Self::ResidualAdd { .. } => "elementwise.residual_add",
-            Self::ResidualAddRmsnorm { .. } => "elementwise.residual_add_rmsnorm",
-            Self::RmsnormResidualAdd { .. } => "elementwise.rmsnorm_residual_add",
-            Self::EmbedScaleAdd { .. } => "elementwise.embed_scale_add",
-            Self::EmbedScaleAddSelect { .. } => "elementwise.embed_scale_add_select",
             Self::AddBias { .. } => "elementwise.add_bias",
             Self::Standardize { .. } => "elementwise.standardize",
             Self::MulScalar { .. } => "elementwise.mul_scalar",
@@ -842,7 +656,6 @@ impl Operands for Elementwise {
             Self::RopePartial { .. } => "elementwise.rope_partial",
             Self::RopeMrope { .. } => "elementwise.rope_mrope",
             Self::RopePartialQ { .. } => "elementwise.rope_partial_q",
-            Self::RmsnormRopePartialQ { .. } => "elementwise.rmsnorm_rope_partial_q",
             Self::RopePartialLast { .. } => "elementwise.rope_partial_last",
             Self::RopeYarn { .. } => "elementwise.rope_yarn",
             Self::GateSigmoidMul { .. } => "elementwise.gate_sigmoid_mul",
@@ -858,8 +671,6 @@ impl Operands for Elementwise {
             Self::PleGate { .. } => "elementwise.ple_gate",
             Self::Modulate { .. } => "elementwise.modulate",
             Self::GatedResidualAdd { .. } => "elementwise.gated_residual_add",
-            Self::NormModulate { .. } => "elementwise.norm_modulate",
-            Self::GatedResidualNormModulate { .. } => "elementwise.gated_residual_norm_modulate",
             Self::Sinusoid { .. } => "elementwise.sinusoid",
             Self::RelativeBucketBias { .. } => "elementwise.relative_bucket_bias",
             Self::Silu { .. } => "elementwise.silu",

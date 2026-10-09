@@ -35,10 +35,9 @@ members = [
     "crates/wasmtime-web",
 
     "crates/poem-ir",
-    "crates/poem-dsl",
+    "crates/poem",
     "crates/poem-compiler",
     "crates/models",
-    "crates/checkpoint-dsl",
     "crates/chat-template",
     "crates/media",
     "crates/kernels-cuda",
@@ -80,8 +79,7 @@ default-members = [
     "crates/eta-exec",
     "crates/models",
     "crates/poem-ir",
-    "crates/poem-dsl",
-    "crates/checkpoint-dsl",
+    "crates/poem",
     "crates/poem-compiler",
     "crates/checkpoint",
     "crates/ztensor",
@@ -158,7 +156,6 @@ worker = { path = "crates/worker", default-features = false, features = ["standa
 runtime = { path = "crates/runtime" }
 models = { path = "crates/models" }
 checkpoint = { path = "crates/checkpoint" }
-checkpoint-dsl = { path = "crates/checkpoint-dsl" }
 ztensor = { workspace = true }
 tokenizer = { path = "crates/tokenizer" }
 client = { package = "pie-client", path = "crates/client" }

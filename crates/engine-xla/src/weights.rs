@@ -15,7 +15,7 @@ use checkpoint::plan::{LoadPlan, StorageTarget, compile_streaming};
 use checkpoint::serving::Stamp;
 use checkpoint::types::{BackendKind, ScaleForm, TensorId};
 use kernels_xla::{Bank, Tensor};
-use poem_ir::{Dtype, ParamSource, Trace};
+use poem_ir::{Dtype, Fused, ParamSource, Trace};
 
 use crate::device::Device;
 use crate::error::{Fault, Result};
@@ -547,7 +547,7 @@ fn pairings<'a>(
     Ok(out)
 }
 
-pub(crate) fn serves_this_deployment(path: &Path, backend: &str, sku: &str) -> Result<()> {
+pub(crate) fn serves_this_deployment(path: &Path, backend: &str, deployment: &str) -> Result<()> {
     if path.is_dir() {
         return Ok(());
     }
@@ -556,9 +556,9 @@ pub(crate) fn serves_this_deployment(path: &Path, backend: &str, sku: &str) -> R
         Ok(Some(stamp)) => stamp,
         Err(why) => return Err(Fault::Recipe(format!("checkpoint: {why}"))),
     };
-    let deployment = Stamp::of(backend, sku);
+    let wanted = Stamp::of(backend, deployment);
     artifact
-        .check(&deployment)
+        .check(&wanted)
         .map_err(|mismatch| Fault::Recipe(mismatch.refuse(&path.display().to_string())))
 }
 
@@ -590,12 +590,11 @@ fn gemm_only(
         inputs.clear();
         node.op.inputs(&mut inputs);
         let w = match &node.op {
-            Operation::Linear(
-                Linear::Matmul { w, .. }
-                | Linear::LmHead { w, .. }
-                | Linear::MatmulBias { w, .. }
-                | Linear::MatmulGeglu { w, .. }
-                | Linear::LmHeadSoftcap { w, .. },
+            Operation::Linear(Linear::Matmul { w, .. } | Linear::LmHead { w, .. })
+            | Operation::Fused(
+                Fused::MatmulBias { w, .. }
+                | Fused::MatmulGeglu { w, .. }
+                | Fused::LmHeadSoftcap { w, .. },
             ) => Some(*w),
             _ => None,
         };
@@ -921,7 +920,7 @@ impl Weights {
             .collect::<Result<_>>()?;
         let mut pairings: BTreeMap<usize, Pairing> = BTreeMap::new();
         for (at, param) in trace.params.iter().enumerate() {
-            let Some(&scales) = index.get(poem_dsl_scales(&param.name).as_str()) else {
+            let Some(&scales) = index.get(poem_scales(&param.name).as_str()) else {
                 continue;
             };
             if trace.params[scales].dtype == param.dtype && param.dtype == Dtype::Bf16 {
@@ -942,7 +941,7 @@ impl Weights {
                 at,
                 Pairing {
                     scales,
-                    biases: index.get(poem_dsl_biases(&param.name).as_str()).copied(),
+                    biases: index.get(poem_biases(&param.name).as_str()).copied(),
                     group,
                     bits,
                 },
@@ -1057,10 +1056,10 @@ impl Weights {
     }
 }
 
-fn poem_dsl_scales(of: &str) -> String {
+fn poem_scales(of: &str) -> String {
     format!("{of}{}", dtype::SCALES)
 }
 
-fn poem_dsl_biases(of: &str) -> String {
+fn poem_biases(of: &str) -> String {
     format!("{of}{}", dtype::BIASES)
 }

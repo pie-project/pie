@@ -1299,7 +1299,7 @@ impl ProcessCtx {
                 (Some(_), false) => {
                     return Ok(Err(format!(
                         "reading `{}` embeds no tokens, but this pass bound `embed`",
-                        reading.map_or("", |reading| reading.name)
+                        reading.map_or("", |reading| reading.name.as_str())
                     )));
                 }
                 (None, false) => None,
@@ -1315,7 +1315,7 @@ impl ProcessCtx {
                 (Some(_), false) => {
                     return Ok(Err(format!(
                         "reading `{}` declares no KV space, but this pass bound `attention`",
-                        reading.map_or("", |reading| reading.name)
+                        reading.map_or("", |reading| reading.name.as_str())
                     )));
                 }
                 (None, false) => None,
@@ -1371,7 +1371,7 @@ impl ProcessCtx {
                 return Ok(Err(format!(
                     "reading `{}` embeds no tokens but declares a KV space; a sequence's rows \
                      are its tokens, and this reading states none",
-                    reading.map_or("", |reading| reading.name)
+                    reading.map_or("", |reading| reading.name.as_str())
                 )));
             }
             if pass.kind == PassKind::Diffusion && pass.bindings.canvas.is_none() {
@@ -1435,7 +1435,7 @@ impl ProcessCtx {
                         return Ok(Err(format!(
                             "reading `{}` embeds tokens and the channel bound to `embed` holds \
                              {ids} of them",
-                            reading.map_or("", |reading| reading.name)
+                            reading.map_or("", |reading| reading.name.as_str())
                         )));
                     }
                 }
@@ -1447,7 +1447,7 @@ impl ProcessCtx {
                         return Ok(Err(format!(
                             "reading `{}` embeds no tokens and this pass bound no `[rows, ·]` \
                              port; nothing states its lane's row count",
-                            reading.map_or("", |reading| reading.name)
+                            reading.map_or("", |reading| reading.name.as_str())
                         )));
                     }
                     Err(error) => return Ok(Err(error)),
@@ -2532,7 +2532,7 @@ mod tests {
 
     fn port(name: &'static str, kind: models::PortKind, width: u32) -> models::PortFact {
         models::PortFact {
-            name,
+            name: name.to_string(),
             kind,
             width,
             streams: Vec::new(),

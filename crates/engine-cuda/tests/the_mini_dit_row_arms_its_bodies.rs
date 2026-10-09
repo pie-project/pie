@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use checkpoint::contract::ModelContract;
 use engine::Engine;
 use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
-use poem_dsl::{Platform, Trace};
+use poem::{Platform, Trace};
 
-const SKU: &str = "mini-dit-bf16-kv-bf16";
+const DEPLOYMENT: &str = "mini-dit-bf16-kv-bf16";
 
 fn artifact() -> Option<PathBuf> {
     let path = std::env::var("PIE_MINI_DIT_ARTIFACT")
@@ -18,7 +18,7 @@ fn artifact() -> Option<PathBuf> {
 
 fn contract_for(trace: &Trace, path: &Path) -> Result<ModelContract, String> {
     let source = ztensor_compat::index(path).map_err(|why| why.to_string())?;
-    checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Cuda)
+    poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
         .map_err(|why| why.to_string())
 }
 
@@ -32,12 +32,10 @@ fn every_armed_body_answers_its_eager_walk() {
         eprintln!("not asked: no mini-dit artifact (PIE_MINI_DIT_ARTIFACT)");
         return;
     };
-    let sku = models::sku(SKU).expect("the catalog ships the mini-dit row");
-    let trace = (sku.trace)(Platform::Cuda);
-    let mut engine = engine_cuda::open(engine_cuda::DeviceBoot::default(), contract_for, |name| {
-        models::sku(name).map(|sku| sku.classify)
-    })
-    .expect("the engine opens");
+    let deployment = models::deployment(DEPLOYMENT).expect("the catalog ships the mini-dit row");
+    let trace = deployment.trace(Platform::Cuda);
+    let mut engine = engine_cuda::open(engine_cuda::DeviceBoot::default(), contract_for)
+        .expect("the engine opens");
     let loaded = engine
         .load(LoadRequest {
             trace,

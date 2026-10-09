@@ -2,12 +2,15 @@ pub mod arena;
 pub mod budget;
 pub mod compiled;
 pub mod error;
+pub mod fuse;
 pub mod layout;
 pub mod lowering;
 mod pq;
 pub mod prefetch;
 mod region;
+pub mod shard;
 pub mod stream;
+mod tree;
 pub mod unit;
 
 #[cfg(test)]

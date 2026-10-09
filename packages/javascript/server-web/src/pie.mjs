@@ -153,7 +153,7 @@ export class Server {
     return server;
   }
 
-  /** What the boot found: model, sku, weight bytes, kv pages. */
+  /** What the boot found: model, deployment, weight bytes, kv pages. */
   get summary() {
     return this.#summary;
   }

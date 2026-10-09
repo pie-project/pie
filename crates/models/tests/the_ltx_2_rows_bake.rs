@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use models::ltx_2::forward::{DENOISE, Facts, REFINE_AUDIO, REFINE_VIDEO, VAE_DECODE};
-use models::ltx_2::model::{self, Dims};
+pub mod ltx_2_dims;
+
+use ltx_2_dims::{self as model, DENOISE, Dims, REFINE_AUDIO, REFINE_VIDEO, VAE_DECODE};
 use models::{PortKind, ReadoutKind, ScheduleKind};
-use poem_dsl::{
-    Attention, Classify, Def, Dim, Dtype, Elementwise, GeomKind, Operands, Operation, Platform,
-    RaggedMask, Request, RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
+use poem::{
+    Attention, Def, Dim, Dtype, Elementwise, GeomKind, Operands, Operation, Platform, RaggedMask,
+    Request, RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
 };
 
 const FLAGSHIP: &str = "ltx25-bf16-kv-bf16";
@@ -19,28 +20,28 @@ const PLATFORMS: [Platform; 4] = [
     Platform::Vulkan,
 ];
 
-fn row(sku: &str) -> &'static models::Sku {
-    models::sku(sku).unwrap_or_else(|| {
-        let names: Vec<&str> = models::skus().map(|row| row.name.as_str()).collect();
-        panic!("this build ships no `{sku}`; rows are {names:#?}")
+fn row(deployment: &str) -> &'static models::Deployment {
+    models::deployment(deployment).unwrap_or_else(|| {
+        let names: Vec<&str> = models::deployments().map(|row| row.name.as_str()).collect();
+        panic!("this build ships no `{deployment}`; rows are {names:#?}")
     })
 }
 
-fn trace(sku: &str, platform: Platform) -> Trace {
-    (row(sku).trace)(platform)
+fn trace(deployment: &str, platform: Platform) -> Trace {
+    row(deployment).trace(platform)
 }
 
-fn dims(sku: &str) -> Dims {
-    match sku {
+fn dims(deployment: &str) -> Dims {
+    match deployment {
         FLAGSHIP => Dims::ltx_2_5(),
         MINI => Dims::mini(),
         other => panic!("no dims for `{other}`"),
     }
 }
 
-fn word(reading: u8, stream: Stream) -> u64 {
+fn word(plan: &Trace, reading: &str, stream: Stream) -> u64 {
     let request = Request::new(4, false).on_stream(stream).in_reading(reading);
-    Facts::of(&request).word()
+    plan.facts.word(&request)
 }
 
 #[test]
@@ -57,13 +58,16 @@ fn the_ltx_2_rows_bake_every_case() {
 }
 
 fn every_row_traces_on_every_platform_holding_nothing_between_fires() {
-    for sku in ROWS {
+    for deployment in ROWS {
         for platform in PLATFORMS {
-            let plan = trace(sku, platform);
-            assert!(!plan.nodes.is_empty(), "{sku} {platform:?}: an empty plan");
+            let plan = trace(deployment, platform);
+            assert!(
+                !plan.nodes.is_empty(),
+                "{deployment} {platform:?}: an empty plan"
+            );
             assert!(
                 plan.caches.is_empty(),
-                "{sku} {platform:?}: a denoiser and two connectors hold nothing between fires"
+                "{deployment} {platform:?}: a denoiser and two connectors hold nothing between fires"
             );
             let seams: BTreeMap<&str, usize> =
                 plan.seams.iter().fold(BTreeMap::new(), |mut acc, s| {
@@ -73,28 +77,28 @@ fn every_row_traces_on_every_platform_holding_nothing_between_fires() {
             assert_eq!(
                 seams.get(seam::VELOCITY.name),
                 Some(&1),
-                "{sku}: one velocity, planted on the merge of the two modalities"
+                "{deployment}: one velocity, planted on the merge of the two modalities"
             );
             assert_eq!(
                 seams.get(seam::HIDDEN.name),
                 Some(&2),
-                "{sku}: one hidden per connector"
+                "{deployment}: one hidden per connector"
             );
             assert!(
                 !seams.contains_key(seam::OUT.name),
-                "{sku}: a denoiser has no logits, and `out` was planted anyway"
+                "{deployment}: a denoiser has no logits, and `out` was planted anyway"
             );
             assert_eq!(
                 seams.get(seam::PIXELS.name),
-                is_flagship(sku).then_some(&1),
-                "{sku}: one `pixels` planting iff the row carries the VAE decoder"
+                is_flagship(deployment).then_some(&1),
+                "{deployment}: one `pixels` planting iff the row carries the VAE decoder"
             );
         }
     }
 }
 
-fn is_flagship(sku: &str) -> bool {
-    sku == FLAGSHIP
+fn is_flagship(deployment: &str) -> bool {
+    deployment == FLAGSHIP
 }
 
 fn traced_ports(plan: &Trace) -> BTreeSet<(String, u8, u32)> {
@@ -116,9 +120,9 @@ fn traced_ports(plan: &Trace) -> BTreeSet<(String, u8, u32)> {
 }
 
 fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
-    for sku in ROWS {
-        let plan = trace(sku, Platform::Cuda);
-        let facts = row(sku).generative.as_ref().expect("facts");
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
+        let facts = row(deployment).generative.as_ref().expect("facts");
         let mut declared: BTreeSet<(String, u8, u32)> = BTreeSet::new();
         for reading in &facts.readings {
             for (index, port) in reading.ports_indexed() {
@@ -128,19 +132,19 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
         assert_eq!(
             traced_ports(&plan),
             declared,
-            "{sku}: the facts and the trace bind one list of ports"
+            "{deployment}: the facts and the trace bind one list of ports"
         );
 
-        let d = dims(sku);
+        let d = dims(deployment);
         let denoise = facts
             .readings
             .iter()
             .find(|r| r.name == "denoise")
-            .unwrap_or_else(|| panic!("{sku} declares no `denoise`"));
+            .unwrap_or_else(|| panic!("{deployment} declares no `denoise`"));
         let at = |name: &str| {
             let (index, port) = denoise
                 .port(name)
-                .unwrap_or_else(|| panic!("{sku}: `denoise` declares no port `{name}`"));
+                .unwrap_or_else(|| panic!("{deployment}: `denoise` declares no port `{name}`"));
             (index, port.kind, port.width, port.streams.clone())
         };
         assert_eq!(
@@ -151,7 +155,7 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
                 d.channels,
                 vec![Stream::Video, Stream::Audio]
             ),
-            "{sku}: one latent rectangle for the two modalities"
+            "{deployment}: one latent rectangle for the two modalities"
         );
         assert_eq!(
             at("context"),
@@ -201,7 +205,7 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
             assert_eq!(
                 (index, port.kind, port.width),
                 (model::port::TEXT, PortKind::Latents, d.text_in()),
-                "{sku} {name}: a token-less reading states its rows through a latents port"
+                "{deployment} {name}: a token-less reading states its rows through a latents port"
             );
             assert_eq!(refine.readout, ReadoutKind::Hidden);
         }
@@ -227,44 +231,43 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
 }
 
 fn each_lane_the_facts_list_classifies_into_its_own_class() {
-    for sku in ROWS {
-        let plan = trace(sku, Platform::Cuda);
-        let classes = poem_dsl::resolve_classes(&plan)
-            .unwrap_or_else(|why| panic!("{sku}: a merge does not resolve: {why:?}"));
-        let facts = row(sku).generative.as_ref().expect("facts");
-        let catalog = row(sku);
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
+        let classes = poem::resolve_classes(&plan)
+            .unwrap_or_else(|why| panic!("{deployment}: a merge does not resolve: {why:?}"));
+        let facts = row(deployment).generative.as_ref().expect("facts");
+        let _catalog = row(deployment);
         let mut seen: Vec<((&str, Stream), usize)> = Vec::new();
         for reading in &facts.readings {
             for &stream in &reading.streams {
                 let request = Request::new(4, false)
                     .on_stream(stream)
-                    .in_reading(reading.index);
-                let w = (catalog.classify)(&request);
-                assert_eq!(w, Facts::of(&request).word(), "{sku} {stream:?}");
-                let class = classes
-                    .class_of(w & classes.mask)
-                    .unwrap_or_else(|| panic!("{sku}: `{}`/{stream:?} has no class", reading.name));
-                seen.push(((reading.name, stream), class));
+                    .in_reading(&reading.name);
+                let w = plan.facts.word(&request);
+                let class = classes.class_of(w & classes.mask).unwrap_or_else(|| {
+                    panic!("{deployment}: `{}`/{stream:?} has no class", reading.name)
+                });
+                seen.push(((reading.name.as_str(), stream), class));
             }
         }
         let distinct: BTreeSet<usize> = seen.iter().map(|(_, class)| *class).collect();
         assert_eq!(
             distinct.len(),
             seen.len(),
-            "{sku}: two lanes share a class: {seen:?}"
+            "{deployment}: two lanes share a class: {seen:?}"
         );
         assert_eq!(
             seen.len(),
-            6 + usize::from(is_flagship(sku)),
-            "{sku}: the lanes the facts list"
+            6 + usize::from(is_flagship(deployment)),
+            "{deployment}: the lanes the facts list"
         );
     }
 }
 
 fn the_attentions_pair_as_the_architecture_says() {
-    for sku in ROWS {
-        let plan = trace(sku, Platform::Cuda);
-        let d = dims(sku);
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
+        let d = dims(deployment);
         let selection_of = |id: ValueId| -> (Selection, &'static str) {
             match &plan.values[id.0 as usize].def {
                 Def::Input(RuntimeInput::Geometry {
@@ -275,15 +278,15 @@ fn the_attentions_pair_as_the_architecture_says() {
                     kind: GeomKind::LaneIndptr { select },
                     ..
                 }) => (*select, "lane"),
-                other => panic!("{sku}: a ragged CSR that is not an indptr: {other:?}"),
+                other => panic!("{deployment}: a ragged CSR that is not an indptr: {other:?}"),
             }
         };
-        let video = word(DENOISE, Stream::Video);
-        let audio = word(DENOISE, Stream::Audio);
-        let ctx = word(DENOISE, Stream::Context);
-        let actx = word(DENOISE, Stream::Reference);
-        let refine_v = word(REFINE_VIDEO, Stream::Text);
-        let refine_a = word(REFINE_AUDIO, Stream::Text);
+        let video = word(&plan, "denoise", Stream::Video);
+        let audio = word(&plan, "denoise", Stream::Audio);
+        let ctx = word(&plan, "denoise", Stream::Context);
+        let actx = word(&plan, "denoise", Stream::Reference);
+        let refine_v = word(&plan, "refine.video", Stream::Text);
+        let refine_a = word(&plan, "refine.audio", Stream::Text);
 
         let mut pairs: BTreeMap<(&str, &str), usize> = BTreeMap::new();
         let mut connector_reads = 0usize;
@@ -299,12 +302,15 @@ fn the_attentions_pair_as_the_architecture_says() {
             else {
                 continue;
             };
-            assert_eq!(*mask, RaggedMask::GroupBlockDiagonal, "{sku}");
+            assert_eq!(*mask, RaggedMask::GroupBlockDiagonal, "{deployment}");
             let (q_sel, q_kind) = selection_of(*q_indptr);
             let (kv_sel, _) = selection_of(*kv_indptr);
             if q_kind == "lane" {
                 connector_reads += 1;
-                assert_eq!(q_indptr, kv_indptr, "{sku}: a connector reads itself");
+                assert_eq!(
+                    q_indptr, kv_indptr,
+                    "{deployment}: a connector reads itself"
+                );
                 assert!(q_sel.holds(refine_v) || q_sel.holds(refine_a));
                 assert!(!q_sel.holds(video) && !q_sel.holds(audio));
                 continue;
@@ -320,7 +326,7 @@ fn the_attentions_pair_as_the_architecture_says() {
                     (false, true, false, false) => "audio",
                     (false, false, true, false) => "context",
                     (false, false, false, true) => "audio_context",
-                    other => panic!("{sku}: a selection over {other:?}"),
+                    other => panic!("{deployment}: a selection over {other:?}"),
                 }
             };
             let (q, kv) = (name(&q_sel), name(&kv_sel));
@@ -328,9 +334,12 @@ fn the_attentions_pair_as_the_architecture_says() {
                 "video" if kv == "video" || kv == "context" => d.head_dim,
                 _ => d.audio_head_dim,
             };
-            assert_eq!(*head_dim, want_head, "{sku}: {q} -> {kv}");
+            assert_eq!(*head_dim, want_head, "{deployment}: {q} -> {kv}");
             let want_scale = (want_head as f32).sqrt().recip();
-            assert!((sm_scale - want_scale).abs() < 1e-7, "{sku}: {q} -> {kv}");
+            assert!(
+                (sm_scale - want_scale).abs() < 1e-7,
+                "{deployment}: {q} -> {kv}"
+            );
             *pairs.entry((q, kv)).or_default() += 1;
         }
         let layers = d.layers as usize;
@@ -344,19 +353,19 @@ fn the_attentions_pair_as_the_architecture_says() {
         ]
         .into_iter()
         .collect();
-        assert_eq!(pairs, want, "{sku}: six attentions a block");
+        assert_eq!(pairs, want, "{deployment}: six attentions a block");
         assert_eq!(
             connector_reads,
             2 * d.conn_layers as usize,
-            "{sku}: one read per connector layer, twice over"
+            "{deployment}: one read per connector layer, twice over"
         );
     }
 }
 
 fn every_rope_is_one_ladder_across_the_row() {
-    for sku in ROWS {
-        let plan = trace(sku, Platform::Cuda);
-        let d = dims(sku);
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
+        let d = dims(deployment);
         let mut seen: BTreeMap<([u32; 4], u32), usize> = BTreeMap::new();
         for node in &plan.nodes {
             let Operation::Elementwise(Elementwise::RopeAxes {
@@ -370,11 +379,11 @@ fn every_rope_is_one_ladder_across_the_row() {
             else {
                 continue;
             };
-            assert_eq!(*form, RopeForm::SplitLadder, "{sku}");
-            assert_eq!(*thetas, [model::ROPE_THETA; 4], "{sku}");
+            assert_eq!(*form, RopeForm::SplitLadder, "{deployment}");
+            assert_eq!(*thetas, [model::ROPE_THETA; 4], "{deployment}");
             assert_eq!(
                 rotary_dim, head_dim,
-                "{sku}: the ladder pairs rotate-half within a whole head"
+                "{deployment}: the ladder pairs rotate-half within a whole head"
             );
             *seen.entry((*dims, *head_dim)).or_default() += 1;
         }
@@ -394,13 +403,17 @@ fn every_rope_is_one_ladder_across_the_row() {
         *want
             .entry(([d.audio_cross_dim, 0, 0, 0], d.audio_head_dim))
             .or_default() += 2 * conn;
-        assert_eq!(seen, want, "{sku}");
+        assert_eq!(seen, want, "{deployment}");
 
-        assert_eq!(model::rope_pad(d.dim(), model::ROPE_AXES), 2, "{sku}");
+        assert_eq!(
+            model::rope_pad(d.dim(), model::ROPE_AXES),
+            2,
+            "{deployment}"
+        );
         assert_eq!(
             model::rope_pad(d.audio_dim(), model::AUDIO_ROPE_AXES),
             0,
-            "{sku}"
+            "{deployment}"
         );
         let no_other = plan.nodes.iter().any(|node| {
             matches!(
@@ -410,7 +423,7 @@ fn every_rope_is_one_ladder_across_the_row() {
                     | Operation::Elementwise(Elementwise::RopeMrope { .. })
             )
         });
-        assert!(!no_other, "{sku}: this text turns one kind of rope");
+        assert!(!no_other, "{deployment}: this text turns one kind of rope");
     }
 }
 
@@ -425,8 +438,8 @@ fn budget() -> poem_compiler::Budget {
 
 fn every_row_bakes_on_every_platform() {
     for platform in PLATFORMS {
-        for sku in ROWS {
-            let plan = trace(sku, platform);
+        for deployment in ROWS {
+            let plan = trace(deployment, platform);
             let budgets = poem_compiler::Budgets::of(budget())
                 .with_voxels(poem_compiler::VoxelLadder::new(256, 2));
             let compiled = poem_compiler::compile_axes(
@@ -434,17 +447,17 @@ fn every_row_bakes_on_every_platform() {
                 &budgets,
                 &poem_compiler::DeviceProfile::default(),
             )
-            .unwrap_or_else(|why| panic!("{platform:?}: `{sku}` does not bake: {why}"));
+            .unwrap_or_else(|why| panic!("{platform:?}: `{deployment}` does not bake: {why}"));
             let tiled: usize = compiled.regions.iter().map(|r| r.nodes.len()).sum();
             assert_eq!(
                 tiled,
                 plan.nodes.len(),
-                "{platform:?} `{sku}`: the regions tile the node list once"
+                "{platform:?} `{deployment}`: the regions tile the node list once"
             );
             assert_eq!(
                 compiled.voxels.is_some(),
-                is_flagship(sku),
-                "{platform:?} `{sku}`: a voxel plan iff the row carries the VAE"
+                is_flagship(deployment),
+                "{platform:?} `{deployment}`: a voxel plan iff the row carries the VAE"
             );
         }
     }
@@ -460,28 +473,28 @@ fn every_row_bakes_on_every_platform() {
 }
 
 fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
-    for sku in ROWS {
-        let facts = row(sku).generative.as_ref().expect("facts");
-        let d = dims(sku);
+    for deployment in ROWS {
+        let facts = row(deployment).generative.as_ref().expect("facts");
+        let d = dims(deployment);
         for (at, reading) in facts.readings.iter().enumerate() {
-            assert_eq!(usize::from(reading.index), at, "{sku}: dense from 0");
+            assert_eq!(usize::from(reading.index), at, "{deployment}: dense from 0");
             assert!(
                 !reading.has_kv && !reading.takes_tokens,
-                "{sku}: every reading here binds float ports alone"
+                "{deployment}: every reading here binds float ports alone"
             );
             assert!(
                 reading.positions.is_none(),
-                "{sku}: LTX turns physical coordinates, which no convention names"
+                "{deployment}: LTX turns physical coordinates, which no convention names"
             );
         }
-        let names: Vec<&str> = facts.readings.iter().map(|r| r.name).collect();
+        let names: Vec<&str> = facts.readings.iter().map(|r| r.name.as_str()).collect();
         let mut want = vec!["denoise", "refine.video", "refine.audio"];
-        if is_flagship(sku) {
+        if is_flagship(deployment) {
             want.push("vae.decode");
         }
         assert_eq!(
             names, want,
-            "{sku}: the decode reading iff the row carries the VAE"
+            "{deployment}: the decode reading iff the row carries the VAE"
         );
         assert_eq!(usize::from(DENOISE), 0);
         assert_eq!(usize::from(REFINE_VIDEO), 1);
@@ -496,7 +509,7 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
                 latent.patch_w
             ),
             (d.channels, 1, 1, 1),
-            "{sku}: a token is one latent cell"
+            "{deployment}: a token is one latent cell"
         );
         assert_eq!(
             (latent.spatial_compression, latent.temporal_compression),
@@ -509,7 +522,7 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
         assert_eq!(
             schedule.pinned_sigmas,
             model::DISTILLED_SIGMAS.to_vec(),
-            "{sku}: the distilled row pins eight sigmas for BOTH modalities"
+            "{deployment}: the distilled row pins eight sigmas for BOTH modalities"
         );
         assert!(facts.max_rows >= 4096);
         validate(facts);
@@ -532,8 +545,8 @@ fn validate(facts: &models::Generative) {
 }
 
 fn every_block_table_folds_into_a_copy_of_the_vector_the_stack_shares() {
-    for sku in ROWS {
-        let plan = trace(sku, Platform::Cuda);
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
         let lane_shaped = |id: ValueId| {
             matches!(
                 &plan.values[id.0 as usize].ty,
@@ -560,24 +573,24 @@ fn every_block_table_folds_into_a_copy_of_the_vector_the_stack_shares() {
             assert_eq!(
                 readers,
                 1,
-                "{sku}: a bias folded in place on a lane vector {} other nodes also read",
+                "{deployment}: a bias folded in place on a lane vector {} other nodes also read",
                 readers - 1
             );
             folded += 1;
         }
-        let d = dims(sku);
+        let d = dims(deployment);
         assert!(
             folded >= 8 * d.layers as usize,
-            "{sku}: {folded} lane-vector folds for {} blocks",
+            "{deployment}: {folded} lane-vector folds for {} blocks",
             d.layers
         );
     }
 }
 
 fn the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk() {
-    for sku in ROWS {
-        let plan = trace(sku, Platform::Cuda);
-        let d = dims(sku);
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
+        let d = dims(deployment);
         let ty = |id: ValueId| plan.values[id.0 as usize].ty.clone();
         let mut modulates = 0usize;
         for node in &plan.nodes {
@@ -590,14 +603,14 @@ fn the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk() {
             modulates += 1;
             let width = match ty(*x) {
                 Ty::Tensor { shape, dtype } => {
-                    assert_eq!(dtype, Dtype::Bf16, "{sku}: a bf16 trunk");
-                    assert_eq!(shape[0], Dim::Tokens, "{sku}");
+                    assert_eq!(dtype, Dtype::Bf16, "{deployment}: a bf16 trunk");
+                    assert_eq!(shape[0], Dim::Tokens, "{deployment}");
                     match shape[1] {
                         Dim::Const(w) => w,
-                        other => panic!("{sku}: a modulated row of width {other:?}"),
+                        other => panic!("{deployment}: a modulated row of width {other:?}"),
                     }
                 }
-                other => panic!("{sku}: {other:?}"),
+                other => panic!("{deployment}: {other:?}"),
             };
             assert_eq!(
                 ty(*m),
@@ -605,7 +618,7 @@ fn the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk() {
                     shape: vec![Dim::Lanes, Dim::Const(2 * width)],
                     dtype: Dtype::F32,
                 },
-                "{sku}: a per-lane f32 scale/shift pair as wide as its rows"
+                "{deployment}: a per-lane f32 scale/shift pair as wide as its rows"
             );
             let lanes = lane_of_row.expect("every modulation here is per lane");
             assert_eq!(
@@ -614,10 +627,10 @@ fn the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk() {
                     space: 0,
                     kind: GeomKind::RequestOfToken
                 }),
-                "{sku}: the broadcast is the fire's token->lane table"
+                "{deployment}: the broadcast is the fire's token->lane table"
             );
         }
-        assert_eq!(modulates, 12 * d.layers as usize + 2, "{sku}");
+        assert_eq!(modulates, 12 * d.layers as usize + 2, "{deployment}");
 
         let mut gates = 0usize;
         for node in &plan.nodes {
@@ -628,7 +641,7 @@ fn the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk() {
                     assert_eq!(
                         pairs.len(),
                         1,
-                        "{sku}: a gated fold is in place on its residual"
+                        "{deployment}: a gated fold is in place on its residual"
                     );
                 }
                 Operation::Elementwise(Elementwise::GateSigmoidMulHeads {
@@ -637,10 +650,14 @@ fn the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk() {
                     ..
                 }) => {
                     gates += 1;
-                    assert_eq!(*scale, model::GATE_SCALE, "{sku}: `out * 2 sigmoid(W x)`");
+                    assert_eq!(
+                        *scale,
+                        model::GATE_SCALE,
+                        "{deployment}: `out * 2 sigmoid(W x)`"
+                    );
                     assert!(
                         *head_dim == d.head_dim || *head_dim == d.audio_head_dim,
-                        "{sku}: a gate logit per head"
+                        "{deployment}: a gate logit per head"
                     );
                 }
                 _ => {}
@@ -649,7 +666,7 @@ fn the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk() {
         assert_eq!(
             gates,
             6 * d.layers as usize + 2 * d.conn_layers as usize,
-            "{sku}: every attention ends in a per-head gate"
+            "{deployment}: every attention ends in a per-head gate"
         );
     }
 }

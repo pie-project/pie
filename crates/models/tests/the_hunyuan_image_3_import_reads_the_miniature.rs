@@ -1,9 +1,12 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+pub mod hunyuan_image_3_dims;
+
 use checkpoint::contract::Expr;
-use models::hunyuan_image_3::model::{Dims, Model};
-use poem_dsl::{Dtype, Platform};
+use poem::Platform;
+
+use hunyuan_image_3_dims::{self as model, Dims};
 
 const MINI: &str = "hunyuanimage3-mini-bf16-kv-bf16";
 
@@ -29,7 +32,7 @@ fn the_miniature_reads_the_golden_and_rearranges_where_the_study_says() {
         return;
     }
     let src = ztensor_compat::open(&path).unwrap_or_else(|why| panic!("{}: {why}", path.display()));
-    let row = models::sku(MINI).expect("this build ships the miniature");
+    let row = models::deployment(MINI).expect("this build ships the miniature");
     let contract = row
         .contract(&src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the miniature does not read its own golden: {why}"));
@@ -106,15 +109,11 @@ fn the_miniature_reads_the_golden_and_rearranges_where_the_study_says() {
         ones.expr.sources().is_empty(),
         "a constant reads no checkpoint tensor"
     );
-
-    let model = Model::mini(Dtype::Bf16, Dtype::Bf16, 1);
-    assert_eq!(model.dims, d);
-    assert_eq!(model.layers.len(), layers);
 }
 
 fn the_rotary_channel_permutation_is_one() {
     for head_dim in [64u32, 128] {
-        let scale = models::hunyuan_image_3::model::rope_x_scale(head_dim);
+        let scale = model::rope_x_scale(head_dim);
         let want = 10_000f32.powf(-2.0 / head_dim as f32);
         assert!((scale - want).abs() < 1e-9, "head {head_dim}");
         assert!(head_dim.is_multiple_of(4));

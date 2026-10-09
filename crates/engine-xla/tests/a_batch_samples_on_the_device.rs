@@ -4,7 +4,7 @@
 //! the host interpreter samples from the same logits. Prints the host time
 //! the guest pass costs both ways.
 //!
-//! Asked for with `PIE_XLA_SNAPSHOT` + `PIE_XLA_SKU` (see
+//! Asked for with `PIE_XLA_SNAPSHOT` + `PIE_XLA_DEPLOYMENT` (see
 //! `a_model_speaks_on_the_device`); `PIE_XLA_SAMPLER_LANES` sets the batch
 //! (default 8), `PIE_XLA_SAMPLER_STEPS` the decode steps (default 12),
 //! `PIE_XLA_SAMPLER_TOP_K` adds a top-k cut (slow on the host side),
@@ -25,8 +25,8 @@ use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceCon
 use eta_ir::op::{IntrinsicId, Op};
 use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
 use eta_ir::types::{Dtype, Literal, Predicate, RngKind, Shape};
+use poem::{Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Platform, Request};
 
 const RNG: u32 = 0;
 const COUNTS: u32 = 1;
@@ -213,7 +213,7 @@ fn token(plane: &mut Plane, instance: u64, chan: u32) -> i32 {
 #[test]
 fn a_batch_samples_on_the_device_as_the_interpreter_does() {
     let Some(m) = common::model() else {
-        eprintln!("not asked: set PIE_XLA_SNAPSHOT + PIE_XLA_SKU or PIE_XLA_ARTIFACT");
+        eprintln!("not asked: set PIE_XLA_SNAPSHOT + PIE_XLA_DEPLOYMENT or PIE_XLA_ARTIFACT");
         return;
     };
     let lanes: u32 = std::env::var("PIE_XLA_SAMPLER_LANES")
@@ -224,12 +224,13 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(12);
-    let sku = m.sku;
-    let word = |query_len: u32| (sku.classify)(&Request::new(query_len, false));
+    let deployment = m.deployment;
+    let facts = deployment.trace(models::Platform::Xla).facts;
+    let word = |query_len: u32| facts.word(&Request::new(query_len, false));
     let context = 512;
     let _device = engine_xla::bench::lock_device();
     let mut shell = Shell::load(Boot {
-        trace: (sku.trace)(Platform::Xla),
+        trace: deployment.trace(Platform::Xla),
         contract: &m.contract,
         checkpoint: &m.checkpoint,
         budget: Budget::new(lanes, 1024),

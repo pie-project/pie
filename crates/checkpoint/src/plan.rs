@@ -8,6 +8,7 @@ use crate::types::{
 };
 
 pub mod build;
+pub mod constant;
 pub(crate) mod geometry;
 pub mod group;
 pub mod index;
@@ -52,6 +53,8 @@ fn compile_through(
     target: StorageTarget,
     passes: fn(&mut LoadPlan) -> Result<Vec<pass::PassStats>>,
 ) -> Result<LoadPlan> {
+    let (metadata, contract) = constant::mounted(metadata, contract)?;
+    let (metadata, contract) = (metadata.as_ref(), contract.as_ref());
     let rewritten =
         crate::contract::rewrite::coalesce_direct_row_shards(contract, metadata, &target)?;
     let mut plan = build::build(metadata, &rewritten, target.clone())?;

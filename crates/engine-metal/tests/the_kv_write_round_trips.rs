@@ -407,6 +407,7 @@ fn the_pre_estimate_sizes_packed_kv_exactly_at_any_head_dim() {
     let kv_trace = |dtype: Dtype, kv_heads: u32, head_dim: u32| {
         let width = u64::from(kv_heads) * u64::from(head_dim);
         Trace {
+            facts: Default::default(),
             name: String::from("kv_estimate_probe"),
             platform: Platform::Metal,
             params: Vec::new(),

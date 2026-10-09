@@ -67,7 +67,7 @@ pub(crate) fn load_model_engines(
             &m.model,
             weights::Want {
                 backend: Some(flavor.as_str()),
-                sku: m.sku.as_deref(),
+                overrides: Some(&m.overrides()?),
             },
             home,
         )
@@ -150,7 +150,7 @@ pub enum Engine {
 #[derive(Debug, Clone, Serialize)]
 pub struct Summary {
     pub model: String,
-    pub sku: String,
+    pub deployment: String,
     pub trace: String,
     pub weight_bytes: u64,
     pub kv_pages: u32,
@@ -244,7 +244,7 @@ fn load(
     let group = &engines.groups[0];
     let summary = Summary {
         model: artifact_name(&group.snapshot_dir),
-        sku: group.sku.clone(),
+        deployment: group.deployment.clone(),
         trace: group.facts.trace_name.clone(),
         weight_bytes: group.facts.weight_bytes,
         kv_pages: caps.pools.kv_pages,
@@ -269,7 +269,7 @@ fn load(
     })
 }
 
-/// The runtime with no engine: the SKU comes from the artifact's serving stamp.
+/// The runtime with no engine: the deployment is the artifact's serving stamp's.
 fn load_without_engine(
     user_cfg: &config::Config,
     home: &Path,
@@ -278,7 +278,7 @@ fn load_without_engine(
     let m = &user_cfg.model;
     let want = weights::Want {
         backend: None,
-        sku: m.sku.as_deref(),
+        overrides: Some(&m.overrides()?),
     };
     let resolved = weights::resolve(&m.model, want, home)
         .with_context(|| format!("resolving the model for {:?}", m.name))?;
@@ -286,18 +286,18 @@ fn load_without_engine(
     let metadata = resolved
         .metadata()
         .with_context(|| format!("reading the model metadata for {:?}", m.name))?;
-    let sku = checkpoint::file::serve::stamp_of(&artifact)?
-        .map(|stamp| stamp.sku)
+    let deployment = checkpoint::file::serve::stamp_of(&artifact)?
+        .map(|stamp| stamp.deployment)
         .ok_or_else(|| anyhow!("{} carries no serving stamp", artifact.display()))?;
     let config =
-        translate::build_without_engine(user_cfg, home, builtins, &artifact, &sku, metadata);
+        translate::build_without_engine(user_cfg, home, builtins, &artifact, &deployment, metadata);
     Ok(Loaded {
         model: m.name.clone(),
         partner: None,
         summary: Summary {
             model: artifact_name(&artifact),
-            sku: sku.clone(),
-            trace: sku,
+            deployment: deployment.clone(),
+            trace: deployment,
             weight_bytes: 0,
             kv_pages: 0,
             kv_page_size: translate::ENGINELESS_PAGE_SIZE,
@@ -357,7 +357,7 @@ fn create_engine_group(
                 m.residency(),
                 m.patch_ceilings(),
                 m.voxel_ceilings(),
-                m.sku.as_deref(),
+                &m.overrides()?,
             )
             .with_context(|| {
                 format!(
@@ -392,7 +392,7 @@ fn create_engine_group(
         m.residency(),
         m.patch_ceilings(),
         m.voxel_ceilings(),
-        m.sku.as_deref(),
+        &m.overrides()?,
         opened,
     )
     .with_context(|| format!("creating engine for model {:?} group {group_idx}", m.name,))

@@ -38,7 +38,7 @@
 //! # The geometry, and why it is a parameter
 //!
 //! The defaults are qwen35-d0.8b's — 24 layers, hidden 1024, the bank's own
-//! rank 16 (`Adapters { slots: 8, rank: 16 }`). A different SKU passes its own
+//! rank 16 (`Adapters { slots: 8, rank: 16 }`). A different deployment passes its own
 //! numbers rather than editing this file, because a rank is TRACE-KNOWN: a
 //! different rank is a different traced program, which is exactly what a
 //! parameter that reaches the channel shape expresses. gemma-4-26b-a4b is

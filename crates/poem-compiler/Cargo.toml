@@ -3,7 +3,7 @@ name = "pie-poem-compiler"
 version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "Bakes a traced Plan once: class resolution, region coalescing and the arena carve, into the backend-neutral CompiledModel artifact an engine records and replays. Pure functions — no device, no I/O."
+description = "Bakes a traced Plan once: fusion into the kernels a backend ships, class resolution, region coalescing and the arena carve, into the backend-neutral CompiledModel artifact an engine records and replays. Pure functions — no device, no I/O."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -12,12 +12,13 @@ name = "poem_compiler"
 path = "src/lib.rs"
 
 [dependencies]
+poem = { package = "pie-poem", path = "../poem" }
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
+serde = "1.0"
 thiserror = "2.0"
 
 [dev-dependencies]
 models = { path = "../models" }
-poem-dsl = { package = "pie-poem-dsl", path = "../poem-dsl" }
 
 [lints]
 workspace = true

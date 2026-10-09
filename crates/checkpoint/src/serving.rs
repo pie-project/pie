@@ -22,7 +22,7 @@ pub const BLOCK_BYTES: u64 = 64 << 20;
 pub struct Stamp {
     pub serving: String,
     pub backend: String,
-    pub sku: String,
+    pub deployment: String,
     pub layout_revision: u64,
     pub adapters_zeroed: bool,
 }
@@ -31,7 +31,7 @@ pub struct Stamp {
 pub enum Field {
     Serving,
     Backend,
-    Sku,
+    Deployment,
     LayoutRevision,
     AdaptersZeroed,
 }
@@ -42,7 +42,7 @@ impl Field {
         match self {
             Field::Serving => PROFILE,
             Field::Backend => "backend",
-            Field::Sku => "sku",
+            Field::Deployment => "deployment",
             Field::LayoutRevision => "layout_revision",
             Field::AdaptersZeroed => "adapters_zeroed",
         }
@@ -53,7 +53,7 @@ impl Field {
         &[
             Field::Serving,
             Field::Backend,
-            Field::Sku,
+            Field::Deployment,
             Field::LayoutRevision,
             Field::AdaptersZeroed,
         ]
@@ -114,7 +114,7 @@ impl Stamp {
             text(PROFILE),
             Value::Map(vec![
                 (text(Field::Backend.key()), text(&self.backend)),
-                (text(Field::Sku.key()), text(&self.sku)),
+                (text(Field::Deployment.key()), text(&self.deployment)),
                 (
                     text(Field::LayoutRevision.key()),
                     Value::Uint(self.layout_revision),
@@ -128,11 +128,11 @@ impl Stamp {
     }
 
     #[must_use]
-    pub fn of(backend: &str, sku: &str) -> Stamp {
+    pub fn of(backend: &str, deployment: &str) -> Stamp {
         Stamp {
             serving: PROFILE.to_string(),
             backend: backend.to_string(),
-            sku: sku.to_string(),
+            deployment: deployment.to_string(),
             layout_revision: LAYOUT_REVISION,
             adapters_zeroed: true,
         }
@@ -167,7 +167,7 @@ impl Stamp {
         Ok(Stamp {
             serving: PROFILE.to_string(),
             backend: required_text(attributes, Field::Backend)?.to_string(),
-            sku: required_text(attributes, Field::Sku)?.to_string(),
+            deployment: required_text(attributes, Field::Deployment)?.to_string(),
             layout_revision: required_uint(attributes, Field::LayoutRevision)?,
             adapters_zeroed,
         })
@@ -192,7 +192,7 @@ impl Stamp {
         match field {
             Field::Serving => self.serving.clone(),
             Field::Backend => self.backend.clone(),
-            Field::Sku => self.sku.clone(),
+            Field::Deployment => self.deployment.clone(),
             Field::LayoutRevision => self.layout_revision.to_string(),
             Field::AdaptersZeroed => self.adapters_zeroed.to_string(),
         }
@@ -507,14 +507,14 @@ pub fn tiling_fault(spans: &[Span<'_>], align: u64) -> Option<Fault> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Name {
     pub slug: String,
-    pub sku: String,
+    pub deployment: String,
     pub backend: String,
 }
 
 impl Name {
     #[must_use]
     pub fn render(&self) -> String {
-        format!("{}.{}.{}.zt", self.slug, self.sku, self.backend)
+        format!("{}.{}.{}.zt", self.slug, self.deployment, self.backend)
     }
 
     pub fn parse(name: &str) -> Result<Name, Error> {
@@ -528,8 +528,10 @@ impl Name {
         let (rest, backend) = rest
             .rsplit_once('.')
             .ok_or_else(|| bad("names no backend"))?;
-        let (slug, sku) = rest.rsplit_once('.').ok_or_else(|| bad("names no sku"))?;
-        for field in [slug, sku, backend] {
+        let (slug, deployment) = rest
+            .rsplit_once('.')
+            .ok_or_else(|| bad("names no deployment"))?;
+        for field in [slug, deployment, backend] {
             if !is_field(field) {
                 return Err(bad(&format!(
                     "holds the field {field:?}, which is not `[a-z0-9][a-z0-9_-]*`"
@@ -538,7 +540,7 @@ impl Name {
         }
         Ok(Name {
             slug: slug.to_string(),
-            sku: sku.to_string(),
+            deployment: deployment.to_string(),
             backend: backend.to_string(),
         })
     }
@@ -547,7 +549,7 @@ impl Name {
     pub fn of(stamp: &Stamp, slug: &str) -> Name {
         Name {
             slug: slugify(slug),
-            sku: slugify(&stamp.sku),
+            deployment: slugify(&stamp.deployment),
             backend: slugify(&stamp.backend),
         }
     }

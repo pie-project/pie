@@ -1,6 +1,6 @@
 use engine_cuda::window::Windows;
+use poem::Platform;
 use poem_compiler::{Budget, CompiledModel, DeviceProfile, compile};
-use poem_dsl::Platform;
 use poem_exec::fire::{WindowTable, fallback};
 use poem_ir::Trace;
 
@@ -8,7 +8,7 @@ fn test_slots() -> engine_cuda::window::Slots {
     engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 2, 512)
 }
 
-const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
+const DEPLOYMENT: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
 fn budget() -> Budget {
     Budget {
@@ -21,16 +21,15 @@ fn budget() -> Budget {
     }
 }
 
-fn sku() -> (Trace, CompiledModel) {
-    let trace = models::sku(SKU)
-        .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"))
-        .trace;
-    let trace = trace(Platform::Cuda);
+fn deployment() -> (Trace, CompiledModel) {
+    let trace = models::deployment(DEPLOYMENT)
+        .unwrap_or_else(|| panic!("`{DEPLOYMENT}` is in the catalog"))
+        .trace(Platform::Cuda);
     let compiled = compile(&trace, &budget(), &DeviceProfile::default())
-        .unwrap_or_else(|refusal| panic!("`{SKU}` bakes: {refusal:?}"));
+        .unwrap_or_else(|refusal| panic!("`{DEPLOYMENT}` bakes: {refusal:?}"));
     assert!(
         !compiled.fallback.rows.is_empty(),
-        "`{SKU}` owes fallback rows — that is the premise of this file",
+        "`{DEPLOYMENT}` owes fallback rows — that is the premise of this file",
     );
     (trace, compiled)
 }
@@ -45,7 +44,7 @@ fn indptr(rows: &[u32]) -> Vec<i32> {
 
 #[test]
 fn a_window_p4_promised_whole_is_still_a_bake_integrity_refusal() {
-    let (plan, compiled) = sku();
+    let (plan, compiled) = deployment();
 
     let count = compiled.classes.classes.len();
     let ascending = WindowTable::new(

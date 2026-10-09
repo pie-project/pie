@@ -41,11 +41,9 @@ pub mod open {
 
     #[cfg(feature = "cuda")]
     pub fn cuda(boot: engine_cuda::DeviceBoot) -> Result<EngineBox> {
-        engine_cuda::open(boot, crate::engine::load::contract_for, |name| {
-            models::sku(name).map(|sku| sku.classify)
-        })
-        .map(|engine| Box::new(engine) as EngineBox)
-        .map_err(::anyhow::Error::msg)
+        engine_cuda::open(boot, crate::engine::load::contract_for)
+            .map(|engine| Box::new(engine) as EngineBox)
+            .map_err(::anyhow::Error::msg)
     }
 
     #[cfg(feature = "cuda")]
@@ -53,11 +51,9 @@ pub mod open {
         match boots.len() {
             0 => Err(super::anyhow!("a cuda group requires at least one rank")),
             1 => Ok((cuda(boots.remove(0))?, 1)),
-            ranks => engine_cuda::open_group(boots, crate::engine::load::contract_for, |name| {
-                models::sku(name).map(|sku| sku.classify)
-            })
-            .map(|group| (Box::new(group) as EngineBox, ranks))
-            .map_err(::anyhow::Error::msg),
+            ranks => engine_cuda::open_group(boots, crate::engine::load::contract_for)
+                .map(|group| (Box::new(group) as EngineBox, ranks))
+                .map_err(::anyhow::Error::msg),
         }
     }
 
@@ -85,7 +81,6 @@ pub mod open {
     #[cfg(feature = "xla")]
     pub fn xla(config_bytes: &[u8]) -> Result<EngineBox> {
         engine_xla::open(config_bytes, crate::engine::load::contract_for)
-            .map(|engine| engine.with_classify(|name| models::sku(name).map(|sku| sku.classify)))
             .map(|engine| Box::new(engine) as EngineBox)
             .map_err(::anyhow::Error::msg)
     }

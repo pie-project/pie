@@ -68,7 +68,7 @@ if let url = URL(string: arguments[1]), url.scheme == "ws" {
     } else {
         client = try await server!.connect()
     }
-    print(String(format: "booted %@ in %.2fs", server!.summary.sku, booted.duration(to: clock.now) / .seconds(1)))
+    print(String(format: "booted %@ in %.2fs", server!.summary.deployment, booted.duration(to: clock.now) / .seconds(1)))
 }
 
 if let server, let script = ProcessInfo.processInfo.environment["PIE_SCRIPT"].map({ URL(filePath: $0) }) {

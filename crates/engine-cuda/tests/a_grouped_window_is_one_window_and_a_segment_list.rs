@@ -1,6 +1,6 @@
 use engine_cuda::window::{Copies, Windows};
+use poem::Platform;
 use poem_compiler::{Budget, CompiledModel, DeviceProfile, FamilyCosts, compile};
-use poem_dsl::Platform;
 use poem_exec::fire::{Lane, compose};
 
 use poem_ir::Trace;
@@ -9,7 +9,7 @@ fn test_slots() -> engine_cuda::window::Slots {
     engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 2, 512)
 }
 
-const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
+const DEPLOYMENT: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
 const CORRECTION: &str = "linear.lora_correct";
 
@@ -39,11 +39,10 @@ fn arms() -> (DeviceProfile, DeviceProfile) {
     (split, grouped)
 }
 
-fn sku() -> (Trace, CompiledModel, CompiledModel) {
-    let trace = models::sku(SKU)
-        .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"))
-        .trace;
-    let trace = trace(Platform::Cuda);
+fn deployment() -> (Trace, CompiledModel, CompiledModel) {
+    let trace = models::deployment(DEPLOYMENT)
+        .unwrap_or_else(|| panic!("`{DEPLOYMENT}` is in the catalog"))
+        .trace(Platform::Cuda);
     let (split, grouped) = arms();
     let split = compile(&trace, &budget(), &split).expect("the split arm bakes");
     let grouped = compile(&trace, &budget(), &grouped).expect("the grouped arm bakes");
@@ -69,7 +68,7 @@ fn one_lane_per_class(compiled: &CompiledModel) -> Vec<Lane> {
 
 #[test]
 fn the_segment_lists_are_staged_beside_the_boundaries_in_the_one_copy() {
-    let (plan, _, grouped) = sku();
+    let (plan, _, grouped) = deployment();
     let lanes = one_lane_per_class(&grouped);
     let fire = compose(&grouped, &budget(), &lanes).expect("eight lanes compose");
     let rows: Vec<u32> = fire.lanes().iter().map(|lane| lane.rows).collect();

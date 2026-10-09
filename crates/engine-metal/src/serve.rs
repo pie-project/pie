@@ -340,7 +340,7 @@ impl Shell {
             });
         }
         let boot = Boot {
-            trace: poem_ir::fuse::residual_norm(boot.trace),
+            trace: poem_compiler::fuse::fuse(boot.trace, &crate::FUSED),
             ..boot
         };
         let device = Context::bind()?;

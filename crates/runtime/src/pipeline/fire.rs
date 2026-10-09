@@ -915,6 +915,23 @@ fn stamp_denoise(
     Ok(())
 }
 
+/// A drafted block of a drafter whose attention reads the mask attends every
+/// row before it and every row of the block, so a block lane its inferlet sent
+/// without a mask carries that whole extent, as a denoise lane does.
+fn stamp_block_masks(req: &mut crate::engine::FireRequest) {
+    if !crate::model::model().eta_caps().draft_bidirectional {
+        return;
+    }
+    for lane in &mut req.lanes {
+        if lane.block_draft && lane.mask.is_none() {
+            lane.mask = Some(::engine::Masking::Extent(::engine::Mask::new(
+                vec![0, u32::MAX],
+                u64::from(u32::MAX),
+            )));
+        }
+    }
+}
+
 fn stamp_lane_words(
     req: &mut crate::engine::FireRequest,
     fire_wide_mask: bool,
@@ -1421,6 +1438,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 }
             }
         }
+        stamp_block_masks(&mut req);
         stamp_lane_words(&mut req, fire_wide_mask, carries_media);
         if !matched.is_empty() {
             let lane_rows: Vec<u32> = req

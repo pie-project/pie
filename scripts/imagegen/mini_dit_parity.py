@@ -60,7 +60,7 @@ import numpy as np
 DEFAULT_GOLDEN = os.path.join(
     os.environ.get("PIE_IMAGEGEN_GOLDEN", "/root/.cache/pie-imagegen/golden"), "mini-dit"
 )
-DEFAULT_SKU = "mini-dit-bf16-kv-bf16"
+DEFAULT_DEPLOYMENT = "mini-dit-bf16-kv-bf16"
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 
@@ -551,7 +551,7 @@ def main() -> int:
     ap.add_argument("--inferlet", default=os.path.join(REPO, "examples/mini-dit-parity"))
     ap.add_argument("--config", default=None,
                     help=f"the serving config; its `[model] model` must be the artifact "
-                         f"`{DEFAULT_SKU}` imported")
+                         f"`{DEFAULT_DEPLOYMENT}` imported")
     ap.add_argument("--pie", default=None, help="the pie binary (default: PATH, else target/debug)")
     ap.add_argument("--case_file", action="store_true", help="pass the case as a scratch file instead of argv pieces")
     ap.add_argument("--keys", action="append", default=None)

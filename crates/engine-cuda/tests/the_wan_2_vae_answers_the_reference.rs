@@ -1,142 +1,53 @@
 #![cfg(feature = "cuda")]
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::Instant;
 
+pub mod common_vae;
+
+use common_vae::{Score, artifact, bf16_bytes, boxed, deploy, f32s, golden, score, shapes};
 use engine_cuda::serve::{Clips, Seated};
-use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
-use models::wan_2::forward::Facts;
-use models::wan_2::model::Model;
-use poem_compiler::{Budget, VoxelLadder};
-use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Stream, Value,
-    trace_hybrid,
-};
+use engine_cuda::{Lane, Shell};
+use poem::{Platform, Request, Stream, Trace};
 
-struct VaeOnly {
-    model: Model,
-}
+/// The VAE's decode readings alone, by the package's own functions.
+const VAE_ONLY: &str = r#"
+def forward(m, inputs):
+    inputs.reading("vae.decode.head", lambda rows: vae_decode(rows, m.vae, True))
+    return inputs.reading("vae.decode", lambda rows: vae_decode(rows, m.vae, False))
+"#;
 
-impl ForwardHybrid for VaeOnly {
-    type Facts = Facts;
-
-    fn caches(&self) -> HybridSpec {
-        self.model.caches()
-    }
-
-    fn forward(&self, inputs: Input<Facts>) -> Value {
-        let vae = self
-            .model
-            .vae
-            .as_ref()
-            .expect("the flagship carries the VAE");
-        let codes = self.model.readings();
-        let (top, bot) = inputs.split(&Facts::reading_top());
-        let (t_hi, t_lo) = top.split(&Facts::reading_hi());
-        let (b_hi, b_lo) = bot.split(&Facts::reading_hi());
-        let (c7, c6) = t_hi.split(&Facts::reading_lo());
-        let (c5, c4) = t_lo.split(&Facts::reading_lo());
-        let (c3, c2) = b_hi.split(&Facts::reading_lo());
-        let (c1, c0) = b_lo.split(&Facts::reading_lo());
-        let arms = [c0, c1, c2, c3, c4, c5, c6, c7];
-        let head = codes.vae_decode_head.expect("the head arm's code");
-        let rest = codes.vae_decode.expect("the later-frames arm's code");
-        let _ = models::wan_2::forward::vae_decode(&arms[usize::from(head)], vae, true);
-        models::wan_2::forward::vae_decode(&arms[usize::from(rest)], vae, false)
-    }
-}
-
-fn artifact() -> Option<PathBuf> {
-    let root = std::env::var_os("PIE_IMAGEGEN_ARTIFACTS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/root/.cache/pie-imagegen"));
-    let file = root.join("wan22-ti2v-5b.zt");
-    file.is_file().then_some(file)
-}
-
-fn golden() -> Option<PathBuf> {
-    let root = std::env::var_os("PIE_IMAGEGEN_GOLDEN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/root/.cache/pie-imagegen/golden"));
-    let dir = root.join("wan22/wan22_vae");
-    dir.join("shapes.json").is_file().then_some(dir)
-}
-
-fn f32s(path: &PathBuf) -> Vec<f32> {
-    let bytes = std::fs::read(path).unwrap_or_else(|why| panic!("{}: {why}", path.display()));
-    bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect()
-}
-
-fn bf16_bytes(values: &[f32]) -> Vec<u8> {
-    values
-        .iter()
-        .flat_map(|&v| {
-            let bits = v.to_bits();
-            let rounding = 0x7fff + ((bits >> 16) & 1);
-            (((bits + rounding) >> 16) as u16).to_le_bytes()
-        })
-        .collect()
-}
-
-struct Score {
-    cos: f64,
-    max_abs: f64,
-    mean_abs: f64,
-}
-
-fn score(got: &[f32], want: &[f32]) -> Score {
-    assert_eq!(got.len(), want.len(), "one value per reference value");
-    let (mut dot, mut gg, mut ww, mut max_abs, mut sum_abs) = (0f64, 0f64, 0f64, 0f64, 0f64);
-    for (g, w) in got.iter().zip(want) {
-        let (g, w) = (f64::from(*g), f64::from(*w));
-        dot += g * w;
-        gg += g * g;
-        ww += w * w;
-        let err = (g - w).abs();
-        max_abs = max_abs.max(err);
-        sum_abs += err;
-    }
-    Score {
-        cos: dot / (gg.sqrt() * ww.sqrt()).max(1e-30),
-        max_abs,
-        mean_abs: sum_abs / want.len().max(1) as f64,
-    }
-}
-
-fn boxed(shapes: &serde_json::Value, key: &str) -> ([u32; 3], usize) {
-    let at = &shapes[key];
-    let get = |name: &str| at[name].as_u64().expect("a box extent") as u32;
-    (
-        [get("t"), get("h"), get("w")],
-        at["channels"].as_u64().expect("channels") as usize,
-    )
-}
-
-fn word(reading: u8) -> u64 {
-    Facts::of(
-        &Request::new(1, false)
-            .on_stream(Stream::Video)
-            .in_reading(reading),
-    )
-    .word()
+fn vae_only() -> Trace {
+    models::star::replacing("wan22-ti2v-5b", "forward.poem", "forward", VAE_ONLY)
+        .unwrap_or_else(|why| panic!("the VAE-only package: {why}"))
+        .trace(
+            "wan22-ti2v-5b",
+            &deploy("wan22-ti2v-5b-bf16-kv-bf16"),
+            "wan22-vae-decode",
+            Platform::Cuda,
+        )
+        .unwrap_or_else(|why| panic!("the VAE-only plan: {why:#}"))
 }
 
 struct Decoder {
     shell: Shell,
-    head: u8,
-    rest: u8,
 }
 
 impl Decoder {
     fn frame(&mut self, first: bool, clip: [u32; 3], payload: &[f32]) -> (Vec<f32>, [u32; 3]) {
-        let reading = if first { self.head } else { self.rest };
+        let reading = if first {
+            "vae.decode.head"
+        } else {
+            "vae.decode"
+        };
         let tokens = [0u32];
         let lanes = [Seated::of(Lane {
             slot: 0,
-            word: word(reading),
+            word: self.shell.trace().facts.word(
+                &Request::new(1, false)
+                    .on_stream(Stream::Video)
+                    .in_reading(reading),
+            ),
             tokens: &tokens,
         })];
         let bytes = bf16_bytes(payload);
@@ -160,18 +71,11 @@ impl Decoder {
     }
 }
 
-fn load(artifact: &PathBuf, max_voxels: u32) -> (Decoder, f64) {
-    let model = Model::ti2v_5b(Dtype::Bf16, 1);
-    let codes = model.readings();
-    let (head, rest) = (
-        codes.vae_decode_head.expect("the head arm"),
-        codes.vae_decode.expect("the later arm"),
-    );
-    let arm = VaeOnly { model };
-    let trace = trace_hybrid("wan22-vae-decode", &arm, Platform::Cuda);
+fn load(artifact: &Path, max_voxels: u32) -> (Decoder, f64) {
+    let trace = vae_only();
     let src = ztensor::Source::open(artifact)
         .unwrap_or_else(|why| panic!("{}: {why}", artifact.display()));
-    let contract = checkpoint_dsl::own_contract(&src, &trace.params, 1, Platform::Cuda)
+    let contract = poem::import::own_contract(&src, &trace.params, 1, Platform::Cuda)
         .unwrap_or_else(|why| {
             panic!(
                 "{} does not hold every plane of the VAE plan: {why}",
@@ -180,55 +84,17 @@ fn load(artifact: &PathBuf, max_voxels: u32) -> (Decoder, f64) {
         });
     drop(src);
     let started = Instant::now();
-    let mut shell = Shell::load(Boot {
-        classify: |request| Facts::of(request).word(),
-        trace,
-        contract: &contract,
-        checkpoint: artifact,
-        budget: Budget::new(2, 16),
-        patches: None,
-        voxels: Some(VoxelLadder::new(max_voxels, 2)),
-        profile: None,
-        page_size: 16,
-        context: 64,
-        slots: 2,
-        pages: 4,
-        ordinal: 0,
-        graphs: Graphs::Off,
-        knobs: Knobs {
-            recording: Recording::Off,
-            ..Knobs::default()
-        },
-        deferred_tier: true,
-        cache_dir: None,
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-    })
-    .unwrap_or_else(|why| panic!("the VAE decoder does not load: {why}"));
-    let load_s = started.elapsed().as_secs_f64();
-    shell.open(0).expect("slot 0 opens");
-    (Decoder { shell, head, rest }, load_s)
+    let shell = common_vae::load(trace, &contract, artifact, max_voxels);
+    (Decoder { shell }, started.elapsed().as_secs_f64())
 }
 
 #[test]
+#[ignore = "needs a CUDA device, wan22-ti2v-5b.zt under PIE_IMAGEGEN_ARTIFACTS and the wan22_golden.py --vae dump under PIE_IMAGEGEN_GOLDEN"]
 fn the_decoder_answers_the_reference_frame_by_frame() {
-    if !engine_cuda::device::present() {
-        eprintln!("skipping the VAE parity gate: no CUDA device");
-        return;
-    }
-    let Some(root) = artifact() else {
-        eprintln!("skipping the VAE parity gate: no wan22-ti2v-5b.zt artifact");
-        return;
-    };
-    let Some(gold) = golden() else {
-        eprintln!("skipping the VAE parity gate: no wan22_golden.py --vae dump");
-        return;
-    };
-    let shapes: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(gold.join("shapes.json")).expect("shapes.json"))
-            .expect("shapes.json parses");
+    assert!(engine_cuda::device::present(), "no CUDA device");
+    let root = artifact("wan22-ti2v-5b.zt");
+    let gold = golden("wan22/wan22_vae");
+    let shapes = shapes(&gold);
     let (latent_box, latent_c) = boxed(&shapes, "latent");
     let (pixel_box, pixel_c) = boxed(&shapes, "pixels");
     let latent = f32s(&gold.join("latent.f32"));

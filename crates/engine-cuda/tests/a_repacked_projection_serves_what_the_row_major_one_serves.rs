@@ -1,26 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use checkpoint::contract::ModelContract;
-use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, ops,
-    trace_hybrid,
-};
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, trace_hybrid};
 use poem_ir::{TILED_BAND, TILED_STEP, Trace};
 
 const VOCAB: u32 = 1000;
 
 const HIDDEN: u64 = 512;
-
-struct NoFacts;
-
-impl Classify for NoFacts {
-    fn of(_: &Request) -> NoFacts {
-        NoFacts
-    }
-    fn word(&self) -> u64 {
-        0
-    }
-}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Arm {
@@ -54,7 +40,7 @@ impl Micro {
     }
 
     fn load(&self, src: &ztensor::Source) -> ModelContract {
-        let mut b = checkpoint_dsl::Builder::new(src, 1, poem_dsl::Platform::Cuda);
+        let mut b = poem::import::Builder::new(src, 1, poem::Platform::Cuda);
         for w in [&self.embed, &self.proj, &self.head] {
             b.read_own(w)
                 .unwrap_or_else(|why| panic!("`{}`: {why}", w.name));
@@ -64,13 +50,11 @@ impl Micro {
 }
 
 impl ForwardHybrid for Micro {
-    type Facts = NoFacts;
-
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input<NoFacts>) -> Value {
+    fn forward(&self, inputs: Input) -> Value {
         let x = ops::layout::embed(&inputs.tokens(), &self.embed, VOCAB);
         let h = ops::linear::matmul(&x, &self.proj);
         ops::linear::lm_head(&h, &self.head)

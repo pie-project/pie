@@ -23,14 +23,15 @@
 //! in `a_buffered_fold_is_the_fold_it_replaces.rs`.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use engine_metal::{Boot, Lane, Shell};
-use models::qwen_3::model::Model;
+use models::star::{import_of, trace_of};
+use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Classify, Dtype, Platform, Request};
 use poem_ir::{Elementwise, Operation};
 
-// ---- the micro_text shape (must match `Model::micro_text_dims`) --------------
+// ---- the micro_text shape (must match the package's `qwen3-micro-text`) --------------
 const HIDDEN: usize = 128;
 const LAYERS: usize = 2;
 const Q_HEADS: usize = 4;
@@ -93,7 +94,7 @@ fn write_safetensors(path: &Path, tensors: &[(String, Vec<u64>, Vec<f32>)]) {
     std::fs::write(path, file).expect("the fixture safetensors writes");
 }
 
-/// Every plane `Model::micro_text` imports under the transformers layout, filled
+/// Every plane `qwen3-micro-text` imports under the transformers layout, filled
 /// with synthetic f32. Norm weights are near zero (rmsnorm here is the +1 form,
 /// so a ~0 weight gives a ~unit scale); projections are small gaussians.
 fn synth_fixture(dir: &Path) {
@@ -179,7 +180,18 @@ fn synth_fixture(dir: &Path) {
 }
 
 fn word(query_len: u32) -> u64 {
-    models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+    static FACTS: OnceLock<poem_ir::Facts> = OnceLock::new();
+    FACTS
+        .get_or_init(|| {
+            trace_of(
+                "qwen3-micro-text",
+                Dtype::Bf16,
+                Dtype::Bf16,
+                Platform::Metal,
+            )
+            .facts
+        })
+        .word(&Request::new(query_len, false))
 }
 
 fn hadamards(trace: &poem_ir::Trace) -> usize {
@@ -194,16 +206,15 @@ fn hadamards(trace: &poem_ir::Trace) -> usize {
 /// the rotation on or off. Returns the load error as a string so a caller can
 /// decide whether an unsupported dtype is fatal or merely "not reached".
 fn try_load(dir: &Path, w: Dtype, rotate: bool) -> Result<Shell, String> {
-    let model = if rotate {
-        Model::micro_text_rotated(w, Dtype::Bf16, 1)
+    let id = if rotate {
+        "qwen3-micro-text-rotated"
     } else {
-        Model::micro_text(w, Dtype::Bf16, 1)
+        "qwen3-micro-text"
     };
-    let trace = poem_dsl::trace_hybrid("qwen3-micro-text", &model, Platform::Metal);
+    let trace = trace_of(id, w, Dtype::Bf16, Platform::Metal);
     let source = ztensor_compat::index(dir.join("model.safetensors")).map_err(|e| e.to_string())?;
-    let contract = model
-        .import(&source, Platform::Metal)
-        .map_err(|e| e.to_string())?;
+    let contract =
+        import_of(id, w, Dtype::Bf16, &source, Platform::Metal).map_err(|e| e.to_string())?;
     drop(source);
     Shell::load(Boot {
         voxels: None,
@@ -285,23 +296,25 @@ fn deviation(off: &[Vec<f32>], on: &[Vec<f32>]) -> (f32, f32, f32) {
 #[test]
 fn the_kv_rotation_is_the_unrotated_forward() {
     // ---- Non-regression / structural check (no device needed): the default
-    // path emits NOT ONE Hadamard, so every shipped SKU is byte-unchanged; the
+    // path emits NOT ONE Hadamard, so every shipped deployment is byte-unchanged; the
     // rotated path emits exactly four per attention layer (q, k, v, o).
-    let off_trace = poem_dsl::trace_hybrid(
+    let off_trace = trace_of(
         "qwen3-micro-text",
-        &Model::micro_text(Dtype::Bf16, Dtype::Bf16, 1),
+        Dtype::Bf16,
+        Dtype::Bf16,
         Platform::Metal,
     );
-    let on_trace = poem_dsl::trace_hybrid(
-        "qwen3-micro-text",
-        &Model::micro_text_rotated(Dtype::Bf16, Dtype::Bf16, 1),
+    let on_trace = trace_of(
+        "qwen3-micro-text-rotated",
+        Dtype::Bf16,
+        Dtype::Bf16,
         Platform::Metal,
     );
     let (off_h, on_h) = (hadamards(&off_trace), hadamards(&on_trace));
     eprintln!("[trace] rotate_kv=false Hadamard ops = {off_h}; rotate_kv=true = {on_h}");
     assert_eq!(
         off_h, 0,
-        "the default path must emit no Hadamard (byte-unchanged SKUs)"
+        "the default path must emit no Hadamard (byte-unchanged deployments)"
     );
     assert_eq!(
         on_h,

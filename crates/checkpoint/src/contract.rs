@@ -17,6 +17,13 @@ pub enum Expr {
         value: u32,
         ty: TensorType,
     },
+    /// A tensor the contract carries itself: values a model derives from what
+    /// a checkpoint states rather than reads from its planes, laid out as `ty`
+    /// stores them.
+    Const {
+        ty: TensorType,
+        bytes: Vec<u8>,
+    },
     Slice {
         src: Box<Expr>,
         axis: Axis,
@@ -43,9 +50,12 @@ pub enum Expr {
         src: Box<Expr>,
         to: TensorType,
     },
+    /// A rank's share of `src` along `axis`: one of `world / replicas`
+    /// equal parts, the same one for each group of `replicas` ranks in a row.
     Shard {
         src: Box<Expr>,
         axis: Axis,
+        replicas: u32,
     },
     SrcIndexed(String),
     Select {
@@ -254,6 +264,22 @@ impl Partition {
     pub fn new(rank: u32, world: u32) -> Self {
         Self { rank, world }
     }
+
+    /// The partition among groups of `replicas` ranks in a row, each group
+    /// holding one share.
+    pub fn grouped(self, replicas: u32) -> Result<Self, Error> {
+        let replicas = replicas.max(1);
+        if !self.world.max(1).is_multiple_of(replicas) {
+            return Err(Error::Shard(format!(
+                "tp_size {} is no whole number of groups of {replicas} ranks",
+                self.world
+            )));
+        }
+        Ok(Self {
+            rank: self.rank / replicas,
+            world: self.world.max(1) / replicas,
+        })
+    }
 }
 
 impl Default for Partition {
@@ -332,6 +358,7 @@ impl Expr {
             Expr::Src(_) => "Src",
             Expr::Out(_) => "Out",
             Expr::Fill { .. } => "Fill",
+            Expr::Const { .. } => "Const",
             Expr::Slice { .. } => "Slice",
             Expr::Stride { .. } => "Stride",
             Expr::Gather { .. } => "Gather",
@@ -352,7 +379,11 @@ impl Expr {
     pub fn is_sharded(&self) -> bool {
         match self {
             Expr::Shard { .. } => true,
-            Expr::Src(_) | Expr::Out(_) | Expr::Fill { .. } | Expr::SrcIndexed(_) => false,
+            Expr::Src(_)
+            | Expr::Out(_)
+            | Expr::Fill { .. }
+            | Expr::Const { .. }
+            | Expr::SrcIndexed(_) => false,
             Expr::Slice { src, .. }
             | Expr::Stride { src, .. }
             | Expr::Gather { src, .. }
@@ -434,6 +465,11 @@ impl Expr {
         }
     }
 
+    /// The tensor `bytes` hold, laid out as `ty` stores it.
+    pub fn constant(ty: TensorType, bytes: Vec<u8>) -> Self {
+        Expr::Const { ty, bytes }
+    }
+
     pub fn fill(value: f32, ty: TensorType) -> Self {
         Expr::Fill {
             value: value.to_bits(),
@@ -499,15 +535,26 @@ impl Expr {
     }
 
     pub fn shard(self, axis: u8) -> Self {
+        self.shard_among(axis, 1)
+    }
+
+    /// A rank's share of this along `axis`, each share held by `replicas`
+    /// ranks in a row.
+    pub fn shard_among(self, axis: u8, replicas: u32) -> Self {
         Expr::Shard {
             src: Box::new(self),
             axis: Axis(axis),
+            replicas,
         }
     }
 
     pub fn is_affine(&self) -> bool {
         match self {
-            Expr::Src(_) | Expr::Out(_) | Expr::Fill { .. } | Expr::SrcIndexed(_) => true,
+            Expr::Src(_)
+            | Expr::Out(_)
+            | Expr::Fill { .. }
+            | Expr::Const { .. }
+            | Expr::SrcIndexed(_) => true,
             Expr::Slice { src, .. }
             | Expr::Stride { src, .. }
             | Expr::Gather { src, .. }
@@ -549,7 +596,11 @@ impl Expr {
     pub fn visit<'a>(&'a self, seen: &mut impl FnMut(&'a Expr)) {
         seen(self);
         match self {
-            Expr::Src(_) | Expr::Out(_) | Expr::Fill { .. } | Expr::SrcIndexed(_) => {}
+            Expr::Src(_)
+            | Expr::Out(_)
+            | Expr::Fill { .. }
+            | Expr::Const { .. }
+            | Expr::SrcIndexed(_) => {}
             Expr::Slice { src, .. }
             | Expr::Stride { src, .. }
             | Expr::Gather { src, .. }
@@ -585,7 +636,11 @@ impl Expr {
     ) -> Result<Expr, Error> {
         let mut boxed = |src: Box<Expr>| -> Result<Box<Expr>, Error> { Ok(Box::new(f(*src)?)) };
         Ok(match self {
-            Expr::Src(_) | Expr::Out(_) | Expr::Fill { .. } | Expr::SrcIndexed(_) => self,
+            Expr::Src(_)
+            | Expr::Out(_)
+            | Expr::Fill { .. }
+            | Expr::Const { .. }
+            | Expr::SrcIndexed(_) => self,
             Expr::Slice {
                 src,
                 axis,
@@ -657,9 +712,14 @@ impl Expr {
                     uniform => uniform,
                 },
             },
-            Expr::Shard { src, axis } => Expr::Shard {
+            Expr::Shard {
+                src,
+                axis,
+                replicas,
+            } => Expr::Shard {
                 src: boxed(src)?,
                 axis,
+                replicas,
             },
             Expr::Concat { axis, parts } => Expr::Concat {
                 axis,

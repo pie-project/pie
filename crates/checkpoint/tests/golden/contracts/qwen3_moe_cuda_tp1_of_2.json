@@ -33,7 +33,8 @@
           "src": {
             "Src": "model.layers.0.self_attn.q_proj.weight"
           },
-          "axis": 0
+          "axis": 0,
+          "replicas": 1
         }
       },
       "shape": [
@@ -51,7 +52,8 @@
           "src": {
             "Src": "model.layers.0.self_attn.k_proj.weight"
           },
-          "axis": 0
+          "axis": 0,
+          "replicas": 1
         }
       },
       "shape": [
@@ -69,7 +71,8 @@
           "src": {
             "Src": "model.layers.0.self_attn.v_proj.weight"
           },
-          "axis": 0
+          "axis": 0,
+          "replicas": 1
         }
       },
       "shape": [
@@ -87,7 +90,8 @@
           "src": {
             "Src": "model.layers.0.self_attn.o_proj.weight"
           },
-          "axis": 1
+          "axis": 1,
+          "replicas": 1
         }
       },
       "shape": [
@@ -130,7 +134,8 @@
           "src": {
             "Src": "model.layers.0.mlp.experts.0.gate_proj.weight"
           },
-          "axis": 0
+          "axis": 0,
+          "replicas": 1
         }
       },
       "shape": [
@@ -148,7 +153,8 @@
           "src": {
             "Src": "model.layers.0.mlp.experts.0.up_proj.weight"
           },
-          "axis": 0
+          "axis": 0,
+          "replicas": 1
         }
       },
       "shape": [
@@ -166,7 +172,8 @@
           "src": {
             "Src": "model.layers.0.mlp.experts.0.down_proj.weight"
           },
-          "axis": 1
+          "axis": 1,
+          "replicas": 1
         }
       },
       "shape": [
@@ -184,7 +191,8 @@
           "src": {
             "Src": "model.layers.0.mlp.experts.1.gate_proj.weight"
           },
-          "axis": 0
+          "axis": 0,
+          "replicas": 1
         }
       },
       "shape": [
@@ -202,7 +210,8 @@
           "src": {
             "Src": "model.layers.0.mlp.experts.1.up_proj.weight"
           },
-          "axis": 0
+          "axis": 0,
+          "replicas": 1
         }
       },
       "shape": [
@@ -220,7 +229,8 @@
           "src": {
             "Src": "model.layers.0.mlp.experts.1.down_proj.weight"
           },
-          "axis": 1
+          "axis": 1,
+          "replicas": 1
         }
       },
       "shape": [
@@ -238,7 +248,8 @@
           "src": {
             "Src": "model.layers.0.mlp.experts.2.gate_proj.weight"
           },
-          "axis": 0
+          "axis": 0,
+          "replicas": 1
         }
       },
       "shape": [
@@ -256,7 +267,8 @@
           "src": {
             "Src": "model.layers.0.mlp.experts.2.up_proj.weight"
           },
-          "axis": 0
+          "axis": 0,
+          "replicas": 1
         }
       },
       "shape": [
@@ -274,7 +286,8 @@
           "src": {
             "Src": "model.layers.0.mlp.experts.2.down_proj.weight"
           },
-          "axis": 1
+          "axis": 1,
+          "replicas": 1
         }
       },
       "shape": [
@@ -292,7 +305,8 @@
           "src": {
             "Src": "model.layers.0.mlp.experts.3.gate_proj.weight"
           },
-          "axis": 0
+          "axis": 0,
+          "replicas": 1
         }
       },
       "shape": [
@@ -310,7 +324,8 @@
           "src": {
             "Src": "model.layers.0.mlp.experts.3.up_proj.weight"
           },
-          "axis": 0
+          "axis": 0,
+          "replicas": 1
         }
       },
       "shape": [
@@ -328,7 +343,8 @@
           "src": {
             "Src": "model.layers.0.mlp.experts.3.down_proj.weight"
           },
-          "axis": 1
+          "axis": 1,
+          "replicas": 1
         }
       },
       "shape": [

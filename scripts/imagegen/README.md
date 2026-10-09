@@ -297,9 +297,9 @@ into an `.npz` under the golden's own key names, and diffs the two with
 `compare.py` at the bf16 gate above.
 
 ```bash
-# the artifact the row serves (the SKU name is `<text>-<weights>-kv-<kv>`)
+# the artifact the row serves (the deployment name is `<text>-<weights>-kv-<kv>`)
 cargo build -p pie --features cuda
-pie model import "$PIE_IMAGEGEN_GOLDEN/mini-dit/" --sku mini-dit-bf16-kv-bf16 \
+pie model import "$PIE_IMAGEGEN_GOLDEN/mini-dit/" --deployment mini-dit-bf16-kv-bf16 \
     --out ~/.cache/pie-imagegen/mini-dit.zt
 
 # one step, then the four-step Euler schedule
@@ -320,8 +320,8 @@ so the parity walks eagerly.
 
 **Bisecting a mismatch.**  `--tap <dump key>` on `run`, `collect` and
 `compare` reads an INTERMEDIATE out in the velocity's place: `run` sets the
-family's `PIE_MINI_DIT_TAP` knob (`crates/models/src/mini_dit/forward.rs`,
-`Tap`) — the plan plants its readout seam on that rectangle, so the artifact
+family's `PIE_MINI_DIT_TAP` knob (`models/mini_dit/model.poem`,
+`tap`) — the plan plants its readout seam on that rectangle, so the artifact
 must be re-imported under the same environment — `collect` lays the pie rows
 out the way the golden's tensor is shaped (a `[B, H, N, DH]` head tensor is
 transposed back; a joint `[txt || img]` rectangle takes its caption rows from
@@ -329,7 +329,7 @@ the guest's caption-lane readout), and `compare` diffs that one key.
 
 ```bash
 PIE_MINI_DIT_TAP=b0.norm1_out pie model import "$PIE_IMAGEGEN_GOLDEN/mini-dit/" \
-    --sku mini-dit-bf16-kv-bf16 --out ~/.cache/pie-imagegen/mini-dit.zt --force
+    --deployment mini-dit-bf16-kv-bf16 --out ~/.cache/pie-imagegen/mini-dit.zt --force
 python mini_dit_parity.py run     --out /tmp/mini-dit-parity --tap b0.norm1_out --config ...
 python mini_dit_parity.py collect --out /tmp/mini-dit-parity --tap b0.norm1_out
 python mini_dit_parity.py compare --out /tmp/mini-dit-parity --tap b0.norm1_out
@@ -463,7 +463,7 @@ little-endian f32 rows of channels in `(h, w)` order — what the Rust gate load
 CUDA_VISIBLE_DEVICES=2 python flux2_golden.py --vae
 # the gate reads the row's ARTIFACT, not the snapshot: a serving load may not
 # apply the `Unary` the BatchNorm planes are stated through
-pie model import <the FLUX.2-klein-4B snapshot> --sku flux2-klein-4b-bf16-kv-bf16 \
+pie model import <the FLUX.2-klein-4B snapshot> --deployment flux2-klein-4b-bf16-kv-bf16 \
     --out ~/.cache/pie-imagegen/flux2-klein-4b.zt --force
 CUDA_VISIBLE_DEVICES=2 cargo test -p engine-cuda --features cuda \
     --test the_flux_2_vae_answers_the_reference -- --nocapture
@@ -488,7 +488,7 @@ discards the reference rows' predictions; pie never computes them).
 ```bash
 # the artifact: the golden dir needs a `config.json` and a tokenizer
 # beside the weights (the snapshot's `tokenizer/{tokenizer,tokenizer_config}.json`)
-pie model import "$PIE_IMAGEGEN_GOLDEN/flux2/" --sku flux2-mini-bf16-kv-bf16 \
+pie model import "$PIE_IMAGEGEN_GOLDEN/flux2/" --deployment flux2-mini-bf16-kv-bf16 \
     --out ~/.cache/pie-imagegen/flux2-mini.zt
 python flux2_parity.py all --out /tmp/flux2-parity --config ~/.pie/config.flux2-mini.toml
 ```
@@ -508,7 +508,7 @@ latents through the diffusers VAE.
 ```bash
 # ~3 min to import, ~2 min to run
 pie model import ~/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-4B/snapshots/*/ \
-    --sku flux2-klein-4b-bf16-kv-bf16 --out ~/.cache/pie-imagegen/flux2-klein-4b.zt
+    --deployment flux2-klein-4b-bf16-kv-bf16 --out ~/.cache/pie-imagegen/flux2-klein-4b.zt
 CUDA_VISIBLE_DEVICES=0 python flux2_klein_parity.py all \
     --out /tmp/flux2-klein-parity --config ~/.pie/config.flux2-klein.toml
 ```
@@ -615,7 +615,7 @@ environment, and `import sglang` needs the whole stack (starlette, orjson, …)
 this box does not have. `vendor/ltx_2/modeling.py` is a self-contained
 transcription of the reference classes — provenance at the top of the file,
 the HUGGING FACE checkpoint's module names throughout, so ONE
-`crates/models/src/ltx_2/import.rs` reads both this miniature and
+`models/ltx_2/formats.poem` reads both this miniature and
 `Lightricks/LTX-2.5-Diffusers`.
 
 `--mini` writes a random-init miniature (two blocks, two heads a side at the
@@ -654,7 +654,7 @@ one rectangle of packed trunk rows.
 ```bash
 python ltx2_golden.py --mini
 # the golden dir needs a `config.json` and a tokenizer beside the weights
-pie model import "$PIE_IMAGEGEN_GOLDEN/ltx25/" --sku ltx25-mini-bf16-kv-bf16 \
+pie model import "$PIE_IMAGEGEN_GOLDEN/ltx25/" --deployment ltx25-mini-bf16-kv-bf16 \
     --out ~/.cache/pie-imagegen/ltx2-mini.zt
 python ltx2_parity.py all          --out /tmp/ltx2-parity --config ~/.pie/config.ltx2-mini.toml
 python ltx2_parity.py all --refine --out /tmp/ltx2-parity --config ~/.pie/config.ltx2-mini.toml
@@ -672,7 +672,7 @@ Measured (bf16 pie vs the fp32 golden), under the mini-dit gate
 | `refine.audio` | 0.0345 | 0.0047 | 0.99999 |
 
 The FLAGSHIP row's import is checked against the real 201 GB snapshot:
-`pie model import <snapshot> --sku ltx25-bf16-kv-bf16 --dry-run` lands every
+`pie model import <snapshot> --deployment ltx25-bf16-kv-bf16 --dry-run` lands every
 plane the flagship declares (13.0 GiB decoded — the reordered tables and the
 doubled head projection — and 28.3 GiB copied through). Nothing runs the
 DiT yet: the arm has no `text` reading. The VIDEO VAE DECODER runs, below.
@@ -739,7 +739,7 @@ channel-major) and 4 keyframe rows. The four unique timesteps are
 `[0.35, 0.999, 0.62, 1.0]` — video, the pinned visual condition, audio, and the
 ref2va audio-reference slot nothing in FL2VA claims.
 
-It also **checks** the claim `crates/models/src/minimax_h3/forward.rs` makes
+It also **checks** the claim `models/minimax_h3/forward.poem` makes
 about the packed row order: pie's `[text | video | audio | reference]` (lanes by
 stream code) and the reference's `[text | refs | audio | video]` answer at
 cos 1.0, because the joint attention is unmasked and every row's rotary
@@ -757,7 +757,7 @@ positions,token_tags,inverse_indices,unique_timesteps}`,
 
 ```bash
 python h3_golden.py --mini
-pie model import <dir with h3_mini.safetensors> --sku minimax-h3-mini-bf16-kv-bf16
+pie model import <dir with h3_mini.safetensors> --deployment minimax-h3-mini-bf16-kv-bf16
 python h3_parity.py all --out /tmp/h3-parity --config ~/.pie/config.h3-mini.toml
 ```
 
@@ -792,7 +792,7 @@ prefill and one denoise step tapped at the three seams pie reads back.
 CUDA_VISIBLE_DEVICES=1 python hy3_golden.py --mini      # seconds
 # a directory the importer can read: the weights, config.json, tokenizer.json
 pie model import $PIE_IMAGEGEN_GOLDEN/hy3/artifact \
-    --sku hunyuanimage3-mini-bf16-kv-bf16 --out .../hy3-mini.zt
+    --deployment hunyuanimage3-mini-bf16-kv-bf16 --out .../hy3-mini.zt
 python hy3_parity.py all --out /tmp/hy3-parity --config ~/.pie/config.hy3-mini.toml
 ```
 
@@ -847,7 +847,7 @@ the device today. A production loop would carry it in an epilogue.
 
 ```bash
 pie model import <dir with wan22_mini_d128.safetensors, a config.json and a tokenizer> \
-    --sku wan22-mini-d128-bf16-kv-bf16 --out ~/.cache/pie-imagegen/wan22-mini-d128.zt
+    --deployment wan22-mini-d128-bf16-kv-bf16 --out ~/.cache/pie-imagegen/wan22-mini-d128.zt
 python wan22_parity.py all --out /tmp/wan22-parity --config ~/.pie/config.wan22-mini.toml
 python wan22_parity.py all --pertoken --out /tmp/wan22-parity --config ...
 ```

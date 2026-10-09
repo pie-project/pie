@@ -3,10 +3,10 @@
 use std::path::{Path, PathBuf};
 
 use engine_cuda::{Boot, Knobs, Shell};
+use poem::Platform;
 use poem_compiler::Budget;
-use poem_dsl::Platform;
 
-const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
+const DEPLOYMENT: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
 const PAGE: u32 = 16;
 const LANES: u32 = 16;
@@ -58,18 +58,17 @@ fn a_short_card_keeps_the_declared_context() {
         eprintln!("{checkpoint:?} holds no tensor container");
         return;
     };
-    let sku = models::sku(SKU).expect("the catalog ships the SKU");
-    let trace = (sku.trace)(Platform::Cuda);
+    let deployment = models::deployment(DEPLOYMENT).expect("the catalog ships the deployment");
+    let trace = deployment.trace(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-    let contract = sku
+    let contract = deployment
         .contract(&source, Platform::Cuda)
-        .expect("the SKU's import contract fits its own checkpoint");
+        .expect("the deployment's import contract fits its own checkpoint");
     drop(source);
 
     let shell = Shell::load(Boot {
         voxels: None,
         deferred_tier: false,
-        classify: sku.classify,
         residency: engine_cuda::experts::Plan::default(),
         trace,
         contract: &contract,

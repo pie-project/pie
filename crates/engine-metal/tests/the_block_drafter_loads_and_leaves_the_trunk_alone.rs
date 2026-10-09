@@ -5,13 +5,21 @@ use std::time::Instant;
 
 use engine::fire::{Mask, Masking};
 use engine_metal::{Boot, Lane, Seated, Shell};
+use poem::{Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Classify, Platform, Request};
 
-const SKU: &str = "qwen36-27b-dflash-u4g64-kv-bf16";
-const PLAIN_SKU: &str = "qwen36-27b-mtp-u4g64-kv-bf16";
+const DEPLOYMENT: &str = "qwen36-27b-dflash-u4g64-kv-bf16";
+const PLAIN_DEPLOYMENT: &str = "qwen36-27b-mtp-u4g64-kv-bf16";
 const PROMPT: &[u32] = &[9707, 11, 847, 829, 374, 264, 1602, 2613, 3364];
 const STEPS: usize = 4;
+
+/// The facts the deployment `deployment` classifies its lanes by.
+fn facts_of(deployment: &str) -> poem_ir::Facts {
+    models::deployment(deployment)
+        .expect("the catalog ships the row")
+        .trace(Platform::Metal)
+        .facts
+}
 
 fn artifact() -> Option<PathBuf> {
     if let Ok(named) = std::env::var("PIE_DFLASH_ARTIFACT") {
@@ -22,7 +30,7 @@ fn artifact() -> Option<PathBuf> {
     for entry in std::fs::read_dir(store).ok()?.flatten() {
         for file in std::fs::read_dir(entry.path()).ok()?.flatten() {
             let name = file.file_name().to_string_lossy().into_owned();
-            if name.contains(SKU) && name.ends_with(".zt") {
+            if name.contains(DEPLOYMENT) && name.ends_with(".zt") {
                 return Some(file.path());
             }
         }
@@ -35,7 +43,7 @@ fn plain_artifact() -> Option<PathBuf> {
     for entry in std::fs::read_dir(store).ok()?.flatten() {
         for file in std::fs::read_dir(entry.path()).ok()?.flatten() {
             let name = file.file_name().to_string_lossy().into_owned();
-            if name.contains(PLAIN_SKU) && name.ends_with(".zt") {
+            if name.contains(PLAIN_DEPLOYMENT) && name.ends_with(".zt") {
                 return Some(file.path());
             }
         }
@@ -51,7 +59,7 @@ fn shellexpand(path: &str) -> String {
 }
 
 fn word(query_len: u32, drafts: bool) -> u64 {
-    models::qwen_3::forward::Facts::of(&Request::new(query_len, false).drafting(drafts)).word()
+    facts_of(DEPLOYMENT).word(&Request::new(query_len, false).drafting(drafts))
 }
 
 fn argmax(logits: &[f32]) -> u32 {
@@ -118,11 +126,12 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
         eprintln!("not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/models)");
         return;
     };
-    let sku = models::sku(SKU).expect("the catalog ships the block-drafter row");
-    let trace = (sku.trace)(Platform::Metal);
+    let deployment =
+        models::deployment(DEPLOYMENT).expect("the catalog ships the block-drafter row");
+    let trace = deployment.trace(Platform::Metal);
     let source = ztensor_compat::index(&artifact).expect("the artifact opens");
-    let contract = checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Metal)
-        .unwrap_or_else(|why| panic!("the artifact holds every plane of {SKU}: {why}"));
+    let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Metal)
+        .unwrap_or_else(|why| panic!("the artifact holds every plane of {DEPLOYMENT}: {why}"));
     drop(source);
 
     let booted = Instant::now();
@@ -144,7 +153,7 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
     })
     .expect("the block drafter's shell loads");
     eprintln!(
-        "loaded {SKU} in {:.1}s; drafts advertised: {}, depth {}",
+        "loaded {DEPLOYMENT} in {:.1}s; drafts advertised: {}, depth {}",
         booted.elapsed().as_secs_f64(),
         shell.drafts(),
         shell.mtp_depth(),
@@ -167,11 +176,12 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
         );
         return;
     };
-    let plain_sku = models::sku(PLAIN_SKU).expect("the catalog ships the plain row");
-    let plain_trace = (plain_sku.trace)(Platform::Metal);
+    let plain_deployment =
+        models::deployment(PLAIN_DEPLOYMENT).expect("the catalog ships the plain row");
+    let plain_trace = plain_deployment.trace(Platform::Metal);
     let plain_source = ztensor_compat::index(&plain_artifact).expect("the artifact opens");
     let plain_contract =
-        checkpoint_dsl::own_contract(&plain_source, &plain_trace.params, 1, Platform::Metal)
+        poem::import::own_contract(&plain_source, &plain_trace.params, 1, Platform::Metal)
             .expect("the plain artifact holds every plane");
     drop(plain_source);
     let mut plain_shell = Shell::load(Boot {
@@ -191,9 +201,8 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
         residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the plain shell loads");
-    let plain_word = |len: u32| {
-        models::qwen_3::forward::Facts::of(&Request::new(len, false).drafting(false)).word()
-    };
+    let plain_word =
+        |len: u32| facts_of(PLAIN_DEPLOYMENT).word(&Request::new(len, false).drafting(false));
     plain_shell.open(0).expect("the slot opens");
     let mut plain_tokens = Vec::with_capacity(STEPS + 1);
     let got = plain_shell
@@ -242,10 +251,12 @@ fn a_draft_block_fires_and_the_drafter_answers_it() {
         eprintln!("not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/models)");
         return;
     };
-    let sku = models::sku(SKU).expect("the catalog ships the block-drafter row");
-    let trace = (sku.trace)(Platform::Metal);
+    let deployment =
+        models::deployment(DEPLOYMENT).expect("the catalog ships the block-drafter row");
+    let trace = deployment.trace(Platform::Metal);
+    let drafter = trace.drafter.expect("the row states its block drafter");
     let source = ztensor_compat::index(&artifact).expect("the artifact opens");
-    let contract = checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Metal)
+    let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Metal)
         .expect("the artifact holds every plane");
     drop(source);
     let mut shell = Shell::load(Boot {
@@ -276,17 +287,14 @@ fn a_draft_block_fires_and_the_drafter_answers_it() {
         .expect("the prefill fires");
     let anchor = argmax(&seeded[0]);
 
-    let block = models::qwen_3::model::QWEN36_27B_DFLASH.block as usize;
-    let mut tokens = vec![models::qwen_3::model::QWEN36_27B_DFLASH.mask_token; block];
+    let block = drafter.rows as usize;
+    let mut tokens = vec![drafter.mask_token; block];
     tokens[0] = anchor;
     let extent = PROMPT.len() as u64 + block as u64;
     let masking = all_visible(extent);
     let mut seat = Seated::of(Lane {
         slot: 0,
-        word: models::qwen_3::forward::Facts::of(
-            &Request::new(block as u32, true).drafting_a_block(true),
-        )
-        .word(),
+        word: facts_of(DEPLOYMENT).word(&Request::new(block as u32, true).drafting_a_block(true)),
         tokens: &tokens,
     });
     seat.mask = Some(&masking);

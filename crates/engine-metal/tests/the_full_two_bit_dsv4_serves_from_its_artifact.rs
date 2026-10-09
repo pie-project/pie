@@ -5,13 +5,21 @@ use std::time::Instant;
 
 use engine_metal::experts::{Attachments, Plan};
 use engine_metal::{Boot, Lane, Shell};
+use poem::{Platform, Request};
 use poem_compiler::Budget;
-use poem_dsl::{Classify, Platform, Request};
 use poem_ir::Trace;
 
-const SKU: &str = "dsv4-flash-full-mtp-u4g64-u2g64-mxfp4-kv-bf16";
+const DEPLOYMENT: &str = "dsv4-flash-mtp-u4g64-u2g64-mxfp4-kv-bf16";
 
 const REPO: &str = "models--mlx-community--DeepSeek-V4-Flash-2bit-DQ";
+
+/// The facts the deployment `deployment` classifies its lanes by.
+fn facts_of(deployment: &str) -> poem_ir::Facts {
+    models::deployment(deployment)
+        .expect("the catalog ships the row")
+        .trace(Platform::Metal)
+        .facts
+}
 
 fn seats() -> u32 {
     std::env::var("PIE_U2_FULL_SEATS")
@@ -74,7 +82,7 @@ fn delta(before: Option<u64>, after: Option<u64>) -> String {
 fn artifact() -> Option<PathBuf> {
     let stamped = |path: &Path| {
         let stamp = checkpoint::file::serve::stamp_of(path).ok().flatten()?;
-        (stamp.backend == "metal" && stamp.sku == SKU).then(|| path.to_path_buf())
+        (stamp.backend == "metal" && stamp.deployment == DEPLOYMENT).then(|| path.to_path_buf())
     };
     if let Ok(stated) = std::env::var("PIE_METAL_FULL_ARTIFACT") {
         return stamped(Path::new(&stated));
@@ -149,12 +157,12 @@ struct Read {
 }
 
 fn read(artifact: &Path) -> Read {
-    let trace = (models::sku(SKU)
+    let trace = models::deployment(DEPLOYMENT)
         .expect("the catalog ships the full 2-bit row")
-        .trace)(Platform::Metal);
+        .trace(Platform::Metal);
     let source = ztensor_compat::index(artifact).expect("the artifact opens");
-    let contract = checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Metal)
-        .unwrap_or_else(|why| panic!("the artifact holds every plane of {SKU}: {why}"));
+    let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Metal)
+        .unwrap_or_else(|why| panic!("the artifact holds every plane of {DEPLOYMENT}: {why}"));
     drop(source);
     let planes = engine_metal::weights::attachments(&trace, &contract, artifact)
         .expect("the load plan pairs this artifact's quantized banks");
@@ -226,7 +234,7 @@ fn finite_and_spread(logits: &[f32], what: &str) {
 }
 
 fn word(len: u32) -> u64 {
-    models::deepseek_v4::forward::Facts::of(&Request::new(len, false)).word()
+    facts_of(DEPLOYMENT).word(&Request::new(len, false))
 }
 
 struct Run {
@@ -330,7 +338,7 @@ fn the_full_dsv4_artifact_loads_warm_streams_its_experts_and_answers_twice_the_s
     }
     let Some(artifact) = artifact() else {
         eprintln!(
-            "skipping: no `metal`-stamped {SKU} artifact found — import one with an \
+            "skipping: no `metal`-stamped {DEPLOYMENT} artifact found — import one with an \
              ENGINE-METAL-FEATURE binary (see this file's header; `-p pie`, never a \
              workspace build) and name it in PIE_METAL_FULL_ARTIFACT"
         );
@@ -432,13 +440,13 @@ fn the_full_dsv4_artifact_loads_warm_streams_its_experts_and_answers_twice_the_s
 
     assert!(
         first.warm,
-        "the {SKU} artifact did not take the warm arm, so this load read 89.9 GiB into \
+        "the {DEPLOYMENT} artifact did not take the warm arm, so this load read 89.9 GiB into \
          a host store on a 32 GiB box rather than mapping it"
     );
 
     assert!(
         first.windows >= least as usize,
-        "the {SKU} artifact bound as {} window(s) against a {ceiling}-byte          `maxBufferLength` and {bytes} bytes of file, which needs at least {least}",
+        "the {DEPLOYMENT} artifact bound as {} window(s) against a {ceiling}-byte          `maxBufferLength` and {bytes} bytes of file, which needs at least {least}",
         first.windows,
     );
     assert_eq!(

@@ -476,16 +476,18 @@ fn copy_in(stream: *mut c_void, dst: u64, src: *const u8, bytes: u64) -> Result<
 
 #[cfg(test)]
 mod tests {
+    use poem::Platform;
     use poem_compiler::{Budget, Budgets, DeviceProfile, compile_axes};
-    use poem_dsl::Platform;
 
     use super::*;
     use crate::experts::{Budgets as Tiers, Plan};
 
-    const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
+    const DEPLOYMENT: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
     fn rig() -> (poem_ir::Trace, poem_compiler::CompiledModel, Plan) {
-        let trace = (models::sku(SKU).expect("the catalog ships the SKU").trace)(Platform::Cuda);
+        let trace = models::deployment(DEPLOYMENT)
+            .expect("the catalog ships the deployment")
+            .trace(Platform::Cuda);
         let compiled = compile_axes(
             &trace,
             &Budgets {

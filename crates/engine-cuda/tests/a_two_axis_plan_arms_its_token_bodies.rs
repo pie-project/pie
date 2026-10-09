@@ -3,8 +3,8 @@
 mod common_two_axis;
 
 use common_two_axis::{
-    C_IN, C_OUT, Lcg, Rig, WIDTH, Weights, assert_close, attach, bf, conv_reference, dit_lane,
-    frame, pixel_epilogue, trace, vae_lane,
+    C_IN, C_OUT, Lcg, Rig, WIDTH, Weights, assert_close, attach, bf, conv_reference, frame,
+    pixel_epilogue, trace,
 };
 use engine::Engine;
 use engine::fire::{ReadoutSeam, StepVoxels};
@@ -54,7 +54,7 @@ fn the_token_regions_arm_while_the_voxel_regions_stay_eager() {
     let mut ticket = rig
         .engine
         .submit(&frame(
-            vec![vae_lane(0, cell)],
+            vec![rig.vae_lane(0, cell)],
             vec![attach(0, vae)],
             vec![StepVoxels {
                 lane: 0,
@@ -97,7 +97,7 @@ fn the_token_regions_arm_while_the_voxel_regions_stay_eager() {
     let mut ticket = rig
         .engine
         .submit(&frame(
-            vec![dit_lane(0, ROWS, latent, timestep, positions)],
+            vec![rig.dit_lane(0, ROWS, latent, timestep, positions)],
             vec![attach(0, dit)],
             Vec::new(),
         ))

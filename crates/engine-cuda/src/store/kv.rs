@@ -323,11 +323,10 @@ mod tests {
 
     #[test]
     fn a_rows_heads_are_read_off_the_ops_that_restate_them() {
-        let trace = models::sku("qwen35-d0.8b-bf16-kv-bf16")
-            .expect("the catalog ships the smoke's SKU")
-            .trace;
-        let plan = trace(poem_dsl::Platform::Cuda);
-        let facts = probe(&plan).expect("a hybrid SKU's caches read");
+        let plan = models::deployment("qwen35-d0.8b-bf16-kv-bf16")
+            .expect("the catalog ships the smoke's deployment")
+            .trace(poem::Platform::Cuda);
+        let facts = probe(&plan).expect("a hybrid deployment's caches read");
 
         let stated: Vec<SpaceFacts> = facts.rows.iter().flatten().copied().collect();
         assert!(!stated.is_empty(), "qwen3.5 declares kv rows");

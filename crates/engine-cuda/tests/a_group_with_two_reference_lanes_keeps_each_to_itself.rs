@@ -3,12 +3,13 @@
 mod common_dit;
 
 use common_dit::{
-    HEAD_DIM, Lcg, NAME, Rig, SM_SCALE, StreamFacts, THETA, WIDTH, Weights, assert_close, attach,
-    bf, condition, frame, lane, matmul_bf16, matmul_f32, rope, silu, sinusoid,
+    HEAD_DIM, Lcg, NAME, Rig, SM_SCALE, THETA, WIDTH, Weights, assert_close, attach, bf, condition,
+    frame, lane, matmul_bf16, matmul_f32, rope, silu, sinusoid,
 };
 use engine::Engine;
 use engine::fire::{LaneStream, ReadoutSeam};
-use poem_dsl::{
+use poem::fact;
+use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, RaggedMask, RopeForm, Stream,
     Trace, Value, Weight, ops, seam, trace_hybrid,
 };
@@ -18,12 +19,14 @@ const FREQ: u32 = 16;
 struct ReferenceBlock;
 
 impl ForwardHybrid for ReferenceBlock {
-    type Facts = StreamFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<StreamFacts>) -> Value {
-        let (txt, img) = inputs.split(&StreamFacts::on(Stream::Text));
+    fn forward(&self, inputs: Input) -> Value {
+        let (txt, img) = (
+            inputs.on(fact::stream(Stream::Text)),
+            inputs.on(!fact::stream(Stream::Text)),
+        );
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
@@ -90,7 +93,10 @@ impl ForwardHybrid for ReferenceBlock {
             },
         );
         let o = ops::layout::unpack_rows(&o, &perm);
-        let (o_txt, o_img) = o.split(&StreamFacts::on(Stream::Text));
+        let (o_txt, o_img) = (
+            o.on(fact::stream(Stream::Text)),
+            o.on(!fact::stream(Stream::Text)),
+        );
         let y_txt = ops::linear::matmul(&o_txt, &w("txt.o", WIDTH, HEAD_DIM));
         let y_img = ops::linear::matmul(&o_img, &w("img.o", WIDTH, HEAD_DIM));
         let r_txt = ops::elemwise::residual_add(&x_txt, &y_txt);
@@ -239,9 +245,9 @@ fn each_reference_lane_attends_itself_and_the_rest_see_everything() {
             (false, true) => LaneStream::Reference,
             (false, false) => LaneStream::Image,
         };
-        let mut submitted = lane(slot as u32, &handles, stream, 0);
-        submitted.word = common_dit::classify(
-            &poem_dsl::Request::new(lane_host.count as u32, false).on_stream(match stream {
+        let mut submitted = lane(&rig, slot as u32, &handles, stream, 0);
+        submitted.word = rig.facts.word(
+            &poem::Request::new(lane_host.count as u32, false).on_stream(match stream {
                 LaneStream::Text => Stream::Text,
                 LaneStream::Reference => Stream::Reference,
                 _ => Stream::Image,

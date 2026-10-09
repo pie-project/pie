@@ -31,10 +31,11 @@ use eta_ir::op::Op;
 use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use eta_ir::validate::bind;
-use poem_dsl::ops::spatial::{self, Conv};
-use poem_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Predicate,
-    RaggedMask, Request, RopeForm, Stream, Trace, Value, Weight, ops, seam, trace_hybrid,
+use poem::fact;
+use poem::ops::spatial::{self, Conv};
+use poem::{
+    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, RaggedMask, Request, RopeForm,
+    Stream, Trace, Value, Weight, ops, seam, trace_hybrid,
 };
 
 pub const WIDTH: u32 = 32;
@@ -46,7 +47,6 @@ pub const NAME: &str = "dit-mini";
 pub const C_IN: u32 = 8;
 pub const C_OUT: u32 = 4;
 pub const TAPS: u32 = 27;
-pub const VAE_READING: u8 = 1;
 
 /// Whether a PJRT plugin is here to run on; device gates skip otherwise.
 #[must_use]
@@ -82,36 +82,17 @@ pub fn device() -> Option<engine_xla::bench::DeviceLock> {
 
 // ------------------------------------------------------------ the DiT block
 
-pub struct StreamFacts(Stream);
-
-impl StreamFacts {
-    pub fn on(stream: Stream) -> Predicate {
-        Predicate::stream(0, stream)
-    }
-}
-
-impl Classify for StreamFacts {
-    fn of(r: &Request) -> StreamFacts {
-        StreamFacts(r.stream())
-    }
-    fn word(&self) -> u64 {
-        self.0.word(0)
-    }
-}
-
-pub fn classify(request: &Request) -> u64 {
-    StreamFacts::of(request).word()
-}
-
 pub struct DoubleBlock;
 
 impl ForwardHybrid for DoubleBlock {
-    type Facts = StreamFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<StreamFacts>) -> Value {
-        let (txt, img) = inputs.split(&StreamFacts::on(Stream::Text));
+    fn forward(&self, inputs: Input) -> Value {
+        let (txt, img) = (
+            inputs.on(fact::stream(Stream::Text)),
+            inputs.on(!fact::stream(Stream::Text)),
+        );
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
@@ -174,7 +155,10 @@ impl ForwardHybrid for DoubleBlock {
             RaggedMask::GroupBlockDiagonal,
         );
         let o = ops::layout::unpack_rows(&o, &perm);
-        let (o_txt, o_img) = o.split(&StreamFacts::on(Stream::Text));
+        let (o_txt, o_img) = (
+            o.on(fact::stream(Stream::Text)),
+            o.on(!fact::stream(Stream::Text)),
+        );
         let y_txt = ops::linear::matmul(&o_txt, &w("txt.o", WIDTH, HEAD_DIM));
         let y_img = ops::linear::matmul(&o_img, &w("img.o", WIDTH, HEAD_DIM));
         let r_txt = ops::elemwise::residual_add(&x_txt, &y_txt);
@@ -191,37 +175,17 @@ pub fn trace() -> Trace {
 
 // ------------------------------------------------------------ the two-axis plan
 
-pub struct VaeFacts(bool);
-
-impl VaeFacts {
-    pub fn is_vae() -> Predicate {
-        Predicate::fact(0)
-    }
-}
-
-impl Classify for VaeFacts {
-    fn of(r: &Request) -> VaeFacts {
-        VaeFacts(r.reading() & 1 == 1)
-    }
-    fn word(&self) -> u64 {
-        u64::from(self.0)
-    }
-}
-
-#[must_use]
-pub fn vae_word(reading: u8) -> u64 {
-    VaeFacts::of(&Request::new(1, false).in_reading(reading)).word()
-}
-
 pub struct TwoAxis;
 
 impl ForwardHybrid for TwoAxis {
-    type Facts = VaeFacts;
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input<VaeFacts>) -> Value {
-        let (vae, dit) = inputs.split(&VaeFacts::is_vae());
+    fn forward(&self, inputs: Input) -> Value {
+        let (vae, dit) = (
+            inputs.on(fact::reading("vae")),
+            inputs.on(!fact::reading("vae")),
+        );
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
@@ -332,7 +296,7 @@ impl Weights {
 
 pub fn contract_for(trace: &Trace, path: &Path) -> Result<ModelContract, String> {
     let source = ztensor_compat::index(path).map_err(|why| why.to_string())?;
-    checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Xla)
+    poem::import::own_contract(&source, &trace.params, 1, Platform::Xla)
         .map_err(|why| why.to_string())
 }
 
@@ -569,6 +533,7 @@ pub struct LaneHandles {
 pub struct Rig {
     pub engine: Xla,
     pub loaded: Loaded,
+    pub facts: poem_ir::Facts,
     programs: BTreeMap<u32, u64>,
     next_channel: u64,
     dir: PathBuf,
@@ -600,6 +565,7 @@ impl Rig {
         let path = dir.join("weights.zt");
         weights.write(&path);
         let mut engine = Xla::new(DeviceBoot::default(), contract_for);
+        let facts = plan.facts.clone();
         let loaded = engine
             .load(LoadRequest {
                 trace: plan,
@@ -626,6 +592,7 @@ impl Rig {
         Rig {
             engine,
             loaded,
+            facts,
             programs: BTreeMap::new(),
             next_channel: 1,
             dir,
@@ -634,6 +601,17 @@ impl Rig {
 
     pub fn profile(&self) -> &ModelProfile {
         &self.loaded.caps.profile
+    }
+
+    /// The word of a one-row lane running `reading`, or the plan's token
+    /// reading when `None`.
+    #[must_use]
+    pub fn word(&self, reading: Option<&str>) -> u64 {
+        let request = Request::new(1, false);
+        self.facts.word(&match reading {
+            Some(reading) => request.in_reading(reading),
+            None => request,
+        })
     }
 
     pub fn register(&mut self, container: TraceContainer) -> u64 {
@@ -765,17 +743,19 @@ impl Rig {
 
 /// A double-block lane: its stream's latent port, the timestep and the
 /// positions, in attention group `group`.
-pub fn lane(slot: u32, handles: &LaneHandles, stream: LaneStream, group: u32) -> Lane {
+pub fn lane(rig: &Rig, slot: u32, handles: &LaneHandles, stream: LaneStream, group: u32) -> Lane {
     let port = match stream {
         LaneStream::Text => 0,
         _ => 1,
     };
     Lane {
         slot,
-        word: classify(&Request::new(handles.rows, false).on_stream(match stream {
-            LaneStream::Text => Stream::Text,
-            _ => Stream::Image,
-        })),
+        word: rig
+            .facts
+            .word(&Request::new(handles.rows, false).on_stream(match stream {
+                LaneStream::Text => Stream::Text,
+                _ => Stream::Image,
+            })),
         tokens: vec![0; handles.rows as usize],
         readout: Readout::Rows((0..handles.rows).collect()),
         stream,

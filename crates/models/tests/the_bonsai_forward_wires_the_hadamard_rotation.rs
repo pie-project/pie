@@ -1,6 +1,6 @@
-//! M3c: the Bonsai `d27b` forward wires the online-Hadamard rotation-undo at
+//! The Bonsai qwen36-27b forward wires the online-Hadamard rotation-undo at
 //! exactly the sites the fork rotates, keyed by input width — and every
-//! non-Bonsai SKU is byte-unchanged (no Hadamard appears).
+//! non-Bonsai deployment is byte-unchanged (no Hadamard appears).
 //!
 //! This is a GRAPH-STRUCTURE oracle: it traces the real forward and counts the
 //! `elementwise.hadamard` nodes and the sign bank each one references, then
@@ -26,10 +26,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use models::qwen_3::model::Model;
-use poem_dsl::{
-    Def, Dtype, Elementwise, Linear, Operation, Platform, Trace, ValueId, trace_hybrid,
-};
+use models::star::trace_of;
+use poem::{Def, Dtype, Elementwise, Linear, Operation, Platform, Trace, ValueId};
 
 /// The width of the sign bank a Hadamard node references, or `None` for a plain
 /// (unsigned) Hadamard. Resolves the `signs` value to its registered param name
@@ -76,7 +74,7 @@ fn tally(trace: &Trace) -> (usize, usize, (usize, usize, usize)) {
 #[test]
 fn the_bonsai_forward_wires_the_hadamard_rotation_every_case() {
     the_bonsai_flag_declares_three_width_keyed_sign_banks();
-    a_non_bonsai_d27b_wires_no_hadamard_on_any_platform();
+    a_non_bonsai_qwen36_27b_wires_no_hadamard_on_any_platform();
     the_bonsai_forward_rotates_every_site_by_input_width();
     the_attention_q_k_v_share_the_one_rotated_input();
 }
@@ -89,9 +87,10 @@ fn the_bonsai_forward_wires_the_hadamard_rotation_every_case() {
 /// see it) but diverges the trunk. This is a pure graph-structure check — no
 /// GGUF, no Metal.
 fn the_attention_q_k_v_share_the_one_rotated_input() {
-    let trace = trace_hybrid(
-        "d27b-bonsai",
-        &Model::d27b_bonsai(Dtype::Bf16, Dtype::Bf16, 1),
+    let trace = trace_of(
+        "qwen36-27b-bonsai",
+        Dtype::Bf16,
+        Dtype::Bf16,
         Platform::Metal,
     );
 
@@ -161,56 +160,62 @@ fn the_attention_q_k_v_share_the_one_rotated_input() {
     }
     assert!(
         checked >= 1,
-        "the d27b_bonsai trace carried no full-attention layer to guard",
+        "the qwen36-27b-bonsai trace carried no full-attention layer to guard",
     );
 }
 
 fn the_bonsai_flag_declares_three_width_keyed_sign_banks() {
-    let plain = Model::d27b_undrafted(Dtype::Bf16, Dtype::Bf16, 1);
+    let signs = |trace: &Trace| -> Vec<poem::Param> {
+        trace
+            .params
+            .iter()
+            .filter(|p| p.name.starts_with("prism.hadamard.signs."))
+            .cloned()
+            .collect()
+    };
+    let plain = trace_of("qwen36-27b", Dtype::Bf16, Dtype::Bf16, Platform::Metal);
     assert!(
-        plain.bonsai.is_none(),
-        "a plain d27b arms no rotation — the flag must default off",
+        signs(&plain).is_empty(),
+        "a plain qwen36-27b arms no rotation and reads no signs",
     );
 
-    let b = Model::d27b_bonsai(Dtype::Ptq1_0, Dtype::Bf16, 1);
-    let signs = b
-        .bonsai
-        .as_ref()
-        .expect("the Bonsai instance arms the rotation");
-    for (w, width) in [
-        (&signs.hidden, 5120u64),
-        (&signs.ssm, 6144),
-        (&signs.ffn_down, 17408),
-    ] {
-        assert_eq!(w.name, format!("prism.hadamard.signs.{width}"));
-        // One registered seat, `width` wide (the leading 1 is the seat count the
-        // engine's registered-bank bookkeeper reads off `shape[0]`).
+    let b = trace_of(
+        "qwen36-27b-bonsai",
+        Dtype::Ptq1_0,
+        Dtype::Bf16,
+        Platform::Metal,
+    );
+    let banks = signs(&b);
+    assert_eq!(banks.len(), 3, "{banks:?}");
+    for width in [5120u64, 6144, 17408] {
+        let w = banks
+            .iter()
+            .find(|w| w.name == format!("prism.hadamard.signs.{width}"))
+            .unwrap_or_else(|| panic!("no {width}-wide sign diagonal in {banks:?}"));
         assert_eq!(w.shape, vec![1, width]);
         // Declared in the activation compute dtype (bf16 for the Ptq1_0 serve),
         // as the Metal Hadamard kernel binds `signs.dtype == activation.dtype`.
         assert_eq!(w.dtype, Dtype::Bf16);
-        assert!(matches!(w.source, poem_dsl::ParamSource::Registered));
+        // The artifact carries the signs, decoded from the GGUF's metadata at
+        // import: nothing registers them at load.
+        assert!(matches!(w.source, poem::ParamSource::Checkpoint));
     }
 }
 
-fn a_non_bonsai_d27b_wires_no_hadamard_on_any_platform() {
+fn a_non_bonsai_qwen36_27b_wires_no_hadamard_on_any_platform() {
     for platform in [Platform::Metal, Platform::Cuda] {
-        let trace = trace_hybrid(
-            "d27b",
-            &Model::d27b_undrafted(Dtype::Bf16, Dtype::Bf16, 1),
-            platform,
-        );
+        let trace = trace_of("qwen36-27b", Dtype::Bf16, Dtype::Bf16, platform);
         let (total, ..) = tally(&trace);
         assert_eq!(
             total, 0,
-            "a non-Bonsai d27b must be byte-unchanged: it wires no Hadamard, found {total} on {platform:?}",
+            "a non-Bonsai qwen36-27b must be byte-unchanged: it wires no Hadamard, found {total} on {platform:?}",
         );
     }
 
-    // The whole shipped catalog stays Hadamard-free (the flag lives only on the
-    // test-level Bonsai instance).
-    for row in models::skus() {
-        let trace = (row.trace)(Platform::Metal);
+    // No listed deployment is the Bonsai model, so the whole catalog stays
+    // Hadamard-free.
+    for row in models::deployments().chain(models::splits()) {
+        let trace = row.trace(Platform::Metal);
         let (total, ..) = tally(&trace);
         assert_eq!(
             total, 0,
@@ -221,9 +226,10 @@ fn a_non_bonsai_d27b_wires_no_hadamard_on_any_platform() {
 }
 
 fn the_bonsai_forward_rotates_every_site_by_input_width() {
-    let trace = trace_hybrid(
-        "d27b-bonsai",
-        &Model::d27b_bonsai(Dtype::Bf16, Dtype::Bf16, 1),
+    let trace = trace_of(
+        "qwen36-27b-bonsai",
+        Dtype::Bf16,
+        Dtype::Bf16,
         Platform::Metal,
     );
     let (total, signed, (w5120, w6144, w17408)) = tally(&trace);
