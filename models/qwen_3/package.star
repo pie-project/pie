@@ -4,22 +4,22 @@
 # the test geometries are models of it too, listed nowhere: a test traces
 # and imports them by id.
 
-def qwen(id, template = "qwen_3", **kwargs):
-    return model(id, template = template, tokenizer = "qwen_3", **kwargs)
+def qwen(id, template = "qwen_3", tokenizer = "qwen_3", **kwargs):
+    return model(id, template = template, tokenizer = tokenizer, **kwargs)
 
 MODELS = [
-    qwen("qwen36-27b", parts = ["vision"], drafters = ["mtp", "dflash"]),
-    qwen("qwen38-27b", template = "qwen_3_chatml_interleaved", parts = ["vision"], drafters = ["mtp", "dflash2", "dspark"]),
-    qwen("qwen35-d0.8b", parts = ["vision"], drafters = ["eagle"]),
-    qwen("qwen35-d2b"),
-    qwen("qwen35-d3b"),
-    qwen("qwen35-d4b"),
-    qwen("qwen35-a3b"),
-    qwen("qwen35-d9b", drafters = ["dflash"]),
-    qwen("qwen36-35b-a3b", drafters = ["mtp", "dflash"]),
-    qwen("qwen35-tiny", mini = True),
-    qwen("qwen36-35b-a3b-mini", mini = True),
-    qwen("qwen36-35b-a3b-mini64", mini = True),
+    qwen("qwen36-27b", parts = ["vision"], drafters = ["mtp", "dflash"], arch = "qwen3_5", layers = 64, vocab = 248320),
+    qwen("qwen38-27b", template = "qwen_3_chatml_interleaved", tokenizer = "qwen_3.38", parts = ["vision"], drafters = ["mtp", "dflash2", "dspark"], arch = "qwen3_5", layers = 64, vocab = 248320),
+    qwen("qwen35-d0.8b", parts = ["vision"], drafters = ["eagle"], arch = "qwen3_5", layers = 24, vocab = 248320),
+    qwen("qwen35-d2b", arch = "qwen3_5", layers = 24, vocab = 248320),
+    qwen("qwen35-d3b", arch = "qwen3_5", layers = 24, vocab = 151936),
+    qwen("qwen35-d4b", arch = "qwen3_5", layers = 32, vocab = 248320),
+    qwen("qwen35-a3b", arch = "qwen3_5", layers = 40, vocab = 248320),
+    qwen("qwen35-d9b", drafters = ["dflash"], arch = "qwen3_5", layers = 32, vocab = 248320),
+    qwen("qwen36-35b-a3b", drafters = ["mtp", "dflash"], arch = "qwen3_5", layers = 40, vocab = 248320),
+    qwen("qwen35-tiny", mini = True, arch = "qwen3_5", layers = 4, vocab = 248320),
+    qwen("qwen36-35b-a3b-mini", mini = True, arch = "qwen3_5", layers = 5, vocab = 248320),
+    qwen("qwen36-35b-a3b-mini64", mini = True, arch = "qwen3_5", layers = 5, vocab = 248320),
     # Listed nowhere.
     qwen("qwen36-27b-bonsai", mini = True),
     qwen("qwen3-a3b-micro", mini = True),

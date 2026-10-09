@@ -2,8 +2,8 @@
 # prefix of the whole model's checkpoint.
 
 MODELS = [
-    model("inkling", template = "inkling", tokenizer = "inkling"),
-    model("inkling-mini-l7-e8", mini = True, template = "inkling", tokenizer = "inkling"),
+    model("inkling", template = "inkling", tokenizer = "inkling", arch = "inkling", layers = 66, vocab = 200058),
+    model("inkling-mini-l7-e8", mini = True, template = "inkling", tokenizer = "inkling", arch = "inkling", layers = 7, vocab = 200058),
 ]
 
 DEPLOYMENTS = [

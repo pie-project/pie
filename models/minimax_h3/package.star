@@ -3,8 +3,8 @@
 # carries no text encoder.
 
 MODELS = [
-    model("minimax-h3-fl2va", template = "minimax_h3", tokenizer = "minimax_h3"),
-    model("minimax-h3-mini", mini = True, template = "minimax_h3", tokenizer = "minimax_h3"),
+    model("minimax-h3-fl2va", template = "minimax_h3", tokenizer = "minimax_h3", arch = "minimax_h3", layers = 50, vocab = 151936),
+    model("minimax-h3-mini", mini = True, template = "minimax_h3", tokenizer = "minimax_h3", arch = "minimax_h3", layers = 3, vocab = 0),
 ]
 
 DEPLOYMENTS = [

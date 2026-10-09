@@ -156,6 +156,18 @@ pub fn packaged(
     Ok(Some((name, deploy.tp, trace)))
 }
 
+/// How the deployment `name` stamped on the artifact at `artifact` is
+/// served: as this build's catalog, or else the package it carries, spells it.
+#[must_use]
+pub fn deploy_of(artifact: &Path, name: &str) -> Option<models::catalog::Deploy> {
+    if let Some(deployment) = models::Deployment::parse(name) {
+        return Some(deployment.deploy);
+    }
+    let package = package_of(artifact).ok()??;
+    let (_, deploy) = package.manifest().parse(name)?;
+    models::star::catalog(&deploy).ok()
+}
+
 /// The attributes an artifact of the deployment `name` carries its package
 /// in, if a package holds its model.
 pub fn package_attributes(name: &str) -> Result<std::collections::BTreeMap<String, String>> {

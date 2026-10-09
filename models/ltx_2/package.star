@@ -2,8 +2,8 @@
 # a miniature of its transformer alone.
 
 MODELS = [
-    model("ltx25", template = "ltx_2", tokenizer = "ltx_2"),
-    model("ltx25-mini", mini = True, template = "ltx_2", tokenizer = "ltx_2"),
+    model("ltx25", template = "ltx_2", tokenizer = "ltx_2", arch = "ltx_2", layers = 48, vocab = 0),
+    model("ltx25-mini", mini = True, template = "ltx_2", tokenizer = "ltx_2", arch = "ltx_2", layers = 2, vocab = 0),
 ]
 
 DEPLOYMENTS = [

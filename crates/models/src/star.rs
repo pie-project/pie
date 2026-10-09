@@ -68,7 +68,7 @@ fn drafter(word: &str) -> Result<Drafter, Refused> {
 
 /// The catalog entries of `package`, one family: each model it states,
 /// with the deployments it lists of it in the package's order.
-fn family(package: &'static poem::star::Package) -> Vec<Entry> {
+pub fn family(package: &'static poem::star::Package) -> Vec<Entry> {
     let manifest = package.manifest();
     let fail = |why: String| -> ! { panic!("the package `{}`: {why}", package.name()) };
     manifest
@@ -114,9 +114,17 @@ fn family(package: &'static poem::star::Package) -> Vec<Entry> {
                         model.template
                     ))
                 }),
-                tokenizer: crate::tokenizer::named(&model.tokenizer).unwrap_or_else(|| {
-                    fail(format!("`{id}` names no tokenizer `{}`", model.tokenizer))
-                }),
+                tokenizer: {
+                    for vision in [false, true] {
+                        if crate::tokenizer::named(&model.tokenizer, vision).is_none() {
+                            fail(format!("`{id}` names no tokenizer `{}`", model.tokenizer));
+                        }
+                    }
+                    model.tokenizer.as_str()
+                },
+                arch: model.arch.as_str(),
+                layers: model.layers,
+                vocab: model.vocab,
                 diffusion: Box::new(move |d| {
                     package
                         .diffusion(id, &deploy(d))

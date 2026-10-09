@@ -2,8 +2,8 @@
 # of its transformer alone.
 
 MODELS = [
-    model("flux2-klein-4b", template = "flux_2", tokenizer = "flux_2"),
-    model("flux2-mini", mini = True, template = "flux_2", tokenizer = "flux_2"),
+    model("flux2-klein-4b", template = "flux_2", tokenizer = "flux_2", arch = "flux_2", layers = 27, vocab = 151936),
+    model("flux2-mini", mini = True, template = "flux_2", tokenizer = "flux_2", arch = "flux_2", layers = 4, vocab = 0),
 ]
 
 DEPLOYMENTS = [

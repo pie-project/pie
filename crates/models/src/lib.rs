@@ -66,7 +66,11 @@ impl Deployment {
             name: entry.name(&deploy),
             entry,
             template: entry.template,
-            tokenizer: entry.tokenizer,
+            tokenizer: tokenizer::named(
+                entry.tokenizer,
+                deploy.parts.contains(&catalog::Part::Vision),
+            )
+            .expect("a model's package names a tokenizer for every deployment"),
             diffusion: (entry.diffusion)(&deploy),
             generative: (entry.generative)(&deploy),
             deploy,

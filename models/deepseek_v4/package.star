@@ -3,11 +3,11 @@
 # miniature; and the small V4 base.
 
 MODELS = [
-    model("dsv41-flash", template = "deepseek_v4", tokenizer = "deepseek_v4"),
-    model("dsv41-flash-mini", mini = True, template = "deepseek_v4", tokenizer = "deepseek_v4"),
-    model("dsv4-flash", template = "deepseek_v4", tokenizer = "deepseek_v4", drafters = ["mtp"]),
-    model("dsv4-flash-mini", mini = True, template = "deepseek_v4", tokenizer = "deepseek_v4", drafters = ["mtp"]),
-    model("dsv4-base", mini = True, template = "deepseek_v4", tokenizer = "deepseek_v4"),
+    model("dsv41-flash", template = "deepseek_v4", tokenizer = "deepseek_v4", arch = "deepseek_v4", layers = 40, vocab = 129280),
+    model("dsv41-flash-mini", mini = True, template = "deepseek_v4", tokenizer = "deepseek_v4", arch = "deepseek_v4", layers = 8, vocab = 129280),
+    model("dsv4-flash", template = "deepseek_v4", tokenizer = "deepseek_v4", drafters = ["mtp"], arch = "deepseek_v4", layers = 43, vocab = 129280),
+    model("dsv4-flash-mini", mini = True, template = "deepseek_v4", tokenizer = "deepseek_v4", drafters = ["mtp"], arch = "deepseek_v4", layers = 5, vocab = 129280),
+    model("dsv4-base", mini = True, template = "deepseek_v4", tokenizer = "deepseek_v4", arch = "deepseek_v4", layers = 6, vocab = 129280),
 ]
 
 BF = dtype.bf16

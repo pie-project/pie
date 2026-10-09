@@ -8,7 +8,7 @@ use std::sync::Arc;
 use checkpoint::contract::ModelContract;
 use poem::{Dtype, Platform, Trace};
 
-use crate::{Diffusion, Generative, template, tokenizer};
+use crate::{Diffusion, Generative, template};
 
 /// A part a checkpoint may carry besides the text trunk, which a deployment
 /// may leave off.
@@ -100,7 +100,14 @@ pub struct Entry {
     pub trace: TraceFn,
     pub import: ImportFn,
     pub template: TemplateFn,
-    pub tokenizer: &'static tokenizer::Contract,
+    /// The tokenizer contract it names, which a deployment picks its
+    /// contract by.
+    pub tokenizer: &'static str,
+    /// The architecture its media front-ends are chosen by, and its depth
+    /// and vocabulary.
+    pub arch: &'static str,
+    pub layers: u32,
+    pub vocab: u32,
     pub diffusion: DiffusionFn,
     pub generative: GenerativeFn,
     /// The deployments the catalog lists for this model, with each one's

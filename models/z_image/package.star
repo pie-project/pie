@@ -2,8 +2,8 @@
 # its diffusion transformer alone.
 
 MODELS = [
-    model("z-image-turbo", template = "z_image", tokenizer = "z_image"),
-    model("z-image-mini", mini = True, template = "z_image", tokenizer = "z_image"),
+    model("z-image-turbo", template = "z_image", tokenizer = "z_image", arch = "z_image", layers = 35, vocab = 151936),
+    model("z-image-mini", mini = True, template = "z_image", tokenizer = "z_image", arch = "z_image", layers = 6, vocab = 0),
 ]
 
 DEPLOYMENTS = [

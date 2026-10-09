@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, anyhow};
@@ -14,328 +14,45 @@ pub struct ModelMetadata {
     pub config: Vec<u8>,
 }
 
-pub struct Row {
-    pub id: &'static str,
-    pub layers: u32,
-    pub vocab: u32,
-    pub arch: &'static str,
+/// The deployment `model_id` names: one of the package the artifact at
+/// `artifact` carries, or else one of this build's catalog.
+pub fn deployment_of(model_id: &str, artifact: &Path) -> Result<models::Deployment> {
+    let Some(package) = crate::engine::load::package_of(artifact)? else {
+        return models::Deployment::parse(model_id).ok_or_else(|| {
+            anyhow!(
+                "the engine loaded {model_id:?}, which names no deployment of this \
+                 build's catalog; nearest: {:?}",
+                nearest(model_id, 3)
+            )
+        });
+    };
+    // The runtime serves one model for as long as it runs.
+    let package: &'static poem::star::Package = Box::leak(Box::new(package));
+    let (model, deploy) = package.manifest().parse(model_id).ok_or_else(|| {
+        anyhow!(
+            "the engine loaded {model_id:?}, which the package `{}` names no deployment of",
+            package.name()
+        )
+    })?;
+    let entries = Box::leak(models::star::family(package).into_boxed_slice());
+    let entry = entries
+        .iter()
+        .find(|entry| entry.id == model.id)
+        .expect("a package's entries are its models");
+    let deploy = models::star::catalog(&deploy).map_err(|why| anyhow!("{model_id}: {}", why.0))?;
+    Ok(models::Deployment::of(entry, deploy))
 }
 
-pub const ROWS: &[Row] = &[
-    Row {
-        id: "dsv4-base",
-        layers: 6,
-        vocab: 129_280,
-        arch: "deepseek_v4",
-    },
-    Row {
-        id: "dsv4-flash",
-        layers: 43,
-        vocab: 129_280,
-        arch: "deepseek_v4",
-    },
-    Row {
-        id: "dsv4-flash-mini",
-        layers: 5,
-        vocab: 129_280,
-        arch: "deepseek_v4",
-    },
-    Row {
-        id: "dsv41-flash",
-        layers: 40,
-        vocab: 129_280,
-        arch: "deepseek_v4",
-    },
-    Row {
-        id: "dsv41-flash-mini",
-        layers: 8,
-        vocab: 129_280,
-        arch: "deepseek_v4",
-    },
-    Row {
-        id: "gemma4-e4b",
-        layers: 42,
-        vocab: 262_144,
-        arch: "gemma4",
-    },
-    Row {
-        id: "diffusiongemma-26b-a4b",
-        layers: 30,
-        vocab: 262_144,
-        arch: "diffusion_gemma",
-    },
-    Row {
-        id: "gemma4-26b-a4b",
-        layers: 30,
-        vocab: 262_144,
-        arch: "gemma4",
-    },
-    Row {
-        id: "gemma4-31b",
-        layers: 60,
-        vocab: 262_144,
-        arch: "gemma4",
-    },
-    Row {
-        id: "glm5-a12b",
-        layers: 46,
-        vocab: 151_552,
-        arch: "glm_moe_dsa",
-    },
-    Row {
-        id: "glm53-flash-mini",
-        layers: 8,
-        vocab: 154_880,
-        arch: "glm5_next",
-    },
-    Row {
-        id: "glm53-flash",
-        layers: 45,
-        vocab: 154_880,
-        arch: "glm5_next",
-    },
-    Row {
-        id: "gptoss-20b",
-        layers: 24,
-        vocab: 201_088,
-        arch: "gptoss",
-    },
-    Row {
-        id: "gptoss-20b-mini",
-        layers: 5,
-        vocab: 201_088,
-        arch: "gptoss",
-    },
-    Row {
-        id: "gptoss-120b",
-        layers: 36,
-        vocab: 201_088,
-        arch: "gptoss",
-    },
-    Row {
-        id: "kimik3-mini",
-        layers: 8,
-        vocab: 163_840,
-        arch: "kimi_k3",
-    },
-    Row {
-        id: "kimik3",
-        layers: 8,
-        vocab: 163_840,
-        arch: "kimi_k3",
-    },
-    Row {
-        id: "qwen36-27b",
-        layers: 64,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen38-27b",
-        layers: 64,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen36-35b-a3b",
-        layers: 40,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen36-35b-a3b-mini",
-        layers: 5,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen36-35b-a3b-mini64",
-        layers: 5,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen35-d0.8b",
-        layers: 24,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen35-tiny",
-        layers: 4,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen35-d2b",
-        layers: 24,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen35-d4b",
-        layers: 32,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen35-d9b",
-        layers: 32,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen35-a3b",
-        layers: 40,
-        vocab: 248_320,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "qwen38-flash-next",
-        layers: 48,
-        vocab: 248_320,
-        arch: "qwen4_exp",
-    },
-    Row {
-        id: "qwen38-flash-next-mini",
-        layers: 4,
-        vocab: 248_320,
-        arch: "qwen4_exp",
-    },
-    Row {
-        id: "qwen35-d3b",
-        layers: 24,
-        vocab: 151_936,
-        arch: "qwen3_5",
-    },
-    Row {
-        id: "z-image-turbo",
-        layers: 35,
-        vocab: 151_936,
-        arch: "z_image",
-    },
-    Row {
-        id: "z-image-mini",
-        layers: 6,
-        vocab: 0,
-        arch: "z_image",
-    },
-    Row {
-        id: "flux2-klein-4b",
-        layers: 27,
-        vocab: 151_936,
-        arch: "flux_2",
-    },
-    Row {
-        id: "flux2-mini",
-        layers: 4,
-        vocab: 0,
-        arch: "flux_2",
-    },
-    Row {
-        id: "hunyuanimage3-80b-a13b",
-        layers: 32,
-        vocab: 133_120,
-        arch: "hunyuan_image_3_moe",
-    },
-    Row {
-        id: "hunyuanimage3-mini",
-        layers: 2,
-        vocab: 133_120,
-        arch: "hunyuan_image_3_moe",
-    },
-    Row {
-        id: "minimax-h3-fl2va",
-        layers: 50,
-        vocab: 151_936,
-        arch: "minimax_h3",
-    },
-    Row {
-        id: "minimax-h3-mini",
-        layers: 3,
-        vocab: 0,
-        arch: "minimax_h3",
-    },
-    Row {
-        id: "wan22-ti2v-5b",
-        layers: 24,
-        vocab: 256_384,
-        arch: "wan_2",
-    },
-    Row {
-        id: "wan22-mini-d128",
-        layers: 2,
-        vocab: 0,
-        arch: "wan_2",
-    },
-    Row {
-        id: "wan22-mini-nano",
-        layers: 2,
-        vocab: 0,
-        arch: "wan_2",
-    },
-    Row {
-        id: "ltx25",
-        layers: 48,
-        vocab: 0,
-        arch: "ltx_2",
-    },
-    Row {
-        id: "ltx25-mini",
-        layers: 2,
-        vocab: 0,
-        arch: "ltx_2",
-    },
-    Row {
-        id: "mini-dit",
-        layers: 3,
-        vocab: 0,
-        arch: "mini_dit",
-    },
-    Row {
-        id: "muse-glimmer-30b",
-        layers: 52,
-        vocab: 202_048,
-        arch: "muse_glimmer",
-    },
-    Row {
-        id: "muse-glimmer-30b-mini-l8",
-        layers: 8,
-        vocab: 202_048,
-        arch: "muse_glimmer",
-    },
-    Row {
-        id: "inkling",
-        layers: 66,
-        vocab: 200_058,
-        arch: "inkling",
-    },
-    Row {
-        id: "inkling-mini-l7-e8",
-        layers: 7,
-        vocab: 200_058,
-        arch: "inkling",
-    },
-];
-
-#[must_use]
-pub fn row(id: &str) -> Option<&'static Row> {
-    ROWS.iter().find(|row| row.id == id)
-}
-
-#[must_use]
-pub fn ids() -> Vec<&'static str> {
-    ROWS.iter().map(|row| row.id).collect()
-}
-
-#[must_use]
-pub fn nearest_ids(id: &str, take: usize) -> Vec<&'static str> {
-    let mut scored: Vec<(usize, &'static str)> = ids()
-        .into_iter()
-        .map(|k| (edit_distance(id, k), k))
+fn nearest(name: &str, take: usize) -> Vec<&'static str> {
+    let mut scored: Vec<(usize, &'static str)> = models::deployments()
+        .map(|d| (edit_distance(name, &d.name), d.name.as_str()))
         .collect();
-    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
-    scored.into_iter().take(take).map(|(_, k)| k).collect()
+    scored.sort();
+    scored
+        .into_iter()
+        .take(take)
+        .map(|(_, name)| name)
+        .collect()
 }
 
 fn edit_distance(a: &str, b: &str) -> usize {
@@ -377,22 +94,7 @@ pub fn register(
     tokenizer_path: PathBuf,
     metadata: &ModelMetadata,
 ) -> Result<()> {
-    let deployment = models::Deployment::parse(model_id).ok_or_else(|| {
-        anyhow!(
-            "the engine loaded {model_id:?}, which names no model of this build's \
-             catalog; nearest ids: {:?}",
-            nearest_ids(model_id, 3)
-        )
-    })?;
-    let row = row(deployment.entry.id).ok_or_else(|| {
-        anyhow!(
-            "this build serves `{}` but `runtime::model::ROWS` states no depth or \
-             vocabulary for it",
-            deployment.entry.id
-        )
-    })?;
-    let num_layers = row.layers;
-    let vocab_size = row.vocab;
+    let deployment = deployment_of(model_id, &tokenizer_path)?;
     let tokenizer = match compiled_tokenizer(metadata) {
         Some(compiled) => compiled?,
         None => Tokenizer::from_file(&tokenizer_path)?,
@@ -413,7 +115,7 @@ pub fn register(
 
     let model = Arc::new(Model {
         name,
-        arch_name: row.arch,
+        arch_name: deployment.entry.arch,
         instruct,
         facts,
         kv_page_size,
@@ -421,8 +123,8 @@ pub fn register(
         eta_caps: eta,
         tokenizer,
         vocab: OnceLock::new(),
-        vocab_size,
-        num_layers,
+        vocab_size: deployment.entry.vocab,
+        num_layers: deployment.entry.layers,
         diffusion,
         generative,
     });

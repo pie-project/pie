@@ -2,9 +2,9 @@
 # sixteen-expert miniature, and 120B.
 
 MODELS = [
-    model("gptoss-20b", template = "gpt_oss", tokenizer = "gpt_oss", drafters = ["dflash"]),
-    model("gptoss-20b-mini", mini = True, template = "gpt_oss", tokenizer = "gpt_oss"),
-    model("gptoss-120b", template = "gpt_oss", tokenizer = "gpt_oss"),
+    model("gptoss-20b", template = "gpt_oss", tokenizer = "gpt_oss", drafters = ["dflash"], arch = "gptoss", layers = 24, vocab = 201088),
+    model("gptoss-20b-mini", mini = True, template = "gpt_oss", tokenizer = "gpt_oss", arch = "gptoss", layers = 5, vocab = 201088),
+    model("gptoss-120b", template = "gpt_oss", tokenizer = "gpt_oss", arch = "gptoss", layers = 36, vocab = 201088),
 ]
 
 DEPLOYMENTS = [

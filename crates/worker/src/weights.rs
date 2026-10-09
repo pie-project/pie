@@ -102,20 +102,21 @@ pub struct Want<'a> {
 }
 
 impl Want<'_> {
-    /// Whether the artifact stamped `deployment` serves what the config asks.
-    fn serves(&self, deployment: &str) -> bool {
+    /// Whether the artifact at `path`, stamped `deployment`, serves what
+    /// the config asks.
+    fn serves(&self, path: &Path, deployment: &str) -> bool {
         let Some(overrides) = self.overrides else {
             return true;
         };
-        let Some(stamped) = models::Deployment::parse(deployment) else {
+        let Some(stamped) = runtime::engine::load::deploy_of(path, deployment) else {
             return false;
         };
         overrides
             .precision
             .as_ref()
-            .is_none_or(|precision| *precision == stamped.deploy.weights)
+            .is_none_or(|precision| *precision == stamped.weights)
             && match overrides.drafter {
-                Some(Some(drafter)) => stamped.deploy.drafter == Some(drafter),
+                Some(Some(drafter)) => stamped.drafter == Some(drafter),
                 _ => true,
             }
     }
@@ -177,10 +178,10 @@ fn pick(dir: &Path, found: Vec<PathBuf>, want: Want<'_>) -> Result<Option<PathBu
         wanted.retain(|(_, parsed)| parsed.as_ref().is_some_and(|it| it.backend == backend));
     }
     if wanted.len() > 1 && want.overrides.is_some() {
-        wanted.retain(|(_, parsed)| {
+        wanted.retain(|(path, parsed)| {
             parsed
                 .as_ref()
-                .is_some_and(|it| want.serves(&it.deployment))
+                .is_some_and(|it| want.serves(path, &it.deployment))
         });
     }
     if let [(path, _)] = wanted[..] {

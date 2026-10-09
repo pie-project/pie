@@ -8,8 +8,9 @@ MODELS = [
         tokenizer = "glm_5_next",
         parts = ["vision"],
         drafters = ["mtp"],
+        arch = "glm5_next", layers = 45, vocab = 154880,
     ),
-    model("glm53-flash-mini", mini = True, template = "glm_5_next", tokenizer = "glm_5_next"),
+    model("glm53-flash-mini", mini = True, template = "glm_5_next", tokenizer = "glm_5_next", arch = "glm5_next", layers = 8, vocab = 154880),
 ]
 
 DEPLOYMENTS = [

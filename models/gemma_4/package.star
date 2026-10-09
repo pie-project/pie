@@ -4,15 +4,15 @@
 # as a block-diffusion text model.
 
 MODELS = [
-    model("gemma4-26b-a4b", template = "gemma_4", tokenizer = "gemma_4", parts = ["vision"], drafters = ["mtp", "dflash"]),
-    model("gemma4-31b", template = "gemma_4", tokenizer = "gemma_4", parts = ["vision"], drafters = ["mtp"]),
-    model("gemma4-e4b", template = "gemma_4", tokenizer = "gemma_4", parts = ["vision"], drafters = ["eagle"]),
-    model("gemma4-e4b-mini-l1", mini = True, template = "gemma_4", tokenizer = "gemma_4"),
-    model("gemma4-e4b-mini-l6", mini = True, template = "gemma_4", tokenizer = "gemma_4"),
-    model("gemma4-e4b-mini-l24", mini = True, template = "gemma_4", tokenizer = "gemma_4"),
-    model("gemma4-e4b-mini-l30", mini = True, template = "gemma_4", tokenizer = "gemma_4"),
-    model("gemma4-e4b-mini-l36", mini = True, template = "gemma_4", tokenizer = "gemma_4"),
-    model("diffusiongemma-26b-a4b", template = "gemma_4", tokenizer = "gemma_4", parts = ["selfcond"]),
+    model("gemma4-26b-a4b", template = "gemma_4", tokenizer = "gemma_4", parts = ["vision"], drafters = ["mtp", "dflash"], arch = "gemma4", layers = 30, vocab = 262144),
+    model("gemma4-31b", template = "gemma_4", tokenizer = "gemma_4", parts = ["vision"], drafters = ["mtp"], arch = "gemma4", layers = 60, vocab = 262144),
+    model("gemma4-e4b", template = "gemma_4", tokenizer = "gemma_4", parts = ["vision"], drafters = ["eagle"], arch = "gemma4", layers = 42, vocab = 262144),
+    model("gemma4-e4b-mini-l1", mini = True, template = "gemma_4", tokenizer = "gemma_4", arch = "gemma4", layers = 1, vocab = 262144),
+    model("gemma4-e4b-mini-l6", mini = True, template = "gemma_4", tokenizer = "gemma_4", arch = "gemma4", layers = 6, vocab = 262144),
+    model("gemma4-e4b-mini-l24", mini = True, template = "gemma_4", tokenizer = "gemma_4", arch = "gemma4", layers = 24, vocab = 262144),
+    model("gemma4-e4b-mini-l30", mini = True, template = "gemma_4", tokenizer = "gemma_4", arch = "gemma4", layers = 30, vocab = 262144),
+    model("gemma4-e4b-mini-l36", mini = True, template = "gemma_4", tokenizer = "gemma_4", arch = "gemma4", layers = 36, vocab = 262144),
+    model("diffusiongemma-26b-a4b", template = "gemma_4", tokenizer = "gemma_4", parts = ["selfcond"], arch = "diffusion_gemma", layers = 30, vocab = 262144),
 ]
 
 U4 = dtype.u4g64

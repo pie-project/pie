@@ -10,7 +10,7 @@ use poem::star::Package;
 use runtime::engine::load::{Overrides, packaged};
 
 const PACKAGE: &str = r#"
-MODELS = [model("stranger-1b", template = "none", tokenizer = "none")]
+MODELS = [model("stranger-1b", template = "qwen_3", tokenizer = "qwen_3", arch = "stranger", layers = 1, vocab = 16)]
 DEPLOYMENTS = [deployment("stranger-1b", weights = dtype.bf16, kv = dtype.bf16)]
 "#;
 
@@ -63,6 +63,17 @@ fn a_model_no_catalog_lists_serves_from_its_artifact() {
     assert_eq!((name.as_str(), tp), ("stranger-1b-bf16-kv-bf16", 1));
     assert_eq!(trace.name, name);
     assert_eq!(trace.params.len(), 2);
+
+    let registered = runtime::model::deployment_of(&name, &path).unwrap();
+    assert_eq!(
+        (
+            registered.entry.arch,
+            registered.entry.layers,
+            registered.entry.vocab
+        ),
+        ("stranger", 1, 16),
+        "the runtime registers it by its package"
+    );
 
     let kv = Overrides {
         kv: Some(poem::Dtype::E4m3),

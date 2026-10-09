@@ -3,8 +3,8 @@
 # its two-layer miniature.
 
 MODELS = [
-    model("hunyuanimage3-80b-a13b", template = "hunyuan_image_3", tokenizer = "hunyuan_image_3"),
-    model("hunyuanimage3-mini", mini = True, template = "hunyuan_image_3", tokenizer = "hunyuan_image_3"),
+    model("hunyuanimage3-80b-a13b", template = "hunyuan_image_3", tokenizer = "hunyuan_image_3", arch = "hunyuan_image_3_moe", layers = 32, vocab = 133120),
+    model("hunyuanimage3-mini", mini = True, template = "hunyuan_image_3", tokenizer = "hunyuan_image_3", arch = "hunyuan_image_3_moe", layers = 2, vocab = 133120),
 ]
 
 DEPLOYMENTS = [

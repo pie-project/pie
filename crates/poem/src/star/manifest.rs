@@ -44,6 +44,11 @@ pub struct Model {
     pub template: String,
     /// The tokenizer its checkpoint carries, by name.
     pub tokenizer: String,
+    /// The architecture its media front-ends are chosen by.
+    pub arch: String,
+    /// Its depth and vocabulary, as the runtime states them to an inferlet.
+    pub layers: u32,
+    pub vocab: u32,
 }
 
 starlark_simple_value!(Model);
@@ -313,6 +318,9 @@ pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
         #[starlark(require = named, default = false)] mini: bool,
         #[starlark(require = named, default = UnpackList::default())] parts: UnpackList<String>,
         #[starlark(require = named, default = UnpackList::default())] drafters: UnpackList<String>,
+        #[starlark(require = named, default = String::new())] arch: String,
+        #[starlark(require = named, default = 0)] layers: u32,
+        #[starlark(require = named, default = 0)] vocab: u32,
     ) -> anyhow::Result<Model> {
         Ok(Model {
             id,
@@ -321,6 +329,9 @@ pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
             drafters: drafters.items,
             template,
             tokenizer,
+            arch,
+            layers,
+            vocab,
         })
     }
 
