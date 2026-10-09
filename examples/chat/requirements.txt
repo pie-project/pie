@@ -1,0 +1,2 @@
+prompt_toolkit>=3.0
+rich>=13

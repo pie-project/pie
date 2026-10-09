@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Start the terminal chat with one command, the way `claude` starts Claude Code.
+# First run creates a Python environment next to the repo; later runs start at once.
+set -euo pipefail
+
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do  # follow the ~/.local/bin symlink back to the repo copy
+  link="$(readlink "$src")"
+  case "$link" in /*) src="$link" ;; *) src="$(dirname "$src")/$link" ;; esac
+done
+here="$(cd "$(dirname "$src")" && pwd)"
+repo="$(cd "$here/../.." && pwd)"
+venv="$repo/.venv"
+
+if [ ! -x "$venv/bin/python" ]; then
+  python3 -m venv "$venv"
+fi
+"$venv/bin/pip" -q install -r "$here/requirements.txt"
+
+exec "$venv/bin/python" "$here/chat.py" "$@"
