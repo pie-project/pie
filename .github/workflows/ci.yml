@@ -61,10 +61,11 @@ jobs:
         run: |
           cargo test --workspace --exclude pie-server-py --exclude pie-server-node --exclude worker --exclude engine-cuda
           cargo test -p worker --lib
-      # The C library from C: its header compiles and a refused boot reports why.
+      # The C library from C: its header compiles warning-free, its version
+      # matches the library's, and a refused boot reports why.
       - name: libpie from C
         run: |
-          cc packages/c/test/smoke.c -Ipackages/c/include -Ltarget/debug -lpie -o target/pie-c-smoke
+          cc -Wall -Wextra -Werror packages/c/test/smoke.c -Ipackages/c/include -Ltarget/debug -lpie -o target/pie-c-smoke
           LD_LIBRARY_PATH=target/debug target/pie-c-smoke
       # Both halves of engine-cuda build without a toolkit: cudarc loads the
       # driver at run time and the device tests are `#[ignore]`d.
