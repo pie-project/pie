@@ -60,39 +60,36 @@ def forward(m, inputs):
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
     logits = ops.linear.lm_head(x, m.head)
 
-    mtp = m.mtp
-    if mtp != None:
-        input_mtp = inputs.on(fact.drafts())
-        plan_mtp = whole(input_mtp, m.heads, m.kv_lora_rank)
-        dy = y.on(fact.drafts())
-        dpos = positions.on(fact.drafts())
-        dlogits = logits.on(fact.drafts())
-        token = ops.layout.argmax([dlogits])
-        hidden = dy
-        chain = []
-        for step in range(mtp.depth):
-            e = ops.layout.embed(token, m.embed, m.vocab)
-            e = ops.elemwise.rmsnorm(e, mtp.enorm, mtp.norm_eps)
-            h = ops.elemwise.rmsnorm(hidden, mtp.hnorm, mtp.norm_eps)
-            fused = ops.elemwise.residual_add(
-                ops.linear.matmul(e, mtp.e_proj),
-                ops.linear.matmul(h, mtp.h_proj),
-            )
-            x = ops.elemwise.rmsnorm(fused, mtp.mixer_norm, mtp.mixer_norm_eps)
-            o = mla_mixer(x, input_mtp, plan_mtp, dpos, m.act, mtp.attn)
-            r = ops.elemwise.residual_add(o, fused)
-            x = ops.elemwise.rmsnorm(r, mtp.mlp_norm, mtp.mlp_norm_eps)
-            f = mlp(x, mtp.mlp, None)
-            r = ops.elemwise.residual_add(f, r)
-            read = ops.elemwise.rmsnorm(r, mtp.norm, mtp.norm_eps)
-            draft = ops.linear.lm_head(read, m.head)
-            if step == 0:
-                seam.at(seam.MTP, [draft])
-            token = ops.layout.argmax([draft])
-            hidden = r
-            chain.append(draft)
-        seam.at(seam.MTP_DRAFTS, [ops.layout.argmax(chain)])
+    if m.mtp != None:
+        draft(m, inputs, y, positions, logits)
     return logits
+
+def draft(m, inputs, y, positions, logits):
+    """The MTP head's drafted token, from the trunk's last hidden rows `y`
+    and the token its logits pick."""
+    mtp = m.mtp
+    drafted = inputs.on(fact.drafts())
+    plan = whole(drafted, m.heads, m.kv_lora_rank)
+    hidden = y.on(fact.drafts())
+    positions = positions.on(fact.drafts())
+    token = ops.layout.argmax([logits.on(fact.drafts())])
+
+    e = ops.layout.embed(token, m.embed, m.vocab)
+    e = ops.elemwise.rmsnorm(e, mtp.enorm, mtp.norm_eps)
+    h = ops.elemwise.rmsnorm(hidden, mtp.hnorm, mtp.norm_eps)
+    fused = ops.elemwise.residual_add(
+        ops.linear.matmul(e, mtp.e_proj),
+        ops.linear.matmul(h, mtp.h_proj),
+    )
+    x = ops.elemwise.rmsnorm(fused, mtp.mixer_norm, mtp.mixer_norm_eps)
+    o = mla_mixer(x, drafted, plan, positions, m.act, mtp.attn)
+    r = ops.elemwise.residual_add(o, fused)
+    x = ops.elemwise.rmsnorm(r, mtp.mlp_norm, mtp.mlp_norm_eps)
+    r = ops.elemwise.residual_add(mlp(x, mtp.mlp, None), r)
+    proposal = ops.linear.lm_head(ops.elemwise.rmsnorm(r, mtp.norm, mtp.norm_eps), m.head)
+    seam.at(seam.MTP, [proposal])
+    ops.layout.argmax([proposal])
+    seam.at(seam.MTP_DRAFTS, [ops.layout.argmax([proposal])])
 
 def predict_next(streams, following, hy):
     if following == None or not following.mlp.routed:

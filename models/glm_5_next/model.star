@@ -8,9 +8,6 @@ load("//lib/hyper/model.star", "hyper", "mix")
 load("//lib/kda/model.star", kda = "mixer")
 load("//lib/mla/model.star", "attention")
 
-# How many tokens the draft head proposes per step.
-DRAFT_DEPTH = 1
-
 def flash(layers = 45, experts = 288):
     return struct(
         hidden = 4096,
@@ -188,7 +185,6 @@ def layout(id, deploy):
             mlp = routed_at("mtp", draft),
             norm = weight("mtp.norm", [hidden], dense),
             norm_eps = d.norm_eps,
-            depth = DRAFT_DEPTH,
         )
 
     return struct(
