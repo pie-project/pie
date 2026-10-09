@@ -6,7 +6,13 @@ from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
 
 from .backend import PlaceholderBackend
-from .config import EXIT_WINDOW_SECONDS, FRAME_SECONDS, MODES, WARM_DELAY_SECONDS
+from .config import (
+    EXIT_WINDOW_SECONDS,
+    FRAME_SECONDS,
+    MODES,
+    STREAM_REDRAW_SECONDS,
+    WARM_DELAY_SECONDS,
+)
 from .markdown import Markdown
 
 
@@ -18,6 +24,8 @@ class Chat:
         self.app: Application | None = None
         self.frame = 0
         self.scroll_back = 0
+        self.version = 0
+        self.last_draw = 0.0
         self.exit_armed = False
         self.exit_key = ""
         self.mode = 0
@@ -44,8 +52,14 @@ class Chat:
         self.redraw()
 
     def redraw(self) -> None:
+        self.version += 1
+        self.last_draw = time.monotonic()
         if self.app:
             self.app.invalidate()
+
+    def redraw_while_streaming(self) -> None:
+        if time.monotonic() - self.last_draw >= STREAM_REDRAW_SECONDS:
+            self.redraw()
 
     def scroll(self, lines: int) -> None:
         self.scroll_back = max(0, self.scroll_back + lines)
@@ -66,7 +80,7 @@ class Chat:
         try:
             async for piece in self.backend.reply(text):
                 answer.text += piece
-                self.redraw()
+                self.redraw_while_streaming()
             self.add("", "\n\n")
             elapsed = round(time.monotonic() - started)
             done_at = datetime.now(timezone.utc).astimezone().strftime("%-I:%M %p")

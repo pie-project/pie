@@ -1,5 +1,6 @@
 import io
 import shutil
+from functools import lru_cache
 
 from prompt_toolkit.formatted_text import ANSI, to_formatted_text
 from rich.console import Console
@@ -12,7 +13,11 @@ class Markdown:
 
 
 def render(text: str) -> list[tuple[str, str]]:
-    width = max(20, shutil.get_terminal_size((80, 24)).columns - 2)
+    return _render(text, max(20, shutil.get_terminal_size((80, 24)).columns - 2))
+
+
+@lru_cache(maxsize=256)
+def _render(text: str, width: int) -> list[tuple[str, str]]:
     buffer = io.StringIO()
     console = Console(file=buffer, force_terminal=True, color_system="truecolor", width=width)
     console.print(RichMarkdown(text), end="")

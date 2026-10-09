@@ -49,7 +49,12 @@ def wheel(chat: Chat):
     return handler
 
 
+_cache = {"version": None, "pieces": [], "lines": 0}
+
+
 def transcript_pieces(chat: Chat) -> list[tuple]:
+    if _cache["version"] == chat.version:
+        return _cache["pieces"]
     handler = wheel(chat)
     pieces = banner(chat)
     for item in chat.transcript:
@@ -57,13 +62,14 @@ def transcript_pieces(chat: Chat) -> list[tuple]:
             pieces.extend(render(item.text))
         else:
             pieces.append(item)
-    return [(piece[0], piece[1], handler) for piece in pieces]
+    result = [(piece[0], piece[1], handler) for piece in pieces]
+    _cache.update(version=chat.version, pieces=result, lines=sum(piece[1].count("\n") for piece in result))
+    return result
 
 
 def cursor_at_end(chat: Chat) -> Point:
-    text = "".join(piece[1] for piece in transcript_pieces(chat))
-    lines = text.count("\n")
-    return Point(x=0, y=max(0, lines - chat.scroll_back))
+    transcript_pieces(chat)
+    return Point(x=0, y=max(0, _cache["lines"] - chat.scroll_back))
 
 
 def mode_line(chat: Chat) -> list[tuple[str, str]]:
