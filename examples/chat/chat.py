@@ -119,22 +119,25 @@ class EngineBackend:
 
 # The animated mascot: a fixed body with bubbles that start at its bottom right, rise one row
 # per frame and vanish, then the cycle repeats. Rows are 0 (top) to 2 (bottom), columns 0 to 9.
-_BODY = {1: "▐▟▙▙▙▛▌", 2: "▜██▄██▛"}  # the half block in the bottom row is the fin
-# Each bubble stays in one column and rises one row per frame, then vanishes. The two columns
-# are offset by two frames, so the four frames loop cleanly.
+# The fish is drawn on a four-row canvas: row 0 is empty so the bubbles can rise above the body.
+_BODY = {2: "▐▟▙▙▙▛▌", 3: "▜██▄██▛"}  # the half block in the bottom row is the fin
+# (row, column, character) for each bubble, per frame. Bubble A rises in column 8 and bubble B in
+# column 9, starting two frames later; each moves one row up per frame and then vanishes.
 _BUBBLES = [
-    [(2, 8, "▖"), (0, 9, "▘")],  # frame 1: bubble A bottom, bubble B top
-    [(1, 8, "▖")],               # frame 2: A middle, B gone
-    [(0, 8, "▖"), (2, 9, "▘")],  # frame 3: A top, B bottom
-    [(1, 9, "▘")],               # frame 4: A gone, B middle
+    [(3, 8, "▖")],
+    [(2, 8, "▖")],
+    [(1, 8, "▖"), (3, 9, "▘")],
+    [(0, 8, "▖"), (2, 9, "▘")],
+    [(1, 9, "▘")],
+    [(0, 9, "▘")],
 ]
 BODY_STYLE = "class:accent"
 BUBBLE_STYLE = "fg:#3a2a26"  # almost the background colour: the bubbles are barely visible
 
 
 def _frame(bubbles):
-    """One frame as three rows of (style, character) cells, ten columns wide."""
-    grid = [[("", " ")] * 10 for _ in range(3)]
+    """One frame as four rows of (style, character) cells, ten columns wide."""
+    grid = [[("", " ")] * 10 for _ in range(4)]
     for row, text in _BODY.items():
         for col, ch in enumerate(text):
             grid[row][col] = (BODY_STYLE, ch)
