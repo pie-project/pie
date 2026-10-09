@@ -4,6 +4,9 @@
 # block-sparse indexer; every layer routes to experts beside a shared one; an
 # n-gram embedding (PLE) enriches the stream at one layer.
 
+load("//lib/qwen_gdn/model.star", "gated_attn", "gdn", "routed")
+load("//lib/qwen_vision/model.star", "LARGE", "tower")
+
 def ple_dims(layer, heads_per_ngram, base_vocab, split_parts):
     return struct(
         layer = layer,
@@ -87,20 +90,6 @@ MICRO = dims(
     indexer = struct(heads = 2, head_dim = 16, budget = 32, ratio = 4),
     vocab = 256,
     eos = 3,
-)
-
-TOWER = struct(
-    depth = 27,
-    hidden = 1152,
-    heads = 16,
-    inter = 4304,
-    patch_width = 1536,
-    merge = 2,
-    positions = 2304,
-    out_hidden = 2560,
-    theta = 10000.0,
-    norm_eps = 1e-6,
-    taps = 4,
 )
 
 DRAFT_DEPTH = 2
@@ -193,7 +182,7 @@ def layout(id, deploy):
         if not mixed:
             fail(refused)
         return build(MIXED_2BIT, deploy.kv, MINI, HASHES["mini"], False, False)
-    if len(deploy.weights) == 1 and not vision and not mtp and deploy.drafter == None:
+    if len(deploy.weights) == 1 and not vision and deploy.drafter == None:
         return build(mix_of(deploy.weights[0]), deploy.kv, FLASH, HASHES["flash"], False, False)
     if mixed and (mtp or deploy.drafter == None):
         return build(MIXED_2BIT, deploy.kv, FLASH, HASHES["flash"], mtp, vision)
@@ -214,200 +203,81 @@ def build(mix, kv, d, hashes, draft, vision):
             eps = d.norm_eps,
         )
 
-    def block(n, attn, kv_name, index_name, conv_name, delta_name, experts_w):
-        if attn:
-            hd = d.head_dim
-            indexer = None
-            ix = d.indexer
-            if index_name != None and ix != None:
-                ihd = ix.head_dim
-                q_w = ix.heads * ihd
-                indexer = struct(
-                    heads = ix.heads,
-                    head_dim = ihd,
-                    ratio = ix.ratio,
-                    top_k = ix.budget // ix.ratio,
-                    norm_eps = d.norm_eps,
-                    qk_proj = weight(n("index_qk_proj"), [q_w + ihd, hidden], proj).packed([q_w, ihd]),
-                    q_norm = weight(n("index_q_norm"), [ihd], dense),
-                    k_norm = weight(n("index_k_norm"), [ihd], dense),
-                    keys = index_name,
-                )
-            mixer = struct(
-                kind = "attn",
-                attn = struct(
-                    rotary_dim = d.rotary_dim,
-                    theta = d.theta,
-                    sm_scale = f32(1.0 / f32(sqrt(d.head_dim))),
-                    qg_proj = weight(n("qg_proj"), [2 * d.q_heads * hd, hidden], proj).columns(),
-                    k_proj = weight(n("k_proj"), [d.kv_heads * hd, hidden], proj).columns(heads = d.kv_heads),
-                    v_proj = weight(n("v_proj"), [d.kv_heads * hd, hidden], proj).columns(heads = d.kv_heads),
-                    o_proj = weight(n("o_proj"), [hidden, d.q_heads * hd], proj).rows(),
-                    q_norm = weight(n("q_norm"), [hd], dense),
-                    q_norm_eps = d.norm_eps,
-                    k_norm = weight(n("k_norm"), [hd], dense),
-                    k_norm_eps = d.norm_eps,
-                    kv = kv_name,
-                ),
-                indexer = indexer,
-            )
-        else:
-            k_w = d.k_heads * d.k_dim
-            v_w = d.v_heads * d.v_dim
-            qkv = 2 * k_w + v_w
-            mixer = struct(
-                kind = "gdn",
-                k_heads = d.k_heads,
-                v_heads = d.v_heads,
-                k_dim = d.k_dim,
-                v_dim = d.v_dim,
-                qkv_width = qkv,
-                conv_kernel = d.conv_kernel,
-                in_qkvz = weight(n("in_qkvz"), [qkv + v_w, hidden], proj).packed([k_w, k_w, v_w, v_w]),
-                in_ba = weight(n("in_ba"), [2 * d.v_heads, hidden], mix.gdn_ba).packed([d.v_heads, d.v_heads]),
-                conv = weight(n("conv"), [qkv, d.conv_kernel], dense).packed([k_w, k_w, v_w]),
-                dt_bias = weight(n("dt_bias"), [d.v_heads], dense).columns(),
-                a_log = weight(n("a_log"), [d.v_heads], dtype.f32).columns(),
-                norm = weight(n("gdn_norm"), [d.v_dim], dtype.f32),
-                norm_eps = d.norm_eps,
-                out_proj = weight(n("out_proj"), [hidden, v_w], proj).rows(),
-                conv_state = conv_name,
-                delta_state = delta_name,
-            )
-        inter = d.inter
-        shared = d.shared_inter
+    def block(n, attn, indexer, delta, experts):
         return struct(
-            mixer = mixer,
+            attn = attn,
+            indexer = indexer,
+            gdn = delta,
             attn_res = residual(n("attn_res"), True),
             mlp_res = residual(n("mlp_res"), True),
-            mlp = struct(
-                router = weight(n("router"), [d.experts, hidden], dense),
-                gate_up = weight(n("experts_gate_up"), [d.experts, 2 * inter, hidden], experts_w).bank([inter, inter]),
-                down = weight(n("experts_down"), [d.experts, hidden, inter], experts_w).rows(),
-                shared_gate_up = weight(n("shared_gate_up"), [2 * shared, hidden], proj).packed([shared, shared]),
-                shared_down = weight(n("shared_down"), [hidden, shared], proj).rows(),
-                shared_gate = weight(n("shared_gate"), [1, hidden], dense),
-                experts = d.experts,
-                top_k = d.top_k,
-                inter = inter,
-                shared_inter = shared,
-            ),
+            mlp = routed(n, hidden, d, experts, proj, dense),
+        )
+
+    def index(n, keys):
+        ix = d.indexer
+        q_w = ix.heads * ix.head_dim
+        return struct(
+            heads = ix.heads,
+            head_dim = ix.head_dim,
+            ratio = ix.ratio,
+            top_k = ix.budget // ix.ratio,
+            norm_eps = d.norm_eps,
+            qk_proj = weight(n("index_qk_proj"), [q_w + ix.head_dim, hidden], proj).packed([q_w, ix.head_dim]),
+            q_norm = weight(n("index_q_norm"), [ix.head_dim], dense),
+            k_norm = weight(n("index_k_norm"), [ix.head_dim], dense),
+            keys = keys,
         )
 
     def layer(l):
-        attn = l % d.attn_every == d.attn_every - 1
-        return block(
-            lambda s: "layer.{}.{}".format(l, s),
-            attn,
-            "kv.{}".format(l),
-            "index.{}".format(l) if attn else None,
-            "conv.{}".format(l),
-            "delta.{}".format(l),
-            mix.experts,
-        )
+        n = lambda s: "layer.{}.{}".format(l, s)
+        if l % d.attn_every == d.attn_every - 1:
+            indexer = index(n, "index.{}".format(l))
+            return block(n, gated_attn(n, d, proj, "kv.{}".format(l)), indexer, None, mix.experts)
+        delta = gdn(n, d, proj, mix.gdn_ba, dense, "conv.{}".format(l), "delta.{}".format(l))
+        return block(n, None, None, delta, mix.experts)
 
-    tower = None
-    if vision:
-        t = TOWER
-        th = t.hidden
-        ti = t.inter
-        merged = t.merge * t.merge * th
-        head_dim = t.hidden // t.heads
-        v = lambda s: "visual." + s
-        plane = lambda s, dims: weight(v(s), dims, dense)
-        vec1 = lambda s, length: weight(v(s), [length], dense)
-
-        def tower_block(l):
-            b = lambda s: "block.{}.{}".format(l, s)
-            return struct(
-                norm1 = vec1(b("norm1"), th),
-                norm1_bias = vec1(b("norm1_bias"), th),
-                qkv = plane(b("qkv"), [3 * th, th]),
-                qkv_bias = vec1(b("qkv_bias"), 3 * th),
-                proj = plane(b("proj"), [th, th]),
-                proj_bias = vec1(b("proj_bias"), th),
-                norm2 = vec1(b("norm2"), th),
-                norm2_bias = vec1(b("norm2_bias"), th),
-                fc1 = plane(b("fc1"), [ti, th]),
-                fc1_bias = vec1(b("fc1_bias"), ti),
-                fc2 = plane(b("fc2"), [th, ti]),
-                fc2_bias = vec1(b("fc2_bias"), th),
-            )
-
-        tower = struct(
-            hidden = t.hidden,
-            heads = t.heads,
-            head_dim = head_dim,
-            merge = t.merge,
-            patch_width = t.patch_width,
-            taps = t.taps,
-            positions = t.positions,
-            theta = t.theta,
-            norm_eps = t.norm_eps,
-            sm_scale = f32(1.0 / f32(sqrt(head_dim))),
-            patch_embed = plane("patch_embed", [th, t.patch_width]),
-            patch_embed_bias = vec1("patch_embed_bias", th),
-            pos_embed = plane("pos_embed", [t.positions, th]),
-            blocks = [tower_block(l) for l in range(t.depth)],
-            merger = struct(
-                norm = vec1("merger_norm", th),
-                norm_bias = vec1("merger_norm_bias", th),
-                fc1 = plane("merger_fc1", [merged, merged]),
-                fc1_bias = vec1("merger_fc1_bias", merged),
-                fc2 = plane("merger_fc2", [hidden, merged]),
-                fc2_bias = vec1("merger_fc2_bias", hidden),
-            ),
-        )
+    visual = tower(LARGE, hidden, dense) if vision else None
 
     mtp = None
     if draft:
+        n = lambda s: "mtp.layer." + s
         mtp = struct(
             norm_embed = weight("mtp.norm_embed", [hidden], dense),
             norm_hidden = weight("mtp.norm_hidden", [sh], dense),
             fc_embed = weight("mtp.fc_embed", [hidden, hidden], dense),
             fc_hidden = weight("mtp.fc_hidden", [sh, hidden], dense),
-            block = block(
-                lambda s: "mtp.layer." + s,
-                True,
-                "kv.mtp",
-                None,
-                "conv.mtp",
-                "delta.mtp",
-                proj,
-            ),
+            block = block(n, gated_attn(n, d, proj, "kv.mtp"), None, None, proj),
             mixer = residual("mtp.mixer", False),
             eps = d.norm_eps,
             depth = DRAFT_DEPTH,
         )
 
-    ple = None
-    if d.ple != None:
-        p = d.ple
-        padded = (hashes.total + p.divisible_by - 1) // p.divisible_by * p.divisible_by
-        heads = (p.ngram - 1) * p.heads_per_ngram
-        shards = p.split_parts
-        ple = struct(
-            layer = p.layer,
-            eos = d.eos,
-            heads_per_ngram = p.heads_per_ngram,
-            mults = hashes.mults,
-            primes = hashes.primes,
-            offsets = hashes.offsets,
-            padded_vocab = padded,
-            shards = shards,
-            table = weight("ple.table", [padded, hidden // heads], mix.table).packed([padded // shards] * shards),
-            key_proj = weight("ple.key_proj", [sh, hidden], proj),
-            value_proj = weight("ple.value_proj", [hidden, hidden], proj),
-            norm_key = weight("ple.norm_key", [sh], dense),
-            norm_query = weight("ple.norm_query", [sh], dense),
-            norm_conv = weight("ple.norm_conv", [sh], dense),
-            conv = weight("ple.conv", [sh, p.conv_kernel], dense),
-            conv_kernel = p.conv_kernel,
-            dilation = p.ngram,
-            eps = d.norm_eps,
-            ids_state = "ple.ids",
-            conv_state = "ple.conv",
-        )
+    p = d.ple
+    padded = (hashes.total + p.divisible_by - 1) // p.divisible_by * p.divisible_by
+    heads = (p.ngram - 1) * p.heads_per_ngram
+    shards = p.split_parts
+    ple = struct(
+        layer = p.layer,
+        eos = d.eos,
+        heads_per_ngram = p.heads_per_ngram,
+        mults = hashes.mults,
+        primes = hashes.primes,
+        offsets = hashes.offsets,
+        padded_vocab = padded,
+        shards = shards,
+        table = weight("ple.table", [padded, hidden // heads], mix.table).packed([padded // shards] * shards),
+        key_proj = weight("ple.key_proj", [sh, hidden], proj),
+        value_proj = weight("ple.value_proj", [hidden, hidden], proj),
+        norm_key = weight("ple.norm_key", [sh], dense),
+        norm_query = weight("ple.norm_query", [sh], dense),
+        norm_conv = weight("ple.norm_conv", [sh], dense),
+        conv = weight("ple.conv", [sh, p.conv_kernel], dense),
+        conv_kernel = p.conv_kernel,
+        dilation = p.ngram,
+        eps = d.norm_eps,
+        ids_state = "ple.ids",
+        conv_state = "ple.conv",
+    )
 
     return struct(
         hidden = hidden,
@@ -416,7 +286,6 @@ def build(mix, kv, d, hashes, draft, vision):
         kv_heads = d.kv_heads,
         head_dim = d.head_dim,
         streams = d.streams,
-        lowrank = d.lowrank,
         kv = kv,
         embed = weight("embed", [d.vocab, hidden], mix.embed),
         head = weight("lm_head", [d.vocab, hidden], mix.head),
@@ -424,5 +293,5 @@ def build(mix, kv, d, hashes, draft, vision):
         mixer = residual("mixer", False),
         ple = ple,
         mtp = mtp,
-        tower = tower,
+        tower = visual,
     )

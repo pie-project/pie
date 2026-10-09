@@ -6,10 +6,10 @@
 # rotated geometries turn their attention's q, k and v by a Hadamard.
 
 load("//lib/dflash/forward.star", "arm", "block_rows", "plant_readout", "tap", dflash_caches = "caches")
+load("//lib/qwen_gdn/forward.star", "draft_attn", "moe")
+load("//lib/qwen_vision/forward.star", "positions", "rope", "scatter", "tower")
 
-MROPE_SECTIONS = [11, 11, 10]
 BONSAI_BLOCK = 1024
-DRAFT_DEPTH = 1
 
 def rot_copy(x, signs):
     """`H·(S·x)` on a copy of `x`, which a sibling projection still reads."""
@@ -19,18 +19,15 @@ def rot_take(x, signs):
     """`H·(S·x)` over `x` itself, dead after its rotated matmul."""
     return ops.elemwise.hadamard_signed(x, BONSAI_BLOCK, signs)
 
-def qkv_width(g):
-    return 2 * g.k_heads * g.k_dim + g.v_heads * g.v_dim
-
 def caches(m, c):
     kv = c.kv_space(m.kv)
     plane = m.kv_heads * m.head_dim
     for w in m.layers:
-        if w.mixer.attn:
-            c.kv(kv, w.mixer.a.kv, [plane, plane], m.head_dim, heads = True)
+        if w.attn != None:
+            c.kv(kv, w.attn.kv, [plane, plane], m.head_dim, heads = True)
         else:
-            g = w.mixer.g
-            c.state(g.conv_state, [g.conv_kernel, qkv_width(g)], dtype.bf16, split = 1)
+            g = w.gdn
+            c.state(g.conv_state, [g.conv_kernel, g.qkv_width], dtype.bf16, split = 1)
             c.state(g.delta_state, [g.v_heads, g.k_dim, g.v_dim], dtype.bf16, split = 0)
     if m.mtp != None:
         c.kv(kv, m.mtp.attn.kv, [plane, plane], m.head_dim, heads = True)
@@ -63,8 +60,7 @@ def forward(m, inputs):
         y = ops.elemwise.hadamard_plain(hshy, BONSAI_BLOCK)
 
     if towered != None:
-        imaged = y.on(fact.has(fact.Media))
-        y = ops.layout.scatter_live_rows(towered, inputs.patch_routes(), imaged).everywhere()
+        y = scatter(y, towered, inputs)
 
     h_block = None
     if dr != None:
@@ -76,10 +72,10 @@ def forward(m, inputs):
     def block(l, w, carried):
         y, fused = carried
         x = ops.elemwise.rmsnorm_plus_one(y, w.mixer_norm, w.mixer_norm_eps)
-        if w.mixer.attn:
-            o = attn_mixer(x, inputs, m, plans, mask, w.mixer.a)
+        if w.attn != None:
+            o = attn_mixer(x, inputs, m, plans, mask, w.attn)
         else:
-            o = gdn_mixer(x, inputs, w.mixer.g, m.bonsai)
+            o = gdn_mixer(x, inputs, w.gdn, m.bonsai)
         adapted = fact.has(fact.Adapter)
         o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
         y = ops.elemwise.residual_add(o, y)
@@ -116,94 +112,39 @@ def mlp(x, f, bonsai):
         h = ops.linear.mlp_swiglu(ops.linear.matmul(gate_in, f.gate_up), f.inter)
         down_in = rot_take(h, bonsai.ffn_down) if bonsai != None else h
         return ops.linear.matmul(down_in, f.down)
-    experts, weights = ops.linear.moe_topk_softmax(ops.linear.matmul(x, f.router), f.experts, f.top_k)
-
-    def select(act, bank):
-        if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
-            return ops.linear.moe_matmul_select(act, bank, experts, f.top_k)
-        return ops.linear.moe_matmul_select_quant(act, bank, experts, f.top_k)
-
-    hidden = ops.linear.mlp_swiglu(select(x, f.gate_up), f.inter)
-    routed = ops.linear.moe_weighted_sum(select(hidden, f.down), weights)
-    shared = ops.linear.matmul(
-        ops.linear.mlp_swiglu(ops.linear.matmul(x, f.shared_gate_up), f.shared_inter),
-        f.shared_down,
-    )
-    return ops.linear.moe_sigmoid_gate_add(routed, shared, ops.linear.matmul(x, f.shared_gate))
+    return moe(x, f)
 
 def draft(m, inputs, x, logits, head):
     mtp = m.mtp
-    input_mtp = inputs.on(fact.drafts())
-    plan_mtp = ops.attn.plan_prefill(input_mtp, m.q_heads, m.kv_heads, m.head_dim, None)
-    dx = x.on(fact.drafts())
-    dlogits = logits.on(fact.drafts())
-    chosen = ops.layout.argmax([dlogits])
-    hidden = dx
-    chain = []
-    for step in range(DRAFT_DEPTH):
-        e = ops.layout.embed(chosen, m.embed, m.vocab)
-        if mtp.pre_fc != None:
-            pre = mtp.pre_fc
-            e = ops.elemwise.rmsnorm_plus_one(e, pre.embedding, pre.eps)
-            h = ops.elemwise.rmsnorm_plus_one(hidden, pre.hidden, pre.eps)
-        else:
-            h = hidden
-        dy = ops.elemwise.residual_add(ops.linear.matmul(e, mtp.fc_embed), ops.linear.matmul(h, mtp.fc_hidden))
+    plan = ops.attn.plan_prefill(inputs.on(fact.drafts()), m.q_heads, m.kv_heads, m.head_dim, None)
+    hidden = x.on(fact.drafts())
+    chosen = ops.layout.argmax([logits.on(fact.drafts())])
+    e = ops.layout.embed(chosen, m.embed, m.vocab)
+    if mtp.pre_fc != None:
+        pre = mtp.pre_fc
+        e = ops.elemwise.rmsnorm_plus_one(e, pre.embedding, pre.eps)
+        hidden = ops.elemwise.rmsnorm_plus_one(hidden, pre.hidden, pre.eps)
+    dy = ops.elemwise.residual_add(ops.linear.matmul(e, mtp.fc_embed), ops.linear.matmul(hidden, mtp.fc_hidden))
 
-        nx = ops.elemwise.rmsnorm_plus_one(dy, mtp.mixer_norm, mtp.mixer_norm_eps)
-        o = mtp_attn(nx, inputs, m, plan_mtp, mtp.attn, step > 0)
-        dy = ops.elemwise.residual_add(o, dy)
+    nx = ops.elemwise.rmsnorm_plus_one(dy, mtp.mixer_norm, mtp.mixer_norm_eps)
+    a = mtp.attn
+    o = draft_attn(nx, inputs, plan, a, m.head_dim, m.kv_heads, lambda q, k: rotate(q, k, inputs, m, a))
+    dy = ops.elemwise.residual_add(o, dy)
 
-        nx = ops.elemwise.rmsnorm_plus_one(dy, mtp.mlp_norm, mtp.mlp_norm_eps)
-        f = ops.linear.matmul(ops.linear.mlp_swiglu(ops.linear.matmul(nx, mtp.mlp.gate_up), mtp.mlp.inter), mtp.mlp.down)
-        dy = ops.elemwise.residual_add(f, dy)
+    nx = ops.elemwise.rmsnorm_plus_one(dy, mtp.mlp_norm, mtp.mlp_norm_eps)
+    f = ops.linear.matmul(ops.linear.mlp_swiglu(ops.linear.matmul(nx, mtp.mlp.gate_up), mtp.mlp.inter), mtp.mlp.down)
+    dy = ops.elemwise.residual_add(f, dy)
 
-        read = ops.elemwise.rmsnorm_plus_one(dy, mtp.norm, mtp.norm_eps) if mtp.norm != None else dy
-        proposal = ops.linear.lm_head(read, head)
-        if step == 0:
-            seam.at(seam.MTP, [proposal])
-        chosen = ops.layout.argmax([proposal])
-        hidden = dy
-        chain.append(proposal)
-    seam.at(seam.MTP_DRAFTS, [ops.layout.argmax(chain)])
+    read = ops.elemwise.rmsnorm_plus_one(dy, mtp.norm, mtp.norm_eps) if mtp.norm != None else dy
+    proposal = ops.linear.lm_head(read, head)
+    seam.at(seam.MTP, [proposal])
+    # The token a second draft step would embed: unread, but traced.
+    ops.layout.argmax([proposal])
+    seam.at(seam.MTP_DRAFTS, [ops.layout.argmax([proposal])])
 
-def rotate(q, k, inputs, m, a, d):
-    if m.tower == None:
-        return ops.elemwise.rope_partial(q, k, inputs.positions(), a.rotary_dim, d, a.theta)
-    return ops.elemwise.rope_mrope(q, k, inputs.mrope_positions(), MROPE_SECTIONS, "interleaved", a.rotary_dim, d, a.theta)
-
-def tower(inputs, t):
-    d = t.head_dim
-    x = inputs.patches(t.patch_width)
-    segments = inputs.patch_segments()
-    grid = inputs.patch_positions()
-
-    y = ops.elemwise.add_bias(t.patch_embed_bias, ops.linear.matmul(x, t.patch_embed))
-    ids = inputs.patch_embed_rows(t.taps)
-    if t.taps == 1:
-        pos = ops.layout.embed(ids, t.pos_embed, t.positions)
-    else:
-        pos = ops.layout.embed_weighted(ids, inputs.patch_embed_weights(t.taps), t.pos_embed, t.positions)
-    y = ops.elemwise.residual_add(pos, y)
-
-    for b in t.blocks:
-        n = ops.elemwise.layernorm(y, b.norm1, b.norm1_bias, t.norm_eps)
-        q, k, v = ops.layout.split_qkv(ops.elemwise.add_bias(b.qkv_bias, ops.linear.matmul(n, b.qkv)), t.hidden, t.hidden)
-        q, k = ops.elemwise.rope_mrope(q, k, grid, [0, d // 4, d // 4], "blocked", d, d, t.theta)
-        o = ops.attn.dense(q, k, v, segments, d, t.sm_scale)
-        y = ops.elemwise.residual_add(ops.elemwise.add_bias(b.proj_bias, ops.linear.matmul(o, b.proj)), y)
-
-        n = ops.elemwise.layernorm(y, b.norm2, b.norm2_bias, t.norm_eps)
-        h = ops.elemwise.add_bias(b.fc1_bias, ops.linear.matmul(n, b.fc1))
-        a = ops.linear.mlp_gelu_tanh(h)
-        y = ops.elemwise.residual_add(ops.elemwise.add_bias(b.fc2_bias, ops.linear.matmul(a, b.fc2)), y)
-
-    mg = t.merger
-    n = ops.elemwise.layernorm(y, mg.norm, mg.norm_bias, t.norm_eps)
-    folded = ops.layout.merge_rows(n, t.merge)
-    h = ops.elemwise.add_bias(mg.fc1_bias, ops.linear.matmul(folded, mg.fc1))
-    a = ops.linear.mlp_gelu_tanh(h)
-    return ops.elemwise.add_bias(mg.fc2_bias, ops.linear.matmul(a, mg.fc2))
+def rotate(q, k, inputs, m, a):
+    vision = m.tower != None
+    return rope(q, k, positions(inputs, vision), vision, a.rotary_dim, m.head_dim, a.theta)
 
 def attn_mixer(x, inputs, m, plans, mask, a):
     pages = inputs.kv(a.kv)
@@ -219,7 +160,7 @@ def attn_mixer(x, inputs, m, plans, mask, a):
     seam.at(seam.ATTN_QV, [q, v])
     q = ops.elemwise.rmsnorm_per_head_plus_one(q, a.q_norm, d, a.q_norm_eps)
     k = ops.elemwise.rmsnorm_per_head_plus_one(k, a.k_norm, d, a.k_norm_eps)
-    q, k = rotate(q, k, inputs, m, a, d)
+    q, k = rotate(q, k, inputs, m, a)
     # KV rotation: K and V are cached turned by a Hadamard, Q turned to keep
     # the scores, and the output turned back once more.
     if m.rotate_kv:
@@ -247,29 +188,6 @@ def attn_mixer(x, inputs, m, plans, mask, a):
     o_in = rot_take(gated, m.bonsai.ssm) if m.bonsai != None else gated
     return ops.linear.matmul(o_in, a.o_proj)
 
-def mtp_attn(x, inputs, m, plan, a, chain):
-    pages = inputs.kv(a.kv)
-    write_page = inputs.write_page(a.kv)
-    write_offset = inputs.write_offset(a.kv)
-    d = m.head_dim
-    q, gate = ops.layout.split_q_gate(ops.linear.matmul(x, a.qg_proj), d)
-    k = ops.linear.matmul(x, a.k_proj)
-    v = ops.linear.matmul(x, a.v_proj)
-    q = ops.elemwise.rmsnorm_per_head_plus_one(q, a.q_norm, d, a.q_norm_eps)
-    k = ops.elemwise.rmsnorm_per_head_plus_one(k, a.k_norm, d, a.k_norm_eps)
-    q, k = rotate(q, k, inputs, m, a, d)
-    if m.rotate_kv:
-        q = ops.elemwise.hadamard_plain(q, d)
-        k = ops.elemwise.hadamard_plain(k, d)
-    if not chain:
-        if m.rotate_kv:
-            v = ops.elemwise.hadamard_plain(v, d)
-        ops.attn.kv_append(k, v, pages, write_page, write_offset)
-    o = ops.attn.prefill(q, plan, pages, None, d, m.kv_heads, a.sm_scale)
-    if m.rotate_kv:
-        o = ops.elemwise.hadamard_plain(o, d)
-    return ops.linear.matmul(ops.elemwise.gate_sigmoid_mul(o, gate), a.o_proj)
-
 def gdn_mixer(x, inputs, g, bonsai):
     conv_state = inputs.state(g.conv_state)
     delta_state = inputs.state(g.delta_state)
@@ -278,7 +196,7 @@ def gdn_mixer(x, inputs, g, bonsai):
     qkvz = ops.linear.matmul(qkvz_in, g.in_qkvz)
     ba = ops.linear.matmul(x, g.in_ba)
     seam.at(seam.RECURRENT, [qkvz])
-    width = qkv_width(g)
+    width = g.qkv_width
 
     def step(qkvz):
         qkv, z = ops.layout.split_rows(qkvz, width)

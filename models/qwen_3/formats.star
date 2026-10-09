@@ -4,22 +4,8 @@
 # contract carries as constants.
 
 load("//lib/dflash/formats.star", "bind_aux")
-load("//lib/reads/formats.star", "flattened", "squeezed")
-
-LAYOUTS = {
-    "transformers": struct(
-        trunk = "model.language_model.",
-        head = "lm_head.weight",
-        tower = "model.visual.",
-        folds_the_norm_one = False,
-    ),
-    "mlx_lm": struct(
-        trunk = "language_model.model.",
-        head = "language_model.lm_head.weight",
-        tower = "vision_tower.",
-        folds_the_norm_one = True,
-    ),
-}
+load("//lib/qwen_gdn/formats.star", "LAYOUTS", "norm_of", "read_attn", "read_gdn", "read_routed", "safetensors_format")
+load("//lib/qwen_vision/formats.star", "read_tower")
 
 # The Bonsai GGUF's rotation metadata.
 BLOCK_SIZE_KEY = "prism.hadamard.block_size"
@@ -36,14 +22,10 @@ def formats(m):
             read = lambda reads: gguf(m, reads),
         )]
     arch = text_attribute("general.architecture") or ""
+    states = configured(m, "text_config.")
     return [
-        format(
-            name,
-            recognizes = (lambda layout: lambda checkpoint: has(layout.trunk + "embed_tokens.weight"))(LAYOUTS[name]),
-            read = (lambda layout: lambda reads: safetensors(m, reads, layout))(LAYOUTS[name]),
-            states = configured(m, "text_config."),
-        )
-        for name in ["transformers", "mlx_lm"]
+        safetensors_format(layout, lambda reads, layout: safetensors(m, reads, layout), states)
+        for layout in LAYOUTS
     ] + [
         format(
             "gguf",
@@ -55,8 +37,8 @@ def formats(m):
 
 def theta(m):
     for w in m.layers:
-        if w.mixer.attn:
-            return w.mixer.a.theta
+        if w.attn != None:
+            return w.attn.theta
     return None
 
 def configured(m, at):
@@ -103,7 +85,7 @@ def held(names):
     return name
 
 def safetensors(m, reads, layout):
-    norm = (lambda name: src(name).bias(-1.0)) if layout.folds_the_norm_one else (lambda name: src(name))
+    norm = norm_of(layout)
     reads.read(m.embed, layout.trunk + "embed_tokens.weight")
     reads.read_expr(m.final_norm, norm(layout.trunk + "norm.weight"))
     if m.head != None:
@@ -113,78 +95,18 @@ def safetensors(m, reads, layout):
         n = lambda s: "{}layers.{}.{}".format(layout.trunk, l, s)
         reads.read_expr(w.mixer_norm, norm(n("input_layernorm.weight")))
         reads.read_expr(w.mlp_norm, norm(n("post_attention_layernorm.weight")))
-        if w.mixer.attn:
-            a = w.mixer.a
-            reads.read(a.qg_proj, n("self_attn.q_proj.weight"))
-            reads.read(a.k_proj, n("self_attn.k_proj.weight"))
-            reads.read(a.v_proj, n("self_attn.v_proj.weight"))
-            reads.read(a.o_proj, n("self_attn.o_proj.weight"))
-            reads.read_expr(a.q_norm, norm(n("self_attn.q_norm.weight")))
-            reads.read_expr(a.k_norm, norm(n("self_attn.k_norm.weight")))
+        if w.attn != None:
+            read_attn(reads, w.attn, n, norm)
         else:
-            g = w.mixer.g
-            reads.read_concat(g.in_qkvz, [n("linear_attn.in_proj_qkv.weight"), n("linear_attn.in_proj_z.weight")])
-            reads.read_concat(g.in_ba, [n("linear_attn.in_proj_b.weight"), n("linear_attn.in_proj_a.weight")])
-            reads.read_expr(g.conv, squeezed(n("linear_attn.conv1d.weight")))
-            reads.read(g.dt_bias, n("linear_attn.dt_bias"))
-            reads.read(g.a_log, n("linear_attn.A_log"))
-            reads.read(g.norm, n("linear_attn.norm.weight"))
-            reads.read(g.out_proj, n("linear_attn.out_proj.weight"))
-
-        f = w.mlp
-        if not f.routed:
-            reads.read_concat(f.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
-            reads.read(f.down, n("mlp.down_proj.weight"))
+            read_gdn(reads, w.gdn, n)
+        if w.mlp.routed:
+            read_routed(reads, w.mlp, n, layout)
         else:
-            reads.read(f.router, n("mlp.gate.weight"))
-            if not layout.folds_the_norm_one:
-                reads.read(f.gate_up, n("mlp.experts.gate_up_proj"))
-                reads.read(f.down, n("mlp.experts.down_proj"))
-            else:
-                reads.read_concat(f.gate_up, [n("mlp.switch_mlp.gate_proj.weight"), n("mlp.switch_mlp.up_proj.weight")])
-                reads.read(f.down, n("mlp.switch_mlp.down_proj.weight"))
-            reads.read_concat(f.shared_gate_up, [n("mlp.shared_expert.gate_proj.weight"), n("mlp.shared_expert.up_proj.weight")])
-            reads.read(f.shared_down, n("mlp.shared_expert.down_proj.weight"))
-            reads.read(f.shared_gate, n("mlp.shared_expert_gate.weight"))
+            reads.read_concat(w.mlp.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+            reads.read(w.mlp.down, n("mlp.down_proj.weight"))
 
     if m.tower != None:
-        t = m.tower
-        v = lambda s: layout.tower + s
-        flat = flattened(v("patch_embed.proj.weight"), t.patch_embed.shape, broadcast = True)
-        if layout.folds_the_norm_one:
-            # mlx_lm stores the patch embedding channels-last.
-            per = t.patch_embed.shape[1] // 3
-            flat = flat.gather(1, [j * 3 + c for c in range(3) for j in range(per)])
-        reads.read_expr(t.patch_embed, flat)
-        reads.read(t.patch_embed_bias, v("patch_embed.proj.bias"))
-        reads.read(t.pos_embed, v("pos_embed.weight"))
-        for l, blk in enumerate(t.blocks):
-            n = lambda s: v("blocks.{}.{}".format(l, s))
-            for weight_, name in [
-                (blk.norm1, n("norm1.weight")),
-                (blk.norm1_bias, n("norm1.bias")),
-                (blk.qkv, n("attn.qkv.weight")),
-                (blk.qkv_bias, n("attn.qkv.bias")),
-                (blk.proj, n("attn.proj.weight")),
-                (blk.proj_bias, n("attn.proj.bias")),
-                (blk.norm2, n("norm2.weight")),
-                (blk.norm2_bias, n("norm2.bias")),
-                (blk.fc1, n("mlp.linear_fc1.weight")),
-                (blk.fc1_bias, n("mlp.linear_fc1.bias")),
-                (blk.fc2, n("mlp.linear_fc2.weight")),
-                (blk.fc2_bias, n("mlp.linear_fc2.bias")),
-            ]:
-                reads.read(weight_, name)
-        mg = t.merger
-        for weight_, name in [
-            (mg.norm, v("merger.norm.weight")),
-            (mg.norm_bias, v("merger.norm.bias")),
-            (mg.fc1, v("merger.linear_fc1.weight")),
-            (mg.fc1_bias, v("merger.linear_fc1.bias")),
-            (mg.fc2, v("merger.linear_fc2.weight")),
-            (mg.fc2_bias, v("merger.linear_fc2.bias")),
-        ]:
-            reads.read(weight_, name)
+        read_tower(reads, m.tower, layout.tower, layout.mlx)
 
     if m.mtp != None:
         mtp = m.mtp
@@ -247,8 +169,8 @@ def gguf(m, reads):
         n = lambda s: "blk.{}.{}".format(l, s)
         reads.read_over(w.mixer_norm, n("attn_norm.weight"), minus_one)
         reads.read_over(w.mlp_norm, held([n("ffn_norm.weight"), n("post_attention_norm.weight")]), minus_one)
-        if w.mixer.attn:
-            a = w.mixer.a
+        if w.attn != None:
+            a = w.attn
             reads.read(a.qg_proj, n("attn_q.weight"))
             reads.read(a.k_proj, n("attn_k.weight"))
             reads.read(a.v_proj, n("attn_v.weight"))
@@ -256,7 +178,7 @@ def gguf(m, reads):
             reads.read_over(a.q_norm, n("attn_q_norm.weight"), minus_one)
             reads.read_over(a.k_norm, n("attn_k_norm.weight"), minus_one)
         else:
-            g = w.mixer.g
+            g = w.gdn
             k_w = 2 * g.k_heads * g.k_dim
             heads = g.v_heads
             width = g.v_dim
