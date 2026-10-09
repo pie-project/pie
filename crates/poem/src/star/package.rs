@@ -254,7 +254,7 @@ fn freeze(
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         module
-            .freeze_named(FrozenHeapName::user(format!("{package}/{file}")))
+            .freeze_named(FrozenHeapName::User(Box::new(format!("{package}/{file}"))))
             .map_err(|e| anyhow::anyhow!("{e:?}"))
     })?;
     modules.insert(file.to_string(), frozen);

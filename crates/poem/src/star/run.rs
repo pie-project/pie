@@ -9,6 +9,7 @@ use checkpoint::contract::ModelContract;
 use crate::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Trace, Value};
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
+use starlark::values::ValueLike;
 use starlark::values::structs::AllocStruct;
 use starlark::values::{Heap, Value as Star};
 
@@ -58,10 +59,9 @@ impl Package {
         module: &Module<'v>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Star<'v>> {
-        let layout = self
-            .module("model.poem")?
-            .get("layout")?
-            .add_to_heap(module.heap());
+        let layout = module
+            .heap()
+            .access_owned_frozen_value(&self.module("model.poem")?.get("layout")?);
         let heap = module.heap();
         eval.eval_function(layout, &[heap.alloc(id), deploy.alloc(heap)], &[])
             .map_err(error)
@@ -110,7 +110,7 @@ impl Package {
         Module::with_temp_heap(|module| {
             let mut eval = Evaluator::new(&module);
             let m = self.layout(id, deploy, &module, &mut eval)?;
-            let stating = stating.add_to_heap(module.heap());
+            let stating = module.heap().access_owned_frozen_value(&stating);
             let stated = eval.eval_function(stating, &[m], &[]).map_err(error)?;
             if stated.is_none() {
                 return Ok(None);
@@ -131,8 +131,12 @@ impl Package {
             let mut eval = Evaluator::new(&module);
             let m = self.layout(id, deploy, &module, &mut eval)?;
             let forward = self.module("forward.poem")?;
-            let caches = forward.get("caches")?.add_to_heap(module.heap());
-            let run = forward.get("forward")?.add_to_heap(module.heap());
+            let caches = module
+                .heap()
+                .access_owned_frozen_value(&forward.get("caches")?);
+            let run = module
+                .heap()
+                .access_owned_frozen_value(&forward.get("forward")?);
 
             TRAIL.with(|t| *t.borrow_mut() = Trail::default());
             let declared = eval
@@ -264,8 +268,8 @@ impl Package {
             let formats = self
                 .module("formats.poem")
                 .and_then(|f| f.get("formats"))
-                .map_err(|e| illegible(format!("{e:#}")))?
-                .add_to_heap(heap);
+                .map_err(|e| illegible(format!("{e:#}")))?;
+            let formats = heap.access_owned_frozen_value(&formats);
             let listed = eval
                 .eval_function(formats, &[m], &[])
                 .map_err(|e| illegible(format!("{e}")))?;

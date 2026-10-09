@@ -14,11 +14,12 @@ use allocative::Allocative;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::{GlobalsBuilder, Methods, MethodsBuilder};
 use starlark::starlark_simple_value;
+use starlark::values::ValueLike;
 use starlark::values::float::UnpackFloat;
 use starlark::values::list::UnpackList;
 use starlark::values::none::{NoneOr, NoneType};
 use starlark::values::structs::AllocStruct;
-use starlark::values::{Heap, NoSerialize, StarlarkPagableUnsupported, StarlarkValue, Value};
+use starlark::values::{Heap, NoSerialize, StarlarkValue, Value};
 use starlark_derive::{starlark_module, starlark_value};
 
 use crate::star::values::{DtypeValue, weight};
@@ -63,7 +64,7 @@ impl Read {
 }
 
 /// A tensor a read computes from the checkpoint's.
-#[derive(Debug, Clone, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative)]
+#[derive(Debug, Clone, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct ExprValue(#[allocative(skip)] pub(crate) Expr);
 
 starlark_simple_value!(ExprValue);
@@ -89,7 +90,7 @@ fn expr_of(v: Value<'_>) -> anyhow::Result<Expr> {
 
 /// A tensor a contract states whole: its name, what computes it, its shape
 /// and encoding, and what scales it.
-#[derive(Debug, Clone, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative)]
+#[derive(Debug, Clone, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct TensorValue(#[allocative(skip)] pub(crate) TensorContract);
 
 starlark_simple_value!(TensorValue);
@@ -104,7 +105,7 @@ impl fmt::Display for TensorValue {
 impl<'v> StarlarkValue<'v> for TensorValue {}
 
 /// How a tensor's bytes are stored.
-#[derive(Debug, Clone, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative)]
+#[derive(Debug, Clone, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct EncodingValue(#[allocative(skip)] pub(crate) Encoding);
 
 starlark_simple_value!(EncodingValue);
@@ -341,9 +342,7 @@ fn source<R>(f: impl FnOnce(&Snapshot) -> R) -> anyhow::Result<R> {
 }
 
 /// The checkpoint a format's test reads.
-#[derive(
-    Debug, Clone, Copy, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative,
-)]
+#[derive(Debug, Clone, Copy, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct SourceHandle;
 
 starlark_simple_value!(SourceHandle);
@@ -358,9 +357,7 @@ impl fmt::Display for SourceHandle {
 impl<'v> StarlarkValue<'v> for SourceHandle {}
 
 /// The reads of the format reading a checkpoint.
-#[derive(
-    Debug, Clone, Copy, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative,
-)]
+#[derive(Debug, Clone, Copy, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct ReadsHandle;
 
 starlark_simple_value!(ReadsHandle);
@@ -481,7 +478,7 @@ fn reads_methods(builder: &mut MethodsBuilder) {
 }
 
 /// A value a checkpoint states of the model it holds.
-#[derive(Debug, Clone, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative)]
+#[derive(Debug, Clone, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct StatedValue(#[allocative(skip)] pub(crate) Stated);
 
 starlark_simple_value!(StatedValue);

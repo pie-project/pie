@@ -8,13 +8,12 @@ use allocative::Allocative;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
 use starlark::starlark_simple_value;
+use starlark::values::ValueLike;
 use starlark::values::float::UnpackFloat;
 use starlark::values::list::UnpackList;
 use starlark::values::none::NoneOr;
 use starlark::values::tuple::UnpackTuple;
-use starlark::values::{
-    NoSerialize, StarlarkPagableUnsupported, StarlarkValue, UnpackValue, Value,
-};
+use starlark::values::{NoSerialize, StarlarkValue, UnpackValue, Value};
 use starlark_derive::{starlark_module, starlark_value};
 
 use crate::Stream;
@@ -24,7 +23,7 @@ use crate::generative::{
 };
 
 /// A fact of a generative model a layout states.
-#[derive(Debug, Clone, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative)]
+#[derive(Debug, Clone, ProvidesStaticType, NoSerialize, Allocative)]
 pub(crate) struct Stated(#[allocative(skip)] pub(crate) Fact);
 
 #[derive(Debug, Clone)]

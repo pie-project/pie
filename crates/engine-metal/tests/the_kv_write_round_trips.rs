@@ -217,6 +217,7 @@ fn the_kv_write_round_trips() {
         let cells = paging.pages() * u64::from(PAGE_SIZE);
         let width = (HEADS * HEAD_DIM) as u64;
         let kv_trace = |dtype: Dtype| Trace {
+            facts: Default::default(),
             name: String::from("kv_size_probe"),
             platform: Platform::Metal,
             params: Vec::new(),
@@ -228,6 +229,7 @@ fn the_kv_write_round_trips() {
                 space: 0,
                 window: None,
                 head_dim: HEAD_DIM as u32,
+                shard: Default::default(),
             }],
             values: Vec::new(),
             nodes: Vec::new(),
@@ -418,6 +420,7 @@ fn the_pre_estimate_sizes_packed_kv_exactly_at_any_head_dim() {
                 space: 0,
                 window: None,
                 head_dim,
+                shard: Default::default(),
             }],
             values: Vec::new(),
             nodes: Vec::new(),
