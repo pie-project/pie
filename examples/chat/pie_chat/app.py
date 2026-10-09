@@ -69,7 +69,7 @@ def split_lines(pieces: list[tuple]) -> list[list[tuple]]:
 def history_lines(chat: Chat) -> list[list[tuple]]:
     if _cache["key"] != chat.content_version:
         handler = wheel(chat)
-        pieces: list[tuple] = []
+        pieces: list[tuple] = list(banner(chat))
         for item in chat.transcript:
             if isinstance(item, Markdown):
                 pieces.extend(render(item.text))
@@ -79,13 +79,9 @@ def history_lines(chat: Chat) -> list[list[tuple]]:
     return _cache["history"]
 
 
-def header_rows(chat: Chat) -> int:
-    return sum(piece[1].count("\n") for piece in banner(chat))
-
-
 def visible_lines(chat: Chat) -> list[list[tuple]]:
     lines = history_lines(chat)
-    rows = max(1, shutil.get_terminal_size((80, 24)).lines - RESERVED_ROWS - header_rows(chat))
+    rows = max(1, shutil.get_terminal_size((80, 24)).lines - RESERVED_ROWS)
     chat.scroll_back = min(chat.scroll_back, max(0, len(lines) - rows))
     end = len(lines) - chat.scroll_back
     return lines[max(0, end - rows):end]
@@ -141,11 +137,6 @@ def build(chat: Chat) -> Application:
             event.app.exit()
 
     input_window = Window(content=BufferControl(buffer=chat.input), height=1, dont_extend_height=True)
-    header = Window(
-        content=FormattedTextControl(lambda: banner(chat)),
-        height=lambda: header_rows(chat),
-        dont_extend_height=True,
-    )
     output = Window(
         content=FormattedTextControl(lambda: visible_pieces(chat), get_cursor_position=lambda: cursor_at_end(chat)),
         wrap_lines=True,
@@ -160,7 +151,7 @@ def build(chat: Chat) -> Application:
     box = HSplit([rule, VSplit([prompt, input_window]), rule])
     mode = Window(content=FormattedTextControl(lambda: mode_line(chat)), height=1)
     chat.app = Application(
-        layout=Layout(HSplit([header, output, box, mode]), focused_element=input_window),
+        layout=Layout(HSplit([output, box, mode]), focused_element=input_window),
         key_bindings=bindings,
         style=STYLE,
         full_screen=True,
