@@ -313,24 +313,6 @@ def stop_engine(engine: subprocess.Popen) -> None:
         engine.kill()
 
 
-BOLD, RESET = "\033[1m", "\033[0m"
-TRUST_MARK = Path.home() / ".config" / "pie-chat" / "trusted"
-
-
-def trust_screen() -> None:
-    """A one-time, tongue-in-cheek first-run screen. Nothing here is a real permission."""
-    if TRUST_MARK.exists():
-        return
-    print(f"{BOLD}Accessing workspace:{RESET}\n")
-    print(f"{BOLD}{os.getcwd()}{RESET}\n")
-    print("Quick safety check: does this chat send anything out? Nope, data anyways does not leave your computer.\n")
-    print(f"{BOLD}❯ Continue{RESET}")
-    print("\033[2mEnter to confirm\033[0m\n")
-    input()
-    TRUST_MARK.parent.mkdir(parents=True, exist_ok=True)
-    TRUST_MARK.touch()
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Terminal chat on a running pie engine.")
     parser.add_argument("--url", default="http://127.0.0.1:8080", help="address of `pie serve`")
@@ -347,8 +329,6 @@ def main() -> None:
 
     backend = PlaceholderBackend() if args.placeholder else EngineBackend(args.url)
     os.system("cls" if os.name == "nt" else "clear")  # start on a clean screen, as the Claude CLI does
-    trust_screen()
-    os.system("cls" if os.name == "nt" else "clear")
     try:
         Chat(backend).build().run()
     finally:
