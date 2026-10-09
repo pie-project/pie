@@ -7,12 +7,13 @@ from prompt_toolkit.buffer import Buffer
 
 from .backend import PlaceholderBackend
 from .config import EXIT_WINDOW_SECONDS, FRAME_SECONDS, MODES, WARM_DELAY_SECONDS
+from .markdown import Markdown
 
 
 class Chat:
     def __init__(self, backend: PlaceholderBackend) -> None:
         self.backend = backend
-        self.transcript: list[tuple[str, str]] = []
+        self.transcript: list = []
         self.streaming = False
         self.app: Application | None = None
         self.frame = 0
@@ -53,10 +54,13 @@ class Chat:
         self.add("class:bold", f"❯ {text}\n\n")
         self.streaming = True
         self.add("class:accent", "● ")
+        answer = Markdown()
+        self.transcript.append(answer)
         started = time.monotonic()
         try:
             async for piece in self.backend.reply(text):
-                self.add("", piece)
+                answer.text += piece
+                self.redraw()
             self.add("", "\n\n")
             elapsed = round(time.monotonic() - started)
             done_at = datetime.now(timezone.utc).astimezone().strftime("%-I:%M %p")

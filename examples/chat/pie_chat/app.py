@@ -9,6 +9,7 @@ from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from .chat import Chat
 from .config import MODEL_NAME, MODES, PROMPT_COLOUR, STYLE
 from .engine import engine_version
+from .markdown import Markdown, render
 from .mascot import mascot_rows
 
 ENGINE_VERSION = engine_version()
@@ -37,7 +38,13 @@ def banner(chat: Chat) -> list[tuple[str, str]]:
 
 
 def transcript_pieces(chat: Chat) -> list[tuple[str, str]]:
-    return banner(chat) + chat.transcript
+    pieces = banner(chat)
+    for item in chat.transcript:
+        if isinstance(item, Markdown):
+            pieces.extend(render(item.text))
+        else:
+            pieces.append(item)
+    return pieces
 
 
 def cursor_at_end(chat: Chat) -> Point:
