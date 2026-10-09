@@ -11,15 +11,12 @@ FRAC_1_SQRT_2 = 0.70710677
 
 def caches(m, c):
     kv = c.kv_space(m.kv)
-    sliding = c.kv_space(m.kv, m.sliding.window)
+    spaces = [c.kv_space(m.kv, m.sliding.window), kv]
     for w in m.layers:
         if not w.attn.banks.shared:
-            if w.attn.reading == SLIDING:
-                space, head_dim, kv_heads = sliding, m.sliding.head_dim, m.sliding.kv_heads
-            else:
-                space, head_dim, kv_heads = kv, m.glob.head_dim, m.glob.kv_heads
+            head_dim, kv_heads, _ = geometry(m, w.attn.reading)
             plane = kv_heads * head_dim
-            c.kv(space, w.attn.kv, [plane, plane], head_dim, heads = True)
+            c.kv(spaces[w.attn.reading], w.attn.kv, [plane, plane], head_dim, heads = True)
     if m.draft != None:
         plane = m.glob.kv_heads * m.glob.head_dim
         c.kv(kv, m.draft.attn.kv, [plane, plane], m.glob.head_dim, heads = True)
@@ -31,27 +28,24 @@ def geometry(m, reading):
         return m.sliding.head_dim, m.sliding.kv_heads, m.sliding.window
     return m.glob.head_dim, m.glob.kv_heads, None
 
+def plans(m, input, plan):
+    """`plan` over `input` for each reading, indexed by it."""
+    return [
+        plan(input, m.q_heads, m.sliding.kv_heads, m.sliding.head_dim, m.sliding.window),
+        plan(input, m.q_heads, m.glob.kv_heads, m.glob.head_dim, None),
+    ]
+
 def forward(m, inputs):
     classes = [fact.has(fact.Mask), fact.scores(), fact.single_token()]
     dr = m.dflash
-    if dr != None:
-        _ = inputs.on(block_rows(dr))
-        trunk_inputs = inputs.on(~block_rows(dr))
-    else:
-        trunk_inputs = inputs
+    trunk_inputs = inputs.on(~block_rows(dr)) if dr != None else inputs
     ([input_m, input_s, input_d], input_p) = trunk_inputs.partition(classes)
     positions = trunk_inputs.positions()
 
-    def plans(input, plan):
-        return [
-            plan(input, m.q_heads, m.sliding.kv_heads, m.sliding.head_dim, m.sliding.window),
-            plan(input, m.q_heads, m.glob.kv_heads, m.glob.head_dim, None),
-        ]
-
-    plan_m = plans(input_m, ops.attn.plan_prefill)
-    plan_d = plans(input_d, ops.attn.plan_decode)
-    plan_p = plans(input_p, ops.attn.plan_prefill)
-    plan_s = plans(input_s, ops.attn.plan_prefill)
+    plan_m = plans(m, input_m, ops.attn.plan_prefill)
+    plan_d = plans(m, input_d, ops.attn.plan_decode)
+    plan_p = plans(m, input_p, ops.attn.plan_prefill)
+    plan_s = plans(m, input_s, ops.attn.plan_prefill)
     mask = inputs.mask()
 
     towered = tower(inputs, m.tower) if m.tower != None else None
@@ -138,14 +132,8 @@ def forward(m, inputs):
                 x.top_k,
             )
             moe_in = ops.elemwise.rmsnorm(y, x.pre_ffw_norm_2, x.pre_ffw_norm_2_eps)
-
-            def select(act, bank):
-                if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
-                    return ops.linear.moe_matmul_select(act, bank, experts, x.top_k)
-                return ops.linear.moe_matmul_select_quant(act, bank, experts, x.top_k)
-
-            hidden = ops.linear.mlp_geglu_tanh_packed(select(moe_in, x.gate_up), x.inter)
-            routed = ops.linear.moe_weighted_sum(select(hidden, x.down), weights)
+            hidden = ops.linear.mlp_geglu_tanh_packed(ops.linear.moe_matmul_select_quant(moe_in, x.gate_up, experts, x.top_k), x.inter)
+            routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select_quant(hidden, x.down, experts, x.top_k), weights)
             h2 = ops.elemwise.rmsnorm(routed, x.post_ffw_norm_2, x.post_ffw_norm_2_eps)
             f = ops.elemwise.residual_add(h1, h2)
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(f, w.post_ffw_norm, w.post_ffw_norm_eps), y)
@@ -174,19 +162,19 @@ def forward(m, inputs):
         hb = arm(dr, inputs, tapped, h_block, mask, block_rows(dr))
         x = merge([hb, x])
     x = ops.layout.gather_rows(x, inputs.readout_rows())
-    logits = ops.linear.lm_head(x, m.embed)
-    if m.softcap != None:
-        logits = ops.attn.logit_softcap(logits, m.softcap)
+    logits = ops.attn.logit_softcap(ops.linear.lm_head(x, m.embed), m.softcap)
     if dr != None:
         plant_readout(dr, logits, inputs, hb, block_rows(dr))
 
     if m.draft != None:
-        eagle(m, inputs, x, logits, root)
+        eagle_draft(m, inputs, x, logits, root)
     if m.assistant != None:
-        assist(m, inputs, positions, x, logits, root)
+        assistant_draft(m, inputs, positions, x, logits, root)
     return logits
 
-def eagle(m, inputs, x, logits, root):
+def eagle_draft(m, inputs, x, logits, root):
+    """E4B's EAGLE head (`m.draft`) proposes one token from the trunk's last
+    hidden row and the token the trunk chose."""
     a = m.draft
     input_draft = inputs.on(fact.drafts())
     plan_draft = ops.attn.plan_prefill(input_draft, m.q_heads, m.glob.kv_heads, m.glob.head_dim, None)
@@ -197,66 +185,56 @@ def eagle(m, inputs, x, logits, root):
     dy = ops.elemwise.residual_add(ops.linear.matmul(e, a.fc_embed), ops.linear.matmul(dx, a.fc_hidden))
 
     normed = ops.elemwise.rmsnorm(dy, a.attn_norm, a.norm_eps)
-    o = draft_attn(normed, inputs, m, plan_draft, a)
+    at = a.attn
+    hd = m.glob.head_dim
+    pages = inputs.kv(at.kv)
+    q = qkv_unfused(normed, inputs.positions(), inputs, m, at, hd, m.glob.kv_heads, at.banks.qkv,
+                    at.banks.k_norm, at.banks.k_norm_eps, pages)
+    o = ops.attn.prefill(q, plan_draft, pages, None, hd, m.glob.kv_heads, at.sm_scale)
+    o = ops.linear.matmul(o, a.o_proj)
     dy = ops.elemwise.residual_add(ops.elemwise.rmsnorm(o, a.post_attn_norm, a.norm_eps), dy)
     mlp_in = ops.elemwise.rmsnorm(dy, a.pre_ffw_norm, a.norm_eps)
     act = ops.linear.mlp_geglu_tanh_packed(ops.linear.matmul(mlp_in, a.gate_up), a.inter)
     f = ops.linear.matmul(act, a.down)
     dy = ops.elemwise.residual_add(ops.elemwise.rmsnorm(f, a.post_ffw_norm, a.norm_eps), dy)
 
-    draft = ops.linear.lm_head(ops.elemwise.rmsnorm(dy, m.final_norm, m.final_norm_eps), m.embed)
-    if m.softcap != None:
-        draft = ops.attn.logit_softcap(draft, m.softcap)
+    draft = ops.attn.logit_softcap(ops.linear.lm_head(ops.elemwise.rmsnorm(dy, m.final_norm, m.final_norm_eps), m.embed), m.softcap)
     seam.at(seam.MTP, [draft])
     seam.at(seam.MTP_DRAFTS, [ops.layout.argmax([draft])])
 
-def assist(m, inputs, positions, x, logits, root):
+def assistant_draft(m, inputs, positions, x, logits, root):
+    """The MTP assistant (`m.assistant`) proposes one token from the trunk's
+    last hidden row and the token the trunk chose, attending the trunk's
+    last cache of each reading."""
     a = m.assistant
     input_draft = inputs.on(fact.drafts())
     dpos = positions.on(fact.drafts())
-    plans = [
-        ops.attn.plan_prefill(input_draft, m.q_heads, m.sliding.kv_heads, m.sliding.head_dim, m.sliding.window),
-        ops.attn.plan_prefill(input_draft, m.q_heads, m.glob.kv_heads, m.glob.head_dim, None),
-    ]
+    plan_draft = plans(m, input_draft, ops.attn.plan_prefill)
     dx = x.on(fact.drafts())
     dlogits = logits.on(fact.drafts())
     token = ops.layout.argmax([dlogits])
-    hidden = dx
-    chain = []
-    for step in range(a.depth):
-        e = ops.layout.embed(token, m.embed, m.vocab) * root
-        y = ops.elemwise.residual_add(ops.linear.matmul(e, a.pre_embed), ops.linear.matmul(hidden, a.pre_hidden))
-        for w in a.layers:
-            at = w.attn
-            d, kv_heads, win = geometry(m, at.reading)
-            pages = inputs.kv(at.kv)
-            normed = ops.elemwise.rmsnorm(y, w.attn_norm, a.norm_eps)
-            q = q_only(normed, dpos, m, at, d, at.banks.q_proj)
-            o = ops.attn.prefill(q, plans[at.reading], pages, win, d, kv_heads, at.sm_scale)
-            o = ops.linear.matmul(o, w.o_proj)
-            y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(o, w.post_attn_norm, a.norm_eps), y)
-            mlp_in = ops.elemwise.rmsnorm(y, w.pre_ffw_norm, a.norm_eps)
-            act = ops.linear.mlp_geglu_tanh_packed(ops.linear.matmul(mlp_in, w.gate_up), w.inter)
-            f = ops.linear.matmul(act, w.down)
-            y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(f, w.post_ffw_norm, a.norm_eps), y)
-            y = ops.elemwise.scale(w.scalar, y)
-        read = ops.elemwise.rmsnorm(y, a.norm, a.norm_eps)
-        draft = ops.linear.lm_head(read, a.embed)
-        if step == 0:
-            seam.at(seam.MTP, [draft])
-        token = ops.layout.argmax([draft])
-        hidden = ops.linear.matmul(read, a.post)
-        chain.append(draft)
-    seam.at(seam.MTP_DRAFTS, [ops.layout.argmax(chain)])
-
-def draft_attn(x, inputs, m, plan, a):
-    at = a.attn
-    d = m.glob.head_dim
-    pages = inputs.kv(at.kv)
-    q = qkv_unfused(x, inputs.positions(), inputs, m, at, d, m.glob.kv_heads, at.banks.qkv,
-                    at.banks.k_norm, at.banks.k_norm_eps, pages)
-    o = ops.attn.prefill(q, plan, pages, None, d, m.glob.kv_heads, at.sm_scale)
-    return ops.linear.matmul(o, a.o_proj)
+    e = ops.layout.embed(token, m.embed, m.vocab) * root
+    y = ops.elemwise.residual_add(ops.linear.matmul(e, a.pre_embed), ops.linear.matmul(dx, a.pre_hidden))
+    for w in a.layers:
+        at = w.attn
+        d, kv_heads, win = geometry(m, at.reading)
+        pages = inputs.kv(at.kv)
+        normed = ops.elemwise.rmsnorm(y, w.attn_norm, a.norm_eps)
+        q = q_only(normed, dpos, m, at, d, at.banks.q_proj)
+        o = ops.attn.prefill(q, plan_draft[at.reading], pages, win, d, kv_heads, at.sm_scale)
+        o = ops.linear.matmul(o, w.o_proj)
+        y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(o, w.post_attn_norm, a.norm_eps), y)
+        mlp_in = ops.elemwise.rmsnorm(y, w.pre_ffw_norm, a.norm_eps)
+        act = ops.linear.mlp_geglu_tanh_packed(ops.linear.matmul(mlp_in, w.gate_up), w.inter)
+        f = ops.linear.matmul(act, w.down)
+        y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(f, w.post_ffw_norm, a.norm_eps), y)
+        y = ops.elemwise.scale(w.scalar, y)
+    read = ops.elemwise.rmsnorm(y, a.norm, a.norm_eps)
+    draft = ops.linear.lm_head(read, a.embed)
+    seam.at(seam.MTP, [draft])
+    token = ops.layout.argmax([draft])
+    hidden = ops.linear.matmul(read, a.post)
+    seam.at(seam.MTP_DRAFTS, [ops.layout.argmax([draft])])
 
 def clipped(x, c):
     if c.clip == None:

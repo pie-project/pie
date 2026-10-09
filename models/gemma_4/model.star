@@ -15,17 +15,50 @@ CANVAS = 256
 ASSISTANT_HIDDEN = 1024
 ASSISTANT_INTER = 8192
 ASSISTANT_READINGS = [SLIDING, SLIDING, SLIDING, GLOBAL]
-ASSISTANT_DEPTH = 1
 
-def tower_e4b():
-    return struct(depth = 16, hidden = 768, heads = 12, inter = 3072, patch_width = 3 * 16 * 16,
-                  pool = 3, positions = 10240, out_hidden = 2560, theta = 100.0, norm_eps = 1e-6,
-                  sm_scale = 1.0, clipped = True, standardize = False)
+def trunk(hidden, layers, q_heads, kv_heads, global_kv_heads, inter, window, shared_tail = None, ple_dim = None, moe = None):
+    return struct(
+        hidden = hidden, layers = layers, q_heads = q_heads, kv_heads = kv_heads,
+        global_kv_heads = global_kv_heads, inter = inter, window = window,
+        shared_tail = shared_tail, ple_dim = ple_dim, moe = moe,
+        full_every = 6, head_dim = 256, global_head_dim = 512, global_rotary_dim = 128,
+        theta_local = 10000.0, theta_global = 1000000.0, sm_scale = 1.0, vocab = 262144,
+        softcap = 30.0, norm_eps = 1e-6,
+    )
 
-def tower_wide(out_hidden):
-    return struct(depth = 27, hidden = 1152, heads = 16, inter = 4304, patch_width = 3 * 16 * 16,
-                  pool = 3, positions = 10240, out_hidden = out_hidden, theta = 100.0, norm_eps = 1e-6,
-                  sm_scale = 1.0, clipped = False, standardize = True)
+def e4b(layers):
+    owned = 42 - 18
+    return trunk(hidden = 2560, layers = layers, q_heads = 8, kv_heads = 2, global_kv_heads = 2, inter = 10240,
+                 window = 512, shared_tail = layers - owned if layers > owned else None, ple_dim = 256)
+
+A4B = trunk(hidden = 2816, layers = 30, q_heads = 16, kv_heads = 8, global_kv_heads = 2, inter = 2112,
+            window = 1024, moe = struct(experts = 128, top_k = 8, inter = 704))
+
+TRUNKS = {
+    "gemma4-26b-a4b": A4B,
+    "gemma4-31b": trunk(hidden = 5376, layers = 60, q_heads = 32, kv_heads = 16, global_kv_heads = 4,
+                        inter = 21504, window = 1024),
+    "gemma4-e4b": e4b(42),
+    "gemma4-e4b-mini-l1": e4b(1),
+    "gemma4-e4b-mini-l6": e4b(6),
+    "gemma4-e4b-mini-l24": e4b(24),
+    "gemma4-e4b-mini-l30": e4b(30),
+    "gemma4-e4b-mini-l36": e4b(36),
+    "diffusiongemma-26b-a4b": A4B,
+}
+
+def vision_tower(depth, hidden, heads, inter, clipped, standardize):
+    return struct(depth = depth, hidden = hidden, heads = heads, inter = inter, clipped = clipped,
+                  standardize = standardize, patch_width = 3 * 16 * 16, pool = 3, positions = 10240,
+                  theta = 100.0, norm_eps = 1e-6, sm_scale = 1.0)
+
+WIDE_TOWER = vision_tower(depth = 27, hidden = 1152, heads = 16, inter = 4304, clipped = False, standardize = True)
+
+TOWERS = {
+    "gemma4-26b-a4b": WIDE_TOWER,
+    "gemma4-31b": WIDE_TOWER,
+    "gemma4-e4b": vision_tower(depth = 16, hidden = 768, heads = 12, inter = 3072, clipped = True, standardize = False),
+}
 
 DFLASH_26B_A4B = dflash_head(
     taps = [1, 6, 11, 17, 22, 27],
@@ -39,105 +72,25 @@ DFLASH_26B_A4B = dflash_head(
     mask_token = 4,
 )
 
-def e4b(layers = 42):
-    owned = 42 - 18
-    return dict(
-        hidden = 2560, layers = layers, full_every = 6, q_heads = 8, kv_heads = 2, head_dim = 256,
-        global_head_dim = 512, global_kv_heads = 2, global_rotary_dim = 128, theta_local = 10000.0,
-        theta_global = 1000000.0, sm_scale = 1.0, intermediate = 10240, vocab = 262144,
-        shared_tail = layers - owned if layers > owned else None,
-        ple_dim = 256, softcap = 30.0, window = 512, norm_eps = 1e-6, moe = None,
-    )
-
-def b31():
-    return dict(
-        hidden = 5376, layers = 60, full_every = 6, q_heads = 32, kv_heads = 16, head_dim = 256,
-        global_head_dim = 512, global_kv_heads = 4, global_rotary_dim = 128, theta_local = 10000.0,
-        theta_global = 1000000.0, sm_scale = 1.0, intermediate = 21504, vocab = 262144,
-        shared_tail = None, ple_dim = None, softcap = 30.0, window = 1024, norm_eps = 1e-6, moe = None,
-    )
-
-def a4b():
-    return dict(
-        hidden = 2816, layers = 30, full_every = 6, q_heads = 16, kv_heads = 8, head_dim = 256,
-        global_head_dim = 512, global_kv_heads = 2, global_rotary_dim = 128, theta_local = 10000.0,
-        theta_global = 1000000.0, sm_scale = 1.0, intermediate = 2112, vocab = 262144,
-        shared_tail = None, ple_dim = None, softcap = 30.0, window = 1024, norm_eps = 1e-6,
-        moe = struct(experts = 128, top_k = 8, inter = 704),
-    )
-
-MINIS = {
-    "gemma4-e4b-mini-l1": 1,
-    "gemma4-e4b-mini-l6": 6,
-    "gemma4-e4b-mini-l24": 24,
-    "gemma4-e4b-mini-l30": 30,
-    "gemma4-e4b-mini-l36": 36,
-}
-
-def dims(id, deploy):
-    """The dims `id`'s deployment `deploy` builds, and its weights: the
-    trunk's, the experts', the self-conditioning block's."""
-    vision = "vision" in deploy.parts
-    weights = deploy.weights
-    extra = dict(tower = None, self_cond = False, self_cond_w = None, draft = False,
-                 assistant = False, dflash = None)
-
-    def one():
-        if len(weights) != 1:
-            fail("{} stores its weights at one dtype, not {}".format(id, weights))
-        return weights[0]
-
-    if id == "gemma4-26b-a4b":
-        d = a4b()
-        if vision and deploy.drafter == None:
-            extra["tower"] = tower_wide(d["hidden"])
-        elif not vision and deploy.drafter == "mtp":
-            extra["assistant"] = True
-        elif not vision and deploy.drafter == "dflash":
-            extra["dflash"] = DFLASH_26B_A4B
-        elif vision or deploy.drafter != None:
-            fail("gemma4-26b-a4b does not ship {}".format(deploy))
-        w = one()
-        return d, extra, w, w
-    if id == "gemma4-31b":
-        d = b31()
-        if vision and deploy.drafter == None:
-            extra["tower"] = tower_wide(d["hidden"])
-        elif not vision and deploy.drafter == "mtp":
-            extra["assistant"] = True
-        elif vision or deploy.drafter != None:
-            fail("gemma4-31b does not ship {}".format(deploy))
-        w = one()
-        return d, extra, w, w
-    if id == "gemma4-e4b":
-        d = e4b()
-        if vision and deploy.drafter == None:
-            extra["tower"] = tower_e4b()
-        elif not vision and deploy.drafter == "eagle":
-            extra["draft"] = True
-        elif vision or deploy.drafter != None:
-            fail("gemma4-e4b does not ship {}".format(deploy))
-        w = one()
-        return d, extra, w, w
-    if id in MINIS:
-        w = one()
-        return e4b(MINIS[id]), extra, w, w
-    # diffusiongemma-26b-a4b
-    self_cond = "selfcond" in deploy.parts
-    extra["self_cond"] = True
-    if len(weights) == 1 and not self_cond:
-        return a4b(), extra, weights[0], weights[0]
-    if len(weights) == 2 and not self_cond:
-        return a4b(), extra, weights[0], weights[1]
-    if len(weights) == 3 and self_cond:
-        extra["self_cond_w"] = weights[2]
-        return a4b(), extra, weights[0], weights[1]
-    fail("diffusiongemma-26b-a4b does not ship {}".format(deploy))
-
 def layout(id, deploy):
-    d, extra, w, xw = dims(id, deploy)
-    d = struct(**d)
-    x = struct(**extra)
+    """`id`'s weights as `deploy` stores them: the trunk's at its first
+    dtype, the experts' at the second if it has one, DiffusionGemma's
+    self-conditioning block's at the third."""
+    d = TRUNKS[id]
+    weights = deploy.weights
+    drafter = deploy.drafter
+    vision = "vision" in deploy.parts
+    self_cond = id == "diffusiongemma-26b-a4b"
+    if self_cond:
+        if len(weights) not in ([3] if "selfcond" in deploy.parts else [1, 2]):
+            fail("{} does not ship {}".format(id, deploy))
+    elif len(weights) != 1:
+        fail("{} stores its weights at one dtype, not {}".format(id, weights))
+    if vision and drafter != None:
+        fail("{} does not ship {}".format(id, deploy))
+    w = weights[0]
+    xw = weights[1] if len(weights) > 1 else w
+    sw = weights[2] if len(weights) > 2 else w
     dense = compute(w)
     gate = dtype.u8g64 if w == dtype.u4g64 else w
     proj = dtype.u4g64tiled if w == dtype.u4g64 else w
@@ -165,7 +118,7 @@ def layout(id, deploy):
         head_dim, row_heads = (sliding.head_dim, sliding.kv_heads) if reading == SLIDING else (glob.head_dim, glob.kv_heads)
         q_w = d.q_heads * head_dim
         kv_w = row_heads * head_dim
-        iw = d.intermediate
+        iw = d.inter
         if shared_at(l):
             attn_banks = struct(shared = True, q_proj = weight(n("q_proj"), [q_w, hidden], proj).columns())
         else:
@@ -223,10 +176,8 @@ def layout(id, deploy):
         )
 
     tower = None
-    if x.tower != None:
-        t = x.tower
-        if t.out_hidden != hidden:
-            fail("a tower's projection lands a trunk row")
+    if vision:
+        t = TOWERS[id]
         th = t.hidden
         ti = t.inter
         head_dim = t.hidden // t.heads
@@ -280,12 +231,13 @@ def layout(id, deploy):
             std = struct(bias = vec1("std_bias", th), scale = vec1("std_scale", th)) if t.standardize else None,
         )
 
+    # E4B's EAGLE head.
     draft = None
-    if x.draft:
+    if drafter == "eagle":
         hd = glob.head_dim
         q_w = d.q_heads * hd
         kv_w = glob.kv_heads * hd
-        iw = d.intermediate
+        iw = d.inter
         an = lambda s: "aux." + s
         anorm = lambda s, length: weight(an(s), [length], dense)
         draft = struct(
@@ -315,8 +267,9 @@ def layout(id, deploy):
             norm_eps = d.norm_eps,
         )
 
+    # The MTP assistant of 26B-A4B and 31B.
     assistant = None
-    if x.assistant:
+    if drafter == "mtp":
         def last(want_full):
             for l in range(d.layers - 1, -1, -1):
                 if not shared_at(l) and full_at(l) == want_full:
@@ -352,7 +305,6 @@ def layout(id, deploy):
             )
 
         assistant = struct(
-            depth = ASSISTANT_DEPTH,
             pre_embed = weight("aux.pre_embed.weight", [ah, hidden], w),
             pre_hidden = weight("aux.pre_hidden.weight", [ah, hidden], w),
             post = weight("aux.post.weight", [hidden, ah], w),
@@ -362,9 +314,8 @@ def layout(id, deploy):
             layers = [assistant_layer(l, r) for l, r in enumerate(ASSISTANT_READINGS)],
         )
 
-    banded = not x.self_cond and env("PIE_NO_VOCAB_SHARD") == None
-    embed = weight("embed", [d.vocab, hidden], dense if x.self_cond else w)
-    if banded:
+    embed = weight("embed", [d.vocab, hidden], dense if self_cond else w)
+    if not self_cond:
         embed = embed.packed([d.vocab])
 
     ple = None
@@ -385,11 +336,10 @@ def layout(id, deploy):
             ) for l in range(d.layers)],
         )
 
-    self_cond = None
-    if x.self_cond:
-        iw = d.intermediate
-        sw = x.self_cond_w if x.self_cond_w != None else w
-        self_cond = struct(
+    self_cond_block = None
+    if self_cond:
+        iw = d.inter
+        self_cond_block = struct(
             taps = SELF_COND_TAPS,
             pre_norm = weight("self_cond.pre_norm", [hidden], dense),
             norm_eps = d.norm_eps,
@@ -414,8 +364,8 @@ def layout(id, deploy):
         final_norm_eps = d.norm_eps,
         draft = draft,
         assistant = assistant,
-        self_cond = self_cond,
-        dflash = dflash_declare(x.dflash, "aux", hidden, d.vocab, d.norm_eps, w, dense) if x.dflash != None else None,
+        self_cond = self_cond_block,
+        dflash = dflash_declare(DFLASH_26B_A4B, "aux", hidden, d.vocab, d.norm_eps, w, dense) if drafter == "dflash" else None,
     )
 
 def diffusion(m):

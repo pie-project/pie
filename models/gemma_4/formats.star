@@ -27,18 +27,8 @@ def formats(m):
         return [format("diffusion", read = lambda reads: safetensors(m, reads, LAYOUTS["diffusion"]))]
     arch = text_attribute("general.architecture") or ""
     return [
-        format(
-            "transformers",
-            recognizes = lambda checkpoint: has(LAYOUTS["transformers"].trunk + "embed_tokens.weight"),
-            read = lambda reads: safetensors(m, reads, LAYOUTS["transformers"]),
-            states = configured(m, "text_config."),
-        ),
-        format(
-            "mlx_lm",
-            recognizes = lambda checkpoint: has(LAYOUTS["mlx_lm"].trunk + "embed_tokens.weight"),
-            read = lambda reads: safetensors(m, reads, LAYOUTS["mlx_lm"]),
-            states = configured(m, "text_config."),
-        ),
+        safetensors_format(m, "transformers"),
+        safetensors_format(m, "mlx_lm"),
         format(
             "gguf",
             recognizes = lambda checkpoint: text_attribute("general.architecture") != None,
@@ -46,6 +36,15 @@ def formats(m):
             states = attributed(m, arch),
         ),
     ]
+
+def safetensors_format(m, name):
+    layout = LAYOUTS[name]
+    return format(
+        name,
+        recognizes = lambda checkpoint: has(layout.trunk + "embed_tokens.weight"),
+        read = lambda reads: safetensors(m, reads, layout),
+        states = configured(m, "text_config."),
+    )
 
 def configured(m, at):
     """The shape a transformers configuration states of this model, its text
