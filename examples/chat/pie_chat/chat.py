@@ -1,0 +1,88 @@
+import asyncio
+import time
+from datetime import datetime, timezone
+
+from prompt_toolkit.application import Application
+from prompt_toolkit.buffer import Buffer
+
+from .backend import PlaceholderBackend
+from .config import EXIT_WINDOW_SECONDS, FRAME_SECONDS, MODES
+
+
+class Chat:
+    def __init__(self, backend: PlaceholderBackend) -> None:
+        self.backend = backend
+        self.transcript: list[tuple[str, str]] = []
+        self.streaming = False
+        self.app: Application | None = None
+        self.frame = 0
+        self.exit_armed = False
+        self.exit_key = ""
+        self.mode = 0
+        self.input = Buffer(multiline=False)
+        self.input.accept_handler = self.on_enter
+
+    def add(self, style: str, text: str) -> None:
+        self.transcript.append((style, text))
+        self.redraw()
+
+    def redraw(self) -> None:
+        if self.app:
+            self.app.invalidate()
+
+    def cycle_mode(self) -> None:
+        self.mode = (self.mode + 1) % len(MODES)
+        self.redraw()
+
+    async def send(self, text: str) -> None:
+        self.add("class:bold", f"❯ {text}\n\n")
+        self.streaming = True
+        self.add("class:accent", "● ")
+        started = time.monotonic()
+        try:
+            async for piece in self.backend.reply(text):
+                self.add("", piece)
+            self.add("", "\n\n")
+            elapsed = round(time.monotonic() - started)
+            done_at = datetime.now(timezone.utc).astimezone().strftime("%-I:%M %p")
+            self.add("class:dim", f"✻ Done for {elapsed}s · done {done_at}\n\n")
+        except RuntimeError as error:
+            self.add("class:error", f"\n  could not reach the engine: {error}\n")
+            self.add("class:dim", "  start it with `pie serve`, then send the message again.\n\n")
+        finally:
+            self.streaming = False
+            self.redraw()
+
+    def on_enter(self, buffer: Buffer) -> bool:
+        text = buffer.text.strip()
+        buffer.reset()
+        if not text:
+            return False
+        if text == "/new":
+            self.transcript.clear()
+            self.backend.reset()
+            self.add("class:dim", "(new conversation)\n\n")
+            return False
+        if self.app:
+            self.app.create_background_task(self.send(text))
+        return False
+
+    def press_exit_key(self, key: str) -> bool:
+        if self.exit_armed and self.exit_key == key:
+            return True
+        self.exit_armed = True
+        self.exit_key = key
+        self.redraw()
+        asyncio.get_running_loop().call_later(EXIT_WINDOW_SECONDS, self.disarm_exit)
+        return False
+
+    def disarm_exit(self) -> None:
+        self.exit_armed = False
+        self.exit_key = ""
+        self.redraw()
+
+    async def animate(self) -> None:
+        while True:
+            await asyncio.sleep(FRAME_SECONDS)
+            self.frame += 1
+            self.redraw()

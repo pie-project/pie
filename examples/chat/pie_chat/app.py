@@ -1,0 +1,98 @@
+import os
+
+from prompt_toolkit.application import Application
+from prompt_toolkit.data_structures import Point
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
+from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+
+from .chat import Chat
+from .config import MODEL_NAME, MODES, PROMPT_COLOUR, STYLE
+from .engine import engine_version
+from .mascot import mascot_rows
+
+ENGINE_VERSION = engine_version()
+MASCOT_WIDTH = 10
+GAP = " "
+
+
+def banner(chat: Chat) -> list[tuple[str, str]]:
+    mascot = mascot_rows(chat.frame)
+    info = [
+        [],
+        [("class:bold", "Pie Code"), ("class:dim", f" v{ENGINE_VERSION}")],
+        [("class:dim", f"{MODEL_NAME} · this Mac")],
+        [("class:dim", os.getcwd())],
+    ]
+    blank = [("", " " * MASCOT_WIDTH)]
+    pieces: list[tuple[str, str]] = []
+    for row in range(max(len(mascot), len(info))):
+        pieces.extend(mascot[row] if row < len(mascot) else blank)
+        pieces.append(("", GAP))
+        if row < len(info):
+            pieces.extend(info[row])
+        pieces.append(("", "\n"))
+    pieces.append(("", "\n"))
+    return pieces
+
+
+def transcript_pieces(chat: Chat) -> list[tuple[str, str]]:
+    return banner(chat) + chat.transcript
+
+
+def cursor_at_end(chat: Chat) -> Point:
+    text = "".join(t for _, t in transcript_pieces(chat))
+    return Point(x=0, y=text.count("\n"))
+
+
+def mode_line(chat: Chat) -> list[tuple[str, str]]:
+    if chat.exit_armed:
+        return [("class:dim", f"  Press Ctrl-{chat.exit_key} again to exit")]
+    icon, label, colour = MODES[chat.mode]
+    return [(f"fg:{colour}", f"  {icon} {label}"), ("class:dim", " (shift+tab to cycle)")]
+
+
+def build(chat: Chat) -> Application:
+    bindings = KeyBindings()
+
+    @bindings.add("s-tab")
+    def _(event):
+        chat.cycle_mode()
+
+    @bindings.add("c-d")
+    def _(event):
+        if chat.input.text:
+            return
+        if chat.press_exit_key("D"):
+            event.app.exit()
+
+    @bindings.add("c-c")
+    def _(event):
+        if chat.input.text:
+            chat.input.reset()
+            return
+        if chat.press_exit_key("C"):
+            event.app.exit()
+
+    input_window = Window(content=BufferControl(buffer=chat.input), height=1, dont_extend_height=True)
+    output = Window(
+        content=FormattedTextControl(lambda: transcript_pieces(chat), get_cursor_position=lambda: cursor_at_end(chat)),
+        wrap_lines=True,
+        always_hide_cursor=True,
+    )
+    rule = Window(height=1, char="─", style="class:rule")
+    prompt = Window(
+        content=FormattedTextControl(lambda: [(f"fg:{PROMPT_COLOUR} bold", "❯ ")]),
+        width=2,
+        dont_extend_width=True,
+    )
+    box = HSplit([rule, VSplit([prompt, input_window]), rule])
+    mode = Window(content=FormattedTextControl(lambda: mode_line(chat)), height=1)
+    chat.app = Application(
+        layout=Layout(HSplit([output, box, mode]), focused_element=input_window),
+        key_bindings=bindings,
+        style=STYLE,
+        full_screen=True,
+        mouse_support=False,
+    )
+    return chat.app
