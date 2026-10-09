@@ -21,4 +21,4 @@ def _render(text: str, width: int) -> list[tuple[str, str]]:
     buffer = io.StringIO()
     console = Console(file=buffer, force_terminal=True, color_system="truecolor", width=width)
     console.print(RichMarkdown(text), end="")
-    return to_formatted_text(ANSI(buffer.getvalue()))
+    return to_formatted_text(ANSI(buffer.getvalue().rstrip("\n")))
