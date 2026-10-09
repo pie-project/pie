@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use pie::{compose, derive, ops, ui};
+use pie::{derive, ops, ui};
 #[derive(Parser, Debug)]
 #[command(
     name = "pie",
@@ -139,7 +139,7 @@ async fn serve(global: bootstrap::GlobalArgs, diag: Option<&str>) -> anyhow::Res
     if let Some(words) = diag {
         worker.state_diagnostics(words)?;
     }
-    let handle = compose::run_standalone(controller, gateway, worker).await?;
+    let handle = pie::run_standalone(controller, gateway, worker).await?;
     tracing::info!(
         listen = %handle.listen_addr,
         worker = %handle.worker_addr,

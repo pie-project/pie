@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 
-use crate::boot::BootConfig;
+use worker::embedded::Settings;
 
 /// A WebGPU device with the boot document the engine opens on it.
 pub struct Device {
@@ -10,9 +10,9 @@ pub struct Device {
     doc: String,
 }
 
-/// The page's boot config: the host-neutral `BootConfig` plus the two keys
+/// The page's boot config: the host-neutral `Settings` plus the two keys
 /// only the WebGPU engine reads.
-pub fn parse_config(text: &str) -> Result<(BootConfig, String)> {
+pub fn parse_config(text: &str) -> Result<(Settings, String)> {
     let mut document: serde_json::Value = if text.trim_start().starts_with('{') {
         serde_json::from_str(text)?
     } else {
@@ -31,7 +31,7 @@ pub fn parse_config(text: &str) -> Result<(BootConfig, String)> {
         .map(serde_json::from_value)
         .transpose()?
         .unwrap_or_else(|| "high-performance".into());
-    let config: BootConfig = serde_json::from_value(document).context("parse the boot config")?;
+    let config: Settings = serde_json::from_value(document).context("parse the boot config")?;
     let mut doc = format!(
         "[wgpu]\nadapter_index = 0\ngpu_mem_utilization = {:?}\npower_preference = {}\n",
         config.gpu_mem_utilization,

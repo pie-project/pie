@@ -2,10 +2,10 @@ package org.pieproject.server
 
 internal object NativeCore {
     init {
-        System.loadLibrary("pie_server")
+        System.loadLibrary("pie_jni")
     }
 
-    external fun start(artifact: String, config: String, home: String): Long
+    external fun start(artifact: String, config: String, home: String, listen: String?): Long
     external fun summary(handle: Long): String
     external fun install(handle: Long, program: ByteArray, file: String, version: String?): String
     external fun installLanguage(handle: Long, language: String, component: ByteArray)

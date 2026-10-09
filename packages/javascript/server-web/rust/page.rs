@@ -236,7 +236,7 @@ pub fn pie_close_session(session: u32) {
 
 #[wasm_bindgen]
 pub fn pie_send_frame(session: u32, frame: js_sys::Uint8Array) -> Result<(), JsError> {
-    runtime::embed::send_frame(session, &frame.to_vec())
+    worker::embedded::send_frame(session, &frame.to_vec())
         .map_err(|e| JsError::new(&format!("{e:#}")))
 }
 
@@ -245,7 +245,7 @@ pub fn pie_recv_frames(session: u32, max_wait_ms: u32, max: u32) -> js_sys::Prom
     promise(async move {
         let frames = js_sys::Array::new();
         for bytes in
-            runtime::embed::recv_frames(session, u64::from(max_wait_ms), max as usize).await?
+            worker::embedded::recv_frames(session, u64::from(max_wait_ms), max as usize).await?
         {
             frames.push(&js_sys::Uint8Array::from(bytes.as_slice()));
         }

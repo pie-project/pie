@@ -17,10 +17,11 @@ extern "C" {
 
 typedef struct PieServer PieServer;
 
-/* Boots `artifact` (a `.metal.zt`). `config` is a runtime::embed::BootConfig
-   as TOML or JSON, or NULL; `home` is a writable directory. One per process. */
+/* Boots `artifact` (a `.metal.zt`). `config` is worker::embedded::Settings
+   as TOML or JSON, or NULL; `home` is a writable directory; `listen`
+   (`host:port`, or NULL) also serves pie's gateway there. One per process. */
 PieServer *pie_server_start(const char *artifact, const char *config,
-                            const char *home, char **error);
+                            const char *home, const char *listen, char **error);
 
 /* The boot summary as JSON; valid until pie_server_free. */
 const char *pie_server_summary(const PieServer *server);

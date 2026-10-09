@@ -14,8 +14,8 @@ path = "rust/lib.rs"
 
 [dependencies]
 runtime = { path = "../../../crates/runtime", features = ["wgpu"] }
+worker = { path = "../../../crates/worker", default-features = false, features = ["wgpu"] }
 engine-wgpu = { path = "../../../crates/engine-wgpu", features = ["wgpu"] }
-poem-ir = { package = "pie-poem-ir", path = "../../../crates/poem-ir" }
 ztensor = { workspace = true }
 web-std = { path = "../../../crates/web-std" }
 wasmtime-web = { path = "../../../crates/wasmtime-web" }

@@ -3,7 +3,7 @@ name = "pie-swift-core"
 version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "The C core of the Swift `PieServer`: a runtime::embed::Server on the Metal engine, behind include/pie_server.h."
+description = "The C core of the Swift `PieServer`: a worker::Server on the Metal engine, behind include/pie_server.h."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -13,8 +13,7 @@ crate-type = ["staticlib", "rlib"]
 path = "src/lib.rs"
 
 [dependencies]
-runtime = { path = "../../../crates/runtime", features = ["metal"] }
-builtins = { path = "../../../crates/builtins" }
+worker = { path = "../../../crates/worker", default-features = false, features = ["metal", "standalone"] }
 serde_json = "1"
 anyhow = "1.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

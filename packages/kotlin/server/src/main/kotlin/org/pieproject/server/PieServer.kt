@@ -33,7 +33,7 @@ public class PieServer private constructor(private val handle: Long) : AutoClose
         @SerialName("max_tokens") public val maxTokens: Int,
     )
 
-    /** The boot configuration (`runtime::embed::BootConfig`), sized for a phone. */
+    /** The boot configuration (`worker::embedded::Settings`), sized for a phone. */
     @Serializable
     public class Configuration internal constructor() {
         /** Share of the device's GPU memory the engine may use. */
@@ -73,17 +73,20 @@ public class PieServer private constructor(private val handle: Long) : AutoClose
         /**
          * Boots [model] (a `.vulkan.zt` from `pie model import`) with [languages]
          * installed; [home] (such as `File(context.cacheDir, "pie")`) holds the
-         * inferlet cache. One server per process.
+         * inferlet cache. With [listen] (`"127.0.0.1:8080"`) pie's gateway also
+         * serves it there: its WebSocket and the OpenAI-compatible HTTP routes.
+         * One server per process.
          */
         public suspend fun start(
             model: File,
             home: File,
             languages: List<Language> = emptyList(),
+            listen: String? = null,
             configure: Configuration.() -> Unit = {},
         ): PieServer = withContext(Dispatchers.IO) {
             home.mkdirs()
             val config = json.encodeToString(Configuration.serializer(), Configuration().apply(configure))
-            val server = PieServer(NativeCore.start(model.path, config, home.path))
+            val server = PieServer(NativeCore.start(model.path, config, home.path, listen))
             languages.forEach { server.install(it) }
             server
         }

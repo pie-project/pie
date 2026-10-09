@@ -1,10 +1,15 @@
+#[cfg(feature = "net")]
 use std::net::IpAddr;
+#[cfg(feature = "net")]
 use std::sync::Arc;
+#[cfg(feature = "net")]
 use std::sync::atomic::{AtomicU32, Ordering};
 
+#[cfg(feature = "net")]
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "net")]
 use crate::backend::ModelEngines;
 
 #[repr(u32)]
@@ -21,12 +26,14 @@ pub struct ModelIdentity {
     pub component: ModelComponent,
 }
 
+#[cfg(feature = "net")]
 #[derive(Default)]
 pub(crate) struct ExecutorStats {
     inflight: AtomicU32,
     leased_pages: AtomicU32,
 }
 
+#[cfg(feature = "net")]
 impl ExecutorStats {
     pub(crate) fn inflight(&self) -> u32 {
         self.inflight.load(Ordering::Relaxed)
@@ -41,12 +48,14 @@ impl ExecutorStats {
     }
 }
 
+#[cfg(feature = "net")]
 pub(crate) struct ExecutorServer {
     endpoint: String,
     stats: Arc<ExecutorStats>,
     total_pages: u32,
 }
 
+#[cfg(feature = "net")]
 impl ExecutorServer {
     pub(crate) async fn bind_with_transfer(
         addr: &str,
@@ -78,6 +87,7 @@ impl ExecutorServer {
     pub(crate) async fn shutdown(self) {}
 }
 
+#[cfg(feature = "net")]
 pub(crate) async fn connect_with_local_ip(addr: &str) -> Result<((), IpAddr)> {
     Err(anyhow!(
         "cannot dial executor {addr}: remote executors are not supported in this release"

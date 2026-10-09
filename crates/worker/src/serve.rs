@@ -1,21 +1,16 @@
 mod banner;
 use banner::StartupBanner;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use controller_api::{ControlClient, Role, WorkerInfo};
 use ids::WorkerId;
-use std::path::Path;
 
-use crate::backend::flavor::Flavor;
-use crate::backend::{EngineCapabilities, EngineOptions};
-use crate::backend::{GroupEngine, ModelEngines};
+use crate::boot::{self, Booted, LoadedPartnerMetadata, Summary};
 use crate::config;
 use crate::executor::ExecutorServer;
 use crate::link::client;
 use crate::link::control::{self, ControlLink};
 use crate::link::{gateway, partner, topology};
-use crate::translate;
-use crate::weights;
 
 pub use crate::link::topology::{Coordinator, TopologyMode, connect};
 
@@ -53,6 +48,7 @@ pub struct RuntimeHandle {
     partners: Option<std::sync::Arc<tokio::sync::Mutex<partner::PartnerLinkManager>>>,
     control_plane: ClusterControl,
     pub url: String,
+    pub summary: Summary,
 }
 
 enum ClusterControl {
@@ -133,6 +129,14 @@ impl WorkerHandle {
         }
     }
 
+    /// What booted, for a decode worker.
+    pub fn summary(&self) -> Option<&Summary> {
+        match &self.inner {
+            WorkerKind::Decode(engine) => Some(&engine.summary),
+            WorkerKind::Executor(_) => None,
+        }
+    }
+
     pub async fn shutdown(self) {
         match self.inner {
             WorkerKind::Decode(engine) => engine.shutdown().await,
@@ -197,175 +201,6 @@ pub fn build_runtime(user_cfg: &config::Config) -> Result<tokio::runtime::Runtim
         .context("building tokio runtime")
 }
 
-struct LoadedModelEngines {
-    model: String,
-    caps: EngineCapabilities,
-    full_identity: crate::executor::ModelIdentity,
-    encode_identity: crate::executor::ModelIdentity,
-    kv_handle: Option<engine::KvHandle>,
-    engines: ModelEngines,
-    metadata: runtime::model::ModelMetadata,
-}
-
-struct LoadedPartnerMetadata {
-    full_identity: crate::executor::ModelIdentity,
-    encode_identity: crate::executor::ModelIdentity,
-    kv_handle: Option<engine::KvHandle>,
-    page_size: u32,
-    supports_media_encode: bool,
-    hidden_size: u32,
-}
-
-fn load_model_engines(
-    user_cfg: &config::Config,
-    component: crate::executor::ModelComponent,
-) -> Result<LoadedModelEngines> {
-    let engine_cache_dir = crate::disk::engine_cache_dir();
-
-    let (engine_groups, snapshot_dir, metadata) = {
-        let m = &user_cfg.model;
-        let flavor = crate::backend::flavor::resolve(m.engine.kind, &m.name)?;
-
-        let world_size = m.engine.device.len();
-        let tp_degree = if m.engine.tensor_parallel_size == 0 {
-            world_size
-        } else {
-            m.engine.tensor_parallel_size as usize
-        };
-        let topology = crate::backend::calculate_topology(world_size, tp_degree)
-            .with_context(|| format!("model {:?} topology", m.name))?;
-
-        #[allow(unreachable_patterns)]
-        if tp_degree > 1 {
-            match flavor {
-                #[cfg(feature = "cuda")]
-                Flavor::Cuda => {}
-                _ => anyhow::bail!(
-                    "model {:?}: tensor_parallel_size={tp_degree} is only \
-                     supported for cuda_native",
-                    m.name,
-                ),
-            }
-        }
-
-        let mut embedded_base_opts = crate::backend::build_options(m, flavor)?;
-        apply_embedded_verbose(&mut embedded_base_opts, user_cfg.server.verbose);
-        let resolved_model = weights::resolve(
-            &m.model,
-            weights::Want {
-                backend: Some(flavor.as_str()),
-                sku: m.sku.as_deref(),
-            },
-        )
-        .with_context(|| format!("resolving the model for {:?}", m.name))?;
-        let lifted = resolved_model
-            .metadata()
-            .with_context(|| format!("reading the model metadata for {:?}", m.name))?;
-        let snapshot_dir = resolved_model.path().to_path_buf();
-        let mut group_engines: Vec<GroupEngine> = Vec::with_capacity(topology.len());
-        for (group_idx, group) in topology.iter().enumerate() {
-            group_engines.push(create_engine_group(
-                m,
-                group_idx,
-                group,
-                flavor,
-                &embedded_base_opts,
-                &snapshot_dir,
-                &engine_cache_dir,
-                tp_degree,
-                component,
-                u8::try_from(user_cfg.runtime.frame_dispatch_depth).unwrap_or(u8::MAX),
-            )?);
-        }
-        (
-            ModelEngines {
-                groups: group_engines,
-            },
-            snapshot_dir,
-            lifted,
-        )
-    };
-
-    let caps = engine_groups
-        .groups
-        .first()
-        .map(|group| group.caps.clone())
-        .context("no engine capabilities available for control-plane registration")?;
-    let kv_handle = engine_groups
-        .groups
-        .first()
-        .and_then(|group| group.backend.export_kv_handle());
-    let artifact_digest = if user_cfg.cluster.controller.is_some() || user_cfg.offload.enabled {
-        weights::model_artifact_digest(&snapshot_dir)?
-    } else {
-        *blake3::hash(user_cfg.model.model.as_bytes()).as_bytes()
-    };
-    Ok(LoadedModelEngines {
-        metadata,
-        model: user_cfg.model.name.clone(),
-        full_identity: weights::model_identity(
-            user_cfg,
-            &caps,
-            &artifact_digest,
-            crate::executor::ModelComponent::Full,
-        )?,
-        encode_identity: weights::model_identity(
-            user_cfg,
-            &caps,
-            &artifact_digest,
-            crate::executor::ModelComponent::Encode,
-        )?,
-        caps,
-        kv_handle,
-        engines: engine_groups,
-    })
-}
-
-async fn boot_engine(
-    user_cfg: &config::Config,
-) -> Result<(
-    String,
-    LoadedPartnerMetadata,
-    runtime::bootstrap::BootstrapHandle,
-)> {
-    let LoadedModelEngines {
-        model,
-        caps,
-        full_identity,
-        encode_identity,
-        kv_handle,
-        engines,
-        metadata,
-    } = load_model_engines(user_cfg, crate::executor::ModelComponent::Full)?;
-    let metadata_hidden_size: u32 = serde_json::from_slice::<serde_json::Value>(&metadata.config)
-        .ok()
-        .and_then(|config| config.get("hidden_size")?.as_u64())
-        .and_then(|size| u32::try_from(size).ok())
-        .unwrap_or(0);
-
-    let boot_cfg = translate::build(user_cfg, engines, metadata)
-        .context("translating to bootstrap::Config")?;
-
-    let boot = runtime::bootstrap::bootstrap(boot_cfg)
-        .await
-        .map_err(|e| anyhow!("runtime::bootstrap::bootstrap: {e}"))?;
-    let page_size = caps.pools.kv_page_size;
-    let supports_media_encode = caps.media_encode;
-    let hidden_size = metadata_hidden_size;
-    Ok((
-        model,
-        LoadedPartnerMetadata {
-            full_identity,
-            encode_identity,
-            kv_handle,
-            page_size,
-            supports_media_encode,
-            hidden_size,
-        },
-        boot,
-    ))
-}
-
 async fn boot_executor(
     user_cfg: &config::Config,
     coordinator: &Coordinator,
@@ -385,7 +220,7 @@ async fn boot_executor(
     } else {
         crate::executor::ModelComponent::Full
     };
-    let loaded = load_model_engines(user_cfg, component)?;
+    let loaded = boot::load_model_engines(user_cfg, component, None)?;
     let model_identity = if role == Role::Encode {
         loaded.encode_identity.clone()
     } else {
@@ -446,10 +281,9 @@ pub async fn start_runtime(
     user_cfg: config::Config,
     coordinator: Coordinator,
 ) -> Result<RuntimeHandle> {
-    let (model, partner_metadata, runtime) = boot_engine(&user_cfg).await?;
-    let partner_bootstrap = build_partner_bootstrap(&user_cfg, partner_metadata, runtime.model_idx);
+    let (booted, partner_bootstrap) = boot_decode(&user_cfg).await?;
     let (edge_server, control_tasks, control_plane, partners, url) =
-        assemble_control_and_edge(coordinator, &user_cfg, model, partner_bootstrap).await?;
+        assemble_control_and_edge(coordinator, &user_cfg, booted.model, partner_bootstrap).await?;
     log_serving(&user_cfg, &url);
     Ok(RuntimeHandle {
         url,
@@ -457,7 +291,8 @@ pub async fn start_runtime(
         control_tasks,
         partners,
         control_plane,
-        runtime: Some(runtime),
+        runtime: Some(booted.runtime),
+        summary: booted.summary,
     })
 }
 
@@ -467,14 +302,13 @@ pub async fn start_runtime_embedded<C: ControlLink>(
     gateways: Vec<String>,
     client_edge: Option<String>,
 ) -> Result<RuntimeHandle> {
-    let (model, partner_metadata, runtime) = boot_engine(&user_cfg).await?;
-    let partner_bootstrap = build_partner_bootstrap(&user_cfg, partner_metadata, runtime.model_idx);
+    let (booted, partner_bootstrap) = boot_decode(&user_cfg).await?;
     let addr = topology::addr_from_host_port(&user_cfg.server.host, user_cfg.server.port);
     let (edge_server, control_tasks, worker_id, partners) = assemble_distributed(
         control,
         &gateways,
         Role::Decode,
-        model,
+        booted.model,
         addr,
         partner_bootstrap,
     )
@@ -487,8 +321,27 @@ pub async fn start_runtime_embedded<C: ControlLink>(
         control_tasks,
         partners,
         control_plane: ClusterControl::Embedded { worker_id },
-        runtime: Some(runtime),
+        runtime: Some(booted.runtime),
+        summary: booted.summary,
     })
+}
+
+/// Boots a decode worker on its configured engine, with offload set up.
+async fn boot_decode(
+    user_cfg: &config::Config,
+) -> Result<(Booted, Option<partner::PartnerBootstrap>)> {
+    let mut booted = boot::boot(
+        user_cfg,
+        boot::Engine::Configured,
+        crate::translate::builtins(),
+    )
+    .await?;
+    let metadata = booted
+        .partner
+        .take()
+        .context("a configured engine reports its partner metadata")?;
+    let partner = build_partner_bootstrap(user_cfg, metadata, booted.runtime.model_idx);
+    Ok((booted, partner))
 }
 
 fn build_partner_bootstrap(
@@ -631,159 +484,6 @@ async fn assemble_distributed<C: ControlLink>(
         worker_id,
         partners,
     ))
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "independent inputs to one engine launch; a struct here \
-              would be a parameter list with a name"
-)]
-#[cfg_attr(
-    not(feature = "cuda"),
-    allow(
-        unused_variables,
-        unreachable_code,
-        reason = "with no `engine-*` feature `EngineOptions` is uninhabited, so \
-                  every path that takes one diverges"
-    )
-)]
-fn create_engine_group(
-    m: &config::ModelConfig,
-    group_idx: usize,
-    group: &[usize],
-    flavor: Flavor,
-    base_opts: &EngineOptions,
-    snapshot_dir: &Path,
-    cache_dir: &Path,
-    tp_degree: usize,
-    component: crate::executor::ModelComponent,
-    frames_in_flight: u8,
-) -> Result<GroupEngine> {
-    #[cfg(feature = "cuda")]
-    {
-        if flavor == Flavor::Cuda && tp_degree > 1 {
-            let rank_opts = cuda_rank_options(m, group_idx, group, base_opts)?;
-            return crate::backend::create_engine_backend_group(
-                &rank_opts,
-                snapshot_dir,
-                cache_dir,
-                m.adapter_mount().as_deref(),
-                group_idx,
-                component,
-                frames_in_flight,
-                &m.adapters,
-                m.residency(),
-                m.patch_ceilings(),
-                m.voxel_ceilings(),
-                m.sku.as_deref(),
-            )
-            .with_context(|| {
-                format!(
-                    "creating cuda TP engine group for model {:?} group {group_idx}",
-                    m.name,
-                )
-            });
-        }
-    }
-
-    #[cfg(not(feature = "cuda"))]
-    let _ = (flavor, tp_degree);
-
-    let first_engine_idx = group.first().copied().ok_or_else(|| {
-        anyhow!(
-            "model {:?}: group {group_idx} is empty; topology calculation produced no ranks",
-            m.name,
-        )
-    })?;
-    let device = group_engine(m, group_idx, first_engine_idx)?;
-    let opts = embedded_opts_for_device(base_opts, device);
-
-    crate::backend::create_engine_backend(
-        &opts,
-        snapshot_dir,
-        cache_dir,
-        m.adapter_mount().as_deref(),
-        group_idx,
-        component,
-        frames_in_flight,
-        &m.adapters,
-        m.residency(),
-        m.patch_ceilings(),
-        m.voxel_ceilings(),
-        m.sku.as_deref(),
-    )
-    .with_context(|| format!("creating engine for model {:?} group {group_idx}", m.name,))
-}
-
-fn embedded_opts_for_device(base_opts: &EngineOptions, device: String) -> EngineOptions {
-    #[cfg(not(feature = "cuda"))]
-    let _ = &device;
-
-    #[allow(unreachable_patterns)]
-    match base_opts {
-        #[cfg(feature = "cuda")]
-        EngineOptions::CudaNative(opts) => {
-            let mut opts = opts.clone();
-            opts.device = device;
-            EngineOptions::CudaNative(opts)
-        }
-        other => other.clone(),
-    }
-}
-
-fn apply_embedded_verbose(options: &mut EngineOptions, verbose: bool) {
-    #[cfg(feature = "cuda")]
-    #[allow(
-        irrefutable_let_patterns,
-        reason = "`EngineOptions` has one variant in a CUDA-only build"
-    )]
-    if let EngineOptions::CudaNative(opts) = options {
-        opts.verbose = verbose;
-    }
-
-    #[cfg(not(feature = "cuda"))]
-    let _ = (options, verbose);
-}
-
-#[cfg(feature = "cuda")]
-fn cuda_rank_options(
-    m: &config::ModelConfig,
-    group_idx: usize,
-    group: &[usize],
-    base_opts: &EngineOptions,
-) -> Result<Vec<EngineOptions>> {
-    let mut rank_opts = Vec::with_capacity(group.len());
-    for &rank_engine_idx in group {
-        let rank_engine = group_engine(m, group_idx, rank_engine_idx)?;
-        #[allow(
-            unreachable_patterns,
-            reason = "`EngineOptions` has one variant in a CUDA-only build"
-        )]
-        match base_opts {
-            EngineOptions::CudaNative(opts) => {
-                let mut o = opts.clone();
-                o.device = rank_engine;
-                rank_opts.push(EngineOptions::CudaNative(o));
-            }
-            _ => unreachable!("flavor checked before building cuda rank options"),
-        }
-    }
-    Ok(rank_opts)
-}
-
-fn group_engine(m: &config::ModelConfig, group_idx: usize, engine_idx: usize) -> Result<String> {
-    m.engine
-        .device
-        .get(engine_idx)
-        .cloned()
-        .ok_or_else(|| {
-            anyhow!(
-                "model {:?}: group {group_idx} references device index {} but only {} devices configured",
-                m.name,
-                engine_idx,
-                m.engine.device.len(),
-            )
-        })
 }
 
 async fn wait_for_sigterm() {

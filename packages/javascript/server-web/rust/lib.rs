@@ -8,4 +8,4 @@ mod log;
 #[cfg(target_arch = "wasm32")]
 mod page;
 
-pub use boot::{BootConfig, BootSummary, Mount, boot};
+pub use boot::{Mount, boot};

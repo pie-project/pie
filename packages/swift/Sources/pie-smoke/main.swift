@@ -2,6 +2,7 @@
 //   swift run pie-smoke <model.zt | ws://host:port> ["prompt"]
 // or, with PIE_SCRIPT=<inferlet.py | inferlet.js>, one run of that script
 // inferlet (in-process only) with {"prompt", "max_tokens"} as its input.
+// PIE_LISTEN=<host:port> also serves the gateway, and the turn goes through it.
 
 import Foundation
 import PieLanguageJavaScript
@@ -59,8 +60,13 @@ if let url = URL(string: arguments[1]), url.scheme == "ws" {
     client = try await PieClient.connect(to: url)
     print("connected to \(url)")
 } else {
-    server = try await PieServer.start(model: URL(filePath: arguments[1]))
-    client = try await server!.connect()
+    let listen = ProcessInfo.processInfo.environment["PIE_LISTEN"]
+    server = try await PieServer.start(model: URL(filePath: arguments[1]), listen: listen)
+    if let listen {
+        client = try await PieClient.connect(to: URL(string: "ws://\(listen)")!)
+    } else {
+        client = try await server!.connect()
+    }
     print(String(format: "booted %@ in %.2fs", server!.summary.sku, booted.duration(to: clock.now) / .seconds(1)))
 }
 

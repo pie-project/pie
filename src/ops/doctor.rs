@@ -216,7 +216,7 @@ fn check_config(path: &Path, origin: bootstrap::Origin) -> Checks {
         backend: flavor.as_ref().ok().map(|flavor| flavor.as_str()),
         sku: worker.model.sku.as_deref(),
     };
-    match worker::weights::resolve(&worker.model.model, want) {
+    match worker::weights::resolve(&worker.model.model, want, &worker.home()) {
         Ok(resolved) => out.push((
             "weights".into(),
             match resolved {

@@ -1,14 +1,14 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-pub fn engine_cache_dir() -> PathBuf {
-    bootstrap::paths::pie_home().join("cache")
+pub fn engine_cache_dir(home: &Path) -> PathBuf {
+    home.join("cache")
 }
 
 /// Where a load's kv slot files live when the config names no path: one
 /// directory per checkpoint digest, so no two models share one.
-pub fn kv_dir(snapshot_dir: &std::path::Path) -> anyhow::Result<PathBuf> {
+pub fn kv_dir(engine_cache_dir: &Path, snapshot_dir: &Path) -> anyhow::Result<PathBuf> {
     let digest = crate::weights::model_artifact_digest(snapshot_dir)?;
-    Ok(engine_cache_dir()
+    Ok(engine_cache_dir
         .join("kv")
         .join(blake3::Hash::from(digest).to_hex().as_str()))
 }
@@ -34,7 +34,7 @@ pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
     let mut entries = vec![
         Entry {
             name: "engine",
-            path: engine_cache_dir(),
+            path: engine_cache_dir(&home),
             what: "Engine-side disk caches: compiled ETA modules, kernel \
                    cubins, GEMM autotuning results. All keyed and \
                    self-invalidating; deleting costs one cold rebuild.",

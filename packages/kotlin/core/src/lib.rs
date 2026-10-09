@@ -1,5 +1,5 @@
 //! The JNI core of the Kotlin `PieServer` (`org.pieproject.server.NativeCore`):
-//! a `runtime::embed::Server` behind a `jlong` handle. Failures throw
+//! a `worker::Server` behind a `jlong` handle. Failures throw
 //! `org.pieproject.client.PieException$Server`.
 
 use std::path::{Path, PathBuf};
@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JString};
 use jni::sys::{jint, jlong, jobjectArray};
-use runtime::embed::{Host, Server};
+use worker::embedded::Settings;
+use worker::{Options, Server};
 
 const EXCEPTION: &str = "org/pieproject/client/PieException$Server";
 
@@ -46,7 +47,12 @@ fn server<'a>(handle: jlong) -> anyhow::Result<&'a Server> {
     unsafe { (handle as *const Server).as_ref() }.ok_or_else(|| anyhow::anyhow!("no server"))
 }
 
-fn boot(artifact: &Path, config: Option<&str>, home: &Path) -> anyhow::Result<Server> {
+fn boot(
+    artifact: &Path,
+    settings: Option<&str>,
+    home: &Path,
+    listen: Option<&str>,
+) -> anyhow::Result<Server> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     let _ = tracing_subscriber::fmt()
@@ -55,20 +61,15 @@ fn boot(artifact: &Path, config: Option<&str>, home: &Path) -> anyhow::Result<Se
         .with_ansi(false)
         .try_init();
 
-    let host = Host {
-        name: "pie-kotlin".into(),
-        home: home.to_path_buf(),
-        worker_threads: 2,
+    let settings = settings.map_or_else(|| Ok(Settings::default()), Settings::parse)?;
+    let mut config = settings.config(artifact, home)?;
+    config.server.worker_threads = 2;
+    let options = Options {
+        engine: settings.engine(),
+        listen: listen.map(str::parse).transpose()?,
+        ..Options::default()
     };
-    let builtins = builtins::all()
-        .iter()
-        .map(|b| runtime::bootstrap::BuiltinProgram {
-            name: b.name,
-            version: b.version,
-            component: b.component,
-        })
-        .collect();
-    Server::start(artifact, config, host, builtins)
+    Server::start(config, options)
 }
 
 #[unsafe(no_mangle)]
@@ -78,12 +79,14 @@ pub extern "system" fn Java_org_pieproject_server_NativeCore_start(
     artifact: JString,
     config: JString,
     home: JString,
+    listen: JString,
 ) -> jlong {
     throwing(&mut env, 0, |env| {
         let artifact = PathBuf::from(string(env, &artifact)?);
         let config = optional_string(env, &config)?;
         let home = PathBuf::from(string(env, &home)?);
-        let server = boot(&artifact, config.as_deref(), &home)?;
+        let listen = optional_string(env, &listen)?;
+        let server = boot(&artifact, config.as_deref(), &home, listen.as_deref())?;
         Ok(Box::into_raw(Box::new(server)) as jlong)
     })
 }

@@ -1,5 +1,5 @@
 //! The C core of the Swift `PieServer` (include/pie_server.h): a
-//! `runtime::embed::Server` on the Metal engine.
+//! `worker::Server` on the Metal engine.
 #![cfg(target_vendor = "apple")]
 // Each call's safety contract is its entry in include/pie_server.h.
 #![allow(clippy::missing_safety_doc)]
@@ -7,7 +7,8 @@
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::{Path, PathBuf};
 
-use runtime::embed::{Host, Server};
+use worker::embedded::Settings;
+use worker::{Options, Server};
 
 pub struct PieServer {
     server: Server,
@@ -70,7 +71,12 @@ unsafe fn server<'a>(ptr: *const PieServer) -> Outcome<&'a Server> {
         .ok_or_else(|| "server is NULL".to_string())
 }
 
-fn boot(artifact: &Path, config: Option<&str>, home: &Path) -> anyhow::Result<PieServer> {
+fn boot(
+    artifact: &Path,
+    settings: Option<&str>,
+    home: &Path,
+    listen: Option<&str>,
+) -> anyhow::Result<PieServer> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     let _ = tracing_subscriber::fmt()
@@ -79,20 +85,15 @@ fn boot(artifact: &Path, config: Option<&str>, home: &Path) -> anyhow::Result<Pi
         .with_ansi(false)
         .try_init();
 
-    let host = Host {
-        name: "pie-swift".into(),
-        home: home.to_path_buf(),
-        worker_threads: 2,
+    let settings = settings.map_or_else(|| Ok(Settings::default()), Settings::parse)?;
+    let mut config = settings.config(artifact, home)?;
+    config.server.worker_threads = 2;
+    let options = Options {
+        engine: settings.engine(),
+        listen: listen.map(str::parse).transpose()?,
+        ..Options::default()
     };
-    let builtins = builtins::all()
-        .iter()
-        .map(|b| runtime::bootstrap::BuiltinProgram {
-            name: b.name,
-            version: b.version,
-            component: b.component,
-        })
-        .collect();
-    let server = Server::start(artifact, config, host, builtins)?;
+    let server = Server::start(config, options)?;
     Ok(PieServer {
         summary: CString::new(serde_json::to_string(server.summary())?)?,
         server,
@@ -104,6 +105,7 @@ pub unsafe extern "C" fn pie_server_start(
     artifact: *const c_char,
     config: *const c_char,
     home: *const c_char,
+    listen: *const c_char,
     error: *mut *mut c_char,
 ) -> *mut PieServer {
     unsafe {
@@ -111,7 +113,8 @@ pub unsafe extern "C" fn pie_server_start(
             let artifact = PathBuf::from(str_arg(artifact, "artifact")?);
             let config = opt_str_arg(config, "config")?;
             let home = PathBuf::from(str_arg(home, "home")?);
-            let server = boot(&artifact, config, &home).map_err(message)?;
+            let listen = opt_str_arg(listen, "listen")?;
+            let server = boot(&artifact, config, &home, listen).map_err(message)?;
             Ok(Box::into_raw(Box::new(server)))
         })
     }

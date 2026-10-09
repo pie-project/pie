@@ -154,7 +154,7 @@ gateway = { path = "crates/gateway" }
 builtins = { path = "crates/builtins" }
 tar = "0.4"
 flate2 = "1"
-worker = { path = "crates/worker", default-features = false }
+worker = { path = "crates/worker", default-features = false, features = ["standalone"] }
 runtime = { path = "crates/runtime" }
 models = { path = "crates/models" }
 checkpoint = { path = "crates/checkpoint" }

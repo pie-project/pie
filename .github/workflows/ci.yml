@@ -34,6 +34,9 @@ jobs:
         run: cargo clippy --no-deps --all-targets $(bash scripts/ci/members.sh engine-cuda pie-server-node pie-server-py) -- -D warnings
       - name: cargo clippy (servers, no engine)
         run: cargo clippy --no-deps --all-targets -p pie-server-node -p pie-server-py --no-default-features -- -D warnings
+      # The worker an app embeds: no gateway or controller links.
+      - name: cargo clippy (worker, embedded only)
+        run: cargo clippy --no-deps --all-targets -p worker --no-default-features -- -D warnings
       # engine-metal's device half is `cfg(target_vendor = "apple")`; clippy
       # type-checks it for that target without a Mac.
       - name: cargo clippy (engine-metal, Apple half)

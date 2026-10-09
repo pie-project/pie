@@ -15,6 +15,9 @@ pkgs() { for c in "$@"; do printf -- '-p %s ' "$c"; done; }
 echo "== wasm32: clippy"
 CARGO_TARGET_DIR=target-wasm cargo clippy --target wasm32-unknown-unknown \
   $(pkgs "${WASM_CRATES[@]}") --features runtime/wgpu,engine-wgpu/wgpu -- -D warnings
+# The worker the tab boots through: without `net`, its default.
+CARGO_TARGET_DIR=target-wasm cargo clippy --target wasm32-unknown-unknown \
+  -p worker -p bootstrap --no-default-features --features worker/wgpu -- -D warnings
 
 echo "== native, wgpu feature: clippy + tests"
 cargo clippy $(pkgs "${NATIVE_CRATES[@]}") --features runtime/wgpu,engine-wgpu/wgpu -- -D warnings

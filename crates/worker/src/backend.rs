@@ -204,13 +204,14 @@ fn dump_device_boot(boot: &DeviceBoot, group_id: usize, rank: Option<usize>) {
 fn land(
     backend: &mut runtime::engine::EngineBox,
     snapshot_dir: &Path,
+    cache_dir: &Path,
     budgets: engine::Budgets,
     residency: engine::Residency,
     platform: poem_ir::Platform,
     component: crate::executor::ModelComponent,
     frames_in_flight: u8,
     sku: Option<&str>,
-) -> Result<engine::Loaded> {
+) -> Result<(engine::Loaded, String)> {
     if component != crate::executor::ModelComponent::Full {
         return Err(anyhow!(
             "this build loads only the full model; {component:?} needs a traced plan the catalog \
@@ -227,9 +228,11 @@ fn land(
         frames_in_flight,
     )?;
     if request.residency.disk_kv_budget > 0 && request.residency.disk_kv_dir.is_none() {
-        request.residency.disk_kv_dir = Some(crate::disk::kv_dir(snapshot_dir)?);
+        request.residency.disk_kv_dir = Some(crate::disk::kv_dir(cache_dir, snapshot_dir)?);
     }
-    backend.load(request).map_err(anyhow::Error::from)
+    let sku = request.trace.name.clone();
+    let loaded = backend.load(request).map_err(anyhow::Error::from)?;
+    Ok((loaded, sku))
 }
 
 fn register_operator_adapters(
@@ -268,7 +271,7 @@ fn register_operator_adapters(
 
 fn validate_snapshot_dir(snapshot_dir: &Path) -> Result<()> {
     if snapshot_dir.is_dir()
-        || (snapshot_dir.is_file() && crate::weights::is_artifact_path(snapshot_dir))
+        || (crate::weights::is_file(snapshot_dir) && crate::weights::is_artifact_path(snapshot_dir))
     {
         return Ok(());
     }
@@ -347,9 +350,10 @@ pub(crate) fn create_engine_backend_group(
     let EngineOptions::CudaNative(opts) = &rank_options[0] else {
         unreachable!("validated cuda options above");
     };
-    let loaded = land(
+    let (loaded, sku) = land(
         &mut backend,
         snapshot_dir,
+        cache_dir,
         cuda_budgets(opts, adapters.seats(), patch_ceilings, voxel_ceilings),
         residency,
         poem_ir::Platform::Cuda,
@@ -360,6 +364,7 @@ pub(crate) fn create_engine_backend_group(
     register_operator_adapters(&mut backend, adapters)?;
 
     Ok(GroupEngine {
+        sku,
         caps: loaded.caps,
         facts: loaded.facts,
         snapshot_dir: snapshot_dir.to_path_buf(),
@@ -390,9 +395,15 @@ pub(crate) fn create_engine_backend(
     patch_ceilings: (Option<u32>, Option<u32>),
     voxel_ceilings: (Option<u32>, Option<u32>),
     sku: Option<&str>,
+    opened: Option<runtime::engine::EngineBox>,
 ) -> Result<GroupEngine> {
-    let _ = (group_id, cache_dir, adapter_dir);
+    let _ = (group_id, adapter_dir);
     validate_snapshot_dir(snapshot_dir)?;
+    // The host's engine when it opened one itself (the browser's WebGPU device).
+    let open = |doc: &str, open_doc: fn(&[u8]) -> Result<runtime::engine::EngineBox>| match opened {
+        Some(engine) => Ok(engine),
+        None => open_doc(doc.as_bytes()),
+    };
 
     let (mut backend, budgets, platform): (
         runtime::engine::EngineBox,
@@ -443,7 +454,7 @@ pub(crate) fn create_engine_backend(
                 ));
             }
             metal_geometry_is_stated(opts)?;
-            let backend = runtime::engine::backend::open::metal(boot_doc.as_bytes())?;
+            let backend = open(&boot_doc, runtime::engine::backend::open::metal)?;
             let page_size = opts.kv_page_size.max(1);
             let max_context = opts
                 .max_model_len
@@ -479,7 +490,7 @@ pub(crate) fn create_engine_backend(
                     toml::Value::String(cache.display().to_string())
                 ));
             }
-            let backend = runtime::engine::backend::open::vulkan(boot_doc.as_bytes())?;
+            let backend = open(&boot_doc, runtime::engine::backend::open::vulkan)?;
             let defaults = engine::Budgets::default();
             (
                 backend,
@@ -489,7 +500,7 @@ pub(crate) fn create_engine_backend(
                     buckets: Vec::new(),
                     max_adapters: adapters.seats(),
                     page_size: defaults.page_size,
-                    max_context: defaults.max_context,
+                    max_context: opts.max_model_len.unwrap_or(defaults.max_context),
                     slots: opts.max_state_slots.unwrap_or(256).max(1),
                     pages: opts.max_total_pages.unwrap_or(defaults.pages).max(1),
                     max_patches: patch_ceilings.0,
@@ -523,7 +534,7 @@ pub(crate) fn create_engine_backend(
             if let Some(memory) = opts.device_memory {
                 boot_doc.push_str(&format!("device_memory = {}\n", memory.as_bytes()));
             }
-            let backend = runtime::engine::backend::open::wgpu(boot_doc.as_bytes())?;
+            let backend = open(&boot_doc, runtime::engine::backend::open::wgpu)?;
             let defaults = engine::Budgets::default();
             (
                 backend,
@@ -533,7 +544,7 @@ pub(crate) fn create_engine_backend(
                     buckets: Vec::new(),
                     max_adapters: adapters.seats(),
                     page_size: defaults.page_size,
-                    max_context: defaults.max_context,
+                    max_context: opts.max_model_len.unwrap_or(defaults.max_context),
                     slots: opts.max_state_slots.unwrap_or(256).max(1),
                     pages: opts.max_total_pages.unwrap_or(defaults.pages).max(1),
                     max_patches: patch_ceilings.0,
@@ -556,7 +567,7 @@ pub(crate) fn create_engine_backend(
                     toml::Value::String(plugin.display().to_string())
                 ));
             }
-            let backend = runtime::engine::backend::open::xla(boot_doc.as_bytes())?;
+            let backend = open(&boot_doc, runtime::engine::backend::open::xla)?;
             let defaults = engine::Budgets::default();
             (
                 backend,
@@ -589,9 +600,10 @@ pub(crate) fn create_engine_backend(
             reason = "`EngineOptions` has no variants in this build"
         )
     )]
-    let loaded = land(
+    let (loaded, sku) = land(
         &mut backend,
         snapshot_dir,
+        cache_dir,
         budgets,
         residency,
         platform,
@@ -603,6 +615,7 @@ pub(crate) fn create_engine_backend(
     register_operator_adapters(&mut backend, adapters)?;
 
     Ok(GroupEngine {
+        sku,
         caps: loaded.caps,
         facts: loaded.facts,
         snapshot_dir: snapshot_dir.to_path_buf(),
@@ -684,6 +697,7 @@ mod tests {
 }
 
 pub struct GroupEngine {
+    pub sku: String,
     pub caps: EngineCapabilities,
     pub facts: engine::LoadFacts,
     pub snapshot_dir: PathBuf,

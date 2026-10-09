@@ -14,15 +14,20 @@ path = "src/lib.rs"
 [[bin]]
 name = "pie-env"
 path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+cli = ["dep:clap", "dep:rustls", "dep:tracing-subscriber", "dep:tokio", "dep:tracing", "dep:anyhow"]
 
 [dependencies]
-anyhow = "1"
-clap = { version = "4.6", features = ["derive"] }
+anyhow = { version = "1", optional = true }
+clap = { version = "4.6", features = ["derive"], optional = true }
 dirs = "7.0"
-rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tokio = { version = "1", features = ["rt", "macros", "net", "signal", "io-util"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"], optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
+tokio = { version = "1", features = ["rt", "macros", "net", "signal", "io-util"], optional = true }
 
 [lints]
 workspace = true
