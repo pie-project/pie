@@ -120,16 +120,28 @@ class EngineBackend:
 
 # The duck from mascots.py: a 10x8 sprite drawn with half-block characters,
 # one pixel per column and two pixel rows per text line, so the banner is 3 lines tall.
-MASCOT_NAME, (MASCOT_PALETTE, MASCOT_ROWS) = "duck", ANIMALS["duck"]
-# six pixel rows (three text lines) sampled evenly from the 8 rows of each sprite
-MASCOT_ROWS = [MASCOT_ROWS[round(i * 7 / 5)] for i in range(6)]
+MASCOT_NAME, (MASCOT_PALETTE, _MASCOT_ART) = "duck", ANIMALS["duck"]
+FRAME_SECONDS = 0.4
 
 
-def mascot_rows() -> list[list[tuple[str, str]]]:
+def _mascot_frames(art: list[str]) -> list[list[str]]:
+    """Normal, blink and bob frames of the duck, each sampled to six pixel rows."""
+    blink = list(art)
+    blink[2] = blink[2][:4] + "Y" + blink[2][5:]  # the eye closes into the body colour
+    bob = ["." * len(art[0])] + art[:-1]           # the whole duck moves down one pixel row
+    frames = [art, art, blink, art, bob]
+    return [[f[round(i * 7 / 5)] for i in range(6)] for f in frames]
+
+
+MASCOT_FRAMES = _mascot_frames(_MASCOT_ART)
+
+
+def mascot_rows(frame: int = 0) -> list[list[tuple[str, str]]]:
     """Return the mascot as rows of styled text fragments, two pixel rows per line."""
     colors = {k: f"#{r:02x}{g:02x}{b:02x}" for k, (r, g, b) in MASCOT_PALETTE.items()}
     lines = []
-    for top, bottom in zip(MASCOT_ROWS[0::2], MASCOT_ROWS[1::2]):
+    rows = MASCOT_FRAMES[frame % len(MASCOT_FRAMES)]
+    for top, bottom in zip(rows[0::2], rows[1::2]):
         fragments = []
         for t, b in zip(top, bottom):
             if t in colors and b in colors:
@@ -167,6 +179,7 @@ class Chat:
         self.transcript: list[tuple[str, str]] = []  # (style, text) pieces, in order
         self.streaming = False
         self.app: Application | None = None
+        self.frame = 0  # which mascot frame is drawn; advanced by animate()
         self.exit_armed = False  # set by the first Ctrl-C on an empty prompt
 
         self.input = Buffer(multiline=False)
@@ -185,7 +198,7 @@ class Chat:
 
     def banner(self) -> list[tuple[str, str]]:
         """The pie mascot on the left, the title and model on the right, as in the Claude logo."""
-        mascot = mascot_rows()
+        mascot = mascot_rows(self.frame)
         info = [
             [("class:bold", "pie chat")],
             [("class:dim", f"model {MODEL} · this Mac")],
@@ -272,6 +285,14 @@ class Chat:
             self.app.invalidate()
 
     # ---- layout --------------------------------------------------------
+
+    async def animate(self) -> None:
+        """Advance the mascot frame on a timer and redraw the screen."""
+        while True:
+            await asyncio.sleep(FRAME_SECONDS)
+            self.frame += 1
+            if self.app:
+                self.app.invalidate()
 
     def build(self) -> Application:
         bindings = KeyBindings()
@@ -368,7 +389,8 @@ def main() -> None:
     backend = PlaceholderBackend() if args.placeholder else EngineBackend(args.url)
     os.system("cls" if os.name == "nt" else "clear")  # start on a clean screen, as the Claude CLI does
     try:
-        Chat(backend).build().run()
+        chat = Chat(backend)
+        chat.build().run(pre_run=lambda: asyncio.ensure_future(chat.animate()))
     finally:
         if engine is not None:
             stop_engine(engine)
