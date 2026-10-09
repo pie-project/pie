@@ -91,14 +91,14 @@ impl crate::ui::Report for DoctorReport {
     }
 }
 
-pub fn run(global: &crate::process::GlobalArgs) -> Result<crate::ui::Answer> {
+pub fn run(global: &crate::args::GlobalArgs) -> Result<crate::ui::Answer> {
     let mut warnings = 0usize;
     let mut passes = 0usize;
     let mut failures = 0usize;
 
     let mut sections: Vec<(&'static str, Checks)> = Vec::new();
 
-    let (path, origin) = crate::process::cli_config_path(global);
+    let (path, origin) = crate::args::config_path(global);
 
     let mut system = vec![check_platform()];
     system.extend(Language::ALL.into_iter().map(check_language));
@@ -161,9 +161,9 @@ pub fn run(global: &crate::process::GlobalArgs) -> Result<crate::ui::Answer> {
     })
 }
 
-fn check_config(path: &Path, origin: crate::process::Origin) -> Checks {
+fn check_config(path: &Path, origin: crate::args::Origin) -> Checks {
     if !path.exists() {
-        return if origin == crate::process::Origin::Default {
+        return if origin == crate::args::Origin::Default {
             vec![(
                 "config".into(),
                 format!(

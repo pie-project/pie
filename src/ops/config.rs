@@ -44,7 +44,7 @@ pub enum ConfigCmd {
     Tune(tune::TuneArgs),
 }
 
-pub async fn run(cmd: ConfigCmd, global: &crate::process::GlobalArgs) -> Result<Answer> {
+pub async fn run(cmd: ConfigCmd, global: &crate::args::GlobalArgs) -> Result<Answer> {
     match cmd {
         ConfigCmd::List { prefix } => list(global, prefix),
         ConfigCmd::Show { key } => show(global, key),
@@ -56,11 +56,11 @@ pub async fn run(cmd: ConfigCmd, global: &crate::process::GlobalArgs) -> Result<
     }
 }
 
-fn config_path(global: &crate::process::GlobalArgs) -> PathBuf {
-    crate::process::cli_config_path(global).0
+fn config_path(global: &crate::args::GlobalArgs) -> PathBuf {
+    crate::args::config_path(global).0
 }
 
-fn init(global: &crate::process::GlobalArgs, force: bool) -> Result<Answer> {
+fn init(global: &crate::args::GlobalArgs, force: bool) -> Result<Answer> {
     let cfg_path = config_path(global);
     if cfg_path.exists() && !force {
         bail!("config file already exists at {cfg_path:?}; pass --force to overwrite");
@@ -75,13 +75,11 @@ fn init(global: &crate::process::GlobalArgs, force: bool) -> Result<Answer> {
     Ok(Answer::did(did))
 }
 
-fn list(global: &crate::process::GlobalArgs, prefix: Option<String>) -> Result<Answer> {
-    let (cfg_path, origin) = crate::process::cli_config_path(global);
+fn list(global: &crate::args::GlobalArgs, prefix: Option<String>) -> Result<Answer> {
+    let (cfg_path, origin) = crate::args::config_path(global);
     let file: toml::Value = match std::fs::read_to_string(&cfg_path) {
         Ok(content) => toml::from_str(&content).map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?,
-        Err(_) if origin == crate::process::Origin::Default => {
-            toml::Value::Table(Default::default())
-        }
+        Err(_) if origin == crate::args::Origin::Default => toml::Value::Table(Default::default()),
         Err(e) => bail!(
             "no config file at {} ({}): {e}",
             crate::ui::short_path(&cfg_path),
@@ -313,10 +311,10 @@ impl crate::ui::Report for ConfigShow {
     }
 }
 
-fn show(global: &crate::process::GlobalArgs, key: Option<String>) -> Result<Answer> {
-    let (cfg_path, origin) = crate::process::cli_config_path(global);
+fn show(global: &crate::args::GlobalArgs, key: Option<String>) -> Result<Answer> {
+    let (cfg_path, origin) = crate::args::config_path(global);
     if !cfg_path.exists() {
-        if origin == crate::process::Origin::Default {
+        if origin == crate::args::Origin::Default {
             return Ok(Answer::report(ConfigShow::File {
                 path: cfg_path,
                 origin: origin.describe().to_string(),
@@ -362,11 +360,11 @@ fn show(global: &crate::process::GlobalArgs, key: Option<String>) -> Result<Answ
         origin: origin.describe().to_string(),
         content: Some(content),
         display,
-        redirected: origin != crate::process::Origin::Default,
+        redirected: origin != crate::args::Origin::Default,
     }))
 }
 
-fn set(global: &crate::process::GlobalArgs, key: String, value: String) -> Result<Answer> {
+fn set(global: &crate::args::GlobalArgs, key: String, value: String) -> Result<Answer> {
     let cfg_path = config_path(global);
     if !cfg_path.exists() {
         bail!("config file not found at {cfg_path:?} (run `pie config init`)");
@@ -457,8 +455,8 @@ fn parse_toml_literal(value: &str) -> Option<toml::Value> {
     table.get("value").cloned()
 }
 
-fn edit(global: &crate::process::GlobalArgs) -> Result<Answer> {
-    let (cfg_path, _) = crate::process::cli_config_path(global);
+fn edit(global: &crate::args::GlobalArgs) -> Result<Answer> {
+    let (cfg_path, _) = crate::args::config_path(global);
     if !cfg_path.exists() {
         bail!(
             "no config file at {}; `pie config init` writes one",
@@ -509,7 +507,7 @@ fn edit(global: &crate::process::GlobalArgs) -> Result<Answer> {
     )))
 }
 
-fn unset(global: &crate::process::GlobalArgs, key: String) -> Result<Answer> {
+fn unset(global: &crate::args::GlobalArgs, key: String) -> Result<Answer> {
     let cfg_path = config_path(global);
     if !cfg_path.exists() {
         bail!("config file not found at {cfg_path:?} (run `pie config init`)");

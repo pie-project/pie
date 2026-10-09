@@ -11,7 +11,7 @@ use pie::{derive, ops, ui};
 )]
 struct Cli {
     #[command(flatten)]
-    global: pie::process::GlobalArgs,
+    global: pie::args::GlobalArgs,
 
     #[arg(long, global = true)]
     json: bool,
@@ -99,7 +99,7 @@ async fn run() -> anyhow::Result<ExitCode> {
         return serve(cli.global, cli.diag.as_deref()).await;
     }
 
-    pie::process::init_cli(&cli.global)?;
+    pie::daemon::init_command(&cli.global);
 
     let answer = match cli.command {
         Command::Serve => unreachable!("serve returns before the op dispatch"),
@@ -130,9 +130,9 @@ async fn run() -> anyhow::Result<ExitCode> {
     Ok(code)
 }
 
-async fn serve(global: pie::process::GlobalArgs, diag: Option<&str>) -> anyhow::Result<ExitCode> {
-    let ctx = pie::process::init(
-        pie::process::BootSpec::pie().version(env!("CARGO_PKG_VERSION")),
+async fn serve(global: pie::args::GlobalArgs, diag: Option<&str>) -> anyhow::Result<ExitCode> {
+    let ctx = pie::daemon::init(
+        pie::daemon::BootSpec::pie().version(env!("CARGO_PKG_VERSION")),
         global,
     )?;
     let (controller, gateway, mut worker) = derive::derive_standalone(ctx.config_str())?;

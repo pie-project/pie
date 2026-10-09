@@ -28,7 +28,7 @@ pub enum ModelCmd {
     },
 }
 
-pub fn run(cmd: ModelCmd, global: &crate::process::GlobalArgs) -> Result<Answer> {
+pub fn run(cmd: ModelCmd, global: &crate::args::GlobalArgs) -> Result<Answer> {
     match cmd {
         ModelCmd::List => list(),
         ModelCmd::Info { name } => info(name),

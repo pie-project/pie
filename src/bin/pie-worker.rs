@@ -6,7 +6,7 @@ use clap::Parser;
 #[command(name = "pie-worker", version)]
 struct Cli {
     #[command(flatten)]
-    global: pie::process::GlobalArgs,
+    global: pie::args::GlobalArgs,
 
     #[arg(long)]
     host: Option<String>,
@@ -24,8 +24,8 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
-    let ctx = pie::process::init(
-        pie::process::BootSpec::worker().version(env!("CARGO_PKG_VERSION")),
+    let ctx = pie::daemon::init(
+        pie::daemon::BootSpec::worker().version(env!("CARGO_PKG_VERSION")),
         cli.global,
     )?;
 

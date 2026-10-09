@@ -136,10 +136,6 @@ path = "src/bin/pie-gateway.rs"
 name = "pie-worker"
 path = "src/bin/pie-worker.rs"
 
-[[bin]]
-name = "pie-env"
-path = "src/bin/pie-env.rs"
-
 [features]
 default = []
 cuda = ["worker/cuda"]

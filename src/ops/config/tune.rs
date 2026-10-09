@@ -332,8 +332,8 @@ pub fn apply(content: &str, knobs: Knobs) -> Result<String> {
     Ok(content)
 }
 
-pub async fn run(global: &crate::process::GlobalArgs, args: TuneArgs) -> Result<crate::ui::Answer> {
-    let (cfg_path, origin) = crate::process::cli_config_path(global);
+pub async fn run(global: &crate::args::GlobalArgs, args: TuneArgs) -> Result<crate::ui::Answer> {
+    let (cfg_path, origin) = crate::args::config_path(global);
     let content = std::fs::read_to_string(&cfg_path).with_context(|| {
         format!(
             "no config file at {} ({}); `pie config init` writes one",
