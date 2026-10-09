@@ -119,7 +119,7 @@ class EngineBackend:
 
 # The animated mascot: a fixed body with bubbles that start at its bottom right, rise one row
 # per frame and vanish, then the cycle repeats. Rows are 0 (top) to 2 (bottom), columns 0 to 9.
-_BODY = {1: "▐▟▙▙▙▛▌", 2: "▜█████▛"}
+_BODY = {1: "▐▟▙▙▙▛▌", 2: "▜██▄██▛"}  # the half block in the bottom row is the fin
 # (row, column, character) for each bubble, per frame; the two bubbles are offset by two frames
 _BUBBLES = [
     [(2, 8, "▖"), (0, 9, "▘")],
