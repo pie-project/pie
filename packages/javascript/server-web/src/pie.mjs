@@ -99,10 +99,16 @@ export async function install(bytes, file, version = null) {
 }
 
 /** Hand the runtime a language component (`"python"`, `"javascript"`)
- * from bytes; a script inferlet in that language can run once this has. */
-export async function installLanguage(language, wasmBytes) {
+ * from bytes; a script inferlet in that language can run once this has.
+ * `precompiled`, from `precompileComponent` on this same build, spares the
+ * first such inferlet compiling the component; one the runtime refuses is
+ * ignored and the source compiled instead. */
+export async function installLanguage(language, wasmBytes, precompiled) {
   const copy = new Uint8Array(wasmBytes).slice();
-  return await ready().call("installLanguage", [language, copy], { transfer: [copy.buffer] });
+  const ready_ = precompiled ? new Uint8Array(precompiled).slice() : undefined;
+  return await ready().call("installLanguage", [language, copy, ready_], {
+    transfer: ready_ ? [copy.buffer, ready_.buffer] : [copy.buffer],
+  });
 }
 
 export async function memoryBytes() {
@@ -168,10 +174,16 @@ export class Server {
     return this.#open && backend !== null;
   }
 
-  /** A language component (`python`, `javascript`) from bytes or a URL. */
-  async installLanguage(language, source) {
+  /** A language component (`python`, `javascript`) from bytes or a URL,
+   * and optionally the same component precompiled for this build. A
+   * precompiled one that fails to fetch is skipped, not fatal. */
+  async installLanguage(language, source, { precompiled } = {}) {
     this.#alive();
-    return installLanguage(language, await bytesOf(source));
+    const [bytes, ready_] = await Promise.all([
+      bytesOf(source),
+      precompiled ? bytesOf(precompiled).catch(() => undefined) : undefined,
+    ]);
+    return installLanguage(language, bytes, ready_);
   }
 
   async install(source, file = null, version = null) {

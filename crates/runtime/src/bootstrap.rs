@@ -550,6 +550,14 @@ const CORE_RESOURCES_PER_COMPONENT: u32 = 16;
 
 #[cfg(target_arch = "wasm32")]
 fn init_wasmtime(_runtime: &RuntimeConfig) -> wasmtime::Engine {
+    browser_wasm_engine()
+}
+
+/// The engine inferlets run on in a browser tab. A component precompiled for
+/// it (`program::precompile_component`) loads only into an engine built the
+/// same way, so precompiling goes through here too.
+#[cfg(target_arch = "wasm32")]
+pub fn browser_wasm_engine() -> wasmtime::Engine {
     let mut wasm_config = wasmtime::Config::default();
     wasmtime_web::configure(&mut wasm_config).expect("configure wasmtime for the browser");
     wasm_config.wasm_component_model_async(true);

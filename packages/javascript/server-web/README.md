@@ -53,6 +53,16 @@ well; `tests/browser` drives them directly.
   `max_total_pages`) in the boot config. `Settings` in
   `crates/worker/src/embedded.rs` lists the keys, plus `device_memory_mb` and
   `power_preference` for the WebGPU engine.
+- A tab compiles a script language's component (Python's is 37 MB) on the
+  first inferlet in that language, about 8 s, and again after every reload.
+  Precompile it once at build time with this same build,
+  `node node_modules/@pie-project/server-web/dist/precompile.mjs python.wasm
+  python.pulley.cwasm` (or `precompileComponent` from
+  `@pie-project/server-web/precompile`; no GPU needed), serve the result
+  beside the source, and pass it as
+  `installLanguage("python", source, { precompiled })`. It fits only the
+  `pie_browser_bg.wasm` it was made with; one that does not is ignored with
+  a warning and the source compiled instead.
 - Rust, JavaScript and Python inferlets run. Not available in a tab: MoE
   host-tier expert streaming, Python inferlet snapshots, telemetry, and
   outbound HTTP or files from inferlets (the WASI interfaces link, a call

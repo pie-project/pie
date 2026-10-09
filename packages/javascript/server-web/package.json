@@ -13,7 +13,8 @@
     "./languages": {
       "types": "./src/languages.d.ts",
       "default": "./src/languages.mjs"
-    }
+    },
+    "./precompile": "./dist/precompile.mjs"
   },
   "files": [
     "dist",
@@ -22,7 +23,7 @@
   ],
   "scripts": {
     "build": "./build.sh release",
-    "bundle": "esbuild src/pie.mjs src/worker.mjs --bundle --format=esm --outdir=dist --out-extension:.js=.mjs --external:./worker.mjs --external:fs --external:path --define:__PIE_WASM__='\"./pie_browser_bg.wasm\"' --log-level=warning --log-override:duplicate-object-key=silent && cp pkg/pie_browser_bg.wasm dist/"
+    "bundle": "esbuild src/pie.mjs src/worker.mjs src/precompile.mjs --bundle --format=esm --outdir=dist --out-extension:.js=.mjs --external:./worker.mjs --external:fs --external:path --external:node:fs --external:node:url --define:__PIE_WASM__='\"./pie_browser_bg.wasm\"' --log-level=warning --log-override:duplicate-object-key=silent && cp pkg/pie_browser_bg.wasm dist/"
   },
   "dependencies": {
     "@pie-project/client": "^0.5.0"

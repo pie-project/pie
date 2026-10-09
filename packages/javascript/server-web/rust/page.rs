@@ -216,12 +216,31 @@ pub fn pie_install_program(
 /// bytes: this host reads no files, so a script inferlet can only run once
 /// the page has installed its language component this way.
 #[wasm_bindgen]
-pub fn pie_install_language(language: String, component: Vec<u8>) -> js_sys::Promise {
+pub fn pie_install_language(
+    language: String,
+    component: Vec<u8>,
+    precompiled: Option<Vec<u8>>,
+) -> js_sys::Promise {
     promise(async move {
         let language = runtime::inferlet::program::Language::parse(&language)?;
         runtime::inferlet::program::add_language(language, component).await?;
+        if let Some(precompiled) = precompiled {
+            runtime::inferlet::program::add_precompiled_language(language, precompiled).await?;
+        }
         Ok(JsValue::from_str(language.name()))
     })
+}
+
+/// A component compiled for the engine a tab runs inferlets on, for
+/// `pie_install_language`'s `precompiled`. Compiling the Python language
+/// component takes seconds in a tab; a site can do it once at build time
+/// (this needs no boot and no GPU, so it runs in Node too) and serve the
+/// result next to the source.
+#[wasm_bindgen]
+pub fn pie_precompile_component(component: Vec<u8>) -> Result<Vec<u8>, JsError> {
+    let engine = runtime::bootstrap::browser_wasm_engine();
+    runtime::inferlet::program::precompile_component(&engine, &component)
+        .map_err(|e| JsError::new(&format!("{e:#}")))
 }
 
 #[wasm_bindgen]

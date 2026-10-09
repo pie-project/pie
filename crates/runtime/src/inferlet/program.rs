@@ -168,6 +168,30 @@ pub async fn add_language(language: Language, wasm_binary: Vec<u8>) -> Result<()
     rx.await?
 }
 
+/// Hand over `language`'s component already compiled for this runtime's
+/// engine (`precompile_component`), alongside its source from
+/// `add_language`. The first program in that language loads it instead of
+/// compiling the source, which in a browser tab takes seconds; if the engine
+/// refuses it (another wasmtime version or engine settings), the source is
+/// compiled as before.
+pub async fn add_precompiled_language(language: Language, precompiled: Vec<u8>) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    SERVICE.send(Message::AddPrecompiledLanguage {
+        language,
+        precompiled,
+        response: tx,
+    })?;
+    rx.await?
+}
+
+/// Compile a component for `engine` and serialize it, for
+/// `add_precompiled_language`.
+pub fn precompile_component(engine: &WasmEngine, wasm_binary: &[u8]) -> Result<Vec<u8>> {
+    engine
+        .precompile_component(wasm_binary)
+        .map_err(|e| anyhow!("precompiling the component: {e}"))
+}
+
 pub async fn is_registered(name: &ProgramName) -> bool {
     let (tx, rx) = oneshot::channel();
     SERVICE
@@ -277,6 +301,9 @@ struct ProgramService {
     languages_dir: PathBuf,
     /// Handed over as bytes, compiled on first use.
     language_binaries: HashMap<Language, Vec<u8>>,
+    /// Handed over already compiled, loaded on first use in place of the
+    /// source in `language_binaries`.
+    language_precompiled: HashMap<Language, Vec<u8>>,
     /// Compiled once, shared by every script program in that language.
     languages: HashMap<Language, Component>,
 }
@@ -305,6 +332,7 @@ impl ProgramService {
             generation: 0,
             languages_dir,
             language_binaries: HashMap::new(),
+            language_precompiled: HashMap::new(),
             languages: HashMap::new(),
         }
     }
@@ -356,11 +384,28 @@ impl ProgramService {
         self.language_binaries.insert(language, wasm_binary);
     }
 
+    fn add_precompiled_language(&mut self, language: Language, precompiled: Vec<u8>) {
+        self.languages.remove(&language);
+        self.language_precompiled.insert(language, precompiled);
+    }
+
     /// The compiled language component for `language`: compiled once from the
     /// bytes handed over, else from `<languages_dir>/<language>.wasm`.
     async fn language_component(&mut self, language: Language) -> Result<Component> {
         if let Some(component) = self.languages.get(&language) {
             return Ok(component.clone());
+        }
+        if let Some(precompiled) = self.language_precompiled.remove(&language) {
+            match deserialize_component(&self.wasm_engine, &precompiled) {
+                Ok(component) => {
+                    self.languages.insert(language, component.clone());
+                    return Ok(component);
+                }
+                Err(e) => tracing::warn!(
+                    "the precompiled {language} language component does not load ({e:#}); \
+                     compiling its source instead"
+                ),
+            }
         }
         let path = self.languages_dir.join(language.component_file());
         let binary = match self.language_binaries.remove(&language) {
@@ -445,6 +490,12 @@ enum Message {
         response: oneshot::Sender<Result<()>>,
     },
 
+    AddPrecompiledLanguage {
+        language: Language,
+        precompiled: Vec<u8>,
+        response: oneshot::Sender<Result<()>>,
+    },
+
     Exists {
         name: ProgramName,
         response: oneshot::Sender<bool>,
@@ -492,6 +543,14 @@ impl ServiceHandler for ProgramService {
                 self.add_language(language, wasm_binary);
                 let _ = response.send(Ok(()));
             }
+            Message::AddPrecompiledLanguage {
+                language,
+                precompiled,
+                response,
+            } => {
+                self.add_precompiled_language(language, precompiled);
+                let _ = response.send(Ok(()));
+            }
             Message::Exists { name, response } => {
                 let _ = response.send(self.repository.exists(&name));
             }
@@ -506,6 +565,21 @@ impl ServiceHandler for ProgramService {
             }
         }
     }
+}
+
+/// A component serialized by `precompile_component`. Wasmtime checks the
+/// artifact's header against this engine's version and settings and refuses
+/// a mismatch.
+fn deserialize_component(engine: &WasmEngine, precompiled: &[u8]) -> Result<Component> {
+    if WasmEngine::detect_precompiled(precompiled) != Some(wasmtime::Precompiled::Component) {
+        anyhow::bail!("not a component precompiled by wasmtime");
+    }
+    // SAFETY: deserializing trusts the bytes to be wasmtime's own output, as
+    // wasmtime cannot verify the code inside. They come from the host that
+    // embeds this runtime (the page, in a browser), which is trusted as much
+    // as the runtime itself: it supplies the language component's source too.
+    unsafe { Component::deserialize(engine, precompiled) }
+        .map_err(|e| anyhow!("{e}"))
 }
 
 pub async fn compile_wasm_component(

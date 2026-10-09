@@ -180,8 +180,8 @@ export const host = {
     await cacheFill;
   },
 
-  async installLanguage(language, wasmBytes) {
-    return await driven(bindings.pie_install_language(language, wasmBytes));
+  async installLanguage(language, wasmBytes, precompiled) {
+    return await driven(bindings.pie_install_language(language, wasmBytes, precompiled));
   },
   async install(bytes, file, version) {
     return await driven(bindings.pie_install_program(bytes, file, version ?? undefined));
