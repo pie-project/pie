@@ -4,72 +4,71 @@
 # the test geometries are models of it too, listed nowhere: a test traces
 # and imports them by id.
 
-def qwen(id, template = "qwen_3", tokenizer = "qwen_3", **kwargs):
-    return model(id, template = template, tokenizer = tokenizer, **kwargs)
+def qwen(id, layers, vocab = 248320, template = "qwen_3", tokenizer = "qwen_3", **kwargs):
+    return model(id, template = template, tokenizer = tokenizer, arch = "qwen3_5", layers = layers, vocab = vocab, **kwargs)
+
+def fixture(id):
+    return model(id, mini = True, template = "qwen_3", tokenizer = "qwen_3")
 
 MODELS = [
-    qwen("qwen36-27b", parts = ["vision"], drafters = ["mtp", "dflash"], arch = "qwen3_5", layers = 64, vocab = 248320),
-    qwen("qwen38-27b", template = "qwen_3_chatml_interleaved", tokenizer = "qwen_3.38", parts = ["vision"], drafters = ["mtp", "dflash2", "dspark"], arch = "qwen3_5", layers = 64, vocab = 248320),
-    qwen("qwen35-d0.8b", parts = ["vision"], drafters = ["eagle"], arch = "qwen3_5", layers = 24, vocab = 248320),
-    qwen("qwen35-d2b", arch = "qwen3_5", layers = 24, vocab = 248320),
-    qwen("qwen35-d3b", arch = "qwen3_5", layers = 24, vocab = 151936),
-    qwen("qwen35-d4b", arch = "qwen3_5", layers = 32, vocab = 248320),
-    qwen("qwen35-a3b", arch = "qwen3_5", layers = 40, vocab = 248320),
-    qwen("qwen35-d9b", drafters = ["dflash"], arch = "qwen3_5", layers = 32, vocab = 248320),
-    qwen("qwen36-35b-a3b", drafters = ["mtp", "dflash"], arch = "qwen3_5", layers = 40, vocab = 248320),
-    qwen("qwen35-tiny", mini = True, arch = "qwen3_5", layers = 4, vocab = 248320),
-    qwen("qwen36-35b-a3b-mini", mini = True, arch = "qwen3_5", layers = 5, vocab = 248320),
-    qwen("qwen36-35b-a3b-mini64", mini = True, arch = "qwen3_5", layers = 5, vocab = 248320),
-    # Listed nowhere.
-    qwen("qwen36-27b-bonsai", mini = True),
-    qwen("qwen3-a3b-micro", mini = True),
-    qwen("qwen3-a3b-uncached-bank", mini = True),
-    qwen("qwen3-micro-text", mini = True),
-    qwen("qwen3-micro-text-rotated", mini = True),
-    qwen("qwen3-micro-text-hd128", mini = True),
-    qwen("qwen3-micro-text-hd128-rotated", mini = True),
-    qwen("qwen3-micro-text-hd256", mini = True),
-    qwen("qwen3-micro-text-hd256-rotated", mini = True),
+    qwen("qwen36-27b", parts = ["vision"], drafters = ["mtp", "dflash"], layers = 64),
+    qwen("qwen38-27b", template = "qwen_3_chatml_interleaved", tokenizer = "qwen_3.38", parts = ["vision"], drafters = ["mtp", "dflash2", "dspark"], layers = 64),
+    qwen("qwen35-d0.8b", parts = ["vision"], drafters = ["eagle"], layers = 24),
+    qwen("qwen35-d2b", layers = 24),
+    qwen("qwen35-d3b", layers = 24, vocab = 151936),
+    qwen("qwen35-d4b", layers = 32),
+    qwen("qwen35-a3b", layers = 40),
+    qwen("qwen35-d9b", drafters = ["dflash"], layers = 32),
+    qwen("qwen36-35b-a3b", drafters = ["mtp", "dflash"], layers = 40),
+    qwen("qwen35-tiny", mini = True, layers = 4),
+    qwen("qwen36-35b-a3b-mini", mini = True, layers = 5),
+    qwen("qwen36-35b-a3b-mini64", mini = True, layers = 5),
+    fixture("qwen36-27b-bonsai"),
+    fixture("qwen3-a3b-micro"),
+    fixture("qwen3-a3b-uncached-bank"),
+    fixture("qwen3-micro-text"),
+    fixture("qwen3-micro-text-rotated"),
+    fixture("qwen3-micro-text-hd128"),
+    fixture("qwen3-micro-text-hd128-rotated"),
+    fixture("qwen3-micro-text-hd256"),
+    fixture("qwen3-micro-text-hd256-rotated"),
 ]
 
 U4 = dtype.u4g64
 BF = dtype.bf16
 
-def row(id, weights, drafter = None, parts = []):
-    return deployment(id, weights = weights, kv = BF, drafter = drafter, parts = parts)
-
 DEPLOYMENTS = [
-    row("qwen36-27b", U4, "mtp"),
-    row("qwen36-27b", U4, "dflash"),
-    row("qwen36-27b", U4),
-    row("qwen35-tiny", U4),
-    row("qwen35-d0.8b", U4),
-    row("qwen35-d2b", U4),
-    row("qwen35-d4b", U4),
-    row("qwen35-d9b", U4, "dflash"),
-    row("qwen35-d9b", U4),
-    row("qwen36-35b-a3b", U4, "dflash"),
-    row("qwen36-35b-a3b", U4, "mtp"),
-    row("qwen36-35b-a3b", U4),
-    row("qwen36-35b-a3b-mini", U4),
-    row("qwen36-35b-a3b-mini64", U4),
-    row("qwen36-27b", BF, "mtp"),
-    row("qwen38-27b", BF, "mtp"),
-    row("qwen38-27b", U4, "dflash2"),
-    row("qwen38-27b", U4, "dspark"),
-    row("qwen38-27b", U4, "mtp"),
-    row("qwen38-27b", U4),
-    row("qwen35-a3b", BF),
-    row("qwen35-d3b", BF),
-    row("qwen35-d0.8b", BF, "eagle"),
-    row("qwen35-d0.8b", BF),
-    row("qwen35-d0.8b", BF, "eagle", ["vision"]),
-    row("qwen36-27b", U4, None, ["vision"]),
-    row("qwen36-27b", BF, "mtp", ["vision"]),
-    row("qwen38-27b", U4, None, ["vision"]),
-    row("qwen38-27b", BF, "mtp", ["vision"]),
-    row("qwen35-d0.8b", U4, None, ["vision"]),
-    row("qwen35-d0.8b", BF, None, ["vision"]),
+    deployment("qwen36-27b", weights = U4, kv = BF, drafter = "mtp"),
+    deployment("qwen36-27b", weights = U4, kv = BF, drafter = "dflash"),
+    deployment("qwen36-27b", weights = U4, kv = BF),
+    deployment("qwen35-tiny", weights = U4, kv = BF),
+    deployment("qwen35-d0.8b", weights = U4, kv = BF),
+    deployment("qwen35-d2b", weights = U4, kv = BF),
+    deployment("qwen35-d4b", weights = U4, kv = BF),
+    deployment("qwen35-d9b", weights = U4, kv = BF, drafter = "dflash"),
+    deployment("qwen35-d9b", weights = U4, kv = BF),
+    deployment("qwen36-35b-a3b", weights = U4, kv = BF, drafter = "dflash"),
+    deployment("qwen36-35b-a3b", weights = U4, kv = BF, drafter = "mtp"),
+    deployment("qwen36-35b-a3b", weights = U4, kv = BF),
+    deployment("qwen36-35b-a3b-mini", weights = U4, kv = BF),
+    deployment("qwen36-35b-a3b-mini64", weights = U4, kv = BF),
+    deployment("qwen36-27b", weights = BF, kv = BF, drafter = "mtp"),
+    deployment("qwen38-27b", weights = BF, kv = BF, drafter = "mtp"),
+    deployment("qwen38-27b", weights = U4, kv = BF, drafter = "dflash2"),
+    deployment("qwen38-27b", weights = U4, kv = BF, drafter = "dspark"),
+    deployment("qwen38-27b", weights = U4, kv = BF, drafter = "mtp"),
+    deployment("qwen38-27b", weights = U4, kv = BF),
+    deployment("qwen35-a3b", weights = BF, kv = BF),
+    deployment("qwen35-d3b", weights = BF, kv = BF),
+    deployment("qwen35-d0.8b", weights = BF, kv = BF, drafter = "eagle"),
+    deployment("qwen35-d0.8b", weights = BF, kv = BF),
+    deployment("qwen35-d0.8b", weights = BF, kv = BF, drafter = "eagle", parts = ["vision"]),
+    deployment("qwen36-27b", weights = U4, kv = BF, parts = ["vision"]),
+    deployment("qwen36-27b", weights = BF, kv = BF, drafter = "mtp", parts = ["vision"]),
+    deployment("qwen38-27b", weights = U4, kv = BF, parts = ["vision"]),
+    deployment("qwen38-27b", weights = BF, kv = BF, drafter = "mtp", parts = ["vision"]),
+    deployment("qwen35-d0.8b", weights = U4, kv = BF, parts = ["vision"]),
+    deployment("qwen35-d0.8b", weights = BF, kv = BF, parts = ["vision"]),
 ]
 
 # The drafters published apart from the models they draft for.

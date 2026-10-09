@@ -4,28 +4,13 @@
 # miniature; and a micro model of toy widths for engine tests, which lists no
 # deployment.
 
+def flash(id, **kwargs):
+    return model(id, template = "qwen_3_chatml_interleaved", tokenizer = "qwen_3.38", **kwargs)
+
 MODELS = [
-    model(
-        "qwen38-flash-next",
-        template = "qwen_3_chatml_interleaved",
-        tokenizer = "qwen_3.38",
-        parts = ["vision"],
-        drafters = ["mtp"],
-        arch = "qwen4_exp", layers = 48, vocab = 248320,
-    ),
-    model(
-        "qwen38-flash-next-mini",
-        mini = True,
-        template = "qwen_3_chatml_interleaved",
-        tokenizer = "qwen_3.38",
-        arch = "qwen4_exp", layers = 4, vocab = 248320,
-    ),
-    model(
-        "qwen38-flash-next-micro",
-        mini = True,
-        template = "qwen_3_chatml_interleaved",
-        tokenizer = "qwen_3.38",
-    ),
+    flash("qwen38-flash-next", parts = ["vision"], drafters = ["mtp"], arch = "qwen4_exp", layers = 48, vocab = 248320),
+    flash("qwen38-flash-next-mini", mini = True, arch = "qwen4_exp", layers = 4, vocab = 248320),
+    flash("qwen38-flash-next-micro", mini = True),
 ]
 
 MIXED = [dtype.u4g64, dtype.u2g128]
