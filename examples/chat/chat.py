@@ -40,6 +40,13 @@ from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.styles import Style
 
+# The modes shown under the input box, cycled with Shift+Tab: (icon, label, colour)
+MODES = [
+    ("▸▸", "auto mode on", "#e6c44a"),
+    ("❚❚", "manual mode on", "#9a9a9a"),
+    ("▸▸", "accept edits on", "#a78bfa"),
+    ("❚❚", "plan mode on", "#5aa39a"),
+]
 ACCENT = "#d97757"  # the warm orange of the demo
 DIM = "#8a8a8a"
 MODEL = "default"  # the name the server answers to
@@ -213,6 +220,7 @@ class Chat:
         self.frame = 0  # which mascot frame is drawn; advanced by animate()
         self.exit_armed = False  # set by the first Ctrl-C or Ctrl-D on an empty prompt
         self.exit_key = ""  # which key armed the exit: "C" or "D"
+        self.mode = 0  # index into MODES; Shift+Tab cycles it
 
         self.input = Buffer(multiline=False)
         self.input_window = Window(
@@ -259,6 +267,10 @@ class Chat:
 
         text = "".join(t for _, t in self.render_transcript())
         return Point(x=0, y=text.count("\n"))
+
+    def mode_line(self) -> list[tuple[str, str]]:
+        icon, label, colour = MODES[self.mode]
+        return [(f"fg:{colour}", f"  {icon} {label}"), ("class:dim", " (shift+tab to cycle)")]
 
     def status(self) -> list[tuple[str, str]]:
         if self.exit_armed:
@@ -334,6 +346,11 @@ class Chat:
     def build(self) -> Application:
         bindings = KeyBindings()
 
+        @bindings.add("s-tab")
+        def _(event):
+            self.mode = (self.mode + 1) % len(MODES)
+            event.app.invalidate()
+
         @bindings.add("c-d")
         def _(event):
             # Like the Claude CLI: on an empty prompt, one press arms the exit and a
@@ -360,9 +377,10 @@ class Chat:
             dont_extend_width=True,
         )
         box = HSplit([rule, VSplit([prompt, self.input_window]), rule])
+        mode = Window(content=FormattedTextControl(self.mode_line), height=1)
         status = Window(content=FormattedTextControl(self.status), height=1, style="class:status")
 
-        root = HSplit([self.output, box, status])
+        root = HSplit([self.output, box, mode, status])
         self.app = Application(
             layout=Layout(root, focused_element=self.input_window),
             key_bindings=bindings,
