@@ -142,7 +142,6 @@ def shifted_sigmas(shift, steps):
 
 def generative(m):
     d = m.dims
-    p = lambda name, kind, at, width, streams: port(name, kind, width, streams, at = at)
     readings = []
     index = 0
     if m.te != None:
@@ -160,7 +159,7 @@ def generative(m):
         "refine",
         index = index,
         streams = ["text"],
-        ports = [p("caption", "context", 0, d.text_dim, ["text"])],
+        ports = [port("caption", "context", d.text_dim, ["text"], at = 0)],
         readout = "hidden",
         readout_width = d.dim,
     ))
@@ -170,12 +169,12 @@ def generative(m):
         index = index + 1,
         streams = every,
         ports = [
-            p("latents", "latents", 0, VIDEO_FEATURES, ["video"]),
-            p("reference", "latents", 1, VIDEO_FEATURES, ["reference"]),
-            p("audio", "latents", 2, AUDIO_CHANNELS, ["audio"]),
-            p("context", "latents", 3, d.dim, ["text"]),
-            p("timestep", "lane_vector", 0, TIMESTEP_SLOTS, every),
-            p("positions", "axis_positions", 0, ROPE_AXES, every),
+            port("latents", "latents", VIDEO_FEATURES, ["video"], at = 0),
+            port("reference", "latents", VIDEO_FEATURES, ["reference"], at = 1),
+            port("audio", "latents", AUDIO_CHANNELS, ["audio"], at = 2),
+            port("context", "latents", d.dim, ["text"], at = 3),
+            port("timestep", "lane_vector", TIMESTEP_SLOTS, every, at = 0),
+            port("positions", "axis_positions", ROPE_AXES, every, at = 0),
         ],
         readout = "velocity",
         readout_width = VIDEO_FEATURES,

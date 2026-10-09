@@ -1,20 +1,13 @@
 # The forward of Wan 2.2: the text encoder's reading, the denoiser's, and
 # the VAE's decode and encode, each in a head (first chunk) and a rest form.
 
+load("//lib/diffusion/forward.star", "attend", "chunks", "linear", "norm_modulate")
 
 NORM_EPS = 1e-6
 ROPE_THETA = 10000.0
-ROPE_AXES = 3
 T_MAX_PERIOD = 10000.0
-TE_VOCAB = 256384
-TE_HEAD_DIM = 64
 TE_EPS = 1e-6
-TE_BUCKETS = 32
 TE_MAX_DISTANCE = 128.0
-TE_MAX_TOKENS = 512
-VAE_Z = 48
-VAE_RGB = 3
-VAE_PATCH = 2
 VAE_EPS = 1e-12
 
 def slab(c):
@@ -56,33 +49,22 @@ def forward(m, inputs):
     if m.vae != None:
         inputs.reading("vae.decode.head", lambda rows: vae_decode(rows, m.vae, True))
         inputs.reading("vae.decode", lambda rows: vae_decode(rows, m.vae, False))
-        inputs.reading("vae.encode.head", lambda rows: vae_encode(rows, m.vae.enc, True))
-        inputs.reading("vae.encode", lambda rows: vae_encode(rows, m.vae.enc, False))
+        inputs.reading("vae.encode.head", lambda rows: vae_encode(rows, m.vae, True))
+        inputs.reading("vae.encode", lambda rows: vae_encode(rows, m.vae, False))
     return velocity
 
 def text_encode(arm, te):
     ids = arm.tokens()
-    perm = arm.row_permutation()
-    csr = arm.lane_indptr()
-    y = ops.layout.embed(ids, te.embed, TE_VOCAB)
+    rows = struct(perm = arm.row_permutation(), csr = arm.lane_indptr())
+    y = ops.layout.embed(ids, te.embed, te.vocab)
 
     def layer(l, w, y):
-        table = ops.elemwise.relative_bucket_bias(arm, w.rel_bias, TE_MAX_TOKENS, TE_BUCKETS, TE_MAX_DISTANCE, True)
+        table = ops.elemwise.relative_bucket_bias(arm, w.rel_bias, te.max_tokens, te.buckets, TE_MAX_DISTANCE, True)
         x = ops.elemwise.rmsnorm(y, w.attn_norm, TE_EPS)
         q = ops.linear.matmul(x, w.q)
         k = ops.linear.matmul(x, w.k)
         v = ops.linear.matmul(x, w.v)
-        o = ops.attn.ragged(
-            ops.layout.pack_rows(q, perm),
-            ops.layout.pack_rows(k, perm),
-            ops.layout.pack_rows(v, perm),
-            csr,
-            csr,
-            TE_HEAD_DIM,
-            1.0,
-            ops.attn.relative_bias(table, TE_MAX_TOKENS),
-        )
-        o = ops.layout.unpack_rows(o, perm)
+        o = attend(q, k, v, rows, rows, te.head_dim, 1.0, ops.attn.relative_bias(table, te.max_tokens))
         y = ops.elemwise.residual_add(ops.linear.matmul(o, w.o), y)
 
         x = ops.elemwise.rmsnorm(y, w.ffn_norm, TE_EPS)
@@ -95,24 +77,12 @@ def text_encode(arm, te):
     out = ops.elemwise.rmsnorm(y, te.final_norm, TE_EPS)
     seam.at(seam.HIDDEN, [out])
 
-def linear(w, x):
-    return ops.elemwise.add_bias(w.bias, ops.linear.matmul(x, w.w))
-
-def adaln6(e, dim):
-    attn_ss, rest = ops.layout.split_rows(e, 2 * dim)
-    attn_gate, rest = ops.layout.split_rows(rest, dim)
-    ffn_ss, ffn_gate = ops.layout.split_rows(rest, 2 * dim)
-    return struct(attn_ss = attn_ss, attn_gate = attn_gate, ffn_ss = ffn_ss, ffn_gate = ffn_gate)
-
-def norm_modulate(x, scale_shift, lanes):
-    return ops.elemwise.modulate(ops.elemwise.layernorm_no_scale(x, NORM_EPS), scale_shift, lanes, "scale_shift")
-
 def block(x, c, b, e, d, vg, cg):
     dim = d.dim
     hd = d.head_dim
-    m = adaln6(e, dim)
+    attn_ss, attn_gate, ffn_ss, ffn_gate = chunks(e, [2 * dim, dim, 2 * dim, dim])
 
-    h = norm_modulate(x, m.attn_ss, vg.lanes)
+    h = norm_modulate(x, attn_ss, vg.lanes, NORM_EPS)
     q, k, v = ops.layout.split_qkv(linear(b.self_attn.qkv, h), dim, dim)
 
     def turn(x, gain):
@@ -137,28 +107,18 @@ def block(x, c, b, e, d, vg, cg):
         group_block_diagonal(),
     )
     o = ops.layout.unpack_rows(o, vg.perm)
-    x = ops.elemwise.gated_residual_add(x, m.attn_gate, linear(b.self_attn.out, o), vg.lanes)
+    x = ops.elemwise.gated_residual_add(x, attn_gate, linear(b.self_attn.out, o), vg.lanes)
 
     hc = ops.elemwise.layernorm(x, b.norm2, b.norm2_bias, NORM_EPS)
     cq = ops.elemwise.rmsnorm(linear(b.cross.q, hc), b.cross.norm_q, NORM_EPS)
     ck, cv = ops.layout.split_rows(linear(b.cross.kv, c), dim)
     ck = ops.elemwise.rmsnorm(ck, b.cross.norm_k, NORM_EPS)
-    ca = ops.attn.ragged(
-        ops.layout.pack_rows(cq, vg.perm),
-        ops.layout.pack_rows(ck, cg.perm),
-        ops.layout.pack_rows(cv, cg.perm),
-        vg.csr,
-        cg.csr,
-        hd,
-        d.sm_scale,
-        group_block_diagonal(),
-    )
-    ca = ops.layout.unpack_rows(ca, vg.perm)
+    ca = attend(cq, ck, cv, vg, cg, hd, d.sm_scale, group_block_diagonal())
     x = ops.elemwise.residual_add(linear(b.cross.out, ca), x)
 
-    hf = norm_modulate(x, m.ffn_ss, vg.lanes)
+    hf = norm_modulate(x, ffn_ss, vg.lanes, NORM_EPS)
     f = linear(b.ffn.down, ops.elemwise.gelu(linear(b.ffn.up, hf), True))
-    return ops.elemwise.gated_residual_add(x, m.ffn_gate, f, vg.lanes)
+    return ops.elemwise.gated_residual_add(x, ffn_gate, f, vg.lanes)
 
 def denoise(arm, m):
     d = m.dims
@@ -166,7 +126,7 @@ def denoise(arm, m):
     ctx, vid = arm.on(fact.stream("context")), arm.on(~fact.stream("context"))
     vg = struct(
         lanes = vid.request_of_token(),
-        positions = vid.axis_positions(0, ROPE_AXES),
+        positions = vid.axis_positions(0, m.rope_axes),
         perm = vid.row_permutation(),
         csr = vid.group_indptr(),
     )
@@ -184,14 +144,14 @@ def denoise(arm, m):
     c = ctx.context(0, d.text_dim)
     c = linear(dit.text_embed.linear_2, ops.elemwise.gelu(linear(dit.text_embed.linear_1, c), True))
 
-    x = linear(dit.patch_embed, vid.latents(0, d.patch_in, dtype.bf16))
+    x = linear(dit.patch_embed, vid.latents(0, d.patch, dtype.bf16))
 
     def step(l, b, x):
         e = ops.elemwise.add_bias(b.table, ops.elemwise.copy(proj))
         return block(x, c, b, e, d, vg, cg)
 
     x = arm.fold_layers(dit.blocks, x, step)
-    h = norm_modulate(x, head_mod, vg.lanes)
+    h = norm_modulate(x, head_mod, vg.lanes, NORM_EPS)
     velocity = linear(dit.proj_out, h)
     seam.at(seam.VELOCITY, [velocity])
     return velocity
@@ -225,7 +185,7 @@ def mid_attention(x, g, a):
 
 def vae_decode(arm, vae, first):
     g0 = arm.grid()
-    z = arm.voxels(0, VAE_Z, dtype.bf16)
+    z = arm.voxels(0, vae.z, dtype.bf16)
     z = ops.elemwise.mul_scalar(0.5, ops.elemwise.add(z, z))
     z = ops.elemwise.standardize(z, vae.denorm_bias, vae.denorm_scale)
     z, g = vconv(z, g0, vae.post_quant, arm)
@@ -257,7 +217,7 @@ def vae_decode(arm, vae, first):
 
     x = norm_silu(x, vae.norm_out)
     y, gy = vconv(x, g, vae.conv_out, arm)
-    pixels, gp = ops.spatial.pixel_shuffle(y, gy, [1, VAE_PATCH, VAE_PATCH])
+    pixels, gp = ops.spatial.pixel_shuffle(y, gy, [1, vae.patch, vae.patch])
     pixels = ops.elemwise.clamp(pixels, -1.0, 1.0)
     seam.at(seam.PIXELS, [pixels, gp])
     return pixels
@@ -270,10 +230,11 @@ def downsample_time(x, g, c, arm):
     shape = conv3d(k = c.k, stride = [2, 1, 1], pad = [c.front, 0, 0], pad_back = [0, 0, 0], causal_t = True)
     return ops.spatial.conv3d(x, g, c.w, c.bias, shape, arm.state(c.cache))
 
-def vae_encode(arm, e, first):
+def vae_encode(arm, vae, first):
+    e = vae.enc
     g0 = arm.grid()
-    px = arm.voxels(1, VAE_RGB, dtype.bf16)
-    x, g = ops.spatial.pixel_unshuffle(px, g0, [1, VAE_PATCH, VAE_PATCH])
+    px = arm.voxels(1, vae.rgb, dtype.bf16)
+    x, g = ops.spatial.pixel_unshuffle(px, g0, [1, vae.patch, vae.patch])
     x, g = vconv(x, g, e.conv_in, arm)
 
     for b in e.down:

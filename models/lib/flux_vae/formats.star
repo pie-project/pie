@@ -1,11 +1,6 @@
 # The Flux VAE as diffusers names it, under `vae.`.
 
-load("//lib/diffusion/formats.star", "biased")
-
-def conv(reads, c, stem):
-    name = stem + ".weight"
-    reads.read_expr(c.w, src(name).transmute(c.w.shape, stored(name)))
-    reads.read(c.bias, stem + ".bias")
+load("//lib/diffusion/formats.star", "biased", "conv")
 
 def conv_head(reads, c, stem, rows_stored):
     """The convolution `c`: the first of the `rows_stored` output channels

@@ -2,11 +2,12 @@
 # rope, routed and shared experts), the timestep embedders, and the U-Net
 # blocks that take a latent clip into the trunk and its rows back out.
 
+load("//lib/diffusion/model.star", "linear")
+
 TRAIN_STEPS = 1000
 FLOW_SHIFT = 3.0
 ROPE_AXES = 2
 T_FREQ_DIM = 256
-GN_GROUPS = 32
 PATCH = 1
 LATENT_CHANNELS = 32
 SPATIAL_COMPRESSION = 16
@@ -41,12 +42,6 @@ DIMS = {
         head_hidden = 64,
     ),
 }
-
-def linear(name, out, in_, banks):
-    return struct(
-        w = weight(name, [out, in_], banks),
-        bias = weight(name + ".bias", [out], compute(banks)),
-    )
 
 def conv(name, c_out, c_in, k, banks):
     taps = k[0] * k[1] * k[2]
@@ -121,6 +116,9 @@ def layout(id, deploy):
     return struct(
         dims = d,
         kv = deploy.kv,
+        rope_axes = ROPE_AXES,
+        t_freq_dim = T_FREQ_DIM,
+        latent_channels = LATENT_CHANNELS,
         q_width = q_w,
         kv_width = kv_w,
         sm_scale = f32(1.0 / f32(sqrt(hd))),
@@ -128,10 +126,7 @@ def layout(id, deploy):
         head = weight("lm_head", [d.vocab, hidden], banks),
         final_norm = weight("ln_f", [hidden], dense),
         layers = [layer(l) for l in range(d.layers)],
-        timestep_emb = struct(
-            mlp_in = linear("timestep_emb.in", hidden, T_FREQ_DIM, banks),
-            mlp_out = linear("timestep_emb.out", 2 * hidden, hidden, banks),
-        ),
+        timestep_emb = embedder("timestep_emb", hidden, 2 * hidden, banks),
         time_embed = embedder("time_embed", hidden, hidden, banks),
         time_embed_2 = embedder("time_embed_2", hidden, hidden, banks),
         patch_embed = struct(

@@ -12,6 +12,13 @@ def packed(reads, w, stems):
     reads.read_concat(w.w, [s + ".weight" for s in stems])
     reads.read_concat(w.bias, [s + ".bias" for s in stems])
 
+def conv(reads, c, stem):
+    """The convolution `c` from `stem`, its kernel transmuted to the taps-major
+    plane the layout holds."""
+    name = stem + ".weight"
+    reads.read_expr(c.w, src(name).transmute(c.w.shape, stored(name)))
+    reads.read(c.bias, stem + ".bias")
+
 def adaln_order(slices):
     """The order a layout takes an adaLN projection's `slices` slices in
     from a checkpoint's: each (shift, scale) pair as (scale, shift), each

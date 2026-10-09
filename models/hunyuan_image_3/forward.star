@@ -2,14 +2,13 @@
 # and the canvas rows it denoises; the `image.in` and `image.out` readings
 # run its U-Net ends over a latent clip and the trunk's rows.
 
+load("//lib/diffusion/forward.star", "linear")
+
 NORM_EPS = 1e-5
 ROPE_THETA = 10000.0
-ROPE_AXES = 2
-T_FREQ_DIM = 256
 T_MAX_PERIOD = 10000.0
 GN_GROUPS = 32
 GN_EPS = 1e-5
-LATENT_CHANNELS = 32
 
 def caches(m, c):
     kv = c.kv_space(m.kv)
@@ -29,9 +28,6 @@ def forward(m, inputs):
     canvas_rows = trunk_rows.on(on_canvas())
     return trunk(trunk_rows, canvas_rows, m)
 
-def linear(w, x):
-    return ops.elemwise.add_bias(w.bias, ops.linear.matmul(x, w.w))
-
 def embedder(e, t_freq):
     return linear(e.mlp_out, ops.elemwise.gelu(linear(e.mlp_in, t_freq), True))
 
@@ -47,7 +43,7 @@ def trunk(all, den, m):
     plan_pre = ops.attn.plan_prefill(ar_prefill, d.q_heads, d.kv_heads, hd, None)
     mask = canvas_in.mask()
 
-    positions = all.axis_positions(0, ROPE_AXES)
+    positions = all.axis_positions(0, m.rope_axes)
     y = ops.layout.embed(all.tokens(), m.embed, d.vocab)
     encoded = y.on(~on_canvas())
     y = merge([canvas_rows(den, m), encoded])
@@ -113,7 +109,7 @@ def canvas_rows(arm, m):
     lanes = arm.request_of_token()
 
     t = arm.lane_vector(0, 1)
-    freqs = ops.elemwise.sinusoid(t, T_FREQ_DIM, T_MAX_PERIOD, True, 1.0)
+    freqs = ops.elemwise.sinusoid(t, m.t_freq_dim, T_MAX_PERIOD, True, 1.0)
     doubled = embedder(m.timestep_emb, freqs)
 
     spread = ops.linear.matmul(flag, m.ones)
@@ -124,36 +120,39 @@ def canvas_rows(arm, m):
     kept = ops.elemwise.modulate(u, neg, None, "scale")
     return ops.elemwise.add(kept, ops.elemwise.mul(special, pos))
 
-def conv_(x, g, c):
+def convolve(x, g, c):
     shape = conv(c.k, [1, 1, 1], [0, c.k[1] // 2, c.k[2] // 2])
     return ops.spatial.conv3d(x, g, c.w, c.bias, shape, None)
 
+def group_norm(x, g, n, silu):
+    return ops.spatial.group_norm(x, g, GN_GROUPS, n.weight, n.bias, GN_EPS, silu)
+
 def resblock(x, g, r, temb):
-    h = ops.spatial.group_norm(x, g, GN_GROUPS, r.norm_in.weight, r.norm_in.bias, GN_EPS, True)
-    h, g1 = conv_(h, g, r.conv_in)
+    h = group_norm(x, g, r.norm_in, True)
+    h, g1 = convolve(h, g, r.conv_in)
     mod = linear(r.emb, ops.elemwise.silu(temb))
-    h = ops.spatial.group_norm(h, g1, GN_GROUPS, r.norm_out.weight, r.norm_out.bias, GN_EPS, False)
+    h = group_norm(h, g1, r.norm_out, False)
     h = ops.elemwise.modulate(h, mod, None, "scale_shift")
     h = ops.elemwise.silu(h)
-    h, _ = conv_(h, g1, r.conv_out)
-    skip = conv_(x, g, r.skip)[0] if r.skip != None else x
+    h, _ = convolve(h, g1, r.conv_out)
+    skip = convolve(x, g, r.skip)[0] if r.skip != None else x
     return ops.elemwise.add(skip, h)
 
 def image_in(arm, m):
     g = arm.grid()
-    clip = arm.voxels(0, LATENT_CHANNELS + T_FREQ_DIM, dtype.bf16)
-    z, freqs = ops.layout.split_rows(clip, LATENT_CHANNELS)
+    clip = arm.voxels(0, m.latent_channels + m.t_freq_dim, dtype.bf16)
+    z, freqs = ops.layout.split_rows(clip, m.latent_channels)
     temb = embedder(m.time_embed, freqs)
-    h, g1 = conv_(z, g, m.patch_embed.conv_in)
+    h, g1 = convolve(z, g, m.patch_embed.conv_in)
     x = resblock(h, g1, m.patch_embed.res, temb)
     seam.at(seam.PIXELS, [x, g1])
 
 def image_out(arm, m):
     g = arm.grid()
-    clip = arm.voxels(1, m.dims.hidden + T_FREQ_DIM, dtype.bf16)
+    clip = arm.voxels(1, m.dims.hidden + m.t_freq_dim, dtype.bf16)
     rows, freqs = ops.layout.split_rows(clip, m.dims.hidden)
     temb = embedder(m.time_embed_2, freqs)
     x = resblock(rows, g, m.final_layer.res, temb)
-    h = ops.spatial.group_norm(x, g, GN_GROUPS, m.final_layer.norm_out.weight, m.final_layer.norm_out.bias, GN_EPS, True)
-    v, gv = conv_(h, g, m.final_layer.conv_out)
+    h = group_norm(x, g, m.final_layer.norm_out, True)
+    v, gv = convolve(h, g, m.final_layer.conv_out)
     seam.at(seam.PIXELS, [v, gv])

@@ -2,8 +2,8 @@
 # under `dit.`, `te.` and `vae.`; or, for a model of the transformer alone,
 # a bare transformer state_dict.
 
-load("//lib/diffusion/formats.star", "adaln_order", "reordered")
-load("//lib/flux_vae/formats.star", "conv", "conv_head", vae_read = "read")
+load("//lib/diffusion/formats.star", "adaln_order", "conv", "reordered")
+load("//lib/flux_vae/formats.star", "conv_head", vae_read = "read")
 load("//lib/qwen3_text/formats.star", te_read = "read")
 
 DIFFUSERS = "a diffusers pipeline (`dit.`/`te.`/`vae.` prefixes)"

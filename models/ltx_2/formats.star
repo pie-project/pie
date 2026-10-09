@@ -2,13 +2,11 @@
 # transformer under `dit.`, the text connectors under `connectors.` and the
 # VAE under `vae.`.
 
-MOD_SLICES = 9
+load("//lib/diffusion/formats.star", "adaln_order", "biased", "packed", "reordered")
+
 AV_SS_SLICES = 4
 AV_GATE_SLICES = 1
-PROMPT_SLICES = 2
-HEAD_SLICES = 2
 VAE_RGB = 3
-VAE_PATCH = 4
 
 def formats(m):
     return [format("diffusers", read = lambda reads: read(m, reads))]
@@ -34,7 +32,7 @@ def vae(reads, v):
         vae_conv(reads, up.upsampler, stem + ".upsamplers.0.conv")
         for r, res in enumerate(up.resnets):
             vae_resnet(reads, res, "{}.resnets.{}".format(stem, r))
-    vae_conv(reads, v.conv_out, at("decoder.conv_out"), conv_out_rows())
+    vae_conv(reads, v.conv_out, at("decoder.conv_out"), conv_out_rows(v.patch))
 
 def vae_resnet(reads, r, stem):
     vae_conv(reads, r.conv1, stem + ".conv1")
@@ -51,8 +49,7 @@ def vae_conv(reads, c, stem, rows = None):
         reads.read_over(c.w, name, lambda e: e.transmute(c.w.shape, held))
         reads.read(c.bias, bias)
 
-def conv_out_rows():
-    p = VAE_PATCH
+def conv_out_rows(p):
     rows = []
     for c in range(VAE_RGB):
         for ph in range(p):
@@ -70,34 +67,24 @@ def dit(reads, m, d):
     at = lambda tail: "dit." + tail
     stream(reads, m.video, at("proj_in"), at("time_embed"), "", d.dim)
     stream(reads, m.audio, at("audio_proj_in"), at("audio_time_embed"), "audio_", d.audio_dim)
-    adaln(reads, m.prompt, at("prompt_adaln"), d.dim, [1, 0])
-    adaln(reads, m.audio_prompt, at("audio_prompt_adaln"), d.audio_dim, [1, 0])
+    adaln(reads, m.prompt, at("prompt_adaln"), d.dim, adaln_order(2))
+    adaln(reads, m.audio_prompt, at("audio_prompt_adaln"), d.audio_dim, adaln_order(2))
     for i, b in enumerate(m.blocks):
         transformer_block(reads, b, at("transformer_blocks.{}".format(i)), d)
 
-def av_stem(prefix):
-    return "video" if prefix == "" else "audio"
-
-def av_gate(prefix):
-    return "a2v" if prefix == "" else "v2a"
-
 def stream(reads, s, proj_in, time_embed, prefix, dim):
+    video = prefix == ""
     biased(reads, s.patchify, proj_in)
-    adaln(reads, s.adaln, time_embed, dim, [1, 0, 2, 4, 3, 5, 7, 6, 8])
+    adaln(reads, s.adaln, time_embed, dim, adaln_order(9))
     l2 = time_embed + ".emb.timestep_embedder.linear_2"
     rows = list(range(dim)) + list(range(dim))
     twice = lambda tail: src(l2 + "." + tail).gather(0, rows)
     reads.read_expr(s.head_proj.w, twice("weight"))
     reads.read_expr(s.head_proj.bias, twice("bias"))
-    table(reads, s.head_table, "dit.{}scale_shift_table".format(prefix), HEAD_SLICES, [1, 0])
-    adaln(reads, s.av_ss, "dit.av_cross_attn_{}_scale_shift".format(av_stem(prefix)), dim, [0, 1, 2, 3])
-    adaln(
-        reads,
-        s.av_gate,
-        "dit.av_cross_attn_{}_{}_gate".format(av_stem(prefix), av_gate(prefix)),
-        dim,
-        [0],
-    )
+    table(reads, s.head_table, "dit.{}scale_shift_table".format(prefix), adaln_order(2))
+    av = "dit.av_cross_attn_{}".format("video" if video else "audio")
+    adaln(reads, s.av_ss, av + "_scale_shift", dim, [0, 1, 2, 3])
+    adaln(reads, s.av_gate, av + ("_a2v_gate" if video else "_v2a_gate"), dim, [0])
     biased(reads, s.proj_out, "dit.{}proj_out".format(prefix))
 
 def adaln(reads, head, stem, dim, order):
@@ -105,8 +92,8 @@ def adaln(reads, head, stem, dim, order):
     biased(reads, head.embed.linear_1, emb + ".linear_1")
     biased(reads, head.embed.linear_2, emb + ".linear_2")
     proj = stem + ".linear"
-    reads.read_expr(head.proj.w, reordered(proj + ".weight", order, dim, 0))
-    reads.read_expr(head.proj.bias, reordered(proj + ".bias", order, dim, 0))
+    reads.read_expr(head.proj.w, ordered(proj + ".weight", order, dim))
+    reads.read_expr(head.proj.bias, ordered(proj + ".bias", order, dim))
 
 def transformer_block(reads, b, stem, d):
     side(reads, b.video, stem, "", d.dim)
@@ -115,11 +102,11 @@ def transformer_block(reads, b, stem, d):
     attention(reads, b.v2a, stem + ".video_to_audio_attn")
 
 def side(reads, s, stem, prefix, dim):
-    table(reads, s.table, "{}.{}scale_shift_table".format(stem, prefix), MOD_SLICES, [1, 0, 2, 4, 3, 5, 7, 6, 8])
-    av = "{}.{}_a2v_cross_attn_scale_shift_table".format(stem, av_stem(prefix))
+    table(reads, s.table, "{}.{}scale_shift_table".format(stem, prefix), adaln_order(9))
+    av = "{}.{}_a2v_cross_attn_scale_shift_table".format(stem, "video" if prefix == "" else "audio")
     banded(reads, s.av_ss_table, av, 0, AV_SS_SLICES)
     banded(reads, s.av_gate_table, av, AV_SS_SLICES, AV_GATE_SLICES)
-    table(reads, s.prompt_table, "{}.{}prompt_scale_shift_table".format(stem, prefix), PROMPT_SLICES, [1, 0])
+    table(reads, s.prompt_table, "{}.{}prompt_scale_shift_table".format(stem, prefix), adaln_order(2))
     attention(reads, s.self_attn, "{}.{}attn1".format(stem, prefix))
     attention(reads, s.cross, "{}.{}attn2".format(stem, prefix))
     feed_forward(reads, s.ffn, "{}.{}ff".format(stem, prefix))
@@ -146,24 +133,16 @@ def connector(reads, conn, stem):
         attention(reads, b.attn, at + ".attn1")
         feed_forward(reads, b.ffn, at + ".ff")
 
-def biased(reads, w, stem):
-    reads.read(w.w, stem + ".weight")
-    if w.bias != None:
-        reads.read(w.bias, stem + ".bias")
-
-def packed(reads, w, stems):
-    reads.read_concat(w.w, [s + ".weight" for s in stems])
-    reads.read_concat(w.bias, [s + ".bias" for s in stems])
-
-def table(reads, w, name, slices, order):
+def table(reads, w, name, order):
     held = stored(name)
-    reads.read_expr(w, reordered(name, order, 1, 0).transmute(w.shape, held))
+    reads.read_expr(w, ordered(name, order, 1).transmute(w.shape, held))
 
 def banded(reads, w, name, start, length):
     held = stored(name)
     reads.read_expr(w, src(name).slice(0, start, length).transmute(w.shape, held))
 
-def reordered(name, order, width, axis):
+def ordered(name, order, width):
+    """`name`'s `width`-wide slices in `order`; as stored if that is theirs."""
     if order == list(range(len(order))):
         return src(name)
-    return concat(axis, [src(name).slice(axis, i * width, width) for i in order])
+    return reordered(src(name), order, width)

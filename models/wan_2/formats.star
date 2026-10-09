@@ -2,11 +2,11 @@
 # components under `dit.`, `te.` and `vae.`; or, for a denoiser alone, a bare
 # transformer state_dict.
 
+load("//lib/diffusion/formats.star", "adaln_order", "biased", "packed", "reordered")
+load("//lib/reads/formats.star", "product")
+
 MOD_SLICES = 6
 HEAD_SLICES = 2
-VAE_Z = 48
-VAE_RGB = 3
-VAE_PATCH = 2
 
 VAE_LATENTS_MEAN = [
     -0.2289, -0.0052, -0.1323, -0.2339, -0.2799, 0.0174, 0.1838, 0.1557, -0.1382, 0.0542, 0.2813,
@@ -43,25 +43,13 @@ def read(m, reads, prefix):
     if m.vae != None:
         vae(reads, m.vae)
 
-def biased(reads, w, stem):
-    reads.read(w.w, stem + ".weight")
-    reads.read(w.bias, stem + ".bias")
-
-def packed(reads, w, stems):
-    reads.read_concat(w.w, [s + ".weight" for s in stems])
-    reads.read_concat(w.bias, [s + ".bias" for s in stems])
-
 def transmuted(reads, w, name):
     held = stored(name)
     reads.read_over(w, name, lambda e: e.transmute(w.shape, held))
 
-def slices_reordered(e, slices, width, axis):
-    order = {2: [1, 0], 6: [1, 0, 2, 4, 3, 5]}[slices]
-    return concat(axis, [e.slice(axis, i * width, width) for i in order])
-
 def table(reads, w, name, slices):
     held = stored(name)
-    reads.read_over(w, name, lambda e: slices_reordered(e, slices, 1, 1).transmute(w.shape, held))
+    reads.read_over(w, name, lambda e: reordered(e, adaln_order(slices), 1, 1).transmute(w.shape, held))
 
 def head_rows(c_out):
     rows = []
@@ -77,10 +65,10 @@ def time_conv_rows(c):
         rows += [ch, c + ch]
     return rows
 
-def conv_out_rows():
-    p = VAE_PATCH
+def conv_out_rows(v):
+    p = v.patch
     rows = []
-    for c in range(VAE_RGB):
+    for c in range(v.rgb):
         for ph in range(p):
             for pw in range(p):
                 rows.append(c * p * p + pw * p + ph)
@@ -103,7 +91,7 @@ def dit(reads, m, d, prefix):
     reads.read_over(m.head_proj.w, l2 + ".weight", doubled)
     reads.read_over(m.head_proj.bias, l2 + ".bias", doubled)
     proj = cond("time_proj")
-    swap = lambda e: slices_reordered(e, MOD_SLICES, dim, 0)
+    swap = lambda e: reordered(e, adaln_order(MOD_SLICES), dim)
     reads.read_over(m.time_proj.w, proj + ".weight", swap)
     reads.read_over(m.time_proj.bias, proj + ".bias", swap)
 
@@ -111,7 +99,7 @@ def dit(reads, m, d, prefix):
         transformer_block(reads, b, at("blocks.{}".format(i)))
 
     table(reads, m.head_table, at("scale_shift_table"), HEAD_SLICES)
-    rows = head_rows(d.out_channels)
+    rows = head_rows(d.channels)
     reads.read_over(m.proj_out.w, at("proj_out.weight"), lambda e: e.gather(0, rows))
     reads.read_over(m.proj_out.bias, at("proj_out.bias"), lambda e: e.gather(0, rows))
 
@@ -162,18 +150,13 @@ def row_of(reads, w, seed, value):
     held = stored(seed)
     if held.raw == None:
         fail("`{}`: `{}` is stored {}; a stated row wants a raw dtype".format(w.name, seed, held))
-    n = 1
-    for x in w.shape:
-        n *= x
+    n = product(w.shape)
     values = [value(i) for i in range(n)]
     want = encoding(w.dtype)
     row = constant(w.name, values, [n], held.raw)
     if want != held:
         row = row.cast(want)
     reads.push(tensor(w.name, row, want, shape = w.shape))
-
-def gamma(reads, w, name):
-    transmuted(reads, w, name)
 
 def conv(reads, c, stem, rows = None):
     name = stem + ".weight"
@@ -186,15 +169,15 @@ def conv(reads, c, stem, rows = None):
         reads.read(c.bias, stem + ".bias")
 
 def resnet(reads, r, stem):
-    gamma(reads, r.norm1, stem + ".norm1.gamma")
+    transmuted(reads, r.norm1, stem + ".norm1.gamma")
     conv(reads, r.conv1, stem + ".conv1")
-    gamma(reads, r.norm2, stem + ".norm2.gamma")
+    transmuted(reads, r.norm2, stem + ".norm2.gamma")
     conv(reads, r.conv2, stem + ".conv2")
     if r.shortcut != None:
         conv(reads, r.shortcut, stem + ".conv_shortcut")
 
 def mid_attention(reads, a, attn):
-    gamma(reads, a.norm, attn + ".norm.gamma")
+    transmuted(reads, a.norm, attn + ".norm.gamma")
     transmuted(reads, a.qkv.w, attn + ".to_qkv.weight")
     reads.read(a.qkv.bias, attn + ".to_qkv.bias")
     transmuted(reads, a.proj.w, attn + ".proj.weight")
@@ -224,11 +207,12 @@ def vae(reads, v):
                 conv(reads, u.time_conv, stem + ".time_conv", time_conv_rows(u.time_conv.c_in))
             conv(reads, u.resample, stem + ".resample.1")
 
-    gamma(reads, v.norm_out, at("decoder.norm_out.gamma"))
-    conv(reads, v.conv_out, at("decoder.conv_out"), conv_out_rows())
-    encoder(reads, v.enc)
+    transmuted(reads, v.norm_out, at("decoder.norm_out.gamma"))
+    conv(reads, v.conv_out, at("decoder.conv_out"), conv_out_rows(v))
+    encoder(reads, v)
 
-def encoder(reads, e):
+def encoder(reads, v):
+    e = v.enc
     at = lambda tail: "vae." + tail
     std = lambda i: f32(VAE_LATENTS_STD[i])
     row_of(reads, e.norm_bias, at("quant_conv.bias"), lambda i: f32(VAE_LATENTS_MEAN[i]))
@@ -236,7 +220,7 @@ def encoder(reads, e):
 
     name = at("encoder.conv_in.weight")
     held = stored(name)
-    cols = conv_out_rows()
+    cols = conv_out_rows(v)
     reads.read_over(e.conv_in.w, name, lambda x: x.gather(1, cols).transmute(e.conv_in.w.shape, held))
     reads.read(e.conv_in.bias, at("encoder.conv_in.bias"))
 
@@ -254,9 +238,9 @@ def encoder(reads, e):
     mid_attention(reads, e.mid_attn, at("encoder.mid_block.attentions.0"))
     resnet(reads, e.mid_res1, at("encoder.mid_block.resnets.1"))
 
-    gamma(reads, e.norm_out, at("encoder.norm_out.gamma"))
+    transmuted(reads, e.norm_out, at("encoder.norm_out.gamma"))
     conv(reads, e.conv_out, at("encoder.conv_out"))
     name = at("quant_conv.weight")
     held = stored(name)
-    reads.read_over(e.quant.w, name, lambda x: x.slice(0, 0, VAE_Z).transmute(e.quant.w.shape, held))
-    reads.read_over(e.quant.bias, at("quant_conv.bias"), lambda x: x.slice(0, 0, VAE_Z))
+    reads.read_over(e.quant.w, name, lambda x: x.slice(0, 0, v.z).transmute(e.quant.w.shape, held))
+    reads.read_over(e.quant.bias, at("quant_conv.bias"), lambda x: x.slice(0, 0, v.z))

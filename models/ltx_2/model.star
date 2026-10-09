@@ -2,6 +2,8 @@
 # self- and cross-attention and their attention across to each other; the
 # text connectors that refine the prompt for each; and the video VAE decoder.
 
+load("//lib/diffusion/model.star", "embedder", "linear", "packed_linear")
+
 PATCH_T = 1
 PATCH_H = 1
 PATCH_W = 1
@@ -26,63 +28,70 @@ DISTILLED_SIGMAS = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421
 TEXT_LAYERS = 49
 TEXT_LEN = 1024
 CONN_FF_MULT = 4
+HEAD_DIM = 128
+AUDIO_HEAD_DIM = 64
+CHANNELS = 128
+FF_MULT = 4
 
-def dims(layers, heads, head_dim, audio_heads, audio_head_dim, channels, cross_dim, audio_cross_dim, ff_mult, caption, conn_layers):
-    dim = heads * head_dim
-    audio_dim = audio_heads * audio_head_dim
+def dims(layers, heads, audio_heads, cross_dim, audio_cross_dim, caption, conn_layers):
+    dim = heads * HEAD_DIM
+    audio_dim = audio_heads * AUDIO_HEAD_DIM
     f = dim // (2 * ROPE_AXES)
     return struct(
         layers = layers,
         heads = heads,
-        head_dim = head_dim,
+        head_dim = HEAD_DIM,
         audio_heads = audio_heads,
-        audio_head_dim = audio_head_dim,
-        channels = channels,
+        audio_head_dim = AUDIO_HEAD_DIM,
+        channels = CHANNELS,
         cross_dim = cross_dim,
         audio_cross_dim = audio_cross_dim,
-        ff_mult = ff_mult,
         caption = caption,
         conn_layers = conn_layers,
         dim = dim,
         audio_dim = audio_dim,
-        av_inner = audio_dim,
         text_in = caption * TEXT_LAYERS,
         rope_dims = [2 * f, 2 * f, 2 * f, 0],
         audio_rope_dims = [audio_dim, 0, 0, 0],
-        av_rope_dims = [audio_dim, 0, 0, 0],
     )
 
 DIMS = {
-    "ltx25": dims(48, 32, 128, 32, 64, 128, 4096, 2048, 4, 3840, 8),
-    "ltx25-mini": dims(2, 2, 128, 2, 64, 128, 256, 128, 4, 16, 1),
+    "ltx25": dims(
+        layers = 48,
+        heads = 32,
+        audio_heads = 32,
+        cross_dim = 4096,
+        audio_cross_dim = 2048,
+        caption = 3840,
+        conn_layers = 8,
+    ),
+    "ltx25-mini": dims(
+        layers = 2,
+        heads = 2,
+        audio_heads = 2,
+        cross_dim = 256,
+        audio_cross_dim = 128,
+        caption = 16,
+        conn_layers = 1,
+    ),
 }
-
-def sm_scale(head_dim):
-    return f32(1.0 / f32(sqrt(head_dim)))
-
-def linear(name, out, in_, banks, bias = True):
-    return struct(
-        w = weight(name, [out, in_], banks),
-        bias = weight(name + ".bias", [out], compute(banks)) if bias else None,
-    )
-
-def packed_linear(name, seams, in_, banks):
-    out = 0
-    for s in seams:
-        out += s
-    return struct(
-        w = weight(name, [out, in_], banks).packed(seams),
-        bias = weight(name + ".bias", [out], compute(banks)).packed(seams),
-    )
 
 def gain(name, width, banks):
     return weight(name, [width], compute(banks))
 
-def attn_own(prefix, dim, heads, head_dim, banks):
+def attention(prefix, dim, heads, head_dim, banks, ctx = None):
+    """Self-attention, or (given the `ctx` width it attends) cross-attention,
+    gated per head."""
     inner = heads * head_dim
+    if ctx == None:
+        qkv = packed_linear(prefix + ".qkv", [inner, inner, inner], dim, banks)
+        kv = None
+    else:
+        qkv = linear(prefix + ".q", inner, dim, banks)
+        kv = packed_linear(prefix + ".kv", [inner, inner], ctx, banks)
     return struct(
-        qkv = packed_linear(prefix + ".qkv", [inner, inner, inner], dim, banks),
-        kv = None,
+        qkv = qkv,
+        kv = kv,
         q_norm = gain(prefix + ".q_norm", inner, banks),
         k_norm = gain(prefix + ".k_norm", inner, banks),
         gate = linear(prefix + ".gate", heads, dim, banks),
@@ -90,22 +99,7 @@ def attn_own(prefix, dim, heads, head_dim, banks):
         heads = heads,
         head_dim = head_dim,
         inner = inner,
-        sm_scale = sm_scale(head_dim),
-    )
-
-def attn_cross(prefix, dim, ctx, heads, head_dim, banks):
-    inner = heads * head_dim
-    return struct(
-        qkv = linear(prefix + ".q", inner, dim, banks),
-        kv = packed_linear(prefix + ".kv", [inner, inner], ctx, banks),
-        q_norm = gain(prefix + ".q_norm", inner, banks),
-        k_norm = gain(prefix + ".k_norm", inner, banks),
-        gate = linear(prefix + ".gate", heads, dim, banks),
-        out = linear(prefix + ".out", dim, inner, banks),
-        heads = heads,
-        head_dim = head_dim,
-        inner = inner,
-        sm_scale = sm_scale(head_dim),
+        sm_scale = f32(1.0 / f32(sqrt(head_dim))),
     )
 
 def ffn(prefix, dim, mult, bias, banks):
@@ -124,22 +118,16 @@ def block(prefix, d, banks):
             av_ss_table = table(stem + ".av_ss_table", AV_SS_SLICES, width),
             av_gate_table = table(stem + ".av_gate_table", AV_GATE_SLICES, width),
             prompt_table = table(stem + ".prompt_table", PROMPT_SLICES, width),
-            self_attn = attn_own(stem + ".self", width, heads, head_dim, banks),
-            cross = attn_cross(stem + ".cross", width, ctx, heads, head_dim, banks),
-            ffn = ffn(stem + ".ffn", width, d.ff_mult, bias, banks),
+            self_attn = attention(stem + ".self", width, heads, head_dim, banks),
+            cross = attention(stem + ".cross", width, heads, head_dim, banks, ctx),
+            ffn = ffn(stem + ".ffn", width, FF_MULT, bias, banks),
         )
 
     return struct(
         video = side(prefix + ".video", d.dim, d.heads, d.head_dim, d.cross_dim, False),
         audio = side(prefix + ".audio", d.audio_dim, d.audio_heads, d.audio_head_dim, d.audio_cross_dim, True),
-        a2v = attn_cross(prefix + ".a2v", d.dim, d.audio_dim, d.audio_heads, d.audio_head_dim, banks),
-        v2a = attn_cross(prefix + ".v2a", d.audio_dim, d.dim, d.audio_heads, d.audio_head_dim, banks),
-    )
-
-def embedder(prefix, in_, dim, banks):
-    return struct(
-        linear_1 = linear(prefix + ".1", dim, in_, banks),
-        linear_2 = linear(prefix + ".2", dim, dim, banks),
+        a2v = attention(prefix + ".a2v", d.dim, d.audio_heads, d.audio_head_dim, banks, d.audio_dim),
+        v2a = attention(prefix + ".v2a", d.audio_dim, d.audio_heads, d.audio_head_dim, banks, d.dim),
     )
 
 def adaln(prefix, dim, slices, banks):
@@ -166,7 +154,7 @@ def connector(prefix, text_in, dim, heads, layers, caption, banks):
         aggregate = linear(prefix + ".aggregate", dim, text_in, banks),
         blocks = [
             struct(
-                attn = attn_own("{}.block.{}.attn".format(prefix, l), dim, heads, head_dim, banks),
+                attn = attention("{}.block.{}.attn".format(prefix, l), dim, heads, head_dim, banks),
                 ffn = ffn("{}.block.{}.ffn".format(prefix, l), dim, CONN_FF_MULT, True, banks),
             )
             for l in range(layers)
@@ -209,6 +197,8 @@ def vae(banks):
     dense = compute(banks)
     row = lambda name: weight(name, [VAE_Z], dense)
     return struct(
+        z = VAE_Z,
+        patch = VAE_PATCH,
         latents_mean = row("vae.latents_mean"),
         latents_std = row("vae.latents_std"),
         zero = row("vae.zero"),
@@ -225,6 +215,8 @@ def layout(id, deploy):
     d = DIMS[id]
     return struct(
         dims = d,
+        rope_axes = ROPE_AXES,
+        t_freq_dim = T_FREQ_DIM,
         dit = struct(
             video = stream("dit.video", d.channels, d.dim, banks),
             audio = stream("dit.audio", d.channels, d.audio_dim, banks),

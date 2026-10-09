@@ -1,6 +1,8 @@
 # The weights of Wan 2.2: a diffusion transformer over video latents with
 # cross-attention to text, its UMT5-XXL text encoder, and its causal 3D VAE.
 
+load("//lib/diffusion/model.star", "embedder", "linear", "packed_linear")
+
 PATCH_T = 1
 PATCH_H = 2
 PATCH_W = 2
@@ -25,6 +27,7 @@ TE_BUCKETS = 32
 VAE_Z = 48
 VAE_PIX_CHANNELS = 12
 VAE_RGB = 3
+VAE_PATCH = 2
 VAE_DECODER_DIMS = [1024, 1024, 1024, 512, 256]
 VAE_RESNETS = 3
 VAE_TEMPORAL_UP = [True, True, False, False]
@@ -33,7 +36,7 @@ VAE_ENC_RESNETS = 2
 VAE_TEMPORAL_DOWN = [False, True, True, False]
 VAE_MAX_LATENT_PLANE = 44 * 80
 
-def dims(dim, heads, head_dim, ffn, layers, in_channels, out_channels, text_dim, freq_dim):
+def dims(dim, heads, head_dim, ffn, layers, channels, text_dim = 64, freq_dim = 256):
     hw = 2 * (head_dim // 6)
     return struct(
         dim = dim,
@@ -41,40 +44,19 @@ def dims(dim, heads, head_dim, ffn, layers, in_channels, out_channels, text_dim,
         head_dim = head_dim,
         ffn = ffn,
         layers = layers,
-        in_channels = in_channels,
-        out_channels = out_channels,
+        channels = channels,
         text_dim = text_dim,
         freq_dim = freq_dim,
         rope_dims = [head_dim - 2 * hw, hw, hw, 0],
         sm_scale = f32(1.0 / f32(sqrt(head_dim))),
-        patch_in = in_channels * PATCH_VOL,
-        patch_out = out_channels * PATCH_VOL,
+        patch = channels * PATCH_VOL,
     )
 
 DIMS = {
-    "wan22-ti2v-5b": dims(3072, 24, 128, 14336, 30, 48, 48, 4096, 256),
-    "wan22-mini-d128": dims(256, 2, 128, 512, 2, 16, 16, 64, 256),
-    "wan22-mini-nano": dims(48, 2, 24, 128, 2, 16, 16, 64, 32),
+    "wan22-ti2v-5b": dims(dim = 3072, heads = 24, head_dim = 128, ffn = 14336, layers = 30, channels = 48, text_dim = TE_HIDDEN),
+    "wan22-mini-d128": dims(dim = 256, heads = 2, head_dim = 128, ffn = 512, layers = 2, channels = 16),
+    "wan22-mini-nano": dims(dim = 48, heads = 2, head_dim = 24, ffn = 128, layers = 2, channels = 16, freq_dim = 32),
 }
-
-def linear(name, out, in_, banks):
-    return struct(
-        w = weight(name, [out, in_], banks),
-        bias = weight(name + ".bias", [out], compute(banks)),
-    )
-
-def packed_linear(name, seams, in_, banks):
-    out = sum(seams)
-    return struct(
-        w = weight(name, [out, in_], banks).packed(seams),
-        bias = weight(name + ".bias", [out], compute(banks)).packed(seams),
-    )
-
-def sum(xs):
-    out = 0
-    for x in xs:
-        out += x
-    return out
 
 def block(prefix, d, banks):
     dense = compute(banks)
@@ -104,12 +86,6 @@ def block(prefix, d, banks):
         ),
     )
 
-def embedder(prefix, in_, dim, banks):
-    return struct(
-        linear_1 = linear(prefix + ".1", dim, in_, banks),
-        linear_2 = linear(prefix + ".2", dim, dim, banks),
-    )
-
 def text_encoder(banks):
     dense = compute(banks)
     inner = TE_HEADS * TE_HEAD_DIM
@@ -130,6 +106,10 @@ def text_encoder(banks):
         )
 
     return struct(
+        vocab = TE_VOCAB,
+        head_dim = TE_HEAD_DIM,
+        buckets = TE_BUCKETS,
+        max_tokens = CONTEXT_LEN,
         embed = weight("te.embed", [TE_VOCAB, TE_HIDDEN], banks),
         layers = [layer(l) for l in range(TE_LAYERS)],
         final_norm = weight("te.final_norm", [TE_HIDDEN], dense),
@@ -247,6 +227,9 @@ def vae(banks):
             plane *= 4
     last = dims[4]
     return struct(
+        z = VAE_Z,
+        rgb = VAE_RGB,
+        patch = VAE_PATCH,
         denorm_bias = weight("vae.denorm_bias", [VAE_Z], dense),
         denorm_scale = weight("vae.denorm_scale", [VAE_Z], dense),
         post_quant = conv("vae.post_quant", VAE_Z, VAE_Z, [1, 1, 1], p0, banks),
@@ -271,15 +254,16 @@ def layout(id, deploy):
     dim = d.dim
     return struct(
         dims = d,
+        rope_axes = ROPE_AXES,
         dit = struct(
-            patch_embed = linear("dit.patch_embed", dim, d.patch_in, banks),
+            patch_embed = linear("dit.patch_embed", dim, d.patch, banks),
             text_embed = embedder("dit.text_embed", d.text_dim, dim, banks),
             time_embed = embedder("dit.time_embed", d.freq_dim, dim, banks),
             time_proj = linear("dit.time_proj", MOD_SLICES * dim, dim, banks),
             head_proj = linear("dit.head_proj", HEAD_SLICES * dim, dim, banks),
             blocks = [block("dit.block.{}".format(i), d, banks) for i in range(d.layers)],
             head_table = weight("dit.head_table", [HEAD_SLICES * dim], dtype.f32),
-            proj_out = linear("dit.proj_out", d.patch_out, dim, banks),
+            proj_out = linear("dit.proj_out", d.patch, dim, banks),
         ),
         te = text_encoder(banks) if whole else None,
         vae = vae(dtype.bf16) if whole else None,
@@ -305,7 +289,7 @@ def generative(m):
         index = index,
         streams = ["video", "context"],
         ports = [
-            port("latents", "latents", d.patch_in, ["video"]),
+            port("latents", "latents", d.patch, ["video"]),
             port("context", "context", d.text_dim, ["context"], rows = CONTEXT_LEN if m.te != None else None),
             port("timestep", "lane_vector", 1, ["video"]),
             port("positions", "axis_positions", ROPE_AXES, ["video"]),
@@ -317,7 +301,7 @@ def generative(m):
             image_follows_text = False,
         ),
         readout = "velocity",
-        readout_width = d.patch_out,
+        readout_width = d.patch,
     ))
     index += 1
     if m.vae != None:
@@ -344,7 +328,7 @@ def generative(m):
     return generation(
         readings = readings,
         latent = latent_space(
-            channels = d.in_channels,
+            channels = d.channels,
             patch_t = PATCH_T,
             patch_h = PATCH_H,
             patch_w = PATCH_W,

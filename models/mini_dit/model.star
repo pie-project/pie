@@ -2,6 +2,8 @@
 # forward reads out instead of its velocity, for parity against the
 # reference.
 
+load("//lib/diffusion/model.star", "linear", "packed_linear")
+
 HIDDEN = 256
 HEADS = 4
 HEAD_DIM = 64
@@ -14,25 +16,16 @@ CONTEXT_WIDTH = 512
 MOD_SLICES = 6
 ROPE_AXES = 3
 
-def linear(name, out, in_, banks):
-    return struct(
-        w = weight(name, [out, in_], banks),
-        bias = weight(name + ".bias", [out], compute(banks)),
-    )
-
 def columns(l):
     return struct(w = l.w.columns(), bias = l.bias.columns())
 
 def rows(l):
     return struct(w = l.w.rows(), bias = l.bias)
 
-def packed(l, seams):
-    return struct(w = l.w.packed(seams), bias = l.bias.packed(seams))
-
 def self_attn(prefix, banks):
     dense = compute(banks)
     return struct(
-        qkv = packed(linear(prefix + ".qkv", 3 * HIDDEN, HIDDEN, banks), [HIDDEN] * 3),
+        qkv = packed_linear(prefix + ".qkv", [HIDDEN] * 3, HIDDEN, banks),
         q_norm = weight(prefix + ".q_norm", [HEAD_DIM], dense),
         k_norm = weight(prefix + ".k_norm", [HEAD_DIM], dense),
         out = rows(linear(prefix + ".o", HIDDEN, HIDDEN, banks)),
@@ -42,20 +35,15 @@ def cross_attn(prefix, banks):
     dense = compute(banks)
     return struct(
         q = columns(linear(prefix + ".q", HIDDEN, HIDDEN, banks)),
-        kv = packed(linear(prefix + ".kv", 2 * HIDDEN, CONTEXT_WIDTH, banks), [HIDDEN] * 2),
+        kv = packed_linear(prefix + ".kv", [HIDDEN] * 2, CONTEXT_WIDTH, banks),
         q_norm = weight(prefix + ".q_norm", [HEAD_DIM], dense),
         k_norm = weight(prefix + ".k_norm", [HEAD_DIM], dense),
         out = rows(linear(prefix + ".o", HIDDEN, HIDDEN, banks)),
     )
 
 def swiglu(prefix, banks):
-    name = prefix + ".gate_up"
-    seams = [INTER, INTER]
     return struct(
-        gate_up = struct(
-            w = weight(name, [2 * INTER, HIDDEN], banks).packed(seams),
-            bias = weight(name + ".bias", [2 * INTER], compute(banks)).packed(seams),
-        ),
+        gate_up = packed_linear(prefix + ".gate_up", [INTER, INTER], HIDDEN, banks),
         down = rows(linear(prefix + ".down", HIDDEN, INTER, banks)),
     )
 
@@ -66,16 +54,20 @@ def side(prefix, banks):
         mlp = swiglu(prefix + ".mlp", banks),
     )
 
-def tap():
-    key = env("PIE_MINI_DIT_TAP")
-    return key if key != "" else None
-
 def layout(id, deploy):
     if len(deploy.weights) != 1:
         fail("{} stores its weights at one dtype, not {}".format(id, deploy.weights))
     banks = deploy.weights[0]
     dense = compute(banks)
     return struct(
+        hidden = HIDDEN,
+        head_dim = HEAD_DIM,
+        inter = INTER,
+        patch_features = PATCH_FEATURES,
+        text_width = TEXT_WIDTH,
+        context_width = CONTEXT_WIDTH,
+        rope_axes = ROPE_AXES,
+        sm_scale = f32(1.0 / f32(sqrt(HEAD_DIM))),
         x_embed = linear("x_embed", HIDDEN, PATCH_FEATURES, banks),
         single = side("single", banks),
         double = struct(img = side("double.img", banks), txt = side("double.txt", banks)),
@@ -90,22 +82,21 @@ def layout(id, deploy):
         ),
         final_ada = linear("final.ada", 2 * HIDDEN, HIDDEN, banks),
         final_proj = linear("final.proj", PATCH_FEATURES, HIDDEN, banks),
-        tap = tap(),
+        tap = env("PIE_MINI_DIT_TAP") or "",
     )
 
 def generative(m):
-    p = lambda name, kind, width, streams: port(name, kind, width, streams)
     return generation(
         readings = [reading(
             "denoise",
             index = 0,
             streams = ["text", "image", "context"],
             ports = [
-                p("latents", "latents", PATCH_FEATURES, ["image"]),
-                p("text", "context", TEXT_WIDTH, ["text"]),
-                p("context", "context", CONTEXT_WIDTH, ["context"]),
-                p("timestep", "lane_vector", 1, ["text", "image"]),
-                p("positions", "axis_positions", ROPE_AXES, ["text", "image"]),
+                port("latents", "latents", PATCH_FEATURES, ["image"]),
+                port("text", "context", TEXT_WIDTH, ["text"]),
+                port("context", "context", CONTEXT_WIDTH, ["context"]),
+                port("timestep", "lane_vector", 1, ["text", "image"]),
+                port("positions", "axis_positions", ROPE_AXES, ["text", "image"]),
             ],
             positions = positions(
                 axes = ["time", "height", "width"],
@@ -114,7 +105,7 @@ def generative(m):
                 image_follows_text = False,
             ),
             readout = "velocity",
-            readout_width = PATCH_FEATURES if m.tap in [None, "final.tokens"] else HIDDEN,
+            readout_width = PATCH_FEATURES if m.tap in ["", "final.tokens"] else HIDDEN,
         )],
         latent = latent_space(
             channels = CHANNELS,

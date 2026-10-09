@@ -1,14 +1,12 @@
 # The forward of LTX-2.5: the denoiser over paired video and audio, the text
 # connectors' refining of the prompt for each stream, and the VAE decode.
 
-T_FREQ_DIM = 256
+load("//lib/diffusion/forward.star", "attend", "chunks", "linear")
+
 T_MAX_PERIOD = 10000.0
 NORM_EPS = 1e-6
 ROPE_THETA = 10000.0
-ROPE_AXES = 3
 GATE_SCALE = 2.0
-VAE_Z = 128
-VAE_PATCH = 4
 VAE_EPS = 1e-8
 
 def caches(m, c):
@@ -18,17 +16,11 @@ def forward(m, inputs):
     velocity = inputs.reading("denoise", lambda rows: denoise(rows, m))
     text_in = m.dims.text_in
     video, audio = m.connectors
-    inputs.reading("refine.video", lambda rows: refine(rows, video, text_in, video.rescale))
-    inputs.reading("refine.audio", lambda rows: refine(rows, audio, text_in, audio.rescale))
+    inputs.reading("refine.video", lambda rows: refine(rows, video, text_in))
+    inputs.reading("refine.audio", lambda rows: refine(rows, audio, text_in))
     if m.vae != None:
         inputs.reading("vae.decode", lambda rows: vae_decode(rows, m.vae))
     return velocity
-
-def linear(w, x):
-    y = ops.linear.matmul(x, w.w)
-    if w.bias != None:
-        return ops.elemwise.add_bias(w.bias, y)
-    return y
 
 def rms(x):
     return ops.elemwise.rmsnorm_no_scale(x, x.width(), NORM_EPS)
@@ -39,16 +31,12 @@ def modulate(x, scale_shift, lanes):
 def norm_modulate(x, scale_shift, lanes):
     return modulate(rms(x), scale_shift, lanes)
 
-def adaln9(e, dim):
-    msa_ss, rest = ops.layout.split_rows(e, 2 * dim)
-    msa_gate, rest = ops.layout.split_rows(rest, dim)
-    mlp_ss, rest = ops.layout.split_rows(rest, 2 * dim)
-    mlp_gate, rest = ops.layout.split_rows(rest, dim)
-    q_ss, q_gate = ops.layout.split_rows(rest, 2 * dim)
+def adaln_block(e, dim):
+    msa_ss, msa_gate, mlp_ss, mlp_gate, q_ss, q_gate = chunks(e, [2 * dim, dim, 2 * dim, dim, 2 * dim, dim])
     return struct(msa_ss = msa_ss, msa_gate = msa_gate, mlp_ss = mlp_ss, mlp_gate = mlp_gate, q_ss = q_ss, q_gate = q_gate)
 
 def adaln_av(e, dim):
-    a2v_ss, v2a_ss = ops.layout.split_rows(e, 2 * dim)
+    a2v_ss, v2a_ss = chunks(e, [2 * dim, 2 * dim])
     return struct(a2v_ss = a2v_ss, v2a_ss = v2a_ss)
 
 def adaln(head, sin):
@@ -56,11 +44,11 @@ def adaln(head, sin):
     emb = linear(head.embed.linear_2, h)
     return (linear(head.proj, ops.elemwise.silu(emb)), h)
 
-def sinusoid(t):
-    return ops.elemwise.sinusoid(t, T_FREQ_DIM, T_MAX_PERIOD, True, 1.0)
+def sinusoid(t, m):
+    return ops.elemwise.sinusoid(t, m.t_freq_dim, T_MAX_PERIOD, True, 1.0)
 
-def stream_mods(heads, t):
-    sin = sinusoid(t)
+def stream_mods(heads, t, m):
+    sin = sinusoid(t, m)
     proj9, hidden = adaln(heads.adaln, sin)
     av_ss, _ = adaln(heads.av_ss, sin)
     av_gate, _ = adaln(heads.av_gate, sin)
@@ -82,17 +70,8 @@ def self_attention(h, a, dims, g):
     q, k, v = ops.layout.split_qkv(linear(a.qkv, h), a.inner, a.inner)
     q = turn(qk_norm(q, a.q_norm), g.positions, dims, a.head_dim)
     k = turn(qk_norm(k, a.k_norm), g.positions, dims, a.head_dim)
-    o = ops.attn.ragged(
-        ops.layout.pack_rows(q, g.perm),
-        ops.layout.pack_rows(k, g.perm),
-        ops.layout.pack_rows(v, g.perm),
-        g.csr,
-        g.csr,
-        a.head_dim,
-        a.sm_scale,
-        group_block_diagonal(),
-    )
-    return gate_out(ops.layout.unpack_rows(o, g.perm), h, a)
+    o = attend(q, k, v, g, g, a.head_dim, a.sm_scale, group_block_diagonal())
+    return gate_out(o, h, a)
 
 def cross_attention(h, ctx, a, rope, qg, kg):
     q = qk_norm(linear(a.qkv, h), a.q_norm)
@@ -102,17 +81,8 @@ def cross_attention(h, ctx, a, rope, qg, kg):
         q_pos, k_pos, dims = rope
         q = turn(q, q_pos, dims, a.head_dim)
         k = turn(k, k_pos, dims, a.head_dim)
-    o = ops.attn.ragged(
-        ops.layout.pack_rows(q, qg.perm),
-        ops.layout.pack_rows(k, kg.perm),
-        ops.layout.pack_rows(v, kg.perm),
-        qg.csr,
-        kg.csr,
-        a.head_dim,
-        a.sm_scale,
-        group_block_diagonal(),
-    )
-    return gate_out(ops.layout.unpack_rows(o, qg.perm), h, a)
+    o = attend(q, k, v, qg, kg, a.head_dim, a.sm_scale, group_block_diagonal())
+    return gate_out(o, h, a)
 
 def ff_sublayer(x, ff, ss, gate, lanes):
     h = norm_modulate(x, ss, lanes)
@@ -123,7 +93,7 @@ def table_add(table, v):
     return ops.elemwise.add_bias(table, ops.elemwise.copy(v))
 
 def block_mods(side, s, prompt, dim):
-    m = adaln9(table_add(side.table, s.proj9), dim)
+    m = adaln_block(table_add(side.table, s.proj9), dim)
     av = adaln_av(table_add(side.av_ss_table, s.av_ss), dim)
     av_gate = table_add(side.av_gate_table, s.av_gate)
     prompt_ss = table_add(side.prompt_table, prompt)
@@ -150,7 +120,7 @@ def block(xv, xa, b, d, mv, ma, ctx, actx, vg, ag, v_time, cg, acg):
 
     nv = rms(xv)
     na = rms(xa)
-    av_dims = d.av_rope_dims
+    av_dims = d.audio_rope_dims
 
     q_in = modulate(nv, mv.av.a2v_ss, vg.lanes)
     kv_in = modulate(na, ma.av.a2v_ss, ag.lanes)
@@ -175,7 +145,7 @@ def denoise(arm, m):
 
     vg = struct(
         lanes = vid.request_of_token(),
-        positions = vid.axis_positions(0, ROPE_AXES),
+        positions = vid.axis_positions(0, m.rope_axes),
         perm = vid.row_permutation(),
         csr = vid.group_indptr(),
     )
@@ -191,10 +161,10 @@ def denoise(arm, m):
 
     vt = vid.lane_vector(0, 1)
     at = aud.lane_vector(0, 1)
-    mods_v = stream_mods(dit.video, vt)
-    mods_a = stream_mods(dit.audio, at)
-    prompt_v, _ = adaln(dit.prompt, sinusoid(ctx.lane_vector(0, 1)))
-    prompt_a, _ = adaln(dit.audio_prompt, sinusoid(actx.lane_vector(0, 1)))
+    mods_v = stream_mods(dit.video, vt, m)
+    mods_a = stream_mods(dit.audio, at, m)
+    prompt_v, _ = adaln(dit.prompt, sinusoid(ctx.lane_vector(0, 1), m))
+    prompt_a, _ = adaln(dit.audio_prompt, sinusoid(actx.lane_vector(0, 1), m))
 
     xv = linear(dit.video.patchify, vid.latents(0, d.channels, dtype.bf16))
     xa = linear(dit.audio.patchify, aud.latents(0, d.channels, dtype.bf16))
@@ -219,7 +189,7 @@ def denoise(arm, m):
     seam.at(seam.VELOCITY, [velocity])
     return velocity
 
-def refine(arm, conn, text_in, rescale):
+def refine(arm, conn, text_in):
     g = struct(
         lanes = arm.request_of_token(),
         positions = arm.axis_positions(1, 1),
@@ -227,9 +197,8 @@ def refine(arm, conn, text_in, rescale):
         csr = arm.lane_indptr(),
     )
     x = arm.latents(1, text_in, dtype.bf16)
-    h = ops.elemwise.mul_scalar(rescale, ops.linear.matmul(x, conn.aggregate.w))
-    if conn.aggregate.bias != None:
-        h = ops.elemwise.add_bias(conn.aggregate.bias, h)
+    h = ops.elemwise.mul_scalar(conn.rescale, ops.linear.matmul(x, conn.aggregate.w))
+    h = ops.elemwise.add_bias(conn.aggregate.bias, h)
 
     def step(l, b, h):
         n = rms(h)
@@ -257,7 +226,7 @@ def resnet(x, g, r):
 
 def vae_decode(arm, vae):
     g = arm.grid()
-    z = arm.voxels(0, VAE_Z, dtype.bf16)
+    z = arm.voxels(0, vae.z, dtype.bf16)
     z = ops.elemwise.mul_scalar(0.5, ops.elemwise.add(z, z))
     z = ops.elemwise.standardize(z, vae.zero, vae.latents_std)
     z = ops.elemwise.add_bias(vae.latents_mean, z)
@@ -273,6 +242,6 @@ def vae_decode(arm, vae):
 
     x = norm_silu(x)
     y, gy = vconv(x, g, vae.conv_out)
-    pixels, gp = ops.spatial.pixel_shuffle(y, gy, [1, VAE_PATCH, VAE_PATCH])
+    pixels, gp = ops.spatial.pixel_shuffle(y, gy, [1, vae.patch, vae.patch])
     seam.at(seam.PIXELS, [pixels, gp])
     return pixels

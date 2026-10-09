@@ -3,6 +3,8 @@
 # channels are interleaved, so both are gathered into the trunk's order; its
 # gate-and-up projections hold up before gate.
 
+load("//lib/diffusion/formats.star", "biased", "conv")
+
 def formats(m):
     return [format("huggingface", read = lambda reads: read(m, reads))]
 
@@ -51,19 +53,9 @@ def signs(reads, w, seed):
     expr = joined if want == held else joined.cast(want)
     reads.push(tensor(w.name, expr, want, shape = w.shape))
 
-def linear(reads, w, name):
-    reads.read(w.w, name + ".weight")
-    reads.read(w.bias, name + ".bias")
-
 def embedder(reads, e, prefix):
-    reads.read(e.mlp_in.w, prefix + ".mlp.0.weight")
-    reads.read(e.mlp_in.bias, prefix + ".mlp.0.bias")
-    reads.read(e.mlp_out.w, prefix + ".mlp.2.weight")
-    reads.read(e.mlp_out.bias, prefix + ".mlp.2.bias")
-
-def conv(reads, c, name):
-    reads.read_expr(c.w, src(name + ".weight").transmute(c.w.shape, stored(name + ".weight")))
-    reads.read(c.bias, name + ".bias")
+    biased(reads, e.mlp_in, prefix + ".mlp.0")
+    biased(reads, e.mlp_out, prefix + ".mlp.2")
 
 def group_norm(reads, g, name):
     reads.read(g.weight, name + ".weight")
@@ -72,7 +64,7 @@ def group_norm(reads, g, name):
 def resblock(reads, r, prefix):
     group_norm(reads, r.norm_in, prefix + ".in_layers.0")
     conv(reads, r.conv_in, prefix + ".in_layers.2")
-    linear(reads, r.emb, prefix + ".emb_layers.1")
+    biased(reads, r.emb, prefix + ".emb_layers.1")
     group_norm(reads, r.norm_out, prefix + ".out_layers.0")
     conv(reads, r.conv_out, prefix + ".out_layers.3")
     if r.skip != None:
@@ -118,8 +110,7 @@ def read(m, reads):
             for e in range(d.experts)
         ]))
 
-    reads.read(m.timestep_emb.mlp_in.w, "timestep_emb.mlp.0.weight")
-    reads.read(m.timestep_emb.mlp_in.bias, "timestep_emb.mlp.0.bias")
+    biased(reads, m.timestep_emb.mlp_in, "timestep_emb.mlp.0")
     reads.read_expr(m.timestep_emb.mlp_out.w, doubled(src("timestep_emb.mlp.2.weight")))
     reads.read_expr(m.timestep_emb.mlp_out.bias, doubled(src("timestep_emb.mlp.2.bias")))
     embedder(reads, m.time_embed, "time_embed")
