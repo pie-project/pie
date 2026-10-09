@@ -4,6 +4,7 @@
 
 load("//lib/kda/formats.star", kda_conv = "conv", kda_gate = "gate", kda_qkv = "qkv")
 load("//lib/mla/formats.star", "named")
+load("//lib/reads/formats.star", "flattened")
 
 HEAD = "model.language_model.layers.45."
 VISUAL = "model.visual."
@@ -97,26 +98,8 @@ def land(m, reads, own, new):
     moe(reads, own, n, mtp.mlp)
     read(reads, own, mtp.norm, n("shared_head.norm.weight"))
 
-def reshaped(name, want):
-    """The tensor `name` as stored, read as `want`."""
-    held = 1
-    for x in shape(name):
-        held *= x
-    asked = 1
-    for x in want:
-        asked *= x
-    if held > 1 and held != asked:
-        fail("`{}` is stored {} ({} elements) and the plan reads it as {} ({} elements)".format(
-            name,
-            shape(name),
-            held,
-            want,
-            asked,
-        ))
-    return src(name).transmute(want, stored(name))
-
 def tower(reads, own, v, t):
-    read_expr(reads, own, t.patch_embed, lambda: reshaped(v("patch_embed.proj.weight"), [t.hidden, t.patch_width]))
+    read_expr(reads, own, t.patch_embed, lambda: flattened(v("patch_embed.proj.weight"), [t.hidden, t.patch_width], broadcast = True))
     read(reads, own, t.patch_embed_bias, v("patch_embed.proj.bias"))
     for l, blk in enumerate(t.blocks):
         n = lambda s: v("blocks.{}.{}".format(l, s))
@@ -140,7 +123,7 @@ def tower(reads, own, v, t):
     def downsample():
         c, k = t.hidden, t.merge
         out = t.downsample.shape[0]
-        flat = reshaped(v("downsample.weight"), [out, c * k * k])
+        flat = flattened(v("downsample.weight"), [out, c * k * k], broadcast = True)
         return flat.gather(1, [ch * k * k + kk for kk in range(k * k) for ch in range(c)])
 
     read_expr(reads, own, t.downsample, downsample)
@@ -153,8 +136,6 @@ def tower(reads, own, v, t):
     read(reads, own, mg.down, v("merger.down_proj.weight"))
 
 def moe(reads, own, n, f):
-    if not f.routed:
-        return
     read(reads, own, f.router, n("mlp.gate.weight"))
     read(reads, own, f.bias, n("mlp.gate.e_score_correction_bias"))
     read_stack(reads, own, f.gate_up, [
@@ -162,13 +143,11 @@ def moe(reads, own, n, f):
         for e in range(f.experts)
     ])
     read_stack(reads, own, f.down, [[n("mlp.experts.{}.down_proj.weight".format(e))] for e in range(f.experts)])
-    s = f.shared
-    if s != None:
-        read_concat(reads, own, s.gate_up, [
-            n("mlp.shared_experts.gate_proj.weight"),
-            n("mlp.shared_experts.up_proj.weight"),
-        ])
-        read(reads, own, s.down, n("mlp.shared_experts.down_proj.weight"))
+    read_concat(reads, own, f.shared.gate_up, [
+        n("mlp.shared_experts.gate_proj.weight"),
+        n("mlp.shared_experts.up_proj.weight"),
+    ])
+    read(reads, own, f.shared.down, n("mlp.shared_experts.down_proj.weight"))
 
 def mla(reads, own, n, a):
     for w, name in named(a, n):

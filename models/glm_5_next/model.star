@@ -116,7 +116,7 @@ def layout(id, deploy):
                 gate_up = weight(n("shared_gate_up"), [2 * sw, hidden], weights).packed([sw, sw]),
                 down = weight(n("shared_down"), [hidden, sw], weights).rows(),
                 inter = sw,
-            ) if sw > 0 else None,
+            ),
             experts = m.experts,
             top_k = m.top_k,
             inter = iw,
@@ -129,7 +129,7 @@ def layout(id, deploy):
         n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s, width: weight(n(s), [width], dense)
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
-        if d.full_attn_every > 0 and (l + 1) % d.full_attn_every == 0:
+        if (l + 1) % d.full_attn_every == 0:
             mixer = mla_at("layer.{}".format(l), "kv.{}".format(l), "index.{}".format(l))
             mixer_kind = "mla"
         else:

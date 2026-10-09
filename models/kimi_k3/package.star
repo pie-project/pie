@@ -1,5 +1,5 @@
-# Kimi-K3: its eight-layer, 32-expert miniature cut from the released
-# checkpoint, and the fixture's shape it was first brought up at.
+# Kimi-K3: an eight-layer, 32-expert miniature of the released model, and
+# `kimik3`, a small fixture of its architecture (2048 wide, 64 experts).
 
 MODELS = [
     model("kimik3-mini", mini = True, template = "kimi_k3.instruct3", tokenizer = "kimi_k3.instruct3", arch = "kimi_k3", layers = 8, vocab = 163840),

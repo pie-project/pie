@@ -3,6 +3,7 @@
 
 load("//lib/kda/formats.star", kda_conv = "conv", kda_gate = "gate", kda_qkv = "qkv")
 load("//lib/mla/formats.star", "named")
+load("//lib/reads/formats.star", "product")
 
 GGUF_EMBED = "token_embd.weight"
 
@@ -33,39 +34,40 @@ def huggingface(m, reads):
     reads.read(m.final_norm, "language_model.model.norm.weight")
     reads.read(m.head, "language_model.lm_head.weight")
     for l, w in enumerate(m.layers):
-        reads.read(w.mixer_norm, at(l, "input_layernorm.weight"))
-        reads.read(w.mlp_norm, at(l, "post_attention_layernorm.weight"))
+        n = lambda leaf: at(l, leaf)
+        reads.read(w.mixer_norm, n("input_layernorm.weight"))
+        reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
         if w.res_blend != None:
-            reads.read(w.res_blend.norm, at(l, "self_attention_res_norm.weight"))
-            reads.read(w.res_blend.proj, at(l, "self_attention_res_proj.weight"))
+            reads.read(w.res_blend.norm, n("self_attention_res_norm.weight"))
+            reads.read(w.res_blend.proj, n("self_attention_res_proj.weight"))
         if w.mlp_res != None:
-            reads.read(w.mlp_res.norm, at(l, "mlp_res_norm.weight"))
-            reads.read(w.mlp_res.proj, at(l, "mlp_res_proj.weight"))
+            reads.read(w.mlp_res.norm, n("mlp_res_norm.weight"))
+            reads.read(w.mlp_res.proj, n("mlp_res_proj.weight"))
         if w.mixer.mla:
-            for a, name in named(w.mixer, lambda leaf: at(l, leaf)):
+            for a, name in named(w.mixer, n):
                 reads.read(a, name)
         else:
-            kda(reads, lambda leaf: at(l, leaf), w.mixer)
+            kda(reads, n, w.mixer)
         f = w.mlp
         if not f.routed:
-            reads.read_concat(f.gate_up, [at(l, "mlp.gate_proj.weight"), at(l, "mlp.up_proj.weight")])
-            reads.read(f.down, at(l, "mlp.down_proj.weight"))
+            reads.read_concat(f.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+            reads.read(f.down, n("mlp.down_proj.weight"))
             continue
-        reads.read(f.router, at(l, "block_sparse_moe.gate.weight"))
+        reads.read(f.router, n("block_sparse_moe.gate.weight"))
         if f.bias != None:
-            reads.read(f.bias, at(l, "block_sparse_moe.gate.e_score_correction_bias"))
+            reads.read(f.bias, n("block_sparse_moe.gate.e_score_correction_bias"))
         lat = f.latent
         if lat != None:
-            reads.read(lat.down, at(l, "block_sparse_moe.routed_expert_down_proj.weight"))
+            reads.read(lat.down, n("block_sparse_moe.routed_expert_down_proj.weight"))
             if lat.norm != None:
-                reads.read(lat.norm, at(l, "block_sparse_moe.routed_expert_norm.weight"))
-            reads.read(lat.up, at(l, "block_sparse_moe.routed_expert_up_proj.weight"))
+                reads.read(lat.norm, n("block_sparse_moe.routed_expert_norm.weight"))
+            reads.read(lat.up, n("block_sparse_moe.routed_expert_up_proj.weight"))
 
         # The released checkpoint stores every expert leg as
         # compressed-tensors MXFP4 (`w1.weight_packed` beside
         # `w1.weight_scale`); the fixture stores bf16 `w1.weight`.
         def leg(e, what):
-            stem = at(l, "block_sparse_moe.experts.{}.{}".format(e, what))
+            stem = n("block_sparse_moe.experts.{}.{}".format(e, what))
             return stem + ".weight_packed" if has(stem + ".weight_packed") else stem + ".weight"
 
         gate_up = []
@@ -73,14 +75,13 @@ def huggingface(m, reads):
             gate_up += [leg(e, "w1"), leg(e, "w3")]
         expert_bank(reads, f.gate_up, gate_up)
         expert_bank(reads, f.down, [leg(e, "w2") for e in range(f.experts)])
+        # one shared expert (`shared_expert.`) or several folded into one
+        # wider MLP (`shared_experts.`)
         s = f.shared
-        if s != None:
-            # one shared expert (`shared_expert.`) or several folded into one
-            # wider MLP (`shared_experts.`)
-            many = has(at(l, "block_sparse_moe.shared_experts.gate_proj.weight"))
-            stem = "block_sparse_moe.shared_experts" if many else "block_sparse_moe.shared_expert"
-            reads.read_concat(s.gate_up, [at(l, stem + ".gate_proj.weight"), at(l, stem + ".up_proj.weight")])
-            reads.read(s.down, at(l, stem + ".down_proj.weight"))
+        many = has(n("block_sparse_moe.shared_experts.gate_proj.weight"))
+        stem = "block_sparse_moe.shared_experts" if many else "block_sparse_moe.shared_expert"
+        reads.read_concat(s.gate_up, [n(stem + ".gate_proj.weight"), n(stem + ".up_proj.weight")])
+        reads.read(s.down, n(stem + ".down_proj.weight"))
     r = m.output_res
     if r != None:
         reads.read(r.norm, "language_model.model.output_attn_res_norm.weight")
@@ -100,12 +101,7 @@ def kda(reads, n, k):
     # reference's KDA gate loads one entry per head, so the first `heads`
     # entries are the decays and the tail is never read.
     a_log = n("self_attn.A_log")
-    held = 0
-    if has(a_log):
-        held = 1
-        for d in shape(a_log):
-            held *= d
-    if held > k.heads:
+    if has(a_log) and product(shape(a_log)) > k.heads:
         reads.read_expr(k.a_log, src(a_log).slice(0, 0, k.heads))
     else:
         reads.read(k.a_log, a_log)
@@ -192,6 +188,5 @@ def gguf(m, reads):
         reads.read(f.router, blk(l, "ffn_gate_inp.weight"))
         reads.read_concat(f.gate_up, [blk(l, "ffn_gate_exps.weight"), blk(l, "ffn_up_exps.weight")])
         reads.read(f.down, blk(l, "ffn_down_exps.weight"))
-        if f.shared != None:
-            reads.read_concat(f.shared.gate_up, [blk(l, "ffn_gate_shexp.weight"), blk(l, "ffn_up_shexp.weight")])
-            reads.read(f.shared.down, blk(l, "ffn_down_shexp.weight"))
+        reads.read_concat(f.shared.gate_up, [blk(l, "ffn_gate_shexp.weight"), blk(l, "ffn_up_shexp.weight")])
+        reads.read(f.shared.down, blk(l, "ffn_down_shexp.weight"))

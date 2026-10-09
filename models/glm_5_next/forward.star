@@ -128,8 +128,6 @@ def mlp(x, f, hint):
         weights,
     )
     s = f.shared
-    if s == None:
-        return routed
     act = ops.linear.mlp_swiglu_clamp(ops.linear.matmul(x, s.gate_up), s.inter, f.limit)
     return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
 

@@ -1,6 +1,7 @@
 # The forward of multi-head latent attention: the queries absorbed into the
 # latent space, scored against the cached latent rows (all of them, or the
-# ones an indexer selects), and the result expanded back out per head.
+# ones an indexer selects), and the result expanded back out per head; and
+# the boundaries of a key pool that compresses runs of rows into one.
 
 def cache(c, space, a):
     """`a`'s latent rows in the kv `space`."""

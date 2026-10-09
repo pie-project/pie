@@ -14,7 +14,7 @@ def caches(m, c):
             kda_caches(c, a)
 
 def opens_block(m, l):
-    return m.res_block > 0 and l % m.res_block == 0
+    return l % m.res_block == 0
 
 def forward(m, inputs):
     plan = plans(inputs, m.mla_heads, m.kv_lora_rank)
@@ -97,8 +97,6 @@ def mlp(x, f):
         r = ops.elemwise.rmsnorm(routed, lat.norm, lat.norm_eps) if lat.norm != None else routed
         routed = ops.linear.matmul(r, lat.up)
     s = f.shared
-    if s == None:
-        return routed
     act = ops.linear.mlp_situ(ops.linear.matmul(x, s.gate_up), s.inter, f.beta, f.up_cap)
     return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
 

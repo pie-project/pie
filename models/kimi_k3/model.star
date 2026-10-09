@@ -90,7 +90,7 @@ DIMS = {
 }
 
 def closes_a_block(l, every):
-    return every > 0 and (l + 1) % every == 0
+    return (l + 1) % every == 0
 
 def layout(id, deploy):
     if len(deploy.weights) != 2 or deploy.weights[0] != dtype.bf16:
@@ -167,7 +167,7 @@ def layout(id, deploy):
                     gate_up = weight(n("shared_gate_up"), [2 * sw, hidden], weights).packed([sw, sw]),
                     down = weight(n("shared_down"), [hidden, sw], weights).rows(),
                     inter = sw,
-                ) if sw > 0 else None,
+                ),
                 experts = m.experts,
                 top_k = m.top_k,
                 renorm = m.renorm,
@@ -200,9 +200,6 @@ def layout(id, deploy):
             lora_b = lora_b,
         )
 
-    head = weight("lm_head", [d.vocab, hidden], weights)
-    if env("PIE_NO_VOCAB_SHARD") == None:
-        head = head.packed([d.vocab])
     return struct(
         hidden = hidden,
         vocab = d.vocab,
@@ -211,7 +208,7 @@ def layout(id, deploy):
         kv_lora_rank = a.kv_lora_rank,
         kv = deploy.kv,
         embed = weight("embed", [d.vocab, hidden], weights),
-        head = head,
+        head = weight("lm_head", [d.vocab, hidden], weights).packed([d.vocab]),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight("final_norm", [hidden], weights),
         final_norm_eps = d.norm_eps,
