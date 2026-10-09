@@ -44,7 +44,7 @@ from prompt_toolkit.widgets import Frame
 ACCENT = "#d97757"  # the warm orange of the demo
 DIM = "#8a8a8a"
 MODEL = "default"  # the name the server answers to
-MODEL_NAME = "qwen"  # the model family shown in the banner
+MODEL_NAME = "Qwen"  # the model family shown in the banner
 
 STYLE = Style.from_dict({
     "accent": ACCENT,
