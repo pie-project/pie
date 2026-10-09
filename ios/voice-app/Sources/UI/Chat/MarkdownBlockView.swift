@@ -51,11 +51,13 @@ struct MarkdownBlockView: View, Equatable {
 
     private func inlineText(_ source: String) -> RevealText {
         // The end of a streaming reply changes with every word: closed
-        // spans, and not cached.
+        // spans, and not cached. It is also the paragraph that wraps as it
+        // grows, so it ends in invisible words that keep its words from
+        // jumping between lines (see `RevealText`).
         let attributed = isStreamingTail
             ? MarkdownInline.render(MarkdownInline.closingOpenSpans(source), cached: false)
             : MarkdownInline.render(source)
-        return RevealText(attributed, isLive: isLive, startsFresh: isStreamingTail)
+        return RevealText(attributed, isLive: isLive, startsFresh: isStreamingTail, padsLastLine: isStreamingTail)
     }
 
     private func listView(_ list: MarkdownList) -> some View {
@@ -63,13 +65,19 @@ struct MarkdownBlockView: View, Equatable {
             ForEach(Array(list.items.enumerated()), id: \.offset) { offset, item in
                 let isLastItem = offset == list.items.count - 1
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(marker(for: list, at: offset))
-                        .font(.body)
-                        .monospacedDigit()
-                        .frame(minWidth: list.isOrdered ? 20 : 12, alignment: .trailing)
-                        .accessibilityHidden(!list.isOrdered)
-                        // A new item's marker fades in with its first words.
-                        .modifier(FadeInWhenNew(isNew: isLive && isStreamingTail && isLastItem))
+                    // A new item's marker fades in on the same clock and
+                    // curve as its first words, by going through the same
+                    // renderer; with a fade of its own it trailed them by
+                    // a few frames (recorded).
+                    RevealText(
+                        AttributedString(marker(for: list, at: offset)),
+                        isLive: isLive,
+                        startsFresh: isStreamingTail && isLastItem
+                    )
+                    .font(.body)
+                    .monospacedDigit()
+                    .frame(minWidth: list.isOrdered ? 20 : 12, alignment: .trailing)
+                    .accessibilityHidden(!list.isOrdered)
                     VStack(alignment: .leading, spacing: 8) {
                         MarkdownBlockView(
                             block: .paragraph(item.text),
@@ -127,7 +135,7 @@ struct MarkdownBlockView: View, Equatable {
 }
 
 /// A block that appears while a reply streams (a code block's frame, a
-/// table, a rule, a list item's marker) fades in instead of popping in,
+/// table, a rule) fades in instead of popping in,
 /// as the words in it do. One that is already there when the view is
 /// built (a finished reply, an older block) just shows.
 struct FadeInWhenNew: ViewModifier {

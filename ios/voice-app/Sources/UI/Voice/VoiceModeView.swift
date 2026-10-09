@@ -12,13 +12,19 @@ import UIKit
 /// - entering, the orb grows in from 60% as it fades in, and the controls
 ///   follow a beat later, fading in as they rise; a soft haptic marks the
 ///   moment the microphone is listening;
-/// - leaving, the orb shrinks and fades and the controls fade as the cover
-///   goes;
+/// - leaving, the orb shrinks a little and fades and the controls fade,
+///   a beat quicker than the screen itself fades back to the chat;
 /// - in between, most changes come from the audio side (a reply starting,
 ///   the user talking over it), not from a tap, so each piece animates its
 ///   own: the orb eases between moods frame by frame (`VoiceOrb`), the
-///   status line crossfades, the mute button swaps its glyph and fill, and
-///   new caption words fade in (`VoiceCaptionsView`).
+///   status line fades one message out before the next fades in, the mute
+///   button swaps its glyph and fill, and new caption words fade in
+///   (`VoiceCaptionsView`).
+///
+/// The screen itself fades in and out over the chat (0.35 s, as ChatGPT's
+/// separate voice mode does); the orb's and the controls' own fades run
+/// inside that one, so the orb arrives a moment after the background and
+/// leaves a moment before it.
 ///
 /// The orb, the status line and the captions each sit in a slot of fixed
 /// size, so nothing that changes in one of them moves the others.
@@ -31,21 +37,26 @@ struct VoiceModeView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// "Voice settings" closes voice mode first; Settings is presented once
-    /// the cover has gone, since a sheet cannot be presented while the
-    /// cover is still being dismissed.
+    /// voice mode has gone, so the sheet does not rise while it is still
+    /// fading out.
     @State private var opensSettingsAfterClose = false
     /// The orb has grown in; false before voice mode appears and once it
     /// is closing.
     @State private var orbShown = false
     /// The header, captions and controls have faded in.
     @State private var controlsShown = false
+    /// `close()` has run: the orb is leaving rather than arriving, so it
+    /// shrinks less than it grew.
+    @State private var isClosing = false
 
     /// Entering: the orb grows from 60% while fading in (ChatGPT, estimated).
     private static let orbEntrance = Animation.smooth(duration: 0.5)
     /// The controls follow a beat after the orb, rising 20 points.
     private static let controlsEntrance = Animation.smooth(duration: 0.3).delay(0.1)
-    /// Leaving: a little quicker than arriving, as everything in the app.
-    private static let exit = Animation.smooth(duration: 0.35)
+    /// Leaving: the orb (to 85%) and the controls fade out in 0.25 s, so
+    /// they are gone a beat before the screen's own 0.35 s fade
+    /// (`AppRouter.voiceModeCrossfade`) ends.
+    private static let exit = Animation.smooth(duration: 0.25)
 
     var body: some View {
         GeometryReader { geometry in
@@ -82,13 +93,20 @@ struct VoiceModeView: View {
             // A conversation can outlast the auto-lock delay without a
             // single touch.
             UIApplication.shared.isIdleTimerDisabled = true
-            // The sidebar can open voice mode while the composer is still
-            // dictating; both share the one microphone, and the composer
-            // would otherwise come back showing a dictation with no session.
-            dictation.cancel()
             VoiceHaptics.prepare(enabled: settings.haptics)
-            voice.start()
-            withMotion(Self.orbEntrance) { orbShown = true }
+            // One transaction with the orb's entrance, for the same reason
+            // as in `close()`: the conversation's published changes (the
+            // status, the mood) land in the same moment as the screen's
+            // fade-in, and must not cancel it.
+            withMotion(Self.orbEntrance) {
+                // The sidebar can open voice mode while the composer is
+                // still dictating; both share the one microphone, and the
+                // composer would otherwise come back showing a dictation
+                // with no session.
+                dictation.cancel()
+                voice.start()
+                orbShown = true
+            }
             withMotion(Self.controlsEntrance) { controlsShown = true }
         }
         .onDisappear {
@@ -175,7 +193,7 @@ struct VoiceModeView: View {
     /// `size` shrinks the orb in place (for the notice) without changing
     /// the diameter it draws at, so its clouds and rim keep their scale.
     private func orb(diameter: CGFloat, size: CGFloat) -> some View {
-        let entrance: CGFloat = orbShown || reduceMotion ? 1 : 0.6
+        let entrance: CGFloat = orbShown || reduceMotion ? 1 : (isClosing ? 0.85 : 0.6)
         return Button {
             Haptics.tap(enabled: settings.haptics)
             voice.tapOrb()
@@ -349,14 +367,24 @@ struct VoiceModeView: View {
     }
 
     /// The conversation stops at once; the orb shrinks and fades and the
-    /// controls fade while the cover goes.
+    /// controls fade while the screen fades back to the chat.
+    ///
+    /// All of it is one transaction, `voice.end()` included: its published
+    /// changes (the status emptying, the captions clearing, the mute
+    /// button resetting) are made in the same moment as the screen's fade,
+    /// and an unanimated published change in the same run-loop turn as an
+    /// animated one can cancel that animation. The orb and the controls
+    /// get their own quicker ease, nested inside.
     private func close() {
-        voice.end()
-        withMotion(Self.exit) {
-            orbShown = false
-            controlsShown = false
+        withMotion(AppRouter.voiceModeCrossfade) {
+            voice.end()
+            withMotion(Self.exit) {
+                isClosing = true
+                orbShown = false
+                controlsShown = false
+            }
+            router.isVoiceModePresented = false
         }
-        router.isVoiceModePresented = false
     }
 }
 
@@ -364,19 +392,49 @@ struct VoiceModeView: View {
 /// because it watches the chat controller for the model's loading
 /// progress, and that controller publishes every streamed token: only
 /// this line redraws for them, not the whole screen.
+///
+/// A new message replaces the old one in two overlapping steps rather than
+/// one crossfade: the old fades out in 0.14 s and the new fades in once
+/// the old is mostly gone. Crossfaded in place, two different strings
+/// showed at half strength on top of each other for a moment ("Speaking -
+/// talk or tap to interrupt" through "Listening"), their letters
+/// interleaved.
 private struct VoiceStatusLine: View {
     @EnvironmentObject private var voice: VoiceModeController
     @EnvironmentObject private var chat: ChatController
 
+    /// How long the new message waits for the old one to fade: by then
+    /// the old one is all but gone (at 0.1 s the two still showed faintly
+    /// together for two frames, recorded).
+    private static let handOver: TimeInterval = 0.12
+
     var body: some View {
-        Text(text)
-            .font(.callout.weight(.medium))
-            .foregroundStyle(isFailed ? Theme.destructive : Theme.secondaryInk)
-            .multilineTextAlignment(.center)
-            .lineLimit(3)
-            .contentTransition(.opacity)
-            .animation(Motion.crossfade, value: text)
-            .accessibilityAddTraits(.updatesFrequently)
+        let text = text
+        // Top-aligned, so a one-line message and a three-line one start at
+        // the same place while they overlap.
+        ZStack(alignment: .top) {
+            Text(text)
+                .font(.callout.weight(.medium))
+                .foregroundStyle(isFailed ? Theme.destructive : Theme.secondaryInk)
+                .multilineTextAlignment(.center)
+                .lineLimit(3)
+                // The loading line keeps its view while its seconds count
+                // up, so only the digits roll instead of the whole line
+                // blinking out and in every second.
+                .contentTransition(.numericText())
+                // A new view for each message, so the old one can fade out
+                // while the new one fades in after it.
+                .id(isLoading ? "loading" : text)
+                .transition(
+                    .asymmetric(
+                        insertion: .opacity.animation(Motion.fadeIn.delay(Self.handOver)),
+                        removal: .opacity.animation(Motion.fadeOut)
+                    )
+                )
+        }
+        .animation(Motion.crossfade, value: text)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.updatesFrequently)
     }
 
     private var text: String {
@@ -403,6 +461,12 @@ private struct VoiceStatusLine: View {
     private var isFailed: Bool {
         if case .failed = voice.phase { return true }
         return false
+    }
+
+    /// The line is counting the model's loading time.
+    private var isLoading: Bool {
+        guard case .booting = chat.engineState else { return false }
+        return text.hasPrefix("Loading")
     }
 }
 

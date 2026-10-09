@@ -13,7 +13,9 @@ import UIKit
 /// wide as it is tall) and in a direction the drawer can go, so scrolling
 /// the chat or the history up and down always wins. It never takes a touch
 /// that lands in something that scrolls sideways (code blocks, tables, the
-/// suggestion chips), so those keep their own drags.
+/// suggestion chips), so those keep their own drags, nor one in a text
+/// field that is being edited, where a sideways drag moves the caret or a
+/// selection handle.
 @available(iOS 18.0, *)
 struct SidebarPanGesture: UIGestureRecognizerRepresentable {
     /// The drawer's position when a drag is about to start (0 shut, 1
@@ -48,11 +50,17 @@ struct SidebarPanGesture: UIGestureRecognizerRepresentable {
             // points. Counting from here rather than from touch-down means
             // the drawer does not jump by that distance on the first frame.
             pan.setTranslation(.zero, in: pan.view)
+            context.coordinator.lastMovement = CACurrentMediaTime()
             onBegan()
         case .changed:
+            context.coordinator.lastMovement = CACurrentMediaTime()
             onChanged(pan.translation(in: pan.view).x)
         case .ended:
-            onEnded(pan.velocity(in: pan.view).x)
+            // UIKit reports the speed of the last movement even when the
+            // finger then rested before lifting; the drawer then leapt off
+            // from rest (recorded). A finger that stopped hands over none.
+            let rested = CACurrentMediaTime() - context.coordinator.lastMovement > 0.04
+            onEnded(rested ? 0 : pan.velocity(in: pan.view).x)
         case .cancelled, .failed:
             onEnded(0)
         default:
@@ -61,6 +69,8 @@ struct SidebarPanGesture: UIGestureRecognizerRepresentable {
     }
 
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        /// When the finger last moved, for the release speed.
+        var lastMovement: CFTimeInterval = 0
         var position: () -> CGFloat = { 0 }
 
         func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
@@ -77,6 +87,13 @@ struct SidebarPanGesture: UIGestureRecognizerRepresentable {
             while let current = view, current !== recognizer.view {
                 if let scrollView = current as? UIScrollView,
                    scrollView.contentSize.width > scrollView.bounds.width + 1 {
+                    return false
+                }
+                // The composer's field (a text view) or the sidebar's
+                // search (a text field) while the keyboard is up for it:
+                // the drag belongs to the text. Not being edited, a drag
+                // on it still opens or closes the drawer.
+                if current is UITextInput, current.isFirstResponder {
                     return false
                 }
                 view = current.superview

@@ -328,19 +328,71 @@ final class VoiceModeController: ObservableObject {
 
     func toggleMute() {
         guard isActive else { return }
-        isMuted.toggle()
         if isMuted {
-            // No session, so no barge-in either: a muted user can let a
-            // reply play out whatever the room sounds like.
-            microphone.cancel()
-            forgetMicrophoneUtterance()
-            inputLevel = 0
-            releaseHold()
-            if activeTurn == nil { userCaption = "" }
-            askUnfinishedQuestion()
+            unmute()
         } else {
+            mute()
+        }
+    }
+
+    /// Muting leaves the microphone's session open but deaf: its level is
+    /// shown as silence, and the first sound it hears closes it for real
+    /// (`inputDidDetectOnset`), so nothing said while muted is transcribed.
+    /// Kept open, unmuting is instant. Closing it on every mute, as before,
+    /// let the audio session lapse a second later, and unmuting then
+    /// rebuilt the whole echo-cancelled engine on the main thread: 2.6 s
+    /// with the screen frozen in the Simulator (an audio-device timeout
+    /// after the session came back), a visible hitch on a phone.
+    ///
+    /// Either way there is no barge-in while muted: a muted user can let a
+    /// reply play out whatever the room sounds like.
+    private func mute() {
+        isMuted = true
+        if microphoneUtteranceOpen {
+            // The user was talking as they muted: what they were saying is
+            // dropped, not asked, and its words leave the caption with it.
+            // An onset that could not have heard a reply had already
+            // cleared the last question to make room for it, so the
+            // caption stays empty; otherwise it goes back to what it was
+            // when the utterance began. A sample question's caption was
+            // never touched by the utterance its recording set off.
+            if !discardsMicrophoneUtterance {
+                userCaption = utteranceEcho == nil && activeTurn == nil ? "" : captionBeforeUtterance
+            }
+            closeMicrophone()
+        }
+        // A finished question stays captioned: muting only stops the
+        // microphone, as in ChatGPT, and leaves the transcript alone.
+        inputLevel = 0
+        releaseHold()
+        askUnfinishedQuestion()
+    }
+
+    /// Listening again. Nothing to reopen if the session stayed open while
+    /// muted. If it was closed (sound while muted, or a failure), reopening
+    /// it costs the main thread a moment, so it waits until the mute
+    /// button and the status line have finished changing rather than
+    /// freezing them halfway.
+    private func unmute() {
+        isMuted = false
+        guard !microphone.isListening else { return }
+        let current = visit
+        Task {
+            try? await Task.sleep(for: Self.reopenDelay)
+            guard visit == current else { return }
             startMicrophone()
         }
+    }
+
+    /// The mute button's crossfade (`Motion.crossfade`, 0.22 s) and a frame
+    /// to spare.
+    private static let reopenDelay: Duration = .milliseconds(250)
+
+    /// Ends the microphone's session at once, discarding the utterance in
+    /// progress (no final transcript comes for it).
+    private func closeMicrophone() {
+        microphone.cancel()
+        forgetMicrophoneUtterance()
     }
 
     /// Plays the next bundled sample question and answers it, waiting for
@@ -400,10 +452,23 @@ final class VoiceModeController: ObservableObject {
     /// from the last check is not the answer now.
     private func prepareAndListen() {
         let current = visit
+        let began = Date()
         isConnecting = true
         Task {
             let availability = await microphone.prepare()
             guard isActive, visit == current else { return }
+            // Voice mode fades in over 0.35 s, an animation SwiftUI drives
+            // on the main thread. Opening the session and starting the
+            // echo-cancelled engine blocks that thread (about 2.5 s in the
+            // Simulator, less on a phone), which froze the fade at its
+            // first frame. So the microphone waits for the fade to finish;
+            // the orb shows its connecting look meanwhile, as ChatGPT's
+            // does while its session connects.
+            let settle = Self.entranceSettle - Date().timeIntervalSince(began)
+            if settle > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(settle * 1_000_000_000))
+                guard isActive, visit == current else { return }
+            }
             self.availability = availability
             // Ready or not, the check is over: the orb stops connecting
             // and shows listening, or the failure below.
@@ -417,6 +482,10 @@ final class VoiceModeController: ObservableObject {
         }
     }
 
+    /// How long voice mode's entrance takes, with a little to spare: the
+    /// microphone opens after it (see `prepareAndListen`).
+    private static let entranceSettle: TimeInterval = 0.4
+
     /// Opens the session if it is not open. A recording that starts before
     /// the microphone is up (the permission check is still out) leaves it
     /// to the recording's end.
@@ -424,7 +493,9 @@ final class VoiceModeController: ObservableObject {
         guard isActive, !isMuted, !isSamplePlaying, !microphone.isListening else { return }
         microphone.delegate = microphoneRelay
         do {
+            let opening = Date()
             try microphone.start(mode: .conversation)
+            print(String(format: "[voice] microphone opened in %.0f ms", Date().timeIntervalSince(opening) * 1000))
             forgetMicrophoneUtterance()
             inputFailure = nil
         } catch {
@@ -493,12 +564,46 @@ final class VoiceModeController: ObservableObject {
         replyText += delta
         // Whole words only: the caption fades each new word in, and a
         // token is often a piece of one.
-        if let wordEnd = replyText.lastIndex(where: \.isWhitespace) {
+        if let wordEnd = Self.captionEnd(in: replyText) {
             let words = replyText[..<wordEnd].trimmingCharacters(in: .whitespacesAndNewlines)
             if words != assistantCaption { assistantCaption = words }
         }
         for sentence in chunker.push(delta) {
             speak(sentence)
+        }
+    }
+
+    /// Where the caption of `text`, a reply still arriving, may end: just
+    /// before its last space, or just after its last character of Chinese
+    /// or Japanese or their punctuation, whichever comes later. Those
+    /// languages put no spaces between words, so waiting for a space left
+    /// their captions empty until the whole reply had been generated.
+    /// Nil while not even one word is complete.
+    private static func captionEnd(in text: String) -> String.Index? {
+        var end = text.endIndex
+        while end > text.startIndex {
+            let before = text.index(before: end)
+            let character = text[before]
+            if character.isWhitespace { return before }
+            if isWrittenWithoutSpaces(character) { return end }
+            end = before
+        }
+        return nil
+    }
+
+    /// A Chinese character (hanzi, kanji), Japanese kana, or the punctuation
+    /// and full-width forms written with them (、。「」，！？). Each one is a
+    /// complete piece of text on its own.
+    private static func isWrittenWithoutSpaces(_ character: Character) -> Bool {
+        guard let scalar = character.unicodeScalars.first else { return false }
+        if scalar.properties.isIdeographic { return true }
+        switch scalar.value {
+        case 0x3000...0x303F,  // CJK symbols and punctuation
+             0x3040...0x30FF,  // hiragana and katakana
+             0xFF00...0xFFEF:  // full-width and half-width forms
+            return true
+        default:
+            return false
         }
     }
 
@@ -855,6 +960,15 @@ final class VoiceModeController: ObservableObject {
     fileprivate func inputDidDetectOnset(from source: InputRelay.Source) {
         // The sample is the question itself; it never interrupts anything.
         guard isActive, source == .microphone else { return }
+        if isMuted {
+            // Someone is talking while the microphone is off: the session
+            // muting kept open is closed now, before the recogniser hears
+            // more than the onset's first moment, and it is cancelled, so
+            // no transcript of it ever comes. Unmuting opens a new one.
+            print("[voice] sound while muted: microphone closed until unmuted")
+            closeMicrophone()
+            return
+        }
         microphoneUtteranceOpen = true
         captionBeforeUtterance = userCaption
         if isSamplePlaying {
@@ -900,6 +1014,9 @@ final class VoiceModeController: ObservableObject {
             // reply through it.
             forgetMicrophoneUtterance()
             releaseHold()
+            // Muted, the microphone was off as far as the user can tell:
+            // unmuting opens a new session, and says so if that fails too.
+            guard !isMuted else { return }
             inputFailure = error.localizedDescription
             if activeTurn == nil { phase = .failed(error.localizedDescription) }
             askUnfinishedQuestion()

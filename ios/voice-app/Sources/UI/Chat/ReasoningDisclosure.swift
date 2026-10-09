@@ -4,12 +4,16 @@ import SwiftUI
 /// while it streams, then "Thought for Ns". Either one expands to show the
 /// reasoning itself, set off by a rule in the accent color.
 ///
-/// "Thinking" crossfades into "Thought for Ns" in place (the controller
-/// makes that change animated), and the chevron glides to the new label's
-/// end rather than jumping. Opening rotates the chevron and reveals the
-/// reasoning from the top down as the reply below moves to make room; its
-/// text fades in just behind the reveal, so fading text never overlaps
-/// moving text. Closing runs the same reveal backwards.
+/// "Thinking" gives way to "Thought for Ns" in place, each label with its
+/// own chevron: the old one fades out quickly, then the new one fades in,
+/// so the two never show through each other at similar strength, and no
+/// chevron travels across the letters to the longer label's end (both
+/// were recorded with one shared chevron and a plain crossfade). The
+/// controller makes that change without an animation; the labels carry
+/// their own. Opening rotates the chevron and reveals the reasoning from
+/// the top down as the reply below moves to make room; its text fades in
+/// just behind the reveal, so fading text never overlaps moving text.
+/// Closing runs the same reveal backwards.
 struct ReasoningDisclosure: View {
     let reasoning: String
     let isThinking: Bool
@@ -23,22 +27,21 @@ struct ReasoningDisclosure: View {
             Button {
                 withMotion(Motion.content) { isExpanded.toggle() }
             } label: {
-                HStack(spacing: 4) {
-                    ZStack(alignment: .leading) {
-                        if isThinking {
+                ZStack(alignment: .leading) {
+                    if isThinking {
+                        HStack(spacing: 4) {
                             ShimmerText(text: "Thinking")
-                                .transition(.opacity)
-                        } else {
+                            chevron
+                        }
+                        .transition(Self.labelSwap)
+                    } else {
+                        HStack(spacing: 4) {
                             Text(title)
                                 .foregroundStyle(Theme.secondaryInk)
-                                .transition(.opacity)
+                            chevron
                         }
+                        .transition(Self.labelSwap)
                     }
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(Theme.tertiaryInk)
-                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                        .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: isExpanded)
                 }
                 .font(.subheadline.weight(.medium))
                 .frame(minHeight: 32)
@@ -62,6 +65,21 @@ struct ReasoningDisclosure: View {
             }
         }
     }
+
+    private var chevron: some View {
+        Image(systemName: "chevron.right")
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(Theme.tertiaryInk)
+            .rotationEffect(.degrees(isExpanded ? 90 : 0))
+            .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: isExpanded)
+    }
+
+    /// The outgoing label is gone in 0.1 s; the incoming one starts as it
+    /// is nearly gone and takes 0.2 s.
+    private static let labelSwap = AnyTransition.asymmetric(
+        insertion: .opacity.animation(.easeOut(duration: 0.2).delay(0.06)),
+        removal: .opacity.animation(.easeOut(duration: 0.1))
+    )
 
     private var title: String {
         guard let seconds = thoughtSeconds, seconds >= 1 else { return "Thought for a moment" }

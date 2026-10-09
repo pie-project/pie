@@ -250,8 +250,8 @@ private struct ComposedRootView: View {
 /// `preferredColorScheme(nil)` only withdraws the request for a scheme;
 /// the window can keep the one asked for last, so going from Dark back to
 /// System would not follow the system until the next launch. Overriding
-/// the window's style covers that, and reaches sheets and the voice-mode
-/// cover too because they are presented in the same window.
+/// the window's style covers that, and reaches sheets too because they
+/// are presented in the same window.
 private enum WindowAppearance {
     @MainActor
     static func apply(_ appearance: AppSettings.Appearance) {

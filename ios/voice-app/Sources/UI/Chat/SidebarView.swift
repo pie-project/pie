@@ -33,6 +33,8 @@ private struct SidebarContent: View, Equatable {
     @EnvironmentObject private var router: AppRouter
     @EnvironmentObject private var newChat: NewChatTransition
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     @State private var query = ""
     @State private var renaming: Conversation?
     @State private var renameText = ""
@@ -54,8 +56,9 @@ private struct SidebarContent: View, Equatable {
             .scrollDismissesKeyboard(.immediately)
             .environment(\.defaultMinListRowHeight, 36)
             // Results and their section headers slide and fade into place
-            // as the query changes, rather than blinking.
-            .animation(Motion.content, value: query)
+            // as the query changes, rather than blinking; with Reduce
+            // Motion they only fade.
+            .animation(Motion.reduced(Motion.content, reduceMotion), value: query)
             Rectangle().fill(Theme.hairline).frame(height: 0.5)
             settingsRow
         }
@@ -136,8 +139,9 @@ private struct SidebarContent: View, Equatable {
             SidebarShortcutRow(title: "Talk to Pie") {
                 Image(systemName: "waveform")
             } action: {
-                // Voice mode rises once the drawer has slid shut, so the
-                // two motions do not cross.
+                // Voice mode fades in once the drawer has slid shut, so
+                // the two motions do not cross.
+                KeyboardDismissal.dismiss()
                 router.closeSidebar { router.isVoiceModePresented = true }
             }
         }
@@ -235,20 +239,27 @@ private struct SidebarContent: View, Equatable {
 
     /// ChatGPT swaps the chat behind the sidebar at once (no fade, no
     /// scrolling) and lets the closing drawer reveal it, already at its
-    /// last message.
+    /// last message. The keyboard goes first (`setSidebarOpen`), so the
+    /// layout settles before anything else changes.
     private func open(_ conversation: Conversation) {
+        router.setSidebarOpen(false)
         var swap = Transaction()
         swap.disablesAnimations = true
         withTransaction(swap) {
             chat.open(conversation.id)
         }
-        router.isSidebarOpen = false
     }
 
     /// The chat behind fades to the greeting as the drawer closes over it.
+    /// The keyboard goes first; then the drawer's flag and the fade are
+    /// one transaction, since an unanimated published change made in the
+    /// same moment as an animated one can cancel it.
     private func startChat(temporary: Bool) {
-        newChat.start(chat, temporary: temporary)
-        router.isSidebarOpen = false
+        KeyboardDismissal.dismiss()
+        withMotion(Motion.crossfade) {
+            router.isSidebarOpen = false
+            newChat.start(chat, temporary: temporary)
+        }
     }
 
     /// The store animates the row's new title in place.

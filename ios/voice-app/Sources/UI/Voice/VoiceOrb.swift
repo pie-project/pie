@@ -11,16 +11,18 @@ import SwiftUI
 ///   swells a little while the user talks;
 /// - thinking: a slower, softer pulse, a touch smaller, the drift slowed
 ///   to a holding pattern;
-/// - speaking: grows with the voice, to about 1.15 at its loudest, and
-///   its clouds move two to three times faster;
+/// - speaking: pulses with the voice, swelling on each syllable (about 5%
+///   between a vowel and the consonants around it, to about 1.15 at its
+///   loudest), and its clouds move two to three times faster;
 /// - muted and failed: washed out and deaf to the room, but still idling.
 ///
 /// None of this is SwiftUI animation. `OrbDynamics` works out each frame
 /// from the time since the last one: it eases the look towards the
 /// mood's, so a change of mood never snaps (even halfway through another);
-/// it follows the loudness with a 50 ms attack and a 200 ms release, so it
-/// never jitters; and it advances the drift by speed × time, so a change
-/// of speed never makes the clouds jump. Loudness is read from the
+/// it follows the loudness with a 50 ms attack and a 100 ms release, quick
+/// enough to swell with each syllable and fall back between them without
+/// flickering; and it advances the drift by speed × time, so a change of
+/// speed never makes the clouds jump. Loudness is read from the
 /// `VoiceLevelMeter` each frame instead of being passed in, so the audio
 /// callbacks never redraw anything; only this view's timeline does.
 ///
@@ -53,7 +55,7 @@ struct VoiceOrb: View {
     @State private var isOnScreen = false
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: reduceMotion ? 1.0 / 30 : nil, paused: !isOnScreen || scenePhase != .active)) { timeline in
+        TimelineView(.animation(minimumInterval: reduceMotion ? 1.0 / 30 : 1.0 / 60, paused: !isOnScreen || scenePhase != .active)) { timeline in
             let frame = dynamics.advance(
                 to: timeline.date.timeIntervalSinceReferenceDate,
                 mood: mood,
@@ -282,10 +284,13 @@ final class OrbDynamics {
     /// How quickly the look follows a change of mood: about two thirds of
     /// the way in this many seconds, all of it in about a second.
     private static let moodTime: Double = 0.3
-    /// Loudness envelope: quick to rise, slower to fall, so the orb jumps
-    /// with a stressed syllable but does not flicker between words.
+    /// Loudness envelope: quick to rise, a little slower to fall. The
+    /// release is short enough that the orb falls back in the 0.1 s gap
+    /// between two syllables, so it pulses with the speech instead of
+    /// swelling once and holding (at 0.2 s it barely dipped, measured on
+    /// rendered speech: a 1.8% swing per syllable, now about 5%).
     private static let attack: Double = 0.05
-    private static let release: Double = 0.2
+    private static let release: Double = 0.1
     /// The most the voice grows the orb: 1.15 times at full loudness.
     private static let loudnessGrowth: Double = 0.15
 
@@ -297,10 +302,12 @@ final class OrbDynamics {
 
     /// Moves everything on to `time` and returns the frame to draw.
     func advance(to time: TimeInterval, mood: VoiceOrb.Mood, levels: VoiceLevelMeter?, reduceMotion: Bool) -> OrbFrame {
-        // At most a tenth of a second: after a pause (the app in the
-        // background, the timeline stopped) the orb carries on from where
-        // it was instead of leaping.
-        let dt = min(max(time - (lastTime ?? time), 0), 0.1)
+        // At most 50 ms, a little more than a frame at 30 Hz: after a
+        // pause (the app in the background, the timeline stopped, the main
+        // thread busy for a moment) the orb carries on from where it was,
+        // moving no more than it would in one slow frame, instead of
+        // leaping a third of the way to its new look.
+        let dt = min(max(time - (lastTime ?? time), 0), 0.05)
         lastTime = time
 
         let target = Look.of(mood)
@@ -348,7 +355,7 @@ final class OrbDynamics {
     /// speaks. A muted orb ignores the room.
     private static func targetLoudness(mood: VoiceOrb.Mood, levels: VoiceLevelMeter?) -> Double {
         guard let levels else { return 0 }
-        let voice = audible(levels.output)
+        let voice = spoken(levels.output)
         let user = 0.6 * audible(levels.input)
         switch mood {
         case .listening, .thinking, .speaking: return max(voice, user)
@@ -362,5 +369,18 @@ final class OrbDynamics {
     private static func audible(_ level: Float) -> Double {
         let floor = 0.15
         return min(max((Double(level) - floor) / (1 - floor), 0), 1)
+    }
+
+    /// The reply's meter level as loudness, stretched over the narrow band
+    /// synthesized speech actually uses. Measured on the system voice's
+    /// rendered speech, at this meter's 1/60 s windows: vowels sit at 0.72
+    /// to 0.78 (-14 to -11 dB) and the consonants between syllables dip to
+    /// about 0.5. Over the whole 0...1 range that was a 0.3 swing the
+    /// orb could hardly show; mapped from 0.45 to 0.78, each syllable goes
+    /// from near 0 to near 1.
+    private static func spoken(_ level: Float) -> Double {
+        let quiet = 0.45
+        let loud = 0.78
+        return min(max((Double(level) - quiet) / (loud - quiet), 0), 1)
     }
 }

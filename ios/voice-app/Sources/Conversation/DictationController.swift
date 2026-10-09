@@ -141,7 +141,11 @@ final class DictationController: ObservableObject {
         if isPaused { isPaused = false }
         microphone.delegate = self
         do {
+            let opening = Date()
             try microphone.start(mode: .dictation)
+            // Opening the microphone blocks the main thread (about 4 s in
+            // the Simulator); the phone's real cost lands in the console log.
+            print(String(format: "[dictation] microphone opened in %.0f ms", Date().timeIntervalSince(opening) * 1000))
         } catch {
             availability = .unavailable(error.localizedDescription)
             pause()

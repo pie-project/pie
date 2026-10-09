@@ -38,26 +38,25 @@ enum KeyboardDismissal {
 
     // MARK: - How this device hides the keyboard
 
-    /// Whether hides on this device are reported with zero duration. The
-    /// workaround above is only right where the keyboard really leaves in
-    /// one frame; where it slides (iOS 18, and possibly a real iOS 26
-    /// phone), removing SwiftUI's animation would drop the composer ahead
-    /// of the keyboard. The path has to be chosen before the field
-    /// resigns, so it follows the last hide UIKit reported, from any
-    /// cause. Until a hide has been seen, iOS 26 assumes the one-frame
-    /// hide measured in its Simulator.
+    /// Whether to use the one-frame workaround above. Only in the
+    /// Simulator, where the zero-length hide was measured. It cannot be
+    /// learned at run time: a hide made inside performWithoutAnimation is
+    /// itself reported with zero duration, so the workaround would teach
+    /// itself and a phone whose keyboard slides would then snap forever.
+    /// On a device the keyboard keeps the system's own animation and
+    /// SwiftUI rides it; the first hide's duration is logged, so the
+    /// phone's real behaviour can be read off `pie-console.log`.
     private static var zeroLengthHides: Bool {
-        if let lastHideDuration { return lastHideDuration == 0 }
+        #if targetEnvironment(simulator)
         if #available(iOS 26, *) { return true }
+        #endif
         return false
     }
 
-    private static var lastHideDuration: Double?
+    private static var didLogHide = false
     private static var observer: NSObjectProtocol?
 
-    /// Listens for every keyboard hide, once per process, and logs the
-    /// first duration so a phone's behaviour can be read off
-    /// `pie-console.log`.
+    /// Logs the first keyboard hide of the process, whatever caused it.
     static func startListening() {
         guard observer == nil else { return }
         observer = NotificationCenter.default.addObserver(
@@ -65,10 +64,9 @@ enum KeyboardDismissal {
         ) { note in
             let duration = note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double
             MainActor.assumeIsolated {
-                if lastHideDuration == nil, let duration {
-                    print("[ui] keyboard hide reported \(duration) s")
-                }
-                lastHideDuration = duration ?? lastHideDuration
+                guard !didLogHide, let duration else { return }
+                didLogHide = true
+                print("[ui] keyboard hide reported \(duration) s (workaround \(zeroLengthHides ? "on" : "off"))")
             }
         }
     }

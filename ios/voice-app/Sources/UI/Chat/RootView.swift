@@ -2,13 +2,20 @@ import SwiftUI
 import UIKit
 
 /// The whole app: ChatGPT's left drawer over the chat screen, with
-/// Settings and voice mode presented from the router.
+/// Settings presented from the router and voice mode drawn over both.
 ///
 /// The drawer is not a navigation container. The chat screen slides right
 /// to reveal the sidebar and is dimmed while it is pushed aside, as in
 /// ChatGPT's iPhone app. A sideways drag almost anywhere on the chat opens
 /// it; a tap on the dimmed chat, or a drag to the left on the chat or the
 /// sidebar, closes it again.
+///
+/// Voice mode is a layer over everything rather than a full-screen cover:
+/// a cover can only slide up from the bottom, and ChatGPT's separate
+/// voice mode fades in over the chat instead (about 0.35 s), its orb
+/// growing in the middle. The router animates every change of
+/// `isVoiceModePresented`, so the layer fades in and out whoever opens or
+/// closes it.
 struct RootView: View {
     @EnvironmentObject private var settings: AppSettings
     @EnvironmentObject private var router: AppRouter
@@ -18,15 +25,42 @@ struct RootView: View {
     @StateObject private var newChat = NewChatTransition()
 
     var body: some View {
-        SidebarDrawer()
-            .sheet(isPresented: $router.isSettingsPresented) { SettingsView() }
-            .fullScreenCover(isPresented: $router.isVoiceModePresented) { VoiceModeView() }
-            .onChange(of: router.isVoiceModePresented) { _, presented in
-                Haptics.isStreamingSuppressed = presented
+        ZStack {
+            SidebarDrawer()
+            if router.isVoiceModePresented {
+                VoiceModeView()
+                    // Its controls stay put if a keyboard was still on its
+                    // way down when it arrived.
+                    .ignoresSafeArea(.keyboard)
+                    .transition(.opacity)
+                    // Above the chat while it fades out, too.
+                    .zIndex(1)
+                    // VoiceOver stays inside voice mode, as it did in a
+                    // full-screen cover. (Not `.accessibilityHidden` on the
+                    // chat behind: `.accessibilityHidden(false)` there
+                    // un-hid the sidebar and the dim inside it, and their
+                    // elements covered the chat's buttons.)
+                    .accessibilityAddTraits(.isModal)
             }
-            .tint(Theme.accent)
-            .preferredColorScheme(settings.appearance.colorScheme)
-            .environmentObject(newChat)
+        }
+        .sheet(isPresented: $router.isSettingsPresented) { SettingsView() }
+        .onChange(of: router.isVoiceModePresented) { _, presented in
+            // ChatGPT's voice mode does not tick as its replies stream.
+            Haptics.isStreamingSuppressed = presented
+            // The callers drop the keyboard before opening voice mode;
+            // this catches one that did not, so it is not left up over it.
+            // After this update, so the fade that has just started is not
+            // laid out again in the middle of it.
+            if presented {
+                DispatchQueue.main.async { KeyboardDismissal.dismiss() }
+            }
+            // What a cover's presentation did on its own: VoiceOver moves
+            // to the new screen.
+            UIAccessibility.post(notification: .screenChanged, argument: nil)
+        }
+        .tint(Theme.accent)
+        .preferredColorScheme(settings.appearance.colorScheme)
+        .environmentObject(newChat)
     }
 }
 
@@ -59,7 +93,11 @@ private struct SidebarDrawer: View {
     var body: some View {
         GeometryReader { proxy in
             let sidebarWidth = (proxy.size.width * Self.sidebarFraction).rounded()
-            let layers = DrawerLayers(drawer: drawer, width: proxy.size.width, sidebarWidth: sidebarWidth)
+            // The status bar's clock: in the left corner beside the Dynamic
+            // Island or notch, about a fifth of the way across; in the
+            // middle on iPhones with a Home button (a 20-point status bar).
+            let clockX = proxy.size.width * (proxy.safeAreaInsets.top > 24 ? 0.18 : 0.5)
+            let layers = DrawerLayers(drawer: drawer, width: proxy.size.width, sidebarWidth: sidebarWidth, clockX: clockX)
             if #available(iOS 18.0, *) {
                 layers.gesture(SidebarPanGesture(
                     position: { [drawer] in drawer.position },
@@ -75,9 +113,12 @@ private struct SidebarDrawer: View {
             drawer.onClosed = { [router] in router.sidebarDidClose() }
         }
         .onChange(of: router.isSidebarOpen) { _, open in
-            // ChatGPT drops the keyboard as the drawer moves (the
-            // composer's, or the sidebar search's).
-            Self.dismissKeyboard()
+            // Taps drop the keyboard themselves, before the flag changes
+            // (`AppRouter.setSidebarOpen`). This catches anything that set
+            // the flag directly (the tour), so the keyboard never stays up
+            // beside the open sidebar; from here the layout follows it a
+            // little late.
+            KeyboardDismissal.dismiss()
             drawer.move(toOpen: open, reduceMotion: reduceMotion)
         }
         .onChange(of: fallbackIsActive) { _, isActive in
@@ -92,8 +133,10 @@ private struct SidebarDrawer: View {
 
     // MARK: - Dragging
 
+    /// Called by the pan itself, outside any SwiftUI update, so dropping
+    /// the keyboard here lands the layout with it.
     private func dragBegan() {
-        Self.dismissKeyboard()
+        KeyboardDismissal.dismiss()
         drawer.beginDrag()
     }
 
@@ -139,9 +182,6 @@ private struct SidebarDrawer: View {
             }
     }
 
-    private static func dismissKeyboard() {
-        KeyboardDismissal.dismiss()
-    }
 }
 
 /// The sidebar, the chat and the dim over the chat, placed by the
@@ -152,8 +192,11 @@ private struct DrawerLayers: View {
     @ObservedObject var drawer: SidebarDrawerModel
     let width: CGFloat
     let sidebarWidth: CGFloat
+    /// Where the middle of the status bar's clock is, from the left edge.
+    let clockX: CGFloat
 
     @EnvironmentObject private var router: AppRouter
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         let progress = drawer.position
@@ -161,17 +204,19 @@ private struct DrawerLayers: View {
 
         ZStack(alignment: .topLeading) {
             SidebarView()
+                // The keyboard of the sidebar's search slides over the
+                // bottom of the list, as in ChatGPT, instead of shrinking
+                // the sidebar: shrunk, the list dropped its last rows in
+                // one frame before the keyboard had even started to rise,
+                // and the footer rode up after it (recorded).
+                .ignoresSafeArea(.keyboard, edges: .bottom)
                 .frame(width: sidebarWidth)
                 .offset(x: offset - sidebarWidth)
                 .accessibilityHidden(!router.isSidebarOpen)
-                .accessibilityAction(.escape) { router.isSidebarOpen = false }
+                .accessibilityAction(.escape) { router.setSidebarOpen(false) }
 
             ChatScreen()
                 .frame(width: width)
-                // The status bar turns dark over the sidebar's light top
-                // once the sidebar covers most of it, not when a button
-                // is tapped or a finger lets go.
-                .environment(\.sidebarCoversStatusBar, progress > 0.5)
                 .offset(x: offset)
                 .accessibilityHidden(router.isSidebarOpen)
 
@@ -184,6 +229,23 @@ private struct DrawerLayers: View {
         // Behind both, in case a fraction of a point ever opens between
         // them.
         .background(Theme.sidebar.ignoresSafeArea())
+        .onChange(of: statusBarStyle(offset: offset), initial: true) { _, style in
+            StatusBarOverride.apply(style)
+        }
+    }
+
+    /// The status bar's clock and battery: white over the blue top bar,
+    /// dark once the sidebar's light top has slid under the clock, and
+    /// dark over voice mode. It changes as the sidebar's edge passes the
+    /// clock, during a drag too, without touching the chat's navigation
+    /// bar (`StatusBarOverride`). (Switched at halfway instead, the white
+    /// clock sat invisible on the sidebar for a third of every slide.) In
+    /// dark mode the sidebar and voice mode are dark as well, and nothing
+    /// needs to change. A sheet over the sidebar (Settings) brings its own.
+    private func statusBarStyle(offset: CGFloat) -> StatusBarOverride.Style {
+        guard colorScheme == .light, !router.isSettingsPresented else { return .app }
+        if router.isVoiceModePresented || offset > clockX { return .dark }
+        return offset > 0 ? .light : .app
     }
 
     /// Dims the part of the chat still showing beside the sidebar. Always
@@ -197,12 +259,12 @@ private struct DrawerLayers: View {
             .frame(width: width)
             .ignoresSafeArea()
             .contentShape(Rectangle())
-            .onTapGesture { router.isSidebarOpen = false }
+            .onTapGesture { router.setSidebarOpen(false) }
             .allowsHitTesting(router.isSidebarOpen)
             .accessibilityElement()
             .accessibilityLabel("Close sidebar")
             .accessibilityAddTraits(.isButton)
-            .accessibilityAction { router.isSidebarOpen = false }
+            .accessibilityAction { router.setSidebarOpen(false) }
             .accessibilityHidden(!router.isSidebarOpen)
     }
 }

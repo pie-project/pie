@@ -7,7 +7,12 @@ import SwiftUI
 ///
 /// When the empty chat appears, the chips fade in rising, one after
 /// another from the left. They fade away the moment the user starts a
-/// message of their own, and come back when the composer is emptied.
+/// message of their own, and fade back when the composer is emptied.
+///
+/// Hidden rows keep their space, as ChatGPT's do: the greeting is centred
+/// in the space above them, and taking the rows out of the layout slid it
+/// 48 pt down on the first keystroke (recorded). Only their opacity
+/// changes, so nothing else on screen moves while the user types.
 struct SuggestionChips: View {
     @EnvironmentObject private var chat: ChatController
     @EnvironmentObject private var router: AppRouter
@@ -15,37 +20,38 @@ struct SuggestionChips: View {
 
     /// Whether the rows show, copied from `wantsRows` inside an animation:
     /// the draft changes with each keystroke outside any animation, and
-    /// the rows (and the greeting re-centring above them) would jump.
-    /// Nil until the first change, when `wantsRows` is used as it is.
+    /// the rows would blink out and in. Nil until the first change, when
+    /// `wantsRows` is used as it is.
     @State private var showsRows: Bool?
     @State private var isPickingPhoto = false
     @State private var photoItem: PhotosPickerItem?
 
     var body: some View {
-        VStack(spacing: 0) {
-            if showsRows ?? wantsRows {
-                rows
-                    // Arriving, each chip runs its own staggered entrance
-                    // (`ChipEntrance`); leaving, the rows fade as one.
-                    .transition(.asymmetric(insertion: .identity, removal: .opacity))
+        let isShown = showsRows ?? wantsRows
+        rows
+            // Faded, never removed (see above). Arriving with the empty
+            // chat, each chip also runs its own staggered entrance
+            // (`ChipEntrance`); hiding and showing while the user types,
+            // the rows fade as one: out in 0.14 s, back in 0.22 s.
+            .opacity(isShown ? 1 : 0)
+            .allowsHitTesting(isShown)
+            .accessibilityHidden(!isShown)
+            .onChange(of: wantsRows) { _, wants in
+                withMotion(wants ? Motion.fadeIn : Motion.fadeOut) { showsRows = wants }
             }
-        }
-        .onChange(of: wantsRows) { _, wants in
-            withMotion(wants ? Motion.fadeIn : Motion.fadeOut) { showsRows = wants }
-        }
-        .photosPicker(isPresented: $isPickingPhoto, selection: $photoItem, matching: .images, photoLibrary: .shared())
-        .onChange(of: photoItem) { _, item in
-            guard let item else { return }
-            photoItem = nil
-            let chat = self.chat
-            Task {
-                guard let data = try? await item.loadTransferable(type: Data.self) else {
-                    chat.banner = "Couldn't load that photo"
-                    return
+            .photosPicker(isPresented: $isPickingPhoto, selection: $photoItem, matching: .images, photoLibrary: .shared())
+            .onChange(of: photoItem) { _, item in
+                guard let item else { return }
+                photoItem = nil
+                let chat = self.chat
+                Task {
+                    guard let data = try? await item.loadTransferable(type: Data.self) else {
+                        chat.banner = "Couldn't load that photo"
+                        return
+                    }
+                    await chat.addPhoto(data)
                 }
-                await chat.addPhoto(data)
             }
-        }
     }
 
     private var rows: some View {
@@ -158,8 +164,9 @@ private struct ChipButtonStyle: ButtonStyle {
     }
 }
 
-/// A chip's entrance when its rows appear: a fade while rising 10 pt,
-/// `delay` after the first chip's. Reduce Motion keeps the fade only.
+/// A chip's entrance when the empty chat appears: a fade while rising
+/// 10 pt, `delay` after the first chip's. Reduce Motion keeps the fade
+/// only. Hiding and showing while the user types is the rows' own fade.
 private struct ChipEntrance: ViewModifier {
     let delay: Double
 

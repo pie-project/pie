@@ -162,16 +162,19 @@ enum Haptics {
         soft.prepare()
     }
 
-    /// One tick of the streaming train, at most every 70 ms: called each
-    /// time new words are revealed, it reads as the phone typing. Like
+    /// One tick of the streaming train, at most every 90 ms (about 11 a
+    /// second, the soft purr ChatGPT's FAQ describes): called each time new
+    /// words are revealed, it reads as the phone typing. Like
     /// ChatGPT (its iOS FAQ), the train stays off in Low Power Mode and
     /// below 20% battery, where a long reply's ticks cost real charge.
     static func streamTick(enabled: Bool) {
         guard enabled, !isStreamingSuppressed, !streamingTicksSaveBattery else { return }
         let now = ProcessInfo.processInfo.systemUptime
-        guard now - lastTick >= 0.07 else { return }
+        guard now - lastTick >= 0.09 else { return }
+        // Only for a reply the user can see: not from the background.
+        guard UIApplication.shared.applicationState == .active else { return }
         lastTick = now
-        soft.impactOccurred(intensity: 0.5)
+        soft.impactOccurred(intensity: 0.45)
         soft.prepare()
     }
 

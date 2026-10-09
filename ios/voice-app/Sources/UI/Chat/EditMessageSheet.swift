@@ -16,9 +16,6 @@ struct EditMessageSheet: View {
     @State private var text: String
     @FocusState private var isFocused: Bool
 
-    /// About how long the system sheet takes to rise to its detent. Not a
-    /// `Motion` token: it times the system's animation, not one of ours.
-    private static let sheetSettleDelay: Duration = .milliseconds(450)
 
     init(original: String, onSend: @escaping (String) -> Void) {
         self.onSend = onSend
@@ -54,14 +51,11 @@ struct EditMessageSheet: View {
                     }
                 }
         }
-        .presentationDetents([.medium, .large])
-        .task {
-            // Cancelled with the view, so a sheet closed before it settles
-            // never raises the keyboard.
-            try? await Task.sleep(for: Self.sheetSettleDelay)
-            guard !Task.isCancelled else { return }
-            isFocused = true
-        }
+        // One detent, with the keyboard rising alongside the sheet on the
+        // same system curve. With a medium detent the sheet parked half way
+        // and then jumped to large when the keyboard arrived (recorded).
+        .presentationDetents([.large])
+        .onAppear { isFocused = true }
     }
 
     private var trimmed: String {

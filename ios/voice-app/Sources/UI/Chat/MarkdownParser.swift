@@ -54,7 +54,7 @@ enum MarkdownParser {
     static func parse(_ source: String) -> [MarkdownBlock] {
         let key = source as NSString
         if let cached = cache.object(forKey: key) { return cached.blocks }
-        var parser = BlockParser(lines: lines(of: source).map(\.text))
+        var parser = BlockParser(lines: lines(of: normalizingLineEnds(source)).map(\.text))
         let blocks = parser.parse()
         cache.setObject(Parsed(blocks), forKey: key)
         return blocks
@@ -72,6 +72,7 @@ enum MarkdownParser {
     /// cache of finished replies.
     @MainActor
     static func parseStreaming(_ source: String) -> [MarkdownBlock] {
+        let source = normalizingLineEnds(source)
         var closed: [MarkdownBlock] = []
         var resumeAt = 0
         if let memo = streamMemo,
@@ -105,7 +106,16 @@ enum MarkdownParser {
     /// then redrawing them as something else flickers; this leaves them
     /// out until the next words decide them. Finished replies are shown
     /// whole.
+    ///
+    /// A last line of digits only is held back too: `2` under a list item
+    /// reads as more of that item's text until its `.` arrives and makes it
+    /// the next item, and the words already shown would reflow (and the
+    /// text get shorter) as it moved.
+    ///
+    /// Returns the text with Windows line ends (`\r\n`) made `\n`, as
+    /// the parser reads them.
     static func withoutUndecidedEnd(_ source: String) -> String {
+        let source = normalizingLineEnds(source)
         guard let lastBreak = source.lastIndex(of: "\n") else {
             return isUndecided(source[...], previous: nil, beforePrevious: nil) ? "" : source
         }
@@ -129,6 +139,7 @@ enum MarkdownParser {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return false }
         if trimmed.allSatisfy({ "-*+_#`~=".contains($0) }) { return true }
+        if trimmed.allSatisfy({ $0.isASCII && $0.isNumber }) { return true }
         guard trimmed.hasPrefix("|") else { return false }
         if let previous, isTableHeader(previous, before: beforePrevious) {
             // The delimiter row under a header: undecided only until its
@@ -175,18 +186,30 @@ enum MarkdownParser {
 
     @MainActor private static var streamMemo: StreamMemo?
 
-    /// The source's lines, each with where it starts (in UTF-8 bytes, so
-    /// a streaming parse can find its place again). A `\r` before a line
-    /// break is dropped, and leading tabs are expanded.
+    /// `source` with each `\r\n` (and lone `\r`) made `\n`.
+    ///
+    /// A Swift `String` holds `\r\n` as one character, which is not
+    /// equal to `\n`: splitting into lines on `\n` would leave a reply
+    /// written with Windows line ends as one long line, its lists and
+    /// headings and code all lost. Every entry point normalizes first.
+    /// Cheap when there is nothing to do, which is almost always.
+    static func normalizingLineEnds(_ source: String) -> String {
+        guard source.utf8.contains(13) else { return source }
+        return source
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+    }
+
+    /// The lines of `source` (normalized: no `\r`), each with where it
+    /// starts in UTF-8 bytes, so a streaming parse can find its place
+    /// again. Leading tabs are expanded.
     private static func lines(of source: String) -> [(text: String, start: Int)] {
         var result: [(text: String, start: Int)] = []
         var start = 0
         for piece in source.split(separator: "\n", omittingEmptySubsequences: false) {
-            var line = String(piece)
-            let length = line.utf8.count
-            if line.hasSuffix("\r") { line.removeLast() }
+            let line = String(piece)
             result.append((expandingLeadingTabs(line), start))
-            start += length + 1
+            start += line.utf8.count + 1
         }
         return result
     }

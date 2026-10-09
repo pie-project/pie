@@ -7,9 +7,15 @@ import UIKit
 /// engine stats.
 ///
 /// The dot sits over the row's top-left corner, where the first word (or
-/// "Thinking") will be, so each one fades out exactly where the next fades
-/// in. The controls fade in a moment after the last word, below the
-/// reply, without moving it.
+/// "Thinking") will be. It hands over quickly, as ChatGPT's does: it
+/// shrinks away in 0.1 s, and what replaces it starts fading in 0.08 s
+/// later, so the dot is never drawn over a half-faded first letter (it
+/// was, for about 80 ms, when both faded at once). The controls fade in a
+/// moment after the last word, below the reply, without moving it.
+///
+/// The controller changes a generating reply without an animation (see
+/// `ChatController`), so every piece here that comes or goes carries its
+/// own.
 ///
 /// Equatable on its values (not its closures or binding), so the list can
 /// skip every reply but the one that is streaming.
@@ -38,7 +44,7 @@ struct AssistantMessageRow: View, Equatable {
                     isThinking: isThinking,
                     thoughtSeconds: message.thoughtSeconds
                 )
-                .transition(.opacity)
+                .transition(Self.replacesDot)
             }
 
             if !message.text.isEmpty {
@@ -46,7 +52,7 @@ struct AssistantMessageRow: View, Equatable {
                     .equatable()
                     .contentShape(Rectangle())
                     .contextMenu { contextMenuItems }
-                    .transition(.opacity)
+                    .transition(Self.replacesDot)
             }
 
             if !message.isStreaming {
@@ -61,10 +67,29 @@ struct AssistantMessageRow: View, Equatable {
         .overlay(alignment: .topLeading) {
             if isWaiting {
                 PulsingDot()
-                    .transition(.asymmetric(insertion: .identity, removal: .opacity.animation(Motion.fadeOut)))
+                    .transition(Self.dotLeaving)
             }
         }
     }
+
+    /// The dot arrives by itself (`PulsingDot`) and leaves shrinking
+    /// toward its centre while it fades, gone in 0.1 s. With Reduce Motion
+    /// it only fades.
+    private static var dotLeaving: AnyTransition {
+        .asymmetric(
+            insertion: .identity,
+            removal: .opacity.combined(with: .scale(scale: Motion.prefersReduced ? 1 : 0.4))
+                .animation(.easeOut(duration: 0.1))
+        )
+    }
+
+    /// The first words (or "Thinking") start fading in just as the dot
+    /// has nearly gone. The words then also fade in one by one
+    /// (`RevealText`); this short fade of the whole block only delays them.
+    private static let replacesDot = AnyTransition.asymmetric(
+        insertion: .opacity.animation(.easeOut(duration: 0.12).delay(0.08)),
+        removal: .opacity.animation(Motion.fadeOut)
+    )
 
     /// Sent, and nothing has come back yet.
     private var isWaiting: Bool {
@@ -76,9 +101,13 @@ struct AssistantMessageRow: View, Equatable {
         return false
     }
 
+    /// A stopped reply keeps its words and gets its controls, with no
+    /// "Stopped" label, as in ChatGPT now. Only a reply stopped before its
+    /// first word says so, since otherwise there would be nothing above
+    /// its controls.
     private var footer: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if message.wasStopped {
+            if message.wasStopped && message.text.isEmpty {
                 Label("Stopped", systemImage: "stop.circle")
                     .font(.footnote)
                     .foregroundStyle(Theme.tertiaryInk)

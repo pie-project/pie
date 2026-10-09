@@ -5,8 +5,9 @@ import SwiftUI
 ///
 /// It arrives a beat after the question's bubble (a short scale and
 /// fade), breathes between 70% and 100% over `Motion.pulsePeriod`, and is
-/// faded out by its row as the first words fade in over it. With Reduce
-/// Motion it only fades in and stays still.
+/// shrunk away by its row in 0.1 s, just before the first words fade in
+/// where it was (`AssistantMessageRow`). With Reduce Motion it only fades
+/// in and out and stays still.
 struct PulsingDot: View {
     /// The height of the reply's first line, which the dot is centered on.
     static let lineHeight: CGFloat = 22

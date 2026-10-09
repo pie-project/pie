@@ -6,7 +6,7 @@ import UIKit
 ///
 /// Every glyph change is a symbol replace, so it morphs rather than
 /// flickers: copy becomes a checkmark for two seconds (a second copy
-/// restarts the two seconds), a thumb fills and the other thumb fades
+/// restarts the two seconds), a thumb fills and the other thumb shrinks
 /// away (as in ChatGPT), and the speaker fills and its waves animate while
 /// the reply is read aloud. Each tap has a light haptic. A reply with no
 /// text (stopped before its first word) offers nothing to copy, read or
@@ -28,10 +28,10 @@ struct MessageActionBar: View {
                 copyButton
             }
             if message.feedback != .bad {
-                thumb(.good).transition(.opacity)
+                thumb(.good).transition(Self.otherThumb)
             }
             if message.feedback != .good {
-                thumb(.bad).transition(.opacity)
+                thumb(.bad).transition(Self.otherThumb)
             }
             if hasText {
                 readAloudButton
@@ -67,19 +67,34 @@ struct MessageActionBar: View {
         }
     }
 
+    /// The thumb not chosen shrinks to 80% as it fades, and is gone in
+    /// 0.1 s, before the icons to its right (sliding left over 0.2 s) reach
+    /// its place; at the slide's own pace it was still half there when the
+    /// speaker passed over it (recorded). Coming back, it waits a moment
+    /// for the icons to move out of its way.
+    private static var otherThumb: AnyTransition {
+        let shrunk = AnyTransition.opacity.combined(with: .scale(scale: Motion.prefersReduced ? 1 : 0.8))
+        return .asymmetric(
+            insertion: shrunk.animation(.easeOut(duration: 0.18).delay(0.08)),
+            removal: shrunk.animation(.easeOut(duration: 0.1))
+        )
+    }
+
     private var hasText: Bool {
         !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// The checkmark comes first and the pasteboard after, and the swap
+    /// takes about 0.2 s (see `Clipboard`).
     private var copyButton: some View {
         Button {
-            UIPasteboard.general.string = message.text
             Haptics.tap(enabled: settings.haptics)
             withAnimation(Motion.control) { didCopy = true }
             copies += 1
+            Clipboard.copy(message.text)
         } label: {
             glyph(didCopy ? "checkmark" : "doc.on.doc")
-                .contentTransition(.symbolEffect(.replace))
+                .contentTransition(Clipboard.glyphSwap)
         }
         .buttonStyle(PressDimButtonStyle())
         .accessibilityLabel(didCopy ? "Copied" : "Copy")
@@ -97,7 +112,7 @@ struct MessageActionBar: View {
         } label: {
             glyph(isSelected ? symbol + ".fill" : symbol)
                 .foregroundStyle(isSelected ? Theme.accent : Theme.secondaryInk)
-                .contentTransition(.symbolEffect(.replace))
+                .contentTransition(Clipboard.glyphSwap)
         }
         .buttonStyle(PressDimButtonStyle())
         .accessibilityLabel(kind == .good ? "Good response" : "Bad response")
@@ -113,7 +128,7 @@ struct MessageActionBar: View {
         } label: {
             glyph(isReadingAloud ? "speaker.wave.2.fill" : "speaker.wave.2")
                 .foregroundStyle(isReadingAloud ? Theme.accent : Theme.secondaryInk)
-                .contentTransition(.symbolEffect(.replace))
+                .contentTransition(Clipboard.glyphSwap)
                 .symbolEffect(.variableColor.iterative, options: .repeating, isActive: isReadingAloud)
         }
         .buttonStyle(PressDimButtonStyle())

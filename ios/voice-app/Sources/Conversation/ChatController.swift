@@ -13,17 +13,20 @@ import SwiftUI
 /// is fenced by it: a reply that was stopped, or whose conversation was
 /// left, can never write into the conversation on screen afterwards.
 ///
-/// Motion: the moments a person notices that change a row in place (the
-/// first words of a reply, a reply finishing or stopped, a thumbs tap,
-/// read-aloud starting) are made inside `withMotion`, so the views'
-/// transitions run. Changes that add or remove rows (a send, a regenerate,
-/// an edit) are not: the transcript glides the question to the top as they
-/// happen, and a scroll requested while its content lays out inside an
-/// animation is dropped (measured on iOS 26), so those rows animate
-/// themselves instead (see `MessageList`). Streamed text never animates
-/// through a transaction: a chat reply's text goes through a `RevealPacer`,
-/// which shows it a word at a time at most once per frame, and the
-/// transcript fades the new words in itself.
+/// Motion: a thumbs tap and read-aloud starting are made inside
+/// `withMotion`, so the action bar's icons slide and morph. Everything
+/// that happens to a reply while it is generated (the rows a send,
+/// regenerate or edit adds and removes, the first words or reasoning
+/// replacing the pending dot, the reply finishing or being stopped) is
+/// made without an animation, and the views it changes carry their own
+/// (the dot shrinks away, the text and the controls fade in; see
+/// `AssistantMessageRow`). The transcript glides the question to the top
+/// while these happen, and on iOS 26 a scroll requested during an
+/// animated layout of its content was dropped (recorded), so nothing here
+/// lends the transcript's layout an animation while it may be gliding.
+/// Streamed text never animates through a transaction: a chat reply's
+/// text goes through a `RevealPacer`, which shows it a word at a time at
+/// most once per frame, and the transcript fades the new words in itself.
 @MainActor
 final class ChatController: ObservableObject {
 
@@ -191,7 +194,7 @@ final class ChatController: ObservableObject {
     /// stands, a stopped reply's partial text included.
     private func leaveConversation() {
         stopReadingAloud()
-        stop()
+        stop(keepingEverythingReceived: true)
         draft = ""
         pendingAttachments = []
         composerGeneration += 1
@@ -268,38 +271,66 @@ final class ChatController: ObservableObject {
     /// simply queues behind the cancelled reply's last ~200 ms.
     ///
     /// A chat reply keeps exactly the text on screen: words the pacer had
-    /// not shown yet are dropped, nothing shown is taken back. The dot or
-    /// shimmer fades out and the reply's controls fade in.
+    /// not shown yet are dropped, nothing shown is taken back, and a last
+    /// line the transcript was still holding back (see
+    /// `MarkdownParser.withoutUndecidedEnd`) is dropped too, so nothing
+    /// appears at the moment of the stop. The dot or shimmer goes and the
+    /// reply's controls fade in, each on its own transition.
     func stop() {
-        stop(animated: true)
+        stop(keepingEverythingReceived: false)
     }
 
-    /// `stop()`, optionally without its animation: an edit stops the reply
-    /// it is about to replace, and the transcript's glide to the edited
-    /// message must not run into an animated layout (see `MessageList`).
-    private func stop(animated: Bool) {
+    /// - Parameter keepsAll: the stop is a side effect, not the Stop
+    ///   button: the user left the conversation, or a spoken question took
+    ///   over. Nobody is watching the reply freeze, so a chat reply keeps
+    ///   everything the engine sent, not only what was on screen. And a
+    ///   reply the engine had already finished, whose last words were
+    ///   still being shown, is settled as finished (its full text, stats
+    ///   and a title for the chat), not cut short and marked stopped.
+    private func stop(keepingEverythingReceived keepsAll: Bool) {
         guard let reply = active else { return }
+        if keepsAll, let result = reply.result {
+            reply.stopPacing()
+            active = nil
+            phase = .idle
+            finish(reply, with: result)
+            if !result.cancelled { nameConversationIfNeeded() }
+            return
+        }
         backend.cancel(reply.ticket)
+        let received = (text: reply.textPacer?.received, reasoning: reply.reasoningPacer?.received)
         reply.stopPacing()
         active = nil
         guard let index = index(of: reply.messageID) else {
             phase = .idle
             return
         }
-        let settle = {
-            self.phase = .idle
-            self.conversation.messages[index].isStreaming = false
-            self.conversation.messages[index].wasStopped = true
-            self.conversation.messages[index].thoughtSeconds = reply.thoughtSeconds(endingAt: Date())
-            self.conversation.updatedAt = Date()
-            reply.finished = self.conversation.messages[index]
+        var message = conversation.messages[index]
+        if reply.textPacer != nil {
+            if keepsAll {
+                message.text = received.text ?? message.text
+                if let reasoning = received.reasoning, !reasoning.isEmpty { message.reasoning = reasoning }
+            } else {
+                message.text = Self.textAsShown(message.text)
+            }
         }
-        if animated {
-            withMotion(Motion.fadeIn, settle)
-        } else {
-            settle()
-        }
+        message.isStreaming = false
+        message.wasStopped = true
+        message.thoughtSeconds = reply.thoughtSeconds(endingAt: Date())
+        phase = .idle
+        conversation.messages[index] = message
+        conversation.updatedAt = Date()
+        reply.finished = message
         save()
+    }
+
+    /// A chat reply cut off while streaming, as the transcript was showing
+    /// it: without a last line it was still holding back, and without
+    /// trailing blank space.
+    private static func textAsShown(_ text: String) -> String {
+        var shown = MarkdownParser.withoutUndecidedEnd(text)
+        while let last = shown.last, last.isWhitespace { shown.removeLast() }
+        return shown
     }
 
     /// Replaces an assistant reply with a fresh one, optionally in a
@@ -321,7 +352,7 @@ final class ChatController: ObservableObject {
     /// after it is dropped. As in ChatGPT, an edit is answered at once: a
     /// reply still on its way is stopped first (the edit drops it anyway).
     func edit(_ messageID: UUID, to newText: String) {
-        stop(animated: false)
+        stop()
         let text = newText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard engineState == .ready, !isGenerating,
               let index = conversation.messages.firstIndex(where: { $0.id == messageID && $0.role == .user }),
@@ -354,8 +385,9 @@ final class ChatController: ObservableObject {
     func sendSpoken(_ text: String, onText: @escaping (String) -> Void) async -> StoredMessage? {
         let utterance = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !utterance.isEmpty, engineState == .ready else { return nil }
-        // A spoken question supersedes a typed reply still generating.
-        stop()
+        // A spoken question supersedes a typed reply still generating,
+        // which keeps all it had received (it is behind voice mode).
+        stop(keepingEverythingReceived: true)
         conversation.messages.append(StoredMessage(role: .user, text: utterance, viaVoice: true))
         conversation.updatedAt = Date()
         let system = PieRuntimeConfig.systemPrompt(
@@ -486,6 +518,11 @@ final class ChatController: ObservableObject {
             apply(event, to: reply)
         }
         let outcome = await generation.value
+        if case .success(let result) = outcome {
+            // Kept, so leaving the chat while the screen catches up settles
+            // the reply as finished (see `stop(keepingEverythingReceived:)`).
+            reply.result = result
+        }
 
         // Stopped, or its conversation was left: already settled, or
         // nothing left to settle.
@@ -501,10 +538,10 @@ final class ChatController: ObservableObject {
             guard active === reply else { return reply.finished }
             reply.stopPacing()
             active = nil
-            withMotion(Motion.fadeIn) {
-                phase = .idle
-                finish(reply, with: result)
-            }
+            // Not animated: the controls fade in on their own transition
+            // (see the class comment).
+            phase = .idle
+            finish(reply, with: result)
             if !result.cancelled { nameConversationIfNeeded() }
             return reply.finished
         case .failure(let error):
@@ -598,19 +635,23 @@ final class ChatController: ObservableObject {
     /// The pacer has more of a chat reply's text for the screen.
     ///
     /// The first words are a moment of their own: the pending dot (or the
-    /// "Thinking" shimmer) gives way to them and the phase becomes
-    /// `.writing`, animated. After that the text is set plainly; the
-    /// transcript fades each new word in itself. Each reveal is one tick
-    /// of the soft haptic train.
+    /// "Thinking" shimmer, which becomes "Thought for Ns") gives way to
+    /// them and the phase becomes `.writing`. They come with any reasoning
+    /// not shown yet (see `reveal(reasoning:of:)`). Not animated here; the
+    /// views involved have their own transitions (see the class comment).
+    /// After that the text is set plainly; the transcript fades each new
+    /// word in itself. Each reveal is one tick of the soft haptic train.
     private func reveal(text shown: String, of reply: ActiveReply) {
         guard active === reply, let index = index(of: reply.messageID) else { return }
         if conversation.messages[index].text.isEmpty {
-            let wasThinking = phase != .waiting
-            withMotion(wasThinking ? Motion.crossfade : Motion.fadeOut) {
-                conversation.messages[index].thoughtSeconds = reply.thoughtSeconds(endingAt: reply.firstTextAt ?? Date())
-                conversation.messages[index].text = shown
-                phase = .writing
+            var message = conversation.messages[index]
+            if let reasoning = reply.reasoningPacer?.shown, !reasoning.isEmpty {
+                message.reasoning = reasoning
             }
+            message.thoughtSeconds = reply.thoughtSeconds(endingAt: reply.firstTextAt ?? Date())
+            message.text = shown
+            conversation.messages[index] = message
+            phase = .writing
         } else {
             conversation.messages[index].text = shown
         }
@@ -619,16 +660,18 @@ final class ChatController: ObservableObject {
 
     /// The pacer has more of a chat reply's reasoning. The first of it
     /// turns the pending dot into the "Thinking" shimmer.
+    ///
+    /// Once the reply's own words have arrived (the reasoning is flushed
+    /// then), reasoning that has not been shown yet waits for those words
+    /// and appears with them, already as "Thought for Ns": shown now, it
+    /// would flash "Thinking" for the frame or two before the words.
     private func reveal(reasoning shown: String, of reply: ActiveReply) {
         guard active === reply, let index = index(of: reply.messageID) else { return }
+        if reply.firstTextAt != nil, conversation.messages[index].text.isEmpty { return }
         if conversation.messages[index].reasoning.isEmpty, phase == .waiting {
-            withMotion(Motion.crossfade) {
-                phase = .thinking(since: reply.firstReasoningAt ?? Date())
-                conversation.messages[index].reasoning = shown
-            }
-        } else {
-            conversation.messages[index].reasoning = shown
+            phase = .thinking(since: reply.firstReasoningAt ?? Date())
         }
+        conversation.messages[index].reasoning = shown
     }
 
     private func finish(_ reply: ActiveReply, with result: ReplyResult) {
@@ -674,16 +717,19 @@ final class ChatController: ObservableObject {
         var message = conversation.messages[index]
         message.isStreaming = false
         message.thoughtSeconds = reply.thoughtSeconds(endingAt: Date())
+        if reply.textPacer != nil {
+            // As it was on screen, as for a stop.
+            message.text = Self.textAsShown(message.text)
+        }
         if message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             message.text = MessageRendering.failedReplyPlaceholder
         } else {
             message.wasStopped = true
         }
-        withMotion(Motion.fadeIn) {
-            phase = .idle
-            conversation.messages[index] = message
-            conversation.updatedAt = Date()
-        }
+        // Not animated; see the class comment.
+        phase = .idle
+        conversation.messages[index] = message
+        conversation.updatedAt = Date()
         save()
     }
 
@@ -864,6 +910,9 @@ private final class ActiveReply {
     /// The message as it was settled; what a caller awaiting the reply
     /// gets back.
     var finished: StoredMessage?
+    /// The engine's finished reply, once it has returned, while the screen
+    /// may still be catching up with it.
+    var result: ReplyResult?
     /// Meter a chat reply's text and reasoning onto the screen. Nil for
     /// voice mode's turns, which are written as they arrive.
     var textPacer: RevealPacer?

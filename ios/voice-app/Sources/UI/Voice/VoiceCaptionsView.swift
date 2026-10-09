@@ -8,11 +8,25 @@ import SwiftUI
 /// subtitles do, and new words fade in where they land while the words
 /// before them stay put.
 ///
+/// The bottom edge is soft too, and the settled text sits one line above
+/// it. A new line makes the text one line taller at once, and the text
+/// then glides up by that line; the new line starts the glide a line
+/// lower, in that bottom margin. With a hard edge there it was sliced
+/// through its letters for the first 100-150 ms of every new line; in the
+/// fade it simply rises into view.
+///
 /// It watches only `VoiceCaptions`, which changes with every word; the
 /// rest of voice mode does not redraw for them.
 struct VoiceCaptionsView: View {
     @ObservedObject var captions: VoiceCaptions
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// The soft bottom edge, and the margin the settled text keeps above
+    /// the slot's bottom: a little more than one caption line, so a line
+    /// that has just arrived starts inside the fade, never below the clip.
+    /// It grows with Dynamic Type, as the line does.
+    @ScaledMetric(relativeTo: .title3) private var bottomFade: CGFloat = 32
+    /// The soft top edge the oldest lines slide away under.
+    private static let topFade: CGFloat = 44
 
     private struct Line: Identifiable {
         let id: String
@@ -49,21 +63,23 @@ struct VoiceCaptionsView: View {
         .animation(reduceMotion ? nil : Motion.content, value: captions.user)
         .animation(reduceMotion ? nil : Motion.content, value: captions.assistant)
         .padding(.horizontal, 24)
+        .padding(.bottom, bottomFade)
         .frame(maxHeight: .infinity, alignment: .bottom)
         .clipped()
-        .mask(
-            LinearGradient(
-                stops: [
-                    .init(color: .clear, location: 0),
-                    .init(color: .black, location: 0.22),
-                    .init(color: .black, location: 1),
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-        )
+        .mask(edges)
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.updatesFrequently)
+    }
+
+    /// Opaque in the middle, fading out over the top and bottom edges.
+    private var edges: some View {
+        VStack(spacing: 0) {
+            LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
+                .frame(height: Self.topFade)
+            Rectangle().fill(.black)
+            LinearGradient(colors: [.black, .clear], startPoint: .top, endPoint: .bottom)
+                .frame(height: bottomFade)
+        }
     }
 }
 

@@ -7,20 +7,18 @@ import SwiftUI
 /// It is the chat's navigation bar rather than a plain view because only a
 /// bar SwiftUI manages can set the status bar's style. Told that the band
 /// is dark, the stack turns the clock and battery white; over a custom band
-/// they stay black in light mode, about 1.7:1 against the blue. While the
-/// sidebar covers most of the status bar its light top sits under the
-/// clock instead, so the bar goes back to the app's own scheme. The drawer
-/// reports that from its live position (`sidebarCoversStatusBar`), so the
-/// clock changes color as the sidebar passes halfway, during a drag too.
-/// The style is not set app-wide because voice mode and the sidebar have
-/// light tops in light mode.
+/// they stay black in light mode, about 1.7:1 against the blue.
+///
+/// The bar's style never changes. Over the open sidebar and voice mode,
+/// whose tops are light, the status bar is turned dark by
+/// `StatusBarOverride` instead: switching this bar's color scheme there
+/// restyled the whole bar mid-slide and stalled the drawer at halfway.
 ///
 /// It reads nothing from the chat itself: the items that do (the title,
 /// the trailing button) are their own views, so a streamed token or a
 /// keystroke does not rebuild the bar.
 struct ChatTopBar: ViewModifier {
     @EnvironmentObject private var router: AppRouter
-    @Environment(\.sidebarCoversStatusBar) private var sidebarCoversStatusBar
 
     func body(content: Content) -> some View {
         content
@@ -40,14 +38,14 @@ struct ChatTopBar: ViewModifier {
             }
             .toolbarBackground(Theme.topBar, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
-            .toolbarColorScheme(sidebarCoversStatusBar ? nil : .dark, for: .navigationBar)
+            .toolbarColorScheme(.dark, for: .navigationBar)
     }
 
     private var sidebarButton: some View {
         Button {
-            // The drawer slides to match (see `RootView`), dropping the
-            // keyboard as it goes; no haptic, as in ChatGPT.
-            router.isSidebarOpen = true
+            // The keyboard drops and the drawer slides to match (see
+            // `RootView`); no haptic, as in ChatGPT.
+            router.setSidebarOpen(true)
         } label: {
             SidebarGlyph()
                 .frame(width: 44, height: 44)
@@ -145,20 +143,6 @@ private struct TemporaryChatToggle: View {
             Label("Temporary chat", systemImage: "bubble.left")
         }
     }
-}
-
-extension EnvironmentValues {
-    /// Whether the sidebar is more than half open, so its light top rather
-    /// than the blue band is under the status bar. Set by the drawer from
-    /// its live position; read by `ChatTopBar`.
-    var sidebarCoversStatusBar: Bool {
-        get { self[SidebarCoversStatusBarKey.self] }
-        set { self[SidebarCoversStatusBarKey.self] = newValue }
-    }
-}
-
-private struct SidebarCoversStatusBarKey: EnvironmentKey {
-    static let defaultValue = false
 }
 
 private extension ToolbarContent {

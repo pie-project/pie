@@ -7,9 +7,16 @@ import SwiftUI
 /// microphone was, and ✓ in the round button.
 ///
 /// Every part keeps its place, so a change of state never moves a
-/// neighbour: the round button swaps only its glyph, and the microphone's
-/// slot stays reserved while the microphone is hidden, so the first
-/// letter typed does not re-wrap the text.
+/// neighbour: the round button swaps only its glyph, and the microphone
+/// stays while the user types, as ChatGPT's does, so the first letter
+/// typed changes nothing but that glyph. (It hides only while a reply is
+/// generating, as before; its slot stays reserved.)
+///
+/// Where one piece gives way to another in the same place (the field and
+/// the recording strip, the microphone and the clock), the one leaving
+/// fades in 0.14 s and the one arriving starts 0.07 s later, so the two
+/// are never both legible: overlapping fades drew "+" and "✕" as an
+/// asterisk and the dotted strip through "Ask anything" (recorded).
 struct ComposerView: View {
     @EnvironmentObject private var chat: ChatController
     @EnvironmentObject private var router: AppRouter
@@ -17,11 +24,16 @@ struct ComposerView: View {
     @EnvironmentObject private var settings: AppSettings
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    /// The text field's shown height. It follows the field's natural height
+    /// The text area's shown height. It follows the text's natural height
     /// through an animation, so a new line grows the composer smoothly
     /// instead of in 22 pt jumps, and the transcript above follows; nil
-    /// until measured.
+    /// until measured, and set back to nil on send.
     @State private var fieldHeight: CGFloat?
+    /// Set by send, whose emptied field returns to one line at once, as
+    /// ChatGPT's does. Emptying the field by hand (select all, delete)
+    /// collapses it with the same animation as growing. Cleared by the
+    /// next measurement of a non-empty draft.
+    @State private var collapsesAtOnce = false
     /// The pending attachments as shown. The chat changes its list outside
     /// any animation (an import finishes in the background); copying it
     /// here inside one lets the tiles pop in and out and the composer grow
@@ -92,14 +104,18 @@ struct ComposerView: View {
         HStack(alignment: .bottom, spacing: 0) {
             leadingButton
             ZStack(alignment: .bottomLeading) {
+                // The field stays in the hierarchy (it holds the draft and
+                // the keyboard focus) and only fades: out quickly as the
+                // strip opens, back in just after the strip has gone.
                 field
                     .opacity(showsDictation ? 0 : 1)
+                    .animation(showsDictation ? Motion.fadeOut : Self.handOffIn, value: showsDictation)
                     .allowsHitTesting(!showsDictation)
                     .accessibilityHidden(showsDictation)
                 if showsDictation {
                     DictationWaveform(meter: dictation.meter, isPaused: dictation.isPaused || dictation.isFinishing)
                         .padding(.horizontal, 6)
-                        .transition(.opacity)
+                        .transition(Self.handOff(scale: 1))
                 }
             }
             microphoneSlot
@@ -107,46 +123,69 @@ struct ComposerView: View {
         }
     }
 
-    /// "+", or ✕ while dictating; one pops in where the other was.
+    /// "+", which turns a quarter of the way round into ✕ while dictating,
+    /// its ring fading away. One glyph that turns, so there is never a
+    /// moment with both on screen; one button, whose action and label
+    /// follow the state. Reduce Motion swaps the glyphs by a fade instead.
     private var leadingButton: some View {
-        ZStack {
-            if showsDictation {
-                ComposerIconButton(symbol: "xmark", style: .plain, label: "Cancel dictation") {
-                    dictation.cancel()
-                }
-                .transition(Self.buttonSwap)
+        let cancels = showsDictation
+        return Button {
+            if cancels {
+                dictation.cancel()
             } else {
-                ComposerIconButton(symbol: "plus", style: .outlined, label: "Add photos and files") {
-                    KeyboardDismissal.dismiss()
-                    router.isAttachmentSheetPresented = true
-                }
-                .transition(Self.buttonSwap)
+                KeyboardDismissal.dismiss()
+                router.isAttachmentSheetPresented = true
             }
+        } label: {
+            ZStack {
+                Circle()
+                    .strokeBorder(Theme.hairline, lineWidth: 1)
+                    .opacity(cancels ? 0 : 1)
+                Image(systemName: reduceMotion && cancels ? "xmark" : "plus")
+                    .font(.system(size: 18, weight: .regular))
+                    .foregroundStyle(Theme.ink)
+                    .rotationEffect(.degrees(cancels && !reduceMotion ? 45 : 0))
+                    .contentTransition(.opacity)
+            }
+            .frame(width: 36, height: 36)
+            .frame(width: 44, height: 44)
+            .contentShape(Circle())
+            .animation(Motion.control, value: cancels)
         }
+        .buttonStyle(PressDimButtonStyle())
+        .accessibilityLabel(cancels ? "Cancel dictation" : "Add photos and files")
     }
 
+    /// The text field, clipped to its animated height.
+    ///
+    /// UIKit draws a wrapped line the moment it wraps, but SwiftUI learns
+    /// the taller height a frame or two later, so the growth starts late.
+    /// The clip is therefore the text itself (with 1 pt to spare for the
+    /// caret), not the padded field: in those frames a new line stays hidden instead of showing
+    /// cut off in the bottom padding (recorded), and the growth uncovers
+    /// it. Pinned to the top, so the lines above glide up with the
+    /// composer's top edge.
     private var field: some View {
         TextField("Ask anything", text: $chat.draft, axis: .vertical)
             .lineLimit(1...7)
             .font(.body)
             .foregroundStyle(Theme.ink)
             .padding(.horizontal, 6)
-            .padding(.vertical, 11)
-            .frame(minHeight: 44)
+            .padding(.vertical, Self.clipAllowance)
             // Its natural height, whatever the frame below allows right now.
             .fixedSize(horizontal: false, vertical: true)
             .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
                 follow(fieldHeight: height)
             }
-            // Pinned to the top while the frame catches up, so on a new line
-            // the text glides up with the composer's top edge; the line being
-            // added shows as the growth (0.18 s) uncovers it.
             .frame(height: fieldHeight, alignment: .top)
             .clipped()
+            .padding(.vertical, 11 - Self.clipAllowance)
+            .frame(minHeight: 44)
     }
 
     /// The microphone, or the clock while dictating, in a slot that keeps
-    /// its width either way.
+    /// its width either way. One leaves before the other arrives
+    /// (`handOff`), so the microphone never sits on the clock's digits.
     private var microphoneSlot: some View {
         ZStack {
             if showsDictation {
@@ -157,18 +196,18 @@ struct ComposerView: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
                     .accessibilityLabel("Dictating, \(Int(dictation.elapsed)) seconds")
-                    .transition(.opacity)
+                    .transition(Self.handOff(scale: 1))
             } else if showsMicrophone {
                 ComposerIconButton(symbol: "mic", style: .plain, label: "Dictate") {
                     startDictation()
                 }
-                .transition(Self.buttonSwap)
+                .transition(Self.handOff(scale: reduceMotion ? 1 : 0.8))
             }
         }
         .frame(width: 44, height: 44)
-        // Typing hides the microphone and clearing shows it again; neither
-        // happens inside an animation of its own. Local to the slot, whose
-        // size never changes, so nothing else moves.
+        // A reply starting or ending hides or shows the microphone outside
+        // any animation of its own. Local to the slot, whose size never
+        // changes, so nothing else moves.
         .animation(Motion.control, value: showsMicrophone)
     }
 
@@ -240,8 +279,12 @@ struct ComposerView: View {
             && (Self.unavailableReason(dictation.availability) == nil || dictation.isPaused)
     }
 
+    /// Shown while typing, as in ChatGPT, where only the round button
+    /// changes as the first letter is typed. Hidden while a reply is
+    /// generating, as it always has been here, so dictation (the speech
+    /// recogniser) never runs alongside the model.
     private var showsMicrophone: Bool {
-        !chat.isGenerating && !hasSomethingToSend
+        !chat.isGenerating
     }
 
     /// Text, an attachment, or one on its way (then send shows, disabled,
@@ -260,9 +303,12 @@ struct ComposerView: View {
         // First, so the composer lands with the keyboard before the send's
         // own animations start (see `KeyboardDismissal`).
         KeyboardDismissal.dismiss()
-        // Back to one line at once, as ChatGPT's field does on send: the
-        // next measurement finds the draft empty and is taken as it is.
+        // Back to one line at once, as ChatGPT's field does on send: with
+        // no height set, the field takes its one-line height in the same
+        // update that empties it, and the measurements that follow are
+        // taken as they are.
         fieldHeight = nil
+        collapsesAtOnce = true
         // Not wrapped in an animation here: the chat animates the message
         // going out itself.
         chat.send()
@@ -281,12 +327,14 @@ struct ComposerView: View {
         dictation.start()
     }
 
-    /// Follows the field's natural height: animated while typing or when
-    /// dictated text arrives; at once on the first measurement, when the
-    /// field has been emptied (sent or cleared), and with Reduce Motion.
+    /// Follows the text's natural height: animated while typing, deleting
+    /// (emptying the field by hand included) and when dictated text
+    /// arrives; at once on the first measurement, after a send, and with
+    /// Reduce Motion.
     private func follow(fieldHeight height: CGFloat) {
         guard height != fieldHeight else { return }
-        if fieldHeight == nil || chat.draft.isEmpty || reduceMotion {
+        if !chat.draft.isEmpty { collapsesAtOnce = false }
+        if fieldHeight == nil || collapsesAtOnce || reduceMotion {
             fieldHeight = height
         } else {
             withAnimation(Self.growth) { fieldHeight = height }
@@ -295,10 +343,26 @@ struct ComposerView: View {
 
     // MARK: - Helpers
 
-    /// A button giving way to another in the same place: the newcomer pops
-    /// in from 80 %, the one leaving fades.
-    private static var buttonSwap: AnyTransition {
-        AnyTransition.popIn(from: 0.8).animation(Motion.control)
+    /// Room around the text inside the clip, for the caret, which stands a
+    /// little taller than its line. Kept to 1 pt: with 3 pt the caret of a
+    /// line not yet given its height peeked out as a tick (recorded).
+    private static let clipAllowance: CGFloat = 1
+
+    /// The one arriving in a hand-off: a fade-in that waits until the one
+    /// leaving (`Motion.fadeOut`, 0.14 s, mostly gone by half way) has
+    /// faded most of the way.
+    private static let handOffIn = Motion.fadeIn.delay(0.07)
+
+    /// One piece giving way to another in the same place (strip and
+    /// field, clock and microphone). Out: a 0.14 s fade. In: `handOffIn`,
+    /// from `scale` of its size. The animations ride on the transition, so
+    /// they hold whatever animation the change came in (dictation opens
+    /// inside a crossfade; a reply ending, inside none).
+    private static func handOff(scale: CGFloat) -> AnyTransition {
+        .asymmetric(
+            insertion: .opacity.combined(with: .scale(scale: scale)).animation(handOffIn),
+            removal: .opacity.animation(Motion.fadeOut)
+        )
     }
 
     private static func unavailableReason(_ availability: VoiceInputAvailability?) -> String? {

@@ -147,6 +147,10 @@ final class MotionTourUITests: XCTestCase {
             pause(1.0)
             if tapButton("label == 'Try again'", "regenerate") { pause(8.0) }
         }
+        // The code block's own Copy (Copy -> Copied).
+        drag(from: CGVector(dx: 0.5, dy: 0.75), to: CGVector(dx: 0.5, dy: 0.35), velocity: 900, "scroll-to-code")
+        pause(1.0)
+        if tapButton("label == 'Copy code'", "copy-code") { pause(1.5) }
 
         // Stop a reply part way.
         if tap(field, "composer-focus-2") {
@@ -158,18 +162,27 @@ final class MotionTourUITests: XCTestCase {
             if tapButton("label == 'Stop generating'", "stop") { pause(1.5) }
         }
 
-        // Dismiss the keyboard by dragging the list.
+        // Dismiss the keyboard by dragging the list (raise it first: the
+        // send above dismissed it).
+        if tap(field, "composer-focus-for-dismiss") { pause(1.0) }
         drag(from: CGVector(dx: 0.5, dy: 0.4), to: CGVector(dx: 0.5, dy: 0.7), velocity: 800, "keyboard-interactive-dismiss")
         pause(1.0)
 
-        // Long press for the context menu, then dismiss it.
+        // Long press for the context menu, then edit the message from it.
         let lastText = app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] 'Tell me more'")).firstMatch
         if lastText.waitForExistence(timeout: 2) {
             mark("context-menu")
             lastText.press(forDuration: 0.8)
             pause(1.5)
-            app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
-            pause(1.0)
+            if tapButton("label == 'Edit'", "edit-open") {
+                pause(1.2)
+                app.typeText(" in two sentences")
+                pause(0.5)
+                if tapButton("label == 'Send'", "edit-send") { pause(6.0) }
+            } else {
+                app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+                pause(1.0)
+            }
         }
 
         // New chat, then a suggestion chip.

@@ -16,6 +16,15 @@ import QuartzCore
 /// has not been received yet is held back (so `**bo` never flashes before
 /// `**bold**`), unless nothing else has been shown for `partialWordWait`.
 ///
+/// The unit is a word, as ChatGPT's is, except where words are not
+/// separated by spaces. Chinese and Japanese (and Thai and its
+/// neighbours) are shown a character at a time: taken as one "word" up to
+/// the next space, a paragraph of them waited for `partialWordWait` and
+/// then appeared at once, in jerks four times a second. A long run with
+/// no space in Latin script (a URL, an identifier) is shown as it arrives
+/// once it is `longWord` characters long, or once part of it is already
+/// on screen, for the same reason.
+///
 /// This is for the screen only: voice mode speaks the engine's text as it
 /// arrives and never goes through a pacer.
 @MainActor
@@ -28,6 +37,8 @@ final class RevealPacer {
     private static let flushTime: TimeInterval = 0.25
     /// How long a half-received word may hold everything up.
     private static let partialWordWait: TimeInterval = 0.25
+    /// A run without spaces this long is not waited for (see above).
+    private static let longWord = 24
 
     /// What is on screen.
     private(set) var shown = ""
@@ -122,6 +133,9 @@ final class RevealPacer {
     private func startTicking() {
         guard displayLink == nil else { return }
         let link = CADisplayLink(target: FrameTarget(self), selector: #selector(FrameTarget.frame(_:)))
+        // Word timing needs no more than 60 Hz; on a 120 Hz phone this
+        // halves the main-thread wake-ups while the model decodes.
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
         link.add(to: .main, forMode: .common)
         displayLink = link
         lastFrame = nil
@@ -173,19 +187,60 @@ final class RevealPacer {
 
     /// The next thing to show: the whitespace before the next word plus
     /// the word itself, so a paragraph break and the word after it appear
-    /// together. Nil if that word is still arriving and may not be shown
+    /// together. In a script written without spaces the "word" is one
+    /// character. Nil if that word is still arriving and may not be shown
     /// partly yet.
     private func nextWord(includingPartial: Bool) -> String? {
         guard !pending.isEmpty else { return nil }
         var end = pending.startIndex
         while end < pending.endIndex, pending[end].isWhitespace { end = pending.index(after: end) }
-        while end < pending.endIndex, !pending[end].isWhitespace { end = pending.index(after: end) }
+        guard end < pending.endIndex else {
+            // Whitespace with no word after it yet: wait for the word.
+            return includingPartial ? pending : nil
+        }
+        if pending[end].isWrittenWithoutSpaces {
+            // A whole character: shown on its own.
+            return String(pending[...end])
+        }
+        let wordStart = end
+        while end < pending.endIndex, !pending[end].isWhitespace, !pending[end].isWrittenWithoutSpaces {
+            end = pending.index(after: end)
+        }
         if end == pending.endIndex, !includingPartial {
-            // Ends in the middle of a word, or in whitespace with no word
-            // after it yet: wait for more.
-            return nil
+            // The word may still be arriving. Wait for its end, unless it
+            // is long, or it carries on a word already partly on screen
+            // (nothing here to hold back that is not already showing).
+            let continuesShownWord = wordStart == pending.startIndex
+                && shown.last.map { !$0.isWhitespace } ?? false
+            let isLong = pending.distance(from: wordStart, to: end) >= Self.longWord
+            guard continuesShownWord || isLong else { return nil }
         }
         return String(pending[..<end])
+    }
+}
+
+private extension Character {
+    /// A character of a script whose words are not separated by spaces:
+    /// Chinese characters, Japanese kana, their punctuation and full-width
+    /// forms, and Thai, Lao, Khmer and Myanmar. Korean separates words
+    /// with spaces and is not included.
+    var isWrittenWithoutSpaces: Bool {
+        guard let scalar = unicodeScalars.first, scalar.value >= 0x0E00 else { return false }
+        switch scalar.value {
+        case 0x0E00...0x0EFF,   // Thai, Lao
+             0x1000...0x109F,   // Myanmar
+             0x1780...0x17FF,   // Khmer
+             0x2E80...0x2FDF,   // CJK radicals
+             0x3000...0x30FF,   // CJK punctuation, Hiragana, Katakana
+             0x3400...0x4DBF,   // CJK extension A
+             0x4E00...0x9FFF,   // CJK unified ideographs
+             0xF900...0xFAFF,   // CJK compatibility ideographs
+             0xFF00...0xFFEF,   // full-width forms and punctuation
+             0x20000...0x3FFFF: // CJK extensions B and later
+            return true
+        default:
+            return false
+        }
     }
 }
 

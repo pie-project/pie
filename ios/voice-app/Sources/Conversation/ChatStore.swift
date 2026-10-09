@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import UIKit
 
 /// Saved conversations: one JSON file per thread under
 /// Application Support/PieVoice/chats/. Temporary conversations are never
@@ -14,6 +15,13 @@ import SwiftUI
 /// collapses a deleted row. The files follow on a background queue, in
 /// order: a save never costs the frame in which a send, a new chat or a
 /// switch starts its animation.
+///
+/// Off the main thread, a write could still be waiting when the app is
+/// put away, and a suspended app writes nothing: a reply finished just as
+/// the user swiped home, then quit from the app switcher, was lost. So
+/// each write asks iOS for the moment it needs to finish in the background
+/// (`beginBackgroundTask`), and the queue is drained when the app is told
+/// it is about to end.
 @MainActor
 final class ChatStore: ObservableObject {
 
@@ -34,9 +42,17 @@ final class ChatStore: ObservableObject {
     /// that would bring the chat back.
     private static let disk = DispatchQueue(label: "PieVoice.ChatStore.disk", qos: .utility)
 
+    private var terminationObserver: NSObjectProtocol?
+
     init() {
         directory = Self.makeDirectory()
         conversations = Self.loadAll(from: directory)
+        // Posted on the main thread; the app has a few seconds left.
+        terminationObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willTerminateNotification, object: nil, queue: .main
+        ) { _ in
+            MainActor.assumeIsolated { Self.finishPendingWrites() }
+        }
     }
 
     func conversation(_ id: UUID) -> Conversation? {
@@ -75,7 +91,7 @@ final class ChatStore: ObservableObject {
     func delete(_ id: UUID) {
         publish(conversations.filter { $0.id != id })
         guard let url = fileURL(for: id) else { return }
-        Self.disk.async {
+        Self.onDisk("Delete chat") {
             ChatFiles.remove(url)
         }
     }
@@ -87,16 +103,30 @@ final class ChatStore: ObservableObject {
     func deleteAll() {
         publish([])
         guard let directory else { return }
-        Self.disk.async {
+        Self.onDisk("Delete all chats") {
             ChatFiles.removeAll(in: directory)
         }
     }
 
     /// Waits until every write and delete asked for so far has reached the
-    /// disk. For quitting on purpose (to load another model), so a reply
-    /// saved a moment before is not lost.
+    /// disk. For quitting (on purpose, to load another model, or because
+    /// iOS is ending the app), so a reply saved a moment before is not lost.
     static func finishPendingWrites() {
         disk.sync {}
+    }
+
+    /// Runs `work` on the disk queue, holding a background task until it is
+    /// done, so that going to the home screen cannot suspend the app with
+    /// the file half way. (The queue is serial: earlier work finishes
+    /// first, under its own task.)
+    private static func onDisk(_ name: String, _ work: @escaping @Sendable () -> Void) {
+        let task = UIApplication.shared.beginBackgroundTask(withName: name)
+        disk.async {
+            work()
+            Task { @MainActor in
+                if task != .invalid { UIApplication.shared.endBackgroundTask(task) }
+            }
+        }
     }
 
     /// Title and message text, case-insensitive; empty query = all.
@@ -165,9 +195,10 @@ final class ChatStore: ObservableObject {
 
     /// Replaces the list in one change, animated, so the sidebar moves its
     /// rows rather than redrawing them in place, and observers hear about
-    /// one change rather than one per step.
+    /// one change rather than one per step. With Reduce Motion the rows
+    /// only fade (`withMotion`).
     private func publish(_ updated: [Conversation]) {
-        withAnimation(Motion.content) {
+        withMotion(Motion.content) {
             conversations = updated
         }
     }
@@ -178,7 +209,7 @@ final class ChatStore: ObservableObject {
 
     private func write(_ conversation: Conversation) {
         guard let url = fileURL(for: conversation.id) else { return }
-        Self.disk.async {
+        Self.onDisk("Save chat") {
             ChatFiles.write(conversation, to: url)
         }
     }

@@ -847,6 +847,14 @@ final class AudioEngineHub {
         if session.category != .playAndRecord || session.mode != mode || session.categoryOptions != options {
             try session.setCategory(.playAndRecord, mode: mode, options: options)
         }
+        // iOS mutes haptics while the microphone records unless told
+        // otherwise, and voice mode keeps it open the whole time: without
+        // this the taps on connect, mute and end never play. Harmless when
+        // nothing is recording; the voice-mode taps are discrete, never
+        // while the user is talking.
+        if !session.allowHapticsAndSystemSoundsDuringRecording {
+            try? session.setAllowHapticsAndSystemSoundsDuringRecording(true)
+        }
         if sessionEcho {
             try preferEchoCancelledInput(true, session: session)
         }

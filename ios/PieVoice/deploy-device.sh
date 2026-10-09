@@ -5,6 +5,8 @@
 #   bash ios/PieVoice/deploy-device.sh            # build, sign, install, launch, verify
 #   bash ios/PieVoice/deploy-device.sh --no-rust  # skip the cargo steps (Swift-only change)
 #   bash ios/PieVoice/deploy-device.sh --log      # just pull the on-device console log
+#   bash ios/PieVoice/deploy-device.sh --no-launch  # install only; never opens the app
+#                                                   # over whatever the phone is showing
 #
 # What it builds and stages (Pie 0.5):
 #   - the engine shim, ios/pie-shim, for arm64 iOS into the repository
@@ -45,10 +47,12 @@ LOG_LOCAL="$HERE/build/pie-console.log"
 
 DO_RUST=1
 ONLY_LOG=0
+DO_LAUNCH=1
 for arg in "$@"; do
   case "$arg" in
     --no-rust) DO_RUST=0 ;;
     --log) ONLY_LOG=1 ;;
+    --no-launch) DO_LAUNCH=0 ;;
     -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
   esac
@@ -246,6 +250,11 @@ done
 # for last week's success.
 launches_before=0
 if pull_log; then launches_before=$(grep -c '=== PieVoice launch' "$LOG_LOCAL" || true); fi
+
+if [ $DO_LAUNCH -eq 0 ]; then
+  bold "Installed (not launched: --no-launch)"
+  exit 0
+fi
 
 bold "Launching"
 # The first launch straight after an install can be refused with a

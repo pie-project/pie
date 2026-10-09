@@ -57,13 +57,15 @@ struct CodeBlockView: View {
     }
 
     /// "Copy" becomes "Copied" with a checkmark for two seconds. The label
-    /// keeps the width of the longer one, so nothing beside it shifts.
+    /// keeps the width of the longer one, so nothing beside it shifts. As
+    /// with a reply's copy icon, the checkmark comes first and the
+    /// pasteboard after, and the swap takes about 0.2 s (see `Clipboard`).
     private var copyButton: some View {
         Button {
-            UIPasteboard.general.string = code
             Haptics.tap(enabled: settings.haptics)
             withAnimation(Motion.control) { didCopy = true }
             copies += 1
+            Clipboard.copy(code)
         } label: {
             ZStack(alignment: .leading) {
                 copyLabel(copied: true).hidden()
@@ -80,7 +82,7 @@ struct CodeBlockView: View {
     private func copyLabel(copied: Bool) -> some View {
         HStack(spacing: 4) {
             Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                .contentTransition(.symbolEffect(.replace))
+                .contentTransition(Clipboard.glyphSwap)
             Text(copied ? "Copied" : "Copy")
                 .contentTransition(.opacity)
         }
