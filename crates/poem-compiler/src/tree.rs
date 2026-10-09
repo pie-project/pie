@@ -1,6 +1,7 @@
-//! An op as a tree of its fields, with every `ValueId` marked, so the matcher
-//! compares two ops of any family field by field and renumbers values without
-//! a hand-written walk per variant.
+//! An op as a tree of its fields, with every `ValueId` marked, so the fusion
+//! matcher and the tensor-parallel pass read, compare and renumber an op of
+//! any family field by field without a hand-written walk per variant. It
+//! holds only the kinds of field ops have: no strings, maps or `f64`s.
 
 use poem_ir::{Operation, ValueId};
 use serde::de::value::{MapDeserializer, SeqDeserializer};
@@ -11,15 +12,12 @@ use serde::ser::{self, Serialize};
 pub enum Tree {
     Id(u32),
     F32(u32),
-    F64(u64),
     Int(i128),
     Bool(bool),
-    Str(String),
     Unit,
     None,
     Some(Box<Tree>),
     Seq(Vec<Tree>),
-    Map(Vec<(Tree, Tree)>),
     Struct(Vec<(&'static str, Tree)>),
     Variant(&'static str, Box<Tree>),
 }
@@ -90,12 +88,6 @@ pub fn renumbered(tree: Tree, f: &impl Fn(ValueId) -> ValueId) -> Tree {
         Tree::Id(id) => Tree::Id(f(ValueId(id)).0),
         Tree::Some(inner) => Tree::Some(Box::new(renumbered(*inner, f))),
         Tree::Seq(items) => Tree::Seq(items.into_iter().map(|t| renumbered(t, f)).collect()),
-        Tree::Map(entries) => Tree::Map(
-            entries
-                .into_iter()
-                .map(|(k, v)| (renumbered(k, f), renumbered(v, f)))
-                .collect(),
-        ),
         Tree::Struct(fields) => Tree::Struct(
             fields
                 .into_iter()
@@ -132,9 +124,12 @@ impl de::Error for Error {
 
 struct Ser;
 
+fn unheld(kind: &str) -> Error {
+    Error(format!("an op field is {kind}, which a tree does not hold"))
+}
+
 pub struct Items(Vec<Tree>, Option<&'static str>);
 pub struct Fields(Vec<(&'static str, Tree)>, Option<&'static str>);
-pub struct Entries(Vec<(Tree, Tree)>, Option<Tree>);
 
 fn wrap(variant: Option<&'static str>, tree: Tree) -> Tree {
     match variant {
@@ -150,7 +145,7 @@ impl ser::Serializer for Ser {
     type SerializeTuple = Items;
     type SerializeTupleStruct = Items;
     type SerializeTupleVariant = Items;
-    type SerializeMap = Entries;
+    type SerializeMap = ser::Impossible<Tree, Error>;
     type SerializeStruct = Fields;
     type SerializeStructVariant = Fields;
 
@@ -184,19 +179,17 @@ impl ser::Serializer for Ser {
     fn serialize_f32(self, v: f32) -> Result<Tree, Error> {
         Ok(Tree::F32(v.to_bits()))
     }
-    fn serialize_f64(self, v: f64) -> Result<Tree, Error> {
-        Ok(Tree::F64(v.to_bits()))
+    fn serialize_f64(self, _: f64) -> Result<Tree, Error> {
+        Err(unheld("an f64"))
     }
-    fn serialize_char(self, v: char) -> Result<Tree, Error> {
-        Ok(Tree::Str(v.to_string()))
+    fn serialize_char(self, _: char) -> Result<Tree, Error> {
+        Err(unheld("a char"))
     }
-    fn serialize_str(self, v: &str) -> Result<Tree, Error> {
-        Ok(Tree::Str(v.to_string()))
+    fn serialize_str(self, _: &str) -> Result<Tree, Error> {
+        Err(unheld("a string"))
     }
-    fn serialize_bytes(self, v: &[u8]) -> Result<Tree, Error> {
-        Ok(Tree::Seq(
-            v.iter().map(|b| Tree::Int((*b).into())).collect(),
-        ))
+    fn serialize_bytes(self, _: &[u8]) -> Result<Tree, Error> {
+        Err(unheld("bytes"))
     }
     fn serialize_none(self) -> Result<Tree, Error> {
         Ok(Tree::None)
@@ -258,8 +251,8 @@ impl ser::Serializer for Ser {
     ) -> Result<Items, Error> {
         Ok(Items(Vec::with_capacity(len), Some(variant)))
     }
-    fn serialize_map(self, _: Option<usize>) -> Result<Entries, Error> {
-        Ok(Entries(Vec::new(), None))
+    fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, Error> {
+        Err(unheld("a map"))
     }
     fn serialize_struct(self, _: &'static str, len: usize) -> Result<Fields, Error> {
         Ok(Fields(Vec::with_capacity(len), None))
@@ -324,23 +317,6 @@ macro_rules! fields {
 
 fields!(SerializeStruct, SerializeStructVariant);
 
-impl ser::SerializeMap for Entries {
-    type Ok = Tree;
-    type Error = Error;
-    fn serialize_key<T: ?Sized + Serialize>(&mut self, key: &T) -> Result<(), Error> {
-        self.1 = Some(key.serialize(Ser)?);
-        Ok(())
-    }
-    fn serialize_value<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Error> {
-        let key = self.1.take().expect("a map value follows its key");
-        self.0.push((key, value.serialize(Ser)?));
-        Ok(())
-    }
-    fn end(self) -> Result<Tree, Error> {
-        Ok(Tree::Map(self.0))
-    }
-}
-
 pub struct De(Tree);
 
 impl<'de> IntoDeserializer<'de, Error> for Tree {
@@ -357,7 +333,6 @@ impl<'de> de::Deserializer<'de> for De {
         match self.0 {
             Tree::Id(id) => visitor.visit_u32(id),
             Tree::F32(bits) => visitor.visit_f32(f32::from_bits(bits)),
-            Tree::F64(bits) => visitor.visit_f64(f64::from_bits(bits)),
             Tree::Int(n) => match u64::try_from(n) {
                 Ok(n) => visitor.visit_u64(n),
                 Err(_) => visitor.visit_i64(
@@ -365,12 +340,10 @@ impl<'de> de::Deserializer<'de> for De {
                 ),
             },
             Tree::Bool(b) => visitor.visit_bool(b),
-            Tree::Str(s) => visitor.visit_string(s),
             Tree::Unit => visitor.visit_unit(),
             Tree::None => visitor.visit_none(),
             Tree::Some(inner) => visitor.visit_some(De(*inner)),
             Tree::Seq(items) => visitor.visit_seq(SeqDeserializer::new(items.into_iter())),
-            Tree::Map(entries) => visitor.visit_map(MapDeserializer::new(entries.into_iter())),
             Tree::Struct(fields) => visitor.visit_map(MapDeserializer::new(fields.into_iter())),
             Tree::Variant(..) => Err(Error("a variant read where no enum is".into())),
         }

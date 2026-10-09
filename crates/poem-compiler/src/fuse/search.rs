@@ -304,13 +304,6 @@ fn unify(trace: &Trace, shape: &Shape, p: &Tree, t: &Tree, b: &mut Binding) -> b
         (Tree::Seq(ps), Tree::Seq(ts)) => {
             ps.len() == ts.len() && ps.iter().zip(ts).all(|(p, t)| unify(trace, shape, p, t, b))
         }
-        (Tree::Map(ps), Tree::Map(ts)) => {
-            ps.len() == ts.len()
-                && ps
-                    .iter()
-                    .zip(ts)
-                    .all(|((pk, pv), (tk, tv))| pk == tk && unify(trace, shape, pv, tv, b))
-        }
         (Tree::Struct(ps), Tree::Struct(ts)) => {
             ps.len() == ts.len()
                 && ps.iter().zip(ts).all(|((pk, pv), (tk, tv))| {
