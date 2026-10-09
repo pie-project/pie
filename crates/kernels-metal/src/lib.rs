@@ -1,3 +1,5 @@
+#[cfg(target_vendor = "apple")]
+pub mod ane;
 pub mod attn;
 pub mod collective;
 pub mod elemwise;

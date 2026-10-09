@@ -3,7 +3,7 @@ name = "kernels-metal"
 version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "Pure Metal kernel definitions: shader entry names, argument marshalling, and dispatch geometry. Knows nothing about the IR; an engine Run resolves plan ids to handles and calls these entry functions."
+description = "Pure Metal kernel definitions: shader entry names, argument marshalling, and dispatch geometry, plus the Neural Engine bridge the split MLP hands work to. Knows nothing about the IR; an engine Run resolves plan ids to handles and calls these entry functions."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -13,3 +13,14 @@ path = "src/lib.rs"
 
 [dependencies]
 dtype = { package = "pie-dtype", path = "../dtype" }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2 = "0.6"
+objc2-metal = { version = "0.3", default-features = false, features = [
+    "std",
+    "MTLDevice",
+    "MTLEvent",
+] }
+
+[build-dependencies]
+cc = "1"
