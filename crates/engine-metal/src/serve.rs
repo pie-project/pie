@@ -255,6 +255,8 @@ pub struct Shell {
     trace: Trace,
     compiled: CompiledModel,
     budgets: Budgets,
+    /// The Neural Engine's share of the dense MLPs, when this load has one.
+    ane: Option<crate::ane::Ane>,
     weights: Weights,
     arena: Arena,
     pools: Pools,
@@ -514,6 +516,11 @@ impl Shell {
         weights.decode_absorbed(&device, &handles, &boot.trace)?;
         weights.relabel_conv_weights(&device, &handles, &boot.trace)?;
         weights.repack_mpp(&device, &handles, &boot.trace)?;
+        let ane =
+            crate::ane::load(&device, &handles, &boot.trace, &weights).unwrap_or_else(|why| {
+                eprintln!("PIE_ANE: staying on the GPU: {why}");
+                None
+            });
         handles.seal();
 
         {
@@ -933,6 +940,7 @@ impl Shell {
             trace: boot.trace,
             compiled,
             budgets,
+            ane,
             weights,
             arena,
             pools,
@@ -3711,12 +3719,17 @@ impl Shell {
             self.land_merges(frame, p)?;
         }
         let sink = match mode {
-            Mode::Encode => Encoded::Live(Sink::new(
-                &self.device,
-                frame.as_ref().expect("the encoding mode opened a frame"),
-                &self.pipelines,
-                &self.handles,
-            )),
+            Mode::Encode => {
+                let sink = Sink::new(
+                    &self.device,
+                    frame.as_ref().expect("the encoding mode opened a frame"),
+                    &self.pipelines,
+                    &self.handles,
+                );
+                #[cfg(target_vendor = "apple")]
+                let sink = sink.with_handoff(self.ane.as_ref().map(crate::ane::Ane::handoff));
+                Encoded::Live(sink)
+            }
             Mode::Record | Mode::Replay => {
                 Encoded::Taped(Tape::new(&self.handles, &place, &p.windows))
             }
@@ -3745,7 +3758,8 @@ impl Shell {
                 &p.windows,
                 &place,
                 &self.scratch,
-            );
+            )
+            .with_ane(self.ane.as_ref().filter(|_| matches!(mode, Mode::Encode)));
             walk(
                 &self.trace,
                 &self.compiled,
@@ -4308,8 +4322,10 @@ impl engine::frame::Shell for Shell {
         let seq = self.airborne.enter();
         let counts = self.airborne.clone();
         let done = prepared.done.take();
+        let verdict = self.ane.as_ref().and_then(crate::ane::Ane::verdict);
         let pending = frame.commit_async(Some(Box::new(move |refused: Option<String>| {
             counts.leave();
+            let refused = refused.or_else(|| verdict.as_ref().and_then(|verdict| verdict()));
             if let Some(done) = done.as_ref() {
                 let outcome = match &refused {
                     None => engine::StepOutcome::Committed,

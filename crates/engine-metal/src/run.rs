@@ -154,6 +154,10 @@ pub struct Run<'c> {
     copy: CopyPlan,
 
     scratch: &'c Scratch,
+
+    /// The Neural Engine's share of this load, when a live encode may hand
+    /// it work.
+    ane: Option<&'c crate::ane::Ane>,
 }
 
 impl<'c> Run<'c> {
@@ -187,7 +191,18 @@ impl<'c> Run<'c> {
             place,
             copy: CopyPlan::default(),
             scratch,
+            ane: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_ane(mut self, ane: Option<&'c crate::ane::Ane>) -> Self {
+        self.ane = ane;
+        self
+    }
+
+    pub(crate) fn ane(&self) -> Option<&'c crate::ane::Ane> {
+        self.ane
     }
 
     pub(crate) fn window(&self) -> &'c Window {

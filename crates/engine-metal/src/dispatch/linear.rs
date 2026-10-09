@@ -21,25 +21,103 @@ impl Run<'_> {
                 packed,
                 h,
                 y,
-            } => {
-                self.linear(&Linear::Matmul {
-                    act: *act,
-                    w: *gate_up,
-                    y: *packed,
-                })?;
-                self.linear(&Linear::MlpSwiglu {
-                    packed: *packed,
-                    intermediate: *intermediate,
-                    y: *h,
-                })?;
-                self.linear(&Linear::Matmul {
-                    act: *h,
-                    w: *down,
-                    y: *y,
-                })
-            }
+            } => match self
+                .ane()
+                .and_then(|ane| Some((ane, ane.plan(*gate_up, self.tensor(*act).rows)?)))
+                .filter(|(_, plan)| self.split_fits(plan, *act, *h, *y))
+            {
+                Some((ane, plan)) => self.mlp_split(ane, &plan, *act, *packed, *h, *y),
+                None => {
+                    self.linear(&Linear::Matmul {
+                        act: *act,
+                        w: *gate_up,
+                        y: *packed,
+                    })?;
+                    self.linear(&Linear::MlpSwiglu {
+                        packed: *packed,
+                        intermediate: *intermediate,
+                        y: *h,
+                    })?;
+                    self.linear(&Linear::Matmul {
+                        act: *h,
+                        w: *down,
+                        y: *y,
+                    })
+                }
+            },
             _ => Err(kernels_metal::Error::Unsupported { op: op.name() }),
         }
+    }
+
+    /// Whether the plan's rows, padded to the matmul tile, fit the planes
+    /// this call writes and the precast the GPU's share needs.
+    fn split_fits(
+        &self,
+        plan: &crate::ane::Plan,
+        act: poem_ir::ValueId,
+        h: poem_ir::ValueId,
+        y: poem_ir::ValueId,
+    ) -> bool {
+        let padded = plan.rows.div_ceil(32) * 32;
+        padded
+            <= self
+                .capacity(act)
+                .min(self.capacity(h))
+                .min(self.capacity(y))
+            && self.precast(padded, plan.split.keep).is_some()
+    }
+
+    /// The GPU's share of a split MLP, between the hand-off and the join:
+    /// gate and up over its leading `keep` channels, written compactly into
+    /// the packed and staging planes, swiglu, and down over those channels
+    /// into `y`, which the join then adds the Neural Engine's partial to.
+    fn mlp_split(
+        &self,
+        ane: &crate::ane::Ane,
+        plan: &crate::ane::Plan,
+        act: poem_ir::ValueId,
+        packed: poem_ir::ValueId,
+        h: poem_ir::ValueId,
+        y: poem_ir::ValueId,
+    ) -> Result<(), kernels_metal::Error> {
+        let keep = plan.split.keep;
+        let x = self.tensor(act);
+        let out = self.tensor(y);
+        let gate = kernels_metal::Tensor {
+            width: keep,
+            ..self.tensor(packed)
+        };
+        let h_gpu = kernels_metal::Tensor {
+            width: keep,
+            ..self.tensor(h)
+        };
+        ane.before(self.ctx(), plan, x)?;
+        let precast = |rows, contraction| self.precast(rows, contraction);
+        let partials = |rows, width| self.partials(rows, width);
+        let scratch = || linear::quant::Scratch {
+            precast: &precast,
+            partials: &partials,
+        };
+        let rows = self.capacity(act);
+        linear::quant::matmul(
+            self.ctx(),
+            x,
+            plan.split.gate,
+            gate,
+            scratch(),
+            rows.min(self.capacity(packed)),
+        )?;
+        linear::quant::matmul(self.ctx(), x, plan.split.up, plan.up_rows, scratch(), rows)?;
+        linear::mlp::swiglu_clamp_split(self.ctx(), gate, plan.up_rows, f32::MAX, h_gpu)?;
+        linear::quant::matmul(
+            self.ctx(),
+            h_gpu,
+            plan.split.down,
+            out,
+            scratch(),
+            self.capacity(h).min(self.capacity(y)),
+        )?;
+        ane.after(self.ctx(), plan, out)
     }
 
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_metal::Error> {
