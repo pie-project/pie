@@ -3,7 +3,7 @@
 //! staged, and the program, compiled off the serving thread.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use kernels_metal::ane::ffn::{self, Ffn, MAX_ROWS, MIN_ROWS, Memory, SEGMENT, Shape};
@@ -39,6 +39,8 @@ pub struct Private {
     status: usize,
     /// The layer whose weights are in the set of its parity.
     staged: AtomicU32,
+    /// How many MLPs have been handed to the Neural Engine.
+    splits: AtomicU64,
     _buffers: Vec<Buffer>,
     _memory: Arc<Memory>,
 }
@@ -253,6 +255,7 @@ pub fn load(device: &Context, handles: &Handles, mlps: &[Mlp]) -> Result<Option<
         rotated,
         status: status_host,
         staged: AtomicU32::new(u32::MAX),
+        splits: AtomicU64::new(0),
         _buffers: keep,
         _memory: memory,
     }))
@@ -266,6 +269,22 @@ impl Private {
     /// The hand-off a live encode fences on.
     pub fn handoff(&self) -> &Handoff {
         &self.handoff
+    }
+
+    /// How the program's compile went: `None` while it is still running,
+    /// `Some(Ok)` once a plan may be made, `Some(Err)` with the reason when
+    /// the GPU is keeping the whole MLP.
+    #[must_use]
+    pub fn compiled(&self) -> Option<std::result::Result<(), String>> {
+        self.ffn
+            .get()
+            .map(|result| result.as_ref().map(|_| ()).map_err(Clone::clone))
+    }
+
+    /// How many MLPs the Neural Engine has been handed so far.
+    #[must_use]
+    pub fn splits(&self) -> u64 {
+        self.splits.load(Ordering::Acquire)
     }
 
     /// A split for the MLP whose gate-up weight is `gate_up`, over `rows`,
@@ -319,6 +338,7 @@ impl Private {
             let binding = &ffn.evaluations[plan.evaluation].1[(plan.layer & 1) as usize];
             self.handoff
                 .start(&ffn.program, binding, plan.ready, plan.done);
+            self.splits.fetch_add(1, Ordering::AcqRel);
         }
         Ok(())
     }

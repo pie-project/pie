@@ -1053,6 +1053,12 @@ impl Shell {
         self.held.get(slot as usize).copied().unwrap_or(0)
     }
 
+    /// The Neural Engine's share of this load, if it has one.
+    #[must_use]
+    pub fn neural_engine(&self) -> Option<&crate::ane::Ane> {
+        self.ane.as_ref()
+    }
+
     #[must_use]
     pub fn trace(&self) -> &Trace {
         &self.trace

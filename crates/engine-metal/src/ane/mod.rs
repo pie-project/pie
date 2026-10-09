@@ -49,6 +49,12 @@ impl Ane {
     pub fn verdict(&self) -> Option<Box<dyn Fn() -> Option<String> + Send>> {
         match *self {}
     }
+    pub fn compiled(&self) -> Option<Result<(), String>> {
+        match *self {}
+    }
+    pub fn splits(&self) -> u64 {
+        match *self {}
+    }
 }
 
 /// Sets the Neural Engine up for the dense MLPs in `trace`, or `None` when
