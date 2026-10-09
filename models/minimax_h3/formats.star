@@ -32,7 +32,7 @@ def modulation(reads, w, stem, order, width):
 def attention(reads, m, a, stem):
     d = m.dims
     name = stem + ".qkv_proj.weight"
-    raw_dtype = dtype_of(stored(name))
+    raw_dtype = stored(name).raw
     if raw_dtype == None:
         fail("`{}`: `{}` is stored {}; a fused qkv bank is a raw plane".format(a.qkv.name, name, stored(name)))
     heads = d.heads

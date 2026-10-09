@@ -126,20 +126,6 @@ impl<'v> StarlarkValue<'v> for EncodingValue {
             .downcast_ref::<EncodingValue>()
             .is_some_and(|other| other.0 == self.0))
     }
-
-    /// `raw`: the dtype of plain values, or `None` for a quantized
-    /// encoding.
-    fn get_attr(&self, attribute: &str, heap: starlark::values::Heap<'v>) -> Option<Value<'v>> {
-        match (attribute, &self.0) {
-            ("raw", Encoding::Raw(dtype)) => Some(heap.alloc(DtypeValue(*dtype))),
-            ("raw", _) => Some(Value::new_none()),
-            _ => None,
-        }
-    }
-
-    fn has_attr(&self, attribute: &str, _heap: starlark::values::Heap<'v>) -> bool {
-        attribute == "raw"
-    }
 }
 
 /// A checkpoint attribute as Starlark spells it.
@@ -369,56 +355,7 @@ impl fmt::Display for SourceHandle {
 }
 
 #[starlark_value(type = "checkpoint")]
-impl<'v> StarlarkValue<'v> for SourceHandle {
-    fn get_methods() -> Option<&'static Methods> {
-        Some(SOURCE_METHODS_STATICS.methods())
-    }
-}
-
-#[starlark_module]
-fn source_methods(builder: &mut MethodsBuilder) {
-    /// Whether the checkpoint holds a tensor named `name`.
-    fn has(
-        #[starlark(this)] _this: &SourceHandle,
-        #[starlark(require = pos)] name: &str,
-    ) -> anyhow::Result<bool> {
-        source(|src| src.names.contains(name))
-    }
-
-    /// Whether the checkpoint holds a tensor whose name begins with `prefix`.
-    fn has_prefix(
-        #[starlark(this)] _this: &SourceHandle,
-        #[starlark(require = pos)] prefix: &str,
-    ) -> anyhow::Result<bool> {
-        source(|src| src.names.iter().any(|name| name.starts_with(prefix)))
-    }
-
-    /// Whether the checkpoint holds a tensor whose name ends in `suffix`.
-    fn has_suffix(
-        #[starlark(this)] _this: &SourceHandle,
-        #[starlark(require = pos)] suffix: &str,
-    ) -> anyhow::Result<bool> {
-        source(|src| src.names.iter().any(|name| name.ends_with(suffix)))
-    }
-
-    /// The container attribute `key`, as text, or `None`.
-    fn attribute(
-        #[starlark(this)] _this: &SourceHandle,
-        #[starlark(require = pos)] key: &str,
-    ) -> anyhow::Result<NoneOr<String>> {
-        source(|src| {
-            match src
-                .attributes
-                .as_ref()
-                .and_then(|a| a.get(key))
-                .and_then(|v| v.as_text())
-            {
-                Some(text) => NoneOr::Other(text.to_string()),
-                None => NoneOr::None,
-            }
-        })
-    }
-}
+impl<'v> StarlarkValue<'v> for SourceHandle {}
 
 /// The reads of the format reading a checkpoint.
 #[derive(
@@ -742,17 +679,6 @@ pub(crate) fn formats(builder: &mut GlobalsBuilder) {
     /// The name the biases of the weight `name` are held under.
     fn biases_name(#[starlark(require = pos)] name: &str) -> anyhow::Result<String> {
         Ok(crate::biases_name(name))
-    }
-
-    /// The dtype a raw `encoding` holds its values in, or `None` for a
-    /// quantized one.
-    fn dtype_of(
-        #[starlark(require = pos)] encoding: &EncodingValue,
-    ) -> anyhow::Result<NoneOr<DtypeValue>> {
-        Ok(match encoding.0 {
-            Encoding::Raw(dtype) => NoneOr::Other(DtypeValue(dtype)),
-            _ => NoneOr::None,
-        })
     }
 
     /// How a weight of `dtype` is stored.

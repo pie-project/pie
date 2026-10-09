@@ -11,7 +11,7 @@ BARE = "a bare transformer state_dict"
 BN_EPS = 1e-4
 
 def formats(m):
-    pipeline = lambda checkpoint: checkpoint.has_prefix("dit.")
+    pipeline = lambda checkpoint: has_prefix("dit.")
     out = [format(DIFFUSERS, recognizes = pipeline, read = lambda reads: read(m, reads, "dit."))]
     if m.te == None and m.vae == None:
         out.append(format(

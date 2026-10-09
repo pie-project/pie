@@ -44,7 +44,7 @@ def signs(reads, w, seed):
     """The sign table `w`: a column of ones over one of minus ones, stored as
     the raw dtype `seed` is stored in."""
     held = stored(seed)
-    raw_dtype = dtype_of(held)
+    raw_dtype = held.raw
     if raw_dtype == None:
         fail("`{}`: `{}` is stored {}; a constant is stated in a raw dtype".format(w.name, seed, held))
     half = w.shape[0] // 2

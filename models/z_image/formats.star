@@ -13,7 +13,7 @@ T_FLIP = 1000.0
 SHIFT_FACTOR = 0.1159
 
 def formats(m):
-    pipeline = lambda checkpoint: checkpoint.has_prefix("dit.")
+    pipeline = lambda checkpoint: has_prefix("dit.")
     out = [format(DIFFUSERS, recognizes = pipeline, read = lambda reads: read(m, reads, "dit."))]
     if m.te == None:
         out.append(format(
