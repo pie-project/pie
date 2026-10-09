@@ -10,6 +10,7 @@ from .config import (
     EXIT_WINDOW_SECONDS,
     FRAME_SECONDS,
     MODES,
+    SCROLL_PAUSE_SECONDS,
     STREAM_REDRAW_SECONDS,
     WARM_DELAY_SECONDS,
 )
@@ -24,6 +25,7 @@ class Chat:
         self.app: Application | None = None
         self.frame = 0
         self.scroll_back = 0
+        self.last_scroll = 0.0
         self.content_version = 0
         self.last_draw = 0.0
         self.exit_armed = False
@@ -66,6 +68,7 @@ class Chat:
 
     def scroll(self, lines: int) -> None:
         self.scroll_back = max(0, self.scroll_back + lines)
+        self.last_scroll = time.monotonic()
         self.redraw()
 
     def cycle_mode(self) -> None:
@@ -127,5 +130,7 @@ class Chat:
     async def animate(self) -> None:
         while True:
             await asyncio.sleep(FRAME_SECONDS)
+            if time.monotonic() - self.last_scroll < SCROLL_PAUSE_SECONDS:
+                continue
             self.frame += 1
             self.redraw()
