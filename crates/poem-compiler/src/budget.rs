@@ -208,6 +208,7 @@ impl FamilyCosts {
             poem_ir::Operation::Collective(_) => self.collective,
             poem_ir::Operation::Fused(op) => match op {
                 poem_ir::Fused::MatmulGeglu { .. }
+                | poem_ir::Fused::MlpSwiglu { .. }
                 | poem_ir::Fused::LmHeadSoftcap { .. }
                 | poem_ir::Fused::MatmulBias { .. } => self.linear,
                 poem_ir::Fused::QkvFusedQknormRopeVnormWrite { .. } => self.custom,

@@ -59,6 +59,33 @@ impl Run<'_> {
                     y: *y,
                 })
             }
+            // Not in `FUSED`, so never formed here; whole, it is its three
+            // primitives.
+            Fused::MlpSwiglu {
+                act,
+                gate_up,
+                down,
+                intermediate,
+                packed,
+                h,
+                y,
+            } => {
+                self.linear(&Linear::Matmul {
+                    act: *act,
+                    w: *gate_up,
+                    y: *packed,
+                })?;
+                self.linear(&Linear::MlpSwiglu {
+                    packed: *packed,
+                    intermediate: *intermediate,
+                    y: *h,
+                })?;
+                self.linear(&Linear::Matmul {
+                    act: *h,
+                    w: *down,
+                    y: *y,
+                })
+            }
             Fused::MatmulBias {
                 act,
                 w,

@@ -8,9 +8,10 @@ impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         match op {
             Fused::QkvFusedQknormRopeVnormWrite { .. } => self.custom_cuda(op),
-            Fused::MatmulGeglu { .. } | Fused::LmHeadSoftcap { .. } | Fused::MatmulBias { .. } => {
-                self.fused_linear(op)
-            }
+            Fused::MatmulGeglu { .. }
+            | Fused::MlpSwiglu { .. }
+            | Fused::LmHeadSoftcap { .. }
+            | Fused::MatmulBias { .. } => self.fused_linear(op),
             Fused::ResidualAddRmsnorm { .. }
             | Fused::RmsnormResidualAdd { .. }
             | Fused::EmbedScaleAdd { .. }

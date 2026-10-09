@@ -5,7 +5,11 @@ use crate::run::Run;
 
 impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
-        self.fused_elementwise(op).map_err(crate::error::kernel)
+        match op {
+            Fused::MlpSwiglu { .. } => self.fused_linear(op),
+            _ => self.fused_elementwise(op),
+        }
+        .map_err(crate::error::kernel)
     }
 }
 

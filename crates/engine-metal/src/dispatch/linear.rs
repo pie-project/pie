@@ -1,6 +1,6 @@
 use kernels_metal::linear;
 use poem_exec::{DispatchLinear, KernelError};
-use poem_ir::{Linear, Operands};
+use poem_ir::{Fused, Linear, Operands};
 
 use crate::run::Run;
 
@@ -11,6 +11,37 @@ impl DispatchLinear for Run<'_> {
 }
 
 impl Run<'_> {
+    pub(super) fn fused_linear(&mut self, op: &Fused) -> Result<(), kernels_metal::Error> {
+        match op {
+            Fused::MlpSwiglu {
+                act,
+                gate_up,
+                down,
+                intermediate,
+                packed,
+                h,
+                y,
+            } => {
+                self.linear(&Linear::Matmul {
+                    act: *act,
+                    w: *gate_up,
+                    y: *packed,
+                })?;
+                self.linear(&Linear::MlpSwiglu {
+                    packed: *packed,
+                    intermediate: *intermediate,
+                    y: *h,
+                })?;
+                self.linear(&Linear::Matmul {
+                    act: *h,
+                    w: *down,
+                    y: *y,
+                })
+            }
+            _ => Err(kernels_metal::Error::Unsupported { op: op.name() }),
+        }
+    }
+
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_metal::Error> {
         match op {
             Linear::Matmul { act, w, y }
