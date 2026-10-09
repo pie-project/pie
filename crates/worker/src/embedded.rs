@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
-pub use crate::boot::{Engine, Summary};
+pub use crate::boot::{Embedded, Engine, Loaded, Summary};
 use crate::config::{ByteSize, Config, EngineKind};
 
 /// The knobs an app sets (`PieServer.Configuration` in Swift and Kotlin, the
@@ -86,6 +86,7 @@ impl Settings {
         config.model.sku = self.sku.clone();
         config.model.engine.options = self.engine_options(kind, home);
         config.home = Some(home.to_path_buf());
+        config.server.worker_threads = 2;
         config.server.verbose = self.verbose;
         config.server.max_upload = ByteSize::from_mib(256);
         config.runtime.frame_size = self.frame_size;
@@ -101,15 +102,6 @@ impl Settings {
         sandbox.allow_network = false;
         sandbox.network_allowed_hosts.clear();
         Ok(config)
-    }
-
-    /// What to boot on: this build's engine, or none.
-    pub fn engine(&self) -> Engine {
-        if self.engine {
-            Engine::Configured
-        } else {
-            Engine::None
-        }
     }
 
     fn engine_options(&self, kind: EngineKind, home: &Path) -> toml::Table {
@@ -156,56 +148,6 @@ fn native_kind() -> EngineKind {
         EngineKind::Vulkan
     } else {
         EngineKind::Wgpu
-    }
-}
-
-/// A booted runtime; dropping it leaves the runtime running. The runtime
-/// boots once per process.
-pub struct Embedded {
-    runtime: runtime::bootstrap::BootstrapHandle,
-    pub summary: Summary,
-}
-
-impl Embedded {
-    /// Loads the model onto `engine` and boots the runtime over it, with
-    /// `builtins` registered.
-    pub async fn start(
-        config: &Config,
-        engine: Engine,
-        builtins: Vec<runtime::bootstrap::BuiltinProgram>,
-    ) -> Result<Embedded> {
-        Embedded::load(config, engine, builtins)?.start().await
-    }
-
-    /// The first half of [`Embedded::start`], blocking: the weights land on
-    /// the engine, and the runtime is not up yet.
-    pub fn load(
-        config: &Config,
-        engine: Engine,
-        builtins: Vec<runtime::bootstrap::BuiltinProgram>,
-    ) -> Result<Loaded> {
-        Ok(Loaded(crate::boot::prepare(config, engine, builtins)?))
-    }
-
-    pub async fn shutdown(self) -> Result<()> {
-        self.runtime.shutdown().await
-    }
-}
-
-/// A model on its engine, the runtime not yet booted over it.
-pub struct Loaded(crate::boot::Prepared);
-
-impl Loaded {
-    pub fn summary(&self) -> &Summary {
-        &self.0.summary
-    }
-
-    pub async fn start(self) -> Result<Embedded> {
-        let booted = self.0.start().await?;
-        Ok(Embedded {
-            runtime: booted.runtime,
-            summary: booted.summary,
-        })
     }
 }
 

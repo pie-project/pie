@@ -21,7 +21,6 @@ path = "src/lib.rs"
 
 [dependencies]
 worker = { path = "../../../crates/worker", default-features = false, features = ["standalone"] }
-runtime = { path = "../../../crates/runtime", default-features = false }
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
 toml = "1.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

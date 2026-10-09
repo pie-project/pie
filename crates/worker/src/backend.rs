@@ -397,13 +397,8 @@ pub(crate) fn create_engine_backend(
     sku: Option<&str>,
     opened: Option<runtime::engine::EngineBox>,
 ) -> Result<GroupEngine> {
-    let _ = (group_id, adapter_dir);
+    let _ = (group_id, adapter_dir, &opened);
     validate_snapshot_dir(snapshot_dir)?;
-    // The host's engine when it opened one itself (the browser's WebGPU device).
-    let open = |doc: &str, open_doc: fn(&[u8]) -> Result<runtime::engine::EngineBox>| match opened {
-        Some(engine) => Ok(engine),
-        None => open_doc(doc.as_bytes()),
-    };
 
     let (mut backend, budgets, platform): (
         runtime::engine::EngineBox,
@@ -454,7 +449,10 @@ pub(crate) fn create_engine_backend(
                 ));
             }
             metal_geometry_is_stated(opts)?;
-            let backend = open(&boot_doc, runtime::engine::backend::open::metal)?;
+            let backend = opened.map_or_else(
+                || runtime::engine::backend::open::metal(boot_doc.as_bytes()),
+                Ok,
+            )?;
             let page_size = opts.kv_page_size.max(1);
             let max_context = opts
                 .max_model_len
@@ -490,7 +488,10 @@ pub(crate) fn create_engine_backend(
                     toml::Value::String(cache.display().to_string())
                 ));
             }
-            let backend = open(&boot_doc, runtime::engine::backend::open::vulkan)?;
+            let backend = opened.map_or_else(
+                || runtime::engine::backend::open::vulkan(boot_doc.as_bytes()),
+                Ok,
+            )?;
             let defaults = engine::Budgets::default();
             (
                 backend,
@@ -534,7 +535,10 @@ pub(crate) fn create_engine_backend(
             if let Some(memory) = opts.device_memory {
                 boot_doc.push_str(&format!("device_memory = {}\n", memory.as_bytes()));
             }
-            let backend = open(&boot_doc, runtime::engine::backend::open::wgpu)?;
+            let backend = opened.map_or_else(
+                || runtime::engine::backend::open::wgpu(boot_doc.as_bytes()),
+                Ok,
+            )?;
             let defaults = engine::Budgets::default();
             (
                 backend,
@@ -567,7 +571,10 @@ pub(crate) fn create_engine_backend(
                     toml::Value::String(plugin.display().to_string())
                 ));
             }
-            let backend = open(&boot_doc, runtime::engine::backend::open::xla)?;
+            let backend = opened.map_or_else(
+                || runtime::engine::backend::open::xla(boot_doc.as_bytes()),
+                Ok,
+            )?;
             let defaults = engine::Budgets::default();
             (
                 backend,

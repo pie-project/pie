@@ -4,32 +4,14 @@
 //! `pie serve` does.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::RwLock;
 
 use anyhow::{Result, anyhow};
 use tokio::sync::watch;
 
 use crate::config::Config;
-use crate::embedded::{Embedded, Engine, Summary};
-
-/// How a [`Server`] boots.
-pub struct Options {
-    pub engine: Engine,
-    /// Registers the built-in inferlets (`compat-openai`, ...).
-    pub builtins: bool,
-    /// Also serves the gateway (its WebSocket and HTTP routes) here.
-    pub listen: Option<SocketAddr>,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Options {
-            engine: Engine::Configured,
-            builtins: true,
-            listen: None,
-        }
-    }
-}
+use crate::embedded::{Embedded, Engine, Settings, Summary};
 
 pub struct Server {
     summary: Summary,
@@ -50,31 +32,29 @@ enum Serving {
 }
 
 impl Server {
-    /// Boots `config`. One per process.
-    pub fn start(mut config: Config, options: Options) -> Result<Server> {
+    /// Boots `config` on `engine`, with the built-in inferlets; with `listen`
+    /// the gateway serves it there too. One per process.
+    pub fn start(config: Config, engine: Engine, listen: Option<SocketAddr>) -> Result<Server> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(config.server.worker_threads)
             .thread_stack_size(8 << 20)
             .enable_all()
             .build()?;
-        let (serving, summary, listen_addr) = match options.listen {
+        let (serving, summary, listen_addr) = match listen {
             None => {
-                let builtins = if options.builtins {
-                    crate::translate::builtins()
-                } else {
-                    Vec::new()
-                };
-                let embedded =
-                    runtime.block_on(Embedded::start(&config, options.engine, builtins))?;
+                let embedded = runtime.block_on(
+                    Embedded::load(&config, engine, crate::translate::builtins())?.start(),
+                )?;
                 let summary = embedded.summary.clone();
                 (Serving::Embedded(embedded), summary, None)
             }
             #[cfg(feature = "standalone")]
             Some(listen) => {
                 anyhow::ensure!(
-                    matches!(options.engine, Engine::Configured) && options.builtins,
-                    "a gateway serves the configured engine, with the built-in inferlets"
+                    matches!(engine, Engine::Configured),
+                    "a gateway serves the configured engine"
                 );
+                let mut config = config;
                 config.server.host = listen.ip().to_string();
                 config.server.port = listen.port();
                 let controller = controller::Config::parse("")?;
@@ -88,7 +68,6 @@ impl Server {
             }
             #[cfg(not(feature = "standalone"))]
             Some(_) => {
-                let _ = &mut config;
                 anyhow::bail!("this build serves no gateway (the worker's `standalone` feature)")
             }
         };
@@ -98,6 +77,22 @@ impl Server {
             live: RwLock::new(Some(Live { serving, runtime })),
             stop: watch::channel(false).0,
         })
+    }
+
+    /// Boots `artifact` for an app: `settings` laid onto a worker config
+    /// that keeps its files under `home`.
+    pub fn embed(
+        artifact: &Path,
+        settings: &Settings,
+        home: &Path,
+        listen: Option<SocketAddr>,
+    ) -> Result<Server> {
+        let engine = if settings.engine {
+            Engine::Configured
+        } else {
+            Engine::None
+        };
+        Server::start(settings.config(artifact, home)?, engine, listen)
     }
 
     /// Boots `config` the way `pie serve` does: the gateway at its
@@ -111,13 +106,7 @@ impl Server {
             )
         })?;
         let listen = SocketAddr::new(host, config.server.port);
-        Server::start(
-            config,
-            Options {
-                listen: Some(listen),
-                ..Options::default()
-            },
-        )
+        Server::start(config, Engine::Configured, Some(listen))
     }
 
     /// True until [`Server::shutdown`].
@@ -145,15 +134,17 @@ impl Server {
         })
     }
 
-    /// Installs the component that runs `language` (`python`, `javascript`).
-    pub fn install_language(&self, language: &str, component: Vec<u8>) -> Result<()> {
+    /// Installs the component that runs `language` (`python`, `javascript`);
+    /// returns the language's name.
+    pub fn install_language(&self, language: &str, component: Vec<u8>) -> Result<&'static str> {
         let language = runtime::inferlet::program::Language::parse(language)?;
         self.with(|live| {
             live.runtime
                 .block_on(runtime::inferlet::program::add_language(
                     language, component,
                 ))
-        })
+        })?;
+        Ok(language.name())
     }
 
     pub fn open_session(&self) -> Result<u32> {

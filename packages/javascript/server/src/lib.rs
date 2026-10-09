@@ -12,8 +12,6 @@ use std::sync::{Arc, Mutex};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use runtime::inferlet::program;
-
 type Live = Arc<worker::Server>;
 
 #[napi]
@@ -104,12 +102,11 @@ impl Task for InstallLanguage {
     type JsValue = String;
 
     fn compute(&mut self) -> Result<String> {
-        let language = program::Language::parse(&self.language)
-            .map_err(|e| invalid("language", format!("{e:#}")))?;
-        self.server
-            .install_language(language.name(), std::mem::take(&mut self.component))
+        let name = self
+            .server
+            .install_language(&self.language, std::mem::take(&mut self.component))
             .map_err(|e| failed("install language", format!("{e:#}")))?;
-        Ok(language.name().to_string())
+        Ok(name.to_string())
     }
 
     fn resolve(&mut self, _env: Env, name: String) -> Result<String> {

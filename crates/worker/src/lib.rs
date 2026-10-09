@@ -3,7 +3,7 @@
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub mod backend;
-pub mod boot;
+mod boot;
 pub mod config;
 pub mod disk;
 pub mod embedded;
@@ -17,7 +17,7 @@ pub mod weights;
 #[cfg(not(target_arch = "wasm32"))]
 mod server;
 #[cfg(not(target_arch = "wasm32"))]
-pub use server::{Options, Server};
+pub use server::Server;
 
 mod executor;
 #[cfg(feature = "net")]

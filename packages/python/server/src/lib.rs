@@ -13,8 +13,6 @@ use std::sync::{Arc, Mutex};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use runtime::inferlet::program;
-
 type Live = Arc<worker::Server>;
 
 #[pyclass(name = "EngineHandle")]
@@ -46,13 +44,12 @@ impl PyEngineHandle {
         language: &str,
         component: &[u8],
     ) -> PyResult<String> {
-        let language = program::Language::parse(language)
-            .map_err(|e| PyValueError::new_err(format!("language: {e:#}")))?;
         let server = self.live()?;
         let component = component.to_vec();
-        py.detach(|| server.install_language(language.name(), component))
+        let name = py
+            .detach(|| server.install_language(language, component))
             .map_err(|e| PyRuntimeError::new_err(format!("install language: {e:#}")))?;
-        Ok(language.name().to_string())
+        Ok(name.to_string())
     }
 
     #[pyo3(signature = (bytes, file, version=None))]

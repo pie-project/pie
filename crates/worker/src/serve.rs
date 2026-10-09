@@ -5,8 +5,9 @@ use anyhow::{Context, Result, bail};
 use controller_api::{ControlClient, Role, WorkerInfo};
 use ids::WorkerId;
 
-use crate::boot::{self, Booted, LoadedPartnerMetadata, Summary};
+use crate::boot::{self, LoadedPartnerMetadata};
 use crate::config;
+use crate::embedded::{Embedded, Engine, Summary};
 use crate::executor::ExecutorServer;
 use crate::link::client;
 use crate::link::control::{self, ControlLink};
@@ -281,9 +282,9 @@ pub async fn start_runtime(
     user_cfg: config::Config,
     coordinator: Coordinator,
 ) -> Result<RuntimeHandle> {
-    let (booted, partner_bootstrap) = boot_decode(&user_cfg).await?;
+    let (model, booted, partner_bootstrap) = boot_decode(&user_cfg).await?;
     let (edge_server, control_tasks, control_plane, partners, url) =
-        assemble_control_and_edge(coordinator, &user_cfg, booted.model, partner_bootstrap).await?;
+        assemble_control_and_edge(coordinator, &user_cfg, model, partner_bootstrap).await?;
     log_serving(&user_cfg, &url);
     Ok(RuntimeHandle {
         url,
@@ -302,13 +303,13 @@ pub async fn start_runtime_embedded<C: ControlLink>(
     gateways: Vec<String>,
     client_edge: Option<String>,
 ) -> Result<RuntimeHandle> {
-    let (booted, partner_bootstrap) = boot_decode(&user_cfg).await?;
+    let (model, booted, partner_bootstrap) = boot_decode(&user_cfg).await?;
     let addr = topology::addr_from_host_port(&user_cfg.server.host, user_cfg.server.port);
     let (edge_server, control_tasks, worker_id, partners) = assemble_distributed(
         control,
         &gateways,
         Role::Decode,
-        booted.model,
+        model,
         addr,
         partner_bootstrap,
     )
@@ -329,19 +330,16 @@ pub async fn start_runtime_embedded<C: ControlLink>(
 /// Boots a decode worker on its configured engine, with offload set up.
 async fn boot_decode(
     user_cfg: &config::Config,
-) -> Result<(Booted, Option<partner::PartnerBootstrap>)> {
-    let mut booted = boot::boot(
-        user_cfg,
-        boot::Engine::Configured,
-        crate::translate::builtins(),
-    )
-    .await?;
-    let metadata = booted
+) -> Result<(String, Embedded, Option<partner::PartnerBootstrap>)> {
+    let mut loaded = Embedded::load(user_cfg, Engine::Configured, crate::translate::builtins())?;
+    let metadata = loaded
         .partner
         .take()
         .context("a configured engine reports its partner metadata")?;
+    let model = std::mem::take(&mut loaded.model);
+    let booted = loaded.start().await?;
     let partner = build_partner_bootstrap(user_cfg, metadata, booted.runtime.model_idx);
-    Ok((booted, partner))
+    Ok((model, booted, partner))
 }
 
 fn build_partner_bootstrap(

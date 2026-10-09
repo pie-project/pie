@@ -3904,7 +3904,6 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
- "runtime",
  "serde_json",
  "toml 1.1.4+spec-1.1.0",
  "tracing-subscriber",
@@ -3916,7 +3915,6 @@ name = "pie-server-py"
 version = "0.5.4"
 dependencies = [
  "pyo3",
- "runtime",
  "toml 1.1.4+spec-1.1.0",
  "tracing-subscriber",
  "worker",

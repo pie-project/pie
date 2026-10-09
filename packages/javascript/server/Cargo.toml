@@ -21,7 +21,6 @@ path = "src/lib.rs"
 
 [dependencies]
 worker = { path = "../../../crates/worker", default-features = false, features = ["standalone"] }
-runtime = { path = "../../../crates/runtime", default-features = false }
 napi = { version = "3", default-features = false, features = ["napi4", "serde-json"] }
 napi-derive = "3"
 serde_json = "1"

@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JString};
 use jni::sys::{jint, jlong, jobjectArray};
+use worker::Server;
 use worker::embedded::Settings;
-use worker::{Options, Server};
 
 const EXCEPTION: &str = "org/pieproject/client/PieException$Server";
 
@@ -62,14 +62,12 @@ fn boot(
         .try_init();
 
     let settings = settings.map_or_else(|| Ok(Settings::default()), Settings::parse)?;
-    let mut config = settings.config(artifact, home)?;
-    config.server.worker_threads = 2;
-    let options = Options {
-        engine: settings.engine(),
-        listen: listen.map(str::parse).transpose()?,
-        ..Options::default()
-    };
-    Server::start(config, options)
+    Server::embed(
+        artifact,
+        &settings,
+        home,
+        listen.map(str::parse).transpose()?,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -136,7 +134,8 @@ pub extern "system" fn Java_org_pieproject_server_NativeCore_installLanguage(
         let component = env.convert_byte_array(&component)?;
         server(handle)?
             .install_language(&language, component)
-            .map_err(|e| e.context("install language"))
+            .map_err(|e| e.context("install language"))?;
+        Ok(())
     });
 }
 

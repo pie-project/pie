@@ -161,56 +161,62 @@ pub struct Summary {
     pub max_tokens: u32,
 }
 
-#[cfg_attr(not(feature = "net"), allow(dead_code))]
-pub(crate) struct Booted {
-    pub model: String,
-    pub partner: Option<LoadedPartnerMetadata>,
-    pub runtime: runtime::bootstrap::BootstrapHandle,
+/// A booted runtime; dropping it leaves the runtime running. The runtime
+/// boots once per process.
+pub struct Embedded {
+    pub(crate) runtime: runtime::bootstrap::BootstrapHandle,
     pub summary: Summary,
 }
 
-/// A model landed on its engine, ready for [`Prepared::start`].
-#[cfg_attr(not(feature = "net"), allow(dead_code))]
-pub(crate) struct Prepared {
-    pub model: String,
-    pub partner: Option<LoadedPartnerMetadata>,
-    pub summary: Summary,
+impl Embedded {
+    /// The model onto `engine`, blocking: the weights land here and the
+    /// runtime is not up yet; [`Loaded::start`] boots it with `builtins`.
+    pub fn load(
+        config: &config::Config,
+        engine: Engine,
+        builtins: Vec<runtime::bootstrap::BuiltinProgram>,
+    ) -> Result<Loaded> {
+        load(config, engine, builtins)
+    }
+
+    pub async fn shutdown(self) -> Result<()> {
+        self.runtime.shutdown().await
+    }
+}
+
+/// A model on its engine, the runtime not yet booted over it.
+pub struct Loaded {
+    #[cfg_attr(not(feature = "net"), allow(dead_code))]
+    pub(crate) model: String,
+    #[cfg_attr(not(feature = "net"), allow(dead_code))]
+    pub(crate) partner: Option<LoadedPartnerMetadata>,
+    summary: Summary,
     config: runtime::bootstrap::Config,
 }
 
-impl Prepared {
-    /// Boots the runtime over what [`prepare`] landed.
-    pub async fn start(self) -> Result<Booted> {
+impl Loaded {
+    pub fn summary(&self) -> &Summary {
+        &self.summary
+    }
+
+    pub async fn start(self) -> Result<Embedded> {
         let runtime = runtime::bootstrap::bootstrap(self.config)
             .await
             .map_err(|e| anyhow!("runtime::bootstrap::bootstrap: {e}"))?;
-        Ok(Booted {
-            model: self.model,
-            partner: self.partner,
+        Ok(Embedded {
             runtime,
             summary: self.summary,
         })
     }
 }
 
-/// Loads the model onto `engine` and boots the runtime over it.
-#[cfg(feature = "net")]
-pub(crate) async fn boot(
+fn load(
     user_cfg: &config::Config,
     engine: Engine,
     builtins: Vec<runtime::bootstrap::BuiltinProgram>,
-) -> Result<Booted> {
-    prepare(user_cfg, engine, builtins)?.start().await
-}
-
-/// Loads the model onto `engine` (blocking: the weights land here).
-pub(crate) fn prepare(
-    user_cfg: &config::Config,
-    engine: Engine,
-    builtins: Vec<runtime::bootstrap::BuiltinProgram>,
-) -> Result<Prepared> {
+) -> Result<Loaded> {
     let opened = match engine {
-        Engine::None => return prepare_without_engine(user_cfg, builtins),
+        Engine::None => return load_without_engine(user_cfg, builtins),
         Engine::Configured => None,
         Engine::Opened(engine) => Some(engine),
     };
@@ -241,7 +247,7 @@ pub(crate) fn prepare(
     };
     let config = translate::build(user_cfg, builtins, engines, metadata)
         .context("translating to bootstrap::Config")?;
-    Ok(Prepared {
+    Ok(Loaded {
         model,
         partner: Some(LoadedPartnerMetadata {
             full_identity,
@@ -257,10 +263,10 @@ pub(crate) fn prepare(
 }
 
 /// The runtime with no engine: the SKU comes from the artifact's serving stamp.
-fn prepare_without_engine(
+fn load_without_engine(
     user_cfg: &config::Config,
     builtins: Vec<runtime::bootstrap::BuiltinProgram>,
-) -> Result<Prepared> {
+) -> Result<Loaded> {
     let m = &user_cfg.model;
     let want = weights::Want {
         backend: None,
@@ -276,7 +282,7 @@ fn prepare_without_engine(
         .map(|stamp| stamp.sku)
         .ok_or_else(|| anyhow!("{} carries no serving stamp", artifact.display()))?;
     let config = translate::build_without_engine(user_cfg, builtins, &artifact, &sku, metadata);
-    Ok(Prepared {
+    Ok(Loaded {
         model: m.name.clone(),
         partner: None,
         summary: Summary {

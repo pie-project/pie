@@ -7,8 +7,8 @@
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::{Path, PathBuf};
 
+use worker::Server;
 use worker::embedded::Settings;
-use worker::{Options, Server};
 
 pub struct PieServer {
     server: Server,
@@ -86,14 +86,12 @@ fn boot(
         .try_init();
 
     let settings = settings.map_or_else(|| Ok(Settings::default()), Settings::parse)?;
-    let mut config = settings.config(artifact, home)?;
-    config.server.worker_threads = 2;
-    let options = Options {
-        engine: settings.engine(),
-        listen: listen.map(str::parse).transpose()?,
-        ..Options::default()
-    };
-    let server = Server::start(config, options)?;
+    let server = Server::embed(
+        artifact,
+        &settings,
+        home,
+        listen.map(str::parse).transpose()?,
+    )?;
     Ok(PieServer {
         summary: CString::new(serde_json::to_string(server.summary())?)?,
         server,
