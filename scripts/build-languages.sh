@@ -43,7 +43,9 @@ for language in "${languages[@]}"; do
   cp "$stage/languages/$language.wasm" "$root/packages/python/language-$language/src/pie_language_$language/$language.wasm"
   swift_target=$([ "$language" = python ] && echo Python || echo JavaScript)
   cp "$stage/languages/$language.wasm" "$root/packages/swift/Sources/PieLanguage$swift_target/Resources/$language.wasm"
-  cp "$stage/languages/$language.wasm" "$root/packages/kotlin/language-$language/src/main/resources/org/pieproject/language/$language.wasm"
+  kotlin_dir="$root/packages/kotlin/language-$language/src/main/resources/org/pieproject/language"
+  mkdir -p "$kotlin_dir"  # a fresh checkout has no resources folder: the Kotlin package is built from these
+  cp "$stage/languages/$language.wasm" "$kotlin_dir/$language.wasm"
   rm -rf "$stage"
   echo "== $out/pie-language-$language.tar.gz ($(du -h "$out/pie-language-$language.tar.gz" | cut -f1))"
 done
