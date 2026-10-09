@@ -26,6 +26,10 @@ PieServer *pie_server_start(const char *artifact, const char *config,
 /* The boot summary as JSON; valid until pie_server_free. */
 const char *pie_server_summary(const PieServer *server);
 
+/* `host:port` the gateway listens on (the OS's port for `listen` port 0), or
+   NULL without `listen`; valid until pie_server_free. */
+const char *pie_server_listen_addr(const PieServer *server);
+
 /* Installs a program (`file` names it: `x.wasm`, `x.py`, ...); `version` may
    be NULL. Returns its `name@version`. */
 char *pie_server_install(const PieServer *server, const uint8_t *bytes, size_t len,

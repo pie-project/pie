@@ -63,6 +63,9 @@ public class PieServer private constructor(private val handle: Long) : AutoClose
 
     public val summary: Summary = json.decodeFromString(NativeCore.summary(handle))
 
+    /** `host:port` the gateway listens on with `listen` (the OS's port for port 0), else null. */
+    public val listenAddress: String? = NativeCore.listenAddr(handle)
+
     public companion object {
         internal val json = Json {
             ignoreUnknownKeys = true

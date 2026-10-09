@@ -67,6 +67,9 @@ public final class PieServer: Sendable {
     }
 
     public let summary: Summary
+    /// `host:port` the gateway listens on with `listen` (the OS's port for
+    /// port 0), else nil.
+    public let listenAddress: String?
     let handle: Handle
 
     /// The C handle; every call on it is safe from any thread.
@@ -77,6 +80,7 @@ public final class PieServer: Sendable {
     private init(handle: Handle) throws {
         self.handle = handle
         summary = try JSONDecoder.snakeCase.decode(Summary.self, from: Data(String(cString: pie_server_summary(handle.pointer)).utf8))
+        listenAddress = pie_server_listen_addr(handle.pointer).map { String(cString: $0) }
     }
 
     deinit {

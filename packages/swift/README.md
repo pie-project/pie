@@ -47,7 +47,8 @@ your own from bytes (`server.install(contentsOf:)`) and launch them by the
 `PieServer.start(model:listen: "127.0.0.1:8080")` also serves pie's gateway
 from the app, as `pie serve` would: the WebSocket at `/v1/ws` and the
 OpenAI-, Anthropic- and Gemini-compatible HTTP routes (`/v1/chat/completions`,
-...), for an SDK in the app or a client on the same network.
+...), for an SDK in the app or a client on the same network. `listenAddress`
+says where it bound (with port 0, the port the OS picked).
 
 ## Models
 

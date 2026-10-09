@@ -62,8 +62,9 @@ if let url = URL(string: arguments[1]), url.scheme == "ws" {
 } else {
     let listen = ProcessInfo.processInfo.environment["PIE_LISTEN"]
     server = try await PieServer.start(model: URL(filePath: arguments[1]), listen: listen)
-    if let listen {
-        client = try await PieClient.connect(to: URL(string: "ws://\(listen)")!)
+    if listen != nil, let address = server!.listenAddress {
+        print("gateway at \(address)")
+        client = try await PieClient.connect(to: URL(string: "ws://\(address)")!)
     } else {
         client = try await server!.connect()
     }

@@ -42,7 +42,8 @@ when the inferlet fails; cancelling its collection terminates the inferlet.
 The built-in inferlets (`compat-openai`, ...) are registered at boot.
 `PieClient.connect("ws://host:port")` reaches a `pie serve` with the same API.
 `PieServer.start(..., listen = "127.0.0.1:8080")` also serves pie's gateway
-from the app: the WebSocket and the OpenAI-compatible HTTP routes.
+from the app: the WebSocket and the OpenAI-compatible HTTP routes;
+`listenAddress` says where it bound (with port 0, the port the OS picked).
 
 ## Models
 

@@ -102,6 +102,20 @@ pub extern "system" fn Java_org_pieproject_server_NativeCore_summary<'a>(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_pieproject_server_NativeCore_listenAddr<'a>(
+    mut env: JNIEnv<'a>,
+    _: JClass,
+    handle: jlong,
+) -> JString<'a> {
+    throwing(&mut env, JObject::null().into(), |env| {
+        Ok(match server(handle)?.listen_addr() {
+            Some(addr) => env.new_string(addr.to_string())?,
+            None => JObject::null().into(),
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_pieproject_server_NativeCore_install<'a>(
     mut env: JNIEnv<'a>,
     _: JClass,

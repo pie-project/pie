@@ -13,6 +13,7 @@ use worker::embedded::Settings;
 pub struct PieServer {
     server: Server,
     summary: CString,
+    listen_addr: Option<CString>,
 }
 
 pub type FrameSink = extern "C" fn(ctx: *mut c_void, frame: *const u8, len: usize);
@@ -94,6 +95,10 @@ fn boot(
     )?;
     Ok(PieServer {
         summary: CString::new(serde_json::to_string(server.summary())?)?,
+        listen_addr: server
+            .listen_addr()
+            .map(|addr| CString::new(addr.to_string()))
+            .transpose()?,
         server,
     })
 }
@@ -122,6 +127,14 @@ pub unsafe extern "C" fn pie_server_start(
 pub unsafe extern "C" fn pie_server_summary(server: *const PieServer) -> *const c_char {
     match unsafe { server.as_ref() } {
         Some(server) => server.summary.as_ptr(),
+        None => std::ptr::null(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pie_server_listen_addr(server: *const PieServer) -> *const c_char {
+    match unsafe { server.as_ref() }.and_then(|server| server.listen_addr.as_ref()) {
+        Some(addr) => addr.as_ptr(),
         None => std::ptr::null(),
     }
 }
