@@ -138,8 +138,6 @@ def draft(m, inputs, x, logits, head):
     read = ops.elemwise.rmsnorm_plus_one(dy, mtp.norm, mtp.norm_eps) if mtp.norm != None else dy
     proposal = ops.linear.lm_head(read, head)
     seam.at(seam.MTP, [proposal])
-    # The token a second draft step would embed: unread, but traced.
-    ops.layout.argmax([proposal])
     seam.at(seam.MTP_DRAFTS, [ops.layout.argmax([proposal])])
 
 def rotate(q, k, inputs, m, a):
