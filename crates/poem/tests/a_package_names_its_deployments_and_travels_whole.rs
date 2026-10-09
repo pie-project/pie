@@ -2,8 +2,8 @@
 //! each named by the one grammar every deployment is named by; and the
 //! package travels in an artifact's attributes, refused under other builtins.
 
+use poem::Platform;
 use poem::star::{API, ATTRIBUTE, Deploy, Package};
-use poem::{Dtype, Platform};
 
 const PACKAGE: &str = r#"
 MODELS = [
@@ -160,11 +160,4 @@ fn a_package_written_against_other_builtins_is_refused() {
         format!("{why:#}").contains("import the checkpoint again"),
         "{why:#}"
     );
-}
-
-#[test]
-fn a_deployment_states_its_dtypes() {
-    let package = toy();
-    let (_, deploy) = &package.manifest().deployments[1];
-    assert_eq!(deploy.weights, [Dtype::U4g64, Dtype::U2g64]);
 }

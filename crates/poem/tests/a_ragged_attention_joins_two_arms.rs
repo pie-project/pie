@@ -1,34 +1,88 @@
-mod common;
-
-use common::{CrossAttention, HEAD_DIM};
 use poem::fact;
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, Request, Selection, Stream,
-    Value, Weight, ops, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, RaggedMask, Request, Selection,
+    Stream, Trace, Value, Weight, ops, seam, trace_hybrid,
 };
 use poem_ir::{Attention, Def, GeomKind, Guard, Layout, Operation, RuntimeInput};
 
-/// The guard `p` stands for in the cross-attention plan.
-fn cond_of(p: &Predicate) -> Guard {
-    let trace = trace_hybrid("cross", &CrossAttention, Platform::Cuda);
+const AUDIO_WIDTH: u32 = 32;
+const VIDEO_WIDTH: u32 = 48;
+const HEAD_DIM: u32 = 16;
+const HEADS: u64 = 4;
+
+struct CrossAttention;
+
+impl ForwardHybrid for CrossAttention {
+    fn caches(&self) -> HybridSpec {
+        HybridSpec::new()
+    }
+
+    fn forward(&self, inputs: Input) -> Value {
+        let ([audio, video], _rest) =
+            inputs.partition([fact::stream(Stream::Audio), fact::stream(Stream::Video)]);
+        let wq = Weight::sym(
+            "audio.q",
+            [HEADS * u64::from(HEAD_DIM), u64::from(AUDIO_WIDTH)],
+            Dtype::Bf16,
+        );
+        let wk = Weight::sym(
+            "video.k",
+            [HEADS * u64::from(HEAD_DIM), u64::from(VIDEO_WIDTH)],
+            Dtype::Bf16,
+        );
+        let wv = Weight::sym(
+            "video.v",
+            [HEADS * u64::from(HEAD_DIM), u64::from(VIDEO_WIDTH)],
+            Dtype::Bf16,
+        );
+        let wo = Weight::sym(
+            "audio.o",
+            [u64::from(AUDIO_WIDTH), HEADS * u64::from(HEAD_DIM)],
+            Dtype::Bf16,
+        );
+
+        let xa = audio.latents(0, AUDIO_WIDTH, Dtype::Bf16);
+        let xv = video.latents(1, VIDEO_WIDTH, Dtype::Bf16);
+        let q = ops::layout::pack_rows(&ops::linear::matmul(&xa, &wq), &audio.row_permutation());
+        let k = ops::layout::pack_rows(&ops::linear::matmul(&xv, &wk), &video.row_permutation());
+        let v = ops::layout::pack_rows(&ops::linear::matmul(&xv, &wv), &video.row_permutation());
+        let o = ops::attn::ragged(
+            &q,
+            &k,
+            &v,
+            &audio.lane_indptr(),
+            &video.lane_indptr(),
+            HEAD_DIM,
+            0.25,
+            RaggedMask::None,
+        );
+        let o = ops::layout::unpack_rows(&o, &audio.row_permutation());
+        let out = ops::linear::matmul(&o, &wo);
+        seam::at(seam::VELOCITY, &[&out]);
+        out
+    }
+}
+
+/// The guard `p` stands for in `trace`.
+fn cond_of(trace: &Trace, p: &Predicate) -> Guard {
     p.guard(&mut trace.facts.clone())
 }
 
 #[test]
 fn a_ragged_attention_joins_two_arms_every_case() {
-    queries_off_one_arm_and_keys_off_another_trace_under_the_or_of_both();
+    let trace = trace_hybrid("cross", &CrossAttention, Platform::Cuda);
+    queries_off_one_arm_and_keys_off_another_trace_under_the_or_of_both(&trace);
     every_other_op_still_refuses_two_arms();
-    a_lanes_stream_is_its_fact_word();
+    a_lanes_stream_is_its_fact_word(&trace);
 }
 
-fn queries_off_one_arm_and_keys_off_another_trace_under_the_or_of_both() {
-    let trace = trace_hybrid("cross", &CrossAttention, Platform::Cuda);
+fn queries_off_one_arm_and_keys_off_another_trace_under_the_or_of_both(trace: &Trace) {
     assert!(trace.caches.is_empty(), "a denoiser declares no kv space");
 
-    let audio = cond_of(&fact::stream(Stream::Audio));
+    let audio = cond_of(trace, &fact::stream(Stream::Audio));
     let video = Guard::and(
         Guard::not(audio.clone()),
-        cond_of(&fact::stream(Stream::Video)),
+        cond_of(trace, &fact::stream(Stream::Video)),
     );
 
     let (at, ragged) = trace
@@ -131,16 +185,17 @@ fn every_other_op_still_refuses_two_arms() {
     );
 }
 
-fn a_lanes_stream_is_its_fact_word() {
-    let trace = trace_hybrid("cross", &CrossAttention, Platform::Cuda);
+fn a_lanes_stream_is_its_fact_word(trace: &Trace) {
+    let audio = cond_of(trace, &fact::stream(Stream::Audio));
+    let video = cond_of(trace, &fact::stream(Stream::Video));
     let word = trace
         .facts
         .word(&Request::new(16, false).on_stream(Stream::Video));
-    assert!(cond_of(&fact::stream(Stream::Video)).holds(word));
-    assert!(!cond_of(&fact::stream(Stream::Audio)).holds(word));
-    assert_eq!(
-        Request::new(16, false).stream(),
-        Stream::Text,
-        "text is the default"
+    assert!(video.holds(word));
+    assert!(!audio.holds(word));
+    let text = trace.facts.word(&Request::new(16, false));
+    assert!(
+        !audio.holds(text) && !video.holds(text),
+        "a lane that names no stream is on neither arm"
     );
 }
