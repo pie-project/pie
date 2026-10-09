@@ -12,7 +12,8 @@
                   "src": {
                     "Src": "model.layers.0.mlp.experts.gate_up_proj_blocks"
                   },
-                  "axis": 1
+                  "axis": 1,
+                  "replicas": 1
                 }
               },
               "axis": 1,
@@ -76,7 +77,8 @@
                   "src": {
                     "Src": "model.layers.0.mlp.experts.gate_up_proj_scales"
                   },
-                  "axis": 1
+                  "axis": 1,
+                  "replicas": 1
                 }
               },
               "axis": 1,
@@ -116,7 +118,8 @@
               "src": {
                 "Src": "model.layers.0.mlp.experts.gate_up_proj_bias"
               },
-              "axis": 1
+              "axis": 1,
+              "replicas": 1
             }
           },
           "axis": 1,
@@ -144,7 +147,8 @@
                   "src": {
                     "Src": "model.layers.0.mlp.experts.gate_up_proj_blocks"
                   },
-                  "axis": 1
+                  "axis": 1,
+                  "replicas": 1
                 }
               },
               "axis": 1,
@@ -208,7 +212,8 @@
                   "src": {
                     "Src": "model.layers.0.mlp.experts.gate_up_proj_scales"
                   },
-                  "axis": 1
+                  "axis": 1,
+                  "replicas": 1
                 }
               },
               "axis": 1,
@@ -248,7 +253,8 @@
               "src": {
                 "Src": "model.layers.0.mlp.experts.gate_up_proj_bias"
               },
-              "axis": 1
+              "axis": 1,
+              "replicas": 1
             }
           },
           "axis": 1,
@@ -274,7 +280,8 @@
               "src": {
                 "Src": "model.layers.0.mlp.experts.down_proj_blocks"
               },
-              "axis": 2
+              "axis": 2,
+              "replicas": 1
             }
           },
           "layout": "MarlinMxfp4Weight",
@@ -330,7 +337,8 @@
               "src": {
                 "Src": "model.layers.0.mlp.experts.down_proj_scales"
               },
-              "axis": 2
+              "axis": 2,
+              "replicas": 1
             }
           },
           "layout": "MarlinMxfp4Scale",
