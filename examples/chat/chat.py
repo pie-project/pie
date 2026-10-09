@@ -1,16 +1,24 @@
 """A full-screen terminal chat with the look of the pie-cli demo.
 
 The screen clears on start. The conversation fills the top, and the input box
-stays at the bottom with a status line under it. The reply comes from a
-placeholder backend until the engine is connected.
+stays at the bottom with a status line under it.
 
-    python examples/chat/chat.py
+Replies come from a running `pie serve` through its OpenAI-compatible endpoint
+(`/v1/chat/completions`, streamed). Start the engine first, then:
+
+    python examples/chat/chat.py                 # uses http://127.0.0.1:8080
+    python examples/chat/chat.py --placeholder   # fixed text, no engine needed
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import json
 import os
+import threading
+import urllib.error
+import urllib.request
 from collections.abc import AsyncIterator
 
 from prompt_toolkit.application import Application
@@ -23,7 +31,7 @@ from prompt_toolkit.widgets import Frame
 
 ACCENT = "#d97757"  # the warm orange of the demo
 DIM = "#8a8a8a"
-MODEL = "placeholder"
+MODEL = "default"
 
 STYLE = Style.from_dict({
     "accent": ACCENT,
@@ -31,20 +39,76 @@ STYLE = Style.from_dict({
     "bold": "bold",
     "status": f"{DIM} bg:#1c1c1e",
     "banner": ACCENT,
+    "error": "#e06c75",
     "input-frame": ACCENT,
     "placeholder": "#666666",
 })
+
+
+class EngineBackend:
+    """Sends the conversation to a running `pie serve` and streams the reply."""
+
+    def __init__(self, url: str) -> None:
+        self.endpoint = url.rstrip("/") + "/v1/chat/completions"
+        self.history: list[dict[str, str]] = []
+
+    def reset(self) -> None:
+        self.history.clear()
+
+    async def reply(self, text: str) -> AsyncIterator[str]:
+        self.history.append({"role": "user", "content": text})
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        pieces: list[str] = []
+
+        def pump() -> None:
+            # Blocking HTTP read on a worker thread; deltas hop back to the event loop.
+            body = json.dumps({"model": MODEL, "messages": self.history, "stream": True}).encode()
+            request = urllib.request.Request(
+                self.endpoint, data=body, headers={"content-type": "application/json"}
+            )
+            try:
+                with urllib.request.urlopen(request) as response:
+                    for raw in response:
+                        line = raw.decode("utf-8").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        payload = line[len("data:"):].strip()
+                        if payload == "[DONE]":
+                            break
+                        choice = json.loads(payload)["choices"][0]
+                        delta = choice.get("delta", {}).get("content") or ""
+                        if delta:
+                            loop.call_soon_threadsafe(queue.put_nowait, ("text", delta))
+            except (urllib.error.URLError, OSError, ValueError, KeyError) as error:
+                loop.call_soon_threadsafe(queue.put_nowait, ("error", str(error)))
+            loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+
+        threading.Thread(target=pump, daemon=True).start()
+        while True:
+            kind, value = await queue.get()
+            if kind == "done":
+                break
+            if kind == "error":
+                self.history.pop()  # drop the unanswered question so a retry stays clean
+                raise RuntimeError(value)
+            pieces.append(value)
+            yield value
+        self.history.append({"role": "assistant", "content": "".join(pieces)})
 
 
 class PlaceholderBackend:
     """Stands in for the engine: streams a fixed reply, one word at a time."""
 
     REPLY = (
-        "This is a placeholder reply. The engine is not connected yet, so every answer "
-        "is the same text. Once it is wired in, tokens will stream here as they are generated."
+        "This is a placeholder reply. The engine is not connected, so every answer "
+        "is the same text. Run without --placeholder to talk to the engine."
     )
 
-    async def reply(self, _prompt: str) -> AsyncIterator[str]:
+    def reset(self) -> None:
+        pass
+
+    async def reply(self, _text: str) -> AsyncIterator[str]:
         for word in self.REPLY.split(" "):
             await asyncio.sleep(0.04)
             yield word + " "
@@ -104,12 +168,17 @@ class Chat:
         self.add("class:bold", f"❯ {text}\n")
         self.streaming = True
         self.add("class:accent", "● ")
-        async for piece in self.backend.reply(text):
-            self.add("", piece)
-        self.add("", "\n\n")
-        self.streaming = False
-        if self.app:
-            self.app.invalidate()
+        try:
+            async for piece in self.backend.reply(text):
+                self.add("", piece)
+            self.add("", "\n\n")
+        except RuntimeError as error:
+            self.add("class:error", f"\n  could not reach the engine: {error}\n")
+            self.add("class:dim", "  start it with `pie serve`, then send the message again.\n\n")
+        finally:
+            self.streaming = False
+            if self.app:
+                self.app.invalidate()
 
     def on_enter(self, buffer: Buffer) -> bool:
         text = buffer.text.strip()
@@ -118,6 +187,7 @@ class Chat:
             return False
         if text == "/new":
             self.transcript.clear()
+            self.backend.reset()
             self.add("class:dim", "(new conversation)\n\n")
             return False
         if self.app:
@@ -150,8 +220,14 @@ class Chat:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Terminal chat on a running pie engine.")
+    parser.add_argument("--url", default="http://127.0.0.1:8080", help="address of `pie serve`")
+    parser.add_argument("--placeholder", action="store_true", help="fixed replies, no engine")
+    args = parser.parse_args()
+
+    backend = PlaceholderBackend() if args.placeholder else EngineBackend(args.url)
     os.system("cls" if os.name == "nt" else "clear")  # start on a clean screen, as the Claude CLI does
-    Chat(PlaceholderBackend()).build().run()
+    Chat(backend).build().run()
 
 
 if __name__ == "__main__":
