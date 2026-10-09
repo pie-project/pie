@@ -1,6 +1,9 @@
 # The forward of Inkling: relative-biased attention, short convolutions
 # around it and the MLP, a dense or sink-routed MLP.
 
+LOCAL = 0
+GLOBAL = 1
+
 def caches(m, c):
     kv = c.kv_space(m.kv)
     taps = m.conv_width
@@ -22,7 +25,7 @@ def forward(m, inputs):
     d = m.head_dim
     one = fact.single_token()
     input_d, input_p = inputs.on(one), inputs.on(~one)
-    geometry = [(kv_heads_of(m, 0), m.window), (kv_heads_of(m, 1), None)]
+    geometry = [(kv_heads_of(m, LOCAL), m.window), (kv_heads_of(m, GLOBAL), None)]
     plan_d = [
         ops.attn.plan_decode(input_d, m.heads, kv_heads, d, win) if kv_heads > 0 else None
         for kv_heads, win in geometry
@@ -51,7 +54,7 @@ def forward(m, inputs):
         seam.at(seam.ATTN_Q, [q])
 
         bias = ops.linear.rel_bias(r, w.rel_proj, m.heads, m.d_rel, w.extent)
-        log_scaling = m.log_scaling if reading == 1 else None
+        log_scaling = m.log_scaling if reading == GLOBAL else None
         a = merge([
             ops.attn.decode_rel(
                 q.on(one), plan_d[reading], pages, bias.on(one), win, d, w.extent,
@@ -92,14 +95,8 @@ def mlp(x, f):
         f.sink,
         f.scaling,
     )
-
-    def select(act, bank):
-        if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
-            return ops.linear.moe_matmul_select(act, bank, routes, fan)
-        return ops.linear.moe_matmul_select_quant(act, bank, routes, fan)
-
-    hidden = ops.linear.mlp_swiglu(select(x, f.gate_up), f.inter)
-    return ops.linear.moe_weighted_sum(select(hidden, f.down), weights)
+    hidden = ops.linear.mlp_swiglu(ops.linear.moe_matmul_select(x, f.gate_up, routes, fan), f.inter)
+    return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(hidden, f.down, routes, fan), weights)
 
 def conv(v, weight, state, inputs, m):
     slab = inputs.state(state)

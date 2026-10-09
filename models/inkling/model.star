@@ -47,7 +47,6 @@ def layout(id, deploy):
     d = DIMS[id]
     w = deploy.weights[0]
     dense = compute(w)
-    proj = dtype.u4g64tiled if w == dtype.u4g64 else w
     hidden = d.hidden
     hd = d.head_dim
     q_w = d.heads * hd
@@ -68,9 +67,9 @@ def layout(id, deploy):
             iw = d.dense_inter
             mlp = struct(
                 routed = False,
-                gate_up = weight(n("gate_up"), [2 * iw, hidden], proj).packed([iw, iw]),
+                gate_up = weight(n("gate_up"), [2 * iw, hidden], w).packed([iw, iw]),
                 inter = iw,
-                down = weight(n("down"), [hidden, iw], proj).rows(),
+                down = weight(n("down"), [hidden, iw], w).rows(),
                 scale = vec("mlp_scale", 1),
             )
         else:
@@ -78,7 +77,7 @@ def layout(id, deploy):
             mi = d.moe_inter
             mlp = struct(
                 routed = True,
-                router = weight(n("router"), [bank, hidden], proj),
+                router = weight(n("router"), [bank, hidden], w),
                 bias = weight(n("router_bias"), [d.experts], dtype.f32),
                 scale = weight(n("router_scale"), [1], dtype.f32),
                 gate_up = weight(n("experts_gate_up"), [bank, 2 * mi, hidden], w).bank([mi, mi]),
@@ -94,11 +93,11 @@ def layout(id, deploy):
             kv_heads = kv_heads,
             extent = extent,
             attn_norm = vec("attn_norm", hidden),
-            q_proj = weight(n("q_proj"), [q_w, hidden], proj).columns(),
-            k_proj = weight(n("k_proj"), [kv_w, hidden], proj).columns(heads = kv_heads),
-            v_proj = weight(n("v_proj"), [kv_w, hidden], proj).columns(heads = kv_heads),
-            r_proj = weight(n("r_proj"), [r_w, hidden], proj).columns(),
-            o_proj = weight(n("o_proj"), [hidden, q_w], proj).rows(),
+            q_proj = weight(n("q_proj"), [q_w, hidden], w).columns(),
+            k_proj = weight(n("k_proj"), [kv_w, hidden], w).columns(heads = kv_heads),
+            v_proj = weight(n("v_proj"), [kv_w, hidden], w).columns(heads = kv_heads),
+            r_proj = weight(n("r_proj"), [r_w, hidden], w).columns(),
+            o_proj = weight(n("o_proj"), [hidden, q_w], w).rows(),
             q_norm = vec("q_norm", hd),
             k_norm = vec("k_norm", hd),
             rel_proj = weight(n("rel_proj"), [d.d_rel, extent], dense),
@@ -135,5 +134,5 @@ def layout(id, deploy):
         embed_norm = weight("embed_norm", [hidden], dense),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight("final_norm", [hidden], dense),
-        unembed = weight("unembed", [d.head_rows, hidden], proj),
+        unembed = weight("unembed", [d.head_rows, hidden], w),
     )
