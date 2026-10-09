@@ -86,7 +86,8 @@ def header_rows(chat: Chat) -> int:
 def visible_lines(chat: Chat) -> list[list[tuple]]:
     lines = history_lines(chat)
     rows = max(1, shutil.get_terminal_size((80, 24)).lines - RESERVED_ROWS - header_rows(chat))
-    end = max(0, len(lines) - chat.scroll_back)
+    chat.scroll_back = min(chat.scroll_back, max(0, len(lines) - rows))
+    end = len(lines) - chat.scroll_back
     return lines[max(0, end - rows):end]
 
 
