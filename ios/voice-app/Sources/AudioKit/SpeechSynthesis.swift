@@ -45,6 +45,10 @@ final class SpeechSynthesis: NSObject, SpeechOutput {
     private var unplayedBuffers = 0
     private var turnIsOpen = false
     private var turnVoice: AVSpeechSynthesisVoice?
+    /// Whether `turnVoice` is the one chosen in Settings, and whether it
+    /// has played anything yet this turn; see `fallBackIfChosenVoiceIsSilent`.
+    private var turnVoiceIsChosen = false
+    private var turnVoiceHasSpoken = false
     private var meter: Timer?
     private var meterLevel: Float = 0
 
@@ -91,15 +95,58 @@ final class SpeechSynthesis: NSObject, SpeechOutput {
         endTurn(interrupted: true)
     }
 
-    /// Installed voices in the current language, best quality first.
+    /// Installed voices in the current language (or, with none fit to
+    /// choose there, its language family), in the order automatic
+    /// selection prefers them (see `automaticVoices`). Legacy voices come
+    /// last and are marked (`SpeechVoiceInfo.isLegacy`) so the picker can
+    /// hide or mark them. Novelty voices are not listed, and neither is
+    /// Personal Voice, which has a list of its own (`personalVoices()`).
     static func availableVoices() -> [SpeechVoiceInfo] {
-        rankedVoices().map { voice in
-            SpeechVoiceInfo(
-                id: voice.identifier,
-                name: voice.name,
-                quality: qualityName(voice.quality),
-                language: voice.language
-            )
+        let language = AVSpeechSynthesisVoice.currentLanguageCode()
+        let pool = voicePool(language: language)
+        let modern = ranked(pool.filter { !isLegacyVoice($0) }, language: language)
+        let legacy = pool.filter(isLegacyVoice).sorted { ($0.name, $0.language) < ($1.name, $1.language) }
+        return (modern + legacy).map(info)
+    }
+
+    // MARK: - Personal Voice
+
+    /// Whether the app may speak in the user's Personal Voice. Reading it
+    /// never asks the user anything.
+    static var personalVoiceAccess: PersonalVoiceAccess {
+        access(AVSpeechSynthesizer.personalVoiceAuthorizationStatus)
+    }
+
+    /// Asks the user to let the app speak in their Personal Voice. For the
+    /// settings screen's "Use my Personal Voice" only: nothing else calls
+    /// it, so the system prompt appears only when the user asked for it.
+    /// The system asks once; after that this returns the answer given,
+    /// which the user can change only in the Settings app.
+    static func requestPersonalVoiceAccess() async -> PersonalVoiceAccess {
+        access(await AVSpeechSynthesizer.requestPersonalVoiceAuthorization())
+    }
+
+    /// The user's Personal Voices, once the app may use them, and empty
+    /// otherwise; never asks. A voice the user allows or finishes creating
+    /// while the app runs can take a moment to be listed:
+    /// `AVSpeechSynthesizer.availableVoicesDidChangeNotification` says when.
+    /// Choosing one is choosing it in `voiceIdentifier`; automatic
+    /// selection never picks it, since it is the user's own voice.
+    static func personalVoices() -> [SpeechVoiceInfo] {
+        guard AVSpeechSynthesizer.personalVoiceAuthorizationStatus == .authorized else { return [] }
+        return AVSpeechSynthesisVoice.speechVoices()
+            .filter { $0.voiceTraits.contains(.isPersonalVoice) }
+            .sorted { ($0.name, $0.identifier) < ($1.name, $1.identifier) }
+            .map(info)
+    }
+
+    private static func access(_ status: AVSpeechSynthesizer.PersonalVoiceAuthorizationStatus) -> PersonalVoiceAccess {
+        switch status {
+        case .authorized: return .authorized
+        case .denied: return .denied
+        case .unsupported: return .unsupported
+        case .notDetermined: return .notDetermined
+        @unknown default: return .unsupported
         }
     }
 
@@ -124,7 +171,11 @@ final class SpeechSynthesis: NSObject, SpeechOutput {
             return false
         }
         isSpeaking = true
-        turnVoice = resolveVoice()
+        let resolved = resolveVoice()
+        turnVoice = resolved.voice
+        turnVoiceIsChosen = resolved.chosen
+        turnVoiceHasSpoken = false
+        Self.logVoice(resolved.voice, how: resolved.how)
         startMeter()
         deliver { target?.speechOutputDidStart() }
         return true
@@ -185,30 +236,37 @@ final class SpeechSynthesis: NSObject, SpeechOutput {
                 // finds nothing left to flush and a sentence already over.
                 let tail = coalescer.append(converter.finish()) + coalescer.flush()
                 DispatchQueue.main.async {
-                    self?.play(tail, turn: turn)
+                    self?.play(tail, of: utterance, turn: turn)
                     self?.renderingDidEnd(utterance, turn: turn)
                 }
             } else {
                 let ready = coalescer.append(converter.convert(pcm))
                 guard !ready.isEmpty else { return }
                 DispatchQueue.main.async {
-                    self?.play(ready, turn: turn)
+                    self?.play(ready, of: utterance, turn: turn)
                 }
             }
         }
         // A sentence the synthesizer renders nothing for (a voice that
-        // failed to load) must not leave the turn speaking forever.
+        // failed to load) must not leave the turn speaking forever. The
+        // render is stopped too: the synthesizer queues what it is given,
+        // so a render that never ends would hold up every sentence after it.
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
             guard let self, self.rendering === utterance, !self.renderingProducedAudio else { return }
-            print("[audio] the synthesizer rendered nothing for a sentence; skipping it")
+            print("[audio] the synthesizer rendered nothing for a sentence in 5 s; stopping it")
+            self.synthesizer.stopSpeaking(at: .immediate)
             self.renderingDidEnd(utterance, turn: turn)
         }
     }
 
-    private func play(_ buffers: [AVAudioPCMBuffer], turn: Int) {
-        guard turn == self.turn, isSpeaking else { return }
+    /// Queues `buffers` of `utterance`. Audio of a sentence that is no
+    /// longer the one rendering is dropped: one given up on above, or
+    /// handed to another voice, must not play late, out of order or twice.
+    private func play(_ buffers: [AVAudioPCMBuffer], of utterance: AVSpeechUtterance, turn: Int) {
+        guard turn == self.turn, isSpeaking, rendering === utterance else { return }
         if !buffers.isEmpty {
             renderingProducedAudio = true
+            turnVoiceHasSpoken = true
         }
         for buffer in buffers {
             unplayedBuffers += 1
@@ -227,8 +285,35 @@ final class SpeechSynthesis: NSObject, SpeechOutput {
     private func renderingDidEnd(_ utterance: AVSpeechUtterance, turn: Int) {
         guard turn == self.turn, rendering === utterance else { return }
         rendering = nil
+        if !renderingProducedAudio {
+            fallBackIfChosenVoiceIsSilent(lost: utterance)
+        }
         renderNextIfIdle()
         settleIfDone()
+    }
+
+    /// A voice chosen in Settings that renders nothing through
+    /// `write(_:toBufferCallback:)` (a Personal Voice the synthesizer will
+    /// not hand over as audio, a voice that failed to load) would leave
+    /// the whole reply silent, sentence after sentence. The rest of the
+    /// turn moves to the automatic voice, starting again with the sentence
+    /// that was lost. Only while the chosen voice has not played anything
+    /// this turn, and for a sentence with a letter or digit in it, so a
+    /// voice that works is never dropped over a line of punctuation.
+    private func fallBackIfChosenVoiceIsSilent(lost utterance: AVSpeechUtterance) {
+        let text = utterance.speechString
+        guard turnVoiceIsChosen, !turnVoiceHasSpoken, text.contains(where: { $0.isLetter || $0.isNumber }) else {
+            return
+        }
+        let language = AVSpeechSynthesisVoice.currentLanguageCode()
+        let fallback = Self.automaticVoices(language: language).first ?? AVSpeechSynthesisVoice(language: language)
+        turnVoiceIsChosen = false
+        guard let fallback, fallback.identifier != turnVoice?.identifier else { return }
+        print("[audio] the voice chosen in Settings (\(turnVoice?.identifier ?? "none")) rendered nothing; "
+            + "this reply goes on in the automatic voice")
+        turnVoice = fallback
+        Self.logVoice(fallback, how: "automatic, because the voice chosen in Settings rendered nothing")
+        pending.insert(text, at: 0)
     }
 
     // MARK: - Meter
@@ -252,38 +337,138 @@ final class SpeechSynthesis: NSObject, SpeechOutput {
 
     // MARK: - Voices
 
-    private func resolveVoice() -> AVSpeechSynthesisVoice? {
-        if let voiceIdentifier, let voice = AVSpeechSynthesisVoice(identifier: voiceIdentifier) {
-            return voice
+    /// The voice a turn speaks with, and how it came to be chosen, for the
+    /// log. A voice chosen in Settings is used as it is, legacy or not; a
+    /// Personal Voice only while the app is still allowed to use it, since
+    /// without that it renders nothing.
+    private func resolveVoice() -> (voice: AVSpeechSynthesisVoice?, how: String, chosen: Bool) {
+        var how = "automatic"
+        if let voiceIdentifier {
+            if let voice = AVSpeechSynthesisVoice(identifier: voiceIdentifier),
+               !voice.voiceTraits.contains(.isPersonalVoice)
+                || AVSpeechSynthesizer.personalVoiceAuthorizationStatus == .authorized {
+                return (voice, "chosen in Settings", true)
+            }
+            how = "automatic, because the voice chosen in Settings (\(voiceIdentifier)) is not available"
         }
-        return Self.rankedVoices().first
-            ?? AVSpeechSynthesisVoice(language: AVSpeechSynthesisVoice.currentLanguageCode())
-    }
-
-    /// Premium, then enhanced, then default voices in the current language.
-    /// Novelty voices are not offered, and neither is Personal Voice,
-    /// which renders nothing without its own authorisation.
-    private static func rankedVoices() -> [AVSpeechSynthesisVoice] {
         let language = AVSpeechSynthesisVoice.currentLanguageCode()
-        return AVSpeechSynthesisVoice.speechVoices()
-            .filter { voice in
-                voice.language == language
-                    && !voice.voiceTraits.contains(.isNoveltyVoice)
-                    && !voice.voiceTraits.contains(.isPersonalVoice)
-            }
-            .sorted { lhs, rhs in
-                let left = rank(lhs.quality)
-                let right = rank(rhs.quality)
-                return left != right ? left > right : lhs.name < rhs.name
-            }
+        let voice = Self.automaticVoices(language: language).first
+            ?? AVSpeechSynthesisVoice(language: language)
+        return (voice, how, false)
     }
 
-    private static func rank(_ quality: AVSpeechSynthesisVoiceQuality) -> Int {
-        switch quality {
-        case .premium: return 3
-        case .enhanced: return 2
-        default: return 1
+    /// Automatic selection, best first: Premium, then Enhanced, then the
+    /// system's own default voice for the language (what Spoken Content
+    /// speaks with, `AVSpeechSynthesisVoice(language:)`), then the other
+    /// Default voices, then the Eloquence voices. Never a legacy or novelty
+    /// voice, and never Personal Voice.
+    ///
+    /// Sorting the Default voices by name alone, as this used to, put
+    /// "Eddy" first in US English (listed on a Mac, which ships the same
+    /// voices as iOS 17 and later): an Eloquence voice, the formant
+    /// synthesizer screen-reader users know, clear at speed but plainly
+    /// synthetic, then Flo, another, then Fred, a MacinTalk voice from the
+    /// 1980s. With no Premium or Enhanced voice downloaded, the user heard
+    /// Eddy instead of Samantha, the system's own voice.
+    private static func automaticVoices(language: String) -> [AVSpeechSynthesisVoice] {
+        ranked(voicePool(language: language).filter { !isLegacyVoice($0) }, language: language)
+    }
+
+    /// The installed voices of `language`, or, when none of them is fit to
+    /// choose automatically, of its language family (en-GB, en-AU and the
+    /// rest for en-US), so a regional setting with no voice of its own
+    /// still gets a natural one. Novelty voices and Personal Voice are
+    /// left out.
+    private static func voicePool(language: String) -> [AVSpeechSynthesisVoice] {
+        let installed = AVSpeechSynthesisVoice.speechVoices().filter { voice in
+            !voice.voiceTraits.contains(.isNoveltyVoice) && !voice.voiceTraits.contains(.isPersonalVoice)
         }
+        let exact = installed.filter { $0.language == language }
+        if exact.contains(where: { !isLegacyVoice($0) }) {
+            return exact
+        }
+        let family = languageFamily(language)
+        return installed.filter { languageFamily($0.language) == family }
+    }
+
+    private static func ranked(_ voices: [AVSpeechSynthesisVoice], language: String) -> [AVSpeechSynthesisVoice] {
+        let systemDefault = AVSpeechSynthesisVoice(language: language)?.identifier
+        return voices.sorted { lhs, rhs in
+            let left = (tier(lhs), lhs.identifier == systemDefault ? 1 : 0)
+            let right = (tier(rhs), rhs.identifier == systemDefault ? 1 : 0)
+            if left != right { return left > right }
+            // Within a tier, the language's own voices before its regional
+            // cousins, then by name, so the choice is the same on every run.
+            let leftExact = lhs.language == language ? 0 : 1
+            let rightExact = rhs.language == language ? 0 : 1
+            return (leftExact, lhs.name, lhs.identifier) < (rightExact, rhs.name, rhs.identifier)
+        }
+    }
+
+    private static func tier(_ voice: AVSpeechSynthesisVoice) -> Int {
+        switch voice.quality {
+        case .premium: return 4
+        case .enhanced: return 3
+        default: return isEloquenceVoice(voice) ? 1 : 2
+        }
+    }
+
+    private static func languageFamily(_ language: String) -> String {
+        String(language.prefix { $0 != "-" && $0 != "_" }).lowercased()
+    }
+
+    /// A voice that is never chosen automatically: a novelty voice, or one
+    /// of the MacinTalk voices of the 1980s and 90s that Apple still ships
+    /// (Fred, Junior, Kathy, Ralph and the rest). Only some of them carry
+    /// `isNoveltyVoice` (Fred, Junior, Kathy and Ralph do not), so they are
+    /// also matched by name, against both the voice's display name and the
+    /// last component of its identifier, because the two disagree: the
+    /// voice shown as "Jester" is com.apple.speech.synthesis.voice.Hysterical,
+    /// "Superstar" is Princess and "Wobble" is Deranged. The list also
+    /// covers the older names macOS used (Agnes, Bruce, Vicki, Victoria).
+    ///
+    /// Names are matched only under the MacinTalk identifiers
+    /// (`macinTalkPrefix`, which all of them use), so a Personal Voice the
+    /// user named "Kathy", or a later voice that reuses one of these names,
+    /// is not taken for one.
+    static func isLegacyVoice(_ voice: AVSpeechSynthesisVoice) -> Bool {
+        if voice.voiceTraits.contains(.isNoveltyVoice) {
+            return true
+        }
+        guard voice.identifier.hasPrefix(macinTalkPrefix) else { return false }
+        let lastComponent = voice.identifier.split(separator: ".").last.map(String.init) ?? ""
+        return [voice.name, lastComponent].contains { legacyNames.contains(normalizedName($0)) }
+    }
+
+    private static let macinTalkPrefix = "com.apple.speech.synthesis.voice."
+
+    private static let legacyNames: Set<String> = [
+        "agnes", "albert", "badnews", "bahh", "bells", "boing", "bruce", "bubbles",
+        "cellos", "deranged", "fred", "goodnews", "hysterical", "jester", "junior",
+        "kathy", "organ", "pipeorgan", "princess", "ralph", "superstar", "trinoids",
+        "vicki", "victoria", "whisper", "wobble", "zarvox",
+    ]
+
+    private static func normalizedName(_ name: String) -> String {
+        name.lowercased().filter { $0.isLetter }
+    }
+
+    /// The Eloquence voices (Eddy, Flo, Grandma, Grandpa, Reed, Rocko,
+    /// Sandy, Shelley): a choice for those who want them, ranked below
+    /// every other Default voice for everyone else.
+    private static func isEloquenceVoice(_ voice: AVSpeechSynthesisVoice) -> Bool {
+        voice.identifier.hasPrefix("com.apple.eloquence.")
+    }
+
+    private static func info(_ voice: AVSpeechSynthesisVoice) -> SpeechVoiceInfo {
+        SpeechVoiceInfo(
+            id: voice.identifier,
+            name: voice.name,
+            quality: qualityName(voice.quality),
+            language: voice.language,
+            isLegacy: isLegacyVoice(voice),
+            isPersonalVoice: voice.voiceTraits.contains(.isPersonalVoice)
+        )
     }
 
     private static func qualityName(_ quality: AVSpeechSynthesisVoiceQuality) -> String {
@@ -292,6 +477,43 @@ final class SpeechSynthesis: NSObject, SpeechOutput {
         case .enhanced: return "Enhanced"
         default: return "Default"
         }
+    }
+
+    /// What the log last said this process speaks with. The first turn of
+    /// a process names its voice, and a turn names it again only when it
+    /// changed, so the console says what the user is hearing.
+    private static var loggedVoice: String?
+
+    private static func logVoice(_ voice: AVSpeechSynthesisVoice?, how: String) {
+        let key = "\(voice?.identifier ?? "") \(how)"
+        guard key != loggedVoice else { return }
+        loggedVoice = key
+        let language = AVSpeechSynthesisVoice.currentLanguageCode()
+        if let voice {
+            print("[audio] voice \(voice.name) (\(qualityName(voice.quality)), \(voice.identifier)), \(how)")
+        } else {
+            print("[audio] voice: none installed for \(language); the synthesizer's own default, \(how)")
+        }
+        print("[audio] \(voiceCensus(language: language))")
+    }
+
+    /// One line: the voices installed for `language` by quality, how many
+    /// of the Default ones are legacy or Eloquence, and the system's own
+    /// default voice for it.
+    private static func voiceCensus(language: String) -> String {
+        let voices = AVSpeechSynthesisVoice.speechVoices().filter { $0.language == language }
+        let personal = voices.filter { $0.voiceTraits.contains(.isPersonalVoice) }.count
+        let installed = voices.filter { !$0.voiceTraits.contains(.isPersonalVoice) }
+        let premium = installed.filter { $0.quality == .premium }.count
+        let enhanced = installed.filter { $0.quality == .enhanced }.count
+        let standard = installed.count - premium - enhanced
+        let legacy = installed.filter(isLegacyVoice).count
+        let eloquence = installed.filter(isEloquenceVoice).count
+        let systemDefault = AVSpeechSynthesisVoice(language: language)
+            .map { "\($0.name) (\($0.identifier))" } ?? "none"
+        return "voices installed for \(language): \(premium) Premium, \(enhanced) Enhanced, "
+            + "\(standard) Default (\(legacy) legacy or novelty, \(eloquence) Eloquence), "
+            + "\(personal) Personal Voice; system default \(systemDefault)"
     }
 
     // MARK: - Plumbing

@@ -32,6 +32,9 @@ import Foundation
 ///     it is the mode the voice-processing unit is designed for, and iOS
 ///     switches to it implicitly anyway, so setting it ourselves keeps the
 ///     route decision ours;
+///   - mode `.default` with `setPrefersEchoCancelledInput(true)` instead,
+///     when voice mode runs on the session's echo cancellation (`EchoPath`,
+///     chosen with `-PieEchoPath`): the only mode that option works in;
 ///   - mode `.spokenAudio` otherwise (read-aloud, dictation), the mode the
 ///     previous build shipped with;
 ///   - Bluetooth A2DP always, and HFP only while a microphone is open
@@ -54,8 +57,33 @@ final class AudioEngineHub {
         case none
         /// The raw microphone, for dictation.
         case plain
-        /// The echo-cancelled microphone, for voice mode.
+        /// The echo-cancelled microphone, for voice mode, cancelled the
+        /// way `EchoPath` says.
         case voiceProcessed
+    }
+
+    /// How voice mode keeps the reply out of the microphone.
+    enum EchoPath: String {
+        /// The voice-processing I/O unit on the engine's input node, in
+        /// session mode `.voiceChat`. Besides cancelling the echo it runs
+        /// the engine's output through processing made for phone calls and
+        /// the voice-chat volume curve, which make the reply quieter (see
+        /// `voiceMakeUpGainDB`) and can narrow and colour it. The fallback
+        /// where the session path is not offered, and `-PieEchoPath vpio`.
+        case vpio
+        /// The session's own echo-cancelled input (iOS 18.2 and later, on
+        /// the 2024 and later iPhones that offer it), in mode `.default`,
+        /// with no voice processing on the engine: the microphone is
+        /// cleared of what the built-in speaker plays, and the reply plays
+        /// without call processing. Apple's header says it is tuned for a
+        /// "wider range of audio signals", where voice processing is tuned
+        /// for voice.
+        /// The default (see `requestedEchoPath`), used only on the built-in
+        /// microphone and speaker and only while the session reports it on
+        /// (`isEchoCancelledInputEnabled`); otherwise voice mode falls back
+        /// to `vpio`. It has no automatic gain control, so the detector
+        /// uses thresholds of its own on it (`VoiceActivityDetector.Canceller`).
+        case session
     }
 
     /// Who is using the engine. It runs while anyone is, and stops (which
@@ -108,6 +136,10 @@ final class AudioEngineHub {
     /// `-PieMakeUpGainDB <dB>` (0 to 9) overrides it, read whenever the
     /// engine is built, to compare settings on the phone.
     private static let voiceMakeUpGainDB: Float = 2
+    /// On the session's echo-cancelled input the reply goes through no
+    /// voice processing and no voice-chat volume curve, so there is
+    /// nothing to make up. `-PieMakeUpGainDB` overrides this too.
+    private static let sessionMakeUpGainDB: Float = 0
     private static let makeUpGainRange: ClosedRange<Float> = 0 ... 9
 
     /// Whether the voice-processed microphone's automatic gain control is
@@ -140,6 +172,11 @@ final class AudioEngineHub {
     /// user is told it has gone.
     private static let inputRetryDelay: TimeInterval = 0.4
     private static let inputRetryLimit = 3
+    /// How long after the engine starts the session is given to report
+    /// echo-cancelled input as on, before voice mode falls back to voice
+    /// processing. The header promises the answer once the session is
+    /// active, not that it is immediate.
+    private static let echoPathGrace: TimeInterval = 0.5
 
     private static let peakLimiter = AudioComponentDescription(
         componentType: kAudioUnitType_Effect,
@@ -160,6 +197,21 @@ final class AudioEngineHub {
     private var built: InputConfiguration?
     /// Voice processing was asked for and the input node refused it.
     private var echoCancellationFailed = false
+    /// How the current engine's voice-processed input is cancelled; nil
+    /// when it was built for anything else.
+    private var echoPath: EchoPath? {
+        didSet { echo.canceller = echoPath == .session ? .session : .voiceProcessing }
+    }
+    /// The session path was asked for and this iPhone, its system or the
+    /// session turned it down. Voice mode stays on voice processing until
+    /// the session is let go, so a refusal is not retried, with its
+    /// rebuild, on every rebuild. A headset or AirPods do not set it
+    /// (`EchoPathError.isLasting`): they are checked for on every build
+    /// before the session is touched, which costs nothing.
+    private var sessionEchoRefused = false
+    /// Whether this engine's session path has been checked since the
+    /// engine started or the session was activated.
+    private var echoPathConfirmed = false
     private var tapBlock: AVAudioNodeTapBlock?
     private var tapInstalled = false
     /// The format the input tap was installed with and the hardware
@@ -220,26 +272,45 @@ final class AudioEngineHub {
     /// activity detector reads it on the tap thread.
     var playbackEcho: PlaybackEcho { echo.state }
 
+    /// Which echo canceller cleans the microphone, for the detector's
+    /// thresholds. Thread-safe, like `playbackEcho`.
+    var echoCanceller: VoiceActivityDetector.Canceller { echo.canceller }
+
     // MARK: - Audio self-check
 
     /// What the engine is running with, read back from the audio units
     /// rather than from the settings asked for.
     struct VoiceProcessingState {
+        /// On the `vpio` path, the input node's voice processing; on the
+        /// `session` path, the session's echo-cancelled input.
         let echoCancellation: Bool
         let makeUpGainDB: Float
         let automaticGainControl: Bool
+        /// "vpio" or "session" for the voice-processed microphone, "none"
+        /// when the engine was built for anything else.
+        let echoPath: String
+        /// What `-PieEchoPath` asked for, "vpio" without it.
+        let echoPathRequested: String
+        /// `AVAudioSession.isEchoCancelledInputEnabled`, false before iOS
+        /// 18.2: on either path, what the session itself reports.
+        let sessionEchoCancelledInput: Bool
     }
 
     var voiceProcessingState: VoiceProcessingState {
         // The input node is only touched when the engine was built with
         // the voice-processed microphone; asking for it otherwise would
         // create one.
-        let processing = built == .voiceProcessed && !echoCancellationFailed && !engineIsOrphaned
+        let path = built == .voiceProcessed && !engineIsOrphaned ? echoPath : nil
+        let processing = path == .vpio && !echoCancellationFailed
         let input = processing ? engine.inputNode : nil
+        let sessionEcho = Self.sessionEchoCancelledInputEnabled
         return VoiceProcessingState(
-            echoCancellation: input?.isVoiceProcessingEnabled ?? false,
+            echoCancellation: input?.isVoiceProcessingEnabled ?? (path == .session && sessionEcho),
             makeUpGainDB: engineIsOrphaned ? 0 : gainStage?.globalGain ?? 0,
-            automaticGainControl: input?.isVoiceProcessingAGCEnabled ?? false
+            automaticGainControl: input?.isVoiceProcessingAGCEnabled ?? false,
+            echoPath: path?.rawValue ?? "none",
+            echoPathRequested: Self.requestedEchoPath().rawValue,
+            sessionEchoCancelledInput: sessionEcho
         )
     }
 
@@ -381,6 +452,10 @@ final class AudioEngineHub {
             guard self.clients.isEmpty, self.sessionActive else { return }
             do {
                 try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            } catch let error as NSError where error.code == AVAudioSession.ErrorCode.isBusy.rawValue {
+                // Other audio was still running: the session is deactivated
+                // all the same (AVAudioSession.h), so it is let go below.
+                print("[audio] audio session deactivated over running audio: \(error.localizedDescription)")
             } catch {
                 print("[audio] could not deactivate the audio session: \(error.localizedDescription)")
                 return
@@ -388,8 +463,11 @@ final class AudioEngineHub {
             self.sessionActive = false
             // The next client builds a fresh engine against the session
             // as it is when reactivated: the route may have changed while
-            // nothing was listening for it.
+            // nothing was listening for it. That includes asking for the
+            // session's echo cancellation again if it was turned down.
             self.built = nil
+            self.echoPath = nil
+            self.sessionEchoRefused = false
             print("[audio] audio session deactivated")
         }
         pendingDeactivation = work
@@ -398,7 +476,17 @@ final class AudioEngineHub {
 
     private func startIfNeeded() throws {
         if !sessionActive {
-            try shapeSession(for: built ?? .none)
+            do {
+                try shapeSession(for: built ?? .none, echoPath: built == .voiceProcessed ? echoPath : nil)
+            } catch let error as EchoPathError {
+                // The session went inactive (an interruption) under an
+                // engine built for its echo cancellation, which it no
+                // longer offers, or not on this route: voice processing
+                // takes over.
+                print("[audio] echo path vpio: \(error.localizedDescription)")
+                sessionEchoRefused = error.isLasting
+                try rebuildKeepingInput(.voiceProcessed)
+            }
         }
         if !engine.isRunning {
             engine.prepare()
@@ -408,6 +496,7 @@ final class AudioEngineHub {
         updateLatency()
         speech.playIfPossible()
         cue.playIfPossible()
+        confirmEchoPath()
     }
 
     /// Replaces the engine with a fresh one built for `configuration`.
@@ -417,7 +506,20 @@ final class AudioEngineHub {
     /// real hardware format), voice processing is enabled before anything
     /// is connected, and the output graph is connected afterwards.
     private func rebuild(_ configuration: InputConfiguration) throws {
-        try shapeSession(for: configuration)
+        var path = configuration == .voiceProcessed ? chooseEchoPath() : nil
+        let wasActive = sessionActive
+        if path == .session {
+            do {
+                try shapeSession(for: configuration, echoPath: .session)
+            } catch {
+                print("[audio] echo path vpio: \(error.localizedDescription)")
+                sessionEchoRefused = (error as? EchoPathError)?.isLasting ?? true
+                path = .vpio
+            }
+        }
+        if path != .session {
+            try shapeSession(for: configuration, echoPath: path)
+        }
 
         speech.detachFromEngine()
         cue.detachFromEngine()
@@ -430,10 +532,17 @@ final class AudioEngineHub {
             NotificationCenter.default.removeObserver(configurationObserver)
         }
 
+        var sessionEchoAtBuild = false
+        if path == .session {
+            sessionEchoAtBuild = applySessionEchoCancellation(sessionWasActive: wasActive)
+        }
+
         let engine = AVAudioEngine()
         self.engine = engine
         engineIsOrphaned = false
         echoCancellationFailed = false
+        echoPath = path
+        echoPathConfirmed = false
         configurationObserver = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange,
             object: engine,
@@ -445,7 +554,7 @@ final class AudioEngineHub {
 
         if configuration != .none {
             let input = engine.inputNode
-            if configuration == .voiceProcessed {
+            if path == .vpio {
                 do {
                     try input.setVoiceProcessingEnabled(true)
                     input.isVoiceProcessingAGCEnabled = Self.voiceAGC()
@@ -485,30 +594,184 @@ final class AudioEngineHub {
         engine.connect(gain, to: limiter, format: Self.playbackFormat)
         engine.connect(limiter, to: engine.mainMixerNode, format: Self.playbackFormat)
 
-        let echoCancelling = configuration == .voiceProcessed && !echoCancellationFailed
-        gain.globalGain = echoCancelling ? Self.voiceMakeUpGain() : 0
+        let echoCancelling = path == .vpio && !echoCancellationFailed
+        switch path {
+        case .vpio?:
+            gain.globalGain = echoCancelling ? Self.makeUpGainOverride() ?? Self.voiceMakeUpGainDB : 0
+        case .session?:
+            gain.globalGain = Self.makeUpGainOverride() ?? Self.sessionMakeUpGainDB
+        case nil:
+            gain.globalGain = 0
+        }
         gainStage = gain
         installOutputTap()
 
         built = configuration
         builtOutputFormat = engine.outputNode.outputFormat(forBus: 0)
-        let agc = echoCancelling ? ", voice AGC \(engine.inputNode.isVoiceProcessingAGCEnabled ? "on" : "off")" : ""
-        print("[audio] engine built for \(configuration.rawValue) input; "
-            + "echo cancellation \(echoCancelling ? "on" : "off"), "
-            + "make-up gain \(gain.globalGain) dB\(agc), \(Self.describeRoute())")
+        let cancellation: String
+        switch path {
+        case .vpio?:
+            let agc = echoCancelling ? ", voice AGC \(engine.inputNode.isVoiceProcessingAGCEnabled ? "on" : "off")" : ""
+            cancellation = "echo path vpio (asked for \(Self.requestedEchoPath().rawValue)), "
+                + "echo cancellation \(echoCancelling ? "on" : "off")\(agc)"
+        case .session?:
+            cancellation = "echo path session, echo-cancelled input enabled after activation: \(sessionEchoAtBuild)"
+        case nil:
+            cancellation = "echo cancellation off"
+        }
+        // The rate the hardware plays at on this path: voice processing
+        // can run the speaker below the 48 kHz the reply is mastered at,
+        // and then the main mixer cuts everything above half that rate.
+        let outputRate = Int(builtOutputFormat?.sampleRate ?? 0)
+        let sessionRate = Int(AVAudioSession.sharedInstance().sampleRate)
+        print("[audio] engine built for \(configuration.rawValue) input; \(cancellation), "
+            + "make-up gain \(gain.globalGain) dB, out \(outputRate) Hz (session \(sessionRate) Hz), "
+            + Self.describeRoute())
     }
 
-    /// `voiceMakeUpGainDB`, or `-PieMakeUpGainDB` when it is a number.
-    private static func voiceMakeUpGain() -> Float {
+    /// `-PieMakeUpGainDB` when it is a number, clamped to
+    /// `makeUpGainRange`.
+    private static func makeUpGainOverride() -> Float? {
         guard
             let argument = UserDefaults.standard.string(forKey: "PieMakeUpGainDB"),
             let decibels = Float(argument.trimmingCharacters(in: .whitespaces)),
             decibels.isFinite
-        else { return voiceMakeUpGainDB }
+        else { return nil }
         return min(max(decibels, makeUpGainRange.lowerBound), makeUpGainRange.upperBound)
     }
 
-    /// `voiceAGCDefault`, or `-PieVoiceAGC 0|1`.
+    /// `-PieEchoPath session|vpio`, read whenever the engine is built;
+    /// `session` without it. Measured on an iPhone 16 Pro with the audio
+    /// self-check and the voice soak, the session path left a reply's
+    /// loudest residue at -40 dBFS against -13 with voice processing, set
+    /// off no false onset where voice processing set off one, passed every
+    /// check, and plays the reply at the speaker's 48 kHz without call
+    /// processing. Where the phone or the route does not offer it, voice
+    /// mode falls back to `vpio` as before.
+    private static func requestedEchoPath() -> EchoPath {
+        let argument = UserDefaults.standard.string(forKey: "PieEchoPath")?
+            .trimmingCharacters(in: .whitespaces).lowercased()
+        return argument.flatMap(EchoPath.init(rawValue:)) ?? .session
+    }
+
+    /// The path the next voice-processed engine is built on: what was
+    /// asked for, unless the session already turned its echo cancellation
+    /// down while it stayed active. A route without the built-in
+    /// microphone and speaker is turned down later, in `shapeSession`.
+    private func chooseEchoPath() -> EchoPath {
+        let requested = Self.requestedEchoPath()
+        if requested == .session, sessionEchoRefused {
+            print("[audio] echo path vpio: the session turned echo-cancelled input down earlier")
+            return .vpio
+        }
+        return requested
+    }
+
+    /// The session's echo cancellation, read back; false before iOS 18.2.
+    private static var sessionEchoCancelledInputEnabled: Bool {
+        if #available(iOS 18.2, *) {
+            return AVAudioSession.sharedInstance().isEchoCancelledInputEnabled
+        }
+        return false
+    }
+
+    /// Called with the old engine stopped and the session shaped for the
+    /// session path. Apple documents the preference as read back once the
+    /// session goes active; a session that was already active (a reply or
+    /// the sample question playing when the microphone opened) may not
+    /// apply it until it goes active again, so it is cycled once when it
+    /// does not report the option on. The engine is down, so nothing is
+    /// cut off that the rebuild was not already interrupting. Returns what
+    /// the session reports; the verdict that counts is the one after the
+    /// engine has started (`confirmEchoPath`).
+    private func applySessionEchoCancellation(sessionWasActive: Bool) -> Bool {
+        guard !Self.sessionEchoCancelledInputEnabled, sessionWasActive, sessionActive else {
+            return Self.sessionEchoCancelledInputEnabled
+        }
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setActive(false)
+        } catch {
+            // A deactivation that finds other audio running (the
+            // self-check's `AVAudioPlayer`) stops it and deactivates the
+            // session anyway, and before iOS 19 reports IsBusy
+            // (AVAudioSession.h). Whatever the error, the session counts as
+            // inactive from here: activating an active one costs nothing,
+            // while one wrongly counted active is never reactivated, and its
+            // engine's input node reports no format.
+            print("[audio] echo path session: deactivation reported \(error.localizedDescription)")
+        }
+        sessionActive = false
+        do {
+            try session.setActive(true)
+            sessionActive = true
+            print("[audio] echo path session: reactivated the session to apply echo-cancelled input")
+        } catch {
+            // `startIfNeeded` activates it again before the engine starts.
+            print("[audio] echo path session: could not reactivate the session: \(error.localizedDescription)")
+        }
+        return Self.sessionEchoCancelledInputEnabled
+    }
+
+    /// Settles, once the engine runs, whether the session honoured its
+    /// echo cancellation, and falls back to voice processing if it did
+    /// not: a voice-mode microphone with no echo cancellation at all hears
+    /// every reply as the user. Given `echoPathGrace` to come on.
+    private func confirmEchoPath() {
+        guard built == .voiceProcessed, echoPath == .session, !echoPathConfirmed, engine.isRunning else { return }
+        echoPathConfirmed = true
+        if Self.sessionEchoCancelledInputEnabled {
+            print("[audio] echo path session: echo-cancelled input enabled")
+            return
+        }
+        print("[audio] echo path session: echo-cancelled input not enabled yet; checking again shortly")
+        let engine = self.engine
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.echoPathGrace) { [weak self] in
+            guard let self, self.engine === engine, self.built == .voiceProcessed, self.echoPath == .session else { return }
+            if Self.sessionEchoCancelledInputEnabled {
+                print("[audio] echo path session: echo-cancelled input enabled")
+            } else {
+                self.fallBackToVoiceProcessing("the session did not honour echo-cancelled input")
+            }
+        }
+    }
+
+    /// Moves voice mode from the session's echo cancellation to voice
+    /// processing, keeping whatever is playing and the open microphone.
+    /// `lasting` says whether the session path stays refused until the
+    /// session is let go (`sessionEchoRefused`).
+    private func fallBackToVoiceProcessing(_ reason: String, lasting: Bool = true) {
+        print("[audio] echo path vpio: \(reason)")
+        sessionEchoRefused = lasting
+        guard !clients.isEmpty else {
+            // Nobody is using the engine; the next user builds afresh.
+            built = nil
+            echoPath = nil
+            return
+        }
+        do {
+            try rebuildKeepingInput(.voiceProcessed)
+            try startIfNeeded()
+        } catch VoiceInputError.noAudioInput where clients.contains(.input) {
+            print("[audio] no input route after falling back to voice processing; waiting for the microphone")
+            try? startIfNeeded()
+            retryInput(attempt: 1)
+        } catch {
+            print("[audio] could not fall back to voice processing: \(error.localizedDescription)")
+            interruptEveryone()
+        }
+    }
+
+    /// `rebuild`, with the microphone's tap put back if it is open.
+    private func rebuildKeepingInput(_ configuration: InputConfiguration) throws {
+        try rebuild(configuration)
+        if clients.contains(.input), tapBlock != nil {
+            _ = try installTap()
+        }
+    }
+
+    /// `voiceAGCDefault`, or `-PieVoiceAGC 0|1`. Voice processing's own
+    /// control, so it applies to the `vpio` path only.
     private static func voiceAGC() -> Bool {
         switch UserDefaults.standard.string(forKey: "PieVoiceAGC") {
         case "0": return false
@@ -545,20 +808,90 @@ final class AudioEngineHub {
 
     // MARK: - Session
 
-    private func shapeSession(for configuration: InputConfiguration) throws {
+    /// Shapes and activates the session for `configuration`, on
+    /// `echoPath` when that is the voice-processed microphone. Throws an
+    /// `EchoPathError` when the session path is asked for and not on offer
+    /// (the caller falls back to `vpio`); the category may be left set for
+    /// it.
+    private func shapeSession(for configuration: InputConfiguration, echoPath: EchoPath?) throws {
         let session = AVAudioSession.sharedInstance()
-        let mode: AVAudioSession.Mode = configuration == .voiceProcessed ? .voiceChat : .spokenAudio
+        let sessionEcho = configuration == .voiceProcessed && echoPath == .session
+        // Checked before the category changes, so a headset or AirPods do
+        // not cost a switch to mode `.default` and straight back.
+        // `isEchoCancelledInputAvailable` cannot catch them: it answers for
+        // the built-in microphone and speaker, whatever the current route.
+        if sessionEcho, let port = Self.externalPort() {
+            throw EchoPathError.notOnThisRoute(port.portType.rawValue)
+        }
+        let mode: AVAudioSession.Mode
+        if configuration == .voiceProcessed {
+            mode = sessionEcho ? .default : .voiceChat
+        } else {
+            mode = .spokenAudio
+        }
         var options: AVAudioSession.CategoryOptions = [.defaultToSpeaker, .allowBluetoothA2DP]
         if configuration != .none {
             options.insert(.allowBluetoothHFP)
         }
+        // The preference is valid in mode `.default` only, so it is let go
+        // while the session is still in that mode, before the category
+        // below moves it to `.voiceChat` or `.spokenAudio`. It outlives a
+        // deactivation, so this is also where the next read-aloud or
+        // dictation after a session-path conversation clears it.
+        if !sessionEcho {
+            try preferEchoCancelledInput(false, session: session)
+        }
         if session.category != .playAndRecord || session.mode != mode || session.categoryOptions != options {
             try session.setCategory(.playAndRecord, mode: mode, options: options)
+        }
+        if sessionEcho {
+            try preferEchoCancelledInput(true, session: session)
         }
         if !sessionActive {
             try session.setActive(true)
             sessionActive = true
+            echoPathConfirmed = false
         }
+    }
+
+    /// Sets the session's echo-cancelled input preference. Availability is
+    /// asked after the category and mode are set, because the session only
+    /// reports it for play-and-record in mode `.default`. Turning the
+    /// preference on throws an `EchoPathError` when it is not on offer or
+    /// the system refuses it, so every caller falls back to `vpio` instead
+    /// of failing the turn; turning it off never throws, and is not even
+    /// called for unless it was on, so the default path and playback never
+    /// depend on it.
+    private func preferEchoCancelledInput(_ wanted: Bool, session: AVAudioSession) throws {
+        guard #available(iOS 18.2, *) else {
+            if wanted {
+                throw EchoPathError.needsNewerSystem
+            }
+            return
+        }
+        if wanted, !session.isEchoCancelledInputAvailable {
+            throw EchoPathError.unavailable
+        }
+        guard session.prefersEchoCancelledInput != wanted else { return }
+        do {
+            try session.setPrefersEchoCancelledInput(wanted)
+        } catch {
+            if wanted {
+                throw EchoPathError.refused(error.localizedDescription)
+            }
+            print("[audio] could not clear the echo-cancelled input preference: \(error.localizedDescription)")
+        }
+    }
+
+    /// The first port of the current route that is not the iPhone's own
+    /// microphone, speaker or receiver (a headset, AirPods, car audio), or
+    /// nil. The session's echo cancellation covers the built-in microphone
+    /// and speaker only. An empty side of the route (an inactive session
+    /// whose category records nothing) says nothing either way.
+    private static func externalPort() -> AVAudioSessionPortDescription? {
+        let route = AVAudioSession.sharedInstance().currentRoute
+        let builtIn: Set<AVAudioSession.Port> = [.builtInMic, .builtInSpeaker, .builtInReceiver]
+        return (route.inputs + route.outputs).first { !builtIn.contains($0.portType) }
     }
 
     /// Play-and-record sends output to the earpiece unless told otherwise;
@@ -619,14 +952,31 @@ final class AudioEngineHub {
             self.engineIsOrphaned = true
             self.interruptEveryone()
             self.built = nil
+            self.echoPath = nil
+            self.sessionEchoRefused = false
         }
     }
 
     @objc private func routeChanged(_ note: Notification) {
+        let reason = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt)
+            .flatMap(AVAudioSession.RouteChangeReason.init(rawValue:))
         DispatchQueue.main.async { [weak self] in
             guard let self, self.sessionActive, self.engine.isRunning else { return }
             self.routeAwayFromReceiver()
             self.updateLatency()
+            // The session's echo cancellation covers the built-in
+            // microphone and speaker only, so a headset or AirPods coming
+            // or going can turn it off under a running engine.
+            if reason == .newDeviceAvailable || reason == .oldDeviceUnavailable,
+               self.built == .voiceProcessed, self.echoPath == .session, self.echoPathConfirmed,
+               !Self.sessionEchoCancelledInputEnabled {
+                // A headset or AirPods are why: once they go, the built-in
+                // route is worth the session path again.
+                self.fallBackToVoiceProcessing(
+                    "the new route has no echo-cancelled input",
+                    lasting: Self.externalPort() == nil
+                )
+            }
         }
     }
 
@@ -998,6 +1348,21 @@ final class EchoGate {
     private let lock = NSLock()
     private var sources: Set<ObjectIdentifier> = []
     private var quietSince: CFAbsoluteTime = 0
+    private var cancellerInForce: VoiceActivityDetector.Canceller = .voiceProcessing
+
+    /// Which echo canceller the engine is built on.
+    var canceller: VoiceActivityDetector.Canceller {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return cancellerInForce
+        }
+        set {
+            lock.lock()
+            cancellerInForce = newValue
+            lock.unlock()
+        }
+    }
 
     func set(_ source: ObjectIdentifier, active: Bool) {
         lock.lock()
@@ -1066,5 +1431,39 @@ private final class OutputMeter {
             peakDecibels: AudioLevel.decibels(rms: peak),
             limitedShare: audibleBlocks > 0 ? Double(limitedBlocks) / Double(audibleBlocks) : 0
         )
+    }
+}
+
+/// Why voice mode cannot use the session's echo cancellation.
+private enum EchoPathError: LocalizedError {
+    case needsNewerSystem
+    case unavailable
+    /// The route has a port other than the built-in microphone and
+    /// speaker, named here.
+    case notOnThisRoute(String)
+    /// `setPrefersEchoCancelledInput(true)` failed, with the system's
+    /// reason.
+    case refused(String)
+
+    /// Whether the refusal stands until the session is let go
+    /// (`sessionEchoRefused`). A route refusal does not: the next rebuild
+    /// on the built-in microphone and speaker, after the headset or AirPods
+    /// go, is worth the session path again.
+    var isLasting: Bool {
+        if case .notOnThisRoute = self { return false }
+        return true
+    }
+
+    var errorDescription: String? {
+        switch self {
+        case .needsNewerSystem:
+            return "echo-cancelled input needs iOS 18.2"
+        case .unavailable:
+            return "the session does not offer echo-cancelled input on this iPhone"
+        case .notOnThisRoute(let port):
+            return "echo-cancelled input covers the built-in microphone and speaker only, and the route has \(port)"
+        case .refused(let reason):
+            return "the session refused echo-cancelled input: \(reason)"
+        }
     }
 }

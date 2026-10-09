@@ -19,15 +19,24 @@ final class VoicePreview: ObservableObject, @preconcurrency SpeechOutputDelegate
         self.chat = chat
     }
 
-    /// Plays the sample from the start, cutting off one already playing.
-    func play() {
+    /// Plays the sample from the start in the given voice (nil for
+    /// Automatic) and rate, cutting off whatever is playing.
+    ///
+    /// The voice and rate are applied here rather than left to the
+    /// settings subscription, so the sample is always the one on screen.
+    /// The synthesizer fixes a turn's voice when the turn starts, so any
+    /// speech still going is stopped first: text added to it would come
+    /// out in the old voice.
+    func play(voiceIdentifier: String?, rate: Float) {
         // A message being read aloud is stopped through its controller, so
         // the chat's speaker button does not stay lit for speech that has
         // been taken over.
         chat.stopReadingAloud()
-        if isPlaying {
+        if isPlaying || speech.isSpeaking {
             speech.stop()
         }
+        speech.voiceIdentifier = voiceIdentifier
+        speech.rate = rate
         speech.delegate = self
         speech.enqueue(Self.sampleSentence)
         speech.finishTurn()
@@ -40,8 +49,12 @@ final class VoicePreview: ObservableObject, @preconcurrency SpeechOutputDelegate
         speech.stop()
     }
 
-    func toggle() {
-        if isPlaying { stop() } else { play() }
+    func toggle(voiceIdentifier: String?, rate: Float) {
+        if isPlaying {
+            stop()
+        } else {
+            play(voiceIdentifier: voiceIdentifier, rate: rate)
+        }
     }
 
     // MARK: - SpeechOutputDelegate

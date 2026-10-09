@@ -12,8 +12,9 @@ struct SettingsView: View {
     @EnvironmentObject private var dictation: DictationController
     @EnvironmentObject private var preview: VoicePreview
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
 
-    @State private var voices: [SpeechVoiceInfo] = []
+    @StateObject private var catalog = VoiceCatalog()
     @State private var confirmsDeleteAll = false
     @State private var modelToSwitchTo: PieRuntimeConfig.Model?
 
@@ -66,8 +67,10 @@ struct SettingsView: View {
             }
         }
         .tint(Theme.accent)
-        .onAppear {
-            voices = SpeechSynthesis.availableVoices()
+        .onChange(of: scenePhase) { _, phase in
+            // Back from the Settings app, where a voice may have been
+            // downloaded or Personal Voice allowed.
+            if phase == .active { catalog.reload() }
         }
         .onDisappear {
             preview.stop()
@@ -153,9 +156,21 @@ struct SettingsView: View {
     private var voiceSection: some View {
         Section {
             NavigationLink {
-                VoicePickerView(voices: voices)
+                VoicePickerView(catalog: catalog)
             } label: {
-                LabeledContent("Voice", value: selectedVoiceName)
+                LabeledContent("Voice") {
+                    HStack(spacing: 6) {
+                        Text(selectedVoiceName)
+                            .lineLimit(1)
+                        if let voice = speakingVoice {
+                            VoiceBadge(voice: voice)
+                        }
+                    }
+                }
+            }
+
+            if !catalog.hasNaturalVoice {
+                NaturalVoiceHint(catalog: catalog)
             }
 
             VStack(alignment: .leading, spacing: 8) {
@@ -169,13 +184,13 @@ struct SettingsView: View {
                     Image(systemName: "hare")
                         .foregroundStyle(Theme.secondaryInk)
                 } onEditingChanged: { editing in
-                    if !editing { preview.play() }
+                    if !editing { previewSelectedVoice() }
                 }
             }
             .padding(.vertical, 4)
 
             Button {
-                preview.toggle()
+                preview.toggle(voiceIdentifier: settings.voiceIdentifier, rate: settings.speechRate)
             } label: {
                 Label(
                     preview.isPlaying ? "Stop preview" : "Preview voice",
@@ -191,9 +206,28 @@ struct SettingsView: View {
         }
     }
 
+    /// The chosen voice, or nil when Automatic is in force, including when
+    /// the saved voice is no longer installed and the synthesizer falls
+    /// back to Automatic.
+    private var chosenVoice: VoiceCatalog.Voice? {
+        settings.voiceIdentifier.flatMap(catalog.voice(withID:))
+    }
+
+    /// The voice replies are spoken in right now.
+    private var speakingVoice: VoiceCatalog.Voice? {
+        chosenVoice ?? catalog.automatic
+    }
+
+    /// "Automatic (Ava)" says which voice Automatic resolves to, so a
+    /// robotic-sounding reply can be traced to the voice behind it.
     private var selectedVoiceName: String {
-        guard let id = settings.voiceIdentifier else { return "Automatic" }
-        return voices.first(where: { $0.id == id })?.name ?? "Automatic"
+        if let chosenVoice { return chosenVoice.name }
+        guard let automatic = catalog.automatic else { return "Automatic" }
+        return "Automatic (\(automatic.name))"
+    }
+
+    private func previewSelectedVoice() {
+        preview.play(voiceIdentifier: settings.voiceIdentifier, rate: settings.speechRate)
     }
 
     // MARK: - App

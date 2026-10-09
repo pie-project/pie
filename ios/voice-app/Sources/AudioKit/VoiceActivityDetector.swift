@@ -52,7 +52,9 @@ import Foundation
 /// The numbers are for the iPhone's voice-processed microphone (automatic
 /// gain control on), set from what the audio self-check measured there and
 /// checked by its no_false_bargein, echo_transcripts and external_onset
-/// results.
+/// results. The session's echo-cancelled input (`-PieEchoPath session`)
+/// has no gain control and has not been measured; its self-check results
+/// say whether they hold there too.
 struct VoiceActivityDetector {
 
     enum Event: Equatable {
@@ -116,6 +118,27 @@ struct VoiceActivityDetector {
     /// being learnt or is out of date, and under the quiet end of a normal
     /// voice.
     static let echoOnsetMinimum: Float = -32
+
+    /// Which echo canceller cleaned the input; set for every buffer from
+    /// what the engine is built on. The echo thresholds above were tuned
+    /// and measured on voice processing. The session's echo-cancelled
+    /// input leaves far less of a reply behind (on an iPhone 16 Pro the
+    /// loudest residue window measured -40 dBFS against -13 dBFS with
+    /// voice processing, its 90th percentile -48 against -41) and has no
+    /// automatic gain control, so a voice also arrives several dB quieter.
+    /// There, the parts of the threshold that stand in for an unknown
+    /// residue come down; the margin over the learnt residue envelope is
+    /// the same.
+    enum Canceller: Equatable {
+        case voiceProcessing
+        case session
+    }
+
+    var canceller: Canceller = .voiceProcessing
+
+    /// The session canceller's room margin and absolute minimum.
+    static let sessionEchoOnsetMargin: Float = 12
+    static let sessionEchoOnsetMinimum: Float = -40
     /// Once talking, the level only has to stay this far above the room
     /// floor to count as still talking (and, while a reply plays or has
     /// just stopped, above the loud parts of its residue). Lower than the onset margin, so the
@@ -376,7 +399,16 @@ struct VoiceActivityDetector {
         guard echoLikely else {
             return max(floor + Self.onsetMargin, Self.onsetMinimum)
         }
-        return max(floor + Self.echoOnsetMargin, echoResidue + Self.echoResidueMargin, Self.echoOnsetMinimum)
+        switch canceller {
+        case .voiceProcessing:
+            return max(floor + Self.echoOnsetMargin, echoResidue + Self.echoResidueMargin, Self.echoOnsetMinimum)
+        case .session:
+            return max(
+                floor + Self.sessionEchoOnsetMargin,
+                echoResidue + Self.echoResidueMargin,
+                Self.sessionEchoOnsetMinimum
+            )
+        }
     }
 
     /// Adds a window to the recent history and says whether the history

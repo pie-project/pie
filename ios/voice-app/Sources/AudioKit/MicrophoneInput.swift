@@ -66,6 +66,7 @@ final class MicrophoneInput: NSObject, SpeechInput {
     private let hub = AudioEngineHub.shared
     private lazy var pipeline = CapturePipeline(
         playbackEcho: { [hub] in hub.playbackEcho },
+        echoCanceller: { [hub] in hub.echoCanceller },
         emit: { [weak self] session, event in
             DispatchQueue.main.async {
                 self?.handle(event, session: session)

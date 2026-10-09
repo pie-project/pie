@@ -68,6 +68,9 @@ final class CapturePipeline {
 
     private let lock = NSLock()
     private let playbackEcho: () -> PlaybackEcho
+    /// Which echo canceller the engine is built on; the detector's echo
+    /// thresholds follow it.
+    private let echoCanceller: () -> VoiceActivityDetector.Canceller
     private let emit: (_ session: Int, _ event: Event) -> Void
 
     private var session = 0
@@ -94,8 +97,13 @@ final class CapturePipeline {
     private var kept: [AVAudioPCMBuffer] = []
     private var keptTotal: TimeInterval = 0
 
-    init(playbackEcho: @escaping () -> PlaybackEcho, emit: @escaping (_ session: Int, _ event: Event) -> Void) {
+    init(
+        playbackEcho: @escaping () -> PlaybackEcho,
+        echoCanceller: @escaping () -> VoiceActivityDetector.Canceller,
+        emit: @escaping (_ session: Int, _ event: Event) -> Void
+    ) {
         self.playbackEcho = playbackEcho
+        self.echoCanceller = echoCanceller
         self.emit = emit
     }
 
@@ -234,6 +242,7 @@ final class CapturePipeline {
         guard !rms.isEmpty else { return }
         let decibels = rms.map(AudioLevel.decibels(rms:))
         let echo = playbackEcho()
+        detector.canceller = echoCanceller()
         var events: [Event] = [
             .levels(decibels.map(AudioLevel.normalized(decibels:)), window: Double(windowFrames) / rate),
         ]

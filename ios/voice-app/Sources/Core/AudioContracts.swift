@@ -107,4 +107,23 @@ struct SpeechVoiceInfo: Identifiable, Equatable {
     /// "Premium", "Enhanced" or "Default".
     let quality: String
     let language: String
+    /// A novelty voice or one of the old MacinTalk voices (Fred, Kathy,
+    /// Ralph and the rest). Never chosen automatically, because it sounds
+    /// like a 1980s computer; the picker can hide or mark it.
+    var isLegacy: Bool = false
+    /// The user's own Personal Voice. Listed only once the user has let
+    /// the app use it (`PersonalVoiceAccess.authorized`).
+    var isPersonalVoice: Bool = false
+}
+
+/// Whether the app may speak in the user's Personal Voice, the voice the
+/// user records on the device in Settings > Accessibility.
+enum PersonalVoiceAccess: Equatable {
+    /// The user has not been asked yet.
+    case notDetermined
+    /// The user said no; only the Settings app can change that.
+    case denied
+    /// This device cannot use Personal Voice.
+    case unsupported
+    case authorized
 }

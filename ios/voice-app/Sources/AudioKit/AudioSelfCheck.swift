@@ -9,8 +9,9 @@ import Foundation
 /// `PIECHECK {json}` lines and writes Documents/audio-check.jsonl, then
 /// exits. `-PieMakeUpGainDB` and `-PieVoiceAGC` (see `AudioEngineHub`)
 /// change the reply's make-up gain and the microphone's gain control for
-/// a run, so settings can be compared; echo_transcripts records what was
-/// in force.
+/// a run, and `-PieEchoPath session|vpio` how voice mode cancels the
+/// reply's echo, so settings can be compared; echo_transcripts records
+/// what was in force.
 ///
 /// None of this can be exercised on a Mac: voice processing, the speaker
 /// route and the recogniser's assets only exist on the phone, so the
@@ -531,6 +532,9 @@ private final class AudioChecks {
         let spokenAt = Date()
         let output = hub.endOutputMeasurement()
         let readingsAfter = (microphone as? MicrophoneInput)?.detectorReadings
+        // A session path the session did not honour falls back to voice
+        // processing mid-run; the record says if that happened.
+        let stateAfter = hub.voiceProcessingState
         await pause(Self.echoTail)
         let end = Date()
         // An utterance still open would go on to a final transcript of
@@ -584,6 +588,10 @@ private final class AudioChecks {
             "residue_after_speaking": probe.inputDecibels(from: spokenAt, to: end),
             "detector_before": Self.json(readingsBefore),
             "detector": Self.json(readingsAfter),
+            "echo_path": state.echoPath,
+            "echo_path_requested": state.echoPathRequested,
+            "echo_path_after_reply": stateAfter.echoPath,
+            "session_echo_cancelled_input": state.sessionEchoCancelledInput,
             "echo_cancellation": state.echoCancellation,
             "make_up_gain_db": Self.tenths(Double(state.makeUpGainDB)),
             "voice_agc": state.automaticGainControl,
@@ -616,6 +624,10 @@ private final class AudioChecks {
             return
         }
         defer { microphone.cancel() }
+        // The session path cancels whatever the built-in speaker plays,
+        // which may include this recording; the record says which path
+        // heard it.
+        let echoPath = AudioEngineHub.shared.voiceProcessingState.echoPath
 
         let speech = self.speech
         let start = Date()
@@ -641,6 +653,7 @@ private final class AudioChecks {
         speech.stop()
 
         record(name, pass: nil, [
+            "echo_path": echoPath,
             "onset_fired": fired,
             "onset_after_play": Self.seconds(playAt, onsetAt),
             "microphone_while_talking_over": probe.inputDecibels(from: playAt, to: onsetAt ?? Date()),
