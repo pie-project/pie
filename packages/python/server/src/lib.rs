@@ -1,35 +1,24 @@
 //! `pie._engine`: what `pie serve` boots, inside a Python process — the
 //! Python twin of `@pie-project/server`.
 //!
-//! [`pie::run_standalone`] brings up the controller, the gateway with its
-//! HTTP routes and the worker from the same config file the CLI reads. The
-//! boot and the shutdown block with the GIL released; `pie.server.Server`
+//! [`worker::Server::serve`] brings up the worker and, beside it, the
+//! controller and the gateway with its HTTP routes, from the same config file
+//! the CLI reads. Its calls block with the GIL released; `pie.server.Server`
 //! runs them off-thread. A handle dropped without `shutdown()` (GC,
 //! interpreter exit) still tears the engine down, on a thread of its own so
-//! the GIL is not held; what that thread has not released by process exit,
-//! the OS reclaims.
+//! the GIL is not held.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use pie::StandaloneHandle;
-use runtime::inferlet::program;
-
-/// The runtime outlives the handle's shutdown: every engine is joined on it.
-type Live = (StandaloneHandle, tokio::runtime::Runtime);
-
-fn stop((handle, runtime): Live) {
-    runtime.block_on(handle.shutdown());
-    drop(runtime);
-}
+type Live = Arc<worker::Server>;
 
 #[pyclass(name = "EngineHandle")]
 struct PyEngineHandle {
     url: String,
     live: Mutex<Option<Live>>,
-    runtime: tokio::runtime::Handle,
 }
 
 #[pymethods]
@@ -55,13 +44,12 @@ impl PyEngineHandle {
         language: &str,
         component: &[u8],
     ) -> PyResult<String> {
-        let language = program::Language::parse(language)
-            .map_err(|e| PyValueError::new_err(format!("language: {e:#}")))?;
-        let runtime = self.runtime()?;
+        let server = self.live()?;
         let component = component.to_vec();
-        py.detach(|| runtime.block_on(program::add_language(language, component)))
+        let name = py
+            .detach(|| server.install_language(language, component))
             .map_err(|e| PyRuntimeError::new_err(format!("install language: {e:#}")))?;
-        Ok(language.name().to_string())
+        Ok(name.to_string())
     }
 
     #[pyo3(signature = (bytes, file, version=None))]
@@ -72,36 +60,35 @@ impl PyEngineHandle {
         file: &str,
         version: Option<&str>,
     ) -> PyResult<String> {
-        let runtime = self.runtime()?;
+        let server = self.live()?;
         let bytes = bytes.to_vec();
-        let name = py
-            .detach(|| runtime.block_on(program::add(bytes, file, version, true)))
-            .map_err(|e| PyRuntimeError::new_err(format!("install: {e:#}")))?;
-        Ok(name.to_string())
+        py.detach(|| server.install(bytes, file, version))
+            .map_err(|e| PyRuntimeError::new_err(format!("install: {e:#}")))
     }
 
     /// Stop every engine, join them, and release the runtime. Idempotent;
     /// blocks with the GIL released.
     fn shutdown(&self, py: Python<'_>) {
-        if let Some(live) = self.live.lock().unwrap().take() {
-            py.detach(|| stop(live));
+        if let Some(server) = self.live.lock().unwrap().take() {
+            py.detach(|| server.shutdown());
         }
     }
 }
 
 impl PyEngineHandle {
-    fn runtime(&self) -> PyResult<tokio::runtime::Handle> {
-        if self.live.lock().unwrap().is_none() {
-            return Err(PyRuntimeError::new_err("the server is shut down"));
-        }
-        Ok(self.runtime.clone())
+    fn live(&self) -> PyResult<Live> {
+        self.live
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("the server is shut down"))
     }
 }
 
 impl Drop for PyEngineHandle {
     fn drop(&mut self) {
-        if let Some(live) = self.live.lock().unwrap().take() {
-            std::thread::spawn(move || stop(live));
+        if let Some(server) = self.live.lock().unwrap().take() {
+            std::thread::spawn(move || server.shutdown());
         }
     }
 }
@@ -117,26 +104,21 @@ fn init_tracing() {
         .try_init();
 }
 
-/// Boot from the TOML text `pie serve --config` reads. Blocks, with the
-/// GIL released, until engines are up, weights are loaded and the listener
-/// is bound.
+/// Boot from the TOML text `pie serve --config` reads, keeping the runtime's
+/// files under `home`. Blocks, with the GIL released, until engines are up,
+/// weights are loaded and the listener is bound.
 #[pyfunction]
-fn bootstrap(py: Python<'_>, toml_str: &str) -> PyResult<PyEngineHandle> {
+fn bootstrap(py: Python<'_>, toml_str: &str, home: &str) -> PyResult<PyEngineHandle> {
     init_tracing();
-    let (controller, gateway, worker) = pie::derive::derive_standalone(toml_str)
+    let config = worker::Config::parse(toml_str)
         .map_err(|e| PyValueError::new_err(format!("config: {e:#}")))?;
-
-    py.detach(|| {
-        let runtime = worker::serve::build_runtime(&worker)
-            .map_err(|e| PyRuntimeError::new_err(format!("build tokio runtime: {e:#}")))?;
-        let handle = runtime
-            .block_on(pie::run_standalone(controller, gateway, worker))
-            .map_err(|e| PyRuntimeError::new_err(format!("start: {e:#}")))?;
-        Ok(PyEngineHandle {
-            url: format!("ws://{}", handle.listen_addr),
-            runtime: runtime.handle().clone(),
-            live: Mutex::new(Some((handle, runtime))),
-        })
+    let server = py
+        .detach(|| worker::Server::serve(config, std::path::Path::new(home)))
+        .map_err(|e| PyRuntimeError::new_err(format!("start: {e:#}")))?;
+    let addr = server.listen_addr().expect("a served worker listens");
+    Ok(PyEngineHandle {
+        url: format!("ws://{addr}"),
+        live: Mutex::new(Some(Arc::new(server))),
     })
 }
 

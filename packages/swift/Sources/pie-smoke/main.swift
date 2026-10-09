@@ -1,7 +1,12 @@
 // One chat turn through compat-openai, end to end on a Mac:
 //   swift run pie-smoke <model.zt | ws://host:port> ["prompt"]
+// or, with PIE_SCRIPT=<inferlet.py | inferlet.js>, one run of that script
+// inferlet (in-process only) with {"prompt", "max_tokens"} as its input.
+// PIE_LISTEN=<host:port> also serves the gateway, and the turn goes through it.
 
 import Foundation
+import PieLanguageJavaScript
+import PieLanguagePython
 import PieServer
 
 struct ChatRequest: Encodable {
@@ -20,6 +25,11 @@ struct ChatRequest: Encodable {
         case maxTokens = "max_tokens"
         case chatTemplateKwargs = "chat_template_kwargs"
     }
+}
+
+struct ScriptInput: Encodable {
+    let prompt: String
+    let max_tokens: Int
 }
 
 struct Chunk: Decodable {
@@ -50,9 +60,24 @@ if let url = URL(string: arguments[1]), url.scheme == "ws" {
     client = try await PieClient.connect(to: url)
     print("connected to \(url)")
 } else {
-    server = try await PieServer.start(model: URL(filePath: arguments[1]))
-    client = try await server!.connect()
+    let listen = ProcessInfo.processInfo.environment["PIE_LISTEN"]
+    server = try await PieServer.start(model: URL(filePath: arguments[1]), listen: listen)
+    if listen != nil, let address = server!.listenAddress {
+        print("gateway at \(address)")
+        client = try await PieClient.connect(to: URL(string: "ws://\(address)")!)
+    } else {
+        client = try await server!.connect()
+    }
     print(String(format: "booted %@ in %.2fs", server!.summary.deployment, booted.duration(to: clock.now) / .seconds(1)))
+}
+
+if let server, let script = ProcessInfo.processInfo.environment["PIE_SCRIPT"].map({ URL(filePath: $0) }) {
+    try await server.install(script.pathExtension == "py" ? .python : .javascript)
+    let name = try await server.install(contentsOf: script)
+    print(try await client.launch(name, input: ScriptInput(prompt: prompt, max_tokens: maxTokens)).result())
+    await client.close()
+    await server.shutdown()
+    exit(0)
 }
 
 let launched = clock.now

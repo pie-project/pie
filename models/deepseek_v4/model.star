@@ -569,6 +569,8 @@ def layout(id, deploy):
             return flash(u4, DQ_2BIT, kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16))
         if ws == [u4, dtype.u2g64, mx] and mtp:
             return flash(u4, DQ_2BIT, kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16, draft = True))
+        if ws == [bf, mx] and not mtp:
+            return flash(bf, split_of(mx), kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16))
     if id == "dsv4-base" and ws == [bf] and not mtp:
         return base(bf, kv, BASE)
     fail("{} does not ship {}".format(id, deploy))

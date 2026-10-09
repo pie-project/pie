@@ -18,7 +18,7 @@ public final class PieServer: Sendable {
         public let maxTokens: Int
     }
 
-    /// The boot configuration (`runtime::embed::BootConfig`), sized for a phone.
+    /// The boot configuration (`worker::embedded::Settings`), sized for a phone.
     public struct Configuration: Encodable, Sendable, Equatable {
         /// Share of the device's recommended working set the engine may use.
         public var gpuMemoryUtilization = 0.6
@@ -45,11 +45,28 @@ public final class PieServer: Sendable {
         }
     }
 
-    public enum Language: String, Sendable {
-        case python, javascript
+    /// A language script inferlets (`x.py`, `x.js`) run in: the component
+    /// that hosts them. `PieLanguagePython` and `PieLanguageJavaScript`
+    /// provide `.python` and `.javascript`.
+    public struct Language: Sendable {
+        public let name: String
+        let component: @Sendable () throws -> Data
+
+        public init(name: String, component: @escaping @Sendable () throws -> Data) {
+            self.name = name
+            self.component = component
+        }
+
+        /// The component at `url`, read when the language installs.
+        public init(name: String, contentsOf url: URL) {
+            self.init(name: name) { try Data(contentsOf: url) }
+        }
     }
 
     public let summary: Summary
+    /// `host:port` the gateway listens on with `listen` (the OS's port for
+    /// port 0), else nil.
+    public let listenAddress: String?
     let handle: Handle
 
     /// The C handle; every call on it is safe from any thread.
@@ -60,6 +77,7 @@ public final class PieServer: Sendable {
     private init(handle: Handle) throws {
         self.handle = handle
         summary = try JSONDecoder.snakeCase.decode(Summary.self, from: Data(String(cString: pie_server_summary(handle.pointer)).utf8))
+        listenAddress = pie_server_listen_addr(handle.pointer).map { String(cString: $0) }
     }
 
     deinit {
@@ -67,24 +85,34 @@ public final class PieServer: Sendable {
         Thread.detachNewThread { pie_server_free(handle.pointer) }
     }
 
-    /// Boots `model` (a `.metal.zt` from `pie model import`); `home` holds the
-    /// inferlet cache and defaults to `<Caches>/pie`. One server per process.
+    /// Boots `model` (a `.metal.zt` from `pie model import`) with `languages`
+    /// installed; `home` holds the inferlet cache and defaults to
+    /// `<Caches>/pie`. With `listen` (`"127.0.0.1:8080"`) pie's gateway also
+    /// serves it there: its WebSocket and the OpenAI-compatible HTTP routes.
+    /// One server per process.
     public static func start(
         model: URL,
         configuration: Configuration = Configuration(),
+        languages: [Language] = [],
+        listen: String? = nil,
         home: URL = .cachesDirectory.appending(path: "pie", directoryHint: .isDirectory)
     ) async throws -> PieServer {
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         let config = try String(decoding: JSONEncoder().encode(configuration), as: UTF8.self)
         let handle = try await blocking {
-            Handle(pointer: try call { error in pie_server_start(model.path(), config, home.path(), error) })
+            Handle(pointer: try call { error in pie_server_start(model.path(), config, home.path(), listen, error) })
         }
+        let server: PieServer
         do {
-            return try PieServer(handle: handle)
+            server = try PieServer(handle: handle)
         } catch {
             pie_server_free(handle.pointer)
             throw error
         }
+        for language in languages {
+            try await server.install(language)
+        }
+        return server
     }
 
     public func connect() async throws -> PieClient {
@@ -117,12 +145,13 @@ public final class PieServer: Sendable {
         try await install(Data(contentsOf: url), file: url.lastPathComponent, version: version)
     }
 
-    /// Installs the component that runs script inferlets in `language`.
-    public func installLanguage(_ language: Language, component: Data) async throws {
+    /// Installs `language`, so script inferlets in it install and run.
+    public func install(_ language: Language) async throws {
         try await Self.blocking { [handle] in
+            let component = try language.component()
             try Self.check { error in
                 component.withUnsafeBytes { bytes in
-                    pie_server_install_language(handle.pointer, language.rawValue, bytes.baseAddress, bytes.count, error)
+                    pie_server_install_language(handle.pointer, language.name, bytes.baseAddress, bytes.count, error)
                 }
             }
         }

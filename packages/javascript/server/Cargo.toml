@@ -9,10 +9,10 @@ repository = "https://github.com/pie-project/pie"
 
 [features]
 default = ["cuda"]
-cuda = ["pie/cuda"]
-metal = ["pie/metal"]
-vulkan = ["pie/vulkan"]
-wgpu = ["pie/wgpu"]
+cuda = ["worker/cuda"]
+metal = ["worker/metal"]
+vulkan = ["worker/vulkan"]
+wgpu = ["worker/wgpu"]
 
 [lib]
 name = "pie_server"
@@ -20,13 +20,10 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
-pie = { path = "../../..", default-features = false }
-worker = { path = "../../../crates/worker", default-features = false }
-runtime = { path = "../../../crates/runtime", default-features = false }
+worker = { path = "../../../crates/worker", default-features = false, features = ["standalone"] }
 napi = { version = "3", default-features = false, features = ["napi4", "serde-json"] }
 napi-derive = "3"
 serde_json = "1"
-tokio = { version = "1.53", features = ["rt-multi-thread"] }
 toml = "1.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

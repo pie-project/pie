@@ -38,6 +38,10 @@ const CANNOT_SERVE: &[(&str, &[&str])] = &[
         &["attention.pool_lse_selected"],
     ),
     (
+        "dsv4-flash-mini-bf16-mxfp4-kv-bf16",
+        &["attention.pool_lse_selected"],
+    ),
+    (
         "dsv41-flash-u4g64-kv-bf16",
         &["attention.pool_lse_selected"],
     ),

@@ -13,6 +13,7 @@
 
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -105,13 +106,15 @@ export class Server {
    */
   static async start(options) {
     let config = options;
+    let home = process.env.PIE_HOME?.trim() || join(homedir(), '.pie');
     if (options && typeof options === 'object' && typeof options.model === 'string') {
       const { model, config: rest = {} } = options;
       if (typeof rest !== 'object') throw new Error('Server.start: with `model`, `config` is an object');
       config = { ...rest, model: { name: 'default', ...(rest.model ?? {}), model } };
+      home = options.home ?? home;
     }
     const api = load();
-    const handle = typeof config === 'string' ? await api.startToml(config) : await api.start(config);
+    const handle = typeof config === 'string' ? await api.startToml(config, home) : await api.start(config, home);
     const server = new Server(handle);
     await importInstalledLanguages();
     server.#detach = await attachLanguages(server);

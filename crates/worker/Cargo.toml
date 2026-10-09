@@ -3,7 +3,7 @@ name = "worker"
 version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "Standalone Pie server (no Python). Embeds a native engine in-process."
+description = "The role that owns the runtime: loads the model onto its engine and boots the runtime, then serves it to a gateway (`net`), beside one in `pie serve`'s process (`standalone`), or to an app in its own process (`embedded`, `Server`)."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -13,7 +13,20 @@ path = "src/lib.rs"
 crate-type = ["rlib"]
 
 [features]
-default = []
+default = ["net"]
+# The worker's links to a gateway and a controller; without them it is the
+# in-process runtime an app embeds (`embedded`, `Server` without `listen`).
+net = [
+    "dep:client",
+    "dep:mimalloc",
+    "dep:reqwest",
+    "dep:tarpc",
+    "dep:tokio-tungstenite",
+    "dep:worker-api",
+    "tokio/full",
+]
+# `pie serve` in one process: the controller and the gateway beside this worker.
+standalone = ["net", "dep:controller", "dep:gateway", "dep:rustls"]
 cuda = ["runtime/cuda"]
 metal = ["runtime/metal"]
 vulkan = ["runtime/vulkan"]
@@ -25,10 +38,9 @@ profile-fire = ["runtime/profile-fire"]
 
 [dependencies]
 runtime = { path = "../runtime" }
-builtins = { path = "../builtins" }
 models = { path = "../models" }
 controller-api = { path = "../controller-api" }
-worker-api = { path = "../worker-api" }
+worker-api = { path = "../worker-api", optional = true }
 
 engine = { path = "../engine" }
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
@@ -36,29 +48,36 @@ transport = { path = "../transport", optional = true }
 ids = { path = "../ids" }
 client-api = { package = "pie-client-api", path = "../client-api" }
 anyhow = "1.0"
-bootstrap = { path = "../bootstrap" }
+controller = { path = "../controller", optional = true }
+gateway = { path = "../gateway", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"], optional = true }
 rmp-serde = "1.3"
 blake3 = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.1"
-tokio = { version = "1.53", features = ["full"] }
-tarpc = { version = "0.37", features = [
+tokio = { version = "1.53", features = ["sync", "macros", "rt"] }
+tarpc = { version = "0.37", optional = true, features = [
 	"serde-transport",
 	"serde-transport-bincode",
 	"tcp",
 	"unix",
 ] }
-tokio-tungstenite = "0.30.0"
+tokio-tungstenite = { version = "0.30.0", optional = true }
 futures = "0.3.33"
-mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
+mimalloc = { version = "0.1", features = ["local_dynamic_tls"], optional = true }
 tracing = "0.1"
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"], optional = true }
 
 checkpoint = { path = "../checkpoint", default-features = false }
+ztensor = { workspace = true }
 tokenizer = { path = "../tokenizer" }
 
-client = { package = "pie-client", path = "../client" }
+client = { package = "pie-client", path = "../client", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+builtins = { path = "../builtins" }
+tokio = { version = "1.53", features = ["rt-multi-thread", "time"] }
 
 [dev-dependencies]
 tempfile = "3"

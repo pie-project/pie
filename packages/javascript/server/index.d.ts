@@ -11,6 +11,8 @@ export interface StartOptions {
   model: string;
   /** The rest of the config (server, engine, sandbox, …), as an object; TOML text is accepted for a bare `start(config)`. */
   config?: Record<string, unknown> | string;
+  /** Node: where the runtime keeps its files (installed inferlets, languages, caches, models); `$PIE_HOME`, else `~/.pie`. */
+  home?: string;
   /** Browser only: download progress of a lazy boot. */
   onProgress?: (served: number, total: number, from: 'network' | 'cache') => void;
 }

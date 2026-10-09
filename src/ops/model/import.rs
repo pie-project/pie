@@ -69,7 +69,7 @@ fn consuming_marker(source: &Path) -> PathBuf {
     }
 }
 
-pub fn run(mut args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui::Answer> {
+pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<crate::ui::Answer> {
     if let Some(name) = args.drafter.take() {
         let Some(published) = models::published::lookup(&args.source, &name) else {
             let known: Vec<String> = models::published::for_target(&args.source)

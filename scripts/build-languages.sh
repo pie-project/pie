@@ -7,7 +7,9 @@
 #   pie-language-javascript.tar.gz      languages/javascript.wasm
 #
 # and the same wasm into the packages that ship it: packages/javascript/language-*
-# (npm) and packages/python/language-*/src/pie_language_* (PyPI).
+# (npm), packages/python/language-*/src/pie_language_* (PyPI),
+# packages/swift/Sources/PieLanguage*/Resources (SwiftPM) and
+# packages/kotlin/language-* (Gradle).
 #
 #   scripts/build-languages.sh [OUT_DIR] [LANGUAGE...]
 #     OUT_DIR     where the archives go        (default: target/languages)
@@ -39,6 +41,11 @@ for language in "${languages[@]}"; do
   tar -C "$stage" -czf "$out/pie-language-$language.tar.gz" languages
   cp "$stage/languages/$language.wasm" "$root/packages/javascript/language-$language/$language.wasm"
   cp "$stage/languages/$language.wasm" "$root/packages/python/language-$language/src/pie_language_$language/$language.wasm"
+  swift_target=$([ "$language" = python ] && echo Python || echo JavaScript)
+  cp "$stage/languages/$language.wasm" "$root/packages/swift/Sources/PieLanguage$swift_target/Resources/$language.wasm"
+  kotlin_dir="$root/packages/kotlin/language-$language/src/main/resources/org/pieproject/language"
+  mkdir -p "$kotlin_dir"  # a fresh checkout has no resources folder: the Kotlin package is built from these
+  cp "$stage/languages/$language.wasm" "$kotlin_dir/$language.wasm"
   rm -rf "$stage"
   echo "== $out/pie-language-$language.tar.gz ($(du -h "$out/pie-language-$language.tar.gz" | cut -f1))"
 done

@@ -24,6 +24,7 @@ DEPLOYMENTS = [
     deployment("dsv4-flash", weights = [U4, U2], kv = BF),
     deployment("dsv4-flash-mini", weights = [U4, U2], kv = BF),
     deployment("dsv4-flash-mini", weights = BF, kv = BF),
+    deployment("dsv4-flash-mini", weights = [BF, FP4], kv = BF),
     deployment("dsv4-base", weights = BF, kv = BF),
     deployment("dsv4-flash", weights = BF, kv = BF),
 ]

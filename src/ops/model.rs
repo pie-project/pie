@@ -28,7 +28,7 @@ pub enum ModelCmd {
     },
 }
 
-pub fn run(cmd: ModelCmd, global: &bootstrap::GlobalArgs) -> Result<Answer> {
+pub fn run(cmd: ModelCmd, global: &crate::args::GlobalArgs) -> Result<Answer> {
     match cmd {
         ModelCmd::List => list(),
         ModelCmd::Info { name } => info(name),
@@ -271,7 +271,7 @@ impl crate::ui::Report for ModelList {
 }
 
 fn dead_weight() -> Option<DeadWeight> {
-    let dir = bootstrap::paths::pie_home().join("cache").join("weights");
+    let dir = crate::paths::pie_home().join("cache").join("weights");
     let mut files = 0usize;
     let mut bytes = 0u64;
     for entry in std::fs::read_dir(&dir).ok()?.filter_map(|it| it.ok()) {

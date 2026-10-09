@@ -34,6 +34,9 @@ jobs:
         run: cargo clippy --no-deps --all-targets $(bash scripts/ci/members.sh engine-cuda pie-server-node pie-server-py) -- -D warnings
       - name: cargo clippy (servers, no engine)
         run: cargo clippy --no-deps --all-targets -p pie-server-node -p pie-server-py --no-default-features -- -D warnings
+      # The worker an app embeds: no gateway or controller links.
+      - name: cargo clippy (worker, embedded only)
+        run: cargo clippy --no-deps --all-targets -p worker --no-default-features -- -D warnings
       # engine-metal's device half is `cfg(target_vendor = "apple")`; clippy
       # type-checks it for that target without a Mac.
       - name: cargo clippy (engine-metal, Apple half)
@@ -190,6 +193,28 @@ jobs:
           name: languages
           path: target/languages/pie-language-*.tar.gz
           if-no-files-found: error
+
+  android:
+    name: "android: core (arm64) + Kotlin packages"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+        with:
+          features: vulkan
+          cache-key: ${{ runner.os }}-android
+      - run: rustup target add aarch64-linux-android
+      - run: cargo install cargo-ndk --locked
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      # The runner image carries the NDK (ANDROID_NDK_HOME) and the SDK.
+      - name: cargo clippy (Android)
+        run: cargo ndk -t arm64-v8a -P 29 clippy --no-deps -p pie-kotlin-core -- -D warnings
+      - run: bash packages/kotlin/build-native.sh
+      - run: ./gradlew test assembleRelease
+        working-directory: packages/kotlin
 
   browser:
     name: "browser: wasm32 lint → Tint → serve in Chromium"

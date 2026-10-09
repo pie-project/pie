@@ -1,10 +1,17 @@
+use std::path::Path;
+
 use anyhow::Result;
 
 use crate::backend::ModelEngines;
 use crate::config;
 
+/// The page size the runtime keys on when no engine reports one.
+pub const ENGINELESS_PAGE_SIZE: u32 = 16;
+
 pub fn build(
     user: &config::Config,
+    home: &Path,
+    builtins: Vec<runtime::bootstrap::BuiltinProgram>,
     engines: ModelEngines,
     metadata: runtime::model::ModelMetadata,
 ) -> Result<runtime::bootstrap::Config> {
@@ -15,27 +22,58 @@ pub fn build(
             user.model.name,
         );
     }
-
-    let pie_home = bootstrap::paths::pie_home();
-    let cache_dir = bootstrap::paths::inferlets_dir();
-    let log_dir = Some(pie_home.join("logs"));
-
     let model = build_model(&user.model, &user.runtime, engines, metadata)?;
+    Ok(runtime_config(user, home, builtins, model))
+}
 
-    Ok(runtime::bootstrap::Config {
+/// A runtime with no engine over `artifact`, keyed by its stamped `deployment`.
+pub fn build_without_engine(
+    user: &config::Config,
+    home: &Path,
+    builtins: Vec<runtime::bootstrap::BuiltinProgram>,
+    artifact: &Path,
+    deployment: &str,
+    metadata: runtime::model::ModelMetadata,
+) -> runtime::bootstrap::Config {
+    let model = runtime::bootstrap::ModelConfig {
+        name: user.model.name.clone(),
+        model_id: deployment.to_string(),
+        kv_page_size: ENGINELESS_PAGE_SIZE as usize,
+        tokenizer_path: artifact.to_path_buf(),
+        metadata,
+        engines: Vec::new(),
+        scheduler: scheduler(&user.runtime),
+    };
+    runtime_config(user, home, builtins, model)
+}
+
+/// Every built-in inferlet, as `pie serve` registers them. The browser
+/// registers none, so a wasm32 build carries none.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn builtins() -> Vec<runtime::bootstrap::BuiltinProgram> {
+    builtins::all()
+        .iter()
+        .map(|b| runtime::bootstrap::BuiltinProgram {
+            name: b.name,
+            version: b.version,
+            component: b.component,
+        })
+        .collect()
+}
+
+fn runtime_config(
+    user: &config::Config,
+    home: &Path,
+    builtin_programs: Vec<runtime::bootstrap::BuiltinProgram>,
+    model: runtime::bootstrap::ModelConfig,
+) -> runtime::bootstrap::Config {
+    runtime::bootstrap::Config {
         host: user.server.host.clone(),
         port: user.server.port,
-        cache_dir,
-        builtin_programs: builtins::all()
-            .iter()
-            .map(|b| runtime::bootstrap::BuiltinProgram {
-                name: b.name,
-                version: b.version,
-                component: b.component,
-            })
-            .collect(),
+        cache_dir: home.join("inferlets"),
+        builtin_programs,
         verbose: user.server.verbose,
-        log_dir,
+        log_dir: Some(home.join("logs")),
         telemetry: runtime::bootstrap::TelemetryConfig {
             enabled: user.telemetry.enabled,
             endpoint: user.telemetry.endpoint.clone(),
@@ -52,13 +90,22 @@ pub fn build(
             allow_network: user.sandbox.allow_network,
             network_allowed_hosts: user.sandbox.network_allowed_hosts.clone(),
             max_upload_mb: user.server.max_upload.as_mib() as usize,
-            languages_dir: bootstrap::paths::languages_dir(),
-            compile_cache_dir: Some(bootstrap::paths::compile_cache_dir()),
+            languages_dir: home.join("languages"),
+            compile_cache_dir: Some(home.join("cache").join("wasmtime")),
         },
         model,
         skip_tracing: true,
         max_concurrent_processes: user.runtime.max_concurrent_processes,
-    })
+    }
+}
+
+fn scheduler(runtime: &config::RuntimeConfig) -> runtime::bootstrap::SchedulerConfig {
+    runtime::bootstrap::SchedulerConfig {
+        submit_deadline_us: runtime.submit_deadline.as_micros(),
+        silence_timeout_secs: runtime.silence_timeout.as_secs(),
+        frame_size: runtime.frame_size,
+        frame_dispatch_depth: runtime.frame_dispatch_depth,
+    }
 }
 
 fn build_model(
@@ -130,11 +177,6 @@ fn build_model(
         tokenizer_path,
         metadata,
         engines,
-        scheduler: runtime::bootstrap::SchedulerConfig {
-            submit_deadline_us: runtime.submit_deadline.as_micros(),
-            silence_timeout_secs: runtime.silence_timeout.as_secs(),
-            frame_size: runtime.frame_size,
-            frame_dispatch_depth: runtime.frame_dispatch_depth,
-        },
+        scheduler: scheduler(runtime),
     })
 }

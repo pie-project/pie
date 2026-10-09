@@ -89,8 +89,8 @@ fn lift_snapshot_config(path: &Path) -> Result<Vec<u8>> {
     Ok(raw.into_bytes())
 }
 
-fn store_dir() -> PathBuf {
-    bootstrap::paths::pie_home().join("models")
+fn store_dir(home: &Path) -> PathBuf {
+    home.join("models")
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -213,13 +213,13 @@ fn pick(dir: &Path, found: Vec<PathBuf>, want: Want<'_>) -> Result<Option<PathBu
     )
 }
 
-pub fn resolve(model: &str, want: Want<'_>) -> Result<Model> {
+pub fn resolve(model: &str, want: Want<'_>, home: &Path) -> Result<Model> {
     if model.trim().is_empty() {
         bail!("[model].model is empty; set it to a store name or a path to a .zt artifact");
     }
     if looks_like_path(model) {
         let path = PathBuf::from(model);
-        if path.is_file() {
+        if is_file(&path) {
             return Ok(if is_artifact_path(&path) {
                 Model::Artifact(path)
             } else {
@@ -232,7 +232,7 @@ pub fn resolve(model: &str, want: Want<'_>) -> Result<Model> {
         bail!("model {model:?} does not exist");
     }
 
-    let store = store_dir();
+    let store = store_dir(home);
     if let Some(artifact) = archive_in(&store, model, want)? {
         return Ok(Model::Artifact(artifact));
     }
@@ -242,8 +242,13 @@ pub fn resolve(model: &str, want: Want<'_>) -> Result<Model> {
     bail!(
         "no model {model:?} in {}; `pie model import {model}` fetches and converts one, \
          and `pie model list` shows what is there",
-        store_dir().display()
+        store.display()
     )
+}
+
+/// A file on disk, or an artifact a host mounted in memory (the browser's).
+pub(crate) fn is_file(path: &Path) -> bool {
+    path.is_file() || ztensor::memfs::is_mounted(path)
 }
 
 pub(crate) fn is_artifact_path(path: &Path) -> bool {
@@ -382,7 +387,7 @@ mod tests {
         let artifact = dir.path().join("model.zt");
         std::fs::write(&artifact, b"stand-in for an artifact").unwrap();
         assert_eq!(
-            resolve(artifact.to_str().unwrap(), Want::default()).unwrap(),
+            resolve(artifact.to_str().unwrap(), Want::default(), dir.path()).unwrap(),
             Model::Artifact(artifact)
         );
     }
