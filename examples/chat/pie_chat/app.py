@@ -79,15 +79,13 @@ def history_lines(chat: Chat) -> list[list[tuple]]:
     return _cache["history"]
 
 
-def transcript_lines(chat: Chat) -> list[list[tuple]]:
-    handler = wheel(chat)
-    banner_lines = split_lines([(p[0], p[1], handler) for p in banner(chat)])
-    return banner_lines + history_lines(chat)
+def header_rows(chat: Chat) -> int:
+    return sum(piece[1].count("\n") for piece in banner(chat))
 
 
 def visible_lines(chat: Chat) -> list[list[tuple]]:
-    lines = transcript_lines(chat)
-    rows = max(1, shutil.get_terminal_size((80, 24)).lines - RESERVED_ROWS)
+    lines = history_lines(chat)
+    rows = max(1, shutil.get_terminal_size((80, 24)).lines - RESERVED_ROWS - header_rows(chat))
     end = max(0, len(lines) - chat.scroll_back)
     return lines[max(0, end - rows):end]
 
@@ -142,6 +140,11 @@ def build(chat: Chat) -> Application:
             event.app.exit()
 
     input_window = Window(content=BufferControl(buffer=chat.input), height=1, dont_extend_height=True)
+    header = Window(
+        content=FormattedTextControl(lambda: banner(chat)),
+        height=lambda: header_rows(chat),
+        dont_extend_height=True,
+    )
     output = Window(
         content=FormattedTextControl(lambda: visible_pieces(chat), get_cursor_position=lambda: cursor_at_end(chat)),
         wrap_lines=True,
@@ -156,7 +159,7 @@ def build(chat: Chat) -> Application:
     box = HSplit([rule, VSplit([prompt, input_window]), rule])
     mode = Window(content=FormattedTextControl(lambda: mode_line(chat)), height=1)
     chat.app = Application(
-        layout=Layout(HSplit([output, box, mode]), focused_element=input_window),
+        layout=Layout(HSplit([header, output, box, mode]), focused_element=input_window),
         key_bindings=bindings,
         style=STYLE,
         full_screen=True,
