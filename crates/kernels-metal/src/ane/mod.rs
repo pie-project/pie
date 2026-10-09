@@ -13,11 +13,13 @@
 //! * [`Program`] and [`Binding`]: a compiled MIL program and its procedures
 //!   tied to surfaces.
 //! * [`Handoff`]: the shared event the two engines order their work on.
+//! * [`ffn`]: the MLP program itself, over those.
 
 use std::ffi::c_int;
 use std::path::PathBuf;
 
 mod event;
+pub mod ffn;
 mod program;
 mod surface;
 mod sys;
