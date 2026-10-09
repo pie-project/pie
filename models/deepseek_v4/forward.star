@@ -103,7 +103,6 @@ def draft(m, rows, streams, logits):
     y = ops.elemwise.rmsnorm(collapse(out, mtp.hc_head, hy), mtp.norm, mtp.norm_eps)
     proposal = ops.linear.lm_head(y, m.head)
     seam.at(seam.MTP, [proposal])
-    ops.layout.argmax([proposal])
     seam.at(seam.MTP_DRAFTS, [ops.layout.argmax([proposal])])
 
 def rope(x, pos, rope_dim, head_dim, theta, scaling, inverse = False):

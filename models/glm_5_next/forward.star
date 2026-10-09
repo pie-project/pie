@@ -88,7 +88,6 @@ def draft(m, inputs, y, positions, logits):
     r = ops.elemwise.residual_add(mlp(x, mtp.mlp, None), r)
     proposal = ops.linear.lm_head(ops.elemwise.rmsnorm(r, mtp.norm, mtp.norm_eps), m.head)
     seam.at(seam.MTP, [proposal])
-    ops.layout.argmax([proposal])
     seam.at(seam.MTP_DRAFTS, [ops.layout.argmax([proposal])])
 
 def predict_next(streams, following, hy):
