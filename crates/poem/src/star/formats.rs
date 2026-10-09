@@ -3,7 +3,7 @@
 //!
 //! A read is stated, not performed: `formats.star` names what lands where,
 //! and the builder the contract is built by performs it, refusing a missing or
-//! misshapen tensor exactly as a Rust import's reads do.
+//! misshapen tensor.
 
 use std::cell::RefCell;
 use std::fmt;

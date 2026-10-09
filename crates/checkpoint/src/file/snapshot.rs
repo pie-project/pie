@@ -105,7 +105,7 @@ fn json_file(path: &Path) -> Result<Value, Error> {
 
 /// A JSON value as the attribute value a source carries.
 #[must_use]
-pub fn cbor(json: &serde_json::Value) -> Value {
+fn cbor(json: &serde_json::Value) -> Value {
     match json {
         serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(b) => Value::Bool(*b),

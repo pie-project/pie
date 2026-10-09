@@ -61,7 +61,7 @@ impl Facts {
     pub fn flag(&mut self, name: &str) -> Guard {
         assert!(
             Request::FLAGS.contains(&name),
-            "no inferlet can set the flag `{name}` yet; the runtime carries {:?}",
+            "no inferlet can set the flag `{name}`; a request carries {:?}",
             Request::FLAGS,
         );
         self.bit_of(Fact::Flag(name.to_string()))
@@ -72,7 +72,7 @@ impl Facts {
     pub fn choice(&mut self, name: &str, value: &str) -> Guard {
         assert!(
             Request::CHOICES.contains(&name),
-            "no inferlet can set the choice `{name}` yet; the runtime carries {:?}",
+            "no inferlet can set the choice `{name}`; a request carries {:?}",
             Request::CHOICES,
         );
         self.bit_of(Fact::Choice {

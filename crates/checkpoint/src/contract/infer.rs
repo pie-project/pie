@@ -654,7 +654,7 @@ fn infer_fill(value: u32, ty: &TensorType) -> Result<TensorType, Error> {
     Ok(ty.clone())
 }
 
-fn infer_const(ty: &TensorType, bytes: &[u8]) -> Result<TensorType, Error> {
+pub(crate) fn infer_const(ty: &TensorType, bytes: &[u8]) -> Result<TensorType, Error> {
     if let Some(bad) = ty.shape.iter().find(|extent| **extent < 1) {
         return Err(Error::Contract(format!(
             "Const shape {:?} has a non-positive extent {bad}; a constant states \

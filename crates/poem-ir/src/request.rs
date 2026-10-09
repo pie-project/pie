@@ -60,10 +60,28 @@ pub struct Request {
 }
 
 impl Request {
-    /// The custom flags an inferlet can set today.
-    pub const FLAGS: [&'static str; 4] = ["drafts", "block_draft", "scores", "bidirectional"];
-    /// The custom choices an inferlet can set today.
-    pub const CHOICES: [&'static str; 2] = ["stream", "reading"];
+    /// The flag an inferlet sets on rows whose drafts it reads.
+    pub const DRAFTS: &'static str = "drafts";
+    /// The flag an inferlet sets on the rows of a drafted block.
+    pub const BLOCK_DRAFT: &'static str = "block_draft";
+    /// The flag an inferlet sets on rows whose attention scores it reads.
+    pub const SCORES: &'static str = "scores";
+    /// The flag an inferlet sets on rows that attend both ways.
+    pub const BIDIRECTIONAL: &'static str = "bidirectional";
+    /// The choice of the stream a lane's rows join.
+    pub const STREAM: &'static str = "stream";
+    /// The choice of the reading a pass runs.
+    pub const READING: &'static str = "reading";
+
+    /// The custom flags a request carries.
+    pub const FLAGS: [&'static str; 4] = [
+        Self::DRAFTS,
+        Self::BLOCK_DRAFT,
+        Self::SCORES,
+        Self::BIDIRECTIONAL,
+    ];
+    /// The custom choices a request carries.
+    pub const CHOICES: [&'static str; 2] = [Self::STREAM, Self::READING];
 
     #[must_use]
     pub fn new(query_len: u32, custom_mask: bool) -> Request {
@@ -183,10 +201,10 @@ impl Request {
     #[must_use]
     pub fn flag(&self, name: &str) -> bool {
         match name {
-            "drafts" => self.drafts,
-            "block_draft" => self.block_draft,
-            "scores" => self.captures_scores,
-            "bidirectional" => self.denoise,
+            Self::DRAFTS => self.drafts,
+            Self::BLOCK_DRAFT => self.block_draft,
+            Self::SCORES => self.captures_scores,
+            Self::BIDIRECTIONAL => self.denoise,
             _ => panic!("`{name}` is no flag a request carries"),
         }
     }
@@ -196,8 +214,8 @@ impl Request {
     #[must_use]
     pub fn choice(&self, name: &str) -> Option<&str> {
         match name {
-            "stream" => Some(self.stream.name()),
-            "reading" => self.reading(),
+            Self::STREAM => Some(self.stream.name()),
+            Self::READING => self.reading(),
             _ => panic!("`{name}` is no choice a request carries"),
         }
     }

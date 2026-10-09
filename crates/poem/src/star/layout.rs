@@ -73,13 +73,12 @@ pub(crate) fn layout(builder: &mut GlobalsBuilder) {
 
 #[starlark_module]
 pub(crate) fn numbers(builder: &mut GlobalsBuilder) {
-    /// `x` rounded to the nearest f32, as a model's Rust spelling computes.
+    /// `x` rounded to the nearest f32.
     fn f32(#[starlark(require = pos)] x: UnpackFloat) -> anyhow::Result<f64> {
         Ok(f64::from(x.0 as f32))
     }
 
-    /// `x` to the power `y`, both rounded to f32 and raised in f32, as a
-    /// model's Rust spelling computes.
+    /// `x` to the power `y`, both rounded to f32 and raised in f32.
     fn powf32(
         #[starlark(require = pos)] x: UnpackFloat,
         #[starlark(require = pos)] y: UnpackFloat,

@@ -1468,7 +1468,7 @@ fn agreed(src: &ztensor::Source, name: &str, expr: &Expr) -> Result<Encoding, Er
     Ok(first.clone())
 }
 
-pub fn stored_encoding(src: &ztensor::Source, name: &str) -> Result<Encoding, Error> {
+pub(crate) fn stored_encoding(src: &ztensor::Source, name: &str) -> Result<Encoding, Error> {
     let Some(tensor) = src.get(name) else {
         return Err(Error::Missing(name.to_string()));
     };
@@ -1562,36 +1562,27 @@ pub fn extents(w: &Weight) -> Vec<i64> {
         .collect()
 }
 
+/// `w`'s shape as the checkpoint holds it whole.
 fn whole(w: &Weight, tp: u32) -> Vec<i64> {
     let mut dims = extents(w);
-    match &w.shard {
-        Shard::Replicated => dims,
-        Shard::Cut {
-            axis,
-            segments,
-            heads,
-        } => {
-            let at = *axis as usize;
-            let dim = dims.get_mut(at).unwrap_or_else(|| {
-                panic!("`{}` is {:?} and its cut names axis {at}", w.name, w.shape)
-            });
-            let seams: u64 = segments.iter().sum();
-            assert_eq!(
-                u64::try_from(*dim).expect("an extent no u64 holds"),
-                seams,
-                "`{}`: its segments sum to {seams} and its axis {at} is {dim}",
-                w.name,
-            );
-            *dim = segments
-                .iter()
-                .enumerate()
-                .map(|(i, segment)| {
-                    leg_extent(*segment, cut_parts(w, heads.get(i).copied(), tp), &w.name)
-                })
-                .sum();
-            dims
-        }
+    if let Some((axis, bands)) = banding(w, tp) {
+        let at = axis as usize;
+        let seams: u64 = match &w.shard {
+            Shard::Cut { segments, .. } => segments.iter().sum(),
+            Shard::Replicated => unreachable!("a band is a cut's"),
+        };
+        let dim = dims
+            .get_mut(at)
+            .unwrap_or_else(|| panic!("`{}` is {:?} and its cut names axis {at}", w.name, w.shape));
+        assert_eq!(
+            u64::try_from(*dim).expect("an extent no u64 holds"),
+            seams,
+            "`{}`: its segments sum to {seams} and its axis {at} is {dim}",
+            w.name,
+        );
+        *dim = bands.iter().map(|(extent, _)| extent).sum();
     }
+    dims
 }
 
 pub fn divided(shape: &[i64], axis: u32, group: u32, name: &str) -> Vec<i64> {
@@ -1677,10 +1668,10 @@ fn pack_axis(w: &Weight) -> u8 {
     }
 }
 
-fn leg_extent(segment: u64, tp: u32, name: &str) -> i64 {
-    let whole = segment
-        .checked_mul(u64::from(tp))
-        .unwrap_or_else(|| panic!("`{name}`: a segment of {segment} is not {tp} times anything"));
+fn leg_extent(segment: u64, parts: u32, name: &str) -> i64 {
+    let whole = segment.checked_mul(u64::from(parts)).unwrap_or_else(|| {
+        panic!("`{name}`: a segment of {segment} is not {parts} times anything")
+    });
     i64::try_from(whole).expect("an extent no i64 holds")
 }
 

@@ -13,9 +13,9 @@ mod manifest;
 mod ops;
 mod package;
 mod run;
-pub mod values;
+mod values;
 
 pub use layout::with_env;
 pub use manifest::{Manifest, Model, Published};
-pub use package::{API, ATTRIBUTE, LIBRARY, Package, Stage};
+pub use package::{API, ATTRIBUTE, Package};
 pub use run::Deploy;

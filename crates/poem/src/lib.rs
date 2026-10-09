@@ -1,7 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod declare;
-pub mod facts;
+pub mod fact;
 pub mod forward;
 pub mod generative;
 pub mod import;
@@ -12,8 +12,7 @@ mod record;
 pub mod star;
 
 pub use declare::*;
-pub use facts as fact;
-pub use facts::Predicate;
+pub use fact::Predicate;
 pub use forward::*;
 pub use poem_ir::{
     Attention, BlockDrafter, CacheRow, Collective, Def, Dim, Dtype, Elementwise, GateActivation,

@@ -8,7 +8,7 @@ use poem_ir::{
 };
 
 use crate::declare::Weight;
-use crate::facts::Predicate;
+use crate::fact::Predicate;
 
 const UNCLAIMED: u32 = u32::MAX;
 
@@ -214,7 +214,7 @@ impl Recorder {
     }
 
     #[must_use]
-    pub fn seamed(&self, name: &str, value: &Value) -> bool {
+    pub(crate) fn seamed(&self, name: &str, value: &Value) -> bool {
         self.inner
             .borrow()
             .seams
@@ -290,10 +290,10 @@ fn unguarded_read(plan: &Trace) -> Option<String> {
         for id in &ins {
             let (builtin, what) = match &plan.values[id.0 as usize].def {
                 Def::Input(RuntimeInput::Mask { .. }) => {
-                    (poem_ir::Builtin::Masked, "fact::has(fact::Mask)")
+                    (poem_ir::Builtin::Masked, "fact.has(fact.Mask)")
                 }
                 Def::Input(RuntimeInput::AdapterRoutes) => {
-                    (poem_ir::Builtin::Adapted, "fact::has(fact::Adapter)")
+                    (poem_ir::Builtin::Adapted, "fact.has(fact.Adapter)")
                 }
                 _ => continue,
             };

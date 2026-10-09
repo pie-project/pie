@@ -7,22 +7,9 @@
 
 use std::ops::{BitAnd, Not};
 
-use poem_ir::{Builtin, Guard, Stream};
+use poem_ir::{Builtin, Guard, Request, Stream};
 
 pub use poem_ir::Builtin::{Adapted as Adapter, Masked as Mask, Media};
-
-/// The flag an inferlet sets on rows whose drafts it reads.
-pub const DRAFTS: &str = "drafts";
-/// The flag an inferlet sets on the rows of a drafted block.
-pub const BLOCK_DRAFT: &str = "block_draft";
-/// The flag an inferlet sets on rows whose attention scores it reads.
-pub const SCORES: &str = "scores";
-/// The flag an inferlet sets on rows that attend both ways.
-pub const BIDIRECTIONAL: &str = "bidirectional";
-/// The choice of the stream a lane's rows join.
-pub const STREAM: &str = "stream";
-/// The choice of the reading a pass runs.
-pub const READING: &str = "reading";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Predicate {
@@ -77,34 +64,34 @@ pub fn choice(name: &str, value: &str) -> Predicate {
 
 #[must_use]
 pub fn drafts() -> Predicate {
-    flag(DRAFTS)
+    flag(Request::DRAFTS)
 }
 
 #[must_use]
 pub fn block_draft() -> Predicate {
-    flag(BLOCK_DRAFT)
+    flag(Request::BLOCK_DRAFT)
 }
 
 #[must_use]
 pub fn scores() -> Predicate {
-    flag(SCORES)
+    flag(Request::SCORES)
 }
 
 #[must_use]
 pub fn bidirectional() -> Predicate {
-    flag(BIDIRECTIONAL)
+    flag(Request::BIDIRECTIONAL)
 }
 
 /// The rows of the stream `stream`.
 #[must_use]
 pub fn stream(stream: Stream) -> Predicate {
-    choice(STREAM, stream.name())
+    choice(Request::STREAM, stream.name())
 }
 
 /// The rows of the reading `name`.
 #[must_use]
 pub fn reading(name: &str) -> Predicate {
-    choice(READING, name)
+    choice(Request::READING, name)
 }
 
 impl BitAnd for Predicate {

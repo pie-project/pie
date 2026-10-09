@@ -203,12 +203,6 @@ impl Package {
         Package::new(&name, &files)
     }
 
-    /// The package in the directory `dir`, named after it: every `.star`
-    /// file in it, and the libraries of `../lib` beside it.
-    pub fn from_dir(dir: &std::path::Path) -> anyhow::Result<Package> {
-        Package::from_dir_with(dir, &dir.join("../lib"))
-    }
-
     /// The package's name.
     #[must_use]
     pub fn name(&self) -> &str {

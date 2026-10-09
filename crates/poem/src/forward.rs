@@ -3,7 +3,7 @@ use poem_ir::{
     ValueId,
 };
 
-use crate::facts::Predicate;
+use crate::fact::Predicate;
 use crate::record::{Recorder, Refine, Value};
 use crate::seam;
 

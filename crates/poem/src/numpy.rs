@@ -1,10 +1,6 @@
-//! `numpy.random.default_rng(seed).integers(0, high, size)` — bit for bit.
-//!
-//! DeepSeek's Engram derives its per-module n-gram hash multipliers from
-//! NumPy's default generator seeded by the module's layer id, so a checkpoint
-//! can only be hashed the way it was trained by reproducing NumPy's
-//! `SeedSequence` entropy mixing, the PCG64 (XSL-RR 128/64) stream, and the
-//! generator's Lemire bounded draw. Pinned against NumPy in the tests.
+//! `numpy.random.default_rng(seed).integers(0, high, size)`, bit for bit:
+//! NumPy's `SeedSequence` entropy mixing, the PCG64 (XSL-RR 128/64) stream and
+//! the generator's Lemire bounded draw, pinned against NumPy in the tests.
 
 const INIT_A: u32 = 0x43b0_d7e5;
 const MULT_A: u32 = 0x931e_8875;
@@ -19,7 +15,7 @@ const PCG_MULTIPLIER: u128 =
     ((2_549_297_995_355_413_924u128) << 64) | 4_865_540_595_714_422_341u128;
 
 /// `numpy.random.SeedSequence(entropy)` for an integer entropy.
-pub struct SeedSequence {
+struct SeedSequence {
     pool: [u32; POOL_SIZE],
 }
 
@@ -91,7 +87,7 @@ impl SeedSequence {
 }
 
 /// NumPy's `PCG64` bit generator: PCG XSL-RR 128/64 with the setseq stream.
-pub struct Pcg64 {
+struct Pcg64 {
     state: u128,
     inc: u128,
 }
@@ -143,7 +139,7 @@ impl Generator {
     /// `integers(low=0, high, size=count, dtype=np.int64)`: `count` draws
     /// uniform on `0..high` by the generator's Lemire rejection sampler.
     /// `high` must exceed 2^32 (the range the 64-bit sampler serves; NumPy
-    /// buffers 32-bit draws below it) — Engram's multiplier bound does.
+    /// buffers 32-bit draws below it).
     pub fn integers(&mut self, high: u64, count: usize) -> Vec<u64> {
         assert!(high > 0, "an empty range has no draws");
         let rng = high - 1;

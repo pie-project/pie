@@ -289,7 +289,7 @@ pub(crate) fn landing_requests(
 ) -> Vec<Vec<poem_ir::Request>> {
     let mut landing = vec![Vec::new(); classes.classes.len()];
     let readings: Vec<Option<&str>> = std::iter::once(None)
-        .chain(facts.values("reading").map(Some))
+        .chain(facts.values(poem_ir::Request::READING).map(Some))
         .collect();
     for reading in readings {
         for stream in poem_ir::Stream::ALL {

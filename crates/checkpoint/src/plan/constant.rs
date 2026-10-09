@@ -8,12 +8,12 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
 use crate::contract::{Expr, ModelContract};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::file::{File, Metadata, RawTensor};
 use crate::types::{CheckpointFormat, FileId, TensorId};
 
 /// The prefix a mounted constant's tensor is named under.
-pub const CONST_PREFIX: &str = "__const__/";
+pub(crate) const CONST_PREFIX: &str = "__const__/";
 
 /// `contract` with every constant read as a mounted source tensor, and
 /// `metadata` stating those tensors.
@@ -43,15 +43,7 @@ fn mount(expr: Expr, metadata: &mut Metadata) -> Result<Expr> {
     let Expr::Const { ty, bytes } = expr else {
         return expr.map_children(|child| mount(child, metadata));
     };
-    let want = ty.byte_size()?;
-    if bytes.len() as u64 != want {
-        return Err(Error::Contract(format!(
-            "Const of shape {:?} as {:?} is {want} bytes and carries {}",
-            ty.shape,
-            ty.encoding,
-            bytes.len()
-        )));
-    }
+    crate::contract::infer::infer_const(&ty, &bytes)?;
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     ty.shape.hash(&mut hasher);
