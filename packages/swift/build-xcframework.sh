@@ -17,6 +17,9 @@ esac
 
 # Package.swift's platforms, for the C dependencies too.
 export IPHONEOS_DEPLOYMENT_TARGET=26.0 IPHONESIMULATOR_DEPLOYMENT_TARGET=26.0 MACOSX_DEPLOYMENT_TARGET=26.0 XROS_DEPLOYMENT_TARGET=26.0
+# psm's assembly (stacker, under starlark) knows visionOS's Mach-O only by
+# iOS's name.
+export CFLAGS_aarch64_apple_visionos=-DCFG_TARGET_OS_ios CFLAGS_aarch64_apple_visionos_sim=-DCFG_TARGET_OS_ios
 
 slices=(aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-visionos aarch64-apple-visionos-sim aarch64-apple-darwin)
 for triple in "${slices[@]}"; do

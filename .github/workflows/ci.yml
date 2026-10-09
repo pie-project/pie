@@ -15,6 +15,9 @@ permissions:
 env:
   NPM_CONFIG_FUND: 'false'
   NPM_CONFIG_AUDIT: 'false'
+  # Line tables keep backtraces readable; full debug info overflows the
+  # runners' disks on a workspace build.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   workspace-lint:
@@ -37,16 +40,40 @@ jobs:
       # The worker an app embeds: no gateway or controller links.
       - name: cargo clippy (worker, embedded only)
         run: cargo clippy --no-deps --all-targets -p worker --no-default-features -- -D warnings
-      # engine-metal's device half is `cfg(target_vendor = "apple")`; clippy
-      # type-checks it for that target without a Mac.
-      - name: cargo clippy (engine-metal, Apple half)
-        run: cargo clippy --no-deps --all-targets -p engine-metal --target aarch64-apple-darwin -- -D warnings
+
+  apple:
+    name: "apple: engine-metal clippy + libpie for iOS and visionOS"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+        with:
+          cache-key: ${{ runner.os }}-apple
+      - run: rustup target add aarch64-apple-ios aarch64-apple-visionos
+      # engine-metal's device half is `cfg(target_vendor = "apple")`, and its
+      # C dependencies build only against an Apple SDK.
+      - name: cargo clippy (engine-metal)
+        run: cargo clippy --no-deps --all-targets -p engine-metal -- -D warnings
+      - name: cargo check (libpie for iOS and visionOS)
+        env:
+          # psm's assembly knows visionOS's Mach-O only by iOS's name.
+          CFLAGS_aarch64_apple_visionos: -DCFG_TARGET_OS_ios
+        run: |
+          cargo check -p pie-c --target aarch64-apple-ios
+          if xcrun --sdk xros --show-sdk-path >/dev/null 2>&1; then
+            cargo check -p pie-c --target aarch64-apple-visionos
+          else
+            echo "no visionOS SDK on this runner; skipped"
+          fi
 
   workspace-test:
     name: "workspace: build + test"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # A whole-workspace build needs more disk than the image leaves free.
+      - name: free disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build python3-yaml
       - uses: ./.github/actions/toolchain
         with:
@@ -288,6 +315,7 @@ jobs:
     name: "wgpu: serve on lavapipe"
     needs: languages
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
@@ -318,6 +346,7 @@ jobs:
   vulkan-serve:
     name: "vulkan: serve on lavapipe"
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain

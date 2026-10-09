@@ -399,7 +399,7 @@ dependencies = [
  "regex",
  "rustc-hash 2.1.3",
  "shlex",
- "syn 3.0.6",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -4252,7 +4252,6 @@ dependencies = [
 [[package]]
 name = "pagable"
 version = "0.4.2"
-source = "git+https://github.com/facebook/buck2.git?branch=main#03a23abe298a9407d497eebf1855b826df3da407"
 dependencies = [
  "allocative",
  "anyhow",
@@ -6368,7 +6367,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

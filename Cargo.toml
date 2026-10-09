@@ -101,6 +101,7 @@ default-members = [
 ]
 exclude = [
     "examples",
+    "third_party",
     "crates/builtins/inferlets",
     ".claude",
 ]
@@ -203,3 +204,8 @@ dbg_macro = "deny"
 inherits = "release"
 lto = "thin"
 strip = "symbols"
+
+# pagable with Android and Apple's other platforms let in; see
+# third_party/pagable/README.md.
+[patch."https://github.com/facebook/buck2.git"]
+pagable = { path = "third_party/pagable" }
