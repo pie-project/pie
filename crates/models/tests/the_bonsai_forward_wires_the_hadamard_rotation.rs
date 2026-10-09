@@ -1,4 +1,4 @@
-//! M3c: the Bonsai `d27b` forward wires the online-Hadamard rotation-undo at
+//! The Bonsai qwen36-27b forward wires the online-Hadamard rotation-undo at
 //! exactly the sites the fork rotates, keyed by input width — and every
 //! non-Bonsai deployment is byte-unchanged (no Hadamard appears).
 //!
@@ -74,7 +74,7 @@ fn tally(trace: &Trace) -> (usize, usize, (usize, usize, usize)) {
 #[test]
 fn the_bonsai_forward_wires_the_hadamard_rotation_every_case() {
     the_bonsai_flag_declares_three_width_keyed_sign_banks();
-    a_non_bonsai_d27b_wires_no_hadamard_on_any_platform();
+    a_non_bonsai_qwen36_27b_wires_no_hadamard_on_any_platform();
     the_bonsai_forward_rotates_every_site_by_input_width();
     the_attention_q_k_v_share_the_one_rotated_input();
 }
@@ -160,7 +160,7 @@ fn the_attention_q_k_v_share_the_one_rotated_input() {
     }
     assert!(
         checked >= 1,
-        "the d27b_bonsai trace carried no full-attention layer to guard",
+        "the qwen36-27b-bonsai trace carried no full-attention layer to guard",
     );
 }
 
@@ -176,7 +176,7 @@ fn the_bonsai_flag_declares_three_width_keyed_sign_banks() {
     let plain = trace_of("qwen36-27b", Dtype::Bf16, Dtype::Bf16, Platform::Metal);
     assert!(
         signs(&plain).is_empty(),
-        "a plain d27b arms no rotation and reads no signs",
+        "a plain qwen36-27b arms no rotation and reads no signs",
     );
 
     let b = trace_of(
@@ -202,18 +202,18 @@ fn the_bonsai_flag_declares_three_width_keyed_sign_banks() {
     }
 }
 
-fn a_non_bonsai_d27b_wires_no_hadamard_on_any_platform() {
+fn a_non_bonsai_qwen36_27b_wires_no_hadamard_on_any_platform() {
     for platform in [Platform::Metal, Platform::Cuda] {
         let trace = trace_of("qwen36-27b", Dtype::Bf16, Dtype::Bf16, platform);
         let (total, ..) = tally(&trace);
         assert_eq!(
             total, 0,
-            "a non-Bonsai d27b must be byte-unchanged: it wires no Hadamard, found {total} on {platform:?}",
+            "a non-Bonsai qwen36-27b must be byte-unchanged: it wires no Hadamard, found {total} on {platform:?}",
         );
     }
 
-    // The whole shipped catalog stays Hadamard-free (the flag lives only on the
-    // test-level Bonsai instance).
+    // No listed deployment is the Bonsai model, so the whole catalog stays
+    // Hadamard-free.
     for row in models::deployments().chain(models::splits()) {
         let trace = row.trace(Platform::Metal);
         let (total, ..) = tally(&trace);

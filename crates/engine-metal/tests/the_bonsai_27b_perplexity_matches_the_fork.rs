@@ -104,7 +104,7 @@ fn import_zt(gguf: &Path, out: &Path) {
         &src,
         Platform::Metal,
     )
-    .expect("the d27b_bonsai contract reads every plane of the Bonsai GGUF");
+    .expect("the qwen36-27b-bonsai contract reads every plane of the Bonsai GGUF");
     drop(src);
 
     let target = StorageTarget {
@@ -224,9 +224,6 @@ fn the_bonsai_27b_perplexity_matches_the_fork() {
         }
         Err(other) => panic!("the Bonsai shell loads: {other}"),
     };
-
-    // The three RHT sign diagonals ride in the artifact, decoded from the
-    // GGUF's metadata at import: nothing binds them at load.
 
     // Teacher-forced NLL, mirroring the fork's per-chunk window.
     let started = std::time::Instant::now();

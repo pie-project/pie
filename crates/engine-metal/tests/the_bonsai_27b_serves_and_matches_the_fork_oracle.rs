@@ -29,8 +29,7 @@
 //!      the norms fold `-1`, the fused GDN/attn projections concat, the GDN
 //!      v-heads reorder tiled→block when `gdn_v_grouped` is set, and the three
 //!      RHT sign diagonals are decoded from the GGUF metadata into constants the
-//!      artifact carries) — cached so the 6 GB decode runs once (an artifact
-//!      cached before the signs rode in it must be imported again);
+//!      artifact carries) — cached so the 6 GB decode runs once;
 //!   2. builds the `qwen36-27b-bonsai` PTQ1_0 forward trace (the online
 //!      Hadamard rotation-undo at every rotated site; the v-head reorder is
 //!      folded into the weights at import, not the trace);
@@ -111,7 +110,7 @@ fn import_zt(gguf: &Path, out: &Path) {
         &src,
         Platform::Metal,
     )
-    .expect("the d27b_bonsai contract reads every plane of the Bonsai GGUF");
+    .expect("the qwen36-27b-bonsai contract reads every plane of the Bonsai GGUF");
     drop(src);
 
     let target = StorageTarget {
@@ -220,7 +219,7 @@ fn the_bonsai_27b_serves_ptq1_0_and_matches_the_fork_oracle() {
     let zt = zt_path(&gguf);
     import_zt(&gguf, &zt);
 
-    // The forward trace: d27b_bonsai in PTQ1_0, the rotation-undo armed.
+    // The forward trace: qwen36-27b-bonsai in PTQ1_0, the rotation-undo armed.
     let trace = trace_of(
         "qwen36-27b-bonsai",
         Dtype::Ptq1_0,
@@ -270,9 +269,6 @@ fn the_bonsai_27b_serves_ptq1_0_and_matches_the_fork_oracle() {
         shell.weights_warm(),
         shell.weight_windows()
     );
-
-    // The three RHT sign diagonals ride in the artifact, decoded from the
-    // GGUF's metadata at import: nothing binds them at load.
 
     // Fire the exact fork prompt (no BOS, greedy readout of the last token) as a
     // single chunked prefill.
