@@ -3,7 +3,7 @@
 
 use poem::ops::{attn, elemwise, layout, linear};
 use poem::pattern::{Pattern, Template, template};
-use poem_ir::ops::elemwise::PostNorm;
+use poem_ir::ops::fused::PostNorm;
 use poem_ir::{Dim, Dtype, Elementwise, Fused, ModulateForm, NormKind, Operation, Ty};
 
 use super::Rule;
@@ -97,9 +97,8 @@ fn qkv_qknorm_rope_vnorm_write() -> Rule {
                 packed: m.value("packed"),
                 positions: m.value("positions"),
                 q_norm_weight: m.value("q_norm"),
-                q_norm_eps: m.f32("eps"),
                 k_norm_weight: m.value("k_norm"),
-                k_norm_eps: m.f32("eps"),
+                eps: m.f32("eps"),
                 cache: m.value("cache"),
                 write_page: m.value("write_page"),
                 write_offset: m.value("write_offset"),

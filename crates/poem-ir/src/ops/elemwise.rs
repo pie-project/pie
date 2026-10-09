@@ -12,14 +12,6 @@ pub struct Yarn {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PostNorm {
-    pub weight: ValueId,
-    pub plus_one: bool,
-    pub eps: f32,
-    pub out: ValueId,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Elementwise {
     Rmsnorm {
         x: ValueId,
@@ -371,12 +363,6 @@ impl ModulateForm {
             ModulateForm::Scale | ModulateForm::TanhGate => 1,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum NormKind {
-    Layernorm { eps: f32 },
-    Rmsnorm { head_dim: u32, eps: f32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -13,8 +13,8 @@ pub mod spatial;
 
 pub use attn::{Attention, RaggedMask};
 pub use collective::Collective;
-pub use elemwise::{Elementwise, GateActivation, ModulateForm, MropeForm, NormKind, RopeForm};
-pub use fused::Fused;
+pub use elemwise::{Elementwise, GateActivation, ModulateForm, MropeForm, RopeForm};
+pub use fused::{Fused, NormKind};
 pub use layout::Layout;
 pub use linear::Linear;
 pub use spatial::{GridRule, Spatial, TimePad, VoxelSegment};

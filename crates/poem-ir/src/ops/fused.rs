@@ -1,8 +1,22 @@
 use serde::{Deserialize, Serialize};
 
 use crate::operands::Operands;
-use crate::ops::elemwise::{ModulateForm, NormKind, PostNorm};
+use crate::ops::elemwise::ModulateForm;
 use crate::value::ValueId;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PostNorm {
+    pub weight: ValueId,
+    pub plus_one: bool,
+    pub eps: f32,
+    pub out: ValueId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum NormKind {
+    Layernorm { eps: f32 },
+    Rmsnorm { head_dim: u32, eps: f32 },
+}
 
 /// Ops only the compiler forms, from the primitive ones a model writes; each
 /// is a kernel some backend ships.
@@ -110,9 +124,9 @@ pub enum Fused {
         packed: ValueId,
         positions: ValueId,
         q_norm_weight: ValueId,
-        q_norm_eps: f32,
         k_norm_weight: ValueId,
-        k_norm_eps: f32,
+        /// The one epsilon both head norms and the v norm use.
+        eps: f32,
         cache: ValueId,
         write_page: ValueId,
         write_offset: ValueId,
@@ -260,6 +274,8 @@ impl Operands for Fused {
             Self::MatmulGeglu { .. } | Self::QkvFusedQknormRopeVnormWrite { .. } => {}
         }
     }
+    // The name a backend keys its kernel by (seat tables, `FUSED` lists), in
+    // the family that kernel ships in.
     fn name(&self) -> &'static str {
         match self {
             Self::ResidualAddRmsnorm { .. } => "elementwise.residual_add_rmsnorm",
