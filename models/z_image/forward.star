@@ -2,9 +2,143 @@
 # refiner over the caption, the denoiser over the image and the refined
 # context jointly, and the VAE's decode and encode, each its own reading.
 
-load("//lib/diffusion/forward.star", "attend", "chunks", "linear")
-load("//lib/flux_vae/forward.star", vae_decode = "decode", vae_encode = "encode")
-load("//lib/qwen3_text/forward.star", qwen3_caches = "caches", qwen3_encode = "encode")
+def linear(w, x):
+    """`x` through the projection `w`, plus its bias if it has one."""
+    y = ops.linear.matmul(x, w.w)
+    if w.bias == None:
+        return y
+    return ops.elemwise.add_bias(w.bias, y)
+
+def chunks(x, widths):
+    """`x`'s rows cut into consecutive pieces of `widths`, the last one
+    whatever remains."""
+    out = []
+    for width in widths[:-1]:
+        head, x = ops.layout.split_rows(x, width)
+        out.append(head)
+    out.append(x)
+    return out
+
+def attend(q, k, v, rows, over, head_dim, sm_scale, mask):
+    """`q`'s rows attending `k` and `v`'s, each side grouped by its own
+    `perm` and `csr`."""
+    o = ops.attn.ragged(
+        ops.layout.pack_rows(q, rows.perm),
+        ops.layout.pack_rows(k, over.perm),
+        ops.layout.pack_rows(v, over.perm),
+        rows.csr,
+        over.csr,
+        head_dim,
+        sm_scale,
+        mask,
+    )
+    return ops.layout.unpack_rows(o, rows.perm)
+
+GN_GROUPS = 32
+
+GN_EPS = 1e-6
+
+RGB = 3
+
+def convolve(x, grid, c):
+    shape = conv([1, 1], [1, 1], [0, 0]) if c.taps == 1 else conv([3, 3], [1, 1], [1, 1])
+    return ops.spatial.conv3d(x, grid, c.w, c.bias, shape, None)[0]
+
+def group_norm(x, grid, n, silu):
+    return ops.spatial.group_norm(x, grid, GN_GROUPS, n.weight, n.bias, GN_EPS, silu)
+
+def resnet(x, grid, r):
+    h = group_norm(x, grid, r.norm1, True)
+    h = convolve(h, grid, r.conv1)
+    h = group_norm(h, grid, r.norm2, True)
+    h = convolve(h, grid, r.conv2)
+    skip = convolve(x, grid, r.shortcut) if r.shortcut != None else x
+    return ops.elemwise.add(skip, h)
+
+def attention(x, grid, a):
+    h = group_norm(x, grid, a.norm, False)
+    q = linear(a.q, h)
+    k = linear(a.k, h)
+    v = linear(a.v, h)
+    o = ops.spatial.attention(q, k, v, grid, f32(1.0 / f32(sqrt(a.width))))
+    return ops.elemwise.add(x, linear(a.out, o))
+
+def mid(x, grid, m):
+    h = resnet(x, grid, m.res0)
+    h = attention(h, grid, m.attn)
+    return resnet(h, grid, m.res1)
+
+def vae_decode(vae, z, grid):
+    """The pixels the decoder makes of the latent `z`, read out."""
+    d = vae.decoder
+    h = convolve(z, grid, d.conv_in)
+    h = mid(h, grid, d.mid)
+    for block in d.up:
+        for res in block.resnets:
+            h = resnet(h, grid, res)
+        if block.upsample != None:
+            up, grid = ops.spatial.upsample_nearest(h, grid, [1, 2, 2], False)
+            h = convolve(up, grid, block.upsample)
+    h = group_norm(h, grid, d.norm_out, True)
+    y = convolve(h, grid, d.conv_out)
+    seam.at(seam.PIXELS, [y, grid])
+    return y
+
+def vae_encode(vae, arm):
+    """The encoder's output over `arm`'s pixels, and its grid."""
+    e = vae.encoder
+    grid = arm.grid()
+    x = arm.voxels(1, RGB, dtype.bf16)
+    h = convolve(x, grid, e.conv_in)
+    for block in e.down:
+        for res in block.resnets:
+            h = resnet(h, grid, res)
+        if block.downsample != None:
+            c = block.downsample
+            h, grid = ops.spatial.conv3d(h, grid, c.w, c.bias, conv([3, 3], [2, 2], [0, 0], pad_back = [0, 1, 1]), None)
+    h = mid(h, grid, e.mid)
+    h = group_norm(h, grid, e.norm_out, True)
+    return convolve(h, grid, e.conv_out), grid
+
+def qwen3_caches(te, c, kv):
+    space = c.kv_space(kv)
+    plane = te.kv_heads * te.head_dim
+    for layer in te.layers:
+        c.kv(space, layer.kv, [plane, plane], te.head_dim, heads = True)
+
+def qwen3_encode(arm, te, tap = None):
+    """The encoder over `arm`'s tokens. `tap(l, y)` sees each layer's output
+    rows and reads the encoder out; without one, the last layer's rows are
+    its readout."""
+    plan = ops.attn.plan_prefill(arm, te.q_heads, te.kv_heads, te.head_dim, None)
+    ids = arm.tokens()
+    positions = arm.positions()
+    y = ops.layout.embed(ids, te.embed, te.vocab)
+    last = len(te.layers) - 1
+
+    def layer(l, w, y):
+        pages = arm.kv(w.kv)
+        x = ops.elemwise.rmsnorm(y, w.attn_norm, te.eps)
+        q = ops.linear.matmul(x, w.q)
+        k = ops.linear.matmul(x, w.k)
+        v = ops.linear.matmul(x, w.v)
+        q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, te.head_dim, te.eps)
+        k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, te.head_dim, te.eps)
+        q, k = ops.elemwise.rope_full(q, k, positions, te.head_dim, te.theta, False)
+        ops.attn.kv_append(k, v, pages, arm.write_page(w.kv), arm.write_offset(w.kv))
+        o = ops.attn.prefill(q, plan, pages, None, te.head_dim, te.kv_heads, te.sm_scale)
+        y = ops.elemwise.residual_add(ops.linear.matmul(o, w.o), y)
+
+        x = ops.elemwise.rmsnorm(y, w.mlp_norm, te.eps)
+        f = ops.linear.matmul(ops.linear.mlp_swiglu(ops.linear.matmul(x, w.gate_up), te.inter), w.down)
+        y = ops.elemwise.residual_add(f, y)
+        if tap != None:
+            tap(l, y)
+        elif l == last:
+            seam.at(seam.HIDDEN, [y])
+        return y
+
+    arm.fold_layers(te.layers, y, layer)
 
 T_MAX_PERIOD = 10000.0
 NORM_EPS = 1e-5

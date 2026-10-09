@@ -1,8 +1,95 @@
 # The forward of Kimi-K3: each layer's mixer (MLA or KDA) and MLP read a
 # blend of the residual stream's closed AttnRes blocks.
 
-load("//lib/kda/forward.star", kda = "mixer", kda_caches = "caches")
-load("//lib/mla/forward.star", "attend", "cache", "plans")
+def kda_caches(c, k):
+    """`k`'s convolution window and its f32 delta-rule state."""
+    width = k.heads * k.head_dim
+    c.state(k.conv_state, [k.conv_kernel, 3 * width], dtype.bf16, split = 1)
+    c.state(k.delta_state, [k.heads, k.head_dim, k.head_dim], dtype.f32, split = 0)
+
+def kda(x, inputs, k):
+    conv = inputs.state(k.conv_state)
+    delta = inputs.state(k.delta_state)
+    qkv = ops.linear.matmul(x, k.qkv)
+    f = ops.linear.matmul(ops.linear.matmul(x, k.f_a), k.f_b)
+    b = ops.linear.matmul(x, k.b)
+    seam.at(seam.RECURRENT, [qkv])
+
+    one = fact.single_token()
+    step = ops.attn.ssm_kda_step(
+        ops.attn.ssm_causal_conv1d(qkv.on(one), k.conv, conv, k.conv_kernel),
+        f.on(one),
+        b.on(one),
+        k.dt_bias,
+        k.a_log,
+        delta,
+        k.heads,
+        k.head_dim,
+        k.norm_eps,
+        k.gate_floor,
+    )
+    chunked = ops.attn.ssm_kda_chunked(
+        ops.attn.ssm_causal_conv1d_chunked(qkv.on(~one), k.conv, conv, k.conv_kernel),
+        f.on(~one),
+        b.on(~one),
+        k.dt_bias,
+        k.a_log,
+        delta,
+        k.heads,
+        k.head_dim,
+        k.norm_eps,
+        k.gate_floor,
+    )
+    core = merge([step, chunked])
+
+    g = x
+    for proj in k.gate:
+        g = ops.linear.matmul(g, proj)
+    o = ops.elemwise.rmsnorm_gated_by(core, g, k.o_norm, k.heads, k.o_norm_eps)
+    return ops.linear.matmul(o, k.o_proj)
+
+def cache(c, space, a):
+    """`a`'s latent rows in the kv `space`."""
+    c.kv(space, a.kv, [a.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
+
+def plans(inputs, heads, kv_lora_rank):
+    """The decode and prefill arms' plans over `inputs`."""
+    one = fact.single_token()
+    decode, prefill = inputs.on(one), inputs.on(~one)
+    return struct(
+        decode = ops.attn.mla_plan(decode, heads, kv_lora_rank),
+        prefill = ops.attn.mla_plan(prefill, heads, kv_lora_rank),
+    )
+
+def attend(x, q_nope, q_pe, pages, plan, a, selection = None):
+    """The split queries `q_nope`/`q_pe` of the rows `x` scored against the
+    latent `pages` (or the `selection` of them), through `a`'s output
+    projection. A plan with no decode arm reads its rows whole."""
+    q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
+    seam.at(seam.ATTN_Q, [q])
+
+    if plan.decode == None:
+        scored = arm(False, q, plan.prefill, q_pe, selection, pages, a)
+    else:
+        one = fact.single_token()
+        on = lambda rows, holds: rows.on(holds) if rows != None else None
+        scored = merge([
+            arm(True, q.on(one), plan.decode, q_pe.on(one), on(selection, one), pages, a),
+            arm(False, q.on(~one), plan.prefill, q_pe.on(~one), on(selection, ~one), pages, a),
+        ])
+
+    o = ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
+    if a.gate != None:
+        o = ops.elemwise.gate_sigmoid_mul(o, ops.linear.matmul(x, a.gate))
+    seam.at(seam.ATTN_OUT, [o])
+    return ops.linear.matmul(o, a.o_proj)
+
+def arm(decode, q, plan, q_pe, selection, pages, a):
+    if selection == None:
+        score = ops.attn.mla_decode if decode else ops.attn.mla_prefill
+        return score(q, plan, q_pe, pages, a.heads, a.kv_lora_rank, a.sm_scale)
+    score = ops.attn.mla_decode_selected if decode else ops.attn.mla_prefill_selected
+    return score(q, plan, q_pe, selection, pages, a.heads, a.kv_lora_rank, a.sm_scale)
 
 def caches(m, c):
     kv = c.kv_space(m.kv)

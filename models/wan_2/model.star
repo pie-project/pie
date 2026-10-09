@@ -1,7 +1,29 @@
 # The weights of Wan 2.2: a diffusion transformer over video latents with
 # cross-attention to text, its UMT5-XXL text encoder, and its causal 3D VAE.
 
-load("//lib/diffusion/model.star", "embedder", "linear", "packed_linear")
+def linear(name, out, in_, banks, bias = True):
+    """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
+    return struct(
+        w = weight(name, [out, in_], banks),
+        bias = weight(name + ".bias", [out], compute(banks)) if bias else None,
+    )
+
+def packed_linear(name, seams, in_, banks):
+    """A biased projection whose output is the `seams`-wide pieces end to end."""
+    out = 0
+    for s in seams:
+        out += s
+    return struct(
+        w = weight(name, [out, in_], banks).packed(seams),
+        bias = weight(name + ".bias", [out], compute(banks)).packed(seams),
+    )
+
+def embedder(prefix, in_, dim, banks):
+    """A two-layer timestep (or caption) embedder from `in_` to `dim`."""
+    return struct(
+        linear_1 = linear(prefix + ".1", dim, in_, banks),
+        linear_2 = linear(prefix + ".2", dim, dim, banks),
+    )
 
 PATCH_T = 1
 PATCH_H = 2

@@ -2,8 +2,161 @@
 # single-stream blocks over both; a Qwen3 4B text encoder whose three tapped
 # layers project into the context; and a VAE with a batch-normed latent.
 
-load("//lib/flux_vae/model.star", flux_vae = "vae", vae_conv = "conv")
-load("//lib/qwen3_text/model.star", "QWEN3_4B", "encoder")
+def linear(name, out, in_, banks, bias = True):
+    """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
+    return struct(
+        w = weight(name, [out, in_], banks),
+        bias = weight(name + ".bias", [out], compute(banks)) if bias else None,
+    )
+
+BLOCKS = [128, 256, 512, 512]
+
+LAYERS_PER_BLOCK = 2
+
+
+TAPS3 = 9
+
+def vae_conv(name, c_out, c_in, taps):
+    return struct(
+        w = weight(name, [c_out, c_in * taps], dtype.bf16).conv_taps_major(c_in, taps),
+        bias = weight(name + ".bias", [c_out], dtype.f32),
+        c_in = c_in,
+        c_out = c_out,
+        taps = taps,
+    )
+
+def group_norm(name, c):
+    return struct(
+        weight = weight(name + ".weight", [c], dtype.f32),
+        bias = weight(name + ".bias", [c], dtype.f32),
+    )
+
+def resnet(name, c_in, c_out):
+    return struct(
+        norm1 = group_norm(name + ".norm1", c_in),
+        conv1 = vae_conv(name + ".conv1", c_out, c_in, TAPS3),
+        norm2 = group_norm(name + ".norm2", c_out),
+        conv2 = vae_conv(name + ".conv2", c_out, c_out, TAPS3),
+        shortcut = vae_conv(name + ".shortcut", c_out, c_in, 1) if c_in != c_out else None,
+    )
+
+def mid(name, c):
+    return struct(
+        res0 = resnet(name + ".res0", c, c),
+        attn = struct(
+            norm = group_norm(name + ".attn.norm", c),
+            q = linear(name + ".attn.q", c, c, dtype.bf16),
+            k = linear(name + ".attn.k", c, c, dtype.bf16),
+            v = linear(name + ".attn.v", c, c, dtype.bf16),
+            out = linear(name + ".attn.out", c, c, dtype.bf16),
+            width = c,
+        ),
+        res1 = resnet(name + ".res1", c, c),
+    )
+
+def flux_vae(channels, encoder_out, latent):
+    """The VAE whose decoder takes `channels` and whose encoder gives
+    `encoder_out`; `latent()` lays out what carries a latent to and from
+    them."""
+    top = BLOCKS[-1]
+    up = []
+    c_prev = top
+    for i, c in enumerate(reversed(BLOCKS)):
+        name = "vae.dec.up{}".format(i)
+        resnets = []
+        for r in range(LAYERS_PER_BLOCK + 1):
+            resnets.append(resnet("{}.res{}".format(name, r), c_prev, c))
+            c_prev = c
+        last = i + 1 == len(BLOCKS)
+        up.append(struct(
+            resnets = resnets,
+            upsample = vae_conv(name + ".upsample", c, c, TAPS3) if not last else None,
+        ))
+    down = []
+    c_prev = BLOCKS[0]
+    for i, c in enumerate(BLOCKS):
+        name = "vae.enc.down{}".format(i)
+        resnets = []
+        for r in range(LAYERS_PER_BLOCK):
+            resnets.append(resnet("{}.res{}".format(name, r), c_prev, c))
+            c_prev = c
+        last = i + 1 == len(BLOCKS)
+        down.append(struct(
+            resnets = resnets,
+            downsample = vae_conv(name + ".downsample", c, c, TAPS3) if not last else None,
+        ))
+    return struct(
+        latent = latent(),
+        decoder = struct(
+            conv_in = vae_conv("vae.dec.conv_in", top, channels, TAPS3),
+            mid = mid("vae.dec.mid", top),
+            up = up,
+            norm_out = group_norm("vae.dec.norm_out", BLOCKS[0]),
+            conv_out = vae_conv("vae.dec.conv_out", RGB, BLOCKS[0], TAPS3),
+        ),
+        encoder = struct(
+            conv_in = vae_conv("vae.enc.conv_in", BLOCKS[0], RGB, TAPS3),
+            down = down,
+            mid = mid("vae.enc.mid", top),
+            norm_out = group_norm("vae.enc.norm_out", top),
+            conv_out = vae_conv("vae.enc.conv_out", encoder_out, top, TAPS3),
+        ),
+    )
+
+QWEN3_4B = struct(
+    hidden = 2560,
+    vocab = 151936,
+    q_heads = 32,
+    kv_heads = 8,
+    head_dim = 128,
+    inter = 9728,
+    theta = 1000000.0,
+    eps = 1e-6,
+)
+
+def encoder(c, layers, banks, sharded = False):
+    """The encoder of config `c` through its first `layers` layers; with
+    `sharded`, its attention and mlp split across ranks."""
+    dense = compute(banks)
+    hidden, hd, inter = c.hidden, c.head_dim, c.inter
+
+    def columns(w, heads = None):
+        if not sharded:
+            return w
+        return w.columns() if heads == None else w.columns(heads = heads)
+
+    def rows(w):
+        return w.rows() if sharded else w
+
+    def layer(l):
+        n = lambda s: "te.layer.{}.{}".format(l, s)
+        return struct(
+            attn_norm = weight(n("attn_norm"), [hidden], dense),
+            q = columns(weight(n("q"), [c.q_heads * hd, hidden], banks)),
+            k = columns(weight(n("k"), [c.kv_heads * hd, hidden], banks), c.kv_heads),
+            v = columns(weight(n("v"), [c.kv_heads * hd, hidden], banks), c.kv_heads),
+            o = rows(weight(n("o"), [hidden, c.q_heads * hd], banks)),
+            q_norm = weight(n("q_norm"), [hd], dense),
+            k_norm = weight(n("k_norm"), [hd], dense),
+            mlp_norm = weight(n("mlp_norm"), [hidden], dense),
+            gate_up = weight(n("gate_up"), [2 * inter, hidden], banks).packed([inter, inter]),
+            down = rows(weight(n("down"), [hidden, inter], banks)),
+            kv = "te.kv.{}".format(l),
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = c.vocab,
+        q_heads = c.q_heads,
+        kv_heads = c.kv_heads,
+        head_dim = hd,
+        inter = inter,
+        theta = c.theta,
+        eps = c.eps,
+        sm_scale = f32(1.0 / f32(sqrt(hd))),
+        embed = weight("te.embed", [c.vocab, hidden], banks),
+        layers = [layer(l) for l in range(layers)],
+    )
 
 IN_CHANNELS = 128
 VAE_CHANNELS = 32

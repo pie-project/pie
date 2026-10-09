@@ -2,7 +2,12 @@
 # and the canvas rows it denoises; the `image.in` and `image.out` readings
 # run its U-Net ends over a latent clip and the trunk's rows.
 
-load("//lib/diffusion/forward.star", "linear")
+def linear(w, x):
+    """`x` through the projection `w`, plus its bias if it has one."""
+    y = ops.linear.matmul(x, w.w)
+    if w.bias == None:
+        return y
+    return ops.elemwise.add_bias(w.bias, y)
 
 NORM_EPS = 1e-5
 ROPE_THETA = 10000.0

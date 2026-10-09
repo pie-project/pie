@@ -3,8 +3,42 @@
 # bare transformer state_dict. The fused qkv interleaves q, k and v head by
 # head, and the adaLN projections' slices come in another order.
 
-load("//lib/diffusion/formats.star", "adaln_order", "biased", "reordered")
-load("//lib/qwen3_text/formats.star", te_read = "read")
+def biased(reads, w, stem):
+    """The projection `w` from `stem.weight`, and its bias (if any) from
+    `stem.bias`."""
+    reads.read(w.w, stem + ".weight")
+    if w.bias != None:
+        reads.read(w.bias, stem + ".bias")
+
+def adaln_order(slices):
+    """The order a layout takes an adaLN projection's `slices` slices in
+    from a checkpoint's: each (shift, scale) pair as (scale, shift), each
+    gate where it stands."""
+    return {
+        2: [1, 0],
+        3: [1, 0, 2],
+        6: [1, 0, 2, 4, 3, 5],
+        9: [1, 0, 2, 4, 3, 5, 7, 6, 8],
+    }[slices]
+
+def reordered(e, order, width, axis = 0):
+    """`e`'s `width`-wide slices along `axis`, taken in `order`."""
+    return concat(axis, [e.slice(axis, i * width, width) for i in order])
+
+def te_read(reads, te, prefix):
+    reads.read(te.embed, prefix + "embed_tokens.weight")
+    for l, w in enumerate(te.layers):
+        n = lambda s: "{}layers.{}.{}".format(prefix, l, s)
+        reads.read(w.attn_norm, n("input_layernorm.weight"))
+        reads.read(w.q, n("self_attn.q_proj.weight"))
+        reads.read(w.k, n("self_attn.k_proj.weight"))
+        reads.read(w.v, n("self_attn.v_proj.weight"))
+        reads.read(w.o, n("self_attn.o_proj.weight"))
+        reads.read(w.q_norm, n("self_attn.q_norm.weight"))
+        reads.read(w.k_norm, n("self_attn.k_norm.weight"))
+        reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
+        reads.read_concat(w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+        reads.read(w.down, n("mlp.down_proj.weight"))
 
 ADALN_SLICES = 6
 PIPELINE = "a MiniMax H3 partition (`dit.`/`te.` prefixes)"

@@ -3,9 +3,188 @@
 # vision tower's patches scattered into the embedded rows; and the MTP head
 # drafting from the trunk's last hidden rows.
 
-load("//lib/hyper/forward.star", "gate", "predict_route", "summed")
-load("//lib/kda/forward.star", kda = "mixer", kda_caches = "caches")
-load("//lib/mla/forward.star", "attention", "boundaries", "cache", "plans", "whole")
+# How many experts the next layer's router is predicted to take.
+PREDICT_K = 16
+
+def mixes(normed, mix, hy):
+    """`mix`'s per-row mixes of the `normed` streams: its dynamic
+    projection, or with none the leading rows of the streams."""
+    if mix.dynamic != None:
+        return ops.elemwise.hc_project(normed, mix.dynamic, hy.streams)
+    head, _ = ops.layout.split_rows(normed, mix.base.shape[0])
+    return head
+
+def gate(streams, mix, hy):
+    """The sublayer input `mix` reads out of `streams`, and the post and
+    combine mixes its output is folded back with."""
+    normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
+    return ops.elemwise.hc_gates(
+        mixes(normed, mix, hy),
+        streams,
+        mix.scale,
+        mix.base,
+        hy.streams,
+        hy.gate_eps,
+        hy.alpha,
+        hy.sinkhorn,
+    )
+
+def summed(streams, hidden, count):
+    """The `count` streams, each `hidden` wide, added into one row."""
+    y, rest = ops.layout.split_rows(streams, hidden)
+    for _ in range(1, count - 1):
+        stream, rest = ops.layout.split_rows(rest, hidden)
+        y = ops.elemwise.residual_add(stream, y)
+    return ops.elemwise.residual_add(rest, y)
+
+def predict_route(streams, hy, mix, norm, norm_eps, router, bias, experts):
+    """The experts a following MLP's router is predicted to take: the
+    streams through its `mix` and `norm`, scored by its `router`."""
+    x, _, _ = gate(streams, mix, hy)
+    x = ops.elemwise.rmsnorm(x, norm, norm_eps)
+    logits = ops.linear.matmul(x, router)
+    return ops.linear.moe_predict_route(logits, bias, experts, PREDICT_K)
+
+def kda_caches(c, k):
+    """`k`'s convolution window and its f32 delta-rule state."""
+    width = k.heads * k.head_dim
+    c.state(k.conv_state, [k.conv_kernel, 3 * width], dtype.bf16, split = 1)
+    c.state(k.delta_state, [k.heads, k.head_dim, k.head_dim], dtype.f32, split = 0)
+
+def kda(x, inputs, k):
+    conv = inputs.state(k.conv_state)
+    delta = inputs.state(k.delta_state)
+    qkv = ops.linear.matmul(x, k.qkv)
+    f = ops.linear.matmul(ops.linear.matmul(x, k.f_a), k.f_b)
+    b = ops.linear.matmul(x, k.b)
+    seam.at(seam.RECURRENT, [qkv])
+
+    one = fact.single_token()
+    step = ops.attn.ssm_kda_step(
+        ops.attn.ssm_causal_conv1d(qkv.on(one), k.conv, conv, k.conv_kernel),
+        f.on(one),
+        b.on(one),
+        k.dt_bias,
+        k.a_log,
+        delta,
+        k.heads,
+        k.head_dim,
+        k.norm_eps,
+        k.gate_floor,
+    )
+    chunked = ops.attn.ssm_kda_chunked(
+        ops.attn.ssm_causal_conv1d_chunked(qkv.on(~one), k.conv, conv, k.conv_kernel),
+        f.on(~one),
+        b.on(~one),
+        k.dt_bias,
+        k.a_log,
+        delta,
+        k.heads,
+        k.head_dim,
+        k.norm_eps,
+        k.gate_floor,
+    )
+    core = merge([step, chunked])
+
+    g = x
+    for proj in k.gate:
+        g = ops.linear.matmul(g, proj)
+    o = ops.elemwise.rmsnorm_gated_by(core, g, k.o_norm, k.heads, k.o_norm_eps)
+    return ops.linear.matmul(o, k.o_proj)
+
+def cache(c, space, a):
+    """`a`'s latent rows in the kv `space`."""
+    c.kv(space, a.kv, [a.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
+
+def plans(inputs, heads, kv_lora_rank):
+    """The decode and prefill arms' plans over `inputs`."""
+    one = fact.single_token()
+    decode, prefill = inputs.on(one), inputs.on(~one)
+    return struct(
+        decode = ops.attn.mla_plan(decode, heads, kv_lora_rank),
+        prefill = ops.attn.mla_plan(prefill, heads, kv_lora_rank),
+    )
+
+def whole(inputs, heads, kv_lora_rank):
+    """A plan that reads every row of `inputs` through the prefill arm."""
+    return struct(decode = None, prefill = ops.attn.mla_plan(inputs, heads, kv_lora_rank))
+
+def attention(x, inputs, plan, a, positions = None, select = None):
+    """Latent attention of the rows `x`. `select(q_a)`, if given, picks the
+    keys each query reads; `positions` default to the rows' own."""
+    pages = inputs.kv(a.kv)
+    if positions == None:
+        positions = inputs.positions()
+    write_page = inputs.write_page(a.kv)
+    write_offset = inputs.write_offset(a.kv)
+
+    q_a = ops.linear.matmul(x, a.q_a_proj)
+    q_a = ops.elemwise.rmsnorm(q_a, a.q_a_norm, a.q_a_norm_eps)
+    q_b = ops.linear.matmul(q_a, a.q_b_proj)
+    kv_a = ops.linear.matmul(x, a.kv_a_proj)
+    seam.at(seam.ATTN_QV, [q_b, kv_a])
+
+    selection = select(q_a) if select != None else None
+
+    if a.theta != None:
+        kv_c, k_pe = ops.attn.mla_latents_rope(
+            kv_a,
+            positions,
+            a.kv_a_norm,
+            a.kv_a_norm_eps,
+            a.kv_lora_rank,
+            a.qk_rope_head_dim,
+            a.theta,
+        )
+    else:
+        kv_c, k_pe = ops.attn.mla_latents(kv_a, a.kv_a_norm, a.kv_a_norm_eps, a.kv_lora_rank)
+    ops.attn.mla_kv_append(kv_c, k_pe, pages, write_page, write_offset)
+
+    q_nope, q_pe = ops.attn.mla_split_q_b(q_b, a.heads, a.qk_nope_head_dim, a.qk_rope_head_dim)
+    if a.theta != None:
+        q_pe = ops.elemwise.rope_partial_q(q_pe, positions, a.qk_rope_head_dim, a.qk_rope_head_dim, a.theta)
+    return attend(x, q_nope, q_pe, pages, plan, a, selection)
+
+def attend(x, q_nope, q_pe, pages, plan, a, selection = None):
+    """The split queries `q_nope`/`q_pe` of the rows `x` scored against the
+    latent `pages` (or the `selection` of them), through `a`'s output
+    projection. A plan with no decode arm reads its rows whole."""
+    q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
+    seam.at(seam.ATTN_Q, [q])
+
+    if plan.decode == None:
+        scored = arm(False, q, plan.prefill, q_pe, selection, pages, a)
+    else:
+        one = fact.single_token()
+        on = lambda rows, holds: rows.on(holds) if rows != None else None
+        scored = merge([
+            arm(True, q.on(one), plan.decode, q_pe.on(one), on(selection, one), pages, a),
+            arm(False, q.on(~one), plan.prefill, q_pe.on(~one), on(selection, ~one), pages, a),
+        ])
+
+    o = ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
+    if a.gate != None:
+        o = ops.elemwise.gate_sigmoid_mul(o, ops.linear.matmul(x, a.gate))
+    seam.at(seam.ATTN_OUT, [o])
+    return ops.linear.matmul(o, a.o_proj)
+
+def arm(decode, q, plan, q_pe, selection, pages, a):
+    if selection == None:
+        score = ops.attn.mla_decode if decode else ops.attn.mla_prefill
+        return score(q, plan, q_pe, pages, a.heads, a.kv_lora_rank, a.sm_scale)
+    score = ops.attn.mla_decode_selected if decode else ops.attn.mla_prefill_selected
+    return score(q, plan, q_pe, selection, pages, a.heads, a.kv_lora_rank, a.sm_scale)
+
+def boundaries(positions, row_valid, ratio, split = True):
+    """Where the rows close entries of a key pool that compresses `ratio`
+    rows into one: each boundary's position, request and rope position.
+    With `split` the decode and prefill arms find theirs apart."""
+    if not split:
+        return ops.attn.pool_boundary_prefill(positions, row_valid, ratio)
+    one = fact.single_token()
+    dpos, dreq, drope = ops.attn.pool_boundary_decode(positions.on(one), row_valid, ratio)
+    ppos, preq, prope = ops.attn.pool_boundary_prefill(positions.on(~one), row_valid, ratio)
+    return merge([dpos, ppos]), merge([dreq, preq]), merge([drope, prope])
 
 def caches(m, c):
     kv = c.kv_space(m.kv)

@@ -3,8 +3,77 @@
 # video, audio and reference rows jointly, each stream modulated by its own
 # timestep through its modality's adaLN.
 
-load("//lib/diffusion/forward.star", "attend", "chunks", "linear")
-load("//lib/qwen3_text/forward.star", qwen3_caches = "caches", qwen3_encode = "encode")
+def linear(w, x):
+    """`x` through the projection `w`, plus its bias if it has one."""
+    y = ops.linear.matmul(x, w.w)
+    if w.bias == None:
+        return y
+    return ops.elemwise.add_bias(w.bias, y)
+
+def chunks(x, widths):
+    """`x`'s rows cut into consecutive pieces of `widths`, the last one
+    whatever remains."""
+    out = []
+    for width in widths[:-1]:
+        head, x = ops.layout.split_rows(x, width)
+        out.append(head)
+    out.append(x)
+    return out
+
+def attend(q, k, v, rows, over, head_dim, sm_scale, mask):
+    """`q`'s rows attending `k` and `v`'s, each side grouped by its own
+    `perm` and `csr`."""
+    o = ops.attn.ragged(
+        ops.layout.pack_rows(q, rows.perm),
+        ops.layout.pack_rows(k, over.perm),
+        ops.layout.pack_rows(v, over.perm),
+        rows.csr,
+        over.csr,
+        head_dim,
+        sm_scale,
+        mask,
+    )
+    return ops.layout.unpack_rows(o, rows.perm)
+
+def qwen3_caches(te, c, kv):
+    space = c.kv_space(kv)
+    plane = te.kv_heads * te.head_dim
+    for layer in te.layers:
+        c.kv(space, layer.kv, [plane, plane], te.head_dim, heads = True)
+
+def qwen3_encode(arm, te, tap = None):
+    """The encoder over `arm`'s tokens. `tap(l, y)` sees each layer's output
+    rows and reads the encoder out; without one, the last layer's rows are
+    its readout."""
+    plan = ops.attn.plan_prefill(arm, te.q_heads, te.kv_heads, te.head_dim, None)
+    ids = arm.tokens()
+    positions = arm.positions()
+    y = ops.layout.embed(ids, te.embed, te.vocab)
+    last = len(te.layers) - 1
+
+    def layer(l, w, y):
+        pages = arm.kv(w.kv)
+        x = ops.elemwise.rmsnorm(y, w.attn_norm, te.eps)
+        q = ops.linear.matmul(x, w.q)
+        k = ops.linear.matmul(x, w.k)
+        v = ops.linear.matmul(x, w.v)
+        q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, te.head_dim, te.eps)
+        k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, te.head_dim, te.eps)
+        q, k = ops.elemwise.rope_full(q, k, positions, te.head_dim, te.theta, False)
+        ops.attn.kv_append(k, v, pages, arm.write_page(w.kv), arm.write_offset(w.kv))
+        o = ops.attn.prefill(q, plan, pages, None, te.head_dim, te.kv_heads, te.sm_scale)
+        y = ops.elemwise.residual_add(ops.linear.matmul(o, w.o), y)
+
+        x = ops.elemwise.rmsnorm(y, w.mlp_norm, te.eps)
+        f = ops.linear.matmul(ops.linear.mlp_swiglu(ops.linear.matmul(x, w.gate_up), te.inter), w.down)
+        y = ops.elemwise.residual_add(f, y)
+        if tap != None:
+            tap(l, y)
+        elif l == last:
+            seam.at(seam.HIDDEN, [y])
+        return y
+
+    arm.fold_layers(te.layers, y, layer)
 
 NORM_EPS = 1e-5
 T_MAX_PERIOD = 10000.0

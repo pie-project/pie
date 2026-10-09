@@ -3,7 +3,19 @@
 # channels are interleaved, so both are gathered into the trunk's order; its
 # gate-and-up projections hold up before gate.
 
-load("//lib/diffusion/formats.star", "biased", "conv")
+def biased(reads, w, stem):
+    """The projection `w` from `stem.weight`, and its bias (if any) from
+    `stem.bias`."""
+    reads.read(w.w, stem + ".weight")
+    if w.bias != None:
+        reads.read(w.bias, stem + ".bias")
+
+def conv(reads, c, stem):
+    """The convolution `c` from `stem`, its kernel transmuted to the taps-major
+    plane the layout holds."""
+    name = stem + ".weight"
+    reads.read_expr(c.w, src(name).transmute(c.w.shape, stored(name)))
+    reads.read(c.bias, stem + ".bias")
 
 def formats(m):
     return [format("huggingface", read = lambda reads: read(m, reads))]

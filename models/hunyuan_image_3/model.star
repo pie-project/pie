@@ -2,7 +2,12 @@
 # rope, routed and shared experts), the timestep embedders, and the U-Net
 # blocks that take a latent clip into the trunk and its rows back out.
 
-load("//lib/diffusion/model.star", "linear")
+def linear(name, out, in_, banks, bias = True):
+    """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
+    return struct(
+        w = weight(name, [out, in_], banks),
+        bias = weight(name + ".bias", [out], compute(banks)) if bias else None,
+    )
 
 TRAIN_STEPS = 1000
 FLOW_SHIFT = 3.0

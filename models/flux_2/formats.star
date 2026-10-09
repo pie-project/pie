@@ -2,9 +2,116 @@
 # under `dit.`, `te.` and `vae.`; or, for a model of the transformer alone,
 # a bare transformer state_dict.
 
-load("//lib/diffusion/formats.star", "adaln_order", "conv", "reordered")
-load("//lib/flux_vae/formats.star", "conv_head", vae_read = "read")
-load("//lib/qwen3_text/formats.star", te_read = "read")
+def biased(reads, w, stem):
+    """The projection `w` from `stem.weight`, and its bias (if any) from
+    `stem.bias`."""
+    reads.read(w.w, stem + ".weight")
+    if w.bias != None:
+        reads.read(w.bias, stem + ".bias")
+
+def conv(reads, c, stem):
+    """The convolution `c` from `stem`, its kernel transmuted to the taps-major
+    plane the layout holds."""
+    name = stem + ".weight"
+    reads.read_expr(c.w, src(name).transmute(c.w.shape, stored(name)))
+    reads.read(c.bias, stem + ".bias")
+
+def adaln_order(slices):
+    """The order a layout takes an adaLN projection's `slices` slices in
+    from a checkpoint's: each (shift, scale) pair as (scale, shift), each
+    gate where it stands."""
+    return {
+        2: [1, 0],
+        3: [1, 0, 2],
+        6: [1, 0, 2, 4, 3, 5],
+        9: [1, 0, 2, 4, 3, 5, 7, 6, 8],
+    }[slices]
+
+def reordered(e, order, width, axis = 0):
+    """`e`'s `width`-wide slices along `axis`, taken in `order`."""
+    return concat(axis, [e.slice(axis, i * width, width) for i in order])
+
+def conv_head(reads, c, stem, rows_stored):
+    """The convolution `c`: the first of the `rows_stored` output channels
+    the checkpoint holds at `stem`."""
+    kernel = stem + ".weight"
+    natural = list(c.w.shape)
+    natural[0] = rows_stored
+    rows = c.c_out
+    reads.read_expr(c.w, src(kernel).transmute(natural, stored(kernel)).slice(0, 0, rows))
+    bias = stem + ".bias"
+    held = stored(bias)
+    want = encoding(c.bias.dtype)
+    head = c.bias.name + ".head"
+    reads.push(tensor(head, src(bias).slice(0, 0, rows), held, shape = c.bias.shape, internal = True))
+    reads.push(tensor(c.bias.name, out(head) if want == held else out(head).cast(want), want, shape = c.bias.shape))
+
+def group_norm(reads, n, stem):
+    reads.read(n.weight, stem + ".weight")
+    reads.read(n.bias, stem + ".bias")
+
+def resnet(reads, r, stem):
+    group_norm(reads, r.norm1, stem + ".norm1")
+    conv(reads, r.conv1, stem + ".conv1")
+    group_norm(reads, r.norm2, stem + ".norm2")
+    conv(reads, r.conv2, stem + ".conv2")
+    if r.shortcut != None:
+        conv(reads, r.shortcut, stem + ".conv_shortcut")
+
+def mid(reads, m, stem):
+    resnet(reads, m.res0, stem + ".resnets.0")
+    a = m.attn
+    n = lambda s: stem + ".attentions.0." + s
+    group_norm(reads, a.norm, n("group_norm"))
+    biased(reads, a.q, n("to_q"))
+    biased(reads, a.k, n("to_k"))
+    biased(reads, a.v, n("to_v"))
+    biased(reads, a.out, n("to_out.0"))
+    resnet(reads, m.res1, stem + ".resnets.1")
+
+def vae_read(reads, v, encoder_out_stored = None):
+    """The decoder, then the encoder; with `encoder_out_stored`, the
+    encoder's output convolution is the head of the one stored."""
+    at = lambda tail: "vae." + tail
+    d = v.decoder
+    conv(reads, d.conv_in, at("decoder.conv_in"))
+    mid(reads, d.mid, at("decoder.mid_block"))
+    for i, up in enumerate(d.up):
+        for r, block in enumerate(up.resnets):
+            resnet(reads, block, at("decoder.up_blocks.{}.resnets.{}".format(i, r)))
+        if up.upsample != None:
+            conv(reads, up.upsample, at("decoder.up_blocks.{}.upsamplers.0.conv".format(i)))
+    group_norm(reads, d.norm_out, at("decoder.conv_norm_out"))
+    conv(reads, d.conv_out, at("decoder.conv_out"))
+
+    e = v.encoder
+    conv(reads, e.conv_in, at("encoder.conv_in"))
+    for i, down in enumerate(e.down):
+        for r, block in enumerate(down.resnets):
+            resnet(reads, block, at("encoder.down_blocks.{}.resnets.{}".format(i, r)))
+        if down.downsample != None:
+            conv(reads, down.downsample, at("encoder.down_blocks.{}.downsamplers.0.conv".format(i)))
+    mid(reads, e.mid, at("encoder.mid_block"))
+    group_norm(reads, e.norm_out, at("encoder.conv_norm_out"))
+    if encoder_out_stored == None:
+        conv(reads, e.conv_out, at("encoder.conv_out"))
+    else:
+        conv_head(reads, e.conv_out, at("encoder.conv_out"), encoder_out_stored)
+
+def te_read(reads, te, prefix):
+    reads.read(te.embed, prefix + "embed_tokens.weight")
+    for l, w in enumerate(te.layers):
+        n = lambda s: "{}layers.{}.{}".format(prefix, l, s)
+        reads.read(w.attn_norm, n("input_layernorm.weight"))
+        reads.read(w.q, n("self_attn.q_proj.weight"))
+        reads.read(w.k, n("self_attn.k_proj.weight"))
+        reads.read(w.v, n("self_attn.v_proj.weight"))
+        reads.read(w.o, n("self_attn.o_proj.weight"))
+        reads.read(w.q_norm, n("self_attn.q_norm.weight"))
+        reads.read(w.k_norm, n("self_attn.k_norm.weight"))
+        reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
+        reads.read_concat(w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+        reads.read(w.down, n("mlp.down_proj.weight"))
 
 DIFFUSERS = "a diffusers pipeline (`dit.`/`te.`/`vae.` prefixes)"
 BARE = "a bare transformer state_dict"

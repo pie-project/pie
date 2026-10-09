@@ -2,7 +2,20 @@
 # `aux.`, as the drafter's own release spells it. `norm(name)` reads one of
 # its norms as the trunk's checkpoint states norms.
 
-load("//lib/reads/formats.star", "flattened")
+def product(xs):
+    out = 1
+    for x in xs:
+        out *= x
+    return out
+
+def flattened(name, want, broadcast = False):
+    """The tensor `name` as stored, its elements read as `want`; with
+    `broadcast`, a single stored value is read as any shape."""
+    held = shape(name)
+    if (not broadcast or product(held) > 1) and product(held) != product(want):
+        fail("`{}` is stored {} ({} elements) and the plan reads it as {} ({} elements)".format(
+            name, held, product(held), want, product(want)))
+    return src(name).transmute(want, stored(name))
 
 def bind_aux(d, reads, norm):
     reads.read_expr(d.hidden_norm, norm("aux.hidden_norm.weight"))

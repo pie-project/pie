@@ -4,9 +4,97 @@
 # hyper-connected streams; an optional vision tower and MTP draft head.
 
 load("//lib/adapters/model.star", "banks")
-load("//lib/hyper/model.star", "hyper", "mix")
-load("//lib/kda/model.star", kda = "mixer")
-load("//lib/mla/model.star", "attention")
+
+def hyper(streams, norm_eps, gate_eps, alpha, sinkhorn, single_pass = False):
+    """The streams' shape and the constants their gates are computed with;
+    under `single_pass` each sublayer's input mix is the one the previous
+    sublayer predicted."""
+    return struct(
+        streams = streams,
+        norm_eps = norm_eps,
+        gate_eps = gate_eps,
+        alpha = alpha,
+        sinkhorn = sinkhorn,
+        single_pass = single_pass,
+    )
+
+def mix(n, name, streams, hidden, dynamic = True):
+    """A sublayer's mix `name` over `streams` streams `hidden` wide: a
+    static `base` and `scale`, and with `dynamic` a projection of the
+    normed streams added to it."""
+    width = 2 * streams + streams * streams
+    return struct(
+        scale = weight(n(name + "_scale"), [3], dtype.f32),
+        base = weight(n(name + "_base"), [width], dtype.f32),
+        dynamic = weight(n(name + "_fn"), [width, streams * hidden], dtype.f32) if dynamic else None,
+    )
+
+def kda(n, l, k, hidden, weights, conv, eps, gate_floor, gate_rank = None, **extra):
+    """The KDA mixer of layer `l` named by `n`, its projections in `weights`
+    and its convolution bank in `conv`. Its output gate is one projection,
+    or a pair through `gate_rank`. `extra` rides along."""
+    width = k.heads * k.head_dim
+    if gate_rank == None:
+        gate = [weight(n("kda_gate"), [width, hidden], weights).columns()]
+    else:
+        gate = [
+            weight(n("kda_g_a"), [gate_rank, hidden], weights),
+            weight(n("kda_g_b"), [width, gate_rank], weights).columns(),
+        ]
+    return struct(
+        heads = k.heads,
+        head_dim = k.head_dim,
+        conv_kernel = k.conv_kernel,
+        norm_eps = eps,
+        gate_floor = gate_floor,
+        qkv = weight(n("kda_qkv"), [3 * width, hidden], weights).packed([width] * 3),
+        conv = weight(n("kda_conv"), [3 * width, k.conv_kernel], conv).packed([width] * 3),
+        f_a = weight(n("kda_f_a"), [k.f_rank, hidden], weights),
+        f_b = weight(n("kda_f_b"), [width, k.f_rank], weights).columns(),
+        gate = gate,
+        b = weight(n("kda_b"), [k.heads, hidden], weights).columns(),
+        dt_bias = weight(n("kda_dt_bias"), [k.heads, k.head_dim], dtype.f32).columns(),
+        a_log = weight(n("kda_a_log"), [k.heads], dtype.f32).columns(),
+        o_norm = weight(n("kda_o_norm"), [k.head_dim], dtype.f32),
+        o_norm_eps = eps,
+        o_proj = weight(n("kda_o_proj"), [hidden, width], weights).rows(),
+        conv_state = "conv.{}".format(l),
+        delta_state = "delta.{}".format(l),
+        **extra
+    )
+
+def attention(n, d, hidden, weights, norms, eps, kv, theta = None, gated = False, **extra):
+    """The latent attention named by `n`, its projections in `weights` and
+    its norms in `norms`, caching under `kv`. Its rope part is rotated at
+    `theta`, or left as it is with none; `gated` adds a sigmoid gate on its
+    output. `extra` rides along (an indexer, say)."""
+    qk_head_dim = d.qk_nope_head_dim + d.qk_rope_head_dim
+    v_width = d.heads * d.v_head_dim
+    return struct(
+        heads = d.heads,
+        kv_lora_rank = d.kv_lora_rank,
+        qk_nope_head_dim = d.qk_nope_head_dim,
+        qk_rope_head_dim = d.qk_rope_head_dim,
+        v_head_dim = d.v_head_dim,
+        theta = theta,
+        sm_scale = f32(1.0 / f32(sqrt(qk_head_dim))),
+        q_a_proj = weight(n("q_a_proj"), [d.q_lora_rank, hidden], weights),
+        q_a_norm = weight(n("q_a_norm"), [d.q_lora_rank], norms),
+        q_a_norm_eps = eps,
+        q_b_proj = weight(n("q_b_proj"), [d.heads * qk_head_dim, d.q_lora_rank], weights).columns(),
+        kv_a_proj = weight(n("kv_a_proj"), [d.kv_lora_rank + d.qk_rope_head_dim, hidden], weights),
+        kv_a_norm = weight(n("kv_a_norm"), [d.kv_lora_rank], norms),
+        kv_a_norm_eps = eps,
+        kv_b_proj = weight(
+            n("kv_b_proj"),
+            [d.heads * (d.qk_nope_head_dim + d.v_head_dim), d.kv_lora_rank],
+            weights,
+        ).columns(),
+        gate = weight(n("o_gate"), [v_width, hidden], weights).columns() if gated else None,
+        o_proj = weight(n("o_proj"), [hidden, v_width], weights).rows(),
+        kv = kv,
+        **extra
+    )
 
 def flash(layers = 45, experts = 288):
     return struct(

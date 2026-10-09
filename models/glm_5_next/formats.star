@@ -2,9 +2,62 @@
 # already imported, its draft head and vision tower overlaid under `aux.`
 # (`pie model import --aux`), the trunk read as the artifact holds it.
 
-load("//lib/kda/formats.star", kda_conv = "conv", kda_gate = "gate", kda_qkv = "qkv")
-load("//lib/mla/formats.star", "named")
-load("//lib/reads/formats.star", "flattened")
+def product(xs):
+    out = 1
+    for x in xs:
+        out *= x
+    return out
+
+def flattened(name, want, broadcast = False):
+    """The tensor `name` as stored, its elements read as `want`; with
+    `broadcast`, a single stored value is read as any shape."""
+    held = shape(name)
+    if (not broadcast or product(held) > 1) and product(held) != product(want):
+        fail("`{}` is stored {} ({} elements) and the plan reads it as {} ({} elements)".format(
+            name, held, product(held), want, product(want)))
+    return src(name).transmute(want, stored(name))
+
+def squeezed(name):
+    """A depthwise convolution bank stored `[channels, 1, kernel]` or
+    `[channels, kernel, 1]`, read as `[channels, kernel]`."""
+    held = shape(name)
+    if len(held) == 3 and held[1] == 1:
+        channels, kernel = held[0], held[2]
+    elif len(held) == 3 and held[2] == 1:
+        channels, kernel = held[0], held[1]
+    else:
+        fail("`{}`: a depthwise convolution bank is stored [channels, 1, kernel] or [channels, kernel, 1] and this one is stored {}".format(name, held))
+    return src(name).transmute([channels, kernel], stored(name))
+
+def kda_qkv(at):
+    """The names of the q, k and v projections the packed `qkv` reads."""
+    return [at("self_attn.{}_proj.weight".format(p)) for p in ["q", "k", "v"]]
+
+def kda_conv(k, at):
+    """The packed `conv` bank, read from the q, k and v banks."""
+    return concat(k.conv.cut_axis, [squeezed(at("self_attn.{}_conv1d.weight".format(p))) for p in ["q", "k", "v"]])
+
+def kda_gate(k, at):
+    """The output gate's projections, each beside its name."""
+    if len(k.gate) == 1:
+        return [(k.gate[0], at("self_attn.g_proj.weight"))]
+    return [(k.gate[0], at("self_attn.g_a_proj.weight")), (k.gate[1], at("self_attn.g_b_proj.weight"))]
+
+def named(a, at):
+    """`a`'s weights, each beside the name `at` gives its transformers leaf,
+    in the order a checkpoint lists them."""
+    out = [
+        (a.q_a_proj, at("self_attn.q_a_proj.weight")),
+        (a.q_a_norm, at("self_attn.q_a_layernorm.weight")),
+        (a.q_b_proj, at("self_attn.q_b_proj.weight")),
+        (a.kv_a_proj, at("self_attn.kv_a_proj_with_mqa.weight")),
+        (a.kv_a_norm, at("self_attn.kv_a_layernorm.weight")),
+        (a.kv_b_proj, at("self_attn.kv_b_proj.weight")),
+    ]
+    if a.gate != None:
+        out.append((a.gate, at("self_attn.g_proj.weight")))
+    out.append((a.o_proj, at("self_attn.o_proj.weight")))
+    return out
 
 HEAD = "model.language_model.layers.45."
 VISUAL = "model.visual."

@@ -2,7 +2,22 @@
 # forward reads out instead of its velocity, for parity against the
 # reference.
 
-load("//lib/diffusion/model.star", "linear", "packed_linear")
+def linear(name, out, in_, banks, bias = True):
+    """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
+    return struct(
+        w = weight(name, [out, in_], banks),
+        bias = weight(name + ".bias", [out], compute(banks)) if bias else None,
+    )
+
+def packed_linear(name, seams, in_, banks):
+    """A biased projection whose output is the `seams`-wide pieces end to end."""
+    out = 0
+    for s in seams:
+        out += s
+    return struct(
+        w = weight(name, [out, in_], banks).packed(seams),
+        bias = weight(name + ".bias", [out], compute(banks)).packed(seams),
+    )
 
 HIDDEN = 256
 HEADS = 4
