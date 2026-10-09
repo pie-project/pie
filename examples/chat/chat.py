@@ -117,25 +117,24 @@ class EngineBackend:
         self.history.append({"role": "assistant", "content": "".join(pieces)})
 
 
-# The pie mascot: 'o' is the pie, 'e' an eye, '.' empty. Two pixel rows share one
-# terminal row, drawn with half-block characters.
+# The pie-slice mascot: 'c' cream, 'f' filling, 'k' crust, '.' empty. Two pixel rows
+# share one terminal row, drawn with half-block characters.
 MASCOT_GRID = [
-    "..oooo..",
-    ".oooooo.",
-    "ooeoooe.",
-    "oooo....",
-    "oooo....",
-    ".oooooo.",
-    "..oooo..",
-    "........",
+    ".....cc.....",
+    "...cccccc...",
+    "..cccccccc..",
+    ".ffffffffff.",
+    ".ffffffffff.",
+    ".ffffffffff.",
+    ".kkkkkkkkkk.",
+    "............",
 ]
-PIE_COLOR = ACCENT
-EYE_COLOR = "#1c1c1e"
+MASCOT_COLORS = {"c": "#f4f4f4", "f": "#dc5f5a", "k": "#b8864f"}
 
 
 def mascot_rows() -> list[list[tuple[str, str]]]:
     """Return the mascot as rows of styled text fragments, two pixel rows per line."""
-    colors = {"o": PIE_COLOR, "e": EYE_COLOR}
+    colors = MASCOT_COLORS
     lines = []
     for top, bottom in zip(MASCOT_GRID[0::2], MASCOT_GRID[1::2]):
         fragments = []
