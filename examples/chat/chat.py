@@ -1,7 +1,8 @@
-"""A terminal chat with the look of the pie-cli demo.
+"""A full-screen terminal chat with the look of the pie-cli demo.
 
-This file is only the interface: a prompt, a streamed reply and a status bar.
-The reply comes from a placeholder backend until the engine is wired in.
+The screen clears on start. The conversation fills the top, and the input box
+stays at the bottom with a status line under it. The reply comes from a
+placeholder backend until the engine is connected.
 
     python examples/chat/chat.py
 """
@@ -9,20 +10,30 @@ The reply comes from a placeholder backend until the engine is wired in.
 from __future__ import annotations
 
 import asyncio
-import itertools
+import os
 from collections.abc import AsyncIterator
 
-from prompt_toolkit import PromptSession
-from prompt_toolkit.formatted_text import HTML
-from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.application import Application
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.styles import Style
+from prompt_toolkit.widgets import Frame
 
-ACCENT = "\033[38;5;173m"  # the warm orange of the demo
-DIM, BOLD, RESET = "\033[2m", "\033[1m", "\033[0m"
-WIDTH = 66
+ACCENT = "#d97757"  # the warm orange of the demo
+DIM = "#8a8a8a"
 MODEL = "placeholder"
 
-STYLE = Style.from_dict({"bottom-toolbar": "#9a9a9a bg:#1c1c1e", "placeholder": "#666666"})
+STYLE = Style.from_dict({
+    "accent": ACCENT,
+    "dim": DIM,
+    "bold": "bold",
+    "status": f"{DIM} bg:#1c1c1e",
+    "banner": ACCENT,
+    "input-frame": ACCENT,
+    "placeholder": "#666666",
+})
 
 
 class PlaceholderBackend:
@@ -39,68 +50,108 @@ class PlaceholderBackend:
             yield word + " "
 
 
-def banner() -> None:
-    lines = [
-        f"{ACCENT}✻{RESET} {BOLD}pie chat{RESET}",
-        "",
-        f"{DIM}Ask a question, and the answer streams in as it is written.{RESET}",
-        f"{DIM}model {MODEL} · this Mac{RESET}",
-    ]
-    print(f"{ACCENT}╭" + "─" * WIDTH + f"╮{RESET}")
-    for line in lines:
-        visible = len(line.replace(ACCENT, "").replace(DIM, "").replace(BOLD, "").replace(RESET, ""))
-        print(f"{ACCENT}│{RESET} " + line + " " * (WIDTH - 1 - visible) + f"{ACCENT}│{RESET}")
-    print(f"{ACCENT}╰" + "─" * WIDTH + f"╯{RESET}")
-    print(f"{DIM}  Enter sends. /new starts over. Ctrl-D quits.{RESET}\n")
+class Chat:
+    def __init__(self, backend: PlaceholderBackend) -> None:
+        self.backend = backend
+        self.transcript: list[tuple[str, str]] = []  # (style, text) pieces, in order
+        self.streaming = False
+        self.app: Application | None = None
 
+        self.input = Buffer(multiline=False)
+        self.input_window = Window(
+            content=BufferControl(buffer=self.input),
+            height=1,
+            dont_extend_height=True,
+        )
+        self.output = Window(
+            content=FormattedTextControl(self.render_transcript, get_cursor_position=self.end_of_transcript),
+            wrap_lines=True,
+            always_hide_cursor=True,
+        )
 
-def toolbar(streaming: bool) -> HTML:
-    if streaming:
-        return HTML(" ✍  answering…")
-    return HTML(" Enter sends · /new starts over · Ctrl-D quits")
+    # ---- what is drawn -------------------------------------------------
 
+    def banner(self) -> list[tuple[str, str]]:
+        return [
+            ("class:banner", "✻ "), ("class:bold", "pie chat\n"),
+            ("class:dim", f"model {MODEL} · this Mac\n"),
+            ("class:dim", "Ask a question, and the answer streams in as it is written.\n\n"),
+        ]
 
-async def run(backend: PlaceholderBackend) -> None:
-    session: PromptSession[str] = PromptSession(style=STYLE)
-    streaming = False
+    def render_transcript(self) -> list[tuple[str, str]]:
+        pieces = self.banner()
+        pieces.extend(self.transcript)
+        return pieces
 
-    def prompt_mark() -> HTML:
-        return HTML("<style fg='#d97757'><b>❯</b></style> ")
+    def end_of_transcript(self):
+        from prompt_toolkit.data_structures import Point
 
-    def placeholder() -> HTML:
-        return HTML("<placeholder>Ask anything…</placeholder>")
+        text = "".join(t for _, t in self.render_transcript())
+        return Point(x=0, y=text.count("\n"))
 
-    banner()
-    with patch_stdout(raw=True):
-        while True:
-            try:
-                text = await session.prompt_async(
-                    prompt_mark,
-                    placeholder=placeholder,
-                    bottom_toolbar=lambda: toolbar(streaming),
-                    refresh_interval=0.2,
-                )
-            except (EOFError, KeyboardInterrupt):
-                break
+    def status(self) -> list[tuple[str, str]]:
+        hint = " answering…" if self.streaming else " Enter sends · /new starts over · Ctrl-D quits"
+        return [("class:status", hint.ljust(200))]
 
-            text = text.strip()
-            if not text:
-                continue
-            if text == "/new":
-                print(f"{DIM}  (new conversation){RESET}\n")
-                continue
+    # ---- what happens ----------------------------------------------------
 
-            print(f"{BOLD}❯{RESET} {text}")
-            streaming = True
-            print(f"{ACCENT}●{RESET} ", end="", flush=True)
-            async for piece in backend.reply(text):
-                print(piece, end="", flush=True)
-            print("\n")
-            streaming = False
+    def add(self, style: str, text: str) -> None:
+        self.transcript.append((style, text))
+        if self.app:
+            self.app.invalidate()
+
+    async def send(self, text: str) -> None:
+        self.add("class:bold", f"❯ {text}\n")
+        self.streaming = True
+        self.add("class:accent", "● ")
+        async for piece in self.backend.reply(text):
+            self.add("", piece)
+        self.add("", "\n\n")
+        self.streaming = False
+        if self.app:
+            self.app.invalidate()
+
+    def on_enter(self, buffer: Buffer) -> bool:
+        text = buffer.text.strip()
+        buffer.reset()
+        if not text:
+            return False
+        if text == "/new":
+            self.transcript.clear()
+            self.add("class:dim", "(new conversation)\n\n")
+            return False
+        if self.app:
+            self.app.create_background_task(self.send(text))
+        return False
+
+    # ---- layout --------------------------------------------------------
+
+    def build(self) -> Application:
+        bindings = KeyBindings()
+
+        @bindings.add("c-d")
+        def _(event):
+            event.app.exit()
+
+        self.input.accept_handler = self.on_enter
+
+        box = Frame(self.input_window, style="class:input-frame")
+        status = Window(content=FormattedTextControl(self.status), height=1, style="class:status")
+
+        root = HSplit([self.output, box, status])
+        self.app = Application(
+            layout=Layout(root, focused_element=self.input_window),
+            key_bindings=bindings,
+            style=STYLE,
+            full_screen=True,
+            mouse_support=False,
+        )
+        return self.app
 
 
 def main() -> None:
-    asyncio.run(run(PlaceholderBackend()))
+    os.system("cls" if os.name == "nt" else "clear")  # start on a clean screen, as the Claude CLI does
+    Chat(PlaceholderBackend()).build().run()
 
 
 if __name__ == "__main__":
