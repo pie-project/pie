@@ -50,7 +50,7 @@ def wheel(chat: Chat):
     return handler
 
 
-_cache = {"key": None, "lines": []}
+_cache = {"key": None, "history": []}
 RESERVED_ROWS = 5
 
 
@@ -66,18 +66,23 @@ def split_lines(pieces: list[tuple]) -> list[list[tuple]]:
     return lines
 
 
-def transcript_lines(chat: Chat) -> list[list[tuple]]:
-    key = (chat.content_version, chat.frame)
-    if _cache["key"] != key:
+def history_lines(chat: Chat) -> list[list[tuple]]:
+    if _cache["key"] != chat.content_version:
         handler = wheel(chat)
-        pieces = banner(chat)
+        pieces: list[tuple] = []
         for item in chat.transcript:
             if isinstance(item, Markdown):
                 pieces.extend(render(item.text))
             else:
                 pieces.append(item)
-        _cache.update(key=key, lines=split_lines([(p[0], p[1], handler) for p in pieces]))
-    return _cache["lines"]
+        _cache.update(key=chat.content_version, history=split_lines([(p[0], p[1], handler) for p in pieces]))
+    return _cache["history"]
+
+
+def transcript_lines(chat: Chat) -> list[list[tuple]]:
+    handler = wheel(chat)
+    banner_lines = split_lines([(p[0], p[1], handler) for p in banner(chat)])
+    return banner_lines + history_lines(chat)
 
 
 def visible_lines(chat: Chat) -> list[list[tuple]]:
