@@ -803,19 +803,7 @@ impl Shell {
             .find(|seam| seam.seam == DRAFTS_SEAM)
             .and_then(|seam| seam.values.first().copied());
         let (out_width, readout_bytes, readout_dtype, drafts_plane) = {
-            let carved = arena.slots(
-                &handles,
-                &compiled.arena,
-                FireRows {
-                    tokens: u64::from(boot.budget.max_tokens),
-                    lanes: u64::from(boot.budget.max_lanes),
-                    patches: u64::from(budgets.max_patches()),
-                    images: u64::from(budgets.max_images()),
-                    voxels: u64::from(budgets.max_voxels()),
-                    clips: u64::from(budgets.max_clips()),
-                    readouts: u64::from(boot.budget.max_tokens),
-                },
-            )?;
+            let carved = arena.slots(&handles, &compiled.arena, FireRows::ceilings(&budgets))?;
             let logits = carved.0[readout_value.0 as usize].ok_or_else(|| Fault::Unbound {
                 what: format!(
                     "value {}, the `{readout_seam:?}` readout seam, which the carve gave no \
