@@ -163,7 +163,7 @@ for frame in range(_LOOP):
             bubbles.append((row, column, char))
     _BUBBLES.append(bubbles)
 
-BODY_STYLE = "fg:#c8cbf2"  # the light lavender from the reference
+BODY_STYLE = "class:accent"  # the Claude orange, like the Claude mascot
 BUBBLE_STYLE = "fg:#3a2a26"  # almost the background colour: the bubbles are barely visible
 
 
