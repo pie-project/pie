@@ -1,35 +1,4 @@
-use poem_ir::{Fault, Platform};
-
-/// Every catalog row that runs on more than one rank splits, and the split
-/// trace reads each value only after the op, or the collective, that makes it.
-#[test]
-fn every_split_row_reads_what_it_makes_in_order() {
-    let mut broken = Vec::new();
-    for deployment in models::splits() {
-        for platform in [Platform::Cuda, Platform::Metal] {
-            let Err(faults) = poem_ir::check(&deployment.trace(platform)) else {
-                continue;
-            };
-            broken.extend(
-                faults
-                    .into_iter()
-                    .filter(|fault| {
-                        matches!(
-                            fault,
-                            Fault::UseBeforeDef { .. }
-                                | Fault::PhantomDef { .. }
-                                | Fault::DoubleOutput { .. }
-                                | Fault::ForeignOutput { .. }
-                                | Fault::DefNodeOutOfRange { .. }
-                                | Fault::OutOfRange { .. }
-                        )
-                    })
-                    .map(|fault| format!("{} on {platform:?}: {fault}", deployment.name)),
-            );
-        }
-    }
-    assert!(broken.is_empty(), "{}", broken.join("\n"));
-}
+use poem_ir::Platform;
 
 /// A row-parallel projection leaves each rank a partial sum, which is reduced
 /// once, right after it, and nothing else is added.

@@ -1,7 +1,7 @@
 use poem::ops::{attn, elemwise, layout, linear};
 use poem::pattern::{Pattern, template};
 use poem_compiler::fuse::fuse;
-use poem_ir::{Dim, Dtype, Operands, Trace, Ty};
+use poem_ir::{Operands, Trace};
 
 fn trace(build: impl FnOnce(&Pattern)) -> Trace {
     template(build).trace
@@ -82,13 +82,7 @@ fn an_op_that_overwrites_what_the_match_reads_keeps_it_in_place() {
 }
 
 fn qkv_write(p: &Pattern, q_eps: f32, k_eps: f32) {
-    let positions = p.value(
-        "positions",
-        Ty::Tensor {
-            shape: vec![Dim::Tokens],
-            dtype: Dtype::I32,
-        },
-    );
+    let positions = p.indices("positions");
     let (q, k, v) = layout::split_qkv(&p.rows("packed", 512), 256, 128);
     let v = elemwise::rmsnorm_no_scale(&v, 64, q_eps);
     let q = elemwise::rmsnorm_per_head(&q, &p.weight("q_norm", [64]), 64, q_eps);
@@ -131,9 +125,10 @@ fn the_qkv_write_folds_when_its_norms_share_an_epsilon() {
 
 #[test]
 fn the_qkv_write_stays_apart_when_its_norms_do_not() {
+    let apart = trace(|p| qkv_write(p, 1e-6, 1e-5));
     let fused = fuse(
-        trace(|p| qkv_write(p, 1e-6, 1e-5)),
+        apart.clone(),
         &["custom_cuda.qkv_fused_qknorm_rope_vnorm_write"],
     );
-    assert_eq!(fused.nodes.len(), 7);
+    assert_eq!(ops(&fused), ops(&apart), "no op folds");
 }
