@@ -119,9 +119,9 @@ class EngineBackend:
         self.history.append({"role": "assistant", "content": "".join(pieces)})
 
 
-# One random animal from mascots.py per launch. The 16x16 art is taken at every other row
-# (16x8 pixels, outlines dropped), then drawn with quadrant blocks: each text cell holds a
-# 2x2 group of pixels, so the banner is 8 cells wide and 4 lines tall, like Claude's mascot.
+# One random animal from mascots.py per launch. The 16x16 art is resampled to 16x6 pixels
+# (outlines dropped) and drawn with quadrant blocks: each text cell holds a 2x2 group of
+# pixels, so the banner is 8 cells wide and 3 lines tall.
 QUADRANTS = {
     (0, 0, 0, 0): " ", (1, 0, 0, 0): "▘", (0, 1, 0, 0): "▝", (1, 1, 0, 0): "▀",
     (0, 0, 1, 0): "▖", (1, 0, 1, 0): "▌", (0, 1, 1, 0): "▞", (1, 1, 1, 0): "▛",
@@ -129,7 +129,8 @@ QUADRANTS = {
     (0, 0, 1, 1): "▄", (1, 0, 1, 1): "▙", (0, 1, 1, 1): "▟", (1, 1, 1, 1): "█",
 }
 MASCOT_NAME, (MASCOT_PALETTE, MASCOT_ART) = random.choice(list(ANIMALS.items()))
-MASCOT_ROWS = [row for row in MASCOT_ART[::2]]
+# six pixel rows (three text lines) sampled evenly from the 16 rows of art
+MASCOT_ROWS = [MASCOT_ART[round(i * (len(MASCOT_ART) - 1) / 5)] for i in range(6)]
 
 
 def _colour(letter):
