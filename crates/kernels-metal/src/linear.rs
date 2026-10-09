@@ -1,3 +1,6 @@
+#[cfg(target_vendor = "apple")]
+pub mod ane;
+
 pub mod gemm;
 
 pub mod kv_codec;

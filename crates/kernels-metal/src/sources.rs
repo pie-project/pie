@@ -269,6 +269,10 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/layout/row_gather.metal")),
     ),
     (
+        "linear/ane.metal",
+        include_str!(concat!(source_root!(), "/linear/ane.metal")),
+    ),
+    (
         "linear/gemm_dense.metal",
         include_str!(concat!(source_root!(), "/linear/gemm_dense.metal")),
     ),
