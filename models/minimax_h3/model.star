@@ -114,8 +114,8 @@ def text_encoder(banks):
         return struct(
             attn_norm = weight(n("attn_norm"), [hidden], dense),
             q = weight(n("q"), [TE.q_heads * hd, hidden], banks).columns(),
-            k = weight(n("k"), [TE.kv_heads * hd, hidden], banks).columns(),
-            v = weight(n("v"), [TE.kv_heads * hd, hidden], banks).columns(),
+            k = weight(n("k"), [TE.kv_heads * hd, hidden], banks).columns(heads = TE.kv_heads),
+            v = weight(n("v"), [TE.kv_heads * hd, hidden], banks).columns(heads = TE.kv_heads),
             o = weight(n("o"), [hidden, TE.q_heads * hd], banks).rows(),
             q_norm = weight(n("q_norm"), [hd], dense),
             k_norm = weight(n("k_norm"), [hd], dense),

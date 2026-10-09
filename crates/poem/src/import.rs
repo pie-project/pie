@@ -306,10 +306,14 @@ fn word_codes(dtype: Dtype) -> i64 {
 
 const ALIGNMENT: u32 = 256;
 
+/// The axis a weight is cut along, and each segment's whole extent with how
+/// many ranks in a row read the same share of it.
+type Bands = (u32, Vec<(i64, u32)>);
+
 struct Claim {
     pub name: String,
     pub shape: Vec<i64>,
-    pub bands: Option<(u32, Vec<i64>)>,
+    pub bands: Option<Bands>,
     pub encoding: Encoding,
     pub scales: Option<Scales>,
 }
@@ -1416,12 +1420,7 @@ fn holds_the_declared_rectangle(w: &Weight, axis: u8, legs: &[Vec<i64>]) -> Resu
     Ok(())
 }
 
-fn interned(
-    of: &str,
-    shape: &[i64],
-    bands: Option<(u32, Vec<i64>)>,
-    pairing: Scales,
-) -> Vec<TensorContract> {
+fn interned(of: &str, shape: &[i64], bands: Option<Bands>, pairing: Scales) -> Vec<TensorContract> {
     seams_clear_the_blocked_axis(of, bands.as_ref(), pairing.channel_axis, pairing.group_size);
     let declared = divided(shape, pairing.channel_axis, pairing.group_size, of);
     let plane = |name: String, dtype: Dtype, shape: Vec<i64>| {
@@ -1501,33 +1500,52 @@ fn ladder(name: &str, expr: Expr, stored: &Encoding, want: &Encoding) -> Result<
     }
 }
 
-fn banding(w: &Weight, tp: u32) -> Option<(u32, Vec<i64>)> {
+/// Each segment of `w`'s cut as the checkpoint holds it whole, and how many
+/// ranks in a row read the same share of it.
+fn banding(w: &Weight, tp: u32) -> Option<Bands> {
     match &w.shard {
         Shard::Replicated => None,
-        Shard::Cut { axis, segments } => Some((
+        Shard::Cut {
+            axis,
+            segments,
+            heads,
+        } => Some((
             *axis,
             segments
                 .iter()
-                .map(|segment| leg_extent(*segment, tp, &w.name))
+                .enumerate()
+                .map(|(i, segment)| {
+                    let parts = cut_parts(w, heads.get(i).copied(), tp);
+                    (leg_extent(*segment, parts, &w.name), tp / parts)
+                })
                 .collect(),
         )),
     }
 }
 
-fn banded(name: &str, bands: Option<&(u32, Vec<i64>)>) -> Expr {
+/// The ways `tp` ranks cut a segment of `heads` heads.
+fn cut_parts(w: &Weight, heads: Option<u64>, tp: u32) -> u32 {
+    let parts =
+        Shard::parts(heads, u64::from(tp)).unwrap_or_else(|why| panic!("`{}`: {why}", w.name));
+    u32::try_from(parts).expect("no more parts than ranks")
+}
+
+fn banded(name: &str, bands: Option<&Bands>) -> Expr {
     let Some((axis, extents)) = bands else {
         return Expr::src(name);
     };
     let at = as_axis(*axis, name);
     match extents.as_slice() {
         [] => panic!("`{name}` is cut at no seam at all"),
-        [_lone] => Expr::src(name).shard(at),
+        [(_, replicas)] => Expr::src(name).shard_among(at, *replicas),
         many => {
             let mut start = 0;
             let legs = many
                 .iter()
-                .map(|extent| {
-                    let leg = Expr::src(name).slice(at, start, *extent).shard(at);
+                .map(|(extent, replicas)| {
+                    let leg = Expr::src(name)
+                        .slice(at, start, *extent)
+                        .shard_among(at, *replicas);
                     start += *extent;
                     leg
                 })
@@ -1548,7 +1566,11 @@ fn whole(w: &Weight, tp: u32) -> Vec<i64> {
     let mut dims = extents(w);
     match &w.shard {
         Shard::Replicated => dims,
-        Shard::Cut { axis, segments } => {
+        Shard::Cut {
+            axis,
+            segments,
+            heads,
+        } => {
             let at = *axis as usize;
             let dim = dims.get_mut(at).unwrap_or_else(|| {
                 panic!("`{}` is {:?} and its cut names axis {at}", w.name, w.shape)
@@ -1560,9 +1582,13 @@ fn whole(w: &Weight, tp: u32) -> Vec<i64> {
                 "`{}`: its segments sum to {seams} and its axis {at} is {dim}",
                 w.name,
             );
-            *dim = dim
-                .checked_mul(i64::from(tp))
-                .unwrap_or_else(|| panic!("`{}` is {tp} times wider than an i64", w.name));
+            *dim = segments
+                .iter()
+                .enumerate()
+                .map(|(i, segment)| {
+                    leg_extent(*segment, cut_parts(w, heads.get(i).copied(), tp), &w.name)
+                })
+                .sum();
             dims
         }
     }
@@ -1584,12 +1610,7 @@ pub fn divided(shape: &[i64], axis: u32, group: u32, name: &str) -> Vec<i64> {
     dims
 }
 
-fn seams_clear_the_blocked_axis(
-    name: &str,
-    bands: Option<&(u32, Vec<i64>)>,
-    channel: u32,
-    group: u32,
-) {
+fn seams_clear_the_blocked_axis(name: &str, bands: Option<&Bands>, channel: u32, group: u32) {
     let Some((axis, extents)) = bands else {
         return;
     };

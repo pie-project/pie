@@ -4,7 +4,10 @@
 //! value needs where an op wants it whole.
 //!
 //! Every value is replicated, split across the ranks along its last axis, or
-//! a partial sum each rank holds a term of. An op's rule (`rules.rs`) says
+//! a partial sum each rank holds a term of. A block of heads fewer than the
+//! ranks is cut once per head, each head then held by a group of ranks in a
+//! row (the kv heads of grouped-query attention, whose query heads the ranks
+//! split one more level). An op's rule (`rules.rs`) says
 //! which of these it takes and what it yields; a partial or split value that
 //! reaches an op wanting it whole is all-reduced or all-gathered right after
 //! the op that made it.
@@ -35,11 +38,42 @@ const OUTPUTS: &[&str] = &["out", "mtp", "mtp.drafts", "velocity", "hidden", "pi
 #[derive(Clone, Debug, PartialEq)]
 enum Dist {
     Whole,
-    /// Split along the last axis; each block of `segments` (whole widths) is
-    /// split on its own, so a rank holds one share of every block.
-    Split(Vec<u64>),
+    /// Split along the last axis; each block is split on its own, so a rank
+    /// holds one share of every block.
+    Split(Vec<Block>),
     /// Each rank holds one term of a sum.
     Partial,
+}
+
+/// A block of a split value's last axis: its whole width, and how many ways
+/// the ranks cut it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Block {
+    width: u64,
+    parts: u64,
+}
+
+impl Dist {
+    /// Split into blocks of `widths`, each cut once per rank.
+    fn even(widths: &[u64], world: u32) -> Dist {
+        Dist::Split(
+            widths
+                .iter()
+                .map(|width| Block {
+                    width: *width,
+                    parts: u64::from(world),
+                })
+                .collect(),
+        )
+    }
+
+    /// Whether every block is cut once per rank.
+    fn is_even(&self, world: u32) -> bool {
+        match self {
+            Dist::Split(blocks) => blocks.iter().all(|b| b.parts == u64::from(world)),
+            _ => true,
+        }
+    }
 }
 
 /// The trace each of `world` ranks runs.
@@ -129,13 +163,50 @@ impl Pass {
     }
 
     /// How the ranks split weight `v`: the axis and its blocks.
-    fn weight_cut(&self, v: ValueId) -> Option<(u32, Vec<u64>)> {
+    fn weight_cut(&self, v: ValueId) -> Result<Option<(u32, Vec<Block>)>, String> {
         let Def::Weight(p) = self.trace.values[v.0 as usize].def else {
-            return None;
+            return Ok(None);
         };
-        match &self.trace.params[p as usize].shard {
-            Shard::Cut { axis, segments } => Some((*axis, segments.clone())),
-            Shard::Replicated => None,
+        let param = &self.trace.params[p as usize];
+        match &param.shard {
+            Shard::Cut {
+                axis,
+                segments,
+                heads,
+            } => {
+                let blocks = segments
+                    .iter()
+                    .enumerate()
+                    .map(|(i, width)| {
+                        Ok(Block {
+                            width: *width,
+                            parts: Shard::parts(heads.get(i).copied(), u64::from(self.world))
+                                .map_err(|why| format!("`{}`: {why}", param.name))?,
+                        })
+                    })
+                    .collect::<Result<_, String>>()?;
+                Ok(Some((*axis, blocks)))
+            }
+            Shard::Replicated => Ok(None),
+        }
+    }
+
+    /// The ways the ranks cut the kv cache `v`'s heads, if they split it.
+    fn cache_parts(&self, v: ValueId) -> Result<Option<u64>, String> {
+        let Def::Cache(c) = self.trace.values[v.0 as usize].def else {
+            return Ok(None);
+        };
+        match &self.trace.caches[c as usize] {
+            CacheRow::Kv {
+                name,
+                planes,
+                head_dim,
+                shard: Shard::Cut { .. },
+                ..
+            } => kv_parts(planes, *head_dim, u64::from(self.world))
+                .map(Some)
+                .map_err(|why| format!("`{name}`: {why}")),
+            _ => Ok(None),
         }
     }
 
@@ -225,10 +296,12 @@ impl Pass {
                 buf: v,
                 buf_out: out,
             },
-            Dist::Split(segments) if segments.len() == 1 => Collective::AllGather { x: v, y: out },
-            Dist::Split(segments) => {
+            Dist::Split(blocks) if blocks.len() == 1 && dist.is_even(self.world) => {
+                Collective::AllGather { x: v, y: out }
+            }
+            Dist::Split(blocks) => {
                 return Err(format!(
-                    "value {} is split in blocks {segments:?}, which no gather puts back in order",
+                    "value {} is split in blocks {blocks:?}, which no gather puts back in order",
                     v.0
                 ));
             }
@@ -279,30 +352,50 @@ impl Pass {
         self.trace.nodes = nodes;
 
         let world = u64::from(self.world);
-        for (v, decl) in self.trace.values.iter_mut().enumerate() {
-            let cut = match (&decl.def, self.dists.get(v)) {
-                (_, Some(Some(Dist::Split(_)))) => Some(match &decl.ty {
-                    Ty::Tensor { shape, .. } => shape.len().saturating_sub(1),
-                    Ty::Struct(_) => 0,
-                }),
-                (Def::Weight(p), _) => match &self.trace.params[*p as usize].shard {
-                    Shard::Cut { axis, .. } => Some(*axis as usize),
-                    Shard::Replicated => None,
-                },
-                _ => None,
-            };
-            if let (Some(axis), Ty::Tensor { shape, .. }) = (cut, &mut decl.ty)
-                && let Some(Dim::Const(extent)) = shape.get_mut(axis)
+        // Each param's cut extent, whole and one rank's share.
+        let mut shares = vec![None; self.trace.params.len()];
+        for (at, param) in self.trace.params.iter_mut().enumerate() {
+            if let Shard::Cut {
+                axis,
+                segments,
+                heads,
+            } = &mut param.shard
             {
-                *extent /= world;
+                let whole: u64 = segments.iter().sum();
+                for (i, segment) in segments.iter_mut().enumerate() {
+                    let parts = Shard::parts(heads.get(i).copied(), world)
+                        .map_err(|why| format!("`{}`: {why}", param.name))?;
+                    *segment = split(*segment, parts, &param.name)?;
+                }
+                let local: u64 = segments.iter().sum();
+                param.shape[*axis as usize] = local;
+                shares[at] = Some((*axis as usize, whole, local));
             }
         }
-        for param in &mut self.trace.params {
-            if let Shard::Cut { axis, segments } = &mut param.shard {
-                for segment in segments.iter_mut() {
-                    *segment = split(*segment, world, &param.name)?;
+        for (v, decl) in self.trace.values.iter_mut().enumerate() {
+            let Ty::Tensor { shape, .. } = &mut decl.ty else {
+                continue;
+            };
+            match (&decl.def, self.dists.get(v)) {
+                (_, Some(Some(Dist::Split(blocks)))) => {
+                    let local = blocks
+                        .iter()
+                        .map(|b| split(b.width, b.parts, &format!("value {v}")))
+                        .sum::<Result<u64, String>>()?;
+                    if let Some(Dim::Const(extent)) = shape.last_mut() {
+                        *extent = local;
+                    }
                 }
-                param.shape[*axis as usize] = segments.iter().sum();
+                // A weight's value may be wider or narrower than the plane
+                // its param stores; it keeps the share its param keeps.
+                (Def::Weight(p), _) => {
+                    if let Some((axis, whole, local)) = shares[*p as usize]
+                        && let Some(Dim::Const(extent)) = shape.get_mut(axis)
+                    {
+                        *extent = *extent * local / whole;
+                    }
+                }
+                _ => {}
             }
         }
         for row in &mut self.trace.caches {
@@ -310,18 +403,21 @@ impl Pass {
                 CacheRow::Kv {
                     name,
                     planes,
+                    head_dim,
                     shard: Shard::Cut { segments, .. },
                     ..
                 } => {
+                    let parts = kv_parts(planes, *head_dim, world)
+                        .map_err(|why| format!("`{name}`: {why}"))?;
                     for plane in planes.iter_mut() {
-                        *plane = split(*plane, world, name)?;
+                        *plane = split(*plane, parts, name)?;
                     }
                     segments.clone_from(planes);
                 }
                 CacheRow::State {
                     name,
                     slab,
-                    shard: Shard::Cut { axis, segments },
+                    shard: Shard::Cut { axis, segments, .. },
                     ..
                 } => {
                     let extent = &mut slab[*axis as usize];
@@ -333,6 +429,19 @@ impl Pass {
         }
         Ok(self.trace)
     }
+}
+
+/// The ways `world` ranks cut a kv cache whose planes hold heads
+/// `head_dim` wide: once per rank, or once per head when the ranks outnumber
+/// them.
+fn kv_parts(planes: &[u64], head_dim: u32, world: u64) -> Result<u64, String> {
+    let head_dim = u64::from(head_dim);
+    let heads = planes
+        .iter()
+        .map(|plane| (head_dim > 0 && plane.is_multiple_of(head_dim)).then(|| plane / head_dim))
+        .min()
+        .flatten();
+    Shard::parts(heads, world)
 }
 
 fn split(whole: u64, world: u64, name: &str) -> Result<u64, String> {

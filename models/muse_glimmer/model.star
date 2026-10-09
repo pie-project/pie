@@ -46,7 +46,7 @@ def layout(id, deploy):
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         return struct(
             full = l % d.full_every == d.full_every - 1,
-            qkv = weight(n("qkv"), [q_w + 2 * kv_w, hidden], proj).packed([q_w, kv_w, kv_w]),
+            qkv = weight(n("qkv"), [q_w + 2 * kv_w, hidden], proj).packed([q_w, kv_w, kv_w], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
             gate = weight(n("gate"), [q_w, hidden], proj).columns(),
             o_proj = weight(n("o_proj"), [hidden, q_w], proj).rows(),
             kv = "kv.{}".format(l),

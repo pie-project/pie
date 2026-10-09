@@ -50,9 +50,13 @@ pub enum Expr {
         src: Box<Expr>,
         to: TensorType,
     },
+    /// A rank's share of `src` along `axis`: one of `world / replicas`
+    /// equal parts, the same one for each group of `replicas` ranks in a row.
     Shard {
         src: Box<Expr>,
         axis: Axis,
+        #[serde(default = "one", skip_serializing_if = "is_one")]
+        replicas: u32,
     },
     SrcIndexed(String),
     Select {
@@ -261,6 +265,31 @@ impl Partition {
     pub fn new(rank: u32, world: u32) -> Self {
         Self { rank, world }
     }
+
+    /// The partition among groups of `replicas` ranks in a row, each group
+    /// holding one share.
+    pub fn grouped(self, replicas: u32) -> Result<Self, Error> {
+        let replicas = replicas.max(1);
+        if !self.world.max(1).is_multiple_of(replicas) {
+            return Err(Error::Shard(format!(
+                "tp_size {} is no whole number of groups of {replicas} ranks",
+                self.world
+            )));
+        }
+        Ok(Self {
+            rank: self.rank / replicas,
+            world: self.world.max(1) / replicas,
+        })
+    }
+}
+
+fn one() -> u32 {
+    1
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_one(n: &u32) -> bool {
+    *n == 1
 }
 
 impl Default for Partition {
@@ -516,9 +545,16 @@ impl Expr {
     }
 
     pub fn shard(self, axis: u8) -> Self {
+        self.shard_among(axis, 1)
+    }
+
+    /// A rank's share of this along `axis`, each share held by `replicas`
+    /// ranks in a row.
+    pub fn shard_among(self, axis: u8, replicas: u32) -> Self {
         Expr::Shard {
             src: Box::new(self),
             axis: Axis(axis),
+            replicas,
         }
     }
 
@@ -686,9 +722,14 @@ impl Expr {
                     uniform => uniform,
                 },
             },
-            Expr::Shard { src, axis } => Expr::Shard {
+            Expr::Shard {
+                src,
+                axis,
+                replicas,
+            } => Expr::Shard {
                 src: boxed(src)?,
                 axis,
+                replicas,
             },
             Expr::Concat { axis, parts } => Expr::Concat {
                 axis,

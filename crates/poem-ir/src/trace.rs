@@ -53,7 +53,27 @@ pub enum Shard {
     Cut {
         axis: u32,
         segments: Vec<u64>,
+        /// The heads each segment holds, whole, when the model states them;
+        /// a segment of fewer heads than ranks is copied to each rank of a
+        /// group rather than cut mid-head. Empty when the ranks cut each
+        /// segment evenly.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        heads: Vec<u64>,
     },
+}
+
+impl Shard {
+    /// How many ways the ranks cut a segment of `heads` heads (none stated:
+    /// every rank's own share): `world`, or the head count when there are
+    /// fewer heads than ranks, each head then held by `world / heads` ranks.
+    pub fn parts(heads: Option<u64>, world: u64) -> Result<u64, String> {
+        match heads {
+            None => Ok(world),
+            Some(h) if h >= world && h.is_multiple_of(world) => Ok(world),
+            Some(h) if h > 0 && h < world && world.is_multiple_of(h) => Ok(h),
+            Some(h) => Err(format!("{h} heads do not split {world} ways")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

@@ -325,9 +325,21 @@ fn a_declared_shape_is_the_whole_tensors() {
                 .map(|(at, extent)| {
                     let extent = i64::try_from(*extent).expect("an extent no i64 holds");
                     match &param.shard {
-                        Shard::Cut { axis, .. } if *axis as usize == at => {
-                            extent * i64::from(one.tp)
-                        }
+                        // A block of heads fewer than the ranks is held whole
+                        // by each of a group of them.
+                        Shard::Cut {
+                            axis,
+                            segments,
+                            heads,
+                        } if *axis as usize == at => segments
+                            .iter()
+                            .enumerate()
+                            .map(|(i, segment)| {
+                                let parts = Shard::parts(heads.get(i).copied(), u64::from(one.tp))
+                                    .expect("a cut the sharding pass took");
+                                i64::try_from(segment * parts).expect("an extent no i64 holds")
+                            })
+                            .sum(),
                         Shard::Cut { .. } | Shard::Replicated => extent,
                     }
                 })

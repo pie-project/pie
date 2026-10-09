@@ -88,6 +88,7 @@ impl DeclaredCache<'_> {
         *shard = Shard::Cut {
             axis: 0,
             segments: planes.clone(),
+            heads: Vec::new(),
         };
     }
 
@@ -102,6 +103,7 @@ impl DeclaredCache<'_> {
         *shard = Shard::Cut {
             axis,
             segments: vec![extent],
+            heads: Vec::new(),
         };
     }
 }

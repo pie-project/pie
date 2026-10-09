@@ -72,6 +72,7 @@ const HEAD_OPS: &[(&str, &[&str], &[&str], bool)] = &[
     ("elementwise.rope_partial_q", &["q"], &[], false),
     ("elementwise.rope_partial_last", &["q"], &[], false),
     ("elementwise.rope_yarn", &["q", "k"], &[], false),
+    ("elementwise.rope_mrope", &["q", "k"], &[], false),
     ("elementwise.rope_axes", &["x"], &[], false),
     ("elementwise.add_bias", &["out"], &[], false),
     (
@@ -265,7 +266,10 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
         }
         Rule::Lookup { table } => {
             at.whole_except(pass, &[table])?;
-            let cut = at.one(table).and_then(|t| pass.weight_cut(t));
+            let cut = match at.one(table) {
+                Some(t) => pass.weight_cut(t)?,
+                None => None,
+            };
             match cut {
                 Some((0, _)) => vec![Dist::Partial; outs.len()],
                 Some((axis, _)) => {
@@ -280,9 +284,12 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
         Rule::Norm => {
             at.whole_except(pass, &["x"])?;
             let x = at.one("x").expect("a norm reads a row");
-            let cut = at.one("weight").and_then(|w| pass.weight_cut(w));
+            let cut = match at.one("weight") {
+                Some(w) => pass.weight_cut(w)?,
+                None => None,
+            };
             match (pass.dist(x)?, cut) {
-                (Dist::Split(segments), Some((0, _))) => vec![Dist::Split(segments); outs.len()],
+                (Dist::Split(blocks), Some((0, _))) => vec![Dist::Split(blocks); outs.len()],
                 (_, None) => {
                     at.make_whole(pass, x)?;
                     vec![Dist::Whole; outs.len()]
@@ -300,7 +307,7 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
             if grouped {
                 at.scale(pass, &["groups"])?;
                 outs.iter()
-                    .map(|o| Dist::Split(vec![pass.width(*o).unwrap_or(0)]))
+                    .map(|o| Dist::even(&[pass.width(*o).unwrap_or(0)], pass.world))
                     .collect()
             } else {
                 vec![Dist::Whole; outs.len()]
@@ -326,16 +333,26 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
             at.whole_except(pass, &[act, w])?;
             let a = at.one(act).expect("a contraction reads an activation");
             let weight = at.one(w).expect("a contraction reads a weight");
-            match pass.weight_cut(weight) {
+            match pass.weight_cut(weight)? {
                 None => {
                     at.make_whole(pass, a)?;
                     vec![Dist::Whole; outs.len()]
                 }
-                Some((axis, segments)) if axis == out => {
+                Some((axis, blocks)) if axis == out => {
                     at.make_whole(pass, a)?;
-                    vec![Dist::Split(segments); outs.len()]
+                    vec![Dist::Split(blocks); outs.len()]
                 }
-                Some((axis, _)) if axis == input => match pass.dist(a)? {
+                Some((axis, blocks)) if axis == input => match pass.dist(a)? {
+                    held @ Dist::Split(_)
+                        if !held.is_even(pass.world)
+                            || blocks.iter().any(|b| b.parts != u64::from(pass.world)) =>
+                    {
+                        return Err(format!(
+                            "`{}` contracts heads a group of ranks holds alike, whose \
+                             partial sums would count each head once per rank",
+                            at.name
+                        ));
+                    }
                     Dist::Split(_) => vec![Dist::Partial; outs.len()],
                     held => {
                         return Err(format!(
@@ -383,18 +400,13 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
                     .copied()
                     .filter(|f| *f != "kv_heads" || !whole_kv)
                     .collect();
+                at.check_kv_parts(pass)?;
                 at.scale(pass, &scale)?;
-                let first = at.all_of(follow)[0];
-                let (width, Dist::Split(segments)) = (pass.width(first), &held[0]) else {
-                    unreachable!("a split op follows a split value");
-                };
+                let followed = at.all_of(follow);
                 outs.iter()
-                    .map(|o| match pass.width(*o) {
-                        w if w == width => Dist::Split(segments.clone()),
-                        Some(w) => Dist::Split(vec![w]),
-                        None => Dist::Whole,
-                    })
-                    .collect()
+                    .enumerate()
+                    .map(|(i, o)| held_like(pass, *o, i, &followed, &held, outs.len()))
+                    .collect::<Result<_, String>>()?
             } else {
                 vec![Dist::Whole; outs.len()]
             }
@@ -474,7 +486,7 @@ impl At {
         let mut ins = Vec::new();
         tree::op(self.tree.clone()).inputs(&mut ins);
         for v in ins {
-            if !split && pass.weight_cut(v).is_some() {
+            if !split && pass.weight_cut(v)?.is_some() {
                 return Err(format!("`{}` reads a weight the ranks split", self.name));
             }
             let reader = KV_READERS.contains(&self.name);
@@ -511,10 +523,99 @@ impl At {
                 let Tree::Int(n) = value else {
                     return Err(format!("`{op}`.{field} is not a count"));
                 };
-                if *n % world != 0 {
+                // A group of ranks holds each kv head when there are fewer
+                // of them than ranks.
+                let parts = if *field == "kv_heads" && *n > 0 && *n < world {
+                    *n
+                } else {
+                    world
+                };
+                if *n % parts != 0 || world % parts != 0 {
                     return Err(format!("`{op}`.{field} of {n} does not split {world} ways"));
                 }
-                *n /= world;
+                *n /= parts;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// How the ranks hold output `out`, the `index`-th of `count`, of an op
+/// whose `followed` inputs they hold as `held`: as the input in its place
+/// or the first one as wide, else as the block of a lone packed input it
+/// unpacks, else cut once per rank.
+fn held_like(
+    pass: &Pass,
+    out: ValueId,
+    index: usize,
+    followed: &[ValueId],
+    held: &[Dist],
+    count: usize,
+) -> Result<Dist, String> {
+    let width = pass.width(out);
+    if width.is_none() {
+        return Ok(Dist::Whole);
+    }
+    let same = |i: usize| pass.width(followed[i]) == width;
+    if index < followed.len() && same(index) {
+        return Ok(held[index].clone());
+    }
+    if let Some(i) = (0..followed.len()).find(|i| same(*i)) {
+        return Ok(held[i].clone());
+    }
+    if let [Dist::Split(blocks)] = held
+        && blocks.len() == count
+        && Some(blocks[index].width) == width
+    {
+        return Ok(Dist::Split(vec![blocks[index]]));
+    }
+    if held.iter().all(|d| d.is_even(pass.world)) {
+        return Ok(Dist::even(&[width.unwrap_or(0)], pass.world));
+    }
+    Err(format!(
+        "an output of `{}` is {} wide, which no input it follows is, and they \
+         are held by groups of ranks alike",
+        pass.maker(out),
+        width.unwrap_or(0),
+    ))
+}
+
+impl At {
+    /// Kv an op appends to a cache, or attends to without one, is cut as
+    /// the cache is and as its kv head count is.
+    fn check_kv_parts(&self, pass: &Pass) -> Result<(), String> {
+        let mut ins = Vec::new();
+        tree::op(self.tree.clone()).inputs(&mut ins);
+        let mut want = None;
+        for v in ins {
+            if let Some(parts) = pass.cache_parts(v)? {
+                want = Some(parts);
+            }
+        }
+        let want = match (self.name, want) {
+            ("attention.kv_append" | "attention.kv_append_shared", Some(parts)) => parts,
+            ("attention.ragged", _) => match self.find("kv_heads") {
+                Some(Tree::Int(n)) => {
+                    let n = u64::try_from(*n).map_err(|_| "a negative head count")?;
+                    super::Shard::parts(Some(n), u64::from(pass.world))
+                        .map_err(|why| format!("`{}`: {why}", self.name))?
+                }
+                _ => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        for name in ["k", "v", "plane"] {
+            for v in self.all(name) {
+                if let Dist::Split(blocks) = pass.dist(v)?
+                    && blocks.iter().any(|b| b.parts != want)
+                {
+                    return Err(format!(
+                        "`{}` writes or reads kv `{name}` cut {:?} ways where its heads \
+                         are cut {want} ways",
+                        self.name,
+                        blocks.iter().map(|b| b.parts).collect::<Vec<_>>(),
+                    ));
+                }
             }
         }
         Ok(())

@@ -79,10 +79,18 @@ impl<'v> StarlarkValue<'v> for WeightValue {
 #[starlark_module]
 fn weight_methods(builder: &mut MethodsBuilder) {
     /// The weight's rows are banks a rank holds a whole of, cut into
-    /// `segments` along them.
-    fn packed(this: &WeightValue, segments: UnpackList<u64>) -> anyhow::Result<WeightValue> {
+    /// `segments` along them; `heads` are the heads each segment holds.
+    fn packed(
+        this: &WeightValue,
+        #[starlark(require = pos)] segments: UnpackList<u64>,
+        #[starlark(require = named, default = NoneOr::None)] heads: NoneOr<UnpackList<u64>>,
+    ) -> anyhow::Result<WeightValue> {
         crate::star::forward::dsl("packed", || {
-            WeightValue(this.0.clone().packed(segments.items))
+            let w = this.0.clone().packed(segments.items);
+            match heads.into_option() {
+                Some(heads) => WeightValue(w.heads(heads.items)),
+                None => WeightValue(w),
+            }
         })
     }
 
@@ -99,9 +107,19 @@ fn weight_methods(builder: &mut MethodsBuilder) {
         })
     }
 
-    /// The weight is cut along its rows between ranks.
-    fn columns(this: &WeightValue) -> anyhow::Result<WeightValue> {
-        crate::star::forward::dsl("columns", || WeightValue(this.0.clone().columns()))
+    /// The weight is cut along its rows between ranks; `heads` are the
+    /// heads its rows hold.
+    fn columns(
+        this: &WeightValue,
+        #[starlark(require = named, default = NoneOr::None)] heads: NoneOr<u64>,
+    ) -> anyhow::Result<WeightValue> {
+        crate::star::forward::dsl("columns", || {
+            let w = this.0.clone().columns();
+            match heads.into_option() {
+                Some(heads) => WeightValue(w.heads([heads])),
+                None => WeightValue(w),
+            }
+        })
     }
 
     /// The weight is cut along its last axis between ranks.

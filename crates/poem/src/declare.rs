@@ -86,7 +86,40 @@ impl Weight {
         self.shard = Shard::Cut {
             axis: u32::try_from(axis).expect("an axis inside a shape"),
             segments,
+            heads: Vec::new(),
         };
+        self
+    }
+
+    /// The heads each segment of the cut holds, so ranks outnumbering a
+    /// segment's heads each hold a whole head rather than part of one.
+    #[must_use]
+    pub fn heads(mut self, heads: impl IntoIterator<Item = u64>) -> Weight {
+        let Shard::Cut {
+            segments,
+            heads: held,
+            ..
+        } = &mut self.shard
+        else {
+            panic!("`{}` is not cut, so its heads split nothing", self.name);
+        };
+        let heads: Vec<u64> = heads.into_iter().collect();
+        assert_eq!(
+            heads.len(),
+            segments.len(),
+            "`{}` has {} segments and {} head counts",
+            self.name,
+            segments.len(),
+            heads.len(),
+        );
+        for (segment, h) in segments.iter().zip(&heads) {
+            assert!(
+                *h > 0 && segment.is_multiple_of(*h),
+                "`{}`: a segment of {segment} does not hold {h} heads",
+                self.name,
+            );
+        }
+        *held = heads;
         self
     }
 
@@ -347,12 +380,17 @@ impl Weight {
         };
         let shard = match &p.shard {
             Shard::Replicated => Shard::Replicated,
-            Shard::Cut { axis, segments } => {
+            Shard::Cut {
+                axis,
+                segments,
+                heads,
+            } => {
                 let at = *axis as usize;
                 let block = shape[at] / p.shape[at];
                 Shard::Cut {
                     axis: *axis,
                     segments: segments.iter().map(|s| s * block).collect(),
+                    heads: heads.clone(),
                 }
             }
         };

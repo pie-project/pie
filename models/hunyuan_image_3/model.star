@@ -104,7 +104,7 @@ def layout(id, deploy):
         n = lambda s: "layer.{}.{}".format(l, s)
         return struct(
             attn_norm = weight(n("attn_norm"), [hidden], dense),
-            qkv = weight(n("qkv"), [q_w + 2 * kv_w, hidden], banks).packed([q_w, kv_w, kv_w]),
+            qkv = weight(n("qkv"), [q_w + 2 * kv_w, hidden], banks).packed([q_w, kv_w, kv_w], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
             q_norm = weight(n("q_norm"), [hd], dense),
             k_norm = weight(n("k_norm"), [hd], dense),
             o_proj = weight(n("o_proj"), [hidden, q_w], banks).rows(),

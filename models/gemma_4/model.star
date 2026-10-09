@@ -171,7 +171,7 @@ def layout(id, deploy):
         else:
             attn_banks = struct(
                 shared = False,
-                qkv = weight(n("qkv"), [q_w + 2 * kv_w, hidden], proj).packed([q_w, kv_w, kv_w]),
+                qkv = weight(n("qkv"), [q_w + 2 * kv_w, hidden], proj).packed([q_w, kv_w, kv_w], heads = [d.q_heads, row_heads, row_heads]),
                 k_norm = norm("k_norm", head_dim),
                 k_norm_eps = d.norm_eps,
             )
@@ -302,7 +302,7 @@ def layout(id, deploy):
                 kv = "kv.mtp",
                 banks = struct(
                     shared = False,
-                    qkv = weight(an("qkv"), [q_w + 2 * kv_w, hidden], w).packed([q_w, kv_w, kv_w]),
+                    qkv = weight(an("qkv"), [q_w + 2 * kv_w, hidden], w).packed([q_w, kv_w, kv_w], heads = [d.q_heads, glob.kv_heads, glob.kv_heads]),
                     k_norm = anorm("k_norm", hd),
                     k_norm_eps = d.norm_eps,
                 ),

@@ -605,7 +605,12 @@ impl<T: Arm> Switch<'_, T> {
 }
 
 fn restated(shard: &Shard, logical: &[u64], plane: &[u64], name: &str) -> Shard {
-    let Shard::Cut { axis, segments } = shard else {
+    let Shard::Cut {
+        axis,
+        segments,
+        heads,
+    } = shard
+    else {
         return Shard::Replicated;
     };
     let at = *axis as usize;
@@ -636,6 +641,7 @@ fn restated(shard: &Shard, logical: &[u64], plane: &[u64], name: &str) -> Shard 
                 s / block
             })
             .collect(),
+        heads: heads.clone(),
     }
 }
 
