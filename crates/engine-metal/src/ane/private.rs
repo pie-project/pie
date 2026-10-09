@@ -91,14 +91,17 @@ fn target(
 }
 
 /// How many 512-channel units the Neural Engine takes: `PIE_ANE_UNITS`,
-/// else eight where the GPU reads prompts through MPP, else three fifths.
+/// else eight where the GPU reads prompts through MPP, else 47 percent.
+/// The two engines must finish together: on an M-series box without MPP
+/// serving Qwen3.6-27B at 640 rows, 16 of 34 units was the floor of a
+/// curve that rose on both sides (14: +5%, 18: +8%, 8: +19%).
 fn units(intermediate: u32) -> u32 {
     let all = intermediate / ffn::UNIT;
     kernels_metal::ane::units()
         .unwrap_or(if kernels_metal::tuning::current().qmm_mpp {
             8
         } else {
-            all * 3 / 5
+            (all * 47 + 50) / 100
         })
         .clamp(1, all.saturating_sub(1).max(1))
 }
