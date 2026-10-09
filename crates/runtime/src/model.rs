@@ -71,6 +71,12 @@ pub const ROWS: &[Row] = &[
         arch: "deepseek_v4",
     },
     Row {
+        id: "dsv4-flash-mini-bf16-mxfp4-kv-bf16",
+        layers: 5,
+        vocab: 129_280,
+        arch: "deepseek_v4",
+    },
+    Row {
         id: "dsv4-flash-mtp-u4g64-u2g64-mxfp4-kv-bf16",
         layers: 5,
         vocab: 129_280,

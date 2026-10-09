@@ -158,6 +158,22 @@ pub fn skus() -> Vec<crate::Sku> {
             ),
         ),
         (
+            "dsv4-flash-mini",
+            1,
+            [Dtype::Bf16, Dtype::Mxfp4],
+            Dtype::Bf16,
+            poem_dsl::trace_hybrid,
+            template::r1,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::flash_mini(
+                Dtype::Bf16,
+                Routed::split(Dtype::Mxfp4),
+                Dtype::Bf16,
+                Dtype::Bf16,
+                tp
+            ),
+        ),
+        (
             "dsv4-base",
             1,
             [Dtype::Bf16],
