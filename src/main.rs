@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use pie::{derive, ops, ui};
+use pie::{ops, ui};
 #[derive(Parser, Debug)]
 #[command(
     name = "pie",
@@ -135,11 +135,14 @@ async fn serve(global: pie::args::GlobalArgs, diag: Option<&str>) -> anyhow::Res
         pie::daemon::BootSpec::pie().version(env!("CARGO_PKG_VERSION")),
         global,
     )?;
-    let (controller, gateway, mut worker) = derive::derive_standalone(ctx.config_str())?;
+    let (controller, gateway, mut worker) =
+        worker::standalone::derive_standalone(ctx.config_str())?;
     if let Some(words) = diag {
         worker.state_diagnostics(words)?;
     }
-    let handle = pie::run_standalone(controller, gateway, worker, &pie::paths::pie_home()).await?;
+    let handle =
+        worker::standalone::run_standalone(controller, gateway, worker, &pie::paths::pie_home())
+            .await?;
     tracing::info!(
         listen = %handle.listen_addr,
         worker = %handle.worker_addr,

@@ -11,7 +11,7 @@ pub mod embedded;
 pub mod serve;
 #[cfg(feature = "standalone")]
 pub mod standalone;
-pub mod translate;
+mod translate;
 pub mod weights;
 
 #[cfg(not(target_arch = "wasm32"))]

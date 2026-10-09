@@ -388,7 +388,7 @@ fn typed_by_schema(content: &str, key: &str, value: &str) -> Result<(String, tom
             toml::from_str(content).map_err(|e| anyhow!("parse config: {e}"))?;
         set_nested(&mut root, key, candidate.clone())?;
         let serialized = toml::to_string(&root).map_err(|e| anyhow!("serialize TOML: {e}"))?;
-        match crate::derive::derive_standalone(&serialized) {
+        match worker::standalone::derive_standalone(&serialized) {
             Ok(_) => {
                 let mut doc: toml_edit::DocumentMut =
                     content.parse().map_err(|e| anyhow!("parse config: {e}"))?;
@@ -492,7 +492,7 @@ fn edit(global: &crate::args::GlobalArgs) -> Result<Answer> {
     }
 
     let edited = std::fs::read_to_string(&scratch).map_err(|e| anyhow!("read {scratch:?}: {e}"))?;
-    if let Err(error) = crate::derive::derive_standalone(&edited) {
+    if let Err(error) = worker::standalone::derive_standalone(&edited) {
         return Err(error).with_context(|| {
             format!(
                 "the edit is invalid and was NOT saved; it is kept at {}",
@@ -522,7 +522,8 @@ fn unset(global: &crate::args::GlobalArgs, key: String) -> Result<Answer> {
         return Ok(Answer::noop(format!("{key} was already unset")));
     }
     let serialized = toml::to_string(&root).map_err(|e| anyhow!("serialize TOML: {e}"))?;
-    crate::derive::derive_standalone(&serialized).with_context(|| format!("unsetting {key}"))?;
+    worker::standalone::derive_standalone(&serialized)
+        .with_context(|| format!("unsetting {key}"))?;
     let mut doc: toml_edit::DocumentMut = content
         .parse()
         .map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?;

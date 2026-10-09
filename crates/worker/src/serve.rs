@@ -9,9 +9,9 @@ use std::path::Path;
 use crate::boot::{self, LoadedPartnerMetadata};
 use crate::config;
 use crate::embedded::{Embedded, Engine, Summary};
-use crate::executor::ExecutorServer;
 use crate::link::client;
 use crate::link::control::{self, ControlLink};
+use crate::link::executor::ExecutorServer;
 use crate::link::{gateway, partner, topology};
 
 pub use crate::link::topology::{Coordinator, TopologyMode, connect};

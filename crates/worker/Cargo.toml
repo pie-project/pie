@@ -38,7 +38,6 @@ profile-fire = ["runtime/profile-fire"]
 
 [dependencies]
 runtime = { path = "../runtime" }
-builtins = { path = "../builtins" }
 models = { path = "../models" }
 controller-api = { path = "../controller-api" }
 worker-api = { path = "../worker-api", optional = true }
@@ -77,6 +76,7 @@ tokenizer = { path = "../tokenizer" }
 client = { package = "pie-client", path = "../client", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+builtins = { path = "../builtins" }
 tokio = { version = "1.53", features = ["rt-multi-thread", "time"] }
 
 [dev-dependencies]

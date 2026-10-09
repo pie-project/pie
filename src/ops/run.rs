@@ -276,7 +276,7 @@ pub async fn run(
 
     let target = target(args.inferlet.as_deref(), args.path.as_deref())?;
 
-    let (controller, gateway, mut worker) = crate::derive::derive_standalone(&content)?;
+    let (controller, gateway, mut worker) = worker::standalone::derive_standalone(&content)?;
     if let Some(words) = diag {
         worker.state_diagnostics(words)?;
     }
@@ -294,9 +294,10 @@ pub async fn run(
     }
     println!();
 
-    let pie = crate::run_standalone(controller, gateway, worker, &crate::paths::pie_home())
-        .await
-        .context("boot the engine")?;
+    let pie =
+        worker::standalone::run_standalone(controller, gateway, worker, &crate::paths::pie_home())
+            .await
+            .context("boot the engine")?;
     let outcome = drive(
         &pie.listen_addr.to_string(),
         &plan,

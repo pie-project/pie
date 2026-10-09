@@ -185,7 +185,7 @@ fn check_config(path: &Path, origin: crate::args::Origin) -> Checks {
         };
     }
 
-    let combined = match crate::derive::read_config_file(path) {
+    let combined = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
             return vec![(
@@ -195,7 +195,7 @@ fn check_config(path: &Path, origin: crate::args::Origin) -> Checks {
             )];
         }
     };
-    let worker = match crate::derive::derive_standalone(&combined) {
+    let worker = match worker::standalone::derive_standalone(&combined) {
         Ok((_controller, _gateway, worker)) => worker,
         Err(e) => {
             return vec![(

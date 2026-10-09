@@ -47,7 +47,9 @@ pub fn build_without_engine(
     runtime_config(user, home, builtins, model)
 }
 
-/// Every built-in inferlet, as `pie serve` registers them.
+/// Every built-in inferlet, as `pie serve` registers them. The browser
+/// registers none, so a wasm32 build carries none.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn builtins() -> Vec<runtime::bootstrap::BuiltinProgram> {
     builtins::all()
         .iter()
