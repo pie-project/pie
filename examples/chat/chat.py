@@ -195,14 +195,17 @@ class Chat:
     def banner(self) -> list[tuple[str, str]]:
         """The pie mascot on the left, the title and model on the right, as in the Claude logo."""
         mascot = mascot_rows(self.frame)
+        # the text starts one line below the top of the mascot, so it sits lower beside it
         info = [
+            [],
             [("class:bold", "pie chat")],
             [("class:dim", f"model {MODEL} · this Mac")],
             [("class:dim", os.getcwd())],
         ]
+        blank_mascot = [("", " " * 10)]
         pieces: list[tuple[str, str]] = []
-        for row in range(len(mascot)):
-            pieces.extend(mascot[row])
+        for row in range(max(len(mascot), len(info))):
+            pieces.extend(mascot[row] if row < len(mascot) else blank_mascot)
             pieces.append(("", " "))
             if row < len(info):
                 pieces.extend(info[row])
