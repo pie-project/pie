@@ -120,23 +120,27 @@ class EngineBackend:
 # The animated mascot: a fixed body with bubbles that start at its bottom right, rise one row
 # per frame and vanish, then the cycle repeats. Rows are 0 (top) to 2 (bottom), columns 0 to 9.
 _BODY = {1: "▐▟▙▙▙▛▌", 2: "▜██▄██▛"}  # the half block in the bottom row is the fin
-# (row, column, character) for each bubble, per frame; the two bubbles are offset by two frames
+# (row, column) for each bubble, per frame; the two bubbles are offset by two frames
 _BUBBLES = [
-    [(2, 8, "▖"), (0, 9, "▘")],
-    [(1, 8, "▘")],
-    [(0, 8, "▖"), (2, 9, "▘")],
-    [(1, 9, "▖")],
+    [(2, 8), (0, 9)],
+    [(1, 8)],
+    [(0, 8), (2, 9)],
+    [(1, 9)],
 ]
+BODY_STYLE = "class:accent"
+BUBBLE_STYLE = "fg:#7a5046"  # the accent blended half way into the background: a see-through look
+BUBBLE_CHAR = "▄"
 
 
 def _frame(bubbles):
-    grid = [[" "] * 10 for _ in range(3)]
+    """One frame as three rows of (style, character) cells, ten columns wide."""
+    grid = [[("", " ")] * 10 for _ in range(3)]
     for row, text in _BODY.items():
         for col, ch in enumerate(text):
-            grid[row][col] = ch
-    for row, col, ch in bubbles:
-        grid[row][col] = ch
-    return ["".join(r) for r in grid]
+            grid[row][col] = (BODY_STYLE, ch)
+    for row, col in bubbles:
+        grid[row][col] = (BUBBLE_STYLE, BUBBLE_CHAR)
+    return grid
 
 
 MASCOT_FRAMES = [_frame(bubbles) for bubbles in _BUBBLES]
@@ -144,10 +148,8 @@ FRAME_SECONDS = 0.6  # time between mascot frames
 
 
 def mascot_rows(frame: int = 0) -> list[list[tuple[str, str]]]:
-    """Return the mascot frame as three rows of styled text, in the accent colour."""
-    # pad every line to the widest frame, so the text beside the mascot never moves
-    width = max(len(line) for f in MASCOT_FRAMES for line in f)
-    return [[("class:accent", line.ljust(width))] for line in MASCOT_FRAMES[frame % len(MASCOT_FRAMES)]]
+    """Return the mascot frame as three rows of styled text."""
+    return [list(row) for row in MASCOT_FRAMES[frame % len(MASCOT_FRAMES)]]
 
 
 class PlaceholderBackend:
