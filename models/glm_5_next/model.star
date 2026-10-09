@@ -4,6 +4,7 @@
 # hyper-connected streams; an optional vision tower and MTP draft head.
 
 load("//lib/adapters/model.star", "banks")
+load("//lib/hyper/model.star", "hyper", "mix")
 load("//lib/kda/model.star", kda = "mixer")
 load("//lib/mla/model.star", "attention")
 
@@ -70,8 +71,6 @@ def layout(id, deploy):
     dense = compute(weights)
     hidden = d.hidden
     streams = d.streams
-    hc_base = 2 * streams + streams * streams
-    hc_fan = streams * hidden
     a = d.mla
     k = d.kda
     index_width = d.index_heads * d.index_head_dim
@@ -132,11 +131,6 @@ def layout(id, deploy):
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s, width: weight(n(s), [width], dense)
-        mix = lambda s: struct(
-            scale = weight(n(s + "_scale"), [3], dtype.f32),
-            base = weight(n(s + "_base"), [hc_base], dtype.f32),
-            dynamic = weight(n(s + "_fn"), [hc_base, hc_fan], dtype.f32),
-        )
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         if d.full_attn_every > 0 and (l + 1) % d.full_attn_every == 0:
             mixer = mla_at("layer.{}".format(l), "kv.{}".format(l), "index.{}".format(l))
@@ -166,12 +160,12 @@ def layout(id, deploy):
         else:
             mlp = routed_at("layer.{}".format(l), experts)
         return struct(
-            attn_mix = mix("attn_hc"),
+            attn_mix = mix(n, "attn_hc", streams, hidden),
             mixer_norm = norm("mixer_norm", hidden),
             mixer_norm_eps = d.norm_eps,
             mixer_kind = mixer_kind,
             mixer = mixer,
-            mlp_mix = mix("ffn_hc"),
+            mlp_mix = mix(n, "ffn_hc", streams, hidden),
             mlp_norm = norm("mlp_norm", hidden),
             mlp_norm_eps = d.norm_eps,
             mlp = mlp,
@@ -204,13 +198,7 @@ def layout(id, deploy):
         heads = a.heads,
         kv_lora_rank = a.kv_lora_rank,
         kv = deploy.kv,
-        hyper = struct(
-            streams = streams,
-            norm_eps = d.norm_eps,
-            gate_eps = d.gate_eps,
-            alpha = d.alpha,
-            sinkhorn = d.sinkhorn,
-        ),
+        hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha, d.sinkhorn),
         embed = weight("embed", [d.vocab, hidden], dtype.u4g64),
         head = weight("lm_head", [d.vocab, hidden], dtype.u4g64),
         layers = [layer(l) for l in range(d.layers)],

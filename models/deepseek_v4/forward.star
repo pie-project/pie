@@ -3,7 +3,8 @@
 # compressed (and on V4.1 sparsely selected) pool, and folds its outputs back;
 # V4.1's Engram writes n-gram memories into the streams before a layer.
 
-PREDICT_K = 16
+load("//lib/hyper/forward.star", "collapse", "gate", "mixes", "predict_route", "summed")
+load("//lib/mla/forward.star", "boundaries")
 
 def caches(m, c):
     kv = c.kv_space(m.kv)
@@ -50,19 +51,11 @@ def forward(m, inputs):
     streams = inputs.fold_layers(m.layers, streams, block)
 
     if m.hc_head != None:
-        hc = m.hc_head
-        normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
-        mixes = ops.elemwise.hc_project(normed, hc.dynamic, hy.streams)
-        y = ops.elemwise.hc_collapse(mixes, streams, hc.scale, hc.base, hy.streams, hy.gate_eps)
+        y = collapse(streams, m.hc_head, hy)
     elif hy.single_pass:
         y = premix(streams, carry["mix"], m)
     else:
-        y, rest = ops.layout.split_rows(streams, m.hidden)
-        for _ in range(1, hy.streams - 1):
-            stream, more = ops.layout.split_rows(rest, m.hidden)
-            y = ops.elemwise.residual_add(stream, y)
-            rest = more
-        y = ops.elemwise.residual_add(rest, y)
+        y = summed(streams, m.hidden, hy.streams)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
     x = ops.layout.gather_rows(x, inputs.readout_rows())
     logits = ops.linear.lm_head(x, m.head if m.head != None else m.embed)
@@ -90,9 +83,7 @@ def forward(m, inputs):
 
             out = layer(m, input_mtp, plan_mtp, dpos, adapter_routes, mtp.block, None, fused, token,
                         step > 0, draft_carry)
-            normed = ops.elemwise.hc_rmsnorm_f32(out, hy.norm_eps)
-            mixes = ops.elemwise.hc_project(normed, mtp.hc_head.dynamic, hy.streams)
-            dy = ops.elemwise.hc_collapse(mixes, out, mtp.hc_head.scale, mtp.hc_head.base, hy.streams, hy.gate_eps)
+            dy = collapse(out, mtp.hc_head, hy)
             read = ops.elemwise.rmsnorm(dy, mtp.norm, mtp.norm_eps)
             draft = ops.linear.lm_head(read, m.head)
             if step == 0:
@@ -217,22 +208,16 @@ def compress(m, x, p, pages, write_page, write_offset, bpos, breq, chain):
     kv = ops.linear.matmul(x, c.wkv)
     return ops.elemwise.rmsnorm(kv, c.norm, c.norm_eps)
 
-def mixes_of(normed, mix, hy):
-    if mix.dynamic != None:
-        return ops.elemwise.hc_project(normed, mix.dynamic, hy.streams)
-    head, _ = ops.layout.split_rows(normed, mix.base.shape[0])
-    return head
-
 def sublayer_input(streams, mix, m, carry):
     hy = m.hyper
     if not hy.single_pass:
         return gate(streams, mix, hy)
     normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
-    mixes = mixes_of(normed, mix, hy)
-    _, post_mix, comb_mix = ops.elemwise.hc_gates(mixes, streams, mix.scale, mix.base, hy.streams,
+    mixed = mixes(normed, mix, hy)
+    _, post_mix, comb_mix = ops.elemwise.hc_gates(mixed, streams, mix.scale, mix.base, hy.streams,
                                                   hy.gate_eps, hy.alpha, hy.sinkhorn)
     x = premix(streams, carry["mix"], m)
-    carry["mix"] = struct(mixes = mixes, scale = mix.scale, base = mix.base)
+    carry["mix"] = struct(mixes = mixed, scale = mix.scale, base = mix.base)
     return x, post_mix, comb_mix
 
 def premix(streams, prev, m):
@@ -273,11 +258,7 @@ def predict_next(streams, nxt, hy):
         # The next layer's input mix is this layer's own prediction, which is
         # not settled here: the hint would score the wrong row.
         return None
-    px, _, _ = gate(streams, nxt.mlp_mix, hy)
-    if nxt.mlp_norm != None:
-        px = ops.elemwise.rmsnorm(px, nxt.mlp_norm, hy.norm_eps)
-    logits = ops.linear.matmul(px, f.router)
-    return ops.linear.moe_predict_route(logits, f.gate.bias, f.experts, PREDICT_K)
+    return predict_route(streams, hy, nxt.mlp_mix, nxt.mlp_norm, hy.norm_eps, f.router, f.gate.bias, f.experts)
 
 def mlp(x, ids, f, streams, nxt, hy):
     if f.kind == "dense":
@@ -335,14 +316,3 @@ def rank(x, q_a, ix, positions, keys, ratio):
     q = rope(q, positions, ix.rope_dim, ix.head_dim, ix.theta, ix.yarn)
     weights = ops.linear.matmul(x, ix.weights_proj)
     return ops.attn.index_topk(q, weights, keys, ix.heads, ix.head_dim, ix.top_k, ratio)
-
-def gate(streams, mix, hy):
-    normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
-    mixes = mixes_of(normed, mix, hy)
-    return ops.elemwise.hc_gates(mixes, streams, mix.scale, mix.base, hy.streams, hy.gate_eps, hy.alpha, hy.sinkhorn)
-
-def boundaries(positions, row_valid, ratio):
-    one, many = positions.on(fact.single_token()), positions.on(~fact.single_token())
-    dpos, dreq, drope = ops.attn.pool_boundary_decode(one, row_valid, ratio)
-    ppos, preq, prope = ops.attn.pool_boundary_prefill(many, row_valid, ratio)
-    return merge([dpos, ppos]), merge([dreq, preq]), merge([drope, prope])

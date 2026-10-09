@@ -3,11 +3,9 @@
 # vision tower's patches scattered into the embedded rows; and the MTP head
 # drafting from the trunk's last hidden rows.
 
+load("//lib/hyper/forward.star", "gate", "predict_route", "summed")
 load("//lib/kda/forward.star", kda = "mixer", kda_caches = "caches")
-load("//lib/mla/forward.star", "attention", "cache", "plans", "whole")
-
-# How many experts the next layer's router is predicted to take.
-PREDICT_K = 16
+load("//lib/mla/forward.star", "attention", "boundaries", "cache", "plans", "whole")
 
 def caches(m, c):
     kv = c.kv_space(m.kv)
@@ -57,13 +55,7 @@ def forward(m, inputs):
 
     streams = inputs.fold_layers(m.layers, streams, block)
 
-    y, rest = ops.layout.split_rows(streams, m.hidden)
-    for _ in range(1, hy.streams - 1):
-        stream, more = ops.layout.split_rows(rest, m.hidden)
-        y = ops.elemwise.residual_add(stream, y)
-        rest = more
-    y = ops.elemwise.residual_add(rest, y)
-
+    y = summed(streams, m.hidden, hy.streams)
     y = ops.layout.gather_rows(y, inputs.readout_rows())
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
     logits = ops.linear.lm_head(x, m.head)
@@ -106,10 +98,16 @@ def predict_next(streams, following, hy):
     if following == None or not following.mlp.routed:
         return None
     f = following.mlp
-    px, _, _ = gate(streams, following.mlp_mix, hy)
-    px = ops.elemwise.rmsnorm(px, following.mlp_norm, following.mlp_norm_eps)
-    logits = ops.linear.matmul(px, f.router)
-    return ops.linear.moe_predict_route(logits, f.bias, f.experts, PREDICT_K)
+    return predict_route(
+        streams,
+        hy,
+        following.mlp_mix,
+        following.mlp_norm,
+        following.mlp_norm_eps,
+        f.router,
+        f.bias,
+        f.experts,
+    )
 
 def mlp(x, f, hint):
     if not f.routed:
@@ -178,14 +176,6 @@ def index_select(x, q_a, inputs, positions, act, ix, split):
     weights = ops.linear.matmul(x, ix.weights_proj)
     return ops.attn.index_topk(q, weights, keys, ix.heads, ix.head_dim, ix.top_k, ix.kpool)
 
-def boundaries(positions, row_valid, ratio, split):
-    if not split:
-        return ops.attn.pool_boundary_prefill(positions, row_valid, ratio)
-    one = fact.single_token()
-    dpos, dreq, drope = ops.attn.pool_boundary_decode(positions.on(one), row_valid, ratio)
-    ppos, preq, prope = ops.attn.pool_boundary_prefill(positions.on(~one), row_valid, ratio)
-    return (merge([dpos, ppos]), merge([dreq, preq]), merge([drope, prope]))
-
 def tower(inputs, t):
     d = t.head_dim
     x = inputs.patches(t.patch_width)
@@ -224,17 +214,3 @@ def tower(inputs, t):
     h = ops.linear.matmul(g, mg.gate_up)
     a = ops.linear.mlp_swiglu_clamp(h, t.merger_inter, t.limit)
     return ops.linear.matmul(a, mg.down)
-
-def gate(streams, mix, hy):
-    normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
-    mixes = ops.elemwise.hc_project(normed, mix.dynamic, hy.streams)
-    return ops.elemwise.hc_gates(
-        mixes,
-        streams,
-        mix.scale,
-        mix.base,
-        hy.streams,
-        hy.gate_eps,
-        hy.alpha,
-        hy.sinkhorn,
-    )

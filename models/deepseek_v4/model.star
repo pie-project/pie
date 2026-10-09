@@ -4,6 +4,7 @@
 # Attention 2 (cross-layer KV and index reuse), Single-Pass mHC and Engram.
 
 load("//lib/adapters/model.star", "banks")
+load("//lib/hyper/model.star", "head", "hyper", "mix")
 
 DRAFT_DEPTH = 1
 DRAFT_EXPERTS = 256
@@ -26,10 +27,6 @@ def gate_of(r, layer):
             return d
     return r.gate
 
-def hyper(streams, norm_eps, gate_eps, alpha, sinkhorn, single_pass):
-    return struct(streams = streams, norm_eps = norm_eps, gate_eps = gate_eps, alpha = alpha,
-                  sinkhorn = sinkhorn, single_pass = single_pass)
-
 # ---------------------------------------------------------------------------
 # The V4 base.
 # ---------------------------------------------------------------------------
@@ -50,11 +47,6 @@ def base(w, act, kv, d):
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s, dim: weight(n(s), [dim], w)
-        mix = lambda s: struct(
-            scale = weight(n(s + "_scale"), [3], dtype.f32),
-            base = weight(n(s + "_base"), [2 * streams + streams * streams], dtype.f32),
-            dynamic = None,
-        )
         lora_a, lora_b = banks("layer.{}".format(l), hidden, compute(w))
         ratio = d.pool[l]
         if l < d.dense_layers:
@@ -82,7 +74,7 @@ def base(w, act, kv, d):
                 scaling = d.scaling,
             )
         return struct(
-            attn_mix = mix("attn_mix"),
+            attn_mix = mix(n, "attn_mix", streams, hidden, dynamic = False),
             attn_norm = None,
             mlp_norm = None,
             attn = struct(
@@ -107,7 +99,7 @@ def base(w, act, kv, d):
                 indexer = None,
                 selection = "none",
             ),
-            mlp_mix = mix("mlp_mix"),
+            mlp_mix = mix(n, "mlp_mix", streams, hidden, dynamic = False),
             mlp = mlp,
             lora_a = lora_a,
             lora_b = lora_b,
@@ -122,7 +114,7 @@ def base(w, act, kv, d):
         head_dim = d.head_dim,
         window = d.window,
         kv = kv,
-        hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha, d.sinkhorn, False),
+        hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha, d.sinkhorn),
         embed = weight("embed", [d.vocab, hidden], w),
         head = None,
         hc_head = None,
@@ -153,13 +145,6 @@ def flash_dims(layers, pool, hash, experts = 256, draft = False):
         streams = 4, gate_eps = 1e-6, alpha = 2.0, sinkhorn = 20, experts = experts, top_k = 6,
         moe_inter = 2048, shared_inter = 2048, renorm = True, scaling = 1.5,
         swiglu_limit = 10.0, vocab = 129280, norm_eps = 1e-6,
-    )
-
-def mix_of(n, s, hc_base, hc_fan):
-    return struct(
-        scale = weight(n(s + "_scale"), [3], dtype.f32),
-        base = weight(n(s + "_base"), [hc_base], dtype.f32),
-        dynamic = weight(n(s + "_fn"), [hc_base, hc_fan], dtype.f32),
     )
 
 def moe_flash(n, d, experts, gate, gate_dtype, up_dtype, down_dtype, split, weights, dense):
@@ -196,8 +181,6 @@ def flash(w, r, act, kv, d):
     dense = compute(w)
     hidden = d.hidden
     streams = d.streams
-    hc_base = 2 * streams + streams * streams
-    hc_fan = streams * hidden
     q_w = d.heads * d.head_dim
     kv_latent = d.kv_latent
     o_out = d.o_groups * d.o_lora
@@ -249,7 +232,7 @@ def flash(w, r, act, kv, d):
         else:
             gate = struct(kind = "bias", bias = weight(n("gate.bias"), [experts], dtype.f32))
         return struct(
-            attn_mix = mix_of(n, "attn_mix", hc_base, hc_fan),
+            attn_mix = mix(n, "attn_mix", streams, hidden),
             attn_norm = norm("attn_norm", hidden),
             mlp_norm = norm("ffn_norm", hidden),
             attn = struct(
@@ -273,7 +256,7 @@ def flash(w, r, act, kv, d):
                 indexer = indexer,
                 selection = "own" if has_indexer else "none",
             ),
-            mlp_mix = mix_of(n, "mlp_mix", hc_base, hc_fan),
+            mlp_mix = mix(n, "mlp_mix", streams, hidden),
             mlp = moe_flash(n, d, experts, gate, gate_dtype, up_dtype, down_dtype, split, weights, sdense),
             lora_a = lora_a,
             lora_b = lora_b,
@@ -296,11 +279,7 @@ def flash(w, r, act, kv, d):
             h_proj = weight("mtp.h_proj", [streams * hidden, hidden], bf),
             block = layer_at("mtp.decoder", None, False, DRAFT_EXPERTS, True, dtype.mxfp4,
                              dtype.mxfp4, dtype.mxfp4, bf, bf, "kv.mtp", "pool.mtp", "index.mtp"),
-            hc_head = struct(
-                base = weight("mtp.hc_head.base", [streams], dtype.f32),
-                dynamic = weight("mtp.hc_head.fn", [streams, hc_fan], dtype.f32),
-                scale = weight("mtp.hc_head.scale", [1], dtype.f32),
-            ),
+            hc_head = head("mtp.hc_head", streams, hidden),
             norm = weight("mtp.norm", [hidden], bf),
             norm_eps = d.norm_eps,
             depth = DRAFT_DEPTH,
@@ -313,14 +292,10 @@ def flash(w, r, act, kv, d):
         head_dim = d.head_dim,
         window = d.window,
         kv = kv,
-        hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha, d.sinkhorn, False),
+        hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha, d.sinkhorn),
         embed = weight("embed", [d.vocab, hidden], w),
         head = weight("lm_head", [d.vocab, hidden], w),
-        hc_head = struct(
-            base = weight("hc_head.base", [streams], dtype.f32),
-            dynamic = weight("hc_head.fn", [streams, hc_fan], dtype.f32),
-            scale = weight("hc_head.scale", [1], dtype.f32),
-        ),
+        hc_head = head("hc_head", streams, hidden),
         layers = layers,
         final_norm = weight("final_norm", [hidden], dense),
         final_norm_eps = d.norm_eps,
@@ -409,8 +384,6 @@ def flash41(w, r, act, kv, d):
     dense = compute(w)
     hidden = d.hidden
     streams = d.streams
-    hc_base = 2 * streams + streams * streams
-    hc_fan = streams * hidden
     q_w = d.heads * d.head_dim
     kv_latent = d.kv_latent
     o_out = d.o_groups * d.o_lora
@@ -492,7 +465,7 @@ def flash41(w, r, act, kv, d):
             )
 
         return struct(
-            attn_mix = mix_of(n, "attn_mix", hc_base, hc_fan),
+            attn_mix = mix(n, "attn_mix", streams, hidden),
             attn_norm = norm("attn_norm", hidden),
             mlp_norm = norm("ffn_norm", hidden),
             attn = struct(
@@ -516,7 +489,7 @@ def flash41(w, r, act, kv, d):
                 indexer = indexer,
                 selection = selection,
             ),
-            mlp_mix = mix_of(n, "mlp_mix", hc_base, hc_fan),
+            mlp_mix = mix(n, "mlp_mix", streams, hidden),
             mlp = moe_flash(n, d, d.experts, struct(kind = "bias", bias = weight(n("gate.bias"), [d.experts], dtype.f32)),
                             gate_of(r, l), r.up, r.down, True, w, dense),
             lora_a = lora_a,
@@ -532,7 +505,7 @@ def flash41(w, r, act, kv, d):
         head_dim = d.head_dim,
         window = d.window,
         kv = kv,
-        hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha, d.sinkhorn, True),
+        hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha, d.sinkhorn, single_pass = True),
         embed = weight("embed", [d.vocab, hidden], dense),
         head = weight("lm_head", [d.vocab, hidden], dense),
         hc_head = None,

@@ -84,3 +84,14 @@ def arm(decode, q, plan, q_pe, selection, pages, a):
         return score(q, plan, q_pe, pages, a.heads, a.kv_lora_rank, a.sm_scale)
     score = ops.attn.mla_decode_selected if decode else ops.attn.mla_prefill_selected
     return score(q, plan, q_pe, selection, pages, a.heads, a.kv_lora_rank, a.sm_scale)
+
+def boundaries(positions, row_valid, ratio, split = True):
+    """Where the rows close entries of a key pool that compresses `ratio`
+    rows into one: each boundary's position, request and rope position.
+    With `split` the decode and prefill arms find theirs apart."""
+    if not split:
+        return ops.attn.pool_boundary_prefill(positions, row_valid, ratio)
+    one = fact.single_token()
+    dpos, dreq, drope = ops.attn.pool_boundary_decode(positions.on(one), row_valid, ratio)
+    ppos, preq, prope = ops.attn.pool_boundary_prefill(positions.on(~one), row_valid, ratio)
+    return merge([dpos, ppos]), merge([dreq, preq]), merge([drope, prope])
