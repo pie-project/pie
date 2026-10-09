@@ -6,37 +6,65 @@
 //! and drive one inferlet turn per call over the loopback WebSocket with
 //! `pie-client`. The engine boots once and stays warm for the life of the
 //! process. Each call installs the component on first sight, launches it,
-//! streams its stdout to the caller as it is produced, and returns its
-//! return value as a heap-allocated C string the caller releases with
-//! `pie_ios_free`.
+//! streams its reply text (stdout) and reasoning text (session messages)
+//! to the caller as they are produced, and returns its return value as a
+//! heap-allocated C string the caller releases with `pie_ios_free`.
+//!
+//! Every turn carries a caller-chosen id, so `pie_ios_cancel` can stop it
+//! from any thread: in flight, by terminating its process on the engine,
+//! or before it has started, so that it never launches. A voice app needs
+//! both: the user talks over a reply that is still being generated, and the
+//! next question must not wait behind the one it replaces.
 
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::pin::pin;
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use client::client::{Client, Process, ProcessEvent};
+use tokio::sync::watch;
 use tokio::time::{Instant, timeout, timeout_at};
 
-/// Per-chunk callback: a NUL-terminated UTF-8 chunk plus the caller's ctx.
-/// Invoked on the thread that called `pie_ios_run_stream`.
-pub type PieStreamCb = unsafe extern "C" fn(chunk: *const c_char, ctx: *mut c_void);
+/// Per-chunk callback: what the chunk is (`PIE_CHUNK_REPLY` or
+/// `PIE_CHUNK_REASONING`), the chunk as NUL-terminated UTF-8, and the
+/// caller's ctx. Invoked on the thread that called `pie_ios_run_stream`.
+pub type PieStreamCb = unsafe extern "C" fn(kind: i32, chunk: *const c_char, ctx: *mut c_void);
+
+/// Chunk kind for reply text: the inferlet's stdout, which by the
+/// voice-chat contract is speakable as it arrives.
+pub const PIE_CHUNK_REPLY: i32 = 0;
+
+/// Chunk kind for reasoning text: the inferlet's session messages. Never
+/// to be spoken.
+pub const PIE_CHUNK_REASONING: i32 = 1;
+
+/// What `pie_ios_run_stream` returns, exactly, for a cancelled turn.
+pub const PIE_CANCELLED: &str = "PIE CANCELLED";
 
 /// Run one inferlet turn: boot the engine on first use, install the
 /// component at `wasm_path` on first sight, launch it with `input_json`,
-/// deliver every stdout chunk to `cb` as it arrives, and return the
-/// inferlet's return value.
+/// deliver every stdout chunk (kind 0) and session message (kind 1) to `cb`
+/// as it arrives, and return the inferlet's return value.
 ///
 /// `version` may be null. When given it must equal the version the
 /// component's `pie.package` section declares (the engine refuses the
 /// install otherwise), and it names the version of a component that has
 /// no such section.
-/// The result is a malloc'd C string: the return value, or a message
-/// starting with "PIE ERROR:" on any failure, a panic on this thread
-/// included. Release it with `pie_ios_free`.
+///
+/// `turn_id` names the turn for `pie_ios_cancel`. Ids must be unique for
+/// the life of the process; a cancel that arrived for this id before the
+/// call makes it return at once, without launching anything.
+///
+/// The result is a malloc'd C string: the return value; exactly
+/// `PIE CANCELLED` when the turn was cancelled, before or during (any text
+/// already streamed was delivered through `cb`); or a message starting with
+/// `PIE ERROR: ` on any failure, a panic on this thread included. Release
+/// it with `pie_ios_free`.
 ///
 /// # Safety
 /// `config_path`, `wasm_path` and `input_json` must be valid
@@ -48,6 +76,7 @@ pub unsafe extern "C" fn pie_ios_run_stream(
     wasm_path: *const c_char,
     version: *const c_char,
     input_json: *const c_char,
+    turn_id: u64,
     cb: PieStreamCb,
     cb_ctx: *mut c_void,
 ) -> *mut c_char {
@@ -55,17 +84,18 @@ pub unsafe extern "C" fn pie_ios_run_stream(
     // NUL-terminated string that outlives this call.
     let arg = |p: *const c_char| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
     let version = (!version.is_null()).then(|| arg(version));
-    let emit = move |chunk: &str| {
+    let emit = move |kind: i32, chunk: &str| {
         if let Ok(c) = CString::new(chunk.replace('\0', "")) {
             // SAFETY: `cb` is callable for the duration of the call and `c`
             // outlives the callback.
-            unsafe { cb(c.as_ptr(), cb_ctx) };
+            unsafe { cb(kind, c.as_ptr(), cb_ctx) };
         }
     };
     // Unwinding into the C caller aborts the app with nothing on screen;
     // an error string at least says why.
     let out = catching(|| {
         stream_impl(
+            turn_id,
             &arg(config_path),
             &arg(wasm_path),
             version.as_deref(),
@@ -77,6 +107,27 @@ pub unsafe extern "C" fn pie_ios_run_stream(
     CString::new(out.replace('\0', ""))
         .expect("NULs stripped above")
         .into_raw()
+}
+
+/// Stop the turn `turn_id`.
+///
+/// A turn in flight has its process terminated on the engine and returns
+/// `PIE CANCELLED` as soon as the engine acknowledges, a few milliseconds.
+/// A turn still booting the engine or installing its component (both only
+/// ever on the first turn of the process) stops right after that step,
+/// before it launches. A turn not started yet returns `PIE CANCELLED`
+/// without launching when it starts; the ids of the most recent
+/// `REMEMBERED_IDS` such cancels are kept for that. On a turn that has
+/// already returned this does nothing.
+///
+/// Never blocks on the engine: it flips the turn's state and wakes it, so
+/// it is safe to call from any thread, the main thread included, while
+/// `pie_ios_run_stream` is blocked on another.
+#[unsafe(no_mangle)]
+pub extern "C" fn pie_ios_cancel(turn_id: u64) {
+    // Unwinding into the C caller aborts the app. A cancel that panicked
+    // is one that did not happen, and the turn's deadline still bounds it.
+    let _ = panic::catch_unwind(|| cancel(turn_id));
 }
 
 /// Release a string returned by `pie_ios_run_stream`.
@@ -111,6 +162,11 @@ const DEFAULT_LOG_FILTER: &str = "info,tarpc=warn";
 /// gateway accepts a bare name without a key, as it does for `pie run`.
 const CLIENT_IDENTITY: &str = "pie-ios";
 
+/// How many ids the turn registry remembers of turns cancelled before they
+/// started, and of turns that have returned. A voice app has a turn or two
+/// queued at most, so this only has to outlast that queue.
+const REMEMBERED_IDS: usize = 64;
+
 /// Programs already installed in this process: wasm path to the name the
 /// engine gave it (from the component's `pie.package` section when it has
 /// one, else file stem plus version). The wasm ships inside the app bundle
@@ -118,6 +174,121 @@ const CLIENT_IDENTITY: &str = "pie-ios";
 /// force-overwrite, uninstalling and recompiling) it on every turn is
 /// pure latency.
 static INSTALLED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// Turns by id, for `pie_ios_cancel`, which may run on any thread while
+/// the turn it names blocks another. Held only to flip state, never across
+/// a call into the engine, so a cancel never waits on one.
+static TURNS: Mutex<Turns> = Mutex::new(Turns {
+    live: Vec::new(),
+    early: VecDeque::new(),
+    finished: VecDeque::new(),
+    serial: 0,
+});
+
+struct Turns {
+    /// Turns registered and not yet returned.
+    live: Vec<LiveTurn>,
+    /// Ids cancelled before any turn registered them, oldest first. The
+    /// turn that registers one takes it out and returns at once.
+    early: VecDeque<u64>,
+    /// Ids of turns that have returned, oldest first, so that a cancel
+    /// arriving just after its turn finished stays the no-op it should be
+    /// instead of reading as a cancel-before-start.
+    finished: VecDeque<u64>,
+    /// Tells registrations apart, so a turn removes exactly its own entry.
+    serial: u64,
+}
+
+struct LiveTurn {
+    id: u64,
+    serial: u64,
+    /// Flipped to true by a cancel; the turn watches the other end.
+    cancel: watch::Sender<bool>,
+}
+
+/// Every critical section on the registry is a few pushes and removals
+/// that cannot be left half done, so a panic elsewhere while it was held
+/// leaves nothing inconsistent behind; recover the guard rather than turn
+/// every later turn and cancel into a panic.
+fn turns() -> MutexGuard<'static, Turns> {
+    TURNS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn remember(ids: &mut VecDeque<u64>, id: u64) {
+    if ids.len() == REMEMBERED_IDS {
+        ids.pop_front();
+    }
+    ids.push_back(id);
+}
+
+fn cancel(turn_id: u64) {
+    let mut turns = turns();
+    let mut live = false;
+    for turn in turns.live.iter().filter(|turn| turn.id == turn_id) {
+        // Works whether or not the turn is waiting on it yet: a turn reads
+        // the current value before it waits.
+        turn.cancel.send_replace(true);
+        live = true;
+    }
+    if live || turns.finished.contains(&turn_id) || turns.early.contains(&turn_id) {
+        return;
+    }
+    remember(&mut turns.early, turn_id);
+}
+
+/// One turn's place in the registry, from before the engine boots until
+/// the call returns (or unwinds).
+struct Registration {
+    id: u64,
+    serial: u64,
+    cancel: watch::Receiver<bool>,
+}
+
+impl Registration {
+    /// Registers `id`, or `None` when it was cancelled before it started.
+    fn new(id: u64) -> Option<Self> {
+        let mut turns = turns();
+        if let Some(at) = turns.early.iter().position(|&early| early == id) {
+            turns.early.remove(at);
+            remember(&mut turns.finished, id);
+            return None;
+        }
+        let (tx, rx) = watch::channel(false);
+        turns.serial += 1;
+        let serial = turns.serial;
+        turns.live.push(LiveTurn {
+            id,
+            serial,
+            cancel: tx,
+        });
+        Some(Self {
+            id,
+            serial,
+            cancel: rx,
+        })
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self.cancel.borrow()
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        let mut turns = turns();
+        turns.live.retain(|turn| turn.serial != self.serial);
+        remember(&mut turns.finished, self.id);
+    }
+}
+
+/// Resolves once the turn is cancelled, and never if it is not.
+async fn cancelled(mut signal: watch::Receiver<bool>) {
+    // The registry holds the sender until the turn returns, so `wait_for`
+    // fails only once nothing is waiting on it any more.
+    if signal.wait_for(|&cancelled| cancelled).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
 
 /// Runs `f`, reporting a panic as an error instead of unwinding. Tasks on
 /// the tokio workers are already contained by tokio; this covers the
@@ -136,54 +307,81 @@ fn catching<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     }
 }
 
+/// How a turn that did not fail ended.
+enum Outcome {
+    /// The inferlet's return value.
+    Returned(String),
+    Cancelled,
+}
+
 fn stream_impl(
+    turn_id: u64,
     config_path: &str,
     wasm: &str,
     version: Option<&str>,
     input: &str,
-    emit: &dyn Fn(&str),
+    emit: &dyn Fn(i32, &str),
 ) -> Result<String> {
+    // Registered before the boot, which can take seconds on the first turn,
+    // so a cancel during it is not lost.
+    let Some(registration) = Registration::new(turn_id) else {
+        return Ok(PIE_CANCELLED.to_string());
+    };
     let g = engine_globals(config_path)?;
-    g.runtime
-        .block_on(turn(&g.ws_url, wasm, version, input, emit))
+    if registration.is_cancelled() {
+        return Ok(PIE_CANCELLED.to_string());
+    }
+    let outcome = g.runtime.block_on(turn(
+        &g.ws_url,
+        wasm,
+        version,
+        input,
+        emit,
+        &registration.cancel,
+    ))?;
+    Ok(match outcome {
+        Outcome::Returned(value) => value,
+        Outcome::Cancelled => PIE_CANCELLED.to_string(),
+    })
 }
 
 /// One client connection per turn, exactly as `pie run` does it: connect,
 /// identify, drive, close. Closing joins the client's reader and writer
 /// tasks so a long session does not accumulate them.
 ///
-/// The deadline spans the whole turn. When it fires, the launched process
-/// is terminated (best effort) rather than left running: the phone config
-/// allows only a handful of concurrent processes, and a stalled one would
-/// hold its seat while the app shows the error.
+/// The deadline spans the whole turn. When it fires, or the turn is
+/// cancelled, the launched process is terminated rather than left running:
+/// the phone config allows only a handful of concurrent processes, and one
+/// still generating a reply nobody wants holds its seat and the GPU while
+/// the next turn waits behind it.
 async fn turn(
     ws_url: &str,
     wasm: &str,
     version: Option<&str>,
     input: &str,
-    emit: &dyn Fn(&str),
-) -> Result<String> {
+    emit: &dyn Fn(i32, &str),
+    cancel: &watch::Receiver<bool>,
+) -> Result<Outcome> {
     let deadline = Instant::now() + TURN_DEADLINE;
     let client = match timeout_at(deadline, connect(ws_url)).await {
         Ok(client) => client?,
         Err(_) => return Err(stalled()),
     };
-    // The launched process lives out here so that a deadline firing
-    // mid-turn still knows what to terminate.
+    // The launched process lives out here so that a deadline firing or a
+    // cancel arriving mid-turn still knows what to terminate.
     let mut process = None;
-    let drive = drive(&client, &mut process, wasm, version, input, emit);
+    let drive = drive(&client, &mut process, wasm, version, input, emit, cancel);
     let outcome = match timeout_at(deadline, drive).await {
+        Ok(Ok(Outcome::Cancelled)) => {
+            if let Some(process) = &process {
+                terminate(&client, process, "cancelled").await;
+            }
+            Ok(Outcome::Cancelled)
+        }
         Ok(outcome) => outcome,
         Err(_) => {
             if let Some(process) = &process {
-                match timeout(CLOSE_GRACE, client.terminate_process(process.id())).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => tracing::warn!(error = %e, "terminating the stalled process"),
-                    Err(_) => tracing::warn!(
-                        "the engine did not acknowledge termination within {} s",
-                        CLOSE_GRACE.as_secs()
-                    ),
-                }
+                terminate(&client, process, "stalled").await;
             }
             Err(stalled())
         }
@@ -201,6 +399,20 @@ async fn turn(
         ),
     }
     outcome
+}
+
+/// Best effort, bounded by `CLOSE_GRACE`. The engine acknowledges as soon
+/// as it has signalled the process; the fires it already has in flight
+/// settle on their own.
+async fn terminate(client: &Client, process: &Process, why: &str) {
+    match timeout(CLOSE_GRACE, client.terminate_process(process.id())).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "terminating the {why} process"),
+        Err(_) => tracing::warn!(
+            "the engine did not acknowledge terminating the {why} process within {} s",
+            CLOSE_GRACE.as_secs()
+        ),
+    }
 }
 
 fn stalled() -> anyhow::Error {
@@ -227,29 +439,49 @@ async fn drive(
     wasm: &str,
     version: Option<&str>,
     input: &str,
-    emit: &dyn Fn(&str),
-) -> Result<String> {
+    emit: &dyn Fn(i32, &str),
+    cancel: &watch::Receiver<bool>,
+) -> Result<Outcome> {
+    if *cancel.borrow() {
+        return Ok(Outcome::Cancelled);
+    }
+    // The install is not interrupted: abandoning an upload part-way would
+    // leave the engine compiling a program this process has no record of,
+    // and the next turn needs it anyway. It happens once per process.
     let program = installed_program(client, wasm, version).await?;
+    // Nor is the launch, a loopback round trip: once it returns the process
+    // has an id to terminate, while a launch abandoned mid-flight would
+    // leave one running that this turn cannot name.
+    if *cancel.borrow() {
+        return Ok(Outcome::Cancelled);
+    }
     let process = slot.insert(
         client
             .launch_process(program.clone(), input.to_string(), true)
             .await
             .with_context(|| format!("launching {program}"))?,
     );
+    let mut stop = pin!(cancelled(cancel.clone()));
     loop {
-        match process.recv().await.context("reading process output")? {
-            // Only stdout is speakable by contract; everything else is
-            // diagnostics and belongs in the console log.
-            ProcessEvent::Stdout(text) => emit(&text),
+        // A cancel wins a tie: the reply it interrupts is unwanted even if
+        // its last event is already here.
+        let event = tokio::select! {
+            biased;
+            () = &mut stop => return Ok(Outcome::Cancelled),
+            event = process.recv() => event.context("reading process output")?,
+        };
+        match event {
+            ProcessEvent::Stdout(text) => emit(PIE_CHUNK_REPLY, &text),
+            ProcessEvent::Message(text) => emit(PIE_CHUNK_REASONING, &text),
+            // Diagnostics; the app mirrors stderr into its log file.
             ProcessEvent::Stderr(text) => eprintln!("[inferlet stderr] {}", text.trim_end()),
-            ProcessEvent::Message(text) => eprintln!("[inferlet message] {}", text.trim_end()),
             // Nowhere on a phone to put a file the inferlet sends back.
             ProcessEvent::File(file) => eprintln!(
                 "[inferlet file] dropped {} ({} bytes)",
                 file.file_name("unnamed"),
                 file.data.len()
             ),
-            ProcessEvent::Return(value) => return Ok(value),
+            ProcessEvent::Return(value) => return Ok(Outcome::Returned(value)),
             ProcessEvent::Error(message) => return Err(anyhow!("inferlet errored: {message}")),
         }
     }

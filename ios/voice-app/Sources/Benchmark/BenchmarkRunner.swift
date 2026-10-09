@@ -8,6 +8,12 @@ import Foundation
 /// script can capture them from the console of either the Simulator or a
 /// physical device.
 ///
+/// Each turn is a spoken reply under the voice prompt, so the numbers
+/// describe what voice mode feels like. The generation settings are the
+/// benchmark's own rather than voice mode's preset, so a table from this
+/// build compares like for like with the published ones whatever the app's
+/// presets become.
+///
 /// What it measures, per turn:
 ///   - `ttft_s`      time from request to the first token reaching the app
 ///   - `decode_tps`  generated tokens ÷ time spent generating after TTFT
@@ -27,6 +33,10 @@ enum BenchmarkRunner {
         let n = UserDefaults.standard.integer(forKey: "PieBenchmarkTurns")
         return n > 0 ? n : 5
     }
+
+    /// The settings every published table was measured with: 120 tokens
+    /// a turn, sampled as the voice preset samples.
+    private static let options = ReplyOptions(maxTokens: 120, temperature: 0.7, topP: 0.95, think: false)
 
     private static let script = [
         "What is one good reason to run a language model on a phone instead of in the cloud?",
@@ -122,26 +132,34 @@ enum BenchmarkRunner {
 
             var peak = footprintMB()
             // The backend is stateless: the pass carries the transcript
-            // itself, exactly as the conversation controller would.
-            var history: [ChatMessage] = []
+            // itself, exactly as the chat controller would, under a session
+            // of its own so no earlier run's cached prefixes are adopted.
+            let session = "bench-" + UUID().uuidString.lowercased()
+            let system = PromptMessage(role: .system, content: PieRuntimeConfig.chatSystemPrompt)
+            var history: [PromptMessage] = []
 
             for index in 0..<turnCount {
                 let utterance = script[index % script.count]
-                let started = Date()
-                var firstTokenAt: Date?
+                let question = PromptMessage(
+                    role: .user,
+                    content: MessageRendering.spokenQuestion(utterance)
+                )
 
                 do {
                     let result = try await backend.reply(
-                        to: utterance,
-                        history: history
-                    ) { _ in
-                        if firstTokenAt == nil { firstTokenAt = Date() }
-                    }
-                    history.append(ChatMessage(role: .user, content: utterance))
-                    history.append(ChatMessage(role: .assistant, content: result.text))
+                        ReplyTicket(),
+                        session: session,
+                        messages: [system] + history + [question],
+                        options: options,
+                        onEvent: { _ in }
+                    )
+                    history.append(question)
+                    history.append(PromptMessage(role: .assistant, content: result.text))
 
-                    let ttft = (firstTokenAt ?? Date()).timeIntervalSince(started)
-                    let total = -started.timeIntervalSinceNow
+                    // Both clocks are the backend's: request to first
+                    // streamed token, and request to return.
+                    let total = result.stats.elapsed
+                    let ttft = result.stats.timeToFirstToken ?? total
                     // Decode rate over the generation window only: including
                     // prefill would flatter or punish the number depending on
                     // prompt length rather than reporting decode speed.

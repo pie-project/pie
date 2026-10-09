@@ -5,61 +5,85 @@ the device, answered by Qwen3.5-0.8B running through the Pie 0.5 Metal
 engine embedded in the app, and spoken back. Nothing leaves the phone.
 
 ```
-   microphone ──▶ SFSpeechRecognizer ──▶ transcript
-                                             │
-                                             ▼
-                                   ConversationController
-                                             │
-                       voice-chat inferlet (wasmtime Pulley)
-                                             │
-                          Qwen3.5-0.8B U4g64 · Metal engine
-                                             │
-                       speakable text, streamed sentence by sentence
-                                             ▼
-                                    AVSpeechSynthesizer ──▶ speaker
+   microphone ─▶ echo canceller ─▶ voice-activity gate ─▶ SFSpeechRecognizer
+        ▲                                                        │ transcript
+        │ talking over a reply cancels it                        ▼
+        │                                            VoiceModeController
+        │                                                        │
+        │                                  ChatController ─▶ PieEngine (ConversationBackend)
+        │                                                        │
+        │                               voice-chat inferlet (wasmtime Pulley)
+        │                               Qwen3.5-0.8B U4g64 · Metal engine
+        │                                                        │ reply text, streamed
+        │                                                        ▼
+   speaker ◀── AudioEngineHub ◀── AVSpeechSynthesizer.write, sentence by sentence
 ```
+
+The same conversations are also a typed chat, laid out like ChatGPT's
+iPhone app (sidebar of saved chats, composer with dictation and
+attachments, Markdown replies, "Think longer" mode) in the palette of
+Lin Zhong's site. Voice mode is a full-screen view over the open chat, and
+its turns land in that chat.
 
 ## Layout
 
 | Directory | Knows about | Depends on |
 |---|---|---|
-| `Sources/PieKit/` | the inferlet, wasm, `.zt` artifacts, the C shim | `ConversationBackend` |
-| `Sources/AudioKit/` | microphones, recognisers, synthesizers | nothing app-specific |
-| `Sources/Conversation/` | turn-taking, the transcript | protocols only |
-| `Sources/UI/` | SwiftUI | the controller |
-| `Sources/VoiceApp.swift` | all three, once | composition root |
+| `Sources/Core/` | the shared contracts: chat models, the backend and audio protocols | nothing |
+| `Sources/PieKit/` | the inferlet, wasm, `.zt` artifacts, the C shim | `Core/` |
+| `Sources/AudioKit/` | the audio engine and session, microphones, recognisers, synthesizers | `Core/` |
+| `Sources/Conversation/` | chats, their storage, voice mode and dictation turn-taking | `Core/` protocols |
+| `Sources/UI/` | SwiftUI: chat, voice mode, settings, the screenshot tour | the controllers |
+| `Sources/Benchmark/` | the `-PieBenchmark 1` scripted run | `ConversationBackend` |
+| `Sources/VoiceApp.swift` | all of them, once | composition root |
 
 Three protocols hold the seams open:
 
-- **`ConversationBackend`** (`Conversation/ConversationBackend.swift`) —
-  "here is the conversation so far and what was just said; stream me the
-  reply." Says nothing about Pie.
-- **`VoiceInput`** / **`VoiceOutput`** (`AudioKit/VoiceIO.swift`) — where
-  utterances come from and where replies go.
+- **`ConversationBackend`** (`Core/ConversationBackend.swift`): "here is
+  the conversation so far; stream me the reply, and stop when I say so."
+  Says nothing about Pie.
+- **`SpeechInput`** / **`SpeechOutput`** (`Core/AudioContracts.swift`):
+  where utterances come from and where replies go.
 
-`ConversationController` holds all three as protocol references and is
-the only type that sees more than one layer at a time.
+`ChatController` (typed chat, read-aloud), `VoiceModeController` and
+`DictationController` hold these as protocol references; only
+`VoiceApp.swift` names the concrete types.
 
 ### Upgrading Pie
 
 Everything version-specific is in **`PieKit/PieRuntimeConfig.swift`**:
 the engine config TOML, the model ladder and artifact lookup, the
-inferlet's wasm name and version, and the voice system prompt. A new Pie
-release that changes the config schema or the inferlet's inputs should be
-a diff to that file plus a rebuild of `ios/pie-shim`. `AudioKit/`,
-`Conversation/`, and `UI/` do not import anything Pie-shaped and should
-not need to change.
+inferlet's wasm name and version, the system prompts and the reply
+options. A new Pie release that changes the config schema or the
+inferlet's inputs should be a diff to that file plus a rebuild of
+`ios/pie-shim`. `AudioKit/`, `Conversation/`, and `UI/` do not import
+anything Pie-shaped and should not need to change.
 
-The C ABI itself is confined to `PieKit/PieBridge.swift` — two
-`@_silgen_name` declarations and a callback trampoline.
+The C ABI itself (version 3) is confined to `PieKit/PieBridge.swift`:
+three `@_silgen_name` declarations (`pie_ios_run_stream`,
+`pie_ios_cancel`, `pie_ios_free`) and a callback trampoline that tells
+reply text from reasoning.
 
-### Swapping audio
+### Talking over a reply
 
-`MicrophoneInput` and `AudioFileInput` are both `VoiceInput`. The app
-ships with the second one wired to the "Sample" segment in the UI, which
-plays a bundled recording through the same recogniser, controller, and
-model as the microphone. That is how the voice path is exercised in the
-Simulator, which has nobody to talk to it.
+Speech output and the microphone share one `AVAudioEngine`
+(`AudioKit/AudioEngineHub.swift`) whose input node has voice processing
+on in voice mode, so the reply coming out of the speaker is cancelled out
+of what the microphone hears. That lets voice mode keep listening while
+it speaks: the user starting to talk is the barge-in signal, which
+silences the speech and cancels the engine's turn (`pie_ios_cancel`
+terminates the inferlet's process), and what they are saying is already
+being transcribed as the next question.
+
+### Sample questions
+
+`MicrophoneInput` and `SampleQuestionInput` are both `SpeechInput`. The
+second plays a bundled recording through the same engine, recogniser,
+controller and model as the microphone, from voice mode's menu or the
+composer's "+" sheet. It finalises only when the recording has finished
+playing, so the reply never starts over the question. That is also how
+the voice path is exercised in the Simulator, which has nobody to talk
+to it.
 
 ## What is Pie-specific about it
 
@@ -72,10 +96,11 @@ recurrent state it published on earlier turns under the session name.
 The accounting is on screen: each assistant bubble reports prompt tokens
 reused, new prefill tokens, and decode rate for that turn.
 
-The inferlet splits its two output channels deliberately — stdout carries
-only speakable text, so chunks go straight to the synthesizer, while the
-token accounting comes back in the return value where it can't be spoken
-aloud.
+The inferlet splits its output channels deliberately: stdout carries only
+reply text, so chunks go straight to the screen and the synthesizer;
+reasoning in "Think longer" mode streams as session messages, shown under
+"Thought for Ns" and never spoken; the token accounting comes back in the
+return value, where it can't be spoken aloud.
 
 ## Building
 
@@ -110,12 +135,10 @@ The sample recordings are synthesised at build time by
   raw runs. The 2026-09-21 numbers there are from the 0.4 ggml CPU build.
 - **Simulator speech.** `supportsOnDeviceRecognition` is false until the
   en-US assets are present; the app then uses Apple's server recogniser
-  and the header badge says "cloud speech" instead of "on-device speech".
-  The badge always reports which one is actually in force.
-- **Barge-in is client-side.** Tapping while the app is speaking stops
-  the synthesizer and starts listening, but the inferlet keeps generating
-  to `max_tokens`. Cancelling a running turn needs a stop path through
-  the shim, which does not exist yet.
-- **Hands-free is off by default.** With speakers and a microphone in one
-  room the synthesizer talks into the recogniser and the app answers
-  itself. It is a toggle, not a default.
+  and Settings shows Transcription as "Apple's servers" instead of "On
+  this iPhone". It always reports which one is actually in force.
+- **Barge-in depends on the echo canceller.** The onset thresholds in
+  `AudioKit/VoiceActivityDetector.swift` were tuned on a Mac harness and
+  are checked on the phone by `-PieAudioCheck 1` (`no_false_bargein`,
+  `external_onset`). With the mic muted there is no barge-in; a tap on the
+  orb still interrupts.

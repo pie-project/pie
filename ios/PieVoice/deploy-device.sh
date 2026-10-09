@@ -195,11 +195,13 @@ for f in "$HERE/Resources/voice_chat.wasm" "$HERE/Resources/sample-question-1.wa
 done
 
 # ── 4. Xcode project + signed build ──────────────────────────────────────────
-if [ ! -d "$HERE/PieVoice.xcodeproj" ] || [ "$HERE/project.yml" -nt "$HERE/PieVoice.xcodeproj/project.pbxproj" ]; then
-  bold "Generating the Xcode project"
-  command -v xcodegen >/dev/null || die "xcodegen not installed (brew install xcodegen)"
-  ( cd "$HERE" && xcodegen 2>&1 | tail -1 ) || die "xcodegen failed"
-fi
+# Every run: the project lists the source files one by one, so a Swift
+# file added or removed under voice-app/Sources needs a regeneration even
+# when project.yml is untouched. The cache makes it a no-op when neither
+# the spec nor the file list changed.
+bold "Generating the Xcode project"
+command -v xcodegen >/dev/null || die "xcodegen not installed (brew install xcodegen)"
+( cd "$HERE" && xcodegen --use-cache 2>&1 | tail -1 ) || die "xcodegen failed"
 
 bold "Building + signing PieVoice ($CONFIGURATION, team $TEAM)"
 BUILD_LOG="$HERE/build/xcodebuild.log"

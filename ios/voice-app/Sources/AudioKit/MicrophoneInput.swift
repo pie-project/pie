@@ -2,61 +2,129 @@ import AVFoundation
 import Foundation
 import Speech
 
-/// `VoiceInput` from the microphone, transcribed by the Speech framework.
+/// `SpeechInput` from the microphone, transcribed by the Speech framework.
 ///
 /// On-device recognition is requested whenever the device supports it, so
 /// that in the intended configuration nothing spoken to this app leaves
-/// the phone — the audio is transcribed locally and the transcript is
-/// answered by a model that is also local. When on-device recognition is
-/// unavailable the class still works, but it reports that fact rather
-/// than quietly shipping audio to a server.
-final class MicrophoneInput: NSObject, VoiceInput {
+/// the phone: the audio is transcribed locally and answered by a model
+/// that is also local. When on-device recognition turns out to be
+/// unusable the class falls back to the network recogniser and says so
+/// through `speechInputDidChangeAvailability`, rather than quietly
+/// shipping audio to a server.
+///
+/// Two modes share the engine and the recogniser:
+///   - `.dictation`: the raw microphone, streamed to the recogniser from
+///     the start. An utterance ends 1.3 s after its last recognised word;
+///     the microphone stays open and what is said next goes to the next
+///     utterance (it is held while the last one waits for its final
+///     result, so a word spoken in that gap is not lost). The session ends
+///     on `stop()`, after an utterance in which nothing was recognised
+///     (8 s of nothing), or on an error.
+///   - `.conversation`: the echo-cancelled microphone, open until
+///     `cancel()`. Nothing is transcribed until the voice-activity
+///     detector hears the user start (`speechInputDidDetectSpeechOnset`);
+///     each utterance then gets its own recognition task, fed the pre-roll
+///     and the live audio, and ends on trailing silence, after which the
+///     microphone waits for the next one. Because the reply is played
+///     through the same engine and cancelled out of the input, this runs
+///     while the reply plays: that is how the user talks over it. One
+///     utterance the recogniser fails on is an empty utterance, not the end
+///     of the session.
+///
+/// Call from the main thread. Delegate calls arrive on the main queue.
+final class MicrophoneInput: NSObject, SpeechInput {
 
-    weak var delegate: VoiceInputDelegate?
+    weak var delegate: SpeechInputDelegate?
     private(set) var isListening = false
 
-    /// Silence after speech that ends an utterance. Long enough to think
-    /// mid-sentence, short enough that the app doesn't feel deaf.
-    private let endOfSpeechSilence: TimeInterval = 1.3
-
-    /// An on-device request whose language assets are missing fails
-    /// within milliseconds of opening the audio. Anything that dies this
-    /// soon, unprompted, is that failure and not the user's silence.
-    private let assetFailureWindow: TimeInterval = 3.0
-
-    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
-    private let audioEngine = AVAudioEngine()
-
-    private var request: SFSpeechAudioBufferRecognitionRequest?
-    private var task: SFSpeechRecognitionTask?
-    private var silenceTimer: Timer?
-
-    private var latestTranscript = ""
-    private var didFinalize = false
-    private var usesOnDeviceRecognition = false
-    /// Set once `stop()` has been asked for, so a recogniser error that
-    /// follows the end of audio reads as "utterance over", not "broken".
-    private var stopRequested = false
-    private var listeningSince = Date.distantPast
-    private var permissionsGranted = false
-    /// Bumped by every start() and stop(). Deferred callbacks capture it
-    /// and bail if the session they belong to is over, so the 1 s
-    /// finalise fallback from one press can't tear down the next one.
-    private var generation = 0
-
-    /// On-device recognition never errors on silence, so without this a
-    /// press that hears nothing would listen until the 1-minute system
-    /// limit. Long enough for someone to gather a thought.
+    /// Dictation: silence after the last recognised word that ends the
+    /// utterance. Long enough to think mid-sentence, short enough that the
+    /// app doesn't feel deaf.
+    private let dictationSilence: TimeInterval = 1.3
+    /// Dictation: on-device recognition never errors on silence, so
+    /// without this a press that hears nothing would listen until the
+    /// one-minute system limit.
     private let noSpeechTimeout: TimeInterval = 8.0
+    /// The final result usually follows the end of audio within a few
+    /// hundred milliseconds. If it doesn't, the last partial is what was
+    /// said.
+    private let finalResultGrace: TimeInterval = 1.0
+    /// The same, for audio replayed to the network recogniser after the
+    /// on-device one failed.
+    private let networkReplayGrace: TimeInterval = 4.0
+    /// Voice mode: utterances in a row lost to recogniser errors before the
+    /// session gives up and reports the error. One is a glitch; several
+    /// mean the recogniser is not working, and an always-on microphone
+    /// that silently hears nothing is worse than a visible failure.
+    private let failuresBeforeGivingUp = 3
+
+    private let recognizer = SpeechRecognition.makeRecognizer()
+    private let hub = AudioEngineHub.shared
+    private lazy var pipeline = CapturePipeline(
+        echoLikely: { [hub] in hub.isEchoLikely },
+        emit: { [weak self] session, event in
+            DispatchQueue.main.async {
+                self?.handle(event, session: session)
+            }
+        }
+    )
+
+    private var mode: ListeningMode = .dictation
+    /// Bumped by every start and every end of a session. Deferred work
+    /// (pipeline events, spaced level reports, the final-result grace)
+    /// carries the session it belongs to and is dropped once it is over,
+    /// so nothing from a cancelled session reaches the delegate.
+    private var session = 0
+    private var utterance: Utterance?
+    private var dictationTimer: Timer?
+    private var usesOnDeviceRecognition = false
+    /// What the delegate was last told about on-device recognition. The
+    /// sample question can find on-device recognition unusable and switch
+    /// the whole app to the network recogniser; the microphone says so the
+    /// next time it starts, rather than shipping audio to a server while
+    /// the UI still promises it stays on the phone.
+    private var reportedOnDevice: Bool?
+    private var permissionsGranted = false
+    /// Dictation: the utterance in progress is the session's last, because
+    /// `stop()` was called.
+    private var closing = false
+    /// Voice mode: utterances in a row the recogniser failed on.
+    private var consecutiveFailures = 0
+
+    /// One recognised utterance.
+    private final class Utterance {
+        var request: SFSpeechAudioBufferRecognitionRequest
+        var task: SFSpeechRecognitionTask?
+        var onDevice: Bool
+        var startedAt = Date()
+        var transcript = ""
+        /// The recogniser has produced at least one word.
+        var heardWords = false
+        /// No more audio is coming: trailing silence, `stop()`, or the
+        /// end of the session.
+        var audioEnded = false
+        var finalized = false
+
+        init(request: SFSpeechAudioBufferRecognitionRequest, onDevice: Bool) {
+            self.request = request
+            self.onDevice = onDevice
+        }
+    }
 
     override init() {
         super.init()
         recognizer?.delegate = self
         NotificationCenter.default.addObserver(
             self,
-            selector: #selector(audioSessionInterrupted(_:)),
-            name: AVAudioSession.interruptionNotification,
-            object: AVAudioSession.sharedInstance()
+            selector: #selector(audioWasInterrupted(_:)),
+            name: AudioEngineHub.audioWasInterrupted,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(inputWasLost(_:)),
+            name: AudioEngineHub.inputWasLost,
+            object: nil
         )
     }
 
@@ -64,238 +132,391 @@ final class MicrophoneInput: NSObject, VoiceInput {
         NotificationCenter.default.removeObserver(self)
     }
 
-    // MARK: - VoiceInput
+    // MARK: - SpeechInput
 
     func prepare() async -> VoiceInputAvailability {
         guard let recognizer else {
-            return .unavailable("No speech recogniser for this locale")
+            return .unavailable("No English speech recogniser on this device. Type instead.")
         }
-
-        let speechStatus = await withCheckedContinuation { continuation in
-            SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0) }
+        guard await SpeechPermissions.requestRecognition() else {
+            return .denied("Speech recognition permission was declined. Type instead, or allow it in Settings.")
         }
-        guard speechStatus == .authorized else {
-            return .denied("Speech recognition permission was declined — type instead, or allow it in Settings")
+        guard await SpeechPermissions.requestMicrophone() else {
+            return .denied("Microphone permission was declined. Type instead, or allow it in Settings.")
         }
-
-        let micGranted = await withCheckedContinuation { continuation in
-            AVAudioApplication.requestRecordPermission { continuation.resume(returning: $0) }
+        return await MainActor.run {
+            self.permissionsGranted = true
+            guard recognizer.isAvailable else {
+                return .unavailable(SpeechRecognition.unavailableMessage)
+            }
+            self.usesOnDeviceRecognition = OnDeviceRecognition.isAvailable(on: recognizer)
+            self.reportedOnDevice = self.usesOnDeviceRecognition
+            return .ready(onDevice: self.usesOnDeviceRecognition)
         }
-        guard micGranted else {
-            return .denied("Microphone permission was declined — type instead, or allow it in Settings")
-        }
-        permissionsGranted = true
-
-        guard recognizer.isAvailable else {
-            return .unavailable("Speech recogniser is not available right now — try again in a moment, or type")
-        }
-
-        usesOnDeviceRecognition = OnDeviceRecognition.isAvailable(on: recognizer)
-        return .ready(onDevice: usesOnDeviceRecognition)
     }
 
-    func start() throws {
-        guard !isListening else { return }
+    func start(mode: ListeningMode) throws {
+        if isListening {
+            if mode == self.mode { return }
+            cancel()
+        }
         guard let recognizer, recognizer.isAvailable else {
             throw VoiceInputError.recogniserUnavailable
         }
 
-        try AudioSessionCoordinator.configure()
+        session += 1
+        let session = self.session
+        self.mode = mode
+        closing = false
+        consecutiveFailures = 0
+        usesOnDeviceRecognition = OnDeviceRecognition.isAvailable(on: recognizer)
 
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        request.requiresOnDeviceRecognition = usesOnDeviceRecognition
-        request.taskHint = .dictation
-        self.request = request
-
-        latestTranscript = ""
-        didFinalize = false
-        stopRequested = false
-        listeningSince = Date()
-        generation += 1
-
-        let input = audioEngine.inputNode
-        let format = input.outputFormat(forBus: 0)
-        // A zero-channel or zero-rate format means the session handed us
-        // no input route (Simulator without a mic, a Bluetooth handoff in
-        // progress). Installing a tap on it crashes; throwing doesn't.
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            throw VoiceInputError.noAudioInput
-        }
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            self?.request?.append(buffer)
-            self?.reportLevel(of: buffer)
+        switch mode {
+        case .conversation:
+            pipeline.startGated(session: session, onDevice: usesOnDeviceRecognition)
+        case .dictation:
+            let request = SpeechRecognition.bufferRequest(onDevice: usesOnDeviceRecognition)
+            pipeline.startStreaming(session: session, request: request, onDevice: usesOnDeviceRecognition)
+            begin(Utterance(request: request, onDevice: usesOnDeviceRecognition))
         }
 
-        audioEngine.prepare()
         do {
-            try audioEngine.start()
+            let pipeline = self.pipeline
+            try hub.startInput(mode == .conversation ? .voiceProcessed : .plain) { buffer, _ in
+                pipeline.process(buffer)
+            }
         } catch {
-            input.removeTap(onBus: 0)
+            pipeline.stop()
+            discardUtterance()
+            self.session += 1
             throw error
         }
+
         isListening = true
-        armSilenceTimer(after: noSpeechTimeout)
-
-        task = recognizer.recognitionTask(with: request) { [weak self, weak request] result, error in
-            guard let self else { return }
-            // A cancelled task delivers one last callback; if a new
-            // session has since started (the on-device -> network
-            // fallback), that callback must not touch it.
-            guard let request, request === self.request else { return }
-
-            if let result {
-                let text = result.bestTranscription.formattedString
-                if !text.isEmpty {
-                    self.latestTranscript = text
-                    DispatchQueue.main.async { self.delegate?.voiceInputDidUpdatePartial(text) }
-                    self.restartSilenceTimer()
-                }
-                if result.isFinal {
-                    self.finishUtterance()
-                    return
-                }
-            }
-
-            if let error {
-                self.handleRecognitionError(error)
-            }
+        if mode == .dictation {
+            armDictationTimer(after: noSpeechTimeout)
         }
+        reportOnDeviceIfChanged()
     }
 
+    /// Dictation: ends the utterance and the session; the transcript is
+    /// finalised once the recogniser has had its last word. Voice mode:
+    /// ends the utterance in progress, if any, and keeps listening.
     func stop() {
         guard isListening else { return }
-        stopRequested = true
-        generation += 1
-        let stopping = generation
-        silenceTimer?.invalidate()
-        silenceTimer = nil
-        teardownAudio()
-        request?.endAudio()
-
-        // The final result usually follows within a few hundred
-        // milliseconds. If it doesn't, the last partial is what was said.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            guard let self, self.generation == stopping else { return }
-            self.finishUtterance()
+        switch mode {
+        case .conversation:
+            if let current = utterance, !current.audioEnded {
+                endAudio(of: current)
+            }
+        case .dictation:
+            closing = true
+            dictationTimer?.invalidate()
+            dictationTimer = nil
+            // The microphone closes now, as the user expects when they tap
+            // stop; recognition finishes on the audio already captured.
+            hub.stopInput()
+            if let current = utterance {
+                endAudio(of: current)
+            } else {
+                let target = delegate
+                endSession()
+                target?.speechInputDidFinalize("")
+            }
         }
     }
 
-    // MARK: - Internals
+    func cancel() {
+        guard isListening else { return }
+        endSession()
+    }
 
-    private func handleRecognitionError(_ error: Error) {
-        // A recogniser that times out after the user has already said
-        // something is not a failure — it is the end of the utterance,
-        // and the transcript stands.
-        if !latestTranscript.isEmpty {
-            finishUtterance()
-            return
+    // MARK: - Pipeline events
+
+    private func handle(_ event: CapturePipeline.Event, session: Int) {
+        guard session == self.session, isListening else { return }
+        switch event {
+        case .levels(let levels, let window):
+            deliverLevels(levels, spacedBy: window, session: session)
+
+        case .onset(let request):
+            // The previous utterance may still be waiting for its final
+            // result; the user has moved on, so its best transcript stands.
+            if let previous = utterance {
+                finalize(previous)
+            }
+            begin(Utterance(request: request, onDevice: request.requiresOnDeviceRecognition))
+            delegate?.speechInputDidDetectSpeechOnset()
+
+        case .audioEnded(let request):
+            guard let current = utterance, current.request === request else { return }
+            endAudio(of: current)
         }
-        // Audio was ended on purpose and nothing was said: that is
-        // silence, and silence is not an error.
-        if stopRequested {
-            finishUtterance()
-            return
+    }
+
+    /// Spreads one tap buffer's worth of levels (the tap delivers about
+    /// 100 ms at a time) over the time they cover, so the meter moves at
+    /// 30 Hz instead of jumping ten times a second.
+    private func deliverLevels(_ levels: [Float], spacedBy window: TimeInterval, session: Int) {
+        for (index, level) in levels.enumerated() {
+            if index == 0 {
+                delegate?.speechInputDidUpdateLevel(level)
+                continue
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + window * Double(index)) { [weak self] in
+                guard let self, self.session == session else { return }
+                self.delegate?.speechInputDidUpdateLevel(level)
+            }
         }
-        let diedEarly = -listeningSince.timeIntervalSinceNow < assetFailureWindow
-        if usesOnDeviceRecognition && diedEarly {
-            // The local recogniser has no usable assets. Live audio can't
-            // be replayed, but the microphone can be reopened straight
-            // away over the network path — the user just keeps talking.
-            OnDeviceRecognition.markUnusable()
-            usesOnDeviceRecognition = false
-            teardown()
-            DispatchQueue.main.async {
-                self.delegate?.voiceInputDidChangeAvailability(.ready(onDevice: false))
-                do {
-                    try self.start()
-                } catch {
-                    self.delegate?.voiceInputDidFail(error)
+    }
+
+    // MARK: - Recognition
+
+    private func begin(_ current: Utterance) {
+        utterance = current
+        startTask(for: current)
+    }
+
+    private func startTask(for current: Utterance) {
+        guard let recognizer else { return }
+        let request = current.request
+        current.startedAt = Date()
+        // Results arrive on the recogniser's queue, which is the main
+        // queue.
+        current.task = recognizer.recognitionTask(with: request) { [weak self, weak current] result, error in
+            // A replaced or finished request can still deliver one last
+            // callback; only the utterance's live request speaks for it.
+            guard let self, let current, !current.finalized, current.request === request else { return }
+            self.recognition(of: current, result: result, error: error)
+        }
+    }
+
+    private func recognition(of current: Utterance, result: SFSpeechRecognitionResult?, error: Error?) {
+        if let result {
+            let text = result.bestTranscription.formattedString
+            if !text.isEmpty {
+                if !current.heardWords {
+                    current.heardWords = true
+                    consecutiveFailures = 0
+                    pipeline.stopKeeping(for: current.request)
+                    if mode == .dictation {
+                        delegate?.speechInputDidDetectSpeechOnset()
+                    }
+                }
+                current.transcript = text
+                delegate?.speechInputDidUpdatePartial(text)
+                if mode == .dictation, !current.audioEnded {
+                    armDictationTimer(after: dictationSilence)
                 }
             }
-            return
-        }
-        DispatchQueue.main.async { self.delegate?.voiceInputDidFail(error) }
-        teardown()
-    }
-
-    private func restartSilenceTimer() {
-        armSilenceTimer(after: endOfSpeechSilence)
-    }
-
-    private func armSilenceTimer(after interval: TimeInterval) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.isListening else { return }
-            self.silenceTimer?.invalidate()
-            self.silenceTimer = Timer.scheduledTimer(
-                withTimeInterval: interval,
-                repeats: false
-            ) { [weak self] _ in
-                self?.stop()
+            if result.isFinal {
+                finalize(current)
+                return
             }
         }
-    }
-
-    /// Siri, a call, or an alarm stops the audio engine underneath us; the
-    /// recogniser never finalises on its own. End the utterance with
-    /// whatever was heard so the app doesn't sit in "listening…" forever.
-    @objc private func audioSessionInterrupted(_ note: Notification) {
-        guard
-            let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-            AVAudioSession.InterruptionType(rawValue: raw) == .began
-        else { return }
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.isListening else { return }
-            self.stop()
+        if let error {
+            recognitionFailed(current, error: error)
         }
     }
 
-    private func finishUtterance() {
-        guard !didFinalize else { return }
-        didFinalize = true
+    private func recognitionFailed(_ current: Utterance, error: Error) {
+        // A recogniser that gives up after the user has already said
+        // something is not a failure: it is the end of the utterance, and
+        // the transcript stands. Likewise when the audio was ended on
+        // purpose: what was heard, possibly nothing, is the utterance.
+        if !current.transcript.isEmpty || current.audioEnded {
+            finalize(current)
+            return
+        }
+        if current.onDevice, -current.startedAt.timeIntervalSinceNow < OnDeviceRecognition.assetFailureWindow {
+            fallBackToNetwork(current)
+            return
+        }
+        if SpeechRecognition.isNoSpeech(error) {
+            finalize(current)
+            return
+        }
+        if mode == .conversation, recognizer?.isAvailable == true {
+            // The session outlives one utterance the recogniser could not
+            // handle (a transient recogniser or server error): that
+            // utterance is empty and the microphone waits for the next.
+            consecutiveFailures += 1
+            if consecutiveFailures < failuresBeforeGivingUp {
+                let code = (error as NSError).code
+                print("[audio] recognition failed for one utterance (\((error as NSError).domain) \(code)); still listening")
+                finalize(current)
+                return
+            }
+        }
+        let target = delegate
+        endSession()
+        target?.speechInputDidFail(error)
+    }
 
-        let transcript = latestTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
-        teardown()
-        DispatchQueue.main.async { [weak self] in
-            self?.delegate?.voiceInputDidFinalize(transcript)
+    /// The local recogniser has no usable assets. The utterance's audio
+    /// was kept, so it is handed to the network recogniser and the user
+    /// does not have to repeat themselves.
+    private func fallBackToNetwork(_ current: Utterance) {
+        OnDeviceRecognition.markUnusable()
+        usesOnDeviceRecognition = false
+        pipeline.setOnDevice(false)
+
+        let replacement = SpeechRecognition.bufferRequest(onDevice: false)
+        let old = current.request
+        current.request = replacement
+        current.onDevice = false
+        // Swapped before the old request is ended, so the tap never
+        // appends to a request that has been told its audio is over.
+        let handover = pipeline.replace(old, with: replacement)
+        old.endAudio()
+        current.task?.cancel()
+        startTask(for: current)
+        reportedOnDevice = false
+        if handover != .live {
+            // The utterance's audio was already over: the network
+            // recogniser gets all of it at once, plus the time a round
+            // trip takes, before the best partial stands.
+            replacement.endAudio()
+            current.audioEnded = true
+            armFinalizeGrace(for: current, after: networkReplayGrace)
+        }
+        delegate?.speechInputDidChangeAvailability(.ready(onDevice: false))
+    }
+
+    private func endAudio(of current: Utterance) {
+        guard !current.audioEnded else { return }
+        current.audioEnded = true
+        pipeline.endAudio(of: current.request)
+        current.request.endAudio()
+        armFinalizeGrace(for: current, after: finalResultGrace)
+    }
+
+    private func armFinalizeGrace(for current: Utterance, after interval: TimeInterval) {
+        let session = self.session
+        DispatchQueue.main.asyncAfter(deadline: .now() + interval) { [weak self, weak current] in
+            guard let self, let current, self.session == session else { return }
+            self.finalize(current)
         }
     }
 
-    private func teardownAudio() {
-        if audioEngine.isRunning {
-            audioEngine.stop()
+    private func finalize(_ current: Utterance) {
+        guard !current.finalized else { return }
+        current.finalized = true
+        if !current.audioEnded {
+            current.audioEnded = true
+            pipeline.endAudio(of: current.request)
+            current.request.endAudio()
         }
-        audioEngine.inputNode.removeTap(onBus: 0)
+        pipeline.stopKeeping(for: current.request)
+        current.task?.cancel()
+        current.task = nil
+        if utterance === current {
+            utterance = nil
+        }
+
+        let transcript = current.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        let target = delegate
+        guard mode == .dictation else {
+            target?.speechInputDidFinalize(transcript)
+            return
+        }
+        // Dictation goes on to the next utterance after a pause that
+        // followed words. After `stop()`, or an utterance that heard
+        // nothing, the session is over.
+        guard isListening, !closing, !transcript.isEmpty else {
+            endSession()
+            target?.speechInputDidFinalize(transcript)
+            return
+        }
+        let session = self.session
+        target?.speechInputDidFinalize(transcript)
+        // The delegate may have stopped, cancelled or restarted the session
+        // in answer.
+        guard session == self.session, isListening, !closing, utterance == nil else { return }
+        let next = SpeechRecognition.bufferRequest(onDevice: usesOnDeviceRecognition)
+        pipeline.resumeStreaming(with: next, onDevice: usesOnDeviceRecognition)
+        begin(Utterance(request: next, onDevice: usesOnDeviceRecognition))
+        armDictationTimer(after: noSpeechTimeout)
+    }
+
+    /// Tells the delegate when on-device recognition was given up since it
+    /// last heard, before this session's audio reaches a recogniser that
+    /// is not on the phone.
+    private func reportOnDeviceIfChanged() {
+        guard reportedOnDevice != usesOnDeviceRecognition else { return }
+        reportedOnDevice = usesOnDeviceRecognition
+        delegate?.speechInputDidChangeAvailability(.ready(onDevice: usesOnDeviceRecognition))
+    }
+
+    // MARK: - Session
+
+    private func endSession() {
+        session += 1
+        pipeline.stop()
+        discardUtterance()
+        dictationTimer?.invalidate()
+        dictationTimer = nil
+        hub.stopInput()
         isListening = false
     }
 
-    private func teardown() {
-        silenceTimer?.invalidate()
-        silenceTimer = nil
-        teardownAudio()
-        task?.cancel()
-        task = nil
-        request = nil
+    private func discardUtterance() {
+        guard let current = utterance else { return }
+        utterance = nil
+        current.finalized = true
+        current.task?.cancel()
+        current.task = nil
     }
 
-    /// RMS of the buffer, mapped onto 0…1 for the meter ring.
-    private func reportLevel(of buffer: AVAudioPCMBuffer) {
-        guard let channel = buffer.floatChannelData?[0] else { return }
-        let count = Int(buffer.frameLength)
-        guard count > 0 else { return }
-
-        var sum: Float = 0
-        for index in 0..<count {
-            let sample = channel[index]
-            sum += sample * sample
+    private func armDictationTimer(after interval: TimeInterval) {
+        dictationTimer?.invalidate()
+        let session = self.session
+        let timer = Timer(timeInterval: interval, repeats: false) { [weak self] _ in
+            guard let self, self.session == session else { return }
+            self.dictationTimerFired()
         }
-        let rms = sqrt(sum / Float(count))
-        // -50 dBFS is a quiet room, 0 dBFS is clipping.
-        let decibels = 20 * log10(max(rms, 1e-7))
-        let level = max(0, min(1, (decibels + 50) / 50))
+        RunLoop.main.add(timer, forMode: .common)
+        dictationTimer = timer
+    }
 
-        DispatchQueue.main.async { [weak self] in
-            self?.delegate?.voiceInputDidUpdateLevel(level)
+    private func dictationTimerFired() {
+        dictationTimer = nil
+        guard isListening, mode == .dictation else { return }
+        guard let current = utterance, current.heardWords else {
+            // Nothing recognised since the microphone opened or since the
+            // last utterance: the user is not dictating any more.
+            stop()
+            return
+        }
+        // A pause after words ends this utterance only. The microphone
+        // stays open; what is said next is held for the next utterance,
+        // which starts once this one's final result is in.
+        endAudio(of: current)
+    }
+
+    /// Siri, a call, or an alarm took the audio. Dictation keeps what was
+    /// heard and finalises it, as before. Voice mode ends: answering a
+    /// half-heard question in the middle of a phone call would be worse
+    /// than asking the user to tap to resume.
+    @objc private func audioWasInterrupted(_ note: Notification) {
+        audioWentAway(VoiceInputError.interrupted)
+    }
+
+    /// The microphone's input route went away during a hardware change and
+    /// did not come back (playback, if any, carries on).
+    @objc private func inputWasLost(_ note: Notification) {
+        audioWentAway(VoiceInputError.inputLost)
+    }
+
+    private func audioWentAway(_ error: VoiceInputError) {
+        guard isListening else { return }
+        switch mode {
+        case .dictation:
+            stop()
+        case .conversation:
+            let target = delegate
+            endSession()
+            target?.speechInputDidFail(error)
         }
     }
 }
@@ -312,29 +533,11 @@ extension MicrophoneInput: SFSpeechRecognizerDelegate {
         let availability: VoiceInputAvailability
         if available {
             usesOnDeviceRecognition = OnDeviceRecognition.isAvailable(on: speechRecognizer)
+            reportedOnDevice = usesOnDeviceRecognition
             availability = .ready(onDevice: usesOnDeviceRecognition)
         } else {
-            availability = .unavailable("Speech recogniser is not available right now — try again in a moment, or type")
+            availability = .unavailable(SpeechRecognition.unavailableMessage)
         }
-        DispatchQueue.main.async { [weak self] in
-            self?.delegate?.voiceInputDidChangeAvailability(availability)
-        }
-    }
-}
-
-enum VoiceInputError: LocalizedError {
-    case recogniserUnavailable
-    case missingAudioFile(String)
-    case noAudioInput
-
-    var errorDescription: String? {
-        switch self {
-        case .recogniserUnavailable:
-            return "The speech recogniser is unavailable — try again, or type"
-        case .missingAudioFile(let name):
-            return "Bundled audio file not found: \(name)"
-        case .noAudioInput:
-            return "No microphone input is available right now"
-        }
+        delegate?.speechInputDidChangeAvailability(availability)
     }
 }

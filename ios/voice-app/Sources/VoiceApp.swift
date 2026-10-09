@@ -1,55 +1,100 @@
+import Combine
 import SwiftUI
+import UIKit
 
 /// Composition root.
 ///
-/// The only place where a concrete backend, a concrete microphone, and a
-/// concrete synthesizer are named. Everything downstream sees protocols,
-/// which is what keeps a Pie upgrade confined to `PieKit/` and an audio
-/// change confined to `AudioKit/`.
+/// The only place where the concrete engine, microphone, sample player and
+/// synthesizer are named. Everything downstream sees protocols and the
+/// controllers built on them, which keeps a Pie upgrade confined to
+/// `PieKit/` and an audio change confined to `AudioKit/`.
+@MainActor
 final class AppComposition: ObservableObject {
 
-    let controller: ConversationController
-    /// Exposed so benchmark mode can drive the backend without the
-    /// listen/speak loop in the way.
-    let backend: ConversationBackend
-
-    private let microphone = MicrophoneInput()
-    private let sample = AudioFileInput(resources: AppComposition.sampleResources)
-
-    /// A bundled utterance is optional — the app is fully usable without
-    /// one, it just can't be driven hands-off.
-    var hasSampleRecording: Bool { sample.url != nil }
-
-    @Published var inputSource: InputSource = .microphone {
-        didSet {
-            guard oldValue != inputSource else { return }
-            controller.useInput(inputSource == .microphone ? microphone : sample)
-        }
-    }
+    let settings: AppSettings
+    let store: ChatStore
+    let router: AppRouter
+    /// Exposed so benchmark mode and the audio self-check can drive the
+    /// backend without the chat in the way.
+    let engine: PieEngine
+    /// The one synthesizer: chat read-aloud, voice mode and the Settings
+    /// preview all speak through it, so they share the engine whose echo
+    /// canceller voice mode depends on.
+    let speech: SpeechSynthesis
+    let microphone: MicrophoneInput
+    let sample: SampleQuestionInput
+    let chat: ChatController
+    let voice: VoiceModeController
+    let dictation: DictationController
+    let voicePreview: VoicePreview
 
     /// Turns 2 and 3 are follow-ups on purpose: they are only coherent if
-    /// the backend kept the conversation, so pressing "Sample" three
-    /// times exercises the KV-snapshot path without anyone speaking.
+    /// the backend kept the conversation, so asking the samples in a row
+    /// exercises the cached-prefix path without anyone speaking.
     static let sampleResources = [
         "sample-question-1",
         "sample-question-2",
         "sample-question-3",
     ]
 
+    private var subscriptions: Set<AnyCancellable> = []
+    private var didLaunch = false
+
     init() {
         // Restore the ladder rung chosen on a previous launch before
-        // anything reads the engine description or logs the model.
+        // anything reads the engine description or logs the model, and
+        // mirror the console before anything prints.
         PieRuntimeConfig.restoreSelection()
         ConsoleMirror.install()
         LaunchDiagnostics.log()
 
-        let engine = PieEngine()
-        backend = engine
-        controller = ConversationController(
-            backend: engine,
-            input: microphone,
-            output: SpokenOutput()
+        settings = AppSettings()
+        store = ChatStore()
+        router = AppRouter()
+        engine = PieEngine()
+        speech = SpeechSynthesis()
+        microphone = MicrophoneInput()
+        sample = SampleQuestionInput(resources: Self.sampleResources)
+        chat = ChatController(store: store, backend: engine, speech: speech, settings: settings)
+        // A build without the recordings simply has no sample question;
+        // voice mode hides the menu item rather than failing on tap.
+        voice = VoiceModeController(
+            chat: chat,
+            microphone: microphone,
+            sample: sample.hasRecordings ? sample : nil,
+            speech: speech,
+            settings: settings
         )
+        dictation = DictationController(microphone: microphone)
+        voicePreview = VoicePreview(speech: speech, chat: chat)
+
+        // `@Published` replays its current value on subscription, so these
+        // also apply the saved voice and rate before anything is spoken.
+        settings.$voiceIdentifier
+            .sink { [speech] identifier in speech.voiceIdentifier = identifier }
+            .store(in: &subscriptions)
+        settings.$speechRate
+            .sink { [speech] rate in speech.rate = rate }
+            .store(in: &subscriptions)
+    }
+
+    /// Runs once, when the first window appears. The launch arguments pick
+    /// exactly one of the modes; each harness drives the engine itself, so
+    /// the chat's warm-up would race it.
+    func launch() {
+        guard !didLaunch else { return }
+        didLaunch = true
+
+        if BenchmarkRunner.isEnabled {
+            BenchmarkRunner.run(backend: engine)
+        } else if AudioSelfCheck.isEnabled {
+            AudioSelfCheck.run(backend: engine, speech: speech, microphone: microphone, sample: sample)
+        } else {
+            chat.bootstrap()
+            if UITour.isEnabled {
+                UITour.run(chat: chat, voice: voice, router: router, settings: settings, store: store)
+            }
+        }
     }
 }
 
@@ -119,7 +164,8 @@ enum LaunchDiagnostics {
             info.activeProcessorCount,
             largestReservableGB()
         ))
-        print("[launch] model=\(PieRuntimeConfig.selected.directory) artifact=\(PieRuntimeConfig.selected.artifactPath ?? "missing")")
+        let selected = PieRuntimeConfig.selected
+        print("[launch] model=\(selected.directory) artifact=\(selected.artifactPath ?? "missing")")
     }
 
     /// Largest single PROT_NONE reservation the kernel will grant, found
@@ -152,23 +198,59 @@ struct PieVoiceApp: App {
 
     var body: some Scene {
         WindowGroup {
-            VoiceChatView(
-                controller: composition.controller,
-                inputSource: Binding(
-                    get: { composition.inputSource },
-                    set: { composition.inputSource = $0 }
-                ),
-                hasSampleRecording: composition.hasSampleRecording
-            )
-            .onAppear {
-                    if BenchmarkRunner.isEnabled {
-                        // Benchmark mode drives the backend directly; the
-                        // normal warm-up/listen path would race it.
-                        BenchmarkRunner.run(backend: composition.backend)
-                    } else {
-                        composition.controller.bootstrap()
-                    }
-                }
+            ComposedRootView(composition: composition, settings: composition.settings)
+        }
+    }
+}
+
+/// Hands every view its collaborators and applies the app-wide look.
+///
+/// A view of its own so that it observes `AppSettings`: the scene body
+/// only re-renders when the composition itself changes, which it never
+/// does.
+private struct ComposedRootView: View {
+    let composition: AppComposition
+    @ObservedObject var settings: AppSettings
+
+    var body: some View {
+        RootView()
+            .environmentObject(composition.settings)
+            .environmentObject(composition.store)
+            .environmentObject(composition.chat)
+            .environmentObject(composition.voice)
+            .environmentObject(composition.dictation)
+            .environmentObject(composition.router)
+            .environmentObject(composition.voicePreview)
+            .preferredColorScheme(settings.appearance.colorScheme)
+            .tint(Theme.accent)
+            .onChange(of: settings.appearance, initial: true) { _, appearance in
+                WindowAppearance.apply(appearance)
+            }
+            .onAppear(perform: composition.launch)
+    }
+}
+
+/// Sets the appearance on the app's windows directly.
+///
+/// `preferredColorScheme(nil)` only withdraws the request for a scheme;
+/// the window can keep the one asked for last, so going from Dark back to
+/// System would not follow the system until the next launch. Overriding
+/// the window's style covers that, and reaches sheets and the voice-mode
+/// cover too because they are presented in the same window.
+private enum WindowAppearance {
+    @MainActor
+    static func apply(_ appearance: AppSettings.Appearance) {
+        let style: UIUserInterfaceStyle
+        switch appearance {
+        case .system: style = .unspecified
+        case .light: style = .light
+        case .dark: style = .dark
+        }
+        for scene in UIApplication.shared.connectedScenes {
+            guard let windowScene = scene as? UIWindowScene else { continue }
+            for window in windowScene.windows {
+                window.overrideUserInterfaceStyle = style
+            }
         }
     }
 }

@@ -1,13 +1,15 @@
 [package]
 name = "pie-ios-shim"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "C-ABI staticlib embedding the Pie engine for iOS apps"
 license = "Apache-2.0"
 
 [lib]
 name = "pie_ios_shim"
-crate-type = ["staticlib"]
+# The staticlib is what the app links; the rlib lets tests/ call the same
+# extern "C" functions on a Mac.
+crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 # The standalone composition (controller + gateway + worker in one
@@ -19,6 +21,9 @@ anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+serde_json = "1"
 
 # Standalone crate: opt out of the parent cargo workspace, which does not
 # list this directory as a member.

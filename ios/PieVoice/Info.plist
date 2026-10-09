@@ -18,6 +18,8 @@
 	<string>1</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>Pie Voice reads the text in a photo you take, on this device, so the model can answer questions about it.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Pie Voice listens to your question so the on-device model can answer it. Audio is transcribed on this device.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>

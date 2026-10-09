@@ -4,12 +4,14 @@ Runs the Pie 0.5 runtime — the Metal engine plus wasmtime executing
 inferlets — inside an iOS app.
 
 - `pie-shim/`: C-ABI staticlib embedding the standalone engine
-  (`pie_ios_run_stream` / `pie_ios_free`). The first call boots the
-  engine from a Pie 0.5 config TOML and keeps it warm for the life of the
-  process; each call installs the inferlet component once, launches it
-  with a JSON input, streams its stdout to a callback and returns its
-  return value. Build with `cargo build --release --target
-  aarch64-apple-ios` (or `aarch64-apple-ios-sim`).
+  (`pie_ios_run_stream` / `pie_ios_cancel` / `pie_ios_free`, ABI v3).
+  The first call boots the engine from a Pie 0.5 config TOML and keeps it
+  warm for the life of the process; each call installs the inferlet
+  component once, launches it with a JSON input, streams its stdout
+  (reply text) and session messages (reasoning) to a callback and returns
+  its return value. `pie_ios_cancel` stops a turn from any thread. Build
+  with `cargo build --release --target aarch64-apple-ios` (or
+  `aarch64-apple-ios-sim`).
 - `voice-app/`: **a voice assistant you hold a conversation with** —
   speech in, model reply spoken back, all on the device. Layered so the
   Pie-facing code, the audio code, and the UI can each be replaced

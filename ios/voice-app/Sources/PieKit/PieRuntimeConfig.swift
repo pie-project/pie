@@ -4,8 +4,10 @@ import Foundation
 ///
 /// This is the upgrade seam. When a new Pie release changes the engine
 /// config schema, the model layout, or the inferlet's name and inputs,
-/// this file is the only one that should need editing — `AudioKit`, the
-/// conversation controller, and the views know nothing about Pie.
+/// this file is the only one that should need editing. The controllers
+/// take their prompts and generation presets from here, and the views
+/// its descriptions; neither knows anything else about Pie, and
+/// `AudioKit` knows nothing at all.
 enum PieRuntimeConfig {
 
     /// Which inferlet serves a conversational turn, and where its wasm
@@ -21,28 +23,151 @@ enum PieRuntimeConfig {
         var wasmPath: String { "\(Bundle.main.bundlePath)/\(wasmName).wasm" }
     }
 
-    /// The conversational inferlet: one invocation per spoken turn. It is
-    /// stateless — the app sends the whole transcript every turn and the
-    /// engine serves what it can from the KV state of earlier turns.
+    /// The conversational inferlet: one invocation per reply, typed or
+    /// spoken. It is stateless: the app sends the whole transcript every
+    /// turn and the engine serves what it can from the KV state that
+    /// earlier turns of the same session published.
     static let voiceChat = Inferlet(wasmName: "voice_chat", version: "0.1.0")
 
-    /// Name under which the engine keeps the conversation's cached state
-    /// between turns. One per app: iOS runs a single instance.
-    static let sessionName = "ios-voice-session"
-
     /// A throwaway session for the boot-time warm-up turn, so the state it
-    /// leaves behind is never mistaken for the conversation's.
+    /// leaves behind is never mistaken for a conversation's.
     static let warmUpSessionName = "warmup"
 
-    /// Spoken-reply instructions, sent as the leading system message of
-    /// every turn. Lives here rather than in the inferlet so the voice
-    /// style can change without rebuilding wasm.
-    static let systemPrompt = """
-        You are a friendly voice assistant. Everything you say is read \
-        aloud by a speech synthesizer, so answer in plain spoken sentences \
-        with no lists, headings, code, symbols or markdown. Keep each \
-        answer to one to three short sentences unless asked for more.
+    /// The session title replies run in. Titles share one namespace so
+    /// their short fixed prompt is served from cache after the first.
+    static let titleSessionName = "titles"
+
+    /// Tokens the engine holds for one sequence: prompt plus reply. Sizes
+    /// `max_model_len` in the engine config and the prompt budget the
+    /// engine trims the transcript to.
+    static let contextTokens = 8192
+
+    /// The most of one message's attachments the model is shown, in
+    /// estimated tokens, shared among them, and the most any one of them
+    /// gets. Half the context at most, so a message with attachments still
+    /// leaves room for the reply (Thinking's 1,536 tokens), the system
+    /// prompt and some of the conversation before it.
+    static let attachmentTokensPerMessage = 4096
+    static let attachmentTokensEach = 2048
+
+    // MARK: - Prompts
+
+    /// Instructions for a typed chat, sent as the leading system message.
+    /// Lives here rather than in the inferlet so the style can change
+    /// without rebuilding wasm.
+    static let chatSystemPrompt = """
+        You are Pie, a helpful assistant that runs entirely on this iPhone, \
+        with no server involved. You may use Markdown \
+        (lists, bold, tables, code blocks) when it makes an answer clearer. \
+        Be concise by default and go into detail only when asked. You are a \
+        small model, so when you do not know something, say "I'm not sure" \
+        rather than inventing an answer.
         """
+
+    /// Added to every question asked in voice mode, where the model reads
+    /// it: the reply is read aloud, so no formatting survives, and a small
+    /// model follows an instruction next to the question far more reliably
+    /// than one in the system prompt. Voice turns share the typed chat's
+    /// system prompt so that, within a conversation, a spoken question
+    /// reuses the engine's cached prefix of the typed turns before it (a
+    /// different system prompt would change the very first tokens and
+    /// nothing could be reused). The instruction is part of how a voice
+    /// question is rendered every time, not only when it is asked, so the
+    /// prefix of a later turn still matches.
+    static let spokenReplyInstruction =
+        "(Spoken aloud: answer in one or two short sentences of plain speech, with no formatting.)"
+
+    /// Instructions for naming a conversation in the sidebar.
+    static let titleSystemPrompt = """
+        You name conversations. Reply with a short title of at most five \
+        words and nothing else: no quotes, no punctuation at the end, no \
+        explanation.
+        """
+
+    /// `base` with the user's custom instructions appended, when they have
+    /// written any.
+    static func systemPrompt(_ base: String, customInstructions: String) -> String {
+        let custom = customInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !custom.isEmpty else { return base }
+        return base + "\n\nThe user has given these instructions; follow them:\n" + custom
+    }
+
+    // MARK: - Generation presets
+
+    /// A typed reply in Instant mode. Room for a few paragraphs or a code
+    /// block; the engine stops early at the end of the answer.
+    static let chatInstantOptions = ReplyOptions(maxTokens: 768, temperature: 0.7, topP: 0.95, think: false)
+
+    /// A typed reply in Thinking mode: up to `thinkingBudget` tokens of
+    /// reasoning, then the answer in what is left.
+    static let chatThinkingOptions = ReplyOptions(maxTokens: 1024, temperature: 0.6, topP: 0.95, think: true)
+
+    /// With thinking on, the most tokens the model may reason before the
+    /// inferlet closes the reasoning and has it answer: about seven seconds
+    /// at the phone's decode rate before the first word of the answer.
+    static let thinkingBudget = 512
+
+    /// A spoken reply. Short replies matter more here than in a text UI:
+    /// every extra token is another second of someone waiting to be
+    /// talked at, and reasoning would be spoken aloud as a stream of
+    /// consciousness before the answer, so thinking stays off.
+    static let voiceOptions = ReplyOptions(maxTokens: 160, temperature: 0.7, topP: 0.95, think: false)
+
+    /// A conversation title: a handful of tokens, sampled conservatively.
+    static let titleOptions = ReplyOptions(maxTokens: 16, temperature: 0.3, topP: 0.9, think: false)
+
+    static func chatOptions(for mode: ReplyMode) -> ReplyOptions {
+        switch mode {
+        case .instant: return chatInstantOptions
+        case .thinking: return chatThinkingOptions
+        }
+    }
+
+    // MARK: - Token accounting
+
+    /// Characters per token for ASCII text on Qwen's tokenizer, estimated:
+    /// close for English prose and on the generous side for code.
+    static let asciiCharactersPerToken = 3.2
+
+    /// Estimated tokens in `text`, without running the tokenizer. ASCII
+    /// counts at `asciiCharactersPerToken`; every other character counts
+    /// as a whole token, which is about right for Chinese, Japanese and
+    /// Korean (one character, one token) and errs on the safe side for
+    /// accented Latin.
+    static func estimatedTokens(in text: String) -> Int {
+        Int(cost(of: text.unicodeScalars).rounded(.up))
+    }
+
+    /// The longest start of `text` estimated at no more than `tokens`.
+    /// Never splits a character.
+    static func prefix(of text: String, tokens: Int) -> String {
+        var spent = 0.0
+        var end = text.startIndex
+        while end < text.endIndex {
+            spent += cost(of: text[end].unicodeScalars)
+            if spent > Double(tokens) { break }
+            end = text.index(after: end)
+        }
+        return String(text[..<end])
+    }
+
+    /// The longest end of `text` estimated at no more than `tokens`.
+    static func suffix(of text: String, tokens: Int) -> String {
+        var spent = 0.0
+        var start = text.endIndex
+        while start > text.startIndex {
+            let previous = text.index(before: start)
+            spent += cost(of: text[previous].unicodeScalars)
+            if spent > Double(tokens) { break }
+            start = previous
+        }
+        return String(text[start...])
+    }
+
+    private static func cost<Scalars: Sequence>(of scalars: Scalars) -> Double
+        where Scalars.Element == Unicode.Scalar {
+        scalars.reduce(0) { $0 + ($1.isASCII ? 1 / asciiCharactersPerToken : 1) }
+    }
 
     /// One rung of the model ladder: a Pie 0.5 model artifact, which is a
     /// directory named as `pie model list` prints it, holding one `.zt`
@@ -54,11 +179,6 @@ enum PieRuntimeConfig {
     struct Model: Equatable {
         let label: String       // shown in the UI
         let directory: String   // inside models/, e.g. "Qwen--Qwen3.5-0.8B"
-
-        /// What the views and the `-PieModel` launch argument key on.
-        /// Kept under its earlier name so the picker needs no change; it
-        /// is the artifact directory name now, not a file.
-        var fileName: String { directory }
 
         /// Documents first, then the app bundle. Bundling every rung of the
         /// ladder would mean a multi-gigabyte app; pushing the larger models
@@ -144,6 +264,7 @@ enum PieRuntimeConfig {
     static var modelDescription: String { selected.label }
     static let driverDescription = "Metal"
     static let runtimeDescription = "wasmtime Pulley"
+    static let pieVersion = "Pie 0.5"
 
     /// `-PieVerbose 1` (launch argument or `defaults`) turns on the
     /// engine's verbose logging and widens the tracing filter, both into
@@ -257,7 +378,7 @@ enum PieRuntimeConfig {
         # nothing sized by these limits is built for a datacenter.
         max_forward_tokens = 2048
         max_forward_requests = 4
-        max_model_len = 8192
+        max_model_len = \(contextTokens)
         # Hybrid models reserve one recurrent-state slot per seat at boot,
         # and the default 256 would be gigabytes on a phone.
         max_state_slots = 8
@@ -283,14 +404,4 @@ enum PieRuntimeConfig {
         try toml.write(toFile: path, atomically: true, encoding: .utf8)
         return path
     }
-
-    /// Generation settings for a spoken turn. Short replies matter more
-    /// here than in a text UI: every extra token is another second of
-    /// someone waiting to be talked at.
-    static let maxTokensPerTurn = 120
-    static let temperature = 0.7
-    static let topP = 0.95
-    /// Reasoning text would be spoken aloud as a stream of consciousness
-    /// before the answer; keep the model in its direct-answer mode.
-    static let think = false
 }

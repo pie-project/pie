@@ -24,6 +24,9 @@ targets:
     platform: iOS
     sources:
       - path: ../voice-app/Sources
+      # App icon and the global accent color (Yale blue, lighter in dark
+      # mode), which also tints system alerts and pickers.
+      - path: Assets.xcassets
       # Individual files land at the bundle root; the model keeps its
       # models/<name>/ directory via a folder reference — the layout
       # PieRuntimeConfig expects, and the one a Pie store uses.
@@ -42,6 +45,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.pie-project.voice
         INFOPLIST_FILE: Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         SWIFT_VERSION: "5.9"
         IPHONEOS_DEPLOYMENT_TARGET: "17.0"
         # The Rust shim staticlib, built into the repository target
