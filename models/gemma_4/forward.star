@@ -229,11 +229,8 @@ def assistant_draft(m, inputs, positions, x, logits, root):
         f = ops.linear.matmul(act, w.down)
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(f, w.post_ffw_norm, a.norm_eps), y)
         y = ops.elemwise.scale(w.scalar, y)
-    read = ops.elemwise.rmsnorm(y, a.norm, a.norm_eps)
-    draft = ops.linear.lm_head(read, a.embed)
+    draft = ops.linear.lm_head(ops.elemwise.rmsnorm(y, a.norm, a.norm_eps), a.embed)
     seam.at(seam.MTP, [draft])
-    token = ops.layout.argmax([draft])
-    hidden = ops.linear.matmul(read, a.post)
     seam.at(seam.MTP_DRAFTS, [ops.layout.argmax([draft])])
 
 def clipped(x, c):
