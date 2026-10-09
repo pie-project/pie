@@ -325,7 +325,7 @@ def trust_screen() -> None:
     print(f"{BOLD}{os.getcwd()}{RESET}\n")
     print("Quick safety check: does this chat send anything out? Nope, data anyways does not leave your computer.\n")
     print(f"{BOLD}❯ Continue{RESET}")
-    print(f"{DIM}Enter to confirm{RESET}\n")
+    print("\033[2mEnter to confirm\033[0m\n")
     input()
     TRUST_MARK.parent.mkdir(parents=True, exist_ok=True)
     TRUST_MARK.touch()
