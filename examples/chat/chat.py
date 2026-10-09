@@ -117,7 +117,7 @@ class EngineBackend:
         self.history.append({"role": "assistant", "content": "".join(pieces)})
 
 
-FRAME_SECONDS = 0.3  # time between mascot frames
+FRAME_SECONDS = 0.6  # time between mascot frames
 
 MASCOT_FRAMES = [
     ["   ▘  ▖", "▐▟▙▙▙▛▌", "▜█████▛"],
