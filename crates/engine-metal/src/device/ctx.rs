@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use crate::error::{Fault, Result};
 
 #[cfg(target_vendor = "apple")]
@@ -301,8 +303,9 @@ impl Context {
                 why: "the command buffer would not open a compute pass".to_string(),
             })?;
             Ok(Frame {
-                buffer,
-                encoder: Some(encoder),
+                buffer: RefCell::new(buffer),
+                encoder: RefCell::new(Some(encoder)),
+                fenced: RefCell::new(Vec::new()),
                 blit: None,
             })
         }
@@ -313,16 +316,24 @@ impl Context {
     }
 }
 
+/// One command buffer and the compute pass open on it. A fence (see
+/// [`Frame::fence`]) commits the buffer and opens the next on the same
+/// queue, so a frame that handed work to another engine is a chain of
+/// buffers; `fenced` keeps the committed ones until the frame is reaped and
+/// their errors are read. The cells let a fence happen through a shared
+/// `&Frame`, which is all a live encode holds.
 pub struct Frame {
     #[cfg(target_vendor = "apple")]
-    buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    buffer: RefCell<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     #[cfg(not(target_vendor = "apple"))]
     #[allow(dead_code)]
     buffer: (),
     #[cfg(target_vendor = "apple")]
-    encoder: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
+    encoder: RefCell<Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>>,
     #[cfg(not(target_vendor = "apple"))]
     encoder: Option<()>,
+    #[cfg(target_vendor = "apple")]
+    fenced: RefCell<Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
     #[cfg(target_vendor = "apple")]
     blit: Option<Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>>,
     #[cfg(not(target_vendor = "apple"))]
@@ -335,16 +346,19 @@ pub struct Frame {
 unsafe impl Send for Frame {}
 
 impl Frame {
+    /// The open compute pass, retained: a fence may replace it while the
+    /// caller still holds this one, so nothing borrows the cell for long.
     #[cfg(target_vendor = "apple")]
-    pub(crate) fn encoder(&self) -> &ProtocolObject<dyn MTLComputeCommandEncoder> {
+    pub(crate) fn encoder(&self) -> Retained<ProtocolObject<dyn MTLComputeCommandEncoder>> {
         self.encoder
-            .as_deref()
+            .borrow()
+            .clone()
             .expect("the pass is open until `commit` closes it")
     }
 
     #[cfg(target_vendor = "apple")]
     fn end_pass(&mut self) {
-        if let Some(encoder) = self.encoder.take() {
+        if let Some(encoder) = self.encoder.get_mut().take() {
             encoder.endEncoding();
         }
         if let Some(blit) = self.blit.take() {
@@ -355,12 +369,75 @@ impl Frame {
     #[cfg(target_vendor = "apple")]
     pub(crate) fn next_pass(&mut self) -> Result<&ProtocolObject<dyn MTLComputeCommandEncoder>> {
         self.end_pass();
-        let encoder = self.buffer.computeCommandEncoder().ok_or(Fault::Device {
-            call: "computeCommandEncoder",
-            why: "the command buffer would not open a second compute pass".to_string(),
-        })?;
-        self.encoder = Some(encoder);
-        Ok(self.encoder.as_deref().expect("just opened"))
+        let encoder = self
+            .buffer
+            .get_mut()
+            .computeCommandEncoder()
+            .ok_or(Fault::Device {
+                call: "computeCommandEncoder",
+                why: "the command buffer would not open a second compute pass".to_string(),
+            })?;
+        *self.encoder.get_mut() = Some(encoder);
+        Ok(self.encoder.get_mut().as_deref().expect("just opened"))
+    }
+
+    /// The first error among the command buffers a fence committed.
+    #[cfg(target_vendor = "apple")]
+    fn fenced_error(&self) -> Option<String> {
+        self.fenced
+            .borrow()
+            .iter()
+            .find_map(|buffer| buffer.error())
+            .map(|error| error.localizedDescription().to_string())
+    }
+
+    /// Ends the pass and the command buffer here and opens the next on the
+    /// same queue. With `signal`, the buffer so far signals `event` to
+    /// `value` when it is done; without, the next waits for `event` to reach
+    /// `value` before it starts. Either way the GPU work on both sides stays
+    /// ordered, and the other engine runs between.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn fence(
+        &self,
+        event: &ProtocolObject<dyn objc2_metal::MTLEvent>,
+        value: u64,
+        signal: bool,
+    ) -> Result<()> {
+        if self.blit.is_some() {
+            return Err(Fault::Device {
+                call: "fence",
+                why: "a blit pass is open where a compute pass was expected".to_string(),
+            });
+        }
+        if let Some(encoder) = self.encoder.borrow_mut().take() {
+            encoder.endEncoding();
+        }
+        let current = self.buffer.borrow().clone();
+        let next = current
+            .commandQueue()
+            .commandBuffer()
+            .ok_or(Fault::Device {
+                call: "commandBuffer",
+                why: "the queue would not open a command buffer after a fence".to_string(),
+            })?;
+        if signal {
+            current.encodeSignalEvent_value(event, value);
+        } else {
+            next.encodeWaitForEvent_value(event, value);
+        }
+        current.commit();
+        let done = std::mem::replace(&mut *self.buffer.borrow_mut(), next);
+        self.fenced.borrow_mut().push(done);
+        let reopened = self
+            .buffer
+            .borrow()
+            .computeCommandEncoder()
+            .ok_or(Fault::Device {
+                call: "computeCommandEncoder",
+                why: "the command buffer would not reopen a compute pass after a fence".to_string(),
+            })?;
+        *self.encoder.borrow_mut() = Some(reopened);
+        Ok(())
     }
 
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
@@ -373,13 +450,15 @@ impl Frame {
                 return Ok(());
             }
             if self.blit.is_none() {
-                if let Some(encoder) = self.encoder.take() {
+                if let Some(encoder) = self.encoder.get_mut().take() {
                     encoder.endEncoding();
                 }
-                self.blit = Some(self.buffer.blitCommandEncoder().ok_or(Fault::Device {
-                    call: "blitCommandEncoder",
-                    why: "the command buffer would not open a blit pass".to_string(),
-                })?);
+                self.blit = Some(self.buffer.get_mut().blitCommandEncoder().ok_or(
+                    Fault::Device {
+                        call: "blitCommandEncoder",
+                        why: "the command buffer would not open a blit pass".to_string(),
+                    },
+                )?);
             }
             let blit = self.blit.as_deref().expect("just opened");
             blit.fillBuffer_range_value(
@@ -411,13 +490,15 @@ impl Frame {
                 return Ok(());
             }
             if self.blit.is_none() {
-                if let Some(encoder) = self.encoder.take() {
+                if let Some(encoder) = self.encoder.get_mut().take() {
                     encoder.endEncoding();
                 }
-                self.blit = Some(self.buffer.blitCommandEncoder().ok_or(Fault::Device {
-                    call: "blitCommandEncoder",
-                    why: "the command buffer would not open a blit pass".to_string(),
-                })?);
+                self.blit = Some(self.buffer.get_mut().blitCommandEncoder().ok_or(
+                    Fault::Device {
+                        call: "blitCommandEncoder",
+                        why: "the command buffer would not open a blit pass".to_string(),
+                    },
+                )?);
             }
             let blit = self.blit.as_deref().expect("just opened");
             blit.fillBuffer_range_value(
@@ -463,13 +544,15 @@ impl Frame {
                 return Ok(());
             }
             if self.blit.is_none() {
-                if let Some(encoder) = self.encoder.take() {
+                if let Some(encoder) = self.encoder.get_mut().take() {
                     encoder.endEncoding();
                 }
-                self.blit = Some(self.buffer.blitCommandEncoder().ok_or(Fault::Device {
-                    call: "blitCommandEncoder",
-                    why: "the command buffer would not open a blit pass".to_string(),
-                })?);
+                self.blit = Some(self.buffer.get_mut().blitCommandEncoder().ok_or(
+                    Fault::Device {
+                        call: "blitCommandEncoder",
+                        why: "the command buffer would not open a blit pass".to_string(),
+                    },
+                )?);
             }
             let blit = self.blit.as_deref().expect("just opened");
             // SAFETY: both spans were bounds-checked by `Buffer::span`, and
@@ -496,12 +579,17 @@ impl Frame {
         #[cfg(target_vendor = "apple")]
         {
             self.end_pass();
-            self.buffer.commit();
-            self.buffer.waitUntilCompleted();
-            if let Some(error) = self.buffer.error() {
+            let buffer = self.buffer.get_mut().clone();
+            buffer.commit();
+            buffer.waitUntilCompleted();
+            if let Some(why) = self.fenced_error().or_else(|| {
+                buffer
+                    .error()
+                    .map(|error| error.localizedDescription().to_string())
+            }) {
                 return Err(Fault::Device {
                     call: "waitUntilCompleted",
-                    why: error.localizedDescription().to_string(),
+                    why,
                 });
             }
             Ok(())
@@ -517,15 +605,20 @@ impl Frame {
         #[cfg(target_vendor = "apple")]
         {
             self.end_pass();
-            self.buffer.commit();
-            self.buffer.waitUntilCompleted();
-            if let Some(error) = self.buffer.error() {
+            let buffer = self.buffer.get_mut().clone();
+            buffer.commit();
+            buffer.waitUntilCompleted();
+            if let Some(why) = self.fenced_error().or_else(|| {
+                buffer
+                    .error()
+                    .map(|error| error.localizedDescription().to_string())
+            }) {
                 return Err(Fault::Device {
                     call: "waitUntilCompleted",
-                    why: error.localizedDescription().to_string(),
+                    why,
                 });
             }
-            Ok(self.buffer.GPUEndTime() - self.buffer.GPUStartTime())
+            Ok(buffer.GPUEndTime() - buffer.GPUStartTime())
         }
         #[cfg(not(target_vendor = "apple"))]
         {
@@ -543,6 +636,7 @@ impl Frame {
         {
             self.end_pass();
             if let Some(on_done) = on_done {
+                let fenced = Fenced(self.fenced.get_mut().clone());
                 let handler = block2::RcBlock::new(
                     move |buffer: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
                         // SAFETY: Metal hands the handler a live reference to
@@ -550,8 +644,11 @@ impl Frame {
                         // the length of this call.
                         let buffer = unsafe { buffer.as_ref() };
                         on_done(
-                            buffer
-                                .error()
+                            fenced
+                                .0
+                                .iter()
+                                .find_map(|earlier| earlier.error())
+                                .or_else(|| buffer.error())
                                 .map(|error| error.localizedDescription().to_string()),
                         );
                     },
@@ -561,12 +658,14 @@ impl Frame {
                 // closure owns everything it touches and is `Send`.
                 unsafe {
                     self.buffer
+                        .get_mut()
                         .addCompletedHandler(block2::RcBlock::as_ptr(&handler));
                 }
             }
-            self.buffer.commit();
+            self.buffer.get_mut().commit();
             Ok(Pending {
-                buffer: self.buffer.clone(),
+                buffer: self.buffer.get_mut().clone(),
+                fenced: std::mem::take(self.fenced.get_mut()),
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -584,9 +683,23 @@ impl Drop for Frame {
     }
 }
 
+/// The command buffers a fence committed ahead of the frame's last, as a
+/// completion handler holds them.
+#[cfg(target_vendor = "apple")]
+struct Fenced(Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>);
+
+// SAFETY: the handler only reads `error` off them, which is safe from any
+// thread; nothing encodes into a committed buffer.
+#[cfg(target_vendor = "apple")]
+unsafe impl Send for Fenced {}
+
 pub struct Pending {
     #[cfg(target_vendor = "apple")]
     buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    /// Committed at fences ahead of `buffer`, on the same queue, so done
+    /// once it is; their errors count as the frame's.
+    #[cfg(target_vendor = "apple")]
+    fenced: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     #[cfg(not(target_vendor = "apple"))]
     #[allow(dead_code)]
     buffer: (),
@@ -638,7 +751,12 @@ impl Pending {
         #[cfg(target_vendor = "apple")]
         {
             self.buffer.waitUntilCompleted();
-            if let Some(error) = self.buffer.error() {
+            if let Some(error) = self
+                .fenced
+                .iter()
+                .find_map(|buffer| buffer.error())
+                .or_else(|| self.buffer.error())
+            {
                 return Err(Fault::Device {
                     call: "waitUntilCompleted",
                     why: error.localizedDescription().to_string(),

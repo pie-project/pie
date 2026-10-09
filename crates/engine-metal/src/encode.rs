@@ -41,6 +41,10 @@ pub struct Sink<'a> {
     pipelines: &'a Pipelines,
     handles: &'a Handles,
     cuts: Option<Cuts<'a>>,
+    /// The event a `signal` or `wait` fences the frame on; none unless this
+    /// load hands work to the Neural Engine.
+    #[cfg(target_vendor = "apple")]
+    handoff: Option<&'a kernels_metal::ane::Handoff>,
 }
 
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
@@ -105,6 +109,8 @@ impl<'a> Sink<'a> {
             pipelines,
             handles,
             cuts: None,
+            #[cfg(target_vendor = "apple")]
+            handoff: None,
         }
     }
 
@@ -122,6 +128,8 @@ impl<'a> Sink<'a> {
             pipelines,
             handles,
             cuts: Some(cuts),
+            #[cfg(target_vendor = "apple")]
+            handoff: None,
         }
     }
 
@@ -355,7 +363,7 @@ impl Encode for Sink<'_> {
                     let encoder = own.encoder();
                     encoder.setComputePipelineState(&pipeline);
                     for (at, arg) in args.iter().enumerate() {
-                        self.bind(encoder, fire, at, *arg)?;
+                        self.bind(&encoder, fire, at, *arg)?;
                     }
                     let lanes = MTLSize {
                         width: fire.lanes[0].max(1) as usize,
@@ -381,7 +389,7 @@ impl Encode for Sink<'_> {
                 let encoder = frame.encoder();
                 encoder.setComputePipelineState(&pipeline);
                 for (at, arg) in args.iter().enumerate() {
-                    self.bind(encoder, fire, at, *arg)?;
+                    self.bind(&encoder, fire, at, *arg)?;
                 }
                 let lanes = MTLSize {
                     width: fire.lanes[0].max(1) as usize,
@@ -429,6 +437,55 @@ impl Encode for Sink<'_> {
 
     fn absent(&self) -> Result<ArgValue, Error> {
         Ok(ArgValue::Buffer(NIL))
+    }
+
+    fn signal(&self, stamp: u64) -> Result<(), Error> {
+        self.fence(stamp, true)
+    }
+
+    fn wait(&self, stamp: u64) -> Result<(), Error> {
+        self.fence(stamp, false)
+    }
+}
+
+impl<'a> Sink<'a> {
+    /// Arms the hand-off `signal` and `wait` fence on.
+    #[cfg(target_vendor = "apple")]
+    #[must_use]
+    pub fn with_handoff(mut self, handoff: Option<&'a kernels_metal::ane::Handoff>) -> Self {
+        self.handoff = handoff;
+        self
+    }
+
+    #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
+    fn fence(&self, stamp: u64, signal: bool) -> Result<(), Error> {
+        let op = if signal {
+            "handoff.signal"
+        } else {
+            "handoff.wait"
+        };
+        #[cfg(target_vendor = "apple")]
+        {
+            let handoff = self.handoff.ok_or(Error::Backend {
+                op,
+                detail: "no Neural Engine hand-off is armed for this encode".to_string(),
+            })?;
+            let event = objc2::runtime::ProtocolObject::<dyn objc2_metal::MTLEvent>::from_ref(
+                &**handoff.event(),
+            );
+            self.with_frame(|frame| frame.fence(event, stamp, signal))
+                .map_err(|fault| Error::Backend {
+                    op,
+                    detail: fault.to_string(),
+                })
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            Err(Error::Backend {
+                op,
+                detail: Fault::Deviceless.to_string(),
+            })
+        }
     }
 }
 

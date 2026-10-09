@@ -4402,6 +4402,24 @@ impl kernels_metal::Encode for Encoded<'_> {
             Encoded::Built(builder) => builder.absent(),
         }
     }
+
+    fn signal(&self, stamp: u64) -> std::result::Result<(), kernels_metal::Error> {
+        match self {
+            Encoded::Live(sink) => sink.signal(stamp),
+            Encoded::Taped(tape) => tape.signal(stamp),
+            #[cfg(target_vendor = "apple")]
+            Encoded::Built(builder) => builder.signal(stamp),
+        }
+    }
+
+    fn wait(&self, stamp: u64) -> std::result::Result<(), kernels_metal::Error> {
+        match self {
+            Encoded::Live(sink) => sink.wait(stamp),
+            Encoded::Taped(tape) => tape.wait(stamp),
+            #[cfg(target_vendor = "apple")]
+            Encoded::Built(builder) => builder.wait(stamp),
+        }
+    }
 }
 
 fn widen(raw: &[u8], stride: usize) -> Vec<f32> {
