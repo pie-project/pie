@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import json
 import os
+import random
 import shutil
 import socket
 import subprocess
@@ -33,6 +34,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from mascots import ANIMALS
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.key_binding import KeyBindings
@@ -117,26 +119,10 @@ class EngineBackend:
         self.history.append({"role": "assistant", "content": "".join(pieces)})
 
 
-# The mascot is a pixel cat drawn with half-block characters: two pixel rows per text line.
-MASCOT_PALETTE = {"K": (24, 24, 28), "o": (245, 140, 40), "d": (205, 100, 22), "p": (250, 182, 170)}
-MASCOT_ROWS = [
-    ".K............K.",
-    ".KK..........KK.",
-    ".KoK........KoK.",
-    ".KpoK......KopK.",
-    ".KppoKKKKKKoppK.",
-    ".KooooooooooooK.",
-    ".KooooooooooooK.",
-    ".KooKKooooKKooK.",
-    ".KooKKooooKKooK.",
-    "KKooooooooooooKK",
-    ".KoooooKKoooooK.",
-    "KKooooKooKooooKK",
-    ".KooooooooooooK.",
-    "..KooooooooooK..",
-    "..KoddooooddoK..",
-    "..KKKKKKKKKKKK..",
-]
+# One random animal from mascots.py per launch, drawn small like Claude's mascot:
+# every other pixel of the 16x16 art (8x8), then two pixel rows per text line.
+MASCOT_NAME, (MASCOT_PALETTE, MASCOT_16) = random.choice(list(ANIMALS.items()))
+MASCOT_ROWS = [row[::2] for row in MASCOT_16[::2]]
 
 
 def mascot_rows() -> list[list[tuple[str, str]]]:
