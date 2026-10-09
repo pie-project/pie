@@ -9,7 +9,7 @@ from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.mouse_events import MouseEventType
 
 from .chat import Chat
-from .config import MODEL_NAME, MODES, PROMPT_COLOUR, STYLE
+from .config import MODEL_NAME, MODES, PROMPT_COLOUR, REDRAW_INTERVAL_SECONDS, STYLE
 from .engine import engine_version
 from .markdown import Markdown, render
 from .mascot import mascot_rows
@@ -161,6 +161,7 @@ def build(chat: Chat) -> Application:
         style=STYLE,
         full_screen=True,
         mouse_support=True,
+        min_redraw_interval=REDRAW_INTERVAL_SECONDS,
     )
     chat.app.ttimeoutlen = 0.01
     chat.app.timeoutlen = 0.05
