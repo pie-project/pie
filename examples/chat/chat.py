@@ -132,6 +132,7 @@ class Chat:
         self.transcript: list[tuple[str, str]] = []  # (style, text) pieces, in order
         self.streaming = False
         self.app: Application | None = None
+        self.exit_armed = False  # set by the first Ctrl-C on an empty prompt
 
         self.input = Buffer(multiline=False)
         self.input_window = Window(
@@ -166,7 +167,12 @@ class Chat:
         return Point(x=0, y=text.count("\n"))
 
     def status(self) -> list[tuple[str, str]]:
-        hint = " answering…" if self.streaming else " Enter sends · /new starts over · Ctrl-D quits"
+        if self.exit_armed:
+            hint = " Press Ctrl-C again to exit"
+        elif self.streaming:
+            hint = " answering…"
+        else:
+            hint = " Enter sends · /new starts over · Ctrl-C twice or Ctrl-D quits"
         return [("class:status", hint.ljust(200))]
 
     # ---- what happens ----------------------------------------------------
@@ -206,6 +212,11 @@ class Chat:
             self.app.create_background_task(self.send(text))
         return False
 
+    def disarm_exit(self) -> None:
+        self.exit_armed = False
+        if self.app:
+            self.app.invalidate()
+
     # ---- layout --------------------------------------------------------
 
     def build(self) -> Application:
@@ -214,6 +225,21 @@ class Chat:
         @bindings.add("c-d")
         def _(event):
             event.app.exit()
+
+        @bindings.add("c-c")
+        def _(event):
+            # Like the Claude CLI: clear typed text first; on an empty prompt, one
+            # Ctrl-C arms the exit and a second one within a couple of seconds quits.
+            if self.input.text:
+                self.input.reset()
+                return
+            if self.exit_armed:
+                event.app.exit()
+                return
+            self.exit_armed = True
+            event.app.invalidate()
+            loop = asyncio.get_running_loop()
+            loop.call_later(2.0, self.disarm_exit)
 
         self.input.accept_handler = self.on_enter
 
