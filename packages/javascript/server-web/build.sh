@@ -21,8 +21,7 @@ cp packages/javascript/server-web/src/platform.mjs packages/javascript/server-we
 # wasm-bindgen 0.2.128 stores a string-returning import's (ptr, len) through the
 # signed i32 `arg0`, so an out-pointer above 2 GiB throws; coerce it unsigned.
 n=$(grep -c 'setInt32(arg0 + 4 \* ' packages/javascript/server-web/pkg/pie_browser.js || true)
-sed -i.orig 's/setInt32(arg0 + 4 \* /setInt32((arg0 >>> 0) + 4 * /g' packages/javascript/server-web/pkg/pie_browser.js
-rm packages/javascript/server-web/pkg/pie_browser.js.orig
+sed -i 's/setInt32(arg0 + 4 \* /setInt32((arg0 >>> 0) + 4 * /g' packages/javascript/server-web/pkg/pie_browser.js
 echo "glue: $n out-pointer stores made unsigned"
 ls -la packages/javascript/server-web/pkg/pie_browser_bg.wasm
 

@@ -6,7 +6,7 @@ import PackageDescription
 
 let package = Package(
     name: "Pie",
-    platforms: [.iOS(.v26), .macOS(.v26), .visionOS(.v26)],
+    platforms: [.iOS(.v26), .macOS(.v26)],
     products: [
         .library(name: "PieClient", targets: ["PieClient"]),
         .library(name: "PieServer", targets: ["PieServer"]),

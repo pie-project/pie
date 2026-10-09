@@ -100,9 +100,7 @@ public final class PieServer: Sendable {
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         let config = try String(decoding: JSONEncoder().encode(configuration), as: UTF8.self)
         let handle = try await blocking {
-            var pointer: OpaquePointer?
-            try check { error in pie_server_start(model.path(), config, home.path(), listen, &pointer, error) }
-            return Handle(pointer: pointer!)
+            Handle(pointer: try call { error in pie_server_start(model.path(), config, home.path(), listen, error) })
         }
         let server: PieServer
         do {
@@ -133,14 +131,13 @@ public final class PieServer: Sendable {
     /// Returns its `name@version`, which `PieClient.launch` takes.
     public func install(_ program: Data, file: String, version: String? = nil) async throws -> String {
         try await Self.blocking { [handle] in
-            var name: UnsafeMutablePointer<CChar>?
-            try Self.check { error in
+            let name = try Self.call { error in
                 program.withUnsafeBytes { bytes in
-                    pie_server_install(handle.pointer, bytes.baseAddress, bytes.count, file, version, &name, error)
+                    pie_server_install(handle.pointer, bytes.baseAddress, bytes.count, file, version, error)
                 }
             }
             defer { pie_string_free(name) }
-            return String(cString: name!)
+            return String(cString: name)
         }
     }
 
@@ -167,18 +164,23 @@ public final class PieServer: Sendable {
         try? await Self.blocking { [handle] in pie_server_shutdown(handle.pointer) }
     }
 
-    /// Runs a C call, throwing the message of a status other than `PIE_OK`.
-    static func check(_ body: (UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> pie_status) throws {
+    /// Runs a C call that returns NULL on failure.
+    static func call<T>(_ body: (UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> T?) throws -> T {
         var error: UnsafeMutablePointer<CChar>?
-        let status = body(&error)
-        guard status != PIE_OK else { return }
-        throw failure(status, error)
+        guard let value = body(&error) else { throw failure(error) }
+        return value
     }
 
-    static func failure(_ status: pie_status, _ error: UnsafeMutablePointer<CChar>?) -> PieError {
+    /// Runs a C call that returns nonzero on failure.
+    static func check(_ body: (UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> Int32) throws {
+        var error: UnsafeMutablePointer<CChar>?
+        if body(&error) != 0 { throw failure(error) }
+    }
+
+    static func failure(_ error: UnsafeMutablePointer<CChar>?) -> PieError {
+        guard let error else { return .server("pie failed without a message") }
         defer { pie_string_free(error) }
-        if status == PIE_ERR_SHUT_DOWN { return .connectionClosed }
-        return .server(error.map { String(cString: $0) } ?? "pie failed without a message")
+        return .server(String(cString: error))
     }
 
     /// The C calls block for as long as a boot or a compile takes, so each
@@ -241,12 +243,11 @@ final class InProcessTransport: PieTransport {
         }
         while !closed.withLock({ $0 }) {
             var error: UnsafeMutablePointer<CChar>?
-            var received = 0
-            let status = pie_server_recv_frames(server.handle.pointer, session, 5_000, 64, { context, frame, length in
+            let delivered = pie_server_recv_frames(server.handle.pointer, session, 5_000, 64, { context, frame, length in
                 Unmanaged<Sink>.fromOpaque(context!).takeUnretainedValue().continuation.yield(Data(bytes: frame!, count: length))
-            }, sink.toOpaque(), &received, &error)
-            if status != PIE_OK {
-                let failure = PieServer.failure(status, error)
+            }, sink.toOpaque(), &error)
+            if delivered < 0 {
+                let failure = PieServer.failure(error)
                 if !closed.withLock({ $0 }) { continuation.finish(throwing: failure) }
                 return
             }

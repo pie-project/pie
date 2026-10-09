@@ -420,13 +420,7 @@ fn default_warm_slots() -> u32 {
     100
 }
 fn default_fs_scratch_dir() -> PathBuf {
-    // wasm32 has no temp dir to ask for (`temp_dir` panics); the browser's
-    // sandbox reads no files anyway.
-    if cfg!(target_arch = "wasm32") {
-        PathBuf::from("/tmp/pie")
-    } else {
-        std::env::temp_dir().join("pie")
-    }
+    std::env::temp_dir().join("pie")
 }
 fn default_network_allowed_hosts() -> Vec<String> {
     vec!["*".to_string()]

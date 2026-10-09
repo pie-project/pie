@@ -5,10 +5,10 @@ Libraries:
 - **`PieClient`** speaks pie's client protocol (MessagePack frames,
   crates/client-api). It talks to a remote `pie serve` over WebSocket, or to
   the runtime a `PieServer` runs in this process.
-- **`PieServer`** runs pie inside an iOS, visionOS or macOS app: the runtime, the Metal
+- **`PieServer`** runs pie inside an iOS or macOS app: the runtime, the Metal
   engine and the inferlet sandbox in-process, booted by the same worker
   `pie serve` runs (`worker::Server`). Inferlets run under wasmtime's Pulley
-  interpreter on iOS and visionOS, where an app may not JIT.
+  interpreter on iOS, where an app may not JIT.
 - **`PieLanguagePython`**, **`PieLanguageJavaScript`** add the components
   script inferlets (`x.py`, `x.js`) run in:
 
@@ -66,7 +66,7 @@ lanes, the share of the GPU working set), sized for a phone by default.
 ## Build
 
 ```bash
-./build-xcframework.sh        # ../c → build/PieServerCore.xcframework (iOS, visionOS and their simulators, macOS; arm64)
+./build-xcframework.sh        # the Rust core → build/PieServerCore.xcframework (iOS, iOS simulator, macOS; arm64)
 ../../scripts/build-languages.sh                      # the language components → Sources/PieLanguage*/Resources
 swift test                                            # protocol and configuration, no GPU
 swift run -c release pie-smoke <model.zt> "prompt"   # end to end on a Mac (or ws://host:port)
@@ -74,9 +74,8 @@ PIE_SCRIPT=../../examples/quickstart-py/main.py swift run -c release pie-smoke <
 PIE_LISTEN=127.0.0.1:8080 swift run -c release pie-smoke <model.zt> "prompt"   # the turn through its own gateway
 ```
 
-`PieServerCore` is `../c`, pie's C library (`libpie`, `include/pie.h`),
-built for each Apple slice: iOS, iOS simulator, visionOS, visionOS simulator
-and macOS.
+`core/` is the Rust core (`pie-swift-core`, a workspace member) behind
+`core/include/pie_server.h`; anything that speaks C can link it the same way.
 
 ## Limits
 

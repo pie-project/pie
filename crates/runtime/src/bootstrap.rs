@@ -542,10 +542,7 @@ fn verify_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(
-    target_arch = "wasm32",
-    all(target_vendor = "apple", not(target_os = "macos"))
-)))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
 const CORE_RESOURCES_PER_COMPONENT: u32 = 16;
 
 #[cfg(target_arch = "wasm32")]
@@ -578,24 +575,20 @@ fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     wasmtime::Engine::new(&wasm_config).unwrap()
 }
 
-/// Apple's platforms other than macOS (iOS, visionOS, tvOS, watchOS) give an
-/// app no executable memory: inferlets run as Pulley bytecode, with memories
-/// allocated on demand.
-#[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
+/// iOS gives an app no executable memory: inferlets run as Pulley bytecode,
+/// with memories allocated on demand.
+#[cfg(target_os = "ios")]
 fn configure_execution(wasm_config: &mut wasmtime::Config, _runtime: &RuntimeConfig) {
     wasm_config
         .target("pulley64")
-        .expect("pulley64 is compiled in where an app may not JIT");
+        .expect("pulley64 is compiled in on iOS");
     wasm_config.signals_based_traps(false);
     wasm_config.memory_reservation(0);
     wasm_config.memory_guard_size(0);
     wasm_config.memory_init_cow(false);
 }
 
-#[cfg(not(any(
-    target_arch = "wasm32",
-    all(target_vendor = "apple", not(target_os = "macos"))
-)))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
 fn configure_execution(wasm_config: &mut wasmtime::Config, runtime: &RuntimeConfig) {
     let mut pooling_config = wasmtime::PoolingAllocationConfig::default();
     pooling_config.total_component_instances(runtime.wasm_max_instances);
