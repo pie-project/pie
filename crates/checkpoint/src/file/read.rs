@@ -10,7 +10,7 @@ pub fn discover_safetensors_files(snapshot_dir: &Path) -> Result<Vec<PathBuf>, E
     let index = snapshot_dir.join("model.safetensors.index.json");
 
     if single.is_file() {
-        return Ok(vec![single]);
+        return Ok(with_sidecars(snapshot_dir, vec![single]));
     }
 
     if index.is_file() {
@@ -35,10 +35,11 @@ pub fn discover_safetensors_files(snapshot_dir: &Path) -> Result<Vec<PathBuf>, E
             })?;
             shard_names.insert(shard.to_string());
         }
-        return Ok(shard_names
+        let shards = shard_names
             .into_iter()
             .map(|s| snapshot_dir.join(s))
-            .collect());
+            .collect();
+        return Ok(with_sidecars(snapshot_dir, shards));
     }
 
     let named = named_safetensors_files(snapshot_dir);
@@ -50,6 +51,18 @@ pub fn discover_safetensors_files(snapshot_dir: &Path) -> Result<Vec<PathBuf>, E
         "no model.safetensors[.index.json] in {}",
         snapshot_dir.display()
     )))
+}
+
+/// `files` plus every other `.safetensors` beside them: a sidecar written next
+/// to a published checkpoint (DeepSeek-V4.1's `engram_token_map.safetensors`)
+/// is in no index, and the source the import reads lists the whole directory.
+fn with_sidecars(snapshot_dir: &Path, mut files: Vec<PathBuf>) -> Vec<PathBuf> {
+    for path in named_safetensors_files(snapshot_dir) {
+        if !files.contains(&path) {
+            files.push(path);
+        }
+    }
+    files
 }
 
 fn named_safetensors_files(snapshot_dir: &Path) -> Vec<PathBuf> {
@@ -356,6 +369,24 @@ mod tests {
         a_fixed_name_wins_over_everything_beside_it();
         a_file_names_itself();
         a_directory_without_artifacts_discovers_nothing();
+        a_sidecar_beside_an_index_is_discovered();
+    }
+
+    fn a_sidecar_beside_an_index_is_discovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = dir.path().join("model-00001-of-00001.safetensors");
+        let sidecar = dir.path().join("engram_token_map.safetensors");
+        touch(&shard);
+        touch(&sidecar);
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            br#"{"weight_map": {"a": "model-00001-of-00001.safetensors"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            discover_safetensors_files(dir.path()).unwrap(),
+            vec![shard, sidecar]
+        );
     }
 
     fn a_directory_of_specializations_discovers_all_of_them() {
