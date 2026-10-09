@@ -30,6 +30,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -295,10 +296,14 @@ class Chat:
         self.add("class:bold", f"❯ {text}\n\n")
         self.streaming = True
         self.add("class:accent", "● ")
+        started = time.monotonic()
         try:
             async for piece in self.backend.reply(text):
                 self.add("", piece)
             self.add("", "\n\n")
+            elapsed = round(time.monotonic() - started)
+            done_at = datetime.now(timezone.utc).astimezone().strftime("%-I:%M %p")
+            self.add("class:dim", f"✻ Done for {elapsed}s · done {done_at}\n\n")
         except RuntimeError as error:
             self.add("class:error", f"\n  could not reach the engine: {error}\n")
             self.add("class:dim", "  start it with `pie serve`, then send the message again.\n\n")
