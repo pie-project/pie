@@ -321,8 +321,12 @@ def trust_screen() -> None:
     """A one-time, tongue-in-cheek first-run screen. Nothing here is a real permission."""
     if TRUST_MARK.exists():
         return
-    print(f"  {BOLD}❯ Continue{RESET}  data anyways does not leave your computer")
-    input("  Press Enter ")
+    print(f"{BOLD}Accessing workspace:{RESET}\n")
+    print(f"{BOLD}{os.getcwd()}{RESET}\n")
+    print("Quick safety check: does this chat send anything out? Nope, data anyways does not leave your computer.\n")
+    print(f"{BOLD}❯ Continue{RESET}")
+    print(f"{DIM}Enter to confirm{RESET}\n")
+    input()
     TRUST_MARK.parent.mkdir(parents=True, exist_ok=True)
     TRUST_MARK.touch()
 
