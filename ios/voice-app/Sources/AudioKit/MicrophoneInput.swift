@@ -37,6 +37,10 @@ final class MicrophoneInput: NSObject, SpeechInput {
     weak var delegate: SpeechInputDelegate?
     private(set) var isListening = false
 
+    /// What voice mode's voice-activity detector has learnt about the room
+    /// and the reply's echo residue. Read by the audio self-check.
+    var detectorReadings: CapturePipeline.DetectorReadings { pipeline.detectorReadings }
+
     /// Dictation: silence after the last recognised word that ends the
     /// utterance. Long enough to think mid-sentence, short enough that the
     /// app doesn't feel deaf.
@@ -61,7 +65,7 @@ final class MicrophoneInput: NSObject, SpeechInput {
     private let recognizer = SpeechRecognition.makeRecognizer()
     private let hub = AudioEngineHub.shared
     private lazy var pipeline = CapturePipeline(
-        echoLikely: { [hub] in hub.isEchoLikely },
+        playbackEcho: { [hub] in hub.playbackEcho },
         emit: { [weak self] session, event in
             DispatchQueue.main.async {
                 self?.handle(event, session: session)

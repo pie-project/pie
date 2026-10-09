@@ -180,6 +180,7 @@ enum BenchmarkRunner {
                         "decode_tps": Double(result.stats.generated) / decodeWindow,
                         "footprint_mb": footprint,
                         "chars": result.text.count,
+                        "reply": result.text,
                         "note": result.stats.note,
                     ])
                 } catch {

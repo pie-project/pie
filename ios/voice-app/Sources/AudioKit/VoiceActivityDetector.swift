@@ -22,6 +22,10 @@ import Foundation
 /// Keeping them apart matters: folded into one floor, the residue would
 /// raise the room floor and the echo margin would then be stacked on top
 /// of it, which put barge-in out of reach of a normal speaking voice.
+/// In the moments after a reply stops (`PlaybackEcho.tail`), onset is
+/// still held to the reply's thresholds, but neither reference learns:
+/// what is heard then is the reply's last reverberation, or the user
+/// answering it.
 ///
 /// Neither reference is assumed. A reference that starts from a guess and
 /// only learns from levels below the threshold it sets can never learn a
@@ -45,9 +49,10 @@ import Foundation
 /// a property of the route and the volume, not of the session, and is
 /// forgotten only when the route changes (`forgetRoute()`).
 ///
-/// The numbers are starting points for the iPhone's voice-processed
-/// microphone (automatic gain control on), to be checked against the audio
-/// self-check's no_false_bargein and external_onset results.
+/// The numbers are for the iPhone's voice-processed microphone (automatic
+/// gain control on), set from what the audio self-check measured there and
+/// checked by its no_false_bargein, echo_transcripts and external_onset
+/// results.
 struct VoiceActivityDetector {
 
     enum Event: Equatable {
@@ -59,18 +64,62 @@ struct VoiceActivityDetector {
     static let onsetMargin: Float = 10
     /// ...and at least this loud, in dBFS.
     static let onsetMinimum: Float = -50
-    /// While a reply plays: this far above the room floor, this far above
-    /// the loud parts of the echo residue, and at least this loud.
-    static let echoOnsetMargin: Float = 18
-    static let echoResidueMargin: Float = 6
-    static let echoOnsetMinimum: Float = -38
     /// How long the level has to stay up: long enough to ignore a click
     /// or a cough's first burst, short enough not to lose the first word
     /// (the pre-roll covers it).
     static let onsetTime: TimeInterval = 0.2
+
+    /// While a reply plays or has just stopped, onset needs the level above
+    /// all three of the thresholds below, for `onsetTime` as without one.
+    ///
+    /// Onset over a reply decides nothing by itself: voice mode ducks the
+    /// reply and lets `EchoFilter` judge the words recognised. An onset the
+    /// residue sets off costs a second or two of quieter reply; a voice
+    /// missed costs the user their interruption. The level alone cannot
+    /// tell them apart: what leaks through the echo canceller comes a
+    /// syllable or a word at a time, sometimes louder than the user, and
+    /// "stop" said over the reply is one syllable too. Asking for 0.35 s
+    /// rather than 0.2 kept out most of the leaks, and nearly every
+    /// one-word interruption with them, so only the thresholds are stricter
+    /// than without a reply.
+    ///
+    /// The audio self-check on an iPhone 16 Pro in a quiet room, with the
+    /// reply at the earlier +6 dB make-up gain, measured the residue
+    /// reaching the detector: a median near -38 dBFS, a 90th percentile
+    /// between -34.6 and -31.4 dBFS, bursts as loud as -8 dBFS, and an
+    /// onset during the reply in three of four runs; a normal voice at arm's
+    /// length measures about -30 to -15 dBFS. Run against level tracks
+    /// shaped like that residue (words of syllables and gaps, some leaking
+    /// louder), these thresholds against the earlier ones (a 6 dB residue
+    /// margin and a -38 dBFS minimum), on the same residue:
+    ///   - a 7 s reply whose leaks reach 16 dB over its usual syllables set
+    ///     off onset in 10 to 14% of replies, against 20 to 29%; with leaks
+    ///     as loud as the -8 dBFS measured, in about half either way;
+    ///   - a voice talking over the reply at -22 dBFS was missed within 4 s
+    ///     in 17% of tries against 5% with the residue 4 dB lower, as the
+    ///     smaller make-up gain should leave it, and in 59% against 35%
+    ///     with the residue as measured;
+    ///   - "stop" at -18 dBFS, its vowel 233 ms long, was heard in 95 to
+    ///     99% of tries, as before.
+    /// So the phone has to show the residue coming down with the make-up
+    /// gain; if it does not, the residue margin is the number to give
+    /// back first.
+    ///
+    /// This far above the room floor.
+    static let echoOnsetMargin: Float = 18
+    /// This far above the residue envelope, which settles near the
+    /// residue's 95th percentile (it jumps up to loud windows and lets go
+    /// over ten seconds), some 6 dB over its median.
+    static let echoResidueMargin: Float = 7
+    /// At least this loud, in dBFS: about the residue's 90th percentile as
+    /// measured, so most of it is kept out while the envelope is still
+    /// being learnt or is out of date, and under the quiet end of a normal
+    /// voice.
+    static let echoOnsetMinimum: Float = -32
     /// Once talking, the level only has to stay this far above the room
-    /// floor to count as still talking. Lower than the onset margin, so
-    /// the quiet end of a word does not count as silence.
+    /// floor to count as still talking (and, while a reply plays or has
+    /// just stopped, above the loud parts of its residue). Lower than the onset margin, so the
+    /// quiet end of a word does not count as silence.
     static let holdMargin: Float = 6
     static let holdMinimum: Float = -56
     /// Silence that ends an utterance.
@@ -111,6 +160,10 @@ struct VoiceActivityDetector {
     private(set) var echoResidue = VoiceActivityDetector.initialFloor
     private(set) var isSpeech = false
 
+    /// The level onset needs while a reply plays, from what has been
+    /// learnt so far, in dBFS. Read by the audio self-check.
+    var echoOnsetLevel: Float { onsetThreshold(echoLikely: true) }
+
     private var floorSeeded = false
     private var floorMeasured: TimeInterval = 0
     private var floorSeedLevel = Float.infinity
@@ -129,9 +182,11 @@ struct VoiceActivityDetector {
     private var speechTime: TimeInterval = 0
     private var wasEchoLikely = false
 
-    /// Feeds one window's level (dBFS) lasting `duration` seconds.
-    mutating func process(level: Float, duration: TimeInterval, echoLikely: Bool) -> Event? {
+    /// Feeds one window's level (dBFS) lasting `duration` seconds, with
+    /// what the speaker was doing when it was heard.
+    mutating func process(level: Float, duration: TimeInterval, echo: PlaybackEcho) -> Event? {
         let steady = remember(level, duration: duration)
+        let echoLikely = echo != .none
         if echoLikely, !wasEchoLikely {
             // A reply just started; its residue is never quieter than the
             // room. If it is the first on this route, it is measured before
@@ -151,19 +206,23 @@ struct VoiceActivityDetector {
         wasEchoLikely = echoLikely
 
         if isSpeech {
-            return continueSpeech(level: level, duration: duration, echoLikely: echoLikely, steady: steady)
+            return continueSpeech(level: level, duration: duration, echo: echo, steady: steady)
         }
 
         if echoLikely, residueSeeding {
-            residueWaited += duration
-            if level >= floor + Self.audibleMargin {
-                residueHeard += duration
-                residueSeedLevel = max(residueSeedLevel, level)
-            }
-            if residueHeard >= Self.residueSeedTime || residueWaited >= Self.residueSeedLimit {
-                echoResidue = Self.clamped(max(echoResidue, residueSeedLevel))
-                residueSeeding = false
-                residueKnown = true
+            // Only what is heard while the reply plays is measured: in the
+            // moments after it the user may already be answering.
+            if echo == .playing {
+                residueWaited += duration
+                if level >= floor + Self.audibleMargin {
+                    residueHeard += duration
+                    residueSeedLevel = max(residueSeedLevel, level)
+                }
+                if residueHeard >= Self.residueSeedTime || residueWaited >= Self.residueSeedLimit {
+                    echoResidue = Self.clamped(max(echoResidue, residueSeedLevel))
+                    residueSeeding = false
+                    residueKnown = true
+                }
             }
             onsetEvidence = 0
             return nil
@@ -184,10 +243,13 @@ struct VoiceActivityDetector {
                 // Loud but unchanging: a noise that has become part of the
                 // room, or of the residue, not someone starting to talk.
                 onsetEvidence = max(0, onsetEvidence - duration)
-                if echoLikely {
-                    adapt(&echoResidue, toward: level, duration: duration, timeConstant: Self.steadyFollowTime)
-                } else {
+                switch echo {
+                case .none:
                     adapt(&floor, toward: level, duration: duration, timeConstant: Self.steadyFollowTime)
+                case .playing:
+                    adapt(&echoResidue, toward: level, duration: duration, timeConstant: Self.steadyFollowTime)
+                case .tail:
+                    break
                 }
                 return nil
             }
@@ -205,17 +267,26 @@ struct VoiceActivityDetector {
         // Leaky rather than reset, so the dip between two syllables does
         // not throw away the first one.
         onsetEvidence = max(0, onsetEvidence - duration)
-        if echoLikely {
-            // Below the threshold, so it cannot be the user: the envelope
+        switch echo {
+        case .none:
+            // Falls quickly (a noise ending) and rises slowly.
+            adapt(&floor, toward: level, duration: duration, timeConstant: level < floor ? 0.15 : 2)
+        case .playing:
+            // Below the threshold, so it is taken for residue: the envelope
             // jumps to the residue's loud parts and lets go of them slowly,
             // so the gaps between the reply's words do not pull it down to
             // where its next syllable would read as the user. A syllable
             // louder than the threshold is rejected by the onset evidence
             // leaking away before it is over.
             adapt(&echoResidue, toward: level, duration: duration, timeConstant: level > echoResidue ? 0.15 : 10)
-        } else {
-            // Falls quickly (a noise ending) and rises slowly.
-            adapt(&floor, toward: level, duration: duration, timeConstant: level < floor ? 0.15 : 2)
+        case .tail:
+            // The reply has stopped, and what is heard now is its last
+            // reverberation or the user answering it, often quietly at
+            // first. Learnt as residue, an answer like that would raise
+            // the envelope that the next reply's barge-in has to clear;
+            // learnt as the room, the reverberation would raise the floor.
+            // So neither reference moves.
+            break
         }
         return nil
     }
@@ -255,15 +326,31 @@ struct VoiceActivityDetector {
 
     // MARK: - Internals
 
-    private mutating func continueSpeech(level: Float, duration: TimeInterval, echoLikely: Bool, steady: Bool) -> Event? {
+    private mutating func continueSpeech(level: Float, duration: TimeInterval, echo: PlaybackEcho, steady: Bool) -> Event? {
         speechTime += duration
-        let hold = max(floor + Self.holdMargin, Self.holdMinimum)
+        var hold = max(floor + Self.holdMargin, Self.holdMinimum)
+        if echo != .none {
+            // A reply's residue is louder than the room, so above the room
+            // is not enough to be still talking: above the residue's loud
+            // parts is. Otherwise an onset the residue itself set off is
+            // held open by it for the rest of the reply and past its end,
+            // feeding the recogniser the reply's words all the way, and an
+            // utterance that outlives the reply reaches voice mode as a
+            // new question with no reply left to compare it with. Voice
+            // mode ducks the reply on onset, which drops the residue well
+            // under this, so such an utterance ends one trailing silence
+            // later, while the reply is still there to compare it with.
+            // A voice talking over the reply rises well above it on every
+            // syllable, so for the user only a real pause counts.
+            hold = max(hold, echoResidue)
+        }
         if level > hold {
             silence = 0
         } else {
             silence += duration
         }
-        if !echoLikely {
+        switch echo {
+        case .none:
             // A noise that has become part of the room (a fan switched on)
             // must not hold an utterance open: the floor rises underneath
             // it, within about a second once the level is plainly steady
@@ -271,8 +358,12 @@ struct VoiceActivityDetector {
             // and falls back quickly when the noise stops.
             let timeConstant = level < floor ? 0.5 : (steady ? Self.steadyFollowTime : 15)
             adapt(&floor, toward: level, duration: duration, timeConstant: timeConstant)
-        } else if steady, level > echoResidue {
-            adapt(&echoResidue, toward: level, duration: duration, timeConstant: Self.steadyFollowTime)
+        case .playing:
+            if steady, level > echoResidue {
+                adapt(&echoResidue, toward: level, duration: duration, timeConstant: Self.steadyFollowTime)
+            }
+        case .tail:
+            break
         }
         if silence >= Self.trailingSilence || speechTime >= Self.maximumUtterance {
             endSpeech()

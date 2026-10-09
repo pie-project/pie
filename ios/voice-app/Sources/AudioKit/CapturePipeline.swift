@@ -51,8 +51,15 @@ final class CapturePipeline {
     /// this only bounds the memory if that ever fails.
     static let holdLimit: TimeInterval = 10
     /// Audio kept from before onset, so the first syllable, spoken before
-    /// the detector was sure, still reaches the recogniser.
-    static let preRollDuration: TimeInterval = 0.6
+    /// the detector was sure, still reaches the recogniser. Onset over a
+    /// reply comes well after its 0.2 s of evidence, because a voice's
+    /// quieter syllables fall under the stricter thresholds there and the
+    /// evidence leaks away between syllables: in the detector's
+    /// simulations, half the time 0.45 s or more after the first syllable,
+    /// and one time in ten 1 s or more. Not longer: over a reply, what
+    /// comes before the user's first word is the reply's residue, and the
+    /// recogniser would transcribe that too.
+    static let preRollDuration: TimeInterval = 1.0
     /// Audio kept in case the on-device recogniser turns out to have no
     /// language assets and the utterance has to be recognised again over
     /// the network. Once the recogniser has produced a word it is clearly
@@ -60,7 +67,7 @@ final class CapturePipeline {
     static let replayLimit: TimeInterval = 20
 
     private let lock = NSLock()
-    private let echoLikely: () -> Bool
+    private let playbackEcho: () -> PlaybackEcho
     private let emit: (_ session: Int, _ event: Event) -> Void
 
     private var session = 0
@@ -87,8 +94,8 @@ final class CapturePipeline {
     private var kept: [AVAudioPCMBuffer] = []
     private var keptTotal: TimeInterval = 0
 
-    init(echoLikely: @escaping () -> Bool, emit: @escaping (_ session: Int, _ event: Event) -> Void) {
-        self.echoLikely = echoLikely
+    init(playbackEcho: @escaping () -> PlaybackEcho, emit: @escaping (_ session: Int, _ event: Event) -> Void) {
+        self.playbackEcho = playbackEcho
         self.emit = emit
     }
 
@@ -158,6 +165,25 @@ final class CapturePipeline {
         self.request = request
     }
 
+    /// What the voice-activity detector has learnt, in dBFS.
+    struct DetectorReadings {
+        let floor: Float
+        let echoResidue: Float
+        /// The level onset needs while a reply plays.
+        let echoOnsetLevel: Float
+    }
+
+    /// Read by the audio self-check.
+    var detectorReadings: DetectorReadings {
+        lock.lock()
+        defer { lock.unlock() }
+        return DetectorReadings(
+            floor: detector.floor,
+            echoResidue: detector.echoResidue,
+            echoOnsetLevel: detector.echoOnsetLevel
+        )
+    }
+
     /// Requests created from now on use (or not) on-device recognition.
     func setOnDevice(_ onDevice: Bool) {
         lock.lock()
@@ -207,7 +233,7 @@ final class CapturePipeline {
         let rms = AudioLevel.windowRMS(buffer, windowFrames: windowFrames)
         guard !rms.isEmpty else { return }
         let decibels = rms.map(AudioLevel.decibels(rms:))
-        let echo = echoLikely()
+        let echo = playbackEcho()
         var events: [Event] = [
             .levels(decibels.map(AudioLevel.normalized(decibels:)), window: Double(windowFrames) / rate),
         ]
@@ -256,7 +282,7 @@ final class CapturePipeline {
             var ended = false
             for (index, level) in decibels.enumerated() {
                 let frames = min(windowFrames, Int(buffer.frameLength) - index * windowFrames)
-                switch detector.process(level: level, duration: Double(frames) / rate, echoLikely: echo) {
+                switch detector.process(level: level, duration: Double(frames) / rate, echo: echo) {
                 case .onset?:
                     onset = true
                 case .end?:

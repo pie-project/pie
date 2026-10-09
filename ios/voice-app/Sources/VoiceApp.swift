@@ -93,6 +93,15 @@ final class AppComposition: ObservableObject {
             chat.bootstrap()
             if UITour.isEnabled {
                 UITour.run(chat: chat, voice: voice, router: router, settings: settings, store: store)
+            } else if VoiceSoak.isEnabled {
+                VoiceSoak.run(
+                    chat: chat,
+                    voice: voice,
+                    speech: speech,
+                    microphone: microphone,
+                    router: router,
+                    store: store
+                )
             }
         }
     }

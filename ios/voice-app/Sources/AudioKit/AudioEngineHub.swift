@@ -41,7 +41,7 @@ import Foundation
 /// after the last client leaves it is deactivated, telling other apps, so
 /// music the app paused resumes and the voice-chat route is let go.
 ///
-/// Main thread only, except `isEchoLikely`, which the input tap reads.
+/// Main thread only, except `playbackEcho`, which the input tap reads.
 final class AudioEngineHub {
 
     static let shared = AudioEngineHub()
@@ -85,10 +85,49 @@ final class AudioEngineHub {
 
     /// Voice processing plays the reply at a noticeably lower level than
     /// the same audio without it on the iPhone speaker (the voice-chat
-    /// volume curve plus the processing's own output stage). This much
-    /// make-up gain, applied ahead of a peak limiter so the louder speech
-    /// cannot clip, brings replies back to a normal speaking level.
-    private static let voiceProcessingMakeUpGain: Float = 6
+    /// volume curve plus the processing's own output stage), so in voice
+    /// mode the reply is played this much louder, in dB.
+    ///
+    /// Kept small, because what leaks past the echo canceller grows faster
+    /// than the reply gets louder. The canceller models the echo path as
+    /// linear: it removes what the speaker plays to the extent that it is
+    /// the reply scaled, and leaves the rest for the microphone and the
+    /// recogniser. The 6 dB this replaced drove the peak limiter into the
+    /// reply. Rendered offline with the default US English voice
+    /// (Samantha, whose peaks reach -1.8 dBFS), the limiter turned down 41%
+    /// of its samples, leaving distortion only 18.5 dB under the reply:
+    /// nothing a linear model can remove, and no quieter than what a
+    /// canceller typically leaves of the linear echo, 20 to 30 dB under
+    /// it. At 3 dB the limiter still turns down 1.6% of the samples
+    /// (distortion 40 dB down); at 2 dB, 0.01% (62 dB down), and the other
+    /// voices measured, which peak lower, pass untouched. A louder speaker
+    /// also distorts more on its own, which nothing here can see. So 2 dB:
+    /// linear for the loudest voice measured, at the cost of replies 4 dB
+    /// quieter than before.
+    ///
+    /// `-PieMakeUpGainDB <dB>` (0 to 9) overrides it, read whenever the
+    /// engine is built, to compare settings on the phone.
+    private static let voiceMakeUpGainDB: Float = 2
+    private static let makeUpGainRange: ClosedRange<Float> = 0 ... 9
+
+    /// Whether the voice-processed microphone's automatic gain control is
+    /// on. It stays on, as the voice-processing unit ships:
+    ///   - every level the detector and the self-check were tuned on was
+    ///     measured with it on, a normal voice's -30 to -15 dBFS included.
+    ///     Without it, the voice and the residue both drop by whatever gain
+    ///     it had been adding, which is neither documented nor fixed, so
+    ///     the detector's absolute minimums would sit at an unknown point
+    ///     of the user's voice, and the stricter echo minimum could put a
+    ///     soft voice out of reach while a reply plays;
+    ///   - the detector's decisions rest on the contrast between the user
+    ///     and the room or the residue, which a gain applied to all of
+    ///     them leaves alone; a gain control moves its gain over seconds,
+    ///     and the room floor and the residue envelope are learnt
+    ///     continuously and follow it.
+    /// Its cost is that it can lift the residue in the quiet between the
+    /// user's words. `-PieVoiceAGC 0|1` overrides it, read whenever the
+    /// engine is built, to measure that cost on the phone.
+    private static let voiceAGCDefault = true
 
     /// How long the engine has to have had no clients before the session is
     /// deactivated. Long enough that one turn handing over to the next
@@ -140,6 +179,12 @@ final class AudioEngineHub {
     private var pendingDeactivation: DispatchWorkItem?
     private var pendingInputRetry: DispatchWorkItem?
     private let echo = EchoGate()
+    /// The current engine's make-up gain stage, ahead of the limiter.
+    private var gainStage: AVAudioUnitEQ?
+    /// The audio self-check's output measurement, while one is open, and
+    /// the node its tap is on.
+    private var outputMeter: OutputMeter?
+    private var outputTapNode: AVAudioNode?
 
     private init() {
         for channel in [speech, cue] {
@@ -173,7 +218,71 @@ final class AudioEngineHub {
     /// Whether the speaker is playing (or was a moment ago) something the
     /// microphone may still hear a residue of. Thread-safe; the voice
     /// activity detector reads it on the tap thread.
-    var isEchoLikely: Bool { echo.isEchoLikely }
+    var playbackEcho: PlaybackEcho { echo.state }
+
+    // MARK: - Audio self-check
+
+    /// What the engine is running with, read back from the audio units
+    /// rather than from the settings asked for.
+    struct VoiceProcessingState {
+        let echoCancellation: Bool
+        let makeUpGainDB: Float
+        let automaticGainControl: Bool
+    }
+
+    var voiceProcessingState: VoiceProcessingState {
+        // The input node is only touched when the engine was built with
+        // the voice-processed microphone; asking for it otherwise would
+        // create one.
+        let processing = built == .voiceProcessed && !echoCancellationFailed && !engineIsOrphaned
+        let input = processing ? engine.inputNode : nil
+        return VoiceProcessingState(
+            echoCancellation: input?.isVoiceProcessingEnabled ?? false,
+            makeUpGainDB: engineIsOrphaned ? 0 : gainStage?.globalGain ?? 0,
+            automaticGainControl: input?.isVoiceProcessingAGCEnabled ?? false
+        )
+    }
+
+    /// What left the make-up gain stage, ahead of the limiter, during an
+    /// output measurement.
+    struct OutputMeasurement {
+        /// The loudest sample, in dBFS.
+        let peakDecibels: Float
+        /// Of the 10 ms blocks with anything audible in them, the share
+        /// with a sample past full scale: where the limiter turned the
+        /// reply down, so the speaker was no longer playing the reply
+        /// scaled and the echo canceller could not fully remove it.
+        let limitedShare: Double
+    }
+
+    /// Starts measuring what the playback channels send towards the
+    /// speaker, through engine rebuilds, until `endOutputMeasurement()`.
+    func beginOutputMeasurement() {
+        removeOutputTap()
+        outputMeter = OutputMeter()
+        installOutputTap()
+    }
+
+    func endOutputMeasurement() -> OutputMeasurement? {
+        removeOutputTap()
+        defer { outputMeter = nil }
+        return outputMeter?.measurement
+    }
+
+    private func installOutputTap() {
+        guard let outputMeter, let gainStage, outputTapNode == nil, !engineIsOrphaned else { return }
+        gainStage.installTap(onBus: 0, bufferSize: 4800, format: nil) { buffer, _ in
+            outputMeter.add(buffer)
+        }
+        outputTapNode = gainStage
+    }
+
+    private func removeOutputTap() {
+        if let outputTapNode, !engineIsOrphaned {
+            outputTapNode.removeTap(onBus: 0)
+        }
+        outputTapNode = nil
+    }
 
     // MARK: - Playback
 
@@ -313,6 +422,7 @@ final class AudioEngineHub {
         speech.detachFromEngine()
         cue.detachFromEngine()
         removeTap()
+        removeOutputTap()
         if !engineIsOrphaned {
             engine.stop()
         }
@@ -338,6 +448,7 @@ final class AudioEngineHub {
             if configuration == .voiceProcessed {
                 do {
                     try input.setVoiceProcessingEnabled(true)
+                    input.isVoiceProcessingAGCEnabled = Self.voiceAGC()
                     // Other audio (anything not played through this
                     // engine) is ducked as little as the system allows.
                     input.voiceProcessingOtherAudioDuckingConfiguration =
@@ -355,32 +466,55 @@ final class AudioEngineHub {
             }
         }
 
+        // The make-up gain is a plain multiplication: an EQ unit's global
+        // gain, with its one band bypassed (a player's or a mixer's volume
+        // cannot go above unity). The peak limiter after it runs at its
+        // default pre-gain of 0 dB, which leaves everything up to full
+        // scale untouched; it only catches a peak the gain would otherwise
+        // have clipped at the output, gentler than clipping it.
         let submix = AVAudioMixerNode()
+        let gain = AVAudioUnitEQ(numberOfBands: 1)
+        gain.bands[0].bypass = true
         let limiter = AVAudioUnitEffect(audioComponentDescription: Self.peakLimiter)
         engine.attach(submix)
+        engine.attach(gain)
         engine.attach(limiter)
         speech.attach(to: engine, feeding: submix)
         cue.attach(to: engine, feeding: submix)
-        engine.connect(submix, to: limiter, format: Self.playbackFormat)
+        engine.connect(submix, to: gain, format: Self.playbackFormat)
+        engine.connect(gain, to: limiter, format: Self.playbackFormat)
         engine.connect(limiter, to: engine.mainMixerNode, format: Self.playbackFormat)
 
-        let makeUpGain = configuration == .voiceProcessed && !echoCancellationFailed
-            ? Self.voiceProcessingMakeUpGain
-            : 0
-        AudioUnitSetParameter(
-            limiter.audioUnit,
-            AudioUnitParameterID(kLimiterParam_PreGain),
-            kAudioUnitScope_Global,
-            0,
-            makeUpGain,
-            0
-        )
+        let echoCancelling = configuration == .voiceProcessed && !echoCancellationFailed
+        gain.globalGain = echoCancelling ? Self.voiceMakeUpGain() : 0
+        gainStage = gain
+        installOutputTap()
 
         built = configuration
         builtOutputFormat = engine.outputNode.outputFormat(forBus: 0)
+        let agc = echoCancelling ? ", voice AGC \(engine.inputNode.isVoiceProcessingAGCEnabled ? "on" : "off")" : ""
         print("[audio] engine built for \(configuration.rawValue) input; "
-            + "echo cancellation \(configuration == .voiceProcessed && !echoCancellationFailed ? "on" : "off"), "
-            + "make-up gain \(makeUpGain) dB, \(Self.describeRoute())")
+            + "echo cancellation \(echoCancelling ? "on" : "off"), "
+            + "make-up gain \(gain.globalGain) dB\(agc), \(Self.describeRoute())")
+    }
+
+    /// `voiceMakeUpGainDB`, or `-PieMakeUpGainDB` when it is a number.
+    private static func voiceMakeUpGain() -> Float {
+        guard
+            let argument = UserDefaults.standard.string(forKey: "PieMakeUpGainDB"),
+            let decibels = Float(argument.trimmingCharacters(in: .whitespaces)),
+            decibels.isFinite
+        else { return voiceMakeUpGainDB }
+        return min(max(decibels, makeUpGainRange.lowerBound), makeUpGainRange.upperBound)
+    }
+
+    /// `voiceAGCDefault`, or `-PieVoiceAGC 0|1`.
+    private static func voiceAGC() -> Bool {
+        switch UserDefaults.standard.string(forKey: "PieVoiceAGC") {
+        case "0": return false
+        case "1": return true
+        default: return voiceAGCDefault
+        }
     }
 
     private func installTap() throws -> AVAudioFormat {
@@ -822,12 +956,44 @@ final class PlaybackChannel {
     }
 }
 
-/// Whether a reply is coming out of the speaker, or was a moment ago:
-/// room reverberation keeps the residual echo up for a few hundred
-/// milliseconds after the last sample plays. Read on the input tap's
-/// thread, written on the main thread.
+/// What the microphone may be hearing of the engine's own playback.
+enum PlaybackEcho {
+    /// Nothing has played for long enough that none of it is left.
+    case none
+    /// A playback channel is playing.
+    case playing
+    /// The channels stopped moments ago (`EchoGate.tail`), and the end of
+    /// what they played may still be reaching the microphone.
+    case tail
+}
+
+/// Whether a reply is coming out of the speaker, or was a moment ago and
+/// may still be reaching the microphone. Read on the input tap's thread,
+/// written on the main thread.
 final class EchoGate {
-    private static let tail: CFAbsoluteTime = 0.35
+    /// How long after a channel has drained the input is still taken to
+    /// hold its echo. A channel reports the end once its last buffer has
+    /// played out of the speaker, output latency included, but the input
+    /// side runs later than that:
+    ///   - the tap delivers about 0.1 s of audio at a time, judged against
+    ///     the gate as it stands when the buffer arrives, so the start of
+    ///     that buffer was heard up to 0.1 s earlier;
+    ///   - the input and the voice processing add tens of milliseconds,
+    ///     and a Bluetooth headset's microphone 0.1 to 0.2 s more;
+    ///   - the room goes on sounding the reply for as long as it
+    ///     reverberates, a few hundred milliseconds in a furnished room,
+    ///     and the part of that beyond the echo canceller's filter reaches
+    ///     the microphone uncancelled.
+    /// 0.35 s covered the first two and not the room, so the reverberant
+    /// end of a reply could start an utterance judged against the room
+    /// alone, which then reached voice mode after the reply's turn was
+    /// over, as the user's next question. A user who answers the moment a
+    /// reply ends is still heard: onset is held to the echo thresholds
+    /// only this long, and a normal voice clears those anyway. Nothing
+    /// heard in the tail is learnt as the reply's residue (see
+    /// `VoiceActivityDetector`), so an answer that starts in it does not
+    /// make the next reply harder to talk over.
+    static let tail: CFAbsoluteTime = 0.8
 
     private let lock = NSLock()
     private var sources: Set<ObjectIdentifier> = []
@@ -847,9 +1013,58 @@ final class EchoGate {
         }
     }
 
-    var isEchoLikely: Bool {
+    /// What the microphone may be hearing of the playback now.
+    var state: PlaybackEcho {
         lock.lock()
         defer { lock.unlock() }
-        return !sources.isEmpty || CFAbsoluteTimeGetCurrent() - quietSince < Self.tail
+        if !sources.isEmpty { return .playing }
+        return CFAbsoluteTimeGetCurrent() - quietSince < Self.tail ? .tail : .none
+    }
+}
+
+/// Tallies, on the tap thread, what an output measurement reports.
+private final class OutputMeter {
+    /// 10 ms at the playback rate.
+    private static let blockFrames = 480
+    /// -60 dBFS: quieter than this is silence between replies, not reply.
+    private static let audible: Float = 0.001
+
+    private let lock = NSLock()
+    private var peak: Float = 0
+    private var audibleBlocks = 0
+    private var limitedBlocks = 0
+
+    func add(_ buffer: AVAudioPCMBuffer) {
+        guard let samples = buffer.floatChannelData?[0] else { return }
+        let frames = Int(buffer.frameLength)
+        var bufferPeak: Float = 0
+        var audible = 0
+        var limited = 0
+        var start = 0
+        while start < frames {
+            let end = min(start + Self.blockFrames, frames)
+            var blockPeak: Float = 0
+            for frame in start..<end {
+                blockPeak = max(blockPeak, abs(samples[frame]))
+            }
+            bufferPeak = max(bufferPeak, blockPeak)
+            if blockPeak > Self.audible { audible += 1 }
+            if blockPeak > 1 { limited += 1 }
+            start = end
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        peak = max(peak, bufferPeak)
+        audibleBlocks += audible
+        limitedBlocks += limited
+    }
+
+    var measurement: AudioEngineHub.OutputMeasurement {
+        lock.lock()
+        defer { lock.unlock() }
+        return AudioEngineHub.OutputMeasurement(
+            peakDecibels: AudioLevel.decibels(rms: peak),
+            limitedShare: audibleBlocks > 0 ? Double(limitedBlocks) / Double(audibleBlocks) : 0
+        )
     }
 }

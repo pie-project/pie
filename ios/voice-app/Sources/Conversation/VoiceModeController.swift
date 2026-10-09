@@ -14,14 +14,31 @@ import Foundation
 ///   - at onset the reply is held: ducked at once if it is playing, so the
 ///     user is not drowned out, with anything more it says kept back,
 ///     while the engine carries on generating;
-///   - the first recognised words that are not the reply's own make it a
-///     barge-in: the reply is cancelled and what the user is saying
+///   - once the utterance is over, `EchoFilter` judges its final transcript.
+///     Words of the user's make it a barge-in: the reply is cancelled and
+///     what the user said, less any of the reply's words leading it,
 ///     becomes the next question. The echo canceller is good but not
-///     perfect, and what leaks through it is the reply's own words, so a
-///     transcript made of them is the reply heard back, not the user. An
-///     utterance that ends with no words of the user's in it (a cough, a
-///     chair, the room, the reply's echo) releases the hold and the reply
-///     carries on at full volume, never cut off or repeated.
+///     perfect, and what leaks through it is the reply's own words,
+///     misheard here and there, so a transcript that follows the reply is
+///     the reply heard back, not the user. An utterance with no words of
+///     the user's in it (a cough, a chair, the room, the reply's echo)
+///     releases the hold and the reply carries on at full volume, never cut
+///     off or repeated.
+///
+/// An utterance is held to that test whenever it could have heard a reply:
+/// the reply was audible at some point while it was open, even if the reply
+/// finished before the utterance did, or it began within moments of a reply
+/// finishing or being stopped, when the detector's pre-roll and the room can
+/// still carry the reply's last words. The same goes for the moments after a
+/// sample question's recording ends. Judged the reply's, it is never asked,
+/// and any caption its partial transcripts earned is taken back.
+///
+/// The partial transcripts of such an utterance are not acted on, beyond a
+/// caption and keeping the hold while they look like the user's: the
+/// recogniser revises them, and the first few words of an echo, misheard,
+/// look like anybody's. The one exception is a request to stop ("stop",
+/// "wait", "hold on") that opens the utterance, which stops the reply at
+/// once.
 ///
 /// A pause in the middle of a question ends an utterance like any other,
 /// and the turn it starts would answer half a question. When the user
@@ -95,15 +112,38 @@ final class VoiceModeController: ObservableObject {
     /// How many of `replySentences` the synthesizer has been handed.
     private var handedToSpeech = 0
 
+    /// What the last turn to end handed the synthesizer, kept so an
+    /// utterance that overlapped its reply, or began just after it, can
+    /// still be checked against it once the turn is over. Cleared when the
+    /// next turn starts.
+    private var recentReply: [String] = []
+    /// When speech last stopped playing a reply, and whether it was cut off
+    /// (a tap, a request to stop) rather than played to its end. Speech
+    /// that catches up with the model mid-turn also counts as an end; a
+    /// stop later in that turn replaces it.
+    private var replyEndedAt: ContinuousClock.Instant?
+    private var replyWasCut = false
+    /// The last sample question, as recognised, and when its recording
+    /// ended.
+    private var sampleEnded: (question: String, at: ContinuousClock.Instant)?
+    /// How long after a reply or a recording stops an utterance that starts
+    /// is still checked against it. The detector's pre-roll reaches 1.0 s
+    /// back and an onset is reported once 0.2 s of sound has been heard, so
+    /// an onset up to about 1.2 s after the last word can still carry that
+    /// word. The detector treats what it hears as possible echo for 0.8 s
+    /// after playback, and onsets the echo itself starts come within about
+    /// 0.9 s of the end; the margin is for the room ringing on.
+    private static let replyTail: Duration = .milliseconds(1500)
+
     /// The user may be talking over the active turn; see `holdReply()`.
     private var isHoldingReply = false
     /// Bumped by every hold and every end of one, so a timeout that fires
     /// after its hold ended does nothing.
     private var holdCounter: UInt64 = 0
-    /// How long a hold waits for a recognised word before deciding the
-    /// sound that started it was not the user: a noise that goes on
-    /// without words (a fan switching on, traffic) would otherwise keep
-    /// the reply silent until the detector's utterance cap.
+    /// How long a hold waits for words that look like the user's before
+    /// deciding the sound that started it was not the user: a noise that
+    /// goes on without words (a fan switching on, traffic) would otherwise
+    /// keep the reply silent until the detector's utterance cap.
     private static let holdTimeout: UInt64 = 3_000_000_000
 
     /// A question withdrawn because the user carried on talking before its
@@ -117,6 +157,36 @@ final class VoiceModeController: ObservableObject {
     /// was playing, so it is what the microphone heard of the recording, or
     /// it was cut short to make way for one.
     private var discardsMicrophoneUtterance = false
+    /// What that utterance may have heard besides the user: a reply that
+    /// was audible at some point while it was open, or a reply or a
+    /// recording that had just stopped as it began. Nil when there was
+    /// nothing.
+    private var utteranceEcho: EchoScope?
+    /// Its latest partial transcript looks like the user's: the hold on the
+    /// reply waits for the final one rather than timing out.
+    private var utteranceSeemsUsers = false
+    /// A request to stop in it has already cut the reply off.
+    private var utteranceStoppedReply = false
+    /// The caption when it began, put back if it turns out not to be the
+    /// user.
+    private var captionBeforeUtterance = ""
+
+    private enum EchoScope {
+        /// The reply: the active turn's as far as it was handed to the
+        /// synthesizer or, once that turn is over, the last turn's.
+        case reply(EchoFilter.Timing)
+        /// A sample question's recording, which had just ended.
+        case sample(String)
+
+        var name: String {
+            switch self {
+            case .reply(.during): return "over the reply"
+            case .reply(.afterEnd): return "after the reply"
+            case .reply(.afterStop): return "after the reply was stopped"
+            case .sample: return "after the sample question"
+            }
+        }
+    }
 
     /// A bundled recording is playing in place of the user.
     private var isSamplePlaying = false
@@ -149,6 +219,9 @@ final class VoiceModeController: ObservableObject {
         isMuted = false
         inputFailure = nil
         unfinishedQuestion = nil
+        recentReply = []
+        replyEndedAt = nil
+        sampleEnded = nil
         phase = .listening
         userCaption = ""
         assistantCaption = ""
@@ -320,6 +393,9 @@ final class VoiceModeController: ObservableObject {
     private func forgetMicrophoneUtterance() {
         microphoneUtteranceOpen = false
         discardsMicrophoneUtterance = false
+        utteranceEcho = nil
+        utteranceSeemsUsers = false
+        utteranceStoppedReply = false
     }
 
     // MARK: - Turns
@@ -347,6 +423,8 @@ final class VoiceModeController: ObservableObject {
         replyWasHeard = false
         replySentences = []
         handedToSpeech = 0
+        recentReply = []
+        replyEndedAt = nil
         isHoldingReply = false
         chunker.reset()
         phase = .thinking
@@ -430,6 +508,7 @@ final class VoiceModeController: ObservableObject {
         isGenerating = false
         isHoldingReply = false
         holdCounter += 1
+        recentReply = Array(replySentences.prefix(handedToSpeech))
         replySentences = []
         handedToSpeech = 0
         speech.isDucked = false
@@ -439,6 +518,12 @@ final class VoiceModeController: ObservableObject {
     /// goes back to listening.
     private func interrupt() {
         guard activeTurn != nil else { return }
+        if speech.isSpeaking {
+            // The words it was saying can still reach an utterance that
+            // starts in the next moments, through the detector's pre-roll.
+            replyEndedAt = .now
+            replyWasCut = true
+        }
         endTurn()
         chunker.reset()
         speech.stop()
@@ -448,22 +533,32 @@ final class VoiceModeController: ObservableObject {
         phase = afterTurn
     }
 
-    /// The user may be starting to talk over the active turn. Until words
-    /// of theirs are recognised it could as well be a cough, or the reply's
-    /// own echo, so the reply is held, not cancelled: ducked if it is
-    /// playing, with anything more it says kept back. The engine carries
+    /// The user may be starting to talk over the active turn. Until what
+    /// they said has been judged it could as well be a cough, or the
+    /// reply's own echo, so the reply is held, not cancelled: ducked if it
+    /// is playing, with anything more it says kept back. The engine carries
     /// on, so a false alarm costs a moment of quieter speech rather than
     /// the answer.
     private func holdReply() {
         guard activeTurn != nil, !isHoldingReply else { return }
         isHoldingReply = true
         holdCounter += 1
-        let hold = holdCounter
         speech.isDucked = true
+        timeOutHold(holdCounter)
+    }
+
+    /// Releases hold `hold` if it is still on after `holdTimeout`, unless
+    /// what is being said looks like the user's: then its final transcript
+    /// settles it, however long they talk.
+    private func timeOutHold(_ hold: UInt64) {
         Task { [weak self] in
             try? await Task.sleep(nanoseconds: Self.holdTimeout)
             guard let self, self.holdCounter == hold else { return }
-            self.releaseHold()
+            if self.microphoneUtteranceOpen, self.utteranceSeemsUsers {
+                self.timeOutHold(hold)
+            } else {
+                self.releaseHold()
+            }
         }
     }
 
@@ -491,41 +586,35 @@ final class VoiceModeController: ObservableObject {
         phase = speech.isSpeaking ? .speaking : .thinking
     }
 
-    /// Whether what the recogniser heard during a reply is the user or the
-    /// reply itself, leaking past the echo canceller. The leak is the
-    /// reply's own words, so a transcript made almost entirely of them is
-    /// the reply. One or two words that all occur in the reply could be
-    /// either and wait for more.
-    private enum Heard {
-        case user
-        case echo
-        case undecided
+    /// Judges the open utterance against what it may have heard.
+    private func echoFilter(for scope: EchoScope) -> EchoFilter {
+        switch scope {
+        case .reply(let timing):
+            let sentences = activeTurn == nil ? recentReply : Array(replySentences.prefix(handedToSpeech))
+            return EchoFilter(reply: sentences.joined(separator: " "), timing: timing)
+        case .sample(let question):
+            return EchoFilter(reply: question, timing: .afterEnd)
+        }
     }
 
-    private func classify(_ transcript: String) -> Heard {
-        let heard = Self.words(transcript)
-        guard !heard.isEmpty else { return .undecided }
-        let reply = Set(replySentences.flatMap(Self.words))
-        let matched = heard.filter(reply.contains).count
-        if matched == heard.count, heard.count < Self.echoDecisionWords { return .undecided }
-        return Double(matched) >= Self.echoWordShare * Double(heard.count) ? .echo : .user
+    /// A reply stopped playing moments ago, so an utterance starting now
+    /// may open with the words it was saying: its last words if it played
+    /// to the end, wherever it had got to if it was cut off.
+    private var replyTailTiming: EchoFilter.Timing? {
+        guard !recentReply.isEmpty, let ended = replyEndedAt, ended.duration(to: .now) < Self.replyTail else { return nil }
+        return replyWasCut ? .afterStop : .afterEnd
     }
 
-    /// Words below which a transcript made entirely of the reply's words
-    /// is not yet taken for its echo.
-    private static let echoDecisionWords = 3
-    /// The share of a transcript's words that must occur in the reply for
-    /// it to be the reply's echo.
-    private static let echoWordShare = 0.75
-
-    private static func words(_ text: String) -> [String] {
-        text.lowercased()
-            .split { !$0.isLetter && !$0.isNumber && $0 != "'" }
-            .map(String.init)
+    /// A sample question's recording ended moments ago, so an utterance
+    /// starting now may open with its last words.
+    private var sampleTail: String? {
+        guard let sampleEnded, sampleEnded.at.duration(to: .now) < Self.replyTail else { return nil }
+        return sampleEnded.question
     }
 
-    /// A word was recognised while a turn was under way: the user is
-    /// talking over it, and what they are saying is the next question.
+    /// Words of the user's were recognised while a turn was under way: the
+    /// user is talking over it, and what they are saying is the next
+    /// question.
     private func userTalkedOver() {
         guard activeTurn != nil else { return }
         let question = turnQuestion
@@ -544,6 +633,18 @@ final class VoiceModeController: ObservableObject {
         guard let question = unfinishedQuestion, activeTurn == nil, !isSamplePlaying else { return }
         unfinishedQuestion = nil
         beginTurn(question)
+    }
+
+    /// One line per utterance that could have heard a reply or a
+    /// recording, for checking on the device what the filter made of it.
+    private static func log(_ utterance: String, scope: EchoScope, verdict: EchoFilter.Verdict, stoppedReply: Bool) {
+        let judged: String
+        switch verdict {
+        case .user(let words): judged = "user \"\(words)\""
+        case .echo: judged = "echo"
+        case .undecided: judged = "undecided"
+        }
+        print("[voice] \(scope.name): \"\(utterance)\" -> \(judged)\(stoppedReply ? " (had stopped the reply)" : "")")
     }
 
     private static func joined(_ first: String?, _ second: String) -> String {
@@ -584,13 +685,32 @@ final class VoiceModeController: ObservableObject {
             userCaption = text
         case .microphone:
             guard !isSamplePlaying, !discardsMicrophoneUtterance else { return }
-            if activeTurn != nil {
-                // The reply's own words, heard back, are neither a barge-in
-                // nor a caption.
-                guard classify(text) == .user else { return }
-                userTalkedOver()
+            guard let scope = utteranceEcho else {
+                // Nothing has been audible over this utterance, so whatever
+                // was recognised is the user: with a turn under way,
+                // carrying on the question it would only half answer.
+                if activeTurn != nil { userTalkedOver() }
+                userCaption = Self.joined(unfinishedQuestion, text)
+                return
             }
-            userCaption = Self.joined(unfinishedQuestion, text)
+            // It may be the reply's own words heard back, which are neither
+            // a barge-in nor a caption. What it is waits for the final
+            // transcript; until then words that look like the user's are
+            // captioned and keep the reply held.
+            let filter = echoFilter(for: scope)
+            guard case .user(let words) = filter.judge(text) else {
+                utteranceSeemsUsers = false
+                userCaption = captionBeforeUtterance
+                return
+            }
+            utteranceSeemsUsers = true
+            if activeTurn != nil, !utteranceStoppedReply, filter.asksToStop(text) {
+                print("[voice] stop request \(scope.name): \"\(text)\"")
+                utteranceStoppedReply = true
+                userTalkedOver()
+                captionBeforeUtterance = userCaption
+            }
+            userCaption = Self.joined(unfinishedQuestion, words)
         }
     }
 
@@ -614,23 +734,50 @@ final class VoiceModeController: ObservableObject {
                 if activeTurn == nil { userCaption = "" }
                 return
             }
+            // The microphone can still pick up the recording's last words
+            // in the next moments, once its own utterance has been dropped.
+            sampleEnded = (utterance, .now)
             interrupt()
             beginTurn(utterance)
 
         case .microphone:
             let discarded = discardsMicrophoneUtterance
+            let scope = utteranceEcho
+            let stoppedReply = utteranceStoppedReply
             forgetMicrophoneUtterance()
             guard !discarded, !isSamplePlaying else { return }
+            var heard = utterance
+            if let scope {
+                // Judged again even when a request to stop already cut the
+                // reply off: the recogniser revises its partials, and what
+                // is asked is what the final transcript holds.
+                let verdict = echoFilter(for: scope).judge(utterance)
+                Self.log(utterance, scope: scope, verdict: verdict, stoppedReply: stoppedReply)
+                guard case .user(let words) = verdict else {
+                    // The reply's own echo, or too little to tell it from
+                    // one: nothing to answer. A reply still playing goes on;
+                    // one already stopped stays stopped, and a question it
+                    // had withdrawn is asked as it stood.
+                    userCaption = captionBeforeUtterance
+                    if stoppedReply {
+                        askUnfinishedQuestion()
+                    } else {
+                        releaseHold()
+                    }
+                    return
+                }
+                heard = words
+            }
             if activeTurn != nil {
-                guard classify(utterance) == .user else {
-                    // A cough, a chair, the room, the reply's own echo:
-                    // nothing to answer, and the reply goes on.
+                guard !heard.isEmpty else {
+                    // A cough, a chair, the room: nothing to answer, and
+                    // the reply goes on.
                     releaseHold()
                     return
                 }
                 userTalkedOver()
             }
-            let question = Self.joined(unfinishedQuestion, utterance)
+            let question = Self.joined(unfinishedQuestion, heard)
             unfinishedQuestion = nil
             guard !question.isEmpty else {
                 userCaption = ""
@@ -655,12 +802,29 @@ final class VoiceModeController: ObservableObject {
         // The sample is the question itself; it never interrupts anything.
         guard isActive, source == .microphone else { return }
         microphoneUtteranceOpen = true
+        captionBeforeUtterance = userCaption
         if isSamplePlaying {
             discardsMicrophoneUtterance = true
             return
         }
         if activeTurn != nil {
+            // Only a reply that has been audible can be heard back. One
+            // handed to the synthesizer but not yet sounding cannot, and a
+            // user carrying on their question over it must not be checked
+            // against words nobody has heard; `speechOutputLevel` takes the
+            // reply in if it starts sounding while they talk.
+            if replyWasHeard {
+                utteranceEcho = .reply(.during)
+            } else if let question = sampleTail {
+                utteranceEcho = .sample(question)
+            }
+            print("[voice] onset \(replyWasHeard ? "over the reply" : "while thinking")")
             holdReply()
+        } else if let timing = replyTailTiming {
+            // Possibly the words the reply was saying as it stopped: the
+            // caption waits until the filter finds the user.
+            utteranceEcho = .reply(timing)
+            phase = .listening
         } else {
             userCaption = unfinishedQuestion ?? ""
             phase = .listening
@@ -699,6 +863,12 @@ extension VoiceModeController: @preconcurrency SpeechOutputDelegate {
 
     func speechOutputDidFinish(interrupted: Bool) {
         outputLevel = 0
+        // Played to the end, so the room may still be ringing with its last
+        // words. A stop voice mode makes is noted where it makes it.
+        if !interrupted {
+            replyEndedAt = .now
+            replyWasCut = false
+        }
         // A hold settles the turn itself when it ends, and its own stop
         // reports here too.
         guard isActive, activeTurn != nil, !isHoldingReply else { return }
@@ -729,8 +899,12 @@ extension VoiceModeController: @preconcurrency SpeechOutputDelegate {
         outputLevel = level
         // Heard, not merely queued: the start is reported before the
         // synthesizer has rendered a sound.
-        if level > Self.audibleLevel, activeTurn != nil, !isHoldingReply {
-            replyWasHeard = true
+        guard level > Self.audibleLevel, activeTurn != nil else { return }
+        if !isHoldingReply { replyWasHeard = true }
+        // An utterance under way now has the reply sounding over it, ducked
+        // or not, and the reply's echo can reach it.
+        if microphoneUtteranceOpen, !discardsMicrophoneUtterance {
+            utteranceEcho = .reply(.during)
         }
     }
 }

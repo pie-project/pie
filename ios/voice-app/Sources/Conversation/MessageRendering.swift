@@ -114,10 +114,10 @@ enum MessageRendering {
     // MARK: - Speech
 
     /// `markdown` as a synthesizer should say it: no heading marks,
-    /// emphasis, backticks, link targets or table rules, and each code
-    /// block replaced by a short notice, since reading code aloud symbol by
-    /// symbol helps nobody. Lines stay on lines so the sentence chunker
-    /// treats each list item as its own utterance.
+    /// emphasis, backticks, link targets, table rules or emoji, and each
+    /// code block replaced by a short notice, since reading code aloud
+    /// symbol by symbol helps nobody. Lines stay on lines so the sentence
+    /// chunker treats each list item as its own utterance.
     static func speakable(_ markdown: String) -> String {
         var lines: [String] = []
         var inCodeBlock = false
@@ -140,7 +140,7 @@ enum MessageRendering {
         if line.range(of: #"^([-*_]\s*){3,}$"#, options: .regularExpression) != nil { return "" }
         if line.range(of: #"^\|?(\s*:?-+:?\s*\|)+\s*:?-*:?\s*$"#, options: .regularExpression) != nil { return "" }
 
-        var text = line
+        var text = line.filter { !isPictograph($0) }
         text = text.replacingOccurrences(of: #"^#{1,6}\s*"#, with: "", options: .regularExpression)
         text = text.replacingOccurrences(of: #"^>\s?"#, with: "", options: .regularExpression)
         text = text.replacingOccurrences(of: #"^[-*+]\s+"#, with: "", options: .regularExpression)
@@ -158,6 +158,22 @@ enum MessageRendering {
             text = text.replacingOccurrences(of: mark, with: "")
         }
         return text.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// An emoji, which a synthesizer reads out by name ("smiling face with
+    /// smiling eyes"). Digits, "#", "*", "©" and "™" carry the emoji
+    /// property too but are drawn as text, so they stay, and so does the
+    /// joiner Indic scripts put between letters.
+    private static func isPictograph(_ character: Character) -> Bool {
+        let scalars = character.unicodeScalars
+        if scalars.contains(where: { $0.properties.isEmojiPresentation || $0.properties.isEmojiModifier }) {
+            return true
+        }
+        // A symbol that is text by default, asked to be drawn as a picture
+        // ("❤️") or joined into one ("🏳️‍🌈"). A keycap ("1️⃣") is built
+        // on a digit, which is worth saying.
+        let drawnAsPicture = scalars.contains("\u{FE0F}") || scalars.contains("\u{200D}")
+        return drawnAsPicture && scalars.contains { $0.properties.isEmoji && !$0.isASCII }
     }
 
     // MARK: - Share sheet

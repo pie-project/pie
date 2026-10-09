@@ -5,8 +5,12 @@ import Foundation
 /// sample question finishes playing before the reply speaks, `stop()`
 /// silences speech promptly, a cancelled reply frees the engine for the
 /// next one, and echo cancellation keeps a playing reply from triggering
-/// a false barge-in. Prints `PIECHECK {json}` lines and writes
-/// Documents/audio-check.jsonl, then exits.
+/// a false barge-in or reaching voice mode as the user's words. Prints
+/// `PIECHECK {json}` lines and writes Documents/audio-check.jsonl, then
+/// exits. `-PieMakeUpGainDB` and `-PieVoiceAGC` (see `AudioEngineHub`)
+/// change the reply's make-up gain and the microphone's gain control for
+/// a run, so settings can be compared; echo_transcripts records what was
+/// in force.
 ///
 /// None of this can be exercised on a Mac: voice processing, the speaker
 /// route and the recogniser's assets only exist on the phone, so the
@@ -62,6 +66,23 @@ private final class AudioChecks {
         "The lighthouse stood on a rocky point at the edge of the bay,",
         "and every night its lamp swept slowly across the water.",
     ]
+    /// About twelve seconds at the default rate, in the shape of real
+    /// voice-mode replies: their echo, transcribed, is what came back as
+    /// the user's next question.
+    private static let echoParagraph = [
+        "I don't have any personal experiences or feelings, so I can't say how your friend is doing.",
+        "I only know what you tell me in this conversation.",
+        "If you let me know what you need, I can help you with it.",
+    ]
+    /// How long after a reply what the microphone reports is still counted
+    /// as the reply's doing: the echo gate's tail, and the input still on
+    /// its way (a tap buffer of about 0.1 s, then the hop to the main
+    /// thread).
+    private static let afterReply: TimeInterval = EchoGate.tail + 0.2
+    /// How long after the reply echo_transcripts keeps listening: as long
+    /// as `afterReply`, and then for long enough to end an utterance begun
+    /// in the gate's tail.
+    private static let echoTail: TimeInterval = afterReply + VoiceActivityDetector.trailingSilence
     private static let audible: Float = 0.02
 
     private let backend: ConversationBackend
@@ -89,6 +110,7 @@ private final class AudioChecks {
         await speechStopLatency(microphoneReady: microphoneAvailability.isReady)
         await cancelFreesEngine(engineReady: engineReady)
         await noFalseBargeIn(microphoneAvailability)
+        await echoTranscripts(microphoneAvailability)
         await externalOnset(microphoneAvailability)
 
         var results: [String: Any] = [:]
@@ -417,24 +439,19 @@ private final class AudioChecks {
 
     // MARK: - e. no_false_bargein
 
-    /// Leaves the microphone running for `externalOnset`.
+    /// A reply spoken with voice mode's microphone running must not set
+    /// off onset, while it plays or in the echo gate's tail after it.
     private func noFalseBargeIn(_ availability: VoiceInputAvailability) async {
         let name = "no_false_bargein"
         guard availability.isReady else {
             record(name, pass: nil, ["skipped": "microphone unavailable: \(availability)"])
             return
         }
-        probe.reset()
-        microphone.delegate = probe
-        speech.delegate = probe
-        do {
-            try microphone.start(mode: .conversation)
-        } catch {
-            record(name, pass: false, ["error": error.localizedDescription])
+        if let error = await listen() {
+            record(name, pass: false, ["error": error])
             return
         }
-        // Let the detector learn the room before anything plays.
-        await pause(1.0)
+        defer { microphone.cancel() }
         let quietOnsets = probe.onsets.count
 
         let start = Date()
@@ -443,8 +460,7 @@ private final class AudioChecks {
         }
         speech.finishTurn()
         let finished = await wait(upTo: 30) { !self.probe.speechFinishes.isEmpty }
-        // The echo tail outlasts the last sample by a few hundred ms.
-        await pause(0.5)
+        await pause(Self.afterReply)
         let end = Date()
 
         let onsets = probe.onsets.filter { $0 >= start && $0 <= end }.count
@@ -464,7 +480,120 @@ private final class AudioChecks {
         ])
     }
 
-    // MARK: - f. external_onset
+    // MARK: - f. echo_transcripts
+
+    /// The user's bug: the reply's own echo, transcribed, taken for the
+    /// user talking over it. With voice mode's microphone running, a
+    /// reply-length paragraph is spoken, and every onset, partial and final
+    /// transcript the microphone reports while it plays and for `echoTail`
+    /// after is recorded word for word (a partial repeated unchanged is
+    /// listed once), together with what voice mode would make of it. Each
+    /// transcript belongs to the utterance of the last onset before it:
+    ///   - the words of an utterance that began while the reply played go
+    ///     to `EchoFilter` against the whole reply, as in voice mode, and
+    ///     any it judges the user's fail the check;
+    ///   - any words of an utterance that began after the reply finished
+    ///     fail it, whatever the filter says: voice mode checks those
+    ///     against only the reply's last words, and a moment later not at
+    ///     all, and nothing but the reply was there to start one.
+    /// Words the filter does not judge the user's are reported without
+    /// failing the check: the echo canceller leaks now and then, and voice
+    /// mode drops them.
+    ///
+    /// Runs straight after no_false_bargein, whose reply teaches the
+    /// detector the residue as an earlier reply would, and before
+    /// external_onset, whose recording would teach it a voice. Starts a
+    /// session of its own, as voice mode does on entry and after mute. The
+    /// detector's readings are taken before the reply and after it.
+    private func echoTranscripts(_ availability: VoiceInputAvailability) async {
+        let name = "echo_transcripts"
+        guard availability.isReady else {
+            record(name, pass: nil, ["skipped": "microphone unavailable: \(availability)"])
+            return
+        }
+        if let error = await listen() {
+            record(name, pass: false, ["error": error])
+            return
+        }
+        defer { microphone.cancel() }
+        let quietOnsets = probe.onsets.count
+        let readingsBefore = (microphone as? MicrophoneInput)?.detectorReadings
+
+        let hub = AudioEngineHub.shared
+        let state = hub.voiceProcessingState
+        hub.beginOutputMeasurement()
+        let start = Date()
+        for sentence in Self.echoParagraph {
+            speech.enqueue(sentence)
+        }
+        speech.finishTurn()
+        let finished = await wait(upTo: 30) { !self.probe.speechFinishes.isEmpty }
+        let spokenAt = Date()
+        let output = hub.endOutputMeasurement()
+        let readingsAfter = (microphone as? MicrophoneInput)?.detectorReadings
+        await pause(Self.echoTail)
+        let end = Date()
+        // An utterance still open would go on to a final transcript of
+        // the echo it has heard; it is ended now so that is recorded too.
+        if probe.onsets.count > probe.finals.count {
+            microphone.stop()
+            _ = await wait(upTo: 2) { self.probe.finals.count >= self.probe.onsets.count }
+        }
+
+        let onsets = probe.onsets.filter { $0 >= start }
+        var partials: [(at: Date, text: String)] = []
+        for partial in probe.partials where partial.at >= start && partial.text != partials.last?.text {
+            partials.append(partial)
+        }
+        let finals = probe.finals.filter { $0.at >= start }
+        let heard = (partials + finals).filter { !$0.text.isEmpty }
+        let replyEnded = probe.speechFinishes.first?.at ?? spokenAt
+        let allOnsets = probe.onsets
+        let beganAfterReply = { (entry: (at: Date, text: String)) -> Bool in
+            guard let began = allOnsets.last(where: { $0 <= entry.at }) else { return false }
+            return began > replyEnded
+        }
+        let filter = EchoFilter(reply: Self.echoParagraph.joined(separator: " "))
+        let afterReply = heard.filter(beganAfterReply)
+        let takenAsUser = heard.filter { entry in
+            guard !beganAfterReply(entry), case .user = filter.judge(entry.text) else { return false }
+            return true
+        }
+        let audibleAt = probe.firstAudible(after: start)
+        let spoken = probe.speechFinishes.first.map { $0.at.timeIntervalSince(start) }
+        // No transcript proves nothing unless the microphone was still
+        // delivering audio once the reply was over.
+        let microphoneLive = probe.inputLevels.contains { $0.at >= spokenAt }
+        let transcript = { (entry: (at: Date, text: String)) -> [String: Any] in
+            ["at": Self.rounded(entry.at.timeIntervalSince(start)), "text": entry.text]
+        }
+        let pass = finished && audibleAt != nil && microphoneLive && takenAsUser.isEmpty && afterReply.isEmpty
+        record(name, pass: pass, [
+            "reply": Self.echoParagraph.joined(separator: " "),
+            "speech_seconds": Self.json(spoken),
+            "audible": audibleAt != nil,
+            "onsets": onsets.map { Self.rounded($0.timeIntervalSince(start)) },
+            "onsets_before_speaking": quietOnsets,
+            "partials": partials.map(transcript),
+            "finals": finals.map(transcript),
+            "heard_words": !heard.isEmpty,
+            "taken_as_user": takenAsUser.map(transcript),
+            "after_reply": afterReply.map(transcript),
+            "room": probe.inputDecibels(from: start.addingTimeInterval(-1), to: start),
+            "residue_while_speaking": probe.inputDecibels(from: start, to: spokenAt),
+            "residue_after_speaking": probe.inputDecibels(from: spokenAt, to: end),
+            "detector_before": Self.json(readingsBefore),
+            "detector": Self.json(readingsAfter),
+            "echo_cancellation": state.echoCancellation,
+            "make_up_gain_db": Self.tenths(Double(state.makeUpGainDB)),
+            "voice_agc": state.automaticGainControl,
+            "output_peak_dbfs": output.map { Self.tenths(Double($0.peakDecibels)) as Any } ?? NSNull(),
+            "output_limited_share": output.map { ($0.limitedShare * 10_000).rounded() / 10_000 as Any } ?? NSNull(),
+            "note": "someone talking in the room during this check invalidates it",
+        ])
+    }
+
+    // MARK: - g. external_onset
 
     /// Informational: a voice from outside the engine (a recording played
     /// with `AVAudioPlayer`, standing in for the user) while a reply is
@@ -472,9 +601,8 @@ private final class AudioChecks {
     /// and what the recogniser made of it.
     private func externalOnset(_ availability: VoiceInputAvailability) async {
         let name = "external_onset"
-        defer { microphone.cancel() }
-        guard availability.isReady, microphone.isListening else {
-            record(name, pass: nil, ["skipped": "microphone not listening"])
+        guard availability.isReady else {
+            record(name, pass: nil, ["skipped": "microphone unavailable: \(availability)"])
             return
         }
         guard let url = Bundle.main.url(forResource: "sample-question-1", withExtension: "wav"),
@@ -483,8 +611,12 @@ private final class AudioChecks {
             record(name, pass: nil, ["skipped": "sample-question-1.wav is not in the bundle"])
             return
         }
+        if let error = await listen() {
+            record(name, pass: nil, ["skipped": "microphone did not start: \(error)"])
+            return
+        }
+        defer { microphone.cancel() }
 
-        probe.reset()
         let speech = self.speech
         let start = Date()
         for sentence in Self.longParagraph {
@@ -519,6 +651,23 @@ private final class AudioChecks {
     }
 
     // MARK: - Plumbing
+
+    /// Starts a voice-mode listening session of the check's own, reporting
+    /// to the probe, and gives the detector a second to measure the room
+    /// before anything plays. Returns why the microphone did not start.
+    private func listen() async -> String? {
+        probe.reset()
+        if microphone.isListening { microphone.cancel() }
+        microphone.delegate = probe
+        speech.delegate = probe
+        do {
+            try microphone.start(mode: .conversation)
+        } catch {
+            return error.localizedDescription
+        }
+        await pause(1.0)
+        return nil
+    }
 
     /// `prepare()` with a time limit: on a fresh install it waits on
     /// permission prompts.
@@ -616,6 +765,15 @@ private final class AudioChecks {
         guard let value, value.isFinite else { return NSNull() }
         return rounded(value)
     }
+
+    private static func json(_ readings: CapturePipeline.DetectorReadings?) -> Any {
+        guard let readings else { return NSNull() }
+        return [
+            "floor_dbfs": tenths(Double(readings.floor)),
+            "echo_residue_dbfs": tenths(Double(readings.echoResidue)),
+            "echo_onset_dbfs": tenths(Double(readings.echoOnsetLevel)),
+        ]
+    }
 }
 
 private final class PrepareOutcome {
@@ -643,6 +801,7 @@ private final class Stamp {
 /// Every callback the inputs and the synthesizer make, with when it came.
 private final class Probe: SpeechInputDelegate, SpeechOutputDelegate {
     var onsets: [Date] = []
+    var partials: [(at: Date, text: String)] = []
     var finals: [(at: Date, text: String)] = []
     var failures: [String] = []
     var availability: [String] = []
@@ -655,6 +814,7 @@ private final class Probe: SpeechInputDelegate, SpeechOutputDelegate {
 
     func reset() {
         onsets.removeAll()
+        partials.removeAll()
         finals.removeAll()
         failures.removeAll()
         availability.removeAll()
@@ -688,7 +848,9 @@ private final class Probe: SpeechInputDelegate, SpeechOutputDelegate {
         self.availability.append("\(availability)")
     }
 
-    func speechInputDidUpdatePartial(_ text: String) {}
+    func speechInputDidUpdatePartial(_ text: String) {
+        partials.append((Date(), text))
+    }
 
     func speechInputDidFinalize(_ text: String) {
         finals.append((Date(), text))
