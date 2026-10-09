@@ -119,26 +119,43 @@ class EngineBackend:
         self.history.append({"role": "assistant", "content": "".join(pieces)})
 
 
-# One random animal from mascots.py per launch: a 10x8 sprite, two pixel rows per text line.
-MASCOT_NAME, (MASCOT_PALETTE, MASCOT_ROWS) = random.choice(list(ANIMALS.items()))
+# One random animal from mascots.py per launch. The 16x16 art is taken at every other row
+# (16x8 pixels, outlines dropped), then drawn with quadrant blocks: each text cell holds a
+# 2x2 group of pixels, so the banner is 8 cells wide and 4 lines tall, like Claude's mascot.
+QUADRANTS = {
+    (0, 0, 0, 0): " ", (1, 0, 0, 0): "▘", (0, 1, 0, 0): "▝", (1, 1, 0, 0): "▀",
+    (0, 0, 1, 0): "▖", (1, 0, 1, 0): "▌", (0, 1, 1, 0): "▞", (1, 1, 1, 0): "▛",
+    (0, 0, 0, 1): "▗", (1, 0, 0, 1): "▚", (0, 1, 0, 1): "▐", (1, 1, 0, 1): "▜",
+    (0, 0, 1, 1): "▄", (1, 0, 1, 1): "▙", (0, 1, 1, 1): "▟", (1, 1, 1, 1): "█",
+}
+MASCOT_NAME, (MASCOT_PALETTE, MASCOT_ART) = random.choice(list(ANIMALS.items()))
+MASCOT_ROWS = [row for row in MASCOT_ART[::2]]
+
+
+def _colour(letter):
+    if letter == "." or letter == "K" or letter not in MASCOT_PALETTE:
+        return None
+    r, g, b = MASCOT_PALETTE[letter]
+    return f"#{r:02x}{g:02x}{b:02x}"
 
 
 def mascot_rows() -> list[list[tuple[str, str]]]:
-    """Return the mascot as rows of styled text fragments, two pixel rows per line."""
-    colors = {k: f"#{r:02x}{g:02x}{b:02x}" for k, (r, g, b) in MASCOT_PALETTE.items()}
+    """Return the mascot as rows of styled text fragments, two pixel rows and two pixel columns per cell."""
     lines = []
-    rows = MASCOT_ROWS
-    for top, bottom in zip(rows[0::2], rows[1::2]):
+    for top, bottom in zip(MASCOT_ROWS[0::2], MASCOT_ROWS[1::2]):
         fragments = []
-        for t, b in zip(top, bottom):
-            if t in colors and b in colors:
-                fragments.append((f"fg:{colors[t]} bg:{colors[b]}", "▀"))
-            elif t in colors:
-                fragments.append((f"fg:{colors[t]}", "▀"))
-            elif b in colors:
-                fragments.append((f"fg:{colors[b]}", "▄"))
-            else:
+        for x in range(0, len(top), 2):
+            quad = [_colour(top[x]), _colour(top[x + 1]), _colour(bottom[x]), _colour(bottom[x + 1])]
+            present = [c for c in quad if c is not None]
+            if not present:
                 fragments.append(("", " "))
+                continue
+            fg = max(set(present), key=present.count)
+            others = [c for c in present if c != fg]
+            bg = others[0] if others else None
+            bits = tuple(1 if c == fg else 0 for c in quad)
+            style = f"fg:{fg}" + (f" bg:{bg}" if bg else "")
+            fragments.append((style, QUADRANTS[bits]))
         lines.append(fragments)
     return lines
 
