@@ -514,19 +514,35 @@ pub trait Refine: Sized {
     fn refined(&self, cond: Guard) -> Self;
 }
 
+/// Cases taken in order, each holding for the rows it is the first to hold
+/// for.
+#[derive(Default)]
+pub(crate) struct FirstMatch {
+    rest: Option<Guard>,
+}
+
+impl FirstMatch {
+    /// The rows `holds` is the first case to hold for.
+    pub(crate) fn case(&mut self, holds: Guard) -> Guard {
+        let rest = self.rest.take().unwrap_or(Guard::Always);
+        self.rest = Some(Guard::and(rest.clone(), Guard::not(holds.clone())));
+        Guard::and(rest, holds)
+    }
+
+    /// The rows no case holds for.
+    pub(crate) fn rest(self) -> Guard {
+        self.rest.unwrap_or(Guard::Always)
+    }
+}
+
 pub(crate) fn partition<T: Refine, const N: usize>(
     of: &T,
     rec: &Recorder,
     cases: [Predicate; N],
 ) -> ([T; N], T) {
-    let mut rest = Guard::Always;
-    let arms = cases.map(|case| {
-        let holds = rec.guard_of(&case);
-        let mine = Guard::and(rest.clone(), holds.clone());
-        rest = Guard::and(rest.clone(), Guard::not(holds));
-        of.refined(mine)
-    });
-    (arms, of.refined(rest))
+    let mut chain = FirstMatch::default();
+    let arms = cases.map(|case| of.refined(chain.case(rec.guard_of(&case))));
+    (arms, of.refined(chain.rest()))
 }
 
 /// What a [`switch`] arm computes: a value, or several, each joined across
@@ -569,7 +585,7 @@ impl Arm for (Value, Value, Value) {
 pub fn switch<T: Arm>(x: &Value) -> Switch<'_, T> {
     Switch {
         x,
-        rest: Guard::Always,
+        chain: FirstMatch::default(),
         arms: Vec::new(),
     }
 }
@@ -577,23 +593,23 @@ pub fn switch<T: Arm>(x: &Value) -> Switch<'_, T> {
 #[must_use = "a switch computes nothing until it is ended"]
 pub struct Switch<'a, T> {
     x: &'a Value,
-    rest: Guard,
+    chain: FirstMatch,
     arms: Vec<T>,
 }
 
 impl<T: Arm> Switch<'_, T> {
     /// The rows `predicate` is the first case to hold for.
     pub fn case(mut self, predicate: Predicate, arm: impl FnOnce(&Value) -> T) -> Self {
-        let holds = self.x.rec.guard_of(&predicate);
-        let rows = self.x.refined(Guard::and(self.rest.clone(), holds.clone()));
-        self.rest = Guard::and(self.rest.clone(), Guard::not(holds));
+        let rows = self
+            .x
+            .refined(self.chain.case(self.x.rec.guard_of(&predicate)));
         self.arms.push(arm(&rows));
         self
     }
 
     /// The rows no case holds for, and the joined result.
     pub fn otherwise(mut self, arm: impl FnOnce(&Value) -> T) -> T {
-        let rows = self.x.refined(self.rest.clone());
+        let rows = self.x.refined(self.chain.rest());
         self.arms.push(arm(&rows));
         T::join(self.arms)
     }

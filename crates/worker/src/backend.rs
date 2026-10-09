@@ -217,7 +217,7 @@ fn land(
              does not ship"
         ));
     }
-    let mut request = runtime::engine::load::request_of(
+    let mut request = runtime::engine::load::request(
         overrides,
         snapshot_dir,
         platform,

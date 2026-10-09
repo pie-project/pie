@@ -80,7 +80,7 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
     };
     match runtime::engine::load::identify(&snap, platform) {
         Ok(deployment) => (true, deployment.to_string()),
-        Err(_) if pipeline => (false, "(no row)".to_string()),
+        Err(_) if pipeline => (false, "(no deployment)".to_string()),
         Err(_) => (false, "no deployment".to_string()),
     }
 }
@@ -246,8 +246,8 @@ impl crate::ui::Report for ModelList {
             println!(
                 "  {}",
                 palette.dim(
-                    "The row shown is the one an import picks by itself; `pie model import \
-                     <repo> --deployment <NAME>` imports as another (`--deployment '?'` lists every row this \
+                    "The deployment shown is the one an import picks by itself; `pie model import \
+                     <repo> --deployment <NAME>` imports as another (`--deployment '?'` lists every deployment this \
                      build ships)."
                 )
             );
@@ -535,7 +535,7 @@ impl crate::ui::Report for ModelInfo {
                 println!(
                     "  {}",
                     palette.dim(
-                        "this row has a text reading and a denoise reading: \
+                        "this deployment has a text reading and a denoise reading: \
                          `pie run text-to-image -- --prompt \"...\"` drives it."
                     )
                 );
@@ -547,7 +547,7 @@ impl crate::ui::Report for ModelInfo {
                 "  {}",
                 palette.dim(format!(
                     "imported as `{deployment}`; `pie model import <source> --deployment <NAME>` imports \
-                     the same source as another row (`--deployment '?'` lists every row this build \
+                     the same source as another deployment (`--deployment '?'` lists every deployment this build \
                      ships)."
                 ))
             );

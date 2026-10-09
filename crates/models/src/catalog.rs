@@ -41,40 +41,10 @@ pub struct Deploy {
     pub drafter: Option<Drafter>,
 }
 
-impl Deploy {
-    #[must_use]
-    pub fn has(&self, part: Part) -> bool {
-        self.parts.contains(&part)
-    }
-
-    #[must_use]
-    pub fn drafts_with(&self, drafter: Drafter) -> bool {
-        self.drafter == Some(drafter)
-    }
-
-    /// The one weight dtype of a single-precision deployment.
-    pub fn dtype(&self) -> Result<Dtype, Refused> {
-        match self.weights[..] {
-            [dtype] => Ok(dtype),
-            _ => Err(Refused(format!(
-                "the weights are one dtype here, not {:?}",
-                self.weights
-            ))),
-        }
-    }
-}
-
 /// Why a model does not serve a deployment.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
 pub struct Refused(pub String);
-
-impl Refused {
-    #[must_use]
-    pub fn unsupported(what: &str, deploy: &Deploy) -> Refused {
-        Refused(format!("{what} does not ship {deploy:?}"))
-    }
-}
 
 pub type TraceFn = Box<dyn Fn(&str, &Deploy, Platform) -> Result<Trace, Refused> + Send + Sync>;
 pub type ImportFn = Box<

@@ -8,7 +8,8 @@
 use std::cell::RefCell;
 use std::fmt;
 
-use crate::{HybridSpec, Input, Predicate, Value, ValueId, fact};
+use crate::record::FirstMatch;
+use crate::{HybridSpec, Input, Predicate, Refine as _, Value, ValueId, fact};
 use allocative::Allocative;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::{GlobalsBuilder, Methods, MethodsBuilder};
@@ -42,14 +43,17 @@ fn with<R>(f: impl FnOnce(&mut Trail) -> R) -> R {
 /// Runs `op`, a call into the DSL, turning the panic a misuse of it raises
 /// into an error the script's caller is told of.
 pub(crate) fn dsl<R>(what: &str, op: impl FnOnce() -> R) -> anyhow::Result<R> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(op)).map_err(|panic| {
-        let why = panic
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_string()))
-            .unwrap_or_else(|| "a panic with no message".to_string());
-        anyhow::anyhow!("{what}: {why}")
-    })
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(op))
+        .map_err(|panic| anyhow::anyhow!("{what}: {}", panic_message(&*panic)))
+}
+
+/// What a panic said.
+pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .unwrap_or_else(|| "a panic with no message".to_string())
 }
 
 /// A DSL value a forward holds.
@@ -75,13 +79,6 @@ pub(crate) fn hold(value: Value) -> ValueHandle {
 
 pub(crate) fn held(handle: ValueHandle) -> Value {
     with(|t| t.values[handle.0 as usize].clone())
-}
-
-fn value_of(value: Star<'_>) -> anyhow::Result<Value> {
-    value
-        .downcast_ref::<ValueHandle>()
-        .map(|h| held(*h))
-        .ok_or_else(|| anyhow::anyhow!("a value was wanted, not {}", value.get_type()))
 }
 
 #[starlark_value(type = "value")]
@@ -148,18 +145,13 @@ fn value_methods(builder: &mut MethodsBuilder) {
 }
 
 fn parted(x: &Value, cases: Vec<Predicate>) -> (Vec<Value>, Value) {
-    let mut rest = crate::Guard::Always;
     let rec = x.rec().clone();
-    let mut arms = Vec::new();
-    for case in cases {
-        let holds = rec.guard_of(&case);
-        arms.push(<Value as crate::Refine>::refined(
-            x,
-            crate::Guard::and(rest.clone(), holds.clone()),
-        ));
-        rest = crate::Guard::and(rest, crate::Guard::not(holds));
-    }
-    (arms, <Value as crate::Refine>::refined(x, rest))
+    let mut chain = FirstMatch::default();
+    let arms = cases
+        .iter()
+        .map(|case| x.refined(chain.case(rec.guard_of(case))))
+        .collect();
+    (arms, x.refined(chain.rest()))
 }
 
 /// The rows a forward reads.
@@ -244,18 +236,13 @@ fn input_methods(builder: &mut MethodsBuilder) {
             .into_iter()
             .map(predicate)
             .collect::<anyhow::Result<_>>()?;
-        let mut rest = crate::Guard::Always;
         let rec = i.recorder().clone();
-        let mut arms = Vec::new();
-        for case in cases {
-            let holds = rec.guard_of(&case);
-            arms.push(heap.alloc(hold_input(<Input as crate::Refine>::refined(
-                &i,
-                crate::Guard::and(rest.clone(), holds.clone()),
-            ))));
-            rest = crate::Guard::and(rest, crate::Guard::not(holds));
-        }
-        let rest = hold_input(<Input as crate::Refine>::refined(&i, rest));
+        let mut chain = FirstMatch::default();
+        let arms: Vec<Star<'v>> = cases
+            .iter()
+            .map(|case| heap.alloc(hold_input(i.refined(chain.case(rec.guard_of(case))))))
+            .collect();
+        let rest = hold_input(i.refined(chain.rest()));
         Ok(heap.alloc((heap.alloc(arms), rest)))
     }
 
@@ -429,9 +416,9 @@ pub(crate) fn forward(builder: &mut GlobalsBuilder) {
         #[starlark(require = named, default = NoneOr::None)] otherwise: NoneOr<Star<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Star<'v>> {
-        let x = value_of(x)?;
+        let x = <Value as crate::star::bind::Arg>::arg(Some(x))?;
         let rec = x.rec().clone();
-        let mut rest = crate::Guard::Always;
+        let mut chain = FirstMatch::default();
         let mut arms: Vec<Vec<Value>> = Vec::new();
         let call = |rows: Value, arm: Star<'v>, eval: &mut Evaluator<'v, '_, '_>| {
             let rows = eval.heap().alloc(hold(rows));
@@ -442,16 +429,11 @@ pub(crate) fn forward(builder: &mut GlobalsBuilder) {
         };
         for case in cases.items {
             let (fact, arm) = pair(case)?;
-            let holds = rec.guard_of(&predicate(fact)?);
-            let rows = <Value as crate::Refine>::refined(
-                &x,
-                crate::Guard::and(rest.clone(), holds.clone()),
-            );
-            rest = crate::Guard::and(rest, crate::Guard::not(holds));
+            let rows = x.refined(chain.case(rec.guard_of(&predicate(fact)?)));
             arms.push(call(rows, arm, eval)?);
         }
         if let NoneOr::Other(arm) = otherwise {
-            let rows = <Value as crate::Refine>::refined(&x, rest);
+            let rows = x.refined(chain.rest());
             arms.push(call(rows, arm, eval)?);
         }
         let width = arms.first().map_or(1, Vec::len);
@@ -502,7 +484,7 @@ pub(crate) fn forward(builder: &mut GlobalsBuilder) {
         let arms: Vec<Value> = arms
             .items
             .into_iter()
-            .map(value_of)
+            .map(|v| <Value as crate::star::bind::Arg>::arg(Some(v)))
             .collect::<anyhow::Result<_>>()?;
         dsl("merge", || Value::merge(arms)).map(hold)
     }
@@ -511,18 +493,11 @@ pub(crate) fn forward(builder: &mut GlobalsBuilder) {
 /// The `ops` namespace: the DSL's ops a forward writes.
 pub(crate) fn ops(builder: &mut GlobalsBuilder) {
     builder.namespace("ops", |ops| {
-        for module in [
-            "attn",
-            "collective",
-            "elemwise",
-            "layout",
-            "linear",
-            "spatial",
-        ] {
+        for module in crate::star::ops::MODULES {
             ops.namespace(module, |ns| {
                 for op in crate::star::ops::OPS
                     .iter()
-                    .filter(|op| op.module == module)
+                    .filter(|op| op.module == *module)
                 {
                     ns.set(op.name, crate::star::bind::OpValue(op));
                 }
@@ -575,29 +550,13 @@ fn facts(builder: &mut GlobalsBuilder) {
     /// The rows of the stream `name` (text, image, video, audio, context,
     /// reference).
     fn stream(#[starlark(require = pos)] name: &str) -> anyhow::Result<PredicateValue> {
-        let stream = crate::Stream::ALL
-            .into_iter()
-            .find(|s| format!("{s:?}").eq_ignore_ascii_case(name))
-            .ok_or_else(|| anyhow::anyhow!("no stream is called `{name}`"))?;
+        let stream = crate::star::generative::stream(name)?;
         Ok(PredicateValue(fact::stream(stream)))
-    }
-
-    /// The rows whose inferlet chose `value` for the choice `name`.
-    fn choice(
-        #[starlark(require = pos)] name: &str,
-        #[starlark(require = pos)] value: &str,
-    ) -> anyhow::Result<PredicateValue> {
-        Ok(PredicateValue(fact::choice(name, value)))
     }
 
     /// The rows of the reading `name`.
     fn reading(#[starlark(require = pos)] name: &str) -> anyhow::Result<PredicateValue> {
         Ok(PredicateValue(fact::reading(name)))
-    }
-
-    /// The rows whose inferlet turned the flag `name` on.
-    fn flag(#[starlark(require = pos)] name: &str) -> anyhow::Result<PredicateValue> {
-        Ok(PredicateValue(fact::flag(name)))
     }
 }
 
@@ -624,7 +583,7 @@ fn seams(builder: &mut GlobalsBuilder) {
         let values: Vec<Value> = values
             .items
             .into_iter()
-            .map(value_of)
+            .map(|v| <Value as crate::star::bind::Arg>::arg(Some(v)))
             .collect::<anyhow::Result<_>>()?;
         let refs: Vec<&Value> = values.iter().collect();
         let first = refs

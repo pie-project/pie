@@ -193,12 +193,6 @@ impl Input {
         crate::record::partition(self, &self.rec, cases)
     }
 
-    /// The reading `name`: what `read` computes over the rows of passes that
-    /// run it.
-    pub fn reading<T>(&self, name: &str, read: impl FnOnce(&Input) -> T) -> T {
-        read(&self.on(crate::facts::reading(name)))
-    }
-
     #[must_use]
     pub fn tokens(&self) -> Value {
         self.rec

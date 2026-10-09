@@ -196,7 +196,7 @@ fn load_engine(
     let residency = ::engine::load::Residency::default();
 
     let frames_in_flight = u8::try_from(config.frame_dispatch_depth.max(1)).unwrap_or(u8::MAX);
-    let request = crate::engine::load::request_of(
+    let request = crate::engine::load::request(
         &crate::engine::load::Overrides::default(),
         artifact,
         platform,

@@ -11,9 +11,7 @@ use ztensor::format::cbor::Value;
 
 use crate::import::Error;
 
-/// The attribute a snapshot's configuration rides under
-/// (`checkpoint::file::snapshot::CONFIG`).
-pub const CONFIG: &str = "config";
+pub use checkpoint::file::snapshot::CONFIG;
 
 type Recognizes<'a> = Box<dyn Fn(&ztensor::Source) -> bool + 'a>;
 
@@ -266,27 +264,13 @@ fn same(found: f64, want: f64) -> bool {
     found == want || (found - want).abs() <= 1e-6 * want.abs().max(found.abs())
 }
 
-/// Whether `src` holds a tensor named `name`.
-#[must_use]
-pub fn has(src: &ztensor::Source, name: &str) -> bool {
-    src.get(name).is_some()
-}
-
-/// Whether `src` holds a tensor whose name ends in `suffix`.
-#[must_use]
-pub fn has_suffix(src: &ztensor::Source, suffix: &str) -> bool {
-    src.names().any(|name| name.ends_with(suffix))
-}
-
-/// The container attribute `key`, as text.
-#[must_use]
-pub fn attribute_text<'s>(src: &'s ztensor::Source, key: &str) -> Option<&'s str> {
-    src.attributes()?.get(key)?.as_text()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn has(src: &ztensor::Source, name: &str) -> bool {
+        src.get(name).is_some()
+    }
 
     fn source(dir: &std::path::Path, names: &[&str], layers: u64) -> ztensor::Source {
         std::fs::create_dir_all(dir).expect("a scratch directory");

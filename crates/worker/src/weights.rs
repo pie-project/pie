@@ -194,12 +194,15 @@ fn pick(dir: &Path, found: Vec<PathBuf>, want: Want<'_>) -> Result<Option<PathBu
         .map(|stem| format!("`{}`", stem.to_string_lossy()))
         .collect::<Vec<_>>()
         .join(", ");
-    let asked = match (want.backend, want.overrides) {
-        (Some(backend), Some(_)) => {
+    let picks = want
+        .overrides
+        .is_some_and(|o| o.precision.is_some() || o.drafter.is_some());
+    let asked = match want.backend {
+        Some(backend) if picks && wanted.is_empty() => {
             format!(" and not one of them serves the config's precision and drafter on {backend}")
         }
-        (Some(backend), None) => format!(" and {} of them are for {backend}", wanted.len()),
-        _ => String::new(),
+        Some(backend) => format!(" and {} of them are for {backend}", wanted.len()),
+        None => String::new(),
     };
     bail!(
         "{} holds {} artifacts of one model{asked}. Name the one to serve in \

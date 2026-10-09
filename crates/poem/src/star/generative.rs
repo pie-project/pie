@@ -93,18 +93,10 @@ fn interned(name: &str) -> &'static str {
     held
 }
 
-fn spelled<T: Copy>(word: &str, what: &str, words: &[(&str, T)]) -> anyhow::Result<T> {
-    words
-        .iter()
-        .find(|(w, _)| *w == word)
-        .map(|(_, t)| *t)
-        .ok_or_else(|| {
-            let known: Vec<&str> = words.iter().map(|(w, _)| *w).collect();
-            anyhow::anyhow!("{what} is one of {known:?}, not {word:?}")
-        })
-}
+use crate::star::bind::word as spelled;
 
-fn stream(word: &str) -> anyhow::Result<Stream> {
+/// The stream `word` names.
+pub(crate) fn stream(word: &str) -> anyhow::Result<Stream> {
     spelled(
         word,
         "a stream",
@@ -257,7 +249,6 @@ pub(crate) fn generative(builder: &mut GlobalsBuilder) {
         #[starlark(require = pos)] kind: &str,
         #[starlark(require = named)] shift: UnpackFloat,
         #[starlark(require = named)] train_steps: u32,
-        #[starlark(require = named, default = NoneOr::None)] boundary: NoneOr<UnpackFloat>,
         #[starlark(require = named, default = UnpackList::default())] pinned_sigmas: UnpackList<
             UnpackFloat,
         >,
@@ -293,7 +284,7 @@ pub(crate) fn generative(builder: &mut GlobalsBuilder) {
             )?,
             shift: shift.0 as f32,
             train_steps,
-            boundary: boundary.into_option().map(|b| b.0 as f32),
+            boundary: None,
             pinned_sigmas: pinned_sigmas
                 .items
                 .into_iter()

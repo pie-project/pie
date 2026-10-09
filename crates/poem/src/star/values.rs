@@ -187,11 +187,6 @@ impl<'v> StarlarkValue<'v> for PredicateValue {
     }
 }
 
-/// Unpacks an optional window: `None`, or a count of positions.
-pub fn window(value: NoneOr<u32>) -> Option<u32> {
-    value.into_option()
-}
-
 /// The value `value` is, if it is a [`PredicateValue`].
 pub fn predicate<'v>(value: Value<'v>) -> anyhow::Result<Predicate> {
     value

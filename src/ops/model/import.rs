@@ -93,7 +93,7 @@ pub fn run(mut args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate
         }
     }
     if let Some(name) = args.deployment.as_deref() {
-        runtime::engine::load::row_named(name)
+        runtime::engine::load::deployment(name)
             .map_err(|why| anyhow!("--deployment {name}: {why:#}"))?;
     }
     let mut source = resolve_source(&args.source)?;
@@ -207,14 +207,14 @@ pub fn run(mut args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate
         merge_metadata(&mut metadata, overlay.metadata.clone());
     }
     let metadata = metadata;
-    let (deployment_name, contract) = choose_row(
+    let (deployment, contract) = choose_deployment(
         args.deployment.as_deref(),
         &opened,
         &metadata,
         platform,
         &source.path,
     )?;
-    let deployment = deployment_name.as_str();
+    let deployment = deployment.as_str();
     drop(opened);
     refuse_a_decode_of_packed_codes(deployment, &contract, &metadata)?;
     let attributes = gguf_attributes(&source, &metadata);
@@ -547,19 +547,19 @@ fn overlay_onto_artifact(
         .with_context(|| "merge the overlay into the artifact's name space")?;
     merge_metadata(&mut metadata, overlay.metadata.clone());
     let metadata = metadata;
-    let (deployment_name, contract) = choose_row(
+    let (deployment, contract) = choose_deployment(
         args.deployment.as_deref(),
         &opened,
         &metadata,
         platform,
         &base_file,
     )?;
-    let deployment = deployment_name.as_str();
+    let deployment = deployment.as_str();
     drop(opened);
     if deployment == before.deployment {
         bail!(
-            "{} already serves `{deployment}`; the overlay lands on a row that reads the head, and \
-             identification chose the row it already was",
+            "{} already serves `{deployment}`; the overlay lands on a deployment that reads the head, and \
+             identification chose the one it already was",
             crate::ui::short_path(&base_file)
         );
     }
@@ -611,7 +611,7 @@ fn overlay_onto_artifact(
             .count(),
     );
     if head_planes == 0 {
-        bail!("the overlay contributes no plane the row `{deployment}` reads");
+        bail!("the overlay contributes no plane the deployment `{deployment}` reads");
     }
 
     let plan = if decode.tensors.is_empty() {
@@ -1414,7 +1414,7 @@ fn name_the_specialization(
     Ok(renamed)
 }
 
-fn choose_row(
+fn choose_deployment(
     named: Option<&str>,
     opened: &ztensor::Source,
     metadata: &Metadata,
@@ -2123,8 +2123,8 @@ mod tests {
         a_store_archive_takes_its_name_from_its_directory();
         a_destination_that_is_the_source_is_recognized_through_a_symlink();
         the_row_override_parses_as_a_name_and_is_absent_by_default();
-        an_unknown_row_name_is_refused_with_the_catalog();
-        a_row_that_does_not_read_the_checkpoint_refuses_by_name();
+        an_unknown_deployment_name_is_refused_with_the_catalog();
+        a_deployment_that_does_not_read_the_checkpoint_refuses_by_name();
         the_chosen_row_is_in_the_filename_the_dry_run_reports();
         two_imports_beside_one_output_spool_apart();
     }
@@ -2301,18 +2301,20 @@ mod tests {
         assert!(Just::try_parse_from(["pie", "google/gemma-4-E4B-it", "--deployment"]).is_err());
     }
 
-    fn an_unknown_row_name_is_refused_with_the_catalog() {
-        let why = runtime::engine::load::row_named("gemma4-vision")
-            .expect_err("no row carries that name")
+    fn an_unknown_deployment_name_is_refused_with_the_catalog() {
+        let why = runtime::engine::load::deployment("gemma4-vision")
+            .map(|_| ())
+            .expect_err("no deployment carries that name")
             .to_string();
         assert!(why.contains("gemma4-vision"), "{why}");
         assert!(
             why.contains("gemma4-e4b-vision-bf16-kv-bf16"),
-            "the refusal lists the rows this build ships, which is how an \
+            "the refusal lists the deployments this build ships, which is how an \
              operator finds the one they meant: {why}"
         );
-        let listed = runtime::engine::load::row_named("?")
-            .expect_err("`?` is not a row")
+        let listed = runtime::engine::load::deployment("?")
+            .map(|_| ())
+            .expect_err("`?` is not a deployment")
             .to_string();
         assert!(
             listed.contains("gemma4-e4b-vision-bf16-kv-bf16"),
@@ -2320,7 +2322,7 @@ mod tests {
         );
     }
 
-    fn a_row_that_does_not_read_the_checkpoint_refuses_by_name() {
+    fn a_deployment_that_does_not_read_the_checkpoint_refuses_by_name() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("stranger.zt");
         let mut writer = ztensor::Writer::create(&path).unwrap();
@@ -2339,18 +2341,18 @@ mod tests {
         let asked = "gemma4-e4b-vision-bf16-kv-bf16";
 
         assert!(
-            choose_row(None, &source, &metadata, Platform::Vulkan, &path).is_err(),
-            "a checkpoint of one stranger is claimed by no row"
+            choose_deployment(None, &source, &metadata, Platform::Vulkan, &path).is_err(),
+            "a checkpoint of one stranger is claimed by no deployment"
         );
 
         let why = format!(
             "{:#}",
-            choose_row(Some(asked), &source, &metadata, Platform::Vulkan, &path)
-                .expect_err("the named row does not read this checkpoint")
+            choose_deployment(Some(asked), &source, &metadata, Platform::Vulkan, &path)
+                .expect_err("the named deployment does not read this checkpoint")
         );
         assert!(
             why.contains(asked) && why.contains("--deployment"),
-            "the refusal names the row that was asked for, and the flag that \
+            "the refusal names the deployment that was asked for, and the flag that \
              asked for it: {why}"
         );
         assert!(

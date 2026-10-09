@@ -348,10 +348,6 @@ fn convert_target() -> checkpoint::plan::StorageTarget {
     }
 }
 
-pub fn row_named(name: &str) -> Result<String> {
-    Ok(deployment(name)?.name)
-}
-
 pub fn conversion_contract_named(
     source: &ztensor::Source,
     metadata: &Metadata,
@@ -383,56 +379,45 @@ pub fn contract_for(
     trace: &Trace,
     checkpoint: &Path,
 ) -> std::result::Result<ModelContract, String> {
-    let source = open_source(checkpoint).map_err(|error| format!("{error:#}"))?;
-    let stamped = stamp_of(checkpoint)
-        .map_err(|error| format!("{error:#}"))?
-        .is_some();
-    if stamped
-        && let Some(package) = package_of(checkpoint).map_err(|error| format!("{error:#}"))?
-    {
-        let (_, deploy) = package.manifest().parse(&trace.name).ok_or_else(|| {
+    let said = |error: &dyn std::fmt::Display| format!("{error:#}");
+    let source = open_source(checkpoint).map_err(|e| said(&e))?;
+    let catalog = || {
+        models::Deployment::parse(&trace.name).ok_or_else(|| {
             format!(
-                "{:?} names no deployment of the package `{}` {checkpoint:?} carries",
-                trace.name,
-                package.name()
+                "{:?} names no deployment of a model this build ships, so a checkpoint's \
+                 tensors cannot be mapped onto its params",
+                trace.name
             )
-        })?;
-        return poem::import::own_contract(&source, &trace.params, deploy.tp, trace.platform)
-            .map_err(|error| {
+        })
+    };
+    if stamp_of(checkpoint).map_err(|e| said(&e))?.is_some() {
+        let tp = match package_of(checkpoint).map_err(|e| said(&e))? {
+            Some(package) => {
+                let (_, deploy) = package.manifest().parse(&trace.name).ok_or_else(|| {
+                    format!(
+                        "{:?} names no deployment of the package `{}` {checkpoint:?} carries",
+                        trace.name,
+                        package.name()
+                    )
+                })?;
+                deploy.tp
+            }
+            None => catalog()?.deploy.tp,
+        };
+        return poem::import::own_contract(&source, &trace.params, tp, trace.platform).map_err(
+            |error| {
                 format!(
                     "{checkpoint:?} does not hold every plane of {:?}: {error}",
                     trace.name
                 )
-            });
+            },
+        );
     }
-    let deployment = models::Deployment::parse(&trace.name).ok_or_else(|| {
-        format!(
-            "{:?} names no deployment of a model this build ships, so a checkpoint's \
-             tensors cannot be mapped onto its params",
-            trace.name
-        )
-    })?;
-    if stamped {
-        return poem::import::own_contract(
-            &source,
-            &trace.params,
-            deployment.deploy.tp,
-            trace.platform,
-        )
-        .map_err(|error| {
-            format!(
-                "{checkpoint:?} does not hold every plane of {:?}: {error}",
-                trace.name
-            )
-        });
-    }
+    let deployment = catalog()?;
     if deployment.deploy.tp > 1 {
-        // an import states the whole checkpoint; the ranks of a tensor-parallel
-        // group band their shares out of a stamped artifact at load (own_contract),
-        // so a raw snapshot cannot be served at tp > 1 directly
         return Err(format!(
-            "{:?} is a {}-rank row and {checkpoint:?} is an unconverted checkpoint: the ranks \
-             band their shares out of a stamped artifact, so convert it first (`pie model \
+            "{:?} is a {}-rank deployment and {checkpoint:?} is an unconverted checkpoint: the \
+             ranks band their shares out of a stamped artifact, so convert it first (`pie model \
              import`) and serve the artifact",
             trace.name, deployment.deploy.tp
         ));
@@ -447,28 +432,9 @@ pub fn contract_for(
         })
 }
 
-pub fn request(
-    checkpoint: &Path,
-    platform: Platform,
-    budgets: Budgets,
-    residency: Residency,
-    ordinal: i32,
-    frames_in_flight: u8,
-) -> Result<LoadRequest> {
-    request_of(
-        &Overrides::default(),
-        checkpoint,
-        platform,
-        budgets,
-        residency,
-        ordinal,
-        frames_in_flight,
-    )
-}
-
 /// The load of the deployment `checkpoint` states, under the config's
 /// `overrides`.
-pub fn request_of(
+pub fn request(
     overrides: &Overrides,
     checkpoint: &Path,
     platform: Platform,
@@ -477,18 +443,13 @@ pub fn request_of(
     ordinal: i32,
     frames_in_flight: u8,
 ) -> Result<LoadRequest> {
-    let base = identify(checkpoint, platform)?;
     let trace = match packaged(checkpoint, overrides, platform)? {
         Some((name, _, trace)) => {
-            tracing::info!(
-                deployment = name,
-                identified = base,
-                ?checkpoint,
-                "serving its package"
-            );
+            tracing::info!(deployment = name, ?checkpoint, "serving its package");
             trace
         }
         None => {
+            let base = identify(checkpoint, platform)?;
             let name = compose(&base, overrides, platform)?;
             tracing::info!(deployment = name, identified = base, ?checkpoint, "serving");
             self::trace(&name, platform)?

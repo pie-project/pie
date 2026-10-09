@@ -27,9 +27,8 @@ pub(crate) mod spelled {
     pub(crate) use crate::ops::spatial::Conv;
     pub(crate) use crate::{
         Dtype, GateActivation, Input, ModulateForm, MropeForm, RaggedMask, RopeForm, Value,
-        VoxelSegment, Weight,
+        ValueId, VoxelSegment, Weight,
     };
-    pub(crate) use poem_ir::GridRule;
 }
 
 /// One op of the DSL, as a forward calls it.
@@ -63,9 +62,6 @@ impl<'v> Args<'v> {
     }
 }
 
-/// A cache row an op reads or writes.
-pub(crate) struct Cache(pub(crate) ValueId);
-
 /// What a parameter of an op is unpacked as.
 pub(crate) trait Arg<'v>: Sized {
     fn arg(given: Option<Star<'v>>) -> anyhow::Result<Self>;
@@ -96,11 +92,12 @@ impl<'v> Arg<'v> for Weight {
     }
 }
 
-impl<'v> Arg<'v> for Cache {
+/// A cache row an op reads or writes.
+impl<'v> Arg<'v> for ValueId {
     fn arg(v: Option<Star<'v>>) -> anyhow::Result<Self> {
         let v = given(v)?;
         match v.downcast_ref::<CacheHandle>() {
-            Some(h) => Ok(Cache(h.0)),
+            Some(h) => Ok(h.0),
             None => wanted("a cache", v),
         }
     }
@@ -239,9 +236,14 @@ impl<'v, A: Arg<'v>, B: Arg<'v>> Arg<'v> for (A, B) {
 /// An enum a package spells by name.
 fn spelled<T: Copy>(v: Option<Star<'_>>, what: &str, words: &[(&str, T)]) -> anyhow::Result<T> {
     let v = given(v)?;
-    let Some(word) = v.unpack_str() else {
+    let Some(spelling) = v.unpack_str() else {
         return wanted(what, v);
     };
+    word(spelling, what, words)
+}
+
+/// The `T` of `words` that `word` spells.
+pub(crate) fn word<T: Copy>(word: &str, what: &str, words: &[(&str, T)]) -> anyhow::Result<T> {
     words
         .iter()
         .find(|(w, _)| *w == word)
@@ -313,7 +315,6 @@ pub(crate) struct Whole(#[allocative(skip)] pub(crate) Held);
 #[derive(Debug, Clone)]
 pub(crate) enum Held {
     Conv(Conv),
-    Grid(GridRule),
     Yarn(Yarn),
     Mask(RaggedMask),
     Segment(VoxelSegment),
@@ -345,7 +346,6 @@ macro_rules! whole {
 }
 
 whole!(Conv, Conv, "a conv");
-whole!(GridRule, Grid, "a grid rule");
 whole!(Yarn, Yarn, "a yarn scaling");
 whole!(RaggedMask, Mask, "a ragged mask");
 whole!(VoxelSegment, Segment, "a voxel segment");
@@ -394,8 +394,6 @@ impl Result for RaggedMask {
 pub(crate) fn result<R: Result>(heap: Heap<'_>, r: R) -> anyhow::Result<Star<'_>> {
     Ok(r.star(heap))
 }
-
-pub(crate) use crate::star::forward::dsl;
 
 /// An op as the value a forward calls.
 #[derive(Clone, Copy, ProvidesStaticType, NoSerialize, StarlarkPagableUnsupported, Allocative)]
@@ -579,18 +577,6 @@ pub(crate) fn wholes(builder: &mut starlark::environment::GlobalsBuilder) {
         Ok(Whole(Held::Mask(RaggedMask::None)))
     }
 
-    /// A ragged attention's mask under which a reference row attends only
-    /// the rows of its own reference, by the tags `q_tags` and `kv_tags`.
-    fn reference_self_only<'v>(
-        #[starlark(require = pos)] q_tags: Star<'v>,
-        #[starlark(require = pos)] kv_tags: Star<'v>,
-    ) -> anyhow::Result<Whole> {
-        Ok(Whole(Held::Mask(RaggedMask::ReferenceSelfOnly {
-            q_tags: Value::arg(Some(q_tags))?.id(),
-            kv_tags: Value::arg(Some(kv_tags))?.id(),
-        })))
-    }
-
     /// A conv stated whole: kernel `k`, `stride`, `pad` before and
     /// `pad_back` after each (t, h, w) axis, `causal_t` reading only past
     /// frames, its time padded by `time_pad` ("zero" or "replicate").
@@ -614,11 +600,6 @@ pub(crate) fn wholes(builder: &mut starlark::environment::GlobalsBuilder) {
                 other => anyhow::bail!("a conv pads time with zero or replicate, not {other}"),
             },
         })))
-    }
-
-    /// The grid rule a conv steps its grid by.
-    fn grid_rule(#[starlark(require = pos)] conv: Star<'_>) -> anyhow::Result<Whole> {
-        Ok(Whole(Held::Grid(Conv::arg(Some(conv))?.rule())))
     }
 
     /// Yarn's rope scaling.
@@ -662,14 +643,7 @@ mod tests {
             .filter_map(|l| l.strip_prefix("//! `")?.strip_suffix('`'))
             .collect();
         let mut missing = Vec::new();
-        for module in [
-            "attn",
-            "collective",
-            "elemwise",
-            "layout",
-            "linear",
-            "spatial",
-        ] {
+        for module in super::super::ops::MODULES {
             let text = std::fs::read_to_string(root.join(format!("src/ops/{module}.rs"))).unwrap();
             for line in text.lines() {
                 let Some(rest) = line.strip_prefix("pub fn ") else {
@@ -678,7 +652,7 @@ mod tests {
                 let name = &rest[..rest.find(['(', '<']).unwrap()];
                 let bound = super::super::ops::OPS
                     .iter()
-                    .any(|op| op.module == module && op.name == name);
+                    .any(|op| op.module == *module && op.name == name);
                 if !bound && !unbound.contains(&format!("{module}::{name}").as_str()) {
                     missing.push(format!("{module}::{name}"));
                 }
@@ -687,7 +661,6 @@ mod tests {
         let forward = std::fs::read_to_string(root.join("src/forward.rs")).unwrap();
         let methods = &forward[forward.find("impl Input {").unwrap()..];
         let methods = &methods[..methods.find("\n}\n").unwrap()];
-        let by_hand = ["recorder", "on", "partition", "reading", "walk_layers"];
         for line in methods.lines() {
             let Some(rest) = line.strip_prefix("    pub fn ") else {
                 continue;
@@ -695,7 +668,7 @@ mod tests {
             let name = &rest[..rest.find(['(', '<']).unwrap()];
             let bound = super::super::ops::INPUTS.iter().any(|op| op.name == name);
             if !bound
-                && !by_hand.contains(&name)
+                && !super::super::ops::NOT_GENERATED.contains(&name)
                 && !unbound.contains(&format!("inputs::{name}").as_str())
             {
                 missing.push(format!("Input::{name}"));

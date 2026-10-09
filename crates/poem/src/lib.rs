@@ -23,8 +23,6 @@ pub use poem_ir::{
 };
 pub use record::{Arm, Primitive, Recorder, Refine, Switch, Value, switch};
 
-pub type TraceFn = fn(Platform) -> Trace;
-
 pub mod seam {
 
     use crate::record::Value;

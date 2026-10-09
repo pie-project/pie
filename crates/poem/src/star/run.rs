@@ -146,14 +146,12 @@ impl Package {
                 .unwrap_or_default();
             declared?;
 
-            let star = Star::new_none();
             let model = Model {
                 spec,
                 eval: RefCell::new(&mut eval),
                 run,
                 m,
                 failed: RefCell::new(None),
-                _star: star,
             };
             let traced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::trace_hybrid(name, &model, platform)
@@ -163,12 +161,10 @@ impl Package {
                 return Err(why);
             }
             traced.map_err(|panic| {
-                let why = panic
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_string()))
-                    .unwrap_or_else(|| "a panic with no message".to_string());
-                anyhow::anyhow!("`{name}` does not trace: {why}")
+                anyhow::anyhow!(
+                    "`{name}` does not trace: {}",
+                    crate::star::forward::panic_message(&*panic)
+                )
             })
         })
     }
@@ -181,7 +177,6 @@ struct Model<'a, 'v, 'e> {
     run: Star<'v>,
     m: Star<'v>,
     failed: RefCell<Option<anyhow::Error>>,
-    _star: Star<'v>,
 }
 
 impl ForwardHybrid for Model<'_, '_, '_> {

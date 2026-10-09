@@ -3,10 +3,24 @@
 //!
 //! Every op and `Input` method a package can spell the arguments and
 //! result of. Not bound:
+//! `spatial::grid`
 
 use crate::ops;
 use crate::star::bind::spelled::*;
-use crate::star::bind::{Cache, Op, dsl, result};
+use crate::star::bind::{Op, result};
+use crate::star::forward::dsl;
+
+pub(crate) const MODULES: &[&str] = &[
+    "attn",
+    "collective",
+    "elemwise",
+    "layout",
+    "linear",
+    "spatial",
+];
+
+#[cfg(test)]
+pub(crate) const NOT_GENERATED: &[&str] = &["recorder", "on", "partition", "walk_layers"];
 
 pub(crate) static OPS: &[Op] = &[
     Op {
@@ -52,14 +66,14 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let q: Value = a.next()?;
             let plan: Value = a.next()?;
-            let pages: Cache = a.next()?;
+            let pages: ValueId = a.next()?;
             let window: Option<u32> = a.next()?;
             let head_dim: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
             result(
                 heap,
                 dsl("attn.decode", || {
-                    ops::attn::decode(&q, &plan, pages.0, window, head_dim, sm_scale)
+                    ops::attn::decode(&q, &plan, pages, window, head_dim, sm_scale)
                 })?,
             )
         },
@@ -73,7 +87,7 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let q: Value = a.next()?;
             let plan: Value = a.next()?;
-            let pages: Cache = a.next()?;
+            let pages: ValueId = a.next()?;
             let window: Option<u32> = a.next()?;
             let head_dim: u32 = a.next()?;
             let kv_heads: u32 = a.next()?;
@@ -81,7 +95,7 @@ pub(crate) static OPS: &[Op] = &[
             result(
                 heap,
                 dsl("attn.prefill", || {
-                    ops::attn::prefill(&q, &plan, pages.0, window, head_dim, kv_heads, sm_scale)
+                    ops::attn::prefill(&q, &plan, pages, window, head_dim, kv_heads, sm_scale)
                 })?,
             )
         },
@@ -103,7 +117,7 @@ pub(crate) static OPS: &[Op] = &[
             let q: Value = a.next()?;
             let plan: Value = a.next()?;
             let selection: Value = a.next()?;
-            let pages: Cache = a.next()?;
+            let pages: ValueId = a.next()?;
             let window: Option<u32> = a.next()?;
             let head_dim: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
@@ -112,7 +126,7 @@ pub(crate) static OPS: &[Op] = &[
                 heap,
                 dsl("attn.decode_selected", || {
                     ops::attn::decode_selected(
-                        &q, &plan, &selection, pages.0, window, head_dim, sm_scale, ratio,
+                        &q, &plan, &selection, pages, window, head_dim, sm_scale, ratio,
                     )
                 })?,
             )
@@ -136,7 +150,7 @@ pub(crate) static OPS: &[Op] = &[
             let q: Value = a.next()?;
             let plan: Value = a.next()?;
             let selection: Value = a.next()?;
-            let pages: Cache = a.next()?;
+            let pages: ValueId = a.next()?;
             let window: Option<u32> = a.next()?;
             let head_dim: u32 = a.next()?;
             let kv_heads: u32 = a.next()?;
@@ -146,7 +160,7 @@ pub(crate) static OPS: &[Op] = &[
                 heap,
                 dsl("attn.prefill_selected", || {
                     ops::attn::prefill_selected(
-                        &q, &plan, &selection, pages.0, window, head_dim, kv_heads, sm_scale, ratio,
+                        &q, &plan, &selection, pages, window, head_dim, kv_heads, sm_scale, ratio,
                     )
                 })?,
             )
@@ -169,7 +183,7 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let q: Value = a.next()?;
             let plan: Value = a.next()?;
-            let pages: Cache = a.next()?;
+            let pages: ValueId = a.next()?;
             let bias: Value = a.next()?;
             let window: Option<u32> = a.next()?;
             let head_dim: u32 = a.next()?;
@@ -182,7 +196,7 @@ pub(crate) static OPS: &[Op] = &[
                     ops::attn::decode_rel(
                         &q,
                         &plan,
-                        pages.0,
+                        pages,
                         &bias,
                         window,
                         head_dim,
@@ -212,7 +226,7 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let q: Value = a.next()?;
             let plan: Value = a.next()?;
-            let pages: Cache = a.next()?;
+            let pages: ValueId = a.next()?;
             let bias: Value = a.next()?;
             let window: Option<u32> = a.next()?;
             let head_dim: u32 = a.next()?;
@@ -226,7 +240,7 @@ pub(crate) static OPS: &[Op] = &[
                     ops::attn::prefill_rel(
                         &q,
                         &plan,
-                        pages.0,
+                        pages,
                         &bias,
                         window,
                         head_dim,
@@ -249,7 +263,7 @@ pub(crate) static OPS: &[Op] = &[
             let q: Value = a.next()?;
             let plan: Value = a.next()?;
             let mask: Value = a.next()?;
-            let pages: Cache = a.next()?;
+            let pages: ValueId = a.next()?;
             let window: Option<u32> = a.next()?;
             let head_dim: u32 = a.next()?;
             let kv_heads: u32 = a.next()?;
@@ -259,7 +273,7 @@ pub(crate) static OPS: &[Op] = &[
                 heap,
                 dsl("attn.masked", || {
                     ops::attn::masked(
-                        &q, &plan, &mask, pages.0, window, head_dim, kv_heads, causal, sm_scale,
+                        &q, &plan, &mask, pages, window, head_dim, kv_heads, causal, sm_scale,
                     )
                 })?,
             )
@@ -275,7 +289,7 @@ pub(crate) static OPS: &[Op] = &[
             let q: Value = a.next()?;
             let plan: Value = a.next()?;
             let mask: Value = a.next()?;
-            let pages: Cache = a.next()?;
+            let pages: ValueId = a.next()?;
             let window: Option<u32> = a.next()?;
             let head_dim: u32 = a.next()?;
             let kv_heads: u32 = a.next()?;
@@ -285,7 +299,7 @@ pub(crate) static OPS: &[Op] = &[
                 heap,
                 dsl("attn.masked_lse", || {
                     ops::attn::masked_lse(
-                        &q, &plan, &mask, pages.0, window, head_dim, kv_heads, causal, sm_scale,
+                        &q, &plan, &mask, pages, window, head_dim, kv_heads, causal, sm_scale,
                     )
                 })?,
             )
@@ -298,14 +312,14 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let q: Value = a.next()?;
             let plan: Value = a.next()?;
-            let pages: Cache = a.next()?;
+            let pages: ValueId = a.next()?;
             let window: Option<u32> = a.next()?;
             let head_dim: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
             result(
                 heap,
                 dsl("attn.decode_lse", || {
-                    ops::attn::decode_lse(&q, &plan, pages.0, window, head_dim, sm_scale)
+                    ops::attn::decode_lse(&q, &plan, pages, window, head_dim, sm_scale)
                 })?,
             )
         },
@@ -319,7 +333,7 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let q: Value = a.next()?;
             let plan: Value = a.next()?;
-            let pages: Cache = a.next()?;
+            let pages: ValueId = a.next()?;
             let window: Option<u32> = a.next()?;
             let head_dim: u32 = a.next()?;
             let kv_heads: u32 = a.next()?;
@@ -327,7 +341,7 @@ pub(crate) static OPS: &[Op] = &[
             result(
                 heap,
                 dsl("attn.prefill_lse", || {
-                    ops::attn::prefill_lse(&q, &plan, pages.0, window, head_dim, kv_heads, sm_scale)
+                    ops::attn::prefill_lse(&q, &plan, pages, window, head_dim, kv_heads, sm_scale)
                 })?,
             )
         },
@@ -386,13 +400,13 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let k: Value = a.next()?;
             let v: Value = a.next()?;
-            let pages: Cache = a.next()?;
+            let pages: ValueId = a.next()?;
             let write_page: Value = a.next()?;
             let write_offset: Value = a.next()?;
             result(
                 heap,
                 dsl("attn.kv_append", || {
-                    ops::attn::kv_append(&k, &v, pages.0, &write_page, &write_offset)
+                    ops::attn::kv_append(&k, &v, pages, &write_page, &write_offset)
                 })?,
             )
         },
@@ -403,13 +417,13 @@ pub(crate) static OPS: &[Op] = &[
         params: &["plane", "pages", "write_page", "write_offset"],
         call: |a, heap| {
             let plane: Value = a.next()?;
-            let pages: Cache = a.next()?;
+            let pages: ValueId = a.next()?;
             let write_page: Value = a.next()?;
             let write_offset: Value = a.next()?;
             result(
                 heap,
                 dsl("attn.kv_append_shared", || {
-                    ops::attn::kv_append_shared(&plane, pages.0, &write_page, &write_offset)
+                    ops::attn::kv_append_shared(&plane, pages, &write_page, &write_offset)
                 })?,
             )
         },
@@ -421,12 +435,12 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let x: Value = a.next()?;
             let weight: Weight = a.next()?;
-            let state: Cache = a.next()?;
+            let state: ValueId = a.next()?;
             let conv_width: u32 = a.next()?;
             result(
                 heap,
                 dsl("attn.ssm_causal_conv1d", || {
-                    ops::attn::ssm_causal_conv1d(&x, &weight, state.0, conv_width)
+                    ops::attn::ssm_causal_conv1d(&x, &weight, state, conv_width)
                 })?,
             )
         },
@@ -438,13 +452,13 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let x: Value = a.next()?;
             let weight: Weight = a.next()?;
-            let state: Cache = a.next()?;
+            let state: ValueId = a.next()?;
             let conv_width: u32 = a.next()?;
             let dilation: u32 = a.next()?;
             result(
                 heap,
                 dsl("attn.ssm_causal_conv1d_dilated", || {
-                    ops::attn::ssm_causal_conv1d_dilated(&x, &weight, state.0, conv_width, dilation)
+                    ops::attn::ssm_causal_conv1d_dilated(&x, &weight, state, conv_width, dilation)
                 })?,
             )
         },
@@ -456,12 +470,12 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let x: Value = a.next()?;
             let weight: Weight = a.next()?;
-            let state: Cache = a.next()?;
+            let state: ValueId = a.next()?;
             let conv_width: u32 = a.next()?;
             result(
                 heap,
                 dsl("attn.ssm_causal_conv1d_chunked", || {
-                    ops::attn::ssm_causal_conv1d_chunked(&x, &weight, state.0, conv_width)
+                    ops::attn::ssm_causal_conv1d_chunked(&x, &weight, state, conv_width)
                 })?,
             )
         },
@@ -473,14 +487,14 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let x: Value = a.next()?;
             let weight: Weight = a.next()?;
-            let state: Cache = a.next()?;
+            let state: ValueId = a.next()?;
             let conv_width: u32 = a.next()?;
             let dilation: u32 = a.next()?;
             result(
                 heap,
                 dsl("attn.ssm_causal_conv1d_chunked_dilated", || {
                     ops::attn::ssm_causal_conv1d_chunked_dilated(
-                        &x, &weight, state.0, conv_width, dilation,
+                        &x, &weight, state, conv_width, dilation,
                     )
                 })?,
             )
@@ -493,12 +507,12 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let x: Value = a.next()?;
             let weight: Weight = a.next()?;
-            let state: Cache = a.next()?;
+            let state: ValueId = a.next()?;
             let conv_width: u32 = a.next()?;
             result(
                 heap,
                 dsl("attn.short_conv", || {
-                    ops::attn::short_conv(&x, &weight, state.0, conv_width)
+                    ops::attn::short_conv(&x, &weight, state, conv_width)
                 })?,
             )
         },
@@ -510,12 +524,12 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let x: Value = a.next()?;
             let weight: Weight = a.next()?;
-            let state: Cache = a.next()?;
+            let state: ValueId = a.next()?;
             let conv_width: u32 = a.next()?;
             result(
                 heap,
                 dsl("attn.short_conv_chunked", || {
-                    ops::attn::short_conv_chunked(&x, &weight, state.0, conv_width)
+                    ops::attn::short_conv_chunked(&x, &weight, state, conv_width)
                 })?,
             )
         },
@@ -582,7 +596,7 @@ pub(crate) static OPS: &[Op] = &[
         ],
         call: |a, heap| {
             let ids: Value = a.next()?;
-            let state: Cache = a.next()?;
+            let state: ValueId = a.next()?;
             let eos: u32 = a.next()?;
             let mults: Vec<u64> = a.next()?;
             let primes: Vec<u64> = a.next()?;
@@ -594,7 +608,7 @@ pub(crate) static OPS: &[Op] = &[
                 dsl("attn.ple_ngram_ids", || {
                     ops::attn::ple_ngram_ids(
                         &ids,
-                        state.0,
+                        state,
                         eos,
                         &mults,
                         &primes,
@@ -621,7 +635,7 @@ pub(crate) static OPS: &[Op] = &[
         ],
         call: |a, heap| {
             let ids: Value = a.next()?;
-            let state: Cache = a.next()?;
+            let state: ValueId = a.next()?;
             let eos: u32 = a.next()?;
             let mults: Vec<u64> = a.next()?;
             let primes: Vec<u64> = a.next()?;
@@ -633,7 +647,7 @@ pub(crate) static OPS: &[Op] = &[
                 dsl("attn.ple_ngram_ids_chunked", || {
                     ops::attn::ple_ngram_ids_chunked(
                         &ids,
-                        state.0,
+                        state,
                         eos,
                         &mults,
                         &primes,
@@ -671,7 +685,7 @@ pub(crate) static OPS: &[Op] = &[
             let qkv: Value = a.next()?;
             let z: Value = a.next()?;
             let gates: Value = a.next()?;
-            let state: Cache = a.next()?;
+            let state: ValueId = a.next()?;
             let k_heads: u32 = a.next()?;
             let v_heads: u32 = a.next()?;
             let k_dim: u32 = a.next()?;
@@ -680,7 +694,7 @@ pub(crate) static OPS: &[Op] = &[
                 heap,
                 dsl("attn.ssm_gated_delta", || {
                     ops::attn::ssm_gated_delta(
-                        &qkv, &z, &gates, state.0, k_heads, v_heads, k_dim, v_dim,
+                        &qkv, &z, &gates, state, k_heads, v_heads, k_dim, v_dim,
                     )
                 })?,
             )
@@ -696,7 +710,7 @@ pub(crate) static OPS: &[Op] = &[
             let qkv: Value = a.next()?;
             let z: Value = a.next()?;
             let gates: Value = a.next()?;
-            let state: Cache = a.next()?;
+            let state: ValueId = a.next()?;
             let k_heads: u32 = a.next()?;
             let v_heads: u32 = a.next()?;
             let k_dim: u32 = a.next()?;
@@ -705,7 +719,7 @@ pub(crate) static OPS: &[Op] = &[
                 heap,
                 dsl("attn.ssm_gated_delta_chunked", || {
                     ops::attn::ssm_gated_delta_chunked(
-                        &qkv, &z, &gates, state.0, k_heads, v_heads, k_dim, v_dim,
+                        &qkv, &z, &gates, state, k_heads, v_heads, k_dim, v_dim,
                     )
                 })?,
             )
@@ -732,7 +746,7 @@ pub(crate) static OPS: &[Op] = &[
             let b: Value = a.next()?;
             let dt_bias: Weight = a.next()?;
             let a_log: Weight = a.next()?;
-            let state: Cache = a.next()?;
+            let state: ValueId = a.next()?;
             let heads: u32 = a.next()?;
             let head_dim: u32 = a.next()?;
             let norm_eps: f32 = a.next()?;
@@ -741,7 +755,7 @@ pub(crate) static OPS: &[Op] = &[
                 heap,
                 dsl("attn.ssm_kda_step", || {
                     ops::attn::ssm_kda_step(
-                        &mixed, &f, &b, &dt_bias, &a_log, state.0, heads, head_dim, norm_eps,
+                        &mixed, &f, &b, &dt_bias, &a_log, state, heads, head_dim, norm_eps,
                         gate_floor,
                     )
                 })?,
@@ -769,7 +783,7 @@ pub(crate) static OPS: &[Op] = &[
             let b: Value = a.next()?;
             let dt_bias: Weight = a.next()?;
             let a_log: Weight = a.next()?;
-            let state: Cache = a.next()?;
+            let state: ValueId = a.next()?;
             let heads: u32 = a.next()?;
             let head_dim: u32 = a.next()?;
             let norm_eps: f32 = a.next()?;
@@ -778,7 +792,7 @@ pub(crate) static OPS: &[Op] = &[
                 heap,
                 dsl("attn.ssm_kda_chunked", || {
                     ops::attn::ssm_kda_chunked(
-                        &mixed, &f, &b, &dt_bias, &a_log, state.0, heads, head_dim, norm_eps,
+                        &mixed, &f, &b, &dt_bias, &a_log, state, heads, head_dim, norm_eps,
                         gate_floor,
                     )
                 })?,
@@ -944,13 +958,13 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let kv_c: Value = a.next()?;
             let k_pe: Value = a.next()?;
-            let pages: Cache = a.next()?;
+            let pages: ValueId = a.next()?;
             let write_page: Value = a.next()?;
             let write_offset: Value = a.next()?;
             result(
                 heap,
                 dsl("attn.mla_kv_append", || {
-                    ops::attn::mla_kv_append(&kv_c, &k_pe, pages.0, &write_page, &write_offset)
+                    ops::attn::mla_kv_append(&kv_c, &k_pe, pages, &write_page, &write_offset)
                 })?,
             )
         },
@@ -971,14 +985,14 @@ pub(crate) static OPS: &[Op] = &[
             let q: Value = a.next()?;
             let plan: Value = a.next()?;
             let q_pe: Value = a.next()?;
-            let pages: Cache = a.next()?;
+            let pages: ValueId = a.next()?;
             let heads: u32 = a.next()?;
             let kv_lora_rank: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
             result(
                 heap,
                 dsl("attn.mla_decode", || {
-                    ops::attn::mla_decode(&q, &plan, &q_pe, pages.0, heads, kv_lora_rank, sm_scale)
+                    ops::attn::mla_decode(&q, &plan, &q_pe, pages, heads, kv_lora_rank, sm_scale)
                 })?,
             )
         },
@@ -999,14 +1013,14 @@ pub(crate) static OPS: &[Op] = &[
             let q: Value = a.next()?;
             let plan: Value = a.next()?;
             let q_pe: Value = a.next()?;
-            let pages: Cache = a.next()?;
+            let pages: ValueId = a.next()?;
             let heads: u32 = a.next()?;
             let kv_lora_rank: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
             result(
                 heap,
                 dsl("attn.mla_prefill", || {
-                    ops::attn::mla_prefill(&q, &plan, &q_pe, pages.0, heads, kv_lora_rank, sm_scale)
+                    ops::attn::mla_prefill(&q, &plan, &q_pe, pages, heads, kv_lora_rank, sm_scale)
                 })?,
             )
         },
@@ -1029,7 +1043,7 @@ pub(crate) static OPS: &[Op] = &[
             let plan: Value = a.next()?;
             let q_pe: Value = a.next()?;
             let selection: Value = a.next()?;
-            let pages: Cache = a.next()?;
+            let pages: ValueId = a.next()?;
             let heads: u32 = a.next()?;
             let kv_lora_rank: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
@@ -1041,7 +1055,7 @@ pub(crate) static OPS: &[Op] = &[
                         &plan,
                         &q_pe,
                         &selection,
-                        pages.0,
+                        pages,
                         heads,
                         kv_lora_rank,
                         sm_scale,
@@ -1068,7 +1082,7 @@ pub(crate) static OPS: &[Op] = &[
             let plan: Value = a.next()?;
             let q_pe: Value = a.next()?;
             let selection: Value = a.next()?;
-            let pages: Cache = a.next()?;
+            let pages: ValueId = a.next()?;
             let heads: u32 = a.next()?;
             let kv_lora_rank: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
@@ -1080,7 +1094,7 @@ pub(crate) static OPS: &[Op] = &[
                         &plan,
                         &q_pe,
                         &selection,
-                        pages.0,
+                        pages,
                         heads,
                         kv_lora_rank,
                         sm_scale,
@@ -1139,7 +1153,7 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let q: Value = a.next()?;
             let weights: Option<Value> = a.next()?;
-            let keys: Cache = a.next()?;
+            let keys: ValueId = a.next()?;
             let heads: u32 = a.next()?;
             let head_dim: u32 = a.next()?;
             let top_k: u32 = a.next()?;
@@ -1147,15 +1161,7 @@ pub(crate) static OPS: &[Op] = &[
             result(
                 heap,
                 dsl("attn.index_topk", || {
-                    ops::attn::index_topk(
-                        &q,
-                        weights.as_ref(),
-                        keys.0,
-                        heads,
-                        head_dim,
-                        top_k,
-                        ratio,
-                    )
+                    ops::attn::index_topk(&q, weights.as_ref(), keys, heads, head_dim, top_k, ratio)
                 })?,
             )
         },
@@ -1174,7 +1180,7 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let boundary_pos: Value = a.next()?;
             let boundary_req: Value = a.next()?;
-            let keys: Cache = a.next()?;
+            let keys: ValueId = a.next()?;
             let head_dim: u32 = a.next()?;
             let ratio: u32 = a.next()?;
             let dtype: Dtype = a.next()?;
@@ -1184,7 +1190,7 @@ pub(crate) static OPS: &[Op] = &[
                     ops::attn::index_block_mean(
                         &boundary_pos,
                         &boundary_req,
-                        keys.0,
+                        keys,
                         head_dim,
                         ratio,
                         dtype,
@@ -1199,13 +1205,13 @@ pub(crate) static OPS: &[Op] = &[
         params: &["k", "keys", "write_page", "write_offset"],
         call: |a, heap| {
             let k: Value = a.next()?;
-            let keys: Cache = a.next()?;
+            let keys: ValueId = a.next()?;
             let write_page: Value = a.next()?;
             let write_offset: Value = a.next()?;
             result(
                 heap,
                 dsl("attn.index_kv_append", || {
-                    ops::attn::index_kv_append(&k, keys.0, &write_page, &write_offset)
+                    ops::attn::index_kv_append(&k, keys, &write_page, &write_offset)
                 })?,
             )
         },
@@ -1257,7 +1263,7 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let boundary_pos: Value = a.next()?;
             let boundary_req: Value = a.next()?;
-            let pages: Cache = a.next()?;
+            let pages: ValueId = a.next()?;
             let ape: Option<Weight> = a.next()?;
             let head_dim: u32 = a.next()?;
             let ratio: u32 = a.next()?;
@@ -1268,7 +1274,7 @@ pub(crate) static OPS: &[Op] = &[
                     ops::attn::pool_gather(
                         &boundary_pos,
                         &boundary_req,
-                        pages.0,
+                        pages,
                         ape.as_ref(),
                         head_dim,
                         ratio,
@@ -1293,7 +1299,7 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let kv: Value = a.next()?;
             let score: Value = a.next()?;
-            let pages: Cache = a.next()?;
+            let pages: ValueId = a.next()?;
             let write_page: Value = a.next()?;
             let write_offset: Value = a.next()?;
             let head_dim: u32 = a.next()?;
@@ -1304,7 +1310,7 @@ pub(crate) static OPS: &[Op] = &[
                     ops::attn::pool_state_write(
                         &kv,
                         &score,
-                        pages.0,
+                        pages,
                         &write_page,
                         &write_offset,
                         head_dim,
@@ -1329,7 +1335,7 @@ pub(crate) static OPS: &[Op] = &[
             let entries: Value = a.next()?;
             let boundary_pos: Value = a.next()?;
             let boundary_req: Value = a.next()?;
-            let pool: Cache = a.next()?;
+            let pool: ValueId = a.next()?;
             let write_page: Value = a.next()?;
             let write_offset: Value = a.next()?;
             result(
@@ -1339,7 +1345,7 @@ pub(crate) static OPS: &[Op] = &[
                         &entries,
                         &boundary_pos,
                         &boundary_req,
-                        pool.0,
+                        pool,
                         &write_page,
                         &write_offset,
                     )
@@ -1364,7 +1370,7 @@ pub(crate) static OPS: &[Op] = &[
             let q: Value = a.next()?;
             let positions: Value = a.next()?;
             let request_of_token: Value = a.next()?;
-            let entries: Cache = a.next()?;
+            let entries: ValueId = a.next()?;
             let ratio: u32 = a.next()?;
             let heads: u32 = a.next()?;
             let head_dim: u32 = a.next()?;
@@ -1376,7 +1382,7 @@ pub(crate) static OPS: &[Op] = &[
                         &q,
                         &positions,
                         &request_of_token,
-                        entries.0,
+                        entries,
                         ratio,
                         heads,
                         head_dim,
@@ -1406,7 +1412,7 @@ pub(crate) static OPS: &[Op] = &[
             let positions: Value = a.next()?;
             let request_of_token: Value = a.next()?;
             let selection: Value = a.next()?;
-            let entries: Cache = a.next()?;
+            let entries: ValueId = a.next()?;
             let ratio: u32 = a.next()?;
             let top_k: u32 = a.next()?;
             let heads: u32 = a.next()?;
@@ -1420,7 +1426,7 @@ pub(crate) static OPS: &[Op] = &[
                         &positions,
                         &request_of_token,
                         &selection,
-                        entries.0,
+                        entries,
                         ratio,
                         top_k,
                         heads,
@@ -3307,19 +3313,6 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "spatial",
-        name: "grid",
-        params: &["grid", "rule"],
-        call: |a, heap| {
-            let grid: Value = a.next()?;
-            let rule: GridRule = a.next()?;
-            result(
-                heap,
-                dsl("spatial.grid", || ops::spatial::grid(&grid, rule))?,
-            )
-        },
-    },
-    Op {
-        module: "spatial",
         name: "conv3d",
         params: &["x", "grid", "w", "bias", "conv", "cache"],
         call: |a, heap| {
@@ -3328,11 +3321,11 @@ pub(crate) static OPS: &[Op] = &[
             let w: Weight = a.next()?;
             let bias: Option<Weight> = a.next()?;
             let conv: Conv = a.next()?;
-            let cache: Option<Cache> = a.next()?;
+            let cache: Option<ValueId> = a.next()?;
             result(
                 heap,
                 dsl("spatial.conv3d", || {
-                    ops::spatial::conv3d(&x, &grid, &w, bias.as_ref(), conv, cache.map(|c| c.0))
+                    ops::spatial::conv3d(&x, &grid, &w, bias.as_ref(), conv, cache)
                 })?,
             )
         },
@@ -3484,12 +3477,12 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let x: Value = a.next()?;
             let grid: Value = a.next()?;
-            let cache: Cache = a.next()?;
+            let cache: ValueId = a.next()?;
             let frames: u32 = a.next()?;
             result(
                 heap,
                 dsl("spatial.store_frames", || {
-                    ops::spatial::store_frames(&x, &grid, cache.0, frames)
+                    ops::spatial::store_frames(&x, &grid, cache, frames)
                 })?,
             )
         },
