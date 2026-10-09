@@ -133,13 +133,13 @@ fn the_merged_context_rows_and_the_f32_lane_chain_land_the_reference() {
             rig.publish(handles.instance, 2, &vec![0.0; rows * 2]);
         }
         let slot = 2 * req;
-        let mut text_lane = lane(slot, &t, LaneStream::Text, req);
+        let mut text_lane = lane(&rig, slot, &t, LaneStream::Text, req);
         for feed in &mut text_lane.ports {
             if feed.kind == engine::fire::PortKind::Latents {
                 feed.kind = engine::fire::PortKind::Context;
             }
         }
-        let mut image_lane = lane(slot + 1, &i, LaneStream::Image, req);
+        let mut image_lane = lane(&rig, slot + 1, &i, LaneStream::Image, req);
         for feed in &mut image_lane.ports {
             if feed.kind == engine::fire::PortKind::Latents {
                 feed.port = 0;

@@ -35,20 +35,6 @@ pub const MAX_DISTANCE: f32 = 128.0;
 pub const SM_SCALE: f32 = 0.125;
 pub const NAME: &str = "encoder-mini";
 
-thread_local! {
-    /// The facts of the trace this thread's rig loaded, which its lanes are
-    /// worded by.
-    static FACTS: std::cell::RefCell<poem_ir::Facts> = std::cell::RefCell::default();
-}
-
-pub fn classify(request: &Request) -> u64 {
-    FACTS.with(|facts| facts.borrow().word(request))
-}
-
-fn remember(trace: &Trace) {
-    FACTS.with(|facts| *facts.borrow_mut() = trace.facts.clone());
-}
-
 pub struct EncoderLayer;
 
 impl ForwardHybrid for EncoderLayer {
@@ -307,6 +293,7 @@ pub struct LaneHandles {
 pub struct Rig {
     pub engine: engine_cuda::Cuda,
     pub loaded: Loaded,
+    pub facts: poem_ir::Facts,
     pub programs: BTreeMap<u32, u64>,
     next_channel: u64,
     _dir: tempfile::TempDir,
@@ -321,13 +308,11 @@ impl Rig {
             ..engine_cuda::DeviceBoot::default()
         };
         let mut engine = engine_cuda::open(boot, contract_for).expect("the engine opens");
+        let trace = trace();
+        let facts = trace.facts.clone();
         let loaded = engine
             .load(LoadRequest {
-                trace: {
-                    let trace = trace();
-                    remember(&trace);
-                    trace
-                },
+                trace,
                 checkpoint: Checkpoint::Path(path.clone()),
                 budgets: Budgets {
                     max_lanes: 8,
@@ -351,6 +336,7 @@ impl Rig {
         Rig {
             engine,
             loaded,
+            facts,
             programs: BTreeMap::new(),
             next_channel: 1,
             _dir: dir,
@@ -441,10 +427,10 @@ impl Rig {
     }
 }
 
-pub fn lane(slot: u32, handles: &LaneHandles, group: u32) -> Lane {
+pub fn lane(rig: &Rig, slot: u32, handles: &LaneHandles, group: u32) -> Lane {
     Lane {
         slot,
-        word: classify(&Request::new(handles.rows, false)),
+        word: rig.facts.word(&Request::new(handles.rows, false)),
         tokens: vec![0; handles.rows as usize],
         readout: Readout::Rows((0..handles.rows).collect()),
         stream: LaneStream::Text,

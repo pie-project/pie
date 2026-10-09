@@ -20,7 +20,7 @@ fn a_missing_feed_and_a_wrong_cell_are_refused_by_name() {
     rig.publish(handles.instance, 1, &[0.3]);
     rig.publish(handles.instance, 2, &vec![0.0; rows as usize * 2]);
 
-    let mut bare = lane(0, &handles, LaneStream::Text, 0);
+    let mut bare = lane(&rig, 0, &handles, LaneStream::Text, 0);
     bare.ports.retain(|feed| feed.kind != PortKind::Latents);
     let refusal = rig
         .engine
@@ -36,7 +36,7 @@ fn a_missing_feed_and_a_wrong_cell_are_refused_by_name() {
     rig.publish(wide.instance, 0, &vec![0.0; (rows as usize + 1) * w]);
     rig.publish(wide.instance, 1, &[0.3]);
     rig.publish(wide.instance, 2, &vec![0.0; (rows as usize + 1) * 2]);
-    let mut short = lane(0, &wide, LaneStream::Text, 0);
+    let mut short = lane(&rig, 0, &wide, LaneStream::Text, 0);
     short.tokens = vec![0; rows as usize];
     short.readout = engine::fire::Readout::Rows((0..rows).collect());
     let refusal = rig
@@ -51,7 +51,7 @@ fn a_missing_feed_and_a_wrong_cell_are_refused_by_name() {
         "the refusal names the port and the shapes: {refusal}"
     );
 
-    let mut stray = lane(0, &handles, LaneStream::Text, 0);
+    let mut stray = lane(&rig, 0, &handles, LaneStream::Text, 0);
     rig.publish(handles.instance, 0, &vec![0.0; rows as usize * w]);
     stray.ports.push(engine::fire::PortFeed {
         kind: PortKind::Context,

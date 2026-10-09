@@ -47,7 +47,6 @@ pub const NAME: &str = "dit-mini";
 pub const C_IN: u32 = 8;
 pub const C_OUT: u32 = 4;
 pub const TAPS: u32 = 27;
-pub const VAE_READING: u8 = 1;
 
 /// Whether a PJRT plugin is here to run on; device gates skip otherwise.
 #[must_use]
@@ -82,20 +81,6 @@ pub fn device() -> Option<engine_xla::bench::DeviceLock> {
 }
 
 // ------------------------------------------------------------ the DiT block
-
-thread_local! {
-    /// The facts of the trace this thread's rig loaded, which its lanes are
-    /// worded by.
-    static FACTS: std::cell::RefCell<poem_ir::Facts> = std::cell::RefCell::default();
-}
-
-pub fn classify(request: &Request) -> u64 {
-    FACTS.with(|facts| facts.borrow().word(request))
-}
-
-fn remember(trace: &Trace) {
-    FACTS.with(|facts| *facts.borrow_mut() = trace.facts.clone());
-}
 
 pub struct DoubleBlock;
 
@@ -189,18 +174,6 @@ pub fn trace() -> Trace {
 }
 
 // ------------------------------------------------------------ the two-axis plan
-
-/// The word of a lane of the two-axis plan running `reading` (1 is the VAE).
-#[must_use]
-pub fn vae_word(reading: u8) -> u64 {
-    let request = Request::new(1, false);
-    let request = if reading == VAE_READING {
-        request.in_reading("vae")
-    } else {
-        request
-    };
-    two_axis().facts.word(&request)
-}
 
 pub struct TwoAxis;
 
@@ -560,6 +533,7 @@ pub struct LaneHandles {
 pub struct Rig {
     pub engine: Xla,
     pub loaded: Loaded,
+    pub facts: poem_ir::Facts,
     programs: BTreeMap<u32, u64>,
     next_channel: u64,
     dir: PathBuf,
@@ -591,12 +565,10 @@ impl Rig {
         let path = dir.join("weights.zt");
         weights.write(&path);
         let mut engine = Xla::new(DeviceBoot::default(), contract_for);
+        let facts = plan.facts.clone();
         let loaded = engine
             .load(LoadRequest {
-                trace: {
-                    remember(&plan);
-                    plan
-                },
+                trace: plan,
                 checkpoint: Checkpoint::Path(path),
                 budgets: Budgets {
                     max_lanes: 8,
@@ -620,6 +592,7 @@ impl Rig {
         Rig {
             engine,
             loaded,
+            facts,
             programs: BTreeMap::new(),
             next_channel: 1,
             dir,
@@ -628,6 +601,17 @@ impl Rig {
 
     pub fn profile(&self) -> &ModelProfile {
         &self.loaded.caps.profile
+    }
+
+    /// The word of a one-row lane running `reading`, or the plan's token
+    /// reading when `None`.
+    #[must_use]
+    pub fn word(&self, reading: Option<&str>) -> u64 {
+        let request = Request::new(1, false);
+        self.facts.word(&match reading {
+            Some(reading) => request.in_reading(reading),
+            None => request,
+        })
     }
 
     pub fn register(&mut self, container: TraceContainer) -> u64 {
@@ -759,17 +743,19 @@ impl Rig {
 
 /// A double-block lane: its stream's latent port, the timestep and the
 /// positions, in attention group `group`.
-pub fn lane(slot: u32, handles: &LaneHandles, stream: LaneStream, group: u32) -> Lane {
+pub fn lane(rig: &Rig, slot: u32, handles: &LaneHandles, stream: LaneStream, group: u32) -> Lane {
     let port = match stream {
         LaneStream::Text => 0,
         _ => 1,
     };
     Lane {
         slot,
-        word: classify(&Request::new(handles.rows, false).on_stream(match stream {
-            LaneStream::Text => Stream::Text,
-            _ => Stream::Image,
-        })),
+        word: rig
+            .facts
+            .word(&Request::new(handles.rows, false).on_stream(match stream {
+                LaneStream::Text => Stream::Text,
+                _ => Stream::Image,
+            })),
         tokens: vec![0; handles.rows as usize],
         readout: Readout::Rows((0..handles.rows).collect()),
         stream,

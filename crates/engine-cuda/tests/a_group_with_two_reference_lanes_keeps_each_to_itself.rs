@@ -245,8 +245,8 @@ fn each_reference_lane_attends_itself_and_the_rest_see_everything() {
             (false, true) => LaneStream::Reference,
             (false, false) => LaneStream::Image,
         };
-        let mut submitted = lane(slot as u32, &handles, stream, 0);
-        submitted.word = common_dit::classify(
+        let mut submitted = lane(&rig, slot as u32, &handles, stream, 0);
+        submitted.word = rig.facts.word(
             &poem::Request::new(lane_host.count as u32, false).on_stream(match stream {
                 LaneStream::Text => Stream::Text,
                 LaneStream::Reference => Stream::Reference,

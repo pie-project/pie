@@ -73,8 +73,8 @@ fn the_second_fire_lands_the_second_cells() {
         rig.publish(text.instance, 0, &req.text);
         rig.publish(image.instance, 0, &req.image);
         let lanes = vec![
-            lane(0, &text, LaneStream::Text, 0),
-            lane(1, &image, LaneStream::Image, 0),
+            lane(&rig, 0, &text, LaneStream::Text, 0),
+            lane(&rig, 1, &image, LaneStream::Image, 0),
         ];
         let attachments = vec![attach(0, &text), attach(1, &image)];
         let mut ticket = rig

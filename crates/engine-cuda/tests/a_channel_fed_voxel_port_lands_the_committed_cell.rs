@@ -4,7 +4,7 @@ mod common_two_axis;
 
 use common_two_axis::{
     C_IN, C_OUT, Lcg, Rig, Weights, assert_close, attach, bf, conv_reference, frame,
-    pixel_epilogue, trace, vae_lane,
+    pixel_epilogue, trace,
 };
 use engine::Engine;
 use engine::fire::{ReadoutSeam, StepVoxels};
@@ -50,7 +50,7 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
         let mut ticket = rig
             .engine
             .submit(&frame(
-                vec![vae_lane(0, cell)],
+                vec![rig.vae_lane(0, cell)],
                 vec![attach(0, instance)],
                 vec![StepVoxels {
                     lane: 0,

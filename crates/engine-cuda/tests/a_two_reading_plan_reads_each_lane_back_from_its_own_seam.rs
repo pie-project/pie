@@ -182,8 +182,8 @@ fn each_lane_reads_back_its_own_arms_seam() {
     rig.publish(i.instance, 0, &image);
     rig.publish(i.instance, 1, &[timestep]);
 
-    let mut text_lane = lane(0, &t, LaneStream::Text, 0);
-    let mut image_lane = lane(1, &i, LaneStream::Image, 1);
+    let mut text_lane = lane(&rig, 0, &t, LaneStream::Text, 0);
+    let mut image_lane = lane(&rig, 1, &i, LaneStream::Image, 1);
     for lane in [&mut text_lane, &mut image_lane] {
         lane.ports.retain(|f| f.kind != PortKind::AxisPositions);
     }

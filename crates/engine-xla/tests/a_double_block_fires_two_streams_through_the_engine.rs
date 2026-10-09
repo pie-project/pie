@@ -106,13 +106,13 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
         // Request 0 submits its image lane first: the packing, not the
         // submission order, puts a group's rows together.
         if at == 0 {
-            lanes.push(lane(slot, &image, LaneStream::Image, at as u32));
-            lanes.push(lane(slot + 1, &text, LaneStream::Text, at as u32));
+            lanes.push(lane(&rig, slot, &image, LaneStream::Image, at as u32));
+            lanes.push(lane(&rig, slot + 1, &text, LaneStream::Text, at as u32));
             attachments.push(attach(lanes.len() as u32 - 2, image.instance));
             attachments.push(attach(lanes.len() as u32 - 1, text.instance));
         } else {
-            lanes.push(lane(slot, &text, LaneStream::Text, at as u32));
-            lanes.push(lane(slot + 1, &image, LaneStream::Image, at as u32));
+            lanes.push(lane(&rig, slot, &text, LaneStream::Text, at as u32));
+            lanes.push(lane(&rig, slot + 1, &image, LaneStream::Image, at as u32));
             attachments.push(attach(lanes.len() as u32 - 2, text.instance));
             attachments.push(attach(lanes.len() as u32 - 1, image.instance));
         }

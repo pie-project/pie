@@ -29,7 +29,7 @@ fn fire_and_compare(graphs: Graphs) {
     for (at, (&n, x)) in ROWS.iter().zip(&inputs).enumerate() {
         let handles = rig.lane(n as u32);
         rig.publish(handles.instance, 0, x);
-        lanes.push(lane(at as u32, &handles, at as u32));
+        lanes.push(lane(&rig, at as u32, &handles, at as u32));
         attachments.push(attach(at as u32, &handles));
     }
     let mut ticket = rig

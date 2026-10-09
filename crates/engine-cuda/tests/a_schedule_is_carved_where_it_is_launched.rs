@@ -139,7 +139,7 @@ fn the_token_reading_fires_alone() {
         .collect();
     rig.publish(handles.instance, 0, &cell);
 
-    let mut text = lane(0, &handles, LaneStream::Text, 0);
+    let mut text = lane(&rig, 0, &handles, LaneStream::Text, 0);
     text.tokens = (0..TEXT_ROWS).map(|r| r % VOCAB).collect();
     text.ports.clear();
 
