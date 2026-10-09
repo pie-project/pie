@@ -380,7 +380,7 @@ class Chat:
         # Claude's input style: a thin grey rule above and below, the ❯ prompt, no side borders
         rule = Window(height=1, char="─", style="class:rule")
         prompt = Window(
-            content=FormattedTextControl(lambda: [("class:accent bold", "❯ ")]),
+            content=FormattedTextControl(lambda: [("fg:#ffffff bold", "❯ ")]),
             width=2,
             dont_extend_width=True,
         )
