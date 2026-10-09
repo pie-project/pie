@@ -33,7 +33,7 @@ enum Kind {
 /// and an op that reads a bound value is one of that value's readers.
 #[derive(Clone, Copy)]
 enum Step {
-    Anchor(usize),
+    Anchor,
     Defines(usize, ValueId),
     Reads(usize, ValueId),
 }
@@ -56,7 +56,7 @@ impl Shape {
                 }
             })
             .collect();
-        let mut steps = vec![Step::Anchor(0)];
+        let mut steps = vec![Step::Anchor];
         let mut placed = vec![false; trace.nodes.len()];
         placed[0] = true;
         let mut bound = BTreeSet::new();
@@ -83,7 +83,9 @@ impl Shape {
                         })
                 })
                 .expect("a pattern's ops are connected through the values they share");
-            let (Step::Defines(p, _) | Step::Reads(p, _) | Step::Anchor(p)) = next;
+            let (Step::Defines(p, _) | Step::Reads(p, _)) = next else {
+                unreachable!("only the first op anchors")
+            };
             placed[p] = true;
             operands(&trace.nodes[p].op, &mut bound);
             steps.push(next);
@@ -154,7 +156,7 @@ impl Uses {
 pub(super) struct Binding {
     pub(super) values: Vec<Option<ValueId>>,
     pub(super) attrs: Vec<Option<Tree>>,
-    pub(super) nodes: Vec<Option<usize>>,
+    nodes: Vec<Option<usize>>,
 }
 
 /// Every match of `rule` replaced by its fused op, scanning the trace in order
@@ -225,7 +227,7 @@ fn extend(
         return done(&binding);
     };
     let (p, candidates): (usize, Vec<usize>) = match how {
-        Step::Anchor(p) => (p, vec![anchor]),
+        Step::Anchor => (0, vec![anchor]),
         Step::Defines(p, v) => {
             let bound = binding.values[v.0 as usize].expect("a step follows a bound value");
             match trace.values[bound.0 as usize].def {

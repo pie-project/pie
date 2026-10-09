@@ -8,6 +8,8 @@ use poem_ir::{Dim, Dtype, Elementwise, Fused, ModulateForm, NormKind, Operation,
 
 use super::Rule;
 
+/// A placeholder width for pattern holes; the matcher compares op fields, not
+/// the types of the values they hold.
 const W: u64 = 64;
 
 pub(super) fn all() -> Vec<Rule> {
@@ -65,13 +67,7 @@ fn qkv_qknorm_rope_vnorm_write() -> Rule {
     let rope = |partial: bool| {
         template(move |p| {
             let packed = p.rows("packed", 3 * W);
-            let positions = p.value(
-                "positions",
-                Ty::Tensor {
-                    shape: vec![Dim::Tokens],
-                    dtype: Dtype::I32,
-                },
-            );
+            let positions = p.indices("positions");
             let (d, eps, theta) = (p.u32("d"), p.f32("eps"), p.f32("theta"));
             let (q, k, v) = layout::split_qkv(&packed, p.u32("q_width"), p.u32("kv_width"));
             let v = elemwise::rmsnorm_no_scale(&v, d, eps);
@@ -143,14 +139,10 @@ fn rmsnorm_residual_add() -> Rule {
             }
         })
     };
-    let mut alternatives = Vec::new();
-    for scaled in [true, false] {
-        for post in [Some(Norm::Plain), Some(Norm::PlusOne)] {
-            alternatives.push(chain(scaled, post));
-        }
-    }
-    alternatives.push(chain(true, None));
-    alternatives.push(chain(false, None));
+    let alternatives = [true, false]
+        .into_iter()
+        .flat_map(|scaled| Norm::BOTH.map(|post| chain(scaled, Some(post))))
+        .chain([chain(true, None), chain(false, None)]);
     Rule::new("elementwise.rmsnorm_residual_add", alternatives, |m| {
         Fused::RmsnormResidualAdd {
             x: m.value("x"),
@@ -175,13 +167,7 @@ fn rmsnorm_residual_add() -> Rule {
 /// `select` names the stacked row the stream is read from.
 fn embed_chain(select: bool) -> Template {
     template(|p| {
-        let ids = p.value(
-            "ids",
-            Ty::Tensor {
-                shape: vec![Dim::Tokens],
-                dtype: Dtype::I32,
-            },
-        );
+        let ids = p.indices("ids");
         let e = layout::embed(&ids, &p.weight("table", [W, W]), p.u32("vocab"));
         p.export("e", &e);
         let e_scaled = elemwise::mul_scalar(p.f32("embed_scale"), &e);
@@ -352,8 +338,9 @@ fn modulate_form(op: &Operation) -> ModulateForm {
     }
 }
 
-/// The per-row (or, through `lanes`, per-lane) vectors a modulation reads.
-fn modulation_inputs(p: &Pattern, per_lane: bool) -> (poem::Value, Option<poem::Value>) {
+/// The per-row (or, through `lanes`, per-lane) vectors a modulation reads,
+/// and the rows they are per.
+fn modulation_inputs(p: &Pattern, per_lane: bool) -> (poem::Value, Option<poem::Value>, Dim) {
     let rows = if per_lane { Dim::Lanes } else { Dim::Tokens };
     let m = p.value(
         "m",
@@ -362,24 +349,15 @@ fn modulation_inputs(p: &Pattern, per_lane: bool) -> (poem::Value, Option<poem::
             dtype: Dtype::Bf16,
         },
     );
-    let lanes = per_lane.then(|| {
-        p.value(
-            "lanes",
-            Ty::Tensor {
-                shape: vec![Dim::Tokens],
-                dtype: Dtype::I32,
-            },
-        )
-    });
-    (m, lanes)
+    let lanes = per_lane.then(|| p.indices("lanes"));
+    (m, lanes, rows)
 }
 
 /// A gated residual add, normed without a scale and modulated.
 fn gated_residual_norm_modulate() -> Rule {
     let chain = |norm: ScaleFree, per_lane: bool| {
         template(move |p| {
-            let (m, lanes) = modulation_inputs(p, per_lane);
-            let rows = if per_lane { Dim::Lanes } else { Dim::Tokens };
+            let (m, lanes, rows) = modulation_inputs(p, per_lane);
             let g = p.value(
                 "g",
                 Ty::Tensor {
@@ -422,7 +400,7 @@ fn gated_residual_norm_modulate() -> Rule {
 fn norm_modulate() -> Rule {
     let pair = |norm: ScaleFree, per_lane: bool| {
         template(move |p| {
-            let (m, lanes) = modulation_inputs(p, per_lane);
+            let (m, lanes, _) = modulation_inputs(p, per_lane);
             let normed = norm.apply(p, &p.rows("x", W));
             p.export("normed", &normed);
             p.free("form");
@@ -449,13 +427,7 @@ fn norm_modulate() -> Rule {
 /// A per-head norm of q, rotated.
 fn rmsnorm_rope_partial_q() -> Rule {
     let pattern = template(|p| {
-        let positions = p.value(
-            "positions",
-            Ty::Tensor {
-                shape: vec![Dim::Tokens],
-                dtype: Dtype::I32,
-            },
-        );
+        let positions = p.indices("positions");
         let d = p.u32("head_dim");
         let y =
             elemwise::rmsnorm_per_head(&p.rows("x", W), &p.weight("weight", [W]), d, p.f32("eps"));

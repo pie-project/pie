@@ -80,6 +80,17 @@ impl Pattern {
         )
     }
 
+    /// A hole of one i32 per row: positions, token ids, a row's lane.
+    pub fn indices(&self, name: &'static str) -> Value {
+        self.value(
+            name,
+            Ty::Tensor {
+                shape: vec![Dim::Tokens],
+                dtype: Dtype::I32,
+            },
+        )
+    }
+
     /// A hole that matches only a weight.
     pub fn weight(&self, name: &'static str, shape: impl IntoIterator<Item = u64>) -> Weight {
         let w = Weight::sym(format!("pattern.{name}"), shape, Dtype::Bf16);

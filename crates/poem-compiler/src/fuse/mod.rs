@@ -15,8 +15,8 @@ use poem_ir::{Dim, Dtype, Fused, Operation, Trace, Ty, ValueId};
 
 use search::{Binding, Shape};
 
-pub struct Rule {
-    pub kernel: &'static str,
+struct Rule {
+    kernel: &'static str,
     shapes: Vec<Shape>,
     when: fn(&Match) -> bool,
     replace: fn(&Match) -> Fused,
@@ -47,7 +47,7 @@ impl Rule {
 
 /// One match of a rule's pattern, as the replacement reads it: the trace's
 /// values and ops bound to the pattern's names.
-pub struct Match<'a> {
+struct Match<'a> {
     trace: &'a Trace,
     shape: &'a Shape,
     binding: &'a Binding,
@@ -55,21 +55,18 @@ pub struct Match<'a> {
 
 impl Match<'_> {
     /// The trace value bound to `name`, if this alternative names it.
-    #[must_use]
-    pub fn get(&self, name: &str) -> Option<ValueId> {
+    fn get(&self, name: &str) -> Option<ValueId> {
         let p = self.shape.template.value(name)?;
         self.binding.values[p.0 as usize]
     }
 
-    #[must_use]
-    pub fn value(&self, name: &str) -> ValueId {
+    fn value(&self, name: &str) -> ValueId {
         self.get(name)
             .unwrap_or_else(|| panic!("the pattern binds no value `{name}`"))
     }
 
     /// The op that computes the value bound to `name`.
-    #[must_use]
-    pub fn op(&self, name: &str) -> &Operation {
+    fn op(&self, name: &str) -> &Operation {
         let v = self.value(name);
         match self.trace.values[v.0 as usize].def {
             poem_ir::Def::Op(i) => &self.trace.nodes[i as usize].op,
@@ -87,22 +84,19 @@ impl Match<'_> {
         self.binding.attrs[at].as_ref()
     }
 
-    #[must_use]
-    pub fn f32(&self, name: &str) -> f32 {
+    fn f32(&self, name: &str) -> f32 {
         match self.attr(name) {
             Some(crate::tree::Tree::F32(bits)) => f32::from_bits(*bits),
             other => panic!("`{name}` binds {other:?}, not an f32"),
         }
     }
 
-    #[must_use]
-    pub fn u32(&self, name: &str) -> u32 {
+    fn u32(&self, name: &str) -> u32 {
         self.get_u32(name)
             .unwrap_or_else(|| panic!("the pattern binds no u32 `{name}`"))
     }
 
-    #[must_use]
-    pub fn get_u32(&self, name: &str) -> Option<u32> {
+    fn get_u32(&self, name: &str) -> Option<u32> {
         match self.attr(name)? {
             crate::tree::Tree::Int(n) => u32::try_from(*n).ok(),
             _ => None,
@@ -113,8 +107,7 @@ impl Match<'_> {
         &self.trace.values[self.value(name).0 as usize].ty
     }
 
-    #[must_use]
-    pub fn width(&self, name: &str) -> Option<u64> {
+    fn width(&self, name: &str) -> Option<u64> {
         match self.ty(name) {
             Ty::Tensor { shape, .. } => match shape.last() {
                 Some(Dim::Const(width)) => Some(*width),
@@ -124,8 +117,7 @@ impl Match<'_> {
         }
     }
 
-    #[must_use]
-    pub fn dtype(&self, name: &str) -> Option<Dtype> {
+    fn dtype(&self, name: &str) -> Option<Dtype> {
         match self.ty(name) {
             Ty::Tensor { dtype, .. } => Some(*dtype),
             Ty::Struct(_) => None,
