@@ -36,6 +36,26 @@ pub fn op(tree: Tree) -> Operation {
     Operation::deserialize(De(tree)).expect("a tree read back is the op it was taken from")
 }
 
+/// The fields of the struct an op's family and variant wrap; none for a
+/// variant without fields.
+#[must_use]
+pub fn fields(tree: &Tree) -> &[(&'static str, Tree)] {
+    match tree {
+        Tree::Variant(_, inner) => fields(inner),
+        Tree::Struct(fields) => fields,
+        _ => &[],
+    }
+}
+
+/// The field `name` of an op's struct.
+#[must_use]
+pub fn field<'t>(tree: &'t Tree, name: &str) -> Option<&'t Tree> {
+    fields(tree)
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, t)| t)
+}
+
 /// The fields of the struct an op's family and variant wrap.
 pub fn fields_mut(tree: &mut Tree) -> &mut Vec<(&'static str, Tree)> {
     match tree {
@@ -63,7 +83,9 @@ pub fn remap(op: &Operation, f: &impl Fn(ValueId) -> ValueId) -> Operation {
         .expect("a renumbered op reads back as the op it was")
 }
 
-fn renumbered(tree: Tree, f: &impl Fn(ValueId) -> ValueId) -> Tree {
+/// `tree` with every value renumbered by `f`.
+#[must_use]
+pub fn renumbered(tree: Tree, f: &impl Fn(ValueId) -> ValueId) -> Tree {
     match tree {
         Tree::Id(id) => Tree::Id(f(ValueId(id)).0),
         Tree::Some(inner) => Tree::Some(Box::new(renumbered(*inner, f))),

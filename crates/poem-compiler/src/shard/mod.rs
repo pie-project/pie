@@ -7,10 +7,10 @@
 //! a partial sum each rank holds a term of. A block of heads fewer than the
 //! ranks is cut once per head, each head then held by a group of ranks in a
 //! row (the kv heads of grouped-query attention, whose query heads the ranks
-//! split one more level). An op's rule (`rules.rs`) says
-//! which of these it takes and what it yields; a partial or split value that
-//! reaches an op wanting it whole is all-reduced or all-gathered right after
-//! the op that made it.
+//! split one more level). An op's rule (`rules.rs`) says which of these it
+//! takes and what it yields; a partial or split value that reaches an op
+//! wanting it whole is all-reduced or all-gathered right after the op that
+//! made it.
 
 mod rules;
 #[cfg(test)]
@@ -30,9 +30,12 @@ pub struct Unshardable {
     pub why: String,
 }
 
-/// The seams the runtime reads a model's answer from, which every rank holds
-/// whole; the rest are taps a rank reads its own share of.
-const OUTPUTS: &[&str] = &["out", "mtp", "mtp.drafts", "velocity", "hidden", "pixels"];
+/// Whether the runtime reads a model's answer from `seam`, which every rank
+/// then holds whole: every export but the attention scores, a tap each rank
+/// reads its own share of like the other seams.
+fn output(seam: &str) -> bool {
+    seam != poem::seam::SCORES.name && crate::EXPORT_SEAMS.contains(&seam)
+}
 
 /// How the ranks hold a value.
 #[derive(Clone, Debug, PartialEq)]
@@ -54,17 +57,12 @@ struct Block {
 }
 
 impl Dist {
-    /// Split into blocks of `widths`, each cut once per rank.
-    fn even(widths: &[u64], world: u32) -> Dist {
-        Dist::Split(
-            widths
-                .iter()
-                .map(|width| Block {
-                    width: *width,
-                    parts: u64::from(world),
-                })
-                .collect(),
-        )
+    /// Split as one block `width` wide, cut once per rank.
+    fn even(width: u64, world: u32) -> Dist {
+        Dist::Split(vec![Block {
+            width,
+            parts: u64::from(world),
+        }])
     }
 
     /// Whether every block is cut once per rank.
@@ -130,9 +128,9 @@ impl Pass {
         for s in 0..self.trace.seams.len() {
             for v in 0..self.trace.seams[s].values.len() {
                 let id = self.trace.seams[s].values[v];
-                let output = OUTPUTS.contains(&self.trace.seams[s].seam.as_str());
+                let answer = output(&self.trace.seams[s].seam);
                 let held = self.dist(id)?;
-                if held == Dist::Partial || output && held != Dist::Whole {
+                if held == Dist::Partial || answer && held != Dist::Whole {
                     self.trace.seams[s].values[v] = self.whole(id)?;
                 }
             }
