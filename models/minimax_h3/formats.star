@@ -3,6 +3,9 @@
 # bare transformer state_dict. The fused qkv interleaves q, k and v head by
 # head, and the adaLN projections' slices come in another order.
 
+load("//lib/diffusion/formats.star", "adaln_order", "biased", "reordered")
+load("//lib/qwen3_text/formats.star", te_read = "read")
+
 ADALN_SLICES = 6
 PIPELINE = "a MiniMax H3 partition (`dit.`/`te.` prefixes)"
 BARE = "a bare transformer state_dict"
@@ -11,22 +14,18 @@ def formats(m):
     out = [format(
         PIPELINE,
         recognizes = lambda checkpoint: has_prefix("dit."),
-        read = lambda reads: read(m, reads, "dit.", "te.model.language_model."),
+        read = lambda reads: read(m, reads, "dit."),
     )]
     if m.te == None:
         out.append(format(
             BARE,
             recognizes = lambda checkpoint: not has_prefix("dit."),
-            read = lambda reads: read(m, reads, "", None),
+            read = lambda reads: read(m, reads, ""),
         ))
     return out
 
-def biased(reads, w, stem):
-    reads.read(w.w, stem + ".weight")
-    reads.read(w.bias, stem + ".bias")
-
-def pairs(reads, w, stem, order, block):
-    rows = lambda e: concat(0, [e.slice(0, s * block, block) for s in order])
+def modulation(reads, w, stem, order, width):
+    rows = lambda e: reordered(e, order, width)
     reads.read_over(w.w, stem + ".weight", rows)
     reads.read_over(w.bias, stem + ".bias", rows)
 
@@ -49,14 +48,17 @@ def attention(reads, m, a, stem):
     reads.read(a.k_norm, stem + ".k_norm.weight")
     reads.read(a.out, stem + ".out_proj.weight")
 
-def feedforward(reads, f, stem):
-    reads.read(f.fc1, stem + ".fc1.weight")
-    reads.read(f.fc2, stem + ".fc2.weight")
+def block(reads, m, b, stem):
+    reads.read(b.norm1, stem + ".norm1.weight")
+    reads.read(b.norm2, stem + ".norm2.weight")
+    attention(reads, m, b.attn, stem + ".attn")
+    reads.read(b.mlp.fc1, stem + ".mlp.fc1.weight")
+    reads.read(b.mlp.fc2, stem + ".mlp.fc2.weight")
 
-def read(m, reads, dit_prefix, te_prefix):
+def read(m, reads, prefix):
     d = m.dims
     dit = m.dit
-    at = lambda tail: dit_prefix + tail
+    at = lambda tail: prefix + tail
 
     biased(reads, dit.video_patch, at("video_patch_proj"))
     biased(reads, dit.audio_patch, at("audio_patch_proj"))
@@ -64,45 +66,22 @@ def read(m, reads, dit_prefix, te_prefix):
     biased(reads, dit.t_in, at("time_embedder.proj_in"))
     biased(reads, dit.t_out, at("time_embedder.proj_out"))
 
-    for i, block in enumerate(dit.refine):
-        stem = at("token_refiner.blocks.{}".format(i))
-        reads.read(block.norm1, stem + ".norm1.weight")
-        reads.read(block.norm2, stem + ".norm2.weight")
-        attention(reads, m, block.attn, stem + ".attn")
-        feedforward(reads, block.mlp, stem + ".mlp")
+    for i, b in enumerate(dit.refine):
+        block(reads, m, b, at("token_refiner.blocks.{}".format(i)))
     reads.read(dit.refine_norm, at("token_refiner.final_norm.weight"))
 
-    for i, block in enumerate(dit.blocks):
+    for i, b in enumerate(dit.blocks):
         stem = at("blocks.{}".format(i))
-        reads.read(block.norm1, stem + ".norm1.weight")
-        reads.read(block.norm2, stem + ".norm2.weight")
-        attention(reads, m, block.attn, stem + ".attn")
-        feedforward(reads, block.mlp, stem + ".mlp")
-        bank = stem + ".adaln_proj.linear"
-        for k, w in enumerate(block.adaln):
+        block(reads, m, b, stem)
+        for k, w in enumerate(b.adaln):
             base = k * ADALN_SLICES
-            pairs(reads, w, bank, [base + 1, base, base + 2, base + 4, base + 3, base + 5], d.dim)
+            order = [base + s for s in adaln_order(ADALN_SLICES)]
+            modulation(reads, w, stem + ".adaln_proj.linear", order, d.dim)
 
     reads.read(dit.final_norm, at("final_layer.norm.weight"))
-    pairs(reads, dit.final_adaln, at("final_layer.adaln_proj.linear"), [1, 0], d.dim)
+    modulation(reads, dit.final_adaln, at("final_layer.adaln_proj.linear"), adaln_order(2), d.dim)
     biased(reads, dit.video_out, at("final_layer.video_out"))
     biased(reads, dit.audio_out, at("final_layer.audio_out"))
 
-    te = m.te
-    if te == None:
-        return
-    if te_prefix == None:
-        fail("`te.embed_tokens.weight`: {} carries no text encoder, and this row declares one".format(BARE))
-    reads.read(te.embed, te_prefix + "embed_tokens.weight")
-    for l, w in enumerate(te.layers):
-        n = lambda s: "{}layers.{}.{}".format(te_prefix, l, s)
-        reads.read(w.attn_norm, n("input_layernorm.weight"))
-        reads.read(w.q, n("self_attn.q_proj.weight"))
-        reads.read(w.k, n("self_attn.k_proj.weight"))
-        reads.read(w.v, n("self_attn.v_proj.weight"))
-        reads.read(w.o, n("self_attn.o_proj.weight"))
-        reads.read(w.q_norm, n("self_attn.q_norm.weight"))
-        reads.read(w.k_norm, n("self_attn.k_norm.weight"))
-        reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
-        reads.read_concat(w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
-        reads.read(w.down, n("mlp.down_proj.weight"))
+    if m.te != None:
+        te_read(reads, m.te, "te.model.language_model.")

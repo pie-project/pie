@@ -2,6 +2,9 @@
 # embedder, caption refiner, blocks (each with an adaLN projection per
 # modality) and output heads; and the text encoder the full model carries.
 
+load("//lib/diffusion/model.star", "linear")
+load("//lib/qwen3_text/model.star", "encoder")
+
 LATENT_CHANNELS = 24
 AUDIO_CHANNELS = 32
 PATCH_T = 1
@@ -29,8 +32,8 @@ TE = struct(
     inter = 25600,
     theta = 5000000.0,
     eps = 1e-6,
-    layers = 50,
 )
+TE_LAYERS = 50
 
 DIMS = {
     "minimax-h3-fl2va": struct(
@@ -61,12 +64,6 @@ DIMS = {
     ),
 }
 
-def linear(name, out, in_, banks):
-    return struct(
-        w = weight(name, [out, in_], banks),
-        bias = weight(name + ".bias", [out], compute(banks)),
-    )
-
 def attn(prefix, d, banks):
     dense = compute(banks)
     inner = d.heads * d.head_dim
@@ -83,16 +80,9 @@ def mlp(prefix, d, banks):
         fc2 = weight(prefix + ".fc2", [d.dim, d.inter], banks),
     )
 
-def refiner(prefix, d, banks):
-    dense = compute(banks)
-    return struct(
-        norm1 = weight(prefix + ".norm1", [d.dim], dense),
-        norm2 = weight(prefix + ".norm2", [d.dim], dense),
-        attn = attn(prefix + ".attn", d, banks),
-        mlp = mlp(prefix + ".mlp", d, banks),
-    )
-
-def block(prefix, d, banks):
+def block(prefix, d, banks, modulated):
+    """A refiner block, or (`modulated`) a denoiser block with an adaLN
+    projection per modality."""
     dense = compute(banks)
     return struct(
         norm1 = weight(prefix + ".norm1", [d.dim], dense),
@@ -102,41 +92,7 @@ def block(prefix, d, banks):
         adaln = [
             linear("{}.adaln.{}".format(prefix, m), ADALN_SLICES * d.dim, d.t_dim, banks)
             for m in range(MODALITIES)
-        ],
-    )
-
-def text_encoder(banks):
-    dense = compute(banks)
-    hidden, hd, inter = TE.hidden, TE.head_dim, TE.inter
-
-    def layer(l):
-        n = lambda s: "te.layer.{}.{}".format(l, s)
-        return struct(
-            attn_norm = weight(n("attn_norm"), [hidden], dense),
-            q = weight(n("q"), [TE.q_heads * hd, hidden], banks).columns(),
-            k = weight(n("k"), [TE.kv_heads * hd, hidden], banks).columns(heads = TE.kv_heads),
-            v = weight(n("v"), [TE.kv_heads * hd, hidden], banks).columns(heads = TE.kv_heads),
-            o = weight(n("o"), [hidden, TE.q_heads * hd], banks).rows(),
-            q_norm = weight(n("q_norm"), [hd], dense),
-            k_norm = weight(n("k_norm"), [hd], dense),
-            mlp_norm = weight(n("mlp_norm"), [hidden], dense),
-            gate_up = weight(n("gate_up"), [2 * inter, hidden], banks).packed([inter, inter]),
-            down = weight(n("down"), [hidden, inter], banks).rows(),
-            kv = "te.kv.{}".format(l),
-        )
-
-    return struct(
-        hidden = hidden,
-        vocab = TE.vocab,
-        q_heads = TE.q_heads,
-        kv_heads = TE.kv_heads,
-        head_dim = hd,
-        inter = inter,
-        theta = TE.theta,
-        eps = TE.eps,
-        sm_scale = f32(1.0 / f32(sqrt(hd))),
-        embed = weight("te.embed", [TE.vocab, hidden], banks),
-        layers = [layer(l) for l in range(TE.layers)],
+        ] if modulated else None,
     )
 
 def layout(id, deploy):
@@ -155,21 +111,25 @@ def layout(id, deploy):
         sm_scale = f32(1.0 / f32(sqrt(d.head_dim))),
         rope_dims = [2 * d.rope_freqs, 2 * d.rope_freqs, 2 * d.rope_freqs, 0],
         rotary_dim = rotary,
+        rope_axes = ROPE_AXES,
+        timestep_slots = TIMESTEP_SLOTS,
+        video_features = VIDEO_FEATURES,
+        audio_channels = AUDIO_CHANNELS,
         dit = struct(
             video_patch = linear("dit.video_patch", dim, VIDEO_FEATURES, banks),
             audio_patch = linear("dit.audio_patch", dim, AUDIO_CHANNELS, banks),
             condition = linear("dit.condition", dim, d.text_dim, banks),
             t_in = linear("dit.t_in", d.t_hidden, d.t_freq, banks),
             t_out = linear("dit.t_out", d.t_dim, d.t_hidden, banks),
-            refine = [refiner("dit.refine.{}".format(i), d, banks) for i in range(d.refiners)],
+            refine = [block("dit.refine.{}".format(i), d, banks, False) for i in range(d.refiners)],
             refine_norm = weight("dit.refine_norm", [dim], dense),
-            blocks = [block("dit.block.{}".format(i), d, banks) for i in range(d.blocks)],
+            blocks = [block("dit.block.{}".format(i), d, banks, True) for i in range(d.blocks)],
             final_norm = weight("dit.final_norm", [dim], dense),
             final_adaln = linear("dit.final_adaln", FINAL_SLICES * dim, d.t_dim, banks),
             video_out = linear("dit.video_out", VIDEO_FEATURES, dim, banks),
             audio_out = linear("dit.audio_out", AUDIO_CHANNELS, dim, banks),
         ),
-        te = text_encoder(banks) if id == "minimax-h3-fl2va" else None,
+        te = encoder(TE, TE_LAYERS, banks, sharded = True) if id == "minimax-h3-fl2va" else None,
     )
 
 def shifted_sigmas(shift, steps):
