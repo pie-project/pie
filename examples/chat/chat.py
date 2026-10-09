@@ -43,7 +43,8 @@ from prompt_toolkit.widgets import Frame
 
 ACCENT = "#d97757"  # the warm orange of the demo
 DIM = "#8a8a8a"
-MODEL = "default"
+MODEL = "default"  # the name the server answers to
+MODEL_NAME = "Qwen3.5-0.8B"  # the model shown in the banner
 
 STYLE = Style.from_dict({
     "accent": ACCENT,
@@ -218,7 +219,7 @@ class Chat:
         info = [
             [],
             [("class:bold", "pie chat")],
-            [("class:dim", f"model {MODEL} · this Mac")],
+            [("class:dim", f"model {MODEL_NAME} · this Mac")],
             [("class:dim", os.getcwd())],
         ]
         blank_mascot = [("", " " * 10)]
