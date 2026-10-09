@@ -5,6 +5,7 @@ from prompt_toolkit.data_structures import Point
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+from prompt_toolkit.mouse_events import MouseEventType
 
 from .chat import Chat
 from .config import MODEL_NAME, MODES, PROMPT_COLOUR, STYLE
@@ -14,6 +15,8 @@ from .mascot import mascot_rows
 
 ENGINE_VERSION = engine_version()
 MASCOT_WIDTH = 10
+PAGE_LINES = 10
+WHEEL_LINES = 3
 GAP = " "
 
 
@@ -37,19 +40,30 @@ def banner(chat: Chat) -> list[tuple[str, str]]:
     return pieces
 
 
-def transcript_pieces(chat: Chat) -> list[tuple[str, str]]:
+def wheel(chat: Chat):
+    def handler(mouse_event):
+        if mouse_event.event_type == MouseEventType.SCROLL_UP:
+            chat.scroll(WHEEL_LINES)
+        elif mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+            chat.scroll(-WHEEL_LINES)
+    return handler
+
+
+def transcript_pieces(chat: Chat) -> list[tuple]:
+    handler = wheel(chat)
     pieces = banner(chat)
     for item in chat.transcript:
         if isinstance(item, Markdown):
             pieces.extend(render(item.text))
         else:
             pieces.append(item)
-    return pieces
+    return [(piece[0], piece[1], handler) for piece in pieces]
 
 
 def cursor_at_end(chat: Chat) -> Point:
-    text = "".join(t for _, t in transcript_pieces(chat))
-    return Point(x=0, y=text.count("\n"))
+    text = "".join(piece[1] for piece in transcript_pieces(chat))
+    lines = text.count("\n")
+    return Point(x=0, y=max(0, lines - chat.scroll_back))
 
 
 def mode_line(chat: Chat) -> list[tuple[str, str]]:
@@ -65,6 +79,14 @@ def build(chat: Chat) -> Application:
     @bindings.add("s-tab")
     def _(event):
         chat.cycle_mode()
+
+    @bindings.add("pageup")
+    def _(event):
+        chat.scroll(PAGE_LINES)
+
+    @bindings.add("pagedown")
+    def _(event):
+        chat.scroll(-PAGE_LINES)
 
     @bindings.add("c-d")
     def _(event):
@@ -100,6 +122,6 @@ def build(chat: Chat) -> Application:
         key_bindings=bindings,
         style=STYLE,
         full_screen=True,
-        mouse_support=False,
+        mouse_support=True,
     )
     return chat.app

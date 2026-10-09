@@ -17,6 +17,7 @@ class Chat:
         self.streaming = False
         self.app: Application | None = None
         self.frame = 0
+        self.scroll_back = 0
         self.exit_armed = False
         self.exit_key = ""
         self.mode = 0
@@ -46,11 +47,16 @@ class Chat:
         if self.app:
             self.app.invalidate()
 
+    def scroll(self, lines: int) -> None:
+        self.scroll_back = max(0, self.scroll_back + lines)
+        self.redraw()
+
     def cycle_mode(self) -> None:
         self.mode = (self.mode + 1) % len(MODES)
         self.redraw()
 
     async def send(self, text: str) -> None:
+        self.scroll_back = 0
         self.add("class:bold", f"❯ {text}\n\n")
         self.streaming = True
         self.add("class:accent", "● ")
