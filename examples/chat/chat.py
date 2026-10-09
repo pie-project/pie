@@ -36,10 +36,9 @@ from urllib.parse import urlsplit
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.styles import Style
-from prompt_toolkit.widgets import Frame
 
 ACCENT = "#d97757"  # the warm orange of the demo
 DIM = "#8a8a8a"
@@ -69,7 +68,7 @@ STYLE = Style.from_dict({
     "status": f"{DIM} bg:#1c1c1e",
     "banner": ACCENT,
     "error": "#e06c75",
-    "input-frame": "#c8cbf2",  # the same lavender as the fish
+    "rule": "#4a4a50",  # the thin grey lines above and below the input
     "placeholder": "#666666",
 })
 
@@ -353,7 +352,14 @@ class Chat:
 
         self.input.accept_handler = self.on_enter
 
-        box = Frame(self.input_window, style="class:input-frame")
+        # Claude's input style: a thin grey rule above and below, the ❯ prompt, no side borders
+        rule = Window(height=1, char="─", style="class:rule")
+        prompt = Window(
+            content=FormattedTextControl(lambda: [("class:accent bold", "❯ ")]),
+            width=2,
+            dont_extend_width=True,
+        )
+        box = HSplit([rule, VSplit([prompt, self.input_window]), rule])
         status = Window(content=FormattedTextControl(self.status), height=1, style="class:status")
 
         root = HSplit([self.output, box, status])
