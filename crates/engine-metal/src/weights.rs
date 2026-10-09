@@ -444,12 +444,10 @@ impl Weights {
         }
         let mut dense = vec![false; trace.params.len()];
         for node in &trace.nodes {
-            if let poem_ir::Operation::Linear(
-                poem_ir::Linear::Matmul { w, .. } | poem_ir::Linear::LmHead { w, .. },
-            ) = &node.op
-                && let poem_ir::Def::Weight(at) = trace.values[w.0 as usize].def
-            {
-                dense[at as usize] = true;
+            for (_, w, _) in crate::legs::matmuls(&node.op) {
+                if let poem_ir::Def::Weight(at) = trace.values[w.0 as usize].def {
+                    dense[at as usize] = true;
+                }
             }
         }
         let pipelines = Pipelines::new();

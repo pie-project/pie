@@ -149,21 +149,24 @@ impl Scratch {
         let (mut act_rows, mut act_k) = (0u64, 0u64);
         let (mut sorted, mut pairs, mut routed_k, mut routed_n) = (0u64, 0u64, 0u64, 0u64);
         for node in &trace.nodes {
+            for (act, w, y) in crate::legs::matmuls(&node.op) {
+                if !banked(w) {
+                    continue;
+                }
+                let (Some(act), Some(y)) = (of(act), of(y)) else {
+                    continue;
+                };
+                act_rows = act_rows.max(u64::from(act.rows));
+                act_k = act_k.max(u64::from(act.width));
+                let pair = (y.width, act.width);
+                if !dense.contains(&pair) {
+                    dense.push(pair);
+                }
+            }
             let Operation::Linear(op) = &node.op else {
                 continue;
             };
             match op {
-                Linear::Matmul { act, w, y } | Linear::LmHead { act, w, y } if banked(*w) => {
-                    let (Some(act), Some(y)) = (of(*act), of(*y)) else {
-                        continue;
-                    };
-                    act_rows = act_rows.max(u64::from(act.rows));
-                    act_k = act_k.max(u64::from(act.width));
-                    let pair = (y.width, act.width);
-                    if !dense.contains(&pair) {
-                        dense.push(pair);
-                    }
-                }
                 Linear::MoeMatmulSelectBias { x, routes, y, .. }
                 | Linear::MoeMatmulSelectQuant { x, routes, y, .. } => {
                     let (Some(x), Some(y)) = (of(*x), of(*y)) else {
