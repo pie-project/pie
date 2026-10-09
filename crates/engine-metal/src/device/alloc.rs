@@ -230,7 +230,6 @@ impl Buffer {
     /// `at` is a page-aligned, host-visible allocation of `bytes` bytes that
     /// outlives every use of the buffer.
     #[cfg(target_vendor = "apple")]
-    #[allow(dead_code)] // The Neural Engine's surfaces, once they are viewed.
     pub(crate) unsafe fn foreign(
         device: &super::Context,
         at: std::ptr::NonNull<u8>,
