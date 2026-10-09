@@ -117,14 +117,30 @@ class EngineBackend:
         self.history.append({"role": "assistant", "content": "".join(pieces)})
 
 
-FRAME_SECONDS = 0.6  # time between mascot frames
-
-MASCOT_FRAMES = [
-    ["   ▘  ▖", "▐▟▙▙▙▛▌", "▜█████▛"],
-    ["  ▖  ▘", "▐▟▙▙▙▛▌ ▖", "▜█████▛"],
-    [" ▘ ▖", "▐▟▙▙▙▛▌  ▘", "▜█████▛ ▖"],
-    ["▖  ▘", "▐▟▙▙▙▛▌ ▖", "▜█████▛  ▘"],
+# The animated mascot: a fixed body with bubbles that start at its bottom right, rise one row
+# per frame and vanish, then the cycle repeats. Rows are 0 (top) to 2 (bottom), columns 0 to 9.
+_BODY = {1: "▐▟▙▙▙▛▌", 2: "▜█████▛"}
+# (row, column, character) for each bubble, per frame; the two bubbles are offset by two frames
+_BUBBLES = [
+    [(2, 8, "▖"), (0, 9, "▘")],
+    [(1, 8, "▘")],
+    [(0, 8, "▖"), (2, 9, "▘")],
+    [(1, 9, "▖")],
 ]
+
+
+def _frame(bubbles):
+    grid = [[" "] * 10 for _ in range(3)]
+    for row, text in _BODY.items():
+        for col, ch in enumerate(text):
+            grid[row][col] = ch
+    for row, col, ch in bubbles:
+        grid[row][col] = ch
+    return ["".join(r) for r in grid]
+
+
+MASCOT_FRAMES = [_frame(bubbles) for bubbles in _BUBBLES]
+FRAME_SECONDS = 0.6  # time between mascot frames
 
 
 def mascot_rows(frame: int = 0) -> list[list[tuple[str, str]]]:
@@ -185,7 +201,7 @@ class Chat:
         pieces: list[tuple[str, str]] = []
         for row in range(len(mascot)):
             pieces.extend(mascot[row])
-            pieces.append(("", "   "))
+            pieces.append(("", " "))
             if row < len(info):
                 pieces.extend(info[row])
             pieces.append(("", "\n"))
