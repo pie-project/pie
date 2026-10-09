@@ -69,7 +69,7 @@ STYLE = Style.from_dict({
     "status": f"{DIM} bg:#1c1c1e",
     "banner": ACCENT,
     "error": "#e06c75",
-    "input-frame": ACCENT,
+    "input-frame": "#c8cbf2",  # the same lavender as the fish
     "placeholder": "#666666",
 })
 
