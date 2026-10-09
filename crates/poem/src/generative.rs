@@ -15,7 +15,7 @@ pub struct Generative {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReadingFact {
-    pub name: &'static str,
+    pub name: String,
     pub index: u8,
     pub has_kv: bool,
     pub takes_tokens: bool,
@@ -51,7 +51,7 @@ impl ReadingFact {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortFact {
-    pub name: &'static str,
+    pub name: String,
     pub kind: PortKind,
     pub width: u32,
     pub streams: Vec<Stream>,

@@ -184,25 +184,6 @@ impl Package {
         &self.manifest
     }
 
-    /// The package in the directory `dir`, named after it: every `.star`
-    /// file in it, and every library under `lib`.
-    pub fn from_dir_with(dir: &std::path::Path, lib: &std::path::Path) -> anyhow::Result<Package> {
-        let name = dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| anyhow::anyhow!("{} names no package", dir.display()))?
-            .to_string();
-        let mut files = stars(dir, "")?;
-        if lib.is_dir() {
-            files.extend(stars(lib, LIBRARY)?);
-        }
-        let files: Vec<(&str, &str)> = files
-            .iter()
-            .map(|(f, s)| (f.as_str(), s.as_str()))
-            .collect();
-        Package::new(&name, &files)
-    }
-
     /// The package's name.
     #[must_use]
     pub fn name(&self) -> &str {
@@ -278,21 +259,4 @@ fn freeze(
     })?;
     modules.insert(file.to_string(), frozen);
     Ok(())
-}
-
-/// Every `.star` file under `dir`, named by its path below it after `prefix`.
-fn stars(dir: &std::path::Path, prefix: &str) -> anyhow::Result<Vec<(String, String)>> {
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        let Some(file) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if path.is_dir() && !prefix.is_empty() {
-            out.extend(stars(&path, &format!("{prefix}{file}/"))?);
-        } else if file.ends_with(".star") {
-            out.push((format!("{prefix}{file}"), std::fs::read_to_string(&path)?));
-        }
-    }
-    Ok(out)
 }

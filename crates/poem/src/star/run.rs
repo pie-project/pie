@@ -6,9 +6,6 @@ use std::cell::RefCell;
 
 use checkpoint::contract::ModelContract;
 
-/// What a format read of a checkpoint.
-pub type Read = Result<ModelContract, crate::import::Error>;
-
 use crate::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Trace, Value};
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
@@ -230,29 +227,6 @@ impl Package {
         self.formats(id, deploy, src, platform, |built| {
             crate::import::format::read_one(name, src, built)
         })?
-    }
-
-    /// What each format of `formats.star` reads of `src` into `id`'s
-    /// deployment `deploy`, whether or not it recognizes it, by name; and,
-    /// recording, the reads each asked.
-    pub fn read_each(
-        &self,
-        id: &str,
-        deploy: &Deploy,
-        src: &ztensor::Source,
-        platform: Platform,
-    ) -> Result<Vec<(String, Read, Vec<String>)>, crate::import::Error> {
-        self.formats(id, deploy, src, platform, |built| {
-            crate::import::recorded_so_far();
-            built
-                .into_iter()
-                .map(|format| {
-                    let name = format.name().to_string();
-                    let read = format.read();
-                    (name, read, crate::import::recorded_so_far())
-                })
-                .collect()
-        })
     }
 
     /// `then` of the formats of `formats.star`, each reading `src` into

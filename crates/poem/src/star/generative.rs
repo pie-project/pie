@@ -2,9 +2,7 @@
 //! each reads, its positions, latent space and schedule; and the canvas a
 //! text diffusion model denoises.
 
-use std::collections::HashSet;
 use std::fmt;
-use std::sync::{LazyLock, Mutex};
 
 use allocative::Allocative;
 use starlark::any::ProvidesStaticType;
@@ -78,21 +76,6 @@ fact_of!(schedule_of, Schedule, ScheduleFact, "a schedule");
 fact_of!(pub(crate) generative_of, Generative, Generative, "a generative model's facts");
 fact_of!(pub(crate) diffusion_of, Diffusion, Diffusion, "a canvas");
 
-/// `name`, held for as long as the process runs: the facts name readings and
-/// ports as the runtime's tables do, once each.
-fn interned(name: &str) -> &'static str {
-    static NAMES: LazyLock<Mutex<HashSet<&'static str>>> = LazyLock::new(Mutex::default);
-    let mut names = NAMES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(held) = names.get(name) {
-        return held;
-    }
-    let held: &'static str = Box::leak(name.to_string().into_boxed_str());
-    names.insert(held);
-    held
-}
-
 use crate::star::bind::word as spelled;
 
 /// The stream `word` names.
@@ -132,7 +115,7 @@ pub(crate) fn generative(builder: &mut GlobalsBuilder) {
         #[starlark(require = named, default = NoneOr::None)] positions: NoneOr<Value<'_>>,
     ) -> anyhow::Result<Stated> {
         Ok(Stated(Fact::Reading(ReadingFact {
-            name: interned(name),
+            name: name.to_string(),
             index: u8::try_from(index)
                 .map_err(|_| anyhow::anyhow!("reading {index} is past a u8"))?,
             has_kv,
@@ -169,7 +152,7 @@ pub(crate) fn generative(builder: &mut GlobalsBuilder) {
         #[starlark(require = named, default = NoneOr::None)] rows: NoneOr<u32>,
     ) -> anyhow::Result<Stated> {
         Ok(Stated(Fact::Port(PortFact {
-            name: interned(name),
+            name: name.to_string(),
             kind: spelled(
                 kind,
                 "a port's kind",

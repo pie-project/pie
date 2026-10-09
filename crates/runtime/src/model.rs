@@ -438,7 +438,7 @@ impl Model {
             .denoising(denoise)
             .on_stream(stream);
         let request = match self.readings().get(usize::from(reading)) {
-            Some(fact) => request.in_reading(fact.name),
+            Some(fact) => request.in_reading(&fact.name),
             None => request,
         };
         self.facts.word(&request)
