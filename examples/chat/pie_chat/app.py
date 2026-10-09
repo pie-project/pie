@@ -130,4 +130,6 @@ def build(chat: Chat) -> Application:
         full_screen=True,
         mouse_support=True,
     )
+    chat.app.ttimeoutlen = 0.01
+    chat.app.timeoutlen = 0.05
     return chat.app
