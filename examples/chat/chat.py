@@ -121,15 +121,14 @@ class EngineBackend:
 # per frame and vanish, then the cycle repeats. Rows are 0 (top) to 2 (bottom), columns 0 to 9.
 # The fish is drawn on a four-row canvas: row 0 is empty so the bubbles can rise above the body.
 _BODY = {2: "▐▟▙▙▙▛▌", 3: "▜██▄██▛"}  # the half block in the bottom row is the fin
-# (row, column, character) for each bubble, per frame. Bubble A rises in column 8 and bubble B in
-# column 9, starting two frames later; each moves one row up per frame and then vanishes.
+# Bubbles come out of the fish's mouth, the left end of the body, one at a time. Each one
+# rises a row per frame above the mouth and vanishes; the next bubble follows.
+MOUTH_COLUMN = 0
 _BUBBLES = [
-    [(3, 8, "▖")],
-    [(2, 8, "▖")],
-    [(1, 8, "▖"), (3, 9, "▘")],
-    [(0, 8, "▖"), (2, 9, "▘")],
-    [(1, 9, "▘")],
-    [(0, 9, "▘")],
+    [(1, MOUTH_COLUMN, "▖")],
+    [(0, MOUTH_COLUMN, "▖")],
+    [(1, MOUTH_COLUMN, "▘")],
+    [(0, MOUTH_COLUMN, "▘")],
 ]
 BODY_STYLE = "class:accent"
 BUBBLE_STYLE = "fg:#3a2a26"  # almost the background colour: the bubbles are barely visible
