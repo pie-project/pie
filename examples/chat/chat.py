@@ -6,8 +6,13 @@ stays at the bottom with a status line under it.
 Replies come from a running `pie serve` through its OpenAI-compatible endpoint
 (`/v1/chat/completions`, streamed). Start the engine first, then:
 
-    python examples/chat/chat.py                 # uses http://127.0.0.1:8080
+    python examples/chat/chat.py                 # starts `pie serve` if it is not running
+    python examples/chat/chat.py --no-engine     # only connect, never start an engine
     python examples/chat/chat.py --placeholder   # fixed text, no engine needed
+
+A local address (127.0.0.1 or localhost) that nothing is listening on gets a
+`pie serve` started for this chat. The chat stops that engine on exit. An engine
+that was already running is left alone.
 """
 
 from __future__ import annotations
@@ -16,10 +21,17 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
+import socket
+import subprocess
+import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator
+from pathlib import Path
+from urllib.parse import urlsplit
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
@@ -219,15 +231,70 @@ class Chat:
         return self.app
 
 
+LOCAL_HOSTS = {"127.0.0.1", "localhost"}
+START_TIMEOUT_S = 300  # the first load can take minutes while weights are read
+
+
+def port_open(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def start_engine(host: str, port: int) -> subprocess.Popen:
+    """Start `pie serve` in the background and wait until it accepts connections."""
+    pie = shutil.which("pie")
+    if pie is None:
+        raise SystemExit("the `pie` command is not on PATH; install it or use --no-engine")
+    log_dir = Path(tempfile.gettempdir()) / "pie-chat"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log = open(log_dir / "serve.log", "w")  # noqa: SIM115 - the engine keeps writing to it
+    print(f"starting the engine (log: {log.name}) ...", flush=True)
+    engine = subprocess.Popen([pie, "serve"], stdout=log, stderr=subprocess.STDOUT)
+
+    deadline = time.monotonic() + START_TIMEOUT_S
+    while not port_open(host, port):
+        if engine.poll() is not None:
+            raise SystemExit(f"`pie serve` exited early; see {log.name}")
+        if time.monotonic() > deadline:
+            engine.terminate()
+            raise SystemExit(f"the engine did not start within {START_TIMEOUT_S}s; see {log.name}")
+        time.sleep(1)
+    print("engine ready.", flush=True)
+    return engine
+
+
+def stop_engine(engine: subprocess.Popen) -> None:
+    engine.terminate()
+    try:
+        engine.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        engine.kill()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Terminal chat on a running pie engine.")
     parser.add_argument("--url", default="http://127.0.0.1:8080", help="address of `pie serve`")
+    parser.add_argument("--no-engine", action="store_true", help="connect only; never start `pie serve`")
     parser.add_argument("--placeholder", action="store_true", help="fixed replies, no engine")
     args = parser.parse_args()
 
+    engine = None
+    if not args.placeholder:
+        split = urlsplit(args.url)
+        host, port = split.hostname or "127.0.0.1", split.port or 8080
+        if not args.no_engine and host in LOCAL_HOSTS and not port_open(host, port):
+            engine = start_engine(host, port)
+
     backend = PlaceholderBackend() if args.placeholder else EngineBackend(args.url)
     os.system("cls" if os.name == "nt" else "clear")  # start on a clean screen, as the Claude CLI does
-    Chat(backend).build().run()
+    try:
+        Chat(backend).build().run()
+    finally:
+        if engine is not None:
+            stop_engine(engine)
 
 
 if __name__ == "__main__":
