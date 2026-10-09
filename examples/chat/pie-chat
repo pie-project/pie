@@ -3,7 +3,12 @@
 # First run creates a Python environment next to the repo; later runs start at once.
 set -euo pipefail
 
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do  # follow the ~/.local/bin symlink back to the repo copy
+  link="$(readlink "$src")"
+  case "$link" in /*) src="$link" ;; *) src="$(dirname "$src")/$link" ;; esac
+done
+here="$(cd "$(dirname "$src")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 venv="$repo/.venv"
 

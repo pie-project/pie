@@ -75,7 +75,15 @@ class EngineBackend:
 
         def pump() -> None:
             # Blocking HTTP read on a worker thread; deltas hop back to the event loop.
-            body = json.dumps({"model": MODEL, "messages": self.history, "stream": True}).encode()
+            # Sampling settings match the chat-completion inferlet's defaults. Without them
+            # the engine's default sampler produces garbled text with this small model.
+            body = json.dumps({
+                "model": MODEL,
+                "messages": self.history,
+                "stream": True,
+                "temperature": 0.6,
+                "top_p": 0.95,
+            }).encode()
             request = urllib.request.Request(
                 self.endpoint, data=body, headers={"content-type": "application/json"}
             )
