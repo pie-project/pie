@@ -387,6 +387,13 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--unique-prompts", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument(
+        "--prompts-file",
+        default=None,
+        help="JSON list of exact prompt strings, one per request (warmup first). "
+             "Replaces --prompt and every shared-prefix rule, so the caller "
+             "controls each prompt byte for byte (cold-cache runs).",
+    )
+    p.add_argument(
         "--shared-prefix-words",
         type=int,
         default=0,
@@ -722,6 +729,15 @@ def print_first_output(args: argparse.Namespace, text: str | None) -> None:
 
 
 def make_prompts(args: argparse.Namespace, n: int) -> list[str]:
+    prompts_file = getattr(args, "prompts_file", None)
+    if prompts_file:
+        with open(prompts_file, encoding="utf-8") as f:
+            prompts = json.load(f)
+        if not isinstance(prompts, list) or not all(isinstance(x, str) for x in prompts):
+            raise SystemExit(f"--prompts-file {prompts_file}: expected a JSON list of strings")
+        if len(prompts) < n:
+            raise SystemExit(f"--prompts-file {prompts_file}: {len(prompts)} prompts, {n} needed")
+        return prompts[:n]
     if getattr(args, "mixed_phase", False):
         long_body = _filler_words(getattr(args, "mixed_long_prompt_words", 400))
         return [
