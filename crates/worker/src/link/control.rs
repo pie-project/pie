@@ -257,7 +257,7 @@ pub fn spawn_control_tasks<C: ControlLink>(
 pub fn spawn_executor_control_tasks<C: ControlLink>(
     ctrl: C,
     worker_id: WorkerId,
-    stats: std::sync::Arc<crate::executor::ExecutorStats>,
+    stats: std::sync::Arc<crate::link::executor::ExecutorStats>,
     total_pages: u32,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let heartbeat_ctrl = ctrl.clone();

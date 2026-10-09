@@ -1,3 +1,6 @@
+//! `pie serve`'s single-node shape: the controller, the gateway and this
+//! worker in one process.
+
 use std::net::{Ipv4Addr, SocketAddr};
 
 use anyhow::{Context, Result};
@@ -5,7 +8,9 @@ use controller_api::{Ack, GatewayInfo, Neighbors, RoutingTable, WorkerInfo, Work
 use ids::{GatewayId, NodeId, WorkerId};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use worker::ControlLink;
+
+use crate::ControlLink;
+use crate::boot::Summary;
 
 #[derive(Clone)]
 struct EmbeddedControl(controller::Handle);
@@ -47,23 +52,30 @@ pub struct StandaloneHandle {
     pub listen_addr: SocketAddr,
     pub worker_addr: SocketAddr,
     _controller: controller::Handle,
-    worker: worker::WorkerHandle,
+    worker: crate::WorkerHandle,
     gateway: JoinHandle<()>,
 }
 
 impl StandaloneHandle {
+    pub fn summary(&self) -> &Summary {
+        self.worker.summary().expect("a standalone worker decodes")
+    }
+
     pub async fn shutdown(self) {
         self.gateway.abort();
         self.worker.shutdown().await;
     }
 }
 
+/// `pie serve` in one process: the controller, the gateway with its HTTP
+/// routes, and a worker linked to it.
 pub async fn run_standalone(
     controller: controller::Config,
     mut gateway: gateway::Config,
-    worker: worker::Config,
+    worker: crate::Config,
+    home: &std::path::Path,
 ) -> Result<StandaloneHandle> {
-    bootstrap::install_crypto_provider();
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let handle = controller::embed(controller);
     let control = EmbeddedControl(handle.clone());
@@ -83,8 +95,9 @@ pub async fn run_standalone(
     let listen_addr = gw.listen_addr;
     let worker_addr = gw.worker_addr;
 
-    let worker = worker::run_with(
+    let worker = crate::run_with(
         worker,
+        home,
         control,
         vec![format!("tcp://{worker_addr}")],
         Some(format!("ws://{listen_addr}")),
@@ -105,4 +118,15 @@ pub async fn run_standalone(
         worker,
         gateway,
     })
+}
+
+/// The three role configs one combined file yields: the worker reads the
+/// whole file; the controller and gateway take their defaults.
+pub fn derive_standalone(
+    combined: &str,
+) -> Result<(controller::Config, gateway::Config, crate::Config)> {
+    let worker = crate::Config::parse(combined).context("parsing config")?;
+    let controller = controller::Config::parse("").context("controller defaults")?;
+    let gateway = gateway::Config::parse("").context("gateway defaults")?;
+    Ok((controller, gateway, worker))
 }

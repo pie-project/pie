@@ -1,5 +1,5 @@
 //! The C core of the Swift `PieServer` (include/pie_server.h): a
-//! `runtime::embed::Server` on the Metal engine.
+//! `worker::Server` on the Metal engine.
 #![cfg(target_vendor = "apple")]
 // Each call's safety contract is its entry in include/pie_server.h.
 #![allow(clippy::missing_safety_doc)]
@@ -7,11 +7,13 @@
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::{Path, PathBuf};
 
-use runtime::embed::{Host, Server};
+use worker::Server;
+use worker::embedded::Settings;
 
 pub struct PieServer {
     server: Server,
     summary: CString,
+    listen_addr: Option<CString>,
 }
 
 pub type FrameSink = extern "C" fn(ctx: *mut c_void, frame: *const u8, len: usize);
@@ -70,7 +72,12 @@ unsafe fn server<'a>(ptr: *const PieServer) -> Outcome<&'a Server> {
         .ok_or_else(|| "server is NULL".to_string())
 }
 
-fn boot(artifact: &Path, config: Option<&str>, home: &Path) -> anyhow::Result<PieServer> {
+fn boot(
+    artifact: &Path,
+    settings: Option<&str>,
+    home: &Path,
+    listen: Option<&str>,
+) -> anyhow::Result<PieServer> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     let _ = tracing_subscriber::fmt()
@@ -79,22 +86,19 @@ fn boot(artifact: &Path, config: Option<&str>, home: &Path) -> anyhow::Result<Pi
         .with_ansi(false)
         .try_init();
 
-    let host = Host {
-        name: "pie-swift".into(),
-        home: home.to_path_buf(),
-        worker_threads: 2,
-    };
-    let builtins = builtins::all()
-        .iter()
-        .map(|b| runtime::bootstrap::BuiltinProgram {
-            name: b.name,
-            version: b.version,
-            component: b.component,
-        })
-        .collect();
-    let server = Server::start(artifact, config, host, builtins)?;
+    let settings = settings.map_or_else(|| Ok(Settings::default()), Settings::parse)?;
+    let server = Server::embed(
+        artifact,
+        &settings,
+        home,
+        listen.map(str::parse).transpose()?,
+    )?;
     Ok(PieServer {
         summary: CString::new(serde_json::to_string(server.summary())?)?,
+        listen_addr: server
+            .listen_addr()
+            .map(|addr| CString::new(addr.to_string()))
+            .transpose()?,
         server,
     })
 }
@@ -104,6 +108,7 @@ pub unsafe extern "C" fn pie_server_start(
     artifact: *const c_char,
     config: *const c_char,
     home: *const c_char,
+    listen: *const c_char,
     error: *mut *mut c_char,
 ) -> *mut PieServer {
     unsafe {
@@ -111,7 +116,8 @@ pub unsafe extern "C" fn pie_server_start(
             let artifact = PathBuf::from(str_arg(artifact, "artifact")?);
             let config = opt_str_arg(config, "config")?;
             let home = PathBuf::from(str_arg(home, "home")?);
-            let server = boot(&artifact, config, &home).map_err(message)?;
+            let listen = opt_str_arg(listen, "listen")?;
+            let server = boot(&artifact, config, &home, listen).map_err(message)?;
             Ok(Box::into_raw(Box::new(server)))
         })
     }
@@ -121,6 +127,14 @@ pub unsafe extern "C" fn pie_server_start(
 pub unsafe extern "C" fn pie_server_summary(server: *const PieServer) -> *const c_char {
     match unsafe { server.as_ref() } {
         Some(server) => server.summary.as_ptr(),
+        None => std::ptr::null(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pie_server_listen_addr(server: *const PieServer) -> *const c_char {
+    match unsafe { server.as_ref() }.and_then(|server| server.listen_addr.as_ref()) {
+        Some(addr) => addr.as_ptr(),
         None => std::ptr::null(),
     }
 }

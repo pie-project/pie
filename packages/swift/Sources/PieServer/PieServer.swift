@@ -18,7 +18,7 @@ public final class PieServer: Sendable {
         public let maxTokens: Int
     }
 
-    /// The boot configuration (`runtime::embed::BootConfig`), sized for a phone.
+    /// The boot configuration (`worker::embedded::Settings`), sized for a phone.
     public struct Configuration: Encodable, Sendable, Equatable {
         /// Share of the device's recommended working set the engine may use.
         public var gpuMemoryUtilization = 0.6
@@ -67,6 +67,9 @@ public final class PieServer: Sendable {
     }
 
     public let summary: Summary
+    /// `host:port` the gateway listens on with `listen` (the OS's port for
+    /// port 0), else nil.
+    public let listenAddress: String?
     let handle: Handle
 
     /// The C handle; every call on it is safe from any thread.
@@ -77,6 +80,7 @@ public final class PieServer: Sendable {
     private init(handle: Handle) throws {
         self.handle = handle
         summary = try JSONDecoder.snakeCase.decode(Summary.self, from: Data(String(cString: pie_server_summary(handle.pointer)).utf8))
+        listenAddress = pie_server_listen_addr(handle.pointer).map { String(cString: $0) }
     }
 
     deinit {
@@ -86,17 +90,20 @@ public final class PieServer: Sendable {
 
     /// Boots `model` (a `.metal.zt` from `pie model import`) with `languages`
     /// installed; `home` holds the inferlet cache and defaults to
-    /// `<Caches>/pie`. One server per process.
+    /// `<Caches>/pie`. With `listen` (`"127.0.0.1:8080"`) pie's gateway also
+    /// serves it there: its WebSocket and the OpenAI-compatible HTTP routes.
+    /// One server per process.
     public static func start(
         model: URL,
         configuration: Configuration = Configuration(),
         languages: [Language] = [],
+        listen: String? = nil,
         home: URL = .cachesDirectory.appending(path: "pie", directoryHint: .isDirectory)
     ) async throws -> PieServer {
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         let config = try String(decoding: JSONEncoder().encode(configuration), as: UTF8.self)
         let handle = try await blocking {
-            Handle(pointer: try call { error in pie_server_start(model.path(), config, home.path(), error) })
+            Handle(pointer: try call { error in pie_server_start(model.path(), config, home.path(), listen, error) })
         }
         let server: PieServer
         do {

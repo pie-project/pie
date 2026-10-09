@@ -3,28 +3,27 @@ name = "pie-kotlin-core"
 version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "The JNI core of the Kotlin `PieServer`: a runtime::embed::Server on Vulkan (Android) or Metal (a Mac, for host tests)."
+description = "The JNI core of the Kotlin `PieServer`: a worker::Server on Vulkan (Android) or Metal (a Mac, for host tests)."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
 [lib]
-name = "pie_server"
+name = "pie_jni"
 crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
-runtime = { path = "../../../crates/runtime" }
-builtins = { path = "../../../crates/builtins" }
+worker = { path = "../../../crates/worker", default-features = false, features = ["standalone"] }
 jni = "0.21"
 serde_json = "1"
 anyhow = "1.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-runtime = { path = "../../../crates/runtime", features = ["vulkan"] }
+worker = { path = "../../../crates/worker", default-features = false, features = ["vulkan"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
-runtime = { path = "../../../crates/runtime", features = ["metal"] }
+worker = { path = "../../../crates/worker", default-features = false, features = ["metal"] }
 
 [lints.rust]
 unsafe_code = "allow"

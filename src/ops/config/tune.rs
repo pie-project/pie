@@ -332,8 +332,8 @@ pub fn apply(content: &str, knobs: Knobs) -> Result<String> {
     Ok(content)
 }
 
-pub async fn run(global: &bootstrap::GlobalArgs, args: TuneArgs) -> Result<crate::ui::Answer> {
-    let (cfg_path, origin) = bootstrap::cli_config_path(global);
+pub async fn run(global: &crate::args::GlobalArgs, args: TuneArgs) -> Result<crate::ui::Answer> {
+    let (cfg_path, origin) = crate::args::config_path(global);
     let content = std::fs::read_to_string(&cfg_path).with_context(|| {
         format!(
             "no config file at {} ({}); `pie config init` writes one",
@@ -344,7 +344,7 @@ pub async fn run(global: &bootstrap::GlobalArgs, args: TuneArgs) -> Result<crate
 
     let objective = resolve_objective(args.objective)?;
 
-    let (controller, gateway, worker) = crate::derive::derive_standalone(&content)?;
+    let (controller, gateway, worker) = worker::standalone::derive_standalone(&content)?;
     let baseline = Knobs {
         frame_size: worker.runtime.frame_size as usize,
         dispatch_depth: worker.runtime.frame_dispatch_depth as usize,
@@ -371,9 +371,14 @@ pub async fn run(global: &bootstrap::GlobalArgs, args: TuneArgs) -> Result<crate
 
     let inputs = lane_inputs(workload.fleet, workload.tokens);
     let rounds = async {
-        let pie = crate::compose::run_standalone(controller, gateway, worker)
-            .await
-            .context("boot the engine (is something already serving on this port?)")?;
+        let pie = worker::standalone::run_standalone(
+            controller,
+            gateway,
+            worker,
+            &crate::paths::pie_home(),
+        )
+        .await
+        .context("boot the engine (is something already serving on this port?)")?;
         let addr = pie.listen_addr.to_string();
 
         sweep::warmup(&addr, &args.program, &inputs)

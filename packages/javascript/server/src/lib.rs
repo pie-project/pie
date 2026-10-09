@@ -1,34 +1,23 @@
 //! `@pie-project/server`: what `pie serve` boots, inside a Node process.
 //!
-//! [`pie::run_standalone`] brings up the controller, the gateway with its
-//! HTTP routes and the worker from the same config file the CLI reads. The
-//! boot and the shutdown block, so both run as napi async tasks on the
-//! libuv thread pool and reach JavaScript as promises. A handle
+//! [`worker::Server::serve`] brings up the worker and, beside it, the
+//! controller and the gateway with its HTTP routes, from the same config file
+//! the CLI reads. Its calls block, so each runs as a napi async task on the
+//! libuv thread pool and reaches JavaScript as a promise. A handle
 //! garbage-collected without `shutdown()` still tears the engine down, on a
-//! thread of its own so the collector is not held; what that thread has not
-//! released by process exit, the OS reclaims.
+//! thread of its own so the collector is not held.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use pie::StandaloneHandle;
-use runtime::inferlet::program;
-
-/// The runtime outlives the handle's shutdown: every engine is joined on it.
-type Live = (StandaloneHandle, tokio::runtime::Runtime);
-
-fn stop((handle, runtime): Live) {
-    runtime.block_on(handle.shutdown());
-    drop(runtime);
-}
+type Live = Arc<worker::Server>;
 
 #[napi]
 pub struct Server {
     url: String,
     live: Mutex<Option<Live>>,
-    runtime: tokio::runtime::Handle,
 }
 
 #[napi]
@@ -55,7 +44,7 @@ impl Server {
         component: Buffer,
     ) -> Result<AsyncTask<InstallLanguage>> {
         Ok(AsyncTask::new(InstallLanguage {
-            runtime: self.runtime()?,
+            server: self.live("install language")?,
             language,
             component: component.to_vec(),
         }))
@@ -69,7 +58,7 @@ impl Server {
         version: Option<String>,
     ) -> Result<AsyncTask<Install>> {
         Ok(AsyncTask::new(Install {
-            runtime: self.runtime()?,
+            server: self.live("install")?,
             bytes: bytes.to_vec(),
             file,
             version,
@@ -80,20 +69,29 @@ impl Server {
     #[napi(ts_return_type = "Promise<void>")]
     pub fn shutdown(&self) -> AsyncTask<Shutdown> {
         AsyncTask::new(Shutdown {
-            live: self.live.lock().unwrap().take(),
+            server: self.live.lock().unwrap().take(),
         })
     }
 
-    fn runtime(&self) -> Result<tokio::runtime::Handle> {
-        if self.live.lock().unwrap().is_none() {
-            return Err(failed("install", "the server is shut down"));
+    fn live(&self, what: &str) -> Result<Live> {
+        self.live
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| failed(what, "the server is shut down"))
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Some(server) = self.live.lock().unwrap().take() {
+            std::thread::spawn(move || server.shutdown());
         }
-        Ok(self.runtime.clone())
     }
 }
 
 pub struct InstallLanguage {
-    runtime: tokio::runtime::Handle,
+    server: Live,
     language: String,
     component: Vec<u8>,
 }
@@ -104,13 +102,11 @@ impl Task for InstallLanguage {
     type JsValue = String;
 
     fn compute(&mut self) -> Result<String> {
-        let language = program::Language::parse(&self.language)
-            .map_err(|e| invalid("language", format!("{e:#}")))?;
-        let component = std::mem::take(&mut self.component);
-        self.runtime
-            .block_on(program::add_language(language, component))
+        let name = self
+            .server
+            .install_language(&self.language, std::mem::take(&mut self.component))
             .map_err(|e| failed("install language", format!("{e:#}")))?;
-        Ok(language.name().to_string())
+        Ok(name.to_string())
     }
 
     fn resolve(&mut self, _env: Env, name: String) -> Result<String> {
@@ -119,7 +115,7 @@ impl Task for InstallLanguage {
 }
 
 pub struct Install {
-    runtime: tokio::runtime::Handle,
+    server: Live,
     bytes: Vec<u8>,
     file: String,
     version: Option<String>,
@@ -131,17 +127,13 @@ impl Task for Install {
     type JsValue = String;
 
     fn compute(&mut self) -> Result<String> {
-        let bytes = std::mem::take(&mut self.bytes);
-        let name = self
-            .runtime
-            .block_on(program::add(
-                bytes,
+        self.server
+            .install(
+                std::mem::take(&mut self.bytes),
                 &self.file,
                 self.version.as_deref(),
-                true,
-            ))
-            .map_err(|e| failed("install", format!("{e:#}")))?;
-        Ok(name.to_string())
+            )
+            .map_err(|e| failed("install", format!("{e:#}")))
     }
 
     fn resolve(&mut self, _env: Env, name: String) -> Result<String> {
@@ -149,16 +141,8 @@ impl Task for Install {
     }
 }
 
-impl Drop for Server {
-    fn drop(&mut self) {
-        if let Some(live) = self.live.lock().unwrap().take() {
-            std::thread::spawn(move || stop(live));
-        }
-    }
-}
-
 pub struct Shutdown {
-    live: Option<Live>,
+    server: Option<Live>,
 }
 
 #[napi]
@@ -167,8 +151,8 @@ impl Task for Shutdown {
     type JsValue = ();
 
     fn compute(&mut self) -> Result<()> {
-        if let Some(live) = self.live.take() {
-            stop(live);
+        if let Some(server) = self.server.take() {
+            server.shutdown();
         }
         Ok(())
     }
@@ -180,6 +164,7 @@ impl Task for Shutdown {
 
 pub struct Boot {
     toml: String,
+    home: String,
 }
 
 #[napi]
@@ -188,7 +173,7 @@ impl Task for Boot {
     type JsValue = Server;
 
     fn compute(&mut self) -> Result<Server> {
-        boot(&self.toml)
+        boot(&self.toml, &self.home)
     }
 
     fn resolve(&mut self, _env: Env, server: Server) -> Result<Server> {
@@ -215,36 +200,34 @@ fn failed(what: &str, error: impl std::fmt::Display) -> Error {
     Error::new(Status::GenericFailure, format!("{what}: {error}"))
 }
 
-fn boot(toml_str: &str) -> Result<Server> {
+fn boot(toml_str: &str, home: &str) -> Result<Server> {
     init_tracing();
-    let (controller, gateway, worker) = pie::derive::derive_standalone(toml_str)
-        .map_err(|e| invalid("config", format!("{e:#}")))?;
-    let runtime = worker::serve::build_runtime(&worker)
-        .map_err(|e| failed("build tokio runtime", format!("{e:#}")))?;
-    let handle = runtime
-        .block_on(pie::run_standalone(controller, gateway, worker))
+    let config =
+        worker::Config::parse(toml_str).map_err(|e| invalid("config", format!("{e:#}")))?;
+    let server = worker::Server::serve(config, std::path::Path::new(home))
         .map_err(|e| failed("start", format!("{e:#}")))?;
+    let addr = server.listen_addr().expect("a served worker listens");
     Ok(Server {
-        url: format!("ws://{}", handle.listen_addr),
-        runtime: runtime.handle().clone(),
-        live: Mutex::new(Some((handle, runtime))),
+        url: format!("ws://{addr}"),
+        live: Mutex::new(Some(Arc::new(server))),
     })
 }
 
 /// Boot from a config in the shape of `pie serve`'s config file
-/// (`{server: {port: 0}, model: {...}}`). Resolves once engines are up,
-/// weights are loaded and the listener is bound.
+/// (`{server: {port: 0}, model: {...}}`), keeping the runtime's files under
+/// `home`. Resolves once engines are up, weights are loaded and the listener
+/// is bound.
 #[napi(ts_return_type = "Promise<Server>")]
-pub fn start(config: serde_json::Value) -> Result<AsyncTask<Boot>> {
+pub fn start(config: serde_json::Value, home: String) -> Result<AsyncTask<Boot>> {
     if !config.is_object() {
         return Err(invalid("config", "must be an object (or use startToml)"));
     }
     let toml = toml::to_string(&config).map_err(|e| invalid("config", e))?;
-    Ok(AsyncTask::new(Boot { toml }))
+    Ok(AsyncTask::new(Boot { toml, home }))
 }
 
 /// Boot from the TOML text `pie serve --config` reads.
 #[napi(ts_return_type = "Promise<Server>")]
-pub fn start_toml(config: String) -> AsyncTask<Boot> {
-    AsyncTask::new(Boot { toml: config })
+pub fn start_toml(config: String, home: String) -> AsyncTask<Boot> {
+    AsyncTask::new(Boot { toml: config, home })
 }

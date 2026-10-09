@@ -28,9 +28,11 @@ if TYPE_CHECKING:
 
 
 class Server:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, home: str | os.PathLike[str] | None = None):
         # A copy, so the port the OS picks is never written back to the caller's object.
         self._config = copy.deepcopy(config)
+        # Where the runtime keeps its files: installed inferlets, languages, caches, models.
+        self._home = Path(home or os.environ.get("PIE_HOME", "").strip() or Path.home() / ".pie")
         self._handle: Any = None
         self._clients: list[Any] = []
 
@@ -64,7 +66,9 @@ class Server:
                 f"pie.server: the embedded engine (pie._engine) did not load: {error}; "
                 "build the wheel with `maturin develop` in packages/python/server"
             ) from error
-        self._handle = await asyncio.to_thread(_engine.bootstrap, self._config.to_toml())
+        self._handle = await asyncio.to_thread(
+            _engine.bootstrap, self._config.to_toml(), str(self._home)
+        )
         # `pip install "pie-server[python,javascript]"`: a language package that
         # is importable is installed, so its inferlets run.
         for language in ("python", "javascript"):

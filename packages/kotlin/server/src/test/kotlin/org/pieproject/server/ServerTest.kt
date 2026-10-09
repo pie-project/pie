@@ -26,14 +26,16 @@ class ServerTest {
             model = File(model),
             home = Files.createTempDirectory("pie").toFile(),
             languages = listOf(PieServer.Language.python),
+            listen = "127.0.0.1:0",
         )
         try {
             val name = server.install(quickstart.readBytes(), "quickstart.py")
             val client = server.connect()
             val result = client.launch(name, Prompt("The capital of France is", 8)).result()
             val text = Json.parseToJsonElement(result).jsonObject.getValue("text").jsonPrimitive.content
-            println("${server.summary.sku}: $text")
+            println("${server.summary.sku} at ${server.listenAddress}: $text")
             assertTrue(text.isNotBlank())
+            assertTrue(server.listenAddress.orEmpty().substringAfterLast(':').toInt() > 0)
             client.close()
         } finally {
             server.shutdown()

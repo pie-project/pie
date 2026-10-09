@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use anyhow::Result;
 
-pub use runtime::embed::{BootConfig, BootSummary};
+use worker::embedded::{Embedded, Engine, Settings, Summary};
 
 pub const MODELS_DIR: &str = "/models";
 
@@ -14,12 +14,14 @@ pub struct Mount {
 }
 
 pub async fn boot(
-    config: BootConfig,
+    settings: Settings,
     model_name: &str,
     mount: Mount,
     device: Option<crate::engine::Device>,
-) -> Result<BootSummary> {
+) -> Result<Summary> {
     let artifact = PathBuf::from(MODELS_DIR).join(model_name);
+    let mut config = settings.config(&artifact, &PathBuf::from("/"))?;
+    config.server.worker_threads = 1;
     let Mount { len, fetch } = mount;
     ztensor::memfs::mount_lazy(&artifact, len, fetch);
     tracing::info!(
@@ -29,19 +31,14 @@ pub async fn boot(
         "artifact mounted lazily"
     );
 
-    let loaded = {
-        let config = config.clone();
-        let artifact = artifact.clone();
-        let model_name = model_name.to_string();
-        on_green_thread("load", move || {
-            let engine = match device {
-                Some(device) => Some((crate::engine::open(device)?, poem_ir::Platform::Wgpu)),
-                None => None,
-            };
-            runtime::embed::load(&config, &artifact, &model_name, engine)
-        })
-        .await?
-    };
+    let loaded = on_green_thread("load", move || {
+        let engine = match device {
+            Some(device) => Engine::Opened(crate::engine::open(device)?),
+            None => Engine::None,
+        };
+        Embedded::load(&config, std::path::Path::new("/"), engine, Vec::new())
+    })
+    .await?;
     if let Some(stats) = ztensor::memfs::lazy_stats(&artifact) {
         tracing::info!(
             requests = stats.requests,
@@ -72,12 +69,7 @@ pub async fn boot(
     );
     drop(probe);
 
-    let host = runtime::embed::Host {
-        name: "browser".into(),
-        home: PathBuf::from("/"),
-        worker_threads: 1,
-    };
-    let embedded = runtime::embed::start(&config, &host, artifact, loaded, Vec::new()).await?;
+    let embedded = loaded.start().await?;
     let summary = embedded.summary.clone();
     std::mem::forget(embedded);
     Ok(summary)

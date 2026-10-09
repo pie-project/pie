@@ -7,8 +7,6 @@ use ids::WorkerId;
 
 use crate::executor::ModelIdentity;
 
-use crate::executor;
-
 #[allow(
     dead_code,
     reason = "read by the dial handshake once remote executors are supported"
@@ -157,7 +155,7 @@ impl PartnerLinkManager {
             runtime::offload::PartnerRole::Encode => self.config.encode_identity.clone(),
         };
         let _ = (identity, &self.config.kv_layout, self.config.transfer);
-        executor::connect_with_local_ip(&peer.addr).await?;
+        crate::link::executor::connect_with_local_ip(&peer.addr).await?;
         Err(anyhow!(
             "executor partner {} at {} cannot be dialled: remote executors are not supported in this release",
             peer.id,

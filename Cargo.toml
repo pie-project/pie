@@ -1,7 +1,6 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/bootstrap",
     "crates/builtins",
     "crates/runtime",
     "crates/controller",
@@ -61,7 +60,6 @@ members = [
     "packages/javascript/server",
 ]
 default-members = [
-    "crates/bootstrap",
     "crates/builtins",
     "crates/runtime",
     "crates/controller",
@@ -148,13 +146,15 @@ xla = ["worker/xla"]
 profile-fire = ["worker/profile-fire"]
 
 [dependencies]
-bootstrap = { path = "crates/bootstrap" }
+dirs = "7.0"
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 controller = { path = "crates/controller" }
 gateway = { path = "crates/gateway" }
 builtins = { path = "crates/builtins" }
 tar = "0.4"
 flate2 = "1"
-worker = { path = "crates/worker", default-features = false }
+worker = { path = "crates/worker", default-features = false, features = ["standalone"] }
 runtime = { path = "crates/runtime" }
 models = { path = "crates/models" }
 checkpoint = { path = "crates/checkpoint" }

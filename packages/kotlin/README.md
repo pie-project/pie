@@ -6,8 +6,9 @@ Gradle modules, group `org.pieproject`:
   crates/client-api). It talks to a remote `pie serve` over WebSocket, or to
   the runtime a `PieServer` runs in this process.
 - **`server`** (Android, arm64) runs pie inside an app: the runtime, the
-  Vulkan engine and the inferlet sandbox in-process, through
-  `runtime::embed::Server` (what the Swift package wraps too).
+  Vulkan engine and the inferlet sandbox in-process, booted by the same
+  worker `pie serve` runs (`worker::Server`, which the Swift package wraps
+  too).
 - **`language-python`**, **`language-javascript`** add the components script
   inferlets (`x.py`, `x.js`) run in.
 
@@ -40,6 +41,9 @@ server.shutdown()
 when the inferlet fails; cancelling its collection terminates the inferlet.
 The built-in inferlets (`compat-openai`, ...) are registered at boot.
 `PieClient.connect("ws://host:port")` reaches a `pie serve` with the same API.
+`PieServer.start(..., listen = "127.0.0.1:8080")` also serves pie's gateway
+from the app: the WebSocket and the OpenAI-compatible HTTP routes;
+`listenAddress` says where it bound (with port 0, the port the OS picked).
 
 ## Models
 
@@ -69,5 +73,5 @@ PIE_NATIVE_DIR=$PWD/../../target/release PIE_MODEL=<model.metal.zt> ./gradlew :s
   layer runs end to end on a Mac, but the Vulkan engine is unproven on mobile
   GPUs.
 - The runtime boots once per process; after `shutdown()` no server can start.
-- `libpie_server.so` is about 51 MB (18 MB compressed); the Python component
+- `libpie_jni.so` is about 51 MB (18 MB compressed); the Python component
   adds about 38 MB (14 MB compressed).
