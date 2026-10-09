@@ -1,5 +1,7 @@
 # buck2's pagable at 03a23abe (https://github.com/facebook/buck2), with
-# workspace inheritance resolved and one change: generic typetag registration
+# workspace inheritance resolved (the buck2 crates stay on `branch = "main"`,
+# the source starlark names, so they unify; Cargo.lock pins 03a23abe) and one
+# change: generic typetag registration
 # also covers Android (ELF `.init_array`) and Apple's other platforms (Mach-O
 # `__mod_init_func`), which the upstream cfg refuses. See README.md.
 
@@ -41,6 +43,9 @@ take_mut = "0.2"
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"], optional = true }
 triomphe = { version = "0.1.16", features = ["arc-swap"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 
 [features]
 default = []
