@@ -17,7 +17,7 @@ from .mascot import mascot_rows
 ENGINE_VERSION = engine_version()
 MASCOT_WIDTH = 10
 PAGE_LINES = 10
-WHEEL_LINES = 3
+WHEEL_LINES = 1
 GAP = " "
 
 
