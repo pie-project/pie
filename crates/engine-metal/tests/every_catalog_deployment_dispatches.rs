@@ -41,8 +41,6 @@ const REFUSED: &[Refusal] = &[
     },
 ];
 
-const CANNOT_SERVE: &[(&str, &[&str])] = &[];
-
 fn ops_of(deployment: &str) -> BTreeSet<String> {
     let row = models::deployment(deployment).expect("the row is in the catalog");
     row.trace(PLATFORM)
@@ -74,18 +72,15 @@ fn stopped() -> BTreeMap<String, BTreeSet<String>> {
 #[test]
 fn every_catalog_deployment_dispatches_every_case() {
     every_catalog_deployment_dispatches();
-    no_exemption_outlives_its_reason();
     every_refusal_is_still_carried();
     every_catalog_deployment_traces();
 }
 
 fn every_catalog_deployment_dispatches() {
     let refused = refused();
-    let exempt: BTreeMap<&str, &[&str]> = CANNOT_SERVE.iter().copied().collect();
 
-    let unlisted: Vec<String> = stopped()
+    let stopped: Vec<String> = stopped()
         .into_iter()
-        .filter(|(deployment, _)| !exempt.contains_key(one_rank(deployment)))
         .map(|(deployment, ops)| {
             let ops: Vec<&str> = ops.iter().map(String::as_str).collect();
             format!(
@@ -100,50 +95,10 @@ fn every_catalog_deployment_dispatches() {
         .collect();
 
     assert!(
-        unlisted.is_empty(),
-        "{} catalog row(s) name a refused op and are not in CANNOT_SERVE. Either cover the op, \
-         or list the row WITH the op that stops it:\n  {}",
-        unlisted.len(),
-        unlisted.join("\n  ")
-    );
-}
-
-/// The one-rank deployment `deployment` splits: a split is stopped by what stops the
-/// deployment it splits, so it is exempted under that one's name.
-fn one_rank(deployment: &str) -> &str {
-    deployment
-        .rsplit_once("-tp")
-        .filter(|(_, ranks)| ranks.parse::<u32>().is_ok())
-        .map_or(deployment, |(whole, _)| whole)
-}
-
-fn no_exemption_outlives_its_reason() {
-    let stopped = stopped();
-    let mut stale = Vec::new();
-
-    for (deployment, stoppers) in CANNOT_SERVE {
-        if models::deployment(deployment).is_none() {
-            stale.push(format!("{deployment} is exempted but is not a catalog row"));
-            continue;
-        }
-        let listed: BTreeSet<String> = stoppers.iter().map(|op| (*op).to_string()).collect();
-        match stopped.get(*deployment) {
-            Some(blocked) if *blocked == listed => {}
-            Some(blocked) => stale.push(format!(
-                "{deployment} is exempted over {listed:?}, but what stops it is {blocked:?}"
-            )),
-            None => stale.push(format!(
-                "{deployment} is exempted over {listed:?}, but nothing refused stops it any more — \
-                 drop the exemption"
-            )),
-        }
-    }
-
-    assert!(
-        stale.is_empty(),
-        "{} stale exemption(s):\n  {}",
-        stale.len(),
-        stale.join("\n  ")
+        stopped.is_empty(),
+        "{} catalog row(s) name an op {SHELL} refuses; cover the op:\n  {}",
+        stopped.len(),
+        stopped.join("\n  ")
     );
 }
 
@@ -157,7 +112,7 @@ fn every_refusal_is_still_carried() {
         if !source.contains(refusal.needle) {
             gone.push(format!(
                 "`{}` is listed as refused, but `{}` no longer carries `{}` — either it is \
-                 covered now (drop it from REFUSED, and drop the rows it exempted) or the site \
+                 covered now (drop it from REFUSED) or the site \
                  moved (repoint the entry)",
                 refusal.op, refusal.file, refusal.needle
             ));
