@@ -16,6 +16,23 @@ class EngineBackend:
     def reset(self) -> None:
         self.history.clear()
 
+    def warm(self, draft: str) -> None:
+        body = json.dumps({
+            "model": MODEL,
+            "messages": self.history + [{"role": "user", "content": draft}],
+            "stream": False,
+            "max_tokens": 1,
+            "temperature": 0,
+        }).encode()
+        request = urllib.request.Request(
+            self.endpoint, data=body, headers={"content-type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=300):
+                pass
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+
     async def reply(self, text: str) -> AsyncIterator[str]:
         self.history.append({"role": "user", "content": text})
         loop = asyncio.get_running_loop()
@@ -70,6 +87,9 @@ class PlaceholderBackend:
     )
 
     def reset(self) -> None:
+        pass
+
+    def warm(self, _draft: str) -> None:
         pass
 
     async def reply(self, _text: str) -> AsyncIterator[str]:

@@ -10,6 +10,7 @@ DEFAULT_URL = "http://127.0.0.1:8080"
 START_TIMEOUT_S = 300
 FRAME_SECONDS = 1.2
 EXIT_WINDOW_SECONDS = 0.75
+WARM_DELAY_SECONDS = 0.4
 
 MODES = (
     ("⏵⏵", "auto mode on", "#ffd43b"),

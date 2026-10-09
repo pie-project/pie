@@ -6,7 +6,7 @@ from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
 
 from .backend import PlaceholderBackend
-from .config import EXIT_WINDOW_SECONDS, FRAME_SECONDS, MODES
+from .config import EXIT_WINDOW_SECONDS, FRAME_SECONDS, MODES, WARM_DELAY_SECONDS
 
 
 class Chat:
@@ -21,6 +21,21 @@ class Chat:
         self.mode = 0
         self.input = Buffer(multiline=False)
         self.input.accept_handler = self.on_enter
+        self.input.on_text_changed += self.on_typing
+        self.warm_task: asyncio.Task | None = None
+
+    def on_typing(self, buffer: Buffer) -> None:
+        if self.warm_task is not None:
+            self.warm_task.cancel()
+        self.warm_task = asyncio.ensure_future(self.warm_later(buffer.text))
+
+    async def warm_later(self, draft: str) -> None:
+        try:
+            await asyncio.sleep(WARM_DELAY_SECONDS)
+        except asyncio.CancelledError:
+            return
+        if draft.strip() and not self.streaming:
+            await asyncio.to_thread(self.backend.warm, draft)
 
     def add(self, style: str, text: str) -> None:
         self.transcript.append((style, text))
