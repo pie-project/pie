@@ -1,6 +1,5 @@
 //! The widths, constants and schedule FLUX.2's package declares, which the
 //! tests of its rows, its import and its VAE hold the package to.
-#![allow(dead_code)]
 
 pub const IN_CHANNELS: u32 = 128;
 pub const VAE_CHANNELS: u32 = 32;

@@ -5,7 +5,7 @@ use checkpoint::contract::Partition;
 use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{Expr, ModelContract, TensorType};
 use checkpoint::plan::StorageTarget;
-mod z_image_dims;
+pub mod z_image_dims;
 
 use poem::Platform;
 use z_image_dims::{self as model, Dims};

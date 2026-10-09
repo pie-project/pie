@@ -1,40 +1,12 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+pub mod hunyuan_image_3_dims;
+
 use checkpoint::contract::Expr;
 use poem::Platform;
 
-/// The widths HunyuanImage 3's miniature package declares.
-mod model {
-    pub const ROPE_THETA: f32 = 10_000.0;
-
-    #[must_use]
-    pub fn rope_x_scale(head_dim: u32) -> f32 {
-        ROPE_THETA.powf(-2.0 / head_dim as f32)
-    }
-
-    pub struct Dims {
-        pub layers: u32,
-        pub q_heads: u32,
-        pub kv_heads: u32,
-        pub head_dim: u32,
-        pub experts: u32,
-    }
-
-    impl Dims {
-        pub const fn mini() -> Dims {
-            Dims {
-                layers: 2,
-                q_heads: 4,
-                kv_heads: 2,
-                head_dim: 64,
-                experts: 8,
-            }
-        }
-    }
-}
-
-use model::Dims;
+use hunyuan_image_3_dims::{self as model, Dims};
 
 const MINI: &str = "hunyuanimage3-mini-bf16-kv-bf16";
 

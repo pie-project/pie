@@ -1,11 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+pub mod wan_2_dims;
+
 use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{ModelContract, Partition, TensorType};
 use checkpoint::plan::StorageTarget;
-use model::Dims;
 use poem::Platform;
+use wan_2_dims::{self as model, Dims};
 use ztensor::Leaf;
 use ztensor::provide::{Catalog, Entry, Location, Store, StoreId};
 
@@ -508,162 +510,5 @@ fn each_miniature_reads_its_golden_fixture() {
             );
         }
         check_mini(deployment, &d, &src, "");
-    }
-}
-
-/// The widths and constants wan_2's package declares.
-#[allow(dead_code)]
-mod model {
-    pub const PATCH_T: u32 = 1;
-    pub const PATCH_H: u32 = 2;
-    pub const PATCH_W: u32 = 2;
-    pub const PATCH_VOL: u32 = PATCH_T * PATCH_H * PATCH_W;
-
-    pub const VAE_SPATIAL_COMPRESSION: u32 = 16;
-    pub const VAE_TEMPORAL_COMPRESSION: u32 = 4;
-
-    pub const T_MAX_PERIOD: f32 = 10_000.0;
-    pub const T_FLIP_SIN_COS: bool = true;
-    pub const T_SCALE: f32 = 1.0;
-
-    pub const NORM_EPS: f32 = 1e-6;
-    pub const ROPE_THETA: f32 = 10_000.0;
-    pub const ROPE_AXES: u8 = 3;
-
-    pub const MOD_SLICES: u32 = 6;
-    pub const HEAD_SLICES: u32 = 2;
-
-    pub const TRAIN_STEPS: u32 = 1000;
-    pub const SHIFT_TI2V: f32 = 5.0;
-
-    pub const CONTEXT_LEN: u32 = 512;
-
-    pub const TE_HIDDEN: u32 = 4096;
-    pub const TE_VOCAB: u32 = 256_384;
-    pub const TE_HEADS: u32 = 64;
-    pub const TE_HEAD_DIM: u32 = 64;
-    pub const TE_INTER: u32 = 10_240;
-    pub const TE_LAYERS: u32 = 24;
-    pub const TE_EPS: f32 = 1e-6;
-    pub const TE_BUCKETS: u32 = 32;
-    pub const TE_MAX_DISTANCE: f32 = 128.0;
-    pub const TE_MAX_TOKENS: u32 = 512;
-
-    pub const VAE_Z: u32 = 48;
-    pub const VAE_PIX_CHANNELS: u32 = 12;
-    pub const VAE_RGB: u32 = 3;
-    pub const VAE_PATCH: u32 = 2;
-    pub const VAE_DECODER_DIMS: [u32; 5] = [1024, 1024, 1024, 512, 256];
-    pub const VAE_RESNETS: u32 = 3;
-    pub const VAE_TEMPORAL_UP: [bool; 4] = [true, true, false, false];
-    pub const VAE_ENCODER_DIMS: [u32; 5] = [160, 160, 320, 640, 640];
-    pub const VAE_ENC_RESNETS: u32 = 2;
-    pub const VAE_TEMPORAL_DOWN: [bool; 4] = [false, true, true, false];
-    pub const VAE_EPS: f32 = 1e-12;
-    pub const VAE_LATENTS_MEAN: [f32; VAE_Z as usize] = [
-        -0.2289, -0.0052, -0.1323, -0.2339, -0.2799, 0.0174, 0.1838, 0.1557, -0.1382, 0.0542,
-        0.2813, 0.0891, 0.157, -0.0098, 0.0375, -0.1825, -0.2246, -0.1207, -0.0698, 0.5109, 0.2665,
-        -0.2108, -0.2158, 0.2502, -0.2055, -0.0322, 0.1109, 0.1567, -0.0729, 0.0899, -0.2799,
-        -0.123, -0.0313, -0.1649, 0.0117, 0.0723, -0.2839, -0.2083, -0.052, 0.3748, 0.0152, 0.1957,
-        0.1433, -0.2944, 0.3573, -0.0548, -0.1681, -0.0667,
-    ];
-    pub const VAE_LATENTS_STD: [f32; VAE_Z as usize] = [
-        0.4765, 1.0364, 0.4514, 1.1677, 0.5313, 0.499, 0.4818, 0.5013, 0.8158, 1.0344, 0.5894,
-        1.0901, 0.6885, 0.6165, 0.8454, 0.4978, 0.5759, 0.3523, 0.7135, 0.6804, 0.5833, 1.4146,
-        0.8986, 0.5659, 0.7069, 0.5338, 0.4889, 0.4917, 0.4069, 0.4999, 0.6866, 0.4093, 0.5709,
-        0.6065, 0.6415, 0.4944, 0.5726, 1.2042, 0.5458, 1.6887, 0.3971, 1.06, 0.3943, 0.5537,
-        0.5444, 0.4089, 0.7468, 0.7744,
-    ];
-
-    pub const VAE_MAX_LATENT_PLANE: u64 = 44 * 80;
-
-    pub mod port {
-        pub const LATENTS: u8 = 0;
-        pub const CONTEXT: u8 = 0;
-        pub const TIMESTEP: u8 = 0;
-        pub const POSITIONS: u8 = 0;
-        pub const VOXELS: u8 = 0;
-        pub const PIXEL_VOXELS: u8 = 1;
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct Dims {
-        pub dim: u32,
-        pub heads: u32,
-        pub head_dim: u32,
-        pub ffn: u32,
-        pub layers: u32,
-        pub in_channels: u32,
-        pub out_channels: u32,
-        pub text_dim: u32,
-        pub freq_dim: u32,
-    }
-
-    impl Dims {
-        #[must_use]
-        pub const fn ti2v_5b() -> Dims {
-            Dims {
-                dim: 3072,
-                heads: 24,
-                head_dim: 128,
-                ffn: 14_336,
-                layers: 30,
-                in_channels: 48,
-                out_channels: 48,
-                text_dim: 4096,
-                freq_dim: 256,
-            }
-        }
-
-        #[must_use]
-        pub const fn mini_d128() -> Dims {
-            Dims {
-                dim: 256,
-                heads: 2,
-                head_dim: 128,
-                ffn: 512,
-                layers: 2,
-                in_channels: 16,
-                out_channels: 16,
-                text_dim: 64,
-                freq_dim: 256,
-            }
-        }
-
-        #[must_use]
-        pub const fn mini_nano() -> Dims {
-            Dims {
-                dim: 48,
-                heads: 2,
-                head_dim: 24,
-                ffn: 128,
-                layers: 2,
-                in_channels: 16,
-                out_channels: 16,
-                text_dim: 64,
-                freq_dim: 32,
-            }
-        }
-
-        #[must_use]
-        pub const fn rope_dims(&self) -> [u32; 4] {
-            let hw = 2 * (self.head_dim / 6);
-            [self.head_dim - 2 * hw, hw, hw, 0]
-        }
-
-        #[must_use]
-        pub fn sm_scale(&self) -> f32 {
-            (self.head_dim as f32).sqrt().recip()
-        }
-
-        #[must_use]
-        pub const fn patch_in(&self) -> u32 {
-            self.in_channels * PATCH_VOL
-        }
-
-        #[must_use]
-        pub const fn patch_out(&self) -> u32 {
-            self.out_channels * PATCH_VOL
-        }
     }
 }

@@ -1,14 +1,11 @@
 use std::collections::BTreeSet;
 
+pub mod mini_dit_dims;
+
+use mini_dit_dims as model;
 use poem::{Def, Dim, Platform, RuntimeInput, Trace, Ty, seam};
 
 const TAP: &str = "PIE_MINI_DIT_TAP";
-
-/// The widths mini-dit's package declares.
-mod model {
-    pub const HIDDEN: u32 = 256;
-    pub const PATCH_FEATURES: u32 = 64;
-}
 
 fn row() -> &'static models::Deployment {
     models::deployment("mini-dit-bf16-kv-bf16").expect("the mini-dit row")

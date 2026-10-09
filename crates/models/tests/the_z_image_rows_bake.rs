@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-mod z_image_dims;
+pub mod z_image_dims;
 
 use models::{PortKind, ReadoutKind, ScheduleKind};
 use poem::{

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{Expr, Partition, TensorType};
-mod z_image_dims;
+pub mod z_image_dims;
 
 use models::{PortKind, ReadoutKind};
 use poem::{Def, Dim, Dtype, Operation, Platform, Request, Stream, Trace, Ty, seam};

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{ModelContract, Partition, TensorType};
 use checkpoint::plan::StorageTarget;
-mod flux_2_dims;
+pub mod flux_2_dims;
 
 use flux_2_dims::{self as model, Dims};
 use poem::Platform;

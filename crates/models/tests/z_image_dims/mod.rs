@@ -1,6 +1,5 @@
 //! The widths and constants Z-Image's package declares, which the tests of
 //! its rows, its import and its VAE hold the package to.
-#![allow(dead_code)]
 
 pub const CHANNELS: u32 = 16;
 pub const PATCH: u32 = 2;

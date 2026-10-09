@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{Expr, Partition, TensorType};
-mod flux_2_dims;
+pub mod flux_2_dims;
 
 use flux_2_dims::{self as model, vae};
 use models::{PortKind, ReadoutKind};
