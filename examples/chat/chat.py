@@ -21,7 +21,6 @@ import argparse
 import asyncio
 import json
 import os
-import random
 import shutil
 import socket
 import subprocess
@@ -119,9 +118,9 @@ class EngineBackend:
         self.history.append({"role": "assistant", "content": "".join(pieces)})
 
 
-# One random animal from mascots.py per launch: a 10x8 sprite drawn with half-block characters,
+# The duck from mascots.py: a 10x8 sprite drawn with half-block characters,
 # one pixel per column and two pixel rows per text line, so the banner is 3 lines tall.
-MASCOT_NAME, (MASCOT_PALETTE, MASCOT_ROWS) = random.choice(list(ANIMALS.items()))
+MASCOT_NAME, (MASCOT_PALETTE, MASCOT_ROWS) = "duck", ANIMALS["duck"]
 # six pixel rows (three text lines) sampled evenly from the 8 rows of each sprite
 MASCOT_ROWS = [MASCOT_ROWS[round(i * 7 / 5)] for i in range(6)]
 
