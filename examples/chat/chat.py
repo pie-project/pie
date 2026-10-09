@@ -120,15 +120,17 @@ class EngineBackend:
 
 # The duck from mascots.py: a 10x8 sprite drawn with half-block characters,
 # one pixel per column and two pixel rows per text line, so the banner is 3 lines tall.
-MASCOT_NAME, (MASCOT_PALETTE, _MASCOT_ART) = "duck", ANIMALS["duck"]
+MASCOT_NAME, (MASCOT_PALETTE, _MASCOT_ART) = "fish", ANIMALS["fish"]
 FRAME_SECONDS = 0.4
 
 
 def _mascot_frames(art: list[str]) -> list[list[str]]:
-    """Normal, blink and bob frames of the duck, each sampled to six pixel rows."""
+    """Normal, blink and bob frames of the fish, each sampled to six pixel rows."""
+    eye_row = next(i for i, r in enumerate(art) if "d" in r)
+    eye_col = art[eye_row].index("d")
     blink = list(art)
-    blink[2] = blink[2][:4] + "Y" + blink[2][5:]  # the eye closes into the body colour
-    bob = ["." * len(art[0])] + art[:-1]           # the whole duck moves down one pixel row
+    blink[eye_row] = blink[eye_row][:eye_col] + "o" + blink[eye_row][eye_col + 1:]  # the eye closes into the body colour
+    bob = ["." * len(art[0])] + art[:-1]           # the whole fish moves down one pixel row
     frames = [art, art, blink, art, bob]
     return [[f[round(i * 7 / 5)] for i in range(6)] for f in frames]
 
