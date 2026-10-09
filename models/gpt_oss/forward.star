@@ -4,6 +4,10 @@
 
 load("//lib/dflash/forward.star", "arm", "block_rows", "plant_readout", "tap", dflash_caches = "caches")
 
+WINDOWED = 0
+FULL = 1
+CLASSES = [fact.has(fact.Mask), fact.scores(), fact.single_token()]
+
 def caches(m, c):
     kv = c.kv_space(m.kv)
     plane = m.kv_heads * m.head_dim
@@ -12,16 +16,10 @@ def caches(m, c):
     if m.dflash != None:
         dflash_caches(m.dflash, c, kv)
 
-CLASSES = [fact.has(fact.Mask), fact.scores(), fact.single_token()]
-
 def forward(m, inputs):
     mask = inputs.mask()
     dr = m.dflash
-    if dr != None:
-        _ = inputs.on(block_rows(dr))
-        trunk_inputs = inputs.on(~block_rows(dr))
-    else:
-        trunk_inputs = inputs
+    trunk_inputs = inputs.on(~block_rows(dr)) if dr != None else inputs
     positions = trunk_inputs.positions()
     ([input_m, input_s, input_d], input_p) = trunk_inputs.partition(CLASSES)
     d = m.head_dim
@@ -53,25 +51,26 @@ def forward(m, inputs):
         v = ops.elemwise.add_bias(at.v_bias, ops.linear.matmul(x, at.v_proj))
         seam.at(seam.ATTN_QV, [q, v])
 
+        rope = m.rope
         q, k = ops.elemwise.rope_yarn(
-            q, k, positions, d, at.theta, at.factor, at.beta_fast, at.beta_slow,
-            at.attention_factor, at.original_max_position, False,
+            q, k, positions, d, rope.theta, rope.factor, rope.beta_fast, rope.beta_slow,
+            rope.attention_factor, rope.original_max_position, False,
         )
         ops.attn.kv_append(k, v, pages, write_page, write_offset)
         seam.at(seam.ATTN_Q, [q])
 
-        win = m.window if at.reading == 0 else None
         r = at.reading
+        win = m.window if r == WINDOWED else None
         ([mq, sq, dq], p) = q.partition(CLASSES)
-        o_m, lse_m = ops.attn.masked_lse(mq, plan_m[r], mask, pages, win, d, m.kv_heads, True, at.sm_scale)
+        o_m, lse_m = ops.attn.masked_lse(mq, plan_m[r], mask, pages, win, d, m.kv_heads, True, m.sm_scale)
         arm_m = ops.attn.sink(o_m, lse_m, at.sinks, d)
-        o_s, lse_s = ops.attn.prefill_lse(sq, plan_s[r], pages, win, d, m.kv_heads, at.sm_scale)
-        if r == 1:
+        o_s, lse_s = ops.attn.prefill_lse(sq, plan_s[r], pages, win, d, m.kv_heads, m.sm_scale)
+        if r == FULL:
             seam.at(seam.SCORES, [lse_s])
         arm_s = ops.attn.sink(o_s, lse_s, at.sinks, d)
-        o_d, lse_d = ops.attn.decode_lse(dq, plan_d[r], pages, win, d, at.sm_scale)
+        o_d, lse_d = ops.attn.decode_lse(dq, plan_d[r], pages, win, d, m.sm_scale)
         arm_d = ops.attn.sink(o_d, lse_d, at.sinks, d)
-        o_p, lse_p = ops.attn.prefill_lse(p, plan_p[r], pages, win, d, m.kv_heads, at.sm_scale)
+        o_p, lse_p = ops.attn.prefill_lse(p, plan_p[r], pages, win, d, m.kv_heads, m.sm_scale)
         arm_p = ops.attn.sink(o_p, lse_p, at.sinks, d)
         a = merge([arm_m, arm_s, arm_d, arm_p])
         seam.at(seam.ATTN_OUT, [a])

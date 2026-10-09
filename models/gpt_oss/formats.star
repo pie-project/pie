@@ -28,7 +28,7 @@ def formats(m):
 
 def configured(m):
     """The shape a transformers configuration states of this model."""
-    states = [
+    return [
         config("hidden_size", m.hidden),
         config("vocab_size", m.vocab),
         config("num_attention_heads", m.q_heads),
@@ -37,11 +37,9 @@ def configured(m):
         config("num_hidden_layers", len(m.layers), or_deeper = True),
         config("rms_norm_eps", m.final_norm_eps),
         config("sliding_window", m.window),
+        config("num_local_experts", m.layers[0].mlp.experts, or_deeper = True),
+        config("rope_theta", m.rope.theta),
     ]
-    if m.layers:
-        states.append(config("num_local_experts", m.layers[0].mlp.experts, or_deeper = True))
-        states.append(config("rope_theta", m.layers[0].attn.theta))
-    return states
 
 def read(m, reads, codes):
     reads.read(m.embed, "model.embed_tokens.weight")

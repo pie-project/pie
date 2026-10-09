@@ -3,7 +3,7 @@
 # stored as the second dtype of a deployment's weights.
 
 load("//lib/adapters/model.star", "banks")
-load("//lib/dflash/model.star", "declare", "head")
+load("//lib/dflash/model.star", dflash_declare = "declare", dflash_head = "head")
 
 def dims(layers = 24, experts = 32):
     return struct(
@@ -34,7 +34,7 @@ DIMS = {
     "gptoss-120b": dims(layers = 36, experts = 128),
 }
 
-DFLASH_20B = head(
+DFLASH_20B = dflash_head(
     taps = [1, 6, 11, 16, 21],
     windows = [None] * 8,
     q_heads = 64,
@@ -72,13 +72,6 @@ def layout(id, deploy):
         return struct(
             attn = struct(
                 reading = WINDOWED if l % 2 == 0 else FULL,
-                sm_scale = f32(1.0 / f32(sqrt(hd))),
-                theta = d.theta,
-                factor = d.yarn_factor,
-                beta_fast = d.yarn_beta_fast,
-                beta_slow = d.yarn_beta_slow,
-                attention_factor = d.yarn_attention_factor,
-                original_max_position = d.yarn_original_max_position,
                 q_proj = weight(n("q_proj"), [q_w, hidden], weights).columns(),
                 q_bias = weight(n("q_bias"), [q_w], dense).columns(),
                 k_proj = weight(n("k_proj"), [kv_w, hidden], weights).columns(heads = d.kv_heads),
@@ -111,9 +104,7 @@ def layout(id, deploy):
             lora_b = lora_b,
         )
 
-    head_ = weight("lm_head", [d.vocab, hidden], weights)
-    if env("PIE_NO_VOCAB_SHARD") == None:
-        head_ = head_.packed([d.vocab])
+    head = weight("lm_head", [d.vocab, hidden], weights).packed([d.vocab])
     return struct(
         hidden = hidden,
         vocab = d.vocab,
@@ -121,12 +112,21 @@ def layout(id, deploy):
         kv_heads = d.kv_heads,
         head_dim = hd,
         window = d.window,
+        sm_scale = f32(1.0 / f32(sqrt(hd))),
+        rope = struct(
+            theta = d.theta,
+            factor = d.yarn_factor,
+            beta_fast = d.yarn_beta_fast,
+            beta_slow = d.yarn_beta_slow,
+            attention_factor = d.yarn_attention_factor,
+            original_max_position = d.yarn_original_max_position,
+        ),
         kv = deploy.kv,
         embed = weight("embed", [d.vocab, hidden], weights),
-        head = head_,
+        head = head,
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight("final_norm", [hidden], dense),
         final_norm_eps = d.norm_eps,
-        dflash = declare(DFLASH_20B, "aux", hidden, d.vocab, d.norm_eps, weights, dense)
+        dflash = dflash_declare(DFLASH_20B, "aux", hidden, d.vocab, d.norm_eps, weights, dense)
             if deploy.drafter == "dflash" else None,
     )
