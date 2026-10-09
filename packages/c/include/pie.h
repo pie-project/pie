@@ -27,7 +27,8 @@ extern "C" {
 
 typedef enum pie_status {
     PIE_OK = 0,
-    /* A NULL or non-UTF-8 argument, or a config or `listen` that does not parse. */
+    /* A NULL or non-UTF-8 argument (a buffer may be NULL only with length 0),
+       or a config or `listen` that does not parse. */
     PIE_ERR_INVALID_ARGUMENT = 1,
     /* The server was shut down. */
     PIE_ERR_SHUT_DOWN = 2,

@@ -91,11 +91,17 @@ unsafe fn opt_str_arg<'a>(ptr: *const c_char, what: &str) -> Result<Option<&'a s
     }
 }
 
-unsafe fn bytes_arg<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
-    if ptr.is_null() || len == 0 {
-        return &[];
+/// `len` bytes at `ptr`; NULL is an empty buffer only when `len` is zero.
+unsafe fn bytes_arg<'a>(ptr: *const u8, len: usize, what: &str) -> Result<&'a [u8], Failure> {
+    if len == 0 {
+        return Ok(&[]);
     }
-    unsafe { std::slice::from_raw_parts(ptr, len) }
+    if ptr.is_null() {
+        return Err(Failure::invalid(format!(
+            "{what} is NULL with length {len}"
+        )));
+    }
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
 
 unsafe fn out_arg<'a, T>(ptr: *mut T, what: &str) -> Result<&'a mut T, Failure> {
@@ -200,8 +206,9 @@ pub unsafe extern "C" fn pie_server_install(
             let name = out_arg(name, "name")?;
             let file = str_arg(file, "file")?;
             let version = opt_str_arg(version, "version")?;
+            let program = bytes_arg(bytes, len, "bytes")?.to_vec();
             let installed = server
-                .install(bytes_arg(bytes, len).to_vec(), file, version)
+                .install(program, file, version)
                 .map_err(|e| Failure::of(server, "install", e))?;
             *name = to_c(installed);
             Ok(())
@@ -221,8 +228,9 @@ pub unsafe extern "C" fn pie_server_install_language(
         ffi(error, || {
             let server = self::server(server)?;
             let language = str_arg(language, "language")?;
+            let component = bytes_arg(bytes, len, "bytes")?.to_vec();
             server
-                .install_language(language, bytes_arg(bytes, len).to_vec())
+                .install_language(language, component)
                 .map_err(|e| Failure::of(server, "install language", e))?;
             Ok(())
         })
@@ -265,8 +273,9 @@ pub unsafe extern "C" fn pie_server_send_frame(
     unsafe {
         ffi(error, || {
             let server = self::server(server)?;
+            let frame = bytes_arg(frame, len, "frame")?;
             server
-                .send_frame(session, bytes_arg(frame, len))
+                .send_frame(session, frame)
                 .map_err(|e| Failure::of(server, "send frame", e))
         })
     }
@@ -318,5 +327,24 @@ pub unsafe extern "C" fn pie_server_free(server: *mut pie_server) {
 pub unsafe extern "C" fn pie_string_free(s: *mut c_char) {
     if !s.is_null() {
         drop(unsafe { CString::from_raw(s) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_buffer_may_be_null_only_when_empty() {
+        let empty = unsafe { bytes_arg(std::ptr::null(), 0, "bytes") };
+        assert!(matches!(empty, Ok(bytes) if bytes.is_empty()));
+        let refused = unsafe { bytes_arg(std::ptr::null(), 4, "bytes") };
+        assert!(matches!(
+            refused,
+            Err(Failure(pie_status::PIE_ERR_INVALID_ARGUMENT, _))
+        ));
+        let data = [1u8, 2, 3];
+        let read = unsafe { bytes_arg(data.as_ptr(), data.len(), "bytes") };
+        assert!(matches!(read, Ok(bytes) if bytes == data));
     }
 }
