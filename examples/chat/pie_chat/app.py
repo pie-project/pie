@@ -69,7 +69,7 @@ def split_lines(pieces: list[tuple]) -> list[list[tuple]]:
 def history_lines(chat: Chat) -> list[list[tuple]]:
     if _cache["key"] != chat.content_version:
         handler = wheel(chat)
-        pieces: list[tuple] = list(banner(chat))
+        pieces: list[tuple] = []
         for item in chat.transcript:
             if isinstance(item, Markdown):
                 pieces.extend(render(item.text))
@@ -79,8 +79,13 @@ def history_lines(chat: Chat) -> list[list[tuple]]:
     return _cache["history"]
 
 
+def banner_lines(chat: Chat) -> list[list[tuple]]:
+    handler = wheel(chat)
+    return split_lines([(piece[0], piece[1], handler) for piece in banner(chat)])
+
+
 def visible_lines(chat: Chat) -> list[list[tuple]]:
-    lines = history_lines(chat)
+    lines = banner_lines(chat) + history_lines(chat)
     rows = max(1, shutil.get_terminal_size((80, 24)).lines - RESERVED_ROWS)
     chat.scroll_back = min(chat.scroll_back, max(0, len(lines) - rows))
     end = len(lines) - chat.scroll_back
