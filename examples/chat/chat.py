@@ -44,6 +44,22 @@ from prompt_toolkit.widgets import Frame
 ACCENT = "#d97757"  # the warm orange of the demo
 DIM = "#8a8a8a"
 MODEL = "default"  # the name the server answers to
+
+
+def _engine_version() -> str:
+    """The installed engine's version, from `pie --version`, or empty if it is not installed."""
+    pie = shutil.which("pie")
+    if pie is None:
+        return ""
+    try:
+        out = subprocess.run([pie, "--version"], capture_output=True, text=True, timeout=10, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    parts = out.split()
+    return parts[-1] if parts else ""
+
+
+ENGINE_VERSION = _engine_version()
 MODEL_NAME = "Qwen"  # the model family shown in the banner
 
 STYLE = Style.from_dict({
@@ -218,7 +234,7 @@ class Chat:
         # the text starts one line below the top of the mascot, so it sits lower beside it
         info = [
             [],
-            [("class:bold", "pie chat")],
+            [("class:bold", "Pie Code"), ("class:dim", f" v{ENGINE_VERSION}")],
             [("class:dim", f"{MODEL_NAME} · this Mac")],
             [("class:dim", os.getcwd())],
         ]
