@@ -1,12 +1,14 @@
 # The forward of Kimi-K3: each layer's mixer (MLA or KDA) and MLP read a
 # blend of the residual stream's closed AttnRes blocks.
 
+load("//lib/mla/forward.star", "attend", "cache", "plans")
+
 def caches(m, c):
     kv = c.kv_space(m.kv)
     for w in m.layers:
         a = w.mixer
         if a.mla:
-            c.kv(kv, a.kv, [m.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
+            cache(c, kv, a)
         else:
             width = a.heads * a.head_dim
             c.state(a.conv_state, [a.conv_kernel, 3 * width], dtype.bf16, split = 1)
@@ -18,12 +20,7 @@ def opens_block(m, l):
     return m.res_block > 0 and l % m.res_block == 0
 
 def forward(m, inputs):
-    one = fact.single_token()
-    input_d, input_p = inputs.on(one), inputs.on(~one)
-    plan = [
-        ops.attn.mla_plan(input_d, m.mla_heads, m.kv_lora_rank),
-        ops.attn.mla_plan(input_p, m.mla_heads, m.kv_lora_rank),
-    ]
+    plan = plans(inputs, m.mla_heads, m.kv_lora_rank)
     y = ops.layout.embed(inputs.tokens(), m.embed, m.vocab)
     every = m.attn_res == "every"
     routes = inputs.adapter_routes()
@@ -54,7 +51,7 @@ def forward(m, inputs):
 
         x = ops.elemwise.rmsnorm(h, w.mixer_norm, w.mixer_norm_eps)
         if w.mixer.mla:
-            o = mla_mixer(x, inputs, plan, m, w.mixer)
+            o = mla_mixer(x, inputs, plan, w.mixer)
         else:
             o = kda_mixer(x, inputs, w.mixer)
         adapted = fact.has(fact.Adapter)
@@ -108,7 +105,9 @@ def mlp(x, f):
     act = ops.linear.mlp_situ(ops.linear.matmul(x, s.gate_up), s.inter, f.beta, f.up_cap)
     return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
 
-def mla_mixer(x, inputs, plan, m, a):
+def mla_mixer(x, inputs, plan, a):
+    """Latent attention over every cached key, its rope part unrotated and
+    no ATTN_QV seam marked."""
     pages = inputs.kv(a.kv)
     write_page = inputs.write_page(a.kv)
     write_offset = inputs.write_offset(a.kv)
@@ -118,29 +117,16 @@ def mla_mixer(x, inputs, plan, m, a):
         ops.linear.matmul(x, a.kv_a_proj),
         a.kv_a_norm,
         a.kv_a_norm_eps,
-        m.kv_lora_rank,
+        a.kv_lora_rank,
     )
     q_nope, q_pe = ops.attn.mla_split_q_b(
         ops.linear.matmul(q_a, a.q_b_proj),
-        m.mla_heads,
+        a.heads,
         a.qk_nope_head_dim,
         a.qk_rope_head_dim,
     )
     ops.attn.mla_kv_append(kv_c, k_pe, pages, write_page, write_offset)
-
-    q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, m.mla_heads, m.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
-    seam.at(seam.ATTN_Q, [q])
-
-    one = fact.single_token()
-    latent = merge([
-        ops.attn.mla_decode(q.on(one), plan[0], q_pe.on(one), pages, m.mla_heads, m.kv_lora_rank, a.sm_scale),
-        ops.attn.mla_prefill(q.on(~one), plan[1], q_pe.on(~one), pages, m.mla_heads, m.kv_lora_rank, a.sm_scale),
-    ])
-    o = ops.attn.mla_absorb_out(latent, a.kv_b_proj, m.mla_heads, m.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
-    if a.gate != None:
-        o = ops.elemwise.gate_sigmoid_mul(o, ops.linear.matmul(x, a.gate))
-    seam.at(seam.ATTN_OUT, [o])
-    return ops.linear.matmul(o, a.o_proj)
+    return attend(x, q_nope, q_pe, pages, plan, a)
 
 def kda_mixer(x, inputs, k):
     conv = inputs.state(k.conv_state)

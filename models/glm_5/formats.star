@@ -1,6 +1,8 @@
 # How a GLM-5 checkpoint is laid out: transformers' names, each expert's
 # projections a tensor of their own.
 
+load("//lib/mla/formats.star", "named")
+
 def formats(m):
     return [format("huggingface", read = lambda reads: huggingface(m, reads))]
 
@@ -14,13 +16,8 @@ def huggingface(m, reads):
         index = attn.indexer
         reads.read(layer.attn_norm, at("input_layernorm.weight"))
         reads.read(layer.mlp_norm, at("post_attention_layernorm.weight"))
-        reads.read(attn.q_a_proj, at("self_attn.q_a_proj.weight"))
-        reads.read(attn.q_a_norm, at("self_attn.q_a_layernorm.weight"))
-        reads.read(attn.q_b_proj, at("self_attn.q_b_proj.weight"))
-        reads.read(attn.kv_a_proj, at("self_attn.kv_a_proj_with_mqa.weight"))
-        reads.read(attn.kv_a_norm, at("self_attn.kv_a_layernorm.weight"))
-        reads.read(attn.kv_b_proj, at("self_attn.kv_b_proj.weight"))
-        reads.read(attn.o_proj, at("self_attn.o_proj.weight"))
+        for w, name in named(attn, at):
+            reads.read(w, name)
         reads.read(index.q_proj, at("self_attn.indexer.wq_b.weight"))
         reads.read(index.k_proj, at("self_attn.indexer.wk.weight"))
         reads.read(index.weights_proj, at("self_attn.indexer.weights_proj.weight"))
@@ -42,9 +39,8 @@ def huggingface(m, reads):
             expert(e, "down_proj").transmute([1, m.hidden, -1], encoding(f.down.dtype))
             for e in range(f.experts)
         ]))
-        if f.shared != None:
-            reads.read_concat(f.shared.gate_up, [
-                at("mlp.shared_experts.gate_proj.weight"),
-                at("mlp.shared_experts.up_proj.weight"),
-            ])
-            reads.read(f.shared.down, at("mlp.shared_experts.down_proj.weight"))
+        reads.read_concat(f.shared.gate_up, [
+            at("mlp.shared_experts.gate_proj.weight"),
+            at("mlp.shared_experts.up_proj.weight"),
+        ])
+        reads.read(f.shared.down, at("mlp.shared_experts.down_proj.weight"))

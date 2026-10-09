@@ -4,6 +4,7 @@
 # hyper-connected streams; an optional vision tower and MTP draft head.
 
 load("//lib/adapters/model.star", "banks")
+load("//lib/mla/model.star", "attention")
 
 # How many tokens the draft head proposes per step.
 DRAFT_DEPTH = 1
@@ -72,33 +73,19 @@ def layout(id, deploy):
     hc_fan = streams * hidden
     a = d.mla
     k = d.kda
-    q_lora = a.q_lora_rank
-    kv_lora = a.kv_lora_rank
-    qk_head_dim = a.qk_nope_head_dim + a.qk_rope_head_dim
     kda_width = k.heads * k.head_dim
     index_width = d.index_heads * d.index_head_dim
 
-    def mla_at(prefix, kv_row, index_row):
+    def mla_at(prefix, kv, keys):
         n = lambda s: "{}.{}".format(prefix, s)
-        norm = lambda s, width: weight(n(s), [width], dense)
-        return struct(
-            qk_nope_head_dim = a.qk_nope_head_dim,
-            qk_rope_head_dim = a.qk_rope_head_dim,
-            v_head_dim = a.v_head_dim,
-            sm_scale = f32(1.0 / f32(sqrt(qk_head_dim))),
-            q_a_proj = weight(n("q_a_proj"), [q_lora, hidden], weights),
-            q_a_norm = norm("q_a_norm", q_lora),
-            q_a_norm_eps = d.norm_eps,
-            q_b_proj = weight(n("q_b_proj"), [a.heads * qk_head_dim, q_lora], weights).columns(),
-            kv_a_proj = weight(n("kv_a_proj"), [kv_lora + a.qk_rope_head_dim, hidden], weights),
-            kv_a_norm = norm("kv_a_norm", kv_lora),
-            kv_a_norm_eps = d.norm_eps,
-            kv_b_proj = weight(
-                n("kv_b_proj"),
-                [a.heads * (a.qk_nope_head_dim + a.v_head_dim), kv_lora],
-                weights,
-            ).columns(),
-            o_proj = weight(n("o_proj"), [hidden, a.heads * a.v_head_dim], weights).rows(),
+        return attention(
+            n,
+            a,
+            hidden,
+            weights = weights,
+            norms = dense,
+            eps = d.norm_eps,
+            kv = kv,
             indexer = struct(
                 heads = d.index_heads,
                 head_dim = d.index_head_dim,
@@ -106,17 +93,16 @@ def layout(id, deploy):
                 kpool = d.index_kpool,
                 rope_dim = a.qk_rope_head_dim,
                 theta = d.theta,
-                wq_b = weight(n("index_q_proj"), [index_width, q_lora], weights),
+                wq_b = weight(n("index_q_proj"), [index_width, a.q_lora_rank], weights),
                 wk = weight(n("index_k_proj"), [d.index_head_dim, hidden], weights),
                 weights_proj = weight(n("index_weights"), [d.index_heads, hidden], weights),
-                k_norm = norm("index_k_norm", d.index_head_dim),
+                k_norm = weight(n("index_k_norm"), [d.index_head_dim], dense),
                 k_norm_bias = weight(n("index_k_norm_bias"), [d.index_head_dim], dense),
                 k_norm_eps = d.norm_eps,
                 kpool_ape = weight(n("index_kpool_ape"), [d.index_kpool, d.index_head_dim], dtype.f32),
                 kpool_gate = weight(n("index_kpool_gate"), [d.index_head_dim, hidden], dense),
-                keys = index_row,
+                keys = keys,
             ),
-            kv = kv_row,
         )
 
     def routed_at(prefix, banks_dtype):
@@ -226,7 +212,7 @@ def layout(id, deploy):
         vocab = d.vocab,
         act = dense,
         heads = a.heads,
-        kv_lora_rank = kv_lora,
+        kv_lora_rank = a.kv_lora_rank,
         kv = deploy.kv,
         hyper = struct(
             streams = streams,

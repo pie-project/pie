@@ -3,6 +3,8 @@
 # vision tower's patches scattered into the embedded rows; and the MTP head
 # drafting from the trunk's last hidden rows.
 
+load("//lib/mla/forward.star", "attention", "cache", "plans", "whole")
+
 # How many experts the next layer's router is predicted to take.
 PREDICT_K = 16
 
@@ -12,7 +14,7 @@ def caches(m, c):
         a = w.mixer
         if w.mixer_kind == "mla":
             index = c.kv_space(m.kv)
-            c.kv(kv, a.kv, [m.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
+            cache(c, kv, a)
             c.kv(index, a.indexer.keys, [a.indexer.head_dim], a.indexer.head_dim)
         else:
             width = a.heads * a.head_dim
@@ -21,17 +23,12 @@ def caches(m, c):
     if m.mtp != None:
         a = m.mtp.attn
         index = c.kv_space(m.kv)
-        c.kv(kv, a.kv, [m.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
+        cache(c, kv, a)
         c.kv(index, a.indexer.keys, [a.indexer.head_dim], a.indexer.head_dim)
 
 def forward(m, inputs):
     hy = m.hyper
-    one = fact.single_token()
-    input_d, input_p = inputs.on(one), inputs.on(~one)
-    plan = [
-        ops.attn.mla_plan(input_d, m.heads, m.kv_lora_rank),
-        ops.attn.mla_plan(input_p, m.heads, m.kv_lora_rank),
-    ]
+    plan = plans(inputs, m.heads, m.kv_lora_rank)
     positions = inputs.positions()
     towered = tower(inputs, m.tower) if m.tower != None else None
     narrow = ops.layout.embed(inputs.tokens(), m.embed, m.vocab)
@@ -45,7 +42,7 @@ def forward(m, inputs):
         x, post_mix, comb_mix = gate(streams, w.attn_mix, hy)
         x = ops.elemwise.rmsnorm(x, w.mixer_norm, w.mixer_norm_eps)
         if w.mixer_kind == "mla":
-            o = mla_mixer(x, inputs, plan, positions, m, w.mixer, True)
+            o = mla_mixer(x, inputs, plan, positions, m.act, w.mixer)
         else:
             o = kda_mixer(x, inputs, w.mixer)
         adapted = fact.has(fact.Adapter)
@@ -75,8 +72,7 @@ def forward(m, inputs):
     mtp = m.mtp
     if mtp != None:
         input_mtp = inputs.on(fact.drafts())
-        plan_one = ops.attn.mla_plan(input_mtp, m.heads, m.kv_lora_rank)
-        plan_mtp = [plan_one, plan_one]
+        plan_mtp = whole(input_mtp, m.heads, m.kv_lora_rank)
         dy = y.on(fact.drafts())
         dpos = positions.on(fact.drafts())
         dlogits = logits.on(fact.drafts())
@@ -92,7 +88,7 @@ def forward(m, inputs):
                 ops.linear.matmul(h, mtp.h_proj),
             )
             x = ops.elemwise.rmsnorm(fused, mtp.mixer_norm, mtp.mixer_norm_eps)
-            o = mla_mixer(x, input_mtp, plan_mtp, dpos, m, mtp.attn, False)
+            o = mla_mixer(x, input_mtp, plan_mtp, dpos, m.act, mtp.attn)
             r = ops.elemwise.residual_add(o, fused)
             x = ops.elemwise.rmsnorm(r, mtp.mlp_norm, mtp.mlp_norm_eps)
             f = mlp(x, mtp.mlp, None)
@@ -143,58 +139,12 @@ def mlp(x, f, hint):
     act = ops.linear.mlp_swiglu_clamp(ops.linear.matmul(x, s.gate_up), s.inter, f.limit)
     return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
 
-def mla_mixer(x, inputs, plan, positions, m, a, split):
+def mla_mixer(x, inputs, plan, positions, act, a):
     """Latent attention over the keys the indexer picks: its rows split into
     decode and prefill arms, or read whole (the draft head's)."""
-    pages = inputs.kv(a.kv)
-    write_page = inputs.write_page(a.kv)
-    write_offset = inputs.write_offset(a.kv)
-
-    q_a = ops.linear.matmul(x, a.q_a_proj)
-    q_a = ops.elemwise.rmsnorm(q_a, a.q_a_norm, a.q_a_norm_eps)
-    q_b = ops.linear.matmul(q_a, a.q_b_proj)
-    kv_a = ops.linear.matmul(x, a.kv_a_proj)
-    seam.at(seam.ATTN_QV, [q_b, kv_a])
-
-    selection = index_select(x, q_a, inputs, positions, m.act, a.indexer, split)
-
-    kv_c, k_pe = ops.attn.mla_latents(kv_a, a.kv_a_norm, a.kv_a_norm_eps, m.kv_lora_rank)
-    ops.attn.mla_kv_append(kv_c, k_pe, pages, write_page, write_offset)
-
-    q_nope, q_pe = ops.attn.mla_split_q_b(q_b, m.heads, a.qk_nope_head_dim, a.qk_rope_head_dim)
-    q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, m.heads, m.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
-    seam.at(seam.ATTN_Q, [q])
-
-    if split:
-        one = fact.single_token()
-        scored = merge([
-            ops.attn.mla_decode_selected(
-                q.on(one),
-                plan[0],
-                q_pe.on(one),
-                selection.on(one),
-                pages,
-                m.heads,
-                m.kv_lora_rank,
-                a.sm_scale,
-            ),
-            ops.attn.mla_prefill_selected(
-                q.on(~one),
-                plan[1],
-                q_pe.on(~one),
-                selection.on(~one),
-                pages,
-                m.heads,
-                m.kv_lora_rank,
-                a.sm_scale,
-            ),
-        ])
-    else:
-        scored = ops.attn.mla_prefill_selected(q, plan[1], q_pe, selection, pages, m.heads, m.kv_lora_rank, a.sm_scale)
-
-    v = ops.attn.mla_absorb_out(scored, a.kv_b_proj, m.heads, m.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
-    seam.at(seam.ATTN_OUT, [v])
-    return ops.linear.matmul(v, a.o_proj)
+    split = plan.decode != None
+    select = lambda q_a: index_select(x, q_a, inputs, positions, act, a.indexer, split)
+    return attention(x, inputs, plan, a, positions = positions, select = select)
 
 def index_select(x, q_a, inputs, positions, act, ix, split):
     keys = inputs.kv(ix.keys)

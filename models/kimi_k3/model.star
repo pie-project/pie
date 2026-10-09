@@ -3,6 +3,7 @@
 # latent MoE), the residual stream carried as AttnRes blocks.
 
 load("//lib/adapters/model.star", "banks")
+load("//lib/mla/model.star", "attention")
 
 # Where AttnRes blends the residual stream with its closed blocks.
 AT_BLOCK_START = "at_block_start"
@@ -24,7 +25,6 @@ def fixture():
             qk_nope_head_dim = 128,
             qk_rope_head_dim = 64,
             v_head_dim = 128,
-            output_gate = True,
         ),
         kda = struct(heads = 16, head_dim = 128, f_rank = 128, conv_kernel = 4, norm_eps = 1e-5),
         moe = struct(
@@ -63,7 +63,6 @@ def released(layers, experts, res_block):
             qk_nope_head_dim = 128,
             qk_rope_head_dim = 64,
             v_head_dim = 128,
-            output_gate = True,
         ),
         kda = struct(heads = 96, head_dim = 128, f_rank = 128, conv_kernel = 4, norm_eps = 1e-5),
         moe = struct(
@@ -104,8 +103,6 @@ def layout(id, deploy):
     moe_in = d.moe.latent if d.moe.latent != None else hidden
     a = d.mla
     k = d.kda
-    qk_head_dim = a.qk_nope_head_dim + a.qk_rope_head_dim
-    v_width = a.heads * a.v_head_dim
     kda_width = k.heads * k.head_dim
 
     def blend_at(l):
@@ -126,27 +123,16 @@ def layout(id, deploy):
         n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s, width: weight(n(s), [width], weights)
         if closes_a_block(l, d.full_attn_every):
-            mixer = struct(
-                mla = True,
-                qk_nope_head_dim = a.qk_nope_head_dim,
-                qk_rope_head_dim = a.qk_rope_head_dim,
-                v_head_dim = a.v_head_dim,
-                sm_scale = f32(1.0 / f32(sqrt(qk_head_dim))),
-                q_a_proj = weight(n("q_a_proj"), [a.q_lora_rank, hidden], weights),
-                q_a_norm = norm("q_a_norm", a.q_lora_rank),
-                q_a_norm_eps = d.norm_eps,
-                q_b_proj = weight(n("q_b_proj"), [a.heads * qk_head_dim, a.q_lora_rank], weights).columns(),
-                kv_a_proj = weight(n("kv_a_proj"), [a.kv_lora_rank + a.qk_rope_head_dim, hidden], weights),
-                kv_a_norm = norm("kv_a_norm", a.kv_lora_rank),
-                kv_a_norm_eps = d.norm_eps,
-                kv_b_proj = weight(
-                    n("kv_b_proj"),
-                    [a.heads * (a.qk_nope_head_dim + a.v_head_dim), a.kv_lora_rank],
-                    weights,
-                ).columns(),
-                gate = weight(n("o_gate"), [v_width, hidden], weights).columns() if a.output_gate else None,
-                o_proj = weight(n("o_proj"), [hidden, v_width], weights).rows(),
+            mixer = attention(
+                n,
+                a,
+                hidden,
+                weights = weights,
+                norms = weights,
+                eps = d.norm_eps,
                 kv = "kv.{}".format(l),
+                gated = True,
+                mla = True,
             )
         else:
             mixer = struct(

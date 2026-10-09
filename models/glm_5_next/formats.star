@@ -2,6 +2,8 @@
 # already imported, its draft head and vision tower overlaid under `aux.`
 # (`pie model import --aux`), the trunk read as the artifact holds it.
 
+load("//lib/mla/formats.star", "named")
+
 HEAD = "model.language_model.layers.45."
 VISUAL = "model.visual."
 
@@ -168,13 +170,8 @@ def moe(reads, own, n, f):
         read(reads, own, s.down, n("mlp.shared_experts.down_proj.weight"))
 
 def mla(reads, own, n, a):
-    read(reads, own, a.q_a_proj, n("self_attn.q_a_proj.weight"))
-    read(reads, own, a.q_a_norm, n("self_attn.q_a_layernorm.weight"))
-    read(reads, own, a.q_b_proj, n("self_attn.q_b_proj.weight"))
-    read(reads, own, a.kv_a_proj, n("self_attn.kv_a_proj_with_mqa.weight"))
-    read(reads, own, a.kv_a_norm, n("self_attn.kv_a_layernorm.weight"))
-    read(reads, own, a.kv_b_proj, n("self_attn.kv_b_proj.weight"))
-    read(reads, own, a.o_proj, n("self_attn.o_proj.weight"))
+    for w, name in named(a, n):
+        read(reads, own, w, name)
     ix = a.indexer
     read(reads, own, ix.wq_b, n("self_attn.indexer.wq_b.weight"))
     read(reads, own, ix.wk, n("self_attn.indexer.wk.weight"))

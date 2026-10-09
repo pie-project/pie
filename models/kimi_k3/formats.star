@@ -1,6 +1,8 @@
 # How a Kimi-K3 checkpoint is laid out: transformers' names under
 # `language_model.`, or llama.cpp's GGUF names.
 
+load("//lib/mla/formats.star", "named")
+
 GGUF_EMBED = "token_embd.weight"
 
 def formats(m):
@@ -47,7 +49,8 @@ def huggingface(m, reads):
             reads.read(w.mlp_res.norm, at(l, "mlp_res_norm.weight"))
             reads.read(w.mlp_res.proj, at(l, "mlp_res_proj.weight"))
         if w.mixer.mla:
-            mla(reads, l, w.mixer)
+            for a, name in named(w.mixer, lambda leaf: at(l, leaf)):
+                reads.read(a, name)
         else:
             kda(reads, l, w.mixer)
         f = w.mlp
@@ -89,17 +92,6 @@ def huggingface(m, reads):
     if r != None:
         reads.read(r.norm, "language_model.model.output_attn_res_norm.weight")
         reads.read(r.proj, "language_model.model.output_attn_res_proj.weight")
-
-def mla(reads, l, a):
-    reads.read(a.q_a_proj, at(l, "self_attn.q_a_proj.weight"))
-    reads.read(a.q_a_norm, at(l, "self_attn.q_a_layernorm.weight"))
-    reads.read(a.q_b_proj, at(l, "self_attn.q_b_proj.weight"))
-    reads.read(a.kv_a_proj, at(l, "self_attn.kv_a_proj_with_mqa.weight"))
-    reads.read(a.kv_a_norm, at(l, "self_attn.kv_a_layernorm.weight"))
-    reads.read(a.kv_b_proj, at(l, "self_attn.kv_b_proj.weight"))
-    if a.gate != None:
-        reads.read(a.gate, at(l, "self_attn.g_proj.weight"))
-    reads.read(a.o_proj, at(l, "self_attn.o_proj.weight"))
 
 def kda(reads, l, k):
     reads.read_concat(k.qkv, [
@@ -193,8 +185,7 @@ def gguf(m, reads):
             reads.read(a.kv_a_proj, blk(l, "attn_kv_a_mqa.weight"))
             reads.read(a.kv_a_norm, blk(l, "attn_kv_a_norm.weight"))
             reads.read(a.kv_b_proj, blk(l, "attn_kv_b.weight"))
-            if a.gate != None:
-                reads.read(a.gate, blk(l, "attn_gate.weight"))
+            reads.read(a.gate, blk(l, "attn_gate.weight"))
             reads.read(a.o_proj, blk(l, "attn_output.weight"))
         else:
             reads.read(a.qkv, blk(l, "ssm_in.weight"))
