@@ -574,7 +574,7 @@ _TOVA_PROMPT = (
 def _repo_id(model: str) -> str:
     """The HF repository id behind `--model`, which may name a repository
     (`mlx-community/gemma-4-26b-a4b-it-4bit`), a store directory
-    (`~/.pie/models/mlx-community--gemma-4-26b-a4b-it-4bit`) or one stamped
+    (`~/.pie/artifacts/mlx-community--gemma-4-26b-a4b-it-4bit`) or one stamped
     artifact inside it (`<store-dir>/<id>.<deployment>.metal.zt` — the id is the
     file name up to its first dot). A store directory holding two artifacts of
     one model must be named by its artifact, and the geometry helpers below

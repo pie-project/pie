@@ -1,7 +1,7 @@
 //! Qwen3.5's image tower on the device, against numbers Hugging Face
 //! computes for the same picture and prompt. Asked for with
 //! `PIE_XLA_ARTIFACT` naming a Qwen3.5 vision artifact (e.g.
-//! `~/.pie/models/Qwen--Qwen3.5-0.8B/*vision*.xla.zt`).
+//! `~/.pie/artifacts/Qwen--Qwen3.5-0.8B/*vision*.xla.zt`).
 //!
 //! The picture is the `image-captioning` inferlet's: a solid 224 x 224
 //! square, which the preprocessing lifts to 256 x 256 (a 16 x 16 patch grid,

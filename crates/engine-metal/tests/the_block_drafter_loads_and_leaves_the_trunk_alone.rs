@@ -26,7 +26,7 @@ fn artifact() -> Option<PathBuf> {
         let path = PathBuf::from(shellexpand(&named));
         return path.is_file().then_some(path);
     }
-    let store = PathBuf::from(std::env::var("HOME").ok()?).join(".pie/models");
+    let store = PathBuf::from(std::env::var("HOME").ok()?).join(".pie/artifacts");
     for entry in std::fs::read_dir(store).ok()?.flatten() {
         for file in std::fs::read_dir(entry.path()).ok()?.flatten() {
             let name = file.file_name().to_string_lossy().into_owned();
@@ -39,7 +39,7 @@ fn artifact() -> Option<PathBuf> {
 }
 
 fn plain_artifact() -> Option<PathBuf> {
-    let store = PathBuf::from(std::env::var("HOME").ok()?).join(".pie/models");
+    let store = PathBuf::from(std::env::var("HOME").ok()?).join(".pie/artifacts");
     for entry in std::fs::read_dir(store).ok()?.flatten() {
         for file in std::fs::read_dir(entry.path()).ok()?.flatten() {
             let name = file.file_name().to_string_lossy().into_owned();
@@ -123,7 +123,7 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
         return;
     }
     let Some(artifact) = artifact() else {
-        eprintln!("not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/models)");
+        eprintln!("not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/artifacts)");
         return;
     };
     let deployment = poem_compiler::catalog::deployment(DEPLOYMENT)
@@ -248,7 +248,7 @@ fn a_draft_block_fires_and_the_drafter_answers_it() {
         return;
     }
     let Some(artifact) = artifact() else {
-        eprintln!("not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/models)");
+        eprintln!("not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/artifacts)");
         return;
     };
     let deployment = poem_compiler::catalog::deployment(DEPLOYMENT)

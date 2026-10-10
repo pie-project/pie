@@ -10,7 +10,7 @@
 //! the expected cost — and a decode step after it must stay on the GPU.
 //!
 //! Needs a Metal device, the private Neural Engine framework, and a
-//! `metal`-stamped Qwen3.6-27B U4 artifact in `~/.pie/models` (`pie model
+//! `metal`-stamped Qwen3.6-27B U4 artifact in `~/.pie/artifacts` (`pie model
 //! import mlx-community/Qwen3.6-27B-4bit --deployment qwen36-27b-u4g64-kv-bf16`
 //! writes one); skips without them. On a box whose supervisor kills `ANECompilerService`, the
 //! compile is reported refused and the test fails saying so.
@@ -33,7 +33,7 @@ const CONTEXT: u32 = 1024;
 
 /// The artifact and the deployment it was imported as.
 fn artifact() -> Option<(PathBuf, String)> {
-    let store = PathBuf::from(std::env::var("HOME").ok()?).join(".pie/models");
+    let store = PathBuf::from(std::env::var("HOME").ok()?).join(".pie/artifacts");
     for entry in std::fs::read_dir(store).ok()?.flatten() {
         for file in std::fs::read_dir(entry.path()).ok()?.flatten() {
             let path = file.path();
@@ -143,7 +143,7 @@ fn the_split_mlp_matches_the_gpu_alone() {
         return;
     }
     let Some((artifact, name)) = artifact() else {
-        eprintln!("not asked: no metal-stamped {FAMILY}*u4g64* artifact in ~/.pie/models");
+        eprintln!("not asked: no metal-stamped {FAMILY}*u4g64* artifact in ~/.pie/artifacts");
         return;
     };
     let prompt = ids();

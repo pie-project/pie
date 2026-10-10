@@ -89,7 +89,7 @@ fn artifact() -> Option<PathBuf> {
     }
     let homes = [
         format!("{}/models", std::env::var("PIE_HOME").unwrap_or_default()),
-        format!("{}/.pie/models", std::env::var("HOME").unwrap_or_default()),
+        format!("{}/.pie/artifacts", std::env::var("HOME").unwrap_or_default()),
     ];
     homes.iter().find_map(|home| {
         let mut found = walk(Path::new(home));

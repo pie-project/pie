@@ -37,7 +37,7 @@ fn artifact() -> Option<PathBuf> {
         let path = PathBuf::from(named.replace('~', &std::env::var("HOME").unwrap_or_default()));
         return path.is_file().then_some(path);
     }
-    let store = PathBuf::from(std::env::var("HOME").ok()?).join(".pie/models");
+    let store = PathBuf::from(std::env::var("HOME").ok()?).join(".pie/artifacts");
     for entry in std::fs::read_dir(store).ok()?.flatten() {
         for file in std::fs::read_dir(entry.path()).ok()?.flatten() {
             let name = file.file_name().to_string_lossy().into_owned();
@@ -66,7 +66,7 @@ fn the_target_keeps_a_measured_prefix_of_every_block() {
         return;
     }
     let Some(artifact) = artifact() else {
-        eprintln!("not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/models)");
+        eprintln!("not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/artifacts)");
         return;
     };
     let deployment = poem_compiler::catalog::deployment(DEPLOYMENT)
