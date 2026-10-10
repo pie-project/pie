@@ -43,6 +43,9 @@ pub trait PoolPort: Send + Sync + 'static {
     fn rs_stats(&self) -> (u32, u32);
     fn rs_host_stats(&self) -> (u32, u32);
     fn reclaim_idle(&self) -> u32;
+    /// The device pages [`PoolPort::reclaim_idle`] would free now, without
+    /// freeing them.
+    fn reclaimable_idle(&self) -> u32;
     fn suspend_capable(&self) -> bool;
     fn locus(&self) -> (usize, usize);
     fn reserve_device(
@@ -129,6 +132,12 @@ impl PoolPort for RegistryPool {
             freed
         });
         (pages + self.with_rs(|rs| rs.drop_unused_indexes())) as u32
+    }
+
+    fn reclaimable_idle(&self) -> u32 {
+        self.with_kv_tagged("planner-reclaimable-idle", |kv| {
+            kv.reclaimable_cache_pages()
+        })
     }
 
     fn suspend_capable(&self) -> bool {
@@ -3042,7 +3051,10 @@ impl ResidencyPlanner {
         };
         // Pages an idle process holds are headroom: the next demand evicts
         // them first. Counted as pressure, they would hold a launch at the
-        // gateway that no fire is left to free them for.
+        // gateway that no fire is left to free them for. So are the pages
+        // only an unused cache lease keeps (a finished process's indexed
+        // prefix): the next reservation drops the lease, but a launch the
+        // gateway holds back on their account never makes one.
         let idle: Vec<ProcessId> = self.with_inner(|inner| {
             inner
                 .procs
@@ -3055,7 +3067,8 @@ impl ResidencyPlanner {
         let reclaimable: u32 = idle
             .into_iter()
             .map(|pid| held_page_count(pid, model, engine))
-            .sum();
+            .sum::<u32>()
+            .saturating_add(self.port.reclaimable_idle());
         let (free, total) = self.port.device_stats();
         let device = ratio((free.saturating_add(reclaimable).min(total), total));
         let mut bucket = (device.max(ratio((swap_free, swap_total))) * 255.0).round() as u8;
@@ -3437,6 +3450,9 @@ mod starvation_race_tests {
             (0, 0)
         }
         fn reclaim_idle(&self) -> u32 {
+            0
+        }
+        fn reclaimable_idle(&self) -> u32 {
             0
         }
         fn suspend_capable(&self) -> bool {
