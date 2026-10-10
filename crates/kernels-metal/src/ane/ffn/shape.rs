@@ -12,8 +12,8 @@ pub const INTERMEDIATE_BLOCK: u32 = 512;
 pub const UNIT: u32 = 512;
 /// The program has one procedure per row count from `MIN_ROWS` to
 /// `MAX_ROWS` in steps of `STEP`; fewer rows than `MIN_ROWS` stay on the GPU.
-pub const MIN_ROWS: u32 = 512;
-pub const MAX_ROWS: u32 = 2048;
+pub const MIN_ROWS: u32 = 128;
+pub const MAX_ROWS: u32 = 4096;
 pub const STEP: u32 = 128;
 pub const INT8_PEAK: f64 = 127.0;
 pub const INT8_UNIT: f64 = 128.0;
