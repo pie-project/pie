@@ -1374,9 +1374,11 @@ impl KvPageTable {
         marked
     }
 
-    pub fn drop_unused_cache_leases(&mut self) -> (usize, Vec<KvPageBacking>) {
+    /// The cache leases nothing live reads through: no working set's chain
+    /// and no pin passes their node.
+    fn unused_cache_roots(&self) -> Vec<NodeId> {
         if self.cache_roots.is_empty() {
-            return (0, Vec::new());
+            return Vec::new();
         }
         let live = self.mark_chains(
             self.working_sets
@@ -1384,12 +1386,45 @@ impl KvPageTable {
                 .filter_map(|(_, e)| e.terminal)
                 .chain(self.pins.keys().copied()),
         );
-        let dropped: Vec<NodeId> = self
-            .cache_roots
+        self.cache_roots
             .keys()
             .copied()
             .filter(|node| !live.contains(node))
-            .collect();
+            .collect()
+    }
+
+    /// The device pages [`Self::drop_unused_cache_leases`] would free now,
+    /// counted without freeing them: a node goes when every anchor on its
+    /// path is a dropped lease, and takes the pages it owns outright with it.
+    pub fn unused_cache_lease_pages(&self) -> u32 {
+        let mut leases: HashMap<NodeId, u32> = HashMap::new();
+        for root in self.unused_cache_roots() {
+            let mut cursor = Some(root);
+            while let Some(node) = cursor {
+                *leases.entry(node).or_insert(0) += 1;
+                cursor = self.nodes.get(node).expect("live node").parent;
+            }
+        }
+        leases
+            .into_iter()
+            .map(
+                |(node, dropped)| match self.nodes.get(node).expect("live node") {
+                    KvTrieNode {
+                        path_anchors,
+                        pages: Pages::Owned { backings, .. },
+                        ..
+                    } if *path_anchors == dropped => backings
+                        .iter()
+                        .filter(|backing| matches!(backing, KvPageBacking::Resident(_)))
+                        .count() as u32,
+                    _ => 0,
+                },
+            )
+            .sum()
+    }
+
+    pub fn drop_unused_cache_leases(&mut self) -> (usize, Vec<KvPageBacking>) {
+        let dropped = self.unused_cache_roots();
         let mut freed = Vec::new();
         for node in &dropped {
             self.cache_roots.remove(node);
