@@ -38,8 +38,8 @@ pub struct Schedule {
 }
 
 pub fn of(deployment: Option<&str>) -> Option<GenerativeFacts> {
-    let deployment = models::Deployment::parse(deployment?)?;
-    let generative = deployment.generative.as_ref()?;
+    let deployment = runtime::catalog::catalog().parse(deployment?)?;
+    let generative = deployment.generative()?;
     Some(GenerativeFacts {
         readings: generative.readings.iter().map(reading).collect(),
         latent: generative.latent.map(|l| Latent {
@@ -52,9 +52,9 @@ pub fn of(deployment: Option<&str>) -> Option<GenerativeFacts> {
         }),
         schedule: generative.schedule.as_ref().map(|s| Schedule {
             kind: match s.kind {
-                models::ScheduleKind::Flow => "flow",
-                models::ScheduleKind::Epsilon => "epsilon",
-                models::ScheduleKind::V => "v-prediction",
+                poem::generative::ScheduleKind::Flow => "flow",
+                poem::generative::ScheduleKind::Epsilon => "epsilon",
+                poem::generative::ScheduleKind::V => "v-prediction",
             }
             .to_string(),
             shift: s.shift,
@@ -66,7 +66,7 @@ pub fn of(deployment: Option<&str>) -> Option<GenerativeFacts> {
     })
 }
 
-fn reading(fact: &models::ReadingFact) -> Reading {
+fn reading(fact: &poem::generative::ReadingFact) -> Reading {
     Reading {
         name: fact.name.to_string(),
         index: fact.index,
@@ -83,24 +83,24 @@ fn reading(fact: &models::ReadingFact) -> Reading {
             .map(|port| format!("{}[{}]", port.name, port.width))
             .collect(),
         readout: match fact.readout {
-            models::ReadoutKind::Logits => "logits",
-            models::ReadoutKind::Velocity => "velocity",
-            models::ReadoutKind::Hidden => "hidden",
-            models::ReadoutKind::Pixels => "pixels",
+            poem::generative::ReadoutKind::Logits => "logits",
+            poem::generative::ReadoutKind::Velocity => "velocity",
+            poem::generative::ReadoutKind::Hidden => "hidden",
+            poem::generative::ReadoutKind::Pixels => "pixels",
         }
         .to_string(),
         readout_width: fact.readout_width,
     }
 }
 
-fn stream(stream: models::Stream) -> &'static str {
+fn stream(stream: poem::Stream) -> &'static str {
     match stream {
-        models::Stream::Text => "text",
-        models::Stream::Image => "image",
-        models::Stream::Video => "video",
-        models::Stream::Audio => "audio",
-        models::Stream::Context => "context",
-        models::Stream::Reference => "reference",
+        poem::Stream::Text => "text",
+        poem::Stream::Image => "image",
+        poem::Stream::Video => "video",
+        poem::Stream::Audio => "audio",
+        poem::Stream::Context => "context",
+        poem::Stream::Reference => "reference",
     }
 }
 
@@ -197,8 +197,8 @@ mod tests {
     }
 
     fn a_text_row_reports_nothing_here() {
-        let text = models::deployments()
-            .find(|deployment| deployment.generative.is_none())
+        let text = runtime::catalog::deployments()
+            .find(|deployment| deployment.generative().is_none())
             .expect("the catalog ships text rows");
         assert!(of(Some(&text.name)).is_none());
         assert!(of(None).is_none());

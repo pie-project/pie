@@ -45,7 +45,7 @@ fn word(query_len: u32) -> u64 {
     static FACTS: OnceLock<poem_ir::Facts> = OnceLock::new();
     FACTS
         .get_or_init(|| {
-            models::deployment(DEPLOYMENT)
+            poem_compiler::catalog::deployment(DEPLOYMENT)
                 .expect("the catalog ships the deployment")
                 .trace(Platform::Cuda)
                 .facts
@@ -69,7 +69,8 @@ fn ready(what: &str) -> Option<Shell> {
         eprintln!("skipping {what}: {checkpoint:?} holds no tensor container");
         return None;
     };
-    let deployment = models::deployment(DEPLOYMENT).expect("the catalog ships the deployment");
+    let deployment =
+        poem_compiler::catalog::deployment(DEPLOYMENT).expect("the catalog ships the deployment");
     let trace = deployment.trace(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
     let contract = deployment

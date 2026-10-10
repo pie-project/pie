@@ -15,7 +15,7 @@ const REPO: &str = "models--mlx-community--DeepSeek-V4-Flash-2bit-DQ";
 
 /// The facts the deployment `deployment` classifies its lanes by.
 fn facts_of(deployment: &str) -> poem_ir::Facts {
-    models::deployment(deployment)
+    poem_compiler::catalog::deployment(deployment)
         .expect("the catalog ships the row")
         .trace(Platform::Metal)
         .facts
@@ -157,7 +157,7 @@ struct Read {
 }
 
 fn read(artifact: &Path) -> Read {
-    let trace = models::deployment(DEPLOYMENT)
+    let trace = poem_compiler::catalog::deployment(DEPLOYMENT)
         .expect("the catalog ships the full 2-bit row")
         .trace(Platform::Metal);
     let source = ztensor_compat::index(artifact).expect("the artifact opens");

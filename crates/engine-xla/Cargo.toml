@@ -33,7 +33,7 @@ serde_json = "1"
 
 [dev-dependencies]
 poem = { package = "pie-poem", path = "../poem" }
-models = { path = "../models" }
+media = { path = "../media" }
 tokenizer = { path = "../tokenizer" }
 serde_json = "1"
 ztensor-compat = { workspace = true }

@@ -113,11 +113,11 @@ pub struct ForwardBindings {
     pub rs_fold_len: Option<Vec<u32>>,
     pub max_layers: Option<u32>,
     pub block_draft: bool,
-    pub media: Vec<std::sync::Arc<models::media::EncodedSpan>>,
+    pub media: Vec<std::sync::Arc<media::front::EncodedSpan>>,
     pub canvas: Option<CanvasMode>,
     pub self_cond: Option<SelfCondPayload>,
     pub reading: Option<u8>,
-    pub stream: Option<models::Stream>,
+    pub stream: Option<poem::Stream>,
     pub group: Option<u32>,
     pub peer: Option<u32>,
     pub ports: Vec<PortBinding>,
@@ -195,28 +195,28 @@ pub fn cohort_key(group: Option<u32>, peer: Option<u32>) -> Option<u32> {
 }
 
 #[must_use]
-pub fn lane_stream_of(stream: models::Stream) -> ::engine::fire::LaneStream {
+pub fn lane_stream_of(stream: poem::Stream) -> ::engine::fire::LaneStream {
     use ::engine::fire::LaneStream;
     match stream {
-        models::Stream::Text => LaneStream::Text,
-        models::Stream::Image => LaneStream::Image,
-        models::Stream::Video => LaneStream::Video,
-        models::Stream::Audio => LaneStream::Audio,
-        models::Stream::Context => LaneStream::Context,
-        models::Stream::Reference => LaneStream::Reference,
+        poem::Stream::Text => LaneStream::Text,
+        poem::Stream::Image => LaneStream::Image,
+        poem::Stream::Video => LaneStream::Video,
+        poem::Stream::Audio => LaneStream::Audio,
+        poem::Stream::Context => LaneStream::Context,
+        poem::Stream::Reference => LaneStream::Reference,
     }
 }
 
 #[must_use]
-pub fn stream_of_lane(stream: ::engine::fire::LaneStream) -> models::Stream {
+pub fn stream_of_lane(stream: ::engine::fire::LaneStream) -> poem::Stream {
     use ::engine::fire::LaneStream;
     match stream {
-        LaneStream::Text => models::Stream::Text,
-        LaneStream::Image => models::Stream::Image,
-        LaneStream::Video => models::Stream::Video,
-        LaneStream::Audio => models::Stream::Audio,
-        LaneStream::Context => models::Stream::Context,
-        LaneStream::Reference => models::Stream::Reference,
+        LaneStream::Text => poem::Stream::Text,
+        LaneStream::Image => poem::Stream::Image,
+        LaneStream::Video => poem::Stream::Video,
+        LaneStream::Audio => poem::Stream::Audio,
+        LaneStream::Context => poem::Stream::Context,
+        LaneStream::Reference => poem::Stream::Reference,
     }
 }
 

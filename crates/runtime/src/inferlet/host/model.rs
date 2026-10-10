@@ -3,41 +3,41 @@ use crate::inferlet::host::pie;
 use crate::model;
 use anyhow::Result;
 
-pub fn lane_stream(stream: models::Stream) -> pie::inferlet::model::LaneStream {
+pub fn lane_stream(stream: poem::Stream) -> pie::inferlet::model::LaneStream {
     use pie::inferlet::model::LaneStream;
     match stream {
-        models::Stream::Text => LaneStream::Text,
-        models::Stream::Image => LaneStream::Image,
-        models::Stream::Video => LaneStream::Video,
-        models::Stream::Audio => LaneStream::Audio,
-        models::Stream::Context => LaneStream::Context,
-        models::Stream::Reference => LaneStream::Reference,
+        poem::Stream::Text => LaneStream::Text,
+        poem::Stream::Image => LaneStream::Image,
+        poem::Stream::Video => LaneStream::Video,
+        poem::Stream::Audio => LaneStream::Audio,
+        poem::Stream::Context => LaneStream::Context,
+        poem::Stream::Reference => LaneStream::Reference,
     }
 }
 
-pub fn catalog_stream(stream: pie::inferlet::model::LaneStream) -> models::Stream {
+pub fn catalog_stream(stream: pie::inferlet::model::LaneStream) -> poem::Stream {
     use pie::inferlet::model::LaneStream;
     match stream {
-        LaneStream::Text => models::Stream::Text,
-        LaneStream::Image => models::Stream::Image,
-        LaneStream::Video => models::Stream::Video,
-        LaneStream::Audio => models::Stream::Audio,
-        LaneStream::Context => models::Stream::Context,
-        LaneStream::Reference => models::Stream::Reference,
+        LaneStream::Text => poem::Stream::Text,
+        LaneStream::Image => poem::Stream::Image,
+        LaneStream::Video => poem::Stream::Video,
+        LaneStream::Audio => poem::Stream::Audio,
+        LaneStream::Context => poem::Stream::Context,
+        LaneStream::Reference => poem::Stream::Reference,
     }
 }
 
-fn axis_role(role: models::AxisRole) -> pie::inferlet::model::AxisRole {
+fn axis_role(role: poem::generative::AxisRole) -> pie::inferlet::model::AxisRole {
     use pie::inferlet::model::AxisRole;
     match role {
-        models::AxisRole::Time => AxisRole::Time,
-        models::AxisRole::Height => AxisRole::Height,
-        models::AxisRole::Width => AxisRole::Width,
-        models::AxisRole::Index => AxisRole::Index,
+        poem::generative::AxisRole::Time => AxisRole::Time,
+        poem::generative::AxisRole::Height => AxisRole::Height,
+        poem::generative::AxisRole::Width => AxisRole::Width,
+        poem::generative::AxisRole::Index => AxisRole::Index,
     }
 }
 
-fn reading_fact(reading: &models::ReadingFact) -> pie::inferlet::model::ReadingFact {
+fn reading_fact(reading: &poem::generative::ReadingFact) -> pie::inferlet::model::ReadingFact {
     use pie::inferlet::model::{PortKind, ReadoutKind};
     pie::inferlet::model::ReadingFact {
         name: reading.name.to_string(),
@@ -51,11 +51,11 @@ fn reading_fact(reading: &models::ReadingFact) -> pie::inferlet::model::ReadingF
             .map(|port| pie::inferlet::model::PortFact {
                 name: port.name.to_string(),
                 kind: match port.kind {
-                    models::PortKind::Latents => PortKind::Latents,
-                    models::PortKind::LaneVector => PortKind::LaneVector,
-                    models::PortKind::Context => PortKind::Context,
-                    models::PortKind::AxisPositions => PortKind::AxisPositions,
-                    models::PortKind::Voxels => PortKind::Voxels,
+                    poem::generative::PortKind::Latents => PortKind::Latents,
+                    poem::generative::PortKind::LaneVector => PortKind::LaneVector,
+                    poem::generative::PortKind::Context => PortKind::Context,
+                    poem::generative::PortKind::AxisPositions => PortKind::AxisPositions,
+                    poem::generative::PortKind::Voxels => PortKind::Voxels,
                 },
                 width: port.width,
                 dtype: pie::inferlet::types::Dtype::F32,
@@ -73,10 +73,10 @@ fn reading_fact(reading: &models::ReadingFact) -> pie::inferlet::model::ReadingF
             }
         }),
         readout: match reading.readout {
-            models::ReadoutKind::Logits => ReadoutKind::Logits,
-            models::ReadoutKind::Velocity => ReadoutKind::Velocity,
-            models::ReadoutKind::Hidden => ReadoutKind::Hidden,
-            models::ReadoutKind::Pixels => ReadoutKind::Pixels,
+            poem::generative::ReadoutKind::Logits => ReadoutKind::Logits,
+            poem::generative::ReadoutKind::Velocity => ReadoutKind::Velocity,
+            poem::generative::ReadoutKind::Hidden => ReadoutKind::Hidden,
+            poem::generative::ReadoutKind::Pixels => ReadoutKind::Pixels,
         },
         readout_width: reading.readout_width,
     }
@@ -156,9 +156,9 @@ impl pie::inferlet::model::Host for ProcessCtx {
             .and_then(|g| g.schedule.as_ref())
             .map(|s| pie::inferlet::model::ScheduleFact {
                 kind: match s.kind {
-                    models::ScheduleKind::Flow => ScheduleKind::Flow,
-                    models::ScheduleKind::Epsilon => ScheduleKind::Epsilon,
-                    models::ScheduleKind::V => ScheduleKind::V,
+                    poem::generative::ScheduleKind::Flow => ScheduleKind::Flow,
+                    poem::generative::ScheduleKind::Epsilon => ScheduleKind::Epsilon,
+                    poem::generative::ScheduleKind::V => ScheduleKind::V,
                 },
                 shift: s.shift,
                 train_steps: s.train_steps,

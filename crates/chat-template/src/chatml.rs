@@ -7,12 +7,13 @@ use crate::{
     ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar, special, specials,
 };
 
+#[derive(Clone, Debug)]
 pub struct ChatML {
     pub thinking: bool,
     pub preserve_thinking: bool,
     pub tools: bool,
-    pub generation_suffix: &'static str,
-    pub stop_tokens: &'static [&'static str],
+    pub generation_suffix: String,
+    pub stop_tokens: Vec<String>,
 }
 
 const THINK_OPEN: &str = "<think>";
@@ -41,7 +42,7 @@ pub struct ChatMLInstruct {
 impl ChatMLInstruct {
     #[must_use]
     pub fn new(tokenizer: Arc<Tokenizer>, config: ChatML) -> Self {
-        let stop_ids = specials(&tokenizer, config.stop_tokens);
+        let stop_ids = specials(&tokenizer, &config.stop_tokens);
 
         let im_start = special(&tokenizer, "<|im_start|>");
         let im_end = special(&tokenizer, "<|im_end|>");
@@ -63,7 +64,7 @@ impl ChatMLInstruct {
         tool_response_suffix.extend(tokenizer.encode("</tool_response>"));
 
         let mut generation_header = header("assistant");
-        generation_header.extend(tokenizer.encode(config.generation_suffix));
+        generation_header.extend(tokenizer.encode(&config.generation_suffix));
 
         Self {
             system_prefix: header("system"),
@@ -299,8 +300,8 @@ mod tests {
             thinking,
             preserve_thinking,
             tools: true,
-            generation_suffix: "",
-            stop_tokens: &["<|im_end|>"],
+            generation_suffix: String::new(),
+            stop_tokens: vec!["<|im_end|>".to_string()],
         }
     }
 

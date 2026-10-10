@@ -247,7 +247,7 @@ mod tests {
     use super::*;
 
     fn d0_8b() -> Trace {
-        models::deployment("qwen35-d0.8b-bf16-kv-bf16")
+        crate::catalog::deployment("qwen35-d0.8b-bf16-kv-bf16")
             .expect("the catalog ships it")
             .trace(Platform::Cuda)
     }

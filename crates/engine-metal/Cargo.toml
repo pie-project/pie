@@ -71,7 +71,6 @@ objc2-metal = { version = "0.3", default-features = false, features = [
 
 [dev-dependencies]
 poem = { package = "pie-poem", path = "../poem" }
-models = { path = "../models" }
 tokenizer = { path = "../tokenizer" }
 serde_json = "1"
 ztensor = { workspace = true }

@@ -1,4 +1,4 @@
-use models::media::EncodedSpan;
+use media::front::EncodedSpan;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -252,7 +252,7 @@ pub fn lane_media(matched: &[MatchedRun], lane_rows: &[u32], lane_base: &[u32]) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use models::media::Grid;
+    use media::front::Grid;
 
     const PAD: u32 = 151_655;
 

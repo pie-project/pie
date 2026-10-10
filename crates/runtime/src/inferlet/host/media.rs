@@ -4,7 +4,7 @@ pub mod multimodal;
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 use anyhow::Result;
-use models::media::{
+use media::front::{
     AudioFrontEnd, Budget, Delimiters, EncodedSpan, Fault, Grid, Rgb8, VisionFrontEnd,
 };
 use std::sync::Arc;
@@ -44,7 +44,7 @@ impl AudioFrontEnd for AudioAdapter {
         }
     }
 
-    fn encode_audio(&self, bytes: &[u8]) -> models::media::Result<EncodedSpan> {
+    fn encode_audio(&self, bytes: &[u8]) -> media::front::Result<EncodedSpan> {
         let (mel, n_frames) = multimodal::audio::process_wav_bytes(bytes).map_err(Fault::Decode)?;
         if n_frames == 0 {
             return Err(Fault::Empty("audio: clip decoded to zero frames".into()));
@@ -74,16 +74,16 @@ impl AudioFrontEnd for AudioAdapter {
     }
 }
 
-fn vision_front_end() -> models::media::Result<Box<dyn VisionFrontEnd>> {
+fn vision_front_end() -> media::front::Result<Box<dyn VisionFrontEnd>> {
     let m = crate::model::model();
     let arch = m.arch_name();
-    models::media::vision_front_end(arch).ok_or_else(|| Fault::NoVisionFrontEnd {
+    media::front::vision_front_end(arch).ok_or_else(|| Fault::NoVisionFrontEnd {
         model: m.name().to_string(),
         arch: arch.to_string(),
     })
 }
 
-fn audio_front_end() -> models::media::Result<AudioAdapter> {
+fn audio_front_end() -> media::front::Result<AudioAdapter> {
     let m = crate::model::model();
     let arch = m.arch_name();
     if multimodal::audio_arch_supported(arch) {

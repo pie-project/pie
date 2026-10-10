@@ -4,8 +4,8 @@ use poem_ir::Platform;
 /// once, right after it, and nothing else is added.
 #[test]
 fn a_split_row_reduces_each_projection_once() {
-    let deployment =
-        models::deployment("qwen35-d0.8b-bf16-kv-bf16-tp2").expect("the catalog ships the row");
+    let deployment = crate::catalog::deployment("qwen35-d0.8b-bf16-kv-bf16-tp2")
+        .expect("the catalog ships the row");
     let trace = deployment.trace(Platform::Cuda);
     let count = |op: &str| {
         trace
@@ -24,7 +24,7 @@ fn a_split_row_reduces_each_projection_once() {
         0,
         "the 0.8b row ties no vocab-split head"
     );
-    let whole = models::deployment("qwen35-d0.8b-bf16-kv-bf16")
+    let whole = crate::catalog::deployment("qwen35-d0.8b-bf16-kv-bf16")
         .expect("the one-rank row")
         .trace(Platform::Cuda);
     assert_eq!(trace.nodes.len(), whole.nodes.len() + 48);

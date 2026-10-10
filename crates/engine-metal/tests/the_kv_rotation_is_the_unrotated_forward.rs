@@ -26,9 +26,9 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use engine_metal::{Boot, Lane, Shell};
-use models::star::{import_of, trace_of};
 use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
+use poem_compiler::catalog::{import_of, trace_of};
 use poem_ir::{Elementwise, Operation};
 
 // ---- the micro_text shape (must match the package's `qwen3-micro-text`) --------------

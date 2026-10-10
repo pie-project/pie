@@ -71,8 +71,17 @@ fn consuming_marker(source: &Path) -> PathBuf {
 
 pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<crate::ui::Answer> {
     if let Some(name) = args.drafter.take() {
-        let Some(published) = models::published::lookup(&args.source, &name) else {
-            let known: Vec<String> = models::published::for_target(&args.source)
+        let wanted = args.source.to_ascii_lowercase().replace("--", "/");
+        let for_target: Vec<&poem::star::Published> = runtime::catalog::catalog()
+            .published()
+            .filter(|p| p.target.to_ascii_lowercase() == wanted)
+            .collect();
+        let Some(published) = for_target
+            .iter()
+            .find(|p| p.drafter.eq_ignore_ascii_case(&name))
+        else {
+            let known: Vec<String> = for_target
+                .iter()
                 .map(|p| format!("`{}` ({})", p.drafter, p.head))
                 .collect();
             bail!(

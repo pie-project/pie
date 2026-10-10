@@ -15,7 +15,7 @@ const STEPS: usize = 4;
 
 /// The facts the deployment `deployment` classifies its lanes by.
 fn facts_of(deployment: &str) -> poem_ir::Facts {
-    models::deployment(deployment)
+    poem_compiler::catalog::deployment(deployment)
         .expect("the catalog ships the row")
         .trace(Platform::Metal)
         .facts
@@ -126,8 +126,8 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
         eprintln!("not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/models)");
         return;
     };
-    let deployment =
-        models::deployment(DEPLOYMENT).expect("the catalog ships the block-drafter row");
+    let deployment = poem_compiler::catalog::deployment(DEPLOYMENT)
+        .expect("the catalog ships the block-drafter row");
     let trace = deployment.trace(Platform::Metal);
     let source = ztensor_compat::index(&artifact).expect("the artifact opens");
     let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Metal)
@@ -176,8 +176,8 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
         );
         return;
     };
-    let plain_deployment =
-        models::deployment(PLAIN_DEPLOYMENT).expect("the catalog ships the plain row");
+    let plain_deployment = poem_compiler::catalog::deployment(PLAIN_DEPLOYMENT)
+        .expect("the catalog ships the plain row");
     let plain_trace = plain_deployment.trace(Platform::Metal);
     let plain_source = ztensor_compat::index(&plain_artifact).expect("the artifact opens");
     let plain_contract =
@@ -251,8 +251,8 @@ fn a_draft_block_fires_and_the_drafter_answers_it() {
         eprintln!("not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/models)");
         return;
     };
-    let deployment =
-        models::deployment(DEPLOYMENT).expect("the catalog ships the block-drafter row");
+    let deployment = poem_compiler::catalog::deployment(DEPLOYMENT)
+        .expect("the catalog ships the block-drafter row");
     let trace = deployment.trace(Platform::Metal);
     let drafter = trace.drafter.expect("the row states its block drafter");
     let source = ztensor_compat::index(&artifact).expect("the artifact opens");

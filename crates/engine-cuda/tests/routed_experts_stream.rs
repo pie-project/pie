@@ -3,7 +3,7 @@ use poem::{Dtype, Platform};
 use poem_ir::Trace;
 
 fn micro() -> Trace {
-    models::star::trace_of("qwen3-a3b-micro", Dtype::Bf16, Dtype::Bf16, Platform::Cuda)
+    poem_compiler::catalog::trace_of("qwen3-a3b-micro", Dtype::Bf16, Dtype::Bf16, Platform::Cuda)
 }
 
 fn full_demand(trace: &Trace) -> u64 {

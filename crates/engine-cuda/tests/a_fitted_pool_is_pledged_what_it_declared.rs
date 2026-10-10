@@ -80,7 +80,8 @@ fn a_fitted_pool_is_pledged_what_it_declared() {
         eprintln!("{checkpoint:?} holds no tensor container");
         return;
     };
-    let deployment = models::deployment(DEPLOYMENT).expect("the catalog ships the deployment");
+    let deployment =
+        poem_compiler::catalog::deployment(DEPLOYMENT).expect("the catalog ships the deployment");
     let trace = deployment.trace(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
     let contract = deployment
@@ -159,7 +160,7 @@ fn a_fitted_pool_is_pledged_what_it_declared() {
     let lane = Lane {
         slot: 0,
         word: deployment
-            .trace(models::Platform::Cuda)
+            .trace(poem::Platform::Cuda)
             .facts
             .word(&Request::new(rows, false)),
         tokens: &tokens,

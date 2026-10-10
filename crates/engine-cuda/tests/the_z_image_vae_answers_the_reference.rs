@@ -19,7 +19,7 @@ fn fire(
     clip: [u32; 3],
     payload: &[f32],
 ) -> (Vec<f32>, Vec<[u32; 3]>, f64, f64) {
-    let row = models::deployment(ROW).expect("the flagship row");
+    let row = poem_compiler::catalog::deployment(ROW).expect("the flagship row");
     let src = checkpoint::file::diffusers::open(root)
         .unwrap_or_else(|why| panic!("{}: {why}", root.display()));
     let mut contract = row
@@ -28,8 +28,8 @@ fn fire(
     drop(src);
     let trace = one_arm("z-image-turbo", decode)
         .trace(
-            row.entry.id,
-            &models::star::deploy(&row.deploy),
+            &row.model.id,
+            &row.deploy,
             if decode {
                 "z-image-vae-decode"
             } else {

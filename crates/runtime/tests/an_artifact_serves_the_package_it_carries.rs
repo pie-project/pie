@@ -10,7 +10,8 @@ use poem::star::Package;
 use runtime::engine::load::{Overrides, packaged};
 
 const PACKAGE: &str = r#"
-MODELS = [model("stranger-1b", template = "qwen_3", tokenizer = "qwen_3", arch = "stranger", layers = 1, vocab = 16)]
+CHATML = template("chatml", thinking = True, tools = True, stop = ["<|im_end|>"])
+MODELS = [model("stranger-1b", template = CHATML, tokenizer = tokenizer(markers = [["<|im_end|>"]]), arch = "stranger", layers = 1, vocab = 16)]
 DEPLOYMENTS = [deployment("stranger-1b", weights = dtype.bf16, kv = dtype.bf16)]
 "#;
 
@@ -53,7 +54,7 @@ fn a_model_no_catalog_lists_serves_from_its_artifact() {
         ],
     )
     .unwrap();
-    assert!(models::deployment("stranger-1b-bf16-kv-bf16").is_none());
+    assert!(runtime::catalog::deployment("stranger-1b-bf16-kv-bf16").is_none());
     let dir = tempfile::tempdir().unwrap();
     let path = artifact(dir.path(), &package);
 
@@ -67,9 +68,9 @@ fn a_model_no_catalog_lists_serves_from_its_artifact() {
     let registered = runtime::model::deployment_of(&name, &path).unwrap();
     assert_eq!(
         (
-            registered.entry.arch,
-            registered.entry.layers,
-            registered.entry.vocab
+            registered.model.arch.as_str(),
+            registered.model.layers,
+            registered.model.vocab
         ),
         ("stranger", 1, 16),
         "the runtime registers it by its package"

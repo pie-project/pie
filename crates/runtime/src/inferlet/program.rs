@@ -578,8 +578,7 @@ fn deserialize_component(engine: &WasmEngine, precompiled: &[u8]) -> Result<Comp
     // wasmtime cannot verify the code inside. They come from the host that
     // embeds this runtime (the page, in a browser), which is trusted as much
     // as the runtime itself: it supplies the language component's source too.
-    unsafe { Component::deserialize(engine, precompiled) }
-        .map_err(|e| anyhow!("{e}"))
+    unsafe { Component::deserialize(engine, precompiled) }.map_err(|e| anyhow!("{e}"))
 }
 
 pub async fn compile_wasm_component(

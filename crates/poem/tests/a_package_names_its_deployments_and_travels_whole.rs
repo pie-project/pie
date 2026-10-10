@@ -6,9 +6,11 @@ use poem::Platform;
 use poem::star::{API, ATTRIBUTE, Deploy, Package};
 
 const PACKAGE: &str = r#"
+TOY = template("raw", stop = ["<eos>"])
+TOKENIZER = tokenizer(markers = [["<eos>"]], parts = {"vision": [["<image>"]]})
 MODELS = [
-    model("toy-1b", template = "toy", tokenizer = "toy", parts = ["vision"], drafters = ["mtp"]),
-    model("toy-1b-mini-l2", mini = True, template = "toy", tokenizer = "toy"),
+    model("toy-1b", template = TOY, tokenizer = TOKENIZER, parts = ["vision"], drafters = ["mtp"]),
+    model("toy-1b-mini-l2", mini = True, template = TOY, tokenizer = TOKENIZER),
 ]
 
 DEPLOYMENTS = [
@@ -108,14 +110,18 @@ fn a_manifest_refuses_a_deployment_its_model_cannot_serve() {
     };
     let why = refused(
         r#"
-MODELS = [model("toy-1b", template = "toy", tokenizer = "toy")]
+TOY = template("raw", stop = ["<eos>"])
+TOKENIZER = tokenizer()
+MODELS = [model("toy-1b", template = TOY, tokenizer = TOKENIZER)]
 DEPLOYMENTS = [deployment("toy-1b", weights = dtype.bf16, kv = dtype.bf16, drafter = "mtp")]
 "#,
     );
     assert!(why.contains("pairs with no mtp drafter"), "{why}");
     let why = refused(
         r#"
-MODELS = [model("toy-1b", template = "toy", tokenizer = "toy")]
+TOY = template("raw", stop = ["<eos>"])
+TOKENIZER = tokenizer()
+MODELS = [model("toy-1b", template = TOY, tokenizer = TOKENIZER)]
 DEPLOYMENTS = [deployment("toy-2b", weights = dtype.bf16, kv = dtype.bf16)]
 "#,
     );

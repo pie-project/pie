@@ -21,7 +21,7 @@ fn decode_step_time_by_batch_width() {
         return;
     };
     let deployment = m.deployment;
-    let facts = deployment.trace(models::Platform::Xla).facts;
+    let facts = deployment.trace(poem::Platform::Xla).facts;
     let word = |query_len: u32| facts.word(&Request::new(query_len, false));
     let widths: Vec<u32> = std::env::var("PIE_XLA_BENCH_WIDTHS")
         .ok()

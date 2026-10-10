@@ -115,8 +115,8 @@ impl Want<'_> {
             .precision
             .as_ref()
             .is_none_or(|precision| *precision == stamped.weights)
-            && match overrides.drafter {
-                Some(Some(drafter)) => stamped.drafter == Some(drafter),
+            && match &overrides.drafter {
+                Some(Some(drafter)) => stamped.drafter.as_ref() == Some(drafter),
                 _ => true,
             }
     }
@@ -470,7 +470,6 @@ mod tests {
     }
 
     fn two_artifacts_of_one_backend_are_told_apart_by_the_config() {
-        use models::catalog::Drafter;
         use runtime::engine::load::Overrides;
         let store = tempfile::tempdir().unwrap();
         let store = store.path();
@@ -482,7 +481,7 @@ mod tests {
         std::fs::write(&mtp, b"stand-in").unwrap();
 
         let drafting = Overrides {
-            drafter: Some(Some(Drafter::Mtp)),
+            drafter: Some(Some("mtp".to_string())),
             ..Overrides::default()
         };
         let plain_precision = Overrides {

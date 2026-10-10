@@ -28,7 +28,7 @@ fn budget() -> Budget {
 }
 
 fn trace() -> Trace {
-    models::deployment(DEPLOYMENT)
+    poem_compiler::catalog::deployment(DEPLOYMENT)
         .unwrap_or_else(|| panic!("`{DEPLOYMENT}` is in the catalog"))
         .trace(Platform::Cuda)
 }

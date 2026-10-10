@@ -133,15 +133,16 @@ pub fn score(got: &[f32], want: &[f32]) -> Score {
 /// The one-rank deployment the catalog row `row` states.
 #[must_use]
 pub fn deploy(row: &str) -> poem::star::Deploy {
-    let row = models::deployment(row).unwrap_or_else(|| panic!("no `{row}` row"));
-    models::star::deploy(&row.deploy)
+    let row = poem_compiler::catalog::deployment(row).unwrap_or_else(|| panic!("no `{row}` row"));
+    row.deploy.clone()
 }
 
 /// `id`'s package with a forward that runs one of its VAE's readings alone,
 /// over every row, and holds no caches.
 #[must_use]
 pub fn one_arm(id: &str, decode: bool) -> Package {
-    let package = models::star::package_of(id).unwrap_or_else(|| panic!("no package holds {id}"));
+    let package =
+        poem_compiler::catalog::package_of(id).unwrap_or_else(|| panic!("no package holds {id}"));
     let files_at = format!("{}files/", poem::star::ATTRIBUTE);
     let mut files: Vec<(String, String)> = package
         .attributes()

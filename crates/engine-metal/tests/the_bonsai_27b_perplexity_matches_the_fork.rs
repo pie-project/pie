@@ -45,9 +45,9 @@ use checkpoint::file::write::Writer;
 use checkpoint::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 
 use engine_metal::{Boot, Lane, Shell};
-use models::star::{import_of, trace_of};
 use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
+use poem_compiler::catalog::{import_of, trace_of};
 
 fn gguf_path() -> Option<PathBuf> {
     let p = std::env::var_os("BONSAI_GGUF")?;

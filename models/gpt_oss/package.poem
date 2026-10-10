@@ -1,10 +1,13 @@
 # gpt-oss 20B (with a DFlash drafter or without), its five-layer,
 # sixteen-expert miniature, and 120B.
 
+HARMONY = template("harmony")
+TOKENIZER = tokenizer(markers = [["<|endoftext|>", "<|return|>", "<|call|>"]])
+
 MODELS = [
-    model("gptoss-20b", template = "gpt_oss", tokenizer = "gpt_oss", drafters = ["dflash"], arch = "gptoss", layers = 24, vocab = 201088),
-    model("gptoss-20b-mini", mini = True, template = "gpt_oss", tokenizer = "gpt_oss", arch = "gptoss", layers = 5, vocab = 201088),
-    model("gptoss-120b", template = "gpt_oss", tokenizer = "gpt_oss", arch = "gptoss", layers = 36, vocab = 201088),
+    model("gptoss-20b", template = HARMONY, tokenizer = TOKENIZER, drafters = ["dflash"], arch = "gptoss", layers = 24, vocab = 201088),
+    model("gptoss-20b-mini", mini = True, template = HARMONY, tokenizer = TOKENIZER, arch = "gptoss", layers = 5, vocab = 201088),
+    model("gptoss-120b", template = HARMONY, tokenizer = TOKENIZER, arch = "gptoss", layers = 36, vocab = 201088),
 ]
 
 DEPLOYMENTS = [

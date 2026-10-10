@@ -1,9 +1,14 @@
 # LTX-2.5, an audio-video diffusion transformer, with its VAE decoder; and
 # a miniature of its transformer alone.
 
+load("//lib/spoken.poem", "QWEN_STOP")
+
+CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
+TOKENIZER = tokenizer(markers = [QWEN_STOP])
+
 MODELS = [
-    model("ltx25", template = "qwen_3", tokenizer = "qwen_3", arch = "ltx_2", layers = 48, vocab = 0),
-    model("ltx25-mini", mini = True, template = "qwen_3", tokenizer = "qwen_3", arch = "ltx_2", layers = 2, vocab = 0),
+    model("ltx25", template = CHATML, tokenizer = TOKENIZER, arch = "ltx_2", layers = 48, vocab = 0),
+    model("ltx25-mini", mini = True, template = CHATML, tokenizer = TOKENIZER, arch = "ltx_2", layers = 2, vocab = 0),
 ]
 
 DEPLOYMENTS = [

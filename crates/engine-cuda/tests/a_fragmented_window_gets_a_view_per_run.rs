@@ -22,7 +22,7 @@ fn budget() -> Budget {
 }
 
 fn deployment() -> (Trace, CompiledModel) {
-    let trace = models::deployment(DEPLOYMENT)
+    let trace = poem_compiler::catalog::deployment(DEPLOYMENT)
         .unwrap_or_else(|| panic!("`{DEPLOYMENT}` is in the catalog"))
         .trace(Platform::Cuda);
     let compiled = compile(&trace, &budget(), &DeviceProfile::default())

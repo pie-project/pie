@@ -1,4 +1,4 @@
-use models::media::{Budget, EncodedSpan, Fault, Grid, VisionFrontEnd};
+use media::front::{Budget, EncodedSpan, Fault, Grid, VisionFrontEnd};
 use runtime::inferlet::media_decode as decode;
 use runtime::inferlet::span_digest;
 
@@ -6,7 +6,7 @@ fn encode_png(
     fe: &dyn VisionFrontEnd,
     bytes: &[u8],
     budget: Budget,
-) -> models::media::Result<EncodedSpan> {
+) -> media::front::Result<EncodedSpan> {
     fe.encode(&decode::decode(bytes)?, budget, decode::resize_exact)
 }
 
@@ -93,7 +93,7 @@ mod png {
 
 mod qwen {
     use super::*;
-    use models::qwen_3::media::Qwen35Vision;
+    use media::front::qwen::Qwen35Vision;
 
     #[test]
     fn media_pipe_is_the_pinned_preprocessing_every_case() {
@@ -245,7 +245,7 @@ mod qwen {
 
 mod gemma {
     use super::*;
-    use models::gemma_4::media::Gemma4Vision;
+    use media::front::gemma::Gemma4Vision;
 
     #[test]
     fn media_pipe_is_the_pinned_preprocessing_1_every_case() {

@@ -14,11 +14,16 @@ path = "src/lib.rs"
 [dependencies]
 poem = { package = "pie-poem", path = "../poem" }
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
+checkpoint = { path = "../checkpoint" }
+ztensor = { workspace = true }
 serde = "1.0"
 thiserror = "2.0"
 
 [dev-dependencies]
-models = { path = "../models" }
+ztensor-compat = { workspace = true }
+chat-template = { path = "../chat-template" }
+tokenizer = { path = "../tokenizer" }
+serde_json = "1"
 
 [lints]
 workspace = true

@@ -26,7 +26,7 @@ const PROMPTS: &[(&str, &[u32])] = &[
 
 /// The facts the deployment `deployment` classifies its lanes by.
 fn facts_of(deployment: &str) -> poem_ir::Facts {
-    models::deployment(deployment)
+    poem_compiler::catalog::deployment(deployment)
         .expect("the catalog ships the row")
         .trace(Platform::Metal)
         .facts
@@ -69,8 +69,8 @@ fn the_target_keeps_a_measured_prefix_of_every_block() {
         eprintln!("not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/models)");
         return;
     };
-    let deployment =
-        models::deployment(DEPLOYMENT).expect("the catalog ships the block-drafter row");
+    let deployment = poem_compiler::catalog::deployment(DEPLOYMENT)
+        .expect("the catalog ships the block-drafter row");
     let trace = deployment.trace(Platform::Metal);
     let drafter = trace.drafter.expect("the row states its block drafter");
     let source = ztensor_compat::index(&artifact).expect("the artifact opens");

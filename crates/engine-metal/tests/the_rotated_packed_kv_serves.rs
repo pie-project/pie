@@ -36,9 +36,9 @@ use std::sync::OnceLock;
 use engine_metal::store::kv::Paging;
 use engine_metal::store::pool_demand;
 use engine_metal::{Boot, Lane, Shell};
-use models::star::{import_of, trace_of};
 use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
+use poem_compiler::catalog::{import_of, trace_of};
 
 // ---- the micro_text shape (head_dim is the free axis this test sweeps) -------
 const HIDDEN: usize = 128;

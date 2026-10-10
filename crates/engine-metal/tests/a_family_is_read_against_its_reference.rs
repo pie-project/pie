@@ -64,7 +64,7 @@ fn every_probe_is_dumped() {
             let stamp = checkpoint::file::serve::stamp_of(&artifact)
                 .expect("the artifact reads")
                 .expect("the artifact carries a serving stamp");
-            let deployment = models::deployment(&stamp.deployment)
+            let deployment = poem_compiler::catalog::deployment(&stamp.deployment)
                 .unwrap_or_else(|| panic!("no deployment {}", stamp.deployment));
             let trace = deployment.trace(Platform::Metal);
             let source = ztensor_compat::index(&artifact).expect("the artifact opens");
@@ -86,8 +86,8 @@ fn every_probe_is_dumped() {
             let snapshot = PathBuf::from(snapshot);
             let name = std::env::var("PIE_PARITY_DEPLOYMENT")
                 .expect("PIE_PARITY_DEPLOYMENT names the row that reads the snapshot");
-            let deployment =
-                models::deployment(&name).unwrap_or_else(|| panic!("no deployment {name}"));
+            let deployment = poem_compiler::catalog::deployment(&name)
+                .unwrap_or_else(|| panic!("no deployment {name}"));
             let mut shards: Vec<PathBuf> = if snapshot.is_dir() {
                 std::fs::read_dir(&snapshot)
                     .expect("the snapshot lists")
@@ -115,7 +115,7 @@ fn every_probe_is_dumped() {
         }
     };
     let trace = deployment.trace(Platform::Metal);
-    let facts = deployment.trace(models::Platform::Metal).facts;
+    let facts = deployment.trace(poem::Platform::Metal).facts;
     let word = |query_len: u32| facts.word(&Request::new(query_len, false));
 
     let booted = Instant::now();

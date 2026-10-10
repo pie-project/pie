@@ -225,7 +225,7 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(12);
     let deployment = m.deployment;
-    let facts = deployment.trace(models::Platform::Xla).facts;
+    let facts = deployment.trace(poem::Platform::Xla).facts;
     let word = |query_len: u32| facts.word(&Request::new(query_len, false));
     let context = 512;
     let _device = engine_xla::bench::lock_device();

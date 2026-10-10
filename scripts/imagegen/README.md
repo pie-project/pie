@@ -872,7 +872,7 @@ projection wants of its own matmul output — and `denoise` computes
 Each block added its `scale_shift_table` to it, so block `k` modulated by
 `timestep_proj + sum(table_0..table_k)` instead of `timestep_proj + table_k`.
 `wan_2::forward::copy_of` now hands each block a fresh copy (two elementwise
-ops on a `[lanes, 6·dim]` f32 vector), and `cargo test -p models --test
+ops on a `[lanes, 6·dim]` f32 vector), and `cargo test -p pie-poem-compiler --test
 every_wan_2_fold_owns_the_vector_it_folds_into` walks every wan_2 plan on every
 platform for another fold whose operand a later node still reads.
 

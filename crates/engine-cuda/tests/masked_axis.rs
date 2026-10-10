@@ -2,7 +2,9 @@ use poem::Platform;
 use poem_ir::{Attention, Operation, Trace};
 
 fn carries_a_head(deployment: &str) -> bool {
-    models::published::all().any(|p| p.deployment == deployment)
+    poem_compiler::catalog::repository()
+        .published()
+        .any(|p| p.deployment == deployment)
 }
 
 fn masked_arms(trace: &Trace) -> usize {
@@ -35,7 +37,7 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
 
     let mut declaring: Vec<(String, usize)> = Vec::new();
     let mut maskless: Vec<String> = Vec::new();
-    for row in models::deployments().chain(models::splits()) {
+    for row in poem_compiler::catalog::deployments().chain(poem_compiler::catalog::splits()) {
         let deployment = row.name.as_str();
         let arms = masked_arms(&row.trace(Platform::Cuda));
         if arms > 0 {

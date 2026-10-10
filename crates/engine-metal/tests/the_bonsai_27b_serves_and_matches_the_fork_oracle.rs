@@ -54,9 +54,9 @@ use checkpoint::file::write::Writer;
 use checkpoint::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 
 use engine_metal::{Boot, Lane, Shell};
-use models::star::{import_of, trace_of};
 use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
+use poem_compiler::catalog::{import_of, trace_of};
 
 const PROMPT_IDS: [u32; 5] = [760, 6511, 314, 9338, 369];
 const ORACLE_ARGMAX: u32 = 11751;

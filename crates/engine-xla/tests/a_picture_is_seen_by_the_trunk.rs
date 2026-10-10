@@ -23,7 +23,7 @@
 mod common;
 
 use engine_xla::{Boot, DeviceBoot, Lane, Seated, Shell};
-use models::media::{Rgb8, VisionFrontEnd};
+use media::front::{Rgb8, VisionFrontEnd};
 use poem::{Operands, Platform, Request};
 use poem_compiler::{Budget, PatchLadder};
 
@@ -87,7 +87,7 @@ type Captioned = (Vec<f32>, Vec<(u32, Vec<f32>)>, Vec<u32>);
 fn caption(
     shell: &mut Shell,
     word: &dyn Fn(u32, bool) -> u64,
-    span: &models::media::EncodedSpan,
+    span: &media::front::EncodedSpan,
     split: bool,
 ) -> Captioned {
     let pads = span.token_count as usize;
@@ -229,7 +229,7 @@ fn a_solid_square_is_named_by_its_colour() {
         return;
     }
     let trace = m.deployment.trace(Platform::Xla);
-    let facts = m.deployment.trace(models::Platform::Xla).facts;
+    let facts = m.deployment.trace(poem::Platform::Xla).facts;
     let word = |len: u32, media: bool| facts.word(&Request::new(len, false).with_media(media));
 
     // The first patch rows (embedding plus position table) and the tower's
@@ -254,7 +254,7 @@ fn a_solid_square_is_named_by_its_colour() {
         "the plan embeds patches and scatters the tower's rows"
     );
 
-    let vision = models::qwen_3::media::Qwen35Vision::new();
+    let vision = media::front::qwen::Qwen35Vision::new();
     let tokenizer = common::tokenizer(&m);
     let context = 256;
     let _device = engine_xla::bench::lock_device();
@@ -281,7 +281,7 @@ fn a_solid_square_is_named_by_its_colour() {
         let side = 224u32;
         let picture = Rgb8::new(side, side, rgb.repeat((side * side) as usize)).expect("rgb");
         let span = vision
-            .encode(&picture, models::media::Budget::Still, nearest)
+            .encode(&picture, media::front::Budget::Still, nearest)
             .expect("the square encodes");
         assert_eq!(
             span.token_count, 64,

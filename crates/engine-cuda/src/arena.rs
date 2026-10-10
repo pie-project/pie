@@ -107,7 +107,7 @@ mod tests {
     const DEPLOYMENT: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
     fn compiled() -> (poem_ir::Trace, poem_compiler::CompiledModel) {
-        let trace = models::deployment(DEPLOYMENT)
+        let trace = poem_compiler::catalog::deployment(DEPLOYMENT)
             .expect("the catalog ships the smoke's deployment")
             .trace(Platform::Cuda);
         let compiled = compile(&trace, &Budget::new(4, 64), &DeviceProfile::default())

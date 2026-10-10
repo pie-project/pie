@@ -16,6 +16,7 @@ mod run;
 mod values;
 
 pub use layout::with_env;
-pub use manifest::{Manifest, Model, Published};
+pub use manifest::{Manifest, Model, Published, Template, Tokenizer, dtype_of};
 pub use package::{API, ATTRIBUTE, Package};
 pub use run::Deploy;
+pub use values::word;

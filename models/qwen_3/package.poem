@@ -4,15 +4,22 @@
 # the test geometries are models of it too, listed nowhere: a test traces
 # and imports them by id.
 
-def qwen(id, layers, vocab = 248320, template = "qwen_3", tokenizer = "qwen_3", **kwargs):
+load("//lib/spoken.poem", "QWEN_STOP", "QWEN_VISION", "QWEN_AUDIO")
+
+CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
+CHATML_INTERLEAVED = template("chatml", thinking = True, preserve_thinking = True, tools = True, stop = QWEN_STOP)
+TOKENIZER = tokenizer(markers = [QWEN_STOP], parts = {"vision": [QWEN_VISION]})
+TOKENIZER_38 = tokenizer(markers = [QWEN_STOP], pinned = QWEN_AUDIO, parts = {"vision": [QWEN_VISION]})
+
+def qwen(id, layers, vocab = 248320, template = CHATML, tokenizer = TOKENIZER, **kwargs):
     return model(id, template = template, tokenizer = tokenizer, arch = "qwen3_5", layers = layers, vocab = vocab, **kwargs)
 
 def fixture(id):
-    return model(id, mini = True, template = "qwen_3", tokenizer = "qwen_3")
+    return model(id, mini = True, template = CHATML, tokenizer = TOKENIZER)
 
 MODELS = [
     qwen("qwen36-27b", parts = ["vision"], drafters = ["mtp", "dflash"], layers = 64),
-    qwen("qwen38-27b", template = "qwen_3_chatml_interleaved", tokenizer = "qwen_3.38", parts = ["vision"], drafters = ["mtp", "dflash2", "dspark"], layers = 64),
+    qwen("qwen38-27b", template = CHATML_INTERLEAVED, tokenizer = TOKENIZER_38, parts = ["vision"], drafters = ["mtp", "dflash2", "dspark"], layers = 64),
     qwen("qwen35-d0.8b", parts = ["vision"], drafters = ["eagle"], layers = 24),
     qwen("qwen35-d2b", layers = 24),
     qwen("qwen35-d3b", layers = 24, vocab = 151936),

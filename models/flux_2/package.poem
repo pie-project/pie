@@ -1,9 +1,14 @@
 # FLUX.2 [klein] 4B, with its Qwen3 text encoder and its VAE, and a miniature
 # of its transformer alone.
 
+load("//lib/spoken.poem", "QWEN_STOP")
+
+NO_THINKING = template("chatml", thinking = True, generation_suffix = "<think>\n\n</think>\n\n", stop = QWEN_STOP)
+TOKENIZER = tokenizer(markers = [QWEN_STOP])
+
 MODELS = [
-    model("flux2-klein-4b", template = "flux_2", tokenizer = "qwen_3", arch = "flux_2", layers = 27, vocab = 151936),
-    model("flux2-mini", mini = True, template = "flux_2", tokenizer = "qwen_3", arch = "flux_2", layers = 4, vocab = 0),
+    model("flux2-klein-4b", template = NO_THINKING, tokenizer = TOKENIZER, arch = "flux_2", layers = 27, vocab = 151936),
+    model("flux2-mini", mini = True, template = NO_THINKING, tokenizer = TOKENIZER, arch = "flux_2", layers = 4, vocab = 0),
 ]
 
 DEPLOYMENTS = [

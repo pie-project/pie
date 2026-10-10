@@ -27,7 +27,7 @@ fn profile() -> DeviceProfile {
 }
 
 fn baked() -> (Trace, CompiledModel) {
-    let trace = models::deployments()
+    let trace = poem_compiler::catalog::deployments()
         .find(|row| row.name.starts_with(SERVED))
         .unwrap_or_else(|| panic!("the catalog no longer names a {SERVED} text"))
         .trace(Platform::Metal);

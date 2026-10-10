@@ -29,7 +29,7 @@ fn a_prompt_is_answered_and_its_decode_agrees_with_its_prefill() {
     };
     let (checkpoint, deployment, contract) = (m.checkpoint.clone(), m.deployment, &m.contract);
     let trace = deployment.trace(Platform::Xla);
-    let facts = deployment.trace(models::Platform::Xla).facts;
+    let facts = deployment.trace(poem::Platform::Xla).facts;
     let word = |query_len: u32| facts.word(&Request::new(query_len, false));
     let context = 512;
 

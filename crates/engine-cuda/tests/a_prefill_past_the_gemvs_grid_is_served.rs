@@ -27,7 +27,7 @@ struct Text {
 }
 
 fn traced(id: &str) -> Trace {
-    models::star::trace_of(id, Dtype::Bf16, Dtype::Bf16, Platform::Cuda)
+    poem_compiler::catalog::trace_of(id, Dtype::Bf16, Dtype::Bf16, Platform::Cuda)
 }
 
 const MICRO: Text = Text {

@@ -42,7 +42,7 @@ const REFUSED: &[Refusal] = &[
 ];
 
 fn ops_of(deployment: &str) -> BTreeSet<String> {
-    let row = models::deployment(deployment).expect("the row is in the catalog");
+    let row = poem_compiler::catalog::deployment(deployment).expect("the row is in the catalog");
     row.trace(PLATFORM)
         .nodes
         .iter()
@@ -57,7 +57,7 @@ fn refused() -> BTreeMap<&'static str, &'static Refusal> {
 fn stopped() -> BTreeMap<String, BTreeSet<String>> {
     let refused = refused();
     let mut stopped = BTreeMap::new();
-    for row in models::deployments() {
+    for row in poem_compiler::catalog::deployments() {
         let blocked: BTreeSet<String> = ops_of(&row.name)
             .into_iter()
             .filter(|op| refused.contains_key(op.as_str()))
@@ -123,7 +123,7 @@ fn every_refusal_is_still_carried() {
 
 fn every_catalog_deployment_traces() {
     let mut empty = Vec::new();
-    for row in models::deployments() {
+    for row in poem_compiler::catalog::deployments() {
         let trace = row.trace(PLATFORM);
         if trace.nodes.is_empty() {
             empty.push(row.name.clone());
@@ -142,7 +142,7 @@ fn every_catalog_deployment_traces() {
 fn report() {
     let refused = refused();
     let mut named: BTreeMap<String, usize> = BTreeMap::new();
-    for row in models::deployments() {
+    for row in poem_compiler::catalog::deployments() {
         for op in ops_of(&row.name) {
             *named.entry(op).or_default() += 1;
         }
@@ -150,7 +150,7 @@ fn report() {
 
     println!(
         "{SHELL} on {PLATFORM:?}: {} rows",
-        models::deployments().count()
+        poem_compiler::catalog::deployments().count()
     );
     println!("\n== ops named by the catalog ({}) ==", named.len());
     for (op, rows) in &named {
@@ -164,7 +164,7 @@ fn report() {
 
     let stopped = stopped();
     println!("\n== per row ==");
-    for row in models::deployments() {
+    for row in poem_compiler::catalog::deployments() {
         let ops = ops_of(&row.name);
         let verdict = match stopped.get(&row.name) {
             None => "serves".to_string(),
@@ -181,7 +181,7 @@ fn report() {
     }
     println!(
         "\n{} of {} rows serve",
-        models::deployments().count() - stopped.len(),
-        models::deployments().count()
+        poem_compiler::catalog::deployments().count() - stopped.len(),
+        poem_compiler::catalog::deployments().count()
     );
 }

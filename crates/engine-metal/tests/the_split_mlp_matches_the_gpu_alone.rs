@@ -70,7 +70,7 @@ fn ids() -> Vec<u32> {
 }
 
 fn boot(artifact: &PathBuf, name: &str) -> (Shell, poem::Trace) {
-    let deployment = models::deployment(name).expect("the catalog ships the row");
+    let deployment = poem_compiler::catalog::deployment(name).expect("the catalog ships the row");
     let trace = deployment.trace(Platform::Metal);
     let source = ztensor_compat::index(artifact).expect("the artifact opens");
     let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Metal)

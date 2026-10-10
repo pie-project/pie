@@ -14,7 +14,8 @@ const DEPLOYMENT: &str = "gemma4-e4b-mini-l6-bf16-kv-bf16";
 const CHUNK: u32 = 256;
 
 fn logits(trace: Trace, path: &Path, prompt: &[u32], decodes: u32) -> Vec<Vec<f32>> {
-    let deployment = models::deployment(DEPLOYMENT).expect("the catalog ships the mini gemma");
+    let deployment =
+        poem_compiler::catalog::deployment(DEPLOYMENT).expect("the catalog ships the mini gemma");
     let contract = contract_for(&trace, path).expect("the random planes fit the trace");
     let mut shell = Shell::load(Boot {
         voxels: None,
@@ -41,7 +42,7 @@ fn logits(trace: Trace, path: &Path, prompt: &[u32], decodes: u32) -> Vec<Vec<f3
     .expect("the shell loads");
     shell.open(0).expect("the slot opens");
     let mut fire = |tokens: &[u32]| {
-        let facts = deployment.trace(models::Platform::Cuda).facts;
+        let facts = deployment.trace(poem::Platform::Cuda).facts;
         let word = facts.word(&Request::new(tokens.len() as u32, false));
         let rows = shell
             .fire(&[Lane {
@@ -69,7 +70,7 @@ fn a_windowed_row_reads_what_the_full_row_reads() {
         eprintln!("no CUDA device: skipping");
         return;
     }
-    let windowed = models::deployment(DEPLOYMENT)
+    let windowed = poem_compiler::catalog::deployment(DEPLOYMENT)
         .expect("the mini gemma")
         .trace(Platform::Cuda);
     assert!(

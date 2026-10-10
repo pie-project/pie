@@ -1,18 +1,22 @@
 use crate::Tokenizer;
 
-#[derive(Clone, Copy, Debug)]
+/// What a model's package asks of the tokenizer an artifact carries: the
+/// marker tokens its template and media spell, each of which the vocabulary
+/// must hold, and the markers pinned at an id, which select one reading of
+/// the artifact.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Contract {
-    pub markers: &'static [&'static [&'static str]],
-    pub pinned: &'static [(&'static str, u32)],
+    pub markers: Vec<Vec<String>>,
+    pub pinned: Vec<(String, u32)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Fault {
     Missing {
-        marker: &'static str,
+        marker: String,
     },
     Displaced {
-        marker: &'static str,
+        marker: String,
         want: u32,
         found: u32,
     },
@@ -46,20 +50,26 @@ impl std::error::Error for Fault {}
 
 impl Contract {
     pub fn verify(&self, tokenizer: &Tokenizer) -> Result<(), Fault> {
-        for group in self.markers {
-            for &marker in *group {
+        for group in &self.markers {
+            for marker in group {
                 if tokenizer.token_to_id(marker).is_none() {
-                    return Err(Fault::Missing { marker });
+                    return Err(Fault::Missing {
+                        marker: marker.clone(),
+                    });
                 }
             }
         }
-        for &(marker, want) in self.pinned {
+        for (marker, want) in &self.pinned {
             match tokenizer.token_to_id(marker) {
-                None => return Err(Fault::Missing { marker }),
-                Some(found) if found != want => {
+                None => {
+                    return Err(Fault::Missing {
+                        marker: marker.clone(),
+                    });
+                }
+                Some(found) if found != *want => {
                     return Err(Fault::Displaced {
-                        marker,
-                        want,
+                        marker: marker.clone(),
+                        want: *want,
                         found,
                     });
                 }

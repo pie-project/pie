@@ -101,7 +101,7 @@ fn the_first_logits_track_upstream() {
         return;
     }
     let trace = m.deployment.trace(Platform::Xla);
-    let facts = m.deployment.trace(models::Platform::Xla).facts;
+    let facts = m.deployment.trace(poem::Platform::Xla).facts;
     let word = |len: u32| facts.word(&Request::new(len, false));
 
     let wanted: Vec<String> = std::env::var("PIE_XLA_TRUNK_OPS")

@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, anyhow};
 
-use models::template::Instruct;
+use chat_template::Instruct;
 use tokenizer::Tokenizer;
 
 static MODEL: OnceLock<Arc<Model>> = OnceLock::new();
@@ -16,9 +16,9 @@ pub struct ModelMetadata {
 
 /// The deployment `model_id` names: one of the package the artifact at
 /// `artifact` carries, or else one of this build's catalog.
-pub fn deployment_of(model_id: &str, artifact: &Path) -> Result<models::Deployment> {
+pub fn deployment_of(model_id: &str, artifact: &Path) -> Result<crate::catalog::Deployment> {
     let Some(package) = crate::engine::load::package_of(artifact)? else {
-        return models::Deployment::parse(model_id).ok_or_else(|| {
+        return crate::catalog::catalog().parse(model_id).ok_or_else(|| {
             anyhow!(
                 "the engine loaded {model_id:?}, which names no deployment of this \
                  build's catalog; nearest: {:?}",
@@ -26,25 +26,22 @@ pub fn deployment_of(model_id: &str, artifact: &Path) -> Result<models::Deployme
             )
         });
     };
-    // The runtime serves one model for as long as it runs.
-    let package: &'static poem::star::Package = Box::leak(Box::new(package));
+    let package = Arc::new(package);
     let (model, deploy) = package.manifest().parse(model_id).ok_or_else(|| {
         anyhow!(
             "the engine loaded {model_id:?}, which the package `{}` names no deployment of",
             package.name()
         )
     })?;
-    let entries = Box::leak(models::star::family(package).into_boxed_slice());
-    let entry = entries
-        .iter()
-        .find(|entry| entry.id == model.id)
-        .expect("a package's entries are its models");
-    let deploy = models::star::catalog(&deploy).map_err(|why| anyhow!("{model_id}: {}", why.0))?;
-    Ok(models::Deployment::of(entry, deploy))
+    Ok(crate::catalog::Deployment::of(
+        Arc::clone(&package),
+        model,
+        deploy,
+    ))
 }
 
 fn nearest(name: &str, take: usize) -> Vec<&'static str> {
-    let mut scored: Vec<(usize, &'static str)> = models::deployments()
+    let mut scored: Vec<(usize, &'static str)> = crate::catalog::deployments()
         .map(|d| (edit_distance(name, &d.name), d.name.as_str()))
         .collect();
     scored.sort();
@@ -100,13 +97,17 @@ pub fn register(
         None => Tokenizer::from_file(&tokenizer_path)?,
     };
     let tokenizer = Arc::new(tokenizer);
-    deployment
-        .tokenizer
+    let contract = tokenizer::contract::Contract {
+        markers: deployment.markers(),
+        pinned: deployment.model.tokenizer.pinned.clone(),
+    };
+    contract
         .verify(&tokenizer)
         .map_err(|fault| anyhow!("`{model_id}` refuses this artifact's tokenizer: {fault}"))?;
-    let instruct = (deployment.template)(tokenizer.clone());
-    let diffusion = deployment.diffusion;
-    let generative = deployment.generative.clone();
+    let instruct = chat_template::build(&template_of(&deployment.model), tokenizer.clone())
+        .map_err(|why| anyhow!("`{model_id}` states a template this runtime refuses: {why}"))?;
+    let diffusion = deployment.diffusion();
+    let generative = deployment.generative();
     if let Some(generative) = &generative {
         validate_generative(generative).map_err(|fault| {
             anyhow!("`{model_id}` states generative facts this runtime refuses: {fault}")
@@ -115,7 +116,7 @@ pub fn register(
 
     let model = Arc::new(Model {
         name,
-        arch_name: deployment.entry.arch,
+        arch_name: Box::leak(deployment.model.arch.clone().into_boxed_str()),
         instruct,
         facts,
         kv_page_size,
@@ -123,8 +124,8 @@ pub fn register(
         eta_caps: eta,
         tokenizer,
         vocab: OnceLock::new(),
-        vocab_size: deployment.entry.vocab,
-        num_layers: deployment.entry.layers,
+        vocab_size: deployment.model.vocab,
+        num_layers: deployment.model.layers,
         diffusion,
         generative,
     });
@@ -134,7 +135,22 @@ pub fn register(
     Ok(())
 }
 
-pub fn validate_generative(generative: &models::Generative) -> Result<(), String> {
+/// The template a model's package states, as the template crate reads it.
+fn template_of(model: &poem::star::Model) -> chat_template::Spec {
+    let t = &model.template;
+    chat_template::Spec {
+        format: t.format.clone(),
+        thinking: t.thinking,
+        preserve_thinking: t.preserve_thinking,
+        tools: t.tools,
+        generation_suffix: t.generation_suffix.clone(),
+        stop: t.stop.clone(),
+        bos: t.bos.clone(),
+        eos: t.eos.clone(),
+    }
+}
+
+pub fn validate_generative(generative: &poem::generative::Generative) -> Result<(), String> {
     let mut velocity_width = None;
     for (at, reading) in generative.readings.iter().enumerate() {
         if usize::from(reading.index) != at {
@@ -159,7 +175,7 @@ pub fn validate_generative(generative: &models::Generative) -> Result<(), String
                 reading.name
             ));
         }
-        if reading.readout == models::ReadoutKind::Velocity {
+        if reading.readout == poem::generative::ReadoutKind::Velocity {
             match velocity_width {
                 None => velocity_width = Some(reading.readout_width),
                 Some(width) if width != reading.readout_width => {
@@ -191,7 +207,7 @@ pub fn validate_generative(generative: &models::Generative) -> Result<(), String
                     reading.name, port.name
                 ));
             }
-            if port.kind == models::PortKind::AxisPositions && port.width > 4 {
+            if port.kind == poem::generative::PortKind::AxisPositions && port.width > 4 {
                 return Err(format!(
                     "reading `{}` port `{}` states {} axes; a positions port carries 1..=4",
                     reading.name, port.name, port.width
@@ -202,7 +218,7 @@ pub fn validate_generative(generative: &models::Generative) -> Result<(), String
             let axes = reading
                 .ports
                 .iter()
-                .find(|port| port.kind == models::PortKind::AxisPositions)
+                .find(|port| port.kind == poem::generative::PortKind::AxisPositions)
                 .map(|port| port.width);
             let Some(axes) = axes else {
                 return Err(format!(
@@ -230,9 +246,9 @@ pub fn validate_generative(generative: &models::Generative) -> Result<(), String
             && !reading.ports.iter().any(|port| {
                 matches!(
                     port.kind,
-                    models::PortKind::Latents
-                        | models::PortKind::Voxels
-                        | models::PortKind::Context
+                    poem::generative::PortKind::Latents
+                        | poem::generative::PortKind::Voxels
+                        | poem::generative::PortKind::Context
                 )
             })
         {
@@ -246,17 +262,17 @@ pub fn validate_generative(generative: &models::Generative) -> Result<(), String
     Ok(())
 }
 
-pub fn velocity_facts(readings: &[models::ReadingFact]) -> (bool, u32) {
+pub fn velocity_facts(readings: &[poem::generative::ReadingFact]) -> (bool, u32) {
     readings
         .iter()
-        .find(|reading| reading.readout == models::ReadoutKind::Velocity)
+        .find(|reading| reading.readout == poem::generative::ReadoutKind::Velocity)
         .map_or((false, 0), |reading| (true, reading.readout_width))
 }
 
-pub fn pixels_facts(readings: &[models::ReadingFact]) -> (bool, u32) {
+pub fn pixels_facts(readings: &[poem::generative::ReadingFact]) -> (bool, u32) {
     let mut widths = readings
         .iter()
-        .filter(|reading| reading.readout == models::ReadoutKind::Pixels)
+        .filter(|reading| reading.readout == poem::generative::ReadoutKind::Pixels)
         .map(|reading| reading.readout_width);
     let Some(first) = widths.next() else {
         return (false, 0);
@@ -281,7 +297,7 @@ pub fn media_pad() -> Option<u32> {
         use crate::inferlet::host::media::multimodal;
         let m = model();
         let arch = m.arch_name();
-        let spelling = models::media::vision_front_end(arch)
+        let spelling = media::front::vision_front_end(arch)
             .map(|fe| fe.delimiters().placeholder)
             .or_else(|| {
                 multimodal::audio_arch_supported(arch).then(multimodal::audio_placeholder)
@@ -305,8 +321,8 @@ pub struct Model {
     vocab: OnceLock<(Vec<u32>, Vec<Vec<u8>>)>,
     vocab_size: u32,
     num_layers: u32,
-    diffusion: Option<models::Diffusion>,
-    generative: Option<models::Generative>,
+    diffusion: Option<poem::generative::Diffusion>,
+    generative: Option<poem::generative::Generative>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -426,10 +442,10 @@ impl Model {
         media: bool,
         block_draft: bool,
         denoise: bool,
-        stream: models::Stream,
+        stream: poem::Stream,
         reading: u8,
     ) -> u64 {
-        let request = models::Request::new(query_len, custom_mask)
+        let request = poem::Request::new(query_len, custom_mask)
             .adapted(adapter)
             .drafting(drafts)
             .capturing_scores(captures_scores)
@@ -444,21 +460,21 @@ impl Model {
         self.facts.word(&request)
     }
 
-    pub fn diffusion(&self) -> Option<models::Diffusion> {
+    pub fn diffusion(&self) -> Option<poem::generative::Diffusion> {
         self.diffusion
     }
 
-    pub fn generative(&self) -> Option<&models::Generative> {
+    pub fn generative(&self) -> Option<&poem::generative::Generative> {
         self.generative.as_ref()
     }
 
-    pub fn readings(&self) -> &[models::ReadingFact] {
+    pub fn readings(&self) -> &[poem::generative::ReadingFact] {
         self.generative
             .as_ref()
             .map_or(&[], |generative| generative.readings.as_slice())
     }
 
-    pub fn sole_reading(&self) -> Option<&models::ReadingFact> {
+    pub fn sole_reading(&self) -> Option<&poem::generative::ReadingFact> {
         match self.readings() {
             [only] => Some(only),
             _ => None,

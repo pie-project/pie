@@ -32,7 +32,8 @@ fn every_armed_body_answers_its_eager_walk() {
         eprintln!("not asked: no mini-dit artifact (PIE_MINI_DIT_ARTIFACT)");
         return;
     };
-    let deployment = models::deployment(DEPLOYMENT).expect("the catalog ships the mini-dit row");
+    let deployment =
+        poem_compiler::catalog::deployment(DEPLOYMENT).expect("the catalog ships the mini-dit row");
     let trace = deployment.trace(Platform::Cuda);
     let mut engine = engine_cuda::open(engine_cuda::DeviceBoot::default(), contract_for)
         .expect("the engine opens");
