@@ -203,3 +203,38 @@ kernel void ane_join(device bfloat *output [[buffer(0)]],
     output[index] = bfloat(float(output[index]) + staged[position.x][j] * scale[j]);
   }
 }
+
+// The partial of a projection's trailing columns, rescaled per token, into
+// the output's columns from `first` on; the leading columns are the GPU's.
+kernel void ane_join_columns(device bfloat *output [[buffer(0)]],
+                             device const half *partial [[buffer(1)]],
+                             device const half *token_scale [[buffer(2)]],
+                             device atomic_uint *status [[buffer(3)]],
+                             constant uint &width [[buffer(4)]],
+                             constant uint &first [[buffer(5)]],
+                             constant uint &stride [[buffer(6)]],
+                             constant uint &rows [[buffer(7)]],
+                             uint2 tile [[threadgroup_position_in_grid]],
+                             uint2 position [[thread_position_in_threadgroup]]) {
+  threadgroup float staged[32][33];
+  threadgroup float scale[32];
+  const uint row = tile.x * 32, channel = tile.y * 32, token = row + position.x;
+  const bool chunk = token < rows;
+  bool finite = true;
+  for (uint j = position.y; j < 32; j += 8) {
+    const half value = partial[ulong(channel + j) * stride + token];
+    finite &= !(chunk && ane_not_finite(value));
+    staged[j][position.x] = float(value);
+  }
+  if (position.y == 0) {
+    const half input = token_scale[token];
+    finite &= !(chunk && ane_not_finite(input));
+    scale[position.x] = float(input);
+  }
+  if (!finite) atomic_store_explicit(status, 1u, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint j = position.y; j < 32; j += 8) {
+    if (row + j >= rows) continue;
+    output[ulong(row + j) * width + first + channel + position.x] = bfloat(staged[position.x][j] * scale[j]);
+  }
+}

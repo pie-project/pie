@@ -311,3 +311,98 @@ pub fn join(ctx: &Ctx<'_>, shared: &Shared, out: Tensor, done: u64) -> Result<()
     let (partial, stride) = shared.partial;
     split_join(ctx, out, partial, shared.token_scale, shared.status, stride)
 }
+
+/// Rescales the partial of a projection's trailing columns per token into
+/// `out`'s columns from `first` on.
+pub fn join_columns_kernel(
+    ctx: &Ctx<'_>,
+    out: Tensor,
+    first: u32,
+    partial: Tensor,
+    token_scale: Tensor,
+    status: Tensor,
+    stride: u32,
+) -> Result<(), Error> {
+    let tiles = out.rows.div_ceil(32);
+    let columns = out.width - first;
+    ctx.fire(
+        Fire::at(FILE, "ane_join_columns")
+            .apply(Grid::of([tiles * 32, columns / 32 * 8, 1], [32, 8, 1])),
+        &[
+            out.arg_mut(),
+            partial.arg(),
+            token_scale.arg(),
+            status.arg_mut(),
+            out.width.arg(),
+            first.arg(),
+            stride.arg(),
+            out.rows.arg(),
+        ],
+    )
+}
+
+/// A projection's Neural Engine share: the bank, its one row scale, and
+/// where its rows begin.
+pub struct Projection {
+    pub bank: Bank,
+    pub scale: Tensor,
+    /// The first bank row the Neural Engine takes.
+    pub first: u32,
+    /// How many rows it takes.
+    pub rows: u32,
+    pub segment: u32,
+}
+
+/// The row scale of a projection's share. Once, at load.
+pub fn projection_scale(ctx: &Ctx<'_>, p: &Projection, signs: Tensor) -> Result<(), Error> {
+    let rows = Rows {
+        first: p.first,
+        rows: p.rows,
+        input: 0,
+        span: p.bank.codes.width,
+        intermediate: false,
+    };
+    row_scale(ctx, &p.bank, &rows, signs, p.scale)
+}
+
+/// Materializes the share's rows into `targets`, one per segment.
+pub fn stage_projection(
+    ctx: &Ctx<'_>,
+    p: &Projection,
+    signs: Tensor,
+    targets: &[Target],
+) -> Result<(), Error> {
+    for (k, target) in targets.iter().enumerate() {
+        let rows = Rows {
+            first: p.first,
+            rows: p.rows,
+            input: k as u32 * p.segment,
+            span: p.segment,
+            intermediate: false,
+        };
+        weights(ctx, &p.bank, &rows, signs, p.scale, target)?;
+    }
+    Ok(())
+}
+
+/// Waits for the hand-off event to reach `done`, then lands the Neural
+/// Engine's columns of `out` from `first` on.
+pub fn join_columns(
+    ctx: &Ctx<'_>,
+    shared: &Shared,
+    out: Tensor,
+    first: u32,
+    done: u64,
+) -> Result<(), Error> {
+    ctx.wait(done)?;
+    let (partial, stride) = shared.partial;
+    join_columns_kernel(
+        ctx,
+        out,
+        first,
+        partial,
+        shared.token_scale,
+        shared.status,
+        stride,
+    )
+}

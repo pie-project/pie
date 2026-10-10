@@ -14,13 +14,14 @@
 //!   tied to surfaces.
 //! * [`Handoff`]: the shared event the two engines order their work on.
 //! * [`mil`]: the text the programs are written in.
-//! * [`ffn`]: the MLP program itself, over those.
+//! * [`ffn`] and [`linear`]: the programs themselves, over those.
 
 use std::ffi::c_int;
 use std::path::PathBuf;
 
 mod event;
 pub mod ffn;
+pub mod linear;
 pub mod mil;
 mod program;
 mod surface;
