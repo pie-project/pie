@@ -70,12 +70,28 @@ fn consuming_marker(source: &Path) -> PathBuf {
 }
 
 pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<crate::ui::Answer> {
-    if let Some(name) = args.drafter.take() {
-        let wanted = args.source.to_ascii_lowercase().replace("--", "/");
-        let for_target: Vec<&poem::star::Published> = runtime::catalog::catalog()
-            .published()
-            .filter(|p| p.target.to_ascii_lowercase() == wanted)
-            .collect();
+    let wanted = args.source.to_ascii_lowercase().replace("--", "/");
+    let for_target: Vec<&poem::star::Published> = runtime::catalog::catalog()
+        .published()
+        .filter(|p| p.target.to_ascii_lowercase() == wanted)
+        .collect();
+    // A target its package publishes a drafter for is imported with it, the
+    // first listed being the package's pick, unless `--drafter none`, or a
+    // head or deployment named by hand, says otherwise.
+    let drafter = match args.drafter.take() {
+        Some(name) if name.eq_ignore_ascii_case("none") => None,
+        Some(name) => Some(name),
+        None if args.aux.is_none() && args.deployment.is_none() => for_target.first().map(|p| {
+            println!(
+                "import: {} publishes the `{}` drafter for {}; importing with it \
+                     (`--drafter none` imports without)",
+                p.deployment, p.drafter, args.source
+            );
+            p.drafter.clone()
+        }),
+        None => None,
+    };
+    if let Some(name) = drafter {
         let Some(published) = for_target
             .iter()
             .find(|p| p.drafter.eq_ignore_ascii_case(&name))

@@ -6,7 +6,7 @@ with only the builtins of its stage:
 
 | file           | states                                                          |
 | -------------- | --------------------------------------------------------------- |
-| `package.poem` | `MODELS` (ids, miniatures, parts, drafters, template, tokenizer) and `DEPLOYMENTS`, in the order an import tries them |
+| `package.poem` | `MODELS` (ids, miniatures, parts, drafters, template, tokenizer), `DEPLOYMENTS`, in the order an import tries them, and `PUBLISHED`: the draft heads published for a checkpoint repository, the first listed being what `pie model import` drafts with unless told `--drafter none` |
 | `model.poem`   | `layout(id, deploy)`: a deployment's dims and the weights they lay out |
 | `forward.poem` | `caches(m, c)` and `forward(m, inputs)`: the caches it holds and the forward its rows run |
 | `formats.poem` | `formats(m)`: the checkpoint formats it is read in, and what lands where |
