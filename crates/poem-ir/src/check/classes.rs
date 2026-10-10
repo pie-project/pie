@@ -103,7 +103,7 @@ fn written_in_class(trace: &Trace, id: ValueId, word: u64) -> bool {
         return true;
     }
     let conds: Vec<Guard> = arms.iter().map(|(_, cond)| cond.clone()).collect();
-    let common = Guard::common(&conds);
+    let common = Guard::implied(&conds);
     matches!(common, Guard::Always) || common.holds(word)
 }
 
@@ -656,6 +656,27 @@ mod tests {
         a_gap_in_the_arms_is_uncovered_and_names_the_word();
         two_arms_holding_at_once_are_ambiguous();
         a_cache_write_is_its_own_root_and_an_unread_op_is_dead();
+        a_bound_every_arm_implies_holds_though_one_arm_drops_it();
+    }
+
+    fn a_bound_every_arm_implies_holds_though_one_arm_drops_it() {
+        // a merge over the rows `¬(f0 ∧ f1)`, split by `f1`: the `¬f1` arms
+        // need not spell the bound, they imply it. A seam reading the merge
+        // on `f0 ∧ f1` reads rows no arm was meant to write.
+        let mut b = Build::new();
+        let q = b.input();
+        let bound = Guard::not(Guard::and(fact(0), fact(1)));
+        let masked = Guard::and(fact(1), bound.clone());
+        let scored = Guard::and(Guard::not(fact(1)), fact(2));
+        let rest = Guard::and(Guard::not(fact(1)), Guard::not(fact(2)));
+        let m = b.op(q, masked.clone());
+        let s = b.op(q, scored.clone());
+        let r = b.op(q, rest.clone());
+        let o = b.merge(&[(m, masked), (s, scored), (r, rest)]);
+        b.out(o);
+
+        b.resolve()
+            .expect("the merge is bounded by what every arm implies");
     }
 
     fn a_split_and_its_merge_resolve_to_one_arm_per_class() {
