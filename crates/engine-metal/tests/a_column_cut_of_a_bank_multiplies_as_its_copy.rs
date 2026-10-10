@@ -1,0 +1,208 @@
+#![cfg(target_vendor = "apple")]
+
+//! A bank's row stride is its own field now, so the leading columns of a
+//! wider bank are a view: the same planes read narrower at the wide stride.
+//! Every quantized matmul path — one row, a few rows folded, tiled, precast,
+//! split-k — must read that view exactly as it reads a bank copied out of
+//! those columns, since the Neural Engine split hands the GPU such a view of
+//! `down` in place of #837's host copy.
+
+use std::cell::RefCell;
+
+use engine_metal::device::{Buffer, Context, Handles, Pipelines};
+use engine_metal::encode::Sink;
+use kernels_metal::linear::quant;
+use kernels_metal::{Bank, Tensor};
+use poem_ir::Dtype;
+
+/// The whole bank: `N` output rows over `K_FULL` columns in groups of 64.
+const N: u32 = 256;
+const K_FULL: u32 = 2048;
+/// The view keeps the leading `K_CUT` columns.
+const K_CUT: u32 = 1024;
+const GROUP: u32 = 64;
+
+struct Lcg(u64);
+impl Lcg {
+    fn next(&mut self) -> u32 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.0 >> 33) as u32
+    }
+    fn unit(&mut self) -> f32 {
+        (self.next() % 20001) as f32 / 10000.0 - 1.0
+    }
+}
+
+fn bf16(v: f32) -> u16 {
+    let bits = v.to_bits();
+    ((bits.wrapping_add(0x7fff + ((bits >> 16) & 1))) >> 16) as u16
+}
+
+fn bound(device: &Context, handles: &Handles, bytes: &[u8], keep: &mut Vec<Buffer>) -> u32 {
+    let mut buffer = Buffer::zeroed(device, bytes.len() as u64).expect("a buffer");
+    buffer.write(0, bytes).expect("written");
+    let handle = handles.bind(&buffer, 0, buffer.bytes()).expect("a handle");
+    keep.push(buffer);
+    handle
+}
+
+/// Row-major planes of the whole bank, and the same cut to `K_CUT` columns.
+struct Planes {
+    codes: Vec<u8>,
+    scales: Vec<u8>,
+    biases: Vec<u8>,
+}
+
+fn planes(rng: &mut Lcg, k: u32, from: Option<&Planes>) -> Planes {
+    let groups = (k / GROUP) as usize;
+    match from {
+        None => Planes {
+            codes: (0..(N * k / 2)).map(|_| rng.next() as u8).collect(),
+            scales: (0..N as usize * groups)
+                .flat_map(|_| bf16(0.01 + rng.unit().abs() * 0.05).to_le_bytes())
+                .collect(),
+            biases: (0..N as usize * groups)
+                .flat_map(|_| bf16(rng.unit() * 0.1).to_le_bytes())
+                .collect(),
+        },
+        Some(whole) => {
+            let (row_in, row_out) = ((K_FULL / 2) as usize, (k / 2) as usize);
+            let (g_in, g_out) = ((K_FULL / GROUP) as usize * 2, groups * 2);
+            Planes {
+                codes: whole
+                    .codes
+                    .chunks_exact(row_in)
+                    .flat_map(|row| row[..row_out].to_vec())
+                    .collect(),
+                scales: whole
+                    .scales
+                    .chunks_exact(g_in)
+                    .flat_map(|row| row[..g_out].to_vec())
+                    .collect(),
+                biases: whole
+                    .biases
+                    .chunks_exact(g_in)
+                    .flat_map(|row| row[..g_out].to_vec())
+                    .collect(),
+            }
+        }
+    }
+}
+
+fn bank(
+    device: &Context,
+    handles: &Handles,
+    p: &Planes,
+    width: u32,
+    ld: u32,
+    keep: &mut Vec<Buffer>,
+) -> Bank {
+    let groups = width / GROUP;
+    Bank {
+        codes: Tensor::new(
+            bound(device, handles, &p.codes, keep),
+            N,
+            width,
+            Dtype::U4g64,
+        ),
+        mpp_codes: None,
+        scales: Tensor::new(
+            bound(device, handles, &p.scales, keep),
+            N,
+            groups,
+            Dtype::Bf16,
+        ),
+        biases: Some(Tensor::new(
+            bound(device, handles, &p.biases, keep),
+            N,
+            groups,
+            Dtype::Bf16,
+        )),
+        group: GROUP,
+        bits: 4,
+        ld,
+    }
+}
+
+#[test]
+fn a_column_cut_of_a_bank_multiplies_as_its_copy() {
+    let Ok(device) = Context::bind() else {
+        eprintln!("not asked: no Metal device");
+        return;
+    };
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    let mut rng = Lcg(0x5eed);
+    let whole = planes(&mut rng, K_FULL, None);
+    let cut = planes(&mut rng, K_CUT, Some(&whole));
+    let mut keep = Vec::new();
+    let view = bank(&device, &handles, &whole, K_CUT, K_FULL, &mut keep);
+    let copy = bank(&device, &handles, &cut, K_CUT, K_CUT, &mut keep);
+
+    // Scratch the dispatcher may ask for: a precast plane and split-k
+    // partials, sized to whatever it wants, kept until the frame lands.
+    let scratch_keep: RefCell<Vec<Buffer>> = RefCell::new(Vec::new());
+    let plane = |rows: u32, width: u32, dtype: Dtype| -> Option<Tensor> {
+        let bytes = u64::from(rows) * u64::from(width) * dtype.bits() / 8;
+        let buffer = Buffer::zeroed(&device, bytes).ok()?;
+        let handle = handles.bind(&buffer, 0, bytes).ok()?;
+        scratch_keep.borrow_mut().push(buffer);
+        Some(Tensor::new(handle, rows, width, dtype))
+    };
+    let precast = |rows, contraction| plane(rows, contraction, Dtype::F16);
+    let partials = |rows, width| plane(rows, width, Dtype::F32);
+
+    for m in [1u32, 4, 17, 64, 640] {
+        let x: Vec<u8> = (0..m * K_CUT)
+            .flat_map(|_| bf16(rng.unit()).to_le_bytes())
+            .collect();
+        let mut rows = Vec::new();
+        let act = Tensor::new(
+            bound(&device, &handles, &x, &mut rows),
+            m,
+            K_CUT,
+            Dtype::Bf16,
+        );
+        let mut out = Vec::new();
+        for w in [view, copy] {
+            let y_bytes = u64::from(m) * u64::from(N) * 2;
+            let y_buffer = Buffer::zeroed(&device, y_bytes).expect("y");
+            let y = Tensor::new(
+                handles.bind(&y_buffer, 0, y_bytes).expect("y"),
+                m,
+                N,
+                Dtype::Bf16,
+            );
+            let frame = device.frame().expect("a frame");
+            let sink = Sink::new(&device, &frame, &pipelines, &handles);
+            quant::matmul(
+                &sink,
+                act,
+                w,
+                y,
+                quant::Scratch {
+                    precast: &precast,
+                    partials: &partials,
+                },
+                m.div_ceil(32) * 32,
+            )
+            .expect("the matmul launches");
+            frame.commit().expect("the frame lands");
+            out.push(handles.read(y.buf, y_bytes).expect("y read back"));
+            scratch_keep.borrow_mut().clear();
+            drop(y_buffer);
+        }
+        assert!(
+            out[1].iter().any(|&b| b != 0),
+            "m={m}: the copy's product is all zero, so nothing was multiplied"
+        );
+        assert!(
+            out[0] == out[1],
+            "m={m}: the view over the wide bank reads differently from the copy"
+        );
+        eprintln!("m={m}: view == copy over {} bf16 outputs", m * N);
+    }
+}

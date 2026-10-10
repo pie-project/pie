@@ -221,6 +221,7 @@ impl Weights {
                     biases: pairing.biases.map(|at| dense(&places[at])).transpose()?,
                     group: pairing.group,
                     bits: pairing.bits,
+                    ld: place.width,
                 }),
                 // PTQ1_0 is a single-inline-plane ternary codec (its fp16 scale
                 // lives inside each 28-byte block), so it pairs with no separate
@@ -236,6 +237,7 @@ impl Weights {
                     group: 128,
                     bits: 2,
                     mpp_codes: None,
+                    ld: place.width,
                 }),
                 None => WeightRow::Dense(dense(place)?),
             }));
@@ -1069,14 +1071,18 @@ fn warm(
     let mut table = Vec::with_capacity(places.len());
     for (index, param) in trace.params.iter().enumerate() {
         let entry = match pairings.get(param.name.as_str()) {
-            Some(pairing) => WeightRow::Planes(kernels_metal::Bank {
-                mpp_codes: None,
-                codes: row(index)?,
-                scales: row(pairing.scales)?,
-                biases: pairing.biases.map(row).transpose()?,
-                group: pairing.group,
-                bits: pairing.bits,
-            }),
+            Some(pairing) => {
+                let codes = row(index)?;
+                WeightRow::Planes(kernels_metal::Bank {
+                    mpp_codes: None,
+                    ld: codes.width,
+                    codes,
+                    scales: row(pairing.scales)?,
+                    biases: pairing.biases.map(row).transpose()?,
+                    group: pairing.group,
+                    bits: pairing.bits,
+                })
+            }
             // PTQ1_0 is a single-inline-plane ternary codec: the fp16 scale lives
             // INSIDE each 28-byte block, so it pairs with no `.scales`/`.biases`
             // plane. It must still resolve as a quantized BANK (not a dense plane),
@@ -1084,14 +1090,18 @@ fn warm(
             // garbage. The decode-in-dot kernel keys off `codes.dtype == Ptq1_0`
             // and never touches `scales`/`group`/`bits`, so the codes plane doubles
             // as the (unused) scales placeholder.
-            None if param.dtype == Dtype::Ptq1_0 => WeightRow::Planes(kernels_metal::Bank {
-                codes: row(index)?,
-                scales: row(index)?,
-                biases: None,
-                group: 128,
-                bits: 2,
-                mpp_codes: None,
-            }),
+            None if param.dtype == Dtype::Ptq1_0 => {
+                let codes = row(index)?;
+                WeightRow::Planes(kernels_metal::Bank {
+                    ld: codes.width,
+                    codes,
+                    scales: row(index)?,
+                    biases: None,
+                    group: 128,
+                    bits: 2,
+                    mpp_codes: None,
+                })
+            }
             None => WeightRow::Dense(row(index)?),
         };
         table.push(Some(entry));

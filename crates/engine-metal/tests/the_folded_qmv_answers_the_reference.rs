@@ -272,6 +272,7 @@ fn the_folded_qmv_answers_the_reference() {
                             ki.arg(),
                             ni.arg(),
                             mi.arg(),
+                            ki.arg(),
                         ];
                         sink.fire(
                             Fire::at("linear/quant_qmv_rows.metal", point.entry)

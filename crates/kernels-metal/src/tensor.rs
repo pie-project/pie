@@ -83,6 +83,11 @@ pub struct Bank {
     pub group: u32,
 
     pub bits: u32,
+
+    /// The row stride of `codes` in columns: `codes.width` for a whole bank,
+    /// more for a view over the leading columns of a wider one. Scales and
+    /// biases follow it at `ld / group` per row.
+    pub ld: u32,
 }
 
 impl Bank {

@@ -143,6 +143,7 @@ fn every_prefill_row_answers_an_exact_affine_reference() {
                 biases: Some(Tensor::new(bind(&biases_b), n, groups, Dtype::Bf16)),
                 group: 64,
                 bits: 4,
+                ld: k,
             };
             for m in [8u32, 17, 32, 65, 2048] {
                 if !exact && !(n % 128 == 0 && (m > 16 || n >= 1024)) {

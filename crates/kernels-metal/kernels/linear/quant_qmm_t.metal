@@ -261,6 +261,7 @@ METAL_FUNC void qmm_t_aligned_half_impl(
     threadgroup half* Xs,
     threadgroup half* Ws,
     const constant int& K,
+    const constant int& ld,
     const constant int& N,
     uint3 tid,
     uint simd_gid,
@@ -271,15 +272,15 @@ METAL_FUNC void qmm_t_aligned_half_impl(
   using loader_w_t = typename AffineLoaderFor<
       T, BN, BK, BK_padded, WM * WN * SIMD_SIZE, group_size, bits, half>::type;
 
-  const int K_w = K * bytes_per_pack / pack_factor;
-  const int K_g = K / group_size;
+  const int K_w = ld * bytes_per_pack / pack_factor;
+  const int K_g = ld / group_size;
   const int y_col = int(tid.x) * BN;
 
   auto wl = (const device uint8_t*)w;
   wl += y_col * K_w;
   scales += y_col * K_g;
   biases += y_col * K_g;
-  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales, biases, ld, Ws, simd_gid, simd_lid);
 
   qmm_t_cast_loaded_impl<T, loader_w_t, BM, BK, BN, WITH_BIAS, WITH_RESIDUAL,
                          WM, WN>(
@@ -300,6 +301,7 @@ METAL_FUNC void qmm_t_aligned_impl(
     threadgroup T* Xs,
     threadgroup T* Ws,
     const constant int& K,
+    const constant int& ld,
     const constant int& N,
     uint3 tid,
     uint simd_gid,
@@ -310,15 +312,15 @@ METAL_FUNC void qmm_t_aligned_impl(
   using loader_w_t = typename AffineLoaderFor<
       T, BN, BK, BK_padded, WM * WN * SIMD_SIZE, group_size, bits, T>::type;
 
-  const int K_w = K * bytes_per_pack / pack_factor;
-  const int K_g = K / group_size;
+  const int K_w = ld * bytes_per_pack / pack_factor;
+  const int K_g = ld / group_size;
   const int y_col = int(tid.x) * BN;
 
   auto wl = (const device uint8_t*)w;
   wl += y_col * K_w;
   scales += y_col * K_g;
   biases += y_col * K_g;
-  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales, biases, ld, Ws, simd_gid, simd_lid);
   qmm_t_loaded_impl<T, T, loader_w_t, BM, BK, BN, WITH_RESIDUAL, WITH_BIAS,
                     WM, WN>(
       x, y, residual, Xs, Ws, K, N, K, tid, simd_gid, simd_lid, loader_w);
@@ -337,6 +339,7 @@ METAL_FUNC void qmm_t_fp16_precast_impl(
     threadgroup half* Xs,
     threadgroup half* Ws,
     const constant int& K,
+    const constant int& ld,
     const constant int& k_len,
     const constant int& N,
     uint3 tid,
@@ -346,8 +349,8 @@ METAL_FUNC void qmm_t_fp16_precast_impl(
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
   constexpr int BK_padded = BK + 16 / sizeof(half);
 
-  const int K_w = K * bytes_per_pack / pack_factor;
-  const int K_g = K / group_size;
+  const int K_w = ld * bytes_per_pack / pack_factor;
+  const int K_g = ld / group_size;
   const int y_col = int(tid.x) * BN;
 
   auto wl = (const device uint8_t*)w;
@@ -356,7 +359,7 @@ METAL_FUNC void qmm_t_fp16_precast_impl(
   biases += y_col * K_g;
   using loader_w_t = typename AffineLoaderFor<
       bfloat, BN, BK, BK_padded, WM * WN * SIMD_SIZE, group_size, bits, half>::type;
-  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales, biases, ld, Ws, simd_gid, simd_lid);
   qmm_t_loaded_impl<half, P, loader_w_t, BM, BK, BN, WITH_RESIDUAL, WITH_BIAS,
                     WM, WN>(
       x, y, bias, Xs, Ws, K, N, k_len,
@@ -379,6 +382,7 @@ template <int group_size, int bits, int BM, int BK, int BN>
     device bfloat* y [[buffer(4)]],
     const constant int& K [[buffer(5)]],
     const constant int& N [[buffer(6)]],
+    const constant int& ld [[buffer(14)]],
     const device half* x [[buffer(12)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -387,7 +391,7 @@ template <int group_size, int bits, int BM, int BK, int BN>
   threadgroup half Xs[BM * BK_padded];
   threadgroup half Ws[BN * BK_padded];
   qmm_t_fp16_precast_impl<bfloat, group_size, bits, BM, BK, BN>(
-      w, scales, biases, x, y, (const device bfloat*)nullptr, Xs, Ws, K, K, N,
+      w, scales, biases, x, y, (const device bfloat*)nullptr, Xs, Ws, K, ld, K, N,
       tid, simd_gid, simd_lid);
 }
 
@@ -399,6 +403,7 @@ template <int group_size, int bits, int BM, int BK, int BN>
     device bfloat* y [[buffer(4)]],
     const constant int& K [[buffer(5)]],
     const constant int& N [[buffer(6)]],
+    const constant int& ld [[buffer(14)]],
     const device bfloat* bias [[buffer(7)]],
     const device half* x [[buffer(12)]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -408,7 +413,7 @@ template <int group_size, int bits, int BM, int BK, int BN>
   threadgroup half Xs[BM * BK_padded];
   threadgroup half Ws[BN * BK_padded];
   qmm_t_fp16_precast_impl<bfloat, group_size, bits, BM, BK, BN, true>(
-      w, scales, biases, x, y, bias, Xs, Ws, K, K, N, tid, simd_gid, simd_lid);
+      w, scales, biases, x, y, bias, Xs, Ws, K, ld, K, N, tid, simd_gid, simd_lid);
 }
 
 template <int group_size, int bits, int BM, int BK, int BN>
@@ -419,6 +424,7 @@ template <int group_size, int bits, int BM, int BK, int BN>
     device bfloat* y [[buffer(4)]],
     const constant int& K [[buffer(5)]],
     const constant int& N [[buffer(6)]],
+    const constant int& ld [[buffer(14)]],
     const device bfloat* residual [[buffer(7)]],
     const device half* x [[buffer(12)]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -428,7 +434,7 @@ template <int group_size, int bits, int BM, int BK, int BN>
   threadgroup half Xs[BM * BK_padded];
   threadgroup half Ws[BN * BK_padded];
   qmm_t_fp16_precast_impl<bfloat, group_size, bits, BM, BK, BN, false, true>(
-      w, scales, biases, x, y, residual, Xs, Ws, K, K, N, tid, simd_gid,
+      w, scales, biases, x, y, residual, Xs, Ws, K, ld, K, N, tid, simd_gid,
       simd_lid);
 }
 
@@ -441,6 +447,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
     device T* y                [[buffer(4)]],
     const constant int& K      [[buffer(5)]],
     const constant int& N      [[buffer(6)]],
+    const constant int& ld     [[buffer(14)]],
 
     const device T* bias       [[buffer(7)]],
     uint3 tid       [[threadgroup_position_in_grid]],
@@ -450,7 +457,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
   threadgroup half Xs[BM * BK_padded];
   threadgroup half Ws[BN * BK_padded];
   qmm_t_aligned_half_impl<T, group_size, bits, BM, BK, BN, false, true>(
-      w, scales, biases, x, y, bias, Xs, Ws, K, N, tid, simd_gid, simd_lid);
+      w, scales, biases, x, y, bias, Xs, Ws, K, ld, N, tid, simd_gid, simd_lid);
 }
 
 template <typename T, int group_size, int bits, int BM, int BK, int BN,
@@ -463,6 +470,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN,
     device T* y                [[buffer(4)]],
     const constant int& K      [[buffer(5)]],
     const constant int& N      [[buffer(6)]],
+    const constant int& ld     [[buffer(14)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
     uint simd_lid   [[thread_index_in_simdgroup]]) {
@@ -470,7 +478,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN,
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
   qmm_t_aligned_impl<T, group_size, bits, BM, BK, BN, false, false, WM, WN>(
-      w, scales, biases, x, y, nullptr, Xs, Ws, K, N, tid, simd_gid, simd_lid);
+      w, scales, biases, x, y, nullptr, Xs, Ws, K, ld, N, tid, simd_gid, simd_lid);
 }
 
 template <typename T, int group_size, int bits, int BM, int BK, int BN,
@@ -483,6 +491,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN,
     device T* y                [[buffer(4)]],
     const constant int& K      [[buffer(5)]],
     const constant int& N      [[buffer(6)]],
+    const constant int& ld     [[buffer(14)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
     uint simd_lid   [[thread_index_in_simdgroup]]) {
@@ -490,7 +499,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN,
   threadgroup half Xs[BM * BK_padded];
   threadgroup half Ws[BN * BK_padded];
   qmm_t_aligned_half_impl<T, group_size, bits, BM, BK, BN, false, false, WM, WN>(
-      w, scales, biases, x, y, nullptr, Xs, Ws, K, N, tid, simd_gid, simd_lid);
+      w, scales, biases, x, y, nullptr, Xs, Ws, K, ld, N, tid, simd_gid, simd_lid);
 }
 
 template <typename T, int group_size, int bits, int BM, int BK, int BN>
@@ -502,6 +511,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
     device T* y                [[buffer(4)]],
     const constant int& K      [[buffer(5)]],
     const constant int& N      [[buffer(6)]],
+    const constant int& ld     [[buffer(14)]],
     const device T* residual   [[buffer(7)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
@@ -510,7 +520,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
   threadgroup half Xs[BM * BK_padded];
   threadgroup half Ws[BN * BK_padded];
   qmm_t_aligned_half_impl<T, group_size, bits, BM, BK, BN, true>(
-      w, scales, biases, x, y, residual, Xs, Ws, K, N, tid, simd_gid, simd_lid);
+      w, scales, biases, x, y, residual, Xs, Ws, K, ld, N, tid, simd_gid, simd_lid);
 }
 
 template <typename T, int group_size, int bits, int BM, int BK, int BN>
@@ -542,7 +552,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
   threadgroup T Ws[BN * BK_padded];
   qmm_t_aligned_impl<T, group_size, bits, BM, BK, BN, false>(
       (const device uint32_t*)((const device uint8_t*)w + w_bytes),
-      scales + g_off, biases + g_off, x, y, nullptr, Xs, Ws, K, N, tid,
+      scales + g_off, biases + g_off, x, y, nullptr, Xs, Ws, K, K, N, tid,
       simd_gid, simd_lid);
 }
 
@@ -744,28 +754,28 @@ template <typename T, int BM, int BK, int BN>
   [[kernel]] void affine_qmm_t_wide<bfloat, gs, b, bm, bk, bn>(                \
       const device uint32_t*, const device bfloat*, const device bfloat*,      \
       const device bfloat*, device bfloat*, const constant int&,               \
-      const constant int&, uint3, uint, uint);
+      const constant int&, const constant int&, uint3, uint, uint);
 
 #define PIE_STAMP_qmm_t(entry, gs, b, bm, bk, bn)                              \
   template [[host_name(entry)]]                                                \
   [[kernel]] void affine_qmm_t_aligned<bfloat, gs, b, bm, bk, bn>(             \
       const device uint32_t*, const device bfloat*, const device bfloat*,      \
       const device bfloat*, device bfloat*, const constant int&,               \
-      const constant int&, uint3, uint, uint);
+      const constant int&, const constant int&, uint3, uint, uint);
 
 #define PIE_STAMP_qmm_t_residual(entry, gs, b, bm, bk, bn)                     \
   template [[host_name(entry)]]                                                \
   [[kernel]] void affine_qmm_t_aligned_residual<bfloat, gs, b, bm, bk, bn>(    \
       const device uint32_t*, const device bfloat*, const device bfloat*,      \
       const device bfloat*, device bfloat*, const constant int&,               \
-      const constant int&, const device bfloat*, uint3, uint, uint);
+      const constant int&, const constant int&, const device bfloat*, uint3, uint, uint);
 
 #define PIE_STAMP_qmm_t_bias(entry, gs, b, bm, bk, bn)                         \
   template [[host_name(entry)]]                                                \
   [[kernel]] void affine_qmm_t_aligned_bias<bfloat, gs, b, bm, bk, bn>(        \
       const device uint32_t*, const device bfloat*, const device bfloat*,      \
       const device bfloat*, device bfloat*, const constant int&,               \
-      const constant int&, const device bfloat*, uint3, uint, uint);
+      const constant int&, const constant int&, const device bfloat*, uint3, uint, uint);
 
 #define instantiate_mxfp4_qmm_t_routed(bm, bn)                              \
   template [[host_name("mxfp4_qmm_t_routed_bias_bfloat16_bm_" #bm           \
@@ -829,7 +839,7 @@ instantiate_qmm_t_routed_fp16(64, 64)
                        #bm "_bn_" #bn)]]                                     \
   [[kernel]] void affine_qmm_t_fp16_precast<64, 4, bm, 64, bn>(             \
       const device uint32_t*, const device bfloat*, const device bfloat*,    \
-      device bfloat*, const constant int&, const constant int&,              \
+      device bfloat*, const constant int&, const constant int&, const constant int&,              \
       const device half*, uint3, uint, uint);
 
 instantiate_qmm_t_fp16_precast(16, 16)
@@ -851,7 +861,7 @@ instantiate_qmm_t_fp16_precast(8, 64)
                        "_bm_" #bm "_bn_" #bn)]]                              \
   [[kernel]] void affine_qmm_t_bias_fp16_precast<64, 4, bm, 64, bn>(         \
       const device uint32_t*, const device bfloat*, const device bfloat*,    \
-      device bfloat*, const constant int&, const constant int&,              \
+      device bfloat*, const constant int&, const constant int&, const constant int&,              \
       const device bfloat*, const device half*, uint3, uint, uint);
 
 #define instantiate_qmm_t_residual_fp16_precast(bm, bn)                      \
@@ -859,7 +869,7 @@ instantiate_qmm_t_fp16_precast(8, 64)
                        "_gs_64_b_4_bm_" #bm "_bn_" #bn)]]                    \
   [[kernel]] void affine_qmm_t_residual_fp16_precast<64, 4, bm, 64, bn>(     \
       const device uint32_t*, const device bfloat*, const device bfloat*,    \
-      device bfloat*, const constant int&, const constant int&,              \
+      device bfloat*, const constant int&, const constant int&, const constant int&,              \
       const device bfloat*, const device half*, uint3, uint, uint);
 
 instantiate_qmm_t_residual_fp16_precast(16, 16)
@@ -1177,6 +1187,7 @@ METAL_FUNC void qmm_t_splitk_impl(
     threadgroup T* Xs,
     threadgroup T* Ws,
     const constant int& K,
+    const constant int& ld,
     const constant int& k_len,
     const constant int& N,
     uint3 tid,
@@ -1190,15 +1201,15 @@ METAL_FUNC void qmm_t_splitk_impl(
       T, BN, BK, BK_padded, 1, qmm_tgp<BM>(), group_size, bits>;
 
 
-  const int K_w = K * bytes_per_pack / pack_factor;
-  const int K_g = K / group_size;
+  const int K_w = ld * bytes_per_pack / pack_factor;
+  const int K_g = ld / group_size;
   const int y_col = int(tid.x) * BN;
 
   auto wl = (const device uint8_t*)w;
   wl += y_col * K_w;
   scales += y_col * K_g;
   biases += y_col * K_g;
-  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales, biases, ld, Ws, simd_gid, simd_lid);
   qmm_t_loaded_impl<T, P, loader_w_t, BM, BK, BN, false, false>(
       x, y, nullptr, Xs, Ws, K, N, k_len,
       tid, simd_gid, simd_lid, loader_w);
@@ -1213,6 +1224,7 @@ template <typename T, typename P, int group_size, int bits, int BM, int BK, int 
     device P* y              [[buffer(8)]],
     const constant int& K    [[buffer(5)]],
     const constant int& N    [[buffer(6)]],
+    const constant int& ld   [[buffer(14)]],
     const constant int& k_partition_size [[buffer(9)]],
     const constant int& split_k_partition_stride [[buffer(10)]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -1234,7 +1246,7 @@ template <typename T, typename P, int group_size, int bits, int BM, int BK, int 
   y += int64_t(tid.z) * split_k_partition_stride;
 
   qmm_t_splitk_impl<T, P, group_size, bits, BM, BK, BN>(
-      (const device uint32_t*)wl, scales, biases, x, y, Xs, Ws, K,
+      (const device uint32_t*)wl, scales, biases, x, y, Xs, Ws, K, ld,
       k_partition_size, N, tid, simd_gid, simd_lid);
 }
 
@@ -1246,6 +1258,7 @@ template <typename P, int group_size, int bits, int BM, int BK, int BN>
     device P* y [[buffer(8)]],
     const constant int& K [[buffer(5)]],
     const constant int& N [[buffer(6)]],
+    const constant int& ld [[buffer(14)]],
     const constant int& k_partition_size [[buffer(9)]],
     const constant int& split_k_partition_stride [[buffer(10)]],
     const device half* x [[buffer(12)]],
@@ -1268,7 +1281,7 @@ template <typename P, int group_size, int bits, int BM, int BK, int BN>
 
   qmm_t_fp16_precast_impl<P, group_size, bits, BM, BK, BN>(
       (const device uint32_t*)wl, scales, biases, x, y, (const device P*)nullptr,
-      Xs, Ws, K, k_partition_size, N, tid, simd_gid, simd_lid);
+      Xs, Ws, K, ld, k_partition_size, N, tid, simd_gid, simd_lid);
 }
 
 template <typename T, typename P>
@@ -1295,7 +1308,7 @@ template <typename T, typename P>
   [[kernel]] void affine_qmm_t_splitk<bfloat, ptype, gs, b, bm, bk, bn>(        \
       const device uint32_t*, const device bfloat*, const device bfloat*,       \
       const device bfloat*, device ptype*, const constant int&,                 \
-      const constant int&, const constant int&, const constant int&,            \
+      const constant int&, const constant int&, const constant int&, const constant int&,            \
       uint3, uint, uint);
 
 #define instantiate_qmm_t_splitk(gs, bm, bk, bn, b)                              \
@@ -1332,7 +1345,7 @@ instantiate_qmm_t_splitk(128, 8, 32, 32, 8)
                        "_gs_64_b_4_bm_" #bm "_bn_32")]]                      \
   [[kernel]] void affine_qmm_t_splitk_fp16_precast<ptype, 64, 4, bm, 32, 32>(\
       const device uint32_t*, const device bfloat*, const device bfloat*,    \
-      device ptype*, const constant int&, const constant int&,               \
+      device ptype*, const constant int&, const constant int&, const constant int&,               \
       const constant int&, const constant int&, const device half*,          \
       uint3, uint, uint);
 
@@ -1358,28 +1371,28 @@ template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4")]]
 [[kernel]] void affine_qmm_t_aligned<bfloat, 64, 4, 64, 32, 64, 2, 4>(
     const device uint32_t*, const device bfloat*, const device bfloat*,
     const device bfloat*, device bfloat*, const constant int&,
-    const constant int&, uint3, uint, uint);
+    const constant int&, const constant int&, uint3, uint, uint);
 
 template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4")]]
 [[kernel]] void affine_qmm_t_aligned<bfloat, 64, 4, 128, 32, 32, 4, 2>(
     const device uint32_t*, const device bfloat*, const device bfloat*,
     const device bfloat*, device bfloat*, const constant int&,
-    const constant int&, uint3, uint, uint);
+    const constant int&, const constant int&, uint3, uint, uint);
 
 template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1")]]
 [[kernel]] void affine_qmm_t_aligned<bfloat, 64, 4, 64, 32, 32, 2, 1>(
     const device uint32_t*, const device bfloat*, const device bfloat*,
     const device bfloat*, device bfloat*, const constant int&,
-    const constant int&, uint3, uint, uint);
+    const constant int&, const constant int&, uint3, uint, uint);
 
 template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2")]]
 [[kernel]] void affine_qmm_t_aligned<bfloat, 64, 4, 64, 32, 32, 1, 2>(
     const device uint32_t*, const device bfloat*, const device bfloat*,
     const device bfloat*, device bfloat*, const constant int&,
-    const constant int&, uint3, uint, uint);
+    const constant int&, const constant int&, uint3, uint, uint);
 
 template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2")]]
 [[kernel]] void affine_qmm_t_aligned<bfloat, 64, 4, 32, 32, 32, 1, 2>(
     const device uint32_t*, const device bfloat*, const device bfloat*,
     const device bfloat*, device bfloat*, const constant int&,
-    const constant int&, uint3, uint, uint);
+    const constant int&, const constant int&, uint3, uint, uint);

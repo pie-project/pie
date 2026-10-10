@@ -194,6 +194,7 @@ fn every_row_count_is_timed() {
                 biases: Some(Tensor::new(hb, n, k / group, Dtype::Bf16)),
                 group,
                 bits,
+                ld: k,
             };
             let act = Tensor::new(ha, m, k, Dtype::Bf16);
             let y = Tensor::new(ho, m, n, Dtype::Bf16);
@@ -453,6 +454,7 @@ fn every_folded_point_answers_the_one_row_point() {
                         ki.arg(),
                         ni.arg(),
                         mi.arg(),
+                        ki.arg(),
                     ]);
                     sink.fire(
                         Fire::at("linear/quant_qmv_rows.metal", point.entry)
@@ -472,6 +474,10 @@ fn every_folded_point_answers_the_one_row_point() {
                         ki.arg(),
                         ni.arg(),
                     ]);
+                    for _ in 7..12 {
+                        single.push(sink.absent().expect("an absent slot"));
+                    }
+                    single.push(ki.arg());
                     sink.fire(
                         Fire::at("linear/quant_qmv.metal", one.entry).apply(Grid::of(
                             quant::qmv_grid("sweep", mi, ni).expect("grid"),

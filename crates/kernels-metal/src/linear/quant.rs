@@ -583,6 +583,17 @@ pub fn act_x_wt(
         stated(op, columns)?,
         stated(op, contraction)?,
     );
+    if w.ld < contraction || !w.ld.is_multiple_of(w.group) {
+        return Err(refuse(
+            op,
+            format!(
+                "the bank's row stride is {} columns, which holds no {contraction}-wide row \
+                 of whole {}-code groups",
+                w.ld, w.group
+            ),
+        ));
+    }
+    let ld = stated(op, w.ld)?;
     let tuned = crate::tuning::current();
     let bm = match rows {
         1..=8 => 8,
@@ -681,6 +692,7 @@ pub fn act_x_wt(
                     n.arg(),
                     aux.arg(),
                     (if local { rows } else { padded } as i32).arg(),
+                    ld.arg(),
                 ],
             )?;
             if local {
@@ -769,6 +781,8 @@ pub fn act_x_wt(
                 gemm.push(ctx.absent()?);
             }
             gemm.push(staged.arg());
+            gemm.push(ctx.absent()?);
+            gemm.push(ld.arg());
             return ctx.fire(
                 Fire::at(QMM_FILE, precast_point(op, "", bm, bn)?)
                     .apply(Grid::of(qmm_grid(op, n, bn, padded, bm, 1)?, qmm_group(bm))),
@@ -796,6 +810,10 @@ pub fn act_x_wt(
                     partials.arg_mut(),
                     (k / split).arg(),
                     stride.arg(),
+                    ctx.absent()?,
+                    ctx.absent()?,
+                    ctx.absent()?,
+                    ld.arg(),
                 ],
             )?;
             let mut reduce = vec![ctx.absent()?; 4];
@@ -818,19 +836,24 @@ pub fn act_x_wt(
         if let Some(bn) = bn_unsplit(n, padded / bm, crossover) {
             let (form, stamp) = tiled_form();
             let point = qmm_point(op, form, stamp, group, bits, bm, bn)?;
+            let mut tiled = vec![
+                w.codes.arg(),
+                w.scales.arg(),
+                biases.arg(),
+                act.arg(),
+                y.arg_mut(),
+                k.arg(),
+                n.arg(),
+            ];
+            for _ in 7..14 {
+                tiled.push(ctx.absent()?);
+            }
+            tiled.push(ld.arg());
             return ctx.fire(
                 Fire::at(QMM_FILE, point.entry)
                     .stamp(point.stamp)
                     .apply(Grid::of(qmm_grid(op, n, bn, padded, bm, 1)?, qmm_group(bm))),
-                &[
-                    w.codes.arg(),
-                    w.scales.arg(),
-                    biases.arg(),
-                    act.arg(),
-                    y.arg_mut(),
-                    k.arg(),
-                    n.arg(),
-                ],
+                &tiled,
             );
         }
     }
@@ -851,21 +874,27 @@ pub fn act_x_wt(
                 k.arg(),
                 n.arg(),
                 m.arg(),
+                ld.arg(),
             ],
         );
     }
     let point = qmv_point(op, "fast", group, bits)?;
+    let mut fast = vec![
+        w.codes.arg(),
+        w.scales.arg(),
+        biases.arg(),
+        act.arg(),
+        y.arg_mut(),
+        k.arg(),
+        n.arg(),
+    ];
+    for _ in 7..12 {
+        fast.push(ctx.absent()?);
+    }
+    fast.push(ld.arg());
     ctx.fire(
         Fire::at(QMV_FILE, point.entry).apply(Grid::of(qmv_grid(op, m, n)?, QMV_GROUP)),
-        &[
-            w.codes.arg(),
-            w.scales.arg(),
-            biases.arg(),
-            act.arg(),
-            y.arg_mut(),
-            k.arg(),
-            n.arg(),
-        ],
+        &fast,
     )
 }
 

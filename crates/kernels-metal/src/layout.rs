@@ -789,6 +789,7 @@ mod tests {
             biases: Some(Tensor::new(12, vocab, width / 32, Dtype::Bf16)),
             group: 32,
             bits: 4,
+            ld: width,
         }
     }
 
