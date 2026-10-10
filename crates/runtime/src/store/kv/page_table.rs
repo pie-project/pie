@@ -1374,6 +1374,44 @@ impl KvPageTable {
         marked
     }
 
+    /// The device pages [`Self::drop_unused_cache_leases`] would free now,
+    /// counted without freeing them: headroom the next demand reclaims, not
+    /// pressure. A node goes when every anchor on its path is a dropped
+    /// lease; the pages it owns outright go with it.
+    pub fn unused_cache_lease_pages(&self) -> u32 {
+        if self.cache_roots.is_empty() {
+            return 0;
+        }
+        let live = self.mark_chains(
+            self.working_sets
+                .iter()
+                .filter_map(|(_, e)| e.terminal)
+                .chain(self.pins.keys().copied()),
+        );
+        let mut dropped: HashMap<NodeId, u32> = HashMap::new();
+        for &root in self.cache_roots.keys().filter(|node| !live.contains(node)) {
+            let mut cursor = Some(root);
+            while let Some(node) = cursor {
+                *dropped.entry(node).or_insert(0) += 1;
+                cursor = self.nodes.get(node).expect("live node").parent;
+            }
+        }
+        dropped
+            .into_iter()
+            .filter_map(|(node, leases)| {
+                let entry = self.nodes.get(node).expect("live node");
+                (entry.path_anchors == leases).then_some(&entry.pages)
+            })
+            .map(|pages| match pages {
+                Pages::Owned { backings, .. } => backings
+                    .iter()
+                    .filter(|backing| matches!(backing, KvPageBacking::Resident(_)))
+                    .count() as u32,
+                Pages::ParentSelection { .. } => 0,
+            })
+            .sum()
+    }
+
     pub fn drop_unused_cache_leases(&mut self) -> (usize, Vec<KvPageBacking>) {
         if self.cache_roots.is_empty() {
             return (0, Vec::new());
