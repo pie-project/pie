@@ -147,6 +147,7 @@ fn the_ane_ffn_matches_its_reference_on_one_chunk() {
             .enqueue(
                 &ffn.evaluations[evaluation].1[0],
                 &event,
+                &event,
                 1,
                 2,
                 Box::new(move |ok| tx_done.send(ok).unwrap()),

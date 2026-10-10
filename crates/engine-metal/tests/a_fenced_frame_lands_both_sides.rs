@@ -40,11 +40,13 @@ fn a_fenced_frame_lands_both_sides() {
     let pipelines = Pipelines::new();
     // A shared event is shareable across devices, so the default device's
     // serves the context's.
-    let event = MTLCreateSystemDefaultDevice()
-        .expect("a device")
-        .newSharedEvent()
-        .expect("a shared event");
-    let handoff = Handoff::new(event);
+    let event = || {
+        MTLCreateSystemDefaultDevice()
+            .expect("a device")
+            .newSharedEvent()
+            .expect("a shared event")
+    };
+    let handoff = Handoff::new(event(), event());
 
     let (rows, width, block) = (4u32, 256u32, 256u32);
     let data: Vec<f32> = (0..rows * width)
@@ -59,18 +61,25 @@ fn a_fenced_frame_lands_both_sides() {
     {
         let frame = device.frame().expect("a frame");
         let sink = Sink::new(&device, &frame, &pipelines, &handles).with_handoff(Some(&handoff));
-        let ready = handoff.next();
+        let at = handoff.allot();
         pointwise::hadamard(&sink, x, block, None).expect("the first launch");
-        sink.signal(ready).expect("the signal fence");
-        sink.wait(ready).expect("the wait fence");
+        sink.signal(at.ready).expect("the signal fence");
+        sink.wait(at.done).expect("the wait fence");
         pointwise::hadamard(&sink, x, block, None).expect("the second launch");
+        // The other engine's side: answer `done` once the GPU raises `ready`.
+        let (ready, done) = (handoff.ready_event().clone(), handoff.done_event().clone());
+        let other = std::thread::spawn(move || {
+            assert!(ready.waitUntilSignaledValue_timeoutMS(at.ready, 10_000));
+            done.setSignaledValue(at.done);
+        });
         frame.commit().expect("the commit");
+        other.join().expect("the other engine");
+        assert_eq!(
+            handoff.ready_event().signaledValue(),
+            at.ready,
+            "the GPU raised the event"
+        );
     }
-    assert_eq!(
-        handoff.event().signaledValue(),
-        1,
-        "the GPU raised the event"
-    );
     let got = f32_floats(&handles.read(handle, bytes).expect("read x"));
     for (i, (&g, &w)) in got.iter().zip(&data).enumerate() {
         assert!((g - w).abs() <= 1e-4, "element {i}: got {g}, want {w}");

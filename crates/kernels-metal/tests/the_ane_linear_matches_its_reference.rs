@@ -132,6 +132,7 @@ fn the_ane_linear_matches_its_reference_on_one_chunk() {
             .enqueue(
                 &linear.evaluations[evaluation].1[1],
                 &event,
+                &event,
                 1,
                 2,
                 Box::new(move |ok| tx_done.send(ok).unwrap()),

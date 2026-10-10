@@ -4155,6 +4155,12 @@ impl engine::frame::Shell for Shell {
             keepalive.touch();
         }
         fire_trace(|| "encode-begin".to_string());
+        // An encode that stopped short left its hand-offs staged; its frame
+        // never runs, so they never reach the Neural Engine.
+        #[cfg(target_vendor = "apple")]
+        if let Some(ane) = &self.ane {
+            ane.handoff().discard_staged();
+        }
         let walked = if self.weights.tier().is_some() || self.weights.rows().is_some() {
             let trace = crate::diag::on().tier_trace;
             let before = trace.then(|| {
@@ -4351,6 +4357,12 @@ impl engine::frame::Shell for Shell {
                 return Err(fault);
             }
         };
+        // Only now, with the frame on the queue, do its hand-offs go to the
+        // Neural Engine.
+        #[cfg(target_vendor = "apple")]
+        if let Some(ane) = &self.ane {
+            ane.handoff().commit_staged();
+        }
 
         self.handles.rewind();
 

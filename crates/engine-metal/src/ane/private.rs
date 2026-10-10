@@ -447,11 +447,13 @@ pub fn load(
     }
     frame.commit()?;
 
-    let event = device
-        .device()
-        .newSharedEvent()
-        .ok_or(fault("no shared event".into()))?;
-    let handoff = Handoff::new(event);
+    let event = || {
+        device
+            .device()
+            .newSharedEvent()
+            .ok_or(fault("no shared event".into()))
+    };
+    let handoff = Handoff::new(event()?, event()?);
 
     // Every program compiles on one thread, in order, so serving starts
     // while they do and the compiler service sees one at a time.
