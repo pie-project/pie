@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use kernels_metal::ane::ffn::{self, Ffn, MAX_ROWS, MIN_ROWS, Memory, SEGMENT, Shape};
+use kernels_metal::ane::ffn::{self, Ffn, MAX_ROWS, MIN_ROWS, Memory, Shape};
 use kernels_metal::ane::{Element, Handoff, Surface};
 use kernels_metal::linear::ane::{self as kernels, Set, Shared, Source, Target};
 use kernels_metal::{Ctx, Error, Tensor};
@@ -120,7 +120,7 @@ pub fn load(device: &Context, handles: &Handles, mlps: &[Mlp]) -> Result<Option<
         .iter()
         .map(|s| {
             Ok((
-                view(device, handles, s, SEGMENT, MAX_ROWS, &mut keep)?,
+                view(device, handles, s, shape.segment, MAX_ROWS, &mut keep)?,
                 s.stride(),
             ))
         })

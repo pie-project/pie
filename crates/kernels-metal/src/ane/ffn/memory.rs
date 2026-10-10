@@ -2,7 +2,8 @@
 //! two sets of weights that alternate by layer parity, and the partial the
 //! Neural Engine writes.
 
-use super::shape::{MAX_ROWS, SEGMENT, Shape};
+use super::shape::{MAX_ROWS, Shape};
+use crate::ane::mil::Input;
 use crate::ane::{Element, Surface};
 
 /// One layer's share of the weights, int8 rows with an fp16 scale per row.
@@ -33,10 +34,10 @@ impl Memory {
         let weights = || -> Result<Weights, String> {
             Ok(Weights {
                 gate: (0..shape.segments())
-                    .map(|_| Surface::new(shape.ane, SEGMENT, Element::Int8))
+                    .map(|_| Surface::new(shape.ane, shape.segment, Element::Int8))
                     .collect::<Result<_, _>>()?,
                 up: (0..shape.segments())
-                    .map(|_| Surface::new(shape.ane, SEGMENT, Element::Int8))
+                    .map(|_| Surface::new(shape.ane, shape.segment, Element::Int8))
                     .collect::<Result<_, _>>()?,
                 down: shape
                     .down
@@ -50,7 +51,7 @@ impl Memory {
         };
         Ok(Memory {
             inputs: (0..shape.segments())
-                .map(|_| Surface::new(SEGMENT, MAX_ROWS, Element::Int8))
+                .map(|_| Surface::new(shape.segment, MAX_ROWS, Element::Int8))
                 .collect::<Result<_, _>>()?,
             token_scale: Surface::new(1, MAX_ROWS, Element::Fp16)?,
             partial: Surface::new(shape.hidden + 1, MAX_ROWS, Element::Fp16)?,
@@ -59,23 +60,13 @@ impl Memory {
     }
 }
 
-/// One input of the program: its name, the surface behind it in each weight
-/// set, and its tensor shape. A `width` of zero means the row count the
-/// procedure is specialized for.
-pub(super) struct Input<'a> {
-    pub(super) name: String,
-    pub(super) surfaces: [&'a Surface; 2],
-    pub(super) rows: u32,
-    pub(super) width: u32,
-}
-
 pub(super) fn inputs<'a>(shape: &Shape, memory: &'a Memory) -> Vec<Input<'a>> {
     let mut list = Vec::new();
     for (k, x) in memory.inputs.iter().enumerate() {
         list.push(Input {
             name: format!("x{k}"),
             surfaces: [x, x],
-            rows: SEGMENT,
+            rows: shape.segment,
             width: 0,
         });
     }
@@ -91,13 +82,13 @@ pub(super) fn inputs<'a>(shape: &Shape, memory: &'a Memory) -> Vec<Input<'a>> {
             name: format!("wg{k}"),
             surfaces: [&a.gate[k], &b.gate[k]],
             rows: shape.ane,
-            width: SEGMENT,
+            width: shape.segment,
         });
         list.push(Input {
             name: format!("wu{k}"),
             surfaces: [&a.up[k], &b.up[k]],
             rows: shape.ane,
-            width: SEGMENT,
+            width: shape.segment,
         });
     }
     list.push(Input {

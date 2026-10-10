@@ -1,8 +1,9 @@
 //! How an MLP's intermediate channels divide between the two engines, and
 //! the sizes the Neural Engine program is written for.
 
-/// The Neural Engine program takes the hidden axis in segments this wide.
-pub const SEGMENT: u32 = 2560;
+/// The widest hidden-axis segment; a shape takes the widest divisor of its
+/// hidden size up to this (see [`crate::ane::mil::segment_of`]).
+pub const SEGMENT: u32 = crate::ane::mil::SEGMENT_MAX;
 /// The GPU rotates activations in blocks this wide before quantizing them.
 pub const INPUT_BLOCK: u32 = 128;
 /// The program rotates the swiglu intermediate in blocks this wide.
@@ -22,6 +23,8 @@ pub(super) const INTERMEDIATE_FLOOR: f64 = 1.0 / 512.0;
 #[derive(Clone, Debug)]
 pub struct Shape {
     pub hidden: u32,
+    /// How wide a segment of the hidden axis the program multiplies at once.
+    pub segment: u32,
     pub intermediate: u32,
     /// The intermediate channels the GPU keeps: the leading ones.
     pub gpu: u32,
@@ -34,13 +37,13 @@ pub struct Shape {
 
 impl Shape {
     /// `units` of [`UNIT`] channels go to the Neural Engine. The hidden size
-    /// must be whole segments, and both engines must be left something.
+    /// must split into segments, and both engines must be left something.
     pub fn new(hidden: u32, intermediate: u32, units: u32) -> Result<Shape, String> {
-        if !hidden.is_multiple_of(SEGMENT) || hidden / INPUT_BLOCK / 8 > 8 {
+        let Some(segment) = crate::ane::mil::segment_of(hidden) else {
             return Err(format!(
-                "hidden size {hidden} is not whole {SEGMENT}-channel segments"
+                "hidden size {hidden} does not split into {INPUT_BLOCK}-block segments of at most {SEGMENT}"
             ));
-        }
+        };
         if !intermediate.is_multiple_of(UNIT) || units == 0 || units >= intermediate / UNIT {
             return Err(format!(
                 "{units} units leave the GPU or the Neural Engine nothing of {intermediate}"
@@ -53,6 +56,7 @@ impl Shape {
             .collect();
         Ok(Shape {
             hidden,
+            segment,
             intermediate,
             gpu: intermediate - ane,
             ane,
@@ -62,6 +66,6 @@ impl Shape {
 
     #[must_use]
     pub fn segments(&self) -> u32 {
-        self.hidden / SEGMENT
+        self.hidden / self.segment
     }
 }

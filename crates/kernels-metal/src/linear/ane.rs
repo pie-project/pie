@@ -7,7 +7,7 @@
 //! Everything here is over resolved tensors; who owns them, which layer is
 //! staged, and whether the Neural Engine is ready are the engine's business.
 
-use crate::ane::ffn::{INPUT_BLOCK, INTERMEDIATE_BLOCK, SEGMENT, Shape};
+use crate::ane::ffn::{INPUT_BLOCK, INTERMEDIATE_BLOCK, Shape};
 use crate::encode::{Arg, ArgValue, Ctx, Fire, Grid};
 use crate::error::Error;
 use crate::tensor::{Bank, Tensor};
@@ -252,8 +252,8 @@ pub fn stage(
         let rows = Rows {
             first: shape.gpu,
             rows: shape.ane,
-            input: k as u32 * SEGMENT,
-            span: SEGMENT,
+            input: k as u32 * shape.segment,
+            span: shape.segment,
             intermediate: false,
         };
         weights(ctx, &source.gate_up, &rows, signs, source.scales[0], gate)?;
@@ -288,14 +288,15 @@ pub fn prepare(
     ready: u64,
 ) -> Result<(), Error> {
     rotate(ctx, x, shared.signs, rotated, shared.token_scale)?;
+    // Each input surface holds one segment of the hidden axis: its rows.
     for (k, &(packed, stride)) in shared.inputs.iter().enumerate() {
         pack(
             ctx,
             rotated,
             packed,
             &Pack {
-                channel: k as u32 * SEGMENT,
-                width: SEGMENT,
+                channel: k as u32 * packed.rows,
+                width: packed.rows,
                 stride,
             },
         )?;
