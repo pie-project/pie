@@ -1,34 +1,27 @@
-//! The shared event the GPU and the Neural Engine hand work across. Its
-//! value only rises: each hand-off takes two fresh values, one the GPU
-//! signals when the inputs are ready and one the Neural Engine signals when
-//! its partial is written.
+//! The two shared events the GPU and the Neural Engine hand work across:
+//! `ready`, which only the GPU raises, and `done`, which only the Neural
+//! Engine raises (and this side, for a request that came back without). The
+//! order that keeps either from falling is the [`ledger`](crate::ledger)'s.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLSharedEvent, MTLSharedEventListener};
 
 use super::program::{Binding, Program};
+pub use crate::ledger::Allotment;
+use crate::ledger::Ledger;
 
-/// The two event values of one hand-off.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Allotment {
-    /// The GPU raises it when the inputs are packed.
-    pub ready: u64,
-    /// The Neural Engine raises it when the partial is written.
-    pub done: u64,
-}
+type Event = Retained<ProtocolObject<dyn MTLSharedEvent>>;
 
 struct State {
-    event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
-    /// Where the event tells us the GPU has raised a `ready` value, so the
-    /// request can be submitted then and not before.
+    ready: Event,
+    done: Event,
+    /// Where the `ready` event tells us the GPU has raised the front's
+    /// value, so its request is submitted then and not before.
     listener: Retained<MTLSharedEventListener>,
-    value: AtomicU64,
-    failures: AtomicU64,
-    retired: AtomicBool,
+    ledger: Ledger<(Program, Binding)>,
 }
 
 unsafe impl Send for State {}
@@ -38,104 +31,134 @@ unsafe impl Sync for State {}
 pub struct Handoff(Arc<State>);
 
 impl Handoff {
-    pub fn new(event: Retained<ProtocolObject<dyn MTLSharedEvent>>) -> Handoff {
+    pub fn new(ready: Event, done: Event) -> Handoff {
         Handoff(Arc::new(State {
-            event,
+            ready,
+            done,
             listener: MTLSharedEventListener::new(),
-            value: AtomicU64::new(0),
-            failures: AtomicU64::new(0),
-            retired: AtomicBool::new(false),
+            ledger: Ledger::new(),
         }))
     }
 
+    /// The event the GPU signals once a hand-off's inputs are packed.
     #[must_use]
-    pub fn event(&self) -> &Retained<ProtocolObject<dyn MTLSharedEvent>> {
-        &self.0.event
+    pub fn ready_event(&self) -> &Event {
+        &self.0.ready
     }
 
-    /// The next value to hand off on. Once retired, every value is signaled
-    /// at once, so a GPU wait on it never blocks.
+    /// The event the GPU waits on for a hand-off's partial.
+    #[must_use]
+    pub fn done_event(&self) -> &Event {
+        &self.0.done
+    }
+
+    /// The next value to hand off on.
     pub fn next(&self) -> u64 {
-        let value = self.0.value.fetch_add(1, Ordering::AcqRel) + 1;
-        if self.retired() {
-            self.0.event.setSignaledValue(value);
-        }
-        value
+        self.0.ledger.next()
     }
 
     /// One hand-off's values.
     pub fn allot(&self) -> Allotment {
-        Allotment {
-            ready: self.next(),
-            done: self.next(),
-        }
+        self.0.ledger.allot()
     }
 
-    /// Whether the Neural Engine has failed and the split is off for good.
+    /// Whether the Neural Engine has failed and no new split is planned.
     #[must_use]
     pub fn retired(&self) -> bool {
-        self.0.retired.load(Ordering::Acquire)
+        self.0.ledger.retired()
     }
 
     #[must_use]
     pub fn failures(&self) -> u64 {
-        self.0.failures.load(Ordering::Acquire)
+        self.0.ledger.failures()
     }
 
-    /// Retires the hand-off: says why once, and signals every value taken so
-    /// far so no GPU command buffer waits on a partial that will never come.
+    /// Stops new splits being planned, and says why once. Hand-offs already
+    /// committed still run.
     pub fn fail(&self, why: &str) {
-        self.0.failures.fetch_add(1, Ordering::AcqRel);
-        if !self.0.retired.swap(true, Ordering::AcqRel) {
-            eprintln!(
-                "PIE_ANE: the Neural Engine split stopped ({why}); the GPU runs everything alone"
-            );
+        if self.0.ledger.retire() {
+            stopped(why);
         }
-        let at = self.0.value.load(Ordering::Acquire);
-        self.0
-            .event
-            .setSignaledValue(at.max(self.0.event.signaledValue()));
     }
 
-    /// Arranges for `binding` to run once the GPU raises `ready`, signaling
-    /// `done` after. The request is submitted from the event's listener at
-    /// that moment, not before, so the Neural Engine's queue never holds a
-    /// request behind its wait. A failure, at submission or on completion,
-    /// retires the hand-off.
+    /// Stages `binding` to run once the GPU raises `ready`, signaling `done`
+    /// after. It reaches the Neural Engine only if this frame commits.
     pub fn start(&self, program: &Program, binding: &Binding, ready: u64, done: u64) {
-        if self.retired() {
-            return;
-        }
-        let state = self.0.clone();
-        let (program, binding) = (program.clone(), binding.clone());
-        let block = block2::RcBlock::new(
-            move |_: core::ptr::NonNull<ProtocolObject<dyn MTLSharedEvent>>, _: u64| {
-                // Retired since: the event sits at its ceiling, and a request
-                // signaling `done` now would pull it back down.
-                if state.retired.load(Ordering::Acquire) {
-                    return;
-                }
-                let this = Handoff(state.clone());
-                let report = Box::new(move |ok: bool| {
-                    if !ok {
-                        this.fail("an evaluation failed");
-                    }
-                });
-                if let Err(why) =
-                    unsafe { program.enqueue(&binding, &state.event, ready, done, report) }
-                {
-                    Handoff(state.clone()).fail(&why);
-                }
-            },
+        self.0.ledger.stage(
+            Allotment { ready, done },
+            (program.clone(), binding.clone()),
         );
-        // SAFETY: `notifyListener:atValue:block:` copies the block; the
-        // listener and the event are the hand-off's own and outlive it.
-        unsafe {
-            self.0.event.notifyListener_atValue_block(
-                &self.0.listener,
-                ready,
-                block2::RcBlock::as_ptr(&block),
-            );
+    }
+
+    /// Drops what an encode that stopped short staged.
+    pub fn discard_staged(&self) {
+        self.0.ledger.discard_staged();
+    }
+
+    /// The frame being encoded committed: its hand-offs join the queue.
+    pub fn commit_staged(&self) {
+        if let Some(head) = self.0.ledger.commit_staged() {
+            listen(&self.0, head);
         }
     }
+}
+
+/// Submits `at`'s request once the `ready` event reaches it. One request is
+/// out at a time: the next is listened for only once this one is back.
+fn listen(state: &Arc<State>, at: Allotment) {
+    let owner = state.clone();
+    let block = block2::RcBlock::new(
+        move |_: core::ptr::NonNull<ProtocolObject<dyn MTLSharedEvent>>, _: u64| {
+            let Some((program, binding)) = owner.ledger.take(at) else {
+                return;
+            };
+            let state = owner.clone();
+            let report = Box::new(move |ok: bool| {
+                back(&state, at, ok, "an evaluation failed");
+            });
+            if let Err(why) = unsafe {
+                program.enqueue(
+                    &binding,
+                    &owner.ready,
+                    &owner.done,
+                    at.ready,
+                    at.done,
+                    report,
+                )
+            } {
+                back(&owner, at, false, &why);
+            }
+        },
+    );
+    // SAFETY: `notifyListener:atValue:block:` copies the block; the
+    // listener and the event are the hand-off's own and outlive it.
+    unsafe {
+        state.ready.notifyListener_atValue_block(
+            &state.listener,
+            at.ready,
+            block2::RcBlock::as_ptr(&block),
+        );
+    }
+}
+
+/// `at`'s request is back. One that failed has its `done` raised here
+/// before the next request is listened for, so the Neural Engine's next
+/// raise always lands after it.
+fn back(state: &Arc<State>, at: Allotment, ok: bool, why: &str) {
+    let back = state.ledger.back(at, ok);
+    if let Some(value) = back.raise
+        && state.done.signaledValue() < value
+    {
+        state.done.setSignaledValue(value);
+    }
+    if back.retired {
+        stopped(why);
+    }
+    if let Some(next) = back.next {
+        listen(state, next);
+    }
+}
+
+fn stopped(why: &str) {
+    eprintln!("PIE_ANE: the Neural Engine split stopped ({why}); the GPU runs everything alone");
 }

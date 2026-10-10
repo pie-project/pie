@@ -393,21 +393,23 @@ typedef void (*PieAneReport)(void *context, int success);
 // handler or from the failure path. Returns 1 when queued, 2 when the request
 // was handed over but evaluation failed (`report` has fired), 0 when nothing
 // was handed over (`report` will not fire).
-int pie_ane_enqueue(void *handle, void *bound, void *event, uint64_t wait, uint64_t signal, PieAneReport report,
-                    void *context, char *err, int cap) {
+int pie_ane_enqueue(void *handle, void *bound, void *waitsOn, void *signals, uint64_t wait, uint64_t signal,
+                    PieAneReport report, void *context, char *err, int cap) {
   Program *program = (Program *)handle;
   Binding *binding = (Binding *)bound;
   __block int fired = 0;
   BOOL handed = NO;
   @autoreleasepool {
     @try {
-      id native = (__bridge id)event;
-      if (![native respondsToSelector:NSSelectorFromString(@"eventPort")]) {
+      id ready = (__bridge id)waitsOn;
+      id done = (__bridge id)signals;
+      SEL port = NSSelectorFromString(@"eventPort");
+      if (![ready respondsToSelector:port] || ![done respondsToSelector:port]) {
         say(err, cap, @"the Neural Engine cannot share this Metal event");
         return 0;
       }
-      id signalEvent = [gSignal signalEventWithValue:signal symbolIndex:0 eventType:0 sharedEvent:native];
-      id waitEvent = [gWait waitEventWithValue:wait sharedEvent:native eventType:0];
+      id signalEvent = [gSignal signalEventWithValue:signal symbolIndex:0 eventType:0 sharedEvent:done];
+      id waitEvent = [gWait waitEventWithValue:wait sharedEvent:ready eventType:0];
       id events = [gEvents sharedEventsWithSignalEvents:@[ signalEvent ] waitEvents:@[ waitEvent ]];
       id request = [gRequest requestWithInputs:binding->inputs
                                   inputIndices:binding->inputIndices

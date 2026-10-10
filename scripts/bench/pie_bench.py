@@ -617,9 +617,13 @@ async def cli_pie_client(args: argparse.Namespace):
         path.parent.mkdir(parents=True, exist_ok=True)
         server_log_file = path.open("w", encoding="utf-8")
 
+    spawned = time.perf_counter()
+
     def should_surface_server_line(txt: str) -> bool:
         return (
-            txt.startswith("[fire ")
+            txt.startswith("PIE_ANE")
+            or "panicked at" in txt
+            or txt.startswith("[fire ")
             or txt.startswith("[pie-fire-timing] ")
             or txt.startswith("[sched-fire ")
             or txt.startswith("[outer-fire ")
@@ -639,6 +643,13 @@ async def cli_pie_client(args: argparse.Namespace):
             or "graph captured" in txt
         )
 
+    def stamped(txt: str) -> str:
+        # The Neural Engine's lines carry when they landed, so a stall can be
+        # set against its compile and its hand-offs.
+        if txt.startswith("PIE_ANE") or "panicked at" in txt:
+            return f"[{time.perf_counter() - spawned:7.1f}s] {txt}"
+        return txt
+
     async def drain_stdout() -> None:
         assert proc.stdout is not None
         import sys
@@ -656,7 +667,7 @@ async def cli_pie_client(args: argparse.Namespace):
             # they land; otherwise keep the server log buffered for
             # startup/failure messages.
             if should_surface_server_line(txt):
-                sys.stderr.write(txt)
+                sys.stderr.write(stamped(txt))
                 sys.stderr.flush()
 
     try:
@@ -684,7 +695,7 @@ async def cli_pie_client(args: argparse.Namespace):
                 server_log_file.write(text)
                 server_log_file.flush()
             if should_surface_server_line(text):
-                sys.stderr.write(text)
+                sys.stderr.write(stamped(text))
                 sys.stderr.flush()
             # The banner's scheme moved from `ws://` to `gateway://` when the
             # gateway edge landed; match the phrase, not the scheme.
