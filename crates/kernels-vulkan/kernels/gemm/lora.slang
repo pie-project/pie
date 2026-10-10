@@ -1,4 +1,5 @@
 #include "common/bf16.slang"
+#include "common/subgroup.slang"
 
 #ifndef PIE_GROUP_X
 #define PIE_GROUP_X 256
@@ -33,7 +34,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 
     uint lane = WaveGetLaneIndex();
     uint width = WaveGetLaneCount();
-    for (uint i = gl_SubgroupID; i < r; i += gl_NumSubgroups) {
+    for (uint i = pie_subgroup_id(); i < r; i += pie_num_subgroups()) {
         uint wrow = down + i * in_width;
         float acc = 0.0;
         for (uint c = lane; c < in_width; c += width) {
