@@ -261,3 +261,58 @@ pub fn unpack_rows(x: &Value, perm: &Value) -> Value {
     );
     y
 }
+
+/// Patch rows of raw RGB bytes (`patch` × `patch` pixels, HWC) to the
+/// tower's rows: normalized by `mean` and `std` per channel, columns in
+/// `order`, the frame repeated `temporal` times.
+pub fn pixels(x: &Value, mean: [f32; 3], std: [f32; 3], order: PixelOrder, temporal: u32) -> Value {
+    let r = x.rec();
+    let width = x.width();
+    let patch = ((width / 3) as f64).sqrt() as u64;
+    assert!(
+        3 * patch * patch == width,
+        "pixel rows are 3 · patch² bytes wide, not {width}"
+    );
+    let y = r.fresh(tensor(x.rows(), u64::from(temporal) * width, Dtype::Bf16));
+    r.push(
+        Layout::Pixels {
+            x: x.id(),
+            patch: patch as u32,
+            mean,
+            std,
+            order,
+            temporal,
+            y: y.id(),
+        },
+        &[x],
+    );
+    y
+}
+
+/// Position-table taps for each patch, from its grid position, its image's
+/// grid and the patch segments: `(ids, weights)` for `embed_weighted`.
+pub fn grid_taps(
+    positions: &Value,
+    grids: &Value,
+    segments: &Value,
+    kind: TapKind,
+    side: u32,
+) -> (Value, Value) {
+    let r = positions.rec();
+    let taps = u64::from(kind.taps());
+    let ids = r.fresh(tensor(positions.rows(), taps, Dtype::I32));
+    let weights = r.fresh(tensor(positions.rows(), taps, Dtype::F32));
+    r.push(
+        Layout::GridTaps {
+            positions: positions.id(),
+            grids: grids.id(),
+            segments: segments.id(),
+            kind,
+            side,
+            ids: ids.id(),
+            weights: weights.id(),
+        },
+        &[positions, grids, segments],
+    );
+    (ids, weights)
+}

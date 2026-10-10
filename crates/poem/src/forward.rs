@@ -273,14 +273,29 @@ impl Input {
             .refined(self.over.clone())
     }
 
+    /// Each patch's `width` raw RGB bytes, `3 · patch²`, pixel-major.
     #[must_use]
-    pub fn patches(&self, width: impl Into<u64>) -> Value {
+    pub fn pixels(&self, width: impl Into<u64>) -> Value {
         self.rec
             .input(
                 RuntimeInput::Patches,
                 Ty::Tensor {
                     shape: vec![Dim::Patches, Dim::Const(width.into())],
-                    dtype: Dtype::Bf16,
+                    dtype: Dtype::U8,
+                },
+            )
+            .refined(self.over.clone())
+    }
+
+    /// Each image's `(t, rows, cols)` patch grid.
+    #[must_use]
+    pub fn image_grids(&self) -> Value {
+        self.rec
+            .input(
+                RuntimeInput::ImageGrids,
+                Ty::Tensor {
+                    shape: vec![Dim::Images, Dim::Const(3)],
+                    dtype: Dtype::I32,
                 },
             )
             .refined(self.over.clone())
@@ -320,32 +335,6 @@ impl Input {
                 Ty::Tensor {
                     shape: vec![Dim::Patches, Dim::Const(3)],
                     dtype: Dtype::I32,
-                },
-            )
-            .refined(self.over.clone())
-    }
-
-    #[must_use]
-    pub fn patch_embed_rows(&self, taps: u32) -> Value {
-        self.rec
-            .input(
-                RuntimeInput::PatchEmbedRows,
-                Ty::Tensor {
-                    shape: vec![Dim::Patches, Dim::Const(u64::from(taps))],
-                    dtype: Dtype::I32,
-                },
-            )
-            .refined(self.over.clone())
-    }
-
-    #[must_use]
-    pub fn patch_embed_weights(&self, taps: u32) -> Value {
-        self.rec
-            .input(
-                RuntimeInput::PatchEmbedWeights,
-                Ty::Tensor {
-                    shape: vec![Dim::Patches, Dim::Const(u64::from(taps))],
-                    dtype: Dtype::F32,
                 },
             )
             .refined(self.over.clone())

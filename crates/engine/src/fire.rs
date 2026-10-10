@@ -418,11 +418,12 @@ pub struct Attachment {
 pub struct StepMedia {
     pub lane: u32,
     pub rows: Vec<u32>,
-    pub patches: Vec<f32>,
+    /// Each span's patches, `3 · patch²` RGB bytes a row.
+    pub patches: Vec<u8>,
     pub routes: Vec<i32>,
     pub positions: Vec<i32>,
-    pub embed_rows: Vec<i32>,
-    pub embed_weights: Vec<f32>,
+    /// Each span's `(t, rows, cols)` patch grid.
+    pub grids: Vec<i32>,
     pub token_positions: Vec<i32>,
 }
 
@@ -460,13 +461,13 @@ impl StepMedia {
                 )));
             }
         }
-        if self.embed_rows.len() != self.embed_weights.len() {
+        if self.grids.len() != 3 * self.rows.len() {
             return Err(Error::Invalid(format!(
-                "lane {}'s media carries {} position-table rows and {} weights; the \
-                 two streams are read together and are the same length or both empty",
+                "lane {}'s media carries {} grid entries for {} spans; each span states \
+                 its `(t, rows, cols)` patch grid",
                 self.lane,
-                self.embed_rows.len(),
-                self.embed_weights.len()
+                self.grids.len(),
+                self.rows.len()
             )));
         }
         if !self.token_positions.is_empty() && self.token_positions.len() != 3 * lane_rows as usize

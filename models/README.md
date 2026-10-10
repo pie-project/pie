@@ -7,7 +7,7 @@ with only the builtins of its stage:
 | file           | states                                                          |
 | -------------- | --------------------------------------------------------------- |
 | `package.poem` | `MODELS` (ids, miniatures, parts, drafters, template, tokenizer), `DEPLOYMENTS`, in the order an import tries them, and `PUBLISHED`: the draft heads published for a checkpoint repository, the first listed being what `pie model import` drafts with unless told `--drafter none` |
-| `model.poem`   | `layout(id, deploy)`: a deployment's dims and the weights they lay out |
+| `model.poem`   | `layout(id, deploy)`: a deployment's dims and the weights they lay out; `media(id, deploy)`, if it reads stills: `struct(image = struct(patch, block, mrope, prefix, placeholder, suffix, frame))` |
 | `forward.poem` | `caches(m, c)` and `forward(m, inputs)`: the caches it holds and the forward its rows run |
 | `formats.poem` | `formats(m)`: the checkpoint formats it is read in, and what lands where |
 
@@ -31,6 +31,20 @@ A model is spoken through a template and a tokenizer, both stated as data in
   tokenizer an artifact carries: `markers`, groups of tokens the vocabulary
   must hold; `pinned`, markers at the id they must hold; and `parts`, the
   marker groups each part (`vision`, say) adds when a deployment serves it.
+
+## How a still is read
+
+Nothing about a model's pictures is in Rust. `media(id, deploy)` in
+`model.poem` states how a still is spelled and framed: `patch` and
+`block` (the tower's patch size and the side of the block its row fold
+takes, one token a block), `mrope` (tokens placed on the merged grid or in
+sequence), the delimiter tokens, and `frame(h, w, budget)`, the resize the
+family's processor applies (`//lib/media.poem` has Qwen's and Gemma's).
+The host decodes, frames, resamples and cuts the still into patch rows of
+raw RGB bytes in block order; the tower does the rest in the forward:
+`ops.layout.pixels(inputs.pixels(3 · patch²), mean, std, order, temporal)`
+normalizes and lays the rows out, and `ops.layout.grid_taps(positions,
+inputs.image_grids(), segments, kind, side)` taps the position table.
 
 ## Where the packages go
 

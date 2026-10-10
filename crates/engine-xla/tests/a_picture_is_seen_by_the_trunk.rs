@@ -23,7 +23,7 @@
 mod common;
 
 use engine_xla::{Boot, DeviceBoot, Lane, Seated, Shell};
-use media::front::{Rgb8, VisionFrontEnd};
+use media::front::{Image, Rgb8};
 use poem::{Operands, Platform, Request};
 use poem_compiler::{Budget, PatchLadder};
 
@@ -51,12 +51,6 @@ fn argmax(xs: &[f32]) -> u32 {
         }
     }
     best as u32
-}
-
-fn bf16(v: f32) -> [u8; 2] {
-    let bits = v.to_bits();
-    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
-    ((rounded >> 16) as u16).to_le_bytes()
 }
 
 fn nearest(src: &Rgb8, h: u32, w: u32) -> Rgb8 {
@@ -125,8 +119,10 @@ fn caption(
         }
     }
 
-    let patches: Vec<u8> = span.payload.iter().flat_map(|&v| bf16(v)).collect();
+    let patches = &span.payload;
     let rows = [span.rows];
+    let g = span.patch_grid;
+    let grids = [g.t as i32, g.h as i32, g.w as i32];
     let grid: Vec<i32> = span
         .positions
         .as_chunks::<2>()
@@ -156,11 +152,10 @@ fn caption(
             if media {
                 seated.media = Some(engine_xla::Media {
                     rows: &rows,
-                    patches: &patches,
+                    patches,
                     routes: &run_routes,
                     positions: &grid,
-                    embed_rows: &span.embed_rows,
-                    embed_weights: &span.embed_weights,
+                    grids: &grids,
                     token_positions: &triples[3 * from..3 * to],
                 });
             }
@@ -182,11 +177,10 @@ fn caption(
         });
         seated.media = Some(engine_xla::Media {
             rows: &rows,
-            patches: &patches,
+            patches,
             routes: &all_routes,
             positions: &grid,
-            embed_rows: &span.embed_rows,
-            embed_weights: &span.embed_weights,
+            grids: &grids,
             token_positions: &triples,
         });
         let fired = shell.fire_full(&[seated]).expect("the prefill fires");
@@ -254,7 +248,12 @@ fn a_solid_square_is_named_by_its_colour() {
         "the plan embeds patches and scatters the tower's rows"
     );
 
-    let vision = media::front::qwen::Qwen35Vision::new();
+    let vision = Image {
+        patch: 16,
+        block: 2,
+        mrope: true,
+    };
+    let deployment = m.deployment;
     let tokenizer = common::tokenizer(&m);
     let context = 256;
     let _device = engine_xla::bench::lock_device();
@@ -280,8 +279,18 @@ fn a_solid_square_is_named_by_its_colour() {
     ] {
         let side = 224u32;
         let picture = Rgb8::new(side, side, rgb.repeat((side * side) as usize)).expect("rgb");
+        let framed = deployment
+            .package
+            .frame(
+                &deployment.model.id,
+                &deployment.deploy,
+                side,
+                side,
+                "still",
+            )
+            .expect("the package frames a still");
         let span = vision
-            .encode(&picture, media::front::Budget::Still, nearest)
+            .encode(&picture, framed, nearest)
             .expect("the square encodes");
         assert_eq!(
             span.token_count, 64,

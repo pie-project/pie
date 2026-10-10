@@ -88,7 +88,7 @@ impl pie::inferlet::model::Host for ProcessCtx {
     }
 
     async fn architecture(&mut self) -> Result<String> {
-        Ok(model::model().arch_name().to_string())
+        Ok(model::model().arch().to_string())
     }
 
     async fn default_system_speculation(&mut self) -> Result<bool> {

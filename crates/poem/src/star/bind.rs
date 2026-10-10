@@ -25,8 +25,8 @@ pub(crate) mod spelled {
     pub(crate) use crate::ops::elemwise::Yarn;
     pub(crate) use crate::ops::spatial::Conv;
     pub(crate) use crate::{
-        Dtype, GateActivation, Input, ModulateForm, MropeForm, RaggedMask, RopeForm, Value,
-        ValueId, VoxelSegment, Weight,
+        Dtype, GateActivation, Input, ModulateForm, MropeForm, PixelOrder, RaggedMask, RopeForm,
+        TapKind, Value, ValueId, VoxelSegment, Weight,
     };
 }
 
@@ -288,6 +288,20 @@ impl<'v> Arg<'v> for MropeForm {
                 ("split", Split),
             ],
         )
+    }
+}
+
+impl<'v> Arg<'v> for PixelOrder {
+    fn arg(v: Option<Star<'v>>) -> anyhow::Result<Self> {
+        use PixelOrder::*;
+        spelled(v, "a pixel order", &[("chw", Chw), ("hwc", Hwc)])
+    }
+}
+
+impl<'v> Arg<'v> for TapKind {
+    fn arg(v: Option<Star<'v>>) -> anyhow::Result<Self> {
+        use TapKind::*;
+        spelled(v, "a tap kind", &[("bilinear", Bilinear), ("axes", Axes)])
     }
 }
 

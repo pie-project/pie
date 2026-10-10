@@ -3,6 +3,8 @@
 # layers and then routed experts, the residual stream carried as four
 # hyper-connected streams; an optional vision tower and MTP draft head.
 
+load("//lib/media.poem", "smart_resize")
+
 load("//lib/adapters/model.poem", "banks")
 
 def hyper(streams, norm_eps, gate_eps, alpha, sinkhorn, single_pass = False):
@@ -292,9 +294,21 @@ def layout(id, deploy):
         tower = tower(d) if vision else None,
     )
 
+PATCH, TEMPORAL, MERGE = 14, 2, 2
+
+def media(id, deploy):
+    if "vision" not in deploy.parts:
+        return None
+    per_token = PATCH * PATCH * MERGE * MERGE
+    return struct(image = struct(
+        patch = PATCH, block = MERGE, mrope = False,
+        prefix = "<|begin_of_image|>", placeholder = "<|image|>", suffix = "<|end_of_image|>",
+        frame = lambda h, w, budget: smart_resize(h, w, PATCH * MERGE, 16 * per_token, 8000 * per_token),
+    ))
+
 def tower(d):
     hidden, heads, depth, inter, merger_inter = 1024, 16, 24, 4096, 10240
-    patch, temporal, merge = 14, 2, 2
+    patch, temporal, merge = PATCH, TEMPORAL, MERGE
     out = d.hidden
     head_dim = hidden // heads
     bf = dtype.bf16
@@ -322,6 +336,8 @@ def tower(d):
         heads = heads,
         head_dim = head_dim,
         merge = merge,
+        patch = patch,
+        temporal = temporal,
         patch_width = 3 * temporal * patch * patch,
         inter = inter,
         merger_inter = merger_inter,

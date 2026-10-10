@@ -166,8 +166,6 @@ pub struct PatchSeat {
     pub row_bytes: u64,
     pub images: u64,
     pub dtype: Dtype,
-    pub embed_taps: u64,
-    pub embed_weights: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -176,8 +174,7 @@ struct PatchAt {
     segments: u64,
     routes: u64,
     positions: u64,
-    embed_rows: u64,
-    embed_weights: u64,
+    grids: u64,
     seat: PatchSeat,
 }
 
@@ -187,8 +184,7 @@ pub struct PatchHandles {
     pub segments: Tensor,
     pub routes: Tensor,
     pub positions: Tensor,
-    pub embed_rows: Option<Tensor>,
-    pub embed_weights: Option<Tensor>,
+    pub grids: Tensor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -505,12 +501,7 @@ impl Inputs {
             segments: take((seat.images + 1) * 4),
             routes: take(seat.rows * 4),
             positions: take(seat.rows * AXES * 4),
-            embed_rows: take(seat.rows * seat.embed_taps * 4),
-            embed_weights: if seat.embed_weights {
-                take(seat.rows * seat.embed_taps * 4)
-            } else {
-                0
-            },
+            grids: take(seat.images * AXES * 4),
             seat,
         });
         let mrope = mrope.then(|| take(rows * AXES * 4));
@@ -984,8 +975,7 @@ impl Inputs {
         segments: &[i32],
         routes: &[i32],
         positions: &[i32],
-        embed_rows: &[i32],
-        embed_weights: &[f32],
+        grids: &[i32],
     ) -> Result<PatchHandles> {
         let Some(at) = self.patch else {
             return Err(crate::error::Fault::Ceiling {
@@ -999,18 +989,7 @@ impl Inputs {
             (segments.len() as u64 * 4, (at.seat.images + 1) * 4),
             (routes.len() as u64 * 4, at.seat.rows * 4),
             (positions.len() as u64 * 4, at.seat.rows * AXES * 4),
-            (
-                embed_rows.len() as u64 * 4,
-                at.seat.rows * at.seat.embed_taps * 4,
-            ),
-            (
-                embed_weights.len() as u64 * 4,
-                if at.seat.embed_weights {
-                    at.seat.rows * at.seat.embed_taps * 4
-                } else {
-                    0
-                },
-            ),
+            (grids.len() as u64 * 4, at.seat.images * AXES * 4),
         ];
         for (need, have) in owed {
             if need > have {
@@ -1027,14 +1006,7 @@ impl Inputs {
         self.store.stage(stream, at.routes, bytes_of(routes))?;
         self.store
             .stage(stream, at.positions, bytes_of(positions))?;
-        if !embed_rows.is_empty() {
-            self.store
-                .stage(stream, at.embed_rows, bytes_of(embed_rows))?;
-        }
-        if !embed_weights.is_empty() {
-            self.store
-                .stage(stream, at.embed_weights, f32_bytes_of(embed_weights))?;
-        }
+        self.store.stage(stream, at.grids, bytes_of(grids))?;
         let rows = if at.seat.row_bytes == 0 {
             0
         } else {
@@ -1053,24 +1025,12 @@ impl Inputs {
                 AXES as u32,
                 Dtype::I32,
             ),
-            embed_rows: (!embed_rows.is_empty()).then(|| {
-                let taps = at.seat.embed_taps.max(1) as u32;
-                Tensor::new(
-                    base + at.embed_rows,
-                    embed_rows.len() as u32 / taps,
-                    taps,
-                    Dtype::I32,
-                )
-            }),
-            embed_weights: (!embed_weights.is_empty()).then(|| {
-                let taps = at.seat.embed_taps.max(1) as u32;
-                Tensor::new(
-                    base + at.embed_weights,
-                    embed_weights.len() as u32 / taps,
-                    taps,
-                    Dtype::F32,
-                )
-            }),
+            grids: Tensor::new(
+                base + at.grids,
+                (grids.len() / AXES as usize) as u32,
+                AXES as u32,
+                Dtype::I32,
+            ),
         })
     }
 

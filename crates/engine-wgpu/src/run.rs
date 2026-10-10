@@ -93,9 +93,7 @@ pub struct FireBindings {
 
     pub patch_positions: Option<Tensor>,
 
-    pub patch_embed_rows: Option<Tensor>,
-
-    pub patch_embed_weights: Option<Tensor>,
+    pub patch_grids: Option<Tensor>,
 
     pub mrope_positions: Option<Tensor>,
 
@@ -479,29 +477,15 @@ impl<'c> Run<'c> {
                     )
                 })
             }
-            Def::Input(RuntimeInput::PatchEmbedRows) => {
-                self.fire.patch_embed_rows.unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads this fire's position-table taps, and this load \
-                         stages none — the plan reads the table on its native grid"
-                    )
-                })
-            }
+            Def::Input(RuntimeInput::ImageGrids) => self.fire.patch_grids.unwrap_or_else(|| {
+                panic!("value {at} reads this fire's image grids, which no lane of it submitted")
+            }),
             Def::Input(RuntimeInput::SelfCondRows | RuntimeInput::SelfCondWeights) => {
                 panic!(
                     "value {at} reads a self-conditioning input, which this shell stages none \
                      of; the load refuses such a plan"
                 )
             }
-            Def::Input(RuntimeInput::PatchEmbedWeights) => {
-                self.fire.patch_embed_weights.unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads this fire's interpolation weights, and this load \
-                         stages none — the plan reads the table on its native grid"
-                    )
-                })
-            }
-
             Def::Input(RuntimeInput::MropePositions) => {
                 self.fire.mrope_positions.unwrap_or_else(|| {
                     panic!(

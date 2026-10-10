@@ -312,8 +312,7 @@ impl FireCtx<'_> {
                 &p.patch_segments,
                 &p.patch_routes,
                 &p.patch_positions,
-                &p.patch_embed_rows,
-                &p.patch_embed_weights,
+                &p.patch_grids,
             )?)
         };
         let mrope = if p.mrope_positions.is_empty() {
@@ -613,11 +612,7 @@ impl FireCtx<'_> {
             patch_segments: staged.patches.as_ref().map(|seats| seats.segments),
             patch_routes: staged.patches.as_ref().map(|seats| seats.routes),
             patch_positions: staged.patches.as_ref().map(|seats| seats.positions),
-            patch_embed_rows: staged.patches.as_ref().and_then(|seats| seats.embed_rows),
-            patch_embed_weights: staged
-                .patches
-                .as_ref()
-                .and_then(|seats| seats.embed_weights),
+            patch_grids: staged.patches.as_ref().map(|seats| seats.grids),
             mrope_positions: staged.mrope,
             grid: staged.voxels.as_ref().map(|seats| seats.grid),
             token_grid: staged.voxels.as_ref().and_then(|seats| seats.token_grid),

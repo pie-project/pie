@@ -962,6 +962,227 @@ pub fn merge_rows(ctx: &Ctx<'_>, x: Tensor, side: u32, y: Tensor) -> Result<(), 
     })
 }
 
+/// Patch rows of raw RGB bytes to the tower's rows: `(v / 255 - mean[c]) /
+/// std[c]`, channel-major or pixel-major, the frame repeated `temporal` times.
+#[allow(clippy::too_many_arguments)]
+pub fn pixels(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    patch: u32,
+    mean: [f32; 3],
+    std: [f32; 3],
+    channel_major: bool,
+    temporal: u32,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "layout.pixels";
+    if !matches!(y.dtype, Dtype::Bf16 | Dtype::F16 | Dtype::F32) {
+        return Err(Error::DtypeUnsupported {
+            op: OP,
+            dtype: y.dtype,
+        });
+    }
+    if x.dtype != Dtype::U8 {
+        return Err(refuse(
+            OP,
+            format!("pixel rows are u8 bytes, not {:?}", x.dtype),
+        ));
+    }
+    let in_width = 3 * u64::from(patch) * u64::from(patch);
+    if u64::from(x.width) != in_width
+        || u64::from(y.width) != u64::from(temporal) * in_width
+        || y.rows < x.rows
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} x {} pixel rows of {patch} x {patch} patches do not land as {} x {} rows \
+                 repeated {temporal} times",
+                x.rows, x.width, y.rows, y.width
+            ),
+        ));
+    }
+    if std.contains(&0.0) {
+        return Err(refuse(OP, "a channel's std is zero"));
+    }
+    nonzero(OP, "the frame count", temporal)?;
+    if x.rows == 0 {
+        return Ok(());
+    }
+    ctx.emit(&mut |cx| {
+        let (n, px, t) = (
+            i64::from(x.rows),
+            i64::from(patch) * i64::from(patch),
+            i64::from(temporal),
+        );
+        let v = cx.read_f32(x)?;
+        let v = cx.reshape(v, &[n, px, 3])?;
+        let (v, dims, ch) = if channel_major {
+            (cx.transpose(v, &[0, 2, 1])?, [n, 3, px], 1)
+        } else {
+            (v, [n, px, 3], 2)
+        };
+        let m = cx.const_floats(Elem::F32, &mean.map(f64::from), &[3])?;
+        let m = cx.broadcast(m, &dims, &[ch])?;
+        let s = cx.const_floats(Elem::F32, &std.map(f64::from), &[3])?;
+        let s = cx.broadcast(s, &dims, &[ch])?;
+        let k = cx.const_f(Elem::F32, 255.0, &dims);
+        let v = cx.div(v, k)?;
+        let v = cx.sub(v, m)?;
+        let v = cx.div(v, s)?;
+        let v = if channel_major {
+            cx.broadcast(v, &[n, 3, t, px], &[0, 1, 3])?
+        } else {
+            cx.broadcast(v, &[n, t, px, 3], &[0, 2, 3])?
+        };
+        let v = cx.reshape(v, &[n, i64::from(y.width)])?;
+        write_head(cx, y, v)
+    })
+}
+
+/// Position-table taps for each patch: bilinear over its image's grid
+/// stretched onto a `side x side` table (4 taps), or axes (2 unit taps).
+#[allow(clippy::too_many_arguments)]
+pub fn grid_taps(
+    ctx: &Ctx<'_>,
+    positions: Tensor,
+    grids: Tensor,
+    segments: Tensor,
+    bilinear: bool,
+    side: u32,
+    ids: Tensor,
+    weights: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "layout.grid_taps";
+    let taps: u32 = if bilinear { 4 } else { 2 };
+    if positions.dtype != Dtype::I32 || grids.dtype != Dtype::I32 || segments.dtype != Dtype::I32 {
+        return Err(refuse(OP, "positions, grids and segments are i32"));
+    }
+    if ids.dtype != Dtype::I32 || weights.dtype != Dtype::F32 {
+        return Err(refuse(OP, "the taps land as i32 ids and f32 weights"));
+    }
+    if positions.width != 3 || grids.width != 3 {
+        return Err(refuse(OP, "positions and grids are three wide"));
+    }
+    if ids.width != taps
+        || weights.width != taps
+        || ids.rows < positions.rows
+        || weights.rows < positions.rows
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "{taps} taps a row, and the destinations are {} x {} and {} x {}",
+                ids.rows, ids.width, weights.rows, weights.width
+            ),
+        ));
+    }
+    nonzero(OP, "the table side", side)?;
+    let images = (segments.elements().saturating_sub(1)).min(u64::from(grids.rows));
+    if images == 0 || positions.rows == 0 {
+        return Ok(());
+    }
+    ctx.emit(&mut |cx| {
+        let (n, img, side) = (i64::from(positions.rows), images as i64, i64::from(side));
+        let p = cx.read(positions)?;
+        let row = cx.slice_axis(p, 1, 1, 2)?;
+        let row = cx.reshape(row, &[n])?;
+        let col = cx.slice_axis(p, 1, 2, 3)?;
+        let col = cx.reshape(col, &[n])?;
+        let (id_cols, w_cols) = if bilinear {
+            let seg = cx.read(segments)?;
+            let seg = cx.reshape(seg, &[segments.elements() as i64])?;
+            let seg = cx.slice_axis(seg, 0, 0, img)?;
+            let seg = cx.broadcast(seg, &[n, img], &[1])?;
+            let at = cx.iota(Elem::I32, &[n, img], 0);
+            let past = cx.compare(Cmp::Ge, at, seg)?;
+            let past = cx.convert(past, Elem::I32);
+            let which = cx.reduce(past, &[1], crate::hlo::Fold::Sum)?;
+            let one = cx.const_i(Elem::I32, 1, &[n]);
+            let which = cx.sub(which, one)?;
+            let lo = cx.const_i(Elem::I32, 0, &[]);
+            let hi = cx.const_i(Elem::I32, img - 1, &[]);
+            let which = cx.clamp(lo, which, hi)?;
+            let g = cx.read(grids)?;
+            let g = cx.take_rows(g, which)?;
+            let gh = cx.slice_axis(g, 1, 1, 2)?;
+            let gh = cx.reshape(gh, &[n])?;
+            let gw = cx.slice_axis(g, 1, 2, 3)?;
+            let gw = cx.reshape(gw, &[n])?;
+            let (ht, hw) = axis_taps(cx, row, gh, side)?;
+            let (wt, ww) = axis_taps(cx, col, gw, side)?;
+            let stride = cx.const_i(Elem::I32, side, &[n]);
+            let (mut id_cols, mut w_cols) = (Vec::new(), Vec::new());
+            for a in 0..2 {
+                for b in 0..2 {
+                    let id = cx.mul(ht[a], stride)?;
+                    id_cols.push(cx.add(id, wt[b])?);
+                    w_cols.push(cx.mul(hw[a], ww[b])?);
+                }
+            }
+            (id_cols, w_cols)
+        } else {
+            let last = cx.const_i(Elem::I32, side - 1, &[n]);
+            let c = cx.min(col, last)?;
+            let r = cx.min(row, last)?;
+            let off = cx.const_i(Elem::I32, side, &[n]);
+            let r = cx.add(r, off)?;
+            let unit = cx.const_f(Elem::F32, 1.0, &[n]);
+            (vec![c, r], vec![unit, unit])
+        };
+        let columns = |cx: &mut Cx<'_>, vs: Vec<Val>| -> Result<Val, Error> {
+            let vs = vs
+                .into_iter()
+                .map(|v| cx.reshape(v, &[n, 1]))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(cx.concat(&vs, 1)?)
+        };
+        let id = columns(cx, id_cols)?;
+        let w = columns(cx, w_cols)?;
+        write_head(cx, ids, id)?;
+        write_head(cx, weights, w)
+    })
+}
+
+/// The two bilinear taps of `index` on a `size`-long axis stretched onto
+/// `side`: `(taps, weights)`, `[n]` each.
+fn axis_taps(
+    cx: &mut Cx<'_>,
+    index: Val,
+    size: Val,
+    side: i64,
+) -> Result<([Val; 2], [Val; 2]), Error> {
+    let n = cx.dims(index)[0];
+    let one_i = cx.const_i(Elem::I32, 1, &[n]);
+    let span = cx.sub(size, one_i)?;
+    let span = cx.max(span, one_i)?;
+    let span = cx.convert(span, Elem::F32);
+    let i = cx.convert(index, Elem::F32);
+    let reach = cx.const_f(Elem::F32, (side - 1) as f64, &[n]);
+    let src = cx.mul(i, reach)?;
+    let src = cx.div(src, span)?;
+    let fl = cx.floor(src);
+    let base = cx.convert(fl, Elem::I32);
+    let frac = cx.sub(src, fl)?;
+    let lo = cx.const_i(Elem::I32, 0, &[]);
+    let hi = cx.const_i(Elem::I32, side - 1, &[]);
+    let one = cx.const_f(Elem::F32, 1.0, &[n]);
+    let zero = cx.const_f(Elem::F32, 0.0, &[n]);
+    let mut taps = [base; 2];
+    let mut weights = [one; 2];
+    for t in 0..2i64 {
+        let k = cx.const_i(Elem::I32, t, &[n]);
+        let tap = cx.add(base, k)?;
+        taps[t as usize] = cx.clamp(lo, tap, hi)?;
+        let kf = cx.const_f(Elem::F32, t as f64, &[n]);
+        let d = cx.sub(frac, kf)?;
+        let d = cx.abs(d);
+        let w = cx.sub(one, d)?;
+        weights[t as usize] = cx.max(w, zero)?;
+    }
+    Ok((taps, weights))
+}
+
 // ---------------------------------------------------------------- ranking
 
 /// The best column of each row of an f32 `[rows, width]` — largest value,

@@ -301,8 +301,7 @@ pub struct FireBindings {
     pub patch_segments: Option<Tensor>,
     pub patch_routes: Option<Tensor>,
     pub patch_positions: Option<Tensor>,
-    pub patch_embed_rows: Option<Tensor>,
-    pub patch_embed_weights: Option<Tensor>,
+    pub patch_grids: Option<Tensor>,
     pub mrope_positions: Option<Tensor>,
     pub grid: Option<Tensor>,
     pub token_grid: Option<Tensor>,
@@ -1372,14 +1371,9 @@ impl<'c> Run<'c> {
                          submitted an image"
                 )
             }),
-            Def::Input(RuntimeInput::PatchEmbedRows) => {
-                self.fire.patch_embed_rows.unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads which position-table rows this fire's patches gather, \
-                         and no lane of it submitted an image"
-                    )
-                })
-            }
+            Def::Input(RuntimeInput::ImageGrids) => self.fire.patch_grids.unwrap_or_else(|| {
+                panic!("value {at} reads this fire's image grids, which no lane of it submitted")
+            }),
             Def::Input(RuntimeInput::SelfCondRows) => {
                 self.fire.self_cond_rows.unwrap_or_else(|| {
                     panic!(
@@ -1393,14 +1387,6 @@ impl<'c> Run<'c> {
                     panic!(
                         "value {at} reads this fire's self-conditioning weights, which this \
                          load reserved no seat for"
-                    )
-                })
-            }
-            Def::Input(RuntimeInput::PatchEmbedWeights) => {
-                self.fire.patch_embed_weights.unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads this fire's interpolation weights, which a native-grid \
-                         plan declares none of"
                     )
                 })
             }

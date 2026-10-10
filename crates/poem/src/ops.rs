@@ -2,7 +2,7 @@ use crate::declare::Weight;
 use crate::record::Value;
 use poem_ir::{
     Attention, Collective, Dim, Dtype, Elementwise, GateActivation, Layout, Linear, ModulateForm,
-    MropeForm, RaggedMask, RopeForm, StructKind, Ty, ValueId,
+    MropeForm, PixelOrder, RaggedMask, RopeForm, StructKind, TapKind, Ty, ValueId,
 };
 
 pub mod attn;

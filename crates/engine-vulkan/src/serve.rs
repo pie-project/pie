@@ -140,9 +140,7 @@ pub struct Media<'a> {
 
     pub positions: &'a [i32],
 
-    pub embed_rows: &'a [i32],
-
-    pub embed_weights: &'a [f32],
+    pub grids: &'a [i32],
 
     pub token_positions: &'a [i32],
 }
@@ -494,8 +492,6 @@ impl Shell {
                     row_bytes: width * element,
                     images: u64::from(ladder.max_images),
                     dtype: *dtype,
-                    embed_taps: declared_width(&boot.trace, RuntimeInput::PatchEmbedRows),
-                    embed_weights: declared_width(&boot.trace, RuntimeInput::PatchEmbedWeights) > 0,
                 })
             })
         });
@@ -1418,18 +1414,9 @@ impl Shell {
                     patch_rows * 3,
                 ),
                 (
-                    "position-table taps",
-                    shot.embed_rows.len() as u64,
-                    patch_rows * seat.embed_taps,
-                ),
-                (
-                    "interpolation weights",
-                    shot.embed_weights.len() as u64,
-                    if seat.embed_weights {
-                        patch_rows * seat.embed_taps
-                    } else {
-                        0
-                    },
+                    "image grids",
+                    shot.grids.len() as u64,
+                    shot.rows.len() as u64 * 3,
                 ),
             ] {
                 if have != want {
@@ -1768,20 +1755,16 @@ impl Shell {
         let mut patch_segments: Vec<i32> = Vec::new();
         let mut patch_routes: Vec<i32> = Vec::new();
         let mut patch_positions: Vec<i32> = Vec::new();
-        let mut patch_embed_rows: Vec<i32> = Vec::new();
-        let mut patch_embed_weights: Vec<f32> = Vec::new();
+        let mut patch_grids: Vec<i32> = Vec::new();
         if patch_rows > 0 {
             let seat = self.patch_seat.expect(
                 "a composition with patch rows came out of budgets with a patch ladder, and \
                  the seat is derived from the same trace the ladder admitted",
             );
             let stride = seat.row_bytes as usize;
-            let taps = seat.embed_taps as usize;
-            let weight_taps = if seat.embed_weights { taps } else { 0 };
             patch_payload = vec![0u8; patch_rows * stride];
             patch_positions = vec![0i32; patch_rows * 3];
-            patch_embed_rows = vec![0i32; patch_rows * taps];
-            patch_embed_weights = vec![0.0f32; patch_rows * weight_taps];
+            patch_grids = vec![0i32; composition.images() as usize * 3];
 
             patch_routes = vec![
                 if self.drops_patch_rows {
@@ -1810,16 +1793,8 @@ impl Shell {
                 let triples = row.patch_offset as usize * 3;
                 patch_positions[triples..triples + shot.positions.len()]
                     .copy_from_slice(shot.positions);
-                if taps > 0 {
-                    let at_ids = row.patch_offset as usize * taps;
-                    patch_embed_rows[at_ids..at_ids + shot.embed_rows.len()]
-                        .copy_from_slice(shot.embed_rows);
-                }
-                if weight_taps > 0 {
-                    let at_w = row.patch_offset as usize * weight_taps;
-                    patch_embed_weights[at_w..at_w + shot.embed_weights.len()]
-                        .copy_from_slice(shot.embed_weights);
-                }
+                let at_grids = row.image_offset as usize * 3;
+                patch_grids[at_grids..at_grids + shot.grids.len()].copy_from_slice(shot.grids);
                 for (i, &rows) in shot.rows.iter().enumerate() {
                     per_image[row.image_offset as usize + i] = rows;
                 }
@@ -1898,8 +1873,7 @@ impl Shell {
                     segments: &patch_segments,
                     routes: &patch_routes,
                     positions: &patch_positions,
-                    embed_rows: &patch_embed_rows,
-                    embed_weights: &patch_embed_weights,
+                    grids: &patch_grids,
                 }),
                 mrope_positions: self.states_mrope.then_some(mrope_positions.as_slice()),
             },
@@ -1962,8 +1936,7 @@ impl Shell {
             patch_routes: patch_seats.map(|seats| seats.routes),
             patch_positions: patch_seats.map(|seats| seats.positions),
 
-            patch_embed_rows: patch_seats.and_then(|seats| seats.embed_rows),
-            patch_embed_weights: patch_seats.and_then(|seats| seats.embed_weights),
+            patch_grids: patch_seats.map(|seats| seats.grids),
 
             mrope_positions: bound.mrope_positions,
             geometry,

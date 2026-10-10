@@ -3,6 +3,8 @@
 # EAGLE draft head or a DFlash-family block drafter; Ternary-Bonsai's
 # rotation signs; and the small geometries the engines' tests serve.
 
+load("//lib/media.poem", "smart_resize")
+
 load("//lib/adapters/model.poem", "banks")
 load("//lib/dflash/model.poem", dflash_declare = "declare", dflash_head = "head", "markov", "selector")
 
@@ -73,11 +75,28 @@ SMALL = struct(depth = 12, hidden = 768, heads = 12, inter = 3072)
 
 LARGE = struct(depth = 27, hidden = 1152, heads = 16, inter = 4304)
 
-PATCH_WIDTH = 1536
+PATCH = 16
+
+TEMPORAL = 2
+
+PATCH_WIDTH = 3 * TEMPORAL * PATCH * PATCH
 
 MERGE = 2
 
-POSITIONS = 2304
+GRID_SIDE = 48
+
+POSITIONS = GRID_SIDE * GRID_SIDE
+
+def media(id, deploy):
+    """How a still is spoken: framed by the processor's resize, cut into
+    `PATCH` patches in `MERGE` blocks, its tokens placed by mrope."""
+    if "vision" not in deploy.parts:
+        return None
+    return struct(image = struct(
+        patch = PATCH, block = MERGE, mrope = True,
+        prefix = "<|vision_start|>", placeholder = "<|image_pad|>", suffix = "<|vision_end|>",
+        frame = lambda h, w, budget: smart_resize(h, w, PATCH * MERGE, 65536, 16777216),
+    ))
 
 def tower(size, out, dt):
     """`size`'s tower, merging into rows `out` wide, its weights at `dt`."""
@@ -110,8 +129,10 @@ def tower(size, out, dt):
         heads = size.heads,
         head_dim = head_dim,
         merge = MERGE,
+        patch = PATCH,
+        temporal = TEMPORAL,
         patch_width = PATCH_WIDTH,
-        taps = 4,
+        grid_side = GRID_SIDE,
         positions = POSITIONS,
         theta = 10000.0,
         norm_eps = 1e-6,

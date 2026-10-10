@@ -89,7 +89,13 @@ pub fn register(
 
     let model = Arc::new(Model {
         name,
-        arch_name: Box::leak(deployment.model.arch.clone().into_boxed_str()),
+        image: deployment
+            .package
+            .image(&deployment.model.id, &deployment.deploy)
+            .map_err(|why| {
+                anyhow!("`{model_id}` states a still front end this runtime refuses: {why:#}")
+            })?,
+        deployment: deployment.clone(),
         instruct,
         facts,
         kv_page_size,
@@ -267,15 +273,9 @@ pub fn model() -> &'static Arc<Model> {
 pub fn media_pad() -> Option<u32> {
     static PAD: OnceLock<Option<u32>> = OnceLock::new();
     *PAD.get_or_init(|| {
-        use crate::inferlet::host::media::multimodal;
         let m = model();
-        let arch = m.arch_name();
-        let spelling = media::front::vision_front_end(arch)
-            .map(|fe| fe.delimiters().placeholder)
-            .or_else(|| {
-                multimodal::audio_arch_supported(arch).then(multimodal::audio_placeholder)
-            })?;
-        match m.tokenize(spelling)[..] {
+        let spelling = m.image()?.placeholder.clone();
+        match m.tokenize(&spelling)[..] {
             [id] => Some(id),
             _ => None,
         }
@@ -284,7 +284,8 @@ pub fn media_pad() -> Option<u32> {
 
 pub struct Model {
     name: String,
-    arch_name: &'static str,
+    deployment: crate::catalog::Deployment,
+    image: Option<poem::star::ImageSpec>,
     instruct: Arc<dyn Instruct>,
     facts: poem_ir::Facts,
     kv_page_size: u32,
@@ -341,8 +342,20 @@ impl Model {
         &self.name
     }
 
-    pub fn arch_name(&self) -> &'static str {
-        self.arch_name
+    /// The architecture word the package states, for inferlets that ask.
+    pub fn arch(&self) -> &str {
+        &self.deployment.model.arch
+    }
+
+    /// How this model reads a still, if it does.
+    pub fn image(&self) -> Option<&poem::star::ImageSpec> {
+        self.image.as_ref()
+    }
+
+    /// The size a `h` × `w` still is framed to before the tower reads it.
+    pub fn frame(&self, h: u32, w: u32, budget: &str) -> Result<(u32, u32)> {
+        let d = &self.deployment;
+        d.package.frame(&d.model.id, &d.deploy, h, w, budget)
     }
 
     pub fn instruct(&self) -> &dyn Instruct {

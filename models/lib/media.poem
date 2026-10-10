@@ -1,0 +1,40 @@
+# How a still is framed before a tower reads it: the resize each family's
+# processor applies, as a pure function of the image's size.
+
+def smart_resize(h, w, factor, min_pixels, max_pixels):
+    """Qwen's: each side rounded to a multiple of `factor`, the area clamped
+    to [min_pixels, max_pixels], an aspect ratio past 200 refused."""
+    long, short = max(h, w), min(h, w)
+    if short <= 0 or long > 200 * short:
+        fail("a {} x {} image has an aspect ratio past 200".format(h, w))
+    round_f = lambda x: int(x / factor + 0.5) * factor
+    floor_f = lambda x: int(x / factor) * factor
+    ceil_f = lambda x: (int(x / factor) + (1 if x > int(x / factor) * factor else 0)) * factor
+    h_bar, w_bar = round_f(h), round_f(w)
+    if h_bar * w_bar > max_pixels:
+        beta = sqrt(h * w / max_pixels)
+        h_bar, w_bar = max(floor_f(h / beta), factor), max(floor_f(w / beta), factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = sqrt(min_pixels / (h * w))
+        h_bar, w_bar = ceil_f(h * beta), ceil_f(w * beta)
+    return (h_bar, w_bar)
+
+def budget_resize(h, w, patch, pool, soft_tokens):
+    """Gemma's: the aspect ratio kept, each side a multiple of `pool · patch`,
+    at most `soft_tokens · pool²` patches."""
+    max_patches = soft_tokens * pool * pool
+    side_mult = pool * patch
+    target_px = max_patches * patch * patch
+    factor = sqrt(target_px / (h * w))
+    down = lambda ideal: int(ideal / side_mult) * side_mult
+    th, tw = down(factor * h), down(factor * w)
+    if th == 0 and tw == 0:
+        fail("a {} x {} image resizes to 0 x 0".format(h, w))
+    max_side = (max_patches // (pool * pool)) * side_mult
+    if th == 0:
+        th, tw = side_mult, min(w // h * side_mult, max_side)
+    elif tw == 0:
+        th, tw = min(h // w * side_mult, max_side), side_mult
+    if th * tw > target_px:
+        fail("resizing {} x {} to {} x {} exceeds {} patches".format(h, w, th, tw, max_patches))
+    return (th, tw)

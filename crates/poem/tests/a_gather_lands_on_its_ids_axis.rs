@@ -1,5 +1,5 @@
 use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, trace_hybrid};
-use poem_ir::{Dim, Layout, Operation, Trace, Ty};
+use poem_ir::{Dim, Layout, Operation, TapKind, Trace, Ty};
 
 #[derive(Clone, Copy)]
 enum Axis {
@@ -22,8 +22,6 @@ const HIDDEN: u64 = 64;
 
 const VOCAB: u32 = 2304;
 
-const TAPS: u32 = 4;
-
 impl ForwardHybrid for OneGather {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
@@ -31,18 +29,28 @@ impl ForwardHybrid for OneGather {
 
     fn forward(&self, inputs: Input) -> Value {
         let table = Weight::sym("pos_embed", [u64::from(VOCAB), HIDDEN], Dtype::Bf16);
-        let taps = match self.gather {
-            Gather::Plain => 1,
-            Gather::Weighted => TAPS,
+        let taps = |inputs: &Input| {
+            ops::layout::grid_taps(
+                &inputs.patch_positions(),
+                &inputs.image_grids(),
+                &inputs.patch_segments(),
+                TapKind::Bilinear,
+                48,
+            )
         };
-        let ids = match self.axis {
-            Axis::Tokens => inputs.tokens(),
-            Axis::Patches => inputs.patch_embed_rows(taps),
-        };
-        match self.gather {
-            Gather::Plain => ops::layout::embed(&ids, &table, VOCAB),
-            Gather::Weighted => {
-                let weights = inputs.patch_embed_weights(taps);
+        match (self.axis, self.gather) {
+            (Axis::Tokens, Gather::Plain) => ops::layout::embed(&inputs.tokens(), &table, VOCAB),
+            (Axis::Patches, Gather::Plain) => {
+                ops::layout::embed(&inputs.patch_routes(), &table, VOCAB)
+            }
+            (Axis::Tokens, Gather::Weighted) => ops::layout::embed_weighted(
+                &inputs.mrope_positions(),
+                &inputs.axis_positions(0, 3),
+                &table,
+                VOCAB,
+            ),
+            (Axis::Patches, Gather::Weighted) => {
+                let (ids, weights) = taps(&inputs);
                 ops::layout::embed_weighted(&ids, &weights, &table, VOCAB)
             }
         }

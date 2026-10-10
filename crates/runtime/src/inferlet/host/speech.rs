@@ -35,7 +35,7 @@ impl pie::inferlet::speech::HostSpeech for ProcessCtx {
         }
         let prompt = {
             let m = crate::model::model();
-            let arch = m.arch_name();
+            let arch = m.arch();
             if arch != "csm" {
                 return Ok(Err(format!(
                     "model '{}' (arch '{arch}') has no audio-output front-end \

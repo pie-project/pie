@@ -236,26 +236,13 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
 }
 
 fn patch_bytes(
-    patches: &[f32],
+    patches: &[u8],
     element: poem_ir::Dtype,
 ) -> std::result::Result<Vec<u8>, &'static str> {
     match element {
-        poem_ir::Dtype::Bf16 => Ok(patches
-            .iter()
-            .flat_map(|&v| bf16_bits(v).to_le_bytes())
-            .collect()),
-        poem_ir::Dtype::F32 => Ok(patches.iter().flat_map(|&v| v.to_le_bytes()).collect()),
-        _ => Err(
-            "a media submission against a plan whose activation element is neither \
-                  `bf16` nor `f32`, which is the pair every tower in this catalog computes in",
-        ),
+        poem_ir::Dtype::U8 => Ok(patches.to_vec()),
+        _ => Err("a media submission against a plan whose pixel rows are not u8 bytes"),
     }
-}
-
-fn bf16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let rounding = 0x7fff + ((bits >> 16) & 1);
-    ((bits + rounding) >> 16) as u16
 }
 
 fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
@@ -866,8 +853,7 @@ impl Vulkan {
                 patches,
                 routes: &row.routes,
                 positions: &row.positions,
-                embed_rows: &row.embed_rows,
-                embed_weights: &row.embed_weights,
+                grids: &row.grids,
                 token_positions: &row.token_positions,
             })
             .collect();
