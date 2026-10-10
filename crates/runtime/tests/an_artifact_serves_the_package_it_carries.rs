@@ -58,9 +58,7 @@ fn a_model_no_catalog_lists_serves_from_its_artifact() {
     let dir = tempfile::tempdir().unwrap();
     let path = artifact(dir.path(), &package);
 
-    let (name, tp, trace) = packaged(&path, &Overrides::default(), poem::Platform::Cuda)
-        .unwrap()
-        .expect("the artifact carries its package");
+    let (name, tp, trace) = packaged(&path, &Overrides::default(), poem::Platform::Cuda).unwrap();
     assert_eq!((name.as_str(), tp), ("stranger-1b-bf16-kv-bf16", 1));
     assert_eq!(trace.name, name);
     assert_eq!(trace.params.len(), 2);
@@ -80,7 +78,7 @@ fn a_model_no_catalog_lists_serves_from_its_artifact() {
         kv: Some(poem::Dtype::E4m3),
         ..Overrides::default()
     };
-    let (name, _, _) = packaged(&path, &kv, poem::Platform::Cuda).unwrap().unwrap();
+    let (name, _, _) = packaged(&path, &kv, poem::Platform::Cuda).unwrap();
     assert_eq!(
         name, "stranger-1b-bf16-kv-e4m3",
         "a config's kv is the package's to name"
@@ -98,16 +96,15 @@ fn a_model_no_catalog_lists_serves_from_its_artifact() {
 }
 
 #[test]
-fn an_artifact_without_a_package_is_left_to_the_catalog() {
+fn an_artifact_without_a_package_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("plain.zt");
     Writer::create_serving(&path, &BTreeMap::new(), Stamp::of("cuda", "anything"))
         .unwrap()
         .finish()
         .unwrap();
-    assert!(
-        packaged(&path, &Overrides::default(), poem::Platform::Cuda)
-            .unwrap()
-            .is_none()
-    );
+    let why = packaged(&path, &Overrides::default(), poem::Platform::Cuda)
+        .unwrap_err()
+        .to_string();
+    assert!(why.contains("carries no model package"), "{why}");
 }

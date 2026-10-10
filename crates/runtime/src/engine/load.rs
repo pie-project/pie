@@ -120,40 +120,31 @@ pub fn package_of(path: &Path) -> Result<Option<poem::star::Package>> {
     let Some(ztensor::format::cbor::Value::Map(attributes)) = manifest.attributes.as_ref() else {
         return Ok(None);
     };
-    let texts: Vec<(&str, &str)> = attributes
+    let texts = attributes
         .iter()
-        .filter_map(|(key, value)| Some((key.as_text()?, value.as_text()?)))
-        .collect();
-    // A package written against other builtins is not served as a package: the
-    // stamp still names the deployment, which this build's catalog serves.
-    let api = format!("{}api", poem::star::ATTRIBUTE);
-    if let Some((_, written)) = texts.iter().find(|(key, _)| *key == api)
-        && *written != poem::star::API.to_string()
-    {
-        tracing::warn!(
-            ?path,
-            written,
-            ships = poem::star::API,
-            "the artifact's package is written against other builtins; serving it as this \
-             build's catalog spells its deployment"
-        );
-        return Ok(None);
-    }
+        .filter_map(|(key, value)| Some((key.as_text()?, value.as_text()?)));
     poem::star::Package::from_attributes(texts)
         .with_context(|| format!("read the package {path:?} carries"))
 }
 
-/// What an artifact that carries its package serves under `overrides`: the
-/// deployment's name, its rank count and the trace each rank runs, all of it
-/// from the package, none of it from this build's catalog.
+/// The package the artifact at `path` carries. An artifact is served by its
+/// own package and nothing else: one that carries none is not an artifact
+/// this build serves.
+pub fn carried(path: &Path) -> Result<poem::star::Package> {
+    package_of(path)?.ok_or_else(|| {
+        anyhow!("{path:?} carries no model package; import the checkpoint again with this build")
+    })
+}
+
+/// What an artifact serves under `overrides`: the deployment's name, its rank
+/// count and the trace each rank runs, all of it from the package the
+/// artifact carries, none of it from this build's catalog.
 pub fn packaged(
     artifact: &Path,
     overrides: &Overrides,
     platform: Platform,
-) -> Result<Option<(String, u32, Trace)>> {
-    let Some(package) = package_of(artifact)? else {
-        return Ok(None);
-    };
+) -> Result<(String, u32, Trace)> {
+    let package = carried(artifact)?;
     let stamp =
         stamp_of(artifact)?.ok_or_else(|| anyhow!("{artifact:?} carries no serving stamp"))?;
     let (model, base) = package.manifest().parse(&stamp.deployment).ok_or_else(|| {
@@ -171,16 +162,13 @@ pub fn packaged(
         .map_err(|why| anyhow!("`{name}` does not serve on {platform:?}: {why:#}"))?;
     let trace = poem_compiler::shard::shard(trace, deploy.tp)
         .map_err(|why| anyhow!("`{name}` does not split across {} ranks: {why}", deploy.tp))?;
-    Ok(Some((name, deploy.tp, trace)))
+    Ok((name, deploy.tp, trace))
 }
 
 /// How the deployment `name` stamped on the artifact at `artifact` is
-/// served: as this build's catalog, or else the package it carries, spells it.
+/// served, as the package it carries spells it.
 #[must_use]
 pub fn deploy_of(artifact: &Path, name: &str) -> Option<poem::star::Deploy> {
-    if let Some(deployment) = catalog().parse(name) {
-        return Some(deployment.deploy);
-    }
     let package = package_of(artifact).ok()??;
     let (_, deploy) = package.manifest().parse(name)?;
     Some(deploy)
@@ -267,26 +255,7 @@ pub fn this_box() -> Option<Platform> {
 }
 
 pub fn verify_artifact(artifact: &Path, platform: Platform) -> Result<String> {
-    let stamp =
-        stamp_of(artifact)?.ok_or_else(|| anyhow!("{artifact:?} carries no serving stamp"))?;
-    let (name, tp, trace) = match packaged(artifact, &Overrides::default(), platform)? {
-        Some(served) => served,
-        None => {
-            let deployment = deployment(&stamp.deployment).with_context(|| {
-                format!(
-                    "{artifact:?} was imported as `{}`; import it again with this build",
-                    stamp.deployment
-                )
-            })?;
-            let trace = deployment.try_trace(platform).map_err(|why| {
-                anyhow!(
-                    "`{}` does not serve on {platform:?}: {why}",
-                    deployment.name
-                )
-            })?;
-            (deployment.name, deployment.deploy.tp, trace)
-        }
-    };
+    let (name, tp, trace) = packaged(artifact, &Overrides::default(), platform)?;
     let source = open_source(artifact)?;
     let metadata = checkpoint_metadata(artifact)?;
     let contract = poem::import::own_contract(&source, &trace.params, tp, platform)
@@ -402,29 +371,16 @@ pub fn contract_for(
 ) -> std::result::Result<ModelContract, String> {
     let said = |error: &dyn std::fmt::Display| format!("{error:#}");
     let source = open_source(checkpoint).map_err(|e| said(&e))?;
-    let catalog = || {
-        catalog().parse(&trace.name).ok_or_else(|| {
-            format!(
-                "{:?} names no deployment of a model this build ships, so a checkpoint's \
-                 tensors cannot be mapped onto its params",
-                trace.name
-            )
-        })
-    };
     if stamp_of(checkpoint).map_err(|e| said(&e))?.is_some() {
-        let tp = match package_of(checkpoint).map_err(|e| said(&e))? {
-            Some(package) => {
-                let (_, deploy) = package.manifest().parse(&trace.name).ok_or_else(|| {
-                    format!(
-                        "{:?} names no deployment of the package `{}` {checkpoint:?} carries",
-                        trace.name,
-                        package.name()
-                    )
-                })?;
-                deploy.tp
-            }
-            None => catalog()?.deploy.tp,
-        };
+        let package = carried(checkpoint).map_err(|e| said(&e))?;
+        let (_, deploy) = package.manifest().parse(&trace.name).ok_or_else(|| {
+            format!(
+                "{:?} names no deployment of the package `{}` {checkpoint:?} carries",
+                trace.name,
+                package.name()
+            )
+        })?;
+        let tp = deploy.tp;
         return poem::import::own_contract(&source, &trace.params, tp, trace.platform).map_err(
             |error| {
                 format!(
@@ -434,7 +390,13 @@ pub fn contract_for(
             },
         );
     }
-    let deployment = catalog()?;
+    let deployment = catalog().parse(&trace.name).ok_or_else(|| {
+        format!(
+            "{:?} names no deployment of a model this build ships, so a checkpoint's tensors \
+             cannot be mapped onto its params",
+            trace.name
+        )
+    })?;
     if deployment.deploy.tp > 1 {
         return Err(format!(
             "{:?} is a {}-rank deployment and {checkpoint:?} is an unconverted checkpoint: the \
@@ -464,17 +426,17 @@ pub fn request(
     ordinal: i32,
     frames_in_flight: u8,
 ) -> Result<LoadRequest> {
-    let trace = match packaged(checkpoint, overrides, platform)? {
-        Some((name, _, trace)) => {
-            tracing::info!(deployment = name, ?checkpoint, "serving its package");
-            trace
-        }
-        None => {
-            let base = identify(checkpoint, platform)?;
-            let name = compose(&base, overrides, platform)?;
-            tracing::info!(deployment = name, identified = base, ?checkpoint, "serving");
-            self::trace(&name, platform)?
-        }
+    // An artifact is served by the package it carries; a raw checkpoint by
+    // the deployment of this build's catalog that reads it.
+    let trace = if stamp_of(checkpoint)?.is_some() {
+        let (name, _, trace) = packaged(checkpoint, overrides, platform)?;
+        tracing::info!(deployment = name, ?checkpoint, "serving its package");
+        trace
+    } else {
+        let base = identify(checkpoint, platform)?;
+        let name = compose(&base, overrides, platform)?;
+        tracing::info!(deployment = name, identified = base, ?checkpoint, "serving");
+        self::trace(&name, platform)?
     };
     Ok(LoadRequest {
         trace,

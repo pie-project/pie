@@ -14,19 +14,10 @@ pub struct ModelMetadata {
     pub config: Vec<u8>,
 }
 
-/// The deployment `model_id` names: one of the package the artifact at
-/// `artifact` carries, or else one of this build's catalog.
+/// The deployment `model_id` names, of the package the artifact at
+/// `artifact` carries: the runtime serves an artifact by its own package.
 pub fn deployment_of(model_id: &str, artifact: &Path) -> Result<crate::catalog::Deployment> {
-    let Some(package) = crate::engine::load::package_of(artifact)? else {
-        return crate::catalog::catalog().parse(model_id).ok_or_else(|| {
-            anyhow!(
-                "the engine loaded {model_id:?}, which names no deployment of this \
-                 build's catalog; nearest: {:?}",
-                nearest(model_id, 3)
-            )
-        });
-    };
-    let package = Arc::new(package);
+    let package = Arc::new(crate::engine::load::carried(artifact)?);
     let (model, deploy) = package.manifest().parse(model_id).ok_or_else(|| {
         anyhow!(
             "the engine loaded {model_id:?}, which the package `{}` names no deployment of",
@@ -38,33 +29,6 @@ pub fn deployment_of(model_id: &str, artifact: &Path) -> Result<crate::catalog::
         model,
         deploy,
     ))
-}
-
-fn nearest(name: &str, take: usize) -> Vec<&'static str> {
-    let mut scored: Vec<(usize, &'static str)> = crate::catalog::deployments()
-        .map(|d| (edit_distance(name, &d.name), d.name.as_str()))
-        .collect();
-    scored.sort();
-    scored
-        .into_iter()
-        .take(take)
-        .map(|(_, name)| name)
-        .collect()
-}
-
-fn edit_distance(a: &str, b: &str) -> usize {
-    let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    let mut cur = vec![0usize; b.len() + 1];
-    for (i, ca) in a.chars().enumerate() {
-        cur[0] = i + 1;
-        for (j, &cb) in b.iter().enumerate() {
-            let sub = prev[j] + usize::from(ca != cb);
-            cur[j + 1] = sub.min(prev[j + 1] + 1).min(cur[j] + 1);
-        }
-        std::mem::swap(&mut prev, &mut cur);
-    }
-    prev[b.len()]
 }
 
 fn compiled_tokenizer(metadata: &ModelMetadata) -> Option<Result<Tokenizer>> {
