@@ -51,7 +51,8 @@ unsafe extern "C" {
     pub(super) fn pie_ane_enqueue(
         program: *mut c_void,
         binding: *mut c_void,
-        event: *mut c_void,
+        waits_on: *mut c_void,
+        signals: *mut c_void,
         wait: u64,
         signal: u64,
         report: Report,

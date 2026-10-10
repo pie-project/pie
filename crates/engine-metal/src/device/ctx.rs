@@ -307,6 +307,7 @@ impl Context {
                 buffer: RefCell::new(buffer),
                 encoder: RefCell::new(Some(encoder)),
                 blit: None,
+                committed: RefCell::new(Vec::new()),
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -335,6 +336,9 @@ pub struct Frame {
     #[cfg(not(target_vendor = "apple"))]
     #[allow(dead_code)]
     blit: Option<()>,
+    /// What runs once the buffer is committed, in the order it was added.
+    #[cfg(target_vendor = "apple")]
+    committed: RefCell<Vec<Box<dyn FnOnce() + Send>>>,
 }
 
 // SAFETY: a `Frame` is created, encoded into and committed on one thread —
@@ -350,6 +354,24 @@ impl Frame {
             .borrow()
             .clone()
             .expect("the pass is open until `commit` closes it")
+    }
+
+    /// Has `then` run once this frame's buffer is committed; a frame dropped
+    /// uncommitted never runs it.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn on_commit(&self, then: Box<dyn FnOnce() + Send>) {
+        self.committed.borrow_mut().push(then);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn commit_buffer(&mut self) -> Retained<ProtocolObject<dyn MTLCommandBuffer>> {
+        self.end_pass();
+        let buffer = self.buffer.get_mut().clone();
+        buffer.commit();
+        for then in self.committed.get_mut().drain(..) {
+            then();
+        }
+        buffer
     }
 
     #[cfg(target_vendor = "apple")]
@@ -559,9 +581,7 @@ impl Frame {
     pub fn commit(mut self) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
-            self.end_pass();
-            let buffer = self.buffer.get_mut().clone();
-            buffer.commit();
+            let buffer = self.commit_buffer();
             buffer.waitUntilCompleted();
             if let Some(error) = buffer.error() {
                 return Err(Fault::Device {
@@ -581,9 +601,7 @@ impl Frame {
     pub fn commit_timed(mut self) -> Result<f64> {
         #[cfg(target_vendor = "apple")]
         {
-            self.end_pass();
-            let buffer = self.buffer.get_mut().clone();
-            buffer.commit();
+            let buffer = self.commit_buffer();
             buffer.waitUntilCompleted();
             if let Some(error) = buffer.error() {
                 return Err(Fault::Device {
@@ -607,7 +625,6 @@ impl Frame {
     ) -> Result<Pending> {
         #[cfg(target_vendor = "apple")]
         {
-            self.end_pass();
             if let Some(on_done) = on_done {
                 let handler = block2::RcBlock::new(
                     move |buffer: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
@@ -631,9 +648,8 @@ impl Frame {
                         .addCompletedHandler(block2::RcBlock::as_ptr(&handler));
                 }
             }
-            self.buffer.get_mut().commit();
             Ok(Pending {
-                buffer: self.buffer.get_mut().clone(),
+                buffer: self.commit_buffer(),
             })
         }
         #[cfg(not(target_vendor = "apple"))]

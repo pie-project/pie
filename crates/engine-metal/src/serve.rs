@@ -4416,6 +4416,18 @@ impl kernels_metal::Encode for Encoded<'_> {
             Encoded::Built(builder) => builder.wait(stamp),
         }
     }
+
+    fn on_commit(
+        &self,
+        then: Box<dyn FnOnce() + Send>,
+    ) -> std::result::Result<(), kernels_metal::Error> {
+        match self {
+            Encoded::Live(sink) => sink.on_commit(then),
+            Encoded::Taped(tape) => tape.on_commit(then),
+            #[cfg(target_vendor = "apple")]
+            Encoded::Built(builder) => builder.on_commit(then),
+        }
+    }
 }
 
 fn widen(raw: &[u8], stride: usize) -> Vec<f32> {

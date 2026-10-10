@@ -148,18 +148,19 @@ impl Program {
         Ok(Binding(Arc::new(RawBinding(binding))))
     }
 
-    /// Queues one evaluation of `binding`: the Neural Engine waits for `event`
-    /// to reach `wait`, runs, and signals `signal`. `report` is called exactly
-    /// once with whether the evaluation succeeded; when the request could not
-    /// be handed over at all this returns `Err` and `report` is dropped
-    /// uncalled.
+    /// Queues one evaluation of `binding`: the Neural Engine waits for
+    /// `waits_on` to reach `wait`, runs, and raises `signals` to `signal`.
+    /// `report` is called exactly once with whether the evaluation succeeded;
+    /// when the request could not be handed over at all this returns `Err`
+    /// and `report` is dropped uncalled.
     ///
     /// # Safety
     /// The binding's surfaces outlive the evaluation.
     pub unsafe fn enqueue(
         &self,
         binding: &Binding,
-        event: &Retained<ProtocolObject<dyn MTLSharedEvent>>,
+        waits_on: &Retained<ProtocolObject<dyn MTLSharedEvent>>,
+        signals: &Retained<ProtocolObject<dyn MTLSharedEvent>>,
         wait: u64,
         signal: u64,
         report: Box<dyn FnOnce(bool) + Send>,
@@ -170,13 +171,15 @@ impl Program {
             report(success == 1);
         }
         let context = Box::into_raw(Box::new(report)).cast::<c_void>();
-        let event = Retained::as_ptr(event).cast_mut().cast::<c_void>();
+        let waits_on = Retained::as_ptr(waits_on).cast_mut().cast::<c_void>();
+        let signals = Retained::as_ptr(signals).cast_mut().cast::<c_void>();
         let mut err = sys::message();
         let queued = unsafe {
             sys::pie_ane_enqueue(
                 self.raw(),
                 binding.0.0,
-                event,
+                waits_on,
+                signals,
                 wait,
                 signal,
                 reported,
