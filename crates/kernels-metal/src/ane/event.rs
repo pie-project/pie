@@ -8,12 +8,37 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLSharedEvent;
+use objc2_metal::{MTLSharedEvent, MTLSharedEventListener};
 
 use super::program::{Binding, Program};
 
+/// Seconds on the clock Metal stamps command buffers with
+/// (`CLOCK_UPTIME_RAW`, which is `mach_absolute_time`).
+#[must_use]
+pub fn uptime() -> f64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a plain clock read into a local.
+    unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut ts) };
+    ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9
+}
+
+/// The two event values of one hand-off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Allotment {
+    /// The GPU raises it when the inputs are packed.
+    pub ready: u64,
+    /// The Neural Engine raises it when the partial is written.
+    pub done: u64,
+}
+
 struct State {
     event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    /// Where the event tells us the GPU has raised a `ready` value, so the
+    /// request can be submitted then and not before.
+    listener: Retained<MTLSharedEventListener>,
     value: AtomicU64,
     failures: AtomicU64,
     retired: AtomicBool,
@@ -29,6 +54,7 @@ impl Handoff {
     pub fn new(event: Retained<ProtocolObject<dyn MTLSharedEvent>>) -> Handoff {
         Handoff(Arc::new(State {
             event,
+            listener: MTLSharedEventListener::new(),
             value: AtomicU64::new(0),
             failures: AtomicU64::new(0),
             retired: AtomicBool::new(false),
@@ -48,6 +74,14 @@ impl Handoff {
             self.0.event.setSignaledValue(value);
         }
         value
+    }
+
+    /// One hand-off's values.
+    pub fn allot(&self) -> Allotment {
+        Allotment {
+            ready: self.next(),
+            done: self.next(),
+        }
     }
 
     /// Whether the Neural Engine has failed and the split is off for good.
@@ -76,20 +110,59 @@ impl Handoff {
             .setSignaledValue(at.max(self.0.event.signaledValue()));
     }
 
-    /// Queues `binding` to run once the GPU signals `ready`, signaling `done`
-    /// after. A failure, now or on completion, retires the hand-off.
+    /// Arranges for `binding` to run once the GPU raises `ready`, signaling
+    /// `done` after. The request is submitted from the event's listener at
+    /// that moment, not before, so the Neural Engine's queue never holds a
+    /// request behind its wait. A failure, at submission or on completion,
+    /// retires the hand-off. With `PIE_ANE_TRACE` set, each submission and
+    /// completion is logged with its [`uptime`].
     pub fn start(&self, program: &Program, binding: &Binding, ready: u64, done: u64) {
         if self.retired() {
             return;
         }
-        let this = self.clone();
-        let report = Box::new(move |ok: bool| {
-            if !ok {
-                this.fail("an evaluation failed");
-            }
-        });
-        if let Err(why) = unsafe { program.enqueue(binding, &self.0.event, ready, done, report) } {
-            self.fail(&why);
+        let trace = std::env::var_os("PIE_ANE_TRACE").is_some();
+        let state = self.0.clone();
+        let (program, binding) = (program.clone(), binding.clone());
+        let block = block2::RcBlock::new(
+            move |_: core::ptr::NonNull<ProtocolObject<dyn MTLSharedEvent>>, _: u64| {
+                // Retired since: the event sits at its ceiling, and a request
+                // signaling `done` now would pull it back down.
+                if state.retired.load(Ordering::Acquire) {
+                    return;
+                }
+                if trace {
+                    eprintln!(
+                        "PIE_ANE_TRACE submit ready={ready} done={done} t={:.4}",
+                        uptime()
+                    );
+                }
+                let this = Handoff(state.clone());
+                let report = Box::new(move |ok: bool| {
+                    if trace {
+                        eprintln!(
+                            "PIE_ANE_TRACE complete done={done} ok={ok} t={:.4}",
+                            uptime()
+                        );
+                    }
+                    if !ok {
+                        this.fail("an evaluation failed");
+                    }
+                });
+                if let Err(why) =
+                    unsafe { program.enqueue(&binding, &state.event, ready, done, report) }
+                {
+                    Handoff(state.clone()).fail(&why);
+                }
+            },
+        );
+        // SAFETY: `notifyListener:atValue:block:` copies the block; the
+        // listener and the event are the hand-off's own and outlive it.
+        unsafe {
+            self.0.event.notifyListener_atValue_block(
+                &self.0.listener,
+                ready,
+                block2::RcBlock::as_ptr(&block),
+            );
         }
     }
 }

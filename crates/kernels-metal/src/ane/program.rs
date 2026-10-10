@@ -3,6 +3,7 @@
 
 use std::ffi::{CStr, CString, c_int, c_void};
 use std::path::Path;
+use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -45,12 +46,21 @@ pub fn fingerprint(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
-pub struct Program {
-    raw: *mut c_void,
-}
+/// The loaded program, shared: a hand-off's listener holds one past the
+/// site's own borrow.
+#[derive(Clone)]
+pub struct Program(Arc<RawProgram>);
 
-unsafe impl Send for Program {}
-unsafe impl Sync for Program {}
+struct RawProgram(*mut c_void);
+
+unsafe impl Send for RawProgram {}
+unsafe impl Sync for RawProgram {}
+
+impl Drop for RawProgram {
+    fn drop(&mut self) {
+        unsafe { sys::pie_ane_program_free(self.0) };
+    }
+}
 
 impl Program {
     /// Writes `mil` and `weights` under `cache`, keyed by their fingerprint,
@@ -83,24 +93,28 @@ impl Program {
         if raw.is_null() {
             return Err(sys::failure(&err));
         }
-        Ok(Program { raw })
+        Ok(Program(Arc::new(RawProgram(raw))))
+    }
+
+    fn raw(&self) -> *mut c_void {
+        self.0.0
     }
 
     /// The index of the procedure named `function`, if the program has one.
     #[must_use]
     pub fn procedure(&self, function: &str) -> Option<u32> {
         let function = CString::new(function).ok()?;
-        let index = unsafe { sys::pie_ane_procedure(self.raw, function.as_ptr()) };
+        let index = unsafe { sys::pie_ane_procedure(self.raw(), function.as_ptr()) };
         u32::try_from(index).ok()
     }
 
     /// The procedure's input names, in the order a binding supplies them.
     #[must_use]
     pub fn inputs(&self, procedure: u32) -> Vec<String> {
-        let count = unsafe { sys::pie_ane_input_count(self.raw, procedure as c_int) };
+        let count = unsafe { sys::pie_ane_input_count(self.raw(), procedure as c_int) };
         (0..count)
             .map(|i| {
-                let name = unsafe { sys::pie_ane_input_name(self.raw, procedure as c_int, i) };
+                let name = unsafe { sys::pie_ane_input_name(self.raw(), procedure as c_int, i) };
                 unsafe { CStr::from_ptr(name) }
                     .to_string_lossy()
                     .into_owned()
@@ -120,7 +134,7 @@ impl Program {
         let mut err = sys::message();
         let binding = unsafe {
             sys::pie_ane_bind(
-                self.raw,
+                self.raw(),
                 procedure as c_int,
                 raw.as_ptr(),
                 raw.len() as c_int,
@@ -132,7 +146,7 @@ impl Program {
         if binding.is_null() {
             return Err(sys::failure(&err));
         }
-        Ok(Binding { raw: binding })
+        Ok(Binding(Arc::new(RawBinding(binding))))
     }
 
     /// Queues one evaluation of `binding`: the Neural Engine waits for `event`
@@ -161,8 +175,8 @@ impl Program {
         let mut err = sys::message();
         let queued = unsafe {
             sys::pie_ane_enqueue(
-                self.raw,
-                binding.raw,
+                self.raw(),
+                binding.0.0,
                 event,
                 wait,
                 signal,
@@ -189,22 +203,18 @@ impl Program {
     }
 }
 
-impl Drop for Program {
+/// One procedure's inputs and output, resolved to surfaces; shared like
+/// the program.
+#[derive(Clone)]
+pub struct Binding(Arc<RawBinding>);
+
+struct RawBinding(*mut c_void);
+
+unsafe impl Send for RawBinding {}
+unsafe impl Sync for RawBinding {}
+
+impl Drop for RawBinding {
     fn drop(&mut self) {
-        unsafe { sys::pie_ane_program_free(self.raw) };
-    }
-}
-
-/// One procedure's inputs and output, resolved to surfaces.
-pub struct Binding {
-    raw: *mut c_void,
-}
-
-unsafe impl Send for Binding {}
-unsafe impl Sync for Binding {}
-
-impl Drop for Binding {
-    fn drop(&mut self) {
-        unsafe { sys::pie_ane_binding_free(self.raw) };
+        unsafe { sys::pie_ane_binding_free(self.0) };
     }
 }

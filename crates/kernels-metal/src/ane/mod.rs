@@ -27,7 +27,7 @@ mod program;
 mod surface;
 mod sys;
 
-pub use event::Handoff;
+pub use event::{Allotment, Handoff, uptime};
 pub use program::{Binding, CONSTANT_OFFSET, Program, constant_blob, fingerprint};
 pub use surface::{Element, Surface};
 
