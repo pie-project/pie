@@ -1,5 +1,7 @@
-//! Embeds every package under the repository's `models/` into the runtime: each directory
-//! with a `package.poem`, and every `.poem` file in it.
+//! Embeds the repository's `models/` into the runtime: each directory with a
+//! `package.poem` and every `.poem` file in it, and the libraries under
+//! `models/lib/`, which every package may load and which seed
+//! `$PIE_HOME/models/lib/`.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -37,9 +39,6 @@ fn main() {
         walk(&lib, "//lib/", &mut libraries);
     }
     libraries.sort();
-    for (_, files) in &mut packages {
-        files.extend(libraries.iter().cloned());
-    }
     let mut out = String::from("pub static PACKAGES: &[(&str, &[(&str, &str)])] = &[\n");
     for (name, files) in &packages {
         writeln!(out, "    ({name:?}, &[").unwrap();
@@ -47,6 +46,11 @@ fn main() {
             writeln!(out, "        ({file:?}, include_str!({path:?})),").unwrap();
         }
         out.push_str("    ]),\n");
+    }
+    out.push_str("];\n");
+    out.push_str("pub static LIBRARY: &[(&str, &str)] = &[\n");
+    for (file, path) in &libraries {
+        writeln!(out, "    ({file:?}, include_str!({path:?})),").unwrap();
     }
     out.push_str("];\n");
     let dest = Path::new(&std::env::var("OUT_DIR").unwrap()).join("packages.rs");

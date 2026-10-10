@@ -123,7 +123,9 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
         return;
     }
     let Some(artifact) = artifact() else {
-        eprintln!("not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/artifacts)");
+        eprintln!(
+            "not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/artifacts)"
+        );
         return;
     };
     let deployment = poem_compiler::catalog::deployment(DEPLOYMENT)
@@ -248,7 +250,9 @@ fn a_draft_block_fires_and_the_drafter_answers_it() {
         return;
     }
     let Some(artifact) = artifact() else {
-        eprintln!("not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/artifacts)");
+        eprintln!(
+            "not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/artifacts)"
+        );
         return;
     };
     let deployment = poem_compiler::catalog::deployment(DEPLOYMENT)

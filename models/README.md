@@ -35,11 +35,15 @@ A model is spoken through a template and a tokenizer, both stated as data in
 ## Where the packages go
 
 The runtime embeds every package here at build time (`crates/runtime/build.rs`)
-as the catalog a build ships. `$PIE_HOME/models/` holds the same tree on a
-machine: a package there shadows the embedded one of the same name, and a
-new directory there is a new model, with no build. The tests read this
-directory (`poem_compiler::catalog::repository()`), so editing a package
-rebuilds nothing below the runtime.
+and, on every start, seeds `$PIE_HOME/models/` with the same tree and reads
+the catalog from there, so the directory is always complete and is what
+serves. Each seeded directory records its seed's digest in `.seeded`: a
+directory nobody edited is brought up to the binary's version when the
+binary changes; one edited by hand is kept, and a warning says when the
+built-in it started from has moved on. A new directory there is a new
+model, with no build. The tests read this directory
+(`poem_compiler::catalog::repository()`), so editing a package rebuilds
+nothing below the runtime.
 
 An artifact (`$PIE_HOME/artifacts/<model>/*.zt`) names the package it was
 imported with and that package's digest in its serving stamp; it is served

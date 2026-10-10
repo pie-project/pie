@@ -66,7 +66,9 @@ fn the_target_keeps_a_measured_prefix_of_every_block() {
         return;
     }
     let Some(artifact) = artifact() else {
-        eprintln!("not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/artifacts)");
+        eprintln!(
+            "not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/artifacts)"
+        );
         return;
     };
     let deployment = poem_compiler::catalog::deployment(DEPLOYMENT)

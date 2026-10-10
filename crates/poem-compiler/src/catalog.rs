@@ -152,96 +152,48 @@ impl Catalog {
         })
     }
 
-    /// The catalog of packages given as `(name, [(file, source)])`: the form
-    /// a build embeds them in.
-    pub fn from_files(packages: &[(&str, &[(&str, &str)])]) -> Result<Catalog, Refused> {
-        let packages = packages
-            .iter()
-            .map(|(name, files)| {
-                Package::new(name, files)
-                    .map_err(|why| Refused(format!("the package `{name}` does not load: {why:#}")))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Catalog::new(packages)
-    }
-
-    /// The catalog of the packages under `root`: each directory holding a
-    /// `package.poem`, with every `.poem` file in it, and the libraries under
-    /// `root/lib/` as `//lib/…`, which every package may load.
-    pub fn from_dir(root: &Path) -> Result<Catalog, Refused> {
-        let io = |what: &str, why: std::io::Error| Refused(format!("{what}: {why}"));
-        let mut libraries = Vec::new();
-        let lib = root.join("lib");
-        if lib.is_dir() {
-            walk(&lib, "//lib/", &mut libraries)?;
-        }
-        libraries.sort();
+    /// The catalog of `tree`, a package that does not load left out and
+    /// reported: a tree a person edits serves every package but the broken
+    /// one.
+    pub fn of_tree(tree: &Tree) -> (Catalog, Vec<Refused>) {
         let mut packages = Vec::new();
-        let dirs = std::fs::read_dir(root).map_err(|why| io(&format!("read {root:?}"), why))?;
-        for dir in dirs {
-            let dir = dir
-                .map_err(|why| io(&format!("read {root:?}"), why))?
-                .path();
-            if !dir.join("package.poem").is_file() {
-                continue;
+        let mut refused = Vec::new();
+        for (name, files) in &tree.packages {
+            let files: Vec<(&str, &str)> = files
+                .iter()
+                .chain(&tree.library)
+                .map(|(f, s)| (f.as_str(), s.as_str()))
+                .collect();
+            match Package::new(name, &files) {
+                Ok(package) => packages.push(package),
+                Err(why) => refused.push(Refused(format!(
+                    "the package `{name}` does not load: {why:#}"
+                ))),
             }
-            let name = dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| Refused(format!("{dir:?} is no package name")))?
-                .to_string();
-            let mut files = Vec::new();
-            let entries =
-                std::fs::read_dir(&dir).map_err(|why| io(&format!("read {dir:?}"), why))?;
-            for entry in entries {
-                let path = entry
-                    .map_err(|why| io(&format!("read {dir:?}"), why))?
-                    .path();
-                let Some(file) = path.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                if file.ends_with(".poem") {
-                    let text = std::fs::read_to_string(&path)
-                        .map_err(|why| io(&format!("read {path:?}"), why))?;
-                    files.push((file.to_string(), text));
-                }
-            }
-            files.sort();
-            files.extend(libraries.iter().cloned());
-            packages.push((name, files));
         }
-        packages.sort();
-        let packages = packages
-            .iter()
-            .map(|(name, files)| {
-                let files: Vec<(&str, &str)> = files
-                    .iter()
-                    .map(|(f, s)| (f.as_str(), s.as_str()))
-                    .collect();
-                Package::new(name, &files)
-                    .map_err(|why| Refused(format!("the package `{name}` does not load: {why:#}")))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Catalog::new(packages)
+        match Catalog::new(packages) {
+            Ok(catalog) => (catalog, refused),
+            Err(why) => {
+                refused.push(why);
+                (Catalog::new(Vec::new()).expect("an empty catalog"), refused)
+            }
+        }
     }
 
-    /// This catalog with the packages under `root` added, a package of a
-    /// name this catalog already holds replaced by the one on disk: what a
-    /// build ships, shadowed by what `$PIE_HOME/models` holds.
-    pub fn shadowed_by(self, root: &Path) -> Result<Catalog, Refused> {
-        if !root.is_dir() {
-            return Ok(self);
+    /// The catalog of `tree`, every package of which must load.
+    pub fn from_tree(tree: &Tree) -> Result<Catalog, Refused> {
+        let (catalog, refused) = Catalog::of_tree(tree);
+        match refused.into_iter().next() {
+            None => Ok(catalog),
+            Some(why) => Err(why),
         }
-        let disk = Catalog::from_dir(root)?;
-        let mut packages: Vec<Arc<Package>> = self
-            .packages
-            .iter()
-            .filter(|package| disk.package(package.name()).is_none())
-            .cloned()
-            .collect();
-        packages.extend(disk.packages.iter().cloned());
-        packages.sort_by(|a, b| a.name().cmp(b.name()));
-        Catalog::of(packages)
+    }
+
+    /// The catalog of the packages under `root`, every one of which must
+    /// load: each directory holding a `package.poem`, with every `.poem`
+    /// file in it, and the libraries under `root/lib/`.
+    pub fn from_dir(root: &Path) -> Result<Catalog, Refused> {
+        Catalog::from_tree(&Tree::read(root)?)
     }
 
     /// Every package, in order.
@@ -447,6 +399,76 @@ impl Catalog {
             .map(|(f, s)| (f.as_str(), s.as_str()))
             .collect();
         Package::new(package.name(), &files).map_err(|why| format!("{why:#}"))
+    }
+}
+
+/// A tree of packages as a directory holds them: each package's own files,
+/// `(file, source)`, and the libraries every package may load, as
+/// `(//lib/…, source)`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Tree {
+    pub packages: Vec<(String, Vec<(String, String)>)>,
+    pub library: Vec<(String, String)>,
+}
+
+/// The prefix a library file is loaded under.
+pub const LIBRARY: &str = "//lib/";
+
+impl Tree {
+    /// The tree under `root`: each directory holding a `package.poem`, with
+    /// every `.poem` file in it, and `root/lib/` walked whole.
+    pub fn read(root: &Path) -> Result<Tree, Refused> {
+        let io = |what: &str, why: std::io::Error| Refused(format!("{what}: {why}"));
+        let mut library = Vec::new();
+        let lib = root.join("lib");
+        if lib.is_dir() {
+            walk(&lib, LIBRARY, &mut library)?;
+        }
+        library.sort();
+        let mut packages = Vec::new();
+        let dirs = std::fs::read_dir(root).map_err(|why| io(&format!("read {root:?}"), why))?;
+        for dir in dirs {
+            let dir = dir
+                .map_err(|why| io(&format!("read {root:?}"), why))?
+                .path();
+            if !dir.join("package.poem").is_file() {
+                continue;
+            }
+            let name = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| Refused(format!("{dir:?} is no package name")))?
+                .to_string();
+            let mut files = Vec::new();
+            let entries =
+                std::fs::read_dir(&dir).map_err(|why| io(&format!("read {dir:?}"), why))?;
+            for entry in entries {
+                let path = entry
+                    .map_err(|why| io(&format!("read {dir:?}"), why))?
+                    .path();
+                let Some(file) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if file.ends_with(".poem") && path.is_file() {
+                    let text = std::fs::read_to_string(&path)
+                        .map_err(|why| io(&format!("read {path:?}"), why))?;
+                    files.push((file.to_string(), text));
+                }
+            }
+            files.sort();
+            packages.push((name, files));
+        }
+        packages.sort();
+        Ok(Tree { packages, library })
+    }
+
+    /// The package `name`'s own files, if the tree holds it.
+    #[must_use]
+    pub fn package(&self, name: &str) -> Option<&[(String, String)]> {
+        self.packages
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, files)| files.as_slice())
     }
 }
 
