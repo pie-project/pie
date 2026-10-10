@@ -5,7 +5,7 @@
 // ships a public API.
 
 #import <Foundation/Foundation.h>
-#import <IOSurface/IOSurface.h>
+#import <IOSurface/IOSurfaceRef.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <objc/runtime.h>
