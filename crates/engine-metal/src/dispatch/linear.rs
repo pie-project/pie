@@ -67,6 +67,45 @@ impl Run<'_> {
             && self.precast(padded, plan.split.keep).is_some()
     }
 
+    /// Whether a column plan's rows, padded to the matmul tile, fit the
+    /// planes this call reads and writes.
+    fn columns_fit(
+        &self,
+        plan: &crate::ane::Columns,
+        act: poem_ir::ValueId,
+        y: poem_ir::ValueId,
+    ) -> bool {
+        plan.rows.div_ceil(32) * 32 <= self.capacity(act).min(self.capacity(y))
+    }
+
+    /// The GPU's columns of a split projection, between the hand-off and
+    /// the join: the leading `keep` landed in place, the rest the Neural
+    /// Engine's.
+    fn matmul_split(
+        &self,
+        ane: &crate::ane::Ane,
+        plan: &crate::ane::Columns,
+        act: poem_ir::ValueId,
+        y: poem_ir::ValueId,
+    ) -> Result<(), kernels_metal::Error> {
+        let x = self.tensor(act);
+        let out = self.tensor(y);
+        ane.before_columns(self.ctx(), plan, x)?;
+        linear::quant::matmul_columns(
+            self.ctx(),
+            x,
+            plan.view,
+            out,
+            plan.keep,
+            linear::quant::Scratch {
+                precast: &|rows, contraction| self.precast(rows, contraction),
+                partials: &|rows, width| self.partials(rows, width),
+            },
+            self.capacity(act).min(self.capacity(y)),
+        )?;
+        ane.after_columns(self.ctx(), plan, out)
+    }
+
     /// The GPU's share of a split MLP, between the hand-off and the join:
     /// gate and up over its leading `keep` channels, written compactly into
     /// the packed and staging planes, swiglu, and down over those channels
@@ -134,17 +173,27 @@ impl Run<'_> {
                 )
             }
             Linear::Matmul { act, w, y } => match self.banked(*w) {
-                Some(bank) => linear::quant::matmul(
-                    self.ctx(),
-                    self.tensor(*act),
-                    bank,
-                    self.tensor(*y),
-                    linear::quant::Scratch {
-                        precast: &|rows, contraction| self.precast(rows, contraction),
-                        partials: &|rows, width| self.partials(rows, width),
-                    },
-                    self.capacity(*act).min(self.capacity(*y)),
-                ),
+                Some(bank) => {
+                    let x = self.tensor(*act);
+                    if let Some((ane, plan)) = self
+                        .ane()
+                        .and_then(|ane| Some((ane, ane.plan_columns(*w, x.rows)?)))
+                        .filter(|(_, plan)| self.columns_fit(plan, *act, *y))
+                    {
+                        return self.matmul_split(ane, &plan, *act, *y);
+                    }
+                    linear::quant::matmul(
+                        self.ctx(),
+                        x,
+                        bank,
+                        self.tensor(*y),
+                        linear::quant::Scratch {
+                            precast: &|rows, contraction| self.precast(rows, contraction),
+                            partials: &|rows, width| self.partials(rows, width),
+                        },
+                        self.capacity(*act).min(self.capacity(*y)),
+                    )
+                }
                 None => linear::gemm::matmul(
                     self.ctx(),
                     self.tensor(*act),

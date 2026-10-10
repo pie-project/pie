@@ -1,6 +1,6 @@
-//! The GPU's banks of a split MLP, all views into the whole banks: the
-//! leading `keep` rows of gate and up by offset, and the leading `keep`
-//! columns of down by a row stride wider than the width.
+//! The GPU's banks of a split, all views into the whole banks: the leading
+//! `keep` rows of gate and up (or of a projection) by offset, and the
+//! leading `keep` columns of down by a row stride wider than the width.
 
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
@@ -29,10 +29,14 @@ pub struct Mlp {
     pub intermediate: u32,
 }
 
-/// Every fused dense MLP whose weights are affine 4-bit planes in groups
-/// of 64, which is what the hand-off kernels dequantize.
-pub fn mlps(trace: &poem_ir::Trace, weights: &crate::weights::Weights) -> Vec<Mlp> {
-    let bank = |id: poem_ir::ValueId| match trace.values[id.0 as usize].def {
+/// The affine 4-bit bank in groups of 64 behind `id`, which is what the
+/// hand-off kernels dequantize, if that is what `id` is.
+fn q4_bank(
+    trace: &poem_ir::Trace,
+    weights: &crate::weights::Weights,
+    id: poem_ir::ValueId,
+) -> Option<Bank> {
+    match trace.values[id.0 as usize].def {
         poem_ir::Def::Weight(at) => match weights.table().0.get(at as usize).copied().flatten() {
             Some(crate::run::WeightRow::Planes(bank))
                 if bank.bits == 4 && bank.group == 64 && bank.codes.dtype == Dtype::U4g64 =>
@@ -42,7 +46,13 @@ pub fn mlps(trace: &poem_ir::Trace, weights: &crate::weights::Weights) -> Vec<Ml
             _ => None,
         },
         _ => None,
-    };
+    }
+}
+
+/// Every fused dense MLP whose weights are affine 4-bit planes in groups
+/// of 64.
+pub fn mlps(trace: &poem_ir::Trace, weights: &crate::weights::Weights) -> Vec<Mlp> {
+    let bank = |id| q4_bank(trace, weights, id);
     trace
         .nodes
         .iter()
@@ -66,6 +76,68 @@ pub fn mlps(trace: &poem_ir::Trace, weights: &crate::weights::Weights) -> Vec<Ml
             })
         })
         .collect()
+}
+
+/// A plain projection the Neural Engine may take trailing columns of.
+pub struct Projection {
+    /// The projection's index among those of its shape, in trace order.
+    pub layer: u32,
+    /// The op's weight value, which is how a dispatch names it.
+    pub key: poem_ir::ValueId,
+    pub bank: Bank,
+}
+
+/// A projection must land at least this many columns to be worth a
+/// hand-off of its own; `PIE_ANE_PROJECTIONS=<columns>` moves the bar,
+/// `PIE_ANE_PROJECTIONS=off` keeps them all on the GPU.
+pub const MIN_PROJECTION_COLUMNS: u32 = 4096;
+
+fn min_projection_columns() -> Option<u32> {
+    match std::env::var("PIE_ANE_PROJECTIONS").ok().as_deref() {
+        Some("off" | "0" | "false") => None,
+        Some(n) => n.parse().ok().or(Some(MIN_PROJECTION_COLUMNS)),
+        None => Some(MIN_PROJECTION_COLUMNS),
+    }
+}
+
+/// Every `linear.matmul` over an affine 4-bit bank wide enough to split,
+/// grouped by `(contraction, columns)` and numbered within the group.
+pub fn projections(
+    trace: &poem_ir::Trace,
+    weights: &crate::weights::Weights,
+) -> Vec<((u32, u32), Vec<Projection>)> {
+    let mut groups: Vec<((u32, u32), Vec<Projection>)> = Vec::new();
+    let Some(min_columns) = min_projection_columns() else {
+        return groups;
+    };
+    for node in &trace.nodes {
+        let poem_ir::Operation::Linear(poem_ir::Linear::Matmul { w, .. }) = &node.op else {
+            continue;
+        };
+        let Some(bank) = q4_bank(trace, weights, *w) else {
+            continue;
+        };
+        let (k, n) = (bank.codes.width, bank.codes.rows);
+        if n < min_columns
+            || !n.is_multiple_of(kernels_metal::ane::ffn::UNIT)
+            || kernels_metal::ane::mil::segment_of(k).is_none()
+        {
+            continue;
+        }
+        let group = match groups.iter_mut().find(|(shape, _)| *shape == (k, n)) {
+            Some((_, group)) => group,
+            None => {
+                groups.push(((k, n), Vec::new()));
+                &mut groups.last_mut().expect("just pushed").1
+            }
+        };
+        group.push(Projection {
+            layer: group.len() as u32,
+            key: *w,
+            bank,
+        });
+    }
+    groups
 }
 
 /// `rows` rows of the bank from `start`, as views.

@@ -191,14 +191,27 @@ fn the_split_mlp_matches_the_gpu_alone() {
     );
     shell.open(0).expect("the slot opens");
     let _warm = fire(&mut shell, &trace, &prompt);
+    // `PIE_ANE_STEPS` fires more warm steps first, so the split's planner
+    // can be watched settling with `PIE_ANE_TRACE`.
+    let more = std::env::var("PIE_ANE_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0);
+    for _ in 0..more {
+        shell.open(0).expect("the slot reopens");
+        let _warm = fire(&mut shell, &trace, &prompt);
+    }
     shell.open(0).expect("the slot reopens");
     let split = fire(&mut shell, &trace, &prompt);
-    let handed = shell.neural_engine().expect("still there").splits();
+    let ane = shell.neural_engine().expect("still there");
+    let (handed, columns) = (ane.splits(), ane.column_splits());
     assert!(handed > 0, "no MLP was handed to the Neural Engine");
+    assert!(columns > 0, "no projection was handed to the Neural Engine");
     let decoded = fire(&mut shell, &trace, &next);
+    let ane = shell.neural_engine().expect("still there");
     assert_eq!(
-        shell.neural_engine().expect("still there").splits(),
-        handed,
+        (ane.splits(), ane.column_splits()),
+        (handed, columns),
         "a one-token decode stays on the GPU"
     );
     assert!(
@@ -214,7 +227,7 @@ fn the_split_mlp_matches_the_gpu_alone() {
     let cos = cosine(&whole, &split);
     let (top_whole, top_split) = (argmax(&whole), argmax(&split));
     eprintln!(
-        "{handed} MLPs handed over; readout cosine {cos:.5}; top-1 {top_whole} vs {top_split}"
+        "{handed} MLPs and {columns} projections handed over; readout cosine {cos:.5}; top-1 {top_whole} vs {top_split}"
     );
     assert!(cos > 0.99, "the split readout drifted: cosine {cos:.5}");
     assert_eq!(top_whole, top_split, "the split changes the next token");
