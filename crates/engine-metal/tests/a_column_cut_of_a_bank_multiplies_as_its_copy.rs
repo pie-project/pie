@@ -47,6 +47,16 @@ fn bf16(v: f32) -> u16 {
     ((bits.wrapping_add(0x7fff + ((bits >> 16) & 1))) >> 16) as u16
 }
 
+/// The two tests here run on two contexts at once, and a small shared
+/// buffer of each shares 16 KB pages with its neighbours: with `y` sized
+/// to its bytes, one run in seven read its first rows back as zero after
+/// the kernel had written them — a neighbouring allocation on the other
+/// thread wiping the page — while `y` on whole pages never did, nor did a
+/// second process on the GPU. So each output takes whole pages.
+fn whole_pages(bytes: u64) -> u64 {
+    bytes.next_multiple_of(16384)
+}
+
 fn bound(device: &Context, handles: &Handles, bytes: &[u8], keep: &mut Vec<Buffer>) -> u32 {
     let mut buffer = Buffer::zeroed(device, bytes.len() as u64).expect("a buffer");
     buffer.write(0, bytes).expect("written");
@@ -175,7 +185,7 @@ fn a_column_cut_of_a_bank_multiplies_as_its_copy() {
         let mut out = Vec::new();
         for w in [view, copy] {
             let y_bytes = u64::from(m) * u64::from(N) * 2;
-            let y_buffer = Buffer::zeroed(&device, y_bytes).expect("y");
+            let y_buffer = Buffer::zeroed(&device, whole_pages(y_bytes)).expect("y");
             let y = Tensor::new(
                 handles.bind(&y_buffer, 0, y_bytes).expect("y"),
                 m,
@@ -205,10 +215,30 @@ fn a_column_cut_of_a_bank_multiplies_as_its_copy() {
             out[1].iter().any(|&b| b != 0),
             "m={m}: the copy's product is all zero, so nothing was multiplied"
         );
-        assert!(
-            out[0] == out[1],
-            "m={m}: the view over the wide bank reads differently from the copy"
-        );
+        if out[0] != out[1] {
+            let diffs: Vec<(usize, u16, u16)> = out[0]
+                .chunks(2)
+                .zip(out[1].chunks(2))
+                .enumerate()
+                .filter(|(_, (a, b))| a != b)
+                .map(|(i, (a, b))| {
+                    (
+                        i,
+                        u16::from_le_bytes([a[0], a[1]]),
+                        u16::from_le_bytes([b[0], b[1]]),
+                    )
+                })
+                .collect();
+            let rows: std::collections::BTreeSet<usize> =
+                diffs.iter().map(|d| d.0 / N as usize).collect();
+            panic!(
+                "m={m}: the view over the wide bank reads differently from the copy: {} of {} differ, rows {:?}, first {:?}",
+                diffs.len(),
+                m * N,
+                rows,
+                &diffs[..diffs.len().min(6)]
+            );
+        }
         eprintln!("m={m}: view == copy over {} bf16 outputs", m * N);
     }
 }
@@ -263,7 +293,7 @@ fn the_leading_output_columns_land_in_place() {
         let y_bytes = u64::from(m) * u64::from(N) * 2;
         let mut out = Vec::new();
         for (w, columns) in [(full, None), (head, Some(KEEP))] {
-            let y_buffer = Buffer::zeroed(&device, y_bytes).expect("y");
+            let y_buffer = Buffer::zeroed(&device, whole_pages(y_bytes)).expect("y");
             let y = Tensor::new(
                 handles.bind(&y_buffer, 0, y_bytes).expect("y"),
                 m,
