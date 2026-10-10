@@ -42,7 +42,7 @@ fn main() {
     }
     std::panic::set_hook(Box::new(|_| {}));
     let mut tally = [0usize; 3];
-    for deployment in models::deployments() {
+    for deployment in poem_compiler::catalog::deployments() {
         if deployment.deploy.tp != 1 {
             continue;
         }
@@ -83,7 +83,7 @@ fn main() {
 }
 
 fn one(
-    deployment: &models::Deployment,
+    deployment: &poem_compiler::catalog::Deployment,
     compile: bool,
     lean: bool,
     verbose: bool,

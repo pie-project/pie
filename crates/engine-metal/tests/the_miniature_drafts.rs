@@ -13,7 +13,7 @@ const STEPS: usize = 6;
 
 /// The facts the deployment `deployment` classifies its lanes by.
 fn facts_of(deployment: &str) -> poem_ir::Facts {
-    models::deployment(deployment)
+    poem_compiler::catalog::deployment(deployment)
         .expect("the catalog ships the row")
         .trace(Platform::Metal)
         .facts
@@ -91,8 +91,8 @@ fn the_draft_head_fires_and_the_trunk_is_unchanged() {
         );
         return;
     };
-    let deployment =
-        models::deployment(DEPLOYMENT).expect("the catalog ships the drafting mini row");
+    let deployment = poem_compiler::catalog::deployment(DEPLOYMENT)
+        .expect("the catalog ships the drafting mini row");
     let trace = deployment.trace(Platform::Metal);
     let source = ztensor_compat::index(&artifact).expect("the artifact opens");
     let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Metal)

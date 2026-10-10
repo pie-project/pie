@@ -58,7 +58,8 @@ fn a_short_card_keeps_the_declared_context() {
         eprintln!("{checkpoint:?} holds no tensor container");
         return;
     };
-    let deployment = models::deployment(DEPLOYMENT).expect("the catalog ships the deployment");
+    let deployment =
+        poem_compiler::catalog::deployment(DEPLOYMENT).expect("the catalog ships the deployment");
     let trace = deployment.trace(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
     let contract = deployment

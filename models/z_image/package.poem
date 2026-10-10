@@ -1,9 +1,14 @@
 # Z-Image Turbo, with its Qwen3 text encoder and its VAE, and a miniature of
 # its diffusion transformer alone.
 
+load("//lib/spoken.poem", "QWEN_STOP")
+
+CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
+TOKENIZER = tokenizer(markers = [QWEN_STOP])
+
 MODELS = [
-    model("z-image-turbo", template = "qwen_3", tokenizer = "qwen_3", arch = "z_image", layers = 35, vocab = 151936),
-    model("z-image-mini", mini = True, template = "qwen_3", tokenizer = "qwen_3", arch = "z_image", layers = 6, vocab = 0),
+    model("z-image-turbo", template = CHATML, tokenizer = TOKENIZER, arch = "z_image", layers = 35, vocab = 151936),
+    model("z-image-mini", mini = True, template = CHATML, tokenizer = TOKENIZER, arch = "z_image", layers = 6, vocab = 0),
 ]
 
 DEPLOYMENTS = [

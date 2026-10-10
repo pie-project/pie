@@ -106,9 +106,7 @@ pub struct Media<'a> {
 
     pub positions: &'a [i32],
 
-    pub embed_rows: &'a [i32],
-
-    pub embed_weights: &'a [f32],
+    pub grids: &'a [i32],
 
     pub token_positions: &'a [i32],
 }
@@ -119,8 +117,6 @@ pub struct PatchSeat {
     pub width: u32,
     pub row_bytes: u64,
     pub dtype: Dtype,
-    pub embed_taps: u64,
-    pub embed_weights: bool,
     pub images: u32,
 }
 
@@ -644,11 +640,6 @@ impl Shell {
                     width: u32::try_from(width).unwrap_or(u32::MAX),
                     row_bytes: width * poem_compiler::arena::elem_bytes(*dtype).unwrap_or(0),
                     dtype: *dtype,
-                    embed_taps: declared_width(&boot.trace, poem_ir::RuntimeInput::PatchEmbedRows),
-                    embed_weights: declared_width(
-                        &boot.trace,
-                        poem_ir::RuntimeInput::PatchEmbedWeights,
-                    ) > 0,
                     images: ladder.max_images,
                 })
             })
@@ -2195,18 +2186,9 @@ impl Shell {
                     patch_rows * 3,
                 ),
                 (
-                    "position-table taps",
-                    shot.embed_rows.len() as u64,
-                    patch_rows * seat.embed_taps,
-                ),
-                (
-                    "interpolation weights",
-                    shot.embed_weights.len() as u64,
-                    if seat.embed_weights {
-                        patch_rows * seat.embed_taps
-                    } else {
-                        0
-                    },
+                    "image grids",
+                    shot.grids.len() as u64,
+                    shot.rows.len() as u64 * 3,
                 ),
             ] {
                 if have != want {
@@ -2261,12 +2243,9 @@ impl Shell {
         })?;
         let handles = &self.handles;
         let stride = seat.row_bytes as usize;
-        let taps = seat.embed_taps as usize;
-        let weight_taps = if seat.embed_weights { taps } else { 0 };
         let mut payload = vec![0u8; patch_rows * stride];
         let mut positions = vec![0i32; patch_rows * 3];
-        let mut embed_rows = vec![0i32; patch_rows * taps];
-        let mut embed_weights = vec![0.0f32; patch_rows * weight_taps];
+        let mut grids = vec![0i32; composition.images() as usize * 3];
         let fold = self.patch_fold.max(1) as usize;
         let mut routes = vec![
             if self.drops_patch_rows {
@@ -2296,15 +2275,8 @@ impl Shell {
             }
             let triples = row.patch_offset as usize * 3;
             positions[triples..triples + shot.positions.len()].copy_from_slice(shot.positions);
-            if taps > 0 {
-                let at = row.patch_offset as usize * taps;
-                embed_rows[at..at + shot.embed_rows.len()].copy_from_slice(shot.embed_rows);
-            }
-            if weight_taps > 0 {
-                let at = row.patch_offset as usize * weight_taps;
-                embed_weights[at..at + shot.embed_weights.len()]
-                    .copy_from_slice(shot.embed_weights);
-            }
+            let at = row.image_offset as usize * 3;
+            grids[at..at + shot.grids.len()].copy_from_slice(shot.grids);
             for (i, &rows) in shot.rows.iter().enumerate() {
                 per_image[row.image_offset as usize + i] = rows;
             }
@@ -2322,9 +2294,7 @@ impl Shell {
             segments: inputs.i32s(handles, &segments, 1),
             routes: inputs.i32s(handles, &routes, 1),
             positions: inputs.i32s(handles, &positions, 3),
-            embed_rows: (taps > 0).then(|| inputs.i32s(handles, &embed_rows, taps as u32)),
-            embed_weights: (weight_taps > 0)
-                .then(|| inputs.f32s(handles, &embed_weights, weight_taps as u32)),
+            grids: inputs.i32s(handles, &grids, 3),
         }))
     }
 

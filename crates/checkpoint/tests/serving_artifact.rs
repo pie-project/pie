@@ -24,6 +24,8 @@ fn stamp() -> Stamp {
         deployment: "qwen_3".to_string(),
         layout_revision: 1,
         adapters_zeroed: true,
+        package: "qwen_3".to_string(),
+        package_digest: "0".repeat(64),
     }
 }
 

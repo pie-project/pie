@@ -28,8 +28,8 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let name = args.next().expect("usage: tiny_e2e <deployment> [--keep]");
     let keep = args.any(|a| a == "--keep");
-    let deployment = models::deployment(&name)
-        .or_else(|| models::deployments().find(|s| s.name.starts_with(&name)))
+    let deployment = poem_compiler::catalog::deployment(&name)
+        .or_else(|| poem_compiler::catalog::deployments().find(|s| s.name.starts_with(&name)))
         .unwrap_or_else(|| panic!("no deployment `{name}`"));
     let trace = deployment.trace(Platform::Xla);
     let dir = PathBuf::from("/dev/shm/pie-xla-e2e");
@@ -69,7 +69,7 @@ fn main() {
 }
 
 fn run(
-    deployment: &models::Deployment,
+    deployment: &poem_compiler::catalog::Deployment,
     trace: poem::Trace,
     contract: &checkpoint::contract::ModelContract,
     path: &Path,
@@ -144,8 +144,11 @@ fn run(
 }
 
 /// Prefill against a token-by-token walk of the same prompt.
-fn agree(shell: &mut Shell, deployment: &models::Deployment) -> Result<String, String> {
-    let facts = deployment.trace(models::Platform::Xla).facts;
+fn agree(
+    shell: &mut Shell,
+    deployment: &poem_compiler::catalog::Deployment,
+) -> Result<String, String> {
+    let facts = deployment.trace(poem::Platform::Xla).facts;
     let word = |query_len: u32| facts.word(&Request::new(query_len, false));
     let vocab = shell.out_width();
     let mut lcg = 0x2545_f491_4f6c_dd1du64;
@@ -322,7 +325,7 @@ fn write_random(trace: &poem::Trace, path: &Path) -> u64 {
         .params
         .iter()
         .filter(|p| quantized(p.dtype))
-        .flat_map(|p| [models::scales_name(&p.name), models::biases_name(&p.name)])
+        .flat_map(|p| [poem::scales_name(&p.name), poem::biases_name(&p.name)])
         .collect();
     let mut writer = ztensor::Writer::create(path).expect("the checkpoint opens");
     let mut state = 0x9e37_79b9_7f4a_7c15u64;

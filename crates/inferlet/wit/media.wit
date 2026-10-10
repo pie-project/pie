@@ -5,9 +5,9 @@
 // this file is the source of truth.
 //
 // Model-agnostic by construction: the inferlet hands the host raw encoded
-// bytes (a PNG/JPEG, an animated GIF, a WAV) and the host — which knows the
-// bound model — does ALL of the model-specific work (decode, resize, patchify,
-// log-mel, video frame-sampling, and the model's own span delimiters). An
+// bytes (a PNG/JPEG, an animated GIF) and the host decodes, frames the still
+// as the bound model's package states, cuts it into patch rows and spells
+// it with the package's delimiters; the tower normalizes in the forward. An
 // inferlet never branches on the model. An encoded input becomes ordinary
 // context KV, so fork / snapshot / prefix-cache all apply for free;
 // the inferlet only ever holds a handle (pixels/features never cross into WASM
@@ -41,16 +41,15 @@ interface media {
         w: u32,
     }
 
-    // A host-side handle to a preprocessed still image (also used for one
-    // decoded video frame). `from-bytes` decodes + resizes + patchifies per the
-    // bound model's processor, so the layout queries below are answerable
+    // A host-side handle to a cut still image (also used for one decoded
+    // video frame). `from-bytes` decodes, frames and cuts it as the bound
+    // model's package states, so the layout queries below are answerable
     // synchronously, before the span is ever fed to a forward pass.
     resource image {
 
-        // Encoded still image (PNG / JPEG / …). The host decodes it, then
-        // resizes + patchifies + normalizes exactly as the bound model's image
-        // processor requires (Gemma SigLIP2 vs Qwen smart-resize, etc.). Errors
-        // if the model has no vision front-end or the bytes don't decode.
+        // Encoded still image (PNG / JPEG / …). The host decodes it, frames
+        // it by the package's `frame` and cuts it into patch rows. Errors if
+        // the model reads no stills or the bytes don't decode.
         from-bytes: static func(bytes: list<u8>)
             -> result<image, error>;
 

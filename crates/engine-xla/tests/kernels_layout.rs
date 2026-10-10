@@ -381,6 +381,132 @@ fn folds_pool_and_merge_blocks_of_rows() {
     assert_close(&b.read_f32(merge), &x[..8 * width], 0.0, 0.0);
 }
 
+/// `(byte / 255 - mean[ch]) / std[ch]` laid out channel- or pixel-major,
+/// the frame repeated `temporal` times.
+fn pixels_ref(
+    x: &[u8],
+    patch: usize,
+    mean: [f32; 3],
+    std: [f32; 3],
+    channel_major: bool,
+    temporal: usize,
+) -> Vec<f32> {
+    let (px, in_width) = (patch * patch, 3 * patch * patch);
+    let width = temporal * in_width;
+    x.chunks(in_width)
+        .flat_map(|row| {
+            (0..width).map(move |c| {
+                let (ch, at) = if channel_major {
+                    let ch = c / (temporal * px);
+                    (ch, (c % px) * 3 + ch)
+                } else {
+                    let k = c % in_width;
+                    (k % 3, k)
+                };
+                round_bf16((f32::from(row[at]) / 255.0 - mean[ch]) / std[ch])
+            })
+        })
+        .collect()
+}
+
+/// Bilinear (4) or axes (2) taps of each patch over a `side`-wide table.
+fn taps_ref(
+    positions: &[i32],
+    grids: &[i32],
+    segments: &[i32],
+    bilinear: bool,
+    side: i32,
+) -> (Vec<i32>, Vec<f32>) {
+    let axis = |index: i32, size: i32| -> ([i32; 2], [f32; 2]) {
+        let src = index as f32 * (side - 1) as f32 / (size - 1).max(1) as f32;
+        let fl = src.floor();
+        let mut taps = [0; 2];
+        let mut w = [0.0; 2];
+        for t in 0..2 {
+            taps[t] = (fl as i32 + t as i32).clamp(0, side - 1);
+            w[t] = (1.0 - (src - fl - t as f32).abs()).max(0.0);
+        }
+        (taps, w)
+    };
+    let (mut ids, mut weights) = (Vec::new(), Vec::new());
+    for (n, p) in positions.chunks(3).enumerate() {
+        let (row, col) = (p[1], p[2]);
+        if !bilinear {
+            ids.extend([col.min(side - 1), side + row.min(side - 1)]);
+            weights.extend([1.0, 1.0]);
+            continue;
+        }
+        let image = segments[..segments.len() - 1]
+            .iter()
+            .rposition(|&s| s <= n as i32)
+            .unwrap_or(0);
+        let (ht, hw) = axis(row, grids[image * 3 + 1]);
+        let (wt, ww) = axis(col, grids[image * 3 + 2]);
+        for a in 0..2 {
+            for b in 0..2 {
+                ids.push(ht[a] * side + wt[b]);
+                weights.push(hw[a] * ww[b]);
+            }
+        }
+    }
+    (ids, weights)
+}
+
+#[test]
+fn pixels_and_grid_taps_answer_the_host() {
+    let patch = 2u32;
+    let in_width = 3 * patch * patch;
+    // Two images: a 2 x 2 patch grid and a 1 x 3 one, seven patch rows.
+    let grids = [1, 2, 2, 1, 1, 3];
+    let segments = [0, 4, 7];
+    let positions = [
+        0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 2,
+    ];
+    let n = 7u32;
+    let bytes: Vec<u8> = (0..n * in_width)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let (mean, std) = ([0.5f32, 0.4, 0.3], [0.5f32, 0.25, 0.2]);
+    let side = 4u32;
+
+    let mut b = Bench::new();
+    let x = b.u8(n, in_width, &bytes);
+    // One spare row past the patches stays as it was.
+    let chw = b.zeros(Dtype::Bf16, n + 1, 2 * in_width);
+    let hwc = b.zeros(Dtype::Bf16, n, in_width);
+    let pos = b.i32(n, 3, &positions);
+    let grid = b.i32(2, 3, &grids);
+    let seg = b.i32(3, 1, &segments);
+    let bi = b.zeros(Dtype::I32, n, 4);
+    let bw = b.zeros(Dtype::F32, n, 4);
+    let ai = b.zeros(Dtype::I32, n, 2);
+    let aw = b.zeros(Dtype::F32, n, 2);
+    if !b
+        .run(|ctx| {
+            layout::pixels(ctx, x, patch, mean, std, true, 2, chw)?;
+            layout::pixels(ctx, x, patch, mean, std, false, 1, hwc)?;
+            layout::grid_taps(ctx, pos, grid, seg, true, side, bi, bw)?;
+            layout::grid_taps(ctx, pos, grid, seg, false, side, ai, aw)
+        })
+        .unwrap()
+    {
+        return;
+    }
+    let p = patch as usize;
+    let mut want = pixels_ref(&bytes, p, mean, std, true, 2);
+    want.extend(std::iter::repeat_n(0.0, 2 * in_width as usize));
+    assert_close(&b.read_f32(chw), &want, 1e-6, 1e-2);
+    let want = pixels_ref(&bytes, p, mean, std, false, 1);
+    assert_close(&b.read_f32(hwc), &want, 1e-6, 1e-2);
+
+    let (ids, weights) = taps_ref(&positions, &grids, &segments, true, side as i32);
+    assert_eq!(b.read_i32(bi), ids);
+    assert_close(&b.read_f32(bw), &weights, 1e-6, 1e-6);
+    let (ids, weights) = taps_ref(&positions, &grids, &segments, false, side as i32);
+    assert_eq!(b.read_i32(ai), ids);
+    assert_close(&b.read_f32(aw), &weights, 0.0, 0.0);
+}
+
 fn top(row: &[f32], k: usize) -> Vec<(f32, i32)> {
     let mut idx: Vec<usize> = (0..row.len()).filter(|&i| !row[i].is_nan()).collect();
     idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap().then(a.cmp(&b)));

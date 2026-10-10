@@ -55,7 +55,7 @@ fn profile() -> DeviceProfile {
 fn baked(budget: &Budget) -> (Trace, CompiledModel) {
     // The whole deployment name, not the text it serves: a prefix match also takes
     // the `-eagle` and `-vision` rows, whose names start with this text.
-    let trace = models::deployment(SERVED)
+    let trace = poem_compiler::catalog::deployment(SERVED)
         .unwrap_or_else(|| panic!("the catalog no longer ships {SERVED}"))
         .trace(Platform::Metal);
     let compiled = compile(&trace, budget, &profile()).expect("the served text bakes");

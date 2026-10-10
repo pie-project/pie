@@ -66,8 +66,7 @@ struct SyntheticMedia {
     patches: Vec<u8>,
     routes: Vec<i32>,
     positions: Vec<i32>,
-    embed_rows: Vec<i32>,
-    embed_weights: Vec<f32>,
+    grids: Vec<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -398,14 +397,6 @@ impl Shell {
         let page_size = u64::from(self.pools.paging().page_size).max(1);
         let mut next_page = 0u64;
         let row_bytes = self.patch_seat.map_or(0, |seat| seat.row_bytes) as usize;
-        let taps = self.patch_seat.map_or(0, |seat| seat.embed_taps) as usize;
-        let weight_taps = self.patch_seat.map_or(0, |seat| {
-            if seat.embed_weights {
-                seat.embed_taps
-            } else {
-                0
-            }
-        }) as usize;
         let fold = (self.patch_fold as usize).max(1);
         lanes
             .iter()
@@ -455,19 +446,16 @@ impl Shell {
                             for (j, route) in routes.iter_mut().take(live).enumerate() {
                                 *route = (j % rows.max(1) as usize) as i32;
                             }
-                            let mut embed_weights = vec![0f32; patches * weight_taps];
-                            for row in embed_weights.chunks_mut(weight_taps.max(1)) {
-                                if let Some(first) = row.first_mut() {
-                                    *first = 1.0;
-                                }
-                            }
+                            let grids = per_image
+                                .iter()
+                                .flat_map(|&rows| [1, rows as i32, 1])
+                                .collect();
                             SyntheticMedia {
                                 rows: per_image,
                                 patches: vec![0u8; patches * row_bytes],
                                 routes,
                                 positions: vec![0i32; patches * MROPE_COORDS],
-                                embed_rows: vec![0i32; patches * taps],
-                                embed_weights,
+                                grids,
                             }
                         }),
                 }
@@ -560,8 +548,7 @@ impl Shell {
                     routes: &shot.routes,
                     positions: &shot.positions,
                     token_positions: &[],
-                    embed_rows: &shot.embed_rows,
-                    embed_weights: &shot.embed_weights,
+                    grids: &shot.grids,
                 })
             })
             .collect();

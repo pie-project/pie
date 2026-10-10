@@ -1284,7 +1284,7 @@ mod tests {
 
     #[test]
     fn the_store_is_laid_out_aligned_disjoint_and_in_plan_order() {
-        let trace = models::deployment("qwen35-d0.8b-bf16-kv-bf16")
+        let trace = poem_compiler::catalog::deployment("qwen35-d0.8b-bf16-kv-bf16")
             .expect("the catalog ships the deployment")
             .trace(Platform::Cuda);
         let places = places(&trace, &crate::experts::Plan::default())

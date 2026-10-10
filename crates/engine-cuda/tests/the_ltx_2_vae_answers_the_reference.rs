@@ -23,7 +23,7 @@ def forward(m, inputs):
 "#;
 
 fn vae_only() -> Trace {
-    models::star::replacing("ltx25", "forward.poem", "forward", VAE_ONLY)
+    poem_compiler::catalog::replacing("ltx25", "forward.poem", "forward", VAE_ONLY)
         .unwrap_or_else(|why| panic!("the VAE-only package: {why}"))
         .trace(
             "ltx25",
@@ -41,8 +41,9 @@ def formats(m):
 "#;
 
 fn import_vae(src: &ztensor::Source) -> checkpoint::contract::ModelContract {
-    let package = models::star::replacing("ltx25", "formats.poem", "formats", VAE_FORMATS)
-        .unwrap_or_else(|why| panic!("the VAE-only package: {why}"));
+    let package =
+        poem_compiler::catalog::replacing("ltx25", "formats.poem", "formats", VAE_FORMATS)
+            .unwrap_or_else(|why| panic!("the VAE-only package: {why}"));
     package
         .import("ltx25", &deploy(FLAGSHIP), src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the VAE does not read this snapshot: {why}"))

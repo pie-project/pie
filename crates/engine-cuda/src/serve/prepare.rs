@@ -270,14 +270,6 @@ impl FrameShell for Shell {
         }
 
         let row_bytes = self.patch_seat.map_or(0, |seat| seat.row_bytes);
-        let embed_taps = self.patch_seat.map_or(0, |seat| seat.embed_taps);
-        let embed_weight_taps = self.patch_seat.map_or(0, |seat| {
-            if seat.embed_weights {
-                seat.embed_taps
-            } else {
-                0
-            }
-        });
         let mut media_of: Vec<Option<&Media<'_>>> = vec![None; lanes.len()];
         for shot in media {
             let at = shot.lane as usize;
@@ -325,26 +317,13 @@ impl FrameShell for Shell {
                     have: shot.token_positions.len() as u64,
                 });
             }
-            for (what, have, owed) in [
-                (
-                    "the position table's gather rows",
-                    shot.embed_rows.len() as u64,
-                    patch_rows * embed_taps,
-                ),
-                (
-                    "the position table's interpolation weights",
-                    shot.embed_weights.len() as u64,
-                    patch_rows * embed_weight_taps,
-                ),
-            ] {
-                let _ = what;
-                if have != owed {
-                    return Err(Fault::PatchPayload {
-                        lane: shot.lane,
-                        need: owed,
-                        have,
-                    });
-                }
+            let grids_owed = shot.rows.len() as u64 * MROPE_COORDS as u64;
+            if shot.grids.len() as u64 != grids_owed {
+                return Err(Fault::PatchPayload {
+                    lane: shot.lane,
+                    need: grids_owed,
+                    have: shot.grids.len() as u64,
+                });
             }
             let rows = lane_rows[at];
             let drop = self.drops_patch_rows;
@@ -665,82 +644,57 @@ impl FrameShell for Shell {
             )?
         };
 
-        let (
-            patch_payload,
-            patch_segments,
-            patch_routes,
-            patch_positions,
-            patch_embed_rows,
-            patch_embed_weights,
-        ) = if composition.patch_rows() == 0 {
-            (
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            )
-        } else {
-            let stride = row_bytes as usize;
-            let mut payload = vec![0u8; composition.patch_rows() as usize * stride];
-            let mut routes = vec![
-                if self.drops_patch_rows {
-                    PATCH_ROUTE_DROP
-                } else {
-                    0
-                };
-                composition.patch_rows() as usize
-            ];
-            let mut positions = vec![0i32; composition.patch_rows() as usize * MROPE_COORDS];
-            let fold = (self.patch_fold as usize).max(1);
-            let taps = embed_taps as usize;
-            let weight_taps = embed_weight_taps as usize;
-            let mut embed_rows = vec![0i32; composition.patch_rows() as usize * taps];
-            let mut embed_weights = vec![0f32; composition.patch_rows() as usize * weight_taps];
-            let mut per_image = vec![0u32; composition.images() as usize];
-            for row in composition.lanes() {
-                let Some(shot) = media_of[row.source as usize] else {
-                    continue;
-                };
-                let at = row.patch_offset as usize * stride;
-                payload[at..at + shot.patches.len()].copy_from_slice(shot.patches);
-                let landed = (row.patch_offset as usize) / fold;
-                let live = shot.rows.iter().map(|rows| *rows as usize).sum::<usize>() / fold;
-                for (j, &route) in shot.routes.iter().take(live).enumerate() {
-                    routes[landed + j] = if route < 0 {
-                        route
+        let (patch_payload, patch_segments, patch_routes, patch_positions, patch_grids) =
+            if composition.patch_rows() == 0 {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            } else {
+                let stride = row_bytes as usize;
+                let mut payload = vec![0u8; composition.patch_rows() as usize * stride];
+                let mut routes = vec![
+                    if self.drops_patch_rows {
+                        PATCH_ROUTE_DROP
                     } else {
-                        route + row.row_offset as i32
+                        0
                     };
+                    composition.patch_rows() as usize
+                ];
+                let mut positions = vec![0i32; composition.patch_rows() as usize * MROPE_COORDS];
+                let fold = (self.patch_fold as usize).max(1);
+                let mut grids = vec![0i32; composition.images() as usize * MROPE_COORDS];
+                let mut per_image = vec![0u32; composition.images() as usize];
+                for row in composition.lanes() {
+                    let Some(shot) = media_of[row.source as usize] else {
+                        continue;
+                    };
+                    let at = row.patch_offset as usize * stride;
+                    payload[at..at + shot.patches.len()].copy_from_slice(shot.patches);
+                    let landed = (row.patch_offset as usize) / fold;
+                    let live = shot.rows.iter().map(|rows| *rows as usize).sum::<usize>() / fold;
+                    for (j, &route) in shot.routes.iter().take(live).enumerate() {
+                        routes[landed + j] = if route < 0 {
+                            route
+                        } else {
+                            route + row.row_offset as i32
+                        };
+                    }
+                    let triples = row.patch_offset as usize * MROPE_COORDS;
+                    positions[triples..triples + shot.positions.len()]
+                        .copy_from_slice(shot.positions);
+                    let at_grids = row.image_offset as usize * MROPE_COORDS;
+                    grids[at_grids..at_grids + shot.grids.len()].copy_from_slice(shot.grids);
+                    for (i, &rows) in shot.rows.iter().enumerate() {
+                        per_image[row.image_offset as usize + i] = rows;
+                    }
                 }
-                let triples = row.patch_offset as usize * MROPE_COORDS;
-                positions[triples..triples + shot.positions.len()].copy_from_slice(shot.positions);
-                let at_ids = row.patch_offset as usize * taps;
-                embed_rows[at_ids..at_ids + shot.embed_rows.len()].copy_from_slice(shot.embed_rows);
-                let at_w = row.patch_offset as usize * weight_taps;
-                embed_weights[at_w..at_w + shot.embed_weights.len()]
-                    .copy_from_slice(shot.embed_weights);
-                for (i, &rows) in shot.rows.iter().enumerate() {
-                    per_image[row.image_offset as usize + i] = rows;
-                }
-            }
-            let mut segments = Vec::with_capacity(per_image.len() + 1);
-            let mut at = 0i32;
-            segments.push(at);
-            for rows in per_image {
-                at += rows as i32;
+                let mut segments = Vec::with_capacity(per_image.len() + 1);
+                let mut at = 0i32;
                 segments.push(at);
-            }
-            (
-                payload,
-                segments,
-                routes,
-                positions,
-                embed_rows,
-                embed_weights,
-            )
-        };
+                for rows in per_image {
+                    at += rows as i32;
+                    segments.push(at);
+                }
+                (payload, segments, routes, positions, grids)
+            };
         let rows = composition.rows();
 
         let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
@@ -1529,8 +1483,7 @@ impl FrameShell for Shell {
             patch_segments,
             patch_routes,
             patch_positions,
-            patch_embed_rows,
-            patch_embed_weights,
+            patch_grids,
             mrope_positions,
             self_cond_rows,
             self_cond_weights,

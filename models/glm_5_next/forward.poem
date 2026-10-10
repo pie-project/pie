@@ -351,7 +351,7 @@ def index_select(x, q_a, inputs, positions, act, ix, split):
 
 def tower(inputs, t):
     d = t.head_dim
-    x = inputs.patches(t.patch_width)
+    x = ops.layout.pixels(inputs.pixels(3 * t.patch * t.patch), [0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711], "chw", t.temporal)
     segments = inputs.patch_segments()
     grid = inputs.patch_positions()
     y = ops.elemwise.add_bias(t.patch_embed_bias, ops.linear.matmul(x, t.patch_embed))

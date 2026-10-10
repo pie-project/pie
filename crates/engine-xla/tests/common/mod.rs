@@ -10,7 +10,7 @@ use poem::Platform;
 
 pub struct Model {
     pub checkpoint: PathBuf,
-    pub deployment: &'static models::Deployment,
+    pub deployment: &'static poem_compiler::catalog::Deployment,
     pub contract: ModelContract,
     pub tokenizer: Option<PathBuf>,
 }
@@ -26,7 +26,7 @@ pub fn model() -> Option<Model> {
             let stamp = checkpoint::file::serve::stamp_of(&artifact)
                 .expect("the artifact reads")
                 .expect("the artifact carries a serving stamp");
-            let deployment = models::deployment(&stamp.deployment)
+            let deployment = poem_compiler::catalog::deployment(&stamp.deployment)
                 .unwrap_or_else(|| panic!("no deployment {}", stamp.deployment));
             let trace = deployment.trace(Platform::Xla);
             let source = ztensor_compat::index(&artifact).expect("the artifact opens");
@@ -48,8 +48,8 @@ pub fn model() -> Option<Model> {
         }
         (_, Ok(snapshot), Ok(name)) => {
             let snapshot = PathBuf::from(snapshot);
-            let deployment =
-                models::deployment(&name).unwrap_or_else(|| panic!("no deployment {name}"));
+            let deployment = poem_compiler::catalog::deployment(&name)
+                .unwrap_or_else(|| panic!("no deployment {name}"));
             let mut shards: Vec<PathBuf> = std::fs::read_dir(&snapshot)
                 .expect("the snapshot lists")
                 .filter_map(|e| {

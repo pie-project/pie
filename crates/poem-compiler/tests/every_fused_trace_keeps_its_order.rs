@@ -6,7 +6,8 @@ use poem_ir::{Fault, Platform};
 fn every_fused_trace_keeps_its_order() {
     let kernels: Vec<&str> = poem_compiler::fuse::kernels().collect();
     let mut broken = Vec::new();
-    for deployment in models::deployments().chain(models::splits()) {
+    for deployment in poem_compiler::catalog::deployments().chain(poem_compiler::catalog::splits())
+    {
         for platform in [Platform::Cuda, Platform::Metal] {
             let fused = poem_compiler::fuse::fuse(deployment.trace(platform), &kernels);
             let Err(faults) = poem_ir::check(&fused) else {
@@ -37,8 +38,8 @@ fn every_fused_trace_keeps_its_order() {
 /// layer whose q, k and v share one projection.
 #[test]
 fn gemma_4_writes_its_kv_through_the_fused_kernel() {
-    let deployment =
-        models::deployment("gemma4-31b-bf16-kv-bf16").expect("the catalog states gemma4-31b");
+    let deployment = poem_compiler::catalog::deployment("gemma4-31b-bf16-kv-bf16")
+        .expect("the catalog states gemma4-31b");
     let trace = deployment.trace(Platform::Cuda);
     let count = |t: &poem_ir::Trace, op: &str| {
         t.nodes

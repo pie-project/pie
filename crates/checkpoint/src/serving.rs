@@ -25,6 +25,11 @@ pub struct Stamp {
     pub deployment: String,
     pub layout_revision: u64,
     pub adapters_zeroed: bool,
+    /// The model package the deployment is of, by name.
+    pub package: String,
+    /// The package's digest at import; a later edit serves, and `pie model
+    /// import` writes the artifact again.
+    pub package_digest: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -34,6 +39,8 @@ pub enum Field {
     Deployment,
     LayoutRevision,
     AdaptersZeroed,
+    Package,
+    PackageDigest,
 }
 
 impl Field {
@@ -45,11 +52,15 @@ impl Field {
             Field::Deployment => "deployment",
             Field::LayoutRevision => "layout_revision",
             Field::AdaptersZeroed => "adapters_zeroed",
+            Field::Package => "package",
+            Field::PackageDigest => "package_digest",
         }
     }
 
+    /// What an artifact is for, which a load must match; the package fields say
+    /// where it came from.
     #[must_use]
-    pub fn required() -> &'static [Field] {
+    pub fn identity() -> &'static [Field] {
         &[
             Field::Serving,
             Field::Backend,
@@ -123,6 +134,8 @@ impl Stamp {
                     text(Field::AdaptersZeroed.key()),
                     Value::Bool(self.adapters_zeroed),
                 ),
+                (text(Field::Package.key()), text(&self.package)),
+                (text(Field::PackageDigest.key()), text(&self.package_digest)),
             ]),
         )])
     }
@@ -135,7 +148,16 @@ impl Stamp {
             deployment: deployment.to_string(),
             layout_revision: LAYOUT_REVISION,
             adapters_zeroed: true,
+            package: String::new(),
+            package_digest: String::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_package(mut self, package: &str, digest: &str) -> Stamp {
+        self.package = package.to_string();
+        self.package_digest = digest.to_string();
+        self
     }
 
     pub fn decode(attributes: &Value) -> Result<Stamp, Error> {
@@ -170,11 +192,13 @@ impl Stamp {
             deployment: required_text(attributes, Field::Deployment)?.to_string(),
             layout_revision: required_uint(attributes, Field::LayoutRevision)?,
             adapters_zeroed,
+            package: optional_text(attributes, Field::Package),
+            package_digest: optional_text(attributes, Field::PackageDigest),
         })
     }
 
     pub fn check(&self, deployment: &Stamp) -> Result<(), Mismatch> {
-        for field in Field::required() {
+        for field in Field::identity() {
             let (artifact, wanted) = (self.say(*field), deployment.say(*field));
             if artifact != wanted {
                 return Err(Mismatch {
@@ -195,6 +219,8 @@ impl Stamp {
             Field::Deployment => self.deployment.clone(),
             Field::LayoutRevision => self.layout_revision.to_string(),
             Field::AdaptersZeroed => self.adapters_zeroed.to_string(),
+            Field::Package => self.package.clone(),
+            Field::PackageDigest => self.package_digest.clone(),
         }
     }
 }
@@ -617,6 +643,13 @@ fn required_text(attributes: &Value, field: Field) -> Result<&str, Error> {
         Some(Value::Text(it)) => Ok(it),
         Some(_) => Err(malformed(field, "is not text")),
         None => Err(missing(field)),
+    }
+}
+
+fn optional_text(attributes: &Value, field: Field) -> String {
+    match attributes.get(field.key()) {
+        Some(Value::Text(it)) => it.clone(),
+        _ => String::new(),
     }
 }
 

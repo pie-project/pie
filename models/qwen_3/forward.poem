@@ -56,16 +56,13 @@ def rope(q, k, positions, vision, rotary_dim, head_dim, theta):
 def tower(inputs, t):
     """The tower's merged rows for the request's patches."""
     d = t.head_dim
-    x = inputs.patches(t.patch_width)
+    x = ops.layout.pixels(inputs.pixels(3 * t.patch * t.patch), [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], "chw", t.temporal)
     segments = inputs.patch_segments()
     grid = inputs.patch_positions()
 
     y = ops.elemwise.add_bias(t.patch_embed_bias, ops.linear.matmul(x, t.patch_embed))
-    ids = inputs.patch_embed_rows(t.taps)
-    if t.taps == 1:
-        pos = ops.layout.embed(ids, t.pos_embed, t.positions)
-    else:
-        pos = ops.layout.embed_weighted(ids, inputs.patch_embed_weights(t.taps), t.pos_embed, t.positions)
+    ids, weights = ops.layout.grid_taps(grid, inputs.image_grids(), segments, "bilinear", t.grid_side)
+    pos = ops.layout.embed_weighted(ids, weights, t.pos_embed, t.positions)
     y = ops.elemwise.residual_add(pos, y)
 
     for b in t.blocks:

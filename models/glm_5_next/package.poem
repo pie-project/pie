@@ -1,16 +1,22 @@
 # GLM-5.3-Flash, with its vision tower and multi-token draft head or
 # without, and its eight-layer, 32-expert miniature.
 
+GLM = template("glm")
+TOKENIZER = tokenizer(
+    markers = [["<|user|>", "<|observation|>", "<|endoftext|>"]],
+    parts = {"vision": [["<|begin_of_image|>", "<|image|>", "<|end_of_image|>"]]},
+)
+
 MODELS = [
     model(
         "glm53-flash",
-        template = "glm_5_next",
-        tokenizer = "glm_5_next",
+        template = GLM,
+        tokenizer = TOKENIZER,
         parts = ["vision"],
         drafters = ["mtp"],
         arch = "glm5_next", layers = 45, vocab = 154880,
     ),
-    model("glm53-flash-mini", mini = True, template = "glm_5_next", tokenizer = "glm_5_next", arch = "glm5_next", layers = 8, vocab = 154880),
+    model("glm53-flash-mini", mini = True, template = GLM, tokenizer = TOKENIZER, arch = "glm5_next", layers = 8, vocab = 154880),
 ]
 
 DEPLOYMENTS = [

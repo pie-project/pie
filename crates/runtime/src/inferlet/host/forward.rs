@@ -24,7 +24,9 @@ use super::pie;
 
 type Anyhow<T> = anyhow::Result<T>;
 
-fn reading_of(pass: &ForwardPass) -> Result<Option<&'static models::ReadingFact>, String> {
+fn reading_of(
+    pass: &ForwardPass,
+) -> Result<Option<&'static poem::generative::ReadingFact>, String> {
     let model = crate::model::model();
     if let Some(index) = pass.bindings.reading {
         return Ok(model.readings().get(usize::from(index)));
@@ -43,7 +45,7 @@ fn reading_of(pass: &ForwardPass) -> Result<Option<&'static models::ReadingFact>
     ))
 }
 
-fn reading_names(readings: &[models::ReadingFact]) -> String {
+fn reading_names(readings: &[poem::generative::ReadingFact]) -> String {
     readings
         .iter()
         .map(|reading| format!("`{}`", reading.name))
@@ -51,14 +53,14 @@ fn reading_names(readings: &[models::ReadingFact]) -> String {
         .join(", ")
 }
 
-fn reading_lists_stream(reading: &models::ReadingFact, stream: models::Stream) -> bool {
+fn reading_lists_stream(reading: &poem::generative::ReadingFact, stream: poem::Stream) -> bool {
     if reading.streams.is_empty() {
-        return stream == models::Stream::Text;
+        return stream == poem::Stream::Text;
     }
     reading.streams.contains(&stream)
 }
 
-fn stream_names(reading: &models::ReadingFact) -> String {
+fn stream_names(reading: &poem::generative::ReadingFact) -> String {
     if reading.streams.is_empty() {
         return "`text`".to_string();
     }
@@ -70,19 +72,19 @@ fn stream_names(reading: &models::ReadingFact) -> String {
         .join(", ")
 }
 
-fn engine_port_kind(kind: models::PortKind) -> ::engine::fire::PortKind {
+fn engine_port_kind(kind: poem::generative::PortKind) -> ::engine::fire::PortKind {
     use ::engine::fire::PortKind;
     match kind {
-        models::PortKind::Latents => PortKind::Latents,
-        models::PortKind::LaneVector => PortKind::LaneVector,
-        models::PortKind::Context => PortKind::Context,
-        models::PortKind::AxisPositions => PortKind::AxisPositions,
-        models::PortKind::Voxels => PortKind::Voxels,
+        poem::generative::PortKind::Latents => PortKind::Latents,
+        poem::generative::PortKind::LaneVector => PortKind::LaneVector,
+        poem::generative::PortKind::Context => PortKind::Context,
+        poem::generative::PortKind::AxisPositions => PortKind::AxisPositions,
+        poem::generative::PortKind::Voxels => PortKind::Voxels,
     }
 }
 
 pub(crate) fn validate_port_channel(
-    port: &models::PortFact,
+    port: &poem::generative::PortFact,
     shape: &[u32],
     dtype: Dtype,
 ) -> Result<Option<u32>, String> {
@@ -93,7 +95,7 @@ pub(crate) fn validate_port_channel(
         ));
     }
     match port.kind {
-        models::PortKind::LaneVector => match shape {
+        poem::generative::PortKind::LaneVector => match shape {
             [width] | [1, width] if *width == port.width => Ok(None),
             _ => Err(format!(
                 "port `{}` is a lane vector of width {}: its channel must be `[{}]` or `[1, {}]` \
@@ -101,16 +103,16 @@ pub(crate) fn validate_port_channel(
                 port.name, port.width, port.width, port.width
             )),
         },
-        models::PortKind::Latents | models::PortKind::Context | models::PortKind::AxisPositions => {
-            match shape {
-                [rows, width] if *width == port.width && *rows > 0 => Ok(Some(*rows)),
-                _ => Err(format!(
-                    "port `{}` reads `[rows, {}]` f32; this channel is {shape:?}",
-                    port.name, port.width
-                )),
-            }
-        }
-        models::PortKind::Voxels => match shape {
+        poem::generative::PortKind::Latents
+        | poem::generative::PortKind::Context
+        | poem::generative::PortKind::AxisPositions => match shape {
+            [rows, width] if *width == port.width && *rows > 0 => Ok(Some(*rows)),
+            _ => Err(format!(
+                "port `{}` reads `[rows, {}]` f32; this channel is {shape:?}",
+                port.name, port.width
+            )),
+        },
+        poem::generative::PortKind::Voxels => match shape {
             [h, w, width] if *width == port.width && *h > 0 && *w > 0 => Ok(Some(h * w)),
             [t, h, w, width] if *width == port.width && *t > 0 && *h > 0 && *w > 0 => {
                 Ok(Some(t * h * w))
@@ -124,8 +126,8 @@ pub(crate) fn validate_port_channel(
     }
 }
 
-pub(crate) fn port_clip(port: &models::PortFact, shape: &[u32]) -> Option<[u32; 3]> {
-    if port.kind != models::PortKind::Voxels {
+pub(crate) fn port_clip(port: &poem::generative::PortFact, shape: &[u32]) -> Option<[u32; 3]> {
+    if port.kind != poem::generative::PortKind::Voxels {
         return None;
     }
     match *shape {
@@ -573,7 +575,7 @@ impl ProcessCtx {
     fn core_gate(
         &mut self,
         this: &Resource<ForwardPass>,
-        named: Option<&'static models::ReadingFact>,
+        named: Option<&'static poem::generative::ReadingFact>,
     ) -> Anyhow<Result<(), String>> {
         let kind = self.ctx().table.get(this)?.kind;
         let actual = crate::model::model().pass_kind();
@@ -801,7 +803,7 @@ impl ProcessCtx {
             return Ok(Err("forward pass program is already attached".to_string()));
         }
         let model = crate::model::model();
-        let candidates: Vec<&models::ReadingFact> = match reading_of(pass) {
+        let candidates: Vec<&poem::generative::ReadingFact> = match reading_of(pass) {
             Ok(Some(reading)) => vec![reading],
             Ok(None) => Vec::new(),
             Err(_) => model.readings().iter().collect(),
@@ -842,7 +844,7 @@ impl ProcessCtx {
             Err(error) => return Ok(Err(error)),
         };
         if let Some(rows) = rows
-            && fact.kind == models::PortKind::Latents
+            && fact.kind == poem::generative::PortKind::Latents
             && let Some(generative) = model.generative()
             && rows > generative.max_rows
         {
@@ -1321,7 +1323,7 @@ impl ProcessCtx {
                 (None, false) => None,
             };
             let pass_stream = pass.bindings.stream.unwrap_or_default();
-            let carried = |port: &models::PortFact| {
+            let carried = |port: &poem::generative::PortFact| {
                 port.streams.is_empty() || port.streams.contains(&pass_stream)
             };
             if let Some(reading) = reading {
@@ -1398,7 +1400,7 @@ impl ProcessCtx {
                         }
                     }
                     binding.clip = port_clip(fact, shape);
-                    if fact.kind == models::PortKind::Latents
+                    if fact.kind == poem::generative::PortKind::Latents
                         && let Some(rows) = binding.rows
                         && let Some(generative) = crate::model::model().generative()
                         && rows > generative.max_rows
@@ -2530,8 +2532,12 @@ mod tests {
     use crate::pipeline::instance::{AttentionBinding, KvPageSpan, PortBinding};
     use eta_ir::types::Dtype;
 
-    fn port(name: &'static str, kind: models::PortKind, width: u32) -> models::PortFact {
-        models::PortFact {
+    fn port(
+        name: &'static str,
+        kind: poem::generative::PortKind,
+        width: u32,
+    ) -> poem::generative::PortFact {
+        poem::generative::PortFact {
             name: name.to_string(),
             kind,
             width,
@@ -2562,7 +2568,7 @@ mod tests {
     }
 
     fn a_port_channel_is_validated_against_its_fact() {
-        let latents = port("latents", models::PortKind::Latents, 64);
+        let latents = port("latents", poem::generative::PortKind::Latents, 64);
         assert_eq!(
             validate_port_channel(&latents, &[256, 64], Dtype::F32),
             Ok(Some(256))
@@ -2580,7 +2586,7 @@ mod tests {
                 .contains("f32")
         );
 
-        let timestep = port("timestep", models::PortKind::LaneVector, 1);
+        let timestep = port("timestep", poem::generative::PortKind::LaneVector, 1);
         assert_eq!(validate_port_channel(&timestep, &[1], Dtype::F32), Ok(None));
         assert_eq!(
             validate_port_channel(&timestep, &[1, 1], Dtype::F32),
@@ -2588,7 +2594,7 @@ mod tests {
         );
         assert!(validate_port_channel(&timestep, &[2], Dtype::F32).is_err());
 
-        let positions = port("positions", models::PortKind::AxisPositions, 3);
+        let positions = port("positions", poem::generative::PortKind::AxisPositions, 3);
         assert_eq!(
             validate_port_channel(&positions, &[256, 3], Dtype::F32),
             Ok(Some(256))

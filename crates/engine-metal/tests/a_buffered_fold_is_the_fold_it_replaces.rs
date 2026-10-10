@@ -26,7 +26,7 @@ fn fixture() -> Option<PathBuf> {
 const MICRO: &str = "qwen38-flash-next-micro";
 
 fn package() -> &'static poem::star::Package {
-    models::star::package_of(MICRO).expect("the qwen_4 package holds its micro model")
+    poem_compiler::catalog::package_of(MICRO).expect("the qwen_4 package holds its micro model")
 }
 
 fn deploy() -> poem::star::Deploy {

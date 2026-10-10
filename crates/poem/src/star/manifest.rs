@@ -1,7 +1,7 @@
-//! What a package states of itself in `package.poem`: the models it holds and
-//! the deployments of them it lists, each named by the grammar every
-//! deployment is named by.
+//! What a package states of itself in `package.poem`: its models, the
+//! deployments it lists, and each model's template and tokenizer, as data.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use allocative::Allocative;
@@ -9,6 +9,7 @@ use starlark::any::ProvidesStaticType;
 use starlark::environment::{FrozenModule, GlobalsBuilder, Module};
 use starlark::starlark_simple_value;
 use starlark::values::ValueLike;
+use starlark::values::dict::UnpackDictEntries;
 use starlark::values::list::{ListRef, UnpackList};
 use starlark::values::none::NoneOr;
 use starlark::values::{NoSerialize, StarlarkValue, UnpackValue, Value};
@@ -17,6 +18,63 @@ use starlark_derive::{starlark_module, starlark_value};
 use crate::Dtype;
 use crate::star::run::Deploy;
 use crate::star::values::{DtypeValue, word};
+
+/// A template: a format the runtime ships, with the settings it reads.
+#[derive(Clone, Debug, Default, PartialEq, Eq, ProvidesStaticType, NoSerialize, Allocative)]
+pub struct Template {
+    pub format: String,
+    pub thinking: bool,
+    pub preserve_thinking: bool,
+    pub tools: bool,
+    pub generation_suffix: String,
+    pub stop: Vec<String>,
+    pub bos: Option<String>,
+    pub eos: Option<String>,
+}
+
+starlark_simple_value!(Template);
+
+impl fmt::Display for Template {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "template({:?})", self.format)
+    }
+}
+
+#[starlark_value(type = "template")]
+impl<'v> StarlarkValue<'v> for Template {}
+
+/// What a model asks of its tokenizer: markers the vocabulary holds, markers
+/// pinned at an id, and the markers each part adds when served.
+#[derive(Clone, Debug, Default, PartialEq, Eq, ProvidesStaticType, NoSerialize, Allocative)]
+pub struct Tokenizer {
+    pub markers: Vec<Vec<String>>,
+    pub pinned: Vec<(String, u32)>,
+    pub parts: BTreeMap<String, Vec<Vec<String>>>,
+}
+
+starlark_simple_value!(Tokenizer);
+
+impl fmt::Display for Tokenizer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "tokenizer({} marker groups)", self.markers.len())
+    }
+}
+
+#[starlark_value(type = "tokenizer")]
+impl<'v> StarlarkValue<'v> for Tokenizer {}
+
+impl Tokenizer {
+    #[must_use]
+    pub fn markers_for(&self, parts: &[String]) -> Vec<Vec<String>> {
+        let mut markers = self.markers.clone();
+        for part in parts {
+            if let Some(groups) = self.parts.get(part) {
+                markers.extend(groups.iter().cloned());
+            }
+        }
+        markers
+    }
+}
 
 /// One model a package holds.
 #[derive(Clone, Debug, PartialEq, Eq, ProvidesStaticType, NoSerialize, Allocative)]
@@ -30,10 +88,8 @@ pub struct Model {
     pub parts: Vec<String>,
     /// The drafters it pairs with.
     pub drafters: Vec<String>,
-    /// The chat template its turns are written in, by name.
-    pub template: String,
-    /// The tokenizer its checkpoint carries, by name.
-    pub tokenizer: String,
+    pub template: Template,
+    pub tokenizer: Tokenizer,
     /// The architecture its media front-ends are chosen by.
     pub arch: String,
     /// Its depth and vocabulary, as the runtime states them to an inferlet.
@@ -284,18 +340,66 @@ impl Model {
     }
 }
 
-fn dtype_of(spelled: &str) -> Option<Dtype> {
+#[must_use]
+pub fn dtype_of(spelled: &str) -> Option<Dtype> {
     Dtype::ALL.iter().copied().find(|d| word(*d) == spelled)
 }
 
 #[starlark_module]
 pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
+    /// The template `format` with the settings it reads: ChatML `thinking`,
+    /// `preserve_thinking`, `tools`, `generation_suffix`, `stop`; `lines`
+    /// `stop`, `bos`, `eos`; `raw` `stop`.
+    fn template(
+        #[starlark(require = pos)] format: String,
+        #[starlark(require = named, default = false)] thinking: bool,
+        #[starlark(require = named, default = false)] preserve_thinking: bool,
+        #[starlark(require = named, default = false)] tools: bool,
+        #[starlark(require = named, default = String::new())] generation_suffix: String,
+        #[starlark(require = named, default = UnpackList::default())] stop: UnpackList<String>,
+        #[starlark(require = named, default = NoneOr::None)] bos: NoneOr<String>,
+        #[starlark(require = named, default = NoneOr::None)] eos: NoneOr<String>,
+    ) -> anyhow::Result<Template> {
+        Ok(Template {
+            format,
+            thinking,
+            preserve_thinking,
+            tools,
+            generation_suffix,
+            stop: stop.items,
+            bos: bos.into_option(),
+            eos: eos.into_option(),
+        })
+    }
+
+    /// `markers` the vocabulary must hold, `pinned` at the id given, and the
+    /// marker groups each of `parts` adds when served.
+    fn tokenizer<'v>(
+        #[starlark(require = named, default = UnpackList::default())] markers: UnpackList<
+            UnpackList<String>,
+        >,
+        #[starlark(require = named, default = UnpackDictEntries::default())]
+        pinned: UnpackDictEntries<String, u32>,
+        #[starlark(require = named, default = UnpackDictEntries::default())]
+        parts: UnpackDictEntries<String, UnpackList<UnpackList<String>>>,
+    ) -> anyhow::Result<Tokenizer> {
+        Ok(Tokenizer {
+            markers: markers.items.into_iter().map(|g| g.items).collect(),
+            pinned: pinned.entries,
+            parts: parts
+                .entries
+                .into_iter()
+                .map(|(part, groups)| (part, groups.items.into_iter().map(|g| g.items).collect()))
+                .collect(),
+        })
+    }
+
     /// The model `id`: whether it is a miniature, the parts and drafters it
     /// may serve with, and the template and tokenizer it is spoken through.
     fn model(
         #[starlark(require = pos)] id: String,
-        #[starlark(require = named)] template: String,
-        #[starlark(require = named)] tokenizer: String,
+        #[starlark(require = named)] template: &Template,
+        #[starlark(require = named)] tokenizer: &Tokenizer,
         #[starlark(require = named, default = false)] mini: bool,
         #[starlark(require = named, default = UnpackList::default())] parts: UnpackList<String>,
         #[starlark(require = named, default = UnpackList::default())] drafters: UnpackList<String>,
@@ -308,8 +412,8 @@ pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
             mini,
             parts: parts.items,
             drafters: drafters.items,
-            template,
-            tokenizer,
+            template: template.clone(),
+            tokenizer: tokenizer.clone(),
             arch,
             layers,
             vocab,

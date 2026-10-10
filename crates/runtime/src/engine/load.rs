@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use checkpoint::contract::ModelContract;
@@ -10,9 +11,12 @@ use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
 
 pub use poem_ir::{Platform, Trace};
 
-/// The deployment `name` spells.
-pub fn deployment(name: &str) -> Result<models::Deployment> {
-    models::Deployment::parse(name).ok_or_else(|| anyhow!("{}", no_such_deployment(name)))
+use crate::catalog::{Deployment, catalog};
+
+pub fn deployment(name: &str) -> Result<Deployment> {
+    catalog()
+        .parse(name)
+        .ok_or_else(|| anyhow!("{}", no_such_deployment(name)))
 }
 
 /// The trace each rank of the deployment `name` runs.
@@ -25,7 +29,8 @@ pub fn trace(name: &str, platform: Platform) -> Result<Trace> {
 fn no_such_deployment(name: &str) -> String {
     format!(
         "{name:?} names no deployment of a model this build ships; it lists:\n  {}",
-        models::deployments()
+        catalog()
+            .deployments()
             .map(|deployment| deployment.name.as_str())
             .collect::<Vec<_>>()
             .join("\n  ")
@@ -43,18 +48,17 @@ pub struct Overrides {
     /// refused rather than re-quantized.
     pub precision: Option<Vec<poem_ir::Dtype>>,
     pub kv: Option<poem_ir::Dtype>,
-    pub off: Vec<models::catalog::Part>,
+    pub off: Vec<String>,
     /// `Some(None)` serves without the checkpoint's drafter.
-    pub drafter: Option<Option<models::catalog::Drafter>>,
+    pub drafter: Option<Option<String>>,
     pub tp: Option<u32>,
 }
 
 /// The deployment `base` becomes under `overrides`, checked on `platform`.
 pub fn compose(base: &str, overrides: &Overrides, platform: Platform) -> Result<String> {
     let base = deployment(base)?;
-    let deploy = composed(&base.name, models::star::deploy(&base.deploy), overrides)?;
-    let deploy = models::star::catalog(&deploy).map_err(|why| anyhow!("{why}"))?;
-    let composed = models::Deployment::of(base.entry, deploy);
+    let deploy = composed(&base.name, base.deploy.clone(), overrides)?;
+    let composed = Deployment::of(base.package.clone(), &base.model, deploy);
     composed
         .check(platform)
         .map_err(|why| anyhow!("`{}` does not serve on {platform:?}: {why}", composed.name))?;
@@ -80,7 +84,6 @@ fn composed(
         deploy.kv = kv;
     }
     for part in &overrides.off {
-        let part = part.word();
         if !deploy.parts.iter().any(|have| have == part) {
             return Err(anyhow!(
                 "the config leaves {part} off and `{base}` carries none"
@@ -88,15 +91,14 @@ fn composed(
         }
         deploy.parts.retain(|have| have != part);
     }
-    match overrides.drafter {
+    match &overrides.drafter {
         None => {}
         Some(None) => deploy.drafter = None,
-        Some(Some(drafter)) if deploy.drafter.as_deref() == Some(drafter.word()) => {}
+        Some(Some(drafter)) if deploy.drafter.as_deref() == Some(drafter.as_str()) => {}
         Some(Some(drafter)) => {
             return Err(anyhow!(
-                "the config drafts with {} and `{base}` carries {}; import the checkpoint \
-                 with that drafter to serve it",
-                drafter.word(),
+                "the config drafts with {drafter} and `{base}` carries {}; import the \
+                 checkpoint with that drafter to serve it",
                 deploy.drafter.as_deref().unwrap_or("no drafter")
             ));
         }
@@ -107,37 +109,46 @@ fn composed(
     Ok(deploy)
 }
 
-/// The package an artifact carries, if it carries one.
-pub fn package_of(path: &Path) -> Result<Option<poem::star::Package>> {
-    if path.is_dir() {
-        return Ok(None);
+/// The package the artifact's stamp names, from the catalog: what serves it.
+pub fn carried(path: &Path) -> Result<Arc<poem::star::Package>> {
+    let stamp = stamp_of(path)?.ok_or_else(|| anyhow!("{path:?} carries no serving stamp"))?;
+    if stamp.package.is_empty() {
+        return Err(anyhow!(
+            "{path:?} names no model package; import the checkpoint again with this build"
+        ));
     }
-    let Ok(Some(manifest)) = ztensor::read::manifest_of(path) else {
-        return Ok(None);
-    };
-    let Some(ztensor::format::cbor::Value::Map(attributes)) = manifest.attributes.as_ref() else {
-        return Ok(None);
-    };
-    let texts = attributes
-        .iter()
-        .filter_map(|(key, value)| Some((key.as_text()?, value.as_text()?)));
-    poem::star::Package::from_attributes(texts)
-        .with_context(|| format!("read the package {path:?} carries"))
+    let package = catalog().package(&stamp.package).ok_or_else(|| {
+        anyhow!(
+            "{path:?} was imported with the package `{}`, which this build's catalog does not \
+             hold{}",
+            stamp.package,
+            match crate::catalog::installed() {
+                Some(models) => format!(" (it reads {models:?} and what it embeds)"),
+                None => String::new(),
+            }
+        )
+    })?;
+    Ok(Arc::clone(package))
 }
 
-/// What an artifact that carries its package serves under `overrides`: the
-/// deployment's name, its rank count and the trace each rank runs, all of it
-/// from the package, none of it from this build's catalog.
+/// What `artifact` serves under `overrides`: name, rank count and trace, all
+/// from the package its stamp names.
 pub fn packaged(
     artifact: &Path,
     overrides: &Overrides,
     platform: Platform,
-) -> Result<Option<(String, u32, Trace)>> {
-    let Some(package) = package_of(artifact)? else {
-        return Ok(None);
-    };
+) -> Result<(String, u32, Trace)> {
+    let package = carried(artifact)?;
     let stamp =
         stamp_of(artifact)?.ok_or_else(|| anyhow!("{artifact:?} carries no serving stamp"))?;
+    if package.digest() != stamp.package_digest {
+        tracing::warn!(
+            ?artifact,
+            package = stamp.package,
+            "the package differs from the one the artifact was imported with; it serves if its \
+             layout is the same, and `pie model import` writes the artifact again if not"
+        );
+    }
     let (model, base) = package.manifest().parse(&stamp.deployment).ok_or_else(|| {
         anyhow!(
             "{artifact:?} was imported as `{}`, which its package `{}` names no deployment of",
@@ -153,28 +164,19 @@ pub fn packaged(
         .map_err(|why| anyhow!("`{name}` does not serve on {platform:?}: {why:#}"))?;
     let trace = poem_compiler::shard::shard(trace, deploy.tp)
         .map_err(|why| anyhow!("`{name}` does not split across {} ranks: {why}", deploy.tp))?;
-    Ok(Some((name, deploy.tp, trace)))
+    Ok((name, deploy.tp, trace))
 }
 
-/// How the deployment `name` stamped on the artifact at `artifact` is
-/// served: as this build's catalog, or else the package it carries, spells it.
+/// How the deployment `name` of `artifact` is served, by name through the
+/// catalog or else through the artifact's package: what a config picks by.
 #[must_use]
-pub fn deploy_of(artifact: &Path, name: &str) -> Option<models::catalog::Deploy> {
-    if let Some(deployment) = models::Deployment::parse(name) {
+pub fn deploy_of(artifact: &Path, name: &str) -> Option<poem::star::Deploy> {
+    if let Some(deployment) = catalog().parse(name) {
         return Some(deployment.deploy);
     }
-    let package = package_of(artifact).ok()??;
+    let package = carried(artifact).ok()?;
     let (_, deploy) = package.manifest().parse(name)?;
-    models::star::catalog(&deploy).ok()
-}
-
-/// The attributes an artifact of the deployment `name` carries its package
-/// in, if a package holds its model.
-pub fn package_attributes(name: &str) -> Result<std::collections::BTreeMap<String, String>> {
-    let deployment = deployment(name)?;
-    Ok(models::star::package_of(deployment.entry.id)
-        .map(poem::star::Package::attributes)
-        .unwrap_or_default())
+    Some(deploy)
 }
 
 pub fn open_source(checkpoint: &Path) -> Result<ztensor::Source> {
@@ -191,7 +193,7 @@ pub fn identify(checkpoint: &Path, platform: Platform) -> Result<String> {
     let target = checkpoint::plan::StorageTarget::for_backend(backend_of(platform), 0, 1);
 
     let mut misses: Vec<String> = Vec::new();
-    for (deployment, read) in models::fits(&source, platform) {
+    for (deployment, read) in catalog().fits(&source, platform) {
         let contract = match read {
             Ok(contract) => contract,
             Err(why) => {
@@ -252,21 +254,7 @@ pub fn this_box() -> Option<Platform> {
 }
 
 pub fn verify_artifact(artifact: &Path, platform: Platform) -> Result<String> {
-    let stamp =
-        stamp_of(artifact)?.ok_or_else(|| anyhow!("{artifact:?} carries no serving stamp"))?;
-    let (name, tp, trace) = match packaged(artifact, &Overrides::default(), platform)? {
-        Some(served) => served,
-        None => {
-            let deployment = deployment(&stamp.deployment).with_context(|| {
-                format!(
-                    "{artifact:?} was imported as `{}`; import it again with this build",
-                    stamp.deployment
-                )
-            })?;
-            let trace = deployment.trace(platform);
-            (deployment.name, deployment.deploy.tp, trace)
-        }
-    };
+    let (name, tp, trace) = packaged(artifact, &Overrides::default(), platform)?;
     let source = open_source(artifact)?;
     let metadata = checkpoint_metadata(artifact)?;
     let contract = poem::import::own_contract(&source, &trace.params, tp, platform)
@@ -296,7 +284,8 @@ pub fn conversion_contract(
     let target = convert_target();
     let trace = std::env::var_os("PIE_IMPORT_TRACE").is_some_and(|v| v != "0");
     let pinned = std::env::var("PIE_IMPORT_DEPLOYMENT").ok();
-    for (deployment, read) in models::fits(source, platform) {
+    for deployment in catalog().candidates() {
+        let read = deployment.contract(source, platform);
         if pinned
             .as_deref()
             .is_some_and(|name| name != deployment.name)
@@ -316,7 +305,7 @@ pub fn conversion_contract(
             }
         };
         if pinned.is_none()
-            && let Some(plane) = models::requantizes(&contract)
+            && let Some(plane) = poem_compiler::catalog::requantizes(&contract)
         {
             if trace {
                 eprintln!(
@@ -381,29 +370,16 @@ pub fn contract_for(
 ) -> std::result::Result<ModelContract, String> {
     let said = |error: &dyn std::fmt::Display| format!("{error:#}");
     let source = open_source(checkpoint).map_err(|e| said(&e))?;
-    let catalog = || {
-        models::Deployment::parse(&trace.name).ok_or_else(|| {
-            format!(
-                "{:?} names no deployment of a model this build ships, so a checkpoint's \
-                 tensors cannot be mapped onto its params",
-                trace.name
-            )
-        })
-    };
     if stamp_of(checkpoint).map_err(|e| said(&e))?.is_some() {
-        let tp = match package_of(checkpoint).map_err(|e| said(&e))? {
-            Some(package) => {
-                let (_, deploy) = package.manifest().parse(&trace.name).ok_or_else(|| {
-                    format!(
-                        "{:?} names no deployment of the package `{}` {checkpoint:?} carries",
-                        trace.name,
-                        package.name()
-                    )
-                })?;
-                deploy.tp
-            }
-            None => catalog()?.deploy.tp,
-        };
+        let package = carried(checkpoint).map_err(|e| said(&e))?;
+        let (_, deploy) = package.manifest().parse(&trace.name).ok_or_else(|| {
+            format!(
+                "{:?} names no deployment of the package `{}` {checkpoint:?} carries",
+                trace.name,
+                package.name()
+            )
+        })?;
+        let tp = deploy.tp;
         return poem::import::own_contract(&source, &trace.params, tp, trace.platform).map_err(
             |error| {
                 format!(
@@ -413,7 +389,13 @@ pub fn contract_for(
             },
         );
     }
-    let deployment = catalog()?;
+    let deployment = catalog().parse(&trace.name).ok_or_else(|| {
+        format!(
+            "{:?} names no deployment of a model this build ships, so a checkpoint's tensors \
+             cannot be mapped onto its params",
+            trace.name
+        )
+    })?;
     if deployment.deploy.tp > 1 {
         return Err(format!(
             "{:?} is a {}-rank deployment and {checkpoint:?} is an unconverted checkpoint: the \
@@ -443,17 +425,15 @@ pub fn request(
     ordinal: i32,
     frames_in_flight: u8,
 ) -> Result<LoadRequest> {
-    let trace = match packaged(checkpoint, overrides, platform)? {
-        Some((name, _, trace)) => {
-            tracing::info!(deployment = name, ?checkpoint, "serving its package");
-            trace
-        }
-        None => {
-            let base = identify(checkpoint, platform)?;
-            let name = compose(&base, overrides, platform)?;
-            tracing::info!(deployment = name, identified = base, ?checkpoint, "serving");
-            self::trace(&name, platform)?
-        }
+    let trace = if stamp_of(checkpoint)?.is_some() {
+        let (name, _, trace) = packaged(checkpoint, overrides, platform)?;
+        tracing::info!(deployment = name, ?checkpoint, "serving its package");
+        trace
+    } else {
+        let base = identify(checkpoint, platform)?;
+        let name = compose(&base, overrides, platform)?;
+        tracing::info!(deployment = name, identified = base, ?checkpoint, "serving");
+        self::trace(&name, platform)?
     };
     Ok(LoadRequest {
         trace,
@@ -477,10 +457,10 @@ pub fn sequence(trace: &Trace) -> Option<Vec<String>> {
     let mut pairings = engine_cuda::experts::Attachments::new();
     for (codes, param) in trace.params.iter().enumerate() {
         let mut companions = Vec::new();
-        if let Some(&scales) = at.get(models::scales_name(&param.name).as_str()) {
+        if let Some(&scales) = at.get(poem::scales_name(&param.name).as_str()) {
             companions.push(scales);
         }
-        if let Some(&biases) = at.get(models::biases_name(&param.name).as_str()) {
+        if let Some(&biases) = at.get(poem::biases_name(&param.name).as_str()) {
             companions.push(biases);
         }
         if !companions.is_empty() {
@@ -543,7 +523,8 @@ mod tests {
             why.contains("gemma4-vision"),
             "the refusal names what was asked for: {why}"
         );
-        let ships = models::deployments()
+        let ships = catalog()
+            .deployments()
             .next()
             .expect("a catalog of at least one row");
         assert!(
@@ -559,7 +540,7 @@ mod tests {
         let source = ztensor::Source::open(&path).expect("open the checkpoint");
         let metadata = checkpoint_metadata(&path).expect("read the checkpoint");
 
-        let row = models::deployments().next().expect("a one-rank row");
+        let row = catalog().deployments().next().expect("a one-rank row");
         let why = conversion_contract_named(&source, &metadata, Platform::Cuda, &row.name)
             .expect_err("no row reads a checkpoint of one stranger")
             .to_string();
@@ -589,7 +570,7 @@ mod tests {
             "glm53-flash-u8g64-u2g64-kv-bf16",
         ] {
             assert!(
-                models::deployment(name).is_some(),
+                catalog().deployment(name).is_some(),
                 "`{name}` is the row this override exists to reach, and the \
                  catalog no longer ships it under that name"
             );

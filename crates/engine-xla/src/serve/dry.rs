@@ -105,8 +105,7 @@ struct OwnedMedia {
     patches: Vec<u8>,
     routes: Vec<i32>,
     positions: Vec<i32>,
-    embed_rows: Vec<i32>,
-    embed_weights: Vec<f32>,
+    grids: Vec<i32>,
 }
 
 impl Shell {
@@ -243,8 +242,7 @@ impl Shell {
                 patches: &m.patches,
                 routes: &m.routes,
                 positions: &m.positions,
-                embed_rows: &m.embed_rows,
-                embed_weights: &m.embed_weights,
+                grids: &m.grids,
                 token_positions: &[],
             });
             seated_lanes.push(seated);
@@ -397,21 +395,12 @@ impl Shell {
         for (j, route) in routes.iter_mut().take(live).enumerate() {
             *route = (j % rows.max(1) as usize) as i32;
         }
-        let taps = seat.embed_taps as usize;
-        let weight_taps = if seat.embed_weights { taps } else { 0 };
-        let mut embed_weights = vec![0f32; n * weight_taps];
-        for row in embed_weights.chunks_mut(weight_taps.max(1)) {
-            if let Some(first) = row.first_mut() {
-                *first = 1.0;
-            }
-        }
         Some(OwnedMedia {
             rows: vec![patches],
             patches: vec![0u8; n * seat.row_bytes as usize],
             routes,
             positions: vec![0i32; n * 3],
-            embed_rows: vec![0i32; n * taps],
-            embed_weights,
+            grids: vec![1, 1, patches as i32],
         })
     }
 }

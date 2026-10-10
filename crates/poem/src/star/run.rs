@@ -17,6 +17,50 @@ use crate::star::forward::{SpecHandle, TRAIL, Trail, ValueHandle, held, hold_inp
 use crate::star::package::Package;
 use crate::star::values::DtypeValue;
 
+/// How a deployment reads a still: cut into `patch` × `patch` patches in
+/// `block` × `block` blocks, its tokens placed by mrope or in sequence,
+/// spelled between `prefix` and `suffix` as `placeholder` tokens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageSpec {
+    pub patch: u32,
+    pub block: u32,
+    pub mrope: bool,
+    pub prefix: String,
+    pub placeholder: String,
+    pub suffix: String,
+}
+
+impl ImageSpec {
+    fn of<'v>(image: Star<'v>, heap: Heap<'v>) -> anyhow::Result<ImageSpec> {
+        let field = |name: &str| -> anyhow::Result<Star<'v>> {
+            image
+                .get_attr(name, heap)
+                .map_err(error)?
+                .ok_or_else(|| anyhow::anyhow!("the image front end states no `{name}`"))
+        };
+        let text = |name: &str| -> anyhow::Result<String> {
+            field(name)?
+                .unpack_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("`{name}` is a string"))
+        };
+        let int = |name: &str| -> anyhow::Result<u32> {
+            field(name)?
+                .unpack_i32()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| anyhow::anyhow!("`{name}` is a count"))
+        };
+        Ok(ImageSpec {
+            patch: int("patch")?,
+            block: int("block")?,
+            mrope: field("mrope")?.to_bool(),
+            prefix: text("prefix")?,
+            placeholder: text("placeholder")?,
+            suffix: text("suffix")?,
+        })
+    }
+}
+
 /// A deployment as a package's layout reads it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Deploy {
@@ -116,6 +160,70 @@ impl Package {
                 return Ok(None);
             }
             of(stated).map(Some)
+        })
+    }
+
+    /// How `id`'s deployment `deploy` reads a still, if its `model.poem`
+    /// states a `media(id, deploy)` with an `image`.
+    pub fn image(&self, id: &str, deploy: &Deploy) -> anyhow::Result<Option<ImageSpec>> {
+        self.with_image(id, deploy, |_, heap, image| ImageSpec::of(image, heap))
+    }
+
+    /// The size a `h` × `w` still is framed to before `id`'s deployment
+    /// `deploy` reads it, under `budget` (`still` or `video`).
+    pub fn frame(
+        &self,
+        id: &str,
+        deploy: &Deploy,
+        h: u32,
+        w: u32,
+        budget: &str,
+    ) -> anyhow::Result<(u32, u32)> {
+        self.with_image(id, deploy, |eval, heap, image| {
+            let frame = image
+                .get_attr("frame", heap)
+                .map_err(error)?
+                .ok_or_else(|| anyhow::anyhow!("the image front end states no `frame`"))?;
+            let framed = eval
+                .eval_function(
+                    frame,
+                    &[heap.alloc(h), heap.alloc(w), heap.alloc(budget)],
+                    &[],
+                )
+                .map_err(error)?;
+            let (fh, fw): (u32, u32) = starlark::values::UnpackValue::unpack_value_err(framed)
+                .map_err(|e| anyhow::anyhow!("`frame` returns a `(height, width)` pair: {e}"))?;
+            Ok((fh, fw))
+        })?
+        .ok_or_else(|| anyhow::anyhow!("`{id}` reads no stills"))
+    }
+
+    fn with_image<T>(
+        &self,
+        id: &str,
+        deploy: &Deploy,
+        f: impl for<'v> FnOnce(&mut Evaluator<'v, '_, '_>, Heap<'v>, Star<'v>) -> anyhow::Result<T>,
+    ) -> anyhow::Result<Option<T>> {
+        let Ok(media) = self.module("model.poem")?.get("media") else {
+            return Ok(None);
+        };
+        Module::with_temp_heap(|module| {
+            let mut eval = Evaluator::new(&module);
+            let heap = module.heap();
+            let media = heap.access_owned_frozen_value(&media);
+            let stated = eval
+                .eval_function(media, &[heap.alloc(id), deploy.alloc(heap)], &[])
+                .map_err(error)?;
+            if stated.is_none() {
+                return Ok(None);
+            }
+            let Some(image) = stated.get_attr("image", heap).map_err(error)? else {
+                return Ok(None);
+            };
+            if image.is_none() {
+                return Ok(None);
+            }
+            f(&mut eval, heap, image).map(Some)
         })
     }
 

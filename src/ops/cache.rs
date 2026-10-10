@@ -227,6 +227,10 @@ mod tests {
         let chosen = selected(&[]).unwrap();
         assert!(!chosen.is_empty());
         assert!(chosen.iter().all(|e| e.reclaim == Reclaim::Safe));
-        assert!(chosen.iter().all(|e| e.name != "models"));
+        assert!(
+            chosen
+                .iter()
+                .all(|e| e.name != "artifacts" && e.name != "models")
+        );
     }
 }

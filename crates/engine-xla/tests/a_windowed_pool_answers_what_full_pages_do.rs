@@ -84,7 +84,7 @@ fn answer(m: &common::Model, prompt: &[u32], full_windows: bool) -> Answer {
         }
     }
     let deployment = m.deployment;
-    let facts = deployment.trace(models::Platform::Xla).facts;
+    let facts = deployment.trace(poem::Platform::Xla).facts;
     let word = |rows: u32| facts.word(&Request::new(rows, false));
     let mut shell = Shell::load(Boot {
         trace: deployment.trace(Platform::Xla),

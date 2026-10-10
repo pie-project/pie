@@ -1,8 +1,8 @@
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 use anyhow::Result;
+use chat_template::{ToolDecoder, ToolEvent};
 use grammar::matcher::GrammarMatcher;
-use models::template::{ToolDecoder, ToolEvent};
 use std::collections::VecDeque;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;

@@ -2720,6 +2720,42 @@ pub(crate) static OPS: &[Op] = &[
         },
     },
     Op {
+        module: "layout",
+        name: "pixels",
+        params: &["x", "mean", "std", "order", "temporal"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            let mean: [f32; 3] = a.next()?;
+            let std: [f32; 3] = a.next()?;
+            let order: PixelOrder = a.next()?;
+            let temporal: u32 = a.next()?;
+            result(
+                heap,
+                dsl("layout.pixels", || {
+                    ops::layout::pixels(&x, mean, std, order, temporal)
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "layout",
+        name: "grid_taps",
+        params: &["positions", "grids", "segments", "kind", "side"],
+        call: |a, heap| {
+            let positions: Value = a.next()?;
+            let grids: Value = a.next()?;
+            let segments: Value = a.next()?;
+            let kind: TapKind = a.next()?;
+            let side: u32 = a.next()?;
+            result(
+                heap,
+                dsl("layout.grid_taps", || {
+                    ops::layout::grid_taps(&positions, &grids, &segments, kind, side)
+                })?,
+            )
+        },
+    },
+    Op {
         module: "linear",
         name: "matmul",
         params: &["act", "w"],
@@ -3586,12 +3622,21 @@ pub(crate) static INPUTS: &[Op] = &[
     },
     Op {
         module: "inputs",
-        name: "patches",
+        name: "pixels",
         params: &["inputs", "width"],
         call: |a, heap| {
             let inputs: Input = a.next()?;
             let width: u64 = a.next()?;
-            result(heap, dsl("inputs.patches", || inputs.patches(width))?)
+            result(heap, dsl("inputs.pixels", || inputs.pixels(width))?)
+        },
+    },
+    Op {
+        module: "inputs",
+        name: "image_grids",
+        params: &["inputs"],
+        call: |a, heap| {
+            let inputs: Input = a.next()?;
+            result(heap, dsl("inputs.image_grids", || inputs.image_grids())?)
         },
     },
     Op {
@@ -3624,34 +3669,6 @@ pub(crate) static INPUTS: &[Op] = &[
             result(
                 heap,
                 dsl("inputs.patch_positions", || inputs.patch_positions())?,
-            )
-        },
-    },
-    Op {
-        module: "inputs",
-        name: "patch_embed_rows",
-        params: &["inputs", "taps"],
-        call: |a, heap| {
-            let inputs: Input = a.next()?;
-            let taps: u32 = a.next()?;
-            result(
-                heap,
-                dsl("inputs.patch_embed_rows", || inputs.patch_embed_rows(taps))?,
-            )
-        },
-    },
-    Op {
-        module: "inputs",
-        name: "patch_embed_weights",
-        params: &["inputs", "taps"],
-        call: |a, heap| {
-            let inputs: Input = a.next()?;
-            let taps: u32 = a.next()?;
-            result(
-                heap,
-                dsl("inputs.patch_embed_weights", || {
-                    inputs.patch_embed_weights(taps)
-                })?,
             )
         },
     },

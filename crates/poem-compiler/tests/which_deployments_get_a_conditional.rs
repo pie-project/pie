@@ -49,7 +49,7 @@ fn admits(trace: &Trace, compiled: &CompiledModel, at: usize, profile: &DevicePr
 fn every_conditional_region_clears_every_gate_and_every_other_one_does_not() {
     let mut wrong: Vec<String> = Vec::new();
 
-    for row in models::deployments().chain(models::splits()) {
+    for row in poem_compiler::catalog::deployments().chain(poem_compiler::catalog::splits()) {
         let deployment = row.name.as_str();
         for platform in PLATFORMS {
             let trace = row.trace(platform);

@@ -1,5 +1,6 @@
-use models::{
-    AxisRole, Generative, PortFact, PortKind, PositionConvention, ReadingFact, ReadoutKind, Stream,
+use poem::Stream;
+use poem::generative::{
+    AxisRole, Generative, PortFact, PortKind, PositionConvention, ReadingFact, ReadoutKind,
 };
 use runtime::model::{validate_generative, velocity_facts};
 

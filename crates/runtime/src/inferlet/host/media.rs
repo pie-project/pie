@@ -1,12 +1,9 @@
 pub mod decode;
-pub mod multimodal;
 
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 use anyhow::Result;
-use models::media::{
-    AudioFrontEnd, Budget, Delimiters, EncodedSpan, Fault, Grid, Rgb8, VisionFrontEnd,
-};
+use media::front::{Budget, EncodedSpan, Fault, Rgb8};
 use std::sync::Arc;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
@@ -26,77 +23,37 @@ pub struct Audio {
     pub span: Arc<EncodedSpan>,
 }
 
-struct AudioAdapter {
-    arch_name: &'static str,
-}
-
-impl AudioFrontEnd for AudioAdapter {
-    fn arch(&self) -> &'static str {
-        self.arch_name
-    }
-
-    fn delimiters(&self) -> Delimiters {
-        let (prefix, suffix) = multimodal::audio_delimiters(self.arch_name);
-        Delimiters {
-            prefix,
-            placeholder: multimodal::audio_placeholder(),
-            suffix,
-        }
-    }
-
-    fn encode_audio(&self, bytes: &[u8]) -> models::media::Result<EncodedSpan> {
-        let (mel, n_frames) = multimodal::audio::process_wav_bytes(bytes).map_err(Fault::Decode)?;
-        if n_frames == 0 {
-            return Err(Fault::Empty("audio: clip decoded to zero frames".into()));
-        }
-        let n_frames = n_frames as u32;
-        let token_count = multimodal::gemma_audio_token_count(n_frames);
-        if token_count == 0 {
-            return Err(Fault::Empty(
-                "audio: clip is shorter than one soft token".into(),
-            ));
-        }
-        Ok(EncodedSpan {
-            token_count,
-            position_span: token_count,
-            grid: Grid::still(1, token_count),
-            patch_grid: Grid::still(1, n_frames),
-            uses_mrope: false,
-            payload: mel,
-            rows: n_frames,
-            positions: Vec::new(),
-            embed_rows: Vec::new(),
-            embed_weights: Vec::new(),
-            prefix: Vec::new(),
-            placeholder: 0,
-            suffix: Vec::new(),
-        })
-    }
-}
-
-fn vision_front_end() -> models::media::Result<Box<dyn VisionFrontEnd>> {
+/// A still `rgb` as this model reads it under `budget`: framed by the
+/// package, cut, and spelled.
+fn encode(rgb: &Rgb8, budget: Budget) -> Result<EncodedSpan, String> {
     let m = crate::model::model();
-    let arch = m.arch_name();
-    models::media::vision_front_end(arch).ok_or_else(|| Fault::NoVisionFrontEnd {
-        model: m.name().to_string(),
-        arch: arch.to_string(),
-    })
-}
-
-fn audio_front_end() -> models::media::Result<AudioAdapter> {
-    let m = crate::model::model();
-    let arch = m.arch_name();
-    if multimodal::audio_arch_supported(arch) {
-        Ok(AudioAdapter { arch_name: arch })
-    } else {
-        Err(Fault::NoAudioFrontEnd {
+    let Some(spec) = m.image() else {
+        return Err(Fault::NoVisionFrontEnd {
             model: m.name().to_string(),
-            arch: arch.to_string(),
-        })
-    }
+        }
+        .to_string());
+    };
+    let framed = m
+        .frame(rgb.h, rgb.w, budget.word())
+        .map_err(|why| Fault::Frame(format!("{why:#}")).to_string())?;
+    let image = media::front::Image {
+        patch: spec.patch,
+        block: spec.block,
+        mrope: spec.mrope,
+    };
+    let mut span = image
+        .encode(rgb, framed, decode::resize_exact)
+        .map_err(|fault| fault.to_string())?;
+    spell(&mut span, &spec.prefix, &spec.placeholder, &spec.suffix)?;
+    Ok(span)
 }
 
-fn spell(span: &mut EncodedSpan, delims: Delimiters) -> Result<(), String> {
+fn spell(
+    span: &mut EncodedSpan,
+    prefix: &str,
+    placeholder: &str,
+    suffix: &str,
+) -> Result<(), String> {
     let encode = |s: &str| -> Vec<u32> {
         if s.is_empty() {
             Vec::new()
@@ -104,17 +61,16 @@ fn spell(span: &mut EncodedSpan, delims: Delimiters) -> Result<(), String> {
             crate::model::model().tokenize(s)
         }
     };
-    let pad = encode(delims.placeholder);
-    let [placeholder] = pad[..] else {
+    let pad = encode(placeholder);
+    let [id] = pad[..] else {
         return Err(format!(
             "MediaSpelling: this model's tokenizer spells the placeholder \
-             '{}' as {} tokens; a media run is one reserved id repeated, so a \
+             '{placeholder}' as {} tokens; a media run is one reserved id repeated, so a \
              span it cannot spell has no run the submission scan could match",
-            delims.placeholder,
             pad.len()
         ));
     };
-    span.spell_with(encode(delims.prefix), placeholder, encode(delims.suffix));
+    span.spell_with(encode(prefix), id, encode(suffix));
     Ok(())
 }
 
@@ -136,17 +92,9 @@ pub fn span_digest(span: &EncodedSpan) -> Vec<u8> {
         h.update(&n.to_le_bytes());
     }
     h.update(&[u8::from(span.uses_mrope)]);
-    for f in &span.payload {
-        h.update(&f.to_le_bytes());
-    }
+    h.update(&span.payload);
     for p in &span.positions {
         h.update(&p.to_le_bytes());
-    }
-    for r in &span.embed_rows {
-        h.update(&r.to_le_bytes());
-    }
-    for w in &span.embed_weights {
-        h.update(&w.to_le_bytes());
     }
     h.finalize().as_bytes().to_vec()
 }
@@ -169,21 +117,14 @@ impl pie::inferlet::media::Host for ProcessCtx {}
 
 impl pie::inferlet::media::HostImage for ProcessCtx {
     async fn from_bytes(&mut self, bytes: Vec<u8>) -> Result<Result<Resource<Image>, String>> {
-        let front_end = match vision_front_end() {
-            Ok(fe) => fe,
-            Err(fault) => return Ok(Err(fault.to_string())),
-        };
         let rgb = match decode::decode(&bytes) {
             Ok(rgb) => rgb,
             Err(fault) => return Ok(Err(fault.to_string())),
         };
-        let mut span = match front_end.encode(&rgb, Budget::Still, decode::resize_exact) {
+        let span = match encode(&rgb, Budget::Still) {
             Ok(span) => span,
-            Err(fault) => return Ok(Err(fault.to_string())),
+            Err(refusal) => return Ok(Err(refusal)),
         };
-        if let Err(refusal) = spell(&mut span, front_end.delimiters()) {
-            return Ok(Err(refusal));
-        }
         let image = Image {
             span: Arc::new(span),
         };
@@ -235,15 +176,10 @@ impl pie::inferlet::media::HostVideo for ProcessCtx {
         bytes: Vec<u8>,
         max_frames: u32,
     ) -> Result<Result<Resource<Video>, String>> {
-        let front_end = match vision_front_end() {
-            Ok(fe) => fe,
-            Err(fault) => return Ok(Err(fault.to_string())),
-        };
         let mut decoded = match media::gif::frames(&bytes) {
             Ok(f) => f,
             Err(e) => return Ok(Err(Fault::Decode(e).to_string())),
         };
-        let delims = front_end.delimiters();
         let sel = sample_indices(decoded.len(), max_frames as usize);
         let mut frames = Vec::with_capacity(sel.len());
         let mut timestamps = Vec::with_capacity(sel.len());
@@ -254,14 +190,10 @@ impl pie::inferlet::media::HostVideo for ProcessCtx {
                 Ok(frame) => frame,
                 Err(fault) => return Ok(Err(fault.to_string())),
             };
-            let mut span = match front_end.encode(&frame, Budget::VideoFrame, decode::resize_exact)
-            {
+            let span = match encode(&frame, Budget::VideoFrame) {
                 Ok(span) => span,
-                Err(fault) => return Ok(Err(fault.to_string())),
+                Err(refusal) => return Ok(Err(refusal)),
             };
-            if let Err(refusal) = spell(&mut span, delims) {
-                return Ok(Err(refusal));
-            }
             frames.push(Image {
                 span: Arc::new(span),
             });
@@ -313,23 +245,11 @@ impl pie::inferlet::media::HostVideo for ProcessCtx {
 }
 
 impl pie::inferlet::media::HostAudio for ProcessCtx {
-    async fn from_bytes(&mut self, bytes: Vec<u8>) -> Result<Result<Resource<Audio>, String>> {
-        let adapter = match audio_front_end() {
-            Ok(fe) => fe,
-            Err(fault) => return Ok(Err(fault.to_string())),
-        };
-        let front_end: &dyn AudioFrontEnd = &adapter;
-        let mut span = match front_end.encode_audio(&bytes) {
-            Ok(span) => span,
-            Err(fault) => return Ok(Err(fault.to_string())),
-        };
-        if let Err(refusal) = spell(&mut span, front_end.delimiters()) {
-            return Ok(Err(refusal));
+    async fn from_bytes(&mut self, _bytes: Vec<u8>) -> Result<Result<Resource<Audio>, String>> {
+        Ok(Err(Fault::NoAudioFrontEnd {
+            model: crate::model::model().name().to_string(),
         }
-        let audio = Audio {
-            span: Arc::new(span),
-        };
-        Ok(Ok(self.ctx().table.push(audio)?))
+        .to_string()))
     }
 
     async fn tokens(&mut self, this: Resource<Audio>) -> Result<Vec<u32>> {

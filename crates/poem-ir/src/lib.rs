@@ -16,8 +16,8 @@ pub use guard::Guard;
 pub use operands::Operands;
 pub use ops::{
     Attention, Collective, Elementwise, Fused, GateActivation, GridRule, Layout, Linear,
-    ModulateForm, MropeForm, NormKind, Operation, RaggedMask, RopeForm, Spatial, TimePad,
-    VoxelSegment,
+    ModulateForm, MropeForm, NormKind, Operation, PixelOrder, RaggedMask, RopeForm, Spatial,
+    TapKind, TimePad, VoxelSegment,
 };
 pub use request::{Request, Stream};
 pub use trace::{

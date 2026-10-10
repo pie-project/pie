@@ -641,11 +641,6 @@ impl Shell {
                     row_bytes: width * element,
                     images: u64::from(ladder.max_images),
                     dtype: *dtype,
-                    embed_taps: declared_width(&boot.trace, poem_ir::RuntimeInput::PatchEmbedRows),
-                    embed_weights: declared_width(
-                        &boot.trace,
-                        poem_ir::RuntimeInput::PatchEmbedWeights,
-                    ) > 0,
                 })
             })
         });

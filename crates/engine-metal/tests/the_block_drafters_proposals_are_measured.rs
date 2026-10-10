@@ -26,7 +26,7 @@ const PROMPTS: &[(&str, &[u32])] = &[
 
 /// The facts the deployment `deployment` classifies its lanes by.
 fn facts_of(deployment: &str) -> poem_ir::Facts {
-    models::deployment(deployment)
+    poem_compiler::catalog::deployment(deployment)
         .expect("the catalog ships the row")
         .trace(Platform::Metal)
         .facts
@@ -37,7 +37,7 @@ fn artifact() -> Option<PathBuf> {
         let path = PathBuf::from(named.replace('~', &std::env::var("HOME").unwrap_or_default()));
         return path.is_file().then_some(path);
     }
-    let store = PathBuf::from(std::env::var("HOME").ok()?).join(".pie/models");
+    let store = PathBuf::from(std::env::var("HOME").ok()?).join(".pie/artifacts");
     for entry in std::fs::read_dir(store).ok()?.flatten() {
         for file in std::fs::read_dir(entry.path()).ok()?.flatten() {
             let name = file.file_name().to_string_lossy().into_owned();
@@ -66,11 +66,13 @@ fn the_target_keeps_a_measured_prefix_of_every_block() {
         return;
     }
     let Some(artifact) = artifact() else {
-        eprintln!("not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/models)");
+        eprintln!(
+            "not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/artifacts)"
+        );
         return;
     };
-    let deployment =
-        models::deployment(DEPLOYMENT).expect("the catalog ships the block-drafter row");
+    let deployment = poem_compiler::catalog::deployment(DEPLOYMENT)
+        .expect("the catalog ships the block-drafter row");
     let trace = deployment.trace(Platform::Metal);
     let drafter = trace.drafter.expect("the row states its block drafter");
     let source = ztensor_compat::index(&artifact).expect("the artifact opens");

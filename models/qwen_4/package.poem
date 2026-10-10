@@ -4,8 +4,13 @@
 # miniature; and a micro model of toy widths for engine tests, which lists no
 # deployment.
 
+load("//lib/spoken.poem", "QWEN_STOP", "QWEN_VISION", "QWEN_AUDIO")
+
+CHATML_INTERLEAVED = template("chatml", thinking = True, preserve_thinking = True, tools = True, stop = QWEN_STOP)
+TOKENIZER_38 = tokenizer(markers = [QWEN_STOP], pinned = QWEN_AUDIO, parts = {"vision": [QWEN_VISION]})
+
 def flash(id, **kwargs):
-    return model(id, template = "qwen_3_chatml_interleaved", tokenizer = "qwen_3.38", **kwargs)
+    return model(id, template = CHATML_INTERLEAVED, tokenizer = TOKENIZER_38, **kwargs)
 
 MODELS = [
     flash("qwen38-flash-next", parts = ["vision"], drafters = ["mtp"], arch = "qwen4_exp", layers = 48, vocab = 248320),

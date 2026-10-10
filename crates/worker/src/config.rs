@@ -465,7 +465,7 @@ pub struct ModelConfig {
     pub engine: EngineConfig,
     /// Where this model's materialized-weight artifacts are kept between runs.
     /// Empty derives `$PIE_HOME/cache/weights` (distinct from the `.zt`
-    /// artifact store at `$PIE_HOME/models`).
+    /// artifact store at `$PIE_HOME/artifacts`).
     /// Where this deployment's shared adapters live, or empty to mount none.
     /// A read-only directory with one subdirectory per adapter, each holding
     /// an `adapter.toml` and the plane files it names.
@@ -678,10 +678,12 @@ impl ModelConfig {
     ///
     /// # Errors
     ///
-    /// A precision, kv dtype, part or drafter word this build does not know.
+    /// A precision or kv dtype word this build does not know; a part or
+    /// drafter word is checked against the model when the deployment is
+    /// composed.
     pub fn overrides(&self) -> Result<runtime::engine::load::Overrides> {
         let dtype = |word: &str, field: &str| {
-            models::dtype_of(word.trim())
+            poem::star::dtype_of(word.trim())
                 .ok_or_else(|| anyhow::anyhow!("model.{field} = {word:?} names no dtype"))
         };
         let precision = self
@@ -693,17 +695,12 @@ impl ModelConfig {
         let off = self
             .off
             .iter()
-            .map(|word| {
-                models::catalog::Part::of(word.trim())
-                    .ok_or_else(|| anyhow::anyhow!("model.off names {word:?}, no part a model has"))
-            })
-            .collect::<Result<_>>()?;
+            .map(|word| word.trim().to_string())
+            .collect();
         let drafter = match self.drafter.as_deref().map(str::trim) {
             None => None,
             Some("none") => Some(None),
-            Some(word) => Some(Some(models::catalog::Drafter::of(word).ok_or_else(
-                || anyhow::anyhow!("model.drafter = {word:?} names no drafter"),
-            )?)),
+            Some(word) => Some(Some(word.to_string())),
         };
         Ok(runtime::engine::load::Overrides {
             precision,

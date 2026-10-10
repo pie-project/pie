@@ -54,7 +54,7 @@ telemetry = false
 const DEFAULT_MODEL_BLOCK: &str = r#"[model]
 name = "default"
 model = "Qwen/Qwen3.5-0.8B"
-# weight_cache_dir = ""       # empty derives $PIE_HOME/models
+# weight_cache_dir = ""       # empty derives $PIE_HOME/cache/weights
 # weight_dtype     = "bfloat16"  # what the CHECKPOINT holds. activation_dtype
                                  # is what the engine computes in, so that is
                                  # an engine key and this is a model one.

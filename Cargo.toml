@@ -37,7 +37,6 @@ members = [
     "crates/poem-ir",
     "crates/poem",
     "crates/poem-compiler",
-    "crates/models",
     "crates/chat-template",
     "crates/media",
     "crates/kernels-cuda",
@@ -77,7 +76,6 @@ default-members = [
     "crates/engine",
     "crates/poem-exec",
     "crates/eta-exec",
-    "crates/models",
     "crates/poem-ir",
     "crates/poem",
     "crates/poem-compiler",
@@ -154,7 +152,7 @@ tar = "0.4"
 flate2 = "1"
 worker = { path = "crates/worker", default-features = false, features = ["standalone"] }
 runtime = { path = "crates/runtime" }
-models = { path = "crates/models" }
+poem = { package = "pie-poem", path = "crates/poem" }
 checkpoint = { path = "crates/checkpoint" }
 ztensor = { workspace = true }
 tokenizer = { path = "crates/tokenizer" }

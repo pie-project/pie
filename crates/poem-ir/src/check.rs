@@ -823,6 +823,14 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Layout::Argmax { .. } => &[],
             Layout::TopK { .. } => &[(Out(0), F32), (Out(1), I32)],
             Layout::PackRows { .. } | Layout::UnpackRows { .. } => &[(In(1), I32)],
+            Layout::Pixels { .. } => &[(In(0), U8)],
+            Layout::GridTaps { .. } => &[
+                (In(0), I32),
+                (In(1), I32),
+                (In(2), I32),
+                (Out(0), I32),
+                (Out(1), F32),
+            ],
         },
         Operation::Fused(op) => match op {
             Fused::NormModulate {

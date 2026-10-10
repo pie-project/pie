@@ -1,7 +1,7 @@
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 use anyhow::Result;
-use models::template::{ChatDecoder, ChatEvent};
+use chat_template::{ChatDecoder, ChatEvent};
 use std::collections::VecDeque;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;

@@ -242,12 +242,13 @@ def clipped(x, c):
 
 def tower(inputs, t):
     d = t.head_dim
-    x = inputs.patches(t.patch_width)
+    x = ops.layout.pixels(inputs.pixels(3 * t.patch * t.patch), [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], "hwc", 1)
     segments = inputs.patch_segments()
     grid = inputs.patch_positions()
 
     y = ops.linear.matmul(x, t.patch_embed)
-    pos = ops.layout.embed_weighted(inputs.patch_embed_rows(2), inputs.patch_embed_weights(2), t.pos_embed, t.positions)
+    ids, weights = ops.layout.grid_taps(grid, inputs.image_grids(), segments, "axes", t.grid_side)
+    pos = ops.layout.embed_weighted(ids, weights, t.pos_embed, t.positions)
     y = ops.elemwise.residual_add(pos, y)
 
     for b in t.blocks:

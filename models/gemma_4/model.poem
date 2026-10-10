@@ -3,6 +3,7 @@
 # shared tail, per-layer embeddings (E4B), routed experts beside the dense
 # MLP (26B-A4B), a vision tower, and the drafters each pairs with.
 
+load("//lib/media.poem", "budget_resize")
 load("//lib/adapters/model.poem", "banks")
 load("//lib/dflash/model.poem", dflash_head = "head", dflash_declare = "declare")
 
@@ -47,10 +48,29 @@ TRUNKS = {
     "diffusiongemma-26b-a4b": A4B,
 }
 
+PATCH = 16
+
+POOL = 3
+
+SOFT_TOKENS = 280
+
+VIDEO_SOFT_TOKENS = 70
+
 def vision_tower(depth, hidden, heads, inter, clipped, standardize):
     return struct(depth = depth, hidden = hidden, heads = heads, inter = inter, clipped = clipped,
-                  standardize = standardize, patch_width = 3 * 16 * 16, pool = 3, positions = 10240,
-                  theta = 100.0, norm_eps = 1e-6, sm_scale = 1.0)
+                  standardize = standardize, patch = PATCH, patch_width = 3 * PATCH * PATCH, pool = POOL,
+                  positions = 10240, theta = 100.0, norm_eps = 1e-6, sm_scale = 1.0)
+
+def media(id, deploy):
+    """How a still is spoken: framed within the soft-token budget, cut into
+    `PATCH` patches in `POOL` blocks, its tokens placed in sequence."""
+    if "vision" not in deploy.parts:
+        return None
+    return struct(image = struct(
+        patch = PATCH, block = POOL, mrope = False,
+        prefix = "<|image>", placeholder = "<|image|>", suffix = "<image|>",
+        frame = lambda h, w, budget: budget_resize(h, w, PATCH, POOL, SOFT_TOKENS if budget == "still" else VIDEO_SOFT_TOKENS),
+    ))
 
 WIDE_TOWER = vision_tower(depth = 27, hidden = 1152, heads = 16, inter = 4304, clipped = False, standardize = True)
 
@@ -219,7 +239,9 @@ def layout(id, deploy):
             heads = t.heads,
             head_dim = head_dim,
             pool = t.pool,
+            patch = t.patch,
             patch_width = t.patch_width,
+            grid_side = t.positions,
             positions = 2 * t.positions,
             theta = t.theta,
             norm_eps = t.norm_eps,

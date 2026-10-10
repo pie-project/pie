@@ -21,5 +21,4 @@ poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 
 [dev-dependencies]
-models = { path = "../models" }
 poem = { package = "pie-poem", path = "../poem" }

@@ -1,7 +1,7 @@
 //! Qwen3.5-0.8B's text trunk on the device against Hugging Face's f32
 //! forward of the same prompt. Asked for with `PIE_XLA_ARTIFACT` naming a
 //! Qwen3.5-0.8B bf16 artifact, text or vision (e.g.
-//! `~/.pie/models/Qwen--Qwen3.5-0.8B/*d0-8b-{bf16,vision-bf16}-kv-bf16.xla.zt`).
+//! `~/.pie/artifacts/Qwen--Qwen3.5-0.8B/*d0-8b-{bf16,vision-bf16}-kv-bf16.xla.zt`).
 //!
 //! transformers in bf16 lands within 0.22 of its own f32 logits on the ids
 //! below (0.38 over the whole vocab, correlation 0.9996); the device lands
@@ -101,7 +101,7 @@ fn the_first_logits_track_upstream() {
         return;
     }
     let trace = m.deployment.trace(Platform::Xla);
-    let facts = m.deployment.trace(models::Platform::Xla).facts;
+    let facts = m.deployment.trace(poem::Platform::Xla).facts;
     let word = |len: u32| facts.word(&Request::new(len, false));
 
     let wanted: Vec<String> = std::env::var("PIE_XLA_TRUNK_OPS")

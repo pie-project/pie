@@ -6,16 +6,62 @@ with only the builtins of its stage:
 
 | file           | states                                                          |
 | -------------- | --------------------------------------------------------------- |
-| `package.poem` | `MODELS` (ids, miniatures, parts, drafters, template, tokenizer) and `DEPLOYMENTS`, in the order an import tries them |
-| `model.poem`   | `layout(id, deploy)`: a deployment's dims and the weights they lay out |
+| `package.poem` | `MODELS` (ids, miniatures, parts, drafters, template, tokenizer), `DEPLOYMENTS`, in the order an import tries them, and `PUBLISHED`: the draft heads published for a checkpoint repository, the first listed being what `pie model import` drafts with unless told `--drafter none` |
+| `model.poem`   | `layout(id, deploy)`: a deployment's dims and the weights they lay out; `media(id, deploy)`, if it reads stills: `struct(image = struct(patch, block, mrope, prefix, placeholder, suffix, frame))` |
 | `forward.poem` | `caches(m, c)` and `forward(m, inputs)`: the caches it holds and the forward its rows run |
 | `formats.poem` | `formats(m)`: the checkpoint formats it is read in, and what lands where |
 
-Any other `.poem` file is a helper the stages may `load()`.
+Any other `.poem` file is a helper the stages may `load()`; `lib/` holds
+the helpers every package may load, as `//lib/…`.
 
 A deployment is named `{id}[-{part}…][-{drafter}]-{weights…}-kv-{kv}[-tp{n}]`.
 
-`pie model import` writes the package into the artifact it produces (under
-the `pie.package/` attributes, with the builtins version it was written
-against), and serving traces the artifact's own package: an artifact keeps
-meaning what it meant when it was imported, whatever this tree holds since.
+## What a model says of its tokens
+
+A model is spoken through a template and a tokenizer, both stated as data in
+`package.poem`, so no Rust names a model:
+
+- `template(format, …)` picks a format the runtime ships (`chatml`, `harmony`,
+  `gemma`, `deepseek`, `glm`, `kimi`, `kimi3`, `inkling`, `atem`, `lines`,
+  `raw`) and sets what the format leaves open: ChatML its `thinking`,
+  `preserve_thinking`, `tools`, `generation_suffix` and `stop`; `lines` its
+  `stop`, `bos` and `eos`; `raw` its `stop`. A setting the format does not
+  read is refused.
+- `tokenizer(markers, pinned, parts)` states what the model asks of the
+  tokenizer an artifact carries: `markers`, groups of tokens the vocabulary
+  must hold; `pinned`, markers at the id they must hold; and `parts`, the
+  marker groups each part (`vision`, say) adds when a deployment serves it.
+
+## How a still is read
+
+Nothing about a model's pictures is in Rust. `media(id, deploy)` in
+`model.poem` states how a still is spelled and framed: `patch` and
+`block` (the tower's patch size and the side of the block its row fold
+takes, one token a block), `mrope` (tokens placed on the merged grid or in
+sequence), the delimiter tokens, and `frame(h, w, budget)`, the resize the
+family's processor applies (`//lib/media.poem` has Qwen's and Gemma's).
+The host decodes, frames, resamples and cuts the still into patch rows of
+raw RGB bytes in block order; the tower does the rest in the forward:
+`ops.layout.pixels(inputs.pixels(3 · patch²), mean, std, order, temporal)`
+normalizes and lays the rows out, and `ops.layout.grid_taps(positions,
+inputs.image_grids(), segments, kind, side)` taps the position table.
+
+## Where the packages go
+
+The runtime embeds every package here at build time (`crates/runtime/build.rs`)
+and, on every start, seeds `$PIE_HOME/models/` with the same tree and reads
+the catalog from there, so the directory is always complete and is what
+serves. Each seeded directory records its seed's digest in `.seeded`: a
+directory nobody edited is brought up to the binary's version when the
+binary changes; one edited by hand is kept, and a warning says when the
+built-in it started from has moved on. A new directory there is a new
+model, with no build. The tests read this directory
+(`poem_compiler::catalog::repository()`), so editing a package rebuilds
+nothing below the runtime.
+
+An artifact (`$PIE_HOME/artifacts/<model>/*.zt`) names the package it was
+imported with and that package's digest in its serving stamp; it is served
+by the package of that name and nothing else. A package edited since import
+still serves if its layout is the same (the artifact's planes are checked
+against the trace), and `pie model import` sees the digest differ and
+writes the artifact again.

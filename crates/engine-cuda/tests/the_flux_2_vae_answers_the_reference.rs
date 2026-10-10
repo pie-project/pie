@@ -21,11 +21,11 @@ fn fire(
     clip: [u32; 3],
     payload: &[f32],
 ) -> (Vec<f32>, Vec<[u32; 3]>, f64, f64) {
-    let row = models::deployment(ROW).expect("the flagship row");
+    let row = poem_compiler::catalog::deployment(ROW).expect("the flagship row");
     let trace = one_arm("flux2-klein-4b", decode)
         .trace(
-            row.entry.id,
-            &models::star::deploy(&row.deploy),
+            &row.model.id,
+            &row.deploy,
             if decode {
                 "flux2-vae-decode"
             } else {
