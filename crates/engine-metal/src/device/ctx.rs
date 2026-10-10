@@ -305,7 +305,6 @@ impl Context {
             Ok(Frame {
                 buffer: RefCell::new(buffer),
                 encoder: RefCell::new(Some(encoder)),
-                fenced: RefCell::new(Vec::new()),
                 blit: None,
             })
         }
@@ -317,11 +316,9 @@ impl Context {
 }
 
 /// One command buffer and the compute pass open on it. A fence (see
-/// [`Frame::fence`]) commits the buffer and opens the next on the same
-/// queue, so a frame that handed work to another engine is a chain of
-/// buffers; `fenced` keeps the committed ones until the frame is reaped and
-/// their errors are read. The cells let a fence happen through a shared
-/// `&Frame`, which is all a live encode holds.
+/// [`Frame::fence`]) closes the pass, encodes an event signal or wait on
+/// the buffer, and opens the next pass. The cells let a fence happen
+/// through a shared `&Frame`, which is all a live encode holds.
 pub struct Frame {
     #[cfg(target_vendor = "apple")]
     buffer: RefCell<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
@@ -332,8 +329,6 @@ pub struct Frame {
     encoder: RefCell<Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>>,
     #[cfg(not(target_vendor = "apple"))]
     encoder: Option<()>,
-    #[cfg(target_vendor = "apple")]
-    fenced: RefCell<Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
     #[cfg(target_vendor = "apple")]
     blit: Option<Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>>,
     #[cfg(not(target_vendor = "apple"))]
@@ -381,21 +376,16 @@ impl Frame {
         Ok(self.encoder.get_mut().as_deref().expect("just opened"))
     }
 
-    /// The first error among the command buffers a fence committed.
-    #[cfg(target_vendor = "apple")]
-    fn fenced_error(&self) -> Option<String> {
-        self.fenced
-            .borrow()
-            .iter()
-            .find_map(|buffer| buffer.error())
-            .map(|error| error.localizedDescription().to_string())
-    }
-
-    /// Ends the pass and the command buffer here and opens the next on the
-    /// same queue. With `signal`, the buffer so far signals `event` to
-    /// `value` when it is done; without, the next waits for `event` to reach
-    /// `value` before it starts. Either way the GPU work on both sides stays
-    /// ordered, and the other engine runs between.
+    /// Ends the pass here and opens the next, with an event between them
+    /// in the same command buffer. With `signal`, the GPU signals `event`
+    /// to `value` once the work so far is done; without, it waits for
+    /// `event` to reach `value` before the work after. Either way the GPU
+    /// work on both sides stays ordered, and the other engine runs between.
+    ///
+    /// The buffer stays one: closing it at each fence and chaining the next
+    /// on the queue was seen to cost ~200 ms at a boundary every so often,
+    /// the GPU starting the scheduled buffer late, which a long prefill
+    /// paid a dozen times over.
     #[cfg(target_vendor = "apple")]
     pub(crate) fn fence(
         &self,
@@ -413,21 +403,11 @@ impl Frame {
             encoder.endEncoding();
         }
         let current = self.buffer.borrow().clone();
-        let next = current
-            .commandQueue()
-            .commandBuffer()
-            .ok_or(Fault::Device {
-                call: "commandBuffer",
-                why: "the queue would not open a command buffer after a fence".to_string(),
-            })?;
         if signal {
             current.encodeSignalEvent_value(event, value);
         } else {
-            next.encodeWaitForEvent_value(event, value);
+            current.encodeWaitForEvent_value(event, value);
         }
-        current.commit();
-        let done = std::mem::replace(&mut *self.buffer.borrow_mut(), next);
-        self.fenced.borrow_mut().push(done);
         let reopened = self
             .buffer
             .borrow()
@@ -582,14 +562,10 @@ impl Frame {
             let buffer = self.buffer.get_mut().clone();
             buffer.commit();
             buffer.waitUntilCompleted();
-            if let Some(why) = self.fenced_error().or_else(|| {
-                buffer
-                    .error()
-                    .map(|error| error.localizedDescription().to_string())
-            }) {
+            if let Some(error) = buffer.error() {
                 return Err(Fault::Device {
                     call: "waitUntilCompleted",
-                    why,
+                    why: error.localizedDescription().to_string(),
                 });
             }
             Ok(())
@@ -608,14 +584,10 @@ impl Frame {
             let buffer = self.buffer.get_mut().clone();
             buffer.commit();
             buffer.waitUntilCompleted();
-            if let Some(why) = self.fenced_error().or_else(|| {
-                buffer
-                    .error()
-                    .map(|error| error.localizedDescription().to_string())
-            }) {
+            if let Some(error) = buffer.error() {
                 return Err(Fault::Device {
                     call: "waitUntilCompleted",
-                    why,
+                    why: error.localizedDescription().to_string(),
                 });
             }
             Ok(buffer.GPUEndTime() - buffer.GPUStartTime())
@@ -636,7 +608,6 @@ impl Frame {
         {
             self.end_pass();
             if let Some(on_done) = on_done {
-                let fenced = Fenced(self.fenced.get_mut().clone());
                 let handler = block2::RcBlock::new(
                     move |buffer: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
                         // SAFETY: Metal hands the handler a live reference to
@@ -644,11 +615,8 @@ impl Frame {
                         // the length of this call.
                         let buffer = unsafe { buffer.as_ref() };
                         on_done(
-                            fenced
-                                .0
-                                .iter()
-                                .find_map(|earlier| earlier.error())
-                                .or_else(|| buffer.error())
+                            buffer
+                                .error()
                                 .map(|error| error.localizedDescription().to_string()),
                         );
                     },
@@ -665,7 +633,6 @@ impl Frame {
             self.buffer.get_mut().commit();
             Ok(Pending {
                 buffer: self.buffer.get_mut().clone(),
-                fenced: std::mem::take(self.fenced.get_mut()),
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -683,23 +650,9 @@ impl Drop for Frame {
     }
 }
 
-/// The command buffers a fence committed ahead of the frame's last, as a
-/// completion handler holds them.
-#[cfg(target_vendor = "apple")]
-struct Fenced(Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>);
-
-// SAFETY: the handler only reads `error` off them, which is safe from any
-// thread; nothing encodes into a committed buffer.
-#[cfg(target_vendor = "apple")]
-unsafe impl Send for Fenced {}
-
 pub struct Pending {
     #[cfg(target_vendor = "apple")]
     buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
-    /// Committed at fences ahead of `buffer`, on the same queue, so done
-    /// once it is; their errors count as the frame's.
-    #[cfg(target_vendor = "apple")]
-    fenced: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     #[cfg(not(target_vendor = "apple"))]
     #[allow(dead_code)]
     buffer: (),
@@ -751,12 +704,7 @@ impl Pending {
         #[cfg(target_vendor = "apple")]
         {
             self.buffer.waitUntilCompleted();
-            if let Some(error) = self
-                .fenced
-                .iter()
-                .find_map(|buffer| buffer.error())
-                .or_else(|| self.buffer.error())
-            {
+            if let Some(error) = self.buffer.error() {
                 return Err(Fault::Device {
                     call: "waitUntilCompleted",
                     why: error.localizedDescription().to_string(),
