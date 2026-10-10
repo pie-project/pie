@@ -1,4 +1,5 @@
 #include "common/bf16.slang"
+#include "common/subgroup.slang"
 #include "attn/sdpa_online.slang"
 
 #ifndef PIE_HEAD_DIM
@@ -180,10 +181,10 @@ void decode_walk(uint row, uint q_head, uint n_q_heads, int k_lo, int k_hi,
     uint base_row = row_base(row, q_head, n_q_heads);
     int kv_head = int(q_head) / pc.gqa_factor;
 
-    uint sg = gl_SubgroupID;
+    uint sg = pie_subgroup_id();
     uint lane = WaveGetLaneIndex();
     uint width = WaveGetLaneCount();
-    subgroups = min(gl_NumSubgroups, uint(PIE_DECODE_MAX_SUBGROUPS));
+    subgroups = min(pie_num_subgroups(), uint(PIE_DECODE_MAX_SUBGROUPS));
     bool walks = sg < subgroups;
 
     uint per_lane = uint(PIE_HEAD_DIM) / width;
