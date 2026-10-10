@@ -6,6 +6,10 @@
 //! split-k — must read that view exactly as it reads a bank copied out of
 //! those columns, since the Neural Engine split hands the GPU such a view of
 //! `down` in place of #837's host copy.
+//!
+//! The other cut a split needs is of the output: the leading `KEEP` rows of
+//! the bank landed in the leading `KEEP` columns of a full-width `y`, the
+//! rest of each row untouched for the other engine to fill.
 
 use std::cell::RefCell;
 
@@ -21,6 +25,8 @@ const K_FULL: u32 = 2048;
 /// The view keeps the leading `K_CUT` columns.
 const K_CUT: u32 = 1024;
 const GROUP: u32 = 64;
+/// The output columns the GPU keeps in the in-place test.
+const KEEP: u32 = 128;
 
 struct Lcg(u64);
 impl Lcg {
@@ -204,5 +210,96 @@ fn a_column_cut_of_a_bank_multiplies_as_its_copy() {
             "m={m}: the view over the wide bank reads differently from the copy"
         );
         eprintln!("m={m}: view == copy over {} bf16 outputs", m * N);
+    }
+}
+
+#[test]
+fn the_leading_output_columns_land_in_place() {
+    let Ok(device) = Context::bind() else {
+        eprintln!("not asked: no Metal device");
+        return;
+    };
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    let mut rng = Lcg(0xface);
+    let whole = planes(&mut rng, K_FULL, None);
+    let mut keep = Vec::new();
+    let full = bank(&device, &handles, &whole, K_FULL, K_FULL, &mut keep);
+    // The leading `KEEP` rows of the bank, as the engine's `rows_of` view.
+    let head = Bank {
+        codes: Tensor {
+            rows: KEEP,
+            ..full.codes
+        },
+        scales: Tensor {
+            rows: KEEP,
+            ..full.scales
+        },
+        biases: full.biases.map(|b| Tensor { rows: KEEP, ..b }),
+        ..full
+    };
+    let scratch_keep: RefCell<Vec<Buffer>> = RefCell::new(Vec::new());
+    let plane = |rows: u32, width: u32, dtype: Dtype| -> Option<Tensor> {
+        let bytes = u64::from(rows) * u64::from(width) * dtype.bits() / 8;
+        let buffer = Buffer::zeroed(&device, bytes).ok()?;
+        let handle = handles.bind(&buffer, 0, bytes).ok()?;
+        scratch_keep.borrow_mut().push(buffer);
+        Some(Tensor::new(handle, rows, width, dtype))
+    };
+    let precast = |rows, contraction| plane(rows, contraction, Dtype::F16);
+    let partials = |rows, width| plane(rows, width, Dtype::F32);
+
+    for m in [1u32, 4, 17, 64, 640] {
+        let x: Vec<u8> = (0..m * K_FULL)
+            .flat_map(|_| bf16(rng.unit()).to_le_bytes())
+            .collect();
+        let mut rows = Vec::new();
+        let act = Tensor::new(
+            bound(&device, &handles, &x, &mut rows),
+            m,
+            K_FULL,
+            Dtype::Bf16,
+        );
+        let y_bytes = u64::from(m) * u64::from(N) * 2;
+        let mut out = Vec::new();
+        for (w, columns) in [(full, None), (head, Some(KEEP))] {
+            let y_buffer = Buffer::zeroed(&device, y_bytes).expect("y");
+            let y = Tensor::new(
+                handles.bind(&y_buffer, 0, y_bytes).expect("y"),
+                m,
+                N,
+                Dtype::Bf16,
+            );
+            let frame = device.frame().expect("a frame");
+            let sink = Sink::new(&device, &frame, &pipelines, &handles);
+            let scratch = quant::Scratch {
+                precast: &precast,
+                partials: &partials,
+            };
+            match columns {
+                None => quant::matmul(&sink, act, w, y, scratch, m.div_ceil(32) * 32),
+                Some(c) => quant::matmul_columns(&sink, act, w, y, c, scratch, m.div_ceil(32) * 32),
+            }
+            .expect("the matmul launches");
+            frame.commit().expect("the frame lands");
+            out.push(handles.read(y.buf, y_bytes).expect("y read back"));
+            scratch_keep.borrow_mut().clear();
+            drop(y_buffer);
+        }
+        let (all, part) = (&out[0], &out[1]);
+        for r in 0..m as usize {
+            let span = r * N as usize * 2..(r + 1) * N as usize * 2;
+            let (whole_row, part_row) = (&all[span.clone()], &part[span]);
+            let cut = KEEP as usize * 2;
+            assert!(
+                whole_row[..cut] == part_row[..cut],
+                "m={m} row {r}: the leading columns differ from the full product's"
+            );
+            assert!(
+                part_row[cut..].iter().all(|&b| b == 0),
+                "m={m} row {r}: a column past {KEEP} was written"
+            );
+        }
+        eprintln!("m={m}: leading {KEEP} of {N} columns land in place, the rest untouched");
     }
 }

@@ -518,6 +518,30 @@ pub fn matmul(
     act_x_wt(ctx, "linear.matmul", act, w, y, scratch, capacity_rows)
 }
 
+/// The leading `columns` columns of `act x w^T`, landed in place in `y`,
+/// whose width is the row stride: the rest of each row is left alone, for
+/// another engine to fill. `w` holds at least `columns` rows.
+pub fn matmul_columns(
+    ctx: &Ctx<'_>,
+    act: Tensor,
+    w: Bank,
+    y: Tensor,
+    columns: u32,
+    scratch: Scratch<'_>,
+    capacity_rows: u32,
+) -> Result<(), Error> {
+    act_x_wt_over(
+        ctx,
+        "linear.matmul",
+        act,
+        w,
+        y,
+        Some(columns),
+        scratch,
+        capacity_rows,
+    )
+}
+
 pub fn lm_head(
     ctx: &Ctx<'_>,
     act: Tensor,
@@ -539,16 +563,35 @@ pub fn act_x_wt(
     scratch: Scratch<'_>,
     capacity_rows: u32,
 ) -> Result<(), Error> {
+    act_x_wt_over(ctx, op, act, w, y, None, scratch, capacity_rows)
+}
+
+/// `act x w^T` over `y`'s leading `columns` (every column when `None`), at
+/// `y`'s width as the row stride.
+#[allow(clippy::too_many_arguments)]
+fn act_x_wt_over(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    act: Tensor,
+    w: Bank,
+    y: Tensor,
+    columns: Option<u32>,
+    scratch: Scratch<'_>,
+    capacity_rows: u32,
+) -> Result<(), Error> {
     dtype_dispatch!(op, act.dtype, { Bf16 => () });
     // PTQ1_0 is a single-plane inline-scale ternary bank: the fp16 scale lives
     // inside each 28-byte block, so there is no `scales`/`biases` plane to pair.
     // Route it to its own decode-in-dot kernel before the affine 3-plane checks.
     if w.codes.dtype == Dtype::Ptq1_0 {
-        let (rows, columns, contraction) = extent(op, act, y)?;
+        let (rows, stride, contraction) = extent(op, act, y)?;
+        if columns.is_some_and(|c| c != stride) {
+            return Err(refuse(op, "the ternary kernel lands whole rows only"));
+        }
         if rows == 0 {
             return Ok(());
         }
-        return ptq1_0_matmul(ctx, op, act, w, y, rows, columns, contraction);
+        return ptq1_0_matmul(ctx, op, act, w, y, rows, stride, contraction);
     }
     let Some(biases) = w.biases else {
         return Err(refuse(
@@ -561,7 +604,17 @@ pub fn act_x_wt(
             ),
         ));
     };
-    let (rows, columns, contraction) = extent(op, act, y)?;
+    let (rows, stride, contraction) = extent(op, act, y)?;
+    let columns = match columns {
+        Some(c) if c == 0 || c > stride => {
+            return Err(refuse(
+                op,
+                format!("{c} columns do not fit a row of {stride}"),
+            ));
+        }
+        Some(c) => c,
+        None => stride,
+    };
     if rows == 0 {
         return Ok(());
     }
@@ -578,11 +631,14 @@ pub fn act_x_wt(
     }
     let group = stated(op, w.group)?;
     let bits = stated(op, w.bits)?;
+    // `n` is the row stride every kernel lands by; `cols` is how many of
+    // the row this call computes, and sizes the grids.
     let (m, n, k) = (
         stated(op, rows)?,
-        stated(op, columns)?,
+        stated(op, stride)?,
         stated(op, contraction)?,
     );
+    let cols = stated(op, columns)?;
     if w.ld < contraction || !w.ld.is_multiple_of(w.group) {
         return Err(refuse(
             op,
@@ -603,6 +659,7 @@ pub fn act_x_wt(
     };
     let bn = if bm == 8 { 64 } else { 128 };
     if tuned.qmm_mpp
+        && columns == stride
         && bits == 4
         && group == 64
         && rows >= 8
@@ -730,12 +787,12 @@ pub fn act_x_wt(
     let capacity = i32::try_from(capacity_rows).unwrap_or(i32::MAX);
     let fold_widest = *QMV_ROW_RUNGS.last().expect("a rung");
     let tile_fills = |padded: i32, bm: i32| {
-        let tiles = u64::from(n.unsigned_abs().div_ceil(BN_RUNGS[0].unsigned_abs()))
+        let tiles = u64::from(cols.unsigned_abs().div_ceil(BN_RUNGS[0].unsigned_abs()))
             * u64::from((padded / bm).unsigned_abs());
         tiles >= u64::from(crossover.unsigned_abs())
     };
     let split_plane = |padded: i32, bm: i32| -> Option<(i32, Tensor)> {
-        let split = splitk(n, bm, padded, k, group, bits);
+        let split = splitk(cols, bm, padded, k, group, bits);
         if split <= 1 {
             return None;
         }
@@ -752,7 +809,7 @@ pub fn act_x_wt(
             && bm >= PRECAST_MIN_BM
             && k % PRECAST_BK == 0
             && let Some(staged) = (scratch.precast)(padded.unsigned_abs(), k.unsigned_abs())
-            && let Some(bn) = bn_unsplit(n, padded / bm, crossover)
+            && let Some(bn) = bn_unsplit(cols, padded / bm, crossover)
         {
             let count = padded
                 .checked_mul(k)
@@ -784,8 +841,10 @@ pub fn act_x_wt(
             gemm.push(ctx.absent()?);
             gemm.push(ld.arg());
             return ctx.fire(
-                Fire::at(QMM_FILE, precast_point(op, "", bm, bn)?)
-                    .apply(Grid::of(qmm_grid(op, n, bn, padded, bm, 1)?, qmm_group(bm))),
+                Fire::at(QMM_FILE, precast_point(op, "", bm, bn)?).apply(Grid::of(
+                    qmm_grid(op, cols, bn, padded, bm, 1)?,
+                    qmm_group(bm),
+                )),
                 &gemm,
             );
         }
@@ -795,7 +854,7 @@ pub fn act_x_wt(
                 .ok_or_else(|| refuse(op, format!("{padded} x {n} partials will not stack")))?;
             ctx.fire(
                 Fire::at(QMM_FILE, splitk_point(op, group, bits, bm)?).apply(Grid::of(
-                    qmm_grid(op, n, SPLITK_BN, padded, bm, split)?,
+                    qmm_grid(op, cols, SPLITK_BN, padded, bm, split)?,
                     qmm_group(bm),
                 )),
                 &[
@@ -827,13 +886,13 @@ pub fn act_x_wt(
             reduce.push(split.arg());
             return ctx.fire(
                 Fire::at(QMM_FILE, SPLITK_REDUCE).apply(Grid::of(
-                    [n.unsigned_abs(), m.unsigned_abs(), 1],
+                    [cols.unsigned_abs(), m.unsigned_abs(), 1],
                     [256, 1, 1],
                 )),
                 &reduce,
             );
         }
-        if let Some(bn) = bn_unsplit(n, padded / bm, crossover) {
+        if let Some(bn) = bn_unsplit(cols, padded / bm, crossover) {
             let (form, stamp) = tiled_form();
             let point = qmm_point(op, form, stamp, group, bits, bm, bn)?;
             let mut tiled = vec![
@@ -852,19 +911,22 @@ pub fn act_x_wt(
             return ctx.fire(
                 Fire::at(QMM_FILE, point.entry)
                     .stamp(point.stamp)
-                    .apply(Grid::of(qmm_grid(op, n, bn, padded, bm, 1)?, qmm_group(bm))),
+                    .apply(Grid::of(
+                        qmm_grid(op, cols, bn, padded, bm, 1)?,
+                        qmm_group(bm),
+                    )),
                 &tiled,
             );
         }
     }
     let rows_max = i32::try_from(tuned.qmv_rows_max).unwrap_or(1);
     let packs = i32::try_from(tuned.qmv_rows_packs).unwrap_or(QMV_PACK_RUNGS[1]);
-    if let Some(fold) = qmv_rows_fold(m, n, rows_max, crossover, packs, bits) {
+    if let Some(fold) = qmv_rows_fold(m, cols, rows_max, crossover, packs, bits) {
         let point = qmv_rows_point(op, group, bits, fold, packs)?;
         return ctx.fire(
             Fire::at(QMV_ROWS_FILE, point.entry)
                 .stamp(point.stamp)
-                .apply(Grid::of(qmv_rows_grid(op, m, fold, n)?, QMV_GROUP)),
+                .apply(Grid::of(qmv_rows_grid(op, m, fold, cols)?, QMV_GROUP)),
             &[
                 w.codes.arg(),
                 w.scales.arg(),
@@ -893,7 +955,7 @@ pub fn act_x_wt(
     }
     fast.push(ld.arg());
     ctx.fire(
-        Fire::at(QMV_FILE, point.entry).apply(Grid::of(qmv_grid(op, m, n)?, QMV_GROUP)),
+        Fire::at(QMV_FILE, point.entry).apply(Grid::of(qmv_grid(op, m, cols)?, QMV_GROUP)),
         &fast,
     )
 }
