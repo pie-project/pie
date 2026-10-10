@@ -25,13 +25,10 @@ pub struct Stamp {
     pub deployment: String,
     pub layout_revision: u64,
     pub adapters_zeroed: bool,
-    /// The model package the deployment is of, by name; the serving build
-    /// reads the package of that name from its catalog.
+    /// The model package the deployment is of, by name.
     pub package: String,
-    /// The digest of the package's files as they were when the artifact was
-    /// imported: a package edited since still serves if its layout is the
-    /// same, and `pie model import` knows the artifact is not what the
-    /// package now states.
+    /// The package's digest at import; a later edit serves, and `pie model
+    /// import` writes the artifact again.
     pub package_digest: String,
 }
 
@@ -60,21 +57,8 @@ impl Field {
         }
     }
 
-    #[must_use]
-    pub fn required() -> &'static [Field] {
-        &[
-            Field::Serving,
-            Field::Backend,
-            Field::Deployment,
-            Field::LayoutRevision,
-            Field::AdaptersZeroed,
-            Field::Package,
-            Field::PackageDigest,
-        ]
-    }
-
-    /// The fields that say what an artifact is for, which a load's
-    /// deployment must match; the package fields say where it came from.
+    /// What an artifact is for, which a load must match; the package fields say
+    /// where it came from.
     #[must_use]
     pub fn identity() -> &'static [Field] {
         &[
@@ -169,7 +153,6 @@ impl Stamp {
         }
     }
 
-    /// This stamp, of the model package `package` at `digest`.
     #[must_use]
     pub fn with_package(mut self, package: &str, digest: &str) -> Stamp {
         self.package = package.to_string();
@@ -209,8 +192,8 @@ impl Stamp {
             deployment: required_text(attributes, Field::Deployment)?.to_string(),
             layout_revision: required_uint(attributes, Field::LayoutRevision)?,
             adapters_zeroed,
-            package: required_text(attributes, Field::Package)?.to_string(),
-            package_digest: required_text(attributes, Field::PackageDigest)?.to_string(),
+            package: optional_text(attributes, Field::Package),
+            package_digest: optional_text(attributes, Field::PackageDigest),
         })
     }
 
@@ -660,6 +643,13 @@ fn required_text(attributes: &Value, field: Field) -> Result<&str, Error> {
         Some(Value::Text(it)) => Ok(it),
         Some(_) => Err(malformed(field, "is not text")),
         None => Err(missing(field)),
+    }
+}
+
+fn optional_text(attributes: &Value, field: Field) -> String {
+    match attributes.get(field.key()) {
+        Some(Value::Text(it)) => it.clone(),
+        _ => String::new(),
     }
 }
 

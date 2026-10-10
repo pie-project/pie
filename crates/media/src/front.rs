@@ -1,8 +1,6 @@
-//! The vision and audio front ends: what a still or a clip becomes before
-//! the model's tower reads it. The model-specific ones (Qwen 3.5's, Gemma 4's,
-//! GLM-5's) live here until the packages state the resize policy themselves
-//! and the tower patchifies in the forward; until then an architecture word
-//! picks one.
+//! The vision and audio front ends: what a still or a clip becomes before a
+//! tower reads it. The model-specific ones live here, picked by `arch`, until
+//! the packages state the resize policy and the towers patchify in the forward.
 
 pub mod gemma;
 pub mod glm;

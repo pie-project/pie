@@ -1,9 +1,6 @@
 use crate::Tokenizer;
 
-/// What a model's package asks of the tokenizer an artifact carries: the
-/// marker tokens its template and media spell, each of which the vocabulary
-/// must hold, and the markers pinned at an id, which select one reading of
-/// the artifact.
+/// Marker tokens the vocabulary must hold, and markers pinned at an id.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Contract {
     pub markers: Vec<Vec<String>>,

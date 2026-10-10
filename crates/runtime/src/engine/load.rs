@@ -13,7 +13,6 @@ pub use poem_ir::{Platform, Trace};
 
 use crate::catalog::{Deployment, catalog};
 
-/// The deployment `name` spells, of a model this build's packages hold.
 pub fn deployment(name: &str) -> Result<Deployment> {
     catalog()
         .parse(name)
@@ -110,9 +109,7 @@ fn composed(
     Ok(deploy)
 }
 
-/// The package the artifact at `path` was imported with, which its stamp
-/// names and this build's catalog holds. An artifact is served by that
-/// package and nothing else.
+/// The package the artifact's stamp names, from the catalog: what serves it.
 pub fn carried(path: &Path) -> Result<Arc<poem::star::Package>> {
     let stamp = stamp_of(path)?.ok_or_else(|| anyhow!("{path:?} carries no serving stamp"))?;
     if stamp.package.is_empty() {
@@ -131,20 +128,11 @@ pub fn carried(path: &Path) -> Result<Arc<poem::star::Package>> {
             }
         )
     })?;
-    if package.digest() != stamp.package_digest {
-        tracing::warn!(
-            ?path,
-            package = stamp.package,
-            "the package differs from the one this artifact was imported with; it serves if \
-             its layout is the same, and `pie model import` writes it again if not"
-        );
-    }
     Ok(Arc::clone(package))
 }
 
-/// What an artifact serves under `overrides`: the deployment's name, its rank
-/// count and the trace each rank runs, all of it from the package the
-/// artifact carries, none of it from this build's catalog.
+/// What `artifact` serves under `overrides`: name, rank count and trace, all
+/// from the package its stamp names.
 pub fn packaged(
     artifact: &Path,
     overrides: &Overrides,
@@ -153,6 +141,14 @@ pub fn packaged(
     let package = carried(artifact)?;
     let stamp =
         stamp_of(artifact)?.ok_or_else(|| anyhow!("{artifact:?} carries no serving stamp"))?;
+    if package.digest() != stamp.package_digest {
+        tracing::warn!(
+            ?artifact,
+            package = stamp.package,
+            "the package differs from the one the artifact was imported with; it serves if its \
+             layout is the same, and `pie model import` writes the artifact again if not"
+        );
+    }
     let (model, base) = package.manifest().parse(&stamp.deployment).ok_or_else(|| {
         anyhow!(
             "{artifact:?} was imported as `{}`, which its package `{}` names no deployment of",
@@ -171,9 +167,8 @@ pub fn packaged(
     Ok((name, deploy.tp, trace))
 }
 
-/// How the deployment `name` stamped on the artifact at `artifact` is
-/// served, as this build's catalog or else the artifact's own package
-/// spells it: what a config's precision and drafter pick an artifact by.
+/// How the deployment `name` of `artifact` is served, by name through the
+/// catalog or else through the artifact's package: what a config picks by.
 #[must_use]
 pub fn deploy_of(artifact: &Path, name: &str) -> Option<poem::star::Deploy> {
     if let Some(deployment) = catalog().parse(name) {
@@ -430,8 +425,6 @@ pub fn request(
     ordinal: i32,
     frames_in_flight: u8,
 ) -> Result<LoadRequest> {
-    // An artifact is served by the package it carries; a raw checkpoint by
-    // the deployment of this build's catalog that reads it.
     let trace = if stamp_of(checkpoint)?.is_some() {
         let (name, _, trace) = packaged(checkpoint, overrides, platform)?;
         tracing::info!(deployment = name, ?checkpoint, "serving its package");

@@ -1,12 +1,7 @@
-//! The catalog this build serves: the packages under `$PIE_HOME/models/`,
-//! which [`install`] seeds from the ones the binary embeds (the repository's
-//! `models/` at build time) and keeps complete. What a model is, its package
-//! states; the runtime only reads packages.
-//!
-//! Each seeded directory records the digest of what was seeded in
-//! `.seeded`. A directory nobody edited is brought up to the binary's
-//! version when the binary changes; one that was edited is kept, and a
-//! warning says the built-in it started from has moved on since.
+//! The catalog this build serves: `$PIE_HOME/models/`, which [`install`] seeds
+//! from the packages the binary embeds and keeps whole. A seeded directory
+//! records its seed's digest in `.seeded`: untouched, it follows the binary;
+//! edited, it is kept, with a warning once the built-in it came from moves on.
 
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, OnceLock};
@@ -17,15 +12,12 @@ mod embedded {
     include!(concat!(env!("OUT_DIR"), "/packages.rs"));
 }
 
-/// The file a seeded directory records its seed's digest in.
 pub const SEEDED: &str = ".seeded";
 
-/// The directory under `models/` the libraries live in.
 const LIB: &str = "lib";
 
-static MODELS_DIR: OnceLock<PathBuf> = OnceLock::new();
+static INSTALLED: OnceLock<(PathBuf, Vec<(String, Seeded)>)> = OnceLock::new();
 
-/// The tree this build embeds.
 #[must_use]
 pub fn embedded_tree() -> Tree {
     Tree {
@@ -48,76 +40,74 @@ pub fn embedded_tree() -> Tree {
     }
 }
 
-/// The packages this build embeds, alone.
+/// The embedded packages alone: what serves until [`install`] runs.
 #[must_use]
 pub fn embedded() -> Catalog {
     Catalog::from_tree(&embedded_tree())
         .unwrap_or_else(|why| panic!("this build's packages do not load: {why}"))
 }
 
-/// What seeding `models/` found, per directory.
+/// What seeding found a directory to be.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Seeded {
-    /// Written for the first time.
     Written,
     /// Already the binary's version.
     Current,
-    /// An older seed nobody edited, brought up to the binary's version.
+    /// An older seed nobody edited, now the binary's version.
     Updated,
-    /// Edited by hand; left as it is. The built-in has moved on since the
-    /// seed it was edited from when `behind` is set.
-    Edited { behind: bool },
+    /// Edited by hand and kept; `behind` once the built-in has moved on since.
+    Edited {
+        behind: bool,
+    },
+    /// Made by hand under a built-in's name, with no seed to compare to; kept.
+    Foreign,
 }
 
-/// Seeds `models` from the embedded tree and installs it as the directory
-/// the catalog reads. Set once, before the catalog is first read; a later
-/// call seeds again but does not move the catalog.
-pub fn install(models: &Path) -> Vec<(String, Seeded)> {
-    let outcome = match seed(models) {
-        Ok(outcome) => outcome,
-        Err(why) => {
-            tracing::warn!(
-                ?models,
-                %why,
-                "the models directory could not be seeded; this build's embedded packages serve"
-            );
-            return Vec::new();
-        }
-    };
-    for (name, seeded) in &outcome {
-        match seeded {
-            Seeded::Written => tracing::info!(package = name, ?models, "seeded"),
-            Seeded::Current => {}
-            Seeded::Updated => {
-                tracing::info!(
-                    package = name,
-                    ?models,
-                    "brought up to this build's version"
-                );
+/// Seeds `models` and makes it the directory the catalog reads, once; a
+/// later call returns what the first found.
+pub fn install(models: &Path) -> &'static [(String, Seeded)] {
+    &INSTALLED
+        .get_or_init(|| {
+            let outcome = match seed(models) {
+                Ok(outcome) => outcome,
+                Err(why) => {
+                    tracing::warn!(
+                        ?models,
+                        %why,
+                        "the models directory could not be seeded; this build's embedded packages serve"
+                    );
+                    Vec::new()
+                }
+            };
+            for (name, seeded) in &outcome {
+                match seeded {
+                    Seeded::Written => tracing::info!(package = name, ?models, "seeded"),
+                    Seeded::Current => {}
+                    Seeded::Updated => {
+                        tracing::info!(package = name, ?models, "brought up to this build's")
+                    }
+                    Seeded::Edited { behind: false } | Seeded::Foreign => {
+                        tracing::info!(package = name, ?models, "made by hand; serving it")
+                    }
+                    Seeded::Edited { behind: true } => tracing::warn!(
+                        package = name,
+                        ?models,
+                        "edited by hand from an older built-in, which has changed since; delete \
+                         the directory to take this build's, or carry the edit over"
+                    ),
+                }
             }
-            Seeded::Edited { behind: false } => {
-                tracing::info!(package = name, ?models, "edited by hand; serving the edit");
-            }
-            Seeded::Edited { behind: true } => tracing::warn!(
-                package = name,
-                ?models,
-                "edited by hand from an older built-in, which has changed since; delete the \
-                 directory to take this build's, or carry the edit over"
-            ),
-        }
-    }
-    let _ = MODELS_DIR.set(models.to_path_buf());
-    outcome
+            (models.to_path_buf(), outcome)
+        })
+        .1
 }
 
-/// The models directory installed, if one was.
 #[must_use]
 pub fn installed() -> Option<&'static Path> {
-    MODELS_DIR.get().map(PathBuf::as_path)
+    INSTALLED.get().map(|(models, _)| models.as_path())
 }
 
-/// Every directory the embedded tree seeds: each package by name with its
-/// files, and `lib` with the libraries under their path below it.
+/// Each directory the tree seeds: every package, and `lib`.
 fn seeds(tree: &Tree) -> Vec<(String, Vec<(String, String)>)> {
     let mut seeds = tree.packages.clone();
     if !tree.library.is_empty() {
@@ -137,8 +127,6 @@ fn seeds(tree: &Tree) -> Vec<(String, Vec<(String, String)>)> {
     seeds
 }
 
-/// The digest of a directory's files, `(path below the directory, text)`,
-/// in path order.
 fn digest(files: &[(String, String)]) -> String {
     let mut sorted: Vec<&(String, String)> = files.iter().collect();
     sorted.sort();
@@ -152,7 +140,7 @@ fn digest(files: &[(String, String)]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// The `.poem` files under `dir`, `(path below `dir`, text)`, walked whole.
+/// The `.poem` files under `dir`, by path below it.
 fn on_disk(dir: &Path) -> std::io::Result<Vec<(String, String)>> {
     fn walk(dir: &Path, below: &str, out: &mut Vec<(String, String)>) -> std::io::Result<()> {
         for entry in std::fs::read_dir(dir)? {
@@ -173,24 +161,37 @@ fn on_disk(dir: &Path) -> std::io::Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-/// Writes `files` under `dir`, every other `.poem` file there removed, and
-/// records `seeded` as the directory's seed.
+/// Writes `files` and the seed marker as a fresh directory beside `dir`,
+/// then swaps it in, so a seed that dies partway leaves `dir` as it was.
 fn write(dir: &Path, files: &[(String, String)], seeded: &str) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let stale = on_disk(dir)?;
-    for (path, _) in &stale {
-        if !files.iter().any(|(wanted, _)| wanted == path) {
-            std::fs::remove_file(dir.join(path))?;
-        }
-    }
+    let name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("package");
+    let parent = dir.parent().unwrap_or(Path::new("."));
+    let fresh = parent.join(format!(".{name}.{}.seeding", std::process::id()));
+    let _ = std::fs::remove_dir_all(&fresh);
+    std::fs::create_dir_all(&fresh)?;
     for (path, text) in files {
-        let target = dir.join(path);
+        let target = fresh.join(path);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(target, text)?;
     }
-    std::fs::write(dir.join(SEEDED), seeded)
+    std::fs::write(fresh.join(SEEDED), seeded)?;
+    let old = parent.join(format!(".{name}.{}.replaced", std::process::id()));
+    if dir.is_dir() {
+        std::fs::rename(dir, &old)?;
+    }
+    if let Err(why) = std::fs::rename(&fresh, dir) {
+        if old.is_dir() {
+            let _ = std::fs::rename(&old, dir);
+        }
+        return Err(why);
+    }
+    let _ = std::fs::remove_dir_all(&old);
+    Ok(())
 }
 
 fn seed(models: &Path) -> std::io::Result<Vec<(String, Seeded)>> {
@@ -210,12 +211,16 @@ fn seed(models: &Path) -> std::io::Result<Vec<(String, Seeded)>> {
                     std::fs::write(dir.join(SEEDED), &ships)?;
                 }
                 Seeded::Current
-            } else if marker.as_deref() == Some(held.as_str()) {
-                write(&dir, &files, &ships)?;
-                Seeded::Updated
             } else {
-                Seeded::Edited {
-                    behind: marker.as_deref() != Some(ships.as_str()),
+                match marker.as_deref() {
+                    None => Seeded::Foreign,
+                    Some(seeded) if seeded == held => {
+                        write(&dir, &files, &ships)?;
+                        Seeded::Updated
+                    }
+                    Some(seeded) => Seeded::Edited {
+                        behind: seeded != ships,
+                    },
                 }
             }
         };
@@ -236,24 +241,38 @@ static CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
         }
     };
     let (catalog, refused) = Catalog::of_tree(&tree);
-    for why in refused {
-        tracing::error!(?models, %why, "a package under the models directory does not load and is left out");
+    for why in refused.iter().chain(&template_faults(&catalog)) {
+        tracing::error!(?models, %why, "under the models directory");
     }
     catalog
 });
 
-/// The catalog this build serves.
+/// Each model whose template names a format or a setting the runtime does
+/// not ship. The catalog still lists it; registering it refuses.
+pub fn template_faults(catalog: &Catalog) -> Vec<Refused> {
+    catalog
+        .models()
+        .filter_map(|(package, model)| {
+            crate::model::template_of(model).check().err().map(|why| {
+                Refused(format!(
+                    "`{}` in the package `{}`: {why}",
+                    model.id,
+                    package.name()
+                ))
+            })
+        })
+        .collect()
+}
+
 pub fn catalog() -> &'static Catalog {
     &CATALOG
 }
 
-/// The deployment `name` of this build's catalog, listed or split.
 #[must_use]
 pub fn deployment(name: &str) -> Option<&'static Deployment> {
     catalog().deployment(name)
 }
 
-/// Every deployment this build's packages list.
 pub fn deployments() -> impl Iterator<Item = &'static Deployment> {
     catalog().deployments()
 }
@@ -267,20 +286,17 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let models = home.path().join("models");
 
-        // A fresh directory is written whole, lib included.
         let first = seed(&models).unwrap();
         assert!(first.iter().all(|(_, s)| *s == Seeded::Written));
         assert!(models.join("qwen_3").join("package.poem").is_file());
         assert!(models.join(LIB).join(SEEDED).is_file());
 
-        // Seeding again finds everything current.
         let again = seed(&models).unwrap();
         assert!(
             again.iter().all(|(_, s)| *s == Seeded::Current),
             "{again:?}"
         );
 
-        // An older seed nobody edited: the marker says so, and it is updated.
         let qwen = models.join("qwen_3");
         std::fs::write(qwen.join("forward.poem"), "# an older build's\n").unwrap();
         std::fs::write(qwen.join(SEEDED), digest(&on_disk(&qwen).unwrap())).unwrap();
@@ -296,7 +312,6 @@ mod tests {
             "# an older build's\n"
         );
 
-        // An edit of the current seed is kept and is not behind.
         std::fs::write(qwen.join("forward.poem"), "# mine\n").unwrap();
         let edited = seed(&models).unwrap();
         assert!(
@@ -310,7 +325,6 @@ mod tests {
             "# mine\n"
         );
 
-        // An edit of an older seed is kept and is behind.
         std::fs::write(qwen.join(SEEDED), "an older build's digest").unwrap();
         let behind = seed(&models).unwrap();
         assert!(
@@ -320,7 +334,15 @@ mod tests {
             "{behind:?}"
         );
 
-        // A missing package comes back.
+        std::fs::remove_file(qwen.join(SEEDED)).unwrap();
+        let foreign = seed(&models).unwrap();
+        assert!(
+            foreign
+                .iter()
+                .any(|(n, s)| n == "qwen_3" && *s == Seeded::Foreign),
+            "{foreign:?}"
+        );
+
         std::fs::remove_dir_all(models.join("gemma_4")).unwrap();
         let back = seed(&models).unwrap();
         assert!(

@@ -1,7 +1,4 @@
-//! Embeds the repository's `models/` into the runtime: each directory with a
-//! `package.poem` and every `.poem` file in it, and the libraries under
-//! `models/lib/`, which every package may load and which seed
-//! `$PIE_HOME/models/lib/`.
+//! Embeds the repository's `models/`: every package and the `lib/` libraries.
 
 use std::fmt::Write as _;
 use std::path::Path;

@@ -1,7 +1,5 @@
-//! What a package states of itself in `package.poem`: the models it holds and
-//! the deployments of them it lists, each named by the grammar every
-//! deployment is named by; and, for each model, the template its turns are
-//! written in and what it asks of a tokenizer, as data.
+//! What a package states of itself in `package.poem`: its models, the
+//! deployments it lists, and each model's template and tokenizer, as data.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -21,9 +19,7 @@ use crate::Dtype;
 use crate::star::run::Deploy;
 use crate::star::values::{DtypeValue, word};
 
-/// The template a model's turns are written in: a format the runtime ships,
-/// with the settings the format leaves open. A setting the format does not
-/// read is refused when the template is built.
+/// A template: a format the runtime ships, with the settings it reads.
 #[derive(Clone, Debug, Default, PartialEq, Eq, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct Template {
     pub format: String,
@@ -47,9 +43,8 @@ impl fmt::Display for Template {
 #[starlark_value(type = "template")]
 impl<'v> StarlarkValue<'v> for Template {}
 
-/// What a model asks of the tokenizer an artifact carries: marker tokens the
-/// vocabulary must hold, markers pinned at an id, and the markers a part
-/// (`vision`, say) adds when a deployment serves it.
+/// What a model asks of its tokenizer: markers the vocabulary holds, markers
+/// pinned at an id, and the markers each part adds when served.
 #[derive(Clone, Debug, Default, PartialEq, Eq, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct Tokenizer {
     pub markers: Vec<Vec<String>>,
@@ -69,8 +64,6 @@ impl fmt::Display for Tokenizer {
 impl<'v> StarlarkValue<'v> for Tokenizer {}
 
 impl Tokenizer {
-    /// The marker groups a deployment serving `parts` reads: the model's own
-    /// and those of each part served.
     #[must_use]
     pub fn markers_for(&self, parts: &[String]) -> Vec<Vec<String>> {
         let mut markers = self.markers.clone();
@@ -95,9 +88,7 @@ pub struct Model {
     pub parts: Vec<String>,
     /// The drafters it pairs with.
     pub drafters: Vec<String>,
-    /// The chat template its turns are written in.
     pub template: Template,
-    /// What it asks of the tokenizer its checkpoint carries.
     pub tokenizer: Tokenizer,
     /// The architecture its media front-ends are chosen by.
     pub arch: String,
@@ -349,7 +340,6 @@ impl Model {
     }
 }
 
-/// The dtype `spelled` names, the inverse of [`word`].
 #[must_use]
 pub fn dtype_of(spelled: &str) -> Option<Dtype> {
     Dtype::ALL.iter().copied().find(|d| word(*d) == spelled)
@@ -357,11 +347,9 @@ pub fn dtype_of(spelled: &str) -> Option<Dtype> {
 
 #[starlark_module]
 pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
-    /// The template `format` (`chatml`, `harmony`, `gemma`, `deepseek`,
-    /// `glm`, `kimi`, `kimi3`, `inkling`, `atem`, `lines`, `raw`) with the
-    /// settings the format reads: ChatML its `thinking`, `preserve_thinking`,
-    /// `tools`, `generation_suffix` and `stop`; `lines` its `stop`, `bos` and
-    /// `eos`; `raw` its `stop`.
+    /// The template `format` with the settings it reads: ChatML `thinking`,
+    /// `preserve_thinking`, `tools`, `generation_suffix`, `stop`; `lines`
+    /// `stop`, `bos`, `eos`; `raw` `stop`.
     fn template(
         #[starlark(require = pos)] format: String,
         #[starlark(require = named, default = false)] thinking: bool,
@@ -384,9 +372,8 @@ pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
         })
     }
 
-    /// What a model asks of its tokenizer: `markers`, groups of tokens the
-    /// vocabulary must hold; `pinned`, markers at the id they must hold; and
-    /// `parts`, the marker groups each part adds when served.
+    /// `markers` the vocabulary must hold, `pinned` at the id given, and the
+    /// marker groups each of `parts` adds when served.
     fn tokenizer<'v>(
         #[starlark(require = named, default = UnpackList::default())] markers: UnpackList<
             UnpackList<String>,

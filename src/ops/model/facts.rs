@@ -39,7 +39,7 @@ pub struct Schedule {
 
 pub fn of(deployment: Option<&str>) -> Option<GenerativeFacts> {
     let deployment = runtime::catalog::catalog().parse(deployment?)?;
-    let generative = deployment.generative()?;
+    let generative = deployment.try_generative().ok()??;
     Some(GenerativeFacts {
         readings: generative.readings.iter().map(reading).collect(),
         latent: generative.latent.map(|l| Latent {
@@ -198,7 +198,7 @@ mod tests {
 
     fn a_text_row_reports_nothing_here() {
         let text = runtime::catalog::deployments()
-            .find(|deployment| deployment.generative().is_none())
+            .find(|deployment| deployment.try_generative().ok().flatten().is_none())
             .expect("the catalog ships text rows");
         assert!(of(Some(&text.name)).is_none());
         assert!(of(None).is_none());

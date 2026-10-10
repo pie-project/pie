@@ -1,6 +1,5 @@
-//! Text as it is: every turn is its text's tokens, with no role, cue or
-//! seal. A text encoder that conditions a diffusion model is spoken this
-//! way. A stop token the vocabulary lacks is simply not a stop.
+//! Text as it is: no role, cue or seal. A diffusion model's text encoder is
+//! spoken this way.
 
 use std::sync::Arc;
 

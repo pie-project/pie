@@ -1,8 +1,6 @@
-//! The catalog: a set of model packages and every deployment they list, each
-//! under the name it is served by. A build embeds the packages it ships; a
-//! test reads the repository's from disk, through [`repository`]. Nothing
-//! here names a model: what a model is, which deployments it lists, and what
-//! it asks of a template and a tokenizer, its package states.
+//! The catalog: model packages and every deployment they list, each under
+//! the name it is served by. A build embeds its packages; the tests read the
+//! repository's through [`repository`]. Nothing here names a model.
 
 use std::path::Path;
 use std::sync::{Arc, LazyLock, OnceLock};
@@ -27,7 +25,6 @@ pub struct Deployment {
 }
 
 impl Deployment {
-    /// The deployment `deploy` of `model`, which `package` holds.
     #[must_use]
     pub fn of(package: Arc<Package>, model: &Model, deploy: Deploy) -> Deployment {
         Deployment {
@@ -38,9 +35,7 @@ impl Deployment {
         }
     }
 
-    /// Whether the model serves this deployment on `platform`: the parts and
-    /// the drafter are ones it has, the model builds at that precision, and
-    /// its trace splits across the ranks.
+    /// The model admits the deployment and its trace builds and shards.
     pub fn check(&self, platform: Platform) -> Result<(), Refused> {
         self.model
             .admits(&self.deploy)
@@ -48,7 +43,6 @@ impl Deployment {
         self.try_trace(platform).map(drop)
     }
 
-    /// The trace each of the deployment's ranks runs.
     pub fn try_trace(&self, platform: Platform) -> Result<Trace, Refused> {
         let trace = self
             .package
@@ -57,16 +51,13 @@ impl Deployment {
         crate::shard::shard(trace, self.deploy.tp).map_err(|why| Refused(why.to_string()))
     }
 
-    /// The trace each of the deployment's ranks runs, for a deployment the
-    /// catalog lists, which always builds.
+    /// [`Deployment::try_trace`], panicking: for a listed deployment, which builds.
     #[must_use]
     pub fn trace(&self, platform: Platform) -> Trace {
         self.try_trace(platform)
             .unwrap_or_else(|why| panic!("`{}` does not build: {why}", self.name))
     }
 
-    /// The contract reading the checkpoint `src` into this deployment's
-    /// weights.
     pub fn contract(
         &self,
         src: &ztensor::Source,
@@ -77,32 +68,41 @@ impl Deployment {
             .import(&self.model.id, &self.deploy, src, platform)
     }
 
-    /// The generative facts the model states for this deployment.
-    #[must_use]
-    pub fn generative(&self) -> Option<Generative> {
+    pub fn try_generative(&self) -> Result<Option<Generative>, Refused> {
         self.package
             .generative(&self.model.id, &self.deploy)
-            .unwrap_or_else(|why| panic!("`{}` states no generative facts: {why:#}", self.name))
+            .map_err(|why| Refused(format!("{why:#}")))
     }
 
-    /// The canvas the model states for this deployment.
-    #[must_use]
-    pub fn diffusion(&self) -> Option<Diffusion> {
+    pub fn try_diffusion(&self) -> Result<Option<Diffusion>, Refused> {
         self.package
             .diffusion(&self.model.id, &self.deploy)
-            .unwrap_or_else(|why| panic!("`{}` states no canvas: {why:#}", self.name))
+            .map_err(|why| Refused(format!("{why:#}")))
     }
 
-    /// The marker groups this deployment's tokenizer must hold: the model's
-    /// and those of each part it serves.
+    /// [`Deployment::try_generative`], panicking: for a listed deployment.
+    #[must_use]
+    pub fn generative(&self) -> Option<Generative> {
+        self.try_generative()
+            .unwrap_or_else(|why| panic!("`{}` states no generative facts: {why}", self.name))
+    }
+
+    /// [`Deployment::try_diffusion`], panicking: for a listed deployment.
+    #[must_use]
+    pub fn diffusion(&self) -> Option<Diffusion> {
+        self.try_diffusion()
+            .unwrap_or_else(|why| panic!("`{}` states no canvas: {why}", self.name))
+    }
+
+    /// The marker groups the tokenizer must hold for the parts served.
     #[must_use]
     pub fn markers(&self) -> Vec<Vec<String>> {
         self.model.tokenizer.markers_for(&self.deploy.parts)
     }
 }
 
-/// An import reads a whole checkpoint, which one rank of a split row does not
-/// land: its share is banded out of a stamped artifact instead.
+/// An import reads a whole checkpoint; a split rank bands its share out of an
+/// artifact instead.
 pub fn whole(tp: u32) -> Result<(), poem::import::Error> {
     if tp == 1 {
         return Ok(());
@@ -116,10 +116,9 @@ pub fn whole(tp: u32) -> Result<(), poem::import::Error> {
     })
 }
 
-/// The rank counts [`Catalog::splits`] tries each listed deployment at.
+/// The rank counts [`Catalog::splits`] tries.
 pub const RANKS: [u32; 3] = [2, 4, 8];
 
-/// A set of packages and the deployments they list.
 pub struct Catalog {
     packages: Vec<Arc<Package>>,
     deployments: Vec<Deployment>,
@@ -127,36 +126,51 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    /// The catalog of `packages`, in their order.
     pub fn new(packages: Vec<Package>) -> Result<Catalog, Refused> {
-        Catalog::of(packages.into_iter().map(Arc::new).collect())
-    }
-
-    fn of(packages: Vec<Arc<Package>>) -> Result<Catalog, Refused> {
-        let mut deployments = Vec::new();
-        for package in &packages {
-            for (id, deploy) in &package.manifest().deployments {
-                let model = package.manifest().model(id).ok_or_else(|| {
-                    Refused(format!(
-                        "the package `{}` lists a deployment of `{id}`, which it holds no model of",
-                        package.name()
-                    ))
-                })?;
-                deployments.push(Deployment::of(Arc::clone(package), model, deploy.clone()));
-            }
+        let mut catalog = Catalog::empty();
+        for package in packages {
+            catalog.add(Arc::new(package))?;
         }
-        Ok(Catalog {
-            packages,
-            deployments,
-            splits: OnceLock::new(),
-        })
+        Ok(catalog)
     }
 
-    /// The catalog of `tree`, a package that does not load left out and
-    /// reported: a tree a person edits serves every package but the broken
-    /// one.
+    fn empty() -> Catalog {
+        Catalog {
+            packages: Vec::new(),
+            deployments: Vec::new(),
+            splits: OnceLock::new(),
+        }
+    }
+
+    /// Adds `package`, refused if it holds a model or lists a deployment
+    /// another package already does.
+    fn add(&mut self, package: Arc<Package>) -> Result<(), Refused> {
+        let manifest = package.manifest();
+        if let Some(taken) = manifest.models.iter().find(|m| self.model(&m.id).is_some()) {
+            return Err(Refused(format!(
+                "the package `{}` holds `{}`, which another package already holds",
+                package.name(),
+                taken.id
+            )));
+        }
+        let mut deployments = Vec::new();
+        for (id, deploy) in &manifest.deployments {
+            let model = manifest.model(id).ok_or_else(|| {
+                Refused(format!(
+                    "the package `{}` lists a deployment of `{id}`, which it holds no model of",
+                    package.name()
+                ))
+            })?;
+            deployments.push(Deployment::of(Arc::clone(&package), model, deploy.clone()));
+        }
+        self.packages.push(package);
+        self.deployments.extend(deployments);
+        Ok(())
+    }
+
+    /// The catalog of `tree`, a package that does not load left out and reported.
     pub fn of_tree(tree: &Tree) -> (Catalog, Vec<Refused>) {
-        let mut packages = Vec::new();
+        let mut catalog = Catalog::empty();
         let mut refused = Vec::new();
         for (name, files) in &tree.packages {
             let files: Vec<(&str, &str)> = files
@@ -164,23 +178,16 @@ impl Catalog {
                 .chain(&tree.library)
                 .map(|(f, s)| (f.as_str(), s.as_str()))
                 .collect();
-            match Package::new(name, &files) {
-                Ok(package) => packages.push(package),
-                Err(why) => refused.push(Refused(format!(
-                    "the package `{name}` does not load: {why:#}"
-                ))),
-            }
-        }
-        match Catalog::new(packages) {
-            Ok(catalog) => (catalog, refused),
-            Err(why) => {
+            let added = Package::new(name, &files)
+                .map_err(|why| Refused(format!("the package `{name}` does not load: {why:#}")))
+                .and_then(|package| catalog.add(Arc::new(package)));
+            if let Err(why) = added {
                 refused.push(why);
-                (Catalog::new(Vec::new()).expect("an empty catalog"), refused)
             }
         }
+        (catalog, refused)
     }
 
-    /// The catalog of `tree`, every package of which must load.
     pub fn from_tree(tree: &Tree) -> Result<Catalog, Refused> {
         let (catalog, refused) = Catalog::of_tree(tree);
         match refused.into_iter().next() {
@@ -189,26 +196,20 @@ impl Catalog {
         }
     }
 
-    /// The catalog of the packages under `root`, every one of which must
-    /// load: each directory holding a `package.poem`, with every `.poem`
-    /// file in it, and the libraries under `root/lib/`.
     pub fn from_dir(root: &Path) -> Result<Catalog, Refused> {
         Catalog::from_tree(&Tree::read(root)?)
     }
 
-    /// Every package, in order.
     #[must_use]
     pub fn packages(&self) -> &[Arc<Package>] {
         &self.packages
     }
 
-    /// The package named `name`.
     #[must_use]
     pub fn package(&self, name: &str) -> Option<&Arc<Package>> {
         self.packages.iter().find(|p| p.name() == name)
     }
 
-    /// The package holding the model `id`, if one does.
     #[must_use]
     pub fn package_of(&self, id: &str) -> Option<&Arc<Package>> {
         self.packages
@@ -216,7 +217,6 @@ impl Catalog {
             .find(|package| package.manifest().model(id).is_some())
     }
 
-    /// The model `id` and the package holding it.
     #[must_use]
     pub fn model(&self, id: &str) -> Option<(&Arc<Package>, &Model)> {
         self.packages
@@ -224,22 +224,18 @@ impl Catalog {
             .find_map(|package| package.manifest().model(id).map(|model| (package, model)))
     }
 
-    /// Every model every package holds, whole and miniature alike.
     pub fn models(&self) -> impl Iterator<Item = (&Arc<Package>, &Model)> {
         self.packages
             .iter()
             .flat_map(|package| package.manifest().models.iter().map(move |m| (package, m)))
     }
 
-    /// Every deployment the packages list, package by package in the order
-    /// each lists them. Each runs on one rank; [`Catalog::splits`] are the
-    /// same deployments across more.
+    /// The listed deployments, each on one rank.
     pub fn deployments(&self) -> impl Iterator<Item = &Deployment> {
         self.deployments.iter()
     }
 
-    /// Every listed deployment at every count of [`RANKS`] its model splits
-    /// it across, a deployment the compiler's sharding pass refuses left out.
+    /// The listed deployments at every count of [`RANKS`] they shard across.
     pub fn splits(&self) -> impl Iterator<Item = &Deployment> {
         self.splits
             .get_or_init(|| {
@@ -261,8 +257,7 @@ impl Catalog {
             .iter()
     }
 
-    /// The deployment `name` names: one the packages list, or one of its
-    /// splits.
+    /// A listed deployment or one of its splits, by name.
     #[must_use]
     pub fn deployment(&self, name: &str) -> Option<&Deployment> {
         self.deployments()
@@ -270,8 +265,7 @@ impl Catalog {
             .or_else(|| self.splits().find(|d| d.name == name))
     }
 
-    /// The deployment `name` spells of any model a package holds, listed or
-    /// not.
+    /// The deployment `name` spells, listed or not.
     #[must_use]
     pub fn parse(&self, name: &str) -> Option<Deployment> {
         self.packages.iter().find_map(|package| {
@@ -280,19 +274,15 @@ impl Catalog {
         })
     }
 
-    /// Every drafter a package states it was published for.
     pub fn published(&self) -> impl Iterator<Item = &Published> {
         self.packages
             .iter()
             .flat_map(|package| package.manifest().published.iter())
     }
 
-    /// Every listed deployment, the most likely to read a checkpoint first:
-    /// whole models before miniatures, which read a prefix of their whole
-    /// model's planes and would claim the whole checkpoint too; then the
-    /// richest deployment, since a checkpoint is served with every part and
-    /// drafter it carries unless a config leaves them off; the packages'
-    /// order breaks ties.
+    /// The listed deployments, the most likely to read a checkpoint first: whole
+    /// models before miniatures (which read a prefix of the whole's planes), then
+    /// the most parts and drafter, then package order.
     #[must_use]
     pub fn candidates(&self) -> Vec<&Deployment> {
         let mut candidates: Vec<&Deployment> = self.deployments().collect();
@@ -305,8 +295,6 @@ impl Catalog {
         candidates
     }
 
-    /// Every listed deployment with the contract reading `src` into it, in
-    /// [`Catalog::candidates`] order.
     pub fn fits<'a>(
         &'a self,
         src: &'a ztensor::Source,
@@ -318,7 +306,7 @@ impl Catalog {
             .map(move |d| (d, d.contract(src, platform)))
     }
 
-    /// The listed deployment that reads `src` as it is stored.
+    /// The listed deployment that reads `src` as stored.
     pub fn identify(&self, src: &ztensor::Source, platform: Platform) -> Result<&str, Unmatched> {
         let mut misses: Vec<(String, String)> = Vec::new();
         for deployment in self.candidates() {
@@ -340,8 +328,7 @@ impl Catalog {
         Err(Unmatched { misses })
     }
 
-    /// The trace of the model `id`, listed or not, at weights `w` and kv `kv`
-    /// on one rank, named `id`: the small geometries the engines' tests serve.
+    /// The trace of the model `id`, listed or not, on one rank: the engines' test geometries.
     #[must_use]
     pub fn trace_of(&self, id: &str, w: Dtype, kv: Dtype, platform: Platform) -> Trace {
         let package = self
@@ -352,8 +339,6 @@ impl Catalog {
             .unwrap_or_else(|why| panic!("`{id}` does not trace: {why:#}"))
     }
 
-    /// The contract reading `src` into the model `id`, listed or not, at
-    /// weights `w` and kv `kv` on one rank.
     pub fn import_of(
         &self,
         id: &str,
@@ -368,10 +353,8 @@ impl Catalog {
         package.import(id, &one_rank(w, kv), src, platform)
     }
 
-    /// The package holding the model `id` with `source` appended to its
-    /// `file`, stating `function` in place of the one the file states, which
-    /// stays as `whole_<function>`: a part of a model traced or read alone,
-    /// by the package's own functions.
+    /// The package of `id` with `source` appended to `file`, whose `function` is
+    /// renamed `whole_<function>`: a part of a model traced or read alone.
     pub fn replacing(
         &self,
         id: &str,
@@ -402,21 +385,17 @@ impl Catalog {
     }
 }
 
-/// A tree of packages as a directory holds them: each package's own files,
-/// `(file, source)`, and the libraries every package may load, as
-/// `(//lib/…, source)`.
+/// Packages as a directory holds them: each one's files, and the `//lib/`
+/// files every package may load.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Tree {
     pub packages: Vec<(String, Vec<(String, String)>)>,
     pub library: Vec<(String, String)>,
 }
 
-/// The prefix a library file is loaded under.
 pub const LIBRARY: &str = "//lib/";
 
 impl Tree {
-    /// The tree under `root`: each directory holding a `package.poem`, with
-    /// every `.poem` file in it, and `root/lib/` walked whole.
     pub fn read(root: &Path) -> Result<Tree, Refused> {
         let io = |what: &str, why: std::io::Error| Refused(format!("{what}: {why}"));
         let mut library = Vec::new();
@@ -461,15 +440,6 @@ impl Tree {
         packages.sort();
         Ok(Tree { packages, library })
     }
-
-    /// The package `name`'s own files, if the tree holds it.
-    #[must_use]
-    pub fn package(&self, name: &str) -> Option<&[(String, String)]> {
-        self.packages
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, files)| files.as_slice())
-    }
 }
 
 fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, String)>) -> Result<(), Refused> {
@@ -492,8 +462,6 @@ fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, String)>) -> Result<(),
     Ok(())
 }
 
-/// A deployment at weights `w` and kv `kv` on one rank, with no part or
-/// drafter.
 #[must_use]
 pub fn one_rank(w: Dtype, kv: Dtype) -> Deploy {
     Deploy {
@@ -505,8 +473,7 @@ pub fn one_rank(w: Dtype, kv: Dtype) -> Deploy {
     }
 }
 
-/// The plane an import of `contract` would quantize a second time: one
-/// stored quantized and published quantized again.
+/// The plane an import would quantize a second time, if any.
 #[must_use]
 pub fn requantizes(contract: &ModelContract) -> Option<String> {
     use checkpoint::types::Encoding;
@@ -538,7 +505,6 @@ impl std::fmt::Display for Unmatched {
 
 impl std::error::Error for Unmatched {}
 
-/// Where the repository keeps its packages, beside the crates.
 pub const REPOSITORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models");
 
 static REPOSITORY_CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
@@ -546,41 +512,34 @@ static REPOSITORY_CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
         .unwrap_or_else(|why| panic!("the repository's packages under {REPOSITORY}: {why}"))
 });
 
-/// The repository's catalog, read from `models/` on disk: what the tests
-/// serve. A build ships its own, embedded by the runtime.
+/// The repository's `models/`, read from disk: what the tests serve.
 pub fn repository() -> &'static Catalog {
     &REPOSITORY_CATALOG
 }
 
-/// The deployment `name` of the repository's catalog, listed or split.
 #[must_use]
 pub fn deployment(name: &str) -> Option<&'static Deployment> {
     repository().deployment(name)
 }
 
-/// Every deployment the repository's packages list.
 pub fn deployments() -> impl Iterator<Item = &'static Deployment> {
     repository().deployments()
 }
 
-/// Every listed deployment of the repository's catalog split across ranks.
 pub fn splits() -> impl Iterator<Item = &'static Deployment> {
     repository().splits()
 }
 
-/// The package of the repository's catalog holding the model `id`.
 #[must_use]
 pub fn package_of(id: &str) -> Option<&'static Arc<Package>> {
     repository().package_of(id)
 }
 
-/// [`Catalog::trace_of`] over the repository's catalog.
 #[must_use]
 pub fn trace_of(id: &str, w: Dtype, kv: Dtype, platform: Platform) -> Trace {
     repository().trace_of(id, w, kv, platform)
 }
 
-/// [`Catalog::import_of`] over the repository's catalog.
 pub fn import_of(
     id: &str,
     w: Dtype,
@@ -591,12 +550,10 @@ pub fn import_of(
     repository().import_of(id, w, kv, src, platform)
 }
 
-/// [`Catalog::replacing`] over the repository's catalog.
 pub fn replacing(id: &str, file: &str, function: &str, source: &str) -> Result<Package, String> {
     repository().replacing(id, file, function, source)
 }
 
-/// [`Catalog::identify`] over the repository's catalog.
 pub fn identify(src: &ztensor::Source, platform: Platform) -> Result<&'static str, Unmatched> {
     repository().identify(src, platform)
 }

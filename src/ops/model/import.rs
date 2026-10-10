@@ -75,9 +75,6 @@ pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<cra
         .published()
         .filter(|p| p.target.to_ascii_lowercase() == wanted)
         .collect();
-    // A target its package publishes a drafter for is imported with it, the
-    // first listed being the package's pick, unless `--drafter none`, or a
-    // head or deployment named by hand, says otherwise.
     let drafter = match args.drafter.take() {
         Some(name) if name.eq_ignore_ascii_case("none") => None,
         Some(name) => Some(name),
@@ -1368,8 +1365,7 @@ fn store_archive_name(path: &Path) -> Option<String> {
     Some(path.parent()?.file_name()?.to_str()?.to_string())
 }
 
-/// The stamp an artifact of `deployment` for `platform` is written with:
-/// the backend, the deployment, and the package holding it at its digest.
+/// The stamp an artifact of `deployment` is written with.
 fn stamp_of_deployment(deployment: &str, platform: Platform) -> Result<checkpoint::serving::Stamp> {
     let row = runtime::engine::load::deployment(deployment)?;
     Ok(

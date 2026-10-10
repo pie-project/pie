@@ -1,6 +1,5 @@
-//! Turns written as `Role: text` lines: a bos opens the prompt, each turn is
-//! its role, a colon and the text, closed by a blank line, and the
-//! assistant's is closed by an eos. HunyuanImage 3 is spoken this way.
+//! Turns as `Role: text` lines: a bos opens the prompt, a blank line closes a
+//! turn, an eos closes the assistant's. HunyuanImage 3 is spoken this way.
 
 use std::sync::Arc;
 

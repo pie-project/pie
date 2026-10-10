@@ -14,9 +14,14 @@ pub struct ModelMetadata {
     pub config: Vec<u8>,
 }
 
-/// The deployment `model_id` names, of the package the artifact at
-/// `artifact` carries: the runtime serves an artifact by its own package.
+/// The deployment `model_id` names: of the package an artifact's stamp
+/// names, or of this build's catalog for a raw checkpoint.
 pub fn deployment_of(model_id: &str, artifact: &Path) -> Result<crate::catalog::Deployment> {
+    if checkpoint::file::serve::stamp_of(artifact)?.is_none() {
+        return crate::catalog::catalog().parse(model_id).ok_or_else(|| {
+            anyhow!("the engine loaded {model_id:?}, which names no deployment this build serves")
+        });
+    }
     let package = crate::engine::load::carried(artifact)?;
     let (model, deploy) = package.manifest().parse(model_id).ok_or_else(|| {
         anyhow!(
@@ -70,8 +75,12 @@ pub fn register(
         .map_err(|fault| anyhow!("`{model_id}` refuses this artifact's tokenizer: {fault}"))?;
     let instruct = chat_template::build(&template_of(&deployment.model), tokenizer.clone())
         .map_err(|why| anyhow!("`{model_id}` states a template this runtime refuses: {why}"))?;
-    let diffusion = deployment.diffusion();
-    let generative = deployment.generative();
+    let diffusion = deployment
+        .try_diffusion()
+        .map_err(|why| anyhow!("`{model_id}` states a canvas this runtime refuses: {why}"))?;
+    let generative = deployment.try_generative().map_err(|why| {
+        anyhow!("`{model_id}` states generative facts this runtime refuses: {why}")
+    })?;
     if let Some(generative) = &generative {
         validate_generative(generative).map_err(|fault| {
             anyhow!("`{model_id}` states generative facts this runtime refuses: {fault}")
@@ -100,7 +109,7 @@ pub fn register(
 }
 
 /// The template a model's package states, as the template crate reads it.
-fn template_of(model: &poem::star::Model) -> chat_template::Spec {
+pub(crate) fn template_of(model: &poem::star::Model) -> chat_template::Spec {
     let t = &model.template;
     chat_template::Spec {
         format: t.format.clone(),

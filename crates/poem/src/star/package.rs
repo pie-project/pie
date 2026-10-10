@@ -119,13 +119,11 @@ impl Package {
         })
     }
 
-    /// The package's files, `(file, source)`, in name order.
     pub fn files(&self) -> impl Iterator<Item = (&str, &str)> {
         self.sources.iter().map(|(f, s)| (f.as_str(), s.as_str()))
     }
 
-    /// A digest of the package's name and files: what an artifact records
-    /// of the package it was imported with.
+    /// A digest of the name and files: what an artifact records of its package.
     #[must_use]
     pub fn digest(&self) -> String {
         let mut hasher = blake3::Hasher::new();

@@ -1,6 +1,5 @@
-//! A template as a model's package states it: a format this crate ships,
-//! configured. A package names no Rust; it picks a format and sets what the
-//! format leaves open, and [`build`] is the one place a name becomes an
+//! A template as a package states it: a format this crate ships, with the
+//! settings the format reads. [`build`] is the one place a name becomes an
 //! [`Instruct`].
 
 use std::sync::Arc;
@@ -10,35 +9,28 @@ use tokenizer::Tokenizer;
 use crate::Instruct;
 use crate::chatml::{ChatML, ChatMLInstruct};
 
-/// The formats a package may name, each a module of this crate.
 pub const FORMATS: &[&str] = &[
     "chatml", "harmony", "gemma", "deepseek", "glm", "kimi", "kimi3", "inkling", "atem", "lines",
     "raw",
 ];
 
-/// A format and its settings. A setting a format does not read is refused,
-/// so a package states only what its format reads.
+/// A format and its settings; a setting the format does not read is refused.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Spec {
     pub format: String,
-    /// ChatML: the model reasons in `<think>` blocks.
+    /// ChatML.
     pub thinking: bool,
-    /// ChatML: a replayed assistant turn keeps its reasoning.
     pub preserve_thinking: bool,
-    /// ChatML: the model calls tools.
     pub tools: bool,
-    /// ChatML: text after the assistant header that opens every generation.
     pub generation_suffix: String,
-    /// ChatML, lines, raw: the tokens a generation stops at.
+    /// ChatML, lines, raw.
     pub stop: Vec<String>,
-    /// Lines: the token that opens a prompt.
+    /// Lines.
     pub bos: Option<String>,
-    /// Lines: the token that closes an assistant turn.
     pub eos: Option<String>,
 }
 
 impl Spec {
-    /// The format `format` with nothing set.
     #[must_use]
     pub fn of(format: &str) -> Spec {
         Spec {
@@ -47,7 +39,6 @@ impl Spec {
         }
     }
 
-    /// Which of the settings this spec sets.
     fn set(&self) -> Vec<&'static str> {
         let mut set = Vec::new();
         if self.thinking {
@@ -74,7 +65,6 @@ impl Spec {
         set
     }
 
-    /// Refuses a setting the format does not read.
     pub fn check(&self) -> Result<(), String> {
         let reads: &[&str] = match self.format.as_str() {
             "chatml" => &[
@@ -113,7 +103,6 @@ impl Spec {
     }
 }
 
-/// The template `spec` states, over `tokenizer`.
 pub fn build(spec: &Spec, tokenizer: Arc<Tokenizer>) -> Result<Arc<dyn Instruct>, String> {
     spec.check()?;
     Ok(match spec.format.as_str() {
