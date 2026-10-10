@@ -93,6 +93,7 @@ pub const MIN_PROJECTION_COLUMNS: u32 = 4096;
 
 /// `PIE_ANE_PROJECTIONS=0|off|false` keeps every projection on the GPU;
 /// the MLPs still split.
+#[cfg(target_vendor = "apple")]
 fn projections_enabled() -> bool {
     !matches!(
         std::env::var("PIE_ANE_PROJECTIONS").as_deref(),
@@ -102,6 +103,7 @@ fn projections_enabled() -> bool {
 
 /// Every `linear.matmul` over an affine 4-bit bank wide enough to split,
 /// grouped by `(contraction, columns)` and numbered within the group.
+#[cfg(target_vendor = "apple")]
 pub fn projections(
     trace: &poem_ir::Trace,
     weights: &crate::weights::Weights,

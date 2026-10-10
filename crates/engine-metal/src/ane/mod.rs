@@ -12,8 +12,12 @@ pub use banks::Split;
 #[cfg(target_vendor = "apple")]
 pub use private::Private as Ane;
 
+#[cfg(target_vendor = "apple")]
 use kernels_metal::ane::Allotment;
 use kernels_metal::{Bank, Tensor};
+/// Without the Neural Engine a plan is never made; its values are nothing.
+#[cfg(not(target_vendor = "apple"))]
+type Allotment = ();
 #[cfg(not(target_vendor = "apple"))]
 use kernels_metal::{Ctx, Error};
 
@@ -81,7 +85,7 @@ impl Ane {
     pub fn verdict(&self) -> Option<Box<dyn Fn() -> Option<String> + Send>> {
         match *self {}
     }
-    pub fn compiled(&self) -> Option<Result<(), String>> {
+    pub fn compiled(&self) -> Option<std::result::Result<(), String>> {
         match *self {}
     }
     pub fn splits(&self) -> u64 {

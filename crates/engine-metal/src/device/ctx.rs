@@ -1,3 +1,4 @@
+#[cfg(target_vendor = "apple")]
 use std::cell::RefCell;
 
 use crate::error::{Fault, Result};
