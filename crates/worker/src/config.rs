@@ -465,7 +465,7 @@ pub struct ModelConfig {
     pub engine: EngineConfig,
     /// Where this model's materialized-weight artifacts are kept between runs.
     /// Empty derives `$PIE_HOME/cache/weights` (distinct from the `.zt`
-    /// artifact store at `$PIE_HOME/models`).
+    /// artifact store at `$PIE_HOME/artifacts`).
     /// Where this deployment's shared adapters live, or empty to mount none.
     /// A read-only directory with one subdirectory per adapter, each holding
     /// an `adapter.toml` and the plane files it names.

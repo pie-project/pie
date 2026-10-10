@@ -1,6 +1,7 @@
-//! An artifact that carries its model's package is served from that package:
-//! its deployment is named, composed and traced by the package, and a model
-//! this build's catalog has never heard of serves all the same.
+//! An artifact is served by the package its stamp names, read from the
+//! installed models directory: its deployment is named, composed and traced
+//! by that package, and a model this build embeds no package for serves all
+//! the same once its package is under `models/`.
 
 use std::collections::BTreeMap;
 
@@ -35,16 +36,36 @@ fn artifact(dir: &std::path::Path, package: &Package) -> std::path::PathBuf {
     let path = dir.join("stranger.zt");
     let writer = Writer::create_serving(
         &path,
-        &package.attributes(),
-        Stamp::of("cuda", "stranger-1b-bf16-kv-bf16"),
+        &BTreeMap::new(),
+        Stamp::of("cuda", "stranger-1b-bf16-kv-bf16")
+            .with_package(package.name(), &package.digest()),
     )
     .expect("open the artifact");
     writer.finish().expect("finish the artifact");
     path
 }
 
+/// The two cases share one catalog, installed once, so they run in order.
 #[test]
-fn a_model_no_catalog_lists_serves_from_its_artifact() {
+fn an_artifact_is_served_by_the_package_its_stamp_names() {
+    let home = tempfile::tempdir().unwrap();
+    let models = home.path().join("models");
+    let stranger = models.join("stranger");
+    std::fs::create_dir_all(&stranger).unwrap();
+    for (file, source) in [
+        ("package.poem", PACKAGE),
+        ("model.poem", MODEL),
+        ("forward.poem", FORWARD),
+    ] {
+        std::fs::write(stranger.join(file), source).unwrap();
+    }
+    assert!(runtime::catalog::embedded().package("stranger").is_none());
+    runtime::catalog::install(&models);
+    a_package_under_models_serves_its_artifact();
+    an_artifact_without_a_package_is_refused();
+}
+
+fn a_package_under_models_serves_its_artifact() {
     let package = Package::new(
         "stranger",
         &[
@@ -54,7 +75,10 @@ fn a_model_no_catalog_lists_serves_from_its_artifact() {
         ],
     )
     .unwrap();
-    assert!(runtime::catalog::deployment("stranger-1b-bf16-kv-bf16").is_none());
+    assert!(
+        runtime::catalog::deployment("stranger-1b-bf16-kv-bf16").is_some(),
+        "the installed package lists it"
+    );
     let dir = tempfile::tempdir().unwrap();
     let path = artifact(dir.path(), &package);
 
@@ -95,7 +119,6 @@ fn a_model_no_catalog_lists_serves_from_its_artifact() {
     );
 }
 
-#[test]
 fn an_artifact_without_a_package_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("plain.zt");
@@ -106,5 +129,5 @@ fn an_artifact_without_a_package_is_refused() {
     let why = packaged(&path, &Overrides::default(), poem::Platform::Cuda)
         .unwrap_err()
         .to_string();
-    assert!(why.contains("carries no model package"), "{why}");
+    assert!(why.contains("names no model package"), "{why}");
 }

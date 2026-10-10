@@ -143,11 +143,9 @@ pub fn deploy(row: &str) -> poem::star::Deploy {
 pub fn one_arm(id: &str, decode: bool) -> Package {
     let package =
         poem_compiler::catalog::package_of(id).unwrap_or_else(|| panic!("no package holds {id}"));
-    let files_at = format!("{}files/", poem::star::ATTRIBUTE);
     let mut files: Vec<(String, String)> = package
-        .attributes()
-        .into_iter()
-        .filter_map(|(key, source)| Some((key.strip_prefix(&files_at)?.to_string(), source)))
+        .files()
+        .map(|(file, source)| (file.to_string(), source.to_string()))
         .collect();
     for (file, source) in &mut files {
         if file == "forward.poem" {

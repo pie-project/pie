@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use checkpoint::contract::ModelContract;
@@ -109,31 +110,36 @@ fn composed(
     Ok(deploy)
 }
 
-/// The package an artifact carries, if it carries one.
-pub fn package_of(path: &Path) -> Result<Option<poem::star::Package>> {
-    if path.is_dir() {
-        return Ok(None);
+/// The package the artifact at `path` was imported with, which its stamp
+/// names and this build's catalog holds. An artifact is served by that
+/// package and nothing else.
+pub fn carried(path: &Path) -> Result<Arc<poem::star::Package>> {
+    let stamp = stamp_of(path)?.ok_or_else(|| anyhow!("{path:?} carries no serving stamp"))?;
+    if stamp.package.is_empty() {
+        return Err(anyhow!(
+            "{path:?} names no model package; import the checkpoint again with this build"
+        ));
     }
-    let Ok(Some(manifest)) = ztensor::read::manifest_of(path) else {
-        return Ok(None);
-    };
-    let Some(ztensor::format::cbor::Value::Map(attributes)) = manifest.attributes.as_ref() else {
-        return Ok(None);
-    };
-    let texts = attributes
-        .iter()
-        .filter_map(|(key, value)| Some((key.as_text()?, value.as_text()?)));
-    poem::star::Package::from_attributes(texts)
-        .with_context(|| format!("read the package {path:?} carries"))
-}
-
-/// The package the artifact at `path` carries. An artifact is served by its
-/// own package and nothing else: one that carries none is not an artifact
-/// this build serves.
-pub fn carried(path: &Path) -> Result<poem::star::Package> {
-    package_of(path)?.ok_or_else(|| {
-        anyhow!("{path:?} carries no model package; import the checkpoint again with this build")
-    })
+    let package = catalog().package(&stamp.package).ok_or_else(|| {
+        anyhow!(
+            "{path:?} was imported with the package `{}`, which this build's catalog does not \
+             hold{}",
+            stamp.package,
+            match crate::catalog::installed() {
+                Some(models) => format!(" (it reads {models:?} and what it embeds)"),
+                None => String::new(),
+            }
+        )
+    })?;
+    if package.digest() != stamp.package_digest {
+        tracing::warn!(
+            ?path,
+            package = stamp.package,
+            "the package differs from the one this artifact was imported with; it serves if \
+             its layout is the same, and `pie model import` writes it again if not"
+        );
+    }
+    Ok(Arc::clone(package))
 }
 
 /// What an artifact serves under `overrides`: the deployment's name, its rank
@@ -166,18 +172,16 @@ pub fn packaged(
 }
 
 /// How the deployment `name` stamped on the artifact at `artifact` is
-/// served, as the package it carries spells it.
+/// served, as this build's catalog or else the artifact's own package
+/// spells it: what a config's precision and drafter pick an artifact by.
 #[must_use]
 pub fn deploy_of(artifact: &Path, name: &str) -> Option<poem::star::Deploy> {
-    let package = package_of(artifact).ok()??;
+    if let Some(deployment) = catalog().parse(name) {
+        return Some(deployment.deploy);
+    }
+    let package = carried(artifact).ok()?;
     let (_, deploy) = package.manifest().parse(name)?;
     Some(deploy)
-}
-
-/// The attributes an artifact of the deployment `name` carries its package
-/// in, if a package holds its model.
-pub fn package_attributes(name: &str) -> Result<std::collections::BTreeMap<String, String>> {
-    Ok(deployment(name)?.package.attributes())
 }
 
 pub fn open_source(checkpoint: &Path) -> Result<ztensor::Source> {

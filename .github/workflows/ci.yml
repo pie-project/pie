@@ -292,7 +292,7 @@ jobs:
           cargo build --release -p pie --features wgpu
           python3 scripts/tiny_qwen35.py "$RUNNER_TEMP/snapshot" --tokenizer ~/qwen35-tokenizer
           PIE_HOME="$RUNNER_TEMP/home" target/release/pie model import "$RUNNER_TEMP/snapshot" --deployment qwen35-tiny-u4g64-kv-bf16 --keep-source
-          mkdir -p tests/browser/models && cp "$(find "$RUNNER_TEMP/home/models" -name '*.wgpu.zt' | head -1)" tests/browser/models/tiny.wgpu.zt
+          mkdir -p tests/browser/models && cp "$(find "$RUNNER_TEMP/home/artifacts" -name '*.wgpu.zt' | head -1)" tests/browser/models/tiny.wgpu.zt
           ./packages/javascript/server-web/build.sh release
           for l in python javascript; do tar xzf "$RUNNER_TEMP/languages/pie-language-$l.tar.gz" -C "$RUNNER_TEMP/home"; done
           PIE_HOME="$RUNNER_TEMP/home" ./tests/browser/tools/inferlets.sh

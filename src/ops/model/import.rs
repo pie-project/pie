@@ -337,7 +337,7 @@ pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<cra
         .map(|raw| raw.span_bytes)
         .sum();
 
-    let stamp = checkpoint::serving::Stamp::of(&backend_word(platform), deployment);
+    let stamp = stamp_of_deployment(deployment, platform)?;
     let trace = runtime::engine::load::trace(deployment, platform)?;
     let ranked = runtime::engine::load::sequence(&trace);
     let groups = groups_of(&landing, &trace)?;
@@ -434,12 +434,11 @@ pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<cra
         _ => None,
     };
 
-    let mut provenance = BTreeMap::from([
+    let provenance = BTreeMap::from([
         (VERSION_KEY.to_string(), pie_version().to_string()),
         (SOURCE_KEY.to_string(), source.origin.clone()),
         (SOURCE_ENCODING_KEY.to_string(), source_encoding(&metadata)),
     ]);
-    provenance.extend(runtime::engine::load::package_attributes(deployment)?);
     let mut writer = Writer::create_serving(&out_file, &provenance, stamp.clone())
         .map_err(|err| anyhow!("cannot write the artifact: {err}"))?;
     for group in &groups {
@@ -638,7 +637,7 @@ fn overlay_onto_artifact(
         .map(|raw| raw.span_bytes)
         .sum();
     let copy_bytes: u64 = copies.iter().map(|copy| copy.raw.span_bytes).sum();
-    let stamp = checkpoint::serving::Stamp::of(&backend_word(platform), deployment);
+    let stamp = stamp_of_deployment(deployment, platform)?;
     let trace = runtime::engine::load::trace(deployment, platform)?;
     let ranked = runtime::engine::load::sequence(&trace);
     let groups = groups_of(&landing, &trace)?;
@@ -685,11 +684,10 @@ fn overlay_onto_artifact(
     let held = std::fs::metadata(&base_file)
         .with_context(|| format!("stat {}", base_file.display()))?
         .len();
-    let mut provenance = BTreeMap::from([
+    let provenance = BTreeMap::from([
         (VERSION_KEY.to_string(), pie_version().to_string()),
         (SOURCE_KEY.to_string(), source.origin.clone()),
     ]);
-    provenance.extend(runtime::engine::load::package_attributes(deployment)?);
     let restore = |why: anyhow::Error| -> anyhow::Error {
         match std::fs::OpenOptions::new()
             .write(true)
@@ -1354,6 +1352,16 @@ fn store_archive_name(path: &Path) -> Option<String> {
     Some(path.parent()?.file_name()?.to_str()?.to_string())
 }
 
+/// The stamp an artifact of `deployment` for `platform` is written with:
+/// the backend, the deployment, and the package holding it at its digest.
+fn stamp_of_deployment(deployment: &str, platform: Platform) -> Result<checkpoint::serving::Stamp> {
+    let row = runtime::engine::load::deployment(deployment)?;
+    Ok(
+        checkpoint::serving::Stamp::of(&backend_word(platform), deployment)
+            .with_package(row.package.name(), &row.package.digest()),
+    )
+}
+
 pub(crate) fn store_path(name: &str) -> PathBuf {
     crate::local::store::archive_path(name)
 }
@@ -1687,21 +1695,27 @@ fn staleness(
             stamp.deployment
         ));
     }
-    if runtime::engine::load::trace(&stamp.deployment, platform).is_err() {
+    let wanted = match stamp_of_deployment(&stamp.deployment, platform) {
+        Ok(wanted) => wanted,
+        Err(_) => {
+            return Some(format!(
+                "this build ships no deployment named `{}`",
+                stamp.deployment
+            ));
+        }
+    };
+    if stamp.package != wanted.package {
         return Some(format!(
-            "this build ships no deployment named `{}`",
-            stamp.deployment
+            "it was imported with the package `{}` and `{}` holds that deployment now",
+            stamp.package, wanted.package
         ));
     }
-    let carried = match runtime::engine::load::package_of(artifact) {
-        Ok(carried) => carried.map(|package| package.attributes()),
-        Err(err) => return Some(format!("{err:#}")),
-    };
-    let ships = runtime::engine::load::package_attributes(&stamp.deployment).ok();
-    if carried.unwrap_or_default() != ships.unwrap_or_default() {
-        return Some("the model package it carries is not the one this build ships".to_string());
+    if stamp.package_digest != wanted.package_digest {
+        return Some(format!(
+            "the package `{}` changed since it was imported",
+            stamp.package
+        ));
     }
-    let wanted = checkpoint::serving::Stamp::of(&backend_word(platform), &stamp.deployment);
     if let Err(mismatch) = stamp.check(&wanted) {
         return Some(mismatch.to_string());
     }
@@ -2259,8 +2273,10 @@ mod tests {
 
     fn a_store_archive_takes_its_name_from_its_directory() {
         assert_eq!(
-            store_archive_name(Path::new("/home/u/.pie/models/Qwen--Qwen3-0.6B/archive.zt"))
-                .as_deref(),
+            store_archive_name(Path::new(
+                "/home/u/.pie/artifacts/Qwen--Qwen3-0.6B/archive.zt"
+            ))
+            .as_deref(),
             Some("Qwen--Qwen3-0.6B")
         );
         assert_eq!(store_archive_name(Path::new("/data/qwen.zt")), None);
@@ -2372,11 +2388,11 @@ mod tests {
 
     fn the_chosen_row_is_in_the_filename_the_dry_run_reports() {
         let stamp = checkpoint::serving::Stamp::of("vulkan", "gemma4-e4b-vision-bf16-kv-bf16");
-        let written = Path::new("/home/u/.pie/models/google--gemma-4-E4B-it/archive.zt");
+        let written = Path::new("/home/u/.pie/artifacts/google--gemma-4-E4B-it/archive.zt");
         assert_eq!(
             specialized_path(written, "google--gemma-4-E4B-it", &stamp, None),
             Path::new(
-                "/home/u/.pie/models/google--gemma-4-E4B-it/\
+                "/home/u/.pie/artifacts/google--gemma-4-E4B-it/\
                  google--gemma-4-e4b-it.gemma4-e4b-vision-bf16-kv-bf16.vulkan.zt"
             ),
         );

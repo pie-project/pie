@@ -25,6 +25,14 @@ pub struct Stamp {
     pub deployment: String,
     pub layout_revision: u64,
     pub adapters_zeroed: bool,
+    /// The model package the deployment is of, by name; the serving build
+    /// reads the package of that name from its catalog.
+    pub package: String,
+    /// The digest of the package's files as they were when the artifact was
+    /// imported: a package edited since still serves if its layout is the
+    /// same, and `pie model import` knows the artifact is not what the
+    /// package now states.
+    pub package_digest: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -34,6 +42,8 @@ pub enum Field {
     Deployment,
     LayoutRevision,
     AdaptersZeroed,
+    Package,
+    PackageDigest,
 }
 
 impl Field {
@@ -45,11 +55,28 @@ impl Field {
             Field::Deployment => "deployment",
             Field::LayoutRevision => "layout_revision",
             Field::AdaptersZeroed => "adapters_zeroed",
+            Field::Package => "package",
+            Field::PackageDigest => "package_digest",
         }
     }
 
     #[must_use]
     pub fn required() -> &'static [Field] {
+        &[
+            Field::Serving,
+            Field::Backend,
+            Field::Deployment,
+            Field::LayoutRevision,
+            Field::AdaptersZeroed,
+            Field::Package,
+            Field::PackageDigest,
+        ]
+    }
+
+    /// The fields that say what an artifact is for, which a load's
+    /// deployment must match; the package fields say where it came from.
+    #[must_use]
+    pub fn identity() -> &'static [Field] {
         &[
             Field::Serving,
             Field::Backend,
@@ -123,6 +150,8 @@ impl Stamp {
                     text(Field::AdaptersZeroed.key()),
                     Value::Bool(self.adapters_zeroed),
                 ),
+                (text(Field::Package.key()), text(&self.package)),
+                (text(Field::PackageDigest.key()), text(&self.package_digest)),
             ]),
         )])
     }
@@ -135,7 +164,17 @@ impl Stamp {
             deployment: deployment.to_string(),
             layout_revision: LAYOUT_REVISION,
             adapters_zeroed: true,
+            package: String::new(),
+            package_digest: String::new(),
         }
+    }
+
+    /// This stamp, of the model package `package` at `digest`.
+    #[must_use]
+    pub fn with_package(mut self, package: &str, digest: &str) -> Stamp {
+        self.package = package.to_string();
+        self.package_digest = digest.to_string();
+        self
     }
 
     pub fn decode(attributes: &Value) -> Result<Stamp, Error> {
@@ -170,11 +209,13 @@ impl Stamp {
             deployment: required_text(attributes, Field::Deployment)?.to_string(),
             layout_revision: required_uint(attributes, Field::LayoutRevision)?,
             adapters_zeroed,
+            package: required_text(attributes, Field::Package)?.to_string(),
+            package_digest: required_text(attributes, Field::PackageDigest)?.to_string(),
         })
     }
 
     pub fn check(&self, deployment: &Stamp) -> Result<(), Mismatch> {
-        for field in Field::required() {
+        for field in Field::identity() {
             let (artifact, wanted) = (self.say(*field), deployment.say(*field));
             if artifact != wanted {
                 return Err(Mismatch {
@@ -195,6 +236,8 @@ impl Stamp {
             Field::Deployment => self.deployment.clone(),
             Field::LayoutRevision => self.layout_revision.to_string(),
             Field::AdaptersZeroed => self.adapters_zeroed.to_string(),
+            Field::Package => self.package.clone(),
+            Field::PackageDigest => self.package_digest.clone(),
         }
     }
 }

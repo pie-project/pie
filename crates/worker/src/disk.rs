@@ -58,10 +58,19 @@ pub fn entries(home: &Path, hf_cache: Option<PathBuf>) -> Vec<Entry> {
             keep: &[],
         },
         Entry {
+            name: "artifacts",
+            path: home.join("artifacts"),
+            what: "Imported `.zt` artifacts -- the models pie serves. Losing \
+                   one costs a re-download and a re-import, not a reload.",
+            reclaim: Reclaim::OnRequest,
+            keep: &[],
+        },
+        Entry {
             name: "models",
             path: home.join("models"),
-            what: "Converted `.zt` artifacts -- the models pie serves. Losing \
-                   one costs a re-download and a re-convert, not a reload.",
+            what: "Model packages that shadow or add to the ones built in. \
+                   Deleting one means the built-in package serves again, or \
+                   nothing does.",
             reclaim: Reclaim::OnRequest,
             keep: &[],
         },

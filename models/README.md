@@ -35,11 +35,15 @@ A model is spoken through a template and a tokenizer, both stated as data in
 ## Where the packages go
 
 The runtime embeds every package here at build time (`crates/runtime/build.rs`)
-as the catalog a build ships; the tests read them from this directory
-(`poem_compiler::catalog::repository()`), so editing a package rebuilds
-nothing below the runtime.
+as the catalog a build ships. `$PIE_HOME/models/` holds the same tree on a
+machine: a package there shadows the embedded one of the same name, and a
+new directory there is a new model, with no build. The tests read this
+directory (`poem_compiler::catalog::repository()`), so editing a package
+rebuilds nothing below the runtime.
 
-`pie model import` writes the package into the artifact it produces (under
-the `pie.package/` attributes, with the builtins version it was written
-against), and serving traces the artifact's own package: an artifact keeps
-meaning what it meant when it was imported, whatever this tree holds since.
+An artifact (`$PIE_HOME/artifacts/<model>/*.zt`) names the package it was
+imported with and that package's digest in its serving stamp; it is served
+by the package of that name and nothing else. A package edited since import
+still serves if its layout is the same (the artifact's planes are checked
+against the trace), and `pie model import` sees the digest differ and
+writes the artifact again.

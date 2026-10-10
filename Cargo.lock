@@ -4360,6 +4360,7 @@ version = "0.5.4"
 dependencies = [
  "allocative",
  "anyhow",
+ "blake3",
  "checkpoint",
  "pie-poem-ir",
  "starlark",

@@ -1,9 +1,8 @@
 //! `package.poem` states a package's models and the deployments it lists,
-//! each named by the one grammar every deployment is named by; and the
-//! package travels in an artifact's attributes, refused under other builtins.
+//! each named by the one grammar every deployment is named by; and its
+//! digest follows its files.
 
-use poem::Platform;
-use poem::star::{API, ATTRIBUTE, Deploy, Package};
+use poem::star::{Deploy, Package};
 
 const PACKAGE: &str = r#"
 TOY = template("raw", stop = ["<eos>"])
@@ -129,41 +128,19 @@ DEPLOYMENTS = [deployment("toy-2b", weights = dtype.bf16, kv = dtype.bf16)]
 }
 
 #[test]
-fn a_package_travels_in_attributes_and_traces_the_same() {
+fn a_package_digest_follows_its_files() {
     let package = toy();
-    let attributes = package.attributes();
-    assert!(attributes.keys().all(|k| k.starts_with(ATTRIBUTE)));
-    let carried = Package::from_attributes(
-        attributes
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .chain([("pie_source", "elsewhere")]),
+    let same = toy();
+    assert_eq!(package.digest(), same.digest());
+    let edited = Package::new(
+        "toy",
+        &[
+            ("package.poem", PACKAGE),
+            ("model.poem", MODEL),
+            ("forward.poem", &format!("{FORWARD}\n# a comment\n")),
+        ],
     )
-    .unwrap()
-    .expect("the attributes carry a package");
-    assert_eq!(carried.attributes(), attributes);
-    let (id, deploy) = &package.manifest().deployments[0];
-    let trace = |p: &Package| {
-        p.trace(id, deploy, "toy-1b-bf16-kv-bf16", Platform::Cuda)
-            .unwrap()
-    };
-    assert!(trace(&carried) == trace(&package));
-    assert!(
-        Package::from_attributes([("pie_source", "elsewhere")])
-            .unwrap()
-            .is_none()
-    );
-}
-
-#[test]
-fn a_package_written_against_other_builtins_is_refused() {
-    let mut attributes = toy().attributes();
-    attributes.insert(format!("{ATTRIBUTE}api"), (API + 1).to_string());
-    let why = Package::from_attributes(attributes.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .err()
-        .expect("another version's package is refused");
-    assert!(
-        format!("{why:#}").contains("import the checkpoint again"),
-        "{why:#}"
-    );
+    .unwrap();
+    assert_ne!(package.digest(), edited.digest());
+    assert_eq!(package.files().count(), 3);
 }

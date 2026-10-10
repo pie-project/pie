@@ -90,7 +90,7 @@ fn lift_snapshot_config(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn store_dir(home: &Path) -> PathBuf {
-    home.join("models")
+    home.join("artifacts")
 }
 
 #[derive(Debug, Default, Clone, Copy)]

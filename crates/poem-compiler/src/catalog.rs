@@ -129,7 +129,10 @@ pub struct Catalog {
 impl Catalog {
     /// The catalog of `packages`, in their order.
     pub fn new(packages: Vec<Package>) -> Result<Catalog, Refused> {
-        let packages: Vec<Arc<Package>> = packages.into_iter().map(Arc::new).collect();
+        Catalog::of(packages.into_iter().map(Arc::new).collect())
+    }
+
+    fn of(packages: Vec<Arc<Package>>) -> Result<Catalog, Refused> {
         let mut deployments = Vec::new();
         for package in &packages {
             for (id, deploy) in &package.manifest().deployments {
@@ -222,10 +225,35 @@ impl Catalog {
         Catalog::new(packages)
     }
 
+    /// This catalog with the packages under `root` added, a package of a
+    /// name this catalog already holds replaced by the one on disk: what a
+    /// build ships, shadowed by what `$PIE_HOME/models` holds.
+    pub fn shadowed_by(self, root: &Path) -> Result<Catalog, Refused> {
+        if !root.is_dir() {
+            return Ok(self);
+        }
+        let disk = Catalog::from_dir(root)?;
+        let mut packages: Vec<Arc<Package>> = self
+            .packages
+            .iter()
+            .filter(|package| disk.package(package.name()).is_none())
+            .cloned()
+            .collect();
+        packages.extend(disk.packages.iter().cloned());
+        packages.sort_by(|a, b| a.name().cmp(b.name()));
+        Catalog::of(packages)
+    }
+
     /// Every package, in order.
     #[must_use]
     pub fn packages(&self) -> &[Arc<Package>] {
         &self.packages
+    }
+
+    /// The package named `name`.
+    #[must_use]
+    pub fn package(&self, name: &str) -> Option<&Arc<Package>> {
+        self.packages.iter().find(|p| p.name() == name)
     }
 
     /// The package holding the model `id`, if one does.
@@ -402,19 +430,16 @@ impl Catalog {
         let package = self
             .package_of(id)
             .ok_or_else(|| format!("no package holds `{id}`"))?;
-        let prefix = format!("{}files/", poem::star::ATTRIBUTE);
         let stated = format!("def {function}(");
         let files: Vec<(String, String)> = package
-            .attributes()
-            .into_iter()
-            .filter_map(|(key, text)| {
-                let name = key.strip_prefix(&prefix)?.to_string();
+            .files()
+            .map(|(name, text)| {
                 let text = if name == file {
                     text.replace(&stated, &format!("def whole_{function}(")) + "\n" + source
                 } else {
-                    text
+                    text.to_string()
                 };
-                Some((name, text))
+                (name.to_string(), text)
             })
             .collect();
         let files: Vec<(&str, &str)> = files

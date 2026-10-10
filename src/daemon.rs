@@ -103,10 +103,12 @@ fn install_crypto_provider() {
 /// the panic hook and rustls.
 pub fn init_command(global: &GlobalArgs) {
     init_observability(&global.log_level);
+    runtime::catalog::install(&crate::paths::models_dir());
 }
 
 pub fn init(spec: BootSpec, global: GlobalArgs) -> Result<Ctx> {
     init_observability(&global.log_level);
+    runtime::catalog::install(&crate::paths::models_dir());
 
     let config = read_config(&spec, &global)?;
 

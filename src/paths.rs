@@ -15,6 +15,18 @@ pub fn pie_home_file(name: &str) -> PathBuf {
     pie_home().join(name)
 }
 
+/// Where the model packages live: `<package>/{package,model,forward,formats}.poem`
+/// and `lib/`, the same tree as the repository's `models/`. A package here
+/// shadows the one of the same name the binary embeds.
+pub fn models_dir() -> PathBuf {
+    pie_home().join("models")
+}
+
+/// Where imported artifacts live: `<model>/<slug>.<deployment>.<backend>.zt`.
+pub fn artifacts_dir() -> PathBuf {
+    pie_home().join("artifacts")
+}
+
 /// Where installed inferlets live: `<name>/<version>.{wasm,py,js}` beside
 /// `<version>.toml`.
 pub fn inferlets_dir() -> PathBuf {

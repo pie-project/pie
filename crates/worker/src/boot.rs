@@ -217,6 +217,7 @@ fn load(
     engine: Engine,
     builtins: Vec<runtime::bootstrap::BuiltinProgram>,
 ) -> Result<Loaded> {
+    runtime::catalog::install(&home.join("models"));
     let opened = match engine {
         Engine::None => return load_without_engine(user_cfg, home, builtins),
         Engine::Configured => None,

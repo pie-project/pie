@@ -17,7 +17,7 @@ pub struct ModelMetadata {
 /// The deployment `model_id` names, of the package the artifact at
 /// `artifact` carries: the runtime serves an artifact by its own package.
 pub fn deployment_of(model_id: &str, artifact: &Path) -> Result<crate::catalog::Deployment> {
-    let package = Arc::new(crate::engine::load::carried(artifact)?);
+    let package = crate::engine::load::carried(artifact)?;
     let (model, deploy) = package.manifest().parse(model_id).ok_or_else(|| {
         anyhow!(
             "the engine loaded {model_id:?}, which the package `{}` names no deployment of",

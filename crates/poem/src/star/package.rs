@@ -88,15 +88,6 @@ fn base() -> GlobalsBuilder {
     .with(crate::star::layout::dtypes)
 }
 
-/// The version of the builtins a package is written against. An artifact
-/// records the one its package was imported under, and a build serves it only
-/// at the same one: a package is code, and code written against other
-/// builtins does not mean what it meant.
-pub const API: u32 = 2;
-
-/// The attribute prefix an artifact carries its package under.
-pub const ATTRIBUTE: &str = "pie.package/";
-
 /// A model package, its files frozen.
 pub struct Package {
     name: String,
@@ -128,54 +119,24 @@ impl Package {
         })
     }
 
-    /// The package an artifact carries in its attributes `(key, text)`, if
-    /// it carries one; refused if it was written against other builtins.
-    pub fn from_attributes<'a>(
-        attributes: impl IntoIterator<Item = (&'a str, &'a str)>,
-    ) -> anyhow::Result<Option<Package>> {
-        let mut name = None;
-        let mut api = None;
-        let mut files = Vec::new();
-        for (key, text) in attributes {
-            let Some(key) = key.strip_prefix(ATTRIBUTE) else {
-                continue;
-            };
-            match key {
-                "name" => name = Some(text),
-                "api" => api = Some(text),
-                _ => match key.strip_prefix("files/") {
-                    Some(file) => files.push((file, text)),
-                    None => anyhow::bail!("an artifact's package states `{ATTRIBUTE}{key}`"),
-                },
-            }
-        }
-        let Some(name) = name else {
-            if files.is_empty() && api.is_none() {
-                return Ok(None);
-            }
-            anyhow::bail!("an artifact carries a package's files and not its name");
-        };
-        if api != Some(API.to_string().as_str()) {
-            anyhow::bail!(
-                "the artifact's package `{name}` is written against builtins version {} and \
-                 this build's are version {API}; import the checkpoint again",
-                api.unwrap_or("(none)")
-            );
-        }
-        Package::new(name, &files).map(Some)
+    /// The package's files, `(file, source)`, in name order.
+    pub fn files(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.sources.iter().map(|(f, s)| (f.as_str(), s.as_str()))
     }
 
-    /// The attributes an artifact carries this package in.
+    /// A digest of the package's name and files: what an artifact records
+    /// of the package it was imported with.
     #[must_use]
-    pub fn attributes(&self) -> BTreeMap<String, String> {
-        let mut out = BTreeMap::from([
-            (format!("{ATTRIBUTE}name"), self.name.clone()),
-            (format!("{ATTRIBUTE}api"), API.to_string()),
-        ]);
+    pub fn digest(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(self.name.as_bytes());
         for (file, source) in &self.sources {
-            out.insert(format!("{ATTRIBUTE}files/{file}"), source.clone());
+            hasher.update(&[0]);
+            hasher.update(file.as_bytes());
+            hasher.update(&[0]);
+            hasher.update(source.as_bytes());
         }
-        out
+        hasher.finalize().to_hex().to_string()
     }
 
     /// What the package states of itself in `package.poem`.
