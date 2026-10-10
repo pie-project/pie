@@ -266,8 +266,11 @@ impl Partition {
     }
 
     /// The partition among groups of `replicas` ranks in a row, each group
-    /// holding one share.
+    /// holding one share. The whole is one share however it is replicated.
     pub fn grouped(self, replicas: u32) -> Result<Self, Error> {
+        if self.world <= 1 {
+            return Ok(Self::WHOLE);
+        }
         let replicas = replicas.max(1);
         if !self.world.max(1).is_multiple_of(replicas) {
             return Err(Error::Shard(format!(
