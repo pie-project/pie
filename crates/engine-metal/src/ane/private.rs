@@ -447,11 +447,13 @@ pub fn load(
     }
     frame.commit()?;
 
-    let event = device
-        .device()
-        .newSharedEvent()
-        .ok_or(fault("no shared event".into()))?;
-    let handoff = Handoff::new(event);
+    let event = || {
+        device
+            .device()
+            .newSharedEvent()
+            .ok_or(fault("no shared event".into()))
+    };
+    let handoff = Handoff::new(event()?, event()?);
 
     // Every program compiles on one thread, in order, so serving starts
     // while they do and the compiler service sees one at a time.
@@ -614,8 +616,7 @@ impl Private {
         kernels::prepare(ctx, &site.shared, x, rotated, plan.at.ready)?;
         if let Some(Ok(ffn)) = site.ffn.get() {
             let binding = &ffn.evaluations[plan.evaluation].1[(plan.layer & 1) as usize];
-            self.handoff
-                .start(&ffn.program, binding, plan.at.ready, plan.at.done);
+            self.handoff.start(ctx, &ffn.program, binding, plan.at)?;
             self.splits.fetch_add(1, Ordering::AcqRel);
         }
         Ok(())
@@ -663,7 +664,7 @@ impl Private {
         if let Some(Ok(program)) = site.program.get() {
             let binding = &program.evaluations[plan.evaluation].1[(plan.layer & 1) as usize];
             self.handoff
-                .start(&program.program, binding, plan.at.ready, plan.at.done);
+                .start(ctx, &program.program, binding, plan.at)?;
             self.column_splits.fetch_add(1, Ordering::AcqRel);
         }
         Ok(())

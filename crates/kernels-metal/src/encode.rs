@@ -73,6 +73,15 @@ pub trait Encode {
         let _ = stamp;
         Err(Error::Unsupported { op: "handoff.wait" })
     }
+
+    /// Runs `then` once the frame this encodes into is committed; a frame
+    /// dropped uncommitted never runs it.
+    fn on_commit(&self, then: Box<dyn FnOnce() + Send>) -> Result<(), Error> {
+        drop(then);
+        Err(Error::Unsupported {
+            op: "handoff.on_commit",
+        })
+    }
 }
 
 pub type Ctx<'a> = dyn Encode + 'a;

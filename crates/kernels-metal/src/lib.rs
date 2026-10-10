@@ -7,6 +7,7 @@ pub mod encode;
 pub mod error;
 pub mod icb;
 pub mod layout;
+pub mod ledger;
 pub mod linear;
 
 #[cfg(test)]
