@@ -66,10 +66,8 @@ fn blocked_pairs(sections: [u32; AXES as usize], rotary_dim: u32) -> Result<u32,
 /// Pair `i` of the first `r/2` reads axis `h` when `i % 3 == 1 && i < 3·s1`,
 /// `w` when `i % 3 == 2 && i < 3·s2`, else `t`; pairs `(i, i + r/2)` at
 /// `theta^(-2i/r)`: the rotated prefix is its own neox head, as upstream's
-/// `apply_rotary_pos_emb` turns `x[..r]` (Qwen3.5's `r = d/4`). The GPU
-/// kernels pair `(i, i + d/2)` at `theta^(-2i/d)`, which is the same only
-/// when `r = d` (Qwen3-VL); with Qwen3.5's partial rotation it left the
-/// trunk's first logits at correlation 0.91 with transformers'.
+/// `apply_rotary_pos_emb` turns `x[..r]` (Qwen3.5's `r = d/4`), as the GPU
+/// kernels do.
 pub fn interleaved(
     ctx: &Ctx<'_>,
     q: Tensor,
