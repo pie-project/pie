@@ -16,7 +16,9 @@ template <typename T>
   const int h = int(pos.y);
   const int m = int(pos.z);
   const int n_head = int(grid.y);
-  const int half_hd = head_dim / 2;
+  // One lane per pair of the rotated prefix, which turns as its own neox
+  // head: pairs (i, i + rotary/2) at theta^(-2i/rotary).
+  const int half_rot = int(grid.x);
 
   const int pos_t = positions[3 * m + 0];
   const int pos_h = positions[3 * m + 1];
@@ -33,7 +35,7 @@ template <typename T>
     axis_pos = pos_t;
   }
 
-  const float d = 2.0f * static_cast<float>(i) / static_cast<float>(head_dim);
+  const float d = 2.0f * static_cast<float>(i) / static_cast<float>(2 * half_rot);
   const float inv_freq = exp2(-d * base);
   const float theta = static_cast<float>(axis_pos) * inv_freq;
   const float costheta = fast::cos(theta);
@@ -41,7 +43,7 @@ template <typename T>
 
   const size_t i1 =
       (size_t(m) * size_t(n_head) + size_t(h)) * size_t(head_dim) + size_t(i);
-  const size_t i2 = i1 + size_t(half_hd);
+  const size_t i2 = i1 + size_t(half_rot);
   const float x1 = static_cast<float>(x[i1]);
   const float x2 = static_cast<float>(x[i2]);
   x[i1] = static_cast<T>(x1 * costheta - x2 * sintheta);

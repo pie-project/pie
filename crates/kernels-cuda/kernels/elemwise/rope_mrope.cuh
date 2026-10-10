@@ -27,8 +27,9 @@ __global__ void rope_mrope(
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const int total_heads = num_q_heads + num_kv_heads;
-    const int half = head_dim / 2;
-    const int rope_angles = rotary_dim / 2;
+    // The rotated prefix is its own neox head: pairs (i, i + rotary_dim/2)
+    // at theta^(-2i/rotary_dim), as `rope_partial` and upstream turn it.
+    const int half = rotary_dim / 2;
 
     const int pos_t = positions[3 * row + 0];
     const int pos_h = positions[3 * row + 1];
@@ -39,8 +40,6 @@ __global__ void rope_mrope(
         const int head_idx = t / half;
         const int dim_pair = t % half;
 
-        if (dim_pair >= rope_angles) continue;
-
         int axis_pos;
         const int m = dim_pair % 3;
         if (m == 1 && dim_pair < 3 * s1)      axis_pos = pos_h;
@@ -49,7 +48,7 @@ __global__ void rope_mrope(
 
         const float freq = powf(theta,
             -2.f * static_cast<float>(dim_pair) /
-                   static_cast<float>(head_dim));
+                   static_cast<float>(rotary_dim));
         const float ang = static_cast<float>(axis_pos) * freq;
         float cos_v, sin_v;
         __sincosf(ang, &sin_v, &cos_v);
