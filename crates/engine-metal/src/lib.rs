@@ -10,6 +10,7 @@
 
 pub mod abi;
 pub mod adapter;
+pub mod ane;
 pub mod api;
 pub mod arena;
 pub mod blob;
@@ -30,6 +31,7 @@ pub mod host_source;
 pub mod icb;
 pub mod inputs;
 mod keepalive;
+mod legs;
 pub mod mapping;
 pub mod mask;
 pub mod program;
@@ -79,4 +81,4 @@ pub use weights::{AdapterPlane, BankSeat, Weights};
 pub use window::{Copies, Cursor, Gathered, GatheredSpace, Window, Windows};
 
 /// The fused kernels this backend ships; the compiler forms only these.
-pub const FUSED: [&str; 1] = ["elementwise.residual_add_rmsnorm"];
+pub const FUSED: [&str; 2] = ["elementwise.residual_add_rmsnorm", "linear.mlp_swiglu"];

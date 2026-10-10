@@ -106,6 +106,18 @@ pub enum Fused {
         packed: ValueId,
         y: ValueId,
     },
+    /// A whole dense MLP: `gate_up` over `act`, swiglu, `down`. `packed` and
+    /// `h` are the two intermediates, still written, so a backend may run
+    /// the three primitives, or split the chain between engines.
+    MlpSwiglu {
+        act: ValueId,
+        gate_up: ValueId,
+        down: ValueId,
+        intermediate: u32,
+        packed: ValueId,
+        h: ValueId,
+        y: ValueId,
+    },
     LmHeadSoftcap {
         act: ValueId,
         w: ValueId,
@@ -191,6 +203,9 @@ impl Operands for Fused {
             Self::MatmulGeglu { act, w, .. } | Self::LmHeadSoftcap { act, w, .. } => {
                 sink.extend([*act, *w]);
             }
+            Self::MlpSwiglu {
+                act, gate_up, down, ..
+            } => sink.extend([*act, *gate_up, *down]),
             Self::MatmulBias { act, w, bias, .. } => sink.extend([*act, *w, *bias]),
             Self::QkvFusedQknormRopeVnormWrite {
                 packed,
@@ -254,6 +269,7 @@ impl Operands for Fused {
                 sink.extend([*r_out, *normed, *out]);
             }
             Self::MatmulGeglu { packed, y, .. } => sink.extend([*packed, *y]),
+            Self::MlpSwiglu { packed, h, y, .. } => sink.extend([*packed, *h, *y]),
             Self::LmHeadSoftcap { y, y_out, .. } => sink.extend([*y, *y_out]),
             Self::MatmulBias { y, y_out, .. } => sink.extend([*y, *y_out]),
             Self::QkvFusedQknormRopeVnormWrite { q, .. } => sink.push(*q),
@@ -271,7 +287,9 @@ impl Operands for Fused {
             Self::LmHeadSoftcap { y, y_out, .. } | Self::MatmulBias { y, y_out, .. } => {
                 sink.push((*y_out, *y));
             }
-            Self::MatmulGeglu { .. } | Self::QkvFusedQknormRopeVnormWrite { .. } => {}
+            Self::MatmulGeglu { .. }
+            | Self::MlpSwiglu { .. }
+            | Self::QkvFusedQknormRopeVnormWrite { .. } => {}
         }
     }
     // The name a backend keys its kernel by (seat tables, `FUSED` lists), in
@@ -286,6 +304,7 @@ impl Operands for Fused {
             Self::NormModulate { .. } => "elementwise.norm_modulate",
             Self::GatedResidualNormModulate { .. } => "elementwise.gated_residual_norm_modulate",
             Self::MatmulGeglu { .. } => "linear.matmul_geglu",
+            Self::MlpSwiglu { .. } => "linear.mlp_swiglu",
             Self::LmHeadSoftcap { .. } => "linear.lm_head_softcap",
             Self::MatmulBias { .. } => "linear.matmul_bias",
             Self::QkvFusedQknormRopeVnormWrite { .. } => {

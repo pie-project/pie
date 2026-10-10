@@ -1,6 +1,6 @@
 use kernels_metal::linear;
 use poem_exec::{DispatchLinear, KernelError};
-use poem_ir::{Linear, Operands};
+use poem_ir::{Fused, Linear, Operands};
 
 use crate::run::Run;
 
@@ -11,6 +11,154 @@ impl DispatchLinear for Run<'_> {
 }
 
 impl Run<'_> {
+    pub(super) fn fused_linear(&mut self, op: &Fused) -> Result<(), kernels_metal::Error> {
+        match op {
+            Fused::MlpSwiglu {
+                act,
+                gate_up,
+                down,
+                intermediate,
+                packed,
+                h,
+                y,
+            } => match self
+                .ane()
+                .and_then(|ane| Some((ane, ane.plan(*gate_up, self.tensor(*act).rows)?)))
+                .filter(|(_, plan)| self.split_fits(plan, *act, *h, *y))
+            {
+                Some((ane, plan)) => self.mlp_split(ane, &plan, *act, *packed, *h, *y),
+                None => {
+                    self.linear(&Linear::Matmul {
+                        act: *act,
+                        w: *gate_up,
+                        y: *packed,
+                    })?;
+                    self.linear(&Linear::MlpSwiglu {
+                        packed: *packed,
+                        intermediate: *intermediate,
+                        y: *h,
+                    })?;
+                    self.linear(&Linear::Matmul {
+                        act: *h,
+                        w: *down,
+                        y: *y,
+                    })
+                }
+            },
+            _ => Err(kernels_metal::Error::Unsupported { op: op.name() }),
+        }
+    }
+
+    /// Whether the plan's rows, padded to the matmul tile, fit the planes
+    /// this call writes and the precast the GPU's share needs.
+    fn split_fits(
+        &self,
+        plan: &crate::ane::Plan,
+        act: poem_ir::ValueId,
+        h: poem_ir::ValueId,
+        y: poem_ir::ValueId,
+    ) -> bool {
+        let padded = plan.rows.div_ceil(32) * 32;
+        padded
+            <= self
+                .capacity(act)
+                .min(self.capacity(h))
+                .min(self.capacity(y))
+            && self.precast(padded, plan.split.keep).is_some()
+    }
+
+    /// Whether a column plan's rows, padded to the matmul tile, fit the
+    /// planes this call reads and writes.
+    fn columns_fit(
+        &self,
+        plan: &crate::ane::Columns,
+        act: poem_ir::ValueId,
+        y: poem_ir::ValueId,
+    ) -> bool {
+        plan.rows.div_ceil(32) * 32 <= self.capacity(act).min(self.capacity(y))
+    }
+
+    /// The GPU's columns of a split projection, between the hand-off and
+    /// the join: the leading `keep` landed in place, the rest the Neural
+    /// Engine's.
+    fn matmul_split(
+        &self,
+        ane: &crate::ane::Ane,
+        plan: &crate::ane::Columns,
+        act: poem_ir::ValueId,
+        y: poem_ir::ValueId,
+    ) -> Result<(), kernels_metal::Error> {
+        let x = self.tensor(act);
+        let out = self.tensor(y);
+        ane.before_columns(self.ctx(), plan, x)?;
+        linear::quant::matmul_columns(
+            self.ctx(),
+            x,
+            plan.view,
+            out,
+            plan.keep,
+            linear::quant::Scratch {
+                precast: &|rows, contraction| self.precast(rows, contraction),
+                partials: &|rows, width| self.partials(rows, width),
+            },
+            self.capacity(act).min(self.capacity(y)),
+        )?;
+        ane.after_columns(self.ctx(), plan, out)
+    }
+
+    /// The GPU's share of a split MLP, between the hand-off and the join:
+    /// gate and up over its leading `keep` channels, written compactly into
+    /// the packed and staging planes, swiglu, and down over those channels
+    /// into `y`, which the join then adds the Neural Engine's partial to.
+    fn mlp_split(
+        &self,
+        ane: &crate::ane::Ane,
+        plan: &crate::ane::Plan,
+        act: poem_ir::ValueId,
+        packed: poem_ir::ValueId,
+        h: poem_ir::ValueId,
+        y: poem_ir::ValueId,
+    ) -> Result<(), kernels_metal::Error> {
+        let keep = plan.split.keep;
+        let x = self.tensor(act);
+        let out = self.tensor(y);
+        let gate = kernels_metal::Tensor {
+            width: keep,
+            ..self.tensor(packed)
+        };
+        let h_gpu = kernels_metal::Tensor {
+            width: keep,
+            ..self.tensor(h)
+        };
+        ane.before(self.ctx(), plan, x)?;
+        let precast = |rows, contraction| self.precast(rows, contraction);
+        let partials = |rows, width| self.partials(rows, width);
+        let scratch = || linear::quant::Scratch {
+            precast: &precast,
+            partials: &partials,
+        };
+        let rows = self.capacity(act);
+        linear::quant::matmul(
+            self.ctx(),
+            x,
+            plan.split.gate,
+            gate,
+            scratch(),
+            rows.min(self.capacity(packed)),
+        )?;
+        linear::quant::matmul(self.ctx(), x, plan.split.up, plan.up_rows, scratch(), rows)?;
+        linear::mlp::swiglu_clamp_split(self.ctx(), gate, plan.up_rows, f32::MAX, h_gpu)?;
+        linear::quant::matmul(
+            self.ctx(),
+            h_gpu,
+            plan.split.down,
+            out,
+            scratch(),
+            self.capacity(h).min(self.capacity(y)),
+        )?;
+        ane.after(self.ctx(), plan, out)
+    }
+
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_metal::Error> {
         match op {
             Linear::Matmul { act, w, y }
@@ -25,17 +173,27 @@ impl Run<'_> {
                 )
             }
             Linear::Matmul { act, w, y } => match self.banked(*w) {
-                Some(bank) => linear::quant::matmul(
-                    self.ctx(),
-                    self.tensor(*act),
-                    bank,
-                    self.tensor(*y),
-                    linear::quant::Scratch {
-                        precast: &|rows, contraction| self.precast(rows, contraction),
-                        partials: &|rows, width| self.partials(rows, width),
-                    },
-                    self.capacity(*act).min(self.capacity(*y)),
-                ),
+                Some(bank) => {
+                    let x = self.tensor(*act);
+                    if let Some((ane, plan)) = self
+                        .ane()
+                        .and_then(|ane| Some((ane, ane.plan_columns(*w, x.rows)?)))
+                        .filter(|(_, plan)| self.columns_fit(plan, *act, *y))
+                    {
+                        return self.matmul_split(ane, &plan, *act, *y);
+                    }
+                    linear::quant::matmul(
+                        self.ctx(),
+                        x,
+                        bank,
+                        self.tensor(*y),
+                        linear::quant::Scratch {
+                            precast: &|rows, contraction| self.precast(rows, contraction),
+                            partials: &|rows, width| self.partials(rows, width),
+                        },
+                        self.capacity(*act).min(self.capacity(*y)),
+                    )
+                }
                 None => linear::gemm::matmul(
                     self.ctx(),
                     self.tensor(*act),

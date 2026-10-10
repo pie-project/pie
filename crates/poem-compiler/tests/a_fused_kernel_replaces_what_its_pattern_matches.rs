@@ -81,6 +81,47 @@ fn an_op_that_overwrites_what_the_match_reads_keeps_it_in_place() {
     );
 }
 
+fn dense_mlp(p: &Pattern) -> (poem::Value, poem::Value) {
+    let packed = linear::matmul(&p.rows("x", 64), &p.weight("gate_up", [128, 64]));
+    let h = linear::mlp_swiglu(&packed, 64);
+    let y = linear::matmul(&h, &p.weight("down", [64, 64]));
+    (h, y)
+}
+
+#[test]
+fn a_dense_mlp_folds_into_one_op() {
+    let fused = fuse(trace(|p| drop(dense_mlp(p))), &["linear.mlp_swiglu"]);
+    assert_eq!(ops(&fused), ["linear.mlp_swiglu"]);
+    let Some(poem_ir::Operation::Fused(poem_ir::Fused::MlpSwiglu { intermediate, .. })) =
+        fused.nodes.first().map(|node| &node.op)
+    else {
+        panic!("the op is the fused mlp");
+    };
+    assert_eq!(*intermediate, 64);
+}
+
+#[test]
+fn a_dense_mlp_whose_intermediate_is_read_elsewhere_stays_apart() {
+    // Bonsai rotates the swiglu output before `down`: `h` has another
+    // reader, so the chain is not one kernel's.
+    let fused = fuse(
+        trace(|p| {
+            let (h, _) = dense_mlp(p);
+            elemwise::silu(&h);
+        }),
+        &["linear.mlp_swiglu"],
+    );
+    assert_eq!(
+        ops(&fused),
+        [
+            "linear.matmul",
+            "linear.mlp_swiglu",
+            "linear.matmul",
+            "elementwise.silu"
+        ]
+    );
+}
+
 fn qkv_write(p: &Pattern, q_eps: f32, k_eps: f32) {
     let positions = p.indices("positions");
     let (q, k, v) = layout::split_qkv(&p.rows("packed", 512), 256, 128);

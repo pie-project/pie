@@ -3162,6 +3162,10 @@ dependencies = [
 name = "kernels-metal"
 version = "0.5.4"
 dependencies = [
+ "block2",
+ "cc",
+ "objc2",
+ "objc2-metal",
  "pie-dtype",
 ]
 

@@ -117,6 +117,7 @@ fn every_routed_row_answers_its_experts_exact_affine_reference() {
                 biases: Some(at(2, columns, groups, Dtype::Bf16)),
                 group: 64,
                 bits: 4,
+                ld: k,
             };
             let y = at(5, pairs, n, Dtype::Bf16);
             let frame = device.frame().expect("frame");
