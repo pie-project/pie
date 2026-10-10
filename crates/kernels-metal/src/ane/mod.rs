@@ -27,8 +27,9 @@ mod program;
 mod surface;
 mod sys;
 
-pub use event::{Allotment, Handoff, uptime};
-pub use program::{Binding, CONSTANT_OFFSET, Program, constant_blob, fingerprint};
+pub use event::{Allotment, Handoff};
+pub use program::{Binding, Program};
+pub(crate) use program::{CONSTANT_OFFSET, constant_blob};
 pub use surface::{Element, Surface};
 
 /// Whether the private framework loads and still has every call the bridge
@@ -49,13 +50,6 @@ pub fn enabled() -> bool {
         std::env::var("PIE_ANE").as_deref(),
         Ok("0" | "off" | "false")
     )
-}
-
-/// `PIE_ANE_UNITS`: how many 512-channel units of each MLP the Neural
-/// Engine takes, overriding the split planner's own choice.
-#[must_use]
-pub fn units() -> Option<u32> {
-    std::env::var("PIE_ANE_UNITS").ok()?.parse().ok()
 }
 
 /// Where compiled programs are kept between runs.

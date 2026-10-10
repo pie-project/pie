@@ -3164,7 +3164,6 @@ version = "0.5.4"
 dependencies = [
  "block2",
  "cc",
- "libc",
  "objc2",
  "objc2-metal",
  "pie-dtype",

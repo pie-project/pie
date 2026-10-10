@@ -80,7 +80,6 @@ pub struct Private {
     splits: AtomicU64,
     /// How many projections have.
     column_splits: AtomicU64,
-    trace: bool,
     _buffers: Vec<Buffer>,
 }
 
@@ -147,17 +146,15 @@ fn share(all: u32) -> u32 {
     ((all * percent() + 50) / 100).clamp(1, all.saturating_sub(1).max(1))
 }
 
-/// The MLP's units: `PIE_ANE_UNITS`, else eight where the GPU reads
-/// prompts through MPP, else the share.
+/// The MLP's units: eight where the GPU reads prompts through MPP, else
+/// the share.
 fn mlp_units(intermediate: u32) -> u32 {
     let all = intermediate / ffn::UNIT;
-    kernels_metal::ane::units()
-        .unwrap_or(if kernels_metal::tuning::current().qmm_mpp {
-            8
-        } else {
-            share(all)
-        })
-        .clamp(1, all.saturating_sub(1).max(1))
+    if kernels_metal::tuning::current().qmm_mpp {
+        8.clamp(1, all.saturating_sub(1).max(1))
+    } else {
+        share(all)
+    }
 }
 
 fn fault(why: String) -> Fault {
@@ -490,7 +487,6 @@ pub fn load(
         status: status_host,
         splits: AtomicU64::new(0),
         column_splits: AtomicU64::new(0),
-        trace: std::env::var_os("PIE_ANE_TRACE").is_some(),
         _buffers: keep,
     }))
 }
@@ -616,12 +612,6 @@ impl Private {
             ..site.rotated
         };
         kernels::prepare(ctx, &site.shared, x, rotated, plan.at.ready)?;
-        if self.trace {
-            eprintln!(
-                "PIE_ANE_TRACE site mlp layer {} done={}",
-                plan.layer, plan.at.done
-            );
-        }
         if let Some(Ok(ffn)) = site.ffn.get() {
             let binding = &ffn.evaluations[plan.evaluation].1[(plan.layer & 1) as usize];
             self.handoff
@@ -670,12 +660,6 @@ impl Private {
             ..site.rotated
         };
         kernels::prepare(ctx, &site.shared, x, rotated, plan.at.ready)?;
-        if self.trace {
-            eprintln!(
-                "PIE_ANE_TRACE site {}->{} layer {} done={}",
-                site.shape.k, site.shape.n, plan.layer, plan.at.done
-            );
-        }
         if let Some(Ok(program)) = site.program.get() {
             let binding = &program.evaluations[plan.evaluation].1[(plan.layer & 1) as usize];
             self.handoff

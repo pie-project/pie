@@ -12,19 +12,6 @@ use objc2_metal::{MTLSharedEvent, MTLSharedEventListener};
 
 use super::program::{Binding, Program};
 
-/// Seconds on the clock Metal stamps command buffers with
-/// (`CLOCK_UPTIME_RAW`, which is `mach_absolute_time`).
-#[must_use]
-pub fn uptime() -> f64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: a plain clock read into a local.
-    unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut ts) };
-    ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9
-}
-
 /// The two event values of one hand-off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Allotment {
@@ -101,7 +88,7 @@ impl Handoff {
         self.0.failures.fetch_add(1, Ordering::AcqRel);
         if !self.0.retired.swap(true, Ordering::AcqRel) {
             eprintln!(
-                "PIE_ANE: the Neural Engine split stopped ({why}); the GPU runs the MLP alone"
+                "PIE_ANE: the Neural Engine split stopped ({why}); the GPU runs everything alone"
             );
         }
         let at = self.0.value.load(Ordering::Acquire);
@@ -114,13 +101,11 @@ impl Handoff {
     /// `done` after. The request is submitted from the event's listener at
     /// that moment, not before, so the Neural Engine's queue never holds a
     /// request behind its wait. A failure, at submission or on completion,
-    /// retires the hand-off. With `PIE_ANE_TRACE` set, each submission and
-    /// completion is logged with its [`uptime`].
+    /// retires the hand-off.
     pub fn start(&self, program: &Program, binding: &Binding, ready: u64, done: u64) {
         if self.retired() {
             return;
         }
-        let trace = std::env::var_os("PIE_ANE_TRACE").is_some();
         let state = self.0.clone();
         let (program, binding) = (program.clone(), binding.clone());
         let block = block2::RcBlock::new(
@@ -130,20 +115,8 @@ impl Handoff {
                 if state.retired.load(Ordering::Acquire) {
                     return;
                 }
-                if trace {
-                    eprintln!(
-                        "PIE_ANE_TRACE submit ready={ready} done={done} t={:.4}",
-                        uptime()
-                    );
-                }
                 let this = Handoff(state.clone());
                 let report = Box::new(move |ok: bool| {
-                    if trace {
-                        eprintln!(
-                            "PIE_ANE_TRACE complete done={done} ok={ok} t={:.4}",
-                            uptime()
-                        );
-                    }
                     if !ok {
                         this.fail("an evaluation failed");
                     }

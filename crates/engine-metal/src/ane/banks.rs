@@ -88,16 +88,16 @@ pub struct Projection {
 }
 
 /// A projection must land at least this many columns to be worth a
-/// hand-off of its own; `PIE_ANE_PROJECTIONS=<columns>` moves the bar,
-/// `PIE_ANE_PROJECTIONS=off` keeps them all on the GPU.
+/// hand-off of its own.
 pub const MIN_PROJECTION_COLUMNS: u32 = 4096;
 
-fn min_projection_columns() -> Option<u32> {
-    match std::env::var("PIE_ANE_PROJECTIONS").ok().as_deref() {
-        Some("off" | "0" | "false") => None,
-        Some(n) => n.parse().ok().or(Some(MIN_PROJECTION_COLUMNS)),
-        None => Some(MIN_PROJECTION_COLUMNS),
-    }
+/// `PIE_ANE_PROJECTIONS=0|off|false` keeps every projection on the GPU;
+/// the MLPs still split.
+fn projections_enabled() -> bool {
+    !matches!(
+        std::env::var("PIE_ANE_PROJECTIONS").as_deref(),
+        Ok("0" | "off" | "false")
+    )
 }
 
 /// Every `linear.matmul` over an affine 4-bit bank wide enough to split,
@@ -107,9 +107,9 @@ pub fn projections(
     weights: &crate::weights::Weights,
 ) -> Vec<((u32, u32), Vec<Projection>)> {
     let mut groups: Vec<((u32, u32), Vec<Projection>)> = Vec::new();
-    let Some(min_columns) = min_projection_columns() else {
+    if !projections_enabled() {
         return groups;
-    };
+    }
     for node in &trace.nodes {
         let poem_ir::Operation::Linear(poem_ir::Linear::Matmul { w, .. }) = &node.op else {
             continue;
@@ -118,7 +118,7 @@ pub fn projections(
             continue;
         };
         let (k, n) = (bank.codes.width, bank.codes.rows);
-        if n < min_columns
+        if n < MIN_PROJECTION_COLUMNS
             || !n.is_multiple_of(kernels_metal::ane::ffn::UNIT)
             || kernels_metal::ane::mil::segment_of(k).is_none()
         {

@@ -17,7 +17,6 @@ dtype = { package = "pie-dtype", path = "../dtype" }
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2 = "0.6"
 block2 = "0.6"
-libc = "0.2"
 objc2-metal = { version = "0.3", default-features = false, features = [
     "std",
     "MTLDevice",

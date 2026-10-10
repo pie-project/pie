@@ -38,8 +38,7 @@ pub fn constant_blob(values: &[u16]) -> Vec<u8> {
 }
 
 /// FNV-1a of `bytes`, as the name of a program's cache directory.
-#[must_use]
-pub fn fingerprint(bytes: &[u8]) -> String {
+fn fingerprint(bytes: &[u8]) -> String {
     let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
     });

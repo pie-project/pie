@@ -1,10 +1,11 @@
 #![cfg(target_vendor = "apple")]
 
 //! A prompt long enough for the Neural Engine to take its share of every
-//! dense MLP reads the same as the GPU alone reads it. The same 27B
-//! artifact is served twice: once with `PIE_ANE=off`, once with the
-//! Neural Engine on, waiting for its program to compile; the second serve
-//! must actually hand MLPs over, its readout must sit on the first's — the
+//! dense MLP and wide projection reads the same as the GPU alone reads it.
+//! The same 27B artifact is served twice: once with `PIE_ANE=off`, once
+//! with the Neural Engine on, waiting for its programs to compile; the
+//! second serve must actually hand MLPs and projections over, its readout
+//! must sit on the first's — the
 //! split is int8 activations and weights with fp16 sums, so a small gap is
 //! the expected cost — and a decode step after it must stay on the GPU.
 //!
@@ -191,16 +192,6 @@ fn the_split_mlp_matches_the_gpu_alone() {
     );
     shell.open(0).expect("the slot opens");
     let _warm = fire(&mut shell, &trace, &prompt);
-    // `PIE_ANE_STEPS` fires more warm steps first, so the split's planner
-    // can be watched settling with `PIE_ANE_TRACE`.
-    let more = std::env::var("PIE_ANE_STEPS")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(0);
-    for _ in 0..more {
-        shell.open(0).expect("the slot reopens");
-        let _warm = fire(&mut shell, &trace, &prompt);
-    }
     shell.open(0).expect("the slot reopens");
     let split = fire(&mut shell, &trace, &prompt);
     let ane = shell.neural_engine().expect("still there");
