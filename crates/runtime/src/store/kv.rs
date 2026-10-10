@@ -1033,6 +1033,11 @@ impl KvStore {
         self.recycle_backings(freed, epoch);
     }
 
+    /// The device pages [`Self::drop_unused_cache_leases`] would free now.
+    pub fn reclaimable_cache_pages(&self) -> u32 {
+        self.table.unused_cache_lease_pages()
+    }
+
     pub fn drop_unused_cache_leases(&mut self, epoch: u64) -> usize {
         let (dropped, freed) = self.table.drop_unused_cache_leases();
         if dropped != 0 {
