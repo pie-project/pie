@@ -191,7 +191,7 @@ pub fn load(device: &Context, handles: &Handles, mlps: &[Mlp]) -> Result<Option<
             banks::staging(device, handles, shape.ane, 1, Dtype::F16, &mut keep)?,
             banks::staging(device, handles, hidden, 1, Dtype::F16, &mut keep)?,
         ];
-        let split = banks::split(device, handles, mlp, shape.gpu, &mut keep)?;
+        let split = banks::split(handles, mlp, shape.gpu)?;
         layers.insert(
             mlp.layer,
             Layer {
