@@ -9,6 +9,7 @@ use crate::tensor::{Bank, Tensor};
 
 const QMM_FILE: &str = "quant/qmm_t.slang";
 const QMM_RT_FILE: &str = "quant/qmm_rt.slang";
+const QMV1_FILE: &str = "quant/qmv1.slang";
 const QMV_FILE: &str = "quant/qmv.slang";
 
 const GROUPS: [i32; 3] = [32, 64, 128];
@@ -52,6 +53,9 @@ pub fn composed() -> Vec<Fire> {
                 QMV_FILE,
                 qmv_name("quant.qmv", "", gs, b).expect("an axis point"),
             ));
+            if qmv1_fits(gs, b) {
+                out.push(Fire::at(QMV1_FILE, qmv1_name(gs, b)));
+            }
             for bm in RT_ROW_TILES {
                 out.push(Fire::at(QMM_RT_FILE, qmm_rt_name(gs, b, bm)));
             }
@@ -121,6 +125,19 @@ const RT_COLS: u32 = 64;
 fn qmm_rt_name(group: i32, bits: i32, bm: i32) -> &'static str {
     symbol(&format!("affine_qmm_rt_bf16_gs_{group}_b_{bits}_bm_{bm}"))
 }
+
+/// The one-row point loads 128 bits of codes at once, which must stay
+/// inside one scale group.
+fn qmv1_fits(group: i32, bits: i32) -> bool {
+    matches!(bits, 4 | 8) && 128 / bits <= group
+}
+
+fn qmv1_name(group: i32, bits: i32) -> &'static str {
+    symbol(&format!("affine_qmv1_bf16_gs_{group}_b_{bits}"))
+}
+
+/// Output rows one workgroup of the one-row point lands.
+const QMV1_ROWS: u32 = 8;
 
 pub fn qmm_precast_name(
     op: &'static str,
@@ -473,6 +490,30 @@ pub fn act_x_wt(
         return ctx.fire(
             Fire::at(QMM_FILE, qmm_name(op, "", group, bits, bm, bn)?)
                 .apply(Grid::of(qmm_grid(op, n, bn, padded, bm, 1)?, qmm_group(bm))),
+            &[
+                w.codes.arg(),
+                w.scales.arg(),
+                biases.arg(),
+                act.arg(),
+                y.arg_mut(),
+                k.arg(),
+                n.arg(),
+                m.arg(),
+            ],
+        );
+    }
+    if m == 1
+        && tuned.qmv_one_row
+        && qmv1_fits(group, bits)
+        && GROUPS.contains(&group)
+        && (k * bits) % 128 == 0
+        && k % 8 == 0
+    {
+        return ctx.fire(
+            Fire::at(QMV1_FILE, qmv1_name(group, bits)).apply(Grid::of(
+                [(n as u32).div_ceil(QMV1_ROWS) * 64, 4, 1],
+                [64, 4, 1],
+            )),
             &[
                 w.codes.arg(),
                 w.scales.arg(),

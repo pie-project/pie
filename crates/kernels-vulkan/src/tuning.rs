@@ -79,6 +79,10 @@ pub struct DeviceTuning {
     /// Batched quantized projections on the register-tiled point (a 4x4
     /// block per invocation) rather than the plain tiled one.
     pub qmm_register_tiles: bool,
+
+    /// A one-row quantized projection (decode) on the 128-bit-load point
+    /// that folds with subgroup shuffles; needs subgroups of 32 or more.
+    pub qmv_one_row: bool,
 }
 
 impl Default for DeviceTuning {
@@ -102,6 +106,7 @@ impl Default for DeviceTuning {
             sdpa_split_groups: 128,
             sdpa_split_min_keys: 256,
             qmm_register_tiles: false,
+            qmv_one_row: false,
         }
     }
 }
@@ -121,6 +126,12 @@ impl DeviceTuning {
         // point runs a 64x1024x7168 projection at ~27 GFLOPS there.
         if info.vendor == Vendor::Qualcomm {
             t.qmm_register_tiles = true;
+            t.qmv_one_row = info.subgroup_size >= 32;
+            // A decode row's keys split across 128 workgroups, 128 keys or
+            // more apiece: 3k keys of Qwen3.5-0.8B attend in 1.9 ms a token
+            // over six layers, against 11.7 split two ways.
+            t.sdpa_split_groups = 128;
+            t.sdpa_split_min_keys = 128;
         }
         t
     }
@@ -151,6 +162,7 @@ impl DeviceTuning {
             sdpa_split_groups,
             sdpa_split_min_keys,
             qmm_register_tiles,
+            qmv_one_row,
         );
         self
     }
@@ -193,6 +205,7 @@ pub struct Overrides {
     pub sdpa_split_groups: Option<u32>,
     pub sdpa_split_min_keys: Option<u32>,
     pub qmm_register_tiles: Option<bool>,
+    pub qmv_one_row: Option<bool>,
 }
 
 static DEVICE: OnceLock<DeviceInfo> = OnceLock::new();
