@@ -86,6 +86,20 @@ struct MlpSwiglu;
 #[decision(id = "fuse.residual_add_rmsnorm", flag, default = true)]
 struct ResidualAddRmsnorm;
 
+/// A flag beside constants: written as its own key.
+#[derive(Clone, Copy, Debug, PartialEq, Decision)]
+#[decision(id = "engine.copies", flag, default = true)]
+struct Copies;
+
+/// Two flags alone under one path: written as a list there.
+#[derive(Clone, Copy, Debug, PartialEq, Decision)]
+#[decision(id = "kernel.sdpa.split_small", flag)]
+struct SplitSmall;
+
+#[derive(Clone, Copy, Debug, PartialEq, Decision)]
+#[decision(id = "kernel.sdpa.split_window", flag)]
+struct SplitWindow;
+
 fn registry() -> Registry {
     let mut r = Registry::new("toy", FACTS, &["rows"]);
     r.add::<Qmm>()
@@ -94,7 +108,10 @@ fn registry() -> Registry {
         .add::<PrefillChunk>()
         .add::<LaunchUs>()
         .add::<MlpSwiglu>()
-        .add::<ResidualAddRmsnorm>();
+        .add::<ResidualAddRmsnorm>()
+        .add::<Copies>()
+        .add::<SplitSmall>()
+        .add::<SplitWindow>();
     r
 }
 
@@ -116,12 +133,14 @@ qmm = [
   {                                    use = "qmm_t", bm = 64 },
 ]
 matmul = [{ when = "rows >= 64 and n >= 8192", use = "ane_columns", share = 47 }, "gpu"]
+sdpa = ["split_small"]
 
 [layout]
 weights = "plain"
 
 [engine]
 prefill.chunk = 4096
+copies = false
 
 [compiler]
 launch_us = 4
@@ -323,7 +342,7 @@ fn a_coupled_alternative_needs_its_partner() {
 #[test]
 fn a_flag_cannot_read_a_dynamic_variable_and_a_dynamic_variable_is_an_axis() {
     #[derive(Clone, Debug, Decision)]
-    #[decision(id = "kernel.sdpa", shape(keys; head_dim), default = "vector")]
+    #[decision(id = "kernel.attend", shape(keys; head_dim), default = "vector")]
     enum Sdpa {
         Vector,
         Tiled,

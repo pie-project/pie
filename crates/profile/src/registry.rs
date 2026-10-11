@@ -25,6 +25,8 @@ pub(crate) struct Registered {
     pub(crate) spec: &'static Spec,
     pub(crate) build: Build,
     pub(crate) default: Vec<Rung>,
+    /// The default as this registry spells it: the type's, or the backend's.
+    pub(crate) default_text: String,
 }
 
 /// Every decision one backend exposes, with the facts its alternatives may
@@ -120,22 +122,37 @@ impl Registry {
     /// Register `T`. Panics on a declaration the meta-model forbids: these
     /// are code errors, and any test that assembles the registry finds them.
     pub fn add<T: Decision>(&mut self) -> &mut Registry {
+        self.add_defaulting::<T>(T::spec().default)
+    }
+
+    /// Register `T` with this backend's own default, spelled as the TOML
+    /// value a profile would hold. For a decision several backends share
+    /// whose safe default differs between them: a fusion is on where the
+    /// backend ships its kernel.
+    pub fn add_defaulting<T: Decision>(&mut self, default: &str) -> &mut Registry {
         let spec = T::spec();
         if let Err(why) = self.admit(spec) {
             panic!("decision `{}` cannot register: {why}", spec.id);
         }
-        let default = self
-            .default_rungs(spec)
+        let rungs = self
+            .default_rungs(spec, default)
             .unwrap_or_else(|why| panic!("decision `{}` has an unusable default: {why}", spec.id));
         self.decisions.insert(
             spec.id,
             Registered {
                 spec,
                 build: |rungs| Box::new(Ladder::<T>::of(rungs)),
-                default,
+                default: rungs,
+                default_text: default.to_string(),
             },
         );
         self
+    }
+
+    /// The default `id` takes in this registry, as TOML.
+    #[must_use]
+    pub fn default_text(&self, id: &str) -> Option<&str> {
+        self.decisions.get(id).map(|r| r.default_text.as_str())
     }
 
     #[must_use]
@@ -215,8 +232,8 @@ impl Registry {
         Ok(())
     }
 
-    fn default_rungs(&self, spec: &'static Spec) -> Result<Vec<Rung>, String> {
-        let text = format!("x = {}", spec.default);
+    fn default_rungs(&self, spec: &'static Spec, default: &str) -> Result<Vec<Rung>, String> {
+        let text = format!("x = {default}");
         let mut walk = Walk::new(self, &text, "default", Strict::CheckedIn);
         let table = DeTable::parse(&text).map_err(|e| e.message().to_string())?;
         let value = table.get_ref().iter().next().map(|(_, v)| v.clone());

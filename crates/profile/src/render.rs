@@ -70,7 +70,11 @@ pub fn schema(registry: &Registry) -> String {
             vars_line(spec.vars)
         );
         doc_lines(&mut out, spec.doc, "  ");
-        let _ = writeln!(out, "  default: {}", spec.default);
+        let _ = writeln!(
+            out,
+            "  default: {}",
+            registry.default_text(spec.id).unwrap_or(spec.default)
+        );
         match spec.shape {
             Shape::Constant(c) => {
                 let _ = writeln!(out, "  value: {}", c.kind.describe());
@@ -195,13 +199,24 @@ pub fn dump(profile: &Profile) -> String {
     );
     let _ = writeln!(out, "api = {API}");
 
-    // Flags sharing a parent path are written as one list at that path.
+    // Flags whose parent path holds only flags are written as one list at
+    // that path; any other flag is written as its own key.
+    let all: Vec<&'static Spec> = profile.entries().map(|(spec, _, _)| spec).collect();
+    let flag_set = |parent: &str| {
+        let lead = format!("{parent}.");
+        let children: Vec<&&'static Spec> =
+            all.iter().filter(|s| s.id.starts_with(&lead)).collect();
+        !children.is_empty()
+            && children
+                .iter()
+                .all(|s| matches!(s.shape, Shape::Flag) && !s.id[lead.len()..].contains('.'))
+    };
     let mut sets: BTreeMap<String, Vec<(&'static Spec, &[Rung])>> = BTreeMap::new();
     type Entries<'p> = Vec<(&'static Spec, &'p [Rung], bool)>;
     let mut plain: BTreeMap<&str, Entries<'_>> = BTreeMap::new();
     for (spec, rungs, defaulted) in profile.entries() {
-        if let Shape::Flag = spec.shape {
-            let parent = spec.id.rsplit_once('.').map_or("", |(p, _)| p).to_string();
+        let parent = spec.id.rsplit_once('.').map_or("", |(p, _)| p).to_string();
+        if matches!(spec.shape, Shape::Flag) && flag_set(&parent) {
             sets.entry(parent).or_default().push((spec, rungs));
         } else {
             let domain = spec.id.split('.').next().unwrap_or_default();
@@ -269,10 +284,18 @@ pub fn dump(profile: &Profile) -> String {
             .collect();
         let _ = writeln!(out, "assumes = {{ {} }}", assumed.join(", "));
     }
-    for (domain, entries) in &plain {
+    let mut domains: Vec<&str> = plain.keys().copied().collect();
+    for path in sets.keys().filter(|p| p.contains('.')) {
+        let domain = path.split('.').next().unwrap_or_default();
+        if !domains.contains(&domain) {
+            domains.push(domain);
+        }
+    }
+    domains.sort_unstable();
+    for domain in domains {
         let _ = writeln!(out);
         let _ = writeln!(out, "[{domain}]");
-        for (spec, rungs, defaulted) in entries {
+        for (spec, rungs, defaulted) in plain.get(domain).map(Vec::as_slice).unwrap_or_default() {
             let key = &spec.id[domain.len() + 1..];
             out.push_str(&annotation(spec, *defaulted));
             let _ = writeln!(out, "{key} = {}", value_toml(spec, rungs));

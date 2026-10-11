@@ -242,6 +242,24 @@ impl Profile {
         self.ladder::<T>().at(at).is_some()
     }
 
+    /// Whether `id` is registered with this profile's backend.
+    #[must_use]
+    pub fn has(&self, id: &str) -> bool {
+        self.0.entries.contains_key(id)
+    }
+
+    /// Whether a flag with no shape variables holds, by id: for a pass that
+    /// walks a list of flags by name. `None` when `id` is not a registered
+    /// flag without variables.
+    #[must_use]
+    pub fn flag(&self, id: &str) -> Option<bool> {
+        let entry = self.0.entries.get(id)?;
+        if !matches!(entry.spec.shape, crate::spec::Shape::Flag) || !entry.spec.vars.is_empty() {
+            return None;
+        }
+        Some(!entry.rungs.is_empty())
+    }
+
     /// The value of a decision with no shape variables.
     #[must_use]
     pub fn get<T: Decision<At = Anywhere>>(&self) -> &T {
@@ -336,6 +354,14 @@ impl Registry {
         Ok(self.assemble(Some(&file), Source::Seeded(origin.to_string())))
     }
 
+    /// Read a partial file, filling what it leaves out from the registry,
+    /// without checking facts: for tests that state the one decision they
+    /// exercise.
+    pub fn load_user(&self, text: &str, origin: &str) -> Result<Profile, crate::registry::Refusal> {
+        let file = self.parse(text, origin, Strict::User)?;
+        Ok(self.assemble(Some(&file), Source::User(origin.to_string())))
+    }
+
     /// Check a parsed file against the device: every assumed fact matches,
     /// and every alternative it picks has what it requires.
     fn admits(&self, file: &File, facts: &Facts) -> Result<(), String> {
@@ -397,6 +423,17 @@ impl Registry {
     /// candidate applies whole or not at all.
     #[must_use]
     pub fn resolve(&self, candidates: &[Candidate], facts: &Facts) -> (Profile, Report) {
+        self.resolve_with(candidates, Some(facts))
+    }
+
+    /// Resolve without a device to check facts against: the first candidate
+    /// that reads cleanly. For tools that show a profile by device name.
+    #[must_use]
+    pub fn read(&self, candidates: &[Candidate]) -> (Profile, Report) {
+        self.resolve_with(candidates, None)
+    }
+
+    fn resolve_with(&self, candidates: &[Candidate], facts: Option<&Facts>) -> (Profile, Report) {
         let mut rejected = Vec::new();
         for candidate in candidates {
             let strict = match candidate.source {
@@ -411,7 +448,9 @@ impl Registry {
                     continue;
                 }
             };
-            if let Err(why) = self.admits(&file, facts) {
+            if let Some(facts) = facts
+                && let Err(why) = self.admits(&file, facts)
+            {
                 rejected.push((candidate.source.clone(), why));
                 continue;
             }

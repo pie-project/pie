@@ -99,7 +99,7 @@ fn parse_ints(input: ParseStream) -> syn::Result<Vec<i64>> {
 }
 
 fn int_of(e: &Expr) -> syn::Result<i64> {
-    match e {
+    match ungroup(e) {
         Expr::Lit(ExprLit {
             lit: Lit::Int(i), ..
         }) => i.base10_parse(),
@@ -301,9 +301,18 @@ fn domain_tokens(values: &Values) -> syn::Result<Tokens> {
     })
 }
 
+/// `e` without the invisible group a `macro_rules!` fragment wraps it in.
+fn ungroup(e: &Expr) -> &Expr {
+    match e {
+        Expr::Group(g) => ungroup(&g.expr),
+        Expr::Paren(p) => ungroup(&p.expr),
+        other => other,
+    }
+}
+
 /// A Rust literal as the TOML a profile would spell.
 fn toml_of(e: &Expr) -> syn::Result<String> {
-    match e {
+    match ungroup(e) {
         Expr::Lit(ExprLit { lit, .. }) => match lit {
             Lit::Int(i) => Ok(i.base10_digits().to_string()),
             Lit::Float(f) => {
@@ -674,7 +683,7 @@ fn expand(input: &DeriveInput) -> syn::Result<Tokens> {
         }
         Data::Struct(data) => match (&data.fields, attr.flag, &attr.constant) {
             (Fields::Unit, true, None) => {
-                let default = match &attr.default {
+                let default = match attr.default.as_ref().map(ungroup) {
                     None => "false".to_string(),
                     Some(Expr::Lit(ExprLit {
                         lit: Lit::Bool(b), ..
