@@ -12,6 +12,12 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same branch or PR supersedes the run in flight: a burst
+# of merges to main tests (and wakes the GPU pod for) only the last of them.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   NPM_CONFIG_FUND: 'false'
   NPM_CONFIG_AUDIT: 'false'
@@ -64,8 +70,12 @@ jobs:
     # which the runner's disk cannot hold (even line tables alone: 5.1 GB for
     # pie-poem-compiler's tests). Without it the whole all-targets build is
     # 13 GB; a panic's backtrace still names its functions.
+    # The catalog-wide tests trace and bake every deployment; unoptimized they
+    # take over an hour, at opt-level 1 a fifth of it for a few more seconds
+    # of compiling. Debug assertions stay on.
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_DEV_OPT_LEVEL: "1"
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
@@ -75,17 +85,21 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build python3-yaml
       - uses: ./.github/actions/toolchain
         with:
-          cache-key: ${{ runner.os }}-verify
+          cache-key: ${{ runner.os }}-verify-o1
+      - uses: taiki-e/install-action@nextest
       # `--all-targets` so benches and `tests/*.rs` that stopped compiling
       # are red here rather than nowhere.
       - name: cargo build (all targets)
         run: cargo build --workspace --all-targets --exclude pie-server-py --exclude pie-server-node --exclude engine-cuda
-      # worker's binary-facing tests need an engine feature; its library
-      # tests do not.
+      # nextest runs the test binaries side by side, where `cargo test` runs
+      # them one after another; most hold one test. worker's binary-facing
+      # tests need an engine feature; its library tests do not. inferlet holds
+      # the workspace's one doctest.
       - name: cargo test
         run: |
-          cargo test --workspace --exclude pie-server-py --exclude pie-server-node --exclude worker --exclude engine-cuda
-          cargo test -p worker --lib
+          cargo nextest run --workspace --exclude pie-server-py --exclude pie-server-node --exclude worker --exclude engine-cuda --no-fail-fast
+          cargo nextest run -p worker --lib
+          cargo test --doc -p inferlet
       # The C library from C: its header compiles warning-free, its version
       # matches the library's, and a refused boot reports why.
       - name: libpie from C
@@ -93,11 +107,14 @@ jobs:
           cc -Wall -Wextra -Werror packages/c/test/smoke.c -Ipackages/c/include -Ltarget/debug -lpie -o target/pie-c-smoke
           LD_LIBRARY_PATH=target/debug target/pie-c-smoke
       # Both halves of engine-cuda build without a toolkit: cudarc loads the
-      # driver at run time and the device tests are `#[ignore]`d.
+      # driver at run time and the device tests skip without a card. Without
+      # the feature only the library's own tests differ (the runtimeless
+      # paths); the integration tests are the same, so they only compile.
       - name: cargo test (engine-cuda, with and without the cuda feature)
         run: |
-          cargo test -p engine-cuda --features cuda
-          cargo test -p engine-cuda
+          cargo nextest run -p engine-cuda --features cuda --no-fail-fast
+          cargo nextest run -p engine-cuda --lib
+          cargo check -p engine-cuda --tests
       - name: audits
         run: |
           python3 scripts/mod-reachability-audit.py
