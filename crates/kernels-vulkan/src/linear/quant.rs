@@ -54,7 +54,11 @@ pub fn composed() -> Vec<Fire> {
                 qmv_name("quant.qmv", "", gs, b).expect("an axis point"),
             ));
             if qmv1_fits(gs, b) {
-                out.push(Fire::at(QMV1_FILE, qmv1_name(gs, b)));
+                for lanes in QMV1_LANES {
+                    for rows in QMV1_ROWS_PER_LANE {
+                        out.push(Fire::at(QMV1_FILE, qmv1_name(gs, b, lanes, rows)));
+                    }
+                }
             }
             for bm in RT_ROW_TILES {
                 out.push(Fire::at(QMM_RT_FILE, qmm_rt_name(gs, b, bm)));
@@ -132,12 +136,19 @@ fn qmv1_fits(group: i32, bits: i32) -> bool {
     matches!(bits, 4 | 8) && 128 / bits <= group
 }
 
-fn qmv1_name(group: i32, bits: i32) -> &'static str {
-    symbol(&format!("affine_qmv1_bf16_gs_{group}_b_{bits}"))
+fn qmv1_name(group: i32, bits: i32, lanes: u32, rows: u32) -> &'static str {
+    if lanes == 32 && rows == 1 {
+        symbol(&format!("affine_qmv1_bf16_gs_{group}_b_{bits}"))
+    } else {
+        symbol(&format!("affine_qmv1_bf16_gs_{group}_b_{bits}_l{lanes}_r{rows}"))
+    }
 }
 
-/// Output rows one workgroup of the one-row point lands.
-const QMV1_ROWS: u32 = 8;
+/// Lanes a row of the one-row point can take.
+const QMV1_LANES: [u32; 3] = [32, 16, 8];
+
+/// Rows one lane of the one-row point can carry.
+const QMV1_ROWS_PER_LANE: [u32; 2] = [1, 2];
 
 pub fn qmm_precast_name(
     op: &'static str,
@@ -502,16 +513,20 @@ pub fn act_x_wt(
             ],
         );
     }
+    let (lanes, rows) = (tuned.qmv_one_row_lanes, tuned.qmv_one_row_rows);
     if m == 1
         && tuned.qmv_one_row
+        && QMV1_LANES.contains(&lanes)
+        && QMV1_ROWS_PER_LANE.contains(&rows)
         && qmv1_fits(group, bits)
         && GROUPS.contains(&group)
         && (k * bits) % 128 == 0
         && k % 8 == 0
     {
         return ctx.fire(
-            Fire::at(QMV1_FILE, qmv1_name(group, bits)).apply(Grid::of(
-                [(n as u32).div_ceil(QMV1_ROWS) * 64, 4, 1],
+            Fire::at(QMV1_FILE, qmv1_name(group, bits, lanes, rows)).apply(Grid::of(
+                // 256 invocations land 256 / lanes rows each `rows` deep.
+                [(n as u32).div_ceil(256 / lanes * rows) * 64, 4, 1],
                 [64, 4, 1],
             )),
             &[

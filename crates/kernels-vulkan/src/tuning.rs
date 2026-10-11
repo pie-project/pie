@@ -85,6 +85,14 @@ pub struct DeviceTuning {
     /// A one-row quantized projection (decode) on the 128-bit-load point
     /// that folds with subgroup shuffles; needs subgroups of 32 or more.
     pub qmv_one_row: bool,
+
+    /// Lanes of the one-row point that walk one output row: 32, 16 or 8.
+    /// Fewer give each lane more loads in flight.
+    pub qmv_one_row_lanes: u32,
+
+    /// Output rows one lane of the one-row point carries, sharing the
+    /// activations it loads: 1 or 2.
+    pub qmv_one_row_rows: u32,
 }
 
 impl Default for DeviceTuning {
@@ -109,6 +117,8 @@ impl Default for DeviceTuning {
             sdpa_split_min_keys: 256,
             qmm_register_tiles: false,
             qmv_one_row: false,
+            qmv_one_row_lanes: 32,
+            qmv_one_row_rows: 1,
         }
     }
 }
@@ -135,10 +145,13 @@ impl DeviceTuning {
             t.sdpa_split_groups = 128;
             t.sdpa_split_min_keys = 128;
         }
-        // PowerVR (Pixel 11 Pro, Tensor G6) decodes Qwen3.5-0.8B at 27 tok/s
-        // on the one-row point and 11 on `qmv`.
+        // PowerVR (Pixel 11 Pro, Tensor G6) decodes Qwen3.5-0.8B at 11 tok/s
+        // on `qmv`, 27 on the one-row point, and 33 with 8 lanes a row
+        // carrying two rows each.
         if info.vendor == Vendor::Imagination {
             t.qmv_one_row = info.subgroup_size >= 32;
+            t.qmv_one_row_lanes = 8;
+            t.qmv_one_row_rows = 2;
         }
         t
     }
@@ -170,6 +183,8 @@ impl DeviceTuning {
             sdpa_split_min_keys,
             qmm_register_tiles,
             qmv_one_row,
+            qmv_one_row_lanes,
+            qmv_one_row_rows,
         );
         self
     }
@@ -213,6 +228,8 @@ pub struct Overrides {
     pub sdpa_split_min_keys: Option<u32>,
     pub qmm_register_tiles: Option<bool>,
     pub qmv_one_row: Option<bool>,
+    pub qmv_one_row_lanes: Option<u32>,
+    pub qmv_one_row_rows: Option<u32>,
 }
 
 static DEVICE: OnceLock<DeviceInfo> = OnceLock::new();
