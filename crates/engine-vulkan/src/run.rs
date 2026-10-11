@@ -23,20 +23,20 @@ pub enum WeightRow {
 #[derive(Clone, Debug, Default)]
 pub struct WeightTable(pub Vec<Option<WeightRow>>);
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Hash)]
 pub struct SlotTable(pub Vec<Option<Tensor>>);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Hash)]
 pub enum CachePool {
     Kv(KvPool),
 
     Recurrent(RecurrentPool),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Hash)]
 pub struct CacheTable(pub Vec<CachePool>);
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Hash)]
 pub struct CacheGeometry {
     pub indptr: Option<Tensor>,
 

@@ -2057,8 +2057,11 @@ impl Shell {
         let mut key = crate::record::KeyBuilder::new();
         key.bytes(&p.descriptor.pack());
         key.shown(&p.arm);
-        key.shown(&p.slots);
-        key.shown(&p.caches);
+        // The tables run to a slot per traced value; hashing them field by
+        // field rather than through their debug text keeps a step's key off
+        // the CPU's critical path (1.6 ms of a token on a phone's core).
+        key.hashed(&p.slots);
+        key.hashed(&p.caches);
         key.shown(&p.bindings);
         key.shown(&p.windows);
         key.shown(&p.demand);
