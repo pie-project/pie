@@ -474,8 +474,10 @@ fn rmsnorm_rope_partial_q() -> Rule {
             p.export("q_out", &q_out);
         })
     };
-    Rule::new("elementwise.rmsnorm_rope_partial_q", [pattern(false), pattern(true)], |m| {
-        Fused::RmsnormRopePartialQ {
+    Rule::new(
+        "elementwise.rmsnorm_rope_partial_q",
+        [pattern(false), pattern(true)],
+        |m| Fused::RmsnormRopePartialQ {
             x: m.value("x"),
             weight: m.value("weight"),
             head_dim: m.u32("head_dim"),
@@ -492,6 +494,6 @@ fn rmsnorm_rope_partial_q() -> Rule {
             ),
             y: m.value("y"),
             q_out: m.value("q_out"),
-        }
-    })
+        },
+    )
 }

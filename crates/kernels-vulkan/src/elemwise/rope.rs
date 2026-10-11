@@ -135,10 +135,26 @@ pub fn partial(
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     let base = theta.log2();
     rotate(
-        ctx, OP, q, positions, UNSCALED, base, head_dim, rotary_dim, proportional,
+        ctx,
+        OP,
+        q,
+        positions,
+        UNSCALED,
+        base,
+        head_dim,
+        rotary_dim,
+        proportional,
     )?;
     rotate(
-        ctx, OP, k, positions, UNSCALED, base, head_dim, rotary_dim, proportional,
+        ctx,
+        OP,
+        k,
+        positions,
+        UNSCALED,
+        base,
+        head_dim,
+        rotary_dim,
+        proportional,
     )
 }
 

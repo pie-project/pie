@@ -259,8 +259,26 @@ pub fn partial(
     const OP: &str = "elementwise.rope_partial";
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     let base = theta.log2();
-    rotate_partial(ctx, OP, q, positions, base, head_dim, rotary_dim, proportional)?;
-    rotate_partial(ctx, OP, k, positions, base, head_dim, rotary_dim, proportional)
+    rotate_partial(
+        ctx,
+        OP,
+        q,
+        positions,
+        base,
+        head_dim,
+        rotary_dim,
+        proportional,
+    )?;
+    rotate_partial(
+        ctx,
+        OP,
+        k,
+        positions,
+        base,
+        head_dim,
+        rotary_dim,
+        proportional,
+    )
 }
 
 pub fn partial_q(

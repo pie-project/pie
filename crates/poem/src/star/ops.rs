@@ -1947,9 +1947,7 @@ pub(crate) static OPS: &[Op] = &[
             result(
                 heap,
                 dsl("elemwise.rope_proportional_q", || {
-                    ops::elemwise::rope_partial_q(
-                        &q, &positions, rotary_dim, head_dim, theta, true,
-                    )
+                    ops::elemwise::rope_partial_q(&q, &positions, rotary_dim, head_dim, theta, true)
                 })?,
             )
         },
