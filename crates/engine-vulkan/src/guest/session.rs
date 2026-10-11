@@ -6,7 +6,7 @@ use eta_exec::{Extents, OpParams, ValueDesc, describe, layout};
 
 use crate::device::Context;
 use crate::device::alloc::{Buffer, Memory};
-use crate::device::ctx::{Core, Frame};
+use crate::device::ctx::{Core, Frame, Pending};
 use crate::error::{Fault, Result};
 
 const DESC_WORDS: usize = 9;
@@ -119,6 +119,12 @@ pub struct Session {
 
     /// The cells of channels the device keeps between fires, by channel.
     kept: std::collections::HashMap<u32, Buffer>,
+
+    /// Passes submitted and not yet waited on, oldest first.
+    airborne: std::collections::VecDeque<Pending>,
+    /// Read-back buffers a landed pass has handed back, one stage's landing
+    /// wide each.
+    landings: Arc<std::sync::Mutex<Vec<Buffer>>>,
 }
 
 impl std::fmt::Debug for Session {
@@ -200,6 +206,8 @@ impl Session {
             stages,
             pool,
             kept: std::collections::HashMap::new(),
+            airborne: std::collections::VecDeque::new(),
+            landings: Arc::default(),
         };
         session.bind_sets()?;
         Ok(session)
@@ -288,6 +296,8 @@ impl Session {
                 ),
             });
         }
+        // A pass still on the queue may not have copied its own roots out.
+        self.settle()?;
         let stage = &mut self.stages[stage];
         stage.staging.write(at, bytes)?;
         stage.dirty.push((at, len));
@@ -361,6 +371,68 @@ impl Session {
             self.kept.insert(channel, Buffer::zeroed(device, len)?);
         }
         frame.copy(&self.stages[stage].heap, at, &self.kept[&channel], 0, len)
+    }
+
+    /// A read-back buffer of its own for a pass that lands after the next
+    /// one is recorded.
+    pub fn lend_landing(&mut self, device: &Context, stage: usize) -> Result<Buffer> {
+        let bytes = self.stages[stage].landing.bytes();
+        let spare = self
+            .landings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop();
+        match spare {
+            Some(buffer) if buffer.bytes() >= bytes => Ok(buffer),
+            _ => Buffer::with(device, bytes, Memory::Host),
+        }
+    }
+
+    /// Where a landed pass hands its read-back buffer back.
+    #[must_use]
+    pub fn landings(&self) -> Arc<std::sync::Mutex<Vec<Buffer>>> {
+        Arc::clone(&self.landings)
+    }
+
+    pub fn read_back_into(
+        &self,
+        frame: &mut Frame,
+        stage: usize,
+        value: u32,
+        into: &Buffer,
+    ) -> Result<()> {
+        let (at, len) = self.span(stage, value).ok_or_else(|| Fault::Program {
+            at: "guest::session",
+            why: format!("value {value} is not stage {stage}'s"),
+        })?;
+        frame.copy(&self.stages[stage].heap, at, into, at, len)
+    }
+
+    /// The device's fault word, for a pass that lands on another thread.
+    #[must_use]
+    pub fn status_cell(&self) -> Buffer {
+        self.status.clone()
+    }
+
+    /// The device cell a kept channel holds.
+    #[must_use]
+    pub fn kept_cell(&self, channel: u32) -> Option<&Buffer> {
+        self.kept.get(&channel)
+    }
+
+    pub fn depart(&mut self, pending: Pending) {
+        while self.airborne.front().is_some_and(Pending::landed) {
+            self.airborne.pop_front();
+        }
+        self.airborne.push_back(pending);
+    }
+
+    /// Waits for every pass this session has on the queue.
+    pub fn settle(&mut self) -> Result<()> {
+        while let Some(pending) = self.airborne.pop_front() {
+            pending.wait()?;
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -489,6 +561,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        let _ = self.settle();
         unsafe {
             let d = &self.core.device;
             d.destroy_descriptor_pool(self.pool, None);

@@ -81,6 +81,10 @@ pub(crate) struct Core {
 
     spare_fences: Mutex<Vec<vk::Fence>>,
 
+    /// Command buffers whose frame was dropped off the thread that owns
+    /// their pool, which a pool's own thread frees: a pool is not shared.
+    orphans: Mutex<Vec<(vk::CommandPool, vk::CommandBuffer)>>,
+
     pub(crate) family: u32,
     pub(crate) memory: vk::PhysicalDeviceMemoryProperties,
     pub(crate) limits: vk::PhysicalDeviceLimits,
@@ -197,8 +201,23 @@ impl Core {
             .pools
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(pool) = pools.get(&std::thread::current().id()) {
-            return Ok(*pool);
+        if let Some(&pool) = pools.get(&std::thread::current().id()) {
+            let mut orphans = self
+                .orphans
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut freed = Vec::new();
+            orphans.retain(|&(owner, cmd)| {
+                let mine = owner == pool;
+                if mine {
+                    freed.push(cmd);
+                }
+                !mine
+            });
+            if !freed.is_empty() {
+                unsafe { self.device.free_command_buffers(pool, &freed) };
+            }
+            return Ok(pool);
         }
         let pool = unsafe {
             self.device.create_command_pool(
@@ -625,6 +644,7 @@ impl Context {
                 pool,
             )])),
             spare_fences: Mutex::new(Vec::new()),
+            orphans: Mutex::new(Vec::new()),
             family,
             memory,
             limits: props.limits,
@@ -793,6 +813,22 @@ impl Context {
             d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(flags))
         }
         .map_err(|e| core.fault("vkBeginCommandBuffer", e))?;
+        // Frames run ahead of one another on the queue: each waits for every
+        // write submitted before it.
+        unsafe {
+            let all = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[all],
+                &[],
+                &[],
+            );
+        }
         let timing = if crate::encode::profiling() && core.limits.timestamp_period > 0.0 {
             let pool = unsafe {
                 d.create_query_pool(
@@ -901,7 +937,22 @@ impl Drop for Inner {
             {
                 d.destroy_query_pool(timing.pool, None);
             }
-            d.free_command_buffers(self.cmd_pool, &[self.cmd]);
+            let owned = self
+                .core
+                .pools
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&std::thread::current().id())
+                == Some(&self.cmd_pool);
+            if owned {
+                d.free_command_buffers(self.cmd_pool, &[self.cmd]);
+            } else {
+                self.core
+                    .orphans
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((self.cmd_pool, self.cmd));
+            }
         }
         self.core.return_fence(self.fence);
     }

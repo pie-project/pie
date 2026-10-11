@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
@@ -27,6 +28,11 @@ struct Instance {
 
     #[cfg(feature = "vulkan")]
     session: crate::guest::session::Session,
+
+    /// Ring cells a pass on the queue has yet to land, as (channel, sequence).
+    landing: Arc<Mutex<Vec<(u32, u64)>>>,
+    /// Set by a pass that faulted after its fire returned.
+    faulted: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -185,6 +191,8 @@ impl Plane {
                 geometry: binding.geometry,
                 #[cfg(feature = "vulkan")]
                 session,
+                landing: Arc::default(),
+                faulted: Arc::default(),
             },
         );
         Ok(BoundInstance {
@@ -351,6 +359,18 @@ impl Plane {
                 "instance {instance} carries no channel {channel}"
             )));
         }
+        if seat.faulted.load(Ordering::Acquire) {
+            return Err(Refusal::Program(format!("instance {instance} is poisoned")));
+        }
+        let head = seat.inst.channels[channel as usize].head();
+        if seat
+            .landing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&(channel, head))
+        {
+            return Ok(None);
+        }
         match eta_exec::host_take(&seat.inst, &seat.plan, channel) {
             (HostOp::Ok, Some(value)) => {
                 let mut bytes = vec![0u8; eta_exec::wire_cell_bytes(value.dtype(), value.len())];
@@ -393,6 +413,9 @@ impl Plane {
             what: "instance",
             id: instance,
         })?;
+        if seat.faulted.load(Ordering::Acquire) {
+            return Err(Refusal::Program(format!("instance {instance} is poisoned")));
+        }
 
         #[cfg(feature = "vulkan")]
         let device_half = match (device, widen.is_some()) {
@@ -472,6 +495,189 @@ impl Plane {
                 ))),
             }
         }
+    }
+
+    /// The device cell holding `instance`'s next token, when a pass on the
+    /// queue wrote it there rather than to the ring.
+    #[cfg(feature = "vulkan")]
+    #[must_use]
+    pub fn token_feed(&self, instance: InstanceId) -> Option<crate::device::Buffer> {
+        let seat = self.instances.get(&instance)?;
+        if !seat.geometry.ports().contains(Port::EmbedTokens) {
+            return None;
+        }
+        let binding = seat
+            .plan
+            .package
+            .ports
+            .iter()
+            .find(|binding| binding.port == Port::EmbedTokens && !binding.is_const)?;
+        seat.session.kept_cell(binding.channel).cloned()
+    }
+
+    /// Whether `instance`'s pass can be recorded to land later: one stage,
+    /// reading its logits on the device.
+    #[cfg(feature = "vulkan")]
+    #[must_use]
+    pub fn defers(&self, instance: InstanceId) -> bool {
+        self.widen.is_some()
+            && self.instances.get(&instance).is_some_and(|seat| {
+                seat.plan.package.plans.len() == 1
+                    && !seat.inst.poisoned
+                    && !seat.faulted.load(Ordering::Acquire)
+            })
+    }
+
+    /// Runs `instance`'s pass behind the forward on the queue and returns
+    /// before either lands. The cells the host reads land into the rings on
+    /// another thread, which then reports the step done; every other cell
+    /// stays on the device for the next pass and the next forward.
+    #[cfg(feature = "vulkan")]
+    pub fn fire_deferred(
+        &mut self,
+        instance: InstanceId,
+        device: &crate::device::Context,
+        readout: Option<crate::guest::run::Readout<'_>>,
+        done: Option<crate::settle::Done>,
+    ) -> Result<(), Refusal> {
+        let Plane {
+            instances,
+            tally,
+            widen,
+            ..
+        } = self;
+        let seat = instances.get_mut(&instance).ok_or(Refusal::Closed {
+            what: "instance",
+            id: instance,
+        })?;
+        let widen = widen.as_ref().ok_or_else(|| {
+            Refusal::Program(format!(
+                "instance {instance} has a device half, but the plane built no readout widen"
+            ))
+        })?;
+        if seat.plan.needs_logits && readout.is_none() {
+            return Err(Refusal::Program(format!(
+                "instance {instance} reads logits, but its lane offered no readout seat"
+            )));
+        }
+        let inputs = PassInputs {
+            logits: None,
+            mtp_logits: None,
+            rows: 0,
+            vocab: 0,
+            mtp_draft_row: None,
+            attn_score: None,
+        };
+        let mut runner =
+            crate::guest::run::OnDevice::new(device, &mut seat.session, widen, readout).deferred();
+        let outcome = eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut runner);
+        let deferral = runner.take_deferral().unwrap_or_default();
+        widen.disarm();
+        let program = seat.program;
+        match outcome {
+            StepOutcome::Committed => {}
+            StepOutcome::Blocked(channel) => {
+                return Err(Refusal::Program(format!(
+                    "instance {instance} (program {program}) blocked on channel {channel}"
+                )));
+            }
+            StepOutcome::Faulted(why) => {
+                return Err(Refusal::Program(format!(
+                    "instance {instance} (program {program}) faulted: {why}"
+                )));
+            }
+        }
+        tally.0 += 1;
+
+        let crate::guest::run::Deferral {
+            frame,
+            landing,
+            landings,
+        } = deferral;
+        let Some(frame) = frame else {
+            if let Some(done) = done {
+                (done.sink)(done.at, engine::StepOutcome::Committed);
+            }
+            return Ok(());
+        };
+        let fixups: Vec<(Arc<ChannelState>, u64, crate::guest::run::Landing)> = landings
+            .into_iter()
+            .map(|landing| {
+                let ring = Arc::clone(&seat.inst.channels[landing.channel as usize]);
+                let sequence = ring.tail().saturating_sub(1);
+                (ring, sequence, landing)
+            })
+            .collect();
+        let owed: Vec<(u32, u64)> = fixups
+            .iter()
+            .map(|(_, sequence, landing)| (landing.channel, *sequence))
+            .collect();
+        seat.landing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(owed.iter().copied());
+
+        let status = seat.session.status_cell();
+        let spare = seat.session.landings();
+        let landing = Mutex::new(landing);
+        let owing = Arc::clone(&seat.landing);
+        let faulted = Arc::clone(&seat.faulted);
+        let on_done = move |refused: Option<String>| {
+            let mut fault = refused;
+            if fault.is_none() {
+                let mut word = [0u8; 4];
+                fault = match status.read(0, &mut word) {
+                    Ok(()) if word == [0; 4] => None,
+                    Ok(()) => Some(format!(
+                        "instance {instance} (program {program}) faulted on the device with                          code {}",
+                        u32::from_le_bytes(word)
+                    )),
+                    Err(why) => Some(why.to_string()),
+                };
+            }
+            let lent = landing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if fault.is_none()
+                && let Some(lent) = lent.as_ref()
+            {
+                for (ring, sequence, landing) in &fixups {
+                    match crate::guest::run::landed_value(lent, landing) {
+                        Ok(value) => ring.encode_sequence(*sequence, &value),
+                        Err(why) => {
+                            fault = Some(why.to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+            if fault.is_some() {
+                faulted.store(true, Ordering::Release);
+            }
+            owing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|cell| !owed.contains(cell));
+            if let Some(lent) = lent {
+                spare
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(lent);
+            }
+            if let Some(done) = done.as_ref() {
+                let outcome = match fault {
+                    None => engine::StepOutcome::Committed,
+                    Some(why) => engine::StepOutcome::Faulted(why),
+                };
+                (done.sink)(done.at, outcome);
+            }
+        };
+        let pending = frame
+            .commit_async(Some(Box::new(on_done)))
+            .map_err(|fault| Refusal::Program(format!("instance {instance}: {fault}")))?;
+        seat.session.depart(pending);
+        Ok(())
     }
 
     #[doc(hidden)]

@@ -275,6 +275,13 @@ impl Inputs {
         self.patch.map(|at| at.seat.dtype)
     }
 
+    /// The store and the offset of row 0's token id, for a token the device
+    /// writes in place of the host.
+    #[must_use]
+    pub fn token_seat(&self) -> (&Buffer, u64) {
+        (&self.store, self.tokens)
+    }
+
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.store.bytes()
