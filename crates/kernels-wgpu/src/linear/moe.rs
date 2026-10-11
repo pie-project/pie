@@ -33,23 +33,17 @@ pub fn should_batch(pairs: u32, experts: u32, min_per_expert: u32) -> bool {
 }
 
 #[must_use]
-pub fn tile_rows(pairs: u32, experts: u32, tuning: &crate::DeviceTuning) -> u32 {
-    if !should_batch(pairs, experts, tuning.moe_batch_min_per_expert) {
-        return 1;
-    }
-    let per = pairs / experts;
-    if per >= tuning.moe_tile_wide_per {
-        return MOE_TILE_ROWS[2];
-    }
-    if per >= tuning.moe_tile_mid_per {
-        MOE_TILE_ROWS[1]
-    } else {
-        MOE_TILE_ROWS[0]
-    }
+pub fn tile_rows(pairs: u32, experts: u32, tuning: &crate::Tuning) -> u32 {
+    let tile = tuning.moe_tile_rows(pairs, experts);
+    debug_assert!(
+        tile == 1 || MOE_TILE_ROWS.contains(&tile),
+        "`kernel.moe.tile_rows` declares the tiles this crate stamps"
+    );
+    tile
 }
 
 #[must_use]
-pub fn sorted_rows(pairs: u32, experts: u32, tuning: &crate::DeviceTuning) -> u32 {
+pub fn sorted_rows(pairs: u32, experts: u32, tuning: &crate::Tuning) -> u32 {
     let tile = tile_rows(pairs, experts, tuning);
     if tile <= 1 {
         return pairs;
@@ -728,7 +722,7 @@ pub fn matmul_select_batched(
     experts: u32,
     scratch: RoutedScratch,
     y: Tensor,
-    tuning: &crate::DeviceTuning,
+    tuning: &crate::Tuning,
 ) -> Result<bool, Error> {
     dtype_dispatch!(op, x.dtype, { Bf16 => () });
     let fan = selected(op, x, routes, y)?;

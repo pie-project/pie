@@ -20,6 +20,7 @@ default = []
 [dependencies]
 
 dtype = { package = "pie-dtype", path = "../dtype" }
+profile = { package = "pie-profile", path = "../profile" }
 
 [lints]
 workspace = true

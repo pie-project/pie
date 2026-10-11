@@ -18,6 +18,7 @@ kernels-wgpu = { path = "../kernels-wgpu" }
 engine = { path = "../engine" }
 poem-exec = { package = "pie-poem-exec", path = "../poem-exec" }
 poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
+profile = { package = "pie-profile", path = "../profile" }
 eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
 eta-exec = { path = "../eta-exec" }
 

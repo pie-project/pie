@@ -163,8 +163,11 @@ pub(crate) struct Core {
     pub(crate) last_error: Arc<Mutex<Option<String>>>,
     pub(crate) allocated: AtomicU64,
     pub(crate) name: String,
-    pub(crate) cores: u32,
-    pub(crate) subgroup_size: u32,
+    /// Multiprocessors or compute units, where the native driver says.
+    pub(crate) cores: Option<u32>,
+    /// The narrowest subgroup a dispatch may run at; `None` without the
+    /// subgroup feature.
+    pub(crate) subgroup_min: Option<u32>,
     pub(crate) device_local: u64,
 }
 
@@ -318,10 +321,10 @@ fn rank(kind: wgpu::DeviceType, preference: wgpu::PowerPreference) -> u8 {
 }
 
 #[cfg(not(any(target_vendor = "apple", target_arch = "wasm32")))]
-fn vulkan_facts(adapter: &wgpu::Adapter) -> (Option<u64>, Option<u32>, Option<u32>) {
+fn vulkan_facts(adapter: &wgpu::Adapter) -> (Option<u64>, Option<u32>) {
     use ash::vk;
     let Some(hal) = (unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }) else {
-        return (None, None, None);
+        return (None, None);
     };
     let instance = hal.shared_instance().raw_instance();
     let physical = hal.raw_physical_device();
@@ -358,19 +361,12 @@ fn vulkan_facts(adapter: &wgpu::Adapter) -> (Option<u64>, Option<u32>, Option<u3
     } else {
         None
     };
-    let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
-    let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
-    unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
-    (
-        local,
-        cores.filter(|&n| n > 0),
-        Some(subgroup.subgroup_size).filter(|&n| n > 0),
-    )
+    (local, cores.filter(|&n| n > 0))
 }
 
 #[cfg(any(target_vendor = "apple", target_arch = "wasm32"))]
-fn vulkan_facts(_adapter: &wgpu::Adapter) -> (Option<u64>, Option<u32>, Option<u32>) {
-    (None, None, None)
+fn vulkan_facts(_adapter: &wgpu::Adapter) -> (Option<u64>, Option<u32>) {
+    (None, None)
 }
 
 pub struct Handed {
@@ -503,7 +499,7 @@ impl Context {
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(text);
             }));
         }
-        let (heap, sm, subgroup) = vulkan_facts(&adapter);
+        let (heap, sm) = vulkan_facts(&adapter);
         let device_local = boot
             .device_memory
             .or(heap)
@@ -516,6 +512,7 @@ impl Context {
             pipeline_cache: features.contains(wgpu::Features::PIPELINE_CACHE),
         };
         let max_buffer = limits.max_buffer_size;
+        let subgroup_min = enabled.subgroups.then_some(info.subgroup_min_size);
         let poller = host::Poller::start(device.clone());
         let core = Arc::new(Core {
             device,
@@ -530,8 +527,8 @@ impl Context {
             scratch: Mutex::new(Vec::new()),
             last_error,
             allocated: AtomicU64::new(0),
-            cores: sm.unwrap_or(16),
-            subgroup_size: subgroup.unwrap_or(32),
+            cores: sm,
+            subgroup_min,
             device_local,
         });
         let dummy = Raw::new(&core, DUMMY_BYTES, Memory::Device)?;
@@ -545,7 +542,6 @@ impl Context {
             device_index: boot.adapter_index,
         };
 
-        kernels_wgpu::tuning::describe(context.info());
         Ok(context)
     }
 
@@ -574,19 +570,16 @@ impl Context {
     }
 
     #[must_use]
+    /// The cores the compiler and a decode split size work by: the count
+    /// the native driver reports, else [`crate::chip::UNREPORTED_CORES`].
     pub fn cores(&self) -> u32 {
-        self.core.cores
-    }
-
-    #[must_use]
-    pub fn subgroup_size(&self) -> u32 {
-        self.core.subgroup_size
+        self.chip().sizing_cores()
     }
 
     #[must_use]
     pub fn tiers(&self) -> Vec<kernels_wgpu::Capability> {
         let mut out = Vec::new();
-        if self.core.enabled.subgroups && self.core.subgroup_size >= 32 {
+        if self.chip().subgroups_32() {
             out.push(kernels_wgpu::Capability::Subgroup);
         }
         if self.core.enabled.f16 {
@@ -615,24 +608,22 @@ impl Context {
         self.core.enabled
     }
 
+    /// What the profile is resolved from: the adapter's name and facts.
     #[must_use]
-    pub fn info(&self) -> kernels_wgpu::DeviceInfo {
-        kernels_wgpu::DeviceInfo {
-            vendor: match self.core.info.vendor {
-                0x10DE => kernels_wgpu::tuning::Vendor::Nvidia,
-                0x1002 => kernels_wgpu::tuning::Vendor::Amd,
-                0x8086 => kernels_wgpu::tuning::Vendor::Intel,
-                0x106B => kernels_wgpu::tuning::Vendor::Apple,
-                _ => kernels_wgpu::tuning::Vendor::Other,
-            },
-            subgroups: self.core.enabled.subgroups,
-            f16: self.core.enabled.f16,
+    pub fn chip(&self) -> crate::chip::Device {
+        crate::chip::Device {
+            name: self.core.name.clone(),
+            vendor: crate::chip::vendor_of(self.core.info.vendor),
+            subgroup_min: self.core.subgroup_min,
             cores: self.core.cores,
-            max_workgroup_invocations: self.core.limits.max_compute_invocations_per_workgroup,
-            max_shared_bytes: self.core.limits.max_compute_workgroup_storage_size,
-            max_storage_buffer_binding: self.core.limits.max_storage_buffer_binding_size,
-            max_storage_buffers: self.core.limits.max_storage_buffers_per_shader_stage,
+            f16: self.core.enabled.f16,
         }
+    }
+
+    /// Storage buffers a shader stage may bind.
+    #[must_use]
+    pub fn storage_buffers(&self) -> u32 {
+        self.core.limits.max_storage_buffers_per_shader_stage
     }
 
     /// What the working set has left now, less this process's allocations.

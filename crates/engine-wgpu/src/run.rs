@@ -153,6 +153,9 @@ pub struct Run<'c> {
     copy: CopyPlan,
 
     scratch: &'c Scratch,
+
+    /// The adapter profile this load's kernels run under.
+    tuning: &'c kernels_wgpu::Tuning,
 }
 
 #[derive(Default)]
@@ -162,6 +165,11 @@ pub(crate) struct StageCache {
 }
 
 impl<'c> Run<'c> {
+    /// The adapter profile this load's kernels run under.
+    pub(crate) fn tuning(&self) -> &'c kernels_wgpu::Tuning {
+        self.tuning
+    }
+
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -176,6 +184,7 @@ impl<'c> Run<'c> {
         windows: &'c Windows,
         place: &'c At,
         scratch: &'c Scratch,
+        tuning: &'c kernels_wgpu::Tuning,
         seats: Option<&'c crate::experts::Seats>,
         rows: Option<&'c crate::experts::Gathered>,
         host: Option<&'c crate::experts::HostTier>,
@@ -201,6 +210,7 @@ impl<'c> Run<'c> {
             place,
             copy: CopyPlan::default(),
             scratch,
+            tuning,
         }
     }
 

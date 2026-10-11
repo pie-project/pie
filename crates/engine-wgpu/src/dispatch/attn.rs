@@ -140,6 +140,7 @@ impl Run<'_> {
                 o,
             } => attn::decode(
                 self.ctx(),
+                self.tuning(),
                 self.tensor(*q),
                 self.decode_plan(*plan),
                 self.pool(*cache),
@@ -170,7 +171,7 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
                 self.requests(),
-                &kernels_wgpu::tuning::current(),
+                self.tuning(),
             ),
 
             Attention::DecodeSelected {
@@ -270,7 +271,7 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
                 self.requests(),
-                &kernels_wgpu::tuning::current(),
+                self.tuning(),
             ),
             Attention::MaskedLse {
                 q,
@@ -296,7 +297,7 @@ impl Run<'_> {
                 self.tensor(*o),
                 self.tensor(*lse),
                 self.requests(),
-                &kernels_wgpu::tuning::current(),
+                self.tuning(),
             ),
             Attention::DecodeLse {
                 q,
@@ -309,6 +310,7 @@ impl Run<'_> {
                 lse,
             } => attn::decode_lse(
                 self.ctx(),
+                self.tuning(),
                 self.tensor(*q),
                 self.decode_plan(*plan),
                 self.pool(*cache),
@@ -342,7 +344,7 @@ impl Run<'_> {
                     self.tensor(*o),
                     self.tensor(*lse),
                     self.requests(),
-                    &kernels_wgpu::tuning::current(),
+                    self.tuning(),
                 )?;
 
                 self.capture_scores(

@@ -37,6 +37,9 @@ pub struct DeviceBoot {
     pub pipeline_cache: Option<PathBuf>,
 
     pub device_memory: Option<u64>,
+
+    /// `$PIE_HOME/profiles`, where a native user's adapter profiles live.
+    pub profiles: Option<PathBuf>,
 }
 
 impl Default for DeviceBoot {
@@ -48,6 +51,7 @@ impl Default for DeviceBoot {
             power_preference: crate::boot::DEFAULT_POWER_PREFERENCE.to_string(),
             pipeline_cache: None,
             device_memory: None,
+            profiles: None,
         }
     }
 }

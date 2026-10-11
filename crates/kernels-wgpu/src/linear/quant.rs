@@ -307,28 +307,50 @@ pub struct Scratch<'a> {
 
 pub fn matmul(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     act: Tensor,
     w: Bank,
     y: Tensor,
     scratch: Scratch<'_>,
     capacity_rows: u32,
 ) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.matmul", act, w, y, scratch, capacity_rows)
+    act_x_wt(
+        ctx,
+        tuning,
+        "linear.matmul",
+        act,
+        w,
+        y,
+        scratch,
+        capacity_rows,
+    )
 }
 
 pub fn lm_head(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     act: Tensor,
     w: Bank,
     y: Tensor,
     scratch: Scratch<'_>,
     capacity_rows: u32,
 ) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.lm_head", act, w, y, scratch, capacity_rows)
+    act_x_wt(
+        ctx,
+        tuning,
+        "linear.lm_head",
+        act,
+        w,
+        y,
+        scratch,
+        capacity_rows,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn act_x_wt(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     op: &'static str,
     act: Tensor,
     w: Bank,
@@ -370,9 +392,8 @@ pub fn act_x_wt(
         stated(op, columns)?,
         stated(op, contraction)?,
     );
-    let tuned = crate::tuning::current();
-    let min_batch = i32::try_from(tuned.qmm_min_batch(false, false)).unwrap_or(i32::MAX);
-    let crossover = i32::try_from(tuned.qmm_bn_crossover_tg).unwrap_or(i32::MAX);
+    let min_batch = i32::try_from(tuning.qmm_min_rows()).unwrap_or(i32::MAX);
+    let crossover = i32::try_from(tuning.qmm_crossover_tg()).unwrap_or(i32::MAX);
     let capacity = i32::try_from(capacity_rows).unwrap_or(i32::MAX);
     if m >= min_batch
         && k % QMM_BK == 0

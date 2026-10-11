@@ -16,6 +16,7 @@ impl Run<'_> {
             Linear::Matmul { act, w, y } => match self.banked(*w) {
                 Some(bank) => linear::quant::matmul(
                     self.ctx(),
+                    self.tuning(),
                     self.tensor(*act),
                     bank,
                     self.tensor(*y),
@@ -43,6 +44,7 @@ impl Run<'_> {
             Linear::LmHead { act, w, y } => match self.banked(*w) {
                 Some(bank) => linear::quant::lm_head(
                     self.ctx(),
+                    self.tuning(),
                     self.tensor(*act),
                     bank,
                     self.tensor(*y),
@@ -339,7 +341,7 @@ impl Run<'_> {
                         self.experts(*routes),
                         scratch,
                         self.tensor(*y),
-                        &kernels_wgpu::tuning::current(),
+                        self.tuning(),
                     )?
                 {
                     return Ok(());
@@ -375,7 +377,7 @@ impl Run<'_> {
                         self.experts(*routes),
                         scratch,
                         self.tensor(*y),
-                        &kernels_wgpu::tuning::current(),
+                        self.tuning(),
                     )?
                 {
                     return Ok(());

@@ -8,8 +8,7 @@ pub const DEFAULT_DEVICE_MEMORY: u64 = 8 << 30;
 
 pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Wgpu, String> {
     let doc = parse(config_bytes)?;
-    tuning(&doc);
-    Ok(Wgpu::new(device_boot(&doc), contract_for))
+    Ok(Wgpu::new(device_boot(&doc)?, contract_for))
 }
 
 #[cfg(feature = "wgpu")]
@@ -21,9 +20,8 @@ pub fn open_with_device(
     queue: wgpu::Queue,
 ) -> Result<Wgpu, String> {
     let doc = parse(config_bytes)?;
-    tuning(&doc);
     Ok(Wgpu::with_device(
-        device_boot(&doc),
+        device_boot(&doc)?,
         contract_for,
         crate::device::Handed {
             adapter,
@@ -38,7 +36,7 @@ pub async fn request_device(
     config_bytes: &[u8],
 ) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), String> {
     let doc = parse(config_bytes)?;
-    let handed = crate::device::request(&device_boot(&doc))
+    let handed = crate::device::request(&device_boot(&doc)?)
         .await
         .map_err(|fault| fault.to_string())?;
     Ok((handed.adapter, handed.device, handed.queue))
@@ -51,15 +49,16 @@ fn parse(config_bytes: &[u8]) -> Result<toml::Table, String> {
         .map_err(|error| format!("the wgpu boot config is not TOML: {error}"))
 }
 
-fn device_boot(doc: &toml::Table) -> DeviceBoot {
-    DeviceBoot {
+fn device_boot(doc: &toml::Table) -> Result<DeviceBoot, String> {
+    Ok(DeviceBoot {
         adapter_index: adapter_index(doc),
         backends: backends(doc),
         gpu_mem_utilization: gpu_mem_utilization(doc),
         power_preference: power_preference(doc),
         pipeline_cache: pipeline_cache(doc),
         device_memory: device_memory(doc),
-    }
+        profiles: profiles(doc)?,
+    })
 }
 
 fn table(doc: &toml::Table) -> Option<&toml::Table> {
@@ -118,38 +117,21 @@ fn device_memory(doc: &toml::Table) -> Option<u64> {
         .filter(|&v| v > 0)
 }
 
-fn tuning(doc: &toml::Table) {
-    let Some(table) = table(doc)
-        .and_then(|wgpu| wgpu.get("tuning"))
-        .and_then(toml::Value::as_table)
-    else {
-        return;
+fn profiles(doc: &toml::Table) -> Result<Option<std::path::PathBuf>, String> {
+    let Some(wgpu) = table(doc) else {
+        return Ok(None);
     };
-    let int = |key: &str| {
-        table
-            .get(key)
-            .and_then(toml::Value::as_integer)
-            .and_then(|v| u32::try_from(v).ok())
-    };
-    let flag = |key: &str| table.get(key).and_then(toml::Value::as_bool);
-
-    kernels_wgpu::tuning::override_with(kernels_wgpu::tuning::Overrides {
-        qmm_min_batch: int("qmm_min_batch"),
-        qmm_min_batch_moe: int("qmm_min_batch_moe"),
-        qmm_min_batch_emulated: int("qmm_min_batch_emulated"),
-        qmm_bn_crossover_tg: int("qmm_bn_crossover_tg"),
-        moe_tile_mid_per: int("moe_tile_mid_per"),
-        moe_tile_wide_per: int("moe_tile_wide_per"),
-        fp16_qmm: flag("fp16_qmm"),
-        sdpa_tile_min_rows_per_request: int("sdpa_tile_min_rows_per_request"),
-        sdpa_mma: flag("sdpa_mma"),
-        gdn_scan_lanes: int("gdn_scan_lanes"),
-        gdn_scan_rows: int("gdn_scan_rows"),
-        moe_batch_min_per_expert: int("moe_batch_min_per_expert"),
-        qmv_rows_max: int("qmv_rows_max"),
-        qmv_rows_packs: int("qmv_rows_packs"),
-        stream_rows_per_cut: int("stream_rows_per_cut"),
-        sdpa_split_max: int("sdpa_split_max"),
-        sdpa_split_min_keys: int("sdpa_split_min_keys"),
-    });
+    if wgpu.contains_key("tuning") {
+        return Err(
+            "[wgpu.tuning] is gone: an adapter's tuning is its profile now. Write the \
+             decisions to change into $PIE_HOME/profiles/wgpu/user/<adapter>.toml"
+                .to_string(),
+        );
+    }
+    match wgpu.get("profiles") {
+        None => Ok(None),
+        Some(toml::Value::String(dir)) if dir.trim().is_empty() => Ok(None),
+        Some(toml::Value::String(dir)) => Ok(Some(std::path::PathBuf::from(dir))),
+        Some(other) => Err(format!("[wgpu] profiles is a directory path, not {other}")),
+    }
 }

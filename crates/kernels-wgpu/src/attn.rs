@@ -8,7 +8,7 @@ use crate::encode::{
 };
 use crate::error::Error;
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
-use crate::tuning::DeviceInfo;
+use crate::tuning::Tuning;
 
 pub(crate) fn even_lanes(op: &'static str, what: &str, width: u32) -> Result<u32, Error> {
     if width == 0 || !width.is_multiple_of(2) {
@@ -232,19 +232,20 @@ pub struct Split {
 const SPLIT_STORAGE_BUFFERS: u32 = 11;
 
 #[must_use]
-pub fn splits_for(q_heads: u32, rows: u32, keys: u32, info: DeviceInfo) -> u32 {
-    let tuning = crate::tuning::current();
+pub fn splits_for(q_heads: u32, rows: u32, keys: u32, tuning: &Tuning) -> u32 {
     let occupied = q_heads.saturating_mul(rows).max(1);
-    if tuning.sdpa_split_max <= 1
-        || occupied >= info.cores.max(1)
-        || (info.max_storage_buffers != 0 && info.max_storage_buffers < SPLIT_STORAGE_BUFFERS)
+    let cores = tuning.cores().max(1);
+    let buffers = tuning.storage_buffers();
+    if tuning.sdpa_split_max() <= 1
+        || occupied >= cores
+        || (buffers != 0 && buffers < SPLIT_STORAGE_BUFFERS)
     {
         return 1;
     }
 
-    let room = info.cores.max(1).div_ceil(occupied);
-    let afford = keys / tuning.sdpa_split_min_keys.max(1);
-    room.min(afford).min(tuning.sdpa_split_max).max(1)
+    let room = cores.div_ceil(occupied);
+    let afford = keys / tuning.sdpa_split_min_keys().max(1);
+    room.min(afford).min(tuning.sdpa_split_max()).max(1)
 }
 
 fn fits(part: Split, splits: u32, shape: &Paged, head_dim: u32, o: Tensor) -> bool {
@@ -509,6 +510,7 @@ fn sdpa_args(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn vector(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     op: &'static str,
     q: Tensor,
     pool: &KvPool,
@@ -527,12 +529,7 @@ pub(crate) fn vector(
     );
     let shape = Paged::of(op, q, pool, window, head_dim)?;
     if let Some(part) = split {
-        let splits = splits_for(
-            shape.q_heads,
-            shape.rows,
-            part.keys,
-            crate::tuning::device(),
-        );
+        let splits = splits_for(shape.q_heads, shape.rows, part.keys, tuning);
         if splits > 1 && fits(part, splits, &shape, head_dim, o) {
             return split_decode(
                 ctx, op, q, pool, plan, sm_scale, o, lse, part, splits, &shape, head_dim,
@@ -760,6 +757,7 @@ pub(crate) fn tiled(
 #[allow(clippy::too_many_arguments)]
 pub fn decode(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     q: Tensor,
     plan: &DecodePlan,
     pool: &KvPool,
@@ -771,6 +769,7 @@ pub fn decode(
 ) -> Result<(), Error> {
     vector(
         ctx,
+        tuning,
         "attention.decode",
         q,
         pool,
@@ -787,6 +786,7 @@ pub fn decode(
 #[allow(clippy::too_many_arguments)]
 pub fn decode_lse(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     q: Tensor,
     plan: &DecodePlan,
     pool: &KvPool,
@@ -799,6 +799,7 @@ pub fn decode_lse(
 ) -> Result<(), Error> {
     vector(
         ctx,
+        tuning,
         "attention.decode_lse",
         q,
         pool,

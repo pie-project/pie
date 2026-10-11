@@ -491,6 +491,10 @@ pub(crate) fn create_engine_backend(
                     toml::Value::String(cache.display().to_string())
                 ));
             }
+            boot_doc.push_str(&format!(
+                "profiles = {}\n",
+                toml::Value::String(home.join("profiles").display().to_string())
+            ));
             if let Some(memory) = opts.device_memory {
                 boot_doc.push_str(&format!("device_memory = {}\n", memory.as_bytes()));
             }

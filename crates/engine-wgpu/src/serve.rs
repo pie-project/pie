@@ -249,6 +249,10 @@ struct LandedSeat {
 }
 
 pub struct Shell {
+    /// The adapter profile this load's kernels run under.
+    tuning: kernels_wgpu::Tuning,
+    /// How that profile was resolved, for doctor.
+    chip_report: profile::Report,
     device: Context,
 
     pipelines: Pipelines,
@@ -348,20 +352,27 @@ pub struct Shell {
 
 impl Shell {
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
-        let mut boot = Boot {
-            trace: poem_compiler::fuse::fuse(boot.trace, &crate::FUSED),
-            ..boot
-        };
+        let mut boot = boot;
         let device = match boot.handed.take() {
             Some(handed) => Context::adopt(boot.device, handed)?,
             None => Context::bind(boot.device)?,
         };
+        let measured = device.chip();
+        let (chip, chip_report) = crate::chip::resolve(&measured, boot.device.profiles.as_deref());
+        crate::chip::SHELF.tell_untuned(&measured.name, &chip_report);
+        let tuning =
+            kernels_wgpu::Tuning::new(chip.clone(), device.cores(), device.storage_buffers());
+        let boot = Boot {
+            trace: poem_compiler::fuse::fuse(
+                boot.trace,
+                &poem_compiler::fuse::flags::kernels(&chip),
+            ),
+            ..boot
+        };
 
-        let profile = boot.profile.unwrap_or(DeviceProfile {
-            sms: device.cores(),
-            side_streams: 0,
-            ..DeviceProfile::default()
-        });
+        let profile = boot
+            .profile
+            .unwrap_or_else(|| DeviceProfile::of(&chip, device.cores(), &[], &[]));
 
         let budgets = match boot.patches.clone() {
             None => Budgets::of(boot.budget.clone()),
@@ -472,6 +483,7 @@ impl Shell {
             &compiled,
             &budgets,
             least,
+            &tuning,
         )?;
         let spaces = boot
             .trace
@@ -782,6 +794,7 @@ impl Shell {
                 &compiled,
                 &budgets,
                 paging,
+                &tuning,
             )?;
         }
         let pools = Pools::reserve(&device, &boot.trace, paging, &facts)?;
@@ -794,6 +807,8 @@ impl Shell {
         let adapter_slots = crate::adapter::Slots::new(weights.adapter_seats());
 
         Ok(Shell {
+            tuning,
+            chip_report,
             device,
             pipelines: Pipelines::new(),
             handles,
@@ -921,6 +936,18 @@ impl Shell {
     #[must_use]
     pub fn device_name(&self) -> &str {
         self.device.name()
+    }
+
+    /// The adapter profile this load's kernels run under.
+    #[must_use]
+    pub fn tuning(&self) -> &kernels_wgpu::Tuning {
+        &self.tuning
+    }
+
+    /// How this load's adapter profile was resolved.
+    #[must_use]
+    pub fn chip_report(&self) -> &profile::Report {
+        &self.chip_report
     }
 
     #[must_use]
@@ -2009,6 +2036,7 @@ impl Shell {
                 &p.windows,
                 &place,
                 &self.scratch,
+                &self.tuning,
                 self.weights.seats(),
                 self.weights.gathered(),
                 self.weights.host(),
