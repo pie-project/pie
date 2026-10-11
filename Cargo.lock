@@ -1924,6 +1924,7 @@ dependencies = [
  "pie-poem-compiler",
  "pie-poem-exec",
  "pie-poem-ir",
+ "pie-profile",
  "toml 1.1.4+spec-1.1.0",
  "tracing",
 ]
@@ -3177,6 +3178,7 @@ name = "kernels-vulkan"
 version = "0.5.4"
 dependencies = [
  "pie-dtype",
+ "pie-profile",
 ]
 
 [[package]]

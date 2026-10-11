@@ -18,4 +18,4 @@ pub use encode::{
 pub use error::Error;
 pub use sources::{CENSUS, MODULES, census, module};
 pub use tensor::{Bank, Comm, KvPool, RaggedTensor, RecurrentPool, Tensor};
-pub use tuning::{DeviceInfo, DeviceTuning, Vendor};
+pub use tuning::Tuning;

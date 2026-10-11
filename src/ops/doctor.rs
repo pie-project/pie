@@ -555,9 +555,7 @@ fn check_profiles() -> Checks {
             ));
             continue;
         };
-        let (_, report) = backend
-            .shelf
-            .resolve((backend.registry)(), &device, &facts, Some(&dir));
+        let (_, report) = (backend.resolve)(&device, &facts, Some(&dir));
         checks.push((
             backend.name.to_string(),
             format!("{device} ({})", facts.describe().join(", ")),

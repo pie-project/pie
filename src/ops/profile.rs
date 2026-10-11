@@ -121,7 +121,7 @@ fn dump(b: &Backend, device: Option<String>) -> Result<Answer> {
     };
     let probed = facts != profile::Facts::of(registry);
     let (profile, report) = if probed {
-        b.shelf.resolve(registry, &device, &facts, Some(&dir))
+        (b.resolve)(&device, &facts, Some(&dir))
     } else {
         b.shelf.read(registry, &device, Some(&dir))
     };

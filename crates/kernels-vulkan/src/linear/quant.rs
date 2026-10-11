@@ -362,28 +362,50 @@ pub fn qmm_cm_name(op: &'static str, group: i32, bits: i32) -> Result<&'static s
 
 pub fn matmul(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     act: Tensor,
     w: Bank,
     y: Tensor,
     scratch: Scratch<'_>,
     capacity_rows: u32,
 ) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.matmul", act, w, y, scratch, capacity_rows)
+    act_x_wt(
+        ctx,
+        tuning,
+        "linear.matmul",
+        act,
+        w,
+        y,
+        scratch,
+        capacity_rows,
+    )
 }
 
 pub fn lm_head(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     act: Tensor,
     w: Bank,
     y: Tensor,
     scratch: Scratch<'_>,
     capacity_rows: u32,
 ) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.lm_head", act, w, y, scratch, capacity_rows)
+    act_x_wt(
+        ctx,
+        tuning,
+        "linear.lm_head",
+        act,
+        w,
+        y,
+        scratch,
+        capacity_rows,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn act_x_wt(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     op: &'static str,
     act: Tensor,
     w: Bank,
@@ -425,10 +447,9 @@ pub fn act_x_wt(
         stated(op, columns)?,
         stated(op, contraction)?,
     );
-    let tuned = crate::tuning::current();
-    let min_batch = i32::try_from(tuned.qmm_min_batch(false, false)).unwrap_or(i32::MAX);
+    let min_batch = i32::try_from(tuning.qmm_min_rows()).unwrap_or(i32::MAX);
 
-    if crate::tuning::device().coopmat && m >= min_batch && k % QMM_BK == 0 {
+    if tuning.qmm_coopmat() && m >= min_batch && k % QMM_BK == 0 {
         let name = qmm_cm_name(op, group, bits)?;
         return ctx.fire(
             Fire::at(QMM_FILE, name).apply(Grid::of(
@@ -451,7 +472,7 @@ pub fn act_x_wt(
             ],
         );
     }
-    if tuned.qmm_register_tiles
+    if tuning.qmm_register_tiles()
         && m >= min_batch
         && k % QMM_BK == 0
         && GROUPS.contains(&group)
@@ -480,7 +501,7 @@ pub fn act_x_wt(
             ],
         );
     }
-    let crossover = i32::try_from(tuned.qmm_bn_crossover_tg).unwrap_or(i32::MAX);
+    let crossover = i32::try_from(tuning.qmm_crossover_tg()).unwrap_or(i32::MAX);
     let capacity = i32::try_from(capacity_rows).unwrap_or(i32::MAX);
     if m >= min_batch
         && k % QMM_BK == 0
@@ -503,7 +524,7 @@ pub fn act_x_wt(
         );
     }
     if m == 1
-        && tuned.qmv_one_row
+        && tuning.qmv_one_row()
         && qmv1_fits(group, bits)
         && GROUPS.contains(&group)
         && (k * bits) % 128 == 0

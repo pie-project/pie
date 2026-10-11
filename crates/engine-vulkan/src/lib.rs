@@ -4,6 +4,7 @@ pub mod arena;
 
 pub mod blob;
 pub mod boot;
+pub mod chip;
 
 pub mod comm;
 pub mod decoded;

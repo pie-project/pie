@@ -257,6 +257,10 @@ struct LandedSeat {
 }
 
 pub struct Shell {
+    /// The device profile this load's kernels run under.
+    tuning: kernels_vulkan::Tuning,
+    /// How that profile was resolved, for doctor.
+    chip_report: profile::Report,
     device: Context,
 
     pipelines: Pipelines,
@@ -350,17 +354,22 @@ pub struct Shell {
 
 impl Shell {
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
+        let device = Context::bind(boot.device)?;
+        let measured = device.chip();
+        let (chip, chip_report) = crate::chip::resolve(&measured, boot.device.profiles.as_deref());
+        crate::chip::SHELF.tell_untuned(&measured.name, &chip_report);
+        let tuning = kernels_vulkan::Tuning::new(chip.clone(), device.cores());
         let boot = Boot {
-            trace: poem_compiler::fuse::fuse(boot.trace, &crate::FUSED),
+            trace: poem_compiler::fuse::fuse(
+                boot.trace,
+                &poem_compiler::fuse::flags::kernels(&chip),
+            ),
             ..boot
         };
-        let device = Context::bind(boot.device)?;
 
-        let profile = boot.profile.unwrap_or(DeviceProfile {
-            sms: device.cores(),
-            side_streams: 0,
-            ..DeviceProfile::default()
-        });
+        let profile = boot
+            .profile
+            .unwrap_or_else(|| DeviceProfile::of(&chip, device.cores(), &[], &[]));
 
         let budgets = match boot.patches.clone() {
             None => Budgets::of(boot.budget.clone()),
@@ -465,6 +474,7 @@ impl Shell {
             &compiled,
             &budgets,
             least,
+            &tuning,
         )?;
         let spaces = boot
             .trace
@@ -766,6 +776,7 @@ impl Shell {
                 &compiled,
                 &budgets,
                 paging,
+                &tuning,
             )?;
         }
         let pools = Pools::reserve(&device, &boot.trace, paging, &facts)?;
@@ -783,6 +794,8 @@ impl Shell {
             || weights.pump().is_some();
 
         Ok(Shell {
+            tuning,
+            chip_report,
             device,
             pipelines: Pipelines::new(),
             handles,
@@ -924,6 +937,18 @@ impl Shell {
     #[must_use]
     pub fn device_name(&self) -> &str {
         self.device.name()
+    }
+
+    /// The device profile this load's kernels run under.
+    #[must_use]
+    pub fn tuning(&self) -> &kernels_vulkan::Tuning {
+        &self.tuning
+    }
+
+    /// How this load's device profile was resolved.
+    #[must_use]
+    pub fn chip_report(&self) -> &profile::Report {
+        &self.chip_report
     }
 
     #[must_use]
@@ -2100,6 +2125,7 @@ impl Shell {
                 &p.windows,
                 &place,
                 &self.scratch,
+                &self.tuning,
                 self.weights.seats(),
                 self.weights.gathered(),
                 self.weights.host(),

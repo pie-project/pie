@@ -443,8 +443,9 @@ pub(crate) fn create_engine_backend(
                 .clone()
                 .unwrap_or_else(|| cache_dir.join("vulkan-pipelines.bin"));
             boot_doc.push_str(&format!(
-                "pipeline_cache = {}\n",
-                toml::Value::String(cache.display().to_string())
+                "pipeline_cache = {}\nprofiles = {}\n",
+                toml::Value::String(cache.display().to_string()),
+                toml::Value::String(home.join("profiles").display().to_string())
             ));
             let backend = opened.map_or_else(
                 || runtime::engine::backend::open::vulkan(boot_doc.as_bytes()),

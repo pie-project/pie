@@ -16,6 +16,7 @@ impl Run<'_> {
             Linear::Matmul { act, w, y } => match self.banked(*w) {
                 Some(bank) => linear::quant::matmul(
                     self.ctx(),
+                    self.tuning(),
                     self.tensor(*act),
                     bank,
                     self.tensor(*y),
@@ -34,6 +35,7 @@ impl Run<'_> {
                     ),
                     None => linear::gemm::matmul(
                         self.ctx(),
+                        self.tuning(),
                         self.tensor(*act),
                         self.tensor(*w),
                         self.tensor(*y),
@@ -43,6 +45,7 @@ impl Run<'_> {
             Linear::LmHead { act, w, y } => match self.banked(*w) {
                 Some(bank) => linear::quant::lm_head(
                     self.ctx(),
+                    self.tuning(),
                     self.tensor(*act),
                     bank,
                     self.tensor(*y),
@@ -61,6 +64,7 @@ impl Run<'_> {
                     ),
                     None => linear::gemm::lm_head(
                         self.ctx(),
+                        self.tuning(),
                         self.tensor(*act),
                         self.tensor(*w),
                         self.tensor(*y),
@@ -339,7 +343,7 @@ impl Run<'_> {
                         self.experts(*routes),
                         scratch,
                         self.tensor(*y),
-                        &kernels_vulkan::tuning::current(),
+                        self.tuning(),
                     )?
                 {
                     return Ok(());
@@ -375,7 +379,7 @@ impl Run<'_> {
                         self.experts(*routes),
                         scratch,
                         self.tensor(*y),
-                        &kernels_vulkan::tuning::current(),
+                        self.tuning(),
                     )?
                 {
                     return Ok(());

@@ -88,7 +88,7 @@ impl Context {
     }
 
     #[must_use]
-    pub fn info(&self) -> kernels_vulkan::DeviceInfo {
+    pub fn chip(&self) -> crate::chip::Device {
         match self.never {}
     }
 

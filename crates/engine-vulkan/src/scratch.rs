@@ -115,6 +115,7 @@ impl Scratch {
         compiled: &CompiledModel,
         budgets: &Budgets,
         paging: Paging,
+        tuning: &kernels_vulkan::Tuning,
     ) -> Result<Scratch> {
         let budget = &budgets.tokens;
         let map = &compiled.arena;
@@ -137,7 +138,6 @@ impl Scratch {
         };
 
         let routers = routers(trace);
-        let tuning = kernels_vulkan::tuning::current();
 
         let mut dense: Vec<(u32, u32)> = Vec::new();
         let (mut act_rows, mut act_k) = (0u64, 0u64);
@@ -168,10 +168,10 @@ impl Scratch {
                         continue;
                     }
 
-                    if moe::tile_rows(y.rows, experts, &tuning) <= 1 {
+                    if moe::tile_rows(y.rows, experts, tuning) <= 1 {
                         continue;
                     }
-                    let rows = moe::sorted_rows(y.rows, experts, &tuning);
+                    let rows = moe::sorted_rows(y.rows, experts, tuning);
                     sorted = sorted.max(u64::from(rows));
                     pairs = pairs.max(u64::from(y.rows));
                     routed_k = routed_k.max(u64::from(x.width));

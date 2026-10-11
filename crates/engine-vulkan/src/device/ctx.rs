@@ -93,7 +93,8 @@ pub(crate) struct Core {
     pub(crate) allocated: AtomicU64,
     pub(crate) name: String,
     pub(crate) subgroup_size: u32,
-    pub(crate) cores: u32,
+    /// Multiprocessors or compute units, where an extension says.
+    pub(crate) cores: Option<u32>,
     pub(crate) device_local: u64,
     pub(crate) vendor_id: u32,
     pub(crate) api_version: u32,
@@ -470,10 +471,7 @@ impl Context {
             None
         };
         match Self::finish(entry, instance, messenger, boot, props2) {
-            Ok(context) => {
-                kernels_vulkan::tuning::describe(context.info());
-                Ok(context)
-            }
+            Ok(context) => Ok(context),
             Err((fault, Some((instance, messenger)))) => {
                 unsafe {
                     if let Some((debug, m)) = messenger {
@@ -587,8 +585,8 @@ impl Context {
                 * cu.compute_units_per_shader_array
         } else {
             0
-        }
-        .max(16);
+        };
+        let cores = (cores > 0).then_some(cores);
 
         let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
@@ -808,9 +806,11 @@ impl Context {
         self.max_buffer
     }
 
+    /// The cores the compiler and the guest scheduler size work by: the
+    /// count an extension reports, else [`crate::chip::UNREPORTED_CORES`].
     #[must_use]
     pub fn cores(&self) -> u32 {
-        self.core.cores
+        self.core.cores.unwrap_or(crate::chip::UNREPORTED_CORES)
     }
 
     #[must_use]
@@ -843,22 +843,15 @@ impl Context {
         self.core.features
     }
 
+    /// What the profile is resolved from: the device's name and facts.
     #[must_use]
-    pub fn info(&self) -> kernels_vulkan::DeviceInfo {
-        kernels_vulkan::DeviceInfo {
-            vendor: match self.core.vendor_id {
-                0x10DE => kernels_vulkan::tuning::Vendor::Nvidia,
-                0x1002 => kernels_vulkan::tuning::Vendor::Amd,
-                0x8086 => kernels_vulkan::tuning::Vendor::Intel,
-                0x106B => kernels_vulkan::tuning::Vendor::Apple,
-                0x5143 => kernels_vulkan::tuning::Vendor::Qualcomm,
-                _ => kernels_vulkan::tuning::Vendor::Other,
-            },
-            subgroup_size: self.core.subgroup_size,
-            max_workgroup_invocations: self.core.limits.max_compute_work_group_invocations,
-            max_shared_bytes: self.core.limits.max_compute_shared_memory_size,
+    pub fn chip(&self) -> crate::chip::Device {
+        crate::chip::Device {
+            name: self.core.name.clone(),
+            vendor: crate::chip::vendor_of(self.core.vendor_id),
+            subgroup: self.core.subgroup_size,
+            cores: self.core.cores,
             coopmat: self.core.features.coopmat,
-            multiprocessors: self.core.cores,
         }
     }
 

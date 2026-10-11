@@ -33,6 +33,9 @@ pub struct DeviceBoot {
     pub validation: bool,
 
     pub pipeline_cache: Option<PathBuf>,
+
+    /// `$PIE_HOME/profiles`, where a user's device profiles live.
+    pub profiles: Option<PathBuf>,
 }
 
 impl Default for DeviceBoot {
@@ -42,6 +45,7 @@ impl Default for DeviceBoot {
             gpu_mem_utilization: crate::boot::DEFAULT_GPU_MEM_UTILIZATION,
             validation: false,
             pipeline_cache: None,
+            profiles: None,
         }
     }
 }

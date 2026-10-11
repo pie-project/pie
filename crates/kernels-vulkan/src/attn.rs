@@ -8,7 +8,7 @@ use crate::encode::{
 };
 use crate::error::Error;
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
-use crate::tuning::DeviceTuning;
+use crate::tuning::Tuning;
 
 pub mod arbiter;
 pub mod dense;
@@ -399,16 +399,16 @@ pub fn splits_for(
     ceiling: u32,
     window: Option<u32>,
     keys: u32,
-    tuning: &DeviceTuning,
+    tuning: &Tuning,
 ) -> u32 {
     let groups = q_heads.saturating_mul(rows).max(1);
-    if ceiling <= 1 || groups >= tuning.sdpa_split_groups {
+    if ceiling <= 1 || groups >= tuning.sdpa_split_groups() {
         return 1;
     }
-    let min_keys = tuning.sdpa_split_min_keys.max(1);
+    let min_keys = tuning.sdpa_split_min_keys().max(1);
     let bound = window.map_or(keys, |w| w.min(keys));
     tuning
-        .sdpa_split_groups
+        .sdpa_split_groups()
         .div_ceil(groups)
         .min(bound.div_ceil(min_keys))
         .clamp(1, ceiling.max(1))
@@ -428,7 +428,7 @@ pub(crate) fn vector_split(
     lse: Option<Tensor>,
     split: Split,
     splits: u32,
-    tuning: &DeviceTuning,
+    tuning: &Tuning,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, q.dtype, { Bf16 => () });
     let shape = Paged::of(op, q, pool, window, head_dim)?;
@@ -459,7 +459,7 @@ pub(crate) fn vector_split(
     };
     args.push(stated(op, slices)?.arg());
     args.push(stated(op, shape.rows)?.arg());
-    args.push(stated(op, tuning.sdpa_split_min_keys.max(1))?.arg());
+    args.push(stated(op, tuning.sdpa_split_min_keys().max(1))?.arg());
     ctx.fire(
         Fire::at(FILE, walker)
             .groups([shape.q_heads, shape.rows, slices])
@@ -761,6 +761,7 @@ pub(crate) fn tiled(
 #[allow(clippy::too_many_arguments)]
 pub fn decode(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     q: Tensor,
     plan: &DecodePlan,
     pool: &KvPool,
@@ -772,6 +773,7 @@ pub fn decode(
 ) -> Result<(), Error> {
     decode_arm(
         ctx,
+        tuning,
         "attention.decode",
         q,
         plan,
@@ -788,6 +790,7 @@ pub fn decode(
 #[allow(clippy::too_many_arguments)]
 pub fn decode_lse(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     q: Tensor,
     plan: &DecodePlan,
     pool: &KvPool,
@@ -800,6 +803,7 @@ pub fn decode_lse(
 ) -> Result<(), Error> {
     decode_arm(
         ctx,
+        tuning,
         "attention.decode_lse",
         q,
         plan,
@@ -816,6 +820,7 @@ pub fn decode_lse(
 #[allow(clippy::too_many_arguments)]
 fn decode_arm(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     op: &'static str,
     q: Tensor,
     plan: &DecodePlan,
@@ -828,7 +833,6 @@ fn decode_arm(
     split: Option<Split>,
 ) -> Result<(), Error> {
     if let Some(planes) = split {
-        let tuning = crate::tuning::current();
         let heads = q.width.checked_div(head_dim).unwrap_or(0);
         let ceiling = split_ceiling(&planes, q.rows, heads, head_dim);
 
@@ -839,10 +843,10 @@ fn decode_arm(
             .rows
             .saturating_mul(pool.page_indices.width)
             .saturating_mul(u32::try_from(pool.page_size).unwrap_or(0));
-        let slices = splits_for(heads, q.rows, ceiling, window, keys, &tuning);
+        let slices = splits_for(heads, q.rows, ceiling, window, keys, tuning);
         if slices > 1 {
             return vector_split(
-                ctx, op, q, pool, plan, window, head_dim, sm_scale, o, lse, planes, slices, &tuning,
+                ctx, op, q, pool, plan, window, head_dim, sm_scale, o, lse, planes, slices, tuning,
             );
         }
     }

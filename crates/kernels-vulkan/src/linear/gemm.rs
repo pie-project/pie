@@ -36,16 +36,29 @@ const VECTOR_ENTRY: &str = "dense_gemv_t_bf16";
 
 const VECTOR_GROUP: [u32; 3] = [32, 8, 1];
 
-pub fn matmul(ctx: &Ctx<'_>, act: Tensor, w: Tensor, y: Tensor) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.matmul", act, w, y)
+pub fn matmul(
+    ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
+    act: Tensor,
+    w: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
+    act_x_wt(ctx, tuning, "linear.matmul", act, w, y)
 }
 
-pub fn lm_head(ctx: &Ctx<'_>, act: Tensor, w: Tensor, y: Tensor) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.lm_head", act, w, y)
+pub fn lm_head(
+    ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
+    act: Tensor,
+    w: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
+    act_x_wt(ctx, tuning, "linear.lm_head", act, w, y)
 }
 
 pub fn act_x_wt(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     op: &'static str,
     act: Tensor,
     w: Tensor,
@@ -63,7 +76,7 @@ pub fn act_x_wt(
         )
     } else if rows < VECTOR_MAX_ROWS {
         (VECTOR_ENTRY, vector_grid(op, rows, columns)?)
-    } else if crate::tuning::device().coopmat {
+    } else if tuning.gemm_coopmat() {
         (COOPMAT_ENTRY, coopmat_grid(op, rows, columns)?)
     } else {
         (TILE_ENTRY, tile_grid(op, rows, columns)?)
