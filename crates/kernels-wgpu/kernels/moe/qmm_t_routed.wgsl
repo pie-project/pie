@@ -70,12 +70,22 @@ fn main(
     for (var k0 = 0u; k0 < k; k0 = k0 + PIE_BK) {
         workgroupBarrier();
 
-        for (var i = flat; i < u32(PIE_BM) * (PIE_BK / 2u); i = i + PIE_THREADS) {
-            let r = i / (PIE_BK / 2u);
-            let kk = (i - r * (PIE_BK / 2u)) * 2u;
-            let at = (row0 + r) * k + k0 + kk;
-            xs[kk * PIE_ROWS4 + r / 4u][r & 3u] = pie_bf16_at(x[at >> 1u], at);
-            xs[(kk + 1u) * PIE_ROWS4 + r / 4u][r & 3u] = pie_bf16_at(x[(at + 1u) >> 1u], at + 1u);
+        // Each invocation stores whole vec4s: Metal lowers a store to one
+        // component of a workgroup vector as a read-modify-write of the
+        // whole vector, so invocations filling neighbouring components of
+        // one vec4 race and drop each other's rows.
+        for (var i = flat; i < PIE_ROWS4 * (PIE_BK / 2u); i = i + PIE_THREADS) {
+            let rq = i / (PIE_BK / 2u);
+            let kk = (i - rq * (PIE_BK / 2u)) * 2u;
+            var lo: vec4<f32>;
+            var hi: vec4<f32>;
+            for (var j = 0u; j < 4u; j = j + 1u) {
+                let at = (row0 + rq * 4u + j) * k + k0 + kk;
+                lo[j] = pie_bf16_at(x[at >> 1u], at);
+                hi[j] = pie_bf16_at(x[(at + 1u) >> 1u], at + 1u);
+            }
+            xs[kk * PIE_ROWS4 + rq] = lo;
+            xs[(kk + 1u) * PIE_ROWS4 + rq] = hi;
         }
 //#if defined(PIE_MXFP4)
 
