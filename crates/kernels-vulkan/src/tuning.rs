@@ -17,6 +17,7 @@ pub const FACTS: &[Var] = &[
         "vendor",
         Domain::Enum(&["nvidia", "amd", "intel", "apple", "qualcomm", "other"]),
     ),
+    // The narrowest subgroup a pipeline may be compiled at.
     Var::fixed("subgroup", Domain::COUNT),
     // Multiprocessors or compute units; absent where no extension says.
     Var::fixed("cores", Domain::COUNT),

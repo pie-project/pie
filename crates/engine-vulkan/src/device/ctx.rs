@@ -93,6 +93,8 @@ pub(crate) struct Core {
     pub(crate) allocated: AtomicU64,
     pub(crate) name: String,
     pub(crate) subgroup_size: u32,
+    /// The narrowest subgroup a pipeline may be compiled at.
+    pub(crate) subgroup_min: u32,
     /// Multiprocessors or compute units, where an extension says.
     pub(crate) cores: Option<u32>,
     pub(crate) device_local: u64,
@@ -544,10 +546,23 @@ impl Context {
         let name = name.clone();
         let props = unsafe { instance.get_physical_device_properties(physical) };
         let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
+        let mut sizes = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+        let sized = props.api_version >= vk::API_VERSION_1_3;
         {
             let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
+            if sized {
+                p2 = p2.push_next(&mut sizes);
+            }
             unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
         }
+        // The narrowest subgroup a pipeline may be compiled at: a driver
+        // that varies the width (Intel: 8 to 32) reports its default as
+        // `subgroupSize`, which a kernel folding 32 lanes cannot rely on.
+        let subgroup_min = if sized && sizes.min_subgroup_size > 0 {
+            sizes.min_subgroup_size.min(subgroup.subgroup_size.max(1))
+        } else {
+            subgroup.subgroup_size.max(1)
+        };
         let device_exts =
             unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
         let memory_budget = has_extension(&device_exts, ash::ext::memory_budget::NAME);
@@ -755,6 +770,7 @@ impl Context {
             allocated: AtomicU64::new(0),
             name: name.clone(),
             subgroup_size: subgroup.subgroup_size.max(1),
+            subgroup_min,
             cores,
             device_local,
             vendor_id: props.vendor_id,
@@ -849,7 +865,7 @@ impl Context {
         crate::chip::Device {
             name: self.core.name.clone(),
             vendor: crate::chip::vendor_of(self.core.vendor_id),
-            subgroup: self.core.subgroup_size,
+            subgroup: self.core.subgroup_min,
             cores: self.core.cores,
             coopmat: self.core.features.coopmat,
         }
