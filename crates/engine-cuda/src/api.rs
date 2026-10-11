@@ -581,6 +581,7 @@ intended for diagnostics, not serving",
                     .pages_per_slot
                     .saturating_mul(shell.budget().max_lanes),
                 max_context: paging.context(),
+                prefill_rows: 0,
             },
             profile,
             ports: PortMask::DEVICE_GEOMETRY

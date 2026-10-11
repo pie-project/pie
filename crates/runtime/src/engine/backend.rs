@@ -13,6 +13,8 @@ pub struct SchedulerLimits {
     pub max_forward_tokens: usize,
     pub max_page_refs: usize,
     pub max_context: usize,
+    /// The rows one prefill fire takes best (0: up to `max_forward_tokens`).
+    pub prefill_rows: usize,
 }
 
 #[derive(Debug, Clone)]

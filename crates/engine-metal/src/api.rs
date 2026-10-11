@@ -563,6 +563,9 @@ impl Engine for Metal {
                 max_tokens: budgets.max_tokens,
                 max_page_refs: paging.pages_per_slot.saturating_mul(budgets.max_lanes),
                 max_context: paging.context(),
+                prefill_rows: shell
+                    .neural_engine()
+                    .map_or(0, crate::ane::Ane::prefill_rows),
             },
             profile,
             ports: PortMask::DEVICE_GEOMETRY
