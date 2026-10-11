@@ -53,7 +53,7 @@ pub fn build(req: &Request) -> Result<Vec<u32>, String> {
 
         tokens.extend(chat::cue());
         if req.thinking == Thinking::Disabled {
-            tokens.extend(no_thinking_cue());
+            tokens.extend(chat::no_thinking_cue());
         }
     }
     // The prefill needs at least one token.
@@ -85,22 +85,4 @@ fn assistant_body(m: &Message) -> String {
         body.push_str("\n</tool_call>");
     }
     body
-}
-
-/// The tokens that tell a thinking model not to think this turn: an empty
-/// thinking block right after the cue, which is what the model's own
-/// template emits for `enable_thinking: false`. Only when the vocabulary
-/// has the block markers as single tokens; on any other model the request
-/// to disable thinking is moot and this is nothing.
-fn no_thinking_cue() -> Vec<u32> {
-    let open = model::encode("<think>");
-    let close = model::encode("</think>");
-    if open.len() != 1 || close.len() != 1 {
-        return Vec::new();
-    }
-    let mut tokens = open;
-    tokens.extend(model::encode("\n\n"));
-    tokens.extend(close);
-    tokens.extend(model::encode("\n\n"));
-    tokens
 }

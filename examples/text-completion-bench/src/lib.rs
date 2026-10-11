@@ -34,6 +34,14 @@ use inferlet::prefix_cache::PrefixCache;
 use inferlet::{chat, session};
 use serde::{Deserialize, Serialize};
 
+fn cue(no_think: bool) -> Vec<u32> {
+    let mut cue = chat::cue();
+    if no_think {
+        cue.extend(chat::no_thinking_cue());
+    }
+    cue
+}
+
 #[derive(Deserialize)]
 struct Input {
     #[serde(default)]
@@ -56,6 +64,10 @@ struct Input {
     /// `max_tokens` regardless of model emit.
     #[serde(default)]
     ignore_eos: bool,
+    /// Turn a thinking model's thinking off, as the model's own template does
+    /// for `enable_thinking: false`.
+    #[serde(default)]
+    no_think: bool,
     /// Busy-wait inside WASM for this many microseconds per drained token —
     /// simulates per-token inferlet work.
     #[serde(default)]
@@ -259,7 +271,7 @@ async fn run_one(
         tokens.to_vec()
     } else {
         let mut p = chat::system_user(&input.system, prompt);
-        p.extend(chat::cue());
+        p.extend(cue(input.no_think));
         p
     };
     step(&mut prologue_us, input.report_timing); // [1] tokenize
@@ -923,7 +935,7 @@ async fn main(input: Input) -> Result<Output> {
                         .map(String::as_str)
                         .unwrap_or(input.prompt.as_str());
                     let mut pt = chat::system_user(&input.system, prompt);
-                    pt.extend(chat::cue());
+                    pt.extend(cue(input.no_think));
                     prepared_prompt_tokens.push(pt);
                 }
             }

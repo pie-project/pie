@@ -763,6 +763,7 @@ async def run(args: argparse.Namespace):
                 "temperature": args.temperature,
                 "top_p": args.top_p,
                 "ignore_eos": args.ignore_eos,
+                "no_think": getattr(args, "think", None) is False,
                 "wasm_delay_us": args.wasm_delay_us,
                 # THE FIRST TOKEN TAKES THE DEVICE AGAIN, ON BOTH ENGINES.
                 # This was set unconditionally for `--engine metal`, because
