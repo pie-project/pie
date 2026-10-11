@@ -43,6 +43,9 @@ pub struct Plane {
     #[cfg(feature = "vulkan")]
     widen: Option<crate::guest::widen::Widen>,
 
+    #[cfg(feature = "vulkan")]
+    built: crate::guest::session::BuiltStages,
+
     tally: (u64, u64),
 }
 
@@ -324,7 +327,12 @@ impl Plane {
             ))
         })?;
         match eta_exec::host_put(&seat.inst, &seat.plan, channel, &value) {
-            HostOp::Ok => Ok(true),
+            HostOp::Ok => {
+                // The host's cell supersedes any the device kept.
+                #[cfg(feature = "vulkan")]
+                seat.session.forget(channel);
+                Ok(true)
+            }
             HostOp::WouldBlock => Ok(false),
             HostOp::Poisoned => Err(Refusal::Program(format!("instance {instance} is poisoned"))),
             HostOp::WrongRole => Err(Refusal::Program(format!(
@@ -541,8 +549,14 @@ impl Plane {
             query_len: binding.extents.query_len,
             key_len: binding.extents.key_len,
         };
-        crate::guest::session::Session::new(device, &plan.package.plans, compiled.all(), &extents)
-            .map_err(|why| format!("its device half did not build: {why}"))
+        crate::guest::session::Session::new(
+            device,
+            &plan.package.plans,
+            compiled.all(),
+            &extents,
+            &mut self.built,
+        )
+        .map_err(|why| format!("its device half did not build: {why}"))
     }
 
     #[must_use]

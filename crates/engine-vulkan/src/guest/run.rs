@@ -97,6 +97,12 @@ impl<'a> OnDevice<'a> {
                     .encode(&frame, seat.seat, seat.at, heap, into, seat.width)?;
                 continue;
             }
+            if root.source == ValueOrigin::ChannelTake
+                && vals[global as usize].is_empty()
+                && self.session.restore(&mut frame, at, local, root.channel)?
+            {
+                continue;
+            }
             let bytes = root_bytes(
                 root,
                 &vals[global as usize],
@@ -107,7 +113,26 @@ impl<'a> OnDevice<'a> {
 
         self.session.flush(&mut frame, at)?;
         self.session.dispatch(&frame, at)?;
+        let mut kept = Vec::new();
+        for put in &package.stages[at].puts {
+            let Some(local) = local_of(package, at, put.value)? else {
+                continue;
+            };
+            let channel = put.channel;
+            if keeps(
+                package,
+                channel,
+                self.session.span(at, local).map_or(0, |(_, l)| l),
+            ) {
+                self.session
+                    .keep(self.device, &mut frame, at, local, channel)?;
+                kept.push(put.value);
+            }
+        }
         for &global in wanted {
+            if kept.contains(&global) {
+                continue;
+            }
             if let Some(local) = local_of(package, at, global)? {
                 self.session.read_back(&mut frame, at, local)?;
             }
@@ -145,6 +170,12 @@ impl<'a> OnDevice<'a> {
                 continue;
             };
             let dtype = plan.value_types[local as usize].dtype;
+            if kept.contains(&global) {
+                // The device holds the cell; the ring carries an empty one
+                // for the next take to restore.
+                vals[global as usize] = from_heap(&[], dtype, 0);
+                continue;
+            }
             let (_, held) = self
                 .session
                 .span(at, local)
@@ -158,6 +189,10 @@ impl<'a> OnDevice<'a> {
 }
 
 impl StageRunner for OnDevice<'_> {
+    fn keeps(&self, channel: u32) -> bool {
+        self.session.keeps(channel)
+    }
+
     fn run(
         &mut self,
         plan: &ExecPlan,
@@ -190,6 +225,18 @@ fn local_of(package: &LaunchPackage, at: usize, global: u32) -> Result<Option<u3
             why: format!("value {global} belongs to no stage of this package"),
         }),
     }
+}
+
+/// Cells at least this large stay on the device between fires when only the
+/// device reads them: a sampler's token histograms, a vocabulary wide each.
+const KEEP_BYTES: u64 = 64 << 10;
+
+fn keeps(package: &LaunchPackage, channel: u32, bytes: u64) -> bool {
+    package.channels.get(channel as usize).is_some_and(|decl| {
+        decl.capacity == 1
+            && decl.host_role != eta_ir::container::HostRole::Reader
+            && bytes >= KEEP_BYTES
+    })
 }
 
 fn root_bytes(root: &LaunchValue, value: &Value, span: u64) -> Vec<u8> {
