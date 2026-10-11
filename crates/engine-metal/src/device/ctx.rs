@@ -113,10 +113,23 @@ impl Context {
                 why: "the device would not open a command queue".to_string(),
             })?;
             let name = device.name().to_string();
+            if !device.supportsFamily(MTLGPUFamily::Metal4) {
+                return Err(Fault::Device {
+                    call: "supportsFamily(Metal4)",
+                    why: format!(
+                        "`{name}` does not run Metal 4, and pie's Metal engine needs it: \
+                         Apple Silicon on macOS 26 or newer"
+                    ),
+                });
+            }
+            let cores = super::iokit::gpu_cores().ok_or_else(|| Fault::Device {
+                call: "IORegistryEntryCreateCFProperty",
+                why: format!("the IORegistry does not say how many GPU cores `{name}` has"),
+            })?;
             kernels_metal::tuning::describe(kernels_metal::DeviceInfo {
                 apple_family: family(&device),
-                gpu_core_count: 0,
-                metal4: device.supportsFamily(MTLGPUFamily::Metal4),
+                gpu_core_count: cores,
+                metal4: true,
             });
             let working_set = device.recommendedMaxWorkingSetSize();
             let max_buffer = device.maxBufferLength() as u64;
@@ -126,7 +139,7 @@ impl Context {
                 name,
                 working_set,
                 max_buffer,
-                cores: 32,
+                cores,
                 sparse: std::cell::OnceCell::new(),
             })
         }
@@ -776,4 +789,18 @@ pub(crate) fn compile_options() -> Retained<objc2_metal::MTLCompileOptions> {
 #[cfg(target_vendor = "apple")]
 pub(crate) fn nsstring(text: &str) -> Retained<NSString> {
     NSString::from_str(text)
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod tests {
+    #[test]
+    fn the_core_count_is_the_registrys_not_a_guess() {
+        let ctx = super::Context::bind().expect("a Metal 4 device");
+        let cores = super::super::iokit::gpu_cores().expect("the registry says");
+        assert_eq!(ctx.cores(), cores);
+        assert!(
+            cores >= 7,
+            "no Apple Silicon GPU has fewer than 7 cores: {cores}"
+        );
+    }
 }

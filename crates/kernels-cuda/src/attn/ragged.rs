@@ -233,13 +233,19 @@ pub fn ragged(
         partition_kv: false,
         ..PrefillRaggedParams::default()
     };
+    let device = Device::probe(ctx).ok_or_else(|| {
+        refuse(
+            OP,
+            "the device would not say its multiprocessor count, compute capability or shared memory",
+        )
+    })?;
     let point = |arm: RaggedArm| RaggedPoint {
         head_dim,
         cta_tile_q: cta_tile_q(head_dim),
         arm,
         padded_batch_size: padded_u32,
         num_kv_heads,
-        device: Device::probe(ctx).unwrap_or(Device::L40S),
+        device,
     };
     match mask {
         RaggedMask::None => fa2::prefill_ragged(ctx, OP, point(RaggedArm::Full), &params),

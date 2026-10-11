@@ -13,6 +13,10 @@ pub enum Fault {
         code: i32,
     },
 
+    /// A device this engine does not serve, or one whose facts it could not
+    /// read; never guessed at.
+    Unsupported(String),
+
     Bake(poem_compiler::Error),
 
     Load(checkpoint::error::Error),
@@ -166,6 +170,7 @@ impl fmt::Display for Fault {
             Self::Device { call, code } => {
                 write!(f, "{call} answered {code}")
             }
+            Self::Unsupported(why) => write!(f, "this device is not served: {why}"),
             Self::Bake(refusal) => write!(f, "this plan does not bake: {refusal:?}"),
             Self::Residency(why) => write!(f, "weight residency: {why}"),
             Self::Load(error) => write!(f, "this checkpoint does not land: {error}"),

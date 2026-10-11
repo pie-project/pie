@@ -205,7 +205,9 @@ impl Cuda {
 
 fn fault(fault: Fault) -> Error {
     match fault {
-        Fault::Runtimeless | Fault::Device { .. } => Error::Device(fault.to_string()),
+        Fault::Runtimeless | Fault::Device { .. } | Fault::Unsupported(_) => {
+            Error::Device(fault.to_string())
+        }
         Fault::Bake(_)
         | Fault::Load(_)
         | Fault::Param { .. }

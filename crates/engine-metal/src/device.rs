@@ -2,6 +2,8 @@ pub mod alloc;
 pub mod ctx;
 pub mod elastic;
 pub mod handles;
+#[cfg(target_vendor = "apple")]
+mod iokit;
 pub mod library;
 #[cfg(target_vendor = "apple")]
 pub mod sparse;

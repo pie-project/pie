@@ -14,6 +14,11 @@ pub struct Device {
 }
 
 impl Device {
+    /// The oldest compute capability (major) the CUDA engine serves: sm_80.
+    pub const FLOOR_MAJOR: u32 = 8;
+
+    /// An L40S's figures, for tests and fixtures that need a concrete
+    /// device. Never a stand-in for one the probe could not read.
     pub const L40S: Self = Self {
         num_sm: 148,
         cc_major: 8,

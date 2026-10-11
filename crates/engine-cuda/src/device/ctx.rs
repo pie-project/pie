@@ -135,7 +135,19 @@ impl Context {
                         Some(peers) => ctx.with_comm(comm.raw()).with_peers(peers),
                     },
                 };
-                let device = Device::probe(&ctx).unwrap_or(Device::L40S);
+                let Some(device) = Device::probe(&ctx) else {
+                    return Err(Fault::Unsupported(format!(
+                        "device {ordinal} would not say its multiprocessor count, compute \
+                         capability or shared memory"
+                    )));
+                };
+                if device.cc_major < Device::FLOOR_MAJOR {
+                    return Err(Fault::Unsupported(format!(
+                        "device {ordinal} is compute capability {}.x; the CUDA engine serves \
+                         sm_80 (Ampere) and newer",
+                        device.cc_major
+                    )));
+                }
                 Ok(Context {
                     ordinal,
                     stream,
