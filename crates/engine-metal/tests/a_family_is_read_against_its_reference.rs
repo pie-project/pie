@@ -118,6 +118,7 @@ fn every_probe_is_dumped() {
     let facts = deployment.trace(poem::Platform::Metal).facts;
     let word = |query_len: u32| facts.word(&Request::new(query_len, false));
 
+    let patches = engine_metal::api::patch_ladder(&trace, &engine::load::Budgets::default());
     let booted = Instant::now();
     let mut shell = Shell::load(Boot {
         voxels: None,
@@ -125,7 +126,7 @@ fn every_probe_is_dumped() {
         contract: &contract,
         checkpoint: &artifact,
         budget: Budget::new(4, context),
-        patches: None,
+        patches,
         profile: None,
         page_size: 16,
         context,
