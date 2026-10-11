@@ -2,6 +2,7 @@ pub mod arena;
 pub mod budget;
 pub mod catalog;
 pub mod compiled;
+pub mod costs;
 pub mod error;
 pub mod fuse;
 pub mod layout;

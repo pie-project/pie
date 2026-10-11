@@ -5,6 +5,7 @@
 //! backend lists the fused kernels it ships; only the rules that form one of
 //! those run, and every match is replaced.
 
+pub mod flags;
 mod rules;
 mod search;
 

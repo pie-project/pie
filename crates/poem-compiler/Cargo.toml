@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 poem = { package = "pie-poem", path = "../poem" }
+profile = { package = "pie-profile", path = "../profile" }
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 checkpoint = { path = "../checkpoint" }
 ztensor = { workspace = true }
