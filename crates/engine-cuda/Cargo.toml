@@ -28,6 +28,7 @@ eta-exec = { path = "../eta-exec" }
 eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
 eta-compiler = { path = "../eta-compiler" }
 poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
+profile = { package = "pie-profile", path = "../profile" }
 checkpoint = { path = "../checkpoint" }
 
 cudarc = { version = "0.19.8", optional = true, default-features = false, features = [

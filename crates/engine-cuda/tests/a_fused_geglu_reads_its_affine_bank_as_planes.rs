@@ -192,7 +192,7 @@ fn fire(fixture: &Fixture, knobs: Knobs) -> engine_cuda::Result<Vec<f32>> {
         slots: 1,
         pages: ceiling / PAGE,
         ordinal: 0,
-        graphs: Graphs::Off,
+        graphs: Some(Graphs::Off),
         knobs,
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,

@@ -273,22 +273,20 @@ pub struct Toggles {
     pub force_split_small: bool,
 
     pub window_split: bool,
+
+    /// A split decode chunk holds at least 128 keys.
+    pub chunk_floor_128: bool,
 }
 
 impl Toggles {
+    /// The decode scheduler's switches, from the load's kernel decisions.
     #[must_use]
-    pub fn from_env() -> Self {
+    pub const fn of(tuning: crate::tuning::Tuning) -> Self {
         Self {
-            force_split_small: truthy("PIE_CUDA_FORCE_SPLIT_KV_SMALL"),
-            window_split: truthy("PIE_CUDA_WINDOW_SPLIT_KV"),
+            force_split_small: tuning.decode_split_small,
+            window_split: tuning.decode_split_window,
+            chunk_floor_128: tuning.decode_chunk_floor_128,
         }
-    }
-}
-
-fn truthy(key: &str) -> bool {
-    match std::env::var(key) {
-        Ok(v) => v != "0",
-        Err(_) => false,
     }
 }
 
@@ -358,12 +356,8 @@ pub fn plan_decode(
 
     let windowed_split = toggles.window_split && window_left >= 0;
     let built = if !windowed_split
-        && sched_decode::can_use_static_nonsplit(
-            shape.num_requests,
-            device.cc_major,
-            enable_cuda_graph,
-            toggles,
-        ) {
+        && sched_decode::can_use_static_nonsplit(shape.num_requests, enable_cuda_graph, toggles)
+    {
         sched_decode::static_nonsplit(
             OP,
             shape.num_requests,
@@ -382,6 +376,7 @@ pub fn plan_decode(
             page_size: shape.page_size,
             head_dim: shape.head_dim,
             enable_cuda_graph,
+            chunk_floor_128: toggles.chunk_floor_128,
         };
         sched_decode::plan(
             OP,

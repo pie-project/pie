@@ -96,21 +96,12 @@ extern "C" __device__ int printf(const char*, ...);
 
 __device__ __forceinline__ u64 load_system_acquire(const u64* word) {
     u64 value;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
-    asm volatile("ld.volatile.b64 %0, [%1];" : "=l"(value) : "l"(word) : "memory");
-    __threadfence_system();
-#else
     asm volatile("ld.acquire.sys.b64 %0, [%1];" : "=l"(value) : "l"(word) : "memory");
-#endif
     return value;
 }
 
 __device__ __forceinline__ void store_system_relaxed(u64* word, u64 value) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
-    asm volatile("st.volatile.b64 [%0], %1;" :: "l"(word), "l"(value) : "memory");
-#else
     asm volatile("st.relaxed.sys.b64 [%0], %1;" :: "l"(word), "l"(value) : "memory");
-#endif
 }
 
 

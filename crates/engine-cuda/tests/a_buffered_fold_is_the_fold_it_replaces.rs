@@ -93,7 +93,7 @@ fn ready(what: &str) -> Option<Shell> {
         slots: 8,
         pages: 8 * 512 / PAGE,
         ordinal: 0,
-        graphs: engine_cuda::Graphs::Off,
+        graphs: Some(engine_cuda::Graphs::Off),
         knobs: engine_cuda::Knobs::default(),
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,

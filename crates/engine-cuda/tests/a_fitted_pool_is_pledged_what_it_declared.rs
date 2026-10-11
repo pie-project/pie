@@ -104,7 +104,7 @@ fn a_fitted_pool_is_pledged_what_it_declared() {
         slots: 256,
         pages: 256 * CONTEXT / PAGE,
         ordinal: 0,
-        graphs: engine_cuda::Graphs::Off,
+        graphs: Some(engine_cuda::Graphs::Off),
         knobs: Knobs {
             gpu_mem_utilization: FRACTION,
             ..Knobs::default()

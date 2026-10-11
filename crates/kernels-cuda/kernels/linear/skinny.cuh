@@ -90,7 +90,6 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_bf16_kernel(
     static_assert(kSkinnyM * kLdC <= kStageElems, "the epilogue tile fits in one stage of the ring");
     static_assert(kCols % 8 == 0, "the drain stores whole 16-byte chunks");
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     const int tid = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
     const int lane = tid & 31;
@@ -248,16 +247,6 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_bf16_kernel(
             }
         }
     }
-#else
-    (void)w;
-    (void)act;
-    (void)out;
-    (void)m;
-    (void)n;
-    (void)k;
-    (void)cap;
-    __trap();
-#endif
 }
 
 }

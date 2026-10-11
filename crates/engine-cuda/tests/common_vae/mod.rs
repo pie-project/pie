@@ -202,9 +202,9 @@ pub fn load(trace: Trace, contract: &ModelContract, checkpoint: &Path, max_voxel
         slots: 2,
         pages: 4,
         ordinal: 0,
-        graphs: Graphs::Off,
+        graphs: Some(Graphs::Off),
         knobs: Knobs {
-            recording: Recording::Off,
+            recording: Some(Recording::Off),
             ..Knobs::default()
         },
         cache_dir: None,

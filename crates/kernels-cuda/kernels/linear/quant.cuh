@@ -1129,7 +1129,6 @@ __global__ void moe_matmul_select_mxfp4_wmma(
     const MoeGroupBases* __restrict__ bases,
     unsigned int* __restrict__ group_hits)
 {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     namespace wmma = ::nvcuda::wmma;
     constexpr int kTileN = 128;
     constexpr int kTileK = 128;
@@ -1372,7 +1371,6 @@ __global__ void moe_matmul_select_mxfp4_wmma(
             __syncthreads();
         }
     }
-#endif
 }
 
 template <int kBits, int kGroup>
@@ -1392,7 +1390,6 @@ __global__ void moe_matmul_select_mlxu4_wmma(
     const MoeGroupBases* __restrict__ bases,
     unsigned int* __restrict__ group_hits)
 {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     namespace wmma = ::nvcuda::wmma;
     constexpr int kTileN = 128;
     constexpr int kTileK = 128;
@@ -1638,7 +1635,6 @@ __global__ void moe_matmul_select_mlxu4_wmma(
             __syncthreads();
         }
     }
-#endif
 }
 
 template <class T, int kBits, int kGroup, int kRowsT>

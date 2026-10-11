@@ -728,7 +728,6 @@ __device__ __forceinline__ void moe_matmul_select_wmma_body(
     int N,
     long long expert_stride)
 {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     static_assert(is_same<T, bf16>::value,
                   "pie_mma.cuh implements bf16 fragments only -- see its "
                   "static_assert, and do not extend it without a parity run");
@@ -791,7 +790,6 @@ __device__ __forceinline__ void moe_matmul_select_wmma_body(
         out[out_base + warp_id * 16 + lane] =
             Elem<T>::from_f32(c_tile[warp_id * 16 * 16 + lane]);
     }
-#endif
 }
 
 template <class T>

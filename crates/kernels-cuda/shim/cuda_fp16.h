@@ -3,16 +3,7 @@
 
 #include "prelude/device.cuh"
 
-#if defined(PIE_HALFTYPE_FORCE_PORTABLE)
-#define PIE_FP16_HAS_SM80 0
-#define PIE_FP16_HAS_SM53 0
-#elif defined(__CUDA_ARCH__)
-#define PIE_FP16_HAS_SM80 (__CUDA_ARCH__ >= 800)
-#define PIE_FP16_HAS_SM53 (__CUDA_ARCH__ >= 530)
-#else
-#define PIE_FP16_HAS_SM80 0
-#define PIE_FP16_HAS_SM53 0
-#endif
+// Every target is sm_80 or newer, which has every fp16 instruction below.
 
 
 using __half = ::pie::f16;
@@ -104,17 +95,7 @@ __device__ __forceinline__ __half2 __float2half2_rn(float f) {
 
 __device__ __forceinline__ __half2 __floats2half2_rn(float lo, float hi) {
     unsigned int bits;
-#if PIE_FP16_HAS_SM80
     asm("cvt.rn.f16x2.f32 %0, %2, %1;" : "=r"(bits) : "f"(lo), "f"(hi));
-#else
-
-    asm("{ .reg .f16 l, h;\n"
-        "  cvt.rn.f16.f32 l, %1;\n"
-        "  cvt.rn.f16.f32 h, %2;\n"
-        "  mov.b32 %0, {l, h}; }"
-        : "=r"(bits)
-        : "f"(lo), "f"(hi));
-#endif
     return pie_fp16_detail::unpack(bits);
 }
 
@@ -157,82 +138,42 @@ __device__ __forceinline__ __half __ushort_as_half(unsigned short bits) {
 
 __device__ __forceinline__ __half __hmul(__half a, __half b) {
     __half out;
-#if PIE_FP16_HAS_SM53
     asm("mul.rn.f16 %0, %1, %2;" : "=h"(out.raw) : "h"(a.raw), "h"(b.raw));
-#else
-
-    out = __float2half(__half2float(a) * __half2float(b));
-#endif
     return out;
 }
 
 __device__ __forceinline__ __half __hsub(__half a, __half b) {
     __half out;
-#if PIE_FP16_HAS_SM53
     asm("sub.rn.f16 %0, %1, %2;" : "=h"(out.raw) : "h"(a.raw), "h"(b.raw));
-#else
-
-    out = __float2half(__half2float(a) - __half2float(b));
-#endif
     return out;
 }
 
 __device__ __forceinline__ __half __hadd(__half a, __half b) {
     __half out;
-#if PIE_FP16_HAS_SM53
     asm("add.rn.f16 %0, %1, %2;" : "=h"(out.raw) : "h"(a.raw), "h"(b.raw));
-#else
-    out = __float2half(__half2float(a) + __half2float(b));
-#endif
     return out;
 }
 
 __device__ __forceinline__ __half __hmax(__half a, __half b) {
     __half out;
-#if PIE_FP16_HAS_SM80
     asm("max.f16 %0, %1, %2;" : "=h"(out.raw) : "h"(a.raw), "h"(b.raw));
-#else
-    const bool a_nan = (a.raw & 0x7fffu) > 0x7c00u;
-    const bool b_nan = (b.raw & 0x7fffu) > 0x7c00u;
-    if (a_nan && b_nan) {
-
-        out.raw = 0x7fffu;
-    } else if (a_nan) {
-        out = b;
-    } else if (b_nan) {
-        out = a;
-    } else if ((a.raw | b.raw) == 0x8000u && (a.raw & b.raw) == 0x0000u) {
-
-        out.raw = 0x0000u;
-    } else {
-        out = __half2float(a) > __half2float(b) ? a : b;
-    }
-#endif
     return out;
 }
 
 __device__ __forceinline__ __half2 __hmul2(__half2 a, __half2 b) {
-#if PIE_FP16_HAS_SM53
     unsigned int bits;
     asm("mul.rn.f16x2 %0, %1, %2;"
         : "=r"(bits)
         : "r"(pie_fp16_detail::pack(a)), "r"(pie_fp16_detail::pack(b)));
     return pie_fp16_detail::unpack(bits);
-#else
-    return make_half2(__hmul(a.x, b.x), __hmul(a.y, b.y));
-#endif
 }
 
 __device__ __forceinline__ __half2 __hsub2(__half2 a, __half2 b) {
-#if PIE_FP16_HAS_SM53
     unsigned int bits;
     asm("sub.rn.f16x2 %0, %1, %2;"
         : "=r"(bits)
         : "r"(pie_fp16_detail::pack(a)), "r"(pie_fp16_detail::pack(b)));
     return pie_fp16_detail::unpack(bits);
-#else
-    return make_half2(__hsub(a.x, b.x), __hsub(a.y, b.y));
-#endif
 }
 
 namespace pie_fp16_detail {
@@ -263,31 +204,20 @@ __device__ __forceinline__ __half fma_once(__half a, __half b, __half c) {
 }
 
 __device__ __forceinline__ __half2 __hfma2(__half2 a, __half2 b, __half2 c) {
-#if PIE_FP16_HAS_SM53
     unsigned int bits;
     asm("fma.rn.f16x2 %0, %1, %2, %3;"
         : "=r"(bits)
         : "r"(pie_fp16_detail::pack(a)), "r"(pie_fp16_detail::pack(b)),
           "r"(pie_fp16_detail::pack(c)));
     return pie_fp16_detail::unpack(bits);
-#else
-    __half2 out;
-    out.x = pie_fp16_detail::fma_once(a.x, b.x, c.x);
-    out.y = pie_fp16_detail::fma_once(a.y, b.y, c.y);
-    return out;
-#endif
 }
 
 __device__ __forceinline__ __half2 __hmax2(__half2 a, __half2 b) {
-#if PIE_FP16_HAS_SM80
     unsigned int bits;
     asm("max.f16x2 %0, %1, %2;"
         : "=r"(bits)
         : "r"(pie_fp16_detail::pack(a)), "r"(pie_fp16_detail::pack(b)));
     return pie_fp16_detail::unpack(bits);
-#else
-    return make_half2(__hmax(a.x, b.x), __hmax(a.y, b.y));
-#endif
 }
 
 __device__ __forceinline__ __half2 __half2half2(__half v) { return make_half2(v, v); }
@@ -327,5 +257,3 @@ __device__ __forceinline__ __half2 __shfl_xor_sync(unsigned int mask, __half2 va
 }
 
 
-#undef PIE_FP16_HAS_SM80
-#undef PIE_FP16_HAS_SM53

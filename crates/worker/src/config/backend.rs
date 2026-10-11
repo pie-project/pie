@@ -19,16 +19,8 @@ pub struct CudaNativeEngineOptions {
     pub device: String,
     #[serde(skip)]
     pub verbose: bool,
-    pub graphs: Option<String>,
-    pub recording: Option<String>,
-    pub pad: Option<bool>,
-    pub bodies: Option<bool>,
-    pub bodies_mem: Option<u32>,
-    pub fallback_copy: Option<bool>,
-    pub grouped: Option<bool>,
     pub diagnostics: Option<String>,
     pub nccl_transport: Option<String>,
-    pub side_streams: Option<u32>,
 }
 
 impl Default for CudaNativeEngineOptions {
@@ -43,16 +35,8 @@ impl Default for CudaNativeEngineOptions {
             max_forward_requests: None,
             device: String::new(),
             verbose: false,
-            graphs: None,
-            recording: None,
-            pad: None,
-            bodies: None,
-            bodies_mem: None,
-            fallback_copy: None,
-            grouped: None,
             diagnostics: None,
             nccl_transport: None,
-            side_streams: None,
         }
     }
 }
@@ -316,7 +300,17 @@ impl CudaNativeEngineOptions {
 
 /// Engine options that became device-profile decisions, by engine, with the
 /// profile id each moved to.
-const MOVED_TO_PROFILE: &[(&str, &str, &str)] = &[("metal", "tuning", "the kernel.* decisions")];
+const MOVED_TO_PROFILE: &[(&str, &str, &str)] = &[
+    ("cuda_native", "graphs", "engine.graphs"),
+    ("cuda_native", "recording", "engine.recording"),
+    ("cuda_native", "pad", "engine.recording"),
+    ("cuda_native", "bodies", "engine.recording"),
+    ("cuda_native", "bodies_mem", "engine.recording"),
+    ("cuda_native", "fallback_copy", "engine.copies"),
+    ("cuda_native", "grouped", "compiler.grouped"),
+    ("cuda_native", "side_streams", "compiler.side_streams"),
+    ("metal", "tuning", "the kernel.* decisions"),
+];
 
 /// Refuse an option a device profile now holds, naming where it went: a
 /// chip's tuning lives in `$PIE_HOME/profiles/<backend>/user/<device>.toml`.

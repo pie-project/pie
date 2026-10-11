@@ -117,7 +117,6 @@ __global__ __launch_bounds__(kThreads) void matmul_affine_tiled(
                   "the epilogue drains in whole chunks per thread, vector and "
                   "scalar alike");
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     const int tid = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
     const int lane = tid & 31;
@@ -317,18 +316,6 @@ __global__ __launch_bounds__(kThreads) void matmul_affine_tiled(
             }
         }
     }
-#else
-    (void)act;
-    (void)codes;
-    (void)scales;
-    (void)biases;
-    (void)out;
-    (void)m;
-    (void)n;
-    (void)k;
-    (void)win;
-    __trap();
-#endif
 }
 
 template <class T, int kBits, int kGroup, int kRowsT, int kBands, int kSplit>
@@ -357,7 +344,6 @@ __global__ __launch_bounds__(32 * kBands * kSplit) void gemv_affine_tiled(
 
     constexpr int kNSubs = kTiledBand / kMmaN;
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     const int tid = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
     const int lane = tid & 31;
@@ -505,19 +491,6 @@ __global__ __launch_bounds__(32 * kBands * kSplit) void gemv_affine_tiled(
             }
         }
     }
-#else
-    (void)act;
-    (void)codes;
-    (void)scales;
-    (void)biases;
-    (void)out;
-    (void)m;
-    (void)n;
-    (void)k;
-    (void)win;
-    (void)kNSubs;
-    __trap();
-#endif
 }
 
 template <int kBits>

@@ -37,7 +37,6 @@ __device__ __forceinline__ void mma_m16n8k16(
     const unsigned (&b)[2],
     const float (&c)[4])
 {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
         "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
@@ -45,16 +44,6 @@ __device__ __forceinline__ void mma_m16n8k16(
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
           "r"(b[0]), "r"(b[1]),
           "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
-#else
-
-    (void)a;
-    (void)b;
-    d[0] = c[0];
-    d[1] = c[1];
-    d[2] = c[2];
-    d[3] = c[3];
-    __trap();
-#endif
 }
 
 }

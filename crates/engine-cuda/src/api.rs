@@ -38,30 +38,18 @@ impl Default for World {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct DeviceBoot {
     pub ordinal: i32,
     pub world: World,
     pub comm: Option<Arc<crate::comm::Comm>>,
-    pub graphs: Graphs,
+    /// A graph mode pinned over the profile's, for tests and diagnostics.
+    pub graphs: Option<Graphs>,
     pub knobs: Knobs,
     pub cache_dir: Option<std::path::PathBuf>,
     pub adapter_dir: Option<std::path::PathBuf>,
 }
 
-impl Default for DeviceBoot {
-    fn default() -> DeviceBoot {
-        DeviceBoot {
-            ordinal: 0,
-            world: World::default(),
-            comm: None,
-            graphs: Graphs::default(),
-            knobs: Knobs::default(),
-            cache_dir: None,
-            adapter_dir: None,
-        }
-    }
-}
 
 struct PendingStep {
     readout: Vec<Readout>,
@@ -458,14 +446,6 @@ impl Engine for Cuda {
             ordinal,
             frames_in_flight,
         } = request;
-        if !self.boot.graphs.records() {
-            eprintln!(
-                "engine-cuda: serving without CUDA graph capture ([engine] graphs = \
-{:?}, not \"on\"): every fire launches eagerly, which costs per-step host time; \
-intended for diagnostics, not serving",
-                self.boot.graphs
-            );
-        }
 
         let Checkpoint::Path(path) = checkpoint else {
             return Err(Error::Load(

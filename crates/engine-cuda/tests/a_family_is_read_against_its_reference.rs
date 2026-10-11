@@ -160,7 +160,7 @@ fn every_probe_is_dumped() {
         slots: 4,
         pages: 4 * context / 16,
         ordinal: 0,
-        graphs: Graphs::Off,
+        graphs: Some(Graphs::Off),
         knobs: Knobs::default(),
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,

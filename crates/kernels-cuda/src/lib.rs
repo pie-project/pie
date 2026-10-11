@@ -1,4 +1,5 @@
 pub mod attn;
+pub mod tuning;
 
 #[path = "attn/dense.rs"]
 pub mod attn_dense;

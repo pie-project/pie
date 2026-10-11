@@ -73,6 +73,8 @@ pub struct Context {
     device: Device,
     toggles: Toggles,
     capability: (i32, i32),
+    /// The name the driver gives the GPU: what its profile is filed under.
+    name: String,
 }
 
 impl Context {
@@ -159,8 +161,9 @@ impl Context {
                     conditional: None,
                     events: Vec::new(),
                     device,
-                    toggles: Toggles::from_env(),
+                    toggles: Toggles::of(kernels_cuda::tuning::Tuning::default()),
                     capability: capability(ordinal),
+                    name: name(ordinal),
                 })
             }
         }
@@ -275,7 +278,10 @@ impl Context {
             Ok(Side {
                 stream,
                 cublas,
-                ctx: Ctx::on(stream).with_cublas(cublas).with_slabs(self.slabs),
+                ctx: Ctx::on(stream)
+                    .with_cublas(cublas)
+                    .with_slabs(self.slabs)
+                    .with_tuning(self.ctx.tuning()),
             })
         }
     }
@@ -339,6 +345,19 @@ impl Context {
     #[must_use]
     pub fn toggles(&self) -> Toggles {
         self.toggles
+    }
+
+    /// The GPU's name as the driver gives it.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Lay a load's kernel decisions on this context, before it opens side
+    /// streams.
+    pub fn set_tuning(&mut self, tuning: kernels_cuda::tuning::Tuning) {
+        self.ctx.set_tuning(tuning);
+        self.toggles = Toggles::of(tuning);
     }
 
     #[must_use]
@@ -420,6 +439,33 @@ impl std::fmt::Debug for Context {
 }
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn name(ordinal: i32) -> String {
+    #[cfg(feature = "cuda")]
+    {
+        use cudarc::runtime::sys as rt;
+        // SAFETY: `prop` is a live out-parameter the call fills; an all-zero
+        // `cudaDeviceProp` is a valid value of the plain C struct.
+        let mut prop: rt::cudaDeviceProp = unsafe { core::mem::zeroed() };
+        // SAFETY: as above; `ordinal` was just accepted by cudaSetDevice.
+        let status = unsafe { rt::cudaGetDeviceProperties(&raw mut prop, ordinal) };
+        if status != rt::cudaError::cudaSuccess {
+            return String::new();
+        }
+        let bytes: Vec<u8> = prop
+            .name
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = ordinal;
+        String::new()
+    }
+}
+
 fn capability(ordinal: i32) -> (i32, i32) {
     #[cfg(feature = "cuda")]
     {

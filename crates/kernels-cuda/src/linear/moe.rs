@@ -441,7 +441,7 @@ fn grouped_worth(
     fan: &Selected,
     experts: ExpertTable,
 ) -> Option<u32> {
-    if std::env::var_os("PIE_NO_MOE_GROUP").is_some() {
+    if !ctx.tuning().moe_grouped {
         return None;
     }
     if experts.streams() || !matches!(ctx.stage(), ArgValue::Ptr(0)) {
@@ -787,8 +787,7 @@ fn matmul_select_mxfp4(
     const WMMA_ROUTES: u32 = 32;
 
     let experts = codes.rows.clamp(1, EXPERT_CAP);
-    if fan.route_count > GROUPED_REUSE * experts && std::env::var_os("PIE_NO_MXFP4_GROUP").is_none()
-    {
+    if fan.route_count > GROUPED_REUSE * experts && ctx.tuning().mxfp4_grouped {
         let order_words = fan.route_count as usize;
         let offsets_at = order_words.next_multiple_of(64);
         let work_cap = fan.route_count.div_ceil(WMMA_ROUTES) + experts;
@@ -817,7 +816,7 @@ fn matmul_select_mxfp4(
                 ctx.stage(),
             ],
         )?;
-        let wmma = x.dtype == Dtype::Bf16 && std::env::var_os("PIE_MXFP4_NO_WMMA").is_none();
+        let wmma = x.dtype == Dtype::Bf16 && ctx.tuning().mxfp4_wmma;
         let entry = if wmma {
             "::pie::linear::moe_matmul_select_mxfp4_wmma".to_string()
         } else {

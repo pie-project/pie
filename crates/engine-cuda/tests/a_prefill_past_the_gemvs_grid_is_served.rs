@@ -148,7 +148,7 @@ fn fixture(text: Text) -> Fixture {
     }
 }
 
-fn load(fixture: &Fixture) -> engine_cuda::Result<Shell> {
+fn load(fixture: &Fixture, chip: Option<profile::Profile>) -> engine_cuda::Result<Shell> {
     Shell::load(Boot {
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
@@ -162,8 +162,11 @@ fn load(fixture: &Fixture) -> engine_cuda::Result<Shell> {
         slots: 2,
         pages: 2 * (fixture.text.ceiling.next_multiple_of(PAGE) / PAGE),
         ordinal: 0,
-        graphs: Graphs::Off,
-        knobs: engine_cuda::Knobs::default(),
+        graphs: Some(Graphs::Off),
+        knobs: engine_cuda::Knobs {
+            chip,
+            ..engine_cuda::Knobs::default()
+        },
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         residency: engine_cuda::experts::Plan::default(),
@@ -174,7 +177,15 @@ fn load(fixture: &Fixture) -> engine_cuda::Result<Shell> {
 }
 
 fn fire_at(fixture: &Fixture, tokens: u32) -> engine_cuda::Result<(Vec<Vec<f32>>, f64)> {
-    let mut shell = load(fixture)?;
+    fire_under(fixture, tokens, None)
+}
+
+fn fire_under(
+    fixture: &Fixture,
+    tokens: u32,
+    chip: Option<profile::Profile>,
+) -> engine_cuda::Result<(Vec<Vec<f32>>, f64)> {
+    let mut shell = load(fixture, chip)?;
     shell.open(0).expect("slot 0 opens");
     shell.open(1).expect("slot 1 opens");
     let prompt: Vec<u32> = (0..tokens).map(|t| (t * 7 + 11) % 2048).collect();
@@ -194,10 +205,8 @@ fn fire_at(fixture: &Fixture, tokens: u32) -> engine_cuda::Result<(Vec<Vec<f32>>
 }
 
 fn fire_at_ungrouped(fixture: &Fixture, tokens: u32) -> engine_cuda::Result<(Vec<Vec<f32>>, f64)> {
-    unsafe { std::env::set_var("PIE_NO_MOE_GROUP", "1") };
-    let answer = fire_at(fixture, tokens);
-    unsafe { std::env::remove_var("PIE_NO_MOE_GROUP") };
-    answer
+    let chip = engine_cuda::chip::profile("[kernel]\nmoe.grouped = false\n");
+    fire_under(fixture, tokens, Some(chip))
 }
 
 #[test]

@@ -14,6 +14,8 @@ pub struct Request<'a> {
     pub page_size: u32,
     pub head_dim: u32,
     pub enable_cuda_graph: bool,
+    /// A split chunk holds at least 128 keys rather than one page.
+    pub chunk_floor_128: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,7 +52,7 @@ pub fn estimate(
         });
     }
 
-    let mut low = if std::env::var_os("PIE_DECODE_LEGACY_FLOOR").is_some() {
+    let mut low = if req.chunk_floor_128 {
         (128 / req.page_size).max(1)
     } else {
         1
@@ -285,11 +287,10 @@ pub fn workspace_size(
 #[must_use]
 pub fn can_use_static_nonsplit(
     num_requests: u32,
-    cc_major: u32,
     enable_cuda_graph: bool,
     toggles: Toggles,
 ) -> bool {
-    !enable_cuda_graph && !toggles.force_split_small && cc_major >= 8 && num_requests <= 512
+    !enable_cuda_graph && !toggles.force_split_small && num_requests <= 512
 }
 
 pub fn static_nonsplit(

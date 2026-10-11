@@ -5,15 +5,12 @@
 
 #include "cuda_fp16.h"
 
+// Every target is sm_80 or newer, which has the bf16 cvt, fma and max;
+// sm_90 adds a bf16x2 multiply.
 #if defined(PIE_HALFTYPE_FORCE_PORTABLE)
 #define PIE_BF16_HAS_SM90 0
-#define PIE_BF16_HAS_SM80 0
-#elif defined(__CUDA_ARCH__)
-#define PIE_BF16_HAS_SM90 (__CUDA_ARCH__ >= 900)
-#define PIE_BF16_HAS_SM80 (__CUDA_ARCH__ >= 800)
 #else
-#define PIE_BF16_HAS_SM90 0
-#define PIE_BF16_HAS_SM80 0
+#define PIE_BF16_HAS_SM90 (__CUDA_ARCH__ >= 900)
 #endif
 
 
@@ -75,19 +72,7 @@ __device__ __forceinline__ float __bfloat162float(__nv_bfloat16 v) {
 
 __device__ __forceinline__ __nv_bfloat16 __float2bfloat16(float f) {
     __nv_bfloat16 out;
-#if PIE_BF16_HAS_SM80
     asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(out.raw) : "f"(f));
-#else
-    const unsigned int bits = __float_as_uint(f);
-    if ((bits & 0x7fffffffu) > 0x7f800000u) {
-
-        out.raw = 0x7fffu;
-    } else {
-
-        const unsigned int rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
-        out.raw = static_cast<unsigned short>(rounded >> 16);
-    }
-#endif
     return out;
 }
 
@@ -104,16 +89,9 @@ __device__ __forceinline__ __nv_bfloat162 __float2bfloat162_rn(float f) {
 }
 
 __device__ __forceinline__ __nv_bfloat162 __floats2bfloat162_rn(float lo, float hi) {
-#if PIE_BF16_HAS_SM80
     unsigned int bits;
     asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(bits) : "f"(lo), "f"(hi));
     return pie_bf16_detail::unpack(bits);
-#else
-    __nv_bfloat162 out;
-    out.x = __float2bfloat16(lo);
-    out.y = __float2bfloat16(hi);
-    return out;
-#endif
 }
 
 __device__ __forceinline__ __nv_bfloat162 __float22bfloat162_rn(float2 f) {
@@ -139,7 +117,7 @@ __device__ __forceinline__ __nv_bfloat162 __hmul2(__nv_bfloat162 a, __nv_bfloat1
         : "=r"(bits)
         : "r"(pie_bf16_detail::pack(a)), "r"(pie_bf16_detail::pack(b)));
     return pie_bf16_detail::unpack(bits);
-#elif PIE_BF16_HAS_SM80
+#else
     unsigned int bits;
 
     asm("{ .reg .b32 z;\n"
@@ -148,12 +126,6 @@ __device__ __forceinline__ __nv_bfloat162 __hmul2(__nv_bfloat162 a, __nv_bfloat1
         : "=r"(bits)
         : "r"(pie_bf16_detail::pack(a)), "r"(pie_bf16_detail::pack(b)));
     return pie_bf16_detail::unpack(bits);
-#else
-
-    __nv_bfloat162 out;
-    out.x = __float2bfloat16(__bfloat162float(a.x) * __bfloat162float(b.x));
-    out.y = __float2bfloat16(__bfloat162float(a.y) * __bfloat162float(b.y));
-    return out;
 #endif
 }
 
@@ -191,23 +163,15 @@ __device__ __forceinline__ __nv_bfloat16 negate(__nv_bfloat16 v) {
 
 __device__ __forceinline__ __nv_bfloat162 __hfma2(
     __nv_bfloat162 a, __nv_bfloat162 b, __nv_bfloat162 c) {
-#if PIE_BF16_HAS_SM80
     unsigned int bits;
     asm("fma.rn.bf16x2 %0, %1, %2, %3;"
         : "=r"(bits)
         : "r"(pie_bf16_detail::pack(a)), "r"(pie_bf16_detail::pack(b)),
           "r"(pie_bf16_detail::pack(c)));
     return pie_bf16_detail::unpack(bits);
-#else
-    __nv_bfloat162 out;
-    out.x = pie_bf16_detail::fma_once(a.x, b.x, c.x);
-    out.y = pie_bf16_detail::fma_once(a.y, b.y, c.y);
-    return out;
-#endif
 }
 
 __device__ __forceinline__ __nv_bfloat162 __hsub2(__nv_bfloat162 a, __nv_bfloat162 b) {
-#if PIE_BF16_HAS_SM80
     unsigned int bits;
 
     asm("{ .reg .b32 o, m;\n"
@@ -217,13 +181,6 @@ __device__ __forceinline__ __nv_bfloat162 __hsub2(__nv_bfloat162 a, __nv_bfloat1
         : "=r"(bits)
         : "r"(pie_bf16_detail::pack(a)), "r"(pie_bf16_detail::pack(b)));
     return pie_bf16_detail::unpack(bits);
-#else
-    const __nv_bfloat16 one = __nv_bfloat16(static_cast<unsigned short>(0x3f80u));
-    __nv_bfloat162 out;
-    out.x = pie_bf16_detail::fma_once(a.x, one, pie_bf16_detail::negate(b.x));
-    out.y = pie_bf16_detail::fma_once(a.y, one, pie_bf16_detail::negate(b.y));
-    return out;
-#endif
 }
 
 
@@ -258,35 +215,16 @@ __device__ __forceinline__ __nv_bfloat162 __habs2(__nv_bfloat162 a) {
 
 __device__ __forceinline__ __nv_bfloat16 __hmax(__nv_bfloat16 a, __nv_bfloat16 b) {
     __nv_bfloat16 out;
-#if PIE_BF16_HAS_SM80
     asm("max.bf16 %0, %1, %2;" : "=h"(out.raw) : "h"(a.raw), "h"(b.raw));
-#else
-    const bool a_nan = (a.raw & 0x7fffu) > 0x7f80u;
-    const bool b_nan = (b.raw & 0x7fffu) > 0x7f80u;
-    if (a_nan && b_nan) {
-        out.raw = 0x7fc0u;
-    } else if (a_nan) {
-        out = b;
-    } else if (b_nan) {
-        out = a;
-    } else {
-
-        out = (__bfloat162float(a) >= __bfloat162float(b)) ? a : b;
-    }
-#endif
     return out;
 }
 
 __device__ __forceinline__ __nv_bfloat162 __hmax2(__nv_bfloat162 a, __nv_bfloat162 b) {
-#if PIE_BF16_HAS_SM80
     unsigned int bits;
     asm("max.bf16x2 %0, %1, %2;"
         : "=r"(bits)
         : "r"(pie_bf16_detail::pack(a)), "r"(pie_bf16_detail::pack(b)));
     return pie_bf16_detail::unpack(bits);
-#else
-    return make_bfloat162(__hmax(a.x, b.x), __hmax(a.y, b.y));
-#endif
 }
 
 __device__ __forceinline__ __nv_bfloat16 __hadd(__nv_bfloat16 a, __nv_bfloat16 b) {
@@ -294,4 +232,3 @@ __device__ __forceinline__ __nv_bfloat16 __hadd(__nv_bfloat16 a, __nv_bfloat16 b
 }
 
 #undef PIE_BF16_HAS_SM90
-#undef PIE_BF16_HAS_SM80

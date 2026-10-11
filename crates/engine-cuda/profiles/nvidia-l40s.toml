@@ -1,0 +1,53 @@
+# NVIDIA L40S. Every decision the CUDA registry declares, spelled out.
+api = 1
+fuse = [
+  "embed_scale_add",
+  "embed_scale_add_select",
+  "gated_residual_norm_modulate",
+  "lm_head_softcap",
+  "matmul_bias",
+  "matmul_geglu",
+  "norm_modulate",
+  "qkv_fused_qknorm_rope_vnorm_write",
+  "residual_add_rmsnorm",
+  "rmsnorm_residual_add",
+  "rmsnorm_rope_partial_q",
+]
+
+[target]
+device  = "NVIDIA L40S"
+tier    = "sm_89"
+assumes = { cc = 89 }
+
+[provenance]
+source   = "the settings every CUDA GPU ran before per-GPU profiles, carried over unchanged"
+measured = false
+
+[kernel]
+moe.grouped        = true
+moe.mxfp4_grouped  = true
+moe.mxfp4_wmma     = true
+sdpa.decode.split_small     = false
+sdpa.decode.split_window    = false
+sdpa.decode.chunk_floor_128 = false
+
+[engine]
+graphs    = "on"
+recording = { use = "bodies", mem_mb = 4096 }
+copies    = true
+
+[compiler]
+grouped                = true
+side_streams           = 2
+launch_us              = 1.0
+cond_fixed_us          = 5.0
+cond_per_arm_us        = 0.6
+fat_region_us          = 250.0
+fork_floor_us          = 20.0
+cost.attention_us      = 60.0
+cost.linear_us         = 40.0
+cost.elementwise_us    = 4.0
+cost.layout_us         = 4.0
+cost.collective_us     = 50.0
+cost.custom_us         = 20.0
+cost.spatial_us        = 40.0

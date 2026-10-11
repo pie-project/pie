@@ -304,7 +304,7 @@ impl Rig {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let path = weights.write(dir.path());
         let boot = engine_cuda::DeviceBoot {
-            graphs,
+            graphs: Some(graphs),
             ..engine_cuda::DeviceBoot::default()
         };
         let mut engine = engine_cuda::open(boot, contract_for).expect("the engine opens");

@@ -78,7 +78,7 @@ fn ready(what: &str) -> Option<Shell> {
         slots: LANES,
         pages: LANES * 512 / PAGE,
         ordinal: 0,
-        graphs: engine_cuda::Graphs::On,
+        graphs: Some(engine_cuda::Graphs::On),
         knobs: engine_cuda::Knobs::default(),
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,

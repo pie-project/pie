@@ -6,9 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow};
 
 #[cfg(feature = "cuda")]
-use runtime::engine::backend::{
-    DeviceBoot, Diagnostics, Graphs, Knobs, Recording, Transport, World, ordinal_of,
-};
+use runtime::engine::backend::{DeviceBoot, Diagnostics, Knobs, Transport, World, ordinal_of};
 
 use crate::backend::flavor::Flavor;
 use crate::config;
@@ -123,48 +121,15 @@ fn cuda_budgets(
 #[cfg(feature = "cuda")]
 fn device_boot(
     opts: &CudaNativeEngineOptions,
+    home: &Path,
     cache_dir: &Path,
     adapter_dir: Option<&Path>,
 ) -> Result<DeviceBoot> {
-    let graphs = match opts.graphs.as_deref() {
-        None => Graphs::default(),
-        Some(word) => word
-            .parse::<Graphs>()
-            .map_err(|error| anyhow!("[engine] graphs: {error}"))?,
-    };
     let mut knobs = Knobs {
         gpu_mem_utilization: opts.gpu_mem_utilization,
+        profiles: Some(home.join("profiles")),
         ..Knobs::default()
     };
-    if let Some(word) = opts.recording.as_deref() {
-        knobs.recording = word
-            .parse::<Recording>()
-            .map_err(|error| anyhow!("[engine] recording: {error}"))?;
-    }
-    match opts.bodies {
-        Some(true) if !knobs.bodies() => knobs.recording = Recording::default(),
-        Some(false) if knobs.bodies() => knobs.recording = Recording::Shaped,
-        _ => {}
-    }
-    if let Recording::Bodies { mem_megabytes } = &mut knobs.recording {
-        if let Some(megabytes) = opts.bodies_mem {
-            *mem_megabytes = megabytes;
-        }
-    }
-    match opts.pad {
-        Some(false) => knobs.recording = Recording::Off,
-        Some(true) if !knobs.pad() => knobs.recording = Recording::Shaped,
-        _ => {}
-    }
-    if let Some(copies) = opts.fallback_copy {
-        knobs.copies = copies;
-    }
-    if let Some(grouped) = opts.grouped {
-        knobs.grouped = grouped;
-    }
-    if let Some(streams) = opts.side_streams {
-        knobs.side_streams = Some(streams);
-    }
     if let Some(words) = opts.diagnostics.as_deref() {
         knobs.diagnostics = words
             .parse::<Diagnostics>()
@@ -179,7 +144,7 @@ fn device_boot(
         ordinal: ordinal_of(&opts.device),
         world: World::default(),
         comm: None,
-        graphs,
+        graphs: None,
         knobs,
         cache_dir: Some(cache_dir.to_path_buf()),
         adapter_dir: adapter_dir.map(Path::to_path_buf),
@@ -313,7 +278,7 @@ pub(crate) fn create_engine_backend_group(
                 "cuda group creation requires cuda-native rank options"
             ));
         };
-        let boot = device_boot(opts, cache_dir, adapter_dir)?;
+        let boot = device_boot(opts, home, cache_dir, adapter_dir)?;
         if opts.verbose {
             dump_device_boot(home, &boot, group_id, Some(rank));
         }
@@ -404,7 +369,7 @@ pub(crate) fn create_engine_backend(
         _ => unreachable!("`EngineOptions` has no variants in this build"),
         #[cfg(feature = "cuda")]
         EngineOptions::CudaNative(opts) => {
-            let boot = device_boot(opts, cache_dir, adapter_dir)?;
+            let boot = device_boot(opts, home, cache_dir, adapter_dir)?;
             if opts.verbose {
                 dump_device_boot(home, &boot, group_id, None);
             }

@@ -93,44 +93,42 @@ impl std::str::FromStr for Recording {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Knobs {
-    pub recording: Recording,
-    pub copies: bool,
-    pub grouped: bool,
-    pub side_streams: Option<u32>,
+    /// A recording mode the caller pins for this load over the profile's
+    /// `engine.recording`: for tests and diagnostics.
+    pub recording: Option<Recording>,
     pub gpu_mem_utilization: f64,
     pub diagnostics: Diagnostics,
     pub nccl_transport: crate::comm::Transport,
+    /// `$PIE_HOME/profiles`, where a user's GPU profiles live; `None` reads
+    /// only the checked-in ones.
+    pub profiles: Option<std::path::PathBuf>,
+    /// A profile the caller resolved itself, used as is.
+    pub chip: Option<profile::Profile>,
 }
 
-impl Knobs {
-    #[must_use]
-    pub fn pad(&self) -> bool {
-        self.recording.pad()
-    }
-
-    #[must_use]
-    pub fn bodies(&self) -> bool {
-        self.recording.bodies()
-    }
-
-    #[must_use]
-    pub fn bodies_mem(&self) -> u32 {
-        self.recording.bodies_mem()
+impl PartialEq for Knobs {
+    fn eq(&self, other: &Knobs) -> bool {
+        self.recording == other.recording
+            && self.gpu_mem_utilization == other.gpu_mem_utilization
+            && self.diagnostics == other.diagnostics
+            && self.nccl_transport == other.nccl_transport
+            && self.profiles == other.profiles
+            && self.chip.as_ref().map(profile::Profile::source)
+                == other.chip.as_ref().map(profile::Profile::source)
     }
 }
 
 impl Default for Knobs {
     fn default() -> Knobs {
         Knobs {
-            recording: Recording::default(),
-            copies: true,
-            grouped: true,
-            side_streams: None,
+            recording: None,
             gpu_mem_utilization: DEFAULT_GPU_MEM_UTILIZATION,
             diagnostics: Diagnostics::default(),
             nccl_transport: crate::comm::Transport::default(),
+            profiles: None,
+            chip: None,
         }
     }
 }
@@ -160,7 +158,9 @@ pub struct Boot<'a> {
     pub slots: u32,
     pub pages: u32,
     pub ordinal: i32,
-    pub graphs: Graphs,
+    /// A graph mode the caller pins for this load over the profile's
+    /// `engine.graphs`: for tests and diagnostics.
+    pub graphs: Option<Graphs>,
     pub knobs: Knobs,
     pub cache_dir: Option<&'a Path>,
     pub runahead: engine::runahead::Runahead,

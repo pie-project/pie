@@ -26,35 +26,51 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     super::diag::publish(&boot.knobs.diagnostics);
     // SAFETY: the boot's communicator is held by the engine for the life of
     // the shell it loads.
-    let device = Context::bind(boot.ordinal, unsafe { boot.comm.as_ref() })?;
+    let mut device = Context::bind(boot.ordinal, unsafe { boot.comm.as_ref() })?;
+    let chip = match boot.knobs.chip.clone() {
+        Some(chip) => chip,
+        None => {
+            let (major, minor) = device.capability();
+            let measured = crate::chip::facts(
+                u32::try_from(major).unwrap_or(0),
+                u32::try_from(minor).unwrap_or(0),
+                device.device().num_sm,
+            );
+            let (chip, report) =
+                crate::chip::resolve(device.name(), &measured, boot.knobs.profiles.as_deref());
+            crate::chip::SHELF.tell_untuned(device.name(), &report);
+            chip
+        }
+    };
+    device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
+    let engine = {
+        let of = crate::chip::Engine::of(&chip);
+        crate::chip::Engine {
+            graphs: boot.graphs.unwrap_or(of.graphs),
+            recording: boot.knobs.recording.unwrap_or(of.recording),
+            ..of
+        }
+    };
 
     kernels_cuda::disk::install(boot.cache_dir);
 
     let stated_buckets = std::mem::take(&mut boot.budget.buckets);
     boot.budget.buckets = crate::api::lattice(stated_buckets.clone(), boot.budget.max_tokens);
 
-    let mut profile = boot.profile.take().unwrap_or(DeviceProfile {
-        sms: device.device().num_sm,
-        ..DeviceProfile::default()
+    let grouped: &[&str] = if engine.grouped { &crate::GROUPED } else { &[] };
+    let mut profile = boot.profile.take().unwrap_or_else(|| {
+        DeviceProfile::of(&chip, device.device().num_sm, &crate::EXCLUSIVE, grouped)
     });
-    if let Some(streams) = boot.knobs.side_streams {
-        profile.side_streams = streams;
-    }
     profile.exclusive = crate::EXCLUSIVE
         .iter()
         .map(|op| (*op).to_string())
         .collect();
-    profile.grouped = if boot.knobs.grouped {
-        crate::GROUPED.iter().map(|op| (*op).to_string()).collect()
-    } else {
-        Vec::new()
-    };
-    let kernels: &[&str] = if boot.knobs.diagnostics.fuse_chains {
-        &crate::FUSED
-    } else {
-        &crate::UNCHAINED
-    };
-    boot.trace = poem_compiler::fuse::fuse(boot.trace.clone(), kernels);
+    profile.grouped = grouped.iter().map(|op| (*op).to_string()).collect();
+    let mut kernels = poem_compiler::fuse::flags::kernels(&chip);
+    if !boot.knobs.diagnostics.fuse_chains {
+        kernels.retain(|kernel| crate::UNCHAINED.contains(kernel));
+    }
+    boot.trace = poem_compiler::fuse::fuse(boot.trace.clone(), &kernels);
     if boot.knobs.diagnostics.trace_census {
         let mut census: std::collections::BTreeMap<&'static str, usize> =
             std::collections::BTreeMap::new();
@@ -211,6 +227,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     }
     Ok(Baked {
         device,
+        engine,
         compiled,
         budgets,
         profile,
@@ -411,6 +428,7 @@ impl Shell {
         let mut boot = boot;
         let Baked {
             mut device,
+            engine,
             compiled,
             budgets,
             profile,
@@ -774,12 +792,12 @@ impl Shell {
             held: vec![0; boot.slots as usize],
             readout_rows,
             exports,
-            graphs: boot.graphs,
-            copies: boot.knobs.copies,
-            pad: boot.knobs.pad(),
+            graphs: engine.graphs,
+            copies: engine.copies,
+            pad: engine.recording.pad(),
             golden_arm: Golden::Off,
-            bodies: boot.knobs.bodies(),
-            bodies_mem: (boot.knobs.bodies_mem() as usize).saturating_mul(1 << 20),
+            bodies: engine.recording.bodies(),
+            bodies_mem: (engine.recording.bodies_mem() as usize).saturating_mul(1 << 20),
             decoded_tiles: Vec::new(),
             arming: false,
             armed_body: None,
@@ -802,7 +820,7 @@ impl Shell {
         };
         if shell.weights.rotating() && shell.graphs.records() {
             eprintln!(
-                "engine-cuda: [engine] graphs is on but this load armed a dense rotor, \
+                "engine-cuda: engine.graphs is on but this load armed a dense rotor, \
                  so every fire walks eagerly and nothing is recorded — a rotation's \
                  backpressure is a host cursor and a replayed graph has no walk{}",
                 if shell.bodies {
@@ -816,9 +834,9 @@ impl Shell {
         }
         if !shell.graphs.records() {
             eprintln!(
-                "engine-cuda: [engine] graphs is {}, a diagnostic mode — every fire \
+                "engine-cuda: engine.graphs is {}, a diagnostic mode — every fire \
                  walks eagerly (~470 kernel launches of host time per decode step) \
-                 with nothing captured; leave the key unstated to serve bodies",
+                 with nothing captured; a profile serves `on` with bodies",
                 match shell.graphs {
                     Graphs::Off => "off",
                     Graphs::Shaped => "shaped",
@@ -827,10 +845,10 @@ impl Shell {
             );
         } else if !shell.bodies {
             eprintln!(
-                "engine-cuda: [engine] bodies is off under [engine] graphs = on, a \
+                "engine-cuda: engine.recording keeps no bodies under engine.graphs = on, a \
                  diagnostic arm — bodies are the only recorded path, so every fire walks \
                  eagerly (~470 kernel launches of host time per decode step) with nothing \
-                 captured; leave the key unstated to serve them"
+                 captured; a profile serves `bodies`"
             );
         }
         // The cache rows are declared last, from what the card has left: once
@@ -1200,6 +1218,9 @@ fn adapter_fact(classes: &poem_ir::ClassTable, corrected: &poem_ir::ClassSet) ->
 
 pub(super) struct Baked {
     pub(super) device: Context,
+    /// The GPU's profile settings this load runs under, with what the caller
+    /// pinned over them.
+    pub(super) engine: crate::chip::Engine,
     pub(super) compiled: CompiledModel,
     pub(super) budgets: Budgets,
     pub(super) profile: DeviceProfile,
