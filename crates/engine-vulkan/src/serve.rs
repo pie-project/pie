@@ -65,6 +65,11 @@ pub struct Boot<'a> {
 
 const PATCH_ROUTE_DROP: i32 = -1;
 
+/// A step of at least this many rows is submitted a layer at a time: in one
+/// submit, a long prefill on a slow GPU outlasts the driver's watchdog (about
+/// 2 s on Adreno, which a 64-row prefill reaches) and loses the device.
+const SPLIT_ROWS: u32 = 32;
+
 fn declared_width(trace: &Trace, want: RuntimeInput) -> u64 {
     trace
         .values
@@ -2017,7 +2022,7 @@ impl Shell {
         key.finish()
     }
 
-    fn walk_once(&self, p: &Prepared<'_>, keep: bool) -> Result<Walked> {
+    fn walk_once(&self, p: &Prepared<'_>, keep: bool, split: bool) -> Result<Walked> {
         let place = At::new();
 
         let frame = Some(if keep {
@@ -2049,6 +2054,9 @@ impl Shell {
                 self.weights.host(),
                 self.weights.pump(),
             );
+            if split {
+                run.flush_between_layers();
+            }
             walk(
                 &self.trace,
                 &self.compiled,
@@ -2271,8 +2279,10 @@ impl engine::frame::Shell for Shell {
             });
         }
 
-        let keep = key.filter(|_| self.recorder.has_room());
-        let walked = self.walk_once(&prepared, keep.is_some())?;
+        // A split step is not recorded: a recording replays as one submit.
+        let split = prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= SPLIT_ROWS;
+        let keep = key.filter(|_| !split && self.recorder.has_room());
+        let walked = self.walk_once(&prepared, keep.is_some(), split)?;
         let mut frame = walked.frame.expect("the walk opened a frame");
 
         let logits = prepared.slots.0[self.out.0 as usize].ok_or_else(|| Fault::Unbound {

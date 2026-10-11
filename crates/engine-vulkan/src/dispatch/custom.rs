@@ -18,6 +18,7 @@ impl poem_exec::DispatchSpatial for Run<'_> {
 impl poem_exec::DispatchProbe for Run<'_> {
     fn probe(&mut self, node: &poem_ir::Node) {
         use std::io::Write;
+        self.split_at(node);
         let Some(dir) = crate::probe::dir() else {
             return;
         };

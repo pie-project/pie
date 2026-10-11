@@ -153,6 +153,10 @@ pub struct Run<'c> {
     copy: CopyPlan,
 
     scratch: &'c Scratch,
+
+    /// The layer whose work the frame holds unsubmitted, when the step is
+    /// submitted a layer at a time.
+    split: Option<Option<u32>>,
 }
 
 #[derive(Default)]
@@ -201,7 +205,27 @@ impl<'c> Run<'c> {
             place,
             copy: CopyPlan::default(),
             scratch,
+            split: None,
         }
+    }
+
+    /// Submits the frame each time a node of a new layer has run.
+    pub fn flush_between_layers(&mut self) {
+        self.split = Some(None);
+    }
+
+    /// After `node` runs: submits what the frame holds once a new layer
+    /// starts. A failed submit faults the frame, which its commit reports.
+    pub(crate) fn split_at(&mut self, node: &Node) {
+        let (Some(held), Some(layer)) = (self.split.as_mut(), node.layer) else {
+            return;
+        };
+        if held.is_some_and(|held| held != layer)
+            && let Err(fault) = crate::probe::flush()
+        {
+            tracing::warn!(%fault, "submitting a layer of a split step");
+        }
+        *held = Some(layer);
     }
 
     pub(crate) fn window(&self) -> &'c Window {
