@@ -743,7 +743,7 @@ async def run(args: argparse.Namespace):
     prompt_token_ids: list[list[int]] | None = None
     if args.pretokenized_prompts:
         prompt_token_ids, _ = hf_chat_token_ids_and_counts(
-            args.model, args.system, prompts, getattr(args, "think", None)
+            args.tokenizer or args.model, args.system, prompts, getattr(args, "think", None)
         )
     wasm = bench_inferlet_wasm(args.inferlet_dir)
 
@@ -1633,6 +1633,12 @@ def build_parser() -> argparse.ArgumentParser:
             default=False,
             help="Pre-render chat prompts to token IDs before timing and send raw tokens "
                  "to the benchmark inferlet.",
+        )
+        sp.add_argument(
+            "--tokenizer",
+            default=None,
+            help="Where --pretokenized-prompts loads the tokenizer from (default: "
+                 "--model). An imported .zt artifact is a file, not a tokenizer dir.",
         )
         sp.add_argument(
             "--single-process-batch",
