@@ -121,6 +121,11 @@ impl DeviceTuning {
         // point runs a 64x1024x7168 projection at ~27 GFLOPS there.
         if info.vendor == Vendor::Qualcomm {
             t.qmm_register_tiles = true;
+            // A decode row's keys split across 128 workgroups, 128 keys or
+            // more apiece: 3k keys of Qwen3.5-0.8B attend in 1.9 ms a token
+            // over six layers, against 11.7 split two ways.
+            t.sdpa_split_groups = 128;
+            t.sdpa_split_min_keys = 128;
         }
         t
     }

@@ -832,9 +832,12 @@ fn decode_arm(
         let heads = q.width.checked_div(head_dim).unwrap_or(0);
         let ceiling = split_ceiling(&planes, q.rows, heads, head_dim);
 
+        // Every page the fire's tables name: the table is a column, one page
+        // a row. The walker splits no row past the keys it actually holds.
         let keys = pool
             .page_indices
-            .width
+            .rows
+            .saturating_mul(pool.page_indices.width)
             .saturating_mul(u32::try_from(pool.page_size).unwrap_or(0));
         let slices = splits_for(heads, q.rows, ceiling, window, keys, &tuning);
         if slices > 1 {
