@@ -89,5 +89,6 @@ fn tuning(doc: &toml::Table) {
         sdpa_split_groups: int("sdpa_split_groups"),
         sdpa_split_min_keys: int("sdpa_split_min_keys"),
         qmm_register_tiles: flag("qmm_register_tiles"),
+        qmv_one_row: flag("qmv_one_row"),
     });
 }
