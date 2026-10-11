@@ -454,10 +454,17 @@ impl Registry {
                 rejected.push((candidate.source.clone(), why));
                 continue;
             }
+            // A derived profile states only what its facts change; leaving
+            // the rest to the registry is its design, not an omission.
+            let defaulted = if candidate.source == Source::Derived {
+                Vec::new()
+            } else {
+                file.defaulted.clone()
+            };
             let report = Report {
                 used: candidate.source.clone(),
                 rejected,
-                defaulted: file.defaulted.clone(),
+                defaulted,
             };
             return (self.assemble(Some(&file), candidate.source.clone()), report);
         }
