@@ -4,13 +4,6 @@
 
 namespace cooperative_groups {
 
-#if defined(__CUDACC_RDC__)
-#define PIE_CG_SCOPE_GRID (::cudaCGScopeGrid)
-#else
-extern "C" __device__ unsigned long long cudaCGGetIntrinsicHandle(unsigned int scope);
-extern "C" __device__ unsigned int cudaCGSynchronize(unsigned long long handle, unsigned int flags);
-#define PIE_CG_SCOPE_GRID (1u)
-#endif
 
 class thread_block {
 public:
@@ -35,8 +28,29 @@ __device__ __forceinline__ thread_block this_thread_block() { return thread_bloc
 class grid_group {
 public:
 
+    // The barrier CUDA's own header-only grid sync takes: a cooperative
+    // launch hands each grid a driver workspace at %envreg1:%envreg2, and its
+    // second word counts arrivals until the top bit flips. No device runtime,
+    // so no relocatable link against libcudadevrt.a.
     __device__ __forceinline__ void sync() const {
-        cudaCGSynchronize(cudaCGGetIntrinsicHandle(PIE_CG_SCOPE_GRID), 0u);
+        unsigned int lo, hi;
+        asm("mov.u32 %0, %%envreg1;" : "=r"(hi));
+        asm("mov.u32 %0, %%envreg2;" : "=r"(lo));
+        unsigned int* arrived =
+            reinterpret_cast<unsigned int*>(((unsigned long long)hi << 32) | lo) + 1;
+        __syncthreads();
+        if (threadIdx.x + threadIdx.y + threadIdx.z == 0) {
+            const unsigned int expected = gridDim.x * gridDim.y * gridDim.z;
+            const unsigned int nb =
+                blockIdx.x + blockIdx.y + blockIdx.z == 0 ? 0x80000000u - (expected - 1) : 1u;
+            unsigned int old, now;
+            asm volatile("atom.add.release.gpu.u32 %0,[%1],%2;"
+                         : "=r"(old) : "l"(arrived), "r"(nb) : "memory");
+            do {
+                asm volatile("ld.acquire.gpu.u32 %0,[%1];" : "=r"(now) : "l"(arrived) : "memory");
+            } while (((old ^ now) & 0x80000000u) == 0);
+        }
+        __syncthreads();
     }
 
     __device__ __forceinline__ unsigned long long thread_rank() const {

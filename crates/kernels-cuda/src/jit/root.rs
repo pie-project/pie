@@ -74,10 +74,7 @@ pub struct Root {
 const CONFIGURED: &[(&str, &[&str], Headers, Toolchain)] = &[
     (
         "attn/mla.cuh",
-        &[
-            "--device-as-default-execution-space",
-            "--relocatable-device-code=true",
-        ],
+        &["--device-as-default-execution-space"],
         Headers::LibraryAndUpstream,
         Toolchain::ANY,
     ),
@@ -144,13 +141,6 @@ impl Root {
     #[must_use]
     pub fn header_set(&self) -> &'static [Header] {
         self.headers.set()
-    }
-
-    #[must_use]
-    pub fn needs_device_runtime(&self) -> bool {
-        self.options
-            .iter()
-            .any(|o| *o == "--relocatable-device-code=true" || *o == "-dc" || *o == "--device-c")
     }
 
     #[must_use]

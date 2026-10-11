@@ -8,7 +8,6 @@
 typedef unsigned short ushort;
 typedef unsigned char uchar;
 
-#if !defined(__CUDACC_RDC__)
 __device__ __forceinline__ void cudaGridDependencySynchronize() {
   asm volatile("griddepcontrol.wait;" ::: "memory");
 }
@@ -16,6 +15,5 @@ __device__ __forceinline__ void cudaGridDependencySynchronize() {
 __device__ __forceinline__ void cudaTriggerProgrammaticLaunchCompletion() {
   asm volatile("griddepcontrol.launch_dependents;");
 }
-#endif
 
 #endif
