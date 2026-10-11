@@ -1222,17 +1222,23 @@ impl Shell {
 
     #[must_use]
     pub fn readout_row(&self, landed: &Landed, lane: u32) -> Option<(&Buffer, u64, u32)> {
-        let seat = self.landed_seats.get(&landed.seq)?;
-        if seat.generation != self.generation {
-            return None;
-        }
-        let &(start, count) = seat.rows.get(lane as usize)?;
+        let (arm, rows) = match self.landed_seats.get(&landed.seq) {
+            Some(seat) if seat.generation == self.generation => (seat.arm, &seat.rows),
+            Some(_) => return None,
+            // Still in flight: its arm stays taken until the harvest, and a
+            // reader submitted behind it on the queue sees its readout.
+            None => {
+                let flight = self.inflight.iter().find(|f| f.seq == landed.seq)?;
+                (flight.arm, &flight.rows)
+            }
+        };
+        let &(start, count) = rows.get(lane as usize)?;
         if count == 0 {
             return None;
         }
         let width = u64::from(self.out_width);
         Some((
-            self.readout.get(seat.arm)?,
+            self.readout.get(arm)?,
             u64::from(start) * width * 2,
             count * self.out_width,
         ))

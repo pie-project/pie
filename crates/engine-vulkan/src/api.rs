@@ -509,7 +509,19 @@ impl Engine for Vulkan {
             let fired = self
                 .fire_step(step, at)
                 .and_then(|(ticket, mut step_pending)| {
-                    if !step.attachments.is_empty() {
+                    if !step.attachments.is_empty()
+                        && self.reads_on_device(step, &step_pending.landed)
+                    {
+                        // Every attachment reads its logits on the device:
+                        // it queues behind the forward without waiting for
+                        // it, so the GPU runs on into the sampler and the
+                        // step waits once.
+                        let landed = step_pending.landed;
+                        self.run_attachments(step, &[], None, 0, &landed)?;
+                        let shell = self.loaded_mut()?;
+                        step_pending.rows = Some(shell.rows_of(&landed).map_err(fault)?);
+                        shell.forget_seat(&landed);
+                    } else if !step.attachments.is_empty() {
                         let shell = self.loaded_mut()?;
                         let rows = shell.rows_of(&step_pending.landed).map_err(fault)?;
 
@@ -764,6 +776,21 @@ impl Engine for Vulkan {
 }
 
 impl Vulkan {
+    /// Whether every attachment of `step` can read its lane's logits on the
+    /// device before the step lands: no draft column to read on the host,
+    /// and a readout row for each lane.
+    fn reads_on_device(&self, step: &Step, landed: &crate::serve::Landed) -> bool {
+        let Some(shell) = self.shell.as_ref() else {
+            return false;
+        };
+        cfg!(feature = "vulkan")
+            && shell.mtp_width() == 0
+            && step
+                .attachments
+                .iter()
+                .all(|attachment| shell.readout_row(landed, attachment.lane).is_some())
+    }
+
     fn run_attachments(
         &mut self,
         step: &Step,

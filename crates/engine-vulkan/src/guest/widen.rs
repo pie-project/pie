@@ -207,12 +207,20 @@ impl Widen {
 
             let cmd = frame.cmd();
 
+            // The readout may still be landing: a forward submitted ahead of
+            // this frame on the queue writes it from its shaders.
             let before = vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::HOST_WRITE)
+                .src_access_mask(
+                    vk::AccessFlags::TRANSFER_WRITE
+                        | vk::AccessFlags::HOST_WRITE
+                        | vk::AccessFlags::SHADER_WRITE,
+                )
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
             d.cmd_pipeline_barrier(
                 cmd,
-                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::TRANSFER
+                    | vk::PipelineStageFlags::HOST
+                    | vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
                 &[before],
