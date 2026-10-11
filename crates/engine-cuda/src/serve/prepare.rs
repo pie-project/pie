@@ -1350,7 +1350,21 @@ impl FrameShell for Shell {
             && !self.cache.body_refused(&key)
             && self.cuttable(&key, admits.as_ref());
         super::btrace::mark("cuttable");
-        let readout_ceiling = ladder.lane_reach(lane_ceiling).min(self.budget.max_lanes);
+        // A logits class reads its lanes' last rows; a velocity or hidden
+        // class reads every row of its rung, as the eager ceiling above lets it.
+        let (last_rows, every_row) =
+            ladder
+                .rungs()
+                .iter()
+                .fold((0, 0), |(last, every), &(class, rung)| {
+                    match self.exports.readout_for(class as usize) {
+                        Some(seam) if seam.seam != engine::fire::ReadoutSeam::Logits => {
+                            (last, every + rung)
+                        }
+                        _ => (last + rung.min(lane_ceiling), every),
+                    }
+                });
+        let readout_ceiling = last_rows.min(self.budget.max_lanes) + every_row;
         let bodied = bodied && readout_rows.len() <= readout_ceiling as usize;
         if bodied {
             readout_rows.resize(readout_ceiling as usize, 0);
