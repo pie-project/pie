@@ -538,6 +538,10 @@ impl Engine for Vulkan {
                 }
             }
         }
+        #[cfg(feature = "vulkan")]
+        if let Some(shell) = self.shell.as_ref() {
+            shell.device().pipeline_cache().settle();
+        }
         let mut ticket = FrameTicket { id, steps };
         self.pending = Some((id, pending));
 

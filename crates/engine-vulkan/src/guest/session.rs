@@ -167,7 +167,7 @@ impl Session {
             let pipelines = match built.get(&stage_key(lowered)) {
                 Some(pipelines) => Arc::clone(pipelines),
                 None => {
-                    let pipelines = Arc::new(build_pipelines(&core, lowered)?);
+                    let pipelines = Arc::new(build_pipelines(device, lowered)?);
                     built.insert(stage_key(lowered), Arc::clone(&pipelines));
                     pipelines
                 }
@@ -604,7 +604,8 @@ fn build_stage(
     })
 }
 
-fn build_pipelines(core: &Arc<Core>, lowered: &crate::guest::Lowered) -> Result<Built> {
+fn build_pipelines(device: &Context, lowered: &crate::guest::Lowered) -> Result<Built> {
+    let core = device.core();
     let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..BINDINGS)
         .map(|i| {
             vk::DescriptorSetLayoutBinding::default()
@@ -679,15 +680,24 @@ fn build_pipelines(core: &Arc<Core>, lowered: &crate::guest::Lowered) -> Result<
                 why: "a stage emitted no dispatches, so nothing would run".into(),
             });
         }
-        let built = d.create_compute_pipelines(vk::PipelineCache::null(), &infos, None);
+        let cache = device.pipeline_cache();
+        let built = d.create_compute_pipelines(cache.handle(), &infos, None);
         d.destroy_shader_module(module, None);
         match built {
-            Ok(pipelines) => Ok(Built {
-                core: Arc::clone(core),
-                layout,
-                set_layout,
-                pipelines,
-            }),
+            Ok(pipelines) => {
+                // A sampler's stages take seconds to build on a phone; they
+                // reach the file now rather than with the next settle.
+                cache.built();
+                if let Err(fault) = cache.persist() {
+                    tracing::warn!(%fault, "writing the pipeline cache");
+                }
+                Ok(Built {
+                    core: Arc::clone(core),
+                    layout,
+                    set_layout,
+                    pipelines,
+                })
+            }
             Err((_, e)) => {
                 d.destroy_pipeline_layout(layout, None);
                 d.destroy_descriptor_set_layout(set_layout, None);

@@ -151,7 +151,7 @@ gpu_mem_utilization = 0.90  # of the device-local heap: weights, kv pool, scratc
 # max_forward_requests = 512    # (max_concurrent_processes derives from this)
 # max_state_slots      = 256    # recurrent-state seats (hybrid models)
 # validation           = false  # VK_LAYER_KHRONOS_validation; diagnostic only
-# pipeline_cache       = "/path/to/pipeline.bin"  # omit for in-memory only
+# pipeline_cache       = "/path/to/pipeline.bin"  # omit for $PIE_HOME/cache/vulkan-pipelines.bin
 "#;
 
 #[cfg(any(feature = "wgpu", test))]

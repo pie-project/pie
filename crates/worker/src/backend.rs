@@ -471,12 +471,16 @@ pub(crate) fn create_engine_backend(
                 "[vulkan]\ndevice_index = {}\ngpu_mem_utilization = {:?}\nvalidation = {}\n",
                 opts.device_index, opts.gpu_mem_utilization, opts.validation
             );
-            if let Some(cache) = &opts.pipeline_cache {
-                boot_doc.push_str(&format!(
-                    "pipeline_cache = {}\n",
-                    toml::Value::String(cache.display().to_string())
-                ));
-            }
+            // Pipelines build in seconds on a phone; they persist under
+            // the engine cache unless the config names another file.
+            let cache = opts
+                .pipeline_cache
+                .clone()
+                .unwrap_or_else(|| cache_dir.join("vulkan-pipelines.bin"));
+            boot_doc.push_str(&format!(
+                "pipeline_cache = {}\n",
+                toml::Value::String(cache.display().to_string())
+            ));
             let backend = opened.map_or_else(
                 || runtime::engine::backend::open::vulkan(boot_doc.as_bytes()),
                 Ok,
