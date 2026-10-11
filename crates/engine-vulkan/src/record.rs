@@ -37,6 +37,10 @@ impl KeyBuilder {
         bytes.hash(&mut self.0);
     }
 
+    pub(crate) fn hashed(&mut self, what: &impl Hash) {
+        what.hash(&mut self.0);
+    }
+
     pub(crate) fn shown(&mut self, what: &dyn std::fmt::Debug) {
         use std::fmt::Write;
 
