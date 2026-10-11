@@ -606,7 +606,6 @@ __global__ void rope_partial(
     // mlx-lm, llama.cpp), head_dim/2 for a proportional one (Gemma 4's global
     // layers). Every other entry is left alone.
     const int pairs = rotary_dim / 2;
-    const int half = span;
     const int pos = positions[row] + position_delta;
 
     for (int t = threadIdx.x; t < total_heads * pairs; t += blockDim.x) {
@@ -623,17 +622,17 @@ __global__ void rope_partial(
             T* qp = q +
                 (static_cast<long long>(row) * num_q_heads + head_idx) * head_dim;
             const float a = Elem<T>::to_f32(qp[dim_pair]);
-            const float b = Elem<T>::to_f32(qp[dim_pair + half]);
+            const float b = Elem<T>::to_f32(qp[dim_pair + span]);
             qp[dim_pair]        = Elem<T>::from_f32(a * cos_v - b * sin_v);
-            qp[dim_pair + half] = Elem<T>::from_f32(b * cos_v + a * sin_v);
+            qp[dim_pair + span] = Elem<T>::from_f32(b * cos_v + a * sin_v);
         } else {
             const int kv_h = head_idx - num_q_heads;
             T* kp = k +
                 (static_cast<long long>(row) * num_kv_heads + kv_h) * head_dim;
             const float a = Elem<T>::to_f32(kp[dim_pair]);
-            const float b = Elem<T>::to_f32(kp[dim_pair + half]);
+            const float b = Elem<T>::to_f32(kp[dim_pair + span]);
             kp[dim_pair]        = Elem<T>::from_f32(a * cos_v - b * sin_v);
-            kp[dim_pair + half] = Elem<T>::from_f32(b * cos_v + a * sin_v);
+            kp[dim_pair + span] = Elem<T>::from_f32(b * cos_v + a * sin_v);
         }
     }
 }

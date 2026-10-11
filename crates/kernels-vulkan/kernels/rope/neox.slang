@@ -22,9 +22,9 @@ struct Push {
 };
 #else
 struct Push {
-    float scale;
     float base;
     int head_dim;
+    int span;
     int pair_half;
     int heads;
 };
@@ -64,19 +64,16 @@ void main(uint3 gid : SV_DispatchThreadID) {
     x[j1] = PIE_STORE(xa * cl - xb * sl);
     x[j2] = PIE_STORE(xa * sl + xb * cl);
     return;
-#elif defined(PIE_PROP)
-    float d = 2.0 * float(i) / float(head_dim);
-    uint i2_off = head_dim / 2u;
 #else
-    float d = float(i) / float(pair_half);
-    uint i2_off = pair_half;
-#endif
-#if !defined(PIE_LAST)
-    float theta = pc.scale * float(position[row]) * exp2(-d * pc.base);
+    // pair i is (i, i + span) at theta^(-i/span): span is rotary/2 for a
+    // plain rotary, head_dim/2 for a proportional one
+    uint span = uint(pc.span);
+    float d = float(i) / float(span);
+    float theta = float(position[row]) * exp2(-d * pc.base);
     float c = cos(theta);
     float s = sin(theta);
     uint i1 = row_base + h * head_dim + i;
-    uint i2 = i1 + i2_off;
+    uint i2 = i1 + span;
     float x1 = PIE_LOAD(x[i1]);
     float x2 = PIE_LOAD(x[i2]);
     x[i1] = PIE_STORE(x1 * c - x2 * s);
@@ -85,5 +82,4 @@ void main(uint3 gid : SV_DispatchThreadID) {
 }
 
 // pie:instantiate neox_mb_bf16 PIE_GROUP_X=64
-// pie:instantiate neox_prop_mb_bf16 PIE_GROUP_X=64 PIE_PROP=1
 // pie:instantiate neox_last_mb_bf16 PIE_GROUP_X=64 PIE_LAST=1

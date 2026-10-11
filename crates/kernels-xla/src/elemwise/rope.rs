@@ -276,18 +276,17 @@ pub(crate) fn rotate_all(
     })
 }
 
-/// The first `rotary/2` pairs turn at `theta^(-2i/span)`; a halves pair sits
-/// `span/2` apart.
+/// The first `rotary/2` pairs turn at `theta^(-i/span)`; a halves pair sits
+/// `span` apart.
 fn neox(head_dim: u32, rotary: u32, theta: f32, span: u32, interleaved: bool) -> Turn {
     let mut t = Turn::new(head_dim as usize, 1);
-    let mate = (span / 2) as usize;
     for i in 0..(rotary / 2) as usize {
         let (lo, hi) = if interleaved {
             (2 * i, 2 * i + 1)
         } else {
-            (i, i + mate)
+            (i, i + span as usize)
         };
-        t.pair(lo, hi, 0, inv_freq(theta, i, span));
+        t.pair(lo, hi, 0, inv_freq(theta, i, 2 * span));
     }
     t
 }
@@ -309,15 +308,13 @@ pub fn full(
     rotary_within(OP, head_dim, head_dim)?;
     heads(OP, q.width, head_dim)?;
     heads(OP, k.width, head_dim)?;
-    let t = neox(head_dim, head_dim, theta, head_dim, interleaved);
+    let t = neox(head_dim, head_dim, theta, head_dim / 2, interleaved);
     rotate_all(ctx, OP, &[q, k], positions, 1, &t)
 }
 
-/// The first `rotary_dim` entries of each head turn, paired `(i, i + r/2)` at
-/// `theta^(-2i/r)` (the HF / mlx-lm / llama.cpp convention); the rest pass
-/// through. Proportional (Gemma 4's global layers) pairs `(i, i + d/2)` at
-/// `theta^(-2i/d)` for the first `r/2` pairs instead. Reference: kernels-cuda
-/// `rope_partial`, kernels-metal `neox_prop_mb`.
+/// The first `rotary_dim/2` pairs of each head turn, pair `i` being
+/// `(i, i + span)` at `theta^(-i/span)`; the rest pass through. Reference:
+/// kernels-cuda `rope_partial`, kernels-metal `neox_mb`.
 #[allow(clippy::too_many_arguments)]
 pub fn partial(
     ctx: &Ctx<'_>,
@@ -327,14 +324,13 @@ pub fn partial(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
-    proportional: bool,
+    span: u32,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_partial";
     int_positions(OP, positions)?;
     rotary_within(OP, rotary_dim, head_dim)?;
     heads(OP, q.width, head_dim)?;
     heads(OP, k.width, head_dim)?;
-    let span = if proportional { head_dim } else { rotary_dim };
     let t = neox(head_dim, rotary_dim, theta, span, false);
     rotate_all(ctx, OP, &[q, k], positions, 1, &t)
 }
@@ -346,13 +342,12 @@ pub fn partial_q(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
-    proportional: bool,
+    span: u32,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_partial_q";
     int_positions(OP, positions)?;
     rotary_within(OP, rotary_dim, head_dim)?;
     heads(OP, q.width, head_dim)?;
-    let span = if proportional { head_dim } else { rotary_dim };
     let t = neox(head_dim, rotary_dim, theta, span, false);
     rotate_all(ctx, OP, &[q], positions, 1, &t)
 }

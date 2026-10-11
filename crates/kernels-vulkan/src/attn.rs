@@ -1161,7 +1161,15 @@ pub mod mla {
             kv_c,
             k_pe,
         )?;
-        crate::elemwise::rope::partial_q(ctx, k_pe, positions, rope_dim, rope_dim, theta, false)
+        crate::elemwise::rope::partial_q(
+            ctx,
+            k_pe,
+            positions,
+            rope_dim,
+            rope_dim,
+            theta,
+            rope_dim / 2,
+        )
     }
 
     fn split_kv_a_norm(

@@ -21,7 +21,7 @@ fn turn(head: &mut [f32], pos: i32, rotary_dim: usize, span: usize, theta: f32) 
     }
 }
 
-fn check(head_dim: usize, q_heads: usize, kv_heads: usize, rotary_dim: usize, proportional: bool) {
+fn check(head_dim: usize, q_heads: usize, kv_heads: usize, rotary_dim: usize, span: usize) {
     let rows = 6usize;
     let (q_width, k_width) = (q_heads * head_dim, kv_heads * head_dim);
     let mut lcg = Lcg::seeded(0x5e ^ (head_dim as u64) ^ ((rotary_dim as u64) << 8));
@@ -47,7 +47,7 @@ fn check(head_dim: usize, q_heads: usize, kv_heads: usize, rotary_dim: usize, pr
         rotary_dim as u32,
         head_dim as u32,
         theta,
-        proportional,
+        span as u32,
     )
     .expect("the partial rope fires");
     gpu.sync();
@@ -62,7 +62,6 @@ fn check(head_dim: usize, q_heads: usize, kv_heads: usize, rotary_dim: usize, pr
             for h in 0..heads {
                 let at = r * width + h * head_dim;
                 let mut want = src[at..at + head_dim].to_vec();
-                let span = if proportional { head_dim } else { rotary_dim } / 2;
                 turn(&mut want, positions[r], rotary_dim, span, theta);
                 for (i, want) in want.into_iter().enumerate() {
                     let g = from_bf16(got[at + i]);
@@ -85,16 +84,17 @@ fn the_partial_rope_turns_only_the_rotary_pairs_every_case() {
 }
 
 fn a_full_rotary_head_turns_end_to_end() {
-    check(128, 4, 2, 128, false);
+    check(128, 4, 2, 128, 64);
 }
 
 fn a_partial_rotary_head_leaves_the_tail_where_it_was() {
     // the shape Qwen3 A3B actually asks for: head_dim 256, rotary_dim 64.
-    check(256, 16, 2, 64, false);
-    check(128, 8, 1, 64, false);
+    check(256, 16, 2, 64, 32);
+    check(128, 8, 1, 64, 32);
 }
 
 fn a_proportional_head_pairs_across_the_whole_head() {
-    // Gemma 4 31B's global layers: head_dim 512, a quarter of it turning.
-    check(512, 4, 1, 128, true);
+    // Gemma 4 31B's global layers: head_dim 512, a quarter of it turning,
+    // each pair half a head apart.
+    check(512, 4, 1, 128, 256);
 }

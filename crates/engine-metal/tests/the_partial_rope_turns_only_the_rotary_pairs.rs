@@ -69,7 +69,7 @@ fn check(
     q_heads: u32,
     kv_heads: u32,
     rotary_dim: u32,
-    proportional: bool,
+    span: u32,
 ) {
     let rows: u32 = 6;
     let (q_width, k_width) = (q_heads * head_dim, kv_heads * head_dim);
@@ -105,8 +105,7 @@ fn check(
     {
         let frame = device.frame().expect("a frame");
         let sink = Sink::new(device, &frame, pipelines, handles);
-        rope::partial(&sink, q, k, p, rotary_dim, head_dim, theta, proportional)
-            .expect("the launch");
+        rope::partial(&sink, q, k, p, rotary_dim, head_dim, theta, span).expect("the launch");
         frame.commit().expect("the commit");
     }
     let got_q = bf16_floats(
@@ -128,8 +127,13 @@ fn check(
             for h in 0..heads as usize {
                 let at = r * width as usize + h * head_dim as usize;
                 let mut want = src[at..at + head_dim as usize].to_vec();
-                let span = if proportional { head_dim } else { rotary_dim } as usize / 2;
-                turn(&mut want, position, rotary_dim as usize, span, theta);
+                turn(
+                    &mut want,
+                    position,
+                    rotary_dim as usize,
+                    span as usize,
+                    theta,
+                );
                 for (i, want) in want.into_iter().enumerate() {
                     let g = got[at + i];
                     assert!(
@@ -151,10 +155,11 @@ fn the_partial_rope_turns_only_the_rotary_pairs() {
     let handles = Handles::new();
     let pipelines = Pipelines::new();
     // a full rotary head turns end to end
-    check(&device, &handles, &pipelines, 128, 4, 2, 128, false);
+    check(&device, &handles, &pipelines, 128, 4, 2, 128, 64);
     // the shape Qwen3 A3B asks for: head_dim 256, rotary_dim 64
-    check(&device, &handles, &pipelines, 256, 16, 2, 64, false);
-    check(&device, &handles, &pipelines, 128, 8, 1, 64, false);
-    // Gemma 4 31B's global layers: head_dim 512, a quarter of it turning
-    check(&device, &handles, &pipelines, 512, 4, 1, 128, true);
+    check(&device, &handles, &pipelines, 256, 16, 2, 64, 32);
+    check(&device, &handles, &pipelines, 128, 8, 1, 64, 32);
+    // Gemma 4 31B's global layers: head_dim 512, a quarter of it turning,
+    // each pair half a head apart
+    check(&device, &handles, &pipelines, 512, 4, 1, 128, 256);
 }

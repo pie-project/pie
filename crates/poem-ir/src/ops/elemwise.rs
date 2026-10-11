@@ -142,10 +142,10 @@ pub enum Elementwise {
         q_out: ValueId,
         k_out: ValueId,
     },
-    /// The first `rotary_dim` entries of each head turn. Plain (Qwen's
-    /// partial rotary): pairs `(i, i + rotary_dim/2)` at
-    /// `theta^(-2i/rotary_dim)`. Proportional (Gemma 4's global layers): pairs
-    /// `(i, i + head_dim/2)` at `theta^(-2i/head_dim)`, for `i < rotary_dim/2`.
+    /// The first `rotary_dim/2` pairs of each head turn, pair `i` being
+    /// `(i, i + span)` at `theta^(-i/span)`: `span` is `rotary_dim/2` for a
+    /// plain partial rotary, `head_dim/2` for a proportional one (Gemma 4's
+    /// global layers).
     RopePartial {
         q: ValueId,
         k: ValueId,
@@ -153,7 +153,7 @@ pub enum Elementwise {
         rotary_dim: u32,
         head_dim: u32,
         theta: f32,
-        proportional: bool,
+        span: u32,
         q_out: ValueId,
         k_out: ValueId,
     },
@@ -175,7 +175,7 @@ pub enum Elementwise {
         rotary_dim: u32,
         head_dim: u32,
         theta: f32,
-        proportional: bool,
+        span: u32,
         q_out: ValueId,
     },
     RopePartialLast {

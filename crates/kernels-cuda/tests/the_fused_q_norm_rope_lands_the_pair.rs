@@ -11,7 +11,7 @@ fn check(
     head_dim: usize,
     heads: usize,
     rotary_dim: usize,
-    proportional: bool,
+    span: usize,
     window: Option<(u32, u32, u32)>,
 ) {
     let (rows, live, base) = window.unwrap_or((6, 6, 0));
@@ -44,14 +44,13 @@ fn check(
         Tensor::new(p_at, rows, 1, Dtype::I32),
         rotary_dim as u32,
         theta,
-        proportional,
+        span as u32,
         &mut y,
     )
     .expect("the fused q path fires");
     gpu.sync();
     let got: Vec<u16> = gpu.down(y_at, planes * width);
 
-    let span = if proportional { head_dim } else { rotary_dim } / 2;
     for r in 0..planes {
         let touched = r >= base as usize && r < (base + live) as usize;
         if !touched {
@@ -99,15 +98,16 @@ fn the_fused_q_norm_rope_lands_the_pair_every_case() {
 }
 
 fn a_full_rotary_head_lands_the_pair() {
-    check(256, 4, 256, false, None);
+    check(256, 4, 256, 128, None);
 }
 
 fn a_partial_rotary_head_lands_the_pair_and_leaves_the_rest_normed() {
-    check(256, 8, 128, false, None);
-    check(128, 2, 64, false, Some((6, 4, 1)));
+    check(256, 8, 128, 64, None);
+    check(128, 2, 64, 32, Some((6, 4, 1)));
 }
 
 fn a_proportional_head_pairs_across_the_whole_head() {
-    // Gemma 4 31B's global layers: head_dim 512, a quarter of it turning.
-    check(512, 4, 128, true, None);
+    // Gemma 4 31B's global layers: head_dim 512, a quarter of it turning,
+    // each pair half a head apart.
+    check(512, 4, 128, 256, None);
 }
