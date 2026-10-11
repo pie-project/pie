@@ -494,6 +494,13 @@ pub fn load(
 }
 
 impl Private {
+    /// The most rows the Neural Engine takes a share of in one fire; a fire
+    /// past them runs on the GPU alone.
+    #[must_use]
+    pub fn prefill_rows(&self) -> u32 {
+        MAX_ROWS
+    }
+
     /// The hand-off a live encode fences on.
     pub fn handoff(&self) -> &Handoff {
         &self.handoff

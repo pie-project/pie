@@ -208,7 +208,7 @@ impl pie::inferlet::model::Host for ProcessCtx {
     }
 
     async fn prefill_chunk_hint(&mut self) -> Result<u32> {
-        let budget = crate::engine::get_spec(0)?.limits.max_forward_tokens;
+        let budget = prefill_budget(crate::engine::get_spec(0)?.limits);
         let live = crate::inferlet::process::live_count();
         let page = model::model().kv_page_size() as usize;
         Ok(prefill_share(budget, live, page))
@@ -234,6 +234,16 @@ impl pie::inferlet::model::Host for ProcessCtx {
 // A step spends one row on each other live lane's decode, so a prefill chunk
 // gets the rest of the forward budget; chunks that overflow a wave are
 // deferred by the frame seal, not split into more passes.
+/// The rows a prefill chunk may take: the fire's token budget, or fewer when
+/// the engine prefers it (Metal, while the Neural Engine shares a fire only
+/// up to its rows).
+fn prefill_budget(limits: crate::engine::SchedulerLimits) -> usize {
+    match limits.prefill_rows {
+        0 => limits.max_forward_tokens,
+        rows => rows.min(limits.max_forward_tokens),
+    }
+}
+
 fn prefill_share(budget: usize, live: usize, page: usize) -> u32 {
     let page = page.max(1);
     let share = budget.saturating_sub(live.saturating_sub(1)) / page * page;
@@ -242,6 +252,20 @@ fn prefill_share(budget: usize, live: usize, page: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_prefill_chunk_stops_at_the_rows_the_engine_prefers() {
+        let limits = |max_forward_tokens, prefill_rows| crate::engine::SchedulerLimits {
+            max_forward_requests: 8,
+            max_forward_tokens,
+            max_page_refs: 64,
+            max_context: 0,
+            prefill_rows,
+        };
+        assert_eq!(super::prefill_budget(limits(10240, 0)), 10240);
+        assert_eq!(super::prefill_budget(limits(10240, 2048)), 2048);
+        assert_eq!(super::prefill_budget(limits(1024, 2048)), 1024);
+    }
+
     #[test]
     fn a_prefill_chunk_keeps_the_budget_the_decoding_lanes_leave() {
         assert_eq!(super::prefill_share(8192, 256, 16), 7936);
