@@ -348,6 +348,7 @@ pub fn rope_partial(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
+    proportional: bool,
 ) -> (Value, Value) {
     let r = q.rec();
     let q_out = r.fresh(q.ty().clone());
@@ -360,6 +361,7 @@ pub fn rope_partial(
             rotary_dim,
             head_dim,
             theta,
+            proportional,
             q_out: q_out.id(),
             k_out: k_out.id(),
         },
@@ -374,6 +376,7 @@ pub fn rope_partial_q(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
+    proportional: bool,
 ) -> Value {
     let r = q.rec();
     let q_out = r.fresh(q.ty().clone());
@@ -384,6 +387,7 @@ pub fn rope_partial_q(
             rotary_dim,
             head_dim,
             theta,
+            proportional,
             q_out: q_out.id(),
         },
         &[q, positions],

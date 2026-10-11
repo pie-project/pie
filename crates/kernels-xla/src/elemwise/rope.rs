@@ -276,14 +276,16 @@ pub(crate) fn rotate_all(
     })
 }
 
+/// The first `rotary/2` pairs turn at `theta^(-2i/span)`; a halves pair sits
+/// `span/2` apart.
 fn neox(head_dim: u32, rotary: u32, theta: f32, span: u32, interleaved: bool) -> Turn {
     let mut t = Turn::new(head_dim as usize, 1);
-    let half = (rotary / 2) as usize;
-    for i in 0..half {
+    let mate = (span / 2) as usize;
+    for i in 0..(rotary / 2) as usize {
         let (lo, hi) = if interleaved {
             (2 * i, 2 * i + 1)
         } else {
-            (i, i + half)
+            (i, i + mate)
         };
         t.pair(lo, hi, 0, inv_freq(theta, i, span));
     }
@@ -313,9 +315,10 @@ pub fn full(
 
 /// The first `rotary_dim` entries of each head turn, paired `(i, i + r/2)` at
 /// `theta^(-2i/r)` (the HF / mlx-lm / llama.cpp convention); the rest pass
-/// through. Reference: kernels-cuda `rope_partial` and kernels-metal
-/// `neox_prop_mb` after #603 (kernels-wgpu's `neox_prop` still pairs over
-/// the head width and is stale).
+/// through. Proportional (Gemma 4's global layers) pairs `(i, i + d/2)` at
+/// `theta^(-2i/d)` for the first `r/2` pairs instead. Reference: kernels-cuda
+/// `rope_partial`, kernels-metal `neox_prop_mb`.
+#[allow(clippy::too_many_arguments)]
 pub fn partial(
     ctx: &Ctx<'_>,
     q: Tensor,
@@ -324,13 +327,15 @@ pub fn partial(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
+    proportional: bool,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_partial";
     int_positions(OP, positions)?;
     rotary_within(OP, rotary_dim, head_dim)?;
     heads(OP, q.width, head_dim)?;
     heads(OP, k.width, head_dim)?;
-    let t = neox(head_dim, rotary_dim, theta, rotary_dim, false);
+    let span = if proportional { head_dim } else { rotary_dim };
+    let t = neox(head_dim, rotary_dim, theta, span, false);
     rotate_all(ctx, OP, &[q, k], positions, 1, &t)
 }
 
@@ -341,12 +346,14 @@ pub fn partial_q(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
+    proportional: bool,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_partial_q";
     int_positions(OP, positions)?;
     rotary_within(OP, rotary_dim, head_dim)?;
     heads(OP, q.width, head_dim)?;
-    let t = neox(head_dim, rotary_dim, theta, rotary_dim, false);
+    let span = if proportional { head_dim } else { rotary_dim };
+    let t = neox(head_dim, rotary_dim, theta, span, false);
     rotate_all(ctx, OP, &[q], positions, 1, &t)
 }
 

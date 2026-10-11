@@ -79,28 +79,33 @@ fn rotate_geometric(
     )
 }
 
+/// The first `rotary` entries of each head turn: pairs `(i, i + rotary/2)`
+/// at `theta^(-2i/rotary)`, or, proportional, `(i, i + head_dim/2)` at
+/// `theta^(-2i/head_dim)` for `i < rotary/2`.
 #[allow(clippy::too_many_arguments)]
-fn rotate_proportional(
+fn rotate_partial(
     ctx: &Ctx<'_>,
     op: &'static str,
     x: Tensor,
     positions: Tensor,
-    scale: f32,
     base: f32,
     head_dim: u32,
     rotary: u32,
+    proportional: bool,
 ) -> Result<(), Error> {
     let entry = dtype_dispatch!(op, x.dtype, { Bf16 => "neox_prop_mb_bfloat16" });
     positions_stream(op, positions, x);
     let lanes = rope_grid(op, rotary, x.width, head_dim, x.rows)?;
+    let span = if proportional { head_dim } else { rotary } / 2;
     ctx.fire(
         Fire::at(FILE, entry).apply(Grid::of(lanes, head_group(lanes))),
         &[
             x.arg_mut(),
             positions.arg(),
-            scale.arg(),
+            UNSCALED.arg(),
             base.arg(),
             stated(op, head_dim)?.arg(),
+            stated(op, span)?.arg(),
         ],
     )
 }
@@ -240,6 +245,7 @@ pub fn full(
     rotate_geometric(ctx, OP, k, positions, UNSCALED, base, head_dim, head_dim)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn partial(
     ctx: &Ctx<'_>,
     q: Tensor,
@@ -248,12 +254,13 @@ pub fn partial(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
+    proportional: bool,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_partial";
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     let base = theta.log2();
-    rotate_proportional(ctx, OP, q, positions, UNSCALED, base, head_dim, rotary_dim)?;
-    rotate_proportional(ctx, OP, k, positions, UNSCALED, base, head_dim, rotary_dim)
+    rotate_partial(ctx, OP, q, positions, base, head_dim, rotary_dim, proportional)?;
+    rotate_partial(ctx, OP, k, positions, base, head_dim, rotary_dim, proportional)
 }
 
 pub fn partial_q(
@@ -263,16 +270,17 @@ pub fn partial_q(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
+    proportional: bool,
 ) -> Result<(), Error> {
-    rotate_proportional(
+    rotate_partial(
         ctx,
         "elementwise.rope_partial_q",
         q,
         positions,
-        UNSCALED,
         theta.log2(),
         head_dim,
         rotary_dim,
+        proportional,
     )
 }
 

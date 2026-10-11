@@ -467,6 +467,7 @@ impl Run<'_> {
                 rotary_dim,
                 head_dim,
                 theta,
+                proportional,
                 q_out: _,
                 k_out: _,
             } => elemwise::rope::partial(
@@ -477,6 +478,7 @@ impl Run<'_> {
                 *rotary_dim,
                 *head_dim,
                 *theta,
+                *proportional,
             ),
             Elementwise::RopeMrope {
                 q,
@@ -547,6 +549,7 @@ impl Run<'_> {
                 rotary_dim,
                 head_dim,
                 theta,
+                proportional,
                 q_out: _,
             } => elemwise::rope::partial_q(
                 self.ctx(),
@@ -555,6 +558,7 @@ impl Run<'_> {
                 *rotary_dim,
                 *head_dim,
                 *theta,
+                *proportional,
             ),
             Elementwise::RopePartialLast {
                 q,

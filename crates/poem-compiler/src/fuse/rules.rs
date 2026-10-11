@@ -63,7 +63,8 @@ fn plus_one(op: &Operation) -> bool {
 }
 
 /// Gemma 4's attention prologue: split the packed qkv row, norm q and k per
-/// head and v without a scale, rotate q and k, and write k and v to the cache.
+/// head and v without a scale, rotate q and k (proportionally on a global
+/// layer), and write k and v to the cache.
 fn qkv_qknorm_rope_vnorm_write() -> Rule {
     let rope = |partial: bool| {
         template(move |p| {
@@ -75,7 +76,7 @@ fn qkv_qknorm_rope_vnorm_write() -> Rule {
             let q = elemwise::rmsnorm_per_head(&q, &p.weight("q_norm", [W]), d, eps);
             let k = elemwise::rmsnorm_per_head(&k, &p.weight("k_norm", [W]), d, eps);
             let (q, k) = if partial {
-                elemwise::rope_partial(&q, &k, &positions, p.u32("rotary"), d, theta)
+                elemwise::rope_partial(&q, &k, &positions, p.u32("rotary"), d, theta, true)
             } else {
                 elemwise::rope_full(&q, &k, &positions, d, theta, false)
             };
@@ -451,17 +452,29 @@ fn norm_modulate() -> Rule {
 
 /// A per-head norm of q, rotated.
 fn rmsnorm_rope_partial_q() -> Rule {
-    let pattern = template(|p| {
-        let positions = p.indices("positions");
-        let d = p.u32("head_dim");
-        let y =
-            elemwise::rmsnorm_per_head(&p.rows("x", W), &p.weight("weight", [W]), d, p.f32("eps"));
-        p.name("y", &y);
-        let q_out =
-            elemwise::rope_partial_q(&y, &positions, p.u32("rotary_dim"), d, p.f32("theta"));
-        p.export("q_out", &q_out);
-    });
-    Rule::new("elementwise.rmsnorm_rope_partial_q", [pattern], |m| {
+    let pattern = |proportional: bool| {
+        template(move |p| {
+            let positions = p.indices("positions");
+            let d = p.u32("head_dim");
+            let y = elemwise::rmsnorm_per_head(
+                &p.rows("x", W),
+                &p.weight("weight", [W]),
+                d,
+                p.f32("eps"),
+            );
+            p.name("y", &y);
+            let q_out = elemwise::rope_partial_q(
+                &y,
+                &positions,
+                p.u32("rotary_dim"),
+                d,
+                p.f32("theta"),
+                proportional,
+            );
+            p.export("q_out", &q_out);
+        })
+    };
+    Rule::new("elementwise.rmsnorm_rope_partial_q", [pattern(false), pattern(true)], |m| {
         Fused::RmsnormRopePartialQ {
             x: m.value("x"),
             weight: m.value("weight"),
@@ -470,6 +483,13 @@ fn rmsnorm_rope_partial_q() -> Rule {
             positions: m.value("positions"),
             rotary_dim: m.u32("rotary_dim"),
             theta: m.f32("theta"),
+            proportional: matches!(
+                m.op("q_out"),
+                Operation::Elementwise(Elementwise::RopePartialQ {
+                    proportional: true,
+                    ..
+                })
+            ),
             y: m.value("y"),
             q_out: m.value("q_out"),
         }

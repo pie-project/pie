@@ -75,6 +75,7 @@ pub enum Fused {
         positions: ValueId,
         rotary_dim: u32,
         theta: f32,
+        proportional: bool,
         y: ValueId,
         q_out: ValueId,
     },
