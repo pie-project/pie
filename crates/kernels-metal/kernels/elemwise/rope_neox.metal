@@ -153,17 +153,17 @@ template <typename T>
     const constant float& scale       [[buffer(2)]],
     const constant float& base        [[buffer(3)]],
     const constant int& head_dim      [[buffer(4)]],
+    const constant int& span          [[buffer(5)]],
     uint3 pos  [[thread_position_in_grid]],
     uint3 grid [[threads_per_grid]]) {
   const int i = int(pos.x);
   const int h = int(pos.y);
   const int m = int(pos.z);
   const int n_head = int(grid.y);
-  // Partial rotary follows the HF/mlx convention: the rotated width is
-  // 2*grid.x, the frequencies run over that width, and a pair sits
-  // rotary/2 apart (not head_dim/2). With rotary == head_dim this is the
-  // full-head rotation as before.
-  const int half_hd = int(grid.x);
+  // The first grid.x pairs turn; a pair sits `span` apart and the
+  // frequencies run over 2*span: rotary/2 for a plain partial rotary,
+  // head_dim/2 for a proportional one.
+  const int half_hd = span;
 
   float d = static_cast<float>(i) / static_cast<float>(half_hd);
   float inv_freq = exp2(-d * base);
@@ -183,7 +183,8 @@ template <typename T>
   template [[host_name("neox_prop_mb_" #name)]]             \
   [[kernel]] void rope_neox_prop_mb<itype>(                      \
       device itype*, const device int*, const constant float&,   \
-      const constant float&, const constant int&, uint3, uint3);
+      const constant float&, const constant int&, const constant int&, \
+      uint3, uint3);
 
 instantiate_rope_prop_mb(bfloat16, bfloat)
 

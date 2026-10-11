@@ -277,7 +277,7 @@ def qkv_unfused(x, pos, inputs, m, at, d, kv_heads, qkv, k_norm, k_norm_eps, pag
     q = ops.elemwise.rmsnorm_per_head(q, at.q_norm, d, at.q_norm_eps)
     k = ops.elemwise.rmsnorm_per_head(k, k_norm, d, k_norm_eps)
     if at.reading == GLOBAL:
-        q, k = ops.elemwise.rope_partial(q, k, pos, m.glob.rotary_dim, d, m.glob.theta)
+        q, k = ops.elemwise.rope_proportional(q, k, pos, m.glob.rotary_dim, d, m.glob.theta)
     else:
         q, k = ops.elemwise.rope_full(q, k, pos, d, m.sliding.theta, False)
     ops.attn.kv_append(k, v, pages, write_page, write_offset)
@@ -286,5 +286,5 @@ def qkv_unfused(x, pos, inputs, m, at, d, kv_heads, qkv, k_norm, k_norm_eps, pag
 def q_only(x, pos, m, at, d, q_proj):
     q = ops.elemwise.rmsnorm_per_head(ops.linear.matmul(x, q_proj), at.q_norm, d, at.q_norm_eps)
     if at.reading == GLOBAL:
-        return ops.elemwise.rope_partial_q(q, pos, m.glob.rotary_dim, d, m.glob.theta)
+        return ops.elemwise.rope_proportional_q(q, pos, m.glob.rotary_dim, d, m.glob.theta)
     return ops.elemwise.rope_partial_q(q, pos, d, d, m.sliding.theta)

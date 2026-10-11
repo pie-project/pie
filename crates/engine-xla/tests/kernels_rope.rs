@@ -89,8 +89,8 @@ fn partial_rope_turns_only_the_rotary_pairs_of_q_and_k() {
     let q2 = b.bf16(rows as u32, (qh * hd) as u32, &qs);
     if !b
         .run(|ctx| {
-            rope::partial(ctx, q, k, p, rot as u32, hd as u32, theta)?;
-            rope::partial_q(ctx, q2, p, rot as u32, hd as u32, theta)
+            rope::partial(ctx, q, k, p, rot as u32, hd as u32, theta, false)?;
+            rope::partial_q(ctx, q2, p, rot as u32, hd as u32, theta, false)
         })
         .unwrap()
     {

@@ -7,7 +7,13 @@ use dtype::Dtype;
 use kernels_cuda::elemwise::rope;
 use kernels_cuda::tensor::Tensor;
 
-fn check(head_dim: usize, heads: usize, rotary_dim: usize, window: Option<(u32, u32, u32)>) {
+fn check(
+    head_dim: usize,
+    heads: usize,
+    rotary_dim: usize,
+    proportional: bool,
+    window: Option<(u32, u32, u32)>,
+) {
     let (rows, live, base) = window.unwrap_or((6, 6, 0));
     let planes = (base + rows) as usize;
     let width = heads * head_dim;
@@ -38,13 +44,14 @@ fn check(head_dim: usize, heads: usize, rotary_dim: usize, window: Option<(u32, 
         Tensor::new(p_at, rows, 1, Dtype::I32),
         rotary_dim as u32,
         theta,
+        proportional,
         &mut y,
     )
     .expect("the fused q path fires");
     gpu.sync();
     let got: Vec<u16> = gpu.down(y_at, planes * width);
 
-    let rope_half = rotary_dim / 2;
+    let span = if proportional { head_dim } else { rotary_dim } / 2;
     for r in 0..planes {
         let touched = r >= base as usize && r < (base + live) as usize;
         if !touched {
@@ -61,16 +68,17 @@ fn check(head_dim: usize, heads: usize, rotary_dim: usize, window: Option<(u32, 
             let ms: f32 = xr.iter().map(|v| v * v).sum::<f32>() / head_dim as f32;
             let inv = 1.0 / (ms + eps).sqrt();
             // every element of the head is normed and scaled; only the first
-            // rotary_dim of them rotate, as pairs (dp, dp + rotary_dim / 2) at
-            // theta^(-2 dp / rotary_dim), the way HF and llama.cpp pair them.
+            // rotary_dim / 2 pairs rotate, each `span` apart at theta^(-dp / span):
+            // span = rotary_dim / 2 the way HF and llama.cpp pair a partial
+            // rotary, head_dim / 2 for a proportional one.
             let mut want: Vec<f32> = (0..head_dim).map(|i| xr[i] * inv * w[i]).collect();
-            for dp in 0..rope_half {
-                let (a, b) = (want[dp], want[dp + rope_half]);
-                let freq = theta.powf(-2.0 * dp as f32 / rotary_dim as f32);
+            for dp in 0..rotary_dim / 2 {
+                let (a, b) = (want[dp], want[dp + span]);
+                let freq = theta.powf(-(dp as f32) / span as f32);
                 let ang = positions[r] as f32 * freq;
                 let (s, c) = ang.sin_cos();
                 want[dp] = a * c - b * s;
-                want[dp + rope_half] = b * c + a * s;
+                want[dp + span] = b * c + a * s;
             }
             for (i, want) in want.into_iter().enumerate() {
                 let g = from_bf16(got[at + i]);
@@ -87,13 +95,19 @@ fn check(head_dim: usize, heads: usize, rotary_dim: usize, window: Option<(u32, 
 fn the_fused_q_norm_rope_lands_the_pair_every_case() {
     a_full_rotary_head_lands_the_pair();
     a_partial_rotary_head_lands_the_pair_and_leaves_the_rest_normed();
+    a_proportional_head_pairs_across_the_whole_head();
 }
 
 fn a_full_rotary_head_lands_the_pair() {
-    check(256, 4, 256, None);
+    check(256, 4, 256, false, None);
 }
 
 fn a_partial_rotary_head_lands_the_pair_and_leaves_the_rest_normed() {
-    check(256, 8, 128, None);
-    check(128, 2, 64, Some((6, 4, 1)));
+    check(256, 8, 128, false, None);
+    check(128, 2, 64, false, Some((6, 4, 1)));
+}
+
+fn a_proportional_head_pairs_across_the_whole_head() {
+    // Gemma 4 31B's global layers: head_dim 512, a quarter of it turning.
+    check(512, 4, 128, true, None);
 }

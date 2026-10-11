@@ -5,7 +5,9 @@
 //! `pos * theta^(-2i/rotary_dim)` and leaves the rest alone, the way HF
 //! transformers, mlx-lm and llama.cpp do. Positions sit far from zero: the
 //! head-width convention this replaced agrees with the rotary-width one at
-//! position 0 and drifts with distance.
+//! position 0 and drifts with distance. Proportional (Gemma 4's global
+//! layers) pairs `(i, i + head_dim/2)` at `pos * theta^(-2i/head_dim)` for the
+//! first `rotary_dim/2` pairs instead, as HF's `proportional` rope type does.
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
@@ -46,19 +48,19 @@ fn bf16_floats(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// The reference: pairs `(i, i + rotary_dim/2)` turned by
-/// `pos * theta^(-2i/rotary_dim)`, everything past `rotary_dim` untouched.
-fn turn(head: &mut [f32], pos: i32, rotary_dim: usize, theta: f32) {
-    let rope_half = rotary_dim / 2;
-    for dp in 0..rope_half {
-        let (a, b) = (head[dp], head[dp + rope_half]);
-        let freq = theta.powf(-2.0 * dp as f32 / rotary_dim as f32);
+/// The reference: the first `rotary_dim/2` pairs, `span` apart, turned by
+/// `pos * theta^(-i/span)`; everything else untouched.
+fn turn(head: &mut [f32], pos: i32, rotary_dim: usize, span: usize, theta: f32) {
+    for dp in 0..rotary_dim / 2 {
+        let (a, b) = (head[dp], head[dp + span]);
+        let freq = theta.powf(-(dp as f32) / span as f32);
         let (s, c) = (pos as f32 * freq).sin_cos();
         head[dp] = a * c - b * s;
-        head[dp + rope_half] = b * c + a * s;
+        head[dp + span] = b * c + a * s;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check(
     device: &Context,
     handles: &Handles,
@@ -67,6 +69,7 @@ fn check(
     q_heads: u32,
     kv_heads: u32,
     rotary_dim: u32,
+    proportional: bool,
 ) {
     let rows: u32 = 6;
     let (q_width, k_width) = (q_heads * head_dim, kv_heads * head_dim);
@@ -102,7 +105,8 @@ fn check(
     {
         let frame = device.frame().expect("a frame");
         let sink = Sink::new(device, &frame, pipelines, handles);
-        rope::partial(&sink, q, k, p, rotary_dim, head_dim, theta).expect("the launch");
+        rope::partial(&sink, q, k, p, rotary_dim, head_dim, theta, proportional)
+            .expect("the launch");
         frame.commit().expect("the commit");
     }
     let got_q = bf16_floats(
@@ -124,7 +128,8 @@ fn check(
             for h in 0..heads as usize {
                 let at = r * width as usize + h * head_dim as usize;
                 let mut want = src[at..at + head_dim as usize].to_vec();
-                turn(&mut want, position, rotary_dim as usize, theta);
+                let span = if proportional { head_dim } else { rotary_dim } as usize / 2;
+                turn(&mut want, position, rotary_dim as usize, span, theta);
                 for (i, want) in want.into_iter().enumerate() {
                     let g = got[at + i];
                     assert!(
@@ -146,8 +151,10 @@ fn the_partial_rope_turns_only_the_rotary_pairs() {
     let handles = Handles::new();
     let pipelines = Pipelines::new();
     // a full rotary head turns end to end
-    check(&device, &handles, &pipelines, 128, 4, 2, 128);
+    check(&device, &handles, &pipelines, 128, 4, 2, 128, false);
     // the shape Qwen3 A3B asks for: head_dim 256, rotary_dim 64
-    check(&device, &handles, &pipelines, 256, 16, 2, 64);
-    check(&device, &handles, &pipelines, 128, 8, 1, 64);
+    check(&device, &handles, &pipelines, 256, 16, 2, 64, false);
+    check(&device, &handles, &pipelines, 128, 8, 1, 64, false);
+    // Gemma 4 31B's global layers: head_dim 512, a quarter of it turning
+    check(&device, &handles, &pipelines, 512, 4, 1, 128, true);
 }
