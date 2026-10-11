@@ -89,7 +89,7 @@ pub struct Projection {
 
 /// A projection must land at least this many columns to be worth a
 /// hand-off of its own.
-pub const MIN_PROJECTION_COLUMNS: u32 = 4096;
+pub const MIN_PROJECTION_COLUMNS: u32 = 2048;
 
 /// `PIE_ANE_PROJECTIONS=0|off|false` keeps every projection on the GPU;
 /// the MLPs still split.
