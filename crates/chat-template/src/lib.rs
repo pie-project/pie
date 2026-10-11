@@ -106,6 +106,12 @@ pub trait Instruct: Send + Sync {
 
     fn cue(&self) -> Vec<u32>;
 
+    /// [`Instruct::cue`] for a turn the model answers without thinking, as
+    /// the reference template renders `enable_thinking: false`.
+    fn cue_without_thinking(&self) -> Vec<u32> {
+        self.cue()
+    }
+
     fn seal(&self) -> Vec<u32>;
 
     fn equip(&self, _tools: &[String]) -> Vec<u32> {

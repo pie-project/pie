@@ -18,7 +18,7 @@ pub const FORMATS: &[&str] = &[
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Spec {
     pub format: String,
-    /// ChatML.
+    /// ChatML, gemma.
     pub thinking: bool,
     pub preserve_thinking: bool,
     pub tools: bool,
@@ -74,9 +74,10 @@ impl Spec {
                 "generation_suffix",
                 "stop",
             ],
+            "gemma" => &["thinking"],
             "lines" => &["stop", "bos", "eos"],
             "raw" => &["stop"],
-            "harmony" | "gemma" | "deepseek" | "glm" | "kimi" | "kimi3" | "inkling" | "atem" => &[],
+            "harmony" | "deepseek" | "glm" | "kimi" | "kimi3" | "inkling" | "atem" => &[],
             other => {
                 return Err(format!(
                     "`{other}` names no template format; this build ships {}",
@@ -117,7 +118,7 @@ pub fn build(spec: &Spec, tokenizer: Arc<Tokenizer>) -> Result<Arc<dyn Instruct>
             },
         )),
         "harmony" => Arc::new(crate::harmony::Harmony::new(tokenizer)),
-        "gemma" => Arc::new(crate::gemma::Gemma::new(tokenizer)),
+        "gemma" => Arc::new(crate::gemma::Gemma::new(tokenizer, spec.thinking)),
         "deepseek" => Arc::new(crate::deepseek::DeepSeek::new(tokenizer)),
         "glm" => Arc::new(crate::glm::Glm::new(tokenizer)),
         "kimi" => Arc::new(crate::kimi::Kimi::new(tokenizer)),

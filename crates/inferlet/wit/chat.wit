@@ -25,6 +25,11 @@ interface chat {
     /// Cue the model to generate (fills generation header)
     cue: func() -> list<u32>;
 
+    /// `cue` for a turn the model answers without thinking: an empty thinking
+    /// block where the model has one, as its template renders
+    /// `enable_thinking: false`.
+    cue-without-thinking: func() -> list<u32>;
+
     /// Seal the current turn (insert stop token)
     seal: func() -> list<u32>;
 

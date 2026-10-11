@@ -51,10 +51,7 @@ pub fn build(req: &Request) -> Result<Vec<u32>, String> {
             }
         }
 
-        tokens.extend(chat::cue());
-        if req.thinking == Thinking::Disabled {
-            tokens.extend(chat::no_thinking_cue());
-        }
+        tokens.extend(chat::cue_thinking(req.thinking != Thinking::Disabled));
     }
     // The prefill needs at least one token.
     if tokens.is_empty() {

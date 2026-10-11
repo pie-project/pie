@@ -30,6 +30,7 @@ pub struct ChatMLInstruct {
     assistant_prefix: Vec<u32>,
     turn_suffix: Vec<u32>,
     generation_header: Vec<u32>,
+    quiet_header: Vec<u32>,
     stop_ids: Vec<u32>,
 
     think_open: Vec<u32>,
@@ -65,12 +66,23 @@ impl ChatMLInstruct {
 
         let mut generation_header = header("assistant");
         generation_header.extend(tokenizer.encode(&config.generation_suffix));
+        // An empty thinking block, as the reference template writes for
+        // `enable_thinking: false`.
+        let mut quiet_header = header("assistant");
+        if config.thinking {
+            let gap = tokenizer.encode("\n\n");
+            quiet_header.push(special(&tokenizer, THINK_OPEN));
+            quiet_header.extend(&gap);
+            quiet_header.push(special(&tokenizer, THINK_CLOSE));
+            quiet_header.extend(&gap);
+        }
 
         Self {
             system_prefix: header("system"),
             user_prefix: header("user"),
             assistant_prefix: header("assistant"),
             generation_header,
+            quiet_header,
             turn_suffix,
             stop_ids,
             think_open: vec![special(&tokenizer, THINK_OPEN)],
@@ -84,7 +96,7 @@ impl ChatMLInstruct {
 
     fn turn(&self, prefix: &[u32], msg: &str) -> Vec<u32> {
         let mut tokens = prefix.to_vec();
-        tokens.extend(self.tokenizer.encode(msg));
+        tokens.extend(self.tokenizer.encode(msg.trim()));
         tokens.extend(&self.turn_suffix);
         tokens
     }
@@ -173,6 +185,10 @@ impl Instruct for ChatMLInstruct {
 
     fn cue(&self) -> Vec<u32> {
         self.generation_header.clone()
+    }
+
+    fn cue_without_thinking(&self) -> Vec<u32> {
+        self.quiet_header.clone()
     }
 
     fn seal(&self) -> Vec<u32> {

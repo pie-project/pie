@@ -34,14 +34,6 @@ use inferlet::prefix_cache::PrefixCache;
 use inferlet::{chat, session};
 use serde::{Deserialize, Serialize};
 
-fn cue(no_think: bool) -> Vec<u32> {
-    let mut cue = chat::cue();
-    if no_think {
-        cue.extend(chat::no_thinking_cue());
-    }
-    cue
-}
-
 #[derive(Deserialize)]
 struct Input {
     #[serde(default)]
@@ -271,7 +263,7 @@ async fn run_one(
         tokens.to_vec()
     } else {
         let mut p = chat::system_user(&input.system, prompt);
-        p.extend(cue(input.no_think));
+        p.extend(chat::cue_thinking(!input.no_think));
         p
     };
     step(&mut prologue_us, input.report_timing); // [1] tokenize
@@ -935,7 +927,7 @@ async fn main(input: Input) -> Result<Output> {
                         .map(String::as_str)
                         .unwrap_or(input.prompt.as_str());
                     let mut pt = chat::system_user(&input.system, prompt);
-                    pt.extend(cue(input.no_think));
+                    pt.extend(chat::cue_thinking(!input.no_think));
                     prepared_prompt_tokens.push(pt);
                 }
             }
