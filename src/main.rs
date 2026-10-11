@@ -54,6 +54,11 @@ enum Command {
         cmd: ops::language::LanguageCmd,
     },
 
+    Profile {
+        #[command(subcommand)]
+        cmd: ops::profile::ProfileCmd,
+    },
+
     Doctor,
 }
 
@@ -122,6 +127,9 @@ async fn run() -> anyhow::Result<ExitCode> {
         Command::Inferlet { cmd } => ops::inferlet::run(cmd).await?,
         Command::Language { cmd } => {
             tokio::task::spawn_blocking(move || ops::language::run(cmd)).await??
+        }
+        Command::Profile { cmd } => {
+            tokio::task::spawn_blocking(move || ops::profile::run(cmd)).await??
         }
     };
 

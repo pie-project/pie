@@ -121,6 +121,7 @@ pub fn run(global: &crate::args::GlobalArgs) -> Result<crate::ui::Answer> {
     ));
     sections.push(("config", check_config(&path, origin)));
     sections.push(("tuning", check_tuning(&path)));
+    sections.push(("device profiles", check_profiles()));
 
     for (_, checks) in &sections {
         for (_, _, status) in checks {
@@ -538,6 +539,74 @@ fn check_gpus(named_engine: Option<&str>) -> Checks {
             Status::Warn,
         )],
     }
+}
+
+/// The profile each backend this build hosts would load under on this
+/// machine: where it came from, what was refused, what took a default.
+fn check_profiles() -> Checks {
+    let mut checks = Vec::new();
+    let dir = crate::paths::pie_home().join("profiles");
+    for backend in runtime::engine::profiles::backends() {
+        let Some((device, facts)) = (backend.probe)() else {
+            checks.push((
+                backend.name.to_string(),
+                "no device answers on this machine".to_string(),
+                Status::Warn,
+            ));
+            continue;
+        };
+        let (_, report) = backend
+            .shelf
+            .resolve((backend.registry)(), &device, &facts, Some(&dir));
+        checks.push((
+            backend.name.to_string(),
+            format!("{device} ({})", facts.describe().join(", ")),
+            Status::Pass,
+        ));
+        checks.push((
+            "profile".to_string(),
+            report.used.to_string(),
+            if report.untuned() {
+                Status::Warn
+            } else {
+                Status::Pass
+            },
+        ));
+        for (source, why) in &report.rejected {
+            checks.push((
+                "refused".to_string(),
+                format!("{source}: {why}"),
+                Status::Warn,
+            ));
+        }
+        if !report.defaulted.is_empty() {
+            checks.push((
+                "defaulted".to_string(),
+                report.defaulted.join(", "),
+                Status::Warn,
+            ));
+        }
+        if report.untuned() {
+            checks.push((
+                "to tune".to_string(),
+                format!(
+                    "pie profile dump > {}/{}/user/{}.toml, then edit what you measure",
+                    crate::ui::short_path(&dir),
+                    backend.name,
+                    profile::id_of(&device)
+                ),
+                Status::Warn,
+            ));
+        }
+    }
+    if checks.is_empty() {
+        checks.push((
+            "backends".to_string(),
+            "this build hosts no backend with device profiles".to_string(),
+            Status::Warn,
+        ));
+    }
+    checks
 }
 
 fn check_tuning(config_path: &Path) -> Checks {

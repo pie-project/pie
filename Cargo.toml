@@ -156,6 +156,7 @@ tar = "0.4"
 flate2 = "1"
 worker = { path = "crates/worker", default-features = false, features = ["standalone"] }
 runtime = { path = "crates/runtime" }
+profile = { package = "pie-profile", path = "crates/profile" }
 poem = { package = "pie-poem", path = "crates/poem" }
 checkpoint = { path = "crates/checkpoint" }
 ztensor = { workspace = true }

@@ -4,4 +4,5 @@ pub mod doctor;
 pub mod inferlet;
 pub mod language;
 pub mod model;
+pub mod profile;
 pub mod run;

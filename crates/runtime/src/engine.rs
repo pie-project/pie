@@ -4,6 +4,7 @@ pub mod completion;
 pub mod fire;
 pub mod instance;
 pub mod load;
+pub mod profiles;
 
 pub use waker;
 
