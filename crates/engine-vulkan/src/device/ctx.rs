@@ -846,14 +846,7 @@ impl Context {
     #[must_use]
     pub fn info(&self) -> kernels_vulkan::DeviceInfo {
         kernels_vulkan::DeviceInfo {
-            vendor: match self.core.vendor_id {
-                0x10DE => kernels_vulkan::tuning::Vendor::Nvidia,
-                0x1002 => kernels_vulkan::tuning::Vendor::Amd,
-                0x8086 => kernels_vulkan::tuning::Vendor::Intel,
-                0x106B => kernels_vulkan::tuning::Vendor::Apple,
-                0x5143 => kernels_vulkan::tuning::Vendor::Qualcomm,
-                _ => kernels_vulkan::tuning::Vendor::Other,
-            },
+            vendor: kernels_vulkan::DeviceInfo::vendor_of(self.core.vendor_id),
             subgroup_size: self.core.subgroup_size,
             max_workgroup_invocations: self.core.limits.max_compute_work_group_invocations,
             max_shared_bytes: self.core.limits.max_compute_shared_memory_size,

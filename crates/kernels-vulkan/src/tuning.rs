@@ -7,6 +7,7 @@ pub enum Vendor {
     Intel,
     Apple,
     Qualcomm,
+    Imagination,
     #[default]
     Other,
 }
@@ -35,6 +36,7 @@ impl DeviceInfo {
             0x8086 => Vendor::Intel,
             0x106b => Vendor::Apple,
             0x5143 => Vendor::Qualcomm,
+            0x1010 => Vendor::Imagination,
             _ => Vendor::Other,
         }
     }
@@ -132,6 +134,11 @@ impl DeviceTuning {
             // over six layers, against 11.7 split two ways.
             t.sdpa_split_groups = 128;
             t.sdpa_split_min_keys = 128;
+        }
+        // PowerVR (Pixel 11 Pro, Tensor G6) decodes Qwen3.5-0.8B at 27 tok/s
+        // on the one-row point and 11 on `qmv`.
+        if info.vendor == Vendor::Imagination {
+            t.qmv_one_row = info.subgroup_size >= 32;
         }
         t
     }
