@@ -274,7 +274,9 @@ fn a_stepwise_module_compiles() {
     };
     let stepwise = emit_launch_steps("guest_pass", &plan).expect("the stepwise shape emits");
 
-    assert_eq!(stepwise.steps.len(), 30, "every rung is its own dispatch");
+    // iota, exp, a reduce of three 32-fold levels and its finish, and the
+    // sort's seed, 16 rounds, pre, finish and pack.
+    assert_eq!(stepwise.steps.len(), 26, "every rung is its own dispatch");
 
     let words = compile(&stepwise.source);
     assert_eq!(words[0], 0x0723_0203, "the first word is the SPIR-V magic");
