@@ -427,10 +427,10 @@ pub(crate) fn create_engine_backend(
                     toml::Value::String(words.to_string())
                 ));
             }
-            if !opts.tuning.is_empty() {
-                boot_doc.push_str("\n[metal.tuning]\n");
-                boot_doc.push_str(&opts.tuning.to_string());
-            }
+            boot_doc.push_str(&format!(
+                "profiles = {}\n",
+                toml::Value::String(home.join("profiles").display().to_string())
+            ));
             if let Some(mount) = adapter_dir {
                 boot_doc.push_str(&format!(
                     "\n[model]\nadapter_dir = {}\n",
@@ -764,6 +764,7 @@ pub(crate) fn build_options(m: &config::ModelConfig, flavor: Flavor) -> Result<E
         }
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         Flavor::Metal => {
+            crate::config::backend::moved_to_profile("metal", &m.engine.options)?;
             let p: MetalEngineOptions = m
                 .engine
                 .options

@@ -267,6 +267,7 @@ fn pool_over(rig: &mut Rig, keys: u32, values: u32, dtype: Dtype, head_dim: usiz
         page_size: PAGE_SIZE as i32,
         seq_stride: width as u64,
         head_stride: head_dim as u64,
+        q8: false,
     }
 }
 

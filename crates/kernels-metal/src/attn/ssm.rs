@@ -83,18 +83,12 @@ gdn_scan_points!(
     (32, 8, 8),
 );
 
-fn gdn_scan_launch(shape: &Delta, requests: u32) -> Option<(&'static str, &'static str, Grid)> {
-    let tuned = crate::tuning::current();
-    if ![8, GDN_SCAN_LANES].contains(&tuned.gdn_scan_lanes) {
-        return None;
-    }
-    gdn_scan_launch_at(
-        shape,
-        requests,
-        tuned.gdn_scan_lanes,
-        tuned.gdn_scan_rows,
-        gdn_scan_point,
-    )
+fn gdn_scan_launch(
+    shape: &Delta,
+    requests: u32,
+    (lanes, rows): (u32, u32),
+) -> Option<(&'static str, &'static str, Grid)> {
+    gdn_scan_launch_at(shape, requests, lanes, rows, gdn_scan_point)
 }
 
 fn gdn_staged_launch_at(
@@ -119,35 +113,20 @@ fn gdn_staged_launch_at(
     ))
 }
 
-fn gdn_scan_step_launch(shape: &Delta, rows: u32) -> Option<(&'static str, &'static str, Grid)> {
-    let tuned = crate::tuning::current();
-    if ![8, GDN_SCAN_LANES].contains(&tuned.gdn_scan_lanes) {
-        return None;
-    }
-    gdn_scan_launch_at(
-        shape,
-        rows,
-        tuned.gdn_scan_lanes,
-        tuned.gdn_scan_rows,
-        gdn_scan_step_point,
-    )
+fn gdn_scan_step_launch(
+    shape: &Delta,
+    rows: u32,
+    (lanes, vrows): (u32, u32),
+) -> Option<(&'static str, &'static str, Grid)> {
+    gdn_scan_launch_at(shape, rows, lanes, vrows, gdn_scan_step_point)
 }
 
 fn gdn_scan_committed_launch(
     shape: &Delta,
-    lanes: u32,
+    requests: u32,
+    (lanes, rows): (u32, u32),
 ) -> Option<(&'static str, &'static str, Grid)> {
-    let tuned = crate::tuning::current();
-    if ![8, GDN_SCAN_LANES].contains(&tuned.gdn_scan_lanes) {
-        return None;
-    }
-    gdn_scan_launch_at(
-        shape,
-        lanes,
-        tuned.gdn_scan_lanes,
-        tuned.gdn_scan_rows,
-        gdn_scan_committed_point,
-    )
+    gdn_scan_launch_at(shape, requests, lanes, rows, gdn_scan_committed_point)
 }
 
 fn gdn_scan_launch_at(
@@ -450,6 +429,7 @@ pub fn gdn_prep(
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     qkv: Tensor,
     z: Tensor,
     gates: Tensor,
@@ -467,7 +447,7 @@ pub fn gated_delta(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let rows = nonzero(OP, "rows", qkv.rows)?;
-    if let Some((point, stamp, grid)) = gdn_scan_step_launch(&shape, rows) {
+    if let Some((point, stamp, grid)) = gdn_scan_step_launch(&shape, rows, tuning.gdn_scan()) {
         return ctx.fire(
             Fire::at(GDN_SCAN_FILE, point).stamp(stamp).apply(grid),
             &[
@@ -508,6 +488,7 @@ pub fn gated_delta(
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_chunked(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     qkv: RaggedTensor,
     z: Tensor,
     gates: Tensor,
@@ -537,14 +518,8 @@ pub fn gated_delta_chunked(
         stated(OP, shape.k_dim)?.arg(),
         stated(OP, shape.v_dim)?.arg(),
     ];
-    let tuned = crate::tuning::current();
-    if let Some(grid) = gdn_staged_launch_at(
-        &shape,
-        lanes,
-        qkv.data.rows,
-        tuned.gdn_scan_lanes,
-        tuned.gdn_scan_rows,
-    ) {
+    let (scan_lanes, scan_rows) = tuning.gdn_scan();
+    if let Some(grid) = gdn_staged_launch_at(&shape, lanes, qkv.data.rows, scan_lanes, scan_rows) {
         return ctx.fire(
             Fire::at(
                 "attn/ssm_gdn_staged.metal",
@@ -555,7 +530,7 @@ pub fn gated_delta_chunked(
             &args,
         );
     }
-    if let Some((point, stamp, grid)) = gdn_scan_launch(&shape, lanes) {
+    if let Some((point, stamp, grid)) = gdn_scan_launch(&shape, lanes, tuning.gdn_scan()) {
         return ctx.fire(
             Fire::at(GDN_SCAN_FILE, point).stamp(stamp).apply(grid),
             &args,
@@ -754,11 +729,11 @@ mod tests {
 
     fn a_shape_the_stamp_does_not_name_falls_back() {
         let odd = Delta { k_dim: 100, ..D27B };
-        assert!(gdn_scan_launch(&odd, 1).is_none());
+        assert!(gdn_scan_launch(&odd, 1, (32, 4)).is_none());
         let deep = Delta { k_dim: 512, ..D27B };
-        assert!(gdn_scan_launch(&deep, 1).is_none());
+        assert!(gdn_scan_launch(&deep, 1, (32, 4)).is_none());
         let ragged = Delta { v_dim: 66, ..D27B };
-        assert!(gdn_scan_launch(&ragged, 1).is_none());
+        assert!(gdn_scan_launch(&ragged, 1, (32, 4)).is_none());
     }
 }
 
@@ -840,6 +815,7 @@ pub fn causal_conv1d_committed(
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_committed(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     qkv: Tensor,
     indptr: Tensor,
     committed: &Committed,
@@ -858,7 +834,8 @@ pub fn gated_delta_committed(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let lanes = committed_lanes(OP, indptr)?;
-    if let Some((point, stamp, grid)) = gdn_scan_committed_launch(&shape, lanes) {
+    if let Some((point, stamp, grid)) = gdn_scan_committed_launch(&shape, lanes, tuning.gdn_scan())
+    {
         return ctx.fire(
             Fire::at(GDN_SCAN_FILE, point).stamp(stamp).apply(grid),
             &[

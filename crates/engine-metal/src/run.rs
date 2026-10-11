@@ -156,6 +156,9 @@ pub struct Run<'c> {
     /// The Neural Engine's share of this load, when a live encode may hand
     /// it work.
     ane: Option<&'c crate::ane::Ane>,
+
+    /// The chip profile and model facts this load's kernels run under.
+    tuning: &'c kernels_metal::Tuning,
 }
 
 impl<'c> Run<'c> {
@@ -173,6 +176,7 @@ impl<'c> Run<'c> {
         windows: &'c Windows,
         place: &'c At,
         scratch: &'c Scratch,
+        tuning: &'c kernels_metal::Tuning,
     ) -> Self {
         Self {
             ctx,
@@ -190,7 +194,13 @@ impl<'c> Run<'c> {
             copy: CopyPlan::default(),
             scratch,
             ane: None,
+            tuning,
         }
+    }
+
+    /// The chip profile and model facts this load's kernels run under.
+    pub(crate) fn tuning(&self) -> &'c kernels_metal::Tuning {
+        self.tuning
     }
 
     #[must_use]

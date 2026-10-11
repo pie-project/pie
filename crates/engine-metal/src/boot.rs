@@ -5,12 +5,13 @@ pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Metal, Str
         .map_err(|error| format!("the metal boot config is not utf-8: {error}"))?
         .parse()
         .map_err(|error| format!("the metal boot config is not TOML: {error}"))?;
-    tuning(&doc);
+    let profiles = profiles(&doc)?;
     crate::diag::publish(&diagnostics(&doc)?);
     Ok(Metal::new(
         DeviceBoot {
             gpu_mem_utilization: gpu_mem_utilization(&doc),
             adapter_dir: adapter_dir(&doc),
+            profiles,
         },
         contract_for,
     ))
@@ -51,56 +52,23 @@ fn gpu_mem_utilization(doc: &toml::Table) -> f64 {
         .unwrap_or(crate::store::accounting::DEFAULT_GPU_MEM_UTILIZATION)
 }
 
-fn tuning(doc: &toml::Table) {
-    let Some(table) = doc
-        .get("metal")
-        .and_then(toml::Value::as_table)
-        .and_then(|metal| metal.get("tuning"))
-        .and_then(toml::Value::as_table)
-    else {
-        return;
+fn profiles(doc: &toml::Table) -> Result<Option<std::path::PathBuf>, String> {
+    let Some(metal) = doc.get("metal").and_then(toml::Value::as_table) else {
+        return Ok(None);
     };
-    let int = |key: &str| {
-        table
-            .get(key)
-            .and_then(toml::Value::as_integer)
-            .and_then(|v| u32::try_from(v).ok())
-    };
-    let flag = |key: &str| table.get(key).and_then(toml::Value::as_bool);
-
-    let described = kernels_metal::DeviceInfo {
-        apple_family: int("apple_family").unwrap_or_default(),
-        gpu_core_count: int("gpu_core_count").unwrap_or_default(),
-        metal4: flag("metal4").unwrap_or_default(),
-    };
-    if described != kernels_metal::DeviceInfo::default() {
-        kernels_metal::tuning::describe(described);
+    if metal.contains_key("tuning") {
+        return Err(
+            "[metal.tuning] is gone: a chip's tuning is its device profile now. Write the \
+             decisions to change into $PIE_HOME/profiles/metal/user/<device>.toml"
+                .to_string(),
+        );
     }
-
-    kernels_metal::tuning::override_with(kernels_metal::tuning::Overrides {
-        qmm_min_batch: int("qmm_min_batch"),
-        qmm_min_batch_moe: int("qmm_min_batch_moe"),
-        qmm_min_batch_emulated: int("qmm_min_batch_emulated"),
-        qmm_bn_crossover_tg: int("qmm_bn_crossover_tg"),
-        moe_tile_mid_per: int("moe_tile_mid_per"),
-        moe_tile_wide_per: int("moe_tile_wide_per"),
-        qmm_wide_range: flag("qmm_wide_range"),
-        fp16_qmm: flag("fp16_qmm"),
-        qmm_mpp: flag("qmm_mpp"),
-        qmm_mpp_packed: flag("qmm_mpp_packed"),
-        sdpa_tile_min_rows_per_request: int("sdpa_tile_min_rows_per_request"),
-        sdpa_mma: flag("sdpa_mma"),
-        sdpa_mpp: flag("sdpa_mpp"),
-        gdn_scan_lanes: int("gdn_scan_lanes"),
-        gdn_scan_rows: int("gdn_scan_rows"),
-        moe_batch_min_per_expert: int("moe_batch_min_per_expert"),
-        moe_batch_min_pairs: int("moe_batch_min_pairs"),
-        qmv_rows_max: int("qmv_rows_max"),
-        qmv_rows_packs: int("qmv_rows_packs"),
-        stream_rows_per_cut: int("stream_rows_per_cut"),
-        ane_percent: int("ane_percent"),
-        ane_projections: flag("ane_projections"),
-    });
+    match metal.get("profiles") {
+        None => Ok(None),
+        Some(toml::Value::String(dir)) if dir.trim().is_empty() => Ok(None),
+        Some(toml::Value::String(dir)) => Ok(Some(std::path::PathBuf::from(dir))),
+        Some(other) => Err(format!("[metal] profiles is a directory path, not {other}")),
+    }
 }
 
 #[cfg(test)]
@@ -121,7 +89,8 @@ mod tests {
         the_diagnostics_word_list_is_read_or_refused_by_name();
         gpu_mem_utilization_reads_the_fraction_or_keeps_the_default();
         the_shared_adapter_directory_is_read_and_an_empty_one_is_off();
-        a_tuning_table_is_advisory_and_never_a_refusal();
+        a_tuning_table_is_refused_and_points_at_profiles();
+        the_profiles_directory_is_read_or_refused_by_name();
     }
 
     fn a_boot_document_that_says_nothing_about_this_engine_still_opens() {
@@ -179,10 +148,20 @@ mod tests {
         assert_eq!(read(""), None);
     }
 
-    fn a_tuning_table_is_advisory_and_never_a_refusal() {
-        assert!(open(b"[metal.tuning]\nsdpa_mma = false\n", nothing).is_ok());
-        assert!(open(b"[metal.tuning]\nqmm_min_batch = \"eight\"\n", nothing).is_ok());
-        assert!(open(b"[metal.tuning]\nqmm_min_batch = -3\n", nothing).is_ok());
-        assert!(open(b"[metal.tuning]\nno_such_knob = 1\n", nothing).is_ok());
+    fn a_tuning_table_is_refused_and_points_at_profiles() {
+        let Err(why) = open(b"[metal.tuning]\nsdpa_mma = false\n", nothing) else {
+            panic!("a [metal.tuning] table opened");
+        };
+        assert!(why.contains("profiles/metal/user"), "{why}");
+    }
+
+    fn the_profiles_directory_is_read_or_refused_by_name() {
+        let of = |src: &str| super::profiles(&src.parse::<toml::Table>().unwrap());
+        assert_eq!(of(""), Ok(None));
+        assert_eq!(
+            of("[metal]\nprofiles = \"/home/p/.pie/profiles\"\n"),
+            Ok(Some("/home/p/.pie/profiles".into()))
+        );
+        assert!(of("[metal]\nprofiles = 3\n").is_err());
     }
 }

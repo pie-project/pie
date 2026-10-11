@@ -62,6 +62,7 @@ fn load(artifact: &PathBuf) -> Shell {
         pages: (14) * (512) / (16),
         runahead: engine::runahead::Runahead::F1,
         gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
+        profiles: None,
         residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the drafting shell loads")

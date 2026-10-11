@@ -2,8 +2,9 @@
 
 //! A prompt long enough for the Neural Engine to take its share of every
 //! dense MLP and wide projection reads the same as the GPU alone reads it.
-//! The same 27B artifact is served twice: once with `PIE_ANE=off`, once
-//! with the Neural Engine on, waiting for its programs to compile; the
+//! The same 27B artifact is served twice: once under a profile that keeps
+//! every unit on the GPU, once under one that splits with the Neural Engine,
+//! waiting for its programs to compile; the
 //! second serve must actually hand MLPs and projections over, its readout
 //! must sit on the first's — the
 //! split is int8 activations and weights with fp16 sums, so a small gap is
@@ -69,7 +70,21 @@ fn ids() -> Vec<u32> {
         .collect()
 }
 
-fn boot(artifact: &PathBuf, name: &str) -> (Shell, poem::Trace) {
+/// A user profile directory whose file for this device holds `decisions`.
+fn profiles(decisions: &str) -> PathBuf {
+    let device = engine_metal::device::Context::bind().expect("a Metal device");
+    let dir = std::env::temp_dir().join(format!(
+        "pie-split-mlp-{}-{}",
+        std::process::id(),
+        decisions.len()
+    ));
+    let path = engine_metal::chip::user_path(&dir, device.name());
+    std::fs::create_dir_all(path.parent().expect("a parent")).expect("the directory");
+    std::fs::write(&path, format!("api = 1\n{decisions}")).expect("the profile");
+    dir
+}
+
+fn boot(artifact: &PathBuf, name: &str, profiles: PathBuf) -> (Shell, poem::Trace) {
     let deployment = poem_compiler::catalog::deployment(name).expect("the catalog ships the row");
     let trace = deployment.trace(Platform::Metal);
     let source = ztensor_compat::index(artifact).expect("the artifact opens");
@@ -91,6 +106,7 @@ fn boot(artifact: &PathBuf, name: &str) -> (Shell, poem::Trace) {
         pages: CONTEXT / 16,
         runahead: engine::runahead::Runahead::F1,
         gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
+        profiles: Some(profiles),
         residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the shell loads");
@@ -150,15 +166,14 @@ fn the_split_mlp_matches_the_gpu_alone() {
     assert_eq!(prompt.len(), ROWS, "the fixture holds the prompt");
     let next = [prompt[ROWS - 1]];
 
-    // The GPU alone. The switch is read at load, and the whole model is
+    // The GPU alone. The profile is read at load, and the whole model is
     // dropped before the second load so the box holds one at a time.
-    // SAFETY: this test is the process's only thread reading the variable.
-    unsafe { std::env::set_var("PIE_ANE", "off") };
+    let gpu = profiles("[kernel]\nane.mlp = \"gpu\"\nane.projections = \"gpu\"\n");
     let whole = {
-        let (mut shell, trace) = boot(&artifact, &name);
+        let (mut shell, trace) = boot(&artifact, &name, gpu);
         assert!(
             shell.neural_engine().is_none(),
-            "`PIE_ANE=off` keeps the Neural Engine out of the load"
+            "a profile that keeps both on the GPU keeps the Neural Engine out of the load"
         );
         shell.open(0).expect("the slot opens");
         let _warm = fire(&mut shell, &trace, &prompt);
@@ -167,9 +182,12 @@ fn the_split_mlp_matches_the_gpu_alone() {
     };
 
     // The split.
-    // SAFETY: as above.
-    unsafe { std::env::set_var("PIE_ANE", "on") };
-    let (mut shell, trace) = boot(&artifact, &name);
+    let split = profiles(
+        "[target]\nassumes = { ane = true }\n[kernel]\n\
+         ane.mlp = { use = \"share\", percent = 47 }\n\
+         ane.projections = { use = \"share\", percent = 47 }\n",
+    );
+    let (mut shell, trace) = boot(&artifact, &name, split);
     let ane = shell
         .neural_engine()
         .expect("the Neural Engine is set up for the 27B's dense MLPs");

@@ -15,6 +15,7 @@ pub mod api;
 pub mod arena;
 pub mod blob;
 pub mod boot;
+pub mod chip;
 pub mod device;
 pub mod diag;
 mod dispatch;

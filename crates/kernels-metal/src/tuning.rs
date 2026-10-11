@@ -1,238 +1,254 @@
-use std::sync::OnceLock;
+//! Every hardware-dependent decision the Metal kernels read, declared for the
+//! Metal profile registry, and [`Tuning`]: the values one load runs under.
+//!
+//! A decision here is data a chip's profile sets; the formulas that use it
+//! stay in the kernels. Which chip runs which value lives in
+//! `crates/engine-metal/profiles/`, never in this crate.
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DeviceInfo {
-    pub apple_family: u32,
+use profile::{Decision, Profile, Registry};
 
-    pub gpu_core_count: u32,
-
-    /// Whether the device compiles Metal 4 shaders: the MPP kernels include its header, so
-    /// a family alone does not say they will build.
-    pub metal4: bool,
+/// How dense affine-quantised matmuls read prompt rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.qmm.path", default = "tiled")]
+pub enum QmmPath {
+    /// The tiled and split-k kernels, and the row-folded vector kernel below
+    /// them.
+    Tiled,
+    /// The Metal 4 tensor-op (MPP) kernel first, for the shapes it serves;
+    /// the tiled path for the rest.
+    Mpp,
 }
 
-impl DeviceInfo {
+/// The fewest rows a dense matmul over fp16-format weights takes the tiled
+/// kernel for; fewer take the vector kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.qmm.min_rows", constant(range(1..=4096)), default = 5)]
+pub struct QmmMinRows(pub u32);
+
+/// The same threshold for weights the tiled kernel dequantises in the loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.qmm.min_rows_emulated", constant(range(1..=4096)), default = 12)]
+pub struct QmmMinRowsEmulated(pub u32);
+
+/// Threadgroups a dense matmul must fill before a wider column tile or a
+/// coarser row fold pays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.qmm.crossover_tg", constant(range(1..=1_000_000)), default = 160)]
+pub struct QmmCrossoverTg(pub u32);
+
+/// Whether 4-bit, 64-group weights take the fp16 GEMM format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.qmm.fp16", flag, default = true)]
+pub struct QmmFp16;
+
+/// The most rows the vector kernel folds into one threadgroup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.qmv.rows_max", constant(range(1..=8)), default = 8)]
+pub struct QmvRowsMax(pub u32);
+
+/// Codes the row-folded vector kernel reads per load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.qmv.packs", constant(set(1, 2)), default = 1)]
+pub struct QmvPacks(pub u32);
+
+/// How routed (mixture-of-experts) matmuls read their sorted rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.path", default = "tiled")]
+pub enum MoePath {
+    Tiled,
+    /// The MPP kernel for the 4-bit, 64-group banks it serves.
+    Mpp,
+}
+
+/// The row tile a routed matmul sorts its pairs into, by pairs per expert;
+/// 1 leaves the pairs unsorted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(
+    id = "kernel.moe.tile_rows",
+    shape(per_expert: derived),
+    constant(set(1, 8, 16, 32, 64)),
+    default = r#"[{ when = "per_expert < 2", value = 1 }, { when = "per_expert >= 32", value = 32 }, { value = 16 }]"#
+)]
+pub struct MoeTileRows(pub u32);
+
+/// How prompt rows attend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.prefill", default = "tiled")]
+pub enum SdpaPrefill {
+    Tiled,
+    /// The MPP matmul for the shapes it serves, and the split paged kernel.
+    Mpp,
+}
+
+/// The fewest rows per request that take the tiled attention kernel; fewer
+/// take the vector kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.tile_rows_per_request", constant(range(1..=4096)), default = 32)]
+pub struct SdpaTileRowsPerRequest(pub u32);
+
+/// Whether 64-wide heads attend through the simdgroup-matrix kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.mma", flag, default = true)]
+pub struct SdpaMma;
+
+/// Whether attention reads keys and values through the 8-bit kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.kv_q8", flag, default = false)]
+pub struct SdpaKvQ8;
+
+/// The gated-delta recurrent scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gdn.scan", default = r#"{ use = "simd", rows = 4 }"#)]
+pub enum GdnScan {
+    /// 32 lanes a head, `rows` value rows a simdgroup.
+    Simd {
+        #[constant(set(1, 2, 4, 8), default = 4)]
+        rows: u32,
+    },
+    /// 8 lanes a head and 2 value rows, with the staged prompt kernel where
+    /// a head is 128 wide.
+    Staged,
+}
+
+/// Register every decision this crate reads.
+pub fn register(registry: &mut Registry) {
+    registry
+        .add::<QmmPath>()
+        .add::<QmmMinRows>()
+        .add::<QmmMinRowsEmulated>()
+        .add::<QmmCrossoverTg>()
+        .add::<QmmFp16>()
+        .add::<QmvRowsMax>()
+        .add::<QmvPacks>()
+        .add::<MoePath>()
+        .add::<MoeTileRows>()
+        .add::<SdpaPrefill>()
+        .add::<SdpaTileRowsPerRequest>()
+        .add::<SdpaMma>()
+        .add::<SdpaKvQ8>()
+        .add::<GdnScan>();
+}
+
+/// What one load's kernels run under: the device's resolved profile, and
+/// what the model asks of every load on any chip.
+#[derive(Clone, Debug)]
+pub struct Tuning {
+    profile: Profile,
+    wide_range: bool,
+}
+
+impl Tuning {
+    /// `wide_range` is the model's: a deployment whose activations leave the
+    /// fp16 range (diffusion latents) takes the wide tiled kernel and no fp16
+    /// GEMM format.
     #[must_use]
-    pub fn of_name(name: &str) -> Self {
-        let family = if name.contains("M1") {
-            7
-        } else if name.contains("M2") {
-            8
-        } else if name.contains("M3") || name.contains("M4") {
-            9
+    pub fn new(profile: Profile, wide_range: bool) -> Tuning {
+        Tuning {
+            profile,
+            wide_range,
+        }
+    }
+
+    #[must_use]
+    pub fn profile(&self) -> &Profile {
+        &self.profile
+    }
+
+    #[must_use]
+    pub fn wide_range(&self) -> bool {
+        self.wide_range
+    }
+
+    #[must_use]
+    pub fn qmm_mpp(&self) -> bool {
+        *self.profile.get::<QmmPath>() == QmmPath::Mpp
+    }
+
+    /// The fewest rows that take the tiled kernel, for weights in the fp16
+    /// GEMM format or not.
+    #[must_use]
+    pub fn qmm_min_rows(&self, fp16: bool) -> u32 {
+        if fp16 {
+            self.profile.get::<QmmMinRows>().0
         } else {
-            0
+            self.profile.get::<QmmMinRowsEmulated>().0
+        }
+    }
+
+    #[must_use]
+    pub fn qmm_crossover_tg(&self) -> u32 {
+        self.profile.get::<QmmCrossoverTg>().0
+    }
+
+    /// Whether a bank of `bits`-bit codes in `group`-wide groups takes the
+    /// fp16 GEMM format.
+    #[must_use]
+    pub fn fp16_gemm_format(&self, bits: u32, group: u32) -> bool {
+        !self.wide_range
+            && self.profile.on::<QmmFp16>(&profile::Anywhere)
+            && bits == 4
+            && group == 64
+    }
+
+    #[must_use]
+    pub fn qmv_rows_max(&self) -> u32 {
+        self.profile.get::<QmvRowsMax>().0
+    }
+
+    #[must_use]
+    pub fn qmv_packs(&self) -> u32 {
+        self.profile.get::<QmvPacks>().0
+    }
+
+    #[must_use]
+    pub fn moe_mpp(&self) -> bool {
+        *self.profile.get::<MoePath>() == MoePath::Mpp
+    }
+
+    /// The row tile `pairs` routed pairs over `experts` experts sort into;
+    /// 1 leaves them unsorted.
+    #[must_use]
+    pub fn moe_tile_rows(&self, pairs: u32, experts: u32) -> u32 {
+        if experts == 0 {
+            return 1;
+        }
+        let at = MoeTileRowsAt {
+            per_expert: i64::from(pairs / experts),
         };
-        Self {
-            apple_family: family,
-            gpu_core_count: 0,
-            metal4: false,
-        }
+        self.profile.pick::<MoeTileRows>(&at).0
     }
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeviceTuning {
-    pub qmm_min_batch: u32,
-
-    pub qmm_min_batch_moe: u32,
-
-    pub qmm_min_batch_emulated: u32,
-
-    pub qmm_bn_crossover_tg: u32,
-
-    pub moe_tile_mid_per: u32,
-
-    pub moe_tile_wide_per: u32,
-
-    pub qmm_wide_range: bool,
-
-    pub fp16_qmm: bool,
-
-    pub qmm_mpp: bool,
-
-    pub qmm_mpp_packed: bool,
-
-    pub sdpa_tile_min_rows_per_request: u32,
-
-    pub sdpa_mma: bool,
-    pub sdpa_mpp: bool,
-
-    pub gdn_scan_lanes: u32,
-
-    pub gdn_scan_rows: u32,
-
-    pub moe_batch_min_per_expert: u32,
-
-    pub moe_batch_min_pairs: u32,
-
-    pub qmv_rows_max: u32,
-
-    pub qmv_rows_packs: u32,
-
-    pub stream_rows_per_cut: u32,
-
-    /// The share of a split the Neural Engine takes, in percent.
-    pub ane_percent: u32,
-
-    /// Whether wide projections split with the Neural Engine; the MLPs do
-    /// either way.
-    pub ane_projections: bool,
-}
-
-impl Default for DeviceTuning {
-    fn default() -> Self {
-        Self {
-            qmm_min_batch: 5,
-            qmm_min_batch_moe: 8,
-            qmm_min_batch_emulated: 12,
-            qmm_bn_crossover_tg: 160,
-            moe_tile_mid_per: 32,
-            moe_tile_wide_per: 1 << 24,
-            qmm_wide_range: false,
-            fp16_qmm: true,
-            qmm_mpp: false,
-            qmm_mpp_packed: true,
-            sdpa_tile_min_rows_per_request: 32,
-            sdpa_mma: true,
-            sdpa_mpp: false,
-            gdn_scan_lanes: 32,
-            gdn_scan_rows: 4,
-            moe_batch_min_per_expert: 2,
-            moe_batch_min_pairs: 0,
-            qmv_rows_max: 8,
-            qmv_rows_packs: 1,
-            stream_rows_per_cut: 0,
-            ane_percent: 47,
-            ane_projections: true,
-        }
-    }
-}
-
-impl DeviceTuning {
-    #[must_use]
-    pub fn of(info: DeviceInfo) -> Self {
-        let mut t = Self::default();
-        match info.apple_family {
-            10 => {
-                t.qmm_mpp = true;
-                t.qmm_mpp_packed = false;
-                t.sdpa_mpp = true;
-                t.gdn_scan_lanes = 8;
-                t.gdn_scan_rows = 2;
-            }
-            9 => {
-                t.qmm_bn_crossover_tg = 96;
-            }
-            8 => {
-                t.qmm_min_batch = 8;
-                t.qmm_min_batch_moe = 12;
-                t.sdpa_mpp = true;
-            }
-            _ => {}
-        }
-        if !info.metal4 {
-            t.qmm_mpp = false;
-            t.sdpa_mpp = false;
-        }
-        t
+    /// Every row tile this profile can sort into, for sizing the stack.
+    pub fn moe_tiles(&self) -> impl Iterator<Item = u32> + '_ {
+        self.profile.ladder::<MoeTileRows>().values().map(|t| t.0)
     }
 
     #[must_use]
-    pub fn with(mut self, over: &Overrides) -> Self {
-        macro_rules! lay {
-            ($($field:ident),+ $(,)?) => {
-                $(if let Some(v) = over.$field { self.$field = v; })+
-            };
-        }
-        lay!(
-            qmm_min_batch,
-            qmm_min_batch_moe,
-            qmm_min_batch_emulated,
-            qmm_bn_crossover_tg,
-            moe_tile_mid_per,
-            moe_tile_wide_per,
-            qmm_wide_range,
-            fp16_qmm,
-            qmm_mpp,
-            qmm_mpp_packed,
-            sdpa_tile_min_rows_per_request,
-            sdpa_mma,
-            sdpa_mpp,
-            gdn_scan_lanes,
-            gdn_scan_rows,
-            moe_batch_min_per_expert,
-            moe_batch_min_pairs,
-            qmv_rows_max,
-            qmv_rows_packs,
-            stream_rows_per_cut,
-            ane_percent,
-            ane_projections,
-        );
-        self
+    pub fn sdpa_mpp(&self) -> bool {
+        *self.profile.get::<SdpaPrefill>() == SdpaPrefill::Mpp
     }
 
     #[must_use]
-    pub const fn qmm_min_batch(&self, routed: bool, fp16_gemm: bool) -> u32 {
-        if !fp16_gemm {
-            return self.qmm_min_batch_emulated;
-        }
-        if routed {
-            self.qmm_min_batch_moe
-        } else {
-            self.qmm_min_batch
-        }
+    pub fn sdpa_tile_rows_per_request(&self) -> u32 {
+        self.profile.get::<SdpaTileRowsPerRequest>().0
     }
 
     #[must_use]
-    pub const fn fp16_gemm_format(&self, bits: u32, group: u32) -> bool {
-        !self.qmm_wide_range && self.fp16_qmm && bits == 4 && group == 64
+    pub fn sdpa_mma(&self) -> bool {
+        self.profile.on::<SdpaMma>(&profile::Anywhere)
     }
-}
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Overrides {
-    pub qmm_min_batch: Option<u32>,
-    pub qmm_min_batch_moe: Option<u32>,
-    pub qmm_min_batch_emulated: Option<u32>,
-    pub qmm_bn_crossover_tg: Option<u32>,
-    pub moe_tile_mid_per: Option<u32>,
-    pub moe_tile_wide_per: Option<u32>,
-    pub qmm_wide_range: Option<bool>,
-    pub fp16_qmm: Option<bool>,
-    pub qmm_mpp: Option<bool>,
-    pub qmm_mpp_packed: Option<bool>,
-    pub sdpa_tile_min_rows_per_request: Option<u32>,
-    pub sdpa_mma: Option<bool>,
-    pub sdpa_mpp: Option<bool>,
-    pub gdn_scan_lanes: Option<u32>,
-    pub gdn_scan_rows: Option<u32>,
-    pub moe_batch_min_per_expert: Option<u32>,
-    pub moe_batch_min_pairs: Option<u32>,
-    pub qmv_rows_max: Option<u32>,
-    pub qmv_rows_packs: Option<u32>,
-    pub stream_rows_per_cut: Option<u32>,
-    pub ane_percent: Option<u32>,
-    pub ane_projections: Option<bool>,
-}
+    #[must_use]
+    pub fn kv_q8(&self) -> bool {
+        self.profile.on::<SdpaKvQ8>(&profile::Anywhere)
+    }
 
-static DEVICE: OnceLock<DeviceInfo> = OnceLock::new();
-static OVERRIDES: OnceLock<Overrides> = OnceLock::new();
-static RESOLVED: OnceLock<DeviceTuning> = OnceLock::new();
-
-pub fn describe(info: DeviceInfo) -> bool {
-    DEVICE.set(info).is_ok()
-}
-
-pub fn override_with(over: Overrides) -> bool {
-    OVERRIDES.set(over).is_ok()
-}
-
-#[must_use]
-pub fn current() -> DeviceTuning {
-    *RESOLVED.get_or_init(|| {
-        let info = DEVICE.get().copied().unwrap_or_default();
-        let over = OVERRIDES.get().copied().unwrap_or_default();
-        DeviceTuning::of(info).with(&over)
-    })
+    /// The gated-delta scan as `(lanes a head, value rows a simdgroup)`.
+    #[must_use]
+    pub fn gdn_scan(&self) -> (u32, u32) {
+        match *self.profile.get::<GdnScan>() {
+            GdnScan::Simd { rows } => (32, rows),
+            GdnScan::Staged => (8, 2),
+        }
+    }
 }

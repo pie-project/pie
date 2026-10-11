@@ -25,6 +25,7 @@ eta-exec = { path = "../eta-exec" }
 eta-compiler = { path = "../eta-compiler" }
 eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
 poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
+profile = { package = "pie-profile", path = "../profile" }
 checkpoint = { path = "../checkpoint" }
 
 libc = "0.2"

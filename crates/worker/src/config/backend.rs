@@ -68,7 +68,6 @@ pub struct MetalEngineOptions {
     pub max_state_slots: Option<u32>,
     pub gpu_mem_utilization: f64,
     pub diagnostics: Option<String>,
-    pub tuning: toml::Table,
     #[serde(skip)]
     pub device: String,
     #[serde(skip)]
@@ -86,7 +85,6 @@ impl Default for MetalEngineOptions {
             max_state_slots: None,
             gpu_mem_utilization: 0.90,
             diagnostics: None,
-            tuning: toml::Table::new(),
             device: "metal:0".to_string(),
             verbose: false,
         }
@@ -314,4 +312,27 @@ impl CudaNativeEngineOptions {
         }
         Ok(())
     }
+}
+
+/// Engine options that became device-profile decisions, by engine, with the
+/// profile id each moved to.
+const MOVED_TO_PROFILE: &[(&str, &str, &str)] = &[("metal", "tuning", "the kernel.* decisions")];
+
+/// Refuse an option a device profile now holds, naming where it went: a
+/// chip's tuning lives in `$PIE_HOME/profiles/<backend>/user/<device>.toml`.
+pub fn moved_to_profile(engine: &str, options: &toml::Table) -> Result<()> {
+    for (owner, key, id) in MOVED_TO_PROFILE {
+        if *owner == engine && options.contains_key(*key) {
+            anyhow::bail!(
+                "[engine] {key} is gone: it is the device profile's `{id}` now. State it \
+                 in $PIE_HOME/profiles/{}/user/<device>.toml",
+                if engine == "cuda_native" {
+                    "cuda"
+                } else {
+                    engine
+                }
+            );
+        }
+    }
+    Ok(())
 }

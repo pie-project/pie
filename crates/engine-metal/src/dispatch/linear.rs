@@ -93,6 +93,7 @@ impl Run<'_> {
         ane.before_columns(self.ctx(), plan, x)?;
         linear::quant::matmul_columns(
             self.ctx(),
+            self.tuning(),
             x,
             plan.view,
             out,
@@ -140,16 +141,26 @@ impl Run<'_> {
         let rows = self.capacity(act);
         linear::quant::matmul(
             self.ctx(),
+            self.tuning(),
             x,
             plan.split.gate,
             gate,
             scratch(),
             rows.min(self.capacity(packed)),
         )?;
-        linear::quant::matmul(self.ctx(), x, plan.split.up, plan.up_rows, scratch(), rows)?;
+        linear::quant::matmul(
+            self.ctx(),
+            self.tuning(),
+            x,
+            plan.split.up,
+            plan.up_rows,
+            scratch(),
+            rows,
+        )?;
         linear::mlp::swiglu_clamp_split(self.ctx(), gate, plan.up_rows, f32::MAX, h_gpu)?;
         linear::quant::matmul(
             self.ctx(),
+            self.tuning(),
             h_gpu,
             plan.split.down,
             out,
@@ -184,6 +195,7 @@ impl Run<'_> {
                     }
                     linear::quant::matmul(
                         self.ctx(),
+                        self.tuning(),
                         x,
                         bank,
                         self.tensor(*y),
@@ -204,6 +216,7 @@ impl Run<'_> {
             Linear::LmHead { act, w, y } => match self.banked(*w) {
                 Some(bank) => linear::quant::lm_head(
                     self.ctx(),
+                    self.tuning(),
                     self.tensor(*act),
                     bank,
                     self.tensor(*y),
@@ -470,7 +483,7 @@ impl Run<'_> {
                         self.experts(*routes),
                         scratch,
                         self.tensor(*y),
-                        &kernels_metal::tuning::current(),
+                        self.tuning(),
                     )?
                 {
                     return Ok(());
@@ -497,7 +510,7 @@ impl Run<'_> {
                         self.experts(*routes),
                         scratch,
                         self.tensor(*y),
-                        &kernels_metal::tuning::current(),
+                        self.tuning(),
                     )?
                 {
                     return Ok(());

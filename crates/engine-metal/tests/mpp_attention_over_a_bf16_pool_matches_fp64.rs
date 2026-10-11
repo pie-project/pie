@@ -45,10 +45,7 @@ fn mpp_attention_over_a_bf16_pool_matches_fp64() {
     }
     let handles = Handles::new();
     let pipes = Pipelines::new();
-    let tuning = kernels_metal::DeviceTuning {
-        sdpa_mpp: true,
-        ..Default::default()
-    };
+    let tuning = engine_metal::chip::tuning("[kernel]\nsdpa.prefill = \"mpp\"", false);
     // (head dim, rows, query heads, kv heads, requests, pages per request, first position)
     for (d, m, qh, kh, requests, np, base) in [
         (128usize, 35usize, 6usize, 2usize, 3usize, 3usize, 65usize),
@@ -90,6 +87,7 @@ fn mpp_attention_over_a_bf16_pool_matches_fp64() {
             page_size: page as i32,
             seq_stride: (kh * d) as u64,
             head_stride: d as u64,
+            q8: false,
         };
         // mode 0 is plain causal, 1 a sparse mask, 2 a mask that also admits later keys.
         for (window, mode) in [(None, 0u8), (Some(19u32), 1), (None, 1), (None, 2)] {

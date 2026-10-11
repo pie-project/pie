@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 dtype = { package = "pie-dtype", path = "../dtype" }
+profile = { package = "pie-profile", path = "../profile" }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2 = "0.6"

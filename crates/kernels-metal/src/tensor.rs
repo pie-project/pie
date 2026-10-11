@@ -57,6 +57,10 @@ pub struct KvPool {
     pub seq_stride: u64,
 
     pub head_stride: u64,
+
+    /// Whether attention reads this pool through the 8-bit kernels: the
+    /// load's `kernel.sdpa.kv_q8`.
+    pub q8: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

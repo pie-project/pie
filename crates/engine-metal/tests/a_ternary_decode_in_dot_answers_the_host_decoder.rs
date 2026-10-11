@@ -287,7 +287,16 @@ fn a_random_activation_answers_the_host_decoded_weights(
     };
     let frame = device.frame().expect("a frame");
     let sink = Sink::new(device, &frame, pipelines, handles);
-    quant::matmul(&sink, act, bank, y, scratch, mi.unsigned_abs()).expect("the dispatched launch");
+    quant::matmul(
+        &sink,
+        &engine_metal::chip::tuning("", false),
+        act,
+        bank,
+        y,
+        scratch,
+        mi.unsigned_abs(),
+    )
+    .expect("the dispatched launch");
     frame.commit().expect("commit");
     let yb = handles.read(hy, (m * n * 2) as u64).expect("read y");
 

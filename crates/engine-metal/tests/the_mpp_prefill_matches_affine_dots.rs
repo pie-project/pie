@@ -24,12 +24,7 @@ fn every_prefill_row_answers_an_exact_affine_reference() {
     let Ok(device) = Context::bind() else {
         return;
     };
-    assert!(kernels_metal::tuning::override_with(
-        kernels_metal::tuning::Overrides {
-            qmm_mpp: Some(true),
-            ..Default::default()
-        }
-    ));
+    let tuning = engine_metal::chip::tuning("[kernel]\nqmm.path = \"mpp\"", false);
     let handles = Handles::new();
     let pipelines = Pipelines::new();
     let mut checked = 0;
@@ -179,6 +174,7 @@ fn every_prefill_row_answers_an_exact_affine_reference() {
                 let sink = Sink::new(&device, &frame, &pipelines, &handles);
                 quant::matmul(
                     &sink,
+                    &tuning,
                     Tensor::new(ha, m, k, Dtype::Bf16),
                     bank,
                     Tensor::new(ho, m, n, Dtype::Bf16),

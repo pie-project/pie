@@ -633,6 +633,7 @@ fn tiled(
     sm_scale: f32,
     o: Tensor,
     lse: Option<Tensor>,
+    allow_mpp: bool,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, q.dtype, { Bf16 => () });
     debug_assert!(
@@ -648,18 +649,7 @@ fn tiled(
             mask_stride: plan.mask_stride,
         };
         return q8::attention(
-            ctx,
-            op,
-            q,
-            pool,
-            &decode,
-            window,
-            causal,
-            head_dim,
-            sm_scale,
-            o,
-            lse,
-            crate::tuning::current().sdpa_mpp,
+            ctx, op, q, pool, &decode, window, causal, head_dim, sm_scale, o, lse, allow_mpp,
         );
     }
     let shape = Paged::of(op, q, pool, window, causal, head_dim)?;
@@ -772,6 +762,7 @@ pub fn decode_lse(
 #[allow(clippy::too_many_arguments)]
 pub fn prefill(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     q: RaggedTensor,
     plan: &PrefillPlan,
     pool: &KvPool,
@@ -784,13 +775,26 @@ pub fn prefill(
     const OP: &str = "attention.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     tiled(
-        ctx, OP, q.data, pool, plan, plan.mask, window, true, head_dim, sm_scale, o, None,
+        ctx,
+        OP,
+        q.data,
+        pool,
+        plan,
+        plan.mask,
+        window,
+        true,
+        head_dim,
+        sm_scale,
+        o,
+        None,
+        tuning.sdpa_mpp(),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_lse(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     q: RaggedTensor,
     plan: &PrefillPlan,
     pool: &KvPool,
@@ -816,12 +820,14 @@ pub fn prefill_lse(
         sm_scale,
         o,
         Some(lse),
+        tuning.sdpa_mpp(),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn masked(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     q: RaggedTensor,
     plan: &PrefillPlan,
     mask: Tensor,
@@ -843,7 +849,19 @@ pub fn masked(
         ));
     }
     tiled(
-        ctx, OP, q.data, pool, plan, mask, window, causal, head_dim, sm_scale, o, None,
+        ctx,
+        OP,
+        q.data,
+        pool,
+        plan,
+        mask,
+        window,
+        causal,
+        head_dim,
+        sm_scale,
+        o,
+        None,
+        tuning.sdpa_mpp(),
     )
 }
 
@@ -1090,6 +1108,7 @@ mod tests {
             page_size: 16,
             seq_stride: u64::from(plane),
             head_stride: u64::from(HEAD_DIM),
+            q8: false,
         }
     }
 
@@ -1816,6 +1835,7 @@ pub mod mla {
                 page_size: 16,
                 seq_stride: u64::from(RANK),
                 head_stride: u64::from(RANK),
+                q8: false,
             }
         }
 
@@ -2278,6 +2298,7 @@ pub mod index {
                 page_size: 16,
                 seq_stride: u64::from(DIM),
                 head_stride: u64::from(DIM),
+                q8: false,
             }
         }
 

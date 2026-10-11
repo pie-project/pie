@@ -79,14 +79,12 @@ fn compare(want: &[f32], got: &[f32]) -> (f64, f64) {
 
 #[test]
 fn the_scans_agree() {
-    if std::env::var("PIE_GDN_PACKED").as_deref() == Ok("1") {
-        let over = kernels_metal::tuning::Overrides {
-            gdn_scan_lanes: Some(8),
-            gdn_scan_rows: Some(2),
-            ..Default::default()
-        };
-        assert!(kernels_metal::tuning::override_with(over));
-    }
+    // `PIE_GDN_PACKED=1` runs the staged scan, as an Apple10 profile picks.
+    let tuning = if std::env::var("PIE_GDN_PACKED").as_deref() == Ok("1") {
+        engine_metal::chip::tuning("[kernel]\ngdn.scan = \"staged\"", false)
+    } else {
+        engine_metal::chip::tuning("", false)
+    };
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;
@@ -234,6 +232,7 @@ fn the_scans_agree() {
         run(&|sink| {
             ssm::gated_delta_committed(
                 sink,
+                &tuning,
                 qkv,
                 indptr,
                 &committed(slot, commit),
@@ -263,6 +262,7 @@ fn the_scans_agree() {
             run(&|sink| {
                 ssm::gated_delta(
                     sink,
+                    &tuning,
                     q,
                     q,
                     g,
@@ -281,6 +281,7 @@ fn the_scans_agree() {
     run(&|sink| {
         ssm::gated_delta_chunked(
             sink,
+            &tuning,
             RaggedTensor { data: qkv, indptr },
             qkv,
             gates,

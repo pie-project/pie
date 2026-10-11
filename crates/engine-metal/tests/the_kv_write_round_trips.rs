@@ -305,6 +305,7 @@ fn write_case(rig: &mut Rig, head_dim: usize) {
         page_size: PAGE_SIZE as i32,
         seq_stride: width,
         head_stride: head_dim as u64,
+        q8: false,
     };
     let kt = Tensor::new(hk, TOKENS as u32, width as u32, Dtype::Bf16);
     let vt = Tensor::new(hv, TOKENS as u32, width as u32, Dtype::Bf16);

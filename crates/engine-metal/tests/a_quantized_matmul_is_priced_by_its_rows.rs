@@ -72,27 +72,12 @@ fn every_row_count_is_timed() {
         eprintln!("not asked: no Metal device");
         return;
     };
-    if let Ok(tuning) = std::env::var("PIE_QMM_TUNING") {
-        let mut over = kernels_metal::tuning::Overrides::default();
-        for pair in tuning.split(',').filter(|p| !p.trim().is_empty()) {
-            let (key, value) = pair.split_once('=').expect("key=value");
-            let value: u32 = value.trim().parse().expect("an integer knob");
-            match key.trim() {
-                "qmv_rows_packs" => over.qmv_rows_packs = Some(value),
-                "qmv_rows_max" => over.qmv_rows_max = Some(value),
-                "qmm_min_batch" => over.qmm_min_batch = Some(value),
-                "qmm_min_batch_moe" => over.qmm_min_batch_moe = Some(value),
-                "qmm_min_batch_emulated" => over.qmm_min_batch_emulated = Some(value),
-                "fp16_qmm" => over.fp16_qmm = Some(value != 0),
-                "qmm_bn_crossover_tg" => over.qmm_bn_crossover_tg = Some(value),
-                other => panic!("no knob named {other} here"),
-            }
-        }
-        assert!(
-            kernels_metal::tuning::override_with(over),
-            "the tuning is laid once"
-        );
-        eprintln!("tuning: {tuning}");
+    // `PIE_QMM_TUNING` lays profile decisions over the defaults, one
+    // `kernel.<id> = <value>` per comma: `kernel.qmv.rows_max = 4`.
+    let overrides = std::env::var("PIE_QMM_TUNING").unwrap_or_default();
+    let tuning = engine_metal::chip::tuning(&overrides.replace(',', "\n"), false);
+    if !overrides.is_empty() {
+        eprintln!("tuning: {overrides}");
     }
 
     let rows = list("PIE_QMM_ROWS", "1,2,3,4,6,8,16");
@@ -219,7 +204,8 @@ fn every_row_count_is_timed() {
             let launch = |sink: &dyn Encode| {
                 if split == 0 {
                     let scratch = quant::Scratch { precast, partials };
-                    return quant::matmul(sink, act, bank, y, scratch, cap).expect("the launch");
+                    return quant::matmul(sink, &tuning, act, bank, y, scratch, cap)
+                        .expect("the launch");
                 }
                 let (bm, padded) = split_block(m);
                 let (bm_i, padded_i, n_i, k_i, split_i) = (

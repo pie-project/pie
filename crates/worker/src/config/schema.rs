@@ -255,15 +255,6 @@ mod tests {
                 engine.as_str()
             );
         }
-        let tuning: Vec<String> = keys(EngineKind::Metal)
-            .into_iter()
-            .filter(|k| k.ends_with(".tuning"))
-            .collect();
-        assert_eq!(
-            tuning.len(),
-            1,
-            "metal lists its tuning table once: {tuning:?}"
-        );
     }
 
     fn schema_covers_exactly_the_settable_keys() {

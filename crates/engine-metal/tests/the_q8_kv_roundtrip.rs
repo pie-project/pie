@@ -34,26 +34,13 @@ fn f32s(v: &[u8]) -> Vec<f32> {
 }
 #[test]
 fn stored_q8_and_all_attention_routes_match_fp64() {
-    if std::env::var("PIE_METAL_KV_Q8").as_deref() != Ok("1") {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "stored_q8_and_all_attention_routes_match_fp64",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env("PIE_METAL_KV_Q8", "1")
-            .status()
-            .unwrap();
-        assert!(status.success(), "isolated Q8 integration test failed");
-        return;
-    }
-    assert!(kernels_metal::tuning::override_with(
-        kernels_metal::tuning::Overrides {
-            sdpa_mpp: Some(std::env::var("PIE_TEST_MPP").as_deref() == Ok("1")),
-            ..Default::default()
-        }
-    ));
+    // The pool is read through the 8-bit kernels by its own flag, so this
+    // runs in-process; `PIE_TEST_MPP=1` lets prompt rows take the MPP kernel.
+    let tuning = if std::env::var("PIE_TEST_MPP").as_deref() == Ok("1") {
+        engine_metal::chip::tuning("[kernel]\nsdpa.prefill = \"mpp\"", false)
+    } else {
+        engine_metal::chip::tuning("", false)
+    };
     let dev = Context::bind().unwrap();
     let handles = Handles::new();
     let pipes = Pipelines::new();
@@ -125,6 +112,7 @@ fn stored_q8_and_all_attention_routes_match_fp64() {
             page_size: page as i32,
             seq_stride: (kh * d) as u64,
             head_stride: d as u64,
+            q8: true,
         };
         let frame = dev.frame().unwrap();
         attn::kv_append(
@@ -294,10 +282,8 @@ fn stored_q8_and_all_attention_routes_match_fp64() {
                 } else if route == 0 {
                     attn::decode(&sink, qt, &plan, &pool, window, d as u32, scale, yt).unwrap();
                 } else if route == 1 {
-                    let tuning = kernels_metal::DeviceTuning {
-                        sdpa_mpp: true,
-                        ..Default::default()
-                    };
+                    let tuning =
+                        engine_metal::chip::tuning("[kernel]\nsdpa.prefill = \"mpp\"", false);
                     attn::arbiter::masked(
                         &sink,
                         RaggedTensor {
@@ -319,6 +305,7 @@ fn stored_q8_and_all_attention_routes_match_fp64() {
                 } else if route == 3 {
                     attn::prefill(
                         &sink,
+                        &tuning,
                         RaggedTensor {
                             data: qt,
                             indptr: tensor(&qp, 2, 1, Dtype::I32),

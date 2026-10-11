@@ -205,7 +205,7 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
     let mut pools = Pools::reserve(&rig.device, &trace, paging, &facts).expect("reserve packed KV");
     let seats = seats(rig);
     let table = pools
-        .table(&rig.handles, &seats)
+        .table(&rig.handles, &seats, false)
         .expect("bind plane handles");
     let CachePool::Kv(pool_planes) = table.0[0] else {
         panic!("the one cache row is a KV pool");

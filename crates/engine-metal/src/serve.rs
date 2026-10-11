@@ -59,6 +59,9 @@ pub struct Boot<'a> {
     /// `[metal] gpu_mem_utilization`: the share of the device's working set
     /// this load may wire.
     pub gpu_mem_utilization: f64,
+    /// `$PIE_HOME/profiles`, where a user's device profiles live; `None`
+    /// reads only the checked-in ones.
+    pub profiles: Option<std::path::PathBuf>,
 }
 
 const PATCH_ROUTE_DROP: i32 = -1;
@@ -247,6 +250,10 @@ pub struct FireCost {
 }
 
 pub struct Shell {
+    /// The chip's profile for this load, with what the model asks of it.
+    tuning: kernels_metal::Tuning,
+    /// How that profile was resolved, for doctor.
+    chip_report: profile::Report,
     device: Context,
     keepalive: Option<crate::keepalive::KeepAlive>,
     pipelines: Pipelines,
@@ -324,7 +331,9 @@ pub struct Shell {
 
 impl Shell {
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
-        if boot.trace.values.iter().any(|decl| {
+        // A diffusion or conditioning deployment carries activations past the
+        // fp16 range on every chip: the model's to say, not the profile's.
+        let wide_range = boot.trace.values.iter().any(|decl| {
             matches!(
                 &decl.def,
                 poem_ir::Def::Input(
@@ -334,28 +343,30 @@ impl Shell {
                         | RuntimeInput::Voxels { .. }
                 )
             )
-        }) {
-            kernels_metal::tuning::override_with(kernels_metal::tuning::Overrides {
-                qmm_wide_range: Some(true),
-                ..Default::default()
-            });
-        }
+        });
+        let device = Context::bind()?;
+        let measured =
+            crate::chip::facts(device.family(), device.cores(), crate::chip::ane_loads());
+        let (chip, chip_report) =
+            crate::chip::resolve(device.name(), &measured, boot.profiles.as_deref());
+        crate::chip::tell_untuned(device.name(), &chip_report);
+        let tuning = kernels_metal::Tuning::new(chip.clone(), wide_range);
         let boot = Boot {
-            trace: poem_compiler::fuse::fuse(boot.trace, &crate::FUSED),
+            trace: poem_compiler::fuse::fuse(
+                boot.trace,
+                &poem_compiler::fuse::flags::kernels(&chip),
+            ),
             ..boot
         };
-        let device = Context::bind()?;
         let keepalive = if crate::keepalive::KeepAlive::wanted() {
             Some(crate::keepalive::KeepAlive::start(&device)?)
         } else {
             None
         };
 
-        let profile = boot.profile.unwrap_or(DeviceProfile {
-            sms: device.cores(),
-            side_streams: 0,
-            ..DeviceProfile::default()
-        });
+        let profile = boot
+            .profile
+            .unwrap_or_else(|| DeviceProfile::of(&chip, device.cores(), &[], &[]));
         let budgets = {
             let base = match boot.patches.clone() {
                 None => Budgets::of(boot.budget.clone()),
@@ -450,7 +461,10 @@ impl Shell {
                 let routes = region
                     .checked_sub(1)
                     .and_then(|router| cuts.get(router).copied().flatten());
-                let stated = kernels_metal::tuning::current().stream_rows_per_cut;
+                let stated = match *chip.get::<crate::chip::StreamCut>() {
+                    crate::chip::StreamCut::FanOut => 0,
+                    crate::chip::StreamCut::Fixed { rows } => rows,
+                };
                 match (routes, slots) {
                     (Some(_), slots) if slots > 0 && stated > 0 => stated,
                     (Some(routes), slots) if slots > 0 => {
@@ -514,12 +528,18 @@ impl Shell {
         )?;
         weights.decode_absorbed(&device, &handles, &boot.trace)?;
         weights.relabel_conv_weights(&device, &handles, &boot.trace)?;
-        weights.repack_mpp(&device, &handles, &boot.trace)?;
-        let ane =
-            crate::ane::load(&device, &handles, &boot.trace, &weights).unwrap_or_else(|why| {
-                eprintln!("PIE_ANE: staying on the GPU: {why}");
+        weights.repack_mpp(
+            &device,
+            &handles,
+            &boot.trace,
+            *chip.get::<crate::chip::WeightsLayout>(),
+        )?;
+        let ane = crate::ane::load(&device, &handles, &boot.trace, &weights, &chip).unwrap_or_else(
+            |why| {
+                eprintln!("the Neural Engine stays out of this load: {why}");
                 None
-            });
+            },
+        );
         handles.seal();
 
         {
@@ -578,6 +598,7 @@ impl Shell {
             &compiled,
             &budgets,
             paging,
+            &tuning,
         )?;
         let spaces = boot
             .trace
@@ -930,6 +951,8 @@ impl Shell {
             false => None,
         };
         Ok(Shell {
+            tuning,
+            chip_report,
             device,
             keepalive,
             pipelines: Pipelines::new(),
@@ -1099,6 +1122,18 @@ impl Shell {
     #[must_use]
     pub fn cores(&self) -> u32 {
         self.device.cores()
+    }
+
+    /// The chip profile and model facts this load's kernels run under.
+    #[must_use]
+    pub fn tuning(&self) -> &kernels_metal::Tuning {
+        &self.tuning
+    }
+
+    /// How this load's chip profile was resolved.
+    #[must_use]
+    pub fn chip_report(&self) -> &profile::Report {
+        &self.chip_report
     }
 
     #[must_use]
@@ -3372,6 +3407,7 @@ impl Shell {
         let caches = self.pools.table(
             &self.handles,
             &self.inputs[arm].seats(&self.handles, &bound, pages, rows, lane_count),
+            self.tuning.kv_q8(),
         )?;
 
         let mut geometry = Vec::with_capacity(self.spaces);
@@ -3738,6 +3774,7 @@ impl Shell {
                 &p.windows,
                 &place,
                 &self.scratch,
+                &self.tuning,
             )
             .with_ane(self.ane.as_ref().filter(|_| matches!(mode, Mode::Encode)));
             walk(
@@ -3831,6 +3868,7 @@ impl Shell {
                 &p.windows,
                 &place,
                 &self.scratch,
+                &self.tuning,
             );
             walk(
                 &self.trace,

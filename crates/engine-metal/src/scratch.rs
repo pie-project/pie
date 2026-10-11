@@ -129,6 +129,7 @@ impl Scratch {
         compiled: &CompiledModel,
         budgets: &Budgets,
         paging: Paging,
+        tuning: &kernels_metal::Tuning,
     ) -> Result<Scratch> {
         let budget = &budgets.tokens;
         let map = &compiled.arena;
@@ -143,7 +144,6 @@ impl Scratch {
         };
 
         let routers = routers(trace);
-        let tuning = kernels_metal::tuning::current();
 
         let mut dense: Vec<(u32, u32)> = Vec::new();
         let (mut act_rows, mut act_k) = (0u64, 0u64);
@@ -176,10 +176,10 @@ impl Scratch {
                     if experts == 0 {
                         continue;
                     }
-                    if moe::tile_rows(y.rows, experts, &tuning) <= 1 {
+                    if moe::tile_rows(y.rows, experts, tuning) <= 1 {
                         continue;
                     }
-                    let rows = moe::sorted_rows(y.rows, experts, &tuning);
+                    let rows = moe::sorted_rows(y.rows, experts, tuning);
                     sorted = sorted.max(u64::from(rows));
                     pairs = pairs.max(u64::from(y.rows));
                     routed_k = routed_k.max(u64::from(x.width));
@@ -199,11 +199,11 @@ impl Scratch {
                 let (Ok(n), Ok(k)) = (i32::try_from(n), i32::try_from(k)) else {
                     return false;
                 };
-                quant::splitk(n, 8, 8, k, 32, 4) > 1 || (tuning.qmm_mpp && n <= 65536)
+                quant::splitk(n, 8, 8, k, 32, 4) > 1 || (tuning.qmm_mpp() && n <= 65536)
             })
             .map(|&(n, _)| u64::from(n))
             .max()
-            .map(|n| split_partial_room(precast, n, tuning.qmm_mpp));
+            .map(|n| split_partial_room(precast, n, tuning.qmm_mpp()));
 
         let routed = (sorted > 0).then(|| {
             let mut at = 0u64;

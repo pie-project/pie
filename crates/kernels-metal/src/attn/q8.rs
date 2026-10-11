@@ -2,11 +2,9 @@ use super::{DecodePlan, Paged};
 use crate::encode::{Arg, Ctx, Fire, Grid, stated};
 use crate::{Error, KvPool, Tensor};
 use dtype::Dtype;
-use std::sync::OnceLock;
 
 pub fn enabled(pool: &KvPool, dim: u32) -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("PIE_METAL_KV_Q8").is_ok_and(|v| v == "1"))
+    pool.q8
         && matches!(dim, 64 | 128 | 256 | 512)
         && pool.keys.dtype == Dtype::Bf16
         && pool.values.dtype == Dtype::Bf16

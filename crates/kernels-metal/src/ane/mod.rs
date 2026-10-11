@@ -43,15 +43,6 @@ pub fn available() -> Result<(), String> {
     }
 }
 
-/// `PIE_ANE=0|off|false` keeps the Neural Engine out of every load.
-#[must_use]
-pub fn enabled() -> bool {
-    !matches!(
-        std::env::var("PIE_ANE").as_deref(),
-        Ok("0" | "off" | "false")
-    )
-}
-
 /// Where compiled programs are kept between runs.
 #[must_use]
 pub fn cache_directory() -> PathBuf {

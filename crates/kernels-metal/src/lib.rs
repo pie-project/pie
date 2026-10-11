@@ -29,4 +29,4 @@ pub use encode::{
 pub use error::Error;
 pub use sources::{SOURCES, resolve, source};
 pub use tensor::{Bank, KvPool, RaggedTensor, RecurrentPool, Tensor};
-pub use tuning::{DeviceInfo, DeviceTuning};
+pub use tuning::Tuning;

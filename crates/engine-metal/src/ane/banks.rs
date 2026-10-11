@@ -99,11 +99,6 @@ pub fn projections(
     weights: &crate::weights::Weights,
 ) -> Vec<((u32, u32), Vec<Projection>)> {
     let mut groups: Vec<((u32, u32), Vec<Projection>)> = Vec::new();
-    // `[metal.tuning] ane_projections = false` keeps every projection on the
-    // GPU; the MLPs still split.
-    if !kernels_metal::tuning::current().ane_projections {
-        return groups;
-    }
     for node in &trace.nodes {
         let poem_ir::Operation::Linear(poem_ir::Linear::Matmul { w, .. }) = &node.op else {
             continue;

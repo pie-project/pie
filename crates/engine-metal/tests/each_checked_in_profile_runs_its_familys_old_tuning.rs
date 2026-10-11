@@ -1,0 +1,181 @@
+//! The bridge from per-family tuning to per-chip profiles: every checked-in
+//! profile resolves to exactly what `DeviceTuning::of(family)` gave that
+//! chip before profiles existed. The table below is that function, frozen.
+
+use engine_metal::chip::{self, AneMlp, AneProjections, StreamCut, WeightsLayout};
+use kernels_metal::Tuning;
+use profile::Source;
+
+/// What `DeviceTuning::of` returned for a family on a Metal 4 device.
+struct Old {
+    qmm_min_batch: u32,
+    qmm_min_batch_emulated: u32,
+    qmm_bn_crossover_tg: u32,
+    qmm_mpp: bool,
+    sdpa_mpp: bool,
+    gdn_scan: (u32, u32),
+}
+
+fn old(family: u32) -> Old {
+    let mut t = Old {
+        qmm_min_batch: 5,
+        qmm_min_batch_emulated: 12,
+        qmm_bn_crossover_tg: 160,
+        qmm_mpp: false,
+        sdpa_mpp: false,
+        gdn_scan: (32, 4),
+    };
+    match family {
+        10 => {
+            t.qmm_mpp = true;
+            t.sdpa_mpp = true;
+            t.gdn_scan = (8, 2);
+        }
+        9 => t.qmm_bn_crossover_tg = 96,
+        8 => {
+            t.qmm_min_batch = 8;
+            t.sdpa_mpp = true;
+        }
+        _ => {}
+    }
+    t
+}
+
+/// The old routed tile choice: `moe_batch_min_per_expert` 2, no pair floor,
+/// `moe_tile_mid_per` 32, `moe_tile_wide_per` never.
+fn old_tile(pairs: u32, experts: u32) -> u32 {
+    if experts == 0 || pairs < experts * 2 {
+        return 1;
+    }
+    let per = pairs / experts;
+    if per >= 32 {
+        32
+    } else if per >= 1 {
+        16
+    } else {
+        8
+    }
+}
+
+fn family_of(device: &str) -> u32 {
+    match device.split_whitespace().nth(1) {
+        Some(m) if m.starts_with("M1") => 7,
+        Some(m) if m.starts_with("M2") => 8,
+        Some(m) if m.starts_with("M3") || m.starts_with("M4") => 9,
+        Some(m) if m.starts_with("M5") => 10,
+        other => panic!("no family for {other:?}"),
+    }
+}
+
+#[test]
+fn each_checked_in_profile_runs_its_familys_old_tuning() {
+    assert_eq!(chip::SEEDED.len(), 18);
+    for (name, text) in chip::SEEDED {
+        let device = chip::registry()
+            .parse(text, name, profile::Strict::CheckedIn)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .target
+            .device
+            .expect("named");
+        let family = family_of(&device);
+        let (profile, report) = chip::resolve(&device, &chip::facts(family, 10, true), None);
+        assert_eq!(report.used, Source::Seeded((*name).to_string()), "{device}");
+        let t = Tuning::new(profile.clone(), false);
+        let o = old(family);
+        assert_eq!(t.qmm_min_rows(true), o.qmm_min_batch, "{device}");
+        assert_eq!(t.qmm_min_rows(false), o.qmm_min_batch_emulated, "{device}");
+        assert_eq!(t.qmm_crossover_tg(), o.qmm_bn_crossover_tg, "{device}");
+        assert!(
+            t.fp16_gemm_format(4, 64) && !t.fp16_gemm_format(4, 32),
+            "{device}"
+        );
+        assert_eq!(t.qmm_mpp(), o.qmm_mpp, "{device}");
+        assert_eq!(
+            t.moe_mpp(),
+            o.qmm_mpp,
+            "{device}: the routed matmul followed the dense flag"
+        );
+        assert_eq!(t.sdpa_mpp(), o.sdpa_mpp, "{device}");
+        assert_eq!(t.sdpa_tile_rows_per_request(), 32, "{device}");
+        assert!(t.sdpa_mma() && !t.kv_q8(), "{device}");
+        assert_eq!(t.gdn_scan(), o.gdn_scan, "{device}");
+        assert_eq!((t.qmv_rows_max(), t.qmv_packs()), (8, 1), "{device}");
+        for experts in [1, 8, 64, 128, 256] {
+            for pairs in [0, 1, 7, 8, 64, 255, 256, 2048, 4096, 8191, 8192, 65_536] {
+                assert_eq!(
+                    t.moe_tile_rows(pairs, experts),
+                    old_tile(pairs, experts),
+                    "{device}: {pairs} pairs over {experts} experts"
+                );
+            }
+        }
+        let mlp = if o.qmm_mpp {
+            AneMlp::Units { units: 8 }
+        } else {
+            AneMlp::Share { percent: 47 }
+        };
+        assert_eq!(*profile.get::<AneMlp>(), mlp, "{device}");
+        assert_eq!(
+            *profile.get::<AneProjections>(),
+            AneProjections::Share { percent: 47 }
+        );
+        assert_eq!(
+            *profile.get::<WeightsLayout>(),
+            WeightsLayout::Plain,
+            "{device}: no family repacked"
+        );
+        assert_eq!(*profile.get::<StreamCut>(), StreamCut::FanOut);
+        assert_eq!(
+            poem_compiler::DeviceProfile::of(&profile, 10, &[], &[]),
+            poem_compiler::DeviceProfile {
+                sms: 10,
+                side_streams: 0,
+                ..poem_compiler::DeviceProfile::default()
+            },
+            "{device}: the compiler's prices Metal stated at load"
+        );
+        assert_eq!(
+            poem_compiler::fuse::flags::kernels(&profile),
+            ["elementwise.residual_add_rmsnorm", "linear.mlp_swiglu"],
+            "{device}: the fusions Metal shipped"
+        );
+    }
+}
+
+#[test]
+fn a_wide_range_model_leaves_the_fp16_format_on_any_chip() {
+    let (profile, _) = chip::resolve("Apple M4 Max", &chip::facts(9, 40, true), None);
+    let wide = Tuning::new(profile, true);
+    assert!(!wide.fp16_gemm_format(4, 64));
+    assert_eq!(wide.qmm_min_rows(wide.fp16_gemm_format(4, 64)), 12);
+}
+
+#[test]
+fn a_mac_whose_bridge_does_not_load_runs_the_defaults_whole() {
+    let (profile, report) = chip::resolve("Apple M5 Max", &chip::facts(10, 40, false), None);
+    assert_eq!(report.used, Source::Defaults);
+    assert!(
+        report.rejected[0].1.contains("ane"),
+        "{:?}",
+        report.rejected
+    );
+    let t = Tuning::new(profile.clone(), false);
+    assert!(
+        !t.qmm_mpp() && !t.sdpa_mpp(),
+        "not one rung of the M5 file applies"
+    );
+    assert_eq!(*profile.get::<AneMlp>(), AneMlp::Gpu);
+}
+
+#[test]
+fn a_profile_for_another_family_is_refused() {
+    let (_, report) = chip::resolve("Apple M4 Max", &chip::facts(10, 40, true), None);
+    assert_eq!(report.used, Source::Defaults);
+    assert!(
+        report.rejected[0]
+            .1
+            .contains("it assumes family = 9, and this device has 10"),
+        "{:?}",
+        report.rejected
+    );
+}

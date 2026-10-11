@@ -29,11 +29,20 @@ fn every_routed_row_answers_its_experts_exact_affine_reference() {
     }
     let handles = Handles::new();
     let pipelines = Pipelines::new();
-    let tuning = kernels_metal::DeviceTuning {
-        qmm_mpp: true,
-        moe_batch_min_pairs: 1,
-        ..Default::default()
-    };
+    // Every pair count sorts, so a lone pair per expert still takes the
+    // 8-row tile.
+    let tuning = engine_metal::chip::tuning(
+        r#"
+[kernel]
+moe.path = "mpp"
+moe.tile_rows = [
+  { when = "per_expert >= 32", value = 32 },
+  { when = "per_expert >= 1", value = 16 },
+  { value = 8 },
+]
+"#,
+        false,
+    );
     let mut checked = 0;
     // (experts, tokens, fan-out, K, N): row tiles of 16, 32 and 8.
     let cases = [

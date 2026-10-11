@@ -274,6 +274,7 @@ fn run(what: &str, artifact: &Path, residency: Plan, prompt: &[u32]) -> Option<R
         pages: (4) * (512) / (16),
         runahead: engine::runahead::Runahead::F1,
         gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
+        profiles: None,
         residency,
     });
     let mut shell = match shell {

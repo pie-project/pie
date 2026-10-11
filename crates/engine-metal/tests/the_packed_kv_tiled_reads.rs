@@ -295,6 +295,7 @@ fn pool_over(rig: &mut Rig, keys: u32, values: u32, dtype: Dtype, head_dim: usiz
         page_size: PAGE_SIZE as i32,
         seq_stride: width as u64,
         head_stride: head_dim as u64,
+        q8: false,
     }
 }
 
@@ -409,6 +410,7 @@ fn read_over(rig: &Rig, pool: &KvPool, op: Op, f: &Fires) -> (Vec<f32>, Option<V
         Op::Prefill => {
             attn::prefill(
                 s,
+                &engine_metal::chip::tuning("", false),
                 qrag,
                 &plan_open,
                 pool,
@@ -423,6 +425,7 @@ fn read_over(rig: &Rig, pool: &KvPool, op: Op, f: &Fires) -> (Vec<f32>, Option<V
         Op::Masked => {
             attn::masked(
                 s,
+                &engine_metal::chip::tuning("", false),
                 qrag,
                 &plan_keep,
                 f.keep_mask,
@@ -438,6 +441,7 @@ fn read_over(rig: &Rig, pool: &KvPool, op: Op, f: &Fires) -> (Vec<f32>, Option<V
         Op::PrefillLse => {
             attn::prefill_lse(
                 s,
+                &engine_metal::chip::tuning("", false),
                 qrag,
                 &plan_open,
                 pool,

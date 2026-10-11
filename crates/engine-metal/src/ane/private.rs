@@ -4,6 +4,7 @@
 //! staged, and its program, compiled off the serving thread. All sites
 //! share one hand-off and one status flag.
 
+use crate::chip::{AneMlp, AneProjections};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -128,29 +129,23 @@ fn target(
     })
 }
 
-/// The share of a split the Neural Engine takes, in percent: `[metal.tuning]
-/// ane_percent`, 47 unstated. The two engines must finish together: on an M-series box
-/// without MPP serving Qwen3.6-27B at 640 rows, 16 of the MLP's 34 units
-/// was the floor of a curve that rose on both sides (14: +5%, 18: +8%,
-/// 8: +19%), and the projections split at the same share land a 640-row
-/// prefill in 3.44 s against the GPU's 5.51 s alone.
-fn percent() -> u32 {
-    kernels_metal::tuning::current().ane_percent
+/// How many 512-wide units of `all` the Neural Engine takes at `percent`.
+/// The two engines must finish together: on an M-series box without MPP
+/// serving Qwen3.6-27B at 640 rows, 16 of the MLP's 34 units (47%) was the
+/// floor of a curve that rose on both sides (14: +5%, 18: +8%, 8: +19%),
+/// and the projections split at the same share land a 640-row prefill in
+/// 3.44 s against the GPU's 5.51 s alone.
+fn share(all: u32, percent: u32) -> u32 {
+    ((all * percent + 50) / 100).clamp(1, all.saturating_sub(1).max(1))
 }
 
-/// How many 512-wide units of `all` the Neural Engine takes.
-fn share(all: u32) -> u32 {
-    ((all * percent() + 50) / 100).clamp(1, all.saturating_sub(1).max(1))
-}
-
-/// The MLP's units: eight where the GPU reads prompts through MPP, else
-/// the share.
-fn mlp_units(intermediate: u32) -> u32 {
+/// The MLP's units under the profile's split.
+fn mlp_units(intermediate: u32, split: AneMlp) -> u32 {
     let all = intermediate / ffn::UNIT;
-    if kernels_metal::tuning::current().qmm_mpp {
-        8.clamp(1, all.saturating_sub(1).max(1))
-    } else {
-        share(all)
+    match split {
+        AneMlp::Units { units } => units.clamp(1, all.saturating_sub(1).max(1)),
+        AneMlp::Share { percent } => share(all, percent),
+        AneMlp::Gpu => unreachable!("an MLP site is built only where the profile splits"),
     }
 }
 
@@ -169,11 +164,12 @@ fn mlp_site(
     handles: &Handles,
     common: &Common,
     mlps: &[Mlp],
+    split: AneMlp,
     keep: &mut Vec<Buffer>,
     keys: &mut BTreeMap<u32, Key>,
 ) -> Result<Option<MlpSite>> {
     let (hidden, intermediate) = (mlps[0].gate_up.codes.width, mlps[0].intermediate);
-    let Ok(shape) = Shape::new(hidden, intermediate, mlp_units(intermediate)) else {
+    let Ok(shape) = Shape::new(hidden, intermediate, mlp_units(intermediate, split)) else {
         return Ok(None);
     };
     let memory = Arc::new(Memory::new(&shape).map_err(fault)?);
@@ -246,7 +242,7 @@ fn mlp_site(
         );
     }
     eprintln!(
-        "PIE_ANE: {} MLP layers split, Neural Engine takes {} of {intermediate} columns",
+        "ane: {} MLP layers split, Neural Engine takes {} of {intermediate} columns",
         layers.len(),
         shape.ane
     );
@@ -271,10 +267,11 @@ fn projection_site(
     index: usize,
     (k, n): (u32, u32),
     projections: &[banks::Projection],
+    percent: u32,
     keep: &mut Vec<Buffer>,
     keys: &mut BTreeMap<u32, Key>,
 ) -> Result<Option<ProjectionSite>> {
-    let Ok(shape) = linear::Shape::new(k, n, share(n / ffn::UNIT)) else {
+    let Ok(shape) = linear::Shape::new(k, n, share(n / ffn::UNIT, percent)) else {
         return Ok(None);
     };
     let memory = Arc::new(linear::Memory::new(&shape).map_err(fault)?);
@@ -326,7 +323,7 @@ fn projection_site(
         );
     }
     eprintln!(
-        "PIE_ANE: {} projections of {k} -> {n} split, Neural Engine takes {} columns",
+        "ane: {} projections of {k} -> {n} split, Neural Engine takes {} columns",
         layers.len(),
         shape.ane
     );
@@ -356,11 +353,11 @@ impl Job {
                 let result = Ffn::compile(&shape, &memory, cache);
                 match &result {
                     Ok(_) => eprintln!(
-                        "PIE_ANE: Neural Engine MLP program ready in {:.1}s",
+                        "ane: Neural Engine MLP program ready in {:.1}s",
                         started.elapsed().as_secs_f64()
                     ),
                     Err(why) => eprintln!(
-                        "PIE_ANE: the Neural Engine MLP program did not compile ({why}); the GPU runs the MLP alone"
+                        "ane: the Neural Engine MLP program did not compile ({why}); the GPU runs the MLP alone"
                     ),
                 }
                 let _ = slot.set(result);
@@ -369,13 +366,13 @@ impl Job {
                 let result = linear::Linear::compile(&shape, &memory, cache);
                 match &result {
                     Ok(_) => eprintln!(
-                        "PIE_ANE: Neural Engine {} -> {} program ready in {:.1}s",
+                        "ane: Neural Engine {} -> {} program ready in {:.1}s",
                         shape.k,
                         shape.n,
                         started.elapsed().as_secs_f64()
                     ),
                     Err(why) => eprintln!(
-                        "PIE_ANE: the Neural Engine {} -> {} program did not compile ({why}); the GPU runs it alone",
+                        "ane: the Neural Engine {} -> {} program did not compile ({why}); the GPU runs it alone",
                         shape.k, shape.n
                     ),
                 }
@@ -390,6 +387,8 @@ pub fn load(
     handles: &Handles,
     mlps: &[Mlp],
     projections: &[((u32, u32), Vec<banks::Projection>)],
+    mlp_split: AneMlp,
+    projection_split: AneProjections,
 ) -> Result<Option<Private>> {
     use objc2_metal::MTLDevice;
     let mut keep = Vec::new();
@@ -411,13 +410,19 @@ pub fn load(
     let mlp = if mlps.is_empty() {
         None
     } else {
-        mlp_site(device, handles, &common, mlps, &mut keep, &mut keys)?
+        mlp_site(
+            device, handles, &common, mlps, mlp_split, &mut keep, &mut keys,
+        )?
     };
     let mut sites = Vec::new();
+    let percent = match projection_split {
+        AneProjections::Share { percent } => percent,
+        AneProjections::Gpu => 0,
+    };
     for (shape, group) in projections {
         let index = sites.len();
         if let Some(site) = projection_site(
-            device, handles, &common, index, *shape, group, &mut keep, &mut keys,
+            device, handles, &common, index, *shape, group, percent, &mut keep, &mut keys,
         )? {
             sites.push(site);
         }

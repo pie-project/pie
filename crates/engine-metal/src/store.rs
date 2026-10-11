@@ -524,7 +524,9 @@ impl Pools {
             .map_or(0, |arena| elastic::pages_for_bytes(arena.budget().total))
     }
 
-    pub fn table(&self, handles: &Handles, seats: &Seats) -> Result<CacheTable> {
+    /// The cache table one fire binds; `q8` reads every kv pool through the
+    /// 8-bit attention kernels (the profile's `kernel.sdpa.kv_q8`).
+    pub fn table(&self, handles: &Handles, seats: &Seats, q8: bool) -> Result<CacheTable> {
         let mut rows = Vec::with_capacity(self.shapes.len());
         for shape in &self.shapes {
             rows.push(match *shape {
@@ -564,6 +566,7 @@ impl Pools {
                         page_size: narrow(u64::from(self.paging.page_size)),
                         seq_stride: u64::from(kv_heads) * u64::from(head_dim),
                         head_stride: u64::from(head_dim),
+                        q8,
                     })
                 }
                 Shape::State {

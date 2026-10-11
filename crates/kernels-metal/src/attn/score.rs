@@ -220,6 +220,7 @@ mod tests {
             page_size: 16,
             seq_stride: u64::from(kv_heads) * u64::from(head_dim),
             head_stride: u64::from(head_dim),
+            q8: false,
         }
     }
 

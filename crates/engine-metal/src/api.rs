@@ -33,6 +33,8 @@ pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, S
 pub struct DeviceBoot {
     pub gpu_mem_utilization: f64,
     pub adapter_dir: Option<std::path::PathBuf>,
+    /// `$PIE_HOME/profiles`, where a user's device profiles live.
+    pub profiles: Option<std::path::PathBuf>,
 }
 
 impl Default for DeviceBoot {
@@ -40,6 +42,7 @@ impl Default for DeviceBoot {
         DeviceBoot {
             gpu_mem_utilization: crate::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
             adapter_dir: None,
+            profiles: None,
         }
     }
 }
@@ -503,6 +506,7 @@ impl Engine for Metal {
             runahead: engine::runahead::Runahead::of(frames_in_flight),
             residency: residency_plan,
             gpu_mem_utilization: self.boot.gpu_mem_utilization,
+            profiles: self.boot.profiles.clone(),
         })
         .map_err(fault)?;
 

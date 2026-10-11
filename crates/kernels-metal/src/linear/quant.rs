@@ -3,6 +3,7 @@ use std::sync::{Mutex, OnceLock};
 
 use dtype::Dtype;
 
+use crate::Tuning;
 use crate::error::Error;
 
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, refuse, stated};
@@ -28,8 +29,8 @@ const QMM_STAMP: &str = "PIE_STAMP_qmm_t";
 
 const QMM_WIDE_STAMP: &str = "PIE_STAMP_qmm_t_wide";
 
-fn tiled_form() -> (&'static str, &'static str) {
-    if crate::tuning::current().qmm_wide_range {
+fn tiled_form(wide_range: bool) -> (&'static str, &'static str) {
+    if wide_range {
         ("_wide", QMM_WIDE_STAMP)
     } else {
         ("", QMM_STAMP)
@@ -132,7 +133,7 @@ fn qmv_rungs_at(packs: i32, bits: i32) -> &'static [i32] {
 const QMV_PACK_RUNGS: [i32; 2] = [1, 2];
 
 #[must_use]
-pub fn composed() -> Vec<Fire> {
+pub fn composed(wide_range: bool) -> Vec<Fire> {
     let mut out = Vec::new();
     for &gs in &GROUPS {
         for &b in &WIDTHS {
@@ -147,7 +148,7 @@ pub fn composed() -> Vec<Fire> {
             }
             for &bm in &ROW_TILES {
                 for &bn in &TILES {
-                    let (form, stamp) = tiled_form();
+                    let (form, stamp) = tiled_form(wide_range);
                     let point = qmm_point("quant.qmm_t", form, stamp, gs, b, bm, bn)
                         .expect("an axis point, by construction");
                     out.push(Fire::at(QMM_FILE, point.entry).stamp(point.stamp));
@@ -509,20 +510,32 @@ pub struct Scratch<'a> {
 
 pub fn matmul(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     act: Tensor,
     w: Bank,
     y: Tensor,
     scratch: Scratch<'_>,
     capacity_rows: u32,
 ) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.matmul", act, w, y, scratch, capacity_rows)
+    act_x_wt(
+        ctx,
+        tuning,
+        "linear.matmul",
+        act,
+        w,
+        y,
+        scratch,
+        capacity_rows,
+    )
 }
 
 /// The leading `columns` columns of `act x w^T`, landed in place in `y`,
 /// whose width is the row stride: the rest of each row is left alone, for
 /// another engine to fill. `w` holds at least `columns` rows.
+#[allow(clippy::too_many_arguments)]
 pub fn matmul_columns(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     act: Tensor,
     w: Bank,
     y: Tensor,
@@ -532,6 +545,7 @@ pub fn matmul_columns(
 ) -> Result<(), Error> {
     act_x_wt_over(
         ctx,
+        tuning,
         "linear.matmul",
         act,
         w,
@@ -544,18 +558,29 @@ pub fn matmul_columns(
 
 pub fn lm_head(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     act: Tensor,
     w: Bank,
     y: Tensor,
     scratch: Scratch<'_>,
     capacity_rows: u32,
 ) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.lm_head", act, w, y, scratch, capacity_rows)
+    act_x_wt(
+        ctx,
+        tuning,
+        "linear.lm_head",
+        act,
+        w,
+        y,
+        scratch,
+        capacity_rows,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn act_x_wt(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     op: &'static str,
     act: Tensor,
     w: Bank,
@@ -563,7 +588,7 @@ pub fn act_x_wt(
     scratch: Scratch<'_>,
     capacity_rows: u32,
 ) -> Result<(), Error> {
-    act_x_wt_over(ctx, op, act, w, y, None, scratch, capacity_rows)
+    act_x_wt_over(ctx, tuning, op, act, w, y, None, scratch, capacity_rows)
 }
 
 /// `act x w^T` over `y`'s leading `columns` (every column when `None`), at
@@ -571,6 +596,7 @@ pub fn act_x_wt(
 #[allow(clippy::too_many_arguments)]
 fn act_x_wt_over(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     op: &'static str,
     act: Tensor,
     w: Bank,
@@ -650,7 +676,6 @@ fn act_x_wt_over(
         ));
     }
     let ld = stated(op, w.ld)?;
-    let tuned = crate::tuning::current();
     let bm = match rows {
         1..=8 => 8,
         9..=16 => 16,
@@ -658,7 +683,7 @@ fn act_x_wt_over(
         _ => 32,
     };
     let bn = if bm == 8 { 64 } else { 128 };
-    if tuned.qmm_mpp
+    if tuning.qmm_mpp()
         && columns == stride
         && bits == 4
         && group == 64
@@ -777,13 +802,13 @@ fn act_x_wt_over(
             return Ok(());
         }
     }
-    let fp16 = tuned.fp16_gemm_format(w.bits, w.group);
+    let fp16 = tuning.fp16_gemm_format(w.bits, w.group);
     let min_batch = if bits == 2 {
         QMM_MIN_BATCH_2BIT
     } else {
-        i32::try_from(tuned.qmm_min_batch(false, fp16)).unwrap_or(i32::MAX)
+        i32::try_from(tuning.qmm_min_rows(fp16)).unwrap_or(i32::MAX)
     };
-    let crossover = i32::try_from(tuned.qmm_bn_crossover_tg).unwrap_or(i32::MAX);
+    let crossover = i32::try_from(tuning.qmm_crossover_tg()).unwrap_or(i32::MAX);
     let capacity = i32::try_from(capacity_rows).unwrap_or(i32::MAX);
     let fold_widest = *QMV_ROW_RUNGS.last().expect("a rung");
     let tile_fills = |padded: i32, bm: i32| {
@@ -893,7 +918,7 @@ fn act_x_wt_over(
             );
         }
         if let Some(bn) = bn_unsplit(cols, padded / bm, crossover) {
-            let (form, stamp) = tiled_form();
+            let (form, stamp) = tiled_form(tuning.wide_range());
             let point = qmm_point(op, form, stamp, group, bits, bm, bn)?;
             let mut tiled = vec![
                 w.codes.arg(),
@@ -919,8 +944,8 @@ fn act_x_wt_over(
             );
         }
     }
-    let rows_max = i32::try_from(tuned.qmv_rows_max).unwrap_or(1);
-    let packs = i32::try_from(tuned.qmv_rows_packs).unwrap_or(QMV_PACK_RUNGS[1]);
+    let rows_max = i32::try_from(tuning.qmv_rows_max()).unwrap_or(1);
+    let packs = i32::try_from(tuning.qmv_packs()).unwrap_or(QMV_PACK_RUNGS[1]);
     if let Some(fold) = qmv_rows_fold(m, cols, rows_max, crossover, packs, bits) {
         let point = qmv_rows_point(op, group, bits, fold, packs)?;
         return ctx.fire(

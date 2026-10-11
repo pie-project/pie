@@ -48,7 +48,7 @@ fn family(device: &ProtocolObject<dyn MTLDevice>) -> u32 {
             return number;
         }
     }
-    kernels_metal::DeviceInfo::of_name(&device.name().to_string()).apple_family
+    0
 }
 
 #[cfg(target_vendor = "apple")]
@@ -70,6 +70,8 @@ pub struct Context {
     working_set: u64,
     max_buffer: u64,
     cores: u32,
+    /// The newest `MTLGPUFamily::AppleN` the device supports.
+    family: u32,
     /// The Metal 4 mapping side, opened on first use: most loads never map a
     /// tile, and a second command queue is a scheduler context in the
     /// driver. `None` inside once opened means the device is not Metal 4.
@@ -126,11 +128,7 @@ impl Context {
                 call: "IORegistryEntryCreateCFProperty",
                 why: format!("the IORegistry does not say how many GPU cores `{name}` has"),
             })?;
-            kernels_metal::tuning::describe(kernels_metal::DeviceInfo {
-                apple_family: family(&device),
-                gpu_core_count: cores,
-                metal4: true,
-            });
+            let family = family(&device);
             let working_set = device.recommendedMaxWorkingSetSize();
             let max_buffer = device.maxBufferLength() as u64;
             Ok(Context {
@@ -140,6 +138,7 @@ impl Context {
                 working_set,
                 max_buffer,
                 cores,
+                family,
                 sparse: std::cell::OnceCell::new(),
             })
         }
@@ -192,6 +191,11 @@ impl Context {
     #[must_use]
     pub fn cores(&self) -> u32 {
         self.cores
+    }
+
+    #[must_use]
+    pub fn family(&self) -> u32 {
+        self.family
     }
 
     pub fn bind_thread(&self) -> Result<()> {

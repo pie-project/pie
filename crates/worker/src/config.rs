@@ -895,6 +895,7 @@ pub struct EngineConfig {
 impl EngineConfig {
     fn validate(&self) -> Result<()> {
         ensure!(!self.device.is_empty(), "engine.device must be non-empty");
+        backend::moved_to_profile(self.kind.as_str(), &self.options)?;
         match self.kind {
             EngineKind::CudaNative => {
                 let opts: CudaNativeEngineOptions = toml::Value::Table(self.options.clone())

@@ -196,6 +196,7 @@ fn a_column_cut_of_a_bank_multiplies_as_its_copy() {
             let sink = Sink::new(&device, &frame, &pipelines, &handles);
             quant::matmul(
                 &sink,
+                &engine_metal::chip::tuning("", false),
                 act,
                 w,
                 y,
@@ -307,8 +308,25 @@ fn the_leading_output_columns_land_in_place() {
                 partials: &partials,
             };
             match columns {
-                None => quant::matmul(&sink, act, w, y, scratch, m.div_ceil(32) * 32),
-                Some(c) => quant::matmul_columns(&sink, act, w, y, c, scratch, m.div_ceil(32) * 32),
+                None => quant::matmul(
+                    &sink,
+                    &engine_metal::chip::tuning("", false),
+                    act,
+                    w,
+                    y,
+                    scratch,
+                    m.div_ceil(32) * 32,
+                ),
+                Some(c) => quant::matmul_columns(
+                    &sink,
+                    &engine_metal::chip::tuning("", false),
+                    act,
+                    w,
+                    y,
+                    c,
+                    scratch,
+                    m.div_ceil(32) * 32,
+                ),
             }
             .expect("the matmul launches");
             frame.commit().expect("the frame lands");
