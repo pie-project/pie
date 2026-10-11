@@ -426,6 +426,7 @@ impl Engine for Xla {
                 max_tokens: budgets.max_tokens,
                 max_page_refs: paging.pages_per_slot.saturating_mul(budgets.max_lanes),
                 max_context: paging.context(),
+                prefill_rows: 0,
             },
             profile,
             ports: PortMask::DEVICE_GEOMETRY

@@ -54,6 +54,9 @@ pub enum Ane {}
 
 #[cfg(not(target_vendor = "apple"))]
 impl Ane {
+    pub fn prefill_rows(&self) -> u32 {
+        match *self {}
+    }
     pub fn plan(&self, _: poem_ir::ValueId, _: u32) -> Option<Plan> {
         match *self {}
     }
