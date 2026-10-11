@@ -39,6 +39,16 @@ pub fn backends() -> Vec<Backend> {
         probe: engine_vulkan::chip::probe,
         resolve: engine_vulkan::chip::resolve_facts,
     });
+    #[cfg(feature = "xla")]
+    out.push(Backend {
+        name: "xla",
+        registry: engine_xla::chip::registry,
+        shelf: &engine_xla::chip::SHELF,
+        // Opening a PJRT client to read the device kind takes the device;
+        // name one with `--device`.
+        probe: || None,
+        resolve: |kind, _, profiles| engine_xla::chip::resolve(kind, profiles),
+    });
     #[cfg(feature = "metal")]
     out.push(Backend {
         name: "metal",

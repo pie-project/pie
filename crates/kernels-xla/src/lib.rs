@@ -10,6 +10,7 @@ pub mod mosaic;
 pub mod pack;
 pub mod spatial;
 pub mod tensor;
+pub mod tuning;
 
 pub use attn::{DecodePlan, PrefillPlan};
 pub use cx::{Ctx, Cx, Emit, Env, elem_of};

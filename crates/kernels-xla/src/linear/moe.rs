@@ -46,6 +46,7 @@ use crate::linear::quant::{
     Codes, code_values, e8m0, grouped_dot, materialize, offset_dot, read_codes,
 };
 use crate::tensor::{Bank, Tensor};
+use crate::tuning::Tuning;
 
 const MXFP4_BLOCK: u32 = 32;
 
@@ -734,16 +735,6 @@ const LOOP_ROW_NS: i64 = 10;
 const WHOLE_BYTES_PER_NS: i64 = 1_450;
 const WHOLE_PARTIAL_FS: i64 = 5_500;
 
-thread_local! {
-    /// Tiles the loop over active experts multiplies per step
-    /// (`PIE_XLA_MOE_UNROLL`, default 2).
-    static LOOP_UNROLL: i64 = std::env::var("PIE_XLA_MOE_UNROLL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&u: &i64| (1..=8).contains(&u))
-        .unwrap_or(2);
-}
-
 /// How an expert bank is stored. Every form is expert-major and flat:
 /// expert `e`, output row `n`, contracted column `k` sits at `(e*N + n)*K + k`
 /// (one scale/zero point per `group` codes of a row), however the engine
@@ -1080,7 +1071,7 @@ fn pick_small(cx: &mut Cx<'_>, table: Val, ids: Val) -> Result<Val, Error> {
 
 /// The grouped-matmul kernel (`crate::mosaic::gmm`) for this bank, when its
 /// weights are plain (bf16 or pre-scaled f8, no group factors) and a block
-/// of them fits VMEM. `PIE_XLA_MOE_GMM=0` turns it off.
+/// of them fits VMEM. A profile turns it off with `kernel.moe.gmm = false`.
 ///
 /// It reads each routed expert once, at the DMA rate (~1.4 TB/s), with no
 /// per-expert launch. vLLM-TPU's `gmm_v2` streams the same experts in the
@@ -1092,10 +1083,9 @@ fn pick_small(cx: &mut Cx<'_>, table: Val, ids: Val) -> Result<Val, Error> {
 /// Keep the XLA around the call free of gathers from short tables
 /// (`pick_small`) and of per-row column offsets: XLA lowers both to serial
 /// scalar code, which cost more than the kernel saved.
-fn gmm_spec(fan: Fan, bank: &Read, elem: Elem) -> Option<crate::mosaic::gmm::Gmm> {
+fn gmm_spec(fan: Fan, bank: &Read, elem: Elem, tuning: Tuning) -> Option<crate::mosaic::gmm::Gmm> {
     use crate::mosaic::gmm::{Gmm, Orient};
-    let off = std::env::var("PIE_XLA_MOE_GMM").is_ok_and(|v| v == "0")
-        && !std::env::var("PIE_XLA_MOE_PATH").is_ok_and(|v| v == "gmm");
+    let off = !tuning.moe_gmm && tuning.moe_path != Some("gmm");
     if off
         || bank.factor.is_some()
         || !matches!(bank.codes, Codes::Weights(_))
@@ -1256,6 +1246,7 @@ fn gmm(
 /// The routed matmul every select entry lowers to: `y[t*k + s] = W[routes[t,
 /// s]] · x_row (+ bias[e])`; a slot routed outside `0..experts` keeps `y`'s
 /// row as it was (the GPU kernels skip its store).
+#[allow(clippy::too_many_arguments)]
 fn routed(
     cx: &mut Cx<'_>,
     form: Form,
@@ -1264,6 +1255,7 @@ fn routed(
     routes: Val,
     bias: Option<Val>,
     prev: Val,
+    tuning: Tuning,
 ) -> Result<Val, Error> {
     let (p, e, n, k) = (fan.pairs(), fan.experts, fan.n, fan.k);
     let groups = k / i64::from(form.group());
@@ -1290,16 +1282,15 @@ fn routed(
     let expert_bytes = bank_bytes / e;
     // How many active experts (row tiles) the loop runs for less than the
     // whole bank, whose dot also lands a partial per row and expert.
-    let tile = loop_tile(fan);
+    let tile = loop_tile(fan, tuning);
     let whole_ns = bank_bytes / WHOLE_BYTES_PER_NS + r8 * e * n * WHOLE_PARTIAL_FS / 1_000_000;
     let tile_ns = (expert_bytes / 1_200).max(LOOP_TILE_NS + tile * LOOP_ROW_NS);
     let worth = whole_ns / tile_ns;
-    // `PIE_XLA_MOE_PATH=slice|loop|all|ragged|gmm` forces a formulation
-    // (tests reach each with small shapes; `gmm` falls back to `all` for a
-    // bank the kernel does not read).
-    let forced = std::env::var("PIE_XLA_MOE_PATH").ok();
-    let grouped = gmm_spec(fan, &bank, cx.elem(bank.codes.val()));
-    let path = match forced.as_deref() {
+    // A profile's `kernel.moe.path` forces a formulation (tests reach each
+    // with small shapes; `gmm` falls back to `all` for a bank the kernel
+    // does not read).
+    let grouped = gmm_spec(fan, &bank, cx.elem(bank.codes.val()), tuning);
+    let path = match tuning.moe_path {
         Some("gmm") if grouped.is_none() => "all",
         Some(path) => path,
         None if p <= SLICE_PAIRS && p * expert_bytes.max(SLICE_BYTES) < bank_bytes => "slice",
@@ -1332,8 +1323,8 @@ fn routed(
             None => every_expert(cx, &bank, fan, x, ids, groups)?,
         },
         "loop" => {
-            let plan = plan_active(cx, fan, x, r, valid)?;
-            run_active(cx, &plan, &bank, fan, groups, None)?
+            let plan = plan_active(cx, fan, x, r, valid, tuning)?;
+            run_active(cx, &plan, &bank, fan, groups, None, tuning)?
         }
         "active" => {
             // The loop over the experts the fire routes to, unless more are
@@ -1341,10 +1332,10 @@ fn routed(
             // loops whose trip count the fire's routes decide (0 steps for
             // the one not taken); a `case` would copy the bank into its
             // branch (v6e: 3x the whole step).
-            let plan = plan_active(cx, fan, x, r, valid)?;
+            let plan = plan_active(cx, fan, x, r, valid, tuning)?;
             let most = cx.const_i(Elem::I32, worth, &[]);
             let many = cx.compare(Cmp::Gt, plan.steps, most)?;
-            let looped = run_active(cx, &plan, &bank, fan, groups, Some(many))?;
+            let looped = run_active(cx, &plan, &bank, fan, groups, Some(many), tuning)?;
             let zeros = cx.const_f(Elem::F32, 0.0, &[p, n]);
             let whole = cx.while_loop(
                 &[many, zeros],
@@ -1453,14 +1444,10 @@ fn every_expert(
 }
 
 /// The rows of one tile of the loop over active experts: the fire's tokens
-/// (a token routes to an expert once), at most 128 (`PIE_XLA_MOE_TILE`
-/// lowers the cap, for tuning).
-fn loop_tile(fan: Fan) -> i64 {
+/// (a token routes to an expert once), at most `kernel.moe.loop_tile_max`.
+fn loop_tile(fan: Fan, tuning: Tuning) -> i64 {
     let p = fan.pairs();
-    let most = std::env::var("PIE_XLA_MOE_TILE")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(128);
+    let most = tuning.moe_loop_tile_max;
     ((fan.tokens.max(1) + 7) / 8 * 8)
         .min(most)
         .min((p + 7) / 8 * 8)
@@ -1483,9 +1470,16 @@ struct Active {
 /// Sorts the pairs by expert (unrouted last) and cuts each expert's run
 /// into tiles of at most `tile` rows (a token routes to an expert once, so
 /// one tile per active expert unless a router repeats one).
-fn plan_active(cx: &mut Cx<'_>, fan: Fan, x: Val, r: Val, valid: Val) -> Result<Active, Error> {
+fn plan_active(
+    cx: &mut Cx<'_>,
+    fan: Fan,
+    x: Val,
+    r: Val,
+    valid: Val,
+    tuning: Tuning,
+) -> Result<Active, Error> {
     let (p, e) = (fan.pairs(), fan.experts);
-    let tile = loop_tile(fan);
+    let tile = loop_tile(fan, tuning);
     let top = cx.const_i(Elem::I32, e, &[p]);
     let key = cx.select(valid, r, top)?;
     let iota = cx.iota(Elem::I32, &[p], 0);
@@ -1556,12 +1550,13 @@ fn run_active(
     fan: Fan,
     groups: i64,
     skip: Option<Val>,
+    tuning: Tuning,
 ) -> Result<Val, Error> {
     let (p, n, k) = (fan.pairs(), fan.n, fan.k);
     let tile = plan.tile;
     let ys = cx.const_f(Elem::F32, 0.0, &[p + tile, n]);
     let j0 = cx.const_i(Elem::I32, 0, &[]);
-    let per = LOOP_UNROLL.with(|u| *u);
+    let per = tuning.moe_loop_unroll;
     let per_v = cx.const_i(Elem::I32, per, &[]);
     let more = cx.const_i(Elem::I32, per - 1, &[]);
     let steps = cx.add(plan.steps, more)?;
@@ -1717,6 +1712,7 @@ fn select_entry(
             ));
         }
     }
+    let tuning = ctx.tuning();
     ctx.emit(&mut |cx| {
         let xv = cx.read(x)?;
         let rv = cx.read(routes)?;
@@ -1725,7 +1721,7 @@ fn select_entry(
             None => None,
         };
         let prev = cx.read(y)?;
-        let out = routed(cx, form, fan, xv, rv, bv, prev)?;
+        let out = routed(cx, form, fan, xv, rv, bv, prev, tuning)?;
         cx.write(y, out)
     })
 }
@@ -1814,12 +1810,13 @@ pub fn matmul_grouped(
     };
     let (k, n) = (x.width / groups, y.width / groups);
     let fan = fan_of(OP, x.rows * groups, k, n, routes, form)?;
+    let tuning = ctx.tuning();
     ctx.emit(&mut |cx| {
         let xv = cx.read(x)?;
         let xv = cx.reshape(xv, &[fan.pairs(), fan.k])?;
         let rv = cx.read(routes)?;
         let prev = cx.read(y)?;
-        let out = routed(cx, form, fan, xv, rv, None, prev)?;
+        let out = routed(cx, form, fan, xv, rv, None, prev, tuning)?;
         cx.write(y, out)
     })
 }

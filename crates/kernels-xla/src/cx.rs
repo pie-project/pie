@@ -25,6 +25,12 @@ pub trait Emit {
     fn scope(&self, name: &str) {
         let _ = name;
     }
+
+    /// The kernel decisions of the load this sink emits for; the registry
+    /// defaults for a sink no load tuned.
+    fn tuning(&self) -> crate::tuning::Tuning {
+        crate::tuning::Tuning::DEFAULT
+    }
 }
 
 pub type Ctx<'a> = dyn Emit + 'a;

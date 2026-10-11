@@ -39,5 +39,11 @@ fn device_boot(doc: &toml::Table) -> DeviceBoot {
             .and_then(toml::Value::as_float)
             .filter(|f| f.is_finite() && *f > 0.0 && *f <= 1.0)
             .unwrap_or(DEFAULT_MEM_UTILIZATION),
+        profiles: t
+            .and_then(|t| t.get("profiles"))
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from),
     }
 }

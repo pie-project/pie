@@ -232,6 +232,10 @@ pub struct FireCost {
 /// Fields drop in order: every buffer (weights, pools) goes before the
 /// device whose client made it.
 pub struct Shell {
+    /// The TPU profile's kernel decisions this load runs under.
+    tuning: kernels_xla::tuning::Tuning,
+    /// How that profile was resolved, for doctor.
+    chip_report: profile::Report,
     handles: Handles,
     trace: Trace,
     compiled: CompiledModel,
@@ -361,6 +365,18 @@ fn lane_rung(n: u32) -> u32 {
 }
 
 impl Shell {
+    /// The TPU profile's kernel decisions this load runs under.
+    #[must_use]
+    pub fn tuning(&self) -> kernels_xla::tuning::Tuning {
+        self.tuning
+    }
+
+    /// How this load's TPU profile was resolved.
+    #[must_use]
+    pub fn chip_report(&self) -> &profile::Report {
+        &self.chip_report
+    }
+
     /// Loads with the voxel ladder derived from the plan (engine-cuda's
     /// defaults); [`Shell::load_with`] names one.
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
@@ -393,8 +409,17 @@ impl Shell {
         voxels: Option<poem_compiler::VoxelLadder>,
         device: Device,
     ) -> Result<Shell> {
+        let (chip, chip_report) =
+            crate::chip::resolve(device.kind(), boot.device.profiles.as_deref());
+        if !device.kind().is_empty() {
+            crate::chip::SHELF.tell_untuned(device.kind(), &chip_report);
+        }
+        let tuning = kernels_xla::tuning::Tuning::of(&chip);
         let boot = Boot {
-            trace: poem_compiler::fuse::fuse(boot.trace, &crate::FUSED),
+            trace: poem_compiler::fuse::fuse(
+                boot.trace,
+                &poem_compiler::fuse::flags::kernels(&chip),
+            ),
             ..boot
         };
         // The row ladder every fire is padded up to (powers of two to
@@ -677,6 +702,8 @@ impl Shell {
             crate::rows::readout_probe(&boot.trace),
         );
         Ok(Shell {
+            tuning,
+            chip_report,
             device,
             handles,
             trace: boot.trace,
@@ -2064,7 +2091,9 @@ impl Shell {
         lands: &[crate::dit::Land],
         pixels: Option<&crate::dit::PixelsSeat>,
     ) -> Result<(String, crate::trace::Signature, Vec<ValueId>)> {
-        let tracer = Tracer::new(&self.handles).with_pack(pack_len);
+        let tracer = Tracer::new(&self.handles)
+            .with_pack(pack_len)
+            .with_tuning(self.tuning);
         let place = At::new();
         crate::dit::land(&tracer, &self.handles, slots, lands)?;
         let probed = {

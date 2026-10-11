@@ -1,0 +1,15 @@
+# TPU v6e ("TPU v6 lite" to PJRT). Every decision the XLA registry declares.
+api = 1
+
+[target]
+device = "TPU v6 lite"
+
+[provenance]
+source   = "the MoE formulation and loop shape measured on v6e for gpt-oss-20b, carried over"
+measured = true
+
+[kernel]
+moe.path          = "auto"
+moe.gmm           = true
+moe.loop_unroll   = 2
+moe.loop_tile_max = 128

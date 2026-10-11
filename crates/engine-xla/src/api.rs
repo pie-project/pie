@@ -54,6 +54,9 @@ pub struct DeviceBoot {
 
     /// The fraction of device memory this engine plans against.
     pub mem_utilization: f64,
+
+    /// `$PIE_HOME/profiles`, where a user's TPU profiles live.
+    pub profiles: Option<PathBuf>,
 }
 
 impl Default for DeviceBoot {
@@ -62,6 +65,7 @@ impl Default for DeviceBoot {
             plugin: None,
             ordinal: 0,
             mem_utilization: crate::boot::DEFAULT_MEM_UTILIZATION,
+            profiles: None,
         }
     }
 }

@@ -615,11 +615,10 @@ fn e5m2_data(n: usize, seed: u32) -> Vec<f32> {
 /// 128-lane blocks and in per-expert element windows (N not whole lane
 /// tiles: gpt-oss's down bank), and a row-major bank; e5m2 and bf16
 /// weights, per-token and per-pair rows, experts with more rows than a
-/// tile, unrouted pairs, a bias. `PIE_XLA_MOE_GMM=0` or another forced
-/// path checks the same cases on the XLA paths.
+/// tile, unrouted pairs, a bias. The default profile takes the kernel;
+/// a profile forcing another `kernel.moe.path` checks the XLA paths.
 #[test]
 fn the_grouped_matmul_kernel_answers_the_host() {
-    let forced = std::env::var("PIE_XLA_MOE_PATH").ok();
     // (experts, N, K, weights e5m2): K 160 is not whole lane tiles, so the
     // TPU lays the [E·N, K] bank E·N-minor.
     for (e, n, k, f8) in [
@@ -689,13 +688,10 @@ fn the_grouped_matmul_kernel_answers_the_host() {
             if !run.unwrap_or_else(|err| panic!("{err}\n{}", b.last_module)) {
                 return;
             }
-            let off = std::env::var("PIE_XLA_MOE_GMM").is_ok_and(|v| v == "0");
-            if forced.as_deref() == Some("gmm") || (forced.is_none() && !off) {
-                assert!(
-                    b.last_module.contains("tpu_custom_call"),
-                    "the kernel ran for {e}x{n}x{k}"
-                );
-            }
+            assert!(
+                b.last_module.contains("tpu_custom_call"),
+                "the kernel ran for {e}x{n}x{k}"
+            );
             let want = select_ref(
                 &w,
                 e,

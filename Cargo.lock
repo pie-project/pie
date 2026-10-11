@@ -1972,6 +1972,7 @@ dependencies = [
  "pie-poem-compiler",
  "pie-poem-exec",
  "pie-poem-ir",
+ "pie-profile",
  "prost",
  "serde_json",
  "tokenizer",
@@ -3196,6 +3197,7 @@ name = "kernels-xla"
 version = "0.5.4"
 dependencies = [
  "pie-dtype",
+ "pie-profile",
 ]
 
 [[package]]

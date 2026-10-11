@@ -37,9 +37,19 @@ fn bf16s(xs: &[f32]) -> Vec<u8> {
 }
 
 /// Host arrays in their landed form, run through one module.
-#[derive(Default)]
 struct Native {
     planes: Vec<(Dtype, u32, u32, Vec<u8>)>,
+    /// The kernel decisions the trace emits under.
+    tuning: kernels_xla::tuning::Tuning,
+}
+
+impl Default for Native {
+    fn default() -> Native {
+        Native {
+            planes: Vec::new(),
+            tuning: kernels_xla::tuning::Tuning::DEFAULT,
+        }
+    }
 }
 
 impl Native {
@@ -70,6 +80,7 @@ impl Native {
             return false;
         };
         let tracer = Tracer {
+            tuning: self.tuning,
             func: RefCell::new(Func::new("main")),
             env: RefCell::new(Roots {
                 shapes: self.planes.iter().map(|p| (p.0, p.1, p.2)).collect(),
@@ -77,7 +88,7 @@ impl Native {
             }),
         };
         body(&tracer).unwrap_or_else(|e| panic!("{e}"));
-        let Tracer { func, env } = tracer;
+        let Tracer { func, env, .. } = tracer;
         let (func, env) = (func.into_inner(), env.into_inner());
         let written: Vec<u32> = env.written.iter().copied().collect();
         let results: Vec<Val> = written.iter().map(|b| env.current[b]).collect();
@@ -146,11 +157,16 @@ impl Env for Roots {
 }
 
 struct Tracer {
+    tuning: kernels_xla::tuning::Tuning,
     func: RefCell<Func>,
     env: RefCell<Roots>,
 }
 
 impl Emit for Tracer {
+    fn tuning(&self) -> kernels_xla::tuning::Tuning {
+        self.tuning
+    }
+
     fn emit(
         &self,
         body: &mut dyn FnMut(&mut Cx<'_>) -> Result<(), kernels_xla::Error>,
@@ -429,9 +445,13 @@ fn routed_banks_read_native_codes_and_prescaled_weights_every_way() {
         .collect();
     routes[1] = -1;
     for path in ["all", "slice", "ragged"] {
-        // SAFETY: only this test in this binary reads the variable.
-        unsafe { std::env::set_var("PIE_XLA_MOE_PATH", path) };
-        let mut nat = Native::default();
+        let mut nat = Native {
+            tuning: kernels_xla::tuning::Tuning {
+                moe_path: Some(path),
+                ..kernels_xla::tuning::Tuning::DEFAULT
+            },
+            ..Native::default()
+        };
         let xt = nat.bf16(t as u32, k as u32, &x);
         let rt = nat.add(
             Dtype::I32,
@@ -457,7 +477,6 @@ fn routed_banks_read_native_codes_and_prescaled_weights_every_way() {
             }
             Ok(())
         });
-        unsafe { std::env::remove_var("PIE_XLA_MOE_PATH") };
         if !ran {
             return;
         }

@@ -211,6 +211,8 @@ pub struct Signature {
 pub struct Tracer<'h> {
     handles: &'h Handles,
     state: RefCell<State>,
+    /// The kernel decisions of the load this traces for.
+    tuning: kernels_xla::tuning::Tuning,
 }
 
 /// Where the pack's own parameter is kept among the traced roots.
@@ -228,6 +230,7 @@ impl<'h> Tracer<'h> {
     #[must_use]
     pub fn new(handles: &'h Handles) -> Self {
         Self {
+            tuning: kernels_xla::tuning::Tuning::DEFAULT,
             handles,
             state: RefCell::new(State {
                 pack_len: 0,
@@ -237,6 +240,13 @@ impl<'h> Tracer<'h> {
                 written: BTreeMap::new(),
             }),
         }
+    }
+
+    /// The kernel decisions of the load this traces for.
+    #[must_use]
+    pub fn with_tuning(mut self, tuning: kernels_xla::tuning::Tuning) -> Self {
+        self.tuning = tuning;
+        self
     }
 
     /// Declares how long the fire's input pack is (see `Source::Packed`).
@@ -490,6 +500,10 @@ fn reinterpret(f: &mut Func, v: Val, root: Root, t: Tensor) -> Result<Val, kerne
 }
 
 impl Emit for Tracer<'_> {
+    fn tuning(&self) -> kernels_xla::tuning::Tuning {
+        self.tuning
+    }
+
     fn scope(&self, name: &str) {
         self.state.borrow_mut().func.set_scope(Some(name));
     }
