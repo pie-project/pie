@@ -384,7 +384,10 @@ jobs:
       - uses: actions/checkout@v7
       - run: nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv && df -h /workspace
       - run: cargo test -p engine-cuda --features cuda --no-run --all-targets
-      - run: cargo test -p engine-cuda --features cuda -- --ignored
+      # The device tests: kernels-cuda's compile only under its cuda feature,
+      # and engine-cuda's skip on a machine without a card. The ignored ones
+      # need imported artifacts and golden dumps this pod does not hold.
+      - run: cargo test -p engine-cuda -p kernels-cuda --features engine-cuda/cuda,kernels-cuda/cuda
       - run: bash scripts/ci/cuda-e2e.sh
       - name: no CUDA shared library is linked
         run: |
