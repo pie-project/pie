@@ -128,17 +128,14 @@ fn target(
     })
 }
 
-/// The share of a split the Neural Engine takes, in percent: `PIE_ANE_PERCENT`,
-/// else 47. The two engines must finish together: on an M-series box
+/// The share of a split the Neural Engine takes, in percent: `[metal.tuning]
+/// ane_percent`, 47 unstated. The two engines must finish together: on an M-series box
 /// without MPP serving Qwen3.6-27B at 640 rows, 16 of the MLP's 34 units
 /// was the floor of a curve that rose on both sides (14: +5%, 18: +8%,
 /// 8: +19%), and the projections split at the same share land a 640-row
 /// prefill in 3.44 s against the GPU's 5.51 s alone.
 fn percent() -> u32 {
-    std::env::var("PIE_ANE_PERCENT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(47)
+    kernels_metal::tuning::current().ane_percent
 }
 
 /// How many 512-wide units of `all` the Neural Engine takes.
