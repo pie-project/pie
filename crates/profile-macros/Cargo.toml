@@ -1,0 +1,20 @@
+[package]
+name = "pie-profile-macros"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "`#[derive(Decision)]` for pie-profile: one Rust type declares a device-profile decision, its variables, alternatives, constants and default."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "profile_macros"
+proc-macro = true
+
+[dependencies]
+syn = { version = "2.0", features = ["full"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+
+[lints]
+workspace = true

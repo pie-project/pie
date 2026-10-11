@@ -13,6 +13,8 @@ members = [
     "crates/waker",
     "crates/ids",
     "crates/dtype",
+    "crates/profile",
+    "crates/profile-macros",
 
     "crates/client-api",
     "crates/controller-api",
@@ -70,6 +72,8 @@ default-members = [
     "crates/waker",
     "crates/ids",
     "crates/dtype",
+    "crates/profile",
+    "crates/profile-macros",
     "crates/client-api",
     "crates/controller-api",
     "crates/worker-api",

@@ -1,0 +1,19 @@
+[package]
+name = "pie-profile"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Device profiles: the registry of hardware-dependent decisions a backend exposes, the `when` language, the TOML profile reader and its lints, and resolution from candidate files and probed facts. No GPU, no backend. Internal to pie."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "profile"
+path = "src/lib.rs"
+
+[dependencies]
+toml = { version = "1.1", default-features = false, features = ["parse", "std", "preserve_order"] }
+profile-macros = { package = "pie-profile-macros", path = "../profile-macros" }
+
+[lints]
+workspace = true

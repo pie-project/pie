@@ -4404,6 +4404,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "pie-profile"
+version = "0.5.4"
+dependencies = [
+ "pie-profile-macros",
+ "toml 1.1.4+spec-1.1.0",
+]
+
+[[package]]
+name = "pie-profile-macros"
+version = "0.5.4"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "pie-server-node"
 version = "0.5.4"
 dependencies = [
