@@ -8,6 +8,7 @@ use crate::error::Error;
 use crate::tensor::{Bank, Tensor};
 
 const QMM_FILE: &str = "quant/qmm_t.slang";
+const QMM_RT_FILE: &str = "quant/qmm_rt.slang";
 const QMV_FILE: &str = "quant/qmv.slang";
 
 const GROUPS: [i32; 3] = [32, 64, 128];
@@ -51,6 +52,9 @@ pub fn composed() -> Vec<Fire> {
                 QMV_FILE,
                 qmv_name("quant.qmv", "", gs, b).expect("an axis point"),
             ));
+            for bm in RT_ROW_TILES {
+                out.push(Fire::at(QMM_RT_FILE, qmm_rt_name(gs, b, bm)));
+            }
             for &bm in &ROW_TILES {
                 for &bn in &TILES {
                     out.push(Fire::at(
@@ -108,6 +112,14 @@ pub fn qmm_name(
     Ok(symbol(&format!(
         "affine_qmm_t_bf16_gs_{group}_b_{bits}_bm_{bm}_bn_{bn}"
     )))
+}
+
+/// The register-tiled point's row tiles; its column tile is 64.
+const RT_ROW_TILES: [i32; 2] = [32, 64];
+const RT_COLS: u32 = 64;
+
+fn qmm_rt_name(group: i32, bits: i32, bm: i32) -> &'static str {
+    symbol(&format!("affine_qmm_rt_bf16_gs_{group}_b_{bits}_bm_{bm}"))
 }
 
 pub fn qmm_precast_name(
@@ -409,6 +421,35 @@ pub fn act_x_wt(
                     1,
                 ],
                 [32, 4, 1],
+            )),
+            &[
+                w.codes.arg(),
+                w.scales.arg(),
+                biases.arg(),
+                act.arg(),
+                y.arg_mut(),
+                k.arg(),
+                n.arg(),
+                m.arg(),
+            ],
+        );
+    }
+    if tuned.qmm_register_tiles
+        && m >= min_batch
+        && k % QMM_BK == 0
+        && GROUPS.contains(&group)
+        && WIDTHS.contains(&bits)
+    {
+        let bm = if m > 32 { 64 } else { 32 };
+        let rows = (m as u32).div_ceil(bm as u32);
+        return ctx.fire(
+            Fire::at(QMM_RT_FILE, qmm_rt_name(group, bits, bm)).apply(Grid::of(
+                [
+                    (n as u32).div_ceil(RT_COLS) * (RT_COLS / 4),
+                    rows * (bm as u32 / 4),
+                    1,
+                ],
+                [RT_COLS / 4, bm as u32 / 4, 1],
             )),
             &[
                 w.codes.arg(),

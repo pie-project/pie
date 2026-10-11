@@ -6,6 +6,7 @@ pub enum Vendor {
     Amd,
     Intel,
     Apple,
+    Qualcomm,
     #[default]
     Other,
 }
@@ -33,6 +34,7 @@ impl DeviceInfo {
             0x1002 | 0x1022 => Vendor::Amd,
             0x8086 => Vendor::Intel,
             0x106b => Vendor::Apple,
+            0x5143 => Vendor::Qualcomm,
             _ => Vendor::Other,
         }
     }
@@ -73,6 +75,10 @@ pub struct DeviceTuning {
     pub sdpa_split_groups: u32,
 
     pub sdpa_split_min_keys: u32,
+
+    /// Batched quantized projections on the register-tiled point (a 4x4
+    /// block per invocation) rather than the plain tiled one.
+    pub qmm_register_tiles: bool,
 }
 
 impl Default for DeviceTuning {
@@ -95,6 +101,7 @@ impl Default for DeviceTuning {
             stream_rows_per_cut: 0,
             sdpa_split_groups: 128,
             sdpa_split_min_keys: 256,
+            qmm_register_tiles: false,
         }
     }
 }
@@ -109,6 +116,11 @@ impl DeviceTuning {
 
         if info.multiprocessors != 0 {
             t.sdpa_split_groups = info.multiprocessors;
+        }
+        // Adreno's workgroup memory is slow next to its ALUs: the plain tiled
+        // point runs a 64x1024x7168 projection at ~27 GFLOPS there.
+        if info.vendor == Vendor::Qualcomm {
+            t.qmm_register_tiles = true;
         }
         t
     }
@@ -138,6 +150,7 @@ impl DeviceTuning {
             stream_rows_per_cut,
             sdpa_split_groups,
             sdpa_split_min_keys,
+            qmm_register_tiles,
         );
         self
     }
@@ -179,6 +192,7 @@ pub struct Overrides {
     pub stream_rows_per_cut: Option<u32>,
     pub sdpa_split_groups: Option<u32>,
     pub sdpa_split_min_keys: Option<u32>,
+    pub qmm_register_tiles: Option<bool>,
 }
 
 static DEVICE: OnceLock<DeviceInfo> = OnceLock::new();

@@ -718,6 +718,7 @@ impl Context {
                 0x1002 => kernels_vulkan::tuning::Vendor::Amd,
                 0x8086 => kernels_vulkan::tuning::Vendor::Intel,
                 0x106B => kernels_vulkan::tuning::Vendor::Apple,
+                0x5143 => kernels_vulkan::tuning::Vendor::Qualcomm,
                 _ => kernels_vulkan::tuning::Vendor::Other,
             },
             subgroup_size: self.core.subgroup_size,
