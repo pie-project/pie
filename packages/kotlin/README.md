@@ -69,9 +69,9 @@ PIE_NATIVE_DIR=$PWD/../../target/release PIE_MODEL=<model.metal.zt> ./gradlew :s
 
 ## Limits
 
-- Not yet run on an Android device: the core cross-compiles and the Kotlin
-  layer runs end to end on a Mac, but the Vulkan engine is unproven on mobile
-  GPUs.
+- Run on one phone so far: a Galaxy S26 (Adreno 840, Android 16) boots the
+  4-bit Qwen3.5-0.8B in under a second and decodes at ~42 tok/s, but
+  prefills at ~40 ms a token, so a long prompt waits for its first token.
 - The runtime boots once per process; after `shutdown()` no server can start.
 - `libpie_jni.so` is about 51 MB (18 MB compressed); the Python component
   adds about 38 MB (14 MB compressed).
