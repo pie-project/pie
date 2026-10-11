@@ -236,7 +236,7 @@ jobs:
           cache-key: ${{ runner.os }}-android
       - run: rustup target add aarch64-linux-android
       - run: cargo install cargo-ndk --locked
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '21'
