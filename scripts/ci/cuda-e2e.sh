@@ -12,10 +12,9 @@ pie=${CARGO_TARGET_DIR:-target}/debug/pie
 cargo build -p pie --features cuda --bin pie
 (cd examples && cargo build -q --release --target wasm32-wasip2 -p text-completion -p naive-baseline)
 
+# A current artifact is a no-op, a stale one is rebuilt: pie decides, not a path.
+"$pie" model import Qwen/Qwen3.5-0.8B
 "$pie" model list
-if ! ls "$PIE_HOME"/models/Qwen--Qwen3.5-0.8B/*.cuda.zt >/dev/null 2>&1; then
-  "$pie" model import Qwen/Qwen3.5-0.8B
-fi
 mkdir -p "$PIE_HOME"
 cat > "$PIE_HOME/config.toml" <<TOML
 [server]
