@@ -109,6 +109,13 @@ fn listen(state: &Arc<State>, at: Allotment) {
             let Some((program, binding)) = owner.ledger.take(at) else {
                 return;
             };
+            // TEST ONLY: refuse the Nth request, as a failed enqueue would.
+            static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let nth = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if std::env::var("PIE_ANE_FAIL_AT").ok().and_then(|v| v.parse().ok()) == Some(nth) {
+                back(&owner, at, false, &format!("injected refusal of request {nth}"));
+                return;
+            }
             let state = owner.clone();
             let report = Box::new(move |ok: bool| {
                 back(&state, at, ok, "an evaluation failed");
