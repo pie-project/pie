@@ -14,8 +14,19 @@ const TOKENS: u32 = 8192;
 const CONTEXT: u32 = 32768;
 
 // A tenth of a 32 GB card: enough for the weight tier and a sequence, not
-// for an 8192-token working set, so the boot halves the token budget.
-const FRACTION: f64 = 0.10;
+// for an 8192-token working set, so the boot halves the token budget. Stated
+// in bytes, so a card of any size is asked for the same share.
+const SHARE: f64 = 3.2e9;
+
+fn fraction() -> f64 {
+    use cudarc::runtime::sys as rt;
+
+    let (mut free, mut total) = (0usize, 0usize);
+    // SAFETY: two live locals; the call only writes them.
+    let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
+    assert_eq!(asked, rt::cudaError::cudaSuccess, "cudaMemGetInfo answers");
+    SHARE / total as f64
+}
 
 fn snapshot() -> Option<PathBuf> {
     if let Ok(stated) = std::env::var("PIE_SMOKE_SNAPSHOT") {
@@ -84,7 +95,7 @@ fn a_short_card_keeps_the_declared_context() {
         ordinal: 0,
         graphs: engine_cuda::Graphs::On,
         knobs: Knobs {
-            gpu_mem_utilization: FRACTION,
+            gpu_mem_utilization: fraction(),
             ..Knobs::default()
         },
         cache_dir: None,
