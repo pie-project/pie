@@ -60,6 +60,12 @@ jobs:
   workspace-test:
     name: "workspace: build + test"
     runs-on: ubuntu-latest
+    # Every test binary carries its own copy of the workspace's debug info:
+    # line tables alone keep a panic's backtrace and take 13 GB of
+    # pie-poem-compiler's all-targets build to 5.1 GB.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
       # A whole-workspace build needs more disk than the image leaves free.
