@@ -404,6 +404,10 @@ jobs:
     needs: cuda-up
     runs-on: [self-hosted, cuda]
     timeout-minutes: 90
+    # The pod is billed by the minute: its catalog-wide tests and the e2e
+    # `pie` run optimized, as the workspace's do.
+    env:
+      CARGO_PROFILE_DEV_OPT_LEVEL: "1"
     steps:
       - uses: actions/checkout@v7
       - run: nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv && df -h /workspace
