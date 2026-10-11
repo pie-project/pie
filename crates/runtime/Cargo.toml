@@ -67,7 +67,7 @@ crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 tracing-appender = "0.2"
 tracing-opentelemetry = "0.33"
 opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "grpc-tonic",
     "trace",
