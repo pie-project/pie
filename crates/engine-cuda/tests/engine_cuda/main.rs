@@ -1,8 +1,12 @@
 //! engine-cuda's integration tests, one binary: each module was a test file.
 
+#[cfg(feature = "cuda")]
 mod common_dit;
+#[cfg(feature = "cuda")]
 mod common_encoder;
+#[cfg(feature = "cuda")]
 mod common_two_axis;
+#[cfg(feature = "cuda")]
 mod common_vae;
 
 mod a_bank_says_which_site_it_corrects;

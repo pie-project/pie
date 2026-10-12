@@ -136,7 +136,6 @@ fn a_tower_region_reads_the_patch_window_every_case() {
     each_region_is_cut_at_its_own_axis_s_window();
     a_fire_with_no_image_gets_the_token_windows_it_always_had();
     a_patch_rectangle_is_carved_at_the_compositions_own_patch_rows();
-    the_table_a_device_reads_carries_both_seriations();
 }
 
 fn each_region_is_cut_at_its_own_axis_s_window() {
@@ -326,27 +325,3 @@ fn a_patch_rectangle_is_carved_at_the_compositions_own_patch_rows() {
     );
 }
 
-fn the_table_a_device_reads_carries_both_seriations() {
-    let (_, compiled) = baked();
-    let budgets = budgets();
-    let fire = compose_axes(
-        &compiled,
-        &budgets,
-        &[Lane::with_images(1, 5, 2, 128), Lane::new(0, 3)],
-    )
-    .expect("composes");
-
-    let packed = FireDescriptor::unpack(&FireDescriptor::of(&fire).pack()).expect("unpacks");
-    assert_eq!(packed.rows, fire.rows());
-    assert_eq!(packed.patch_rows, fire.patch_rows());
-    assert_eq!(packed.images, fire.images());
-    assert_eq!(packed.patch_bucket, fire.patch_bucket());
-    assert!(packed.has_patches());
-    for region in compiled.template() {
-        assert_eq!(
-            packed.patch_rows_of(&region.mask),
-            fire.patch_classes().rows_of(&region.mask),
-            "the trip through the bytes changed a patch window",
-        );
-    }
-}

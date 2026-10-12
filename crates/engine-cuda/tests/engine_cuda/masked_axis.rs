@@ -100,9 +100,3 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
          genuinely maskless and name it here: {maskless:?}"
     );
 }
-
-mod maskless {}
-
-mod devgeo {}
-
-mod gemma {}

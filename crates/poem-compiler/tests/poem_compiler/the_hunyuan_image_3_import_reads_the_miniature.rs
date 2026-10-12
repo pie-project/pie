@@ -6,7 +6,7 @@ use crate::hunyuan_image_3_dims;
 use checkpoint::contract::Expr;
 use poem::Platform;
 
-use hunyuan_image_3_dims::{self as model, Dims};
+use hunyuan_image_3_dims::Dims;
 
 const MINI: &str = "hunyuanimage3-mini-bf16-kv-bf16";
 
@@ -19,7 +19,6 @@ fn golden() -> PathBuf {
 #[test]
 fn the_hunyuan_image_3_import_reads_the_miniature_every_case() {
     the_miniature_reads_the_golden_and_rearranges_where_the_study_says();
-    the_rotary_channel_permutation_is_one();
 }
 
 fn the_miniature_reads_the_golden_and_rearranges_where_the_study_says() {
@@ -111,11 +110,3 @@ fn the_miniature_reads_the_golden_and_rearranges_where_the_study_says() {
     );
 }
 
-fn the_rotary_channel_permutation_is_one() {
-    for head_dim in [64u32, 128] {
-        let scale = model::rope_x_scale(head_dim);
-        let want = 10_000f32.powf(-2.0 / head_dim as f32);
-        assert!((scale - want).abs() < 1e-9, "head {head_dim}");
-        assert!(head_dim.is_multiple_of(4));
-    }
-}

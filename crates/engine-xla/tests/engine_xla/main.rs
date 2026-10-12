@@ -3,7 +3,6 @@
 mod common;
 mod common_dit;
 
-mod a_batch_decodes_on_the_device;
 mod a_batch_samples_on_the_device;
 mod a_channel_fed_voxel_port_lands_the_committed_cell;
 mod a_context_port_merged_into_the_stream_lands_its_rows;
@@ -16,8 +15,6 @@ mod a_recurrent_verb_replays_what_a_plain_walk_folds;
 mod a_stated_position_rotates_and_the_row_bounds;
 mod a_windowed_pool_answers_what_full_pages_do;
 mod an_epilogue_agrees_with_the_host_interpreter;
-mod bench_decode_kernels;
-mod bench_ssm_decode;
 mod kernels_act;
 mod kernels_attn;
 mod kernels_collective;

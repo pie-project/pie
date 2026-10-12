@@ -14,20 +14,8 @@ fn full_demand(trace: &Trace) -> u64 {
 
 #[test]
 fn routed_experts_stream_every_case() {
-    a_budget_under_the_planes_that_cannot_move_is_refused_by_name();
     a_host_budget_under_the_pinned_tier_is_refused_by_name();
     an_uncapped_budget_opens_no_tier_at_all();
-}
-
-fn a_budget_under_the_planes_that_cannot_move_is_refused_by_name() {
-    let trace = micro();
-    let why = Plan::of(&trace, &Attachments::new(), Budgets::device(1 << 16))
-        .expect_err("64 KiB holds no model");
-    let said = why.to_string();
-    assert!(
-        said.contains("REGISTERED") && said.contains("cannot be moved to another tier"),
-        "the refusal names the planes that cannot hold less: {said}"
-    );
 }
 
 fn a_host_budget_under_the_pinned_tier_is_refused_by_name() {

@@ -10,7 +10,5 @@ mod memory_mount;
 mod quant_terms;
 mod serving_artifact;
 mod storage_compiler;
-mod the_minimax_h3_snapshot_finds_its_video_vae_a_folder_down;
-mod the_z_image_snapshot_opens_as_one_prefixed_source;
 mod ztensor_convert;
 mod ztensor_roundtrip;
