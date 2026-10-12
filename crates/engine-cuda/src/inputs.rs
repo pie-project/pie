@@ -1,5 +1,4 @@
 use kernels_cuda::Tensor;
-use kernels_cuda::attn::fa2::decode_max_grid_size;
 use kernels_cuda::attn::plan::{
     Device, Toggles, Workspace, prefill_graph_padding, prefill_partial_rows,
 };
@@ -41,12 +40,22 @@ fn prefill_float_bytes(
     (v + s).next_multiple_of(ALIGN) + 2 * ALIGN
 }
 
-/// A decode plan's partials: one row per work item, and a recorded decode
-/// pads its work items to the planner's grid over the kv heads
-/// (`sched_decode::schedule`), an eager one to at most that or its lanes.
-fn decode_float_bytes(facts: &SpaceFacts, lanes: u32, device: &Device) -> u64 {
-    let grid = decode_max_grid_size(facts.head_dim, facts.q_heads, facts.kv_heads, device);
-    let padded = u64::from((grid / facts.kv_heads.max(1)).max(lanes).max(1));
+/// A decode plan's partials at `lanes` rows. The decode room is held to the
+/// larger of this and `graph_float_bytes`, a prefill-tile multiple well past
+/// what the decode planner's grid uses: the token budget is fitted against
+/// that room (`serve::load`), and a smaller room moves where the budget
+/// lands, which the card's later state-slot fit does not yet follow.
+fn graph_float_bytes(facts: &SpaceFacts, sms: u32) -> u64 {
+    let padded = u64::from(2 * sms.max(1)) / u64::from(facts.kv_heads.max(1)).max(1);
+    let tile = if facts.head_dim >= 256 { 64 } else { 128 };
+    let heads = u64::from(facts.q_heads);
+    let v = heads * padded * tile * u64::from(facts.head_dim) * 4;
+    let s = heads * padded * tile * 4;
+    (v + s).next_multiple_of(ALIGN) + 2 * ALIGN
+}
+
+fn decode_float_bytes(facts: &SpaceFacts, lanes: u32) -> u64 {
+    let padded = u64::from(lanes.max(1));
     let heads = u64::from(facts.q_heads);
     let v = heads * padded * u64::from(facts.head_dim) * 4;
     let s = heads * padded * 4;
@@ -85,9 +94,8 @@ fn plan_floats(
                     StructKind::AttnPrefillPlanSm90 => {
                         unreachable!("no CUDA trace plans an sm90 prefill")
                     }
-                    StructKind::AttnDecodePlan => {
-                        decode_float_bytes(&seat.reading, budget.max_lanes, device)
-                    }
+                    StructKind::AttnDecodePlan => graph_float_bytes(&seat.reading, device.num_sm)
+                        .max(decode_float_bytes(&seat.reading, budget.max_lanes)),
                     StructKind::MlaPlan => latent_float_bytes(seat.reading.head_dim, device.num_sm),
                 }
                 .max(GRANT_FLOAT_BYTES)
