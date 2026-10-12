@@ -411,6 +411,21 @@ impl Drop for PipelineCache {
     }
 }
 
+/// The transfer staging buffer is a `Slab`, which holds the `Core` that holds
+/// it: left in place, that cycle keeps the device (and its memory) alive
+/// after every load, until `vkCreateDevice` fails. The context is what a load
+/// owns, so its end releases the staging buffer; buffers and pipelines that
+/// outlive it then release the device as they go.
+impl Drop for Context {
+    fn drop(&mut self) {
+        self.core
+            .transfer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .staging = None;
+    }
+}
+
 impl std::fmt::Debug for Context {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Context")
