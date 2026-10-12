@@ -1211,11 +1211,6 @@ impl Shell {
         self.weights.windows()
     }
 
-    #[must_use]
-    pub fn weights_residue(&self) -> (usize, u64) {
-        self.weights.residue()
-    }
-
     /// The kv pool's bytes with memory behind them now, and the most that
     /// ever had at once. Both equal the pool for a fixed pool.
     #[must_use]
@@ -1231,15 +1226,6 @@ impl Shell {
             self.pools.elastic_page_bytes(),
             self.pools.elastic_budget_pages(),
         )
-    }
-
-    /// Lower the kv pool's watermark to `hint` and hand back the memory
-    /// above it. Drains every frame first, because an unmapped page under
-    /// a running kernel is a fault; a fixed pool only lowers the watermark.
-    pub fn release_kv(&mut self, hint: Demand) -> Result<()> {
-        self.drain()?;
-        Supply::trim(&mut self.pools, hint);
-        self.pools.release()
     }
 
     #[must_use]
@@ -1330,11 +1316,6 @@ impl Shell {
     pub fn fire_program(&mut self, instance_id: u64) -> Result<crate::Fired> {
         self.fence_instances(&[instance_id])?;
         self.programs.fire(&self.device, instance_id)
-    }
-
-    #[must_use]
-    pub fn program_stats(&self) -> eta_exec::CacheStats {
-        self.programs.stats()
     }
 
     pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
@@ -1479,13 +1460,6 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn expert_prediction(&self) -> crate::experts::Prediction {
-        self.weights
-            .tier()
-            .map_or_else(Default::default, |tier| tier.borrow().prediction())
-    }
-
-    #[must_use]
     pub fn expert_host_time(&self) -> (u64, u64, u64) {
         self.weights
             .tier()
@@ -1495,18 +1469,6 @@ impl Shell {
     #[must_use]
     pub fn gathered_rows(&self) -> Option<crate::gather::Residency> {
         self.weights.rows().map(|rows| rows.borrow().residency())
-    }
-
-    #[must_use]
-    pub fn gathered_motion(&self) -> Option<(u64, u64)> {
-        self.weights.rows().map(|rows| rows.borrow().motion())
-    }
-
-    #[must_use]
-    pub fn gathered_source(&self) -> Option<(&'static str, Option<(u64, u64)>)> {
-        self.weights
-            .rows()
-            .map(|rows| (rows.borrow().source_kind(), rows.borrow().backing()))
     }
 
     #[must_use]

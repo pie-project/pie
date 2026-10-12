@@ -29,10 +29,6 @@ impl<I: PoolId> Pool<I> {
         }
     }
 
-    pub fn try_alloc(&mut self) -> Option<I> {
-        self.free.pop()
-    }
-
     pub fn try_alloc_n(&mut self, n: usize) -> Option<Vec<I>> {
         if self.free.len() < n {
             return None;

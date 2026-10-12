@@ -76,7 +76,6 @@ fn dense(found: u32, wanted: u32, what: &str) -> Result<()> {
 pub struct PlanIndex {
     tensor: HashMap<TensorId, u32>,
     source: HashMap<TensorId, u32>,
-    view_input: HashMap<BufferId, BufferId>,
 }
 
 impl PlanIndex {
@@ -84,14 +83,6 @@ impl PlanIndex {
         Self {
             tensor: position_by_id(plan.tensors.iter().map(|decl| decl.id)),
             source: position_by_id(plan.sources.iter().map(|decl| decl.id)),
-            view_input: plan
-                .instrs
-                .iter()
-                .filter_map(|instr| match instr {
-                    StorageInstr::CreateView { input, output, .. } => Some((*output, *input)),
-                    _ => None,
-                })
-                .collect(),
         }
     }
 
@@ -101,16 +92,6 @@ impl PlanIndex {
 
     pub fn source<'a>(&self, plan: &'a LoadPlan, id: TensorId) -> Option<&'a SourceTensorDecl> {
         plan.sources.get(*self.source.get(&id)? as usize)
-    }
-
-    pub fn buffer_tensor<'a>(&self, plan: &'a LoadPlan, id: BufferId) -> Option<&'a TensorDecl> {
-        let mut at = id;
-        loop {
-            if let Some(tensor) = plan.buffer(at).ok()?.tensor {
-                return self.tensor(plan, tensor);
-            }
-            at = *self.view_input.get(&at)?;
-        }
     }
 }
 

@@ -115,19 +115,6 @@ impl DescriptorAbi {
     }
 
     #[must_use]
-    pub fn by_kind(&self) -> BTreeMap<&'static str, usize> {
-        let mut per = BTreeMap::new();
-        for slot in &self.slots {
-            for arm in &slot.arms {
-                for (_, law) in &arm.laws {
-                    *per.entry(law.kind()).or_default() += 1;
-                }
-            }
-        }
-        per
-    }
-
-    #[must_use]
     pub fn census(&self) -> Vec<(Point, usize, usize)> {
         let mut per: BTreeMap<Point, (usize, usize)> = BTreeMap::new();
         for slot in &self.slots {
@@ -140,11 +127,6 @@ impl DescriptorAbi {
         per.into_iter()
             .map(|(point, (slots, laws))| (point, slots, laws))
             .collect()
-    }
-
-    #[must_use]
-    pub fn coords_of(&self, classes: &[(u32, u32)]) -> Vec<i128> {
-        self.recipe.iter().map(|row| row.at(classes)).collect()
     }
 
     #[must_use]

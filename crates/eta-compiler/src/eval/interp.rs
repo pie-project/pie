@@ -115,12 +115,6 @@ impl ExternChannel {
             capacity: capacity as usize,
         }
     }
-    pub fn for_decl(decl: &eta_ir::container::ChannelDecl) -> ExternChannel {
-        ExternChannel::new(
-            ValueType::new(decl.shape, decl.dtype.program_dtype()),
-            decl.capacity,
-        )
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -265,15 +259,6 @@ impl Instance {
         externs: &[(u32, ExternChannel)],
     ) -> Result<Instance, HostError> {
         Instance::new_full(bound, seeds, externs, &[])
-    }
-
-    pub fn new_with_shared_rings(
-        bound: &BoundTrace,
-        seeds: &[(u32, Value)],
-        externs: &[(u32, ExternChannel)],
-        shared: &[(u32, ExternChannel)],
-    ) -> Result<Instance, HostError> {
-        Instance::new_full(bound, seeds, externs, shared)
     }
 
     fn new_full(

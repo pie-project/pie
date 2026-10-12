@@ -1163,12 +1163,6 @@ impl Frame {
         owed
     }
 
-    #[must_use]
-    pub fn sync_counts(&self) -> (u64, u64) {
-        let hazards = self.hazards.borrow();
-        (hazards.barriers, hazards.seen)
-    }
-
     fn hazards_settled(&self) {
         self.hazards.borrow_mut().cleared();
     }

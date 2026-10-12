@@ -12,10 +12,6 @@ impl Knobs {
     pub const MAX_FRAME_SIZE: usize = worker::config::Runahead::STEPS_MAX as usize;
     pub const MAX_DISPATCH_DEPTH: usize = worker::config::Runahead::MAX_FRAMES as usize;
 
-    pub fn steps_in_flight(&self) -> usize {
-        self.frame_size * self.dispatch_depth
-    }
-
     pub fn staging_depth(&self) -> usize {
         worker::config::Runahead::of(self.dispatch_depth.min(255) as u8).staging_depth()
     }

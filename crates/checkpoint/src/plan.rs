@@ -362,53 +362,6 @@ impl LoadPlan {
     }
 
     #[must_use]
-    pub fn ties_embeddings(&self) -> bool {
-        self.tensors
-            .iter()
-            .any(|tensor| tensor.name == TIED_EMBEDDING_NAME)
-    }
-
-    #[must_use]
-    pub fn mxfp4_tensor_names(&self) -> std::collections::HashSet<String> {
-        self.tensors
-            .iter()
-            .filter(|t| {
-                matches!(
-                    &t.encoding,
-                    Encoding::Quant(spec) if spec.is_mxfp4()
-                )
-            })
-            .map(|t| t.name.clone())
-            .collect()
-    }
-
-    #[must_use]
-    pub fn affine_points(&self) -> Vec<(u32, u32)> {
-        let mut points: Vec<(u32, u32)> = self
-            .tensors
-            .iter()
-            .filter_map(|t| match &t.encoding {
-                Encoding::Quant(spec) => spec.affine_point(),
-                _ => None,
-            })
-            .collect();
-        points.sort_unstable();
-        points.dedup();
-        points
-    }
-
-    #[must_use]
-    pub fn affine_by_name(&self) -> std::collections::HashMap<String, (u32, u32)> {
-        self.tensors
-            .iter()
-            .filter_map(|t| match &t.encoding {
-                Encoding::Quant(spec) => spec.affine_point().map(|p| (t.name.clone(), p)),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[must_use]
     pub fn affine_point_of(&self, name: &str) -> Option<(u32, u32)> {
         self.tensors
             .iter()
@@ -417,24 +370,6 @@ impl LoadPlan {
                 Encoding::Quant(spec) => spec.affine_point(),
                 _ => None,
             })
-    }
-
-    #[must_use]
-    pub fn affine_point_witnesses(&self) -> Vec<((u32, u32), String)> {
-        let mut out: Vec<((u32, u32), String)> = Vec::new();
-        for t in &self.tensors {
-            let Encoding::Quant(spec) = &t.encoding else {
-                continue;
-            };
-            let Some(point) = spec.affine_point() else {
-                continue;
-            };
-            if !out.iter().any(|(p, _)| *p == point) {
-                out.push((point, t.name.clone()));
-            }
-        }
-        out.sort_unstable_by_key(|(p, _)| *p);
-        out
     }
 }
 

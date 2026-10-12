@@ -962,23 +962,6 @@ impl KvStore {
         Ok(self.table.page_token_hashes(ws, index)?)
     }
 
-    pub fn committed_token_len(
-        &self,
-        ws: WorkingSetId,
-        page_size: u32,
-    ) -> Result<u64, KvStoreError> {
-        let mapped = self.table.mapped_len(ws)?;
-        if mapped == 0 {
-            return Ok(0);
-        }
-        let hashes = self.table.page_token_hashes(ws, mapped - 1)?;
-        let last = hashes
-            .iter()
-            .rposition(|h| h.is_some())
-            .map_or(0, |i| i + 1);
-        Ok((mapped - 1) * page_size as u64 + last as u64)
-    }
-
     #[cfg(test)]
     pub fn lookup_cached_page(&mut self, key: &Hash256) -> Option<(NodeId, u64)> {
         let entry = *self.cas.get(key)?;
@@ -1072,69 +1055,6 @@ impl KvStore {
         Ok(Some(pages))
     }
 
-    pub fn adopt_offloaded_prefix(
-        &mut self,
-        ws: WorkingSetId,
-        tokens: &[u32],
-        pages: Vec<PhysicalKvPageId>,
-        page_size: u32,
-    ) -> Result<u64, KvStoreError> {
-        if tokens.is_empty()
-            || page_size == 0
-            || !tokens.len().is_multiple_of(page_size as usize)
-            || pages.len() * page_size as usize != tokens.len()
-        {
-            self.pool.release_reserved(pages);
-            return Err(KvStoreError::BadWriteSet {
-                reason: "offloaded adoption requires a non-empty full-page token prefix",
-            });
-        }
-        let empty = match (self.mapped_len(ws), self.chain_state(ws)) {
-            (Ok(mapped), Ok(chain)) => mapped == 0 && chain.is_none(),
-            (Err(error), _) | (_, Err(error)) => {
-                self.pool.release_reserved(pages);
-                return Err(error);
-            }
-        };
-        if !empty {
-            self.pool.release_reserved(pages);
-            return Err(KvStoreError::BadWriteSet {
-                reason: "offloaded adoption requires an empty working set",
-            });
-        }
-
-        let page_count = pages.len() as u64;
-        if let Err(error) = self.reserve(ws, page_count) {
-            self.pool.release_reserved(pages);
-            return Err(error);
-        }
-        let indexes = (0..page_count).collect::<Vec<_>>();
-        let prepared = self.prepare_write_granted(ws, &indexes, pages)?;
-        let mut previous = None;
-        let mut commits = Vec::with_capacity(page_count as usize);
-        for (page_index, page_tokens) in tokens.chunks_exact(page_size as usize).enumerate() {
-            let mut token_hashes = Vec::with_capacity(page_size as usize);
-            for (offset, &token) in page_tokens.iter().enumerate() {
-                let position = page_index * page_size as usize + offset;
-                let hash = hash::chain_token_slot_hash(
-                    &self.domain,
-                    previous.as_ref(),
-                    token,
-                    position as u32,
-                );
-                previous = Some(hash);
-                token_hashes.push(Some(hash));
-            }
-            commits.push(PageCommit {
-                page_hash: Some(hash::page_hash(&token_hashes)),
-                token_hashes,
-            });
-        }
-        let (sequence, intents) = self.publish_prepared(prepared, &commits)?;
-        self.settle(sequence, intents, true);
-        Ok(page_count)
-    }
-
     pub fn reclaim_quotes(
         &self,
         groups: &[HashSet<WorkingSetId>],
@@ -1208,27 +1128,6 @@ impl KvStore {
             pages,
             pinned,
         }))
-    }
-
-    pub fn suspendable_page_count(
-        &self,
-        working_sets: &HashSet<WorkingSetId>,
-    ) -> Result<usize, KvStoreError> {
-        let (pages, pinned) = self.table.private_resident_pages(working_sets)?;
-        Ok(if pinned { 0 } else { pages.len() })
-    }
-
-    pub fn post_drain_reclaimable_page_count(
-        &self,
-        working_sets: &HashSet<WorkingSetId>,
-    ) -> Result<usize, KvStoreError> {
-        let pages: HashSet<_> = self
-            .table
-            .post_drain_private_resident_pages(working_sets)?
-            .into_iter()
-            .map(|(_, page)| page)
-            .collect();
-        Ok(pages.len())
     }
 
     pub fn commit_suspend(&mut self, txn: KvSuspendTxn) -> Result<usize, KvStoreError> {
@@ -1409,10 +1308,6 @@ impl KvStore {
 
     pub fn capacity_pages(&self) -> u32 {
         self.pool.capacity()
-    }
-
-    pub fn pending_recycle_pages(&self) -> usize {
-        self.pool.pending_recycle()
     }
 
     pub fn host_swap_available(&self) -> usize {

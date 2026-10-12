@@ -966,17 +966,6 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn recordings(&self) -> (usize, Option<&'static str>) {
-        (self.recorder.len(), self.recorder.refused())
-    }
-
-    #[must_use]
-    pub fn replay_counts(&self) -> (u64, u64, u64) {
-        let (replayed, recorded) = self.recorder.counts();
-        (replayed, recorded, self.recorder.evicted())
-    }
-
-    #[must_use]
     pub fn compiled(&self) -> u64 {
         self.pipelines.compiled()
     }
@@ -1055,14 +1044,6 @@ impl Shell {
             .as_ref()
             .map(|scores| scores.read_lane(lane))
             .transpose()
-    }
-
-    pub fn set_recording(&mut self, on: bool) {
-        self.recorder = if on {
-            crate::record::Recorder::new()
-        } else {
-            crate::record::Recorder::refusing("a caller turned recording off")
-        };
     }
 
     pub fn set_copies(&mut self, copies: bool) {

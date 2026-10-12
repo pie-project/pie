@@ -95,16 +95,6 @@ impl ExecPlan {
             .iter()
             .any(|value| value.intrinsic == Some(wanted))
     }
-
-    #[must_use]
-    pub fn needs_forward(&self) -> bool {
-        self.needs_logits
-            || self.needs_mtp_logits
-            || self.needs_mtp_drafts
-            || self.needs_attn_scores
-            || self.needs_pixels
-            || !self.package.ports.is_empty()
-    }
 }
 
 #[must_use]

@@ -10,14 +10,6 @@ pub fn module(entrypoint: &str) -> Option<&'static [u8]> {
 }
 
 #[must_use]
-pub fn tier_of(entrypoint: &str) -> Option<&'static str> {
-    MODULES
-        .iter()
-        .find(|(name, _, _)| *name == entrypoint)
-        .map(|(_, tier, _)| *tier)
-}
-
-#[must_use]
 pub fn census() -> &'static [&'static str] {
     CENSUS
 }
