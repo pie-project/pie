@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-pub mod minimax_h3_dims;
+use crate::minimax_h3_dims;
 
 use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
 use poem::{

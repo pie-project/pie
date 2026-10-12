@@ -2,7 +2,7 @@ use poem_compiler::{
     CompiledModel, DeviceProfile, Lowering, Phase, Region, collectives_are_never_elided,
 };
 
-mod common;
+use crate::common;
 use common::{PLATFORMS, bake_with};
 use poem_ir::Trace;
 

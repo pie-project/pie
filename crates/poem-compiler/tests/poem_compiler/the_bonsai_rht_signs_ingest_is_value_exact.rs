@@ -10,7 +10,7 @@
 //! the import reads, must land each sign constant equal to it; a table the
 //! Bonsai rotation cannot use is refused.
 
-pub mod sparse_gguf;
+use crate::sparse_gguf;
 
 use std::collections::BTreeMap;
 
@@ -23,7 +23,7 @@ const WIDTH_FFN_DOWN: u32 = 17408;
 const BONSAI_SIGN_WIDTHS: [u32; 3] = [WIDTH_HIDDEN, WIDTH_SSM_OUT, WIDTH_FFN_DOWN];
 
 /// The value-for-value oracle: the fork's 28672 loaded signs, bit-packed.
-const PACKED: &[u8] = include_bytes!("bonsai/rht_signs.packed");
+const PACKED: &[u8] = include_bytes!("../bonsai/rht_signs.packed");
 const TOTAL: usize = 28672;
 
 /// Unpack the committed oracle into the three `±1` vectors, keyed by width, in

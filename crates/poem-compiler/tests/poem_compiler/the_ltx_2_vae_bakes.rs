@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-pub mod ltx_2_dims;
+use crate::ltx_2_dims;
 
 use ltx_2_dims::{self as model, VAE_DECODE};
 use poem::generative::{PortKind, ReadoutKind};

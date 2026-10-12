@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-pub mod hunyuan_image_3_dims;
+use crate::hunyuan_image_3_dims;
 
 use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
 use poem::{

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub mod hunyuan_image_3_dims;
+use crate::hunyuan_image_3_dims;
 
 use checkpoint::contract::Expr;
 use poem::Platform;

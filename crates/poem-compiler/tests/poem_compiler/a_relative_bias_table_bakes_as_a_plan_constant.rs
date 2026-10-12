@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 
 use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Value, Weight, ops, seam, trace_hybrid};
 use poem_compiler::Placement;

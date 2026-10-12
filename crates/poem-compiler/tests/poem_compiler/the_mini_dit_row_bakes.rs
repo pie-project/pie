@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-pub mod mini_dit_dims;
+use crate::mini_dit_dims;
 
 use mini_dit_dims as model;
 use poem::generative::{PortKind, ReadoutKind};

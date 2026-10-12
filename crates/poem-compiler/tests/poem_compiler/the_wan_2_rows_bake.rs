@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-pub mod wan_2_dims;
+use crate::wan_2_dims;
 
 use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
 use poem::{
@@ -521,7 +521,7 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
         assert_eq!(schedule.train_steps, model::TRAIN_STEPS);
         assert!(schedule.pinned_sigmas.is_empty(), "nothing is pinned");
         assert!(facts.max_rows >= 4096);
-        crate::validate(&facts);
+        crate::the_wan_2_rows_bake::validate(&facts);
     }
 }
 

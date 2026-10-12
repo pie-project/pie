@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-pub mod wan_2_dims;
+use crate::wan_2_dims;
 
 use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{ModelContract, Partition, TensorType};

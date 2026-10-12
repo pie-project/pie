@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 
 use poem::fact;
 use poem::{

@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-pub mod flux_2_dims;
+use crate::flux_2_dims;
 
 use flux_2_dims as forward;
 use flux_2_dims as model;

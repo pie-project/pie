@@ -1,6 +1,6 @@
 use poem_compiler::{Budget, PATCH_LATTICE_FLOOR};
 
-mod common;
+use crate::common;
 use common::patch_ladder_for;
 
 #[test]
