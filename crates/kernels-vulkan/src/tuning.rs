@@ -81,6 +81,8 @@ pub struct DeviceTuning {
     /// Batched quantized projections on the register-tiled point (a 4x4
     /// block per invocation) rather than the plain tiled one.
     pub qmm_register_tiles: bool,
+    /// The register-tiled point's K block is 16 wide rather than 32.
+    pub qmm_rt_k16: bool,
 
     /// A one-row quantized projection (decode) on the 128-bit-load point
     /// that folds with subgroup shuffles; needs subgroups of 32 or more.
@@ -116,6 +118,7 @@ impl Default for DeviceTuning {
             sdpa_split_groups: 128,
             sdpa_split_min_keys: 256,
             qmm_register_tiles: false,
+            qmm_rt_k16: false,
             qmv_one_row: false,
             qmv_one_row_lanes: 32,
             qmv_one_row_rows: 1,
@@ -150,9 +153,11 @@ impl DeviceTuning {
         // carrying two rows each.
         // Its prefill halves on the register-tiled point too: 1.2k tokens of
         // the same model in 11.5 s against 23, FLUX.2 klein's four steps in
-        // 65 s of matmul against 140.
+        // 65 s of matmul against 140. Its 16-wide K block runs a 596-row
+        // 3072 x 27648 projection in 273 ms against 688 (371 GFLOPS).
         if info.vendor == Vendor::Imagination {
             t.qmm_register_tiles = true;
+            t.qmm_rt_k16 = true;
             t.qmv_one_row = info.subgroup_size >= 32;
             t.qmv_one_row_lanes = 8;
             t.qmv_one_row_rows = 2;
@@ -186,6 +191,7 @@ impl DeviceTuning {
             sdpa_split_groups,
             sdpa_split_min_keys,
             qmm_register_tiles,
+            qmm_rt_k16,
             qmv_one_row,
             qmv_one_row_lanes,
             qmv_one_row_rows,
@@ -231,6 +237,7 @@ pub struct Overrides {
     pub sdpa_split_groups: Option<u32>,
     pub sdpa_split_min_keys: Option<u32>,
     pub qmm_register_tiles: Option<bool>,
+    pub qmm_rt_k16: Option<bool>,
     pub qmv_one_row: Option<bool>,
     pub qmv_one_row_lanes: Option<u32>,
     pub qmv_one_row_rows: Option<u32>,

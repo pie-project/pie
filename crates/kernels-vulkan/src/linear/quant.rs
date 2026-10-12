@@ -58,7 +58,9 @@ pub fn composed() -> Vec<Fire> {
                 }
             }
             for bm in RT_ROW_TILES {
-                out.push(Fire::at(QMM_RT_FILE, qmm_rt_name(gs, b, bm)));
+                for k16 in [false, true] {
+                    out.push(Fire::at(QMM_RT_FILE, qmm_rt_name(gs, b, bm, k16)));
+                }
             }
             for &bm in &ROW_TILES {
                 for &bn in &TILES {
@@ -123,8 +125,11 @@ pub fn qmm_name(
 const RT_ROW_TILES: [i32; 2] = [32, 64];
 const RT_COLS: u32 = 64;
 
-fn qmm_rt_name(group: i32, bits: i32, bm: i32) -> &'static str {
-    symbol(&format!("affine_qmm_rt_bf16_gs_{group}_b_{bits}_bm_{bm}"))
+fn qmm_rt_name(group: i32, bits: i32, bm: i32, k16: bool) -> &'static str {
+    let block = if k16 { "_k16" } else { "" };
+    symbol(&format!(
+        "affine_qmm_rt{block}_bf16_gs_{group}_b_{bits}_bm_{bm}"
+    ))
 }
 
 /// The one-row point loads 128 bits of codes at once, which must stay
@@ -458,7 +463,7 @@ pub fn act_x_wt(
         let bm = if m > 32 { 64 } else { 32 };
         let rows = (m as u32).div_ceil(bm as u32);
         return ctx.fire(
-            Fire::at(QMM_RT_FILE, qmm_rt_name(group, bits, bm)).apply(Grid::of(
+            Fire::at(QMM_RT_FILE, qmm_rt_name(group, bits, bm, tuned.qmm_rt_k16)).apply(Grid::of(
                 [
                     (n as u32).div_ceil(RT_COLS) * (RT_COLS / 4),
                     rows * (bm as u32 / 4),
