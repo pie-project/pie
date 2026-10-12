@@ -75,7 +75,6 @@ const SPLITK_REDUCE: &str = "qmm_splitk_reduce_f32_bfloat16";
 /// `kernel.qmm_splitk` (`limit` is its `(fill threadgroups, most slices)`):
 /// 1 where it does not split.
 #[must_use]
-#[allow(clippy::too_many_arguments)]
 pub fn splitk(
     n: i32,
     bm: i32,
@@ -293,9 +292,9 @@ pub fn mb_block(rows: i32, capacity: i32) -> Option<(i32, i32)> {
         .or_else(|| fits(BM_RUNGS[0]))
 }
 
-#[must_use]
 /// The widest row tile up to `widen_to` that still fills, for a padded
 /// matmul now tiled at `bm`.
+#[must_use]
 pub fn widen_rung(bm: i32, padded: i32, widen_to: i32, fills: impl Fn(i32) -> bool) -> i32 {
     BM_RUNGS
         .iter()

@@ -226,8 +226,7 @@ METAL_FUNC void qmv_rows_impl(
 // The p=1 rungs (R in {2,3}) trip fewer than 4 times, so unroll_count(4)
 // still fully unrolls them: that hot path is byte-for-byte unchanged.
         if (packs_per_thread > 1) {
-          // At p=2 the accumulators outnumber what the Metal compiler keeps
-          // straight once this loop unrolls at all: leave it rolled.
+          // At p=2 the Metal compiler miscompiles this loop if it unrolls at all.
 #pragma clang loop unroll(disable)
           for (int r = 0; r < R; r++) {
             U sum = load_vector<T, U, values_per_thread, bits>(xb + roff[r], x_thread);

@@ -1,9 +1,5 @@
-//! Every hardware-dependent decision the Metal kernels read, declared for the
-//! Metal profile registry, and [`Tuning`]: the values one load runs under.
-//!
-//! A decision here is data a chip's profile sets; the formulas that use it
-//! stay in the kernels. Which chip runs which value lives in
-//! `crates/engine-metal/profiles/`, never in this crate.
+//! The hardware-dependent decisions the Metal kernels read, and [`Tuning`]:
+//! the values one load runs under.
 
 use profile::{Decision, Profile, Registry};
 
@@ -156,11 +152,7 @@ counts! {
 #[decision(id = "kernel.qmm_mpp.pipeline_rows", constant(set(8, 16, 24, 32)), default = 16, tune = search)]
 pub struct MppPipelineRows(pub u32);
 
-/// The MPP dense kernel's tiling, read from its `kernel.qmm_mpp.*`
-/// decisions: up to `split_rows` rows (or twice that over at most
-/// `split_cols` columns) split the contraction across partitions; up to
-/// `pipeline_rows` rows over at most `pipeline_cols` columns pipeline their
-/// loads; from `linear_from` rows a packed bank walks its tiles linearly.
+/// The `kernel.qmm_mpp.*` decisions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QmmMpp {
     pub split_rows: u32,
@@ -170,8 +162,7 @@ pub struct QmmMpp {
     pub linear_from: u32,
 }
 
-/// Where prompt attention takes the MPP kernels, read from the
-/// `kernel.sdpa.mpp_rows.*` decisions.
+/// The `kernel.sdpa.mpp_rows.*` decisions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SdpaMppRows {
     pub from: u32,
@@ -280,8 +271,6 @@ pub fn register(registry: &mut Registry) {
         .add::<GdnScan>();
 }
 
-/// What one load's kernels run under: the device's resolved profile, its
-/// core count, and what the model asks of every load on any chip.
 #[derive(Clone, Debug)]
 pub struct Tuning {
     profile: Profile,
@@ -290,10 +279,8 @@ pub struct Tuning {
 }
 
 impl Tuning {
-    /// `wide_range` is the model's: a deployment whose activations leave the
-    /// fp16 range (diffusion latents) takes the wide tiled kernel and no fp16
-    /// GEMM format.
-    /// `cores` is the device's GPU core count, which `fill` divides by.
+    /// `wide_range`: the model's activations leave the fp16 range (diffusion
+    /// latents), so it takes the wide tiled kernel and no fp16 GEMM format.
     #[must_use]
     pub fn new(profile: Profile, wide_range: bool, cores: u32) -> Tuning {
         Tuning {
@@ -303,8 +290,6 @@ impl Tuning {
         }
     }
 
-    /// The point a dense matmul of `rows` rows into `n` columns over a
-    /// `k`-long contraction of a `bits`-bit, `group`-wide bank is chosen at.
     #[must_use]
     pub fn qmm_at(&self, rows: u32, n: u32, k: u32, bits: u32, group: u32) -> QmmAt {
         QmmAt {
@@ -352,8 +337,6 @@ impl Tuning {
             .any(|q| *q == Qmm::Mpp)
     }
 
-    /// Whether a bank of `bits`-bit codes in `group`-wide groups takes the
-    /// fp16 GEMM format.
     #[must_use]
     pub fn fp16_gemm_format(&self, bits: u32, group: u32) -> bool {
         !self.wide_range
@@ -459,7 +442,6 @@ impl Tuning {
         self.profile.get::<SdpaSplit>().0
     }
 
-    /// The gated-delta scan the profile picks.
     #[must_use]
     pub fn gdn_scan(&self) -> GdnScan {
         *self.profile.get::<GdnScan>()
