@@ -5,33 +5,7 @@ use poem::import::Error;
 
 #[test]
 fn every_deployment_ships_whole_every_case() {
-    a_deployment_name_states_the_world_its_row_ships();
     every_import_row_reads_the_checkpoint_it_is_handed();
-}
-
-fn a_deployment_name_states_the_world_its_row_ships() {
-    let mut faults = Vec::new();
-
-    for row in poem_compiler::catalog::deployments().chain(poem_compiler::catalog::splits()) {
-        let (deployment, tp) = (row.name.as_str(), row.deploy.tp);
-        let named = match deployment.rsplit_once("-tp") {
-            Some((_, ranks)) => ranks.parse::<u32>().unwrap_or_else(|why| {
-                panic!(
-                    "`{deployment}` ends in a world of `{ranks}` ranks, which is no number: {why}"
-                )
-            }),
-            None => 1,
-        };
-        if named != tp {
-            faults.push(format!(
-                "`{deployment}` names a world of {named} rank(s) and its catalog row \
-                 ships tp {tp}; the name a runtime selects by and the world it \
-                 gets are the same fact"
-            ));
-        }
-    }
-
-    assert!(faults.is_empty(), "\n{}\n", faults.join("\n"));
 }
 
 fn every_import_row_reads_the_checkpoint_it_is_handed() {

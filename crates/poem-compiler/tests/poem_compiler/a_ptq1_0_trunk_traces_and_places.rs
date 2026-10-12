@@ -4,8 +4,10 @@
 use poem::{Dtype, Platform};
 use poem_compiler::catalog::trace_of;
 
+use crate::common;
+
 #[test]
 fn a_ptq1_0_trunk_traces_and_places() {
     let trace = trace_of("qwen36-27b", Dtype::Ptq1_0, Dtype::Bf16, Platform::Metal);
-    assert!(trace.nodes.len() > 100, "the Ptq1_0 forward traced");
+    common::bake(&trace).unwrap_or_else(|why| panic!("the Ptq1_0 trunk places: {why}"));
 }

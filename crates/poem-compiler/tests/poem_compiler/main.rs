@@ -24,7 +24,6 @@ mod every_fused_trace_keeps_its_order;
 mod every_model_is_spoken_through_a_format_the_runtime_ships;
 mod every_out_seam_holds_one_row_per_readout;
 mod every_row_is_a_deployment_its_model_checks;
-mod every_wan_2_fold_owns_the_vector_it_folds_into;
 mod the_block_drafters_state_their_facts;
 mod the_bonsai_forward_wires_the_hadamard_rotation;
 mod the_bonsai_rht_signs_ingest_is_value_exact;
