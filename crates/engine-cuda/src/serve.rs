@@ -439,11 +439,6 @@ impl Shell {
         Ok(std::mem::take(&mut settled.logits))
     }
 
-    #[must_use]
-    pub fn compute_stream(&self) -> *mut core::ffi::c_void {
-        self.device.stream()
-    }
-
     pub fn drain(&mut self) -> Result<()> {
         self.device.synchronize()
     }

@@ -984,11 +984,6 @@ impl Pools {
     }
 
     #[must_use]
-    pub fn committed_watermarks(&self) -> (u32, u32) {
-        (self.committed_kv_pages, self.committed_state_slots)
-    }
-
-    #[must_use]
     pub fn bases(&self) -> Vec<u64> {
         self.arenas().map(elastic::Arena::base).collect()
     }

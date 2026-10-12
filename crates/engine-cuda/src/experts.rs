@@ -564,11 +564,6 @@ impl Plan {
         self.mapped_walk().0
     }
 
-    #[must_use]
-    pub fn mapped_image(&self) -> u64 {
-        self.mapped_walk().1
-    }
-
     fn mapped_walk(&self) -> (Vec<(u64, u64, u64, u64)>, u64) {
         let mut out = Vec::new();
         let mut at = 0u64;
@@ -1154,22 +1149,8 @@ impl Tier {
     }
 
     #[must_use]
-    pub fn spilled_bytes(&self) -> u64 {
-        self.mapped.iter().map(|plane| plane.bytes).sum()
-    }
-
-    #[must_use]
     pub fn source(&self) -> Option<&Spill> {
         self.source.as_ref()
-    }
-
-    #[must_use]
-    pub fn mapped_plane(&self, param: usize) -> Option<&[u8]> {
-        let plane = self.mapped.iter().find(|plane| plane.param == param)?;
-        let at = usize::try_from(plane.at).ok()? as *const u8;
-        let len = usize::try_from(plane.bytes).ok()?;
-        // SAFETY: the pair came from `Spill::plane`, a window on a mapping this tier owns in `source` for its whole life, unchanged since.
-        Some(unsafe { std::slice::from_raw_parts(at, len) })
     }
 
     #[must_use]
@@ -1212,18 +1193,6 @@ impl Tier {
             filled,
             began: std::time::Instant::now(),
         });
-    }
-
-    pub fn undefer(&mut self) -> Result<()> {
-        if !self.deferring() {
-            return Ok(());
-        }
-        self.refill = None;
-        let want = usize::try_from(self.plan.host_image()).unwrap_or(usize::MAX);
-        self.host = Pinned::mapped(want)?;
-        self.reseat();
-        self.image = None;
-        Ok(())
     }
 
     pub fn settle_refill(&mut self, compute: *mut c_void, notify: *mut c_void) -> Result<bool> {
