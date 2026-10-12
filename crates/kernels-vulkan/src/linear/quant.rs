@@ -56,7 +56,9 @@ pub fn composed() -> Vec<Fire> {
             if qmv1_fits(gs, b) {
                 for lanes in QMV1_LANES {
                     for rows in QMV1_ROWS_PER_LANE {
-                        out.push(Fire::at(QMV1_FILE, qmv1_name(gs, b, lanes, rows)));
+                        for vecs in QMV1_VECS {
+                            out.push(Fire::at(QMV1_FILE, qmv1_name(gs, b, lanes, rows, vecs)));
+                        }
                     }
                 }
             }
@@ -136,13 +138,23 @@ fn qmv1_fits(group: i32, bits: i32) -> bool {
     matches!(bits, 4 | 8) && 128 / bits <= group
 }
 
-fn qmv1_name(group: i32, bits: i32, lanes: u32, rows: u32) -> &'static str {
-    if lanes == 32 && rows == 1 {
-        symbol(&format!("affine_qmv1_bf16_gs_{group}_b_{bits}"))
+fn qmv1_name(group: i32, bits: i32, lanes: u32, rows: u32, vecs: u32) -> &'static str {
+    let shape = if lanes == 32 && rows == 1 {
+        String::new()
     } else {
-        symbol(&format!("affine_qmv1_bf16_gs_{group}_b_{bits}_l{lanes}_r{rows}"))
-    }
+        format!("_l{lanes}_r{rows}")
+    };
+    let batch = if vecs == 1 {
+        String::new()
+    } else {
+        format!("_v{vecs}")
+    };
+    symbol(&format!("affine_qmv1_bf16_gs_{group}_b_{bits}{shape}{batch}"))
 }
+
+/// Activation rows one workgroup of the point multiplies; a batch takes
+/// blocks of the widest that is not wider than it.
+const QMV1_VECS: [u32; 3] = [1, 2, 4];
 
 /// Lanes a row of the one-row point can take.
 const QMV1_LANES: [u32; 3] = [32, 16, 8];
@@ -514,7 +526,13 @@ pub fn act_x_wt(
         );
     }
     let (lanes, rows) = (tuned.qmv_one_row_lanes, tuned.qmv_one_row_rows);
-    if m == 1
+    let vecs = match m {
+        1 => 1,
+        2 | 3 => 2,
+        _ => 4,
+    };
+    if (m == 1 || tuned.qmv_small_batch)
+        && m >= 1
         && tuned.qmv_one_row
         && QMV1_LANES.contains(&lanes)
         && QMV1_ROWS_PER_LANE.contains(&rows)
@@ -524,9 +542,14 @@ pub fn act_x_wt(
         && k % 8 == 0
     {
         return ctx.fire(
-            Fire::at(QMV1_FILE, qmv1_name(group, bits, lanes, rows)).apply(Grid::of(
-                // 256 invocations land 256 / lanes rows each `rows` deep.
-                [(n as u32).div_ceil(256 / lanes * rows) * 64, 4, 1],
+            Fire::at(QMV1_FILE, qmv1_name(group, bits, lanes, rows, vecs)).apply(Grid::of(
+                // 256 invocations land 256 / lanes rows each `rows` deep, for
+                // one block of `vecs` activation rows.
+                [
+                    (n as u32).div_ceil(256 / lanes * rows) * 64,
+                    4 * (m as u32).div_ceil(vecs),
+                    1,
+                ],
                 [64, 4, 1],
             )),
             &[

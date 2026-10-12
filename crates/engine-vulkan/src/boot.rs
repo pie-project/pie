@@ -92,5 +92,6 @@ fn tuning(doc: &toml::Table) {
         qmv_one_row: flag("qmv_one_row"),
         qmv_one_row_lanes: int("qmv_one_row_lanes"),
         qmv_one_row_rows: int("qmv_one_row_rows"),
+        qmv_small_batch: flag("qmv_small_batch"),
     });
 }

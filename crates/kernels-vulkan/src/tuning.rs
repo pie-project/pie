@@ -93,6 +93,11 @@ pub struct DeviceTuning {
     /// Output rows one lane of the one-row point carries, sharing the
     /// activations it loads: 1 or 2.
     pub qmv_one_row_rows: u32,
+
+    /// Small batches (decode with drafts, a few lanes) on the one-row point
+    /// too, in blocks of up to four activation rows that share each decoded
+    /// code, rather than on `qmv`.
+    pub qmv_small_batch: bool,
 }
 
 impl Default for DeviceTuning {
@@ -119,6 +124,7 @@ impl Default for DeviceTuning {
             qmv_one_row: false,
             qmv_one_row_lanes: 32,
             qmv_one_row_rows: 1,
+            qmv_small_batch: false,
         }
     }
 }
@@ -152,6 +158,7 @@ impl DeviceTuning {
             t.qmv_one_row = info.subgroup_size >= 32;
             t.qmv_one_row_lanes = 8;
             t.qmv_one_row_rows = 2;
+            t.qmv_small_batch = true;
         }
         t
     }
@@ -185,6 +192,7 @@ impl DeviceTuning {
             qmv_one_row,
             qmv_one_row_lanes,
             qmv_one_row_rows,
+            qmv_small_batch,
         );
         self
     }
@@ -230,6 +238,7 @@ pub struct Overrides {
     pub qmv_one_row: Option<bool>,
     pub qmv_one_row_lanes: Option<u32>,
     pub qmv_one_row_rows: Option<u32>,
+    pub qmv_small_batch: Option<bool>,
 }
 
 static DEVICE: OnceLock<DeviceInfo> = OnceLock::new();

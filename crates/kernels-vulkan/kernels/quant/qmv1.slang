@@ -16,6 +16,12 @@
 #ifndef PIE_RPL
 #define PIE_RPL 1
 #endif
+// Activation rows one workgroup multiplies; the grid's y walks the batch in
+// blocks of this many, so any small batch fits. Each code a lane decodes
+// feeds every one of them.
+#ifndef PIE_VECS
+#define PIE_VECS 1
+#endif
 #define PIE_HALF uint(PIE_LANES)
 // 256 invocations, as 64 x 4, land this many rows.
 #define PIE_ROWS (256u / PIE_HALF * uint(PIE_RPL))
@@ -57,6 +63,66 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint quads = k * uint(PIE_BITS) / 128u;
     uint gpr = k / uint(PIE_GROUP);
 
+#if PIE_VECS > 1
+    uint vec0 = group.y * uint(PIE_VECS);
+    uint vecs = min(uint(pc.vecs) - min(uint(pc.vecs), vec0), uint(PIE_VECS));
+    float acc[PIE_RPL][PIE_VECS];
+    [ForceUnroll] for (uint r = 0u; r < uint(PIE_RPL); r++) {
+        [ForceUnroll] for (uint v = 0u; v < uint(PIE_VECS); v++) acc[r][v] = 0.0;
+    }
+    if (first < n && vecs > 0u) {
+        for (uint q = lane; q < quads; q += PIE_HALF) {
+            uint kb = q * PIE_QUAD_CODES;
+            uint g = kb / uint(PIE_GROUP);
+            uint4 words[PIE_RPL];
+            [ForceUnroll] for (uint r = 0u; r < uint(PIE_RPL); r++) {
+                words[r] = w4[min(first + r, n - 1u) * quads + q];
+            }
+            float dot[PIE_RPL][PIE_VECS];
+            float xsum[PIE_VECS];
+            [ForceUnroll] for (uint v = 0u; v < uint(PIE_VECS); v++) {
+                xsum[v] = 0.0;
+                [ForceUnroll] for (uint r = 0u; r < uint(PIE_RPL); r++) dot[r][v] = 0.0;
+            }
+            [ForceUnroll] for (uint at = 0u; at < PIE_QUAD_CODES; at += 8u) {
+                float xs[PIE_VECS][8];
+                [ForceUnroll] for (uint v = 0u; v < uint(PIE_VECS); v++) {
+                    // A row past the batch reads the last one and lands nowhere.
+                    uint vec = vec0 + min(v, vecs - 1u);
+                    unpack8(x4[(vec * k + kb + at) / 8u], xs[v]);
+                    [ForceUnroll] for (uint i = 0u; i < 8u; i++) xsum[v] += xs[v][i];
+                }
+                [ForceUnroll] for (uint i = 0u; i < 8u; i++) {
+                    uint code = at + i;
+                    [ForceUnroll] for (uint r = 0u; r < uint(PIE_RPL); r++) {
+                        float c = pie_affine_code(words[r][code / cpw], code % cpw);
+                        [ForceUnroll] for (uint v = 0u; v < uint(PIE_VECS); v++) {
+                            dot[r][v] += c * xs[v][i];
+                        }
+                    }
+                }
+            }
+            [ForceUnroll] for (uint r = 0u; r < uint(PIE_RPL); r++) {
+                uint row = min(first + r, n - 1u);
+                float s = PIE_LOAD(scales[row * gpr + g]);
+                float b = PIE_LOAD(biases[row * gpr + g]);
+                [ForceUnroll] for (uint v = 0u; v < uint(PIE_VECS); v++) {
+                    acc[r][v] += s * dot[r][v] + b * xsum[v];
+                }
+            }
+        }
+    }
+    [ForceUnroll] for (uint r = 0u; r < uint(PIE_RPL); r++) {
+        [ForceUnroll] for (uint v = 0u; v < uint(PIE_VECS); v++) {
+            float sum = acc[r][v];
+            [ForceUnroll] for (uint step = PIE_HALF / 2u; step > 0u; step >>= 1u) {
+                sum += subgroupShuffleXor(sum, step);
+            }
+            uint row = first + r;
+            if (lane == 0u && row < n && v < vecs) y[(vec0 + v) * n + row] = PIE_STORE(sum);
+        }
+    }
+#else
     float acc[PIE_RPL];
     [ForceUnroll] for (uint r = 0u; r < uint(PIE_RPL); r++) acc[r] = 0.0;
     if (first < n) {
@@ -112,41 +178,114 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         uint row = first + r;
         if (lane == 0u && row < n) y[row] = PIE_STORE(sum);
     }
+#endif
 }
 
 // pie:instantiate affine_qmv1_bf16_gs_32_b_4 PIE_GROUP=32 PIE_BITS=4
+// pie:instantiate affine_qmv1_bf16_gs_32_b_4_v2 PIE_GROUP=32 PIE_BITS=4 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_32_b_4_v4 PIE_GROUP=32 PIE_BITS=4 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_32_b_4_l32_r2 PIE_GROUP=32 PIE_BITS=4 PIE_LANES=32 PIE_RPL=2
+// pie:instantiate affine_qmv1_bf16_gs_32_b_4_l32_r2_v2 PIE_GROUP=32 PIE_BITS=4 PIE_LANES=32 PIE_RPL=2 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_32_b_4_l32_r2_v4 PIE_GROUP=32 PIE_BITS=4 PIE_LANES=32 PIE_RPL=2 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_32_b_4_l16_r1 PIE_GROUP=32 PIE_BITS=4 PIE_LANES=16 PIE_RPL=1
+// pie:instantiate affine_qmv1_bf16_gs_32_b_4_l16_r1_v2 PIE_GROUP=32 PIE_BITS=4 PIE_LANES=16 PIE_RPL=1 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_32_b_4_l16_r1_v4 PIE_GROUP=32 PIE_BITS=4 PIE_LANES=16 PIE_RPL=1 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_32_b_4_l16_r2 PIE_GROUP=32 PIE_BITS=4 PIE_LANES=16 PIE_RPL=2
+// pie:instantiate affine_qmv1_bf16_gs_32_b_4_l16_r2_v2 PIE_GROUP=32 PIE_BITS=4 PIE_LANES=16 PIE_RPL=2 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_32_b_4_l16_r2_v4 PIE_GROUP=32 PIE_BITS=4 PIE_LANES=16 PIE_RPL=2 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_32_b_4_l8_r1 PIE_GROUP=32 PIE_BITS=4 PIE_LANES=8 PIE_RPL=1
+// pie:instantiate affine_qmv1_bf16_gs_32_b_4_l8_r1_v2 PIE_GROUP=32 PIE_BITS=4 PIE_LANES=8 PIE_RPL=1 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_32_b_4_l8_r1_v4 PIE_GROUP=32 PIE_BITS=4 PIE_LANES=8 PIE_RPL=1 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_32_b_4_l8_r2 PIE_GROUP=32 PIE_BITS=4 PIE_LANES=8 PIE_RPL=2
+// pie:instantiate affine_qmv1_bf16_gs_32_b_4_l8_r2_v2 PIE_GROUP=32 PIE_BITS=4 PIE_LANES=8 PIE_RPL=2 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_32_b_4_l8_r2_v4 PIE_GROUP=32 PIE_BITS=4 PIE_LANES=8 PIE_RPL=2 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_32_b_8 PIE_GROUP=32 PIE_BITS=8
+// pie:instantiate affine_qmv1_bf16_gs_32_b_8_v2 PIE_GROUP=32 PIE_BITS=8 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_32_b_8_v4 PIE_GROUP=32 PIE_BITS=8 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_32_b_8_l32_r2 PIE_GROUP=32 PIE_BITS=8 PIE_LANES=32 PIE_RPL=2
+// pie:instantiate affine_qmv1_bf16_gs_32_b_8_l32_r2_v2 PIE_GROUP=32 PIE_BITS=8 PIE_LANES=32 PIE_RPL=2 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_32_b_8_l32_r2_v4 PIE_GROUP=32 PIE_BITS=8 PIE_LANES=32 PIE_RPL=2 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_32_b_8_l16_r1 PIE_GROUP=32 PIE_BITS=8 PIE_LANES=16 PIE_RPL=1
+// pie:instantiate affine_qmv1_bf16_gs_32_b_8_l16_r1_v2 PIE_GROUP=32 PIE_BITS=8 PIE_LANES=16 PIE_RPL=1 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_32_b_8_l16_r1_v4 PIE_GROUP=32 PIE_BITS=8 PIE_LANES=16 PIE_RPL=1 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_32_b_8_l16_r2 PIE_GROUP=32 PIE_BITS=8 PIE_LANES=16 PIE_RPL=2
+// pie:instantiate affine_qmv1_bf16_gs_32_b_8_l16_r2_v2 PIE_GROUP=32 PIE_BITS=8 PIE_LANES=16 PIE_RPL=2 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_32_b_8_l16_r2_v4 PIE_GROUP=32 PIE_BITS=8 PIE_LANES=16 PIE_RPL=2 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_32_b_8_l8_r1 PIE_GROUP=32 PIE_BITS=8 PIE_LANES=8 PIE_RPL=1
+// pie:instantiate affine_qmv1_bf16_gs_32_b_8_l8_r1_v2 PIE_GROUP=32 PIE_BITS=8 PIE_LANES=8 PIE_RPL=1 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_32_b_8_l8_r1_v4 PIE_GROUP=32 PIE_BITS=8 PIE_LANES=8 PIE_RPL=1 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_32_b_8_l8_r2 PIE_GROUP=32 PIE_BITS=8 PIE_LANES=8 PIE_RPL=2
+// pie:instantiate affine_qmv1_bf16_gs_32_b_8_l8_r2_v2 PIE_GROUP=32 PIE_BITS=8 PIE_LANES=8 PIE_RPL=2 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_32_b_8_l8_r2_v4 PIE_GROUP=32 PIE_BITS=8 PIE_LANES=8 PIE_RPL=2 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_64_b_4 PIE_GROUP=64 PIE_BITS=4
+// pie:instantiate affine_qmv1_bf16_gs_64_b_4_v2 PIE_GROUP=64 PIE_BITS=4 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_64_b_4_v4 PIE_GROUP=64 PIE_BITS=4 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_64_b_4_l32_r2 PIE_GROUP=64 PIE_BITS=4 PIE_LANES=32 PIE_RPL=2
+// pie:instantiate affine_qmv1_bf16_gs_64_b_4_l32_r2_v2 PIE_GROUP=64 PIE_BITS=4 PIE_LANES=32 PIE_RPL=2 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_64_b_4_l32_r2_v4 PIE_GROUP=64 PIE_BITS=4 PIE_LANES=32 PIE_RPL=2 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_64_b_4_l16_r1 PIE_GROUP=64 PIE_BITS=4 PIE_LANES=16 PIE_RPL=1
+// pie:instantiate affine_qmv1_bf16_gs_64_b_4_l16_r1_v2 PIE_GROUP=64 PIE_BITS=4 PIE_LANES=16 PIE_RPL=1 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_64_b_4_l16_r1_v4 PIE_GROUP=64 PIE_BITS=4 PIE_LANES=16 PIE_RPL=1 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_64_b_4_l16_r2 PIE_GROUP=64 PIE_BITS=4 PIE_LANES=16 PIE_RPL=2
+// pie:instantiate affine_qmv1_bf16_gs_64_b_4_l16_r2_v2 PIE_GROUP=64 PIE_BITS=4 PIE_LANES=16 PIE_RPL=2 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_64_b_4_l16_r2_v4 PIE_GROUP=64 PIE_BITS=4 PIE_LANES=16 PIE_RPL=2 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_64_b_4_l8_r1 PIE_GROUP=64 PIE_BITS=4 PIE_LANES=8 PIE_RPL=1
+// pie:instantiate affine_qmv1_bf16_gs_64_b_4_l8_r1_v2 PIE_GROUP=64 PIE_BITS=4 PIE_LANES=8 PIE_RPL=1 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_64_b_4_l8_r1_v4 PIE_GROUP=64 PIE_BITS=4 PIE_LANES=8 PIE_RPL=1 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_64_b_4_l8_r2 PIE_GROUP=64 PIE_BITS=4 PIE_LANES=8 PIE_RPL=2
+// pie:instantiate affine_qmv1_bf16_gs_64_b_4_l8_r2_v2 PIE_GROUP=64 PIE_BITS=4 PIE_LANES=8 PIE_RPL=2 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_64_b_4_l8_r2_v4 PIE_GROUP=64 PIE_BITS=4 PIE_LANES=8 PIE_RPL=2 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_64_b_8 PIE_GROUP=64 PIE_BITS=8
+// pie:instantiate affine_qmv1_bf16_gs_64_b_8_v2 PIE_GROUP=64 PIE_BITS=8 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_64_b_8_v4 PIE_GROUP=64 PIE_BITS=8 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_64_b_8_l32_r2 PIE_GROUP=64 PIE_BITS=8 PIE_LANES=32 PIE_RPL=2
+// pie:instantiate affine_qmv1_bf16_gs_64_b_8_l32_r2_v2 PIE_GROUP=64 PIE_BITS=8 PIE_LANES=32 PIE_RPL=2 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_64_b_8_l32_r2_v4 PIE_GROUP=64 PIE_BITS=8 PIE_LANES=32 PIE_RPL=2 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_64_b_8_l16_r1 PIE_GROUP=64 PIE_BITS=8 PIE_LANES=16 PIE_RPL=1
+// pie:instantiate affine_qmv1_bf16_gs_64_b_8_l16_r1_v2 PIE_GROUP=64 PIE_BITS=8 PIE_LANES=16 PIE_RPL=1 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_64_b_8_l16_r1_v4 PIE_GROUP=64 PIE_BITS=8 PIE_LANES=16 PIE_RPL=1 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_64_b_8_l16_r2 PIE_GROUP=64 PIE_BITS=8 PIE_LANES=16 PIE_RPL=2
+// pie:instantiate affine_qmv1_bf16_gs_64_b_8_l16_r2_v2 PIE_GROUP=64 PIE_BITS=8 PIE_LANES=16 PIE_RPL=2 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_64_b_8_l16_r2_v4 PIE_GROUP=64 PIE_BITS=8 PIE_LANES=16 PIE_RPL=2 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_64_b_8_l8_r1 PIE_GROUP=64 PIE_BITS=8 PIE_LANES=8 PIE_RPL=1
+// pie:instantiate affine_qmv1_bf16_gs_64_b_8_l8_r1_v2 PIE_GROUP=64 PIE_BITS=8 PIE_LANES=8 PIE_RPL=1 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_64_b_8_l8_r1_v4 PIE_GROUP=64 PIE_BITS=8 PIE_LANES=8 PIE_RPL=1 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_64_b_8_l8_r2 PIE_GROUP=64 PIE_BITS=8 PIE_LANES=8 PIE_RPL=2
+// pie:instantiate affine_qmv1_bf16_gs_64_b_8_l8_r2_v2 PIE_GROUP=64 PIE_BITS=8 PIE_LANES=8 PIE_RPL=2 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_64_b_8_l8_r2_v4 PIE_GROUP=64 PIE_BITS=8 PIE_LANES=8 PIE_RPL=2 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_128_b_4 PIE_GROUP=128 PIE_BITS=4
+// pie:instantiate affine_qmv1_bf16_gs_128_b_4_v2 PIE_GROUP=128 PIE_BITS=4 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_128_b_4_v4 PIE_GROUP=128 PIE_BITS=4 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_128_b_4_l32_r2 PIE_GROUP=128 PIE_BITS=4 PIE_LANES=32 PIE_RPL=2
+// pie:instantiate affine_qmv1_bf16_gs_128_b_4_l32_r2_v2 PIE_GROUP=128 PIE_BITS=4 PIE_LANES=32 PIE_RPL=2 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_128_b_4_l32_r2_v4 PIE_GROUP=128 PIE_BITS=4 PIE_LANES=32 PIE_RPL=2 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_128_b_4_l16_r1 PIE_GROUP=128 PIE_BITS=4 PIE_LANES=16 PIE_RPL=1
+// pie:instantiate affine_qmv1_bf16_gs_128_b_4_l16_r1_v2 PIE_GROUP=128 PIE_BITS=4 PIE_LANES=16 PIE_RPL=1 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_128_b_4_l16_r1_v4 PIE_GROUP=128 PIE_BITS=4 PIE_LANES=16 PIE_RPL=1 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_128_b_4_l16_r2 PIE_GROUP=128 PIE_BITS=4 PIE_LANES=16 PIE_RPL=2
+// pie:instantiate affine_qmv1_bf16_gs_128_b_4_l16_r2_v2 PIE_GROUP=128 PIE_BITS=4 PIE_LANES=16 PIE_RPL=2 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_128_b_4_l16_r2_v4 PIE_GROUP=128 PIE_BITS=4 PIE_LANES=16 PIE_RPL=2 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_128_b_4_l8_r1 PIE_GROUP=128 PIE_BITS=4 PIE_LANES=8 PIE_RPL=1
+// pie:instantiate affine_qmv1_bf16_gs_128_b_4_l8_r1_v2 PIE_GROUP=128 PIE_BITS=4 PIE_LANES=8 PIE_RPL=1 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_128_b_4_l8_r1_v4 PIE_GROUP=128 PIE_BITS=4 PIE_LANES=8 PIE_RPL=1 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_128_b_4_l8_r2 PIE_GROUP=128 PIE_BITS=4 PIE_LANES=8 PIE_RPL=2
+// pie:instantiate affine_qmv1_bf16_gs_128_b_4_l8_r2_v2 PIE_GROUP=128 PIE_BITS=4 PIE_LANES=8 PIE_RPL=2 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_128_b_4_l8_r2_v4 PIE_GROUP=128 PIE_BITS=4 PIE_LANES=8 PIE_RPL=2 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_128_b_8 PIE_GROUP=128 PIE_BITS=8
+// pie:instantiate affine_qmv1_bf16_gs_128_b_8_v2 PIE_GROUP=128 PIE_BITS=8 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_128_b_8_v4 PIE_GROUP=128 PIE_BITS=8 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_128_b_8_l32_r2 PIE_GROUP=128 PIE_BITS=8 PIE_LANES=32 PIE_RPL=2
+// pie:instantiate affine_qmv1_bf16_gs_128_b_8_l32_r2_v2 PIE_GROUP=128 PIE_BITS=8 PIE_LANES=32 PIE_RPL=2 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_128_b_8_l32_r2_v4 PIE_GROUP=128 PIE_BITS=8 PIE_LANES=32 PIE_RPL=2 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_128_b_8_l16_r1 PIE_GROUP=128 PIE_BITS=8 PIE_LANES=16 PIE_RPL=1
+// pie:instantiate affine_qmv1_bf16_gs_128_b_8_l16_r1_v2 PIE_GROUP=128 PIE_BITS=8 PIE_LANES=16 PIE_RPL=1 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_128_b_8_l16_r1_v4 PIE_GROUP=128 PIE_BITS=8 PIE_LANES=16 PIE_RPL=1 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_128_b_8_l16_r2 PIE_GROUP=128 PIE_BITS=8 PIE_LANES=16 PIE_RPL=2
+// pie:instantiate affine_qmv1_bf16_gs_128_b_8_l16_r2_v2 PIE_GROUP=128 PIE_BITS=8 PIE_LANES=16 PIE_RPL=2 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_128_b_8_l16_r2_v4 PIE_GROUP=128 PIE_BITS=8 PIE_LANES=16 PIE_RPL=2 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_128_b_8_l8_r1 PIE_GROUP=128 PIE_BITS=8 PIE_LANES=8 PIE_RPL=1
+// pie:instantiate affine_qmv1_bf16_gs_128_b_8_l8_r1_v2 PIE_GROUP=128 PIE_BITS=8 PIE_LANES=8 PIE_RPL=1 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_128_b_8_l8_r1_v4 PIE_GROUP=128 PIE_BITS=8 PIE_LANES=8 PIE_RPL=1 PIE_VECS=4
 // pie:instantiate affine_qmv1_bf16_gs_128_b_8_l8_r2 PIE_GROUP=128 PIE_BITS=8 PIE_LANES=8 PIE_RPL=2
+// pie:instantiate affine_qmv1_bf16_gs_128_b_8_l8_r2_v2 PIE_GROUP=128 PIE_BITS=8 PIE_LANES=8 PIE_RPL=2 PIE_VECS=2
+// pie:instantiate affine_qmv1_bf16_gs_128_b_8_l8_r2_v4 PIE_GROUP=128 PIE_BITS=8 PIE_LANES=8 PIE_RPL=2 PIE_VECS=4
