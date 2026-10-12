@@ -9,7 +9,9 @@
 use std::path::Path;
 use std::sync::LazyLock;
 
-use profile::{Anywhere, Decision, Domain, Facts, Profile, Registry, Report, Shelf, Var};
+use profile::{
+    Anywhere, Candidate, Decision, Domain, Facts, Profile, Registry, Report, Shelf, Source, Var,
+};
 
 use crate::{Graphs, Recording};
 
@@ -63,13 +65,28 @@ pub struct Copies;
 #[decision(id = "compiler.grouped", flag, default = true, tune = engine)]
 pub struct Grouped;
 
+/// The share of the card past the weights a fire's working set (the
+/// activation arena, attention workspaces, decoded tiles) may take, in
+/// percent; the rest is owed to the cache rows, bodies and guests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.working_set_percent", constant(range(10..=90)), default = 50, tune = engine)]
+pub struct WorkingSetPercent(pub u32);
+
+/// Row buckets per doubling of the default lattice: 1 is powers of two, 2
+/// adds a bucket between each, which pads less and records more bodies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.lattice_steps", constant(set(1, 2)), default = 1, tune = engine)]
+pub struct LatticeSteps(pub u32);
+
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("cuda", FACTS, AXES);
     kernels_cuda::tuning::register(&mut r);
     r.add::<GraphMode>()
         .add::<RecordingMode>()
         .add::<Copies>()
-        .add::<Grouped>();
+        .add::<Grouped>()
+        .add::<WorkingSetPercent>()
+        .add::<LatticeSteps>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
     poem_compiler::costs::register(&mut r, 2);
     r
@@ -114,6 +131,8 @@ pub struct Engine {
     pub recording: Recording,
     pub copies: bool,
     pub grouped: bool,
+    pub working_set_percent: u32,
+    pub lattice_steps: u32,
 }
 
 impl Engine {
@@ -134,6 +153,8 @@ impl Engine {
             },
             copies: profile.on::<Copies>(&Anywhere),
             grouped: profile.on::<Grouped>(&Anywhere),
+            working_set_percent: profile.get::<WorkingSetPercent>().0,
+            lattice_steps: profile.get::<LatticeSteps>().0,
         }
     }
 }
@@ -209,7 +230,36 @@ pub fn pinned(graphs: Graphs, recording: Option<Recording>) -> Profile {
 /// then the checked-in one, then the registry defaults.
 #[must_use]
 pub fn resolve(device: &str, facts: &Facts, profiles: Option<&Path>) -> (Profile, Report) {
-    SHELF.resolve(registry(), device, facts, profiles)
+    let mut candidates = Vec::new();
+    if let Some(dir) = profiles {
+        let path = SHELF.user_path(dir, device);
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            candidates.push(Candidate {
+                source: Source::User(path.display().to_string()),
+                text,
+            });
+        }
+    }
+    candidates.extend(SHELF.seeded_for(device));
+    if let Some(text) = derived(facts) {
+        candidates.push(Candidate {
+            source: Source::Derived,
+            text,
+        });
+    }
+    registry().resolve(&candidates, facts)
+}
+
+/// What a GPU's facts change from the registry defaults, for a GPU no file
+/// names: Blackwell (`cc` 100 and up) takes the narrow bf16 GEMV and the
+/// naive MLA kernel, whose FA2 arms were sized for Ada's shared memory.
+/// `None` where the defaults stand.
+#[must_use]
+pub fn derived(facts: &Facts) -> Option<String> {
+    let cc = facts.get("cc")?;
+    (cc >= 100).then(|| {
+        "api = 1\n[kernel]\ngemv.bf16 = \"narrow\"\nmla.path = \"naive\"\n".to_string()
+    })
 }
 
 #[cfg(test)]
@@ -271,6 +321,18 @@ mod tests {
     }
 
     #[test]
+    fn a_blackwell_no_file_names_takes_its_derived_kernels() {
+        let (profile, report) = resolve("NVIDIA RTX PRO 6000", &facts(12, 0, 188), None);
+        assert_eq!(report.used, Source::Derived);
+        let tuning = kernels_cuda::tuning::Tuning::of(&profile);
+        assert!(tuning.gemv_narrow && tuning.mla_naive);
+        let (profile, report) = resolve("NVIDIA A10", &facts(8, 6, 72), None);
+        assert_eq!(report.used, Source::Defaults);
+        let tuning = kernels_cuda::tuning::Tuning::of(&profile);
+        assert!(!tuning.gemv_narrow && !tuning.mla_naive);
+    }
+
+    #[test]
     fn the_defaults_are_what_cuda_ran_before_profiles() {
         let engine = Engine::of(&registry().defaults());
         assert_eq!(
@@ -282,6 +344,8 @@ mod tests {
                 },
                 copies: true,
                 grouped: true,
+                working_set_percent: 50,
+                lattice_steps: 1,
             }
         );
         assert_eq!(

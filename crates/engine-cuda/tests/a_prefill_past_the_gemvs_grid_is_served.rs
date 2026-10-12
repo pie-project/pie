@@ -156,7 +156,6 @@ fn load(fixture: &Fixture, chip: Option<profile::Profile>) -> engine_cuda::Resul
         budget: Budget::new(1, fixture.text.ceiling),
         patches: None,
         voxels: None,
-        profile: None,
         page_size: PAGE,
         context: fixture.text.ceiling.next_multiple_of(PAGE),
         slots: 2,

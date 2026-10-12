@@ -186,7 +186,6 @@ fn fire(fixture: &Fixture, knobs: Knobs) -> engine_cuda::Result<Vec<f32>> {
         budget: Budget::new(1, ceiling),
         patches: None,
         voxels: None,
-        profile: None,
         page_size: PAGE,
         context: ceiling,
         slots: 1,

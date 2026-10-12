@@ -834,9 +834,9 @@ fn dispatch_dense(
     causal: bool,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    // The plan carries the device it was scheduled for, so the arm follows the
-    // same device; a plan built for an Ada ceiling takes the Ada arm anywhere.
-    if plan.device.cc_major >= 10 {
+    // `kernel.mla.path`: Blackwell profiles pick `naive`; otherwise the FA2
+    // arm the plan's device fits.
+    if ctx.tuning().mla_naive {
         let num_requests = kv::lanes_of(op, qo_indptr)?;
         return naive::fire(
             ctx,

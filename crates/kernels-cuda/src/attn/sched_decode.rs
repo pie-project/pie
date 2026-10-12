@@ -290,7 +290,7 @@ pub fn can_use_static_nonsplit(
     enable_cuda_graph: bool,
     toggles: Toggles,
 ) -> bool {
-    !enable_cuda_graph && !toggles.force_split_small && num_requests <= 512
+    !enable_cuda_graph && !toggles.force_split_small && num_requests <= toggles.static_max_requests
 }
 
 pub fn static_nonsplit(

@@ -48,12 +48,12 @@ pub(crate) fn gemv_bf16(
         ArgValue::I32(k),
         ArgValue::F32(0.0),
     ];
-    let blackwell = ctx
-        .compute_capability_major()
-        .is_some_and(|major| major >= 10);
+    // `kernel.gemv.bf16`: Blackwell profiles pick `narrow`.
+    let tuning = ctx.tuning();
+    let narrow = tuning.gemv_narrow;
 
-    if n <= 4096 {
-        let (instantiation, warps) = if blackwell {
+    if n.unsigned_abs() <= tuning.gemv_splitk_max_n {
+        let (instantiation, warps) = if narrow {
             (
                 "::pie::linear::gemv_splitk_bf16_kernel<::pie::i32(4), 2>",
                 4,
@@ -72,7 +72,7 @@ pub(crate) fn gemv_bf16(
         );
     }
 
-    let instantiation = if blackwell {
+    let instantiation = if narrow {
         "::pie::linear::gemv_bf16_kernel<::pie::i32(4), 2>"
     } else {
         "::pie::linear::gemv_bf16_kernel<::pie::i32(4), 4>"

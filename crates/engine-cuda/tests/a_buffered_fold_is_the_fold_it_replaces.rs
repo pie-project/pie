@@ -87,7 +87,6 @@ fn ready(what: &str) -> Option<Shell> {
         checkpoint: &checkpoint,
         budget: Budget::new(4, 256),
         patches: None,
-        profile: None,
         page_size: PAGE,
         context: 512,
         slots: 8,

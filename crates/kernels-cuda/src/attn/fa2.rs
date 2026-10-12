@@ -205,7 +205,6 @@ pub(crate) fn prefill<P>(
         at.head_dim,
         at.cta_tile_q,
         KvWidth::BF16,
-        false,
         &at.device,
     )?;
     ctx.fire(
@@ -242,7 +241,6 @@ pub(crate) fn prefill_ragged<P>(
         at.head_dim,
         at.cta_tile_q,
         KvWidth::BF16,
-        false,
         &at.device,
     )?;
     ctx.fire(
@@ -662,7 +660,6 @@ impl PrefillGeometry {
         head_dim: u32,
         cta_tile_q: u32,
         kv: KvWidth,
-        use_fp16_qk_reduction: bool,
         dev: &Device,
     ) -> Result<Self, Error> {
         if !matches!(cta_tile_q, 16 | 32 | 64 | 128) {
@@ -737,7 +734,6 @@ impl PrefillGeometry {
                 dev.max_smem_per_block_optin
             }
         };
-        let _ = use_fp16_qk_reduction;
         let max_mma_kv_reg = 8 / num_mma_q;
         if per_block <= fixed_smem || (per_block - fixed_smem) < per_mma_kv {
             return Err(refuse(

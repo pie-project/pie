@@ -1,5 +1,7 @@
 use kernels_cuda::Tensor;
-use kernels_cuda::attn::plan::{Device, Workspace, prefill_graph_padding, prefill_partial_rows};
+use kernels_cuda::attn::plan::{
+    Device, Toggles, Workspace, prefill_graph_padding, prefill_partial_rows,
+};
 use poem_compiler::Budget;
 use poem_ir::{Dtype, StructKind};
 
@@ -15,16 +17,13 @@ const GRANT_INT_BYTES: u64 = 1 << 20;
 
 const GRANT_FLOAT_BYTES: u64 = 64 << 20;
 
-fn graph_float_bytes(facts: &SpaceFacts, sms: u32) -> u64 {
-    let padded = u64::from(2 * sms.max(1)) / u64::from(facts.kv_heads.max(1)).max(1);
-    let tile = if facts.head_dim >= 256 { 64 } else { 128 };
-    let heads = u64::from(facts.q_heads);
-    let v = heads * padded * tile * u64::from(facts.head_dim) * 4;
-    let s = heads * padded * tile * 4;
-    (v + s).next_multiple_of(ALIGN) + 2 * ALIGN
-}
-
-fn prefill_float_bytes(facts: &SpaceFacts, rows: u32, lanes: u32, device: &Device) -> u64 {
+fn prefill_float_bytes(
+    facts: &SpaceFacts,
+    rows: u32,
+    lanes: u32,
+    device: &Device,
+    toggles: Toggles,
+) -> u64 {
     let (tile, padded) = prefill_graph_padding(
         rows,
         lanes,
@@ -32,11 +31,26 @@ fn prefill_float_bytes(facts: &SpaceFacts, rows: u32, lanes: u32, device: &Devic
         facts.kv_heads,
         facts.head_dim,
         device,
+        toggles.prefill_ctas_per_sm,
     );
     let heads = u64::from(facts.q_heads);
     let rows = prefill_partial_rows(tile, facts.q_heads, facts.kv_heads);
     let v = heads * padded * rows * u64::from(facts.head_dim) * 4;
     let s = heads * padded * rows * 4;
+    (v + s).next_multiple_of(ALIGN) + 2 * ALIGN
+}
+
+/// A decode plan's partials at `lanes` rows. The decode room is held to the
+/// larger of this and `graph_float_bytes`, a prefill-tile multiple well past
+/// what the decode planner's grid uses: the token budget is fitted against
+/// that room (`serve::load`), and a smaller room moves where the budget
+/// lands, which the card's later state-slot fit does not yet follow.
+fn graph_float_bytes(facts: &SpaceFacts, sms: u32) -> u64 {
+    let padded = u64::from(2 * sms.max(1)) / u64::from(facts.kv_heads.max(1)).max(1);
+    let tile = if facts.head_dim >= 256 { 64 } else { 128 };
+    let heads = u64::from(facts.q_heads);
+    let v = heads * padded * tile * u64::from(facts.head_dim) * 4;
+    let s = heads * padded * tile * 4;
     (v + s).next_multiple_of(ALIGN) + 2 * ALIGN
 }
 
@@ -58,7 +72,12 @@ fn latent_float_bytes(rank: u32, sms: u32) -> u64 {
 /// The float workspace each attention plan's launches need, sized for the
 /// budget's widest fire: a prefill plan for `max_tokens` rows over
 /// `max_lanes`, a decode plan for `max_lanes` rows, on this device's SMs.
-fn plan_floats(budget: &Budget, facts: &Facts, device: &Device) -> Vec<Option<u64>> {
+fn plan_floats(
+    budget: &Budget,
+    facts: &Facts,
+    device: &Device,
+    toggles: Toggles,
+) -> Vec<Option<u64>> {
     facts
         .plans
         .iter()
@@ -70,9 +89,10 @@ fn plan_floats(budget: &Budget, facts: &Facts, device: &Device) -> Vec<Option<u6
                         budget.buckets.last().copied().unwrap_or(budget.max_tokens),
                         budget.max_lanes,
                         device,
+                        toggles,
                     ),
                     StructKind::AttnPrefillPlanSm90 => {
-                        graph_float_bytes(&seat.reading, device.num_sm)
+                        unreachable!("no CUDA trace plans an sm90 prefill")
                     }
                     StructKind::AttnDecodePlan => graph_float_bytes(&seat.reading, device.num_sm)
                         .max(decode_float_bytes(&seat.reading, budget.max_lanes)),
@@ -94,9 +114,10 @@ pub fn attention_workspace_bytes(
     budget: &Budget,
     facts: &Facts,
     device: &Device,
+    toggles: Toggles,
     schedule_streams: &[Option<u32>],
 ) -> u64 {
-    let floats_of = plan_floats(budget, facts, device);
+    let floats_of = plan_floats(budget, facts, device, toggles);
     let mut per_stream: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
     let mut own = 0u64;
     for (plan, floats) in floats_of.iter().enumerate() {
@@ -419,6 +440,7 @@ impl Inputs {
         runs: u32,
         gathered: usize,
         device: Device,
+        toggles: Toggles,
         runahead: engine::runahead::Runahead,
         patch: Option<PatchSeat>,
         mrope: bool,
@@ -507,7 +529,7 @@ impl Inputs {
         let mrope = mrope.then(|| take(rows * AXES * 4));
         let self_cond = (self_cond_taps > 0).then(|| take(rows * self_cond_taps * 4 * 2));
         let runs = runs.max(1);
-        let floats_of = plan_floats(budget, facts, &device);
+        let floats_of = plan_floats(budget, facts, &device, toggles);
         let mut per_stream: std::collections::BTreeMap<u32, u64> =
             std::collections::BTreeMap::new();
         for (plan, floats) in floats_of.iter().enumerate() {

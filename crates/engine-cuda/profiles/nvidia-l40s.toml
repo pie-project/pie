@@ -30,11 +30,31 @@ moe.mxfp4_wmma     = true
 sdpa.decode.split_small     = false
 sdpa.decode.split_window    = false
 sdpa.decode.chunk_floor_128 = false
+sdpa.decode.static_max_requests = 512
+sdpa.prefill.ctas_per_sm        = 2
+moe.group_at                = 4
+moe.mxfp4_grouped_reuse     = 2
+moe.affine_grouped          = true
+moe.affine_wmma             = true
+moe.affine_grouped_from     = 16
+gemv.bf16                   = "wide"
+gemv.splitk_max_n           = 4096
+mla.path                    = "fa2"
+qmm.gemm_from               = 16
+qmm.long_rows               = 512
+qmm.split_warps_per_sm      = 58
+qmm.split_thin_max          = 32
+qmm.split_wide_max          = 16
+gemm.workspace_mb           = 8
+gemm.heuristics             = 8
+gemm.skinny_rows            = 64
 
 [engine]
 graphs    = "on"
 recording = { use = "bodies", mem_mb = 4096 }
 copies    = true
+working_set_percent = 50
+lattice_steps       = 1
 
 [compiler]
 grouped                = true

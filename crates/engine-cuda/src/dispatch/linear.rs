@@ -7,7 +7,6 @@ use poem_ir::{Dtype, Fused, Linear, Operands, ValueId};
 
 use crate::run::Run;
 
-const PREFILL_ROWS: u32 = 16;
 
 impl DispatchLinear for Run<'_> {
     fn dispatch(&mut self, op: &Linear) -> Result<(), KernelError> {
@@ -34,7 +33,13 @@ impl Run<'_> {
                     let (m, k) = (a.rows as i32, a.width as i32);
                     let i = i32::try_from(*intermediate).unwrap_or(0);
                     if weight.rows == 2 * *intermediate
-                        && linear::skinny::covers(m, i, k, linear::skinny::Epilogue::Geglu)
+                        && linear::skinny::covers(
+                            m,
+                            i,
+                            k,
+                            linear::skinny::Epilogue::Geglu,
+                            self.ctx().tuning().gemm_skinny_rows,
+                        )
                     {
                         return linear::skinny::skinny_bf16(
                             self.ctx(),
@@ -126,7 +131,7 @@ impl Run<'_> {
                     let out = self.tensor(*y);
                     let (m, n, k) = (a.rows as i32, weight.rows as i32, a.width as i32);
                     let epilogue = linear::skinny::Epilogue::Softcap(*cap);
-                    if linear::skinny::covers(m, n, k, epilogue) {
+                    if linear::skinny::covers(m, n, k, epilogue, self.ctx().tuning().gemm_skinny_rows) {
                         return linear::skinny::skinny_bf16(
                             self.ctx(),
                             weight.ptr,
@@ -170,7 +175,7 @@ impl Run<'_> {
             Linear::Matmul { act, w, y } => match self.maybe_tiled_planes(*w) {
                 Some((codes, scales, biases, seat)) => {
                     let act = self.tensor(*act);
-                    let entry = if act.rows >= PREFILL_ROWS {
+                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from {
                         linear::tiled::matmul
                     } else {
                         linear::tiled::matmul_gemv
@@ -190,7 +195,7 @@ impl Run<'_> {
             Linear::LmHead { act, w, y } => match self.maybe_tiled_planes(*w) {
                 Some((codes, scales, biases, seat)) => {
                     let act = self.tensor(*act);
-                    let entry = if act.rows >= PREFILL_ROWS {
+                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from {
                         linear::tiled::lm_head
                     } else {
                         linear::tiled::lm_head_gemv
@@ -628,7 +633,7 @@ impl Run<'_> {
             Some((codes, scales, biases, seat)) => {
                 let act = self.tensor(*act);
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
-                let entry = if act.rows >= PREFILL_ROWS && !seat.streams() && held {
+                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from && !seat.streams() && held {
                     linear::quant::matmul_via_dense
                 } else {
                     linear::quant::matmul
@@ -672,7 +677,7 @@ impl Run<'_> {
             Some((codes, scales, biases, seat)) => {
                 let act = self.tensor(*act);
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
-                let entry = if act.rows >= PREFILL_ROWS && !seat.streams() && held {
+                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from && !seat.streams() && held {
                     linear::quant::lm_head_via_dense
                 } else {
                     linear::quant::lm_head
@@ -783,32 +788,37 @@ impl Run<'_> {
     }
 }
 
+/// A staging buffer per `name`, grown by doubling. A buffer it outgrows is
+/// kept, never freed: copies queued on it may still be in flight, and a
+/// free here would either race them or synchronise the device (illegal
+/// mid-capture). Doubling keeps what is retired under the live buffer's
+/// size.
 fn staging(name: &'static str, bytes: usize) -> Option<u64> {
     use std::collections::HashMap;
     use std::sync::Mutex;
-    static HELD: Mutex<Option<HashMap<&'static str, (u64, usize)>>> = Mutex::new(None);
+    struct Held {
+        live: HashMap<&'static str, (u64, usize)>,
+        retired: Vec<u64>,
+    }
+    static HELD: Mutex<Option<Held>> = Mutex::new(None);
     if bytes == 0 {
         return None;
     }
     let mut held = HELD
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let map = held.get_or_insert_with(HashMap::new);
-    if let Some((ptr, cap)) = map.get(name)
-        && *cap >= bytes
-    {
+    let held = held.get_or_insert_with(|| Held {
+        live: HashMap::new(),
+        retired: Vec::new(),
+    });
+    let cap = held.live.get(name).map_or(0, |(_, cap)| *cap);
+    if let Some((ptr, _)) = held.live.get(name).filter(|_| cap >= bytes) {
         return Some(*ptr);
     }
-    let fresh =
-        crate::device::alloc::raw_alloc(bytes.max(map.get(name).map_or(0, |(_, cap)| cap * 2)))?;
-    if let Some((old, _)) = map.insert(
-        name,
-        (
-            fresh,
-            bytes.max(map.get(name).map_or(0, |(_, cap)| cap * 2)),
-        ),
-    ) {
-        crate::device::alloc::raw_free(old);
+    let size = bytes.max(cap * 2);
+    let fresh = crate::device::alloc::raw_alloc(size)?;
+    if let Some((old, _)) = held.live.insert(name, (fresh, size)) {
+        held.retired.push(old);
     }
     Some(fresh)
 }

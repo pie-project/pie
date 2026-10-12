@@ -196,7 +196,6 @@ pub fn load(trace: Trace, contract: &ModelContract, checkpoint: &Path, max_voxel
         budget: Budget::new(2, 16),
         patches: None,
         voxels: Some(VoxelLadder::new(max_voxels, 2)),
-        profile: None,
         page_size: 16,
         context: 64,
         slots: 2,

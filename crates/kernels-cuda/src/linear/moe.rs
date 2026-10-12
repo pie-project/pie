@@ -427,9 +427,6 @@ const fn block_rows(per_expert: u32) -> u32 {
 }
 
 #[cfg(feature = "cuda")]
-const GROUP_AT: u32 = 4;
-
-#[cfg(feature = "cuda")]
 const GROUP_WORKSPACE_CAP: u64 = 512 << 20;
 
 #[cfg(feature = "cuda")]
@@ -458,7 +455,7 @@ fn grouped_worth(
         return None;
     }
     let per_expert = fan.route_count.div_ceil(count);
-    if per_expert < GROUP_AT {
+    if per_expert < ctx.tuning().moe_group_at {
         return None;
     }
     let block = block_rows(per_expert);
@@ -779,15 +776,14 @@ fn matmul_select_mxfp4(
     const EXPERT_CAP: u32 = 4096;
     // The grouped kernels read an expert once per batch of its routes, the
     // by-route one once per route but at the card's streaming rate, so grouping
-    // pays only once an expert serves more than two routes on average; routes
-    // over experts is a floor on that average.
-    const GROUPED_REUSE: u32 = 2;
+    // pays only once an expert serves more than `kernel.moe.mxfp4_grouped_reuse`
+    // routes on average; routes over experts is a floor on that average.
     const GROUPED_TILE_N: u32 = 128;
     const GROUPED_BLOCK: u32 = 256;
     const WMMA_ROUTES: u32 = 32;
 
     let experts = codes.rows.clamp(1, EXPERT_CAP);
-    if fan.route_count > GROUPED_REUSE * experts && ctx.tuning().mxfp4_grouped {
+    if fan.route_count > ctx.tuning().mxfp4_grouped_reuse * experts && ctx.tuning().mxfp4_grouped {
         let order_words = fan.route_count as usize;
         let offsets_at = order_words.next_multiple_of(64);
         let work_cap = fan.route_count.div_ceil(WMMA_ROUTES) + experts;
@@ -992,7 +988,6 @@ fn matmul_select_mlxu4(
     const ROUTE_ORDER: &str = "moe_route_order";
     const ORDER_BLOCK: u32 = 1024;
     const EXPERT_CAP: u32 = 4096;
-    const GROUPED_FROM: u32 = 16;
     const GROUPED_TILE_N: u32 = 128;
     const GROUPED_BLOCK: u32 = 256;
     const WMMA_ROUTES: u32 = 32;
@@ -1025,8 +1020,10 @@ fn matmul_select_mlxu4(
             ctx.stage(),
         ],
     )?;
-    if fan.route_count >= GROUPED_FROM {
-        let entry = if x.dtype == Dtype::Bf16 {
+    let tuning = ctx.tuning();
+    if tuning.affine_grouped && fan.route_count >= tuning.affine_grouped_from {
+        let wmma = x.dtype == Dtype::Bf16 && tuning.affine_wmma;
+        let entry = if wmma {
             format!(
                 "::pie::linear::moe_matmul_select_mlxu4_wmma<::pie::i32({bits}), ::pie::i32({group})>"
             )
@@ -1036,7 +1033,6 @@ fn matmul_select_mlxu4(
                  ::pie::i32({group})>"
             )
         };
-        let wmma = x.dtype == Dtype::Bf16;
         let mut args = vec![x.arg(), ArgValue::Ptr(order), ArgValue::Ptr(offsets)];
         if wmma {
             args.push(ArgValue::Ptr(work));

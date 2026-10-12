@@ -1,7 +1,7 @@
 use kernels_cuda::attn::{self, fa2, index, mla, plan, pool, selected};
 use kernels_cuda::attn_dense;
 use poem_exec::{DispatchAttention, KernelError};
-use poem_ir::{Attention, Operands, StructKind};
+use poem_ir::{Attention, StructKind};
 
 use crate::run::{Run, StructSlot};
 use kernels_cuda::RaggedTensor;
@@ -135,6 +135,7 @@ impl Run<'_> {
                                 fire.capture,
                                 spans,
                                 &fire.device,
+                                fire.toggles,
                                 seat.workspace,
                             )?;
                             if let Some(wanted) = crate::serve::diag::on().plan_trace.as_deref()
@@ -162,33 +163,10 @@ impl Run<'_> {
                             built.stage(self.ctx())?;
                             StructSlot::Prefill(built)
                         }
-                        StructKind::AttnPrefillPlanSm90 => {
-                            let built = plan::plan_prefill_sm90(
-                                self.qo_indptr_host(),
-                                &seat.kv_indptr,
-                                &seat.kv_len,
-                                seat.rows,
-                                seat.shape,
-                                seat.live,
-                                true,
-                                fire.capture,
-                                &fire.device,
-                                seat.workspace,
-                            )?;
-                            if crate::serve::diag::on().plan_trace.is_some() {
-                                eprintln!(
-                                    "[plan-trace] sm90 capture={} rows={} live={:?} window={:?} grant={:?} info={:?}",
-                                    fire.capture,
-                                    seat.rows,
-                                    seat.live,
-                                    seat.window,
-                                    seat.workspace,
-                                    built.info
-                                );
-                            }
-                            built.stage(self.ctx())?;
-                            StructSlot::PrefillSm90(built)
-                        }
+                        StructKind::AttnPrefillPlanSm90 => panic!(
+                            "an sm90 plan kind on a cuda trace is a trace bug: no CUDA \
+                             trace plans one"
+                        ),
                         other => panic!(
                             "`attention.plan_prefill` defines a {other:?}, which is no \
                              prefill plan kind"
@@ -301,11 +279,7 @@ impl Run<'_> {
                 log_floor,
                 log_alpha,
                 o,
-            } => match self.slot(*plan) {
-                StructSlot::PrefillSm90(_) => {
-                    Err(kernels_cuda::Error::Unsupported { op: op.name() })
-                }
-                _ => attn::prefill_rel(
+            } => attn::prefill_rel(
                     self.ctx(),
                     self.ragged_q(*q),
                     self.prefill_plan(*plan),
@@ -322,7 +296,6 @@ impl Run<'_> {
                     *sm_scale,
                     &mut self.tensor(*o),
                 ),
-            },
             Attention::Prefill {
                 q,
                 plan,
@@ -332,19 +305,7 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 o,
-            } => match self.slot(*plan) {
-                StructSlot::PrefillSm90(sm90) => attn::prefill_sm90(
-                    self.ctx(),
-                    self.ragged_q(*q),
-                    sm90,
-                    &self.pool(*cache),
-                    *window,
-                    *head_dim,
-                    *kv_heads,
-                    *sm_scale,
-                    &mut self.tensor(*o),
-                ),
-                _ => attn::prefill(
+            } => attn::prefill(
                     self.ctx(),
                     self.ragged_q(*q),
                     self.prefill_plan(*plan),
@@ -355,7 +316,6 @@ impl Run<'_> {
                     *sm_scale,
                     &mut self.tensor(*o),
                 ),
-            },
             Attention::Masked {
                 kv_heads: _,
                 causal: _,

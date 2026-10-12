@@ -48,12 +48,12 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     kernels_cuda::disk::install(boot.cache_dir);
 
     let stated_buckets = std::mem::take(&mut boot.budget.buckets);
-    boot.budget.buckets = crate::api::lattice(stated_buckets.clone(), boot.budget.max_tokens);
+    boot.budget.buckets =
+        crate::api::lattice(stated_buckets.clone(), boot.budget.max_tokens, engine.lattice_steps);
 
     let grouped: &[&str] = if engine.grouped { &crate::GROUPED } else { &[] };
-    let mut profile = boot.profile.take().unwrap_or_else(|| {
-        DeviceProfile::of(&chip, device.device().num_sm, &crate::EXCLUSIVE, grouped)
-    });
+    let mut profile =
+        DeviceProfile::of(&chip, device.device().num_sm, &crate::EXCLUSIVE, grouped);
     profile.exclusive = crate::EXCLUSIVE
         .iter()
         .map(|op| (*op).to_string())
@@ -110,7 +110,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         if !stated_buckets.is_empty() {
             buckets.push(tokens);
         }
-        budget.buckets = crate::api::lattice(buckets, tokens);
+        budget.buckets = crate::api::lattice(buckets, tokens, engine.lattice_steps);
         budget
     };
     let asked_tokens = boot.budget.max_tokens;
@@ -135,11 +135,13 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 &budget,
                 &facts,
                 &device.device(),
+                device.toggles(),
                 &crate::exports::schedule_streams(&boot.trace, &compiled),
             ))
             .saturating_add(windowed)
     };
-    let tokens = crate::store::tokens_within(asked_tokens, floor, after_weights / 2, working_at);
+    let share = after_weights / 100 * u64::from(engine.working_set_percent);
+    let tokens = crate::store::tokens_within(asked_tokens, floor, share, working_at);
     if tokens != asked_tokens {
         eprintln!(
             "engine-cuda: [engine] max_forward_tokens {asked_tokens} is served at {tokens}: at \
@@ -246,6 +248,7 @@ fn refit(
     profile: &DeviceProfile,
     paging: Paging,
     table: &crate::run::WeightTable,
+    engine: crate::chip::Engine,
 ) -> Result<(CompiledModel, Budgets, Vec<u64>)> {
     let (free, total) = crate::store::device_memory()?;
     let live = crate::device::elastic::budget_bytes(free, total, boot.knobs.gpu_mem_utilization);
@@ -271,7 +274,7 @@ fn refit(
             .filter(|bucket| *bucket < tokens)
             .collect();
         buckets.push(tokens);
-        budget.buckets = crate::api::lattice(buckets, tokens);
+        budget.buckets = crate::api::lattice(buckets, tokens, engine.lattice_steps);
         budget
     };
     let budgets_at = |budget: &Budget| Budgets {
@@ -312,6 +315,7 @@ fn refit(
                 &budget,
                 &facts,
                 &device.device(),
+                device.toggles(),
                 &schedule_streams(&boot.trace, &compiled),
             ))
             .saturating_add(tiles)
@@ -339,7 +343,11 @@ fn refit(
         let room = live
             .saturating_sub(sequence)
             .saturating_sub(crate::store::BODIES_FLOOR_BYTES);
-        Ok(if owed { room.min(live / 2) } else { room })
+        Ok(if owed {
+            room.min(live / 100 * u64::from(engine.working_set_percent))
+        } else {
+            room
+        })
     };
     let floor = TOKENS_FLOOR.min(asked_tokens);
     let fit = |owed: bool, scoped: bool| -> Result<Option<(u32, u32)>> {
@@ -488,6 +496,7 @@ impl Shell {
             &profile,
             paging,
             weights.table(),
+            engine,
         )?;
         let paging = paging.windowed(
             crate::store::window_of(&boot.trace)?,
@@ -705,6 +714,7 @@ impl Shell {
             poem_exec::fire::max_runs(&compiled),
             poem_exec::fire::fragmentable(&compiled),
             device.device(),
+            device.toggles(),
             boot.runahead,
             patch_seat,
             mrope_seat,

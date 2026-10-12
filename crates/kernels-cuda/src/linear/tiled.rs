@@ -49,11 +49,11 @@ pub const SHORT: Tuple = Tuple {
     stages: 4,
 };
 
-pub const LONG_PREFILL_ROWS: u32 = 512;
-
+/// The tile `rows` rows take: the long one from `long_rows`
+/// (`kernel.qmm.long_rows`), else the short one.
 #[must_use]
-pub const fn tuple_for(rows: u32) -> Tuple {
-    if rows >= LONG_PREFILL_ROWS {
+pub const fn tuple_for(rows: u32, long_rows: u32) -> Tuple {
+    if rows >= long_rows {
         LONG
     } else {
         SHORT
@@ -143,7 +143,7 @@ pub fn matmul(
     y: &mut Tensor,
     seat: GroupSeat,
 ) -> Result<(), Error> {
-    let tuple = tuple_for(y.rows);
+    let tuple = tuple_for(y.rows, ctx.tuning().qmm_long_rows);
     tiled_launch(
         ctx,
         "linear.matmul",
@@ -166,7 +166,7 @@ pub fn lm_head(
     y: &mut Tensor,
     seat: GroupSeat,
 ) -> Result<(), Error> {
-    let tuple = tuple_for(y.rows);
+    let tuple = tuple_for(y.rows, ctx.tuning().qmm_long_rows);
     tiled_launch(
         ctx,
         "linear.lm_head",
@@ -299,29 +299,47 @@ impl Carve {
     }
 }
 
-pub const TARGET_WARPS: u32 = 8 * 1024;
-
 pub const MIN_SPLIT: u32 = 8;
-
-pub const THIN_SPLIT: u32 = 32;
-
-pub const WIDE_SPLIT: u32 = 16;
 
 pub const THIN_ROWS: u32 = 8;
 
+/// What a split-K GEMV aims for: warps over the whole GPU (its SMs times
+/// `kernel.qmm.split_warps_per_sm`), and the deepest split for thin (8 rows
+/// or fewer) and wider row counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SplitAim {
+    pub warps: u32,
+    pub thin_max: u32,
+    pub wide_max: u32,
+}
+
+impl SplitAim {
+    #[must_use]
+    pub fn of(ctx: &Ctx) -> SplitAim {
+        let tuning = ctx.tuning();
+        // A context that cannot say its SM count aims as an L40S would.
+        let sms = ctx.multiprocessors().unwrap_or(142);
+        SplitAim {
+            warps: sms.saturating_mul(tuning.qmm_split_warps_per_sm).max(1),
+            thin_max: tuning.qmm_split_thin_max,
+            wide_max: tuning.qmm_split_wide_max,
+        }
+    }
+}
+
 #[must_use]
-pub const fn carve_for(n: u32, rows: u32) -> Carve {
+pub const fn carve_for(n: u32, rows: u32, aim: SplitAim) -> Carve {
     let bands = n.div_ceil(BAND);
     let deepest = if rows <= THIN_ROWS {
-        THIN_SPLIT
+        aim.thin_max
     } else {
-        WIDE_SPLIT
+        aim.wide_max
     };
     #[allow(clippy::manual_checked_ops)]
     let want = if bands == 0 {
         deepest
     } else {
-        (TARGET_WARPS / bands).next_power_of_two()
+        (aim.warps / bands).next_power_of_two()
     };
     let split = if want < MIN_SPLIT {
         MIN_SPLIT
@@ -365,7 +383,7 @@ pub fn matmul_gemv(
         biases,
         y,
         seat,
-        carve_for(y.width, y.rows),
+        carve_for(y.width, y.rows, SplitAim::of(ctx)),
     )
 }
 
@@ -387,7 +405,7 @@ pub fn lm_head_gemv(
         biases,
         y,
         seat,
-        carve_for(y.width, y.rows),
+        carve_for(y.width, y.rows, SplitAim::of(ctx)),
     )
 }
 

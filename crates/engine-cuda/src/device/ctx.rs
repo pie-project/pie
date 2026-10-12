@@ -71,7 +71,6 @@ pub struct Context {
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     slabs: Slabs,
     device: Device,
-    toggles: Toggles,
     capability: (i32, i32),
     /// The name the driver gives the GPU: what its profile is filed under.
     name: String,
@@ -161,7 +160,6 @@ impl Context {
                     conditional: None,
                     events: Vec::new(),
                     device,
-                    toggles: Toggles::of(kernels_cuda::tuning::Tuning::default()),
                     capability: capability(ordinal),
                     name: name(ordinal),
                 })
@@ -344,7 +342,7 @@ impl Context {
 
     #[must_use]
     pub fn toggles(&self) -> Toggles {
-        self.toggles
+        Toggles::of(self.ctx.tuning())
     }
 
     /// The GPU's name as the driver gives it.
@@ -357,7 +355,6 @@ impl Context {
     /// streams.
     pub fn set_tuning(&mut self, tuning: kernels_cuda::tuning::Tuning) {
         self.ctx.set_tuning(tuning);
-        self.toggles = Toggles::of(tuning);
     }
 
     #[must_use]
