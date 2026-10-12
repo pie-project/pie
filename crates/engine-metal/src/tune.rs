@@ -371,6 +371,8 @@ impl Measured {
 #[derive(Clone, Debug)]
 pub struct Knob {
     pub id: &'static str,
+    /// The value the profile holds now, as TOML.
+    pub current: String,
     /// `(label, overrides)`: the value as a reader sees it, and the TOML.
     pub candidates: Vec<(String, String)>,
     pub plan_only: bool,
@@ -484,6 +486,7 @@ pub fn knobs(base: &Profile, _depth: Depth) -> Vec<Knob> {
         let plan_only = matches!(spec.tune, profile::Tune::Price) || domain == "fuse";
         out.push(Knob {
             id: spec.id,
+            current,
             candidates,
             plan_only,
         });
@@ -508,7 +511,7 @@ pub struct Line {
 
 /// The fitted values of the measured decisions, as profile TOML under
 /// `[kernel]`, and the report lines.
-pub fn fit(measured: &Measured, grid: &Grid, cores: u32) -> Result<(Vec<(String, String)>, Vec<Line>), String> {
+pub fn fit(measured: &Measured, grid: &Grid, cores: u32) -> Result<(Entries, Vec<Line>), String> {
     let mut lines = Vec::new();
     // `qmm_fp16`: whether the fp16 format's best time beats the emulated
     // format's over the 4-bit, 64-group points, weighted as decode-heavy.
@@ -587,6 +590,73 @@ pub fn fit(measured: &Measured, grid: &Grid, cores: u32) -> Result<(Vec<(String,
     ];
     Ok((entries, lines))
 }
+
+/// Halfway from `best` toward its nearest tried neighbours, for a
+/// candidate that differs from them in one whole number (`percent = 71`
+/// between 47 and 94): what a second look at a numeric decision tries.
+/// Candidates already tried, and labels with fractions, give nothing.
+#[must_use]
+pub fn halfway(best: &str, tried: &[(String, bool)]) -> Vec<String> {
+    // The label as text with its numbers cut out, and the numbers.
+    fn split(label: &str) -> (Vec<String>, Vec<i64>) {
+        let mut text = vec![String::new()];
+        let mut numbers = Vec::new();
+        let mut digits = String::new();
+        for c in label.chars().chain(std::iter::once(' ')) {
+            if c.is_ascii_digit() {
+                digits.push(c);
+            } else {
+                if !digits.is_empty() {
+                    numbers.push(digits.parse().unwrap_or(0));
+                    digits.clear();
+                    text.push(String::new());
+                }
+                text.last_mut().expect("a piece").push(c);
+            }
+        }
+        (text, numbers)
+    }
+    if best.contains('.') {
+        return Vec::new();
+    }
+    let (text, numbers) = split(best);
+    let mut out = Vec::new();
+    for at in 0..numbers.len() {
+        let v = numbers[at];
+        let others: Vec<i64> = tried
+            .iter()
+            .map(|(l, _)| split(l))
+            .filter(|(t, n)| *t == text && n.len() == numbers.len())
+            .filter(|(_, n)| (0..n.len()).all(|i| i == at || n[i] == numbers[i]))
+            .map(|(_, n)| n[at])
+            .collect();
+        let below = others.iter().copied().filter(|&x| x < v).max();
+        let above = others.iter().copied().filter(|&x| x > v).min();
+        for neighbour in [below, above].into_iter().flatten() {
+            let mid = (v + neighbour) / 2;
+            if mid == v || mid == neighbour || others.contains(&mid) {
+                continue;
+            }
+            let mut n = numbers.clone();
+            n[at] = mid;
+            let mut label = String::new();
+            for (i, piece) in text.iter().enumerate() {
+                label.push_str(piece);
+                if let Some(x) = n.get(i) {
+                    label.push_str(&x.to_string());
+                }
+            }
+            let label = label.trim_end().to_string();
+            if !tried.iter().any(|(l, _)| *l == label) && !out.contains(&label) {
+                out.push(label);
+            }
+        }
+    }
+    out
+}
+
+/// Tuned decisions as `(decision id, TOML value)`.
+pub type Entries = Vec<(String, String)>;
 
 /// `(decision id, TOML value)` entries as profile TOML, a table a domain.
 #[must_use]
@@ -684,10 +754,8 @@ pub fn assemble(
     Ok(text)
 }
 
-#[cfg(target_vendor = "apple")]
 pub use device::{Check, Outcome, artifacts, run};
 
-#[cfg(target_vendor = "apple")]
 mod device {
     use std::cell::RefCell;
     use std::path::Path;
@@ -953,14 +1021,27 @@ mod device {
         dot / (aa * bb).sqrt() >= 0.99 && top(a) == top(b)
     }
 
-    /// Coordinate descent over `knobs`, serving `deployment` end to end:
-    /// each decision's candidates are served against the incumbent, and
-    /// the fastest is taken if it beats it by more than the noise and reads
-    /// the same.
+    /// A decision's best candidate so far: its relative time, label, file,
+    /// and what each model it moved served.
+    type Best = (f64, String, String, Vec<(usize, Served)>);
+
+    /// One model the search serves, and what it served last.
+    struct Seat<'a> {
+        artifact: &'a Path,
+        deployment: &'a str,
+        incumbent: Served,
+        /// Served again in this decision's round already.
+        fresh: bool,
+    }
+
+    /// Coordinate descent over `knobs`, serving `models` end to end: each
+    /// decision's candidates are served on the models that read it (or,
+    /// for a price or fusion, whose plan it changes), against the
+    /// incumbent served again just before them, and the fastest on average
+    /// is taken if it beats the noise on every model and reads the same.
     #[allow(clippy::too_many_arguments)]
     fn search(
-        artifact: &Path,
-        deployment: &str,
+        models: &[(std::path::PathBuf, String)],
         device: &str,
         base: &Profile,
         facts: &profile::Facts,
@@ -968,82 +1049,140 @@ mod device {
         mut chosen: Vec<(String, String)>,
         knobs: &[super::Knob],
         say: &mut dyn FnMut(&str),
-    ) -> Result<(Vec<(String, String)>, Vec<Line>), String> {
+    ) -> Result<(super::Entries, Vec<Line>), String> {
         let file = |entries: &[(String, String)]| {
             super::assemble(base, device, facts, &super::render_overrides(entries), &[])
         };
         let mut incumbent_text = file(&chosen)?;
-        let mut incumbent = serve(artifact, deployment, device, &incumbent_text)?;
-        // What this model reads: a kernel decision it never asks cannot
-        // change how it serves, so it is not served for.
-        let read = incumbent.3.clone();
+        let mut seats: Vec<Seat<'_>> = Vec::new();
+        for (artifact, deployment) in models {
+            match serve(artifact, deployment, device, &incumbent_text) {
+                Ok(served) => seats.push(Seat {
+                    artifact,
+                    deployment,
+                    incumbent: served,
+                    fresh: false,
+                }),
+                Err(why) => say(&format!("  {deployment} did not serve, left out: {why}")),
+            }
+        }
+        if seats.is_empty() {
+            return Err("no check model serves".into());
+        }
         let mut lines = Vec::new();
-        let ane_refused = incumbent.4.clone();
         for knob in knobs {
-            if let Some(why) = ane_refused.as_ref().filter(|_| knob.id.starts_with("kernel.ane")) {
-                let text = format!("kept; the Neural Engine refuses programs on this machine ({why})");
+            for seat in &mut seats {
+                seat.fresh = false;
+            }
+            let ane = knob.id.starts_with("kernel.ane");
+            // The models this decision can move: those that read it, and
+            // for the Neural Engine those whose programs compile.
+            let movable: Vec<usize> = (0..seats.len())
+                .filter(|&i| {
+                    let s = &seats[i].incumbent;
+                    (knob.plan_only || s.3.contains(&knob.id)) && !(ane && s.4.is_some())
+                })
+                .collect();
+            if movable.is_empty() {
+                let text = if ane {
+                    let why = seats.iter().find_map(|s| s.incumbent.4.clone()).unwrap_or_default();
+                    format!("kept; the Neural Engine refuses programs on this machine ({why})")
+                } else {
+                    "kept; no check model reads it".to_string()
+                };
                 say(&format!("{}: {text}", knob.id));
                 lines.push(Line { id: knob.id, text });
                 continue;
             }
-            if !knob.plan_only && !read.contains(&knob.id) {
-                let text = format!("kept; {deployment} never reads it");
-                say(&format!("{}: {text}", knob.id));
-                lines.push(Line { id: knob.id, text });
-                continue;
-            }
-            let incumbent_plan = if knob.plan_only {
-                plan_of(deployment, &incumbent_text, cores)
-            } else {
-                None
-            };
-            let mut best: Option<(f64, String, String, Served)> = None;
+            let plans: Vec<Option<_>> = (0..seats.len())
+                .map(|i| {
+                    knob.plan_only
+                        .then(|| plan_of(seats[i].deployment, &incumbent_text, cores))
+                        .flatten()
+                })
+                .collect();
+            let mut best: Option<Best> = None;
             let mut notes: Vec<String> = Vec::new();
-            // The incumbent again, served just before its rivals: drift
-            // between servings lands on both, and how far it moved since
-            // its last serving is the noise a rival must beat twice over.
             let mut bar = 1.0 / Check::NOISE;
-            let mut fresh = true;
-            for (label, _) in &knob.candidates {
+            let mut queue: Vec<String> = knob.candidates.iter().map(|(l, _)| l.clone()).collect();
+            // The incumbent counts as tried, so halfway never skips it.
+            let mut tried: Vec<(String, bool)> = vec![(knob.current.clone(), true)];
+            let mut bracketed = false;
+            let mut at = 0;
+            'candidate: while at < queue.len() || !bracketed {
+                if at == queue.len() {
+                    // Once: where the fastest number sits between a
+                    // neighbour that lost or failed, try halfway to it.
+                    bracketed = true;
+                    if let Some((_, label, ..)) = &best {
+                        queue.extend(super::halfway(label, &tried));
+                    }
+                    continue;
+                }
+                let label = queue[at].clone();
+                at += 1;
+                let label = &label;
+                tried.push((label.clone(), false));
                 let trial = super::with_entry(&chosen, knob.id, label);
                 let text = match file(&trial) {
                     Ok(t) => t,
                     Err(why) => {
-                        notes.push(format!("{label} refused ({})", why.lines().next().unwrap_or("")));
+                        let why = why.lines().next().unwrap_or("").to_string();
+                        // `origin:line:col: ` says nothing a reader needs.
+                        let why = why.splitn(4, ':').nth(3).map_or(why.clone(), |w| w.trim().to_string());
+                        notes.push(format!("refused: {why}\u{1f}{label}"));
                         continue;
                     }
                 };
-                if knob.plan_only
-                    && incumbent_plan.is_some()
-                    && plan_of(deployment, &text, cores) == incumbent_plan
-                {
-                    notes.push(format!("{label} plans the same"));
+                let on: Vec<usize> = movable
+                    .iter()
+                    .copied()
+                    .filter(|&i| {
+                        !knob.plan_only
+                            || plans[i].is_none()
+                            || plan_of(seats[i].deployment, &text, cores) != plans[i]
+                    })
+                    .collect();
+                if on.is_empty() {
+                    notes.push(format!("plans the same\u{1f}{label}"));
                     continue;
                 }
-                if fresh {
-                    fresh = false;
-                    let again = serve(artifact, deployment, device, &incumbent_text)?;
-                    let noise = (relative(&again, &incumbent) - 1.0).abs();
-                    bar = bar.min(1.0 - 2.0 * noise);
-                    incumbent = again;
+                let mut got: Vec<(usize, Served)> = Vec::new();
+                let mut r = 0.0;
+                for &i in &on {
+                    // The incumbent again, just before its rivals: drift
+                    // lands on both, and how far it moved since its last
+                    // serving is the noise a rival must beat twice over.
+                    if !seats[i].fresh {
+                        let again = serve(seats[i].artifact, seats[i].deployment, device, &incumbent_text)?;
+                        let noise = (relative(&again, &seats[i].incumbent) - 1.0).abs();
+                        bar = bar.min(1.0 - 2.0 * noise);
+                        seats[i].incumbent = again;
+                        seats[i].fresh = true;
+                    }
+                    let seat = &seats[i];
+                    let served = match serve(seat.artifact, seat.deployment, device, &text) {
+                        Ok(Served(.., Some(why))) if seat.incumbent.4.is_none() => {
+                            notes.push(format!("{label}: the Neural Engine refused it ({why})"));
+                            continue 'candidate;
+                        }
+                        Ok(g) => g,
+                        Err(why) => {
+                            let why: String = why.lines().next().unwrap_or("").chars().take(100).collect();
+                            notes.push(format!("{label} did not serve ({why})"));
+                            continue 'candidate;
+                        }
+                    };
+                    if !agrees(&served.2, &seat.incumbent.2) {
+                        notes.push(format!("{label} reads differently on {}", seat.deployment));
+                        continue 'candidate;
+                    }
+                    r += relative(&served, &seat.incumbent) / on.len() as f64;
+                    got.push((i, served));
                 }
-                let got = match serve(artifact, deployment, device, &text) {
-                    Ok(Served(.., Some(why))) if ane_refused.is_none() => {
-                        notes.push(format!("{label}: the Neural Engine refused it ({why})"));
-                        continue;
-                    }
-                    Ok(g) => g,
-                    Err(why) => {
-                        let why: String = why.lines().next().unwrap_or("").chars().take(100).collect();
-                        notes.push(format!("{label} did not serve ({why})"));
-                        continue;
-                    }
-                };
-                let r = relative(&got, &incumbent);
                 say(&format!("  {} = {label}: {:+.1}%", knob.id, (r - 1.0) * 100.0));
-                if !agrees(&got.2, &incumbent.2) {
-                    notes.push(format!("{label} reads differently"));
-                    continue;
+                if let Some(last) = tried.last_mut() {
+                    last.1 = true;
                 }
                 if best.as_ref().is_none_or(|(b, ..)| r < *b) {
                     best = Some((r, label.clone(), text, got));
@@ -1053,7 +1192,9 @@ mod device {
                 Some((r, label, text, got)) if r < bar => {
                     chosen = super::with_entry(&chosen, knob.id, &label);
                     incumbent_text = text;
-                    incumbent = got;
+                    for (i, served) in got {
+                        seats[i].incumbent = served;
+                    }
                     format!("{label}: {:.1}% faster end to end", (1.0 - r) * 100.0)
                 }
                 Some((r, label, ..)) => format!(
@@ -1063,6 +1204,27 @@ mod device {
                 ),
                 None => "kept; no other candidate served".to_string(),
             };
+            // Notes that share a reason name it once: `reason: a, b, c`.
+            let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
+            for note in notes {
+                let (reason, label) = note
+                    .split_once('\u{1f}')
+                    .map_or((note.clone(), None), |(r, l)| (r.to_string(), Some(l.to_string())));
+                match grouped.iter_mut().find(|(r, _)| *r == reason) {
+                    Some((_, labels)) => labels.extend(label),
+                    None => grouped.push((reason, label.into_iter().collect())),
+                }
+            }
+            let notes: Vec<String> = grouped
+                .into_iter()
+                .map(|(reason, labels)| {
+                    if labels.is_empty() {
+                        reason
+                    } else {
+                        format!("{reason}: {}", labels.join(", "))
+                    }
+                })
+                .collect();
             let text = if notes.is_empty() {
                 text
             } else {
@@ -1293,26 +1455,23 @@ mod device {
         };
         let (mut chosen, mut lines) = super::fit(&measured, &grid, cores)?;
         let knobs = super::knobs(&base, depth);
-        match models.first() {
-            Some((artifact, deployment)) => {
-                say(&format!(
-                    "searching {} decisions end to end on {deployment}",
-                    knobs.len()
-                ));
-                let (found, searched) =
-                    search(artifact, deployment, &name, &base, &facts, cores, chosen, &knobs, say)?;
-                chosen = found;
-                lines.extend(searched);
+        if models.is_empty() {
+            for k in &knobs {
+                lines.push(Line {
+                    id: k.id,
+                    text: "not searched: no model to serve (import one, or pass --check)".to_string(),
+                });
             }
-            None => {
-                for k in &knobs {
-                    lines.push(Line {
-                        id: k.id,
-                        text: "not searched: no model to serve (import one, or pass --check)"
-                            .to_string(),
-                    });
-                }
-            }
+        } else {
+            let names: Vec<&str> = models.iter().map(|(_, d)| d.as_str()).collect();
+            say(&format!(
+                "searching {} decisions end to end on {}",
+                knobs.len(),
+                names.join(", ")
+            ));
+            let (found, searched) = search(models, &name, &base, &facts, cores, chosen, &knobs, say)?;
+            chosen = found;
+            lines.extend(searched);
         }
         let tuned = super::render_overrides(&chosen);
         let tuned_ids: Vec<String> = lines
@@ -1852,5 +2011,22 @@ mod tests {
         let _ = tuning.qmm(&tuning.qmm_at(8, 4096, 4096, 4, 64));
         // The point reads the fp16 flag for its format.
         assert_eq!(base.read(), vec!["kernel.qmm", "kernel.qmm_fp16"]);
+    }
+
+    #[test]
+    fn a_second_look_tries_halfway_to_the_neighbours() {
+        let tried: Vec<(String, bool)> = [24, 35, 47, 59, 71, 94]
+            .iter()
+            .map(|p| (format!("{{ use = \"share\", percent = {p} }}"), *p != 94))
+            .collect();
+        assert_eq!(
+            halfway("{ use = \"share\", percent = 71 }", &tried),
+            vec![
+                "{ use = \"share\", percent = 65 }".to_string(),
+                "{ use = \"share\", percent = 82 }".to_string()
+            ]
+        );
+        assert!(halfway("120.0", &[("60.0".into(), true)]).is_empty());
+        assert_eq!(halfway("64", &[("32".into(), true), ("128".into(), true)]), vec!["48", "96"]);
     }
 }

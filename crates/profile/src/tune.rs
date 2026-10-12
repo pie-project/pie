@@ -188,6 +188,9 @@ const THRESHOLDS: usize = 16;
 /// One atom, or two on different variables, by index into the atoms.
 type Condition = (usize, Option<usize>);
 
+/// A ladder's rungs before its tail, as conditions and candidates.
+type Rungs = Vec<(Condition, usize)>;
+
 /// Every single-variable condition the data can tell apart.
 fn atoms(spec: &Spec, samples: &[Sample]) -> Vec<Atom> {
     let mut out = Vec::new();
@@ -277,7 +280,7 @@ fn search(
     };
     let mut current = score(&ladder, tail);
     for _ in 0..64 {
-        let mut best: Option<(f64, Vec<(Condition, usize)>, usize)> = None;
+        let mut best: Option<(f64, Rungs, usize)> = None;
         let mut offer = |value: f64, ladder: Vec<(Condition, usize)>, tail: usize| {
             if value < current - 1e-12 && best.as_ref().is_none_or(|(b, ..)| value < *b) {
                 best = Some((value, ladder, tail));
