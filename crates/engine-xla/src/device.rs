@@ -26,6 +26,9 @@ pub struct Device {
     ordinal: usize,
     kind: String,
     limit: Option<u64>,
+    /// What the plugin reported in use when the device opened, before this
+    /// load landed anything; zero when it reports nothing.
+    held: u64,
     /// Where each compiled module is also written, for inspection
     /// (`PIE_XLA_DUMP`).
     dump: Option<PathBuf>,
@@ -71,18 +74,20 @@ impl Device {
                 ),
             })?;
         let kind = client.device_kind(device).unwrap_or_default();
-        let limit = client
-            .memory_stats(device)
-            .ok()
+        let stats = client.memory_stats(device).ok();
+        let limit = stats
+            .as_ref()
             .and_then(|stats| stats.bytes_limit)
             .and_then(|b| u64::try_from(b).ok());
-        tracing::info!(kind, ?limit, "xla device open");
+        let held = stats.map_or(0, |stats| u64::try_from(stats.bytes_in_use).unwrap_or(0));
+        tracing::info!(kind, ?limit, held, "xla device open");
         Ok(Device {
             client: Some(client),
             dry: None,
             ordinal,
             kind,
             limit,
+            held,
             cache: Mutex::new(HashMap::new()),
             dump: std::env::var_os("PIE_XLA_DUMP").map(PathBuf::from),
             disk: disk_cache(),
@@ -119,6 +124,7 @@ impl Device {
             ordinal,
             kind,
             limit: None,
+            held: 0,
             cache: Mutex::new(HashMap::new()),
             dump: std::env::var_os("PIE_XLA_DUMP").map(PathBuf::from),
             disk: None,
@@ -166,6 +172,13 @@ impl Device {
     #[must_use]
     pub fn memory(&self) -> Option<u64> {
         self.limit
+    }
+
+    /// Device memory in use when it opened, before this load landed
+    /// anything (zero when the plugin reports none).
+    #[must_use]
+    pub fn held(&self) -> u64 {
+        self.held
     }
 
     fn device(&self) -> Result<pjrt::Device> {

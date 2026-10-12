@@ -39,7 +39,13 @@ fn a_replayed_buffer_folds_to_the_plain_walk() {
         page_size: 16,
         context,
         slots: 4,
-        pages: 4 * context / 16,
+        kv_budget: common::kv_budget(
+            &m.deployment.trace(Platform::Xla),
+            context,
+            4,
+            4 * context / 16,
+        ),
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         device: &DeviceBoot::default(),
         patches: None,
     })

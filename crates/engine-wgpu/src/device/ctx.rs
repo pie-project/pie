@@ -477,13 +477,17 @@ pub async fn request(boot: &DeviceBoot) -> Result<Handed> {
 }
 
 impl Context {
-    pub fn bind(boot: &DeviceBoot) -> Result<Context> {
+    /// The device `boot` names, of whose memory a load takes `share`.
+    pub fn bind(boot: &DeviceBoot, share: f64) -> Result<Context> {
         let _gate = gate();
         let handed = host::block_on("request_device", request(boot))??;
-        Context::adopt(boot, handed)
+        Context::adopt(boot, share, handed)
     }
 
-    pub fn adopt(boot: &DeviceBoot, handed: Handed) -> Result<Context> {
+    /// A device the host already holds, of whose memory a load takes
+    /// `share`. wgpu reports no free memory, so the share is of the whole:
+    /// `[wgpu] device_memory`, else the Vulkan device-local heap, else 8 GiB.
+    pub fn adopt(boot: &DeviceBoot, share: f64, handed: Handed) -> Result<Context> {
         let Handed {
             adapter,
             device,
@@ -535,9 +539,8 @@ impl Context {
             device_local,
         });
         let dummy = Raw::new(&core, DUMMY_BYTES, Memory::Device)?;
-        let fraction = boot.gpu_mem_utilization.clamp(0.0, 1.0);
         let context = Context {
-            working_set: (device_local as f64 * fraction) as u64,
+            working_set: (device_local as f64 * share.clamp(0.0, 1.0)) as u64,
             max_buffer,
             core,
             dummy,

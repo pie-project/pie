@@ -78,13 +78,14 @@ impl Accounting {
         }
         Err(Fault::Residency(format!(
             "the card does not hold this deployment: {card} bytes on the device, of which \
-             `[engine] gpu_mem_utilization` allows pie {ceiling}; this load's weight tier \
+             `[model] device_memory_share` allows pie {ceiling}; this load's weight tier \
              takes {weights} and the driver's safety floor holds back {floor}, leaving the \
-             elastic pool {pool} bytes — and one sequence at the declared context needs \
-             {minimum} across this model's cache rows. weight tier + elastic pool + safety \
+             elastic pool {pool} bytes — and the cache rows need {minimum}: `[model] \
+             device_kv_budget`, or one sequence at the declared context when that is \
+             omitted. weight tier + elastic pool + safety \
              floor must fit inside the fraction of the card, and here they do not. Lower \
-             `[model] max_context` or `[model] slots`, raise `[engine] \
-             gpu_mem_utilization`, or state a `[model] device_weight_budget` that streams \
+             `[model] max_context` or `[model] slots`, raise `[model] \
+             device_memory_share`, or state a `[model] device_weight_budget` that streams \
              the weight tier down.",
             card = self.card,
             ceiling = self.ceiling,
@@ -225,6 +226,35 @@ fn slot_file(error: std::io::Error) -> Fault {
     }
 }
 
+/// The most pages `bytes` of cache rows could hold, the ceiling the pool's
+/// address space is reserved for: `bytes` over the least a page adds to the
+/// rows. A full row adds the page; a windowed one at most half of it, since
+/// its window grows by a page for every two past the first sequence.
+pub fn page_ceiling(trace: &Trace, page_size: u32, context: u32, bytes: u64) -> Result<u64> {
+    let mut page: u64 = 0;
+    for row in &trace.caches {
+        if let CacheRow::Kv {
+            name,
+            planes,
+            dtype,
+            window,
+            ..
+        } = row
+        {
+            let cells = u64::from(page_size) / if window.is_some() { 2 } else { 1 };
+            let element = elem_bytes(name, *dtype)?;
+            for width in planes {
+                page = page.saturating_add(cells * width * element);
+            }
+        }
+    }
+    let one_sequence = u64::from(context.div_ceil(page_size.max(1)));
+    Ok(match page {
+        0 => one_sequence,
+        page => (bytes / page).clamp(one_sequence, u64::from(u32::MAX)),
+    })
+}
+
 pub fn one_slot_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
     let mut bytes: u64 = 0;
     for row in &trace.caches {
@@ -306,12 +336,16 @@ pub fn admit_the_card(
     extra_resident: u64,
     trace: &Trace,
     paging: Paging,
+    kv_budget: Option<u64>,
 ) -> Result<Accounting> {
     let accounting = Accounting::of(
         device_memory()?.1,
         utilization,
         weight_tier_bytes(trace, weights, extra_resident)?,
-        one_slot_bytes(trace, paging)?,
+        match kv_budget {
+            Some(budget) => budget,
+            None => one_slot_bytes(trace, paging)?,
+        },
     );
     accounting.admit()?;
     Ok(accounting)
@@ -422,6 +456,9 @@ pub struct Pools {
     paging: Paging,
     asked: u64,
     ceiling: u64,
+    /// `[model] device_kv_budget`: the bytes the cache rows take, never cut
+    /// to fit; `None` fills what the card hands out.
+    budget: Option<u64>,
     airborne: Option<Airborne>,
     committed_kv_pages: u32,
     committed_state_slots: u32,
@@ -459,6 +496,7 @@ impl Pools {
         utilization: f64,
         trace: &Trace,
         paging: Paging,
+        budget: Option<u64>,
         facts: &Facts,
     ) -> Result<Pools> {
         let pool = PhysicalPool::open(device, utilization)?;
@@ -576,6 +614,7 @@ impl Pools {
             paging,
             asked: paging.pages(),
             ceiling: paging.pages(),
+            budget,
             airborne: None,
             committed_kv_pages: 0,
             committed_state_slots: 0,
@@ -817,16 +856,25 @@ impl Pools {
         } else {
             self.declared_at(one_slot)
         };
+        // A stated budget is the rows' before the bodies and programs are
+        // held anything; with none, one sequence is.
+        let claim = self.budget.unwrap_or(need);
         let configured = bodies;
         let asked_programs = programs;
         let (mut bodies, mut programs) =
-            holds_within(configured, asked_programs, live.saturating_sub(need));
+            holds_within(configured, asked_programs, live.saturating_sub(claim));
         let mut held = programs.saturating_add(bodies);
         let mut room = live.saturating_sub(held);
-        let mut fit = pages_within(self.ceiling, room, |pages| self.declared_at(pages));
+        if let Some(budget) = self.budget.filter(|&budget| budget > room) {
+            return Err(Fault::Residency(
+                engine::fit::Short::Budget { budget, room }.to_string(),
+            ));
+        }
+        let limit = self.budget.unwrap_or(room);
+        let mut fit = pages_within(self.ceiling, limit, |pages| self.declared_at(pages));
         if fresh && fit < self.ceiling {
             let slots = self.paging.slots;
-            let fine = pages_within(self.ceiling, room, |pages| {
+            let fine = pages_within(self.ceiling, limit, |pages| {
                 self.declared_reshaped(pages, slots)
             });
             if fine > fit {
@@ -839,7 +887,7 @@ impl Pools {
         // refusal. The slots are then cut to what leaves the kv pages their
         // half of the room past one sequence, in the whole seats the
         // runtime admits lanes by.
-        if fit < one_slot && fresh && self.has_state() {
+        if fit < one_slot && fresh && self.has_state() && self.budget.is_none() {
             let one_sequence = self.declared_reshaped(one_slot, 0);
             let slots = state_slots_within(self.paging.slots, room, one_sequence, |slots| {
                 self.declared_reshaped(0, slots)
@@ -859,13 +907,22 @@ impl Pools {
                 fit = pages_within(self.ceiling, room, |pages| self.declared_at(pages));
             }
         }
+        if let Some(budget) = self.budget.filter(|_| fit < one_slot) {
+            return Err(Fault::Residency(
+                engine::fit::Short::Sequence {
+                    budget,
+                    least: need,
+                }
+                .to_string(),
+            ));
+        }
         if fit < one_slot {
             return Err(Fault::Residency(format!(
-                "the card does not hold this deployment: {resident}; under `[engine] \
-                 gpu_mem_utilization` that leaves {room} bytes for the cache rows, and one \
+                "the card does not hold this deployment: {resident}; under `[model] \
+                 device_memory_share` that leaves {room} bytes for the cache rows, and one \
                  sequence at the declared context, beside the declared state slots, needs \
                  {need} across them. Lower `[engine] max_model_len` or `[engine] \
-                 max_state_slots`, raise `[engine] gpu_mem_utilization`, state a `[model] \
+                 max_state_slots`, raise `[model] device_memory_share`, state a `[model] \
                  device_weight_budget` that streams the weight tier down, or free what \
                  else holds the device."
             )));

@@ -36,7 +36,7 @@ int main(int argc, char **argv) {
     error = NULL;
     if (argc < 2) return 0;
 
-    status = pie_server_start(argv[1], "{\"max_total_pages\": 256}", "/tmp/pie-c-smoke", "127.0.0.1:0", &server, &error);
+    status = pie_server_start(argv[1], "{\"device_kv_budget\": \"256MiB\"}", "/tmp/pie-c-smoke", "127.0.0.1:0", &server, &error);
     if (status != PIE_OK) return fail("boot", status, error);
     printf("booted: %s\n", pie_server_summary(server));
     printf("gateway: %s\n", pie_server_listen_addr(server));

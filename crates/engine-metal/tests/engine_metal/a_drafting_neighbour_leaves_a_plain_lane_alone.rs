@@ -49,6 +49,7 @@ fn load(artifact: &PathBuf) -> Shell {
         .unwrap_or_else(|why| panic!("the artifact holds every plane of {DEPLOYMENT}: {why}"));
     drop(source);
     Shell::load(Boot {
+        kv_budget: crate::full_pool(&trace, 16, 512, 14),
         voxels: None,
         trace,
         contract: &contract,
@@ -59,9 +60,8 @@ fn load(artifact: &PathBuf) -> Shell {
         page_size: 16,
         context: 512,
         slots: 14,
-        pages: (14) * (512) / (16),
         runahead: engine::runahead::Runahead::F1,
-        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the drafting shell loads")

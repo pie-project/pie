@@ -149,7 +149,7 @@ impl Context {
     /// The working set other processes hold now: what of it the system
     /// could not hand this one (free, inactive, purgeable and speculative
     /// pages are counted as handed). Measured before a load wires anything,
-    /// it is what `gpu_mem_utilization`'s share yields to, as on CUDA. 0
+    /// it is what `device_memory_share` yields to, as on CUDA. 0
     /// where the system does not say.
     #[must_use]
     pub fn held_elsewhere(&self) -> u64 {

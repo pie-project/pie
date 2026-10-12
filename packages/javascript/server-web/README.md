@@ -50,7 +50,7 @@ well; `tests/browser` drives them directly.
 - The engine cannot ask WebGPU how much device memory there is and assumes
   8 GiB; a large model with the default pools is refused ("raise the device
   weight budget") — pass `device_memory_mb = 20480` (or a smaller
-  `max_total_pages`) in the boot config. `Settings` in
+  `device_kv_budget`) in the boot config. `Settings` in
   `crates/worker/src/embedded.rs` lists the keys, plus `device_memory_mb` and
   `power_preference` for the WebGPU engine.
 - A tab compiles a script language's component (Python's is 37 MB) on the

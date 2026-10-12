@@ -30,7 +30,7 @@ writes its results through out-parameters; `pie_version()` against
 Sessions carry the MessagePack frames of `pie serve`'s WebSocket
 (crates/client-api); `listen` (`"127.0.0.1:8080"`) also serves the gateway
 itself, HTTP routes included. `config` is `worker::embedded::Settings` as JSON
-or TOML (`{"max_total_pages": 512, "gpu_mem_utilization": 0.6}`). Every call's
+or TOML (`{"device_kv_budget": "1GiB", "device_memory_share": 0.6}`). Every call's
 contract is in `include/pie.h`.
 
 ## Build

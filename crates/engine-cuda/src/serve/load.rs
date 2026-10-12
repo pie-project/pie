@@ -78,12 +78,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // halves toward its floor until they do, and the lattice follows.
     let (free, total) = crate::store::device_memory()?;
     let after_weights =
-        crate::device::elastic::budget_bytes(free, total, boot.knobs.gpu_mem_utilization)
-            .saturating_sub(crate::store::weight_tier_bytes(
-                &boot.trace,
-                boot.residency.device_demand(),
-                0,
-            )?);
+        crate::device::elastic::budget_bytes(free, total, boot.memory_share).saturating_sub(
+            crate::store::weight_tier_bytes(&boot.trace, boot.residency.device_demand(), 0)?,
+        );
     let facts = kv::probe(&boot.trace)?;
     let budgets_at = |budget: &Budget| Budgets {
         tokens: budget.clone(),
@@ -136,9 +133,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             "engine-cuda: [engine] max_forward_tokens {asked_tokens} is served at {tokens}: at \
              {asked_tokens} the activation arena, attention workspaces and one fire's windowed \
              kv rows take {} MiB of the \
-             {} MiB this card has after the weight tier under [engine] gpu_mem_utilization, and \
+             {} MiB this card has after the weight tier under [model] device_memory_share, and \
              the cache rows, graph bodies and guest programs need the other half. State a \
-             smaller max_forward_tokens to choose it, or a larger gpu_mem_utilization.",
+             smaller max_forward_tokens to choose it, or a larger device_memory_share.",
             working_at(asked_tokens) >> 20,
             after_weights >> 20,
         );
@@ -238,7 +235,7 @@ fn refit(
     table: &crate::run::WeightTable,
 ) -> Result<(CompiledModel, Budgets, Vec<u64>)> {
     let (free, total) = crate::store::device_memory()?;
-    let live = crate::device::elastic::budget_bytes(free, total, boot.knobs.gpu_mem_utilization);
+    let live = crate::device::elastic::budget_bytes(free, total, boot.memory_share);
     let facts = kv::probe(&boot.trace)?;
     let window = crate::store::window_of(&boot.trace)?;
     let exports = Exports::of(&boot.trace, &compiled)?;
@@ -378,9 +375,9 @@ fn refit(
          {asked_lanes} are served at {tokens} and {lanes}: at the asked budgets a fire's \
          working set (activation arena, attention workspaces, decoded-weight tiles, guest \
          programs) takes {} MiB of the {} MiB this card has after the weight tier under \
-         [engine] gpu_mem_utilization, past the half the cache rows are owed and what one \
+         [model] device_memory_share, past the half the cache rows are owed and what one \
          sequence at the declared context and the bodies' floor need. State smaller budgets \
-         to choose them, or a larger gpu_mem_utilization.",
+         to choose them, or a larger device_memory_share.",
         working_at(asked_lanes, asked_tokens, scoped) >> 20,
         live >> 20,
     );
@@ -416,11 +413,17 @@ impl Shell {
             profile,
         } = bake(&mut boot)?;
         let (free_before, device_total) = crate::store::device_memory()?;
+        // The pool's address space is reserved for every page its bytes
+        // could hold, the stated budget or the share of the card before the
+        // weights land; `Pools::fit_the_card` sizes it within that.
+        let pool_bytes = boot.kv_budget.unwrap_or_else(|| {
+            crate::device::elastic::budget_bytes(free_before, device_total, boot.memory_share)
+        });
         let paging = Paging::of(
             boot.page_size,
             boot.context,
             boot.slots,
-            u64::from(boot.pages),
+            crate::store::page_ceiling(&boot.trace, boot.page_size, boot.context, pool_bytes)?,
         )?
         .windowed(
             crate::store::window_of(&boot.trace)?,
@@ -436,11 +439,12 @@ impl Shell {
             0
         };
         let accounting = crate::store::admit_the_card(
-            boot.knobs.gpu_mem_utilization,
+            boot.memory_share,
             boot.residency.device_demand(),
             decoded_dense,
             &boot.trace,
             paging,
+            boot.kv_budget,
         )?;
 
         if boot.knobs.diagnostics.arm_trace {
@@ -587,9 +591,10 @@ impl Shell {
         }
         let pools = Pools::reserve(
             device.ordinal(),
-            boot.knobs.gpu_mem_utilization,
+            boot.memory_share,
             &boot.trace,
             paging,
+            boot.kv_budget,
             &facts,
         )?;
         if boot.knobs.diagnostics.arm_trace {
@@ -874,7 +879,7 @@ impl Shell {
                     "the card does not hold this deployment: the decoded-weight tile stream \
                      {stream} decodes its widest plane into, {tile} bytes, would not allocate \
                      beside the weights, activations and inputs ({why}). Lower `[model] \
-                     device_weight_budget`, raise `[engine] gpu_mem_utilization`, or free what \
+                     device_weight_budget`, raise `[model] device_memory_share`, or free what \
                      else holds the device."
                 ))
             })?;
@@ -960,30 +965,14 @@ impl Shell {
         shell.arm_bodies()?;
         let resident = footprint(&shell);
         let fitted = shell.pools.fit_the_card(0, held_for_fires, &resident)?;
-        if fitted.fit != fitted.asked {
-            let paging = shell.pools.paging();
+        if boot.knobs.diagnostics.arm_trace {
             eprintln!(
-                "engine-cuda: the pool was declared {} pages ({} MiB), past the {} MiB this card \
-                 hands out for the cache rows under [engine] gpu_mem_utilization once {} MiB is \
-                 held for the programs guests register at {} lanes{} ({resident}); sized to {} \
-                 pages ({} MiB), {} sequences at the declared context. State [engine] \
-                 max_total_pages to choose the count.",
-                fitted.asked,
-                shell.pools.declared_at(fitted.asked) >> 20,
-                fitted.room >> 20,
-                programs >> 20,
-                boot.budget.max_lanes,
-                if fitted.held.saturating_sub(fitted.bodies) < held_for_fires {
-                    format!(
-                        ", held down to {} MiB so one sequence and the bodies' floor seat",
-                        fitted.held.saturating_sub(fitted.bodies) >> 20
-                    )
-                } else {
-                    String::new()
-                },
+                "[arm-trace] cache rows sized to {} pages ({} MiB, {} sequences at the declared \
+                 context) of the {} MiB the card hands out for them ({resident})",
                 fitted.fit,
                 shell.pools.declared_bytes() >> 20,
-                fitted.fit / u64::from(paging.pages_per_slot),
+                fitted.fit / u64::from(shell.pools.paging().pages_per_slot),
+                fitted.room >> 20,
             );
         }
         if boot.world.rank != 0 {
@@ -1011,7 +1000,7 @@ impl Shell {
 /// What holds the device when the cache rows come to be declared, in bytes:
 /// what was in use before this load began (other processes, and this one's
 /// context) and each thing the load has put down since. The elastic budget
-/// is what `[engine] gpu_mem_utilization` leaves after all of it.
+/// is what `[model] device_memory_share` leaves after all of it.
 struct Footprint {
     total: u64,
     before: u64,

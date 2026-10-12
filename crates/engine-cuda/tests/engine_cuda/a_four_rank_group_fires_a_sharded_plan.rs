@@ -224,7 +224,6 @@ fn four_ranks_land_what_one_rank_lands() {
                 page_size: 16,
                 max_context: 64,
                 slots: 8,
-                pages: 64,
                 max_patches: None,
                 max_images: None,
                 max_voxels: None,

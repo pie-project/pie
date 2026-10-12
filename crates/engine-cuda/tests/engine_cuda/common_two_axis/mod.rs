@@ -368,7 +368,6 @@ impl Rig {
                     page_size: 16,
                     max_context: 64,
                     slots: 4,
-                    pages: 32,
                     max_patches: None,
                     max_images: None,
                     max_voxels: Some(max_voxels),

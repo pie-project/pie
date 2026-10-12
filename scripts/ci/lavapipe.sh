@@ -45,9 +45,9 @@ telemetry = false
 [model]
 name = "default"
 model = "snapshot"
+device_kv_budget = "256MiB"
 [engine]
 $engine_toml
-max_total_pages = 512
 max_forward_tokens = 1024
 max_forward_requests = 8
 max_state_slots = 16

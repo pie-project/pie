@@ -21,10 +21,12 @@ pub struct Settings {
     pub engine: bool,
     pub max_forward_tokens: u32,
     pub max_forward_requests: u32,
-    pub max_total_pages: u32,
     pub max_state_slots: u32,
     pub max_model_len: u32,
-    pub gpu_mem_utilization: f64,
+    /// Device bytes for the kv pages and state slots (`"1GiB"`); omitted,
+    /// the pool fills what `device_memory_share` leaves.
+    pub device_kv_budget: Option<ByteSize>,
+    pub device_memory_share: f64,
     pub sandbox_memory_mb: u64,
     pub max_concurrent_processes: Option<usize>,
     pub frame_size: u32,
@@ -38,10 +40,10 @@ impl Default for Settings {
             engine: true,
             max_forward_tokens: 512,
             max_forward_requests: 8,
-            max_total_pages: 512,
             max_state_slots: 64,
             max_model_len: 4096,
-            gpu_mem_utilization: 0.9,
+            device_kv_budget: None,
+            device_memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
             sandbox_memory_mb: 512,
             max_concurrent_processes: None,
             frame_size: 8,
@@ -86,6 +88,8 @@ impl Settings {
         let mut config = Config::parse(&document.to_string())?;
 
         config.model.engine.options = self.engine_options(kind, home);
+        config.model.device_kv_budget = self.device_kv_budget;
+        config.model.device_memory_share = self.device_memory_share;
         config.server.worker_threads = 2;
         config.server.verbose = self.verbose;
         config.server.max_upload = ByteSize::from_mib(256);
@@ -109,7 +113,6 @@ impl Settings {
         let mut set = |key: &str, value: toml::Value| {
             options.insert(key.into(), value);
         };
-        set("gpu_mem_utilization", self.gpu_mem_utilization.into());
         set(
             "max_forward_tokens",
             i64::from(self.max_forward_tokens).into(),
@@ -120,21 +123,16 @@ impl Settings {
         );
         set("max_state_slots", i64::from(self.max_state_slots).into());
         set("max_model_len", i64::from(self.max_model_len).into());
-        let pages = i64::from(self.max_total_pages).into();
         match kind {
-            EngineKind::Metal => {
-                set("total_pages", pages);
-                set("kv_page_size", 16.into());
-            }
+            EngineKind::Metal => set("kv_page_size", 16.into()),
             EngineKind::Vulkan => {
-                set("max_total_pages", pages);
                 let cache = home.join("vulkan-pipelines.bin");
                 set(
                     "pipeline_cache",
                     cache.to_string_lossy().into_owned().into(),
                 );
             }
-            _ => set("max_total_pages", pages),
+            _ => {}
         }
         options
     }

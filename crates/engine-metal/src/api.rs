@@ -29,19 +29,9 @@ use crate::weights::AdapterPlane;
 
 pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, String>;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct DeviceBoot {
-    pub gpu_mem_utilization: f64,
     pub adapter_dir: Option<std::path::PathBuf>,
-}
-
-impl Default for DeviceBoot {
-    fn default() -> DeviceBoot {
-        DeviceBoot {
-            gpu_mem_utilization: crate::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
-            adapter_dir: None,
-        }
-    }
 }
 
 struct PendingStep {
@@ -434,7 +424,7 @@ impl Engine for Metal {
         {
             let device = crate::device::Context::bind().map_err(fault)?;
             let (working_set, elsewhere) = (device.working_set(), device.held_elsewhere());
-            let util = self.boot.gpu_mem_utilization;
+            let util = residency.device_memory_share;
             let paging = crate::store::kv::Paging::of(
                 budgets.page_size,
                 budgets.max_context,
@@ -442,9 +432,14 @@ impl Engine for Metal {
                 1,
             )
             .map_err(|error| fault(Fault::from(error)))?;
-            let kv_pool = crate::store::PoolDemand::of(&trace, paging, None)
-                .map_err(fault)?
-                .bytes(crate::store::least_pages(budgets.pages, paging));
+            // The pool the weights must leave room for: the stated budget,
+            // or one sequence when the pool fills what is left.
+            let kv_pool = match residency.device_kv_budget {
+                Some(budget) => budget,
+                None => crate::store::PoolDemand::of(&trace, paging, None)
+                    .map_err(fault)?
+                    .bytes(u64::from(paging.pages_per_slot)),
+            };
 
             let acct = crate::store::accounting::Accounting::of(
                 working_set,
@@ -504,10 +499,10 @@ impl Engine for Metal {
             page_size: budgets.page_size,
             context: budgets.max_context,
             slots: budgets.slots,
-            pages: budgets.pages,
+            kv_budget: residency.device_kv_budget,
+            memory_share: residency.device_memory_share,
             runahead: engine::runahead::Runahead::of(frames_in_flight),
             residency: residency_plan,
-            gpu_mem_utilization: self.boot.gpu_mem_utilization,
         })
         .map_err(fault)?;
 

@@ -166,10 +166,10 @@ impl Weights {
                 device_cap_mib = device_cap >> 20,
                 "dense weight planes do not fit the device budget and will rotate through \
                  a host-tier ring on every step; expect decode to run at bus speed. The \
-                 budget is the working set (`device_memory` × `gpu_mem_utilization`) less \
-                 the KV and state pools (`max_total_pages`, `max_state_slots`) and 2 GiB \
-                 of headroom — shrink the pools or raise the budget to keep the weights \
-                 resident"
+                 budget is what `[model] device_memory_share` of the device's memory \
+                 leaves once the working set and one sequence's kv pages and state slots \
+                 are down — raise the share or shorten `max_model_len` to keep the \
+                 weights resident"
             );
         } else if layout.tiers.host > 0 {
             tracing::info!(

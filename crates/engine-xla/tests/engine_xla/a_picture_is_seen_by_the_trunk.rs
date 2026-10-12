@@ -257,6 +257,7 @@ fn a_solid_square_is_named_by_its_colour() {
     let tokenizer = common::tokenizer(&m);
     let context = 256;
     let _device = engine_xla::bench::lock_device();
+    let kv_budget = common::kv_budget(&trace, context, 2, 2 * context / 16);
     let mut shell = Shell::load(Boot {
         trace,
         contract: &m.contract,
@@ -265,7 +266,8 @@ fn a_solid_square_is_named_by_its_colour() {
         page_size: 16,
         context,
         slots: 2,
-        pages: 2 * context / 16,
+        kv_budget,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         device: &DeviceBoot::default(),
         patches: Some(PatchLadder::new(256, 1)),
     })

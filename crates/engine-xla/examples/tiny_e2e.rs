@@ -81,9 +81,13 @@ fn run(
         page_size: 16,
         max_context: context,
         slots: 4,
-        pages: 4 * context / 16,
         ..engine::load::Budgets::default()
     };
+    // The bytes of four sequences at the context.
+    let kv_budget = engine_xla::store::kv::Paging::of(16, context, 4, u64::from(4 * context / 16))
+        .map_err(engine_xla::Fault::from)
+        .and_then(|paging| engine_xla::store::pool_demand(&trace, paging))
+        .map_err(|fault| format!("pool: {fault}"))?;
     let patches = engine_xla::api::patch_ladder(&trace, &budgets);
     let voxels = engine_xla::dit::voxel_ladder(&trace, Some(4096), Some(4), budgets.max_lanes);
     let _device = engine_xla::bench::lock_device();
@@ -98,7 +102,8 @@ fn run(
             page_size: budgets.page_size,
             context,
             slots: budgets.slots,
-            pages: budgets.pages,
+            kv_budget: Some(kv_budget),
+            memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
             device: &DeviceBoot::default(),
         },
         voxels,

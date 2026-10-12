@@ -13,7 +13,7 @@ class ConfigurationTest {
     fun encodesTheBootConfigKeys() {
         assertEquals(
             setOf(
-                "gpu_mem_utilization", "max_total_pages", "max_forward_tokens", "max_forward_requests",
+                "device_memory_share", "max_forward_tokens", "max_forward_requests",
                 "max_state_slots", "max_model_len", "sandbox_memory_mb", "max_concurrent_processes",
             ),
             encoded(PieServer.Configuration()).keys,

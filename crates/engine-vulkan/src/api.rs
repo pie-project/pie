@@ -24,26 +24,13 @@ use crate::settle::Done;
 
 pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, String>;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct DeviceBoot {
     pub device_index: u32,
-
-    pub gpu_mem_utilization: f64,
 
     pub validation: bool,
 
     pub pipeline_cache: Option<PathBuf>,
-}
-
-impl Default for DeviceBoot {
-    fn default() -> DeviceBoot {
-        DeviceBoot {
-            device_index: 0,
-            gpu_mem_utilization: crate::boot::DEFAULT_GPU_MEM_UTILIZATION,
-            validation: false,
-            pipeline_cache: None,
-        }
-    }
 }
 
 struct PendingStep {
@@ -382,7 +369,6 @@ impl Engine for Vulkan {
             page_size: budgets.page_size,
             context: budgets.max_context,
             slots: budgets.slots,
-            pages: budgets.pages,
 
             runahead: engine::runahead::Runahead::of(frames_in_flight),
             residency,

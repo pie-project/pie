@@ -902,7 +902,7 @@ per-block one until the tables differ. On four whole-model cases (1, 1, 4 and
 0.16/0.23/0.30/0.30 to 0.99997/0.99996/0.99993/0.99978; repeat runs of those
 move the last digits by ~2e-5, and nothing worse was seen in ~20 runs.
 
-Two operational notes for the real row: `[engine] gpu_mem_utilization` must be
+Two operational notes for the real row: `[model] device_memory_share` must be
 0.95+ (every fire — a denoise step included — demands the VAE's whole
 causal-conv state watermark, ~6.4 GiB, because `state_slot_bytes` sums EVERY
 `Shape::State` row of the plan with no idea which reading's arms touch them:

@@ -69,6 +69,7 @@ impl Config {
             }
         })?;
         let reshaped = crate::config::layout::reshape(file)?;
+        refuse_retired_keys(&reshaped)?;
         let s = &toml::to_string(&reshaped).map_err(|e| anyhow::anyhow!("reshape config: {e}"))?;
         let cfg: Config = toml::from_str(s).map_err(|e| {
             if s.contains("[[model]]") {
@@ -479,15 +480,24 @@ pub struct ModelConfig {
     #[serde(default = "default_weight_dtype")]
     pub weight_dtype: String,
     /// How many weight bytes this load may keep on the device (tier T0),
-    /// written with its unit (`"18GiB"`). Omit for uncapped. Distinct from
-    /// `[engine] gpu_mem_utilization`, which budgets KV pages and scratch,
-    /// not the weight table.
+    /// written with its unit (`"18GiB"`). Omit for uncapped.
+    #[serde(default)]
+    pub device_weight_budget: Option<ByteSize>,
     /// How many weight bytes this load may keep in the pinned host cache
     /// (tier T1), written with its unit (`"64GiB"`). Omit for uncapped.
     #[serde(default)]
-    pub device_weight_budget: Option<ByteSize>,
-    #[serde(default)]
     pub host_weight_budget: Option<ByteSize>,
+    /// How many device bytes the kv pages and recurrent-state slots take
+    /// (`"20GiB"`), per device. Omit to fill what `device_memory_share`
+    /// leaves once the weights and working set are down. A budget the device
+    /// does not hold refuses the load; it is never cut to fit.
+    #[serde(default)]
+    pub device_kv_budget: Option<ByteSize>,
+    /// The share of the device's memory this load may take: weights, working
+    /// set and kv pool. What other processes hold when the load begins comes
+    /// off it, as on a card another server shares.
+    #[serde(default = "default_device_memory_share")]
+    pub device_memory_share: f64,
     /// How many pinned host bytes a preempted process's kv pages and
     /// recurrent-state slots may be suspended into (`"32GiB"`), shared by
     /// the tensor-parallel ranks: one rs row per device slot, then kv pages.
@@ -547,6 +557,34 @@ pub struct ModelConfig {
     pub max_clips: Option<u32>,
     #[serde(default)]
     pub adapters: AdapterConfig,
+}
+
+/// `[engine]` keys the device-memory budgets in `[model]` replaced, each
+/// refused with the key that took its place.
+const RETIRED: &[(&str, &str)] = &[
+    ("gpu_mem_utilization", "[model] device_memory_share"),
+    ("mem_utilization", "[model] device_memory_share"),
+    ("max_total_pages", "[model] device_kv_budget, in bytes"),
+    ("total_pages", "[model] device_kv_budget, in bytes"),
+];
+
+fn refuse_retired_keys(config: &toml::Table) -> Result<()> {
+    let options = config
+        .get("model")
+        .and_then(|model| model.get("engine"))
+        .and_then(|engine| engine.get("options"))
+        .and_then(toml::Value::as_table);
+    for (key, now) in RETIRED {
+        ensure!(
+            options.is_none_or(|options| !options.contains_key(*key)),
+            "[engine] {key} is gone; state {now} instead"
+        );
+    }
+    Ok(())
+}
+
+fn default_device_memory_share() -> f64 {
+    engine::load::DEFAULT_DEVICE_MEMORY_SHARE
 }
 
 fn default_weight_dtype() -> String {
@@ -659,6 +697,8 @@ impl ModelConfig {
             device_weight_budget: self.device_weight_budget.map(|b| b.as_bytes()),
             host_weight_budget: self.host_weight_budget.map(|b| b.as_bytes()),
             deferred_tier: self.deferred_tier,
+            device_kv_budget: self.device_kv_budget.map(|b| b.as_bytes()),
+            device_memory_share: self.device_memory_share,
             host_kv_budget: self.host_kv_budget.map(|b| b.as_bytes()),
             disk_kv_budget: self.disk_kv_budget.map_or(0, |b| b.as_bytes()),
             disk_kv_dir: self.disk_kv_path.clone(),
@@ -746,6 +786,17 @@ impl ModelConfig {
                  derive a ladder from the model text, or state a positive count"
             );
         }
+        ensure!(
+            self.device_memory_share.is_finite()
+                && self.device_memory_share > 0.0
+                && self.device_memory_share <= 1.0,
+            "model.device_memory_share must be finite and in (0.0, 1.0]"
+        );
+        ensure!(
+            self.device_kv_budget.is_none_or(|b| b.as_bytes() > 0),
+            "model.device_kv_budget is zero, and no load serves without a kv pool; \
+             state a real budget or omit the key to fill what device_memory_share leaves"
+        );
         for (key, budget) in [
             ("device_weight_budget", self.device_weight_budget),
             ("host_weight_budget", self.host_weight_budget),
@@ -908,18 +959,7 @@ impl EngineConfig {
                     })?;
                 opts.validate()?;
             }
-            EngineKind::Metal => {
-                if let Some(fraction) = self
-                    .options
-                    .get("gpu_mem_utilization")
-                    .and_then(toml::Value::as_float)
-                {
-                    ensure!(
-                        fraction.is_finite() && fraction > 0.0 && fraction <= 1.0,
-                        "engine.gpu_mem_utilization must be finite and in (0.0, 1.0]"
-                    );
-                }
-            }
+            EngineKind::Metal => {}
             EngineKind::Vulkan => {
                 let opts: VulkanEngineOptions = toml::Value::Table(self.options.clone())
                     .try_into()

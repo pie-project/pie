@@ -138,6 +138,7 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
 
     let booted = Instant::now();
     let mut shell = Shell::load(Boot {
+        kv_budget: crate::full_pool(&trace, 16, 512, 4),
         voxels: None,
         trace,
         contract: &contract,
@@ -148,9 +149,8 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
         page_size: 16,
         context: 512,
         slots: 4,
-        pages: 4 * 512 / 16,
         runahead: engine::runahead::Runahead::F1,
-        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the block drafter's shell loads");
@@ -187,6 +187,7 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
             .expect("the plain artifact holds every plane");
     drop(plain_source);
     let mut plain_shell = Shell::load(Boot {
+        kv_budget: crate::full_pool(&plain_trace, 16, 512, 4),
         voxels: None,
         trace: plain_trace,
         contract: &plain_contract,
@@ -197,9 +198,8 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
         page_size: 16,
         context: 512,
         slots: 4,
-        pages: 4 * 512 / 16,
         runahead: engine::runahead::Runahead::F1,
-        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the plain shell loads");
@@ -264,6 +264,7 @@ fn a_draft_block_fires_and_the_drafter_answers_it() {
         .expect("the artifact holds every plane");
     drop(source);
     let mut shell = Shell::load(Boot {
+        kv_budget: crate::full_pool(&trace, 16, 512, 4),
         voxels: None,
         trace,
         contract: &contract,
@@ -274,9 +275,8 @@ fn a_draft_block_fires_and_the_drafter_answers_it() {
         page_size: 16,
         context: 512,
         slots: 4,
-        pages: 4 * 512 / 16,
         runahead: engine::runahead::Runahead::F1,
-        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the block drafter's shell loads");

@@ -54,8 +54,6 @@ pub struct Boot<'a> {
 
     pub slots: u32,
 
-    pub pages: u32,
-
     pub runahead: Runahead,
 
     pub device: &'a crate::api::DeviceBoot,
@@ -352,9 +350,11 @@ impl Shell {
             trace: poem_compiler::fuse::fuse(boot.trace, &crate::FUSED),
             ..boot
         };
+        let share = boot.residency.device_memory_share;
+        let kv_budget = boot.residency.device_kv_budget;
         let device = match boot.handed.take() {
-            Some(handed) => Context::adopt(boot.device, handed)?,
-            None => Context::bind(boot.device)?,
+            Some(handed) => Context::adopt(boot.device, share, handed)?,
+            None => Context::bind(boot.device, share)?,
         };
 
         let profile = boot.profile.unwrap_or(DeviceProfile {
@@ -407,17 +407,14 @@ impl Shell {
             }
         }
 
-        let asked = Paging::of(
-            boot.page_size,
-            boot.context,
-            boot.slots,
-            u64::from(boot.pages),
-        )?;
+        let asked = Paging::of(boot.page_size, boot.context, boot.slots, 1)?;
         let handles = Handles::new();
 
-        // The pool's page and slot counts are ceilings: it is fitted to what
-        // the weights and the working set leave, each slab within one device
-        // reservation, and the weights are held only to leave it one sequence.
+        // The pool takes `[model] device_kv_budget`, or with none stated
+        // every page the share leaves once the weights and the working set
+        // are down, each slab within one device reservation. The weights
+        // are held only to leave it one sequence: a budget past what they
+        // leave is refused, not made room for.
         let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
         let pool_at = |pages: u64, slots: u32| -> Result<u64> {
             let paging = Paging {
@@ -439,7 +436,7 @@ impl Shell {
                 )
                 .saturating_add(crate::scratch::pool_bytes(&boot.trace, paging)))
         };
-        let one_slot = u64::from(asked.pages_per_slot).min(asked.pages());
+        let one_slot = u64::from(asked.pages_per_slot);
         let least = Paging {
             pages: one_slot,
             slots: engine::fit::least_state_slots(1).min(asked.slots),
@@ -740,31 +737,51 @@ impl Shell {
         let room = device
             .left()
             .saturating_add(crate::scratch::pool_bytes(&boot.trace, least));
-        let (pages, slots) = engine::fit::pool_within(
-            asked.pages(),
-            asked.slots,
-            one_slot,
-            room,
-            |pages, slots| pool_at(pages, slots).unwrap_or(u64::MAX),
-        )
-        .ok_or_else(|| {
-            Fault::Residency(format!(
-                "the device does not hold this deployment: with the weights ({} bytes) and the \
-                 working set down, {room} bytes of `[engine] gpu_mem_utilization` are left for \
-                 the cache rows, and one sequence at the declared context needs {}. Lower \
-                 `[engine] max_model_len`, raise `[engine] gpu_mem_utilization`, state a \
-                 `[model] device_weight_budget`, or free what else holds the device.",
-                weights.bytes(),
-                pool_at(least.pages, least.slots).unwrap_or(u64::MAX),
-            ))
-        })?;
+        let bytes_at = |pages: u64, slots: u32| pool_at(pages, slots).unwrap_or(u64::MAX);
+        // A stated budget holds the asked slots; with none, a hybrid's state
+        // slots give way before the pool would seat no sequence.
+        let slots = match kv_budget {
+            Some(_) => asked.slots,
+            None => {
+                engine::fit::pool_within(u64::from(u32::MAX), asked.slots, one_slot, room, bytes_at)
+                    .map_or(least.slots, |(_, slots)| slots)
+            }
+        };
+        let pages =
+            engine::fit::pages_for(kv_budget, room, one_slot, |pages| bytes_at(pages, slots))
+                .map_err(|short| Fault::Residency(short.to_string()))?;
+        // A stated budget is never cut: one buffer stopping short of it is a
+        // refusal, as the room is.
+        if let Some(budget) = kv_budget {
+            let next = crate::store::pool_slabs(
+                &boot.trace,
+                Paging {
+                    pages: pages + 1,
+                    slots,
+                    ..asked
+                },
+            )?;
+            if next.iter().any(|slab| *slab > device.max_buffer())
+                && next.iter().sum::<u64>() <= budget
+            {
+                return Err(Fault::Residency(format!(
+                    "`[model] device_kv_budget` states {} MiB, and a cache row is one buffer, \
+                     which this device binds up to {} MiB of: {pages} pages fill it at {} MiB. \
+                     State a budget of at most that",
+                    budget >> 20,
+                    device.max_buffer() >> 20,
+                    bytes_at(pages, slots) >> 20,
+                )));
+            }
+        }
         tracing::info!(
             pages,
             slots,
-            asked_pages = asked.pages(),
             asked_slots = asked.slots,
+            kv_budget,
             room,
-            "the cache pool is fitted to what the weights and the working set leave"
+            weights = weights.bytes(),
+            "the cache pool is fitted to the kv budget or to what the share leaves"
         );
         let paging = Paging {
             pages,

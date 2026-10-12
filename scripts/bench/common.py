@@ -535,7 +535,7 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
         type=int,
         default=None,
         help="Pin SGLang's KV pool to this many tokens. The cross-engine "
-             "analogue of pie's `--total-pages P` and vLLM's "
+             "analogue of pie's `--device-kv-budget` and vLLM's "
              "`--num-gpu-blocks-override P --block-size B`: without it the "
              "pool is sized from --gpu-mem-util and the three engines are "
              "not given the same KV budget.",

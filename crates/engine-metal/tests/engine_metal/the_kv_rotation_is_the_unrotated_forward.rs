@@ -217,6 +217,7 @@ fn try_load(dir: &Path, w: Dtype, rotate: bool) -> Result<Shell, String> {
         import_of(id, w, Dtype::Bf16, &source, Platform::Metal).map_err(|e| e.to_string())?;
     drop(source);
     Shell::load(Boot {
+        kv_budget: crate::full_pool(&trace, 16, 128, 4),
         voxels: None,
         trace,
         contract: &contract,
@@ -227,10 +228,9 @@ fn try_load(dir: &Path, w: Dtype, rotate: bool) -> Result<Shell, String> {
         page_size: 16,
         context: 128,
         slots: 4,
-        pages: 4 * 128 / 16,
         runahead: engine::runahead::Runahead::F1,
         residency: engine_metal::ResidencyPlan::default(),
-        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
     })
     .map_err(|e| e.to_string())
 }
