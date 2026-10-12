@@ -324,4 +324,3 @@ fn a_patch_rectangle_is_carved_at_the_compositions_own_patch_rows() {
         "a token-only carve sizes a tower's input at nothing and does not fault",
     );
 }
-

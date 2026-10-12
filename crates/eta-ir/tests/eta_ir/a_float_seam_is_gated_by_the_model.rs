@@ -85,8 +85,11 @@ fn a_float_seam_is_gated_by_the_model() {
             "{intr:?}: refused for the wrong reason: {refusal:?}"
         );
 
-        let refusal = bind(read(Shape::matrix(ROWS, width + 1), Dtype::F32), (seam.with)(width))
-            .expect_err("a width that is not the model's is refused");
+        let refusal = bind(
+            read(Shape::matrix(ROWS, width + 1), Dtype::F32),
+            (seam.with)(width),
+        )
+        .expect_err("a width that is not the model's is refused");
         assert!(
             matches!(refusal, ValidateError::IntrinsicTypeRule { intr: i, .. } if i == intr),
             "{intr:?}: refused for the wrong reason: {refusal:?}"
@@ -98,7 +101,11 @@ fn a_float_seam_is_gated_by_the_model() {
             );
         }
 
-        assert_eq!(intrinsic_stages(intr), &[Stage::Epilogue], "{intr:?} is the fire's answer");
+        assert_eq!(
+            intrinsic_stages(intr),
+            &[Stage::Epilogue],
+            "{intr:?} is the fire's answer"
+        );
         assert!(intrinsic_available(intr, &(seam.with)(width)));
         assert!(!intrinsic_available(intr, &(seam.without)()));
     }
@@ -113,5 +120,8 @@ fn a_float_seam_is_gated_by_the_model() {
         .unwrap_or_else(|why| panic!("a {width}-wide plane against an unstated width: {why:?}"));
     }
     // The hidden seam is not the velocity's to gate.
-    assert!(intrinsic_available(IntrinsicId::Hidden, &(SEAMS[0].without)()));
+    assert!(intrinsic_available(
+        IntrinsicId::Hidden,
+        &(SEAMS[0].without)()
+    ));
 }

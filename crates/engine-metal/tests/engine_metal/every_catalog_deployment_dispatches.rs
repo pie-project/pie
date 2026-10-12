@@ -136,4 +136,3 @@ fn every_catalog_deployment_traces() {
     }
     assert!(empty.is_empty(), "rows that trace to nothing: {empty:?}");
 }
-

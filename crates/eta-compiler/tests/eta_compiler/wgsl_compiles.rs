@@ -141,4 +141,3 @@ fn a_stepwise_module_compiles() {
 fn alloc_axes(n: u32) -> Vec<Dimension> {
     vec![Dimension::Static(n)]
 }
-

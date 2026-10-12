@@ -109,4 +109,3 @@ fn the_miniature_reads_the_golden_and_rearranges_where_the_study_says() {
         "a constant reads no checkpoint tensor"
     );
 }
-
