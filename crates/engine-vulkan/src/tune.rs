@@ -34,35 +34,6 @@ pub struct Outcome {
     pub seconds: f64,
 }
 
-/// The Vulkan-stamped artifacts under `store`, smallest first.
-#[must_use]
-pub fn artifacts(store: &Path) -> Vec<(PathBuf, String)> {
-    let mut out: Vec<(u64, PathBuf, String)> = Vec::new();
-    let Ok(dirs) = std::fs::read_dir(store) else {
-        return Vec::new();
-    };
-    for dir in dirs.flatten() {
-        let Ok(files) = std::fs::read_dir(dir.path()) else {
-            continue;
-        };
-        for file in files.flatten() {
-            let path = file.path();
-            if path.extension().is_none_or(|e| e != "zt") {
-                continue;
-            }
-            let Some(stamp) = checkpoint::file::serve::stamp_of(&path).ok().flatten() else {
-                continue;
-            };
-            if stamp.backend == "vulkan" {
-                let bytes = file.metadata().map_or(u64::MAX, |m| m.len());
-                out.push((bytes, path, stamp.deployment));
-            }
-        }
-    }
-    out.sort_by_key(|(bytes, ..)| *bytes);
-    out.into_iter().map(|(_, p, d)| (p, d)).collect()
-}
-
 fn patches(trace: &poem_ir::Trace, slots: u32) -> Option<poem_compiler::PatchLadder> {
     crate::api::patch_ladder(
         trace,

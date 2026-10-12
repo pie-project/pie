@@ -21,36 +21,6 @@ pub struct Outcome {
     pub seconds: f64,
 }
 
-/// The CUDA-stamped artifacts under `store`, smallest first: what an
-/// end-to-end check can serve.
-#[must_use]
-pub fn artifacts(store: &Path) -> Vec<(PathBuf, String)> {
-    let mut out: Vec<(u64, PathBuf, String)> = Vec::new();
-    let Ok(dirs) = std::fs::read_dir(store) else {
-        return Vec::new();
-    };
-    for dir in dirs.flatten() {
-        let Ok(files) = std::fs::read_dir(dir.path()) else {
-            continue;
-        };
-        for file in files.flatten() {
-            let path = file.path();
-            if path.extension().is_none_or(|e| e != "zt") {
-                continue;
-            }
-            let Some(stamp) = checkpoint::file::serve::stamp_of(&path).ok().flatten() else {
-                continue;
-            };
-            if stamp.backend == "cuda" {
-                let bytes = file.metadata().map_or(u64::MAX, |m| m.len());
-                out.push((bytes, path, stamp.deployment));
-            }
-        }
-    }
-    out.sort_by_key(|(bytes, ..)| *bytes);
-    out.into_iter().map(|(_, p, d)| (p, d)).collect()
-}
-
 /// Serve `artifact` under `chip`: a prompt, then steps at each lane count.
 fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, String> {
     use poem::{Platform, Request};
