@@ -12,8 +12,7 @@
 #endif
 
 #define PIE_BN 64
-// The K block: 32 on Adreno; PowerVR runs the 16-wide one 2.5x faster, its
-// workgroups half the workgroup memory and its unrolled loop half as long.
+// The K block: 16 by default (`qmm_rt_k16`), 32 for the tuning that asks.
 #ifndef PIE_BK
 #define PIE_BK 32
 #endif
