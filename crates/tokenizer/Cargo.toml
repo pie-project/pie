@@ -15,7 +15,7 @@ path = "src/lib.rs"
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 aho-corasick = "1"
-base64 = "0.22.1"
+base64 = "0.23.1"
 unicode-normalization = "0.1"
 rustc-hash = "2.1"
 smallvec = "1"
