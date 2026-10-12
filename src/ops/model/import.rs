@@ -1015,15 +1015,20 @@ fn delete_source(repo_id: &str, metadata: &Metadata, artifact: &Path) -> Result<
     Ok(())
 }
 
+/// Deletes the source's files and the shard index beside each. An index left
+/// over deleted shards reads as weights to the next import, which then
+/// neither fetches them again nor finds them.
 fn remove_source_files(metadata: &Metadata) -> Result<()> {
-    for file in &metadata.files {
-        remove_cache_file(Path::new(&file.path))?;
+    remove_files_and_indexes(metadata.files.iter().map(|file| Path::new(&file.path)))
+}
+
+fn remove_files_and_indexes<'a>(files: impl IntoIterator<Item = &'a Path>) -> Result<()> {
+    let mut dirs = BTreeSet::new();
+    for file in files {
+        remove_cache_file(file)?;
+        dirs.extend(file.parent());
     }
-    if let Some(dir) = metadata
-        .files
-        .first()
-        .and_then(|file| Path::new(&file.path).parent())
-    {
+    for dir in dirs {
         let index = dir.join("model.safetensors.index.json");
         if index.exists() {
             remove_cache_file(&index)?;
@@ -1079,9 +1084,14 @@ fn peak_sentence(source: u64, decode: u64, copy: u64, spooled: bool, consume: bo
     }
 }
 
+/// Deletes `path` and the blob it links to; a file already gone (a spool
+/// the import released as it read) is deleted.
 fn remove_cache_file(path: &Path) -> Result<()> {
-    let target = std::fs::symlink_metadata(path)
-        .with_context(|| format!("cannot stat {}", path.display()))?
+    let stat = match std::fs::symlink_metadata(path) {
+        Err(why) if why.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        stat => stat.with_context(|| format!("cannot stat {}", path.display()))?,
+    };
+    let target = stat
         .file_type()
         .is_symlink()
         .then(|| std::fs::canonicalize(path).ok())
@@ -2178,6 +2188,23 @@ mod tests {
         the_chosen_row_is_in_the_filename_the_dry_run_reports();
         two_imports_beside_one_output_spool_apart();
         a_download_a_dead_import_consumed_is_discarded_whole();
+        a_consumed_source_leaves_no_index_over_its_shards();
+    }
+
+    fn a_consumed_source_leaves_no_index_over_its_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("snapshot");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("model.safetensors.index.json"), b"{}").unwrap();
+        let shard = snapshot.join("model-00001.safetensors");
+        std::fs::write(&shard, b"").unwrap();
+        // A drafter head is overlaid from a spool the import already released.
+        let released = dir.path().join("archive.aux.zt");
+        remove_files_and_indexes([shard.as_path(), released.as_path()]).unwrap();
+        assert!(
+            std::fs::read_dir(&snapshot).unwrap().next().is_none(),
+            "the snapshot keeps an index over shards that are gone"
+        );
     }
 
     fn a_download_a_dead_import_consumed_is_discarded_whole() {
