@@ -132,22 +132,22 @@ fn the_geglu_epilogue_lands_the_gated_product() {
 
 fn a_shape_the_block_does_not_divide_is_refused_without_firing() {
     assert!(
-        !covers(1, 96, 128, Epilogue::Store),
+        !covers(1, 96, 128, Epilogue::Store, ROWS),
         "n=96 is not whole 64s"
     );
     assert!(
-        !covers(65, 64, 128, Epilogue::Store),
+        !covers(65, 64, 128, Epilogue::Store, ROWS),
         "m=65 is past the tile"
     );
     assert!(
-        !covers(1, 64, 192, Epilogue::Store),
+        !covers(1, 64, 192, Epilogue::Store, ROWS),
         "k=192 is not whole 128s"
     );
     assert!(
-        !covers(1, 48, 128, Epilogue::Geglu),
+        !covers(1, 48, 128, Epilogue::Geglu, ROWS),
         "I=48 is not whole 32s"
     );
-    assert!(covers(64, 32, 128, Epilogue::Geglu));
+    assert!(covers(64, 32, 128, Epilogue::Geglu, ROWS));
     let mut gpu = Gpu::open();
     let w = gpu.up(&vec![0u16; 96 * 128]);
     let a = gpu.up(&vec![0u16; 128]);

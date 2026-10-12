@@ -23,10 +23,12 @@ const fn cols(epilogue: Epilogue) -> u32 {
     }
 }
 
+/// Whether the skinny kernel serves `m x n x k` with at most `rows` rows
+/// (`kernel.gemm.skinny_rows`, never past its 64-row tile).
 #[must_use]
-pub fn covers(m: i32, n: i32, k: i32, epilogue: Epilogue) -> bool {
+pub fn covers(m: i32, n: i32, k: i32, epilogue: Epilogue, rows: u32) -> bool {
     let cols = cols(epilogue) as i32;
-    m >= 1 && m <= ROWS as i32 && n > 0 && n % cols == 0 && k > 0 && k % STEP as i32 == 0
+    m >= 1 && m <= rows.min(ROWS) as i32 && n > 0 && n % cols == 0 && k > 0 && k % STEP as i32 == 0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -40,7 +42,7 @@ pub fn skinny_bf16(
     k: i32,
     epilogue: Epilogue,
 ) -> Result<(), Error> {
-    if !covers(m, n, k, epilogue) {
+    if !covers(m, n, k, epilogue, ROWS) {
         return Err(refuse(
             "linear.skinny",
             format!(

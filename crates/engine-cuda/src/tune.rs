@@ -180,7 +180,7 @@ fn plan_of(deployment: &str, chip: &Profile, sms: u32) -> Option<u64> {
     );
     let slots = *LANES.iter().max().expect("lanes") as u32;
     let mut budget = poem_compiler::Budget::new(slots, CONTEXT);
-    budget.buckets = crate::api::lattice(Vec::new(), budget.max_tokens);
+    budget.buckets = crate::api::lattice(Vec::new(), budget.max_tokens, engine.lattice_steps);
     let mut budgets = poem_compiler::Budgets::of(budget);
     if let Some(ladder) = patches(&trace, slots) {
         budgets = budgets.with_patches(ladder);

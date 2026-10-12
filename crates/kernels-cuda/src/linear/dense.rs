@@ -108,7 +108,12 @@ pub(crate) fn act_x_wt(
         k,
     };
     let capturing = capture_status(stream);
+    let tuning = ctx.tuning();
     let (plan, tactic, lt_handle, want) = with_device(|device| {
+        device.configure(
+            (tuning.gemm_workspace_mb as usize) << 20,
+            tuning.gemm_heuristics as usize,
+        );
         let plan = device.plan_for(call);
         let tactic = capturing
             .and_then(|status| device.tactic_for(handle, stream, plan.as_deref(), call, status));
@@ -301,11 +306,10 @@ impl Drop for LtPlan {
     }
 }
 
-const HEURISTICS: usize = 8;
-
 fn build_lt_plan(
     lt_handle: lt::cublasLtHandle_t,
     workspace_bytes: usize,
+    heuristics_wanted: usize,
     m: i32,
     n: i32,
     k: i32,
@@ -393,7 +397,7 @@ fn build_lt_plan(
         return None;
     }
     let mut heuristics: Vec<lt::cublasLtMatmulHeuristicResult_t> =
-        vec![unsafe { core::mem::zeroed() }; HEURISTICS];
+        vec![unsafe { core::mem::zeroed() }; heuristics_wanted.max(1)];
     let mut returned: i32 = 0;
     if unsafe {
         lt::cublasLtMatmulAlgoGetHeuristic(
@@ -404,7 +408,7 @@ fn build_lt_plan(
             plan.c_desc,
             plan.c_desc,
             pref.0,
-            i32::try_from(HEURISTICS).unwrap_or(8),
+            i32::try_from(heuristics_wanted.max(1)).unwrap_or(8),
             heuristics.as_mut_ptr(),
             &raw mut returned,
         )
@@ -413,7 +417,7 @@ fn build_lt_plan(
     {
         return None;
     }
-    heuristics.truncate((returned as usize).min(HEURISTICS));
+    heuristics.truncate((returned as usize).min(heuristics_wanted.max(1)));
     let mut augmented: Vec<lt::cublasLtMatmulHeuristicResult_t> = Vec::new();
     for heuristic in &heuristics {
         let mut supports: i32 = 0;
@@ -514,6 +518,8 @@ fn run_lt(
 
 struct Device {
     lt: LtCtx,
+    /// cuBLASLt candidates a shape is timed over (`kernel.gemm.heuristics`).
+    heuristics: usize,
     plans: HashMap<(i32, i32, i32), Arc<LtPlan>>,
     chosen: HashMap<u64, Tactic>,
     disk: DiskCache,
@@ -532,6 +538,7 @@ fn with_device<R>(f: impl FnOnce(&mut Device) -> R) -> R {
                     handle: std::ptr::null_mut(),
                     workspace_bytes: 8 * 1024 * 1024,
                 },
+                heuristics: 8,
                 plans: HashMap::new(),
                 chosen: HashMap::new(),
                 disk: DiskCache::new(),
@@ -545,6 +552,18 @@ fn with_device<R>(f: impl FnOnce(&mut Device) -> R) -> R {
 }
 
 impl Device {
+    /// Lay a load's GEMM settings on this device (`kernel.gemm.workspace_mb`,
+    /// `kernel.gemm.heuristics`): plans and tactics chosen under other
+    /// settings are dropped, since an algorithm may need more workspace.
+    fn configure(&mut self, workspace_bytes: usize, heuristics: usize) {
+        if self.lt.workspace_bytes != workspace_bytes || self.heuristics != heuristics {
+            self.lt.workspace_bytes = workspace_bytes;
+            self.heuristics = heuristics;
+            self.plans.clear();
+            self.chosen.clear();
+        }
+    }
+
     fn plan_for(&mut self, call: Call) -> Option<Arc<LtPlan>> {
         let (m, n, k) = (call.m, call.n, call.k);
         if !self.lt.ensure() {
@@ -556,6 +575,7 @@ impl Device {
         let plan = Arc::new(build_lt_plan(
             self.lt.handle,
             self.lt.workspace_bytes,
+            self.heuristics,
             m,
             n,
             k,
@@ -572,7 +592,7 @@ impl Device {
         call: Call,
         capturing: cudaStreamCaptureStatus,
     ) -> Option<Tactic> {
-        let key = shape_key(call);
+        let key = shape_key(call, self.lt.workspace_bytes, self.heuristics);
         if let Some(tactic) = self.chosen.get(&key) {
             return Some(*tactic);
         }
@@ -607,11 +627,14 @@ impl Device {
     }
 }
 
-fn shape_key(call: Call) -> u64 {
-    let mut bytes = [0u8; 12];
+/// A tuned tactic's key: the shape, and the settings it was chosen under.
+fn shape_key(call: Call, workspace_bytes: usize, heuristics: usize) -> u64 {
+    let mut bytes = [0u8; 28];
     bytes[..4].copy_from_slice(&call.m.to_le_bytes());
     bytes[4..8].copy_from_slice(&call.n.to_le_bytes());
-    bytes[8..].copy_from_slice(&call.k.to_le_bytes());
+    bytes[8..12].copy_from_slice(&call.k.to_le_bytes());
+    bytes[12..20].copy_from_slice(&(workspace_bytes as u64).to_le_bytes());
+    bytes[20..].copy_from_slice(&(heuristics as u64).to_le_bytes());
     crate::source::fnv1a64(&bytes)
 }
 

@@ -253,6 +253,12 @@ pub struct Toggles {
 
     /// A split decode chunk holds at least 128 keys.
     pub chunk_floor_128: bool,
+
+    /// CTAs per SM a split prefill grid fills.
+    pub prefill_ctas_per_sm: u32,
+
+    /// The most requests an eager decode serves unsplit and unplanned.
+    pub static_max_requests: u32,
 }
 
 impl Toggles {
@@ -263,6 +269,8 @@ impl Toggles {
             force_split_small: tuning.decode_split_small,
             window_split: tuning.decode_split_window,
             chunk_floor_128: tuning.decode_chunk_floor_128,
+            prefill_ctas_per_sm: tuning.prefill_ctas_per_sm,
+            static_max_requests: tuning.decode_static_max_requests,
         }
     }
 }
@@ -389,6 +397,7 @@ pub fn plan_prefill(
     enable_cuda_graph: bool,
     mask_indptr: Option<Tensor>,
     device: &Device,
+    toggles: Toggles,
     workspace: Workspace,
 ) -> Result<PrefillPlan, Error> {
     const OP: &str = "attention.plan_prefill";
@@ -410,6 +419,7 @@ pub fn plan_prefill(
         page_size: shape.page_size,
         enable_cuda_graph,
         window_left: window.map(|w| w - 1),
+        ctas_per_sm: toggles.prefill_ctas_per_sm,
     };
 
     let (built, capturable, graph_refusal) =

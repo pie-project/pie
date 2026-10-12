@@ -18,6 +18,8 @@ pub struct Request<'a> {
     pub page_size: u32,
     pub enable_cuda_graph: bool,
     pub window_left: Option<u32>,
+    /// CTAs per SM the split grid fills (`kernel.sdpa.prefill.ctas_per_sm`).
+    pub ctas_per_sm: u32,
 }
 
 impl Request<'_> {
@@ -118,11 +120,12 @@ pub fn graph_padding(
     num_kv_heads: u32,
     head_dim: u32,
     device: &Device,
+    ctas_per_sm: u32,
 ) -> (u32, u64) {
     let kv_heads = num_kv_heads.max(1);
     let group = u64::from((num_qo_heads / kv_heads).max(1));
     let (tile, tiles) = graph_tiles(rows, lanes, group, head_dim);
-    let floor = u64::from(2 * device.num_sm.max(1)) / u64::from(kv_heads);
+    let floor = u64::from(ctas_per_sm.max(1) * device.num_sm.max(1)) / u64::from(kv_heads);
     (tile, floor.max(tiles))
 }
 
@@ -148,7 +151,7 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     let kv_pages = spans(op, "kv_indptr", req.kv_indptr, batch)?;
     let group = u64::from(req.num_qo_heads / req.num_kv_heads);
 
-    let max_grid_size = 2 * u64::from(device.num_sm);
+    let max_grid_size = u64::from(req.ctas_per_sm.max(1)) * u64::from(device.num_sm);
     let max_batch_size_if_split =
         u32::try_from(max_grid_size / u64::from(req.num_kv_heads)).unwrap_or(u32::MAX);
 
@@ -469,6 +472,7 @@ mod tests {
                         page_size: 16,
                         enable_cuda_graph: graph,
                         window_left: None,
+                        ctas_per_sm: 2,
                     };
                     let sched = schedule("test", &req, &Device::L40S).unwrap();
                     let laid = layout("test", &req, &sched, usize::MAX, usize::MAX).unwrap();
