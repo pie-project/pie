@@ -194,7 +194,7 @@ impl Program {
             // `false`, so the caller learns of it there; the reason is only
             // here.
             2 => {
-                eprintln!("PIE_ANE: {}", sys::failure(&err));
+                eprintln!("ane: {}", sys::failure(&err));
                 Ok(())
             }
             _ => {

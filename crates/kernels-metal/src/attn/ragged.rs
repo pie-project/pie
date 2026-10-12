@@ -213,10 +213,7 @@ pub fn forward(
     mask: &RaggedMask,
     o: Tensor,
 ) -> Result<(), Error> {
-    let scalar = std::env::var("PIE_METAL_RAGGED_ARM")
-        .map(|v| v.eq_ignore_ascii_case("scalar"))
-        .unwrap_or(false);
-    let arm = if !scalar && stamp(Arm::Tiled, head_dim).is_ok() {
+    let arm = if stamp(Arm::Tiled, head_dim).is_ok() {
         Arm::Tiled
     } else {
         Arm::Scalar

@@ -39,6 +39,11 @@ fn device_boot(doc: &toml::Table) -> DeviceBoot {
             .and_then(toml::Value::as_float)
             .filter(|f| f.is_finite() && *f > 0.0 && *f <= 1.0)
             .unwrap_or(DEFAULT_MEM_UTILIZATION),
+        window_pool: true,
+        prewarm: t
+            .and_then(|t| t.get("prewarm"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false),
         profiles: t
             .and_then(|t| t.get("profiles"))
             .and_then(toml::Value::as_str)

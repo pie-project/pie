@@ -204,7 +204,7 @@ impl Weights {
             }
         }
         let extra: u64 = prescale.keys().map(|&at| sizes[at]).sum();
-        if std::env::var_os("PIE_XLA_MXFP4_CODES").is_some() || total + extra > device_cap {
+        if total + extra > device_cap {
             prescale.clear();
         }
         let scales_of: BTreeMap<usize, usize> = prescale.iter().map(|(&c, &s)| (s, c)).collect();
@@ -570,16 +570,12 @@ pub(crate) fn serves_this_deployment(path: &Path, backend: &str, deployment: &st
 /// sub-byte codes planes of quantized gemm weights the TPU would otherwise
 /// lay out K-minor (below). A param read any other way (an embedding
 /// gather, a norm, a routed bank) lands as declared.
-/// `PIE_XLA_WEIGHT_T=0` lands every param as declared.
 fn gemm_only(
     trace: &Trace,
     banks: &std::collections::BTreeSet<usize>,
 ) -> std::collections::BTreeSet<usize> {
     use poem_ir::{Def, Linear, Operands, Operation};
     let mut out = std::collections::BTreeSet::new();
-    if std::env::var("PIE_XLA_WEIGHT_T").is_ok_and(|v| v == "0") {
-        return out;
-    }
     let param_of = |v: poem_ir::ValueId| match trace.values.get(v.0 as usize).map(|d| &d.def) {
         Some(Def::Weight(p)) => Some(*p as usize),
         _ => None,
@@ -663,17 +659,13 @@ fn fold_of(rows: u64, row: u64) -> (u64, u64) {
 /// (`kernels_xla::layout::folding`): the TPU lays a 2-D array out with the
 /// axis that tiles evenly minor, so a `[V, row]` table lands column-major and
 /// every gather relayouts all of it first (gpt-oss's 201088-row embedding:
-/// 1.75 ms a step as `u4` codes, 0.78 ms as bytes). `PIE_XLA_EMBED_CODES=1`
-/// lands them as codes.
+/// 1.75 ms a step as `u4` codes, 0.78 ms as bytes).
 fn gather_only(
     trace: &Trace,
     codes: &std::collections::BTreeSet<usize>,
 ) -> std::collections::BTreeSet<usize> {
     use poem_ir::{Def, Layout, Operands, Operation};
     let mut out = std::collections::BTreeSet::new();
-    if std::env::var_os("PIE_XLA_EMBED_CODES").is_some_and(|v| v != "0") {
-        return out;
-    }
     let param_of = |v: poem_ir::ValueId| match trace.values.get(v.0 as usize).map(|d| &d.def) {
         Some(Def::Weight(p)) => Some(*p as usize),
         _ => None,

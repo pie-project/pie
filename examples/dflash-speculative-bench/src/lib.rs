@@ -308,9 +308,9 @@
 //! on its probes; the yield is load-blind, which under load is the virtue.
 //! (`latency --requests 8` admits one process at a time and measures nothing
 //! about concurrency — its numbers are one lane's, eight times.) And the
-//! eight-lane numbers above are taken under the scheduler's `ready` seal,
-//! which on this box lands 2.2 lanes a batch; `PIE_SEAL_MODE=strict` fills
-//! the batch and lifts PLAIN decode to 60.7 / 180 / 221 tok/s on qwen38 /
+//! eight-lane numbers above were taken under the scheduler's former `ready`
+//! seal, which on this box landed 2.2 lanes a batch; the `strict` seal, now
+//! the only one, fills the batch and lifts PLAIN decode to 60.7 / 180 / 221 tok/s on qwen38 /
 //! gemma / the A3B (1.7-2.3x), after which the open loop reads 1.02x on
 //! qwen38 counting and 1.31x on gemma counting and the floor-gated prose
 //! 0.65x: at eight lanes the batch is the lever, and this loop is a

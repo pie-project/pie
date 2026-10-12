@@ -30,9 +30,6 @@ pub struct Compiled {
 /// cells can stay on the device between passes (`Plane::fire_guests`).
 #[must_use]
 pub fn carried_channels(package: &LaunchPackage) -> Vec<u32> {
-    if std::env::var_os("PIE_XLA_GUESTS_CARRY").is_some_and(|v| v == "0") {
-        return Vec::new();
-    }
     let mut out = Vec::new();
     for (c, decl) in package.channels.iter().enumerate() {
         let c = c as u32;

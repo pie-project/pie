@@ -348,8 +348,6 @@ pub struct PlannerStats {
     pub serves: AtomicU64,
     pub evictions_started: AtomicU64,
     pub eviction_deferrals: AtomicU64,
-    pub runway_rounds: AtomicU64,
-    pub runway_pages: AtomicU64,
     pub evictions: AtomicU64,
     pub eviction_rollbacks: AtomicU64,
     pub restores: AtomicU64,
@@ -438,8 +436,6 @@ pub struct PlannerDiagnostics {
     pub h2d_rs_slots_total: u64,
     pub d2h_copy_us_total: u64,
     pub h2d_copy_us_total: u64,
-    pub runway_rounds_total: u64,
-    pub runway_pages_total: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -454,7 +450,6 @@ struct VictimSet {
     head_pid: ProcessId,
     deficit: Reclaim,
     members: Vec<Victim>,
-    runway_grab: u32,
 }
 
 impl VictimSet {
@@ -594,7 +589,6 @@ struct Inner {
     host_swap_blocked: HashSet<ProcessId>,
     prepare_blocked: HashSet<ProcessId>,
     killing: HashSet<ProcessId>,
-    runway_round_in_flight: bool,
     admitting: BTreeMap<(u64, ProcessId), Arc<Notify>>,
 }
 
@@ -611,9 +605,6 @@ impl Inner {
 
     fn settle_eviction(&mut self, pid: ProcessId) {
         self.evicting.remove(&pid);
-        if self.evicting.is_empty() {
-            self.runway_round_in_flight = false;
-        }
     }
 
     /// What the evictions in flight are expected to free.
@@ -621,17 +612,6 @@ impl Inner {
         self.evicting
             .values()
             .fold(Reclaim::default(), |sum, &mark| sum.add(mark))
-    }
-
-    fn runway_floor(&self) -> Option<u64> {
-        let oldest = self
-            .procs
-            .values()
-            .filter(|proc| proc.admitted && proc.state == Residency::Resident)
-            .map(|proc| proc.seq)
-            .min()?;
-        let head = self.unmet_head().map_or(0, |(key, _)| key.0);
-        Some(oldest.max(head))
     }
 
     fn nonresident_count(&self) -> usize {
@@ -943,17 +923,6 @@ impl ResidencyPlanner {
         }
     }
 
-    fn poke_if_runway_short(self: &Arc<Self>) {
-        let runway = supply_runway_pages();
-        if runway == 0 {
-            return;
-        }
-        let (free, _) = self.port.device_stats();
-        if free < runway {
-            self.poke();
-        }
-    }
-
     /// Drops the idle cache (unused index roots and snapshots) unless the last
     /// attempt found nothing and nothing was freed since; true when it freed some.
     fn reclaim_idle_once(&self) -> bool {
@@ -1148,8 +1117,6 @@ impl ResidencyPlanner {
         self.re_arm_idle_reclaim();
         if self.waiters.load(Ordering::Acquire) != 0 {
             self.poke();
-        } else {
-            self.poke_if_runway_short();
         }
     }
 
@@ -1169,10 +1136,6 @@ impl ResidencyPlanner {
             RsSlotReservation::empty()
         };
         Some(AllocationGrant::new(demand, kv, rs))
-    }
-
-    fn free_pages(&self) -> u32 {
-        self.port.device_stats().0
     }
 
     pub fn lock_census(&self) -> (u64, u64, u64, u64, u64) {
@@ -1207,25 +1170,10 @@ impl ResidencyPlanner {
         }
         let uncontended = self.waiters.load(Ordering::Acquire) == 0
             && self.nonresident.load(Ordering::Acquire) == 0;
-        if !uncontended && fast_small_bypass_enabled() && demand.rs_slots == 0 {
-            let free_now = self.free_pages();
-            let head_covered = self.with_inner(|inner| {
-                let head_shortfall = inner
-                    .unmet_head()
-                    .map(|(_, waiter)| waiter.kv_need().saturating_sub(inner.accum.len() as u32))
-                    .unwrap_or_default();
-                free_now >= demand.kv_pages.saturating_add(head_shortfall)
-            });
-            if head_covered && let Some(grant) = self.try_reserve(demand) {
-                self.note_progress(pid);
-                return Some(grant);
-            }
-        }
         if !uncontended {
             self.note_progress(pid);
         }
         if uncontended && let Some(grant) = self.try_reserve(demand) {
-            self.poke_if_runway_short();
             return Some(grant);
         }
         None
@@ -1376,25 +1324,10 @@ impl ResidencyPlanner {
         }
         let uncontended = self.waiters.load(Ordering::Acquire) == 0
             && self.nonresident.load(Ordering::Acquire) == 0;
-        if !uncontended && fast_small_bypass_enabled() && demand.rs_slots == 0 {
-            let free_now = self.free_pages();
-            let head_covered = self.with_inner(|inner| {
-                let head_shortfall = inner
-                    .unmet_head()
-                    .map(|(_, waiter)| waiter.kv_need().saturating_sub(inner.accum.len() as u32))
-                    .unwrap_or_default();
-                free_now >= demand.kv_pages.saturating_add(head_shortfall)
-            });
-            if head_covered && let Some(grant) = self.try_reserve(demand) {
-                self.note_progress(pid);
-                return Ok(Enqueued::Granted(grant));
-            }
-        }
         if !uncontended {
             self.note_progress(pid);
         }
         if uncontended && let Some(grant) = self.try_reserve(demand) {
-            self.poke_if_runway_short();
             return Ok(Enqueued::Granted(grant));
         }
         let (_, kv_total) = self.port.device_stats();
@@ -1590,8 +1523,7 @@ impl ResidencyPlanner {
                         extra: inner.burst_shortfall(),
                     },
                     None => {
-                        if rotation_damping_enabled()
-                            && inner.completion_credit == 0
+                        if inner.completion_credit == 0
                             && !inner.fleet_stalled()
                         {
                             return Step::Done;
@@ -1602,13 +1534,9 @@ impl ResidencyPlanner {
                 }
             });
             match step {
-                Step::Done => {
-                    self.plan_runway();
-                    return;
-                }
+                Step::Done => return,
                 Step::Release(stranded) => {
                     drop(stranded);
-                    self.plan_runway();
                     return;
                 }
                 Step::Absorb {
@@ -1925,120 +1853,10 @@ impl ResidencyPlanner {
             }
             return;
         }
-        self.commit_evictions(victims.head, picks, false, victims.runway_grab);
-    }
-
-    fn plan_runway(self: &Arc<Self>) {
-        let runway = supply_runway_pages();
-        if runway == 0 {
-            return;
-        }
-        let room = self.swap_room();
-        if !self.port.suspend_capable() || room.pages == 0 {
-            return;
-        }
-        let (free, _) = self.port.device_stats();
-        let Some((deficit, members)) = self.runway_shortfall_set(runway, free) else {
-            return;
-        };
-        let (model, engine) = self.port.locus();
-        let deficit = Reclaim {
-            pages: deficit,
-            rs_slots: 0,
-        };
-        let (picks, _unhostable) = self.quote_and_pick(members, deficit, room, model, engine);
-        if picks.is_empty() {
-            return;
-        }
-        self.commit_runway(picks);
-    }
-
-    fn runway_shortfall_set(&self, runway: u32, free: u32) -> Option<(u32, Vec<(ProcessId, u64)>)> {
-        self.with_inner(|inner| {
-            if inner.runway_round_in_flight || inner.kill_in_flight() || !rotation_damping_enabled()
-            {
-                return None;
-            }
-            let expected: u32 = inner.evicting.values().map(|mark| mark.pages).sum();
-            let deficit = runway
-                .saturating_sub(free)
-                .saturating_sub(inner.accum.len() as u32 + expected);
-            if deficit == 0 {
-                return None;
-            }
-            let floor = inner.runway_floor()?;
-            let members: Vec<(ProcessId, u64)> = inner
-                .procs
-                .iter()
-                .filter(|(pid, proc)| {
-                    proc.admitted
-                        && proc.seq > floor
-                        && proc.state == Residency::Resident
-                        && proc.progressed
-                        && !inner.host_swap_blocked.contains(*pid)
-                        && !inner.prepare_blocked.contains(*pid)
-                })
-                .map(|(pid, proc)| (*pid, proc.seq))
-                .collect();
-            if members.is_empty() {
-                return None;
-            }
-            Some((deficit, members))
-        })
-    }
-
-    fn commit_runway(self: &Arc<Self>, picks: Vec<(ProcessId, Reclaim)>) {
-        let mut spawned = Vec::new();
-        let mut wake = Vec::new();
-        let mut pages = 0u64;
-        self.with_inner(|inner| {
-            if inner.runway_round_in_flight || inner.kill_in_flight() {
-                return;
-            }
-            let Some(floor) = inner.runway_floor() else {
-                return;
-            };
-            for (pid, expected) in picks {
-                let Some(proc) = inner.procs.get_mut(&pid) else {
-                    continue;
-                };
-                if proc.state != Residency::Resident || proc.seq <= floor || !proc.progressed {
-                    continue;
-                }
-                proc.state = Residency::Evicting;
-                inner.evicting.insert(pid, expected);
-                pages += u64::from(expected.pages);
-                spawned.push(pid);
-                for waiter in inner.queue.values_mut().filter(|w| w.pid == pid) {
-                    if let WaitKind::Allocation {
-                        notify, yielded, ..
-                    } = &mut waiter.kind
-                    {
-                        *yielded = true;
-                        wake.push(notify.clone());
-                    }
-                }
-            }
-            if !spawned.is_empty() {
-                inner.runway_round_in_flight = true;
-            }
-        });
-        for notify in wake {
-            notify.notify_waiters();
-        }
-        if spawned.is_empty() {
-            return;
-        }
-        self.stats.runway_rounds.fetch_add(1, Ordering::Relaxed);
-        self.stats.runway_pages.fetch_add(pages, Ordering::Relaxed);
-        for pid in spawned {
-            self.stats.evictions_started.fetch_add(1, Ordering::Relaxed);
-            exec::spawn_evict(self.clone(), pid);
-        }
+        self.commit_evictions(victims.head, picks, false);
     }
 
     fn victim_set(&self) -> Option<VictimSet> {
-        let runway = supply_runway_pages();
         let (free, _) = self.port.device_stats();
         let (rs_free, _) = self.port.rs_stats();
         self.with_inner(|inner| {
@@ -2052,17 +1870,11 @@ impl ResidencyPlanner {
                     _ => None,
                 })
                 .sum();
-            let runway_target = if runway > 0 && !inner.runway_round_in_flight {
-                runway
-            } else {
-                0
-            };
-            let runway_grab = runway_target.saturating_sub(free);
             // What the device still has free and an eviction in flight
             // returns is supply, not deficit, as `supply_stalled` counts it.
             let missing = waiter
                 .kv_need()
-                .max(queued_quantum.saturating_add(runway_target))
+                .max(queued_quantum)
                 .saturating_sub(inner.accum.len() as u32);
             let expected = inner.expected_reclaim();
             let deficit = Reclaim {
@@ -2096,7 +1908,6 @@ impl ResidencyPlanner {
                 head_pid: waiter.pid,
                 deficit,
                 members,
-                runway_grab,
             })
         })
     }
@@ -2106,7 +1917,6 @@ impl ResidencyPlanner {
         head_key: EntryKey,
         picks: Vec<(ProcessId, Reclaim)>,
         e6_relaxed: bool,
-        runway_grab: u32,
     ) -> bool {
         let mut spawned = Vec::new();
         let mut wake = Vec::new();
@@ -2138,20 +1948,11 @@ impl ResidencyPlanner {
                     }
                 }
             }
-            if runway_grab > 0 && !spawned.is_empty() {
-                inner.runway_round_in_flight = true;
-            }
         });
         for notify in wake {
             notify.notify_waiters();
         }
         let any = !spawned.is_empty();
-        if runway_grab > 0 && any {
-            self.stats.runway_rounds.fetch_add(1, Ordering::Relaxed);
-            self.stats
-                .runway_pages
-                .fetch_add(u64::from(runway_grab), Ordering::Relaxed);
-        }
         for pid in spawned {
             self.stats.evictions_started.fetch_add(1, Ordering::Relaxed);
             exec::spawn_evict(self.clone(), pid);
@@ -2215,13 +2016,6 @@ impl ResidencyPlanner {
             }
             if inner.unmet_head().is_none() {
                 return false;
-            }
-            let runway = supply_runway_pages();
-            if runway > 0 && !inner.runway_round_in_flight {
-                let expected: u32 = inner.evicting.values().map(|mark| mark.pages).sum();
-                if runway.saturating_sub(free) > accum + expected {
-                    return true;
-                }
             }
             let queued_quantum: u32 = inner
                 .queue
@@ -2321,7 +2115,7 @@ impl ResidencyPlanner {
         let (Some(head), false) = (head, picks.is_empty()) else {
             return false;
         };
-        if !self.commit_evictions(head, picks, true, 0) {
+        if !self.commit_evictions(head, picks, true) {
             return false;
         }
         self.stats.e6_relaxations.fetch_add(1, Ordering::Relaxed);
@@ -3002,8 +2796,6 @@ impl ResidencyPlanner {
             h2d_rs_slots_total: self.stats.h2d_rs_slots.load(Relaxed),
             d2h_copy_us_total: self.stats.d2h_copy_us.load(Relaxed),
             h2d_copy_us_total: self.stats.h2d_copy_us.load(Relaxed),
-            runway_rounds_total: self.stats.runway_rounds.load(Relaxed),
-            runway_pages_total: self.stats.runway_pages.load(Relaxed),
         }
     }
 
@@ -3096,29 +2888,6 @@ enum ServeOutcome {
 enum Board {
     Go(DevicePageReservation),
     Replan,
-}
-
-fn fast_small_bypass_enabled() -> bool {
-    static CONFIGURED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CONFIGURED.get_or_init(|| {
-        std::env::var("PIE_ALLOC_FAST_SMALL").is_ok_and(|value| !value.is_empty() && value != "0")
-    })
-}
-
-fn rotation_damping_enabled() -> bool {
-    static CONFIGURED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CONFIGURED
-        .get_or_init(|| !std::env::var("PIE_ROTATION_DAMPING").is_ok_and(|value| value == "0"))
-}
-
-fn supply_runway_pages() -> u32 {
-    static CONFIGURED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *CONFIGURED.get_or_init(|| {
-        std::env::var("PIE_SUPPLY_RUNWAY")
-            .ok()
-            .and_then(|value| value.trim().parse().ok())
-            .unwrap_or(0)
-    })
 }
 
 fn micros(elapsed: Duration) -> u64 {
@@ -3892,7 +3661,6 @@ mod starvation_race_tests {
     async fn an_exhausted_pool_evicts_even_while_the_fleet_still_runs() {
         let pool = Arc::new(RacePool::with_swap(4, 64));
         let planner = Arc::new(ResidencyPlanner::new(pool.clone()));
-        planner.with_inner(|inner| inner.runway_round_in_flight = true);
 
         let holder = ProcessId::new_v4();
         planner.register(holder);

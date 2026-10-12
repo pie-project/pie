@@ -473,13 +473,11 @@ impl Shell {
         });
 
         // Windowed kv rows live in their own pool, a window per sequence
-        // (engine-cuda `serve/load.rs`); `PIE_XLA_FULL_WINDOWS=1` keeps them
-        // in full pages, for an A/B against the windowed pool.
-        let full_windows = std::env::var("PIE_XLA_FULL_WINDOWS").is_ok_and(|v| v == "1");
-        let window = if full_windows {
-            None
-        } else {
+        // (engine-cuda `serve/load.rs`).
+        let window = if boot.device.window_pool {
             crate::store::window_of(&boot.trace)?
+        } else {
+            None
         };
         let paging_at = |pages: u64| -> Result<Paging> {
             Ok(Paging::of(boot.page_size, boot.context, boot.slots, pages)?
@@ -1075,9 +1073,6 @@ impl Shell {
     /// present reads more than tokens (a mask, an adapter, scores, media),
     /// or the padding does not fit the rows or the lanes.
     fn canonical_pads(&self, lanes: &[Seated<'_>], real_rows: u32) -> Option<Vec<(u32, u64)>> {
-        if std::env::var("PIE_XLA_CANONICAL").is_ok_and(|v| v == "0") {
-            return None;
-        }
         let classes = &self.compiled.classes;
         // (class, word, lanes, rows)
         let mut by: Vec<(usize, u64, u32, u32)> = Vec::new();

@@ -232,6 +232,9 @@ pub struct XlaEngineOptions {
     /// The longest sequence (prompt + output) one lane holds, in tokens.
     /// Omit for the engine default (4096).
     pub max_model_len: Option<u32>,
+    /// Trace and compile the fire shapes a server meets first at load, so
+    /// no early request waits on a compile. Slower to load.
+    pub prewarm: bool,
 }
 
 impl Default for XlaEngineOptions {
@@ -245,6 +248,7 @@ impl Default for XlaEngineOptions {
             max_forward_requests: 64,
             max_state_slots: None,
             max_model_len: None,
+            prewarm: false,
         }
     }
 }

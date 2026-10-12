@@ -1,11 +1,11 @@
-//! Warm fires at load (`PIE_XLA_PREWARM=1`): the fire shapes a server meets
+//! Warm fires at load (`[engine] prewarm = true`): the fire shapes a server meets
 //! first are traced, compiled (or loaded from the disk cache, where a warm
 //! machine finds them) and run once before the first request, as engine-cuda
 //! arms its bodies (`serve/arming.rs`), so no request waits on a compile.
 //!
 //! The ladder, over the canonical shapes `fire_inner` pads fires to:
 //! - a decode at every lane rung, at every page bound from `PAGE_FLOOR` to
-//!   `PIE_XLA_PREWARM_PAGES` (default: the context's), as many lanes as the
+//!   the context's, as many lanes as the
 //!   pool seats at half that bound;
 //! - a prefill at every row rung from 16, over 1 lane (one that fills its
 //!   rung, and one that leaves a padding lane) and, from 64 rows, 4 and 8;
@@ -13,7 +13,7 @@
 //!   256 (such a fire pads its prefill lanes to `MIXED_HOST_RUNG`).
 //!
 //! Nothing runs: each shape is traced, and the new programs compile side by
-//! side (`PIE_XLA_PREWARM_THREADS`, default 8).
+//! side (`COMPILE_THREADS` at a time).
 //!
 //! Lanes are synthetic (zero tokens, as `dry.rs` builds them) in the plain
 //! text classes; they share pages, since what they write is never read. The
@@ -23,6 +23,9 @@ use poem_ir::Request;
 
 use super::{Lane, PAD_ROOM, PAGE_FLOOR, Seated, Shell};
 use crate::error::Result;
+
+/// Programs compiled side by side while warming.
+const COMPILE_THREADS: usize = 8;
 
 /// One synthetic lane: its word, its rows, and the pages it holds before
 /// them (a decode lane at a page bound holds all but one slot of them).
@@ -64,11 +67,7 @@ impl Shell {
             .saturating_sub(super::MIXED_HOST_RUNG)
             .min(self.held.len() as u32);
         let cap = self.paging().pages_per_slot.max(1).next_power_of_two();
-        let top_pages = std::env::var("PIE_XLA_PREWARM_PAGES")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(cap)
-            .min(cap);
+        let top_pages = cap;
         let pool = self.paging().pages();
         let fresh = |word, rows| Want {
             word,
@@ -158,8 +157,8 @@ impl Shell {
         Ok(fired)
     }
 
-    /// Compiles what the ladder traced, on up to `PIE_XLA_PREWARM_THREADS`
-    /// (default 8) threads, and seats each program under its keys.
+    /// Compiles what the ladder traced, on up to `COMPILE_THREADS` threads,
+    /// and seats each program under its keys.
     fn compile_deferred(&mut self, deferred: Vec<super::Deferred>) -> Result<()> {
         let mut texts: Vec<(&str, &crate::trace::Signature)> = Vec::new();
         let mut index: Vec<usize> = Vec::with_capacity(deferred.len());
@@ -172,11 +171,7 @@ impl Shell {
             });
             index.push(at);
         }
-        let threads = std::env::var("PIE_XLA_PREWARM_THREADS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(8)
-            .clamp(1, texts.len().max(1));
+        let threads = COMPILE_THREADS.clamp(1, texts.len().max(1));
         let next = std::sync::atomic::AtomicUsize::new(0);
         let device = &self.device;
         let mut programs: Vec<Option<Result<std::sync::Arc<crate::device::Program>>>> =

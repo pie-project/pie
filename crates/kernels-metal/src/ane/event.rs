@@ -157,5 +157,5 @@ fn back(state: &Arc<State>, at: Allotment, ok: bool, why: &str) {
 }
 
 fn stopped(why: &str) {
-    eprintln!("PIE_ANE: the Neural Engine split stopped ({why}); the GPU runs everything alone");
+    eprintln!("ane: the Neural Engine split stopped ({why}); the GPU runs everything alone");
 }

@@ -524,9 +524,10 @@ pub(crate) fn create_engine_backend(
         #[cfg(feature = "xla")]
         EngineOptions::Xla(opts) => {
             let mut boot_doc = format!(
-                "[xla]\ndevice = {}\nmem_utilization = {:?}\nprofiles = {}\n",
+                "[xla]\ndevice = {}\nmem_utilization = {:?}\nprewarm = {}\nprofiles = {}\n",
                 opts.device_index,
                 opts.mem_utilization,
+                opts.prewarm,
                 toml::Value::String(home.join("profiles").display().to_string()),
             );
             if let Some(plugin) = &opts.plugin {

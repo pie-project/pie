@@ -57,6 +57,13 @@ pub struct DeviceBoot {
 
     /// `$PIE_HOME/profiles`, where a user's TPU profiles live.
     pub profiles: Option<PathBuf>,
+
+    /// Trace and compile the first fire shapes at load (`serve/warm.rs`).
+    pub prewarm: bool,
+
+    /// Windowed kv rows live in their own pool; `false` keeps them in full
+    /// pages, for a test that compares the two.
+    pub window_pool: bool,
 }
 
 impl Default for DeviceBoot {
@@ -66,6 +73,8 @@ impl Default for DeviceBoot {
             ordinal: 0,
             mem_utilization: crate::boot::DEFAULT_MEM_UTILIZATION,
             profiles: None,
+            prewarm: false,
+            window_pool: true,
         }
     }
 }
@@ -391,7 +400,7 @@ impl Engine for Xla {
         )
         .map_err(fault)?;
         let mut shell = shell;
-        if std::env::var("PIE_XLA_PREWARM").is_ok_and(|v| v == "1") {
+        if boot.prewarm {
             shell.prewarm().map_err(fault)?;
         }
         let trace_name = shell.trace().name.clone();

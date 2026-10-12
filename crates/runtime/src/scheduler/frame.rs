@@ -42,58 +42,6 @@ pub(super) fn idle_dump_threshold_us() -> u64 {
     })
 }
 
-static SEAL_DEFAULT_READY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-pub(crate) fn set_seal_default_ready(ready: bool) {
-    SEAL_DEFAULT_READY.store(ready, Ordering::Relaxed);
-}
-
-static SEAL_COALESCE_DEFAULT_US: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-pub(crate) fn set_seal_coalesce_default(window: Duration) {
-    SEAL_COALESCE_DEFAULT_US.store(window.as_micros() as u64, Ordering::Relaxed);
-}
-
-fn seal_coalesce() -> Duration {
-    static CONFIGURED: OnceLock<Duration> = OnceLock::new();
-    *CONFIGURED.get_or_init(|| {
-        std::env::var("PIE_SEAL_COALESCE_US")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<u64>().ok())
-            .map_or_else(
-                || Duration::from_micros(SEAL_COALESCE_DEFAULT_US.load(Ordering::Relaxed)),
-                Duration::from_micros,
-            )
-    })
-}
-
-fn seal_mode_ready() -> bool {
-    static CONFIGURED: OnceLock<bool> = OnceLock::new();
-    *CONFIGURED.get_or_init(|| match std::env::var("PIE_SEAL_MODE") {
-        Ok(value) => match value.trim() {
-            "strict" => false,
-            "ready" => true,
-            other => {
-                tracing::warn!(
-                    value = other,
-                    "PIE_SEAL_MODE must be \"ready\" or \"strict\"; \
-                     ignoring and keeping the default (ready)"
-                );
-                true
-            }
-        },
-        Err(_) => SEAL_DEFAULT_READY.load(Ordering::Relaxed),
-    })
-}
-
-fn gate_contributed() -> bool {
-    static CONFIGURED: OnceLock<bool> = OnceLock::new();
-    *CONFIGURED
-        .get_or_init(|| std::env::var("PIE_GATE_CONTRIBUTED").is_ok_and(|value| value == "1"))
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameStamp {
     pub lane: ProcessId,
@@ -300,10 +248,6 @@ pub(super) struct FramePolicy {
     in_flight_since: BTreeMap<ProcessId, Instant>,
     submit_deadline: Duration,
     silence_timeout: Duration,
-    gate_contributed: bool,
-    seal_mode_ready: bool,
-    seal_coalesce: Duration,
-    coalesce_since: Option<Instant>,
     stats: Option<Arc<SchedulerStats>>,
 }
 
@@ -318,12 +262,6 @@ impl FramePolicy {
     #[cfg(test)]
     fn with_silence_timeout(mut self, timeout: Duration) -> Self {
         self.silence_timeout = timeout;
-        self
-    }
-
-    #[cfg(test)]
-    fn with_seal_mode_ready(mut self, on: bool) -> Self {
-        self.seal_mode_ready = on;
         self
     }
 
@@ -359,10 +297,6 @@ impl FramePolicy {
             in_flight_since: BTreeMap::new(),
             submit_deadline: crate::scheduler::configured_submit_deadline(),
             silence_timeout: crate::scheduler::configured_silence_timeout(),
-            gate_contributed: gate_contributed(),
-            seal_mode_ready: seal_mode_ready(),
-            seal_coalesce: seal_coalesce(),
-            coalesce_since: None,
             stats,
         }
     }
@@ -1206,7 +1140,6 @@ ready_age_newest={}us",
             let mut expired: Vec<ProcessId> = Vec::new();
             let leash = self.submit_deadline;
             let silence = self.silence_timeout;
-            let contributed_relax = self.gate_contributed && executing;
             debug_assert!(
                 !self.boundary_open(),
                 "the wait-all gate is evaluated only against a closed boundary"
@@ -1223,7 +1156,7 @@ ready_age_newest={}us",
                 };
                 let owes_forever = debt_since
                     .is_some_and(|from| now.saturating_duration_since(from) >= silence * 2);
-                let blocking = match lane.gate_verdict(contributed_relax && !owes_forever, owes) {
+                let blocking = match lane.gate_verdict(false, owes) {
                     GateVerdict::Blocking => true,
                     GateVerdict::SkippedOwed | GateVerdict::Satisfied => false,
                 };
@@ -1282,30 +1215,7 @@ ready_age_newest={}us",
             if missing > 0 {
                 if executing {
                     self.quiesce_mark = None;
-                    self.coalesce_since = None;
                     return FramePlan::Park;
-                }
-                let mut window_left: Option<Duration> = None;
-                if self.seal_mode_ready && self.have_seal_candidate() {
-                    let since = *self.coalesce_since.get_or_insert(now);
-                    let open_for = now.saturating_duration_since(since);
-                    let quiesced = self.quiesce_mark == Some(self.gather_seq);
-                    if quiesced && open_for >= self.seal_coalesce {
-                        self.quiesce_mark = None;
-                        self.coalesce_since = None;
-                        self.strict_watchdog_deadline = None;
-                        self.idle_dumped = false;
-                        match self.seal() {
-                            Some(FramePlan::Dispatch(_)) => continue,
-                            Some(plan) => return plan,
-                            None => {}
-                        }
-                    } else {
-                        if !quiesced {
-                            self.quiesce_mark = Some(self.gather_seq);
-                        }
-                        window_left = Some(self.seal_coalesce.saturating_sub(open_for));
-                    }
                 }
                 let deadline = self
                     .strict_watchdog_deadline
@@ -1313,20 +1223,14 @@ ready_age_newest={}us",
                 if now >= *deadline {
                     *deadline = now + Duration::from_micros(STRICT_WATCHDOG_US);
                 }
-                let mut hold = deadline
+                let hold = deadline
                     .saturating_duration_since(now)
                     .min(Duration::from_micros(GATHER_POLL_US));
-                if let Some(left) = window_left
-                    && left > Duration::ZERO
-                {
-                    hold = hold.min(left);
-                }
                 return FramePlan::Hold(hold);
             }
             self.strict_watchdog_deadline = None;
             self.idle_dumped = false;
             self.quiesce_mark = None;
-            self.coalesce_since = None;
             match self.seal() {
                 Some(FramePlan::Dispatch(_)) => continue,
                 Some(plan) => return plan,
@@ -1463,7 +1367,6 @@ mod tests {
 
     fn a_grouped_lanes_first_frame_waits_for_its_cohort() {
         let mut policy = FramePolicy::new(1, 64, 4096, None)
-            .with_seal_mode_ready(false)
             .with_submit_deadline(Duration::from_secs(86_400));
         let owner = pid();
         let (caption, context, image) = (pid(), pid(), pid());
@@ -1510,8 +1413,7 @@ mod tests {
     fn a_group_composes_on_a_pipeline_that_already_fired_ungrouped() {
         for reuse_first in [false, true] {
             let mut policy = FramePolicy::new(1, 64, 4096, None)
-                .with_seal_mode_ready(false)
-                .with_submit_deadline(Duration::from_millis(50));
+                    .with_submit_deadline(Duration::from_millis(50));
             let owner = pid();
             let (image, context) = (pid(), pid());
             let now = Instant::now();
@@ -1562,7 +1464,6 @@ mod tests {
     fn a_stated_cohort_is_never_sealed_short() {
         let leash = Duration::from_millis(50);
         let mut policy = FramePolicy::new(1, 64, 4096, None)
-            .with_seal_mode_ready(false)
             .with_submit_deadline(leash);
         let owner = pid();
         let (image, text) = (pid(), pid());
@@ -1590,7 +1491,6 @@ mod tests {
     fn a_cohort_that_never_completes_kills_its_request_by_name() {
         let silence = Duration::from_secs(30);
         let mut policy = FramePolicy::new(1, 64, 4096, None)
-            .with_seal_mode_ready(false)
             .with_submit_deadline(Duration::from_millis(50))
             .with_silence_timeout(silence);
         let owner = pid();
@@ -1635,7 +1535,6 @@ mod tests {
     fn a_group_never_fires_short_when_the_leash_drops_a_member() {
         let leash = Duration::from_millis(50);
         let mut policy = FramePolicy::new(1, 64, 4096, None)
-            .with_seal_mode_ready(false)
             .with_submit_deadline(leash);
         let owner = pid();
         let (image, text) = (pid(), pid());
@@ -1664,7 +1563,6 @@ mod tests {
 
     fn a_gathering_cohort_holds_its_own_lanes_and_not_the_fleet() {
         let mut policy = FramePolicy::new(1, 64, 4096, None)
-            .with_seal_mode_ready(false)
             .with_submit_deadline(Duration::from_millis(50));
         let owner = pid();
         let grouped = pid();
@@ -1682,7 +1580,6 @@ mod tests {
 
     fn a_group_is_never_split_across_two_partitions() {
         let mut policy = FramePolicy::new(1, 8, 4096, None)
-            .with_seal_mode_ready(false)
             .with_submit_deadline(Duration::from_millis(50));
         let owner = ProcessId::from_u128(9);
         let stranger = ProcessId::from_u128(1);
@@ -1704,7 +1601,6 @@ mod tests {
 
     fn incomplete_lane_holds_the_seal_until_it_completes() {
         let mut policy = FramePolicy::new(2, 64, 4096, None)
-            .with_seal_mode_ready(false)
             .with_submit_deadline(Duration::from_secs(86_400));
         let (fast, slow) = (pid(), pid());
         policy.on_fire_enqueued(stamp(fast, 0, 0, 2), Some(fast), 1, 1, 1, None);

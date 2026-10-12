@@ -621,7 +621,7 @@ async def cli_pie_client(args: argparse.Namespace):
 
     def should_surface_server_line(txt: str) -> bool:
         return (
-            txt.startswith("PIE_ANE")
+            txt.startswith("ane: ")
             or "panicked at" in txt
             or txt.startswith("[fire ")
             or txt.startswith("[pie-fire-timing] ")
@@ -646,7 +646,7 @@ async def cli_pie_client(args: argparse.Namespace):
     def stamped(txt: str) -> str:
         # The Neural Engine's lines carry when they landed, so a stall can be
         # set against its compile and its hand-offs.
-        if txt.startswith("PIE_ANE") or "panicked at" in txt:
+        if txt.startswith("ane: ") or "panicked at" in txt:
             return f"[{time.perf_counter() - spawned:7.1f}s] {txt}"
         return txt
 

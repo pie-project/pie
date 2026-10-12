@@ -705,7 +705,6 @@ impl Plane {
         // The cell this fire reads is still in the last pass's output on
         // the device: the fire reads it there, with no trip to the host.
         if ring.is_empty()
-            && std::env::var_os("PIE_XLA_DEVICE_TOKENS").is_none_or(|v| v != "0")
             && let Some(cell) = self.flights.cell_at(ring, ring.head())
             && let crate::guest::lower::Feed::Value(
                 eta_ir::types::Dtype::I32 | eta_ir::types::Dtype::U32,

@@ -75,14 +75,10 @@ struct Answer {
 }
 
 fn answer(m: &common::Model, prompt: &[u32], full_windows: bool) -> Answer {
-    // SAFETY: the test sets the knob before the shell reads it, on one thread.
-    unsafe {
-        if full_windows {
-            std::env::set_var("PIE_XLA_FULL_WINDOWS", "1");
-        } else {
-            std::env::remove_var("PIE_XLA_FULL_WINDOWS");
-        }
-    }
+    let device = DeviceBoot {
+        window_pool: !full_windows,
+        ..DeviceBoot::default()
+    };
     let deployment = m.deployment;
     let facts = deployment.trace(poem::Platform::Xla).facts;
     let word = |rows: u32| facts.word(&Request::new(rows, false));
@@ -95,7 +91,7 @@ fn answer(m: &common::Model, prompt: &[u32], full_windows: bool) -> Answer {
         context: CONTEXT,
         slots: 2,
         pages: 2 * CONTEXT / PAGE,
-        device: &DeviceBoot::default(),
+        device: &device,
         patches: None,
     })
     .expect("the shell loads");

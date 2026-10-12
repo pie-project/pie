@@ -159,14 +159,6 @@ pub fn configured_submit_depth() -> usize {
         .submit_depth()
 }
 
-pub fn set_seal_default_ready(ready: bool) {
-    frame::set_seal_default_ready(ready);
-}
-
-pub fn set_seal_coalesce_default(window: std::time::Duration) {
-    frame::set_seal_coalesce_default(window);
-}
-
 pub fn set_dispatch_depth(depth: usize) {
     frame::set_dispatch_depth(depth);
 }
