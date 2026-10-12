@@ -98,10 +98,18 @@ macro_rules! seeded {
 }
 
 seeded!(
+    "sm80.toml",
+    "sm86.toml",
+    "sm87.toml",
     "sm89.toml",
     "sm89/nvidia-l40s.toml",
+    "sm90.toml",
     "sm100.toml",
+    "sm101.toml",
+    "sm103.toml",
+    "sm110.toml",
     "sm120.toml",
+    "sm121.toml",
 );
 
 pub static SHELF: Shelf = Shelf {
@@ -285,19 +293,57 @@ mod tests {
     }
 
     #[test]
-    fn a_blackwell_no_file_names_takes_its_familys_kernels() {
-        let (profile, report) = resolve("NVIDIA RTX PRO 6000", &facts(12, 0, 188), None);
-        assert_eq!(report.used, profile::Source::Seeded("sm120.toml".into()));
-        let tuning = kernels_cuda::tuning::Tuning::of(&profile);
-        assert!(tuning.gemv_narrow && tuning.mla_naive);
-        let (profile, report) = resolve("NVIDIA B200", &facts(10, 0, 148), None);
-        assert_eq!(report.used, profile::Source::Seeded("sm100.toml".into()));
-        let tuning = kernels_cuda::tuning::Tuning::of(&profile);
-        assert!(tuning.gemv_narrow && tuning.mla_naive);
-        let (profile, report) = resolve("NVIDIA A10", &facts(8, 6, 72), None);
+    fn each_capability_takes_its_family_and_from_10_0_the_blackwell_kernels() {
+        let defaults = kernels_cuda::tuning::Tuning::of(&registry().defaults());
+        for (major, minor, gpu) in [
+            (8, 0, "NVIDIA A100-SXM4-80GB"),
+            (8, 6, "NVIDIA A10"),
+            (8, 7, "Orin"),
+            (8, 9, "NVIDIA L4"),
+            (9, 0, "NVIDIA H100 80GB HBM3"),
+            (10, 0, "NVIDIA B200"),
+            (10, 1, "NVIDIA Thor"),
+            (10, 3, "NVIDIA B300"),
+            (11, 0, "NVIDIA Thor"),
+            (12, 0, "NVIDIA RTX PRO 6000"),
+            (12, 1, "NVIDIA GB10"),
+        ] {
+            let (profile, report) = resolve(gpu, &facts(major, minor, 100), None);
+            assert_eq!(
+                report.layers,
+                [profile::Source::Seeded(format!("sm{major}{minor}.toml"))],
+                "{gpu}"
+            );
+            assert!(report.untuned(), "{gpu}");
+            assert_eq!(Engine::of(&profile), Engine::of(&registry().defaults()));
+            let tuning = kernels_cuda::tuning::Tuning::of(&profile);
+            if major >= 10 {
+                assert!(tuning.gemv_narrow && tuning.mla_naive, "{gpu}");
+                assert_eq!(
+                    kernels_cuda::tuning::Tuning {
+                        gemv_narrow: false,
+                        mla_naive: false,
+                        ..tuning
+                    },
+                    defaults,
+                    "{gpu}: only the Blackwell kernels differ"
+                );
+            } else {
+                assert_eq!(tuning, defaults, "{gpu}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_capability_with_no_family_runs_the_defaults_untuned() {
+        let (profile, report) = resolve("NVIDIA Next", &facts(13, 0, 200), None);
         assert_eq!(report.used, profile::Source::Defaults);
-        let tuning = kernels_cuda::tuning::Tuning::of(&profile);
-        assert!(!tuning.gemv_narrow && !tuning.mla_naive);
+        assert!(report.layers.is_empty());
+        assert!(report.untuned());
+        assert_eq!(
+            kernels_cuda::tuning::Tuning::of(&profile),
+            kernels_cuda::tuning::Tuning::of(&registry().defaults())
+        );
     }
 
     #[test]

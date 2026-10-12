@@ -1,0 +1,9 @@
+# sm_86 (Ampere: A10, A40, RTX A6000, RTX 30): what every GPU of compute capability 8.6 runs over the registry defaults.
+api = 1
+
+[target]
+tier    = "sm_86"
+assumes = { cc = 86 }
+
+[provenance]
+source = "the registry defaults, which every CUDA GPU below compute capability 10.0 ran before family files"
