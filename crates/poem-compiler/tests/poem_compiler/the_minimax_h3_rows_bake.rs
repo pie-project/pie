@@ -1,14 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::minimax_h3_dims;
-
 use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
 use poem::{
     Attention, Def, Dim, Dtype, Elementwise, Operation, Platform, RaggedMask, Request, RopeForm,
     RuntimeInput, Stream, Trace, Ty, seam,
 };
 
-use minimax_h3_dims::{self as model, Dims};
+use crate::minimax_h3_dims::{self as model, Dims};
 
 const FLAGSHIP: &str = "minimax-h3-fl2va-bf16-kv-bf16";
 const MINI: &str = "minimax-h3-mini-bf16-kv-bf16";

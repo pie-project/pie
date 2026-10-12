@@ -2,10 +2,8 @@
 //! is `[beta, alpha]`, beta first, and a "v-grouped" GGUF's tiled v-heads are
 //! gathered back into block order.
 
-use crate::sparse_gguf;
-
+use crate::sparse_gguf::{Kv, Scratch, reads};
 use poem::Dtype;
-use sparse_gguf::{Kv, Scratch, reads};
 
 fn arch() -> (&'static str, Kv) {
     ("general.architecture", Kv::Str("qwen35".into()))

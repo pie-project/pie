@@ -1,8 +1,6 @@
 #![cfg(feature = "cuda")]
 
-use crate::common_two_axis;
-
-use common_two_axis::{
+use crate::common_two_axis::{
     C_IN, C_OUT, Lcg, Rig, Weights, assert_close, attach, bf, conv_reference, frame,
     pixel_epilogue, trace,
 };

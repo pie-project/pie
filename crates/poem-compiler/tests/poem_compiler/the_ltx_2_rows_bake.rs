@@ -1,8 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ltx_2_dims;
-
-use ltx_2_dims::{self as model, DENOISE, Dims, REFINE_AUDIO, REFINE_VIDEO, VAE_DECODE};
+use crate::ltx_2_dims::{self as model, DENOISE, Dims, REFINE_AUDIO, REFINE_VIDEO, VAE_DECODE};
 use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
 use poem::{
     Attention, Def, Dim, Dtype, Elementwise, GeomKind, Operands, Operation, Platform, RaggedMask,

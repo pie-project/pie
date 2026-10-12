@@ -1,8 +1,7 @@
-use crate::msl_corpus;
+use crate::msl_corpus::{corpus_bound, corpus_stages, extended_stages};
 use eta_compiler::codegen::cuda::CUDA_GENERATED_EMITTER_VERSION;
 use eta_compiler::codegen::metal::METAL_M1_EMITTER_VERSION;
 use eta_compiler::codegen::program::{Backend, emit_program};
-use msl_corpus::{corpus_bound, corpus_stages, extended_stages};
 
 const PINNED: &[(&str, u16, u64)] = &[
     ("cuda", 40, 0xa92f_4d4b_c783_4735),

@@ -1,9 +1,8 @@
-use crate::msl_corpus;
 use eta_compiler::codegen::program::{Backend, EmittedKernel, emit_program};
 use eta_compiler::plan::compile_bound;
 use eta_ir::validate::bind;
 
-use msl_corpus::{
+use crate::msl_corpus::{
     GOLDEN_NAMES, extended_traces, golden_container, golden_profile, synthetic_traces,
 };
 

@@ -1,9 +1,7 @@
 #![cfg(feature = "cuda")]
 
-use crate::common;
-
-use common::spatial::{Box3, near, out_boxes, table};
-use common::{Gpu, Lcg, from_bf16};
+use crate::common::spatial::{Box3, near, out_boxes, table};
+use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::spatial::{Conv3d, ConvPath, TimePad, conv3d, conv3d_on};
 use kernels_cuda::tensor::Tensor;

@@ -1,14 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::z_image_dims;
 use checkpoint::contract::Partition;
 use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{Expr, ModelContract, TensorType};
 use checkpoint::plan::StorageTarget;
 
+use crate::z_image_dims::{self as model, Dims};
 use poem::Platform;
-use z_image_dims::{self as model, Dims};
 use ztensor::Leaf;
 use ztensor::provide::{Catalog, Entry, Location, Store, StoreId};
 

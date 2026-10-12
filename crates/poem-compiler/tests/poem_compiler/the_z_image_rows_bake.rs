@@ -1,13 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::z_image_dims;
-
+use crate::z_image_dims::{self as model, Dims};
 use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
 use poem::{
     Attention, Def, Dim, Dtype, Elementwise, GeomKind, Operation, Platform, Request, RopeForm,
     RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
 };
-use z_image_dims::{self as model, Dims};
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
 

@@ -1,8 +1,6 @@
-use crate::msl_corpus;
-use crate::msl_mutations;
+use crate::msl_corpus::{corpus_stages, extended_stages};
+use crate::msl_mutations::{MUTATIONS, mutate};
 use eta_compiler::codegen::metal::validate_singleton_plan;
-use msl_corpus::{corpus_stages, extended_stages};
-use msl_mutations::{MUTATIONS, mutate};
 
 const TOLERATED: &[(&str, &str)] = &[(
     "none",

@@ -1,5 +1,4 @@
-use crate::msl_corpus;
-use msl_corpus::{GOLDEN_NAMES, extended_traces, golden_container};
+use crate::msl_corpus::{GOLDEN_NAMES, extended_traces, golden_container};
 
 struct Sweep {
     name: &'static str,

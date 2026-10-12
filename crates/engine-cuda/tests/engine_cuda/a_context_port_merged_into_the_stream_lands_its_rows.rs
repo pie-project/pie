@@ -1,8 +1,6 @@
 #![cfg(feature = "cuda")]
 
-use crate::common_dit;
-
-use common_dit::{Lcg, NAME, Rig, WIDTH, Weights, assert_close, attach, bf, frame, lane};
+use crate::common_dit::{Lcg, NAME, Rig, WIDTH, Weights, assert_close, attach, bf, frame, lane};
 use engine::Engine;
 use engine::fire::LaneStream;
 use poem::fact;

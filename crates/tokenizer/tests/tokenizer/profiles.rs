@@ -1,8 +1,6 @@
-use crate::common;
-
 use std::sync::Arc;
 
-use common::{MergeFormat, byte_level_json, gemma_json, unigram_json};
+use crate::common::{MergeFormat, byte_level_json, gemma_json, unigram_json};
 use serde_json::json;
 use tokenizer::Tokenizer;
 use tokenizers::Tokenizer as HfTokenizer;

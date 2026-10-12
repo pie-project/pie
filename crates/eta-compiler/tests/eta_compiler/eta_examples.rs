@@ -3,8 +3,7 @@ use eta_ir::container_hash;
 use eta_ir::registry::ModelProfile;
 use eta_ir::validate::bind;
 
-use crate::traces;
-use traces::*;
+use crate::traces::*;
 
 #[test]
 fn eta_examples_every_case() {

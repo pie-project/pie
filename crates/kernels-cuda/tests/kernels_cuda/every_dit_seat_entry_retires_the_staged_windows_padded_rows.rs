@@ -1,8 +1,6 @@
 #![cfg(feature = "cuda")]
 
-use crate::common;
-
-use common::{Gpu, Lcg};
+use crate::common::{Gpu, Lcg};
 use dtype::Dtype;
 use kernels_cuda::elemwise::modulate::{self, NormKind};
 use kernels_cuda::elemwise::{RopeForm, activation, binary, rope_axes, sinusoid};

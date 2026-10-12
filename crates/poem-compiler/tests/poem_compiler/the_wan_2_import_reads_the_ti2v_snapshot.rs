@@ -1,13 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::wan_2_dims;
-
+use crate::wan_2_dims::{self as model, Dims};
 use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{ModelContract, Partition, TensorType};
 use checkpoint::plan::StorageTarget;
 use poem::Platform;
-use wan_2_dims::{self as model, Dims};
 use ztensor::Leaf;
 use ztensor::provide::{Catalog, Entry, Location, Store, StoreId};
 

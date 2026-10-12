@@ -1,13 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::wan_2_dims;
-
+use crate::wan_2_dims::{self as model, Dims};
 use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
 use poem::{
     Attention, CacheRow, Def, Dim, Dtype, Elementwise, GeomKind, Operands, Operation, Platform,
     RaggedMask, Request, RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
 };
-use wan_2_dims::{self as model, Dims};
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
 

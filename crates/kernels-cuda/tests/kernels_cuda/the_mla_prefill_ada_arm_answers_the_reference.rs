@@ -6,9 +6,7 @@
 // GPU and reads it against a host reference and against the plan the probed
 // device would take.
 
-use crate::common;
-
-use common::{Gpu, Lcg, close, from_bf16};
+use crate::common::{Gpu, Lcg, close, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn::mla;
 use kernels_cuda::attn::plan::{self, Device, Live, Workspace};

@@ -1,8 +1,6 @@
 #![cfg(feature = "cuda")]
 
-use crate::common_dit;
-
-use common_dit::{
+use crate::common_dit::{
     HEAD_DIM, Lcg, NAME, Rig, SM_SCALE, THETA, WIDTH, Weights, assert_close, attach, bf, condition,
     frame, lane, matmul_bf16, matmul_f32, rope, silu, sinusoid,
 };

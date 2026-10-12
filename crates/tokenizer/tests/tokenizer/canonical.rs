@@ -1,6 +1,4 @@
-use crate::common;
-
-use common::{MergeFormat, TEXTS, byte_level_json, gemma_json};
+use crate::common::{MergeFormat, TEXTS, byte_level_json, gemma_json};
 use serde_json::json;
 use tokenizer::Tokenizer;
 use tokenizer::canonical::{CanonicalTokenizer, VERSION};

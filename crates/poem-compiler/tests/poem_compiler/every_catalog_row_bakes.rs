@@ -2,8 +2,7 @@ use poem_compiler::{
     CompiledModel, DeviceProfile, Lowering, Phase, Region, collectives_are_never_elided,
 };
 
-use crate::common;
-use common::{PLATFORMS, bake_with, states};
+use crate::common::{PLATFORMS, bake_with, states};
 use poem_ir::{RowAxis, Trace};
 
 fn forced() -> DeviceProfile {

@@ -1,8 +1,6 @@
 #![cfg(feature = "cuda")]
 
-use crate::common_dit;
-
-use common_dit::{Lcg, NAME, Rig, WIDTH, Weights, attach, bf, frame, lane};
+use crate::common_dit::{Lcg, NAME, Rig, WIDTH, Weights, attach, bf, frame, lane};
 use engine::Engine;
 use engine::fire::{LaneStream, ReadoutSeam};
 use engine_cuda::Recording;

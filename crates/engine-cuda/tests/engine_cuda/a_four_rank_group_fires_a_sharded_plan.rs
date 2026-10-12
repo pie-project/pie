@@ -1,12 +1,10 @@
 #![cfg(feature = "cuda")]
 
-use crate::common_dit;
-
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::common_dit::{HEAD_DIM, Lcg, NAME, SM_SCALE, WIDTH, Weights, assert_close, bf};
 use checkpoint::contract::ModelContract;
-use common_dit::{HEAD_DIM, Lcg, NAME, SM_SCALE, WIDTH, Weights, assert_close, bf};
 use engine::Engine;
 use engine::channel::ChannelRegistration;
 use engine::fire::{

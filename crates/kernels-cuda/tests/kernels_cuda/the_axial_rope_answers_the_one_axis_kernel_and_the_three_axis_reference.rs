@@ -1,8 +1,6 @@
 #![cfg(feature = "cuda")]
 
-use crate::common;
-
-use common::{Gpu, Lcg, from_bf16, to_bf16};
+use crate::common::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::elemwise::{RopeForm, rope, rope_axes};
 use kernels_cuda::tensor::Tensor;

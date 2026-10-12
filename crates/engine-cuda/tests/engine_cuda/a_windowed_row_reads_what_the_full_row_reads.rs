@@ -1,10 +1,8 @@
 #![cfg(feature = "cuda")]
 
-use crate::common_encoder;
-
 use std::path::Path;
 
-use common_encoder::{Weights, contract_for};
+use crate::common_encoder::{Weights, contract_for};
 use engine_cuda::{Boot, Lane, Shell};
 use poem::{Platform, Request};
 use poem_compiler::Budget;

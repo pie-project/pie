@@ -1,12 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::minimax_h3_dims;
-
+use crate::minimax_h3_dims::{self as model, Dims};
 use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{ModelContract, Partition, TensorType};
 use checkpoint::plan::StorageTarget;
-use minimax_h3_dims::{self as model, Dims};
 use poem::Platform;
 use ztensor::Leaf;
 use ztensor::provide::{Catalog, Entry, Location, Store, StoreId};

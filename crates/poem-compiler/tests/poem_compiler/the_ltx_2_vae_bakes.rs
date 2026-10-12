@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use crate::ltx_2_dims;
-
-use ltx_2_dims::{self as model, VAE_DECODE};
+use crate::ltx_2_dims::{self as model, VAE_DECODE};
 use poem::generative::{PortKind, ReadoutKind};
 use poem::{Def, Dtype, Operation, Platform, RuntimeInput, Trace};
 use poem_ir::{GridRule, Spatial, TimePad};

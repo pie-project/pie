@@ -1,8 +1,6 @@
-use crate::msl_corpus;
-use crate::msl_mutations;
+use crate::msl_corpus::{corpus_stages, extended_stages};
+use crate::msl_mutations::mutate;
 use eta_compiler::codegen::cuda::validate_generated_region;
-use msl_corpus::{corpus_stages, extended_stages};
-use msl_mutations::mutate;
 
 const MUST_REJECT: &[(&str, &str)] = &[
     ("unordered_region_nodes", "a use before def"),

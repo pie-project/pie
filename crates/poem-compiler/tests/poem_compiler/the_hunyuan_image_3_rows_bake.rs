@@ -1,7 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::hunyuan_image_3_dims;
-
 use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
 use poem::{
     Attention, Def, Elementwise, Linear, Operation, Platform, Request, RopeForm, RuntimeInput,
@@ -10,7 +8,7 @@ use poem::{
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
 
-use hunyuan_image_3_dims::{self as model, DENOISE, Dims, ENCODE, IMAGE_IN, IMAGE_OUT};
+use crate::hunyuan_image_3_dims::{self as model, DENOISE, Dims, ENCODE, IMAGE_IN, IMAGE_OUT};
 const TP1: &str = "hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16";
 const TP4: &str = "hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16-tp4";
 const TP4_U4: &str = "hunyuanimage3-80b-a13b-bf16-u4g64-kv-bf16-tp4";

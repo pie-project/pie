@@ -10,12 +10,10 @@
 //! the import reads, must land each sign constant equal to it; a table the
 //! Bonsai rotation cannot use is refused.
 
-use crate::sparse_gguf;
-
 use std::collections::BTreeMap;
 
+use crate::sparse_gguf::{Kv, Scratch, reads};
 use poem::Dtype;
-use sparse_gguf::{Kv, Scratch, reads};
 
 const WIDTH_HIDDEN: u32 = 5120;
 const WIDTH_SSM_OUT: u32 = 6144;

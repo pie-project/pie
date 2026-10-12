@@ -1,8 +1,6 @@
 #![cfg(feature = "cuda")]
 
-use crate::common;
-
-use common::{Gpu, close, from_bf16, to_bf16};
+use crate::common::{Gpu, close, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::linear::moe::{GroupSeat, matmul_select_bias, matmul_select_quant};
 use kernels_cuda::tensor::Tensor;

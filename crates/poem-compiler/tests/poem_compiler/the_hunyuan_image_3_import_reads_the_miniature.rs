@@ -1,12 +1,10 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::hunyuan_image_3_dims;
-
 use checkpoint::contract::Expr;
 use poem::Platform;
 
-use hunyuan_image_3_dims::Dims;
+use crate::hunyuan_image_3_dims::Dims;
 
 const MINI: &str = "hunyuanimage3-mini-bf16-kv-bf16";
 

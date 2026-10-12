@@ -1,8 +1,6 @@
 #![cfg(feature = "cuda")]
 
-use crate::common;
-
-use common::{Gpu, to_bf16};
+use crate::common::{Gpu, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::elemwise::relative_bucket_bias;
 use kernels_cuda::tensor::Tensor;

@@ -1,11 +1,9 @@
 #![cfg(feature = "cuda")]
 
-use crate::common;
-
-use common::spatial::{
+use crate::common::spatial::{
     Box3, avg_down_ref, pixel_shuffle_ref, pixel_unshuffle_ref, table, upsample_ref,
 };
-use common::{Gpu, Lcg, from_bf16, to_bf16};
+use crate::common::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::spatial::{
     avg_down, patchify, pixel_shuffle, pixel_unshuffle, unpatchify, upsample_nearest,

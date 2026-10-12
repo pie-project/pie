@@ -1,9 +1,7 @@
 #![cfg(feature = "cuda")]
 
-use crate::common;
-
-use common::spatial::{Box3, pixel_shuffle_ref, table};
-use common::{Gpu, Lcg, to_bf16};
+use crate::common::spatial::{Box3, pixel_shuffle_ref, table};
+use crate::common::{Gpu, Lcg, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::spatial::{GridRule, derive_grid, pixel_shuffle};
 use kernels_cuda::tensor::Tensor;
