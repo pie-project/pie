@@ -225,8 +225,19 @@ impl<'c> Run<'c> {
 
     /// After `node` runs: submits what the frame holds once a new layer
     /// starts. A failed submit faults the frame, which its commit reports.
+    /// A node outside any layer splits at each convolution.
     pub(crate) fn split_at(&mut self, node: &Node) {
-        let (Some(held), Some(layer)) = (self.split.as_mut(), node.layer) else {
+        let Some(held) = self.split.as_mut() else {
+            return;
+        };
+        let Some(layer) = node.layer else {
+            if matches!(
+                node.op,
+                poem_ir::Operation::Spatial(poem_ir::Spatial::Conv3d { .. })
+            ) && let Err(fault) = crate::probe::flush()
+            {
+                tracing::warn!(%fault, "submitting a convolution of a split step");
+            }
             return;
         };
         if held.is_some_and(|held| held != layer)

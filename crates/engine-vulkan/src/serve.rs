@@ -3136,7 +3136,11 @@ impl engine::frame::Shell for Shell {
         }
 
         // A split step is not recorded: a recording replays as one submit.
-        let split = prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= SPLIT_ROWS;
+        // A fire on the voxel axis (a VAE's) is one long run of convolutions:
+        // whole, a 512x512 decode outlasts what Adreno's driver lets one
+        // submission run, and the device is lost.
+        let split = prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= SPLIT_ROWS
+            || prepared.bindings.voxels.is_some();
         let keep = key.filter(|_| !split && self.recorder.has_room());
         let walked = self.walk_once(&prepared, keep.is_some(), split)?;
         let mut frame = walked.frame.expect("the walk opened a frame");
