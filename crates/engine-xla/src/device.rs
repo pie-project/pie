@@ -117,7 +117,8 @@ impl Device {
                     .get(ordinal)
                     .and_then(|d| c.device_kind(*d).ok())
             })
-            .unwrap_or_else(|| "dry".to_string());
+            // Without a client, the v6e the defaults were measured on.
+            .unwrap_or_else(|| "TPU v6 lite".to_string());
         Ok(Device {
             client,
             dry: Some(Mutex::new(Vec::new())),

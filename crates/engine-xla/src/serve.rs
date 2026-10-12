@@ -401,6 +401,12 @@ impl Shell {
             crate::chip::SHELF.tell_untuned(device.kind(), &chip_report);
         }
         let tpu = crate::chip::Tpu::of(device.kind());
+        if !tpu.known() {
+            tracing::warn!(
+                "TPU kind {:?} is not one pie knows: running untuned, sized as a v6e",
+                device.kind()
+            );
+        }
         let tuning = kernels_xla::tuning::Tuning::on(&chip, tpu.vmem_bytes());
         let engine = crate::chip::Engine::of(&chip);
         let pad = engine.pad;
