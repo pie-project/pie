@@ -8,34 +8,34 @@ use profile::{Anywhere, Decision, Profile, Registry};
 /// Whether routed matmuls over bf16 or f16 banks take the grouped GEMM once
 /// an expert's routes pay for it; off, every route reads its expert alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.grouped", flag, default = true)]
+#[decision(id = "kernel.moe.grouped", flag, default = true, tune = search)]
 pub struct MoeGrouped;
 
 /// The same for mxfp4 banks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.mxfp4_grouped", flag, default = true)]
+#[decision(id = "kernel.moe.mxfp4_grouped", flag, default = true, tune = search)]
 pub struct MoeMxfp4Grouped;
 
 /// Whether the grouped mxfp4 kernel multiplies bf16 rows with tensor cores
 /// (WMMA) rather than the scalar grouped kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.mxfp4_wmma", flag, default = true)]
+#[decision(id = "kernel.moe.mxfp4_wmma", flag, default = true, tune = search)]
 pub struct MoeMxfp4Wmma;
 
 /// Whether a small decode batch still splits its keys across blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.split_small", flag, default = false)]
+#[decision(id = "kernel.sdpa.decode.split_small", flag, default = false, tune = search)]
 pub struct DecodeSplitSmall;
 
 /// Whether a sliding-window decode splits its keys across blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.split_window", flag, default = false)]
+#[decision(id = "kernel.sdpa.decode.split_window", flag, default = false, tune = search)]
 pub struct DecodeSplitWindow;
 
 /// Whether a split decode chunk holds at least 128 keys, as the scheduler
 /// once floored it, rather than one page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.chunk_floor_128", flag, default = false)]
+#[decision(id = "kernel.sdpa.decode.chunk_floor_128", flag, default = false, tune = search)]
 pub struct DecodeChunkFloor128;
 
 /// Register every decision this crate reads.

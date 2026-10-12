@@ -25,7 +25,7 @@ pub const AXES: &[&str] = &["rows"];
 
 /// Whether fires are captured as CUDA graphs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.graphs", default = "on")]
+#[decision(id = "engine.graphs", default = "on", tune = engine)]
 pub enum GraphMode {
     /// Every fire launches eagerly: for diagnostics, not serving.
     Off,
@@ -39,7 +39,8 @@ pub enum GraphMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(
     id = "engine.recording",
-    default = r#"{ use = "bodies", mem_mb = 4096 }"#
+    default = r#"{ use = "bodies", mem_mb = 4096 }"#,
+    tune = engine
 )]
 pub enum RecordingMode {
     Off,
@@ -54,12 +55,12 @@ pub enum RecordingMode {
 /// Whether a window that cannot be viewed in place is copied rather than
 /// split.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.copies", flag, default = true)]
+#[decision(id = "engine.copies", flag, default = true, tune = engine)]
 pub struct Copies;
 
 /// Whether the ops this engine can launch as one grouped kernel are grouped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "compiler.grouped", flag, default = true)]
+#[decision(id = "compiler.grouped", flag, default = true, tune = engine)]
 pub struct Grouped;
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {

@@ -57,33 +57,58 @@ pub struct Tuned {
     pub seconds: f64,
 }
 
+/// The check models: those `req.check` names among `found`, or the
+/// smallest of `found`.
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
+fn pick_models(
+    found: Vec<(std::path::PathBuf, String)>,
+    req: &TuneRequest<'_>,
+) -> Result<Vec<(std::path::PathBuf, String)>, String> {
+    if req.no_check {
+        return Ok(Vec::new());
+    }
+    if req.check.is_empty() {
+        return Ok(found.into_iter().take(1).collect());
+    }
+    let mut picked = Vec::new();
+    for name in req.check {
+        let hit = found
+            .iter()
+            .find(|(path, d)| {
+                d == name || d.contains(name.as_str()) || path.to_string_lossy().contains(name.as_str())
+            })
+            .ok_or_else(|| {
+                let have: Vec<&str> = found.iter().map(|(_, d)| d.as_str()).collect();
+                format!(
+                    "no stamped artifact for this backend matches `{name}` (servable here: {have:?}); \
+                     `pie model list` marks the rest unstamped, which an import from this \
+                     pie restamps: `pie model import <source>`"
+                )
+            })?;
+        picked.push(hit.clone());
+    }
+    Ok(picked)
+}
+
+#[cfg(feature = "cuda")]
+fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
+    let models = pick_models(engine_cuda::tune::artifacts(req.artifacts), req)?;
+    let out = engine_cuda::tune::run(Some(req.profiles), &models, say)?;
+    Ok(Tuned {
+        device: out.device,
+        file: out.file,
+        lines: out.lines.into_iter().map(|l| (l.id, l.text)).collect(),
+        wrong: Vec::new(),
+        checks: out.checks.iter().map(|c| (c.describe(), c.passes())).collect(),
+        seconds: out.seconds,
+    })
+}
+
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn tune_metal(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
     use engine_metal::tune::{Depth, artifacts, run};
     let depth = if req.full { Depth::Full } else { Depth::Quick };
-    let found = artifacts(req.artifacts);
-    let models: Vec<_> = if req.no_check {
-        Vec::new()
-    } else if req.check.is_empty() {
-        found.into_iter().take(1).collect()
-    } else {
-        let mut picked = Vec::new();
-        for name in req.check {
-            let hit = found
-                .iter()
-                .find(|(path, d)| d == name || d.contains(name.as_str()) || path.to_string_lossy().contains(name.as_str()))
-                .ok_or_else(|| {
-                    let have: Vec<&str> = found.iter().map(|(_, d)| d.as_str()).collect();
-                    format!(
-                        "no stamped Metal artifact matches `{name}` (servable here: {have:?}); \
-                         `pie model list` marks the rest unstamped, which an import from this \
-                         pie restamps: `pie model import <source>`"
-                    )
-                })?;
-            picked.push(hit.clone());
-        }
-        picked
-    };
+    let models = pick_models(artifacts(req.artifacts), req)?;
     let out = run(depth, Some(req.profiles), req.cache, req.refit, &models, say)?;
     Ok(Tuned {
         device: out.device,
@@ -107,7 +132,7 @@ pub fn backends() -> Vec<Backend> {
         shelf: &engine_cuda::chip::SHELF,
         probe: || engine_cuda::chip::probe(0),
         resolve: engine_cuda::chip::resolve,
-        tune: None,
+        tune: Some(tune_cuda),
     });
     #[cfg(feature = "vulkan")]
     out.push(Backend {

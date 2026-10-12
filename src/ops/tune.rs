@@ -58,7 +58,7 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
             [one] => all.iter().position(|b| b.name == *one).expect("listed"),
             [] => bail!(
                 "no backend this build hosts can tune yet (it hosts {names:?}); \
-                 `pie tune` measures Metal on Apple silicon so far"
+                 `pie tune` measures Metal on Apple silicon and CUDA so far"
             ),
             _ => bail!("name a backend to tune: {tunable:?}"),
         },

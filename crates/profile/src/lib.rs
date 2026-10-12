@@ -15,6 +15,7 @@ pub mod profile;
 pub mod region;
 pub mod registry;
 pub mod render;
+pub mod search;
 pub mod shelf;
 pub mod spec;
 pub mod tune;
@@ -30,7 +31,7 @@ pub use spec::{Alternative, Constant, Domain, Kind, Shape, Sort, Spec, Tune, Val
 pub use when::When;
 
 /// The backends `pie tune` can measure.
-pub const TUNABLE: &[&str] = &["metal"];
+pub const TUNABLE: &[&str] = &["metal", "cuda"];
 
 /// What `pie` prints when a device runs without a profile measured on it.
 #[must_use]

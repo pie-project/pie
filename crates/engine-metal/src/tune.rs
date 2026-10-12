@@ -10,8 +10,9 @@
 use std::fmt::Write as _;
 
 use kernels_metal::tuning::{Qmm, QmmFp16};
+use profile::search::{Entries, Line};
 use profile::tune::{Candidate, Fit, Options, Sample};
-use profile::{Decision, Facts, Profile, Source, Strict, Target};
+use profile::{Decision, Facts, Profile, Source};
 
 /// How much to measure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,25 +102,27 @@ impl Grid {
             group,
             fp16: false,
         };
-        let shapes = |count: usize| {
-            let taken = &CENSUS[..count];
+        let shapes = |taken: Vec<(u32, u32, u32)>| {
             let total: f64 = taken.iter().map(|&(n, k, c)| f64::from(n) * f64::from(k) * f64::from(c)).sum();
             taken
                 .iter()
                 .map(|&(n, k, c)| (n, k, f64::from(n) * f64::from(k) * f64::from(c) / total))
-                .collect()
+                .collect::<Vec<_>>()
         };
         match depth {
             Depth::Quick => Grid {
                 rows: vec![1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32, 64, 128, 512],
-                shapes: shapes(8),
+                // The four heaviest, and four spread down the census to its
+                // small attention projections: a crossover learned on large
+                // banks alone misplaces small ones.
+                shapes: shapes([0, 1, 2, 3, 9, 15, 20, 21].iter().map(|&i| CENSUS[i]).collect()),
                 banks: vec![fp16, bank(4, 64), bank(4, 32), bank(8, 64), bank(2, 64)],
             },
             Depth::Full => Grid {
                 rows: (1..=16)
                     .chain([20, 24, 32, 48, 64, 96, 128, 256, 512, 1024, 2048])
                     .collect(),
-                shapes: shapes(CENSUS.len()),
+                shapes: shapes(CENSUS.to_vec()),
                 banks: vec![
                     fp16,
                     bank(4, 64),
@@ -364,150 +367,15 @@ impl Measured {
     }
 }
 
-/// One decision the end-to-end search tries: each candidate as the
-/// profile TOML that sets it, and whether the candidate can only matter by
-/// changing the compiled plan (a price, a fusion), so an unchanged plan is
-/// skipped without serving.
-#[derive(Clone, Debug)]
-pub struct Knob {
-    pub id: &'static str,
-    /// The value the profile holds now, as TOML.
-    pub current: String,
-    /// `(label, overrides)`: the value as a reader sees it, and the TOML.
-    pub candidates: Vec<(String, String)>,
-    pub plan_only: bool,
-}
-
-/// Decisions the search leaves alone, and why.
-const SEARCH_SKIPS: &[(&str, &str)] = &[
-    ("compiler.side_streams", "Metal serves every region from one queue"),
-    ("compiler.cost.collective_us", "Metal serves one device"),
+/// Decisions the end-to-end search leaves alone: the dense matmul, which
+/// the kernel bench measures, and what means nothing on Metal.
+pub const SEARCH_SKIPS: &[&str] = &[
+    "kernel.qmm",
+    "kernel.qmm_fp16",
+    // Metal serves every region from one queue, on one device.
+    "compiler.side_streams",
+    "compiler.cost.collective_us",
 ];
-
-/// The decisions the end-to-end search tries on this registry, in order:
-/// kernels, the Neural Engine, the engine, fusions, then prices. `kernel.qmm`
-/// and `kernel.qmm_fp16` are measured kernel by kernel instead; a `never`
-/// decision is never touched.
-#[must_use]
-pub fn knobs(base: &Profile, _depth: Depth) -> Vec<Knob> {
-    use profile::spec::{Kind, Shape};
-    let mut out: Vec<Knob> = Vec::new();
-    for (spec, rungs, _) in base.entries() {
-        if spec.tune == profile::Tune::Never
-            || spec.id == Qmm::spec().id
-            || spec.id == QmmFp16::spec().id
-            || SEARCH_SKIPS.iter().any(|(id, _)| *id == spec.id)
-        {
-            continue;
-        }
-        let (domain, key) = spec.id.split_once('.').expect("an id is domain.name");
-        let set = |value: &str| format!("[{domain}]\n{key} = {value}\n");
-        let current = profile::render::value_toml(spec, rungs);
-        let mut values: Vec<String> = Vec::new();
-        // A whole number is tried at half to double in quarter steps: fine
-        // enough to place a share such as the Neural Engine's; a price only
-        // at half and double, since its plan moves in steps anyway.
-        let scaled = |v: f64, lo: f64, hi: f64, int: bool| -> Vec<f64> {
-            let steps: &[f64] = if int { &[0.5, 0.75, 1.25, 1.5, 2.0] } else { &[0.5, 2.0] };
-            steps
-                .iter()
-                .map(|m| (v * m).clamp(lo, hi))
-                .map(|x| if int { x.round() } else { x })
-                .filter(|x| (x - v).abs() > f64::EPSILON)
-                .collect()
-        };
-        match spec.shape {
-            Shape::Flag => {
-                if !spec.vars.is_empty() {
-                    continue;
-                }
-                values.push(if current == "false" { "true" } else { "false" }.to_string());
-            }
-            Shape::Constant(c) => match c.kind {
-                Kind::Ints(set) => values.extend(set.iter().map(i64::to_string)),
-                Kind::Int { lo, hi } if spec.vars.is_empty() => {
-                    let v: f64 = current.replace('_', "").parse().unwrap_or(1.0);
-                    values.extend(
-                        scaled(v, lo as f64, hi as f64, true)
-                            .into_iter()
-                            .map(|x| (x as i64).to_string()),
-                    );
-                }
-                Kind::Float { lo, hi } if spec.vars.is_empty() => {
-                    let v: f64 = current.replace('_', "").parse().unwrap_or(1.0);
-                    values.extend(scaled(v, lo, hi, false).into_iter().map(|x| format!("{x:.1}")));
-                }
-                _ => continue,
-            },
-            Shape::Choice(alternatives) => {
-                if !spec.vars.is_empty() {
-                    continue;
-                }
-                for alt in alternatives {
-                    // An alternative's constants: every value of a set, or the
-                    // default and its half and double for a range.
-                    let mut bodies: Vec<String> = vec![format!("use = \"{}\"", alt.name)];
-                    for c in alt.constants {
-                        let options: Vec<String> = match c.kind {
-                            Kind::Ints(set) => set.iter().map(i64::to_string).collect(),
-                            Kind::Int { lo, hi } => {
-                                let d: f64 = c.default.replace('_', "").parse().unwrap_or(1.0);
-                                std::iter::once(d)
-                                    .chain(scaled(d, lo as f64, hi as f64, true))
-                                    .map(|x| (x as i64).to_string())
-                                    .collect()
-                            }
-                            _ => vec![c.default.to_string()],
-                        };
-                        bodies = bodies
-                            .iter()
-                            .flat_map(|b| options.iter().map(move |o| format!("{b}, {} = {o}", c.name)))
-                            .collect();
-                    }
-                    for b in bodies {
-                        values.push(if alt.constants.is_empty() {
-                            format!("\"{}\"", alt.name)
-                        } else {
-                            format!("{{ {b} }}")
-                        });
-                    }
-                }
-            }
-        }
-        let normal = |v: &str| v.replace(' ', "");
-        let candidates: Vec<(String, String)> = values
-            .into_iter()
-            .filter(|v| normal(v) != normal(&current))
-            .map(|v| (v.clone(), set(&v)))
-            .collect();
-        if candidates.is_empty() {
-            continue;
-        }
-        let plan_only = matches!(spec.tune, profile::Tune::Price) || domain == "fuse";
-        out.push(Knob {
-            id: spec.id,
-            current,
-            candidates,
-            plan_only,
-        });
-    }
-    let rank = |id: &str| match id.split('.').next() {
-        _ if id.starts_with("kernel.ane") => 1,
-        Some("kernel") => 0,
-        Some("engine") => 2,
-        Some("fuse") => 3,
-        _ => 4,
-    };
-    out.sort_by_key(|k| rank(k.id));
-    out
-}
-
-/// One decision's outcome, for the report.
-#[derive(Clone, Debug)]
-pub struct Line {
-    pub id: &'static str,
-    pub text: String,
-}
 
 /// The fitted values of the measured decisions, as profile TOML under
 /// `[kernel]`, and the report lines.
@@ -591,104 +459,6 @@ pub fn fit(measured: &Measured, grid: &Grid, cores: u32) -> Result<(Entries, Vec
     Ok((entries, lines))
 }
 
-/// Halfway from `best` toward its nearest tried neighbours, for a
-/// candidate that differs from them in one whole number (`percent = 71`
-/// between 47 and 94): what a second look at a numeric decision tries.
-/// Candidates already tried, and labels with fractions, give nothing.
-#[must_use]
-pub fn halfway(best: &str, tried: &[(String, bool)]) -> Vec<String> {
-    // The label as text with its numbers cut out, and the numbers.
-    fn split(label: &str) -> (Vec<String>, Vec<i64>) {
-        let mut text = vec![String::new()];
-        let mut numbers = Vec::new();
-        let mut digits = String::new();
-        for c in label.chars().chain(std::iter::once(' ')) {
-            if c.is_ascii_digit() {
-                digits.push(c);
-            } else {
-                if !digits.is_empty() {
-                    numbers.push(digits.parse().unwrap_or(0));
-                    digits.clear();
-                    text.push(String::new());
-                }
-                text.last_mut().expect("a piece").push(c);
-            }
-        }
-        (text, numbers)
-    }
-    if best.contains('.') {
-        return Vec::new();
-    }
-    let (text, numbers) = split(best);
-    let mut out = Vec::new();
-    for at in 0..numbers.len() {
-        let v = numbers[at];
-        let others: Vec<i64> = tried
-            .iter()
-            .map(|(l, _)| split(l))
-            .filter(|(t, n)| *t == text && n.len() == numbers.len())
-            .filter(|(_, n)| (0..n.len()).all(|i| i == at || n[i] == numbers[i]))
-            .map(|(_, n)| n[at])
-            .collect();
-        let below = others.iter().copied().filter(|&x| x < v).max();
-        let above = others.iter().copied().filter(|&x| x > v).min();
-        for neighbour in [below, above].into_iter().flatten() {
-            let mid = (v + neighbour) / 2;
-            if mid == v || mid == neighbour || others.contains(&mid) {
-                continue;
-            }
-            let mut n = numbers.clone();
-            n[at] = mid;
-            let mut label = String::new();
-            for (i, piece) in text.iter().enumerate() {
-                label.push_str(piece);
-                if let Some(x) = n.get(i) {
-                    label.push_str(&x.to_string());
-                }
-            }
-            let label = label.trim_end().to_string();
-            if !tried.iter().any(|(l, _)| *l == label) && !out.contains(&label) {
-                out.push(label);
-            }
-        }
-    }
-    out
-}
-
-/// Tuned decisions as `(decision id, TOML value)`.
-pub type Entries = Vec<(String, String)>;
-
-/// `(decision id, TOML value)` entries as profile TOML, a table a domain.
-#[must_use]
-pub fn render_overrides(entries: &[(String, String)]) -> String {
-    let mut domains: Vec<&str> = Vec::new();
-    for (id, _) in entries {
-        let d = id.split('.').next().unwrap_or_default();
-        if !domains.contains(&d) {
-            domains.push(d);
-        }
-    }
-    let mut out = String::new();
-    for d in domains {
-        let _ = writeln!(out, "[{d}]");
-        for (id, value) in entries.iter().filter(|(id, _)| id.split('.').next() == Some(d)) {
-            let _ = writeln!(out, "{} = {value}", &id[d.len() + 1..]);
-        }
-    }
-    out
-}
-
-/// `entries` with `id` set to `value`, in place or appended.
-#[must_use]
-pub fn with_entry(entries: &[(String, String)], id: &str, value: &str) -> Vec<(String, String)> {
-    let mut out = entries.to_vec();
-    match out.iter_mut().find(|(i, _)| i == id) {
-        Some(e) => e.1 = value.to_string(),
-        None => out.push((id.to_string(), value.to_string())),
-    }
-    out
-}
-
 /// A point's coordinates in `kernel.qmm`'s variable order: rows, fill, n,
 /// k, bits, group, format.
 #[must_use]
@@ -716,45 +486,18 @@ pub fn assemble(
     tuned: &str,
     provenance: &[(&str, String)],
 ) -> Result<String, String> {
-    let registry = crate::chip::registry();
-    let mut target: Target = base.target().clone();
-    target.device = Some(device.to_string());
-    if target.assumes.is_empty() {
-        for name in ["family", "ane"] {
-            let i = crate::chip::FACTS
-                .iter()
-                .position(|v| v.name == name)
-                .expect("a Metal fact");
-            if let Some(v) = facts.get(name) {
-                target.assumes.push((i, v));
-            }
-        }
-    }
-    let path = format!("tuned {device}");
-    let profile = registry
-        .overlay(base, tuned, target, Source::User(path.clone()))
-        .map_err(|e| e.to_string())?;
-    let text = profile::render::dump_with(&profile, provenance);
-    registry
-        .parse(&text, &path, Strict::CheckedIn)
-        .map_err(|e| format!("the tuned file does not read back: {e}"))?;
-    let (_, report) = registry.resolve(
-        &[profile::Candidate {
-            source: Source::User(path.clone()),
-            text: text.clone(),
-        }],
+    profile::search::assemble(
+        crate::chip::registry(),
+        base,
+        device,
         facts,
-    );
-    if report.used != Source::User(path) {
-        return Err(format!(
-            "the tuned file is refused on this device: {:?}",
-            report.rejected
-        ));
-    }
-    Ok(text)
+        tuned,
+        provenance,
+        &["family", "ane"],
+    )
 }
 
-pub use device::{Check, Outcome, artifacts, run};
+pub use device::{Outcome, artifacts, run};
 
 mod device {
     use std::cell::RefCell;
@@ -766,7 +509,9 @@ mod device {
     use profile::Decision as _;
     use poem_ir::Dtype;
 
-    use super::{Bank, Depth, Grid, Line, Measured, Point, Profile, Ran, Source, candidates, forcing};
+    use profile::search::{self, Bench, CONTEXT, Check, LANES, Line, PROMPT, STEPS, Serving};
+
+    use super::{Bank, Depth, Grid, Measured, Point, Profile, Ran, Source, candidates, forcing};
     use crate::device::{Buffer, Context, Handles, Pipelines};
     use crate::encode::Sink;
 
@@ -780,52 +525,6 @@ mod device {
         /// The end-to-end runs, today's profile against the tuned one.
         pub checks: Vec<Check>,
         pub seconds: f64,
-    }
-
-    /// One model served under today's profile and under the tuned one.
-    #[derive(Clone, Debug)]
-    pub struct Check {
-        pub model: String,
-        /// Median milliseconds of a prompt, (today, tuned).
-        pub prefill_ms: (f64, f64),
-        /// Median milliseconds of a decode step at each lane count:
-        /// (lanes, today, tuned). Several lanes put several rows through
-        /// every matmul, where ladders differ most.
-        pub decode_ms: Vec<(usize, f64, f64)>,
-        /// Cosine between the two prompts' readouts.
-        pub cosine: f64,
-        pub same_top: bool,
-    }
-
-    impl Check {
-        /// The most a tuned profile may be slower than today's, as noise.
-        pub const NOISE: f64 = 1.02;
-
-        #[must_use]
-        pub fn passes(&self) -> bool {
-            self.prefill_ms.1 <= self.prefill_ms.0 * Self::NOISE
-                && self.decode_ms.iter().all(|(_, a, b)| *b <= *a * Self::NOISE)
-                && self.cosine >= 0.99
-                && self.same_top
-        }
-
-        #[must_use]
-        pub fn describe(&self) -> String {
-            let steps: Vec<String> = self
-                .decode_ms
-                .iter()
-                .map(|(lanes, a, b)| format!("{lanes}-lane step {a:.2} -> {b:.2} ms"))
-                .collect();
-            format!(
-                "{}: {PROMPT}-token prompt {:.1} -> {:.1} ms, {}, readout cosine {:.4}{}",
-                self.model,
-                self.prefill_ms.0,
-                self.prefill_ms.1,
-                steps.join(", "),
-                self.cosine,
-                if self.same_top { "" } else { ", top token differs" }
-            )
-        }
     }
 
     /// The Metal-stamped artifacts under `store`, smallest first: what an
@@ -858,18 +557,10 @@ mod device {
         out.into_iter().map(|(_, p, d)| (p, d)).collect()
     }
 
-    const PROMPT: u32 = 512;
-    const CONTEXT: u32 = 1024;
-    const STEPS: usize = 16;
-    /// The lane counts a decode step is timed at.
-    const LANES: [usize; 3] = [1, 4, 8];
-
-    /// One serving: a prompt's times, each lane count's step times, the
-    /// prompt's readout, the decisions the load read, and why the Neural
-    /// Engine refused its programs, if it did (the GPU then served alone).
-    struct Served(Vec<f64>, Vec<Vec<f64>>, Vec<f32>, Vec<&'static str>, Option<String>);
-
-    fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<Served, String> {
+    /// Serve `artifact` under the complete profile `file`: a prompt, then
+    /// steps at each lane count, timed, once the Neural Engine's programs
+    /// are ready (or refused, which the serving records).
+    fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<Serving, String> {
         use poem::{Platform, Request};
         let slots = *LANES.iter().max().expect("lanes") as u32;
         let dir = std::env::temp_dir().join(format!("pie-tune-{}", std::process::id()));
@@ -890,7 +581,15 @@ mod device {
             contract: &contract,
             checkpoint: artifact,
             budget: poem_compiler::Budget::new(slots, CONTEXT),
-            patches: None,
+            // A vision row states its patch ladder even for a text prompt.
+            patches: crate::api::patch_ladder(
+                &trace,
+                &engine::load::Budgets {
+                    max_lanes: slots,
+                    max_tokens: CONTEXT,
+                    ..engine::load::Budgets::default()
+                },
+            ),
             profile: None,
             page_size: 16,
             context: CONTEXT,
@@ -972,17 +671,20 @@ mod device {
         let read = shell.tuning().profile().read();
         drop(shell);
         let _ = std::fs::remove_dir_all(&dir);
-        Ok(Served(prefill, decode, readout, read, refused))
+        Ok(Serving {
+            prompt: prefill,
+            steps: decode,
+            readout,
+            read,
+            refused,
+        })
     }
 
     /// The fused trace and compiled plan a load under `text` runs: two
     /// files with the same plan serve the same, so a price or a fusion that
     /// leaves the plan alone needs no serving.
-    fn plan_of(
-        deployment: &str,
-        text: &str,
-        cores: u32,
-    ) -> Option<(poem_ir::Trace, poem_compiler::CompiledModel)> {
+    fn plan_of(deployment: &str, text: &str, cores: u32) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
         let profile = crate::chip::registry().load_user(text, "plan").ok()?;
         let row = poem_compiler::catalog::deployment(deployment)?;
         let trace = poem_compiler::fuse::fuse(
@@ -990,285 +692,61 @@ mod device {
             &poem_compiler::fuse::flags::kernels(&profile),
         );
         let slots = *LANES.iter().max().expect("lanes") as u32;
+        let mut budgets = poem_compiler::Budgets::of(poem_compiler::Budget::new(slots, CONTEXT));
+        let ladder = crate::api::patch_ladder(
+            &trace,
+            &engine::load::Budgets {
+                max_lanes: slots,
+                max_tokens: CONTEXT,
+                ..engine::load::Budgets::default()
+            },
+        );
+        if let Some(ladder) = ladder {
+            budgets = budgets.with_patches(ladder);
+        }
         let compiled = poem_compiler::compile_axes(
             &trace,
-            &poem_compiler::Budgets::of(poem_compiler::Budget::new(slots, CONTEXT)),
+            &budgets,
             &poem_compiler::DeviceProfile::of(&profile, cores, &[], &[]),
         )
         .ok()?;
-        Some((trace, compiled))
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        format!("{trace:?}{compiled:?}").hash(&mut h);
+        Some(h.finish())
     }
 
-    /// One serving's weighted time against another's: the prompt and the
-    /// one-lane step count 0.3 each, the 4- and 8-lane steps 0.2.
-    fn relative(got: &Served, against: &Served) -> f64 {
-        let m = |v: &[f64]| median(v.to_vec());
-        let mut r = 0.3 * m(&got.0) / m(&against.0);
-        for (i, w) in [0.3, 0.2, 0.2].iter().enumerate() {
-            r += w * m(&got.1[i]) / m(&against.1[i]);
-        }
-        r
-    }
-
-    fn agrees(a: &[f32], b: &[f32]) -> bool {
-        let (mut dot, mut aa, mut bb) = (0.0f64, 0.0f64, 0.0f64);
-        for (&x, &y) in a.iter().zip(b) {
-            dot += f64::from(x) * f64::from(y);
-            aa += f64::from(x) * f64::from(x);
-            bb += f64::from(y) * f64::from(y);
-        }
-        let top = |r: &[f32]| (0..r.len()).fold(0, |b, i| if r[i] > r[b] { i } else { b });
-        dot / (aa * bb).sqrt() >= 0.99 && top(a) == top(b)
-    }
-
-    /// A decision's best candidate so far: its relative time, label, file,
-    /// and what each model it moved served.
-    type Best = (f64, String, String, Vec<(usize, Served)>);
-
-    /// One model the search serves, and what it served last.
-    struct Seat<'a> {
-        artifact: &'a Path,
-        deployment: &'a str,
-        incumbent: Served,
-        /// Served again in this decision's round already.
-        fresh: bool,
-    }
-
-    /// Coordinate descent over `knobs`, serving `models` end to end: each
-    /// decision's candidates are served on the models that read it (or,
-    /// for a price or fusion, whose plan it changes), against the
-    /// incumbent served again just before them, and the fastest on average
-    /// is taken if it beats the noise on every model and reads the same.
-    #[allow(clippy::too_many_arguments)]
-    fn search(
-        models: &[(std::path::PathBuf, String)],
-        device: &str,
-        base: &Profile,
-        facts: &profile::Facts,
+    /// Metal's bench: the check models, served on this device.
+    struct Metal<'a> {
+        models: &'a [(std::path::PathBuf, String)],
+        device: &'a str,
+        base: &'a Profile,
+        facts: &'a profile::Facts,
         cores: u32,
-        mut chosen: Vec<(String, String)>,
-        knobs: &[super::Knob],
-        say: &mut dyn FnMut(&str),
-    ) -> Result<(super::Entries, Vec<Line>), String> {
-        let file = |entries: &[(String, String)]| {
-            super::assemble(base, device, facts, &super::render_overrides(entries), &[])
-        };
-        let mut incumbent_text = file(&chosen)?;
-        let mut seats: Vec<Seat<'_>> = Vec::new();
-        for (artifact, deployment) in models {
-            match serve(artifact, deployment, device, &incumbent_text) {
-                Ok(served) => seats.push(Seat {
-                    artifact,
-                    deployment,
-                    incumbent: served,
-                    fresh: false,
-                }),
-                Err(why) => say(&format!("  {deployment} did not serve, left out: {why}")),
-            }
-        }
-        if seats.is_empty() {
-            return Err("no check model serves".into());
-        }
-        let mut lines = Vec::new();
-        for knob in knobs {
-            for seat in &mut seats {
-                seat.fresh = false;
-            }
-            let ane = knob.id.starts_with("kernel.ane");
-            // The models this decision can move: those that read it, and
-            // for the Neural Engine those whose programs compile.
-            let movable: Vec<usize> = (0..seats.len())
-                .filter(|&i| {
-                    let s = &seats[i].incumbent;
-                    (knob.plan_only || s.3.contains(&knob.id)) && !(ane && s.4.is_some())
-                })
-                .collect();
-            if movable.is_empty() {
-                let text = if ane {
-                    let why = seats.iter().find_map(|s| s.incumbent.4.clone()).unwrap_or_default();
-                    format!("kept; the Neural Engine refuses programs on this machine ({why})")
-                } else {
-                    "kept; no check model reads it".to_string()
-                };
-                say(&format!("{}: {text}", knob.id));
-                lines.push(Line { id: knob.id, text });
-                continue;
-            }
-            let plans: Vec<Option<_>> = (0..seats.len())
-                .map(|i| {
-                    knob.plan_only
-                        .then(|| plan_of(seats[i].deployment, &incumbent_text, cores))
-                        .flatten()
-                })
-                .collect();
-            let mut best: Option<Best> = None;
-            let mut notes: Vec<String> = Vec::new();
-            let mut bar = 1.0 / Check::NOISE;
-            let mut queue: Vec<String> = knob.candidates.iter().map(|(l, _)| l.clone()).collect();
-            // The incumbent counts as tried, so halfway never skips it.
-            let mut tried: Vec<(String, bool)> = vec![(knob.current.clone(), true)];
-            let mut bracketed = false;
-            let mut at = 0;
-            'candidate: while at < queue.len() || !bracketed {
-                if at == queue.len() {
-                    // Once: where the fastest number sits between a
-                    // neighbour that lost or failed, try halfway to it.
-                    bracketed = true;
-                    if let Some((_, label, ..)) = &best {
-                        queue.extend(super::halfway(label, &tried));
-                    }
-                    continue;
-                }
-                let label = queue[at].clone();
-                at += 1;
-                let label = &label;
-                tried.push((label.clone(), false));
-                let trial = super::with_entry(&chosen, knob.id, label);
-                let text = match file(&trial) {
-                    Ok(t) => t,
-                    Err(why) => {
-                        let why = why.lines().next().unwrap_or("").to_string();
-                        // `origin:line:col: ` says nothing a reader needs.
-                        let why = why.splitn(4, ':').nth(3).map_or(why.clone(), |w| w.trim().to_string());
-                        notes.push(format!("refused: {why}\u{1f}{label}"));
-                        continue;
-                    }
-                };
-                let on: Vec<usize> = movable
-                    .iter()
-                    .copied()
-                    .filter(|&i| {
-                        !knob.plan_only
-                            || plans[i].is_none()
-                            || plan_of(seats[i].deployment, &text, cores) != plans[i]
-                    })
-                    .collect();
-                if on.is_empty() {
-                    notes.push(format!("plans the same\u{1f}{label}"));
-                    continue;
-                }
-                let mut got: Vec<(usize, Served)> = Vec::new();
-                let mut r = 0.0;
-                for &i in &on {
-                    // The incumbent again, just before its rivals: drift
-                    // lands on both, and how far it moved since its last
-                    // serving is the noise a rival must beat twice over.
-                    if !seats[i].fresh {
-                        let again = serve(seats[i].artifact, seats[i].deployment, device, &incumbent_text)?;
-                        let noise = (relative(&again, &seats[i].incumbent) - 1.0).abs();
-                        bar = bar.min(1.0 - 2.0 * noise);
-                        seats[i].incumbent = again;
-                        seats[i].fresh = true;
-                    }
-                    let seat = &seats[i];
-                    let served = match serve(seat.artifact, seat.deployment, device, &text) {
-                        Ok(Served(.., Some(why))) if seat.incumbent.4.is_none() => {
-                            notes.push(format!("{label}: the Neural Engine refused it ({why})"));
-                            continue 'candidate;
-                        }
-                        Ok(g) => g,
-                        Err(why) => {
-                            let why: String = why.lines().next().unwrap_or("").chars().take(100).collect();
-                            notes.push(format!("{label} did not serve ({why})"));
-                            continue 'candidate;
-                        }
-                    };
-                    if !agrees(&served.2, &seat.incumbent.2) {
-                        notes.push(format!("{label} reads differently on {}", seat.deployment));
-                        continue 'candidate;
-                    }
-                    r += relative(&served, &seat.incumbent) / on.len() as f64;
-                    got.push((i, served));
-                }
-                say(&format!("  {} = {label}: {:+.1}%", knob.id, (r - 1.0) * 100.0));
-                if let Some(last) = tried.last_mut() {
-                    last.1 = true;
-                }
-                if best.as_ref().is_none_or(|(b, ..)| r < *b) {
-                    best = Some((r, label.clone(), text, got));
-                }
-            }
-            let text = match best {
-                Some((r, label, text, got)) if r < bar => {
-                    chosen = super::with_entry(&chosen, knob.id, &label);
-                    incumbent_text = text;
-                    for (i, served) in got {
-                        seats[i].incumbent = served;
-                    }
-                    format!("{label}: {:.1}% faster end to end", (1.0 - r) * 100.0)
-                }
-                Some((r, label, ..)) => format!(
-                    "kept; the best other, {label}, was {:+.1}% (a change must beat {:.1}%)",
-                    (r - 1.0) * 100.0,
-                    (1.0 - bar) * 100.0
-                ),
-                None => "kept; no other candidate served".to_string(),
-            };
-            // Notes that share a reason name it once: `reason: a, b, c`.
-            let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
-            for note in notes {
-                let (reason, label) = note
-                    .split_once('\u{1f}')
-                    .map_or((note.clone(), None), |(r, l)| (r.to_string(), Some(l.to_string())));
-                match grouped.iter_mut().find(|(r, _)| *r == reason) {
-                    Some((_, labels)) => labels.extend(label),
-                    None => grouped.push((reason, label.into_iter().collect())),
-                }
-            }
-            let notes: Vec<String> = grouped
-                .into_iter()
-                .map(|(reason, labels)| {
-                    if labels.is_empty() {
-                        reason
-                    } else {
-                        format!("{reason}: {}", labels.join(", "))
-                    }
-                })
-                .collect();
-            let text = if notes.is_empty() {
-                text
-            } else {
-                format!("{text} ({})", notes.join("; "))
-            };
-            say(&format!("{}: {text}", knob.id));
-            lines.push(Line { id: knob.id, text });
-        }
-        Ok((chosen, lines))
     }
 
-    fn median(mut v: Vec<f64>) -> f64 {
-        v.sort_by(f64::total_cmp);
-        v[v.len() / 2]
-    }
-
-    /// Serve `artifact` under `today` and under `tuned`, one at a time.
-    fn check(
-        artifact: &Path,
-        deployment: &str,
-        device: &str,
-        today: &str,
-        tuned: &str,
-    ) -> Result<Check, String> {
-        let Served(p0, d0, r0, ..) = serve(artifact, deployment, device, today)?;
-        let Served(p1, d1, r1, ..) = serve(artifact, deployment, device, tuned)?;
-        let (mut dot, mut aa, mut bb) = (0.0f64, 0.0f64, 0.0f64);
-        for (&x, &y) in r0.iter().zip(&r1) {
-            dot += f64::from(x) * f64::from(y);
-            aa += f64::from(x) * f64::from(x);
-            bb += f64::from(y) * f64::from(y);
+    impl Bench for Metal<'_> {
+        fn models(&self) -> Vec<String> {
+            self.models.iter().map(|(_, d)| d.clone()).collect()
         }
-        let top = |r: &[f32]| (0..r.len()).fold(0, |b, i| if r[i] > r[b] { i } else { b });
-        Ok(Check {
-            model: deployment.to_string(),
-            prefill_ms: (median(p0), median(p1)),
-            decode_ms: LANES
-                .iter()
-                .zip(d0.into_iter().zip(d1))
-                .map(|(&lanes, (a, b))| (lanes, median(a), median(b)))
-                .collect(),
-            cosine: dot / (aa * bb).sqrt(),
-            same_top: top(&r0) == top(&r1),
-        })
+
+        fn file(&self, entries: &[(String, String)]) -> Result<String, String> {
+            super::assemble(
+                self.base,
+                self.device,
+                self.facts,
+                &search::render_overrides(entries),
+                &[],
+            )
+        }
+
+        fn serve(&mut self, model: usize, file: &str) -> Result<Serving, String> {
+            let (artifact, deployment) = &self.models[model];
+            serve(artifact, deployment, self.device, file)
+        }
+
+        fn plan(&self, model: usize, file: &str) -> Option<u64> {
+            plan_of(&self.models[model].1, file, self.cores)
+        }
     }
 
     /// An `Encode` that remembers the files it fired: which kernel a
@@ -1453,10 +931,40 @@ mod device {
             say(&format!("measurements kept in {}", kept.display()));
             m
         };
-        let (mut chosen, mut lines) = super::fit(&measured, &grid, cores)?;
-        let knobs = super::knobs(&base, depth);
+        let (fitted, mut lines) = super::fit(&measured, &grid, cores)?;
+        // The fitted matmul is a candidate like any other: a ladder learned
+        // on kernels alone must also win on the served models to be kept.
+        let mut knobs: Vec<search::Knob> = Vec::new();
+        for (id, value) in &fitted {
+            let (spec, rungs, _) = base
+                .entries()
+                .find(|(s, ..)| s.id == id.as_str())
+                .expect("a Metal decision");
+            let current = profile::render::value_toml(spec, rungs);
+            if current.replace(char::is_whitespace, "") != value.replace(char::is_whitespace, "") {
+                knobs.push(search::Knob {
+                    id: spec.id,
+                    current,
+                    candidates: vec![(value.clone(), String::new())],
+                    halfway: false,
+                    plan_only: false,
+                });
+            }
+        }
+        knobs.extend(search::knobs(&base, super::SEARCH_SKIPS, "kernel.ane"));
+        let mut chosen: search::Entries = Vec::new();
+        let mut bench = Metal {
+            models,
+            device: &name,
+            base: &base,
+            facts: &facts,
+            cores,
+        };
         if models.is_empty() {
-            for k in &knobs {
+            // Nothing to serve: the kernel bench's fit stands alone, and
+            // the provenance says no end-to-end run judged it.
+            chosen = fitted;
+            for k in knobs.iter().filter(|k| k.id != "kernel.qmm" && k.id != "kernel.qmm_fp16") {
                 lines.push(Line {
                     id: k.id,
                     text: "not searched: no model to serve (import one, or pass --check)".to_string(),
@@ -1469,11 +977,11 @@ mod device {
                 knobs.len(),
                 names.join(", ")
             ));
-            let (found, searched) = search(models, &name, &base, &facts, cores, chosen, &knobs, say)?;
+            let (found, searched) = search::search(&mut bench, chosen, &knobs, "kernel.ane", say)?;
             chosen = found;
             lines.extend(searched);
         }
-        let tuned = super::render_overrides(&chosen);
+        let tuned = search::render_overrides(&chosen);
         let tuned_ids: Vec<String> = lines
             .iter()
             .filter(|l| !l.text.starts_with("not searched"))
@@ -1482,9 +990,14 @@ mod device {
         let today = super::assemble(&base, &name, &facts, "", &[])?;
         let draft = super::assemble(&base, &name, &facts, &tuned, &[])?;
         let mut checks = Vec::new();
-        for (artifact, deployment) in models {
+        // A file that changes nothing serves as today's does.
+        let unchanged = draft == today;
+        if unchanged && !models.is_empty() {
+            say("end to end: nothing changed, so nothing to compare");
+        }
+        for (at, (_, deployment)) in models.iter().enumerate().filter(|_| !unchanged) {
             say(&format!("end to end: serving {deployment} under today's profile and the tuned one"));
-            match check(artifact, deployment, &name, &today, &draft) {
+            match search::check(&mut bench, at, &today, &draft) {
                 Ok(c) => {
                     say(&format!("  {}", c.describe()));
                     checks.push(c);
@@ -1492,7 +1005,9 @@ mod device {
                 Err(why) => say(&format!("  {deployment} did not serve: {why}")),
             }
         }
-        let checked = if checks.is_empty() {
+        let checked = if unchanged {
+            "kernels against the f64 reference; nothing changed".to_string()
+        } else if checks.is_empty() {
             "kernels against the f64 reference; no end-to-end run".to_string()
         } else {
             format!(
@@ -1898,7 +1413,7 @@ mod tests {
             wrong: Vec::new(),
         };
         let (entries, lines) = fit(&measured, &grid, 40).unwrap();
-        let tuned = render_overrides(&entries);
+        let tuned = profile::search::render_overrides(&entries);
         assert!(
             tuned.contains("{ when = \"rows >= 16\", use = \"tiled\", crossover_tg = 64 }"),
             "{tuned}"
@@ -1987,7 +1502,7 @@ mod tests {
         let facts = crate::chip::facts(10, 40, true);
         let (base, _) = crate::chip::resolve("Apple M5 Max", &facts, None);
         let registry = crate::chip::registry();
-        let knobs = knobs(&base, Depth::Full);
+        let knobs = profile::search::knobs(&base, SEARCH_SKIPS, "kernel.ane");
         let ids: Vec<&str> = knobs.iter().map(|k| k.id).collect();
         for want in ["kernel.sdpa.prefill", "kernel.gdn.scan", "kernel.ane.mlp", "fuse.mlp_swiglu", "compiler.launch_us"] {
             assert!(ids.contains(&want), "{want} not searched: {ids:?}");
@@ -2013,20 +1528,4 @@ mod tests {
         assert_eq!(base.read(), vec!["kernel.qmm", "kernel.qmm_fp16"]);
     }
 
-    #[test]
-    fn a_second_look_tries_halfway_to_the_neighbours() {
-        let tried: Vec<(String, bool)> = [24, 35, 47, 59, 71, 94]
-            .iter()
-            .map(|p| (format!("{{ use = \"share\", percent = {p} }}"), *p != 94))
-            .collect();
-        assert_eq!(
-            halfway("{ use = \"share\", percent = 71 }", &tried),
-            vec![
-                "{ use = \"share\", percent = 65 }".to_string(),
-                "{ use = \"share\", percent = 82 }".to_string()
-            ]
-        );
-        assert!(halfway("120.0", &[("60.0".into(), true)]).is_empty());
-        assert_eq!(halfway("64", &[("32".into(), true), ("128".into(), true)]), vec!["48", "96"]);
-    }
 }
