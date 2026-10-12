@@ -52,3 +52,24 @@ fn full_pool(trace: &poem_ir::Trace, page_size: u32, context: u32, slots: u32) -
         .expect("a test's paging");
     Some(engine_metal::store::pool_bytes(trace, paging).expect("the pool sizes"))
 }
+
+/// Whether this process runs `test` itself: the first call re-runs the
+/// binary on `test` alone, with `env` set, and asserts it passed, so a test
+/// that states process-wide kernel tuning is not answered by a tuning an
+/// earlier test already resolved. `true` in that child, `false` in the
+/// parent.
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+fn in_own_process(test: &str, env: &[(&str, &str)]) -> bool {
+    const CHILD: &str = "PIE_TEST_OWN_PROCESS";
+    if std::env::var(CHILD).as_deref() == Ok(test) {
+        return true;
+    }
+    let status = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env(CHILD, test)
+        .envs(env.iter().copied())
+        .status()
+        .expect("the test re-runs");
+    assert!(status.success(), "{test}, run in its own process, failed");
+    false
+}

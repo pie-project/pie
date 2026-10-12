@@ -34,18 +34,10 @@ fn f32s(v: &[u8]) -> Vec<f32> {
 }
 #[test]
 fn stored_q8_and_all_attention_routes_match_fp64() {
-    if std::env::var("PIE_METAL_KV_Q8").as_deref() != Ok("1") {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "stored_q8_and_all_attention_routes_match_fp64",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env("PIE_METAL_KV_Q8", "1")
-            .status()
-            .unwrap();
-        assert!(status.success(), "isolated Q8 integration test failed");
+    if !crate::in_own_process(
+        "the_q8_kv_roundtrip::stored_q8_and_all_attention_routes_match_fp64",
+        &[("PIE_METAL_KV_Q8", "1")],
+    ) {
         return;
     }
     assert!(kernels_metal::tuning::override_with(

@@ -87,8 +87,15 @@ impl Handles {
         }
         #[cfg(target_vendor = "apple")]
         {
+            use objc2_metal::{MTLBuffer as _, MTLResource as _, MTLStorageMode};
+            // A private buffer (the elastic kv pool's sparse view) has no host
+            // address; its bytes are read through the pool's own alias.
+            if binding.slab().storageMode() == MTLStorageMode::Private {
+                return Err(Fault::Unbound {
+                    what: format!("host bytes of handle {handle}, a private buffer"),
+                });
+            }
             let mut out = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
-            use objc2_metal::MTLBuffer as _;
             let have = binding.slab().length() as u64;
             if binding.offset().saturating_add(len) > have {
                 return Err(Fault::Ceiling {

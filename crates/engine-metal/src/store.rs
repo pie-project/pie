@@ -425,6 +425,18 @@ impl Pools {
         Ok(rows)
     }
 
+    /// `into.len()` bytes of plane `plane` (the pool's buffers in reserve
+    /// order) from `offset`, read where the host sees them: an elastic plane
+    /// through its alias, since its sparse view has no host address.
+    pub fn read_plane(&self, plane: usize, offset: u64, into: &mut [u8]) -> Result<()> {
+        self.planes
+            .get(plane)
+            .ok_or_else(|| Fault::Unbound {
+                what: format!("pool plane {plane}"),
+            })?
+            .read(offset, into)
+    }
+
     #[must_use]
     pub fn state_slot_bytes(&self) -> u64 {
         self.shapes

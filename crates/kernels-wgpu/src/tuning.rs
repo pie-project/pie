@@ -174,12 +174,17 @@ static DEVICE: OnceLock<DeviceInfo> = OnceLock::new();
 static OVERRIDES: OnceLock<Overrides> = OnceLock::new();
 static RESOLVED: OnceLock<DeviceTuning> = OnceLock::new();
 
+/// States the device the tuning resolves for. The tuning is read once, so
+/// `false` once it has been, or once a device was stated: the info lands
+/// nowhere.
 pub fn describe(info: DeviceInfo) -> bool {
-    DEVICE.set(info).is_ok()
+    RESOLVED.get().is_none() && DEVICE.set(info).is_ok()
 }
 
+/// States the overrides the tuning resolves with; `false`, as for
+/// `describe`, once it has resolved or overrides were stated.
 pub fn override_with(over: Overrides) -> bool {
-    OVERRIDES.set(over).is_ok()
+    RESOLVED.get().is_none() && OVERRIDES.set(over).is_ok()
 }
 
 #[must_use]
