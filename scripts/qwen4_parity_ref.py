@@ -15,7 +15,7 @@ Writes `OUT/probes.json` (a stated file is used instead) and, per probe NAME:
     OUT/NAME.ref.json     {"ids", "argmax", "gen", "vocab"}
 
 `scripts/dsv4_mini_parity_compare.py OUT --a pie --b ref` reads the pie side
-(`crates/engine-metal/tests/a_family_is_read_against_its_reference.rs`)
+(`crates/engine-metal/tests/engine_metal/a_family_is_read_against_its_reference.rs`)
 against these.
 """
 

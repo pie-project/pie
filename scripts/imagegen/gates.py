@@ -610,8 +610,10 @@ def harness(script, *args):
 
 def cargo_test(name):
     def build(ctx, gate):
+        # The reference tests are `#[ignore]`d out of CI (they need imported
+        # artifacts and golden dumps), so the gate asks for them by name.
         return ([ctx.cargo, "test", "-p", "engine-cuda", "--features", "cuda",
-                 "--test", name, "--", "--nocapture"], REPO)
+                 "--test", "engine_cuda", name, "--", "--ignored", "--nocapture"], REPO)
     return build
 
 PIECE = 96 * 1024
@@ -852,7 +854,7 @@ def roster() -> list[Gate]:
         ),
         Gate(
             name="flux2-vae",
-            wraps="cargo test -p engine-cuda --test the_flux_2_vae_answers_the_reference",
+            wraps="cargo test -p engine-cuda --test engine_cuda the_flux_2_vae_answers_the_reference -- --ignored",
             expected="decode 0.99999, encode 0.99995",
             needs=[(g("flux2", "flux2_vae", "shapes.json"),
                     "python scripts/imagegen/flux2_golden.py --vae"),
@@ -944,7 +946,7 @@ def roster() -> list[Gate]:
         ),
         Gate(
             name="ltx2-vae",
-            wraps="cargo test -p engine-cuda --test the_ltx_2_vae_answers_the_reference",
+            wraps="cargo test -p engine-cuda --test engine_cuda the_ltx_2_vae_answers_the_reference -- --ignored",
             expected="decode cos >= 0.9999 per frame and clip (landed 0.999985, mean |err| 0.0019)",
             needs=[(g("ltx25", "ltx2_vae", "shapes.json"),
                     "CUDA_VISIBLE_DEVICES=<n> python scripts/imagegen/ltx2_golden.py --vae"),

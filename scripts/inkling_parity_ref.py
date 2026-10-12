@@ -13,7 +13,7 @@ used instead) and, per probe NAME, the three files every reference writes:
     OUT/NAME.ref.json     {"ids", "argmax", "gen", "vocab"}
 
 `scripts/dsv4_mini_parity_compare.py OUT --a pie --b ref` reads the pie side
-(`crates/engine-cuda/tests/a_family_is_read_against_its_reference.rs`)
+(`crates/engine-cuda/tests/engine_cuda/a_family_is_read_against_its_reference.rs`)
 against these.
 
 The logits are the model's readout as `InklingForCausalLM` states it: the
