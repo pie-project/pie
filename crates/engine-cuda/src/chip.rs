@@ -166,6 +166,11 @@ pub fn probe(ordinal: i32) -> Option<(String, Facts)> {
     #[cfg(feature = "cuda")]
     {
         use cudarc::runtime::sys as rt;
+        // A box with no CUDA runtime has no GPU to name: cudarc panics on the
+        // first call that loads the library, which `present` catches.
+        if !crate::device::present() {
+            return None;
+        }
         // SAFETY: `prop` is a live out-parameter the call fills; an all-zero
         // `cudaDeviceProp` is a valid value of the plain C struct.
         let mut prop: rt::cudaDeviceProp = unsafe { core::mem::zeroed() };
