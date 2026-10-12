@@ -564,9 +564,6 @@ impl Context {
         if self.chip().subgroups_32() {
             out.push(kernels_wgpu::Capability::Subgroup);
         }
-        if self.core.enabled.f16 {
-            out.push(kernels_wgpu::Capability::Fp16);
-        }
         out
     }
 

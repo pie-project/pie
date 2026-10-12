@@ -134,7 +134,7 @@ pub fn expand(
 pub fn enables_of(tier: crate::Capability) -> &'static [&'static str] {
     match tier {
         crate::Capability::Subgroup => &["enable subgroups;"],
-        crate::Capability::Baseline | crate::Capability::Fp16 | crate::Capability::Matrix => &[],
+        crate::Capability::Baseline => &[],
     }
 }
 
