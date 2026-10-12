@@ -155,84 +155,25 @@ pub fn plan_prefill(
 
 const FILE: &str = "attn/sdpa_paged.slang";
 
-/// A tiled entry at `rows` rows a workgroup: the 32-row name, or its
-/// `_r16` / `_r8` variant.
+/// The `_r16` / `_r8` variant of a 32-row tiled entry.
 fn tiled_entry(base: &'static str, rows: u32) -> &'static str {
     if rows == 32 {
-        return base;
+        base
+    } else {
+        crate::linear::quant::symbol(&format!("{base}_r{rows}"))
     }
-    let at = SDPA_TILED
-        .iter()
-        .chain(&SDPA_TILED_LSE)
-        .position(|e| *e == base)
-        .expect("a tiled entry");
-    let (r16, r8) = (&SDPA_TILED_R16, &SDPA_TILED_R8);
-    if rows == 16 { r16[at] } else { r8[at] }
 }
-
-const SDPA_TILED_R16: [&str; 8] = [
-    "sdpa_paged_tiled_bfloat16_d_64_r16",
-    "sdpa_paged_tiled_bfloat16_d_128_r16",
-    "sdpa_paged_tiled_bfloat16_d_256_r16",
-    "sdpa_paged_tiled_bfloat16_d_512_r16",
-    "sdpa_paged_tiled_lse_bfloat16_d_64_r16",
-    "sdpa_paged_tiled_lse_bfloat16_d_128_r16",
-    "sdpa_paged_tiled_lse_bfloat16_d_256_r16",
-    "sdpa_paged_tiled_lse_bfloat16_d_512_r16",
-];
-
-const SDPA_TILED_R8: [&str; 8] = [
-    "sdpa_paged_tiled_bfloat16_d_64_r8",
-    "sdpa_paged_tiled_bfloat16_d_128_r8",
-    "sdpa_paged_tiled_bfloat16_d_256_r8",
-    "sdpa_paged_tiled_bfloat16_d_512_r8",
-    "sdpa_paged_tiled_lse_bfloat16_d_64_r8",
-    "sdpa_paged_tiled_lse_bfloat16_d_128_r8",
-    "sdpa_paged_tiled_lse_bfloat16_d_256_r8",
-    "sdpa_paged_tiled_lse_bfloat16_d_512_r8",
-];
 
 const SDPA_WIDTHS: [u32; 4] = [64, 128, 256, 512];
 
-/// The `_t128` twin of a 256-invocation decode entry, where the tuning
-/// asks for 128.
+/// The `_t128` variant of a 256-invocation decode entry.
 fn decode_entry(base: &'static str, threads: u32) -> &'static str {
     if threads >= 256 {
-        return base;
+        base
+    } else {
+        crate::linear::quant::symbol(&format!("{base}_t128"))
     }
-    let at = SDPA_SELECTED
-        .iter()
-        .chain(&SDPA_DECODE)
-        .chain(&SDPA_DECODE_LSE)
-        .chain(&SDPA_SPLIT)
-        .chain(&SDPA_SPLIT_LSE)
-        .position(|e| *e == base)
-        .expect("a decode entry");
-    SDPA_T128[at]
 }
-
-const SDPA_T128: [&str; 20] = [
-    "sdpa_paged_selected_bfloat16_d_64_t128",
-    "sdpa_paged_selected_bfloat16_d_128_t128",
-    "sdpa_paged_selected_bfloat16_d_256_t128",
-    "sdpa_paged_selected_bfloat16_d_512_t128",
-    "sdpa_paged_decode_bfloat16_d_64_t128",
-    "sdpa_paged_decode_bfloat16_d_128_t128",
-    "sdpa_paged_decode_bfloat16_d_256_t128",
-    "sdpa_paged_decode_bfloat16_d_512_t128",
-    "sdpa_paged_decode_lse_bfloat16_d_64_t128",
-    "sdpa_paged_decode_lse_bfloat16_d_128_t128",
-    "sdpa_paged_decode_lse_bfloat16_d_256_t128",
-    "sdpa_paged_decode_lse_bfloat16_d_512_t128",
-    "sdpa_paged_split_bfloat16_d_64_t128",
-    "sdpa_paged_split_bfloat16_d_128_t128",
-    "sdpa_paged_split_bfloat16_d_256_t128",
-    "sdpa_paged_split_bfloat16_d_512_t128",
-    "sdpa_paged_split_lse_bfloat16_d_64_t128",
-    "sdpa_paged_split_lse_bfloat16_d_128_t128",
-    "sdpa_paged_split_lse_bfloat16_d_256_t128",
-    "sdpa_paged_split_lse_bfloat16_d_512_t128",
-];
 
 const SDPA_DECODE: [&str; 4] = [
     "sdpa_paged_decode_bfloat16_d_64",
@@ -936,7 +877,9 @@ fn decode_arm(
             );
         }
     }
-    vector(ctx, tuning, op, q, pool, plan, window, head_dim, sm_scale, o, lse)
+    vector(
+        ctx, tuning, op, q, pool, plan, window, head_dim, sm_scale, o, lse,
+    )
 }
 
 pub fn sink(

@@ -1,18 +1,9 @@
-//! The shader cores a Vulkan device reports: read the same way by the
-//! Vulkan engine and by the wgpu engine on its Vulkan adapter. The engine
-//! makes the two driver calls; this crate holds no unsafe code.
+//! Shared by the Vulkan engine and the wgpu engine's Vulkan adapter.
 
 use ash::vk;
 
-/// The cores a device reports through a vendor extension: NVIDIA's SMs
-/// (`VK_NV_shader_sm_builtins`), AMD's compute units
-/// (`VK_AMD_shader_core_properties`), Arm's shader cores
-/// (`VK_ARM_shader_core_builtins`). `None` where no extension says, or one
-/// says zero.
-///
-/// `exts` is the device's extension list; `properties2` fills a
-/// `VkPhysicalDeviceProperties2` chain for the device
-/// (`vkGetPhysicalDeviceProperties2`).
+/// The SMs, compute units or shader cores a vendor extension reports.
+/// `properties2` is `vkGetPhysicalDeviceProperties2` on the device.
 #[must_use]
 pub fn shader_cores(
     exts: &[vk::ExtensionProperties],
@@ -29,7 +20,9 @@ pub fn shader_cores(
     } else if has(ash::amd::shader_core_properties::NAME) {
         let mut cu = vk::PhysicalDeviceShaderCorePropertiesAMD::default();
         properties2(&mut vk::PhysicalDeviceProperties2::default().push_next(&mut cu));
-        cu.shader_engine_count * cu.shader_arrays_per_engine_count * cu.compute_units_per_shader_array
+        cu.shader_engine_count
+            * cu.shader_arrays_per_engine_count
+            * cu.compute_units_per_shader_array
     } else if has(ash::arm::shader_core_builtins::NAME) {
         let mut arm = vk::PhysicalDeviceShaderCoreBuiltinsPropertiesARM::default();
         properties2(&mut vk::PhysicalDeviceProperties2::default().push_next(&mut arm));

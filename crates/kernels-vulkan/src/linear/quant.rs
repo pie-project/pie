@@ -31,21 +31,24 @@ const QMV_GROUP: [u32; 3] = [32, 4, 1];
 
 const QMV_CHUNK: i32 = 32;
 
-/// Codes a tiled point walks the contraction by.
 pub(crate) const QMM_BK: i32 = 32;
 
 const BM_RUNGS: [i32; 4] = [8, 16, 32, 64];
 
 const BN_RUNGS: [i32; 2] = [16, 32];
 
-/// Whether a `bits`-bit bank in `group`-wide groups has instantiated tiled,
-/// register-tiled and cooperative-matrix points.
 pub(crate) fn qmm_stamped(group: i64, bits: i64) -> bool {
     i32::try_from(group).is_ok_and(|g| GROUPS.contains(&g))
         && i32::try_from(bits).is_ok_and(|b| WIDTHS.contains(&b))
 }
 
-fn qmm_name(op: &'static str, group: i32, bits: i32, bm: i32, bn: i32) -> Result<&'static str, Error> {
+fn qmm_name(
+    op: &'static str,
+    group: i32,
+    bits: i32,
+    bm: i32,
+    bn: i32,
+) -> Result<&'static str, Error> {
     check(op, &GROUPS, group, "group size")?;
     check(op, &WIDTHS, bits, "bit width")?;
     check(op, &ROW_TILES, bm, "row tile")?;
@@ -84,7 +87,10 @@ fn qmv_name(op: &'static str, group: i32, bits: i32, vecs: u32) -> Result<&'stat
     check(op, &GROUPS, group, "group size")?;
     check(op, &WIDTHS, bits, "bit width")?;
     if !matches!(vecs, 1 | 2 | 4 | 8) {
-        return Err(refuse(op, format!("no vector point reads {vecs} rows a workgroup")));
+        return Err(refuse(
+            op,
+            format!("no vector point reads {vecs} rows a workgroup"),
+        ));
     }
     Ok(symbol(&if vecs == 4 {
         format!("affine_qmv_bf16_gs_{group}_b_{bits}")
@@ -151,12 +157,16 @@ fn qmm_grid(op: &'static str, n: i32, bn: i32, m: i32, bm: i32) -> Result<[u32; 
             group[0],
             "the column tiles",
         )?,
-        lanes(m.unsigned_abs() / bm.unsigned_abs(), group[1], "the row tiles")?,
+        lanes(
+            m.unsigned_abs() / bm.unsigned_abs(),
+            group[1],
+            "the row tiles",
+        )?,
         lanes(1, group[2], "the k splits")?,
     ])
 }
 
-fn symbol(name: &str) -> &'static str {
+pub(crate) fn symbol(name: &str) -> &'static str {
     static INTERNED: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
     let mut map = INTERNED
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -178,8 +188,7 @@ fn qmm_cm_name(op: &'static str, group: i32, bits: i32) -> Result<&'static str, 
     Ok(symbol(&format!("affine_qmm_t_cm_bf16_gs_{group}_b_{bits}")))
 }
 
-/// Which kernel a dense matmul ran: what the tune's bench reads back to
-/// discard a forced candidate that fell through to another.
+/// The `kernel.qmm` variant an entry belongs to.
 #[must_use]
 pub fn ran(entry: &str) -> Option<&'static str> {
     if entry.starts_with("affine_qmm_t_cm_") {
@@ -219,10 +228,8 @@ pub fn lm_head(
     act_x_wt(ctx, tuning, "linear.lm_head", act, w, y, capacity_rows)
 }
 
-/// A dense affine-quantised matmul: the first `kernel.qmm` rung that fits
-/// the shape and can run (a tiled rung declines where the row capacity
-/// cannot hold its padding), down to the vector kernel, which always does.
-#[allow(clippy::too_many_arguments)]
+/// Runs the first `kernel.qmm` rung that fits and can run; a tiled rung
+/// declines where the row capacity cannot hold its padding.
 pub fn act_x_wt(
     ctx: &Ctx<'_>,
     tuning: &crate::Tuning,
@@ -319,7 +326,10 @@ pub fn act_x_wt(
                     );
                 }
             }
-            Qmm::OneRow { lanes, rows: per_lane } => {
+            Qmm::OneRow {
+                lanes,
+                rows: per_lane,
+            } => {
                 return ctx.fire(
                     Fire::at(QMV1_FILE, qmv1_name(group, bits, lanes, per_lane)).apply(Grid::of(
                         // 256 invocations land 256 / lanes rows, `per_lane` each.

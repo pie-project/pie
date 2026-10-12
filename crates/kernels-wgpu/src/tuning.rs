@@ -1,24 +1,16 @@
-//! Every hardware-dependent decision the WebGPU kernels read, declared for
-//! the wgpu profile registry, and [`Tuning`]: the values one load runs under.
-//!
-//! wgpu is the browser's engine. A browser masks the adapter, so there are
-//! no named profiles: a load runs the registry defaults with the facts the
-//! adapter does report, or a user's file where pie runs natively.
+//! The hardware-dependent decisions the WebGPU kernels read, and [`Tuning`],
+//! the values one load runs under.
 
 use profile::{Decision, Domain, Profile, Registry, Var};
 
-/// What the wgpu engine reads off its adapter.
 pub const FACTS: &[Var] = &[
     Var::fixed("vendor", Domain::Enum(profile::vendor::NAMES)),
-    // The narrowest subgroup the adapter may run a dispatch at; absent
-    // without the subgroup feature.
+    // Absent without the subgroup feature.
     Var::fixed("subgroup_min", Domain::COUNT),
-    // Multiprocessors or compute units, where the native driver says.
     Var::fixed("cores", Domain::COUNT),
     Var::fixed("f16", Domain::Bool),
 ];
 
-/// The recording axes a dynamic variable may name.
 pub const AXES: &[&str] = &["rows"];
 
 /// The kernel a dense affine-quantised matmul runs: the first rung whose
@@ -99,7 +91,6 @@ pub enum DecodeSplit {
 #[decision(id = "kernel.sdpa.decode.split_min_keys", constant(range(1..=65_536)), default = 256, tune = search)]
 pub struct DecodeSplitMinKeys(pub u32);
 
-/// Register every decision this crate reads.
 pub fn register(registry: &mut Registry) {
     registry
         .add::<Qmm>()
@@ -109,12 +100,9 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeSplitMinKeys>();
 }
 
-/// What one load's kernels run under: the resolved profile, and the device
-/// limits a decision is weighed against.
 #[derive(Clone, Debug)]
 pub struct Tuning {
     profile: Profile,
-    /// The cores a decode split fills.
     cores: u32,
     /// Storage buffers a shader stage may bind; 0 where unknown.
     storage_buffers: u32,
@@ -136,16 +124,10 @@ impl Tuning {
     }
 
     #[must_use]
-    pub fn cores(&self) -> u32 {
-        self.cores
-    }
-
-    #[must_use]
     pub fn storage_buffers(&self) -> u32 {
         self.storage_buffers
     }
 
-    /// Where a dense matmul of `rows` x `n` over `k` sits on `kernel.qmm`.
     #[must_use]
     pub fn qmm_at(&self, rows: u32, n: u32, k: u32, bits: u32, group: u32) -> QmmAt {
         let tiles = u64::from(rows.div_ceil(32)) * u64::from(n.div_ceil(64));
@@ -159,14 +141,15 @@ impl Tuning {
         }
     }
 
-    /// The kernels a dense matmul at `at` may run, most preferred first.
     #[must_use]
     pub fn qmm(&self, at: &QmmAt) -> Vec<Qmm> {
-        self.profile.ladder::<Qmm>().candidates(at).copied().collect()
+        self.profile
+            .ladder::<Qmm>()
+            .candidates(at)
+            .copied()
+            .collect()
     }
 
-    /// The row tile `pairs` routed pairs over `experts` experts sort into;
-    /// 1 leaves them unsorted.
     #[must_use]
     pub fn moe_tile_rows(&self, pairs: u32, experts: u32) -> u32 {
         if experts == 0 {
@@ -183,7 +166,6 @@ impl Tuning {
         self.profile.get::<SdpaTileRowsPerRequest>().0
     }
 
-    /// The workgroups a decode row's keys may split across.
     #[must_use]
     pub fn sdpa_split_groups(&self) -> u32 {
         match *self.profile.get::<DecodeSplit>() {
