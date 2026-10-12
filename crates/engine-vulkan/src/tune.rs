@@ -1,12 +1,7 @@
-//! `pie tune` on Vulkan: `kernel.qmm` is measured kernel by kernel and a
-//! ladder fitted to the times (`qmm`), then that ladder and every other
-//! decision this backend does not mark `never` are searched end to end on
-//! served models (`profile::search`), starting from the profile the device
-//! resolves to (a user file, a named one, or the one its facts derive). The
-//! result is written as a complete profile for the user's shelf.
-//! `.wiki/pie-tune.md` holds the design.
+//! `pie tune` on Vulkan: `kernel.qmm` is fitted to a kernel bench (`qmm`),
+//! then it and the other decisions are searched end to end on served models.
 
-pub mod qmm;
+mod qmm;
 
 pub use qmm::Depth;
 
@@ -16,16 +11,17 @@ use std::time::Instant;
 use profile::search::{self, Bench, CONTEXT, Check, LANES, Line, PROMPT, STEPS, Serving};
 use profile::{Facts, Profile};
 
-/// Decisions the end-to-end search leaves alone on Vulkan: the dense
-/// matmul, which the kernel bench measures, and what one device with one
-/// queue makes meaningless.
-pub const SEARCH_SKIPS: &[&str] = &["kernel.qmm", "compiler.cost.collective_us", "compiler.side_streams"];
+/// The kernel bench fits `kernel.qmm`; one device with one queue has no
+/// collectives or side streams.
+const SEARCH_SKIPS: &[&str] = &[
+    "kernel.qmm",
+    "compiler.cost.collective_us",
+    "compiler.side_streams",
+];
 
-/// The facts a tuned file assumes where the profile it starts from assumes
-/// nothing: what a kernel's requirement reads.
+/// The facts a tuned file assumes: what a kernel's requirement reads.
 const ASSUME: &[&str] = &["vendor", "subgroup", "coopmat"];
 
-/// What a run produced.
 pub struct Outcome {
     pub device: String,
     /// The complete profile, ready for the user's shelf.
@@ -33,15 +29,12 @@ pub struct Outcome {
     pub lines: Vec<Line>,
     /// Kernel candidates that answered wrongly, and where.
     pub wrong: Vec<String>,
-    /// The end-to-end runs, today's profile against the tuned one.
     pub checks: Vec<Check>,
-    /// Whether the tuned file differs from today's at all.
     pub changed: bool,
     pub seconds: f64,
 }
 
-/// The Vulkan-stamped artifacts under `store`, smallest first: what an
-/// end-to-end check can serve.
+/// The Vulkan-stamped artifacts under `store`, smallest first.
 #[must_use]
 pub fn artifacts(store: &Path) -> Vec<(PathBuf, String)> {
     let mut out: Vec<(u64, PathBuf, String)> = Vec::new();
@@ -81,8 +74,7 @@ fn patches(trace: &poem_ir::Trace, slots: u32) -> Option<poem_compiler::PatchLad
     )
 }
 
-/// Serve `artifact` under the complete profile `file`, which the load
-/// resolves as the user's file for `device`.
+/// Serve `artifact` with `file` as the user's profile for `device`.
 fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<Serving, String> {
     use poem::{Platform, Request};
     let slots = *LANES.iter().max().expect("lanes") as u32;
@@ -95,8 +87,9 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         .ok_or_else(|| format!("no catalog row `{deployment}`"))?;
     let trace = row.trace(Platform::Vulkan);
     let source = ztensor_compat::index(artifact).map_err(|e| e.to_string())?;
-    let contract = poem::import::own_contract(&source, &trace.params, row.deploy.tp, Platform::Vulkan)
-        .map_err(|e| e.to_string())?;
+    let contract =
+        poem::import::own_contract(&source, &trace.params, row.deploy.tp, Platform::Vulkan)
+            .map_err(|e| e.to_string())?;
     drop(source);
     let boot = crate::api::DeviceBoot {
         profiles: Some(dir.clone()),
@@ -120,7 +113,9 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
     .map_err(|e| e.to_string())?;
     let token = |i: u32| 100 + (i * 7919) % 5000;
     let prompt: Vec<u32> = (0..PROMPT).map(token).collect();
-    let fire = |shell: &mut crate::serve::Shell, lanes: &[(u32, &[u32])]| -> Result<(f64, Vec<f32>), String> {
+    let fire = |shell: &mut crate::serve::Shell,
+                lanes: &[(u32, &[u32])]|
+     -> Result<(f64, Vec<f32>), String> {
         let lanes: Vec<crate::serve::Lane> = lanes
             .iter()
             .map(|&(slot, tokens)| crate::serve::Lane {
@@ -131,7 +126,10 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
             .collect();
         let began = Instant::now();
         let out = shell.fire(&lanes).map_err(|e| e.to_string())?;
-        Ok((began.elapsed().as_secs_f64() * 1e3, out.into_iter().next().unwrap_or_default()))
+        Ok((
+            began.elapsed().as_secs_f64() * 1e3,
+            out.into_iter().next().unwrap_or_default(),
+        ))
     };
     let mut prefill = Vec::new();
     let mut readout = Vec::new();
@@ -152,10 +150,16 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
     for &lanes in &LANES {
         let mut times = Vec::new();
         for step in 0..=STEPS {
-            let next: Vec<[u32; 1]> = (0..lanes).map(|l| [token((step * lanes + l) as u32)]).collect();
-            let batch: Vec<(u32, &[u32])> = next.iter().enumerate().map(|(l, t)| (l as u32, &t[..])).collect();
+            let next: Vec<[u32; 1]> = (0..lanes)
+                .map(|l| [token((step * lanes + l) as u32)])
+                .collect();
+            let batch: Vec<(u32, &[u32])> = next
+                .iter()
+                .enumerate()
+                .map(|(l, t)| (l as u32, &t[..]))
+                .collect();
             let (ms, _) = fire(&mut shell, &batch)?;
-            // The first step of a lane count compiles or records.
+            // The first step at a lane count compiles or records.
             if step > 0 {
                 times.push(ms);
             }
@@ -174,8 +178,8 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
     })
 }
 
-/// A fingerprint of the fused trace and compiled plan a load under `text`
-/// runs, built as `Shell::load` builds them.
+/// A fingerprint of the fused trace and plan a load under `text` runs, as
+/// `Shell::load` builds them.
 fn plan_of(deployment: &str, text: &str, cores: u32) -> Option<u64> {
     use std::hash::{Hash, Hasher};
     let chip = crate::chip::registry().load_user(text, "plan").ok()?;
@@ -200,7 +204,6 @@ fn plan_of(deployment: &str, text: &str, cores: u32) -> Option<u64> {
     Some(h.finish())
 }
 
-/// Vulkan's bench: the check models, served on the device a load opens.
 struct Vulkan<'a> {
     models: &'a [(PathBuf, String)],
     device: &'a str,
@@ -236,8 +239,8 @@ impl Bench for Vulkan<'_> {
     }
 }
 
-/// Measure `kernel.qmm` on the device a load opens and fit its ladder; the
-/// measurements are kept under `cache`, and `refit` reads them from there.
+/// Measure `kernel.qmm` and fit its ladder; the measurements are kept under
+/// `cache`, where `refit` reads them back.
 fn bench_qmm(
     depth: Depth,
     name: &str,
@@ -255,7 +258,6 @@ fn bench_qmm(
         let text = std::fs::read_to_string(&kept)
             .map_err(|e| format!("no measurements at {}: {e}", kept.display()))?;
         say(&format!("refitting the measurements in {}", kept.display()));
-        // The kept file lists the candidates this device ran.
         let all = qmm::candidates(base);
         let ran: Vec<_> = text
             .lines()
@@ -282,8 +284,13 @@ fn bench_qmm(
 }
 
 #[cfg(feature = "vulkan")]
-fn measure(base: &Profile, grid: &qmm::Grid, say: &mut dyn FnMut(&str)) -> Result<qmm::Measured, String> {
-    let device = crate::device::Context::bind(&crate::api::DeviceBoot::default()).map_err(|e| e.to_string())?;
+fn measure(
+    base: &Profile,
+    grid: &qmm::Grid,
+    say: &mut dyn FnMut(&str),
+) -> Result<qmm::Measured, String> {
+    let device = crate::device::Context::bind(&crate::api::DeviceBoot::default())
+        .map_err(|e| e.to_string())?;
     qmm::measure(&device, base, grid, say)
 }
 
@@ -292,8 +299,7 @@ fn measure(_: &Profile, _: &qmm::Grid, _: &mut dyn FnMut(&str)) -> Result<qmm::M
     Err("this build carries no Vulkan device code".to_string())
 }
 
-/// Run the tune on the device a load opens: measure and fit `kernel.qmm`,
-/// search, check, and assemble the file. `say` hears progress.
+/// Tune the device a load opens. `say` hears progress.
 pub fn run(
     depth: Depth,
     profiles: Option<&Path>,
@@ -315,8 +321,7 @@ pub fn run(
         report.used
     ));
     let (fitted, mut lines, wrong) = bench_qmm(depth, &name, &base, cores, cache, refit, say)?;
-    // The fitted matmul is a candidate like any other: a ladder learned on
-    // kernels alone must also win on the served models to be kept.
+    // The fitted ladder must also win end to end to be kept.
     let mut knobs: Vec<search::Knob> = Vec::new();
     for (id, value) in &fitted {
         let (spec, rungs, _) = base
@@ -344,7 +349,6 @@ pub fn run(
     };
     let mut chosen = Vec::new();
     if models.is_empty() {
-        // Nothing to serve: the kernel bench's fit stands alone.
         chosen = fitted;
         for k in knobs.iter().filter(|k| k.id != "kernel.qmm") {
             lines.push(Line {
@@ -367,13 +371,14 @@ pub fn run(
     let today = bench.file(&[])?;
     let draft = bench.file(&chosen)?;
     let mut checks = Vec::new();
-    // A file that changes nothing serves as today's does.
     let unchanged = draft == today;
     if unchanged && !models.is_empty() {
         say("end to end: nothing changed, so nothing to compare");
     }
     for (at, (_, deployment)) in models.iter().enumerate().filter(|_| !unchanged) {
-        say(&format!("end to end: serving {deployment} under today's profile and the tuned one"));
+        say(&format!(
+            "end to end: serving {deployment} under today's profile and the tuned one"
+        ));
         match search::check(&mut bench, at, &today, &draft) {
             Ok(c) => {
                 say(&format!("  {}", c.describe()));
@@ -397,12 +402,19 @@ pub fn run(
     } else {
         format!(
             "kernels against the f64 reference; end to end: {}",
-            checks.iter().map(Check::describe).collect::<Vec<_>>().join("; ")
+            checks
+                .iter()
+                .map(Check::describe)
+                .collect::<Vec<_>>()
+                .join("; ")
         )
     };
     let seconds = began.elapsed().as_secs_f64();
     let provenance = [
-        ("source", format!("\"pie tune --{} on this machine\"", depth.word())),
+        (
+            "source",
+            format!("\"pie tune --{} on this machine\"", depth.word()),
+        ),
         ("measured", "true".to_string()),
         ("tuned", format!("[{}]", tuned_ids.join(", "))),
         ("from", format!("\"{}\"", report.used)),
@@ -434,16 +446,14 @@ pub fn run(
 mod tests {
     use super::*;
 
-    /// Every candidate the search offers on a derived profile reads as a
-    /// file this device takes, on a device with and without coopmat.
     #[test]
     fn every_search_candidate_reads_against_the_registry() {
         for coopmat in [false, true] {
-            let mut facts = profile::Facts::of(crate::chip::registry())
+            let facts = profile::Facts::of(crate::chip::registry())
                 .word("vendor", "nvidia")
                 .int("subgroup", 32)
-                .int("cores", 142);
-            facts = facts.flag("coopmat", coopmat);
+                .int("cores", 142)
+                .flag("coopmat", coopmat);
             let (base, _) = crate::chip::resolve_facts("Test GPU", &facts, None);
             let knobs = search::knobs(&base, SEARCH_SKIPS, "");
             let ids: Vec<&str> = knobs.iter().map(|k| k.id).collect();
@@ -462,10 +472,12 @@ mod tests {
                         &[],
                         ASSUME,
                     );
-                    // A coopmat kernel on a device without it is refused,
-                    // which the search records and passes over.
                     if let Err(why) = got {
-                        assert!(!coopmat && why.contains("coopmat"), "{} = {label}: {why}", k.id);
+                        assert!(
+                            !coopmat && why.contains("coopmat"),
+                            "{} = {label}: {why}",
+                            k.id
+                        );
                     }
                 }
             }

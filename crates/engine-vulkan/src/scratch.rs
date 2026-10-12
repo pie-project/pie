@@ -54,10 +54,8 @@ struct SplitRooms {
     part_lse: Room,
 }
 
-/// Slice rows a decode attention of `heads` query heads at up to `rows`
-/// rows writes when it splits across `groups` workgroups: a fire splits only
-/// while its rows hold fewer than `groups` heads, into as many slices as
-/// fill `groups`.
+/// Partial rows a decode of `heads` heads at up to `rows` rows writes when
+/// split across `groups` workgroups (`kernels_vulkan::attn::splits_for`).
 fn split_rows(groups: u32, heads: u32, rows: u32) -> u64 {
     (1..=rows)
         .take_while(|r| u64::from(*r) * u64::from(heads) < u64::from(groups))

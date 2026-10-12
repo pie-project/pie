@@ -33,7 +33,6 @@ pub fn qmm_group(bm: i32) -> [u32; 3] {
 
 const QMV_GROUP: [u32; 3] = [32, 2, 1];
 
-/// Codes a tiled point walks the contraction by.
 pub(crate) const QMM_BK: i32 = 32;
 
 const BM_RUNGS: [i32; 4] = [8, 16, 32, 64];
@@ -201,15 +200,7 @@ pub fn matmul(
     y: Tensor,
     capacity_rows: u32,
 ) -> Result<(), Error> {
-    act_x_wt(
-        ctx,
-        tuning,
-        "linear.matmul",
-        act,
-        w,
-        y,
-        capacity_rows,
-    )
+    act_x_wt(ctx, tuning, "linear.matmul", act, w, y, capacity_rows)
 }
 
 pub fn lm_head(
@@ -220,18 +211,9 @@ pub fn lm_head(
     y: Tensor,
     capacity_rows: u32,
 ) -> Result<(), Error> {
-    act_x_wt(
-        ctx,
-        tuning,
-        "linear.lm_head",
-        act,
-        w,
-        y,
-        capacity_rows,
-    )
+    act_x_wt(ctx, tuning, "linear.lm_head", act, w, y, capacity_rows)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn act_x_wt(
     ctx: &Ctx<'_>,
     tuning: &crate::Tuning,

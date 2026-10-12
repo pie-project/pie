@@ -93,18 +93,11 @@ pub(crate) struct Core {
     pub(crate) allocated: AtomicU64,
     pub(crate) name: String,
     pub(crate) subgroup_size: u32,
-    /// The narrowest subgroup a pipeline runs at: 32 where every pipeline
-    /// is pinned there, else the narrowest the driver may pick.
+    /// The narrowest subgroup a pipeline runs at.
     pub(crate) subgroup_min: u32,
-    /// The width every pipeline is created at (`requiredSubgroupSize`),
-    /// where the device can pin one: 32, which the kernels that fold a
-    /// subgroup as 32 lanes (cooperative matrices, decode attention's
-    /// registers) assume.
+    /// `requiredSubgroupSize` for every pipeline, where the device can pin
+    /// one: 32, which the coopmat and decode attention kernels assume.
     pub(crate) pinned: Option<u32>,
-    /// `maxComputeSharedMemorySize`, `maxComputeWorkGroupInvocations`.
-    pub(crate) shared_bytes: u32,
-    pub(crate) invocations: u32,
-    /// Multiprocessors or compute units, where an extension says.
     pub(crate) cores: Option<u32>,
     pub(crate) device_local: u64,
     pub(crate) vendor_id: u32,
@@ -411,11 +404,8 @@ impl Drop for PipelineCache {
     }
 }
 
-/// The transfer staging buffer is a `Slab`, which holds the `Core` that holds
-/// it: left in place, that cycle keeps the device (and its memory) alive
-/// after every load, until `vkCreateDevice` fails. The context is what a load
-/// owns, so its end releases the staging buffer; buffers and pipelines that
-/// outlive it then release the device as they go.
+/// The staging buffer holds the `Core` that holds it; left in place, that
+/// cycle leaks the device after every load until `vkCreateDevice` fails.
 impl Drop for Context {
     fn drop(&mut self) {
         self.core
@@ -632,10 +622,8 @@ impl Context {
             unsafe { instance.get_physical_device_features2(physical, &mut query) };
         }
         let core = unsafe { instance.get_physical_device_features(physical) };
-        // Pin every pipeline to 32 lanes where the driver lets compute
-        // pipelines ask for a width and 32 is one it runs: AMD RDNA (64 by
-        // default), Intel (8 to 32) and NVIDIA (32) then all run the
-        // kernels at the width they were written for.
+        // Pin every pipeline to 32 lanes where the driver allows it (AMD
+        // RDNA defaults to 64, Intel varies 8 to 32).
         let size_control = api_13 && f13.subgroup_size_control == vk::TRUE;
         let pinned = (size_control
             && sizes.min_subgroup_size <= 32
@@ -796,8 +784,6 @@ impl Context {
             subgroup_size: pinned.unwrap_or(subgroup.subgroup_size.max(1)),
             subgroup_min,
             pinned,
-            shared_bytes: props.limits.max_compute_shared_memory_size,
-            invocations: props.limits.max_compute_work_group_invocations,
             cores,
             device_local,
             vendor_id: props.vendor_id,
@@ -849,8 +835,6 @@ impl Context {
         self.max_buffer
     }
 
-    /// The cores the compiler and the guest scheduler size work by: the
-    /// count an extension reports, else [`crate::chip::UNREPORTED_CORES`].
     #[must_use]
     pub fn cores(&self) -> u32 {
         self.core.cores.unwrap_or(crate::chip::UNREPORTED_CORES)
@@ -867,11 +851,14 @@ impl Context {
         self.core.subgroup_min
     }
 
-    /// The device's compute limits: workgroup memory in bytes, and
-    /// invocations per workgroup.
     #[must_use]
-    pub fn compute_limits(&self) -> (u32, u32) {
-        (self.core.shared_bytes, self.core.invocations)
+    pub fn limits(&self) -> kernels_vulkan::tuning::Limits {
+        kernels_vulkan::tuning::Limits {
+            cores: self.cores(),
+            lanes: self.lanes(),
+            shared_bytes: self.core.limits.max_compute_shared_memory_size,
+            invocations: self.core.limits.max_compute_work_group_invocations,
+        }
     }
 
     #[must_use]
@@ -899,7 +886,6 @@ impl Context {
         self.core.features
     }
 
-    /// What the profile is resolved from: the device's name and facts.
     #[must_use]
     pub fn chip(&self) -> crate::chip::Device {
         crate::chip::Device {

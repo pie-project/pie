@@ -1,10 +1,4 @@
-//! The device's profile: the Vulkan registry, the facts this engine
-//! measures, and resolution for one load.
-//!
-//! Vulkan serves every GPU the other engines do not, so most devices have no
-//! file: their profile is derived from the facts, as `derived` writes it,
-//! after the user's file and any checked-in file whose `target.match` names
-//! the device. See `.wiki/device-profiles.md`.
+//! The Vulkan registry and the profile one load resolves.
 
 use std::path::Path;
 use std::sync::LazyLock;
@@ -31,15 +25,11 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     r
 });
 
-/// Every decision the Vulkan engine exposes.
 #[must_use]
 pub fn registry() -> &'static Registry {
     &REGISTRY
 }
 
-/// The profiles checked in with pie, as `(file name, text)`, matched by
-/// device name or by `target.match`. A device none names runs the profile
-/// its facts derive.
 pub const SEEDED: &[(&str, &str)] = &[
     (
         "qualcomm-adreno-64.toml",
@@ -59,17 +49,14 @@ pub const SEEDED: &[(&str, &str)] = &[
     ),
 ];
 
-/// Where Vulkan's profiles live.
 pub static SHELF: Shelf = Shelf {
     backend: "vulkan",
     seeded: SEEDED,
 };
 
-/// The cores the compiler prices a device at when no extension reports a
-/// count: 16, what this engine assumed for every such device before.
+/// The cores a device is sized by when no extension reports a count.
 pub const UNREPORTED_CORES: u32 = 16;
 
-/// What this engine measured about a device.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Device {
     pub name: String,
@@ -93,22 +80,14 @@ impl Device {
         }
     }
 
-    /// The cores the compiler prices this device at.
     #[must_use]
     pub fn pricing_cores(&self) -> u32 {
         self.cores.unwrap_or(UNREPORTED_CORES)
     }
 }
 
-/// The profile a device's facts derive, as a user file would spell it:
-/// what every device without a measured or checked-in file runs.
-///
-/// - The cooperative-matrix kernels where the device has them.
-/// - A decode row's keys split across one workgroup per core the device
-///   reports, else across 16.
-///
-/// A vendor's own habits (Adreno's slow workgroup memory) live in a
-/// checked-in file matched by vendor, not here.
+/// The profile a device without a user or checked-in file runs, as a user
+/// file would spell it.
 #[must_use]
 pub fn derived(device: &Device) -> String {
     let mut assumes = vec![
@@ -145,9 +124,8 @@ pub fn derived(device: &Device) -> String {
     )
 }
 
-/// The checked-in files whose `target` names this device: by its exact
-/// name, or by `match` on its vendor and, where stated, a substring of its
-/// name.
+/// The checked-in files whose `target` names this device, by name or by
+/// `match`.
 fn matching(device: &Device) -> Vec<Candidate> {
     SEEDED
         .iter()
@@ -170,9 +148,8 @@ fn matching(device: &Device) -> Vec<Candidate> {
         .collect()
 }
 
-/// Resolve the profile one load runs under: the user's file for this
-/// device, then a checked-in file that names it, then the profile its facts
-/// derive, then the registry defaults.
+/// The user's file, then a checked-in file that names the device, then the
+/// derived profile.
 #[must_use]
 pub fn resolve(device: &Device, profiles: Option<&Path>) -> (Profile, Report) {
     let mut candidates = Vec::new();
@@ -193,8 +170,6 @@ pub fn resolve(device: &Device, profiles: Option<&Path>) -> (Profile, Report) {
     registry().resolve(&candidates, &device.facts())
 }
 
-/// The name and facts of the device a load would open: for `pie profile`
-/// and doctor. `None` without a Vulkan loader or device.
 #[must_use]
 pub fn probe() -> Option<(String, Facts)> {
     let context = crate::device::Context::bind(&crate::api::DeviceBoot::default()).ok()?;
@@ -202,7 +177,6 @@ pub fn probe() -> Option<(String, Facts)> {
     Some((device.name.clone(), device.facts()))
 }
 
-/// Resolve by name and facts, as `probe` reports them.
 #[must_use]
 pub fn resolve_facts(name: &str, facts: &Facts, profiles: Option<&Path>) -> (Profile, Report) {
     let vendor = facts
@@ -226,19 +200,11 @@ pub fn resolve_facts(name: &str, facts: &Facts, profiles: Option<&Path>) -> (Pro
     resolve(&device, profiles)
 }
 
-/// The registry defaults with `overrides` (profile TOML after `api = 1`)
-/// laid over them, for a device with `cores`: for a test that exercises one
-/// decision. Panics on an override the registry refuses.
-#[must_use]
-pub fn tuning(overrides: &str, cores: u32) -> kernels_vulkan::Tuning {
-    kernels_vulkan::Tuning::new(
-        registry().with_overrides(overrides),
-        kernels_vulkan::tuning::Limits::with_cores(cores),
-    )
-}
-
 #[cfg(test)]
 mod tests {
+    use kernels_vulkan::Tuning;
+    use kernels_vulkan::tuning::{Limits, Qmm};
+
     use super::*;
 
     #[test]
@@ -256,51 +222,69 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_device_without_a_file_runs_what_its_facts_derive() {
-        for d in [
-            device("nvidia", 32, Some(142), true),
-            device("amd", 64, Some(60), false),
-            device("intel", 16, None, false),
-        ] {
-            let (_, report) = resolve(&d, None);
-            assert_eq!(report.used, Source::Derived, "{d:?}: {report:?}");
-            assert!(report.untuned(), "a derived profile is worth tuning");
-        }
+    fn tuning(d: &Device) -> Tuning {
+        let cores = d.pricing_cores();
+        Tuning::new(
+            resolve(d, None).0,
+            Limits {
+                cores,
+                ..Limits::ASSUMED
+            },
+        )
     }
 
     #[test]
-    fn a_vendor_runs_its_checked_in_file() {
+    fn a_device_runs_its_checked_in_file_or_what_its_facts_derive() {
         for (d, file) in [
-            (device("qualcomm", 64, None, false), "qualcomm-adreno-64.toml"),
-            (device("qualcomm", 128, Some(6), false), "qualcomm-adreno-128.toml"),
-            (device("qualcomm", 16, None, false), "qualcomm-adreno.toml"),
-            (device("imagination", 128, None, false), "imagination-powervr-128.toml"),
+            (device("nvidia", 32, Some(142), true), None),
+            (device("amd", 64, Some(60), false), None),
+            (device("intel", 16, None, false), None),
+            (
+                device("qualcomm", 64, None, false),
+                Some("qualcomm-adreno-64.toml"),
+            ),
+            (
+                device("qualcomm", 128, Some(6), false),
+                Some("qualcomm-adreno-128.toml"),
+            ),
+            (
+                device("qualcomm", 16, None, false),
+                Some("qualcomm-adreno.toml"),
+            ),
+            (
+                device("imagination", 128, None, false),
+                Some("imagination-powervr-128.toml"),
+            ),
         ] {
             let (_, report) = resolve(&d, None);
-            assert_eq!(report.used, Source::Seeded(file.to_string()), "{d:?}: {report:?}");
+            let want = file.map_or(Source::Derived, |f| Source::Seeded(f.to_string()));
+            assert_eq!(report.used, want, "{d:?}");
+            if file.is_none() {
+                assert!(report.untuned());
+            }
         }
     }
 
-    /// The kernel the cascade before the `kernel.qmm` ladder ran a dense
-    /// matmul on, for a device: coopmat, then register tiles (Adreno), then
-    /// tiled, from 12 rows and a contraction of whole 32-code tiles; the
-    /// one-row kernel for one row on an Adreno 32 lanes wide or wider; else
+    /// The dense matmul the per-vendor cascade before `kernel.qmm` picked:
+    /// coopmat, register tiles on Adreno, then tiled, from 12 rows over whole
+    /// 32-code tiles; for one row, the one-row kernel on Adreno (32 lanes a
+    /// row) and on a 128-lane PowerVR (8 lanes a row, two rows a lane); else
     /// four vectors a workgroup.
-    fn old_qmm(d: &Device, rows: u32, n: u32, k: u32) -> kernels_vulkan::tuning::Qmm {
-        use kernels_vulkan::tuning::Qmm;
+    fn old_qmm(d: &Device, rows: u32, n: u32, k: u32) -> Qmm {
         let qualcomm = d.vendor == "qualcomm";
-        let powervr = d.vendor == "imagination";
-        let tiles = rows >= 12 && k % 32 == 0;
+        let tiles = rows >= 12 && k.is_multiple_of(32);
+        let one_row = rows == 1 && k.is_multiple_of(32);
         if d.coopmat && tiles {
             Qmm::Coopmat
         } else if qualcomm && tiles {
-            Qmm::RegisterTiled { bm: if rows > 32 { 64 } else { 32 } }
-        } else if tiles && n % 16 == 0 {
+            Qmm::RegisterTiled {
+                bm: if rows > 32 { 64 } else { 32 },
+            }
+        } else if tiles && n.is_multiple_of(16) {
             Qmm::Tiled { crossover_tg: 160 }
-        } else if rows == 1 && qualcomm && d.subgroup >= 32 && (k * 4) % 128 == 0 && k % 8 == 0 {
+        } else if one_row && qualcomm && d.subgroup >= 32 {
             Qmm::OneRow { lanes: 32, rows: 1 }
-        } else if rows == 1 && powervr && d.subgroup == 128 && (k * 4) % 128 == 0 && k % 8 == 0 {
+        } else if one_row && d.vendor == "imagination" && d.subgroup == 128 {
             Qmm::OneRow { lanes: 8, rows: 2 }
         } else {
             Qmm::Qmv { vecs: 4 }
@@ -324,54 +308,53 @@ mod tests {
             device("imagination", 16, None, false),
             device("other", 32, None, false),
         ] {
-            let (profile, report) = resolve(&d, None);
-            let t = kernels_vulkan::Tuning::new(
-                profile,
-                kernels_vulkan::tuning::Limits::with_cores(d.pricing_cores()),
-            );
+            let t = tuning(&d);
             for rows in [1, 2, 4, 11, 12, 16, 32, 33, 64, 512] {
                 for (n, k) in [(4096, 4096), (4096, 4100), (1000, 4096)] {
                     let at = t.qmm_at(rows, n, k, 4, 64);
                     assert_eq!(
                         t.qmm(&at)[0],
                         old_qmm(&d, rows, n, k),
-                        "{d:?} from {}: {rows} x {n} x {k}",
-                        report.used
+                        "{d:?}: {rows} x {n} x {k}"
                     );
                 }
             }
             let qualcomm = d.vendor == "qualcomm";
             assert_eq!(
                 t.sdpa_split_groups(),
-                if qualcomm { 128 } else { d.cores.unwrap_or(0).max(16) },
+                if qualcomm {
+                    128
+                } else {
+                    d.cores.unwrap_or(0).max(16)
+                },
                 "{d:?}"
             );
             assert_eq!(t.sdpa_split_min_keys(), if qualcomm { 128 } else { 256 });
             assert_eq!(t.gemm_coopmat() && t.moe_coopmat(), d.coopmat, "{d:?}");
             assert_eq!(t.sdpa_tile_rows_per_request(), 32);
-            for (pairs, experts) in [(0, 8), (15, 8), (16, 8), (255, 8), (256, 8), (4096, 64)] {
-                let per = pairs / experts;
-                let old_tile = if pairs < experts * 2 {
-                    1
-                } else if per >= 32 {
-                    32
-                } else {
-                    16
-                };
-                assert_eq!(t.moe_tile_rows(pairs, experts), old_tile, "{pairs} over {experts}");
+            for (pairs, experts, tile) in [
+                (0, 8, 1),
+                (15, 8, 1),
+                (16, 8, 16),
+                (255, 8, 16),
+                (256, 8, 32),
+                (4096, 64, 32),
+            ] {
+                assert_eq!(
+                    t.moe_tile_rows(pairs, experts),
+                    tile,
+                    "{pairs} over {experts}"
+                );
             }
         }
     }
 
     #[test]
     fn a_device_reporting_fewer_than_16_cores_is_split_by_what_it_reported() {
-        let d = device("nvidia", 32, Some(10), false);
-        let (profile, _) = resolve(&d, None);
-        let t = kernels_vulkan::Tuning::new(
-            profile,
-            kernels_vulkan::tuning::Limits::with_cores(d.pricing_cores()),
+        assert_eq!(
+            tuning(&device("nvidia", 32, Some(10), false)).sdpa_split_groups(),
+            10
         );
-        assert_eq!(t.sdpa_split_groups(), 10, "the old floor of 16 was a guess");
     }
 
     #[test]
@@ -386,6 +369,7 @@ mod tests {
         )
         .unwrap();
         let (profile, report) = resolve(&d, Some(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(report.used, Source::Derived);
         assert!(
             report.rejected[0]
@@ -394,12 +378,11 @@ mod tests {
             "{:?}",
             report.rejected
         );
-        let t = kernels_vulkan::Tuning::new(profile, kernels_vulkan::tuning::Limits::ASSUMED);
+        let t = Tuning::new(profile, Limits::ASSUMED);
         assert!(!matches!(
             t.qmm(&t.qmm_at(1, 4096, 4096, 4, 64))[0],
-            kernels_vulkan::tuning::Qmm::OneRow { .. }
+            Qmm::OneRow { .. }
         ));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 

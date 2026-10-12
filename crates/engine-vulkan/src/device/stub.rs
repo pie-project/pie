@@ -73,7 +73,7 @@ impl Context {
     }
 
     #[must_use]
-    pub fn compute_limits(&self) -> (u32, u32) {
+    pub fn limits(&self) -> kernels_vulkan::tuning::Limits {
         match self.never {}
     }
 

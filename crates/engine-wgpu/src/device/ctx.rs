@@ -163,10 +163,8 @@ pub(crate) struct Core {
     pub(crate) last_error: Arc<Mutex<Option<String>>>,
     pub(crate) allocated: AtomicU64,
     pub(crate) name: String,
-    /// Multiprocessors or compute units, where the native driver says.
     pub(crate) cores: Option<u32>,
-    /// The narrowest subgroup a dispatch may run at; `None` without the
-    /// subgroup feature.
+    /// `None` without the subgroup feature.
     pub(crate) subgroup_min: Option<u32>,
     pub(crate) device_local: u64,
 }
@@ -552,10 +550,8 @@ impl Context {
     }
 
     #[must_use]
-    /// The cores the compiler and a decode split size work by: the count
-    /// the native driver reports, else [`crate::chip::UNREPORTED_CORES`].
     pub fn cores(&self) -> u32 {
-        self.chip().sizing_cores()
+        self.core.cores.unwrap_or(crate::chip::UNREPORTED_CORES)
     }
 
     #[must_use]
@@ -587,7 +583,6 @@ impl Context {
         self.core.enabled
     }
 
-    /// What the profile is resolved from: the adapter's name and facts.
     #[must_use]
     pub fn chip(&self) -> crate::chip::Device {
         crate::chip::Device {
@@ -599,8 +594,7 @@ impl Context {
         }
     }
 
-    /// Invocations and bytes of workgroup memory a compute workgroup may
-    /// use on this adapter.
+    /// Invocations and workgroup memory bytes.
     #[must_use]
     pub fn workgroup_limits(&self) -> (u32, u32) {
         (
@@ -609,7 +603,6 @@ impl Context {
         )
     }
 
-    /// Storage buffers a shader stage may bind.
     #[must_use]
     pub fn storage_buffers(&self) -> u32 {
         self.core.limits.max_storage_buffers_per_shader_stage

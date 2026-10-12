@@ -1,7 +1,5 @@
-//! The `kernel.qmm` microbenchmark: every candidate kernel timed at every
-//! point of a grid of dense quantised matmuls, checked against an f64
-//! reference, and a ladder fitted to the times. Metal's bench, on Vulkan:
-//! the fitted ladder is a candidate the end-to-end search must also accept.
+//! The `kernel.qmm` bench: every candidate timed over a grid of dense
+//! quantised matmuls, checked against an f64 reference, and a ladder fitted.
 
 use std::fmt::Write as _;
 
@@ -11,7 +9,6 @@ use profile::Profile;
 use profile::search::{Entries, Line};
 use profile::tune::{Candidate, Fit, Options, Sample};
 
-/// How much to measure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Depth {
     /// A coarse grid: minutes.
@@ -38,8 +35,7 @@ pub struct Bank {
 }
 
 /// The quantised bank shapes of the models pie ships, `(n, k, banks)`,
-/// heaviest first: the census Metal's bench measures (`engine-metal`'s
-/// `tune::CENSUS`, which a test keeps in step with `models/`).
+/// heaviest first; the same census the Metal bench measures.
 pub const CENSUS: &[(u32, u32, u32)] = &[
     (34816, 5120, 593),
     (5120, 17408, 593),
@@ -67,7 +63,6 @@ pub const CENSUS: &[(u32, u32, u32)] = &[
     (20480, 5376, 30),
 ];
 
-/// The points a dense matmul is measured at.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Grid {
     pub rows: Vec<u32>,
@@ -81,7 +76,10 @@ impl Grid {
     pub fn of(depth: Depth) -> Grid {
         let bank = |bits, group| Bank { bits, group };
         let shapes = |taken: Vec<(u32, u32, u32)>| {
-            let total: f64 = taken.iter().map(|&(n, k, c)| f64::from(n) * f64::from(k) * f64::from(c)).sum();
+            let total: f64 = taken
+                .iter()
+                .map(|&(n, k, c)| f64::from(n) * f64::from(k) * f64::from(c))
+                .sum();
             taken
                 .iter()
                 .map(|&(n, k, c)| (n, k, f64::from(n) * f64::from(k) * f64::from(c) / total))
@@ -111,12 +109,18 @@ impl Grid {
     }
 }
 
-/// The standard workload mix, as Metal weighs it: half decode (8 rows or
-/// fewer), a fifth small batches, the rest prefill; by bank, 4-bit 64-group
-/// half, 4-bit 32-group a tenth, 8-bit 0.15, 2-bit a quarter.
+/// Metal's workload mix: half decode (8 rows or fewer), a fifth small
+/// batches, the rest prefill; by bank, 4-bit g64 half, 4-bit g32 a tenth,
+/// 8-bit 0.15, 2-bit a quarter.
 #[must_use]
 pub fn weight(grid: &Grid, rows: u32, n: u32, k: u32, bank: Bank) -> f64 {
-    let band = |lo: u32, hi: u32| grid.rows.iter().filter(|&&r| lo <= r && r <= hi).count().max(1);
+    let band = |lo: u32, hi: u32| {
+        grid.rows
+            .iter()
+            .filter(|&&r| lo <= r && r <= hi)
+            .count()
+            .max(1)
+    };
     let per_rows = match rows {
         0..=8 => 0.5 / band(0, 8) as f64,
         9..=64 => 0.2 / band(9, 64) as f64,
@@ -129,7 +133,12 @@ pub fn weight(grid: &Grid, rows: u32, n: u32, k: u32, bank: Bank) -> f64 {
         _ => 3,
     };
     let share = [0.5, 0.1, 0.15, 0.25][kind(&bank)];
-    let alike = grid.banks.iter().filter(|b| kind(b) == kind(&bank)).count().max(1);
+    let alike = grid
+        .banks
+        .iter()
+        .filter(|b| kind(b) == kind(&bank))
+        .count()
+        .max(1);
     let per_shape = grid
         .shapes
         .iter()
@@ -138,9 +147,8 @@ pub fn weight(grid: &Grid, rows: u32, n: u32, k: u32, bank: Bank) -> f64 {
     per_rows * share / alike as f64 * per_shape
 }
 
-/// What `kernel.qmm` is measured over: every kernel, a spread of its
-/// constants, and every rung value the current profile holds. The bench
-/// drops those the device cannot run.
+/// Every kernel at a spread of its constants, and every rung the current
+/// profile holds.
 #[must_use]
 pub fn candidates(base: &Profile) -> Vec<Qmm> {
     let mut out = vec![
@@ -167,7 +175,6 @@ pub fn candidates(base: &Profile) -> Vec<Qmm> {
     out
 }
 
-/// A rung value as the TOML body of a rung.
 #[must_use]
 pub fn body(q: &Qmm) -> String {
     match *q {
@@ -182,9 +189,9 @@ pub fn body(q: &Qmm) -> String {
 }
 
 /// The ladder that runs `q` wherever it can, and the vector kernel
-/// elsewhere: how one candidate is timed.
-#[must_use]
-pub fn forcing(q: &Qmm) -> String {
+/// elsewhere.
+#[cfg(any(test, feature = "vulkan"))]
+fn forcing(q: &Qmm) -> String {
     match q {
         Qmm::Qmv { .. } => format!("[{{ {} }}]", body(q)),
         _ => format!("[{{ {} }}, {{ use = \"qmv\", vecs = 4 }}]", body(q)),
@@ -192,8 +199,8 @@ pub fn forcing(q: &Qmm) -> String {
 }
 
 /// The kernel `kernels_vulkan::linear::quant::ran` names for `q`.
-#[must_use]
-pub fn kernel(q: &Qmm) -> &'static str {
+#[cfg(feature = "vulkan")]
+fn kernel(q: &Qmm) -> &'static str {
     match q {
         Qmm::Coopmat => "coopmat",
         Qmm::RegisterTiled { .. } => "register_tiled",
@@ -203,7 +210,6 @@ pub fn kernel(q: &Qmm) -> &'static str {
     }
 }
 
-/// One measured point of the dense matmul.
 #[derive(Clone, Debug)]
 pub struct Point {
     pub rows: u32,
@@ -216,18 +222,16 @@ pub struct Point {
     pub baseline: Option<usize>,
 }
 
-/// Everything measured for `kernel.qmm`.
 #[derive(Clone, Debug, Default)]
 pub struct Measured {
     pub candidates: Vec<Qmm>,
     pub points: Vec<Point>,
-    /// Each candidate that answered wrongly: how many points, and the
-    /// first.
+    /// Each candidate that answered wrongly: how many points, and the first.
     pub wrong: Vec<(String, usize, String)>,
 }
 
 impl Measured {
-    /// The measurements as text, what `pie tune --refit` reads back.
+    /// What `pie tune --refit` reads back.
     #[must_use]
     pub fn to_text(&self, device: &str) -> String {
         let mut out = format!("# pie tune measurements, kernel.qmm, {device}\n");
@@ -251,15 +255,15 @@ impl Measured {
                 p.k,
                 p.bank.bits,
                 p.bank.group,
-                p.baseline.map_or_else(|| "-".to_string(), |b| b.to_string()),
+                p.baseline
+                    .map_or_else(|| "-".to_string(), |b| b.to_string()),
                 times.join(",")
             );
         }
         out
     }
 
-    /// Read [`Measured::to_text`] back, against today's candidates: a file
-    /// measured over another candidate list is refused.
+    /// A file measured over another candidate list is refused.
     pub fn from_text(text: &str, candidates: &[Qmm]) -> Result<Measured, String> {
         let bodies: Vec<String> = candidates.iter().map(body).collect();
         let mut seen = Vec::new();
@@ -281,7 +285,9 @@ impl Measured {
             } else if let Some(rest) = line.strip_prefix("point ") {
                 let f: Vec<&str> = rest.split(' ').collect();
                 let num = |i: usize| -> Result<u32, String> {
-                    f.get(i).and_then(|v| v.parse().ok()).ok_or(format!("field {i} of `{line}`"))
+                    f.get(i)
+                        .and_then(|v| v.parse().ok())
+                        .ok_or(format!("field {i} of `{line}`"))
                 };
                 out.points.push(Point {
                     rows: num(0)?,
@@ -302,28 +308,21 @@ impl Measured {
             }
         }
         if seen != bodies {
-            return Err("the measurements were taken over another candidate list; measure again".into());
+            return Err(
+                "the measurements were taken over another candidate list; measure again".into(),
+            );
         }
         Ok(out)
     }
 }
 
-/// A point's coordinates in `kernel.qmm`'s variable order: rows, fill, n,
-/// k, bits, group.
-#[must_use]
-pub fn coords(p: &Point, cores: u32) -> Vec<i64> {
-    let tiles = u64::from(p.rows.div_ceil(32)) * u64::from(p.n.div_ceil(64));
-    vec![
-        i64::from(p.rows),
-        i64::try_from(tiles * 8 / u64::from(cores.max(1))).unwrap_or(i64::MAX),
-        i64::from(p.n),
-        i64::from(p.k),
-        i64::from(p.bank.bits),
-        i64::from(p.bank.group),
-    ]
+/// A point's coordinates in `kernel.qmm`'s variable order.
+fn coords(p: &Point, cores: u32) -> Vec<i64> {
+    let at = kernels_vulkan::tuning::qmm_at(p.rows, p.n, p.k, p.bank.bits, p.bank.group, cores);
+    vec![at.rows, at.fill, at.n, at.k, at.bits, at.group]
 }
 
-/// The fitted `kernel.qmm` ladder as a profile entry, and its report line.
+/// The fitted ladder as a profile entry, and its report line.
 pub fn fit(measured: &Measured, grid: &Grid, cores: u32) -> Result<(Entries, Vec<Line>), String> {
     let spec = Qmm::spec();
     let candidates: Vec<Candidate> = measured
@@ -355,7 +354,10 @@ pub fn fit(measured: &Measured, grid: &Grid, cores: u32) -> Result<(Entries, Vec
     if let Some(b) = fit.baseline {
         let _ = write!(text, "; today's ladder runs at {:.3}x", b / fit.floor);
     }
-    Ok((vec![(spec.id.to_string(), ladder)], vec![Line { id: spec.id, text }]))
+    Ok((
+        vec![(spec.id.to_string(), ladder)],
+        vec![Line { id: spec.id, text }],
+    ))
 }
 
 #[cfg(feature = "vulkan")]
@@ -366,7 +368,6 @@ mod device {
     use std::cell::RefCell;
 
     use kernels_vulkan::linear::quant;
-    use kernels_vulkan::tuning::Limits;
     use kernels_vulkan::{ArgValue, Encode, Error, Fire, Tensor, Tuning};
     use poem_ir::Dtype;
     use profile::{Decision as _, Profile, Source};
@@ -375,8 +376,7 @@ mod device {
     use crate::device::{Buffer, Context, Handles, Pipelines};
     use crate::encode::Sink;
 
-    /// An `Encode` that remembers the entries it fired: which kernel a
-    /// forced candidate actually ran.
+    /// Remembers the entries it fired: which kernel a forced candidate ran.
     struct Watch<'a> {
         inner: &'a dyn Encode,
         entries: RefCell<Vec<&'static str>>,
@@ -424,8 +424,8 @@ mod device {
         }
     }
 
-    /// A bank of one `(n, k, bits, group)`, in enough copies to stream past
-    /// the last-level cache, with its host values for the reference.
+    /// A bank in enough copies to stream past the last-level cache, with
+    /// its host values for the reference.
     struct Weights {
         codes: Vec<u32>,
         scales: Vec<u32>,
@@ -436,13 +436,17 @@ mod device {
         _buffers: Vec<Buffer>,
     }
 
-    /// Bytes a copy rotation must exceed: more than any GPU's last-level
-    /// cache pie meets.
+    /// More than any GPU's last-level cache.
     const STREAM_BYTES: u64 = 256 << 20;
-    /// The most memory one shape may take.
     const SHAPE_BYTES: u64 = 1 << 30;
 
-    fn weights(device: &Context, handles: &Handles, n: u32, k: u32, bank: Bank) -> Result<Weights, String> {
+    fn weights(
+        device: &Context,
+        handles: &Handles,
+        n: u32,
+        k: u32,
+        bank: Bank,
+    ) -> Result<Weights, String> {
         let (bits, group) = (bank.bits, bank.group);
         let (nn, kk) = (n as usize, k as usize);
         let groups = kk / group as usize;
@@ -480,7 +484,9 @@ mod device {
         if bank_bytes > SHAPE_BYTES / 2 {
             return Err(format!("{n} x {k} at {bits} bits is past the shape budget"));
         }
-        let copies = STREAM_BYTES.div_ceil(bank_bytes).clamp(1, SHAPE_BYTES / bank_bytes);
+        let copies = STREAM_BYTES
+            .div_ceil(bank_bytes)
+            .clamp(1, SHAPE_BYTES / bank_bytes);
         let mut out = Weights {
             codes: Vec::new(),
             scales: Vec::new(),
@@ -492,7 +498,8 @@ mod device {
         };
         for _ in 0..copies {
             for (bytes, into) in [(&packed, 0), (&sc, 1), (&bi, 2)] {
-                let mut b = Buffer::zeroed(device, bytes.len() as u64).map_err(|e| e.to_string())?;
+                let mut b =
+                    Buffer::zeroed(device, bytes.len() as u64).map_err(|e| e.to_string())?;
                 b.write(0, bytes).map_err(|e| e.to_string())?;
                 let h = handles.bind(&b, 0, b.bytes()).map_err(|e| e.to_string())?;
                 match into {
@@ -506,7 +513,6 @@ mod device {
         Ok(out)
     }
 
-    /// Time every candidate at every grid point on `device`.
     pub fn measure(
         device: &Context,
         base: &Profile,
@@ -514,21 +520,19 @@ mod device {
         say: &mut dyn FnMut(&str),
     ) -> Result<Measured, String> {
         let registry = crate::chip::registry();
-        let (shared_bytes, invocations) = device.compute_limits();
-        let limits = Limits {
-            cores: device.cores(),
-            lanes: device.lanes(),
-            shared_bytes,
-            invocations,
-        };
+        let limits = device.limits();
         let tuning = |text: &str| -> Option<Tuning> {
             registry
-                .overlay(base, text, base.target().clone(), Source::User("tune".into()))
+                .overlay(
+                    base,
+                    text,
+                    base.target().clone(),
+                    Source::User("tune".into()),
+                )
                 .ok()
                 .map(|p| Tuning::new(p, limits))
         };
-        // A candidate the device cannot run (coopmat without the
-        // extension, one-row under 32 lanes) is refused by the registry.
+        // The registry refuses a candidate the device cannot run.
         let mut kept = Vec::new();
         let mut forced = Vec::new();
         for q in candidates(base) {
@@ -562,8 +566,12 @@ mod device {
             let mut act_b = alloc(act_bytes.len() as u64)?;
             act_b.write(0, &act_bytes).map_err(|e| e.to_string())?;
             let out_b = alloc(u64::from(cap) * u64::from(n) * 2)?;
-            let ha = handles.bind(&act_b, 0, act_b.bytes()).map_err(|e| e.to_string())?;
-            let ho = handles.bind(&out_b, 0, out_b.bytes()).map_err(|e| e.to_string())?;
+            let ha = handles
+                .bind(&act_b, 0, act_b.bytes())
+                .map_err(|e| e.to_string())?;
+            let ho = handles
+                .bind(&out_b, 0, out_b.bytes())
+                .map_err(|e| e.to_string())?;
 
             for bank in &grid.banks {
                 if k % bank.group != 0 {
@@ -585,7 +593,12 @@ mod device {
                         let b = kernels_vulkan::Bank {
                             codes: Tensor::new(w.codes[copy], n, k, dtype(bank.bits, bank.group)),
                             scales: Tensor::new(w.scales[copy], n, k / bank.group, Dtype::Bf16),
-                            biases: Some(Tensor::new(w.biases[copy], n, k / bank.group, Dtype::Bf16)),
+                            biases: Some(Tensor::new(
+                                w.biases[copy],
+                                n,
+                                k / bank.group,
+                                Dtype::Bf16,
+                            )),
                             group: bank.group,
                             bits: bank.bits,
                         };
@@ -619,7 +632,10 @@ mod device {
                             continue;
                         }
                         if let Some(why) = wrong(&handles, ho, m, n, k, *bank, &w, &act) {
-                            let first = format!("{m} x {n} x {k}, {}-bit g{}: {why}", bank.bits, bank.group);
+                            let first = format!(
+                                "{m} x {n} x {k}, {}-bit g{}: {why}",
+                                bank.bits, bank.group
+                            );
                             let name = body(q);
                             match out.wrong.iter_mut().find(|(b, ..)| *b == name) {
                                 Some(entry) => entry.1 += 1,
@@ -660,8 +676,7 @@ mod device {
         Ok(out)
     }
 
-    /// Whether the launch just run answered wrongly: a sample of outputs
-    /// against the f64 reference, with the rounding the kernels may add.
+    /// A sample of the last launch's outputs against the f64 reference.
     #[allow(clippy::too_many_arguments)]
     fn wrong(
         handles: &Handles,
@@ -691,7 +706,9 @@ mod device {
                 let have = f64::from(to_f32(raw[at], raw[at + 1]));
                 let allowed = want.abs().max(have.abs()) / 128.0 + mass / 256.0;
                 if (want - have).abs() > allowed {
-                    return Some(format!("row {r} column {col}: want {want:.5}, got {have:.5}"));
+                    return Some(format!(
+                        "row {r} column {col}: want {want:.5}, got {have:.5}"
+                    ));
                 }
             }
         }
@@ -699,8 +716,7 @@ mod device {
     }
 
     /// Seconds per launch for each of `live`, timed round-robin so drift
-    /// lands on every candidate alike, each frame rotating through the
-    /// weight copies.
+    /// lands on every candidate alike.
     fn time(
         device: &Context,
         pipelines: &Pipelines,
@@ -710,8 +726,7 @@ mod device {
     ) -> Result<Vec<f64>, String> {
         const ROUNDS: usize = 7;
         const FRAME_S: f64 = 0.002;
-        /// How much slower than the fastest a candidate may be and still be
-        /// timed to the end.
+        /// A candidate this much slower than the fastest is timed once.
         const SLOWER: f64 = 3.0;
         let frame = |c: usize, batch: usize| -> Result<f64, String> {
             let f = device.frame().map_err(|e| e.to_string())?;
@@ -788,7 +803,11 @@ mod tests {
             shapes: vec![(4096, 4096, 1.0)],
             banks: vec![Bank { bits: 4, group: 64 }],
         };
-        let candidates = vec![Qmm::Tiled { crossover_tg: 160 }, Qmm::Qmv { vecs: 4 }, Qmm::Qmv { vecs: 2 }];
+        let candidates = vec![
+            Qmm::Tiled { crossover_tg: 160 },
+            Qmm::Qmv { vecs: 4 },
+            Qmm::Qmv { vecs: 2 },
+        ];
         let point = |rows, times: Vec<Option<f64>>| Point {
             rows,
             n: 4096,
@@ -823,7 +842,7 @@ mod tests {
             &facts,
             &profile::search::render_overrides(&entries),
             &[],
-            &["vendor", "subgroup", "coopmat"],
+            crate::tune::ASSUME,
         )
         .unwrap();
         assert!(file.contains("vecs = 2"), "{file}");

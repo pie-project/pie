@@ -126,10 +126,8 @@ fn workgroup_of(wgsl: &str, defines: &BTreeMap<String, String>) -> [u32; 3] {
     group
 }
 
-/// Bytes of workgroup memory an expanded shader declares: every
-/// `var<workgroup>`, arrays of scalars, vectors and arrays of them, with
-/// lengths given as literals or as module `const`s. What a device's
-/// `max_compute_workgroup_storage_size` is held against.
+/// Bytes of `var<workgroup>` an expanded shader declares, array lengths
+/// given as literals or module `const`s.
 #[must_use]
 pub fn workgroup_bytes(wgsl: &str) -> u64 {
     let consts: std::collections::BTreeMap<&str, u64> = wgsl
@@ -137,7 +135,11 @@ pub fn workgroup_bytes(wgsl: &str) -> u64 {
         .filter_map(|l| {
             let rest = l.trim().strip_prefix("const ")?;
             let (name, value) = rest.split_once('=')?;
-            let value = value.trim().trim_end_matches(';').trim().trim_end_matches('u');
+            let value = value
+                .trim()
+                .trim_end_matches(';')
+                .trim()
+                .trim_end_matches('u');
             Some((name.trim().split(':').next()?.trim(), value.parse().ok()?))
         })
         .collect();
@@ -148,7 +150,11 @@ pub fn workgroup_bytes(wgsl: &str) -> u64 {
                 return 0;
             };
             let len = len.trim().trim_end_matches('u');
-            let n = len.parse().ok().or_else(|| consts.get(len).copied()).unwrap_or(0);
+            let n = len
+                .parse()
+                .ok()
+                .or_else(|| consts.get(len).copied())
+                .unwrap_or(0);
             return n * size(elem, consts);
         }
         let lanes = if ty.starts_with("vec2") {

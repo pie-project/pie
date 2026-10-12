@@ -1,10 +1,5 @@
-//! The adapter's profile: the wgpu registry, the facts this engine reads off
-//! its adapter, and resolution for one load.
-//!
-//! wgpu is the browser's engine, where the adapter is masked: there are no
-//! checked-in profiles, so a load runs the registry defaults under the facts
-//! the adapter reports, after a user's file where pie runs natively. See
-//! `.wiki/device-profiles.md`.
+//! The wgpu registry and the profile one load resolves. A browser masks the
+//! adapter, so there are no checked-in profiles.
 
 use std::path::Path;
 use std::sync::LazyLock;
@@ -20,24 +15,19 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     r
 });
 
-/// Every decision the wgpu engine exposes.
 #[must_use]
 pub fn registry() -> &'static Registry {
     &REGISTRY
 }
 
-/// Where wgpu's profiles live: a native user's only.
 pub static SHELF: Shelf = Shelf {
     backend: "wgpu",
     seeded: &[],
 };
 
-/// The cores a decode split and the compiler size work by when the adapter
-/// reports no count, as a browser never does: 16, what this engine assumed
-/// for every such adapter before.
+/// The cores an adapter is sized by when it reports no count.
 pub const UNREPORTED_CORES: u32 = 16;
 
-/// What this engine read off an adapter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Device {
     pub name: String,
@@ -45,7 +35,6 @@ pub struct Device {
     /// The narrowest subgroup a dispatch may run at; `None` without the
     /// subgroup feature.
     pub subgroup_min: Option<u32>,
-    /// Multiprocessors or compute units, where the native driver says.
     pub cores: Option<u32>,
     pub f16: bool,
 }
@@ -65,22 +54,14 @@ impl Device {
         facts
     }
 
-    /// The cores a decode split and the compiler size work by.
-    #[must_use]
-    pub fn sizing_cores(&self) -> u32 {
-        self.cores.unwrap_or(UNREPORTED_CORES)
-    }
-
     /// Whether the subgroup kernels, which fold with 32-lane shuffles, are
-    /// safe here: only where no dispatch can run narrower than 32.
+    /// safe: no dispatch may run narrower than 32.
     #[must_use]
     pub fn subgroups_32(&self) -> bool {
         self.subgroup_min.is_some_and(|n| n >= 32)
     }
 }
 
-/// Resolve the profile one load runs under: a native user's file for this
-/// adapter, else the registry defaults under the adapter's facts.
 #[must_use]
 pub fn resolve(device: &Device, profiles: Option<&Path>) -> (Profile, Report) {
     let mut candidates = Vec::new();
@@ -120,18 +101,15 @@ mod tests {
         };
         let (profile, report) = resolve(&d, None);
         assert_eq!(report.used, Source::Derived);
-        let t = kernels_wgpu::Tuning::new(profile, d.sizing_cores(), 0);
+        let t = kernels_wgpu::Tuning::new(profile, UNREPORTED_CORES, 0);
         assert_eq!(
             (
                 t.sdpa_tile_rows_per_request(),
                 t.sdpa_split_groups(),
-                t.sdpa_split_min_keys(),
-                t.cores(),
+                t.sdpa_split_min_keys()
             ),
-            (32, 16, 256, 16)
+            (32, 16, 256)
         );
-        // The tiled kernel from 12 rows over a contraction of whole 32-code
-        // tiles, the vector kernel elsewhere: what min_rows = 12 ran.
         use kernels_wgpu::tuning::Qmm;
         for (rows, k, want) in [
             (1, 4096, Qmm::Qmv),
@@ -140,7 +118,11 @@ mod tests {
             (512, 4096, Qmm::Tiled { crossover_tg: 160 }),
             (512, 4100, Qmm::Qmv),
         ] {
-            assert_eq!(t.qmm(&t.qmm_at(rows, 4096, k, 4, 64))[0], want, "{rows} x {k}");
+            assert_eq!(
+                t.qmm(&t.qmm_at(rows, 4096, k, 4, 64))[0],
+                want,
+                "{rows} x {k}"
+            );
         }
         for (pairs, experts, tile) in [(15, 8, 1), (16, 8, 16), (256, 8, 32), (4096, 64, 32)] {
             assert_eq!(t.moe_tile_rows(pairs, experts), tile);
@@ -156,13 +138,14 @@ mod tests {
             cores: None,
             f16: false,
         };
-        assert!(at(Some(32)).subgroups_32());
-        assert!(at(Some(64)).subgroups_32());
-        assert!(
-            !at(Some(16)).subgroups_32(),
-            "an Intel SIMD16 dispatch would fold wrong"
-        );
-        assert!(!at(Some(8)).subgroups_32());
-        assert!(!at(None).subgroups_32(), "an unreported width is not 32");
+        for (width, safe) in [
+            (Some(32), true),
+            (Some(64), true),
+            (Some(16), false),
+            (Some(8), false),
+            (None, false),
+        ] {
+            assert_eq!(at(width).subgroups_32(), safe, "{width:?}");
+        }
     }
 }

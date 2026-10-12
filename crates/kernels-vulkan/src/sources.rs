@@ -19,7 +19,6 @@ pub fn module_for(entrypoint: &str, lanes: u32) -> Option<&'static [u8]> {
     find(entrypoint)
 }
 
-/// The entrypoint's module for a device that runs 32 lanes or more.
 #[must_use]
 pub fn module(entrypoint: &str) -> Option<&'static [u8]> {
     module_for(entrypoint, 32)

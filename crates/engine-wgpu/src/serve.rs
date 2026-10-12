@@ -249,10 +249,7 @@ struct LandedSeat {
 }
 
 pub struct Shell {
-    /// The adapter profile this load's kernels run under.
     tuning: kernels_wgpu::Tuning,
-    /// How that profile was resolved, for doctor.
-    chip_report: profile::Report,
     device: Context,
 
     pipelines: Pipelines,
@@ -358,21 +355,21 @@ impl Shell {
             None => Context::bind(boot.device)?,
         };
         let measured = device.chip();
-        let (chip, chip_report) = crate::chip::resolve(&measured, boot.device.profiles.as_deref());
-        crate::chip::SHELF.tell_untuned(&measured.name, &chip_report);
-        let tuning =
-            kernels_wgpu::Tuning::new(chip.clone(), device.cores(), device.storage_buffers());
+        let (chip, report) = crate::chip::resolve(&measured, boot.device.profiles.as_deref());
+        crate::chip::SHELF.tell_untuned(&measured.name, &report);
+        let tuning = kernels_wgpu::Tuning::new(chip, device.cores(), device.storage_buffers());
+        let chip = tuning.profile();
         let boot = Boot {
             trace: poem_compiler::fuse::fuse(
                 boot.trace,
-                &poem_compiler::fuse::flags::kernels(&chip),
+                &poem_compiler::fuse::flags::kernels(chip),
             ),
             ..boot
         };
 
         let profile = boot
             .profile
-            .unwrap_or_else(|| DeviceProfile::of(&chip, device.cores(), &[], &[]));
+            .unwrap_or_else(|| DeviceProfile::of(chip, device.cores(), &[], &[]));
 
         let budgets = match boot.patches.clone() {
             None => Budgets::of(boot.budget.clone()),
@@ -476,14 +473,8 @@ impl Shell {
 
         handles.seal();
 
-        let mut scratch = Scratch::reserve(
-            &device,
-            &boot.trace,
-            &compiled,
-            &budgets,
-            least,
-            &tuning,
-        )?;
+        let mut scratch =
+            Scratch::reserve(&device, &boot.trace, &compiled, &budgets, least, &tuning)?;
         let spaces = boot
             .trace
             .caches
@@ -786,14 +777,7 @@ impl Shell {
             > crate::scratch::pool_bytes(&boot.trace, least)
         {
             drop(scratch);
-            scratch = Scratch::reserve(
-                &device,
-                &boot.trace,
-                &compiled,
-                &budgets,
-                paging,
-                &tuning,
-            )?;
+            scratch = Scratch::reserve(&device, &boot.trace, &compiled, &budgets, paging, &tuning)?;
         }
         let pools = Pools::reserve(&device, &boot.trace, paging, &facts)?;
         let rs_buffers = match &rs_layout {
@@ -806,7 +790,6 @@ impl Shell {
 
         Ok(Shell {
             tuning,
-            chip_report,
             device,
             pipelines: Pipelines::new(),
             handles,
@@ -934,18 +917,6 @@ impl Shell {
     #[must_use]
     pub fn device_name(&self) -> &str {
         self.device.name()
-    }
-
-    /// The adapter profile this load's kernels run under.
-    #[must_use]
-    pub fn tuning(&self) -> &kernels_wgpu::Tuning {
-        &self.tuning
-    }
-
-    /// How this load's adapter profile was resolved.
-    #[must_use]
-    pub fn chip_report(&self) -> &profile::Report {
-        &self.chip_report
     }
 
     #[must_use]
