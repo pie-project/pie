@@ -606,7 +606,18 @@ pub fn search(
                 // on both, and how far it moved since its last serving is
                 // the noise a rival must beat.
                 if !fresh[m] {
-                    let again = bench.serve(m, &incumbent_text)?;
+                    // A device that will not serve the incumbent again (a
+                    // lost device, memory taken by an earlier load) leaves
+                    // this decision as it is; the next one tries again.
+                    let again = match bench.serve(m, &incumbent_text) {
+                        Ok(a) => a,
+                        Err(why) => {
+                            let why: String = why.lines().next().unwrap_or("").chars().take(100).collect();
+                            notes.push(format!("today's file did not serve again on {} ({why})", names[m]));
+                            best = None;
+                            break 'candidate;
+                        }
+                    };
                     let last = incumbent[m].as_ref().expect("movable models served");
                     noise[m] = (relative(&again, last) - 1.0).abs();
                     incumbent[m] = Some(again);
