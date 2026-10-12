@@ -25,8 +25,8 @@ pub enum ProfileCmd {
         device: Option<String>,
     },
 
-    /// A profile's file by id (`nvidia-l40s`, `apple-m4-max`): the user's
-    /// if there is one, else the checked-in one. For contributing.
+    /// A profile's file by id (`nvidia-l40s`, `apple-m4-pro`, `apple9`): the
+    /// user's if there is one, else the checked-in one. For contributing.
     Export { id: String, backend: Option<String> },
 }
 
@@ -130,9 +130,7 @@ fn dump(b: &Backend, device: Option<String>) -> Result<Answer> {
     for (source, why) in &report.rejected {
         out.push_str(&format!("# {source} was not used: {why}\n"));
     }
-    for what in &report.defaulted {
-        out.push_str(&format!("# unspecified, using the default: {what}\n"));
-    }
+    out.push_str(&format!("# layers: {}\n", report.describe()));
     out.push_str(&profile::render::dump(&profile));
     Ok(text(out))
 }
@@ -147,7 +145,11 @@ fn export(b: &Backend, id: &str) -> Result<Answer> {
         return Ok(text(found));
     }
     let file = format!("{id}.toml");
-    match b.shelf.seeded.iter().find(|(name, _)| *name == file) {
+    let found =
+        b.shelf.seeded.iter().find(|(name, _)| {
+            *name == file || name.rsplit_once('/').is_some_and(|(_, n)| n == file)
+        });
+    match found {
         Some((_, found)) => Ok(text((*found).to_string())),
         None => bail!(
             "no {} profile `{id}`: neither {} nor a checked-in file",

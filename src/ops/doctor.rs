@@ -542,7 +542,7 @@ fn check_gpus(named_engine: Option<&str>) -> Checks {
 }
 
 /// The profile each backend this build hosts would load under on this
-/// machine: where it came from, what was refused, what took a default.
+/// machine: the layers it came from, and what was refused.
 fn check_profiles() -> Checks {
     let mut checks = Vec::new();
     let dir = crate::paths::pie_home().join("profiles");
@@ -563,7 +563,7 @@ fn check_profiles() -> Checks {
         ));
         checks.push((
             "profile".to_string(),
-            report.used.to_string(),
+            report.describe(),
             if report.untuned() {
                 Status::Warn
             } else {
@@ -574,13 +574,6 @@ fn check_profiles() -> Checks {
             checks.push((
                 "refused".to_string(),
                 format!("{source}: {why}"),
-                Status::Warn,
-            ));
-        }
-        if !report.defaulted.is_empty() {
-            checks.push((
-                "defaulted".to_string(),
-                report.defaulted.join(", "),
                 Status::Warn,
             ));
         }

@@ -1,6 +1,7 @@
 //! Device profiles: the hardware-dependent decisions a backend exposes, read
-//! from a checked-in or user TOML file against a [`Registry`], checked against
-//! the probed facts, and applied whole or not at all.
+//! from layered TOML files (a checked-in family file, a checked-in device
+//! file, the user's file) against a [`Registry`], each layer checked against
+//! the probed facts and applied whole or not at all.
 
 pub mod ladder;
 pub mod profile;
@@ -27,13 +28,15 @@ const TUNABLE: &[&str] = &["metal", "cuda", "vulkan"];
 
 /// What `pie` prints when a device runs without a profile measured on it.
 fn untuned_hint(device: &str, backend: &str, id: &str, report: &Report) -> String {
-    let mut out = if report.used.is_tuned() && report.rejected.is_empty() {
-        format!(
-            "{device}: running {}, whose numbers were carried over, not measured on it.",
-            report.used
-        )
+    let mut out = if !report.measured.is_empty() {
+        format!("{device}: running {}.", report.describe())
+    } else if report.layers.is_empty() {
+        format!("{device}: no profile for it, running the registry defaults.")
     } else {
-        format!("{device}: no tuned profile, running {}.", report.used)
+        format!(
+            "{device}: running {}, none of whose numbers were measured on it.",
+            report.describe()
+        )
     };
     for (source, why) in &report.rejected {
         out.push_str(&format!("\n  {source} was not used: {why}"));

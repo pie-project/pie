@@ -248,6 +248,29 @@ impl Region {
         Region { boxes }.simplified()
     }
 
+    /// The region over the variables in `keep` alone: a point is in it when
+    /// some point of `self` agrees with it there.
+    #[must_use]
+    pub fn project(&self, keep: std::ops::Range<usize>) -> Region {
+        let boxes = self
+            .boxes
+            .iter()
+            .map(|b| b[keep.clone()].to_vec())
+            .collect();
+        Region { boxes }.simplified()
+    }
+
+    /// The region with the variables of `extra` appended, unconstrained.
+    #[must_use]
+    pub fn lifted(&self, extra: &[Set]) -> Region {
+        let boxes = self
+            .boxes
+            .iter()
+            .map(|b| b.iter().chain(extra).cloned().collect())
+            .collect();
+        Region { boxes }
+    }
+
     /// Drop boxes another box already holds.
     fn simplified(mut self) -> Region {
         let mut keep: Vec<Vec<Set>> = Vec::with_capacity(self.boxes.len());

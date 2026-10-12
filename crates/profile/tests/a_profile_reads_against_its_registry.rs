@@ -219,7 +219,7 @@ fn an_unknown_name_is_refused_with_the_vocabulary_and_its_place() {
     ));
     assert!(
         e.contains(
-            "`keys` is not a variable here; declared: rows, k, n, bits, dtype (in `kernel.qmm`)"
+            "`keys` is not a variable here; declared: rows, k, n, bits, dtype, family, ane (in `kernel.qmm`)"
         ),
         "{e}"
     );
@@ -349,30 +349,59 @@ fn a_flag_cannot_read_a_dynamic_variable_and_a_dynamic_variable_is_an_axis() {
 }
 
 #[test]
-fn a_checked_in_file_spells_everything_a_user_file_may_not() {
+fn a_checked_in_file_spells_its_constants_and_may_leave_decisions_out() {
     let short = M4.replace("[compiler]\nlaunch_us = 4\n", "");
+    let file = registry()
+        .parse(&short, "p.toml", Strict::CheckedIn)
+        .expect("a checked-in file may leave a decision to the layer below");
+    assert!(!file.entries.contains_key("compiler.launch_us"));
+    let p = registry().load(&short, "p.toml").unwrap();
+    assert!((p.get::<LaunchUs>().0 - 4.0).abs() < f64::EPSILON);
+
     let bare = with_qmm(
         M4,
         r#"qmm = [{ when = "rows < 5", use = "qmv" }, { use = "qmm_t", bm = 32 }]"#,
     );
-    for (file, refused, defaulted) in [
+    let e = refusal(&bare);
+    assert!(e.contains("`qmv` leaves `rows_max` unspecified"), "{e}");
+    let p = registry()
+        .load_user(&bare, "user.toml")
+        .expect("a user file fills a constant from its default");
+    assert_eq!(
+        *p.pick::<Qmm>(&qmm(1, 4096, 4096)),
+        Qmm::Qmv { rows_max: 2 }
+    );
+}
+
+#[test]
+fn measured_names_decisions_and_nothing_else() {
+    let file = registry()
+        .parse(
+            &M4.replace(
+                "note = \"hand\"",
+                "measured = [\"kernel.qmm\", \"engine.copies\"]",
+            ),
+            "p.toml",
+            Strict::CheckedIn,
+        )
+        .unwrap();
+    assert_eq!(file.measured, ["kernel.qmm", "engine.copies"]);
+    for (bad, why) in [
         (
-            short,
-            "`compiler.launch_us` is unspecified",
-            "compiler.launch_us",
+            "measured = true",
+            "`provenance.measured` is a list of decision ids",
         ),
         (
-            bare,
-            "`qmv` leaves `rows_max` unspecified",
-            "kernel.qmm.qmv.rows_max",
+            "measured = [\"kernel.qmv\"]",
+            "`kernel.qmv` is not a decision of toy",
+        ),
+        (
+            "measured = [\"kernel.qmm\", \"kernel.qmm\"]",
+            "`kernel.qmm` is listed twice",
         ),
     ] {
-        let e = refusal(&file);
-        assert!(e.contains(refused), "{e}");
-        let file = registry()
-            .parse(&file, "user.toml", Strict::User)
-            .expect("a user file fills from defaults");
-        assert_eq!(file.defaulted, [defaulted]);
+        let e = refusal(&M4.replace("note = \"hand\"", bad));
+        assert!(e.contains(why), "{bad}: {e}");
     }
 }
 
@@ -382,40 +411,59 @@ fn facts(family: i64, ane: bool) -> Facts {
         .flag("ane", ane)
 }
 
+fn layer(source: Source, text: &str) -> Candidate {
+    Candidate {
+        source,
+        text: text.to_string(),
+    }
+}
+
 #[test]
-fn resolution_takes_the_first_file_that_holds_and_says_why_others_did_not() {
-    let user = Candidate {
-        source: Source::User("user/m4.toml".into()),
-        text: M4.replace("rows_max = 8", "rows_max = 4"),
-    };
-    let seeded = Candidate {
-        source: Source::Seeded("m4-max.toml".into()),
-        text: M4.to_string(),
-    };
+fn a_higher_layer_replaces_what_it_spells_and_a_refused_one_leaves_the_rest() {
     let r = registry();
+    let seeded = layer(Source::Seeded("m4-max.toml".into()), M4);
+    let user = layer(
+        Source::User("user/m4.toml".into()),
+        "api = 1\n[provenance]\nmeasured = [\"kernel.qmm\"]\n[kernel]\nqmm = [{ when = \"rows < 5\", use = \"qmv\", rows_max = 4 }, { use = \"qmm_t\", bm = 8 }]\n",
+    );
     let decode = qmm(1, 4096, 131_072);
 
-    let (p, report) = r.resolve(&[user.clone(), seeded.clone()], &facts(9, true));
+    let (p, report) = r.resolve(&[seeded.clone(), user.clone()], &facts(9, true));
     assert_eq!(report.used, user.source);
+    assert_eq!(report.layers, [seeded.source.clone(), user.source.clone()]);
+    assert_eq!(report.measured, ["kernel.qmm"]);
     assert!(!report.untuned());
     assert_eq!(*p.pick::<Qmm>(&decode), Qmm::Qmv { rows_max: 4 });
+    assert!(!p.on::<Copies>(&profile::Anywhere), "the seeded layer's");
+    assert_eq!(
+        report.describe(),
+        "user profile user/m4.toml over checked-in profile m4-max.toml"
+    );
 
-    let broken = Candidate {
-        text: user.text.replace("rows_max = 4", "rows_max = 3"),
-        ..user.clone()
-    };
-    let (p, report) = r.resolve(&[broken, seeded.clone()], &facts(9, true));
+    let (p, report) = r.resolve(&[user.clone(), seeded.clone()], &facts(9, true));
+    assert_eq!(
+        *p.pick::<Qmm>(&decode),
+        Qmm::Qmv { rows_max: 8 },
+        "the later layer wins"
+    );
+    assert_eq!(report.measured, Vec::<&str>::new());
+
+    let broken = layer(
+        user.source.clone(),
+        &user.text.replace("rows_max = 4", "rows_max = 3"),
+    );
+    let (p, report) = r.resolve(&[seeded.clone(), broken], &facts(9, true));
     assert_eq!(report.used, seeded.source);
     assert_eq!(report.rejected.len(), 1);
     assert!(report.rejected[0].1.contains("found 3"), "{report:?}");
     assert!(report.untuned(), "a rejected file is worth saying");
     assert_eq!(*p.pick::<Qmm>(&decode), Qmm::Qmv { rows_max: 8 });
 
-    let (p, report) = r.resolve(std::slice::from_ref(&seeded), &facts(9, false));
+    let (p, report) = r.resolve(&[seeded.clone(), user.clone()], &facts(9, false));
     assert_eq!(
-        report.used,
-        Source::Defaults,
-        "the whole file goes, not the one rung"
+        report.layers,
+        std::slice::from_ref(&user.source),
+        "the whole seeded layer goes, not the one rung"
     );
     assert!(
         report.rejected[0]
@@ -423,32 +471,153 @@ fn resolution_takes_the_first_file_that_holds_and_says_why_others_did_not() {
             .contains("it assumes ane = true, and this device has false"),
         "{report:?}"
     );
-    assert_eq!(*p.pick::<Qmm>(&decode), Qmm::Qmv { rows_max: 2 });
-    assert_eq!(*p.pick::<Qmm>(&qmm(9, 4096, 131_072)), Qmm::QmmT { bm: 32 });
+    assert_eq!(*p.pick::<Qmm>(&decode), Qmm::Qmv { rows_max: 4 });
     assert!(
         !p.on::<MlpSwiglu>(&MlpSwigluAt { width: 1 }),
         "a flag defaults off"
     );
-    assert!(p.on::<ResidualAddRmsnorm>(&profile::Anywhere));
+    assert!(p.on::<Copies>(&profile::Anywhere), "the default again");
 
-    let carried = Candidate {
-        text: M4.replace("note = \"hand\"", "measured = false"),
-        ..seeded.clone()
-    };
-    let (_, report) = r.resolve(std::slice::from_ref(&carried), &facts(9, true));
-    assert_eq!(report.used, carried.source);
+    let (_, report) = r.resolve(std::slice::from_ref(&seeded), &facts(9, true));
     assert!(
         report.untuned(),
-        "a file carried over from other numbers is still worth tuning"
+        "a file that measured nothing is still worth tuning"
     );
 
     let unknown = Facts::of(&r).flag("ane", true);
     let (_, report) = r.resolve(&[seeded], &unknown);
+    assert_eq!(report.used, Source::Defaults);
     assert!(
         report.rejected[0]
             .1
             .contains("this device does not report family"),
         "{report:?}"
+    );
+}
+
+#[test]
+fn a_layer_that_measures_a_decision_it_leaves_out_says_the_one_below_held() {
+    let r = registry();
+    let family = layer(Source::Seeded("f.toml".into()), M4);
+    let device = layer(
+        Source::Seeded("f/d.toml".into()),
+        "api = 1\n[provenance]\nmeasured = [\"kernel.qmm\"]\n",
+    );
+    let (_, report) = r.resolve(&[family, device], &facts(9, true));
+    assert_eq!(report.measured, ["kernel.qmm"]);
+}
+
+/// A family file whose Neural Engine share is settled by the `ane` fact,
+/// and whose launch cost reads the family.
+const FAMILY: &str = r#"
+api = 1
+
+[target]
+assumes = { family = 9 }
+
+[kernel]
+matmul = [
+  { when = "ane and rows >= 64", use = "ane_columns", share = 47 },
+  "gpu",
+]
+
+[compiler]
+launch_us = [{ when = "family >= 9", value = 2 }, { value = 3 }]
+"#;
+
+#[test]
+fn a_when_may_read_a_fact_and_the_device_settles_it() {
+    let r = registry();
+    let file = r
+        .parse(FAMILY, "family.toml", Strict::CheckedIn)
+        .expect("`ane_columns` requires `ane`, and its rung holds only where it is");
+    assert_eq!(file.entries["kernel.matmul"].len(), 2);
+    let e = refusal(&FAMILY.replace("ane and rows >= 64", "rows >= 64"));
+    assert!(
+        e.contains("`kernel.matmul` picks `ane_columns`, which requires `ane`; `target.assumes` does not promise it"),
+        "{e}"
+    );
+    let e = refusal(&FAMILY.replace(", { value = 3 }", ""));
+    assert!(
+        e.contains("`compiler.launch_us` picks nothing where `family <= 8`"),
+        "{e}"
+    );
+
+    let wide = MatmulAt { rows: 64, n: 8192 };
+    let family = layer(Source::Seeded("apple9.toml".into()), FAMILY);
+    let (p, report) = r.resolve(std::slice::from_ref(&family), &facts(9, true));
+    assert!(report.rejected.is_empty(), "{report:?}");
+    assert_eq!(*p.pick::<Matmul>(&wide), Matmul::AneColumns { share: 47 });
+    assert_eq!(
+        *p.pick::<Matmul>(&MatmulAt { rows: 63, n: 8192 }),
+        Matmul::Gpu
+    );
+    assert!((p.get::<LaunchUs>().0 - 2.0).abs() < f64::EPSILON);
+    let dumped = profile::render::dump(&p);
+    assert!(
+        dumped.contains(r#"{ when = "rows >= 64", use = "ane_columns", share = 47 }"#),
+        "a settled `when` names no fact:\n{dumped}"
+    );
+    assert!(dumped.contains("launch_us = 2.0"), "{dumped}");
+
+    let (p, report) = r.resolve(std::slice::from_ref(&family), &facts(9, false));
+    assert!(
+        report.rejected.is_empty(),
+        "a device without the ANE takes the file: {report:?}"
+    );
+    assert_eq!(*p.pick::<Matmul>(&wide), Matmul::Gpu);
+
+    let (_, report) = r.resolve(
+        std::slice::from_ref(&family),
+        &Facts::of(&r).int("family", 9),
+    );
+    assert!(
+        report.rejected[0]
+            .1
+            .contains("reads `ane` in `ane and rows >= 64`, and this device does not report ane"),
+        "{report:?}"
+    );
+
+    let (p, _) = r.read(std::slice::from_ref(&family));
+    let dumped = profile::render::dump(&p);
+    assert!(
+        dumped.contains(r#"when = "ane and rows >= 64""#),
+        "without facts the rungs stay as written:\n{dumped}"
+    );
+}
+
+#[test]
+fn a_default_reads_no_fact_and_no_variable_shares_a_facts_name() {
+    #[derive(Clone, Debug, Decision)]
+    #[decision(id = "kernel.odd", default = r#"[{ when = "ane", use = "a" }, "b"]"#)]
+    enum Odd {
+        A,
+        B,
+    }
+    #[derive(Clone, Debug, Decision)]
+    #[decision(id = "kernel.clash", shape(family), default = "a")]
+    enum Clash {
+        A,
+        B,
+    }
+    let refused = |add: &dyn Fn(&mut Registry)| {
+        let mut r = registry();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| add(&mut r)))
+            .expect_err("refused")
+            .downcast::<String>()
+            .map(|s| *s)
+            .unwrap_or_default()
+    };
+    let why = refused(&|r| {
+        r.add::<Odd>();
+    });
+    assert!(why.contains("a default must run anywhere"), "{why}");
+    let why = refused(&|r| {
+        r.add::<Clash>();
+    });
+    assert!(
+        why.contains("variable `family` is named as a fact"),
+        "{why}"
     );
 }
 
@@ -509,5 +678,186 @@ fn the_census_is_what_a_profile_can_compile() {
             "layout.weights:plain[]",
         ],
         "a launch constant (share) is not compiled"
+    );
+}
+
+const APPLE9: &str = r#"
+api = 1
+[target]
+assumes = { family = 9 }
+[kernel]
+qmm = [{ when = "rows < 5", use = "qmv", rows_max = 4 }, { use = "qmm_t", bm = 16 }]
+[engine]
+copies = false
+"#;
+
+const M4_MAX: &str = r#"
+api = 1
+[target]
+device = "Apple M4 Max"
+assumes = { ane = true }
+[provenance]
+measured = ["kernel.matmul"]
+[kernel]
+matmul = { use = "ane_columns", share = 60 }
+"#;
+
+const APPLE10: &str = "api = 1\n[target]\nassumes = { family = 10 }\n";
+
+static SHELF: profile::Shelf = profile::Shelf {
+    backend: "toy",
+    seeded: &[
+        ("apple9.toml", APPLE9),
+        ("apple9/apple-m4-max.toml", M4_MAX),
+        ("apple10.toml", APPLE10),
+    ],
+    derived: Some(|name, _| {
+        format!("api = 1\n[target]\ndevice = \"{name}\"\n[engine]\nprefill.chunk = 128\n")
+    }),
+};
+
+#[test]
+fn a_device_runs_its_family_then_its_device_file_then_its_user_file() {
+    let r = registry();
+    let wide = MatmulAt { rows: 64, n: 8192 };
+    let decode = qmm(1, 4096, 4096);
+
+    let (p, report) = SHELF.resolve(&r, "Apple M4 Max", &facts(9, true), None);
+    assert_eq!(
+        report.layers,
+        [
+            Source::Seeded("apple9.toml".into()),
+            Source::Seeded("apple9/apple-m4-max.toml".into())
+        ]
+    );
+    assert_eq!(report.measured, ["kernel.matmul"]);
+    assert_eq!(*p.pick::<Matmul>(&wide), Matmul::AneColumns { share: 60 });
+    assert_eq!(
+        *p.pick::<Qmm>(&decode),
+        Qmm::Qmv { rows_max: 4 },
+        "the family's"
+    );
+    assert_eq!(p.get::<PrefillChunk>().0, 4096, "the registry's");
+
+    let (p, report) = SHELF.resolve(&r, "Apple A17 Pro GPU", &facts(9, true), None);
+    assert_eq!(report.layers, [Source::Seeded("apple9.toml".into())]);
+    assert!(report.untuned());
+    assert_eq!(*p.pick::<Qmm>(&decode), Qmm::Qmv { rows_max: 4 });
+    assert_eq!(*p.pick::<Matmul>(&wide), Matmul::Gpu);
+
+    let dir = std::env::temp_dir().join(format!("pie-shelf-{}", std::process::id()));
+    let path = SHELF.user_path(&dir, "Apple M4 Max");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "api = 1\n[engine]\nprefill.chunk = 1024\n").unwrap();
+    let (p, report) = SHELF.resolve(&r, "Apple M4 Max", &facts(9, true), Some(&dir));
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(report.layers.len(), 3, "{report:?}");
+    assert!(matches!(report.used, Source::User(_)));
+    assert_eq!(p.get::<PrefillChunk>().0, 1024);
+    assert_eq!(*p.pick::<Matmul>(&wide), Matmul::AneColumns { share: 60 });
+    assert!(!p.on::<Copies>(&profile::Anywhere));
+
+    let (p, report) = SHELF.resolve(&r, "Apple M5", &facts(10, true), None);
+    assert_eq!(report.layers, [Source::Seeded("apple10.toml".into())]);
+    assert_eq!(*p.pick::<Qmm>(&decode), Qmm::Qmv { rows_max: 2 });
+
+    let (p, report) = SHELF.resolve(&r, "Apple M9", &facts(11, true), None);
+    assert_eq!(report.layers, [Source::Derived], "no family applies");
+    assert_eq!(p.get::<PrefillChunk>().0, 128);
+
+    let (p, report) = SHELF.read(&r, "Apple M4 Max", None);
+    assert_eq!(report.layers.len(), 2, "by name, without facts");
+    assert_eq!(*p.pick::<Matmul>(&wide), Matmul::AneColumns { share: 60 });
+}
+
+#[test]
+fn a_refused_device_file_leaves_its_family() {
+    let r = registry();
+    let (p, report) = SHELF.resolve(&r, "Apple M4 Max", &facts(9, false), None);
+    assert_eq!(report.used, Source::Seeded("apple9.toml".into()));
+    assert_eq!(report.rejected.len(), 1);
+    assert_eq!(
+        report.rejected[0].0,
+        Source::Seeded("apple9/apple-m4-max.toml".into())
+    );
+    assert!(
+        report.rejected[0]
+            .1
+            .contains("it assumes ane = true, and this device has false"),
+        "{report:?}"
+    );
+    assert!(report.untuned());
+    assert_eq!(
+        *p.pick::<Qmm>(&qmm(1, 4096, 4096)),
+        Qmm::Qmv { rows_max: 4 }
+    );
+    assert_eq!(
+        *p.pick::<Matmul>(&MatmulAt { rows: 64, n: 8192 }),
+        Matmul::Gpu
+    );
+}
+
+#[test]
+fn the_shelf_check_keeps_one_family_and_one_device_file_per_device() {
+    fn check(seeded: &'static [(&'static str, &'static str)]) -> Result<(), String> {
+        let dir = std::env::temp_dir().join(format!(
+            "pie-shelf-check-{}-{}",
+            std::process::id(),
+            seeded.len()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (path, text) in seeded {
+            let at = dir.join(path);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::fs::write(at, text).unwrap();
+        }
+        let shelf = profile::Shelf {
+            backend: "toy",
+            seeded,
+            derived: None,
+        };
+        let got = shelf.check(&registry(), &dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        got
+    }
+    check(SHELF.seeded).unwrap();
+    let e = check(&[
+        ("apple9.toml", APPLE9),
+        ("ane.toml", "api = 1\n[target]\nassumes = { ane = true }\n"),
+    ])
+    .unwrap_err();
+    assert!(
+        e.contains("apple9.toml and ane.toml can both apply to one device"),
+        "{e}"
+    );
+    let e = check(&[
+        ("apple9.toml", APPLE9),
+        ("apple9/apple-m4-max.toml", M4_MAX),
+        (
+            "apple9/any.toml",
+            "api = 1\n[target]\nassumes = { ane = true }\n",
+        ),
+    ])
+    .unwrap_err();
+    assert!(e.contains("can both apply to one device"), "{e}");
+    let e = check(&[("apple9.toml", APPLE9), ("apple9/m4.toml", M4_MAX)]).unwrap_err();
+    assert!(
+        e.contains("names `Apple M4 Max`, filed as apple9/apple-m4-max.toml"),
+        "{e}"
+    );
+    let e = check(&[(
+        "apple9.toml",
+        "api = 1\n[target]\ndevice = \"x\"\nassumes = { family = 9 }\n",
+    )])
+    .unwrap_err();
+    assert!(e.contains("is a family file, and names a device"), "{e}");
+    let e = check(&[
+        ("apple9.toml", APPLE9),
+        ("apple8/apple-m4-max.toml", M4_MAX),
+    ])
+    .unwrap_err();
+    assert!(
+        e.contains("is not in the directory of a family file"),
+        "{e}"
     );
 }

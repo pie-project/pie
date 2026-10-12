@@ -224,9 +224,10 @@ pub fn knobs(base: &Profile, skip: &[&str], refusable: &str) -> Vec<Knob> {
 
 /// The complete profile `pie tune` writes: `base` with the tuned
 /// decisions replaced, its target `device`, and a provenance that says how
-/// it was made. Where `base` assumes nothing, the file assumes the `assume`
-/// facts this device has. Read back strictly and resolved against `facts`
-/// before it is returned, so a file that would be refused is never written.
+/// it was made. The file assumes what `base` does, and each `assume` fact
+/// this device has that `base` leaves open. Read back strictly and resolved
+/// against `facts` before it is returned, so a file that would be refused is
+/// never written.
 pub fn assemble(
     registry: &crate::Registry,
     base: &Profile,
@@ -239,14 +240,14 @@ pub fn assemble(
     use crate::{Source, Strict};
     let mut target = base.target().clone();
     target.device = Some(device.to_string());
-    if target.assumes.is_empty() {
-        for name in assume {
-            let Some(i) = registry.facts.iter().position(|v| v.name == *name) else {
-                continue;
-            };
-            if let Some(v) = facts.get(name) {
-                target.assumes.push((i, v));
-            }
+    for name in assume {
+        let Some(i) = registry.facts.iter().position(|v| v.name == *name) else {
+            continue;
+        };
+        if let Some(v) = facts.get(name)
+            && !target.assumes.iter().any(|&(j, _)| j == i)
+        {
+            target.assumes.push((i, v));
         }
     }
     let path = format!("tuned {device}");

@@ -47,9 +47,10 @@ pub struct Registry {
 /// How strictly a file is read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Strict {
-    /// A checked-in profile: every decision and constant spelled out.
+    /// A checked-in profile: every alternative it picks has each constant
+    /// spelled out.
     CheckedIn,
-    /// A user or autotune profile: what is missing takes its default.
+    /// A user or autotune profile: a constant it leaves out takes its default.
     User,
 }
 
@@ -89,9 +90,7 @@ pub struct Target {
     pub device: Option<String>,
     /// The CUDA tier, `sm_89`.
     pub tier: Option<String>,
-    /// A Vulkan named profile's vendor.
-    pub vendor: Option<String>,
-    /// A Vulkan named profile's device-name substrings.
+    /// Device-name substrings a device file applies to, instead of `device`.
     pub name_contains: Vec<String>,
     /// Facts the file was tuned under, as (fact index, coordinate).
     pub assumes: Vec<(usize, i64)>,
@@ -104,22 +103,12 @@ pub struct File {
     pub target: Target,
     /// `[provenance]`, kept as written and never read by resolution.
     pub provenance: Vec<(String, String)>,
+    /// `[provenance] measured`: the decisions measured on the devices this
+    /// file targets. One it lists without spelling was measured, and the
+    /// layer below it held. Only reporting reads it.
+    pub measured: Vec<&'static str>,
     /// Decisions the file spells, by id.
     pub entries: BTreeMap<&'static str, Vec<Rung>>,
-    /// What the file left out and took from the registry (user files only).
-    pub defaulted: Vec<String>,
-}
-
-impl File {
-    /// False where `[provenance] measured = false` marks numbers carried over
-    /// from another device. Only reporting reads it.
-    #[must_use]
-    pub fn measured(&self) -> bool {
-        !self
-            .provenance
-            .iter()
-            .any(|(key, value)| key == "measured" && value.trim() == "false")
-    }
 }
 
 impl Registry {
@@ -208,6 +197,12 @@ impl Registry {
             if spec.vars[..i].iter().any(|v| v.name == var.name) {
                 return Err(format!("variable `{}` is declared twice", var.name));
             }
+            if self.facts.iter().any(|f| f.name == var.name) {
+                return Err(format!(
+                    "variable `{}` is named as a fact of {}, which `when` may also read",
+                    var.name, self.backend
+                ));
+            }
             if var.dynamic && !var.derived && !self.axes.contains(&var.name) {
                 return Err(format!(
                     "`{}` is dynamic but not a recording axis of {} ({}); a dynamic variable \
@@ -266,6 +261,9 @@ impl Registry {
             return Err(d.message.clone());
         }
         for rung in &rungs {
+            if rung.when.as_ref().is_some_and(|w| reads_facts(spec, w)) {
+                return Err("its `when` reads a fact; a default must run anywhere".to_string());
+            }
             if let Pick::Alternative { index, .. } = rung.pick {
                 let alt = &spec.alternatives()[index];
                 if !alt.requires.is_empty() {
@@ -311,21 +309,25 @@ impl Registry {
 
     /// Read `text` as a profile. `origin` names it in diagnostics.
     pub fn parse(&self, text: &str, origin: &str, strict: Strict) -> Result<File, Refusal> {
-        self.parse_over(text, origin, strict, None)
+        self.parse_over(text, origin, strict, &BTreeMap::new(), &[])
     }
 
-    /// [`Registry::parse`] for a file laid over `under`: a decision the file
-    /// leaves out is `under`'s, not the registry default, when a rule such
-    /// as `consistent_with` looks at it.
+    /// [`Registry::parse`] for a file laid over a lower layer: a decision the
+    /// file leaves out is `under`'s where it has one, else the registry
+    /// default, when a rule such as `consistent_with` looks at it; what an
+    /// alternative requires may be promised by `inherited` assumptions as
+    /// well as the file's own.
     pub(crate) fn parse_over(
         &self,
         text: &str,
         origin: &str,
         strict: Strict,
-        under: Option<&BTreeMap<&'static str, Vec<Rung>>>,
+        under: &BTreeMap<&'static str, Vec<Rung>>,
+        inherited: &[(usize, i64)],
     ) -> Result<File, Refusal> {
         let mut walk = Walk::new(self, text, strict);
         walk.under = under;
+        walk.inherited = inherited;
         let refuse = |diagnostics| Refusal {
             origin: origin.to_string(),
             diagnostics,
@@ -360,6 +362,9 @@ impl Registry {
                 "provenance" => match value.get_ref() {
                     DeValue::Table(t) => {
                         for (k, v) in t.iter() {
+                            if k.get_ref() == "measured" {
+                                file.measured = walk.measured(v);
+                            }
                             let raw = &text[v.span()];
                             file.provenance
                                 .push((k.get_ref().to_string(), raw.to_string()));
@@ -374,12 +379,26 @@ impl Registry {
             walk.err(0, format!("a profile starts with `api = {API}`"));
         }
         walk.file_lints(&file);
-        file.defaulted = std::mem::take(&mut walk.defaulted);
         if walk.diags.is_empty() {
             Ok(file)
         } else {
             Err(refuse(walk.diags))
         }
+    }
+}
+
+impl Registry {
+    /// The `[target]` of `text` alone, or `None` where it does not read:
+    /// what picks the layers a device takes, before they are read whole.
+    pub(crate) fn target_of(&self, text: &str) -> Option<Target> {
+        let table = DeTable::parse(text).ok()?;
+        let (_, value) = table
+            .get_ref()
+            .iter()
+            .find(|(k, _)| k.get_ref() == "target")?;
+        let mut walk = Walk::new(self, text, Strict::User);
+        let target = walk.target(value);
+        walk.diags.is_empty().then_some(target)
     }
 }
 
@@ -493,29 +512,74 @@ fn names(list: impl IntoIterator<Item = &'static str>) -> String {
     }
 }
 
+/// Whether `when` names a fact rather than only the decision's variables.
+pub(crate) fn reads_facts(spec: &Spec, when: &When) -> bool {
+    when.names
+        .iter()
+        .any(|n| !spec.vars.iter().any(|v| v.name == *n))
+}
+
+/// A decision's variables, then the backend's facts: what a `when` reads.
+pub(crate) fn when_vars(spec: &Spec, facts: &[Var]) -> Vec<Var> {
+    spec.vars.iter().chain(facts).copied().collect()
+}
+
 struct Walk<'a> {
     reg: &'a Registry,
     text: &'a str,
     strict: Strict,
     diags: Vec<Diagnostic>,
-    defaulted: Vec<String>,
     /// Where each entry was spelled, for lints that point at it.
     spans: BTreeMap<&'static str, usize>,
     /// What a decision the file leaves out holds, when not the default.
-    under: Option<&'a BTreeMap<&'static str, Vec<Rung>>>,
+    under: &'a BTreeMap<&'static str, Vec<Rung>>,
+    /// Facts the layers below assume, which the file may rely on.
+    inherited: &'a [(usize, i64)],
 }
 
 impl<'a> Walk<'a> {
     fn new(reg: &'a Registry, text: &'a str, strict: Strict) -> Walk<'a> {
+        static NONE: BTreeMap<&'static str, Vec<Rung>> = BTreeMap::new();
         Walk {
             reg,
             text,
             strict,
             diags: Vec::new(),
-            defaulted: Vec::new(),
             spans: BTreeMap::new(),
-            under: None,
+            under: &NONE,
+            inherited: &[],
         }
+    }
+
+    fn measured(&mut self, v: &Spanned<DeValue<'_>>) -> Vec<&'static str> {
+        let DeValue::Array(items) = v.get_ref() else {
+            self.err(
+                v.span().start,
+                "`provenance.measured` is a list of decision ids",
+            );
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for item in items.iter() {
+            let Some(id) = item.get_ref().as_str() else {
+                self.err(
+                    item.span().start,
+                    "`provenance.measured` is a list of decision ids",
+                );
+                continue;
+            };
+            match self.reg.decisions.get_key_value(id) {
+                Some((id, _)) if out.contains(id) => {
+                    self.err(item.span().start, format!("`{id}` is listed twice"));
+                }
+                Some((id, _)) => out.push(*id),
+                None => self.err(
+                    item.span().start,
+                    format!("`{id}` is not a decision of {}", self.reg.backend),
+                ),
+            }
+        }
+        out
     }
 
     fn err(&mut self, at: usize, message: impl Into<String>) {
@@ -680,7 +744,7 @@ impl<'a> Walk<'a> {
             );
             return None;
         };
-        match When::compile(text, spec.vars) {
+        match When::compile(text, &when_vars(spec, self.reg.facts)) {
             Ok(w) => Some(w),
             Err(e) => {
                 self.err(
@@ -695,7 +759,7 @@ impl<'a> Walk<'a> {
     fn when_rung(&mut self, spec: &Spec, v: &Spanned<DeValue<'_>>, pick: Pick) -> Option<Rung> {
         let when = self.compile_when(spec, v)?;
         Some(Rung {
-            region: when.region.clone(),
+            region: when.region.project(0..spec.vars.len()),
             when: Some(when),
             pick,
         })
@@ -864,11 +928,8 @@ impl<'a> Walk<'a> {
                     match v {
                         Some(v) => filled.push(v),
                         None => {
-                            let missing = format!("{}.{}.{}", spec.id, name, c.name);
                             if self.strict == Strict::CheckedIn {
                                 self.err(name_at, format!("`{name}` leaves `{}` unspecified; a checked-in profile spells every constant", c.name));
-                            } else {
-                                self.defaulted.push(missing);
                             }
                             filled.push(constant_default(c));
                         }
@@ -931,7 +992,6 @@ impl<'a> Walk<'a> {
                     };
                     for (mk, mv) in m.iter() {
                         match mk.get_ref().as_ref() {
-                            "vendor" => target.vendor = text(self, mv, "match.vendor"),
                             "name_contains" => match mv.get_ref() {
                                 DeValue::Array(items) => {
                                     for i in items.iter() {
@@ -940,9 +1000,15 @@ impl<'a> Walk<'a> {
                                         }
                                     }
                                 }
-                                _ => self.err(mv.span().start, "`target.match.name_contains` is a list of strings"),
+                                _ => self.err(
+                                    mv.span().start,
+                                    "`target.match.name_contains` is a list of strings",
+                                ),
                             },
-                            other => self.err(mk.span().start, format!("`target.match` holds `vendor` and `name_contains`, not `{other}`")),
+                            other => self.err(
+                                mk.span().start,
+                                format!("`target.match` holds `name_contains`, not `{other}`"),
+                            ),
                         }
                     }
                 }
@@ -994,9 +1060,9 @@ impl<'a> Walk<'a> {
         target
     }
 
-    /// Lints on one decision's rungs: total, every rung reachable.
+    /// Lints on one decision's rungs: total, every rung reachable, over the
+    /// decision's variables and the facts its `when`s may read.
     fn ladder_lints(&mut self, spec: &Spec, rungs: &[Rung], at: usize) {
-        let space = space(spec.vars);
         if let Shape::Flag = spec.shape {
             for rung in rungs {
                 if let Some(w) = &rung.when
@@ -1016,26 +1082,29 @@ impl<'a> Walk<'a> {
             }
             return;
         }
+        let vars = when_vars(spec, self.reg.facts);
+        let space = space(&vars);
         let alts = spec.alternatives();
         let partial =
             |r: &Rung| matches!(r.pick, Pick::Alternative { index, .. } if alts[index].partial);
         let mut covered = Region::nothing();
         for (i, rung) in rungs.iter().enumerate() {
-            if rung.region.is_empty() {
+            let region = held(rung, spec.vars.len(), &space);
+            if region.is_empty() {
                 self.err(
                     at,
                     format!("rung {} of `{}` holds no shape", i + 1, spec.id),
                 );
                 continue;
             }
-            if rung.region.is_subset(&covered, &space) {
+            if region.is_subset(&covered, &space) {
                 self.err(
                     at,
                     format!("rung {} of `{}` is unreachable: the rungs above it hold every shape it does", i + 1, spec.id),
                 );
             }
             if !partial(rung) {
-                covered = covered.union(&rung.region);
+                covered = covered.union(&region);
             }
         }
         if rungs.is_empty() {
@@ -1043,7 +1112,7 @@ impl<'a> Walk<'a> {
         }
         let gap = Region::full(&space).minus(&covered, &space);
         if !gap.is_empty() {
-            let shown = crate::when::render(&gap, spec.vars).unwrap_or_default();
+            let shown = crate::when::render(&gap, &vars).unwrap_or_default();
             let tail = if rungs.last().is_some_and(partial) {
                 ", and it ends on an alternative that fits only some shapes"
             } else {
@@ -1056,33 +1125,35 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// Lints across a whole file: requires against assumes, consistency
-    /// between decisions, and (checked in) completeness.
+    /// Lints across a whole file: requires against assumes (the file's and
+    /// those it inherits, narrowed by any fact a rung's `when` reads), and
+    /// consistency between decisions.
     fn file_lints(&mut self, file: &File) {
         let facts = self.reg.facts;
         let fact_space = space(facts);
         let mut assumed = fact_space.clone();
-        for &(i, c) in &file.target.assumes {
-            assumed[i] = crate::region::Set::point(c);
+        for &(i, c) in self.inherited.iter().chain(&file.target.assumes) {
+            assumed[i] = assumed[i].intersect(&crate::region::Set::point(c));
         }
         let assumed = Region::full(&assumed);
-        let picks: Vec<(&'static str, &'static Alternative)> = file
-            .entries
-            .iter()
-            .flat_map(|(id, rungs)| {
-                let spec = self.reg.spec(id).expect("entries are registered");
-                rungs.iter().filter_map(move |r| match r.pick {
-                    Pick::Alternative { index, .. } => Some((*id, &spec.alternatives()[index])),
-                    _ => None,
-                })
-            })
-            .collect();
-        for (id, alt) in picks {
+        let mut picks: Vec<(&'static str, &'static Alternative, Region)> = Vec::new();
+        for (id, rungs) in &file.entries {
+            let spec = self.reg.spec(id).expect("entries are registered");
+            let n = spec.vars.len();
+            let space = space(&when_vars(spec, facts));
+            for rung in rungs {
+                if let Pick::Alternative { index, .. } = rung.pick {
+                    let on = held(rung, n, &space).project(n..n + facts.len());
+                    picks.push((*id, &spec.alternatives()[index], on));
+                }
+            }
+        }
+        for (id, alt, on) in picks {
             let alt_name = alt.name;
             let at = self.spans.get(id).copied().unwrap_or(0);
             if !alt.requires.is_empty() {
                 let req = When::compile(alt.requires, facts).expect("checked at registration");
-                if !assumed.is_subset(&req.region, &fact_space) {
+                if !assumed.intersect(&on).is_subset(&req.region, &fact_space) {
                     self.err(
                         at,
                         format!(
@@ -1099,7 +1170,7 @@ impl<'a> Walk<'a> {
                 let other_has = match file
                     .entries
                     .get(other_id)
-                    .or_else(|| self.under.and_then(|u| u.get(other_id)))
+                    .or_else(|| self.under.get(other_id))
                 {
                     Some(rungs) => {
                         let other = self.reg.spec(other_id);
@@ -1120,20 +1191,15 @@ impl<'a> Walk<'a> {
                 }
             }
         }
-        for id in self.reg.decisions.keys() {
-            if !file.entries.contains_key(id) {
-                if self.strict == Strict::CheckedIn {
-                    self.err(
-                        self.text.len(),
-                        format!(
-                            "`{id}` is unspecified; a checked-in profile spells every decision"
-                        ),
-                    );
-                } else {
-                    self.defaulted.push((*id).to_string());
-                }
-            }
-        }
+    }
+}
+
+/// Where `rung` holds over a decision's `n` variables and then the facts
+/// (`space` spans both).
+pub(crate) fn held(rung: &Rung, n: usize, space: &[crate::region::Set]) -> Region {
+    match &rung.when {
+        Some(w) => w.region.clone(),
+        None => rung.region.lifted(&space[n..]),
     }
 }
 
