@@ -25,6 +25,7 @@ DEPLOYMENTS = [
     deployment("qwen38-flash-next", weights = MIXED, kv = dtype.bf16, drafter = "mtp"),
     deployment("qwen38-flash-next", weights = MIXED, kv = dtype.bf16),
     deployment("qwen38-flash-next-mini", weights = MIXED, kv = dtype.bf16),
+    deployment("qwen38-flash-next-mini", weights = dtype.bf16, kv = dtype.bf16),
     deployment("qwen38-flash-next", weights = dtype.bf16, kv = dtype.bf16),
     deployment("qwen38-flash-next", weights = MIXED, kv = dtype.bf16, parts = ["vision"], drafter = "mtp"),
     deployment("qwen38-flash-next", weights = MIXED, kv = dtype.bf16, parts = ["vision"]),

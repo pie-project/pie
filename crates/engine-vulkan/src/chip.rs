@@ -53,6 +53,10 @@ pub const SEEDED: &[(&str, &str)] = &[
         "qualcomm-adreno.toml",
         include_str!("../profiles/qualcomm-adreno.toml"),
     ),
+    (
+        "imagination-powervr-128.toml",
+        include_str!("../profiles/imagination-powervr-128.toml"),
+    ),
 ];
 
 /// Where Vulkan's profiles live.
@@ -266,11 +270,12 @@ mod tests {
     }
 
     #[test]
-    fn an_adreno_runs_its_checked_in_file() {
+    fn a_vendor_runs_its_checked_in_file() {
         for (d, file) in [
             (device("qualcomm", 64, None, false), "qualcomm-adreno-64.toml"),
             (device("qualcomm", 128, Some(6), false), "qualcomm-adreno-128.toml"),
             (device("qualcomm", 16, None, false), "qualcomm-adreno.toml"),
+            (device("imagination", 128, None, false), "imagination-powervr-128.toml"),
         ] {
             let (_, report) = resolve(&d, None);
             assert_eq!(report.used, Source::Seeded(file.to_string()), "{d:?}: {report:?}");
@@ -285,6 +290,7 @@ mod tests {
     fn old_qmm(d: &Device, rows: u32, n: u32, k: u32) -> kernels_vulkan::tuning::Qmm {
         use kernels_vulkan::tuning::Qmm;
         let qualcomm = d.vendor == "qualcomm";
+        let powervr = d.vendor == "imagination";
         let tiles = rows >= 12 && k % 32 == 0;
         if d.coopmat && tiles {
             Qmm::Coopmat
@@ -293,7 +299,9 @@ mod tests {
         } else if tiles && n % 16 == 0 {
             Qmm::Tiled { crossover_tg: 160 }
         } else if rows == 1 && qualcomm && d.subgroup >= 32 && (k * 4) % 128 == 0 && k % 8 == 0 {
-            Qmm::OneRow
+            Qmm::OneRow { lanes: 32, rows: 1 }
+        } else if rows == 1 && powervr && d.subgroup == 128 && (k * 4) % 128 == 0 && k % 8 == 0 {
+            Qmm::OneRow { lanes: 8, rows: 2 }
         } else {
             Qmm::Qmv { vecs: 4 }
         }
@@ -312,6 +320,8 @@ mod tests {
             device("qualcomm", 64, None, false),
             device("qualcomm", 128, Some(6), false),
             device("qualcomm", 16, None, false),
+            device("imagination", 128, None, false),
+            device("imagination", 16, None, false),
             device("other", 32, None, false),
         ] {
             let (profile, report) = resolve(&d, None);
@@ -385,10 +395,10 @@ mod tests {
             report.rejected
         );
         let t = kernels_vulkan::Tuning::new(profile, kernels_vulkan::tuning::Limits::ASSUMED);
-        assert_ne!(
+        assert!(!matches!(
             t.qmm(&t.qmm_at(1, 4096, 4096, 4, 64))[0],
-            kernels_vulkan::tuning::Qmm::OneRow
-        );
+            kernels_vulkan::tuning::Qmm::OneRow { .. }
+        ));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

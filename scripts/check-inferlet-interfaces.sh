@@ -22,7 +22,7 @@
 # until the hand-written layer actually binds the forward-pass interfaces.
 # Both libraries bind them through their `eta` module (the tracing eDSL + container
 # encoder ported from `eta-dsl`/`eta-ir`, pinned byte-for-byte to the Rust
-# encoder by `crates/eta-dsl/tests/inferlet_goldens.rs`), so this gate is green.
+# encoder by `crates/eta-dsl/tests/eta_dsl/inferlet_goldens.rs`), so this gate is green.
 #
 # Neither check needs componentize-py, jco, or a toolchain -- just the names.
 # A full build is the real gate; this is the cheap one that would have caught

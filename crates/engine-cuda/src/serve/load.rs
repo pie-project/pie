@@ -465,7 +465,7 @@ impl Shell {
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB before weights",
-                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+                crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
         let mut weights = Weights::resident(
@@ -485,7 +485,7 @@ impl Shell {
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB after weights resident",
-                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+                crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
         let (compiled, budgets, tiles) = refit(
@@ -596,13 +596,13 @@ impl Shell {
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB after rotate",
-                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+                crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB after weights",
-                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+                crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
         let pools = Pools::reserve(
@@ -615,7 +615,7 @@ impl Shell {
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB after pools",
-                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+                crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
         let buffers = Buffers::reserve(&boot.trace, paging, &pools)?;
@@ -701,7 +701,7 @@ impl Shell {
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB after buffers",
-                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+                crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
         let inputs = Inputs::reserve(
@@ -743,7 +743,7 @@ impl Shell {
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB after inputs",
-                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+                crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
         let readout_rows = crate::device::Buffer::zeroed(
@@ -975,7 +975,7 @@ impl Shell {
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB before arming",
-                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+                crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
         shell.arm_bodies()?;

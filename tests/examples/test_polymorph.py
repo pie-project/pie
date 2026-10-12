@@ -242,7 +242,7 @@ async def test_churn_two_waves(client, args):
 
 
 # The masked family needs a model text that DECLARES `attention.masked` —
-# only gemma4 does (crates/engine-cuda/tests/masked_axis.rs pins this). On a
+# only gemma4 does (crates/engine-cuda/tests/engine_cuda/masked_axis.rs pins this). On a
 # qwen load these lanes are refused as `Fault::Maskless`, correctly: the qwen
 # text bakes no masked arm, so there is nowhere for the bits to go. Run this
 # file twice: once with the default qwen model (the fleets above), once with

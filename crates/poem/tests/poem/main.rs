@@ -1,0 +1,16 @@
+//! poem's integration tests, one binary: each module was a test file.
+
+mod a_bidirectional_encoder_adds_a_relative_bias_per_layer;
+mod a_conv_decoder_traces_on_the_voxel_axis;
+mod a_custom_branch_reads_no_buffer_its_builtin_does_not_vouch_for;
+mod a_forward_may_return_its_velocity_instead_of_logits;
+mod a_gather_lands_on_its_ids_axis;
+mod a_joint_attention_over_merged_streams_splits_back_onto_its_arms;
+mod a_modulate_over_lanes_broadcasts_by_request_of_token;
+mod a_package_names_its_deployments_and_travels_whole;
+mod a_package_runs_each_file_in_its_own_stage;
+mod a_ragged_attention_joins_two_arms;
+mod a_row_permutation_keeps_the_row_space;
+mod an_in_place_fold_is_the_last_read_of_its_operand;
+mod every_row_permutation_runs_in_every_class_its_guard_admits;
+mod the_axis_rope_states_its_axes_once;

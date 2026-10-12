@@ -1634,52 +1634,6 @@ fn readout_extent(rows: u32, bucket: u32, readouts: usize) -> u64 {
     u64::from(pad.extent(u32::try_from(readouts).unwrap_or(u32::MAX)))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{FoldLen, readout_extent, resolve_fold_len};
-
-    const PORT: eta_ir::registry::Port = eta_ir::registry::Port::RsFoldLen;
-
-    #[test]
-    fn prepare_every_case() {
-        a_device_fold_length_is_clamped_to_the_bound_it_was_promised();
-        a_fold_length_that_resolves_to_zero_is_refused_by_name();
-        a_readout_as_tall_as_the_fire_holds_the_bucket();
-    }
-
-    fn a_readout_as_tall_as_the_fire_holds_the_bucket() {
-        assert_eq!(readout_extent(133, 256, 133), 256);
-        assert_eq!(readout_extent(133, 256, 5), 5);
-        assert_eq!(readout_extent(133, 133, 133), 133);
-    }
-
-    fn a_device_fold_length_is_clamped_to_the_bound_it_was_promised() {
-        let cells = [3u32, 9, 5];
-        let port = Some(&cells[..]);
-        assert_eq!(
-            resolve_fold_len(FoldLen::Device(PORT), 8, 0, port).unwrap(),
-            3
-        );
-        assert_eq!(
-            resolve_fold_len(FoldLen::Device(PORT), 8, 1, port).unwrap(),
-            8
-        );
-        assert_eq!(resolve_fold_len(FoldLen::Host(9), 8, 0, port).unwrap(), 8);
-        assert_eq!(resolve_fold_len(FoldLen::Host(4), 8, 0, None).unwrap(), 4);
-    }
-
-    fn a_fold_length_that_resolves_to_zero_is_refused_by_name() {
-        let cells = [0u32];
-        for len in [FoldLen::Device(PORT), FoldLen::Host(0)] {
-            let error = resolve_fold_len(len, 8, 0, Some(&cells[..])).unwrap_err();
-            let said = error.to_string();
-            assert!(said.contains("bonus token"), "{said}");
-        }
-        let error = resolve_fold_len(FoldLen::Host(4), 0, 0, None).unwrap_err();
-        assert!(error.to_string().contains("bonus token"), "{error}");
-    }
-}
-
 impl Shell {
     /// The attention class table this fire stages: the one every stating
     /// lane agrees on, checked against each lane's rows, or none.
@@ -1760,5 +1714,51 @@ impl Shell {
             }
         }
         Ok(table)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FoldLen, readout_extent, resolve_fold_len};
+
+    const PORT: eta_ir::registry::Port = eta_ir::registry::Port::RsFoldLen;
+
+    #[test]
+    fn prepare_every_case() {
+        a_device_fold_length_is_clamped_to_the_bound_it_was_promised();
+        a_fold_length_that_resolves_to_zero_is_refused_by_name();
+        a_readout_as_tall_as_the_fire_holds_the_bucket();
+    }
+
+    fn a_readout_as_tall_as_the_fire_holds_the_bucket() {
+        assert_eq!(readout_extent(133, 256, 133), 256);
+        assert_eq!(readout_extent(133, 256, 5), 5);
+        assert_eq!(readout_extent(133, 133, 133), 133);
+    }
+
+    fn a_device_fold_length_is_clamped_to_the_bound_it_was_promised() {
+        let cells = [3u32, 9, 5];
+        let port = Some(&cells[..]);
+        assert_eq!(
+            resolve_fold_len(FoldLen::Device(PORT), 8, 0, port).unwrap(),
+            3
+        );
+        assert_eq!(
+            resolve_fold_len(FoldLen::Device(PORT), 8, 1, port).unwrap(),
+            8
+        );
+        assert_eq!(resolve_fold_len(FoldLen::Host(9), 8, 0, port).unwrap(), 8);
+        assert_eq!(resolve_fold_len(FoldLen::Host(4), 8, 0, None).unwrap(), 4);
+    }
+
+    fn a_fold_length_that_resolves_to_zero_is_refused_by_name() {
+        let cells = [0u32];
+        for len in [FoldLen::Device(PORT), FoldLen::Host(0)] {
+            let error = resolve_fold_len(len, 8, 0, Some(&cells[..])).unwrap_err();
+            let said = error.to_string();
+            assert!(said.contains("bonus token"), "{said}");
+        }
+        let error = resolve_fold_len(FoldLen::Host(4), 0, 0, None).unwrap_err();
+        assert!(error.to_string().contains("bonus token"), "{error}");
     }
 }

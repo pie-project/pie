@@ -697,7 +697,7 @@ CUDA_VISIBLE_DEVICES=1 cargo test -p engine-cuda --features cuda \
 CUDA_VISIBLE_DEVICES=1 python gates.py --only ltx2-vae
 ```
 
-The gate (`crates/engine-cuda/tests/the_ltx_2_vae_answers_the_reference.rs`)
+The gate (`crates/engine-cuda/tests/engine_cuda/the_ltx_2_vae_answers_the_reference.rs`)
 reads the decoder's 86 planes straight out of the snapshot through
 `models::ltx_2::Model::import_vae` — no artifact — fires the whole clip once
 through `vae.decode`, and asserts `cos ≥ 0.9999`, `mean |err| ≤ 0.005` over
@@ -969,7 +969,7 @@ file is the roster, the plumbing and the reaper.
 | `zimage-turbo` | `zimage_parity.py gate` | text 0.99999, turbo 0.9998, steps 0.9961–0.9972, PSNR 32.8–33.3 dB | the flagship: the `text` reading, the step-0 `denoise`, the whole text→refine→denoise `chain`, then the eight-step trajectory, then the VAE decode of both final latents. |
 | `flux2-mini` | `flux2_parity.py all` | 0.999991 | the FLUX.2 miniature's one denoise step over three lanes of one group (text, target, references). Re-measured 2026-09-06 after the guest gave each lane a pipeline of its own: the earlier 0.99999 was taken while all three passes rode ONE pipeline, so the group never formed and the image lane denoised alone — the miniature's random-init caption sat under the tolerance and the gate stayed green. `gates.py` caught it once the frame contract began refusing a group that cannot compose. |
 | `flux2-klein` | `flux2_klein_parity.py all` | per-step velocities ≥ 0.999, PSNR ≥ 34 dB | the real klein-4B row: `text.hidden`, `dit.step0.out` and `probe.step{0..3}.out` are gated; the four-step trajectory and the picture's PSNR are reported. |
-| `flux2-vae` | `cargo test -p engine-cuda --features cuda --test the_flux_2_vae_answers_the_reference` | decode 0.99999, encode 0.99995 | the autoencoder alone, host-fed, against the fp32 diffusers reference. |
+| `flux2-vae` | `cargo test -p engine-cuda --features cuda --test engine_cuda the_flux_2_vae_answers_the_reference` | decode 0.99999, encode 0.99995 | the autoencoder alone, host-fed, against the fp32 diffusers reference. |
 | `zimage-vae` | `zimage_vae_parity.py all`, then `the_z_image_vae_answers_the_reference` | 0.99998 | the same VAE reading twice: once fired FROM A GUEST through the real runtime, once from the host. The two roads must agree with the reference to the same distance. |
 | `wan-mini` | `wan22_parity.py all`, `all --pertoken` | 0.999982, and the conditioning must MOVE | the `d128` miniature under both timestep forms (scalar, and TI2V's per-token one), each followed by the `conditioning` claim: zeroing the umT5 context must move the velocity by more than the gate's own slack. |
 | `h3-mini` | `h3_parity.py all` | refined-text / video / audio ≥ 0.9999 | MiniMax H3's `refine` pass and one four-lane `denoise` step, three readouts. |

@@ -237,6 +237,10 @@ fn read_exact_at(file: &std::fs::File, buf: &mut [u8], at: u64) -> std::io::Resu
     Ok(())
 }
 
+/// # Safety
+///
+/// `into` must be valid for writes over every plane's reservation,
+/// `plane.into .. plane.into + plane.reserved`.
 pub unsafe fn read_into(refill: &Landings, into: *mut u8) -> Result<(), String> {
     let file = std::fs::File::open(&refill.path)
         .map_err(|why| format!("{}: {why}", refill.path.display()))?;
@@ -323,7 +327,7 @@ pub unsafe fn read_into(refill: &Landings, into: *mut u8) -> Result<(), String> 
                                 &mut scratch[..len]
                             }
                         };
-                        if let Err(why) = read_exact_at(&file, bytes, at) {
+                        if let Err(why) = read_exact_at(file, bytes, at) {
                             outcome = Err(Failed::Read(format!("read at {at}: {why}")));
                             break;
                         }

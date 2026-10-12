@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use checkpoint::contract::ModelContract;
@@ -38,7 +38,7 @@ impl Default for World {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct DeviceBoot {
     pub ordinal: i32,
     pub world: World,
@@ -47,7 +47,6 @@ pub struct DeviceBoot {
     pub cache_dir: Option<std::path::PathBuf>,
     pub adapter_dir: Option<std::path::PathBuf>,
 }
-
 
 struct PendingStep {
     readout: Vec<Readout>,
@@ -313,7 +312,7 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
     Some(PatchLadder {
         max_images: budgets
             .max_images
-            .unwrap_or_else(|| max_patches / PATCH_LATTICE_FLOOR)
+            .unwrap_or(max_patches / PATCH_LATTICE_FLOOR)
             .max(1),
         max_patches,
         buckets,
@@ -462,7 +461,6 @@ impl Engine for Cuda {
                     .into(),
             ));
         };
-        let path = PathBuf::from(path);
         refuse_an_artifact_for_another_deployment(
             &path,
             trace.platform.backend(),

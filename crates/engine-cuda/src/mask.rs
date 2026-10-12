@@ -4,7 +4,7 @@ use crate::error::{Fault, Result};
 
 #[must_use]
 pub fn from_dense(cells: &[bool], stride: usize) -> Masking {
-    let rows = if stride == 0 { 0 } else { cells.len() / stride };
+    let rows = cells.len().checked_div(stride).unwrap_or(0);
     Masking::Rows(
         (0..rows)
             .map(|row| {

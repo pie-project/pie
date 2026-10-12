@@ -1322,6 +1322,7 @@ pub(crate) fn resolve_source(source: &str) -> Result<Source> {
 fn resolve_snapshot(repo_id: &str) -> Result<(PathBuf, bool)> {
     let repo_dir = crate::local::hf::resolve_cache_dir()
         .join(format!("models--{}", repo_id.replace('/', "--")));
+    discard_consumed(&repo_dir)?;
     let snapshots = repo_dir.join("snapshots");
     let mut fetched = !snapshots.exists();
     if fetched {
@@ -1342,6 +1343,20 @@ fn resolve_snapshot(repo_id: &str) -> Result<(PathBuf, bool)> {
         fetched = true;
     }
     Ok((path, fetched))
+}
+
+/// A consuming import that died left this download's blobs as holes the
+/// size of the weights, which a re-download takes as present; pie fetched
+/// it, so pie deletes it and fetches it again.
+fn discard_consumed(repo_dir: &Path) -> Result<()> {
+    let consumed = std::fs::read_dir(repo_dir.join("snapshots")).is_ok_and(|mut entries| {
+        entries.any(|entry| entry.is_ok_and(|e| consuming_marker(&e.path()).is_file()))
+    });
+    if consumed {
+        std::fs::remove_dir_all(repo_dir)
+            .with_context(|| format!("cannot delete {}", repo_dir.display()))?;
+    }
+    Ok(())
 }
 
 fn has_weights(snapshot: &Path) -> bool {
@@ -2162,6 +2177,28 @@ mod tests {
         a_deployment_that_does_not_read_the_checkpoint_refuses_by_name();
         the_chosen_row_is_in_the_filename_the_dry_run_reports();
         two_imports_beside_one_output_spool_apart();
+        a_download_a_dead_import_consumed_is_discarded_whole();
+    }
+
+    fn a_download_a_dead_import_consumed_is_discarded_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = |name: &str, consumed: bool| {
+            let repo = dir.path().join(name);
+            let snapshot = repo.join("snapshots/abc");
+            std::fs::create_dir_all(&snapshot).unwrap();
+            std::fs::create_dir_all(repo.join("blobs")).unwrap();
+            std::fs::write(repo.join("blobs/weights"), b"").unwrap();
+            if consumed {
+                std::fs::write(snapshot.join(CONSUMING_MARKER), b"").unwrap();
+            }
+            discard_consumed(&repo).unwrap();
+            repo.exists()
+        };
+        assert!(
+            !repo("models--a--consumed", true),
+            "the blobs it holed go with the snapshot, or a re-download would keep them"
+        );
+        assert!(repo("models--a--whole", false), "a whole download stays");
     }
 
     fn two_imports_beside_one_output_spool_apart() {

@@ -778,7 +778,7 @@ fn selects(plan: &LaunchStagePlan, region: &LaunchRegion) -> bool {
 }
 
 fn temporary_floor(plan: &LaunchStagePlan, descriptors: &[ValueDesc], rows: &[u32]) -> u64 {
-    let align = |bytes: u64| bytes.next_multiple_of(u64::from(SCRATCH_ALIGN));
+    let align = |bytes: u64| bytes.next_multiple_of(SCRATCH_ALIGN);
     let widest = descriptors
         .iter()
         .map(|d| u64::from(d.last))

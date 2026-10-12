@@ -435,19 +435,23 @@ impl Engine for Metal {
                 .map_err(fault)?;
 
         {
-            let working_set = crate::device::Context::bind().map_err(fault)?.working_set();
+            let device = crate::device::Context::bind().map_err(fault)?;
+            let (working_set, elsewhere) = (device.working_set(), device.held_elsewhere());
             let util = self.boot.gpu_mem_utilization;
             let paging = crate::store::kv::Paging::of(
                 budgets.page_size,
                 budgets.max_context,
                 budgets.slots,
-                u64::from(budgets.pages),
+                1,
             )
             .map_err(|error| fault(Fault::from(error)))?;
-            let kv_pool = crate::store::pool_demand(&trace, paging).map_err(fault)?;
+            let kv_pool = crate::store::PoolDemand::of(&trace, paging, None)
+                .map_err(fault)?
+                .bytes(crate::store::least_pages(budgets.pages, paging));
 
             let acct = crate::store::accounting::Accounting::of(
                 working_set,
+                elsewhere,
                 util,
                 residency_plan.device_demand(),
                 kv_pool,
@@ -469,6 +473,7 @@ impl Engine for Metal {
                     Ok(shrunk) => {
                         let re = crate::store::accounting::Accounting::of(
                             working_set,
+                            elsewhere,
                             util,
                             shrunk.device_demand(),
                             kv_pool,

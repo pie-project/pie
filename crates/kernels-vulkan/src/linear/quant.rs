@@ -68,12 +68,15 @@ pub(crate) fn qmv1_fits(group: i64, bits: i64) -> bool {
     matches!(bits, 4 | 8) && 128 / bits <= group
 }
 
-fn qmv1_name(group: i32, bits: i32) -> &'static str {
-    symbol(&format!("affine_qmv1_bf16_gs_{group}_b_{bits}"))
+fn qmv1_name(group: i32, bits: i32, lanes: u32, rows: u32) -> &'static str {
+    if lanes == 32 && rows == 1 {
+        symbol(&format!("affine_qmv1_bf16_gs_{group}_b_{bits}"))
+    } else {
+        symbol(&format!(
+            "affine_qmv1_bf16_gs_{group}_b_{bits}_l{lanes}_r{rows}"
+        ))
+    }
 }
-
-/// Output rows one workgroup of the one-row point lands.
-const QMV1_ROWS: u32 = 8;
 
 /// The vector point at `vecs` activation rows a workgroup: 4 carries the
 /// plain name, 1, 2 and 8 a `_v` suffix.
@@ -316,10 +319,11 @@ pub fn act_x_wt(
                     );
                 }
             }
-            Qmm::OneRow => {
+            Qmm::OneRow { lanes, rows: per_lane } => {
                 return ctx.fire(
-                    Fire::at(QMV1_FILE, qmv1_name(group, bits)).apply(Grid::of(
-                        [columns.div_ceil(QMV1_ROWS) * 64, 4, 1],
+                    Fire::at(QMV1_FILE, qmv1_name(group, bits, lanes, per_lane)).apply(Grid::of(
+                        // 256 invocations land 256 / lanes rows, `per_lane` each.
+                        [columns.div_ceil(256 / lanes * per_lane) * 64, 4, 1],
                         [64, 4, 1],
                     )),
                     &args,

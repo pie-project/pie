@@ -497,9 +497,10 @@ pub struct ModelConfig {
     #[serde(default)]
     pub host_kv_budget: Option<ByteSize>,
     /// How many disk bytes suspended kv may spill into once host swap is
-    /// full (`"200GiB"`), shared by the ranks, each in its own preallocated
-    /// slot file under `disk_kv_path` (default `$PIE_HOME/cache/kv/<checkpoint
-    /// digest>`). `"0B"`, the default, turns the disk tier off.
+    /// full (`"200GiB"`), shared by the ranks, each in its own slot file
+    /// under `disk_kv_path` (default `$PIE_HOME/cache/kv/<checkpoint
+    /// digest>`), unlinked once open so it never outlives the server. `"0B"`,
+    /// the default, turns the disk tier off.
     #[serde(default)]
     pub disk_kv_budget: Option<ByteSize>,
     #[serde(default)]

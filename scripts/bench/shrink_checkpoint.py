@@ -1279,6 +1279,31 @@ FAMILIES: dict[str, dict[str, Any]] = {
         config_rewrite=_rewrite_qwen4_exp,
         text_cfg_key="text_config",
     ),
+    # The same architecture as upstream ships it, bf16: the `qwen3_5_moe` /
+    # `qwen3_5_moe_mlx` split again -- `model.language_model.layers.`, and the
+    # bank fused as one `gate_up_proj` and one `down_proj`, stacked on dim 0.
+    "qwen4_exp_hf": dict(
+        model_type="qwen4_exp",
+        layer_prefix="model.language_model.layers.",
+        expert_re=None,
+        router_suffixes=(
+            "mlp.gate.weight",
+            "mlp.experts.gate_up_proj",
+            "mlp.experts.down_proj",
+        ),
+        part_re=re.compile(r"\.ngram_embedding\.shard_(\d+)\."),
+        default_parts=8,
+        globals_keep=("model.language_model.embed_tokens.weight",
+                      "lm_head.weight",
+                      "model.language_model.hyper_connection_mixer.hc_norm.weight",
+                      "model.language_model.hyper_connection_mixer."
+                      "input_mix_weight_down.weight",
+                      "model.language_model.hyper_connection_mixer."
+                      "input_mix_weight_up.weight"),
+        default_layers="0-3",
+        config_rewrite=_rewrite_qwen4_exp,
+        text_cfg_key="text_config",
+    ),
     "kimi_k25": dict(
         layer_prefix="language_model.model.layers.",
         expert_re=re.compile(r"\.mlp\.experts\.(\d+)\."),

@@ -1,0 +1,39 @@
+//! engine-xla's integration tests, one binary: each module was a test file.
+
+mod common;
+mod common_dit;
+
+mod a_batch_samples_on_the_device;
+mod a_channel_fed_voxel_port_lands_the_committed_cell;
+mod a_context_port_merged_into_the_stream_lands_its_rows;
+mod a_conv_decoder_fires_over_a_voxel_port;
+mod a_device_geometry_beam_answers_the_host_path;
+mod a_double_block_fires_two_streams_through_the_engine;
+mod a_model_speaks_on_the_device;
+mod a_picture_is_seen_by_the_trunk;
+mod a_recurrent_verb_replays_what_a_plain_walk_folds;
+mod a_stated_position_rotates_and_the_row_bounds;
+mod a_windowed_pool_answers_what_full_pages_do;
+mod an_epilogue_agrees_with_the_host_interpreter;
+mod kernels_act;
+mod kernels_attn;
+mod kernels_collective;
+mod kernels_decode;
+mod kernels_hc;
+mod kernels_index;
+mod kernels_layout;
+mod kernels_linear;
+mod kernels_mla;
+mod kernels_moe;
+mod kernels_mosaic;
+mod kernels_norm;
+mod kernels_norm_fused;
+mod kernels_pack;
+mod kernels_ple;
+mod kernels_pool;
+mod kernels_quant;
+mod kernels_rope;
+mod kernels_spatial;
+mod kernels_ssm;
+mod pjrt_runs_a_built_module;
+mod the_trunk_tracks_upstream;

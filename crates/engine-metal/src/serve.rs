@@ -358,6 +358,7 @@ impl Shell {
             ),
             ..boot
         };
+        let elsewhere = device.held_elsewhere();
         let keepalive = if crate::keepalive::KeepAlive::wanted() {
             Some(crate::keepalive::KeepAlive::start(&device)?)
         } else {
@@ -447,12 +448,6 @@ impl Shell {
             }
         }
 
-        let paging = Paging::of(
-            boot.page_size,
-            boot.context,
-            boot.slots,
-            u64::from(boot.pages),
-        )?;
         let handles = Handles::new();
         let cuts = crate::experts::cuts(&boot.trace, &compiled, &boot.residency)?;
         let run_caps: Vec<u32> = (0..compiled.template().len())
@@ -548,20 +543,34 @@ impl Shell {
         );
         handles.seal();
 
-        {
-            // The kv pool and the recurrent-state buffers beside it: both are
-            // wired for the life of the load.
-            let rs_buffers = crate::rs::Layout::read(&boot.trace)?
-                .map_or(0, |layout| crate::rs::Buffers::demand(&layout, paging));
-            let kv_pool =
-                crate::store::pool_demand(&boot.trace, paging)?.saturating_add(rs_buffers);
-            let acct = crate::store::accounting::Accounting::with_scratch(
+        // The kv pool and the recurrent-state buffers beside it: both are
+        // wired for the life of the load, in what `gpu_mem_utilization` leaves
+        // of the room the device had when the load began, once the weights,
+        // the arena scratch and the driver's floor are placed. `[engine]
+        // total_pages = 0` takes all of it.
+        let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
+        let paging_at = |pages: u64| Paging::of(boot.page_size, boot.context, boot.slots, pages);
+        let demand =
+            crate::store::PoolDemand::of(&boot.trace, paging_at(1)?, rs_layout.as_deref())?;
+        let accounting = |pool: u64| {
+            crate::store::accounting::Accounting::with_scratch(
                 device.working_set(),
+                elsewhere,
                 boot.gpu_mem_utilization,
                 weights.bytes(),
                 compiled.arena.bytes,
-                kv_pool,
-            );
+                pool,
+            )
+        };
+        let least = crate::store::least_pages(boot.pages, paging_at(1)?);
+        let pages = match boot.pages {
+            0 => demand.pages_within(accounting(0).pool).max(least),
+            _ => least,
+        };
+        let paging = paging_at(pages)?;
+
+        {
+            let acct = accounting(demand.bytes(pages));
             acct.admit(Some(weights.bytes()), boot.gpu_mem_utilization)?;
             let source = boot.residency.source_bytes();
             let ram = Context::physical_memory();
@@ -592,7 +601,6 @@ impl Shell {
         }
         let arena = Arena::reserve(&device, &compiled.arena)?;
         let pools = Pools::reserve(&device, &boot.trace, paging, &facts)?;
-        let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
         let rs_buffers = match &rs_layout {
             Some(layout) => Some(crate::rs::Buffers::reserve(&device, layout, paging)?),
             None => None,

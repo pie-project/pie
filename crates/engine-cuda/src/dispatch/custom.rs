@@ -159,14 +159,20 @@ impl poem_exec::DispatchProbe for Run<'_> {
             }
             let bad = match dtype {
                 poem_ir::Dtype::F32 => host
-                    .chunks_exact(4)
-                    .position(|c| !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_finite()),
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .position(|c| !f32::from_le_bytes(*c).is_finite()),
                 poem_ir::Dtype::Bf16 => host
-                    .chunks_exact(2)
-                    .position(|c| (u16::from_le_bytes([c[0], c[1]]) & 0x7f80) == 0x7f80),
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .position(|c| (u16::from_le_bytes(*c) & 0x7f80) == 0x7f80),
                 _ => host
-                    .chunks_exact(2)
-                    .position(|c| (u16::from_le_bytes([c[0], c[1]]) & 0x7c00) == 0x7c00),
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .position(|c| (u16::from_le_bytes(*c) & 0x7c00) == 0x7c00),
             };
             if let Some(at) = bad {
                 eprintln!(

@@ -69,6 +69,11 @@ struct SyntheticMedia {
     grids: Vec<i32>,
 }
 
+/// A synthetic lane's class and row count.
+type LaneRows = (usize, u32);
+/// A synthetic lane's image and patch counts.
+type LaneMedia = (u32, u32);
+
 #[derive(Debug, Clone)]
 enum BodySynth {
     Decode {
@@ -91,7 +96,7 @@ enum BodySynth {
         patches: u32,
     },
     Wide {
-        lanes: Vec<(usize, u32)>,
+        lanes: Vec<LaneRows>,
     },
 }
 
@@ -106,7 +111,7 @@ impl BodySynth {
         }
     }
 
-    fn lanes(&self) -> (Vec<(usize, u32)>, Vec<(u32, u32)>) {
+    fn lanes(&self) -> (Vec<LaneRows>, Vec<LaneMedia>) {
         match self {
             BodySynth::Decode { lanes, class } => {
                 (vec![(*class, 1u32); *lanes as usize], Vec::new())
@@ -388,11 +393,11 @@ impl core::fmt::Display for BodySynth {
 }
 
 impl Shell {
-    fn synthetic_lanes(&self, lanes: &[(usize, u32)]) -> Vec<Synthetic> {
+    fn synthetic_lanes(&self, lanes: &[LaneRows]) -> Vec<Synthetic> {
         self.synthetic_lanes_with(lanes, &[])
     }
 
-    fn synthetic_lanes_with(&self, lanes: &[(usize, u32)], media: &[(u32, u32)]) -> Vec<Synthetic> {
+    fn synthetic_lanes_with(&self, lanes: &[LaneRows], media: &[LaneMedia]) -> Vec<Synthetic> {
         let slots = self.held.len().max(1) as u32;
         let page_size = u64::from(self.pools.paging().page_size).max(1);
         let mut next_page = 0u64;
@@ -719,10 +724,10 @@ impl Shell {
                         let layers: Vec<Option<u32>> = {
                             let mut seen = Vec::new();
                             for n in nodes..nodes_end {
-                                if let Some(h) = self.trace.nodes.get(n as usize) {
-                                    if seen.last() != Some(&h.layer) {
-                                        seen.push(h.layer);
-                                    }
+                                if let Some(h) = self.trace.nodes.get(n as usize)
+                                    && seen.last() != Some(&h.layer)
+                                {
+                                    seen.push(h.layer);
                                 }
                             }
                             seen
@@ -996,11 +1001,7 @@ impl Shell {
             let at = target.kind().at();
             let (lanes, media) = target.lanes();
             tally[at].1 += 1;
-            let owned = if media.is_empty() {
-                self.synthetic_lanes(&lanes)
-            } else {
-                self.synthetic_lanes_with(&lanes, &media)
-            };
+            let owned = self.synthetic_lanes_with(&lanes, &media);
             self.armed_body = None;
             for _ in 0..record::WARM_FIRES {
                 let fired = self.fire_synthetic(&owned);
@@ -1199,7 +1200,7 @@ impl Shell {
         if super::diag::on().arm_trace {
             let slabs = kernels_cuda::jit::Slabs::census();
             let total: usize = slabs.iter().map(|(_, bytes)| *bytes).sum();
-            let free = crate::device::nodes::free_bytes().unwrap_or(0);
+            let free = crate::device::free_bytes().unwrap_or(0);
             eprintln!(
                 "[arm-trace] device memory: free {} MiB; arena committed {} MiB, inputs reserve {} MiB, buffered activations {} MiB, readout rows {} MiB, rs scratch {} MiB, pool committed {} MiB",
                 free >> 20,

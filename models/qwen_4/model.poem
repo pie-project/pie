@@ -315,9 +315,11 @@ def layout(id, deploy):
             fail(refused)
         return build(mix_of(deploy.weights[0]), deploy.kv, MICRO, HASHES["micro"], False, False)
     if id == "qwen38-flash-next-mini":
-        if not mixed:
+        if mixed:
+            return build(MIXED_2BIT, deploy.kv, MINI, HASHES["mini"], False, False)
+        if len(deploy.weights) != 1:
             fail(refused)
-        return build(MIXED_2BIT, deploy.kv, MINI, HASHES["mini"], False, False)
+        return build(mix_of(deploy.weights[0]), deploy.kv, MINI, HASHES["mini"], False, False)
     if len(deploy.weights) == 1 and not vision and deploy.drafter == None:
         return build(mix_of(deploy.weights[0]), deploy.kv, FLASH, HASHES["flash"], False, False)
     if mixed and (mtp or deploy.drafter == None):

@@ -19,10 +19,10 @@ zstd = ["dep:zstd"]
 
 [dependencies]
 memmap2 = "0.9"
-sha2 = "0.10"
+sha2 = "0.11"
 unicode-normalization = "0.1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-zstd = { version = "0.13", optional = true }
+zstd = { version = "0.14", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

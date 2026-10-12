@@ -151,7 +151,11 @@ pub fn candidates(base: &Profile) -> Vec<Qmm> {
     for crossover_tg in [64, 96, 128, 160, 256] {
         out.push(Qmm::Tiled { crossover_tg });
     }
-    out.push(Qmm::OneRow);
+    for lanes in [8, 16, 32] {
+        for rows in [1, 2] {
+            out.push(Qmm::OneRow { lanes, rows });
+        }
+    }
     for vecs in [1, 2, 4, 8] {
         out.push(Qmm::Qmv { vecs });
     }
@@ -170,7 +174,9 @@ pub fn body(q: &Qmm) -> String {
         Qmm::Coopmat => "use = \"coopmat\"".to_string(),
         Qmm::RegisterTiled { bm } => format!("use = \"register_tiled\", bm = {bm}"),
         Qmm::Tiled { crossover_tg } => format!("use = \"tiled\", crossover_tg = {crossover_tg}"),
-        Qmm::OneRow => "use = \"one_row\"".to_string(),
+        Qmm::OneRow { lanes, rows } => {
+            format!("use = \"one_row\", lanes = {lanes}, rows = {rows}")
+        }
         Qmm::Qmv { vecs } => format!("use = \"qmv\", vecs = {vecs}"),
     }
 }
@@ -192,7 +198,7 @@ pub fn kernel(q: &Qmm) -> &'static str {
         Qmm::Coopmat => "coopmat",
         Qmm::RegisterTiled { .. } => "register_tiled",
         Qmm::Tiled { .. } => "tiled",
-        Qmm::OneRow => "one_row",
+        Qmm::OneRow { .. } => "one_row",
         Qmm::Qmv { .. } => "qmv",
     }
 }

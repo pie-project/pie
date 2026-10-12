@@ -275,6 +275,7 @@ def _make_chat() -> types.ModuleType:
     m.system_user = lambda system, user: [4]
     m.assistant = lambda message: [5, *(ord(c) for c in message)]
     m.cue = lambda: [6]
+    m.cue_without_thinking = lambda: [6, 7]
     m.seal = lambda: [7]
     m.stop_tokens = lambda: [8, 9]
     m.create_decoder = ChatDecoderStub

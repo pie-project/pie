@@ -1014,8 +1014,7 @@ impl FireCtx<'_> {
             let owned = lane_rows.get(lane).copied().unwrap_or(0);
             let stated = p.lanes.get(lane).and_then(|seated| seated.readout);
             let wanted: Vec<u32> = match stated {
-                None => vec![last_row[lane]],
-                Some(rows) if rows.is_empty() => vec![last_row[lane]],
+                None | Some([]) => vec![last_row[lane]],
                 Some(rows) => {
                     if rows.len() as u32 > owned {
                         return Err(Fault::Ceiling {

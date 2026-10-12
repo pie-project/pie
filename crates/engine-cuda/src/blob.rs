@@ -15,6 +15,9 @@ pub struct Vfs {
     root: Option<PathBuf>,
 }
 
+/// A plane's bank name and the bytes landed into it.
+pub type BankBytes = (String, Vec<u8>);
+
 impl Vfs {
     #[must_use]
     pub fn new(root: Option<PathBuf>) -> Vfs {
@@ -638,10 +641,8 @@ impl Adapters {
     where
         L: FnOnce(u32, &[AdapterPlane<'_>]) -> Result<()>,
     {
-        let built = self.planes(name, seats)?;
-        let fingerprint = built.1;
+        let (built, fingerprint) = self.planes(name, seats)?;
         let planes: Vec<AdapterPlane<'_>> = built
-            .0
             .iter()
             .map(|(bank, bytes)| AdapterPlane {
                 bank: bank.as_str(),
@@ -652,7 +653,8 @@ impl Adapters {
         Ok(fingerprint)
     }
 
-    pub fn planes(&self, name: &str, seats: &[BankSeat]) -> Result<(Vec<(String, Vec<u8>)>, u64)> {
+    /// Each plane's bank and bytes, and the adapter's fingerprint.
+    pub fn planes(&self, name: &str, seats: &[BankSeat]) -> Result<(Vec<BankBytes>, u64)> {
         let dir = self.vfs.resolve(name)?;
         let manifest = Manifest::read(&dir, name)?;
         let refuse = |why: String| Fault::Blob {

@@ -69,7 +69,6 @@ impl core::fmt::Display for Decline {
 }
 
 impl Rotation {
-    #[must_use]
     pub fn plan(
         schedule: &Schedule,
         compiled: &CompiledModel,

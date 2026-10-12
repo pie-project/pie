@@ -115,5 +115,5 @@ CUDA_VISIBLE_DEVICES=<n> python scripts/imagegen/gates.py --only wan-video
 ```
 
 Two steps: the host-fed VAE parity
-(`cargo test -p engine-cuda --test the_wan_2_vae_answers_the_reference`,
+(`cargo test -p engine-cuda --test engine_cuda the_wan_2_vae_answers_the_reference`,
 which is the numbers), then this guest end to end (which is the path).

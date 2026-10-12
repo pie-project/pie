@@ -3,7 +3,7 @@
 `text-completion-py` / `text-completion-js` trace the same pass as
 `text-completion`, and `naive-baseline-py` / `naive-baseline-js` the same as
 `naive-baseline`. The Python and JavaScript ports are pinned byte-for-byte to the Rust encoder
-(`crates/eta-dsl/tests/inferlet_goldens.rs`), so the gate here is the end-to-end
+(`crates/eta-dsl/tests/eta_dsl/inferlet_goldens.rs`), so the gate here is the end-to-end
 one: the same prompt produces the SAME TOKENS from every language.
 
 The naive twins are compared to each other (and to Rust on an attention-only

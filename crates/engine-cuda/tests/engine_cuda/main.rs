@@ -1,0 +1,56 @@
+//! engine-cuda's integration tests, one binary: each module was a test file.
+
+#[cfg(feature = "cuda")]
+mod common_dit;
+#[cfg(feature = "cuda")]
+mod common_encoder;
+#[cfg(feature = "cuda")]
+mod common_two_axis;
+#[cfg(feature = "cuda")]
+mod common_vae;
+
+mod a_bank_says_which_site_it_corrects;
+mod a_bidirectional_attention_adds_its_relative_bias_through_the_engine;
+mod a_buffered_fold_is_the_fold_it_replaces;
+mod a_channel_fed_voxel_port_lands_the_committed_cell;
+mod a_context_port_merged_into_the_stream_lands_its_rows;
+mod a_conv_decoder_fires_over_a_voxel_port;
+mod a_dit_plan_loads_at_a_sixty_four_k_row_ceiling;
+mod a_double_block_fires_two_streams_through_the_engine;
+mod a_family_is_read_against_its_reference;
+mod a_fitted_pool_is_pledged_what_it_declared;
+mod a_four_rank_group_fires_a_sharded_plan;
+mod a_fragmented_window_gets_a_view_per_run;
+mod a_fused_geglu_reads_its_affine_bank_as_planes;
+mod a_group_with_two_reference_lanes_keeps_each_to_itself;
+mod a_grouped_window_is_one_window_and_a_segment_list;
+mod a_missing_or_misshapen_port_feed_is_refused_by_name;
+mod a_prefill_past_the_gemvs_grid_is_served;
+mod a_regions_own_values_outlive_its_last_pass;
+mod a_repacked_projection_serves_what_the_row_major_one_serves;
+mod a_schedule_is_carved_where_it_is_launched;
+mod a_second_fire_reads_the_port_cells_it_was_handed;
+mod a_shared_adapter_is_one_slot_and_one_load;
+mod a_shifted_body_admits_the_split_that_moved;
+mod a_short_card_keeps_the_declared_context;
+mod a_stored_k_quant_row_serves_as_stored;
+mod a_tower_region_reads_the_patch_window;
+mod a_two_axis_plan_arms_its_token_bodies;
+mod a_two_reading_plan_reads_each_lane_back_from_its_own_seam;
+mod a_windowed_row_reads_what_the_full_row_reads;
+mod an_adapter_is_not_a_lanes_scratch;
+mod an_epilogue_agrees_with_the_host_interpreter;
+mod every_armed_body_answers_its_eager_walk;
+mod every_catalog_deployment_dispatches;
+mod every_diagnostic_is_a_word_the_boot_states;
+mod masked_axis;
+mod no_shell_reads_the_environment;
+mod peer_collectives_answer_what_every_rank_holds;
+mod routed_experts_stream;
+mod the_flux_2_vae_answers_the_reference;
+mod the_ltx_2_vae_answers_the_reference;
+mod the_mini_dit_row_arms_its_bodies;
+mod the_operators_fraction_sizes_the_pool;
+mod the_wan_2_vae_answers_the_reference;
+mod the_wan_2_vae_encodes_the_reference;
+mod the_z_image_vae_answers_the_reference;

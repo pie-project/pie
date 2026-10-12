@@ -1,10 +1,13 @@
 version: 2
+# Once a month, one pull request per ecosystem carrying every update it has.
 updates:
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
+      interval: "monthly"
+    groups:
+      cargo:
+        patterns: ["*"]
 
   - package-ecosystem: "pip"
     directories:
@@ -12,18 +15,24 @@ updates:
       - "/packages/python/inferlet"
       - "/packages/python/server"
     schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
+      interval: "monthly"
+    groups:
+      pip:
+        patterns: ["*"]
 
   # The npm workspace: one lockfile for client, inferlet, browser and server.
   - package-ecosystem: "npm"
     directory: "/packages/javascript"
     schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
+      interval: "monthly"
+    groups:
+      npm:
+        patterns: ["*"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
+      interval: "monthly"
+    groups:
+      github-actions:
+        patterns: ["*"]

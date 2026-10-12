@@ -2,6 +2,9 @@
 //! installed models directory: its deployment is named, composed and traced
 //! by that package, and a model this build embeds no package for serves all
 //! the same once its package is under `models/`.
+//!
+//! Its own binary, not a module of `tests/runtime`: it installs the
+//! process's one catalog, which no other test may have read first.
 
 use std::collections::BTreeMap;
 

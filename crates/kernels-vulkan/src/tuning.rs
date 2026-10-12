@@ -64,7 +64,14 @@ pub enum Qmm {
     /// One row (decode), 128-bit loads folded with subgroup shuffles.
     #[requires("subgroup >= 32")]
     #[partial]
-    OneRow,
+    OneRow {
+        /// Lanes that walk one output row.
+        #[constant(set(8, 16, 32), default = 32)]
+        lanes: u32,
+        /// Output rows one lane carries, sharing the activations it loads.
+        #[constant(set(1, 2), default = 1)]
+        rows: u32,
+    },
     /// The vector kernel, `vecs` activation rows a workgroup.
     Qmv {
         #[constant(set(1, 2, 4, 8), default = 4)]
@@ -80,7 +87,7 @@ impl Qmm {
         match self {
             Qmm::Coopmat | Qmm::RegisterTiled { .. } => stamped && whole,
             Qmm::Tiled { .. } => stamped && whole && at.n % 16 == 0,
-            Qmm::OneRow => {
+            Qmm::OneRow { .. } => {
                 at.rows == 1
                     && stamped
                     && qmv1_fits(at.group, at.bits)

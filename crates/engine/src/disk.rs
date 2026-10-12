@@ -1,6 +1,8 @@
 //! The slot file an engine suspends kv pages into below host memory: one
-//! per rank, preallocated and locked, one kv page per fixed slot, written
-//! and read around the page cache where the filesystem allows it.
+//! per rank, one kv page per fixed slot, written and read around the page
+//! cache where the filesystem allows it. Preallocated where blocks are
+//! written in place, and unlinked once open, so it never outlives the
+//! process that holds it.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -19,8 +21,11 @@ pub struct SlotFile {
 
 impl SlotFile {
     /// `dir/r<rank>.kv` with as many slots of `slot_bytes` as `budget`
-    /// holds; `None` when that is none. The file is locked for the life of
-    /// the load, so two servers never share one.
+    /// holds; `None` when that is none. The path is unlinked once the file
+    /// is open and locked: what it holds means nothing to the next run, and
+    /// the space comes back when the process exits, however it exits. The
+    /// lock covers the moment before the unlink, so two servers never share
+    /// one file.
     pub fn open(dir: &Path, rank: u32, slot_bytes: u64, budget: u64) -> io::Result<Option<Self>> {
         let stride = usize::try_from(slot_bytes)
             .map_err(io::Error::other)?
@@ -38,8 +43,13 @@ impl SlotFile {
                 path.display()
             ))
         })?;
+        std::fs::remove_file(&path)?;
         let len = u64::from(slots) * stride as u64;
         file.set_len(len)?;
+        // APFS copies on write: a page written lands in new blocks and the
+        // preallocated ones stay reserved, so preallocating there doubles
+        // the file's footprint instead of guaranteeing it.
+        #[cfg(not(target_vendor = "apple"))]
         if let Err(error) =
             rustix::fs::fallocate(&file, rustix::fs::FallocateFlags::empty(), 0, len)
             && error != rustix::io::Errno::OPNOTSUPP
@@ -159,7 +169,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_slot_reads_back_what_was_written_and_the_file_is_one_servers() {
+    fn a_slot_reads_back_what_was_written_and_each_server_has_its_own_file() {
         let dir = std::env::temp_dir().join(format!("pie-slot-file-{}", std::process::id()));
         let file = SlotFile::open(&dir, 0, 5000, 4 * 8192).unwrap().unwrap();
         assert_eq!((file.slots(), file.stride()), (4, 8192));
@@ -170,11 +180,36 @@ mod tests {
             .enumerate()
             .for_each(|(i, b)| *b = i as u8);
         file.write(3, stage.as_slice()).unwrap();
-        assert!(SlotFile::open(&dir, 0, 5000, 4 * 8192).is_err());
+        let other = SlotFile::open(&dir, 0, 5000, 4 * 8192).unwrap().unwrap();
+        other.write(3, Aligned::zeroed(8192).as_slice()).unwrap();
         let mut back = Aligned::zeroed(8192);
         file.read(3, back.as_mut_slice()).unwrap();
         assert_eq!(back.as_slice(), stage.as_slice());
         assert!(file.read(4, back.as_mut_slice()).is_err());
+        drop(file);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rewriting_every_slot_keeps_the_file_within_its_budget_and_it_leaves_no_path() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("pie-slot-budget-{}", std::process::id()));
+        let path = dir.join("r0.kv");
+        let budget = 64 * 8192;
+        let file = SlotFile::open(&dir, 0, 8192, budget).unwrap().unwrap();
+        assert!(!path.exists(), "the slot file outlives its process");
+        let used = || file.file.metadata().unwrap().blocks() * 512;
+        let stage = Aligned::zeroed(file.stride());
+        for _ in 0..3 {
+            for slot in 0..file.slots() {
+                file.write(slot, stage.as_slice()).unwrap();
+            }
+            assert!(
+                used() <= budget,
+                "{} bytes on disk for a budget of {budget}",
+                used()
+            );
+        }
         drop(file);
         std::fs::remove_dir_all(dir).unwrap();
     }
