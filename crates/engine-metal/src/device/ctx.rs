@@ -149,11 +149,14 @@ impl Context {
     /// The working set other processes hold now: what of it the system
     /// could not hand this one (free, inactive, purgeable and speculative
     /// pages are counted as handed). Measured before a load wires anything,
-    /// it is what `gpu_mem_utilization`'s share yields to, as on CUDA.
+    /// it is what `gpu_mem_utilization`'s share yields to, as on CUDA. 0
+    /// where the system does not say.
     #[must_use]
     pub fn held_elsewhere(&self) -> u64 {
-        self.working_set
-            .saturating_sub(available_memory().min(self.working_set))
+        available_memory().map_or(0, |available| {
+            self.working_set
+                .saturating_sub(available.min(self.working_set))
+        })
     }
 
     #[must_use]
@@ -788,10 +791,10 @@ pub(crate) fn nsstring(text: &str) -> Retained<NSString> {
     NSString::from_str(text)
 }
 
-/// Unified memory the system could hand a process now; 0 where it does not
-/// say, which counts every byte as held elsewhere.
-fn available_memory() -> u64 {
-    #[cfg(target_vendor = "apple")]
+/// Unified memory the system could hand a process now, where it says: the
+/// host VM statistics are a macOS interface.
+fn available_memory() -> Option<u64> {
+    #[cfg(target_os = "macos")]
     {
         let mut stats: libc::vm_statistics64 = unsafe { core::mem::zeroed() };
         let mut count = libc::HOST_VM_INFO64_COUNT;
@@ -807,18 +810,17 @@ fn available_memory() -> u64 {
             )
         };
         // SAFETY: a plain query.
-        let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(0);
-        if rc != libc::KERN_SUCCESS {
-            return 0;
-        }
-        (u64::from(stats.free_count)
-            + u64::from(stats.inactive_count)
-            + u64::from(stats.purgeable_count)
-            + u64::from(stats.speculative_count))
-            * page
+        let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+        (rc == libc::KERN_SUCCESS).then(|| {
+            (u64::from(stats.free_count)
+                + u64::from(stats.inactive_count)
+                + u64::from(stats.purgeable_count)
+                + u64::from(stats.speculative_count))
+                * page
+        })
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(target_os = "macos"))]
     {
-        0
+        None
     }
 }
