@@ -27,6 +27,8 @@ instantiate_row_gather(bfloat16, bfloat)
 
 instantiate_row_gather(float32, float)
 
+instantiate_row_gather(int32, int)
+
 template <typename T>
 [[kernel]] void row_scatter(
     const device T* in            [[buffer(0)]],

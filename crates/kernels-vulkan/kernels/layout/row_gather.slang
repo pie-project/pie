@@ -2,6 +2,8 @@
 
 #if defined(PIE_F32)
 #define PIE_T float
+#elif defined(PIE_I32)
+#define PIE_T int
 #else
 #define PIE_T PIE_ACT
 #endif
@@ -34,6 +36,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
 
 // pie:instantiate row_gather_bf16
 // pie:instantiate row_gather_f32 PIE_F32=1
+// pie:instantiate row_gather_i32 PIE_I32=1
 // pie:instantiate row_scatter_bf16 PIE_SCATTER=1
 // pie:instantiate row_scatter_f32 PIE_SCATTER=1 PIE_F32=1
 // pie:instantiate row_scatter_live_bf16 PIE_LIVE=1

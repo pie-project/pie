@@ -95,9 +95,12 @@ def arm(d, inputs, fused, h_block, mask, block_draft):
         h = ops.elemwise.residual_add(f, h)
     return ops.elemwise.rmsnorm_plus_one(h, d.norm, d.norm_eps)
 
-def plant_readout(d, logits, inputs, hb, block_draft):
+def plant_readout(d, logits, inputs, read, block_draft):
     """States the drafter on the trace and plants its proposals: the block's
-    logits, and the tokens drafted from them."""
+    logits, and the tokens drafted from them. `read` is the hidden state at
+    the readout rows `logits` were taken from: a fire may read out fewer of a
+    block's rows than it drafts (the verify width), and the selector walks
+    exactly the rows it has logits for."""
     block_drafter(
         logits,
         rows = d.block,
@@ -108,10 +111,11 @@ def plant_readout(d, logits, inputs, hb, block_draft):
     dlogits = logits.on(block_draft)
     seam.at(seam.MTP, [dlogits])
     sel = d.selector
-    if sel != None and hb != None:
+    if sel != None:
         unary, cand = ops.layout.topk(dlogits, sel.top_k)
+        hb = read.on(block_draft)
         hp = ops.linear.matmul(hb, sel.hidden_projection) if sel.hidden_projection != None else None
-        toks = inputs.tokens().on(block_draft)
+        toks = ops.layout.gather_rows(inputs.tokens(), inputs.readout_rows()).on(block_draft)
         picks = ops.attn.selector_walk(cand, unary, hp, toks, sel.pred, sel.succ, d.proposals_from)
     else:
         picks = ops.layout.argmax([dlogits])
