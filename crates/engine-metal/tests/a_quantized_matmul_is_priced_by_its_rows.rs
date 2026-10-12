@@ -73,10 +73,10 @@ fn every_row_count_is_timed() {
         return;
     };
     // `PIE_QMM_TUNING` lays profile decisions over the defaults, one
-    // `kernel.<id> = <value>` per comma:
+    // `kernel.<id> = <value>` per semicolon:
     // `kernel.qmm = [{ when = "rows >= 8", use = "tiled" }, { use = "qmv", rows_max = 4 }]`.
     let overrides = std::env::var("PIE_QMM_TUNING").unwrap_or_default();
-    let tuning = engine_metal::chip::tuning(&overrides.replace(',', "\n"), false);
+    let tuning = engine_metal::chip::tuning(&overrides.replace(';', "\n"), false);
     if !overrides.is_empty() {
         eprintln!("tuning: {overrides}");
     }
