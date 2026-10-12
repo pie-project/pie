@@ -41,7 +41,7 @@
   "dependencies": {
     "@pie-project/client": "^0.5.0",
     "@pie-project/server-web": "0.5.4",
-    "ws": "^8.18.0"
+    "ws": "^8.22.0"
   },
   "optionalDependencies": {
     "@pie-project/server-linux-x64": "0.5.4",

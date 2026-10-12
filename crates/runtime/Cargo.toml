@@ -47,9 +47,9 @@ media = { path = "../media" }
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
 blake3 = "1.8"
-fancy-regex = "0.18.0"
+fancy-regex = "0.19"
 async-trait = "0.1.91"
-wasm-metadata = "0.254.0"
+wasm-metadata = "0.259"
 rustc-hash = "2.1"
 smallvec = "1"
 lru = "0.18.1"
@@ -65,10 +65,10 @@ wgpu = { version = "30", default-features = false, features = ["wgsl"], optional
 tokio = { version = "1.53", features = ["full"] }
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 tracing-appender = "0.2"
-tracing-opentelemetry = "0.33"
-opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+tracing-opentelemetry = "0.34"
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
     "grpc-tonic",
     "trace",
     "metrics",
