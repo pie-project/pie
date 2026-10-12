@@ -48,11 +48,16 @@ pub struct ImportArgs {
 
 struct Consumed<'a> {
     metadata: &'a Metadata,
+    /// The drafter head's own files, when pie fetched them for this import.
+    head: Option<Metadata>,
 }
 
 impl Drop for Consumed<'_> {
     fn drop(&mut self) {
         let _ = remove_source_files(self.metadata);
+        if let Some(head) = &self.head {
+            let _ = remove_source_files(head);
+        }
     }
 }
 
@@ -141,7 +146,7 @@ pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<cra
         None if onto_artifact => source.path.clone(),
         None => store_path(&source.name),
     };
-    let overlay = match &args.aux {
+    let mut overlay = match &args.aux {
         Some(spec) => {
             let head = resolve_source(spec)?;
             source.origin = format!("{} +aux {}", source.origin, head.origin);
@@ -476,8 +481,10 @@ pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<cra
         std::fs::write(&marker, out_file.to_string_lossy().as_bytes())
             .with_context(|| format!("cannot mark {} as being consumed", marker.display()))?;
     }
+    let head = overlay.as_mut().and_then(|overlay| overlay.fetched.take());
     let consumed = consume.then(|| Consumed {
         metadata: &metadata,
+        head,
     });
     let written_bytes = write_artifact(
         &mut writer,
@@ -787,6 +794,8 @@ fn overlay_onto_artifact(
 struct Overlay {
     path: PathBuf,
     metadata: Metadata,
+    /// The head's source, when pie downloaded it: consumed with the target.
+    fetched: Option<Metadata>,
 }
 
 impl Drop for Overlay {
@@ -853,6 +862,7 @@ fn stage_overlay(head: &Source, out_file: &Path) -> Result<Overlay> {
     Ok(Overlay {
         path,
         metadata: staged,
+        fetched: head.fetched.then_some(metadata),
     })
 }
 
