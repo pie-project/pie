@@ -17,6 +17,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.msgpack.core.MessagePack
 import org.msgpack.value.Value
+import org.msgpack.value.ValueFactory
 
 /** A server scripted per request: [script] sees each client frame and answers through [push]. */
 class MockServer(private val script: (Map<String, Value>, MockServer) -> Unit) : PieTransport {
@@ -90,6 +91,26 @@ class PieClientTest {
         assertEquals("echo", launch.getValue("inferlet").asStringValue().asString())
         val input = Json.parseToJsonElement(launch.getValue("input").asStringValue().asString()).jsonObject
         assertEquals("hi", input.getValue("prompt").jsonPrimitive.content)
+    }
+
+    @Test
+    fun reassemblesAFileFromItsChunks(): Unit = runBlocking {
+        val mock = server { message, server ->
+            server.respond(message, result = "p3")
+            for ((index, part) in listOf("PN", "G!").withIndex()) {
+                server.push(
+                    "type" to "file", "process_id" to "p3", "file_hash" to "h", "chunk_index" to index.toLong(),
+                    "total_chunks" to 2L, "chunk_data" to ValueFactory.newBinary(part.toByteArray()), "name" to "preview-0.png",
+                )
+            }
+            server.event("p3", "return", "ok")
+        }
+        val client = PieClient.connect(mock)
+        val events = client.launch("draw").events.toList()
+        val file = events.first() as PieProcess.Event.File
+        assertEquals("preview-0.png", file.name)
+        assertEquals("PNG!", file.bytes.decodeToString())
+        assertEquals(PieProcess.Event.Returned("ok"), events.last())
     }
 
     @Test

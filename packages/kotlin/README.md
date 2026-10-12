@@ -30,6 +30,7 @@ client.launch(name, Prompt("Hi!")).events.collect { event ->
     when (event) {
         is PieProcess.Event.Stdout -> print(event.text)
         is PieProcess.Event.Message -> print(event.text)
+        is PieProcess.Event.File -> File(context.filesDir, event.name ?: "out.bin").writeBytes(event.bytes)
         is PieProcess.Event.Returned -> println("returned ${event.value}")
         is PieProcess.Event.Stderr -> Unit
     }

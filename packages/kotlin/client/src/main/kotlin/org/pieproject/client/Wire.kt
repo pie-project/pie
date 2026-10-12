@@ -33,6 +33,14 @@ internal sealed interface ClientFrame {
 internal sealed interface ServerFrame {
     data class Response(val correlationId: Int, val ok: Boolean, val result: String) : ServerFrame
     data class ProcessEvent(val processId: String, val event: String, val value: String) : ServerFrame
+    class FileChunk(
+        val processId: String,
+        val hash: String,
+        val index: Int,
+        val total: Int,
+        val data: ByteArray,
+        val name: String?,
+    ) : ServerFrame
     data object Other : ServerFrame
 
     companion object {
@@ -57,6 +65,18 @@ internal sealed interface ServerFrame {
                         throw PieException.MalformedFrame("a process event without process_id or event")
                     }
                     ProcessEvent(id, event, string("value") ?: "")
+                }
+                "file" -> {
+                    fun int(key: String): Int? = message[key]?.takeIf(Value::isIntegerValue)?.asIntegerValue()?.toInt()
+                    val id = string("process_id")
+                    val hash = string("file_hash")
+                    val index = int("chunk_index")
+                    val total = int("total_chunks")
+                    val data = message["chunk_data"]?.takeIf(Value::isBinaryValue)?.asBinaryValue()?.asByteArray()
+                    if (id == null || hash == null || index == null || total == null || data == null) {
+                        throw PieException.MalformedFrame("a file chunk without its process, hash, index, total or data")
+                    }
+                    FileChunk(id, hash, index, total, data, string("name"))
                 }
                 else -> Other
             }
