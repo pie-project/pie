@@ -303,9 +303,19 @@ jobs:
           ./packages/javascript/server-web/build.sh release
           for l in python javascript; do tar xzf "$RUNNER_TEMP/languages/pie-language-$l.tar.gz" -C "$RUNNER_TEMP/home"; done
           PIE_HOME="$RUNNER_TEMP/home" ./tests/browser/tools/inferlets.sh
-          node tests/browser/tools/headless.mjs . "tests/browser/transport.html?n=20&model=models/tiny.wgpu.zt" --timeout 300000
-          node tests/browser/tools/headless.mjs . "tests/browser/index.html?auto&max_tokens=4&model=models/tiny.wgpu.zt&config=max_total_pages%20%3D%20512,max_forward_tokens%20%3D%201024,max_forward_requests%20%3D%208,max_state_slots%20%3D%2016" --timeout 900000
-          node tests/browser/tools/headless.mjs . "tests/browser/server.html?model=models/tiny.wgpu.zt" --timeout 900000
+          # The three pages are independent and each spends its minutes in
+          # SwiftShader compiling pipelines on one core: they run side by side,
+          # each logging to its own file, and the step fails if any does.
+          page() { node tests/browser/tools/headless.mjs . "$2" --timeout "$3" > "$RUNNER_TEMP/$1.log" 2>&1; }
+          page transport "tests/browser/transport.html?n=20&model=models/tiny.wgpu.zt" 300000 & transport=$!
+          page index "tests/browser/index.html?auto&max_tokens=4&model=models/tiny.wgpu.zt&config=max_total_pages%20%3D%20512,max_forward_tokens%20%3D%201024,max_forward_requests%20%3D%208,max_state_slots%20%3D%2016" 900000 & index=$!
+          page server "tests/browser/server.html?model=models/tiny.wgpu.zt" 900000 & server=$!
+          failed=0
+          for name in transport index server; do
+            wait "${!name}" || { echo "::error::the $name page failed"; failed=1; }
+            echo "== $name"; cat "$RUNNER_TEMP/$name.log"
+          done
+          exit $failed
         env:
           PIE_CHROME_ARGS: --use-webgpu-adapter=swiftshader --enable-unsafe-swiftshader
 
