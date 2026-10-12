@@ -343,8 +343,13 @@ impl Shell {
             )
         });
         let device = Context::bind()?;
-        let measured =
-            crate::chip::facts(device.family(), device.cores(), crate::chip::ane_loads());
+        let perf_cores = crate::chip::perf_cores();
+        let measured = crate::chip::facts(
+            device.family(),
+            device.cores(),
+            perf_cores,
+            crate::chip::ane_loads(),
+        );
         let (chip, chip_report) =
             crate::chip::resolve(device.name(), &measured, boot.profiles.as_deref());
         crate::chip::tell_untuned(device.name(), &chip_report);
@@ -512,7 +517,7 @@ impl Shell {
             vec![None; compiled.template().len()]
         };
         let prefetch = chip.get::<crate::chip::ExpertsPrefetch>().0;
-        let threads = chip.get::<crate::chip::ExpertsThreads>().0;
+        let threads = chip.get::<crate::chip::ExpertsThreads>().count(perf_cores);
         let residency = boot
             .residency
             .clone()
