@@ -143,7 +143,6 @@ pub struct MoeAffineWmma;
 #[decision(id = "kernel.moe.affine_grouped_from", constant(range(1..=65_536)), default = 16, tune = search)]
 pub struct MoeAffineGroupedFrom(pub u32);
 
-/// Register every decision this crate reads.
 pub fn register(registry: &mut Registry) {
     registry
         .add::<MoeGrouped>()

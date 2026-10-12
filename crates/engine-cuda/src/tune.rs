@@ -11,15 +11,12 @@ use profile::{Facts, Profile};
 /// nothing to a single-GPU load.
 pub const SEARCH_SKIPS: &[&str] = &["compiler.cost.collective_us"];
 
-/// What a run produced.
 pub struct Outcome {
     pub device: String,
-    /// The complete profile, ready for the user's shelf.
     pub file: String,
     pub lines: Vec<Line>,
     /// The end-to-end runs, today's profile against the tuned one.
     pub checks: Vec<Check>,
-    /// Whether the tuned file differs from today's at all.
     pub changed: bool,
     pub seconds: f64,
 }
@@ -191,7 +188,6 @@ fn plan_of(deployment: &str, chip: &Profile, sms: u32) -> Option<u64> {
     Some(h.finish())
 }
 
-/// The patch ladder a vision row is served with, for a text prompt.
 fn patches(trace: &poem_ir::Trace, slots: u32) -> Option<poem_compiler::PatchLadder> {
     crate::api::patch_ladder(
         trace,
@@ -203,7 +199,6 @@ fn patches(trace: &poem_ir::Trace, slots: u32) -> Option<poem_compiler::PatchLad
     )
 }
 
-/// CUDA's bench: the check models, served on GPU 0.
 struct Cuda<'a> {
     models: &'a [(PathBuf, String)],
     device: &'a str,

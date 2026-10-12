@@ -518,7 +518,6 @@ fn run_lt(
 
 struct Device {
     lt: LtCtx,
-    /// cuBLASLt candidates a shape is timed over (`kernel.gemm.heuristics`).
     heuristics: usize,
     plans: HashMap<(i32, i32, i32), Arc<LtPlan>>,
     chosen: HashMap<u64, Tactic>,
@@ -627,7 +626,6 @@ impl Device {
     }
 }
 
-/// A tuned tactic's key: the shape, and the settings it was chosen under.
 fn shape_key(call: Call, workspace_bytes: usize, heuristics: usize) -> u64 {
     let mut bytes = [0u8; 28];
     bytes[..4].copy_from_slice(&call.m.to_le_bytes());

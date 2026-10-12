@@ -17,7 +17,6 @@ pub const FACTS: &[Var] = &[
     Var::fixed("sms", Domain::COUNT),
 ];
 
-/// The recording axes a dynamic variable may name.
 pub const AXES: &[&str] = &["rows"];
 
 /// Whether fires are captured as CUDA graphs.
@@ -87,7 +86,6 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     r
 });
 
-/// Every decision the CUDA engine exposes.
 #[must_use]
 pub fn registry() -> &'static Registry {
     &REGISTRY
@@ -95,7 +93,6 @@ pub fn registry() -> &'static Registry {
 
 macro_rules! seeded {
     ($($file:literal),* $(,)?) => {
-        /// The profiles checked in with pie, as `(file name, text)`.
         pub const SEEDED: &[(&str, &str)] = &[
             $(($file, include_str!(concat!("../profiles/", $file)))),*
         ];
@@ -104,14 +101,11 @@ macro_rules! seeded {
 
 seeded!("nvidia-l40s.toml");
 
-/// Where CUDA's profiles live.
 pub static SHELF: Shelf = Shelf {
     backend: "cuda",
     seeded: SEEDED,
 };
 
-/// The facts of a GPU at compute capability `major.minor` with `sms`
-/// multiprocessors.
 #[must_use]
 pub fn facts(major: u32, minor: u32, sms: u32) -> Facts {
     Facts::of(registry())
