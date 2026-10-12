@@ -12,7 +12,6 @@
 #endif
 
 #define PIE_BN 64
-// The K block: 16 by default (`qmm_rt_k16`), 32 for the tuning that asks.
 #ifndef PIE_BK
 #define PIE_BK 32
 #endif

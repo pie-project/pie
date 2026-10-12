@@ -1043,9 +1043,7 @@ async fn main(input: Input) -> Result<Output> {
 
     let velocity_width = roles.denoise.readout_width;
     let cells = (rows * row_width) as usize;
-    // From noise, the latent is drawn here and every fire is a step. An
-    // init picture keeps the seeding fire: its first epilogue noises the
-    // encoded picture on the device.
+    // An init picture keeps the seeding fire, which noises it on the device.
     let seeded = init_latent.is_none();
     let start = seeded.then(|| host_noise(input.seed.unwrap_or(0), cells));
     let mut loops = if seeded {
@@ -1171,11 +1169,9 @@ async fn main(input: Input) -> Result<Output> {
         });
     }
 
-    // Both paths are the same loop: every branch starts from the same drawn
-    // latent and the device integrates its own Euler step, guided or not.
-    // The guided branches read each other's velocity off the fire's own
-    // plane, so nothing crosses the host between steps and the same seed
-    // draws the same latent either way.
+    // Both paths are the same loop: the device integrates its own Euler step,
+    // guided or not, and the guided branches read each other's velocity off
+    // the fire's own plane, so nothing crosses the host between steps.
     let mut last: Vec<f32> = Vec::new();
     for fire in 0..loops.fires() {
         let passes: Vec<&ForwardPass> = branches

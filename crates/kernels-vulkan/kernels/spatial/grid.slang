@@ -67,7 +67,6 @@ void segment_of(SpatialClip g, int local, int seg_frames, out int begin, out int
     end = g.off + last * plane;
 }
 
-// A row past a dispatch's 65535-group axis rides the z groups.
 uint spatial_row(uint3 group, uint span) {
     return group.y + group.z * span;
 }

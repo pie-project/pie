@@ -17,8 +17,7 @@ pub(crate) fn absorbed_weights(trace: &Trace) -> BTreeSet<usize> {
     rows
 }
 
-/// The weights an f32 activation multiplies: the quantized kernels take bf16
-/// activations alone, so these are decoded to dense planes at load.
+/// Weights an f32 activation multiplies: the quantized kernels take bf16 activations only.
 pub(crate) fn lane_axis_weights(trace: &Trace) -> BTreeSet<usize> {
     let f32_rows = |value: poem_ir::ValueId| {
         matches!(

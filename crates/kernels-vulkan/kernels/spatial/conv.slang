@@ -1,8 +1,6 @@
 #include "common/bf16.slang"
 #include "spatial/grid.slang"
 
-// One output channel per 32-lane strip of a row; the strip splits the input
-// channels and folds its partial sums in shared memory.
 #define PIE_STRIPS 4
 #define PIE_LANES 32
 #define PIE_THREADS (PIE_STRIPS * PIE_LANES)

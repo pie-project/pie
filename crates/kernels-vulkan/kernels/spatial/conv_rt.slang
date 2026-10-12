@@ -1,12 +1,7 @@
 #include "common/bf16.slang"
 #include "spatial/grid.slang"
 
-// A convolution as a register-tiled GEMM over its taps: output rows x output
-// channels, contracted over `taps * c_in` with the weight taps-major. Each
-// invocation holds a 4x4 block of the output; a 16-wide K block lies inside
-// one tap (`c_in % 16 == 0`), so its activation rows are one gathered voxel
-// per output row. No frame cache: a causal clip's history takes the plain
-// point.
+// A convolution as a register-tiled GEMM over `taps * c_in`, the weight taps-major.
 
 #define PIE_BM 64
 #define PIE_BN 64
@@ -37,8 +32,6 @@ struct Push {
 
 groupshared float4 xs[PIE_BK * PIE_TY];
 groupshared float4 ws[PIE_BK * PIE_TX];
-// Each tile row's input clip and its window's corner, then the voxel it
-// gathers at the current tap (-1 for padding).
 groupshared int4 corner[PIE_BM];
 groupshared int4 clip_box[PIE_BM];
 groupshared int src[PIE_BM];

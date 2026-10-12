@@ -1,7 +1,6 @@
 #include "spatial/grid.slang"
 
-// Derives each clip's output extent under a layer's rule and the running
-// row offsets: conv (0), upsample (1), shuffle (2), unshuffle (3), avg-down (4).
+// Rules: conv (0), upsample (1), shuffle (2), unshuffle (3), avg-down (4).
 [[vk::binding(0)]] StructuredBuffer<int> grid;
 [[vk::binding(1)]] RWStructuredBuffer<int> out_;
 struct Push {

@@ -332,8 +332,7 @@ impl DenoiseLoop {
         }
     }
 
-    /// A loop whose latent arrives already drawn (see [`host_noise`]): one
-    /// fire per step, and no forward spent on a fire that only seeds.
+    /// One fire per step over a latent drawn up front by [`host_noise`].
     #[must_use]
     pub fn seeded(sched: &FlowMatchEuler) -> DenoiseLoop {
         let mut ts = sched.timesteps();
@@ -420,8 +419,6 @@ pub fn seed_or_step(
     rng.put(&state + &Tensor::constant([0u32, 1u32]));
 }
 
-/// One Euler step of a [`DenoiseLoop::seeded`] loop, fire `k` integrating
-/// `dts[k]`.
 pub fn step(k: &Tensor, x: &Channel, velocity: &Tensor, dts: &Channel, out: Option<&Channel>) {
     let next = euler_step(&x.take(), velocity, &at(&dts.read(), k));
     x.put(&next);
@@ -430,9 +427,7 @@ pub fn step(k: &Tensor, x: &Channel, velocity: &Tensor, dts: &Channel, out: Opti
     }
 }
 
-/// `len` standard normal draws keyed by `seed`, drawn in the guest: the
-/// starting latent of a [`DenoiseLoop::seeded`] loop. SplitMix64 into
-/// Box-Muller, so a seed draws the same latent on every host.
+/// `len` standard normal draws for `seed`, the same on every host.
 #[must_use]
 pub fn host_noise(seed: u32, len: usize) -> Vec<f32> {
     let mut state = u64::from(seed) ^ 0x9e37_79b9_7f4a_7c15;

@@ -1,7 +1,5 @@
 #include "common/bf16.slang"
 
-// o = bf16(x), one element per invocation.
-
 [[vk::binding(0)]] StructuredBuffer<float> x;
 PIE_BUFFER_RW(1, o);
 

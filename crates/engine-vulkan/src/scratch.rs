@@ -96,7 +96,6 @@ pub struct Scratch {
 
     split: Option<SplitRooms>,
 
-    /// A VAE group norm's per-clip partial and final moments.
     spatial: Option<Room>,
 
     copy: Option<CopyRoom>,
@@ -332,8 +331,6 @@ impl Scratch {
         self.plane.bytes()
     }
 
-    /// The partial and final moment planes a group norm over `clips` clips
-    /// in `groups` groups folds through.
     pub fn spatial_moments(
         &self,
         handles: &Handles,

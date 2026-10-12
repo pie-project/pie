@@ -1,8 +1,5 @@
 #include "common/bf16.slang"
 
-// y = x w^T for an f32 activation: the timestep and modulation projections
-// a diffusion model runs over a handful of lane rows. One invocation an
-// output; the weight is bf16 unless PIE_W_F32, the output f32 unless PIE_Y_BF16.
 
 [[vk::binding(0)]] StructuredBuffer<float> x;
 #ifdef PIE_W_F32

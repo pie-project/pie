@@ -1,9 +1,6 @@
 #include "common/bf16.slang"
 #include "spatial/grid.slang"
 
-// Single-head attention over a VAE's voxels: one workgroup per query row
-// attends every row of its clip (or its run of seg_frames frames). Four
-// 32-lane strips take keys in turn with an online softmax, then fold.
 #ifndef PIE_C_MAX
 #error "spatial attention requires -DPIE_C_MAX"
 #endif

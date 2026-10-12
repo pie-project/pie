@@ -129,7 +129,6 @@ fn tile_grid(op: &'static str, rows: u32, columns: u32) -> Result<Grid, Error> {
     ))
 }
 
-/// An f32 activation against a bf16 or f32 weight, one invocation an output.
 fn f32_act(
     ctx: &Ctx<'_>,
     op: &'static str,

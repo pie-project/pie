@@ -1,11 +1,6 @@
 #include "common/bf16.slang"
 
-// Ragged bidirectional attention, tiled: a workgroup holds 32 query
-// rows of one head, four invocations a row with a quarter of its dims each,
-// and streams the keys through workgroup memory 4 at a time with an online
-// softmax. A row's keys are its segment's: `segments` (the query CSR) finds
-// the segment, and `kv_segments` (ragged) or `segments` itself names its
-// keys.
+// 32 query rows of one head a workgroup, 4 invocations a row; keys stream 4 at a time.
 
 #ifndef PIE_D
 #error "tiled attention is compiled at a head width: -DPIE_D=128"

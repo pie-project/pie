@@ -277,7 +277,6 @@ impl std::fmt::Debug for Buffer {
 }
 
 impl Buffer {
-    /// The whole of a slab a handle row points into, as a buffer.
     pub(crate) fn of_slab(slab: Slab) -> Buffer {
         let bytes = slab.size;
         Buffer { slab, bytes }

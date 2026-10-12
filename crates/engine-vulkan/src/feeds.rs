@@ -18,8 +18,7 @@ pub(crate) struct MergedPort {
 }
 
 impl Feeds {
-    /// Where port `index` of `ports` sits among the seats the inputs store
-    /// carves: every port but a voxel one, which rides the voxel payload.
+    /// The seat of port `index`; voxel ports ride the voxel payload instead.
     pub(crate) fn seat_of(&self, index: usize) -> usize {
         self.ports[..index]
             .iter()

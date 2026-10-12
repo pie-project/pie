@@ -745,7 +745,6 @@ fn build_pipelines(device: &Context, lowered: &crate::guest::Lowered) -> Result<
             })
             .collect();
         if infos.is_empty() {
-            // A stage that only moves cells between channels runs no shader.
             d.destroy_shader_module(module, None);
             return Ok(Built {
                 core: Arc::clone(core),

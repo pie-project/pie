@@ -1,7 +1,5 @@
 #include "dit/types.slang"
 
-// One activation or sum per element: o = silu(x), tanh(x), or x + y.
-
 [[vk::binding(0)]] StructuredBuffer<PIE_XT> x;
 #ifdef PIE_OP_ADD
 [[vk::binding(1)]] StructuredBuffer<PIE_XT> y;

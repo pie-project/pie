@@ -1,7 +1,6 @@
 #include "common/bf16.slang"
 
 PIE_BUFFER_RW(0, out_);
-// An f32 row may take a bf16 bias: the bank keeps the checkpoint's element.
 #ifdef PIE_BIAS_BF16
 [[vk::binding(1)]] StructuredBuffer<uint16_t> bias;
 #define PIE_BIAS(i) bf16_to_f32(bias[i])

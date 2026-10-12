@@ -1,9 +1,6 @@
 #include "common/bf16.slang"
 #include "spatial/grid.slang"
 
-// Voxel resampling between clip grids: nearest upsample, pixel (un)shuffle,
-// channel-run average-down, and the causal frame cache's gather and store.
-// One lane per output element; a row past the clip table writes zero.
 
 #if defined(PIE_CACHE_GATHER)
 PIE_BUFFER_RO(0, slab);
@@ -33,7 +30,6 @@ struct Push { uint channels; uint clips; uint r1; uint r2; uint r3; uint p3; uin
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
 #if defined(PIE_CACHE_GATHER) || defined(PIE_CACHE_STORE)
-// The clip whose frames x plane rows hold `row`, and that run's first row.
 int cache_clip(uint row, out int base, out SpatialClip found) {
     base = 0;
     found = clip_at(grid, 0);

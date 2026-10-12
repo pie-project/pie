@@ -22,7 +22,6 @@ impl From<String> for Refusal {
 
 struct Instance {
     program: ProgramId,
-    /// The registered channels the instance binds, in its program's order.
     ids: Vec<ChannelId>,
     plan: Arc<ExecPlan>,
     inst: InterpInstance,
@@ -37,16 +36,12 @@ struct Instance {
     faulted: Arc<AtomicBool>,
 }
 
-/// The cell a lane's input port reads this fire: the one the instance's own
-/// take would read.
 #[derive(Debug, Clone)]
 pub enum PortCell {
-    /// On the host ring, as wire bytes.
     Host {
         bytes: Vec<u8>,
         dtype: eta_ir::types::Dtype,
     },
-    /// On the device, kept there by a pass still on the queue or landed.
     #[cfg(feature = "vulkan")]
     Device {
         cell: crate::device::Buffer,
@@ -245,7 +240,6 @@ impl Plane {
             })
     }
 
-    /// The cell channel `id` of `instance` holds for an input port this fire.
     pub fn port_cell(&self, instance: InstanceId, id: ChannelId) -> Result<PortCell, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",

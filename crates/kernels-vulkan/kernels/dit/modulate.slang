@@ -1,8 +1,5 @@
 #include "dit/types.slang"
 
-// adaLN modulation of each row by its lane's (or its own) vectors:
-// scale-shift x * (1 + s) + b, scale x * (1 + s), or tanh-gate tanh(g) * x.
-// PIE_GATED instead folds a gated residual: r + g * y.
 
 #ifdef PIE_GATED
 [[vk::binding(0)]] StructuredBuffer<PIE_XT> r;

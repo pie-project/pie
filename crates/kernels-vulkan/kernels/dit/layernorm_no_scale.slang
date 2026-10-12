@@ -1,7 +1,6 @@
 #include "dit/types.slang"
 #include "common/reduce.slang"
 
-// Layer norm with no affine: (x - mean) / sqrt(var + eps), one workgroup a row.
 
 [[vk::binding(0)]] StructuredBuffer<PIE_XT> x;
 [[vk::binding(1)]] RWStructuredBuffer<PIE_XT> o;

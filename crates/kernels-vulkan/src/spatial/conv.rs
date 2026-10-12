@@ -12,8 +12,7 @@ const THREADS: u32 = 128;
 
 const STRIPS: u32 = THREADS / 32;
 
-/// The register-tiled point: 64 x 64 output tiles over 16-wide K blocks, so a
-/// block lies inside one tap when `c_in` is a multiple of 16.
+/// A 16-wide K block of the tiled point stays inside one tap when `c_in % 16 == 0`.
 const RT_FILE: &str = "spatial/conv_rt.slang";
 
 const RT_TILE: u32 = 64;

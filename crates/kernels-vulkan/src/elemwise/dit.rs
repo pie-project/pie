@@ -1,6 +1,4 @@
-//! The elementwise points a diffusion transformer runs: timestep sinusoids,
-//! adaLN modulation and its gated residual, layer norm with no affine,
-//! multi-axis rotary positions, and the plain activations and sum.
+//! A diffusion transformer's elementwise ops.
 
 use dtype::Dtype;
 

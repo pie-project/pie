@@ -13,8 +13,6 @@ PIE_BUFFER_RO(1, k);
 PIE_BUFFER_RO(2, v);
 PIE_BUFFER_RW(3, o);
 [[vk::binding(4)]] StructuredBuffer<int> segments;
-// Ragged: a query row's group is found in `segments` (the query CSR) and
-// attends that group's rows of `kv_segments`, a different rectangle.
 #ifdef PIE_RAGGED
 [[vk::binding(5)]] StructuredBuffer<int> kv_segments;
 #endif

@@ -1,5 +1,4 @@
-//! The voxel suite an image or video VAE runs over clip tables: grid rules,
-//! 3-D convolution, group norm, resampling, and mid-block attention.
+//! A VAE's ops over clip tables.
 
 pub mod attn;
 pub mod conv;
@@ -12,12 +11,9 @@ use crate::error::Error;
 use crate::tensor::Tensor;
 use dtype::Dtype;
 
-/// Rows past one dispatch axis's 65535 groups ride the z axis; the shader
-/// reads its row as `group.y + group.z * span`.
+/// Rows past 65535 groups ride the z axis: row = `group.y + group.z * span`.
 const ROW_SPAN: u32 = 65_535;
 
-/// A grid of `lanes` x `rows` with `group` lanes a workgroup, and the span the
-/// shader folds its row from.
 pub(crate) fn row_grid(lanes: u32, rows: u32, group: u32) -> (Grid, u32) {
     let span = rows.clamp(1, ROW_SPAN);
     (

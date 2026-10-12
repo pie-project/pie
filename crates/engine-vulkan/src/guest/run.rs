@@ -18,7 +18,6 @@ pub struct Readout<'a> {
 
     pub width: u32,
 
-    /// The seat holds f32 (a velocity or hidden state) rather than bf16.
     pub f32: bool,
 }
 
@@ -27,7 +26,6 @@ pub struct OnDevice<'a> {
     session: &'a mut Session,
     widen: &'a Widen,
     logits: Option<Readout<'a>>,
-    /// A VAE reading's pixels, for a pass that reads `pixels`.
     pixels: Option<Readout<'a>>,
 
     ran: Vec<usize>,
@@ -422,7 +420,6 @@ fn from_heap(raw: &[u8], dtype: Dtype, held: u64) -> Value {
     }
 }
 
-/// The intrinsics a pass reads off the fire's readout seat.
 fn reads_readout(id: Option<IntrinsicId>) -> bool {
     matches!(
         id,

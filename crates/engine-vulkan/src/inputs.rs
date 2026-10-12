@@ -22,8 +22,6 @@ pub struct PatchSeat {
     pub dtype: Dtype,
 }
 
-/// A VAE's voxel axis: the payload rows, each clip's box and where it starts,
-/// and the slot each clip belongs to.
 #[derive(Debug, Clone, Copy)]
 pub struct VoxelSeat {
     pub rows: u64,
@@ -58,8 +56,6 @@ pub struct VoxelFire<'a> {
     pub payload: &'a [u8],
 }
 
-/// A per-lane or per-row input a diffusion fire reads off a channel: the
-/// latents, the timestep vector, the context, the axis positions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PortSeat {
     pub kind: engine::fire::PortKind,
@@ -103,7 +99,6 @@ pub struct PackingHandles {
     pub permutation: Tensor,
 }
 
-/// One selection's packing of a fire's rows into attention groups.
 #[derive(Debug, Clone, Copy)]
 pub struct PackingFire<'a> {
     pub group_indptr: &'a [i32],
@@ -415,7 +410,6 @@ impl Inputs {
         })
     }
 
-    /// The store and the offset of the voxel payload, for a voxel port's cell.
     #[must_use]
     pub fn voxel_payload(&self) -> Option<(&Buffer, u64)> {
         self.voxels.map(|at| (&self.store, at.payload))
@@ -425,8 +419,6 @@ impl Inputs {
         self.store.write(at, bytes)
     }
 
-    /// The store and the offset of port `port`'s rectangle, for a channel's
-    /// cell to be copied into.
     #[must_use]
     pub fn port_seat(&self, port: usize) -> Option<(&Buffer, u64)> {
         self.ports.get(port).map(|at| (&self.store, at.at))

@@ -245,8 +245,6 @@ fn patch_bytes(
     }
 }
 
-/// The voxel axis a plan with a VAE reading walks: the load's budget, or a
-/// derived ceiling.
 #[must_use]
 pub fn voxel_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<poem_compiler::VoxelLadder> {
     const DERIVED_VOXEL_CEILING: u32 = 65_536;
@@ -268,7 +266,6 @@ pub fn voxel_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<poem_compile
     })
 }
 
-/// A voxel row's f32 payload as the plan's element.
 fn voxel_bytes(
     payload: &[f32],
     element: poem_ir::Dtype,
@@ -1129,8 +1126,6 @@ impl Vulkan {
             }
         }
 
-        // The cells a lane's input ports read, off the instance it is
-        // attached to.
         let mut port_cells: Vec<Vec<(engine::fire::PortFeed, crate::program::PortCell)>> =
             vec![Vec::new(); submission.lanes.len()];
         for (at, lane) in submission.lanes.iter().enumerate() {

@@ -14,7 +14,6 @@ uint16_t f32_to_bf16(float f) {
     return uint16_t(rounded >> 16);
 }
 
-// PIE_ACT_F32 stamps a kernel's activation buffers f32 rather than bf16.
 #ifdef PIE_ACT_F32
 #define PIE_ACT float
 #define PIE_LOAD(x) (x)

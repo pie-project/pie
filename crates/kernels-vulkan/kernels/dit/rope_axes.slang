@@ -1,8 +1,5 @@
 #include "dit/types.slang"
 
-// Rotary positions over up to four axes, each owning a slice of the rotated
-// channels with its own theta: interleaved pairs, neox halves, split halves
-// per axis, or one ladder handed round-robin across the axes.
 
 [[vk::binding(0)]] StructuredBuffer<PIE_XT> x;
 [[vk::binding(1)]] StructuredBuffer<float> positions;

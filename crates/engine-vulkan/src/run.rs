@@ -105,13 +105,9 @@ pub struct FireBindings {
 
     pub scores: Option<crate::scores::ScoreSeat>,
 
-    /// Each lane's attention group, and each selection's packing of the
-    /// fire's rows into groups, in the order the load lists the selections.
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
-    /// The input ports' rectangles, by kind and port.
     pub ports: Vec<(engine::fire::PortKind, u8, Tensor)>,
-    /// The voxel axis a VAE reading walks.
     pub voxels: Option<crate::inputs::VoxelHandles>,
 }
 
@@ -225,7 +221,6 @@ impl<'c> Run<'c> {
 
     /// After `node` runs: submits what the frame holds once a new layer
     /// starts. A failed submit faults the frame, which its commit reports.
-    /// A node outside any layer splits at each convolution.
     pub(crate) fn split_at(&mut self, node: &Node) {
         let Some(held) = self.split.as_mut() else {
             return;

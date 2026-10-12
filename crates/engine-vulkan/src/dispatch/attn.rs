@@ -249,7 +249,6 @@ impl Run<'_> {
                 mask,
                 o,
             } => {
-                // One launch answers every row of the fire.
                 if self.run_index() > 0 {
                     return Ok(());
                 }

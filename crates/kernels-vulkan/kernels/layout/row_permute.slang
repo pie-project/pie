@@ -1,8 +1,6 @@
 #include "common/bf16.slang"
 
-// Rows moved by a permutation: a gather packs the fire's rows into their
-// attention groups' order, a scatter unpacks them back. A row the table
-// names as -1 is padding and moves nowhere.
+// A row the table names as -1 is padding.
 
 PIE_BUFFER_RO(0, src);
 PIE_BUFFER_RW(1, dst);

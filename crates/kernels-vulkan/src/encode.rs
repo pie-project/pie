@@ -220,7 +220,6 @@ macro_rules! dtype_dispatch {
 #[allow(unused_imports)]
 pub(crate) use dtype_dispatch;
 
-/// An entry name built at run time, kept for the life of the process.
 pub(crate) fn symbol(name: &str) -> &'static str {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};

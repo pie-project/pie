@@ -767,15 +767,12 @@ pub fn copy_words(ctx: &Ctx<'_>, src: Tensor, dst: Tensor, bytes: u64) -> Result
     )
 }
 
-/// Gathers `x`'s rows into `o` in `perm`'s order: a fire's rows packed into
-/// their attention groups.
 pub fn pack_rows(ctx: &Ctx<'_>, x: Tensor, perm: Tensor, o: Tensor) -> Result<(), Error> {
     const OP: &str = "layout.pack_rows";
     let entry = dtype_dispatch!(OP, o.dtype, { Bf16 => "pack_rows_bf16", F32 => "pack_rows_f32" });
     permute_rows(ctx, OP, entry, x, perm, o, o.rows)
 }
 
-/// Scatters `x`'s rows back to where `perm` names them.
 pub fn unpack_rows(ctx: &Ctx<'_>, x: Tensor, perm: Tensor, o: Tensor) -> Result<(), Error> {
     const OP: &str = "layout.unpack_rows";
     let entry =

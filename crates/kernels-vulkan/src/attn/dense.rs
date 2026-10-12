@@ -124,10 +124,7 @@ pub fn bidirectional(
     )
 }
 
-/// Full attention inside each segment of a packed fire: a query row of
-/// segment `s` attends the rows `kv_indptr[s]..kv_indptr[s + 1]` of the key
-/// and value rectangles. Both CSRs are padded with their last entry, so a
-/// segment past the live ones is empty.
+/// A query row of segment `s` attends key rows `kv_indptr[s]..kv_indptr[s + 1]`.
 #[allow(clippy::too_many_arguments)]
 pub fn ragged(
     ctx: &Ctx<'_>,
@@ -184,8 +181,6 @@ pub fn ragged(
         .filter(|s| *s > 0)
         .ok_or_else(|| refuse(OP, format!("a CSR of {entries} entries names no segment")))?;
     let rows = nonzero(OP, "query rows", q.rows)?;
-    // A bf16 head of 64 or 128 takes the tiled point: 32 query rows a
-    // workgroup, the keys streamed through workgroup memory.
     let (file, entry, grid) = match (q.dtype, head_dim) {
         (Dtype::Bf16, 64 | 128) => (
             TILED_FILE,

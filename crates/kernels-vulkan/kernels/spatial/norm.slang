@@ -1,10 +1,6 @@
 #include "common/bf16.slang"
 #include "spatial/grid.slang"
 
-// Group norm over each clip's voxels in three passes: Welford moments per
-// split of a clip's rows, their fold into (mean, rstd) per (clip, group), and
-// the affine (and optional SiLU) apply. The 32-lane folds mirror a simdgroup
-// butterfly through shared memory.
 
 void welford_merge(inout float cnt, inout float mean, inout float m2,
                    float cnt_b, float mean_b, float m2_b) {

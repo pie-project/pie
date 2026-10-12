@@ -81,10 +81,7 @@ pub struct DeviceTuning {
     /// Batched quantized projections on the register-tiled point (a 4x4
     /// block per invocation) rather than the plain tiled one.
     pub qmm_register_tiles: bool,
-    /// The register-tiled point's K block is 16 wide rather than 32: half the
-    /// workgroup memory and half the unrolled loop. PowerVR runs a 596-row
-    /// 3072 x 27648 projection in 273 ms against 688, Adreno 840 in 138
-    /// against 152.
+    /// A 16-wide K block on the register-tiled point; faster on PowerVR (2.5x) and Adreno.
     pub qmm_rt_k16: bool,
 
     /// A one-row quantized projection (decode) on the 128-bit-load point
@@ -154,9 +151,6 @@ impl DeviceTuning {
         // PowerVR (Pixel 11 Pro, Tensor G6) decodes Qwen3.5-0.8B at 11 tok/s
         // on `qmv`, 27 on the one-row point, and 33 with 8 lanes a row
         // carrying two rows each.
-        // Its prefill halves on the register-tiled point too: 1.2k tokens of
-        // the same model in 11.5 s against 23, FLUX.2 klein's four steps in
-        // 65 s of matmul against 140.
         if info.vendor == Vendor::Imagination {
             t.qmm_register_tiles = true;
             t.qmv_one_row = info.subgroup_size >= 32;

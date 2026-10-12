@@ -173,8 +173,7 @@ pub struct Seated<'a> {
     pub pages: &'a [u32],
 
     pub held: Option<u32>,
-    /// A lane of a reading that declares no KV space (a denoiser's): it
-    /// neither reads nor extends its slot's history.
+    /// The lane's reading declares no KV space: it neither reads nor extends its slot.
     pub kv_less: bool,
 
     pub mask: Option<&'a Masking>,
@@ -199,10 +198,8 @@ pub struct Seated<'a> {
     /// on the queue; the fire copies it in behind that pass.
     pub feed: Option<&'a Buffer>,
 
-    /// The stream and attention group a diffusion lane packs into.
     pub stream: engine::fire::LaneStream,
     pub group: Option<u32>,
-    /// The cells feeding the lane's input ports this fire.
     pub ports: &'a [(engine::fire::PortFeed, crate::program::PortCell)],
 }
 
@@ -268,7 +265,6 @@ fn adapter_fact(classes: &poem_ir::ClassTable, corrected: &poem_ir::ClassSet) ->
     classes.adapter_fact(corrected)
 }
 
-/// A plane a lane may read back, and the classes whose lanes read it.
 struct ReadoutPlane {
     value: ValueId,
     seam: engine::fire::ReadoutSeam,
@@ -277,8 +273,7 @@ struct ReadoutPlane {
     dtype: Dtype,
 }
 
-/// One lane's rows in the readout: `rows` entries of the readout table from
-/// `first`, read from `plane` and landed at byte `at` of the readout seat.
+/// A lane's readout: `rows` table entries from `first`, of `plane`, at byte `at` of the seat.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ReadSpan {
     first: u32,
@@ -378,15 +373,11 @@ pub struct Shell {
 
     capturing: poem_ir::ClassSet,
 
-    /// The value a fire reads back: the logits, or a diffusion model's
-    /// velocity or hidden state.
     out: ValueId,
     readout_seam: engine::fire::ReadoutSeam,
     readouts: Vec<ReadoutPlane>,
     feeds: crate::feeds::Feeds,
     voxel_seat: Option<crate::inputs::VoxelSeat>,
-    /// The VAE's output plane and its width, and per arm the host buffer a
-    /// fire copies it into for a pass to read.
     pixels: Vec<(ValueId, u32, poem_ir::ClassSet)>,
     pixel_out: Vec<Buffer>,
 
@@ -638,8 +629,6 @@ impl Shell {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // A text model reads its logits; a diffusion model reads its last
-        // velocity, or a hidden state, as the readout.
         let logits_seam = boot
             .trace
             .seams
@@ -671,9 +660,6 @@ impl Shell {
             },
         };
 
-        // Every plane a lane may read back, and the classes that write it: a
-        // model with a text trunk and a denoiser reads hidden rows for one and
-        // velocity for the other.
         let mut planes: Vec<(ValueId, engine::fire::ReadoutSeam, poem_ir::ClassSet)> = Vec::new();
         if let Some(out) = logits_seam {
             planes.push((
@@ -701,7 +687,6 @@ impl Shell {
             }
         }
 
-        // Each VAE reading's output plane, and the classes that write it.
         let pixel_planes: Vec<(ValueId, poem_ir::ClassSet)> = boot
             .trace
             .seams
@@ -1564,10 +1549,6 @@ impl Shell {
         frame.commit_async(None).map(Some)
     }
 
-    /// This fire's pixel plane: its offset in the arena store and its rows,
-    /// if the fire carves one.
-    /// The pixel plane a lane of this fire writes: its arena offset, rows and
-    /// width.
     fn pixel_rect(&self, p: &Prepared<'_>) -> Result<Option<(u64, u32, u32)>> {
         let written = self.pixels.iter().find(|(plane, _, classes)| {
             p.slots.0[plane.0 as usize].is_some()
@@ -1586,8 +1567,6 @@ impl Shell {
         Ok(Some((row.offset(), rect.rows, *width)))
     }
 
-    /// Copies the fire's pixel plane to the arm's host buffer, for a pass that
-    /// reads `pixels`; the rows it copied.
     fn copy_pixels(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<u32> {
         let Some((at, rows, width)) = self.pixel_rect(p)? else {
             return Ok(0);
@@ -1605,21 +1584,17 @@ impl Shell {
         Ok(rows * width)
     }
 
-    /// Where a step's pixels sit for a pass to read: the buffer, the offset,
-    /// and the values.
     #[must_use]
     pub fn pixels_row(&self, landed: &Landed) -> Option<(&Buffer, u64, u32)> {
         let flight = self.inflight.iter().find(|f| f.seq == landed.seq)?;
         (flight.pixels > 0).then(|| (&self.pixel_out[flight.arm], 0, flight.pixels))
     }
 
-    /// The decoded image's width: the `vae.decode` plane's.
     #[must_use]
     pub fn pixels_width(&self) -> Option<u32> {
         self.pixels.iter().map(|(_, width, _)| *width).min()
     }
 
-    /// Copies each guarded merge's port rows into its column before the walk.
     #[cfg(not(feature = "vulkan"))]
     fn land_merges(&self, _frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
         if p.merge_lands.is_empty() {
@@ -1632,7 +1607,6 @@ impl Shell {
         }
     }
 
-    /// Copies each guarded merge's port rows into its column before the walk.
     #[cfg(feature = "vulkan")]
     fn land_merges(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
         for land in &p.merge_lands {
@@ -1676,8 +1650,6 @@ impl Shell {
         Ok(())
     }
 
-    /// Lands every port a lane's class reads: a host cell into the inputs
-    /// store now, a device cell as a copy behind the pass that kept it.
     fn feed_ports<'a>(
         &mut self,
         arm: usize,
@@ -1723,11 +1695,11 @@ impl Shell {
                 } else {
                     self.inputs[arm].port_seat(self.feeds.seat_of(index))
                 };
-                let (store, base) = seated_at.ok_or_else(|| {
+                let (_, base) = seated_at.ok_or_else(|| {
                     program(
                         "serve::feed_ports",
                         format!(
-                            "the {:?} port {}, and this load carved no seat for it",
+                            "this load carved no seat for the {:?} port {}",
                             seat.kind, seat.port
                         ),
                     )
@@ -1748,7 +1720,6 @@ impl Shell {
                                 ),
                             )
                         })?;
-                        let _ = store;
                         self.inputs[arm].write_port(at, &landed)?;
                     }
                     #[cfg(feature = "vulkan")]
@@ -1758,7 +1729,6 @@ impl Shell {
                             (eta_ir::types::Dtype::F32, Dtype::F32)
                                 | (eta_ir::types::Dtype::I32, Dtype::I32)
                         );
-                        // An f32 cell feeding a bf16 port is cast on the way in.
                         let cast = matches!(
                             (*dtype, seat.dtype),
                             (eta_ir::types::Dtype::F32, Dtype::Bf16)
@@ -2264,9 +2234,7 @@ impl Shell {
         }
 
         let page_size = u64::from(self.pools.paging().page_size).max(1);
-        // A fire of readings that declare no KV space (a denoiser's, a VAE's)
-        // asks the pool for nothing; its geometry is shaped for the bindings
-        // and never read.
+        // A fire of KV-less lanes takes no pages; its geometry is never read.
         let kv_free = !kv_less.is_empty() && kv_less.iter().all(|&free| free);
         let paging = if kv_free {
             let widest = seats.iter().map(|seat| seat.rows).max().unwrap_or(0);
@@ -2881,8 +2849,6 @@ struct Walked {
     launches: u32,
 }
 
-/// A lane's VAE clips: each clip's (t, h, w) box, and the payload rows in
-/// clip order, if the step carries them rather than a voxel port.
 pub struct Clips<'a> {
     pub lane: u32,
     pub boxes: &'a [[u32; 3]],
@@ -2905,11 +2871,8 @@ pub struct Prepared<'a> {
     lanes: &'a [Seated<'a>],
     done: Option<Done>,
     feeds: Vec<(u32, &'a Buffer)>,
-    /// Device cells copied into the input ports behind the passes that kept
-    /// them: (cell, offset in the inputs store, bytes).
     port_copies: Vec<PortCopy<'a>>,
     merge_lands: Vec<MergeLand>,
-    /// The class of each lane of the fire.
     classes: Vec<usize>,
 
     arm: usize,
@@ -2965,9 +2928,7 @@ pub const READOUT_ROWS_PER_LANE: u32 = 8;
 
 type ReadoutTable = (Vec<i32>, Vec<ReadSpan>);
 
-/// Each lane's readout rows. `plane_of` names, for a lane's class, the plane
-/// it reads, whether that plane is every row of the lane (a velocity or a
-/// hidden state) or its last (logits), and the bytes of one of its rows.
+/// `plane_of(class)` is the plane a lane reads, whether it reads every row, and a row's bytes.
 fn readout_table(
     composition: &Composition,
     lanes: &[Seated<'_>],
@@ -2996,8 +2957,6 @@ fn readout_table(
                 }
                 list.iter().map(|&at| row.row_offset + at).collect()
             }
-            // A velocity or hidden readout is the whole lane's; logits are
-            // its last row's.
             _ if every_row => (row.row_offset..row.row_offset + row.rows).collect(),
             _ => vec![row.row_offset + row.rows - 1],
         };
@@ -3023,8 +2982,6 @@ fn readout_rows(max_lanes: u32) -> u32 {
         .max(max_lanes)
 }
 
-/// A port's rows copied into the merged column a guarded `merge` reads, for
-/// one lane; zeros where the lane feeds no channel for the port.
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
 struct MergeLand {
@@ -3036,8 +2993,6 @@ struct MergeLand {
     fed: bool,
 }
 
-/// A device cell copied into an input port behind the passes that kept it:
-/// `bytes` of the port at `at` in the inputs store, cast from f32 when `cast`.
 struct PortCopy<'a> {
     cell: &'a Buffer,
     at: u64,
@@ -3052,7 +3007,6 @@ struct Flight {
     pending: Pending,
     _fed: Option<Pending>,
     read: bool,
-    /// The pixel values this step copied out, if it ran a VAE reading.
     pixels: u32,
 }
 
@@ -3087,7 +3041,6 @@ impl engine::frame::Shell for Shell {
             .map(|replay| (replay.layout.clone(), replay.launches));
         if let Some((layout, launches)) = replayable {
             let key = key.expect("a recording was found under a key");
-            // The recording copies the plane out as it did when walked.
             let pixels = self
                 .pixel_rect(&prepared)?
                 .map_or(0, |(_, rows, width)| rows * width);
@@ -3136,9 +3089,7 @@ impl engine::frame::Shell for Shell {
         }
 
         // A split step is not recorded: a recording replays as one submit.
-        // A fire on the voxel axis (a VAE's) is one long run of convolutions:
-        // whole, a 512x512 decode outlasts what Adreno's driver lets one
-        // submission run, and the device is lost.
+        // Whole, a 512x512 VAE decode outlasts one Adreno submission and loses the device.
         let split = prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= SPLIT_ROWS
             || prepared.bindings.voxels.is_some();
         let keep = key.filter(|_| !split && self.recorder.has_room());
@@ -3360,8 +3311,6 @@ impl kernels_vulkan::Encode for Encoded<'_> {
     }
 }
 
-/// A host cell's wire bytes as the port's elements: as they are, or f32 cast
-/// to bf16; `None` when they do not fill the port.
 fn port_bytes(raw: &[u8], from: eta_ir::types::Dtype, to: Dtype, bytes: u64) -> Option<Vec<u8>> {
     let bytes = usize::try_from(bytes).ok()?;
     match (from, to) {

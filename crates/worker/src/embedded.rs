@@ -30,8 +30,6 @@ pub struct Settings {
     pub frame_size: u32,
     pub frame_dispatch_depth: u32,
     pub verbose: bool,
-    /// The voxel-axis ceilings a VAE reading is carved for; `None` leaves
-    /// the model's own.
     pub max_voxels: Option<u32>,
     pub max_clips: Option<u32>,
 }
