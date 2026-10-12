@@ -525,14 +525,10 @@ mod device {
     ) -> Result<Measured, String> {
         let registry = crate::chip::registry();
         let limits = device.limits();
+        let target = crate::tune::target(base, &device.chip().facts());
         let tuning = |text: &str| -> Option<Tuning> {
             registry
-                .overlay(
-                    base,
-                    text,
-                    base.target().clone(),
-                    Source::User("tune".into()),
-                )
+                .overlay(base, text, target.clone(), Source::User("tune".into()))
                 .ok()
                 .map(|p| Tuning::new(p, limits))
         };
@@ -781,22 +777,27 @@ mod tests {
 
     #[test]
     fn every_candidate_forces_a_ladder_the_registry_reads() {
-        let facts = profile::Facts::of(crate::chip::registry())
-            .word("vendor", "nvidia")
-            .int("subgroup", 32)
-            .int("cores", 142)
-            .flag("coopmat", true);
-        let (base, _) = crate::chip::resolve_facts("Test GPU", &facts, None);
-        for q in candidates(&base) {
-            let p = crate::chip::registry()
-                .overlay(
-                    &base,
-                    &format!("[kernel]\nqmm = {}\n", forcing(&q)),
-                    base.target().clone(),
-                    profile::Source::User("t".into()),
-                )
-                .unwrap_or_else(|e| panic!("{}: {e}", body(&q)));
-            assert_eq!(p.ladder::<Qmm>().values().next(), Some(&q));
+        for (vendor, subgroup, coopmat) in [("nvidia", 32, true), ("qualcomm", 64, false)] {
+            let facts = profile::Facts::of(crate::chip::registry())
+                .word("vendor", vendor)
+                .int("subgroup", subgroup)
+                .int("cores", 142)
+                .flag("coopmat", coopmat);
+            let (base, _) = crate::chip::resolve_facts("Test GPU", &facts, None);
+            for q in candidates(&base) {
+                if q == Qmm::Coopmat && !coopmat {
+                    continue;
+                }
+                let p = crate::chip::registry()
+                    .overlay(
+                        &base,
+                        &format!("[kernel]\nqmm = {}\n", forcing(&q)),
+                        crate::tune::target(&base, &facts),
+                        profile::Source::User("t".into()),
+                    )
+                    .unwrap_or_else(|e| panic!("{vendor}: {}: {e}", body(&q)));
+                assert_eq!(p.ladder::<Qmm>().values().next(), Some(&q));
+            }
         }
     }
 

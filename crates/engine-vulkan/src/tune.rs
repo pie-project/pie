@@ -20,7 +20,25 @@ const SEARCH_SKIPS: &[&str] = &[
 ];
 
 /// The facts a tuned file assumes: what a kernel's requirement reads.
-const ASSUME: &[&str] = &["vendor", "subgroup", "coopmat"];
+const ASSUME: &[&str] = &["vendor", "subgroup", "coopmat", "cores"];
+
+/// What a tuned overlay on `base` may assume: its target, and the facts
+/// [`ASSUME`] names as this device reports them.
+fn target(base: &Profile, facts: &Facts) -> profile::Target {
+    let mut target = base.target().clone();
+    for name in ASSUME {
+        let i = kernels_vulkan::tuning::FACTS
+            .iter()
+            .position(|v| v.name == *name)
+            .expect("a Vulkan fact");
+        if let Some(v) = facts.get(name)
+            && !target.assumes.iter().any(|&(j, _)| j == i)
+        {
+            target.assumes.push((i, v));
+        }
+    }
+    target
+}
 
 pub struct Outcome {
     pub device: String,
