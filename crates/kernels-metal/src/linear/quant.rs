@@ -5,6 +5,7 @@ use dtype::Dtype;
 
 use crate::Tuning;
 use crate::error::Error;
+use crate::tuning::{Qmm, QmmAt};
 
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, refuse, stated};
 use crate::tensor::{Bank, Tensor};
@@ -58,7 +59,8 @@ const FRAG_ROWS: i32 = 8;
 
 const QMV_GROUP: [u32; 3] = [32, 2, 1];
 
-const QMM_BK: i32 = 32;
+/// The contraction tile of the tiled kernels.
+pub(crate) const QMM_BK: i32 = 32;
 const PRECAST_BK: i32 = 64;
 
 const PRECAST_MIN_BM: i32 = 16;
@@ -115,8 +117,6 @@ const QMV_ROW_RUNGS_PACK2: [i32; 6] = [2, 3, 4, 6, 7, 8];
 const QMV_ROW_RUNGS_PACK2_2BIT: [i32; 3] = [2, 4, 8];
 
 const QMV_ROW_RUNGS_2BIT: [i32; 2] = [2, 3];
-
-const QMM_MIN_BATCH_2BIT: i32 = 5;
 
 fn qmv_rungs_at(packs: i32, bits: i32) -> &'static [i32] {
     if packs >= 2 && bits == 2 {
@@ -676,313 +676,331 @@ fn act_x_wt_over(
         ));
     }
     let ld = stated(op, w.ld)?;
-    let bm = match rows {
-        1..=8 => 8,
-        9..=16 => 16,
-        17..=24 => 24,
-        _ => 32,
-    };
-    let bn = if bm == 8 { 64 } else { 128 };
-    if tuning.qmm_mpp()
-        && columns == stride
-        && bits == 4
-        && group == 64
-        && rows >= 8
-        && columns % bn == 0
-        && (rows > 16 || columns >= 1024)
-    {
-        let padded = rows.div_ceil(bm) * bm;
-        if padded <= capacity_rows
-            && let Some(staged) = (scratch.precast)(padded, contraction)
-        {
-            const FILE: &str = "linear/quant_qmm_mpp.metal";
-            let aux = Tensor::new(staged.buf, padded, contraction / 64, dtype::Dtype::F32);
-            ctx.fire(
-                Fire::at(FILE, "qmm_mpp_input_sums")
-                    .apply(Grid::of([32 * (contraction / 64), padded, 1], [32, 4, 1])),
-                &[act.arg(), aux.arg_mut(), k.arg(), bm.arg()],
-            )?;
-            let partitions = if rows > 32 { 2u32 } else { 4u32 };
-            let partial = if (rows <= 32 || (rows <= 64 && columns <= 8192))
-                && columns <= 65536
-                && contraction % 256 == 0
-            {
-                (scratch.partials)(padded * partitions, columns)
-            } else {
-                None
-            };
-            let split = if partial.is_some() { partitions } else { 1u32 };
-            let packed = w.mpp_codes.is_some();
-            let local = bm == 8 && packed && split == 4;
-            let simdgroups = if bm == 8 { 2 } else { 4 };
-            let pipeline = !local && rows <= 16 && columns <= 8192;
-            let linear_mode = if rows >= 1024 && split == 1 && packed {
-                16
-            } else {
-                -1
-            };
-            let kind = if packed { "packed" } else { "native" };
-            let index = if packed
-                && rows >= 1024
-                && split == 1
-                && [
-                    (padded, contraction),
-                    (padded, columns),
-                    (contraction, columns),
-                ]
-                .iter()
-                .all(|&(a, b)| a.checked_mul(b).is_some())
-            {
-                "uint"
-            } else {
-                "ulong"
-            };
-            let groups_per_tg = simdgroups * if local { split } else { 1 };
-            let entry = symbol(&format!(
-                "affine_qmm_mpp_{kind}_m{bm}_n{bn}_s{simdgroups}_k{split}_p{pipeline}_l{local}_g{}_{index}",
-                linear_mode + 1
-            ));
-            let stamp = symbol(&format!(
-                "PIE_MPP_POINT(\"{entry}\",{bm},{bn},{simdgroups},{packed},false,{split},{pipeline},{local},{linear_mode},{index})"
-            ));
-            ctx.fire(
-                Fire::at(FILE, entry).stamp(stamp).apply(Grid::of(
-                    [
-                        32 * groups_per_tg
-                            * (columns / bn)
-                            * if linear_mode >= 0 { padded / bm } else { 1 },
-                        if linear_mode >= 0 { 1 } else { padded / bm },
-                        if local { 1 } else { split },
-                    ],
-                    [32 * groups_per_tg, 1, 1],
-                )),
-                &[
-                    if packed {
-                        w.mpp_codes.unwrap().arg()
-                    } else {
-                        w.codes.arg()
-                    },
-                    w.scales.arg(),
-                    biases.arg(),
-                    act.arg(),
-                    if local {
-                        y.arg_mut()
-                    } else {
-                        partial.unwrap_or(y).arg_mut()
-                    },
-                    k.arg(),
-                    n.arg(),
-                    aux.arg(),
-                    (if local { rows } else { padded } as i32).arg(),
-                    ld.arg(),
-                ],
-            )?;
-            if local {
-                return Ok(());
-            }
-            if let Some(partial) = partial {
-                let stride = (padded * columns) as i32;
-                let mut args = vec![ctx.absent()?; 4];
-                args.extend([
-                    y.arg_mut(),
-                    ctx.absent()?,
-                    n.arg(),
-                    ctx.absent()?,
-                    partial.arg(),
-                    ctx.absent()?,
-                    stride.arg(),
-                    (split as i32).arg(),
-                ]);
-                return ctx.fire(
-                    Fire::at(QMM_FILE, SPLITK_REDUCE)
-                        .apply(Grid::of([columns, rows, 1], [256, 1, 1])),
-                    &args,
-                );
-            }
-            return Ok(());
-        }
-    }
     let fp16 = tuning.fp16_gemm_format(w.bits, w.group);
-    let min_batch = if bits == 2 {
-        QMM_MIN_BATCH_2BIT
-    } else {
-        i32::try_from(tuning.qmm_min_rows(fp16)).unwrap_or(i32::MAX)
+    let at = QmmAt {
+        rows: i64::from(rows),
+        n: i64::from(columns),
+        k: i64::from(contraction),
+        bits: i64::from(w.bits),
+        group: i64::from(w.group),
+        format: if fp16 { "fp16" } else { "emulated" },
     };
-    let crossover = i32::try_from(tuning.qmm_crossover_tg()).unwrap_or(i32::MAX);
-    let capacity = i32::try_from(capacity_rows).unwrap_or(i32::MAX);
-    let fold_widest = *QMV_ROW_RUNGS.last().expect("a rung");
-    let tile_fills = |padded: i32, bm: i32| {
-        let tiles = u64::from(cols.unsigned_abs().div_ceil(BN_RUNGS[0].unsigned_abs()))
-            * u64::from((padded / bm).unsigned_abs());
-        tiles >= u64::from(crossover.unsigned_abs())
-    };
-    let split_plane = |padded: i32, bm: i32| -> Option<(i32, Tensor)> {
-        let split = splitk(cols, bm, padded, k, group, bits);
-        if split <= 1 {
-            return None;
-        }
-        let rows = padded.checked_mul(split)?.unsigned_abs();
-        (scratch.partials)(rows, n.unsigned_abs()).map(|plane| (split, plane))
-    };
-    if m >= min_batch
-        && k % QMM_BK == 0
-        && let Some((bm, padded)) = mb_block(m, capacity)
-        && (m > fold_widest || tile_fills(padded, bm) || split_plane(padded, bm).is_some())
-    {
-        let bm = widen_rung(bm, padded, |rung| tile_fills(padded, rung));
-        if fp16
-            && bm >= PRECAST_MIN_BM
-            && k % PRECAST_BK == 0
-            && let Some(staged) = (scratch.precast)(padded.unsigned_abs(), k.unsigned_abs())
-            && let Some(bn) = bn_unsplit(cols, padded / bm, crossover)
-        {
-            let count = padded
-                .checked_mul(k)
-                .ok_or_else(|| refuse(op, format!("{padded} x {k} will not stage")))?;
-            let mut cast = vec![ctx.absent()?; 3];
-            cast.push(act.arg());
-            for _ in 4..12 {
-                cast.push(ctx.absent()?);
+    // The profile's `kernel.qmm` rungs that fit this shape, in order: each
+    // runs if it finds its scratch, else the next one does.
+    for choice in tuning.qmm(&at) {
+        match choice {
+            Qmm::Mpp => {
+                let bm = match rows {
+                    1..=8 => 8,
+                    9..=16 => 16,
+                    17..=24 => 24,
+                    _ => 32,
+                };
+                let bn = if bm == 8 { 64 } else { 128 };
+                // A column cut lands part of a row, which the MPP kernel never does.
+                if columns == stride {
+                    let padded = rows.div_ceil(bm) * bm;
+                    if padded <= capacity_rows
+                        && let Some(staged) = (scratch.precast)(padded, contraction)
+                    {
+                        const FILE: &str = "linear/quant_qmm_mpp.metal";
+                        let aux =
+                            Tensor::new(staged.buf, padded, contraction / 64, dtype::Dtype::F32);
+                        ctx.fire(
+                            Fire::at(FILE, "qmm_mpp_input_sums")
+                                .apply(Grid::of([32 * (contraction / 64), padded, 1], [32, 4, 1])),
+                            &[act.arg(), aux.arg_mut(), k.arg(), bm.arg()],
+                        )?;
+                        let partitions = if rows > 32 { 2u32 } else { 4u32 };
+                        let partial = if (rows <= 32 || (rows <= 64 && columns <= 8192))
+                            && columns <= 65536
+                            && contraction % 256 == 0
+                        {
+                            (scratch.partials)(padded * partitions, columns)
+                        } else {
+                            None
+                        };
+                        let split = if partial.is_some() { partitions } else { 1u32 };
+                        let packed = w.mpp_codes.is_some();
+                        let local = bm == 8 && packed && split == 4;
+                        let simdgroups = if bm == 8 { 2 } else { 4 };
+                        let pipeline = !local && rows <= 16 && columns <= 8192;
+                        let linear_mode = if rows >= 1024 && split == 1 && packed {
+                            16
+                        } else {
+                            -1
+                        };
+                        let kind = if packed { "packed" } else { "native" };
+                        let index = if packed
+                            && rows >= 1024
+                            && split == 1
+                            && [
+                                (padded, contraction),
+                                (padded, columns),
+                                (contraction, columns),
+                            ]
+                            .iter()
+                            .all(|&(a, b)| a.checked_mul(b).is_some())
+                        {
+                            "uint"
+                        } else {
+                            "ulong"
+                        };
+                        let groups_per_tg = simdgroups * if local { split } else { 1 };
+                        let entry = symbol(&format!(
+                            "affine_qmm_mpp_{kind}_m{bm}_n{bn}_s{simdgroups}_k{split}_p{pipeline}_l{local}_g{}_{index}",
+                            linear_mode + 1
+                        ));
+                        let stamp = symbol(&format!(
+                            "PIE_MPP_POINT(\"{entry}\",{bm},{bn},{simdgroups},{packed},false,{split},{pipeline},{local},{linear_mode},{index})"
+                        ));
+                        ctx.fire(
+                            Fire::at(FILE, entry).stamp(stamp).apply(Grid::of(
+                                [
+                                    32 * groups_per_tg
+                                        * (columns / bn)
+                                        * if linear_mode >= 0 { padded / bm } else { 1 },
+                                    if linear_mode >= 0 { 1 } else { padded / bm },
+                                    if local { 1 } else { split },
+                                ],
+                                [32 * groups_per_tg, 1, 1],
+                            )),
+                            &[
+                                if packed {
+                                    w.mpp_codes.unwrap().arg()
+                                } else {
+                                    w.codes.arg()
+                                },
+                                w.scales.arg(),
+                                biases.arg(),
+                                act.arg(),
+                                if local {
+                                    y.arg_mut()
+                                } else {
+                                    partial.unwrap_or(y).arg_mut()
+                                },
+                                k.arg(),
+                                n.arg(),
+                                aux.arg(),
+                                (if local { rows } else { padded } as i32).arg(),
+                                ld.arg(),
+                            ],
+                        )?;
+                        if local {
+                            return Ok(());
+                        }
+                        if let Some(partial) = partial {
+                            let stride = (padded * columns) as i32;
+                            let mut args = vec![ctx.absent()?; 4];
+                            args.extend([
+                                y.arg_mut(),
+                                ctx.absent()?,
+                                n.arg(),
+                                ctx.absent()?,
+                                partial.arg(),
+                                ctx.absent()?,
+                                stride.arg(),
+                                (split as i32).arg(),
+                            ]);
+                            return ctx.fire(
+                                Fire::at(QMM_FILE, SPLITK_REDUCE)
+                                    .apply(Grid::of([columns, rows, 1], [256, 1, 1])),
+                                &args,
+                            );
+                        }
+                        return Ok(());
+                    }
+                }
             }
-            cast.push(staged.arg_mut());
-            cast.push(count.arg());
-            ctx.fire(
-                Fire::at(QMM_FILE, PRECAST_STAGE).apply(precast_stage(op, padded, k)?),
-                &cast,
-            )?;
-            let mut gemm = vec![
-                w.codes.arg(),
-                w.scales.arg(),
-                biases.arg(),
-                ctx.absent()?,
-                y.arg_mut(),
-                k.arg(),
-                n.arg(),
-            ];
-            for _ in 7..12 {
-                gemm.push(ctx.absent()?);
+            Qmm::Tiled { crossover_tg } => {
+                let crossover = i32::try_from(crossover_tg).unwrap_or(i32::MAX);
+                let capacity = i32::try_from(capacity_rows).unwrap_or(i32::MAX);
+                let fold_widest = *QMV_ROW_RUNGS.last().expect("a rung");
+                let tile_fills = |padded: i32, bm: i32| {
+                    let tiles = u64::from(cols.unsigned_abs().div_ceil(BN_RUNGS[0].unsigned_abs()))
+                        * u64::from((padded / bm).unsigned_abs());
+                    tiles >= u64::from(crossover.unsigned_abs())
+                };
+                let split_plane = |padded: i32, bm: i32| -> Option<(i32, Tensor)> {
+                    let split = splitk(cols, bm, padded, k, group, bits);
+                    if split <= 1 {
+                        return None;
+                    }
+                    let rows = padded.checked_mul(split)?.unsigned_abs();
+                    (scratch.partials)(rows, n.unsigned_abs()).map(|plane| (split, plane))
+                };
+                if let Some((bm, padded)) = mb_block(m, capacity)
+                    && (m > fold_widest
+                        || tile_fills(padded, bm)
+                        || split_plane(padded, bm).is_some())
+                {
+                    let bm = widen_rung(bm, padded, |rung| tile_fills(padded, rung));
+                    if fp16
+                        && bm >= PRECAST_MIN_BM
+                        && k % PRECAST_BK == 0
+                        && let Some(staged) =
+                            (scratch.precast)(padded.unsigned_abs(), k.unsigned_abs())
+                        && let Some(bn) = bn_unsplit(cols, padded / bm, crossover)
+                    {
+                        let count = padded
+                            .checked_mul(k)
+                            .ok_or_else(|| refuse(op, format!("{padded} x {k} will not stage")))?;
+                        let mut cast = vec![ctx.absent()?; 3];
+                        cast.push(act.arg());
+                        for _ in 4..12 {
+                            cast.push(ctx.absent()?);
+                        }
+                        cast.push(staged.arg_mut());
+                        cast.push(count.arg());
+                        ctx.fire(
+                            Fire::at(QMM_FILE, PRECAST_STAGE).apply(precast_stage(op, padded, k)?),
+                            &cast,
+                        )?;
+                        let mut gemm = vec![
+                            w.codes.arg(),
+                            w.scales.arg(),
+                            biases.arg(),
+                            ctx.absent()?,
+                            y.arg_mut(),
+                            k.arg(),
+                            n.arg(),
+                        ];
+                        for _ in 7..12 {
+                            gemm.push(ctx.absent()?);
+                        }
+                        gemm.push(staged.arg());
+                        gemm.push(ctx.absent()?);
+                        gemm.push(ld.arg());
+                        return ctx.fire(
+                            Fire::at(QMM_FILE, precast_point(op, "", bm, bn)?).apply(Grid::of(
+                                qmm_grid(op, cols, bn, padded, bm, 1)?,
+                                qmm_group(bm),
+                            )),
+                            &gemm,
+                        );
+                    }
+                    if let Some((split, partials)) = split_plane(padded, bm) {
+                        let stride = padded.checked_mul(n).ok_or_else(|| {
+                            refuse(op, format!("{padded} x {n} partials will not stack"))
+                        })?;
+                        ctx.fire(
+                            Fire::at(QMM_FILE, splitk_point(op, group, bits, bm)?).apply(Grid::of(
+                                qmm_grid(op, cols, SPLITK_BN, padded, bm, split)?,
+                                qmm_group(bm),
+                            )),
+                            &[
+                                w.codes.arg(),
+                                w.scales.arg(),
+                                biases.arg(),
+                                act.arg(),
+                                ctx.absent()?,
+                                k.arg(),
+                                n.arg(),
+                                ctx.absent()?,
+                                partials.arg_mut(),
+                                (k / split).arg(),
+                                stride.arg(),
+                                ctx.absent()?,
+                                ctx.absent()?,
+                                ctx.absent()?,
+                                ld.arg(),
+                            ],
+                        )?;
+                        let mut reduce = vec![ctx.absent()?; 4];
+                        reduce.push(y.arg_mut());
+                        reduce.push(ctx.absent()?);
+                        reduce.push(n.arg());
+                        reduce.push(ctx.absent()?);
+                        reduce.push(partials.arg());
+                        reduce.push(ctx.absent()?);
+                        reduce.push(stride.arg());
+                        reduce.push(split.arg());
+                        return ctx.fire(
+                            Fire::at(QMM_FILE, SPLITK_REDUCE).apply(Grid::of(
+                                [cols.unsigned_abs(), m.unsigned_abs(), 1],
+                                [256, 1, 1],
+                            )),
+                            &reduce,
+                        );
+                    }
+                    if let Some(bn) = bn_unsplit(cols, padded / bm, crossover) {
+                        let (form, stamp) = tiled_form(tuning.wide_range());
+                        let point = qmm_point(op, form, stamp, group, bits, bm, bn)?;
+                        let mut tiled = vec![
+                            w.codes.arg(),
+                            w.scales.arg(),
+                            biases.arg(),
+                            act.arg(),
+                            y.arg_mut(),
+                            k.arg(),
+                            n.arg(),
+                        ];
+                        for _ in 7..14 {
+                            tiled.push(ctx.absent()?);
+                        }
+                        tiled.push(ld.arg());
+                        return ctx.fire(
+                            Fire::at(QMM_FILE, point.entry)
+                                .stamp(point.stamp)
+                                .apply(Grid::of(
+                                    qmm_grid(op, cols, bn, padded, bm, 1)?,
+                                    qmm_group(bm),
+                                )),
+                            &tiled,
+                        );
+                    }
+                }
             }
-            gemm.push(staged.arg());
-            gemm.push(ctx.absent()?);
-            gemm.push(ld.arg());
-            return ctx.fire(
-                Fire::at(QMM_FILE, precast_point(op, "", bm, bn)?).apply(Grid::of(
-                    qmm_grid(op, cols, bn, padded, bm, 1)?,
-                    qmm_group(bm),
-                )),
-                &gemm,
-            );
-        }
-        if let Some((split, partials)) = split_plane(padded, bm) {
-            let stride = padded
-                .checked_mul(n)
-                .ok_or_else(|| refuse(op, format!("{padded} x {n} partials will not stack")))?;
-            ctx.fire(
-                Fire::at(QMM_FILE, splitk_point(op, group, bits, bm)?).apply(Grid::of(
-                    qmm_grid(op, cols, SPLITK_BN, padded, bm, split)?,
-                    qmm_group(bm),
-                )),
-                &[
+            Qmm::Qmv {
+                rows_max,
+                packs,
+                crossover_tg,
+            } => {
+                let crossover = i32::try_from(crossover_tg).unwrap_or(i32::MAX);
+                let rows_max = i32::try_from(rows_max).unwrap_or(1);
+                let packs = i32::try_from(packs).unwrap_or(QMV_PACK_RUNGS[1]);
+                if let Some(fold) = qmv_rows_fold(m, cols, rows_max, crossover, packs, bits) {
+                    let point = qmv_rows_point(op, group, bits, fold, packs)?;
+                    return ctx.fire(
+                        Fire::at(QMV_ROWS_FILE, point.entry)
+                            .stamp(point.stamp)
+                            .apply(Grid::of(qmv_rows_grid(op, m, fold, cols)?, QMV_GROUP)),
+                        &[
+                            w.codes.arg(),
+                            w.scales.arg(),
+                            biases.arg(),
+                            act.arg(),
+                            y.arg_mut(),
+                            k.arg(),
+                            n.arg(),
+                            m.arg(),
+                            ld.arg(),
+                        ],
+                    );
+                }
+                let point = qmv_point(op, "fast", group, bits)?;
+                let mut fast = vec![
                     w.codes.arg(),
                     w.scales.arg(),
                     biases.arg(),
                     act.arg(),
-                    ctx.absent()?,
+                    y.arg_mut(),
                     k.arg(),
                     n.arg(),
-                    ctx.absent()?,
-                    partials.arg_mut(),
-                    (k / split).arg(),
-                    stride.arg(),
-                    ctx.absent()?,
-                    ctx.absent()?,
-                    ctx.absent()?,
-                    ld.arg(),
-                ],
-            )?;
-            let mut reduce = vec![ctx.absent()?; 4];
-            reduce.push(y.arg_mut());
-            reduce.push(ctx.absent()?);
-            reduce.push(n.arg());
-            reduce.push(ctx.absent()?);
-            reduce.push(partials.arg());
-            reduce.push(ctx.absent()?);
-            reduce.push(stride.arg());
-            reduce.push(split.arg());
-            return ctx.fire(
-                Fire::at(QMM_FILE, SPLITK_REDUCE).apply(Grid::of(
-                    [cols.unsigned_abs(), m.unsigned_abs(), 1],
-                    [256, 1, 1],
-                )),
-                &reduce,
-            );
-        }
-        if let Some(bn) = bn_unsplit(cols, padded / bm, crossover) {
-            let (form, stamp) = tiled_form(tuning.wide_range());
-            let point = qmm_point(op, form, stamp, group, bits, bm, bn)?;
-            let mut tiled = vec![
-                w.codes.arg(),
-                w.scales.arg(),
-                biases.arg(),
-                act.arg(),
-                y.arg_mut(),
-                k.arg(),
-                n.arg(),
-            ];
-            for _ in 7..14 {
-                tiled.push(ctx.absent()?);
+                ];
+                for _ in 7..12 {
+                    fast.push(ctx.absent()?);
+                }
+                fast.push(ld.arg());
+                return ctx.fire(
+                    Fire::at(QMV_FILE, point.entry)
+                        .apply(Grid::of(qmv_grid(op, m, cols)?, QMV_GROUP)),
+                    &fast,
+                );
             }
-            tiled.push(ld.arg());
-            return ctx.fire(
-                Fire::at(QMM_FILE, point.entry)
-                    .stamp(point.stamp)
-                    .apply(Grid::of(
-                        qmm_grid(op, cols, bn, padded, bm, 1)?,
-                        qmm_group(bm),
-                    )),
-                &tiled,
-            );
         }
     }
-    let rows_max = i32::try_from(tuning.qmv_rows_max()).unwrap_or(1);
-    let packs = i32::try_from(tuning.qmv_packs()).unwrap_or(QMV_PACK_RUNGS[1]);
-    if let Some(fold) = qmv_rows_fold(m, cols, rows_max, crossover, packs, bits) {
-        let point = qmv_rows_point(op, group, bits, fold, packs)?;
-        return ctx.fire(
-            Fire::at(QMV_ROWS_FILE, point.entry)
-                .stamp(point.stamp)
-                .apply(Grid::of(qmv_rows_grid(op, m, fold, cols)?, QMV_GROUP)),
-            &[
-                w.codes.arg(),
-                w.scales.arg(),
-                biases.arg(),
-                act.arg(),
-                y.arg_mut(),
-                k.arg(),
-                n.arg(),
-                m.arg(),
-                ld.arg(),
-            ],
-        );
-    }
-    let point = qmv_point(op, "fast", group, bits)?;
-    let mut fast = vec![
-        w.codes.arg(),
-        w.scales.arg(),
-        biases.arg(),
-        act.arg(),
-        y.arg_mut(),
-        k.arg(),
-        n.arg(),
-    ];
-    for _ in 7..12 {
-        fast.push(ctx.absent()?);
-    }
-    fast.push(ld.arg());
-    ctx.fire(
-        Fire::at(QMV_FILE, point.entry).apply(Grid::of(qmv_grid(op, m, cols)?, QMV_GROUP)),
-        &fast,
-    )
+    unreachable!("`kernel.qmm` ends on the vector kernel, which serves every shape")
 }
 
 /// Serve a PTQ1_0 (ternary, `g128_t3_f16_n`) projection with the decode-in-dot

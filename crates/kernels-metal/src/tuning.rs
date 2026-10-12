@@ -7,49 +7,66 @@
 
 use profile::{Decision, Profile, Registry};
 
-/// How dense affine-quantised matmuls read prompt rows.
+/// The kernel a dense affine-quantised matmul runs: the first rung whose
+/// shape it fits and whose scratch it finds. `format` is the bank's: `fp16`
+/// where its 4-bit, 64-group codes take the fp16 GEMM format, else
+/// `emulated`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.qmm.path", default = "tiled")]
-pub enum QmmPath {
-    /// The tiled and split-k kernels, and the row-folded vector kernel below
-    /// them.
-    Tiled,
-    /// The Metal 4 tensor-op (MPP) kernel first, for the shapes it serves;
-    /// the tiled path for the rest.
+#[decision(
+    id = "kernel.qmm",
+    shape(rows; n, k, bits, group, format: enum(fp16, emulated)),
+    default = r#"[
+        { when = "rows >= 5 and (bits == 2 or format == fp16)", use = "tiled", crossover_tg = 160 },
+        { when = "rows >= 12", use = "tiled", crossover_tg = 160 },
+        { use = "qmv", rows_max = 8, packs = 1, crossover_tg = 160 },
+    ]"#,
+    fits = Qmm::fits_shape
+)]
+pub enum Qmm {
+    /// The Metal 4 tensor-op (MPP) kernel: 4-bit, 64-group banks, at least
+    /// 8 rows, a whole number of its column tiles.
+    #[partial]
     Mpp,
+    /// The tiled kernels (fp16 precast, split-k, plain), where the
+    /// contraction is whole 32-code tiles and a tile fills the device.
+    #[partial]
+    Tiled {
+        /// Threadgroups a tiling must fill before a wider column tile pays.
+        #[constant(range(1..=1_000_000), default = 160)]
+        crossover_tg: u32,
+    },
+    /// The vector kernels: rows folded into a threadgroup where that fills
+    /// the device, else one row at a time.
+    Qmv {
+        /// The most rows folded into one threadgroup.
+        #[constant(range(1..=8), default = 8)]
+        rows_max: u32,
+        /// Codes the row-folded kernel reads per load.
+        #[constant(set(1, 2), default = 1)]
+        packs: u32,
+        /// Threadgroups a fold must fill before a coarser one pays.
+        #[constant(range(1..=1_000_000), default = 160)]
+        crossover_tg: u32,
+    },
 }
 
-/// The fewest rows a dense matmul over fp16-format weights takes the tiled
-/// kernel for; fewer take the vector kernel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.qmm.min_rows", constant(range(1..=4096)), default = 5)]
-pub struct QmmMinRows(pub u32);
-
-/// The same threshold for weights the tiled kernel dequantises in the loop.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.qmm.min_rows_emulated", constant(range(1..=4096)), default = 12)]
-pub struct QmmMinRowsEmulated(pub u32);
-
-/// Threadgroups a dense matmul must fill before a wider column tile or a
-/// coarser row fold pays.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.qmm.crossover_tg", constant(range(1..=1_000_000)), default = 160)]
-pub struct QmmCrossoverTg(pub u32);
+impl Qmm {
+    fn fits_shape(&self, at: &QmmAt) -> bool {
+        match self {
+            Qmm::Mpp => {
+                let bn = if at.rows <= 8 { 64 } else { 128 };
+                at.bits == 4 && at.group == 64 && at.rows >= 8 && at.n % bn == 0
+            }
+            Qmm::Tiled { .. } => at.k % i64::from(crate::linear::quant::QMM_BK) == 0,
+            Qmm::Qmv { .. } => true,
+        }
+    }
+}
 
 /// Whether 4-bit, 64-group weights take the fp16 GEMM format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.qmm.fp16", flag, default = true)]
+#[decision(id = "kernel.qmm_fp16", flag, default = true)]
 pub struct QmmFp16;
-
-/// The most rows the vector kernel folds into one threadgroup.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.qmv.rows_max", constant(range(1..=8)), default = 8)]
-pub struct QmvRowsMax(pub u32);
-
-/// Codes the row-folded vector kernel reads per load.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.qmv.packs", constant(set(1, 2)), default = 1)]
-pub struct QmvPacks(pub u32);
 
 /// How routed (mixture-of-experts) matmuls read their sorted rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -113,13 +130,8 @@ pub enum GdnScan {
 /// Register every decision this crate reads.
 pub fn register(registry: &mut Registry) {
     registry
-        .add::<QmmPath>()
-        .add::<QmmMinRows>()
-        .add::<QmmMinRowsEmulated>()
-        .add::<QmmCrossoverTg>()
+        .add::<Qmm>()
         .add::<QmmFp16>()
-        .add::<QmvRowsMax>()
-        .add::<QmvPacks>()
         .add::<MoePath>()
         .add::<MoeTileRows>()
         .add::<SdpaPrefill>()
@@ -159,25 +171,24 @@ impl Tuning {
         self.wide_range
     }
 
+    /// The kernels a dense matmul at `at` may run, most preferred first.
+    #[must_use]
+    pub fn qmm(&self, at: &QmmAt) -> Vec<Qmm> {
+        self.profile
+            .ladder::<Qmm>()
+            .candidates(at)
+            .copied()
+            .collect()
+    }
+
+    /// Whether any dense matmul may take the MPP kernel: its scratch is
+    /// reserved at load.
     #[must_use]
     pub fn qmm_mpp(&self) -> bool {
-        *self.profile.get::<QmmPath>() == QmmPath::Mpp
-    }
-
-    /// The fewest rows that take the tiled kernel, for weights in the fp16
-    /// GEMM format or not.
-    #[must_use]
-    pub fn qmm_min_rows(&self, fp16: bool) -> u32 {
-        if fp16 {
-            self.profile.get::<QmmMinRows>().0
-        } else {
-            self.profile.get::<QmmMinRowsEmulated>().0
-        }
-    }
-
-    #[must_use]
-    pub fn qmm_crossover_tg(&self) -> u32 {
-        self.profile.get::<QmmCrossoverTg>().0
+        self.profile
+            .ladder::<Qmm>()
+            .values()
+            .any(|q| *q == Qmm::Mpp)
     }
 
     /// Whether a bank of `bits`-bit codes in `group`-wide groups takes the
@@ -188,16 +199,6 @@ impl Tuning {
             && self.profile.on::<QmmFp16>(&profile::Anywhere)
             && bits == 4
             && group == 64
-    }
-
-    #[must_use]
-    pub fn qmv_rows_max(&self) -> u32 {
-        self.profile.get::<QmvRowsMax>().0
-    }
-
-    #[must_use]
-    pub fn qmv_packs(&self) -> u32 {
-        self.profile.get::<QmvPacks>().0
     }
 
     #[must_use]

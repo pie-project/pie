@@ -4,6 +4,7 @@
 
 use engine_metal::chip::{self, AneMlp, AneProjections, StreamCut, WeightsLayout};
 use kernels_metal::Tuning;
+use kernels_metal::tuning::{Qmm, QmmAt};
 use profile::Source;
 
 /// What `DeviceTuning::of` returned for a family on a Metal 4 device.
@@ -57,6 +58,38 @@ fn old_tile(pairs: u32, experts: u32) -> u32 {
     }
 }
 
+/// The kernel the old cascade in `act_x_wt_over` ran a dense matmul on.
+fn old_qmm(o: &Old, at: &QmmAt) -> Qmm {
+    let fp16 = at.format == "fp16";
+    let bn = if at.rows <= 8 { 64 } else { 128 };
+    if o.qmm_mpp
+        && at.bits == 4
+        && at.group == 64
+        && at.rows >= 8
+        && at.n % bn == 0
+        && (at.rows > 16 || at.n >= 1024)
+    {
+        return Qmm::Mpp;
+    }
+    let min_batch = if at.bits == 2 {
+        5
+    } else if fp16 {
+        i64::from(o.qmm_min_batch)
+    } else {
+        i64::from(o.qmm_min_batch_emulated)
+    };
+    if at.rows >= min_batch && at.k % 32 == 0 {
+        return Qmm::Tiled {
+            crossover_tg: o.qmm_bn_crossover_tg,
+        };
+    }
+    Qmm::Qmv {
+        rows_max: 8,
+        packs: 1,
+        crossover_tg: o.qmm_bn_crossover_tg,
+    }
+}
+
 fn family_of(device: &str) -> u32 {
     match device.split_whitespace().nth(1) {
         Some(m) if m.starts_with("M1") => 7,
@@ -82,9 +115,24 @@ fn each_checked_in_profile_runs_its_familys_old_tuning() {
         assert_eq!(report.used, Source::Seeded((*name).to_string()), "{device}");
         let t = Tuning::new(profile.clone(), false);
         let o = old(family);
-        assert_eq!(t.qmm_min_rows(true), o.qmm_min_batch, "{device}");
-        assert_eq!(t.qmm_min_rows(false), o.qmm_min_batch_emulated, "{device}");
-        assert_eq!(t.qmm_crossover_tg(), o.qmm_bn_crossover_tg, "{device}");
+        for rows in [1, 2, 4, 5, 7, 8, 9, 11, 12, 16, 17, 32, 512] {
+            for (n, k) in [(512, 4096), (1000, 4096), (1024, 4096), (4096, 1000), (8192, 8192)] {
+                for (bits, group, format) in [
+                    (4, 64, "fp16"),
+                    (4, 64, "emulated"),
+                    (4, 32, "emulated"),
+                    (2, 64, "emulated"),
+                    (8, 64, "emulated"),
+                ] {
+                    let at = QmmAt { rows, n, k, bits, group, format };
+                    assert_eq!(
+                        t.qmm(&at).first(),
+                        Some(&old_qmm(&o, &at)),
+                        "{device}: {at:?}"
+                    );
+                }
+            }
+        }
         assert!(
             t.fp16_gemm_format(4, 64) && !t.fp16_gemm_format(4, 32),
             "{device}"
@@ -99,7 +147,6 @@ fn each_checked_in_profile_runs_its_familys_old_tuning() {
         assert_eq!(t.sdpa_tile_rows_per_request(), 32, "{device}");
         assert!(t.sdpa_mma() && !t.kv_q8(), "{device}");
         assert_eq!(t.gdn_scan(), o.gdn_scan, "{device}");
-        assert_eq!((t.qmv_rows_max(), t.qmv_packs()), (8, 1), "{device}");
         for experts in [1, 8, 64, 128, 256] {
             for pairs in [0, 1, 7, 8, 64, 255, 256, 2048, 4096, 8191, 8192, 65_536] {
                 assert_eq!(
@@ -147,7 +194,16 @@ fn a_wide_range_model_leaves_the_fp16_format_on_any_chip() {
     let (profile, _) = chip::resolve("Apple M4 Max", &chip::facts(9, 40, true), None);
     let wide = Tuning::new(profile, true);
     assert!(!wide.fp16_gemm_format(4, 64));
-    assert_eq!(wide.qmm_min_rows(wide.fp16_gemm_format(4, 64)), 12);
+    let at = |rows| QmmAt {
+        rows,
+        n: 4096,
+        k: 4096,
+        bits: 4,
+        group: 64,
+        format: "emulated",
+    };
+    assert!(matches!(wide.qmm(&at(11))[0], Qmm::Qmv { .. }));
+    assert!(matches!(wide.qmm(&at(12))[0], Qmm::Tiled { .. }));
 }
 
 #[test]

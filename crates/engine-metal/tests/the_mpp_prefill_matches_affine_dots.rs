@@ -24,7 +24,7 @@ fn every_prefill_row_answers_an_exact_affine_reference() {
     let Ok(device) = Context::bind() else {
         return;
     };
-    let tuning = engine_metal::chip::tuning("[kernel]\nqmm.path = \"mpp\"", false);
+    let tuning = engine_metal::chip::tuning("[kernel]\nqmm = [\"mpp\", \"qmv\"]", false);
     let handles = Handles::new();
     let pipelines = Pipelines::new();
     let mut checked = 0;

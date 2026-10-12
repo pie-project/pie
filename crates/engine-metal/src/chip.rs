@@ -37,7 +37,7 @@ pub enum AneMlp {
     /// The Neural Engine takes a fixed count of units: what keeps it level
     /// with a GPU that reads prompts through MPP.
     #[requires("ane")]
-    #[consistent_with("kernel.qmm.path = mpp")]
+    #[consistent_with("kernel.qmm = mpp")]
     Units {
         #[constant(range(1..=64), default = 8)]
         units: u32,
@@ -64,7 +64,7 @@ pub enum WeightsLayout {
     /// As the checkpoint stores them.
     Plain,
     /// Repacked once for the MPP matmul, which then reads the copy.
-    #[consistent_with("kernel.qmm.path = mpp")]
+    #[consistent_with("kernel.qmm = mpp")]
     MppPacked,
 }
 
@@ -191,11 +191,7 @@ pub fn tell_untuned(device: &str, report: &Report) {
 /// Panics on an override the registry refuses.
 #[must_use]
 pub fn tuning(overrides: &str, wide_range: bool) -> kernels_metal::Tuning {
-    let text = format!("api = 1\n{overrides}");
-    let profile = registry()
-        .load_user(&text, "test overrides")
-        .unwrap_or_else(|e| panic!("{e}"));
-    kernels_metal::Tuning::new(profile, wide_range)
+    kernels_metal::Tuning::new(registry().with_overrides(overrides), wide_range)
 }
 
 #[cfg(test)]
@@ -254,25 +250,29 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pie-chip-{}", std::process::id()));
         let path = user_path(&dir, "Apple M4 Max");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "api = 1\n[kernel]\nqmm.crossover_tg = 120\n").unwrap();
+        std::fs::write(&path, "api = 1\n[kernel]\nqmm = [{ use = \"tiled\", crossover_tg = 120 }, \"qmv\"]\n").unwrap();
         let (profile, report) = resolve("Apple M4 Max", &facts(9, 40, true), Some(&dir));
         assert!(
             matches!(report.used, profile::Source::User(_)),
             "{report:?}"
         );
         assert_eq!(
-            profile.get::<kernels_metal::tuning::QmmCrossoverTg>().0,
-            120
+            profile.ladder::<kernels_metal::tuning::Qmm>().values().next(),
+            Some(&kernels_metal::tuning::Qmm::Tiled { crossover_tg: 120 })
         );
 
-        std::fs::write(&path, "api = 1\n[kernel]\nqmm.crossover_tg = 0\n").unwrap();
+        std::fs::write(&path, "api = 1\n[kernel]\nqmm = [{ use = \"tiled\", crossover_tg = 0 }, \"qmv\"]\n").unwrap();
         let (profile, report) = resolve("Apple M4 Max", &facts(9, 40, true), Some(&dir));
         assert_eq!(
             report.used,
             profile::Source::Seeded("apple-m4-max.toml".into())
         );
         assert_eq!(report.rejected.len(), 1, "{report:?}");
-        assert_eq!(profile.get::<kernels_metal::tuning::QmmCrossoverTg>().0, 96);
+        assert_eq!(
+            profile.ladder::<kernels_metal::tuning::Qmm>().values().next(),
+            Some(&kernels_metal::tuning::Qmm::Tiled { crossover_tg: 96 }),
+            "the M4 Max file again"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

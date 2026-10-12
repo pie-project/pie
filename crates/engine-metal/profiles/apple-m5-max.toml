@@ -11,13 +11,13 @@ source   = "the Apple10 family tuning pie applied before per-chip profiles, carr
 measured = false
 
 [kernel]
-qmm.path              = "mpp"
-qmm.min_rows          = 5
-qmm.min_rows_emulated = 12
-qmm.crossover_tg      = 160
-qmm.fp16              = true
-qmv.rows_max          = 8
-qmv.packs             = 1
+qmm = [
+  { when = "rows >= 8 and (rows > 16 or n >= 1024)", use = "mpp" },
+  { when = "rows >= 5 and (bits == 2 or format == fp16)", use = "tiled", crossover_tg = 160 },
+  { when = "rows >= 12", use = "tiled", crossover_tg = 160 },
+  { use = "qmv", rows_max = 8, packs = 1, crossover_tg = 160 },
+]
+qmm_fp16 = true
 moe.path              = "mpp"
 moe.tile_rows = [
   { when = "per_expert < 2",   value = 1 },
