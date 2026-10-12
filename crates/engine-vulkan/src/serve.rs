@@ -65,11 +65,6 @@ pub struct Boot<'a> {
 
 const PATCH_ROUTE_DROP: i32 = -1;
 
-/// A step of at least this many rows is submitted a layer at a time: in one
-/// submit, a long prefill on a slow GPU outlasts the driver's watchdog (about
-/// 2 s on Adreno, which a 64-row prefill reaches) and loses the device.
-const SPLIT_ROWS: u32 = 32;
-
 fn declared_width(trace: &Trace, want: RuntimeInput) -> u64 {
     trace
         .values
@@ -479,7 +474,6 @@ impl Shell {
         let mut scratch = Scratch::reserve(
             &device,
             &boot.trace,
-            weights.table(),
             &compiled,
             &budgets,
             least,
@@ -781,7 +775,6 @@ impl Shell {
             scratch = Scratch::reserve(
                 &device,
                 &boot.trace,
-                weights.table(),
                 &compiled,
                 &budgets,
                 paging,
@@ -2372,7 +2365,10 @@ impl engine::frame::Shell for Shell {
         }
 
         // A split step is not recorded: a recording replays as one submit.
-        let split = prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= SPLIT_ROWS;
+        // `engine.submit.split_rows`: 0 never splits.
+        let split_rows = self.tuning.profile().get::<crate::chip::SubmitSplitRows>().0;
+        let split =
+            split_rows > 0 && prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= split_rows;
         let keep = key.filter(|_| !split && self.recorder.has_room());
         let walked = self.walk_once(&prepared, keep.is_some(), split)?;
         let mut frame = walked.frame.expect("the walk opened a frame");

@@ -68,6 +68,16 @@ impl Context {
     }
 
     #[must_use]
+    pub fn lanes(&self) -> u32 {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn compute_limits(&self) -> (u32, u32) {
+        match self.never {}
+    }
+
+    #[must_use]
     pub fn api_version(&self) -> u32 {
         match self.never {}
     }

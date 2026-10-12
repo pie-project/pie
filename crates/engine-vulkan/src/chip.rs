@@ -12,9 +12,19 @@ use std::sync::LazyLock;
 use kernels_vulkan::tuning::{AXES, FACTS};
 use profile::{Candidate, Facts, Profile, Registry, Report, Shelf, Source};
 
+/// Rows from which a step is submitted a layer at a time rather than in one
+/// submit: in one, a long prefill on a slow GPU outlasts the driver's
+/// watchdog (about 2 s on Adreno, which a 64-row prefill reaches) and loses
+/// the device. A split step is not recorded, so a desktop GPU with no such
+/// watchdog may say 0, never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, profile::Decision)]
+#[decision(id = "engine.submit.split_rows", constant(range(0..=1_048_576)), default = 32, tune = engine)]
+pub struct SubmitSplitRows(pub u32);
+
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("vulkan", FACTS, AXES);
     kernels_vulkan::tuning::register(&mut r);
+    r.add::<SubmitSplitRows>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
     // One queue serves every region.
     poem_compiler::costs::register(&mut r, 0);
@@ -27,9 +37,23 @@ pub fn registry() -> &'static Registry {
     &REGISTRY
 }
 
-/// The profiles checked in with pie, as `(file name, text)`. None yet: every
-/// device runs the profile its facts derive until someone measures one.
-pub const SEEDED: &[(&str, &str)] = &[];
+/// The profiles checked in with pie, as `(file name, text)`, matched by
+/// device name or by `target.match`. A device none names runs the profile
+/// its facts derive.
+pub const SEEDED: &[(&str, &str)] = &[
+    (
+        "qualcomm-adreno-64.toml",
+        include_str!("../profiles/qualcomm-adreno-64.toml"),
+    ),
+    (
+        "qualcomm-adreno-128.toml",
+        include_str!("../profiles/qualcomm-adreno-128.toml"),
+    ),
+    (
+        "qualcomm-adreno.toml",
+        include_str!("../profiles/qualcomm-adreno.toml"),
+    ),
+];
 
 /// Where Vulkan's profiles live.
 pub static SHELF: Shelf = Shelf {
@@ -73,17 +97,14 @@ impl Device {
 }
 
 /// The profile a device's facts derive, as a user file would spell it:
-/// what every device without a measured file runs.
+/// what every device without a measured or checked-in file runs.
 ///
 /// - The cooperative-matrix kernels where the device has them.
 /// - A decode row's keys split across one workgroup per core the device
 ///   reports, else across 16.
-/// - Adreno's workgroup memory is slow next to its ALUs: the plain tiled
-///   point runs a 64x1024x7168 projection at ~27 GFLOPS there, so it takes
-///   the register-tiled point, the one-row vector kernel where subgroups
-///   are 32 wide or wider, and a decode split across 128 workgroups of 128
-///   keys or more (3k keys of Qwen3.5-0.8B attend in 1.9 ms a token over six
-///   layers, against 11.7 split two ways).
+///
+/// A vendor's own habits (Adreno's slow workgroup memory) live in a
+/// checked-in file matched by vendor, not here.
 #[must_use]
 pub fn derived(device: &Device) -> String {
     let mut assumes = vec![
@@ -96,18 +117,16 @@ pub fn derived(device: &Device) -> String {
     }
     let mut kernel = Vec::new();
     if device.coopmat {
-        kernel.push("qmm.path = \"coopmat\"".to_string());
+        kernel.push(
+            "qmm = [\n  { when = \"rows >= 12\", use = \"coopmat\" },\n  \
+             { when = \"rows >= 12\", use = \"tiled\", crossover_tg = 160 },\n  \
+             { use = \"qmv\", vecs = 4 },\n]"
+                .to_string(),
+        );
         kernel.push("gemm.path = \"coopmat\"".to_string());
         kernel.push("moe.path = \"coopmat\"".to_string());
     }
-    if device.vendor == "qualcomm" {
-        kernel.push("qmm.register_tiles = true".to_string());
-        if device.subgroup >= 32 {
-            kernel.push("qmv.path = \"one_row\"".to_string());
-        }
-        kernel.push("sdpa.decode.split = { use = \"fixed\", groups = 128 }".to_string());
-        kernel.push("sdpa.decode.split_min_keys = 128".to_string());
-    } else if device.cores.is_some() {
+    if device.cores.is_some() {
         kernel.push("sdpa.decode.split = { use = \"per_core\", per = 1 }".to_string());
     } else {
         kernel.push(format!(
@@ -239,8 +258,6 @@ mod tests {
             device("nvidia", 32, Some(142), true),
             device("amd", 64, Some(60), false),
             device("intel", 16, None, false),
-            device("qualcomm", 64, None, false),
-            device("qualcomm", 16, None, false),
         ] {
             let (_, report) = resolve(&d, None);
             assert_eq!(report.used, Source::Derived, "{d:?}: {report:?}");
@@ -248,29 +265,42 @@ mod tests {
         }
     }
 
-    /// What `DeviceTuning::of(info)` gave a device before profiles, frozen:
-    /// `(min rows, crossover, register tiles, one-row, coopmat paths, split
-    /// groups, split min keys)`. `cores` is what the device reported to it,
-    /// floored at 16 then.
-    fn old(d: &Device) -> (u32, u32, bool, bool, bool, u32, u32) {
+    #[test]
+    fn an_adreno_runs_its_checked_in_file() {
+        for (d, file) in [
+            (device("qualcomm", 64, None, false), "qualcomm-adreno-64.toml"),
+            (device("qualcomm", 128, Some(6), false), "qualcomm-adreno-128.toml"),
+            (device("qualcomm", 16, None, false), "qualcomm-adreno.toml"),
+        ] {
+            let (_, report) = resolve(&d, None);
+            assert_eq!(report.used, Source::Seeded(file.to_string()), "{d:?}: {report:?}");
+        }
+    }
+
+    /// The kernel the cascade before the `kernel.qmm` ladder ran a dense
+    /// matmul on, for a device: coopmat, then register tiles (Adreno), then
+    /// tiled, from 12 rows and a contraction of whole 32-code tiles; the
+    /// one-row kernel for one row on an Adreno 32 lanes wide or wider; else
+    /// four vectors a workgroup.
+    fn old_qmm(d: &Device, rows: u32, n: u32, k: u32) -> kernels_vulkan::tuning::Qmm {
+        use kernels_vulkan::tuning::Qmm;
         let qualcomm = d.vendor == "qualcomm";
-        (
-            12,
-            160,
-            qualcomm,
-            qualcomm && d.subgroup >= 32,
-            d.coopmat,
-            if qualcomm {
-                128
-            } else {
-                d.cores.unwrap_or(0).max(16)
-            },
-            if qualcomm { 128 } else { 256 },
-        )
+        let tiles = rows >= 12 && k % 32 == 0;
+        if d.coopmat && tiles {
+            Qmm::Coopmat
+        } else if qualcomm && tiles {
+            Qmm::RegisterTiled { bm: if rows > 32 { 64 } else { 32 } }
+        } else if tiles && n % 16 == 0 {
+            Qmm::Tiled { crossover_tg: 160 }
+        } else if rows == 1 && qualcomm && d.subgroup >= 32 && (k * 4) % 128 == 0 && k % 8 == 0 {
+            Qmm::OneRow
+        } else {
+            Qmm::Qmv { vecs: 4 }
+        }
     }
 
     #[test]
-    fn the_derived_profile_is_the_old_tuning_where_the_device_reported_honestly() {
+    fn every_device_runs_what_it_ran_before_the_ladder() {
         for d in [
             device("nvidia", 32, Some(142), true),
             device("nvidia", 32, Some(24), false),
@@ -285,25 +315,29 @@ mod tests {
             device("other", 32, None, false),
         ] {
             let (profile, report) = resolve(&d, None);
-            assert_eq!(report.used, Source::Derived, "{d:?}: {report:?}");
-            let cores = d.pricing_cores();
-            let t = kernels_vulkan::Tuning::new(profile, kernels_vulkan::tuning::Limits::with_cores(cores));
-            let new = (
-                t.qmm_min_rows(),
-                t.qmm_crossover_tg(),
-                t.qmm_register_tiles(),
-                t.qmv_one_row(),
-                t.qmm_coopmat() && t.gemm_coopmat() && t.moe_coopmat(),
-                t.sdpa_split_groups(),
-                t.sdpa_split_min_keys(),
+            let t = kernels_vulkan::Tuning::new(
+                profile,
+                kernels_vulkan::tuning::Limits::with_cores(d.pricing_cores()),
             );
-            assert_eq!(new, old(&d), "{d:?}");
+            for rows in [1, 2, 4, 11, 12, 16, 32, 33, 64, 512] {
+                for (n, k) in [(4096, 4096), (4096, 4100), (1000, 4096)] {
+                    let at = t.qmm_at(rows, n, k, 4, 64);
+                    assert_eq!(
+                        t.qmm(&at)[0],
+                        old_qmm(&d, rows, n, k),
+                        "{d:?} from {}: {rows} x {n} x {k}",
+                        report.used
+                    );
+                }
+            }
+            let qualcomm = d.vendor == "qualcomm";
             assert_eq!(
-                t.qmm_coopmat() || t.gemm_coopmat() || t.moe_coopmat(),
-                d.coopmat,
-                "{d:?}: every coopmat path follows the device"
+                t.sdpa_split_groups(),
+                if qualcomm { 128 } else { d.cores.unwrap_or(0).max(16) },
+                "{d:?}"
             );
-            assert!(!t.sdpa_mma());
+            assert_eq!(t.sdpa_split_min_keys(), if qualcomm { 128 } else { 256 });
+            assert_eq!(t.gemm_coopmat() && t.moe_coopmat(), d.coopmat, "{d:?}");
             assert_eq!(t.sdpa_tile_rows_per_request(), 32);
             for (pairs, experts) in [(0, 8), (15, 8), (16, 8), (255, 8), (256, 8), (4096, 64)] {
                 let per = pairs / experts;
@@ -314,11 +348,7 @@ mod tests {
                 } else {
                     16
                 };
-                assert_eq!(
-                    t.moe_tile_rows(pairs, experts),
-                    old_tile,
-                    "{pairs} over {experts}"
-                );
+                assert_eq!(t.moe_tile_rows(pairs, experts), old_tile, "{pairs} over {experts}");
             }
         }
     }
@@ -342,7 +372,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            "api = 1\n[target]\nassumes = { subgroup = 32 }\n[kernel]\nqmv.path = \"one_row\"\n",
+            "api = 1\n[target]\nassumes = { subgroup = 32 }\n[kernel]\nqmm = [\"one_row\", \"qmv\"]\n",
         )
         .unwrap();
         let (profile, report) = resolve(&d, Some(&dir));
@@ -354,7 +384,11 @@ mod tests {
             "{:?}",
             report.rejected
         );
-        assert!(!kernels_vulkan::Tuning::new(profile, kernels_vulkan::tuning::Limits::ASSUMED).qmv_one_row());
+        let t = kernels_vulkan::Tuning::new(profile, kernels_vulkan::tuning::Limits::ASSUMED);
+        assert_ne!(
+            t.qmm(&t.qmm_at(1, 4096, 4096, 4, 64))[0],
+            kernels_vulkan::tuning::Qmm::OneRow
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

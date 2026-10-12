@@ -24,16 +24,32 @@ fn artifact() -> Option<(PathBuf, String)> {
     engine_vulkan::tune::artifacts(&store).into_iter().next()
 }
 
-/// The prompt's readout and four decode steps' readouts on device `index`.
-fn serve(index: u32, artifact: &PathBuf, deployment: &str) -> Vec<Vec<f32>> {
+/// The prompt's readout and four decode steps' readouts on device `index`,
+/// under the user profile `kernel` (a `[kernel]` body) where one is given.
+fn serve(index: u32, artifact: &PathBuf, deployment: &str, kernel: Option<&str>) -> Vec<Vec<f32>> {
     let row = poem_compiler::catalog::deployment(deployment).expect("a catalog row");
     let trace = row.trace(Platform::Vulkan);
     let source = ztensor_compat::index(artifact).expect("the artifact opens");
     let contract = poem::import::own_contract(&source, &trace.params, row.deploy.tp, Platform::Vulkan)
         .expect("the artifact holds the row's planes");
     drop(source);
+    let dir = std::env::temp_dir().join(format!("pie-vk-widths-{}-{index}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    if let Some(kernel) = kernel {
+        let name = Context::bind(&DeviceBoot {
+            device_index: index,
+            ..DeviceBoot::default()
+        })
+        .expect("the device binds")
+        .chip()
+        .name;
+        let path = engine_vulkan::chip::SHELF.user_path(&dir, &name);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("the shelf");
+        std::fs::write(&path, format!("api = 1\n[kernel]\n{kernel}\n")).expect("the file");
+    }
     let boot = DeviceBoot {
         device_index: index,
+        profiles: kernel.map(|_| dir.clone()),
         ..DeviceBoot::default()
     };
     let patches = engine_vulkan::api::patch_ladder(
@@ -60,6 +76,13 @@ fn serve(index: u32, artifact: &PathBuf, deployment: &str) -> Vec<Vec<f32>> {
         residency: engine::load::Residency::default(),
     })
     .expect("the shell loads");
+    if kernel.is_some() {
+        assert!(
+            matches!(shell.tuning().profile().source(), profile::Source::User(_)),
+            "the user file was refused: {:?}",
+            shell.tuning().profile().source()
+        );
+    }
     let prompt: Vec<u32> = (0..40u32).map(|i| 100 + (i * 7919) % 5000).collect();
     shell.open(0).expect("the slot opens");
     let mut fire = |tokens: &[u32]| {
@@ -74,9 +97,25 @@ fn serve(index: u32, artifact: &PathBuf, deployment: &str) -> Vec<Vec<f32>> {
             .next()
             .expect("one readout")
     };
+    engine_vulkan::encode::reset_kernel_profile();
+    engine_vulkan::encode::profile_kernels(true);
     let mut rows = vec![fire(&prompt)];
     for step in 0..4u32 {
         rows.push(fire(&[200 + step]));
+    }
+    engine_vulkan::encode::profile_kernels(false);
+    let ran: Vec<String> = engine_vulkan::encode::kernel_profile()
+        .into_iter()
+        .map(|(name, ..)| name)
+        .filter(|name| name.starts_with("sdpa_paged_"))
+        .collect();
+    eprintln!("{kernel:?}: {ran:?}");
+    if let Some(kernel) = kernel {
+        let t128 = ran.iter().any(|name| name.contains("_t128"));
+        assert_eq!(t128, kernel.contains("threads = 128"), "{kernel}: ran {ran:?}");
+        if kernel.contains("groups = 64") {
+            assert!(ran.iter().any(|name| name.contains("_split_")), "{kernel}: ran {ran:?}");
+        }
     }
     rows
 }
@@ -114,11 +153,54 @@ fn a_narrow_device_reads_what_a_wide_one_does() {
         return;
     };
     eprintln!("{deployment}: {} ({} lanes) against {} ({} lanes)", narrow.2, narrow.1, wide.2, wide.1);
-    let a = serve(narrow.0, &artifact, &deployment);
-    let b = serve(wide.0, &artifact, &deployment);
-    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+    let a = serve(narrow.0, &artifact, &deployment, None);
+    let b = serve(wide.0, &artifact, &deployment, None);
+    agree(&a, &b, &deployment, "between widths");
+}
+
+fn agree(a: &[Vec<f32>], b: &[Vec<f32>], deployment: &str, what: &str) {
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
         let c = cosine(x, y);
         eprintln!("readout {i}: cosine {c:.5}");
-        assert!(c > 0.995, "readout {i} of {deployment} differs between widths: cosine {c}");
+        assert!(c > 0.995, "readout {i} of {deployment} differs {what}: cosine {c}");
+    }
+}
+
+/// Decode attention at 128 invocations (`kernel.sdpa.decode.threads`),
+/// whole and split across workgroups, reads what it does at 256, on every
+/// device in the process.
+#[test]
+fn a_decode_at_128_invocations_reads_what_one_at_256_does() {
+    let Some((artifact, deployment)) = artifact() else {
+        eprintln!("not asked: no Vulkan-stamped artifact in ~/.pie/artifacts");
+        return;
+    };
+    let split = "sdpa.decode.split = { use = \"fixed\", groups = 64 }\nsdpa.decode.split_min_keys = 8";
+    for index in 0..4u32 {
+        if Context::bind(&DeviceBoot {
+            device_index: index,
+            ..DeviceBoot::default()
+        })
+        .is_err()
+        {
+            break;
+        }
+        let wide = serve(index, &artifact, &deployment, Some("sdpa.decode.threads = 256"));
+        let narrow = serve(index, &artifact, &deployment, Some("sdpa.decode.threads = 128"));
+        agree(&wide, &narrow, &deployment, "at 128 invocations");
+        let split_wide = serve(
+            index,
+            &artifact,
+            &deployment,
+            Some(&format!("sdpa.decode.threads = 256\n{split}")),
+        );
+        let split_narrow = serve(
+            index,
+            &artifact,
+            &deployment,
+            Some(&format!("sdpa.decode.threads = 128\n{split}")),
+        );
+        agree(&wide, &split_wide, &deployment, "split");
+        agree(&wide, &split_narrow, &deployment, "split at 128 invocations");
     }
 }

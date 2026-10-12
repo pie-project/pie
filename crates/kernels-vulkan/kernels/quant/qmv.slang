@@ -4,7 +4,11 @@
 #define PIE_LANES 32u
 #define PIE_SLICES 4u
 #define PIE_ROWS_PER_SLICE 2u
+// Activation vectors one workgroup reads each weight row for: more vectors
+// re-read the bank fewer times and hold more registers.
+#if !defined(PIE_VROWS)
 #define PIE_VROWS 4u
+#endif
 #if PIE_BITS == 2
 #define PIE_CHUNK_WORDS 2u
 #else
@@ -120,3 +124,31 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate affine_qmv_bf16_gs_128_b_2 PIE_GROUP=128 PIE_BITS=2
 // pie:instantiate affine_qmv_bf16_gs_128_b_4 PIE_GROUP=128 PIE_BITS=4
 // pie:instantiate affine_qmv_bf16_gs_128_b_8 PIE_GROUP=128 PIE_BITS=8
+// The same at 1, 2 and 8 vectors a workgroup.
+// pie:instantiate affine_qmv_bf16_gs_32_b_2_v1 PIE_GROUP=32 PIE_BITS=2 PIE_VROWS=1u
+// pie:instantiate affine_qmv_bf16_gs_32_b_2_v2 PIE_GROUP=32 PIE_BITS=2 PIE_VROWS=2u
+// pie:instantiate affine_qmv_bf16_gs_32_b_2_v8 PIE_GROUP=32 PIE_BITS=2 PIE_VROWS=8u
+// pie:instantiate affine_qmv_bf16_gs_32_b_4_v1 PIE_GROUP=32 PIE_BITS=4 PIE_VROWS=1u
+// pie:instantiate affine_qmv_bf16_gs_32_b_4_v2 PIE_GROUP=32 PIE_BITS=4 PIE_VROWS=2u
+// pie:instantiate affine_qmv_bf16_gs_32_b_4_v8 PIE_GROUP=32 PIE_BITS=4 PIE_VROWS=8u
+// pie:instantiate affine_qmv_bf16_gs_32_b_8_v1 PIE_GROUP=32 PIE_BITS=8 PIE_VROWS=1u
+// pie:instantiate affine_qmv_bf16_gs_32_b_8_v2 PIE_GROUP=32 PIE_BITS=8 PIE_VROWS=2u
+// pie:instantiate affine_qmv_bf16_gs_32_b_8_v8 PIE_GROUP=32 PIE_BITS=8 PIE_VROWS=8u
+// pie:instantiate affine_qmv_bf16_gs_64_b_2_v1 PIE_GROUP=64 PIE_BITS=2 PIE_VROWS=1u
+// pie:instantiate affine_qmv_bf16_gs_64_b_2_v2 PIE_GROUP=64 PIE_BITS=2 PIE_VROWS=2u
+// pie:instantiate affine_qmv_bf16_gs_64_b_2_v8 PIE_GROUP=64 PIE_BITS=2 PIE_VROWS=8u
+// pie:instantiate affine_qmv_bf16_gs_64_b_4_v1 PIE_GROUP=64 PIE_BITS=4 PIE_VROWS=1u
+// pie:instantiate affine_qmv_bf16_gs_64_b_4_v2 PIE_GROUP=64 PIE_BITS=4 PIE_VROWS=2u
+// pie:instantiate affine_qmv_bf16_gs_64_b_4_v8 PIE_GROUP=64 PIE_BITS=4 PIE_VROWS=8u
+// pie:instantiate affine_qmv_bf16_gs_64_b_8_v1 PIE_GROUP=64 PIE_BITS=8 PIE_VROWS=1u
+// pie:instantiate affine_qmv_bf16_gs_64_b_8_v2 PIE_GROUP=64 PIE_BITS=8 PIE_VROWS=2u
+// pie:instantiate affine_qmv_bf16_gs_64_b_8_v8 PIE_GROUP=64 PIE_BITS=8 PIE_VROWS=8u
+// pie:instantiate affine_qmv_bf16_gs_128_b_2_v1 PIE_GROUP=128 PIE_BITS=2 PIE_VROWS=1u
+// pie:instantiate affine_qmv_bf16_gs_128_b_2_v2 PIE_GROUP=128 PIE_BITS=2 PIE_VROWS=2u
+// pie:instantiate affine_qmv_bf16_gs_128_b_2_v8 PIE_GROUP=128 PIE_BITS=2 PIE_VROWS=8u
+// pie:instantiate affine_qmv_bf16_gs_128_b_4_v1 PIE_GROUP=128 PIE_BITS=4 PIE_VROWS=1u
+// pie:instantiate affine_qmv_bf16_gs_128_b_4_v2 PIE_GROUP=128 PIE_BITS=4 PIE_VROWS=2u
+// pie:instantiate affine_qmv_bf16_gs_128_b_4_v8 PIE_GROUP=128 PIE_BITS=4 PIE_VROWS=8u
+// pie:instantiate affine_qmv_bf16_gs_128_b_8_v1 PIE_GROUP=128 PIE_BITS=8 PIE_VROWS=1u
+// pie:instantiate affine_qmv_bf16_gs_128_b_8_v2 PIE_GROUP=128 PIE_BITS=8 PIE_VROWS=2u
+// pie:instantiate affine_qmv_bf16_gs_128_b_8_v8 PIE_GROUP=128 PIE_BITS=8 PIE_VROWS=8u

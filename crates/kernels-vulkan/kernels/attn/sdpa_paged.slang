@@ -15,6 +15,9 @@
 #endif
 #define PIE_NUMTHREADS [numthreads(32, PIE_TILE_ROWS, 1)]
 #else
+#if !defined(PIE_DECODE_THREADS)
+#define PIE_DECODE_THREADS 256
+#endif
 #define PIE_NUMTHREADS [numthreads(PIE_DECODE_THREADS, 1, 1)]
 #endif
 
@@ -172,8 +175,13 @@ void tiled_tile(uint q_head, uint n_q_heads, uint3 group, uint3 local, uint grou
 }
 #else
 
+// Invocations a decode workgroup walks a row's keys with; the `_t128`
+// variants halve them, and their workgroup memory, where the device's
+// limits or the profile ask (`kernel.sdpa.decode.threads`).
+#if !defined(PIE_DECODE_THREADS)
 #define PIE_DECODE_THREADS 256
-#define PIE_DECODE_MAX_SUBGROUPS 8
+#endif
+#define PIE_DECODE_MAX_SUBGROUPS (PIE_DECODE_THREADS / 32)
 // The narrowest subgroup this variant serves: its per-lane registers hold
 // HEAD_DIM / MIN_LANES dims. A device that runs narrower than 32 lanes and
 // cannot be pinned to 32 loads the `_narrow` variant, built at 8.
@@ -431,3 +439,45 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID, uint group_i
 // pie:instantiate sdpa_paged_tiled_lse_bfloat16_d_256_r8 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8
 // pie:instantiate sdpa_paged_tiled_lse_bfloat16_d_512_r16 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16
 // pie:instantiate sdpa_paged_tiled_lse_bfloat16_d_512_r8 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8
+// Decode at 128 invocations, where 256 would pass the device's workgroup
+// memory or invocation limit, or the profile asks.
+// pie:instantiate sdpa_paged_selected_bfloat16_d_64_t128 PIE_HEAD_DIM=64 PIE_SELECTED=1 PIE_DECODE_THREADS=128
+// pie:instantiate sdpa_paged_selected_bfloat16_d_64_t128_narrow PIE_HEAD_DIM=64 PIE_SELECTED=1 PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate sdpa_paged_selected_bfloat16_d_128_t128 PIE_HEAD_DIM=128 PIE_SELECTED=1 PIE_DECODE_THREADS=128
+// pie:instantiate sdpa_paged_selected_bfloat16_d_128_t128_narrow PIE_HEAD_DIM=128 PIE_SELECTED=1 PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate sdpa_paged_selected_bfloat16_d_256_t128 PIE_HEAD_DIM=256 PIE_SELECTED=1 PIE_DECODE_THREADS=128
+// pie:instantiate sdpa_paged_selected_bfloat16_d_256_t128_narrow PIE_HEAD_DIM=256 PIE_SELECTED=1 PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate sdpa_paged_selected_bfloat16_d_512_t128 PIE_HEAD_DIM=512 PIE_SELECTED=1 PIE_DECODE_THREADS=128
+// pie:instantiate sdpa_paged_selected_bfloat16_d_512_t128_narrow PIE_HEAD_DIM=512 PIE_SELECTED=1 PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate sdpa_paged_decode_bfloat16_d_64_t128 PIE_HEAD_DIM=64 PIE_DECODE_THREADS=128
+// pie:instantiate sdpa_paged_decode_bfloat16_d_64_t128_narrow PIE_HEAD_DIM=64 PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate sdpa_paged_decode_bfloat16_d_128_t128 PIE_HEAD_DIM=128 PIE_DECODE_THREADS=128
+// pie:instantiate sdpa_paged_decode_bfloat16_d_128_t128_narrow PIE_HEAD_DIM=128 PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate sdpa_paged_decode_bfloat16_d_256_t128 PIE_HEAD_DIM=256 PIE_DECODE_THREADS=128
+// pie:instantiate sdpa_paged_decode_bfloat16_d_256_t128_narrow PIE_HEAD_DIM=256 PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate sdpa_paged_decode_bfloat16_d_512_t128 PIE_HEAD_DIM=512 PIE_DECODE_THREADS=128
+// pie:instantiate sdpa_paged_decode_bfloat16_d_512_t128_narrow PIE_HEAD_DIM=512 PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate sdpa_paged_decode_lse_bfloat16_d_64_t128 PIE_HEAD_DIM=64 PIE_LSE=1 PIE_DECODE_THREADS=128
+// pie:instantiate sdpa_paged_decode_lse_bfloat16_d_64_t128_narrow PIE_HEAD_DIM=64 PIE_LSE=1 PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate sdpa_paged_decode_lse_bfloat16_d_128_t128 PIE_HEAD_DIM=128 PIE_LSE=1 PIE_DECODE_THREADS=128
+// pie:instantiate sdpa_paged_decode_lse_bfloat16_d_128_t128_narrow PIE_HEAD_DIM=128 PIE_LSE=1 PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate sdpa_paged_decode_lse_bfloat16_d_256_t128 PIE_HEAD_DIM=256 PIE_LSE=1 PIE_DECODE_THREADS=128
+// pie:instantiate sdpa_paged_decode_lse_bfloat16_d_256_t128_narrow PIE_HEAD_DIM=256 PIE_LSE=1 PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate sdpa_paged_decode_lse_bfloat16_d_512_t128 PIE_HEAD_DIM=512 PIE_LSE=1 PIE_DECODE_THREADS=128
+// pie:instantiate sdpa_paged_decode_lse_bfloat16_d_512_t128_narrow PIE_HEAD_DIM=512 PIE_LSE=1 PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate sdpa_paged_split_bfloat16_d_64_t128 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_DECODE_THREADS=128
+// pie:instantiate sdpa_paged_split_bfloat16_d_64_t128_narrow PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate sdpa_paged_split_bfloat16_d_128_t128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_DECODE_THREADS=128
+// pie:instantiate sdpa_paged_split_bfloat16_d_128_t128_narrow PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate sdpa_paged_split_bfloat16_d_256_t128 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_DECODE_THREADS=128
+// pie:instantiate sdpa_paged_split_bfloat16_d_256_t128_narrow PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate sdpa_paged_split_bfloat16_d_512_t128 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_DECODE_THREADS=128
+// pie:instantiate sdpa_paged_split_bfloat16_d_512_t128_narrow PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate sdpa_paged_split_lse_bfloat16_d_64_t128 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_DECODE_THREADS=128
+// pie:instantiate sdpa_paged_split_lse_bfloat16_d_64_t128_narrow PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate sdpa_paged_split_lse_bfloat16_d_128_t128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_DECODE_THREADS=128
+// pie:instantiate sdpa_paged_split_lse_bfloat16_d_128_t128_narrow PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate sdpa_paged_split_lse_bfloat16_d_256_t128 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_DECODE_THREADS=128
+// pie:instantiate sdpa_paged_split_lse_bfloat16_d_256_t128_narrow PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_DECODE_THREADS=128 PIE_MIN_LANES=8
+// pie:instantiate sdpa_paged_split_lse_bfloat16_d_512_t128 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_DECODE_THREADS=128
+// pie:instantiate sdpa_paged_split_lse_bfloat16_d_512_t128_narrow PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_DECODE_THREADS=128 PIE_MIN_LANES=8

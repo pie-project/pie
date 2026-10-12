@@ -10,8 +10,10 @@ use std::time::Instant;
 use profile::search::{self, Bench, CONTEXT, Check, LANES, Line, PROMPT, STEPS, Serving};
 use profile::{Facts, Profile};
 
-/// Decisions the search leaves alone on Vulkan: one device, one queue.
-pub const SEARCH_SKIPS: &[&str] = &["compiler.cost.collective_us", "compiler.side_streams"];
+/// Decisions the end-to-end search leaves alone on Vulkan: the dense
+/// matmul, which the kernel bench measures, and what one device with one
+/// queue makes meaningless.
+pub const SEARCH_SKIPS: &[&str] = &["kernel.qmm", "compiler.cost.collective_us", "compiler.side_streams"];
 
 /// The facts a tuned file assumes where the profile it starts from assumes
 /// nothing: what a kernel's requirement reads.
@@ -353,7 +355,9 @@ mod tests {
             let (base, _) = crate::chip::resolve_facts("Test GPU", &facts, None);
             let knobs = search::knobs(&base, SEARCH_SKIPS, "");
             let ids: Vec<&str> = knobs.iter().map(|k| k.id).collect();
-            assert!(ids.contains(&"kernel.qmm.min_rows"), "{ids:?}");
+            assert!(ids.contains(&"kernel.sdpa.decode.threads"), "{ids:?}");
+            assert!(ids.contains(&"engine.submit.split_rows"), "{ids:?}");
+            assert!(!ids.contains(&"kernel.qmm"), "{ids:?}");
             for k in &knobs {
                 for (label, _) in &k.candidates {
                     let entries = vec![(k.id.to_string(), label.clone())];
