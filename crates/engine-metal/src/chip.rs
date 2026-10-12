@@ -9,6 +9,7 @@ use profile::{Decision, Domain, Facts, Profile, Registry, Report, Shelf, Var};
 const FACTS: &[Var] = &[
     Var::fixed("family", Domain::COUNT),
     Var::fixed("cores", Domain::COUNT),
+    Var::fixed("perf_cores", Domain::COUNT),
     Var::fixed("ane", Domain::Bool),
 ];
 
@@ -99,8 +100,32 @@ pub struct ExpertsPrefetch(pub u32);
 
 /// The copy threads a streamed mixture-of-experts load seats experts on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.experts.threads", constant(range(1..=32)), default = 8, tune = engine)]
-pub struct ExpertsThreads(pub u32);
+#[decision(
+    id = "engine.experts.threads",
+    default = r#"{ use = "perf_cores", most = 8 }"#,
+    tune = engine
+)]
+pub enum ExpertsThreads {
+    /// One a CPU performance core, at most `most`.
+    PerfCores {
+        #[constant(range(1..=32), default = 8)]
+        most: u32,
+    },
+    Fixed {
+        #[constant(range(1..=32), default = 8)]
+        threads: u32,
+    },
+}
+
+impl ExpertsThreads {
+    #[must_use]
+    pub fn count(self, perf_cores: u32) -> u32 {
+        match self {
+            ExpertsThreads::PerfCores { most } => perf_cores.clamp(1, most),
+            ExpertsThreads::Fixed { threads } => threads,
+        }
+    }
+}
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("metal", FACTS, AXES);
@@ -148,11 +173,46 @@ pub static SHELF: Shelf = Shelf {
 };
 
 #[must_use]
-pub fn facts(family: u32, cores: u32, ane: bool) -> Facts {
+pub fn facts(family: u32, cores: u32, perf_cores: u32, ane: bool) -> Facts {
     Facts::of(registry())
         .int("family", i64::from(family))
         .int("cores", i64::from(cores))
+        .int("perf_cores", i64::from(perf_cores))
         .flag("ane", ane)
+}
+
+/// The CPU's performance cores, or every physical core on a CPU without
+/// performance levels; 0 where the system does not say.
+#[must_use]
+pub fn perf_cores() -> u32 {
+    #[cfg(target_vendor = "apple")]
+    {
+        let read = |name: &std::ffi::CStr| {
+            let mut value: i32 = 0;
+            let mut len = std::mem::size_of::<i32>();
+            // SAFETY: each name is an int sysctl; `len` states the out
+            // buffer's size and the call writes at most that many bytes.
+            let rc = unsafe {
+                libc::sysctlbyname(
+                    name.as_ptr(),
+                    (&raw mut value).cast(),
+                    &raw mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            (rc == 0).then(|| u32::try_from(value).unwrap_or(0))
+        };
+        match read(c"hw.perflevel0.physicalcpu") {
+            Some(cores) => cores,
+            None if read(c"hw.nperflevels").is_none() => read(c"hw.physicalcpu").unwrap_or(0),
+            None => 0,
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        0
+    }
 }
 
 #[must_use]
@@ -171,7 +231,7 @@ pub fn ane_loads() -> bool {
 #[must_use]
 pub fn probe() -> Option<(String, Facts)> {
     let device = crate::device::Context::bind().ok()?;
-    let facts = facts(device.family(), device.cores(), ane_loads());
+    let facts = facts(device.family(), device.cores(), perf_cores(), ane_loads());
     Some((device.name().to_string(), facts))
 }
 
@@ -237,12 +297,64 @@ mod tests {
     }
 
     #[test]
+    fn the_copy_threads_follow_the_performance_cores_up_to_their_cap() {
+        let threads = *registry().defaults().get::<ExpertsThreads>();
+        assert_eq!(
+            [2, 4, 8, 10, 16].map(|p| threads.count(p)),
+            [2, 4, 8, 8, 8],
+            "an M4 Pro, with 8 or 10, keeps the 8 it ran before"
+        );
+        assert_eq!(threads.count(0), 1);
+        assert_eq!(ExpertsThreads::Fixed { threads: 12 }.count(4), 12);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn an_apple_cpu_says_how_many_performance_cores_it_has() {
+        let p = perf_cores();
+        assert!((1..=64).contains(&p), "{p}");
+    }
+
+    #[test]
+    fn a_checked_in_file_holds_only_what_differs_from_the_layer_below() {
+        let defaults = registry().defaults();
+        let parse = |name: &str| {
+            let text = SEEDED.iter().find(|(n, _)| *n == name).unwrap().1;
+            registry()
+                .parse(text, name, profile::Strict::CheckedIn)
+                .unwrap_or_else(|e| panic!("{e}"))
+        };
+        for (name, _) in SEEDED {
+            let family = name
+                .split_once('/')
+                .map(|(dir, _)| parse(&format!("{dir}.toml")));
+            for (id, rungs) in &parse(name).entries {
+                let below = match &family {
+                    Some(family) => family.entries.get(id).cloned(),
+                    None => None,
+                }
+                .or_else(|| {
+                    defaults
+                        .entries()
+                        .find(|(spec, ..)| spec.id == *id)
+                        .map(|(_, rungs, _)| rungs.to_vec())
+                });
+                assert_ne!(
+                    below.as_ref(),
+                    Some(rungs),
+                    "{name}: {id} restates the layer below"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_device_no_file_names_runs_its_family_and_is_told_so() {
-        let (profile, report) = resolve("Apple A17 Pro GPU", &facts(9, 6, true), None);
+        let (profile, report) = resolve("Apple A17 Pro GPU", &facts(9, 6, 10, true), None);
         assert_eq!(report.used, profile::Source::Seeded("apple9.toml".into()));
         assert!(report.untuned());
         assert_eq!(*profile.get::<AneMlp>(), AneMlp::Share { percent: 47 });
-        let (profile, report) = resolve("Apple A17 Pro GPU", &facts(9, 6, false), None);
+        let (profile, report) = resolve("Apple A17 Pro GPU", &facts(9, 6, 10, false), None);
         assert!(report.rejected.is_empty(), "{report:?}");
         assert_eq!(
             *profile.get::<AneMlp>(),
@@ -253,7 +365,7 @@ mod tests {
 
     #[test]
     fn the_m4_pro_runs_its_family_and_what_it_measured() {
-        let (profile, report) = resolve("Apple M4 Pro", &facts(9, 20, true), None);
+        let (profile, report) = resolve("Apple M4 Pro", &facts(9, 20, 10, true), None);
         assert_eq!(
             report.layers,
             [
@@ -276,7 +388,7 @@ mod tests {
             "api = 1\n[kernel]\nqmm = [{ use = \"tiled\", crossover_tg = 120 }, \"qmv\"]\n",
         )
         .unwrap();
-        let (profile, report) = resolve("Apple M4 Max", &facts(9, 40, true), Some(&dir));
+        let (profile, report) = resolve("Apple M4 Max", &facts(9, 40, 10, true), Some(&dir));
         assert!(
             matches!(report.used, profile::Source::User(_)),
             "{report:?}"
@@ -294,7 +406,7 @@ mod tests {
             "api = 1\n[kernel]\nqmm = [{ use = \"tiled\", crossover_tg = 0 }, \"qmv\"]\n",
         )
         .unwrap();
-        let (profile, report) = resolve("Apple M4 Max", &facts(9, 40, true), Some(&dir));
+        let (profile, report) = resolve("Apple M4 Max", &facts(9, 40, 10, true), Some(&dir));
         assert_eq!(report.used, profile::Source::Seeded("apple9.toml".into()));
         assert_eq!(report.rejected.len(), 1, "{report:?}");
         assert_eq!(

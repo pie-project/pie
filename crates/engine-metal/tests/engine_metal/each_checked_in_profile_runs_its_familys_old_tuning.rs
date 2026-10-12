@@ -2,7 +2,7 @@
 //! it before profiles existed, but what was measured on it since; the
 //! functions below are that table, frozen.
 
-use engine_metal::chip::{self, AneMlp, AneProjections, StreamCut, WeightsLayout};
+use engine_metal::chip::{self, AneMlp, AneProjections, ExpertsThreads, StreamCut, WeightsLayout};
 use kernels_metal::Tuning;
 use kernels_metal::tuning::{GdnScan, Qmm, QmmAt};
 use profile::Source;
@@ -61,24 +61,32 @@ fn old_qmm(family: u32, at: &QmmAt) -> Qmm {
     }
 }
 
-/// Chips of each family, an iPhone's among them: none is named by a file
-/// but the M4 Pro.
+/// Chips of each family by the newest `MTLGPUFamily::AppleN` they support,
+/// every iPhone and iPad chip that runs Metal 4 among them: none is named by
+/// a file but the M4 Pro.
 const CHIPS: &[(u32, &str)] = &[
     (7, "Apple M1"),
     (7, "Apple M1 Ultra"),
+    (7, "Apple A14 GPU"),
     (8, "Apple M2 Max"),
+    (8, "Apple A15 GPU"),
+    (8, "Apple A16 GPU"),
     (9, "Apple M3"),
     (9, "Apple M4 Max"),
     (9, "Apple A17 Pro GPU"),
+    (9, "Apple A18 GPU"),
+    (9, "Apple A18 Pro GPU"),
     (10, "Apple M5"),
     (10, "Apple M5 Pro"),
+    (10, "Apple A19 GPU"),
+    (10, "Apple A19 Pro GPU"),
 ];
 
 /// What `DeviceTuning::of(family)` gave a chip with the Neural Engine, but
 /// the split-K fill and the Neural Engine's MLP share, which `fill_tg` and
 /// `mlp` stand in for.
 fn assert_old_tuning(device: &str, family: u32, fill_tg: u32, mlp: Option<AneMlp>) {
-    let (profile, report) = chip::resolve(device, &chip::facts(family, 10, true), None);
+    let (profile, report) = chip::resolve(device, &chip::facts(family, 10, 10, true), None);
     assert_eq!(
         report.layers.first(),
         Some(&Source::Seeded(format!("apple{family}.toml"))),
@@ -159,6 +167,11 @@ fn assert_old_tuning(device: &str, family: u32, fill_tg: u32, mlp: Option<AneMlp
     );
     assert_eq!(*profile.get::<StreamCut>(), StreamCut::FanOut);
     assert_eq!(
+        profile.get::<ExpertsThreads>().count(10),
+        8,
+        "{device}: on 10 performance cores"
+    );
+    assert_eq!(
         poem_compiler::DeviceProfile::of(&profile, 10, &[], &[]),
         poem_compiler::DeviceProfile {
             sms: 10,
@@ -184,13 +197,13 @@ fn each_checked_in_profile_runs_its_familys_old_tuning() {
 #[test]
 fn the_m4_pro_runs_its_family_and_the_two_values_it_measured() {
     assert_old_tuning("Apple M4 Pro", 9, 896, Some(AneMlp::Share { percent: 71 }));
-    let (_, report) = chip::resolve("Apple M4 Pro", &chip::facts(9, 20, true), None);
+    let (_, report) = chip::resolve("Apple M4 Pro", &chip::facts(9, 20, 10, true), None);
     assert_eq!(report.measured, ["kernel.ane.mlp", "kernel.qmm_splitk"]);
 }
 
 #[test]
 fn a_wide_range_model_leaves_the_fp16_format_on_any_chip() {
-    let (profile, _) = chip::resolve("Apple M4 Max", &chip::facts(9, 40, true), None);
+    let (profile, _) = chip::resolve("Apple M4 Max", &chip::facts(9, 40, 10, true), None);
     let wide = Tuning::new(profile, true, 10);
     assert!(!wide.fp16_gemm_format(4, 64));
     let at = |rows| QmmAt {
@@ -208,7 +221,7 @@ fn a_wide_range_model_leaves_the_fp16_format_on_any_chip() {
 
 #[test]
 fn a_mac_whose_bridge_does_not_load_runs_its_family_on_the_gpu() {
-    let (profile, report) = chip::resolve("Apple M5 Max", &chip::facts(10, 40, false), None);
+    let (profile, report) = chip::resolve("Apple M5 Max", &chip::facts(10, 40, 10, false), None);
     assert_eq!(report.used, Source::Seeded("apple10.toml".into()));
     assert!(report.rejected.is_empty(), "{report:?}");
     let t = Tuning::new(profile.clone(), false, 10);
@@ -222,9 +235,9 @@ fn a_mac_whose_bridge_does_not_load_runs_its_family_on_the_gpu() {
 
 #[test]
 fn a_device_file_applies_only_within_its_family() {
-    let (profile, report) = chip::resolve("Apple M4 Pro", &chip::facts(10, 40, true), None);
+    let (profile, report) = chip::resolve("Apple M4 Pro", &chip::facts(10, 40, 10, true), None);
     assert_eq!(report.layers, [Source::Seeded("apple10.toml".into())]);
     assert_eq!(*profile.get::<AneMlp>(), AneMlp::Units { units: 8 });
-    let (_, report) = chip::resolve("Apple M4 Pro", &chip::facts(11, 40, true), None);
+    let (_, report) = chip::resolve("Apple M4 Pro", &chip::facts(11, 40, 10, true), None);
     assert_eq!(report.used, Source::Defaults, "no family applies");
 }

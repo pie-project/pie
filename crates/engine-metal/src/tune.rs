@@ -799,7 +799,12 @@ pub fn run(
     let device = Context::bind().map_err(|e| e.to_string())?;
     let name = device.name().to_string();
     let cores = device.cores();
-    let facts = crate::chip::facts(device.family(), cores, crate::chip::ane_loads());
+    let facts = crate::chip::facts(
+        device.family(),
+        cores,
+        crate::chip::perf_cores(),
+        crate::chip::ane_loads(),
+    );
     let (base, report) = crate::chip::resolve(&name, &facts, profiles);
     say(&format!(
         "{name}: {cores} GPU cores, family {}; starting from {}",
@@ -1239,7 +1244,7 @@ mod tests {
     #[test]
     fn every_candidate_forces_a_ladder_the_registry_reads() {
         let (base, _) =
-            crate::chip::resolve("Apple M4 Max", &crate::chip::facts(9, 40, true), None);
+            crate::chip::resolve("Apple M4 Max", &crate::chip::facts(9, 40, 10, true), None);
         let registry = crate::chip::registry();
         for q in candidates(&base) {
             let p = registry
@@ -1256,7 +1261,7 @@ mod tests {
 
     #[test]
     fn a_fitted_ladder_assembles_into_a_file_this_device_takes() {
-        let facts = crate::chip::facts(9, 40, true);
+        let facts = crate::chip::facts(9, 40, 10, true);
         let (base, _) = crate::chip::resolve("Apple M4 Max", &facts, None);
         let grid = Grid::of(Depth::Quick);
         let candidates = candidates(&base);
@@ -1360,7 +1365,7 @@ mod tests {
     #[test]
     fn measurements_read_back_as_written() {
         let (base, _) =
-            crate::chip::resolve("Apple M4 Max", &crate::chip::facts(9, 40, true), None);
+            crate::chip::resolve("Apple M4 Max", &crate::chip::facts(9, 40, 10, true), None);
         let candidates = candidates(&base);
         let mut times = vec![None; candidates.len()];
         times[0] = Some(1.5e-4);
@@ -1395,7 +1400,7 @@ mod tests {
 
     #[test]
     fn every_search_candidate_reads_against_the_registry() {
-        let facts = crate::chip::facts(10, 40, true);
+        let facts = crate::chip::facts(10, 40, 10, true);
         let (base, _) = crate::chip::resolve("Apple M5 Max", &facts, None);
         let knobs = profile::search::knobs(&base, SEARCH_SKIPS, "kernel.ane");
         let ids: Vec<&str> = knobs.iter().map(|k| k.id).collect();
@@ -1420,7 +1425,7 @@ mod tests {
     #[test]
     fn a_load_reads_only_the_decisions_it_evaluates() {
         let (base, _) =
-            crate::chip::resolve("Apple M4 Max", &crate::chip::facts(9, 40, true), None);
+            crate::chip::resolve("Apple M4 Max", &crate::chip::facts(9, 40, 10, true), None);
         let tuning = kernels_metal::Tuning::new(base.clone(), false, 40);
         let _ = tuning.qmm_mpp();
         assert!(
