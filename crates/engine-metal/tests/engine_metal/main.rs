@@ -40,6 +40,7 @@ mod the_ragged_attention_answers_its_host_reference;
 mod the_rotated_packed_kv_serves;
 mod the_selector_reads_out_the_reference_walk;
 mod the_split_mlp_matches_the_gpu_alone;
+mod the_staged_rows_match_affine_dots;
 mod the_tower_reads_pixels_as_the_host_cut_them;
 mod the_voxel_axis_answers_its_host_reference;
 

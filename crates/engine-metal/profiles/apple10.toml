@@ -5,6 +5,7 @@ assumes = { family = 10 }
 
 [kernel]
 qmm = [
+  { when = "rows >= 5 and rows <= 8", use = "staged" },
   { when = "rows >= 8 and (rows > 16 or n >= 1024)", use = "mpp" },
   { when = "rows >= 5 and (bits == 2 or format == fp16)", use = "tiled", crossover_tg = 160 },
   { when = "rows >= 12", use = "tiled", crossover_tg = 160 },

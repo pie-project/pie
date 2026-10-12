@@ -12,6 +12,7 @@ use crate::tensor::{Bank, Tensor};
 
 const QMM_FILE: &str = "linear/quant_qmm_t.metal";
 const QMV_FILE: &str = "linear/quant_qmv.metal";
+const STAGED_FILE: &str = "linear/quant_qmm_staged.metal";
 
 /// The PTQ1_0 ternary decode-in-dot kernel (`Dtype::Ptq1_0`, `g128_t3_f16_n`).
 const PTQ1_0_FILE: &str = "linear/quant_ptq1_0.metal";
@@ -754,6 +755,11 @@ fn act_x_wt_over(
                     }
                 }
             }
+            Qmm::Staged => {
+                if STAGED_TILE.unsigned_abs() <= capacity_rows {
+                    return staged(ctx, op, act, w, biases, y, scratch, (m, n, k, cols, ld));
+                }
+            }
             Qmm::Tiled { crossover_tg } => {
                 let crossover = i32::try_from(crossover_tg).unwrap_or(i32::MAX);
                 let capacity = i32::try_from(capacity_rows).unwrap_or(i32::MAX);
@@ -944,6 +950,93 @@ fn act_x_wt_over(
         }
     }
     unreachable!("`kernel.qmm` ends on the vector kernel, which serves every shape")
+}
+
+const STAGED_TILE: i32 = 8;
+
+const STAGED_SPLIT_WIDE: i32 = 8;
+
+const STAGED_SPLIT: i32 = 4;
+
+const STAGED_DEEP: i32 = 8192;
+
+const STAGED_FEW_TILES: i32 = 32;
+
+#[allow(clippy::too_many_arguments)]
+fn staged(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    act: Tensor,
+    w: Bank,
+    biases: Tensor,
+    y: Tensor,
+    scratch: Scratch<'_>,
+    (m, n, k, cols, ld): (i32, i32, i32, i32, i32),
+) -> Result<(), Error> {
+    let tiles = cols / 64;
+    let mut split = if k >= STAGED_DEEP || tiles < STAGED_FEW_TILES {
+        STAGED_SPLIT_WIDE
+    } else {
+        STAGED_SPLIT
+    };
+    while split > 1 && (k / 64) % split != 0 {
+        split /= 2;
+    }
+    let partial = if split > 1 {
+        (scratch.partials)(m.unsigned_abs() * split.unsigned_abs(), n.unsigned_abs())
+    } else {
+        None
+    };
+    let split = if partial.is_some() { split } else { 1 };
+    let entry = symbol(&format!("affine_qmm_staged_m{STAGED_TILE}_k{split}"));
+    let stamp = symbol(&format!(
+        "PIE_STAGED_POINT(\"{entry}\",{STAGED_TILE},{split})"
+    ));
+    ctx.fire(
+        Fire::at(STAGED_FILE, entry).stamp(stamp).apply(Grid::of(
+            [64 * tiles.unsigned_abs(), split.unsigned_abs(), 1],
+            [64, 1, 1],
+        )),
+        &[
+            w.codes.arg(),
+            w.scales.arg(),
+            biases.arg(),
+            act.arg(),
+            y.arg_mut(),
+            k.arg(),
+            n.arg(),
+            match partial {
+                Some(partial) => partial.arg_mut(),
+                None => ctx.absent()?,
+            },
+            m.arg(),
+            ld.arg(),
+        ],
+    )?;
+    let Some(partial) = partial else {
+        return Ok(());
+    };
+    let stride = m
+        .checked_mul(n)
+        .ok_or_else(|| refuse(op, format!("{m} x {n} partials will not stack")))?;
+    let mut reduce = vec![ctx.absent()?; 4];
+    reduce.extend([
+        y.arg_mut(),
+        ctx.absent()?,
+        n.arg(),
+        ctx.absent()?,
+        partial.arg(),
+        ctx.absent()?,
+        stride.arg(),
+        split.arg(),
+    ]);
+    ctx.fire(
+        Fire::at(QMM_FILE, SPLITK_REDUCE).apply(Grid::of(
+            [cols.unsigned_abs(), m.unsigned_abs(), 1],
+            [256, 1, 1],
+        )),
+        &reduce,
+    )
 }
 
 /// Serve a PTQ1_0 (ternary, `g128_t3_f16_n`) projection with the decode-in-dot
