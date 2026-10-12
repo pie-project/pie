@@ -1,11 +1,9 @@
-# Apple M4 Pro: what pie tune measured to differ from the Apple9 family.
 api = 1
 
 [target]
 device = "Apple M4 Pro"
 
 [provenance]
-source   = "pie tune on a Mac mini M4 Pro (48 GB), Qwen3.8-27B and Qwen3.6-35B-A3B: every decision searched end to end; split-K fill and the Neural Engine MLP share moved, the rest held"
 measured = ["kernel.qmm_splitk", "kernel.ane.mlp"]
 
 [kernel]

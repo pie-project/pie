@@ -1,11 +1,7 @@
-# Qualcomm Adreno without cooperative matrices: register-tiled prompts, the one-row decode kernel at 32 lanes and wider.
 api = 1
 
 [target]
 assumes = { vendor = "qualcomm", coopmat = false }
-
-[provenance]
-source = "the Adreno branch of the facts-derived profile pie ran before vendor files, carried over unchanged"
 
 [kernel]
 qmm = [

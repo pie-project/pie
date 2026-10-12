@@ -1,12 +1,9 @@
-# NVIDIA L40S: pie tune searched every decision it could here and held each
-# value of the sm_89 family, so the file spells none and lists what it measured.
 api = 1
 
 [target]
 device = "NVIDIA L40S"
 
 [provenance]
-source   = "pie tune on an L40S, Qwen3.5-9B and gpt-oss-20b: every decision searched end to end and every value held"
 measured = [
   "kernel.gemm.heuristics",
   "kernel.gemm.skinny_rows",

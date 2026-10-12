@@ -1,10 +1,6 @@
-# What a Vulkan device no family file applies to runs, from its facts.
 api = 1
 
 [target]
-
-[provenance]
-source = "the facts-derived profile pie ran before vendor files"
 
 [kernel]
 gemm.path = [{ when = "coopmat", use = "coopmat" }, { use = "tiled" }]

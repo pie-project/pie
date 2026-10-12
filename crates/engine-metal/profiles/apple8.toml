@@ -1,11 +1,7 @@
-# The Apple8 GPU family (A15, A16, M2): what its devices run beyond the Metal registry defaults.
 api = 1
 
 [target]
 assumes = { family = 8 }
-
-[provenance]
-source = "the Apple8 family tuning pie applied before per-chip profiles, carried over unchanged"
 
 [kernel]
 qmm = [

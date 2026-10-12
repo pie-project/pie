@@ -1,11 +1,7 @@
-# The Apple7 GPU family (A14, M1): what its devices run beyond the Metal registry defaults.
 api = 1
 
 [target]
 assumes = { family = 7 }
-
-[provenance]
-source = "the Apple7 family tuning pie applied before per-chip profiles, carried over unchanged"
 
 [kernel]
 ane.mlp         = [{ when = "ane", use = "share", percent = 47 }, "gpu"]

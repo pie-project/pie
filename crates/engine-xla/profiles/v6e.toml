@@ -1,11 +1,9 @@
-# TPU v6e ("TPU v6 lite" to PJRT): what every TPU of generation 6 runs; the registry defaults are its values.
 api = 1
 
 [target]
 assumes = { generation = 6 }
 
 [provenance]
-source   = "the MoE formulation, its cost model and loop shape, the quantized decode crossover, attention chunks and the weight layouts measured on v6e for gpt-oss-20b; scan chunks, padding and prices carried over"
 measured = [
   "kernel.attn.block_keys",
   "kernel.attn.block_rows",

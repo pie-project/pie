@@ -1,9 +1,5 @@
-# sm_87 (Jetson Orin): what every GPU of compute capability 8.7 runs over the registry defaults.
 api = 1
 
 [target]
 tier    = "sm_87"
 assumes = { cc = 87 }
-
-[provenance]
-source = "the registry defaults, which every CUDA GPU below compute capability 10.0 ran before family files"

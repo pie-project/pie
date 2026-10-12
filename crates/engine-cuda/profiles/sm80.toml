@@ -1,9 +1,5 @@
-# sm_80 (Ampere: A100, A30): what every GPU of compute capability 8.0 runs over the registry defaults.
 api = 1
 
 [target]
 tier    = "sm_80"
 assumes = { cc = 80 }
-
-[provenance]
-source = "the registry defaults, which every CUDA GPU below compute capability 10.0 ran before family files"

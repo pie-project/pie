@@ -1,9 +1,5 @@
-# sm_89 (Ada: L4, L40S, RTX 40): what every GPU of compute capability 8.9 runs over the registry defaults.
 api = 1
 
 [target]
 tier    = "sm_89"
 assumes = { cc = 89 }
-
-[provenance]
-source = "the registry defaults, which every CUDA GPU below compute capability 10.0 ran before family files"

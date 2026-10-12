@@ -147,30 +147,8 @@ mod tests {
         }
     }
 
-    /// Each chip's family is the one the checked-in family profile names it
-    /// under: `# The AppleN GPU family (A15, A16, M2): ...`, where a Pro
-    /// variant goes under its base chip unless named itself.
     #[test]
-    fn every_chip_is_of_the_family_its_profile_names_it_under() {
-        let named = |family: u32| -> Vec<&'static str> {
-            let file = format!("apple{family}.toml");
-            let (_, text) = crate::chip::SEEDED
-                .iter()
-                .find(|(name, _)| *name == file)
-                .unwrap_or_else(|| panic!("no {file}"));
-            let header = text.lines().next().unwrap_or("");
-            let open = header.find('(').expect("a chip list");
-            let close = header.find(')').expect("a chip list");
-            header[open + 1..close].split(", ").collect()
-        };
-        for (chip, family) in CHIPS {
-            let chips = named(*family);
-            let base = chip.strip_suffix(" Pro").unwrap_or(chip);
-            assert!(
-                chips.contains(chip) || chips.contains(&base),
-                "{chip} is not under Apple{family}: {chips:?}"
-            );
-        }
+    fn every_model_has_a_chip_family() {
         for (id, _, chip, _) in MODELS {
             assert!(
                 CHIPS.iter().any(|c| c.0 == *chip),

@@ -1,11 +1,7 @@
-# Imagination PowerVR without cooperative matrices: register-tiled prompts, the one-row decode kernel at 32 lanes and wider.
 api = 1
 
 [target]
 assumes = { vendor = "imagination", coopmat = false }
-
-[provenance]
-source = "the PowerVR branch of the facts-derived profile pie ran before vendor files, with the register-tiled prompts of #939"
 
 [kernel]
 qmm = [

@@ -1,11 +1,7 @@
-# The Apple9 GPU family (A17 Pro, A18, M3, M4): what its devices run beyond the Metal registry defaults.
 api = 1
 
 [target]
 assumes = { family = 9 }
-
-[provenance]
-source = "the Apple9 family tuning pie applied before per-chip profiles, carried over unchanged"
 
 [kernel]
 qmm = [

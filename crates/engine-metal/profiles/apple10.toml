@@ -1,11 +1,7 @@
-# The Apple10 GPU family (A19, M5): what its devices run beyond the Metal registry defaults.
 api = 1
 
 [target]
 assumes = { family = 10 }
-
-[provenance]
-source = "the Apple10 family tuning pie applied before per-chip profiles, carried over unchanged"
 
 [kernel]
 qmm = [
