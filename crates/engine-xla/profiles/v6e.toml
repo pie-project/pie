@@ -1,13 +1,37 @@
-# TPU v6e ("TPU v6 lite" to PJRT). Every decision the XLA registry declares.
+# TPU v6e ("TPU v6 lite" to PJRT): what every TPU of generation 6 runs. Every decision the XLA registry declares.
 api = 1
 
 [target]
-device  = "TPU v6 lite"
 assumes = { generation = 6 }
 
 [provenance]
 source   = "the MoE formulation, its cost model and loop shape, the quantized decode crossover, attention and scan chunks and the weight layouts measured on v6e for gpt-oss-20b; padding and prices carried over"
-measured = true
+measured = [
+  "kernel.attn.block_keys",
+  "kernel.attn.block_rows",
+  "kernel.attn.budget_mi",
+  "kernel.attn.per_row_max",
+  "kernel.moe.cost.dense_all_mi",
+  "kernel.moe.cost.loop_row_ns",
+  "kernel.moe.cost.loop_tile_ns",
+  "kernel.moe.cost.slice_bytes_per_ns",
+  "kernel.moe.cost.slice_mib",
+  "kernel.moe.cost.slice_pairs",
+  "kernel.moe.cost.whole_bytes_per_ns",
+  "kernel.moe.cost.whole_partial_fs",
+  "kernel.moe.gmm_block_mib",
+  "kernel.moe.gmm_tm",
+  "kernel.moe.loop_tile_max",
+  "kernel.moe.loop_unroll",
+  "kernel.moe.path",
+  "kernel.quant.decode",
+  "kernel.ssm.chunk",
+  "kernel.ssm.kda_chunk",
+  "kernel.ssm.long_chunk",
+  "layout.embed_fold",
+  "layout.gemm_transpose",
+  "layout.mxfp4_prescale",
+]
 
 [compiler]
 cond_fixed_us       = 5.0

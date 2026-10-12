@@ -255,15 +255,16 @@ macro_rules! seeded {
     };
 }
 
-seeded!("tpu-v6-lite.toml");
+seeded!("v6e.toml");
 
 pub static SHELF: Shelf = Shelf {
     backend: "xla",
     seeded: SEEDED,
+    derived: None,
 };
 
-/// The profile a load on a device of `kind` runs under: the user's file,
-/// then the checked-in one, then the defaults.
+/// The profile a load on a device of `kind` runs under: its generation's
+/// family file, then the user's file, over the defaults.
 #[must_use]
 pub fn resolve(kind: &str, profiles: Option<&Path>) -> (Profile, Report) {
     SHELF.resolve(registry(), kind, &Tpu::of(kind).facts(), profiles)
@@ -279,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn every_checked_in_profile_reads_strictly_and_is_filed_under_its_device() {
+    fn the_checked_in_profiles_hold_together() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
         SHELF
             .check(registry(), &dir)
@@ -289,10 +290,8 @@ mod tests {
     #[test]
     fn a_v6e_runs_its_file_and_the_file_is_what_it_ran_before() {
         let (profile, report) = resolve("TPU v6 lite", None);
-        assert_eq!(
-            report.used,
-            profile::Source::Seeded("tpu-v6-lite.toml".into())
-        );
+        assert_eq!(report.used, profile::Source::Seeded("v6e.toml".into()));
+        assert!(!report.untuned());
         assert_eq!(
             kernels_xla::tuning::Tuning::on(&profile, Tpu::of("TPU v6 lite").vmem_bytes()),
             kernels_xla::tuning::Tuning::DEFAULT
