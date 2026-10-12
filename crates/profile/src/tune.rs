@@ -222,6 +222,142 @@ fn atoms(spec: &Spec, samples: &[Sample]) -> Vec<Atom> {
     out
 }
 
+/// Improve a ladder by local search, in two passes. The greedy pass
+/// places rungs in order and cannot revisit them, so an early broad rung
+/// can hide a crossover that moves with size. First every move that lowers
+/// the cost is taken (replace a rung, insert one anywhere, delete one,
+/// change the tail), up to `max_rungs`; a narrow rung often pays only once
+/// a later move narrows a broad one. Then parsimony: with `λ` the smallest
+/// gain a rung must earn, moves are taken while `cost + λ · rungs` falls,
+/// inserting nothing, so rungs that do not earn their place go.
+#[allow(clippy::too_many_arguments)]
+fn refine(
+    rel: &[Vec<f64>],
+    holds: &[Vec<bool>],
+    conditions: &[Condition],
+    terminals: &[usize],
+    ladder: Vec<(Condition, usize)>,
+    tail: usize,
+    options: Options,
+    floor: f64,
+) -> (Vec<(Condition, usize)>, usize) {
+    let (ladder, tail) = search(rel, holds, conditions, terminals, ladder, tail, options, 0.0, true);
+    let lambda = options.min_gain * floor;
+    search(rel, holds, conditions, terminals, ladder, tail, options, lambda, false)
+}
+
+/// One local search: take the best move while `cost + lambda · rungs`
+/// falls; `insert` allows new rungs.
+#[allow(clippy::too_many_arguments)]
+fn search(
+    rel: &[Vec<f64>],
+    holds: &[Vec<bool>],
+    conditions: &[Condition],
+    terminals: &[usize],
+    mut ladder: Vec<(Condition, usize)>,
+    mut tail: usize,
+    options: Options,
+    lambda: f64,
+    insert: bool,
+) -> (Vec<(Condition, usize)>, usize) {
+    let inside = |(i, j): Condition, s: usize| holds[i][s] && j.is_none_or(|j| holds[j][s]);
+    let points = rel.len();
+    // Where each point lands on `ladder[from..]` then `tail`.
+    let land_from = |ladder: &[(Condition, usize)], from: usize, tail: usize, s: usize| {
+        ladder[from..]
+            .iter()
+            .find(|&&(c, k)| inside(c, s) && rel[s][k].is_finite())
+            .map_or(tail, |&(_, k)| k)
+    };
+    let score = |ladder: &[(Condition, usize)], tail: usize| -> f64 {
+        (0..points)
+            .map(|s| rel[s][land_from(ladder, 0, tail, s)])
+            .sum::<f64>()
+            + lambda * ladder.len() as f64
+    };
+    let mut current = score(&ladder, tail);
+    for _ in 0..64 {
+        let mut best: Option<(f64, Vec<(Condition, usize)>, usize)> = None;
+        let mut offer = |value: f64, ladder: Vec<(Condition, usize)>, tail: usize| {
+            if value < current - 1e-12 && best.as_ref().is_none_or(|(b, ..)| value < *b) {
+                best = Some((value, ladder, tail));
+            }
+        };
+        // The tail alone.
+        for &t in terminals {
+            if t != tail {
+                offer(score(&ladder, t), ladder.clone(), t);
+            }
+        }
+        // Deleting a rung.
+        for at in 0..ladder.len() {
+            let mut shorter = ladder.clone();
+            shorter.remove(at);
+            offer(score(&shorter, tail), shorter, tail);
+        }
+        // Replacing the rung at `at`, or inserting one before it: only the
+        // points that reach `at` change, and they fall to what follows.
+        for at in 0..=ladder.len() {
+            let reach: Vec<usize> = (0..points)
+                .filter(|&s| {
+                    !ladder[..at]
+                        .iter()
+                        .any(|&(c, k)| inside(c, s) && rel[s][k].is_finite())
+                })
+                .collect();
+            let settled: f64 = (0..points)
+                .filter(|s| !reach.contains(s))
+                .map(|s| rel[s][land_from(&ladder, 0, tail, s)])
+                .sum();
+            for replace in [false, true] {
+                if replace && at == ladder.len() {
+                    continue;
+                }
+                if !replace && (!insert || ladder.len() + 1 >= options.max_rungs) {
+                    continue;
+                }
+                let next = if replace { at + 1 } else { at };
+                let after: Vec<usize> = reach.iter().map(|&s| land_from(&ladder, next, tail, s)).collect();
+                let rungs = ladder.len() - usize::from(replace) + 1;
+                for &cond in conditions {
+                    let mask: Vec<bool> = reach.iter().map(|&s| inside(cond, s)).collect();
+                    if !mask.iter().any(|m| *m) {
+                        continue;
+                    }
+                    for k in 0..rel.first().map_or(0, Vec::len) {
+                        let mut value = settled + lambda * rungs as f64;
+                        for (r, &s) in reach.iter().enumerate() {
+                            value += if mask[r] && rel[s][k].is_finite() {
+                                rel[s][k]
+                            } else {
+                                rel[s][after[r]]
+                            };
+                        }
+                        if value < current - 1e-12 && best.as_ref().is_none_or(|(b, ..)| value < *b) {
+                            let mut changed = ladder.clone();
+                            if replace {
+                                changed[at] = (cond, k);
+                            } else {
+                                changed.insert(at, (cond, k));
+                            }
+                            best = Some((value, changed, tail));
+                        }
+                    }
+                }
+            }
+        }
+        match best {
+            Some((value, changed, t)) => {
+                ladder = changed;
+                tail = t;
+                current = value;
+            }
+            None => break,
+        }
+    }
+    (ladder, tail)
+}
+
 /// Fit an ordered ladder to the measurements.
 ///
 /// `baseline` is the candidate today's profile runs at each point, for the
@@ -267,6 +403,8 @@ pub fn fit(
     };
     let (mut terminal, mut total) = tail(&|_| true).ok_or(Refusal::NoTerminal)?;
     let mut rungs: Vec<FitRung> = Vec::new();
+    // The same rungs as condition indices, for the refinement below.
+    let mut chosen: Vec<(Condition, usize)> = Vec::new();
     // Where each point lands so far: `None` is the tail.
     let mut landed: Vec<Option<usize>> = vec![None; samples.len()];
 
@@ -279,9 +417,12 @@ pub fn fit(
         Atom::AtLeast(v, _) | Atom::Below(v, _) | Atom::Is(v, _) => v,
     };
     let mut conditions: Vec<Condition> = (0..singles.len()).map(|i| (i, None)).collect();
+    // Pairs join two variables, at least one of them dynamic: a crossover
+    // moves along rows, and a pair says where it moves with something else.
     for i in 0..singles.len() {
         for j in i + 1..singles.len() {
-            if var(&singles[i]) != var(&singles[j]) {
+            let (a, b) = (var(&singles[i]), var(&singles[j]));
+            if a != b && (spec.vars[a].dynamic || spec.vars[b].dynamic) {
                 conditions.push((i, Some(j)));
             }
         }
@@ -363,15 +504,36 @@ pub fn fit(
                     }
                 }
                 rungs.push(FitRung { when, candidate: c });
+                chosen.push(((i, j), c));
                 terminal = t;
                 total = new;
             }
             _ => break,
         }
     }
+    let _ = (rungs, total);
+    let chosen = refine(
+        &rel,
+        &holds,
+        &conditions,
+        &terminals,
+        chosen,
+        terminal,
+        options,
+        floor,
+    );
+    let mut rungs: Vec<FitRung> = chosen
+        .0
+        .iter()
+        .map(|&((i, j), c)| {
+            let mut when = vec![singles[i]];
+            when.extend(j.map(|j| singles[j]));
+            FitRung { when, candidate: c }
+        })
+        .collect();
     rungs.push(FitRung {
         when: Vec::new(),
-        candidate: terminal,
+        candidate: chosen.1,
     });
     let cost = cost(&rungs, &samples);
     Ok(Fit {
@@ -478,5 +640,40 @@ mod tests {
         let base: Vec<Option<usize>> = samples().iter().map(|_| Some(0)).collect();
         let fit = fit(&SPEC, &candidates(), &samples(), &base, Options::default()).unwrap();
         assert!(fit.baseline.unwrap() > fit.cost);
+    }
+
+    /// A large bank turns tiled at fewer rows than a small one: the fit
+    /// says so with a size condition, rather than splitting the difference.
+    #[test]
+    fn a_crossover_that_moves_with_size_gets_a_size_condition() {
+        static SIZED: [Var; 2] = [
+            Var::dynamic("rows", Domain::COUNT),
+            Var::fixed("n", Domain::COUNT),
+        ];
+        static SPEC: Spec = Spec {
+            id: "kernel.sized",
+            doc: "",
+            shape: Shape::Flag,
+            vars: &SIZED,
+            default: "",
+            tune: Tune::Search,
+        };
+        let mut samples = Vec::new();
+        for n in [4096, 34816] {
+            for rows in [1, 2, 4, 6, 8, 10, 12, 16, 32] {
+                // Tiled costs a flat tile; on the big bank the tile is
+                // cheaper per row, so it wins from 8 rows, not 12.
+                let tile = if n > 8192 { 7.5 } else { 11.5 };
+                samples.push(Sample {
+                    at: vec![rows, n],
+                    weight: 1.0,
+                    times: vec![Some(rows as f64), (rows >= 4).then_some(tile)],
+                });
+            }
+        }
+        let fit = fit(&SPEC, &candidates(), &samples, &[], Options::default()).unwrap();
+        assert!((fit.cost - fit.floor).abs() < 1e-9, "{}", fit.toml(&SPEC, &candidates()));
+        let toml = fit.toml(&SPEC, &candidates());
+        assert!(toml.contains("n >= 34816") || toml.contains("n < 34816"), "{toml}");
     }
 }
