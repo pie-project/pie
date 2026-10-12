@@ -1,9 +1,4 @@
 //! The compiler's per-chip cost coefficients, as device-profile decisions.
-//!
-//! The compiler prices launches, conditionals and side streams to choose how
-//! a deployment's regions are laid out. The prices are a chip's: each backend
-//! registers these decisions, and [`DeviceProfile::of`] reads them back with
-//! the multiprocessor count the backend measured.
 
 use profile::{Decision, Profile, Registry};
 

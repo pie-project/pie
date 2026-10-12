@@ -1,6 +1,5 @@
 //! `pie profile`: the device profiles this build carries, the one this
-//! machine resolves to, and the files to share. See
-//! `.wiki/device-profiles.md`.
+//! machine resolves to, and the files to share.
 
 use anyhow::{Result, anyhow, bail};
 use clap::Subcommand;
@@ -77,7 +76,7 @@ impl ui::Report for Text {
     }
 }
 
-fn text(text: String) -> Answer {
+pub(crate) fn text(text: String) -> Answer {
     Answer::report(Text { text })
 }
 
@@ -112,10 +111,7 @@ fn dump(b: &Backend, device: Option<String>) -> Result<Answer> {
     let registry = (b.registry)();
     let dir = profiles_dir();
     let (device, facts) = match device {
-        Some(name) => {
-            let facts = profile::Facts::of(registry);
-            (name, facts)
-        }
+        Some(name) => (name, profile::Facts::of(registry)),
         None => (b.probe)()
             .ok_or_else(|| anyhow!("no {} device answers here; name one with --device", b.name))?,
     };

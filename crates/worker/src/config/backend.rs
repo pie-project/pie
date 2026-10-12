@@ -320,7 +320,7 @@ const MOVED_TO_PROFILE: &[(&str, &str, &str)] = &[
 
 /// Refuse an option a device profile now holds, naming where it went: a
 /// chip's tuning lives in `$PIE_HOME/profiles/<backend>/user/<device>.toml`.
-pub fn moved_to_profile(engine: &str, options: &toml::Table) -> Result<()> {
+pub(crate) fn moved_to_profile(engine: &str, options: &toml::Table) -> Result<()> {
     for (owner, key, id) in MOVED_TO_PROFILE {
         if *owner == engine && options.contains_key(*key) {
             anyhow::bail!(

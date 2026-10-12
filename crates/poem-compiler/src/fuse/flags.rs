@@ -1,10 +1,7 @@
 //! One profile flag per fused kernel a rule forms: `fuse.<name>` holds where
-//! the chip runs the fused kernel rather than its primitives.
-//!
-//! Which fused kernels a backend ships is the backend's, not a chip's: it
-//! registers a flag only for those, on by default, and a profile may turn one
-//! off for its chip. A profile can never turn on a kernel the backend lacks,
-//! because the registry has no such flag.
+//! the chip runs the fused kernel rather than its primitives. A backend
+//! registers flags only for the kernels it ships, so a profile can turn one
+//! off but never on a kernel the backend lacks.
 
 use profile::{Profile, Registry};
 
