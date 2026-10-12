@@ -237,6 +237,33 @@ mod tests {
     }
 
     #[test]
+    fn a_checked_in_file_holds_only_what_differs_from_the_layer_below() {
+        let defaults = registry().defaults();
+        let parse = |name: &str| {
+            let text = SEEDED.iter().find(|(n, _)| *n == name).unwrap().1;
+            registry()
+                .parse(text, name, profile::Strict::CheckedIn)
+                .unwrap_or_else(|e| panic!("{e}"))
+        };
+        for (name, _) in SEEDED {
+            let family = name.split_once('/').map(|(dir, _)| parse(&format!("{dir}.toml")));
+            for (id, rungs) in &parse(name).entries {
+                let below = match &family {
+                    Some(family) => family.entries.get(id).cloned(),
+                    None => None,
+                }
+                .or_else(|| {
+                    defaults
+                        .entries()
+                        .find(|(spec, ..)| spec.id == *id)
+                        .map(|(_, rungs, _)| rungs.to_vec())
+                });
+                assert_ne!(below.as_ref(), Some(rungs), "{name}: {id} restates the layer below");
+            }
+        }
+    }
+
+    #[test]
     fn a_device_no_file_names_runs_its_family_and_is_told_so() {
         let (profile, report) = resolve("Apple A17 Pro GPU", &facts(9, 6, true), None);
         assert_eq!(report.used, profile::Source::Seeded("apple9.toml".into()));

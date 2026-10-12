@@ -61,17 +61,25 @@ fn old_qmm(family: u32, at: &QmmAt) -> Qmm {
     }
 }
 
-/// Chips of each family, an iPhone's among them: none is named by a file
-/// but the M4 Pro.
+/// Chips of each family by the newest `MTLGPUFamily::AppleN` they support,
+/// every iPhone and iPad chip that runs Metal 4 among them: none is named by
+/// a file but the M4 Pro.
 const CHIPS: &[(u32, &str)] = &[
     (7, "Apple M1"),
     (7, "Apple M1 Ultra"),
+    (7, "Apple A14 GPU"),
     (8, "Apple M2 Max"),
+    (8, "Apple A15 GPU"),
+    (8, "Apple A16 GPU"),
     (9, "Apple M3"),
     (9, "Apple M4 Max"),
     (9, "Apple A17 Pro GPU"),
+    (9, "Apple A18 GPU"),
+    (9, "Apple A18 Pro GPU"),
     (10, "Apple M5"),
     (10, "Apple M5 Pro"),
+    (10, "Apple A19 GPU"),
+    (10, "Apple A19 Pro GPU"),
 ];
 
 /// What `DeviceTuning::of(family)` gave a chip with the Neural Engine, but
