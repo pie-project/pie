@@ -155,7 +155,7 @@ pub fn one_arm(id: &str, decode: bool) -> Package {
                 .replace("def caches(m, c):", "def every_cache(m, c):")
                 .replace("def forward(m, inputs):", "def every_reading(m, inputs):")
                 + &format!(
-                    "\ndef caches(m, c):\n    pass\n\ndef forward(m, inputs):\n    return {}(inputs, m.vae)\n",
+                    "\ndef caches(m, c):\n    pass\n\ndef forward(m, inputs):\n    return {}(inputs, m)\n",
                     if decode { "decode" } else { "encode" }
                 );
         }
