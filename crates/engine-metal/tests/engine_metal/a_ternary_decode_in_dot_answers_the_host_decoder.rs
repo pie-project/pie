@@ -31,7 +31,7 @@ use poem_ir::Dtype;
 
 // The M1a oracle: `ForkBlock { tensor, block_index, bytes: [u8;28], expect_bits:
 // [u32;128] }` and `FORK_BLOCKS`, generated from the real GGUF + the fork dequant.
-include!("../../checkpoint/src/codec/ptq1_0_fixture.rs");
+include!("../../../checkpoint/src/codec/ptq1_0_fixture.rs");
 
 const PTQ1_0_FILE: &str = "linear/quant_ptq1_0.metal";
 const QMV_GROUP: [u32; 3] = [32, 2, 1];

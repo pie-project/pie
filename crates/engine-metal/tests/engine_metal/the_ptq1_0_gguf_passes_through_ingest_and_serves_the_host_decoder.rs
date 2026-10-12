@@ -52,7 +52,7 @@ use poem_ir::Dtype as IrDtype;
 
 // The M1a oracle: `ForkBlock { tensor, block_index, bytes: [u8;28], .. }` +
 // `FORK_BLOCKS`, real blocks from the GGUF plus synthetic edge cases.
-include!("../../checkpoint/src/codec/ptq1_0_fixture.rs");
+include!("../../../checkpoint/src/codec/ptq1_0_fixture.rs");
 
 const PTQ1_0_TYPE_ID: u32 = 143;
 const BLOCK: usize = 128;
