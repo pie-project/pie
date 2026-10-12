@@ -1,13 +1,11 @@
-# Qualcomm Adreno at any other width: register-tiled prompts; one-row decode needs 32 lanes. Every decision the Vulkan registry declares, spelled out.
+# Qualcomm Adreno: register-tiled prompts; the one-row decode kernel at 32 lanes and wider is in qualcomm/. Every decision the Vulkan registry declares, spelled out.
 api = 1
 
 [target]
-match = { vendor = "qualcomm" }
-assumes = { coopmat = false }
+assumes = { vendor = "qualcomm", coopmat = false }
 
 [provenance]
 source = "the Adreno branch of the facts-derived profile pie ran before vendor files, carried over unchanged"
-measured = false
 
 [compiler]
 # A conditional node's fixed cost, in microseconds.

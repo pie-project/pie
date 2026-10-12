@@ -1,0 +1,16 @@
+# Qualcomm Adreno, 32 lanes wide: the one-row decode kernel, 32 lanes a row.
+api = 1
+
+[target]
+assumes = { subgroup = 32 }
+
+[provenance]
+source = "the Adreno branch of the facts-derived profile pie ran before vendor files, carried over unchanged"
+
+[kernel]
+qmm = [
+  { when = "rows > 32", use = "register_tiled", bm = 64 },
+  { when = "rows >= 12", use = "register_tiled", bm = 32 },
+  { use = "one_row", lanes = 32, rows = 1 },
+  { use = "qmv", vecs = 4 },
+]

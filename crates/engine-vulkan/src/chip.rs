@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use kernels_vulkan::tuning::{AXES, FACTS};
-use profile::{Candidate, Facts, Profile, Registry, Report, Shelf, Source};
+use profile::{Facts, Profile, Registry, Report, Shelf};
 
 /// Rows from which a step is submitted a layer at a time rather than in one
 /// submit: in one, a long prefill on a slow GPU outlasts the driver's
@@ -30,40 +30,29 @@ pub fn registry() -> &'static Registry {
     &REGISTRY
 }
 
-pub const SEEDED: &[(&str, &str)] = &[
-    (
-        "qualcomm-adreno-32.toml",
-        include_str!("../profiles/qualcomm-adreno-32.toml"),
-    ),
-    (
-        "qualcomm-adreno-64.toml",
-        include_str!("../profiles/qualcomm-adreno-64.toml"),
-    ),
-    (
-        "qualcomm-adreno-128.toml",
-        include_str!("../profiles/qualcomm-adreno-128.toml"),
-    ),
-    (
-        "qualcomm-adreno.toml",
-        include_str!("../profiles/qualcomm-adreno.toml"),
-    ),
-    (
-        "imagination-powervr-32.toml",
-        include_str!("../profiles/imagination-powervr-32.toml"),
-    ),
-    (
-        "imagination-powervr-64.toml",
-        include_str!("../profiles/imagination-powervr-64.toml"),
-    ),
-    (
-        "imagination-powervr-128.toml",
-        include_str!("../profiles/imagination-powervr-128.toml"),
-    ),
-];
+macro_rules! seeded {
+    ($($file:literal),* $(,)?) => {
+        pub const SEEDED: &[(&str, &str)] = &[
+            $(($file, include_str!(concat!("../profiles/", $file)))),*
+        ];
+    };
+}
+
+seeded!(
+    "qualcomm.toml",
+    "qualcomm/adreno-32.toml",
+    "qualcomm/adreno-64.toml",
+    "qualcomm/adreno-128.toml",
+    "imagination.toml",
+    "imagination/powervr-32.toml",
+    "imagination/powervr-64.toml",
+    "imagination/powervr-128.toml",
+);
 
 pub static SHELF: Shelf = Shelf {
     backend: "vulkan",
     seeded: SEEDED,
+    derived: Some(|name, facts| derived(&Device::of(name, facts))),
 };
 
 /// The cores a device is sized by when no extension reports a count.
@@ -80,6 +69,29 @@ pub struct Device {
 }
 
 impl Device {
+    /// The device a name and its facts describe.
+    #[must_use]
+    pub fn of(name: &str, facts: &Facts) -> Device {
+        let vendor = facts
+            .get("vendor")
+            .and_then(|i| usize::try_from(i).ok())
+            .and_then(|i| match FACTS[0].domain {
+                profile::Domain::Enum(names) => names.get(i).copied(),
+                _ => None,
+            })
+            .unwrap_or("other");
+        Device {
+            name: name.to_string(),
+            vendor,
+            subgroup: facts
+                .get("subgroup")
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(0),
+            cores: facts.get("cores").and_then(|v| u32::try_from(v).ok()),
+            coopmat: facts.get("coopmat") == Some(1),
+        }
+    }
+
     #[must_use]
     pub fn facts(&self) -> Facts {
         let facts = Facts::of(registry())
@@ -98,8 +110,8 @@ impl Device {
     }
 }
 
-/// The profile a device without a user or checked-in file runs, as a user
-/// file would spell it.
+/// The profile a device no family file applies to runs, as a user file
+/// would spell it.
 #[must_use]
 pub fn derived(device: &Device) -> String {
     let mut assumes = vec![
@@ -136,50 +148,11 @@ pub fn derived(device: &Device) -> String {
     )
 }
 
-/// The checked-in files whose `target` names this device, by name or by
-/// `match`.
-fn matching(device: &Device) -> Vec<Candidate> {
-    SEEDED
-        .iter()
-        .filter(|(name, text)| {
-            let Ok(file) = registry().parse(text, name, profile::Strict::CheckedIn) else {
-                return true; // read again by resolution, which says why it is refused
-            };
-            let t = &file.target;
-            t.device.as_deref() == Some(device.name.as_str())
-                || (t.vendor.as_deref() == Some(device.vendor)
-                    && (t.name_contains.is_empty()
-                        || t.name_contains
-                            .iter()
-                            .any(|s| device.name.contains(s.as_str()))))
-        })
-        .map(|(name, text)| Candidate {
-            source: Source::Seeded((*name).to_string()),
-            text: (*text).to_string(),
-        })
-        .collect()
-}
-
-/// The user's file, then a checked-in file that names the device, then the
-/// derived profile.
+/// The vendor's family file and the device file for its width, or the
+/// derived profile, then the user's file.
 #[must_use]
 pub fn resolve(device: &Device, profiles: Option<&Path>) -> (Profile, Report) {
-    let mut candidates = Vec::new();
-    if let Some(dir) = profiles {
-        let path = SHELF.user_path(dir, &device.name);
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            candidates.push(Candidate {
-                source: Source::User(path.display().to_string()),
-                text,
-            });
-        }
-    }
-    candidates.extend(matching(device));
-    candidates.push(Candidate {
-        source: Source::Derived,
-        text: derived(device),
-    });
-    registry().resolve(&candidates, &device.facts())
+    SHELF.resolve(registry(), &device.name, &device.facts(), profiles)
 }
 
 #[must_use]
@@ -195,25 +168,7 @@ pub fn probe() -> Option<(String, Facts)> {
 
 #[must_use]
 pub fn resolve_facts(name: &str, facts: &Facts, profiles: Option<&Path>) -> (Profile, Report) {
-    let vendor = facts
-        .get("vendor")
-        .and_then(|i| usize::try_from(i).ok())
-        .and_then(|i| match FACTS[0].domain {
-            profile::Domain::Enum(names) => names.get(i).copied(),
-            _ => None,
-        })
-        .unwrap_or("other");
-    let device = Device {
-        name: name.to_string(),
-        vendor,
-        subgroup: facts
-            .get("subgroup")
-            .and_then(|v| u32::try_from(v).ok())
-            .unwrap_or(0),
-        cores: facts.get("cores").and_then(|v| u32::try_from(v).ok()),
-        coopmat: facts.get("coopmat") == Some(1),
-    };
-    resolve(&device, profiles)
+    SHELF.resolve(registry(), name, facts, profiles)
 }
 
 #[cfg(test)]
@@ -221,11 +176,21 @@ mod tests {
     use kernels_vulkan::Tuning;
     use kernels_vulkan::tuning::{Limits, Qmm};
 
+    use profile::Source;
+
     use super::*;
 
     #[test]
     fn the_registry_holds_together() {
         assert_eq!(registry().check(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_checked_in_profiles_hold_together() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
+        SHELF
+            .check(registry(), &dir)
+            .unwrap_or_else(|e| panic!("{e}"));
     }
 
     fn device(vendor: &'static str, subgroup: u32, cores: Option<u32>, coopmat: bool) -> Device {
@@ -250,46 +215,53 @@ mod tests {
     }
 
     #[test]
-    fn a_device_runs_its_checked_in_file_or_what_its_facts_derive() {
-        for (d, file) in [
-            (device("nvidia", 32, Some(142), true), None),
-            (device("amd", 64, Some(60), false), None),
-            (device("intel", 16, None, false), None),
+    fn a_device_runs_its_vendors_files_or_what_its_facts_derive() {
+        let qualcomm = "qualcomm.toml";
+        let imagination = "imagination.toml";
+        for (d, files) in [
+            (device("nvidia", 32, Some(142), true), &[][..]),
+            (device("amd", 64, Some(60), false), &[]),
+            (device("intel", 16, None, false), &[]),
+            (device("qualcomm", 32, None, true), &[]),
             (
                 device("qualcomm", 64, None, false),
-                Some("qualcomm-adreno-64.toml"),
+                &[qualcomm, "qualcomm/adreno-64.toml"],
             ),
             (
                 device("qualcomm", 128, Some(6), false),
-                Some("qualcomm-adreno-128.toml"),
+                &[qualcomm, "qualcomm/adreno-128.toml"],
             ),
-            (
-                device("qualcomm", 16, None, false),
-                Some("qualcomm-adreno.toml"),
-            ),
+            (device("qualcomm", 16, None, false), &[qualcomm]),
             (
                 device("qualcomm", 32, None, false),
-                Some("qualcomm-adreno-32.toml"),
+                &[qualcomm, "qualcomm/adreno-32.toml"],
             ),
             (
                 device("imagination", 32, None, false),
-                Some("imagination-powervr-32.toml"),
+                &[imagination, "imagination/powervr-32.toml"],
             ),
             (
                 device("imagination", 64, None, false),
-                Some("imagination-powervr-64.toml"),
+                &[imagination, "imagination/powervr-64.toml"],
             ),
             (
                 device("imagination", 128, None, false),
-                Some("imagination-powervr-128.toml"),
+                &[imagination, "imagination/powervr-128.toml"],
             ),
+            (device("imagination", 16, Some(24), false), &[imagination]),
         ] {
             let (_, report) = resolve(&d, None);
-            let want = file.map_or(Source::Derived, |f| Source::Seeded(f.to_string()));
-            assert_eq!(report.used, want, "{d:?}");
-            if file.is_none() {
-                assert!(report.untuned());
-            }
+            let want: Vec<Source> = if files.is_empty() {
+                vec![Source::Derived]
+            } else {
+                files
+                    .iter()
+                    .map(|f| Source::Seeded((*f).to_string()))
+                    .collect()
+            };
+            assert_eq!(report.layers, want, "{d:?}");
+            assert!(report.rejected.is_empty(), "{d:?}: {report:?}");
+            assert!(report.untuned());
         }
     }
 
@@ -337,6 +309,7 @@ mod tests {
             device("imagination", 64, None, false),
             device("imagination", 128, None, false),
             device("imagination", 16, None, false),
+            device("imagination", 16, Some(24), false),
             device("other", 32, None, false),
         ] {
             let t = tuning(&d);

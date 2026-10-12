@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use kernels_wgpu::tuning::{AXES, FACTS};
-use profile::{Candidate, Facts, Profile, Registry, Report, Shelf, Source};
+use profile::{Facts, Profile, Registry, Report, Shelf};
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("wgpu", FACTS, AXES);
@@ -23,6 +23,7 @@ pub fn registry() -> &'static Registry {
 pub static SHELF: Shelf = Shelf {
     backend: "wgpu",
     seeded: &[],
+    derived: None,
 };
 
 /// The cores an adapter is sized by when it reports no count.
@@ -62,23 +63,10 @@ impl Device {
     }
 }
 
+/// The user's file for the adapter, over the registry defaults.
 #[must_use]
 pub fn resolve(device: &Device, profiles: Option<&Path>) -> (Profile, Report) {
-    let mut candidates = Vec::new();
-    if let Some(dir) = profiles {
-        let path = SHELF.user_path(dir, &device.name);
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            candidates.push(Candidate {
-                source: Source::User(path.display().to_string()),
-                text,
-            });
-        }
-    }
-    candidates.push(Candidate {
-        source: Source::Derived,
-        text: "api = 1\n".to_string(),
-    });
-    registry().resolve(&candidates, &device.facts())
+    SHELF.resolve(registry(), &device.name, &device.facts(), profiles)
 }
 
 #[cfg(test)]
@@ -100,7 +88,7 @@ mod tests {
             f16: true,
         };
         let (profile, report) = resolve(&d, None);
-        assert_eq!(report.used, Source::Derived);
+        assert_eq!(report.used, profile::Source::Defaults);
         let t = kernels_wgpu::Tuning::new(profile, UNREPORTED_CORES, 0);
         assert_eq!(
             (

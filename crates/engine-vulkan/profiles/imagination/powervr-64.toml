@@ -1,0 +1,17 @@
+# Imagination PowerVR, 64 lanes wide: the one-row decode kernel, 8 lanes a
+# row and two rows a lane, and a fixed decode split whatever cores it reports.
+api = 1
+
+[target]
+assumes = { subgroup = 64 }
+
+[provenance]
+source = "the PowerVR branch of the facts-derived profile pie ran before vendor files, carried over unchanged"
+
+[kernel]
+qmm = [
+  { when = "rows >= 12", use = "tiled", crossover_tg = 160 },
+  { use = "one_row", lanes = 8, rows = 2 },
+  { use = "qmv", vecs = 4 },
+]
+sdpa.decode.split = { use = "fixed", groups = 16 }

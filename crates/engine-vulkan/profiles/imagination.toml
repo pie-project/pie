@@ -1,13 +1,11 @@
-# Imagination PowerVR, 128 lanes wide: the one-row decode kernel, 8 lanes a row and two rows a lane; the rest as any device derives. Every decision the Vulkan registry declares, spelled out.
+# Imagination PowerVR: what any device derives; the one-row decode kernel at 32 lanes and wider is in imagination/. Every decision the Vulkan registry declares, spelled out.
 api = 1
 
 [target]
-match = { vendor = "imagination" }
-assumes = { subgroup = 128, coopmat = false }
+assumes = { vendor = "imagination", coopmat = false }
 
 [provenance]
-source = "the PowerVR branch of the facts-derived profile pie ran before vendor files, carried over unchanged"
-measured = false
+source = "the facts-derived profile pie ran before vendor files, for a PowerVR without cooperative matrices, carried over unchanged"
 
 [compiler]
 # A conditional node's fixed cost, in microseconds.
@@ -81,12 +79,14 @@ moe.tile_rows = [
 # one of coopmat | register_tiled | tiled | one_row | qmv; varies with rows, fill; fixed per op: n, k, bits, group
 qmm = [
   { when = "rows >= 12", use = "tiled", crossover_tg = 160 },
-  { use = "one_row", lanes = 8, rows = 2 },
   { use = "qmv", vecs = 4 },
 ]
 # How many workgroups a decode row's keys may split across.
 # one of fixed | per_core; no variables
-sdpa.decode.split = { use = "fixed", groups = 16 }
+sdpa.decode.split = [
+  { when = "cores > 0", use = "per_core", per = 1 },
+  { use = "fixed", groups = 16 },
+]
 # The fewest keys a split slice holds.
 # integer in 1..65536; no variables
 sdpa.decode.split_min_keys = 256
