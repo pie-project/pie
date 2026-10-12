@@ -64,15 +64,6 @@ pub fn substitute_index(template: &str, index: u32) -> Result<String, Error> {
     Ok(template.replace("{}", &index.to_string()))
 }
 
-pub fn infer_type(
-    expr: &Expr,
-    checkpoint: &dyn CheckpointTypes,
-) -> Result<(TensorType, Checked), Error> {
-    let mut resolver = Resolver::new(checkpoint, Partition::WHOLE);
-    let ty = resolver.infer(expr, "expression")?;
-    Ok((ty, resolver.into_checked()))
-}
-
 pub struct Resolver<'a> {
     scope: Scope<'a>,
 }

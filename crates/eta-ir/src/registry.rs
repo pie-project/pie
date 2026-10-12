@@ -191,17 +191,6 @@ impl GeometryClass {
             GeometryClass::DeviceGeometry => PortMask::DEVICE_GEOMETRY,
         }
     }
-
-    #[must_use]
-    pub fn admitted_by(served: PortMask) -> GeometryClass {
-        if served.covers(PortMask::DEVICE_GEOMETRY) {
-            GeometryClass::DeviceGeometry
-        } else if served.covers(PortMask::DECODE_ENVELOPE) {
-            GeometryClass::DecodeEnvelope
-        } else {
-            GeometryClass::Host
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

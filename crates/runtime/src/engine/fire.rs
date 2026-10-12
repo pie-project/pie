@@ -46,10 +46,6 @@ impl FireRequest {
         self.lanes.first()
     }
 
-    pub fn lane_mut(&mut self) -> Option<&mut Lane> {
-        self.lanes.first_mut()
-    }
-
     #[must_use]
     pub fn qo_indptr(&self) -> Vec<u32> {
         let mut out = Vec::with_capacity(self.lanes.len() + 1);

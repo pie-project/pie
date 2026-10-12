@@ -71,14 +71,6 @@ impl Masking {
     }
 
     #[must_use]
-    pub fn of_row(&self, row: usize) -> Option<&Mask> {
-        match self {
-            Masking::Extent(mask) => Some(mask),
-            Masking::Rows(rows) => rows.get(row),
-        }
-    }
-
-    #[must_use]
     pub fn stated_rows(&self) -> Option<usize> {
         match self {
             Masking::Extent(_) => None,

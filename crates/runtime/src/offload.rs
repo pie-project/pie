@@ -49,10 +49,6 @@ impl Partner {
         self.role
     }
 
-    pub fn transfer_kind(&self) -> TransferKind {
-        self.transfer
-    }
-
     pub fn outstanding(&self) -> u32 {
         self.outstanding.load(Ordering::Relaxed)
     }
@@ -63,10 +59,6 @@ impl Partner {
 
     pub fn mark_available(&self) {
         self.available.store(true, Ordering::Release);
-    }
-
-    pub fn set_blob_host(&self, host: IpAddr) {
-        *self.blob_host.write().unwrap() = Some(host);
     }
 
     pub fn blob_host(&self) -> Option<IpAddr> {
@@ -163,36 +155,6 @@ type PartnerKey = (PartnerRole, u64);
 static PARTNERS: LazyLock<RwLock<HashMap<PartnerKey, Arc<Partner>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
-pub fn register_partner(
-    worker_id: u64,
-    destination_worker_id: u64,
-    engine_id: impl Into<Option<usize>>,
-    role: PartnerRole,
-    max_outstanding: u32,
-    transfer: TransferKind,
-) -> Arc<Partner> {
-    let partner = Arc::new(Partner {
-        worker_id,
-        destination_worker_id,
-        engine_id: engine_id.into(),
-        role,
-        transfer,
-        blob_host: RwLock::new(None),
-        max_outstanding: max_outstanding.max(1),
-        outstanding: AtomicU32::new(0),
-        available: AtomicBool::new(true),
-        drained: tokio::sync::Notify::new(),
-    });
-    if let Some(previous) = PARTNERS
-        .write()
-        .unwrap()
-        .insert((role, worker_id), Arc::clone(&partner))
-    {
-        previous.mark_suspect();
-    }
-    partner
-}
-
 pub fn remove_partner(worker_id: u64, role: PartnerRole) {
     if let Some(partner) = PARTNERS.write().unwrap().remove(&(role, worker_id)) {
         partner.mark_suspect();
@@ -205,25 +167,6 @@ pub fn close_engine_surrogates(engine_id: usize) {
 
 pub(crate) fn close_home_instance(home_instance_id: u64) {
     let _ = home_instance_id;
-}
-
-pub fn register_remote_store(
-    model_idx: usize,
-    engine_idx: usize,
-    kv_page_size: u32,
-    base_page: u32,
-    num_kv_pages: usize,
-) -> anyhow::Result<()> {
-    crate::store::registry::register_engine_with_swap(
-        model_idx,
-        engine_idx,
-        kv_page_size,
-        base_page,
-        num_kv_pages,
-        0,
-        0,
-        0,
-    )
 }
 
 pub fn unregister_remote_store(model_idx: usize, engine_idx: usize) -> anyhow::Result<()> {
@@ -383,11 +326,4 @@ pub(crate) async fn try_encode(request: &mut crate::engine::FireRequest) -> bool
         tracing::warn!(%error, "encode offload declined");
     }
     false
-}
-
-pub fn clear_partners() {
-    let partners: Vec<Arc<Partner>> = PARTNERS.write().unwrap().drain().map(|(_, p)| p).collect();
-    for partner in partners {
-        partner.mark_suspect();
-    }
 }

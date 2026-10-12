@@ -54,16 +54,6 @@ impl InstanceBindingPlan {
     pub fn geometry_class(&self) -> GeometryClass {
         self.binding.geometry
     }
-
-    pub fn validate_binding(&self, bound: &engine::BoundInstance) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            bound.geometry == self.binding.geometry,
-            "engine acknowledged geometry class {:?} for a binding that asked for {:?}",
-            bound.geometry,
-            self.binding.geometry
-        );
-        Ok(())
-    }
 }
 
 #[derive(Debug)]

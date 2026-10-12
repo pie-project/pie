@@ -258,19 +258,6 @@ pub struct LaunchPackage {
 
 impl LaunchPackage {
     #[must_use]
-    pub fn stage_base(&self, at: usize) -> Option<u32> {
-        if at >= self.plans.len() {
-            return None;
-        }
-        Some(
-            self.plans[..at]
-                .iter()
-                .map(|plan| plan.value_map.len() as u32)
-                .sum(),
-        )
-    }
-
-    #[must_use]
     pub fn plan_local(&self, global: u32) -> Option<(usize, Option<u32>)> {
         let mut base = 0u32;
         for (at, plan) in self.plans.iter().enumerate() {

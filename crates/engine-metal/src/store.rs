@@ -425,6 +425,18 @@ impl Pools {
         Ok(rows)
     }
 
+    /// `into.len()` bytes of plane `plane` (the pool's buffers in reserve
+    /// order) from `offset`, read where the host sees them: an elastic plane
+    /// through its alias, since its sparse view has no host address.
+    pub fn read_plane(&self, plane: usize, offset: u64, into: &mut [u8]) -> Result<()> {
+        self.planes
+            .get(plane)
+            .ok_or_else(|| Fault::Unbound {
+                what: format!("pool plane {plane}"),
+            })?
+            .read(offset, into)
+    }
+
     #[must_use]
     pub fn state_slot_bytes(&self) -> u64 {
         self.shapes
@@ -459,25 +471,6 @@ impl Pools {
             self.planes[plane].read(u64::from(slot) * bytes, &mut span)?;
             out.extend_from_slice(&span);
         }
-        Ok(out)
-    }
-
-    /// `len` bytes at `offset` of cache row `row`'s key plane, or its value
-    /// plane when `values`: a host read of a pool whose planes may be
-    /// GPU-private.
-    pub fn read_kv(&self, row: usize, values: bool, offset: u64, len: u64) -> Result<Vec<u8>> {
-        let Some(Shape::Kv {
-            keys, values: v, ..
-        }) = self.shapes.get(row).copied()
-        else {
-            return Err(Fault::Ceiling {
-                what: "kv cache rows",
-                need: row as u64 + 1,
-                have: self.shapes.len() as u64,
-            });
-        };
-        let mut out = vec![0u8; usize::try_from(len).unwrap_or(0)];
-        self.planes[if values { v } else { keys }].read(offset, &mut out)?;
         Ok(out)
     }
 

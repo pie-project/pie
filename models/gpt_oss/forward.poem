@@ -107,5 +107,5 @@ def forward(m, inputs):
     x = ops.layout.gather_rows(x, inputs.readout_rows())
     logits = ops.linear.lm_head(x, m.head)
     if dr != None:
-        plant_readout(dr, logits, inputs, hb, block_rows(dr))
+        plant_readout(dr, logits, inputs, x, block_rows(dr))
     return logits

@@ -203,14 +203,13 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
     };
 
     let mut pools = Pools::reserve(&rig.device, &trace, paging, &facts).expect("reserve packed KV");
-    // An elastic pool maps memory as frames demand it: both pages the test
-    // writes and migrates into.
+    // An elastic pool maps memory under the pages a frame states; the append
+    // below writes outside any frame, so the pages are stated here.
     engine::frame::Supply::commit(
         &mut pools,
         engine::frame::Demand {
             kv_pages: PAGES as u32,
-            state_slots: 0,
-            workspace: 0,
+            ..engine::frame::Demand::ZERO
         },
     )
     .expect("map the pages");
@@ -244,26 +243,26 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
 
     // Bytes per physical page, per plane: PAGE_SIZE cells x HEADS heads x per.
     let page_bytes = tokens * HEADS * per;
-    let plane_cells = (PAGES * u64::from(PAGE_SIZE)) as usize;
-    let plane_bytes = (plane_cells * HEADS * per) as u64;
 
-    // The pool's planes may be GPU-private: read them through the store.
-    let read_page = |pools: &Pools, values: bool, page: usize| -> Vec<u8> {
-        let all = pools
-            .read_kv(0, values, 0, plane_bytes)
+    // The packed row's two planes, keys then values, read through the pool:
+    // an elastic plane's sparse view is private, with no host address.
+    let read_page = |pools: &Pools, plane: usize, page: usize| -> Vec<u8> {
+        let mut bytes = vec![0u8; page_bytes];
+        pools
+            .read_plane(plane, (page * page_bytes) as u64, &mut bytes)
             .expect("read plane");
-        all[page * page_bytes..(page + 1) * page_bytes].to_vec()
+        bytes
     };
 
     // Page 0 must be non-trivial (the append wrote real codes), page 1 zeroed.
-    let src_keys_before = read_page(&pools, false, 0);
-    let src_values_before = read_page(&pools, true, 0);
+    let src_keys_before = read_page(&pools, 0, 0);
+    let src_values_before = read_page(&pools, 1, 0);
     assert!(
         src_keys_before.iter().any(|&b| b != 0),
         "head_dim {head_dim}: page 0 keys should hold the quantized codes"
     );
     assert!(
-        read_page(&pools, false, 1).iter().all(|&b| b == 0),
+        read_page(&pools, 0, 1).iter().all(|&b| b == 0),
         "head_dim {head_dim}: page 1 should start zeroed"
     );
 
@@ -283,8 +282,8 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
 
     // The destination page is byte-for-byte the source page — codes AND the
     // inline fp16 scales moved together, at the packed stride.
-    let dst_keys = read_page(&pools, false, 1);
-    let dst_values = read_page(&pools, true, 1);
+    let dst_keys = read_page(&pools, 0, 1);
+    let dst_values = read_page(&pools, 1, 1);
     assert_eq!(
         dst_keys, src_keys_before,
         "head_dim {head_dim}: migrated key page differs from the source — packed stride is wrong"
@@ -295,7 +294,7 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
     );
     // The source page is untouched by the blit.
     assert_eq!(
-        read_page(&pools, false, 0),
+        read_page(&pools, 0, 0),
         src_keys_before,
         "head_dim {head_dim}: the source key page was disturbed by the migration"
     );

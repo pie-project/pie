@@ -95,11 +95,6 @@ impl OpParams {
             sink_bytes: 0,
         }
     }
-
-    #[must_use]
-    pub fn binds_second_argument(op: &LaunchOp) -> bool {
-        op.args.len() > 1 || op.tag == tags::PIVOT_THRESHOLD
-    }
 }
 
 fn is_mtp(intrinsic: IntrinsicId) -> bool {

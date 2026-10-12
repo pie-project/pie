@@ -260,12 +260,6 @@ pub fn remove(entry: &Entry) -> Result<()> {
     Ok(())
 }
 
-pub fn staging_dir(repo_id: &str) -> Option<PathBuf> {
-    let dir = crate::local::hf::resolve_cache_dir()
-        .join(format!("models--{}", repo_id.replace('/', "--")));
-    dir.is_dir().then_some(dir)
-}
-
 pub fn staging_bytes(dir: &Path) -> u64 {
     fn walk(dir: &Path) -> std::io::Result<u64> {
         let mut total = 0;

@@ -33,10 +33,6 @@ impl AliasTable {
         );
         value
     }
-
-    pub fn is_elided(&self, value: u32) -> bool {
-        self.of.contains_key(&value)
-    }
 }
 
 pub fn escaping_values(region: &Region) -> BTreeSet<u32> {

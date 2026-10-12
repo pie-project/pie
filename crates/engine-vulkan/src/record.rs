@@ -99,10 +99,6 @@ impl Recorder {
         }
     }
 
-    pub(crate) fn refused(&self) -> Option<&'static str> {
-        self.refused
-    }
-
     pub(crate) fn get(&self, key: Key) -> Option<&Recording> {
         if self.refused.is_some() {
             return None;
@@ -119,10 +115,6 @@ impl Recorder {
         let next = self.clock.get() + 1;
         self.clock.set(next);
         next
-    }
-
-    pub(crate) fn counts(&self) -> (u64, u64) {
-        (self.replayed.get(), self.recorded.get())
     }
 
     pub(crate) fn records(&self) -> bool {
@@ -148,13 +140,5 @@ impl Recorder {
             self.evicted.set(self.evicted.get() + 1);
         }
         self.by_key.insert(key, recording);
-    }
-
-    pub(crate) fn evicted(&self) -> u64 {
-        self.evicted.get()
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.by_key.len()
     }
 }

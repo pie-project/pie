@@ -78,9 +78,12 @@ fn scope_of(stream: *mut c_void, region: u32) -> usize {
     }
 }
 
+/// `owner` is the stream a stream-scoped slab belongs to: the launching
+/// stream, or the one whose order it launches in.
 pub(crate) fn take(
     arena: u32,
     stream: *mut c_void,
+    owner: *mut c_void,
     name: &'static str,
     region: u32,
     bytes: usize,
@@ -90,7 +93,7 @@ pub(crate) fn take(
     }
     let mut arenas = locked();
     let held = arenas.entry(arena).or_default();
-    let scope = scope_of(stream, region);
+    let scope = scope_of(owner, region);
     if let Some(slab) = held.slabs.get(&(name, region, scope))
         && slab.bytes >= bytes
     {
