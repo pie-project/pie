@@ -154,7 +154,6 @@ pub struct Run<'c> {
 
     scratch: &'c Scratch,
 
-    /// The adapter profile this load's kernels run under.
     tuning: &'c kernels_wgpu::Tuning,
 }
 
@@ -165,7 +164,6 @@ pub(crate) struct StageCache {
 }
 
 impl<'c> Run<'c> {
-    /// The adapter profile this load's kernels run under.
     pub(crate) fn tuning(&self) -> &'c kernels_wgpu::Tuning {
         self.tuning
     }
