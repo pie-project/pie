@@ -70,9 +70,9 @@ jobs:
     # which the runner's disk cannot hold (even line tables alone: 5.1 GB for
     # pie-poem-compiler's tests). Without it the whole all-targets build is
     # 13 GB; a panic's backtrace still names its functions.
-    # The catalog-wide tests trace and bake every deployment; unoptimized they
-    # take over an hour, at opt-level 1 a fifth of it for a few more seconds
-    # of compiling. Debug assertions stay on.
+    # The catalog-wide tests trace and bake every deployment, which runs about
+    # five times faster at opt-level 1 for a little more compiling. Debug
+    # assertions stay on.
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_DEV_OPT_LEVEL: "1"
@@ -320,9 +320,12 @@ jobs:
           ./packages/javascript/server-web/build.sh release
           for l in python javascript; do tar xzf "$RUNNER_TEMP/languages/pie-language-$l.tar.gz" -C "$RUNNER_TEMP/home"; done
           PIE_HOME="$RUNNER_TEMP/home" ./tests/browser/tools/inferlets.sh
-          node tests/browser/tools/headless.mjs . "tests/browser/transport.html?n=20&model=models/tiny.wgpu.zt" --timeout 300000
-          node tests/browser/tools/headless.mjs . "tests/browser/index.html?auto&max_tokens=4&model=models/tiny.wgpu.zt&config=max_total_pages%20%3D%20512,max_forward_tokens%20%3D%201024,max_forward_requests%20%3D%208,max_state_slots%20%3D%2016" --timeout 900000
-          node tests/browser/tools/headless.mjs . "tests/browser/server.html?model=models/tiny.wgpu.zt" --timeout 900000
+          # The pages are independent, and each spends minutes in SwiftShader
+          # on one core: they open side by side.
+          node tests/browser/tools/headless.mjs . --timeout 900000 \
+            "tests/browser/transport.html?n=20&model=models/tiny.wgpu.zt" \
+            "tests/browser/index.html?auto&max_tokens=4&model=models/tiny.wgpu.zt&config=max_total_pages%20%3D%20512,max_forward_tokens%20%3D%201024,max_forward_requests%20%3D%208,max_state_slots%20%3D%2016" \
+            "tests/browser/server.html?model=models/tiny.wgpu.zt"
         env:
           PIE_CHROME_ARGS: --use-webgpu-adapter=swiftshader --enable-unsafe-swiftshader
 
