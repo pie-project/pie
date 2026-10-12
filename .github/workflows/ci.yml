@@ -148,10 +148,10 @@ jobs:
       - uses: ./.github/actions/toolchain
         with:
           cache-key: ${{ runner.os }}-servers
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: node addon
@@ -180,7 +180,7 @@ jobs:
       - uses: ./.github/actions/toolchain
         with:
           triple: wasm32-wasip2
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -197,10 +197,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
       # The unit suites run against stub WIT bindings; the interface gate
@@ -227,16 +227,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - uses: astral-sh/setup-uv@v7
       - run: uv tool install componentize-py
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
       - run: bash scripts/build-languages.sh target/languages
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: languages
           path: target/languages/pie-language-*.tar.gz
@@ -270,17 +270,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: languages
           path: ${{ runner.temp }}/languages
       - uses: ./.github/actions/toolchain
         with:
           triple: wasm32-unknown-unknown
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -290,7 +290,7 @@ jobs:
             target-wasm
           key: ${{ runner.os }}-browser-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-browser-
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: ~/qwen35-tokenizer
           key: qwen35-tokenizer-v1
@@ -340,17 +340,17 @@ jobs:
         with:
           triple: wasm32-wasip2
           cache-key: ${{ runner.os }}-lavapipe-wgpu
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - uses: astral-sh/setup-uv@v7
       - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: ~/qwen35-tokenizer
           key: qwen35-tokenizer-v1
       - run: bash scripts/ci/tokenizer.sh ~/qwen35-tokenizer
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: languages
           path: ${{ runner.temp }}/languages
@@ -372,11 +372,11 @@ jobs:
           triple: wasm32-wasip2
           features: vulkan
           cache-key: ${{ runner.os }}-lavapipe-vulkan
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: ~/qwen35-tokenizer
           key: qwen35-tokenizer-v1

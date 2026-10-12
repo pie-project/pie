@@ -29,7 +29,7 @@ jobs:
       DIR: packages/python/${{ inputs.package == 'pie-client' && 'client' || inputs.package == 'inferlet' && 'inferlet' || inputs.package == 'pie-language-python' && 'language-python' || 'language-javascript' }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - run: python -m pip install --upgrade build pytest
@@ -37,7 +37,7 @@ jobs:
       - if: startsWith(inputs.package, 'pie-language-')
         uses: astral-sh/setup-uv@v7
       - if: startsWith(inputs.package, 'pie-language-')
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
       - if: startsWith(inputs.package, 'pie-language-')
@@ -74,7 +74,7 @@ jobs:
             -p "$RUNNER_TEMP/app" -p packages/python/inferlet/src -p packages/python/inferlet/src/inferlet/bindings \
             app -o "$RUNNER_TEMP/app/app.wasm"
       - run: python -m build "$DIR"
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-pure
           path: ${{ env.DIR }}/dist
@@ -102,7 +102,7 @@ jobs:
           triple: ${{ matrix.target.triple }}
           features: ${{ matrix.target.features }}
           cache-key: release-pie-server-${{ matrix.target.label }}
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - shell: bash
@@ -112,7 +112,7 @@ jobs:
           python3 -m maturin build --profile release-min --target ${{ matrix.target.triple }} \
             --no-default-features --features ${{ matrix.target.features }} --out dist \
             ${{ matrix.target.manylinux && format('--compatibility {0}', matrix.target.manylinux) || '' }}
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.target.label }}
           path: packages/python/server/dist
@@ -124,12 +124,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - run: python -m pip install maturin && maturin sdist --out dist
         working-directory: packages/python/server
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-sdist
           path: packages/python/server/dist
@@ -145,12 +145,12 @@ jobs:
     runs-on: ubuntu-latest
     environment: pypi
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: dist-*
           merge-multiple: true
           path: dist
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - run: python -m pip install --upgrade twine && ls -la dist && python -m twine check dist/*
