@@ -138,12 +138,20 @@ pub fn ragged(
     const OP: &str = "attention.ragged";
     nonzero(OP, "the head width", head_dim)?;
     let Some(at) = stamp_for(head_dim) else {
-        return Err(refuse(OP, format!("a {head_dim}-wide head is wider than any stamp")));
+        return Err(refuse(
+            OP,
+            format!("a {head_dim}-wide head is wider than any stamp"),
+        ));
     };
     let entry = match q.dtype {
         Dtype::Bf16 => ["ragged_bf16_d_64", "ragged_bf16_d_128", "ragged_bf16_d_256"][at],
         Dtype::F32 => ["ragged_f32_d_64", "ragged_f32_d_128", "ragged_f32_d_256"][at],
-        other => return Err(Error::DtypeUnsupported { op: OP, dtype: other }),
+        other => {
+            return Err(Error::DtypeUnsupported {
+                op: OP,
+                dtype: other,
+            });
+        }
     };
     let q_heads = row_heads(OP, "query", q.width, head_dim)?;
     let kv_heads = nonzero(OP, "kv heads", kv_heads)?;
@@ -158,7 +166,10 @@ pub fn ragged(
     }
     for (what, t) in [("query", q_indptr), ("key", kv_indptr)] {
         if t.dtype != Dtype::I32 {
-            return Err(refuse(OP, format!("the {what} CSR is {:?}, not i32", t.dtype)));
+            return Err(refuse(
+                OP,
+                format!("the {what} CSR is {:?}, not i32", t.dtype),
+            ));
         }
     }
     let entries = (q_indptr.rows * q_indptr.width).min(kv_indptr.rows * kv_indptr.width);

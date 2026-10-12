@@ -7,6 +7,7 @@ pub mod layout;
 pub mod linear;
 
 pub mod sources;
+pub mod spatial;
 pub mod tensor;
 pub mod tuning;
 

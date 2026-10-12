@@ -145,7 +145,8 @@ pub fn split_qkv(
     v: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "layout.split_qkv";
-    let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "split_qkv_bf16", F32 => "split_qkv_f32" });
+    let entry =
+        dtype_dispatch!(OP, packed.dtype, { Bf16 => "split_qkv_bf16", F32 => "split_qkv_f32" });
     if q_width.saturating_add(kv_width.saturating_mul(2)) != packed.width {
         return Err(refuse(
             OP,
@@ -218,7 +219,8 @@ pub fn split_rows(
     right: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "layout.split_rows";
-    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "split_rows_bf16", F32 => "split_rows_f32" });
+    let entry =
+        dtype_dispatch!(OP, x.dtype, { Bf16 => "split_rows_bf16", F32 => "split_rows_f32" });
     nonzero(OP, "the left half of this cut", left.width)?;
     nonzero(OP, "the right half of this cut", right.width)?;
     debug_assert_eq!(
@@ -776,7 +778,8 @@ pub fn pack_rows(ctx: &Ctx<'_>, x: Tensor, perm: Tensor, o: Tensor) -> Result<()
 /// Scatters `x`'s rows back to where `perm` names them.
 pub fn unpack_rows(ctx: &Ctx<'_>, x: Tensor, perm: Tensor, o: Tensor) -> Result<(), Error> {
     const OP: &str = "layout.unpack_rows";
-    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "unpack_rows_bf16", F32 => "unpack_rows_f32" });
+    let entry =
+        dtype_dispatch!(OP, x.dtype, { Bf16 => "unpack_rows_bf16", F32 => "unpack_rows_f32" });
     permute_rows(ctx, OP, entry, x, perm, o, x.rows)
 }
 
@@ -790,16 +793,24 @@ fn permute_rows(
     rows: u32,
 ) -> Result<(), Error> {
     let rows = nonzero(op, "rows to move", rows)?;
-    if perm.dtype != dtype::Dtype::I32 || u64::from(perm.rows) * u64::from(perm.width) < u64::from(rows) {
+    if perm.dtype != dtype::Dtype::I32
+        || u64::from(perm.rows) * u64::from(perm.width) < u64::from(rows)
+    {
         return Err(refuse(
             op,
-            format!("a {:?} permutation of {} x {} for {rows} rows", perm.dtype, perm.rows, perm.width),
+            format!(
+                "a {:?} permutation of {} x {} for {rows} rows",
+                perm.dtype, perm.rows, perm.width
+            ),
         ));
     }
     if x.dtype != o.dtype || x.width != o.width {
         return Err(refuse(
             op,
-            format!("{} x {:?} rows into {} x {:?}", x.width, x.dtype, o.width, o.dtype),
+            format!(
+                "{} x {:?} rows into {} x {:?}",
+                x.width, x.dtype, o.width, o.dtype
+            ),
         ));
     }
     let width = nonzero(op, "the row width", o.width)?;

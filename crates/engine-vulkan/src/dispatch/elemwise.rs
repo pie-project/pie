@@ -102,9 +102,12 @@ impl Run<'_> {
                 self.tensor(*x),
             ),
 
-            Elementwise::LayernormNoScale { x, eps, y } => {
-                elemwise::dit::layernorm_no_scale(self.ctx(), self.tensor(*x), *eps, self.tensor(*y))
-            }
+            Elementwise::LayernormNoScale { x, eps, y } => elemwise::dit::layernorm_no_scale(
+                self.ctx(),
+                self.tensor(*x),
+                *eps,
+                self.tensor(*y),
+            ),
             Elementwise::Modulate {
                 x,
                 m,

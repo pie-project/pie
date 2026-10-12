@@ -39,6 +39,8 @@ const VELOCITY_SEAM: &str = poem_compiler::FLOAT_READOUT_SEAMS[0];
 
 const HIDDEN_SEAM: &str = poem_compiler::FLOAT_READOUT_SEAMS[1];
 
+const PIXELS_SEAM: &str = poem_compiler::FLOAT_READOUT_SEAMS[2];
+
 pub struct Boot<'a> {
     pub trace: Trace,
 
@@ -49,6 +51,7 @@ pub struct Boot<'a> {
     pub budget: Budget,
 
     pub patches: Option<PatchLadder>,
+    pub voxels: Option<poem_compiler::VoxelLadder>,
 
     pub profile: Option<DeviceProfile>,
 
@@ -358,6 +361,11 @@ pub struct Shell {
     readout_seam: engine::fire::ReadoutSeam,
     readout_dtype: Dtype,
     feeds: crate::feeds::Feeds,
+    voxel_seat: Option<crate::inputs::VoxelSeat>,
+    /// The VAE's output plane and its width, and per arm the host buffer a
+    /// fire copies it into for a pass to read.
+    pixels: Vec<(ValueId, u32, poem_ir::ClassSet)>,
+    pixel_out: Vec<Buffer>,
 
     mtp: Option<ValueId>,
 
@@ -380,9 +388,15 @@ impl Shell {
             ..DeviceProfile::default()
         });
 
-        let budgets = match boot.patches.clone() {
-            None => Budgets::of(boot.budget.clone()),
-            Some(ladder) => Budgets::of(boot.budget.clone()).with_patches(ladder),
+        let budgets = {
+            let base = match boot.patches.clone() {
+                None => Budgets::of(boot.budget.clone()),
+                Some(ladder) => Budgets::of(boot.budget.clone()).with_patches(ladder),
+            };
+            match boot.voxels.clone() {
+                None => base,
+                Some(ladder) => base.with_voxels(ladder),
+            }
         };
         let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
 
@@ -473,6 +487,7 @@ impl Shell {
         )?;
 
         weights.decode_absorbed(&device, &handles, &boot.trace)?;
+        weights.relabel_conv_weights(&device, &handles, &boot.trace)?;
 
         handles.seal();
 
@@ -556,6 +571,32 @@ impl Shell {
                 ),
             });
         }
+        let voxel_seat = boot.voxels.as_ref().map(|ladder| {
+            let mut channels = 0u64;
+            let mut dtype = None;
+            for decl in &boot.trace.values {
+                let poem_ir::Def::Input(RuntimeInput::Voxels { channels: c, .. }) = &decl.def
+                else {
+                    continue;
+                };
+                channels = channels.max(u64::from(*c));
+                if let Ty::Tensor { dtype: d, .. } = &decl.ty {
+                    dtype = Some(*d);
+                }
+            }
+            crate::inputs::VoxelSeat {
+                rows: u64::from(ladder.max_voxels),
+                clips: u64::from(ladder.max_clips),
+                channels: channels.max(1),
+                dtype: dtype.unwrap_or(Dtype::Bf16),
+                token_grid: boot.trace.values.iter().any(|decl| {
+                    matches!(
+                        decl.def,
+                        poem_ir::Def::Input(RuntimeInput::TokenGrid { .. })
+                    )
+                }),
+            }
+        });
         let inputs = (0..arms)
             .map(|_| {
                 Inputs::reserve(
@@ -569,6 +610,7 @@ impl Shell {
                     states_mrope,
                     &feeds.seats(),
                     feeds.selections.len(),
+                    voxel_seat,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -605,6 +647,21 @@ impl Shell {
                 },
             },
         };
+
+        // Each VAE reading's output plane, and the classes that write it.
+        let pixel_planes: Vec<(ValueId, poem_ir::ClassSet)> = boot
+            .trace
+            .seams
+            .iter()
+            .filter(|seam| seam.seam == PIXELS_SEAM)
+            .filter_map(|seam| seam.values.first().copied())
+            .map(|plane| {
+                (
+                    plane,
+                    crate::feeds::writer_classes(&boot.trace, &compiled, plane),
+                )
+            })
+            .collect();
 
         let mtp = boot
             .trace
@@ -667,7 +724,7 @@ impl Shell {
             score_heads,
             boot.budget.max_lanes,
         )?;
-        let (out_width, mtp_width, drafts_plane, readout_dtype) = {
+        let (out_width, mtp_width, drafts_plane, readout_dtype, pixels) = {
             let carved = arena.slots(
                 &handles,
                 &compiled.arena,
@@ -752,8 +809,37 @@ impl Shell {
                 }
                 None => None,
             };
+            let mut pixels = Vec::with_capacity(pixel_planes.len());
+            for (plane, classes) in &pixel_planes {
+                let rect = carved.0[plane.0 as usize].ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "value {}, a `{PIXELS_SEAM}` plane, which the carve gave no rectangle",
+                        plane.0
+                    ),
+                })?;
+                if rect.dtype != Dtype::Bf16 {
+                    return Err(Fault::Unbound {
+                        what: format!(
+                            "a `{PIXELS_SEAM}` plane landed as {:?}, not bf16",
+                            rect.dtype
+                        ),
+                    });
+                }
+                pixels.push((
+                    *plane,
+                    rect.width,
+                    classes.clone(),
+                    u64::from(rect.rows) * u64::from(rect.width) * 2,
+                ));
+            }
             handles.rewind();
-            (logits.width, mtp_width, drafts_plane, readout_dtype)
+            (logits.width, mtp_width, drafts_plane, readout_dtype, pixels)
+        };
+        let pixel_out = match pixels.iter().map(|plane| plane.3).max() {
+            Some(bytes) => (0..arms)
+                .map(|_| Buffer::host(&device, bytes))
+                .collect::<Result<Vec<_>>>()?,
+            None => Vec::new(),
         };
 
         let readout = (0..arms)
@@ -893,6 +979,12 @@ impl Shell {
             readout_seam,
             readout_dtype,
             feeds,
+            voxel_seat,
+            pixels: pixels
+                .into_iter()
+                .map(|(plane, width, classes, _)| (plane, width, classes))
+                .collect(),
+            pixel_out,
             mtp,
             drafts_plane,
 
@@ -1026,6 +1118,11 @@ impl Shell {
     }
 
     #[must_use]
+    pub fn voxel_element(&self) -> Option<Dtype> {
+        self.voxel_seat.map(|seat| seat.dtype)
+    }
+
+    #[must_use]
     pub fn readout_seam(&self) -> engine::fire::ReadoutSeam {
         self.readout_seam
     }
@@ -1142,6 +1239,7 @@ impl Shell {
                 attachments: &[],
 
                 media: &[],
+                clips: &[],
                 done: None,
             },
             None,
@@ -1345,13 +1443,71 @@ impl Shell {
         frame.commit_async(None).map(Some)
     }
 
+    /// This fire's pixel plane: its offset in the arena store and its rows,
+    /// if the fire carves one.
+    /// The pixel plane a lane of this fire writes: its arena offset, rows and
+    /// width.
+    fn pixel_rect(&self, p: &Prepared<'_>) -> Result<Option<(u64, u32, u32)>> {
+        let written = self.pixels.iter().find(|(plane, _, classes)| {
+            p.slots.0[plane.0 as usize].is_some()
+                && p.classes.iter().any(|&class| classes.contains(class))
+        });
+        let Some((plane, width, _)) = written else {
+            return Ok(None);
+        };
+        let rect = p.slots.0[plane.0 as usize].expect("checked just above");
+        let row = self.handles.get(rect.buf).ok_or_else(|| Fault::Unbound {
+            what: format!(
+                "handle {}, a pixel plane's, which this fire minted no row for",
+                rect.buf
+            ),
+        })?;
+        Ok(Some((row.offset(), rect.rows, *width)))
+    }
+
+    /// Copies the fire's pixel plane to the arm's host buffer, for a pass that
+    /// reads `pixels`; the rows it copied.
+    fn copy_pixels(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<u32> {
+        let Some((at, rows, width)) = self.pixel_rect(p)? else {
+            return Ok(0);
+        };
+        let into = &self.pixel_out[p.arm];
+        let bytes = u64::from(rows) * u64::from(width) * 2;
+        if bytes > into.bytes() {
+            return Err(Fault::Ceiling {
+                what: "pixel plane bytes",
+                need: bytes,
+                have: into.bytes(),
+            });
+        }
+        frame.copy(self.arena.store(), at, into, 0, bytes)?;
+        Ok(rows * width)
+    }
+
+    /// Where a step's pixels sit for a pass to read: the buffer, the offset,
+    /// and the values.
+    #[must_use]
+    pub fn pixels_row(&self, landed: &Landed) -> Option<(&Buffer, u64, u32)> {
+        let flight = self.inflight.iter().find(|f| f.seq == landed.seq)?;
+        (flight.pixels > 0).then(|| (&self.pixel_out[flight.arm], 0, flight.pixels))
+    }
+
+    /// The decoded image's width: the `vae.decode` plane's.
+    #[must_use]
+    pub fn pixels_width(&self) -> Option<u32> {
+        self.pixels.iter().map(|(_, width, _)| *width).min()
+    }
+
     /// Copies each guarded merge's port rows into its column before the walk.
     #[cfg(not(feature = "vulkan"))]
     fn land_merges(&self, _frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
         if p.merge_lands.is_empty() {
             Ok(())
         } else {
-            Err(program("serve::land_merges", "a merged port needs a device".into()))
+            Err(program(
+                "serve::land_merges",
+                "a merged port needs a device".into(),
+            ))
         }
     }
 
@@ -1360,12 +1516,18 @@ impl Shell {
     fn land_merges(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
         for land in &p.merge_lands {
             let column = p.slots.0[land.merge.0 as usize].ok_or_else(|| Fault::Unbound {
-                what: format!("value {}, a merge over a port, which the carve gave no rectangle", land.merge.0),
+                what: format!(
+                    "value {}, a merge over a port, which the carve gave no rectangle",
+                    land.merge.0
+                ),
             })?;
             let row_bytes = land.seat.row_bytes();
             let bytes = u64::from(land.rows) * row_bytes;
             let row = self.handles.get(column.buf).ok_or_else(|| Fault::Unbound {
-                what: format!("handle {}, a merged column's, which this fire minted no row for", column.buf),
+                what: format!(
+                    "handle {}, a merged column's, which this fire minted no row for",
+                    column.buf
+                ),
             })?;
             let into = Buffer::of_slab(row.slab().clone());
             let into_at = row.offset() + u64::from(land.first) * row_bytes;
@@ -1373,10 +1535,22 @@ impl Shell {
                 frame.fill_zero(&into, into_at, bytes)?;
                 continue;
             }
-            let (store, at) = self.inputs[p.arm].port_seat(land.port).ok_or_else(|| Fault::Unbound {
-                what: format!("the {:?} port {} rectangle, which this load carved none of", land.seat.kind, land.seat.port),
-            })?;
-            frame.copy(store, at + u64::from(land.first) * row_bytes, &into, into_at, bytes)?;
+            let (store, at) =
+                self.inputs[p.arm]
+                    .port_seat(land.port)
+                    .ok_or_else(|| Fault::Unbound {
+                        what: format!(
+                            "the {:?} port {} rectangle, which this load carved none of",
+                            land.seat.kind, land.seat.port
+                        ),
+                    })?;
+            frame.copy(
+                store,
+                at + u64::from(land.first) * row_bytes,
+                &into,
+                into_at,
+                bytes,
+            )?;
         }
         Ok(())
     }
@@ -1414,24 +1588,27 @@ impl Shell {
                         ),
                     ));
                 };
-                if seat.kind == engine::fire::PortKind::Voxels {
-                    return Err(program(
-                        "serve::feed_ports",
-                        "a voxel port feeds the spatial readings, which this shell does not \
-                         serve yet"
-                            .into(),
-                    ));
-                }
+                let voxel = seat.kind == engine::fire::PortKind::Voxels;
                 let (cells, offset) = if seat.per_lane() {
                     (1u64, at_lane as u64)
+                } else if voxel {
+                    (u64::from(row.voxels), u64::from(row.voxel_offset))
                 } else {
                     (u64::from(row.rows), u64::from(row.row_offset))
                 };
                 let bytes = cells * seat.row_bytes();
-                let (store, base) = self.inputs[arm].port_seat(index).ok_or_else(|| {
+                let seated_at = if voxel {
+                    self.inputs[arm].voxel_payload()
+                } else {
+                    self.inputs[arm].port_seat(self.feeds.seat_of(index))
+                };
+                let (store, base) = seated_at.ok_or_else(|| {
                     program(
                         "serve::feed_ports",
-                        format!("port index {index}, and this load carved fewer"),
+                        format!(
+                            "the {:?} port {}, and this load carved no seat for it",
+                            seat.kind, seat.port
+                        ),
                     )
                 })?;
                 let at = base + offset * seat.row_bytes();
@@ -1548,7 +1725,11 @@ impl Shell {
                 let from = start as usize * width * size;
                 let row = &raw[from..from + n as usize * width * size];
                 if self.readout_dtype == Dtype::F32 {
-                    row.as_chunks::<4>().0.iter().map(|w| f32::from_le_bytes(*w)).collect()
+                    row.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|w| f32::from_le_bytes(*w))
+                        .collect()
                 } else {
                     row.as_chunks::<2>()
                         .0
@@ -1609,6 +1790,7 @@ impl Shell {
             lanes,
             attachments: _,
             media,
+            clips,
             done,
         } = step;
 
@@ -1709,20 +1891,54 @@ impl Shell {
             media_of[at] = Some(shot);
         }
 
+        let mut clips_of: Vec<Option<&Clips<'_>>> = vec![None; lanes.len()];
+        for tile in clips {
+            let at = tile.lane as usize;
+            if self.voxel_seat.is_none()
+                || at >= lanes.len()
+                || tile.boxes.is_empty()
+                || clips_of[at].is_some()
+            {
+                return Err(program(
+                    "serve::prepare",
+                    format!(
+                        "lane {} submits {} VAE clip(s), and this load seats {} voxel row \
+                         for a {}-lane fire; a lane's clips are one record",
+                        tile.lane,
+                        tile.boxes.len(),
+                        if self.voxel_seat.is_some() { "a" } else { "no" },
+                        lanes.len()
+                    ),
+                ));
+            }
+            clips_of[at] = Some(tile);
+        }
         let submitted: Vec<FireLane> = lanes
             .iter()
             .zip(&lane_rows)
             .enumerate()
-            .map(|(at, (seated, &rows))| match media_of[at] {
-                None => FireLane::new(seated.lane.word, rows),
-                Some(shot) => FireLane::with_images(
+            .map(|(at, (seated, &rows))| match (media_of[at], clips_of[at]) {
+                (None, None) => FireLane::new(seated.lane.word, rows),
+                (Some(shot), _) => FireLane::with_images(
                     seated.lane.word,
                     rows,
                     shot.rows.len() as u32,
                     shot.rows.iter().copied().fold(0u32, u32::saturating_add),
                 ),
+                (None, Some(tile)) => FireLane::with_clips(
+                    seated.lane.word,
+                    rows,
+                    tile.boxes.len() as u32,
+                    tile.boxes
+                        .iter()
+                        .map(|b| b[0].saturating_mul(b[1]).saturating_mul(b[2]))
+                        .fold(0u32, u32::saturating_add),
+                ),
             })
             .collect();
+        let mut voxel_grid: Vec<i32> = Vec::new();
+        let mut voxel_slots: Vec<i32> = Vec::new();
+        let mut voxel_payload: Vec<u8> = Vec::new();
         let composition = compose_axes(&self.compiled, &self.budgets, &submitted)?;
         let descriptor = FireDescriptor::of(&composition);
         let rows = composition.rows();
@@ -1996,6 +2212,7 @@ impl Shell {
             &self.compiled,
             composition.classes(),
             composition.patch_classes(),
+            composition.voxel_classes(),
             &indptr_host,
             crate::window::Copies {
                 bucket,
@@ -2132,12 +2349,54 @@ impl Shell {
             let mut packings = Vec::with_capacity(self.feeds.selections.len());
             for &select in &self.feeds.selections {
                 packings.push(
-                    poem_exec::fire::pack(select, composition.lanes(), &facts, &group_of_lane, rows)
-                        .map_err(|fault| Fault::from(poem_exec::Error::Fire(fault)))?,
+                    poem_exec::fire::pack(
+                        select,
+                        composition.lanes(),
+                        &facts,
+                        &group_of_lane,
+                        rows,
+                    )
+                    .map_err(|fault| Fault::from(poem_exec::Error::Fire(fault)))?,
                 );
             }
             (group_of_lane, packings)
         };
+        if composition.clips() > 0 {
+            let seat = self
+                .voxel_seat
+                .expect("a clip fire is refused without a voxel seat");
+            let row_bytes = elem(seat.dtype) * seat.channels;
+            voxel_payload = vec![0u8; composition.voxel_rows() as usize * row_bytes as usize];
+            for row in composition.lanes() {
+                let Some(tile) = clips_of[row.source as usize] else {
+                    continue;
+                };
+                let mut offset = row.voxel_offset;
+                for boxed in tile.boxes {
+                    voxel_grid.extend_from_slice(&[
+                        narrow(u64::from(boxed[0])),
+                        narrow(u64::from(boxed[1])),
+                        narrow(u64::from(boxed[2])),
+                        narrow(u64::from(offset)),
+                    ]);
+                    voxel_slots.push(lanes[row.source as usize].lane.slot as i32);
+                    offset = offset
+                        .saturating_add(boxed[0].saturating_mul(boxed[1]).saturating_mul(boxed[2]));
+                }
+                if !tile.payload.is_empty() {
+                    let at = u64::from(row.voxel_offset) * row_bytes;
+                    let end = at + tile.payload.len() as u64;
+                    if end > voxel_payload.len() as u64 {
+                        return Err(Fault::Ceiling {
+                            what: "voxel payload bytes",
+                            need: end,
+                            have: voxel_payload.len() as u64,
+                        });
+                    }
+                    voxel_payload[at as usize..end as usize].copy_from_slice(tile.payload);
+                }
+            }
+        }
         let packing_fires: Vec<crate::inputs::PackingFire<'_>> = packings
             .iter()
             .map(|packed| crate::inputs::PackingFire {
@@ -2178,6 +2437,12 @@ impl Shell {
                 mrope_positions: self.states_mrope.then_some(mrope_positions.as_slice()),
                 group_of_lane: &group_of_lane,
                 packings: &packing_fires,
+                voxels: (composition.clips() > 0).then_some(crate::inputs::VoxelFire {
+                    grid: &voxel_grid,
+                    token_grid: &[],
+                    slots: &voxel_slots,
+                    payload: &voxel_payload,
+                }),
             },
         )?;
         windows.bind(&self.handles, bound.windows)?;
@@ -2189,10 +2454,9 @@ impl Shell {
                 if !merged.select.holds(row.word) {
                     continue;
                 }
-                let fed = seated
-                    .ports
-                    .iter()
-                    .any(|(feed, _)| feed.kind == merged.seat.kind && feed.port == merged.seat.port);
+                let fed = seated.ports.iter().any(|(feed, _)| {
+                    feed.kind == merged.seat.kind && feed.port == merged.seat.port
+                });
                 merge_lands.push(MergeLand {
                     merge: merged.merge,
                     seat: merged.seat,
@@ -2209,7 +2473,7 @@ impl Shell {
                         .position(|(seat, _)| {
                             seat.kind == merged.seat.kind && seat.port == merged.seat.port
                         })
-                        .unwrap_or(usize::MAX),
+                        .map_or(usize::MAX, |index| self.feeds.seat_of(index)),
                     fed,
                 });
             }
@@ -2294,9 +2558,11 @@ impl Shell {
                 .feeds
                 .ports
                 .iter()
+                .filter(|(seat, _)| seat.kind != engine::fire::PortKind::Voxels)
                 .zip(&bound.ports)
                 .map(|((seat, _), tensor)| (seat.kind, seat.port, *tensor))
                 .collect(),
+            voxels: bound.voxels,
             scores: match self.scores.as_ref() {
                 Some(slab) => Some(slab.seat(&self.handles)?),
                 None => None,
@@ -2339,6 +2605,11 @@ impl Shell {
             feeds,
             port_copies,
             merge_lands,
+            classes: composition
+                .lanes()
+                .iter()
+                .map(|row| row.class as usize)
+                .collect(),
             arm,
             readout_rows,
             readout_layout,
@@ -2445,12 +2716,22 @@ struct Walked {
     launches: u32,
 }
 
+/// A lane's VAE clips: each clip's (t, h, w) box, and the payload rows in
+/// clip order, if the step carries them rather than a voxel port.
+pub struct Clips<'a> {
+    pub lane: u32,
+    pub boxes: &'a [[u32; 3]],
+    pub payload: &'a [u8],
+}
+
 pub struct StepView<'a> {
     pub lanes: &'a [Seated<'a>],
 
     pub attachments: &'a [Attached],
 
     pub media: &'a [Media<'a>],
+
+    pub clips: &'a [Clips<'a>],
 
     pub done: Option<Done>,
 }
@@ -2463,6 +2744,8 @@ pub struct Prepared<'a> {
     /// them: (cell, offset in the inputs store, bytes).
     port_copies: Vec<(&'a Buffer, u64, u64)>,
     merge_lands: Vec<MergeLand>,
+    /// The class of each lane of the fire.
+    classes: Vec<usize>,
 
     arm: usize,
     readout_rows: Vec<i32>,
@@ -2492,6 +2775,7 @@ pub struct Enqueued<'a> {
 
     rows: Vec<(u32, u32)>,
     launches: u32,
+    pixels: u32,
 
     step: PhantomData<&'a ()>,
 }
@@ -2585,6 +2869,8 @@ struct Flight {
     pending: Pending,
     _fed: Option<Pending>,
     read: bool,
+    /// The pixel values this step copied out, if it ran a VAE reading.
+    pixels: u32,
 }
 
 impl engine::frame::Shell for Shell {
@@ -2657,6 +2943,10 @@ impl engine::frame::Shell for Shell {
                 arm: prepared.arm,
                 rows: layout,
                 launches,
+                // The recording copies the plane out as it did when walked.
+                pixels: self
+                    .pixel_rect(&prepared)?
+                    .map_or(0, |(_, rows, width)| rows * width),
                 step: PhantomData,
             });
         }
@@ -2726,7 +3016,8 @@ impl engine::frame::Shell for Shell {
             _ => None,
         };
 
-        let seat_rows = self.readout[prepared.arm].bytes() / (width * elem(self.readout_dtype)).max(1);
+        let seat_rows =
+            self.readout[prepared.arm].bytes() / (width * elem(self.readout_dtype)).max(1);
         if prepared.readout_rows.len() as u64 > seat_rows {
             return Err(Fault::Ceiling {
                 what: "readout rows in one step",
@@ -2759,6 +3050,8 @@ impl engine::frame::Shell for Shell {
                 )?;
             }
         }
+
+        let pixel_rows = self.copy_pixels(&mut frame, &prepared)?;
 
         self.generation = self.generation.wrapping_add(1);
         self.advance(&prepared);
@@ -2810,6 +3103,7 @@ impl engine::frame::Shell for Shell {
             arm: prepared.arm,
             rows: layout,
             launches: walked.launches,
+            pixels: pixel_rows,
             step: PhantomData,
         })
     }
@@ -2825,6 +3119,7 @@ impl engine::frame::Shell for Shell {
             arm,
             rows,
             launches,
+            pixels,
             step: _,
         } = enqueued;
         let lanes = rows.len();
@@ -2836,6 +3131,7 @@ impl engine::frame::Shell for Shell {
             pending,
             _fed: fed,
             read: true,
+            pixels,
         });
         Ok(Landed {
             seq,

@@ -294,7 +294,8 @@ pub fn rmsnorm_gated_by(
 
 pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.residual_add";
-    let entry = dtype_dispatch!(OP, y.dtype, { Bf16 => "residual_add_bf16", F32 => "residual_add_f32" });
+    let entry =
+        dtype_dispatch!(OP, y.dtype, { Bf16 => "residual_add_bf16", F32 => "residual_add_f32" });
     let lanes = elementwise(OP, y.width, y.rows)?;
     ctx.fire(
         Fire::at("norm/residual_add.slang", entry).apply(Grid::of(lanes, [FLAT_GROUP, 1, 1])),

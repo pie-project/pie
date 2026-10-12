@@ -27,6 +27,8 @@ pub struct OnDevice<'a> {
     session: &'a mut Session,
     widen: &'a Widen,
     logits: Option<Readout<'a>>,
+    /// A VAE reading's pixels, for a pass that reads `pixels`.
+    pixels: Option<Readout<'a>>,
 
     ran: Vec<usize>,
 
@@ -66,9 +68,16 @@ impl<'a> OnDevice<'a> {
             session,
             widen,
             logits,
+            pixels: None,
             ran: Vec::new(),
             deferral: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_pixels(mut self, pixels: Option<Readout<'a>>) -> OnDevice<'a> {
+        self.pixels = pixels;
+        self
     }
 
     /// Records the pass into a frame of its own for the caller to submit,
@@ -108,8 +117,15 @@ impl<'a> OnDevice<'a> {
                 continue;
             };
             let root = &package.values[global as usize];
-            if root.source == ValueOrigin::Intrinsic && reads_readout(root.intrinsic) {
-                let seat = self.logits.ok_or_else(|| Fault::Program {
+            if root.source == ValueOrigin::Intrinsic
+                && (reads_readout(root.intrinsic) || root.intrinsic == Some(IntrinsicId::Pixels))
+            {
+                let offered = if root.intrinsic == Some(IntrinsicId::Pixels) {
+                    self.pixels
+                } else {
+                    self.logits
+                };
+                let seat = offered.ok_or_else(|| Fault::Program {
                     at: "guest::run",
                     why: "this pass reads the logits and no readout row was offered".into(),
                 })?;
@@ -310,7 +326,8 @@ impl StageRunner for OnDevice<'_> {
     }
 
     fn binds(&self, id: Option<IntrinsicId>) -> bool {
-        reads_readout(id) && self.logits.is_some()
+        (reads_readout(id) && self.logits.is_some())
+            || (id == Some(IntrinsicId::Pixels) && self.pixels.is_some())
     }
 }
 

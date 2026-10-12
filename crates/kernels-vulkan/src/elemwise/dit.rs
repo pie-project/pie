@@ -4,7 +4,9 @@
 
 use dtype::Dtype;
 
-use crate::encode::{Arg, ArgValue, Ctx, Fire, Grid, elementwise, elementwise_rows, nonzero, refuse};
+use crate::encode::{
+    Arg, ArgValue, Ctx, Fire, Grid, elementwise, elementwise_rows, nonzero, refuse,
+};
 use crate::error::Error;
 use crate::tensor::Tensor;
 
@@ -19,10 +21,19 @@ fn stamp(op: &'static str, dtype: Dtype) -> Result<&'static str, Error> {
 }
 
 fn entry(op: &'static str, name: &str, dtype: Dtype) -> Result<&'static str, Error> {
-    Ok(crate::encode::symbol(&format!("{name}_{}", stamp(op, dtype)?)))
+    Ok(crate::encode::symbol(&format!(
+        "{name}_{}",
+        stamp(op, dtype)?
+    )))
 }
 
-fn activation(ctx: &Ctx<'_>, op: &'static str, name: &str, x: Tensor, o: Tensor) -> Result<(), Error> {
+fn activation(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    name: &str,
+    x: Tensor,
+    o: Tensor,
+) -> Result<(), Error> {
     let lanes = elementwise(op, o.width, o.rows)?;
     ctx.fire(
         Fire::at("dit/pointwise.slang", entry(op, name, o.dtype)?).apply(Grid::of(lanes, GROUP)),
@@ -43,7 +54,10 @@ pub fn add(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> 
     if x.dtype != z.dtype || y.dtype != z.dtype {
         return Err(refuse(
             OP,
-            format!("{:?} + {:?} into {:?}; a sum rides one element", x.dtype, y.dtype, z.dtype),
+            format!(
+                "{:?} + {:?} into {:?}; a sum rides one element",
+                x.dtype, y.dtype, z.dtype
+            ),
         ));
     }
     let lanes = elementwise(OP, z.width, z.rows)?;
@@ -66,7 +80,10 @@ pub fn sinusoid(
     if t.dtype != Dtype::F32 || y.dtype != Dtype::F32 {
         return Err(refuse(
             OP,
-            format!("the timesteps are {:?} and the embedding {:?}; both are f32", t.dtype, y.dtype),
+            format!(
+                "the timesteps are {:?} and the embedding {:?}; both are f32",
+                t.dtype, y.dtype
+            ),
         ));
     }
     let rows = nonzero(OP, "rows", y.rows)?;
@@ -117,20 +134,34 @@ impl Form {
     }
 }
 
-fn lane_map(ctx: &Ctx<'_>, op: &'static str, lanes: Option<Tensor>, rows: u32) -> Result<(ArgValue, u32), Error> {
+fn lane_map(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    lanes: Option<Tensor>,
+    rows: u32,
+) -> Result<(ArgValue, u32), Error> {
     let Some(map) = lanes else {
         return Ok((ctx.absent()?, 0));
     };
     if map.dtype != Dtype::I32 || u64::from(map.rows) * u64::from(map.width) < u64::from(rows) {
         return Err(refuse(
             op,
-            format!("a {:?} lane map of {} x {} for {rows} rows", map.dtype, map.rows, map.width),
+            format!(
+                "a {:?} lane map of {} x {} for {rows} rows",
+                map.dtype, map.rows, map.width
+            ),
         ));
     }
     Ok((map.arg(), 1))
 }
 
-fn modulation(op: &'static str, name: &str, x: Dtype, m: Tensor, width: u32) -> Result<&'static str, Error> {
+fn modulation(
+    op: &'static str,
+    name: &str,
+    x: Dtype,
+    m: Tensor,
+    width: u32,
+) -> Result<&'static str, Error> {
     let stamp = match (x, m.dtype) {
         (Dtype::Bf16, Dtype::Bf16) => "bf16",
         (Dtype::Bf16, Dtype::F32) => "bf16_f32",
@@ -143,7 +174,10 @@ fn modulation(op: &'static str, name: &str, x: Dtype, m: Tensor, width: u32) -> 
         }
     };
     if m.width < width {
-        return Err(refuse(op, format!("a {}-wide modulation of {width}-wide rows", m.width)));
+        return Err(refuse(
+            op,
+            format!("a {}-wide modulation of {width}-wide rows", m.width),
+        ));
     }
     Ok(crate::encode::symbol(&format!("{name}_{stamp}")))
 }
@@ -161,11 +195,15 @@ pub fn modulate(
     let rows = nonzero(OP, "rows", o.rows)?;
     let entry = modulation(OP, "modulate", x.dtype, m, form.vectors() * width)?;
     if lane_of_row.is_none() && m.rows < rows {
-        return Err(refuse(OP, format!("{} modulation vectors for {rows} rows", m.rows)));
+        return Err(refuse(
+            OP,
+            format!("{} modulation vectors for {rows} rows", m.rows),
+        ));
     }
     let (map, has_lanes) = lane_map(ctx, OP, lane_of_row, rows)?;
     ctx.fire(
-        Fire::at("dit/modulate.slang", entry).apply(Grid::of(elementwise_rows(OP, width, rows)?, GROUP)),
+        Fire::at("dit/modulate.slang", entry)
+            .apply(Grid::of(elementwise_rows(OP, width, rows)?, GROUP)),
         &[
             x.arg(),
             m.arg(),
@@ -196,7 +234,8 @@ pub fn gated_residual_add(
     }
     let (map, has_lanes) = lane_map(ctx, OP, lane_of_row, rows)?;
     ctx.fire(
-        Fire::at("dit/modulate.slang", entry).apply(Grid::of(elementwise_rows(OP, width, rows)?, GROUP)),
+        Fire::at("dit/modulate.slang", entry)
+            .apply(Grid::of(elementwise_rows(OP, width, rows)?, GROUP)),
         &[
             r.arg(),
             g.arg(),
@@ -214,8 +253,11 @@ pub fn layernorm_no_scale(ctx: &Ctx<'_>, x: Tensor, eps: f32, y: Tensor) -> Resu
     let rows = nonzero(OP, "rows", x.rows)?;
     let width = nonzero(OP, "width", x.width)?;
     ctx.fire(
-        Fire::at("dit/layernorm_no_scale.slang", entry(OP, "layernorm_no_scale", x.dtype)?)
-            .apply(Grid::of([rows * 256, 1, 1], GROUP)),
+        Fire::at(
+            "dit/layernorm_no_scale.slang",
+            entry(OP, "layernorm_no_scale", x.dtype)?,
+        )
+        .apply(Grid::of([rows * 256, 1, 1], GROUP)),
         &[x.arg(), y.arg_mut(), eps.arg(), width.arg()],
     )
 }
@@ -253,12 +295,18 @@ pub fn rope_axes(
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_axes";
     if positions.dtype != Dtype::F32 {
-        return Err(refuse(OP, format!("{:?} positions; a rotation reads f32", positions.dtype)));
+        return Err(refuse(
+            OP,
+            format!("{:?} positions; a rotation reads f32", positions.dtype),
+        ));
     }
     let rows = nonzero(OP, "rows", o.rows)?;
     let head_dim = nonzero(OP, "the head width", head_dim)?;
     if !o.width.is_multiple_of(head_dim) {
-        return Err(refuse(OP, format!("a {}-wide row of {head_dim}-wide heads", o.width)));
+        return Err(refuse(
+            OP,
+            format!("a {}-wide row of {head_dim}-wide heads", o.width),
+        ));
     }
     let heads = o.width / head_dim;
     let axes = u32::try_from(dims.iter().take_while(|d| **d != 0).count()).unwrap_or(0);
@@ -285,7 +333,11 @@ pub fn rope_axes(
         ));
     }
     let angles = rotary_dim / 2;
-    let tail = if x.buf == o.buf { 0 } else { head_dim - rotary_dim };
+    let tail = if x.buf == o.buf {
+        0
+    } else {
+        head_dim - rotary_dim
+    };
     let lanes = heads * (angles + tail);
     ctx.fire(
         Fire::at("dit/rope_axes.slang", entry(OP, "rope_axes", o.dtype)?)

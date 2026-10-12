@@ -273,7 +273,9 @@ impl Run<'_> {
             Attention::Masked { causal: false, .. }
             | Attention::MaskedLse { causal: false, .. }
             | Attention::BlockDynConv { .. }
-            | Attention::SelectorWalk { .. } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
+            | Attention::SelectorWalk { .. } => {
+                Err(kernels_vulkan::Error::Unsupported { op: op.name() })
+            }
             Attention::DecodeRel { .. }
             | Attention::PrefillRel { .. }
             | Attention::ShortConv { .. }

@@ -130,7 +130,13 @@ fn tile_grid(op: &'static str, rows: u32, columns: u32) -> Result<Grid, Error> {
 }
 
 /// An f32 activation against a bf16 or f32 weight, one invocation an output.
-fn f32_act(ctx: &Ctx<'_>, op: &'static str, act: Tensor, w: Tensor, y: Tensor) -> Result<(), Error> {
+fn f32_act(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    act: Tensor,
+    w: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
     let (rows, columns, contraction) = extent(op, act, w, y)?;
     if rows == 0 {
         return Ok(());
@@ -148,8 +154,7 @@ fn f32_act(ctx: &Ctx<'_>, op: &'static str, act: Tensor, w: Tensor, y: Tensor) -
         }
     };
     ctx.fire(
-        Fire::at("gemm/dense_f32.slang", entry)
-            .apply(Grid::of([columns, rows, 1], [64, 4, 1])),
+        Fire::at("gemm/dense_f32.slang", entry).apply(Grid::of([columns, rows, 1], [64, 4, 1])),
         &[
             act.arg(),
             w.arg(),

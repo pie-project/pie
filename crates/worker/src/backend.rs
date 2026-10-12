@@ -459,8 +459,8 @@ pub(crate) fn create_engine_backend(
                     pages: opts.total_pages,
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
-                    max_voxels: None,
-                    max_clips: None,
+                    max_voxels: voxel_ceilings.0,
+                    max_clips: voxel_ceilings.1,
                 },
                 poem_ir::Platform::Metal,
             )
@@ -499,8 +499,8 @@ pub(crate) fn create_engine_backend(
                     pages: opts.max_total_pages.unwrap_or(defaults.pages).max(1),
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
-                    max_voxels: None,
-                    max_clips: None,
+                    max_voxels: voxel_ceilings.0,
+                    max_clips: voxel_ceilings.1,
                 },
                 poem_ir::Platform::Vulkan,
             )
@@ -546,8 +546,8 @@ pub(crate) fn create_engine_backend(
                     pages: opts.max_total_pages.unwrap_or(defaults.pages).max(1),
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
-                    max_voxels: None,
-                    max_clips: None,
+                    max_voxels: voxel_ceilings.0,
+                    max_clips: voxel_ceilings.1,
                 },
                 poem_ir::Platform::Wgpu,
             )
@@ -586,8 +586,8 @@ pub(crate) fn create_engine_backend(
                     pages: opts.max_total_pages.unwrap_or(defaults.pages).max(1),
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
-                    max_voxels: None,
-                    max_clips: None,
+                    max_voxels: voxel_ceilings.0,
+                    max_clips: voxel_ceilings.1,
                 },
                 poem_ir::Platform::Xla,
             )

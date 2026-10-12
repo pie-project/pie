@@ -1,6 +1,5 @@
 #![allow(clippy::too_many_arguments)]
 
-
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, refuse, stated};
 use crate::error::Error;
 use crate::tensor::{Bank, Tensor};
