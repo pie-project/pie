@@ -14,7 +14,7 @@ macro_rules! micros {
         $(
             #[doc = $doc]
             #[derive(Clone, Copy, Debug, PartialEq, Decision)]
-            #[decision(id = $id, constant(range(0..=1_000_000)), default = $default)]
+            #[decision(id = $id, constant(range(0..=1_000_000)), default = $default, tune = price)]
             pub struct $ty(pub f64);
         )*
     };
@@ -37,7 +37,7 @@ micros! {
 
 /// Side streams the compiler may fork independent regions onto.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "compiler.side_streams", constant(range(0..=8)), default = 2)]
+#[decision(id = "compiler.side_streams", constant(range(0..=8)), default = 2, tune = engine)]
 pub struct SideStreams(pub u32);
 
 /// Register the cost decisions, with this backend's own side-stream default.

@@ -186,6 +186,20 @@ fn annotation(spec: &Spec, defaulted: bool) -> String {
     out
 }
 
+/// [`dump`], ending in a `[provenance]` table of `(key, TOML value)`.
+#[must_use]
+pub fn dump_with(profile: &Profile, provenance: &[(&str, String)]) -> String {
+    let mut out = dump(profile);
+    if !provenance.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "[provenance]");
+        for (key, value) in provenance {
+            let _ = writeln!(out, "{key} = {value}");
+        }
+    }
+    out
+}
+
 /// The profile as a complete file, each entry annotated with what it may
 /// hold: `pie profile dump`, the starting point for hand editing.
 #[must_use]

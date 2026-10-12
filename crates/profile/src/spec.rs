@@ -315,6 +315,32 @@ pub enum Shape {
     Flag,
 }
 
+/// How `pie tune` treats a decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tune {
+    /// Its alternatives agree numerically; the fastest over the grid wins.
+    Search,
+    /// A number measured directly, such as a launch's fixed cost.
+    Price,
+    /// Engine behaviour, judged only by end-to-end runs.
+    Engine,
+    /// Never tuned: it changes numerics, memory or import, which is the
+    /// operator's call. Also every decision that says nothing.
+    Never,
+}
+
+impl Tune {
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Tune::Search => "search",
+            Tune::Price => "price",
+            Tune::Engine => "engine",
+            Tune::Never => "never",
+        }
+    }
+}
+
 /// Everything a decision declares.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Spec {
@@ -324,6 +350,7 @@ pub struct Spec {
     pub vars: &'static [Var],
     /// The registry default, spelled as the TOML value a profile would hold.
     pub default: &'static str,
+    pub tune: Tune,
 }
 
 impl Spec {

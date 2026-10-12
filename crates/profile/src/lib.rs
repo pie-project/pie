@@ -17,6 +17,7 @@ pub mod registry;
 pub mod render;
 pub mod shelf;
 pub mod spec;
+pub mod tune;
 pub mod vendor;
 pub mod when;
 
@@ -25,8 +26,11 @@ pub use profile::{Candidate, Facts, Pair, Profile, Report, Source, coord};
 pub use profile_macros::Decision;
 pub use registry::{API, Diagnostic, File, Refusal, Registry, Strict, Target};
 pub use shelf::{Shelf, id_of};
-pub use spec::{Alternative, Constant, Domain, Kind, Shape, Sort, Spec, Value, Var};
+pub use spec::{Alternative, Constant, Domain, Kind, Shape, Sort, Spec, Tune, Value, Var};
 pub use when::When;
+
+/// The backends `pie tune` can measure.
+pub const TUNABLE: &[&str] = &["metal"];
 
 /// What `pie` prints when a device runs without a profile measured on it.
 #[must_use]
@@ -41,6 +45,18 @@ pub fn untuned_hint(device: &str, backend: &str, id: &str, report: &Report) -> S
     };
     for (source, why) in &report.rejected {
         out.push_str(&format!("\n  {source} was not used: {why}"));
+    }
+    if TUNABLE.contains(&backend) {
+        out.push_str(&format!(
+            "\nTo tune it (minutes; --full for a file to contribute):\n    \
+             pie tune {backend}\n\
+             and consider contributing the result:\n    \
+             pie profile export {id} > {id}.toml\n\
+             and open a PR at https://github.com/pie-project/pie adding it under \
+             crates/engine-{backend}/profiles/. The file holds device facts and measured \
+             numbers, nothing else."
+        ));
+        return out;
     }
     out.push_str(&format!(
         "\nTo tune it, start from the profile it runs now:\n    \

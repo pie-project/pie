@@ -375,6 +375,36 @@ impl Registry {
             .unwrap_or_else(|e| panic!("{e}"))
     }
 
+    /// `base` with the decisions `overrides` spells (profile TOML after
+    /// `api = 1`) replaced, under `target`: what `pie tune` writes, before
+    /// it is read back strictly.
+    pub fn overlay(
+        &self,
+        base: &Profile,
+        overrides: &str,
+        target: crate::registry::Target,
+        source: Source,
+    ) -> Result<Profile, crate::registry::Refusal> {
+        let over = self.parse(&format!("api = 1\n{overrides}"), "tuned decisions", Strict::User)?;
+        let mut entries: BTreeMap<&'static str, Vec<Rung>> = base
+            .0
+            .entries
+            .iter()
+            .map(|(id, e)| (*id, e.rungs.clone()))
+            .collect();
+        for (id, rungs) in over.entries {
+            entries.insert(id, rungs);
+        }
+        let file = File {
+            origin: String::new(),
+            target,
+            provenance: Vec::new(),
+            entries,
+            defaulted: Vec::new(),
+        };
+        Ok(self.assemble(Some(&file), source))
+    }
+
     /// Check a parsed file against the device: every assumed fact matches,
     /// and every alternative it picks has what it requires.
     fn admits(&self, file: &File, facts: &Facts) -> Result<(), String> {

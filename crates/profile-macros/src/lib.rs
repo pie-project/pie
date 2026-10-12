@@ -25,6 +25,8 @@
 //!   generated as the point the ladder is evaluated at.
 //! - `fits = path` names `fn(&Self, &<Type>At) -> bool` for partial
 //!   alternatives.
+//! - `tune = search | price | engine | never` says how `pie tune` treats
+//!   the decision; without it, `never`.
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as Tokens};
@@ -192,6 +194,7 @@ struct DecisionAttr {
     fits: Option<Path>,
     flag: bool,
     constant: Option<Values>,
+    tune: Option<Ident>,
 }
 
 impl Parse for DecisionAttr {
@@ -203,6 +206,7 @@ impl Parse for DecisionAttr {
             fits: None,
             flag: false,
             constant: None,
+            tune: None,
         };
         let mut seen_id = false;
         while !input.is_empty() {
@@ -222,6 +226,18 @@ impl Parse for DecisionAttr {
                     attr.fits = Some(input.parse()?);
                 }
                 "flag" => attr.flag = true,
+                "tune" => {
+                    input.parse::<Token![=]>()?;
+                    let word: Ident = input.parse()?;
+                    if !["search", "price", "engine", "never"].contains(&word.to_string().as_str())
+                    {
+                        return Err(syn::Error::new_spanned(
+                            word,
+                            "expected search, price, engine or never",
+                        ));
+                    }
+                    attr.tune = Some(word);
+                }
                 "constant" => {
                     let content;
                     parenthesized!(content in input);
@@ -270,7 +286,7 @@ impl Parse for DecisionAttr {
                 _ => {
                     return Err(syn::Error::new_spanned(
                         key,
-                        "expected id, shape, default, fits, flag or constant(..)",
+                        "expected id, shape, default, fits, flag, tune or constant(..)",
                     ));
                 }
             }
@@ -751,6 +767,13 @@ fn expand(input: &DeriveInput) -> syn::Result<Tokens> {
         }
     };
 
+    let tune = match attr.tune.as_ref().map(|w| w.to_string()).as_deref() {
+        Some("search") => quote!(::profile::Tune::Search),
+        Some("price") => quote!(::profile::Tune::Price),
+        Some("engine") => quote!(::profile::Tune::Engine),
+        _ => quote!(::profile::Tune::Never),
+    };
+
     let fits = match &attr.fits {
         Some(path) => quote!(fn fits(&self, at: &Self::At) -> bool { #path(self, at) }),
         None => quote!(),
@@ -768,6 +791,7 @@ fn expand(input: &DeriveInput) -> syn::Result<Tokens> {
                     shape: #shape,
                     vars: &[#(#var_specs),*],
                     default: #default_toml,
+                    tune: #tune,
                 };
                 &SPEC
             }

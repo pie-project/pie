@@ -12,7 +12,7 @@ macro_rules! flags {
     ($($ty:ident = $id:literal => $kernel:literal,)*) => {
         $(
             #[derive(Clone, Copy, Debug, PartialEq, Eq, profile::Decision)]
-            #[decision(id = $id, flag)]
+            #[decision(id = $id, flag, tune = engine)]
             #[doc = concat!("Whether `", $kernel, "` replaces its primitives.")]
             pub struct $ty;
         )*
