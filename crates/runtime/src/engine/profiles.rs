@@ -54,6 +54,8 @@ pub struct Tuned {
     pub wrong: Vec<String>,
     /// Each end-to-end check, described, and whether it passed.
     pub checks: Vec<(String, bool)>,
+    /// Whether the tuned file differs from today's at all.
+    pub changed: bool,
     pub seconds: f64,
 }
 
@@ -104,6 +106,7 @@ fn tune_vulkan(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned
         lines: out.lines.into_iter().map(|l| (l.id, l.text)).collect(),
         wrong: Vec::new(),
         checks: out.checks.iter().map(|c| (c.describe(), c.passes())).collect(),
+        changed: out.changed,
         seconds: out.seconds,
     })
 }
@@ -118,6 +121,7 @@ fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, 
         lines: out.lines.into_iter().map(|l| (l.id, l.text)).collect(),
         wrong: Vec::new(),
         checks: out.checks.iter().map(|c| (c.describe(), c.passes())).collect(),
+        changed: out.changed,
         seconds: out.seconds,
     })
 }
@@ -134,6 +138,7 @@ fn tune_metal(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned,
         lines: out.lines.into_iter().map(|l| (l.id, l.text)).collect(),
         wrong: out.wrong,
         checks: out.checks.iter().map(|c| (c.describe(), c.passes())).collect(),
+        changed: out.changed,
         seconds: out.seconds,
     })
 }

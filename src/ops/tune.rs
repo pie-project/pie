@@ -103,8 +103,12 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
         }
     }
     let failed = tuned.checks.iter().any(|(_, passed)| !passed);
-    if tuned.checks.is_empty() {
-        out.push_str("end to end: not checked (no Metal artifact imported, or --no-check)\n");
+    if !tuned.changed {
+        out.push_str("nothing changed: today's profile is already the fastest the search found\n");
+    } else if tuned.checks.is_empty() {
+        out.push_str(
+            "end to end: not checked (no artifact for this backend imported, or --no-check)\n",
+        );
     }
     for (line, passed) in &tuned.checks {
         out.push_str(&format!(

@@ -25,6 +25,8 @@ pub struct Outcome {
     pub lines: Vec<Line>,
     /// The end-to-end runs, today's profile against the tuned one.
     pub checks: Vec<Check>,
+    /// Whether the tuned file differs from today's at all.
+    pub changed: bool,
     pub seconds: f64,
 }
 
@@ -329,6 +331,7 @@ pub fn run(
         file,
         lines,
         checks,
+        changed: !unchanged,
         seconds,
     })
 }
