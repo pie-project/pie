@@ -154,7 +154,6 @@ pub struct Run<'c> {
 
     scratch: &'c Scratch,
 
-    /// The device profile this load's kernels run under.
     tuning: &'c kernels_vulkan::Tuning,
 
     /// The layer whose work the frame holds unsubmitted, when the step is
@@ -169,7 +168,6 @@ pub(crate) struct StageCache {
 }
 
 impl<'c> Run<'c> {
-    /// The device profile this load's kernels run under.
     pub(crate) fn tuning(&self) -> &'c kernels_vulkan::Tuning {
         self.tuning
     }
@@ -835,7 +833,6 @@ impl<'c> Run<'c> {
     pub(crate) fn capacity(&self, id: ValueId) -> u32 {
         self.scratch.capacity(id)
     }
-
 
     pub(crate) fn declared(&self, id: ValueId) -> StructKind {
         match &self.values[id.0 as usize].ty {

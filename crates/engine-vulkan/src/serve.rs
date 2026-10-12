@@ -252,10 +252,7 @@ struct LandedSeat {
 }
 
 pub struct Shell {
-    /// The device profile this load's kernels run under.
     tuning: kernels_vulkan::Tuning,
-    /// How that profile was resolved, for doctor.
-    chip_report: profile::Report,
     device: Context,
 
     pipelines: Pipelines,
@@ -351,29 +348,21 @@ impl Shell {
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
         let device = Context::bind(boot.device)?;
         let measured = device.chip();
-        let (chip, chip_report) = crate::chip::resolve(&measured, boot.device.profiles.as_deref());
-        crate::chip::SHELF.tell_untuned(&measured.name, &chip_report);
-        let (shared_bytes, invocations) = device.compute_limits();
-        let tuning = kernels_vulkan::Tuning::new(
-            chip.clone(),
-            kernels_vulkan::tuning::Limits {
-                cores: device.cores(),
-                lanes: device.lanes(),
-                shared_bytes,
-                invocations,
-            },
-        );
+        let (chip, report) = crate::chip::resolve(&measured, boot.device.profiles.as_deref());
+        crate::chip::SHELF.tell_untuned(&measured.name, &report);
+        let tuning = kernels_vulkan::Tuning::new(chip, device.limits());
+        let chip = tuning.profile();
         let boot = Boot {
             trace: poem_compiler::fuse::fuse(
                 boot.trace,
-                &poem_compiler::fuse::flags::kernels(&chip),
+                &poem_compiler::fuse::flags::kernels(chip),
             ),
             ..boot
         };
 
         let profile = boot
             .profile
-            .unwrap_or_else(|| DeviceProfile::of(&chip, device.cores(), &[], &[]));
+            .unwrap_or_else(|| DeviceProfile::of(chip, device.cores(), &[], &[]));
 
         let budgets = match boot.patches.clone() {
             None => Budgets::of(boot.budget.clone()),
@@ -471,14 +460,8 @@ impl Shell {
 
         handles.seal();
 
-        let mut scratch = Scratch::reserve(
-            &device,
-            &boot.trace,
-            &compiled,
-            &budgets,
-            least,
-            &tuning,
-        )?;
+        let mut scratch =
+            Scratch::reserve(&device, &boot.trace, &compiled, &budgets, least, &tuning)?;
         let spaces = boot
             .trace
             .caches
@@ -772,14 +755,7 @@ impl Shell {
             > crate::scratch::pool_bytes(&boot.trace, least)
         {
             drop(scratch);
-            scratch = Scratch::reserve(
-                &device,
-                &boot.trace,
-                &compiled,
-                &budgets,
-                paging,
-                &tuning,
-            )?;
+            scratch = Scratch::reserve(&device, &boot.trace, &compiled, &budgets, paging, &tuning)?;
         }
         let pools = Pools::reserve(&device, &boot.trace, paging, &facts)?;
         let rs_buffers = match &rs_layout {
@@ -797,7 +773,6 @@ impl Shell {
 
         Ok(Shell {
             tuning,
-            chip_report,
             device,
             pipelines: Pipelines::new(),
             handles,
@@ -941,16 +916,9 @@ impl Shell {
         self.device.name()
     }
 
-    /// The device profile this load's kernels run under.
     #[must_use]
     pub fn tuning(&self) -> &kernels_vulkan::Tuning {
         &self.tuning
-    }
-
-    /// How this load's device profile was resolved.
-    #[must_use]
-    pub fn chip_report(&self) -> &profile::Report {
-        &self.chip_report
     }
 
     #[must_use]
@@ -2365,10 +2333,13 @@ impl engine::frame::Shell for Shell {
         }
 
         // A split step is not recorded: a recording replays as one submit.
-        // `engine.submit.split_rows`: 0 never splits.
-        let split_rows = self.tuning.profile().get::<crate::chip::SubmitSplitRows>().0;
-        let split =
-            split_rows > 0 && prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= split_rows;
+        let split_rows = self
+            .tuning
+            .profile()
+            .get::<crate::chip::SubmitSplitRows>()
+            .0;
+        let split = split_rows > 0
+            && prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= split_rows;
         let keep = key.filter(|_| !split && self.recorder.has_room());
         let walked = self.walk_once(&prepared, keep.is_some(), split)?;
         let mut frame = walked.frame.expect("the walk opened a frame");
