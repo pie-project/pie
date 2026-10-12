@@ -178,6 +178,8 @@ pub fn knobs(base: &Profile, skip: &[&str], refusable: &str) -> Vec<Knob> {
                             Kind::Float { lo, hi } => {
                                 scaled(from, lo, hi, false).into_iter().map(|x| format!("{x:.1}")).collect()
                             }
+                            Kind::Bool => vec![(base[i] != "true").to_string()],
+                            Kind::Word(names) => names.iter().map(|n| format!("\"{n}\"")).collect(),
                             _ => Vec::new(),
                         };
                         for o in options {
