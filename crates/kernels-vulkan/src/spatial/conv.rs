@@ -1,6 +1,6 @@
 use dtype::Dtype;
 
-use crate::encode::{Arg, Ctx, Fire, refuse, stated};
+use crate::encode::{Arg, Ctx, Fire, Grid, refuse, stated};
 use crate::error::Error;
 use crate::tensor::Tensor;
 
@@ -11,6 +11,14 @@ const OP: &str = "spatial.conv3d";
 const THREADS: u32 = 128;
 
 const STRIPS: u32 = THREADS / 32;
+
+/// The register-tiled point: 64 x 64 output tiles over 32-wide K blocks, so a
+/// block lies inside one tap when `c_in` is a multiple of 32.
+const RT_FILE: &str = "spatial/conv_rt.slang";
+
+const RT_TILE: u32 = 64;
+
+const RT_BK: u32 = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimePad {
@@ -103,6 +111,52 @@ pub fn conv3d(
     let rows_out = y.rows;
     if rows_out == 0 {
         return Ok(());
+    }
+    if cache.is_none() && c_in.is_multiple_of(RT_BK) {
+        let rows = rows_out.div_ceil(RT_TILE);
+        if rows > 65_535 {
+            return Err(refuse(
+                OP,
+                format!("the grid will not launch: {rows_out} output rows"),
+            ));
+        }
+        return ctx.fire(
+            Fire::at(RT_FILE, "spatial_conv3d_rt_bf16").apply(Grid::of(
+                [
+                    c_out.div_ceil(RT_TILE) * (RT_TILE / 4),
+                    rows * (RT_TILE / 4),
+                    1,
+                ],
+                [RT_TILE / 4, RT_TILE / 4, 1],
+            )),
+            &[
+                x.arg(),
+                grid.arg(),
+                w.arg(),
+                match bias {
+                    Some(bias) => bias.arg(),
+                    None => ctx.absent()?,
+                },
+                y.arg_mut(),
+                o_grid.arg(),
+                stated(OP, c_in)?.arg(),
+                stated(OP, c_out)?.arg(),
+                stated(OP, conv.k[0])?.arg(),
+                stated(OP, conv.k[1])?.arg(),
+                stated(OP, conv.k[2])?.arg(),
+                stated(OP, conv.stride[0])?.arg(),
+                stated(OP, conv.stride[1])?.arg(),
+                stated(OP, conv.stride[2])?.arg(),
+                stated(OP, conv.pad[0])?.arg(),
+                stated(OP, conv.pad[1])?.arg(),
+                stated(OP, conv.pad[2])?.arg(),
+                i32::from(conv.causal_t).arg(),
+                i32::from(conv.time_pad == TimePad::Replicate).arg(),
+                stated(OP, clips)?.arg(),
+                stated(OP, rows_out)?.arg(),
+                u32::from(bias.is_some()).arg(),
+            ],
+        );
     }
     let columns = c_out.div_ceil(STRIPS);
     let lanes = columns.checked_mul(THREADS).ok_or_else(|| {
