@@ -702,16 +702,19 @@ pub fn commit_atomically(pool: &mut PhysicalPool, targets: &mut [Target<'_>]) ->
             (fresh, target.arena.cached.len())
         })
         .collect();
-    let mut done = 0usize;
-    for (target, units) in targets.iter_mut().zip(&wanted) {
-        if let Err(fault) = target.arena.grow(pool, units) {
-            for (undone, (fresh, cached)) in targets[..done].iter_mut().zip(&was[..done]).rev() {
-                undone.arena.rollback(pool, fresh, *cached);
-            }
-            pool.unreserve(growth);
-            return Err(fault);
+    let failed = targets
+        .iter_mut()
+        .zip(&wanted)
+        .enumerate()
+        .find_map(|(done, (target, units))| {
+            target.arena.grow(pool, units).err().map(|f| (done, f))
+        });
+    if let Some((done, fault)) = failed {
+        for (undone, (fresh, cached)) in targets[..done].iter_mut().zip(&was[..done]).rev() {
+            undone.arena.rollback(pool, fresh, *cached);
         }
-        done += 1;
+        pool.unreserve(growth);
+        return Err(fault);
     }
     pool.mark_committed(growth);
     Ok(Commit::Committed)

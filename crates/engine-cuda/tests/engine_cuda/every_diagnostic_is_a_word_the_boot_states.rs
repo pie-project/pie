@@ -1,6 +1,9 @@
 use engine_cuda::{Diagnostics, Knobs};
 
-const WORDS: &[(&str, fn(&Diagnostics) -> bool)] = &[
+/// Whether a boot's diagnostics turned a word on.
+type Reads = fn(&Diagnostics) -> bool;
+
+const WORDS: &[(&str, Reads)] = &[
     ("golden-probe", |d| d.golden_probe),
     ("arm-trace", |d| d.arm_trace),
     ("capture-serial", |d| d.capture_serial),

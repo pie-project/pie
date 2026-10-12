@@ -498,7 +498,7 @@ impl Standing {
             .map_or(0, |bounds| bounds.rows.saturating_sub(1));
         let lanes = own.min(staged.checked_sub(before)?);
         assert!(
-            u64::from(lanes) + 1 <= windows.slots().stride(),
+            u64::from(lanes) < windows.slots().stride(),
             "a ceiling grid of {lanes} requests wants {} boundary words, and a window \
              slot holds {}",
             lanes + 1,
@@ -793,7 +793,7 @@ impl<'c> Run<'c> {
                     pages, at: token, ..
                 }) = seat.lanes.get(lane0 + r)
             {
-                if u64::from(plane.width) != u64::from(own.width) {
+                if plane.width != u64::from(own.width) {
                     return Err(kernels_cuda::Error::Backend {
                         op,
                         detail: format!(

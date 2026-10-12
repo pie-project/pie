@@ -193,8 +193,10 @@ impl Scores {
             .saturating_mul(4);
         self.store.read(at, &mut raw)?;
         Ok(raw
-            .chunks_exact(4)
-            .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| f32::from_le_bytes(*word))
             .collect())
     }
 

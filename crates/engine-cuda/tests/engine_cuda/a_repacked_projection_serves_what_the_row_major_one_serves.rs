@@ -147,7 +147,7 @@ fn repack(codes: &[u8], rows: usize) -> Vec<u8> {
                             let kk = k_base + if s % 2 == 1 { 8 } else { 0 } + h;
                             let flat = col * k + kk;
                             let byte = codes[flat / 2];
-                            let code = if flat % 2 == 0 {
+                            let code = if flat.is_multiple_of(2) {
                                 u32::from(byte & 0xF)
                             } else {
                                 u32::from(byte >> 4)
@@ -169,7 +169,7 @@ fn repack_factors(factors: &[u8], rows: usize) -> Vec<u8> {
     let groups = HIDDEN as usize / GROUP;
     let padded = rows.div_ceil(band) * band;
     let mut out = vec![0u8; padded * groups * 2];
-    for (at, slot) in out.chunks_exact_mut(2).enumerate() {
+    for (at, slot) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
         let j = at % band;
         let rest = at / band;
         let g = rest % groups;

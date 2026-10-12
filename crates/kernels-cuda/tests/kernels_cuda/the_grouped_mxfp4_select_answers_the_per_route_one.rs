@@ -102,7 +102,7 @@ fn check_held(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool) {
     let scales_t = Tensor::new(scales_at, EXPERTS as u32, (n * groups) as u32, Dtype::U8);
     let bias_t = Tensor::new(bias_at, EXPERTS as u32, n as u32, Dtype::Bf16);
     let routes_t = Tensor::new(routes_at, tokens as u32, TOP_K as u32, Dtype::I32);
-    let mut fire = |into: u64| {
+    let fire = |into: u64| {
         let mut y = Tensor::new(into, route_count as u32, n as u32, Dtype::Bf16);
         if biased {
             matmul_select_bias(

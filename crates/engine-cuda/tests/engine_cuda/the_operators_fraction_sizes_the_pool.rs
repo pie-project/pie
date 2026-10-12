@@ -220,7 +220,7 @@ fn the_bodies_keep_their_floor_and_the_tile_is_taken_before_any_capture() {
         "the mlp stream's tile holds the capture: {tile}"
     );
     assert!(
-        tile >= MLP_PLANE && tile < MLP_PLANE + (8 << 20),
+        (MLP_PLANE..MLP_PLANE + (8 << 20)).contains(&tile),
         "in the scratch grain"
     );
 }
@@ -349,7 +349,7 @@ fn the_reservations_scale_to_a_twenty_four_gigabyte_card() {
 
     let bodies = bodies_allowance(4 << 30, room - fine(8192));
     assert!(
-        bodies < 4 << 30 && bodies >= BODIES_FLOOR_BYTES,
+        (BODIES_FLOOR_BYTES..4 << 30).contains(&bodies),
         "held to a quarter: {bodies}"
     );
     assert_eq!(bodies, (room - fine(8192)) / 4);
@@ -374,15 +374,12 @@ fn the_reservations_scale_to_a_twenty_four_gigabyte_card() {
         "a small config is kept"
     );
 
-    let seats = |context: u64, slot: u64| (room - bodies) / slot;
+    let seats = |slot: u64| (room - bodies) / slot;
+    assert!(seats(fine(8192)) >= 1, "the 8k envelope seats a sequence");
     assert!(
-        seats(8192, fine(8192)) >= 1,
-        "the 8k envelope seats a sequence"
-    );
-    assert!(
-        seats(4096, fine(4096)) >= 3,
+        seats(fine(4096)) >= 3,
         "and a 4k one seats a few: {}",
-        seats(4096, fine(4096))
+        seats(fine(4096))
     );
 }
 

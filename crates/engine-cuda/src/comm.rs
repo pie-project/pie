@@ -160,6 +160,7 @@ impl PartialEq for Comm {
 
 /// Bytes of each rank's peer stage; a longer message goes in stage-sized
 /// chunks.
+#[cfg(feature = "cuda")]
 const STAGE_BYTES: u64 = 16 << 20;
 
 /// Maps every rank's stage into every other rank when each pair of devices

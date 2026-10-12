@@ -481,7 +481,10 @@ impl Run<'_> {
                 let x = self.tensor(*x);
                 let y = self.tensor(*y);
                 let groups_nz = *groups;
-                if groups_nz == 0 || x.width % groups_nz != 0 || y.width % groups_nz != 0 {
+                if groups_nz == 0
+                    || !x.width.is_multiple_of(groups_nz)
+                    || !y.width.is_multiple_of(groups_nz)
+                {
                     return Err(kernels_cuda::Error::Backend {
                         op: OP,
                         detail: format!(

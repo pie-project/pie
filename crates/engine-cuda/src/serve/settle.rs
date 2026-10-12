@@ -159,13 +159,17 @@ impl Shell {
                 )?;
                 if element == 4 {
                     values.extend(
-                        raw.chunks_exact(4)
-                            .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]])),
+                        raw.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|word| f32::from_le_bytes(*word)),
                     );
                 } else {
                     values.extend(
-                        raw.chunks_exact(2)
-                            .map(|pair| bf16(u16::from_le_bytes([pair[0], pair[1]]))),
+                        raw.as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|pair| bf16(u16::from_le_bytes(*pair))),
                     );
                 }
             }
@@ -176,7 +180,7 @@ impl Shell {
         let mut scores: Vec<Vec<LayerScores>> = vec![Vec::new(); lanes];
         if !readback.columns.is_empty() {
             let mut mass: Vec<u8> = Vec::new();
-            for lane in 0..lanes {
+            for (lane, scored) in scores.iter_mut().enumerate() {
                 if !readback.captures[lane] {
                     continue;
                 }
@@ -197,12 +201,14 @@ impl Shell {
                         rows,
                         heads,
                         lse: mass
-                            .chunks_exact(4)
-                            .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|word| f32::from_le_bytes(*word))
                             .collect(),
                     });
                 }
-                scores[lane] = layers;
+                *scored = layers;
             }
         }
 
@@ -212,8 +218,10 @@ impl Shell {
             let mut grid = vec![0u8; clips * 16];
             self.arena.read(seat.grid.ptr, &mut grid)?;
             let grid: Vec<i32> = grid
-                .chunks_exact(4)
-                .map(|w| i32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|w| i32::from_le_bytes(*w))
                 .collect();
             let channels = seat.plane.width as usize;
             let element = poem_compiler::arena::elem_bytes(seat.plane.dtype).unwrap_or(0) as usize;
@@ -235,12 +243,16 @@ impl Shell {
                     )?;
                     match seat.plane.dtype {
                         poem_ir::Dtype::F32 => values.extend(
-                            raw.chunks_exact(4)
-                                .map(|w| f32::from_le_bytes([w[0], w[1], w[2], w[3]])),
+                            raw.as_chunks::<4>()
+                                .0
+                                .iter()
+                                .map(|w| f32::from_le_bytes(*w)),
                         ),
                         _ => values.extend(
-                            raw.chunks_exact(2)
-                                .map(|pair| bf16(u16::from_le_bytes([pair[0], pair[1]]))),
+                            raw.as_chunks::<2>()
+                                .0
+                                .iter()
+                                .map(|pair| bf16(u16::from_le_bytes(*pair))),
                         ),
                     }
                 }

@@ -160,7 +160,7 @@ fn load(fixture: &Fixture) -> engine_cuda::Result<Shell> {
         page_size: PAGE,
         context: fixture.text.ceiling.next_multiple_of(PAGE),
         slots: 2,
-        pages: 2 * (fixture.text.ceiling.next_multiple_of(PAGE) / PAGE),
+        pages: 2 * fixture.text.ceiling.div_ceil(PAGE),
         ordinal: 0,
         graphs: Graphs::Off,
         knobs: engine_cuda::Knobs::default(),
@@ -214,11 +214,12 @@ fn a_prefill_past_the_gemvs_grid_is_served() {
         return;
     }
     let fixture = fixture(MICRO);
-    assert_eq!(
-        WIDE * TOP_K > 65_535,
-        true,
-        "the fixture's route run has to pass the GEMV's grid ceiling or this proves nothing"
-    );
+    const {
+        assert!(
+            WIDE * TOP_K > 65_535,
+            "the fixture's route run has to pass the GEMV's grid ceiling or this proves nothing"
+        )
+    };
 
     let (logits, _) = fire_at(&fixture, WIDE).expect(
         "a prefill of 65600 routes fires — if this refused, the engine never reached the \
@@ -227,8 +228,7 @@ fn a_prefill_past_the_gemvs_grid_is_served() {
     finite(&logits[0], "the wide prefill");
 
     let why = fire_at_ungrouped(&fixture, WIDE)
-        .err()
-        .expect("with the grouped leg declined, a 65600-route fire is past the GEMV's grid")
+        .expect_err("with the grouped leg declined, a 65600-route fire is past the GEMV's grid")
         .to_string();
     assert!(
         why.contains("65600") || why.contains("65535"),

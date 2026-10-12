@@ -689,6 +689,7 @@ fn pairings<'a>(
 }
 
 impl Weights {
+    #[allow(clippy::too_many_arguments)]
     pub fn resident(
         trace: &Trace,
         contract: &ModelContract,
@@ -788,7 +789,8 @@ impl Weights {
                 index: &index,
                 landed: vec![false; places.len()],
             };
-            let landed = if plan.streams() {
+
+            if plan.streams() {
                 let streaming = compile_streaming(&metadata, contract, target)?;
                 Execution::new(&streaming, snapshot)
                     .streaming()
@@ -806,9 +808,7 @@ impl Weights {
                 let landed = sink.landed;
                 drop(scratch);
                 landed
-            };
-
-            landed
+            }
         };
 
         if let Some(tier) = experts.as_mut().filter(|tier| tier.deferring()) {

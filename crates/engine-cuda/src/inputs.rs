@@ -1007,11 +1007,9 @@ impl Inputs {
         self.store
             .stage(stream, at.positions, bytes_of(positions))?;
         self.store.stage(stream, at.grids, bytes_of(grids))?;
-        let rows = if at.seat.row_bytes == 0 {
-            0
-        } else {
-            (payload.len() as u64 / at.seat.row_bytes) as u32
-        };
+        let rows = (payload.len() as u64)
+            .checked_div(at.seat.row_bytes)
+            .unwrap_or(0) as u32;
         let width = poem_compiler::arena::elem_bytes(at.seat.dtype)
             .filter(|element| *element > 0)
             .map_or(0, |element| (at.seat.row_bytes / element) as u32);
@@ -1099,6 +1097,10 @@ impl Inputs {
         ))
     }
 
+    #[allow(
+        clippy::not_unsafe_ptr_arg_deref,
+        reason = "`stream` is an opaque CUDA handle the host never dereferences"
+    )]
     pub fn commit(
         &mut self,
         stream: *mut core::ffi::c_void,

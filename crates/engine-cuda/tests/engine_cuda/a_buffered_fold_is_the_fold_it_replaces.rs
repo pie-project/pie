@@ -486,8 +486,10 @@ fn rounding_floor(logits: &[f32]) -> f32 {
 fn bank_gap(a: &[u8], b: &[u8]) -> (f32, usize, usize) {
     let cells = |bytes: &[u8]| -> Vec<f32> {
         bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect()
     };
     let (a, b) = (cells(a), cells(b));

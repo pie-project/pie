@@ -25,7 +25,7 @@ fn lora_prologue(layers: u32, rank: u32, hidden: u32, also_read: bool) -> TraceC
     };
     let a = Shape::new(&[layers, rank, hidden]).expect("A is [layers, rank, hidden]");
     let b = Shape::new(&[layers, hidden, rank]).expect("B is out-major, per §6.3");
-    let mut channels = vec![chan(a.clone()), chan(b), chan(Shape::vector(SITES))];
+    let mut channels = vec![chan(a), chan(b), chan(Shape::vector(SITES))];
     let mut ops = vec![Op::ChanRead(0), Op::ChanRead(1), Op::ChanRead(2)];
     if also_read {
         channels.push(ChannelDecl {

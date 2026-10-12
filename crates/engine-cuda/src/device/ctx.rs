@@ -395,7 +395,7 @@ extern "C" fn host_fn_trampoline(user: *mut c_void) {
     // SAFETY: user is the pointer host_fn leaked; the driver calls this
     // exactly once per successful launch, so this reclaims it exactly once.
     let work = unsafe { Box::from_raw(user.cast::<Box<dyn FnOnce() + Send + 'static>>()) };
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || work()));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
 }
 
 impl std::fmt::Debug for Context {

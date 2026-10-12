@@ -56,11 +56,11 @@ fn check(head_dim: usize, q_heads: usize, kv_heads: usize, rotary_dim: usize, sp
         ("q", &q_in, &got_q, q_heads, q_width),
         ("k", &k_in, &got_k, kv_heads, k_width),
     ] {
-        for r in 0..rows {
+        for (r, &position) in positions.iter().enumerate().take(rows) {
             for h in 0..heads {
                 let at = r * width + h * head_dim;
                 let mut want = src[at..at + head_dim].to_vec();
-                turn(&mut want, positions[r], rotary_dim, span, theta);
+                turn(&mut want, position, rotary_dim, span, theta);
                 for (i, want) in want.into_iter().enumerate() {
                     let g = from_bf16(got[at + i]);
                     assert!(

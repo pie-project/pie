@@ -291,11 +291,11 @@ pub fn condition(x: &[f32], rows: usize, m: &[f32]) -> Vec<f32> {
 pub fn rope(x: &mut [f32], rows: usize, positions: &[[f32; 2]]) {
     let hd = HEAD_DIM as usize;
     let block = hd / 2;
-    for r in 0..rows {
-        for axis in 0..2 {
+    for (r, position) in positions.iter().enumerate().take(rows) {
+        for (axis, &at) in position.iter().enumerate() {
             let base = axis * block;
             for i in 0..block / 2 {
-                let angle = positions[r][axis] * THETA.powf(-2.0 * i as f32 / block as f32);
+                let angle = at * THETA.powf(-2.0 * i as f32 / block as f32);
                 let (s, c) = angle.sin_cos();
                 let a = x[r * hd + base + 2 * i];
                 let b = x[r * hd + base + 2 * i + 1];
@@ -587,8 +587,10 @@ impl Rig {
             .expect("the channel reads")
             .expect("the channel holds a cell");
         bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect()
     }
 }

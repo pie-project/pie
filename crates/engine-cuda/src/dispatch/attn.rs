@@ -77,8 +77,8 @@ impl Run<'_> {
                         &fire.device,
                     );
                     plan::plan_decode(
-                        &seat.kv_indptr,
-                        &seat.kv_len,
+                        seat.kv_indptr,
+                        seat.kv_len,
                         seat.shape,
                         seat.live,
                         seat.window,
@@ -125,8 +125,8 @@ impl Run<'_> {
                         StructKind::AttnPrefillPlan => {
                             let built = plan::plan_prefill(
                                 self.qo_indptr_host(),
-                                &seat.kv_indptr,
-                                &seat.kv_len,
+                                seat.kv_indptr,
+                                seat.kv_len,
                                 seat.rows,
                                 seat.shape,
                                 seat.live,
@@ -142,9 +142,11 @@ impl Run<'_> {
                             {
                                 let ints: Vec<i32> = built
                                     .int_upload
-                                    .chunks_exact(4)
+                                    .as_chunks::<4>()
+                                    .0
+                                    .iter()
                                     .take(96)
-                                    .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                                    .map(|b| i32::from_le_bytes(*b))
                                     .collect();
                                 eprintln!(
                                     "[plan-trace] capture={} rows={} live={:?} window={:?} grant={:?} info={:?} int_bytes={} float_bytes={} ints[..96]={:?}",
@@ -165,8 +167,8 @@ impl Run<'_> {
                         StructKind::AttnPrefillPlanSm90 => {
                             let built = plan::plan_prefill_sm90(
                                 self.qo_indptr_host(),
-                                &seat.kv_indptr,
-                                &seat.kv_len,
+                                seat.kv_indptr,
+                                seat.kv_len,
                                 seat.rows,
                                 seat.shape,
                                 seat.live,
@@ -543,8 +545,8 @@ impl Run<'_> {
                     let seat = self.planning(*kv_indptr, *plan);
                     plan::plan_mla(
                         self.qo_indptr_host(),
-                        &seat.kv_indptr,
-                        &seat.kv_len,
+                        seat.kv_indptr,
+                        seat.kv_len,
                         seat.rows,
                         seat.shape.num_requests,
                         seat.live,

@@ -34,13 +34,15 @@ jobs:
       - uses: ./.github/actions/toolchain
         with:
           cache-key: ${{ runner.os }}-lint
-      # engine-cuda and kernels-cuda are not rustfmt-clean; engine-cuda has
-      # no default engine feature and is tested by `workspace-test`; the two
-      # server crates default to CUDA and lint without an engine below.
+      # The two server crates default to CUDA and lint without an engine
+      # below; the CUDA crates lint both without and with their device half,
+      # which builds without a toolkit.
       - name: cargo fmt
-        run: cargo fmt --check $(bash scripts/ci/members.sh engine-cuda kernels-cuda)
+        run: cargo fmt --all --check
       - name: cargo clippy
-        run: cargo clippy --no-deps --all-targets $(bash scripts/ci/members.sh engine-cuda pie-server-node pie-server-py) -- -D warnings
+        run: cargo clippy --no-deps --all-targets $(bash scripts/ci/members.sh pie-server-node pie-server-py) -- -D warnings
+      - name: cargo clippy (CUDA crates, cuda feature)
+        run: cargo clippy --no-deps --all-targets -p engine-cuda -p kernels-cuda --features engine-cuda/cuda,kernels-cuda/cuda -- -D warnings
       - name: cargo clippy (servers, no engine)
         run: cargo clippy --no-deps --all-targets -p pie-server-node -p pie-server-py --no-default-features -- -D warnings
       # The worker an app embeds: no gateway or controller links.

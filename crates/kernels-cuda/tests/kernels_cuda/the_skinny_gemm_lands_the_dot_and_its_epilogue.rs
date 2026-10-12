@@ -12,7 +12,7 @@ fn round(v: f32) -> f32 {
 }
 
 fn gelu_tanh(g: f32) -> f32 {
-    let inner = 0.797_884_560_802_865_4_f32 * (g + 0.044_715 * g * g * g);
+    let inner = 0.797_884_6_f32 * (g + 0.044_715 * g * g * g);
     0.5 * g * (1.0 + inner.tanh())
 }
 

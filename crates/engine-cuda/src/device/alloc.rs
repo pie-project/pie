@@ -204,6 +204,10 @@ impl Buffer {
         }
     }
 
+    /// # Safety
+    ///
+    /// Each span's source must stay readable for its length until the copy
+    /// on `stream` completes.
     pub unsafe fn stage_batch_from(
         &mut self,
         stream: *mut core::ffi::c_void,
@@ -283,6 +287,10 @@ impl Buffer {
         }
     }
 
+    /// # Safety
+    ///
+    /// `src` must stay readable for `len` bytes until the copy on `stream`
+    /// completes.
     pub unsafe fn stage_from(
         &mut self,
         stream: *mut core::ffi::c_void,

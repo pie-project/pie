@@ -130,6 +130,18 @@ impl Graph {
         }
     }
 
+    /// Device bytes one instantiation of this graph holds, averaged over
+    /// `copies` held at once.
+    pub fn instantiated_bytes(&self, copies: usize) -> Result<f64> {
+        let before = crate::device::free_bytes().unwrap_or(0);
+        let held = (0..copies)
+            .map(|_| self.instantiate(core::ptr::null_mut()))
+            .collect::<Result<Vec<_>>>()?;
+        let after = crate::device::free_bytes().unwrap_or(0);
+        drop(held);
+        Ok(before.saturating_sub(after) as f64 / copies as f64)
+    }
+
     pub fn instantiate(&self, stream: *mut c_void) -> Result<GraphExec> {
         #[cfg(feature = "cuda")]
         {

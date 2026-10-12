@@ -42,6 +42,7 @@ struct Regions {
 }
 
 impl Wave {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn stage(
         &mut self,
         tickets: &[Ticket],
