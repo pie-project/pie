@@ -31,7 +31,7 @@ pub use spec::{Alternative, Constant, Domain, Kind, Shape, Sort, Spec, Tune, Val
 pub use when::When;
 
 /// The backends `pie tune` can measure.
-pub const TUNABLE: &[&str] = &["metal", "cuda"];
+pub const TUNABLE: &[&str] = &["metal", "cuda", "vulkan"];
 
 /// What `pie` prints when a device runs without a profile measured on it.
 #[must_use]

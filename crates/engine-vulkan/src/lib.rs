@@ -28,6 +28,7 @@ mod scratch;
 pub mod serve;
 pub mod settle;
 pub mod store;
+pub mod tune;
 pub mod weight_store;
 pub mod weights;
 pub mod window;

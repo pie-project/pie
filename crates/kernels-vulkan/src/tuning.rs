@@ -26,7 +26,7 @@ pub const AXES: &[&str] = &["rows"];
 
 /// How dense affine-quantised matmuls read prompt rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.qmm.path", default = "tiled")]
+#[decision(id = "kernel.qmm.path", default = "tiled", tune = search)]
 pub enum QmmPath {
     /// The tiled kernels, and the vector kernels below them.
     Tiled,
@@ -39,23 +39,23 @@ pub enum QmmPath {
 /// The fewest rows a dense matmul takes a tiled or cooperative-matrix
 /// kernel for; fewer take the vector kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.qmm.min_rows", constant(range(1..=4096)), default = 12)]
+#[decision(id = "kernel.qmm.min_rows", constant(range(1..=4096)), default = 12, tune = search)]
 pub struct QmmMinRows(pub u32);
 
 /// Workgroups a dense matmul must fill before a wider column tile pays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.qmm.crossover_tg", constant(range(1..=1_000_000)), default = 160)]
+#[decision(id = "kernel.qmm.crossover_tg", constant(range(1..=1_000_000)), default = 160, tune = search)]
 pub struct QmmCrossoverTg(pub u32);
 
 /// Whether batched projections take the register-tiled point (a 4x4 block
 /// per invocation) rather than the plain tiled one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.qmm.register_tiles", flag, default = false)]
+#[decision(id = "kernel.qmm.register_tiles", flag, default = false, tune = search)]
 pub struct QmmRegisterTiles;
 
 /// How a one-row quantised projection (decode) reads its bank.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.qmv.path", default = "plain")]
+#[decision(id = "kernel.qmv.path", default = "plain", tune = search)]
 pub enum QmvPath {
     Plain,
     /// 128-bit loads folded with subgroup shuffles.
@@ -65,7 +65,7 @@ pub enum QmvPath {
 
 /// How unquantised matmuls read prompt rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.gemm.path", default = "tiled")]
+#[decision(id = "kernel.gemm.path", default = "tiled", tune = search)]
 pub enum GemmPath {
     Tiled,
     #[requires("coopmat")]
@@ -74,7 +74,7 @@ pub enum GemmPath {
 
 /// How routed (mixture-of-experts) matmuls read their sorted rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.path", default = "tiled")]
+#[decision(id = "kernel.moe.path", default = "tiled", tune = search)]
 pub enum MoePath {
     Tiled,
     #[requires("coopmat")]
@@ -88,25 +88,27 @@ pub enum MoePath {
     id = "kernel.moe.tile_rows",
     shape(per_expert: derived),
     constant(set(1, 16, 32, 64)),
-    default = r#"[{ when = "per_expert < 2", value = 1 }, { when = "per_expert >= 32", value = 32 }, { value = 16 }]"#
+    default = r#"[{ when = "per_expert < 2", value = 1 }, { when = "per_expert >= 32", value = 32 }, { value = 16 }]"#,
+    tune = search
 )]
 pub struct MoeTileRows(pub u32);
 
 /// The fewest rows per request that take the tiled attention kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.tile_rows_per_request", constant(range(1..=4096)), default = 32)]
+#[decision(id = "kernel.sdpa.tile_rows_per_request", constant(range(1..=4096)), default = 32, tune = search)]
 pub struct SdpaTileRowsPerRequest(pub u32);
 
 /// Whether 64-wide heads attend through the matrix kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.mma", flag, default = false)]
+#[decision(id = "kernel.sdpa.mma", flag, default = false, tune = search)]
 pub struct SdpaMma;
 
 /// How many workgroups a decode row's keys may split across.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(
     id = "kernel.sdpa.decode.split",
-    default = r#"{ use = "fixed", groups = 128 }"#
+    default = r#"{ use = "fixed", groups = 128 }"#,
+    tune = search
 )]
 pub enum DecodeSplit {
     /// A fixed workgroup count.
@@ -124,7 +126,7 @@ pub enum DecodeSplit {
 
 /// The fewest keys a split slice holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.split_min_keys", constant(range(1..=65_536)), default = 256)]
+#[decision(id = "kernel.sdpa.decode.split_min_keys", constant(range(1..=65_536)), default = 256, tune = search)]
 pub struct DecodeSplitMinKeys(pub u32);
 
 /// Register every decision this crate reads.

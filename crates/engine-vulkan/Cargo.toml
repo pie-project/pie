@@ -32,6 +32,8 @@ eta-exec = { path = "../eta-exec" }
 
 eta-compiler = { path = "../eta-compiler" }
 checkpoint = { path = "../checkpoint" }
+poem = { package = "pie-poem", path = "../poem" }
+ztensor-compat = { workspace = true }
 
 libc = "0.2"
 

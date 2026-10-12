@@ -362,6 +362,23 @@ pub fn relative(got: &Serving, against: &Serving) -> f64 {
     r
 }
 
+/// The worst single measure of `got` against `against`: the prompt, or a
+/// lane count's step, whichever slowed most. A trade that wins the prompt
+/// and loses decode is a loss for a server, whatever the weighted mean says.
+#[must_use]
+pub fn worst(got: &Serving, against: &Serving) -> (f64, &'static str) {
+    let m = |v: &[f64]| median(v.to_vec());
+    let mut out = (m(&got.prompt) / m(&against.prompt), "the prompt");
+    let names = ["the 1-lane step", "the 4-lane step", "the 8-lane step"];
+    for (i, name) in names.iter().enumerate() {
+        let r = m(&got.steps[i]) / m(&against.steps[i]);
+        if r > out.0 {
+            out = (r, name);
+        }
+    }
+    out
+}
+
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
     let (mut dot, mut aa, mut bb) = (0.0f64, 0.0f64, 0.0f64);
     for (&x, &y) in a.iter().zip(b) {
@@ -602,9 +619,11 @@ pub fn search(
                     continue 'candidate;
                 }
                 let rm = relative(&served, base);
-                // No model may lose more than its own noise, twice over.
-                if rm > 1.0 + (2.0 * noise[m]).max(Check::NOISE - 1.0) {
-                    worse = Some(format!("{:+.1}% on {}", (rm - 1.0) * 100.0, names[m]));
+                // No measure of any model may lose more than its noise twice
+                // over (and 2%): the final check holds the file to the same.
+                let (w, what) = worst(&served, base);
+                if w > 1.0 + (2.0 * noise[m]).max(Check::NOISE - 1.0) {
+                    worse = Some(format!("{what} {:+.1}% on {}", (w - 1.0) * 100.0, names[m]));
                 }
                 r += rm / on.len() as f64;
                 got.push((m, served));

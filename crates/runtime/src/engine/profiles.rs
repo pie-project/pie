@@ -59,7 +59,11 @@ pub struct Tuned {
 
 /// The check models: those `req.check` names among `found`, or the
 /// smallest of `found`.
-#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "vulkan",
+    all(feature = "metal", target_vendor = "apple")
+))]
 fn pick_models(
     found: Vec<(std::path::PathBuf, String)>,
     req: &TuneRequest<'_>,
@@ -88,6 +92,20 @@ fn pick_models(
         picked.push(hit.clone());
     }
     Ok(picked)
+}
+
+#[cfg(feature = "vulkan")]
+fn tune_vulkan(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
+    let models = pick_models(engine_vulkan::tune::artifacts(req.artifacts), req)?;
+    let out = engine_vulkan::tune::run(Some(req.profiles), &models, say)?;
+    Ok(Tuned {
+        device: out.device,
+        file: out.file,
+        lines: out.lines.into_iter().map(|l| (l.id, l.text)).collect(),
+        wrong: Vec::new(),
+        checks: out.checks.iter().map(|c| (c.describe(), c.passes())).collect(),
+        seconds: out.seconds,
+    })
 }
 
 #[cfg(feature = "cuda")]
@@ -141,7 +159,7 @@ pub fn backends() -> Vec<Backend> {
         shelf: &engine_vulkan::chip::SHELF,
         probe: engine_vulkan::chip::probe,
         resolve: engine_vulkan::chip::resolve_facts,
-        tune: None,
+        tune: Some(tune_vulkan),
     });
     #[cfg(feature = "xla")]
     out.push(Backend {
