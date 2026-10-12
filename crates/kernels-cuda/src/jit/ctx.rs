@@ -197,14 +197,7 @@ impl Ctx {
             stage: core::cell::Cell::new(0),
             region: core::cell::Cell::new(NO_REGION),
             lane: core::cell::Cell::new(0),
-            tuning: crate::tuning::Tuning {
-                moe_grouped: true,
-                mxfp4_grouped: true,
-                mxfp4_wmma: true,
-                decode_split_small: false,
-                decode_split_window: false,
-                decode_chunk_floor_128: false,
-            },
+            tuning: crate::tuning::Tuning::DEFAULT,
         }
     }
 

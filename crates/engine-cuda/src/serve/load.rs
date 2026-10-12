@@ -43,14 +43,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         }
     };
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
-    let engine = {
-        let of = crate::chip::Engine::of(&chip);
-        crate::chip::Engine {
-            graphs: boot.graphs.unwrap_or(of.graphs),
-            recording: boot.knobs.recording.unwrap_or(of.recording),
-            ..of
-        }
-    };
+    let engine = crate::chip::Engine::of(&chip);
 
     kernels_cuda::disk::install(boot.cache_dir);
 

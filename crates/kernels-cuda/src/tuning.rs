@@ -61,6 +61,17 @@ pub struct Tuning {
 }
 
 impl Tuning {
+    /// The registry defaults, for a context no load has tuned (kernel
+    /// tests); a test holds the two equal.
+    pub const DEFAULT: Tuning = Tuning {
+        moe_grouped: true,
+        mxfp4_grouped: true,
+        mxfp4_wmma: true,
+        decode_split_small: false,
+        decode_split_window: false,
+        decode_chunk_floor_128: false,
+    };
+
     #[must_use]
     pub fn of(profile: &Profile) -> Tuning {
         Tuning {
@@ -75,16 +86,8 @@ impl Tuning {
 }
 
 impl Default for Tuning {
-    /// The registry defaults, for a context no load has tuned (kernel tests).
     fn default() -> Tuning {
-        Tuning {
-            moe_grouped: true,
-            mxfp4_grouped: true,
-            mxfp4_wmma: true,
-            decode_split_small: false,
-            decode_split_window: false,
-            decode_chunk_floor_128: false,
-        }
+        Tuning::DEFAULT
     }
 }
 

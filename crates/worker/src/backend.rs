@@ -144,7 +144,6 @@ fn device_boot(
         ordinal: ordinal_of(&opts.device),
         world: World::default(),
         comm: None,
-        graphs: None,
         knobs,
         cache_dir: Some(cache_dir.to_path_buf()),
         adapter_dir: adapter_dir.map(Path::to_path_buf),

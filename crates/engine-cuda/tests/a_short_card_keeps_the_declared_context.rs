@@ -93,7 +93,6 @@ fn a_short_card_keeps_the_declared_context() {
         slots: 256,
         pages: 256 * CONTEXT / PAGE,
         ordinal: 0,
-        graphs: Some(engine_cuda::Graphs::On),
         knobs: Knobs {
             gpu_mem_utilization: fraction(),
             ..Knobs::default()

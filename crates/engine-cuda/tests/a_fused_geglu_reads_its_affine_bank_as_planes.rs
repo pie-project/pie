@@ -192,8 +192,11 @@ fn fire(fixture: &Fixture, knobs: Knobs) -> engine_cuda::Result<Vec<f32>> {
         slots: 1,
         pages: ceiling / PAGE,
         ordinal: 0,
-        graphs: Some(Graphs::Off),
-        knobs,
+        // Eager: the fold is read off the walk, not a recorded body.
+        knobs: Knobs {
+            chip: Some(engine_cuda::chip::pinned(Graphs::Off, None)),
+            ..knobs
+        },
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         residency: engine_cuda::experts::Plan::default(),

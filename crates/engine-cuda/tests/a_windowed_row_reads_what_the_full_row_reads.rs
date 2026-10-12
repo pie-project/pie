@@ -32,8 +32,10 @@ fn logits(trace: Trace, path: &Path, prompt: &[u32], decodes: u32) -> Vec<Vec<f3
         slots: 1,
         pages: 64,
         ordinal: 0,
-        graphs: Some(engine_cuda::Graphs::Off),
-        knobs: engine_cuda::Knobs::default(),
+        knobs: engine_cuda::Knobs {
+            chip: Some(engine_cuda::chip::pinned(engine_cuda::Graphs::Off, None)),
+            ..engine_cuda::Knobs::default()
+        },
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         world: engine_cuda::World::default(),

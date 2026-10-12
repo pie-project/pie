@@ -160,8 +160,10 @@ fn every_probe_is_dumped() {
         slots: 4,
         pages: 4 * context / 16,
         ordinal: 0,
-        graphs: Some(Graphs::Off),
-        knobs: Knobs::default(),
+        knobs: Knobs {
+            chip: Some(engine_cuda::chip::pinned(Graphs::Off, None)),
+            ..Knobs::default()
+        },
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         residency,

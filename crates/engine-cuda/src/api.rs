@@ -22,7 +22,7 @@ use poem_ir::Trace;
 
 use crate::error::Fault;
 use crate::program::Session as ProgramSession;
-use crate::serve::{Attached, Boot, Graphs, Knobs, Lane, Seated, Shell};
+use crate::serve::{Attached, Boot, Knobs, Lane, Seated, Shell};
 
 pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, String>;
 
@@ -43,8 +43,6 @@ pub struct DeviceBoot {
     pub ordinal: i32,
     pub world: World,
     pub comm: Option<Arc<crate::comm::Comm>>,
-    /// A graph mode pinned over the profile's, for tests and diagnostics.
-    pub graphs: Option<Graphs>,
     pub knobs: Knobs,
     pub cache_dir: Option<std::path::PathBuf>,
     pub adapter_dir: Option<std::path::PathBuf>,
@@ -481,7 +479,6 @@ impl Engine for Cuda {
             } else {
                 self.boot.ordinal
             },
-            graphs: self.boot.graphs,
             knobs: self.boot.knobs.clone(),
             cache_dir: self.boot.cache_dir.as_deref(),
             runahead: engine::runahead::Runahead::of(frames_in_flight),

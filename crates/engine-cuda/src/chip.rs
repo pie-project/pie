@@ -178,9 +178,30 @@ pub fn probe(ordinal: i32) -> Option<(String, Facts)> {
 /// Panics on an override the registry refuses.
 #[must_use]
 pub fn profile(overrides: &str) -> Profile {
-    registry()
-        .load_user(&format!("api = 1\n{overrides}"), "test overrides")
-        .unwrap_or_else(|e| panic!("{e}"))
+    registry().with_overrides(overrides)
+}
+
+/// The registry defaults with the graph mode, and the recording mode where
+/// given, pinned: for a test or a diagnostic that runs eagerly.
+#[must_use]
+pub fn pinned(graphs: Graphs, recording: Option<Recording>) -> Profile {
+    let mut text = format!(
+        "[engine]\ngraphs = \"{}\"\n",
+        match graphs {
+            Graphs::Off => "off",
+            Graphs::Shaped => "shaped",
+            Graphs::On => "on",
+        }
+    );
+    match recording {
+        None => {}
+        Some(Recording::Off) => text.push_str("recording = \"off\"\n"),
+        Some(Recording::Shaped) => text.push_str("recording = \"shaped\"\n"),
+        Some(Recording::Bodies { mem_megabytes }) => text.push_str(&format!(
+            "recording = {{ use = \"bodies\", mem_mb = {mem_megabytes} }}\n"
+        )),
+    }
+    profile(&text)
 }
 
 /// Resolve the profile one load runs under: the user's file for this GPU,

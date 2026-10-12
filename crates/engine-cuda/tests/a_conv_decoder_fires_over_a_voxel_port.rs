@@ -385,9 +385,8 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
         slots: 4,
         pages: 16,
         ordinal: 0,
-        graphs: Some(Graphs::Off),
         knobs: Knobs {
-            recording: Some(Recording::Off),
+            chip: Some(engine_cuda::chip::pinned(Graphs::Off, Some(Recording::Off))),
             ..Knobs::default()
         },
         cache_dir: None,
@@ -663,9 +662,8 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
         slots: 4,
         pages: 16,
         ordinal: 0,
-        graphs: Some(Graphs::Off),
         knobs: Knobs {
-            recording: Some(Recording::Off),
+            chip: Some(engine_cuda::chip::pinned(Graphs::Off, Some(Recording::Off))),
             ..Knobs::default()
         },
         cache_dir: None,

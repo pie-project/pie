@@ -162,9 +162,8 @@ fn load(fixture: &Fixture, chip: Option<profile::Profile>) -> engine_cuda::Resul
         slots: 2,
         pages: 2 * (fixture.text.ceiling.next_multiple_of(PAGE) / PAGE),
         ordinal: 0,
-        graphs: Some(Graphs::Off),
         knobs: engine_cuda::Knobs {
-            chip,
+            chip: Some(chip.unwrap_or_else(|| engine_cuda::chip::pinned(Graphs::Off, None))),
             ..engine_cuda::Knobs::default()
         },
         cache_dir: None,
@@ -205,7 +204,7 @@ fn fire_under(
 }
 
 fn fire_at_ungrouped(fixture: &Fixture, tokens: u32) -> engine_cuda::Result<(Vec<Vec<f32>>, f64)> {
-    let chip = engine_cuda::chip::profile("[kernel]\nmoe.grouped = false\n");
+    let chip = engine_cuda::chip::profile("[kernel]\nmoe.grouped = false\n[engine]\ngraphs = \"off\"\n");
     fire_under(fixture, tokens, Some(chip))
 }
 
