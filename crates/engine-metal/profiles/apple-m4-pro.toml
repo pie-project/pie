@@ -7,8 +7,8 @@ device  = "Apple M4 Pro"
 assumes = { family = 9, ane = true }
 
 [provenance]
-source   = "the Apple9 family tuning pie applied before per-chip profiles, carried over unchanged"
-measured = false
+source   = "pie tune on a Mac mini M4 Pro (48 GB), Qwen3.8-27B and Qwen3.6-35B-A3B: every decision searched end to end; split-K fill and the Neural Engine MLP share moved, the rest held"
+measured = true
 
 [kernel]
 qmm = [
@@ -17,7 +17,7 @@ qmm = [
   { use = "qmv", rows_max = 8, packs = 1, crossover_tg = 96 },
 ]
 qmm_fp16 = true
-qmm_splitk = { use = "fill", fill_tg = 512, max = 8 }
+qmm_splitk = { use = "fill", fill_tg = 896, max = 8 }
 qmm_precast = 16
 qmm_widen = 32
 qmm_mpp.split_rows = 32
@@ -42,7 +42,7 @@ sdpa.tile_rows_per_request  = 32
 sdpa.mma                    = true
 sdpa.kv_q8                  = false
 gdn.scan                    = { use = "simd", rows = 4 }
-ane.mlp                     = { use = "share", percent = 47 }
+ane.mlp                     = { use = "share", percent = 71 }
 ane.projections             = { use = "share", percent = 47 }
 
 [compiler]

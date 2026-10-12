@@ -20,8 +20,8 @@ tier    = "sm_89"
 assumes = { cc = 89 }
 
 [provenance]
-source   = "the settings every CUDA GPU ran before per-GPU profiles, carried over unchanged"
-measured = false
+source   = "pie tune on an L40S, Qwen3.5-9B and gpt-oss-20b: every decision searched end to end and every value held"
+measured = true
 
 [kernel]
 moe.grouped        = true
