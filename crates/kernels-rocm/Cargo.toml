@@ -1,0 +1,26 @@
+[package]
+name = "kernels-rocm"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Pure HIP kernel definitions for AMD GPUs: hiprtc unit names, argument marshalling, and launch geometry over a stream. The ROCm counterpart of kernels-cuda; knows nothing about the IR."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+publish = false
+
+[lib]
+name = "kernels_rocm"
+path = "src/lib.rs"
+
+[features]
+default = []
+
+rocm = ["dep:libloading"]
+
+[dependencies]
+dtype = { package = "pie-dtype", path = "../dtype" }
+profile = { package = "pie-profile", path = "../profile" }
+
+libloading = { version = "0.9", optional = true }
+
+tracing = "0.1"

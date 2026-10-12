@@ -3095,6 +3095,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernels-rocm"
+version = "0.5.4"
+dependencies = [
+ "libloading 0.9.0",
+ "pie-dtype",
+ "pie-profile",
+ "tracing",
+]
+
+[[package]]
 name = "kernels-vulkan"
 version = "0.5.4"
 dependencies = [

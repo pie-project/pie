@@ -1,0 +1,453 @@
+NOTICE
+======
+
+This crate redistributes third-party source. What follows names it, states its
+licence, and says exactly what was changed -- in that order, because the third
+part is the one a rebase needs.
+
+The text used to sit under `csrc/vendor/`. It does not any more: there is no
+vendor directory in this crate and no build step looks for one. The files were
+`git mv`'d, subtree shape intact, first into `csrc/src/attn/{flashinfer,xqa}/`
+and then, when `csrc/` itself was retired, to `kernels/flashinfer/` and
+`kernels/xqa/` -- see "Where it lives, and why it moved" below. Nothing about
+the licences, the copyrights or the obligations changes with the path; only
+the paths in this document do.
+
+
+FlashInfer
+----------
+
+    Project:    FlashInfer
+    Upstream:   https://github.com/flashinfer-ai/flashinfer
+    Version:    v0.6.15
+    Licence:    Apache License 2.0
+    Copyright:  Copyright (c) 2023-2025 by FlashInfer team
+    Located at: kernels/flashinfer/
+    Licence at: kernels/flashinfer/LICENSE (upstream's file, unmodified)
+
+The pin was not ours to choose. `crates/kernels-cuda/csrc/CMakeLists.txt` --
+the archive crate's, not this one's -- fetched the same tree for the
+ahead-of-time build:
+
+    CPMAddPackage(
+      NAME flashinfer
+      GITHUB_REPOSITORY flashinfer-ai/flashinfer
+      GIT_TAG v0.6.15
+      GIT_SHALLOW TRUE
+      DOWNLOAD_ONLY YES)
+
+and the carried files were copied from the tree that command produced --
+`.../build/_deps/flashinfer-src/include/flashinfer/` -- rather than from a
+fresh clone, so that the text carried here is byte-for-byte the text the AOT
+build compiled. Seventeen copies of that tree existed under `target/`, one per
+build hash; all seventeen were compared and were identical.
+
+**That crate is gone** -- `85c6c674b` deleted the archive crate, `links` key
+and all -- and the CMakeLists, the CPM block above and the ahead-of-time build
+went with it. So the pin IS ours to choose now, and this paragraph is the only
+place in the repository that states it: nothing else fetches v0.6.15, nothing
+else can disagree with it, and a version bump starts here rather than being
+recorded here afterwards. The block is kept verbatim because it is where the
+carried bytes came from, which remains the answer to *which* v0.6.15.
+
+### What is carried
+
+Twenty-four files: the transitive `#include` closure, inside the FlashInfer
+tree, of the nine headers our own text names --
+`attention/{cascade,decode,default_decode_params,default_prefill_params,
+mask,mla,mla_params,prefill,variants}.cuh`, in ten directives across
+`kernels/attn/{fa2,attention_mla_fa2,attention_score_capture}.cuh` and
+`kernels/attn/merge_states.cuh`. 13,662 lines, 589,556 bytes.
+
+That seed list used to read `attention/{...,state,...}.cuh` and
+`{fastdiv,layout,page,pos_enc,utils}.cuh`, which described the ahead-of-time
+crate's `.cu` roots rather than ours. Those six are still carried and are
+still reached -- they are inside the closure rather than seeds of it. The set
+does not change; only the reason given for it does. Walking quoted includes
+from the four compilation roots -- `attn/fa2.cuh`, `attn/attention_mla_fa2.cuh`,
+`attn/attention_xqa_mha.cuh`, `attn/merge_states.cuh` -- reaches **all 38**
+of the internalised files at this revision, both trees, with nothing orphaned.
+It reached 40 of 43 when the four host-only files were still here, which is
+what identified them; there is no such residue now.
+
+It was twenty-eight, and the four that left are the subject of "What was
+deleted" below. `attention/scheduler.cuh` used to be one of the seeds of this
+closure, because the ahead-of-time crate's `.cu` files included it; under the
+JIT nothing includes it and it is gone. The line count was 16,084 until the
+host C++ inside the twenty-four came out as well -- same section, second
+half.
+
+Not carried, and deliberately: `attention/hopper/*`,
+`gemm/bmm_fp8.cuh`, `cutlass_utils.cuh` and `mamba/selective_state_update.cuh`.
+They are outside the closure of those seeds, they are a different
+architecture's problem (sm_90 TMA, NVSHMEM, CUTLASS), and carrying text
+nobody compiles would be weight in every binary.
+
+`comm/*` used to be on that list and is not any more; see the next section.
+
+### And then `comm/` was carried too, 2026-08-16
+
+Three more files, from a SECOND upstream revision, and the second revision is
+the part to read first:
+
+    comm/vllm_custom_all_reduce.cuh    303 lines    11,734 bytes
+    comm/trtllm_allreduce_fusion.cuh 1,443 lines    54,879 bytes
+    fp4_layout.cuh                      37 lines     1,482 bytes
+
+They are the transitive closure, inside the FlashInfer tree, of
+`kernels/collective/all_reduce.cuh`, which is `kernels_cuda::collective`'s
+NVRTC root and the device text the tensor-parallel collectives fire. The
+other two files that closure reaches -- `utils.cuh` and `vec_dtypes.cuh` -- were already carried and
+are unchanged.
+
+**They came from the flashinfer PYTHON WHEEL, not from the CPM checkout the
+block above pins.** The path was
+
+    /root/.venv/vllm/lib/python3.12/site-packages/flashinfer/data/include/
+        flashinfer/
+
+whose `_build_meta.py` reads `__version__ = "0.6.14"` and `__git_version__ =
+"19f1a41e6b21f0c422d775e377b6fdf9a1fc9d23"`. That is a different revision from
+the v0.6.15 the twenty-four attention files came from, and this tree now
+carries bytes from two of them. It is stated rather than smoothed over, and
+`kernels/flashinfer/MODIFICATIONS` states it again where a rebaser will
+be standing.
+
+What makes the mix defensible rather than merely recorded: the two closures
+overlap in exactly two files, and both were compared by applying
+`MODIFICATIONS`' own strip to this tree's copies and diffing the result
+against the wheel's. `vec_dtypes.cuh`: 2,195 lines in, 2,195 kept, nothing
+deleted, inserted or replaced — byte-identical. `utils.cuh`: 551 in, 472 kept,
+79 deleted by this tree's own `// PIE: REMOVED` markers, and again zero
+insertions and zero replacements. **Every line carried here is present
+unedited in both revisions**, so nothing is a v0.6.14 file shadowing a
+v0.6.15 one. The licence is unchanged between the two revisions and is the
+same Apache-2.0 already recorded above.
+
+The FlashInfer total carried is therefore **26 files, 15,280 lines, 651,326
+bytes**, which is the table at the foot of `MODIFICATIONS` and is re-derived
+there against `wc -l` and `wc -c` rather than restated.
+
+### What was deleted
+
+Four files, and this is the one change in this tree that is not a guard.
+`attention/scheduler.cuh`, `exception.h`, `allocator.h` and
+`attention/heap.h` contained no device code at all -- no `__global__` body, no
+`__device__` function, 2,138 lines and 97,847 bytes of host C++ between them.
+Every one was already guarded in its ENTIRETY, so NVRTC had always seen four
+empty files; the guards were doing a deletion's work at the cost of shipping
+the text, and `kernels/` is device text only.
+
+Each had a Rust owner before it was deleted, which is why this is a deletion
+and not a port: `src/plan/{decode,prefill,mla,sm90}.rs` for the scheduler,
+`src/plan/error.rs`, `src/plan/alloc.rs` and `src/plan/heap.rs` for the other
+three, 3,853 lines of Rust that were written against these files and had been
+carrying the behaviour for some time.
+
+The measurement that made it safe: `scheduler.cuh` was `#include`d by nothing
+in this tree, and `allocator.h` and `heap.h` only by `scheduler.cuh`. Walking
+the four compilation roots reached 40 of the 43 internalised files and missed
+exactly those three. `exception.h` was the fourth and the only reachable one
+-- `page.cuh` and `utils.cuh` included it -- so deleting it deleted two
+`#include` lines as well. That is safe for a reason worth stating plainly:
+because `exception.h` was guarded in its entirety, `FLASHINFER_CHECK` and
+`FLASHINFER_ERROR` were ALREADY undefined in every NVRTC translation unit
+here, and the expansions that survive are all inside `#define` bodies NVRTC
+never expands or host launchers it never reaches. What NVRTC sees did not
+change by one token. (Removing the launchers, below, took the second kind
+with them: 13 expansions remain and every one is a `#define` continuation
+line.)
+
+### And then the host C++ inside the surviving files went too
+
+Four whole files was the easy half. The rule is *the device tree holds pure
+kernels*,
+and after those four deletions it held in effect and not in letter: 34 guarded
+regions carrying 1,503 lines of upstream host text were still on disk, hidden
+from NVRTC by `#ifndef __CUDACC_RTC__` and by XQA's own `#ifndef
+GENERATE_CUBIN`, plus **1,055 lines in 13 `cudaError_t` host launchers that
+were not guarded at all** -- `SinglePrefillWithKVCacheDispatched`,
+`BatchDecodeWithPagedKVCacheDispatched` and their siblings across
+`cascade.cuh`, `decode.cuh`, `mla.cuh` and `prefill.cuh`. Those thirteen
+survived only by being uninstantiated templates, which is a far weaker shield
+than a guard: a single explicit instantiation anywhere would have handed
+`cudaMalloc`, `std::vector` and `cudaStreamCreate` to a device compiler. They
+form a closed set -- the only callers of any of the thirteen are the others --
+so removing them removed no reachable code.
+
+A fifth whole file went with them: **`xqa/hostUtils.h`**, one `inline
+cudaLaunchConfig_t makeLaunchConfig(...)`, no device text, included only from
+the `mha.cuh` host block being deleted. It was found by the deletion rather
+than before it.
+
+Net across both trees: **15 files touched, 2,694 lines and 123,642 bytes
+removed**, each site keeping a `// PIE: REMOVED` marker naming what stood
+there -- 40 markers, and they are inside that net. `MODIFICATIONS` carries the
+per-file ledger and the reasoning.
+
+What was NOT removed: **12 two-sided regions, 36 host lines**, where the
+`#ifndef` has an `#else` arm holding our device replacement -- `<cstdint>`
+against XQA's `mha_stdheaders.cuh` shims, chiefly. The documented strip keeps
+the guarded body and discards the `#else`, so deleting the host arm of one of
+those would make a strip silently promote OUR text into a file that claims to
+be upstream's. They stay, and they are the reason this section says *removed*
+rather than *all removed*.
+
+Two more stay and are NOT two-sided, which this paragraph did not say:
+`xqa/mha_stdheaders.cuh:20`, an `#ifndef GENERATE_CUBIN` around seven host
+`#include`s that NVRTC skips, and `:976`, an `#if GENERATE_CUBIN` around seven
+`using` aliases that NVRTC takes and that hold no host text at all. Fourteen
+regions, twelve of them two-sided. Both stay for a better reason than the
+twelve: that file is byte-identical to upstream, carries zero markers, and the
+switch is upstream's own -- removing them would turn the one XQA file that
+needs no ledger entry into one that needs markers and a row. `MODIFICATIONS`
+has the classification and its two corrections.
+
+Deleting text a marker names is the one edit a strip cannot undo, and there
+are now twelve files' worth of it rather than two `#include` lines.
+`MODIFICATIONS` states it as step 3 of its transform and says plainly that
+step 3 needs upstream's tarball.
+
+### What was changed
+
+Guards, markers, and the `#include` lines named above. **39 `// PIE:` markers
+across 12 of the 24 files, 156 added lines**; the other 12 files are
+byte-identical to upstream. Only **two** `#ifndef __CUDACC_RTC__` directives
+remain in the whole FlashInfer tree, both in `attention/mla.cuh`, both
+two-sided; there were thirty-three markers over ten files when every guard was
+still a guard.
+Every copyright header is intact and untouched. Nothing was reformatted,
+renamed, reordered or "improved" -- include order in particular is upstream's,
+which is why several files carry four small markers where one large one would
+have needed a line moved.
+
+A guard existed because NVRTC compiles for the device only. It refuses a
+function marked `__host__` outright ("a function explicitly marked as a
+__host__ function is not allowed in JIT mode"), it has no C++ standard
+library, and it has no include path -- so `<iostream>`, `<sstream>`,
+`<vector>`, the `cudaLaunchKernel` wrappers and the `std::ostringstream` error
+paths had to be hidden from it. They are no longer hidden: they are gone, and
+a marker records each one. The ahead-of-time build that used to see upstream
+exactly by defining no `__CUDACC_RTC__` no longer exists -- there is no nvcc
+in this crate -- so nothing was left to serve by keeping the text.
+
+Each change is preceded by a marker of one of two fixed forms:
+
+    // PIE: guarded for NVRTC -- <what and why>. Upstream is unmodified apart
+    // from markers of this form; see NOTICE. Removing them restores the file.
+
+    // PIE: REMOVED -- <what stood here>. <N> lines of host C++, <why removing
+    // it changes no compile>. This marker is one a strip does NOT undo; see
+    // MODIFICATIONS.
+
+One `grep -rn "// PIE:" kernels/flashinfer/ --include='*.cuh'
+--include='*.h'` finds all 39; 35 of the 39 are `REMOVED`, and 40 across both
+trees are. The `--include` is load-bearing and was missing from this
+sentence: the bare grep answers more than 39, because `MODIFICATIONS` sits in
+that directory and quotes the marker form throughout its own prose -- and
+answers more again after every edit to that page, which is why no number is
+given for it here. The XQA grep below needs no such filter: that directory
+holds sources and `LICENSE` and nothing else. The boilerplate sentence appears
+once per file, on its first marker.
+`kernels/flashinfer/MODIFICATIONS` lists the count per file, and the
+property that list asserts -- *strip the markers, the `#ifndef` under each and
+its matching `#endif`, and put back what a REMOVED marker names, and every
+file is byte-for-byte upstream* -- was checked mechanically, per file, against
+the CPM tree before this NOTICE was written.
+`tests/upstream_manifest.rs` re-checked the half of that claim which needs no
+network -- every file's guard count, added-line count, line count and byte
+count against the table, and that the strip is still well defined for every
+file -- and **it is deleted**, at `1a08b179a`, with the twelve other test
+files whose subject was machinery that sweep removed. Nothing re-checks the
+table today.
+
+So BOTH halves of the property are manual now: the four columns against `wc
+-l` and `wc -c`, and the stripped text against a CPM checkout. That is the
+largest thing this document lost and it is named rather than left for a rebase
+to discover. The columns were re-derived by hand for this revision and every
+one of the twenty-four rows equals its file; what is gone is the guarantee
+that they will still equal it tomorrow.
+
+One cheap check survives and is worth writing down because it needs no
+network and no table: `git diff 49cb6dfa9..HEAD -- kernels/flashinfer
+kernels/xqa csrc` is what has happened to either tree since the strip that
+describes it -- the trailing `csrc` is there because both trees have been
+`git mv`'d twice since that revision and a pathspec naming only where they
+live now would show the moves as wholesale additions.
+these documents describe. At this revision it is exactly two files --
+`MODIFICATIONS`, which is ours, and one line of `xqa/mha.cuh`, which is the
+undocumented edit the XQA section below now documents. Every other byte in
+both trees is what the strip left. That does not prove the trees equal
+upstream -- only a CPM checkout does -- but it does bound the unexamined
+surface to one line, and bounding it is the half of the deleted test's job
+that `git` can still do.
+
+Two consequences are worth recording because they are not visible in a diff:
+
+  * `attention/scheduler.cuh` used to be guarded in its entirety, all 1,808
+    lines of it, and that whole-file guard is what identified it as a
+    deletion. It was the host planner -- `std::vector` bin-packing, workspace
+    carving, `cudaOccupancyMaxActiveBlocksPerMultiprocessor` -- and the three
+    `__global__` declarations at its top were forward declarations that
+    existed only to give the occupancy query a function pointer. There was no
+    device code in it to keep. Under the JIT the plan is Rust's job, and the
+    file is now gone rather than guarded; see "What was deleted" above.
+  * `attention/default_prefill_params.cuh` loses its six `__host__`
+    constructors, and `page.cuh` and `fastdiv.cuh` theirs, for the reason
+    above: NVRTC rejects the *declaration*, not just the body. The structs and
+    their `__host__ __device__` accessors -- which is what a kernel reads out
+    of `__grid_constant__` -- are untouched, and the fields are filled from
+    Rust.
+
+### What is NOT FlashInfer's, and no longer sits next to it
+
+The six small headers PIE wrote to stand in for names NVRTC does not ship --
+
+    cstdint, type_traits, cuda.h, cuda_runtime.h, bit,
+    boost/math/ccmath/fabs.hpp
+
+-- used to share a directory with the FlashInfer text, which made this a
+paragraph about disambiguation. They are now in `shim/`, a directory that
+holds nothing else and whose README states the rule, so the disambiguation is
+structural and this paragraph is only history -- `bit` and
+`boost/math/ccmath/fabs.hpp` have since been retired, so four of the six
+named above are live. `shim/README.md` is the register, and it records
+each addition and retirement rather than restating a total -- which is why
+no count of the directory appears here either.
+
+They are named after the headers they stand in for because an `#include`
+resolves against a header set by exact spelling -- this crate has no include
+path on disk, so the spelling in the directive *is* the identity of the
+header. Each one exists because guarding its include was tried and measured to
+break device code, and each says so in its own banner. In particular
+`boost/math/ccmath/fabs.hpp` contained no Boost code and was not derived from
+Boost: it was a one-line constexpr absolute value under a name FlashInfer
+asks for, and it is written in the past tense because its only asker,
+`fp16.h`, is deleted and it went with it.
+
+### Where it lives, and why it moved
+
+`kernels/flashinfer/`, subtree shape exactly as upstream ships it, plus
+`LICENSE` and `MODIFICATIONS` at its root. It was `csrc/vendor/flashinfer/`,
+then `csrc/src/attn/flashinfer/`.
+
+The first move is the point, not a side effect: this crate compiles every
+kernel through NVRTC, so its device tree is device text and nothing else, and
+a directory called `vendor` said the opposite -- that the text was a guest
+with its own rules. It is not a guest. It is compiled by the same JIT, guarded
+by the same markers, and tested by the same tests as everything beside it.
+
+The second move took it out from under `attn/`, and that is a correction
+rather than a preference: `flashinfer/comm/` holds the two all-reduce headers
+that are `kernels_cuda::collective`'s NVRTC root, and an all-reduce is not
+attention. Under `attn/` the path made a claim about the text that two of its
+files contradicted. At `kernels/flashinfer/` it makes none -- the directory
+says what the text IS and not which of our families happens to use it, which
+is also why there is no `vendor/` around it to patrol. Provenance is carried
+by the name, by the banner in every file, by `LICENSE` and by this document;
+none of those needs a boundary.
+
+**Not one byte of the twenty-nine changed in the move** -- all 28 source files
+as the tree then stood, and `LICENSE`, zero changed lines each; only
+`MODIFICATIONS`, which is PIE's
+own file, was edited, to record the new path. The subtree shape is what makes
+that true: upstream's files include each other relatively (`"../cp_async.cuh"`,
+`"mask.cuh"`) and a relative spelling survives a move that carries the whole
+tree. Four of those 28 were deleted afterwards and for an unrelated reason;
+that is "What was deleted" above, not part of the move.
+
+Seventeen `#include` directives changed across the whole internalisation, and
+the split is worth stating because only one half of it touches upstream text:
+**twelve in PIE's own files** -- ten `<flashinfer/attention/…>` and two
+`<xqa/…>`, which is where an angled, tree-rooted spelling lived -- and **five
+inside the XQA files themselves**, which had already been made tree-relative
+for an unrelated reason (see the XQA section below) and simply gained the new
+prefix. No FlashInfer file contains a changed directive.
+
+
+XQA (NVIDIA), via FlashInfer -- NO LONGER REDISTRIBUTED
+-------------------------------------------------------
+
+    Directory:  kernels/xqa/                           DELETED
+    Licence:    Apache License 2.0
+    Copyright:  SPDX-FileCopyrightText: Copyright (c) 2023-2025 and
+                2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This entry is kept as a record, not as an attribution: nothing under
+`kernels/xqa/` is redistributed by this crate any more. Fourteen files and
+6,977 lines went, together with `kernels/xqa/LICENSE`, the three PIE files
+that were the only things reaching them -- `attn/attention_xqa.cuh`,
+`attn/attention_xqa_mha.cuh` and their two `CONFIGURED` rows -- and the Rust
+lattice above them, `src/attn/xqa.rs`.
+
+They went for the reason the FP16 header went: measured, not assumed. The
+XQA lattice's whole Rust surface -- `XqaVariant`, `XqaIoHead`, `XQA_ROOTS`,
+`decode_supported` -- had ZERO readers outside its own file, and the twelve
+`XqaIoHead` variants were constructed nowhere at all. `pub` is not
+reachability, and `dead_code` does not fire on a `pub` item in a lib crate,
+so the compiler had nothing to say about 476 lines of Rust holding 7,733
+lines of vendored CUDA past the reachability guard. The guard passed because
+the guard checked whether a file was NAMED, and a `Root::new` literal that
+nothing reads still names one. `tests/every_source_is_reached.rs` gained a
+fourth test, at entry-point granularity, for exactly that gap.
+
+`kernels/flashinfer/MODIFICATIONS` still describes the XQA half of the
+internalisation in its own voice. It is FlashInfer's changelog, it records
+what was true when it was written, and a changelog that quietly loses its
+deleted entries is worth less than one that keeps them; the "Where it lives"
+section below has the same shape and the same reason.
+
+
+FP16 (Marat Dukhan / AMD), via FlashInfer -- NO LONGER REDISTRIBUTED
+--------------------------------------------------------------------
+
+    File:       kernels/flashinfer/fp16.h              DELETED
+    Licence:    MIT
+    Copyright:  SPDX-FileCopyrightText: 2017-2024 Marat Dukhan
+                SPDX-FileCopyrightText: 2025 Advanced Micro Devices, Inc.
+
+This entry is kept as a record, not as an attribution: the file is gone and
+nothing under MIT is redistributed by this crate any more. It was carried
+because the closure walk reached it -- `attention/prefill.cuh` included it
+under `FP16_QK_REDUCTION_SUPPORTED` -- and it was deleted when that guard was
+measured to be one no compile takes, and one that could not help if it did:
+PIE's `DTypeQ` is `bf16`, and the fp16 QK accumulator it feeds is selected
+only for `half`. `MODIFICATIONS` carries the measurement under AND A FIFTH
+FILE WENT. The two shims that existed for it, `shim/bit` and
+`shim/boost/math/ccmath/fabs.hpp`, went with it and were PIE's own, so
+their going changes nothing this notice has to declare.
+
+
+CCCL, NVIDIA CUDA headers
+-------------------------
+
+Neither is carried, and that is the point of `shim/`. No toolkit text is
+in this crate's binary and none is redistributed: every file under `shim/`
+is written here, and nothing was copied out of `$CUDA_HOME` or out of a CCCL
+checkout to get there.
+
+Two probes used to check that claim by READING the real headers at run time,
+to separate "is this source acceptable to NVRTC" from "is our shim correct".
+`examples/flashinfer_probe.rs` read FlashInfer's own CCCL checkout and went at
+`1a08b179a` with sixteen other examples; `examples/halftype_parity.rs` opened
+NVIDIA's `cuda_fp16.h` and `cuda_bf16.h` from `$CUDA_HOME`, and went with the
+rest of `examples/`. Neither ever carried what it read -- a probe compares, it
+does not copy -- so their going changes nothing this notice has to declare. It
+does mean the paragraph above is now stated rather than measured, which is
+worth saying plainly: nothing carried has a `cccl` or `cutlass` path, and
+`shim/` holds no file under either, but no probe re-checks that per run.
+
+
+The LICENSE file
+----------------
+
+`kernels/flashinfer/LICENSE` is the stock Apache License 2.0 text, 230 lines,
+as upstream ships it. It is the licence *of its own directory*, because a
+rebase replaces a directory and not a crate -- which is why there were two of
+these while `kernels/xqa/` was carried, byte-identical to this one and kept
+separate anyway. That one went with its directory; this one stays with its
+own. It may not be renamed: the carried header set is walked from disk by
+`build.rs`, which excludes a file by NAME (`LICENSE`, `MODIFICATIONS`,
+`README.md`), so a rename would put 12 KB of Apache-2.0 into the text NVRTC
+copies per compile. The name stays plain so that "not device text" stays
+obvious.

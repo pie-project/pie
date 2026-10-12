@@ -1,0 +1,95 @@
+//===-- array - `std::array<T, N>`, because a `__global__`'s parameter is one -===//
+//
+// One class template, and it is here because it appears in the SIGNATURE of a
+// kernel this crate launches rather than anywhere in its body.
+//
+// # The site
+//
+// `flashinfer/comm/trtllm_allreduce_fusion.cuh`:
+//
+// ```
+//   template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc>
+//   __global__ void allreduce_fusion_kernel_twoshot_sync(
+//       AllReduceFusionParams<T> params,
+//       std::array<int, NRanks> begin_tokens,
+//       std::array<int, NRanks> token_num_per_ranks);
+// ```
+//
+// Two by-value parameters of the two-shot leaf of the fused all-reduce. The
+// body reads `begin_tokens[r]` and `token_num_per_ranks[r]` and nothing else.
+//
+// **Upstream never includes `<array>` in that file.** It reaches the name
+// transitively: `#include <tuple>` at `:11`, and libstdc++'s `<tuple>` pulls
+// in `<array>` for the `tuple_size`/`tuple_element` specialisations. The
+// carried set matches the literal string in a directive and has no `tuple`,
+// so that route does not exist here; the vendored file names this header
+// directly under a `// PIE:` marker that records the substitution.
+//
+// # Why the LAYOUT is the contract and the members are not
+//
+// This is the first shim in this directory whose type crosses the host/device
+// boundary as DATA. Everything else here answers a name inside a compile;
+// `std::array<int, NRanks>` is marshalled by
+// `kernels_cuda::comm`'s launcher into `cuLaunchKernelEx`'s parameter buffer,
+// so what has to be right is `sizeof` and the offset of element `i` --
+// exactly `N * sizeof(T)` and `i * sizeof(T)`, with the alignment of `T`.
+//
+// A `T[N]` member and nothing else is that layout, and it is also what every
+// real implementation uses: the standard requires `std::array` to be an
+// aggregate whose elements are contiguous, so `sizeof(array<int,2>) == 8` and
+// `alignof == 4` are not this file's choices. The empty-array case
+// (`N == 0`), where implementations differ, is unreachable: `NRanks` is 2, 4,
+// 8 or 16 (`comm::NRANKS`) and no other instantiation exists.
+//
+// # What is deliberately NOT here
+//
+//   * **`begin`/`end`/`data`/`fill`/`swap`/`front`/`back`/`at`, the
+//     comparison operators, `tuple_size`, `tuple_element`, `get<I>`, the
+//     reverse iterators, the deduction guide.** Zero uses across the carried
+//     set: the two askers subscript and nothing else. A missing member is a
+//     hard error naming the member under the carried set, which is the trade
+//     `csrc/shim/README.md` states -- a missing name costs one compile, a
+//     wrong name costs a bisect.
+//   * **`at()`'s bounds check.** It throws `std::out_of_range`, and there is
+//     no `throw` in device code.
+//   * **`std::array`'s aggregate-initialisation syntax being exercised.** The
+//     `T elems[N]` member is public and unnamed-in-practice, so
+//     `std::array<int,2> a{{1, 2}}` and `a{1, 2}` both work as they do
+//     upstream; nothing in the carried set writes either, and the Rust side
+//     builds these two arrays as a `#[repr(C)] [i32; N]` blob rather than
+//     through C++ at all.
+//
+// # `size()` is here and `size` is not
+//
+// `size()` is `constexpr` and returns `N`. It costs one line and it is the
+// one member somebody adding a second asker is likely to reach for first. It
+// has no caller in the carried set today; it is the one deliberate exception
+// to the rule two paragraphs up, and saying so is cheaper than pretending it
+// was measured.
+//
+//===----------------------------------------------------------------------===//
+#pragma once
+
+#include <cstddef>
+
+namespace std {
+
+/// A fixed-size contiguous sequence. An aggregate, with a public array
+/// member, because that member IS the ABI -- see the banner.
+template <class T, ::std::size_t N>
+struct array {
+    /// The elements. Public and first, so the class is standard-layout and
+    /// `offsetof(array, elems) == 0`.
+    T elems[N];
+
+    /// Element `i`, unchecked. The only member the carried set reads.
+    __host__ __device__ constexpr T& operator[](::std::size_t i) { return elems[i]; }
+
+    /// Element `i` of a `const` array.
+    __host__ __device__ constexpr const T& operator[](::std::size_t i) const { return elems[i]; }
+
+    /// `N`. No caller in the carried set; see the banner's last section.
+    __host__ __device__ constexpr ::std::size_t size() const { return N; }
+};
+
+}  // namespace std

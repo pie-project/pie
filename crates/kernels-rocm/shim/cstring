@@ -1,0 +1,74 @@
+//===-- cstring - `std::memcpy`, for the one thing device code uses it ---===//
+//
+// `#include <cstring>`, answered, with a byte loop. Everything about that
+// sentence sounds wrong and none of it is; see "Why a loop" below.
+//
+// # Measured, not assumed — and it exposed a missing include
+//
+// `csrc/src/attn/attention_mla_naive.cuh:341` packs two `__nv_bfloat16` into
+// a `uint32_t` for the `mma.sync` operand registers, and does it the only way
+// that is not a strict-aliasing violation:
+//
+// ```text
+// attention_mla_naive.cuh:343   std::memcpy(&l, &lo, 2);
+// attention_mla_naive.cuh:344   std::memcpy(&h, &hi, 2);
+// ```
+//
+// **The file never included `<cstring>`.** Under nvcc it compiled anyway,
+// because `<cuda_runtime.h>` drags the host `<cstring>` in transitively and a
+// host translation unit has it. Under NVRTC the same text is:
+//
+// ```text
+// probe: NVRTC 13.0, sm_89, toolkit headers on the path
+//   attention_mla_naive.cuh(236): error: namespace "std" has no member "memcpy"
+//   attention_mla_naive.cuh(237): error: namespace "std" has no member "memcpy"
+//   2 errors detected
+// ```
+//
+// — and note WHERE that came from: those two errors survived a probe that had
+// `/usr/local/cuda/include` on the path, so no include path could have fixed
+// them. The repair is one `#include <cstring>` in the device text plus this
+// file, and the transitive dependency is the finding: the include set nvcc
+// accepted was never the include set the file DECLARED, and a JIT is what
+// tells you the difference.
+//
+// # Why a loop, and why that is not slower than the toolkit
+//
+// There is no device `memcpy` to forward to. What the toolkit gives a host TU
+// is a libc symbol; what nvcc gives device code is a compiler builtin it
+// expands. NVRTC does neither, so the shim has to be a definition, and the
+// definition has to be one the optimiser can see through.
+//
+// It can. The measurement is the same one `csrc/shim/cuda_pipeline.h` records
+// and is why it is worth having: the device half of `attention_mla_naive.cuh`
+// compiled with this file, and again with the toolkit's headers answering
+// everything else, produced **byte-identical PTX** — 117 621 bytes, register
+// allocation included. Both call sites are `n == 2` at a constant address, the
+// loop unrolls to two `ld.u8`/`st.u8` pairs and then folds, and the result is
+// the same `prmt`/`shl` sequence in both builds. A loop that the optimiser
+// removes is not a slow `memcpy`; it is the same `memcpy` written where NVRTC
+// can find it.
+//
+// # What is NOT here
+//
+// `memset`, `memmove`, `strlen` and the rest. `csrc/shim/cstdint`'s rule: a
+// shim answers what a real include reached for and a probe showed failing,
+// and nothing else. `memmove` in particular must not be added by copying the
+// loop below — overlapping ranges need the descending copy and a shim that
+// looked right and was not would be worse than an unresolved symbol.
+//
+//===----------------------------------------------------------------------===//
+#pragma once
+
+namespace std {
+
+__device__ __forceinline__ void* memcpy(void* dst, const void* src, unsigned long n) {
+    char* d = static_cast<char*>(dst);
+    const char* s = static_cast<const char*>(src);
+    for (unsigned long i = 0; i < n; ++i) {
+        d[i] = s[i];
+    }
+    return dst;
+}
+
+}  // namespace std

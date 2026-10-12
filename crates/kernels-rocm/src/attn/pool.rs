@@ -1,0 +1,336 @@
+use crate::error::Error;
+use dtype::Dtype;
+
+use crate::attn::kv;
+use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, nonzero, refuse};
+use crate::tensor::{KvPool, RaggedTensor, Tensor};
+
+const FILE: &str = "attn/pool.cuh";
+
+const META_BLOCK: u32 = 128;
+
+const ATTN_BLOCK: u32 = 128;
+
+const WARP: u32 = 32;
+
+fn route_rows(rows: u32, width: u32) -> Launch {
+    const MAX_BLOCK: u32 = 1024;
+
+    Launch::per_row(
+        rows,
+        width
+            .div_ceil(WARP)
+            .max(1)
+            .saturating_mul(WARP)
+            .min(MAX_BLOCK),
+    )
+}
+
+const fn compressor_coff(ratio: i32) -> i32 {
+    if ratio == 4 { 2 } else { 1 }
+}
+
+fn pooling_ratio(op: &'static str, ratio: u32) -> Result<i32, Error> {
+    count(op, "the pooling ratio this statement states", ratio)
+}
+
+fn boundary_rope_table(op: &'static str, boundary_pos: &Tensor, boundary_rope: &Tensor) {
+    debug_assert_eq!(
+        boundary_rope.dtype,
+        Dtype::I32,
+        "`{op}` writes i32 compressed-row rope positions"
+    );
+    debug_assert_eq!(
+        boundary_pos.rows, boundary_rope.rows,
+        "`{op}`'s rope column is one entry per token row"
+    );
+}
+
+fn boundary_tables(op: &'static str, boundary_pos: &Tensor, boundary_req: &Tensor) {
+    debug_assert_eq!(
+        boundary_pos.dtype,
+        Dtype::I32,
+        "`{op}` reads i32 boundary positions"
+    );
+    debug_assert_eq!(
+        boundary_req.dtype,
+        Dtype::I32,
+        "`{op}` reads i32 boundary requests"
+    );
+    debug_assert_eq!(
+        boundary_pos.rows, boundary_req.rows,
+        "`{op}`'s boundary tables are one entry per token row"
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn boundary_decode(
+    ctx: &Ctx,
+    positions: Tensor,
+    row_valid: Tensor,
+    ratio: u32,
+    boundary_pos: &mut Tensor,
+    boundary_req: &mut Tensor,
+    boundary_rope: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.pool_boundary_decode";
+    boundary_tables(OP, boundary_pos, boundary_req);
+    boundary_rope_table(OP, boundary_pos, boundary_rope);
+    let ratio = pooling_ratio(OP, ratio)?;
+    let rows = count(OP, "rows", boundary_pos.rows)?;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::attn::pool_boundary_decode<::pie::i32>")
+            .apply(Launch::flat(boundary_pos.rows, META_BLOCK)),
+        &[
+            positions.arg(),
+            boundary_pos.arg(),
+            boundary_req.arg(),
+            boundary_rope.arg(),
+            rows.arg(),
+            ratio.arg(),
+            row_valid.arg(),
+        ],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn boundary_prefill(
+    ctx: &Ctx,
+    positions: RaggedTensor,
+    row_valid: Tensor,
+    ratio: u32,
+    boundary_pos: &mut Tensor,
+    boundary_req: &mut Tensor,
+    boundary_rope: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.pool_boundary_prefill";
+    boundary_tables(OP, boundary_pos, boundary_req);
+    boundary_rope_table(OP, boundary_pos, boundary_rope);
+    let ratio = pooling_ratio(OP, ratio)?;
+    let rows = count(OP, "rows", boundary_pos.rows)?;
+    let num_requests = kv::lanes_of(OP, positions.indptr)?;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::attn::pool_boundary_prefill<::pie::i32>")
+            .apply(Launch::flat(boundary_pos.rows, META_BLOCK)),
+        &[
+            positions.data.arg(),
+            positions.indptr.arg(),
+            boundary_pos.arg(),
+            boundary_req.arg(),
+            boundary_rope.arg(),
+            rows.arg(),
+            num_requests.arg(),
+            ratio.arg(),
+            row_valid.arg(),
+        ],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn state_write(
+    ctx: &Ctx,
+    kv: Tensor,
+    score: Tensor,
+    pages: &KvPool,
+    write_page: Tensor,
+    write_offset: Tensor,
+    head_dim: u32,
+    ratio: u32,
+    state_kv: Tensor,
+    state_score: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.pool_state_write";
+    dtype_dispatch!(OP, kv.dtype, { Bf16 => () });
+    let ratio = pooling_ratio(OP, ratio)?;
+    let head_dim = count(OP, "the head width this compressor states", head_dim)?;
+    let width = count(OP, "the compressor's row width", kv.width)?;
+    if (width != head_dim && width != 2 * head_dim) || score.width != kv.width {
+        return Err(refuse(
+            OP,
+            format!(
+                "a ratio-{ratio:?} compressor projects head width {head_dim} or twice it; \
+                 the pair handed over is {} and {}",
+                kv.width, score.width
+            ),
+        ));
+    }
+    let pitch = count(OP, "the state plane's row pitch", state_kv.width)?;
+    if state_score.width != state_kv.width {
+        return Err(refuse(
+            OP,
+            "the two state slabs are one plane laid at one pitch",
+        ));
+    }
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::attn::pool_state_write<::pie::bf16>")
+            .apply(route_rows(kv.rows, width.unsigned_abs())),
+        &[
+            kv.arg(),
+            score.arg(),
+            state_kv.arg(),
+            state_score.arg(),
+            write_page.arg(),
+            write_offset.arg(),
+            width.arg(),
+            pages.page_size.arg(),
+            pitch.arg(),
+        ],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gather(
+    ctx: &Ctx,
+    boundary_pos: Tensor,
+    boundary_req: Tensor,
+    pages: &KvPool,
+    head_dim: u32,
+    ratio: u32,
+    state_kv: Tensor,
+    state_score: Tensor,
+    ape: Tensor,
+    entries: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.pool_gather";
+    dtype_dispatch!(OP, entries.dtype, { Bf16 => () });
+    boundary_tables(OP, &boundary_pos, &boundary_req);
+    if entries.width != head_dim {
+        return Err(refuse(
+            OP,
+            format!(
+                "the stated head width {head_dim} is not the {}-wide entry it sized",
+                entries.width
+            ),
+        ));
+    }
+    let ratio = pooling_ratio(OP, ratio)?;
+    let head_dim = count(OP, "the head width this gather states", head_dim)?;
+    let coff = if ape.is_absent() {
+        compressor_coff(ratio)
+    } else {
+        match count(OP, "the ape's row width", ape.width)? {
+            w if w == head_dim => 1,
+            w if w == 2 * head_dim => 2,
+            w => {
+                return Err(refuse(
+                    OP,
+                    format!("an ape {w} wide is neither one head width ({head_dim}) nor two"),
+                ));
+            }
+        }
+    };
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::attn::pool_gather_paged<::pie::bf16>")
+            .apply(route_rows(boundary_pos.rows, head_dim.unsigned_abs())),
+        &[
+            state_kv.arg(),
+            state_score.arg(),
+            ape.arg(),
+            boundary_pos.arg(),
+            boundary_req.arg(),
+            pages.page_indices.arg(),
+            pages.page_indptr.arg(),
+            entries.arg(),
+            head_dim.arg(),
+            ratio.arg(),
+            coff.arg(),
+            pages.page_size.arg(),
+            count(OP, "the state plane's row pitch", state_kv.width)?.arg(),
+        ],
+    )
+}
+
+pub fn kv_append(
+    ctx: &Ctx,
+    entries: Tensor,
+    boundary_pos: Tensor,
+    boundary_req: Tensor,
+    pool: &KvPool,
+    write_page: Tensor,
+    write_offset: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.pool_kv_append";
+    let _ = (write_page, write_offset);
+    dtype_dispatch!(OP, entries.dtype, { Bf16 => () });
+    boundary_tables(OP, &boundary_pos, &boundary_req);
+    let head_dim = count(OP, "the pooled entry's width", entries.width)?;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::attn::pool_store_entries<::pie::bf16>")
+            .apply(route_rows(entries.rows, entries.width)),
+        &[
+            entries.arg(),
+            pool.keys.arg(),
+            boundary_pos.arg(),
+            boundary_req.arg(),
+            pool.page_indices.arg(),
+            pool.page_indptr.arg(),
+            head_dim.arg(),
+            pool.page_size.arg(),
+        ],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn attention_lse(
+    ctx: &Ctx,
+    q: Tensor,
+    positions: Tensor,
+    request_of_token: Tensor,
+    entries: &KvPool,
+    ratio: u32,
+    heads: u32,
+    head_dim: u32,
+    sm_scale: f32,
+    o: &mut Tensor,
+    lse: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.pool_lse";
+    dtype_dispatch!(OP, q.dtype, { Bf16 => () });
+    debug_assert_eq!(
+        lse.dtype,
+        Dtype::F32,
+        "`{OP}` lands an f32 log-sum-exp plane"
+    );
+    debug_assert_eq!(
+        request_of_token.dtype,
+        Dtype::I32,
+        "`{OP}` reads an i32 owning request per token"
+    );
+    let ratio = pooling_ratio(OP, ratio)?;
+    let num_q_heads = count(OP, "the head count this attention states", heads)?;
+    let head_dim = count(OP, "the head width this attention states", head_dim)?;
+    nonzero(OP, "rows", o.rows)?;
+
+    let smem = head_dim
+        .unsigned_abs()
+        .saturating_add(ATTN_BLOCK)
+        .saturating_mul(u32::try_from(core::mem::size_of::<f32>()).unwrap_or(4));
+
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::attn::pool_lse_paged").apply(
+            Launch::grid([o.rows, num_q_heads.unsigned_abs(), 1], [ATTN_BLOCK, 1, 1]).smem(smem),
+        ),
+        &[
+            q.arg(),
+            entries.keys.arg(),
+            o.arg(),
+            lse.arg(),
+            positions.arg(),
+            entries.page_indices.arg(),
+            entries.page_indptr.arg(),
+            request_of_token.arg(),
+            num_q_heads.arg(),
+            head_dim.arg(),
+            ratio.arg(),
+            entries.page_size.arg(),
+            sm_scale.arg(),
+            ctx.stage(),
+        ],
+    )
+}

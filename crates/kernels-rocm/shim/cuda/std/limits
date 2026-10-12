@@ -1,0 +1,99 @@
+//===-- cuda/std/limits - the second CCCL door, one specialisation wide --===//
+//
+// `cuda::std::numeric_limits<float>::infinity()`, and nothing else. This is
+// what `#include <cuda/std/limits>` resolves to when the compiler is NVRTC
+// and the include path is a header set carried in the binary.
+//
+// # Why a whole file for one function
+//
+// Because of where the function is. `mla.cuh` reaches for libcu++ at four
+// sites -- lines 716, 731, 780 and 818, every one of them
+// `-cuda::std::numeric_limits<float>::infinity()` as the log-sum-exp of an
+// empty row -- and `<cuda/std/limits>` is a door into CCCL exactly as
+// `<cooperative_groups.h>` is. Behind it on this box is
+// `/usr/local/cuda-13.0/targets/x86_64-linux/include/cccl`, 13,691,725 bytes
+// across 1691 files, none of which can be handed to NVRTC without reading
+// `$CUDA_HOME` at build time and giving up this crate's toolkit-free build.
+//
+// `examples/header_probe.rs` measured the alternative on this box (L40S,
+// NVRTC 13.0): with an empty header set, `<cuda/std/limits>` fails with
+// *"could not open source file ... (no directories in search list)"*, the
+// same refusal `<cooperative_groups.h>` gets. There is no version of this
+// where NVRTC finds libcu++ by itself.
+//
+// # The name is the trick, again
+//
+// The file has no extension and a directory in its path because the
+// directive does: `mla.cuh:21` says `#include <cuda/std/limits>`, NVRTC
+// matches `includeNames[]` against that literal string, and so the entry --
+// and, so that one file is one spelling, the path on disk -- is
+// `cuda/std/limits`. Nothing here is a directory NVRTC walks; the nesting is
+// part of a name. See `cooperative_groups.h` in this tree for the rest of the
+// argument, which is the same argument.
+//
+// # The specialisation list is the measurement, not the standard's surface
+//
+// A `<limits>` is a hundred-odd members across a dozen types, and every one
+// of them is a promise about a format. This is not that file and must not
+// grow into one -- a second standard library is a second set of constants to
+// disagree with the first. What is here is what was measured in FlashInfer
+// 0.6.15, which is `infinity()`, on `float`, at twenty-six sites tree-wide
+// and four in the attention closure.
+//
+// Measured and deliberately absent:
+//
+//   * **`max()`, `lowest()`, `min()`, `denorm_min()`, `is_specialized`** and
+//     the rest of the members: not read anywhere in the tree. The device code
+//     that wants a finite bound spells it `math::inf` or a bit pattern.
+//   * **`epsilon()`**: exactly one site, `sampling.cuh:673`, which is not in
+//     the attention closure -- and which needs more than a line, because it
+//     reads `constexpr float kSCALE = 1.0f - ...::epsilon();`. A `constexpr`
+//     member cannot be the `__int_as_float` below, so adding it means a
+//     decimal literal and a comment about what it rounds to. That is a
+//     decision for the day `sampling.cuh` enters the set, made with the call
+//     site in view.
+//   * **`half` and `__nv_bfloat16`**: the tree does instantiate
+//     `numeric_limits<DType>::infinity()` at six sites, but every one that
+//     the closure reaches resolves to `float`. Specialising the NVIDIA
+//     spellings would require `cuda_fp16.h`/`cuda_bf16.h` to be IN the set --
+//     they are not, and whether they ever are is a vendoring decision behind
+//     a feature flag rather than something this file gets to assume. The
+//     crate's own `bf16`/`f16` from `pie_device.cuh` are not an answer
+//     either: a header in the set must not include the prelude, because a
+//     diamond the includer did not ask for is exactly what the set exists to
+//     avoid, and FlashInfer has never heard of `pie_cuda_driver`.
+//
+// The primary template is DECLARED and not defined, which is the same shape
+// `pie_device.cuh` gives `Elem<T>` and for the same reason: a type with no
+// specialisation here fails to compile, naming the type, instead of silently
+// picking up some default that is right for one format and wrong for the
+// next.
+//
+//===----------------------------------------------------------------------===//
+#pragma once
+
+// Includes nothing, like everything else in this set. `__int_as_float` is an
+// NVRTC builtin, not a header's.
+
+namespace cuda::std {
+
+/// Declared, never defined. `numeric_limits<double>` is a compile error that
+/// says so, rather than a set of `float` constants wearing a `double`'s name.
+template <class T>
+struct numeric_limits;
+
+/// `float`, the one format the closure asks about.
+template <>
+struct numeric_limits<float> {
+    /// `+inf`, as the bit pattern rather than a decimal, for the reason
+    /// `pie_device.cuh`'s `pos_inf` gives: a literal has to round back to the
+    /// value it names and this cannot.
+    ///
+    /// `__device__` rather than `constexpr`, because the four call sites that
+    /// were measured are all run-time assignments and a `constexpr` version
+    /// cannot be written this way. If a `constexpr` context ever needs one,
+    /// it will say so at compile time -- which is the right way round.
+    static __device__ __forceinline__ float infinity() { return __int_as_float(0x7f800000u); }
+};
+
+}  // namespace cuda::std

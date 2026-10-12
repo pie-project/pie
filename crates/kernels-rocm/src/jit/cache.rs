@@ -1,0 +1,227 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+
+use crate::hip::sys;
+use crate::jit::{Fault, Root, hiprtc};
+
+pub struct Resolved {
+    #[allow(dead_code)]
+    module: sys::Module,
+    pub function: sys::Function,
+}
+
+unsafe impl Send for Resolved {}
+
+unsafe impl Sync for Resolved {}
+
+type Slot = OnceLock<Result<Resolved, Fault>>;
+
+fn slot(key: &str) -> &'static Slot {
+    static SLOTS: OnceLock<Mutex<HashMap<String, &'static Slot>>> = OnceLock::new();
+    let mut map = SLOTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(found) = map.get(key) {
+        return found;
+    }
+
+    let fresh: &'static Slot = Box::leak(Box::new(OnceLock::new()));
+    map.insert(key.to_owned(), fresh);
+    fresh
+}
+
+pub(crate) fn resolve(root: &Root, instantiation: &str) -> Result<&'static Resolved, Fault> {
+    let api = api("hipGetDevice")?;
+    let mut ordinal: i32 = 0;
+    let code = unsafe { (api.hip.hipGetDevice)(&raw mut ordinal) };
+    if code != sys::HIP_SUCCESS {
+        return Err(Fault::Device {
+            call: "hipGetDevice",
+            code,
+        });
+    }
+    let arch = arch(ordinal).ok_or(Fault::Device {
+        call: "hipGetDeviceProperties",
+        code: -1,
+    })?;
+    let key = format!("{}/rtc{}", root.key(instantiation, arch), hiprtc::version()?);
+    slot(&format!("hip:{ordinal}|{key}"))
+        .get_or_init(|| load(root, instantiation, &key, arch))
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+fn load(root: &Root, instantiation: &str, key: &str, arch: &str) -> Result<Resolved, Fault> {
+    let started = std::time::Instant::now();
+    let (image, mangled, compiled) = match read_disk(key) {
+        Some(hit) => (hit.0, hit.1, false),
+        None => {
+            let built = hiprtc::compile_text(&hiprtc::Job {
+                name: root.name,
+                source: root.text.to_owned(),
+                arch,
+                options: root.options,
+                headers: root.header_set(),
+                floor: root.floor,
+                wanted: std::slice::from_ref(&instantiation.to_owned()),
+            })?;
+            if !built.log.trim().is_empty() {
+                tracing::warn!(
+                    root = root.name,
+                    instantiation,
+                    arch,
+                    log = %built.log,
+                    "a device instantiation compiled with something to say"
+                );
+            }
+            let mangled = built
+                .lowered
+                .into_iter()
+                .next()
+                .ok_or_else(|| Fault::Compile {
+                    unit: root.name,
+                    log: format!("`{instantiation}` compiled and hiprtc named nothing for it"),
+                })?;
+            write_disk(key, &built.code, &mangled);
+            (built.code, mangled, true)
+        }
+    };
+
+    let module = load_image(root.name, &image)?;
+    let function = entry_by_name(root.name, module, instantiation, &mangled).inspect_err(|_| {
+        if let Ok(api) = sys::api() {
+            unsafe { (api.hip.hipModuleUnload)(module) };
+        }
+    })?;
+    tracing::info!(
+        root = root.name,
+        instantiation,
+        arch,
+        compiled,
+        ms = started.elapsed().as_secs_f64() * 1e3,
+        "resolved a device instantiation"
+    );
+    Ok(Resolved { module, function })
+}
+
+fn api(call: &'static str) -> Result<&'static sys::Api, Fault> {
+    sys::api().map_err(|_| Fault::Device { call, code: -1 })
+}
+
+fn load_image(root: &'static str, image: &[u8]) -> Result<sys::Module, Fault> {
+    if image.is_empty() {
+        return Err(Fault::Compile {
+            unit: root,
+            log: "the compile produced an empty image, so there is nothing to load".into(),
+        });
+    }
+    let api = api("hipModuleLoadData")?;
+    let mut module: sys::Module = std::ptr::null_mut();
+
+    let code = unsafe { (api.hip.hipModuleLoadData)(&raw mut module, image.as_ptr().cast()) };
+    if code == sys::HIP_SUCCESS {
+        Ok(module)
+    } else {
+        Err(Fault::Device {
+            call: "hipModuleLoadData",
+            code,
+        })
+    }
+}
+
+/// `hipErrorNotFound`.
+const NOT_FOUND: sys::HipError = 500;
+
+fn entry_by_name(
+    root: &'static str,
+    module: sys::Module,
+    instantiation: &str,
+    mangled: &str,
+) -> Result<sys::Function, Fault> {
+    let Ok(c_name) = std::ffi::CString::new(mangled) else {
+        return Err(Fault::Compile {
+            unit: root,
+            log: format!("the lowered name for `{instantiation}` contains a NUL"),
+        });
+    };
+    let api = api("hipModuleGetFunction")?;
+    let mut function: sys::Function = std::ptr::null_mut();
+
+    let code = unsafe { (api.hip.hipModuleGetFunction)(&raw mut function, module, c_name.as_ptr()) };
+    match code {
+        sys::HIP_SUCCESS => Ok(function),
+        NOT_FOUND => Err(Fault::Compile {
+            unit: root,
+            log: format!("`{instantiation}` compiled and is not in the image"),
+        }),
+        other => Err(Fault::Device {
+            call: "hipModuleGetFunction",
+            code: other,
+        }),
+    }
+}
+
+fn disk_path(key: &str) -> Option<PathBuf> {
+    let digest = crate::source::fnv1a64(key.as_bytes());
+    Some(crate::disk::dir(crate::disk::CODE_OBJECTS)?.join(format!("{digest:016x}.hsaco")))
+}
+
+fn read_disk(key: &str) -> Option<(Vec<u8>, String)> {
+    let bytes = std::fs::read(disk_path(key)?).ok()?;
+    let (stored_key, rest) = take_str(&bytes)?;
+    if stored_key != key {
+        return None;
+    }
+    let (mangled, image) = take_str(rest)?;
+    Some((image.to_vec(), mangled.to_owned()))
+}
+
+fn take_str(bytes: &[u8]) -> Option<(&str, &[u8])> {
+    let (len, rest) = bytes.split_at_checked(4)?;
+    let len = u32::from_le_bytes(len.try_into().ok()?) as usize;
+    let (text, rest) = rest.split_at_checked(len)?;
+    Some((std::str::from_utf8(text).ok()?, rest))
+}
+
+fn write_disk(key: &str, image: &[u8], mangled: &str) {
+    let Some(path) = disk_path(key) else { return };
+    let Some(parent) = path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let mut out = Vec::with_capacity(image.len() + mangled.len() + key.len() + 8);
+    put_str(&mut out, key);
+    put_str(&mut out, mangled);
+    out.extend_from_slice(image);
+
+    let staging = path.with_extension(format!("hsaco.{}", std::process::id()));
+    if std::fs::write(&staging, &out).is_ok() && std::fs::rename(&staging, &path).is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+}
+
+fn put_str(out: &mut Vec<u8>, text: &str) {
+    let len = u32::try_from(text.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&text.as_bytes()[..len as usize]);
+}
+
+/// The device's architecture, read once per ordinal: `gfx942` on MI300.
+/// `PIE_ROCM_ARCH` overrides it, for a device whose name hiprtc does not
+/// know yet.
+#[must_use]
+pub fn arch(ordinal: i32) -> Option<&'static str> {
+    static ARCHES: OnceLock<Mutex<HashMap<i32, Option<&'static str>>>> = OnceLock::new();
+    let mut map = ARCHES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *map.entry(ordinal).or_insert_with(|| {
+        let name = std::env::var("PIE_ROCM_ARCH")
+            .ok()
+            .or_else(|| crate::jit::device::arch_name(ordinal))?;
+        Some(Box::leak(name.into_boxed_str()))
+    })
+}
