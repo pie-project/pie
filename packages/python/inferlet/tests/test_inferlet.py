@@ -250,6 +250,9 @@ class TestChatFillers:
         assert chat.user("u")[0] == 3
         assert chat.assistant("a")[0] == 5
         assert chat.cue() == [6]
+        assert chat.cue_without_thinking() == [6, 7]
+        assert chat.cue_thinking(True) == chat.cue()
+        assert chat.cue_thinking(False) == chat.cue_without_thinking()
         assert chat.seal() == [7]
         assert chat.stop_tokens() == [8, 9]
         assert isinstance(chat.system("s"), list)

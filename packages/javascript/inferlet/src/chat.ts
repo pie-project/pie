@@ -58,6 +58,20 @@ export function cue(): Uint32Array {
   return _chat.cue();
 }
 
+/**
+ * `cue` for a turn the model answers without thinking: an empty thinking
+ * block where the model has one, as its template renders
+ * `enable_thinking: false`.
+ */
+export function cueWithoutThinking(): Uint32Array {
+  return _chat.cueWithoutThinking();
+}
+
+/** `cue`, or `cueWithoutThinking` when `think` is false. */
+export function cueThinking(think: boolean): Uint32Array {
+  return think ? cue() : cueWithoutThinking();
+}
+
 /** Token sequence that seals the current turn (inserts a stop token). */
 export function seal(): Uint32Array {
   return _chat.seal();

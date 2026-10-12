@@ -60,10 +60,9 @@ export class Image {
    */
   private constructor();
   /**
-  * Encoded still image (PNG / JPEG / …). The host decodes it, then
-  * resizes + patchifies + normalizes exactly as the bound model's image
-  * processor requires (Gemma SigLIP2 vs Qwen smart-resize, etc.). Errors
-  * if the model has no vision front-end or the bytes don't decode.
+  * Encoded still image (PNG / JPEG / …). The host decodes it, frames
+  * it by the package's `frame` and cuts it into patch rows. Errors if
+  * the model reads no stills or the bytes don't decode.
   */
   static fromBytes(bytes: Uint8Array): Image;
   /**

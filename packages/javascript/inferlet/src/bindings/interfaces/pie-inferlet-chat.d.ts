@@ -18,6 +18,12 @@ export function assistant(message: string): Uint32Array;
  */
 export function cue(): Uint32Array;
 /**
+ * `cue` for a turn the model answers without thinking: an empty thinking
+ * block where the model has one, as its template renders
+ * `enable_thinking: false`.
+ */
+export function cueWithoutThinking(): Uint32Array;
+/**
  * Seal the current turn (insert stop token)
  */
 export function seal(): Uint32Array;

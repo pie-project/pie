@@ -73,6 +73,18 @@ def cue() -> list[int]:
     return list(_chat.cue())
 
 
+def cue_without_thinking() -> list[int]:
+    """:func:`cue` for a turn the model answers without thinking: an empty
+    thinking block where the model has one, as its template renders
+    ``enable_thinking: false``."""
+    return list(_chat.cue_without_thinking())
+
+
+def cue_thinking(think: bool) -> list[int]:
+    """:func:`cue`, or :func:`cue_without_thinking` when ``think`` is false."""
+    return cue() if think else cue_without_thinking()
+
+
 def seal() -> list[int]:
     """Token sequence that seals the current turn (inserts a stop token)."""
     return list(_chat.seal())
