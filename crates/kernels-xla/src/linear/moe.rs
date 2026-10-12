@@ -46,7 +46,7 @@ use crate::linear::quant::{
     Codes, code_values, e8m0, grouped_dot, materialize, offset_dot, read_codes,
 };
 use crate::tensor::{Bank, Tensor};
-use crate::tuning::Tuning;
+use crate::tuning::{MoePath, Tuning};
 
 const MXFP4_BLOCK: u32 = 32;
 
@@ -1085,7 +1085,7 @@ fn pick_small(cx: &mut Cx<'_>, table: Val, ids: Val) -> Result<Val, Error> {
 /// scalar code, which cost more than the kernel saved.
 fn gmm_spec(fan: Fan, bank: &Read, elem: Elem, tuning: Tuning) -> Option<crate::mosaic::gmm::Gmm> {
     use crate::mosaic::gmm::{Gmm, Orient};
-    let off = !tuning.moe_gmm && tuning.moe_path != Some("gmm");
+    let off = !tuning.moe_gmm && tuning.moe_path != MoePath::Gmm;
     if off
         || bank.factor.is_some()
         || !matches!(bank.codes, Codes::Weights(_))
@@ -1291,19 +1291,21 @@ fn routed(
     // does not read).
     let grouped = gmm_spec(fan, &bank, cx.elem(bank.codes.val()), tuning);
     let path = match tuning.moe_path {
-        Some("gmm") if grouped.is_none() => "all",
-        Some(path) => path,
-        None if p <= SLICE_PAIRS && p * expert_bytes.max(SLICE_BYTES) < bank_bytes => "slice",
-        None if r8 * e * n * fold > DENSE_ALL => "ragged",
+        MoePath::Gmm if grouped.is_none() => MoePath::All,
+        MoePath::Auto if p <= SLICE_PAIRS && p * expert_bytes.max(SLICE_BYTES) < bank_bytes => {
+            MoePath::Slice
+        }
+        MoePath::Auto if r8 * e * n * fold > DENSE_ALL => MoePath::Ragged,
         // Past a token or two: each routed expert read once, at the DMA
         // rate, with no per-expert launch (see `gmm_spec`).
-        None if grouped.is_some() => "gmm",
-        None if worth < 2 => "all",
-        None if worth >= p => "loop",
-        None => "active",
+        MoePath::Auto if grouped.is_some() => MoePath::Gmm,
+        MoePath::Auto if worth < 2 => MoePath::All,
+        MoePath::Auto if worth >= p => MoePath::Loop,
+        MoePath::Auto => MoePath::Active,
+        forced => forced,
     };
     let y = match path {
-        "slice" => {
+        MoePath::Slice => {
             // Each pair's expert sliced out of the bank and multiplied by its
             // row alone: independent dots XLA overlaps, no join.
             let mut ys = Vec::with_capacity(p as usize);
@@ -1317,16 +1319,16 @@ fn routed(
             }
             cx.concat(&ys, 0)?
         }
-        "all" => every_expert(cx, &bank, fan, x, ids, groups)?,
-        "gmm" => match grouped {
+        MoePath::All => every_expert(cx, &bank, fan, x, ids, groups)?,
+        MoePath::Gmm => match grouped {
             Some(spec) => gmm(cx, spec, fan, &bank, x, r, valid, ids)?,
             None => every_expert(cx, &bank, fan, x, ids, groups)?,
         },
-        "loop" => {
+        MoePath::Loop => {
             let plan = plan_active(cx, fan, x, r, valid, tuning)?;
             run_active(cx, &plan, &bank, fan, groups, None, tuning)?
         }
-        "active" => {
+        MoePath::Active => {
             // The loop over the experts the fire routes to, unless more are
             // active than it is worth: then the whole bank. Both run inside
             // loops whose trip count the fire's routes decide (0 steps for
@@ -1351,7 +1353,7 @@ fn routed(
             let many = cx.broadcast(many, &[p, n], &[])?;
             cx.select(many, whole, looped)?
         }
-        _ => {
+        MoePath::Ragged | MoePath::Auto => {
             // Sort the pairs by expert (unrouted last), run one ragged dot over
             // the whole bank, and put the rows back.
             let top = cx.const_i(Elem::I32, e, &[p]);

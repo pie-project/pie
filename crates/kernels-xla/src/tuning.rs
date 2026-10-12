@@ -56,8 +56,8 @@ pub fn register(registry: &mut Registry) {
 /// The kernel decisions one load runs under, read once from its profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tuning {
-    /// A formulation the profile forces, or `None` for the automatic one.
-    pub moe_path: Option<&'static str>,
+    /// A formulation the profile forces, or `Auto`.
+    pub moe_path: MoePath,
     pub moe_gmm: bool,
     pub moe_loop_unroll: i64,
     pub moe_loop_tile_max: i64,
@@ -66,7 +66,7 @@ pub struct Tuning {
 impl Tuning {
     /// The registry defaults, for an emitter no load has tuned.
     pub const DEFAULT: Tuning = Tuning {
-        moe_path: None,
+        moe_path: MoePath::Auto,
         moe_gmm: true,
         moe_loop_unroll: 2,
         moe_loop_tile_max: 128,
@@ -75,15 +75,7 @@ impl Tuning {
     #[must_use]
     pub fn of(profile: &Profile) -> Tuning {
         Tuning {
-            moe_path: match profile.get::<MoePath>() {
-                MoePath::Auto => None,
-                MoePath::Slice => Some("slice"),
-                MoePath::Loop => Some("loop"),
-                MoePath::Active => Some("active"),
-                MoePath::All => Some("all"),
-                MoePath::Ragged => Some("ragged"),
-                MoePath::Gmm => Some("gmm"),
-            },
+            moe_path: *profile.get::<MoePath>(),
             moe_gmm: profile.on::<MoeGmm>(&Anywhere),
             moe_loop_unroll: i64::from(profile.get::<MoeLoopUnroll>().0),
             moe_loop_tile_max: i64::from(profile.get::<MoeLoopTileMax>().0),

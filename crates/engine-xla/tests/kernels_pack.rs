@@ -4,6 +4,7 @@
 //! The device types come from `engine_xla::trace::storage`, as the engine's
 //! tracer makes them.
 
+use kernels_xla::tuning::MoePath;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 
@@ -444,10 +445,10 @@ fn routed_banks_read_native_codes_and_prescaled_weights_every_way() {
         .map(|i| (hash(i, 56) % e as u32) as i32)
         .collect();
     routes[1] = -1;
-    for path in ["all", "slice", "ragged"] {
+    for path in [MoePath::All, MoePath::Slice, MoePath::Ragged] {
         let mut nat = Native {
             tuning: kernels_xla::tuning::Tuning {
-                moe_path: Some(path),
+                moe_path: path,
                 ..kernels_xla::tuning::Tuning::DEFAULT
             },
             ..Native::default()
