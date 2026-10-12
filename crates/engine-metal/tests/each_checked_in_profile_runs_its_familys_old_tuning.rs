@@ -4,7 +4,7 @@
 
 use engine_metal::chip::{self, AneMlp, AneProjections, StreamCut, WeightsLayout};
 use kernels_metal::Tuning;
-use kernels_metal::tuning::{Qmm, QmmAt};
+use kernels_metal::tuning::{GdnScan, Qmm, QmmAt};
 use profile::Source;
 
 /// What `DeviceTuning::of` returned for a family on a Metal 4 device.
@@ -14,7 +14,7 @@ struct Old {
     qmm_bn_crossover_tg: u32,
     qmm_mpp: bool,
     sdpa_mpp: bool,
-    gdn_scan: (u32, u32),
+    gdn_scan: GdnScan,
 }
 
 fn old(family: u32) -> Old {
@@ -24,13 +24,13 @@ fn old(family: u32) -> Old {
         qmm_bn_crossover_tg: 160,
         qmm_mpp: false,
         sdpa_mpp: false,
-        gdn_scan: (32, 4),
+        gdn_scan: GdnScan::Simd { rows: 4 },
     };
     match family {
         10 => {
             t.qmm_mpp = true;
             t.sdpa_mpp = true;
-            t.gdn_scan = (8, 2);
+            t.gdn_scan = GdnScan::Staged { min_rows: 32 };
         }
         9 => t.qmm_bn_crossover_tg = 96,
         8 => {
@@ -104,12 +104,14 @@ fn family_of(device: &str) -> u32 {
 fn each_checked_in_profile_runs_its_familys_old_tuning() {
     assert_eq!(chip::SEEDED.len(), 18);
     for (name, text) in chip::SEEDED {
-        let device = chip::registry()
+        let file = chip::registry()
             .parse(text, name, profile::Strict::CheckedIn)
-            .unwrap_or_else(|e| panic!("{e}"))
-            .target
-            .device
-            .expect("named");
+            .unwrap_or_else(|e| panic!("{e}"));
+        // A file measured on its chip owes nothing to the family table.
+        if file.measured() {
+            continue;
+        }
+        let device = file.target.device.expect("named");
         let family = family_of(&device);
         let (profile, report) = chip::resolve(&device, &chip::facts(family, 10, true), None);
         assert_eq!(report.used, Source::Seeded((*name).to_string()), "{device}");

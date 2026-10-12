@@ -2,6 +2,7 @@ use super::{DecodePlan, Paged};
 use crate::encode::{Arg, Ctx, Fire, Grid, stated};
 use crate::{Error, KvPool, Tensor};
 use dtype::Dtype;
+use crate::tuning::SdpaMppRows;
 
 pub fn enabled(pool: &KvPool, dim: u32) -> bool {
     pool.q8
@@ -14,10 +15,18 @@ pub fn enabled(pool: &KvPool, dim: u32) -> bool {
 }
 
 /// Whether the MPP kernel serves these rows over a pool stored as it was written.
-pub(super) fn mpp_fits(q: Tensor, pool: &KvPool, dim: u32, causal: bool, lse: bool) -> bool {
+pub(super) fn mpp_fits(
+    q: Tensor,
+    pool: &KvPool,
+    dim: u32,
+    causal: bool,
+    lse: bool,
+    rows: SdpaMppRows,
+) -> bool {
+    let SdpaMppRows { from, .. } = rows;
     causal
         && !lse
-        && q.rows >= 32
+        && q.rows >= from
         && matches!(dim, 128 | 256)
         && pool.page_size == 32
         && pool.keys.dtype == Dtype::Bf16
@@ -41,18 +50,24 @@ pub(super) fn attention(
     out: Tensor,
     lse: Option<Tensor>,
     allow_mpp: bool,
+    rows: SdpaMppRows,
 ) -> Result<(), Error> {
     let shape = Paged::of(op, q, pool, window, causal, dim)?;
     let q8 = enabled(pool, dim);
+    let SdpaMppRows {
+        from,
+        direct_from,
+        paired_below,
+    } = rows;
     let mpp = allow_mpp
         && causal
         && lse.is_none()
         && pool.page_size == 32
         && matches!(dim, 128 | 256)
-        && q.rows >= 32;
+        && q.rows >= from;
     let paired = !mpp
         && dim == 256
-        && shape.rows < 32
+        && shape.rows < paired_below
         && shape.gqa.is_multiple_of(2)
         && pool.page_size == 32
         && causal
@@ -63,10 +78,10 @@ pub(super) fn attention(
     } else {
         match (mpp, lse.is_some(), dim) {
             (true, _, 128) if q8 => "q8_mpp_d128",
-            (true, _, 256) if q8 && q.rows >= 512 => "q8_visit_direct",
+            (true, _, 256) if q8 && q.rows >= direct_from => "q8_visit_direct",
             (true, _, 256) if q8 => "q8_mpp_d256",
             (true, _, 128) => "sdpa_mpp_d128",
-            (true, _, 256) if q.rows >= 512 => "sdpa_visit_direct",
+            (true, _, 256) if q.rows >= direct_from => "sdpa_visit_direct",
             (true, _, 256) => "sdpa_mpp_d256",
             (_, false, 64) => "q8_decode_bfloat16_d_64",
             (_, false, 128) => "q8_decode_bfloat16_d_128",

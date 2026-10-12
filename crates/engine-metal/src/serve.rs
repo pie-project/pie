@@ -518,13 +518,19 @@ impl Shell {
         } else {
             vec![None; compiled.template().len()]
         };
+        let prefetch = chip.get::<crate::chip::ExpertsPrefetch>().0;
+        let threads = chip.get::<crate::chip::ExpertsThreads>().0;
+        let residency = boot
+            .residency
+            .clone()
+            .with_streaming(prefetch as usize, threads as usize);
         let mut weights = Weights::resident(
             &device,
             &handles,
             &boot.trace,
             boot.contract,
             boot.checkpoint,
-            &boot.residency,
+            &residency,
         )?;
         weights.decode_absorbed(&device, &handles, &boot.trace)?;
         weights.relabel_conv_weights(&device, &handles, &boot.trace)?;

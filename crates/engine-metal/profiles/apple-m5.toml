@@ -18,6 +18,20 @@ qmm = [
   { use = "qmv", rows_max = 8, packs = 1, crossover_tg = 160 },
 ]
 qmm_fp16 = true
+qmm_splitk = { use = "fill", fill_tg = 512, max = 8 }
+qmm_precast = 16
+qmm_widen = 32
+qmm_mpp.split_rows = 32
+qmm_mpp.split_cols = 8192
+qmm_mpp.pipeline_rows = 16
+qmm_mpp.pipeline_cols = 8192
+qmm_mpp.linear_from = 1024
+sdpa.mpp_rows.from = 32
+sdpa.mpp_rows.direct_from = 512
+sdpa.mpp_rows.paired_below = 32
+sdpa.split = 32
+ane.min_rows = 256
+ane.min_columns = 4096
 moe.path              = "mpp"
 moe.tile_rows = [
   { when = "per_expert < 2",   value = 1 },
@@ -28,7 +42,7 @@ sdpa.prefill                = "mpp"
 sdpa.tile_rows_per_request  = 32
 sdpa.mma                    = true
 sdpa.kv_q8                  = false
-gdn.scan                    = "staged"
+gdn.scan                    = { use = "staged", min_rows = 32 }
 ane.mlp                     = { use = "units", units = 8 }
 ane.projections             = { use = "share", percent = 47 }
 
@@ -52,3 +66,5 @@ weights = "plain"
 
 [engine]
 stream.cut = "fan_out"
+experts.prefetch = 4
+experts.threads = 8

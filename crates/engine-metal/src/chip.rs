@@ -59,7 +59,7 @@ pub enum AneProjections {
 
 /// How dense weights are laid out when a load makes them resident.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "layout.weights", default = "plain", tune = never)]
+#[decision(id = "layout.weights", default = "plain", tune = engine)]
 pub enum WeightsLayout {
     /// As the checkpoint stores them.
     Plain,
@@ -81,13 +81,45 @@ pub enum StreamCut {
     },
 }
 
+/// The fewest prompt rows the Neural Engine takes: its programs hold a
+/// procedure from 256 rows in steps of 128, so a raise only narrows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ane.min_rows", constant(set(256, 384, 512, 768, 1024)), default = 256, tune = engine)]
+pub struct AneMinRows(pub u32);
+
+/// The fewest columns a projection must land to be split with the Neural
+/// Engine, in its 512-column units.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(
+    id = "kernel.ane.min_columns",
+    constant(set(2048, 3072, 4096, 6144, 8192)),
+    default = 4096,
+    tune = engine
+)]
+pub struct AneMinColumns(pub u32);
+
+/// How many predicted experts a streamed mixture-of-experts load reads
+/// ahead from storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.experts.prefetch", constant(range(1..=16)), default = 4, tune = engine)]
+pub struct ExpertsPrefetch(pub u32);
+
+/// The copy threads a streamed mixture-of-experts load seats experts on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.experts.threads", constant(range(1..=32)), default = 8, tune = engine)]
+pub struct ExpertsThreads(pub u32);
+
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("metal", FACTS, AXES);
     kernels_metal::tuning::register(&mut r);
     r.add::<AneMlp>()
         .add::<AneProjections>()
         .add::<WeightsLayout>()
-        .add::<StreamCut>();
+        .add::<StreamCut>()
+        .add::<AneMinRows>()
+        .add::<AneMinColumns>()
+        .add::<ExpertsPrefetch>()
+        .add::<ExpertsThreads>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
     // Metal forks no side streams: one queue serves every region.
     poem_compiler::costs::register(&mut r, 0);

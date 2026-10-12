@@ -463,10 +463,9 @@ pub fn fit(measured: &Measured, grid: &Grid, cores: u32) -> Result<(Entries, Vec
 /// k, bits, group, format.
 #[must_use]
 pub fn coords(p: &Point, cores: u32) -> Vec<i64> {
-    let tiles = u64::from(p.rows.div_ceil(32)) * u64::from(p.n.div_ceil(64));
     vec![
         i64::from(p.rows),
-        i64::try_from(tiles * 8 / u64::from(cores.max(1))).unwrap_or(i64::MAX),
+        kernels_metal::tuning::fill(p.rows, p.n, cores),
         i64::from(p.n),
         i64::from(p.k),
         i64::from(p.bank.bits),
@@ -1449,7 +1448,7 @@ mod tests {
                 let quantised = format!("{:?}", p.dtype);
                 if quantised.starts_with('U') && quantised.contains('g') && p.shape.len() == 2 {
                     let (n, k) = (p.shape[0], p.shape[1]);
-                    if n < 100_000 && n >= 256 && k >= 256 {
+                    if (256..100_000).contains(&n) && k >= 256 {
                         *by.entry((n, k)).or_default() += 1;
                     }
                 }

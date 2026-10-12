@@ -63,32 +63,42 @@ const QMV_GROUP: [u32; 3] = [32, 2, 1];
 pub(crate) const QMM_BK: i32 = 32;
 const PRECAST_BK: i32 = 64;
 
-const PRECAST_MIN_BM: i32 = 16;
 
 const BM_RUNGS: [i32; 4] = [8, 16, 32, 64];
 
 const BN_RUNGS: [i32; 3] = [16, 32, 64];
 
-const SPLITK_FILL_TG: u32 = 512;
-
-const SPLITK_MAX: i32 = 8;
-
 const SPLITK_BN: i32 = 32;
 
 const SPLITK_REDUCE: &str = "qmm_splitk_reduce_f32_bfloat16";
 
+/// The slices a skinny matmul's contraction splits into under
+/// `kernel.qmm_splitk` (`limit` is its `(fill threadgroups, most slices)`):
+/// 1 where it does not split.
 #[must_use]
-pub fn splitk(n: i32, bm: i32, padded: i32, k: i32, group: i32, bits: i32) -> i32 {
+#[allow(clippy::too_many_arguments)]
+pub fn splitk(
+    n: i32,
+    bm: i32,
+    padded: i32,
+    k: i32,
+    group: i32,
+    bits: i32,
+    limit: Option<(u32, u32)>,
+) -> i32 {
+    let Some((fill_tg, max)) = limit else {
+        return 1;
+    };
     if bm != BM_RUNGS[0] || n <= 0 || k <= 0 || n % SPLITK_BN != 0 || !(bits == 4 || bits == 8) {
         return 1;
     }
     let tiles = (n / SPLITK_BN).unsigned_abs() * (padded / bm).max(1).unsigned_abs();
-    if tiles == 0 || tiles >= SPLITK_FILL_TG {
+    if tiles == 0 || tiles >= fill_tg {
         return 1;
     }
-    let mut split = i32::try_from((SPLITK_FILL_TG / tiles).next_power_of_two())
+    let mut split = i32::try_from((fill_tg / tiles).next_power_of_two())
         .unwrap_or(1)
-        .clamp(1, SPLITK_MAX);
+        .clamp(1, i32::try_from(max).unwrap_or(1));
     let unit = group.max(QMM_BK);
     while split > 1 && k % (split * unit) != 0 {
         split /= 2;
@@ -132,33 +142,6 @@ fn qmv_rungs_at(packs: i32, bits: i32) -> &'static [i32] {
 
 const QMV_PACK_RUNGS: [i32; 2] = [1, 2];
 
-#[must_use]
-pub fn composed(wide_range: bool) -> Vec<Fire> {
-    let mut out = Vec::new();
-    for &gs in &GROUPS {
-        for &b in &WIDTHS {
-            let point = qmv_point("quant.qmv", "fast", gs, b).expect("an axis point");
-            out.push(Fire::at(QMV_FILE, point.entry));
-            for &p in &QMV_PACK_RUNGS {
-                for &r in qmv_rungs_at(p, b) {
-                    let point =
-                        qmv_rows_point("quant.qmv_rows", gs, b, r, p).expect("an axis point");
-                    out.push(Fire::at(QMV_ROWS_FILE, point.entry).stamp(point.stamp));
-                }
-            }
-            for &bm in &ROW_TILES {
-                for &bn in &TILES {
-                    let (form, stamp) = tiled_form(wide_range);
-                    let point = qmm_point("quant.qmm_t", form, stamp, gs, b, bm, bn)
-                        .expect("an axis point, by construction");
-                    out.push(Fire::at(QMM_FILE, point.entry).stamp(point.stamp));
-                }
-            }
-        }
-    }
-    out
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Point {
     pub entry: &'static str,
@@ -194,31 +177,6 @@ pub fn qmm_point(
     })
 }
 
-pub fn qmm_name(
-    op: &'static str,
-    form: &str,
-    group: i32,
-    bits: i32,
-    bm: i32,
-    bn: i32,
-) -> Result<&'static str, Error> {
-    Ok(qmm_point(op, form, "", group, bits, bm, bn)?.entry)
-}
-
-pub fn qmm_precast_name(
-    op: &'static str,
-    before: &str,
-    after: &str,
-    bm: i32,
-    bn: i32,
-) -> Result<&'static str, Error> {
-    check(op, &ROW_TILES, bm, "row tile")?;
-    check(op, &TILES, bn, "column tile")?;
-    Ok(symbol(&format!(
-        "affine_qmm_t{before}_fp16_precast{after}_bfloat16_gs_64_b_4_bm_{bm}_bn_{bn}"
-    )))
-}
-
 pub fn qmv_point(op: &'static str, form: &str, group: i32, bits: i32) -> Result<Point, Error> {
     check(op, &GROUPS, group, "group size")?;
     check(op, &WIDTHS, bits, "bit width")?;
@@ -226,15 +184,6 @@ pub fn qmv_point(op: &'static str, form: &str, group: i32, bits: i32) -> Result<
         entry: symbol(&format!("affine_qmv_{form}_bfloat16_gs_{group}_b_{bits}")),
         stamp: "",
     })
-}
-
-pub fn qmv_name(
-    op: &'static str,
-    form: &str,
-    group: i32,
-    bits: i32,
-) -> Result<&'static str, Error> {
-    Ok(qmv_point(op, form, group, bits)?.entry)
 }
 
 pub fn qmv_rows_point(
@@ -345,14 +294,15 @@ pub fn mb_block(rows: i32, capacity: i32) -> Option<(i32, i32)> {
         .or_else(|| fits(BM_RUNGS[0]))
 }
 
-const WIDEN_TO: i32 = 32;
 
 #[must_use]
-pub fn widen_rung(bm: i32, padded: i32, fills: impl Fn(i32) -> bool) -> i32 {
+/// The widest row tile up to `widen_to` that still fills, for a padded
+/// matmul now tiled at `bm`.
+pub fn widen_rung(bm: i32, padded: i32, widen_to: i32, fills: impl Fn(i32) -> bool) -> i32 {
     BM_RUNGS
         .iter()
         .copied()
-        .filter(|rung| *rung > bm && *rung <= WIDEN_TO && *rung == padded)
+        .filter(|rung| *rung > bm && *rung <= widen_to && *rung == padded)
         .find(|rung| fills(*rung))
         .unwrap_or(bm)
 }
@@ -683,13 +633,7 @@ fn act_x_wt_over(
     for choice in tuning.qmm(&at) {
         match choice {
             Qmm::Mpp => {
-                let bm = match rows {
-                    1..=8 => 8,
-                    9..=16 => 16,
-                    17..=24 => 24,
-                    _ => 32,
-                };
-                let bn = if bm == 8 { 64 } else { 128 };
+                let (bm, bn) = crate::tuning::mpp_tile(rows);
                 // A column cut lands part of a row, which the MPP kernel never does.
                 if columns == stride {
                     let padded = rows.div_ceil(bm) * bm;
@@ -704,8 +648,16 @@ fn act_x_wt_over(
                                 .apply(Grid::of([32 * (contraction / 64), padded, 1], [32, 4, 1])),
                             &[act.arg(), aux.arg_mut(), k.arg(), bm.arg()],
                         )?;
-                        let partitions = if rows > 32 { 2u32 } else { 4u32 };
-                        let partial = if (rows <= 32 || (rows <= 64 && columns <= 8192))
+                        let crate::tuning::QmmMpp {
+                            split_rows,
+                            split_cols,
+                            pipeline_rows,
+                            pipeline_cols,
+                            linear_from,
+                        } = tuning.qmm_mpp_tiles();
+                        let partitions = if rows > split_rows { 2u32 } else { 4u32 };
+                        let partial = if (rows <= split_rows
+                            || (rows <= 2 * split_rows && columns <= split_cols))
                             && columns <= 65536
                             && contraction % 256 == 0
                         {
@@ -717,15 +669,15 @@ fn act_x_wt_over(
                         let packed = w.mpp_codes.is_some();
                         let local = bm == 8 && packed && split == 4;
                         let simdgroups = if bm == 8 { 2 } else { 4 };
-                        let pipeline = !local && rows <= 16 && columns <= 8192;
-                        let linear_mode = if rows >= 1024 && split == 1 && packed {
+                        let pipeline = !local && rows <= pipeline_rows && columns <= pipeline_cols;
+                        let linear_mode = if rows >= linear_from && split == 1 && packed {
                             16
                         } else {
                             -1
                         };
                         let kind = if packed { "packed" } else { "native" };
                         let index = if packed
-                            && rows >= 1024
+                            && rows >= linear_from
                             && split == 1
                             && [
                                 (padded, contraction),
@@ -815,7 +767,7 @@ fn act_x_wt_over(
                     tiles >= u64::from(crossover.unsigned_abs())
                 };
                 let split_plane = |padded: i32, bm: i32| -> Option<(i32, Tensor)> {
-                    let split = splitk(cols, bm, padded, k, group, bits);
+                    let split = splitk(cols, bm, padded, k, group, bits, tuning.qmm_splitk());
                     if split <= 1 {
                         return None;
                     }
@@ -827,9 +779,10 @@ fn act_x_wt_over(
                         || tile_fills(padded, bm)
                         || split_plane(padded, bm).is_some())
                 {
-                    let bm = widen_rung(bm, padded, |rung| tile_fills(padded, rung));
+                    let widen_to = i32::try_from(tuning.qmm_widen()).unwrap_or(32);
+                    let bm = widen_rung(bm, padded, widen_to, |rung| tile_fills(padded, rung));
                     if fp16
-                        && bm >= PRECAST_MIN_BM
+                        && bm >= i32::try_from(tuning.qmm_precast_min_bm()).unwrap_or(16)
                         && k % PRECAST_BK == 0
                         && let Some(staged) =
                             (scratch.precast)(padded.unsigned_abs(), k.unsigned_abs())
@@ -1081,26 +1034,26 @@ mod tests {
     fn a_batch_between_rungs_takes_the_wider_tile() {
         let fills = |_: i32| true;
         assert_eq!(mb_block(12, 64), Some((8, 16)));
-        assert_eq!(widen_rung(8, 16, fills), 16);
+        assert_eq!(widen_rung(8, 16, 32, fills), 16);
         assert_eq!(mb_block(24, 64), Some((16, 32)));
-        assert_eq!(widen_rung(16, 32, fills), 32);
+        assert_eq!(widen_rung(16, 32, 32, fills), 32);
         assert_eq!(mb_block(48, 64), Some((32, 64)));
-        assert_eq!(widen_rung(32, 64, fills), 32);
-        assert_eq!(widen_rung(16, 16, fills), 16);
-        assert_eq!(widen_rung(8, 8, fills), 8);
-        assert_eq!(widen_rung(8, 16, |_| false), 8);
+        assert_eq!(widen_rung(32, 64, 32, fills), 32);
+        assert_eq!(widen_rung(16, 16, 32, fills), 16);
+        assert_eq!(widen_rung(8, 8, 32, fills), 8);
+        assert_eq!(widen_rung(8, 16, 32, |_| false), 8);
     }
 
     fn the_split_follows_the_tile_count() {
-        assert_eq!(splitk(17408, 8, 8, 5120, 64, 4), 1);
-        assert_eq!(splitk(5120, 8, 8, 5120, 64, 4), 4);
-        assert_eq!(splitk(5120, 8, 8, 17408, 64, 4), 4);
-        assert_eq!(splitk(1024, 8, 8, 5120, 64, 4), 8);
-        assert_eq!(splitk(1024, 16, 16, 5120, 64, 4), 1);
-        assert_eq!(splitk(1024, 8, 8, 5120, 64, 2), 1);
-        assert_eq!(splitk(1024, 8, 8, 5120, 128, 4), 8);
-        assert_eq!(splitk(1024, 8, 8, 576, 64, 4), 1);
-        assert_eq!(splitk(1000, 8, 8, 5120, 64, 4), 1);
+        assert_eq!(splitk(17408, 8, 8, 5120, 64, 4, Some((512, 8))), 1);
+        assert_eq!(splitk(5120, 8, 8, 5120, 64, 4, Some((512, 8))), 4);
+        assert_eq!(splitk(5120, 8, 8, 17408, 64, 4, Some((512, 8))), 4);
+        assert_eq!(splitk(1024, 8, 8, 5120, 64, 4, Some((512, 8))), 8);
+        assert_eq!(splitk(1024, 16, 16, 5120, 64, 4, Some((512, 8))), 1);
+        assert_eq!(splitk(1024, 8, 8, 5120, 64, 2, Some((512, 8))), 1);
+        assert_eq!(splitk(1024, 8, 8, 5120, 128, 4, Some((512, 8))), 8);
+        assert_eq!(splitk(1024, 8, 8, 576, 64, 4, Some((512, 8))), 1);
+        assert_eq!(splitk(1000, 8, 8, 5120, 64, 4, Some((512, 8))), 1);
         assert_eq!(
             splitk_point("t", 64, 4, 8).unwrap(),
             "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_4_bm_8_bn_32"

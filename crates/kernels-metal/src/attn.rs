@@ -56,7 +56,6 @@ const SDPA_TILED: [&str; 4] = [
     "sdpa_paged_tiled_bfloat16_d_512",
 ];
 
-const SDPA_LSE_WIDTHS: [u32; 4] = [64, 128, 256, 512];
 
 const SDPA_DECODE_LSE: [&str; 4] = [
     "sdpa_paged_decode_lse_bfloat16_d_64",
@@ -417,6 +416,7 @@ fn vector(
     if q8::enabled(pool, head_dim) {
         return q8::attention(
             ctx, op, q, pool, plan, window, causal, head_dim, sm_scale, o, lse, false,
+            crate::tuning::SdpaMppRows::DEFAULT,
         );
     }
     let shape = Paged::of(op, q, pool, window, causal, head_dim)?;
@@ -427,7 +427,7 @@ fn vector(
     let entry = match pool.keys.dtype {
         Dtype::Bf16 => match lse {
             None => SDPA_DECODE[shape.at],
-            Some(_) => SDPA_DECODE_LSE[head_point(op, head_dim, &SDPA_LSE_WIDTHS)?],
+            Some(_) => SDPA_DECODE_LSE[head_point(op, head_dim, &SDPA_WIDTHS)?],
         },
         Dtype::KvU4 => {
             if lse.is_some() {
@@ -650,6 +650,7 @@ fn tiled(
         };
         return q8::attention(
             ctx, op, q, pool, &decode, window, causal, head_dim, sm_scale, o, lse, allow_mpp,
+            crate::tuning::SdpaMppRows::DEFAULT,
         );
     }
     let shape = Paged::of(op, q, pool, window, causal, head_dim)?;
@@ -662,7 +663,7 @@ fn tiled(
     let entry = match pool.keys.dtype {
         Dtype::Bf16 => match lse {
             None => SDPA_TILED[shape.at],
-            Some(_) => SDPA_TILED_LSE[head_point(op, head_dim, &SDPA_LSE_WIDTHS)?],
+            Some(_) => SDPA_TILED_LSE[head_point(op, head_dim, &SDPA_WIDTHS)?],
         },
         Dtype::KvU4 => {
             let at = head_point(op, head_dim, &SDPA_KV_U4_WIDTHS)?;

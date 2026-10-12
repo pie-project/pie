@@ -4,8 +4,10 @@ use crate::error::Error;
 use crate::tensor::{KvPool, Tensor};
 use dtype::Dtype;
 
-pub fn split_count(rows: u32) -> u32 {
-    32u32.div_ceil(rows.div_ceil(8).max(1)).clamp(1, 32)
+/// The slices `rows` rows split into, aiming at `target` slices
+/// (`kernel.sdpa.split`) over the rows' 8-row groups.
+pub fn split_count(rows: u32, target: u32) -> u32 {
+    target.div_ceil(rows.div_ceil(8).max(1)).clamp(1, target.max(1))
 }
 pub fn workspace_words(splits: u32, heads: u32) -> Option<u32> {
     heads
@@ -44,6 +46,7 @@ pub fn try_paged(
     out: Tensor,
     requests: u32,
     partials: &dyn Fn(u32, u32) -> Option<Tensor>,
+    target: u32,
 ) -> Result<bool, Error> {
     if !super::q8::enabled(pool, head_dim) {
         return Ok(false);
@@ -71,7 +74,7 @@ pub fn try_paged(
     let Some((pack, split, reduce, stamp)) = point(shape.gqa) else {
         return Ok(false);
     };
-    let splits = split_count(q.rows);
+    let splits = split_count(q.rows, target);
     let Some(per) = workspace_words(splits, shape.q_heads) else {
         return Ok(false);
     };

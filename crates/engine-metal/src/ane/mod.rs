@@ -109,16 +109,18 @@ pub fn load(
 ) -> Result<Option<Ane>> {
     #[cfg(target_vendor = "apple")]
     {
-        use crate::chip::{AneMlp, AneProjections};
+        use crate::chip::{AneMinColumns, AneMinRows, AneMlp, AneProjections};
         let mlp_split = *chip.get::<AneMlp>();
         let projection_split = *chip.get::<AneProjections>();
+        let min_rows = chip.get::<AneMinRows>().0;
+        let min_columns = chip.get::<AneMinColumns>().0;
         let mlps = match mlp_split {
             AneMlp::Gpu => Vec::new(),
             _ => banks::mlps(trace, weights),
         };
         let projections = match projection_split {
             AneProjections::Gpu => Vec::new(),
-            AneProjections::Share { .. } => banks::projections(trace, weights),
+            AneProjections::Share { .. } => banks::projections(trace, weights, min_columns),
         };
         if (mlps.is_empty() && projections.is_empty()) || kernels_metal::ane::available().is_err() {
             return Ok(None);
@@ -130,6 +132,7 @@ pub fn load(
             &projections,
             mlp_split,
             projection_split,
+            min_rows,
         )
     }
     #[cfg(not(target_vendor = "apple"))]

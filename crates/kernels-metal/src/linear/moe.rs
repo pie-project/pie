@@ -27,11 +27,6 @@ const MOE_TILE_ROWS: [u32; 4] = [8, 16, 32, 64];
 const MOE_TILE_COLS: [u32; 3] = [16, 32, 64];
 
 #[must_use]
-pub fn should_batch(pairs: u32, experts: u32, min_per_expert: u32) -> bool {
-    experts > 0 && u64::from(pairs) >= u64::from(experts) * u64::from(min_per_expert)
-}
-
-#[must_use]
 pub fn tile_rows(pairs: u32, experts: u32, tuning: &crate::Tuning) -> u32 {
     let tile = tuning.moe_tile_rows(pairs, experts);
     debug_assert!(
@@ -688,7 +683,8 @@ fn mpp_point(
     tuning: &crate::Tuning,
 ) -> Option<(u32, u32, u32)> {
     let m = tile.min(32);
-    let (n, simdgroups) = if m == 8 { (64, 2) } else { (128, 4) };
+    let (_, n) = crate::tuning::mpp_tile(m);
+    let simdgroups = if m == 8 { 2 } else { 4 };
     let fits = tuning.moe_mpp()
         && !biased
         && bank.affine()

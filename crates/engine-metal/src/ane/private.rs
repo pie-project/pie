@@ -81,6 +81,8 @@ pub struct Private {
     splits: AtomicU64,
     /// How many projections have.
     column_splits: AtomicU64,
+    /// The fewest rows handed over (`kernel.ane.min_rows`).
+    min_rows: u32,
     _buffers: Vec<Buffer>,
 }
 
@@ -389,6 +391,7 @@ pub fn load(
     projections: &[((u32, u32), Vec<banks::Projection>)],
     mlp_split: AneMlp,
     projection_split: AneProjections,
+    min_rows: u32,
 ) -> Result<Option<Private>> {
     use objc2_metal::MTLDevice;
     let mut keep = Vec::new();
@@ -484,6 +487,7 @@ pub fn load(
         })
         .map_err(|e| fault(e.to_string()))?;
     Ok(Some(Private {
+        min_rows,
         handoff,
         mlp,
         projections: sites,
@@ -542,7 +546,7 @@ impl Private {
     }
 
     fn rows_fit(&self, rows: u32) -> bool {
-        (MIN_ROWS..=MAX_ROWS).contains(&rows) && !self.handoff.retired()
+        (MIN_ROWS.max(self.min_rows)..=MAX_ROWS).contains(&rows) && !self.handoff.retired()
     }
 
     /// A split for the MLP whose gate-up weight is `gate_up`, over `rows`,

@@ -53,12 +53,33 @@ pub enum Qmm {
     },
 }
 
+/// The MPP matmul's `(row tile, column tile)` for `rows` rows: what the
+/// dense and the routed kernels both stamp.
+#[must_use]
+pub fn mpp_tile(rows: u32) -> (u32, u32) {
+    let bm = match rows {
+        0..=8 => 8,
+        9..=16 => 16,
+        17..=24 => 24,
+        _ => 32,
+    };
+    (bm, if bm == 8 { 64 } else { 128 })
+}
+
+/// Eighths of a wave of 32x64 output tiles over `cores` GPU cores: how full
+/// `rows` rows into `n` columns keep the device.
+#[must_use]
+pub fn fill(rows: u32, n: u32, cores: u32) -> i64 {
+    let tiles = u64::from(rows.div_ceil(32)) * u64::from(n.div_ceil(64));
+    i64::try_from(tiles * 8 / u64::from(cores.max(1))).unwrap_or(i64::MAX)
+}
+
 impl Qmm {
     fn fits_shape(&self, at: &QmmAt) -> bool {
         match self {
             Qmm::Mpp => {
-                let bn = if at.rows <= 8 { 64 } else { 128 };
-                at.bits == 4 && at.group == 64 && at.rows >= 8 && at.n % bn == 0
+                let (_, bn) = mpp_tile(u32::try_from(at.rows).unwrap_or(u32::MAX));
+                at.bits == 4 && at.group == 64 && at.rows >= 8 && at.n % i64::from(bn) == 0
             }
             Qmm::Tiled { .. } => at.k % i64::from(crate::linear::quant::QMM_BK) == 0,
             Qmm::Qmv { .. } => true,
@@ -71,6 +92,107 @@ impl Qmm {
 #[decision(id = "kernel.qmm_fp16", flag, default = true, tune = search)]
 pub struct QmmFp16;
 
+/// Split-K for skinny dense matmuls: a decode-sized tiled matmul whose
+/// tiles fill fewer than `fill_tg` threadgroups splits its contraction into
+/// up to `max` slices and reduces the partials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(
+    id = "kernel.qmm_splitk",
+    default = r#"{ use = "fill", fill_tg = 512, max = 8 }"#,
+    tune = search
+)]
+pub enum QmmSplitK {
+    Off,
+    Fill {
+        #[constant(range(16..=8192), default = 512)]
+        fill_tg: u32,
+        #[constant(set(2, 4, 8), default = 8)]
+        max: u32,
+    },
+}
+
+/// The fewest rows a tile must hold before activations are cast to fp16 once
+/// and the fp16 GEMM reads them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.qmm_precast", constant(set(16, 32, 64)), default = 16, tune = search)]
+pub struct QmmPrecastMinBm(pub u32);
+
+/// The widest row tile a padded tiled matmul widens to when a wider tile
+/// still fills the device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.qmm_widen", constant(set(16, 32, 64)), default = 32, tune = search)]
+pub struct QmmWiden(pub u32);
+
+macro_rules! counts {
+    ($($ty:ident = $id:literal, $lo:literal ..= $hi:literal, $default:literal, $doc:literal;)*) => {
+        $(
+            #[doc = $doc]
+            #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+            #[decision(id = $id, constant(range($lo..=$hi)), default = $default, tune = search)]
+            pub struct $ty(pub u32);
+        )*
+    };
+}
+
+counts! {
+    MppSplitRows = "kernel.qmm_mpp.split_rows", 8..=256, 32,
+        "Up to this many rows (or twice it over few columns) the MPP matmul splits its contraction across partitions.";
+    MppSplitCols = "kernel.qmm_mpp.split_cols", 1024..=65536, 8192,
+        "The most columns the MPP matmul splits at twice `split_rows` rows.";
+    MppPipelineCols = "kernel.qmm_mpp.pipeline_cols", 1024..=65536, 8192,
+        "The most columns the MPP matmul pipelines its loads over.";
+    MppLinearFrom = "kernel.qmm_mpp.linear_from", 256..=8192, 1024,
+        "From this many rows a packed bank's MPP matmul walks its tiles linearly.";
+    SdpaMppFrom = "kernel.sdpa.mpp_rows.from", 8..=1024, 32,
+        "The fewest prompt rows that attend through the MPP kernels.";
+    SdpaMppDirectFrom = "kernel.sdpa.mpp_rows.direct_from", 64..=8192, 512,
+        "From this many rows 256-wide heads take the direct-visit MPP kernel.";
+    SdpaPairedBelow = "kernel.sdpa.mpp_rows.paired_below", 1..=256, 32,
+        "Below this many rows 256-wide grouped-query heads decode in pairs.";
+}
+
+/// The most rows the MPP matmul pipelines its loads over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.qmm_mpp.pipeline_rows", constant(set(8, 16, 24, 32)), default = 16, tune = search)]
+pub struct MppPipelineRows(pub u32);
+
+/// The MPP dense kernel's tiling, read from its `kernel.qmm_mpp.*`
+/// decisions: up to `split_rows` rows (or twice that over at most
+/// `split_cols` columns) split the contraction across partitions; up to
+/// `pipeline_rows` rows over at most `pipeline_cols` columns pipeline their
+/// loads; from `linear_from` rows a packed bank walks its tiles linearly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QmmMpp {
+    pub split_rows: u32,
+    pub split_cols: u32,
+    pub pipeline_rows: u32,
+    pub pipeline_cols: u32,
+    pub linear_from: u32,
+}
+
+/// Where prompt attention takes the MPP kernels, read from the
+/// `kernel.sdpa.mpp_rows.*` decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SdpaMppRows {
+    pub from: u32,
+    pub direct_from: u32,
+    pub paired_below: u32,
+}
+
+impl SdpaMppRows {
+    /// The registry defaults, for paths that run without a profile.
+    pub const DEFAULT: SdpaMppRows = SdpaMppRows {
+        from: 32,
+        direct_from: 512,
+        paired_below: 32,
+    };
+}
+
+/// How many slices the split paged-attention kernel aims for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.split", constant(set(8, 16, 32)), default = 32, tune = search)]
+pub struct SdpaSplit(pub u32);
+
 /// How routed (mixture-of-experts) matmuls read their sorted rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.path", default = "tiled", tune = search)]
@@ -81,7 +203,8 @@ pub enum MoePath {
 }
 
 /// The row tile a routed matmul sorts its pairs into, by pairs per expert;
-/// 1 leaves the pairs unsorted.
+/// 1 leaves the pairs unsorted. An 8-row tile is stamped only for fp16 4-bit
+/// 64-group banks; any other bank runs it at 16.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(
     id = "kernel.moe.tile_rows",
@@ -133,8 +256,11 @@ pub enum GdnScan {
         rows: u32,
     },
     /// 8 lanes a head and 2 value rows, with the staged prompt kernel where
-    /// a head is 128 wide.
-    Staged,
+    /// a head is 128 wide and a request brings at least `min_rows` rows.
+    Staged {
+        #[constant(range(1..=4096), default = 32)]
+        min_rows: u32,
+    },
 }
 
 /// Register every decision this crate reads.
@@ -142,6 +268,18 @@ pub fn register(registry: &mut Registry) {
     registry
         .add::<Qmm>()
         .add::<QmmFp16>()
+        .add::<QmmSplitK>()
+        .add::<QmmPrecastMinBm>()
+        .add::<QmmWiden>()
+        .add::<MppSplitRows>()
+        .add::<MppSplitCols>()
+        .add::<MppPipelineRows>()
+        .add::<MppPipelineCols>()
+        .add::<MppLinearFrom>()
+        .add::<SdpaMppFrom>()
+        .add::<SdpaMppDirectFrom>()
+        .add::<SdpaPairedBelow>()
+        .add::<SdpaSplit>()
         .add::<MoePath>()
         .add::<MoeTileRows>()
         .add::<SdpaPrefill>()
@@ -178,10 +316,9 @@ impl Tuning {
     /// `k`-long contraction of a `bits`-bit, `group`-wide bank is chosen at.
     #[must_use]
     pub fn qmm_at(&self, rows: u32, n: u32, k: u32, bits: u32, group: u32) -> QmmAt {
-        let tiles = u64::from(rows.div_ceil(32)) * u64::from(n.div_ceil(64));
         QmmAt {
             rows: i64::from(rows),
-            fill: i64::try_from(tiles * 8 / u64::from(self.cores)).unwrap_or(i64::MAX),
+            fill: fill(rows, n, self.cores),
             n: i64::from(n),
             k: i64::from(k),
             bits: i64::from(bits),
@@ -277,12 +414,68 @@ impl Tuning {
         self.profile.on::<SdpaKvQ8>(&profile::Anywhere)
     }
 
-    /// The gated-delta scan as `(lanes a head, value rows a simdgroup)`.
+    /// `(fill threadgroups, most slices)` of split-K, or `None` when off.
     #[must_use]
-    pub fn gdn_scan(&self) -> (u32, u32) {
-        match *self.profile.get::<GdnScan>() {
-            GdnScan::Simd { rows } => (32, rows),
-            GdnScan::Staged => (8, 2),
+    pub fn qmm_splitk(&self) -> Option<(u32, u32)> {
+        match *self.profile.get::<QmmSplitK>() {
+            QmmSplitK::Off => None,
+            QmmSplitK::Fill { fill_tg, max } => Some((fill_tg, max)),
         }
+    }
+
+    /// The most slices split-K may cut, whatever a load decides: what its
+    /// scratch is sized for.
+    #[must_use]
+    pub fn qmm_splitk_max(&self) -> u32 {
+        self.profile
+            .ladder::<QmmSplitK>()
+            .values()
+            .map(|v| match v {
+                QmmSplitK::Off => 1,
+                QmmSplitK::Fill { max, .. } => *max,
+            })
+            .max()
+            .unwrap_or(1)
+    }
+
+    #[must_use]
+    pub fn qmm_precast_min_bm(&self) -> u32 {
+        self.profile.get::<QmmPrecastMinBm>().0
+    }
+
+    #[must_use]
+    pub fn qmm_widen(&self) -> u32 {
+        self.profile.get::<QmmWiden>().0
+    }
+
+    #[must_use]
+    pub fn qmm_mpp_tiles(&self) -> QmmMpp {
+        QmmMpp {
+            split_rows: self.profile.get::<MppSplitRows>().0,
+            split_cols: self.profile.get::<MppSplitCols>().0,
+            pipeline_rows: self.profile.get::<MppPipelineRows>().0,
+            pipeline_cols: self.profile.get::<MppPipelineCols>().0,
+            linear_from: self.profile.get::<MppLinearFrom>().0,
+        }
+    }
+
+    #[must_use]
+    pub fn sdpa_mpp_rows(&self) -> SdpaMppRows {
+        SdpaMppRows {
+            from: self.profile.get::<SdpaMppFrom>().0,
+            direct_from: self.profile.get::<SdpaMppDirectFrom>().0,
+            paired_below: self.profile.get::<SdpaPairedBelow>().0,
+        }
+    }
+
+    #[must_use]
+    pub fn sdpa_split(&self) -> u32 {
+        self.profile.get::<SdpaSplit>().0
+    }
+
+    /// The gated-delta scan the profile picks.
+    #[must_use]
+    pub fn gdn_scan(&self) -> GdnScan {
+        *self.profile.get::<GdnScan>()
     }
 }

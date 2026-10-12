@@ -134,34 +134,57 @@ pub fn knobs(base: &Profile, skip: &[&str], refusable: &str) -> Vec<Knob> {
                 if !spec.vars.is_empty() {
                     continue;
                 }
-                for alt in alternatives {
-                    // An alternative's constants: every value of a set, or
-                    // the default and its half to double for a range.
-                    let mut bodies: Vec<String> = vec![format!("use = \"{}\"", alt.name)];
-                    for c in alt.constants {
+                // The alternative the profile holds, and its constants.
+                let held = match rungs.first().map(|r| &r.pick) {
+                    Some(crate::Pick::Alternative { index, constants }) => Some((*index, constants.clone())),
+                    _ => None,
+                };
+                for (at, alt) in alternatives.iter().enumerate() {
+                    if alt.constants.is_empty() {
+                        values.push(format!("\"{}\"", alt.name));
+                        continue;
+                    }
+                    // The constants it starts from: the held ones for the held
+                    // alternative, the defaults for another.
+                    let base: Vec<String> = match &held {
+                        Some((index, constants)) if *index == at => {
+                            constants.iter().map(crate::Value::toml).collect()
+                        }
+                        _ => alt.constants.iter().map(|c| c.default.to_string()).collect(),
+                    };
+                    let body = |with: &[String]| {
+                        let fields: Vec<String> = alt
+                            .constants
+                            .iter()
+                            .zip(with)
+                            .map(|(c, v)| format!("{} = {v}", c.name))
+                            .collect();
+                        format!("{{ use = \"{}\", {} }}", alt.name, fields.join(", "))
+                    };
+                    values.push(body(&base));
+                    // One constant at a time around where it starts: every
+                    // value of a set, or half to double of a range.
+                    for (i, c) in alt.constants.iter().enumerate() {
+                        let from: f64 = base[i].replace('_', "").parse().unwrap_or(1.0);
                         let options: Vec<String> = match c.kind {
                             Kind::Ints(set) => set.iter().map(i64::to_string).collect(),
                             Kind::Int { lo, hi } => {
                                 ranged = true;
-                                let d: f64 = c.default.replace('_', "").parse().unwrap_or(1.0);
-                                std::iter::once(d)
-                                    .chain(scaled(d, lo as f64, hi as f64, true))
+                                scaled(from, lo as f64, hi as f64, true)
+                                    .into_iter()
                                     .map(|x| (x as i64).to_string())
                                     .collect()
                             }
-                            _ => vec![c.default.to_string()],
+                            Kind::Float { lo, hi } => {
+                                scaled(from, lo, hi, false).into_iter().map(|x| format!("{x:.1}")).collect()
+                            }
+                            _ => Vec::new(),
                         };
-                        bodies = bodies
-                            .iter()
-                            .flat_map(|b| options.iter().map(move |o| format!("{b}, {} = {o}", c.name)))
-                            .collect();
-                    }
-                    for b in bodies {
-                        values.push(if alt.constants.is_empty() {
-                            format!("\"{}\"", alt.name)
-                        } else {
-                            format!("{{ {b} }}")
-                        });
+                        for o in options {
+                            let mut with = base.clone();
+                            with[i] = o;
+                            values.push(body(&with));
+                        }
                     }
                 }
             }

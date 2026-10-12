@@ -14,8 +14,8 @@ use crate::run::{PoolSlabs, WeightRow, WeightTable};
 
 const ALIGN: u64 = 256;
 
+/// The rows a split-K matmul tiles at.
 const SPLITK_ROWS: u64 = 8;
-const SPLITK_MAX: u64 = 8;
 
 #[derive(Clone, Copy, Debug)]
 struct Room {
@@ -103,7 +103,10 @@ pub struct Scratch {
     routers: Vec<u32>,
 }
 
-fn split_partial_room(precast: Option<Room>, width: u64, mpp: bool) -> Room {
+/// The partials of a split matmul: up to `slices` split-K slices of
+/// [`SPLITK_ROWS`] rows, or for MPP four partitions of up to `mpp_rows`
+/// padded rows.
+fn split_partial_room(precast: Option<Room>, width: u64, mpp: bool, slices: u64, mpp_rows: u64) -> Room {
     let mut at = if mpp {
         precast.map_or(0, |room| room.at + room.bytes())
     } else {
@@ -112,9 +115,9 @@ fn split_partial_room(precast: Option<Room>, width: u64, mpp: bool) -> Room {
     Room::lay(
         &mut at,
         if mpp {
-            32 * SPLITK_MAX
+            (4 * mpp_rows).max(SPLITK_ROWS * slices)
         } else {
-            SPLITK_ROWS * SPLITK_MAX
+            SPLITK_ROWS * slices
         },
         width,
         Dtype::F32,
@@ -199,11 +202,18 @@ impl Scratch {
                 let (Ok(n), Ok(k)) = (i32::try_from(n), i32::try_from(k)) else {
                     return false;
                 };
-                quant::splitk(n, 8, 8, k, 32, 4) > 1 || (tuning.qmm_mpp() && n <= 65536)
+                let limit = tuning.qmm_splitk();
+                quant::splitk(n, 8, 8, k, 32, 4, limit) > 1 || (tuning.qmm_mpp() && n <= 65536)
             })
             .map(|&(n, _)| u64::from(n))
             .max()
-            .map(|n| split_partial_room(precast, n, tuning.qmm_mpp()));
+            .map(|n| {
+                // MPP splits up to twice `split_rows` rows, padded to 32.
+                let kernels_metal::tuning::QmmMpp { split_rows, .. } = tuning.qmm_mpp_tiles();
+                let mpp_rows = u64::from(2 * split_rows).div_ceil(32) * 32;
+                let slices = u64::from(tuning.qmm_splitk_max());
+                split_partial_room(precast, n, tuning.qmm_mpp(), slices, mpp_rows)
+            });
 
         let routed = (sorted > 0).then(|| {
             let mut at = 0u64;
@@ -594,7 +604,7 @@ mod tests {
         for rows in [8, 32, 64, 2048] {
             for width in [512, 5120, 17408] {
                 let precast = Room::lay(&mut 0, rows, width, Dtype::F16);
-                let partial = split_partial_room(Some(precast), 34816, true);
+                let partial = split_partial_room(Some(precast), 34816, true, 8, 64);
                 assert!(partial.at >= precast.at + precast.bytes());
                 assert_eq!(partial.at % ALIGN, 0);
                 assert!(partial.rows >= 64 * 4);

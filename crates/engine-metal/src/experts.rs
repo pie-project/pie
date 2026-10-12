@@ -24,6 +24,9 @@ pub struct Plan {
     device_bytes: u64,
     host_bytes: u64,
     gathered: crate::gather::Plan,
+    /// `(prefetch, copy threads)` from the profile's `engine.experts`;
+    /// `None` keeps the built-in values.
+    streaming: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -174,7 +177,16 @@ impl Plan {
             slots,
             host_bytes,
             gathered,
+            streaming: None,
         })
+    }
+
+    /// This plan streaming experts with `prefetch` read ahead on `threads`
+    /// copy threads (`engine.experts`).
+    #[must_use]
+    pub fn with_streaming(mut self, prefetch: usize, threads: usize) -> Plan {
+        self.streaming = Some((prefetch.max(1), threads.max(1)));
+        self
     }
 
     #[must_use]
@@ -666,8 +678,13 @@ impl Tier {
                 .as_ref()
                 .and_then(|path| std::fs::File::create(path).ok())
                 .map(std::io::BufWriter::new),
-            prefetch_k: crate::diag::on().prefetch_k.unwrap_or(PREFETCH_K),
-            threads: crate::diag::on().seat_threads.unwrap_or(SEAT_THREADS),
+            // A diagnostic word overrides the profile, for an experiment.
+            prefetch_k: crate::diag::on()
+                .prefetch_k
+                .unwrap_or(plan.streaming.map_or(PREFETCH_K, |(k, _)| k)),
+            threads: crate::diag::on()
+                .seat_threads
+                .unwrap_or(plan.streaming.map_or(SEAT_THREADS, |(_, t)| t)),
             pending: Vec::new(),
         };
         for (at, group) in plan.groups.iter().enumerate() {

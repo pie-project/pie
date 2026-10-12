@@ -7,8 +7,6 @@ use super::{DecodePlan, Paged, PrefillPlan, SDPA_TILE, kv_heads_agree, lse_plane
 
 const MMA_HEAD_DIM: u32 = 64;
 
-const MMA_LSE_HEAD_DIM: u32 = 64;
-
 const MMA_THREADS: u32 = 128;
 
 const MMA_ENTRY: &str = "sdpa_paged_mma_bfloat16_d_64";
@@ -23,9 +21,9 @@ pub fn should_tile(rows: u32, requests: u32, tuning: &Tuning) -> bool {
 }
 
 #[must_use]
-pub fn should_mma(head_dim: u32, lse: bool, tuning: &Tuning) -> bool {
-    let stamped = if lse { MMA_LSE_HEAD_DIM } else { MMA_HEAD_DIM };
-    tuning.sdpa_mma() && head_dim == stamped
+pub fn should_mma(head_dim: u32, tuning: &Tuning) -> bool {
+    // The plain and the lse kernels are both stamped at one head width.
+    tuning.sdpa_mma() && head_dim == MMA_HEAD_DIM
 }
 
 fn as_decode(plan: &PrefillPlan, mask: Tensor) -> DecodePlan {
@@ -130,6 +128,7 @@ fn arbitrate(
             o,
             lse,
             tuning.sdpa_mpp() && should_tile(q.rows, requests, tuning),
+            tuning.sdpa_mpp_rows(),
         );
     }
     if !should_tile(q.rows, requests, tuning) {
@@ -147,7 +146,9 @@ fn arbitrate(
             lse,
         );
     }
-    if tuning.sdpa_mpp() && super::q8::mpp_fits(q, pool, head_dim, causal, lse.is_some()) {
+    if tuning.sdpa_mpp()
+        && super::q8::mpp_fits(q, pool, head_dim, causal, lse.is_some(), tuning.sdpa_mpp_rows())
+    {
         return super::q8::attention(
             ctx,
             op,
@@ -161,9 +162,10 @@ fn arbitrate(
             o,
             lse,
             true,
+            tuning.sdpa_mpp_rows(),
         );
     }
-    if causal && should_mma(head_dim, lse.is_some(), tuning) {
+    if causal && should_mma(head_dim, tuning) {
         return mma(
             ctx, op, q, pool, plan, mask, window, head_dim, sm_scale, o, lse,
         );
@@ -335,7 +337,7 @@ pub fn prefill_with_scratch(
     if tuning.sdpa_mpp()
         && super::split::try_paged(
             ctx, q.data, pool, plan, plan.mask, window, true, head_dim, sm_scale, o, requests,
-            partials,
+            partials, tuning.sdpa_split(),
         )?
     {
         return Ok(());
@@ -365,7 +367,7 @@ pub fn masked_with_scratch(
     if tuning.sdpa_mpp()
         && super::split::try_paged(
             ctx, q.data, pool, plan, mask, window, causal, head_dim, sm_scale, o, requests,
-            partials,
+            partials, tuning.sdpa_split(),
         )?
     {
         return Ok(());

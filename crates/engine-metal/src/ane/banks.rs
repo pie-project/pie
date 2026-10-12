@@ -87,16 +87,14 @@ pub struct Projection {
     pub bank: Bank,
 }
 
-/// A projection must land at least this many columns to be worth a
-/// hand-off of its own.
-pub const MIN_PROJECTION_COLUMNS: u32 = 4096;
-
-/// Every `linear.matmul` over an affine 4-bit bank wide enough to split,
-/// grouped by `(contraction, columns)` and numbered within the group.
+/// Every `linear.matmul` over an affine 4-bit bank of at least `min_columns`
+/// columns (`kernel.ane.min_columns`), grouped by `(contraction, columns)`
+/// and numbered within the group.
 #[cfg(target_vendor = "apple")]
 pub fn projections(
     trace: &poem_ir::Trace,
     weights: &crate::weights::Weights,
+    min_columns: u32,
 ) -> Vec<((u32, u32), Vec<Projection>)> {
     let mut groups: Vec<((u32, u32), Vec<Projection>)> = Vec::new();
     for node in &trace.nodes {
@@ -107,7 +105,7 @@ pub fn projections(
             continue;
         };
         let (k, n) = (bank.codes.width, bank.codes.rows);
-        if n < MIN_PROJECTION_COLUMNS
+        if n < min_columns
             || !n.is_multiple_of(kernels_metal::ane::ffn::UNIT)
             || kernels_metal::ane::mil::segment_of(k).is_none()
         {
