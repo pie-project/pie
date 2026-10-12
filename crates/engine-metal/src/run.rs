@@ -198,7 +198,6 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// The chip profile and model facts this load's kernels run under.
     pub(crate) fn tuning(&self) -> &'c kernels_metal::Tuning {
         self.tuning
     }

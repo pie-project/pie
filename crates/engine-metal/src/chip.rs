@@ -1,26 +1,19 @@
-//! The chip's profile: the Metal registry, the facts this engine measures,
-//! the checked-in profiles, and resolution for one load.
-//!
-//! A profile is chosen by the device's name and applies whole or not at all;
-//! see `.wiki/device-profiles.md`. Kernel decisions are declared in
-//! `kernels-metal`, fusions in `poem-compiler`; the decisions this crate
-//! owns are below.
+//! The Metal profile registry, the checked-in profiles, and resolution for
+//! one load. Kernel decisions are declared in `kernels-metal`.
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use profile::{Decision, Domain, Facts, Profile, Registry, Report, Shelf, Var};
 
-/// What this engine measures about its device, for `target.assumes` and
-/// what an alternative requires.
-pub const FACTS: &[Var] = &[
+const FACTS: &[Var] = &[
     Var::fixed("family", Domain::COUNT),
     Var::fixed("cores", Domain::COUNT),
     Var::fixed("ane", Domain::Bool),
 ];
 
 /// The recording axes a dynamic variable may name.
-pub const AXES: &[&str] = &["rows"];
+const AXES: &[&str] = &["rows"];
 
 /// How the dense MLPs share work with the Neural Engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -126,7 +119,6 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     r
 });
 
-/// Every decision the Metal engine exposes.
 #[must_use]
 pub fn registry() -> &'static Registry {
     &REGISTRY
@@ -134,7 +126,7 @@ pub fn registry() -> &'static Registry {
 
 macro_rules! seeded {
     ($($file:literal),* $(,)?) => {
-        /// The profiles checked in with pie, as `(file name, text)`.
+        /// `(file name, text)`.
         pub const SEEDED: &[(&str, &str)] = &[
             $(($file, include_str!(concat!("../profiles/", $file)))),*
         ];
@@ -162,14 +154,11 @@ seeded!(
     "apple-m5-max.toml",
 );
 
-/// Where Metal's profiles live.
 pub static SHELF: Shelf = Shelf {
     backend: "metal",
     seeded: SEEDED,
 };
 
-/// The facts of a device with this family and core count, and whether the
-/// Neural Engine bridge loads.
 #[must_use]
 pub fn facts(family: u32, cores: u32, ane: bool) -> Facts {
     Facts::of(registry())
@@ -178,7 +167,6 @@ pub fn facts(family: u32, cores: u32, ane: bool) -> Facts {
         .flag("ane", ane)
 }
 
-/// Whether the Neural Engine bridge loads on this machine: the `ane` fact.
 #[must_use]
 pub fn ane_loads() -> bool {
     #[cfg(target_vendor = "apple")]
@@ -191,8 +179,7 @@ pub fn ane_loads() -> bool {
     }
 }
 
-/// The name and facts of this machine's Metal device: for `pie profile`
-/// and doctor. `None` without a Metal 4 device.
+/// `None` without a Metal 4 device.
 #[must_use]
 pub fn probe() -> Option<(String, Facts)> {
     let device = crate::device::Context::bind().ok()?;
@@ -200,33 +187,26 @@ pub fn probe() -> Option<(String, Facts)> {
     Some((device.name().to_string(), facts))
 }
 
-/// Resolve the profile one load runs under: the user's file for this
-/// device, then the checked-in one, then the registry defaults.
 #[must_use]
 pub fn resolve(device: &str, facts: &Facts, profiles: Option<&Path>) -> (Profile, Report) {
     SHELF.resolve(registry(), device, facts, profiles)
 }
 
-/// Where a user's profile for `device` lives under `profiles`.
 #[must_use]
 pub fn user_path(profiles: &Path, device: &str) -> PathBuf {
     SHELF.user_path(profiles, device)
 }
 
-/// Say once per device that it runs without a profile measured on it.
 pub fn tell_untuned(device: &str, report: &Report) {
     SHELF.tell_untuned(device, report);
 }
 
-/// The core count [`tuning`] assumes: a mid-size chip.
-pub const TEST_CORES: u32 = 16;
-
 /// The registry defaults with `overrides` (profile TOML after `api = 1`)
-/// laid over them: for a test that exercises one decision on any chip.
-/// Panics on an override the registry refuses.
+/// laid over them, on a mid-size chip: for tests. Panics on an override the
+/// registry refuses.
 #[must_use]
 pub fn tuning(overrides: &str, wide_range: bool) -> kernels_metal::Tuning {
-    kernels_metal::Tuning::new(registry().with_overrides(overrides), wide_range, TEST_CORES)
+    kernels_metal::Tuning::new(registry().with_overrides(overrides), wide_range, 16)
 }
 
 #[cfg(test)]

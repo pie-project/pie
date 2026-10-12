@@ -1,49 +1,24 @@
-//! The bridge from per-family tuning to per-chip profiles: every checked-in
-//! profile resolves to exactly what `DeviceTuning::of(family)` gave that
-//! chip before profiles existed. The table below is that function, frozen.
+//! Every checked-in profile not measured on its chip resolves to what
+//! `DeviceTuning::of(family)` gave that chip before profiles existed; the
+//! functions below are that table, frozen.
 
 use engine_metal::chip::{self, AneMlp, AneProjections, StreamCut, WeightsLayout};
 use kernels_metal::Tuning;
 use kernels_metal::tuning::{GdnScan, Qmm, QmmAt};
 use profile::Source;
 
-/// What `DeviceTuning::of` returned for a family on a Metal 4 device.
-struct Old {
-    qmm_min_batch: u32,
-    qmm_min_batch_emulated: u32,
-    qmm_bn_crossover_tg: u32,
-    qmm_mpp: bool,
-    sdpa_mpp: bool,
-    gdn_scan: GdnScan,
-}
-
-fn old(family: u32) -> Old {
-    let mut t = Old {
-        qmm_min_batch: 5,
-        qmm_min_batch_emulated: 12,
-        qmm_bn_crossover_tg: 160,
-        qmm_mpp: false,
-        sdpa_mpp: false,
-        gdn_scan: GdnScan::Simd { rows: 4 },
-    };
+/// `(fp16 tiled from rows, crossover_tg, qmm_mpp, sdpa_mpp, gdn scan)`.
+fn old(family: u32) -> (i64, u32, bool, bool, GdnScan) {
+    let simd = GdnScan::Simd { rows: 4 };
     match family {
-        10 => {
-            t.qmm_mpp = true;
-            t.sdpa_mpp = true;
-            t.gdn_scan = GdnScan::Staged { min_rows: 32 };
-        }
-        9 => t.qmm_bn_crossover_tg = 96,
-        8 => {
-            t.qmm_min_batch = 8;
-            t.sdpa_mpp = true;
-        }
-        _ => {}
+        10 => (5, 160, true, true, GdnScan::Staged { min_rows: 32 }),
+        9 => (5, 96, false, false, simd),
+        8 => (8, 160, false, true, simd),
+        _ => (5, 160, false, false, simd),
     }
-    t
 }
 
-/// The old routed tile choice: `moe_batch_min_per_expert` 2, no pair floor,
-/// `moe_tile_mid_per` 32, `moe_tile_wide_per` never.
+/// The old routed tile choice.
 fn old_tile(pairs: u32, experts: u32) -> u32 {
     if experts == 0 || pairs < experts * 2 {
         return 1;
@@ -59,10 +34,10 @@ fn old_tile(pairs: u32, experts: u32) -> u32 {
 }
 
 /// The kernel the old cascade in `act_x_wt_over` ran a dense matmul on.
-fn old_qmm(o: &Old, at: &QmmAt) -> Qmm {
-    let fp16 = at.format == "fp16";
+fn old_qmm(family: u32, at: &QmmAt) -> Qmm {
+    let (fp16_from, crossover_tg, mpp, ..) = old(family);
     let bn = if at.rows <= 8 { 64 } else { 128 };
-    if o.qmm_mpp
+    if mpp
         && at.bits == 4
         && at.group == 64
         && at.rows >= 8
@@ -71,22 +46,18 @@ fn old_qmm(o: &Old, at: &QmmAt) -> Qmm {
     {
         return Qmm::Mpp;
     }
-    let min_batch = if at.bits == 2 {
-        5
-    } else if fp16 {
-        i64::from(o.qmm_min_batch)
-    } else {
-        i64::from(o.qmm_min_batch_emulated)
+    let from = match (at.bits, at.format) {
+        (2, _) => 5,
+        (_, "fp16") => fp16_from,
+        _ => 12,
     };
-    if at.rows >= min_batch && at.k % 32 == 0 {
-        return Qmm::Tiled {
-            crossover_tg: o.qmm_bn_crossover_tg,
-        };
+    if at.rows >= from && at.k % 32 == 0 {
+        return Qmm::Tiled { crossover_tg };
     }
     Qmm::Qmv {
         rows_max: 8,
         packs: 1,
-        crossover_tg: o.qmm_bn_crossover_tg,
+        crossover_tg,
     }
 }
 
@@ -107,7 +78,6 @@ fn each_checked_in_profile_runs_its_familys_old_tuning() {
         let file = chip::registry()
             .parse(text, name, profile::Strict::CheckedIn)
             .unwrap_or_else(|e| panic!("{e}"));
-        // A file measured on its chip owes nothing to the family table.
         if file.measured() {
             continue;
         }
@@ -116,7 +86,7 @@ fn each_checked_in_profile_runs_its_familys_old_tuning() {
         let (profile, report) = chip::resolve(&device, &chip::facts(family, 10, true), None);
         assert_eq!(report.used, Source::Seeded((*name).to_string()), "{device}");
         let t = Tuning::new(profile.clone(), false, 10);
-        let o = old(family);
+        let (_, _, mpp, sdpa_mpp, gdn_scan) = old(family);
         for rows in [1, 2, 4, 5, 7, 8, 9, 11, 12, 16, 17, 32, 512] {
             for (n, k) in [
                 (512, 4096),
@@ -144,26 +114,12 @@ fn each_checked_in_profile_runs_its_familys_old_tuning() {
                     };
                     assert_eq!(
                         t.qmm(&at).first(),
-                        Some(&old_qmm(&o, &at)),
+                        Some(&old_qmm(family, &at)),
                         "{device}: {at:?}"
                     );
                 }
             }
         }
-        assert!(
-            t.fp16_gemm_format(4, 64) && !t.fp16_gemm_format(4, 32),
-            "{device}"
-        );
-        assert_eq!(t.qmm_mpp(), o.qmm_mpp, "{device}");
-        assert_eq!(
-            t.moe_mpp(),
-            o.qmm_mpp,
-            "{device}: the routed matmul followed the dense flag"
-        );
-        assert_eq!(t.sdpa_mpp(), o.sdpa_mpp, "{device}");
-        assert_eq!(t.sdpa_tile_rows_per_request(), 32, "{device}");
-        assert!(t.sdpa_mma() && !t.kv_q8(), "{device}");
-        assert_eq!(t.gdn_scan(), o.gdn_scan, "{device}");
         for experts in [1, 8, 64, 128, 256] {
             for pairs in [0, 1, 7, 8, 64, 255, 256, 2048, 4096, 8191, 8192, 65_536] {
                 assert_eq!(
@@ -173,7 +129,19 @@ fn each_checked_in_profile_runs_its_familys_old_tuning() {
                 );
             }
         }
-        let mlp = if o.qmm_mpp {
+        assert!(
+            t.fp16_gemm_format(4, 64) && !t.fp16_gemm_format(4, 32),
+            "{device}"
+        );
+        assert_eq!(
+            (t.qmm_mpp(), t.moe_mpp(), t.sdpa_mpp()),
+            (mpp, mpp, sdpa_mpp),
+            "{device}"
+        );
+        assert_eq!(t.sdpa_tile_rows_per_request(), 32, "{device}");
+        assert!(t.sdpa_mma() && !t.kv_q8(), "{device}");
+        assert_eq!(t.gdn_scan(), gdn_scan, "{device}");
+        let mlp = if mpp {
             AneMlp::Units { units: 8 }
         } else {
             AneMlp::Share { percent: 47 }
@@ -186,7 +154,7 @@ fn each_checked_in_profile_runs_its_familys_old_tuning() {
         assert_eq!(
             *profile.get::<WeightsLayout>(),
             WeightsLayout::Plain,
-            "{device}: no family repacked"
+            "{device}"
         );
         assert_eq!(*profile.get::<StreamCut>(), StreamCut::FanOut);
         assert_eq!(
@@ -196,12 +164,12 @@ fn each_checked_in_profile_runs_its_familys_old_tuning() {
                 side_streams: 0,
                 ..poem_compiler::DeviceProfile::default()
             },
-            "{device}: the compiler's prices Metal stated at load"
+            "{device}"
         );
         assert_eq!(
             poem_compiler::fuse::flags::kernels(&profile),
             ["elementwise.residual_add_rmsnorm", "linear.mlp_swiglu"],
-            "{device}: the fusions Metal shipped"
+            "{device}"
         );
     }
 }
@@ -234,10 +202,7 @@ fn a_mac_whose_bridge_does_not_load_runs_the_defaults_whole() {
         report.rejected
     );
     let t = Tuning::new(profile.clone(), false, 10);
-    assert!(
-        !t.qmm_mpp() && !t.sdpa_mpp(),
-        "not one rung of the M5 file applies"
-    );
+    assert!(!t.qmm_mpp() && !t.sdpa_mpp());
     assert_eq!(*profile.get::<AneMlp>(), AneMlp::Gpu);
 }
 
