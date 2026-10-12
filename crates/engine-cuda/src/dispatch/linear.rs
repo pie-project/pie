@@ -783,32 +783,37 @@ impl Run<'_> {
     }
 }
 
+/// A staging buffer per `name`, grown by doubling. A buffer it outgrows is
+/// kept, never freed: copies queued on it may still be in flight, and a
+/// free here would either race them or synchronise the device (illegal
+/// mid-capture). Doubling keeps what is retired under the live buffer's
+/// size.
 fn staging(name: &'static str, bytes: usize) -> Option<u64> {
     use std::collections::HashMap;
     use std::sync::Mutex;
-    static HELD: Mutex<Option<HashMap<&'static str, (u64, usize)>>> = Mutex::new(None);
+    struct Held {
+        live: HashMap<&'static str, (u64, usize)>,
+        retired: Vec<u64>,
+    }
+    static HELD: Mutex<Option<Held>> = Mutex::new(None);
     if bytes == 0 {
         return None;
     }
     let mut held = HELD
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let map = held.get_or_insert_with(HashMap::new);
-    if let Some((ptr, cap)) = map.get(name)
-        && *cap >= bytes
-    {
+    let held = held.get_or_insert_with(|| Held {
+        live: HashMap::new(),
+        retired: Vec::new(),
+    });
+    let cap = held.live.get(name).map_or(0, |(_, cap)| *cap);
+    if let Some((ptr, _)) = held.live.get(name).filter(|_| cap >= bytes) {
         return Some(*ptr);
     }
-    let fresh =
-        crate::device::alloc::raw_alloc(bytes.max(map.get(name).map_or(0, |(_, cap)| cap * 2)))?;
-    if let Some((old, _)) = map.insert(
-        name,
-        (
-            fresh,
-            bytes.max(map.get(name).map_or(0, |(_, cap)| cap * 2)),
-        ),
-    ) {
-        crate::device::alloc::raw_free(old);
+    let size = bytes.max(cap * 2);
+    let fresh = crate::device::alloc::raw_alloc(size)?;
+    if let Some((old, _)) = held.live.insert(name, (fresh, size)) {
+        held.retired.push(old);
     }
     Some(fresh)
 }
