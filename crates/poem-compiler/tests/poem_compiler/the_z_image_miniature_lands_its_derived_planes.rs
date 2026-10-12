@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
+use crate::z_image_dims;
 use checkpoint::executor::Execution;
 use checkpoint::executor::sink::MemorySink;
 use checkpoint::file::read::parse_metadata;
 use checkpoint::plan::{StorageTarget, compile_streaming};
-use crate::z_image_dims;
 
 use poem::Platform;
 use z_image_dims::Dims;

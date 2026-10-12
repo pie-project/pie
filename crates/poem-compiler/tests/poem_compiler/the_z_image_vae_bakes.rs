@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use crate::z_image_dims;
 use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{Expr, Partition, TensorType};
-use crate::z_image_dims;
 
 use poem::generative::{PortKind, ReadoutKind};
 use poem::{Def, Dim, Dtype, Operation, Platform, Request, Stream, Trace, Ty, seam};

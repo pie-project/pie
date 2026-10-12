@@ -1,4 +1,3 @@
-
 #[path = "regressions/compiler.rs"]
 mod compiler;
 #[path = "regressions/json_schema.rs"]

@@ -1,4 +1,3 @@
-
 use ::grammar::grammar::Grammar;
 
 #[test]
