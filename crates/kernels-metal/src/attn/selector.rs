@@ -100,6 +100,10 @@ pub fn walk(
         || tokens.rows != cand.data.rows
         || hp.is_some_and(|h| h.rows != cand.data.rows)
     {
+        eprintln!(
+            "DEBUG selector_walk rows: cand={} picks={} tokens={} hp={:?} unary={}",
+            cand.data.rows, picks.rows, tokens.rows, hp.map(|h| h.rows), unary.rows
+        );
         return Err(refuse(
             OP,
             "hp, tokens and picks carry one row per candidate row",
