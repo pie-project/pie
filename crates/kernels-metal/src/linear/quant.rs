@@ -5,7 +5,7 @@ use dtype::Dtype;
 
 use crate::Tuning;
 use crate::error::Error;
-use crate::tuning::{Qmm, QmmAt};
+use crate::tuning::Qmm;
 
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, refuse, stated};
 use crate::tensor::{Bank, Tensor};
@@ -677,14 +677,7 @@ fn act_x_wt_over(
     }
     let ld = stated(op, w.ld)?;
     let fp16 = tuning.fp16_gemm_format(w.bits, w.group);
-    let at = QmmAt {
-        rows: i64::from(rows),
-        n: i64::from(columns),
-        k: i64::from(contraction),
-        bits: i64::from(w.bits),
-        group: i64::from(w.group),
-        format: if fp16 { "fp16" } else { "emulated" },
-    };
+    let at = tuning.qmm_at(rows, columns, contraction, w.bits, w.group);
     // The profile's `kernel.qmm` rungs that fit this shape, in order: each
     // runs if it finds its scratch, else the next one does.
     for choice in tuning.qmm(&at) {

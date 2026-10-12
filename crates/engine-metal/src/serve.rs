@@ -350,7 +350,7 @@ impl Shell {
         let (chip, chip_report) =
             crate::chip::resolve(device.name(), &measured, boot.profiles.as_deref());
         crate::chip::tell_untuned(device.name(), &chip_report);
-        let tuning = kernels_metal::Tuning::new(chip.clone(), wide_range);
+        let tuning = kernels_metal::Tuning::new(chip.clone(), wide_range, device.cores());
         let boot = Boot {
             trace: poem_compiler::fuse::fuse(
                 boot.trace,

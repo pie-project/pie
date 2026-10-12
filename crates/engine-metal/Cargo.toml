@@ -27,6 +27,8 @@ eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
 poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
 profile = { package = "pie-profile", path = "../profile" }
 checkpoint = { path = "../checkpoint" }
+poem = { package = "pie-poem", path = "../poem" }
+ztensor-compat = { workspace = true }
 
 libc = "0.2"
 

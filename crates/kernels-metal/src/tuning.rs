@@ -10,11 +10,14 @@ use profile::{Decision, Profile, Registry};
 /// The kernel a dense affine-quantised matmul runs: the first rung whose
 /// shape it fits and whose scratch it finds. `format` is the bank's: `fp16`
 /// where its 4-bit, 64-group codes take the fp16 GEMM format, else
-/// `emulated`.
+/// `emulated`. `fill` is how full the device is: eighths of a wave of
+/// 32x64 output tiles over its cores, so a rung can say "fills the device"
+/// in a way that holds on chips of any size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(
     id = "kernel.qmm",
-    shape(rows; n, k, bits, group, format: enum(fp16, emulated)),
+    shape(rows, fill: derived; n, k, bits, group, format: enum(fp16, emulated)),
+    tune = search,
     default = r#"[
         { when = "rows >= 5 and (bits == 2 or format == fp16)", use = "tiled", crossover_tg = 160 },
         { when = "rows >= 12", use = "tiled", crossover_tg = 160 },
@@ -65,12 +68,12 @@ impl Qmm {
 
 /// Whether 4-bit, 64-group weights take the fp16 GEMM format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.qmm_fp16", flag, default = true)]
+#[decision(id = "kernel.qmm_fp16", flag, default = true, tune = search)]
 pub struct QmmFp16;
 
 /// How routed (mixture-of-experts) matmuls read their sorted rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.path", default = "tiled")]
+#[decision(id = "kernel.moe.path", default = "tiled", tune = search)]
 pub enum MoePath {
     Tiled,
     /// The MPP kernel for the 4-bit, 64-group banks it serves.
@@ -83,6 +86,7 @@ pub enum MoePath {
 #[decision(
     id = "kernel.moe.tile_rows",
     shape(per_expert: derived),
+    tune = search,
     constant(set(1, 8, 16, 32, 64)),
     default = r#"[{ when = "per_expert < 2", value = 1 }, { when = "per_expert >= 32", value = 32 }, { value = 16 }]"#
 )]
@@ -90,7 +94,7 @@ pub struct MoeTileRows(pub u32);
 
 /// How prompt rows attend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.prefill", default = "tiled")]
+#[decision(id = "kernel.sdpa.prefill", default = "tiled", tune = search)]
 pub enum SdpaPrefill {
     Tiled,
     /// The MPP matmul for the shapes it serves, and the split paged kernel.
@@ -100,22 +104,28 @@ pub enum SdpaPrefill {
 /// The fewest rows per request that take the tiled attention kernel; fewer
 /// take the vector kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.tile_rows_per_request", constant(range(1..=4096)), default = 32)]
+#[decision(
+    id = "kernel.sdpa.tile_rows_per_request",
+    constant(range(1..=4096)),
+    default = 32,
+    tune = search
+)]
 pub struct SdpaTileRowsPerRequest(pub u32);
 
 /// Whether 64-wide heads attend through the simdgroup-matrix kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.mma", flag, default = true)]
+#[decision(id = "kernel.sdpa.mma", flag, default = true, tune = search)]
 pub struct SdpaMma;
 
-/// Whether attention reads keys and values through the 8-bit kernel.
+/// Whether attention reads keys and values through the 8-bit kernel. It
+/// halves the pool and changes what attention reads: the operator's call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.kv_q8", flag, default = false)]
+#[decision(id = "kernel.sdpa.kv_q8", flag, default = false, tune = never)]
 pub struct SdpaKvQ8;
 
 /// The gated-delta recurrent scan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.gdn.scan", default = r#"{ use = "simd", rows = 4 }"#)]
+#[decision(id = "kernel.gdn.scan", default = r#"{ use = "simd", rows = 4 }"#, tune = search)]
 pub enum GdnScan {
     /// 32 lanes a head, `rows` value rows a simdgroup.
     Simd {
@@ -141,23 +151,46 @@ pub fn register(registry: &mut Registry) {
         .add::<GdnScan>();
 }
 
-/// What one load's kernels run under: the device's resolved profile, and
-/// what the model asks of every load on any chip.
+/// What one load's kernels run under: the device's resolved profile, its
+/// core count, and what the model asks of every load on any chip.
 #[derive(Clone, Debug)]
 pub struct Tuning {
     profile: Profile,
     wide_range: bool,
+    cores: u32,
 }
 
 impl Tuning {
     /// `wide_range` is the model's: a deployment whose activations leave the
     /// fp16 range (diffusion latents) takes the wide tiled kernel and no fp16
     /// GEMM format.
+    /// `cores` is the device's GPU core count, which `fill` divides by.
     #[must_use]
-    pub fn new(profile: Profile, wide_range: bool) -> Tuning {
+    pub fn new(profile: Profile, wide_range: bool, cores: u32) -> Tuning {
         Tuning {
             profile,
             wide_range,
+            cores: cores.max(1),
+        }
+    }
+
+    /// The point a dense matmul of `rows` rows into `n` columns over a
+    /// `k`-long contraction of a `bits`-bit, `group`-wide bank is chosen at.
+    #[must_use]
+    pub fn qmm_at(&self, rows: u32, n: u32, k: u32, bits: u32, group: u32) -> QmmAt {
+        let tiles = u64::from(rows.div_ceil(32)) * u64::from(n.div_ceil(64));
+        QmmAt {
+            rows: i64::from(rows),
+            fill: i64::try_from(tiles * 8 / u64::from(self.cores)).unwrap_or(i64::MAX),
+            n: i64::from(n),
+            k: i64::from(k),
+            bits: i64::from(bits),
+            group: i64::from(group),
+            format: if self.fp16_gemm_format(bits, group) {
+                "fp16"
+            } else {
+                "emulated"
+            },
         }
     }
 

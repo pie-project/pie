@@ -24,7 +24,7 @@ pub const AXES: &[&str] = &["rows"];
 
 /// How the dense MLPs share work with the Neural Engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.ane.mlp", default = "gpu")]
+#[decision(id = "kernel.ane.mlp", default = "gpu", tune = engine)]
 pub enum AneMlp {
     /// The GPU runs every unit.
     Gpu,
@@ -46,7 +46,7 @@ pub enum AneMlp {
 
 /// How wide quantised projections share work with the Neural Engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.ane.projections", default = "gpu")]
+#[decision(id = "kernel.ane.projections", default = "gpu", tune = engine)]
 pub enum AneProjections {
     Gpu,
     /// The Neural Engine takes `percent` of each projection's columns.
@@ -59,7 +59,7 @@ pub enum AneProjections {
 
 /// How dense weights are laid out when a load makes them resident.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "layout.weights", default = "plain")]
+#[decision(id = "layout.weights", default = "plain", tune = never)]
 pub enum WeightsLayout {
     /// As the checkpoint stores them.
     Plain,
@@ -70,7 +70,7 @@ pub enum WeightsLayout {
 
 /// How many rows a streamed expert cut serves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.stream.cut", default = "fan_out")]
+#[decision(id = "engine.stream.cut", default = "fan_out", tune = engine)]
 pub enum StreamCut {
     /// The resident slots over the router's fan-out.
     FanOut,
@@ -186,12 +186,15 @@ pub fn tell_untuned(device: &str, report: &Report) {
     SHELF.tell_untuned(device, report);
 }
 
+/// The core count [`tuning`] assumes: a mid-size chip.
+pub const TEST_CORES: u32 = 16;
+
 /// The registry defaults with `overrides` (profile TOML after `api = 1`)
 /// laid over them: for a test that exercises one decision on any chip.
 /// Panics on an override the registry refuses.
 #[must_use]
 pub fn tuning(overrides: &str, wide_range: bool) -> kernels_metal::Tuning {
-    kernels_metal::Tuning::new(registry().with_overrides(overrides), wide_range)
+    kernels_metal::Tuning::new(registry().with_overrides(overrides), wide_range, TEST_CORES)
 }
 
 #[cfg(test)]

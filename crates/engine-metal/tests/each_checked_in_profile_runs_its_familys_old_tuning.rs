@@ -113,7 +113,7 @@ fn each_checked_in_profile_runs_its_familys_old_tuning() {
         let family = family_of(&device);
         let (profile, report) = chip::resolve(&device, &chip::facts(family, 10, true), None);
         assert_eq!(report.used, Source::Seeded((*name).to_string()), "{device}");
-        let t = Tuning::new(profile.clone(), false);
+        let t = Tuning::new(profile.clone(), false, 10);
         let o = old(family);
         for rows in [1, 2, 4, 5, 7, 8, 9, 11, 12, 16, 17, 32, 512] {
             for (n, k) in [(512, 4096), (1000, 4096), (1024, 4096), (4096, 1000), (8192, 8192)] {
@@ -124,7 +124,8 @@ fn each_checked_in_profile_runs_its_familys_old_tuning() {
                     (2, 64, "emulated"),
                     (8, 64, "emulated"),
                 ] {
-                    let at = QmmAt { rows, n, k, bits, group, format };
+                    // No checked-in ladder reads `fill`.
+                    let at = QmmAt { rows, fill: 0, n, k, bits, group, format };
                     assert_eq!(
                         t.qmm(&at).first(),
                         Some(&old_qmm(&o, &at)),
@@ -192,10 +193,11 @@ fn each_checked_in_profile_runs_its_familys_old_tuning() {
 #[test]
 fn a_wide_range_model_leaves_the_fp16_format_on_any_chip() {
     let (profile, _) = chip::resolve("Apple M4 Max", &chip::facts(9, 40, true), None);
-    let wide = Tuning::new(profile, true);
+    let wide = Tuning::new(profile, true, 10);
     assert!(!wide.fp16_gemm_format(4, 64));
     let at = |rows| QmmAt {
         rows,
+        fill: 0,
         n: 4096,
         k: 4096,
         bits: 4,
@@ -215,7 +217,7 @@ fn a_mac_whose_bridge_does_not_load_runs_the_defaults_whole() {
         "{:?}",
         report.rejected
     );
-    let t = Tuning::new(profile.clone(), false);
+    let t = Tuning::new(profile.clone(), false, 10);
     assert!(
         !t.qmm_mpp() && !t.sdpa_mpp(),
         "not one rung of the M5 file applies"
