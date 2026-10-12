@@ -506,9 +506,10 @@ impl Registry {
     }
 
     /// `rungs` with every fact their `when`s read replaced by its value on
-    /// this device: a rung that cannot hold here, or that the rungs above
-    /// it now cover, goes, and what is left of its `when` names only the
-    /// decision's variables.
+    /// this device: a rung that cannot hold here, that reads a fact the
+    /// device does not report, or that the rungs above it now cover, goes,
+    /// and what is left of its `when` names only the decision's variables.
+    /// Refused where what is left no longer picks at every shape.
     fn settle(&self, spec: &Spec, rungs: &[Rung], facts: &Facts) -> Result<Vec<Rung>, String> {
         if !rungs.iter().any(|r| {
             r.when
@@ -521,6 +522,7 @@ impl Registry {
         let vars = crate::registry::when_vars(spec, self.facts);
         let space = crate::spec::space(spec.vars);
         let mut covered = crate::region::Region::nothing();
+        let mut unreported = None;
         let mut out = Vec::with_capacity(rungs.len());
         let mut keep = |rung: Rung, out: &mut Vec<Rung>| {
             if rung.region.is_subset(&covered, &space) {
@@ -533,7 +535,7 @@ impl Registry {
             }
             out.push(rung);
         };
-        for rung in rungs {
+        'rungs: for rung in rungs {
             let Some(when) = rung
                 .when
                 .as_ref()
@@ -543,22 +545,14 @@ impl Registry {
                 continue;
             };
             let mut region = when.region.clone();
-            for name in when
-                .names
-                .iter()
-                .filter(|n| self.facts.iter().any(|f| f.name == **n))
-            {
-                let i = self
-                    .facts
-                    .iter()
-                    .position(|f| f.name == *name)
-                    .expect("a fact");
-                let value = facts.values[i].ok_or_else(|| {
-                    format!(
-                        "`{}` reads `{name}` in `{}`, and this device does not report {name}",
-                        spec.id, when.text
-                    )
-                })?;
+            for (i, fact) in self.facts.iter().enumerate() {
+                if !when.names.contains(&fact.name) {
+                    continue;
+                }
+                let Some(value) = facts.values[i] else {
+                    unreported = Some(fact.name);
+                    continue 'rungs;
+                };
                 region = region.pinned(n + i, value);
             }
             let region = region.project(0..n);
@@ -575,6 +569,15 @@ impl Registry {
                 },
                 &mut out,
             );
+        }
+        if let Some(name) = unreported
+            && !matches!(spec.shape, crate::spec::Shape::Flag)
+            && !crate::region::Region::full(&space).is_subset(&covered, &space)
+        {
+            return Err(format!(
+                "`{}` reads `{name}`, which this device does not report, and picks nothing without it",
+                spec.id
+            ));
         }
         Ok(out)
     }

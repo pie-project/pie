@@ -567,14 +567,28 @@ fn a_when_may_read_a_fact_and_the_device_settles_it() {
     );
     assert_eq!(*p.pick::<Matmul>(&wide), Matmul::Gpu);
 
-    let (_, report) = r.resolve(
+    let (p, report) = r.resolve(
         std::slice::from_ref(&family),
         &Facts::of(&r).int("family", 9),
     );
+    assert!(report.rejected.is_empty(), "{report:?}");
+    assert_eq!(
+        *p.pick::<Matmul>(&wide),
+        Matmul::Gpu,
+        "a rung on a fact the device does not report does not hold"
+    );
+    let all_on_ane = layer(
+        family.source.clone(),
+        &FAMILY.replace(
+            "launch_us = [{ when = \"family >= 9\", value = 2 }, { value = 3 }]",
+            "launch_us = [{ when = \"ane\", value = 2 }, { when = \"not ane\", value = 3 }]",
+        ),
+    );
+    let (_, report) = r.resolve(&[all_on_ane], &Facts::of(&r).int("family", 9));
     assert!(
-        report.rejected[0]
-            .1
-            .contains("reads `ane` in `ane and rows >= 64`, and this device does not report ane"),
+        report.rejected[0].1.contains(
+            "`compiler.launch_us` reads `ane`, which this device does not report, and picks nothing without it"
+        ),
         "{report:?}"
     );
 
