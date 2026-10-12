@@ -1,106 +1,20 @@
-# Imagination PowerVR: what any device derives; the one-row decode kernel at 32 lanes and wider is in imagination/. Every decision the Vulkan registry declares, spelled out.
+# Imagination PowerVR without cooperative matrices: register-tiled prompts, the one-row decode kernel at 32 lanes and wider.
 api = 1
 
 [target]
 assumes = { vendor = "imagination", coopmat = false }
 
 [provenance]
-source = "the facts-derived profile pie ran before vendor files, for a PowerVR without cooperative matrices, carried over unchanged"
-
-[compiler]
-# A conditional node's fixed cost, in microseconds.
-# number in 0..1000000; no variables
-cond_fixed_us = 5.0
-# Each arm a conditional node adds, in microseconds.
-# number in 0..1000000; no variables
-cond_per_arm_us = 0.6
-# An attention op, in microseconds.
-# number in 0..1000000; no variables
-cost.attention_us = 60.0
-# A collective, in microseconds.
-# number in 0..1000000; no variables
-cost.collective_us = 50.0
-# A custom fused op, in microseconds.
-# number in 0..1000000; no variables
-cost.custom_us = 20.0
-# An elementwise op, in microseconds.
-# number in 0..1000000; no variables
-cost.elementwise_us = 4.0
-# A layout op, in microseconds.
-# number in 0..1000000; no variables
-cost.layout_us = 4.0
-# A matmul, in microseconds.
-# number in 0..1000000; no variables
-cost.linear_us = 40.0
-# A spatial op, in microseconds.
-# number in 0..1000000; no variables
-cost.spatial_us = 40.0
-# A region long enough to leave unsplit, in microseconds.
-# number in 0..1000000; no variables
-fat_region_us = 250.0
-# The least work a side stream is forked for, in microseconds.
-# number in 0..1000000; no variables
-fork_floor_us = 20.0
-# An empty kernel launch, in microseconds.
-# number in 0..1000000; no variables
-launch_us = 1.0
-# Side streams the compiler may fork independent regions onto.
-# integer in 0..8; no variables
-side_streams = 0
-
-[engine]
-# Rows from which a step is submitted a layer at a time rather than in one
-# submit: in one, a long prefill on a slow GPU outlasts the driver's
-# watchdog (about 2 s on Adreno, which a 64-row prefill reaches) and loses
-# the device. A split step is not recorded, so a desktop GPU with no such
-# watchdog may say 0, never.
-# integer in 0..1048576; no variables
-submit.split_rows = 32
+source = "the PowerVR branch of the facts-derived profile pie ran before vendor files, with the register-tiled prompts of #939"
 
 [kernel]
-# How unquantised matmuls read prompt rows.
-# one of tiled | coopmat; no variables
-gemm.path = "tiled"
-# How routed (mixture-of-experts) matmuls read their sorted rows.
-# one of tiled | coopmat; no variables
-moe.path = "tiled"
-# The row tile a routed matmul sorts its pairs into, by pairs per expert;
-# 1 leaves the pairs unsorted.
-# one of 1, 16, 32, 64; varies with nothing; fixed per op: per_expert
-moe.tile_rows = [
-  { when = "per_expert < 2", value = 1 },
-  { when = "per_expert >= 32", value = 32 },
-  { value = 16 },
-]
-# The kernel a dense affine-quantised matmul runs: the first rung whose
-# shape it fits that can run. `fill` is how full the device is: eighths of
-# a wave of 32x64 output tiles over its cores, so a rung can say "fills the
-# device" in a way that holds on GPUs of any size.
-# one of coopmat | register_tiled | tiled | one_row | qmv; varies with rows, fill; fixed per op: n, k, bits, group
 qmm = [
   { when = "rows > 32", use = "register_tiled", bm = 64, k16 = true },
   { when = "rows >= 12", use = "register_tiled", bm = 32, k16 = true },
+  { when = "subgroup >= 32", use = "one_row", lanes = 8, rows = 2 },
   { use = "qmv", vecs = 4 },
 ]
-# How many workgroups a decode row's keys may split across.
-# one of fixed | per_core; no variables
 sdpa.decode.split = [
   { when = "cores > 0", use = "per_core", per = 1 },
   { use = "fixed", groups = 16 },
 ]
-# The fewest keys a split slice holds.
-# integer in 1..65536; no variables
-sdpa.decode.split_min_keys = 256
-# Invocations a decode attention workgroup walks a row's keys with: more
-# walk more keys at once and merge more partial sums. The device's
-# workgroup memory caps it whatever the profile says.
-# one of 128, 256; no variables
-sdpa.decode.threads = 256
-# Query rows a tiled attention workgroup holds, 32 lanes each: fewer rows
-# mean more workgroups and less reuse of each key. The device's invocation
-# limit caps it whatever the profile says.
-# one of 8, 16, 32; no variables
-sdpa.tile_rows = 32
-# The fewest rows per request that take the tiled attention kernel.
-# integer in 1..4096; no variables
-sdpa.tile_rows_per_request = 32

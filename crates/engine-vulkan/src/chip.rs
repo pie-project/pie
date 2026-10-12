@@ -38,21 +38,15 @@ macro_rules! seeded {
     };
 }
 
-seeded!(
-    "qualcomm.toml",
-    "qualcomm/adreno-32.toml",
-    "qualcomm/adreno-64.toml",
-    "qualcomm/adreno-128.toml",
-    "imagination.toml",
-    "imagination/powervr-32.toml",
-    "imagination/powervr-64.toml",
-    "imagination/powervr-128.toml",
-);
+seeded!("qualcomm.toml", "imagination.toml");
+
+/// What a device no family file applies to runs.
+pub const DERIVED: &str = include_str!("derived.toml");
 
 pub static SHELF: Shelf = Shelf {
     backend: "vulkan",
     seeded: SEEDED,
-    derived: Some(|name, facts| derived(&Device::of(name, facts))),
+    derived: Some(|_, _| DERIVED.to_string()),
 };
 
 /// The cores a device is sized by when no extension reports a count.
@@ -69,29 +63,6 @@ pub struct Device {
 }
 
 impl Device {
-    /// The device a name and its facts describe.
-    #[must_use]
-    pub fn of(name: &str, facts: &Facts) -> Device {
-        let vendor = facts
-            .get("vendor")
-            .and_then(|i| usize::try_from(i).ok())
-            .and_then(|i| match FACTS[0].domain {
-                profile::Domain::Enum(names) => names.get(i).copied(),
-                _ => None,
-            })
-            .unwrap_or("other");
-        Device {
-            name: name.to_string(),
-            vendor,
-            subgroup: facts
-                .get("subgroup")
-                .and_then(|v| u32::try_from(v).ok())
-                .unwrap_or(0),
-            cores: facts.get("cores").and_then(|v| u32::try_from(v).ok()),
-            coopmat: facts.get("coopmat") == Some(1),
-        }
-    }
-
     #[must_use]
     pub fn facts(&self) -> Facts {
         let facts = Facts::of(registry())
@@ -110,46 +81,7 @@ impl Device {
     }
 }
 
-/// The profile a device no family file applies to runs, as a user file
-/// would spell it.
-#[must_use]
-pub fn derived(device: &Device) -> String {
-    let mut assumes = vec![
-        format!("vendor = \"{}\"", device.vendor),
-        format!("subgroup = {}", device.subgroup),
-        format!("coopmat = {}", device.coopmat),
-    ];
-    if let Some(cores) = device.cores {
-        assumes.push(format!("cores = {cores}"));
-    }
-    let mut kernel = Vec::new();
-    if device.coopmat {
-        kernel.push(
-            "qmm = [\n  { when = \"rows >= 12\", use = \"coopmat\" },\n  \
-             { when = \"rows >= 12\", use = \"tiled\", crossover_tg = 160 },\n  \
-             { use = \"qmv\", vecs = 4 },\n]"
-                .to_string(),
-        );
-        kernel.push("gemm.path = \"coopmat\"".to_string());
-        kernel.push("moe.path = \"coopmat\"".to_string());
-    }
-    if device.cores.is_some() {
-        kernel.push("sdpa.decode.split = { use = \"per_core\", per = 1 }".to_string());
-    } else {
-        kernel.push(format!(
-            "sdpa.decode.split = {{ use = \"fixed\", groups = {UNREPORTED_CORES} }}"
-        ));
-    }
-    format!(
-        "api = 1\n\n[target]\ndevice = \"{}\"\nassumes = {{ {} }}\n\n[kernel]\n{}\n",
-        device.name.replace('"', "'"),
-        assumes.join(", "),
-        kernel.join("\n")
-    )
-}
-
-/// The vendor's family file and the device file for its width, or the
-/// derived profile, then the user's file.
+/// The vendor's family file, or the derived profile, then the user's file.
 #[must_use]
 pub fn resolve(device: &Device, profiles: Option<&Path>) -> (Profile, Report) {
     SHELF.resolve(registry(), &device.name, &device.facts(), profiles)
@@ -191,6 +123,9 @@ mod tests {
         SHELF
             .check(registry(), &dir)
             .unwrap_or_else(|e| panic!("{e}"));
+        registry()
+            .parse(DERIVED, "derived.toml", profile::Strict::CheckedIn)
+            .unwrap_or_else(|e| panic!("{e}"));
     }
 
     fn device(vendor: &'static str, subgroup: u32, cores: Option<u32>, coopmat: bool) -> Device {
@@ -223,31 +158,13 @@ mod tests {
             (device("amd", 64, Some(60), false), &[]),
             (device("intel", 16, None, false), &[]),
             (device("qualcomm", 32, None, true), &[]),
-            (
-                device("qualcomm", 64, None, false),
-                &[qualcomm, "qualcomm/adreno-64.toml"],
-            ),
-            (
-                device("qualcomm", 128, Some(6), false),
-                &[qualcomm, "qualcomm/adreno-128.toml"],
-            ),
+            (device("qualcomm", 64, None, false), &[qualcomm]),
+            (device("qualcomm", 128, Some(6), false), &[qualcomm]),
             (device("qualcomm", 16, None, false), &[qualcomm]),
-            (
-                device("qualcomm", 32, None, false),
-                &[qualcomm, "qualcomm/adreno-32.toml"],
-            ),
-            (
-                device("imagination", 32, None, false),
-                &[imagination, "imagination/powervr-32.toml"],
-            ),
-            (
-                device("imagination", 64, None, false),
-                &[imagination, "imagination/powervr-64.toml"],
-            ),
-            (
-                device("imagination", 128, None, false),
-                &[imagination, "imagination/powervr-128.toml"],
-            ),
+            (device("qualcomm", 32, None, false), &[qualcomm]),
+            (device("imagination", 32, None, false), &[imagination]),
+            (device("imagination", 64, None, false), &[imagination]),
+            (device("imagination", 128, None, false), &[imagination]),
             (device("imagination", 16, Some(24), false), &[imagination]),
         ] {
             let (_, report) = resolve(&d, None);
@@ -305,7 +222,9 @@ mod tests {
             device("qualcomm", 64, None, false),
             device("qualcomm", 128, Some(6), false),
             device("qualcomm", 16, None, false),
+            device("qualcomm", 8, None, false),
             device("qualcomm", 32, None, false),
+            device("imagination", 8, None, false),
             device("imagination", 32, None, false),
             device("imagination", 64, None, false),
             device("imagination", 128, None, false),
