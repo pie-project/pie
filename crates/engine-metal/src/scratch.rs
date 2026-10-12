@@ -106,7 +106,13 @@ pub struct Scratch {
 /// The partials of a split matmul: up to `slices` split-K slices of
 /// [`SPLITK_ROWS`] rows, or for MPP four partitions of up to `mpp_rows`
 /// padded rows.
-fn split_partial_room(precast: Option<Room>, width: u64, mpp: bool, slices: u64, mpp_rows: u64) -> Room {
+fn split_partial_room(
+    precast: Option<Room>,
+    width: u64,
+    mpp: bool,
+    slices: u64,
+    mpp_rows: u64,
+) -> Room {
     let mut at = if mpp {
         precast.map_or(0, |room| room.at + room.bytes())
     } else {

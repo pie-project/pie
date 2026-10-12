@@ -250,10 +250,7 @@ pub struct FireCost {
 }
 
 pub struct Shell {
-    /// The chip's profile for this load, with what the model asks of it.
     tuning: kernels_metal::Tuning,
-    /// How that profile was resolved, for doctor.
-    chip_report: profile::Report,
     device: Context,
     keepalive: Option<crate::keepalive::KeepAlive>,
     pipelines: Pipelines,
@@ -331,8 +328,7 @@ pub struct Shell {
 
 impl Shell {
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
-        // A diffusion or conditioning deployment carries activations past the
-        // fp16 range on every chip: the model's to say, not the profile's.
+        // Diffusion and conditioning activations leave the fp16 range.
         let wide_range = boot.trace.values.iter().any(|decl| {
             matches!(
                 &decl.def,
@@ -966,7 +962,6 @@ impl Shell {
         };
         Ok(Shell {
             tuning,
-            chip_report,
             device,
             keepalive,
             pipelines: Pipelines::new(),
@@ -1138,16 +1133,9 @@ impl Shell {
         self.device.cores()
     }
 
-    /// The chip profile and model facts this load's kernels run under.
     #[must_use]
     pub fn tuning(&self) -> &kernels_metal::Tuning {
         &self.tuning
-    }
-
-    /// How this load's chip profile was resolved.
-    #[must_use]
-    pub fn chip_report(&self) -> &profile::Report {
-        &self.chip_report
     }
 
     #[must_use]

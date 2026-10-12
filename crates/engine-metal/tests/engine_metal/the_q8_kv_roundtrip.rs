@@ -34,8 +34,7 @@ fn f32s(v: &[u8]) -> Vec<f32> {
 }
 #[test]
 fn stored_q8_and_all_attention_routes_match_fp64() {
-    // The pool is read through the 8-bit kernels by its own flag, so this
-    // runs in-process; `PIE_TEST_MPP=1` lets prompt rows take the MPP kernel.
+    // `PIE_TEST_MPP=1` lets prompt rows take the MPP kernel.
     let tuning = if std::env::var("PIE_TEST_MPP").as_deref() == Ok("1") {
         engine_metal::chip::tuning("[kernel]\nsdpa.prefill = \"mpp\"", false)
     } else {
@@ -241,8 +240,9 @@ fn stored_q8_and_all_attention_routes_match_fp64() {
                     }
                 }
             }
-            let per = attn::split::workspace_words(attn::split::split_count(m as u32, 32), qh as u32)
-                .unwrap();
+            let per =
+                attn::split::workspace_words(attn::split::split_count(m as u32, 32), qh as u32)
+                    .unwrap();
             let words = m.div_ceil(8) as u32 * per;
             let workspace = upload(&vec![0xa5; words as usize * 4 + 64]);
             for route in 0..5 {
@@ -281,7 +281,10 @@ fn stored_q8_and_all_attention_routes_match_fp64() {
                         .unwrap()
                     );
                 } else if route == 0 {
-                    attn::decode(&sink, qt, &plan, &pool, window, d as u32, scale, yt).unwrap();
+                    attn::decode(
+                        &sink, &tuning, qt, &plan, &pool, window, d as u32, scale, yt,
+                    )
+                    .unwrap();
                 } else if route == 1 {
                     let tuning =
                         engine_metal::chip::tuning("[kernel]\nsdpa.prefill = \"mpp\"", false);
@@ -323,6 +326,7 @@ fn stored_q8_and_all_attention_routes_match_fp64() {
                 } else {
                     attn::decode_lse(
                         &sink,
+                        &tuning,
                         qt,
                         &plan,
                         &pool,

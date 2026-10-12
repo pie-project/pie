@@ -144,10 +144,18 @@ fn arbitrate(
             sm_scale,
             o,
             lse,
+            tuning,
         );
     }
     if tuning.sdpa_mpp()
-        && super::q8::mpp_fits(q, pool, head_dim, causal, lse.is_some(), tuning.sdpa_mpp_rows())
+        && super::q8::mpp_fits(
+            q,
+            pool,
+            head_dim,
+            causal,
+            lse.is_some(),
+            tuning.sdpa_mpp_rows(),
+        )
     {
         return super::q8::attention(
             ctx,
@@ -171,19 +179,7 @@ fn arbitrate(
         );
     }
     tiled(
-        ctx,
-        op,
-        q,
-        pool,
-        plan,
-        mask,
-        window,
-        causal,
-        head_dim,
-        sm_scale,
-        o,
-        lse,
-        tuning.sdpa_mpp(),
+        ctx, op, q, pool, plan, mask, window, causal, head_dim, sm_scale, o, lse, tuning,
     )
 }
 
@@ -336,8 +332,19 @@ pub fn prefill_with_scratch(
 ) -> Result<(), Error> {
     if tuning.sdpa_mpp()
         && super::split::try_paged(
-            ctx, q.data, pool, plan, plan.mask, window, true, head_dim, sm_scale, o, requests,
-            partials, tuning.sdpa_split(),
+            ctx,
+            q.data,
+            pool,
+            plan,
+            plan.mask,
+            window,
+            true,
+            head_dim,
+            sm_scale,
+            o,
+            requests,
+            partials,
+            tuning.sdpa_split(),
         )?
     {
         return Ok(());
@@ -366,8 +373,19 @@ pub fn masked_with_scratch(
 ) -> Result<(), Error> {
     if tuning.sdpa_mpp()
         && super::split::try_paged(
-            ctx, q.data, pool, plan, mask, window, causal, head_dim, sm_scale, o, requests,
-            partials, tuning.sdpa_split(),
+            ctx,
+            q.data,
+            pool,
+            plan,
+            mask,
+            window,
+            causal,
+            head_dim,
+            sm_scale,
+            o,
+            requests,
+            partials,
+            tuning.sdpa_split(),
         )?
     {
         return Ok(());

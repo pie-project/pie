@@ -7,7 +7,9 @@ use dtype::Dtype;
 /// The slices `rows` rows split into, aiming at `target` slices
 /// (`kernel.sdpa.split`) over the rows' 8-row groups.
 pub fn split_count(rows: u32, target: u32) -> u32 {
-    target.div_ceil(rows.div_ceil(8).max(1)).clamp(1, target.max(1))
+    target
+        .div_ceil(rows.div_ceil(8).max(1))
+        .clamp(1, target.max(1))
 }
 pub fn workspace_words(splits: u32, heads: u32) -> Option<u32> {
     heads

@@ -56,7 +56,6 @@ const SDPA_TILED: [&str; 4] = [
     "sdpa_paged_tiled_bfloat16_d_512",
 ];
 
-
 const SDPA_DECODE_LSE: [&str; 4] = [
     "sdpa_paged_decode_lse_bfloat16_d_64",
     "sdpa_paged_decode_lse_bfloat16_d_128",
@@ -407,6 +406,7 @@ fn vector(
     sm_scale: f32,
     o: Tensor,
     lse: Option<Tensor>,
+    tuning: &crate::Tuning,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, q.dtype, { Bf16 => () });
     debug_assert!(
@@ -415,8 +415,19 @@ fn vector(
     );
     if q8::enabled(pool, head_dim) {
         return q8::attention(
-            ctx, op, q, pool, plan, window, causal, head_dim, sm_scale, o, lse, false,
-            crate::tuning::SdpaMppRows::DEFAULT,
+            ctx,
+            op,
+            q,
+            pool,
+            plan,
+            window,
+            causal,
+            head_dim,
+            sm_scale,
+            o,
+            lse,
+            false,
+            tuning.sdpa_mpp_rows(),
         );
     }
     let shape = Paged::of(op, q, pool, window, causal, head_dim)?;
@@ -633,7 +644,7 @@ fn tiled(
     sm_scale: f32,
     o: Tensor,
     lse: Option<Tensor>,
-    allow_mpp: bool,
+    tuning: &crate::Tuning,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, q.dtype, { Bf16 => () });
     debug_assert!(
@@ -649,8 +660,19 @@ fn tiled(
             mask_stride: plan.mask_stride,
         };
         return q8::attention(
-            ctx, op, q, pool, &decode, window, causal, head_dim, sm_scale, o, lse, allow_mpp,
-            crate::tuning::SdpaMppRows::DEFAULT,
+            ctx,
+            op,
+            q,
+            pool,
+            &decode,
+            window,
+            causal,
+            head_dim,
+            sm_scale,
+            o,
+            lse,
+            tuning.sdpa_mpp(),
+            tuning.sdpa_mpp_rows(),
         );
     }
     let shape = Paged::of(op, q, pool, window, causal, head_dim)?;
@@ -710,6 +732,7 @@ fn tiled(
 #[allow(clippy::too_many_arguments)]
 pub fn decode(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     q: Tensor,
     plan: &DecodePlan,
     pool: &KvPool,
@@ -730,12 +753,14 @@ pub fn decode(
         sm_scale,
         o,
         None,
+        tuning,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn decode_lse(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     q: Tensor,
     plan: &DecodePlan,
     pool: &KvPool,
@@ -757,6 +782,7 @@ pub fn decode_lse(
         sm_scale,
         o,
         Some(lse),
+        tuning,
     )
 }
 
@@ -776,19 +802,7 @@ pub fn prefill(
     const OP: &str = "attention.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     tiled(
-        ctx,
-        OP,
-        q.data,
-        pool,
-        plan,
-        plan.mask,
-        window,
-        true,
-        head_dim,
-        sm_scale,
-        o,
-        None,
-        tuning.sdpa_mpp(),
+        ctx, OP, q.data, pool, plan, plan.mask, window, true, head_dim, sm_scale, o, None, tuning,
     )
 }
 
@@ -821,7 +835,7 @@ pub fn prefill_lse(
         sm_scale,
         o,
         Some(lse),
-        tuning.sdpa_mpp(),
+        tuning,
     )
 }
 
@@ -850,19 +864,7 @@ pub fn masked(
         ));
     }
     tiled(
-        ctx,
-        OP,
-        q.data,
-        pool,
-        plan,
-        mask,
-        window,
-        causal,
-        head_dim,
-        sm_scale,
-        o,
-        None,
-        tuning.sdpa_mpp(),
+        ctx, OP, q.data, pool, plan, mask, window, causal, head_dim, sm_scale, o, None, tuning,
     )
 }
 

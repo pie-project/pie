@@ -4,11 +4,10 @@
 //! dense MLP and wide projection reads the same as the GPU alone reads it.
 //! The same 27B artifact is served twice: once under a profile that keeps
 //! every unit on the GPU, once under one that splits with the Neural Engine,
-//! waiting for its programs to compile; the
-//! second serve must actually hand MLPs and projections over, its readout
-//! must sit on the first's — the
+//! waiting for its programs to compile. The second serve must actually hand
+//! MLPs and projections over, its readout must sit on the first's (the
 //! split is int8 activations and weights with fp16 sums, so a small gap is
-//! the expected cost — and a decode step after it must stay on the GPU.
+//! the expected cost), and a decode step after it must stay on the GPU.
 //!
 //! Needs a Metal device, the private Neural Engine framework, and a
 //! `metal`-stamped Qwen3.6-27B U4 artifact in `~/.pie/artifacts` (`pie model

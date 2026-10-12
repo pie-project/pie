@@ -131,12 +131,8 @@ fn target(
     })
 }
 
-/// How many 512-wide units of `all` the Neural Engine takes at `percent`.
-/// The two engines must finish together: on an M-series box without MPP
-/// serving Qwen3.6-27B at 640 rows, 16 of the MLP's 34 units (47%) was the
-/// floor of a curve that rose on both sides (14: +5%, 18: +8%, 8: +19%),
-/// and the projections split at the same share land a 640-row prefill in
-/// 3.44 s against the GPU's 5.51 s alone.
+/// How many 512-wide units of `all` the Neural Engine takes at `percent`,
+/// leaving the GPU at least one.
 fn share(all: u32, percent: u32) -> u32 {
     ((all * percent + 50) / 100).clamp(1, all.saturating_sub(1).max(1))
 }

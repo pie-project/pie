@@ -1,8 +1,8 @@
 use super::{DecodePlan, Paged};
 use crate::encode::{Arg, Ctx, Fire, Grid, stated};
+use crate::tuning::SdpaMppRows;
 use crate::{Error, KvPool, Tensor};
 use dtype::Dtype;
-use crate::tuning::SdpaMppRows;
 
 pub fn enabled(pool: &KvPool, dim: u32) -> bool {
     pool.q8
@@ -23,10 +23,9 @@ pub(super) fn mpp_fits(
     lse: bool,
     rows: SdpaMppRows,
 ) -> bool {
-    let SdpaMppRows { from, .. } = rows;
     causal
         && !lse
-        && q.rows >= from
+        && q.rows >= rows.from
         && matches!(dim, 128 | 256)
         && pool.page_size == 32
         && pool.keys.dtype == Dtype::Bf16
