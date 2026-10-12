@@ -92,6 +92,20 @@ impl<T: Decision> Ladder<T> {
             .map(|(_, value)| value)
     }
 
+    /// Every rung whose region holds `at` and whose value fits it, in
+    /// order: for code that tries each until one can run (a runtime
+    /// condition, such as scratch room, can still turn one down).
+    pub fn candidates<'a>(&'a self, at: &'a T::At) -> impl Iterator<Item = &'a T> + 'a {
+        let n = T::spec().vars.len();
+        self.rungs
+            .iter()
+            .filter(move |(region, value)| {
+                region.boxes().iter().any(|b| (0..n).all(|i| b[i].contains(at.coord(i))))
+                    && value.fits(at)
+            })
+            .map(|(_, value)| value)
+    }
+
     /// Every value the ladder can pick, for sizing an envelope.
     pub fn values(&self) -> impl Iterator<Item = &T> {
         self.rungs.iter().map(|(_, v)| v)

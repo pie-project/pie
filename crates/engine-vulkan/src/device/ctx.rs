@@ -864,7 +864,7 @@ impl Context {
     pub fn chip(&self) -> crate::chip::Device {
         crate::chip::Device {
             name: self.core.name.clone(),
-            vendor: crate::chip::vendor_of(self.core.vendor_id),
+            vendor: profile::vendor::of_pci(self.core.vendor_id),
             subgroup: self.core.subgroup_min,
             cores: self.core.cores,
             coopmat: self.core.features.coopmat,

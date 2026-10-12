@@ -143,13 +143,17 @@ pub struct Report {
     pub rejected: Vec<(Source, String)>,
     /// Decisions and constants the used file left to the registry.
     pub defaulted: Vec<String>,
+    /// Whether the used file says it was measured on this device: a file
+    /// carried over from another device's numbers says `measured = false`
+    /// in its provenance.
+    pub measured: bool,
 }
 
 impl Report {
     /// Whether the device runs untuned: nothing measured on it was used.
     #[must_use]
     pub fn untuned(&self) -> bool {
-        !self.used.is_tuned() || !self.rejected.is_empty()
+        !self.used.is_tuned() || !self.rejected.is_empty() || !self.measured
     }
 }
 
@@ -362,6 +366,15 @@ impl Registry {
         Ok(self.assemble(Some(&file), Source::User(origin.to_string())))
     }
 
+    /// The registry defaults with `overrides` (profile TOML after `api = 1`)
+    /// laid over them: for a test that exercises a decision on any device.
+    /// Panics on an override the registry refuses.
+    #[must_use]
+    pub fn with_overrides(&self, overrides: &str) -> Profile {
+        self.load_user(&format!("api = 1\n{overrides}"), "test overrides")
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
     /// Check a parsed file against the device: every assumed fact matches,
     /// and every alternative it picks has what it requires.
     fn admits(&self, file: &File, facts: &Facts) -> Result<(), String> {
@@ -465,6 +478,7 @@ impl Registry {
                 used: candidate.source.clone(),
                 rejected,
                 defaulted,
+                measured: file.measured(),
             };
             return (self.assemble(Some(&file), candidate.source.clone()), report);
         }
@@ -472,6 +486,7 @@ impl Registry {
             used: Source::Defaults,
             rejected,
             defaulted: Vec::new(),
+            measured: false,
         };
         (self.defaults(), report)
     }

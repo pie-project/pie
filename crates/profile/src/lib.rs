@@ -17,6 +17,7 @@ pub mod registry;
 pub mod render;
 pub mod shelf;
 pub mod spec;
+pub mod vendor;
 pub mod when;
 
 pub use ladder::{Anywhere, Decision, Ladder, Pick, Point, Rung};
@@ -30,7 +31,14 @@ pub use when::When;
 /// What `pie` prints when a device runs without a profile measured on it.
 #[must_use]
 pub fn untuned_hint(device: &str, backend: &str, id: &str, report: &Report) -> String {
-    let mut out = format!("{device}: no tuned profile, running {}.", report.used);
+    let mut out = if report.used.is_tuned() && report.rejected.is_empty() {
+        format!(
+            "{device}: running {}, whose numbers were carried over, not measured on it.",
+            report.used
+        )
+    } else {
+        format!("{device}: no tuned profile, running {}.", report.used)
+    };
     for (source, why) in &report.rejected {
         out.push_str(&format!("\n  {source} was not used: {why}"));
     }

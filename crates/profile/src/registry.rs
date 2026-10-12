@@ -104,6 +104,19 @@ pub struct File {
     pub defaulted: Vec<String>,
 }
 
+impl File {
+    /// Whether the file says it was measured on its device: `[provenance]
+    /// measured = false` marks numbers carried over from elsewhere. Only
+    /// reporting reads it; resolution never does.
+    #[must_use]
+    pub fn measured(&self) -> bool {
+        !self
+            .provenance
+            .iter()
+            .any(|(key, value)| key == "measured" && value.trim() == "false")
+    }
+}
+
 impl Registry {
     #[must_use]
     pub fn new(

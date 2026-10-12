@@ -448,6 +448,17 @@ fn resolution_takes_the_first_file_that_holds_and_says_why_others_did_not() {
     );
     assert!(p.on::<ResidualAddRmsnorm>(&profile::Anywhere));
 
+    let carried = Candidate {
+        text: M4.replace("note = \"hand\"", "measured = false"),
+        ..seeded.clone()
+    };
+    let (_, report) = r.resolve(std::slice::from_ref(&carried), &facts(9, true));
+    assert_eq!(report.used, carried.source);
+    assert!(
+        report.untuned(),
+        "a file carried over from other numbers is still worth tuning"
+    );
+
     let unknown = Facts::of(&r).flag("ane", true);
     let (_, report) = r.resolve(&[seeded], &unknown);
     assert!(

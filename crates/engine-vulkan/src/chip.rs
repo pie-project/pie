@@ -52,19 +52,6 @@ pub struct Device {
     pub coopmat: bool,
 }
 
-/// The vendor name a PCI vendor id stands for, as the `vendor` fact spells it.
-#[must_use]
-pub fn vendor_of(id: u32) -> &'static str {
-    match id {
-        0x10DE => "nvidia",
-        0x1002 | 0x1022 => "amd",
-        0x8086 => "intel",
-        0x106B => "apple",
-        0x5143 => "qualcomm",
-        _ => "other",
-    }
-}
-
 impl Device {
     #[must_use]
     pub fn facts(&self) -> Facts {
@@ -221,10 +208,7 @@ pub fn resolve_facts(name: &str, facts: &Facts, profiles: Option<&Path>) -> (Pro
 /// decision. Panics on an override the registry refuses.
 #[must_use]
 pub fn tuning(overrides: &str, cores: u32) -> kernels_vulkan::Tuning {
-    let profile = registry()
-        .load_user(&format!("api = 1\n{overrides}"), "test overrides")
-        .unwrap_or_else(|e| panic!("{e}"));
-    kernels_vulkan::Tuning::new(profile, cores)
+    kernels_vulkan::Tuning::new(registry().with_overrides(overrides), cores)
 }
 
 #[cfg(test)]

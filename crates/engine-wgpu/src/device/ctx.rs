@@ -613,7 +613,7 @@ impl Context {
     pub fn chip(&self) -> crate::chip::Device {
         crate::chip::Device {
             name: self.core.name.clone(),
-            vendor: crate::chip::vendor_of(self.core.info.vendor),
+            vendor: profile::vendor::of_pci(self.core.info.vendor),
             subgroup_min: self.core.subgroup_min,
             cores: self.core.cores,
             f16: self.core.enabled.f16,

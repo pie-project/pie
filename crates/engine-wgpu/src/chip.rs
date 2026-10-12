@@ -50,19 +50,6 @@ pub struct Device {
     pub f16: bool,
 }
 
-/// The vendor name a PCI vendor id stands for, as the `vendor` fact spells it.
-#[must_use]
-pub fn vendor_of(id: u32) -> &'static str {
-    match id {
-        0x10DE => "nvidia",
-        0x1002 | 0x1022 => "amd",
-        0x8086 => "intel",
-        0x106B => "apple",
-        0x5143 => "qualcomm",
-        _ => "other",
-    }
-}
-
 impl Device {
     #[must_use]
     pub fn facts(&self) -> Facts {

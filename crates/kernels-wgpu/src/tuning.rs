@@ -9,10 +9,7 @@ use profile::{Anywhere, Decision, Domain, Profile, Registry, Var};
 
 /// What the wgpu engine reads off its adapter.
 pub const FACTS: &[Var] = &[
-    Var::fixed(
-        "vendor",
-        Domain::Enum(&["nvidia", "amd", "intel", "apple", "qualcomm", "other"]),
-    ),
+    Var::fixed("vendor", Domain::Enum(profile::vendor::NAMES)),
     // The narrowest subgroup the adapter may run a dispatch at; absent
     // without the subgroup feature.
     Var::fixed("subgroup_min", Domain::COUNT),

@@ -13,10 +13,7 @@ use profile::{Anywhere, Decision, Domain, Profile, Registry, Var};
 /// What the Vulkan engine measures about its device, for `target.assumes`,
 /// `target.match` and what an alternative requires.
 pub const FACTS: &[Var] = &[
-    Var::fixed(
-        "vendor",
-        Domain::Enum(&["nvidia", "amd", "intel", "apple", "qualcomm", "other"]),
-    ),
+    Var::fixed("vendor", Domain::Enum(profile::vendor::NAMES)),
     // The narrowest subgroup a pipeline may be compiled at.
     Var::fixed("subgroup", Domain::COUNT),
     // Multiprocessors or compute units; absent where no extension says.
