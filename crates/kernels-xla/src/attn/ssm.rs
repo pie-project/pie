@@ -26,12 +26,6 @@ use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 /// The slot a write that must not land is routed to.
 pub(crate) const DROP: i64 = i32::MAX as i64;
 
-// Tokens per chunk of the scalar-decay (GDN) chunked scan are
-// `kernel.ssm.long_chunk` when the fire's lanes average at least that many
-// rows, else `kernel.ssm.chunk` (every lane pads its last chunk); the
-// per-channel-decay (KDA) scan's intra-chunk decay is a `[C, C, d]` product,
-// so it chunks finer, at `kernel.ssm.kda_chunk`.
-
 /// The GDN's q/k l2-norm epsilon, as the GPU kernels state it.
 const GDN_EPS: f64 = 1e-6;
 
@@ -302,11 +296,6 @@ pub(crate) fn land_slots(
     )?;
     f.reshape(out, &[n, width])
 }
-
-// Lanes a decode-form delta rule moves per gather → step → scatter round
-// are small enough that a round's gathered and updated states stay on chip
-// (`Tuning::decode_round_bytes`, a quarter of VMEM): a whole 64-lane fire of
-// 1 MiB states does not, and every intermediate then goes through HBM.
 
 // -------------------------------------------------------------------- lanes
 
@@ -1509,11 +1498,11 @@ fn delta(
         DeltaLanes::Decode => i64::from(rows),
         DeltaLanes::Ragged(ip) | DeltaLanes::Committed(ip, _) => ip.elements() as i64 - 1,
     };
-    let tuning = ctx.tuning();
-    let chunk = input.chunk(i64::from(rows), lanes_n, tuning.ssm);
-    let chunk = chunk.min(i64::from(rows.next_power_of_two().max(8)));
     let t = i64::from(rows);
     ctx.emit(&mut |cx| {
+        let tuning = cx.tuning();
+        let chunk = input.chunk(t, lanes_n, tuning.ssm);
+        let chunk = chunk.min(i64::from(rows.next_power_of_two().max(8)));
         let raw = input.raw(cx)?;
         let slab = cx.read(state.state)?;
         let (yv, slab) = match lanes {

@@ -857,9 +857,6 @@ impl Flashed {
 
 // ------------------------------------------------------------------ drivers
 
-// One chunk's element budget and the blocked driver's rows per block and
-// keys per chunk are `kernel.attn.*` (`Tuning::chunks`).
-
 /// The keys a per-row walk visits.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum KeyList {
@@ -1747,7 +1744,16 @@ pub(crate) fn attend(ctx: &Ctx<'_>, call: Paged, pool: &KvPool) -> Result<(), Er
         let flashed = match (walk, sel) {
             (_, Some((sel, ratio))) => {
                 let table = selected_positions(f, sel, qpos, ratio)?;
-                per_row(f, &planes, &heads, &rule, &rs, KeyList::Table(table), scale, ch)?
+                per_row(
+                    f,
+                    &planes,
+                    &heads,
+                    &rule,
+                    &rs,
+                    KeyList::Table(table),
+                    scale,
+                    ch,
+                )?
             }
             (Walk::Blocked, None) => blocked(
                 f,

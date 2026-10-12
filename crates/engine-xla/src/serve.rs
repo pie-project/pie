@@ -232,14 +232,9 @@ pub struct FireCost {
 /// Fields drop in order: every buffer (weights, pools) goes before the
 /// device whose client made it.
 pub struct Shell {
-    /// The TPU profile's kernel decisions this load runs under.
     tuning: kernels_xla::tuning::Tuning,
-    /// The profile's engine settings (padding, weight layouts).
-    engine: crate::chip::Engine,
-    /// What the device is, by its kind.
+    pad: crate::chip::Pad,
     tpu: crate::chip::Tpu,
-    /// How that profile was resolved, for doctor.
-    chip_report: profile::Report,
     handles: Handles,
     trace: Trace,
     compiled: CompiledModel,
@@ -351,33 +346,10 @@ fn classes_running(
     set
 }
 
-// The device headroom is `Tpu::headroom`; the padding constants (rows of
-// room past the fire limit, the mixed fire's host lane rung, the least page
-// bound, and how far apart rungs sit) are `engine.pad.*` (`chip::Pad`).
-
 impl Shell {
-    /// The TPU profile's kernel decisions this load runs under.
-    #[must_use]
-    pub fn tuning(&self) -> kernels_xla::tuning::Tuning {
-        self.tuning
-    }
-
-    /// The TPU this load runs on, by its device kind.
     #[must_use]
     pub fn tpu(&self) -> crate::chip::Tpu {
         self.tpu
-    }
-
-    /// The profile's padding of fires to canonical shapes.
-    #[must_use]
-    pub(crate) fn pad(&self) -> crate::chip::Pad {
-        self.engine.pad
-    }
-
-    /// How this load's TPU profile was resolved.
-    #[must_use]
-    pub fn chip_report(&self) -> &profile::Report {
-        &self.chip_report
     }
 
     /// Loads with the voxel ladder derived from the plan (engine-cuda's
@@ -539,12 +511,16 @@ impl Shell {
         let device_cap = working
             .saturating_sub(crate::store::pool_demand(&boot.trace, paging)?)
             .saturating_sub(tpu.headroom());
-        let layouts = crate::weights::Layouts::of(&engine);
         let weights = if device.is_dry() {
             // A device of the target's size would pre-scale an mxfp4 bank
             // when the weights leave room for it: under 5/8 of its HBM (20 of
             // a v6e's 32 GiB).
-            Weights::dry(&handles, &boot.trace, weight_floor < tpu.hbm_bytes() / 8 * 5, layouts)?
+            Weights::dry(
+                &handles,
+                &boot.trace,
+                weight_floor < tpu.hbm_bytes() / 8 * 5,
+                &engine,
+            )?
         } else {
             Weights::resident(
                 &device,
@@ -553,7 +529,7 @@ impl Shell {
                 boot.contract,
                 boot.checkpoint,
                 device_cap,
-                layouts,
+                &engine,
             )?
         };
         let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
@@ -707,9 +683,8 @@ impl Shell {
         );
         Ok(Shell {
             tuning,
-            engine,
+            pad,
             tpu,
-            chip_report,
             device,
             handles,
             trace: boot.trace,
@@ -1118,8 +1093,7 @@ impl Shell {
         }
         // The class that takes the rest of the rows: the one with the most.
         let host = by.iter().enumerate().max_by_key(|(_, e)| e.3)?.0;
-        let pad = self.pad();
-        let lane_rung = |n: u32| pad.rung(n);
+        let pad = self.pad;
         let buckets = &self.budgets.tokens.buckets;
         // A fire that decodes beside its prefill: the prefill's lanes at
         // the mixed host rung at least, and always a rest lane.
@@ -1128,7 +1102,7 @@ impl Shell {
         let ones: Vec<(u32, u64)> = by
             .iter()
             .flat_map(|&(_, word, n, _)| {
-                std::iter::repeat_n((1u32, word), (lane_rung(n) - n) as usize)
+                std::iter::repeat_n((1u32, word), (pad.rung(n) - n) as usize)
             })
             .collect();
         let exact = real_rows + ones.len() as u32;
@@ -1141,11 +1115,11 @@ impl Shell {
         let mut pads: Vec<(u32, u64)> = Vec::new();
         for (at, &(_, word, n, _)) in by.iter().enumerate() {
             let want = if at != host {
-                lane_rung(n)
+                pad.rung(n)
             } else if mixed {
-                lane_rung(n + 1).max(pad.mixed_host_rung) - 1
+                pad.rung(n + 1).max(pad.mixed_host_rung) - 1
             } else {
-                lane_rung(n + 1) - 1
+                pad.rung(n + 1) - 1
             };
             pads.extend(std::iter::repeat_n((1u32, word), (want - n) as usize));
         }
@@ -1501,7 +1475,7 @@ impl Shell {
         // any lane holds, rounded up to a rung (a power of two by default),
         // and at least the profile's page floor (short lanes share one
         // program as they grow).
-        let pad = self.pad();
+        let pad = self.pad;
         let cap = pad.rung(paging.pages_per_slot.max(1));
         let max_pages = geometries
             .first()
@@ -1516,11 +1490,7 @@ impl Shell {
         let max_pages = pad.rung(max_pages).min(cap);
         // A canonical prefill fire lays every table at the page cap, so its
         // program does not vary with how long its lanes are.
-        let max_pages = if canonical {
-            cap
-        } else {
-            max_pages
-        };
+        let max_pages = if canonical { cap } else { max_pages };
 
         let mut windows = Windows::of(
             &self.compiled,

@@ -25,12 +25,6 @@ pub trait Emit {
     fn scope(&self, name: &str) {
         let _ = name;
     }
-
-    /// The kernel decisions of the load this sink emits for; the registry
-    /// defaults for a sink no load tuned.
-    fn tuning(&self) -> crate::tuning::Tuning {
-        crate::tuning::Tuning::DEFAULT
-    }
 }
 
 pub type Ctx<'a> = dyn Emit + 'a;
@@ -61,15 +55,14 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// This view under `tuning`: what the sink's load runs under
-    /// ([`Emit::tuning`]); a nested view carries its parent's.
+    /// The kernel decisions of the sink's load; a nested view takes its
+    /// parent's.
     #[must_use]
     pub fn with_tuning(mut self, tuning: crate::tuning::Tuning) -> Self {
         self.tuning = tuning;
         self
     }
 
-    /// The kernel decisions this view emits under.
     #[must_use]
     pub fn tuning(&self) -> crate::tuning::Tuning {
         self.tuning

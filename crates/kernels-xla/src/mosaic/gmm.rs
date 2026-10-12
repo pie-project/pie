@@ -26,7 +26,6 @@
 use crate::hlo::{Built, Elem, Malformed};
 use crate::mosaic::{Body, Compiled, Grid, ICmp, Kernel, Operand, Sem, V, Window};
 
-
 /// How the bank `[E·N, K]` sits in HBM.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Orient {
@@ -58,10 +57,8 @@ pub struct Gmm {
     pub tiles: i64,
     /// Rows per tile (a multiple of 16: bf16 rows pack in pairs).
     pub tm: i64,
-    /// Weight bytes a block may hold (two are in flight, plus a bf16 copy):
-    /// `kernel.moe.gmm_block_mib`.
+    /// Weight bytes a block may hold (two are in flight, plus a bf16 copy).
     pub block_bytes: i64,
-    /// The scoped VMEM the kernel may ask for (`Tuning::vmem_cap`).
     pub vmem_cap: i64,
     pub k: i64,
     pub n: i64,
@@ -264,8 +261,7 @@ impl Gmm {
             k * cols * 2
         };
         let vmem = 2 * tm * k * 2 + 2 * k * cols * wb + convert + 2 * tm * cols * 4;
-        // The compiler's own scoped default (32 MiB on v6e) at least, where
-        // the device has that much.
+        // At least the compiler's own scoped default, where the device has it.
         let floor = (32 << 20).min(self.vmem_cap);
         let limit = (vmem * 2 + (8 << 20)).clamp(floor, self.vmem_cap);
         let kernel = Kernel {

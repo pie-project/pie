@@ -211,7 +211,6 @@ pub struct Signature {
 pub struct Tracer<'h> {
     handles: &'h Handles,
     state: RefCell<State>,
-    /// The kernel decisions of the load this traces for.
     tuning: kernels_xla::tuning::Tuning,
 }
 
@@ -242,7 +241,6 @@ impl<'h> Tracer<'h> {
         }
     }
 
-    /// The kernel decisions of the load this traces for.
     #[must_use]
     pub fn with_tuning(mut self, tuning: kernels_xla::tuning::Tuning) -> Self {
         self.tuning = tuning;
@@ -501,10 +499,6 @@ fn reinterpret(f: &mut Func, v: Val, root: Root, t: Tensor) -> Result<Val, kerne
 }
 
 impl Emit for Tracer<'_> {
-    fn tuning(&self) -> kernels_xla::tuning::Tuning {
-        self.tuning
-    }
-
     fn scope(&self, name: &str) {
         self.state.borrow_mut().func.set_scope(Some(name));
     }

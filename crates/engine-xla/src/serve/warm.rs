@@ -5,18 +5,14 @@
 //!
 //! The ladder, over the canonical shapes `fire_inner` pads fires to:
 //! - a decode at every lane rung, at every page bound from the page floor to
-//!   the context's, as many lanes as the
-//!   pool seats at half that bound;
+//!   the context's, as many lanes as the pool seats at half that bound;
 //! - a prefill at every row rung from 16, over 1 lane (one that fills its
 //!   rung, and one that leaves a padding lane) and, from 64 rows, 4 and 8;
 //! - a prefill beside a decode at every lane rung, at every row rung from
 //!   256 (such a fire pads its prefill lanes to the mixed host rung).
 //!
-//! Rungs, the padding room, the host rung and the page floor are the
-//! profile's `engine.pad.*` (`crate::chip::Pad`).
-//!
 //! Nothing runs: each shape is traced, and the new programs compile side by
-//! side (`compile_threads` at a time).
+//! side.
 //!
 //! Lanes are synthetic (zero tokens, as `dry.rs` builds them) in the plain
 //! text classes; they share pages, since what they write is never read. The
@@ -26,13 +22,6 @@ use poem_ir::Request;
 
 use super::{Lane, Seated, Shell};
 use crate::error::Result;
-
-/// Programs compiled side by side while warming: a compile is host work, one
-/// core each, so as many as the host has cores, up to 8 (each holds its
-/// program's whole HLO and compile state in host memory).
-fn compile_threads() -> usize {
-    std::thread::available_parallelism().map_or(1, |n| n.get()).min(8)
-}
 
 /// One synthetic lane: its word, its rows, and the pages it holds before
 /// them (a decode lane at a page bound holds all but one slot of them).
@@ -61,7 +50,7 @@ impl Shell {
             return Ok(0);
         }
         let buckets = self.budgets.tokens.buckets.clone();
-        let pad = self.pad();
+        let pad = self.pad;
         // The widest fire the runtime sends (the top rung is padding room).
         let widest = match buckets.as_slice() {
             [.., below, top] if pad.room > 0 && top - below == pad.room => *below,
@@ -75,7 +64,6 @@ impl Shell {
             .saturating_sub(pad.mixed_host_rung)
             .min(self.held.len() as u32);
         let cap = pad.rung(self.paging().pages_per_slot.max(1));
-        let top_pages = cap;
         let pool = self.paging().pages();
         let fresh = |word, rows| Want {
             word,
@@ -84,7 +72,7 @@ impl Shell {
         };
         let mut shapes: Vec<Vec<Want>> = Vec::new();
         let mut pages = pad.rung(pad.page_floor).min(cap);
-        while pages <= top_pages {
+        while pages <= cap {
             // A lane at this bound holds more than half of it.
             let seats = u32::try_from(pool / u64::from(pages / 2).max(1)).unwrap_or(u32::MAX);
             let most = lanes_cap.min(pad.rung(seats.max(1)));
@@ -165,8 +153,8 @@ impl Shell {
         Ok(fired)
     }
 
-    /// Compiles what the ladder traced, on up to `compile_threads` threads,
-    /// and seats each program under its keys.
+    /// Compiles what the ladder traced, a thread a core up to 8, and seats
+    /// each program under its keys.
     fn compile_deferred(&mut self, deferred: Vec<super::Deferred>) -> Result<()> {
         let mut texts: Vec<(&str, &crate::trace::Signature)> = Vec::new();
         let mut index: Vec<usize> = Vec::with_capacity(deferred.len());
@@ -179,7 +167,12 @@ impl Shell {
             });
             index.push(at);
         }
-        let threads = compile_threads().clamp(1, texts.len().max(1));
+        // Each compile holds its program's whole HLO and compile state in
+        // host memory: at most 8 at once.
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(8)
+            .clamp(1, texts.len().max(1));
         let next = std::sync::atomic::AtomicUsize::new(0);
         let device = &self.device;
         let mut programs: Vec<Option<Result<std::sync::Arc<crate::device::Program>>>> =

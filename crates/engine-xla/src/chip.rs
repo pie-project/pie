@@ -1,17 +1,12 @@
-//! The TPU's profile: the XLA registry, what a TPU of each device kind is
-//! (its facts), the checked-in profiles, and resolution for one load, by
-//! the device kind PJRT reports.
-//!
-//! XLA ships no fused kernels (`crate::FUSED` is empty), so the registry
-//! holds no `fuse.*` flag. See `.wiki/device-profiles.md`.
+//! The XLA profile registry, what a TPU of each device kind is, and
+//! resolution of one load's profile by the device kind PJRT reports.
 
 use std::path::Path;
 use std::sync::LazyLock;
 
 use profile::{Decision, Domain, Facts, Profile, Registry, Report, Shelf, Var};
 
-/// What the XLA engine knows about its device, for `target.assumes`: read
-/// from [`Tpu::of`] by device kind, since PJRT reports no sizes.
+/// Read from [`Tpu::of`] by device kind, since PJRT reports no sizes.
 pub const FACTS: &[Var] = &[
     Var::fixed("generation", Domain::COUNT),
     Var::fixed("hbm_gib", Domain::COUNT),
@@ -25,13 +20,12 @@ pub struct Tpu {
     pub generation: u32,
     pub hbm_gib: u32,
     pub vmem_mib: u32,
-    /// The MXU's side.
     pub mxu: u32,
 }
 
 impl Tpu {
-    /// A v6e: what every default was measured on, and what a kind this
-    /// table does not know is taken for (as every load was before).
+    /// What the defaults were measured on, and what an unknown kind is
+    /// taken for.
     pub const V6E: Tpu = Tpu {
         generation: 6,
         hbm_gib: 32,
@@ -39,11 +33,9 @@ impl Tpu {
         mxu: 256,
     };
 
-    /// The TPU PJRT names `kind` (`TPU v6 lite`, `TPU v5 lite`, `TPU v5`,
-    /// `TPU v4`). The v6e and v5e rows are the ones pie has run on; the v4
-    /// and v5p VMEM sizes are public figures not measured here, taken low
-    /// where sources disagree, since a VMEM figure too large fails to compile
-    /// and one too small only cuts blocks finer.
+    /// The TPU PJRT names `kind`. The v4 and v5p VMEM sizes are unmeasured
+    /// public figures, taken low: a VMEM figure too large fails to compile,
+    /// one too small only cuts blocks finer.
     #[must_use]
     pub fn of(kind: &str) -> Tpu {
         let k = kind.to_ascii_lowercase();
@@ -95,14 +87,12 @@ impl Tpu {
         i64::from(self.vmem_mib) << 20
     }
 
-    /// Whether the MXU multiplies fp8 natively (from v7).
     #[must_use]
     pub fn fp8_native(&self) -> bool {
         self.generation >= 7
     }
 
-    /// Device memory a load leaves free past its weights and pool: 2 GiB of
-    /// a v6e's 32, in proportion elsewhere.
+    /// Device memory a load leaves free past its weights and pool.
     #[must_use]
     pub fn headroom(&self) -> u64 {
         self.hbm_bytes() / 16
@@ -168,21 +158,16 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<MixedHostRung>()
         .add::<PageFloor>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
-    // The compiler's own defaults, two side streams included: what it
-    // priced XLA's regions by before the profile held them.
     poem_compiler::costs::register(&mut r, 2);
     r
 });
 
-/// Every decision the XLA engine exposes.
 #[must_use]
 pub fn registry() -> &'static Registry {
     &REGISTRY
 }
 
-/// The compiler's prices for a load under `profile`. XLA has no
-/// multiprocessor count; the compiler's default 132 keeps the plan every
-/// load compiled before.
+/// XLA has no multiprocessor count: the compiler's default 132 stands in.
 #[must_use]
 pub fn compiler_profile(profile: &Profile) -> poem_compiler::DeviceProfile {
     poem_compiler::DeviceProfile::of(profile, 132, &[], &[])
@@ -208,21 +193,14 @@ pub struct Pad {
 }
 
 impl Pad {
-    /// Today's shapes: powers of two, 128 rows of room, mixed fires' host
-    /// at 16 lanes, tables at 16 pages at least.
-    pub const DEFAULT: Pad = Pad {
-        growth: 200,
-        room: 128,
-        mixed_host_rung: 16,
-        page_floor: 16,
-    };
-
     /// The rung after `r`: `growth` percent of it, rounded up, and one more
     /// at least.
     #[must_use]
     pub fn next(&self, r: u32) -> u32 {
         let up = (u64::from(r) * u64::from(self.growth)).div_ceil(100);
-        u32::try_from(up).unwrap_or(u32::MAX).max(r.saturating_add(1))
+        u32::try_from(up)
+            .unwrap_or(u32::MAX)
+            .max(r.saturating_add(1))
     }
 
     /// The least rung at or above `n` (1 for 0): at growth 200, the power
@@ -279,15 +257,13 @@ macro_rules! seeded {
 
 seeded!("tpu-v6-lite.toml");
 
-/// Where XLA's profiles live.
 pub static SHELF: Shelf = Shelf {
     backend: "xla",
     seeded: SEEDED,
 };
 
-/// Resolve the profile one load on a device of `kind` runs under: the
-/// user's file, then the checked-in one, then the defaults (which are the
-/// v6e's), against the facts of the TPU that kind names.
+/// The profile a load on a device of `kind` runs under: the user's file,
+/// then the checked-in one, then the defaults.
 #[must_use]
 pub fn resolve(kind: &str, profiles: Option<&Path>) -> (Profile, Report) {
     SHELF.resolve(registry(), kind, &Tpu::of(kind).facts(), profiles)
@@ -322,8 +298,19 @@ mod tests {
             kernels_xla::tuning::Tuning::DEFAULT
         );
         assert_eq!(Engine::of(&profile), Engine::of(&registry().defaults()));
-        assert_eq!(Engine::of(&profile).pad, Pad::DEFAULT);
-        assert_eq!(compiler_profile(&profile), poem_compiler::DeviceProfile::default());
+        assert_eq!(
+            Engine::of(&profile).pad,
+            Pad {
+                growth: 200,
+                room: 128,
+                mixed_host_rung: 16,
+                page_floor: 16,
+            }
+        );
+        assert_eq!(
+            compiler_profile(&profile),
+            poem_compiler::DeviceProfile::default()
+        );
         let (_, report) = resolve("TPU v5 lite", None);
         assert_eq!(report.used, profile::Source::Defaults);
     }
@@ -344,14 +331,16 @@ mod tests {
 
     #[test]
     fn the_default_padding_is_powers_of_two() {
-        let pad = Pad::DEFAULT;
+        let pad = Engine::of(&registry().defaults()).pad;
         for n in 0..5000u32 {
             assert_eq!(pad.rung(n), n.max(1).next_power_of_two(), "{n}");
         }
-        assert_eq!(pad.ladder(2048), vec![1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]);
+        assert_eq!(
+            pad.ladder(2048),
+            vec![1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+        );
         assert_eq!(pad.ladder(100), vec![1, 2, 4, 8, 16, 32, 64, 100]);
         let finer = Pad { growth: 150, ..pad };
         assert_eq!(finer.ladder(40), vec![1, 2, 3, 5, 8, 12, 18, 27, 40]);
     }
 }
-

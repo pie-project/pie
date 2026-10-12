@@ -4,7 +4,6 @@
 //! The device types come from `engine_xla::trace::storage`, as the engine's
 //! tracer makes them.
 
-use kernels_xla::tuning::MoePath;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 
@@ -15,6 +14,7 @@ use engine_xla::pjrt::Arg;
 use engine_xla::trace::storage;
 use kernels_xla::hlo::{Func, Val, bf16_bits};
 use kernels_xla::linear::{moe, quant};
+use kernels_xla::tuning::{MoePath, Tuning};
 use kernels_xla::{Bank, Cx, Emit, Env, Tensor, layout, pack};
 
 fn hash(i: usize, seed: u32) -> u32 {
@@ -38,19 +38,10 @@ fn bf16s(xs: &[f32]) -> Vec<u8> {
 }
 
 /// Host arrays in their landed form, run through one module.
+#[derive(Default)]
 struct Native {
     planes: Vec<(Dtype, u32, u32, Vec<u8>)>,
-    /// The kernel decisions the trace emits under.
-    tuning: kernels_xla::tuning::Tuning,
-}
-
-impl Default for Native {
-    fn default() -> Native {
-        Native {
-            planes: Vec::new(),
-            tuning: kernels_xla::tuning::Tuning::DEFAULT,
-        }
-    }
+    tuning: Tuning,
 }
 
 impl Native {
@@ -158,23 +149,19 @@ impl Env for Roots {
 }
 
 struct Tracer {
-    tuning: kernels_xla::tuning::Tuning,
+    tuning: Tuning,
     func: RefCell<Func>,
     env: RefCell<Roots>,
 }
 
 impl Emit for Tracer {
-    fn tuning(&self) -> kernels_xla::tuning::Tuning {
-        self.tuning
-    }
-
     fn emit(
         &self,
         body: &mut dyn FnMut(&mut Cx<'_>) -> Result<(), kernels_xla::Error>,
     ) -> Result<(), kernels_xla::Error> {
         let mut func = self.func.borrow_mut();
         let mut env = self.env.borrow_mut();
-        let mut cx = Cx::new(&mut func, &mut *env);
+        let mut cx = Cx::new(&mut func, &mut *env).with_tuning(self.tuning);
         body(&mut cx)
     }
 }
@@ -447,9 +434,9 @@ fn routed_banks_read_native_codes_and_prescaled_weights_every_way() {
     routes[1] = -1;
     for path in [MoePath::All, MoePath::Slice, MoePath::Ragged] {
         let mut nat = Native {
-            tuning: kernels_xla::tuning::Tuning {
+            tuning: Tuning {
                 moe_path: path,
-                ..kernels_xla::tuning::Tuning::DEFAULT
+                ..Tuning::DEFAULT
             },
             ..Native::default()
         };

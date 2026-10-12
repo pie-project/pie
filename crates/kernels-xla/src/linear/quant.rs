@@ -45,10 +45,7 @@ use crate::linear::gemm::{dot_split, extent, head_rows, project};
 use crate::tensor::{Bank, Tensor};
 
 /// Whether an `m`-row projection over `groups` groups of a packed bank runs
-/// group-batched: up to `kernel.quant.decode`'s `max_cells` of `rows ·
-/// groups`; past it the weight is decoded once and contracted densely
-/// (measured on v6e: at 8 rows group-batched wins down to groups of 16; at
-/// 64 rows over 64 groups the dense decode wins).
+/// group-batched; past it the weight is decoded once and contracted densely.
 pub(crate) fn grouped(cx: &Cx<'_>, m: i64, groups: i64) -> bool {
     m * groups <= cx.tuning().grouped.max_cells
 }
@@ -465,11 +462,8 @@ pub(crate) fn contract_native(
     };
     let q = code_values(cx, codes, Elem::Bf16)?;
     let q = cx.reshape(q, &[n, groups, k / groups])?;
-    // Up to `kernel.quant.decode`'s `max_rows` a native bank runs
-    // group-batched: the dot contracts each group on its own and the
-    // factors scale the `[G, m, n]` partials, so only a free convert feeds
-    // the MXU (measured on v6e: at bf16 speed up to 64 rows; past it
-    // decoding the weight once wins).
+    // Group-batched: the dot contracts each group on its own and the factors
+    // scale the `[G, m, n]` partials, so only a free convert feeds the MXU.
     if m <= cx.tuning().grouped.max_rows {
         let xp = cx.reshape(x, &[m, groups, k / groups])?;
         let mut out = grouped_dot(cx, xp, q, factor)?;

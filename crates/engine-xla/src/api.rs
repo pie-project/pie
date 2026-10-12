@@ -414,7 +414,6 @@ impl Engine for Xla {
                 domain: MemoryDomain::XlaDevice(boot.ordinal),
                 sms: 1,
                 unified_memory: false,
-                // Native fp8 MXUs come with v7 (`chip::Tpu::fp8_native`).
                 fp8_native: shell.tpu().fp8_native(),
                 native_mxfp4_moe: false,
                 storage_alignment: 256,

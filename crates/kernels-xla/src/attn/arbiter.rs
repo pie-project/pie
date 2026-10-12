@@ -1,7 +1,6 @@
 //! The prefill entries engine dispatches call (kernels-wgpu `attn::arbiter`),
-//! with Metal's `causal` flag on the masked forms. The walk is the paged
-//! driver's automatic one (`kernel.attn.per_row_max` rows per lane gather by
-//! row, more walk row blocks). `requests` and the GPU tuning argument are
+//! with Metal's `causal` flag on the masked forms. The paged driver picks
+//! the walk (`Walk::Auto`); `requests` and the GPU tuning argument are
 //! dropped.
 
 #![allow(clippy::too_many_arguments)]
@@ -36,8 +35,6 @@ fn call(
         sm_scale,
         o,
         lse,
-        // How many rows per lane gather by row is `kernel.attn.per_row_max`,
-        // which the paged driver reads (`Walk::Auto`).
         walk: Walk::Auto,
         selection: None,
         rel: None,
@@ -134,9 +131,7 @@ pub fn masked(
     const OP: &str = "attention.masked";
     u8_mask(OP, mask)?;
     let tables = Tables::prefill(plan).with_mask(mask);
-    let c = call(
-        OP, q, tables, window, causal, head_dim, sm_scale, o, None,
-    );
+    let c = call(OP, q, tables, window, causal, head_dim, sm_scale, o, None);
     attend(ctx, c, pool)
 }
 

@@ -202,7 +202,16 @@ pub fn forward(
             rows.begin = Some(lo);
         }
         let planes = Planes::Plain { k: kv, v: vv };
-        let fl = blocked(f, &planes, &heads, &rule, &rows, nk, f64::from(sm_scale), ch)?;
+        let fl = blocked(
+            f,
+            &planes,
+            &heads,
+            &rule,
+            &rows,
+            nk,
+            f64::from(sm_scale),
+            ch,
+        )?;
         cx.write(o, fl.o)
     })
 }

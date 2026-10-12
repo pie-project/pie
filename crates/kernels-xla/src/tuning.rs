@@ -1,10 +1,5 @@
-//! Every hardware-dependent decision the XLA kernels read, declared for the
-//! XLA profile registry, and [`Tuning`]: the values one load runs under.
-//!
-//! The defaults are the numbers measured on a TPU v6e, the one generation
-//! tuned so far: XLA compiles for any, and a guess would serve no better.
-//! What a TPU is (its VMEM) comes from the engine's device facts, not from
-//! a decision: [`Tuning::on`].
+//! The XLA kernels' profile decisions and [`Tuning`], the values one load
+//! runs under. The defaults are the ones measured on a TPU v6e.
 
 use profile::{Decision, Profile, Registry};
 
@@ -73,9 +68,7 @@ macro_rules! moe_costs {
     };
 }
 
-// The automatic formulation's cost model (`linear::moe`), measured on v6e
-// for gpt-oss: where slicing, the loop, every expert and the ragged dot
-// cross over is a ratio of HBM bandwidth to a dot's fixed cost.
+// The automatic formulation's cost model (`linear::moe`).
 moe_costs! {
     MoeDenseAllMi = "kernel.moe.cost.dense_all_mi", 1..=4096, 128,
         "Up to this many Mi f32 partials, every row runs against every expert.";
@@ -154,7 +147,6 @@ pub struct SsmLongChunk(pub u32);
 #[decision(id = "kernel.ssm.kda_chunk", constant(set(8, 16, 32)), default = 16, tune = search)]
 pub struct SsmKdaChunk(pub u32);
 
-/// Register every decision this crate reads.
 pub fn register(registry: &mut Registry) {
     registry
         .add::<MoePath>()
@@ -180,7 +172,6 @@ pub fn register(registry: &mut Registry) {
         .add::<SsmKdaChunk>();
 }
 
-/// The automatic MoE formulation's cost model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MoeCosts {
     pub dense_all: i64,
@@ -193,15 +184,14 @@ pub struct MoeCosts {
     pub whole_partial_fs: i64,
 }
 
-/// How a quantized projection runs group-batched: the most `rows · groups`
-/// of a packed bank and the most rows of a native one (0 never).
+/// The most `rows · groups` of a packed bank and the most rows of a native
+/// one that run group-batched (0 never).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Grouped {
     pub max_cells: i64,
     pub max_rows: i64,
 }
 
-/// One attention chunk's shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Chunks {
     /// Elements one chunk's largest intermediate may hold.
@@ -210,7 +200,6 @@ pub struct Chunks {
     pub block_keys: i64,
 }
 
-/// The chunked scans' chunk lengths.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SsmChunks {
     pub chunk: i64,
@@ -218,11 +207,9 @@ pub struct SsmChunks {
     pub kda_chunk: i64,
 }
 
-/// The kernel decisions one load runs under, read once from its profile,
-/// and the device's VMEM.
+/// The kernel decisions one load runs under, and the device's VMEM.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tuning {
-    /// A formulation the profile forces, or `Auto`.
     pub moe_path: MoePath,
     pub moe_loop_unroll: i64,
     pub moe_loop_tile_max: i64,
@@ -233,16 +220,13 @@ pub struct Tuning {
     pub attn_per_row_max: i64,
     pub chunks: Chunks,
     pub ssm: SsmChunks,
-    /// The device's VMEM: what a Mosaic kernel's scoped limit and an
-    /// on-chip working set are sized against.
     pub vmem_bytes: i64,
 }
 
 impl Tuning {
-    /// A v6e's VMEM, which every default here was measured under.
     pub const V6E_VMEM: i64 = 128 << 20;
 
-    /// The registry defaults on a v6e, for an emitter no load has tuned.
+    /// The registry defaults on a v6e.
     pub const DEFAULT: Tuning = Tuning {
         moe_path: MoePath::Auto { gmm: true },
         moe_loop_unroll: 2,
@@ -277,13 +261,6 @@ impl Tuning {
         vmem_bytes: Self::V6E_VMEM,
     };
 
-    /// `profile`'s decisions on a v6e.
-    #[must_use]
-    pub fn of(profile: &Profile) -> Tuning {
-        Self::on(profile, Self::V6E_VMEM)
-    }
-
-    /// `profile`'s decisions on a device with `vmem_bytes` of VMEM.
     #[must_use]
     pub fn on(profile: &Profile, vmem_bytes: i64) -> Tuning {
         let n = |v: u32| i64::from(v);
@@ -331,24 +308,29 @@ impl Tuning {
         }
     }
 
-    /// Whether the automatic formulation may take the grouped-matmul kernel.
     #[must_use]
     pub fn moe_gmm(&self) -> bool {
         matches!(self.moe_path, MoePath::Auto { gmm: true } | MoePath::Gmm)
     }
 
     /// The scoped VMEM a Mosaic kernel may ask for: 110 of a v6e's 128 MiB,
-    /// in proportion on another device.
+    /// in proportion elsewhere.
     #[must_use]
     pub fn vmem_cap(&self) -> i64 {
         self.vmem_bytes / 128 * 110
     }
 
-    /// Bytes of states a decode-form delta rule's round may gather: a
-    /// quarter of VMEM (32 MiB on a v6e), so a round stays on chip.
+    /// Bytes of states a decode-form delta rule's round may gather, so the
+    /// round stays on chip.
     #[must_use]
     pub fn decode_round_bytes(&self) -> i64 {
         self.vmem_bytes / 4
+    }
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self::DEFAULT
     }
 }
 
@@ -360,7 +342,7 @@ mod tests {
     fn the_default_tuning_is_the_registry_defaults() {
         let mut r = Registry::new("xla", &[], &["rows"]);
         register(&mut r);
-        assert_eq!(Tuning::of(&r.defaults()), Tuning::DEFAULT);
+        assert_eq!(Tuning::on(&r.defaults(), Tuning::V6E_VMEM), Tuning::DEFAULT);
     }
 
     #[test]
