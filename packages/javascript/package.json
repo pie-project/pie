@@ -12,5 +12,9 @@
   ],
   "scripts": {
     "test": "npm test --workspaces --if-present"
+  },
+  "//": "componentize-js imports @bytecodealliance/preview2-shim without depending on it, so it reads the hoisted copy; from 0.27 that shim preopens no directory by default and componentize-js reads no WIT. The pin keeps 0.25 hoisted; jco nests its own.",
+  "devDependencies": {
+    "@bytecodealliance/preview2-shim": "^0.25.0"
   }
 }
