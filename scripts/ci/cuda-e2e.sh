@@ -24,11 +24,11 @@ telemetry = false
 [model]
 name = "default"
 model = "Qwen/Qwen3.5-0.8B"
+device_memory_share = 0.85
 [engine]
 type = "cuda_native"
 device = ["cuda:0"]
 activation_dtype = "bfloat16"
-gpu_mem_utilization = 0.85
 [sandbox]
 allow_fs = false
 allow_network = true

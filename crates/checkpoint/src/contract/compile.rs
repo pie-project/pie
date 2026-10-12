@@ -62,13 +62,6 @@ impl Lowering {
             Lowering::Gather(_) => 1,
         }
     }
-
-    pub fn as_copy(&self) -> Option<&CopyList> {
-        match self {
-            Lowering::Copy(copies) => Some(copies),
-            Lowering::Gather(_) => None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,10 +78,6 @@ pub struct GatherList {
 impl GatherList {
     pub fn dst_row(&self) -> i64 {
         self.indices.len() as i64 * self.block
-    }
-
-    pub fn source_elements(&self) -> i64 {
-        self.rows * self.src_row
     }
 
     pub fn byte_geometry(&self, encoding: &Encoding) -> Result<GatherBytes, Error> {
@@ -165,18 +154,6 @@ pub struct CopyList {
 }
 
 impl CopyList {
-    pub fn run_count(&self) -> usize {
-        self.runs.len()
-    }
-
-    pub fn mean_run_elements(&self) -> i64 {
-        if self.runs.is_empty() {
-            0
-        } else {
-            self.elements / self.runs.len() as i64
-        }
-    }
-
     pub fn pieces(&self) -> Vec<Piece> {
         fold(self.runs.iter().map(seed).collect())
     }
@@ -197,26 +174,6 @@ impl CopyList {
 
     pub fn needs_zero_fill(&self) -> bool {
         self.runs.iter().any(|run| run.source == RunSource::Zero)
-    }
-
-    pub fn byte_runs(&self, encoding: &Encoding) -> Result<Vec<ByteRun>, Error> {
-        let scale = ByteScale::of(encoding);
-        self.runs
-            .iter()
-            .map(|run| {
-                Ok(ByteRun {
-                    source: match run.source {
-                        RunSource::Leaf { leaf, src_elem } => ByteRunSource::Leaf {
-                            leaf,
-                            src_offset: scale.offset(src_elem, "run source")?,
-                        },
-                        RunSource::Zero => ByteRunSource::Zero,
-                    },
-                    dst_offset: scale.offset(run.dst_elem, "run destination")?,
-                    len: scale.offset(run.len, "run length")?,
-                })
-            })
-            .collect()
     }
 
     pub fn byte_pieces(&self, encoding: &Encoding) -> Result<Vec<Rect>, Error> {

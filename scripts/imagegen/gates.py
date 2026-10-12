@@ -105,6 +105,7 @@ verbose = false
 [model]
 name = "gates-{name}"
 model = "{model}"
+device_memory_share = {mem}
 {voxels}
 
 [engine]
@@ -113,7 +114,6 @@ type = "cuda_native"
 device = ["cuda:0"]          # whatever CUDA_VISIBLE_DEVICES selects
 tensor_parallel_size = 1
 activation_dtype = "bfloat16"
-gpu_mem_utilization = {mem}
 # rows x submit depth, never the 4096 default: a 1024^2 job dies on its second
 # fire at the default ("wants 8192 kv tokens in one slot").
 max_model_len = {rows}

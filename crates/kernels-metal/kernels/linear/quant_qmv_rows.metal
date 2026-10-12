@@ -218,19 +218,29 @@ METAL_FUNC void qmv_rows_impl(
             pack, s, b, xb, roff, result);
       } else {
 
-// Bounding this row loop's unroll dodges a clang/Metal register-allocation
-// miscompile: at p=2 (values_per_thread=16, ~28 live result[row][r]
-// accumulators) a full unroll of the 7-trip loop corrupts the r=0
-// accumulator. This is a back-end register-pressure bug, not source UB --
-// unroll_count(4) and a simdgroup_barrier(mem_none) both make it correct.
-// The p=1 rungs (R in {2,3}) trip fewer than 4 times, so unroll_count(4)
-// still fully unrolls them: that hot path is byte-for-byte unchanged.
+// The rows loop at p>=2 (values_per_thread=16, ~28 live result[row][r]
+// accumulators) is not unrolled: unrolled, the Metal back end's register
+// allocator corrupts an accumulator (r=0 under an earlier compiler, r=1
+// under metalfe-32023.883), and which unroll count dodges it moves with the
+// compiler. The p=1 rungs (R in {2,3,4}) keep the unroll their hot path was
+// tuned at.
+      if (packs_per_thread == 1) {
 #pragma clang loop unroll_count(4)
-      for (int r = 0; r < R; r++) {
-        U sum = load_vector<T, U, values_per_thread, bits>(xb + roff[r], x_thread);
-        for (int row = 0; row < results_per_simdgroup; row++) {
-          result[row][r] += qdot_staged<U, values_per_thread, bits, packs_per_thread>(
-              pack[row], x_thread, s[row], b[row], sum);
+        for (int r = 0; r < R; r++) {
+          U sum = load_vector<T, U, values_per_thread, bits>(xb + roff[r], x_thread);
+          for (int row = 0; row < results_per_simdgroup; row++) {
+            result[row][r] += qdot_staged<U, values_per_thread, bits, packs_per_thread>(
+                pack[row], x_thread, s[row], b[row], sum);
+          }
+        }
+      } else {
+#pragma clang loop unroll(disable)
+        for (int r = 0; r < R; r++) {
+          U sum = load_vector<T, U, values_per_thread, bits>(xb + roff[r], x_thread);
+          for (int row = 0; row < results_per_simdgroup; row++) {
+            result[row][r] += qdot_staged<U, values_per_thread, bits, packs_per_thread>(
+                pack[row], x_thread, s[row], b[row], sum);
+          }
         }
       }
       }

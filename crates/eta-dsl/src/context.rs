@@ -134,10 +134,6 @@ pub(crate) fn release_channel_state(gid: u64) -> bool {
     CHANNELS_BY_GID.with_borrow_mut(|map| map.remove(&gid).is_some())
 }
 
-pub(crate) fn registered_channel_count() -> usize {
-    CHANNELS_BY_GID.with_borrow(|map| map.len())
-}
-
 pub(crate) fn is_tracing() -> bool {
     SESSION.with_borrow(|s| s.as_ref().map(|s| s.current.is_some()).unwrap_or(false))
 }

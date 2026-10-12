@@ -168,7 +168,6 @@ fn classify_terminal_outcome(value: u32) -> TerminalOutcome {
 
 #[derive(Debug)]
 enum SubmissionCompletionMode {
-    WakeOnly,
     Terminal { cell: OwnedTerminalCell },
 }
 
@@ -211,7 +210,6 @@ impl SubmissionCompletionState {
 
     fn terminal_result(&self) -> Option<Result<()>> {
         match &self.mode {
-            SubmissionCompletionMode::WakeOnly => None,
             SubmissionCompletionMode::Terminal { cell } => match cell.load() {
                 TerminalOutcome::Pending => None,
                 TerminalOutcome::Success => Some(Ok(())),
@@ -230,7 +228,6 @@ impl SubmissionCompletionState {
 
     fn terminal_cell_ptr(&self) -> Option<CellPtr> {
         match &self.mode {
-            SubmissionCompletionMode::WakeOnly => None,
             SubmissionCompletionMode::Terminal { cell } => Some(cell.as_mut_ptr()),
         }
     }
@@ -325,34 +322,6 @@ impl CompletionBroker {
                 cell: OwnedTerminalCell::new(),
             },
         )
-    }
-
-    #[must_use]
-    pub fn control_completion(
-        &self,
-        target_epoch: u64,
-    ) -> (CompletionTarget, SubmissionCompletion) {
-        let completion = self.submission_completion(target_epoch);
-        let target = CompletionTarget {
-            wait_id: completion.wait_id(),
-            target_epoch,
-            terminal_cell: completion
-                .terminal_cell_ptr()
-                .expect("control completion exposes a terminal cell"),
-        };
-        (target, completion)
-    }
-
-    #[must_use]
-    pub fn launch_completion(&self, target_epoch: u64) -> (CompletionTarget, SubmissionCompletion) {
-        let completion =
-            self.make_submission_completion(target_epoch, SubmissionCompletionMode::WakeOnly);
-        let target = CompletionTarget {
-            wait_id: completion.wait_id(),
-            target_epoch,
-            terminal_cell: CellPtr::NULL,
-        };
-        (target, completion)
     }
 
     pub fn close_all(&self, message: impl Into<String>) {

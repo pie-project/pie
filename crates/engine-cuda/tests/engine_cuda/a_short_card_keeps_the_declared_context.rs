@@ -91,13 +91,11 @@ fn a_short_card_keeps_the_declared_context() {
         page_size: PAGE,
         context: CONTEXT,
         slots: 256,
-        pages: 256 * CONTEXT / PAGE,
+        kv_budget: None,
+        memory_share: fraction(),
         ordinal: 0,
         graphs: engine_cuda::Graphs::On,
-        knobs: Knobs {
-            gpu_mem_utilization: fraction(),
-            ..Knobs::default()
-        },
+        knobs: Knobs::default(),
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         world: engine_cuda::World::default(),

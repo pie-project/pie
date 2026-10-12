@@ -179,57 +179,6 @@ impl Graph {
     }
 }
 
-pub fn capture_frontier(stream: *mut c_void) -> Result<Vec<*mut c_void>> {
-    #[cfg(feature = "cuda")]
-    {
-        use cudarc::driver::sys as dr;
-
-        let mut status = dr::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
-        let mut id: u64 = 0;
-        let mut graph: dr::CUgraph = core::ptr::null_mut();
-        let mut deps: *const dr::CUgraphNode = core::ptr::null();
-        let mut dep_count: usize = 0;
-        // SAFETY: every out-parameter is a live local; the stream is the
-        // shell's and this thread began the capture.
-        let code = unsafe {
-            let mut edges: *const dr::CUgraphEdgeData = core::ptr::null();
-            dr::cuStreamGetCaptureInfo_v3(
-                stream.cast(),
-                &raw mut status,
-                &raw mut id,
-                &raw mut graph,
-                &raw mut deps,
-                &raw mut edges,
-                &raw mut dep_count,
-            )
-        };
-        if code != dr::CUresult::CUDA_SUCCESS {
-            return Err(Fault::Device {
-                call: "cuStreamGetCaptureInfo_v3",
-                code: code as i32,
-            });
-        }
-        if status != dr::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE {
-            return Err(Fault::Device {
-                call: "cuStreamGetCaptureInfo_v3 (the stream is not capturing)",
-                code: status as i32,
-            });
-        }
-        if deps.is_null() || dep_count == 0 {
-            return Ok(Vec::new());
-        }
-        // SAFETY: the driver's array is `dep_count` handles long and lives
-        // until the next capture-mutating call, which is after this copy.
-        let frontier = unsafe { core::slice::from_raw_parts(deps, dep_count) };
-        Ok(frontier.iter().map(|node| node.cast()).collect())
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = stream;
-        Err(Fault::Runtimeless)
-    }
-}
-
 impl GraphExec {
     pub fn launch(&self, stream: *mut c_void) -> Result<()> {
         #[cfg(feature = "cuda")]
@@ -379,30 +328,6 @@ impl Event {
         }
         #[cfg(not(feature = "cuda"))]
         {
-            Err(Fault::Runtimeless)
-        }
-    }
-
-    pub fn elapsed_ms(&self, end: &Event) -> Result<f32> {
-        #[cfg(feature = "cuda")]
-        {
-            let mut ms: f32 = 0.0;
-            // SAFETY: both handles are live and this crate created them.
-            unsafe {
-                crate::device::ctx::check(
-                    "cudaEventElapsedTime",
-                    cudarc::runtime::sys::cudaEventElapsedTime(
-                        &raw mut ms,
-                        self.raw.cast(),
-                        end.raw.cast(),
-                    ),
-                )?;
-            }
-            Ok(ms)
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            let _ = end;
             Err(Fault::Runtimeless)
         }
     }

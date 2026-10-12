@@ -425,6 +425,18 @@ impl Pools {
         Ok(rows)
     }
 
+    /// `into.len()` bytes of plane `plane` (the pool's buffers in reserve
+    /// order) from `offset`, read where the host sees them: an elastic plane
+    /// through its alias, since its sparse view has no host address.
+    pub fn read_plane(&self, plane: usize, offset: u64, into: &mut [u8]) -> Result<()> {
+        self.planes
+            .get(plane)
+            .ok_or_else(|| Fault::Unbound {
+                what: format!("pool plane {plane}"),
+            })?
+            .read(offset, into)
+    }
+
     #[must_use]
     pub fn state_slot_bytes(&self) -> u64 {
         self.shapes
@@ -1079,14 +1091,12 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
     Ok(PoolDemand::of(trace, paging, None)?.bytes(paging.pages()))
 }
 
-/// The pages a load cannot do without: those `[engine] total_pages` states,
-/// or one context's when it is 0 and the pool is fitted to the device.
-#[must_use]
-pub fn least_pages(stated: u32, paging: Paging) -> u64 {
-    match stated {
-        0 => u64::from(paging.pages_per_slot),
-        stated => u64::from(stated),
-    }
+/// The bytes a load's pool takes at `paging`: the kv and state rows and the
+/// recurrent-state buffers beside them, what `[model] device_kv_budget`
+/// states for it.
+pub fn pool_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
+    let rs = crate::rs::Layout::read(trace)?;
+    Ok(PoolDemand::of(trace, paging, rs.as_ref())?.bytes(paging.pages()))
 }
 
 struct Planes {

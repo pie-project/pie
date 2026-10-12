@@ -145,8 +145,8 @@ def main() -> None:
                          "has to cover the widest prompt times the concurrency.")
     ap.add_argument("--pie-extra", default="",
                     help="Space-separated flags forwarded to pie_bench only "
-                         "(`--total-pages`, `--max-forward-requests`: the Metal "
-                         "engine derives its fleet from the page pool, and the "
+                         "(`--device-kv-budget`, `--max-forward-requests`: the Metal "
+                         "engine derives its fleet from the kv pool, and the "
                          "shared `--max-model-len` times the fleet is what it "
                          "has to fit).")
     ap.add_argument("--mlx-extra", default="", help="mlx_bench --server-extra (e.g. draft flags)")

@@ -62,10 +62,6 @@ impl Channel {
         context::release_channel_state(gid)
     }
 
-    pub fn registered_count() -> usize {
-        context::registered_channel_count()
-    }
-
     pub fn is_seeded(&self) -> bool {
         self.state.borrow().seeded
     }

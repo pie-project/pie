@@ -107,24 +107,6 @@ impl KvHandle {
     pub fn page_bytes(&self) -> u64 {
         self.layout.page_bytes()
     }
-
-    #[must_use]
-    pub fn page_capacity(&self) -> Option<u64> {
-        let mut capacity = None;
-        for region in &self.regions {
-            if region.page_stride == 0 || region.len % region.page_stride != 0 {
-                return None;
-            }
-            let pages = region.len / region.page_stride;
-            if capacity
-                .replace(pages)
-                .is_some_and(|current| current != pages)
-            {
-                return None;
-            }
-        }
-        capacity
-    }
 }
 
 pub trait KvExport {

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -43,9 +42,7 @@ pub struct ProcessCtx {
     /// script it runs.
     script: Option<Arc<Script>>,
 
-    dynamic_resource_map: HashMap<u32, ResourceAny>,
     guest_resource_map: Vec<(ResourceAny, u32)>,
-    next_dynamic_rep: u32,
     residency: Arc<Mutex<ProcessResidency>>,
     prewarm_permit: Option<OwnedSemaphorePermit>,
     bind_permit: Option<OwnedSemaphorePermit>,
@@ -212,9 +209,7 @@ impl ProcessCtx {
             network_allowed: policy.network.allow,
             scratch_dir,
             script,
-            dynamic_resource_map: HashMap::new(),
             guest_resource_map: Vec::new(),
-            next_dynamic_rep: 1,
             residency: {
                 let residency = Arc::new(Mutex::new(ProcessResidency::default()));
                 super::residency::register_residency(id, Arc::downgrade(&residency));
@@ -363,36 +358,10 @@ impl ProcessCtx {
             });
     }
 
-    pub fn alloc_dynamic_rep(&mut self) -> u32 {
-        let rep = self.next_dynamic_rep;
-        self.next_dynamic_rep = self.next_dynamic_rep.checked_add(1).unwrap();
-        rep
-    }
-
-    pub fn get_dynamic_resource(&self, rep: u32) -> Option<ResourceAny> {
-        self.dynamic_resource_map.get(&rep).copied()
-    }
-
     pub fn rep_for_guest_resource(&self, resource: ResourceAny) -> Option<u32> {
         self.guest_resource_map
             .iter()
             .find(|(r, _)| *r == resource)
             .map(|(_, rep)| *rep)
-    }
-
-    pub fn insert_dynamic_resource_mapping(&mut self, rep: u32, resource: ResourceAny) {
-        self.dynamic_resource_map.insert(rep, resource);
-        if self.rep_for_guest_resource(resource).is_none() {
-            self.guest_resource_map.push((resource, rep));
-        }
-    }
-
-    pub fn remove_dynamic_resource_mapping(&mut self, rep: u32) -> Option<ResourceAny> {
-        if let Some(resource) = self.dynamic_resource_map.remove(&rep) {
-            self.guest_resource_map.retain(|(r, _)| *r != resource);
-            Some(resource)
-        } else {
-            None
-        }
     }
 }

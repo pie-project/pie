@@ -71,10 +71,6 @@ fn forget_restart_state(process_id: ProcessId) {
 
 static RESTART_TOTAL: AtomicUsize = AtomicUsize::new(0);
 
-pub fn restart_total() -> usize {
-    RESTART_TOTAL.load(Relaxed)
-}
-
 #[derive(Debug, Clone)]
 pub enum ProcessEvent {
     Stdout(String),
@@ -96,16 +92,6 @@ impl ProcessEvent {
     }
 
     pub fn value(&self) -> &str {
-        match self {
-            Self::Stdout(v)
-            | Self::Stderr(v)
-            | Self::Message(v)
-            | Self::Return(v)
-            | Self::Error(v) => v,
-        }
-    }
-
-    pub fn into_value(self) -> String {
         match self {
             Self::Stdout(v)
             | Self::Stderr(v)

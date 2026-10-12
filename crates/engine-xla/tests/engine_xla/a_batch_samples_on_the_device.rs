@@ -237,7 +237,13 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
         page_size: 16,
         context,
         slots: lanes,
-        pages: lanes * context / 16,
+        kv_budget: common::kv_budget(
+            &deployment.trace(Platform::Xla),
+            context,
+            lanes,
+            lanes * context / 16,
+        ),
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         device: &DeviceBoot::default(),
         patches: None,
     })

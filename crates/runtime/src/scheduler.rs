@@ -277,24 +277,6 @@ fn rs_state_copy_plan(
     }))
 }
 
-pub fn submit_async(
-    request: crate::engine::FireRequest,
-    engine_idx: usize,
-    instance_id: u64,
-    pipeline_id: Option<ProcessId>,
-    completion: crate::engine::WorkItemCompletion,
-) -> Result<()> {
-    submit_async_with_kv_copy(
-        request,
-        engine_idx,
-        instance_id,
-        pipeline_id,
-        completion,
-        Vec::new(),
-        Vec::new(),
-    )
-}
-
 pub(crate) fn device_domain(engine_idx: usize) -> ::engine::MemoryDomain {
     crate::engine::get_spec(engine_idx)
         .map_or(::engine::MemoryDomain::HostPinned, |s| s.device_domain)
@@ -334,22 +316,6 @@ pub fn submit_async_with_kv_copy(
     )
 }
 
-pub fn submit_prebuilt_async(
-    request: crate::engine::FireRequest,
-    engine_idx: usize,
-    instance_id: u64,
-    completion: crate::engine::WorkItemCompletion,
-) -> Result<()> {
-    submit_prebuilt_async_with_kv_copy(
-        request,
-        engine_idx,
-        instance_id,
-        completion,
-        Vec::new(),
-        Vec::new(),
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn submit_prebuilt_async_with_kv_copy(
     request: crate::engine::FireRequest,
@@ -373,63 +339,6 @@ pub fn submit_prebuilt_async_with_kv_copy(
         completion,
         prelaunch_copy,
         None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn submit_prebuilt_async_with_kv_and_rs_copy(
-    request: crate::engine::FireRequest,
-    engine_idx: usize,
-    instance_id: u64,
-    completion: crate::engine::WorkItemCompletion,
-    copy_src: Vec<u32>,
-    copy_dst: Vec<u32>,
-    rs_copy_src: Vec<u32>,
-    rs_copy_dst: Vec<u32>,
-) -> Result<()> {
-    let prelaunch_copy = (!copy_src.is_empty()).then_some(::engine::KvCopy {
-        src: device_domain(engine_idx),
-        dst: device_domain(engine_idx),
-        src_page_ids: copy_src,
-        dst_page_ids: copy_dst,
-        moves: Vec::new(),
-        windowed: Vec::new(),
-    });
-    scheduler_handle(engine_idx)?.submit_prebuilt_with_copy(
-        request,
-        instance_id,
-        completion,
-        prelaunch_copy,
-        rs_state_copy_plan(rs_copy_src, rs_copy_dst)?,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn submit_prebuilt_tracked_async_with_kv_and_rs_copy(
-    request: crate::engine::FireRequest,
-    engine_idx: usize,
-    instance_id: u64,
-    pipeline_id: ProcessId,
-    completion: crate::engine::WorkItemCompletion,
-    copy_src: Vec<u32>,
-    copy_dst: Vec<u32>,
-    rs_copy_src: Vec<u32>,
-    rs_copy_dst: Vec<u32>,
-) -> Result<()> {
-    submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
-        &scheduler_handle(engine_idx)?,
-        request,
-        instance_id,
-        pipeline_id,
-        pipeline_id,
-        completion,
-        copy_src,
-        copy_dst,
-        rs_copy_src,
-        rs_copy_dst,
-        None,
-        /*hook_program=*/ false,
-        /*lora_program=*/ false,
     )
 }
 

@@ -22,14 +22,12 @@ impl DivClass {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Granularity {
     Request,
-    Token,
 }
 
 impl Granularity {
     fn as_str(self) -> &'static str {
         match self {
             Granularity::Request => "per-request",
-            Granularity::Token => "per-token",
         }
     }
 }
@@ -83,19 +81,6 @@ pub(crate) const SITE_EXPERT_WEIGHTS: &str = "expert_weights";
     dead_code,
     reason = "same as `SITE_EXPERT_WEIGHTS`: nothing reports a site, so only tests build one"
 )]
-pub(crate) fn expert_weights_site(experts: u32, top_k: u32) -> Site {
-    Site {
-        name: SITE_EXPERT_WEIGHTS,
-        class: DivClass::Weight,
-        granularity: Granularity::Token,
-        lowering: Lowering::PerLane,
-        note: format!(
-            "top-{top_k} of {experts} experts selected per token; \
-             grouped GEMM over gathered tokens is the device-side lowering"
-        ),
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MemberFacts {
     pub(crate) hook_program: bool,

@@ -418,6 +418,7 @@ pub fn gather_rows(ctx: &Ctx<'_>, wide: Tensor, index: Tensor, tight: Tensor) ->
     let entry = dtype_dispatch!(OP, tight.dtype, {
         Bf16 => "row_gather_bfloat16",
         F32 => "row_gather_float32",
+        I32 => "row_gather_int32",
     });
     move_rows(ctx, OP, entry, wide, tight, index, [wide, tight])
 }

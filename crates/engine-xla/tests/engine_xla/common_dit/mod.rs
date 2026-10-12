@@ -566,6 +566,10 @@ impl Rig {
         weights.write(&path);
         let mut engine = Xla::new(DeviceBoot::default(), contract_for);
         let facts = plan.facts.clone();
+        let residency = Residency {
+            device_kv_budget: crate::common::kv_budget(&plan, 64, 8, 64),
+            ..Residency::default()
+        };
         let loaded = engine
             .load(LoadRequest {
                 trace: plan,
@@ -578,13 +582,12 @@ impl Rig {
                     page_size: 16,
                     max_context: 64,
                     slots: 8,
-                    pages: 64,
                     max_patches: None,
                     max_images: None,
                     max_voxels,
                     max_clips: max_voxels.map(|_| 2),
                 },
-                residency: Residency::default(),
+                residency,
                 ordinal: 0,
                 frames_in_flight: 1,
             })

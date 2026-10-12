@@ -692,13 +692,6 @@ impl KvPageTable {
         unreachable!("published mapping covers [0, mapped_len)");
     }
 
-    pub fn page_location_alive(&self, node: NodeId, local: u64) -> bool {
-        match self.nodes.get(node).map(|n| &n.pages) {
-            Some(Pages::Owned { backings, .. }) => (local as usize) < backings.len(),
-            _ => false,
-        }
-    }
-
     pub fn path_prefix_len(&self, node: NodeId, local: u64) -> u64 {
         let mut full = local + 1;
         let mut cursor = self.predecessor(node);
@@ -884,46 +877,6 @@ impl KvPageTable {
 
     pub fn node_len(&self, node: NodeId) -> u64 {
         self.contribution_len(node)
-    }
-
-    #[cfg(test)]
-    pub(super) fn assert_liveness_consistent(&self) {
-        let mut exact = HashMap::<NodeId, u32>::new();
-        for (_, entry) in self.working_sets.iter() {
-            if let Some(node) = entry.terminal {
-                *exact.entry(node).or_default() += 1;
-            }
-        }
-        for &node in self.cache_roots.keys() {
-            *exact.entry(node).or_default() += 1;
-        }
-        for &node in self.pins.keys() {
-            *exact.entry(node).or_default() += 1;
-        }
-
-        let mut path = HashMap::<NodeId, u32>::new();
-        for (&node, &count) in &exact {
-            let mut cursor = Some(node);
-            while let Some(current) = cursor {
-                *path.entry(current).or_default() += count;
-                cursor = self.nodes.get(current).expect("anchor path is live").parent;
-            }
-        }
-        assert_eq!(path.len(), self.nodes.len());
-        for (node, entry) in self.nodes.iter() {
-            assert_eq!(entry.exact_anchors, exact.get(&node).copied().unwrap_or(0));
-            assert_eq!(entry.path_anchors, path.get(&node).copied().unwrap_or(0));
-            assert!(entry.path_anchors > 0);
-            assert_eq!(
-                entry.path_anchors,
-                entry.exact_anchors
-                    + entry
-                        .children
-                        .iter()
-                        .map(|child| self.nodes.get(*child).expect("child is live").path_anchors)
-                        .sum::<u32>()
-            );
-        }
     }
 
     fn entry(&self, ws: WorkingSetId) -> Result<&WorkingSetEntry, KvTableError> {

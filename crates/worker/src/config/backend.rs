@@ -5,12 +5,10 @@ use serde::{Deserialize, Serialize};
 
 use super::units::ByteSize;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CudaNativeEngineOptions {
-    pub gpu_mem_utilization: f64,
     pub kv_page_size: Option<u32>,
-    pub max_total_pages: Option<u32>,
     pub max_state_slots: Option<u32>,
     pub max_model_len: Option<u32>,
     pub max_forward_tokens: Option<u32>,
@@ -31,44 +29,14 @@ pub struct CudaNativeEngineOptions {
     pub side_streams: Option<u32>,
 }
 
-impl Default for CudaNativeEngineOptions {
-    fn default() -> Self {
-        Self {
-            gpu_mem_utilization: 0.90,
-            kv_page_size: None,
-            max_total_pages: None,
-            max_state_slots: None,
-            max_model_len: None,
-            max_forward_tokens: None,
-            max_forward_requests: None,
-            device: String::new(),
-            verbose: false,
-            graphs: None,
-            recording: None,
-            pad: None,
-            bodies: None,
-            bodies_mem: None,
-            fallback_copy: None,
-            grouped: None,
-            diagnostics: None,
-            nccl_transport: None,
-            side_streams: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetalEngineOptions {
     pub kv_page_size: u32,
-    /// The kv pool's pages; 0, the default, fits the pool to what `[metal]
-    /// gpu_mem_utilization` leaves once the weights are placed.
-    pub total_pages: u32,
     pub max_forward_tokens: u32,
     pub max_forward_requests: u32,
     pub max_model_len: Option<u32>,
     pub max_state_slots: Option<u32>,
-    pub gpu_mem_utilization: f64,
     pub diagnostics: Option<String>,
     pub tuning: toml::Table,
     #[serde(skip)]
@@ -81,12 +49,10 @@ impl Default for MetalEngineOptions {
     fn default() -> Self {
         Self {
             kv_page_size: 32,
-            total_pages: 0,
             max_forward_tokens: 10240,
             max_forward_requests: 512,
             max_model_len: None,
             max_state_slots: None,
-            gpu_mem_utilization: 0.90,
             diagnostics: None,
             tuning: toml::Table::new(),
             device: "metal:0".to_string(),
@@ -99,8 +65,6 @@ impl Default for MetalEngineOptions {
 #[serde(default, deny_unknown_fields)]
 pub struct VulkanEngineOptions {
     pub device_index: u32,
-    pub gpu_mem_utilization: f64,
-    pub max_total_pages: Option<u32>,
     pub max_forward_tokens: u32,
     pub max_forward_requests: u32,
     pub max_model_len: Option<u32>,
@@ -113,8 +77,6 @@ impl Default for VulkanEngineOptions {
     fn default() -> Self {
         Self {
             device_index: 0,
-            gpu_mem_utilization: 0.90,
-            max_total_pages: None,
             max_forward_tokens: 10240,
             max_forward_requests: 512,
             max_model_len: None,
@@ -127,19 +89,6 @@ impl Default for VulkanEngineOptions {
 
 impl VulkanEngineOptions {
     pub(super) fn validate(&self) -> Result<()> {
-        ensure!(
-            self.gpu_mem_utilization.is_finite()
-                && self.gpu_mem_utilization > 0.0
-                && self.gpu_mem_utilization <= 1.0,
-            "engine.gpu_mem_utilization must be finite and in (0.0, 1.0]"
-        );
-        if let Some(pages) = self.max_total_pages {
-            ensure!(
-                pages > 0,
-                "engine.max_total_pages must be > 0; \
-                 omit it to derive from gpu_mem_utilization"
-            );
-        }
         ensure!(
             self.max_forward_tokens > 0,
             "engine.max_forward_tokens must be > 0"
@@ -158,8 +107,6 @@ pub struct WgpuEngineOptions {
     pub adapter_index: u32,
     pub backends: Option<String>,
     pub power_preference: String,
-    pub gpu_mem_utilization: f64,
-    pub max_total_pages: Option<u32>,
     pub max_forward_tokens: u32,
     pub max_forward_requests: u32,
     pub max_model_len: Option<u32>,
@@ -174,8 +121,6 @@ impl Default for WgpuEngineOptions {
             adapter_index: 0,
             backends: None,
             power_preference: "high-performance".to_string(),
-            gpu_mem_utilization: 0.90,
-            max_total_pages: None,
             max_forward_tokens: 10240,
             max_forward_requests: 512,
             max_model_len: None,
@@ -189,12 +134,6 @@ impl Default for WgpuEngineOptions {
 impl WgpuEngineOptions {
     pub(super) fn validate(&self) -> Result<()> {
         ensure!(
-            self.gpu_mem_utilization.is_finite()
-                && self.gpu_mem_utilization > 0.0
-                && self.gpu_mem_utilization <= 1.0,
-            "engine.gpu_mem_utilization must be finite and in (0.0, 1.0]"
-        );
-        ensure!(
             matches!(
                 self.power_preference.as_str(),
                 "high-performance" | "low-power" | "none"
@@ -203,13 +142,6 @@ impl WgpuEngineOptions {
              \"low-power\", \"none\"; got {:?}",
             self.power_preference
         );
-        if let Some(pages) = self.max_total_pages {
-            ensure!(
-                pages > 0,
-                "engine.max_total_pages must be > 0; \
-                 omit it to derive from gpu_mem_utilization"
-            );
-        }
         ensure!(
             self.max_forward_tokens > 0,
             "engine.max_forward_tokens must be > 0"
@@ -238,11 +170,7 @@ pub struct XlaEngineOptions {
     pub plugin: Option<PathBuf>,
     /// Which of the plugin's addressable devices this engine drives.
     pub device_index: u32,
-    /// The fraction of device memory planned against: weights and the kv
-    /// and state pools.
-    pub mem_utilization: f64,
     /// The kv pool, in pages. Omit for the engine's own default.
-    pub max_total_pages: Option<u32>,
     /// The most tokens one fire carries.
     pub max_forward_tokens: u32,
     /// The most requests one fire carries.
@@ -259,8 +187,6 @@ impl Default for XlaEngineOptions {
         Self {
             plugin: None,
             device_index: 0,
-            mem_utilization: 0.90,
-            max_total_pages: None,
             max_forward_tokens: 2048,
             max_forward_requests: 64,
             max_state_slots: None,
@@ -271,15 +197,6 @@ impl Default for XlaEngineOptions {
 
 impl XlaEngineOptions {
     pub(super) fn validate(&self) -> Result<()> {
-        ensure!(
-            self.mem_utilization.is_finite()
-                && self.mem_utilization > 0.0
-                && self.mem_utilization <= 1.0,
-            "engine.mem_utilization must be finite and in (0.0, 1.0]"
-        );
-        if let Some(pages) = self.max_total_pages {
-            ensure!(pages > 0, "engine.max_total_pages must be > 0");
-        }
         ensure!(
             self.max_forward_tokens > 0,
             "engine.max_forward_tokens must be > 0"
@@ -294,19 +211,6 @@ impl XlaEngineOptions {
 
 impl CudaNativeEngineOptions {
     pub(super) fn validate(&self) -> Result<()> {
-        ensure!(
-            self.gpu_mem_utilization.is_finite()
-                && self.gpu_mem_utilization > 0.0
-                && self.gpu_mem_utilization <= 1.0,
-            "engine.gpu_mem_utilization must be finite and in (0.0, 1.0]"
-        );
-        if let Some(pages) = self.max_total_pages {
-            ensure!(
-                pages > 0,
-                "engine.max_total_pages must be > 0; \
-                 omit it to derive from gpu_mem_utilization"
-            );
-        }
         if let Some(size) = self.kv_page_size {
             ensure!(
                 size > 0,

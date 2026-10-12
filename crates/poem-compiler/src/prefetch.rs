@@ -83,13 +83,6 @@ impl Schedule {
     }
 
     #[must_use]
-    pub fn spill_order(&self) -> Vec<usize> {
-        let mut out = self.order();
-        out.reverse();
-        out
-    }
-
-    #[must_use]
     pub fn against(&self, compiled: &CompiledModel) -> Vec<Range<u32>> {
         self.reads
             .iter()

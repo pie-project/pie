@@ -179,7 +179,7 @@ def forward(m, inputs):
     head_in = rot_copy(x, m.bonsai.hidden) if m.bonsai != None else x
     logits = ops.linear.lm_head(head_in, head)
     if dr != None:
-        plant_readout(dr, logits, inputs, hb, block_rows(dr))
+        plant_readout(dr, logits, inputs, x, block_rows(dr))
     if m.mtp != None:
         draft(m, inputs, x, logits, head)
     return logits

@@ -104,39 +104,7 @@ pub struct AggregateStats {
     pub bubble_us_hist: [u64; BUBBLE_HIST_UPPER_US.len()],
 }
 
-impl AggregateStats {
-    pub fn bubble_p50(&self) -> u64 {
-        self.bubble_percentile(0.50)
-    }
-
-    pub fn bubble_p99(&self) -> u64 {
-        self.bubble_percentile(0.99)
-    }
-
-    pub fn bubble_p50_proxy(&self) -> u64 {
-        Self::hist_percentile(&self.bubble_us_hist, 0.50)
-    }
-
-    fn bubble_percentile(&self, q: f64) -> u64 {
-        Self::hist_percentile(&self.bubble_us_hist, q)
-    }
-
-    fn hist_percentile(hist: &[u64; BUBBLE_HIST_UPPER_US.len()], q: f64) -> u64 {
-        let total: u64 = hist.iter().sum();
-        if total == 0 {
-            return 0;
-        }
-        let target = (total as f64 * q).ceil() as u64;
-        let mut cum = 0u64;
-        for (i, &count) in hist.iter().enumerate() {
-            cum += count;
-            if cum >= target {
-                return BUBBLE_HIST_UPPER_US[i];
-            }
-        }
-        *BUBBLE_HIST_UPPER_US.last().unwrap()
-    }
-}
+impl AggregateStats {}
 
 #[derive(Debug, Default, serde::Serialize)]
 pub struct FireStats {

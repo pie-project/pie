@@ -11,9 +11,7 @@ mod settle;
 mod stats;
 
 pub use arming::{Armed, Kind, Seal};
-pub use boot::{
-    Boot, DEFAULT_BODIES_MEGABYTES, DEFAULT_GPU_MEM_UTILIZATION, Golden, Graphs, Knobs, Recording,
-};
+pub use boot::{Boot, DEFAULT_BODIES_MEGABYTES, Golden, Graphs, Knobs, Recording};
 pub use diag::Diagnostics;
 pub use lanes::{Attached, Clips, Lane, Media, Seated};
 pub(crate) use lanes::{MROPE_COORDS, PATCH_ROUTE_DROP};
@@ -437,11 +435,6 @@ impl Shell {
         Shell::read_out(self, &mut settled)?;
         *scores = std::mem::take(&mut settled.scores);
         Ok(std::mem::take(&mut settled.logits))
-    }
-
-    #[must_use]
-    pub fn compute_stream(&self) -> *mut core::ffi::c_void {
-        self.device.stream()
     }
 
     pub fn drain(&mut self) -> Result<()> {

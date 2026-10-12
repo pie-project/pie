@@ -126,53 +126,6 @@ pub fn register_model_with_swap(
     REGISTRY.push(RwLock::new(stores))
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn register_engine_with_swap(
-    model_idx: usize,
-    engine_idx: usize,
-    kv_page_size: u32,
-    base_page: u32,
-    num_kv_pages: usize,
-    num_host_pages: usize,
-    num_slots: usize,
-    max_context: usize,
-) -> anyhow::Result<()> {
-    let model = REGISTRY
-        .get(model_idx)
-        .ok_or_else(|| anyhow::anyhow!("store registry: unknown model {model_idx}"))?;
-    let mut stores = model.write().unwrap();
-    if stores.len() <= engine_idx {
-        stores.resize_with(engine_idx + 1, || None);
-    }
-    anyhow::ensure!(
-        stores[engine_idx].is_none(),
-        "store registry: engine {engine_idx} is already registered for model {model_idx}"
-    );
-    if let Some(existing) = stores.iter().flatten().next() {
-        anyhow::ensure!(
-            existing.kv_page_size == kv_page_size,
-            "store registry: KV page size {kv_page_size} does not match model {model_idx} page size {}",
-            existing.kv_page_size
-        );
-    }
-    let kv = Arc::new(parking_lot::Mutex::new(KvStore::new_with_swap_range(
-        base_page,
-        num_kv_pages as u32,
-        num_host_pages as u32,
-        0,
-        rand::random::<[u8; 32]>(),
-    )));
-    stores[engine_idx] = Some(Stores {
-        kv,
-        rs: Arc::new(Mutex::new(RsStore::new(num_slots as u32))),
-        seats: Arc::new(Mutex::new(SeatBook::new(num_slots as u32))),
-        seats_freed: Arc::new(tokio::sync::Notify::new()),
-        kv_page_size,
-        context_pages: context_pages(max_context, kv_page_size),
-    });
-    Ok(())
-}
-
 pub fn unregister_engine(model_idx: usize, engine_idx: usize) -> anyhow::Result<()> {
     let model = REGISTRY
         .get(model_idx)
@@ -214,6 +167,53 @@ pub fn all_for_model(model_idx: usize) -> Vec<Stores> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_engine_with_swap(
+        model_idx: usize,
+        engine_idx: usize,
+        kv_page_size: u32,
+        base_page: u32,
+        num_kv_pages: usize,
+        num_host_pages: usize,
+        num_slots: usize,
+        max_context: usize,
+    ) -> anyhow::Result<()> {
+        let model = REGISTRY
+            .get(model_idx)
+            .ok_or_else(|| anyhow::anyhow!("store registry: unknown model {model_idx}"))?;
+        let mut stores = model.write().unwrap();
+        if stores.len() <= engine_idx {
+            stores.resize_with(engine_idx + 1, || None);
+        }
+        anyhow::ensure!(
+            stores[engine_idx].is_none(),
+            "store registry: engine {engine_idx} is already registered for model {model_idx}"
+        );
+        if let Some(existing) = stores.iter().flatten().next() {
+            anyhow::ensure!(
+                existing.kv_page_size == kv_page_size,
+                "store registry: KV page size {kv_page_size} does not match model {model_idx} page size {}",
+                existing.kv_page_size
+            );
+        }
+        let kv = Arc::new(parking_lot::Mutex::new(KvStore::new_with_swap_range(
+            base_page,
+            num_kv_pages as u32,
+            num_host_pages as u32,
+            0,
+            rand::random::<[u8; 32]>(),
+        )));
+        stores[engine_idx] = Some(Stores {
+            kv,
+            rs: Arc::new(Mutex::new(RsStore::new(num_slots as u32))),
+            seats: Arc::new(Mutex::new(SeatBook::new(num_slots as u32))),
+            seats_freed: Arc::new(tokio::sync::Notify::new()),
+            kv_page_size,
+            context_pages: context_pages(max_context, kv_page_size),
+        });
+        Ok(())
+    }
 
     #[test]
     fn registry_every_case() {

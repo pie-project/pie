@@ -101,6 +101,7 @@ fn the_draft_head_fires_and_the_trunk_is_unchanged() {
 
     let booted = Instant::now();
     let mut shell = Shell::load(Boot {
+        kv_budget: crate::full_pool(&trace, 16, 512, 4),
         voxels: None,
         trace,
         contract: &contract,
@@ -111,9 +112,8 @@ fn the_draft_head_fires_and_the_trunk_is_unchanged() {
         page_size: 16,
         context: 512,
         slots: 4,
-        pages: (4) * (512) / (16),
         runahead: engine::runahead::Runahead::F1,
-        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the drafting shell loads");

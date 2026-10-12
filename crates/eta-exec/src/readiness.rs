@@ -48,15 +48,7 @@ pub enum Reason {
     Unpinned,
 }
 
-impl Reason {
-    #[must_use]
-    pub fn is_permanent(self) -> bool {
-        matches!(
-            self,
-            Reason::Poisoned | Reason::Closed | Reason::Inconsistent { .. }
-        )
-    }
-}
+impl Reason {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Readiness {

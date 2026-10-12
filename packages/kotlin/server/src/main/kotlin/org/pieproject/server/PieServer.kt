@@ -37,8 +37,9 @@ public class PieServer private constructor(private val handle: Long) : AutoClose
     @Serializable
     public class Configuration internal constructor() {
         /** Share of the device's GPU memory the engine may use. */
-        @SerialName("gpu_mem_utilization") public var gpuMemoryUtilization: Double = 0.6
-        @SerialName("max_total_pages") public var maxTotalPages: Int = 512
+        @SerialName("device_memory_share") public var deviceMemoryShare: Double = 0.6
+        /** Bytes for the kv pages and state slots, with a unit (`"1GiB"`); null fills what [deviceMemoryShare] leaves past the weights. */
+        @SerialName("device_kv_budget") public var deviceKvBudget: String? = null
         @SerialName("max_forward_tokens") public var maxForwardTokens: Int = 512
         @SerialName("max_forward_requests") public var maxForwardRequests: Int = 4
         @SerialName("max_state_slots") public var maxStateSlots: Int = 16

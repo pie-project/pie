@@ -1,7 +1,7 @@
 use poem_compiler::{Budget, CompiledModel};
 use poem_ir::Trace;
 
-use super::{FireCost, Graphs, Shell};
+use super::{Graphs, Shell};
 use crate::error::Result;
 use crate::record;
 use crate::store::kv::{self, Paging};
@@ -131,11 +131,6 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn score_layers(&self) -> Vec<u32> {
-        self.exports.scores.iter().map(|e| e.layer).collect()
-    }
-
-    #[must_use]
     pub fn held(&self, slot: u32) -> u32 {
         self.held.get(slot as usize).copied().unwrap_or(0)
     }
@@ -176,32 +171,6 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn group_ladder(&self) -> (u64, u64, u64) {
-        self.weights
-            .experts()
-            .map_or((0, 0, 0), crate::experts::Tier::ladder)
-    }
-
-    pub fn promote_group(
-        &mut self,
-        name: &str,
-    ) -> Result<Option<(crate::experts::Held, crate::experts::Held)>> {
-        let (compute, notify) = (self.device.stream(), self.device.notify_stream());
-        match self.weights.experts_mut() {
-            None => Ok(None),
-            Some(tier) => tier.promote_now(name, compute, notify),
-        }
-    }
-
-    pub fn settle_tier_refill(&mut self) -> Result<bool> {
-        let (compute, notify) = (self.device.stream(), self.device.notify_stream());
-        match self.weights.experts_mut() {
-            None => Ok(false),
-            Some(tier) => tier.settle_refill(compute, notify),
-        }
-    }
-
-    #[must_use]
     pub fn buffer_bytes(&self) -> u64 {
         self.buffers.as_ref().map_or(0, Buffers::bytes)
     }
@@ -230,31 +199,12 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn bodying(&self) -> bool {
-        self.bodies
-    }
-
-    pub fn set_bodies(&mut self, bodies: bool) {
-        self.bodies = bodies;
-    }
-
-    #[must_use]
-    pub fn last_fire_cost(&self) -> FireCost {
-        self.last
-    }
-
-    #[must_use]
     pub fn body_stats(&self) -> record::BodyStats {
         self.cache.body_stats()
     }
 
     pub fn keep_graphs(&mut self, keep: bool) {
         self.cache.keep_graphs(keep);
-    }
-
-    #[must_use]
-    pub fn kept_graphs(&self) -> &[(record::BodyKey, crate::device::Graph)] {
-        self.cache.kept()
     }
 
     #[must_use]
@@ -287,11 +237,6 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn pool_bases(&self) -> Vec<u64> {
-        self.pools.bases()
-    }
-
-    #[must_use]
     pub fn elastic(&self) -> (u64, u64, u64, u64) {
         (
             self.pools.committed_bytes(),
@@ -309,10 +254,6 @@ impl Shell {
     #[must_use]
     pub fn weights_from_cache(&self) -> bool {
         self.weights.from_cache()
-    }
-
-    pub fn weight_digest(&self) -> Result<u64> {
-        self.weights.digest()
     }
 
     #[must_use]

@@ -128,6 +128,7 @@ fn the_first_logits_track_upstream() {
 
     let context = 256;
     let _device = engine_xla::bench::lock_device();
+    let kv_budget = common::kv_budget(&trace, context, 2, 2 * context / 16);
     let mut shell = Shell::load(Boot {
         trace,
         contract: &m.contract,
@@ -136,7 +137,8 @@ fn the_first_logits_track_upstream() {
         page_size: 16,
         context,
         slots: 2,
-        pages: 2 * context / 16,
+        kv_budget,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         device: &DeviceBoot::default(),
         // A vision artifact's plan sizes its tower by the patch ladder.
         patches: m

@@ -78,6 +78,7 @@ fn boot(artifact: &PathBuf, name: &str) -> (Shell, poem::Trace) {
     drop(source);
     let started = Instant::now();
     let shell = Shell::load(Boot {
+        kv_budget: crate::full_pool(&trace, 16, CONTEXT, 1),
         voxels: None,
         trace: trace.clone(),
         contract: &contract,
@@ -88,9 +89,8 @@ fn boot(artifact: &PathBuf, name: &str) -> (Shell, poem::Trace) {
         page_size: 16,
         context: CONTEXT,
         slots: 1,
-        pages: CONTEXT / 16,
         runahead: engine::runahead::Runahead::F1,
-        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the shell loads");

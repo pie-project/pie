@@ -21,6 +21,12 @@ fn bf16(v: f32) -> [u8; 2] {
 
 #[test]
 fn every_prefill_row_answers_an_exact_affine_reference() {
+    if !crate::in_own_process(
+        "the_mpp_prefill_matches_affine_dots::every_prefill_row_answers_an_exact_affine_reference",
+        &[],
+    ) {
+        return;
+    }
     let Ok(device) = Context::bind() else {
         return;
     };

@@ -962,13 +962,14 @@ impl<'c> Run<'c> {
         self
     }
 
-    /// Whether this region's stream holds an `[n, k]` plane in bf16. A load
-    /// that warmed no tiles, and the conditional stream, decode as they did.
+    /// Whether this region's stream holds an `[n, k]` plane in bf16. A
+    /// conditional body runs in the main stream's order and decodes into its
+    /// tile; a load that warmed no tiles decodes as it did.
     pub(crate) fn decoded_tile_holds(&self, n: u32, k: u32) -> bool {
-        let at = match self.body {
-            Some(_) if self.stream.get() == crate::window::BODY => return true,
+        let at = match self.stream.get() {
             _ if self.side.is_empty() => 0,
-            _ => self.stream.get() as usize,
+            crate::window::BODY => 0,
+            n => n as usize,
         };
         self.decoded
             .get(at)

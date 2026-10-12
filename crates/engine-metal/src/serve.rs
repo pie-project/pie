@@ -53,12 +53,14 @@ pub struct Boot<'a> {
     pub page_size: u32,
     pub context: u32,
     pub slots: u32,
-    pub pages: u32,
+    /// `[model] device_kv_budget`: the bytes the kv pool and the state slots
+    /// beside it take; `None` fills what `memory_share` leaves.
+    pub kv_budget: Option<u64>,
+    /// `[model] device_memory_share`: the share of the device's working set
+    /// this load may wire.
+    pub memory_share: f64,
     pub runahead: Runahead,
     pub residency: Plan,
-    /// `[metal] gpu_mem_utilization`: the share of the device's working set
-    /// this load may wire.
-    pub gpu_mem_utilization: f64,
 }
 
 const PATCH_ROUTE_DROP: i32 = -1;
@@ -518,10 +520,10 @@ impl Shell {
         handles.seal();
 
         // The kv pool and the recurrent-state buffers beside it: both are
-        // wired for the life of the load, in what `gpu_mem_utilization` leaves
-        // of the room the device had when the load began, once the weights,
-        // the arena scratch and the driver's floor are placed. `[engine]
-        // total_pages = 0` takes all of it.
+        // wired for the life of the load, in what `memory_share` leaves of the
+        // room the device had when the load began, once the weights, the arena
+        // scratch and the driver's floor are placed. A stated `kv_budget` is
+        // its bytes; none takes all of the room.
         let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
         let paging_at = |pages: u64| Paging::of(boot.page_size, boot.context, boot.slots, pages);
         let demand =
@@ -530,22 +532,24 @@ impl Shell {
             crate::store::accounting::Accounting::with_scratch(
                 device.working_set(),
                 elsewhere,
-                boot.gpu_mem_utilization,
+                boot.memory_share,
                 weights.bytes(),
                 compiled.arena.bytes,
                 pool,
             )
         };
-        let least = crate::store::least_pages(boot.pages, paging_at(1)?);
-        let pages = match boot.pages {
-            0 => demand.pages_within(accounting(0).pool).max(least),
-            _ => least,
-        };
+        let pages = engine::fit::pages_for(
+            boot.kv_budget,
+            accounting(0).pool,
+            u64::from(paging_at(1)?.pages_per_slot),
+            |pages| demand.bytes(pages),
+        )
+        .map_err(|short| Fault::Residency(short.to_string()))?;
         let paging = paging_at(pages)?;
 
         {
             let acct = accounting(demand.bytes(pages));
-            acct.admit(Some(weights.bytes()), boot.gpu_mem_utilization)?;
+            acct.admit(Some(weights.bytes()), boot.memory_share)?;
             let source = boot.residency.source_bytes();
             let ram = Context::physical_memory();
             let wired = acct.weights + acct.scratch + acct.minimum + acct.floor;
@@ -1207,11 +1211,6 @@ impl Shell {
         self.weights.windows()
     }
 
-    #[must_use]
-    pub fn weights_residue(&self) -> (usize, u64) {
-        self.weights.residue()
-    }
-
     /// The kv pool's bytes with memory behind them now, and the most that
     /// ever had at once. Both equal the pool for a fixed pool.
     #[must_use]
@@ -1227,15 +1226,6 @@ impl Shell {
             self.pools.elastic_page_bytes(),
             self.pools.elastic_budget_pages(),
         )
-    }
-
-    /// Lower the kv pool's watermark to `hint` and hand back the memory
-    /// above it. Drains every frame first, because an unmapped page under
-    /// a running kernel is a fault; a fixed pool only lowers the watermark.
-    pub fn release_kv(&mut self, hint: Demand) -> Result<()> {
-        self.drain()?;
-        Supply::trim(&mut self.pools, hint);
-        self.pools.release()
     }
 
     #[must_use]
@@ -1326,11 +1316,6 @@ impl Shell {
     pub fn fire_program(&mut self, instance_id: u64) -> Result<crate::Fired> {
         self.fence_instances(&[instance_id])?;
         self.programs.fire(&self.device, instance_id)
-    }
-
-    #[must_use]
-    pub fn program_stats(&self) -> eta_exec::CacheStats {
-        self.programs.stats()
     }
 
     pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
@@ -1475,13 +1460,6 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn expert_prediction(&self) -> crate::experts::Prediction {
-        self.weights
-            .tier()
-            .map_or_else(Default::default, |tier| tier.borrow().prediction())
-    }
-
-    #[must_use]
     pub fn expert_host_time(&self) -> (u64, u64, u64) {
         self.weights
             .tier()
@@ -1491,18 +1469,6 @@ impl Shell {
     #[must_use]
     pub fn gathered_rows(&self) -> Option<crate::gather::Residency> {
         self.weights.rows().map(|rows| rows.borrow().residency())
-    }
-
-    #[must_use]
-    pub fn gathered_motion(&self) -> Option<(u64, u64)> {
-        self.weights.rows().map(|rows| rows.borrow().motion())
-    }
-
-    #[must_use]
-    pub fn gathered_source(&self) -> Option<(&'static str, Option<(u64, u64)>)> {
-        self.weights
-            .rows()
-            .map(|rows| (rows.borrow().source_kind(), rows.borrow().backing()))
     }
 
     #[must_use]

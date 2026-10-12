@@ -272,7 +272,9 @@ impl Context {
         #[cfg(feature = "cuda")]
         {
             if self.conditional.is_none() {
-                self.conditional = Some(self.open_side()?);
+                let mut side = self.open_side()?;
+                side.ctx = side.ctx.in_order_of(self.stream);
+                self.conditional = Some(side);
             }
             Ok(())
         }

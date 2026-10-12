@@ -33,8 +33,7 @@ pub fn parse_config(text: &str) -> Result<(Settings, String)> {
         .unwrap_or_else(|| "high-performance".into());
     let config: Settings = serde_json::from_value(document).context("parse the boot config")?;
     let mut doc = format!(
-        "[wgpu]\nadapter_index = 0\ngpu_mem_utilization = {:?}\npower_preference = {}\n",
-        config.gpu_mem_utilization,
+        "[wgpu]\nadapter_index = 0\npower_preference = {}\n",
         toml::Value::String(power_preference),
     );
     if let Some(mib) = device_memory_mb {

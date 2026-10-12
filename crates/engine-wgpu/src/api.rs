@@ -30,8 +30,6 @@ pub struct DeviceBoot {
 
     pub backends: Option<String>,
 
-    pub gpu_mem_utilization: f64,
-
     pub power_preference: String,
 
     pub pipeline_cache: Option<PathBuf>,
@@ -44,7 +42,6 @@ impl Default for DeviceBoot {
         DeviceBoot {
             adapter_index: 0,
             backends: None,
-            gpu_mem_utilization: crate::boot::DEFAULT_GPU_MEM_UTILIZATION,
             power_preference: crate::boot::DEFAULT_POWER_PREFERENCE.to_string(),
             pipeline_cache: None,
             device_memory: None,
@@ -416,7 +413,6 @@ impl Engine for Wgpu {
             page_size: budgets.page_size,
             context: budgets.max_context,
             slots: budgets.slots,
-            pages: budgets.pages,
 
             runahead: runahead_of(frames_in_flight),
             device: &self.boot,

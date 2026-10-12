@@ -168,24 +168,6 @@ pub fn realize_declaration(
     realize_declaration_impl(store, ws, writable, None)
 }
 
-pub fn realize_ahead_range(
-    store: &KvStore,
-    ws: WorkingSetId,
-    writable: &std::ops::Range<u64>,
-    ahead: u64,
-) -> Result<std::ops::Range<u64>, KvError> {
-    if ahead == 0 {
-        return Ok(writable.clone());
-    }
-    let capacity = store.page_len(ws)?;
-    let end = writable
-        .end
-        .saturating_add(ahead)
-        .min(capacity)
-        .max(writable.end);
-    Ok(writable.start..end)
-}
-
 pub fn realize_declaration_demand(
     store: &mut KvStore,
     ws: WorkingSetId,
@@ -250,39 +232,6 @@ fn realize_declaration_impl(
             mapping_version,
         }),
     ))
-}
-
-pub fn match_prefix(
-    store: &mut KvStore,
-    ws: WorkingSetId,
-    tokens: &[u32],
-    page_size: u32,
-) -> Result<Option<u64>, KvError> {
-    if store.mapped_len(ws)? != 0 || store.chain_state(ws)?.is_some() {
-        return Ok(None);
-    }
-    let ps = page_size as usize;
-    let max_pages = tokens.len().saturating_sub(1) / ps;
-    if max_pages == 0 {
-        return Ok(None);
-    }
-    let domain = store.domain();
-    let mut prev: Option<Hash256> = None;
-    let mut boundaries = Vec::with_capacity(max_pages);
-    for (i, &tok) in tokens[..max_pages * ps].iter().enumerate() {
-        let h = hash::chain_token_slot_hash(&domain, prev.as_ref(), tok, i as u32);
-        prev = Some(h);
-        if (i + 1) % ps == 0 {
-            boundaries.push(h);
-        }
-    }
-    for pages in (1..=max_pages).rev() {
-        let key = boundaries[pages - 1];
-        if let Some(adopted) = store.adopt_cached_prefix(ws, &key, pages as u64)? {
-            return Ok(Some(adopted));
-        }
-    }
-    Ok(None)
 }
 
 pub fn prepare(

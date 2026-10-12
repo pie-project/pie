@@ -1,7 +1,3 @@
-pub fn mlx_affine_group_params(values: &[f64]) -> (f32, f32) {
-    mlx_affine_group_params_bits(values, 4)
-}
-
 pub fn mlx_affine_group_params_bits(values: &[f64], bits: u32) -> (f32, f32) {
     #[allow(clippy::cast_precision_loss)]
     let n_bins = ((1u32 << bits) - 1) as f32;

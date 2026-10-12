@@ -164,7 +164,7 @@ def forward(m, inputs):
     x = ops.layout.gather_rows(x, inputs.readout_rows())
     logits = ops.attn.logit_softcap(ops.linear.lm_head(x, m.embed), m.softcap)
     if dr != None:
-        plant_readout(dr, logits, inputs, hb, block_rows(dr))
+        plant_readout(dr, logits, inputs, x, block_rows(dr))
 
     if m.draft != None:
         eagle_draft(m, inputs, x, logits, root)

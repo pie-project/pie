@@ -155,7 +155,7 @@ pub fn one_arm(id: &str, decode: bool) -> Package {
                 .replace("def caches(m, c):", "def every_cache(m, c):")
                 .replace("def forward(m, inputs):", "def every_reading(m, inputs):")
                 + &format!(
-                    "\ndef caches(m, c):\n    pass\n\ndef forward(m, inputs):\n    return {}(inputs, m.vae)\n",
+                    "\ndef caches(m, c):\n    pass\n\ndef forward(m, inputs):\n    return {}(inputs, m)\n",
                     if decode { "decode" } else { "encode" }
                 );
         }
@@ -202,7 +202,8 @@ pub fn load(trace: Trace, contract: &ModelContract, checkpoint: &Path, max_voxel
         page_size: 16,
         context: 64,
         slots: 2,
-        pages: 4,
+        kv_budget: None,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         ordinal: 0,
         graphs: Graphs::Off,
         knobs: Knobs {

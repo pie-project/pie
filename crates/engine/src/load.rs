@@ -13,7 +13,6 @@ pub struct Budgets {
     pub page_size: u32,
     pub max_context: u32,
     pub slots: u32,
-    pub pages: u32,
     #[serde(default)]
     pub max_patches: Option<u32>,
     #[serde(default)]
@@ -34,7 +33,6 @@ impl Default for Budgets {
             page_size: 16,
             max_context: 4096,
             slots: 256,
-            pages: 65536,
             max_patches: None,
             max_images: None,
             max_voxels: None,
@@ -49,12 +47,24 @@ pub enum Checkpoint {
     None,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The share of the device's memory a load may take when `[model]
+/// device_memory_share` is not stated.
+pub const DEFAULT_DEVICE_MEMORY_SHARE: f64 = 0.9;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Residency {
     pub device_weight_budget: Option<u64>,
     pub host_weight_budget: Option<u64>,
     #[serde(default = "deferred_by_default")]
     pub deferred_tier: bool,
+    /// Device bytes the kv pages and recurrent-state slots take; `None`
+    /// fills what `device_memory_share` leaves.
+    #[serde(default)]
+    pub device_kv_budget: Option<u64>,
+    /// The share of the device's memory the load may take: weights, working
+    /// set and pool. What other processes hold when it begins comes off it.
+    #[serde(default = "default_share")]
+    pub device_memory_share: f64,
     /// Pinned host bytes suspended kv pages and rs slots go to; `None` is
     /// one device pool's worth, zero turns the host tier off.
     #[serde(default)]
@@ -69,6 +79,10 @@ pub struct Residency {
 
 fn deferred_by_default() -> bool {
     true
+}
+
+fn default_share() -> f64 {
+    DEFAULT_DEVICE_MEMORY_SHARE
 }
 
 impl Default for Residency {
@@ -92,6 +106,8 @@ impl Residency {
             device_weight_budget: None,
             host_weight_budget: None,
             deferred_tier: true,
+            device_kv_budget: None,
+            device_memory_share: DEFAULT_DEVICE_MEMORY_SHARE,
             host_kv_budget: None,
             disk_kv_budget: 0,
             disk_kv_dir: None,

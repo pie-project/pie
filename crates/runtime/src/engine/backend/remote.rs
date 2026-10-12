@@ -55,15 +55,6 @@ impl RemoteEngine {
         &self.peer
     }
 
-    #[must_use]
-    pub fn disconnect_handle(&self) -> RemoteDisconnectHandle {
-        RemoteDisconnectHandle {
-            broker: self.broker.clone(),
-            connected: Arc::clone(&self.connected),
-            disconnected: Arc::clone(&self.disconnected),
-        }
-    }
-
     fn refuse(&self, verb: &'static str) -> Error {
         tracing::warn!(
             peer = %self.peer,

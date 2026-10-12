@@ -177,8 +177,12 @@ fn the_vae_decodes_and_encodes_the_golden_clip() {
          max |err| {:.4}, mean |err| {:.5}",
         s.cos, s.max_abs, s.mean_abs
     );
+    // The golden's pixels decode a random latent, and encoding them back is
+    // ill-conditioned: diffusers' own encode lands at cos 0.99984 / max 2.0 on
+    // CUDA fp32 against the CPU golden, and at cos 0.99832 / mean 0.0266 in
+    // bf16. This bounds the encode at that bf16 floor.
     assert!(
-        s.cos >= 0.9995 && s.mean_abs <= 0.02 && s.max_abs <= 3.0,
+        s.cos >= 0.998 && s.mean_abs <= 0.03 && s.max_abs <= 3.0,
         "the encode drifts from the reference: cos {}, mean |err| {}, max |err| {}",
         s.cos,
         s.mean_abs,

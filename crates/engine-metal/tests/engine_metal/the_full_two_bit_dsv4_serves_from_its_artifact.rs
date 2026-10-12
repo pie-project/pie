@@ -261,6 +261,7 @@ fn run(what: &str, artifact: &Path, residency: Plan, prompt: &[u32]) -> Option<R
     let idle = wired();
     let at = Instant::now();
     let shell = Shell::load(Boot {
+        kv_budget: crate::full_pool(&read.trace, 16, 512, 4),
         voxels: None,
         trace: read.trace.clone(),
         contract: &read.contract,
@@ -271,9 +272,8 @@ fn run(what: &str, artifact: &Path, residency: Plan, prompt: &[u32]) -> Option<R
         page_size: 16,
         context: 512,
         slots: 4,
-        pages: (4) * (512) / (16),
         runahead: engine::runahead::Runahead::F1,
-        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         residency,
     });
     let mut shell = match shell {

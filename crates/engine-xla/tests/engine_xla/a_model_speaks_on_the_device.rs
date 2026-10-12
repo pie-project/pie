@@ -35,6 +35,7 @@ fn a_prompt_is_answered_and_its_decode_agrees_with_its_prefill() {
 
     let _device = engine_xla::bench::lock_device();
     let booted = Instant::now();
+    let kv_budget = common::kv_budget(&trace, context, 4, 4 * context / 16);
     let mut shell = Shell::load(Boot {
         trace,
         contract,
@@ -43,7 +44,8 @@ fn a_prompt_is_answered_and_its_decode_agrees_with_its_prefill() {
         page_size: 16,
         context,
         slots: 4,
-        pages: 4 * context / 16,
+        kv_budget,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         device: &DeviceBoot::default(),
         patches: None,
     })

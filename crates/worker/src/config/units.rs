@@ -82,9 +82,6 @@ impl ByteSize {
     pub const fn as_mib(&self) -> u64 {
         self.0 / (1024 * 1024)
     }
-    pub fn as_gib_f64(&self) -> f64 {
-        self.0 as f64 / (1024.0 * 1024.0 * 1024.0)
-    }
 }
 
 fn parse_byte_size(text: &str) -> std::result::Result<ByteSize, String> {

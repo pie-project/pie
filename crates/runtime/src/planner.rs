@@ -1186,14 +1186,6 @@ impl ResidencyPlanner {
         )
     }
 
-    pub fn park_census(&self) -> (u64, usize, usize) {
-        (
-            self.stats.parks.load(Ordering::Relaxed),
-            self.waiters.load(Ordering::Acquire),
-            self.nonresident.load(Ordering::Acquire),
-        )
-    }
-
     /// The grant `demand` takes without parking, if the pools hand it out
     /// now; see `acquire`.
     pub fn grant_now(self: &Arc<Self>, pid: ProcessId, demand: Demand) -> Option<AllocationGrant> {

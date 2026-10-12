@@ -58,6 +58,12 @@ model = "Qwen/Qwen3.5-0.8B"
 # weight_dtype     = "bfloat16"  # what the CHECKPOINT holds. activation_dtype
                                  # is what the engine computes in, so that is
                                  # an engine key and this is a model one.
+# Device memory, per device. The share is of the device's memory, less what
+# other processes hold when the engine starts; the kv pool fills what the
+# share leaves past the weights, unless its bytes are stated.
+# device_memory_share  = 0.90
+# device_kv_budget     = "20GiB"  # kv pages and state slots; refused if it does not fit
+# device_weight_budget = "18GiB"  # omit for uncapped
 "#;
 
 const TAIL: &str = r#"
@@ -104,9 +110,7 @@ type = "cuda_native"
 device = ["cuda:0"]
 tensor_parallel_size = 1
 activation_dtype = "bfloat16"
-gpu_mem_utilization = 0.90
 # kv_page_size    = 32      # omit: the engine derives one
-# max_total_pages = 4096    # omit: derived from gpu_mem_utilization
 # max_state_slots = 256     # recurrent-state seats (hybrid models); omit for 256
 # max_model_len   = 4096    # the most tokens one sequence may hold; omit for
 #                           # 4096. State it at what you serve: a decode body
@@ -123,11 +127,8 @@ const METAL_ENGINE_BLOCK: &str = r#"
 type = "metal"
 device = ["metal:0"]
 activation_dtype = "bfloat16"
-gpu_mem_utilization = 0.90  # of the device's recommended working set. A
-                            # GPU-touched shared page is WIRED on Apple
-                            # silicon, so this ceiling is hard, not a hint.
 kv_page_size = 32           # used as given: this engine has no planner to
-total_pages  = 1024         # derive a geometry, so these two ARE the pool
+                            # derive one
 # max_forward_tokens   = 10240  # omit for the engine's own defaults
 # max_forward_requests = 512    # (max_concurrent_processes derives from this)
 # max_model_len        = 8192   # omit to keep the engine's KV-ring ceiling;
@@ -145,8 +146,6 @@ type = "vulkan"
 device = ["vulkan:0"]
 activation_dtype = "bfloat16"
 device_index = 0            # vkEnumeratePhysicalDevices order; 0 is the first
-gpu_mem_utilization = 0.90  # of the device-local heap: weights, kv pool, scratch
-# max_total_pages      = 4096   # omit: derived from gpu_mem_utilization
 # max_forward_tokens   = 10240  # omit for the engine's own defaults
 # max_forward_requests = 512    # (max_concurrent_processes derives from this)
 # max_state_slots      = 256    # recurrent-state seats (hybrid models)
@@ -165,9 +164,7 @@ device = ["wgpu:0"]
 activation_dtype = "bfloat16"
 adapter_index = 0           # enumeration order among the reachable adapters
 # backends = "vulkan"           # omit for every backend this build carries
-gpu_mem_utilization = 0.90  # of the device-local heap: weights, kv pool, scratch
 # power_preference     = "high-performance"  # or "low-power", "none"
-# max_total_pages      = 4096   # omit: derived from gpu_mem_utilization
 # max_forward_tokens   = 10240  # omit for the engine's own defaults
 # max_forward_requests = 512    # (max_concurrent_processes derives from this)
 # max_state_slots      = 256    # recurrent-state seats (hybrid models)
@@ -184,9 +181,7 @@ type = "xla"
 device = ["tpu:0"]
 activation_dtype = "bfloat16"
 device_index = 0            # which of the plugin's addressable devices
-mem_utilization = 0.90      # of device memory: weights, kv pool, state pool
 # plugin               = "/path/to/libtpu.so"  # omit: PIE_XLA_PLUGIN, TPU_LIBRARY_PATH, libtpu.so
-# max_total_pages      = 4096   # omit for the engine's own default
 # max_forward_tokens   = 2048
 # max_forward_requests = 64
 # max_state_slots      = 256    # recurrent-state seats (hybrid models)
