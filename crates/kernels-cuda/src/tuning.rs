@@ -81,11 +81,11 @@ pub struct QmmSplitWarpsPerSm(pub u32);
 
 /// The deepest split-K for 8 rows or fewer, and for more.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.qmm.split_thin_max", constant(set(8, 16, 32, 64)), default = 32, tune = search)]
+#[decision(id = "kernel.qmm.split_thin_max", constant(set(8, 16, 32)), default = 32, tune = search)]
 pub struct QmmSplitThinMax(pub u32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.qmm.split_wide_max", constant(set(8, 16, 32, 64)), default = 16, tune = search)]
+#[decision(id = "kernel.qmm.split_wide_max", constant(set(8, 16, 32)), default = 16, tune = search)]
 pub struct QmmSplitWideMax(pub u32);
 
 /// Prefill attention CTAs per SM: the grid a split prefill fills, and the
