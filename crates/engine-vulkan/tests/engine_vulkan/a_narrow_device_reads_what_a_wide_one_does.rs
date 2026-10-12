@@ -67,6 +67,7 @@ fn serve(index: u32, artifact: &Path, deployment: &str, kernel: Option<&str>) ->
         checkpoint: artifact,
         budget: poem_compiler::Budget::new(1, CONTEXT),
         patches,
+        voxels: None,
         profile: None,
         page_size: 16,
         context: CONTEXT,

@@ -32,6 +32,8 @@ pub struct Settings {
     pub frame_size: u32,
     pub frame_dispatch_depth: u32,
     pub verbose: bool,
+    pub max_voxels: Option<u32>,
+    pub max_clips: Option<u32>,
 }
 
 impl Default for Settings {
@@ -49,6 +51,8 @@ impl Default for Settings {
             frame_size: 8,
             frame_dispatch_depth: 2,
             verbose: false,
+            max_voxels: None,
+            max_clips: None,
         }
     }
 }
@@ -90,6 +94,12 @@ impl Settings {
         config.model.engine.options = self.engine_options(kind, home);
         config.model.device_kv_budget = self.device_kv_budget;
         config.model.device_memory_share = self.device_memory_share;
+        if self.max_voxels.is_some() {
+            config.model.max_voxels = self.max_voxels;
+        }
+        if self.max_clips.is_some() {
+            config.model.max_clips = self.max_clips;
+        }
         config.server.worker_threads = 2;
         config.server.verbose = self.verbose;
         config.server.max_upload = ByteSize::from_mib(256);

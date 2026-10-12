@@ -1041,9 +1041,16 @@ async fn main(input: Input) -> Result<Output> {
         ))
     };
 
-    let mut loops = DenoiseLoop::new(&sched);
     let velocity_width = roles.denoise.readout_width;
     let cells = (rows * row_width) as usize;
+    // An init picture keeps the seeding fire, which noises it on the device.
+    let seeded = init_latent.is_none();
+    let start = seeded.then(|| host_noise(input.seed.unwrap_or(0), cells));
+    let mut loops = if seeded {
+        DenoiseLoop::seeded(&sched)
+    } else {
+        DenoiseLoop::new(&sched)
+    };
     let shape = [rows, row_width];
     let seed = input.seed.unwrap_or(0);
 
@@ -1072,7 +1079,11 @@ async fn main(input: Input) -> Result<Output> {
             guidance,
             &format!("{tag}_ctx"),
         )?;
-        let latent = Channel::from_shaped(shape, vec![0f32; cells]).named(&format!("{tag}_x"));
+        let latent = match &start {
+            Some(noise) => Channel::from_shaped(shape, noise.as_slice()),
+            None => Channel::from_shaped(shape, vec![0f32; cells]),
+        }
+        .named(&format!("{tag}_x"));
         let image_lane = lane(
             &roles.denoise,
             &ports,
@@ -1132,6 +1143,7 @@ async fn main(input: Input) -> Result<Output> {
             // schedule's first sigma. Every later fire is the same Euler
             // step either way.
             match (&init, &mask) {
+                (None, _) if seeded => step(k, &x, &v, &dts, Some(&readback)),
                 (None, _) => seed_or_step(k, &x, &v, &dts, &rng, shape, Some(&readback)),
                 (Some(init), None) => {
                     resume_or_step(k, &x, init, sigma0, &v, &dts, &rng, shape, Some(&readback))
@@ -1157,11 +1169,9 @@ async fn main(input: Input) -> Result<Output> {
         });
     }
 
-    // Both paths are the same loop now: the device seeds its own latent from
-    // the keyed RNG and integrates its own Euler step, guided or not. The
-    // guided branches read each other's velocity off the fire's own plane,
-    // so nothing crosses the host between steps and the same seed draws the
-    // same latent either way.
+    // Both paths are the same loop: the device integrates its own Euler step,
+    // guided or not, and the guided branches read each other's velocity off
+    // the fire's own plane, so nothing crosses the host between steps.
     let mut last: Vec<f32> = Vec::new();
     for fire in 0..loops.fires() {
         let passes: Vec<&ForwardPass> = branches

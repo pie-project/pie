@@ -746,11 +746,11 @@ fn build_pipelines(device: &Context, lowered: &crate::guest::Lowered) -> Result<
             .collect();
         if infos.is_empty() {
             d.destroy_shader_module(module, None);
-            d.destroy_pipeline_layout(layout, None);
-            d.destroy_descriptor_set_layout(set_layout, None);
-            return Err(Fault::Program {
-                at: "guest::session",
-                why: "a stage emitted no dispatches, so nothing would run".into(),
+            return Ok(Built {
+                core: Arc::clone(core),
+                layout,
+                set_layout,
+                pipelines: Vec::new(),
             });
         }
         let cache = device.pipeline_cache();

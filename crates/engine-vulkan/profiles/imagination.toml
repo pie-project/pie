@@ -78,7 +78,8 @@ moe.tile_rows = [
 # device" in a way that holds on GPUs of any size.
 # one of coopmat | register_tiled | tiled | one_row | qmv; varies with rows, fill; fixed per op: n, k, bits, group
 qmm = [
-  { when = "rows >= 12", use = "tiled", crossover_tg = 160 },
+  { when = "rows > 32", use = "register_tiled", bm = 64, k16 = true },
+  { when = "rows >= 12", use = "register_tiled", bm = 32, k16 = true },
   { use = "qmv", vecs = 4 },
 ]
 # How many workgroups a decode row's keys may split across.

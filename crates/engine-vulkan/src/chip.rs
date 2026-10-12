@@ -266,7 +266,7 @@ mod tests {
     }
 
     /// The dense matmul the per-vendor cascade before `kernel.qmm` picked:
-    /// coopmat, register tiles on Adreno, then tiled, from 12 rows over whole
+    /// coopmat, register tiles on Adreno and PowerVR, then tiled, from 12 rows over whole
     /// 32-code tiles; for one row, the one-row kernel on Adreno (32 lanes a
     /// row) and on PowerVR (8 lanes a row, two rows a lane); else
     /// four vectors a workgroup.
@@ -276,9 +276,10 @@ mod tests {
         let one_row = rows == 1 && k.is_multiple_of(32);
         if d.coopmat && tiles {
             Qmm::Coopmat
-        } else if qualcomm && tiles {
+        } else if (qualcomm || d.vendor == "imagination") && tiles {
             Qmm::RegisterTiled {
                 bm: if rows > 32 { 64 } else { 32 },
+                k16: true,
             }
         } else if tiles && n.is_multiple_of(16) {
             Qmm::Tiled { crossover_tg: 160 }

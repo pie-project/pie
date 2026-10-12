@@ -277,6 +277,11 @@ impl std::fmt::Debug for Buffer {
 }
 
 impl Buffer {
+    pub(crate) fn of_slab(slab: Slab) -> Buffer {
+        let bytes = slab.size;
+        Buffer { slab, bytes }
+    }
+
     pub fn zeroed(device: &Context, bytes: u64) -> Result<Buffer> {
         Buffer::with(device, bytes, Memory::Device)
     }

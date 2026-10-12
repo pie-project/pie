@@ -104,6 +104,11 @@ pub struct FireBindings {
     pub rs: Option<std::sync::Arc<crate::rs::Seat>>,
 
     pub scores: Option<crate::scores::ScoreSeat>,
+
+    pub group_of_lane: Option<Tensor>,
+    pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
+    pub ports: Vec<(engine::fire::PortKind, u8, Tensor)>,
+    pub voxels: Option<crate::inputs::VoxelHandles>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -225,7 +230,17 @@ impl<'c> Run<'c> {
     /// After `node` runs: submits what the frame holds once a new layer
     /// starts. A failed submit faults the frame, which its commit reports.
     pub(crate) fn split_at(&mut self, node: &Node) {
-        let (Some(held), Some(layer)) = (self.split.as_mut(), node.layer) else {
+        let Some(held) = self.split.as_mut() else {
+            return;
+        };
+        let Some(layer) = node.layer else {
+            if matches!(
+                node.op,
+                poem_ir::Operation::Spatial(poem_ir::Spatial::Conv3d { .. })
+            ) && let Err(fault) = crate::probe::flush()
+            {
+                tracing::warn!(%fault, "submitting a convolution of a split step");
+            }
             return;
         };
         if held.is_some_and(|held| held != layer)
@@ -281,6 +296,10 @@ impl<'c> Run<'c> {
 
     pub(crate) fn at_region(&self) -> u32 {
         self.place.region.get()
+    }
+
+    pub(crate) fn run_index(&self) -> u32 {
+        self.place.run.get()
     }
 
     pub(crate) fn nodes(&self) -> &'c [Node] {
@@ -400,12 +419,10 @@ impl<'c> Run<'c> {
             Some(Dim::Patches) => (patch.row_offset, patch.rows),
             Some(Dim::Images) => (patch.lane_offset, patch.lanes),
             Some(Dim::ImagesPlus(k)) => (patch.lane_offset, patch.lanes + k),
-            Some(Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_)) => {
-                panic!(
-                    "value {} lives on the voxel axis, which this shell does not seat",
-                    id.0
-                )
-            }
+            Some(Dim::Voxels) => (seated.voxel.row_offset, seated.voxel.rows),
+            Some(Dim::VoxelsTimes(k)) => (seated.voxel.row_offset * k, seated.voxel.rows * k),
+            Some(Dim::Clips) => (seated.voxel.lane_offset, seated.voxel.lanes),
+            Some(Dim::ClipsPlus(k)) => (seated.voxel.lane_offset, seated.voxel.lanes + k),
         };
         self.slice(handle, skip, keep)
     }
@@ -526,16 +543,50 @@ impl<'c> Run<'c> {
                     )
                 })
             }
-            Def::Input(
-                which @ (RuntimeInput::RowPermutation { .. }
-                | RuntimeInput::Latents { .. }
-                | RuntimeInput::LaneVector { .. }
-                | RuntimeInput::Context { .. }
-                | RuntimeInput::AxisPositions { .. }
-                | RuntimeInput::Grid
-                | RuntimeInput::Voxels { .. }
-                | RuntimeInput::TokenGrid { .. }),
-            ) => panic!("value {at} reads {which:?}, which this shell does not stage"),
+            Def::Input(RuntimeInput::Latents { port, .. }) => {
+                self.port(at, engine::fire::PortKind::Latents, *port)
+            }
+            Def::Input(RuntimeInput::LaneVector { port, .. }) => {
+                self.port(at, engine::fire::PortKind::LaneVector, *port)
+            }
+            Def::Input(RuntimeInput::Context { port, .. }) => {
+                self.port(at, engine::fire::PortKind::Context, *port)
+            }
+            Def::Input(RuntimeInput::AxisPositions { port, .. }) => {
+                self.port(at, engine::fire::PortKind::AxisPositions, *port)
+            }
+            Def::Input(RuntimeInput::RowPermutation { select }) => {
+                self.packing(at, *select).permutation
+            }
+            Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::GroupOfLane,
+                ..
+            }) => self.fire.group_of_lane.unwrap_or_else(|| {
+                panic!("value {at} reads the group-of-lane table, which this load carved none of")
+            }),
+            Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::GroupIndptr { select },
+                ..
+            }) => self.packing(at, *select).group_indptr,
+            Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::LaneIndptr { select },
+                ..
+            }) => self.packing(at, *select).lane_indptr,
+            Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::ReferenceTag { select },
+                ..
+            }) => self.packing(at, *select).reference_tag,
+            Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::RequestOfToken,
+                ..
+            }) if self.fire.geometry.is_empty() => self.fire.tables.request_of_token,
+            Def::Input(RuntimeInput::Grid) => self.voxel_seat(at).grid,
+            Def::Input(RuntimeInput::Voxels { .. }) => self.voxel_seat(at).payload,
+            Def::Input(RuntimeInput::TokenGrid { .. }) => {
+                self.voxel_seat(at).token_grid.unwrap_or_else(|| {
+                    panic!("value {at} reads the token side of the patchify pair, which this load carved none of")
+                })
+            }
             Def::Input(RuntimeInput::Geometry { space, kind }) => {
                 let space = *space as usize;
                 let seat = self.fire.geometry.get(space).unwrap_or_else(|| {
@@ -589,6 +640,44 @@ impl<'c> Run<'c> {
                  never to a tensor"
             ),
         }
+    }
+
+    pub(crate) fn spatial_moments(&self, clips: u32, groups: u32) -> Option<(Tensor, Tensor)> {
+        Some(
+            self.scratch
+                .spatial_moments(self.handles, clips, groups)?
+                .unwrap_or_else(|fault| {
+                    panic!("the moment planes this load reserved do not mint: {fault}")
+                }),
+        )
+    }
+
+    fn voxel_seat(&self, at: usize) -> crate::inputs::VoxelHandles {
+        self.fire.voxels.unwrap_or_else(|| {
+            panic!("value {at} reads the voxel axis, and no lane of this fire submitted a clip")
+        })
+    }
+
+    fn port(&self, at: usize, kind: engine::fire::PortKind, port: u8) -> Tensor {
+        self.fire
+            .ports
+            .iter()
+            .find(|(k, p, _)| *k == kind && *p == port)
+            .map(|(_, _, tensor)| *tensor)
+            .unwrap_or_else(|| {
+                panic!("value {at} reads the {kind:?} port {port}, which this load carved none of")
+            })
+    }
+
+    fn packing(&self, at: usize, select: poem_ir::Selection) -> crate::inputs::PackingHandles {
+        self.fire
+            .packings
+            .iter()
+            .find(|(held, _)| *held == select)
+            .map(|(_, packing)| *packing)
+            .unwrap_or_else(|| {
+                panic!("value {at} reads a packing of {select:?}, which this fire staged none of")
+            })
     }
 
     pub(crate) fn ragged(&self, id: ValueId) -> RaggedTensor {

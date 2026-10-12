@@ -16,11 +16,16 @@ const DENSE: [&str; 3] = [
     "dense_bidirectional_bf16_d_256",
 ];
 
-fn stamp_for(head_dim: u32) -> Option<usize> {
+pub(super) fn stamp_for(head_dim: u32) -> Option<usize> {
     STAMPS.iter().position(|stamp| head_dim <= *stamp)
 }
 
-fn row_heads(op: &'static str, what: &str, width: u32, head_dim: u32) -> Result<u32, Error> {
+pub(super) fn row_heads(
+    op: &'static str,
+    what: &str,
+    width: u32,
+    head_dim: u32,
+) -> Result<u32, Error> {
     if width == 0 || !width.is_multiple_of(head_dim) {
         return Err(refuse(
             op,

@@ -145,7 +145,8 @@ pub fn split_qkv(
     v: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "layout.split_qkv";
-    let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "split_qkv_bf16" });
+    let entry =
+        dtype_dispatch!(OP, packed.dtype, { Bf16 => "split_qkv_bf16", F32 => "split_qkv_f32" });
     if q_width.saturating_add(kv_width.saturating_mul(2)) != packed.width {
         return Err(refuse(
             OP,
@@ -218,7 +219,8 @@ pub fn split_rows(
     right: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "layout.split_rows";
-    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "split_rows_bf16" });
+    let entry =
+        dtype_dispatch!(OP, x.dtype, { Bf16 => "split_rows_bf16", F32 => "split_rows_f32" });
     nonzero(OP, "the left half of this cut", left.width)?;
     nonzero(OP, "the right half of this cut", right.width)?;
     debug_assert_eq!(
@@ -764,4 +766,27 @@ pub fn copy_words(ctx: &Ctx<'_>, src: Tensor, dst: Tensor, bytes: u64) -> Result
         Fire::at("layout/copy.slang", "copy_words").threads([words, 1, 1], [256, 1, 1]),
         &[src.arg(), dst.arg_mut(), stated(OP, words)?.arg()],
     )
+}
+
+pub fn pack_rows(ctx: &Ctx<'_>, x: Tensor, perm: Tensor, o: Tensor) -> Result<(), Error> {
+    let index = permutation("layout.pack_rows", perm, o.rows)?;
+    gather_rows(ctx, x, index, o)
+}
+
+pub fn unpack_rows(ctx: &Ctx<'_>, x: Tensor, perm: Tensor, o: Tensor) -> Result<(), Error> {
+    let index = permutation("layout.unpack_rows", perm, x.rows)?;
+    scatter_rows(ctx, x, index, o)
+}
+
+fn permutation(op: &'static str, perm: Tensor, rows: u32) -> Result<Tensor, Error> {
+    if u64::from(perm.rows) * u64::from(perm.width) < u64::from(rows) {
+        return Err(refuse(
+            op,
+            format!(
+                "a {} x {} permutation for {rows} rows",
+                perm.rows, perm.width
+            ),
+        ));
+    }
+    Ok(Tensor::new(perm.buf, rows, 1, perm.dtype))
 }

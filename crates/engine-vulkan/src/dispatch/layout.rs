@@ -1,6 +1,6 @@
 use kernels_vulkan::layout;
 use poem_exec::{DispatchLayout, KernelError};
-use poem_ir::{Layout, Operands};
+use poem_ir::Layout;
 
 use crate::run::Run;
 
@@ -188,9 +188,18 @@ impl Run<'_> {
             ),
 
             Layout::TopK { .. } => Err(kernels_vulkan::Error::Unsupported { op: "layout.topk" }),
-            Layout::PackRows { .. } | Layout::UnpackRows { .. } => {
-                Err(kernels_vulkan::Error::Unsupported { op: op.name() })
-            }
+            Layout::PackRows { x, perm, y } => layout::pack_rows(
+                self.ctx(),
+                self.uncut(*x),
+                self.tensor(*perm),
+                self.tensor(*y),
+            ),
+            Layout::UnpackRows { x, perm, y } => layout::unpack_rows(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*perm),
+                self.uncut(*y),
+            ),
             Layout::Argmax { xs, y } => {
                 for (column, x) in xs.iter().enumerate() {
                     layout::argmax(

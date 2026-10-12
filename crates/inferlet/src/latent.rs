@@ -9,8 +9,8 @@ pub mod prelude {
     pub use super::{
         DenoiseLoop, Dpm2m, Dpm2mChannels, FlowMatchEuler, LaneClock, LaneRows, apg, at,
         cfg_combine, dpm2m_step, dynamic_shift, encode_ids, encode_ids_rows, encode_text,
-        euler_step, guided_velocity, inpaint_step, noise, positions_for, positions_grid,
-        resume_or_step, rng_state, seed_or_step,
+        euler_step, guided_velocity, host_noise, inpaint_step, noise, positions_for,
+        positions_grid, resume_or_step, rng_state, seed_or_step, step,
     };
     pub use crate::eta::attention::prelude::*;
 }
@@ -332,6 +332,22 @@ impl DenoiseLoop {
         }
     }
 
+    /// One fire per step over a latent drawn up front by [`host_noise`].
+    #[must_use]
+    pub fn seeded(sched: &FlowMatchEuler) -> DenoiseLoop {
+        let mut ts = sched.timesteps();
+        ts.push(0.0);
+        let mut dts = sched.dts();
+        dts.push(0.0);
+        DenoiseLoop {
+            pipes: Vec::new(),
+            dts,
+            ts,
+            sigmas: sched.sigmas.clone(),
+            fires: sched.steps(),
+        }
+    }
+
     #[must_use]
     pub fn fires(&self) -> u32 {
         self.fires
@@ -401,6 +417,38 @@ pub fn seed_or_step(
         out.put(&next);
     }
     rng.put(&state + &Tensor::constant([0u32, 1u32]));
+}
+
+pub fn step(k: &Tensor, x: &Channel, velocity: &Tensor, dts: &Channel, out: Option<&Channel>) {
+    let next = euler_step(&x.take(), velocity, &at(&dts.read(), k));
+    x.put(&next);
+    if let Some(out) = out {
+        out.put(&next);
+    }
+}
+
+/// `len` standard normal draws for `seed`, the same on every host.
+#[must_use]
+pub fn host_noise(seed: u32, len: usize) -> Vec<f32> {
+    let mut state = u64::from(seed) ^ 0x9e37_79b9_7f4a_7c15;
+    let mut next = move || {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        ((z >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    };
+    let mut out = Vec::with_capacity(len + 1);
+    while out.len() < len {
+        let (u, v) = (next(), next());
+        let r = (-2.0 * u.ln()).sqrt();
+        let angle = std::f64::consts::TAU * v;
+        out.push((r * angle.cos()) as f32);
+        out.push((r * angle.sin()) as f32);
+    }
+    out.truncate(len);
+    out
 }
 
 #[allow(clippy::too_many_arguments)]

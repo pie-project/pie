@@ -28,8 +28,11 @@ public class PieClient private constructor(private val transport: PieTransport) 
     private val pending = HashMap<Int, CompletableDeferred<String>>()
     private val processes = HashMap<String, Channel<PieProcess.Event>>()
 
+    /** Files part-way through their chunks, by hash. */
+    private val downloads = HashMap<String, Pair<ServerFrame.FileChunk, java.io.ByteArrayOutputStream>>()
+
     /** Events that arrived before their process's launch response. */
-    private val early = HashMap<String, MutableList<ServerFrame.ProcessEvent>>()
+    private val early = HashMap<String, MutableList<ServerFrame>>()
     private var failure: Throwable? = null
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default + CoroutineExceptionHandler { _, _ -> })
@@ -89,7 +92,7 @@ public class PieClient private constructor(private val transport: PieTransport) 
         }
         synchronized(lock) {
             processes[id] = events
-            early.remove(id)?.forEach(::deliver)
+            early.remove(id)?.forEach(::route)
         }
         return PieProcess(id, events.consumeAsFlow(), this)
     }
@@ -132,8 +135,32 @@ public class PieClient private constructor(private val transport: PieTransport) 
                 }
                 is ServerFrame.ProcessEvent ->
                     if (frame.processId in processes) deliver(frame) else early.getOrPut(frame.processId, ::mutableListOf).add(frame)
+                is ServerFrame.FileChunk ->
+                    if (frame.processId in processes) collect(frame) else early.getOrPut(frame.processId, ::mutableListOf).add(frame)
                 ServerFrame.Other -> Unit
             }
+        }
+    }
+
+    private fun route(frame: ServerFrame) {
+        when (frame) {
+            is ServerFrame.ProcessEvent -> deliver(frame)
+            is ServerFrame.FileChunk -> collect(frame)
+            else -> Unit
+        }
+    }
+
+    private fun collect(chunk: ServerFrame.FileChunk) {
+        val events = processes[chunk.processId] ?: return
+        val started = downloads[chunk.hash] ?: if (chunk.index == 0) {
+            (chunk to java.io.ByteArrayOutputStream()).also { downloads[chunk.hash] = it }
+        } else {
+            return
+        }
+        started.second.write(chunk.data)
+        if (chunk.index == chunk.total - 1) {
+            downloads.remove(chunk.hash)
+            events.trySend(PieProcess.Event.File(started.first.name, started.second.toByteArray()))
         }
     }
 
@@ -182,6 +209,9 @@ public class PieProcess internal constructor(
 
         /** A `session::send` from the inferlet. */
         public data class Message(public val text: String) : Event
+
+        /** A file the inferlet sent (`session::send_file_as`, `send_frames`), under the name it gave, if any. */
+        public class File(public val name: String?, public val bytes: ByteArray) : Event
 
         /** What `main` returned; always the last event. */
         public data class Returned(public val value: String) : Event

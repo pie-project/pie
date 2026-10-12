@@ -22,6 +22,7 @@ impl From<String> for Refusal {
 
 struct Instance {
     program: ProgramId,
+    ids: Vec<ChannelId>,
     plan: Arc<ExecPlan>,
     inst: InterpInstance,
     geometry: GeometryClass,
@@ -33,6 +34,19 @@ struct Instance {
     landing: Arc<Mutex<Vec<(u32, u64)>>>,
     /// Set by a pass that faulted after its fire returned.
     faulted: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone)]
+pub enum PortCell {
+    Host {
+        bytes: Vec<u8>,
+        dtype: eta_ir::types::Dtype,
+    },
+    #[cfg(feature = "vulkan")]
+    Device {
+        cell: crate::device::Buffer,
+        dtype: eta_ir::types::Dtype,
+    },
 }
 
 #[derive(Default)]
@@ -186,6 +200,7 @@ impl Plane {
             id,
             Instance {
                 program: binding.program,
+                ids: binding.channels.clone(),
                 plan,
                 inst,
                 geometry: binding.geometry,
@@ -223,6 +238,41 @@ impl Plane {
                 what: "instance",
                 id,
             })
+    }
+
+    pub fn port_cell(&self, instance: InstanceId, id: ChannelId) -> Result<PortCell, Refusal> {
+        let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
+            what: "instance",
+            id: instance,
+        })?;
+        let dense = seat
+            .ids
+            .iter()
+            .position(|&held| held == id)
+            .ok_or_else(|| {
+                Refusal::Program(format!(
+                    "a port feed names channel {id}, which instance {instance} does not carry"
+                ))
+            })?;
+        let ring = &seat.inst.channels[dense];
+        let dtype = eta_exec::concrete_dtype(seat.plan.package.channels[dense].dtype);
+        #[cfg(feature = "vulkan")]
+        if let Some(cell) = seat.session.kept_cell(dense as u32) {
+            return Ok(PortCell::Device {
+                cell: cell.clone(),
+                dtype,
+            });
+        }
+        if ring.is_empty() {
+            return Err(Refusal::Program(format!(
+                "port channel {id} of instance {instance} holds no cell; publish one before \
+                 the fire that reads it"
+            )));
+        }
+        let value = ring.front();
+        let mut bytes = vec![0u8; eta_exec::wire_cell_bytes(value.dtype(), value.len())];
+        eta_exec::encode_wire(&value, &mut bytes);
+        Ok(PortCell::Host { bytes, dtype })
     }
 
     pub fn envelope_fold_len(&self, instance: InstanceId) -> Result<Option<u32>, Refusal> {
@@ -401,6 +451,7 @@ impl Plane {
         mtp_width: u32,
         #[cfg(feature = "vulkan")] device: Option<&crate::device::Context>,
         #[cfg(feature = "vulkan")] readout: Option<crate::guest::run::Readout<'_>>,
+        #[cfg(feature = "vulkan")] pixels: Option<crate::guest::run::Readout<'_>>,
     ) -> Result<(), Refusal> {
         let Plane {
             instances,
@@ -461,7 +512,8 @@ impl Plane {
         let (outcome, ran) = {
             let widen = widen.as_ref().expect("the device arm checked for one");
             let session = &mut seat.session;
-            let mut runner = crate::guest::run::OnDevice::new(device_half, session, widen, readout);
+            let mut runner = crate::guest::run::OnDevice::new(device_half, session, widen, readout)
+                .with_pixels(pixels);
             let outcome = eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut runner);
             let ran = runner.ran().len();
             widen.disarm();
@@ -538,6 +590,7 @@ impl Plane {
         instance: InstanceId,
         device: &crate::device::Context,
         readout: Option<crate::guest::run::Readout<'_>>,
+        pixels: Option<crate::guest::run::Readout<'_>>,
         done: Option<crate::settle::Done>,
     ) -> Result<(), Refusal> {
         let Plane {
@@ -569,7 +622,9 @@ impl Plane {
             attn_score: None,
         };
         let mut runner =
-            crate::guest::run::OnDevice::new(device, &mut seat.session, widen, readout).deferred();
+            crate::guest::run::OnDevice::new(device, &mut seat.session, widen, readout)
+                .with_pixels(pixels)
+                .deferred();
         let outcome = eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut runner);
         let deferral = runner.take_deferral().unwrap_or_default();
         widen.disarm();

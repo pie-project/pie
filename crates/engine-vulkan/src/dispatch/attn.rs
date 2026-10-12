@@ -236,11 +236,44 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
             ),
+            Attention::Ragged {
+                q,
+                k,
+                v,
+                q_indptr,
+                kv_indptr,
+                head_dim,
+                kv_heads,
+                sm_scale,
+                mask,
+                o,
+            } => {
+                if self.run_index() > 0 {
+                    return Ok(());
+                }
+                match mask {
+                    poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal => {}
+                    _ => return Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
+                }
+                attn::ragged::forward(
+                    self.ctx(),
+                    self.uncut(*q),
+                    self.uncut(*k),
+                    self.uncut(*v),
+                    self.uncut(*q_indptr),
+                    self.uncut(*kv_indptr),
+                    *head_dim,
+                    *kv_heads,
+                    *sm_scale,
+                    self.uncut(*o),
+                )
+            }
             Attention::Masked { causal: false, .. }
             | Attention::MaskedLse { causal: false, .. }
             | Attention::BlockDynConv { .. }
-            | Attention::SelectorWalk { .. }
-            | Attention::Ragged { .. } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
+            | Attention::SelectorWalk { .. } => {
+                Err(kernels_vulkan::Error::Unsupported { op: op.name() })
+            }
             Attention::DecodeRel { .. }
             | Attention::PrefillRel { .. }
             | Attention::ShortConv { .. }

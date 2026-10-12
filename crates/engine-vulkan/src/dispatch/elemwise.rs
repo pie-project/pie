@@ -102,18 +102,107 @@ impl Run<'_> {
                 self.tensor(*x),
             ),
 
-            Elementwise::LayernormNoScale { .. }
-            | Elementwise::Modulate { .. }
-            | Elementwise::GatedResidualAdd { .. }
-            | Elementwise::Sinusoid { .. }
-            | Elementwise::RelativeBucketBias { .. }
-            | Elementwise::Silu { .. }
+            Elementwise::LayernormNoScale { x, eps, y } => elemwise::norm::layernorm_no_scale(
+                self.ctx(),
+                self.tensor(*x),
+                *eps,
+                self.tensor(*y),
+            ),
+            Elementwise::Modulate {
+                x,
+                m,
+                lane_of_row,
+                form,
+                y,
+            } => elemwise::modulate::modulate(
+                self.ctx(),
+                match form {
+                    poem_ir::ModulateForm::ScaleShift => elemwise::modulate::Form::ScaleShift,
+                    poem_ir::ModulateForm::Scale => elemwise::modulate::Form::Scale,
+                    poem_ir::ModulateForm::TanhGate => elemwise::modulate::Form::TanhGate,
+                },
+                self.tensor(*x),
+                match lane_of_row {
+                    Some(_) => self.uncut(*m),
+                    None => self.tensor(*m),
+                },
+                lane_of_row.map(|lanes| self.tensor(lanes)),
+                self.tensor(*y),
+            ),
+            Elementwise::GatedResidualAdd {
+                r,
+                g,
+                y,
+                lane_of_row,
+                r_out: _,
+            } => elemwise::modulate::gated_residual_add(
+                self.ctx(),
+                self.tensor(*r),
+                match lane_of_row {
+                    Some(_) => self.uncut(*g),
+                    None => self.tensor(*g),
+                },
+                self.tensor(*y),
+                lane_of_row.map(|lanes| self.tensor(lanes)),
+                self.tensor(*r),
+            ),
+            Elementwise::Sinusoid {
+                t,
+                dim,
+                max_period,
+                flip_sin_cos,
+                scale,
+                y,
+            } => elemwise::sinusoid::sinusoid(
+                self.ctx(),
+                self.tensor(*t),
+                *dim,
+                *max_period,
+                *flip_sin_cos,
+                *scale,
+                self.tensor(*y),
+            ),
+            Elementwise::Silu { x, x_out: _ } => {
+                elemwise::pointwise::silu(self.ctx(), self.tensor(*x), self.tensor(*x))
+            }
+            Elementwise::Tanh { x, x_out: _ } => {
+                elemwise::pointwise::tanh(self.ctx(), self.tensor(*x), self.tensor(*x))
+            }
+            Elementwise::Add { x, y, z } => elemwise::pointwise::add(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*y),
+                self.tensor(*z),
+            ),
+            Elementwise::RopeAxes {
+                x,
+                positions,
+                dims,
+                thetas,
+                form,
+                rotary_dim,
+                head_dim,
+                x_out: _,
+            } => elemwise::rope_axes::rope_axes(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*positions),
+                *dims,
+                *thetas,
+                match form {
+                    poem_ir::RopeForm::Interleaved => elemwise::rope_axes::RopeForm::Interleaved,
+                    poem_ir::RopeForm::Neox => elemwise::rope_axes::RopeForm::Neox,
+                    poem_ir::RopeForm::Split => elemwise::rope_axes::RopeForm::Split,
+                    poem_ir::RopeForm::SplitLadder => elemwise::rope_axes::RopeForm::SplitLadder,
+                },
+                *rotary_dim,
+                *head_dim,
+                self.tensor(*x),
+            ),
+            Elementwise::RelativeBucketBias { .. }
             | Elementwise::Gelu { .. }
-            | Elementwise::Tanh { .. }
             | Elementwise::Hadamard { .. }
             | Elementwise::Mul { .. }
-            | Elementwise::Add { .. }
-            | Elementwise::RopeAxes { .. }
             | Elementwise::GateSigmoidMulHeads { .. } => {
                 Err(kernels_vulkan::Error::Unsupported { op: op.name() })
             }

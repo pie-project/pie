@@ -29,3 +29,4 @@ void main(uint3 gid : SV_DispatchThreadID) {
 }
 
 // pie:instantiate split_qkv_bf16
+// pie:instantiate split_qkv_f32 PIE_ACT_F32=1

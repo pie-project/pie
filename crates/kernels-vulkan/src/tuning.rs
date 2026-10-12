@@ -36,12 +36,15 @@ pub enum Qmm {
     Coopmat,
     /// The register-tiled kernel: a 4x4 output block an invocation, which
     /// suits GPUs whose workgroup memory is slow next to their ALUs
-    /// (Adreno).
+    /// (Adreno, PowerVR).
     #[partial]
     RegisterTiled {
         /// Rows a workgroup covers.
         #[constant(set(32, 64), default = 32)]
         bm: u32,
+        /// A 16-wide contraction block: 2.5x faster on PowerVR, faster on Adreno.
+        #[constant(default = true)]
+        k16: bool,
     },
     /// The tiled kernel, through workgroup memory.
     #[partial]

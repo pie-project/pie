@@ -14,9 +14,15 @@ uint16_t f32_to_bf16(float f) {
     return uint16_t(rounded >> 16);
 }
 
+#ifdef PIE_ACT_F32
+#define PIE_ACT float
+#define PIE_LOAD(x) (x)
+#define PIE_STORE(f) (f)
+#else
 #define PIE_ACT uint16_t
 #define PIE_LOAD(x) bf16_to_f32(x)
 #define PIE_STORE(f) f32_to_bf16(f)
+#endif
 
 #define PIE_STRIDE uint2
 

@@ -17,3 +17,4 @@ void main(uint3 gid : SV_DispatchThreadID) {
 }
 
 // pie:instantiate residual_add_bf16
+// pie:instantiate residual_add_f32 PIE_ACT_F32=1

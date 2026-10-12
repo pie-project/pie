@@ -103,6 +103,8 @@ pub struct Scratch {
 
     split: Option<SplitRooms>,
 
+    spatial: Option<Room>,
+
     copy: Option<CopyRoom>,
 
     pool: Vec<Pool>,
@@ -224,10 +226,27 @@ impl Scratch {
                 }
             });
 
+        let spatial = trace
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                Operation::Spatial(poem_ir::Spatial::GroupNorm { groups, .. }) => Some(*groups),
+                _ => None,
+            })
+            .max()
+            .filter(|groups| *groups > 0)
+            .map(|groups| {
+                let clips = budgets.max_clips().max(1);
+                let floats = kernels_vulkan::spatial::norm::scratch_floats(clips, groups);
+                let mut at = 0u64;
+                Room::lay(&mut at, floats.div_ceil(4).max(1), 4, Dtype::F32)
+            });
+
         let union = routed
             .map_or(0, |r| r.y.at + r.y.bytes())
             .max(index.map_or(0, |r| r.at + r.bytes()))
-            .max(split.map_or(0, |r| r.part_lse.at + r.part_lse.bytes()));
+            .max(split.map_or(0, |r| r.part_lse.at + r.part_lse.bytes()))
+            .max(spatial.map_or(0, |r| r.at + r.bytes()));
 
         let copy = copy_ceiling(trace, compiled, budget).map(|bytes| CopyRoom {
             at: union.next_multiple_of(ALIGN),
@@ -283,6 +302,7 @@ impl Scratch {
             routed,
             index,
             split,
+            spatial,
             copy,
             pool,
             ple,
@@ -294,6 +314,39 @@ impl Scratch {
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.plane.bytes()
+    }
+
+    pub fn spatial_moments(
+        &self,
+        handles: &Handles,
+        clips: u32,
+        groups: u32,
+    ) -> Option<Result<(Tensor, Tensor)>> {
+        let room = self.spatial?;
+        let splits = kernels_vulkan::spatial::norm::SPLITS;
+        let partial_floats = u64::from(clips) * u64::from(splits) * u64::from(groups) * 4;
+        let stat_floats = u64::from(clips) * u64::from(groups) * 2;
+        if partial_floats + stat_floats > u64::from(room.rows) * u64::from(room.width) {
+            return None;
+        }
+        let partials = Room {
+            at: room.at,
+            rows: u32::try_from(u64::from(clips) * u64::from(splits)).unwrap_or(u32::MAX),
+            width: groups * 4,
+            dtype: Dtype::F32,
+        };
+        let stats = Room {
+            at: room.at + partials.bytes(),
+            rows: clips,
+            width: groups * 2,
+            dtype: Dtype::F32,
+        };
+        Some((|| {
+            Ok((
+                partials.bind(handles, &self.plane)?,
+                stats.bind(handles, &self.plane)?,
+            ))
+        })())
     }
 
     #[must_use]

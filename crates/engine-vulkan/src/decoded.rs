@@ -17,6 +17,35 @@ pub(crate) fn absorbed_weights(trace: &Trace) -> BTreeSet<usize> {
     rows
 }
 
+/// Weights an f32 activation multiplies: the quantized kernels take bf16 activations only.
+pub(crate) fn lane_axis_weights(trace: &Trace) -> BTreeSet<usize> {
+    let f32_rows = |value: poem_ir::ValueId| {
+        matches!(
+            trace.values.get(value.0 as usize).map(|v| &v.ty),
+            Some(poem_ir::Ty::Tensor {
+                dtype: poem_ir::Dtype::F32,
+                ..
+            })
+        )
+    };
+    let mut rows = BTreeSet::new();
+    for node in &trace.nodes {
+        let (act, w) = match &node.op {
+            Operation::Linear(
+                poem_ir::Linear::Matmul { act, w, .. } | poem_ir::Linear::LmHead { act, w, .. },
+            ) => (*act, *w),
+            _ => continue,
+        };
+        if !f32_rows(act) {
+            continue;
+        }
+        if let Some(Def::Weight(index)) = trace.values.get(w.0 as usize).map(|v| &v.def) {
+            rows.insert(*index as usize);
+        }
+    }
+    rows
+}
+
 pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
 }

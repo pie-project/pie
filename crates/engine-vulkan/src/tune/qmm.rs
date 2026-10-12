@@ -153,8 +153,10 @@ pub fn weight(grid: &Grid, rows: u32, n: u32, k: u32, bank: Bank) -> f64 {
 pub fn candidates(base: &Profile) -> Vec<Qmm> {
     let mut out = vec![
         Qmm::Coopmat,
-        Qmm::RegisterTiled { bm: 32 },
-        Qmm::RegisterTiled { bm: 64 },
+        Qmm::RegisterTiled { bm: 32, k16: true },
+        Qmm::RegisterTiled { bm: 64, k16: true },
+        Qmm::RegisterTiled { bm: 32, k16: false },
+        Qmm::RegisterTiled { bm: 64, k16: false },
     ];
     for crossover_tg in [64, 96, 128, 160, 256] {
         out.push(Qmm::Tiled { crossover_tg });
@@ -179,7 +181,9 @@ pub fn candidates(base: &Profile) -> Vec<Qmm> {
 pub fn body(q: &Qmm) -> String {
     match *q {
         Qmm::Coopmat => "use = \"coopmat\"".to_string(),
-        Qmm::RegisterTiled { bm } => format!("use = \"register_tiled\", bm = {bm}"),
+        Qmm::RegisterTiled { bm, k16 } => {
+            format!("use = \"register_tiled\", bm = {bm}, k16 = {k16}")
+        }
         Qmm::Tiled { crossover_tg } => format!("use = \"tiled\", crossover_tg = {crossover_tg}"),
         Qmm::OneRow { lanes, rows } => {
             format!("use = \"one_row\", lanes = {lanes}, rows = {rows}")

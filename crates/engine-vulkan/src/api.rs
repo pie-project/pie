@@ -235,6 +235,44 @@ fn patch_bytes(
     }
 }
 
+#[must_use]
+pub fn voxel_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<poem_compiler::VoxelLadder> {
+    const DERIVED_VOXEL_CEILING: u32 = 65_536;
+    let declares_voxels = trace.values.iter().any(|decl| {
+        matches!(&decl.ty, poem_ir::Ty::Tensor { shape, .. }
+            if shape.first().and_then(|dim| dim.axis()) == Some(poem_ir::RowAxis::Voxels))
+    });
+    if !declares_voxels {
+        return None;
+    }
+    let max_voxels = budgets.max_voxels.unwrap_or(DERIVED_VOXEL_CEILING).max(1);
+    Some(poem_compiler::VoxelLadder {
+        max_voxels,
+        buckets: Vec::new(),
+        max_clips: budgets
+            .max_clips
+            .unwrap_or(budgets.max_lanes)
+            .clamp(1, max_voxels),
+    })
+}
+
+fn voxel_bytes(
+    payload: &[f32],
+    element: poem_ir::Dtype,
+) -> std::result::Result<Vec<u8>, &'static str> {
+    match element {
+        poem_ir::Dtype::Bf16 => Ok(payload
+            .iter()
+            .flat_map(|&v| {
+                let bits = v.to_bits();
+                (((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16).to_le_bytes()
+            })
+            .collect()),
+        poem_ir::Dtype::F32 => Ok(payload.iter().flat_map(|&v| v.to_le_bytes()).collect()),
+        _ => Err("a voxel payload against a plan whose voxel element is neither bf16 nor f32"),
+    }
+}
+
 fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
     let trace = shell.trace();
     let layers = trace
@@ -243,7 +281,12 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         .filter_map(|node| node.layer)
         .max()
         .map_or(0, |top| top + 1);
-    let vocab = u32::try_from(shell.out_width().map_err(fault)?).unwrap_or(u32::MAX);
+    let width = u32::try_from(shell.out_width().map_err(fault)?).unwrap_or(u32::MAX);
+    let seam = shell.readout_seam();
+    let vocab = match seam {
+        engine::fire::ReadoutSeam::Logits => width,
+        _ => 0,
+    };
     Ok(ModelProfile {
         vocab,
         page_size: budgets.page_size,
@@ -261,10 +304,13 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         has_attn_page_mask: false,
 
         has_lora: true,
-        has_velocity: false,
-        velocity_width: 0,
-        has_pixels: false,
-        pixels_width: 0,
+        has_velocity: seam == engine::fire::ReadoutSeam::Velocity,
+        velocity_width: match seam {
+            engine::fire::ReadoutSeam::Velocity => width,
+            _ => 0,
+        },
+        has_pixels: shell.pixels_width().is_some(),
+        pixels_width: shell.pixels_width().unwrap_or(0),
         kernels: Vec::new(),
     })
 }
@@ -359,6 +405,7 @@ impl Engine for Vulkan {
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
 
         let patches = patch_ladder(&trace, &budgets);
+        let voxels = voxel_ladder(&trace, &budgets);
         let (disk_kv_budget, disk_kv_dir) =
             (residency.disk_kv_budget, residency.disk_kv_dir.clone());
         let mut shell = Shell::load(Boot {
@@ -374,6 +421,7 @@ impl Engine for Vulkan {
             slots: budgets.slots,
 
             runahead: engine::runahead::Runahead::of(frames_in_flight),
+            voxels,
             residency,
             device: &self.boot,
         })
@@ -826,12 +874,28 @@ impl Vulkan {
                 .map(Vec::as_slice);
 
             #[cfg(feature = "vulkan")]
+            let pixels = shell.as_ref().and_then(|shell| {
+                shell
+                    .pixels_row(landed)
+                    .map(|(seat, at, width)| crate::guest::run::Readout {
+                        seat,
+                        at,
+                        width,
+                        f32: false,
+                    })
+            });
+            #[cfg(feature = "vulkan")]
             let (device, seat) = match shell.as_ref() {
                 Some(shell) => (
                     Some(shell.device()),
                     shell
                         .readout_row(landed, attachment.lane)
-                        .map(|(seat, at, width)| crate::guest::run::Readout { seat, at, width }),
+                        .map(|(seat, at, width, dtype)| crate::guest::run::Readout {
+                            seat,
+                            at,
+                            width,
+                            f32: dtype == poem_ir::Dtype::F32,
+                        }),
                 ),
                 None => (None, None),
             };
@@ -847,6 +911,8 @@ impl Vulkan {
                     device,
                     #[cfg(feature = "vulkan")]
                     seat,
+                    #[cfg(feature = "vulkan")]
+                    pixels,
                 )
                 .map_err(refusal)?;
         }
@@ -895,12 +961,31 @@ impl Vulkan {
                 .as_ref()
                 .ok_or_else(|| Error::Load("the vulkan engine has no model loaded".into()))?;
             let attachment = &step.attachments[0];
-            let seat = shell
-                .readout_row(landed, attachment.lane)
-                .map(|(seat, at, width)| crate::guest::run::Readout { seat, at, width });
+            let seat =
+                shell
+                    .readout_row(landed, attachment.lane)
+                    .map(|(seat, at, width, dtype)| crate::guest::run::Readout {
+                        seat,
+                        at,
+                        width,
+                        f32: dtype == poem_ir::Dtype::F32,
+                    });
             let done = sink.clone().map(|sink| Done { at, sink });
             programs
-                .fire_deferred(attachment.instance, shell.device(), seat, done)
+                .fire_deferred(
+                    attachment.instance,
+                    shell.device(),
+                    seat,
+                    shell
+                        .pixels_row(landed)
+                        .map(|(seat, at, width)| crate::guest::run::Readout {
+                            seat,
+                            at,
+                            width,
+                            f32: false,
+                        }),
+                    done,
+                )
                 .map_err(refusal)
         }
         #[cfg(not(feature = "vulkan"))]
@@ -935,6 +1020,35 @@ impl Vulkan {
                 })?);
             }
         }
+        let voxel_element = self.loaded()?.voxel_element();
+        if !submission.voxels.is_empty() && voxel_element.is_none() {
+            return Err(Error::Invalid(
+                "this step submits VAE clips and the loaded plan states no voxel row".into(),
+            ));
+        }
+        let voxel_payloads = submission
+            .voxels
+            .iter()
+            .map(|row| {
+                voxel_bytes(&row.payload, voxel_element.unwrap_or(poem_ir::Dtype::Bf16)).map_err(
+                    |why| Error::Unsupported {
+                        verb: why,
+                        engine: "vulkan",
+                    },
+                )
+            })
+            .collect::<EngineResult<Vec<_>>>()?;
+        let clips: Vec<crate::serve::Clips<'_>> = submission
+            .voxels
+            .iter()
+            .zip(&voxel_payloads)
+            .map(|(row, payload)| crate::serve::Clips {
+                lane: row.lane,
+                boxes: &row.clips,
+                payload,
+            })
+            .collect();
+
         let media: Vec<crate::serve::Media<'_>> = submission
             .media
             .iter()
@@ -1001,6 +1115,32 @@ impl Vulkan {
             }
         }
 
+        let mut port_cells: Vec<Vec<(engine::fire::PortFeed, crate::program::PortCell)>> =
+            vec![Vec::new(); submission.lanes.len()];
+        for (at, lane) in submission.lanes.iter().enumerate() {
+            if lane.ports.is_empty() {
+                continue;
+            }
+            let instance = submission
+                .attachments
+                .iter()
+                .find(|attachment| attachment.lane as usize == at)
+                .map(|attachment| attachment.instance)
+                .ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "lane {at} feeds input ports and has no attachment; a port is read \
+                         through the instance the lane is attached to"
+                    ))
+                })?;
+            for feed in &lane.ports {
+                let cell = self
+                    .programs
+                    .port_cell(instance, feed.channel)
+                    .map_err(refusal)?;
+                port_cells[at].push((*feed, cell));
+            }
+        }
+
         let sink = self.sink.clone();
 
         let mut lane_adapters: Vec<Option<u32>> = vec![None; submission.lanes.len()];
@@ -1047,6 +1187,7 @@ impl Vulkan {
                     },
                     pages: &lane.kv.pages,
                     held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                    kv_less: lane.kv_less,
                     captures_scores: lane.captures_scores,
 
                     mask: lane.mask.as_ref(),
@@ -1069,6 +1210,10 @@ impl Vulkan {
                     feed: feeds[at].as_ref(),
                     #[cfg(not(feature = "vulkan"))]
                     feed: None,
+
+                    stream: lane.stream,
+                    group: lane.group,
+                    ports: &port_cells[at],
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;
@@ -1082,6 +1227,7 @@ impl Vulkan {
                     lanes: &seated,
                     attachments: &[],
                     media: &media,
+                    clips: &clips,
                     done,
                 },
                 None,

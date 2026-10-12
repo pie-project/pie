@@ -17,6 +17,8 @@ pub struct Readout<'a> {
     pub at: u64,
 
     pub width: u32,
+
+    pub f32: bool,
 }
 
 pub struct OnDevice<'a> {
@@ -24,6 +26,7 @@ pub struct OnDevice<'a> {
     session: &'a mut Session,
     widen: &'a Widen,
     logits: Option<Readout<'a>>,
+    pixels: Option<Readout<'a>>,
 
     ran: Vec<usize>,
 
@@ -63,9 +66,16 @@ impl<'a> OnDevice<'a> {
             session,
             widen,
             logits,
+            pixels: None,
             ran: Vec::new(),
             deferral: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_pixels(mut self, pixels: Option<Readout<'a>>) -> OnDevice<'a> {
+        self.pixels = pixels;
+        self
     }
 
     /// Records the pass into a frame of its own for the caller to submit,
@@ -105,9 +115,15 @@ impl<'a> OnDevice<'a> {
                 continue;
             };
             let root = &package.values[global as usize];
-            if root.source == ValueOrigin::Intrinsic && root.intrinsic == Some(IntrinsicId::Logits)
+            if root.source == ValueOrigin::Intrinsic
+                && (reads_readout(root.intrinsic) || root.intrinsic == Some(IntrinsicId::Pixels))
             {
-                let seat = self.logits.ok_or_else(|| Fault::Program {
+                let offered = if root.intrinsic == Some(IntrinsicId::Pixels) {
+                    self.pixels
+                } else {
+                    self.logits
+                };
+                let seat = offered.ok_or_else(|| Fault::Program {
                     at: "guest::run",
                     why: "this pass reads the logits and no readout row was offered".into(),
                 })?;
@@ -134,8 +150,13 @@ impl<'a> OnDevice<'a> {
                     .session
                     .span(at, local)
                     .expect("the span was just read");
-                self.widen
-                    .encode(&frame, seat.seat, seat.at, heap, into, seat.width)?;
+                if seat.f32 {
+                    let heap = heap.clone();
+                    frame.copy(seat.seat, seat.at, &heap, into, u64::from(seat.width) * 4)?;
+                } else {
+                    self.widen
+                        .encode(&frame, seat.seat, seat.at, heap, into, seat.width)?;
+                }
                 continue;
             }
             if root.source == ValueOrigin::ChannelTake
@@ -303,7 +324,8 @@ impl StageRunner for OnDevice<'_> {
     }
 
     fn binds(&self, id: Option<IntrinsicId>) -> bool {
-        id == Some(IntrinsicId::Logits) && self.logits.is_some()
+        (reads_readout(id) && self.logits.is_some())
+            || (id == Some(IntrinsicId::Pixels) && self.pixels.is_some())
     }
 }
 
@@ -396,4 +418,11 @@ fn from_heap(raw: &[u8], dtype: Dtype, held: u64) -> Value {
                 .collect(),
         ),
     }
+}
+
+fn reads_readout(id: Option<IntrinsicId>) -> bool {
+    matches!(
+        id,
+        Some(IntrinsicId::Logits | IntrinsicId::Velocity | IntrinsicId::Hidden)
+    )
 }

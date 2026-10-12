@@ -25,6 +25,8 @@ pub struct Window {
     pub passes: u32,
 
     pub patch: MaskSpan,
+
+    pub voxel: MaskSpan,
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +296,7 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], copies: Copies<'_>) -> Wind
         }),
 
         patch: MaskSpan::default(),
+        voxel: MaskSpan::default(),
         pass: 0,
         passes: 1,
     }
@@ -306,6 +309,7 @@ impl Windows {
         compiled: &CompiledModel,
         classes: &WindowTable,
         patches: &WindowTable,
+        voxels: &WindowTable,
         indptr_host: &[i32],
         copies: Copies<'_>,
         run_caps: &[u32],
@@ -321,8 +325,19 @@ impl Windows {
             match axis {
                 poem_ir::RowAxis::Tokens => classes.spans_into(&region.mask, &mut spans),
                 poem_ir::RowAxis::Patches => patches.spans_into(&region.mask, &mut spans),
-                poem_ir::RowAxis::Voxels => spans.clear(),
+                poem_ir::RowAxis::Voxels => voxels.spans_into(&region.mask, &mut spans),
             }
+
+            let voxel = match voxels.span(&region.mask) {
+                Ok(span) => span.unwrap_or_default(),
+                Err(runs) => {
+                    return Err(Fault::Fragmented {
+                        region: at as u32,
+                        runs,
+                        promised: None,
+                    });
+                }
+            };
 
             let patch = match patches.span(&region.mask) {
                 Ok(span) => span.unwrap_or_default(),
@@ -389,6 +404,7 @@ impl Windows {
                     indptr: Tensor::new(NIL, 0, 1, Dtype::I32),
                     gathered: None,
                     patch,
+                    voxel,
                     pass: (i as u32) % passes,
                     passes,
                 };

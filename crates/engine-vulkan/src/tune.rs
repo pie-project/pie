@@ -72,6 +72,7 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         checkpoint: artifact,
         budget: poem_compiler::Budget::new(slots, CONTEXT),
         patches: patches(&trace, slots),
+        voxels: None,
         profile: None,
         page_size: 16,
         context: CONTEXT,

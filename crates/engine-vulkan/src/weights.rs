@@ -435,7 +435,9 @@ impl Weights {
         handles: &Handles,
         trace: &Trace,
     ) -> Result<()> {
-        for at in crate::decoded::absorbed_weights(trace) {
+        let mut wanted = crate::decoded::absorbed_weights(trace);
+        wanted.extend(crate::decoded::lane_axis_weights(trace));
+        for at in wanted {
             let Some(Some(WeightRow::Planes(bank))) = self.table.0.get(at).copied() else {
                 continue;
             };
@@ -477,6 +479,62 @@ impl Weights {
                 handle,
                 u32::try_from(n).unwrap_or(u32::MAX),
                 u32::try_from(k).unwrap_or(u32::MAX),
+                Dtype::Bf16,
+            )));
+            self.decoded.push(buffer);
+        }
+        Ok(())
+    }
+
+    pub fn relabel_conv_weights(
+        &mut self,
+        device: &Context,
+        handles: &Handles,
+        trace: &Trace,
+    ) -> Result<()> {
+        for (at, param) in trace.params.iter().enumerate() {
+            let poem_ir::ParamLayout::ConvTapsMajor { c_in, taps } = param.layout else {
+                continue;
+            };
+            let Some(Some(WeightRow::Dense(plane))) = self.table.0.get(at).copied() else {
+                return Err(Fault::Param {
+                    name: param.name.clone(),
+                    why: "is a convolution weight that did not land as one dense plane",
+                });
+            };
+            if plane.dtype != Dtype::Bf16 {
+                return Err(Fault::Param {
+                    name: param.name.clone(),
+                    why: "is a convolution weight this plane relabels only in bf16",
+                });
+            }
+            let pitch = (c_in as usize).saturating_mul(taps as usize);
+            if pitch == 0 || plane.width as usize != pitch {
+                return Err(Fault::Param {
+                    name: param.name.clone(),
+                    why: "is a convolution weight whose row is not `c_in * taps` wide",
+                });
+            }
+            let rows = plane.rows as usize;
+            let bytes = handles.read(plane.buf, (rows * pitch * 2) as u64)?;
+            let mut relabelled = vec![0u8; bytes.len()];
+            for n in 0..rows {
+                let row = n * pitch;
+                for tap in 0..taps as usize {
+                    for c in 0..c_in as usize {
+                        let from = (row + c * taps as usize + tap) * 2;
+                        let into = (row + tap * c_in as usize + c) * 2;
+                        relabelled[into..into + 2].copy_from_slice(&bytes[from..from + 2]);
+                    }
+                }
+            }
+            let mut buffer = Buffer::zeroed(device, relabelled.len() as u64)?;
+            buffer.write(0, &relabelled)?;
+            let handle = handles.bind(&buffer, 0, relabelled.len() as u64)?;
+            self.table.0[at] = Some(WeightRow::Dense(Tensor::new(
+                handle,
+                plane.rows,
+                plane.width,
                 Dtype::Bf16,
             )));
             self.decoded.push(buffer);

@@ -13,6 +13,9 @@ PIE_BUFFER_RO(1, k);
 PIE_BUFFER_RO(2, v);
 PIE_BUFFER_RW(3, o);
 [[vk::binding(4)]] StructuredBuffer<int> segments;
+#ifdef PIE_RAGGED
+[[vk::binding(5)]] StructuredBuffer<int> kv_segments;
+#endif
 struct Push { int num_segments; int num_q_heads; int num_kv_heads; int head_dim; float sm_scale; };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
@@ -44,8 +47,13 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
                 int mid = (lo + hi + 1) >> 1;
                 if (segments[uint(mid)] <= row) lo = mid; else hi = mid - 1;
             }
+#ifdef PIE_RAGGED
+            begin = kv_segments[uint(lo)];
+            end = kv_segments[uint(lo + 1)];
+#else
             begin = segments[uint(lo)];
             end = segments[uint(lo + 1)];
+#endif
         }
         pie_dense_span[0] = begin;
         pie_dense_span[1] = end;
@@ -127,3 +135,9 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate dense_bidirectional_bf16_d_64 PIE_HEAD_DIM_MAX=64
 // pie:instantiate dense_bidirectional_bf16_d_128 PIE_HEAD_DIM_MAX=128
 // pie:instantiate dense_bidirectional_bf16_d_256 PIE_HEAD_DIM_MAX=256
+// pie:instantiate ragged_bf16_d_64 PIE_HEAD_DIM_MAX=64 PIE_RAGGED=1
+// pie:instantiate ragged_bf16_d_128 PIE_HEAD_DIM_MAX=128 PIE_RAGGED=1
+// pie:instantiate ragged_bf16_d_256 PIE_HEAD_DIM_MAX=256 PIE_RAGGED=1
+// pie:instantiate ragged_f32_d_64 PIE_HEAD_DIM_MAX=64 PIE_RAGGED=1 PIE_ACT_F32=1
+// pie:instantiate ragged_f32_d_128 PIE_HEAD_DIM_MAX=128 PIE_RAGGED=1 PIE_ACT_F32=1
+// pie:instantiate ragged_f32_d_256 PIE_HEAD_DIM_MAX=256 PIE_RAGGED=1 PIE_ACT_F32=1

@@ -1,8 +1,5 @@
 #![allow(clippy::too_many_arguments)]
 
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, refuse, stated};
 use crate::error::Error;
 use crate::tensor::{Bank, Tensor};
@@ -61,8 +58,11 @@ fn qmm_name(
 /// The register-tiled point's column tile.
 const RT_COLS: u32 = 64;
 
-fn qmm_rt_name(group: i32, bits: i32, bm: i32) -> &'static str {
-    symbol(&format!("affine_qmm_rt_bf16_gs_{group}_b_{bits}_bm_{bm}"))
+fn qmm_rt_name(group: i32, bits: i32, bm: i32, k16: bool) -> &'static str {
+    let block = if k16 { "_k16" } else { "" };
+    symbol(&format!(
+        "affine_qmm_rt{block}_bf16_gs_{group}_b_{bits}_bm_{bm}"
+    ))
 }
 
 /// The one-row point loads 128 bits of codes at once, which must stay
@@ -166,19 +166,21 @@ fn qmm_grid(op: &'static str, n: i32, bn: i32, m: i32, bm: i32) -> Result<[u32; 
     ])
 }
 
-pub(crate) fn symbol(name: &str) -> &'static str {
-    static INTERNED: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
-    let mut map = INTERNED
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(found) = map.get(name) {
-        return found;
+pub fn qmv_grid(op: &'static str, vecs: i32, out_vec_size: i32) -> Result<[u32; 3], Error> {
+    if vecs <= 0 {
+        return Err(refuse(op, "the vectors are zero"));
     }
-    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
-    map.insert(name.to_owned(), leaked);
-    leaked
+    if out_vec_size <= 0 {
+        return Err(refuse(op, "the output vector is zero"));
+    }
+    let x = vecs
+        .unsigned_abs()
+        .checked_mul(32)
+        .ok_or_else(|| refuse(op, format!("{vecs} vectors will not launch")))?;
+    Ok([x, out_vec_size.unsigned_abs().div_ceil(4), 1])
 }
+
+use crate::encode::symbol;
 
 const QMM_CM_TILE: u32 = 64;
 
@@ -299,17 +301,19 @@ pub fn act_x_wt(
                     &args,
                 );
             }
-            Qmm::RegisterTiled { bm } => {
+            Qmm::RegisterTiled { bm, k16 } => {
                 let row_tiles = rows.div_ceil(bm);
                 return ctx.fire(
-                    Fire::at(QMM_RT_FILE, qmm_rt_name(group, bits, bm as i32)).apply(Grid::of(
-                        [
-                            columns.div_ceil(RT_COLS) * (RT_COLS / 4),
-                            row_tiles * (bm / 4),
-                            1,
-                        ],
-                        [RT_COLS / 4, bm / 4, 1],
-                    )),
+                    Fire::at(QMM_RT_FILE, qmm_rt_name(group, bits, bm as i32, k16)).apply(
+                        Grid::of(
+                            [
+                                columns.div_ceil(RT_COLS) * (RT_COLS / 4),
+                                row_tiles * (bm / 4),
+                                1,
+                            ],
+                            [RT_COLS / 4, bm / 4, 1],
+                        ),
+                    ),
                     &args,
                 );
             }

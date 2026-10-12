@@ -94,7 +94,12 @@ pub fn act_x_wt(
     )
 }
 
-fn extent(op: &'static str, act: Tensor, w: Tensor, y: Tensor) -> Result<(u32, u32, u32), Error> {
+pub(crate) fn extent(
+    op: &'static str,
+    act: Tensor,
+    w: Tensor,
+    y: Tensor,
+) -> Result<(u32, u32, u32), Error> {
     if y.width == 0 {
         return Err(refuse(op, "the columns this projection lands are zero"));
     }

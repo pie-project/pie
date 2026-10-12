@@ -34,4 +34,6 @@ void main(uint3 gid : SV_DispatchThreadID) {
 
 // pie:instantiate layer_scalar_mul_bf16
 // pie:instantiate layer_scalar_mul_stated_bf16 PIE_STATED=1
+// pie:instantiate layer_scalar_mul_stated_f32 PIE_STATED=1 PIE_ACT_F32=1
 // pie:instantiate silu_scaled_bf16 PIE_SILU=1
+// pie:instantiate silu_scaled_f32 PIE_SILU=1 PIE_ACT_F32=1

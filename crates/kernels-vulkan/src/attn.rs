@@ -14,6 +14,7 @@ pub mod arbiter;
 pub mod dense;
 pub mod merge;
 pub mod ple;
+pub mod ragged;
 pub mod score;
 pub mod ssm;
 
@@ -160,7 +161,7 @@ fn tiled_entry(base: &'static str, rows: u32) -> &'static str {
     if rows == 32 {
         base
     } else {
-        crate::linear::quant::symbol(&format!("{base}_r{rows}"))
+        crate::encode::symbol(&format!("{base}_r{rows}"))
     }
 }
 
@@ -171,7 +172,7 @@ fn decode_entry(base: &'static str, threads: u32) -> &'static str {
     if threads >= 256 {
         base
     } else {
-        crate::linear::quant::symbol(&format!("{base}_t128"))
+        crate::encode::symbol(&format!("{base}_t128"))
     }
 }
 

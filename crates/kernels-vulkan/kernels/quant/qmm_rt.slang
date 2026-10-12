@@ -12,7 +12,9 @@
 #endif
 
 #define PIE_BN 64
+#ifndef PIE_BK
 #define PIE_BK 32
+#endif
 #define PIE_TX (PIE_BN / 4)
 #define PIE_TY (PIE_BM / 4)
 #define PIE_THREADS (PIE_TX * PIE_TY)
@@ -126,3 +128,21 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate affine_qmm_rt_bf16_gs_128_b_4_bm_64 PIE_GROUP=128 PIE_BITS=4 PIE_BM=64
 // pie:instantiate affine_qmm_rt_bf16_gs_128_b_8_bm_32 PIE_GROUP=128 PIE_BITS=8 PIE_BM=32
 // pie:instantiate affine_qmm_rt_bf16_gs_128_b_8_bm_64 PIE_GROUP=128 PIE_BITS=8 PIE_BM=64
+// pie:instantiate affine_qmm_rt_k16_bf16_gs_32_b_2_bm_32 PIE_GROUP=32 PIE_BITS=2 PIE_BM=32 PIE_BK=16
+// pie:instantiate affine_qmm_rt_k16_bf16_gs_32_b_2_bm_64 PIE_GROUP=32 PIE_BITS=2 PIE_BM=64 PIE_BK=16
+// pie:instantiate affine_qmm_rt_k16_bf16_gs_32_b_4_bm_32 PIE_GROUP=32 PIE_BITS=4 PIE_BM=32 PIE_BK=16
+// pie:instantiate affine_qmm_rt_k16_bf16_gs_32_b_4_bm_64 PIE_GROUP=32 PIE_BITS=4 PIE_BM=64 PIE_BK=16
+// pie:instantiate affine_qmm_rt_k16_bf16_gs_32_b_8_bm_32 PIE_GROUP=32 PIE_BITS=8 PIE_BM=32 PIE_BK=16
+// pie:instantiate affine_qmm_rt_k16_bf16_gs_32_b_8_bm_64 PIE_GROUP=32 PIE_BITS=8 PIE_BM=64 PIE_BK=16
+// pie:instantiate affine_qmm_rt_k16_bf16_gs_64_b_2_bm_32 PIE_GROUP=64 PIE_BITS=2 PIE_BM=32 PIE_BK=16
+// pie:instantiate affine_qmm_rt_k16_bf16_gs_64_b_2_bm_64 PIE_GROUP=64 PIE_BITS=2 PIE_BM=64 PIE_BK=16
+// pie:instantiate affine_qmm_rt_k16_bf16_gs_64_b_4_bm_32 PIE_GROUP=64 PIE_BITS=4 PIE_BM=32 PIE_BK=16
+// pie:instantiate affine_qmm_rt_k16_bf16_gs_64_b_4_bm_64 PIE_GROUP=64 PIE_BITS=4 PIE_BM=64 PIE_BK=16
+// pie:instantiate affine_qmm_rt_k16_bf16_gs_64_b_8_bm_32 PIE_GROUP=64 PIE_BITS=8 PIE_BM=32 PIE_BK=16
+// pie:instantiate affine_qmm_rt_k16_bf16_gs_64_b_8_bm_64 PIE_GROUP=64 PIE_BITS=8 PIE_BM=64 PIE_BK=16
+// pie:instantiate affine_qmm_rt_k16_bf16_gs_128_b_2_bm_32 PIE_GROUP=128 PIE_BITS=2 PIE_BM=32 PIE_BK=16
+// pie:instantiate affine_qmm_rt_k16_bf16_gs_128_b_2_bm_64 PIE_GROUP=128 PIE_BITS=2 PIE_BM=64 PIE_BK=16
+// pie:instantiate affine_qmm_rt_k16_bf16_gs_128_b_4_bm_32 PIE_GROUP=128 PIE_BITS=4 PIE_BM=32 PIE_BK=16
+// pie:instantiate affine_qmm_rt_k16_bf16_gs_128_b_4_bm_64 PIE_GROUP=128 PIE_BITS=4 PIE_BM=64 PIE_BK=16
+// pie:instantiate affine_qmm_rt_k16_bf16_gs_128_b_8_bm_32 PIE_GROUP=128 PIE_BITS=8 PIE_BM=32 PIE_BK=16
+// pie:instantiate affine_qmm_rt_k16_bf16_gs_128_b_8_bm_64 PIE_GROUP=128 PIE_BITS=8 PIE_BM=64 PIE_BK=16
