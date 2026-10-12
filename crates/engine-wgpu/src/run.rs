@@ -816,16 +816,6 @@ impl<'c> Run<'c> {
         self.scratch.capacity(id)
     }
 
-    pub(crate) fn precast(&self, rows: u32, contraction: u32) -> Option<Tensor> {
-        Some(
-            self.scratch
-                .precast(self.handles, rows, contraction)?
-                .unwrap_or_else(|fault| {
-                    panic!("the precast plane this load reserved does not mint: {fault}")
-                }),
-        )
-    }
-
     pub(crate) fn declared(&self, id: ValueId) -> StructKind {
         match &self.values[id.0 as usize].ty {
             Ty::Struct(kind) => *kind,

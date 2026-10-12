@@ -123,16 +123,25 @@ mod tests {
         let t = kernels_wgpu::Tuning::new(profile, d.sizing_cores(), 0);
         assert_eq!(
             (
-                t.qmm_min_rows(),
-                t.qmm_crossover_tg(),
                 t.sdpa_tile_rows_per_request(),
-                t.sdpa_mma(),
-                t.sdpa_split_max(),
+                t.sdpa_split_groups(),
                 t.sdpa_split_min_keys(),
                 t.cores(),
             ),
-            (12, 160, 32, false, 32, 256, 16)
+            (32, 16, 256, 16)
         );
+        // The tiled kernel from 12 rows over a contraction of whole 32-code
+        // tiles, the vector kernel elsewhere: what min_rows = 12 ran.
+        use kernels_wgpu::tuning::Qmm;
+        for (rows, k, want) in [
+            (1, 4096, Qmm::Qmv),
+            (11, 4096, Qmm::Qmv),
+            (12, 4096, Qmm::Tiled { crossover_tg: 160 }),
+            (512, 4096, Qmm::Tiled { crossover_tg: 160 }),
+            (512, 4100, Qmm::Qmv),
+        ] {
+            assert_eq!(t.qmm(&t.qmm_at(rows, 4096, k, 4, 64))[0], want, "{rows} x {k}");
+        }
         for (pairs, experts, tile) in [(15, 8, 1), (16, 8, 16), (256, 8, 32), (4096, 64, 32)] {
             assert_eq!(t.moe_tile_rows(pairs, experts), tile);
         }

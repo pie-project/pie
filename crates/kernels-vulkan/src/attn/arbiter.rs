@@ -7,19 +7,9 @@ use crate::tuning::Tuning;
 
 use super::{DecodePlan, PrefillPlan, kv_heads_agree, tiled, vector};
 
-const MMA_HEAD_DIM: u32 = 128;
-
-const MMA_LSE_HEAD_DIM: u32 = 64;
-
 #[must_use]
 pub fn should_tile(rows: u32, requests: u32, tuning: &Tuning) -> bool {
     rows / requests.max(1) >= tuning.sdpa_tile_rows_per_request()
-}
-
-#[must_use]
-pub fn should_mma(head_dim: u32, lse: bool, tuning: &Tuning) -> bool {
-    let stamped = if lse { MMA_LSE_HEAD_DIM } else { MMA_HEAD_DIM };
-    tuning.sdpa_mma() && head_dim == stamped
 }
 
 fn as_decode(plan: &PrefillPlan, mask: Tensor) -> DecodePlan {
@@ -50,6 +40,7 @@ fn arbitrate(
     if !should_tile(q.rows, requests, tuning) {
         return vector(
             ctx,
+            tuning,
             op,
             q,
             pool,
@@ -62,7 +53,7 @@ fn arbitrate(
         );
     }
     tiled(
-        ctx, op, q, pool, plan, mask, window, head_dim, sm_scale, o, lse,
+        ctx, tuning, op, q, pool, plan, mask, window, head_dim, sm_scale, o, lse,
     )
 }
 

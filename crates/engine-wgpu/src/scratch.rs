@@ -9,7 +9,7 @@ use crate::store::kv::Paging;
 
 use crate::device::{Buffer, Context, Handles};
 use crate::error::Result;
-use crate::run::{PoolSlabs, WeightRow, WeightTable};
+use crate::run::PoolSlabs;
 
 const ALIGN: u64 = 256;
 
@@ -89,7 +89,6 @@ struct Routed {
 pub struct Scratch {
     plane: Buffer,
 
-    precast: Option<Room>,
     routed: Option<Routed>,
 
     index: Option<Room>,
@@ -107,11 +106,22 @@ pub struct Scratch {
     routers: Vec<u32>,
 }
 
+/// Slice rows a decode attention of `heads` query heads at up to `rows`
+/// rows writes when it splits across `groups` workgroups: a fire splits only
+/// while its rows hold fewer than `groups` heads, into as many slices as
+/// fill `groups` (`kernels_wgpu::attn::splits_for`).
+fn split_rows(groups: u32, heads: u32, rows: u32) -> u64 {
+    (1..=rows)
+        .take_while(|r| u64::from(*r) * u64::from(heads) < u64::from(groups))
+        .map(|r| u64::from(r) * u64::from(groups.div_ceil(r * heads)))
+        .max()
+        .unwrap_or(0)
+}
+
 impl Scratch {
     pub fn reserve(
         device: &Context,
         trace: &Trace,
-        weights: &WeightTable,
         compiled: &CompiledModel,
         budgets: &Budgets,
         paging: Paging,
@@ -129,35 +139,15 @@ impl Scratch {
             readouts: poem_compiler::arena::readouts_ceiling(budget),
         };
         let of = |id: ValueId| rect(map, id, ceiling);
-        let banked = |id: ValueId| match trace.values.get(id.0 as usize).map(|v| &v.def) {
-            Some(Def::Weight(w)) => matches!(
-                weights.0.get(*w as usize).copied().flatten(),
-                Some(WeightRow::Planes(_))
-            ),
-            _ => false,
-        };
 
         let routers = routers(trace);
 
-        let mut dense: Vec<(u32, u32)> = Vec::new();
-        let (mut act_rows, mut act_k) = (0u64, 0u64);
         let (mut sorted, mut pairs, mut routed_k, mut routed_n) = (0u64, 0u64, 0u64, 0u64);
         for node in &trace.nodes {
             let Operation::Linear(op) = &node.op else {
                 continue;
             };
             match op {
-                Linear::Matmul { act, w, y } | Linear::LmHead { act, w, y } if banked(*w) => {
-                    let (Some(act), Some(y)) = (of(*act), of(*y)) else {
-                        continue;
-                    };
-                    act_rows = act_rows.max(u64::from(act.rows));
-                    act_k = act_k.max(u64::from(act.width));
-                    let pair = (y.width, act.width);
-                    if !dense.contains(&pair) {
-                        dense.push(pair);
-                    }
-                }
                 Linear::MoeMatmulSelectBias { x, routes, y, .. }
                 | Linear::MoeMatmulSelectQuant { x, routes, y, .. } => {
                     let (Some(x), Some(y)) = (of(*x), of(*y)) else {
@@ -181,10 +171,6 @@ impl Scratch {
             }
         }
 
-        let precast = (act_rows > 0 && act_k > 0).then(|| {
-            let mut at = 0u64;
-            Room::lay(&mut at, act_rows, act_k, Dtype::F16)
-        });
         let routed = (sorted > 0).then(|| {
             let mut at = 0u64;
             Routed {
@@ -216,7 +202,6 @@ impl Scratch {
                 })
             });
 
-        let split_max = u64::from(tuning.sdpa_split_max().max(1));
         let split = trace
             .nodes
             .iter()
@@ -228,22 +213,27 @@ impl Scratch {
                 _ => None,
             })
             .filter(|(rect, head_dim)| *head_dim > 0 && rect.rows > 0 && rect.width > 0)
-            .map(|(rect, head_dim)| (u64::from(rect.rows), u64::from(rect.width), head_dim))
-            .reduce(|a, b| (a.0.max(b.0), a.1.max(b.1), a.2.min(b.2)))
-            .map(|(rows, width, head_dim)| {
+            .map(|(rect, head_dim)| {
+                let heads = (rect.width / head_dim).max(1);
+                (
+                    split_rows(tuning.sdpa_split_groups(), heads, rect.rows),
+                    u64::from(rect.width),
+                    u64::from(heads),
+                )
+            })
+            .reduce(|a, b| (a.0.max(b.0), a.1.max(b.1), a.2.max(b.2)))
+            .filter(|(rows, ..)| *rows > 0)
+            .map(|(rows, width, heads)| {
                 let mut at = 0u64;
-
-                let heads = width / u64::from(head_dim).max(1);
                 SdpaSplit {
-                    o: Room::lay(&mut at, split_max * rows, width, Dtype::Bf16),
-                    lse: Room::lay(&mut at, split_max * rows, heads.max(1), Dtype::F32),
+                    o: Room::lay(&mut at, rows, width, Dtype::Bf16),
+                    lse: Room::lay(&mut at, rows, heads, Dtype::F32),
                     keys: paging.context(),
                 }
             });
 
-        let union = precast
-            .map_or(0, |r| r.at + r.bytes())
-            .max(routed.map_or(0, |r| r.y.at + r.y.bytes()))
+        let union = routed
+            .map_or(0, |r| r.y.at + r.y.bytes())
             .max(index.map_or(0, |r| r.at + r.bytes()))
             .max(split.map_or(0, |r| r.lse.at + r.lse.bytes()));
 
@@ -298,7 +288,6 @@ impl Scratch {
 
         Ok(Scratch {
             plane,
-            precast,
             routed,
             index,
             split,
@@ -323,26 +312,6 @@ impl Scratch {
     #[must_use]
     pub fn experts(&self, routes: ValueId) -> u32 {
         self.routers.get(routes.0 as usize).copied().unwrap_or(0)
-    }
-
-    pub fn precast(
-        &self,
-        handles: &Handles,
-        rows: u32,
-        contraction: u32,
-    ) -> Option<Result<Tensor>> {
-        let room = self.precast?;
-        if u64::from(rows) * u64::from(contraction) > room.bytes() / 2 {
-            return None;
-        }
-        Some(
-            Room {
-                rows,
-                width: contraction,
-                ..room
-            }
-            .bind(handles, &self.plane),
-        )
     }
 
     pub fn copy(&self, handles: &Handles, offset: u64, bytes: u64) -> Option<Result<u32>> {

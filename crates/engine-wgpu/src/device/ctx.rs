@@ -340,28 +340,10 @@ fn vulkan_facts(adapter: &wgpu::Adapter) -> (Option<u64>, Option<u32>) {
         .max();
     let exts =
         unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
-    let has = |name: &std::ffi::CStr| {
-        exts.iter()
-            .any(|e| e.extension_name_as_c_str().is_ok_and(|s| s == name))
-    };
-    let cores = if has(ash::nv::shader_sm_builtins::NAME) {
-        let mut sm = vk::PhysicalDeviceShaderSMBuiltinsPropertiesNV::default();
-        let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sm);
-        unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
-        Some(sm.shader_sm_count)
-    } else if has(ash::amd::shader_core_properties::NAME) {
-        let mut cu = vk::PhysicalDeviceShaderCorePropertiesAMD::default();
-        let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut cu);
-        unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
-        Some(
-            cu.shader_engine_count
-                * cu.shader_arrays_per_engine_count
-                * cu.compute_units_per_shader_array,
-        )
-    } else {
-        None
-    };
-    (local, cores.filter(|&n| n > 0))
+    let cores = kernels_vulkan::cores::shader_cores(&exts, &mut |p2| unsafe {
+        instance.get_physical_device_properties2(physical, p2);
+    });
+    (local, cores)
 }
 
 #[cfg(any(target_vendor = "apple", target_arch = "wasm32"))]
@@ -582,9 +564,6 @@ impl Context {
         if self.chip().subgroups_32() {
             out.push(kernels_wgpu::Capability::Subgroup);
         }
-        if self.core.enabled.f16 {
-            out.push(kernels_wgpu::Capability::Fp16);
-        }
         out
     }
 
@@ -618,6 +597,16 @@ impl Context {
             cores: self.core.cores,
             f16: self.core.enabled.f16,
         }
+    }
+
+    /// Invocations and bytes of workgroup memory a compute workgroup may
+    /// use on this adapter.
+    #[must_use]
+    pub fn workgroup_limits(&self) -> (u32, u32) {
+        (
+            self.core.limits.max_compute_invocations_per_workgroup,
+            self.core.limits.max_compute_workgroup_storage_size,
+        )
     }
 
     /// Storage buffers a shader stage may bind.

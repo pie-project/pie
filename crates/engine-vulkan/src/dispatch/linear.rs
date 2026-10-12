@@ -20,9 +20,6 @@ impl Run<'_> {
                     self.tensor(*act),
                     bank,
                     self.tensor(*y),
-                    linear::quant::Scratch {
-                        precast: &|rows, contraction| self.precast(rows, contraction),
-                    },
                     self.capacity(*act).min(self.capacity(*y)),
                 ),
 
@@ -49,9 +46,6 @@ impl Run<'_> {
                     self.tensor(*act),
                     bank,
                     self.tensor(*y),
-                    linear::quant::Scratch {
-                        precast: &|rows, contraction| self.precast(rows, contraction),
-                    },
                     self.capacity(*act).min(self.capacity(*y)),
                 ),
 

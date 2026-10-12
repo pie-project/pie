@@ -186,6 +186,7 @@ impl Run<'_> {
                 o,
             } => attn::decode_selected(
                 self.ctx(),
+                self.tuning(),
                 self.tensor(*q),
                 self.decode_plan(*plan),
                 self.tensor(*selection),
@@ -209,6 +210,7 @@ impl Run<'_> {
                 o,
             } => attn::prefill_selected(
                 self.ctx(),
+                self.tuning(),
                 self.ragged(*q),
                 self.prefill_plan(*plan),
                 self.tensor(*selection),

@@ -8,13 +8,14 @@
 //! 32 lanes. A profile that picks one on a device without it is refused
 //! whole, so no file can run a kernel the device answers wrongly.
 
-use profile::{Anywhere, Decision, Domain, Profile, Registry, Var};
+use profile::{Decision, Domain, Profile, Registry, Var};
 
 /// What the Vulkan engine measures about its device, for `target.assumes`,
 /// `target.match` and what an alternative requires.
 pub const FACTS: &[Var] = &[
     Var::fixed("vendor", Domain::Enum(profile::vendor::NAMES)),
-    // The narrowest subgroup a pipeline may be compiled at.
+    // The narrowest subgroup a pipeline runs at: 32 where pipelines are
+    // pinned there.
     Var::fixed("subgroup", Domain::COUNT),
     // Multiprocessors or compute units; absent where no extension says.
     Var::fixed("cores", Domain::COUNT),
@@ -24,43 +25,71 @@ pub const FACTS: &[Var] = &[
 /// The recording axes a dynamic variable may name.
 pub const AXES: &[&str] = &["rows"];
 
-/// How dense affine-quantised matmuls read prompt rows.
+/// The kernel a dense affine-quantised matmul runs: the first rung whose
+/// shape it fits that can run. `fill` is how full the device is: eighths of
+/// a wave of 32x64 output tiles over its cores, so a rung can say "fills the
+/// device" in a way that holds on GPUs of any size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.qmm.path", default = "tiled", tune = search)]
-pub enum QmmPath {
-    /// The tiled kernels, and the vector kernels below them.
-    Tiled,
-    /// The cooperative-matrix kernel first, where its tile divides the
-    /// contraction.
+#[decision(
+    id = "kernel.qmm",
+    shape(rows, fill: derived; n, k, bits, group),
+    default = r#"[
+        { when = "rows >= 12", use = "tiled", crossover_tg = 160 },
+        { use = "qmv", vecs = 4 },
+    ]"#,
+    fits = Qmm::fits_shape,
+    tune = search
+)]
+pub enum Qmm {
+    /// The cooperative-matrix kernel: 64x64 output tiles on tensor cores.
     #[requires("coopmat")]
+    #[partial]
     Coopmat,
+    /// The register-tiled kernel: a 4x4 output block an invocation, which
+    /// suits GPUs whose workgroup memory is slow next to their ALUs
+    /// (Adreno).
+    #[partial]
+    RegisterTiled {
+        /// Rows a workgroup covers.
+        #[constant(set(32, 64), default = 32)]
+        bm: u32,
+    },
+    /// The tiled kernel, through workgroup memory.
+    #[partial]
+    Tiled {
+        /// Workgroups a tiling must fill before a 32-wide column tile pays.
+        #[constant(range(1..=1_000_000), default = 160)]
+        crossover_tg: u32,
+    },
+    /// One row (decode), 128-bit loads folded with subgroup shuffles.
+    #[requires("subgroup >= 32")]
+    #[partial]
+    OneRow,
+    /// The vector kernel, `vecs` activation rows a workgroup.
+    Qmv {
+        #[constant(set(1, 2, 4, 8), default = 4)]
+        vecs: u32,
+    },
 }
 
-/// The fewest rows a dense matmul takes a tiled or cooperative-matrix
-/// kernel for; fewer take the vector kernel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.qmm.min_rows", constant(range(1..=4096)), default = 12, tune = search)]
-pub struct QmmMinRows(pub u32);
-
-/// Workgroups a dense matmul must fill before a wider column tile pays.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.qmm.crossover_tg", constant(range(1..=1_000_000)), default = 160, tune = search)]
-pub struct QmmCrossoverTg(pub u32);
-
-/// Whether batched projections take the register-tiled point (a 4x4 block
-/// per invocation) rather than the plain tiled one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.qmm.register_tiles", flag, default = false, tune = search)]
-pub struct QmmRegisterTiles;
-
-/// How a one-row quantised projection (decode) reads its bank.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.qmv.path", default = "plain", tune = search)]
-pub enum QmvPath {
-    Plain,
-    /// 128-bit loads folded with subgroup shuffles.
-    #[requires("subgroup >= 32")]
-    OneRow,
+impl Qmm {
+    fn fits_shape(&self, at: &QmmAt) -> bool {
+        use crate::linear::quant::{QMM_BK, qmm_stamped, qmv1_fits};
+        let stamped = qmm_stamped(at.group, at.bits);
+        let whole = at.k % i64::from(QMM_BK) == 0;
+        match self {
+            Qmm::Coopmat | Qmm::RegisterTiled { .. } => stamped && whole,
+            Qmm::Tiled { .. } => stamped && whole && at.n % 16 == 0,
+            Qmm::OneRow => {
+                at.rows == 1
+                    && stamped
+                    && qmv1_fits(at.group, at.bits)
+                    && (at.k * at.bits) % 128 == 0
+                    && at.k % 8 == 0
+            }
+            Qmm::Qmv { .. } => true,
+        }
+    }
 }
 
 /// How unquantised matmuls read prompt rows.
@@ -98,11 +127,6 @@ pub struct MoeTileRows(pub u32);
 #[decision(id = "kernel.sdpa.tile_rows_per_request", constant(range(1..=4096)), default = 32, tune = search)]
 pub struct SdpaTileRowsPerRequest(pub u32);
 
-/// Whether 64-wide heads attend through the matrix kernel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.mma", flag, default = false, tune = search)]
-pub struct SdpaMma;
-
 /// How many workgroups a decode row's keys may split across.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(
@@ -129,35 +153,84 @@ pub enum DecodeSplit {
 #[decision(id = "kernel.sdpa.decode.split_min_keys", constant(range(1..=65_536)), default = 256, tune = search)]
 pub struct DecodeSplitMinKeys(pub u32);
 
+/// Invocations a decode attention workgroup walks a row's keys with: more
+/// walk more keys at once and merge more partial sums. The device's
+/// workgroup memory caps it whatever the profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.threads", constant(set(128, 256)), default = 256, tune = search)]
+pub struct DecodeThreads(pub u32);
+
+/// Query rows a tiled attention workgroup holds, 32 lanes each: fewer rows
+/// mean more workgroups and less reuse of each key. The device's invocation
+/// limit caps it whatever the profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.tile_rows", constant(set(8, 16, 32)), default = 32, tune = search)]
+pub struct SdpaTileRows(pub u32);
+
 /// Register every decision this crate reads.
 pub fn register(registry: &mut Registry) {
     registry
-        .add::<QmmPath>()
-        .add::<QmmMinRows>()
-        .add::<QmmCrossoverTg>()
-        .add::<QmmRegisterTiles>()
-        .add::<QmvPath>()
+        .add::<Qmm>()
         .add::<GemmPath>()
         .add::<MoePath>()
         .add::<MoeTileRows>()
         .add::<SdpaTileRowsPerRequest>()
-        .add::<SdpaMma>()
         .add::<DecodeSplit>()
-        .add::<DecodeSplitMinKeys>();
+        .add::<DecodeSplitMinKeys>()
+        .add::<DecodeThreads>()
+        .add::<SdpaTileRows>();
+}
+
+/// What a device allows a kernel, as the engine measured it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Multiprocessors or compute units a per-core decision multiplies.
+    pub cores: u32,
+    /// The narrowest subgroup a pipeline runs at.
+    pub lanes: u32,
+    /// `maxComputeSharedMemorySize`, in bytes.
+    pub shared_bytes: u32,
+    /// `maxComputeWorkGroupInvocations`.
+    pub invocations: u32,
+}
+
+impl Limits {
+    /// What a test or a tool assumes of a device it does not open: 16 cores,
+    /// 32 lanes, 32 KiB of workgroup memory, 1024 invocations.
+    pub const ASSUMED: Limits = Limits {
+        cores: 16,
+        lanes: 32,
+        shared_bytes: 32 << 10,
+        invocations: 1024,
+    };
+
+    /// `ASSUMED` with `cores` cores.
+    #[must_use]
+    pub fn with_cores(cores: u32) -> Limits {
+        Limits {
+            cores,
+            ..Limits::ASSUMED
+        }
+    }
 }
 
 /// What one load's kernels run under: the device's resolved profile, and
-/// the core count a per-core decision multiplies.
+/// what the device allows.
 #[derive(Clone, Debug)]
 pub struct Tuning {
     profile: Profile,
-    cores: u32,
+    limits: Limits,
 }
 
 impl Tuning {
     #[must_use]
-    pub fn new(profile: Profile, cores: u32) -> Tuning {
-        Tuning { profile, cores }
+    pub fn new(profile: Profile, limits: Limits) -> Tuning {
+        Tuning { profile, limits }
+    }
+
+    #[must_use]
+    pub fn limits(&self) -> Limits {
+        self.limits
     }
 
     #[must_use]
@@ -165,29 +238,29 @@ impl Tuning {
         &self.profile
     }
 
+    /// The point a dense matmul of `rows` rows into `n` columns over a
+    /// `k`-long contraction of a `bits`-bit, `group`-wide bank is chosen at.
     #[must_use]
-    pub fn qmm_coopmat(&self) -> bool {
-        *self.profile.get::<QmmPath>() == QmmPath::Coopmat
+    pub fn qmm_at(&self, rows: u32, n: u32, k: u32, bits: u32, group: u32) -> QmmAt {
+        let tiles = u64::from(rows.div_ceil(32)) * u64::from(n.div_ceil(64));
+        QmmAt {
+            rows: i64::from(rows),
+            fill: i64::try_from(tiles * 8 / u64::from(self.limits.cores.max(1))).unwrap_or(i64::MAX),
+            n: i64::from(n),
+            k: i64::from(k),
+            bits: i64::from(bits),
+            group: i64::from(group),
+        }
     }
 
+    /// The kernels a dense matmul at `at` may run, most preferred first.
     #[must_use]
-    pub fn qmm_min_rows(&self) -> u32 {
-        self.profile.get::<QmmMinRows>().0
-    }
-
-    #[must_use]
-    pub fn qmm_crossover_tg(&self) -> u32 {
-        self.profile.get::<QmmCrossoverTg>().0
-    }
-
-    #[must_use]
-    pub fn qmm_register_tiles(&self) -> bool {
-        self.profile.on::<QmmRegisterTiles>(&Anywhere)
-    }
-
-    #[must_use]
-    pub fn qmv_one_row(&self) -> bool {
-        *self.profile.get::<QmvPath>() == QmvPath::OneRow
+    pub fn qmm(&self, at: &QmmAt) -> Vec<Qmm> {
+        self.profile
+            .ladder::<Qmm>()
+            .candidates(at)
+            .copied()
+            .collect()
     }
 
     #[must_use]
@@ -218,9 +291,31 @@ impl Tuning {
         self.profile.get::<SdpaTileRowsPerRequest>().0
     }
 
+    /// Query rows a tiled attention workgroup holds: the profile's, as far
+    /// as the device's invocations allow 32 lanes each.
     #[must_use]
-    pub fn sdpa_mma(&self) -> bool {
-        self.profile.on::<SdpaMma>(&Anywhere)
+    pub fn sdpa_tile_rows(&self) -> u32 {
+        let fits = (self.limits.invocations / 32).max(8);
+        let mut rows = self.profile.get::<SdpaTileRows>().0;
+        while rows > fits && rows > 8 {
+            rows /= 2;
+        }
+        rows
+    }
+
+    /// Invocations a decode attention workgroup runs for `head_dim`-wide
+    /// heads: the profile's, as far as the device's workgroup memory holds
+    /// one partial row a 32-lane subgroup.
+    #[must_use]
+    pub fn sdpa_decode_threads(&self, head_dim: u32) -> u32 {
+        let want = self.profile.get::<DecodeThreads>().0;
+        let need = |threads: u32| (threads / 32) * (head_dim * 4 + 8);
+        if want > 128 && (need(want) > self.limits.shared_bytes || want > self.limits.invocations)
+        {
+            128
+        } else {
+            want
+        }
     }
 
     /// The workgroups a decode row's keys may split across.
@@ -228,12 +323,35 @@ impl Tuning {
     pub fn sdpa_split_groups(&self) -> u32 {
         match *self.profile.get::<DecodeSplit>() {
             DecodeSplit::Fixed { groups } => groups,
-            DecodeSplit::PerCore { per } => self.cores.saturating_mul(per).max(1),
+            DecodeSplit::PerCore { per } => self.limits.cores.saturating_mul(per).max(1),
         }
     }
 
     #[must_use]
     pub fn sdpa_split_min_keys(&self) -> u32 {
         self.profile.get::<DecodeSplitMinKeys>().0
+    }
+
+    /// Invocations the route sort runs: 1024 where the device allows it.
+    #[must_use]
+    pub fn sort_lanes(&self) -> u32 {
+        if self.limits.invocations >= 1024 { 1024 } else { 256 }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_ladder_tiles_from_twelve_rows_and_folds_below() {
+        let mut r = Registry::new("vulkan-test", FACTS, AXES);
+        register(&mut r);
+        let t = Tuning::new(r.defaults(), Limits::ASSUMED);
+        let at = |rows| t.qmm_at(rows, 4096, 4096, 4, 64);
+        assert_eq!(t.qmm(&at(12))[0], Qmm::Tiled { crossover_tg: 160 });
+        assert_eq!(t.qmm(&at(11))[0], Qmm::Qmv { vecs: 4 });
+        // An odd contraction leaves the tiled rung for the vector kernel.
+        assert_eq!(t.qmm(&t.qmm_at(64, 4096, 4100, 4, 64))[0], Qmm::Qmv { vecs: 4 });
     }
 }

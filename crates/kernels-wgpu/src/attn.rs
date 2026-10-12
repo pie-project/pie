@@ -234,18 +234,15 @@ const SPLIT_STORAGE_BUFFERS: u32 = 11;
 #[must_use]
 pub fn splits_for(q_heads: u32, rows: u32, keys: u32, tuning: &Tuning) -> u32 {
     let occupied = q_heads.saturating_mul(rows).max(1);
-    let cores = tuning.cores().max(1);
+    let groups = tuning.sdpa_split_groups();
     let buffers = tuning.storage_buffers();
-    if tuning.sdpa_split_max() <= 1
-        || occupied >= cores
-        || (buffers != 0 && buffers < SPLIT_STORAGE_BUFFERS)
-    {
+    if occupied >= groups || (buffers != 0 && buffers < SPLIT_STORAGE_BUFFERS) {
         return 1;
     }
 
-    let room = cores.div_ceil(occupied);
-    let afford = keys / tuning.sdpa_split_min_keys().max(1);
-    room.min(afford).min(tuning.sdpa_split_max()).max(1)
+    let room = groups.div_ceil(occupied);
+    let afford = keys.div_ceil(tuning.sdpa_split_min_keys().max(1));
+    room.min(afford).max(1)
 }
 
 fn fits(part: Split, splits: u32, shape: &Paged, head_dim: u32, o: Tensor) -> bool {

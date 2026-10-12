@@ -2,23 +2,19 @@
 pub enum Capability {
     #[default]
     Baseline,
-    Fp16,
     Subgroup,
-    Matrix,
 }
 
 impl Capability {
-    pub const PREFERENCE: [Self; 4] = [Self::Matrix, Self::Subgroup, Self::Fp16, Self::Baseline];
+    pub const PREFERENCE: [Self; 2] = [Self::Subgroup, Self::Baseline];
 
-    pub const ALL: [Self; 4] = [Self::Baseline, Self::Fp16, Self::Subgroup, Self::Matrix];
+    pub const ALL: [Self; 2] = [Self::Baseline, Self::Subgroup];
 
     #[must_use]
     pub const fn tag(self) -> &'static str {
         match self {
             Self::Baseline => "baseline",
-            Self::Fp16 => "fp16",
             Self::Subgroup => "subgroup",
-            Self::Matrix => "matrix",
         }
     }
 
@@ -39,9 +35,7 @@ impl Capability {
     pub const fn requires(self) -> &'static [&'static str] {
         match self {
             Self::Baseline => &[],
-            Self::Fp16 => &["SHADER_F16"],
             Self::Subgroup => &["SUBGROUP"],
-            Self::Matrix => &["EXPERIMENTAL_COOPERATIVE_MATRIX", "SHADER_F16"],
         }
     }
 
@@ -49,9 +43,7 @@ impl Capability {
     pub const fn defines(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Self::Baseline => &[],
-            Self::Fp16 => &[("PIE_FP16", "1")],
             Self::Subgroup => &[("PIE_SUBGROUP", "1")],
-            Self::Matrix => &[("PIE_MATRIX", "1")],
         }
     }
 }

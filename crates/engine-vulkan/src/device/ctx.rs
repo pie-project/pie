@@ -93,8 +93,17 @@ pub(crate) struct Core {
     pub(crate) allocated: AtomicU64,
     pub(crate) name: String,
     pub(crate) subgroup_size: u32,
-    /// The narrowest subgroup a pipeline may be compiled at.
+    /// The narrowest subgroup a pipeline runs at: 32 where every pipeline
+    /// is pinned there, else the narrowest the driver may pick.
     pub(crate) subgroup_min: u32,
+    /// The width every pipeline is created at (`requiredSubgroupSize`),
+    /// where the device can pin one: 32, which the kernels that fold a
+    /// subgroup as 32 lanes (cooperative matrices, decode attention's
+    /// registers) assume.
+    pub(crate) pinned: Option<u32>,
+    /// `maxComputeSharedMemorySize`, `maxComputeWorkGroupInvocations`.
+    pub(crate) shared_bytes: u32,
+    pub(crate) invocations: u32,
     /// Multiprocessors or compute units, where an extension says.
     pub(crate) cores: Option<u32>,
     pub(crate) device_local: u64,
@@ -402,6 +411,21 @@ impl Drop for PipelineCache {
     }
 }
 
+/// The transfer staging buffer is a `Slab`, which holds the `Core` that holds
+/// it: left in place, that cycle keeps the device (and its memory) alive
+/// after every load, until `vkCreateDevice` fails. The context is what a load
+/// owns, so its end releases the staging buffer; buffers and pipelines that
+/// outlive it then release the device as they go.
+impl Drop for Context {
+    fn drop(&mut self) {
+        self.core
+            .transfer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .staging = None;
+    }
+}
+
 impl std::fmt::Debug for Context {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Context")
@@ -586,22 +610,9 @@ impl Context {
                 .unwrap_or(false)
         };
 
-        let cores = if has_extension(&device_exts, ash::nv::shader_sm_builtins::NAME) {
-            let mut sm = vk::PhysicalDeviceShaderSMBuiltinsPropertiesNV::default();
-            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sm);
-            unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
-            sm.shader_sm_count
-        } else if has_extension(&device_exts, ash::amd::shader_core_properties::NAME) {
-            let mut cu = vk::PhysicalDeviceShaderCorePropertiesAMD::default();
-            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut cu);
-            unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
-            cu.shader_engine_count
-                * cu.shader_arrays_per_engine_count
-                * cu.compute_units_per_shader_array
-        } else {
-            0
-        };
-        let cores = (cores > 0).then_some(cores);
+        let cores = kernels_vulkan::cores::shader_cores(&device_exts, &mut |p2| unsafe {
+            instance.get_physical_device_properties2(physical, p2);
+        });
 
         let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
@@ -621,6 +632,19 @@ impl Context {
             unsafe { instance.get_physical_device_features2(physical, &mut query) };
         }
         let core = unsafe { instance.get_physical_device_features(physical) };
+        // Pin every pipeline to 32 lanes where the driver lets compute
+        // pipelines ask for a width and 32 is one it runs: AMD RDNA (64 by
+        // default), Intel (8 to 32) and NVIDIA (32) then all run the
+        // kernels at the width they were written for.
+        let size_control = api_13 && f13.subgroup_size_control == vk::TRUE;
+        let pinned = (size_control
+            && sizes.min_subgroup_size <= 32
+            && sizes.max_subgroup_size >= 32
+            && sizes
+                .required_subgroup_size_stages
+                .contains(vk::ShaderStageFlags::COMPUTE))
+        .then_some(32u32);
+        let subgroup_min = pinned.unwrap_or(subgroup_min);
         let enabled = Enabled {
             shader_int16: core.shader_int16 == vk::TRUE,
             shader_int64: core.shader_int64 == vk::TRUE,
@@ -629,13 +653,13 @@ impl Context {
             storage_8bit: f12.storage_buffer8_bit_access == vk::TRUE,
             memory_model: f12.vulkan_memory_model == vk::TRUE
                 && f12.vulkan_memory_model_device_scope == vk::TRUE,
-            subgroup_size_control: api_13 && f13.subgroup_size_control == vk::TRUE,
+            subgroup_size_control: size_control,
             memory_budget,
             coopmat: coopmat_shape
                 && fcm.cooperative_matrix == vk::TRUE
                 && f12.shader_float16 == vk::TRUE
                 && f12.vulkan_memory_model == vk::TRUE
-                && subgroup.subgroup_size == 32,
+                && (pinned == Some(32) || subgroup.subgroup_size == 32),
         };
         if !enabled.shader_int16 || !enabled.storage_16bit {
             bail!(Fault::NoDevice {
@@ -769,8 +793,11 @@ impl Context {
             messenger,
             allocated: AtomicU64::new(0),
             name: name.clone(),
-            subgroup_size: subgroup.subgroup_size.max(1),
+            subgroup_size: pinned.unwrap_or(subgroup.subgroup_size.max(1)),
             subgroup_min,
+            pinned,
+            shared_bytes: props.limits.max_compute_shared_memory_size,
+            invocations: props.limits.max_compute_work_group_invocations,
             cores,
             device_local,
             vendor_id: props.vendor_id,
@@ -832,6 +859,19 @@ impl Context {
     #[must_use]
     pub fn subgroup_size(&self) -> u32 {
         self.core.subgroup_size
+    }
+
+    /// The narrowest subgroup any pipeline runs at.
+    #[must_use]
+    pub fn lanes(&self) -> u32 {
+        self.core.subgroup_min
+    }
+
+    /// The device's compute limits: workgroup memory in bytes, and
+    /// invocations per workgroup.
+    #[must_use]
+    pub fn compute_limits(&self) -> (u32, u32) {
+        (self.core.shared_bytes, self.core.invocations)
     }
 
     #[must_use]

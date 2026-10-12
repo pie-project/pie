@@ -155,11 +155,84 @@ pub fn plan_prefill(
 
 const FILE: &str = "attn/sdpa_paged.slang";
 
-pub(crate) const SDPA_TILE: u32 = 32;
+/// A tiled entry at `rows` rows a workgroup: the 32-row name, or its
+/// `_r16` / `_r8` variant.
+fn tiled_entry(base: &'static str, rows: u32) -> &'static str {
+    if rows == 32 {
+        return base;
+    }
+    let at = SDPA_TILED
+        .iter()
+        .chain(&SDPA_TILED_LSE)
+        .position(|e| *e == base)
+        .expect("a tiled entry");
+    let (r16, r8) = (&SDPA_TILED_R16, &SDPA_TILED_R8);
+    if rows == 16 { r16[at] } else { r8[at] }
+}
+
+const SDPA_TILED_R16: [&str; 8] = [
+    "sdpa_paged_tiled_bfloat16_d_64_r16",
+    "sdpa_paged_tiled_bfloat16_d_128_r16",
+    "sdpa_paged_tiled_bfloat16_d_256_r16",
+    "sdpa_paged_tiled_bfloat16_d_512_r16",
+    "sdpa_paged_tiled_lse_bfloat16_d_64_r16",
+    "sdpa_paged_tiled_lse_bfloat16_d_128_r16",
+    "sdpa_paged_tiled_lse_bfloat16_d_256_r16",
+    "sdpa_paged_tiled_lse_bfloat16_d_512_r16",
+];
+
+const SDPA_TILED_R8: [&str; 8] = [
+    "sdpa_paged_tiled_bfloat16_d_64_r8",
+    "sdpa_paged_tiled_bfloat16_d_128_r8",
+    "sdpa_paged_tiled_bfloat16_d_256_r8",
+    "sdpa_paged_tiled_bfloat16_d_512_r8",
+    "sdpa_paged_tiled_lse_bfloat16_d_64_r8",
+    "sdpa_paged_tiled_lse_bfloat16_d_128_r8",
+    "sdpa_paged_tiled_lse_bfloat16_d_256_r8",
+    "sdpa_paged_tiled_lse_bfloat16_d_512_r8",
+];
 
 const SDPA_WIDTHS: [u32; 4] = [64, 128, 256, 512];
 
-pub const DECODE_THREADS: u32 = 256;
+/// The `_t128` twin of a 256-invocation decode entry, where the tuning
+/// asks for 128.
+fn decode_entry(base: &'static str, threads: u32) -> &'static str {
+    if threads >= 256 {
+        return base;
+    }
+    let at = SDPA_SELECTED
+        .iter()
+        .chain(&SDPA_DECODE)
+        .chain(&SDPA_DECODE_LSE)
+        .chain(&SDPA_SPLIT)
+        .chain(&SDPA_SPLIT_LSE)
+        .position(|e| *e == base)
+        .expect("a decode entry");
+    SDPA_T128[at]
+}
+
+const SDPA_T128: [&str; 20] = [
+    "sdpa_paged_selected_bfloat16_d_64_t128",
+    "sdpa_paged_selected_bfloat16_d_128_t128",
+    "sdpa_paged_selected_bfloat16_d_256_t128",
+    "sdpa_paged_selected_bfloat16_d_512_t128",
+    "sdpa_paged_decode_bfloat16_d_64_t128",
+    "sdpa_paged_decode_bfloat16_d_128_t128",
+    "sdpa_paged_decode_bfloat16_d_256_t128",
+    "sdpa_paged_decode_bfloat16_d_512_t128",
+    "sdpa_paged_decode_lse_bfloat16_d_64_t128",
+    "sdpa_paged_decode_lse_bfloat16_d_128_t128",
+    "sdpa_paged_decode_lse_bfloat16_d_256_t128",
+    "sdpa_paged_decode_lse_bfloat16_d_512_t128",
+    "sdpa_paged_split_bfloat16_d_64_t128",
+    "sdpa_paged_split_bfloat16_d_128_t128",
+    "sdpa_paged_split_bfloat16_d_256_t128",
+    "sdpa_paged_split_bfloat16_d_512_t128",
+    "sdpa_paged_split_lse_bfloat16_d_64_t128",
+    "sdpa_paged_split_lse_bfloat16_d_128_t128",
+    "sdpa_paged_split_lse_bfloat16_d_256_t128",
+    "sdpa_paged_split_lse_bfloat16_d_512_t128",
+];
 
 const SDPA_DECODE: [&str; 4] = [
     "sdpa_paged_decode_bfloat16_d_64",
@@ -460,10 +533,11 @@ pub(crate) fn vector_split(
     args.push(stated(op, slices)?.arg());
     args.push(stated(op, shape.rows)?.arg());
     args.push(stated(op, tuning.sdpa_split_min_keys().max(1))?.arg());
+    let threads = tuning.sdpa_decode_threads(head_dim);
     ctx.fire(
-        Fire::at(FILE, walker)
+        Fire::at(FILE, decode_entry(walker, threads))
             .groups([shape.q_heads, shape.rows, slices])
-            .group([DECODE_THREADS, 1, 1]),
+            .group([threads, 1, 1]),
         &args,
     )?;
 
@@ -524,6 +598,7 @@ fn split_capacity(
 
 pub(crate) fn vector(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     op: &'static str,
     q: Tensor,
     pool: &KvPool,
@@ -562,10 +637,11 @@ pub(crate) fn vector(
         lse_plane(op, lse, &shape);
         args.push(lse.arg_mut());
     }
+    let threads = tuning.sdpa_decode_threads(SDPA_WIDTHS[shape.at]);
     ctx.fire(
-        Fire::at(FILE, entry)
+        Fire::at(FILE, decode_entry(entry, threads))
             .groups([shape.q_heads, shape.rows, 1])
-            .group([DECODE_THREADS, 1, 1]),
+            .group([threads, 1, 1]),
         &args,
     )
 }
@@ -573,6 +649,7 @@ pub(crate) fn vector(
 #[allow(clippy::too_many_arguments)]
 fn selected(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     op: &'static str,
     q: Tensor,
     pool: &KvPool,
@@ -633,10 +710,11 @@ fn selected(
     args.push(selection.arg());
     args.push(stated(op, top_k)?.arg());
     args.push(stated(op, ratio)?.arg());
+    let threads = tuning.sdpa_decode_threads(SDPA_WIDTHS[shape.at]);
     ctx.fire(
-        Fire::at(FILE, SDPA_SELECTED[shape.at])
+        Fire::at(FILE, decode_entry(SDPA_SELECTED[shape.at], threads))
             .groups([shape.q_heads, shape.rows, 1])
-            .group([DECODE_THREADS, 1, 1]),
+            .group([threads, 1, 1]),
         &args,
     )
 }
@@ -644,6 +722,7 @@ fn selected(
 #[allow(clippy::too_many_arguments)]
 pub fn decode_selected(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     q: Tensor,
     plan: &DecodePlan,
     selection: Tensor,
@@ -656,6 +735,7 @@ pub fn decode_selected(
 ) -> Result<(), Error> {
     selected(
         ctx,
+        tuning,
         "attention.decode_selected",
         q,
         pool,
@@ -676,6 +756,7 @@ pub fn decode_selected(
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_selected(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     q: RaggedTensor,
     plan: &PrefillPlan,
     selection: Tensor,
@@ -691,6 +772,7 @@ pub fn prefill_selected(
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     selected(
         ctx,
+        tuning,
         OP,
         q.data,
         pool,
@@ -708,8 +790,10 @@ pub fn prefill_selected(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn tiled(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     op: &'static str,
     q: Tensor,
     pool: &KvPool,
@@ -727,10 +811,12 @@ pub(crate) fn tiled(
         "the attention lands one output row per query row"
     );
     let shape = Paged::of(op, q, pool, window, head_dim)?;
-    let entry = match lse {
+    let tile = tuning.sdpa_tile_rows();
+    let base = match lse {
         None => SDPA_TILED[shape.at],
         Some(_) => SDPA_TILED_LSE[shape.at],
     };
+    let entry = tiled_entry(base, tile);
     let mut args = sdpa_args(
         ctx,
         op,
@@ -752,8 +838,8 @@ pub(crate) fn tiled(
     }
     ctx.fire(
         Fire::at(FILE, entry)
-            .groups([shape.q_heads, shape.rows.div_ceil(SDPA_TILE), 1])
-            .group([32, SDPA_TILE, 1]),
+            .groups([shape.q_heads, shape.rows.div_ceil(tile), 1])
+            .group([32, tile, 1]),
         &args,
     )
 }
@@ -850,80 +936,7 @@ fn decode_arm(
             );
         }
     }
-    vector(ctx, op, q, pool, plan, window, head_dim, sm_scale, o, lse)
-}
-
-pub fn prefill(
-    ctx: &Ctx<'_>,
-    q: RaggedTensor,
-    plan: &PrefillPlan,
-    pool: &KvPool,
-    window: Option<u32>,
-    head_dim: u32,
-    kv_heads: u32,
-    sm_scale: f32,
-    o: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attention.prefill";
-    kv_heads_agree(OP, pool, head_dim, kv_heads)?;
-    tiled(
-        ctx, OP, q.data, pool, plan, plan.mask, window, head_dim, sm_scale, o, None,
-    )
-}
-
-pub fn prefill_lse(
-    ctx: &Ctx<'_>,
-    q: RaggedTensor,
-    plan: &PrefillPlan,
-    pool: &KvPool,
-    window: Option<u32>,
-    head_dim: u32,
-    kv_heads: u32,
-    sm_scale: f32,
-    o: Tensor,
-    lse: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attention.prefill_lse";
-    kv_heads_agree(OP, pool, head_dim, kv_heads)?;
-    tiled(
-        ctx,
-        OP,
-        q.data,
-        pool,
-        plan,
-        plan.mask,
-        window,
-        head_dim,
-        sm_scale,
-        o,
-        Some(lse),
-    )
-}
-
-pub fn masked(
-    ctx: &Ctx<'_>,
-    q: RaggedTensor,
-    plan: &PrefillPlan,
-    mask: Tensor,
-    pool: &KvPool,
-    window: Option<u32>,
-    head_dim: u32,
-    sm_scale: f32,
-    o: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attention.masked";
-    if mask.dtype != Dtype::U8 {
-        return Err(refuse(
-            OP,
-            format!(
-                "the mask this op states is {:?}, and the shader reads packed u8 mask planes",
-                mask.dtype
-            ),
-        ));
-    }
-    tiled(
-        ctx, OP, q.data, pool, plan, mask, window, head_dim, sm_scale, o, None,
-    )
+    vector(ctx, tuning, op, q, pool, plan, window, head_dim, sm_scale, o, lse)
 }
 
 pub fn sink(

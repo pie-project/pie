@@ -50,4 +50,4 @@ ash = { version = "0.38", default-features = false, features = [
 
 [features]
 default = []
-vulkan = ["dep:ash", "dep:naga", "kernels-vulkan/native"]
+vulkan = ["dep:ash", "dep:naga", "kernels-vulkan/native", "kernels-vulkan/probe"]

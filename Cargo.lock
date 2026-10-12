@@ -1940,6 +1940,7 @@ dependencies = [
  "engine",
  "eta-compiler",
  "eta-exec",
+ "kernels-vulkan",
  "kernels-wgpu",
  "libc",
  "memmap2",
@@ -3181,6 +3182,7 @@ dependencies = [
 name = "kernels-vulkan"
 version = "0.5.4"
 dependencies = [
+ "ash",
  "pie-dtype",
  "pie-profile",
 ]

@@ -479,7 +479,6 @@ impl Shell {
         let mut scratch = Scratch::reserve(
             &device,
             &boot.trace,
-            weights.table(),
             &compiled,
             &budgets,
             least,
@@ -790,7 +789,6 @@ impl Shell {
             scratch = Scratch::reserve(
                 &device,
                 &boot.trace,
-                weights.table(),
                 &compiled,
                 &budgets,
                 paging,

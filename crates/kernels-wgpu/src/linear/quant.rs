@@ -6,6 +6,7 @@ use std::sync::{Mutex, OnceLock};
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, refuse, stated};
 use crate::error::Error;
 use crate::tensor::{Bank, Tensor};
+use crate::tuning::Qmm;
 
 const QMM_FILE: &str = "quant/qmm_t.wgsl";
 const QMV_FILE: &str = "quant/qmv.wgsl";
@@ -32,56 +33,12 @@ pub fn qmm_group(bm: i32) -> [u32; 3] {
 
 const QMV_GROUP: [u32; 3] = [32, 2, 1];
 
-const QMM_BK: i32 = 32;
+/// Codes a tiled point walks the contraction by.
+pub(crate) const QMM_BK: i32 = 32;
 
 const BM_RUNGS: [i32; 4] = [8, 16, 32, 64];
 
 const BN_RUNGS: [i32; 2] = [16, 32];
-
-#[must_use]
-pub fn composed() -> Vec<Fire> {
-    let mut out = Vec::new();
-    for &gs in &GROUPS {
-        for &b in &WIDTHS {
-            out.push(Fire::at(
-                QMV_FILE,
-                qmv_name("quant.qmv", "", gs, b).expect("an axis point"),
-            ));
-            for &bm in &ROW_TILES {
-                for &bn in &TILES {
-                    out.push(Fire::at(
-                        QMM_FILE,
-                        qmm_name("quant.qmm_t", "", gs, b, bm, bn).expect("an axis point"),
-                    ));
-                }
-            }
-        }
-    }
-    out
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Point {
-    pub entry: &'static str,
-
-    pub stamp: &'static str,
-}
-
-pub fn qmm_point(
-    op: &'static str,
-    form: &str,
-    stamp: &str,
-    group: i32,
-    bits: i32,
-    bm: i32,
-    bn: i32,
-) -> Result<Point, Error> {
-    let _ = stamp;
-    Ok(Point {
-        entry: qmm_name(op, form, group, bits, bm, bn)?,
-        stamp: "",
-    })
-}
 
 pub fn qmm_name(
     op: &'static str,
@@ -106,24 +63,6 @@ pub fn qmm_name(
     )))
 }
 
-pub fn qmm_precast_name(
-    op: &'static str,
-    before: &str,
-    after: &str,
-    bm: i32,
-    bn: i32,
-) -> Result<&'static str, Error> {
-    let _ = (before, after, bm, bn);
-    Err(Error::Unsupported { op })
-}
-
-pub fn qmv_point(op: &'static str, form: &str, group: i32, bits: i32) -> Result<Point, Error> {
-    Ok(Point {
-        entry: qmv_name(op, form, group, bits)?,
-        stamp: "",
-    })
-}
-
 pub fn qmv_name(
     op: &'static str,
     form: &str,
@@ -141,58 +80,11 @@ pub fn qmv_name(
     Ok(symbol(&format!("affine_qmv_bf16_gs_{group}_b_{bits}")))
 }
 
-pub fn qmv_rows_point(
-    op: &'static str,
-    group: i32,
-    bits: i32,
-    rows: i32,
-    packs: i32,
-) -> Result<Point, Error> {
-    let _ = (group, bits, rows, packs);
-    Err(Error::Unsupported { op })
-}
-
-pub fn precast_point(
-    op: &'static str,
-    form: &str,
-    bm: i32,
-    bn: i32,
-) -> Result<&'static str, Error> {
-    let _ = (form, bm, bn);
-    Err(Error::Unsupported { op })
-}
-
-pub fn routed_fp16_point(op: &'static str, bm: i32, bn: i32) -> Result<&'static str, Error> {
-    let _ = (bm, bn);
-    Err(Error::Unsupported { op })
-}
-
-pub fn mxfp4_routed_point(
-    op: &'static str,
-    form: &str,
-    bm: i32,
-    bn: i32,
-) -> Result<&'static str, Error> {
-    let _ = (form, bm, bn);
-    Err(Error::Unsupported { op })
-}
-
 fn check(op: &'static str, points: &[i32], v: i32, what: &'static str) -> Result<(), Error> {
     points
         .contains(&v)
         .then_some(())
         .ok_or_else(|| refuse(op, format!("no point is instantiated at {what} {v}")))
-}
-
-#[must_use]
-pub fn bm_rung(rows: i32) -> i32 {
-    let mut best = BM_RUNGS[0];
-    for &rung in &BM_RUNGS[1..] {
-        if rows >= rung {
-            best = rung;
-        }
-    }
-    best
 }
 
 #[must_use]
@@ -301,17 +193,12 @@ fn symbol(name: &str) -> &'static str {
     leaked
 }
 
-pub struct Scratch<'a> {
-    pub precast: &'a dyn Fn(u32, u32) -> Option<Tensor>,
-}
-
 pub fn matmul(
     ctx: &Ctx<'_>,
     tuning: &crate::Tuning,
     act: Tensor,
     w: Bank,
     y: Tensor,
-    scratch: Scratch<'_>,
     capacity_rows: u32,
 ) -> Result<(), Error> {
     act_x_wt(
@@ -321,7 +208,6 @@ pub fn matmul(
         act,
         w,
         y,
-        scratch,
         capacity_rows,
     )
 }
@@ -332,7 +218,6 @@ pub fn lm_head(
     act: Tensor,
     w: Bank,
     y: Tensor,
-    scratch: Scratch<'_>,
     capacity_rows: u32,
 ) -> Result<(), Error> {
     act_x_wt(
@@ -342,7 +227,6 @@ pub fn lm_head(
         act,
         w,
         y,
-        scratch,
         capacity_rows,
     )
 }
@@ -355,10 +239,8 @@ pub fn act_x_wt(
     act: Tensor,
     w: Bank,
     y: Tensor,
-    scratch: Scratch<'_>,
     capacity_rows: u32,
 ) -> Result<(), Error> {
-    let _ = scratch;
     dtype_dispatch!(op, act.dtype, { Bf16 => () });
 
     let Some(biases) = w.biases else {
@@ -392,42 +274,42 @@ pub fn act_x_wt(
         stated(op, columns)?,
         stated(op, contraction)?,
     );
-    let min_batch = i32::try_from(tuning.qmm_min_rows()).unwrap_or(i32::MAX);
-    let crossover = i32::try_from(tuning.qmm_crossover_tg()).unwrap_or(i32::MAX);
     let capacity = i32::try_from(capacity_rows).unwrap_or(i32::MAX);
-    if m >= min_batch
-        && k % QMM_BK == 0
-        && let Some((bm, padded)) = mb_block(m, capacity)
-        && let Some(bn) = bn_unsplit(n, padded / bm, crossover)
-    {
-        return ctx.fire(
-            Fire::at(QMM_FILE, qmm_name(op, "", group, bits, bm, bn)?)
-                .apply(Grid::of(qmm_grid(op, n, bn, padded, bm, 1)?, qmm_group(bm))),
-            &[
-                w.codes.arg(),
-                w.scales.arg(),
-                biases.arg(),
-                act.arg(),
-                y.arg_mut(),
-                k.arg(),
-                n.arg(),
-                m.arg(),
-            ],
-        );
+    let args = [
+        w.codes.arg(),
+        w.scales.arg(),
+        biases.arg(),
+        act.arg(),
+        y.arg_mut(),
+        k.arg(),
+        n.arg(),
+        m.arg(),
+    ];
+    let at = tuning.qmm_at(rows, columns, contraction, w.bits, w.group);
+    for choice in tuning.qmm(&at) {
+        match choice {
+            Qmm::Tiled { crossover_tg } => {
+                let crossover = i32::try_from(crossover_tg).unwrap_or(i32::MAX);
+                if let Some((bm, padded)) = mb_block(m, capacity)
+                    && let Some(bn) = bn_unsplit(n, padded / bm, crossover)
+                {
+                    return ctx.fire(
+                        Fire::at(QMM_FILE, qmm_name(op, "", group, bits, bm, bn)?)
+                            .apply(Grid::of(qmm_grid(op, n, bn, padded, bm, 1)?, qmm_group(bm))),
+                        &args,
+                    );
+                }
+            }
+            Qmm::Qmv => {
+                return ctx.fire(
+                    Fire::at(QMV_FILE, qmv_name(op, "", group, bits)?)
+                        .apply(Grid::of(qmv_grid(op, m, n)?, QMV_GROUP)),
+                    &args[..7],
+                );
+            }
+        }
     }
-    ctx.fire(
-        Fire::at(QMV_FILE, qmv_name(op, "", group, bits)?)
-            .apply(Grid::of(qmv_grid(op, m, n)?, QMV_GROUP)),
-        &[
-            w.codes.arg(),
-            w.scales.arg(),
-            biases.arg(),
-            act.arg(),
-            y.arg_mut(),
-            k.arg(),
-            n.arg(),
-        ],
-    )
+    unreachable!("a kernel.qmm ladder ends in the vector kernel, which fits every shape")
 }
 
 fn extent(op: &'static str, act: Tensor, y: Tensor) -> Result<(u32, u32, u32), Error> {

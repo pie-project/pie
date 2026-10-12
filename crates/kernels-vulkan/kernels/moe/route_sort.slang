@@ -1,7 +1,10 @@
 #include "common/bf16.slang"
 
 #define ROUTER_MAX_EXPERTS 1024u
+// Invocations the sort runs: 1024, or 256 where the device allows fewer.
+#if !defined(PIE_SORT_LANES)
 #define PIE_SORT_LANES 1024u
+#endif
 
 #if defined(PIE_ROUTE_SORT)
 [[vk::binding(0)]] StructuredBuffer<int> expert_ids;
@@ -23,7 +26,7 @@ struct Push {
 groupshared uint counts[ROUTER_MAX_EXPERTS];
 groupshared uint base[ROUTER_MAX_EXPERTS];
 
-[numthreads(1024, 1, 1)]
+[numthreads(PIE_SORT_LANES, 1, 1)]
 void main(uint3 local : SV_GroupThreadID) {
     uint lid = local.x;
     uint nthreads = PIE_SORT_LANES;
@@ -123,5 +126,6 @@ void main(uint3 thread : SV_DispatchThreadID) {
 #endif
 
 // pie:instantiate route_sort PIE_ROUTE_SORT=1
+// pie:instantiate route_sort_256 PIE_ROUTE_SORT=1 PIE_SORT_LANES=256u
 // pie:instantiate route_gather PIE_ROUTE_GATHER=1
 // pie:instantiate route_scatter PIE_ROUTE_SCATTER=1
