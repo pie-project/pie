@@ -4,9 +4,7 @@
 use std::path::Path;
 use std::sync::LazyLock;
 
-use profile::{
-    Anywhere, Candidate, Decision, Domain, Facts, Profile, Registry, Report, Shelf, Source, Var,
-};
+use profile::{Anywhere, Decision, Domain, Facts, Profile, Registry, Report, Shelf, Var};
 
 use crate::{Graphs, Recording};
 
@@ -99,11 +97,17 @@ macro_rules! seeded {
     };
 }
 
-seeded!("nvidia-l40s.toml");
+seeded!(
+    "sm89.toml",
+    "sm89/nvidia-l40s.toml",
+    "sm100.toml",
+    "sm120.toml",
+);
 
 pub static SHELF: Shelf = Shelf {
     backend: "cuda",
     seeded: SEEDED,
+    derived: None,
 };
 
 #[must_use]
@@ -215,39 +219,11 @@ pub fn pinned(graphs: Graphs, recording: Option<Recording>) -> Profile {
     profile(&text)
 }
 
-/// Resolve the profile one load runs under: the user's file for this GPU,
-/// then the checked-in one, then the registry defaults.
+/// Resolve the profile one load runs under: its compute capability's
+/// family file, the file for this GPU, then the user's.
 #[must_use]
 pub fn resolve(device: &str, facts: &Facts, profiles: Option<&Path>) -> (Profile, Report) {
-    let mut candidates = Vec::new();
-    if let Some(dir) = profiles {
-        let path = SHELF.user_path(dir, device);
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            candidates.push(Candidate {
-                source: Source::User(path.display().to_string()),
-                text,
-            });
-        }
-    }
-    candidates.extend(SHELF.seeded_for(device));
-    if let Some(text) = derived(facts) {
-        candidates.push(Candidate {
-            source: Source::Derived,
-            text,
-        });
-    }
-    registry().resolve(&candidates, facts)
-}
-
-/// What a GPU's facts change from the registry defaults, for a GPU no file
-/// names: Blackwell (`cc` 100 and up) takes the narrow bf16 GEMV and the
-/// naive MLA kernel, whose FA2 arms were sized for Ada's shared memory.
-/// `None` where the defaults stand.
-#[must_use]
-pub fn derived(facts: &Facts) -> Option<String> {
-    let cc = facts.get("cc")?;
-    (cc >= 100)
-        .then(|| "api = 1\n[kernel]\ngemv.bf16 = \"narrow\"\nmla.path = \"naive\"\n".to_string())
+    SHELF.resolve(registry(), device, facts, profiles)
 }
 
 #[cfg(test)]
@@ -260,12 +236,12 @@ mod tests {
     }
 
     #[test]
-    fn every_checked_in_profile_reads_strictly_and_is_filed_under_its_gpu() {
+    fn the_checked_in_profiles_hold_together_and_each_family_names_its_tier() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
         SHELF
             .check(registry(), &dir)
             .unwrap_or_else(|e| panic!("{e}"));
-        for (name, text) in SEEDED {
+        for (name, text) in SEEDED.iter().filter(|(n, _)| !n.contains('/')) {
             let file = registry()
                 .parse(text, name, profile::Strict::CheckedIn)
                 .expect("checked above");
@@ -275,7 +251,7 @@ mod tests {
                 .iter()
                 .find(|(i, _)| FACTS[*i].name == "cc")
                 .map(|(_, cc)| *cc)
-                .expect("a GPU profile assumes its compute capability");
+                .expect("a family file assumes its compute capability");
             assert_eq!(
                 file.target.tier.as_deref(),
                 Some(format!("sm_{cc}").as_str()),
@@ -309,13 +285,17 @@ mod tests {
     }
 
     #[test]
-    fn a_blackwell_no_file_names_takes_its_derived_kernels() {
+    fn a_blackwell_no_file_names_takes_its_familys_kernels() {
         let (profile, report) = resolve("NVIDIA RTX PRO 6000", &facts(12, 0, 188), None);
-        assert_eq!(report.used, Source::Derived);
+        assert_eq!(report.used, profile::Source::Seeded("sm120.toml".into()));
+        let tuning = kernels_cuda::tuning::Tuning::of(&profile);
+        assert!(tuning.gemv_narrow && tuning.mla_naive);
+        let (profile, report) = resolve("NVIDIA B200", &facts(10, 0, 148), None);
+        assert_eq!(report.used, profile::Source::Seeded("sm100.toml".into()));
         let tuning = kernels_cuda::tuning::Tuning::of(&profile);
         assert!(tuning.gemv_narrow && tuning.mla_naive);
         let (profile, report) = resolve("NVIDIA A10", &facts(8, 6, 72), None);
-        assert_eq!(report.used, Source::Defaults);
+        assert_eq!(report.used, profile::Source::Defaults);
         let tuning = kernels_cuda::tuning::Tuning::of(&profile);
         assert!(!tuning.gemv_narrow && !tuning.mla_naive);
     }
@@ -348,15 +328,40 @@ mod tests {
     }
 
     #[test]
-    fn the_l40s_runs_its_file_and_another_gpu_the_defaults() {
-        let (_, report) = resolve("NVIDIA L40S", &facts(8, 9, 142), None);
+    fn the_l40s_runs_its_family_measured_and_another_ada_the_same_unmeasured() {
+        let (l40s, report) = resolve("NVIDIA L40S", &facts(8, 9, 142), None);
         assert_eq!(
-            report.used,
-            profile::Source::Seeded("nvidia-l40s.toml".into())
+            report.layers,
+            [
+                profile::Source::Seeded("sm89.toml".into()),
+                profile::Source::Seeded("sm89/nvidia-l40s.toml".into())
+            ]
         );
-        let (_, report) = resolve("NVIDIA GeForce RTX 4090", &facts(8, 9, 128), None);
-        assert_eq!(report.used, profile::Source::Defaults);
+        assert!(!report.untuned());
+        let (rtx, report) = resolve("NVIDIA GeForce RTX 4090", &facts(8, 9, 128), None);
+        assert_eq!(report.used, profile::Source::Seeded("sm89.toml".into()));
         assert!(report.untuned());
+        for p in [&l40s, &rtx] {
+            assert_eq!(Engine::of(p), Engine::of(&registry().defaults()));
+            assert_eq!(
+                kernels_cuda::tuning::Tuning::of(p),
+                kernels_cuda::tuning::Tuning::of(&registry().defaults()),
+                "what an Ada GPU ran before its family file"
+            );
+            for (spec, rungs, _) in p.entries() {
+                assert_eq!(
+                    rungs,
+                    registry()
+                        .defaults()
+                        .entries()
+                        .find(|(s, ..)| s.id == spec.id)
+                        .unwrap()
+                        .1,
+                    "{}",
+                    spec.id
+                );
+            }
+        }
     }
 }
 

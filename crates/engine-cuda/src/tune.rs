@@ -281,11 +281,13 @@ pub fn run(
             Err(why) => say(&format!("  {deployment} did not serve: {why}")),
         }
     }
-    let tuned_ids: Vec<String> = lines
-        .iter()
-        .filter(|l| !l.text.starts_with("not searched"))
-        .map(|l| format!("\"{}\"", l.id))
-        .collect();
+    let mut tuned_ids: Vec<String> = Vec::new();
+    for l in lines.iter().filter(|l| !l.text.starts_with("not searched")) {
+        let id = format!("\"{}\"", l.id);
+        if !tuned_ids.contains(&id) {
+            tuned_ids.push(id);
+        }
+    }
     let checked = if unchanged {
         "nothing changed".to_string()
     } else if checks.is_empty() {
@@ -303,8 +305,7 @@ pub fn run(
     let seconds = began.elapsed().as_secs_f64();
     let provenance = [
         ("source", "\"pie tune on this machine\"".to_string()),
-        ("measured", "true".to_string()),
-        ("tuned", format!("[{}]", tuned_ids.join(", "))),
+        ("measured", format!("[{}]", tuned_ids.join(", "))),
         ("from", format!("\"{}\"", report.used)),
         ("pie", format!("\"{}\"", env!("CARGO_PKG_VERSION"))),
         ("sms", sms.to_string()),

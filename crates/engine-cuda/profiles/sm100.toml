@@ -1,0 +1,13 @@
+# sm_100 (Blackwell datacenter): what every GPU of compute capability 10.0 runs over the registry defaults.
+api = 1
+
+[target]
+tier    = "sm_100"
+assumes = { cc = 100 }
+
+[provenance]
+source = "the profile pie derived for compute capability 10.0 and up before family files: the narrow bf16 GEMV, and the naive MLA kernel, whose FA2 arms were sized for Ada's shared memory"
+
+[kernel]
+gemv.bf16 = "narrow"
+mla.path  = "naive"

@@ -1,4 +1,4 @@
-# NVIDIA L40S. Every decision the CUDA registry declares, spelled out.
+# sm_89 (Ada): what every GPU of compute capability 8.9 runs. Every decision the CUDA registry declares, spelled out.
 api = 1
 fuse = [
   "embed_scale_add",
@@ -15,13 +15,11 @@ fuse = [
 ]
 
 [target]
-device  = "NVIDIA L40S"
 tier    = "sm_89"
 assumes = { cc = 89 }
 
 [provenance]
-source   = "pie tune on an L40S, Qwen3.5-9B and gpt-oss-20b: every decision searched end to end and every value held"
-measured = true
+source = "the NVIDIA L40S file, whose every value pie tune held there (see sm89/nvidia-l40s.toml), carried over to its compute capability"
 
 [kernel]
 moe.grouped        = true
