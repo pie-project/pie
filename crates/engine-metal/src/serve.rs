@@ -345,6 +345,7 @@ impl Shell {
             ..boot
         };
         let device = Context::bind()?;
+        let elsewhere = device.held_elsewhere();
         let keepalive = if crate::keepalive::KeepAlive::wanted() {
             Some(crate::keepalive::KeepAlive::start(&device)?)
         } else {
@@ -518,8 +519,9 @@ impl Shell {
 
         // The kv pool and the recurrent-state buffers beside it: both are
         // wired for the life of the load, in what `gpu_mem_utilization` leaves
-        // once the weights, the arena scratch and the driver's floor are
-        // placed. `[engine] total_pages = 0` takes all of it.
+        // of the room the device had when the load began, once the weights,
+        // the arena scratch and the driver's floor are placed. `[engine]
+        // total_pages = 0` takes all of it.
         let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
         let paging_at = |pages: u64| Paging::of(boot.page_size, boot.context, boot.slots, pages);
         let demand =
@@ -527,6 +529,7 @@ impl Shell {
         let accounting = |pool: u64| {
             crate::store::accounting::Accounting::with_scratch(
                 device.working_set(),
+                elsewhere,
                 boot.gpu_mem_utilization,
                 weights.bytes(),
                 compiled.arena.bytes,

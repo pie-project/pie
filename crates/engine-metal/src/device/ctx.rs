@@ -146,6 +146,16 @@ impl Context {
         self.working_set
     }
 
+    /// The working set other processes hold now: what of it the system
+    /// could not hand this one (free, inactive, purgeable and speculative
+    /// pages are counted as handed). Measured before a load wires anything,
+    /// it is what `gpu_mem_utilization`'s share yields to, as on CUDA.
+    #[must_use]
+    pub fn held_elsewhere(&self) -> u64 {
+        self.working_set
+            .saturating_sub(available_memory().min(self.working_set))
+    }
+
     #[must_use]
     pub fn physical_memory() -> u64 {
         #[cfg(target_vendor = "apple")]
@@ -776,4 +786,39 @@ pub(crate) fn compile_options() -> Retained<objc2_metal::MTLCompileOptions> {
 #[cfg(target_vendor = "apple")]
 pub(crate) fn nsstring(text: &str) -> Retained<NSString> {
     NSString::from_str(text)
+}
+
+/// Unified memory the system could hand a process now; 0 where it does not
+/// say, which counts every byte as held elsewhere.
+fn available_memory() -> u64 {
+    #[cfg(target_vendor = "apple")]
+    {
+        let mut stats: libc::vm_statistics64 = unsafe { core::mem::zeroed() };
+        let mut count = libc::HOST_VM_INFO64_COUNT;
+        // SAFETY: `stats` is a live vm_statistics64 and `count` states its
+        // size in words, as HOST_VM_INFO64 asks; the call writes at most that.
+        #[allow(deprecated, reason = "libc's mach bindings are what this crate links")]
+        let rc = unsafe {
+            libc::host_statistics64(
+                libc::mach_host_self(),
+                libc::HOST_VM_INFO64,
+                (&raw mut stats).cast(),
+                &raw mut count,
+            )
+        };
+        // SAFETY: a plain query.
+        let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(0);
+        if rc != libc::KERN_SUCCESS {
+            return 0;
+        }
+        (u64::from(stats.free_count)
+            + u64::from(stats.inactive_count)
+            + u64::from(stats.purgeable_count)
+            + u64::from(stats.speculative_count))
+            * page
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        0
+    }
 }
