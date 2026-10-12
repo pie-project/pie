@@ -72,7 +72,14 @@ fn tune_metal(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned,
             let hit = found
                 .iter()
                 .find(|(path, d)| d == name || d.contains(name.as_str()) || path.to_string_lossy().contains(name.as_str()))
-                .ok_or_else(|| format!("no Metal artifact matches `{name}`; import one with `pie model import`"))?;
+                .ok_or_else(|| {
+                    let have: Vec<&str> = found.iter().map(|(_, d)| d.as_str()).collect();
+                    format!(
+                        "no stamped Metal artifact matches `{name}` (servable here: {have:?}); \
+                         `pie model list` marks the rest unstamped, which an import from this \
+                         pie restamps: `pie model import <source>`"
+                    )
+                })?;
             picked.push(hit.clone());
         }
         picked
