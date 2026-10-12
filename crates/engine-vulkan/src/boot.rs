@@ -1,7 +1,5 @@
 use crate::api::{ContractFor, DeviceBoot, Vulkan};
 
-pub const DEFAULT_GPU_MEM_UTILIZATION: f64 = 0.9;
-
 pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Vulkan, String> {
     let doc: toml::Table = std::str::from_utf8(config_bytes)
         .map_err(|error| format!("the vulkan boot config is not utf-8: {error}"))?
@@ -11,7 +9,6 @@ pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Vulkan, St
     Ok(Vulkan::new(
         DeviceBoot {
             device_index: device_index(&doc),
-            gpu_mem_utilization: gpu_mem_utilization(&doc),
             validation: validation(&doc),
             pipeline_cache: pipeline_cache(&doc),
         },
@@ -29,14 +26,6 @@ fn device_index(doc: &toml::Table) -> u32 {
         .and_then(toml::Value::as_integer)
         .and_then(|v| u32::try_from(v).ok())
         .unwrap_or(0)
-}
-
-fn gpu_mem_utilization(doc: &toml::Table) -> f64 {
-    table(doc)
-        .and_then(|t| t.get("gpu_mem_utilization"))
-        .and_then(toml::Value::as_float)
-        .filter(|fraction| fraction.is_finite() && *fraction > 0.0 && *fraction <= 1.0)
-        .unwrap_or(DEFAULT_GPU_MEM_UTILIZATION)
 }
 
 fn validation(doc: &toml::Table) -> bool {

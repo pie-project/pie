@@ -42,3 +42,13 @@ mod the_selector_reads_out_the_reference_walk;
 mod the_split_mlp_matches_the_gpu_alone;
 mod the_tower_reads_pixels_as_the_host_cut_them;
 mod the_voxel_axis_answers_its_host_reference;
+
+/// The bytes a pool takes that holds `slots` sequences at `context`, the
+/// `device_kv_budget` a test states for its shell.
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+fn full_pool(trace: &poem_ir::Trace, page_size: u32, context: u32, slots: u32) -> Option<u64> {
+    let pages = u64::from(slots * context.div_ceil(page_size));
+    let paging = engine_metal::store::kv::Paging::of(page_size, context, slots, pages)
+        .expect("a test's paging");
+    Some(engine_metal::store::pool_bytes(trace, paging).expect("the pool sizes"))
+}

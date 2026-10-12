@@ -68,6 +68,7 @@ fn ready() -> Option<Shell> {
         .expect("the micro text's import fits the fixture it was generated for");
     drop(source);
     let shell = Shell::load(Boot {
+        kv_budget: crate::full_pool(&trace, PAGE, 128, 8),
         voxels: None,
         trace,
         contract: &contract,
@@ -78,9 +79,8 @@ fn ready() -> Option<Shell> {
         page_size: PAGE,
         context: 128,
         slots: 8,
-        pages: (8) * (128) / (PAGE),
         runahead: engine::runahead::Runahead::F1,
-        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the micro shell loads");

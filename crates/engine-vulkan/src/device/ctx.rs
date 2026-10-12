@@ -115,6 +115,30 @@ pub struct Enabled {
 }
 
 impl Core {
+    /// What the largest device-local heap holds now, as the driver's memory
+    /// budget reports it: the heap less what the budget leaves free. A
+    /// driver without one reports nothing held.
+    fn held(&self) -> u64 {
+        if !self.features.memory_budget {
+            return 0;
+        }
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut props = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+        unsafe {
+            self.instance
+                .get_physical_device_memory_properties2(self.physical, &mut props);
+        }
+        self.memory.memory_heaps[..self.memory.memory_heap_count as usize]
+            .iter()
+            .enumerate()
+            .filter(|(_, heap)| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+            .max_by_key(|(_, heap)| heap.size)
+            .map_or(0, |(i, heap)| {
+                heap.size
+                    .saturating_sub(budget.heap_budget[i].saturating_sub(budget.heap_usage[i]))
+            })
+    }
+
     pub(crate) fn fault(&self, call: &'static str, code: vk::Result) -> Fault {
         Fault::Vulkan {
             what: call,
@@ -288,6 +312,8 @@ unsafe extern "system" fn on_validation(
 
 pub struct Context {
     pub(crate) core: Arc<Core>,
+    /// The load's share of the device-local heap, less what other
+    /// processes held of it when the device was bound.
     working_set: u64,
     max_buffer: u64,
     pub(crate) dummy: Slab,
@@ -414,7 +440,9 @@ fn has_extension(exts: &[vk::ExtensionProperties], name: &CStr) -> bool {
 }
 
 impl Context {
-    pub fn bind(boot: &DeviceBoot) -> Result<Context> {
+    /// Binds the device `boot` names for a load that may take `share` of
+    /// its device-local heap.
+    pub fn bind(boot: &DeviceBoot, share: f64) -> Result<Context> {
         let entry = entry().map_err(|e| Fault::NoDevice {
             detail: format!("no Vulkan loader: {e}"),
         })?;
@@ -469,7 +497,7 @@ impl Context {
         } else {
             None
         };
-        match Self::finish(entry, instance, messenger, boot, props2) {
+        match Self::finish(entry, instance, messenger, boot, share, props2) {
             Ok(context) => {
                 kernels_vulkan::tuning::describe(context.info());
                 Ok(context)
@@ -497,6 +525,7 @@ impl Context {
         instance: ash::Instance,
         messenger: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
         boot: &DeviceBoot,
+        share: f64,
         _props2: bool,
     ) -> std::result::Result<Context, (Fault, Option<Undone>)> {
         macro_rules! bail {
@@ -764,16 +793,10 @@ impl Context {
             features: enabled,
         });
 
+        // Taken before this load allocates, so what the heap holds then is
+        // other processes'.
+        let working_set = ((device_local as f64 * share) as u64).saturating_sub(core.held());
         let dummy = Raw::new(&core, DUMMY_BYTES, Memory::Device).map_err(|fault| (fault, None))?;
-        let fraction = if boot.gpu_mem_utilization.is_finite()
-            && boot.gpu_mem_utilization > 0.0
-            && boot.gpu_mem_utilization <= 1.0
-        {
-            boot.gpu_mem_utilization
-        } else {
-            0.9
-        };
-        let working_set = (device_local as f64 * fraction) as u64;
         let max_buffer = u64::from(core.limits.max_storage_buffer_range).max(1 << 30);
         let pipeline_cache = Arc::new(
             PipelineCache::open(&core, boot.pipeline_cache.clone())
@@ -855,33 +878,11 @@ impl Context {
         }
     }
 
-    /// What the working set has left now: less this process's allocations
-    /// and, where the driver reports a budget, what other processes hold of
-    /// the device-local heap.
+    /// What the working set has left now, less this load's allocations.
     #[must_use]
     pub fn left(&self) -> u64 {
-        let mut used = self.core.allocated.load(Ordering::Relaxed);
-        if self.core.features.memory_budget {
-            let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
-            let mut props = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
-            unsafe {
-                self.core
-                    .instance
-                    .get_physical_device_memory_properties2(self.core.physical, &mut props);
-            }
-            let heaps =
-                &self.core.memory.memory_heaps[..self.core.memory.memory_heap_count as usize];
-            if let Some((i, heap)) = heaps
-                .iter()
-                .enumerate()
-                .filter(|(_, heap)| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
-                .max_by_key(|(_, heap)| heap.size)
-            {
-                let free = budget.heap_budget[i].saturating_sub(budget.heap_usage[i]);
-                used = heap.size.saturating_sub(free);
-            }
-        }
-        self.working_set.saturating_sub(used)
+        self.working_set
+            .saturating_sub(self.core.allocated.load(Ordering::Relaxed))
     }
 
     pub fn bind_thread(&self) -> Result<()> {

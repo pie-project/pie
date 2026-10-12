@@ -478,7 +478,8 @@ intended for diagnostics, not serving",
             page_size: budgets.page_size,
             context: budgets.max_context,
             slots: budgets.slots,
-            pages: budgets.pages,
+            kv_budget: residency.device_kv_budget,
+            memory_share: residency.device_memory_share,
             ordinal: if ordinal >= 0 {
                 ordinal
             } else {

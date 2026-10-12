@@ -1,7 +1,5 @@
 use crate::error::{Fault, Result};
 
-pub const DEFAULT_GPU_MEM_UTILIZATION: f64 = 0.90;
-
 #[must_use]
 pub fn safety_floor_bytes(working_set: u64) -> u64 {
     const CAP: u64 = 128 * 1024 * 1024;
@@ -101,14 +99,15 @@ impl Accounting {
         Err(Fault::Residency(format!(
             "the device does not hold this deployment: recommendedMaxWorkingSetSize is \
              {working_set} bytes, other processes held {elsewhere} of it when this load began, \
-             and `[metal] gpu_mem_utilization` = {utilization} allows pie {ceiling}; this load's resident weight tier takes {weights} \
+             and `[model] device_memory_share` = {utilization} allows pie {ceiling}; this load's resident weight tier takes {weights} \
              (`device_weight_budget` {budget}){scratch} and the driver's safety floor holds \
-             back {floor}, leaving {pool} bytes for the kv pool — and this model's pool at \
-             the declared context needs {minimum} resident. On Apple Silicon a GPU-touched \
+             back {floor}, leaving {pool} bytes for the kv pool — and the pool needs \
+             {minimum} resident (`[model] device_kv_budget`, or one sequence at the \
+             declared context when that is omitted). On Apple Silicon a GPU-touched \
              Shared page is WIRED and the pager never evicts it (.wiki/alto/streaming.md), \
              so this is a hard bound and not a hint: lower `[model] max_context` or `[model] \
-             slots`, lower `[engine] max_forward_tokens`, raise `[metal] \
-             gpu_mem_utilization`, or state a smaller `[model] device_weight_budget` to \
+             slots`, lower `[engine] max_forward_tokens`, raise `[model] \
+             device_memory_share`, or state a smaller `[model] device_weight_budget` to \
              stream the weight tier down.",
             working_set = self.working_set,
             elsewhere = self.elsewhere,
@@ -123,7 +122,8 @@ impl Accounting {
 
 #[cfg(test)]
 mod tests {
-    use super::{Accounting, DEFAULT_GPU_MEM_UTILIZATION};
+    use super::Accounting;
+    use engine::load::DEFAULT_DEVICE_MEMORY_SHARE;
 
     const GIB: u64 = 1 << 30;
 
@@ -137,7 +137,7 @@ mod tests {
 
     fn the_arena_scratch_counts_against_the_ceiling() {
         let ws = 21_800 * (GIB / 1000);
-        let util = DEFAULT_GPU_MEM_UTILIZATION;
+        let util = DEFAULT_DEVICE_MEMORY_SHARE;
         let without = Accounting::of(ws, 0, util, 11 * GIB, 4 * GIB);
         assert!(without.admit(Some(11 * GIB), util).is_ok());
         let with = Accounting::with_scratch(ws, 0, util, 11 * GIB, 6 * GIB, 4 * GIB);
@@ -154,7 +154,7 @@ mod tests {
 
     fn a_load_under_the_ceiling_is_admitted_and_one_over_it_refuses() {
         let ws = 21_800 * (GIB / 1000);
-        let util = DEFAULT_GPU_MEM_UTILIZATION;
+        let util = DEFAULT_DEVICE_MEMORY_SHARE;
         let ok = Accounting::of(ws, 0, util, 11 * GIB, 4 * GIB);
         assert!(
             ok.admit(Some(11 * GIB), util).is_ok(),
@@ -167,7 +167,7 @@ mod tests {
         let said = format!("{why}");
         for needle in [
             "recommendedMaxWorkingSetSize",
-            "gpu_mem_utilization",
+            "device_memory_share",
             "WIRED",
             "device_weight_budget",
         ] {

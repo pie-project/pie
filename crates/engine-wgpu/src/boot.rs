@@ -1,7 +1,5 @@
 use crate::api::{ContractFor, DeviceBoot, Wgpu};
 
-pub const DEFAULT_GPU_MEM_UTILIZATION: f64 = 0.9;
-
 pub const DEFAULT_POWER_PREFERENCE: &str = "high-performance";
 
 pub const DEFAULT_DEVICE_MEMORY: u64 = 8 << 30;
@@ -55,7 +53,6 @@ fn device_boot(doc: &toml::Table) -> DeviceBoot {
     DeviceBoot {
         adapter_index: adapter_index(doc),
         backends: backends(doc),
-        gpu_mem_utilization: gpu_mem_utilization(doc),
         power_preference: power_preference(doc),
         pipeline_cache: pipeline_cache(doc),
         device_memory: device_memory(doc),
@@ -81,14 +78,6 @@ fn backends(doc: &toml::Table) -> Option<String> {
         .map(str::trim)
         .filter(|list| !list.is_empty())
         .map(str::to_string)
-}
-
-fn gpu_mem_utilization(doc: &toml::Table) -> f64 {
-    table(doc)
-        .and_then(|t| t.get("gpu_mem_utilization"))
-        .and_then(toml::Value::as_float)
-        .filter(|fraction| fraction.is_finite() && *fraction > 0.0 && *fraction <= 1.0)
-        .unwrap_or(DEFAULT_GPU_MEM_UTILIZATION)
 }
 
 fn power_preference(doc: &toml::Table) -> String {

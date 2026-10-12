@@ -80,7 +80,13 @@ pub struct Boot<'a> {
 
     pub slots: u32,
 
-    pub pages: u32,
+    /// Device bytes the kv pages and state slots take (`[model]
+    /// device_kv_budget`); `None` fills what `memory_share` leaves.
+    pub kv_budget: Option<u64>,
+
+    /// The share of the device's memory the load may take (`[model]
+    /// device_memory_share`).
+    pub memory_share: f64,
 
     pub device: &'a crate::api::DeviceBoot,
 }
@@ -345,6 +351,12 @@ fn classes_running(
 
 const DEVICE_HEADROOM: u64 = 2 << 30;
 
+/// The most pages a pool takes on a device that states no memory limit (a
+/// dry one, or a plugin that reports none) with no `[model]
+/// device_kv_budget` stated: the pages a pool defaulted to before it was
+/// sized in bytes.
+const FILL_PAGES: u64 = 65536;
+
 /// Rows past the fire limit a prefill fire may pad into (see `fire_inner`).
 const PAD_ROOM: u32 = 128;
 
@@ -460,59 +472,53 @@ impl Shell {
             Ok(Paging::of(boot.page_size, boot.context, boot.slots, pages)?
                 .windowed(window, boot.budget.max_tokens))
         };
+        // The pool buffers are program parameters, so the pages are fixed
+        // before anything traces: what the budget buys, or with none what
+        // the share leaves past what others held at open, the weights (at
+        // their smallest landing) and the headroom XLA's scratch takes,
+        // since it plans none of its own.
         let working = device
             .memory()
-            .map(|bytes| (bytes as f64 * boot.device.mem_utilization) as u64)
-            .unwrap_or(u64::MAX);
-        // The pages asked for are a ceiling: the pool gets what the device
-        // holds past the weights (at their smallest landing) and the
-        // headroom, as engine-cuda's `fit_the_card` fits its pool.
+            .map(|bytes| ((bytes as f64 * boot.memory_share) as u64).saturating_sub(device.held()));
         let weight_floor = boot.trace.params.iter().try_fold(0u64, |sum, p| {
             crate::weights::plane_bytes(&p.name, p.dtype, &p.shape).map(|b| sum + b)
         })?;
-        let room = working
-            .saturating_sub(weight_floor)
-            .saturating_sub(DEVICE_HEADROOM);
-        let asked = u64::from(boot.pages);
+        let room = working.map_or(u64::MAX, |working| {
+            working
+                .saturating_sub(weight_floor)
+                .saturating_sub(DEVICE_HEADROOM)
+        });
+        let least = u64::from(boot.context.div_ceil(boot.page_size.max(1)));
+        // A plane's cells are addressed by a 32-bit word, and a device with
+        // no limit fills to `FILL_PAGES` when no budget is stated.
+        let cells = u64::from(u32::MAX) / u64::from(boot.page_size.max(1)) - 1;
+        let ceiling = match (boot.kv_budget, working) {
+            (None, None) => FILL_PAGES.max(least).min(cells),
+            _ => cells,
+        };
         let demand = |pages: u64| {
+            if pages > ceiling {
+                return u64::MAX;
+            }
             paging_at(pages)
                 .and_then(|paging| crate::store::pool_demand(&boot.trace, paging))
                 .unwrap_or(u64::MAX)
         };
-        let fit = if demand(asked) <= room {
-            asked
-        } else {
-            let (mut fits, mut over) = (0u64, asked);
-            while over - fits > 1 {
-                let probe = fits + (over - fits) / 2;
-                if demand(probe) <= room {
-                    fits = probe;
-                } else {
-                    over = probe;
-                }
-            }
-            fits
-        };
-        let one_sequence = u64::from(boot.context.div_ceil(boot.page_size.max(1)));
-        if fit < one_sequence.min(asked) {
-            return Err(Fault::Residency(format!(
-                "the device does not hold this deployment: the weights take {} MiB of the {} MiB \
-                 `mem_utilization` leaves, and one sequence at the declared context needs {} MiB \
-                 of kv beside them. Lower the context, raise `mem_utilization`, or serve a \
-                 smaller quantization",
-                weight_floor >> 20,
-                working >> 20,
-                demand(one_sequence) >> 20
-            )));
-        }
-        if fit < asked {
-            tracing::info!(asked, fit, "xla kv pages fitted to the device");
-        }
+        let fit = engine::fit::pages_for(boot.kv_budget, room, least, demand)
+            .map_err(|short| Fault::Residency(short.to_string()))?;
+        tracing::info!(
+            pages = fit,
+            pool_mib = demand(fit) >> 20,
+            weight_floor_mib = weight_floor >> 20,
+            "xla kv pool sized"
+        );
         let paging = paging_at(fit)?;
         let handles = Handles::new();
-        let device_cap = working
-            .saturating_sub(crate::store::pool_demand(&boot.trace, paging)?)
-            .saturating_sub(DEVICE_HEADROOM);
+        let device_cap = working.map_or(u64::MAX, |working| {
+            working
+                .saturating_sub(demand(fit))
+                .saturating_sub(DEVICE_HEADROOM)
+        });
         let weights = if device.is_dry() {
             // A device of the target's size (32 GiB) would pre-scale an
             // mxfp4 bank when the weights leave room for it.

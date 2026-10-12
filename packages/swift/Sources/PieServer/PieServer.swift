@@ -21,8 +21,10 @@ public final class PieServer: Sendable {
     /// The boot configuration (`worker::embedded::Settings`), sized for a phone.
     public struct Configuration: Encodable, Sendable, Equatable {
         /// Share of the device's recommended working set the engine may use.
-        public var gpuMemoryUtilization = 0.6
-        public var maxTotalPages = 512
+        public var deviceMemoryShare = 0.6
+        /// Bytes for the kv pages and state slots, with a unit (`"1GiB"`);
+        /// nil fills what `deviceMemoryShare` leaves past the weights.
+        public var deviceKvBudget: String? = nil
         public var maxForwardTokens = 512
         public var maxForwardRequests = 4
         public var maxStateSlots = 16
@@ -34,8 +36,8 @@ public final class PieServer: Sendable {
         public init() {}
 
         enum CodingKeys: String, CodingKey {
-            case gpuMemoryUtilization = "gpu_mem_utilization"
-            case maxTotalPages = "max_total_pages"
+            case deviceMemoryShare = "device_memory_share"
+            case deviceKvBudget = "device_kv_budget"
             case maxForwardTokens = "max_forward_tokens"
             case maxForwardRequests = "max_forward_requests"
             case maxStateSlots = "max_state_slots"

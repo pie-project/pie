@@ -719,10 +719,20 @@ impl engine::frame::Supply for Pools {
     }
 }
 
+/// The bytes `trace`'s kv and state rows take at `paging`.
 pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
-    let mut bytes: u64 = 0;
-    for row in &trace.caches {
-        match row {
+    Ok(slab_bytes(trace, paging)?
+        .into_iter()
+        .fold(0, u64::saturating_add))
+}
+
+/// Each cache row's slab at `paging`, one buffer apiece as `Pools::reserve`
+/// lays them.
+pub fn slab_bytes(trace: &Trace, paging: Paging) -> Result<Vec<u64>> {
+    trace
+        .caches
+        .iter()
+        .map(|row| match row {
             CacheRow::Kv {
                 name,
                 planes,
@@ -737,22 +747,19 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
                 } else {
                     planes.keys + planes.values
                 };
-                bytes = bytes.saturating_add(cells * width * element);
+                Ok(cells.saturating_mul(width).saturating_mul(element))
             }
             CacheRow::State {
                 name, slab, dtype, ..
             } => {
                 let stride: u64 = slab.iter().product();
                 let dtype = state_dtype(*dtype);
-                bytes = bytes.saturating_add(
-                    stride
-                        .saturating_mul(u64::from(paging.slots))
-                        .saturating_mul(elem_bytes(name, dtype)?),
-                );
+                Ok(stride
+                    .saturating_mul(u64::from(paging.slots))
+                    .saturating_mul(elem_bytes(name, dtype)?))
             }
-        }
-    }
-    Ok(bytes)
+        })
+        .collect()
 }
 
 struct Planes {
@@ -808,7 +815,11 @@ mod tests {
             eprintln!("no Vulkan device on this machine; skipping");
             return;
         }
-        let device = Context::bind(&crate::DeviceBoot::default()).expect("a Vulkan device");
+        let device = Context::bind(
+            &crate::DeviceBoot::default(),
+            engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        )
+        .expect("a Vulkan device");
         let paging = Paging {
             page_size: 16,
             pages_per_slot: 1,

@@ -110,9 +110,14 @@ fn one(
         page_size: 16,
         max_context: 512,
         slots: 4,
-        pages: 128,
         ..engine::load::Budgets::default()
     };
+    // The bytes of 128 pages: four sequences at the context.
+    let kv_budget =
+        engine_xla::store::kv::Paging::of(budgets.page_size, budgets.max_context, 4, 128)
+            .map_err(engine_xla::Fault::from)
+            .and_then(|paging| engine_xla::store::pool_demand(&trace, paging))
+            .map_err(|fault| format!("pool: {fault}"))?;
     let patches = engine_xla::api::patch_ladder(&trace, &budgets);
     let voxels = engine_xla::dit::voxel_ladder(&trace, Some(4096), Some(4), budgets.max_lanes);
     let contract = checkpoint::contract::ModelContract {
@@ -136,7 +141,8 @@ fn one(
             page_size: budgets.page_size,
             context: budgets.max_context,
             slots: budgets.slots,
-            pages: budgets.pages,
+            kv_budget: Some(kv_budget),
+            memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
             device: &boot,
         },
         voxels,

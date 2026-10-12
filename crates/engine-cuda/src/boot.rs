@@ -1,16 +1,6 @@
 use crate::api::{ContractFor, Cuda, DeviceBoot};
 
 pub fn open(boot: DeviceBoot, contract_for: ContractFor) -> Result<Cuda, String> {
-    let fraction = boot.knobs.gpu_mem_utilization;
-    if !fraction.is_finite() || fraction <= 0.0 || fraction > 1.0 {
-        return Err(format!(
-            "`gpu_mem_utilization` must be finite and in (0.0, 1.0]; this boot \
-             says {fraction}. It is the fraction of the whole card this \
-             deployment lets pie hold, weights included — 1.0 is the whole \
-             card, which is what the elastic pool took before the knob \
-             reached a shell at all."
-        ));
-    }
     Ok(Cuda::new(boot, contract_for))
 }
 

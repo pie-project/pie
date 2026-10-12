@@ -121,6 +121,7 @@ fn every_probe_is_dumped() {
     let patches = engine_metal::api::patch_ladder(&trace, &engine::load::Budgets::default());
     let booted = Instant::now();
     let mut shell = Shell::load(Boot {
+        kv_budget: crate::full_pool(&trace, 16, context, 4),
         voxels: None,
         trace,
         contract: &contract,
@@ -131,9 +132,8 @@ fn every_probe_is_dumped() {
         page_size: 16,
         context,
         slots: 4,
-        pages: 4 * context / 16,
         runahead: engine::runahead::Runahead::F1,
-        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the shell loads");

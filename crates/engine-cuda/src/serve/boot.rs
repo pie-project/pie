@@ -99,7 +99,6 @@ pub struct Knobs {
     pub copies: bool,
     pub grouped: bool,
     pub side_streams: Option<u32>,
-    pub gpu_mem_utilization: f64,
     pub diagnostics: Diagnostics,
     pub nccl_transport: crate::comm::Transport,
 }
@@ -128,7 +127,6 @@ impl Default for Knobs {
             copies: true,
             grouped: true,
             side_streams: None,
-            gpu_mem_utilization: DEFAULT_GPU_MEM_UTILIZATION,
             diagnostics: Diagnostics::default(),
             nccl_transport: crate::comm::Transport::default(),
         }
@@ -143,8 +141,6 @@ pub enum Golden {
     Body,
 }
 
-pub const DEFAULT_GPU_MEM_UTILIZATION: f64 = 0.90;
-
 pub const DEFAULT_BODIES_MEGABYTES: u32 = 4096;
 
 pub struct Boot<'a> {
@@ -158,7 +154,12 @@ pub struct Boot<'a> {
     pub page_size: u32,
     pub context: u32,
     pub slots: u32,
-    pub pages: u32,
+    /// `[model] device_kv_budget`: the bytes the cache rows take; `None`
+    /// fills what `memory_share` leaves.
+    pub kv_budget: Option<u64>,
+    /// `[model] device_memory_share`: the share of the card this load may
+    /// hold, less what was in use when it began.
+    pub memory_share: f64,
     pub ordinal: i32,
     pub graphs: Graphs,
     pub knobs: Knobs,

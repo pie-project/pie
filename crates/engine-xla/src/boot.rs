@@ -2,8 +2,6 @@
 
 use crate::api::{ContractFor, DeviceBoot, Xla};
 
-pub const DEFAULT_MEM_UTILIZATION: f64 = 0.9;
-
 pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Xla, String> {
     let doc = parse(config_bytes)?;
     Ok(Xla::new(device_boot(&doc), contract_for))
@@ -34,10 +32,5 @@ fn device_boot(doc: &toml::Table) -> DeviceBoot {
             .and_then(toml::Value::as_integer)
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(0),
-        mem_utilization: t
-            .and_then(|t| t.get("mem_utilization"))
-            .and_then(toml::Value::as_float)
-            .filter(|f| f.is_finite() && *f > 0.0 && *f <= 1.0)
-            .unwrap_or(DEFAULT_MEM_UTILIZATION),
     }
 }

@@ -1079,14 +1079,12 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
     Ok(PoolDemand::of(trace, paging, None)?.bytes(paging.pages()))
 }
 
-/// The pages a load cannot do without: those `[engine] total_pages` states,
-/// or one context's when it is 0 and the pool is fitted to the device.
-#[must_use]
-pub fn least_pages(stated: u32, paging: Paging) -> u64 {
-    match stated {
-        0 => u64::from(paging.pages_per_slot),
-        stated => u64::from(stated),
-    }
+/// The bytes a load's pool takes at `paging`: the kv and state rows and the
+/// recurrent-state buffers beside them, what `[model] device_kv_budget`
+/// states for it.
+pub fn pool_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
+    let rs = crate::rs::Layout::read(trace)?;
+    Ok(PoolDemand::of(trace, paging, rs.as_ref())?.bytes(paging.pages()))
 }
 
 struct Planes {

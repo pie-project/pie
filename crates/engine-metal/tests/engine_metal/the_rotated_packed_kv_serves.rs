@@ -232,6 +232,7 @@ fn load(dir: &Path, deployment: Deployment, head_dim: u32) -> Shell {
         import_of(&id, Dtype::Bf16, kv, &source, Platform::Metal).expect("the fixture imports");
     drop(source);
     Shell::load(Boot {
+        kv_budget: crate::full_pool(&trace, 16, 128, 4),
         voxels: None,
         trace,
         contract: &contract,
@@ -242,10 +243,9 @@ fn load(dir: &Path, deployment: Deployment, head_dim: u32) -> Shell {
         page_size: 16,
         context: 128,
         slots: 4,
-        pages: 4 * 128 / 16,
         runahead: engine::runahead::Runahead::F1,
         residency: engine_metal::ResidencyPlan::default(),
-        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
     })
     .expect("the micro_text shell loads")
 }

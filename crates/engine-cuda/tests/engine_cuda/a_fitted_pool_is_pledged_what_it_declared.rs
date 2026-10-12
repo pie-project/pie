@@ -102,13 +102,11 @@ fn a_fitted_pool_is_pledged_what_it_declared() {
         page_size: PAGE,
         context: CONTEXT,
         slots: 256,
-        pages: 256 * CONTEXT / PAGE,
+        kv_budget: None,
+        memory_share: FRACTION,
         ordinal: 0,
         graphs: engine_cuda::Graphs::Off,
-        knobs: Knobs {
-            gpu_mem_utilization: FRACTION,
-            ..Knobs::default()
-        },
+        knobs: Knobs::default(),
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         world: engine_cuda::World::default(),

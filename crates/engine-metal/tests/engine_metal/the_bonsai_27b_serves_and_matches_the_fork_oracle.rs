@@ -241,6 +241,7 @@ fn the_bonsai_27b_serves_ptq1_0_and_matches_the_fork_oracle() {
     let context = 64u32;
     let page_size = 16u32;
     let shell = Shell::load(Boot {
+        kv_budget: crate::full_pool(&trace, page_size, context, 1),
         trace: trace.clone(),
         contract: &contract,
         checkpoint: &zt,
@@ -251,10 +252,9 @@ fn the_bonsai_27b_serves_ptq1_0_and_matches_the_fork_oracle() {
         page_size,
         context,
         slots: 1,
-        pages: context / page_size,
         runahead: engine::runahead::Runahead::F1,
         residency,
-        gpu_mem_utilization: engine_metal::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
     });
     let mut shell = match shell {
         Ok(shell) => shell,

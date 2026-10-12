@@ -6,30 +6,13 @@ use engine_cuda::store::{
     least_state_slots, one_slot_bytes, pages_within, program_scratch_reserve, state_slots_within,
     tokens_within, window_fire_bytes, window_of,
 };
-use engine_cuda::{DeviceBoot, Knobs};
 
 const CARD: u64 = 48_305_799_168;
 
 const WEIGHTS: u64 = 13_761_281_792;
 
-fn boot_with(fraction: f64) -> DeviceBoot {
-    DeviceBoot {
-        knobs: Knobs {
-            gpu_mem_utilization: fraction,
-            ..Knobs::default()
-        },
-        ..DeviceBoot::default()
-    }
-}
-
-fn no_contract() -> engine_cuda::ContractFor {
-    |_, _| Err("this gate opens a boot and never loads a model".to_string())
-}
-
 #[test]
 fn the_operators_fraction_sizes_the_pool_every_case() {
-    the_boot_carries_the_fraction_and_absence_is_the_configs_default();
-    an_out_of_range_fraction_refuses_at_boot_by_the_knobs_name();
     the_whole_card_is_the_arithmetic_the_pool_had_before();
     the_fraction_is_of_the_card_and_charges_what_is_already_on_it();
     the_card_does_not_hold_a_deployment_whose_weights_leave_no_context();
@@ -46,7 +29,7 @@ fn the_operators_fraction_sizes_the_pool_every_case() {
 
 fn a_twenty_seven_b_serves_on_a_twenty_four_gigabyte_card_at_the_asked_lanes() {
     // Issue #679: an RTX 4090 (25250627584 bytes, 426901504 in use) at
-    // gpu_mem_utilization 0.9 with qwen3.6-27b u4g64, 15300601856 of
+    // device_memory_share 0.9 with qwen3.6-27b u4g64, 15300601856 of
     // weights, a 4096 envelope and 256 lanes: the load put down an
     // 838467584-byte arena and 2150089216 of inputs, took the lm_head's
     // tile (vocab 248320 by hidden 5120 in bf16) and found no room for one
@@ -273,7 +256,7 @@ fn the_decoded_weight_tiles_are_held_out_of_the_pool() {
 }
 
 fn the_reservations_scale_to_a_twenty_four_gigabyte_card() {
-    // Issue #662: an RTX 4090 (24564 MiB) at gpu_mem_utilization 0.9 with
+    // Issue #662: an RTX 4090 (24564 MiB) at device_memory_share 0.9 with
     // gemma-4-26b-a4b 4-bit, 13591 MiB of weights, 60 kv planes of 3755 bytes a
     // token in bf16 (1760 MiB a sequence at 8192), an 8192 envelope and 64 lanes. The fixed reservations —
     // 4 GiB of bodies_mem, an arena and attention workspaces sized for 8192
@@ -498,41 +481,6 @@ fn the_declared_pool_is_sized_to_what_the_card_hands_out() {
     assert_eq!(pages_within(0, room, declared_at), 0);
 }
 
-fn the_boot_carries_the_fraction_and_absence_is_the_configs_default() {
-    engine_cuda::open(boot_with(0.75), no_contract()).expect("a fraction in range opens");
-
-    assert!(
-        (Knobs::default().gpu_mem_utilization - engine_cuda::DEFAULT_GPU_MEM_UTILIZATION).abs()
-            < f64::EPSILON,
-    );
-    assert!(
-        (engine_cuda::DEFAULT_GPU_MEM_UTILIZATION - 0.90).abs() < f64::EPSILON,
-        "and that default is 0.90, which is what the worker's config says"
-    );
-    assert!(
-        (DeviceBoot::default().knobs.gpu_mem_utilization - 0.90).abs() < f64::EPSILON,
-        "a boot that states nothing is the same answer"
-    );
-
-    engine_cuda::open(boot_with(1.0), no_contract()).expect("the whole card opens");
-}
-
-fn an_out_of_range_fraction_refuses_at_boot_by_the_knobs_name() {
-    for fraction in [0.0, 1.5, -0.25, f64::NAN, f64::INFINITY] {
-        let refusal = engine_cuda::open(boot_with(fraction), no_contract())
-            .err()
-            .unwrap_or_else(|| panic!("`{fraction}` is not a deployment"));
-        assert!(
-            refusal.contains("gpu_mem_utilization"),
-            "the refusal names the knob; got: {refusal}"
-        );
-        assert!(
-            refusal.contains(&format!("{fraction}")) || fraction.is_nan(),
-            "and the value it was given; got: {refusal}"
-        );
-    }
-}
-
 fn the_whole_card_is_the_arithmetic_the_pool_had_before() {
     let floor = safety_floor_bytes(CARD);
     for free in [CARD, CARD - WEIGHTS, 1 << 30, floor + 1] {
@@ -602,7 +550,7 @@ fn the_card_does_not_hold_a_deployment_whose_weights_leave_no_context() {
         );
     }
     assert!(
-        refusal.contains("gpu_mem_utilization") && refusal.contains("device_weight_budget"),
+        refusal.contains("device_memory_share") && refusal.contains("device_weight_budget"),
         "and it names the two keys that change the answer: {refusal}"
     );
 

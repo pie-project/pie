@@ -22,7 +22,7 @@
   <input id="model" type="text" value="models/qwen--qwen3-5-0-8b.qwen35-d0-8b-u4g64-kv-bf16.wgpu.zt">
   <br>
   <label for="config">engine config</label>
-  <input id="config" type="text" value='max_forward_tokens = 512, max_forward_requests = 4, max_total_pages = 512'>
+  <input id="config" type="text" value='max_forward_tokens = 512, max_forward_requests = 4, device_kv_budget = "256MiB"'>
   <br>
   <button id="boot">Load model and boot</button>
   <progress id="progress" value="0" max="1"></progress>

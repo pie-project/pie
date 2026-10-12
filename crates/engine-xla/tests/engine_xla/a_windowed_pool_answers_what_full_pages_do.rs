@@ -70,11 +70,12 @@ struct Answer {
     handed: Vec<u32>,
     pool_bytes: u64,
     weight_bytes: u64,
+    pages: u64,
     window_pages: u64,
     reused: usize,
 }
 
-fn answer(m: &common::Model, prompt: &[u32], full_windows: bool) -> Answer {
+fn answer(m: &common::Model, prompt: &[u32], kv_budget: u64, full_windows: bool) -> Answer {
     // SAFETY: the test sets the knob before the shell reads it, on one thread.
     unsafe {
         if full_windows {
@@ -94,7 +95,8 @@ fn answer(m: &common::Model, prompt: &[u32], full_windows: bool) -> Answer {
         page_size: PAGE,
         context: CONTEXT,
         slots: 2,
-        pages: 2 * CONTEXT / PAGE,
+        kv_budget: Some(kv_budget),
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         device: &DeviceBoot::default(),
         patches: None,
     })
@@ -170,6 +172,7 @@ fn answer(m: &common::Model, prompt: &[u32], full_windows: bool) -> Answer {
         handed: handed_out,
         pool_bytes,
         weight_bytes,
+        pages: paging.pages(),
         window_pages: paging.window_pages(),
         reused: handed.reused,
     }
@@ -211,9 +214,12 @@ fn a_windowed_pool_answers_what_full_pages_do() {
         prompt.len()
     );
 
+    // Both pools are handed the bytes of two full sequences in full pages.
+    let pages = 2 * CONTEXT / PAGE;
+    let kv_budget = common::kv_budget(&trace, CONTEXT, 2, pages).expect("a budget");
     let _device = engine_xla::bench::lock_device();
-    let windowed = answer(&m, &prompt, false);
-    let full = answer(&m, &prompt, true);
+    let windowed = answer(&m, &prompt, kv_budget, false);
+    let full = answer(&m, &prompt, kv_budget, true);
     eprintln!(
         "windowed: ring {:?}\n          handed {:?}\n  => {:?}",
         windowed.ring,
@@ -225,20 +231,32 @@ fn a_windowed_pool_answers_what_full_pages_do() {
         full.ring, full.handed
     );
     eprintln!(
-        "pools: windowed {} MiB ({} windowed pages, {} ids reused), full {} MiB; weights {} MiB",
+        "pools: windowed {} MiB ({} kv pages, {} windowed, {} ids reused), full {} MiB ({} kv \
+         pages); weights {} MiB",
         windowed.pool_bytes >> 20,
+        windowed.pages,
         windowed.window_pages,
         windowed.reused,
         full.pool_bytes >> 20,
+        full.pages,
         windowed.weight_bytes >> 20
     );
     assert!(
         windowed.reused > 0,
         "the handed lane released ids behind its window"
     );
+    assert_eq!(
+        full.pages,
+        u64::from(pages),
+        "the budget buys the full pages it was stated for"
+    );
     assert!(
-        windowed.pool_bytes < full.pool_bytes,
-        "the windowed pool is smaller"
+        windowed.pool_bytes <= kv_budget && full.pool_bytes <= kv_budget,
+        "neither pool outgrows the budget"
+    );
+    assert!(
+        windowed.pages > full.pages,
+        "the windowed pool seats more kv pages in the same bytes"
     );
     assert_eq!(
         windowed.ring, full.ring,
