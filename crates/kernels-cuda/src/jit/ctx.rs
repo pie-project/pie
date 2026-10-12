@@ -166,6 +166,7 @@ pub const SHARED_REGION: u32 = u32::MAX - 1;
 
 pub struct Ctx {
     stream: *mut c_void,
+    owner: *mut c_void,
     cublas: *mut c_void,
     comm: *mut c_void,
     peers: Option<crate::collective::Peers>,
@@ -186,6 +187,7 @@ impl Ctx {
     pub const unsafe fn on(stream: *mut c_void) -> Self {
         Self {
             stream,
+            owner: stream,
             cublas: core::ptr::null_mut(),
             comm: core::ptr::null_mut(),
             peers: None,
@@ -195,6 +197,15 @@ impl Ctx {
             region: core::cell::Cell::new(NO_REGION),
             lane: core::cell::Cell::new(0),
         }
+    }
+
+    /// Launches that run in `owner`'s order — a conditional body, captured
+    /// on its own stream and replayed inside `owner`'s graph — share
+    /// `owner`'s per-stream slabs, so what a load warmed there serves them.
+    #[must_use]
+    pub const fn in_order_of(mut self, owner: *mut c_void) -> Self {
+        self.owner = owner;
+        self
     }
 
     #[must_use]
@@ -263,8 +274,15 @@ impl Ctx {
     ) -> Result<*mut c_void, Error> {
         #[cfg(feature = "cuda")]
         {
-            crate::jit::device::take(self.slabs.0, self.stream, name, self.region.get(), bytes)
-                .map_err(|fault| fault.at(op))
+            crate::jit::device::take(
+                self.slabs.0,
+                self.stream,
+                self.stream,
+                name,
+                self.region.get(),
+                bytes,
+            )
+            .map_err(|fault| fault.at(op))
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -286,8 +304,15 @@ impl Ctx {
     ) -> Result<*mut c_void, Error> {
         #[cfg(feature = "cuda")]
         {
-            crate::jit::device::take(self.slabs.0, self.stream, name, NO_REGION, bytes)
-                .map_err(|fault| fault.at(op))
+            crate::jit::device::take(
+                self.slabs.0,
+                self.stream,
+                self.owner,
+                name,
+                NO_REGION,
+                bytes,
+            )
+            .map_err(|fault| fault.at(op))
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -305,7 +330,7 @@ impl Ctx {
         #[cfg(feature = "cuda")]
         {
             let region = SHARED_REGION.saturating_sub(self.lane.get().min(1 << 8));
-            crate::jit::device::take(self.slabs.0, self.stream, name, region, bytes)
+            crate::jit::device::take(self.slabs.0, self.stream, self.stream, name, region, bytes)
                 .map_err(|fault| fault.at(op))
         }
         #[cfg(not(feature = "cuda"))]
