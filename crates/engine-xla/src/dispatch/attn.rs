@@ -66,10 +66,6 @@ impl Run<'_> {
             } => {
                 match self.declared(*plan) {
                     StructKind::AttnPrefillPlan => {}
-                    StructKind::AttnPrefillPlanSm90 => panic!(
-                        "an sm90 plan kind on a wgpu trace is a trace bug: this plane \
-                         builds only the fa2-shaped `AttnPrefillPlan`"
-                    ),
                     other => panic!(
                         "`attention.plan_prefill` defines a {other:?}, which is no \
                          prefill plan kind"

@@ -116,7 +116,6 @@ impl Dim {
 pub enum StructKind {
     AttnDecodePlan,
     AttnPrefillPlan,
-    AttnPrefillPlanSm90,
     MlaPlan,
 }
 

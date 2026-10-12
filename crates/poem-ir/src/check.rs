@@ -617,8 +617,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
     const U8: Expect = Expect::Tensor(Dtype::U8);
     const CACHE: Expect = Expect::Cache;
     const DECODE_PLAN: Expect = Expect::Struct(&[StructKind::AttnDecodePlan]);
-    const PREFILL_PLAN: Expect =
-        Expect::Struct(&[StructKind::AttnPrefillPlan, StructKind::AttnPrefillPlanSm90]);
+    const PREFILL_PLAN: Expect = Expect::Struct(&[StructKind::AttnPrefillPlan]);
     const MLA_PLAN: Expect = Expect::Struct(&[StructKind::MlaPlan]);
 
     match op {

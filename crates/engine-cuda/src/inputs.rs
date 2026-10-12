@@ -89,7 +89,6 @@ fn plan_floats(
                         device,
                         toggles,
                     ),
-                    StructKind::AttnPrefillPlanSm90 => unreachable!("no CUDA trace plans one"),
                     StructKind::AttnDecodePlan => graph_float_bytes(&seat.reading, device.num_sm)
                         .max(decode_float_bytes(&seat.reading, budget.max_lanes)),
                     StructKind::MlaPlan => latent_float_bytes(seat.reading.head_dim, device.num_sm),
