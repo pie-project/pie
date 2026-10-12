@@ -387,7 +387,7 @@ async fn main(input: String) -> Result<String, String> {
         // Clients read `input_tokens` off `message_start`, which goes out
         // before generation begins, so the prompt is rendered once here for
         // its count and again inside `run`.
-        let prompt_tokens = compat::prompt::build(&req)?.len();
+        let prompt_tokens = compat::prompt::build(&req)?.tokens.len();
         emit::send_event(
             "message_start",
             &json!({"type": "message_start", "message": {

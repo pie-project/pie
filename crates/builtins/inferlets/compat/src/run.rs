@@ -157,7 +157,7 @@ pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, 
     Ok(Outcome {
         finish,
         stop_sequence: out.stop_hit.and_then(|i| req.stop.get(i).cloned()),
-        prompt_tokens: prompt.len(),
+        prompt_tokens: prompt.tokens.len(),
         completion_tokens: sampled,
         content: out.content,
         reasoning: demux.reasoning_text,

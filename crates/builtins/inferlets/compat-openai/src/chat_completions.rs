@@ -80,21 +80,31 @@ struct WireFunction {
     arguments: Option<Value>,
 }
 
-fn content_text(content: Option<Value>, param: &str) -> Result<String, ApiError> {
+/// The text of `content`, and the pictures its `image_url` parts carry.
+fn content_parts(content: Option<Value>, param: &str) -> Result<(String, Vec<Vec<u8>>), ApiError> {
     match content {
-        None | Some(Value::Null) => Ok(String::new()),
-        Some(Value::String(s)) => Ok(s),
+        None | Some(Value::Null) => Ok((String::new(), Vec::new())),
+        Some(Value::String(s)) => Ok((s, Vec::new())),
         Some(Value::Array(parts)) => {
             let mut text = String::new();
+            let mut images = Vec::new();
             for part in parts {
                 match part.get("type").and_then(Value::as_str) {
                     Some("text") => {
                         text.push_str(part.get("text").and_then(Value::as_str).unwrap_or(""));
                     }
+                    Some("image_url") => {
+                        let url = part
+                            .get("image_url")
+                            .and_then(|u| u.get("url").or(Some(u)))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        images.push(data_url(url).map_err(|e| invalid(e, Some(param)))?);
+                    }
                     Some(other) => {
                         return Err(invalid(
                             format!(
-                                "content part type `{other}` is not supported; only `text` parts are"
+                                "content part type `{other}` is not supported; only `text` and `image_url` parts are"
                             ),
                             Some(param),
                         ));
@@ -102,13 +112,43 @@ fn content_text(content: Option<Value>, param: &str) -> Result<String, ApiError>
                     None => return Err(invalid("content part has no `type`", Some(param))),
                 }
             }
-            Ok(text)
+            Ok((text, images))
         }
         Some(_) => Err(invalid(
             "`content` must be a string or an array of parts",
             Some(param),
         )),
     }
+}
+
+/// The bytes of a base64 `data:` URL; the program cannot fetch remote ones.
+fn data_url(url: &str) -> Result<Vec<u8>, String> {
+    let Some((head, body)) = url.strip_prefix("data:").and_then(|u| u.split_once(',')) else {
+        return Err("an image must be a `data:` URL".into());
+    };
+    if !head.ends_with(";base64") {
+        return Err("an image `data:` URL must be base64".into());
+    }
+    let mut out = Vec::with_capacity(body.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in body.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' | b'\n' | b'\r' => continue,
+            _ => return Err("an image `data:` URL is not valid base64".into()),
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Ok(out)
 }
 
 /// The normalized request, and whether a streamed reply ends with a usage
@@ -141,8 +181,12 @@ fn parse(body: Value) -> Result<(Request, bool), ApiError> {
                 return Err(invalid(format!("unknown role `{other}`"), Some(&param)));
             }
         };
-        let content = content_text(m.content, &param)?;
+        let (content, images) = content_parts(m.content, &param)?;
+        if !images.is_empty() && role != Role::User {
+            return Err(invalid("only user messages may carry images", Some(&param)));
+        }
         let mut message = Message::text(role, content);
+        message.images = images;
         if role == Role::Assistant {
             for (j, call) in m.tool_calls.unwrap_or_default().into_iter().enumerate() {
                 let id = call.id.unwrap_or_else(|| format!("call_{i}_{j}"));

@@ -25,9 +25,9 @@ pub struct ToolCall {
 #[derive(Clone, Debug)]
 pub struct Message {
     pub role: Role,
-    /// Text content. Only text: image and audio parts are refused by the
-    /// adapters until the chat template can place them.
     pub content: String,
+    /// Encoded pictures (PNG, JPEG, ...) a user turn carries ahead of its text.
+    pub images: Vec<Vec<u8>>,
     /// Tool calls an assistant turn made (empty for every other role).
     pub tool_calls: Vec<ToolCall>,
     /// For a [`Role::Tool`] message: the name of the tool that answered.
@@ -39,6 +39,7 @@ impl Message {
         Self {
             role,
             content: content.into(),
+            images: Vec::new(),
             tool_calls: Vec::new(),
             tool_name: None,
         }

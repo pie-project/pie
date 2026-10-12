@@ -18,6 +18,9 @@ use std::ops::ControlFlow;
 use inferlet::eta::hybrid::prelude::*;
 use inferlet::grammar::Matcher;
 use inferlet::mask::unpack_mask;
+use inferlet::media;
+
+use crate::prompt::Prompt;
 
 /// Sampling parameters. The defaults are the OpenAI defaults: temperature 1,
 /// no truncation, no penalties.
@@ -139,7 +142,8 @@ fn sample(
     (token, next)
 }
 
-/// Generate up to `max_tokens` after `prompt`. Every sampled token — the
+/// Generate up to `max_tokens` after `prompt`; each picture's span is
+/// prefilled whole in a fire of its own. Every sampled token — the
 /// stop token included, if one comes — goes to `on_token`, which ends
 /// generation by returning `Break`; the return value is how many tokens
 /// were sampled.
@@ -147,13 +151,15 @@ fn sample(
 /// With a `matcher`, every fire's logits are masked to what the grammar
 /// allows next, and generation ends when the grammar terminates.
 pub async fn generate(
-    prompt: &[u32],
+    prompt: &Prompt,
     sampling: Sampling,
     max_tokens: usize,
     matcher: Option<&Matcher>,
     on_token: &mut dyn FnMut(u32) -> ControlFlow<()>,
 ) -> Result<usize> {
     sampling.validate()?;
+    let images = &prompt.images;
+    let prompt = &prompt.tokens[..];
     if max_tokens == 0 {
         return Ok(0);
     }
@@ -162,6 +168,7 @@ pub async fn generate(
         && !sampling.penalized()
         && matcher.is_none()
         && !prompt.is_empty()
+        && images.is_empty()
         && let Some(draft) = model::draft_block()
         && !draft.bidirectional
         && draft.proposals_from == 1
@@ -204,13 +211,38 @@ pub async fn generate(
         Vec::new()
     };
 
+    // Rotations past an M-RoPE span lag its rows by `token_count - position_span`.
+    let runs: Vec<(u32, u32, u32)> = images
+        .iter()
+        .map(|(start, image)| {
+            let end = start + image.tokens().len() as u32;
+            (*start, end, image.token_count() - image.position_span())
+        })
+        .collect();
+    let rope_delta: u32 = runs.iter().map(|r| r.2).sum();
+    let mut pieces = Vec::new();
+    let mut at = 0u32;
+    for &(start, end, _) in runs.iter().chain([(n, n, 0)].iter()) {
+        pieces.extend(
+            prefill_chunks(start - at, None)
+                .into_iter()
+                .map(|(b, e)| (at + b, at + e)),
+        );
+        if end > start {
+            pieces.push((start, end));
+        }
+        at = end;
+    }
+
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let mut g0 = 0i32;
-    for (k, &(base, end)) in prefill_chunks(n, None).iter().enumerate() {
+    for (k, &(base, end)) in pieces.iter().enumerate() {
         let len = end - base;
+        let lag: u32 = runs.iter().filter(|r| r.1 <= base).map(|r| r.2).sum();
+        let carried = images.iter().position(|(start, _)| *start == base);
         let toks = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
         let embed_indptr = Channel::from([0u32, len]).named("embed_indptr_p");
-        let positions = Channel::from_iter(base..end).named("positions_p");
+        let positions = Channel::from_iter((base..end).map(|row| row - lag)).named("positions_p");
         let w_slot = Channel::from_iter((base..end).map(|c| pool_ids[(c / page_t) as usize]))
             .named("w_slot_p");
         let w_off = Channel::from_iter((base..end).map(|c| c % page_t)).named("w_off_p");
@@ -229,6 +261,9 @@ pub async fn generate(
 
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &embed_indptr)?;
+        if let Some(at) = carried {
+            fwd.media(&[media::Span::Image(&images[at].1)])?;
+        }
         fwd.attention(
             Some(KvBinding {
                 working_set: &ws,
@@ -290,7 +325,7 @@ pub async fn generate(
 
     let slot_n = pool_ids[(n / page_t) as usize];
     let tok_in = Channel::from([g0]).named("tok_in");
-    let pos = Channel::from([n]).named("pos");
+    let pos = Channel::from([n - rope_delta]).named("pos");
     let fill = Channel::from([n + 1]).named("fill");
     let klen = Channel::from([n + 1]).named("klen");
     let w_slot = Channel::from([slot_n]).named("w_slot");
@@ -371,7 +406,7 @@ pub async fn generate(
         w_slot.put(&w_slot_v);
         w_off.put(&w_off_v);
         klen.put(&klen_v);
-        pos.put(&base);
+        pos.put(&(&base - rope_delta));
         fill.put(&next_free);
         pages.put(&pages_v);
         page_indptr.put(&pidx_v);
