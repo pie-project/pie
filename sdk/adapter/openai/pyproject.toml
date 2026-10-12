@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pie-openai-adapter"
+version = "0.1.0"
+description = "OpenAI-compatible HTTP adapter in front of the Pie engine"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = [
+    "aiohttp>=3.9",
+    "pie-client>=0.5.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+pie-openai-adapter = "pie_openai_adapter.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/pie-project/pie"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["pie_openai_adapter"]
