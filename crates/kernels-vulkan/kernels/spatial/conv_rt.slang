@@ -3,14 +3,14 @@
 
 // A convolution as a register-tiled GEMM over its taps: output rows x output
 // channels, contracted over `taps * c_in` with the weight taps-major. Each
-// invocation holds a 4x4 block of the output; a 32-wide K block lies inside
-// one tap (`c_in % 32 == 0`), so its activation rows are one gathered voxel
+// invocation holds a 4x4 block of the output; a 16-wide K block lies inside
+// one tap (`c_in % 16 == 0`), so its activation rows are one gathered voxel
 // per output row. No frame cache: a causal clip's history takes the plain
 // point.
 
 #define PIE_BM 64
 #define PIE_BN 64
-#define PIE_BK 32
+#define PIE_BK 16
 #define PIE_TX (PIE_BN / 4)
 #define PIE_TY (PIE_BM / 4)
 #define PIE_THREADS (PIE_TX * PIE_TY)
