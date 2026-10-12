@@ -8,6 +8,12 @@ const FILE: &str = "attn/dense.slang";
 
 const THREADS: u32 = 128;
 
+const TILED_FILE: &str = "attn/tiled.slang";
+
+const TILED_THREADS: u32 = 128;
+
+const TILED_ROWS: u32 = 32;
+
 const STAMPS: [u32; 3] = [64, 128, 256];
 
 const DENSE: [&str; 3] = [
@@ -178,8 +184,29 @@ pub fn ragged(
         .filter(|s| *s > 0)
         .ok_or_else(|| refuse(OP, format!("a CSR of {entries} entries names no segment")))?;
     let rows = nonzero(OP, "query rows", q.rows)?;
+    // A bf16 head of 64 or 128 takes the tiled point: 32 query rows a
+    // workgroup, the keys streamed through workgroup memory.
+    let (file, entry, grid) = match (q.dtype, head_dim) {
+        (Dtype::Bf16, 64 | 128) => (
+            TILED_FILE,
+            if head_dim == 64 {
+                "tiled_ragged_bf16_d_64"
+            } else {
+                "tiled_ragged_bf16_d_128"
+            },
+            Grid::of(
+                [q_heads * TILED_THREADS, rows.div_ceil(TILED_ROWS), 1],
+                [TILED_THREADS, 1, 1],
+            ),
+        ),
+        _ => (
+            FILE,
+            entry,
+            Grid::of([q_heads * THREADS, rows, 1], [THREADS, 1, 1]),
+        ),
+    };
     ctx.fire(
-        Fire::at(FILE, entry).apply(Grid::of([q_heads * THREADS, rows, 1], [THREADS, 1, 1])),
+        Fire::at(file, entry).apply(grid),
         &[
             q.arg(),
             k.arg(),
