@@ -24,6 +24,15 @@
 //!   activation rows in that order, decode the whole bank to bf16 once and
 //!   run one `chlo.ragged_dot`, then un-permute with the inverse sort.
 //!
+//! Where the bank is plain (bf16, or pre-scaled f8, no group factors) and a
+//! block of it fits VMEM, the grouped-matmul kernel (`crate::mosaic::gmm`)
+//! is preferred over all of these past the slice case: it reads each
+//! routed expert once at the DMA rate with no per-expert launch. Which
+//! formulation runs is `kernel.moe.path` (`auto` by default, which may take
+//! gmm unless `gmm = false`); the automatic choice's cost model is
+//! `kernel.moe.cost.*` and the gmm tile is `kernel.moe.gmm_tm` /
+//! `kernel.moe.gmm_block_mib`.
+//!
 //! The bytes floor is the active experts' bytes: at batch 64 with top-4 of
 //! 32 experts and diverse tokens nearly every expert is active and the
 //! whole bank streams (e5m2: ~0.55 ms a gpt-oss layer on v6e). An exact
@@ -698,42 +707,28 @@ pub fn group_routes(ctx: &Ctx<'_>, groups: u32, routes: Tensor) -> Result<(), Er
 
 // ------------------------------------------------------------ expert compute
 
-/// Up to this many f32 partials (`rows · experts · N`, times the group count
-/// for a codes bank) a routed matmul runs every activation row against every
-/// expert in one dot and picks each pair's row: the whole bank streams
-/// through the MXU once with only a free convert in front of it (measured on
-/// v6e: gpt-oss's 32-expert gate/up bank in 0.45 ms pre-scaled, at HBM
-/// speed). Past it, the pairs are sorted by expert into one ragged dot over
-/// the bank decoded to bf16.
-const DENSE_ALL: i64 = 1 << 27;
-
-/// What multiplying one expert sliced out of the bank costs at least, in
-/// bank bytes streamed: a dot over a dynamic slice of an expert's rows runs
-/// ~15 us on v6e however small the expert (measured: gpt-oss's 16.6 MB
-/// gate/up expert at the HBM rate, its 8.3 MB down expert in the same time).
-/// Independent slices overlap; a loop over them pays this per step.
-const SLICE_BYTES: i64 = 18 << 20;
-
-/// Up to this many routed pairs, a fire slices each pair's expert out and
-/// multiplies its row alone (one or two tokens' fan-out), when that costs
-/// less than streaming the bank (gpt-oss at one token: 0.11 ms a layer
-/// against 0.67 ms for the banks).
-const SLICE_PAIRS: i64 = 8;
-
-/// What one row tile of the loop over active experts costs, in
-/// nanoseconds (v6e, gpt-oss at 64 tokens, real routing): an expert's dot
-/// over a dynamic slice of the bank runs at the HBM rate (~1,200 bytes a ns)
-/// but not under ~14 us, whatever the expert (its 8.3 MB down expert takes
-/// 14.6 us, its 16.6 MB gate/up expert 13.8 us).
-const LOOP_TILE_NS: i64 = 14_000;
-const LOOP_ROW_NS: i64 = 10;
-
-/// What streaming the whole bank through one dot costs, in nanoseconds:
-/// the bank at ~1,450 bytes a ns plus ~5.5 ps a partial (every row
-/// against every expert, then picked; the pick relayouts them), measured
-/// as for the loop (gate/up at 64 rows 0.38 ms, down at 256 rows 0.33 ms).
-const WHOLE_BYTES_PER_NS: i64 = 1_450;
-const WHOLE_PARTIAL_FS: i64 = 5_500;
+// The automatic formulation's cost model is `kernel.moe.cost.*`
+// (`Tuning::moe_costs`), measured on v6e for gpt-oss-20b:
+// - every row against every expert in one dot (the bank through the MXU
+//   once, a free convert in front) up to `dense_all` f32 partials
+//   (`rows · experts · N`, times the groups of a codes bank): gpt-oss's
+//   32-expert gate/up bank in 0.45 ms pre-scaled, at HBM speed. Past it, the
+//   pairs sort by expert into one ragged dot over the bank decoded to bf16;
+// - a dot over a dynamic slice of one expert costs at least `slice_bytes`
+//   of bank streamed (~15 us however small the expert: its 16.6 MB gate/up
+//   expert at the HBM rate, its 8.3 MB down expert in the same time).
+//   Independent slices overlap; a loop over them pays this per step;
+// - up to `slice_pairs` routed pairs, each pair's expert is sliced out and
+//   multiplied by its row alone, when that costs less than streaming the
+//   bank (gpt-oss at one token: 0.11 ms a layer against 0.67 ms);
+// - one row tile of the loop over active experts costs at least
+//   `loop_tile_ns` plus `loop_row_ns` a row (gpt-oss at 64 tokens, real
+//   routing: its 8.3 MB down expert 14.6 us, its 16.6 MB gate/up expert
+//   13.8 us), streaming at `slice_bytes_per_ns` (~1,200 bytes a ns);
+// - one dot over the whole bank streams at `whole_bytes_per_ns` (~1,450)
+//   plus `whole_partial_fs` (~5.5 ps) a partial (every row against every
+//   expert, then picked: gate/up at 64 rows 0.38 ms, down at 256 rows
+//   0.33 ms).
 
 /// How an expert bank is stored. Every form is expert-major and flat:
 /// expert `e`, output row `n`, contracted column `k` sits at `(e*N + n)*K + k`
@@ -1050,10 +1045,6 @@ fn ragged_dot(cx: &mut Cx<'_>, x: Val, w: Val, sizes: Val) -> Result<Val, Error>
     Ok(cx.op_named("chlo.ragged_dot", &[x, w, sizes], attrs, vec![out])[0])
 }
 
-/// Rows of one tile of the grouped matmul kernel (bf16 rows pack in pairs
-/// of sublanes: 16 is the least whole tile).
-const GMM_TM: i64 = 16;
-
 /// `table[ids]` for a short i32 `table` (`[E]`) and `[n]` i32 `ids` in
 /// range, as a one-hot select and sum: XLA lowers a gather from a table this
 /// small to a serial chain of scalar selects (v6e: ~40 us over 768 ids).
@@ -1071,7 +1062,8 @@ fn pick_small(cx: &mut Cx<'_>, table: Val, ids: Val) -> Result<Val, Error> {
 
 /// The grouped-matmul kernel (`crate::mosaic::gmm`) for this bank, when its
 /// weights are plain (bf16 or pre-scaled f8, no group factors) and a block
-/// of them fits VMEM. A profile turns it off with `kernel.moe.gmm = false`.
+/// of them fits VMEM. A profile turns it off with
+/// `kernel.moe.path = { use = "auto", gmm = false }`.
 ///
 /// It reads each routed expert once, at the DMA rate (~1.4 TB/s), with no
 /// per-expert launch. vLLM-TPU's `gmm_v2` streams the same experts in the
@@ -1085,7 +1077,7 @@ fn pick_small(cx: &mut Cx<'_>, table: Val, ids: Val) -> Result<Val, Error> {
 /// scalar code, which cost more than the kernel saved.
 fn gmm_spec(fan: Fan, bank: &Read, elem: Elem, tuning: Tuning) -> Option<crate::mosaic::gmm::Gmm> {
     use crate::mosaic::gmm::{Gmm, Orient};
-    let off = !tuning.moe_gmm && tuning.moe_path != MoePath::Gmm;
+    let off = !tuning.moe_gmm();
     if off
         || bank.factor.is_some()
         || !matches!(bank.codes, Codes::Weights(_))
@@ -1094,10 +1086,13 @@ fn gmm_spec(fan: Fan, bank: &Read, elem: Elem, tuning: Tuning) -> Option<crate::
         return None;
     }
     let (p, e) = (fan.pairs(), fan.experts);
+    let tm = tuning.moe_gmm_tm;
     let spec = Gmm {
         // Every active expert's rows round up to whole tiles.
-        tiles: (p + GMM_TM - 1) / GMM_TM + e.min(p),
-        tm: GMM_TM,
+        tiles: (p + tm - 1) / tm + e.min(p),
+        tm,
+        block_bytes: tuning.moe_gmm_block_bytes,
+        vmem_cap: tuning.vmem_cap(),
         k: fan.k,
         n: fan.n,
         experts: e,
@@ -1109,7 +1104,7 @@ fn gmm_spec(fan: Fan, bank: &Read, elem: Elem, tuning: Tuning) -> Option<crate::
 
 /// The routed matmul through the grouped-matmul kernel: the pairs sorted by
 /// expert (unrouted last), each expert's run of rows padded to whole tiles
-/// of `GMM_TM`, one tile per grid step against its expert's weights, and
+/// of `kernel.moe.gmm_tm` rows, one tile per grid step against its expert's weights, and
 /// each pair's row picked back out. Only the routed experts' weights move.
 /// f32 `[P, N]`.
 fn gmm(
@@ -1283,8 +1278,9 @@ fn routed(
     // How many active experts (row tiles) the loop runs for less than the
     // whole bank, whose dot also lands a partial per row and expert.
     let tile = loop_tile(fan, tuning);
-    let whole_ns = bank_bytes / WHOLE_BYTES_PER_NS + r8 * e * n * WHOLE_PARTIAL_FS / 1_000_000;
-    let tile_ns = (expert_bytes / 1_200).max(LOOP_TILE_NS + tile * LOOP_ROW_NS);
+    let c = tuning.moe_costs;
+    let whole_ns = bank_bytes / c.whole_bytes_per_ns.max(1) + r8 * e * n * c.whole_partial_fs / 1_000_000;
+    let tile_ns = (expert_bytes / c.slice_bytes_per_ns.max(1)).max(c.loop_tile_ns + tile * c.loop_row_ns);
     let worth = whole_ns / tile_ns;
     // A profile's `kernel.moe.path` forces a formulation (tests reach each
     // with small shapes; `gmm` falls back to `all` for a bank the kernel
@@ -1292,16 +1288,16 @@ fn routed(
     let grouped = gmm_spec(fan, &bank, cx.elem(bank.codes.val()), tuning);
     let path = match tuning.moe_path {
         MoePath::Gmm if grouped.is_none() => MoePath::All,
-        MoePath::Auto if p <= SLICE_PAIRS && p * expert_bytes.max(SLICE_BYTES) < bank_bytes => {
+        MoePath::Auto { .. } if p <= c.slice_pairs && p * expert_bytes.max(c.slice_bytes) < bank_bytes => {
             MoePath::Slice
         }
-        MoePath::Auto if r8 * e * n * fold > DENSE_ALL => MoePath::Ragged,
+        MoePath::Auto { .. } if r8 * e * n * fold > c.dense_all => MoePath::Ragged,
         // Past a token or two: each routed expert read once, at the DMA
         // rate, with no per-expert launch (see `gmm_spec`).
-        MoePath::Auto if grouped.is_some() => MoePath::Gmm,
-        MoePath::Auto if worth < 2 => MoePath::All,
-        MoePath::Auto if worth >= p => MoePath::Loop,
-        MoePath::Auto => MoePath::Active,
+        MoePath::Auto { .. } if grouped.is_some() => MoePath::Gmm,
+        MoePath::Auto { .. } if worth < 2 => MoePath::All,
+        MoePath::Auto { .. } if worth >= p => MoePath::Loop,
+        MoePath::Auto { .. } => MoePath::Active,
         forced => forced,
     };
     let y = match path {
@@ -1344,7 +1340,7 @@ fn routed(
                 |_, a| Ok(a[0]),
                 |f, _| {
                     let mut env = Sealed;
-                    let mut cx = Cx::new(f, &mut env);
+                    let mut cx = Cx::new(f, &mut env).with_tuning(tuning);
                     let all = every_expert(&mut cx, &bank, fan, x, ids, groups).map_err(sealed)?;
                     let done = cx.const_i(Elem::Pred, 0, &[]);
                     Ok(vec![done, all])
@@ -1353,7 +1349,7 @@ fn routed(
             let many = cx.broadcast(many, &[p, n], &[])?;
             cx.select(many, whole, looped)?
         }
-        MoePath::Ragged | MoePath::Auto => {
+        MoePath::Ragged | MoePath::Auto { .. } => {
             // Sort the pairs by expert (unrouted last), run one ragged dot over
             // the whole bank, and put the rows back.
             let top = cx.const_i(Elem::I32, e, &[p]);
@@ -1577,7 +1573,7 @@ fn run_active(
         |f, a| f.compare(Cmp::Lt, a[0], steps),
         |f, a| {
             let mut env = Sealed;
-            let mut cx = Cx::new(f, &mut env);
+            let mut cx = Cx::new(f, &mut env).with_tuning(tuning);
             let (j, mut ys) = (a[0], a[1]);
             let step = (|| -> Result<Val, Error> {
                 let per_v = cx.const_i(Elem::I32, per, &[]);

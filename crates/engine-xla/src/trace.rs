@@ -528,7 +528,7 @@ impl Emit for Tracer<'_> {
             params,
             written,
         };
-        let mut cx = Cx::new(func, &mut lens);
+        let mut cx = Cx::new(func, &mut lens).with_tuning(self.tuning);
         body(&mut cx)
     }
 }

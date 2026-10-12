@@ -26,9 +26,6 @@
 use crate::hlo::{Built, Elem, Malformed};
 use crate::mosaic::{Body, Compiled, Grid, ICmp, Kernel, Operand, Sem, V, Window};
 
-/// Weight bytes a block may hold (two are in flight, plus a bf16 copy).
-const BLOCK_BYTES: i64 = 12 << 20;
-const VMEM_CAP: i64 = 110 << 20;
 
 /// How the bank `[E·N, K]` sits in HBM.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +58,11 @@ pub struct Gmm {
     pub tiles: i64,
     /// Rows per tile (a multiple of 16: bf16 rows pack in pairs).
     pub tm: i64,
+    /// Weight bytes a block may hold (two are in flight, plus a bf16 copy):
+    /// `kernel.moe.gmm_block_mib`.
+    pub block_bytes: i64,
+    /// The scoped VMEM the kernel may ask for (`Tuning::vmem_cap`).
+    pub vmem_cap: i64,
     pub k: i64,
     pub n: i64,
     pub experts: i64,
@@ -93,7 +95,7 @@ impl Gmm {
 
     fn cut(&self) -> Built<Cut> {
         let (k, n, e) = (self.k, self.n, self.experts);
-        let fits = |cols: i64| k * cols * self.wbytes() <= BLOCK_BYTES;
+        let fits = |cols: i64| k * cols * self.wbytes() <= self.block_bytes;
         let blocked = (1..=n / 128)
             .rev()
             .map(|d| d * 128)
@@ -262,7 +264,10 @@ impl Gmm {
             k * cols * 2
         };
         let vmem = 2 * tm * k * 2 + 2 * k * cols * wb + convert + 2 * tm * cols * 4;
-        let limit = (vmem * 2 + (8 << 20)).clamp(32 << 20, VMEM_CAP);
+        // The compiler's own scoped default (32 MiB on v6e) at least, where
+        // the device has that much.
+        let floor = (32 << 20).min(self.vmem_cap);
+        let limit = (vmem * 2 + (8 << 20)).clamp(floor, self.vmem_cap);
         let kernel = Kernel {
             name: "gmm".into(),
             grid: vec![nblocks, self.tiles],
@@ -296,6 +301,8 @@ mod tests {
         Gmm {
             tiles: 48,
             tm: 16,
+            block_bytes: crate::tuning::Tuning::DEFAULT.moe_gmm_block_bytes,
+            vmem_cap: crate::tuning::Tuning::DEFAULT.vmem_cap(),
             k: 2880,
             n,
             experts: 32,

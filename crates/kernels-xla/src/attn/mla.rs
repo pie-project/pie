@@ -474,6 +474,7 @@ fn flash(
             }
             None => None,
         };
+        let (ch, per_row_max) = (cx.tuning().chunks, cx.tuning().attn_per_row_max);
         let f = cx.func();
         let q3 = f.reshape(qv, &[r, h.g, i64::from(rank)])?;
         let q3 = match qp {
@@ -497,7 +498,7 @@ fn flash(
             latent: true,
         };
         let scale = f64::from(sm_scale);
-        let per = sel.is_some() || decode || r <= 2 * geom.lanes;
+        let per = sel.is_some() || decode || r <= per_row_max * geom.lanes;
         let fl = if per {
             let mut rows_v = Rows::new(q4, zero, hi);
             rows_v.lane = Some(lane);
@@ -505,7 +506,7 @@ fn flash(
                 Some(t) => KeyList::Table(t),
                 None => KeyList::Range,
             };
-            per_row(f, &planes, &h, &Rule::default(), &rows_v, keys, scale)?
+            per_row(f, &planes, &h, &Rule::default(), &rows_v, keys, scale, ch)?
         } else {
             let base = with_i(f, lane, geom.span, Func::mul)?;
             let hi = f.add(base, hi)?;
@@ -522,6 +523,7 @@ fn flash(
                 &rows_v,
                 geom.lanes * geom.span,
                 scale,
+                ch,
             )?
         };
         cx.write(o, fl.o)
