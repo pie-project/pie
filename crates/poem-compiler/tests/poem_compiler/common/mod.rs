@@ -3,7 +3,7 @@
 use poem::Platform;
 use poem_compiler::{
     Budget, Budgets, CompiledModel, DeviceProfile, Error, PATCH_LATTICE_FLOOR, PatchLadder,
-    compile_axes,
+    VoxelLadder, compile_axes,
 };
 use poem_ir::{ParamSource, RowAxis, Trace, Ty};
 
@@ -32,10 +32,10 @@ pub fn budgets_for(trace: &Trace) -> Budget {
     }
 }
 
-pub fn states_patches(trace: &Trace) -> bool {
+pub fn states(trace: &Trace, axis: RowAxis) -> bool {
     trace.values.iter().any(|decl| {
         matches!(&decl.ty, Ty::Tensor { shape, .. }
-            if shape.first().and_then(|dim| dim.axis()) == Some(RowAxis::Patches))
+            if shape.first().and_then(|dim| dim.axis()) == Some(axis))
     })
 }
 
@@ -59,14 +59,18 @@ pub fn patch_ladder_for(budget: &Budget) -> PatchLadder {
     }
 }
 
+/// The budgets a row's own axes need: a patch ladder for a tower, a voxel
+/// ladder for a VAE, as a serving shell derives them.
 pub fn budgets_of(trace: &Trace) -> Budgets {
     let budget = budgets_for(trace);
-    let budgets = Budgets::of(budget.clone());
-    if states_patches(trace) {
-        budgets.with_patches(patch_ladder_for(&budget))
-    } else {
-        budgets
+    let mut budgets = Budgets::of(budget.clone());
+    if states(trace, RowAxis::Patches) {
+        budgets = budgets.with_patches(patch_ladder_for(&budget));
     }
+    if states(trace, RowAxis::Voxels) {
+        budgets = budgets.with_voxels(VoxelLadder::new(4096, 4));
+    }
+    budgets
 }
 
 pub fn bake(trace: &Trace) -> Result<CompiledModel, Error> {

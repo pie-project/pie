@@ -54,9 +54,8 @@ fn every_conditional_region_clears_every_gate_and_every_other_one_does_not() {
         for platform in PLATFORMS {
             let trace = row.trace(platform);
             for profile in [DeviceProfile::default(), forced()] {
-                let Ok(compiled) = bake_with(&trace, &profile) else {
-                    continue;
-                };
+                let compiled = bake_with(&trace, &profile)
+                    .unwrap_or_else(|why| panic!("{deployment} on {platform:?} bakes: {why}"));
                 for at in 0..compiled.regions.len() {
                     let region = &compiled.regions[at];
                     let conditional = region.lowering != Lowering::AlwaysLaunch;
