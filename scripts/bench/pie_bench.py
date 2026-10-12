@@ -920,7 +920,11 @@ async def run(args: argparse.Namespace):
                                 for value in arrival_monotonic_ns
                             ]
                         if measured_epoch_monotonic_ns is not None:
-                            if first_arrival_s is not None:
+                            # A program may stamp its first token (`t0`) and
+                            # report no gaps after it (dflash-speculative-bench
+                            # lands tokens a round at a time): its row has a
+                            # TTFT and no per-token arrivals.
+                            if first_arrival_s is not None and (gaps or output_tokens == 1):
                                 arrivals = reconstruct_token_arrivals(
                                     first_arrival_s, gaps, output_tokens
                                 )
