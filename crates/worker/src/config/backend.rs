@@ -215,36 +215,3 @@ impl CudaNativeEngineOptions {
         Ok(())
     }
 }
-
-/// Engine options that became device-profile decisions, by engine, with the
-/// profile id each moved to.
-const MOVED_TO_PROFILE: &[(&str, &str, &str)] = &[
-    ("cuda_native", "graphs", "engine.graphs"),
-    ("cuda_native", "recording", "engine.recording"),
-    ("cuda_native", "pad", "engine.recording"),
-    ("cuda_native", "bodies", "engine.recording"),
-    ("cuda_native", "bodies_mem", "engine.recording"),
-    ("cuda_native", "fallback_copy", "engine.copies"),
-    ("cuda_native", "grouped", "compiler.grouped"),
-    ("cuda_native", "side_streams", "compiler.side_streams"),
-    ("metal", "tuning", "the kernel.* decisions"),
-];
-
-/// Refuse an option a device profile now holds, naming where it went: a
-/// chip's tuning lives in `$PIE_HOME/profiles/<backend>/user/<device>.toml`.
-pub(crate) fn moved_to_profile(engine: &str, options: &toml::Table) -> Result<()> {
-    for (owner, key, id) in MOVED_TO_PROFILE {
-        if *owner == engine && options.contains_key(*key) {
-            anyhow::bail!(
-                "[engine] {key} is gone: it is the device profile's `{id}` now. State it \
-                 in $PIE_HOME/profiles/{}/user/<device>.toml",
-                if engine == "cuda_native" {
-                    "cuda"
-                } else {
-                    engine
-                }
-            );
-        }
-    }
-    Ok(())
-}

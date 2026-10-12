@@ -49,13 +49,6 @@ fn profiles(doc: &toml::Table) -> Result<Option<std::path::PathBuf>, String> {
     let Some(vulkan) = table(doc) else {
         return Ok(None);
     };
-    if vulkan.contains_key("tuning") {
-        return Err(
-            "[vulkan.tuning] is gone: a device's tuning is its profile now. Write the \
-             decisions to change into $PIE_HOME/profiles/vulkan/user/<device>.toml"
-                .to_string(),
-        );
-    }
     match vulkan.get("profiles") {
         None => Ok(None),
         Some(toml::Value::String(dir)) if dir.trim().is_empty() => Ok(None),

@@ -46,13 +46,6 @@ fn profiles(doc: &toml::Table) -> Result<Option<std::path::PathBuf>, String> {
     let Some(metal) = doc.get("metal").and_then(toml::Value::as_table) else {
         return Ok(None);
     };
-    if metal.contains_key("tuning") {
-        return Err(
-            "[metal.tuning] is gone: a chip's tuning is its device profile now. Write the \
-             decisions to change into $PIE_HOME/profiles/metal/user/<device>.toml"
-                .to_string(),
-        );
-    }
     match metal.get("profiles") {
         None => Ok(None),
         Some(toml::Value::String(dir)) if dir.trim().is_empty() => Ok(None),
@@ -78,7 +71,6 @@ mod tests {
         a_boot_document_that_is_not_toml_is_refused_at_the_door();
         the_diagnostics_word_list_is_read_or_refused_by_name();
         the_shared_adapter_directory_is_read_and_an_empty_one_is_off();
-        a_tuning_table_is_refused_and_points_at_profiles();
         the_profiles_directory_is_read_or_refused_by_name();
     }
 
@@ -118,13 +110,6 @@ mod tests {
         assert_eq!(read("[model]\nadapter_dir = \"  \""), None, "empty is off");
         assert_eq!(read("[model]"), None, "and so is absent");
         assert_eq!(read(""), None);
-    }
-
-    fn a_tuning_table_is_refused_and_points_at_profiles() {
-        let Err(why) = open(b"[metal.tuning]\nsdpa_mma = false\n", nothing) else {
-            panic!("a [metal.tuning] table opened");
-        };
-        assert!(why.contains("profiles/metal/user"), "{why}");
     }
 
     fn the_profiles_directory_is_read_or_refused_by_name() {

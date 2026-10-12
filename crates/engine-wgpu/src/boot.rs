@@ -110,13 +110,6 @@ fn profiles(doc: &toml::Table) -> Result<Option<std::path::PathBuf>, String> {
     let Some(wgpu) = table(doc) else {
         return Ok(None);
     };
-    if wgpu.contains_key("tuning") {
-        return Err(
-            "[wgpu.tuning] is gone: an adapter's tuning is its profile now. Write the \
-             decisions to change into $PIE_HOME/profiles/wgpu/user/<adapter>.toml"
-                .to_string(),
-        );
-    }
     match wgpu.get("profiles") {
         None => Ok(None),
         Some(toml::Value::String(dir)) if dir.trim().is_empty() => Ok(None),
