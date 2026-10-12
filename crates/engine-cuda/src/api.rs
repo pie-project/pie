@@ -38,7 +38,7 @@ impl Default for World {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct DeviceBoot {
     pub ordinal: i32,
     pub world: World,
@@ -247,9 +247,9 @@ fn extents(stated: &BindExtents) -> eta_exec::Extents {
     }
 }
 
+/// Powers of two from the floor up to `max_tokens`, with `steps - 1` more
+/// between each pair.
 #[must_use]
-/// Row buckets up to `max_tokens`: powers of two from the floor, with
-/// `steps - 1` more between each pair (`engine.lattice_steps`), rounded up.
 pub(crate) fn default_lattice(max_tokens: u32, steps: u32) -> Vec<u32> {
     let steps = steps.max(1);
     let mut lattice: Vec<u32> = Vec::new();

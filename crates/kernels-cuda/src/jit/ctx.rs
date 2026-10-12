@@ -177,7 +177,6 @@ pub struct Ctx {
     region: core::cell::Cell<u32>,
     lane: core::cell::Cell<u32>,
 
-    /// The load's kernel decisions; the registry defaults until a load says.
     tuning: crate::tuning::Tuning,
 }
 
@@ -201,14 +200,12 @@ impl Ctx {
         }
     }
 
-    /// The load's kernel decisions.
     #[must_use]
     pub const fn with_tuning(mut self, tuning: crate::tuning::Tuning) -> Self {
         self.tuning = tuning;
         self
     }
 
-    /// Lay a load's kernel decisions on a context already open.
     pub fn set_tuning(&mut self, tuning: crate::tuning::Tuning) {
         self.tuning = tuning;
     }
@@ -218,6 +215,7 @@ impl Ctx {
         self.tuning
     }
 
+    #[must_use]
     pub const fn with_slabs(mut self, slabs: Slabs) -> Self {
         self.slabs = slabs;
         self
@@ -385,19 +383,6 @@ impl Ctx {
         i32::try_from(self.pad.get().extent(stated))
             .unwrap_or(rows)
             .max(rows)
-    }
-
-    #[allow(clippy::unused_self)]
-    #[must_use]
-    pub fn compute_capability_major(&self) -> Option<u32> {
-        #[cfg(feature = "cuda")]
-        {
-            crate::jit::device::compute_capability_major()
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            None
-        }
     }
 
     #[allow(clippy::unused_self)]

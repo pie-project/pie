@@ -1,10 +1,5 @@
 //! The GPU's profile: the CUDA registry, the facts this engine measures, the
 //! checked-in profiles, and resolution for one load.
-//!
-//! A profile is chosen by the GPU's name and applies whole or not at all;
-//! see `.wiki/device-profiles.md`. Kernel decisions are declared in
-//! `kernels-cuda`, fusions and compiler prices in `poem-compiler`; the
-//! engine's own are below.
 
 use std::path::Path;
 use std::sync::LazyLock;
@@ -22,7 +17,6 @@ pub const FACTS: &[Var] = &[
     Var::fixed("sms", Domain::COUNT),
 ];
 
-/// The recording axes a dynamic variable may name.
 pub const AXES: &[&str] = &["rows"];
 
 /// Whether fires are captured as CUDA graphs.
@@ -92,7 +86,6 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     r
 });
 
-/// Every decision the CUDA engine exposes.
 #[must_use]
 pub fn registry() -> &'static Registry {
     &REGISTRY
@@ -100,7 +93,6 @@ pub fn registry() -> &'static Registry {
 
 macro_rules! seeded {
     ($($file:literal),* $(,)?) => {
-        /// The profiles checked in with pie, as `(file name, text)`.
         pub const SEEDED: &[(&str, &str)] = &[
             $(($file, include_str!(concat!("../profiles/", $file)))),*
         ];
@@ -109,14 +101,11 @@ macro_rules! seeded {
 
 seeded!("nvidia-l40s.toml");
 
-/// Where CUDA's profiles live.
 pub static SHELF: Shelf = Shelf {
     backend: "cuda",
     seeded: SEEDED,
 };
 
-/// The facts of a GPU at compute capability `major.minor` with `sms`
-/// multiprocessors.
 #[must_use]
 pub fn facts(major: u32, minor: u32, sms: u32) -> Facts {
     Facts::of(registry())
@@ -257,9 +246,8 @@ pub fn resolve(device: &str, facts: &Facts, profiles: Option<&Path>) -> (Profile
 #[must_use]
 pub fn derived(facts: &Facts) -> Option<String> {
     let cc = facts.get("cc")?;
-    (cc >= 100).then(|| {
-        "api = 1\n[kernel]\ngemv.bf16 = \"narrow\"\nmla.path = \"naive\"\n".to_string()
-    })
+    (cc >= 100)
+        .then(|| "api = 1\n[kernel]\ngemv.bf16 = \"narrow\"\nmla.path = \"naive\"\n".to_string())
 }
 
 #[cfg(test)]
@@ -357,10 +345,6 @@ mod tests {
         fused.sort_unstable();
         shipped.sort_unstable();
         assert_eq!(fused, shipped);
-        assert_eq!(
-            kernels_cuda::tuning::Tuning::of(&registry().defaults()),
-            kernels_cuda::tuning::Tuning::default()
-        );
     }
 
     #[test]

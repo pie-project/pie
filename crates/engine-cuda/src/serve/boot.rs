@@ -66,23 +66,10 @@ pub struct Knobs {
     pub gpu_mem_utilization: f64,
     pub diagnostics: Diagnostics,
     pub nccl_transport: crate::comm::Transport,
-    /// `$PIE_HOME/profiles`, where a user's GPU profiles live; `None` reads
-    /// only the checked-in ones.
+    /// The user's profile directory; `None` reads only the checked-in ones.
     pub profiles: Option<std::path::PathBuf>,
-    /// A profile the caller resolved itself, used as is: a test or a
-    /// diagnostic that pins a decision (`chip::pinned`, `chip::profile`).
+    /// A profile used as is instead of resolving one (`chip::pinned`).
     pub chip: Option<profile::Profile>,
-}
-
-impl PartialEq for Knobs {
-    fn eq(&self, other: &Knobs) -> bool {
-        self.gpu_mem_utilization == other.gpu_mem_utilization
-            && self.diagnostics == other.diagnostics
-            && self.nccl_transport == other.nccl_transport
-            && self.profiles == other.profiles
-            && self.chip.as_ref().map(profile::Profile::source)
-                == other.chip.as_ref().map(profile::Profile::source)
-    }
 }
 
 impl Default for Knobs {

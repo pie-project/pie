@@ -200,13 +200,8 @@ pub(crate) fn prefill<P>(
     at: PrefillPoint,
     params: &P,
 ) -> Result<(), Error> {
-    let geometry = PrefillGeometry::derive(
-        op,
-        at.head_dim,
-        at.cta_tile_q,
-        KvWidth::BF16,
-        &at.device,
-    )?;
+    let geometry =
+        PrefillGeometry::derive(op, at.head_dim, at.cta_tile_q, KvWidth::BF16, &at.device)?;
     ctx.fire(
         op,
         Fire::at(FILE, prefill_symbol(op, &geometry, at.arm)?).apply(
@@ -236,13 +231,8 @@ pub(crate) fn prefill_ragged<P>(
     at: RaggedPoint,
     params: &P,
 ) -> Result<(), Error> {
-    let geometry = PrefillGeometry::derive(
-        op,
-        at.head_dim,
-        at.cta_tile_q,
-        KvWidth::BF16,
-        &at.device,
-    )?;
+    let geometry =
+        PrefillGeometry::derive(op, at.head_dim, at.cta_tile_q, KvWidth::BF16, &at.device)?;
     ctx.fire(
         op,
         Fire::at(FILE, prefill_ragged_symbol(op, &geometry, at.arm)?).apply(

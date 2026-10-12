@@ -18,7 +18,6 @@ pub struct Request<'a> {
     pub page_size: u32,
     pub enable_cuda_graph: bool,
     pub window_left: Option<u32>,
-    /// CTAs per SM the split grid fills (`kernel.sdpa.prefill.ctas_per_sm`).
     pub ctas_per_sm: u32,
 }
 
@@ -47,8 +46,6 @@ impl Request<'_> {
 }
 
 #[must_use]
-/// Every device served is sm_80 or newer, where a short request takes the
-/// 16-row tile.
 const fn determine_cta_tile_q(avg_packed_qo_len: u64, head_dim: u32) -> u32 {
     if head_dim >= 512 {
         if avg_packed_qo_len <= 32 {

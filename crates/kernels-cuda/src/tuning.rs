@@ -1,7 +1,5 @@
-//! Every hardware-dependent decision the CUDA kernels read, declared for the
-//! CUDA profile registry, and [`Tuning`]: the values one load runs under.
-//!
-//! Which GPU runs which value lives in `crates/engine-cuda/profiles/`.
+//! The hardware-dependent decisions the CUDA kernels read, and [`Tuning`]:
+//! the values one load runs under.
 
 use profile::{Anywhere, Decision, Profile, Registry};
 
@@ -145,7 +143,6 @@ pub struct MoeAffineWmma;
 #[decision(id = "kernel.moe.affine_grouped_from", constant(range(1..=65_536)), default = 16, tune = search)]
 pub struct MoeAffineGroupedFrom(pub u32);
 
-/// Register every decision this crate reads.
 pub fn register(registry: &mut Registry) {
     registry
         .add::<MoeGrouped>()
@@ -206,8 +203,7 @@ pub struct Tuning {
 }
 
 impl Tuning {
-    /// The registry defaults, for a context no load has tuned (kernel
-    /// tests); a test holds the two equal.
+    /// The registry defaults; a test holds the two equal.
     pub const DEFAULT: Tuning = Tuning {
         moe_grouped: true,
         mxfp4_grouped: true,
@@ -266,12 +262,6 @@ impl Tuning {
     }
 }
 
-impl Default for Tuning {
-    fn default() -> Tuning {
-        Tuning::DEFAULT
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +270,6 @@ mod tests {
     fn the_default_tuning_is_the_registry_defaults() {
         let mut r = Registry::new("cuda", &[], &["rows"]);
         register(&mut r);
-        assert_eq!(Tuning::of(&r.defaults()), Tuning::default());
+        assert_eq!(Tuning::of(&r.defaults()), Tuning::DEFAULT);
     }
 }

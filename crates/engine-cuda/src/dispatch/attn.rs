@@ -165,10 +165,6 @@ impl Run<'_> {
                             built.stage(self.ctx())?;
                             StructSlot::Prefill(built)
                         }
-                        StructKind::AttnPrefillPlanSm90 => panic!(
-                            "an sm90 plan kind on a cuda trace is a trace bug: no CUDA \
-                             trace plans one"
-                        ),
                         other => panic!(
                             "`attention.plan_prefill` defines a {other:?}, which is no \
                              prefill plan kind"
@@ -282,22 +278,22 @@ impl Run<'_> {
                 log_alpha,
                 o,
             } => attn::prefill_rel(
-                    self.ctx(),
-                    self.ragged_q(*q),
-                    self.prefill_plan(*plan),
-                    &self.pool_absolute(*cache),
-                    attn::RelBias {
-                        bias: self.tensor(*bias),
-                        extent: *extent,
-                        log_floor: *log_floor,
-                        log_alpha: *log_alpha,
-                    },
-                    *window,
-                    *head_dim,
-                    *kv_heads,
-                    *sm_scale,
-                    &mut self.tensor(*o),
-                ),
+                self.ctx(),
+                self.ragged_q(*q),
+                self.prefill_plan(*plan),
+                &self.pool_absolute(*cache),
+                attn::RelBias {
+                    bias: self.tensor(*bias),
+                    extent: *extent,
+                    log_floor: *log_floor,
+                    log_alpha: *log_alpha,
+                },
+                *window,
+                *head_dim,
+                *kv_heads,
+                *sm_scale,
+                &mut self.tensor(*o),
+            ),
             Attention::Prefill {
                 q,
                 plan,
@@ -308,16 +304,16 @@ impl Run<'_> {
                 sm_scale,
                 o,
             } => attn::prefill(
-                    self.ctx(),
-                    self.ragged_q(*q),
-                    self.prefill_plan(*plan),
-                    &self.pool_absolute(*cache),
-                    *window,
-                    *head_dim,
-                    *kv_heads,
-                    *sm_scale,
-                    &mut self.tensor(*o),
-                ),
+                self.ctx(),
+                self.ragged_q(*q),
+                self.prefill_plan(*plan),
+                &self.pool_absolute(*cache),
+                *window,
+                *head_dim,
+                *kv_heads,
+                *sm_scale,
+                &mut self.tensor(*o),
+            ),
             Attention::Masked {
                 kv_heads: _,
                 causal: _,

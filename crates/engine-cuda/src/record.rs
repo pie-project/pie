@@ -357,10 +357,8 @@ pub fn cuts(
     Ok(cuts)
 }
 
-/// The most recorded bodies a load keeps, a count beside the byte budget
-/// `engine.recording = { use = "bodies", mem_mb }`: whichever is reached
-/// first stops arming (arming reports which). The count bounds host-side
-/// bookkeeping and graph handles, which bytes do not measure.
+/// Bodies a load keeps beside `mem_mb`: the count bounds host bookkeeping and
+/// graph handles, which bytes do not measure.
 pub const MAX_BODIES: usize = 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
