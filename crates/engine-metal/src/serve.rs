@@ -344,12 +344,7 @@ impl Shell {
         });
         let device = Context::bind()?;
         let perf_cores = crate::chip::perf_cores();
-        let measured = crate::chip::facts(
-            device.family(),
-            device.cores(),
-            perf_cores,
-            crate::chip::ane_loads(),
-        );
+        let measured = crate::chip::measured(&device, perf_cores);
         let (chip, chip_report) =
             crate::chip::resolve(device.name(), &measured, boot.profiles.as_deref());
         crate::chip::tell_untuned(device.name(), &chip_report);

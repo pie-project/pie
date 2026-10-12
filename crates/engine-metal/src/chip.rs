@@ -9,6 +9,7 @@ use profile::{Decision, Domain, Facts, Profile, Registry, Report, Shelf, Var};
 const FACTS: &[Var] = &[
     Var::fixed("family", Domain::COUNT),
     Var::fixed("cores", Domain::COUNT),
+    Var::fixed("cores_from", Domain::Enum(&["registry", "model"])),
     Var::fixed("perf_cores", Domain::COUNT),
     Var::fixed("ane", Domain::Bool),
 ];
@@ -243,12 +244,22 @@ pub fn ane_loads() -> bool {
     }
 }
 
+/// The facts of the device `device` opened, with where its GPU core count
+/// came from.
+#[must_use]
+pub fn measured(device: &crate::device::Context, perf_cores: u32) -> Facts {
+    let measured = facts(device.family(), device.cores(), perf_cores, ane_loads());
+    match device.cores_from() {
+        Some(from) => measured.word("cores_from", from.word()),
+        None => measured,
+    }
+}
+
 /// `None` without a Metal 4 device.
 #[must_use]
 pub fn probe() -> Option<(String, Facts)> {
     let device = crate::device::Context::bind().ok()?;
-    let facts = facts(device.family(), device.cores(), perf_cores(), ane_loads());
-    Some((device.name().to_string(), facts))
+    Some((device.name().to_string(), measured(&device, perf_cores())))
 }
 
 #[must_use]

@@ -814,19 +814,14 @@ pub fn run(
     let device = Context::bind().map_err(|e| e.to_string())?;
     let name = device.name().to_string();
     let cores = device.cores();
-    let facts = crate::chip::facts(
-        device.family(),
-        cores,
-        crate::chip::perf_cores(),
-        crate::chip::ane_loads(),
-    );
+    let facts = crate::chip::measured(&device, crate::chip::perf_cores());
     let (base, report) = crate::chip::resolve(&name, &facts, profiles);
     say(&format!(
         "{name}: {}, family {}; starting from {}",
-        cores.map_or_else(
-            || "GPU cores unreported".to_string(),
-            |cores| format!("{cores} GPU cores")
-        ),
+        match (cores, device.cores_from()) {
+            (Some(cores), Some(from)) => format!("{cores} GPU cores ({from})"),
+            _ => "GPU cores unreported".to_string(),
+        },
         device.family(),
         report.used
     ));
