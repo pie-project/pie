@@ -364,6 +364,141 @@ impl Measured {
     }
 }
 
+/// One decision the end-to-end search tries: each candidate as the
+/// profile TOML that sets it, and whether the candidate can only matter by
+/// changing the compiled plan (a price, a fusion), so an unchanged plan is
+/// skipped without serving.
+#[derive(Clone, Debug)]
+pub struct Knob {
+    pub id: &'static str,
+    /// `(label, overrides)`: the value as a reader sees it, and the TOML.
+    pub candidates: Vec<(String, String)>,
+    pub plan_only: bool,
+}
+
+/// Decisions the search leaves alone, and why.
+const SEARCH_SKIPS: &[(&str, &str)] = &[
+    ("compiler.side_streams", "Metal serves every region from one queue"),
+    ("compiler.cost.collective_us", "Metal serves one device"),
+];
+
+/// The decisions the end-to-end search tries on this registry, in order:
+/// kernels, the Neural Engine, the engine, fusions, then prices. `kernel.qmm`
+/// and `kernel.qmm_fp16` are measured kernel by kernel instead; a `never`
+/// decision is never touched.
+#[must_use]
+pub fn knobs(base: &Profile, _depth: Depth) -> Vec<Knob> {
+    use profile::spec::{Kind, Shape};
+    let mut out: Vec<Knob> = Vec::new();
+    for (spec, rungs, _) in base.entries() {
+        if spec.tune == profile::Tune::Never
+            || spec.id == Qmm::spec().id
+            || spec.id == QmmFp16::spec().id
+            || SEARCH_SKIPS.iter().any(|(id, _)| *id == spec.id)
+        {
+            continue;
+        }
+        let (domain, key) = spec.id.split_once('.').expect("an id is domain.name");
+        let set = |value: &str| format!("[{domain}]\n{key} = {value}\n");
+        let current = profile::render::value_toml(spec, rungs);
+        let mut values: Vec<String> = Vec::new();
+        // A whole number is tried at half to double in quarter steps: fine
+        // enough to place a share such as the Neural Engine's; a price only
+        // at half and double, since its plan moves in steps anyway.
+        let scaled = |v: f64, lo: f64, hi: f64, int: bool| -> Vec<f64> {
+            let steps: &[f64] = if int { &[0.5, 0.75, 1.25, 1.5, 2.0] } else { &[0.5, 2.0] };
+            steps
+                .iter()
+                .map(|m| (v * m).clamp(lo, hi))
+                .map(|x| if int { x.round() } else { x })
+                .filter(|x| (x - v).abs() > f64::EPSILON)
+                .collect()
+        };
+        match spec.shape {
+            Shape::Flag => {
+                if !spec.vars.is_empty() {
+                    continue;
+                }
+                values.push(if current == "false" { "true" } else { "false" }.to_string());
+            }
+            Shape::Constant(c) => match c.kind {
+                Kind::Ints(set) => values.extend(set.iter().map(i64::to_string)),
+                Kind::Int { lo, hi } if spec.vars.is_empty() => {
+                    let v: f64 = current.replace('_', "").parse().unwrap_or(1.0);
+                    values.extend(
+                        scaled(v, lo as f64, hi as f64, true)
+                            .into_iter()
+                            .map(|x| (x as i64).to_string()),
+                    );
+                }
+                Kind::Float { lo, hi } if spec.vars.is_empty() => {
+                    let v: f64 = current.replace('_', "").parse().unwrap_or(1.0);
+                    values.extend(scaled(v, lo, hi, false).into_iter().map(|x| format!("{x:.1}")));
+                }
+                _ => continue,
+            },
+            Shape::Choice(alternatives) => {
+                if !spec.vars.is_empty() {
+                    continue;
+                }
+                for alt in alternatives {
+                    // An alternative's constants: every value of a set, or the
+                    // default and its half and double for a range.
+                    let mut bodies: Vec<String> = vec![format!("use = \"{}\"", alt.name)];
+                    for c in alt.constants {
+                        let options: Vec<String> = match c.kind {
+                            Kind::Ints(set) => set.iter().map(i64::to_string).collect(),
+                            Kind::Int { lo, hi } => {
+                                let d: f64 = c.default.replace('_', "").parse().unwrap_or(1.0);
+                                std::iter::once(d)
+                                    .chain(scaled(d, lo as f64, hi as f64, true))
+                                    .map(|x| (x as i64).to_string())
+                                    .collect()
+                            }
+                            _ => vec![c.default.to_string()],
+                        };
+                        bodies = bodies
+                            .iter()
+                            .flat_map(|b| options.iter().map(move |o| format!("{b}, {} = {o}", c.name)))
+                            .collect();
+                    }
+                    for b in bodies {
+                        values.push(if alt.constants.is_empty() {
+                            format!("\"{}\"", alt.name)
+                        } else {
+                            format!("{{ {b} }}")
+                        });
+                    }
+                }
+            }
+        }
+        let normal = |v: &str| v.replace(' ', "");
+        let candidates: Vec<(String, String)> = values
+            .into_iter()
+            .filter(|v| normal(v) != normal(&current))
+            .map(|v| (v.clone(), set(&v)))
+            .collect();
+        if candidates.is_empty() {
+            continue;
+        }
+        let plan_only = matches!(spec.tune, profile::Tune::Price) || domain == "fuse";
+        out.push(Knob {
+            id: spec.id,
+            candidates,
+            plan_only,
+        });
+    }
+    let rank = |id: &str| match id.split('.').next() {
+        _ if id.starts_with("kernel.ane") => 1,
+        Some("kernel") => 0,
+        Some("engine") => 2,
+        Some("fuse") => 3,
+        _ => 4,
+    };
+    out.sort_by_key(|k| rank(k.id));
+    out
+}
+
 /// One decision's outcome, for the report.
 #[derive(Clone, Debug)]
 pub struct Line {
@@ -373,7 +508,7 @@ pub struct Line {
 
 /// The fitted values of the measured decisions, as profile TOML under
 /// `[kernel]`, and the report lines.
-pub fn fit(measured: &Measured, grid: &Grid, cores: u32) -> Result<(String, Vec<Line>), String> {
+pub fn fit(measured: &Measured, grid: &Grid, cores: u32) -> Result<(Vec<(String, String)>, Vec<Line>), String> {
     let mut lines = Vec::new();
     // `qmm_fp16`: whether the fp16 format's best time beats the emulated
     // format's over the 4-bit, 64-group points, weighted as decode-heavy.
@@ -446,8 +581,42 @@ pub fn fit(measured: &Measured, grid: &Grid, cores: u32) -> Result<(String, Vec<
         id: spec.id,
         text,
     });
-    let toml = format!("[kernel]\nqmm = {ladder}\nqmm_fp16 = {fp16_on}\n");
-    Ok((toml, lines))
+    let entries = vec![
+        (spec.id.to_string(), ladder),
+        (QmmFp16::spec().id.to_string(), fp16_on.to_string()),
+    ];
+    Ok((entries, lines))
+}
+
+/// `(decision id, TOML value)` entries as profile TOML, a table a domain.
+#[must_use]
+pub fn render_overrides(entries: &[(String, String)]) -> String {
+    let mut domains: Vec<&str> = Vec::new();
+    for (id, _) in entries {
+        let d = id.split('.').next().unwrap_or_default();
+        if !domains.contains(&d) {
+            domains.push(d);
+        }
+    }
+    let mut out = String::new();
+    for d in domains {
+        let _ = writeln!(out, "[{d}]");
+        for (id, value) in entries.iter().filter(|(id, _)| id.split('.').next() == Some(d)) {
+            let _ = writeln!(out, "{} = {value}", &id[d.len() + 1..]);
+        }
+    }
+    out
+}
+
+/// `entries` with `id` set to `value`, in place or appended.
+#[must_use]
+pub fn with_entry(entries: &[(String, String)], id: &str, value: &str) -> Vec<(String, String)> {
+    let mut out = entries.to_vec();
+    match out.iter_mut().find(|(i, _)| i == id) {
+        Some(e) => e.1 = value.to_string(),
+        None => out.push((id.to_string(), value.to_string())),
+    }
+    out
 }
 
 /// A point's coordinates in `kernel.qmm`'s variable order: rows, fill, n,
@@ -627,9 +796,10 @@ mod device {
     /// The lane counts a decode step is timed at.
     const LANES: [usize; 3] = [1, 4, 8];
 
-    /// A prompt's times, each lane count's step times, and the prompt's
-    /// readout.
-    type Served = (Vec<f64>, Vec<Vec<f64>>, Vec<f32>);
+    /// One serving: a prompt's times, each lane count's step times, the
+    /// prompt's readout, the decisions the load read, and why the Neural
+    /// Engine refused its programs, if it did (the GPU then served alone).
+    struct Served(Vec<f64>, Vec<Vec<f64>>, Vec<f32>, Vec<&'static str>, Option<String>);
 
     fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<Served, String> {
         use poem::{Platform, Request};
@@ -664,6 +834,25 @@ mod device {
             residency: crate::ResidencyPlan::default(),
         })
         .map_err(|e| e.to_string())?;
+        // A Neural Engine split runs only once its programs compile; time
+        // the load as it will serve, not the GPU-alone stretch before.
+        let mut refused = None;
+        if let Some(ane) = shell.neural_engine() {
+            let waited = Instant::now();
+            loop {
+                match ane.compiled() {
+                    Some(Ok(())) => break,
+                    Some(Err(why)) => {
+                        refused = Some(why.lines().next().unwrap_or("").chars().take(100).collect());
+                        break;
+                    }
+                    None if waited.elapsed().as_secs() > 1200 => {
+                        return Err("the Neural Engine programs did not compile in 20 minutes".into());
+                    }
+                    None => std::thread::sleep(std::time::Duration::from_millis(250)),
+                }
+            }
+        }
         let token = |i: u32| 100 + (i * 7919) % 5000;
         let prompt: Vec<u32> = (0..PROMPT).map(token).collect();
         // One fire of `lanes`: each lane's tokens into its own slot.
@@ -712,9 +901,177 @@ mod device {
             }
             decode.push(times);
         }
+        let read = shell.tuning().profile().read();
         drop(shell);
         let _ = std::fs::remove_dir_all(&dir);
-        Ok((prefill, decode, readout))
+        Ok(Served(prefill, decode, readout, read, refused))
+    }
+
+    /// The fused trace and compiled plan a load under `text` runs: two
+    /// files with the same plan serve the same, so a price or a fusion that
+    /// leaves the plan alone needs no serving.
+    fn plan_of(
+        deployment: &str,
+        text: &str,
+        cores: u32,
+    ) -> Option<(poem_ir::Trace, poem_compiler::CompiledModel)> {
+        let profile = crate::chip::registry().load_user(text, "plan").ok()?;
+        let row = poem_compiler::catalog::deployment(deployment)?;
+        let trace = poem_compiler::fuse::fuse(
+            row.trace(poem::Platform::Metal),
+            &poem_compiler::fuse::flags::kernels(&profile),
+        );
+        let slots = *LANES.iter().max().expect("lanes") as u32;
+        let compiled = poem_compiler::compile_axes(
+            &trace,
+            &poem_compiler::Budgets::of(poem_compiler::Budget::new(slots, CONTEXT)),
+            &poem_compiler::DeviceProfile::of(&profile, cores, &[], &[]),
+        )
+        .ok()?;
+        Some((trace, compiled))
+    }
+
+    /// One serving's weighted time against another's: the prompt and the
+    /// one-lane step count 0.3 each, the 4- and 8-lane steps 0.2.
+    fn relative(got: &Served, against: &Served) -> f64 {
+        let m = |v: &[f64]| median(v.to_vec());
+        let mut r = 0.3 * m(&got.0) / m(&against.0);
+        for (i, w) in [0.3, 0.2, 0.2].iter().enumerate() {
+            r += w * m(&got.1[i]) / m(&against.1[i]);
+        }
+        r
+    }
+
+    fn agrees(a: &[f32], b: &[f32]) -> bool {
+        let (mut dot, mut aa, mut bb) = (0.0f64, 0.0f64, 0.0f64);
+        for (&x, &y) in a.iter().zip(b) {
+            dot += f64::from(x) * f64::from(y);
+            aa += f64::from(x) * f64::from(x);
+            bb += f64::from(y) * f64::from(y);
+        }
+        let top = |r: &[f32]| (0..r.len()).fold(0, |b, i| if r[i] > r[b] { i } else { b });
+        dot / (aa * bb).sqrt() >= 0.99 && top(a) == top(b)
+    }
+
+    /// Coordinate descent over `knobs`, serving `deployment` end to end:
+    /// each decision's candidates are served against the incumbent, and
+    /// the fastest is taken if it beats it by more than the noise and reads
+    /// the same.
+    #[allow(clippy::too_many_arguments)]
+    fn search(
+        artifact: &Path,
+        deployment: &str,
+        device: &str,
+        base: &Profile,
+        facts: &profile::Facts,
+        cores: u32,
+        mut chosen: Vec<(String, String)>,
+        knobs: &[super::Knob],
+        say: &mut dyn FnMut(&str),
+    ) -> Result<(Vec<(String, String)>, Vec<Line>), String> {
+        let file = |entries: &[(String, String)]| {
+            super::assemble(base, device, facts, &super::render_overrides(entries), &[])
+        };
+        let mut incumbent_text = file(&chosen)?;
+        let mut incumbent = serve(artifact, deployment, device, &incumbent_text)?;
+        // What this model reads: a kernel decision it never asks cannot
+        // change how it serves, so it is not served for.
+        let read = incumbent.3.clone();
+        let mut lines = Vec::new();
+        let ane_refused = incumbent.4.clone();
+        for knob in knobs {
+            if let Some(why) = ane_refused.as_ref().filter(|_| knob.id.starts_with("kernel.ane")) {
+                let text = format!("kept; the Neural Engine refuses programs on this machine ({why})");
+                say(&format!("{}: {text}", knob.id));
+                lines.push(Line { id: knob.id, text });
+                continue;
+            }
+            if !knob.plan_only && !read.contains(&knob.id) {
+                let text = format!("kept; {deployment} never reads it");
+                say(&format!("{}: {text}", knob.id));
+                lines.push(Line { id: knob.id, text });
+                continue;
+            }
+            let incumbent_plan = if knob.plan_only {
+                plan_of(deployment, &incumbent_text, cores)
+            } else {
+                None
+            };
+            let mut best: Option<(f64, String, String, Served)> = None;
+            let mut notes: Vec<String> = Vec::new();
+            // The incumbent again, served just before its rivals: drift
+            // between servings lands on both, and how far it moved since
+            // its last serving is the noise a rival must beat twice over.
+            let mut bar = 1.0 / Check::NOISE;
+            let mut fresh = true;
+            for (label, _) in &knob.candidates {
+                let trial = super::with_entry(&chosen, knob.id, label);
+                let text = match file(&trial) {
+                    Ok(t) => t,
+                    Err(why) => {
+                        notes.push(format!("{label} refused ({})", why.lines().next().unwrap_or("")));
+                        continue;
+                    }
+                };
+                if knob.plan_only
+                    && incumbent_plan.is_some()
+                    && plan_of(deployment, &text, cores) == incumbent_plan
+                {
+                    notes.push(format!("{label} plans the same"));
+                    continue;
+                }
+                if fresh {
+                    fresh = false;
+                    let again = serve(artifact, deployment, device, &incumbent_text)?;
+                    let noise = (relative(&again, &incumbent) - 1.0).abs();
+                    bar = bar.min(1.0 - 2.0 * noise);
+                    incumbent = again;
+                }
+                let got = match serve(artifact, deployment, device, &text) {
+                    Ok(Served(.., Some(why))) if ane_refused.is_none() => {
+                        notes.push(format!("{label}: the Neural Engine refused it ({why})"));
+                        continue;
+                    }
+                    Ok(g) => g,
+                    Err(why) => {
+                        let why: String = why.lines().next().unwrap_or("").chars().take(100).collect();
+                        notes.push(format!("{label} did not serve ({why})"));
+                        continue;
+                    }
+                };
+                let r = relative(&got, &incumbent);
+                say(&format!("  {} = {label}: {:+.1}%", knob.id, (r - 1.0) * 100.0));
+                if !agrees(&got.2, &incumbent.2) {
+                    notes.push(format!("{label} reads differently"));
+                    continue;
+                }
+                if best.as_ref().is_none_or(|(b, ..)| r < *b) {
+                    best = Some((r, label.clone(), text, got));
+                }
+            }
+            let text = match best {
+                Some((r, label, text, got)) if r < bar => {
+                    chosen = super::with_entry(&chosen, knob.id, &label);
+                    incumbent_text = text;
+                    incumbent = got;
+                    format!("{label}: {:.1}% faster end to end", (1.0 - r) * 100.0)
+                }
+                Some((r, label, ..)) => format!(
+                    "kept; the best other, {label}, was {:+.1}% (a change must beat {:.1}%)",
+                    (r - 1.0) * 100.0,
+                    (1.0 - bar) * 100.0
+                ),
+                None => "kept; no other candidate served".to_string(),
+            };
+            let text = if notes.is_empty() {
+                text
+            } else {
+                format!("{text} ({})", notes.join("; "))
+            };
+            say(&format!("{}: {text}", knob.id));
+            lines.push(Line { id: knob.id, text });
+        }
+        Ok((chosen, lines))
     }
 
     fn median(mut v: Vec<f64>) -> f64 {
@@ -730,8 +1087,8 @@ mod device {
         today: &str,
         tuned: &str,
     ) -> Result<Check, String> {
-        let (p0, d0, r0) = serve(artifact, deployment, device, today)?;
-        let (p1, d1, r1) = serve(artifact, deployment, device, tuned)?;
+        let Served(p0, d0, r0, ..) = serve(artifact, deployment, device, today)?;
+        let Served(p1, d1, r1, ..) = serve(artifact, deployment, device, tuned)?;
         let (mut dot, mut aa, mut bb) = (0.0f64, 0.0f64, 0.0f64);
         for (&x, &y) in r0.iter().zip(&r1) {
             dot += f64::from(x) * f64::from(y);
@@ -934,20 +1291,33 @@ mod device {
             say(&format!("measurements kept in {}", kept.display()));
             m
         };
-        let (tuned, mut lines) = super::fit(&measured, &grid, cores)?;
-        for spec in crate::chip::registry().specs() {
-            if spec.tune == profile::Tune::Search
-                && !lines.iter().any(|l| l.id == spec.id)
-            {
-                lines.push(Line {
-                    id: spec.id,
-                    text: "not measured yet; copied from the current profile".to_string(),
-                });
+        let (mut chosen, mut lines) = super::fit(&measured, &grid, cores)?;
+        let knobs = super::knobs(&base, depth);
+        match models.first() {
+            Some((artifact, deployment)) => {
+                say(&format!(
+                    "searching {} decisions end to end on {deployment}",
+                    knobs.len()
+                ));
+                let (found, searched) =
+                    search(artifact, deployment, &name, &base, &facts, cores, chosen, &knobs, say)?;
+                chosen = found;
+                lines.extend(searched);
+            }
+            None => {
+                for k in &knobs {
+                    lines.push(Line {
+                        id: k.id,
+                        text: "not searched: no model to serve (import one, or pass --check)"
+                            .to_string(),
+                    });
+                }
             }
         }
+        let tuned = super::render_overrides(&chosen);
         let tuned_ids: Vec<String> = lines
             .iter()
-            .filter(|l| !l.text.starts_with("not measured"))
+            .filter(|l| !l.text.starts_with("not searched"))
             .map(|l| format!("\"{}\"", l.id))
             .collect();
         let today = super::assemble(&base, &name, &facts, "", &[])?;
@@ -1368,7 +1738,8 @@ mod tests {
             points,
             wrong: Vec::new(),
         };
-        let (tuned, lines) = fit(&measured, &grid, 40).unwrap();
+        let (entries, lines) = fit(&measured, &grid, 40).unwrap();
+        let tuned = render_overrides(&entries);
         assert!(
             tuned.contains("{ when = \"rows >= 16\", use = \"tiled\", crossover_tg = 64 }"),
             "{tuned}"
@@ -1450,5 +1821,36 @@ mod tests {
         assert_eq!(back.points[0].bank, m.points[0].bank);
         assert_eq!(back.wrong, m.wrong);
         assert!(Measured::from_text(&m.to_text("x"), &candidates[1..]).is_err());
+    }
+
+    #[test]
+    fn every_search_candidate_reads_against_the_registry() {
+        let facts = crate::chip::facts(10, 40, true);
+        let (base, _) = crate::chip::resolve("Apple M5 Max", &facts, None);
+        let registry = crate::chip::registry();
+        let knobs = knobs(&base, Depth::Full);
+        let ids: Vec<&str> = knobs.iter().map(|k| k.id).collect();
+        for want in ["kernel.sdpa.prefill", "kernel.gdn.scan", "kernel.ane.mlp", "fuse.mlp_swiglu", "compiler.launch_us"] {
+            assert!(ids.contains(&want), "{want} not searched: {ids:?}");
+        }
+        assert!(!ids.contains(&"kernel.sdpa.kv_q8") && !ids.contains(&"kernel.qmm"));
+        for k in &knobs {
+            for (label, text) in &k.candidates {
+                registry
+                    .overlay(&base, text, base.target().clone(), Source::User("t".into()))
+                    .unwrap_or_else(|e| panic!("{} = {label}: {e}", k.id));
+            }
+        }
+    }
+
+    #[test]
+    fn a_load_reads_only_the_decisions_it_evaluates() {
+        let (base, _) = crate::chip::resolve("Apple M4 Max", &crate::chip::facts(9, 40, true), None);
+        let tuning = kernels_metal::Tuning::new(base.clone(), false, 40);
+        let _ = tuning.qmm_mpp();
+        assert!(base.read().is_empty(), "sizing at load is not a read: {:?}", base.read());
+        let _ = tuning.qmm(&tuning.qmm_at(8, 4096, 4096, 4, 64));
+        // The point reads the fp16 flag for its format.
+        assert_eq!(base.read(), vec!["kernel.qmm", "kernel.qmm_fp16"]);
     }
 }
