@@ -14,7 +14,6 @@ pub struct Request<'a> {
     pub page_size: u32,
     pub head_dim: u32,
     pub enable_cuda_graph: bool,
-    /// A split chunk holds at least 128 keys rather than one page.
     pub chunk_floor_128: bool,
 }
 

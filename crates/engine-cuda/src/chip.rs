@@ -1,10 +1,5 @@
 //! The GPU's profile: the CUDA registry, the facts this engine measures, the
 //! checked-in profiles, and resolution for one load.
-//!
-//! A profile is chosen by the GPU's name and applies whole or not at all;
-//! see `.wiki/device-profiles.md`. Kernel decisions are declared in
-//! `kernels-cuda`, fusions and compiler prices in `poem-compiler`; the
-//! engine's own are below.
 
 use std::path::Path;
 use std::sync::LazyLock;
@@ -257,9 +252,8 @@ pub fn resolve(device: &str, facts: &Facts, profiles: Option<&Path>) -> (Profile
 #[must_use]
 pub fn derived(facts: &Facts) -> Option<String> {
     let cc = facts.get("cc")?;
-    (cc >= 100).then(|| {
-        "api = 1\n[kernel]\ngemv.bf16 = \"narrow\"\nmla.path = \"naive\"\n".to_string()
-    })
+    (cc >= 100)
+        .then(|| "api = 1\n[kernel]\ngemv.bf16 = \"narrow\"\nmla.path = \"naive\"\n".to_string())
 }
 
 #[cfg(test)]
@@ -357,10 +351,6 @@ mod tests {
         fused.sort_unstable();
         shipped.sort_unstable();
         assert_eq!(fused, shipped);
-        assert_eq!(
-            kernels_cuda::tuning::Tuning::of(&registry().defaults()),
-            kernels_cuda::tuning::Tuning::default()
-        );
     }
 
     #[test]

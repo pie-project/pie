@@ -14,11 +14,9 @@ pub struct Device {
 }
 
 impl Device {
-    /// The oldest compute capability (major) the CUDA engine serves: sm_80.
     pub const FLOOR_MAJOR: u32 = 8;
 
-    /// An L40S's figures, for tests and fixtures that need a concrete
-    /// device. Never a stand-in for one the probe could not read.
+    /// For tests; never a stand-in for a device the probe could not read.
     pub const L40S: Self = Self {
         num_sm: 142,
         cc_major: 8,
@@ -251,18 +249,14 @@ pub struct Toggles {
 
     pub window_split: bool,
 
-    /// A split decode chunk holds at least 128 keys.
     pub chunk_floor_128: bool,
 
-    /// CTAs per SM a split prefill grid fills.
     pub prefill_ctas_per_sm: u32,
 
-    /// The most requests an eager decode serves unsplit and unplanned.
     pub static_max_requests: u32,
 }
 
 impl Toggles {
-    /// The decode scheduler's switches, from the load's kernel decisions.
     #[must_use]
     pub const fn of(tuning: crate::tuning::Tuning) -> Self {
         Self {
@@ -474,7 +468,6 @@ pub fn plan_prefill(
 pub use crate::attn::sched_prefill::{
     graph_padding as prefill_graph_padding, partial_rows as prefill_partial_rows,
 };
-
 
 #[allow(clippy::too_many_arguments)]
 pub fn plan_mla(

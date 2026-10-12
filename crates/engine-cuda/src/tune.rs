@@ -1,8 +1,5 @@
-//! `pie tune` on CUDA: every decision this backend does not mark `never` is
-//! searched end to end on served models (`profile::search`), and the result
-//! is written as a complete profile for the user's shelf. CUDA's kernel
-//! decisions are flags without a shape, so there is no kernel bench here.
-//! `.wiki/pie-tune.md` holds the design.
+//! `pie tune` on CUDA: every searchable decision is searched end to end on
+//! served models (`profile::search`); there is no kernel bench.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -65,11 +62,14 @@ fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, St
         .ok_or_else(|| format!("no catalog row `{deployment}`"))?;
     let trace = row.trace(Platform::Cuda);
     let source = ztensor_compat::index(artifact).map_err(|e| e.to_string())?;
-    let contract = poem::import::own_contract(&source, &trace.params, row.deploy.tp, Platform::Cuda)
-        .map_err(|e| e.to_string())?;
+    let contract =
+        poem::import::own_contract(&source, &trace.params, row.deploy.tp, Platform::Cuda)
+            .map_err(|e| e.to_string())?;
     drop(source);
-    let target = checkpoint::plan::StorageTarget::for_backend(checkpoint::types::BackendKind::Cuda, 0, 1);
-    let prospect = crate::weights::prospect(&trace, &contract, artifact, target).map_err(|e| e.to_string())?;
+    let target =
+        checkpoint::plan::StorageTarget::for_backend(checkpoint::types::BackendKind::Cuda, 0, 1);
+    let prospect =
+        crate::weights::prospect(&trace, &contract, artifact, target).map_err(|e| e.to_string())?;
     let residency = crate::experts::Plan::cut(
         &prospect.ranking,
         crate::experts::Budgets {
@@ -85,15 +85,7 @@ fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, St
         contract: &contract,
         checkpoint: artifact,
         budget: poem_compiler::Budget::new(slots, CONTEXT),
-        // A vision row states its patch ladder even for a text prompt.
-        patches: crate::api::patch_ladder(
-            &trace,
-            &engine::load::Budgets {
-                max_lanes: slots,
-                max_tokens: CONTEXT,
-                ..engine::load::Budgets::default()
-            },
-        ),
+        patches: patches(&trace, slots),
         page_size: 16,
         context: CONTEXT,
         slots,
@@ -112,19 +104,23 @@ fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, St
     .map_err(|e| e.to_string())?;
     let token = |i: u32| 100 + (i * 7919) % 5000;
     let prompt: Vec<u32> = (0..PROMPT).map(token).collect();
-    let fire = |shell: &mut crate::Shell, lanes: &[(u32, &[u32])]| -> Result<(f64, Vec<f32>), String> {
-        let lanes: Vec<crate::Lane> = lanes
-            .iter()
-            .map(|&(slot, tokens)| crate::Lane {
-                slot,
-                word: trace.facts.word(&Request::new(tokens.len() as u32, false)),
-                tokens,
-            })
-            .collect();
-        let began = Instant::now();
-        let out = shell.fire(&lanes).map_err(|e| e.to_string())?;
-        Ok((began.elapsed().as_secs_f64() * 1e3, out.into_iter().next().unwrap_or_default()))
-    };
+    let fire =
+        |shell: &mut crate::Shell, lanes: &[(u32, &[u32])]| -> Result<(f64, Vec<f32>), String> {
+            let lanes: Vec<crate::Lane> = lanes
+                .iter()
+                .map(|&(slot, tokens)| crate::Lane {
+                    slot,
+                    word: trace.facts.word(&Request::new(tokens.len() as u32, false)),
+                    tokens,
+                })
+                .collect();
+            let began = Instant::now();
+            let out = shell.fire(&lanes).map_err(|e| e.to_string())?;
+            Ok((
+                began.elapsed().as_secs_f64() * 1e3,
+                out.into_iter().next().unwrap_or_default(),
+            ))
+        };
     let mut prefill = Vec::new();
     let mut readout = Vec::new();
     for round in 0..4 {
@@ -144,8 +140,14 @@ fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, St
     for &lanes in &LANES {
         let mut times = Vec::new();
         for step in 0..=STEPS {
-            let next: Vec<[u32; 1]> = (0..lanes).map(|l| [token((step * lanes + l) as u32)]).collect();
-            let batch: Vec<(u32, &[u32])> = next.iter().enumerate().map(|(l, t)| (l as u32, &t[..])).collect();
+            let next: Vec<[u32; 1]> = (0..lanes)
+                .map(|l| [token((step * lanes + l) as u32)])
+                .collect();
+            let batch: Vec<(u32, &[u32])> = next
+                .iter()
+                .enumerate()
+                .map(|(l, t)| (l as u32, &t[..]))
+                .collect();
             let (ms, _) = fire(&mut shell, &batch)?;
             // The first step of a lane count compiles or records.
             if step > 0 {
@@ -171,9 +173,7 @@ fn plan_of(deployment: &str, chip: &Profile, sms: u32) -> Option<u64> {
     let row = poem_compiler::catalog::deployment(deployment)?;
     let engine = crate::chip::Engine::of(chip);
     let grouped: &[&str] = if engine.grouped { &crate::GROUPED } else { &[] };
-    let mut profile = poem_compiler::DeviceProfile::of(chip, sms, &crate::EXCLUSIVE, grouped);
-    profile.exclusive = crate::EXCLUSIVE.iter().map(|op| (*op).to_string()).collect();
-    profile.grouped = grouped.iter().map(|op| (*op).to_string()).collect();
+    let profile = poem_compiler::DeviceProfile::of(chip, sms, &crate::EXCLUSIVE, grouped);
     let trace = poem_compiler::fuse::fuse(
         row.trace(poem::Platform::Cuda),
         &poem_compiler::fuse::flags::kernels(chip),
@@ -243,7 +243,11 @@ impl Bench for Cuda<'_> {
     }
 
     fn plan(&self, model: usize, file: &str) -> Option<u64> {
-        plan_of(&self.models[model].1, &Self::profile_of(file).ok()?, self.sms)
+        plan_of(
+            &self.models[model].1,
+            &Self::profile_of(file).ok()?,
+            self.sms,
+        )
     }
 }
 
@@ -256,7 +260,10 @@ pub fn run(
 ) -> Result<Outcome, String> {
     let began = Instant::now();
     let (name, facts) = crate::chip::probe(0).ok_or("no CUDA device answers")?;
-    let sms = facts.get("sms").and_then(|v| u32::try_from(v).ok()).unwrap_or(1);
+    let sms = facts
+        .get("sms")
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(1);
     let (base, report) = crate::chip::resolve(&name, &facts, profiles);
     say(&format!("{name}: {sms} SMs; starting from {}", report.used));
     let knobs = search::knobs(&base, SEARCH_SKIPS, "");
@@ -297,7 +304,9 @@ pub fn run(
         say("end to end: nothing changed, so nothing to compare");
     }
     for (at, (_, deployment)) in models.iter().enumerate().filter(|_| !unchanged) {
-        say(&format!("end to end: serving {deployment} under today's profile and the tuned one"));
+        say(&format!(
+            "end to end: serving {deployment} under today's profile and the tuned one"
+        ));
         match search::check(&mut bench, at, &today, &draft) {
             Ok(c) => {
                 say(&format!("  {}", c.describe()));
@@ -318,7 +327,11 @@ pub fn run(
     } else {
         format!(
             "end to end: {}",
-            checks.iter().map(Check::describe).collect::<Vec<_>>().join("; ")
+            checks
+                .iter()
+                .map(Check::describe)
+                .collect::<Vec<_>>()
+                .join("; ")
         )
     };
     let seconds = began.elapsed().as_secs_f64();
@@ -362,7 +375,12 @@ mod tests {
         let registry = crate::chip::registry();
         let knobs = search::knobs(&base, SEARCH_SKIPS, "");
         let ids: Vec<&str> = knobs.iter().map(|k| k.id).collect();
-        for want in ["kernel.moe.grouped", "engine.graphs", "engine.recording", "fuse.matmul_bias"] {
+        for want in [
+            "kernel.moe.grouped",
+            "engine.graphs",
+            "engine.recording",
+            "fuse.matmul_bias",
+        ] {
             assert!(ids.contains(&want), "{want} not searched: {ids:?}");
         }
         for k in &knobs {

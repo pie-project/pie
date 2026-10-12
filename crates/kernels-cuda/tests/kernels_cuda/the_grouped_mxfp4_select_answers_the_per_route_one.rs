@@ -5,23 +5,7 @@ use dtype::Dtype;
 use kernels_cuda::linear::moe::{GroupSeat, matmul_select_bias, matmul_select_quant};
 use kernels_cuda::tensor::Tensor;
 use kernels_cuda::tuning::Tuning;
-use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
-
-static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-
-fn serialized() -> MutexGuard<'static, ()> {
-    ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// `tuning` with the grouped mxfp4 kernel declined: every route reads its
-/// expert alone.
-const fn per_route(tuning: Tuning) -> Tuning {
-    Tuning {
-        mxfp4_grouped: false,
-        ..tuning
-    }
-}
 
 const EXPERTS: usize = 8;
 const TOP_K: usize = 4;
@@ -57,12 +41,12 @@ fn routes_of(tokens: usize) -> Vec<i32> {
         .collect()
 }
 
-fn check(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool) {
-    let _one = serialized();
-    check_held(tokens, n, k, by_token, biased, Tuning::default());
-}
+const FP32: Tuning = Tuning {
+    mxfp4_wmma: false,
+    ..Tuning::DEFAULT
+};
 
-fn check_held(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool, tuning: Tuning) {
+fn check(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool, tuning: Tuning) {
     assert_eq!(k % BLOCK, 0, "K is whole mxfp4 blocks");
     let groups = k / BLOCK;
     let routes = routes_of(tokens);
@@ -90,7 +74,10 @@ fn check_held(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool, t
     let per_route_at = gpu.zeros(route_count * n * 2);
 
     let grouped = gpu.ctx().with_tuning(tuning);
-    let bare = gpu.ctx().with_tuning(per_route(tuning));
+    let bare = gpu.ctx().with_tuning(Tuning {
+        mxfp4_grouped: false,
+        ..tuning
+    });
     let x = Tensor::new(act_at, act_rows as u32, k as u32, Dtype::Bf16);
     let codes_t = Tensor::new(codes_at, EXPERTS as u32, (n * k / 2) as u32, Dtype::U8);
     let scales_t = Tensor::new(scales_at, EXPERTS as u32, (n * groups) as u32, Dtype::U8);
@@ -164,31 +151,30 @@ fn the_grouped_mxfp4_select_answers_the_per_route_one_every_case() {
 }
 
 fn the_token_read_leg_with_a_bias_agrees() {
-    check(64, 256, 256, true, true);
+    check(64, 256, 256, true, true, Tuning::DEFAULT);
 }
 
 fn the_route_read_leg_agrees() {
-    check(64, 256, 256, false, false);
+    check(64, 256, 256, false, false, Tuning::DEFAULT);
 }
 
 fn the_token_read_leg_without_a_bias_agrees() {
-    check(64, 256, 256, true, false);
+    check(64, 256, 256, true, false, Tuning::DEFAULT);
 }
 
 fn the_route_read_leg_with_a_bias_agrees() {
-    check(64, 256, 256, false, true);
+    check(64, 256, 256, false, true, Tuning::DEFAULT);
 }
 
 fn a_rectangle_that_divides_neither_tile_agrees() {
-    check(48, 200, 160, true, true);
+    check(48, 200, 160, true, true, Tuning::DEFAULT);
 }
 
 fn a_row_longer_than_two_blocks_a_lane_agrees() {
-    check(24, 96, 2240, true, true);
+    check(24, 96, 2240, true, true, Tuning::DEFAULT);
 }
 
 fn price(n: usize, k: usize, by_token: bool, label: &str) {
-    let _one = serialized();
     let tokens = 256usize;
     let groups = k / BLOCK;
     let routes = routes_of(tokens);
@@ -207,7 +193,10 @@ fn price(n: usize, k: usize, by_token: bool, label: &str) {
     let y_at = gpu.zeros(route_count * n * 2);
 
     let grouped = gpu.ctx();
-    let bare = gpu.ctx().with_tuning(per_route(Tuning::default()));
+    let bare = gpu.ctx().with_tuning(Tuning {
+        mxfp4_grouped: false,
+        ..Tuning::DEFAULT
+    });
     let x = Tensor::new(act_at, act_rows as u32, k as u32, Dtype::Bf16);
     let codes_t = Tensor::new(codes_at, EXPERTS as u32, (n * k / 2) as u32, Dtype::U8);
     let scales_t = Tensor::new(scales_at, EXPERTS as u32, (n * groups) as u32, Dtype::U8);
@@ -215,23 +204,8 @@ fn price(n: usize, k: usize, by_token: bool, label: &str) {
     let mut y = Tensor::new(y_at, route_count as u32, n as u32, Dtype::Bf16);
 
     let mut run = |ctx: &kernels_cuda::Ctx| {
-        for _ in 0..3 {
-            matmul_select_quant(
-                ctx,
-                x,
-                codes_t,
-                scales_t,
-                None,
-                routes_t,
-                &mut y,
-                GroupSeat::RESIDENT,
-            )
-            .expect("the mxfp4 select fires");
-        }
-        gpu.sync();
         const REPS: usize = 10;
-        let t0 = Instant::now();
-        for _ in 0..REPS {
+        let mut fire = || {
             matmul_select_quant(
                 ctx,
                 x,
@@ -243,7 +217,11 @@ fn price(n: usize, k: usize, by_token: bool, label: &str) {
                 GroupSeat::RESIDENT,
             )
             .expect("the mxfp4 select fires");
-        }
+        };
+        (0..3).for_each(|_| fire());
+        gpu.sync();
+        let t0 = Instant::now();
+        (0..REPS).for_each(|_| fire());
         gpu.sync();
         t0.elapsed().as_secs_f64() * 1e3 / REPS as f64
     };
@@ -270,20 +248,11 @@ fn the_gpt_oss_legs_are_priced() {
     price(2880, 2880, false, "down");
 }
 
-fn check_fp32_form(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool) {
-    let _one = serialized();
-    let fp32 = Tuning {
-        mxfp4_wmma: false,
-        ..Tuning::default()
-    };
-    check_held(tokens, n, k, by_token, biased, fp32);
-}
-
 fn the_fp32_form_agrees_at_both_readings() {
-    check_fp32_form(64, 256, 256, true, true);
-    check_fp32_form(64, 256, 256, false, false);
+    check(64, 256, 256, true, true, FP32);
+    check(64, 256, 256, false, false, FP32);
 }
 
 fn the_fp32_form_agrees_on_a_ragged_rectangle() {
-    check_fp32_form(48, 200, 160, true, true);
+    check(48, 200, 160, true, true, FP32);
 }

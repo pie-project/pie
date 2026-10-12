@@ -7,7 +7,6 @@ use poem_ir::{Dtype, Fused, Linear, Operands, ValueId};
 
 use crate::run::Run;
 
-
 impl DispatchLinear for Run<'_> {
     fn dispatch(&mut self, op: &Linear) -> Result<(), KernelError> {
         self.linear(op).map_err(crate::error::kernel)
@@ -131,7 +130,13 @@ impl Run<'_> {
                     let out = self.tensor(*y);
                     let (m, n, k) = (a.rows as i32, weight.rows as i32, a.width as i32);
                     let epilogue = linear::skinny::Epilogue::Softcap(*cap);
-                    if linear::skinny::covers(m, n, k, epilogue, self.ctx().tuning().gemm_skinny_rows) {
+                    if linear::skinny::covers(
+                        m,
+                        n,
+                        k,
+                        epilogue,
+                        self.ctx().tuning().gemm_skinny_rows,
+                    ) {
                         return linear::skinny::skinny_bf16(
                             self.ctx(),
                             weight.ptr,
@@ -636,11 +641,12 @@ impl Run<'_> {
             Some((codes, scales, biases, seat)) => {
                 let act = self.tensor(*act);
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
-                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from && !seat.streams() && held {
-                    linear::quant::matmul_via_dense
-                } else {
-                    linear::quant::matmul
-                };
+                let entry =
+                    if act.rows >= self.ctx().tuning().qmm_gemm_from && !seat.streams() && held {
+                        linear::quant::matmul_via_dense
+                    } else {
+                        linear::quant::matmul
+                    };
                 entry(
                     self.ctx(),
                     act,
@@ -680,11 +686,12 @@ impl Run<'_> {
             Some((codes, scales, biases, seat)) => {
                 let act = self.tensor(*act);
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
-                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from && !seat.streams() && held {
-                    linear::quant::lm_head_via_dense
-                } else {
-                    linear::quant::lm_head
-                };
+                let entry =
+                    if act.rows >= self.ctx().tuning().qmm_gemm_from && !seat.streams() && held {
+                        linear::quant::lm_head_via_dense
+                    } else {
+                        linear::quant::lm_head
+                    };
                 entry(
                     self.ctx(),
                     act,

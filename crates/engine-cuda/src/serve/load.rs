@@ -48,17 +48,14 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     kernels_cuda::disk::install(boot.cache_dir);
 
     let stated_buckets = std::mem::take(&mut boot.budget.buckets);
-    boot.budget.buckets =
-        crate::api::lattice(stated_buckets.clone(), boot.budget.max_tokens, engine.lattice_steps);
+    boot.budget.buckets = crate::api::lattice(
+        stated_buckets.clone(),
+        boot.budget.max_tokens,
+        engine.lattice_steps,
+    );
 
     let grouped: &[&str] = if engine.grouped { &crate::GROUPED } else { &[] };
-    let mut profile =
-        DeviceProfile::of(&chip, device.device().num_sm, &crate::EXCLUSIVE, grouped);
-    profile.exclusive = crate::EXCLUSIVE
-        .iter()
-        .map(|op| (*op).to_string())
-        .collect();
-    profile.grouped = grouped.iter().map(|op| (*op).to_string()).collect();
+    let profile = DeviceProfile::of(&chip, device.device().num_sm, &crate::EXCLUSIVE, grouped);
     let mut kernels = poem_compiler::fuse::flags::kernels(&chip);
     if !boot.knobs.diagnostics.fuse_chains {
         kernels.retain(|kernel| crate::UNCHAINED.contains(kernel));
@@ -1221,8 +1218,6 @@ fn adapter_fact(classes: &poem_ir::ClassTable, corrected: &poem_ir::ClassSet) ->
 
 pub(super) struct Baked {
     pub(super) device: Context,
-    /// The GPU's profile settings this load runs under, with what the caller
-    /// pinned over them.
     pub(super) engine: crate::chip::Engine,
     pub(super) compiled: CompiledModel,
     pub(super) budgets: Budgets,

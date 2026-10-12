@@ -72,7 +72,6 @@ pub struct Context {
     slabs: Slabs,
     device: Device,
     capability: (i32, i32),
-    /// The name the driver gives the GPU: what its profile is filed under.
     name: String,
 }
 
@@ -161,7 +160,9 @@ impl Context {
                     events: Vec::new(),
                     device,
                     capability: capability(ordinal),
-                    name: name(ordinal),
+                    name: crate::chip::probe(ordinal)
+                        .map(|(name, _)| name)
+                        .unwrap_or_default(),
                 })
             }
         }
@@ -345,7 +346,6 @@ impl Context {
         Toggles::of(self.ctx.tuning())
     }
 
-    /// The GPU's name as the driver gives it.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
@@ -436,33 +436,6 @@ impl std::fmt::Debug for Context {
 }
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn name(ordinal: i32) -> String {
-    #[cfg(feature = "cuda")]
-    {
-        use cudarc::runtime::sys as rt;
-        // SAFETY: `prop` is a live out-parameter the call fills; an all-zero
-        // `cudaDeviceProp` is a valid value of the plain C struct.
-        let mut prop: rt::cudaDeviceProp = unsafe { core::mem::zeroed() };
-        // SAFETY: as above; `ordinal` was just accepted by cudaSetDevice.
-        let status = unsafe { rt::cudaGetDeviceProperties(&raw mut prop, ordinal) };
-        if status != rt::cudaError::cudaSuccess {
-            return String::new();
-        }
-        let bytes: Vec<u8> = prop
-            .name
-            .iter()
-            .take_while(|&&c| c != 0)
-            .map(|&c| c as u8)
-            .collect();
-        String::from_utf8_lossy(&bytes).into_owned()
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = ordinal;
-        String::new()
-    }
-}
-
 fn capability(ordinal: i32) -> (i32, i32) {
     #[cfg(feature = "cuda")]
     {

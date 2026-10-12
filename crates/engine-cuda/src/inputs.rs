@@ -40,11 +40,9 @@ fn prefill_float_bytes(
     (v + s).next_multiple_of(ALIGN) + 2 * ALIGN
 }
 
-/// A decode plan's partials at `lanes` rows. The decode room is held to the
-/// larger of this and `graph_float_bytes`, a prefill-tile multiple well past
-/// what the decode planner's grid uses: the token budget is fitted against
-/// that room (`serve::load`), and a smaller room moves where the budget
-/// lands, which the card's later state-slot fit does not yet follow.
+/// A floor on the decode room, well past what the decode grid uses: the token
+/// budget is fitted against it (`serve::load`), and the later state-slot fit
+/// does not follow a smaller room.
 fn graph_float_bytes(facts: &SpaceFacts, sms: u32) -> u64 {
     let padded = u64::from(2 * sms.max(1)) / u64::from(facts.kv_heads.max(1)).max(1);
     let tile = if facts.head_dim >= 256 { 64 } else { 128 };
@@ -91,9 +89,7 @@ fn plan_floats(
                         device,
                         toggles,
                     ),
-                    StructKind::AttnPrefillPlanSm90 => {
-                        unreachable!("no CUDA trace plans an sm90 prefill")
-                    }
+                    StructKind::AttnPrefillPlanSm90 => unreachable!("no CUDA trace plans one"),
                     StructKind::AttnDecodePlan => graph_float_bytes(&seat.reading, device.num_sm)
                         .max(decode_float_bytes(&seat.reading, budget.max_lanes)),
                     StructKind::MlaPlan => latent_float_bytes(seat.reading.head_dim, device.num_sm),
