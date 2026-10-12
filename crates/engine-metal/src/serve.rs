@@ -567,15 +567,35 @@ impl Shell {
                 pool,
             )
         };
+        // Each plane is one buffer, so no more pages than the device binds in
+        // one, whatever the room allows.
+        let max_buffer = device.max_buffer();
         let (pages, slots) = engine::fit::pool_for(
             boot.kv_budget,
             boot.slots,
             u64::from(paging_at(1, boot.slots)?.pages_per_slot),
             accounting(0).pool,
-            |pages, slots| demand_at(slots).map_or(u64::MAX, |demand| demand.bytes(pages)),
+            |pages, slots| {
+                demand_at(slots).map_or(u64::MAX, |demand| demand.bytes_binding(pages, max_buffer))
+            },
         )
         .map_err(|short| Fault::Residency(short.to_string()))?;
         let demand = demand_at(slots)?;
+        // A stated budget is never cut: one buffer stopping short of it is a
+        // refusal, as the room is.
+        if let Some(budget) = boot.kv_budget
+            && demand.bytes_binding(pages + 1, max_buffer) == u64::MAX
+            && demand.bytes(pages + 1) <= budget
+        {
+            return Err(Fault::Residency(format!(
+                "`[model] device_kv_budget` states {} MiB, and a cache plane is one buffer, \
+                 which this device binds up to {} MiB of: {pages} pages fill it at {} MiB. \
+                 State a budget of at most that",
+                budget >> 20,
+                max_buffer >> 20,
+                demand.bytes(pages) >> 20,
+            )));
+        }
         let paging = paging_at(pages, slots)?;
 
         {

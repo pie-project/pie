@@ -10,7 +10,7 @@ use crate::store::kv::Paging;
 
 use crate::device::{Buffer, Context, Handles};
 use crate::error::Result;
-use crate::run::{PoolSlabs, WeightRow, WeightTable};
+use crate::run::{WeightRow, WeightTable};
 
 const ALIGN: u64 = 256;
 
@@ -58,13 +58,6 @@ struct CopyRoom {
     bytes: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Pool {
-    space: u32,
-    state_kv: Room,
-    state_score: Room,
-}
-
 #[derive(Clone, Debug)]
 struct PleHash {
     key: Box<[u64]>,
@@ -93,8 +86,6 @@ pub struct Scratch {
     copy: Option<CopyRoom>,
 
     spatial: Option<Room>,
-
-    pool: Vec<Pool>,
 
     ple: Vec<PleHash>,
 
@@ -280,14 +271,6 @@ impl Scratch {
         });
 
         let mut at = copy.map_or(union, |room| room.at + room.bytes);
-        let pool: Vec<Pool> = pool_state(trace, paging)
-            .into_iter()
-            .map(|(space, cells, width)| Pool {
-                space,
-                state_kv: Room::lay(&mut at, cells, width, Dtype::Bf16),
-                state_score: Room::lay(&mut at, cells, width, Dtype::Bf16),
-            })
-            .collect();
 
         let mut ple: Vec<PleHash> = Vec::new();
         for node in &trace.nodes {
@@ -330,7 +313,6 @@ impl Scratch {
             index,
             copy,
             spatial,
-            pool,
             ple,
             capacity: crate::arena::capacities(map),
             routers,
@@ -448,17 +430,6 @@ impl Scratch {
         Some(self.index?.bind(handles, &self.plane))
     }
 
-    pub fn pool_state(&self, handles: &Handles, space: u32) -> Option<Result<PoolSlabs>> {
-        let rooms = *self.pool.iter().find(|held| held.space == space)?;
-        let mint = || {
-            Ok(PoolSlabs {
-                state_kv: rooms.state_kv.bind(handles, &self.plane)?,
-                state_score: rooms.state_score.bind(handles, &self.plane)?,
-            })
-        };
-        Some(mint())
-    }
-
     pub fn ple_hash(
         &self,
         handles: &Handles,
@@ -470,44 +441,6 @@ impl Scratch {
         let held = self.ple.iter().find(|h| *h.key == *want)?;
         Some(held.room.bind(handles, &self.plane))
     }
-}
-
-const fn compressor_coff(ratio: u32) -> u64 {
-    if ratio == 4 { 2 } else { 1 }
-}
-
-fn pool_state(trace: &Trace, paging: Paging) -> Vec<(u32, u64, u64)> {
-    let cells = paging.pages() * u64::from(paging.page_size);
-    if cells == 0 {
-        return Vec::new();
-    }
-    let mut spaces: Vec<(u32, u64)> = Vec::new();
-    for node in &trace.nodes {
-        let Operation::Attention(Attention::PoolGather {
-            pages,
-            head_dim,
-            ratio,
-            ..
-        }) = &node.op
-        else {
-            continue;
-        };
-        let Some(Def::Cache(space)) = trace.values.get(pages.0 as usize).map(|v| &v.def) else {
-            continue;
-        };
-        let width = compressor_coff(*ratio) * u64::from(*head_dim);
-        if width == 0 {
-            continue;
-        }
-        match spaces.iter_mut().find(|(held, _)| *held == *space) {
-            Some((_, held)) => *held = (*held).max(width),
-            None => spaces.push((*space, width)),
-        }
-    }
-    spaces
-        .into_iter()
-        .map(|(space, width)| (space, cells, width))
-        .collect()
 }
 
 fn copy_ceiling(trace: &Trace, compiled: &CompiledModel, budget: &Budget) -> Option<u64> {
