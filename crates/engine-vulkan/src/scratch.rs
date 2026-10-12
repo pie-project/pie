@@ -54,7 +54,17 @@ struct SplitRooms {
     part_lse: Room,
 }
 
-const SPLIT_PLANE_ROWS: u64 = 128;
+/// Slice rows a decode attention of `heads` query heads at up to `rows`
+/// rows writes when it splits across `groups` workgroups: a fire splits only
+/// while its rows hold fewer than `groups` heads, into as many slices as
+/// fill `groups`.
+fn split_rows(groups: u32, heads: u32, rows: u32) -> u64 {
+    (1..=rows)
+        .take_while(|r| u64::from(*r) * u64::from(heads) < u64::from(groups))
+        .map(|r| u64::from(r) * u64::from(groups.div_ceil(r * heads)))
+        .max()
+        .unwrap_or(0)
+}
 
 #[derive(Clone, Copy, Debug)]
 struct CopyRoom {
@@ -197,17 +207,22 @@ impl Scratch {
                 Operation::Attention(
                     Attention::Decode { o, head_dim, .. }
                     | Attention::DecodeLse { o, head_dim, .. },
-                ) => of(*o).map(|rect| (rect.width, *head_dim)),
+                ) => of(*o).map(|rect| (rect.width, rect.rows, *head_dim)),
                 _ => None,
             })
-            .filter(|(width, head_dim)| *width > 0 && *head_dim > 0 && width % head_dim == 0)
-            .map(|(width, head_dim)| (u64::from(width), u64::from(width / head_dim)))
+            .filter(|(width, _, head_dim)| *width > 0 && *head_dim > 0 && width % head_dim == 0)
+            .map(|(width, rows, head_dim)| {
+                let heads = width / head_dim;
+                let slices = split_rows(tuning.sdpa_split_groups(), heads, rows);
+                (slices * u64::from(width), slices * u64::from(heads))
+            })
             .reduce(|a, b| (a.0.max(b.0), a.1.max(b.1)))
-            .map(|(width, heads)| {
+            .filter(|(out, _)| *out > 0)
+            .map(|(out, lse)| {
                 let mut at = 0u64;
                 SplitRooms {
-                    part_out: Room::lay(&mut at, SPLIT_PLANE_ROWS, width, Dtype::F32),
-                    part_lse: Room::lay(&mut at, SPLIT_PLANE_ROWS, heads, Dtype::F32),
+                    part_out: Room::lay(&mut at, 1, out, Dtype::F32),
+                    part_lse: Room::lay(&mut at, 1, lse, Dtype::F32),
                 }
             });
 

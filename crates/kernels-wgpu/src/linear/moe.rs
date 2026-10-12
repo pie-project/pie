@@ -9,8 +9,6 @@ use crate::tensor::{Bank, Tensor};
 
 const MOE_TILE_ROWS: [u32; 3] = [16, 32, 64];
 
-const MOE_TILE_COLS: [u32; 3] = [32, 64, 128];
-
 const ROUTER_MAX_EXPERTS: u32 = 1024;
 
 const ROUTER_MAX_TOP_K: u32 = 16;
@@ -26,11 +24,6 @@ const QMV_FILE: &str = "moe/qmv_routed.wgsl";
 const ROUTE_GROUP: [u32; 3] = [256, 1, 1];
 
 const QMV_GROUP: [u32; 3] = [32, 8, 1];
-
-#[must_use]
-pub fn should_batch(pairs: u32, experts: u32, min_per_expert: u32) -> bool {
-    experts > 0 && u64::from(pairs) >= u64::from(experts) * u64::from(min_per_expert)
-}
 
 #[must_use]
 pub fn tile_rows(pairs: u32, experts: u32, tuning: &crate::Tuning) -> u32 {
@@ -51,15 +44,6 @@ pub fn sorted_rows(pairs: u32, experts: u32, tuning: &crate::Tuning) -> u32 {
     let touched = pairs.min(experts);
     let bound = pairs.saturating_add(touched.saturating_mul(tile - 1));
     bound.div_ceil(tile) * tile
-}
-
-#[must_use]
-pub fn tile_cols(out_width: u32) -> Option<u32> {
-    MOE_TILE_COLS
-        .iter()
-        .rev()
-        .copied()
-        .find(|tile| out_width.is_multiple_of(*tile))
 }
 
 fn router_grid(op: &'static str, rows: u32) -> Result<Grid, Error> {
