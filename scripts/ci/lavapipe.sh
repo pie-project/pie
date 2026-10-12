@@ -30,7 +30,7 @@ echo "== inferlets (wasm32-wasip2)"
 (cd examples && cargo build -q --release --target wasm32-wasip2 -p text-completion -p naive-baseline -p sort-probe)
 
 echo "== import"
-"$pie" model import "$work/snapshot" --sku qwen35-tiny-u4g64-kv-bf16 --keep-source
+"$pie" model import "$work/snapshot" --deployment qwen35-tiny-u4g64-kv-bf16 --keep-source
 
 case "$engine" in
   wgpu)   engine_toml=$'type = "wgpu"\nbackends = "vulkan"\ndevice = ["wgpu:0"]' ;;
@@ -90,7 +90,7 @@ if [ -n "${PIE_LANGUAGES_DIR:-}" ]; then
   "$pie" inferlet install examples/text-completion-py/main.py
   "$pie" inferlet install examples/text-completion-js/index.js
   for name in text-completion-py text-completion-js; do
-    uv run --project python/client python scripts/ci/launch.py "$ws" "$name" | tee /dev/stderr | grep -q '^ok' || exit 1
+    uv run --project packages/python/client python scripts/ci/launch.py "$ws" "$name" | tee /dev/stderr | grep -q '^ok' || exit 1
   done
 fi
 

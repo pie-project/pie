@@ -93,9 +93,7 @@ pub struct FireBindings {
 
     pub patch_positions: Option<Tensor>,
 
-    pub patch_embed_rows: Option<Tensor>,
-
-    pub patch_embed_weights: Option<Tensor>,
+    pub patch_grids: Option<Tensor>,
 
     pub mrope_positions: Option<Tensor>,
 
@@ -154,6 +152,10 @@ pub struct Run<'c> {
     copy: CopyPlan,
 
     scratch: &'c Scratch,
+
+    /// The Neural Engine's share of this load, when a live encode may hand
+    /// it work.
+    ane: Option<&'c crate::ane::Ane>,
 }
 
 impl<'c> Run<'c> {
@@ -187,7 +189,18 @@ impl<'c> Run<'c> {
             place,
             copy: CopyPlan::default(),
             scratch,
+            ane: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_ane(mut self, ane: Option<&'c crate::ane::Ane>) -> Self {
+        self.ane = ane;
+        self
+    }
+
+    pub(crate) fn ane(&self) -> Option<&'c crate::ane::Ane> {
+        self.ane
     }
 
     pub(crate) fn window(&self) -> &'c Window {
@@ -504,14 +517,9 @@ impl<'c> Run<'c> {
                     )
                 })
             }
-            Def::Input(RuntimeInput::PatchEmbedRows) => {
-                self.fire.patch_embed_rows.unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads this fire's position-table taps, and this load \
-                         stages none — the plan reads the table on its native grid"
-                    )
-                })
-            }
+            Def::Input(RuntimeInput::ImageGrids) => self.fire.patch_grids.unwrap_or_else(|| {
+                panic!("value {at} reads this fire's image grids, which no lane of it submitted")
+            }),
             Def::Input(RuntimeInput::SelfCondRows) => {
                 self.fire.self_cond_rows.unwrap_or_else(|| {
                     panic!(
@@ -525,14 +533,6 @@ impl<'c> Run<'c> {
                     panic!(
                         "value {at} reads this fire's self-conditioning weights, which this \
                          load reserved no seat for"
-                    )
-                })
-            }
-            Def::Input(RuntimeInput::PatchEmbedWeights) => {
-                self.fire.patch_embed_weights.unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads this fire's interpolation weights, and this load \
-                         stages none — the plan reads the table on its native grid"
                     )
                 })
             }

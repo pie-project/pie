@@ -276,16 +276,17 @@ pub(crate) fn rotate_all(
     })
 }
 
+/// The first `rotary/2` pairs turn at `theta^(-i/span)`; a halves pair sits
+/// `span` apart.
 fn neox(head_dim: u32, rotary: u32, theta: f32, span: u32, interleaved: bool) -> Turn {
     let mut t = Turn::new(head_dim as usize, 1);
-    let half = (rotary / 2) as usize;
-    for i in 0..half {
+    for i in 0..(rotary / 2) as usize {
         let (lo, hi) = if interleaved {
             (2 * i, 2 * i + 1)
         } else {
-            (i, i + half)
+            (i, i + span as usize)
         };
-        t.pair(lo, hi, 0, inv_freq(theta, i, span));
+        t.pair(lo, hi, 0, inv_freq(theta, i, 2 * span));
     }
     t
 }
@@ -307,15 +308,14 @@ pub fn full(
     rotary_within(OP, head_dim, head_dim)?;
     heads(OP, q.width, head_dim)?;
     heads(OP, k.width, head_dim)?;
-    let t = neox(head_dim, head_dim, theta, head_dim, interleaved);
+    let t = neox(head_dim, head_dim, theta, head_dim / 2, interleaved);
     rotate_all(ctx, OP, &[q, k], positions, 1, &t)
 }
 
-/// The first `rotary_dim` entries of each head turn, paired `(i, i + r/2)` at
-/// `theta^(-2i/r)` (the HF / mlx-lm / llama.cpp convention); the rest pass
-/// through. Reference: kernels-cuda `rope_partial` and kernels-metal
-/// `neox_prop_mb` after #603 (kernels-wgpu's `neox_prop` still pairs over
-/// the head width and is stale).
+/// The first `rotary_dim/2` pairs of each head turn, pair `i` being
+/// `(i, i + span)` at `theta^(-i/span)`; the rest pass through. Reference:
+/// kernels-cuda `rope_partial`, kernels-metal `neox_mb`.
+#[allow(clippy::too_many_arguments)]
 pub fn partial(
     ctx: &Ctx<'_>,
     q: Tensor,
@@ -324,13 +324,14 @@ pub fn partial(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
+    span: u32,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_partial";
     int_positions(OP, positions)?;
     rotary_within(OP, rotary_dim, head_dim)?;
     heads(OP, q.width, head_dim)?;
     heads(OP, k.width, head_dim)?;
-    let t = neox(head_dim, rotary_dim, theta, rotary_dim, false);
+    let t = neox(head_dim, rotary_dim, theta, span, false);
     rotate_all(ctx, OP, &[q, k], positions, 1, &t)
 }
 
@@ -341,12 +342,13 @@ pub fn partial_q(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
+    span: u32,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_partial_q";
     int_positions(OP, positions)?;
     rotary_within(OP, rotary_dim, head_dim)?;
     heads(OP, q.width, head_dim)?;
-    let t = neox(head_dim, rotary_dim, theta, rotary_dim, false);
+    let t = neox(head_dim, rotary_dim, theta, span, false);
     rotate_all(ctx, OP, &[q], positions, 1, &t)
 }
 
@@ -480,46 +482,4 @@ pub fn yarn(
     }
     let t = t.scaled(attention_factor);
     rotate_all(ctx, OP, &[q, k], positions, 1, &t)
-}
-
-/// Per-head rmsnorm (gain `w`, not `1 + w`) over the whole head, then the
-/// first `rotary_dim` entries turn as `partial` turns them, with no rounding
-/// between the norm and the turn. Reference: kernels-cuda
-/// `q_rmsnorm_rope_partial` (wgpu and Metal refuse the fused op).
-pub fn rmsnorm_rope_partial_q(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    weight: Tensor,
-    head_dim: u32,
-    eps: f32,
-    positions: Tensor,
-    rotary_dim: u32,
-    theta: f32,
-    y: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_rope_partial_q";
-    expect(OP, x, FLOATS)?;
-    int_positions(OP, positions)?;
-    rotary_within(OP, rotary_dim, head_dim)?;
-    heads(OP, y.width, head_dim)?;
-    if x.rows != y.rows || x.width != y.width {
-        return Err(refuse(OP, "the normed row lands the rectangle it reads"));
-    }
-    if weight.elements() != u64::from(head_dim) {
-        return Err(refuse(OP, "the weight is one gain per head column"));
-    }
-    let t = neox(head_dim, rotary_dim, theta, rotary_dim, false);
-    ctx.emit(&mut |cx| {
-        let xv = cx.read_f32(x)?;
-        let n = super::norm::inv_rms_rows(cx, OP, xv, head_dim, eps)?;
-        let w = cx.read_f32(weight)?;
-        let w = cx.reshape(w, &[i64::from(head_dim)])?;
-        let (rows, hs) = (i64::from(x.rows), i64::from(x.width / head_dim));
-        let w = cx.broadcast(w, &[rows, hs, i64::from(head_dim)], &[2])?;
-        let w = cx.reshape(w, &[rows, i64::from(x.width)])?;
-        let n = cx.mul(n, w)?;
-        let pos = positions_f32(cx, OP, positions, x.rows, 1)?;
-        let out = turn(cx, n, pos, &t)?;
-        cx.write(y, out)
-    })
 }

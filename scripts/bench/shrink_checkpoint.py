@@ -57,7 +57,7 @@ node (routed delta 0.078) without the delta ever crossing an expert boundary:
 at 8-of-16 the eighth-to-ninth logit gap is wider than the perturbation, so the
 routing decision never changed. Sixty-four leaves fifty-six rejected experts in
 that tail instead of eight and contracts the gap with them, which is the whole
-reason the second row exists. Both land their own SKU
+reason the second row exists. Both land their own deployment
 (`qwen36-35b-a3b-mini-u4g64-kv-bf16` and `…-mini64-…`) and both are held by
 `crates/models/tests/the_a3b_text_reads_the_routed_miniature.rs`.
 """
@@ -1133,7 +1133,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
         # **NO `keep_res`, SO THE 333-PLANE VISION TOWER IS DROPPED**, as
         # `qwen4_exp` drops its own. The reason is not size (0.83 GiB) but the
         # reader: `models::qwen_3::Model::a3b` declares `tower: None`, so the
-        # SKU this artifact has to land on opens no `vision_tower.*` plane at
+        # deployment this artifact has to land on opens no `vision_tower.*` plane at
         # all. Carrying the tower would put a third of the artifact's names
         # outside the census with nothing reading them, and the miniature is
         # here to be a bijection with the text.
@@ -1275,6 +1275,31 @@ FAMILIES: dict[str, dict[str, Any]] = {
         # `full_attention_interval` is 4: three `linear_attention` layers then
         # one `full_attention`. Layers 0-3 are one whole period -- and layer 1
         # is the PLE layer, so the n-gram memory is in the block too.
+        default_layers="0-3",
+        config_rewrite=_rewrite_qwen4_exp,
+        text_cfg_key="text_config",
+    ),
+    # The same architecture as upstream ships it, bf16: the `qwen3_5_moe` /
+    # `qwen3_5_moe_mlx` split again -- `model.language_model.layers.`, and the
+    # bank fused as one `gate_up_proj` and one `down_proj`, stacked on dim 0.
+    "qwen4_exp_hf": dict(
+        model_type="qwen4_exp",
+        layer_prefix="model.language_model.layers.",
+        expert_re=None,
+        router_suffixes=(
+            "mlp.gate.weight",
+            "mlp.experts.gate_up_proj",
+            "mlp.experts.down_proj",
+        ),
+        part_re=re.compile(r"\.ngram_embedding\.shard_(\d+)\."),
+        default_parts=8,
+        globals_keep=("model.language_model.embed_tokens.weight",
+                      "lm_head.weight",
+                      "model.language_model.hyper_connection_mixer.hc_norm.weight",
+                      "model.language_model.hyper_connection_mixer."
+                      "input_mix_weight_down.weight",
+                      "model.language_model.hyper_connection_mixer."
+                      "input_mix_weight_up.weight"),
         default_layers="0-3",
         config_rewrite=_rewrite_qwen4_exp,
         text_cfg_key="text_config",

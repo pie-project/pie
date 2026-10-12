@@ -1061,6 +1061,7 @@ mod tests {
             biases: None,
             group: MXFP4_BLOCK,
             bits: 4,
+            ld: 2880,
         };
         let biased = batched_point("t", bank, true, 32, 64, false)
             .expect("the biased form answers")

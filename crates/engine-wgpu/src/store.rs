@@ -254,7 +254,9 @@ impl Pools {
                         },
                     });
                 }
-                CacheRow::State { name, slab, dtype } => {
+                CacheRow::State {
+                    name, slab, dtype, ..
+                } => {
                     let stride: u64 = slab.iter().product();
                     let dtype = state_dtype(*dtype);
                     let bytes = stride * u64::from(paging.slots) * elem_bytes(name, dtype)?;
@@ -596,7 +598,9 @@ pub fn pool_slabs(trace: &Trace, paging: Paging) -> Result<Vec<u64>> {
                 };
                 slabs.push(cells * width * element);
             }
-            CacheRow::State { name, slab, dtype } => {
+            CacheRow::State {
+                name, slab, dtype, ..
+            } => {
                 let stride: u64 = slab.iter().product();
                 let dtype = state_dtype(*dtype);
                 slabs.push(

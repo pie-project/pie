@@ -158,12 +158,15 @@ pub fn partial(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
+    span: u32,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_partial";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     positions_stream(OP, positions, q);
-    rope_partial(ctx, OP, *q, *k, positions, rotary_dim, head_dim, theta)
+    rope_partial(
+        ctx, OP, *q, *k, positions, rotary_dim, head_dim, theta, span,
+    )
 }
 
 pub fn partial_q(
@@ -173,12 +176,13 @@ pub fn partial_q(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
+    span: u32,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_partial_q";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     positions_stream(OP, positions, q);
     let k = Tensor::new(q.ptr, q.rows, 0, q.dtype);
-    rope_partial(ctx, OP, *q, k, positions, rotary_dim, head_dim, theta)
+    rope_partial(ctx, OP, *q, k, positions, rotary_dim, head_dim, theta, span)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -191,6 +195,7 @@ pub fn rmsnorm_rope_partial_q(
     positions: Tensor,
     rotary_dim: u32,
     theta: f32,
+    span: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rmsnorm_rope_partial_q";
@@ -199,14 +204,16 @@ pub fn rmsnorm_rope_partial_q(
     if head_dim == 0
         || !head_dim.is_multiple_of(2)
         || !y.width.is_multiple_of(head_dim)
-        || rotary_dim > head_dim
         || !rotary_dim.is_multiple_of(2)
+        || span < rotary_dim / 2
+        || span + rotary_dim / 2 > head_dim
     {
         return Err(refuse(
             OP,
             format!(
-                "wants whole even heads and an even rotary width within them, and was handed \
-                 width={}, head_dim={head_dim}, rotary_dim={rotary_dim}",
+                "wants whole even heads and an even rotary width whose pairs sit within them, \
+                 and was handed width={}, head_dim={head_dim}, rotary_dim={rotary_dim}, \
+                 span={span}",
                 y.width
             ),
         ));
@@ -227,6 +234,7 @@ pub fn rmsnorm_rope_partial_q(
             stated(OP, head_dim)?.arg(),
             stated(OP, heads)?.arg(),
             stated(OP, rotary_dim)?.arg(),
+            stated(OP, span)?.arg(),
             theta.arg(),
             eps.arg(),
             ctx.stage(),
@@ -374,6 +382,7 @@ pub fn yarn(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rope_partial(
     ctx: &Ctx,
     op: &'static str,
@@ -383,6 +392,7 @@ fn rope_partial(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
+    span: u32,
 ) -> Result<(), Error> {
     let num_q_heads = q_heads(op, q.width, head_dim)?;
     let num_kv_heads = heads(op, k.width, head_dim)?;
@@ -399,6 +409,7 @@ fn rope_partial(
             stated(op, num_kv_heads)?.arg(),
             stated(op, head_dim)?.arg(),
             stated(op, rotary_dim)?.arg(),
+            stated(op, span)?.arg(),
             theta.arg(),
             ctx.stage(),
         ],

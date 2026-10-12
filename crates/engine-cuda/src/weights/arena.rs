@@ -76,6 +76,10 @@ pub struct CudaArena {
 }
 
 impl CudaArena {
+    /// # Safety
+    ///
+    /// `base` must be device memory valid for `len` bytes for as long as the
+    /// arena lives, and `stream` a live CUDA stream.
     pub unsafe fn new(
         base: *mut c_void,
         len: usize,

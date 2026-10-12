@@ -23,7 +23,7 @@ testkit = []
 dtype = { package = "pie-dtype", path = "../dtype" }
 half = "2"
 ztensor = { workspace = true }
-sha2 = "0.10"
+sha2 = "0.11"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 ztensor-compat = { workspace = true, features = [
     "safetensors",

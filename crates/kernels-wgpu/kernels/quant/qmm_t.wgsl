@@ -139,22 +139,27 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     for (var k0 = 0u; k0 < k; k0 = k0 + PIE_BK) {
         workgroupBarrier();
 
-        for (var i = flat; i < u32(PIE_BM) * (PIE_BK / 2u); i = i + u32(PIE_THREADS)) {
-            let r = i / (PIE_BK / 2u);
-            let kk = (i - r * (PIE_BK / 2u)) * 2u;
-            let row = row0 + r;
-            var lo = 0.0;
-            var hi = 0.0;
-            if (row < m) {
-                let e = row * k + k0 + kk;
-                lo = pie_bf16_at(x[e >> 1u], e);
-                hi = pie_bf16_at(x[(e + 1u) >> 1u], e + 1u);
+        // Each invocation stores whole vec4s: Metal lowers a store to one
+        // component of a workgroup vector as a read-modify-write of the
+        // whole vector, so invocations filling neighbouring components of
+        // one vec4 race and drop each other's rows.
+        for (var i = flat; i < rows4 * (PIE_BK / 2u); i = i + u32(PIE_THREADS)) {
+            let rq = i / (PIE_BK / 2u);
+            let kk = (i - rq * (PIE_BK / 2u)) * 2u;
+            var lo = vec4<f32>(0.0);
+            var hi = vec4<f32>(0.0);
+            for (var j = 0u; j < 4u; j = j + 1u) {
+                let row = row0 + rq * 4u + j;
+                if (row < m) {
+                    let e = row * k + k0 + kk;
+                    lo[j] = pie_bf16_at(x[e >> 1u], e);
+                    hi[j] = pie_bf16_at(x[(e + 1u) >> 1u], e + 1u);
+                }
             }
-            xs[kk * rows4 + r / 4u][r & 3u] = lo;
-            xs[(kk + 1u) * rows4 + r / 4u][r & 3u] = hi;
+            xs[kk * rows4 + rq] = lo;
+            xs[(kk + 1u) * rows4 + rq] = hi;
         }
         let g = k0 / u32(PIE_GROUP);
-//#if !defined(PIE_WCOMPONENT)
 
         for (var i = flat; i < PIE_QUADS * words_per_block; i = i + u32(PIE_THREADS)) {
             let cq4 = i / words_per_block;
@@ -186,26 +191,6 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
                 ws[(wi * cpw + q) * PIE_QUADS + cq4] = code * sc + bi;
             }
         }
-//#else
-        for (var i = flat; i < u32(PIE_BN) * words_per_block; i = i + u32(PIE_THREADS)) {
-            let c = i / words_per_block;
-            let wi = i - c * words_per_block;
-            let col = col0 + c;
-            if (col < n) {
-                let word = w[col * wpr + k0 / cpw + wi];
-                let sg = col * gpr + g;
-                let s = pie_bf16_at(scales[sg >> 1u], sg);
-                let b = pie_bf16_at(biases[sg >> 1u], sg);
-                for (var q = 0u; q < cpw; q = q + 1u) {
-                    ws[(wi * cpw + q) * PIE_QUADS + c / 4u][c & 3u] = pie_affine_code(word, q) * s + b;
-                }
-            } else {
-                for (var q = 0u; q < cpw; q = q + 1u) {
-                    ws[(wi * cpw + q) * PIE_QUADS + c / 4u][c & 3u] = 0.0;
-                }
-            }
-        }
-//#endif
         workgroupBarrier();
         for (var kk = 0u; kk < PIE_BK; kk = kk + 1u) {
             let wv = ws[kk * PIE_QUADS + cq];
@@ -310,5 +295,3 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
 // pie:instantiate affine_qmm_t_bf16_gs_128_b_8_bm_32_bn_32 PIE_GROUP=128 PIE_BITS=8 PIE_BM=32 PIE_BN=32 PIE_WM=2
 // pie:instantiate affine_qmm_t_bf16_gs_128_b_8_bm_64_bn_16 PIE_GROUP=128 PIE_BITS=8 PIE_BM=64 PIE_BN=16 PIE_WM=2
 // pie:instantiate affine_qmm_t_bf16_gs_128_b_8_bm_64_bn_32 PIE_GROUP=128 PIE_BITS=8 PIE_BM=64 PIE_BN=32 PIE_WM=2
-
-// pie:instantiate affine_qmm_t_components_bf16_gs_64_b_4_bm_64_bn_32 PIE_GROUP=64 PIE_BITS=4 PIE_BM=64 PIE_BN=32 PIE_WM=2 PIE_WCOMPONENT=1

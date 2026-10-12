@@ -115,12 +115,36 @@ var<workgroup> xs: array<vec4<f32>, PIE_BK * (PIE_BM / 4u)>;
 
 var<workgroup> ws: array<vec4<f32>, PIE_BK * PIE_BN4>;
 
-fn load_x_word(row: u32, kk: u32) -> u32 {
-    return x[(row * u32(params.k) + kk) >> 1u];
+fn x_pair(row: u32, kk: u32, k: u32, k_even: bool) -> vec2<f32> {
+    if (kk >= k) {
+        return vec2<f32>(0.0);
+    }
+    let i0 = row * k + kk;
+    if (k_even) {
+        let word = x[i0 >> 1u];
+        return vec2<f32>(pie_bf16_to_f32(word & 0xffffu), pie_bf16_to_f32(word >> 16u));
+    }
+    var hi = 0.0;
+    if (kk + 1u < k) {
+        hi = pie_bf16_at(x[(i0 + 1u) >> 1u], i0 + 1u);
+    }
+    return vec2<f32>(pie_bf16_at(x[i0 >> 1u], i0), hi);
 }
 
-fn load_w_word(col: u32, kk: u32) -> u32 {
-    return w[(col * u32(params.k) + kk) >> 1u];
+fn w_pair(col: u32, kk: u32, k: u32, k_even: bool) -> vec2<f32> {
+    if (kk >= k) {
+        return vec2<f32>(0.0);
+    }
+    let i0 = col * k + kk;
+    if (k_even) {
+        let word = w[i0 >> 1u];
+        return vec2<f32>(pie_bf16_to_f32(word & 0xffffu), pie_bf16_to_f32(word >> 16u));
+    }
+    var hi = 0.0;
+    if (kk + 1u < k) {
+        hi = pie_bf16_at(w[(i0 + 1u) >> 1u], i0 + 1u);
+    }
+    return vec2<f32>(pie_bf16_at(w[i0 >> 1u], i0), hi);
 }
 
 @compute @workgroup_size(16, 16, 1)
@@ -141,54 +165,42 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     for (var kb = 0u; kb < k; kb = kb + PIE_BK) {
         workgroupBarrier();
 
-        for (var e = flat; e < PIE_BM * 8u; e = e + PIE_LANES) {
-            let r = e / 8u;
-            let kk = (e - r * 8u) * 2u;
-            let row = tile_row + r;
-            var lo = 0.0;
-            var hi = 0.0;
-            if (row < m && kb + kk < k) {
-                if (k_even) {
-                    let word = load_x_word(row, kb + kk);
-                    lo = pie_bf16_to_f32(word & 0xffffu);
-                    if (kb + kk + 1u < k) {
-                        hi = pie_bf16_to_f32(word >> 16u);
-                    }
-                } else {
-                    let i0 = row * k + kb + kk;
-                    lo = pie_bf16_at(x[i0 >> 1u], i0);
-                    if (kb + kk + 1u < k) {
-                        hi = pie_bf16_at(x[(i0 + 1u) >> 1u], i0 + 1u);
-                    }
+        // Each invocation stores whole vec4s: Metal lowers a store to one
+        // component of a workgroup vector as a read-modify-write of the
+        // whole vector, so invocations filling neighbouring components of
+        // one vec4 race and drop each other's rows.
+        for (var e = flat; e < (PIE_BM / 4u) * 8u; e = e + PIE_LANES) {
+            let rq = e / 8u;
+            let kk = (e - rq * 8u) * 2u;
+            var lo = vec4<f32>(0.0);
+            var hi = vec4<f32>(0.0);
+            for (var j = 0u; j < 4u; j = j + 1u) {
+                let row = tile_row + rq * 4u + j;
+                if (row < m) {
+                    let pair = x_pair(row, kb + kk, k, k_even);
+                    lo[j] = pair.x;
+                    hi[j] = pair.y;
                 }
             }
-            xs[kk * (PIE_BM / 4u) + r / 4u][r & 3u] = lo;
-            xs[(kk + 1u) * (PIE_BM / 4u) + r / 4u][r & 3u] = hi;
+            xs[kk * (PIE_BM / 4u) + rq] = lo;
+            xs[(kk + 1u) * (PIE_BM / 4u) + rq] = hi;
         }
 
-        for (var e = flat; e < PIE_BN * 8u; e = e + PIE_LANES) {
-            let c = e / 8u;
-            let kk = (e - c * 8u) * 2u;
-            let col = tile_col + c;
-            var lo = 0.0;
-            var hi = 0.0;
-            if (col < n && kb + kk < k) {
-                if (k_even) {
-                    let word = load_w_word(col, kb + kk);
-                    lo = pie_bf16_to_f32(word & 0xffffu);
-                    if (kb + kk + 1u < k) {
-                        hi = pie_bf16_to_f32(word >> 16u);
-                    }
-                } else {
-                    let i0 = col * k + kb + kk;
-                    lo = pie_bf16_at(w[i0 >> 1u], i0);
-                    if (kb + kk + 1u < k) {
-                        hi = pie_bf16_at(w[(i0 + 1u) >> 1u], i0 + 1u);
-                    }
+        for (var e = flat; e < PIE_BN4 * 8u; e = e + PIE_LANES) {
+            let cq = e / 8u;
+            let kk = (e - cq * 8u) * 2u;
+            var lo = vec4<f32>(0.0);
+            var hi = vec4<f32>(0.0);
+            for (var j = 0u; j < 4u; j = j + 1u) {
+                let col = tile_col + cq * 4u + j;
+                if (col < n) {
+                    let pair = w_pair(col, kb + kk, k, k_even);
+                    lo[j] = pair.x;
+                    hi[j] = pair.y;
                 }
             }
-            ws[kk * PIE_BN4 + c / 4u][c & 3u] = lo;
-            ws[(kk + 1u) * PIE_BN4 + c / 4u][c & 3u] = hi;
+            ws[kk * PIE_BN4 + cq] = lo;
+            ws[(kk + 1u) * PIE_BN4 + cq] = hi;
         }
         workgroupBarrier();
         for (var kk = 0u; kk < PIE_BK; kk = kk + 1u) {

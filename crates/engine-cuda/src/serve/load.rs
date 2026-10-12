@@ -49,14 +49,12 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     } else {
         Vec::new()
     };
-    boot.trace = poem_ir::fuse::residual_norm(boot.trace.clone());
-    if boot.knobs.diagnostics.fuse_chains {
-        boot.trace = poem_ir::fuse::residual_chains(boot.trace.clone());
-        boot.trace = poem_ir::fuse::gemm_epilogues(boot.trace.clone());
-        boot.trace = poem_ir::fuse::modulation(boot.trace.clone());
-        boot.trace = poem_ir::fuse::q_norm_rope(boot.trace.clone());
-        boot.trace = poem_ir::fuse::embed_select(boot.trace.clone());
-    }
+    let kernels: &[&str] = if boot.knobs.diagnostics.fuse_chains {
+        &crate::FUSED
+    } else {
+        &crate::UNCHAINED
+    };
+    boot.trace = poem_compiler::fuse::fuse(boot.trace.clone(), kernels);
     if boot.knobs.diagnostics.trace_census {
         let mut census: std::collections::BTreeMap<&'static str, usize> =
             std::collections::BTreeMap::new();
@@ -428,7 +426,7 @@ impl Shell {
             crate::store::window_of(&boot.trace)?,
             boot.budget.max_tokens,
         );
-        let decode_dense = landing_requests(boot.classify, &compiled.classes)
+        let decode_dense = landing_requests(&boot.trace.facts, &compiled.classes)
             .iter()
             .flatten()
             .any(poem_ir::Request::denoise);
@@ -448,7 +446,7 @@ impl Shell {
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB before weights",
-                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+                crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
         let mut weights = Weights::resident(
@@ -468,7 +466,7 @@ impl Shell {
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB after weights resident",
-                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+                crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
         let (compiled, budgets, tiles) = refit(
@@ -543,7 +541,7 @@ impl Shell {
         crate::window::no_grouped_window_is_also_a_prepare_window(&compiled)?;
         let masked = masked_classes(&boot.trace, &compiled);
         let corrected = corrected_classes(&boot.trace, &compiled);
-        let landing = landing_requests(boot.classify, &compiled.classes);
+        let landing = landing_requests(&boot.trace.facts, &compiled.classes);
         let decoding = decoding_of(&landing);
         let feeds = Feeds::of(&boot.trace, &compiled);
         // A wide body is captured from representative lanes and keyed by the
@@ -559,7 +557,7 @@ impl Shell {
                         && requests.iter().all(|request| {
                             !request.denoise()
                                 && request.stream() == poem_ir::Stream::Text
-                                && request.reading() == 0
+                                && request.reading().is_none()
                         })
                         && !feeds
                             .ports
@@ -578,13 +576,13 @@ impl Shell {
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB after rotate",
-                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+                crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB after weights",
-                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+                crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
         let pools = Pools::reserve(
@@ -597,7 +595,7 @@ impl Shell {
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB after pools",
-                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+                crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
         let buffers = Buffers::reserve(&boot.trace, paging, &pools)?;
@@ -643,11 +641,6 @@ impl Shell {
                     row_bytes: width * element,
                     images: u64::from(ladder.max_images),
                     dtype: *dtype,
-                    embed_taps: declared_width(&boot.trace, poem_ir::RuntimeInput::PatchEmbedRows),
-                    embed_weights: declared_width(
-                        &boot.trace,
-                        poem_ir::RuntimeInput::PatchEmbedWeights,
-                    ) > 0,
                 })
             })
         });
@@ -688,7 +681,7 @@ impl Shell {
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB after buffers",
-                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+                crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
         let inputs = Inputs::reserve(
@@ -729,7 +722,7 @@ impl Shell {
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB after inputs",
-                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+                crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
         let readout_rows = crate::device::Buffer::zeroed(
@@ -771,7 +764,6 @@ impl Shell {
             decoding,
             tiers,
             landing,
-            classify: boot.classify,
             armed: None,
             media,
             shifted,
@@ -962,7 +954,7 @@ impl Shell {
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB before arming",
-                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+                crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
         shell.arm_bodies()?;

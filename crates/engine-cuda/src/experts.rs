@@ -631,7 +631,7 @@ fn routed(
         }
         if dense {
             let plane = bytes[at];
-            if plane == 0 || plane % u64::from(experts) != 0 {
+            if plane == 0 || !plane.is_multiple_of(u64::from(experts)) {
                 return Err(Fault::Param {
                     name: param.name.clone(),
                     why: "is a routed expert bank whose bytes do not divide by its expert \
@@ -921,19 +921,17 @@ impl Tier {
             })
             .collect();
         let spilled = plan.groups().iter().any(|group| group.held == Held::Mapped);
-        if spilled {
-            if !pageable_access() {
-                return Err(Fault::Residency(format!(
-                    "this load plans {} bytes onto the mapped tier and this device does \
+        if spilled && !pageable_access() {
+            return Err(Fault::Residency(format!(
+                "this load plans {} bytes onto the mapped tier and this device does \
                      not report `pageableMemoryAccess` (CUDA 12.2+ HMM), so a GPU touch \
                      of a mapped page cannot fault it in. The T2 arm needs it: \
                      registering the mapping instead would page-lock every byte of it, \
                      which is the pinned tier under another name and is exactly what \
                      `host_weight_budget` said this machine does not have. Raise a \
                      budget, or run on a device that reports the attribute.",
-                    plan.spill_demand(),
-                )));
-            }
+                plan.spill_demand(),
+            )));
         }
         let mut mapped = Vec::new();
         for group in plan.groups() {
@@ -1886,22 +1884,20 @@ fn pinned_address_of(seat: &Seat, expert: u32) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use poem_dsl::Platform;
+    use poem::Platform;
 
     use super::*;
 
     fn a3b() -> Trace {
-        let trace = models::sku("qwen35-a3b-bf16-kv-bf16")
-            .expect("the catalog ships the SKU")
-            .trace;
-        trace(Platform::Cuda)
+        poem_compiler::catalog::deployment("qwen35-a3b-bf16-kv-bf16")
+            .expect("the catalog ships the deployment")
+            .trace(Platform::Cuda)
     }
 
     fn gpt_oss() -> Trace {
-        let trace = models::sku("gptoss-20b-bf16-mxfp4-kv-bf16")
-            .expect("the catalog ships the SKU")
-            .trace;
-        trace(Platform::Cuda)
+        poem_compiler::catalog::deployment("gptoss-20b-bf16-mxfp4-kv-bf16")
+            .expect("the catalog ships the deployment")
+            .trace(Platform::Cuda)
     }
 
     fn scales_of(trace: &Trace) -> Attachments {
@@ -1917,7 +1913,7 @@ mod tests {
             .enumerate()
             .filter(|(_, param)| param.dtype == poem_ir::Dtype::Mxfp4)
             .map(|(codes, param)| {
-                let scales = poem_dsl::scales_name(&param.name);
+                let scales = poem::scales_name(&param.name);
                 let scales = *at
                     .get(scales.as_str())
                     .unwrap_or_else(|| panic!("`{}` declares no scales plane", param.name));

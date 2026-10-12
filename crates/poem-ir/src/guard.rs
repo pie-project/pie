@@ -116,6 +116,25 @@ impl Guard {
         }
     }
 
+    /// The conjuncts, of any arm, that every arm implies: what the arms
+    /// share in meaning however each spells it. `common` sees only a
+    /// conjunct the arms spell alike, and a simplifier is free to drop one
+    /// an arm already implies (`¬m ∧ ¬(b ∧ m)` is `¬m`).
+    #[must_use]
+    pub fn implied(arms: &[Guard]) -> Guard {
+        let mut candidates: Vec<&Guard> = Vec::new();
+        for arm in arms {
+            arm.conjuncts(&mut candidates);
+        }
+        let mut kept: Vec<Guard> = Vec::new();
+        for candidate in candidates {
+            if !kept.contains(candidate) && arms.iter().all(|arm| arm.implies(candidate)) {
+                kept.push(candidate.clone());
+            }
+        }
+        kept.into_iter().fold(Guard::Always, Guard::and)
+    }
+
     #[must_use]
     pub fn common(arms: &[Guard]) -> Guard {
         let Some((first, rest)) = arms.split_first() else {

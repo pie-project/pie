@@ -184,8 +184,8 @@ def main() -> None:
                     cmd = [PIE_PY, "pie_bench.py"] + run + [
                         "--engine", "metal", "--inferlet-dir", args.inferlet_dir]
                     cmd += args.pie_extra.split() if args.pie_extra else []
-                    env = {"PYTHONPATH": f"{REPO}/python/client/src:"
-                                         f"{REPO}/python/server/python"}
+                    env = {"PYTHONPATH": f"{REPO}/packages/python/client/src:"
+                                         f"{REPO}/packages/python/server/python"}
                 elif engine == "mlx":
                     cmd, env = [MLX_PY, "mlx_bench.py"] + run, None
                     if args.mlx_extra:

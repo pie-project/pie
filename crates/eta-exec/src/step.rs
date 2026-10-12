@@ -181,6 +181,13 @@ pub trait StageRunner {
     fn binds(&self, _id: Option<IntrinsicId>) -> bool {
         false
     }
+
+    /// Whether the runner keeps `channel`'s cell itself between fires: a
+    /// take of it hands the runner an empty value rather than the ring's
+    /// cell, and a put of an empty value leaves the ring's bytes as they are.
+    fn keeps(&self, _channel: u32) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -223,6 +230,10 @@ fn exec_stage(
         let root = &plan.package.values[id as usize];
         let cell = match root.source {
             ValueOrigin::Const => const_root_value(root),
+            ValueOrigin::ChannelTake if runner.keeps(root.channel) => {
+                overlay.taken[root.channel as usize] = true;
+                Value::F32(Vec::new())
+            }
             ValueOrigin::ChannelTake => overlay.take(inst, root.channel),
             ValueOrigin::ChannelRead => overlay.resolve(inst, root.channel),
             ValueOrigin::Intrinsic if runner.binds(root.intrinsic) => Value::F32(Vec::new()),

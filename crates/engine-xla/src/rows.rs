@@ -1,7 +1,7 @@
 //! Values the model text rows by `Tokens` on a readout-rowed path.
 //!
 //! A few plan builders state their outputs' rows as `Tokens` (or
-//! `TokensTimes(k)`) whatever their inputs' rows are (poem-dsl's MoE
+//! `TokensTimes(k)`) whatever their inputs' rows are (poem's MoE
 //! routers and routed matmuls), so an MTP head that runs over `Readouts`
 //! rows feeds token-rowed routing tables, expert rows and sums into its
 //! readout-rowed residual. A GPU engine never notices: its buffers are sized

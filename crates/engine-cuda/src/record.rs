@@ -191,7 +191,7 @@ pub fn widen(compiled: &CompiledModel, admits: &[Admit]) -> Vec<Admit> {
     let mut table: Vec<Admit> = (0..template.len())
         .map(|at| admits.get(at).copied().unwrap_or(Admit::Island))
         .collect();
-    if !table.iter().any(|admit| *admit == Admit::Island) {
+    if !table.contains(&Admit::Island) {
         return table;
     }
     let welded = welds(compiled);
@@ -289,7 +289,7 @@ pub fn cuts(
 ) -> core::result::Result<Vec<Stretch>, Uncut> {
     let template = compiled.template();
     let table = widen(compiled, admits);
-    if table.iter().any(|admit| *admit == Admit::Island) {
+    if table.contains(&Admit::Island) {
         let mut seen: Vec<(&poem_ir::ClassSet, Admit)> = Vec::new();
         for (index, region) in template.iter().enumerate() {
             let planned = template.iter().any(|other| {
@@ -1126,7 +1126,7 @@ impl Recorder {
         static PRICE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
         *PRICE.get_or_init(|| {
             let nodes = graph.nodes().filter(|nodes| *nodes > 0)?;
-            let (bytes, _) = crate::device::nodes::exec_footprint(graph, COPIES).ok()?;
+            let bytes = graph.instantiated_bytes(COPIES).ok()?;
             let price = (bytes > 0.0).then(|| (bytes / nodes as f64).ceil() as usize);
             if crate::serve::diag::on().arm_trace {
                 eprintln!(

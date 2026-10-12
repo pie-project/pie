@@ -141,8 +141,7 @@ pub struct Media<'a> {
     pub patches: &'a [u8],
     pub routes: &'a [i32],
     pub positions: &'a [i32],
-    pub embed_rows: &'a [i32],
-    pub embed_weights: &'a [f32],
+    pub grids: &'a [i32],
     pub token_positions: &'a [i32],
 }
 
@@ -259,6 +258,8 @@ pub struct Shell {
     trace: Trace,
     compiled: CompiledModel,
     budgets: Budgets,
+    /// The Neural Engine's share of the dense MLPs, when this load has one.
+    ane: Option<crate::ane::Ane>,
     weights: Weights,
     arena: Arena,
     pools: Pools,
@@ -344,7 +345,7 @@ impl Shell {
             });
         }
         let boot = Boot {
-            trace: poem_ir::fuse::residual_norm(boot.trace),
+            trace: poem_compiler::fuse::fuse(boot.trace, &crate::FUSED),
             ..boot
         };
         let device = Context::bind()?;
@@ -512,6 +513,11 @@ impl Shell {
         weights.decode_absorbed(&device, &handles, &boot.trace)?;
         weights.relabel_conv_weights(&device, &handles, &boot.trace)?;
         weights.repack_mpp(&device, &handles, &boot.trace)?;
+        let ane =
+            crate::ane::load(&device, &handles, &boot.trace, &weights).unwrap_or_else(|why| {
+                eprintln!("PIE_ANE: staying on the GPU: {why}");
+                None
+            });
         handles.seal();
 
         let paging_of = |pages: u64| Paging::of(boot.page_size, boot.context, boot.slots, pages);
@@ -635,8 +641,6 @@ impl Shell {
                     row_bytes: width * element,
                     images: u64::from(ladder.max_images),
                     dtype: *dtype,
-                    embed_taps: declared_width(&boot.trace, RuntimeInput::PatchEmbedRows),
-                    embed_weights: declared_width(&boot.trace, RuntimeInput::PatchEmbedWeights) > 0,
                 })
             })
         });
@@ -962,6 +966,7 @@ impl Shell {
             trace: boot.trace,
             compiled,
             budgets,
+            ane,
             weights,
             arena,
             pools,
@@ -1072,6 +1077,12 @@ impl Shell {
     #[must_use]
     pub fn held(&self, slot: u32) -> u32 {
         self.held.get(slot as usize).copied().unwrap_or(0)
+    }
+
+    /// The Neural Engine's share of this load, if it has one.
+    #[must_use]
+    pub fn neural_engine(&self) -> Option<&crate::ane::Ane> {
+        self.ane.as_ref()
     }
 
     #[must_use]
@@ -2493,18 +2504,9 @@ impl Shell {
                     patch_rows * 3,
                 ),
                 (
-                    "position-table taps",
-                    shot.embed_rows.len() as u64,
-                    patch_rows * seat.embed_taps,
-                ),
-                (
-                    "interpolation weights",
-                    shot.embed_weights.len() as u64,
-                    if seat.embed_weights {
-                        patch_rows * seat.embed_taps
-                    } else {
-                        0
-                    },
+                    "image grids",
+                    shot.grids.len() as u64,
+                    shot.rows.len() as u64 * 3,
                 ),
             ] {
                 if have != want {
@@ -2962,20 +2964,16 @@ impl Shell {
         let mut patch_segments: Vec<i32> = Vec::new();
         let mut patch_routes: Vec<i32> = Vec::new();
         let mut patch_positions: Vec<i32> = Vec::new();
-        let mut patch_embed_rows: Vec<i32> = Vec::new();
-        let mut patch_embed_weights: Vec<f32> = Vec::new();
+        let mut patch_grids: Vec<i32> = Vec::new();
         if patch_rows > 0 {
             let seat = self.patch_seat.expect(
                 "a composition with patch rows came out of budgets with a patch ladder, and \
                  the seat is derived from the same trace the ladder admitted",
             );
             let stride = seat.row_bytes as usize;
-            let taps = seat.embed_taps as usize;
-            let weight_taps = if seat.embed_weights { taps } else { 0 };
             patch_payload = vec![0u8; patch_rows * stride];
             patch_positions = vec![0i32; patch_rows * 3];
-            patch_embed_rows = vec![0i32; patch_rows * taps];
-            patch_embed_weights = vec![0.0f32; patch_rows * weight_taps];
+            patch_grids = vec![0i32; composition.images() as usize * 3];
             patch_routes = vec![
                 if self.drops_patch_rows {
                     PATCH_ROUTE_DROP
@@ -3003,16 +3001,8 @@ impl Shell {
                 let triples = row.patch_offset as usize * 3;
                 patch_positions[triples..triples + shot.positions.len()]
                     .copy_from_slice(shot.positions);
-                if taps > 0 {
-                    let at_ids = row.patch_offset as usize * taps;
-                    patch_embed_rows[at_ids..at_ids + shot.embed_rows.len()]
-                        .copy_from_slice(shot.embed_rows);
-                }
-                if weight_taps > 0 {
-                    let at_w = row.patch_offset as usize * weight_taps;
-                    patch_embed_weights[at_w..at_w + shot.embed_weights.len()]
-                        .copy_from_slice(shot.embed_weights);
-                }
+                let at_grids = row.image_offset as usize * 3;
+                patch_grids[at_grids..at_grids + shot.grids.len()].copy_from_slice(shot.grids);
                 for (i, &rows) in shot.rows.iter().enumerate() {
                     per_image[row.image_offset as usize + i] = rows;
                 }
@@ -3378,8 +3368,7 @@ impl Shell {
                     segments: &patch_segments,
                     routes: &patch_routes,
                     positions: &patch_positions,
-                    embed_rows: &patch_embed_rows,
-                    embed_weights: &patch_embed_weights,
+                    grids: &patch_grids,
                 }),
                 voxels: (composition.clips() > 0).then_some(crate::inputs::VoxelFire {
                     grid: &voxel_grid,
@@ -3452,8 +3441,7 @@ impl Shell {
             patch_segments: patch_seats.map(|seats| seats.segments),
             patch_routes: patch_seats.map(|seats| seats.routes),
             patch_positions: patch_seats.map(|seats| seats.positions),
-            patch_embed_rows: patch_seats.and_then(|seats| seats.embed_rows),
-            patch_embed_weights: patch_seats.and_then(|seats| seats.embed_weights),
+            patch_grids: patch_seats.map(|seats| seats.grids),
             mrope_positions: bound.mrope_positions,
             self_cond_rows: bound.self_cond_rows,
             self_cond_weights: bound.self_cond_weights,
@@ -3740,12 +3728,17 @@ impl Shell {
             self.land_merges(frame, p)?;
         }
         let sink = match mode {
-            Mode::Encode => Encoded::Live(Sink::new(
-                &self.device,
-                frame.as_ref().expect("the encoding mode opened a frame"),
-                &self.pipelines,
-                &self.handles,
-            )),
+            Mode::Encode => {
+                let sink = Sink::new(
+                    &self.device,
+                    frame.as_ref().expect("the encoding mode opened a frame"),
+                    &self.pipelines,
+                    &self.handles,
+                );
+                #[cfg(target_vendor = "apple")]
+                let sink = sink.with_handoff(self.ane.as_ref().map(crate::ane::Ane::handoff));
+                Encoded::Live(sink)
+            }
             Mode::Record | Mode::Replay => {
                 Encoded::Taped(Tape::new(&self.handles, &place, &p.windows))
             }
@@ -3774,7 +3767,8 @@ impl Shell {
                 &p.windows,
                 &place,
                 &self.scratch,
-            );
+            )
+            .with_ane(self.ane.as_ref().filter(|_| matches!(mode, Mode::Encode)));
             walk(
                 &self.trace,
                 &self.compiled,
@@ -4337,8 +4331,10 @@ impl engine::frame::Shell for Shell {
         let seq = self.airborne.enter();
         let counts = self.airborne.clone();
         let done = prepared.done.take();
+        let verdict = self.ane.as_ref().and_then(crate::ane::Ane::verdict);
         let pending = frame.commit_async(Some(Box::new(move |refused: Option<String>| {
             counts.leave();
+            let refused = refused.or_else(|| verdict.as_ref().and_then(|verdict| verdict()));
             if let Some(done) = done.as_ref() {
                 let outcome = match &refused {
                     None => engine::StepOutcome::Committed,
@@ -4429,6 +4425,36 @@ impl kernels_metal::Encode for Encoded<'_> {
             Encoded::Taped(tape) => tape.absent(),
             #[cfg(target_vendor = "apple")]
             Encoded::Built(builder) => builder.absent(),
+        }
+    }
+
+    fn signal(&self, stamp: u64) -> std::result::Result<(), kernels_metal::Error> {
+        match self {
+            Encoded::Live(sink) => sink.signal(stamp),
+            Encoded::Taped(tape) => tape.signal(stamp),
+            #[cfg(target_vendor = "apple")]
+            Encoded::Built(builder) => builder.signal(stamp),
+        }
+    }
+
+    fn wait(&self, stamp: u64) -> std::result::Result<(), kernels_metal::Error> {
+        match self {
+            Encoded::Live(sink) => sink.wait(stamp),
+            Encoded::Taped(tape) => tape.wait(stamp),
+            #[cfg(target_vendor = "apple")]
+            Encoded::Built(builder) => builder.wait(stamp),
+        }
+    }
+
+    fn on_commit(
+        &self,
+        then: Box<dyn FnOnce() + Send>,
+    ) -> std::result::Result<(), kernels_metal::Error> {
+        match self {
+            Encoded::Live(sink) => sink.on_commit(then),
+            Encoded::Taped(tape) => tape.on_commit(then),
+            #[cfg(target_vendor = "apple")]
+            Encoded::Built(builder) => builder.on_commit(then),
         }
     }
 }

@@ -295,6 +295,13 @@ impl Builder<'_> {
                 let (value, _) = self.operand_bytes(src, &operand)?;
                 self.convert(value, operand, to)?
             }
+            Expr::Const { .. } => {
+                return Err(Error::Internal(
+                    "Const reached plan building; plan::compile reads a constant as \
+                     the source tensor it mounts"
+                        .to_string(),
+                ));
+            }
             Expr::Src(_)
             | Expr::Out(_)
             | Expr::Fill { .. }

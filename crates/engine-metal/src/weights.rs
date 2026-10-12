@@ -221,6 +221,7 @@ impl Weights {
                     biases: pairing.biases.map(|at| dense(&places[at])).transpose()?,
                     group: pairing.group,
                     bits: pairing.bits,
+                    ld: place.width,
                 }),
                 // PTQ1_0 is a single-inline-plane ternary codec (its fp16 scale
                 // lives inside each 28-byte block), so it pairs with no separate
@@ -236,6 +237,7 @@ impl Weights {
                     group: 128,
                     bits: 2,
                     mpp_codes: None,
+                    ld: place.width,
                 }),
                 None => WeightRow::Dense(dense(place)?),
             }));
@@ -444,12 +446,10 @@ impl Weights {
         }
         let mut dense = vec![false; trace.params.len()];
         for node in &trace.nodes {
-            if let poem_ir::Operation::Linear(
-                poem_ir::Linear::Matmul { w, .. } | poem_ir::Linear::LmHead { w, .. },
-            ) = &node.op
-                && let poem_ir::Def::Weight(at) = trace.values[w.0 as usize].def
-            {
-                dense[at as usize] = true;
+            for (_, w, _) in crate::legs::matmuls(&node.op) {
+                if let poem_ir::Def::Weight(at) = trace.values[w.0 as usize].def {
+                    dense[at as usize] = true;
+                }
             }
         }
         let pipelines = Pipelines::new();
@@ -703,7 +703,7 @@ pub(crate) fn readable_plane_orders(trace: &Trace) -> Result<()> {
                   this shell has no reader for: its qmm and qmv arms index an affine bank \
                   row-major and would answer nonsense off a relaid plane. The order is \
                   `kernels_cuda::linear::tiled`'s, and a model text reaches it only by asking \
-                  for it: `poem_dsl::place` resolves a placed dtype against the platform the \
+                  for it: `poem::place` resolves a placed dtype against the platform the \
                   declaration is read for, and this platform's answer is the canonical \
                   row-major sibling. So either this plane came out of an artifact converted \
                   FOR the cuda shell — convert it again on this box, or serve it there — or a \
@@ -712,7 +712,7 @@ pub(crate) fn readable_plane_orders(trace: &Trace) -> Result<()> {
     }
 }
 
-pub(crate) fn serves_this_deployment(path: &Path, backend: &str, sku: &str) -> Result<()> {
+pub(crate) fn serves_this_deployment(path: &Path, backend: &str, deployment: &str) -> Result<()> {
     if path.is_dir() {
         return Ok(());
     }
@@ -721,9 +721,9 @@ pub(crate) fn serves_this_deployment(path: &Path, backend: &str, sku: &str) -> R
         Ok(Some(stamp)) => stamp,
         Err(why) => return Err(Fault::Recipe(format!("checkpoint: {why}"))),
     };
-    let deployment = Stamp::of(backend, sku);
+    let wanted = Stamp::of(backend, deployment);
     artifact
-        .check(&deployment)
+        .check(&wanted)
         .map_err(|mismatch| Fault::Recipe(mismatch.refuse(&path.display().to_string())))
 }
 
@@ -1071,14 +1071,18 @@ fn warm(
     let mut table = Vec::with_capacity(places.len());
     for (index, param) in trace.params.iter().enumerate() {
         let entry = match pairings.get(param.name.as_str()) {
-            Some(pairing) => WeightRow::Planes(kernels_metal::Bank {
-                mpp_codes: None,
-                codes: row(index)?,
-                scales: row(pairing.scales)?,
-                biases: pairing.biases.map(row).transpose()?,
-                group: pairing.group,
-                bits: pairing.bits,
-            }),
+            Some(pairing) => {
+                let codes = row(index)?;
+                WeightRow::Planes(kernels_metal::Bank {
+                    mpp_codes: None,
+                    ld: codes.width,
+                    codes,
+                    scales: row(pairing.scales)?,
+                    biases: pairing.biases.map(row).transpose()?,
+                    group: pairing.group,
+                    bits: pairing.bits,
+                })
+            }
             // PTQ1_0 is a single-inline-plane ternary codec: the fp16 scale lives
             // INSIDE each 28-byte block, so it pairs with no `.scales`/`.biases`
             // plane. It must still resolve as a quantized BANK (not a dense plane),
@@ -1086,14 +1090,18 @@ fn warm(
             // garbage. The decode-in-dot kernel keys off `codes.dtype == Ptq1_0`
             // and never touches `scales`/`group`/`bits`, so the codes plane doubles
             // as the (unused) scales placeholder.
-            None if param.dtype == Dtype::Ptq1_0 => WeightRow::Planes(kernels_metal::Bank {
-                codes: row(index)?,
-                scales: row(index)?,
-                biases: None,
-                group: 128,
-                bits: 2,
-                mpp_codes: None,
-            }),
+            None if param.dtype == Dtype::Ptq1_0 => {
+                let codes = row(index)?;
+                WeightRow::Planes(kernels_metal::Bank {
+                    ld: codes.width,
+                    codes,
+                    scales: row(index)?,
+                    biases: None,
+                    group: 128,
+                    bits: 2,
+                    mpp_codes: None,
+                })
+            }
             None => WeightRow::Dense(row(index)?),
         };
         table.push(Some(entry));
@@ -1340,12 +1348,11 @@ mod tests {
     }
 
     fn the_store_is_laid_out_aligned_disjoint_and_in_plan_order() {
-        let trace = models::sku("qwen35-d0.8b-bf16-kv-bf16")
-            .expect("the catalog ships the SKU")
-            .trace;
-        let trace = trace(Platform::Metal);
+        let trace = poem_compiler::catalog::deployment("qwen35-d0.8b-bf16-kv-bf16")
+            .expect("the catalog ships the deployment")
+            .trace(Platform::Metal);
         let places = places(&trace, &Plan::default(), &gather::Plan::default())
-            .expect("every param of a bf16 SKU has an element size");
+            .expect("every param of a bf16 deployment has an element size");
 
         assert_eq!(places.len(), trace.params.len());
         let mut end = 0u64;

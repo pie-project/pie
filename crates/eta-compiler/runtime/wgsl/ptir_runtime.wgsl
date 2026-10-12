@@ -33,6 +33,11 @@ var<private> tid : u32;
 
 var<private> lanes : u32;
 
+// The invocation within its workgroup, the workgroup, and how many run.
+var<private> sel_lt : u32;
+var<private> sel_group : u32;
+var<private> sel_groups : u32;
+
 
 fn d_len(v : u32) -> u32 { return descs[v * DESC_WORDS + 0u]; }
 fn d_rows(v : u32) -> u32 { return descs[v * DESC_WORDS + 1u]; }
@@ -1308,6 +1313,301 @@ fn op_pivot_finish(p : u32) {
     }
     st_b_word(o, w, n, b[0], b[1], b[2], b[3]);
   }
+}
+
+// A one-row PivotThreshold by radix select rather than a sort of the row.
+// Four 8-bit histogram passes find the want-th smallest sort key: for RankLe
+// that key is the cut itself (keep x when key(x) <= it, ties and all); for
+// CummassLe it bounds the SEL_CAP heaviest candidates, which one workgroup
+// sorts and walks in the reference's order. A row whose mass those do not
+// reach, or that holds a negative or NaN, takes the sort ladder after all.
+// The state sits in the SEL_WORDS just below the temporary area, which the
+// ladder overwrites; eta-exec's scratch layout reserves them.
+
+const SEL_CAP : u32 = 1024u;
+const SEL_GROUPS : u32 = 32u;
+const SEL_WORDS : u32 = 10320u;
+
+const SEL_MODE : u32 = 0u;
+const SEL_ACTIVE : u32 = 1u;
+const SEL_WANT : u32 = 2u;
+const SEL_PREFIX : u32 = 3u;
+const SEL_REMAINING : u32 = 4u;
+const SEL_TOTAL_LT : u32 = 5u;
+const SEL_KEEP : u32 = 6u;
+
+// SEL_MODE: the select runs, has decided the row, or hands it to the ladder.
+const SEL_RUNS : u32 = 0u;
+const SEL_DECIDED : u32 = 1u;
+const SEL_LADDER : u32 = 2u;
+
+// SEL_KEEP for RankLe: the cut decides, or every non-NaN lane is kept, or none.
+const SEL_KEEP_CUT : u32 = 0u;
+const SEL_KEEP_ALL : u32 = 1u;
+const SEL_KEEP_NONE : u32 = 2u;
+
+var<workgroup> sel_wg_hist : array<atomic<u32>, 256>;
+var<workgroup> sel_wg_fill : array<atomic<u32>, 2>;
+var<workgroup> sel_wg_key : array<u32, 1024>;
+var<workgroup> sel_wg_idx : array<u32, 1024>;
+var<workgroup> sel_wg_skip : u32;
+
+fn sel_at(k : u32) -> u32 { return cfg.temporary - SEL_WORDS + k; }
+fn sel_part(g : u32, b : u32) -> u32 { return sel_at(16u + g * 256u + b); }
+fn sel_count(g : u32, which : u32) -> u32 { return sel_at(16u + SEL_GROUPS * 256u + g * 2u + which); }
+fn sel_cand_key(i : u32) -> u32 { return sel_at(16u + SEL_GROUPS * 258u + i); }
+fn sel_cand_idx(i : u32) -> u32 { return sel_at(16u + SEL_GROUPS * 258u + SEL_CAP + i); }
+
+// Whether this workgroup sits the step out; uniform across it.
+fn sel_skips(only_first : bool) -> bool {
+  if (sel_lt == 0u) {
+    let busy = heap[sel_at(SEL_ACTIVE)];
+    let idle = select(sel_group >= busy, sel_group != 0u, only_first);
+    sel_wg_skip = select(0u, 1u, heap[sel_at(SEL_MODE)] != SEL_RUNS || idle);
+  }
+  return workgroupUniformLoad(&sel_wg_skip) != 0u;
+}
+
+fn sel_chunk(n : u32) -> vec2<u32> {
+  let busy = heap[sel_at(SEL_ACTIVE)];
+  let chunk = (n + busy - 1u) / busy;
+  let lo = min(sel_group * chunk, n);
+  return vec2<u32>(lo, min(lo + chunk, n));
+}
+
+// The ladder's steps run only for a row the select handed over.
+fn sel_ladder_idle() -> bool {
+  return heap[sel_at(SEL_MODE)] != SEL_LADDER;
+}
+
+fn sel_init(p : u32) {
+  let o = p_o0(p);
+  let n = d_len(p_a0(p));
+  let words = (n + 3u) / 4u;
+  for (var w : u32 = tid; w < words; w = w + lanes) { heap[base(o) + w] = 0u; }
+  if (tid == 0u) {
+    heap[sel_at(SEL_MODE)] = SEL_RUNS;
+    heap[sel_at(SEL_ACTIVE)] = max(min(SEL_GROUPS, sel_groups), 1u);
+    heap[sel_at(SEL_PREFIX)] = 0u;
+    heap[sel_at(SEL_KEEP)] = SEL_KEEP_CUT;
+  }
+}
+
+fn sel_hist(p : u32, sweep : u32) {
+  if (sel_skips(false)) { return; }
+  let a = p_a0(p);
+  let span = sel_chunk(d_len(a));
+  let shift = 24u - 8u * sweep;
+  let prefix = heap[sel_at(SEL_PREFIX)];
+  atomicStore(&sel_wg_hist[sel_lt], 0u);
+  workgroupBarrier();
+  for (var i : u32 = span.x + sel_lt; i < span.y; i = i + PTIR_WG) {
+    let x = ld_f(a, i);
+    if (x != x) { continue; }
+    let key = sort_key(x);
+    if (sweep == 0u || (key >> (shift + 8u)) == (prefix >> (shift + 8u))) {
+      atomicAdd(&sel_wg_hist[(key >> shift) & 255u], 1u);
+    }
+  }
+  workgroupBarrier();
+  heap[sel_part(sel_group, sel_lt)] = atomicLoad(&sel_wg_hist[sel_lt]);
+}
+
+fn sel_pick(p : u32, sweep : u32) {
+  if (sel_skips(true)) { return; }
+  let busy = heap[sel_at(SEL_ACTIVE)];
+  var here : u32 = 0u;
+  for (var g : u32 = 0u; g < busy; g = g + 1u) { here = here + heap[sel_part(g, sel_lt)]; }
+  sel_wg_key[sel_lt] = here;
+  workgroupBarrier();
+  if (sel_lt != 0u) { return; }
+  var remaining = heap[sel_at(SEL_REMAINING)];
+  if (sweep == 0u) {
+    let n = d_len(p_a0(p));
+    var count : u32 = 0u;
+    var negative : u32 = 0u;
+    for (var b : u32 = 0u; b < 256u; b = b + 1u) {
+      count = count + sel_wg_key[b];
+      if (b >= 128u) { negative = negative + sel_wg_key[b]; }
+    }
+    let payload = p_pred_payload(p);
+    var want : u32 = 0u;
+    if (p_pred_tag(p) == 0u) {
+      let k = ld_i(payload, 0u);
+      if (k <= 0) {
+        heap[sel_at(SEL_KEEP)] = SEL_KEEP_NONE;
+        heap[sel_at(SEL_MODE)] = SEL_DECIDED;
+        return;
+      }
+      if (u32(k) >= count) {
+        heap[sel_at(SEL_KEEP)] = SEL_KEEP_ALL;
+        heap[sel_at(SEL_MODE)] = SEL_DECIDED;
+        return;
+      }
+      want = u32(k);
+    } else {
+      let cut = ld_f(payload, 0u);
+      if (!(0.0 < cut)) {
+        heap[sel_at(SEL_MODE)] = SEL_DECIDED;
+        return;
+      }
+      if (negative != 0u || count != n || count == 0u) {
+        heap[sel_at(SEL_MODE)] = SEL_LADDER;
+        return;
+      }
+      want = min(SEL_CAP, count);
+    }
+    heap[sel_at(SEL_WANT)] = want;
+    remaining = want;
+  }
+  let shift = 24u - 8u * sweep;
+  var before : u32 = 0u;
+  var digit : u32 = 0u;
+  loop {
+    if (digit + 1u >= 256u) { break; }
+    let count = sel_wg_key[digit];
+    if (before + count >= remaining) { break; }
+    before = before + count;
+    digit = digit + 1u;
+  }
+  heap[sel_at(SEL_PREFIX)] = heap[sel_at(SEL_PREFIX)] | (digit << shift);
+  heap[sel_at(SEL_REMAINING)] = remaining - before;
+  if (sweep == 3u) {
+    heap[sel_at(SEL_TOTAL_LT)] = heap[sel_at(SEL_WANT)] - (remaining - before);
+  }
+}
+
+fn sel_rank_mask(p : u32) {
+  let a = p_a0(p);
+  let o = p_o0(p);
+  let n = d_len(a);
+  let keep = heap[sel_at(SEL_KEEP)];
+  let cut = heap[sel_at(SEL_PREFIX)];
+  let words = (n + 3u) / 4u;
+  for (var w : u32 = tid; w < words; w = w + lanes) {
+    var b : array<bool, 4>;
+    for (var k : u32 = 0u; k < 4u; k = k + 1u) {
+      let i = w * 4u + k;
+      var on = false;
+      if (i < n && keep != SEL_KEEP_NONE) {
+        let x = ld_f(a, i);
+        on = !(x != x) && (keep == SEL_KEEP_ALL || sort_key(x) <= cut);
+      }
+      b[k] = on;
+    }
+    st_b_word(o, w, n, b[0], b[1], b[2], b[3]);
+  }
+}
+
+// Counts each workgroup's candidates: keys below the cut, and keys at it.
+fn sel_tally(p : u32) {
+  if (sel_skips(false)) { return; }
+  let a = p_a0(p);
+  let span = sel_chunk(d_len(a));
+  let cut = heap[sel_at(SEL_PREFIX)];
+  if (sel_lt < 2u) { atomicStore(&sel_wg_fill[sel_lt], 0u); }
+  workgroupBarrier();
+  for (var i : u32 = span.x + sel_lt; i < span.y; i = i + PTIR_WG) {
+    let key = sort_key(ld_f(a, i));
+    if (key < cut) { atomicAdd(&sel_wg_fill[0], 1u); }
+    else if (key == cut) { atomicAdd(&sel_wg_fill[1], 1u); }
+  }
+  workgroupBarrier();
+  if (sel_lt < 2u) { heap[sel_count(sel_group, sel_lt)] = atomicLoad(&sel_wg_fill[sel_lt]); }
+}
+
+// Writes the candidates out: those below the cut first, then the ties the
+// cap leaves room for.
+fn sel_place(p : u32) {
+  if (sel_skips(false)) { return; }
+  let a = p_a0(p);
+  let span = sel_chunk(d_len(a));
+  let cut = heap[sel_at(SEL_PREFIX)];
+  let below = heap[sel_at(SEL_TOTAL_LT)];
+  var lt_at : u32 = 0u;
+  var eq_at : u32 = 0u;
+  for (var g : u32 = 0u; g < sel_group; g = g + 1u) {
+    lt_at = lt_at + heap[sel_count(g, 0u)];
+    eq_at = eq_at + heap[sel_count(g, 1u)];
+  }
+  if (sel_lt < 2u) { atomicStore(&sel_wg_fill[sel_lt], 0u); }
+  workgroupBarrier();
+  for (var i : u32 = span.x + sel_lt; i < span.y; i = i + PTIR_WG) {
+    let key = sort_key(ld_f(a, i));
+    if (key < cut) {
+      let slot = lt_at + atomicAdd(&sel_wg_fill[0], 1u);
+      heap[sel_cand_key(slot)] = key;
+      heap[sel_cand_idx(slot)] = i;
+    } else if (key == cut) {
+      let slot = below + eq_at + atomicAdd(&sel_wg_fill[1], 1u);
+      if (slot < SEL_CAP) {
+        heap[sel_cand_key(slot)] = key;
+        heap[sel_cand_idx(slot)] = i;
+      }
+    }
+  }
+}
+
+fn st_b_on(v : u32, i : u32) {
+  let at = base(v) + i / 4u;
+  heap[at] = heap[at] | (0xFFu << (8u * (i % 4u)));
+}
+
+// Sorts the candidates by (key, index) and walks them as the reference does.
+fn sel_walk(p : u32) {
+  if (sel_skips(true)) { return; }
+  let a = p_a0(p);
+  let o = p_o0(p);
+  let busy = heap[sel_at(SEL_ACTIVE)];
+  var ties : u32 = 0u;
+  for (var g : u32 = 0u; g < busy; g = g + 1u) { ties = ties + heap[sel_count(g, 1u)]; }
+  let below = heap[sel_at(SEL_TOTAL_LT)];
+  // Ties past the cap landed in no particular order, so the walk trusts
+  // only the keys below the cut then.
+  let held = select(below, below + ties, below + ties <= SEL_CAP);
+  for (var i : u32 = sel_lt; i < SEL_CAP; i = i + PTIR_WG) {
+    if (i < held) {
+      sel_wg_key[i] = heap[sel_cand_key(i)];
+      sel_wg_idx[i] = heap[sel_cand_idx(i)];
+    } else {
+      sel_wg_key[i] = 0xFFFFFFFFu;
+      sel_wg_idx[i] = 0xFFFFFFFFu;
+    }
+  }
+  workgroupBarrier();
+  for (var size : u32 = 2u; size <= SEL_CAP; size = size * 2u) {
+    for (var stride : u32 = size / 2u; stride > 0u; stride = stride / 2u) {
+      for (var t : u32 = sel_lt; t < SEL_CAP / 2u; t = t + PTIR_WG) {
+        let lo = 2u * stride * (t / stride) + (t % stride);
+        let hi = lo + stride;
+        let ascending = (lo & size) == 0u;
+        let klo = sel_wg_key[lo];
+        let khi = sel_wg_key[hi];
+        let ilo = sel_wg_idx[lo];
+        let ihi = sel_wg_idx[hi];
+        let lo_greater = klo > khi || (klo == khi && ilo > ihi);
+        if (lo_greater == ascending) {
+          sel_wg_key[lo] = khi;
+          sel_wg_key[hi] = klo;
+          sel_wg_idx[lo] = ihi;
+          sel_wg_idx[hi] = ilo;
+        }
+      }
+      workgroupBarrier();
+    }
+  }
+  if (sel_lt != 0u) { return; }
+  let cut = ld_f(p_pred_payload(p), 0u);
+  var excl : f32 = 0.0;
+  var reached = false;
+  for (var t : u32 = 0u; t < held; t = t + 1u) {
+    if (!(excl < cut)) { reached = true; break; }
+    let index = sel_wg_idx[t];
+    st_b_on(o, index);
+    excl = excl + ld_f(a, index);
+  }
+  let whole = held == d_len(a);
+  heap[sel_at(SEL_MODE)] = select(SEL_LADDER, SEL_DECIDED, reached || !(excl < cut) || whole);
 }
 
 fn op_matmul(p : u32) {

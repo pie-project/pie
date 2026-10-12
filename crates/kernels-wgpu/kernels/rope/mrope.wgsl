@@ -92,9 +92,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else {
         axis_pos = pos_t;
     }
-    inv_freq = exp2(-(2.0 * f32(i) / f32(params.head_dim)) * params.base_);
+    inv_freq = exp2(-(2.0 * f32(i) / f32(2 * params.pairs)) * params.base_);
     i1 = row + u32(i);
-    i2 = i1 + u32(half_hd);
+    i2 = i1 + u32(params.pairs);
 //#endif
     let theta = f32(axis_pos) * inv_freq;
     let c = cos(theta);

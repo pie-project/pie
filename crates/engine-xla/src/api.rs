@@ -43,10 +43,6 @@ use crate::serve::{Boot, Lane, Seated, Shell};
 
 pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, String>;
 
-/// The request classifier of a trace's model, by trace name (engine-cuda's
-/// `ClassifyFor`): what the warm ladder words its synthetic lanes with.
-pub type ClassifyFor = fn(&str) -> Option<poem_ir::ClassifyFn>;
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceBoot {
     /// The PJRT plugin; `None` finds one (`PIE_XLA_PLUGIN`,
@@ -81,7 +77,6 @@ pub struct Xla {
     programs: crate::program::Plane,
     boot: DeviceBoot,
     contract_for: ContractFor,
-    classify_for: Option<ClassifyFor>,
     shell: Option<Shell>,
     caps: Option<Capabilities>,
     next_fire: FireId,
@@ -112,7 +107,6 @@ impl Xla {
         Xla {
             boot,
             contract_for,
-            classify_for: None,
             shell: None,
             caps: None,
             next_fire: 1,
@@ -122,14 +116,6 @@ impl Xla {
             adapters: BTreeMap::new(),
             pending: None,
         }
-    }
-
-    /// Names the classifier the warm ladder (`PIE_XLA_PREWARM=1`) words its
-    /// lanes with.
-    #[must_use]
-    pub fn with_classify(mut self, classify_for: ClassifyFor) -> Xla {
-        self.classify_for = Some(classify_for);
-        self
     }
 
     #[must_use]
@@ -257,26 +243,13 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
 }
 
 fn patch_bytes(
-    patches: &[f32],
+    patches: &[u8],
     element: poem_ir::Dtype,
 ) -> std::result::Result<Vec<u8>, &'static str> {
     match element {
-        poem_ir::Dtype::Bf16 => Ok(patches
-            .iter()
-            .flat_map(|&v| bf16_bits(v).to_le_bytes())
-            .collect()),
-        poem_ir::Dtype::F32 => Ok(patches.iter().flat_map(|&v| v.to_le_bytes()).collect()),
-        _ => Err(
-            "a media submission against a plan whose activation element is neither \
-                  `bf16` nor `f32`, which is the pair every tower in this catalog computes in",
-        ),
+        poem_ir::Dtype::U8 => Ok(patches.to_vec()),
+        _ => Err("a media submission against a plan whose pixel rows are not u8 bytes"),
     }
-}
-
-fn bf16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let rounding = 0x7fff + ((bits >> 16) & 1);
-    ((bits + rounding) >> 16) as u16
 }
 
 fn profile(shell: &Shell, budgets: &LoadBudgets) -> ModelProfile {
@@ -414,10 +387,8 @@ impl Engine for Xla {
         )
         .map_err(fault)?;
         let mut shell = shell;
-        if std::env::var("PIE_XLA_PREWARM").is_ok_and(|v| v == "1")
-            && let Some(classify) = self.classify_for.and_then(|of| of(&shell.trace().name))
-        {
-            shell.prewarm(classify).map_err(fault)?;
+        if std::env::var("PIE_XLA_PREWARM").is_ok_and(|v| v == "1") {
+            shell.prewarm().map_err(fault)?;
         }
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, pool_bytes) = shell.footprint();
@@ -455,6 +426,7 @@ impl Engine for Xla {
                 max_tokens: budgets.max_tokens,
                 max_page_refs: paging.pages_per_slot.saturating_mul(budgets.max_lanes),
                 max_context: paging.context(),
+                prefill_rows: 0,
             },
             profile,
             ports: PortMask::DEVICE_GEOMETRY
@@ -472,6 +444,7 @@ impl Engine for Xla {
             device_channel_commit: true,
             rs_verbs: shell.serves_rs_verbs(),
             bidirectional_attention: true,
+            facts: shell.trace().facts.clone(),
         };
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
@@ -1077,8 +1050,7 @@ impl Xla {
                 patches,
                 routes: &row.routes,
                 positions: &row.positions,
-                embed_rows: &row.embed_rows,
-                embed_weights: &row.embed_weights,
+                grids: &row.grids,
                 token_positions: &row.token_positions,
             });
         }

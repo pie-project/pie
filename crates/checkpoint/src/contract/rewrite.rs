@@ -26,7 +26,12 @@ pub fn coalesce_direct_row_shards(
     let mut buckets: Vec<(GroupKey, Vec<usize>)> = Vec::new();
     let mut local_bytes_by_index = vec![0_u64; contract.tensors.len()];
     for (index, tensor) in contract.tensors.iter().enumerate() {
-        let Expr::Shard { src, axis: Axis(0) } = &tensor.expr else {
+        let Expr::Shard {
+            src,
+            axis: Axis(0),
+            replicas: 1,
+        } = &tensor.expr
+        else {
             continue;
         };
         let Expr::Src(name) = src.as_ref() else {

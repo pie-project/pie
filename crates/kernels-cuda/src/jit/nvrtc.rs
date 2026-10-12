@@ -45,7 +45,6 @@ pub(crate) struct Job<'a> {
     pub headers: &'a [Header],
     pub floor: Toolchain,
     pub wanted: &'a [String],
-    pub device_link: bool,
 }
 
 pub(crate) struct Built {
@@ -204,142 +203,12 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
 
     let wants_function = job.wanted.iter().any(|w| !w.trim_start().starts_with('&'));
     unassembled_tile_ir(unit, &cubin, wants_function)?;
-    if job.device_link {
-        cubin = device_link(unit, &cubin)?;
-    }
 
     Ok(Built {
         cubin,
         lowered,
         log,
     })
-}
-
-fn cudadevrt() -> Result<CString, Fault> {
-    let roots = ["CUDA_ROOT", "CUDA_HOME", "CUDA_PATH"]
-        .into_iter()
-        .filter_map(std::env::var_os)
-        .map(std::path::PathBuf::from)
-        .chain(
-            ["/usr/local/cuda", "/opt/cuda"]
-                .into_iter()
-                .map(std::path::PathBuf::from),
-        );
-    for root in roots {
-        for lib in ["lib64", "lib"] {
-            let path = root.join(lib).join("libcudadevrt.a");
-            if path.exists() {
-                return CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
-                    Fault::Compile {
-                        unit: "nvrtc",
-                        log: "the path to `libcudadevrt.a` contains a NUL".into(),
-                    }
-                });
-            }
-        }
-    }
-    Err(Fault::Compile {
-        unit: "nvrtc",
-        log: "a cooperative unit needs `libcudadevrt.a` and none was found under CUDA_ROOT, \
-              CUDA_HOME, CUDA_PATH, /usr/local/cuda or /opt/cuda"
-            .into(),
-    })
-}
-
-fn device_link(unit: &'static str, relocatable: &[u8]) -> Result<Vec<u8>, Fault> {
-    use cudarc::driver::sys as dr;
-
-    let devrt = cudadevrt()?;
-
-    crate::jit::cache::bind_context().map_err(|_| Fault::Compile {
-        unit,
-        log: format!(
-            "`{unit}` is relocatable device code and its link step needs a current \
-             CUDA context, which no device on this machine would give"
-        ),
-    })?;
-    let mut state: dr::CUlinkState = std::ptr::null_mut();
-
-    let code = unsafe {
-        dr::cuLinkCreate_v2(
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &raw mut state,
-        )
-    };
-    if code != dr::CUresult::CUDA_SUCCESS {
-        return Err(Fault::Device {
-            call: "cuLinkCreate",
-            code: code as i32,
-        });
-    }
-
-    struct Link(dr::CUlinkState);
-    impl Drop for Link {
-        fn drop(&mut self) {
-            unsafe { dr::cuLinkDestroy(self.0) };
-        }
-    }
-    let link = Link(state);
-
-    let name = CString::new(unit).unwrap_or_default();
-
-    let code = unsafe {
-        dr::cuLinkAddData_v2(
-            link.0,
-            dr::CUjitInputType::CU_JIT_INPUT_CUBIN,
-            relocatable.as_ptr().cast_mut().cast(),
-            relocatable.len(),
-            name.as_ptr(),
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if code != dr::CUresult::CUDA_SUCCESS {
-        return Err(Fault::Device {
-            call: "cuLinkAddData",
-            code: code as i32,
-        });
-    }
-
-    let code = unsafe {
-        dr::cuLinkAddFile_v2(
-            link.0,
-            dr::CUjitInputType::CU_JIT_INPUT_LIBRARY,
-            devrt.as_ptr(),
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if code != dr::CUresult::CUDA_SUCCESS {
-        return Err(Fault::Device {
-            call: "cuLinkAddFile",
-            code: code as i32,
-        });
-    }
-
-    let mut image: *mut std::ffi::c_void = std::ptr::null_mut();
-    let mut size = 0usize;
-
-    let code = unsafe { dr::cuLinkComplete(link.0, &raw mut image, &raw mut size) };
-    if code != dr::CUresult::CUDA_SUCCESS {
-        return Err(Fault::Device {
-            call: "cuLinkComplete",
-            code: code as i32,
-        });
-    }
-    if image.is_null() || size == 0 {
-        return Err(Fault::Compile {
-            unit,
-            log: format!("`{unit}` linked to an empty image"),
-        });
-    }
-
-    let linked = unsafe { std::slice::from_raw_parts(image.cast::<u8>(), size) }.to_vec();
-    Ok(linked)
 }
 
 fn unassembled_tile_ir(
@@ -496,7 +365,6 @@ mod tests {
             headers: root.header_set(),
             floor: Toolchain::ANY,
             wanted: &wanted,
-            device_link: root.needs_device_runtime(),
         })
         .map(|_| ())
         .map_err(|why| why.to_string())

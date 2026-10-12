@@ -261,11 +261,11 @@ fn plan_local(path: &Path) -> Result<Plan> {
 }
 
 pub async fn run(
-    global: &bootstrap::GlobalArgs,
+    global: &crate::args::GlobalArgs,
     args: RunArgs,
     diag: Option<&str>,
 ) -> Result<crate::ui::Answer> {
-    let (cfg_path, origin) = bootstrap::cli_config_path(global);
+    let (cfg_path, origin) = crate::args::config_path(global);
     let content = std::fs::read_to_string(&cfg_path).with_context(|| {
         format!(
             "no config file at {} ({}); `pie config init` writes one",
@@ -276,7 +276,7 @@ pub async fn run(
 
     let target = target(args.inferlet.as_deref(), args.path.as_deref())?;
 
-    let (controller, gateway, mut worker) = crate::derive::derive_standalone(&content)?;
+    let (controller, gateway, mut worker) = worker::standalone::derive_standalone(&content)?;
     if let Some(words) = diag {
         worker.state_diagnostics(words)?;
     }
@@ -294,9 +294,10 @@ pub async fn run(
     }
     println!();
 
-    let pie = crate::compose::run_standalone(controller, gateway, worker)
-        .await
-        .context("boot the engine")?;
+    let pie =
+        worker::standalone::run_standalone(controller, gateway, worker, &crate::paths::pie_home())
+            .await
+            .context("boot the engine")?;
     let outcome = drive(
         &pie.listen_addr.to_string(),
         &plan,

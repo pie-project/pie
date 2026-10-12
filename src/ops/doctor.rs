@@ -91,19 +91,20 @@ impl crate::ui::Report for DoctorReport {
     }
 }
 
-pub fn run(global: &bootstrap::GlobalArgs) -> Result<crate::ui::Answer> {
+pub fn run(global: &crate::args::GlobalArgs) -> Result<crate::ui::Answer> {
     let mut warnings = 0usize;
     let mut passes = 0usize;
     let mut failures = 0usize;
 
     let mut sections: Vec<(&'static str, Checks)> = Vec::new();
 
-    let (path, origin) = bootstrap::cli_config_path(global);
+    let (path, origin) = crate::args::config_path(global);
 
     let mut system = vec![check_platform()];
     system.extend(Language::ALL.into_iter().map(check_language));
     sections.push(("system", system));
     sections.push(("built-in inferlets", check_builtin_inferlets()));
+    sections.push(("models", check_models()));
     sections.push(("gpus", check_gpus(configured_engine(&path).as_deref())));
     sections.push((
         "engines",
@@ -161,9 +162,9 @@ pub fn run(global: &bootstrap::GlobalArgs) -> Result<crate::ui::Answer> {
     })
 }
 
-fn check_config(path: &Path, origin: bootstrap::Origin) -> Checks {
+fn check_config(path: &Path, origin: crate::args::Origin) -> Checks {
     if !path.exists() {
-        return if origin == bootstrap::Origin::Default {
+        return if origin == crate::args::Origin::Default {
             vec![(
                 "config".into(),
                 format!(
@@ -185,7 +186,7 @@ fn check_config(path: &Path, origin: bootstrap::Origin) -> Checks {
         };
     }
 
-    let combined = match crate::derive::read_config_file(path) {
+    let combined = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
             return vec![(
@@ -195,7 +196,7 @@ fn check_config(path: &Path, origin: bootstrap::Origin) -> Checks {
             )];
         }
     };
-    let worker = match crate::derive::derive_standalone(&combined) {
+    let worker = match worker::standalone::derive_standalone(&combined) {
         Ok((_controller, _gateway, worker)) => worker,
         Err(e) => {
             return vec![(
@@ -212,11 +213,12 @@ fn check_config(path: &Path, origin: bootstrap::Origin) -> Checks {
         Status::Pass,
     )];
     let flavor = worker::backend::flavor::resolve(worker.model.engine.kind, &worker.model.name);
+    let overrides = worker.model.overrides().ok();
     let want = worker::weights::Want {
         backend: flavor.as_ref().ok().map(|flavor| flavor.as_str()),
-        sku: worker.model.sku.as_deref(),
+        overrides: overrides.as_ref(),
     };
-    match worker::weights::resolve(&worker.model.model, want) {
+    match worker::weights::resolve(&worker.model.model, want, &crate::paths::pie_home()) {
         Ok(resolved) => out.push((
             "weights".into(),
             match resolved {
@@ -276,7 +278,7 @@ fn absent_because(name: &str) -> String {
 
 /// The newest version of `name` installed under the inferlets directory.
 fn installed_version(name: &str) -> Option<String> {
-    let mut repo = Repository::new(bootstrap::paths::inferlets_dir());
+    let mut repo = Repository::new(crate::paths::inferlets_dir());
     repo.refresh();
     repo.newest(name).map(|program| program.version)
 }
@@ -291,7 +293,7 @@ fn check_builtin_inferlets() -> Checks {
         .collect();
     programs.sort_unstable();
     programs.dedup();
-    let inferlets_dir = crate::ui::short_path(&bootstrap::paths::inferlets_dir());
+    let inferlets_dir = crate::ui::short_path(&crate::paths::inferlets_dir());
     programs
         .into_iter()
         .map(|name| {
@@ -339,6 +341,109 @@ fn check_builtin_inferlets() -> Checks {
             }
         })
         .collect()
+}
+
+/// Each package under `$PIE_HOME/models`, as it stands beside the built-in.
+fn check_models() -> Checks {
+    use runtime::catalog::{Catalog, Seeded, Tree};
+    let models = crate::paths::models_dir();
+    let short = crate::ui::short_path(&models);
+    let seeded = runtime::catalog::install(&models);
+    let mut out: Checks = Vec::new();
+    if seeded.is_empty() {
+        out.push((
+            "models".to_string(),
+            format!("{short} could not be seeded; the packages built into this pie serve"),
+            Status::Warn,
+        ));
+    }
+    let tree = match Tree::read(&models) {
+        Ok(tree) => tree,
+        Err(why) => {
+            out.push((
+                "models".to_string(),
+                format!("{short}: {why}"),
+                Status::Fail,
+            ));
+            return out;
+        }
+    };
+    let (catalog, refused) = Catalog::of_tree(&tree);
+    let lists = |name: &str| -> String {
+        match catalog.package(name) {
+            Some(package) => {
+                let manifest = package.manifest();
+                format!(
+                    "{} models, {} deployments",
+                    manifest.models.len(),
+                    manifest.deployments.len()
+                )
+            }
+            None => "does not load".to_string(),
+        }
+    };
+    for (name, how) in seeded {
+        let (detail, status) = match how {
+            Seeded::Written => (format!("seeded into {short}"), Status::Pass),
+            Seeded::Current => ("this build's".to_string(), Status::Pass),
+            Seeded::Updated => ("brought up to this build's".to_string(), Status::Pass),
+            Seeded::Edited { behind: false } => {
+                (format!("edited in {short}; the edit serves"), Status::Pass)
+            }
+            Seeded::Edited { behind: true } => (
+                format!(
+                    "edited in {short} from an older build's, and this build's has changed \
+                     since; delete {short}/{name} to take this build's, or carry the edit over"
+                ),
+                Status::Warn,
+            ),
+            Seeded::Foreign => (
+                format!("made by hand in {short} under a built-in's name; it serves"),
+                Status::Pass,
+            ),
+        };
+        let detail = if name == "lib" {
+            detail
+        } else {
+            format!("{detail}; {}", lists(name))
+        };
+        out.push((name.to_string(), detail, status));
+    }
+    for (name, _) in &tree.packages {
+        if seeded.iter().any(|(seeded, _)| seeded == name) {
+            continue;
+        }
+        out.push((
+            name.clone(),
+            format!("added in {short}, not built into this pie; {}", lists(name)),
+            Status::Pass,
+        ));
+    }
+    for why in refused {
+        out.push(("package".to_string(), why.to_string(), Status::Fail));
+    }
+    for why in runtime::catalog::template_faults(&catalog) {
+        out.push(("template".to_string(), why.to_string(), Status::Fail));
+    }
+    if let Ok(entries) = std::fs::read_dir(&models) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if path.is_dir() && name != "lib" && !path.join("package.poem").is_file() {
+                out.push((
+                    name.to_string(),
+                    format!(
+                        "no package.poem; artifacts live under {} now, so move or delete it",
+                        crate::ui::short_path(&crate::paths::artifacts_dir())
+                    ),
+                    Status::Warn,
+                ));
+            }
+        }
+    }
+    out
 }
 
 fn check_platform() -> (String, String, Status) {

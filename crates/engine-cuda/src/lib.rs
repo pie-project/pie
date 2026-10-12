@@ -30,6 +30,29 @@ pub const EXCLUSIVE: [&str; 0] = [];
 
 pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
 
+/// The fused kernels this backend ships; the compiler forms only these. A
+/// rule it does not list (`linear.mlp_swiglu`, which Metal splits across
+/// engines) leaves its primitives alone here.
+pub const FUSED: [&str; 11] = [
+    "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
+    "elementwise.rmsnorm_residual_add",
+    "elementwise.embed_scale_add_select",
+    "elementwise.embed_scale_add",
+    "elementwise.residual_add_rmsnorm",
+    "linear.matmul_geglu",
+    "linear.lm_head_softcap",
+    "linear.matmul_bias",
+    "elementwise.gated_residual_norm_modulate",
+    "elementwise.norm_modulate",
+    "elementwise.rmsnorm_rope_partial_q",
+];
+
+/// The fused kernels left on with `fuse-chains=off`.
+pub const UNCHAINED: [&str; 2] = [
+    "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
+    "elementwise.residual_add_rmsnorm",
+];
+
 #[must_use]
 pub fn shifted(op: &str) -> bool {
     matches!(
@@ -45,7 +68,7 @@ pub fn lane_shifted(op: &str) -> bool {
     kernels_cuda::seat::reads(op) == Reads::RowsAndLanes
 }
 
-pub use api::{ClassifyFor, ContractFor, Cuda, DeviceBoot, World};
+pub use api::{ContractFor, Cuda, DeviceBoot, World};
 pub use boot::{open, ordinal_of};
 pub use error::{Fault, Result};
 pub use group::{Group, open_group};

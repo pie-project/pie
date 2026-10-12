@@ -8,6 +8,10 @@ pub const MAX_BYTES: u64 = (4 << 30) - ALIGN;
 
 const TEMPORARIES_PER_ELEMENT: u64 = 4;
 
+/// The WGSL runtime's one-row select keeps its state just below the
+/// temporary area, out of reach of the sort ladder that reuses all of it.
+const SELECT_BYTES: u64 = eta_compiler::codegen::wgsl::SELECT_WORDS as u64 * 4;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TooLarge {
     Bound { bytes: u64, limit: u64 },
@@ -44,7 +48,10 @@ pub fn layout(descriptors: &[ValueDesc]) -> Result<Layout, TooLarge> {
         widest = widest.max(u64::from(descriptor.len));
     }
 
-    let temporary = align_up(at).ok_or(TooLarge::Overflow)?;
+    let temporary = at
+        .checked_add(SELECT_BYTES)
+        .and_then(align_up)
+        .ok_or(TooLarge::Overflow)?;
     let temporary_bytes = widest
         .checked_mul(size_of::<u32>() as u64)
         .and_then(|bytes| bytes.checked_mul(TEMPORARIES_PER_ELEMENT))

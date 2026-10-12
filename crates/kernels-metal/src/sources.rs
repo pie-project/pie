@@ -261,12 +261,24 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/layout/fold.metal")),
     ),
     (
+        "layout/grid_taps.metal",
+        include_str!(concat!(source_root!(), "/layout/grid_taps.metal")),
+    ),
+    (
+        "layout/pixels.metal",
+        include_str!(concat!(source_root!(), "/layout/pixels.metal")),
+    ),
+    (
         "layout/ple_combine.metal",
         include_str!(concat!(source_root!(), "/layout/ple_combine.metal")),
     ),
     (
         "layout/row_gather.metal",
         include_str!(concat!(source_root!(), "/layout/row_gather.metal")),
+    ),
+    (
+        "linear/ane.metal",
+        include_str!(concat!(source_root!(), "/linear/ane.metal")),
     ),
     (
         "linear/gemm_dense.metal",

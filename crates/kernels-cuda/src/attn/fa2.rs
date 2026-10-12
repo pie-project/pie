@@ -441,9 +441,8 @@ pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<(), 
 #[cfg(feature = "cuda")]
 #[must_use]
 pub fn decode_blocks_per_sm(head_dim: u32, group_size: u32, device: &Device) -> Option<u32> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(u32, u32, u32), Option<u32>>>,
-    > = std::sync::OnceLock::new();
+    type Cached = std::sync::Mutex<std::collections::HashMap<(u32, u32, u32), Option<u32>>>;
+    static CACHE: std::sync::OnceLock<Cached> = std::sync::OnceLock::new();
     let key = (head_dim, group_size, device.num_sm);
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Some(known) = cache.lock().ok().and_then(|held| held.get(&key).copied()) {

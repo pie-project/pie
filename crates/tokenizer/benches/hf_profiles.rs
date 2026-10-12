@@ -1,4 +1,4 @@
-#[path = "../tests/common/mod.rs"]
+#[path = "../tests/tokenizer/common/mod.rs"]
 mod common;
 
 use std::hint::black_box;

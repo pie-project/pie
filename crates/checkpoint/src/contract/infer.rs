@@ -164,6 +164,7 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
             infer_slice(&ty, *axis, 0, *len)
         }
         Expr::Fill { value, ty } => infer_fill(*value, ty),
+        Expr::Const { ty, bytes } => infer_const(ty, bytes),
         Expr::Slice {
             src,
             axis,
@@ -245,10 +246,15 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
                 }
             }
         }
-        Expr::Shard { src, axis } => {
+        Expr::Shard {
+            src,
+            axis,
+            replicas,
+        } => {
             let ty = infer(src, scope)?;
-            let (start, len) = shard_range(&ty, *axis, scope.partition, &scope.what)?;
-            if scope.partition.world <= 1 {
+            let partition = scope.partition.grouped(*replicas)?;
+            let (start, len) = shard_range(&ty, *axis, partition, &scope.what)?;
+            if partition.world <= 1 {
                 return Ok(ty);
             }
             infer_slice(&ty, *axis, start, len)
@@ -298,15 +304,21 @@ fn specialize(expr: Expr, scope: &mut Scope<'_>) -> Result<Expr, Error> {
         infer_slice(&ty, axis, start, len)?;
         return Ok(src.slice(axis.0, start, len));
     }
-    let Expr::Shard { src, axis } = expr else {
+    let Expr::Shard {
+        src,
+        axis,
+        replicas,
+    } = expr
+    else {
         return expr.map_children(|src| specialize(src, scope));
     };
     let src = specialize(*src, scope)?;
-    if scope.partition.world <= 1 {
+    let partition = scope.partition.grouped(replicas)?;
+    if partition.world <= 1 {
         return Ok(src);
     }
     let ty = infer(&src, scope)?;
-    let (start, len) = shard_range(&ty, axis, scope.partition, &scope.what)?;
+    let (start, len) = shard_range(&ty, axis, partition, &scope.what)?;
     Ok(src.slice(axis.0, start, len))
 }
 
@@ -637,6 +649,26 @@ fn infer_fill(value: u32, ty: &TensorType) -> Result<TensorType, Error> {
             "Fill of {} as {dtype:?} is not a run of zero bytes, which is all \
              the zeroing can write",
             f32::from_bits(value)
+        )));
+    }
+    Ok(ty.clone())
+}
+
+pub(crate) fn infer_const(ty: &TensorType, bytes: &[u8]) -> Result<TensorType, Error> {
+    if let Some(bad) = ty.shape.iter().find(|extent| **extent < 1) {
+        return Err(Error::Contract(format!(
+            "Const shape {:?} has a non-positive extent {bad}; a constant states \
+             every extent of the bytes it carries",
+            ty.shape
+        )));
+    }
+    let want = ty.byte_size()?;
+    if bytes.len() as u64 != want {
+        return Err(Error::Contract(format!(
+            "Const of shape {:?} as {:?} is {want} bytes and carries {}",
+            ty.shape,
+            ty.encoding,
+            bytes.len()
         )));
     }
     Ok(ty.clone())
@@ -1029,4 +1061,54 @@ fn infer_scale_per_block(ty: TensorType, by: TensorType) -> Result<TensorType, E
         shape: ty.shape,
         encoding: Encoding::Raw(out_dtype),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct OneTensor;
+
+    impl CheckpointTypes for OneTensor {
+        fn tensor_type(&self, name: &str) -> Option<TensorType> {
+            (name == "k").then(|| TensorType {
+                shape: vec![512, 64],
+                encoding: Encoding::Raw(DType::Bf16),
+            })
+        }
+    }
+
+    fn share(replicas: u32, rank: u32, world: u32) -> Result<Expr, Error> {
+        Resolver::new(&OneTensor, Partition::new(rank, world))
+            .specialize(Expr::src("k").shard_among(0, replicas), "k")
+    }
+
+    /// Two heads over four ranks: ranks 0 and 1 read the first head, ranks
+    /// 2 and 3 the second, each the whole of it.
+    #[test]
+    fn a_group_of_ranks_reads_one_share() {
+        for rank in 0..4 {
+            assert_eq!(
+                share(2, rank, 4).unwrap(),
+                Expr::src("k").slice(0, i64::from(rank / 2) * 256, 256),
+                "rank {rank}",
+            );
+        }
+    }
+
+    /// One replica per rank is the plain cut.
+    #[test]
+    fn a_lone_replica_is_the_plain_cut() {
+        for rank in 0..4 {
+            assert_eq!(
+                share(1, rank, 4).unwrap(),
+                Expr::src("k").slice(0, i64::from(rank) * 128, 128),
+            );
+        }
+    }
+
+    #[test]
+    fn replicas_that_do_not_group_the_ranks_are_refused() {
+        assert!(matches!(share(3, 0, 4), Err(Error::Shard(_))));
+    }
 }

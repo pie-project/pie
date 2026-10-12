@@ -1,0 +1,14 @@
+# The marker tokens the families' templates and media spell, shared by the
+# packages whose models are spoken through another family's tokenizer.
+
+QWEN_STOP = ["<|im_end|>", "<|endoftext|>"]
+QWEN_VISION = ["<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
+QWEN_AUDIO = {
+    "<|audio_start|>": 248070,
+    "<|audio_end|>": 248071,
+    "<tts_pad>": 248072,
+    "<tts_text_bos>": 248073,
+    "<tts_text_eod>": 248074,
+    "<tts_text_bos_single>": 248075,
+    "<|audio_pad|>": 248076,
+}

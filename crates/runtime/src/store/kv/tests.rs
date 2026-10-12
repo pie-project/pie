@@ -79,6 +79,7 @@ fn tests_every_case() {
     fork_shares_prefix_and_diverges_into_children();
     release_reclaims_exclusive_suffix_but_keeps_shared_prefix();
     held_pages_is_a_durable_fact_where_a_reclaim_quote_is_not();
+    an_unused_cache_lease_counts_the_pages_dropping_it_frees();
     path_hash_is_independent_of_node_boundaries();
     path_hash_is_none_while_any_contributing_page_hash_is_pending();
     store_explicit_index_roundtrip_remove_preserves_loaded_working_set();
@@ -125,6 +126,39 @@ fn release_reclaims_exclusive_suffix_but_keeps_shared_prefix() {
     let freed = t.release_working_set(c);
     assert_eq!(sorted(freed), vec![0, 1, 2, 3, 4]);
     assert_eq!(t.node_count(), 0);
+}
+
+fn an_unused_cache_lease_counts_the_pages_dropping_it_frees() {
+    let mut t = KvPageTable::new();
+    let a = t.create_working_set();
+    publish(&mut t, a, 0..5);
+    let c = t.fork(a).unwrap();
+    publish(&mut t, a, 5..10); // a's private suffix
+    let term_a = t.terminal(a).unwrap().unwrap();
+    t.lease_cache_root(term_a);
+    assert_eq!(
+        t.unused_cache_lease_pages(),
+        0,
+        "a's own working set still holds it"
+    );
+
+    // The process ends; its pages stay behind the lease, its suffix only.
+    assert!(t.release_working_set(a).is_empty());
+    assert_eq!(
+        t.unused_cache_lease_pages(),
+        5,
+        "c still reads the shared prefix"
+    );
+
+    // c ends too: the whole chain now hangs off the lease.
+    assert!(t.release_working_set(c).is_empty());
+    assert_eq!(t.unused_cache_lease_pages(), 10);
+
+    // Counting freed nothing, and the count is what dropping frees.
+    let (dropped, freed) = t.drop_unused_cache_leases();
+    assert_eq!(dropped, 1);
+    assert_eq!(sorted_backings(freed), (0..10).collect::<Vec<_>>());
+    assert_eq!(t.unused_cache_lease_pages(), 0);
 }
 
 fn held_pages_is_a_durable_fact_where_a_reclaim_quote_is_not() {

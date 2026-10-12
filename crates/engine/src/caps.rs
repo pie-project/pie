@@ -30,6 +30,12 @@ pub struct FireLimits {
     pub max_tokens: u32,
     pub max_page_refs: u32,
     pub max_context: u32,
+    /// The rows one prefill fire takes best, when the engine prefers fewer
+    /// than `max_tokens` (0: no preference). A guest chunks a long prompt to
+    /// it: on Metal, the Neural Engine takes its share of a fire only up to
+    /// this many rows.
+    #[serde(default)]
+    pub prefill_rows: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +102,11 @@ pub struct Capabilities {
 
     #[serde(default)]
     pub bidirectional_attention: bool,
+
+    /// The facts the loaded trace's rows branch on, which a lane's word is
+    /// classified by.
+    #[serde(default)]
+    pub facts: poem_ir::Facts,
 }
 
 impl Capabilities {

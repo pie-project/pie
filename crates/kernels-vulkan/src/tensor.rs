@@ -2,7 +2,7 @@ use dtype::Dtype;
 
 use crate::encode::ArgValue;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Tensor {
     pub buf: u32,
 
@@ -42,7 +42,7 @@ pub struct RaggedTensor {
     pub indptr: Tensor,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct KvPool {
     pub keys: Tensor,
 
@@ -59,7 +59,7 @@ pub struct KvPool {
     pub head_stride: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RecurrentPool {
     pub state: Tensor,
 

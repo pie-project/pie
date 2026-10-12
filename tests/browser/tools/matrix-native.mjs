@@ -1,8 +1,8 @@
 import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
-import { PieClient } from "../../../javascript/client/src/index.js";
+import { PieClient } from "../../../packages/javascript/client/src/index.js";
 
-const require = createRequire(new URL("../../../javascript/client/package.json", import.meta.url));
+const require = createRequire(new URL("../../../packages/javascript/client/package.json", import.meta.url));
 const WsWebSocket = require("ws");
 globalThis.WebSocket = class extends WsWebSocket {
   constructor(url) {

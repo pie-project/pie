@@ -513,7 +513,7 @@ one file left.
 **Four files that answered directives no NVRTC compile takes, found by
 deleting each shim in turn and recompiling.** The probe is the method this
 page had been missing: for every file here, drop it from the header set and
-run `tests/every_instantiation_compiles.rs`. A shim with a live asker fails
+run `tests/every_instantiation_compiles.rs` (since deleted, in fb5325c5a). A shim with a live asker fails
 loudly — `catastrophic error: could not open source file "X"`. A shim with
 none compiles clean, and there were four.
 

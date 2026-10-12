@@ -17,8 +17,6 @@ pub struct PatchSeat {
     pub row_bytes: u64,
     pub images: u64,
     pub dtype: Dtype,
-    pub embed_taps: u64,
-    pub embed_weights: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,8 +78,7 @@ struct PatchAt {
     segments: u64,
     routes: u64,
     positions: u64,
-    embed_rows: u64,
-    embed_weights: u64,
+    grids: u64,
     seat: PatchSeat,
 }
 
@@ -144,8 +141,7 @@ pub struct PatchHandles {
     pub segments: Tensor,
     pub routes: Tensor,
     pub positions: Tensor,
-    pub embed_rows: Option<Tensor>,
-    pub embed_weights: Option<Tensor>,
+    pub grids: Tensor,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -203,8 +199,7 @@ pub struct PatchFire<'a> {
     pub segments: &'a [i32],
     pub routes: &'a [i32],
     pub positions: &'a [i32],
-    pub embed_rows: &'a [i32],
-    pub embed_weights: &'a [f32],
+    pub grids: &'a [i32],
 }
 
 #[derive(Debug)]
@@ -340,12 +335,7 @@ impl Inputs {
             segments: take((seat.images + 1) * 4),
             routes: take(seat.rows * 4),
             positions: take(seat.rows * AXES * 4),
-            embed_rows: take(seat.rows * seat.embed_taps * 4),
-            embed_weights: if seat.embed_weights {
-                take(seat.rows * seat.embed_taps * 4)
-            } else {
-                0
-            },
+            grids: take(seat.images * AXES * 4),
             seat,
         });
         let group_of_lane = if selections == 0 { 0 } else { take(lanes * 4) };
@@ -558,20 +548,7 @@ impl Inputs {
                         staged.positions.len() as u64,
                         seat.rows * AXES,
                     ),
-                    (
-                        "patch table rows",
-                        staged.embed_rows.len() as u64,
-                        seat.rows * seat.embed_taps,
-                    ),
-                    (
-                        "patch table weights",
-                        staged.embed_weights.len() as u64,
-                        if seat.embed_weights {
-                            seat.rows * seat.embed_taps
-                        } else {
-                            0
-                        },
-                    ),
+                    ("image grids", staged.grids.len() as u64, seat.images * AXES),
                 ] {
                     if have > ceiling {
                         return Err(Fault::Ceiling {
@@ -585,15 +562,7 @@ impl Inputs {
                 self.store.write(at.segments, bytes_of(staged.segments))?;
                 self.store.write(at.routes, bytes_of(staged.routes))?;
                 self.store.write(at.positions, bytes_of(staged.positions))?;
-                if !staged.embed_rows.is_empty() {
-                    self.store
-                        .write(at.embed_rows, bytes_of(staged.embed_rows))?;
-                }
-                if !staged.embed_weights.is_empty() {
-                    self.store
-                        .write(at.embed_weights, f32_bytes_of(staged.embed_weights))?;
-                }
-                let taps = u32::try_from(seat.embed_taps).unwrap_or(u32::MAX).max(1);
+                self.store.write(at.grids, bytes_of(staged.grids))?;
                 let rows32 = u32::try_from(rows).unwrap_or(u32::MAX);
                 let element = poem_compiler::arena::elem_bytes(seat.dtype).unwrap_or(1);
                 let width = u32::try_from(seat.row_bytes.checked_div(element).unwrap_or(0))
@@ -622,34 +591,12 @@ impl Inputs {
                         AXES as u32,
                         Dtype::I32,
                     ),
-                    embed_rows: if staged.embed_rows.is_empty() {
-                        None
-                    } else {
-                        Some(Tensor::new(
-                            handles.bind(
-                                &self.store,
-                                at.embed_rows,
-                                staged.embed_rows.len() as u64 * 4,
-                            )?,
-                            staged.embed_rows.len() as u32 / taps,
-                            taps,
-                            Dtype::I32,
-                        ))
-                    },
-                    embed_weights: if staged.embed_weights.is_empty() {
-                        None
-                    } else {
-                        Some(Tensor::new(
-                            handles.bind(
-                                &self.store,
-                                at.embed_weights,
-                                staged.embed_weights.len() as u64 * 4,
-                            )?,
-                            staged.embed_weights.len() as u32 / taps,
-                            taps,
-                            Dtype::F32,
-                        ))
-                    },
+                    grids: Tensor::new(
+                        handles.bind(&self.store, at.grids, staged.grids.len() as u64 * 4)?,
+                        staged.grids.len() as u32 / AXES as u32,
+                        AXES as u32,
+                        Dtype::I32,
+                    ),
                 })
             }
         };

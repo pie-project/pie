@@ -56,6 +56,10 @@ struct Input {
     prompt_tokens: Option<Vec<u32>>,
     #[serde(default = "default_system")]
     system: String,
+    /// Turn a thinking model's thinking off, as its template does for
+    /// `enable_thinking: false`.
+    #[serde(default)]
+    no_think: bool,
     /// Drop the template's stop tokens so the loop runs to `max_tokens`.
     #[serde(default)]
     ignore_eos: bool,
@@ -147,7 +151,7 @@ async fn main(input: Input) -> Result<Output> {
     }
     let depth = model::mtp_depth();
     if input.k > 0 && depth == 0 {
-        return Err("this SKU ships no draft head (mtp_depth = 0); run with k = 0".into());
+        return Err("this deployment ships no draft head (mtp_depth = 0); run with k = 0".into());
     }
     let k = input.k.min(depth);
     if input.max_tokens == 0 {
@@ -161,7 +165,7 @@ async fn main(input: Input) -> Result<Output> {
         Some(tokens) => tokens.clone(),
         None => {
             let mut p = chat::system_user(&input.system, &input.prompt);
-            p.extend(chat::cue());
+            p.extend(chat::cue_thinking(!input.no_think));
             p
         }
     };

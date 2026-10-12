@@ -9,7 +9,7 @@ The weights are small random bf16 values, so the model serves any prompt and say
 nothing in particular; the tokenizer beside it is the real Qwen3.5 one, fetched from
 Hugging Face when no `--tokenizer` directory is given. Then:
 
-    pie model import <out-dir> --sku qwen35-tiny
+    pie model import <out-dir> --deployment qwen35-tiny
 """
 import argparse
 import json

@@ -10,7 +10,7 @@ into an `.npz` under the golden's own key names, and diffs the two with
 
     # 0. the artifact (one file, already carrying the pipeline's prefixes)
     pie model import /root/.cache/pie-imagegen/golden/ltx25 \
-        --sku ltx25-mini-bf16-kv-bf16
+        --deployment ltx25-mini-bf16-kv-bf16
 
     # 1. the case the inferlet reads
     python ltx2_parity.py case --out /tmp/ltx2-parity            # the joint step

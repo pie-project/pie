@@ -56,6 +56,10 @@ struct Input {
     /// `max_tokens` regardless of model emit.
     #[serde(default)]
     ignore_eos: bool,
+    /// Turn a thinking model's thinking off, as the model's own template does
+    /// for `enable_thinking: false`.
+    #[serde(default)]
+    no_think: bool,
     /// Busy-wait inside WASM for this many microseconds per drained token —
     /// simulates per-token inferlet work.
     #[serde(default)]
@@ -130,6 +134,14 @@ struct Input {
     /// retires the day `engine-metal` mirrors `27de300fa`.
     #[serde(default)]
     host_first_token: bool,
+
+    /// Prefill every prompt from scratch: no cached prefix is mapped in and
+    /// none is published. A hybrid model's prefix cache also ends a prefill
+    /// chunk at pages 1, 2, 4, 8, ... to snapshot its recurrent state, which
+    /// turns a 512-token prompt into seven launches; this arm prefills it in
+    /// as few as the forward budget allows, the way a cold engine does.
+    #[serde(default)]
+    no_prefix_cache: bool,
 }
 
 fn default_max_tokens() -> usize {
@@ -259,7 +271,7 @@ async fn run_one(
         tokens.to_vec()
     } else {
         let mut p = chat::system_user(&input.system, prompt);
-        p.extend(chat::cue());
+        p.extend(chat::cue_thinking(!input.no_think));
         p
     };
     step(&mut prologue_us, input.report_timing); // [1] tokenize
@@ -289,9 +301,13 @@ async fn run_one(
     let prefixes = PrefixCache::new(
         concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION")).as_bytes(),
     );
-    let (ws, cached_rs, cached) = prefixes
-        .adopt(&prompt_vec, None)
-        .context("adopt cached prefix")?;
+    let (ws, cached_rs, cached) = if input.no_prefix_cache {
+        (WorkingSet::new(), None, 0)
+    } else {
+        prefixes
+            .adopt(&prompt_vec, None)
+            .context("adopt cached prefix")?
+    };
     let page_size = kv_page_size();
     let n = prompt_vec.len() as u32;
     let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size);
@@ -334,7 +350,11 @@ async fn run_one(
     //
     // A hybrid model's recurrent state is published only where a chunk
     // ends, so chunks are also cut at the cache's boundaries.
-    let cuts = prefixes.boundaries(&prompt_vec, cached, None);
+    let cuts = if input.no_prefix_cache {
+        Vec::new()
+    } else {
+        prefixes.boundaries(&prompt_vec, cached, None)
+    };
     let state_keys = prefixes.state_keys(&prompt_vec);
     let mut spans: Vec<(u32, u32)> = Vec::new();
     for (base, end) in prefill_chunks(n - cached, None) {
@@ -766,9 +786,11 @@ async fn run_one(
         session::send("t0");
     }
     // The prefill has landed: offer its prompt prefixes to later requests.
-    prefixes
-        .publish(&ws, &states, &pipe, &prompt_vec, cached)
-        .context("publish prompt prefix")?;
+    if !input.no_prefix_cache {
+        prefixes
+            .publish(&ws, &states, &pipe, &prompt_vec, cached)
+            .context("publish prompt prefix")?;
+    }
 
     // **THE HOST ARM'S HANDOFF, AND THE WHOLE OF IT.** The token is
     // here; the decode pass can be built on it now, `tok_in` SEEDED
@@ -923,7 +945,7 @@ async fn main(input: Input) -> Result<Output> {
                         .map(String::as_str)
                         .unwrap_or(input.prompt.as_str());
                     let mut pt = chat::system_user(&input.system, prompt);
-                    pt.extend(chat::cue());
+                    pt.extend(chat::cue_thinking(!input.no_think));
                     prepared_prompt_tokens.push(pt);
                 }
             }

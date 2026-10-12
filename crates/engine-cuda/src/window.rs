@@ -71,7 +71,9 @@ impl Window {
     #[must_use]
     pub fn segment_rows(&self) -> u32 {
         self.segments_host
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| pair[1].max(0) as u32)
             .max()
             .unwrap_or(0)
@@ -248,7 +250,7 @@ fn copyable(trace: &Trace, region: &Region) -> bool {
             Operation::Elementwise(op) => collect!(op),
             Operation::Layout(op) => collect!(op),
             Operation::Collective(op) => collect!(op),
-            Operation::CustomCuda(op) => collect!(op),
+            Operation::Fused(op) => collect!(op),
             Operation::Spatial(op) => collect!(op),
         }
     }
@@ -1195,9 +1197,11 @@ impl Sink for Cursor<'_> {
         let Some(cond) = self.cond else {
             return;
         };
-        let closed = body
-            .then(|| crate::device::conditional::end_body(cond.body))
-            .unwrap_or(Ok(()));
+        let closed = if body {
+            crate::device::conditional::end_body(cond.body)
+        } else {
+            Ok(())
+        };
         cond.at.set(was);
         if let Err(fault) = closed
             && self.fault.is_none()

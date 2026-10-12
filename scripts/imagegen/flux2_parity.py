@@ -12,7 +12,7 @@ into an `.npz` under the golden's own key names, and diffs the two with
     python flux2_parity.py case  --out /tmp/flux2-parity
 
     # 2. run it (the config's `[model] model` is the imported artifact:
-    #    `pie model import $PIE_IMAGEGEN_GOLDEN/flux2/ --sku flux2-mini-bf16-kv-bf16`)
+    #    `pie model import $PIE_IMAGEGEN_GOLDEN/flux2/ --deployment flux2-mini-bf16-kv-bf16`)
     python flux2_parity.py run   --out /tmp/flux2-parity --config ~/.pie/config.flux2-mini.toml
 
     # 3. the pie-side npz, then the diff
@@ -49,7 +49,7 @@ import numpy as np
 DEFAULT_GOLDEN = os.path.join(
     os.environ.get("PIE_IMAGEGEN_GOLDEN", "/root/.cache/pie-imagegen/golden"), "flux2"
 )
-DEFAULT_SKU = "flux2-mini-bf16-kv-bf16"
+DEFAULT_DEPLOYMENT = "flux2-mini-bf16-kv-bf16"
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 
@@ -220,7 +220,7 @@ def main() -> int:
     ap.add_argument("--inferlet", default=os.path.join(REPO, "examples/flux2-parity"))
     ap.add_argument("--config", default=None,
                     help=f"the serving config; its `[model] model` must be the artifact "
-                         f"`{DEFAULT_SKU}` imported")
+                         f"`{DEFAULT_DEPLOYMENT}` imported")
     ap.add_argument("--pie", default=None, help="the pie binary (default: PATH, else target/debug)")
     ap.add_argument("--case_file", action="store_true", help="pass the case as a scratch file instead of argv pieces")
     args = ap.parse_args()

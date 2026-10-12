@@ -12,6 +12,7 @@ pub struct Gemma {
     system_prefix: Vec<u32>,
     user_prefix: Vec<u32>,
     model_prefix: Vec<u32>,
+    cue: Vec<u32>,
     turn_suffix: Vec<u32>,
     bos: u32,
     stop_ids: Vec<u32>,
@@ -19,7 +20,9 @@ pub struct Gemma {
 
 impl Gemma {
     #[must_use]
-    pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
+    /// `thinking`: the reference template's cue closes an empty thought
+    /// channel when the turn does not think (26B-A4B and 31B; E4B's does not).
+    pub fn new(tokenizer: Arc<Tokenizer>, thinking: bool) -> Self {
         let stop_ids = specials(&tokenizer, STOP_TOKENS);
 
         let open_turn = special(&tokenizer, "<|turn>");
@@ -36,10 +39,19 @@ impl Gemma {
         let mut turn_suffix = vec![close_turn];
         turn_suffix.extend(&newline);
 
+        let mut cue = header("model");
+        if thinking {
+            cue.push(special(&tokenizer, "<|channel>"));
+            cue.extend(tokenizer.encode("thought"));
+            cue.extend(&newline);
+            cue.push(special(&tokenizer, "<channel|>"));
+        }
+
         Self {
             system_prefix: header("system"),
             user_prefix: header("user"),
             model_prefix: header("model"),
+            cue,
             turn_suffix,
             bos: special(&tokenizer, "<bos>"),
             stop_ids,
@@ -89,7 +101,7 @@ impl Instruct for Gemma {
     }
 
     fn cue(&self) -> Vec<u32> {
-        self.model_prefix.clone()
+        self.cue.clone()
     }
 
     fn seal(&self) -> Vec<u32> {

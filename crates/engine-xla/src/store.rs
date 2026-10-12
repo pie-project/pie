@@ -250,7 +250,9 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
                 };
                 cells * (planes.keys + values) * elem_bytes(name, *dtype)?
             }
-            CacheRow::State { name, slab, dtype } => {
+            CacheRow::State {
+                name, slab, dtype, ..
+            } => {
                 let stride: u64 = slab.iter().product();
                 stride * u64::from(paging.slots + 1) * elem_bytes(name, state_dtype(*dtype))?
             }
@@ -355,7 +357,9 @@ impl Pools {
                         windowed,
                     });
                 }
-                CacheRow::State { name, slab, dtype } => {
+                CacheRow::State {
+                    name, slab, dtype, ..
+                } => {
                     let stride: u64 = slab.iter().product();
                     let dtype = state_dtype(*dtype);
                     let slots = paging.slots + 1;

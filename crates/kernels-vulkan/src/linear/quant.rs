@@ -8,6 +8,8 @@ use crate::error::Error;
 use crate::tensor::{Bank, Tensor};
 
 const QMM_FILE: &str = "quant/qmm_t.slang";
+const QMM_RT_FILE: &str = "quant/qmm_rt.slang";
+const QMV1_FILE: &str = "quant/qmv1.slang";
 const QMV_FILE: &str = "quant/qmv.slang";
 
 const GROUPS: [i32; 3] = [32, 64, 128];
@@ -51,6 +53,16 @@ pub fn composed() -> Vec<Fire> {
                 QMV_FILE,
                 qmv_name("quant.qmv", "", gs, b).expect("an axis point"),
             ));
+            if qmv1_fits(gs, b) {
+                for lanes in QMV1_LANES {
+                    for rows in QMV1_ROWS_PER_LANE {
+                        out.push(Fire::at(QMV1_FILE, qmv1_name(gs, b, lanes, rows)));
+                    }
+                }
+            }
+            for bm in RT_ROW_TILES {
+                out.push(Fire::at(QMM_RT_FILE, qmm_rt_name(gs, b, bm)));
+            }
             for &bm in &ROW_TILES {
                 for &bn in &TILES {
                     out.push(Fire::at(
@@ -109,6 +121,36 @@ pub fn qmm_name(
         "affine_qmm_t_bf16_gs_{group}_b_{bits}_bm_{bm}_bn_{bn}"
     )))
 }
+
+/// The register-tiled point's row tiles; its column tile is 64.
+const RT_ROW_TILES: [i32; 2] = [32, 64];
+const RT_COLS: u32 = 64;
+
+fn qmm_rt_name(group: i32, bits: i32, bm: i32) -> &'static str {
+    symbol(&format!("affine_qmm_rt_bf16_gs_{group}_b_{bits}_bm_{bm}"))
+}
+
+/// The one-row point loads 128 bits of codes at once, which must stay
+/// inside one scale group.
+fn qmv1_fits(group: i32, bits: i32) -> bool {
+    matches!(bits, 4 | 8) && 128 / bits <= group
+}
+
+fn qmv1_name(group: i32, bits: i32, lanes: u32, rows: u32) -> &'static str {
+    if lanes == 32 && rows == 1 {
+        symbol(&format!("affine_qmv1_bf16_gs_{group}_b_{bits}"))
+    } else {
+        symbol(&format!(
+            "affine_qmv1_bf16_gs_{group}_b_{bits}_l{lanes}_r{rows}"
+        ))
+    }
+}
+
+/// Lanes a row of the one-row point can take.
+const QMV1_LANES: [u32; 3] = [32, 16, 8];
+
+/// Rows one lane of the one-row point can carry.
+const QMV1_ROWS_PER_LANE: [u32; 2] = [1, 2];
 
 pub fn qmm_precast_name(
     op: &'static str,
@@ -422,6 +464,35 @@ pub fn act_x_wt(
             ],
         );
     }
+    if tuned.qmm_register_tiles
+        && m >= min_batch
+        && k % QMM_BK == 0
+        && GROUPS.contains(&group)
+        && WIDTHS.contains(&bits)
+    {
+        let bm = if m > 32 { 64 } else { 32 };
+        let rows = (m as u32).div_ceil(bm as u32);
+        return ctx.fire(
+            Fire::at(QMM_RT_FILE, qmm_rt_name(group, bits, bm)).apply(Grid::of(
+                [
+                    (n as u32).div_ceil(RT_COLS) * (RT_COLS / 4),
+                    rows * (bm as u32 / 4),
+                    1,
+                ],
+                [RT_COLS / 4, bm as u32 / 4, 1],
+            )),
+            &[
+                w.codes.arg(),
+                w.scales.arg(),
+                biases.arg(),
+                act.arg(),
+                y.arg_mut(),
+                k.arg(),
+                n.arg(),
+                m.arg(),
+            ],
+        );
+    }
     let crossover = i32::try_from(tuned.qmm_bn_crossover_tg).unwrap_or(i32::MAX);
     let capacity = i32::try_from(capacity_rows).unwrap_or(i32::MAX);
     if m >= min_batch
@@ -432,6 +503,34 @@ pub fn act_x_wt(
         return ctx.fire(
             Fire::at(QMM_FILE, qmm_name(op, "", group, bits, bm, bn)?)
                 .apply(Grid::of(qmm_grid(op, n, bn, padded, bm, 1)?, qmm_group(bm))),
+            &[
+                w.codes.arg(),
+                w.scales.arg(),
+                biases.arg(),
+                act.arg(),
+                y.arg_mut(),
+                k.arg(),
+                n.arg(),
+                m.arg(),
+            ],
+        );
+    }
+    let (lanes, rows) = (tuned.qmv_one_row_lanes, tuned.qmv_one_row_rows);
+    if m == 1
+        && tuned.qmv_one_row
+        && QMV1_LANES.contains(&lanes)
+        && QMV1_ROWS_PER_LANE.contains(&rows)
+        && qmv1_fits(group, bits)
+        && GROUPS.contains(&group)
+        && (k * bits) % 128 == 0
+        && k % 8 == 0
+    {
+        return ctx.fire(
+            Fire::at(QMV1_FILE, qmv1_name(group, bits, lanes, rows)).apply(Grid::of(
+                // 256 invocations land 256 / lanes rows each `rows` deep.
+                [(n as u32).div_ceil(256 / lanes * rows) * 64, 4, 1],
+                [64, 4, 1],
+            )),
             &[
                 w.codes.arg(),
                 w.scales.arg(),

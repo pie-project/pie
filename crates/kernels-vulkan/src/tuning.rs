@@ -6,6 +6,8 @@ pub enum Vendor {
     Amd,
     Intel,
     Apple,
+    Qualcomm,
+    Imagination,
     #[default]
     Other,
 }
@@ -33,6 +35,8 @@ impl DeviceInfo {
             0x1002 | 0x1022 => Vendor::Amd,
             0x8086 => Vendor::Intel,
             0x106b => Vendor::Apple,
+            0x5143 => Vendor::Qualcomm,
+            0x1010 => Vendor::Imagination,
             _ => Vendor::Other,
         }
     }
@@ -73,6 +77,22 @@ pub struct DeviceTuning {
     pub sdpa_split_groups: u32,
 
     pub sdpa_split_min_keys: u32,
+
+    /// Batched quantized projections on the register-tiled point (a 4x4
+    /// block per invocation) rather than the plain tiled one.
+    pub qmm_register_tiles: bool,
+
+    /// A one-row quantized projection (decode) on the 128-bit-load point
+    /// that folds with subgroup shuffles; needs subgroups of 32 or more.
+    pub qmv_one_row: bool,
+
+    /// Lanes of the one-row point that walk one output row: 32, 16 or 8.
+    /// Fewer give each lane more loads in flight.
+    pub qmv_one_row_lanes: u32,
+
+    /// Output rows one lane of the one-row point carries, sharing the
+    /// activations it loads: 1 or 2.
+    pub qmv_one_row_rows: u32,
 }
 
 impl Default for DeviceTuning {
@@ -95,6 +115,10 @@ impl Default for DeviceTuning {
             stream_rows_per_cut: 0,
             sdpa_split_groups: 128,
             sdpa_split_min_keys: 256,
+            qmm_register_tiles: false,
+            qmv_one_row: false,
+            qmv_one_row_lanes: 32,
+            qmv_one_row_rows: 1,
         }
     }
 }
@@ -109,6 +133,25 @@ impl DeviceTuning {
 
         if info.multiprocessors != 0 {
             t.sdpa_split_groups = info.multiprocessors;
+        }
+        // Adreno's workgroup memory is slow next to its ALUs: the plain tiled
+        // point runs a 64x1024x7168 projection at ~27 GFLOPS there.
+        if info.vendor == Vendor::Qualcomm {
+            t.qmm_register_tiles = true;
+            t.qmv_one_row = info.subgroup_size >= 32;
+            // A decode row's keys split across 128 workgroups, 128 keys or
+            // more apiece: 3k keys of Qwen3.5-0.8B attend in 1.9 ms a token
+            // over six layers, against 11.7 split two ways.
+            t.sdpa_split_groups = 128;
+            t.sdpa_split_min_keys = 128;
+        }
+        // PowerVR (Pixel 11 Pro, Tensor G6) decodes Qwen3.5-0.8B at 11 tok/s
+        // on `qmv`, 27 on the one-row point, and 33 with 8 lanes a row
+        // carrying two rows each.
+        if info.vendor == Vendor::Imagination {
+            t.qmv_one_row = info.subgroup_size >= 32;
+            t.qmv_one_row_lanes = 8;
+            t.qmv_one_row_rows = 2;
         }
         t
     }
@@ -138,6 +181,10 @@ impl DeviceTuning {
             stream_rows_per_cut,
             sdpa_split_groups,
             sdpa_split_min_keys,
+            qmm_register_tiles,
+            qmv_one_row,
+            qmv_one_row_lanes,
+            qmv_one_row_rows,
         );
         self
     }
@@ -179,6 +226,10 @@ pub struct Overrides {
     pub stream_rows_per_cut: Option<u32>,
     pub sdpa_split_groups: Option<u32>,
     pub sdpa_split_min_keys: Option<u32>,
+    pub qmm_register_tiles: Option<bool>,
+    pub qmv_one_row: Option<bool>,
+    pub qmv_one_row_lanes: Option<u32>,
+    pub qmv_one_row_rows: Option<u32>,
 }
 
 static DEVICE: OnceLock<DeviceInfo> = OnceLock::new();

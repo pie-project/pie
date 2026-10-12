@@ -36,12 +36,9 @@ impl Drop for Pipeline {
     }
 }
 
-type CacheSlot = (Arc<Core>, vk::PipelineCache, Option<std::path::PathBuf>);
-
 #[derive(Default)]
 pub struct Pipelines {
     built: RefCell<HashMap<&'static str, Arc<Pipeline>>>,
-    cache: RefCell<Option<CacheSlot>>,
     compiles: Cell<u64>,
 }
 
@@ -81,68 +78,14 @@ impl Pipelines {
                   `kernels-vulkan/native`, or the variant is not instantiated)"
                 .to_string(),
         })?;
-        let cache = self.cache(device)?;
-        let pipeline = Arc::new(build(device.core(), cache, fire, code)?);
+        let cache = device.pipeline_cache();
+        let pipeline = Arc::new(build(device.core(), cache.handle(), fire, code)?);
+        cache.built();
         self.compiles.set(self.compiles.get() + 1);
         self.built
             .borrow_mut()
             .insert(entrypoint, Arc::clone(&pipeline));
         Ok(pipeline)
-    }
-
-    fn cache(&self, device: &Context) -> Result<vk::PipelineCache> {
-        if let Some((_, cache, _)) = self.cache.borrow().as_ref() {
-            return Ok(*cache);
-        }
-        let core = device.core();
-        let path = device
-            .pipeline_cache_path()
-            .map(std::path::Path::to_path_buf);
-        let initial = path
-            .as_ref()
-            .and_then(|p| std::fs::read(p).ok())
-            .unwrap_or_default();
-        let make = |bytes: &[u8]| unsafe {
-            core.device.create_pipeline_cache(
-                &vk::PipelineCacheCreateInfo::default().initial_data(bytes),
-                None,
-            )
-        };
-
-        let cache = make(&initial)
-            .or_else(|_| make(&[]))
-            .map_err(|e| core.fault("vkCreatePipelineCache", e))?;
-        *self.cache.borrow_mut() = Some((Arc::clone(core), cache, path));
-        Ok(cache)
-    }
-
-    pub fn persist(&self) -> Result<()> {
-        let cache = self.cache.borrow();
-        let Some((core, cache, Some(path))) = cache.as_ref() else {
-            return Ok(());
-        };
-        let bytes = unsafe { core.device.get_pipeline_cache_data(*cache) }
-            .map_err(|e| core.fault("vkGetPipelineCacheData", e))?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| Fault::Device {
-                call: "pipeline cache dir",
-                why: e.to_string(),
-            })?;
-        }
-        std::fs::write(path, bytes).map_err(|e| Fault::Device {
-            call: "pipeline cache write",
-            why: e.to_string(),
-        })
-    }
-}
-
-impl Drop for Pipelines {
-    fn drop(&mut self) {
-        let _ = self.persist();
-        self.built.get_mut().clear();
-        if let Some((core, cache, _)) = self.cache.get_mut().take() {
-            unsafe { core.device.destroy_pipeline_cache(cache, None) };
-        }
     }
 }
 

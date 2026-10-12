@@ -44,7 +44,7 @@ pub enum ConfigCmd {
     Tune(tune::TuneArgs),
 }
 
-pub async fn run(cmd: ConfigCmd, global: &bootstrap::GlobalArgs) -> Result<Answer> {
+pub async fn run(cmd: ConfigCmd, global: &crate::args::GlobalArgs) -> Result<Answer> {
     match cmd {
         ConfigCmd::List { prefix } => list(global, prefix),
         ConfigCmd::Show { key } => show(global, key),
@@ -56,11 +56,11 @@ pub async fn run(cmd: ConfigCmd, global: &bootstrap::GlobalArgs) -> Result<Answe
     }
 }
 
-fn config_path(global: &bootstrap::GlobalArgs) -> PathBuf {
-    bootstrap::cli_config_path(global).0
+fn config_path(global: &crate::args::GlobalArgs) -> PathBuf {
+    crate::args::config_path(global).0
 }
 
-fn init(global: &bootstrap::GlobalArgs, force: bool) -> Result<Answer> {
+fn init(global: &crate::args::GlobalArgs, force: bool) -> Result<Answer> {
     let cfg_path = config_path(global);
     if cfg_path.exists() && !force {
         bail!("config file already exists at {cfg_path:?}; pass --force to overwrite");
@@ -75,11 +75,11 @@ fn init(global: &bootstrap::GlobalArgs, force: bool) -> Result<Answer> {
     Ok(Answer::did(did))
 }
 
-fn list(global: &bootstrap::GlobalArgs, prefix: Option<String>) -> Result<Answer> {
-    let (cfg_path, origin) = bootstrap::cli_config_path(global);
+fn list(global: &crate::args::GlobalArgs, prefix: Option<String>) -> Result<Answer> {
+    let (cfg_path, origin) = crate::args::config_path(global);
     let file: toml::Value = match std::fs::read_to_string(&cfg_path) {
         Ok(content) => toml::from_str(&content).map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?,
-        Err(_) if origin == bootstrap::Origin::Default => toml::Value::Table(Default::default()),
+        Err(_) if origin == crate::args::Origin::Default => toml::Value::Table(Default::default()),
         Err(e) => bail!(
             "no config file at {} ({}): {e}",
             crate::ui::short_path(&cfg_path),
@@ -311,10 +311,10 @@ impl crate::ui::Report for ConfigShow {
     }
 }
 
-fn show(global: &bootstrap::GlobalArgs, key: Option<String>) -> Result<Answer> {
-    let (cfg_path, origin) = bootstrap::cli_config_path(global);
+fn show(global: &crate::args::GlobalArgs, key: Option<String>) -> Result<Answer> {
+    let (cfg_path, origin) = crate::args::config_path(global);
     if !cfg_path.exists() {
-        if origin == bootstrap::Origin::Default {
+        if origin == crate::args::Origin::Default {
             return Ok(Answer::report(ConfigShow::File {
                 path: cfg_path,
                 origin: origin.describe().to_string(),
@@ -360,11 +360,11 @@ fn show(global: &bootstrap::GlobalArgs, key: Option<String>) -> Result<Answer> {
         origin: origin.describe().to_string(),
         content: Some(content),
         display,
-        redirected: origin != bootstrap::Origin::Default,
+        redirected: origin != crate::args::Origin::Default,
     }))
 }
 
-fn set(global: &bootstrap::GlobalArgs, key: String, value: String) -> Result<Answer> {
+fn set(global: &crate::args::GlobalArgs, key: String, value: String) -> Result<Answer> {
     let cfg_path = config_path(global);
     if !cfg_path.exists() {
         bail!("config file not found at {cfg_path:?} (run `pie config init`)");
@@ -388,7 +388,7 @@ fn typed_by_schema(content: &str, key: &str, value: &str) -> Result<(String, tom
             toml::from_str(content).map_err(|e| anyhow!("parse config: {e}"))?;
         set_nested(&mut root, key, candidate.clone())?;
         let serialized = toml::to_string(&root).map_err(|e| anyhow!("serialize TOML: {e}"))?;
-        match crate::derive::derive_standalone(&serialized) {
+        match worker::standalone::derive_standalone(&serialized) {
             Ok(_) => {
                 let mut doc: toml_edit::DocumentMut =
                     content.parse().map_err(|e| anyhow!("parse config: {e}"))?;
@@ -455,8 +455,8 @@ fn parse_toml_literal(value: &str) -> Option<toml::Value> {
     table.get("value").cloned()
 }
 
-fn edit(global: &bootstrap::GlobalArgs) -> Result<Answer> {
-    let (cfg_path, _) = bootstrap::cli_config_path(global);
+fn edit(global: &crate::args::GlobalArgs) -> Result<Answer> {
+    let (cfg_path, _) = crate::args::config_path(global);
     if !cfg_path.exists() {
         bail!(
             "no config file at {}; `pie config init` writes one",
@@ -492,7 +492,7 @@ fn edit(global: &bootstrap::GlobalArgs) -> Result<Answer> {
     }
 
     let edited = std::fs::read_to_string(&scratch).map_err(|e| anyhow!("read {scratch:?}: {e}"))?;
-    if let Err(error) = crate::derive::derive_standalone(&edited) {
+    if let Err(error) = worker::standalone::derive_standalone(&edited) {
         return Err(error).with_context(|| {
             format!(
                 "the edit is invalid and was NOT saved; it is kept at {}",
@@ -507,7 +507,7 @@ fn edit(global: &bootstrap::GlobalArgs) -> Result<Answer> {
     )))
 }
 
-fn unset(global: &bootstrap::GlobalArgs, key: String) -> Result<Answer> {
+fn unset(global: &crate::args::GlobalArgs, key: String) -> Result<Answer> {
     let cfg_path = config_path(global);
     if !cfg_path.exists() {
         bail!("config file not found at {cfg_path:?} (run `pie config init`)");
@@ -522,7 +522,8 @@ fn unset(global: &bootstrap::GlobalArgs, key: String) -> Result<Answer> {
         return Ok(Answer::noop(format!("{key} was already unset")));
     }
     let serialized = toml::to_string(&root).map_err(|e| anyhow!("serialize TOML: {e}"))?;
-    crate::derive::derive_standalone(&serialized).with_context(|| format!("unsetting {key}"))?;
+    worker::standalone::derive_standalone(&serialized)
+        .with_context(|| format!("unsetting {key}"))?;
     let mut doc: toml_edit::DocumentMut = content
         .parse()
         .map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?;

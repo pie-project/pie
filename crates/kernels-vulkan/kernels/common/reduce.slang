@@ -1,6 +1,8 @@
 #ifndef PIE_VULKAN_REDUCE_SLANG
 #define PIE_VULKAN_REDUCE_SLANG
 
+#include "common/subgroup.slang"
+
 #define PIE_REDUCE_MAX_SUBGROUPS 128
 
 groupshared float pie_partials[PIE_REDUCE_MAX_SUBGROUPS];
@@ -8,12 +10,12 @@ groupshared float pie_partials[PIE_REDUCE_MAX_SUBGROUPS];
 float pie_workgroup_sum(float v) {
     float s = WaveActiveSum(v);
     if (WaveIsFirstLane()) {
-        pie_partials[gl_SubgroupID] = s;
+        pie_partials[pie_subgroup_id()] = s;
     }
     GroupMemoryBarrierWithGroupSync();
 
     float total = 0.0;
-    for (uint i = 0; i < gl_NumSubgroups; i++) {
+    for (uint i = 0; i < pie_num_subgroups(); i++) {
         total += pie_partials[i];
     }
     GroupMemoryBarrierWithGroupSync();
@@ -23,12 +25,12 @@ float pie_workgroup_sum(float v) {
 float pie_workgroup_max(float v) {
     float m = WaveActiveMax(v);
     if (WaveIsFirstLane()) {
-        pie_partials[gl_SubgroupID] = m;
+        pie_partials[pie_subgroup_id()] = m;
     }
     GroupMemoryBarrierWithGroupSync();
 
     float total = pie_partials[0];
-    for (uint i = 1; i < gl_NumSubgroups; i++) {
+    for (uint i = 1; i < pie_num_subgroups(); i++) {
         total = max(total, pie_partials[i]);
     }
     GroupMemoryBarrierWithGroupSync();

@@ -5,8 +5,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 WASM_CRATES=(pie-browser runtime engine-wgpu kernels-wgpu web-std wasmtime-web
-  checkpoint checkpoint-dsl ztensor ztensor-compat tokenizer grammar chat-template
-  models pie-poem-ir pie-poem-dsl pie-poem-compiler engine pie-poem-exec pie-eta-ir pie-eta-dsl eta-compiler
+  checkpoint ztensor ztensor-compat tokenizer grammar chat-template
+  pie-poem-ir pie-poem pie-poem-compiler engine pie-poem-exec pie-eta-ir pie-eta-dsl eta-compiler
   eta-exec waker ids pie-dtype pie-client-api)
 NATIVE_CRATES=(pie-browser runtime engine-wgpu kernels-wgpu web-std wasmtime-web)
 
@@ -15,13 +15,16 @@ pkgs() { for c in "$@"; do printf -- '-p %s ' "$c"; done; }
 echo "== wasm32: clippy"
 CARGO_TARGET_DIR=target-wasm cargo clippy --target wasm32-unknown-unknown \
   $(pkgs "${WASM_CRATES[@]}") --features runtime/wgpu,engine-wgpu/wgpu -- -D warnings
+# The worker the tab boots through: without `net`, its default.
+CARGO_TARGET_DIR=target-wasm cargo clippy --target wasm32-unknown-unknown \
+  -p worker --no-default-features --features worker/wgpu -- -D warnings
 
 echo "== native, wgpu feature: clippy + tests"
 cargo clippy $(pkgs "${NATIVE_CRATES[@]}") --features runtime/wgpu,engine-wgpu/wgpu -- -D warnings
 cargo test -q $(pkgs "${NATIVE_CRATES[@]}") --features runtime/wgpu,engine-wgpu/wgpu
 
 echo "== javascript"
-for f in javascript/server-web/src/*.mjs tests/browser/*.mjs tests/browser/tools/*.mjs scripts/bench/browser/*.mjs; do
+for f in packages/javascript/server-web/src/*.mjs tests/browser/*.mjs tests/browser/tools/*.mjs scripts/bench/browser/*.mjs; do
   node --check "$f"
 done
 for f in tests/browser/*.html crates/kernels-wgpu/tools/*.html; do

@@ -71,6 +71,13 @@ pub struct DeviceTuning {
     pub qmv_rows_packs: u32,
 
     pub stream_rows_per_cut: u32,
+
+    /// The share of a split the Neural Engine takes, in percent.
+    pub ane_percent: u32,
+
+    /// Whether wide projections split with the Neural Engine; the MLPs do
+    /// either way.
+    pub ane_projections: bool,
 }
 
 impl Default for DeviceTuning {
@@ -96,6 +103,8 @@ impl Default for DeviceTuning {
             qmv_rows_max: 8,
             qmv_rows_packs: 1,
             stream_rows_per_cut: 0,
+            ane_percent: 47,
+            ane_projections: true,
         }
     }
 }
@@ -157,6 +166,8 @@ impl DeviceTuning {
             qmv_rows_max,
             qmv_rows_packs,
             stream_rows_per_cut,
+            ane_percent,
+            ane_projections,
         );
         self
     }
@@ -201,6 +212,8 @@ pub struct Overrides {
     pub qmv_rows_max: Option<u32>,
     pub qmv_rows_packs: Option<u32>,
     pub stream_rows_per_cut: Option<u32>,
+    pub ane_percent: Option<u32>,
+    pub ane_projections: Option<bool>,
 }
 
 static DEVICE: OnceLock<DeviceInfo> = OnceLock::new();

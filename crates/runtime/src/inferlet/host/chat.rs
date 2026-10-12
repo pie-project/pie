@@ -1,7 +1,7 @@
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 use anyhow::Result;
-use models::template::{ChatDecoder, ChatEvent};
+use chat_template::{ChatDecoder, ChatEvent};
 use std::collections::VecDeque;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
@@ -44,6 +44,10 @@ impl pie::inferlet::chat::Host for ProcessCtx {
 
     async fn cue(&mut self) -> Result<Vec<u32>> {
         Ok(crate::model::model().instruct().cue())
+    }
+
+    async fn cue_without_thinking(&mut self) -> Result<Vec<u32>> {
+        Ok(crate::model::model().instruct().cue_without_thinking())
     }
 
     async fn seal(&mut self) -> Result<Vec<u32>> {

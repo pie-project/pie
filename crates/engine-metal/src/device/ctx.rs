@@ -1,3 +1,6 @@
+#[cfg(target_vendor = "apple")]
+use std::cell::RefCell;
+
 use crate::error::{Fault, Result};
 
 #[cfg(target_vendor = "apple")]
@@ -301,9 +304,10 @@ impl Context {
                 why: "the command buffer would not open a compute pass".to_string(),
             })?;
             Ok(Frame {
-                buffer,
-                encoder: Some(encoder),
+                buffer: RefCell::new(buffer),
+                encoder: RefCell::new(Some(encoder)),
                 blit: None,
+                committed: RefCell::new(Vec::new()),
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -313,14 +317,18 @@ impl Context {
     }
 }
 
+/// One command buffer and the compute pass open on it. A fence (see
+/// [`Frame::fence`]) closes the pass, encodes an event signal or wait on
+/// the buffer, and opens the next pass. The cells let a fence happen
+/// through a shared `&Frame`, which is all a live encode holds.
 pub struct Frame {
     #[cfg(target_vendor = "apple")]
-    buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    buffer: RefCell<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     #[cfg(not(target_vendor = "apple"))]
     #[allow(dead_code)]
     buffer: (),
     #[cfg(target_vendor = "apple")]
-    encoder: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
+    encoder: RefCell<Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>>,
     #[cfg(not(target_vendor = "apple"))]
     encoder: Option<()>,
     #[cfg(target_vendor = "apple")]
@@ -328,6 +336,9 @@ pub struct Frame {
     #[cfg(not(target_vendor = "apple"))]
     #[allow(dead_code)]
     blit: Option<()>,
+    /// What runs once the buffer is committed, in the order it was added.
+    #[cfg(target_vendor = "apple")]
+    committed: RefCell<Vec<Box<dyn FnOnce() + Send>>>,
 }
 
 // SAFETY: a `Frame` is created, encoded into and committed on one thread —
@@ -335,16 +346,37 @@ pub struct Frame {
 unsafe impl Send for Frame {}
 
 impl Frame {
+    /// The open compute pass, retained: a fence may replace it while the
+    /// caller still holds this one, so nothing borrows the cell for long.
     #[cfg(target_vendor = "apple")]
-    pub(crate) fn encoder(&self) -> &ProtocolObject<dyn MTLComputeCommandEncoder> {
+    pub(crate) fn encoder(&self) -> Retained<ProtocolObject<dyn MTLComputeCommandEncoder>> {
         self.encoder
-            .as_deref()
+            .borrow()
+            .clone()
             .expect("the pass is open until `commit` closes it")
+    }
+
+    /// Has `then` run once this frame's buffer is committed; a frame dropped
+    /// uncommitted never runs it.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn on_commit(&self, then: Box<dyn FnOnce() + Send>) {
+        self.committed.borrow_mut().push(then);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn commit_buffer(&mut self) -> Retained<ProtocolObject<dyn MTLCommandBuffer>> {
+        self.end_pass();
+        let buffer = self.buffer.get_mut().clone();
+        buffer.commit();
+        for then in self.committed.get_mut().drain(..) {
+            then();
+        }
+        buffer
     }
 
     #[cfg(target_vendor = "apple")]
     fn end_pass(&mut self) {
-        if let Some(encoder) = self.encoder.take() {
+        if let Some(encoder) = self.encoder.get_mut().take() {
             encoder.endEncoding();
         }
         if let Some(blit) = self.blit.take() {
@@ -355,12 +387,60 @@ impl Frame {
     #[cfg(target_vendor = "apple")]
     pub(crate) fn next_pass(&mut self) -> Result<&ProtocolObject<dyn MTLComputeCommandEncoder>> {
         self.end_pass();
-        let encoder = self.buffer.computeCommandEncoder().ok_or(Fault::Device {
-            call: "computeCommandEncoder",
-            why: "the command buffer would not open a second compute pass".to_string(),
-        })?;
-        self.encoder = Some(encoder);
-        Ok(self.encoder.as_deref().expect("just opened"))
+        let encoder = self
+            .buffer
+            .get_mut()
+            .computeCommandEncoder()
+            .ok_or(Fault::Device {
+                call: "computeCommandEncoder",
+                why: "the command buffer would not open a second compute pass".to_string(),
+            })?;
+        *self.encoder.get_mut() = Some(encoder);
+        Ok(self.encoder.get_mut().as_deref().expect("just opened"))
+    }
+
+    /// Ends the pass here and opens the next, with an event between them
+    /// in the same command buffer. With `signal`, the GPU signals `event`
+    /// to `value` once the work so far is done; without, it waits for
+    /// `event` to reach `value` before the work after. Either way the GPU
+    /// work on both sides stays ordered, and the other engine runs between.
+    ///
+    /// The buffer stays one: closing it at each fence and chaining the next
+    /// on the queue was seen to cost ~200 ms at a boundary every so often,
+    /// the GPU starting the scheduled buffer late, which a long prefill
+    /// paid a dozen times over.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn fence(
+        &self,
+        event: &ProtocolObject<dyn objc2_metal::MTLEvent>,
+        value: u64,
+        signal: bool,
+    ) -> Result<()> {
+        if self.blit.is_some() {
+            return Err(Fault::Device {
+                call: "fence",
+                why: "a blit pass is open where a compute pass was expected".to_string(),
+            });
+        }
+        if let Some(encoder) = self.encoder.borrow_mut().take() {
+            encoder.endEncoding();
+        }
+        let current = self.buffer.borrow().clone();
+        if signal {
+            current.encodeSignalEvent_value(event, value);
+        } else {
+            current.encodeWaitForEvent_value(event, value);
+        }
+        let reopened = self
+            .buffer
+            .borrow()
+            .computeCommandEncoder()
+            .ok_or(Fault::Device {
+                call: "computeCommandEncoder",
+                why: "the command buffer would not reopen a compute pass after a fence".to_string(),
+            })?;
+        *self.encoder.borrow_mut() = Some(reopened);
+        Ok(())
     }
 
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
@@ -373,13 +453,15 @@ impl Frame {
                 return Ok(());
             }
             if self.blit.is_none() {
-                if let Some(encoder) = self.encoder.take() {
+                if let Some(encoder) = self.encoder.get_mut().take() {
                     encoder.endEncoding();
                 }
-                self.blit = Some(self.buffer.blitCommandEncoder().ok_or(Fault::Device {
-                    call: "blitCommandEncoder",
-                    why: "the command buffer would not open a blit pass".to_string(),
-                })?);
+                self.blit = Some(self.buffer.get_mut().blitCommandEncoder().ok_or(
+                    Fault::Device {
+                        call: "blitCommandEncoder",
+                        why: "the command buffer would not open a blit pass".to_string(),
+                    },
+                )?);
             }
             let blit = self.blit.as_deref().expect("just opened");
             blit.fillBuffer_range_value(
@@ -411,13 +493,15 @@ impl Frame {
                 return Ok(());
             }
             if self.blit.is_none() {
-                if let Some(encoder) = self.encoder.take() {
+                if let Some(encoder) = self.encoder.get_mut().take() {
                     encoder.endEncoding();
                 }
-                self.blit = Some(self.buffer.blitCommandEncoder().ok_or(Fault::Device {
-                    call: "blitCommandEncoder",
-                    why: "the command buffer would not open a blit pass".to_string(),
-                })?);
+                self.blit = Some(self.buffer.get_mut().blitCommandEncoder().ok_or(
+                    Fault::Device {
+                        call: "blitCommandEncoder",
+                        why: "the command buffer would not open a blit pass".to_string(),
+                    },
+                )?);
             }
             let blit = self.blit.as_deref().expect("just opened");
             blit.fillBuffer_range_value(
@@ -463,13 +547,15 @@ impl Frame {
                 return Ok(());
             }
             if self.blit.is_none() {
-                if let Some(encoder) = self.encoder.take() {
+                if let Some(encoder) = self.encoder.get_mut().take() {
                     encoder.endEncoding();
                 }
-                self.blit = Some(self.buffer.blitCommandEncoder().ok_or(Fault::Device {
-                    call: "blitCommandEncoder",
-                    why: "the command buffer would not open a blit pass".to_string(),
-                })?);
+                self.blit = Some(self.buffer.get_mut().blitCommandEncoder().ok_or(
+                    Fault::Device {
+                        call: "blitCommandEncoder",
+                        why: "the command buffer would not open a blit pass".to_string(),
+                    },
+                )?);
             }
             let blit = self.blit.as_deref().expect("just opened");
             // SAFETY: both spans were bounds-checked by `Buffer::span`, and
@@ -495,10 +581,9 @@ impl Frame {
     pub fn commit(mut self) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
-            self.end_pass();
-            self.buffer.commit();
-            self.buffer.waitUntilCompleted();
-            if let Some(error) = self.buffer.error() {
+            let buffer = self.commit_buffer();
+            buffer.waitUntilCompleted();
+            if let Some(error) = buffer.error() {
                 return Err(Fault::Device {
                     call: "waitUntilCompleted",
                     why: error.localizedDescription().to_string(),
@@ -516,16 +601,15 @@ impl Frame {
     pub fn commit_timed(mut self) -> Result<f64> {
         #[cfg(target_vendor = "apple")]
         {
-            self.end_pass();
-            self.buffer.commit();
-            self.buffer.waitUntilCompleted();
-            if let Some(error) = self.buffer.error() {
+            let buffer = self.commit_buffer();
+            buffer.waitUntilCompleted();
+            if let Some(error) = buffer.error() {
                 return Err(Fault::Device {
                     call: "waitUntilCompleted",
                     why: error.localizedDescription().to_string(),
                 });
             }
-            Ok(self.buffer.GPUEndTime() - self.buffer.GPUStartTime())
+            Ok(buffer.GPUEndTime() - buffer.GPUStartTime())
         }
         #[cfg(not(target_vendor = "apple"))]
         {
@@ -541,7 +625,6 @@ impl Frame {
     ) -> Result<Pending> {
         #[cfg(target_vendor = "apple")]
         {
-            self.end_pass();
             if let Some(on_done) = on_done {
                 let handler = block2::RcBlock::new(
                     move |buffer: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
@@ -561,12 +644,12 @@ impl Frame {
                 // closure owns everything it touches and is `Send`.
                 unsafe {
                     self.buffer
+                        .get_mut()
                         .addCompletedHandler(block2::RcBlock::as_ptr(&handler));
                 }
             }
-            self.buffer.commit();
             Ok(Pending {
-                buffer: self.buffer.clone(),
+                buffer: self.commit_buffer(),
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -668,6 +751,26 @@ pub(crate) fn threadgroup(
         height: y,
         depth: z,
     }
+}
+
+/// Without a stated version a library compiles as the default of the SDK the
+/// app linked against, which can predate the MSL 4.0 some kernels need, so
+/// name 4.0 wherever the OS has it (26 on both macOS and iOS).
+#[cfg(target_vendor = "apple")]
+pub(crate) fn compile_options() -> Retained<objc2_metal::MTLCompileOptions> {
+    use objc2_foundation::{NSOperatingSystemVersion, NSProcessInfo};
+
+    let options = objc2_metal::MTLCompileOptions::new();
+    let msl4 =
+        NSProcessInfo::processInfo().isOperatingSystemAtLeastVersion(NSOperatingSystemVersion {
+            majorVersion: 26,
+            minorVersion: 0,
+            patchVersion: 0,
+        });
+    if msl4 {
+        options.setLanguageVersion(objc2_metal::MTLLanguageVersion::Version4_0);
+    }
+    options
 }
 
 #[cfg(target_vendor = "apple")]

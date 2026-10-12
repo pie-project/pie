@@ -1,6 +1,6 @@
-use models::media::{Fault, Rgb8};
+use media::front::{Fault, Rgb8};
 
-pub fn decode(bytes: &[u8]) -> models::media::Result<Rgb8> {
+pub fn decode(bytes: &[u8]) -> media::front::Result<Rgb8> {
     if bytes.is_empty() {
         return Err(Fault::Decode(
             "no bytes: an empty payload is no image".into(),

@@ -38,7 +38,7 @@ from common import (
     visible_cuda_devices,
 )
 
-SERVER_PY = ROOT / "python" / "server" / "python"
+SERVER_PY = ROOT / "packages" / "python" / "server" / "python"
 if str(SERVER_PY) not in sys.path:
     sys.path.insert(0, str(SERVER_PY))
 
@@ -119,7 +119,7 @@ def bench_inferlet_wasm(inferlet_dir: str | None) -> Path:
             "cargo build --target wasm32-wasip2 --release"
         )
     # The wasm is a build OUTPUT with no staleness guard of its own (the engine
-    # guard below covers only crates and python/server sources), so
+    # guard below covers only crates and packages/python/server sources), so
     # an edited inferlet silently benches the previous build. Refuse instead.
     newest_src = max(
         (p.stat().st_mtime_ns for p in (inferlet_dir / "src").rglob("*.rs")),
@@ -149,10 +149,10 @@ def embedded_engine_identity() -> dict[str, str]:
     # staleness guard was watching one file and any newer `.so` passed it.
     source_roots = [
         ROOT / "crates",
-        ROOT / "python" / "server" / "src",
+        ROOT / "packages" / "python" / "server" / "src",
     ]
     # `engine-metal` is only in the dependency list on Apple-Silicon builds
-    # (python/server/Cargo.toml), so on Linux its sources cannot have gone
+    # (packages/python/server/Cargo.toml), so on Linux its sources cannot have gone
     # into this .so. Counting them makes an origin/dev pull that touched only
     # the Metal engine look like a stale CUDA engine.
     skip_roots = () if sys.platform == "darwin" else (ROOT / "crates" / "engine-metal",)
@@ -181,7 +181,7 @@ def embedded_engine_identity() -> dict[str, str]:
         raise RuntimeError(
             f"embedded engine {engine_path} is older than {newest_source}; "
             "rebuild with PIE_COMPILER_LAUNCHER=env CARGO_BUILD_JOBS=2 "
-            "CMAKE_BUILD_PARALLEL_LEVEL=2 uv --project python/server sync "
+            "CMAKE_BUILD_PARALLEL_LEVEL=2 uv --project packages/python/server sync "
             "--reinstall-package pie-server"
         )
     digest = hashlib.sha256()
@@ -617,9 +617,13 @@ async def cli_pie_client(args: argparse.Namespace):
         path.parent.mkdir(parents=True, exist_ok=True)
         server_log_file = path.open("w", encoding="utf-8")
 
+    spawned = time.perf_counter()
+
     def should_surface_server_line(txt: str) -> bool:
         return (
-            txt.startswith("[fire ")
+            txt.startswith("PIE_ANE")
+            or "panicked at" in txt
+            or txt.startswith("[fire ")
             or txt.startswith("[pie-fire-timing] ")
             or txt.startswith("[sched-fire ")
             or txt.startswith("[outer-fire ")
@@ -639,6 +643,13 @@ async def cli_pie_client(args: argparse.Namespace):
             or "graph captured" in txt
         )
 
+    def stamped(txt: str) -> str:
+        # The Neural Engine's lines carry when they landed, so a stall can be
+        # set against its compile and its hand-offs.
+        if txt.startswith("PIE_ANE") or "panicked at" in txt:
+            return f"[{time.perf_counter() - spawned:7.1f}s] {txt}"
+        return txt
+
     async def drain_stdout() -> None:
         assert proc.stdout is not None
         import sys
@@ -656,7 +667,7 @@ async def cli_pie_client(args: argparse.Namespace):
             # they land; otherwise keep the server log buffered for
             # startup/failure messages.
             if should_surface_server_line(txt):
-                sys.stderr.write(txt)
+                sys.stderr.write(stamped(txt))
                 sys.stderr.flush()
 
     try:
@@ -684,7 +695,7 @@ async def cli_pie_client(args: argparse.Namespace):
                 server_log_file.write(text)
                 server_log_file.flush()
             if should_surface_server_line(text):
-                sys.stderr.write(text)
+                sys.stderr.write(stamped(text))
                 sys.stderr.flush()
             # The banner's scheme moved from `ws://` to `gateway://` when the
             # gateway edge landed; match the phrase, not the scheme.
@@ -763,6 +774,7 @@ async def run(args: argparse.Namespace):
                 "temperature": args.temperature,
                 "top_p": args.top_p,
                 "ignore_eos": args.ignore_eos,
+                "no_think": getattr(args, "think", None) is False,
                 "wasm_delay_us": args.wasm_delay_us,
                 # THE FIRST TOKEN TAKES THE DEVICE AGAIN, ON BOTH ENGINES.
                 # This was set unconditionally for `--engine metal`, because
@@ -777,6 +789,7 @@ async def run(args: argparse.Namespace):
                 # token out on `g0` and back as the decode's seed) and an A/B
                 # against the device handoff is worth being able to run.
                 **({"host_first_token": True} if getattr(args, "host_first_token", False) else {}),
+                **({"no_prefix_cache": True} if getattr(args, "no_prefix_cache", False) else {}),
                 **(
                     {"run_ahead_frames": args.run_ahead_frames}
                     if getattr(args, "run_ahead_frames", None)
@@ -1576,6 +1589,18 @@ def build_parser() -> argparse.ArgumentParser:
                      "frames (forwarded as the bench input's "
                      "run_ahead_frames; the ring grows to match). "
                      "Default: the inferlet's own sizing.",
+            )
+        if not any(
+            "--no-prefix-cache" in a.option_strings for a in sp._actions
+        ):
+            sp.add_argument(
+                "--no-prefix-cache",
+                dest="no_prefix_cache",
+                action="store_true",
+                help="Prefill every prompt from scratch: no cached prefix is "
+                     "mapped in or published, and a hybrid model's prefill is "
+                     "not cut at the cache's state snapshots (pages 1, 2, 4, "
+                     "...). For cold-prefill measurements.",
             )
         if not any(
             "--host-first-token" in a.option_strings for a in sp._actions

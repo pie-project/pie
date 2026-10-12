@@ -60,7 +60,7 @@ heads, then sum over layers" in one pass, because
 and the inferlet library has no host call for it, so the program states it and the backend
 **refuses** a claim larger than the load exports, by name. The defaults are
 `Qwen/Qwen3.5-0.8B`: `Model::d0_8b` is `layers: 24, attn_every: 4`, so the
-hybrid SKU puts attention on 6 of its 24 layers (the other 18 are GDN and export
+hybrid deployment puts attention on 6 of its 24 layers (the other 18 are GDN and export
 nothing), with `q_heads: 8` → **6 layers × 8 heads = 48 planes**.
 
 The row's WIDTH is not the program's to declare: a slab pitch cannot be a

@@ -120,7 +120,7 @@ DEFAULT_SNAPSHOT = os.path.join(
     os.path.expanduser("~/.cache/huggingface/hub"),
     "models--black-forest-labs--FLUX.2-klein-4B/snapshots/*/",
 )
-DEFAULT_SKU = "flux2-klein-4b-bf16-kv-bf16"
+DEFAULT_DEPLOYMENT = "flux2-klein-4b-bf16-kv-bf16"
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 
@@ -479,7 +479,7 @@ def main() -> int:
     ap.add_argument("--out", default="/tmp/flux2-klein-parity")
     ap.add_argument("--inferlet", default=os.path.join(REPO, "examples/flux2-klein-parity"))
     ap.add_argument("--config", default=None,
-                    help=f"the serving config; its `[model] model` must be the artifact `{DEFAULT_SKU}` imported")
+                    help=f"the serving config; its `[model] model` must be the artifact `{DEFAULT_DEPLOYMENT}` imported")
     ap.add_argument("--pie", default=None, help="the pie binary (default: PATH, else target/debug)")
     ap.add_argument("--wait", type=int, default=600, help="seconds to wait for the instance to start")
     ap.add_argument("--native", action="store_true", help="also run the trajectory over pie's own text rows")

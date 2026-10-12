@@ -282,14 +282,42 @@ impl Concurrency {
         &self.pairs
     }
 
+    /// Which fork pairs' two sides `span` meets, as bitsets: two spans
+    /// overlap when they touch, or when one meets a pair's side and the other
+    /// meets the other. Computed once per span, so a placement's every
+    /// overlap test is a few words of AND rather than a walk of the pairs.
     #[must_use]
-    pub fn overlap(&self, a: Span, b: Span) -> bool {
-        if a.first <= b.last && b.first <= a.last {
-            return true;
+    pub fn reach(&self, span: Span) -> Reach {
+        let words = self.paired.len().div_ceil(64);
+        let (mut one, mut two) = (vec![0u64; words], vec![0u64; words]);
+        for (i, &(a, b)) in self.paired.iter().enumerate() {
+            let bit = 1u64 << (i % 64);
+            if meets(a, span) {
+                one[i / 64] |= bit;
+            }
+            if meets(b, span) {
+                two[i / 64] |= bit;
+            }
         }
-        self.paired
-            .iter()
-            .any(|&(one, two)| (meets(one, a) && meets(two, b)) || (meets(one, b) && meets(two, a)))
+        Reach { span, one, two }
+    }
+}
+
+/// A span with the fork-pair sides it meets ([`Concurrency::reach`]).
+#[derive(Debug, Clone)]
+pub struct Reach {
+    span: Span,
+    one: Vec<u64>,
+    two: Vec<u64>,
+}
+
+impl Reach {
+    #[must_use]
+    pub fn overlaps(&self, other: &Reach) -> bool {
+        let across = |a: &[u64], b: &[u64]| a.iter().zip(b).any(|(x, y)| x & y != 0);
+        touching(self.span, other.span)
+            || across(&self.one, &other.two)
+            || across(&self.two, &other.one)
     }
 }
 
@@ -438,14 +466,15 @@ impl ArenaMap {
 
     #[must_use]
     pub fn clashes_blind(&self, conc: &Concurrency) -> Vec<(ValueId, ValueId)> {
-        let live = self.live();
+        let live: Vec<_> = self
+            .live()
+            .into_iter()
+            .map(|(value, span, at, bytes)| (value, conc.reach(span), at, bytes))
+            .collect();
         let mut found = Vec::new();
-        for (i, (a, a_span, a_at, a_bytes)) in live.iter().enumerate() {
-            for (b, b_span, b_at, b_bytes) in &live[i + 1..] {
-                if conc.overlap(*a_span, *b_span)
-                    && *a_at < b_at + b_bytes
-                    && *b_at < a_at + a_bytes
-                {
+        for (i, (a, a_reach, a_at, a_bytes)) in live.iter().enumerate() {
+            for (b, b_reach, b_at, b_bytes) in &live[i + 1..] {
+                if *a_at < b_at + b_bytes && *b_at < a_at + a_bytes && a_reach.overlaps(b_reach) {
                     found.push((*a, *b));
                 }
             }
@@ -980,15 +1009,16 @@ fn place(
 
     let columns = gather(placements, live_in, &order, mode);
 
-    let mut placed: Vec<(u64, u64, Span)> = Vec::with_capacity(columns.len());
+    let mut placed: Vec<(u64, u64, Reach)> = Vec::with_capacity(columns.len());
     let mut blockers: Vec<(u64, u64)> = Vec::new();
     let mut bytes = 0u64;
     for column in &columns {
+        let reach = conc.reach(column.span);
         blockers.clear();
         blockers.extend(
             placed
                 .iter()
-                .filter(|(_, _, live)| conc.overlap(*live, column.span))
+                .filter(|(_, _, live)| live.overlaps(&reach))
                 .map(|(at, size, _)| (*at, at + size)),
         );
         blockers.sort_unstable();
@@ -1005,7 +1035,7 @@ fn place(
             };
             *offset = at;
         }
-        placed.push((at, column.size, column.span));
+        placed.push((at, column.size, reach));
         bytes = bytes.max(at + column.size);
     }
     bytes

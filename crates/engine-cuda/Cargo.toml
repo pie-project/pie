@@ -50,10 +50,8 @@ cuda = ["dep:cudarc", "kernels-cuda/cuda", "cudarc/cuda-13000"]
 windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
 
 [dev-dependencies]
-models = { path = "../models" }
-poem-dsl = { package = "pie-poem-dsl", path = "../poem-dsl" }
+poem = { package = "pie-poem", path = "../poem" }
 tokenizer = { path = "../tokenizer" }
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
-checkpoint-dsl = { path = "../checkpoint-dsl" }
 tempfile = "3"

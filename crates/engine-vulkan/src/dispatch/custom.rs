@@ -1,10 +1,10 @@
-use poem_exec::{DispatchCustomCuda, KernelError};
-use poem_ir::{CustomCuda, Operands};
+use poem_exec::{DispatchFused, KernelError};
+use poem_ir::{Fused, Operands};
 
 use crate::run::Run;
 
-impl DispatchCustomCuda for Run<'_> {
-    fn dispatch(&mut self, op: &CustomCuda) -> Result<(), KernelError> {
+impl DispatchFused for Run<'_> {
+    fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         Err(KernelError::Unsupported { op: op.name() })
     }
 }
@@ -18,6 +18,7 @@ impl poem_exec::DispatchSpatial for Run<'_> {
 impl poem_exec::DispatchProbe for Run<'_> {
     fn probe(&mut self, node: &poem_ir::Node) {
         use std::io::Write;
+        self.split_at(node);
         let Some(dir) = crate::probe::dir() else {
             return;
         };

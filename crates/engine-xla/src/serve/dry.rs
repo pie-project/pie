@@ -2,7 +2,7 @@
 //! Over a dry device (`Shell::load_dry`) they trace and run nothing (no
 //! weights land, no pool holds a buffer); over a device that runs, they run
 //! and read back (the e2e example checks what came back is finite). The coverage harness
-//! (`examples/coverage.rs`) answers with it, for each catalog SKU, whether
+//! (`examples/coverage.rs`) answers with it, for each catalog deployment, whether
 //! engine-xla emits the plan's programs, and, on a compiling dry device,
 //! whether the plugin compiles them.
 //!
@@ -13,7 +13,7 @@
 //! over the voxel axis one clip, a class that lands media one image.
 
 use engine::fire::{Mask, Masking};
-use poem_ir::{ClassifyFn, Request, Stream};
+use poem_ir::{Facts, Request, Stream};
 
 use super::{Lane, Media, PATCH_ROUTE_DROP, Seated, Shell};
 use crate::dit::{Clips, PortCell, SelfCond};
@@ -37,9 +37,12 @@ pub struct Probe {
 /// Every request shape the arming pass enumerates (engine-cuda
 /// `exports::landing_requests`), by the class it lands in.
 #[must_use]
-pub fn landing(classify: ClassifyFn, classes: &poem_ir::ClassTable) -> Vec<Vec<Request>> {
+pub fn landing(facts: &Facts, classes: &poem_ir::ClassTable) -> Vec<Vec<Request>> {
     let mut landing = vec![Vec::new(); classes.classes.len()];
-    for reading in 0..8u8 {
+    let readings: Vec<Option<&str>> = std::iter::once(None)
+        .chain(facts.values(poem_ir::Request::READING).map(Some))
+        .collect();
+    for reading in readings {
         for stream in Stream::ALL {
             for bits in 0..256u32 {
                 let request = Request::new(if bits & 1 == 0 { 1 } else { 2 }, bits & 2 != 0)
@@ -49,9 +52,12 @@ pub fn landing(classify: ClassifyFn, classes: &poem_ir::ClassTable) -> Vec<Vec<R
                     .with_media(bits & 32 != 0)
                     .denoising(bits & 64 != 0)
                     .drafting_a_block(bits & 128 != 0)
-                    .on_stream(stream)
-                    .in_reading(reading);
-                let word = classify(&request) & classes.mask;
+                    .on_stream(stream);
+                let request = match reading {
+                    Some(name) => request.in_reading(name),
+                    None => request,
+                };
+                let word = facts.word(&request) & classes.mask;
                 if let Some(class) = classes.class_of(word) {
                     landing[class].push(request);
                 }
@@ -68,7 +74,7 @@ pub fn landing(classify: ClassifyFn, classes: &poem_ir::ClassTable) -> Vec<Vec<R
                 + u32::from(r.denoise())
                 + u32::from(r.drafts_a_block())
                 + u32::from(r.stream() != Stream::Text)
-                + u32::from(r.reading() != 0)
+                + u32::from(r.reading().is_some())
         });
     }
     landing
@@ -99,8 +105,7 @@ struct OwnedMedia {
     patches: Vec<u8>,
     routes: Vec<i32>,
     positions: Vec<i32>,
-    embed_rows: Vec<i32>,
-    embed_weights: Vec<f32>,
+    grids: Vec<i32>,
 }
 
 impl Shell {
@@ -110,13 +115,9 @@ impl Shell {
     ///
     /// `lean` skips the classes that run a custom-mask, adapter or score
     /// capture arm (a compile check keeps the device briefly).
-    pub fn synthetic_fires(
-        &mut self,
-        classify: ClassifyFn,
-        prefill: u32,
-        lean: bool,
-    ) -> Vec<Probe> {
-        let landing = landing(classify, &self.compiled_model().classes);
+    pub fn synthetic_fires(&mut self, prefill: u32, lean: bool) -> Vec<Probe> {
+        let facts = self.trace().facts.clone();
+        let landing = landing(&facts, &self.compiled_model().classes);
         let mut probes = Vec::new();
         for (class, requests) in landing.iter().enumerate() {
             if lean
@@ -147,7 +148,7 @@ impl Shell {
             }
             for (request, rows, lanes) in shapes {
                 let before = self.device().dry_texts().len();
-                let fired = self.dry_fire(class, request, classify(&request), rows, lanes);
+                let fired = self.dry_fire(class, request, facts.word(&request), rows, lanes);
                 let finite = match (&fired, self.device().is_dry()) {
                     (Ok(fired), false) => {
                         let values = fired
@@ -241,8 +242,7 @@ impl Shell {
                 patches: &m.patches,
                 routes: &m.routes,
                 positions: &m.positions,
-                embed_rows: &m.embed_rows,
-                embed_weights: &m.embed_weights,
+                grids: &m.grids,
                 token_positions: &[],
             });
             seated_lanes.push(seated);
@@ -395,21 +395,12 @@ impl Shell {
         for (j, route) in routes.iter_mut().take(live).enumerate() {
             *route = (j % rows.max(1) as usize) as i32;
         }
-        let taps = seat.embed_taps as usize;
-        let weight_taps = if seat.embed_weights { taps } else { 0 };
-        let mut embed_weights = vec![0f32; n * weight_taps];
-        for row in embed_weights.chunks_mut(weight_taps.max(1)) {
-            if let Some(first) = row.first_mut() {
-                *first = 1.0;
-            }
-        }
         Some(OwnedMedia {
             rows: vec![patches],
             patches: vec![0u8; n * seat.row_bytes as usize],
             routes,
             positions: vec![0i32; n * 3],
-            embed_rows: vec![0i32; n * taps],
-            embed_weights,
+            grids: vec![1, 1, patches as i32],
         })
     }
 }

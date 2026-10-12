@@ -10,7 +10,7 @@
 <code>pie.client()</code> gets an in-page transport instead of a WebSocket.</p>
 <pre id="out"></pre>
 <script type="module">
-  import * as pie from "../../javascript/server-web/dist/pie.mjs";
+  import * as pie from "../../packages/javascript/server-web/dist/pie.mjs";
   import { SHORT, page, loadRuntime, installInferlet } from "./harness.mjs";
 
   const { log, params, modelUrl, finish, fail } = page();
@@ -20,7 +20,7 @@
   try {
     await loadRuntime(params);
     const summary = await pie.bootLazy(modelUrl, "");
-    log(`booted: ${summary.sku}`);
+    log(`booted: ${summary.deployment}`);
     const { program } = await installInferlet("text-completion");
     log(`installed ${program}`);
 

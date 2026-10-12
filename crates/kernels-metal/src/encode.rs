@@ -56,6 +56,32 @@ pub trait Encode {
     fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error>;
 
     fn absent(&self) -> Result<ArgValue, Error>;
+
+    /// Has the GPU raise the hand-off event to `stamp` once everything fired
+    /// so far has run, so another engine waiting on it may start. Only a live
+    /// encode can hand work off; a tape or an indirect command buffer cannot.
+    fn signal(&self, stamp: u64) -> Result<(), Error> {
+        let _ = stamp;
+        Err(Error::Unsupported {
+            op: "handoff.signal",
+        })
+    }
+
+    /// Has the GPU hold everything fired after this until the hand-off event
+    /// reaches `stamp`.
+    fn wait(&self, stamp: u64) -> Result<(), Error> {
+        let _ = stamp;
+        Err(Error::Unsupported { op: "handoff.wait" })
+    }
+
+    /// Runs `then` once the frame this encodes into is committed; a frame
+    /// dropped uncommitted never runs it.
+    fn on_commit(&self, then: Box<dyn FnOnce() + Send>) -> Result<(), Error> {
+        drop(then);
+        Err(Error::Unsupported {
+            op: "handoff.on_commit",
+        })
+    }
 }
 
 pub type Ctx<'a> = dyn Encode + 'a;

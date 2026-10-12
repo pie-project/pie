@@ -98,6 +98,8 @@ fn tuning(doc: &toml::Table) {
         qmv_rows_max: int("qmv_rows_max"),
         qmv_rows_packs: int("qmv_rows_packs"),
         stream_rows_per_cut: int("stream_rows_per_cut"),
+        ane_percent: int("ane_percent"),
+        ane_projections: flag("ane_projections"),
     });
 }
 

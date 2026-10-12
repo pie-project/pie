@@ -68,7 +68,6 @@ fn load(root: &Root, instantiation: &str, key: &str, arch: &str) -> Result<Resol
                 headers: root.header_set(),
                 floor: root.floor,
                 wanted: std::slice::from_ref(&instantiation.to_owned()),
-                device_link: root.needs_device_runtime(),
             })?;
             if !built.log.trim().is_empty() {
                 tracing::warn!(

@@ -12,8 +12,12 @@ pub mod harmony;
 pub mod inkling;
 pub mod kimi;
 pub mod kimi3;
+pub mod lines;
+pub mod raw;
+pub mod spec;
 
 pub use decode::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder, ThinkingDecoder};
+pub use spec::{FORMATS, Spec, build};
 
 pub struct ToolGrammar {
     pub source: String,
@@ -30,10 +34,10 @@ pub fn special(tokenizer: &Tokenizer, marker: &str) -> u32 {
 }
 
 #[must_use]
-pub fn specials(tokenizer: &Tokenizer, markers: &[&str]) -> Vec<u32> {
+pub fn specials<S: AsRef<str>>(tokenizer: &Tokenizer, markers: &[S]) -> Vec<u32> {
     markers
         .iter()
-        .map(|marker| special(tokenizer, marker))
+        .map(|marker| special(tokenizer, marker.as_ref()))
         .collect()
 }
 
@@ -101,6 +105,12 @@ pub trait Instruct: Send + Sync {
     fn assistant(&self, msg: &str) -> Vec<u32>;
 
     fn cue(&self) -> Vec<u32>;
+
+    /// [`Instruct::cue`] for a turn the model answers without thinking, as
+    /// the reference template renders `enable_thinking: false`.
+    fn cue_without_thinking(&self) -> Vec<u32> {
+        self.cue()
+    }
 
     fn seal(&self) -> Vec<u32>;
 

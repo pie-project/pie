@@ -24,7 +24,7 @@ makes the next meaningless:
      claim 3 is satisfiable by a model that can answer from the question alone,
      and the whole file would be measuring nothing.
 
-Run from the repo root with PYTHONPATH=python/server/python.
+Run from the repo root with PYTHONPATH=packages/python/server/python.
 """
 
 import json

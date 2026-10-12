@@ -270,14 +270,6 @@ impl FrameShell for Shell {
         }
 
         let row_bytes = self.patch_seat.map_or(0, |seat| seat.row_bytes);
-        let embed_taps = self.patch_seat.map_or(0, |seat| seat.embed_taps);
-        let embed_weight_taps = self.patch_seat.map_or(0, |seat| {
-            if seat.embed_weights {
-                seat.embed_taps
-            } else {
-                0
-            }
-        });
         let mut media_of: Vec<Option<&Media<'_>>> = vec![None; lanes.len()];
         for shot in media {
             let at = shot.lane as usize;
@@ -325,26 +317,13 @@ impl FrameShell for Shell {
                     have: shot.token_positions.len() as u64,
                 });
             }
-            for (what, have, owed) in [
-                (
-                    "the position table's gather rows",
-                    shot.embed_rows.len() as u64,
-                    patch_rows * embed_taps,
-                ),
-                (
-                    "the position table's interpolation weights",
-                    shot.embed_weights.len() as u64,
-                    patch_rows * embed_weight_taps,
-                ),
-            ] {
-                let _ = what;
-                if have != owed {
-                    return Err(Fault::PatchPayload {
-                        lane: shot.lane,
-                        need: owed,
-                        have,
-                    });
-                }
+            let grids_owed = shot.rows.len() as u64 * MROPE_COORDS as u64;
+            if shot.grids.len() as u64 != grids_owed {
+                return Err(Fault::PatchPayload {
+                    lane: shot.lane,
+                    need: grids_owed,
+                    have: shot.grids.len() as u64,
+                });
             }
             let rows = lane_rows[at];
             let drop = self.drops_patch_rows;
@@ -665,82 +644,57 @@ impl FrameShell for Shell {
             )?
         };
 
-        let (
-            patch_payload,
-            patch_segments,
-            patch_routes,
-            patch_positions,
-            patch_embed_rows,
-            patch_embed_weights,
-        ) = if composition.patch_rows() == 0 {
-            (
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            )
-        } else {
-            let stride = row_bytes as usize;
-            let mut payload = vec![0u8; composition.patch_rows() as usize * stride];
-            let mut routes = vec![
-                if self.drops_patch_rows {
-                    PATCH_ROUTE_DROP
-                } else {
-                    0
-                };
-                composition.patch_rows() as usize
-            ];
-            let mut positions = vec![0i32; composition.patch_rows() as usize * MROPE_COORDS];
-            let fold = (self.patch_fold as usize).max(1);
-            let taps = embed_taps as usize;
-            let weight_taps = embed_weight_taps as usize;
-            let mut embed_rows = vec![0i32; composition.patch_rows() as usize * taps];
-            let mut embed_weights = vec![0f32; composition.patch_rows() as usize * weight_taps];
-            let mut per_image = vec![0u32; composition.images() as usize];
-            for row in composition.lanes() {
-                let Some(shot) = media_of[row.source as usize] else {
-                    continue;
-                };
-                let at = row.patch_offset as usize * stride;
-                payload[at..at + shot.patches.len()].copy_from_slice(shot.patches);
-                let landed = (row.patch_offset as usize) / fold;
-                let live = shot.rows.iter().map(|rows| *rows as usize).sum::<usize>() / fold;
-                for (j, &route) in shot.routes.iter().take(live).enumerate() {
-                    routes[landed + j] = if route < 0 {
-                        route
+        let (patch_payload, patch_segments, patch_routes, patch_positions, patch_grids) =
+            if composition.patch_rows() == 0 {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            } else {
+                let stride = row_bytes as usize;
+                let mut payload = vec![0u8; composition.patch_rows() as usize * stride];
+                let mut routes = vec![
+                    if self.drops_patch_rows {
+                        PATCH_ROUTE_DROP
                     } else {
-                        route + row.row_offset as i32
+                        0
                     };
+                    composition.patch_rows() as usize
+                ];
+                let mut positions = vec![0i32; composition.patch_rows() as usize * MROPE_COORDS];
+                let fold = (self.patch_fold as usize).max(1);
+                let mut grids = vec![0i32; composition.images() as usize * MROPE_COORDS];
+                let mut per_image = vec![0u32; composition.images() as usize];
+                for row in composition.lanes() {
+                    let Some(shot) = media_of[row.source as usize] else {
+                        continue;
+                    };
+                    let at = row.patch_offset as usize * stride;
+                    payload[at..at + shot.patches.len()].copy_from_slice(shot.patches);
+                    let landed = (row.patch_offset as usize) / fold;
+                    let live = shot.rows.iter().map(|rows| *rows as usize).sum::<usize>() / fold;
+                    for (j, &route) in shot.routes.iter().take(live).enumerate() {
+                        routes[landed + j] = if route < 0 {
+                            route
+                        } else {
+                            route + row.row_offset as i32
+                        };
+                    }
+                    let triples = row.patch_offset as usize * MROPE_COORDS;
+                    positions[triples..triples + shot.positions.len()]
+                        .copy_from_slice(shot.positions);
+                    let at_grids = row.image_offset as usize * MROPE_COORDS;
+                    grids[at_grids..at_grids + shot.grids.len()].copy_from_slice(shot.grids);
+                    for (i, &rows) in shot.rows.iter().enumerate() {
+                        per_image[row.image_offset as usize + i] = rows;
+                    }
                 }
-                let triples = row.patch_offset as usize * MROPE_COORDS;
-                positions[triples..triples + shot.positions.len()].copy_from_slice(shot.positions);
-                let at_ids = row.patch_offset as usize * taps;
-                embed_rows[at_ids..at_ids + shot.embed_rows.len()].copy_from_slice(shot.embed_rows);
-                let at_w = row.patch_offset as usize * weight_taps;
-                embed_weights[at_w..at_w + shot.embed_weights.len()]
-                    .copy_from_slice(shot.embed_weights);
-                for (i, &rows) in shot.rows.iter().enumerate() {
-                    per_image[row.image_offset as usize + i] = rows;
-                }
-            }
-            let mut segments = Vec::with_capacity(per_image.len() + 1);
-            let mut at = 0i32;
-            segments.push(at);
-            for rows in per_image {
-                at += rows as i32;
+                let mut segments = Vec::with_capacity(per_image.len() + 1);
+                let mut at = 0i32;
                 segments.push(at);
-            }
-            (
-                payload,
-                segments,
-                routes,
-                positions,
-                embed_rows,
-                embed_weights,
-            )
-        };
+                for rows in per_image {
+                    at += rows as i32;
+                    segments.push(at);
+                }
+                (payload, segments, routes, positions, grids)
+            };
         let rows = composition.rows();
 
         let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
@@ -1396,7 +1350,21 @@ impl FrameShell for Shell {
             && !self.cache.body_refused(&key)
             && self.cuttable(&key, admits.as_ref());
         super::btrace::mark("cuttable");
-        let readout_ceiling = ladder.lane_reach(lane_ceiling).min(self.budget.max_lanes);
+        // A logits class reads its lanes' last rows; a velocity or hidden
+        // class reads every row of its rung, as the eager ceiling above lets it.
+        let (last_rows, every_row) =
+            ladder
+                .rungs()
+                .iter()
+                .fold((0, 0), |(last, every), &(class, rung)| {
+                    match self.exports.readout_for(class as usize) {
+                        Some(seam) if seam.seam != engine::fire::ReadoutSeam::Logits => {
+                            (last, every + rung)
+                        }
+                        _ => (last + rung.min(lane_ceiling), every),
+                    }
+                });
+        let readout_ceiling = last_rows.min(self.budget.max_lanes) + every_row;
         let bodied = bodied && readout_rows.len() <= readout_ceiling as usize;
         if bodied {
             readout_rows.resize(readout_ceiling as usize, 0);
@@ -1529,8 +1497,7 @@ impl FrameShell for Shell {
             patch_segments,
             patch_routes,
             patch_positions,
-            patch_embed_rows,
-            patch_embed_weights,
+            patch_grids,
             mrope_positions,
             self_cond_rows,
             self_cond_weights,
@@ -1667,52 +1634,6 @@ fn readout_extent(rows: u32, bucket: u32, readouts: usize) -> u64 {
     u64::from(pad.extent(u32::try_from(readouts).unwrap_or(u32::MAX)))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{FoldLen, readout_extent, resolve_fold_len};
-
-    const PORT: eta_ir::registry::Port = eta_ir::registry::Port::RsFoldLen;
-
-    #[test]
-    fn prepare_every_case() {
-        a_device_fold_length_is_clamped_to_the_bound_it_was_promised();
-        a_fold_length_that_resolves_to_zero_is_refused_by_name();
-        a_readout_as_tall_as_the_fire_holds_the_bucket();
-    }
-
-    fn a_readout_as_tall_as_the_fire_holds_the_bucket() {
-        assert_eq!(readout_extent(133, 256, 133), 256);
-        assert_eq!(readout_extent(133, 256, 5), 5);
-        assert_eq!(readout_extent(133, 133, 133), 133);
-    }
-
-    fn a_device_fold_length_is_clamped_to_the_bound_it_was_promised() {
-        let cells = [3u32, 9, 5];
-        let port = Some(&cells[..]);
-        assert_eq!(
-            resolve_fold_len(FoldLen::Device(PORT), 8, 0, port).unwrap(),
-            3
-        );
-        assert_eq!(
-            resolve_fold_len(FoldLen::Device(PORT), 8, 1, port).unwrap(),
-            8
-        );
-        assert_eq!(resolve_fold_len(FoldLen::Host(9), 8, 0, port).unwrap(), 8);
-        assert_eq!(resolve_fold_len(FoldLen::Host(4), 8, 0, None).unwrap(), 4);
-    }
-
-    fn a_fold_length_that_resolves_to_zero_is_refused_by_name() {
-        let cells = [0u32];
-        for len in [FoldLen::Device(PORT), FoldLen::Host(0)] {
-            let error = resolve_fold_len(len, 8, 0, Some(&cells[..])).unwrap_err();
-            let said = error.to_string();
-            assert!(said.contains("bonus token"), "{said}");
-        }
-        let error = resolve_fold_len(FoldLen::Host(4), 0, 0, None).unwrap_err();
-        assert!(error.to_string().contains("bonus token"), "{error}");
-    }
-}
-
 impl Shell {
     /// The attention class table this fire stages: the one every stating
     /// lane agrees on, checked against each lane's rows, or none.
@@ -1793,5 +1714,51 @@ impl Shell {
             }
         }
         Ok(table)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FoldLen, readout_extent, resolve_fold_len};
+
+    const PORT: eta_ir::registry::Port = eta_ir::registry::Port::RsFoldLen;
+
+    #[test]
+    fn prepare_every_case() {
+        a_device_fold_length_is_clamped_to_the_bound_it_was_promised();
+        a_fold_length_that_resolves_to_zero_is_refused_by_name();
+        a_readout_as_tall_as_the_fire_holds_the_bucket();
+    }
+
+    fn a_readout_as_tall_as_the_fire_holds_the_bucket() {
+        assert_eq!(readout_extent(133, 256, 133), 256);
+        assert_eq!(readout_extent(133, 256, 5), 5);
+        assert_eq!(readout_extent(133, 133, 133), 133);
+    }
+
+    fn a_device_fold_length_is_clamped_to_the_bound_it_was_promised() {
+        let cells = [3u32, 9, 5];
+        let port = Some(&cells[..]);
+        assert_eq!(
+            resolve_fold_len(FoldLen::Device(PORT), 8, 0, port).unwrap(),
+            3
+        );
+        assert_eq!(
+            resolve_fold_len(FoldLen::Device(PORT), 8, 1, port).unwrap(),
+            8
+        );
+        assert_eq!(resolve_fold_len(FoldLen::Host(9), 8, 0, port).unwrap(), 8);
+        assert_eq!(resolve_fold_len(FoldLen::Host(4), 8, 0, None).unwrap(), 4);
+    }
+
+    fn a_fold_length_that_resolves_to_zero_is_refused_by_name() {
+        let cells = [0u32];
+        for len in [FoldLen::Device(PORT), FoldLen::Host(0)] {
+            let error = resolve_fold_len(len, 8, 0, Some(&cells[..])).unwrap_err();
+            let said = error.to_string();
+            assert!(said.contains("bonus token"), "{said}");
+        }
+        let error = resolve_fold_len(FoldLen::Host(4), 0, 0, None).unwrap_err();
+        assert!(error.to_string().contains("bonus token"), "{error}");
     }
 }

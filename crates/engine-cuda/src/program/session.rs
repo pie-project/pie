@@ -144,7 +144,6 @@ impl Session {
         self.shapes.get(channel as usize).copied()
     }
 
-    #[must_use]
     pub fn cell(&self, channel: usize, sequence: u64) -> Result<(u64, u64)> {
         let address = self.rings.cell_address(channel, sequence)?;
         let bytes = self.rings.shape_of(channel)?.cell_bytes() as u64;

@@ -1,4 +1,4 @@
-use models::media::EncodedSpan;
+use media::front::EncodedSpan;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -177,8 +177,12 @@ pub fn lane_media(matched: &[MatchedRun], lane_rows: &[u32], lane_base: &[u32]) 
         let span = &run.span;
         m.rows.push(span.rows);
         m.patches.extend_from_slice(&span.payload);
-        m.embed_rows.extend_from_slice(&span.embed_rows);
-        m.embed_weights.extend_from_slice(&span.embed_weights);
+        let g = span.patch_grid;
+        m.grids.extend(
+            [g.t, g.h, g.w]
+                .into_iter()
+                .map(|n| i32::try_from(n).unwrap_or(i32::MAX)),
+        );
         for k in 0..run.rows {
             m.routes.push((run.anchor + k) as i32);
         }
@@ -252,7 +256,7 @@ pub fn lane_media(matched: &[MatchedRun], lane_rows: &[u32], lane_base: &[u32]) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use models::media::Grid;
+    use media::front::Grid;
 
     const PAD: u32 = 151_655;
 
@@ -263,11 +267,9 @@ mod tests {
             grid: Grid::still(1, rows),
             patch_grid: Grid::still(1, rows),
             uses_mrope: false,
-            payload: vec![0.5; rows as usize],
+            payload: vec![128; rows as usize],
             rows,
             positions: Vec::new(),
-            embed_rows: Vec::new(),
-            embed_weights: Vec::new(),
             prefix: vec![1],
             placeholder: PAD,
             suffix: vec![2],

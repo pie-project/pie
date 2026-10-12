@@ -48,7 +48,7 @@ pub async fn run(cmd: InferletCmd) -> Result<Answer> {
 /// into the binary (which a disk install of the same name and version
 /// shadows).
 fn open() -> Repository {
-    let mut repo = Repository::new(bootstrap::paths::inferlets_dir());
+    let mut repo = Repository::new(crate::paths::inferlets_dir());
     repo.refresh();
     for builtin in builtins::all() {
         if let Ok(name) = ProgramName::parse(&format!("{}@{}", builtin.name, builtin.version)) {

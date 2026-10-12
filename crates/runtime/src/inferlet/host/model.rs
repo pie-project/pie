@@ -3,41 +3,41 @@ use crate::inferlet::host::pie;
 use crate::model;
 use anyhow::Result;
 
-pub fn lane_stream(stream: models::Stream) -> pie::inferlet::model::LaneStream {
+pub fn lane_stream(stream: poem::Stream) -> pie::inferlet::model::LaneStream {
     use pie::inferlet::model::LaneStream;
     match stream {
-        models::Stream::Text => LaneStream::Text,
-        models::Stream::Image => LaneStream::Image,
-        models::Stream::Video => LaneStream::Video,
-        models::Stream::Audio => LaneStream::Audio,
-        models::Stream::Context => LaneStream::Context,
-        models::Stream::Reference => LaneStream::Reference,
+        poem::Stream::Text => LaneStream::Text,
+        poem::Stream::Image => LaneStream::Image,
+        poem::Stream::Video => LaneStream::Video,
+        poem::Stream::Audio => LaneStream::Audio,
+        poem::Stream::Context => LaneStream::Context,
+        poem::Stream::Reference => LaneStream::Reference,
     }
 }
 
-pub fn catalog_stream(stream: pie::inferlet::model::LaneStream) -> models::Stream {
+pub fn catalog_stream(stream: pie::inferlet::model::LaneStream) -> poem::Stream {
     use pie::inferlet::model::LaneStream;
     match stream {
-        LaneStream::Text => models::Stream::Text,
-        LaneStream::Image => models::Stream::Image,
-        LaneStream::Video => models::Stream::Video,
-        LaneStream::Audio => models::Stream::Audio,
-        LaneStream::Context => models::Stream::Context,
-        LaneStream::Reference => models::Stream::Reference,
+        LaneStream::Text => poem::Stream::Text,
+        LaneStream::Image => poem::Stream::Image,
+        LaneStream::Video => poem::Stream::Video,
+        LaneStream::Audio => poem::Stream::Audio,
+        LaneStream::Context => poem::Stream::Context,
+        LaneStream::Reference => poem::Stream::Reference,
     }
 }
 
-fn axis_role(role: models::AxisRole) -> pie::inferlet::model::AxisRole {
+fn axis_role(role: poem::generative::AxisRole) -> pie::inferlet::model::AxisRole {
     use pie::inferlet::model::AxisRole;
     match role {
-        models::AxisRole::Time => AxisRole::Time,
-        models::AxisRole::Height => AxisRole::Height,
-        models::AxisRole::Width => AxisRole::Width,
-        models::AxisRole::Index => AxisRole::Index,
+        poem::generative::AxisRole::Time => AxisRole::Time,
+        poem::generative::AxisRole::Height => AxisRole::Height,
+        poem::generative::AxisRole::Width => AxisRole::Width,
+        poem::generative::AxisRole::Index => AxisRole::Index,
     }
 }
 
-fn reading_fact(reading: &models::ReadingFact) -> pie::inferlet::model::ReadingFact {
+fn reading_fact(reading: &poem::generative::ReadingFact) -> pie::inferlet::model::ReadingFact {
     use pie::inferlet::model::{PortKind, ReadoutKind};
     pie::inferlet::model::ReadingFact {
         name: reading.name.to_string(),
@@ -51,11 +51,11 @@ fn reading_fact(reading: &models::ReadingFact) -> pie::inferlet::model::ReadingF
             .map(|port| pie::inferlet::model::PortFact {
                 name: port.name.to_string(),
                 kind: match port.kind {
-                    models::PortKind::Latents => PortKind::Latents,
-                    models::PortKind::LaneVector => PortKind::LaneVector,
-                    models::PortKind::Context => PortKind::Context,
-                    models::PortKind::AxisPositions => PortKind::AxisPositions,
-                    models::PortKind::Voxels => PortKind::Voxels,
+                    poem::generative::PortKind::Latents => PortKind::Latents,
+                    poem::generative::PortKind::LaneVector => PortKind::LaneVector,
+                    poem::generative::PortKind::Context => PortKind::Context,
+                    poem::generative::PortKind::AxisPositions => PortKind::AxisPositions,
+                    poem::generative::PortKind::Voxels => PortKind::Voxels,
                 },
                 width: port.width,
                 dtype: pie::inferlet::types::Dtype::F32,
@@ -73,10 +73,10 @@ fn reading_fact(reading: &models::ReadingFact) -> pie::inferlet::model::ReadingF
             }
         }),
         readout: match reading.readout {
-            models::ReadoutKind::Logits => ReadoutKind::Logits,
-            models::ReadoutKind::Velocity => ReadoutKind::Velocity,
-            models::ReadoutKind::Hidden => ReadoutKind::Hidden,
-            models::ReadoutKind::Pixels => ReadoutKind::Pixels,
+            poem::generative::ReadoutKind::Logits => ReadoutKind::Logits,
+            poem::generative::ReadoutKind::Velocity => ReadoutKind::Velocity,
+            poem::generative::ReadoutKind::Hidden => ReadoutKind::Hidden,
+            poem::generative::ReadoutKind::Pixels => ReadoutKind::Pixels,
         },
         readout_width: reading.readout_width,
     }
@@ -88,7 +88,7 @@ impl pie::inferlet::model::Host for ProcessCtx {
     }
 
     async fn architecture(&mut self) -> Result<String> {
-        Ok(model::model().arch_name().to_string())
+        Ok(model::model().arch().to_string())
     }
 
     async fn default_system_speculation(&mut self) -> Result<bool> {
@@ -156,9 +156,9 @@ impl pie::inferlet::model::Host for ProcessCtx {
             .and_then(|g| g.schedule.as_ref())
             .map(|s| pie::inferlet::model::ScheduleFact {
                 kind: match s.kind {
-                    models::ScheduleKind::Flow => ScheduleKind::Flow,
-                    models::ScheduleKind::Epsilon => ScheduleKind::Epsilon,
-                    models::ScheduleKind::V => ScheduleKind::V,
+                    poem::generative::ScheduleKind::Flow => ScheduleKind::Flow,
+                    poem::generative::ScheduleKind::Epsilon => ScheduleKind::Epsilon,
+                    poem::generative::ScheduleKind::V => ScheduleKind::V,
                 },
                 shift: s.shift,
                 train_steps: s.train_steps,
@@ -208,7 +208,7 @@ impl pie::inferlet::model::Host for ProcessCtx {
     }
 
     async fn prefill_chunk_hint(&mut self) -> Result<u32> {
-        let budget = crate::engine::get_spec(0)?.limits.max_forward_tokens;
+        let budget = prefill_budget(crate::engine::get_spec(0)?.limits);
         let live = crate::inferlet::process::live_count();
         let page = model::model().kv_page_size() as usize;
         Ok(prefill_share(budget, live, page))
@@ -234,6 +234,16 @@ impl pie::inferlet::model::Host for ProcessCtx {
 // A step spends one row on each other live lane's decode, so a prefill chunk
 // gets the rest of the forward budget; chunks that overflow a wave are
 // deferred by the frame seal, not split into more passes.
+/// The rows a prefill chunk may take: the fire's token budget, or fewer when
+/// the engine prefers it (Metal, while the Neural Engine shares a fire only
+/// up to its rows).
+fn prefill_budget(limits: crate::engine::SchedulerLimits) -> usize {
+    match limits.prefill_rows {
+        0 => limits.max_forward_tokens,
+        rows => rows.min(limits.max_forward_tokens),
+    }
+}
+
 fn prefill_share(budget: usize, live: usize, page: usize) -> u32 {
     let page = page.max(1);
     let share = budget.saturating_sub(live.saturating_sub(1)) / page * page;
@@ -242,6 +252,20 @@ fn prefill_share(budget: usize, live: usize, page: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_prefill_chunk_stops_at_the_rows_the_engine_prefers() {
+        let limits = |max_forward_tokens, prefill_rows| crate::engine::SchedulerLimits {
+            max_forward_requests: 8,
+            max_forward_tokens,
+            max_page_refs: 64,
+            max_context: 0,
+            prefill_rows,
+        };
+        assert_eq!(super::prefill_budget(limits(10240, 0)), 10240);
+        assert_eq!(super::prefill_budget(limits(10240, 2048)), 2048);
+        assert_eq!(super::prefill_budget(limits(1024, 2048)), 1024);
+    }
+
     #[test]
     fn a_prefill_chunk_keeps_the_budget_the_decoding_lanes_leave() {
         assert_eq!(super::prefill_share(8192, 256, 16), 7936);

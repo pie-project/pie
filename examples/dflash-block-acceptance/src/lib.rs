@@ -228,7 +228,7 @@ const MASK_TOKEN: i32 = 248_070;
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
     if model::mtp_depth() == 0 {
-        return Err("this SKU ships no draft head".into());
+        return Err("this deployment ships no draft head".into());
     }
     // The head's facts off the load (`model::draft_block`); the inputs
     // override for a diagnostic, the constants are the last resort.

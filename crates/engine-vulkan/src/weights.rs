@@ -611,7 +611,7 @@ pub(crate) fn readable_plane_orders(trace: &Trace) -> Result<()> {
                   this shell has no reader for: its qmm and qmv arms index an affine bank \
                   row-major and would answer nonsense off a relaid plane. The order is \
                   `kernels_cuda::linear::tiled`'s, and a model text reaches it only by asking \
-                  for it: `poem_dsl::place` resolves a placed dtype against the platform the \
+                  for it: `poem::place` resolves a placed dtype against the platform the \
                   declaration is read for, and this platform's answer is the canonical \
                   row-major sibling. So either this plane came out of an artifact converted \
                   FOR the cuda shell — convert it again on this box, or serve it there — or a \
@@ -620,7 +620,7 @@ pub(crate) fn readable_plane_orders(trace: &Trace) -> Result<()> {
     }
 }
 
-pub(crate) fn serves_this_deployment(path: &Path, backend: &str, sku: &str) -> Result<()> {
+pub(crate) fn serves_this_deployment(path: &Path, backend: &str, deployment: &str) -> Result<()> {
     if path.is_dir() {
         return Ok(());
     }
@@ -630,9 +630,9 @@ pub(crate) fn serves_this_deployment(path: &Path, backend: &str, sku: &str) -> R
 
         Err(why) => return Err(Fault::Recipe(format!("checkpoint: {why}"))),
     };
-    let deployment = Stamp::of(backend, sku);
+    let wanted = Stamp::of(backend, deployment);
     artifact
-        .check(&deployment)
+        .check(&wanted)
         .map_err(|mismatch| Fault::Recipe(mismatch.refuse(&path.display().to_string())))
 }
 

@@ -236,26 +236,13 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
 }
 
 fn patch_bytes(
-    patches: &[f32],
+    patches: &[u8],
     element: poem_ir::Dtype,
 ) -> std::result::Result<Vec<u8>, &'static str> {
     match element {
-        poem_ir::Dtype::Bf16 => Ok(patches
-            .iter()
-            .flat_map(|&v| bf16_bits(v).to_le_bytes())
-            .collect()),
-        poem_ir::Dtype::F32 => Ok(patches.iter().flat_map(|&v| v.to_le_bytes()).collect()),
-        _ => Err(
-            "a media submission against a plan whose activation element is neither \
-                  `bf16` nor `f32`, which is the pair every tower in this catalog computes in",
-        ),
+        poem_ir::Dtype::U8 => Ok(patches.to_vec()),
+        _ => Err("a media submission against a plan whose pixel rows are not u8 bytes"),
     }
-}
-
-fn bf16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let rounding = 0x7fff + ((bits >> 16) & 1);
-    ((bits + rounding) >> 16) as u16
 }
 
 fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
@@ -365,8 +352,7 @@ impl Engine for Vulkan {
             budgets,
             residency,
             ordinal,
-
-            frames_in_flight: _,
+            frames_in_flight,
         } = request;
 
         if ordinal > 0 {
@@ -398,7 +384,7 @@ impl Engine for Vulkan {
             slots: budgets.slots,
             pages: budgets.pages,
 
-            runahead: engine::runahead::Runahead::of(1),
+            runahead: engine::runahead::Runahead::of(frames_in_flight),
             residency,
             device: &self.boot,
         })
@@ -456,6 +442,7 @@ impl Engine for Vulkan {
                 max_tokens: budgets.max_tokens,
                 max_page_refs: paging.pages_per_slot.saturating_mul(budgets.max_lanes),
                 max_context: paging.context(),
+                prefill_rows: 0,
             },
             profile,
 
@@ -473,6 +460,7 @@ impl Engine for Vulkan {
             device_channel_commit: false,
             rs_verbs: shell.serves_rs_verbs(),
             bidirectional_attention: false,
+            facts: shell.trace().facts.clone(),
         };
 
         self.shell = Some(shell);
@@ -517,10 +505,35 @@ impl Engine for Vulkan {
                 frame: id,
                 step: index as u32,
             };
+            let defers = self.defers(step);
             let fired = self
-                .fire_step(step, at)
+                .fire_step(step, at, defers)
                 .and_then(|(ticket, mut step_pending)| {
-                    if !step.attachments.is_empty() {
+                    let landed = step_pending.landed;
+                    if defers && self.reads_on_device(step, &landed) {
+                        // The sampler lands on its own and reports the step;
+                        // the next frame's forward reads its token on the
+                        // device, so nothing here waits.
+                        self.defer_attachment(step, at, &landed)?;
+                        let shell = self.loaded_mut()?;
+                        shell.leave_unread(&landed);
+                        shell.forget_seat(&landed);
+                        step_pending.rows = Some(Vec::new());
+                        return Ok((ticket, step_pending));
+                    }
+                    if !step.attachments.is_empty()
+                        && self.reads_on_device(step, &step_pending.landed)
+                    {
+                        // Every attachment reads its logits on the device:
+                        // it queues behind the forward without waiting for
+                        // it, so the GPU runs on into the sampler and the
+                        // step waits once.
+                        let landed = step_pending.landed;
+                        self.run_attachments(step, &[], None, 0, &landed)?;
+                        let shell = self.loaded_mut()?;
+                        step_pending.rows = Some(shell.rows_of(&landed).map_err(fault)?);
+                        shell.forget_seat(&landed);
+                    } else if !step.attachments.is_empty() {
                         let shell = self.loaded_mut()?;
                         let rows = shell.rows_of(&step_pending.landed).map_err(fault)?;
 
@@ -536,6 +549,10 @@ impl Engine for Vulkan {
                             &landed,
                         )?;
                     }
+                    if defers && let Some(sink) = self.sink.as_ref() {
+                        // The forward's own report was held for the sampler.
+                        (sink)(at, engine::StepOutcome::Committed);
+                    }
                     Ok((ticket, step_pending))
                 });
             match fired {
@@ -548,6 +565,10 @@ impl Engine for Vulkan {
                     return Err(error);
                 }
             }
+        }
+        #[cfg(feature = "vulkan")]
+        if let Some(shell) = self.shell.as_ref() {
+            shell.device().pipeline_cache().settle();
         }
         let mut ticket = FrameTicket { id, steps };
         self.pending = Some((id, pending));
@@ -775,6 +796,21 @@ impl Engine for Vulkan {
 }
 
 impl Vulkan {
+    /// Whether every attachment of `step` can read its lane's logits on the
+    /// device before the step lands: no draft column to read on the host,
+    /// and a readout row for each lane.
+    fn reads_on_device(&self, step: &Step, landed: &crate::serve::Landed) -> bool {
+        let Some(shell) = self.shell.as_ref() else {
+            return false;
+        };
+        cfg!(feature = "vulkan")
+            && shell.mtp_width() == 0
+            && step
+                .attachments
+                .iter()
+                .all(|attachment| shell.readout_row(landed, attachment.lane).is_some())
+    }
+
     fn run_attachments(
         &mut self,
         step: &Step,
@@ -831,10 +867,65 @@ impl Vulkan {
         Ok(())
     }
 
+    /// Whether `step`'s one attachment can run behind its forward without
+    /// the host waiting for either.
+    fn defers(&self, step: &Step) -> bool {
+        #[cfg(feature = "vulkan")]
+        {
+            self.sink.is_some()
+                && self.settles_asynchronously()
+                && step.attachments.len() == 1
+                && self
+                    .shell
+                    .as_ref()
+                    .is_some_and(|shell| shell.mtp_width() == 0)
+                && self.programs.defers(step.attachments[0].instance)
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            let _ = step;
+            false
+        }
+    }
+
+    fn defer_attachment(
+        &mut self,
+        step: &Step,
+        at: engine::StepDone,
+        landed: &crate::serve::Landed,
+    ) -> EngineResult<()> {
+        #[cfg(feature = "vulkan")]
+        {
+            let Vulkan {
+                shell,
+                programs,
+                sink,
+                ..
+            } = self;
+            let shell = shell
+                .as_ref()
+                .ok_or_else(|| Error::Load("the vulkan engine has no model loaded".into()))?;
+            let attachment = &step.attachments[0];
+            let seat = shell
+                .readout_row(landed, attachment.lane)
+                .map(|(seat, at, width)| crate::guest::run::Readout { seat, at, width });
+            let done = sink.clone().map(|sink| Done { at, sink });
+            programs
+                .fire_deferred(attachment.instance, shell.device(), seat, done)
+                .map_err(refusal)
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            let _ = (step, at, landed);
+            Err(Error::unsupported("vulkan", "a deferred guest pass"))
+        }
+    }
+
     fn fire_step(
         &mut self,
         submission: &Step,
         at: engine::StepDone,
+        defers: bool,
     ) -> EngineResult<(FireTicket, PendingStep)> {
         let mut staged: Vec<Vec<u8>> = Vec::new();
         if !submission.media.is_empty() {
@@ -865,8 +956,7 @@ impl Vulkan {
                 patches,
                 routes: &row.routes,
                 positions: &row.positions,
-                embed_rows: &row.embed_rows,
-                embed_weights: &row.embed_weights,
+                grids: &row.grids,
                 token_positions: &row.token_positions,
             })
             .collect();
@@ -875,6 +965,8 @@ impl Vulkan {
         self.next_fire = self.next_fire.wrapping_add(1);
 
         let mut resolved: Vec<Option<Vec<u32>>> = vec![None; submission.lanes.len()];
+        #[cfg(feature = "vulkan")]
+        let mut feeds: Vec<Option<crate::device::Buffer>> = vec![None; submission.lanes.len()];
         for attachment in &submission.attachments {
             let Some(lane) = submission.lanes.get(attachment.lane as usize) else {
                 return Err(Error::Invalid(format!(
@@ -883,6 +975,14 @@ impl Vulkan {
                     submission.lanes.len()
                 )));
             };
+            #[cfg(feature = "vulkan")]
+            if let Some(cell) = self.programs.token_feed(attachment.instance) {
+                // A pass still on the queue wrote this lane's token; the
+                // forward copies it in behind that pass.
+                resolved[attachment.lane as usize] = Some(vec![0; lane.tokens.len()]);
+                feeds[attachment.lane as usize] = Some(cell);
+                continue;
+            }
             resolved[attachment.lane as usize] = self
                 .programs
                 .envelope_tokens(attachment.instance, lane.tokens.len())
@@ -975,13 +1075,18 @@ impl Vulkan {
                     rs: &verbs[at],
                     rs_reset: lane.rs_reset,
                     rs_slot: lane.rs_slot,
+
+                    #[cfg(feature = "vulkan")]
+                    feed: feeds[at].as_ref(),
+                    #[cfg(not(feature = "vulkan"))]
+                    feed: None,
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;
 
         let landed = {
             use engine::frame::Shell as FrameShell;
-            let done = sink.map(|sink| Done { at, sink });
+            let done = sink.filter(|_| !defers).map(|sink| Done { at, sink });
             let prepared = FrameShell::prepare(
                 shell,
                 StepView {

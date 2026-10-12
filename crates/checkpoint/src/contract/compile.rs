@@ -668,6 +668,11 @@ impl Builder<'_> {
                 }
             },
             Expr::Fill { ty, .. } => self.push(Kind::Fill, ty.shape.clone()),
+            Expr::Const { .. } => Err(Error::Internal(
+                "Const reached lowering; plan::compile mounts a constant and reads it \
+                 as a source tensor, so its bytes are never a node"
+                    .to_string(),
+            )),
             Expr::Repack { .. }
             | Expr::Cast { .. }
             | Expr::Scale { .. }

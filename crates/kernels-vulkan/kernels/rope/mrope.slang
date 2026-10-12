@@ -45,9 +45,9 @@ void main(uint3 gid : SV_DispatchThreadID) {
     if (r == 1 && i < 3 * pc.s1) axis_pos = pos_h;
     else if (r == 2 && i < 3 * pc.s2) axis_pos = pos_w;
     else axis_pos = pos_t;
-    inv_freq = exp2(-(2.0 * float(i) / float(pc.head_dim)) * pc.base_);
+    inv_freq = exp2(-(2.0 * float(i) / float(2 * pc.pairs)) * pc.base_);
     i1 = row + uint(i);
-    i2 = i1 + uint(half_hd);
+    i2 = i1 + uint(pc.pairs);
 #endif
     float theta = float(axis_pos) * inv_freq;
     float c = cos(theta);

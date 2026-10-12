@@ -3,8 +3,6 @@ pub mod conditional;
 pub mod ctx;
 pub mod elastic;
 pub mod graph;
-pub mod map;
-pub mod nodes;
 
 pub use alloc::{
     Buffer, Pinned, Pinning, copy_any, copy_d2d, copy_d2h, free_bytes, stage_raw, write_raw,

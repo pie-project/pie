@@ -115,7 +115,6 @@ pub struct Media<'a> {
     pub patches: &'a [u8],
     pub routes: &'a [i32],
     pub positions: &'a [i32],
-    pub embed_rows: &'a [i32],
-    pub embed_weights: &'a [f32],
+    pub grids: &'a [i32],
     pub token_positions: &'a [i32],
 }

@@ -100,6 +100,7 @@ METAL_FUNC void qmv_fast_impl(
     const device T* x,
     device T* y,
     const constant int& in_vec_size,
+    const constant int& ld,
     const constant int& out_vec_size,
     uint3 tid,
     uint simd_gid,
@@ -120,8 +121,8 @@ METAL_FUNC void qmv_fast_impl(
   thread U x_thread[values_per_thread];
   thread U result[results_per_simdgroup] = {0};
 
-  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
-  const int in_vec_size_g = in_vec_size / group_size;
+  const int in_vec_size_w = ld * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = ld / group_size;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
@@ -167,11 +168,12 @@ template <typename T, int group_size, int bits>
     device T* y                [[buffer(4)]],
     const constant int& in_vec_size  [[buffer(5)]],
     const constant int& out_vec_size [[buffer(6)]],
+    const constant int& ld     [[buffer(12)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
     uint simd_lid   [[thread_index_in_simdgroup]]) {
   qmv_fast_impl<T, group_size, bits>(
-      w, scales, biases, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+      w, scales, biases, x, y, in_vec_size, ld, out_vec_size, tid, simd_gid, simd_lid);
 }
 
 template <typename T, int group_size, int bits>
@@ -183,6 +185,7 @@ METAL_FUNC void qmv_fast_residual_impl(
     device T* y,
     const device T* residual,
     const constant int& in_vec_size,
+    const constant int& ld,
     const constant int& out_vec_size,
     uint3 tid,
     uint simd_gid,
@@ -202,8 +205,8 @@ METAL_FUNC void qmv_fast_residual_impl(
   thread U x_thread[values_per_thread];
   thread U result[results_per_simdgroup] = {0};
 
-  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
-  const int in_vec_size_g = in_vec_size / group_size;
+  const int in_vec_size_w = ld * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = ld / group_size;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
@@ -250,12 +253,13 @@ template <typename T, int group_size, int bits>
     device T* y                [[buffer(4)]],
     const constant int& in_vec_size  [[buffer(5)]],
     const constant int& out_vec_size [[buffer(6)]],
+    const constant int& ld     [[buffer(12)]],
     const device T* residual   [[buffer(7)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
     uint simd_lid   [[thread_index_in_simdgroup]]) {
   qmv_fast_residual_impl<T, group_size, bits>(
-      w, scales, biases, x, y, residual, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+      w, scales, biases, x, y, residual, in_vec_size, ld, out_vec_size, tid, simd_gid, simd_lid);
 }
 
 #define instantiate_qmv_fast(name, itype, gs, b)                         \
@@ -263,7 +267,7 @@ template <typename T, int group_size, int bits>
   [[kernel]] void affine_qmv_fast<itype, gs, b>(                         \
       const device uint32_t*, const device itype*, const device itype*,  \
       const device itype*, device itype*, const constant int&,           \
-      const constant int&, uint3, uint, uint);
+      const constant int&, const constant int&, uint3, uint, uint);
 
 instantiate_qmv_fast(bfloat16, bfloat, 64, 4)
 instantiate_qmv_fast(bfloat16, bfloat, 32, 4)
@@ -281,7 +285,7 @@ instantiate_qmv_fast(bfloat16, bfloat, 128, 2)
   [[kernel]] void affine_qmv_fast_residual<itype, gs, b>(                       \
       const device uint32_t*, const device itype*, const device itype*,         \
       const device itype*, device itype*, const constant int&,                  \
-      const constant int&, const device itype*, uint3, uint, uint);
+      const constant int&, const constant int&, const device itype*, uint3, uint, uint);
 
 instantiate_qmv_fast_residual(bfloat16, bfloat, 64, 4)
 instantiate_qmv_fast_residual(bfloat16, bfloat, 32, 4)

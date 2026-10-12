@@ -57,7 +57,8 @@
               ]
             }
           },
-          "axis": 1
+          "axis": 1,
+          "replicas": 1
         }
       },
       "shape": [

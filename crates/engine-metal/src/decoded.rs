@@ -29,14 +29,13 @@ pub(crate) fn lane_axis_weights(trace: &Trace) -> BTreeSet<usize> {
     };
     let mut rows = BTreeSet::new();
     for node in &trace.nodes {
-        let Operation::Linear(poem_ir::Linear::Matmul { act, w, .. }) = &node.op else {
-            continue;
-        };
-        if !f32_rows(*act) {
-            continue;
-        }
-        if let Some(Def::Weight(index)) = trace.values.get(w.0 as usize).map(|v| &v.def) {
-            rows.insert(*index as usize);
+        for (act, w, _) in crate::legs::matmuls(&node.op) {
+            if !f32_rows(act) {
+                continue;
+            }
+            if let Some(Def::Weight(index)) = trace.values.get(w.0 as usize).map(|v| &v.def) {
+                rows.insert(*index as usize);
+            }
         }
     }
     rows

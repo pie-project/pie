@@ -65,6 +65,11 @@ pub struct Boot<'a> {
 
 const PATCH_ROUTE_DROP: i32 = -1;
 
+/// A step of at least this many rows is submitted a layer at a time: in one
+/// submit, a long prefill on a slow GPU outlasts the driver's watchdog (about
+/// 2 s on Adreno, which a 64-row prefill reaches) and loses the device.
+const SPLIT_ROWS: u32 = 32;
+
 fn declared_width(trace: &Trace, want: RuntimeInput) -> u64 {
     trace
         .values
@@ -140,9 +145,7 @@ pub struct Media<'a> {
 
     pub positions: &'a [i32],
 
-    pub embed_rows: &'a [i32],
-
-    pub embed_weights: &'a [f32],
+    pub grids: &'a [i32],
 
     pub token_positions: &'a [i32],
 }
@@ -181,6 +184,10 @@ pub struct Seated<'a> {
     pub captures_scores: bool,
 
     pub translation: &'a [u32],
+
+    /// A device cell holding the lane's one token, written by a pass still
+    /// on the queue; the fire copies it in behind that pass.
+    pub feed: Option<&'a Buffer>,
 }
 
 impl<'a> Seated<'a> {
@@ -200,6 +207,7 @@ impl<'a> Seated<'a> {
             rs: &FOLD,
             rs_reset: engine::fire::RsReset::Inferred,
             rs_slot: None,
+            feed: None,
         }
     }
 
@@ -342,6 +350,10 @@ pub struct Shell {
 
 impl Shell {
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
+        let boot = Boot {
+            trace: poem_compiler::fuse::fuse(boot.trace, &crate::FUSED),
+            ..boot
+        };
         let device = Context::bind(boot.device)?;
 
         let profile = boot.profile.unwrap_or(DeviceProfile {
@@ -490,8 +502,6 @@ impl Shell {
                     row_bytes: width * element,
                     images: u64::from(ladder.max_images),
                     dtype: *dtype,
-                    embed_taps: declared_width(&boot.trace, RuntimeInput::PatchEmbedRows),
-                    embed_weights: declared_width(&boot.trace, RuntimeInput::PatchEmbedWeights) > 0,
                 })
             })
         });
@@ -1217,17 +1227,23 @@ impl Shell {
 
     #[must_use]
     pub fn readout_row(&self, landed: &Landed, lane: u32) -> Option<(&Buffer, u64, u32)> {
-        let seat = self.landed_seats.get(&landed.seq)?;
-        if seat.generation != self.generation {
-            return None;
-        }
-        let &(start, count) = seat.rows.get(lane as usize)?;
+        let (arm, rows) = match self.landed_seats.get(&landed.seq) {
+            Some(seat) if seat.generation == self.generation => (seat.arm, &seat.rows),
+            Some(_) => return None,
+            // Still in flight: its arm stays taken until the harvest, and a
+            // reader submitted behind it on the queue sees its readout.
+            None => {
+                let flight = self.inflight.iter().find(|f| f.seq == landed.seq)?;
+                (flight.arm, &flight.rows)
+            }
+        };
+        let &(start, count) = rows.get(lane as usize)?;
         if count == 0 {
             return None;
         }
         let width = u64::from(self.out_width);
         Some((
-            self.readout.get(seat.arm)?,
+            self.readout.get(arm)?,
             u64::from(start) * width * 2,
             count * self.out_width,
         ))
@@ -1235,6 +1251,25 @@ impl Shell {
 
     pub fn forget_seat(&mut self, landed: &Landed) {
         self.landed_seats.remove(&landed.seq);
+    }
+
+    /// Lets the host leave a step's rows unread: the device read them.
+    pub fn leave_unread(&mut self, landed: &Landed) {
+        if let Some(flight) = self.inflight.iter_mut().find(|f| f.seq == landed.seq) {
+            flight.read = false;
+        }
+    }
+
+    fn feed(&self, p: &Prepared<'_>) -> Result<Option<Pending>> {
+        if p.feeds.is_empty() {
+            return Ok(None);
+        }
+        let (store, tokens) = self.inputs[p.arm].token_seat();
+        let mut frame = self.device.frame()?;
+        for &(row, cell) in &p.feeds {
+            frame.copy(cell, 0, store, tokens + u64::from(row) * 4, 4)?;
+        }
+        frame.commit_async(None).map(Some)
     }
 
     #[must_use]
@@ -1286,6 +1321,10 @@ impl Shell {
                 },
                 other => other,
             });
+        }
+        if !flight.read {
+            self.arms.give(flight.arm);
+            return Ok(());
         }
         let width = self.out_width as usize;
         let total: usize = flight.rows.iter().map(|&(_, n)| n as usize).sum();
@@ -1414,18 +1453,9 @@ impl Shell {
                     patch_rows * 3,
                 ),
                 (
-                    "position-table taps",
-                    shot.embed_rows.len() as u64,
-                    patch_rows * seat.embed_taps,
-                ),
-                (
-                    "interpolation weights",
-                    shot.embed_weights.len() as u64,
-                    if seat.embed_weights {
-                        patch_rows * seat.embed_taps
-                    } else {
-                        0
-                    },
+                    "image grids",
+                    shot.grids.len() as u64,
+                    shot.rows.len() as u64 * 3,
                 ),
             ] {
                 if have != want {
@@ -1509,10 +1539,23 @@ impl Shell {
         let mut beginning: Vec<u32> = Vec::new();
 
         let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
+        let mut feeds: Vec<(u32, &'a Buffer)> = Vec::new();
         for row in composition.lanes() {
             let source = row.source as usize;
             let seated = &lanes[source];
             let lane = &seated.lane;
+            if let Some(cell) = seated.feed {
+                if row.rows != 1 {
+                    return Err(program(
+                        "serve::stage",
+                        format!(
+                            "lane {source} is fed one token on the device and carries {} rows",
+                            row.rows
+                        ),
+                    ));
+                }
+                feeds.push((row.row_offset, cell));
+            }
 
             let have = match seated.held {
                 Some(held) => held,
@@ -1764,20 +1807,16 @@ impl Shell {
         let mut patch_segments: Vec<i32> = Vec::new();
         let mut patch_routes: Vec<i32> = Vec::new();
         let mut patch_positions: Vec<i32> = Vec::new();
-        let mut patch_embed_rows: Vec<i32> = Vec::new();
-        let mut patch_embed_weights: Vec<f32> = Vec::new();
+        let mut patch_grids: Vec<i32> = Vec::new();
         if patch_rows > 0 {
             let seat = self.patch_seat.expect(
                 "a composition with patch rows came out of budgets with a patch ladder, and \
                  the seat is derived from the same trace the ladder admitted",
             );
             let stride = seat.row_bytes as usize;
-            let taps = seat.embed_taps as usize;
-            let weight_taps = if seat.embed_weights { taps } else { 0 };
             patch_payload = vec![0u8; patch_rows * stride];
             patch_positions = vec![0i32; patch_rows * 3];
-            patch_embed_rows = vec![0i32; patch_rows * taps];
-            patch_embed_weights = vec![0.0f32; patch_rows * weight_taps];
+            patch_grids = vec![0i32; composition.images() as usize * 3];
 
             patch_routes = vec![
                 if self.drops_patch_rows {
@@ -1806,16 +1845,8 @@ impl Shell {
                 let triples = row.patch_offset as usize * 3;
                 patch_positions[triples..triples + shot.positions.len()]
                     .copy_from_slice(shot.positions);
-                if taps > 0 {
-                    let at_ids = row.patch_offset as usize * taps;
-                    patch_embed_rows[at_ids..at_ids + shot.embed_rows.len()]
-                        .copy_from_slice(shot.embed_rows);
-                }
-                if weight_taps > 0 {
-                    let at_w = row.patch_offset as usize * weight_taps;
-                    patch_embed_weights[at_w..at_w + shot.embed_weights.len()]
-                        .copy_from_slice(shot.embed_weights);
-                }
+                let at_grids = row.image_offset as usize * 3;
+                patch_grids[at_grids..at_grids + shot.grids.len()].copy_from_slice(shot.grids);
                 for (i, &rows) in shot.rows.iter().enumerate() {
                     per_image[row.image_offset as usize + i] = rows;
                 }
@@ -1894,8 +1925,7 @@ impl Shell {
                     segments: &patch_segments,
                     routes: &patch_routes,
                     positions: &patch_positions,
-                    embed_rows: &patch_embed_rows,
-                    embed_weights: &patch_embed_weights,
+                    grids: &patch_grids,
                 }),
                 mrope_positions: self.states_mrope.then_some(mrope_positions.as_slice()),
             },
@@ -1958,8 +1988,7 @@ impl Shell {
             patch_routes: patch_seats.map(|seats| seats.routes),
             patch_positions: patch_seats.map(|seats| seats.positions),
 
-            patch_embed_rows: patch_seats.and_then(|seats| seats.embed_rows),
-            patch_embed_weights: patch_seats.and_then(|seats| seats.embed_weights),
+            patch_grids: patch_seats.map(|seats| seats.grids),
 
             mrope_positions: bound.mrope_positions,
             geometry,
@@ -2009,6 +2038,7 @@ impl Shell {
         Ok(Prepared {
             lanes,
             done,
+            feeds,
             arm,
             readout_rows,
             readout_layout,
@@ -2027,8 +2057,11 @@ impl Shell {
         let mut key = crate::record::KeyBuilder::new();
         key.bytes(&p.descriptor.pack());
         key.shown(&p.arm);
-        key.shown(&p.slots);
-        key.shown(&p.caches);
+        // The tables run to a slot per traced value; hashing them field by
+        // field rather than through their debug text keeps a step's key off
+        // the CPU's critical path (1.6 ms of a token on a phone's core).
+        key.hashed(&p.slots);
+        key.hashed(&p.caches);
         key.shown(&p.bindings);
         key.shown(&p.windows);
         key.shown(&p.demand);
@@ -2040,7 +2073,7 @@ impl Shell {
         key.finish()
     }
 
-    fn walk_once(&self, p: &Prepared<'_>, keep: bool) -> Result<Walked> {
+    fn walk_once(&self, p: &Prepared<'_>, keep: bool, split: bool) -> Result<Walked> {
         let place = At::new();
 
         let frame = Some(if keep {
@@ -2072,6 +2105,9 @@ impl Shell {
                 self.weights.host(),
                 self.weights.pump(),
             );
+            if split {
+                run.flush_between_layers();
+            }
             walk(
                 &self.trace,
                 &self.compiled,
@@ -2121,6 +2157,7 @@ pub struct StepView<'a> {
 pub struct Prepared<'a> {
     lanes: &'a [Seated<'a>],
     done: Option<Done>,
+    feeds: Vec<(u32, &'a Buffer)>,
 
     arm: usize,
     readout_rows: Vec<i32>,
@@ -2144,6 +2181,7 @@ impl PreparedPhase for Prepared<'_> {
 
 pub struct Enqueued<'a> {
     pending: Pending,
+    fed: Option<Pending>,
     seq: u64,
     arm: usize,
 
@@ -2220,6 +2258,8 @@ struct Flight {
     arm: usize,
     rows: Vec<(u32, u32)>,
     pending: Pending,
+    _fed: Option<Pending>,
+    read: bool,
 }
 
 impl engine::frame::Shell for Shell {
@@ -2245,6 +2285,7 @@ impl engine::frame::Shell for Shell {
     where
         Self: 'a,
     {
+        let fed = self.feed(&prepared)?;
         let key = self.recorder.records().then(|| self.record_key(&prepared));
 
         let replayable = key
@@ -2286,6 +2327,7 @@ impl engine::frame::Shell for Shell {
             self.handles.rewind();
             return Ok(Enqueued {
                 pending,
+                fed,
                 seq,
                 arm: prepared.arm,
                 rows: layout,
@@ -2294,8 +2336,10 @@ impl engine::frame::Shell for Shell {
             });
         }
 
-        let keep = key.filter(|_| self.recorder.has_room());
-        let walked = self.walk_once(&prepared, keep.is_some())?;
+        // A split step is not recorded: a recording replays as one submit.
+        let split = prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= SPLIT_ROWS;
+        let keep = key.filter(|_| !split && self.recorder.has_room());
+        let walked = self.walk_once(&prepared, keep.is_some(), split)?;
         let mut frame = walked.frame.expect("the walk opened a frame");
 
         let logits = prepared.slots.0[self.out.0 as usize].ok_or_else(|| Fault::Unbound {
@@ -2436,6 +2480,7 @@ impl engine::frame::Shell for Shell {
 
         Ok(Enqueued {
             pending,
+            fed,
             seq,
             arm: prepared.arm,
             rows: layout,
@@ -2450,6 +2495,7 @@ impl engine::frame::Shell for Shell {
     {
         let Enqueued {
             pending,
+            fed,
             seq,
             arm,
             rows,
@@ -2463,6 +2509,8 @@ impl engine::frame::Shell for Shell {
             arm,
             rows,
             pending,
+            _fed: fed,
+            read: true,
         });
         Ok(Landed {
             seq,

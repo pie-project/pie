@@ -54,7 +54,7 @@ telemetry = false
 const DEFAULT_MODEL_BLOCK: &str = r#"[model]
 name = "default"
 model = "Qwen/Qwen3.5-0.8B"
-# weight_cache_dir = ""       # empty derives $PIE_HOME/models
+# weight_cache_dir = ""       # empty derives $PIE_HOME/cache/weights
 # weight_dtype     = "bfloat16"  # what the CHECKPOINT holds. activation_dtype
                                  # is what the engine computes in, so that is
                                  # an engine key and this is a model one.
@@ -151,7 +151,7 @@ gpu_mem_utilization = 0.90  # of the device-local heap: weights, kv pool, scratc
 # max_forward_requests = 512    # (max_concurrent_processes derives from this)
 # max_state_slots      = 256    # recurrent-state seats (hybrid models)
 # validation           = false  # VK_LAYER_KHRONOS_validation; diagnostic only
-# pipeline_cache       = "/path/to/pipeline.bin"  # omit for in-memory only
+# pipeline_cache       = "/path/to/pipeline.bin"  # omit for $PIE_HOME/cache/vulkan-pipelines.bin
 "#;
 
 #[cfg(any(feature = "wgpu", test))]

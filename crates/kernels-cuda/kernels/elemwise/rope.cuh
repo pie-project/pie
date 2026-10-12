@@ -516,6 +516,7 @@ __global__ __launch_bounds__(BLOCK) void q_rmsnorm_rope_partial(
     int head_dim,
     int heads,
     int rotary_dim,
+    int span,
     float theta,
     float eps,
     const u32* __restrict__ win)
@@ -556,20 +557,21 @@ __global__ __launch_bounds__(BLOCK) void q_rmsnorm_rope_partial(
     __syncthreads();
     const float inv_rms = rsqrtf(partial[kWarps] / static_cast<float>(head_dim) + eps);
 
-    // the norm covers the whole head; only the first rotary_dim entries turn,
-    // paired (i, i + rotary_dim/2) at theta^(-2i/rotary_dim) -- the convention
-    // HF, mlx-lm and llama.cpp share.
-    const int rope_half = rotary_dim / 2;
+    // the norm covers the whole head; the first rotary_dim/2 pairs turn, each
+    // pair `span` apart at theta^(-i/span): span = rotary_dim/2 for a plain
+    // partial rotary (HF, mlx-lm, llama.cpp), head_dim/2 for a proportional
+    // one (Gemma 4's global layers).
     const int pos = positions[row];
-    for (int i = rotary_dim + threadIdx.x; i < head_dim; i += BLOCK) {
+    for (int i = threadIdx.x; i < head_dim; i += BLOCK) {
         yr[i] = f32_to_bf16(bf16_to_f32(xr[i]) * inv_rms * bf16_to_f32(weight[i]));
     }
-    for (int dim_pair = threadIdx.x; dim_pair < rope_half; dim_pair += BLOCK) {
-        const int mate = dim_pair + rope_half;
+    __syncthreads();
+    for (int dim_pair = threadIdx.x; dim_pair < rotary_dim / 2; dim_pair += BLOCK) {
+        const int mate = dim_pair + span;
         const float a = bf16_to_f32(xr[dim_pair]) * inv_rms * bf16_to_f32(weight[dim_pair]);
         const float b = bf16_to_f32(xr[mate]) * inv_rms * bf16_to_f32(weight[mate]);
         const float freq = powf(theta,
-            -2.f * static_cast<float>(dim_pair) / static_cast<float>(rotary_dim));
+            -static_cast<float>(dim_pair) / static_cast<float>(span));
         const float ang = static_cast<float>(pos) * freq;
         float cos_v, sin_v;
         __sincosf(ang, &sin_v, &cos_v);
@@ -588,6 +590,7 @@ __global__ void rope_partial(
     int num_kv_heads,
     int head_dim,
     int rotary_dim,
+    int span,
     float theta,
     const u32* __restrict__ win)
 {
@@ -598,19 +601,19 @@ __global__ void rope_partial(
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const int total_heads = num_q_heads + num_kv_heads;
-    // the first rotary_dim entries of each head turn, paired
-    // (i, i + rotary_dim/2) at theta^(-2i/rotary_dim) -- the convention HF,
-    // mlx-lm and llama.cpp share; dims at or past rotary_dim are left alone.
-    const int half = rotary_dim / 2;
+    // the first rotary_dim/2 pairs of each head turn, each pair `span` apart
+    // at theta^(-i/span): span = rotary_dim/2 for a plain partial rotary (HF,
+    // mlx-lm, llama.cpp), head_dim/2 for a proportional one (Gemma 4's global
+    // layers). Every other entry is left alone.
+    const int pairs = rotary_dim / 2;
     const int pos = positions[row] + position_delta;
 
-    for (int t = threadIdx.x; t < total_heads * half; t += blockDim.x) {
-        const int head_idx = t / half;
-        const int dim_pair = t % half;
+    for (int t = threadIdx.x; t < total_heads * pairs; t += blockDim.x) {
+        const int head_idx = t / pairs;
+        const int dim_pair = t % pairs;
 
         const float freq = powf(theta,
-            -2.f * static_cast<float>(dim_pair) /
-                   static_cast<float>(rotary_dim));
+            -static_cast<float>(dim_pair) / static_cast<float>(span));
         const float ang = static_cast<float>(pos) * freq;
         float cos_v, sin_v;
         __sincosf(ang, &sin_v, &cos_v);
@@ -619,17 +622,17 @@ __global__ void rope_partial(
             T* qp = q +
                 (static_cast<long long>(row) * num_q_heads + head_idx) * head_dim;
             const float a = Elem<T>::to_f32(qp[dim_pair]);
-            const float b = Elem<T>::to_f32(qp[dim_pair + half]);
+            const float b = Elem<T>::to_f32(qp[dim_pair + span]);
             qp[dim_pair]        = Elem<T>::from_f32(a * cos_v - b * sin_v);
-            qp[dim_pair + half] = Elem<T>::from_f32(b * cos_v + a * sin_v);
+            qp[dim_pair + span] = Elem<T>::from_f32(b * cos_v + a * sin_v);
         } else {
             const int kv_h = head_idx - num_q_heads;
             T* kp = k +
                 (static_cast<long long>(row) * num_kv_heads + kv_h) * head_dim;
             const float a = Elem<T>::to_f32(kp[dim_pair]);
-            const float b = Elem<T>::to_f32(kp[dim_pair + half]);
+            const float b = Elem<T>::to_f32(kp[dim_pair + span]);
             kp[dim_pair]        = Elem<T>::from_f32(a * cos_v - b * sin_v);
-            kp[dim_pair + half] = Elem<T>::from_f32(b * cos_v + a * sin_v);
+            kp[dim_pair + span] = Elem<T>::from_f32(b * cos_v + a * sin_v);
         }
     }
 }

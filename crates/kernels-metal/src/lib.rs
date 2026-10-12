@@ -1,3 +1,5 @@
+#[cfg(target_vendor = "apple")]
+pub mod ane;
 pub mod attn;
 pub mod collective;
 pub mod elemwise;
@@ -5,6 +7,7 @@ pub mod encode;
 pub mod error;
 pub mod icb;
 pub mod layout;
+pub mod ledger;
 pub mod linear;
 
 #[cfg(test)]

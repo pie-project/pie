@@ -12,10 +12,9 @@ pie=${CARGO_TARGET_DIR:-target}/debug/pie
 cargo build -p pie --features cuda --bin pie
 (cd examples && cargo build -q --release --target wasm32-wasip2 -p text-completion -p naive-baseline)
 
+# A current artifact is a no-op, a stale one is rebuilt: pie decides, not a path.
+"$pie" model import Qwen/Qwen3.5-0.8B
 "$pie" model list
-if ! ls "$PIE_HOME"/models/Qwen--Qwen3.5-0.8B/*.cuda.zt >/dev/null 2>&1; then
-  "$pie" model import Qwen/Qwen3.5-0.8B
-fi
 mkdir -p "$PIE_HOME"
 cat > "$PIE_HOME/config.toml" <<TOML
 [server]
@@ -49,7 +48,7 @@ echo "== compat API suite"
 uv run --with openai --with anthropic --with google-genai python tests/builtins/test_compat.py --base-url "http://127.0.0.1:$port"
 
 echo "== install, replace and remove while serving"
-submit() { uv run --project python/client python scripts/ci/launch.py "ws://127.0.0.1:$port" "$1" || true; }
+submit() { uv run --project packages/python/client python scripts/ci/launch.py "ws://127.0.0.1:$port" "$1" || true; }
 wasm=$(cd examples && cargo metadata --format-version 1 --no-deps | jq -r .target_directory)/wasm32-wasip2/release
 tc=$wasm/text_completion.wasm
 nb=$wasm/naive_baseline.wasm

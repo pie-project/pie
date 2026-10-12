@@ -108,6 +108,42 @@ impl Run<'_> {
             Layout::MergeRows { x, side, y } => {
                 layout::merge_rows(self.ctx(), self.tensor(*x), *side, self.tensor(*y))
             }
+            Layout::Pixels {
+                x,
+                patch,
+                mean,
+                std,
+                order,
+                temporal,
+                y,
+            } => layout::pixels(
+                self.ctx(),
+                self.tensor(*x),
+                *patch,
+                *mean,
+                *std,
+                *order == poem_ir::PixelOrder::Chw,
+                *temporal,
+                self.tensor(*y),
+            ),
+            Layout::GridTaps {
+                positions,
+                grids,
+                segments,
+                kind,
+                side,
+                ids,
+                weights,
+            } => layout::grid_taps(
+                self.ctx(),
+                self.tensor(*positions),
+                self.tensor(*grids),
+                self.tensor(*segments),
+                *kind == poem_ir::TapKind::Bilinear,
+                *side,
+                self.tensor(*ids),
+                self.tensor(*weights),
+            ),
             Layout::ScatterLiveRows {
                 src,
                 routes,

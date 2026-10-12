@@ -88,8 +88,11 @@ impl ui::Report for CacheReport {
 }
 
 fn list() -> Result<Answer> {
-    let entries = disk::entries(Some(crate::local::hf::resolve_cache_dir()));
-    let home = bootstrap::paths::pie_home();
+    let entries = disk::entries(
+        &crate::paths::pie_home(),
+        Some(crate::local::hf::resolve_cache_dir()),
+    );
+    let home = crate::paths::pie_home();
 
     let measured: Vec<(disk::Entry, bool, u64)> = entries
         .into_iter()
@@ -134,7 +137,10 @@ fn list() -> Result<Answer> {
 }
 
 fn selected(names: &[String]) -> Result<Vec<disk::Entry>> {
-    let all = disk::entries(Some(crate::local::hf::resolve_cache_dir()));
+    let all = disk::entries(
+        &crate::paths::pie_home(),
+        Some(crate::local::hf::resolve_cache_dir()),
+    );
     if names.is_empty() {
         return Ok(all
             .into_iter()
@@ -221,6 +227,10 @@ mod tests {
         let chosen = selected(&[]).unwrap();
         assert!(!chosen.is_empty());
         assert!(chosen.iter().all(|e| e.reclaim == Reclaim::Safe));
-        assert!(chosen.iter().all(|e| e.name != "models"));
+        assert!(
+            chosen
+                .iter()
+                .all(|e| e.name != "artifacts" && e.name != "models")
+        );
     }
 }

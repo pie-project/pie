@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use pie::{compose, derive, ops, ui};
+use pie::{ops, ui};
 #[derive(Parser, Debug)]
 #[command(
     name = "pie",
@@ -11,7 +11,7 @@ use pie::{compose, derive, ops, ui};
 )]
 struct Cli {
     #[command(flatten)]
-    global: bootstrap::GlobalArgs,
+    global: pie::args::GlobalArgs,
 
     #[arg(long, global = true)]
     json: bool,
@@ -99,7 +99,7 @@ async fn run() -> anyhow::Result<ExitCode> {
         return serve(cli.global, cli.diag.as_deref()).await;
     }
 
-    bootstrap::init_cli(&cli.global)?;
+    pie::daemon::init_command(&cli.global);
 
     let answer = match cli.command {
         Command::Serve => unreachable!("serve returns before the op dispatch"),
@@ -130,16 +130,19 @@ async fn run() -> anyhow::Result<ExitCode> {
     Ok(code)
 }
 
-async fn serve(global: bootstrap::GlobalArgs, diag: Option<&str>) -> anyhow::Result<ExitCode> {
-    let ctx = bootstrap::init(
-        bootstrap::BootSpec::pie().version(env!("CARGO_PKG_VERSION")),
+async fn serve(global: pie::args::GlobalArgs, diag: Option<&str>) -> anyhow::Result<ExitCode> {
+    let ctx = pie::daemon::init(
+        pie::daemon::BootSpec::pie().version(env!("CARGO_PKG_VERSION")),
         global,
     )?;
-    let (controller, gateway, mut worker) = derive::derive_standalone(ctx.config_str())?;
+    let (controller, gateway, mut worker) =
+        worker::standalone::derive_standalone(ctx.config_str())?;
     if let Some(words) = diag {
         worker.state_diagnostics(words)?;
     }
-    let handle = compose::run_standalone(controller, gateway, worker).await?;
+    let handle =
+        worker::standalone::run_standalone(controller, gateway, worker, &pie::paths::pie_home())
+            .await?;
     tracing::info!(
         listen = %handle.listen_addr,
         worker = %handle.worker_addr,

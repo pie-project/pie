@@ -14,8 +14,6 @@ pub struct Yarn {
 
 const FILE: &str = "elemwise/rope_neox.metal";
 
-const UNSCALED: f32 = 1.0;
-
 fn rope_grid(
     op: &'static str,
     rotary: u32,
@@ -53,16 +51,18 @@ fn positions_stream(op: &'static str, positions: Tensor, x: Tensor) {
     );
 }
 
+/// The first `rotary/2` pairs of each head turn, pair `i` being
+/// `(i, i + span)` at `theta^(-i/span)`.
 #[allow(clippy::too_many_arguments)]
-fn rotate_geometric(
+fn rotate(
     ctx: &Ctx<'_>,
     op: &'static str,
     x: Tensor,
     positions: Tensor,
-    scale: f32,
     base: f32,
     head_dim: u32,
     rotary: u32,
+    span: u32,
 ) -> Result<(), Error> {
     let entry = dtype_dispatch!(op, x.dtype, { Bf16 => "neox_mb_bfloat16" });
     positions_stream(op, positions, x);
@@ -72,35 +72,9 @@ fn rotate_geometric(
         &[
             x.arg_mut(),
             positions.arg(),
-            scale.arg(),
             base.arg(),
             stated(op, head_dim)?.arg(),
-        ],
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn rotate_proportional(
-    ctx: &Ctx<'_>,
-    op: &'static str,
-    x: Tensor,
-    positions: Tensor,
-    scale: f32,
-    base: f32,
-    head_dim: u32,
-    rotary: u32,
-) -> Result<(), Error> {
-    let entry = dtype_dispatch!(op, x.dtype, { Bf16 => "neox_prop_mb_bfloat16" });
-    positions_stream(op, positions, x);
-    let lanes = rope_grid(op, rotary, x.width, head_dim, x.rows)?;
-    ctx.fire(
-        Fire::at(FILE, entry).apply(Grid::of(lanes, head_group(lanes))),
-        &[
-            x.arg_mut(),
-            positions.arg(),
-            scale.arg(),
-            base.arg(),
-            stated(op, head_dim)?.arg(),
+            stated(op, span)?.arg(),
         ],
     )
 }
@@ -236,10 +210,12 @@ pub fn full(
     }
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     let base = theta.log2();
-    rotate_geometric(ctx, OP, q, positions, UNSCALED, base, head_dim, head_dim)?;
-    rotate_geometric(ctx, OP, k, positions, UNSCALED, base, head_dim, head_dim)
+    let span = head_dim / 2;
+    rotate(ctx, OP, q, positions, base, head_dim, head_dim, span)?;
+    rotate(ctx, OP, k, positions, base, head_dim, head_dim, span)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn partial(
     ctx: &Ctx<'_>,
     q: Tensor,
@@ -248,12 +224,13 @@ pub fn partial(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
+    span: u32,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_partial";
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     let base = theta.log2();
-    rotate_proportional(ctx, OP, q, positions, UNSCALED, base, head_dim, rotary_dim)?;
-    rotate_proportional(ctx, OP, k, positions, UNSCALED, base, head_dim, rotary_dim)
+    rotate(ctx, OP, q, positions, base, head_dim, rotary_dim, span)?;
+    rotate(ctx, OP, k, positions, base, head_dim, rotary_dim, span)
 }
 
 pub fn partial_q(
@@ -263,16 +240,18 @@ pub fn partial_q(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
+    span: u32,
 ) -> Result<(), Error> {
-    rotate_proportional(
+    const OP: &str = "elementwise.rope_partial_q";
+    rotate(
         ctx,
-        "elementwise.rope_partial_q",
+        OP,
         q,
         positions,
-        UNSCALED,
         theta.log2(),
         head_dim,
         rotary_dim,
+        span,
     )
 }
 

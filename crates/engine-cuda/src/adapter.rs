@@ -231,7 +231,9 @@ pub fn planes_of(
     let hidden = seat.rows.max(seat.cols);
     let layers = banks.len() as u64;
     let elems = wire.len() as u64 / 4;
-    if wire.len() as u64 % 4 != 0 || elems % (layers.saturating_mul(hidden)).max(1) != 0 {
+    if !(wire.len() as u64).is_multiple_of(4)
+        || !elems.is_multiple_of((layers.saturating_mul(hidden)).max(1))
+    {
         return Err(refuse(format!(
             "was seeded {} bytes, which is not {layers} layers x rank x {hidden} f32 \
              elements; a plane is a whole `[layers, rank, hidden]` cell",

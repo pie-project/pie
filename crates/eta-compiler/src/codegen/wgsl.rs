@@ -15,9 +15,13 @@ const REDUCE_LEVELS: u32 = 7;
 
 const SORT_ROUNDS: u32 = 28;
 
+/// Words the runtime's one-row select keeps just below the temporary area
+/// (`SEL_WORDS` in the runtime), which a scratch layout must leave free.
+pub const SELECT_WORDS: u32 = 10320;
+
 const BARRIER: &str = "  storageBarrier();\n";
 
-pub const WGSL_EMITTER_VERSION: u16 = 4;
+pub const WGSL_EMITTER_VERSION: u16 = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refused {
@@ -156,6 +160,49 @@ fn sort_rounds(plan: &crate::codegen::launch::LaunchStagePlan, at: usize) -> u32
     rounds.min(SORT_ROUNDS)
 }
 
+/// The fold levels a reduce over `at`'s argument needs: one per 32-fold
+/// until a row is one cell. A row of unknown length gets the full ladder.
+fn reduce_levels(plan: &crate::codegen::launch::LaunchStagePlan, at: usize) -> u32 {
+    let Some(mut len) = last_extent(plan, at) else {
+        return REDUCE_LEVELS;
+    };
+    let mut levels = 0;
+    while len > 1 && levels < REDUCE_LEVELS {
+        len = len.div_ceil(32);
+        levels += 1;
+    }
+    levels
+}
+
+fn arg_axes(
+    plan: &crate::codegen::launch::LaunchStagePlan,
+    at: usize,
+) -> Option<&[crate::plan::Dimension]> {
+    let arg = *plan.ops.get(at)?.args.first()?;
+    Some(&plan.value_types.get(arg as usize)?.axes)
+}
+
+fn last_extent(plan: &crate::codegen::launch::LaunchStagePlan, at: usize) -> Option<u64> {
+    match arg_axes(plan, at)?.last() {
+        Some(crate::plan::Dimension::Static(extent)) => Some(u64::from(*extent)),
+        None => Some(1),
+        _ => None,
+    }
+}
+
+/// Whether `at`'s argument is one row, which the runtime's select handles.
+fn one_row(plan: &crate::codegen::launch::LaunchStagePlan, at: usize) -> bool {
+    let Some(axes) = arg_axes(plan, at) else {
+        return false;
+    };
+    let Some((_, leading)) = axes.split_last() else {
+        return true;
+    };
+    leading
+        .iter()
+        .all(|axis| matches!(axis, crate::plan::Dimension::Static(1)))
+}
+
 // Native drivers recompile everything an entry point reaches per pipeline, so
 // naming the op cuts a stage's build from minutes to seconds; Dawn reuses the
 // compile of the shared switch instead, and specialising defeats that.
@@ -228,7 +275,7 @@ fn reduce_finish_call(at: usize, tag: u8) -> String {
     }
 }
 
-fn emit_op(body: &mut String, at: usize, tag: u8, rounds: u32) {
+fn emit_op(body: &mut String, at: usize, tag: u8, rounds: u32, levels: u32) {
     if is_sort(tag) {
         let _ = writeln!(body, "  ptir_sort_seed({at}u);");
         body.push_str(BARRIER);
@@ -242,7 +289,7 @@ fn emit_op(body: &mut String, at: usize, tag: u8, rounds: u32) {
         body.push_str(BARRIER);
         let _ = writeln!(body, "  ptir_pivot_pack({at}u);");
     } else if is_reduce(tag) {
-        for level in 0..REDUCE_LEVELS {
+        for level in 0..levels {
             let _ = writeln!(body, "  {};", reduce_level_call(at, tag, level));
             body.push_str(BARRIER);
         }
@@ -266,6 +313,7 @@ fn wrap(entry_name: &str, body: &str) -> String {
     source.push_str(entry_name);
     source.push_str("(@builtin(local_invocation_id) lid : vec3<u32>) {\n  tid = lid.x;\n");
     let _ = writeln!(source, "  lanes = {WORKGROUP}u;");
+    source.push_str("  sel_lt = lid.x;\n  sel_group = 0u;\n  sel_groups = 1u;\n");
     source.push_str(body);
     source.push_str("}\n");
     source
@@ -306,7 +354,7 @@ pub fn emit_region(
                 name: eta_ir::op::spec(op.tag).map_or("?", |row| row.name),
             });
         }
-        emit_op(&mut body, at, op.tag, SORT_ROUNDS);
+        emit_op(&mut body, at, op.tag, SORT_ROUNDS, REDUCE_LEVELS);
     }
 
     Ok(wrap(entry_name, &body))
@@ -331,7 +379,13 @@ pub fn emit_launch_stage(
                 name: eta_ir::op::spec(op.tag).map_or("?", |row| row.name),
             });
         }
-        emit_op(&mut body, at, op.tag, sort_rounds(plan, at));
+        emit_op(
+            &mut body,
+            at,
+            op.tag,
+            sort_rounds(plan, at),
+            reduce_levels(plan, at),
+        );
     }
     Ok(wrap(entry_name, &body))
 }
@@ -355,9 +409,12 @@ fn wrap_step(source: &mut String, entry_name: &str, call: &str) {
     source.push_str(entry_name);
     source.push_str(
         "(@builtin(global_invocation_id) gid : vec3<u32>,\n   \
+         @builtin(local_invocation_id) lid : vec3<u32>,\n   \
+         @builtin(workgroup_id) wid : vec3<u32>,\n   \
          @builtin(num_workgroups) grid : vec3<u32>) {\n  tid = gid.x;\n",
     );
     let _ = writeln!(source, "  lanes = grid.x * {WORKGROUP}u;");
+    source.push_str("  sel_lt = lid.x;\n  sel_group = wid.x;\n  sel_groups = grid.x;\n");
     source.push_str(call);
     source.push_str("}\n");
 }
@@ -366,9 +423,9 @@ fn step_op(
     source: &mut String,
     steps: &mut Vec<Step>,
     prefix: &str,
+    plan: &crate::codegen::launch::LaunchStagePlan,
     at: usize,
     tag: u8,
-    rounds: u32,
 ) {
     let mut push = |call: String, suffix: &str| {
         let entry = alloc::format!("{prefix}_{at}_{suffix}");
@@ -378,9 +435,44 @@ fn step_op(
             node: at as u32,
         });
     };
-    if is_sort(tag) {
+    let pivot = (tag == tags::PIVOT_THRESHOLD).then(|| plan.ops[at].pred_tag);
+    if pivot.is_some_and(|pred| pred > 1) {
+        // ProbGe compares each lane with the threshold; nothing to order.
+        push(alloc::format!("  {};\n", step_call(at, tag)), "step");
+    } else if pivot.is_some() && one_row(plan, at) {
+        let rank = pivot == Some(0);
+        push(alloc::format!("  sel_init({at}u);\n"), "sel");
+        for pass in 0..4 {
+            push(
+                alloc::format!("  sel_hist({at}u, {pass}u);\n"),
+                &alloc::format!("h{pass}"),
+            );
+            push(
+                alloc::format!("  sel_pick({at}u, {pass}u);\n"),
+                &alloc::format!("p{pass}"),
+            );
+        }
+        if rank {
+            push(alloc::format!("  sel_rank_mask({at}u);\n"), "mask");
+        } else {
+            push(alloc::format!("  sel_tally({at}u);\n"), "tally");
+            push(alloc::format!("  sel_place({at}u);\n"), "place");
+            push(alloc::format!("  sel_walk({at}u);\n"), "walk");
+            let guard = "  if (sel_ladder_idle()) { return; }\n";
+            push(alloc::format!("{guard}  ptir_sort_seed({at}u);\n"), "seed");
+            for round in 0..sort_rounds(plan, at) {
+                push(
+                    alloc::format!("{guard}  ptir_sort_round({at}u, {round}u);\n"),
+                    &alloc::format!("r{round}"),
+                );
+            }
+            push(alloc::format!("{guard}  ptir_sort_pre({at}u);\n"), "pre");
+            push(alloc::format!("{guard}  {};\n", step_call(at, tag)), "step");
+            push(alloc::format!("{guard}  ptir_pivot_pack({at}u);\n"), "pack");
+        }
+    } else if is_sort(tag) {
         push(alloc::format!("  ptir_sort_seed({at}u);\n"), "seed");
-        for round in 0..rounds {
+        for round in 0..sort_rounds(plan, at) {
             push(
                 alloc::format!("  ptir_sort_round({at}u, {round}u);\n"),
                 &alloc::format!("r{round}"),
@@ -390,7 +482,7 @@ fn step_op(
         push(alloc::format!("  {};\n", step_call(at, tag)), "step");
         push(alloc::format!("  ptir_pivot_pack({at}u);\n"), "pack");
     } else if is_reduce(tag) {
-        for level in 0..REDUCE_LEVELS {
+        for level in 0..reduce_levels(plan, at) {
             push(
                 alloc::format!("  {};\n", reduce_level_call(at, tag, level)),
                 &alloc::format!("l{level}"),
@@ -428,14 +520,7 @@ pub fn emit_launch_steps(
                 name: eta_ir::op::spec(op.tag).map_or("?", |row| row.name),
             });
         }
-        step_op(
-            &mut source,
-            &mut steps,
-            prefix,
-            at,
-            op.tag,
-            sort_rounds(plan, at),
-        );
+        step_op(&mut source, &mut steps, prefix, plan, at, op.tag);
     }
     Ok(Stepwise { source, steps })
 }
@@ -965,5 +1050,102 @@ mod sort_bound_tests {
         orphan.ops[1].args.clear();
         assert_eq!(sort_rounds(&orphan, 1), SORT_ROUNDS);
         assert_eq!(sort_rounds(&orphan, 99), SORT_ROUNDS);
+    }
+}
+
+#[cfg(test)]
+mod select_tests {
+    use super::{RUNTIME, SELECT_WORDS, emit_launch_steps};
+    use crate::codegen::launch::{LaunchOp, LaunchPlanValue, LaunchStagePlan};
+    use crate::plan::Dimension;
+    use alloc::string::String;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use eta_ir::op::tags;
+    use eta_ir::types::Dtype;
+
+    fn pivot(pred_tag: u8, input: &[Dimension]) -> LaunchStagePlan {
+        let value = |axes: &[Dimension]| LaunchPlanValue {
+            dtype: Dtype::F32,
+            axes: axes.to_vec(),
+        };
+        LaunchStagePlan {
+            ops: vec![LaunchOp {
+                tag: tags::PIVOT_THRESHOLD,
+                result_count: 1,
+                result_id: 2,
+                pred_tag,
+                args: vec![0, 1],
+                ..LaunchOp::default()
+            }],
+            value_types: vec![value(input), value(&[Dimension::Static(1)]), value(input)],
+            ..LaunchStagePlan::default()
+        }
+    }
+
+    fn suffixes(plan: &LaunchStagePlan) -> Vec<String> {
+        emit_launch_steps("main", plan)
+            .expect("a pivot emits")
+            .steps
+            .into_iter()
+            .map(|step| step.entry.trim_start_matches("main_0_").into())
+            .collect()
+    }
+
+    const ROW: [Dimension; 2] = [Dimension::Static(1), Dimension::Static(248_320)];
+
+    #[test]
+    fn a_one_row_rank_cut_selects_and_masks_without_a_sort() {
+        assert_eq!(
+            suffixes(&pivot(0, &ROW)),
+            [
+                "sel", "h0", "p0", "h1", "p1", "h2", "p2", "h3", "p3", "mask"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_one_row_mass_cut_walks_its_candidates_and_keeps_the_ladder_behind() {
+        let steps = suffixes(&pivot(1, &ROW));
+        assert_eq!(
+            steps[..12],
+            [
+                "sel", "h0", "p0", "h1", "p1", "h2", "p2", "h3", "p3", "tally", "place", "walk"
+            ]
+        );
+        assert_eq!(steps[12], "seed");
+        assert_eq!(steps.last().map(String::as_str), Some("pack"));
+        let source = emit_launch_steps("main", &pivot(1, &ROW)).unwrap().source;
+        assert!(
+            source.contains("if (sel_ladder_idle()) { return; }\n  ptir_sort_seed(0u);"),
+            "the ladder runs only for a row the select handed over"
+        );
+    }
+
+    #[test]
+    fn a_threshold_cut_is_one_compare() {
+        assert_eq!(suffixes(&pivot(2, &ROW)), ["step"]);
+        let rows = [Dimension::Static(4), Dimension::Static(1024)];
+        assert_eq!(suffixes(&pivot(2, &rows)), ["step"]);
+    }
+
+    #[test]
+    fn several_rows_keep_the_sort_ladder() {
+        let rows = [Dimension::Static(4), Dimension::Static(1024)];
+        let steps = suffixes(&pivot(1, &rows));
+        assert_eq!(steps.first().map(String::as_str), Some("seed"));
+        assert!(!steps.iter().any(|step| step.starts_with('h')));
+    }
+
+    #[test]
+    fn the_layout_reserves_what_the_runtime_addresses() {
+        let declared = alloc::format!("const SEL_WORDS : u32 = {SELECT_WORDS}u;");
+        assert!(
+            RUNTIME.contains(&declared),
+            "the runtime's SEL_WORDS is not SELECT_WORDS"
+        );
+        // State, a histogram per workgroup, a tally pair per workgroup, and
+        // the candidates' keys and indices.
+        assert_eq!(SELECT_WORDS, 16 + 32 * 256 + 32 * 2 + 1024 * 2);
     }
 }

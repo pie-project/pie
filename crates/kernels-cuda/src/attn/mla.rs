@@ -132,7 +132,15 @@ pub fn latents_rope(
         "the latent output is the stated rank wide"
     );
     split_kv_a_norm(ctx, OP, kv_a, weight, eps, kv_c, k_pe)?;
-    crate::elemwise::rope::partial_q(ctx, k_pe, positions, rope_dim, rope_dim, theta)
+    crate::elemwise::rope::partial_q(
+        ctx,
+        k_pe,
+        positions,
+        rope_dim,
+        rope_dim,
+        theta,
+        rope_dim / 2,
+    )
 }
 
 pub fn split_q_b(

@@ -1,14 +1,14 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-pub fn engine_cache_dir() -> PathBuf {
-    bootstrap::paths::pie_home().join("cache")
+pub fn engine_cache_dir(home: &Path) -> PathBuf {
+    home.join("cache")
 }
 
 /// Where a load's kv slot files live when the config names no path: one
 /// directory per checkpoint digest, so no two models share one.
-pub fn kv_dir(snapshot_dir: &std::path::Path) -> anyhow::Result<PathBuf> {
+pub fn kv_dir(engine_cache_dir: &Path, snapshot_dir: &Path) -> anyhow::Result<PathBuf> {
     let digest = crate::weights::model_artifact_digest(snapshot_dir)?;
-    Ok(engine_cache_dir()
+    Ok(engine_cache_dir
         .join("kv")
         .join(blake3::Hash::from(digest).to_hex().as_str()))
 }
@@ -29,12 +29,11 @@ pub struct Entry {
     pub keep: &'static [&'static str],
 }
 
-pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
-    let home = bootstrap::paths::pie_home();
+pub fn entries(home: &Path, hf_cache: Option<PathBuf>) -> Vec<Entry> {
     let mut entries = vec![
         Entry {
             name: "engine",
-            path: engine_cache_dir(),
+            path: engine_cache_dir(home),
             what: "Engine-side disk caches: compiled ETA modules, kernel \
                    cubins, GEMM autotuning results. All keyed and \
                    self-invalidating; deleting costs one cold rebuild.",
@@ -43,7 +42,7 @@ pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
         },
         Entry {
             name: "inferlets",
-            path: bootstrap::paths::inferlets_dir(),
+            path: home.join("inferlets"),
             what: "Installed inferlets. Deleting one means `pie inferlet \
                    install` again; the built-in ones need no install.",
             reclaim: Reclaim::Safe,
@@ -51,7 +50,7 @@ pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
         },
         Entry {
             name: "languages",
-            path: bootstrap::paths::languages_dir(),
+            path: home.join("languages"),
             what: "The language components script inferlets run under \
                    (`python.wasm`, `javascript.wasm`). `pie language install` \
                    puts one back from a release archive.",
@@ -59,10 +58,19 @@ pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
             keep: &[],
         },
         Entry {
+            name: "artifacts",
+            path: home.join("artifacts"),
+            what: "Imported `.zt` artifacts -- the models pie serves. Losing \
+                   one costs a re-download and a re-import, not a reload.",
+            reclaim: Reclaim::OnRequest,
+            keep: &[],
+        },
+        Entry {
             name: "models",
             path: home.join("models"),
-            what: "Converted `.zt` artifacts -- the models pie serves. Losing \
-                   one costs a re-download and a re-convert, not a reload.",
+            what: "Model packages that shadow or add to the ones built in. \
+                   Deleting one means the built-in package serves again, or \
+                   nothing does.",
             reclaim: Reclaim::OnRequest,
             keep: &[],
         },
@@ -149,7 +157,7 @@ mod tests {
 
     #[test]
     fn the_authored_files_are_never_reclaimable() {
-        for entry in entries(None) {
+        for entry in entries(Path::new("/home"), None) {
             if entry.name == "config" {
                 assert_eq!(
                     entry.reclaim,

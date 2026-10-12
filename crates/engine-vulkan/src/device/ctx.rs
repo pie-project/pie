@@ -81,6 +81,10 @@ pub(crate) struct Core {
 
     spare_fences: Mutex<Vec<vk::Fence>>,
 
+    /// Command buffers whose frame was dropped off the thread that owns
+    /// their pool, which a pool's own thread frees: a pool is not shared.
+    orphans: Mutex<Vec<(vk::CommandPool, vk::CommandBuffer)>>,
+
     pub(crate) family: u32,
     pub(crate) memory: vk::PhysicalDeviceMemoryProperties,
     pub(crate) limits: vk::PhysicalDeviceLimits,
@@ -197,8 +201,23 @@ impl Core {
             .pools
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(pool) = pools.get(&std::thread::current().id()) {
-            return Ok(*pool);
+        if let Some(&pool) = pools.get(&std::thread::current().id()) {
+            let mut orphans = self
+                .orphans
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut freed = Vec::new();
+            orphans.retain(|&(owner, cmd)| {
+                let mine = owner == pool;
+                if mine {
+                    freed.push(cmd);
+                }
+                !mine
+            });
+            if !freed.is_empty() {
+                unsafe { self.device.free_command_buffers(pool, &freed) };
+            }
+            return Ok(pool);
         }
         let pool = unsafe {
             self.device.create_command_pool(
@@ -272,8 +291,112 @@ pub struct Context {
     working_set: u64,
     max_buffer: u64,
     pub(crate) dummy: Slab,
-    pipeline_cache: Option<std::path::PathBuf>,
+    pipeline_cache: Arc<PipelineCache>,
     device_index: u32,
+}
+
+/// The device's pipeline cache, which kernel and guest pipelines share. A
+/// build marks it changed, and it reaches its file shortly after rather
+/// than at shutdown: a phone kills an app's process more often than the app
+/// shuts down.
+pub struct PipelineCache {
+    core: Arc<Core>,
+    cache: vk::PipelineCache,
+    path: Option<std::path::PathBuf>,
+    changed: std::sync::atomic::AtomicBool,
+    written: Mutex<std::time::Instant>,
+}
+
+/// How long a changed cache waits for more builds before it is written.
+const PIPELINE_CACHE_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl PipelineCache {
+    fn open(core: &Arc<Core>, path: Option<std::path::PathBuf>) -> Result<PipelineCache> {
+        let initial = path
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok())
+            .unwrap_or_default();
+        let make = |bytes: &[u8]| unsafe {
+            core.device.create_pipeline_cache(
+                &vk::PipelineCacheCreateInfo::default().initial_data(bytes),
+                None,
+            )
+        };
+        let cache = make(&initial)
+            .or_else(|_| make(&[]))
+            .map_err(|e| core.fault("vkCreatePipelineCache", e))?;
+        Ok(PipelineCache {
+            core: Arc::clone(core),
+            cache,
+            path,
+            changed: std::sync::atomic::AtomicBool::new(false),
+            written: Mutex::new(std::time::Instant::now()),
+        })
+    }
+
+    #[must_use]
+    pub fn handle(&self) -> vk::PipelineCache {
+        self.cache
+    }
+
+    #[must_use]
+    pub fn path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
+    }
+
+    /// Marks the cache changed by a build.
+    pub fn built(&self) {
+        self.changed.store(true, Ordering::Release);
+    }
+
+    /// Writes a changed cache once builds have paused for a moment.
+    pub fn settle(&self) {
+        let due = self.changed.load(Ordering::Acquire)
+            && self
+                .written
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .elapsed()
+                >= PIPELINE_CACHE_SETTLE;
+        if due && let Err(fault) = self.persist() {
+            tracing::warn!(%fault, "writing the pipeline cache");
+        }
+    }
+
+    pub fn persist(&self) -> Result<()> {
+        if !self.changed.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        *self
+            .written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::time::Instant::now();
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let bytes = unsafe { self.core.device.get_pipeline_cache_data(self.cache) }
+            .map_err(|e| self.core.fault("vkGetPipelineCacheData", e))?;
+        let io = |call: &'static str| {
+            move |e: std::io::Error| Fault::Device {
+                call,
+                why: e.to_string(),
+            }
+        };
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(io("pipeline cache dir"))?;
+        }
+        // Whole or not at all: a reader never meets a half-written file.
+        let partial = path.with_extension("partial");
+        std::fs::write(&partial, bytes).map_err(io("pipeline cache write"))?;
+        std::fs::rename(&partial, path).map_err(io("pipeline cache rename"))
+    }
+}
+
+impl Drop for PipelineCache {
+    fn drop(&mut self) {
+        let _ = self.persist();
+        unsafe { self.core.device.destroy_pipeline_cache(self.cache, None) };
+    }
 }
 
 impl std::fmt::Debug for Context {
@@ -625,6 +748,7 @@ impl Context {
                 pool,
             )])),
             spare_fences: Mutex::new(Vec::new()),
+            orphans: Mutex::new(Vec::new()),
             family,
             memory,
             limits: props.limits,
@@ -651,12 +775,16 @@ impl Context {
         };
         let working_set = (device_local as f64 * fraction) as u64;
         let max_buffer = u64::from(core.limits.max_storage_buffer_range).max(1 << 30);
+        let pipeline_cache = Arc::new(
+            PipelineCache::open(&core, boot.pipeline_cache.clone())
+                .map_err(|fault| (fault, None))?,
+        );
         Ok(Context {
             core,
             working_set,
             max_buffer,
             dummy,
-            pipeline_cache: boot.pipeline_cache.clone(),
+            pipeline_cache,
             device_index: boot.device_index,
         })
     }
@@ -702,7 +830,12 @@ impl Context {
 
     #[must_use]
     pub fn pipeline_cache_path(&self) -> Option<&std::path::Path> {
-        self.pipeline_cache.as_deref()
+        self.pipeline_cache.path()
+    }
+
+    #[must_use]
+    pub fn pipeline_cache(&self) -> &PipelineCache {
+        &self.pipeline_cache
     }
 
     #[must_use]
@@ -713,13 +846,7 @@ impl Context {
     #[must_use]
     pub fn info(&self) -> kernels_vulkan::DeviceInfo {
         kernels_vulkan::DeviceInfo {
-            vendor: match self.core.vendor_id {
-                0x10DE => kernels_vulkan::tuning::Vendor::Nvidia,
-                0x1002 => kernels_vulkan::tuning::Vendor::Amd,
-                0x8086 => kernels_vulkan::tuning::Vendor::Intel,
-                0x106B => kernels_vulkan::tuning::Vendor::Apple,
-                _ => kernels_vulkan::tuning::Vendor::Other,
-            },
+            vendor: kernels_vulkan::DeviceInfo::vendor_of(self.core.vendor_id),
             subgroup_size: self.core.subgroup_size,
             max_workgroup_invocations: self.core.limits.max_compute_work_group_invocations,
             max_shared_bytes: self.core.limits.max_compute_shared_memory_size,
@@ -792,6 +919,22 @@ impl Context {
             d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(flags))
         }
         .map_err(|e| core.fault("vkBeginCommandBuffer", e))?;
+        // Frames run ahead of one another on the queue: each waits for every
+        // write submitted before it.
+        unsafe {
+            let all = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[all],
+                &[],
+                &[],
+            );
+        }
         let timing = if crate::encode::profiling() && core.limits.timestamp_period > 0.0 {
             let pool = unsafe {
                 d.create_query_pool(
@@ -900,7 +1043,22 @@ impl Drop for Inner {
             {
                 d.destroy_query_pool(timing.pool, None);
             }
-            d.free_command_buffers(self.cmd_pool, &[self.cmd]);
+            let owned = self
+                .core
+                .pools
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&std::thread::current().id())
+                == Some(&self.cmd_pool);
+            if owned {
+                d.free_command_buffers(self.cmd_pool, &[self.cmd]);
+            } else {
+                self.core
+                    .orphans
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((self.cmd_pool, self.cmd));
+            }
         }
         self.core.return_fence(self.fence);
     }

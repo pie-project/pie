@@ -9,6 +9,7 @@ use ipnet::IpNet;
 pub struct InstancePolicy {
     pub(crate) fs: FsPolicy,
     pub(crate) network: NetworkPolicy,
+    pub(crate) memory_limit: usize,
 }
 
 #[cfg(test)]
@@ -20,6 +21,7 @@ impl InstancePolicy {
                 base_dir: PathBuf::new(),
             },
             network: NetworkPolicy::parse(false, &[]).expect("deny-all parse"),
+            memory_limit: usize::MAX,
         }
     }
 }

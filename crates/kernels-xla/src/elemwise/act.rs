@@ -1,6 +1,6 @@
 //! The elementwise ops kernels-wgpu refuses and kernels-metal / kernels-cuda
 //! serve: pointwise activations and binaries, DiT modulation, timestep and
-//! relative-position tables, multi-axis rotary, and the fused embed/scale/add.
+//! relative-position tables and multi-axis rotary.
 //! Each entry's `///` names the reference it follows.
 #![allow(clippy::too_many_arguments)]
 
@@ -8,10 +8,9 @@ use dtype::Dtype;
 
 use crate::cx::{Ctx, Cx, expect};
 use crate::error::{Error, refuse};
-use crate::hlo::{Cmp, Elem, Val};
+use crate::hlo::{Elem, Val};
 use crate::tensor::Tensor;
 
-use super::norm::landed;
 use super::rope::{Turn, positions_f32, turn};
 
 const FLOATS: &[Dtype] = &[Dtype::Bf16, Dtype::F16, Dtype::F32];
@@ -116,13 +115,6 @@ impl Form {
             Form::Scale | Form::TanhGate => 1,
         }
     }
-}
-
-/// The scale-free norm a fused modulation runs first (poem_ir `NormKind`).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum NormKind {
-    Layernorm { eps: f32 },
-    Rmsnorm { head_dim: u32, eps: f32 },
 }
 
 /// Checks a `vectors · width`-wide modulation plane `m` for `rows` rows.
@@ -264,80 +256,6 @@ fn gated_sum(
     let rv = cx.read_f32(r)?;
     let p = cx.mul(gv, yv)?;
     Ok(cx.add(p, rv)?)
-}
-
-fn scale_free(cx: &mut Cx<'_>, op: &'static str, x: Val, norm: NormKind) -> Result<Val, Error> {
-    match norm {
-        NormKind::Layernorm { eps } => super::norm::centered(cx, x, eps),
-        NormKind::Rmsnorm { head_dim, eps } => super::norm::inv_rms_rows(cx, op, x, head_dim, eps),
-    }
-}
-
-/// `normed = norm(x)` (layernorm without affine, or per-head rmsnorm without
-/// scale), then `y = form(normed, m[lane])` reading the stored (rounded)
-/// `normed`. Reference: kernels-cuda's composed path (`layernorm_no_scale`
-/// / `rmsnorm_no_scale`, then `modulate`); the CUDA fused kernel skips the
-/// intermediate rounding. Metal and wgpu refuse the op.
-pub fn norm_modulate(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    norm: NormKind,
-    normed: Tensor,
-    m: Tensor,
-    lane_of_row: Option<Tensor>,
-    form: Form,
-    y: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.norm_modulate";
-    expect(OP, x, FLOATS)?;
-    same_shape(OP, x, normed)?;
-    same_shape(OP, x, y)?;
-    modulation(OP, m, lane_of_row, x, form.vectors())?;
-    ctx.emit(&mut |cx| {
-        let xv = cx.read_f32(x)?;
-        let n = scale_free(cx, OP, xv, norm)?;
-        let n = landed(cx, n, normed.dtype)?;
-        cx.write(normed, n)?;
-        let mv = vectors_of(cx, m, lane_of_row, x.rows)?;
-        let v = bend(cx, n, mv, form)?;
-        cx.write(y, v)
-    })
-}
-
-/// `r_out = g[lane]·y + r`, `normed = norm(r_out)`, `out = form(normed,
-/// m[lane])`, each step reading the previous stored value. Reference:
-/// kernels-cuda's composed path for `GatedResidualNormModulate`.
-pub fn gated_residual_norm_modulate(
-    ctx: &Ctx<'_>,
-    r: Tensor,
-    g: Tensor,
-    y: Tensor,
-    lane_of_row: Option<Tensor>,
-    r_out: Tensor,
-    norm: NormKind,
-    normed: Tensor,
-    m: Tensor,
-    form: Form,
-    out: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.gated_residual_norm_modulate";
-    expect(OP, r, FLOATS)?;
-    for t in [y, r_out, normed, out] {
-        same_shape(OP, r, t)?;
-    }
-    modulation(OP, g, lane_of_row, r, 1)?;
-    modulation(OP, m, lane_of_row, r, form.vectors())?;
-    ctx.emit(&mut |cx| {
-        let v = gated_sum(cx, r, g, y, lane_of_row)?;
-        let v = landed(cx, v, r_out.dtype)?;
-        cx.write(r_out, v)?;
-        let n = scale_free(cx, OP, v, norm)?;
-        let n = landed(cx, n, normed.dtype)?;
-        cx.write(normed, n)?;
-        let mv = vectors_of(cx, m, lane_of_row, r.rows)?;
-        let o = bend(cx, n, mv, form)?;
-        cx.write(out, o)
-    })
 }
 
 // ------------------------------------------------------------------ tables
@@ -661,158 +579,3 @@ pub fn rope_axes(
 }
 
 // ------------------------------------------------------------ embed + scale
-
-/// Rows of `table` by token id, ids outside `[0, vocab)` reading row 0.
-fn embed_rows(
-    cx: &mut Cx<'_>,
-    ids: Tensor,
-    table: Tensor,
-    vocab: u32,
-    rows: u32,
-) -> Result<Val, Error> {
-    let iv = cx.read(ids)?;
-    let n = cx.ty(iv).elements();
-    let iv = cx.reshape(iv, &[n])?;
-    let iv = cx.slice(iv, &[0], &[i64::from(rows)], &[1])?;
-    let zero = cx.like_i(iv, 0);
-    let top = cx.like_i(iv, i64::from(vocab));
-    let ge = cx.compare(Cmp::Ge, iv, zero)?;
-    let lt = cx.compare(Cmp::Lt, iv, top)?;
-    let ok = cx.and(ge, lt)?;
-    let iv = cx.select(ok, iv, zero)?;
-    let tv = cx.read(table)?;
-    Ok(cx.take_rows(tv, iv)?)
-}
-
-/// `e = table[ids]`, `e_scaled = e · bf16(scale)`, both stored; the rounded
-/// `e_scaled` is returned in f32.
-fn scaled_embed(
-    cx: &mut Cx<'_>,
-    ids: Tensor,
-    table: Tensor,
-    vocab: u32,
-    e: Tensor,
-    scale: f32,
-    e_scaled: Tensor,
-) -> Result<Val, Error> {
-    let ev = embed_rows(cx, ids, table, vocab, e.rows)?;
-    cx.write(e, ev)?;
-    let ev = cx.convert(ev, Elem::F32);
-    let es = cx.scale(ev, bf16_scalar(scale))?;
-    let es = landed(cx, es, e_scaled.dtype)?;
-    cx.write(e_scaled, es)?;
-    Ok(es)
-}
-
-fn bf16_scalar(v: f32) -> f64 {
-    f64::from(f32::from_bits(u32::from(crate::hlo::bf16_bits(v)) << 16))
-}
-
-fn embed_checks(
-    op: &'static str,
-    ids: Tensor,
-    table: Tensor,
-    vocab: u32,
-    e: Tensor,
-) -> Result<(), Error> {
-    expect(op, table, &[Dtype::Bf16])?;
-    if ids.dtype != Dtype::I32 || ids.elements() < u64::from(e.rows) {
-        return Err(refuse(op, "one i32 token id per row"));
-    }
-    if vocab == 0 || table.rows < vocab || table.width != e.width {
-        return Err(refuse(
-            op,
-            format!(
-                "a {vocab}-row vocabulary from a {} x {} table into {}-wide rows",
-                table.rows, table.width, e.width
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// `e = table[ids]`; `e_scaled = e · bf16(embed_scale)`; `y += e_scaled`;
-/// `y_scaled = y · bf16(out_scale)`, each stored rounded and read back
-/// rounded. Reference: kernels-cuda `layout::embed_scale_add` (the engine
-/// reaches it as `elemwise::act::embed_scale_add` here).
-pub fn embed_scale_add(
-    ctx: &Ctx<'_>,
-    ids: Tensor,
-    table: Tensor,
-    vocab: u32,
-    e: Tensor,
-    embed_scale: f32,
-    e_scaled: Tensor,
-    y: Tensor,
-    out_scale: f32,
-    y_scaled: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.embed_scale_add";
-    embed_checks(OP, ids, table, vocab, e)?;
-    for t in [e_scaled, y, y_scaled] {
-        same_shape(OP, e, t)?;
-    }
-    ctx.emit(&mut |cx| {
-        let es = scaled_embed(cx, ids, table, vocab, e, embed_scale, e_scaled)?;
-        let yv = cx.read_f32(y)?;
-        let yv = cx.add(yv, es)?;
-        let yv = landed(cx, yv, y.dtype)?;
-        cx.write(y, yv)?;
-        let ys = cx.scale(yv, bf16_scalar(out_scale))?;
-        cx.write(y_scaled, ys)
-    })
-}
-
-/// As [`embed_scale_add`], the addend being layer `layer`'s `width`-wide
-/// column slice of `stacked`, landing in `y_out`. Reference: kernels-cuda
-/// `layout::embed_scale_add_select`.
-pub fn embed_scale_add_select(
-    ctx: &Ctx<'_>,
-    ids: Tensor,
-    table: Tensor,
-    vocab: u32,
-    e: Tensor,
-    embed_scale: f32,
-    e_scaled: Tensor,
-    stacked: Tensor,
-    layer: u32,
-    width: u32,
-    y_out: Tensor,
-    out_scale: f32,
-    y_scaled: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.embed_scale_add_select";
-    embed_checks(OP, ids, table, vocab, e)?;
-    for t in [e_scaled, y_out, y_scaled] {
-        same_shape(OP, e, t)?;
-    }
-    let col = u64::from(layer) * u64::from(width);
-    if width != y_out.width
-        || col + u64::from(width) > u64::from(stacked.width)
-        || stacked.rows < y_out.rows
-    {
-        return Err(refuse(
-            OP,
-            format!(
-                "layer {layer}'s {width}-wide slice does not sit in a {}-wide stacked row landing a {}-wide row",
-                stacked.width, y_out.width
-            ),
-        ));
-    }
-    let col = col as i64;
-    ctx.emit(&mut |cx| {
-        let es = scaled_embed(cx, ids, table, vocab, e, embed_scale, e_scaled)?;
-        let sv = cx.read_f32(stacked)?;
-        let sv = cx.slice(
-            sv,
-            &[0, col],
-            &[i64::from(y_out.rows), col + i64::from(width)],
-            &[1, 1],
-        )?;
-        let yv = cx.add(sv, es)?;
-        let yv = landed(cx, yv, y_out.dtype)?;
-        cx.write(y_out, yv)?;
-        let ys = cx.scale(yv, bf16_scalar(out_scale))?;
-        cx.write(y_scaled, ys)
-    })
-}

@@ -183,7 +183,7 @@ struct Input {
     ///
     /// The default is `Qwen/Qwen3.5-0.8B`: `Model::d0_8b` in
     /// `crates/models/src/qwen_3/model.rs` is `layers: 24, attn_every: 4`, and
-    /// the SKU is hybrid — `attn_at(l) = l % attn_every == attn_every - 1`
+    /// the deployment is hybrid — `attn_at(l) = l % attn_every == attn_every - 1`
     /// puts an attention mixer on 6 of the 24 layers and a GDN mixer on the
     /// other 18. Only the attention layers export a plane.
     #[serde(default = "default_layers")]

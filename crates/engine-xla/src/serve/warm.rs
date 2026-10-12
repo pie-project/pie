@@ -19,7 +19,7 @@
 //! text classes; they share pages, since what they write is never read. The
 //! slots they touch are opened again afterwards.
 
-use poem_ir::{ClassifyFn, Request};
+use poem_ir::Request;
 
 use super::{Lane, PAD_ROOM, PAGE_FLOOR, Seated, Shell};
 use crate::error::Result;
@@ -35,7 +35,10 @@ struct Want {
 
 impl Shell {
     /// Fires the warm ladder; answers how many fires ran.
-    pub fn prewarm(&mut self, classify: ClassifyFn) -> Result<usize> {
+    pub fn prewarm(&mut self) -> Result<usize> {
+        let facts = &self.trace().facts;
+        let decode = facts.word(&Request::new(1, false));
+        let prefill = facts.word(&Request::new(2, false));
         let classes = &self.compiled.classes;
         let plain = |shell: &Shell, word: u64| {
             classes.class_of(word & classes.mask).is_some_and(|class| {
@@ -44,8 +47,6 @@ impl Shell {
                     && !shell.capturing.contains(class)
             })
         };
-        let decode = classify(&Request::new(1, false));
-        let prefill = classify(&Request::new(2, false));
         if !plain(self, decode) || !plain(self, prefill) || self.patch_seat.is_some() {
             return Ok(0);
         }

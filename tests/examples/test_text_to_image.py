@@ -33,7 +33,7 @@ exercise the door name their config:
         --config ~/.pie/config.minidit.toml --expect-refusal
 
 where the config's `[model] model` is the imported `.zt` (`pie model import
-<diffusers folder> --sku flux2-klein-4b-bf16-kv-bf16 --out ...`). Unlike the
+<diffusers folder> --deployment flux2-klein-4b-bf16-kv-bf16 --out ...`). Unlike the
 curated suites this one does not use the embedded `pie.server` wheel: what is
 under test includes `pie run -o`, so it runs the binary.
 

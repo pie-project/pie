@@ -20,7 +20,7 @@ struct Cfg {
   lanes    : u32,
   pad      : u32,
 };
-@group(0) @binding(2) var<uniform> cfg : Cfg;
+@group(0) @binding(2) var<storage, read> cfg : Cfg;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
@@ -42,14 +42,20 @@ struct Cfg {
     pad: u32,
 }
 
+/// Config slots, one per widen still on the queue: a frame that runs ahead
+/// keeps its own offsets while the next frame records.
+const SLOTS: u64 = 16;
+
+/// Apart by any device's storage-buffer offset alignment.
+const SLOT_BYTES: u64 = 256;
+
 pub struct Widen {
     core: Arc<Core>,
     set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
-    pool: vk::DescriptorPool,
-    set: vk::DescriptorSet,
     cfg: Buffer,
+    next: Cell<u64>,
 
     armed: Cell<bool>,
 }
@@ -68,13 +74,12 @@ impl Widen {
                 why: format!("the readout widen does not lower: {why}"),
             })?;
         let core = device.core().clone();
-        let mut cfg = Buffer::with(device, size_of::<Cfg>() as u64, Memory::Host)?;
-        cfg.write(0, &[0u8; size_of::<Cfg>()])?;
+        let cfg = Buffer::with(device, SLOTS * SLOT_BYTES, Memory::Host)?;
 
         let bindings = [
             binding(0, vk::DescriptorType::STORAGE_BUFFER),
             binding(1, vk::DescriptorType::STORAGE_BUFFER),
-            binding(2, vk::DescriptorType::UNIFORM_BUFFER),
+            binding(2, vk::DescriptorType::STORAGE_BUFFER),
         ];
         let d = &core.device;
         unsafe {
@@ -107,39 +112,13 @@ impl Widen {
             d.destroy_shader_module(module, None);
             let pipeline = built.map_err(|(_, e)| core.fault("vkCreateComputePipelines", e))?[0];
 
-            let sizes = [
-                vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(2),
-                vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                    .descriptor_count(1),
-            ];
-            let pool = d
-                .create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(1)
-                        .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-                        .pool_sizes(&sizes),
-                    None,
-                )
-                .map_err(|e| core.fault("vkCreateDescriptorPool", e))?;
-            let set = d
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(pool)
-                        .set_layouts(&set_layouts),
-                )
-                .map_err(|e| core.fault("vkAllocateDescriptorSets", e))?[0];
-
             Ok(Widen {
                 core,
                 set_layout,
                 layout,
                 pipeline,
-                pool,
-                set,
                 cfg,
+                next: Cell::new(0),
                 armed: Cell::new(false),
             })
         }
@@ -171,8 +150,10 @@ impl Widen {
                 ),
             });
         }
+        let slot = self.next.get();
+        self.next.set((slot + 1) % SLOTS);
         self.cfg.write_shared(
-            0,
+            slot * SLOT_BYTES,
             &config_bytes(Cfg {
                 src_word: u32::try_from(src_at / 4).unwrap_or(u32::MAX),
                 dst_word: u32::try_from(dst_at / 4).unwrap_or(u32::MAX),
@@ -182,24 +163,24 @@ impl Widen {
         )?;
         self.armed.set(true);
 
+        let set = frame.descriptor_set(self.set_layout)?;
+        frame.retain(self.cfg.slab());
         let d = &self.core.device;
         unsafe {
             let infos = [
                 [buffer_info(src)],
                 [buffer_info(dst)],
-                [buffer_info(&self.cfg)],
-            ];
-            let kinds = [
-                vk::DescriptorType::STORAGE_BUFFER,
-                vk::DescriptorType::STORAGE_BUFFER,
-                vk::DescriptorType::UNIFORM_BUFFER,
+                [vk::DescriptorBufferInfo::default()
+                    .buffer(self.cfg.slab().buffer)
+                    .offset(slot * SLOT_BYTES)
+                    .range(size_of::<Cfg>() as u64)],
             ];
             let writes: Vec<vk::WriteDescriptorSet> = (0..3)
                 .map(|i| {
                     vk::WriteDescriptorSet::default()
-                        .dst_set(self.set)
+                        .dst_set(set)
                         .dst_binding(i as u32)
-                        .descriptor_type(kinds[i])
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                         .buffer_info(&infos[i])
                 })
                 .collect();
@@ -207,12 +188,20 @@ impl Widen {
 
             let cmd = frame.cmd();
 
+            // The readout may still be landing: a forward submitted ahead of
+            // this frame on the queue writes it from its shaders.
             let before = vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::HOST_WRITE)
+                .src_access_mask(
+                    vk::AccessFlags::TRANSFER_WRITE
+                        | vk::AccessFlags::HOST_WRITE
+                        | vk::AccessFlags::SHADER_WRITE,
+                )
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
             d.cmd_pipeline_barrier(
                 cmd,
-                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::TRANSFER
+                    | vk::PipelineStageFlags::HOST
+                    | vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
                 &[before],
@@ -225,7 +214,7 @@ impl Widen {
                 vk::PipelineBindPoint::COMPUTE,
                 self.layout,
                 0,
-                &[self.set],
+                &[set],
                 &[],
             );
             d.cmd_dispatch(cmd, lanes.div_ceil(WG).max(1), 1, 1);
@@ -255,7 +244,6 @@ impl Drop for Widen {
     fn drop(&mut self) {
         unsafe {
             let d = &self.core.device;
-            d.destroy_descriptor_pool(self.pool, None);
             d.destroy_pipeline(self.pipeline, None);
             d.destroy_pipeline_layout(self.layout, None);
             d.destroy_descriptor_set_layout(self.set_layout, None);

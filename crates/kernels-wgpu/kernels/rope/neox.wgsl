@@ -17,9 +17,9 @@ struct Params {
 }
 //#else
 struct Params {
-    scale: f32,
     base: f32,
     head_dim: i32,
+    span: i32,
     pair_half: i32,
     heads: i32,
 }
@@ -92,23 +92,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         rotate_word(i1, i1 + pair_half, theta0, theta1);
     }
 //#else
-//#if defined(PIE_PROP)
-    let d0 = 2.0 * f32(i) / f32(head_dim);
-    let d1 = 2.0 * f32(i + 1u) / f32(head_dim);
-    let i2_off = head_dim / 2u;
-//#else
-    let d0 = f32(i) / f32(pair_half);
-    let d1 = f32(i + 1u) / f32(pair_half);
-    let i2_off = pair_half;
-//#endif
-    let pos = params.scale * f32(position[row]);
-    let theta0 = pos * exp2(-d0 * params.base);
-    let theta1 = pos * exp2(-d1 * params.base);
+    // pair i is (i, i + span) at theta^(-i/span): span is rotary/2 for a
+    // plain rotary, head_dim/2 for a proportional one
+    let span = u32(max(params.span, 1));
+    let pos = f32(position[row]);
+    let theta0 = pos * exp2(-f32(i) / f32(span) * params.base);
+    let theta1 = pos * exp2(-f32(i + 1u) / f32(span) * params.base);
     let i1 = row_base + h * head_dim + i;
-    rotate_word(i1, i1 + i2_off, theta0, theta1);
+    rotate_word(i1, i1 + span, theta0, theta1);
 //#endif
 }
 
 // pie:instantiate neox_mb_bf16 PIE_GROUP_X=64
-// pie:instantiate neox_prop_mb_bf16 PIE_GROUP_X=64 PIE_PROP=1
 // pie:instantiate neox_last_mb_bf16 PIE_GROUP_X=64 PIE_LAST=1

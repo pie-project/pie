@@ -12,9 +12,18 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same branch or PR supersedes the run in flight: a burst
+# of merges to main tests (and wakes the GPU pod for) only the last of them.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   NPM_CONFIG_FUND: 'false'
   NPM_CONFIG_AUDIT: 'false'
+  # Line tables keep backtraces readable; full debug info overflows the
+  # runners' disks on a workspace build.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   workspace-lint:
@@ -25,45 +34,88 @@ jobs:
       - uses: ./.github/actions/toolchain
         with:
           cache-key: ${{ runner.os }}-lint
-      # engine-cuda and kernels-cuda are not rustfmt-clean; engine-cuda has
-      # no default engine feature and is tested by `workspace-test`; the two
-      # server crates default to CUDA and lint without an engine below.
+      # The two server crates default to CUDA and lint without an engine
+      # below; the CUDA crates lint both without and with their device half,
+      # which builds without a toolkit.
       - name: cargo fmt
-        run: cargo fmt --check $(bash scripts/ci/members.sh engine-cuda kernels-cuda)
+        run: cargo fmt --all --check
       - name: cargo clippy
-        run: cargo clippy --no-deps --all-targets $(bash scripts/ci/members.sh engine-cuda pie-server-node pie-server-py) -- -D warnings
+        run: cargo clippy --no-deps --all-targets $(bash scripts/ci/members.sh pie-server-node pie-server-py) -- -D warnings
+      - name: cargo clippy (CUDA crates, cuda feature)
+        run: cargo clippy --no-deps --all-targets -p engine-cuda -p kernels-cuda --features engine-cuda/cuda,kernels-cuda/cuda -- -D warnings
       - name: cargo clippy (servers, no engine)
         run: cargo clippy --no-deps --all-targets -p pie-server-node -p pie-server-py --no-default-features -- -D warnings
-      # engine-metal's device half is `cfg(target_vendor = "apple")`; clippy
-      # type-checks it for that target without a Mac.
-      - name: cargo clippy (engine-metal, Apple half)
-        run: cargo clippy --no-deps --all-targets -p engine-metal --target aarch64-apple-darwin -- -D warnings
+      # The worker an app embeds: no gateway or controller links.
+      - name: cargo clippy (worker, embedded only)
+        run: cargo clippy --no-deps --all-targets -p worker --no-default-features -- -D warnings
+
+  apple:
+    name: "apple: engine-metal clippy + libpie for iOS"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+        with:
+          cache-key: ${{ runner.os }}-apple
+      - run: rustup target add aarch64-apple-ios
+      # engine-metal's device half is `cfg(target_vendor = "apple")`, and its
+      # C dependencies build only against an Apple SDK.
+      - name: cargo clippy (engine-metal)
+        run: cargo clippy --no-deps --all-targets -p engine-metal -- -D warnings
+      - name: cargo check (libpie for iOS)
+        run: cargo check -p pie-c --target aarch64-apple-ios
 
   workspace-test:
     name: "workspace: build + test"
     runs-on: ubuntu-latest
+    # Every test binary carries its own copy of the workspace's debug info,
+    # which the runner's disk cannot hold (even line tables alone: 5.1 GB for
+    # pie-poem-compiler's tests). Without it the whole all-targets build is
+    # 13 GB; a panic's backtrace still names its functions.
+    # The catalog-wide tests trace and bake every deployment, which runs about
+    # five times faster at opt-level 1 for a little more compiling. Debug
+    # assertions stay on.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_DEV_OPT_LEVEL: "1"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
+      # A whole-workspace build needs more disk than the image leaves free.
+      - name: free disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build python3-yaml
       - uses: ./.github/actions/toolchain
         with:
-          cache-key: ${{ runner.os }}-verify
+          cache-key: ${{ runner.os }}-verify-o1
+      - uses: taiki-e/install-action@nextest
       # `--all-targets` so benches and `tests/*.rs` that stopped compiling
       # are red here rather than nowhere.
       - name: cargo build (all targets)
         run: cargo build --workspace --all-targets --exclude pie-server-py --exclude pie-server-node --exclude engine-cuda
-      # worker's binary-facing tests need an engine feature; its library
-      # tests do not.
+      # nextest runs the test binaries side by side, where `cargo test` runs
+      # them one after another. It tests the package set the build above
+      # built, so it links what is already compiled rather than unifying
+      # features anew. inferlet holds the workspace's one doctest.
       - name: cargo test
         run: |
-          cargo test --workspace --exclude pie-server-py --exclude pie-server-node --exclude worker --exclude engine-cuda
-          cargo test -p worker --lib
+          cargo nextest run --workspace --exclude pie-server-py --exclude pie-server-node --exclude engine-cuda --no-fail-fast
+          cargo test --doc -p inferlet
+      # The C library from C: its header compiles warning-free, its version
+      # matches the library's, and a refused boot reports why.
+      - name: libpie from C
+        run: |
+          cc -Wall -Wextra -Werror packages/c/test/smoke.c -Ipackages/c/include -Ltarget/debug -lpie -o target/pie-c-smoke
+          LD_LIBRARY_PATH=target/debug target/pie-c-smoke
       # Both halves of engine-cuda build without a toolkit: cudarc loads the
-      # driver at run time and the device tests are `#[ignore]`d.
+      # driver at run time and the device tests skip without a card. Without
+      # the feature only the library's own tests differ (the runtimeless
+      # paths); the integration tests are the same, so they only compile.
       - name: cargo test (engine-cuda, with and without the cuda feature)
         run: |
-          cargo test -p engine-cuda --features cuda
-          cargo test -p engine-cuda
+          cargo nextest run -p engine-cuda --features cuda --no-fail-fast
+          cargo nextest run -p engine-cuda --lib
+          cargo check -p engine-cuda --tests
       - name: audits
         run: |
           python3 scripts/mod-reachability-audit.py
@@ -97,21 +149,21 @@ jobs:
       - uses: ./.github/actions/toolchain
         with:
           cache-key: ${{ runner.os }}-servers
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: node addon
-        working-directory: javascript
+        working-directory: packages/javascript
         run: |
           npm ci --include=dev --ignore-scripts
           bash server/build.sh dev --no-default-features
           npm test -w server
           npm pack --dry-run -w server
       - name: python wheel
-        working-directory: python/server
+        working-directory: packages/python/server
         run: |
           python -m pip install maturin
           maturin build --no-default-features --out dist
@@ -129,7 +181,7 @@ jobs:
       - uses: ./.github/actions/toolchain
         with:
           triple: wasm32-wasip2
-      - uses: actions/cache@v5
+      - uses: ./.github/actions/cache
         with:
           path: |
             ~/.cargo/registry
@@ -146,25 +198,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
       # The unit suites run against stub WIT bindings; the interface gate
       # and the shared goldens tie them to the real world.
       - run: |
           bash scripts/check-inferlet-interfaces.sh
-          cmp crates/eta-dsl/tests/goldens/inferlet_containers.txt python/inferlet/tests/goldens/eta_containers.txt
+          cmp crates/eta-dsl/tests/goldens/inferlet_containers.txt packages/python/inferlet/tests/goldens/eta_containers.txt
       - name: python
         run: |
-          python -m pip install pytest -e python/client
-          PYTHONPATH=python/inferlet/src python -m pytest -q python/inferlet/tests
-          python -m pytest -q python/client/tests
+          python -m pip install pytest -e packages/python/client
+          PYTHONPATH=packages/python/inferlet/src python -m pytest -q packages/python/inferlet/tests
+          python -m pytest -q packages/python/client/tests
           python -m pytest -q scripts/bench/tests
       - name: javascript
-        working-directory: javascript
+        working-directory: packages/javascript
         run: |
           npm ci --include=dev --ignore-scripts
           npm run generate-bindings -w inferlet
@@ -176,20 +228,42 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - uses: astral-sh/setup-uv@v7
       - run: uv tool install componentize-py
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
       - run: bash scripts/build-languages.sh target/languages
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: languages
           path: target/languages/pie-language-*.tar.gz
           if-no-files-found: error
+
+  android:
+    name: "android: core (arm64) + Kotlin packages"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+        with:
+          features: vulkan
+          cache-key: ${{ runner.os }}-android
+      - run: rustup target add aarch64-linux-android
+      - run: cargo install cargo-ndk --locked
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+      # The runner image carries the NDK (ANDROID_NDK_HOME) and the SDK.
+      - name: cargo clippy (Android)
+        run: cargo ndk -t arm64-v8a -P 29 clippy --no-deps -p pie-kotlin-core -- -D warnings
+      - run: bash packages/kotlin/build-native.sh
+      - run: ./gradlew test assembleRelease
+        working-directory: packages/kotlin
 
   browser:
     name: "browser: wasm32 lint → Tint → serve in Chromium"
@@ -197,17 +271,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: languages
           path: ${{ runner.temp }}/languages
       - uses: ./.github/actions/toolchain
         with:
           triple: wasm32-unknown-unknown
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
-      - uses: actions/cache@v5
+      - uses: ./.github/actions/cache
         with:
           path: |
             ~/.cargo/registry
@@ -217,13 +291,13 @@ jobs:
             target-wasm
           key: ${{ runner.os }}-browser-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-browser-
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: ~/qwen35-tokenizer
           key: qwen35-tokenizer-v1
       - run: bash scripts/ci/tokenizer.sh ~/qwen35-tokenizer
       - run: npm ci --include=dev --ignore-scripts
-        working-directory: javascript
+        working-directory: packages/javascript
       - run: |
           npm install --prefix tests/browser/tools playwright@1.63.0
           npx --prefix tests/browser/tools playwright install --with-deps chromium
@@ -242,14 +316,17 @@ jobs:
           [[ -x ~/.cargo/bin/wasm-bindgen ]] || cargo install wasm-bindgen-cli --locked --version "$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')"
           cargo build --release -p pie --features wgpu
           python3 scripts/tiny_qwen35.py "$RUNNER_TEMP/snapshot" --tokenizer ~/qwen35-tokenizer
-          PIE_HOME="$RUNNER_TEMP/home" target/release/pie model import "$RUNNER_TEMP/snapshot" --sku qwen35-tiny-u4g64-kv-bf16 --keep-source
-          mkdir -p tests/browser/models && cp "$(find "$RUNNER_TEMP/home/models" -name '*.wgpu.zt' | head -1)" tests/browser/models/tiny.wgpu.zt
-          ./javascript/server-web/build.sh release
+          PIE_HOME="$RUNNER_TEMP/home" target/release/pie model import "$RUNNER_TEMP/snapshot" --deployment qwen35-tiny-u4g64-kv-bf16 --keep-source
+          mkdir -p tests/browser/models && cp "$(find "$RUNNER_TEMP/home/artifacts" -name '*.wgpu.zt' | head -1)" tests/browser/models/tiny.wgpu.zt
+          ./packages/javascript/server-web/build.sh release
           for l in python javascript; do tar xzf "$RUNNER_TEMP/languages/pie-language-$l.tar.gz" -C "$RUNNER_TEMP/home"; done
           PIE_HOME="$RUNNER_TEMP/home" ./tests/browser/tools/inferlets.sh
-          node tests/browser/tools/headless.mjs . "tests/browser/transport.html?n=20&model=models/tiny.wgpu.zt" --timeout 300000
-          node tests/browser/tools/headless.mjs . "tests/browser/index.html?auto&max_tokens=4&model=models/tiny.wgpu.zt&config=max_total_pages%20%3D%20512,max_forward_tokens%20%3D%201024,max_forward_requests%20%3D%208,max_state_slots%20%3D%2016" --timeout 900000
-          node tests/browser/tools/headless.mjs . "tests/browser/server.html?model=models/tiny.wgpu.zt" --timeout 900000
+          # The pages are independent, and each spends minutes in SwiftShader
+          # on one core: they open side by side.
+          node tests/browser/tools/headless.mjs . --timeout 900000 \
+            "tests/browser/transport.html?n=20&model=models/tiny.wgpu.zt" \
+            "tests/browser/index.html?auto&max_tokens=4&model=models/tiny.wgpu.zt&config=max_total_pages%20%3D%20512,max_forward_tokens%20%3D%201024,max_forward_requests%20%3D%208,max_state_slots%20%3D%2016" \
+            "tests/browser/server.html?model=models/tiny.wgpu.zt"
         env:
           PIE_CHROME_ARGS: --use-webgpu-adapter=swiftshader --enable-unsafe-swiftshader
 
@@ -257,28 +334,29 @@ jobs:
     name: "wgpu: serve on lavapipe"
     needs: languages
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
         with:
           triple: wasm32-wasip2
           cache-key: ${{ runner.os }}-lavapipe-wgpu
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - uses: astral-sh/setup-uv@v7
       - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: ~/qwen35-tokenizer
           key: qwen35-tokenizer-v1
       - run: bash scripts/ci/tokenizer.sh ~/qwen35-tokenizer
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: languages
           path: ${{ runner.temp }}/languages
       - run: npm ci --include=dev --ignore-scripts
-        working-directory: javascript
+        working-directory: packages/javascript
       - run: PIE_TOKENIZER_DIR=$HOME/qwen35-tokenizer bash scripts/ci/lavapipe.sh
         env:
           PIE_ENGINE: wgpu
@@ -287,6 +365,7 @@ jobs:
   vulkan-serve:
     name: "vulkan: serve on lavapipe"
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
@@ -294,17 +373,17 @@ jobs:
           triple: wasm32-wasip2
           features: vulkan
           cache-key: ${{ runner.os }}-lavapipe-vulkan
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: ~/qwen35-tokenizer
           key: qwen35-tokenizer-v1
       - run: bash scripts/ci/tokenizer.sh ~/qwen35-tokenizer
       - run: npm ci --include=dev --ignore-scripts
-        working-directory: javascript
+        working-directory: packages/javascript
       - run: PIE_TOKENIZER_DIR=$HOME/qwen35-tokenizer bash scripts/ci/lavapipe.sh
         env:
           PIE_ENGINE: vulkan
@@ -329,11 +408,20 @@ jobs:
     needs: cuda-up
     runs-on: [self-hosted, cuda]
     timeout-minutes: 90
+    # The pod is billed by the minute: its catalog-wide tests and the e2e
+    # `pie` run optimized, as the workspace's do.
+    env:
+      CARGO_PROFILE_DEV_OPT_LEVEL: "1"
     steps:
       - uses: actions/checkout@v7
       - run: nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv && df -h /workspace
       - run: cargo test -p engine-cuda --features cuda --no-run --all-targets
-      - run: cargo test -p engine-cuda --features cuda -- --ignored
+      # The device tests: kernels-cuda's compile only under its cuda feature,
+      # and engine-cuda's skip on a machine without a card. The ignored ones
+      # need imported artifacts and golden dumps this pod does not hold.
+      # One test at a time, as when each was its own binary: a few toggle an
+      # engine knob through the environment, and they share one card.
+      - run: cargo test --no-fail-fast -p engine-cuda -p kernels-cuda --features engine-cuda/cuda,kernels-cuda/cuda -- --test-threads=1
       - run: bash scripts/ci/cuda-e2e.sh
       - name: no CUDA shared library is linked
         run: |

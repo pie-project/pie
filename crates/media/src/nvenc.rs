@@ -528,7 +528,7 @@ pub fn encode_h264(
     fps: f32,
     device: usize,
 ) -> Result<Vec<Vec<u8>>, String> {
-    if width % 2 != 0 || height % 2 != 0 {
+    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
         return Err(format!(
             "H.264 4:2:0 needs even dimensions; this handle is {width}x{height}"
         ));

@@ -148,6 +148,7 @@ METAL_FUNC void qmv_rows_impl(
     const device T* x,
     device T* y,
     const constant int& in_vec_size,
+    const constant int& ld,
     const constant int& out_vec_size,
     const constant int& row_count,
     uint3 tid,
@@ -177,8 +178,8 @@ METAL_FUNC void qmv_rows_impl(
     }
   }
 
-  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
-  const int in_vec_size_g = in_vec_size / group_size;
+  const int in_vec_size_w = ld * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = ld / group_size;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
   const int row0 = int(tid.x) * R;
@@ -260,11 +261,12 @@ template <typename T, int group_size, int bits, int rows_per_group, int packs_pe
     const constant int& in_vec_size  [[buffer(5)]],
     const constant int& out_vec_size [[buffer(6)]],
     const constant int& row_count    [[buffer(7)]],
+    const constant int& ld           [[buffer(8)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
     uint simd_lid   [[thread_index_in_simdgroup]]) {
   qmv_rows_impl<T, group_size, bits, rows_per_group, packs_per_thread>(
-      w, scales, biases, x, y, in_vec_size, out_vec_size, row_count, tid,
+      w, scales, biases, x, y, in_vec_size, ld, out_vec_size, row_count, tid,
       simd_gid, simd_lid);
 }
 
@@ -273,4 +275,4 @@ template <typename T, int group_size, int bits, int rows_per_group, int packs_pe
   [[kernel]] void affine_qmv_rows<bfloat, gs, b, r, p>(                        \
       const device uint32_t*, const device bfloat*, const device bfloat*,      \
       const device bfloat*, device bfloat*, const constant int&,               \
-      const constant int&, const constant int&, uint3, uint, uint);
+      const constant int&, const constant int&, const constant int&, uint3, uint, uint);

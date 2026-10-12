@@ -23,20 +23,20 @@ pub enum WeightRow {
 #[derive(Clone, Debug, Default)]
 pub struct WeightTable(pub Vec<Option<WeightRow>>);
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Hash)]
 pub struct SlotTable(pub Vec<Option<Tensor>>);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Hash)]
 pub enum CachePool {
     Kv(KvPool),
 
     Recurrent(RecurrentPool),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Hash)]
 pub struct CacheTable(pub Vec<CachePool>);
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Hash)]
 pub struct CacheGeometry {
     pub indptr: Option<Tensor>,
 
@@ -93,9 +93,7 @@ pub struct FireBindings {
 
     pub patch_positions: Option<Tensor>,
 
-    pub patch_embed_rows: Option<Tensor>,
-
-    pub patch_embed_weights: Option<Tensor>,
+    pub patch_grids: Option<Tensor>,
 
     pub mrope_positions: Option<Tensor>,
 
@@ -155,6 +153,10 @@ pub struct Run<'c> {
     copy: CopyPlan,
 
     scratch: &'c Scratch,
+
+    /// The layer whose work the frame holds unsubmitted, when the step is
+    /// submitted a layer at a time.
+    split: Option<Option<u32>>,
 }
 
 #[derive(Default)]
@@ -203,7 +205,27 @@ impl<'c> Run<'c> {
             place,
             copy: CopyPlan::default(),
             scratch,
+            split: None,
         }
+    }
+
+    /// Submits the frame each time a node of a new layer has run.
+    pub fn flush_between_layers(&mut self) {
+        self.split = Some(None);
+    }
+
+    /// After `node` runs: submits what the frame holds once a new layer
+    /// starts. A failed submit faults the frame, which its commit reports.
+    pub(crate) fn split_at(&mut self, node: &Node) {
+        let (Some(held), Some(layer)) = (self.split.as_mut(), node.layer) else {
+            return;
+        };
+        if held.is_some_and(|held| held != layer)
+            && let Err(fault) = crate::probe::flush()
+        {
+            tracing::warn!(%fault, "submitting a layer of a split step");
+        }
+        *held = Some(layer);
     }
 
     pub(crate) fn window(&self) -> &'c Window {
@@ -479,29 +501,15 @@ impl<'c> Run<'c> {
                     )
                 })
             }
-            Def::Input(RuntimeInput::PatchEmbedRows) => {
-                self.fire.patch_embed_rows.unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads this fire's position-table taps, and this load \
-                         stages none — the plan reads the table on its native grid"
-                    )
-                })
-            }
+            Def::Input(RuntimeInput::ImageGrids) => self.fire.patch_grids.unwrap_or_else(|| {
+                panic!("value {at} reads this fire's image grids, which no lane of it submitted")
+            }),
             Def::Input(RuntimeInput::SelfCondRows | RuntimeInput::SelfCondWeights) => {
                 panic!(
                     "value {at} reads a self-conditioning input, which this shell stages none \
                      of; the load refuses such a plan"
                 )
             }
-            Def::Input(RuntimeInput::PatchEmbedWeights) => {
-                self.fire.patch_embed_weights.unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads this fire's interpolation weights, and this load \
-                         stages none — the plan reads the table on its native grid"
-                    )
-                })
-            }
-
             Def::Input(RuntimeInput::MropePositions) => {
                 self.fire.mrope_positions.unwrap_or_else(|| {
                     panic!(

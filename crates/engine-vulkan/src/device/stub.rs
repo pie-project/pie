@@ -423,8 +423,4 @@ impl Pipelines {
     ) -> Result<std::sync::Arc<Pipeline>> {
         Err(Fault::Deviceless)
     }
-
-    pub fn persist(&self) -> Result<()> {
-        Ok(())
-    }
 }

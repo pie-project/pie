@@ -6,7 +6,7 @@ use eta_exec::{Extents, OpParams, ValueDesc, describe, layout};
 
 use crate::device::Context;
 use crate::device::alloc::{Buffer, Memory};
-use crate::device::ctx::{Core, Frame};
+use crate::device::ctx::{Core, Frame, Pending};
 use crate::error::{Fault, Result};
 
 const DESC_WORDS: usize = 9;
@@ -53,11 +53,42 @@ fn as_bytes<T: Copy>(items: &[T]) -> Vec<u8> {
     out
 }
 
-struct Stage {
+/// A stage's pipelines, which follow from its SPIR-V alone: built once per
+/// distinct stage and shared by every session that runs it, since a mobile
+/// driver takes seconds to build a sampler's worth of them.
+pub struct Built {
+    core: Arc<Core>,
     layout: vk::PipelineLayout,
     set_layout: vk::DescriptorSetLayout,
-
     pipelines: Vec<vk::Pipeline>,
+}
+
+impl Drop for Built {
+    fn drop(&mut self) {
+        let d = &self.core.device;
+        unsafe {
+            for &pipeline in &self.pipelines {
+                d.destroy_pipeline(pipeline, None);
+            }
+            d.destroy_pipeline_layout(self.layout, None);
+            d.destroy_descriptor_set_layout(self.set_layout, None);
+        }
+    }
+}
+
+/// Built stages by the hash of their SPIR-V and entry points.
+pub type BuiltStages = std::collections::HashMap<u64, Arc<Built>>;
+
+fn stage_key(lowered: &crate::guest::Lowered) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    lowered.words.hash(&mut hasher);
+    lowered.entries.hash(&mut hasher);
+    hasher.finish()
+}
+
+struct Stage {
+    built: Arc<Built>,
 
     groups: u32,
     set: vk::DescriptorSet,
@@ -85,6 +116,15 @@ pub struct Session {
     status: Buffer,
     stages: Vec<Stage>,
     pool: vk::DescriptorPool,
+
+    /// The cells of channels the device keeps between fires, by channel.
+    kept: std::collections::HashMap<u32, Buffer>,
+
+    /// Passes submitted and not yet waited on, oldest first.
+    airborne: std::collections::VecDeque<Pending>,
+    /// Read-back buffers a landed pass has handed back, one stage's landing
+    /// wide each.
+    landings: Arc<std::sync::Mutex<Vec<Buffer>>>,
 }
 
 impl std::fmt::Debug for Session {
@@ -105,6 +145,7 @@ impl Session {
         plans: &[LaunchStagePlan],
         code: &[crate::guest::Lowered],
         extents: &Extents,
+        built: &mut BuiltStages,
     ) -> Result<Session> {
         if plans.is_empty() {
             return Err(Fault::Program {
@@ -129,7 +170,15 @@ impl Session {
         let core = device.core().clone();
         let mut stages = Vec::with_capacity(plans.len());
         for (plan, lowered) in plans.iter().zip(code) {
-            stages.push(build_stage(device, &core, plan, lowered, extents)?);
+            let pipelines = match built.get(&stage_key(lowered)) {
+                Some(pipelines) => Arc::clone(pipelines),
+                None => {
+                    let pipelines = Arc::new(build_pipelines(device, lowered)?);
+                    built.insert(stage_key(lowered), Arc::clone(&pipelines));
+                    pipelines
+                }
+            };
+            stages.push(build_stage(device, plan, lowered, extents, pipelines)?);
         }
 
         let sizes = [
@@ -156,6 +205,9 @@ impl Session {
             status,
             stages,
             pool,
+            kept: std::collections::HashMap::new(),
+            airborne: std::collections::VecDeque::new(),
+            landings: Arc::default(),
         };
         session.bind_sets()?;
         Ok(session)
@@ -165,7 +217,7 @@ impl Session {
         let d = &self.core.device;
         for at in 0..self.stages.len() {
             let set = unsafe {
-                let layouts = [self.stages[at].set_layout];
+                let layouts = [self.stages[at].built.set_layout];
                 d.allocate_descriptor_sets(
                     &vk::DescriptorSetAllocateInfo::default()
                         .descriptor_pool(self.pool)
@@ -244,6 +296,8 @@ impl Session {
                 ),
             });
         }
+        // A pass still on the queue may not have copied its own roots out.
+        self.settle()?;
         let stage = &mut self.stages[stage];
         stage.staging.write(at, bytes)?;
         stage.dirty.push((at, len));
@@ -295,6 +349,123 @@ impl Session {
         frame.copy(&stage.heap, at, &stage.landing, at, len)
     }
 
+    /// Copies `value` into the device's cell for `channel`, in place of a
+    /// read back: the next fire's take of the channel restores it.
+    pub fn keep(
+        &mut self,
+        device: &Context,
+        frame: &mut Frame,
+        stage: usize,
+        value: u32,
+        channel: u32,
+    ) -> Result<()> {
+        let (at, len) = self.span(stage, value).ok_or_else(|| Fault::Program {
+            at: "guest::session",
+            why: format!("value {value} is not stage {stage}'s"),
+        })?;
+        if self
+            .kept
+            .get(&channel)
+            .is_none_or(|cell| cell.bytes() < len)
+        {
+            self.kept.insert(channel, Buffer::zeroed(device, len)?);
+        }
+        frame.copy(&self.stages[stage].heap, at, &self.kept[&channel], 0, len)
+    }
+
+    /// A read-back buffer of its own for a pass that lands after the next
+    /// one is recorded.
+    pub fn lend_landing(&mut self, device: &Context, stage: usize) -> Result<Buffer> {
+        let bytes = self.stages[stage].landing.bytes();
+        let spare = self
+            .landings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop();
+        match spare {
+            Some(buffer) if buffer.bytes() >= bytes => Ok(buffer),
+            _ => Buffer::with(device, bytes, Memory::Host),
+        }
+    }
+
+    /// Where a landed pass hands its read-back buffer back.
+    #[must_use]
+    pub fn landings(&self) -> Arc<std::sync::Mutex<Vec<Buffer>>> {
+        Arc::clone(&self.landings)
+    }
+
+    pub fn read_back_into(
+        &self,
+        frame: &mut Frame,
+        stage: usize,
+        value: u32,
+        into: &Buffer,
+    ) -> Result<()> {
+        let (at, len) = self.span(stage, value).ok_or_else(|| Fault::Program {
+            at: "guest::session",
+            why: format!("value {value} is not stage {stage}'s"),
+        })?;
+        frame.copy(&self.stages[stage].heap, at, into, at, len)
+    }
+
+    /// The device's fault word, for a pass that lands on another thread.
+    #[must_use]
+    pub fn status_cell(&self) -> Buffer {
+        self.status.clone()
+    }
+
+    /// The device cell a kept channel holds.
+    #[must_use]
+    pub fn kept_cell(&self, channel: u32) -> Option<&Buffer> {
+        self.kept.get(&channel)
+    }
+
+    pub fn depart(&mut self, pending: Pending) {
+        while self.airborne.front().is_some_and(Pending::landed) {
+            self.airborne.pop_front();
+        }
+        self.airborne.push_back(pending);
+    }
+
+    /// Waits for every pass this session has on the queue.
+    pub fn settle(&mut self) -> Result<()> {
+        while let Some(pending) = self.airborne.pop_front() {
+            pending.wait()?;
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn keeps(&self, channel: u32) -> bool {
+        self.kept.contains_key(&channel)
+    }
+
+    /// Drops the device's cell for `channel`, so the next take reads the
+    /// ring, which the host has written.
+    pub fn forget(&mut self, channel: u32) {
+        self.kept.remove(&channel);
+    }
+
+    /// Copies `channel`'s kept cell into `value`; false when the device keeps
+    /// no cell for it.
+    pub fn restore(
+        &mut self,
+        frame: &mut Frame,
+        stage: usize,
+        value: u32,
+        channel: u32,
+    ) -> Result<bool> {
+        let Some(cell) = self.kept.get(&channel) else {
+            return Ok(false);
+        };
+        let (at, len) = self.span(stage, value).ok_or_else(|| Fault::Program {
+            at: "guest::session",
+            why: format!("value {value} is not stage {stage}'s"),
+        })?;
+        frame.copy(cell, 0, &self.stages[stage].heap, at, len.min(cell.bytes()))?;
+        Ok(true)
+    }
+
     pub fn taken(&self, stage: usize, value: u32) -> Result<Vec<u8>> {
         let (at, len) = self.span(stage, value).ok_or_else(|| Fault::Program {
             at: "guest::session",
@@ -329,7 +500,7 @@ impl Session {
             d.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::COMPUTE,
-                stage.layout,
+                stage.built.layout,
                 0,
                 &[stage.set],
                 &[],
@@ -338,7 +509,7 @@ impl Session {
             let between = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
-            for (step, &pipeline) in stage.pipelines.iter().enumerate() {
+            for (step, &pipeline) in stage.built.pipelines.iter().enumerate() {
                 if step > 0 {
                     d.cmd_pipeline_barrier(
                         cmd,
@@ -390,16 +561,10 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        let _ = self.settle();
         unsafe {
             let d = &self.core.device;
             d.destroy_descriptor_pool(self.pool, None);
-            for stage in &self.stages {
-                for &pipeline in &stage.pipelines {
-                    d.destroy_pipeline(pipeline, None);
-                }
-                d.destroy_pipeline_layout(stage.layout, None);
-                d.destroy_descriptor_set_layout(stage.set_layout, None);
-            }
         }
     }
 }
@@ -424,10 +589,10 @@ fn alias_reshapes(plan: &LaunchStagePlan, values: &mut [u64]) {
 
 fn build_stage(
     device: &Context,
-    core: &Arc<Core>,
     plan: &LaunchStagePlan,
     lowered: &crate::guest::Lowered,
     extents: &Extents,
+    built: Arc<Built>,
 ) -> Result<Stage> {
     let descriptors = plan
         .value_types
@@ -491,6 +656,29 @@ fn build_stage(
     let staging = Buffer::with(device, bytes, Memory::Host)?;
     let landing = Buffer::with(device, bytes, Memory::Host)?;
 
+    Ok(Stage {
+        built,
+        groups: if lowered.strides_the_grid {
+            groups_for(&descriptors, device)
+        } else {
+            1
+        },
+        set: vk::DescriptorSet::null(),
+        offsets: scratch.values,
+        descriptors,
+        descs,
+        params,
+        offs,
+        cfg,
+        heap,
+        staging,
+        landing,
+        dirty: Vec::new(),
+    })
+}
+
+fn build_pipelines(device: &Context, lowered: &crate::guest::Lowered) -> Result<Built> {
+    let core = device.core();
     let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..BINDINGS)
         .map(|i| {
             vk::DescriptorSetLayoutBinding::default()
@@ -565,30 +753,24 @@ fn build_stage(
                 why: "a stage emitted no dispatches, so nothing would run".into(),
             });
         }
-        let built = d.create_compute_pipelines(vk::PipelineCache::null(), &infos, None);
+        let cache = device.pipeline_cache();
+        let built = d.create_compute_pipelines(cache.handle(), &infos, None);
         d.destroy_shader_module(module, None);
         match built {
-            Ok(pipelines) => Ok(Stage {
-                layout,
-                set_layout,
-                pipelines,
-                groups: if lowered.strides_the_grid {
-                    groups_for(&descriptors, device)
-                } else {
-                    1
-                },
-                set: vk::DescriptorSet::null(),
-                offsets: scratch.values,
-                descriptors,
-                descs,
-                params,
-                offs,
-                cfg,
-                heap,
-                staging,
-                landing,
-                dirty: Vec::new(),
-            }),
+            Ok(pipelines) => {
+                // A sampler's stages take seconds to build on a phone; they
+                // reach the file now rather than with the next settle.
+                cache.built();
+                if let Err(fault) = cache.persist() {
+                    tracing::warn!(%fault, "writing the pipeline cache");
+                }
+                Ok(Built {
+                    core: Arc::clone(core),
+                    layout,
+                    set_layout,
+                    pipelines,
+                })
+            }
             Err((_, e)) => {
                 d.destroy_pipeline_layout(layout, None);
                 d.destroy_descriptor_set_layout(set_layout, None);

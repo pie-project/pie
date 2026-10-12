@@ -146,6 +146,8 @@ pub struct EngineConfig {
     pub has_lora: bool,
     pub device_geometry_port_mask: eta_ir::registry::PortMask,
     pub limits: crate::engine::SchedulerLimits,
+    /// The facts the engine's trace branches on.
+    pub facts: poem_ir::Facts,
     pub engine_backend: crate::engine::EngineBox,
 }
 
@@ -217,7 +219,15 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         &config.runtime.network_allowed_hosts,
     )?;
 
-    linker::spawn(&wasm_engine, fs_policy, network_policy);
+    linker::spawn(
+        &wasm_engine,
+        fs_policy,
+        network_policy,
+        config
+            .runtime
+            .wasm_max_memory_mb
+            .saturating_mul(1024 * 1024),
+    );
     let max_upload_bytes = config.runtime.max_upload_mb.saturating_mul(1024 * 1024);
     server::init(max_upload_bytes);
     let bound_port = config.port;
@@ -307,9 +317,22 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         has_attn_page_mask: !engine_configs.is_empty()
             && engine_configs.iter().all(|d| d.has_attn_page_mask),
     };
+    let facts = engine_configs
+        .first()
+        .map(|engine| engine.facts.clone())
+        .unwrap_or_default();
+    if let Some(other) = engine_configs.iter().find(|engine| engine.facts != facts) {
+        anyhow::bail!(
+            "the engines of one model classify requests by different facts ({:?} and {:?}); \
+             they run different traces",
+            facts.table,
+            other.facts.table
+        );
+    }
     model::register(
         name.clone(),
         &model_id,
+        facts,
         kv_page_size as u32,
         rs_caps,
         eta_caps,
@@ -519,11 +542,22 @@ fn verify_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(
+    target_arch = "wasm32",
+    all(target_vendor = "apple", not(target_os = "macos"))
+)))]
 const CORE_RESOURCES_PER_COMPONENT: u32 = 16;
 
 #[cfg(target_arch = "wasm32")]
 fn init_wasmtime(_runtime: &RuntimeConfig) -> wasmtime::Engine {
+    browser_wasm_engine()
+}
+
+/// The engine inferlets run on in a browser tab. A component precompiled for
+/// it (`program::precompile_component`) loads only into an engine built the
+/// same way, so precompiling goes through here too.
+#[cfg(target_arch = "wasm32")]
+pub fn browser_wasm_engine() -> wasmtime::Engine {
     let mut wasm_config = wasmtime::Config::default();
     wasmtime_web::configure(&mut wasm_config).expect("configure wasmtime for the browser");
     wasm_config.wasm_component_model_async(true);
@@ -548,6 +582,29 @@ fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
         }
     }
 
+    configure_execution(&mut wasm_config, runtime);
+    wasmtime::Engine::new(&wasm_config).unwrap()
+}
+
+/// Apple's platforms other than macOS (iOS, visionOS, tvOS, watchOS) give an
+/// app no executable memory: inferlets run as Pulley bytecode, with memories
+/// allocated on demand.
+#[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
+fn configure_execution(wasm_config: &mut wasmtime::Config, _runtime: &RuntimeConfig) {
+    wasm_config
+        .target("pulley64")
+        .expect("pulley64 is compiled in where an app may not JIT");
+    wasm_config.signals_based_traps(false);
+    wasm_config.memory_reservation(0);
+    wasm_config.memory_guard_size(0);
+    wasm_config.memory_init_cow(false);
+}
+
+#[cfg(not(any(
+    target_arch = "wasm32",
+    all(target_vendor = "apple", not(target_os = "macos"))
+)))]
+fn configure_execution(wasm_config: &mut wasmtime::Config, runtime: &RuntimeConfig) {
     let mut pooling_config = wasmtime::PoolingAllocationConfig::default();
     pooling_config.total_component_instances(runtime.wasm_max_instances);
     pooling_config.total_memories(runtime.wasm_max_instances);
@@ -572,8 +629,6 @@ fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     wasm_config.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(
         pooling_config,
     ));
-
-    wasmtime::Engine::new(&wasm_config).unwrap()
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -1227,7 +1227,7 @@ impl Prepared {
             let temporary_bytes =
                 u64::from(self.scratch_stride.saturating_sub(self.temporary_offset));
             dispatch_streamed(
-                encoder,
+                &encoder,
                 &streamed_dispatches(
                     &region.steps,
                     &self.descriptor_table,
@@ -1803,7 +1803,7 @@ impl Batch {
             );
             self.dump_streamed_tables(region, template)?;
             dispatch_streamed(
-                encoder,
+                &encoder,
                 &streamed_dispatches(
                     &region.steps,
                     &template.descriptor_table,

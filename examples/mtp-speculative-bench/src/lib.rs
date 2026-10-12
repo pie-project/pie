@@ -45,6 +45,10 @@ struct Input {
     prompt_tokens: Option<Vec<u32>>,
     #[serde(default = "default_system")]
     system: String,
+    /// Turn a thinking model's thinking off, as its template does for
+    /// `enable_thinking: false`.
+    #[serde(default)]
+    no_think: bool,
     /// Drop the template's stop tokens so the loop runs to `max_tokens`.
     #[serde(default)]
     ignore_eos: bool,
@@ -204,7 +208,7 @@ async fn main(input: Input) -> Result<Output> {
         Some(tokens) => tokens.clone(),
         None => {
             let mut p = chat::system_user(&input.system, &input.prompt);
-            p.extend(chat::cue());
+            p.extend(chat::cue_thinking(!input.no_think));
             p
         }
     };

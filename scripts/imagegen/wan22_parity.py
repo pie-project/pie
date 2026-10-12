@@ -14,7 +14,7 @@ two with `compare.py`.
     python wan22_parity.py case  --out /tmp/wan22-parity --pertoken
 
     # 2. run it (the config's `[model] model` is the imported artifact:
-    #    `pie model import <dir with wan22_mini_d128.safetensors> --sku wan22-mini-d128-bf16-kv-bf16`)
+    #    `pie model import <dir with wan22_mini_d128.safetensors> --deployment wan22-mini-d128-bf16-kv-bf16`)
     python wan22_parity.py run   --out /tmp/wan22-parity --config ~/.pie/config.wan22-mini.toml
 
     # 3. the pie-side npz, then the diff

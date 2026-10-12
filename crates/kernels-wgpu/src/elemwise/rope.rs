@@ -18,8 +18,6 @@ const FILE: &str = "rope/neox.wgsl";
 
 const GROUP: u32 = 64;
 
-const UNSCALED: f32 = 1.0;
-
 fn pairs(lanes: [u32; 3]) -> [u32; 3] {
     [lanes[0] / 2, lanes[1], lanes[2]]
 }
@@ -70,32 +68,35 @@ fn positions_stream(op: &'static str, positions: Tensor, x: Tensor) {
     );
 }
 
+/// The first `rotary/2` pairs of each head turn, pair `i` being
+/// `(i, i + span)` at `theta^(-i/span)`.
 fn rotate(
     ctx: &Ctx<'_>,
     op: &'static str,
     x: Tensor,
     positions: Tensor,
-    scale: f32,
     base: f32,
     head_dim: u32,
     rotary: u32,
-    proportional: bool,
+    span: u32,
 ) -> Result<(), Error> {
-    let entry = if proportional {
-        dtype_dispatch!(op, x.dtype, { Bf16 => "neox_prop_mb_bf16" })
-    } else {
-        dtype_dispatch!(op, x.dtype, { Bf16 => "neox_mb_bf16" })
-    };
+    let entry = dtype_dispatch!(op, x.dtype, { Bf16 => "neox_mb_bf16" });
     positions_stream(op, positions, x);
     let lanes = rope_grid(op, rotary, x.width, head_dim, x.rows)?;
+    if !span.is_multiple_of(2) {
+        return Err(refuse(
+            op,
+            format!("a pair {span} apart splits a bf16 word"),
+        ));
+    }
     ctx.fire(
         Fire::at(FILE, entry).apply(Grid::of(pairs(lanes), [GROUP, 1, 1])),
         &[
             x.arg_mut(),
             positions.arg(),
-            scale.arg(),
             base.arg(),
             stated(op, head_dim)?.arg(),
+            stated(op, span)?.arg(),
             stated(op, lanes[0])?.arg(),
             stated(op, lanes[1])?.arg(),
         ],
@@ -120,12 +121,9 @@ pub fn full(
     }
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     let base = theta.log2();
-    rotate(
-        ctx, OP, q, positions, UNSCALED, base, head_dim, head_dim, false,
-    )?;
-    rotate(
-        ctx, OP, k, positions, UNSCALED, base, head_dim, head_dim, false,
-    )
+    let span = head_dim / 2;
+    rotate(ctx, OP, q, positions, base, head_dim, head_dim, span)?;
+    rotate(ctx, OP, k, positions, base, head_dim, head_dim, span)
 }
 
 pub fn partial(
@@ -136,16 +134,13 @@ pub fn partial(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
+    span: u32,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_partial";
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     let base = theta.log2();
-    rotate(
-        ctx, OP, q, positions, UNSCALED, base, head_dim, rotary_dim, true,
-    )?;
-    rotate(
-        ctx, OP, k, positions, UNSCALED, base, head_dim, rotary_dim, true,
-    )
+    rotate(ctx, OP, q, positions, base, head_dim, rotary_dim, span)?;
+    rotate(ctx, OP, k, positions, base, head_dim, rotary_dim, span)
 }
 
 pub fn partial_q(
@@ -155,17 +150,18 @@ pub fn partial_q(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
+    span: u32,
 ) -> Result<(), Error> {
+    const OP: &str = "elementwise.rope_partial_q";
     rotate(
         ctx,
-        "elementwise.rope_partial_q",
+        OP,
         q,
         positions,
-        UNSCALED,
         theta.log2(),
         head_dim,
         rotary_dim,
-        true,
+        span,
     )
 }
 

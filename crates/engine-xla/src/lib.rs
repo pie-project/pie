@@ -29,3 +29,6 @@ pub use api::{ContractFor, DeviceBoot, Xla};
 pub use boot::open;
 pub use error::{Fault, Result, kernel};
 pub use serve::{Boot, FireCost, Fired, Lane, Media, Seated, Shell};
+
+/// The fused kernels this backend ships; the compiler forms only these.
+pub const FUSED: [&str; 0] = [];

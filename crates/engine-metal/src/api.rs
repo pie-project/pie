@@ -258,19 +258,12 @@ pub fn voxel_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<poem_compile
 }
 
 fn patch_bytes(
-    patches: &[f32],
+    patches: &[u8],
     element: poem_ir::Dtype,
 ) -> std::result::Result<Vec<u8>, &'static str> {
     match element {
-        poem_ir::Dtype::Bf16 => Ok(patches
-            .iter()
-            .flat_map(|&v| bf16_bits(v).to_le_bytes())
-            .collect()),
-        poem_ir::Dtype::F32 => Ok(patches.iter().flat_map(|&v| v.to_le_bytes()).collect()),
-        _ => Err(
-            "a media submission against a plan whose activation element is neither \
-                  `bf16` nor `f32`, which is the pair every tower in this catalog computes in",
-        ),
+        poem_ir::Dtype::U8 => Ok(patches.to_vec()),
+        _ => Err("a media submission against a plan whose pixel rows are not u8 bytes"),
     }
 }
 
@@ -570,6 +563,9 @@ impl Engine for Metal {
                 max_tokens: budgets.max_tokens,
                 max_page_refs: paging.pages_per_slot.saturating_mul(budgets.max_lanes),
                 max_context: paging.context(),
+                prefill_rows: shell
+                    .neural_engine()
+                    .map_or(0, crate::ane::Ane::prefill_rows),
             },
             profile,
             ports: PortMask::DEVICE_GEOMETRY
@@ -587,6 +583,7 @@ impl Engine for Metal {
             device_channel_commit: false,
             rs_verbs: shell.serves_rs_verbs(),
             bidirectional_attention: true,
+            facts: shell.trace().facts.clone(),
         };
 
         self.shell = Some(shell);
@@ -962,8 +959,7 @@ impl Metal {
                 patches,
                 routes: &row.routes,
                 positions: &row.positions,
-                embed_rows: &row.embed_rows,
-                embed_weights: &row.embed_weights,
+                grids: &row.grids,
                 token_positions: &row.token_positions,
             })
             .collect();

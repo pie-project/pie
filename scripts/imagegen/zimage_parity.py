@@ -36,8 +36,8 @@ Two modes, one per row:
     python zimage_parity.py all     --out /tmp/zimage-parity [--turbo]
 
 `run` needs the config's `[model] model` to be the row's artifact (`pie model
-import <golden dir> --sku z-image-mini-bf16-kv-bf16`, or the Z-Image-Turbo
-snapshot under `--sku z-image-turbo-bf16-kv-bf16`), and — for a case too large
+import <golden dir> --deployment z-image-mini-bf16-kv-bf16`, or the Z-Image-Turbo
+snapshot under `--deployment z-image-turbo-bf16-kv-bf16`), and — for a case too large
 for argv — `[sandbox] allow_fs = true` with `fs_scratch_dir` equal to `--out`,
 since the case is then read as `/scratch/<name>` inside the sandbox.
 
@@ -112,29 +112,29 @@ TOLERANCES = {
 }
 PROMPT_KEY = "prompt_embeds.0"
 
-def keyed(file: str, prefix: str, out: str, sku: str, refined: str | None = None) -> dict:
+def keyed(file: str, prefix: str, out: str, deployment: str, refined: str | None = None) -> dict:
     """A mode: the golden file, its input keys (`<prefix>x.0`, `<prefix>cap.0`,
-    `<prefix>t`), the output key the velocity lands under, the row's SKU and —
+    `<prefix>t`), the output key the velocity lands under, the row's deployment and —
     for a tapped golden — the key the refined caption lands under."""
     return dict(file=file, x=f"{prefix}x.0", cap=f"{prefix}cap.0", t=f"{prefix}t",
-                out=out, sku=sku, refined=refined)
+                out=out, deployment=deployment, refined=refined)
 
-MINI_SKU = "z-image-mini-bf16-kv-bf16"
-TURBO_SKU = "z-image-turbo-bf16-kv-bf16"
+MINI_DEPLOYMENT = "z-image-mini-bf16-kv-bf16"
+TURBO_DEPLOYMENT = "z-image-turbo-bf16-kv-bf16"
 MODES = {
-    "mini": keyed("zimage_mini.npz", "mini.in.", "mini.out.0", MINI_SKU),
-    "mini_pad": keyed("zimage_mini_pad.npz", "mini_pad.in.", "mini_pad.out.0", MINI_SKU),
-    "turbo": keyed("zimage_golden.npz", "dit.step0.in.", "dit.step0.out.0", TURBO_SKU),
-    "text": keyed("zimage_golden.npz", "dit.step0.in.", PROMPT_KEY, TURBO_SKU),
-    "chain": keyed("zimage_golden.npz", "dit.step0.in.", "dit.step0.out.0", TURBO_SKU),
-    "full": keyed("zimage_taps.npz", "taps.full.in.", "taps.full.out.0", TURBO_SKU,
+    "mini": keyed("zimage_mini.npz", "mini.in.", "mini.out.0", MINI_DEPLOYMENT),
+    "mini_pad": keyed("zimage_mini_pad.npz", "mini_pad.in.", "mini_pad.out.0", MINI_DEPLOYMENT),
+    "turbo": keyed("zimage_golden.npz", "dit.step0.in.", "dit.step0.out.0", TURBO_DEPLOYMENT),
+    "text": keyed("zimage_golden.npz", "dit.step0.in.", PROMPT_KEY, TURBO_DEPLOYMENT),
+    "chain": keyed("zimage_golden.npz", "dit.step0.in.", "dit.step0.out.0", TURBO_DEPLOYMENT),
+    "full": keyed("zimage_taps.npz", "taps.full.in.", "taps.full.out.0", TURBO_DEPLOYMENT,
                   refined="taps.full.cap.refined"),
-    "crop": keyed("zimage_taps.npz", "taps.crop.in.", "taps.crop.out.0", TURBO_SKU,
+    "crop": keyed("zimage_taps.npz", "taps.crop.in.", "taps.crop.out.0", TURBO_DEPLOYMENT,
                   refined="taps.crop.cap.refined"),
-    "tiny": keyed("zimage_taps.npz", "taps.tiny.in.", "taps.tiny.out.0", TURBO_SKU,
+    "tiny": keyed("zimage_taps.npz", "taps.tiny.in.", "taps.tiny.out.0", TURBO_DEPLOYMENT,
                   refined="taps.tiny.cap.refined"),
 }
-MODES["steps"] = keyed("zimage_golden.npz", "dit.step0.in.", "latent.final", TURBO_SKU)
+MODES["steps"] = keyed("zimage_golden.npz", "dit.step0.in.", "latent.final", TURBO_DEPLOYMENT)
 for _mode in ("turbo", "text", "chain", "steps"):
     MODES[_mode].update(x="dit.step0.in.arg0.0", cap="dit.step0.in.arg2.0", t="dit.step0.in.arg1")
 TOLERANCES.update(full=TOLERANCES["turbo"], crop=TOLERANCES["turbo"], tiny=TOLERANCES["turbo"])

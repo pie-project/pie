@@ -58,8 +58,7 @@ pub struct PatchBindings {
     pub segments: Tensor,
     pub routes: Tensor,
     pub positions: Tensor,
-    pub embed_rows: Option<Tensor>,
-    pub embed_weights: Option<Tensor>,
+    pub grids: Tensor,
 }
 
 /// One packing of a fire's rows by attention group (`poem_exec::fire::pack`),
@@ -478,23 +477,18 @@ impl<'c> Run<'c> {
                 | RuntimeInput::PatchSegments
                 | RuntimeInput::PatchRoutes
                 | RuntimeInput::PatchPositions
-                | RuntimeInput::PatchEmbedRows
-                | RuntimeInput::PatchEmbedWeights),
+                | RuntimeInput::ImageGrids),
             ) => {
                 let seat = self.fire.patches.unwrap_or_else(|| {
                     panic!("value {at} reads {which:?}, which no lane of this fire submitted")
                 });
-                let bound = match which {
-                    RuntimeInput::Patches => Some(seat.patches),
-                    RuntimeInput::PatchSegments => Some(seat.segments),
-                    RuntimeInput::PatchRoutes => Some(seat.routes),
-                    RuntimeInput::PatchPositions => Some(seat.positions),
-                    RuntimeInput::PatchEmbedRows => seat.embed_rows,
-                    _ => seat.embed_weights,
-                };
-                bound.unwrap_or_else(|| {
-                    panic!("value {at} reads {which:?}, which this load stages none of")
-                })
+                match which {
+                    RuntimeInput::Patches => seat.patches,
+                    RuntimeInput::PatchSegments => seat.segments,
+                    RuntimeInput::PatchRoutes => seat.routes,
+                    RuntimeInput::PatchPositions => seat.positions,
+                    _ => seat.grids,
+                }
             }
             Def::Weight(w) => {
                 let row = *w as usize;

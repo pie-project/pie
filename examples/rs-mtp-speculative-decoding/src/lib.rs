@@ -124,7 +124,7 @@ async fn main(input: Input) -> Result<Output> {
     }
     let depth = model::mtp_depth();
     if input.k > 0 && depth == 0 {
-        return Err("this SKU ships no draft head (mtp_depth = 0); run with k = 0".into());
+        return Err("this deployment ships no draft head (mtp_depth = 0); run with k = 0".into());
     }
     let k = input.k.min(depth);
     if input.max_tokens == 0 {

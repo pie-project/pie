@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use checkpoint::contract::ModelContract;
@@ -26,8 +26,6 @@ use crate::serve::{Attached, Boot, Graphs, Knobs, Lane, Seated, Shell};
 
 pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, String>;
 
-pub type ClassifyFor = fn(&str) -> Option<poem_ir::ClassifyFn>;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct World {
     pub rank: u32,
@@ -40,7 +38,7 @@ impl Default for World {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct DeviceBoot {
     pub ordinal: i32,
     pub world: World,
@@ -51,20 +49,6 @@ pub struct DeviceBoot {
     pub adapter_dir: Option<std::path::PathBuf>,
 }
 
-impl Default for DeviceBoot {
-    fn default() -> DeviceBoot {
-        DeviceBoot {
-            ordinal: 0,
-            world: World::default(),
-            comm: None,
-            graphs: Graphs::default(),
-            knobs: Knobs::default(),
-            cache_dir: None,
-            adapter_dir: None,
-        }
-    }
-}
-
 struct PendingStep {
     readout: Vec<Readout>,
     settled: crate::serve::Settled,
@@ -73,7 +57,6 @@ struct PendingStep {
 pub struct Cuda {
     boot: DeviceBoot,
     contract_for: ContractFor,
-    classify_for: ClassifyFor,
     shell: Option<Shell>,
     caps: Option<Capabilities>,
     next_fire: FireId,
@@ -86,12 +69,11 @@ pub struct Cuda {
 
 impl Cuda {
     #[must_use]
-    pub fn new(boot: DeviceBoot, contract_for: ContractFor, classify_for: ClassifyFor) -> Cuda {
+    pub fn new(boot: DeviceBoot, contract_for: ContractFor) -> Cuda {
         crate::serve::diag::publish(&boot.knobs.diagnostics);
         Cuda {
             boot,
             contract_for,
-            classify_for,
             shell: None,
             caps: None,
             next_fire: 1,
@@ -319,7 +301,7 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
     Some(PatchLadder {
         max_images: budgets
             .max_images
-            .unwrap_or_else(|| max_patches / PATCH_LATTICE_FLOOR)
+            .unwrap_or(max_patches / PATCH_LATTICE_FLOOR)
             .max(1),
         max_patches,
         buckets,
@@ -460,13 +442,6 @@ impl Engine for Cuda {
             ordinal,
             frames_in_flight,
         } = request;
-        let trace = poem_ir::fuse::residual_norm(trace);
-        let trace = if self.boot.knobs.diagnostics.fuse_chains {
-            poem_ir::fuse::residual_chains(trace)
-        } else {
-            trace
-        };
-
         if !self.boot.graphs.records() {
             eprintln!(
                 "engine-cuda: serving without CUDA graph capture ([engine] graphs = \
@@ -483,7 +458,6 @@ intended for diagnostics, not serving",
                     .into(),
             ));
         };
-        let path = PathBuf::from(path);
         refuse_an_artifact_for_another_deployment(
             &path,
             trace.platform.backend(),
@@ -493,14 +467,7 @@ intended for diagnostics, not serving",
 
         let patches = patch_ladder(&trace, &budgets);
         let voxels = voxel_ladder(&trace, &budgets);
-        let classify = (self.classify_for)(&trace.name).ok_or_else(|| {
-            Error::Load(format!(
-                "this build ships no classifier for {:?}",
-                trace.name
-            ))
-        })?;
         let mut shell = Shell::load(Boot {
-            classify,
             trace,
             contract: &contract,
             checkpoint: &path,
@@ -599,6 +566,7 @@ intended for diagnostics, not serving",
                     .pages_per_slot
                     .saturating_mul(shell.budget().max_lanes),
                 max_context: paging.context(),
+                prefill_rows: 0,
             },
             profile,
             ports: PortMask::DEVICE_GEOMETRY
@@ -616,6 +584,7 @@ intended for diagnostics, not serving",
             device_channel_commit: true,
             rs_verbs: true,
             bidirectional_attention: true,
+            facts: shell.trace().facts.clone(),
         };
 
         self.shell = Some(shell);
@@ -1171,8 +1140,7 @@ impl Cuda {
                 patches,
                 routes: &row.routes,
                 positions: &row.positions,
-                embed_rows: &row.embed_rows,
-                embed_weights: &row.embed_weights,
+                grids: &row.grids,
                 token_positions: &row.token_positions,
             })
             .collect();
@@ -1212,19 +1180,12 @@ impl Cuda {
 }
 
 fn patch_bytes(
-    patches: &[f32],
+    patches: &[u8],
     element: poem_ir::Dtype,
 ) -> std::result::Result<Vec<u8>, &'static str> {
     match element {
-        poem_ir::Dtype::Bf16 => Ok(patches
-            .iter()
-            .flat_map(|&v| crate::adapter::bf16_bits(v).to_le_bytes())
-            .collect()),
-        poem_ir::Dtype::F32 => Ok(patches.iter().flat_map(|&v| v.to_le_bytes()).collect()),
-        _ => Err(
-            "a media submission against a plan whose activation element is neither \
-                  `bf16` nor `f32`, which is the pair every tower in this catalog computes in",
-        ),
+        poem_ir::Dtype::U8 => Ok(patches.to_vec()),
+        _ => Err("a media submission against a plan whose pixel rows are not u8 bytes"),
     }
 }
 
@@ -1330,6 +1291,7 @@ mod tests {
 
     fn trace_with(shape: Vec<Dim>) -> Trace {
         Trace {
+            facts: Default::default(),
             name: "gate".into(),
             platform: poem_ir::Platform::Cuda,
             params: Vec::new(),
@@ -1400,28 +1362,28 @@ mod tests {
     }
 }
 
-fn width_free(sku: &str) -> &str {
-    match sku.rsplit_once("-tp") {
+fn width_free(deployment: &str) -> &str {
+    match deployment.rsplit_once("-tp") {
         Some((base, width)) if !width.is_empty() && width.bytes().all(|b| b.is_ascii_digit()) => {
             base
         }
-        _ => sku,
+        _ => deployment,
     }
 }
 
 fn refuse_an_artifact_for_another_deployment(
     path: &std::path::Path,
     backend: &str,
-    sku: &str,
+    deployment: &str,
 ) -> EngineResult<()> {
     let stamp = match checkpoint::file::serve::stamp_of(path) {
         Ok(None) => return Ok(()),
         Ok(Some(stamp)) => stamp,
         Err(why) => return Err(Error::Load(why.to_string())),
     };
-    let deployment = checkpoint::serving::Stamp::of(backend, sku);
+    let wanted = checkpoint::serving::Stamp::of(backend, deployment);
     stamp
-        .check(&deployment)
+        .check(&wanted)
         .map_err(|mismatch| Error::Load(mismatch.refuse(&path.display().to_string())))
 }
 
@@ -1432,12 +1394,12 @@ mod serving_stamp_tests {
     use checkpoint::serving::Stamp;
     use std::collections::BTreeMap;
 
-    fn artifact(dir: &std::path::Path, backend: &str, sku: &str) -> std::path::PathBuf {
-        let path = dir.join(format!("{backend}-{sku}.zt"));
+    fn artifact(dir: &std::path::Path, backend: &str, deployment: &str) -> std::path::PathBuf {
+        let path = dir.join(format!("{backend}-{deployment}.zt"));
         let bytes = vec![7u8; 8192];
         emit::write(
             &path,
-            &Stamp::of(backend, sku),
+            &Stamp::of(backend, deployment),
             &BTreeMap::new(),
             4096,
             &[Object::leaf("embed", vec![8192], ztensor::Leaf::U8, &bytes)],

@@ -1,0 +1,111 @@
+# The forward of gpt-oss: biased attention with sinks over YaRN rope, every
+# other layer windowed, then experts with clamped SwiGLU; and with a DFlash
+# drafter, the block it drafts.
+
+load("//lib/dflash/forward.poem", "arm", "block_rows", "plant_readout", "tap", dflash_caches = "caches")
+
+WINDOWED = 0
+FULL = 1
+CLASSES = [fact.has(fact.Mask), fact.scores(), fact.single_token()]
+
+def caches(m, c):
+    kv = c.kv_space(m.kv)
+    plane = m.kv_heads * m.head_dim
+    for w in m.layers:
+        c.kv(kv, w.attn.kv, [plane, plane], m.head_dim, heads = True)
+    if m.dflash != None:
+        dflash_caches(m.dflash, c, kv)
+
+def forward(m, inputs):
+    mask = inputs.mask()
+    dr = m.dflash
+    trunk_inputs = inputs.on(~block_rows(dr)) if dr != None else inputs
+    positions = trunk_inputs.positions()
+    ([input_m, input_s, input_d], input_p) = trunk_inputs.partition(CLASSES)
+    d = m.head_dim
+
+    def plans(input, plan):
+        return [plan(input, m.q_heads, m.kv_heads, d, win) for win in [m.window, None]]
+
+    plan_m = plans(input_m, ops.attn.plan_prefill)
+    plan_s = plans(input_s, ops.attn.plan_prefill)
+    plan_d = plans(input_d, ops.attn.plan_decode)
+    plan_p = plans(input_p, ops.attn.plan_prefill)
+    y = ops.layout.embed(inputs.tokens(), m.embed, m.vocab)
+    h_block = None
+    if dr != None:
+        h_block = y.on(block_rows(dr))
+        y = y.on(~block_rows(dr))
+    routes = inputs.adapter_routes()
+
+    def block(l, w, carried):
+        y, tapped = carried
+        at = w.attn
+        pages = inputs.kv(at.kv)
+        write_page = inputs.write_page(at.kv)
+        write_offset = inputs.write_offset(at.kv)
+
+        x = ops.elemwise.rmsnorm(y, w.attn_norm, w.attn_norm_eps)
+        q = ops.elemwise.add_bias(at.q_bias, ops.linear.matmul(x, at.q_proj))
+        k = ops.elemwise.add_bias(at.k_bias, ops.linear.matmul(x, at.k_proj))
+        v = ops.elemwise.add_bias(at.v_bias, ops.linear.matmul(x, at.v_proj))
+        seam.at(seam.ATTN_QV, [q, v])
+
+        rope = m.rope
+        q, k = ops.elemwise.rope_yarn(
+            q, k, positions, d, rope.theta, rope.factor, rope.beta_fast, rope.beta_slow,
+            rope.attention_factor, rope.original_max_position, False,
+        )
+        ops.attn.kv_append(k, v, pages, write_page, write_offset)
+        seam.at(seam.ATTN_Q, [q])
+
+        r = at.reading
+        win = m.window if r == WINDOWED else None
+        ([mq, sq, dq], p) = q.partition(CLASSES)
+        o_m, lse_m = ops.attn.masked_lse(mq, plan_m[r], mask, pages, win, d, m.kv_heads, True, m.sm_scale)
+        arm_m = ops.attn.sink(o_m, lse_m, at.sinks, d)
+        o_s, lse_s = ops.attn.prefill_lse(sq, plan_s[r], pages, win, d, m.kv_heads, m.sm_scale)
+        if r == FULL:
+            seam.at(seam.SCORES, [lse_s])
+        arm_s = ops.attn.sink(o_s, lse_s, at.sinks, d)
+        o_d, lse_d = ops.attn.decode_lse(dq, plan_d[r], pages, win, d, m.sm_scale)
+        arm_d = ops.attn.sink(o_d, lse_d, at.sinks, d)
+        o_p, lse_p = ops.attn.prefill_lse(p, plan_p[r], pages, win, d, m.kv_heads, m.sm_scale)
+        arm_p = ops.attn.sink(o_p, lse_p, at.sinks, d)
+        a = merge([arm_m, arm_s, arm_d, arm_p])
+        seam.at(seam.ATTN_OUT, [a])
+
+        o = ops.elemwise.add_bias(at.o_bias, ops.linear.matmul(a, at.o_proj))
+        adapted = fact.has(fact.Adapter)
+        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        y = ops.elemwise.residual_add(o, y)
+
+        e = w.mlp
+        x = ops.elemwise.rmsnorm(y, w.mlp_norm, w.mlp_norm_eps)
+        experts, weights = ops.linear.moe_topk_softmax(
+            ops.elemwise.add_bias(e.router_bias, ops.linear.matmul(x, e.router)),
+            e.experts,
+            e.top_k,
+        )
+        packed = ops.linear.moe_matmul_select_bias(x, e.gate_up, e.gate_up_bias, experts, e.top_k)
+        act = ops.linear.mlp_swiglu_clamp_alpha(packed, e.inter, e.swiglu_limit, e.swiglu_alpha)
+        routed = ops.linear.moe_matmul_select_quant(act, e.down, experts, e.top_k)
+        f = ops.linear.moe_weighted_sum(routed, weights)
+        f = ops.linear.moe_bias_sum(f, e.down_bias, experts, weights)
+        y = ops.elemwise.residual_add(f, y)
+        if dr != None:
+            tapped = tap(dr, l, y, tapped)
+        return (y, tapped)
+
+    y, tapped = inputs.fold_layers(m.layers, (y, None), block)
+
+    x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
+    hb = None
+    if dr != None:
+        hb = arm(dr, inputs, tapped, h_block, mask, block_rows(dr))
+        x = merge([hb, x])
+    x = ops.layout.gather_rows(x, inputs.readout_rows())
+    logits = ops.linear.lm_head(x, m.head)
+    if dr != None:
+        plant_readout(dr, logits, inputs, hb, block_rows(dr))
+    return logits
