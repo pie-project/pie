@@ -1002,49 +1002,91 @@ impl engine::frame::Supply for Pools {
     }
 }
 
-pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
-    let mut bytes: u64 = 0;
-    for row in &trace.caches {
-        match row {
-            CacheRow::Kv {
-                name,
-                planes,
-                dtype,
-                head_dim,
-                ..
-            } => {
-                let planes = split(name, planes)?;
-                let cells = paging.pages() * u64::from(paging.page_size);
-                // The demand estimate runs before consumers state a seat, but the
-                // trace row now carries the cache's head_dim, so a packed KvU4
-                // cache is sized exactly per head at ANY head_dim (matching what
-                // `reserve` computes from the seat), not from the 256 anchor. A
-                // row from a trace serialized before this field carries head_dim
-                // 0, which `row_stride` treats as "unknown" and falls back to the
-                // format anchor — the old behavior.
-                let block = (*head_dim != 0).then_some(*head_dim);
-                let keys = cells * row_stride(name, *dtype, planes.keys, block)?;
-                let values = if planes.shared || planes.values == 0 {
-                    0
-                } else {
-                    cells * row_stride(name, *dtype, planes.values, block)?
-                };
-                bytes = bytes.saturating_add(keys.saturating_add(values));
-            }
-            CacheRow::State {
-                name, slab, dtype, ..
-            } => {
-                let stride: u64 = slab.iter().product();
-                let dtype = state_dtype(*dtype);
-                bytes = bytes.saturating_add(
-                    stride
-                        .saturating_mul(u64::from(paging.slots))
-                        .saturating_mul(elem_bytes(name, dtype)?),
-                );
+/// What the kv pool and the recurrent-state buffers beside it wire: a part
+/// per kv page, and a part per state slot the page count leaves alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolDemand {
+    pub per_page: u64,
+    pub fixed: u64,
+}
+
+impl PoolDemand {
+    /// `trace`'s pool at `paging`'s page size and slots, beside `rs`'s
+    /// recurrent-state buffers; `paging`'s page count is not read.
+    pub fn of(trace: &Trace, paging: Paging, rs: Option<&crate::rs::Layout>) -> Result<PoolDemand> {
+        let mut demand = PoolDemand {
+            per_page: 0,
+            fixed: rs.map_or(0, |layout| crate::rs::Buffers::demand(layout, paging)),
+        };
+        for row in &trace.caches {
+            match row {
+                CacheRow::Kv {
+                    name,
+                    planes,
+                    dtype,
+                    head_dim,
+                    ..
+                } => {
+                    let planes = split(name, planes)?;
+                    let tokens = u64::from(paging.page_size);
+                    // The demand estimate runs before consumers state a seat, but the
+                    // trace row now carries the cache's head_dim, so a packed KvU4
+                    // cache is sized exactly per head at ANY head_dim (matching what
+                    // `reserve` computes from the seat), not from the 256 anchor. A
+                    // row from a trace serialized before this field carries head_dim
+                    // 0, which `row_stride` treats as "unknown" and falls back to the
+                    // format anchor — the old behavior.
+                    let block = (*head_dim != 0).then_some(*head_dim);
+                    let keys = tokens * row_stride(name, *dtype, planes.keys, block)?;
+                    let values = if planes.shared || planes.values == 0 {
+                        0
+                    } else {
+                        tokens * row_stride(name, *dtype, planes.values, block)?
+                    };
+                    demand.per_page = demand.per_page.saturating_add(keys.saturating_add(values));
+                }
+                CacheRow::State {
+                    name, slab, dtype, ..
+                } => {
+                    let stride: u64 = slab.iter().product();
+                    let dtype = state_dtype(*dtype);
+                    demand.fixed = demand.fixed.saturating_add(
+                        stride
+                            .saturating_mul(u64::from(paging.slots))
+                            .saturating_mul(elem_bytes(name, dtype)?),
+                    );
+                }
             }
         }
+        Ok(demand)
     }
-    Ok(bytes)
+
+    #[must_use]
+    pub fn bytes(self, pages: u64) -> u64 {
+        self.fixed
+            .saturating_add(self.per_page.saturating_mul(pages))
+    }
+
+    /// The most pages whose pool fits in `room`.
+    #[must_use]
+    pub fn pages_within(self, room: u64) -> u64 {
+        room.saturating_sub(self.fixed) / self.per_page.max(1)
+    }
+}
+
+/// The bytes `trace`'s kv and state rows wire at `paging`.
+pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
+    Ok(PoolDemand::of(trace, paging, None)?.bytes(paging.pages()))
+}
+
+/// The pages a load cannot do without: those `[engine] total_pages` states,
+/// or one context's when it is 0 and the pool is fitted to the device.
+#[must_use]
+pub fn least_pages(stated: u32, paging: Paging) -> u64 {
+    match stated {
+        0 => u64::from(paging.pages_per_slot),
+        stated => u64::from(stated),
+    }
 }
 
 struct Planes {

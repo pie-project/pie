@@ -66,7 +66,7 @@ pub use engine::Capabilities as EngineCapabilities;
 
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn metal_geometry_is_stated(opts: &MetalEngineOptions) -> Result<()> {
-    // `total_pages = 0` sizes the kv pool to the device's free room.
+    // `total_pages` may be 0: the pool is then fitted to the device.
     for (key, value) in [
         ("max_forward_tokens", opts.max_forward_tokens),
         ("max_forward_requests", opts.max_forward_requests),

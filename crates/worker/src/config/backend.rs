@@ -61,6 +61,8 @@ impl Default for CudaNativeEngineOptions {
 #[serde(default, deny_unknown_fields)]
 pub struct MetalEngineOptions {
     pub kv_page_size: u32,
+    /// The kv pool's pages; 0, the default, fits the pool to what `[metal]
+    /// gpu_mem_utilization` leaves once the weights are placed.
     pub total_pages: u32,
     pub max_forward_tokens: u32,
     pub max_forward_requests: u32,

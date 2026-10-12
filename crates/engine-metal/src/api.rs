@@ -438,10 +438,12 @@ impl Engine for Metal {
                 budgets.page_size,
                 budgets.max_context,
                 budgets.slots,
-                u64::from(budgets.pages),
+                1,
             )
             .map_err(|error| fault(Fault::from(error)))?;
-            let kv_pool = crate::store::pool_demand(&trace, paging).map_err(fault)?;
+            let kv_pool = crate::store::PoolDemand::of(&trace, paging, None)
+                .map_err(fault)?
+                .bytes(crate::store::least_pages(budgets.pages, paging));
 
             let acct = crate::store::accounting::Accounting::of(
                 working_set,

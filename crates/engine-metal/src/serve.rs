@@ -63,10 +63,6 @@ pub struct Boot<'a> {
 
 const PATCH_ROUTE_DROP: i32 = -1;
 
-/// The percent of the device's free room an automatic kv pool takes
-/// (`[engine] total_pages = 0`).
-const AUTO_POOL_SHARE: u64 = 60;
-
 fn declared_width(trace: &Trace, want: RuntimeInput) -> u64 {
     trace
         .values
@@ -520,51 +516,32 @@ impl Shell {
             });
         handles.seal();
 
-        let paging_of = |pages: u64| Paging::of(boot.page_size, boot.context, boot.slots, pages);
         // The kv pool and the recurrent-state buffers beside it: both are
-        // wired for the life of the load.
-        let rs_layout_for_pool = crate::rs::Layout::read(&boot.trace)?;
-        let pool_bytes = |paging: Paging| -> Result<u64> {
-            let rs = rs_layout_for_pool
-                .as_ref()
-                .map_or(0, |layout| crate::rs::Buffers::demand(layout, paging));
-            Ok(crate::store::pool_demand(&boot.trace, paging)?.saturating_add(rs))
-        };
-        let pages = if boot.pages > 0 {
-            u64::from(boot.pages)
-        } else {
-            // `[engine] total_pages = 0`: as many pages as fit in
-            // AUTO_POOL_SHARE of what the device leaves once the weights, the
-            // arena scratch and the state slots are placed. The rest stays
-            // free for what a frame allocates and for the other processes
-            // that share unified memory.
-            let room = crate::store::accounting::Accounting::with_scratch(
+        // wired for the life of the load, in what `gpu_mem_utilization` leaves
+        // once the weights, the arena scratch and the driver's floor are
+        // placed. `[engine] total_pages = 0` takes all of it.
+        let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
+        let paging_at = |pages: u64| Paging::of(boot.page_size, boot.context, boot.slots, pages);
+        let demand =
+            crate::store::PoolDemand::of(&boot.trace, paging_at(1)?, rs_layout.as_deref())?;
+        let accounting = |pool: u64| {
+            crate::store::accounting::Accounting::with_scratch(
                 device.working_set(),
                 boot.gpu_mem_utilization,
                 weights.bytes(),
                 compiled.arena.bytes,
-                0,
+                pool,
             )
-            .pool;
-            let at = |pages: u64| -> Result<u64> { pool_bytes(paging_of(pages)?) };
-            let (a, b) = (at(1024)?, at(2048)?);
-            let per_page = (b.saturating_sub(a) / 1024).max(1);
-            let fixed = a.saturating_sub(1024 * per_page);
-            let usable = room / 100 * AUTO_POOL_SHARE;
-            let one_context = u64::from(boot.context.div_ceil(boot.page_size.max(1)));
-            (usable.saturating_sub(fixed) / per_page).max(one_context)
         };
-        let paging = paging_of(pages)?;
+        let least = crate::store::least_pages(boot.pages, paging_at(1)?);
+        let pages = match boot.pages {
+            0 => demand.pages_within(accounting(0).pool).max(least),
+            _ => least,
+        };
+        let paging = paging_at(pages)?;
 
         {
-            let kv_pool = pool_bytes(paging)?;
-            let acct = crate::store::accounting::Accounting::with_scratch(
-                device.working_set(),
-                boot.gpu_mem_utilization,
-                weights.bytes(),
-                compiled.arena.bytes,
-                kv_pool,
-            );
+            let acct = accounting(demand.bytes(pages));
             acct.admit(Some(weights.bytes()), boot.gpu_mem_utilization)?;
             let source = boot.residency.source_bytes();
             let ram = Context::physical_memory();
@@ -595,7 +572,6 @@ impl Shell {
         }
         let arena = Arena::reserve(&device, &compiled.arena)?;
         let pools = Pools::reserve(&device, &boot.trace, paging, &facts)?;
-        let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
         let rs_buffers = match &rs_layout {
             Some(layout) => Some(crate::rs::Buffers::reserve(&device, layout, paging)?),
             None => None,
