@@ -736,7 +736,6 @@ pub(crate) fn build_options(m: &config::ModelConfig, flavor: Flavor) -> Result<E
         }
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         Flavor::Metal => {
-            crate::config::backend::moved_to_profile("metal", &m.engine.options)?;
             let p: MetalEngineOptions = m
                 .engine
                 .options

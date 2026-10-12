@@ -27,40 +27,32 @@ impl Facts {
         }
     }
 
-    fn slot(&mut self, name: &str) -> &mut Option<i64> {
-        let i = self
-            .vars
+    fn index(&self, name: &str) -> usize {
+        self.vars
             .iter()
             .position(|v| v.name == name)
-            .unwrap_or_else(|| panic!("`{name}` is not a declared fact"));
-        &mut self.values[i]
+            .unwrap_or_else(|| panic!("`{name}` is not a declared fact"))
     }
 
     #[must_use]
     pub fn int(mut self, name: &str, value: i64) -> Facts {
-        *self.slot(name) = Some(value);
+        let i = self.index(name);
+        self.values[i] = Some(value);
         self
     }
 
     #[must_use]
-    pub fn flag(mut self, name: &str, value: bool) -> Facts {
-        *self.slot(name) = Some(i64::from(value));
-        self
+    pub fn flag(self, name: &str, value: bool) -> Facts {
+        self.int(name, i64::from(value))
     }
 
     #[must_use]
-    pub fn word(mut self, name: &str, value: &str) -> Facts {
-        let i = self
-            .vars
-            .iter()
-            .position(|v| v.name == name)
-            .expect("a declared fact");
-        let coord = self.vars[i]
+    pub fn word(self, name: &str, value: &str) -> Facts {
+        let coord = self.vars[self.index(name)]
             .domain
             .word(value)
             .unwrap_or_else(|| panic!("`{value}` is not a value of fact `{name}`"));
-        self.values[i] = Some(coord);
-        self
+        self.int(name, coord)
     }
 
     #[must_use]
@@ -143,9 +135,7 @@ pub struct Report {
     pub rejected: Vec<(Source, String)>,
     /// Decisions and constants the used file left to the registry.
     pub defaulted: Vec<String>,
-    /// Whether the used file says it was measured on this device: a file
-    /// carried over from another device's numbers says `measured = false`
-    /// in its provenance.
+    /// [`File::measured`] of the used file.
     pub measured: bool,
 }
 
@@ -327,22 +317,19 @@ impl Profile {
 
 impl Registry {
     fn assemble(&self, file: Option<&File>, source: Source) -> Profile {
-        let empty = File {
-            origin: String::new(),
-            target: Default::default(),
-            provenance: Vec::new(),
-            entries: BTreeMap::new(),
-            defaulted: Vec::new(),
-        };
+        let empty = File::default();
         let file = file.unwrap_or(&empty);
         let entries = self
-            .complete(file)
-            .into_iter()
-            .map(|(id, (rungs, defaulted))| {
-                let reg = self.registered(id).expect("complete walks the registry");
+            .decisions
+            .iter()
+            .map(|(id, reg)| {
+                let (rungs, defaulted) = match file.entries.get(id) {
+                    Some(rungs) => (rungs.clone(), false),
+                    None => (reg.default.clone(), true),
+                };
                 let (typed, read) = (reg.build)(&rungs);
                 (
-                    id,
+                    *id,
                     Entry {
                         spec: reg.spec,
                         rungs,
@@ -405,19 +392,10 @@ impl Registry {
         // What the overrides may require is what the target assumes.
         let mut head = String::from("api = 1\n");
         if !target.assumes.is_empty() {
-            let assumed: Vec<String> = target
-                .assumes
-                .iter()
-                .map(|&(i, c)| {
-                    let f = &self.facts[i];
-                    let v = match f.domain {
-                        Domain::Enum(_) => format!("\"{}\"", f.domain.render(c)),
-                        _ => f.domain.render(c),
-                    };
-                    format!("{} = {v}", f.name)
-                })
-                .collect();
-            head.push_str(&format!("[target]\nassumes = {{ {} }}\n", assumed.join(", ")));
+            head.push_str(&format!(
+                "[target]\nassumes = {}\n",
+                target.assumes_toml(self.facts)
+            ));
         }
         let mut entries: BTreeMap<&'static str, Vec<Rung>> = base
             .0
@@ -435,11 +413,9 @@ impl Registry {
             entries.insert(id, rungs);
         }
         let file = File {
-            origin: String::new(),
             target,
-            provenance: Vec::new(),
             entries,
-            defaulted: Vec::new(),
+            ..File::default()
         };
         Ok(self.assemble(Some(&file), source))
     }

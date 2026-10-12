@@ -1,9 +1,5 @@
-//! The end-to-end search `pie tune` runs on every backend: the decisions a
-//! kernel bench cannot price (a choice with no shape, the engine's
-//! behaviour, a fusion, a compiler price) are tried on served models, one
-//! decision at a time. A backend supplies a [`Bench`]: how to build a
-//! complete profile, serve a model under it, and fingerprint the plan it
-//! compiles. `.wiki/pie-tune.md` holds the design.
+//! The end-to-end search `pie tune` runs on every backend: decisions a
+//! kernel bench cannot price are tried on served models, one at a time.
 
 use std::fmt::Write as _;
 
@@ -21,14 +17,12 @@ pub const LANES: [usize; 3] = [1, 4, 8];
 /// Tuned decisions as `(decision id, TOML value)`.
 pub type Entries = Vec<(String, String)>;
 
-/// One decision's outcome, for the report.
 #[derive(Clone, Debug)]
 pub struct Line {
     pub id: &'static str,
     pub text: String,
 }
 
-/// One serving of one model.
 #[derive(Clone, Debug)]
 pub struct Serving {
     /// Milliseconds of each timed prompt.
@@ -46,21 +40,17 @@ pub struct Serving {
 
 /// What a backend gives the search.
 pub trait Bench {
-    /// The models the search serves, by name.
     fn models(&self) -> Vec<String>;
     /// The complete profile `entries` lay over today's, checked against
     /// the device.
     fn file(&self, entries: &[(String, String)]) -> Result<String, String>;
-    /// Serve model `model` under `file`.
     fn serve(&mut self, model: usize, file: &str) -> Result<Serving, String>;
     /// A fingerprint of the plan model `model` compiles under `file`:
     /// equal fingerprints serve the same. `None` where it cannot say.
     fn plan(&self, model: usize, file: &str) -> Option<u64>;
 }
 
-/// One decision the search tries: each candidate as the profile TOML that
-/// sets it, and whether the candidate can only matter by changing the
-/// compiled plan (a price, a fusion), so an unchanged plan is not served.
+/// One decision the search tries.
 #[derive(Clone, Debug)]
 pub struct Knob {
     pub id: &'static str,
@@ -68,9 +58,11 @@ pub struct Knob {
     pub current: String,
     /// `(label, overrides)`: the value as a reader sees it, and the TOML.
     pub candidates: Vec<(String, String)>,
-    /// Whether a number in it ranges freely, so a second look halfway
-    /// between two tried values is a value too (not so for a set).
+    /// Whether a number in it ranges freely, so halfway between two tried
+    /// values is a value too (not so for a set).
     pub halfway: bool,
+    /// It can only matter by changing the compiled plan (a price, a
+    /// fusion), so a candidate whose plan is unchanged is not served.
     pub plan_only: bool,
 }
 
@@ -106,6 +98,23 @@ pub fn knobs(base: &Profile, skip: &[&str], refusable: &str) -> Vec<Knob> {
                 .filter(|x| (x - v).abs() > f64::EPSILON)
                 .collect()
         };
+        // The values a number is tried at, around `from`: every value of a
+        // set, or half to double of a range.
+        let around = |kind: Kind, from: &str| -> Vec<String> {
+            let from: f64 = from.replace('_', "").parse().unwrap_or(1.0);
+            match kind {
+                Kind::Ints(set) => set.iter().map(i64::to_string).collect(),
+                Kind::Int { lo, hi } => scaled(from, lo as f64, hi as f64, true)
+                    .into_iter()
+                    .map(|x| (x as i64).to_string())
+                    .collect(),
+                Kind::Float { lo, hi } => scaled(from, lo, hi, false)
+                    .into_iter()
+                    .map(|x| format!("{x:.1}"))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
         match spec.shape {
             Shape::Flag => {
                 if !spec.vars.is_empty() {
@@ -114,19 +123,10 @@ pub fn knobs(base: &Profile, skip: &[&str], refusable: &str) -> Vec<Knob> {
                 values.push(if current == "false" { "true" } else { "false" }.to_string());
             }
             Shape::Constant(c) => match c.kind {
-                Kind::Ints(set) => values.extend(set.iter().map(i64::to_string)),
-                Kind::Int { lo, hi } if spec.vars.is_empty() => {
-                    ranged = true;
-                    let v: f64 = current.replace('_', "").parse().unwrap_or(1.0);
-                    values.extend(
-                        scaled(v, lo as f64, hi as f64, true)
-                            .into_iter()
-                            .map(|x| (x as i64).to_string()),
-                    );
-                }
-                Kind::Float { lo, hi } if spec.vars.is_empty() => {
-                    let v: f64 = current.replace('_', "").parse().unwrap_or(1.0);
-                    values.extend(scaled(v, lo, hi, false).into_iter().map(|x| format!("{x:.1}")));
+                Kind::Ints(_) => values.extend(around(c.kind, &current)),
+                Kind::Int { .. } | Kind::Float { .. } if spec.vars.is_empty() => {
+                    ranged = matches!(c.kind, Kind::Int { .. });
+                    values.extend(around(c.kind, &current));
                 }
                 _ => continue,
             },
@@ -136,7 +136,9 @@ pub fn knobs(base: &Profile, skip: &[&str], refusable: &str) -> Vec<Knob> {
                 }
                 // The alternative the profile holds, and its constants.
                 let held = match rungs.first().map(|r| &r.pick) {
-                    Some(crate::Pick::Alternative { index, constants }) => Some((*index, constants.clone())),
+                    Some(crate::Pick::Alternative { index, constants }) => {
+                        Some((*index, constants.clone()))
+                    }
                     _ => None,
                 };
                 for (at, alt) in alternatives.iter().enumerate() {
@@ -150,7 +152,11 @@ pub fn knobs(base: &Profile, skip: &[&str], refusable: &str) -> Vec<Knob> {
                         Some((index, constants)) if *index == at => {
                             constants.iter().map(crate::Value::toml).collect()
                         }
-                        _ => alt.constants.iter().map(|c| c.default.to_string()).collect(),
+                        _ => alt
+                            .constants
+                            .iter()
+                            .map(|c| c.default.to_string())
+                            .collect(),
                     };
                     let body = |with: &[String]| {
                         let fields: Vec<String> = alt
@@ -162,25 +168,15 @@ pub fn knobs(base: &Profile, skip: &[&str], refusable: &str) -> Vec<Knob> {
                         format!("{{ use = \"{}\", {} }}", alt.name, fields.join(", "))
                     };
                     values.push(body(&base));
-                    // One constant at a time around where it starts: every
-                    // value of a set, or half to double of a range.
+                    // One constant at a time around where it starts.
                     for (i, c) in alt.constants.iter().enumerate() {
-                        let from: f64 = base[i].replace('_', "").parse().unwrap_or(1.0);
                         let options: Vec<String> = match c.kind {
-                            Kind::Ints(set) => set.iter().map(i64::to_string).collect(),
-                            Kind::Int { lo, hi } => {
-                                ranged = true;
-                                scaled(from, lo as f64, hi as f64, true)
-                                    .into_iter()
-                                    .map(|x| (x as i64).to_string())
-                                    .collect()
-                            }
-                            Kind::Float { lo, hi } => {
-                                scaled(from, lo, hi, false).into_iter().map(|x| format!("{x:.1}")).collect()
-                            }
                             Kind::Bool => vec![(base[i] != "true").to_string()],
                             Kind::Word(names) => names.iter().map(|n| format!("\"{n}\"")).collect(),
-                            _ => Vec::new(),
+                            kind => {
+                                ranged |= matches!(kind, Kind::Int { .. });
+                                around(kind, &base[i])
+                            }
                         };
                         for o in options {
                             let mut with = base.clone();
@@ -269,7 +265,10 @@ pub fn assemble(
         facts,
     );
     if report.used != Source::User(path) {
-        return Err(format!("the tuned file is refused on this device: {:?}", report.rejected));
+        return Err(format!(
+            "the tuned file is refused on this device: {:?}",
+            report.rejected
+        ));
     }
     Ok(text)
 }
@@ -287,7 +286,10 @@ pub fn render_overrides(entries: &[(String, String)]) -> String {
     let mut out = String::new();
     for d in domains {
         let _ = writeln!(out, "[{d}]");
-        for (id, value) in entries.iter().filter(|(id, _)| id.split('.').next() == Some(d)) {
+        for (id, value) in entries
+            .iter()
+            .filter(|(id, _)| id.split('.').next() == Some(d))
+        {
             let _ = writeln!(out, "{} = {value}", &id[d.len() + 1..]);
         }
     }
@@ -295,8 +297,7 @@ pub fn render_overrides(entries: &[(String, String)]) -> String {
 }
 
 /// `entries` with `id` set to `value`, in place or appended.
-#[must_use]
-pub fn with_entry(entries: &[(String, String)], id: &str, value: &str) -> Entries {
+fn with_entry(entries: &[(String, String)], id: &str, value: &str) -> Entries {
     let mut out = entries.to_vec();
     match out.iter_mut().find(|(i, _)| i == id) {
         Some(e) => e.1 = value.to_string(),
@@ -309,8 +310,7 @@ pub fn with_entry(entries: &[(String, String)], id: &str, value: &str) -> Entrie
 /// candidate that differs from them in one whole number (`percent = 71`
 /// between 47 and 94): what a second look at a numeric decision tries.
 /// Candidates already tried, and labels with fractions, give nothing.
-#[must_use]
-pub fn halfway(best: &str, tried: &[(String, bool)]) -> Vec<String> {
+fn halfway(best: &str, tried: &[(String, bool)]) -> Vec<String> {
     // The label as text with its numbers cut out, and the numbers.
     fn split(label: &str) -> (Vec<String>, Vec<i64>) {
         let mut text = vec![String::new()];
@@ -369,16 +369,14 @@ pub fn halfway(best: &str, tried: &[(String, bool)]) -> Vec<String> {
     out
 }
 
-#[must_use]
-pub fn median(mut v: Vec<f64>) -> f64 {
+fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(f64::total_cmp);
     v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
 }
 
 /// One serving's weighted time against another's: the prompt and the
 /// one-lane step count 0.3 each, the 4- and 8-lane steps 0.2.
-#[must_use]
-pub fn relative(got: &Serving, against: &Serving) -> f64 {
+fn relative(got: &Serving, against: &Serving) -> f64 {
     let m = |v: &[f64]| median(v.to_vec());
     let mut r = 0.3 * m(&got.prompt) / m(&against.prompt);
     for (i, w) in [0.3, 0.2, 0.2].iter().enumerate() {
@@ -390,8 +388,7 @@ pub fn relative(got: &Serving, against: &Serving) -> f64 {
 /// The worst single measure of `got` against `against`: the prompt, or a
 /// lane count's step, whichever slowed most. A trade that wins the prompt
 /// and loses decode is a loss for a server, whatever the weighted mean says.
-#[must_use]
-pub fn worst(got: &Serving, against: &Serving) -> (f64, &'static str) {
+fn worst(got: &Serving, against: &Serving) -> (f64, &'static str) {
     let m = |v: &[f64]| median(v.to_vec());
     let mut out = (m(&got.prompt) / m(&against.prompt), "the prompt");
     let names = ["the 1-lane step", "the 4-lane step", "the 8-lane step"];
@@ -427,8 +424,7 @@ fn same(cosine: f64, same_top: bool) -> bool {
 }
 
 /// Why two readouts disagree, or `None` ([`same`]).
-#[must_use]
-pub fn disagrees(a: &[f32], b: &[f32]) -> Option<String> {
+fn disagrees(a: &[f32], b: &[f32]) -> Option<String> {
     let c = cosine(a, b);
     let (ta, tb) = (top(a), top(b));
     (!same(c, ta == tb)).then(|| format!("cosine {c:.4}, top token {tb} for {ta}"))
@@ -444,7 +440,6 @@ pub struct Check {
     /// (lanes, today, tuned). Several lanes put several rows through every
     /// matmul, where ladders differ most.
     pub decode_ms: Vec<(usize, f64, f64)>,
-    /// Cosine between the two prompts' readouts.
     pub cosine: f64,
     pub same_top: bool,
     /// How much slower the tuned file may read and still pass: today's own
@@ -478,7 +473,11 @@ impl Check {
             self.prefill_ms.1,
             steps.join(", "),
             self.cosine,
-            if self.same_top { "" } else { ", top token differs" }
+            if self.same_top {
+                ""
+            } else {
+                ", top token differs"
+            }
         )
     }
 }
@@ -486,7 +485,12 @@ impl Check {
 /// Serve model `model` under `today`, `tuned`, and `today` again: today's
 /// two servings bracket the tuned one, their mean is what it is compared
 /// against, and their drift is the noise it is allowed.
-pub fn check(bench: &mut dyn Bench, model: usize, today: &str, tuned: &str) -> Result<Check, String> {
+pub fn check(
+    bench: &mut dyn Bench,
+    model: usize,
+    today: &str,
+    tuned: &str,
+) -> Result<Check, String> {
     let a = bench.serve(model, today)?;
     let b = bench.serve(model, tuned)?;
     let c = bench.serve(model, today)?;
@@ -496,7 +500,13 @@ pub fn check(bench: &mut dyn Bench, model: usize, today: &str, tuned: &str) -> R
         model: bench.models()[model].clone(),
         prefill_ms: (both(&a.prompt, &c.prompt), median(b.prompt.clone())),
         decode_ms: (0..LANES.len())
-            .map(|i| (LANES[i], both(&a.steps[i], &c.steps[i]), median(b.steps[i].clone())))
+            .map(|i| {
+                (
+                    LANES[i],
+                    both(&a.steps[i], &c.steps[i]),
+                    median(b.steps[i].clone()),
+                )
+            })
             .collect(),
         cosine: cosine(&a.readout, &b.readout),
         same_top: top(&a.readout) == top(&b.readout),
@@ -578,7 +588,13 @@ pub fn search(
             continue;
         }
         let plans: Vec<Option<u64>> = (0..names.len())
-            .map(|m| if knob.plan_only { bench.plan(m, &incumbent_text) } else { None })
+            .map(|m| {
+                if knob.plan_only {
+                    bench.plan(m, &incumbent_text)
+                } else {
+                    None
+                }
+            })
             .collect();
         let mut best: Option<Best> = None;
         let mut notes: Vec<String> = Vec::new();
@@ -609,7 +625,10 @@ pub fn search(
                 Err(why) => {
                     let why = why.lines().next().unwrap_or("").to_string();
                     // `origin:line:col: ` says nothing a reader needs.
-                    let why = why.splitn(4, ':').nth(3).map_or(why.clone(), |w| w.trim().to_string());
+                    let why = why
+                        .splitn(4, ':')
+                        .nth(3)
+                        .map_or(why.clone(), |w| w.trim().to_string());
                     notes.push(format!("refused: {why}\u{1f}{seen}"));
                     continue;
                 }
@@ -617,7 +636,9 @@ pub fn search(
             let on: Vec<usize> = movable
                 .iter()
                 .copied()
-                .filter(|&m| !knob.plan_only || plans[m].is_none() || bench.plan(m, &text) != plans[m])
+                .filter(|&m| {
+                    !knob.plan_only || plans[m].is_none() || bench.plan(m, &text) != plans[m]
+                })
                 .collect();
             if on.is_empty() {
                 notes.push(format!("plans the same\u{1f}{seen}"));
@@ -637,8 +658,12 @@ pub fn search(
                     let again = match bench.serve(m, &incumbent_text) {
                         Ok(a) => a,
                         Err(why) => {
-                            let why: String = why.lines().next().unwrap_or("").chars().take(100).collect();
-                            notes.push(format!("today's file did not serve again on {} ({why})", names[m]));
+                            let why: String =
+                                why.lines().next().unwrap_or("").chars().take(100).collect();
+                            notes.push(format!(
+                                "today's file did not serve again on {} ({why})",
+                                names[m]
+                            ));
                             best = None;
                             break 'candidate;
                         }
@@ -657,7 +682,8 @@ pub fn search(
                     }
                     Ok(s) => s,
                     Err(why) => {
-                        let why: String = why.lines().next().unwrap_or("").chars().take(100).collect();
+                        let why: String =
+                            why.lines().next().unwrap_or("").chars().take(100).collect();
                         notes.push(format!("{seen} did not serve ({why})"));
                         continue 'candidate;
                     }
@@ -676,7 +702,11 @@ pub fn search(
                 r += rm / on.len() as f64;
                 got.push((m, served));
             }
-            say(&format!("  {} = {seen}: {:+.1}%", knob.id, (r - 1.0) * 100.0));
+            say(&format!(
+                "  {} = {seen}: {:+.1}%",
+                knob.id,
+                (r - 1.0) * 100.0
+            ));
             if let Some(last) = tried.last_mut() {
                 last.1 = true;
             }
@@ -700,7 +730,11 @@ pub fn search(
                 for (m, served) in got {
                     incumbent[m] = Some(served);
                 }
-                format!("{}: {:.1}% faster end to end", shown(&label), (1.0 - r) * 100.0)
+                format!(
+                    "{}: {:.1}% faster end to end",
+                    shown(&label),
+                    (1.0 - r) * 100.0
+                )
             }
             Some((r, label, _, _, bar)) => format!(
                 "kept; the best other, {}, was {:+.1}% (a change must beat {:.1}%)",
@@ -715,7 +749,9 @@ pub fn search(
         for note in notes {
             let (reason, label) = note
                 .split_once('\u{1f}')
-                .map_or((note.clone(), None), |(r, l)| (r.to_string(), Some(l.to_string())));
+                .map_or((note.clone(), None), |(r, l)| {
+                    (r.to_string(), Some(l.to_string()))
+                });
             match grouped.iter_mut().find(|(r, _)| *r == reason) {
                 Some((_, labels)) => labels.extend(label),
                 None => grouped.push((reason, label.into_iter().collect())),
@@ -760,7 +796,10 @@ mod tests {
             ]
         );
         assert!(halfway("120.0", &[("60.0".into(), true)]).is_empty());
-        assert_eq!(halfway("64", &[("32".into(), true), ("128".into(), true)]), vec!["48", "96"]);
+        assert_eq!(
+            halfway("64", &[("32".into(), true), ("128".into(), true)]),
+            vec!["48", "96"]
+        );
     }
 
     /// A bench whose time is a function of one flag and one number, with
@@ -781,7 +820,9 @@ mod tests {
         }
         fn serve(&mut self, _: usize, file: &str) -> Result<Serving, String> {
             let fast = value(file, "fast").is_some_and(|v| v == "true");
-            let n: f64 = value(file, "n").and_then(|v| v.parse().ok()).unwrap_or(10.0);
+            let n: f64 = value(file, "n")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10.0);
             let t = (if fast { 50.0 } else { 100.0 }) + (n - 30.0).abs();
             Ok(Serving {
                 prompt: vec![t],
@@ -801,7 +842,10 @@ mod tests {
         let knob = |id: &'static str, current: &str, values: &[&str], halfway: bool| Knob {
             id,
             current: current.into(),
-            candidates: values.iter().map(|v| (v.to_string(), String::new())).collect(),
+            candidates: values
+                .iter()
+                .map(|v| (v.to_string(), String::new()))
+                .collect(),
             halfway,
             plan_only: false,
         };
@@ -810,11 +854,17 @@ mod tests {
             knob("kernel.n", "10", &["5", "20", "40"], true),
             knob("kernel.unread", "1", &["2"], false),
         ];
-        let start = vec![("kernel.fast".to_string(), "false".to_string()), ("kernel.n".to_string(), "10".to_string())];
+        let start = vec![
+            ("kernel.fast".to_string(), "false".to_string()),
+            ("kernel.n".to_string(), "10".to_string()),
+        ];
         let (chosen, lines) = search(&mut Toy, start, &knobs, "", &mut |_| {}).unwrap();
         assert_eq!(chosen[0].1, "true");
         // 20 and 40 tie at 10 from 30; halfway between them finds 30.
         assert_eq!(chosen[1].1, "30", "{lines:?}");
-        assert!(lines[2].text.contains("no check model reads it"), "{lines:?}");
+        assert!(
+            lines[2].text.contains("no check model reads it"),
+            "{lines:?}"
+        );
     }
 }

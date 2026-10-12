@@ -1,11 +1,11 @@
 //! `pie tune`: measure this machine's device, fit the profile decisions its
-//! backend can measure, and write the result to the user's shelf. See
-//! `.wiki/pie-tune.md`.
+//! backend can measure, and write the result to the user's shelf.
 
 use anyhow::{Result, anyhow, bail};
 use clap::Args;
 use runtime::engine::profiles::backends;
 
+use super::profile::text;
 use crate::ui::{self, Answer, Palette};
 
 #[derive(Args, Debug)]
@@ -89,10 +89,7 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
 
     let id = profile::id_of(&tuned.device);
     let path = backend.shelf.user_path(&dir, &tuned.device);
-    let mut out = format!(
-        "{}: tuned in {:.0} s\n",
-        tuned.device, tuned.seconds
-    );
+    let mut out = format!("{}: tuned in {:.0} s\n", tuned.device, tuned.seconds);
     for (id, text) in &tuned.lines {
         out.push_str(&format!("  {id}: {text}\n"));
     }
@@ -113,13 +110,17 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
     for (line, passed) in &tuned.checks {
         out.push_str(&format!(
             "end to end: {line}{}\n",
-            if *passed { "" } else { "  <- slower or different" }
+            if *passed {
+                ""
+            } else {
+                "  <- slower or different"
+            }
         ));
     }
     if args.dry_run {
         out.push_str("\n--dry-run: nothing written. The profile:\n\n");
         out.push_str(&tuned.file);
-        return Ok(Answer::report(Text { text: out }));
+        return Ok(text(out));
     }
     if failed && !args.force {
         bail!(
@@ -154,16 +155,5 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
             "This was the quick grid; run `pie tune --full` for a profile you contribute.\n",
         );
     }
-    Ok(Answer::report(Text { text: out }))
-}
-
-#[derive(serde::Serialize)]
-struct Text {
-    text: String,
-}
-
-impl ui::Report for Text {
-    fn render(&self, _palette: &Palette) {
-        print!("{}", self.text);
-    }
+    Ok(text(out))
 }

@@ -1,16 +1,8 @@
 //! From measurements to a ladder: what `pie tune` writes for a decision.
 //!
-//! A backend measures every candidate (an alternative with its constants,
-//! or a constant's value) at every point of a grid, and hands the times
-//! here with each point's weight in the workload mix. [`fit`] writes the
-//! ordered ladder that minimises the weighted time, measured relative to
-//! the fastest candidate at each point, so a decode row and a long prefill
-//! count by their weight and not by how long they take.
-//!
-//! The fit is greedy: it starts from the best single candidate for every
-//! point, then repeatedly adds the rung (a condition of at most two atoms,
-//! and a candidate) that saves the most, while a rung saves at least
-//! [`Options::min_gain`] of the total. `.wiki/pie-tune.md` holds the design.
+//! Times are weighed relative to the fastest candidate at each point, so a
+//! decode row and a long prefill count by their weight in the workload mix,
+//! not by how long they take.
 
 use std::fmt::Write as _;
 
@@ -139,10 +131,9 @@ impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Refusal::NoSamples => write!(f, "no point was measured"),
-            Refusal::NoTerminal => write!(
-                f,
-                "no candidate that may end a ladder ran at every point"
-            ),
+            Refusal::NoTerminal => {
+                write!(f, "no candidate that may end a ladder ran at every point")
+            }
         }
     }
 }
@@ -164,8 +155,7 @@ fn relative(s: &Sample, c: usize) -> f64 {
 }
 
 /// The weighted relative time of `rungs` over `samples`.
-#[must_use]
-pub fn cost(rungs: &[FitRung], samples: &[Sample]) -> f64 {
+fn cost(rungs: &[FitRung], samples: &[Sample]) -> f64 {
     samples
         .iter()
         .map(|s| lands(rungs, s).map_or(f64::INFINITY, |c| relative(s, c)))
@@ -174,8 +164,7 @@ pub fn cost(rungs: &[FitRung], samples: &[Sample]) -> f64 {
 
 /// The weighted relative time of a per-point choice, such as the ladder a
 /// profile holds today: `None` where it picked nothing measured.
-#[must_use]
-pub fn cost_of(choice: &[Option<usize>], samples: &[Sample]) -> f64 {
+fn cost_of(choice: &[Option<usize>], samples: &[Sample]) -> f64 {
     samples
         .iter()
         .zip(choice)
@@ -225,44 +214,21 @@ fn atoms(spec: &Spec, samples: &[Sample]) -> Vec<Atom> {
     out
 }
 
-/// Improve a ladder by local search, in two passes. The greedy pass
-/// places rungs in order and cannot revisit them, so an early broad rung
-/// can hide a crossover that moves with size. First every move that lowers
-/// the cost is taken (replace a rung, insert one anywhere, delete one,
-/// change the tail), up to `max_rungs`; a narrow rung often pays only once
-/// a later move narrows a broad one. Then parsimony: with `λ` the smallest
-/// gain a rung must earn, moves are taken while `cost + λ · rungs` falls,
-/// inserting nothing, so rungs that do not earn their place go.
-#[allow(clippy::too_many_arguments)]
-fn refine(
-    rel: &[Vec<f64>],
-    holds: &[Vec<bool>],
-    conditions: &[Condition],
-    terminals: &[usize],
-    ladder: Vec<(Condition, usize)>,
-    tail: usize,
-    options: Options,
-    floor: f64,
-) -> (Vec<(Condition, usize)>, usize) {
-    let (ladder, tail) = search(rel, holds, conditions, terminals, ladder, tail, options, 0.0, true);
-    let lambda = options.min_gain * floor;
-    search(rel, holds, conditions, terminals, ladder, tail, options, lambda, false)
-}
-
-/// One local search: take the best move while `cost + lambda · rungs`
-/// falls; `insert` allows new rungs.
+/// One local search: take the best move (replace, insert or delete a rung,
+/// or change the tail) while `cost + lambda · rungs` falls; `insert` allows
+/// new rungs.
 #[allow(clippy::too_many_arguments)]
 fn search(
     rel: &[Vec<f64>],
     holds: &[Vec<bool>],
     conditions: &[Condition],
     terminals: &[usize],
-    mut ladder: Vec<(Condition, usize)>,
+    mut ladder: Rungs,
     mut tail: usize,
     options: Options,
     lambda: f64,
     insert: bool,
-) -> (Vec<(Condition, usize)>, usize) {
+) -> (Rungs, usize) {
     let inside = |(i, j): Condition, s: usize| holds[i][s] && j.is_none_or(|j| holds[j][s]);
     let points = rel.len();
     // Where each point lands on `ladder[from..]` then `tail`.
@@ -281,7 +247,7 @@ fn search(
     let mut current = score(&ladder, tail);
     for _ in 0..64 {
         let mut best: Option<(f64, Rungs, usize)> = None;
-        let mut offer = |value: f64, ladder: Vec<(Condition, usize)>, tail: usize| {
+        let mut offer = |value: f64, ladder: Rungs, tail: usize| {
             if value < current - 1e-12 && best.as_ref().is_none_or(|(b, ..)| value < *b) {
                 best = Some((value, ladder, tail));
             }
@@ -320,7 +286,10 @@ fn search(
                     continue;
                 }
                 let next = if replace { at + 1 } else { at };
-                let after: Vec<usize> = reach.iter().map(|&s| land_from(&ladder, next, tail, s)).collect();
+                let after: Vec<usize> = reach
+                    .iter()
+                    .map(|&s| land_from(&ladder, next, tail, s))
+                    .collect();
                 let rungs = ladder.len() - usize::from(replace) + 1;
                 for &cond in conditions {
                     let mask: Vec<bool> = reach.iter().map(|&s| inside(cond, s)).collect();
@@ -336,7 +305,8 @@ fn search(
                                 rel[s][after[r]]
                             };
                         }
-                        if value < current - 1e-12 && best.as_ref().is_none_or(|(b, ..)| value < *b) {
+                        if value < current - 1e-12 && best.as_ref().is_none_or(|(b, ..)| value < *b)
+                        {
                             let mut changed = ladder.clone();
                             if replace {
                                 changed[at] = (cond, k);
@@ -390,24 +360,15 @@ pub fn fit(
     let terminals: Vec<usize> = (0..candidates.len())
         .filter(|&c| candidates[c].terminal)
         .collect();
-    // The tail every ladder ends on: the terminal candidate cheapest over
-    // the points that reach it.
-    let tail = |reach: &dyn Fn(usize) -> bool| -> Option<(usize, f64)> {
-        terminals
-            .iter()
-            .map(|&c| {
-                (
-                    c,
-                    (0..samples.len()).filter(|&s| reach(s)).map(|s| rel[s][c]).sum::<f64>(),
-                )
-            })
-            .filter(|(_, cost)| cost.is_finite())
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-    };
-    let (mut terminal, mut total) = tail(&|_| true).ok_or(Refusal::NoTerminal)?;
-    let mut rungs: Vec<FitRung> = Vec::new();
-    // The same rungs as condition indices, for the refinement below.
-    let mut chosen: Vec<(Condition, usize)> = Vec::new();
+    // Greedy first: from the cheapest terminal over every point, add the
+    // rung that saves the most while it saves `min_gain` of the floor.
+    let (mut terminal, mut total) = terminals
+        .iter()
+        .map(|&c| (c, rel.iter().map(|r| r[c]).sum::<f64>()))
+        .filter(|(_, cost)| cost.is_finite())
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .ok_or(Refusal::NoTerminal)?;
+    let mut chosen: Rungs = Vec::new();
     // Where each point lands so far: `None` is the tail.
     let mut landed: Vec<Option<usize>> = vec![None; samples.len()];
 
@@ -431,11 +392,13 @@ pub fn fit(
         }
     }
 
-    while rungs.len() + 1 < options.max_rungs {
+    while chosen.len() + 1 < options.max_rungs {
         let settled: f64 = (0..samples.len())
             .filter_map(|s| landed[s].map(|c| rel[s][c]))
             .sum();
-        let reach: Vec<usize> = (0..samples.len()).filter(|&s| landed[s].is_none()).collect();
+        let reach: Vec<usize> = (0..samples.len())
+            .filter(|&s| landed[s].is_none())
+            .collect();
         // Each terminal's cost over the reach: (finite sum, points it
         // cannot run).
         let reach_cost: Vec<(f64, usize)> = terminals
@@ -462,8 +425,11 @@ pub fn fit(
                 continue;
             }
             for c in 0..candidates.len() {
-                let taken_at: Vec<usize> =
-                    inside.iter().copied().filter(|&s| rel[s][c].is_finite()).collect();
+                let taken_at: Vec<usize> = inside
+                    .iter()
+                    .copied()
+                    .filter(|&s| rel[s][c].is_finite())
+                    .collect();
                 if taken_at.is_empty() {
                     continue;
                 }
@@ -495,8 +461,6 @@ pub fn fit(
         }
         match best {
             Some((new, (i, j), c, t)) if total - new >= options.min_gain * floor => {
-                let mut when = vec![singles[i]];
-                when.extend(j.map(|j| singles[j]));
                 for s in 0..samples.len() {
                     if landed[s].is_none()
                         && holds[i][s]
@@ -506,7 +470,6 @@ pub fn fit(
                         landed[s] = Some(c);
                     }
                 }
-                rungs.push(FitRung { when, candidate: c });
                 chosen.push(((i, j), c));
                 terminal = t;
                 total = new;
@@ -514,8 +477,11 @@ pub fn fit(
             _ => break,
         }
     }
-    let _ = (rungs, total);
-    let chosen = refine(
+    // The greedy pass cannot revisit a rung, so an early broad one can hide
+    // a crossover that moves with size: search locally for any move that
+    // lowers the cost, then for parsimony, with each rung charged the least
+    // gain it must earn, so rungs that do not earn their place go.
+    let (ladder, tail) = search(
         &rel,
         &holds,
         &conditions,
@@ -523,10 +489,22 @@ pub fn fit(
         chosen,
         terminal,
         options,
-        floor,
+        0.0,
+        true,
     );
-    let mut rungs: Vec<FitRung> = chosen
-        .0
+    let lambda = options.min_gain * floor;
+    let (ladder, tail) = search(
+        &rel,
+        &holds,
+        &conditions,
+        &terminals,
+        ladder,
+        tail,
+        options,
+        lambda,
+        false,
+    );
+    let mut rungs: Vec<FitRung> = ladder
         .iter()
         .map(|&((i, j), c)| {
             let mut when = vec![singles[i]];
@@ -536,7 +514,7 @@ pub fn fit(
         .collect();
     rungs.push(FitRung {
         when: Vec::new(),
-        candidate: chosen.1,
+        candidate: tail,
     });
     let cost = cost(&rungs, &samples);
     Ok(Fit {
@@ -675,8 +653,15 @@ mod tests {
             }
         }
         let fit = fit(&SPEC, &candidates(), &samples, &[], Options::default()).unwrap();
-        assert!((fit.cost - fit.floor).abs() < 1e-9, "{}", fit.toml(&SPEC, &candidates()));
+        assert!(
+            (fit.cost - fit.floor).abs() < 1e-9,
+            "{}",
+            fit.toml(&SPEC, &candidates())
+        );
         let toml = fit.toml(&SPEC, &candidates());
-        assert!(toml.contains("n >= 34816") || toml.contains("n < 34816"), "{toml}");
+        assert!(
+            toml.contains("n >= 34816") || toml.contains("n < 34816"),
+            "{toml}"
+        );
     }
 }

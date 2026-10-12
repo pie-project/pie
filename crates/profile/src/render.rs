@@ -190,7 +190,7 @@ fn annotation(spec: &Spec, defaulted: bool) -> String {
 
 /// [`dump`], ending in a `[provenance]` table of `(key, TOML value)`.
 #[must_use]
-pub fn dump_with(profile: &Profile, provenance: &[(&str, String)]) -> String {
+pub(crate) fn dump_with(profile: &Profile, provenance: &[(&str, String)]) -> String {
     let mut out = dump(profile);
     if !provenance.is_empty() {
         let _ = writeln!(out);
@@ -247,13 +247,10 @@ pub fn dump(profile: &Profile) -> String {
             .iter()
             .filter_map(|(spec, rungs)| {
                 let name = spec.id.rsplit_once('.').map_or(spec.id, |(_, n)| n);
-                match rungs.first() {
-                    None => None,
-                    Some(r) => match &r.when {
-                        None => Some(format!("\"{name}\"")),
-                        Some(w) => Some(format!("{{ {name} = \"{}\" }}", w.text)),
-                    },
-                }
+                rungs.first().map(|r| match &r.when {
+                    None => format!("\"{name}\""),
+                    Some(w) => format!("{{ {name} = \"{}\" }}", w.text),
+                })
             })
             .collect();
         let off: Vec<&str> = flags
@@ -285,20 +282,7 @@ pub fn dump(profile: &Profile) -> String {
         let _ = writeln!(out, "tier = \"{t}\"");
     }
     if !target.assumes.is_empty() {
-        let facts = profile.facts();
-        let assumed: Vec<String> = target
-            .assumes
-            .iter()
-            .map(|&(i, c)| {
-                let f = &facts[i];
-                let v = match f.domain {
-                    crate::spec::Domain::Enum(_) => format!("\"{}\"", f.domain.render(c)),
-                    _ => f.domain.render(c),
-                };
-                format!("{} = {v}", f.name)
-            })
-            .collect();
-        let _ = writeln!(out, "assumes = {{ {} }}", assumed.join(", "));
+        let _ = writeln!(out, "assumes = {}", target.assumes_toml(profile.facts()));
     }
     let mut domains: Vec<&str> = plain.keys().copied().collect();
     for path in sets.keys().filter(|p| p.contains('.')) {

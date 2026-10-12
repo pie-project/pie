@@ -1,14 +1,6 @@
-//! Device profiles.
-//!
-//! A profile maps the hardware-dependent **decisions** a backend's code
-//! exposes to values: which alternative an op runs and with what constants,
-//! which fusions hold, how pages are laid out, how the engine paces frames.
-//! Each consuming crate declares its decisions with `#[derive(Decision)]`;
-//! the engine crate assembles them into one [`Registry`] per backend; a
-//! checked-in or user TOML file is read against it, linted, checked against
-//! the facts the backend probed, and applied whole or not at all.
-//!
-//! `.wiki/device-profiles.md` holds the design and its rulings.
+//! Device profiles: the hardware-dependent decisions a backend exposes, read
+//! from a checked-in or user TOML file against a [`Registry`], checked against
+//! the probed facts, and applied whole or not at all.
 
 pub mod ladder;
 pub mod profile;
@@ -31,11 +23,10 @@ pub use spec::{Alternative, Constant, Domain, Kind, Shape, Sort, Spec, Tune, Val
 pub use when::When;
 
 /// The backends `pie tune` can measure.
-pub const TUNABLE: &[&str] = &["metal", "cuda", "vulkan"];
+const TUNABLE: &[&str] = &["metal", "cuda", "vulkan"];
 
 /// What `pie` prints when a device runs without a profile measured on it.
-#[must_use]
-pub fn untuned_hint(device: &str, backend: &str, id: &str, report: &Report) -> String {
+fn untuned_hint(device: &str, backend: &str, id: &str, report: &Report) -> String {
     let mut out = if report.used.is_tuned() && report.rejected.is_empty() {
         format!(
             "{device}: running {}, whose numbers were carried over, not measured on it.",
@@ -47,22 +38,17 @@ pub fn untuned_hint(device: &str, backend: &str, id: &str, report: &Report) -> S
     for (source, why) in &report.rejected {
         out.push_str(&format!("\n  {source} was not used: {why}"));
     }
-    if TUNABLE.contains(&backend) {
-        out.push_str(&format!(
-            "\nTo tune it (minutes; --full for a file to contribute):\n    \
-             pie tune {backend}\n\
-             and consider contributing the result:\n    \
-             pie profile export {id} > {id}.toml\n\
-             and open a PR at https://github.com/pie-project/pie adding it under \
-             crates/engine-{backend}/profiles/. The file holds device facts and measured \
-             numbers, nothing else."
-        ));
-        return out;
-    }
+    let how = if TUNABLE.contains(&backend) {
+        format!("To tune it (minutes; --full for a file to contribute):\n    pie tune {backend}\n")
+    } else {
+        format!(
+            "To tune it, start from the profile it runs now:\n    \
+             pie profile dump > $PIE_HOME/profiles/{backend}/user/{id}.toml\n\
+             change what you measure, "
+        )
+    };
     out.push_str(&format!(
-        "\nTo tune it, start from the profile it runs now:\n    \
-         pie profile dump > $PIE_HOME/profiles/{backend}/user/{id}.toml\n\
-         change what you measure, and consider contributing the result:\n    \
+        "\n{how}and consider contributing the result:\n    \
          pie profile export {id} > {id}.toml\n\
          and open a PR at https://github.com/pie-project/pie adding it under \
          crates/engine-{backend}/profiles/. The file holds device facts and measured \

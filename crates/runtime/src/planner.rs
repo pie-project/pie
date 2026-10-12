@@ -1523,9 +1523,7 @@ impl ResidencyPlanner {
                         extra: inner.burst_shortfall(),
                     },
                     None => {
-                        if inner.completion_credit == 0
-                            && !inner.fleet_stalled()
-                        {
+                        if inner.completion_credit == 0 && !inner.fleet_stalled() {
                             return Step::Done;
                         }
                         inner.completion_credit = inner.completion_credit.saturating_sub(1);

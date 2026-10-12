@@ -145,22 +145,13 @@ fn lex(text: &str) -> Result<Vec<Token>, Error> {
                 i += 1;
                 continue;
             }
-            b'(' => {
-                out.push(Token { tok: Tok::Open, at });
-                i += 1;
-            }
-            b')' => {
-                out.push(Token {
-                    tok: Tok::Close,
-                    at,
-                });
-                i += 1;
-            }
-            b',' => {
-                out.push(Token {
-                    tok: Tok::Comma,
-                    at,
-                });
+            b'(' | b')' | b',' => {
+                let tok = match c {
+                    b'(' => Tok::Open,
+                    b')' => Tok::Close,
+                    _ => Tok::Comma,
+                };
+                out.push(Token { tok, at });
                 i += 1;
             }
             b'.' if bytes.get(i + 1) == Some(&b'.') => {
@@ -632,42 +623,17 @@ mod tests {
             "`keys` is not a variable here; declared: rows, n, bits, dtype"
         );
         assert_eq!(When::compile("rows < 4.5", VARS).unwrap_err().at, 7);
-        assert!(
-            When::compile("rows < n", VARS)
-                .unwrap_err()
-                .message
-                .contains("integer")
-        );
-        assert!(
-            When::compile("rows = 4", VARS)
-                .unwrap_err()
-                .message
-                .contains("`==`")
-        );
-        assert!(
-            When::compile("rows < 4 +1", VARS)
-                .unwrap_err()
-                .message
-                .contains("arithmetic")
-        );
-        assert!(
-            When::compile("rows < 4 rows", VARS)
-                .unwrap_err()
-                .message
-                .contains("expected `and`")
-        );
-        assert!(
-            When::compile("rows in 8..4", VARS)
-                .unwrap_err()
-                .message
-                .contains("holds nothing")
-        );
-        assert!(
-            When::compile("(rows < 4", VARS)
-                .unwrap_err()
-                .message
-                .contains("`)`")
-        );
+        for (text, want) in [
+            ("rows < n", "integer"),
+            ("rows = 4", "`==`"),
+            ("rows < 4 +1", "arithmetic"),
+            ("rows < 4 rows", "expected `and`"),
+            ("rows in 8..4", "holds nothing"),
+            ("(rows < 4", "`)`"),
+        ] {
+            let e = When::compile(text, VARS).unwrap_err();
+            assert!(e.message.contains(want), "`{text}`: {e:?}");
+        }
     }
 
     #[test]

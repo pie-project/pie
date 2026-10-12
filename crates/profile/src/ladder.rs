@@ -65,8 +65,7 @@ pub trait Decision: Sized + Clone + Send + Sync + 'static {
 #[derive(Clone, Debug)]
 pub struct Ladder<T> {
     rungs: Vec<(Region, T)>,
-    /// Raised the first time the ladder is evaluated at a point: whether a
-    /// load ever asked this decision anything (`Profile::read`).
+    /// Raised when the ladder is evaluated at a point (`Profile::read`).
     read: Arc<AtomicBool>,
 }
 
@@ -96,30 +95,21 @@ impl<T: Decision> Ladder<T> {
     /// A checked choice or constant ladder always answers.
     #[must_use]
     pub fn at(&self, at: &T::At) -> Option<&T> {
-        self.mark();
-        let n = T::spec().vars.len();
-        self.rungs
-            .iter()
-            .find(|(region, value)| {
-                region
-                    .boxes()
-                    .iter()
-                    .any(|b| (0..n).all(|i| b[i].contains(at.coord(i))))
-                    && value.fits(at)
-            })
-            .map(|(_, value)| value)
+        self.candidates(at).next()
     }
 
     /// Every rung whose region holds `at` and whose value fits it, in
-    /// order: for code that tries each until one can run (a runtime
-    /// condition, such as scratch room, can still turn one down).
-    pub fn candidates<'a>(&'a self, at: &'a T::At) -> impl Iterator<Item = &'a T> + 'a {
+    /// order: for code that tries each until one can run.
+    pub fn candidates<'a>(&'a self, at: &T::At) -> impl Iterator<Item = &'a T> {
         self.mark();
         let n = T::spec().vars.len();
         self.rungs
             .iter()
             .filter(move |(region, value)| {
-                region.boxes().iter().any(|b| (0..n).all(|i| b[i].contains(at.coord(i))))
+                region
+                    .boxes()
+                    .iter()
+                    .any(|b| (0..n).all(|i| b[i].contains(at.coord(i))))
                     && value.fits(at)
             })
             .map(|(_, value)| value)
