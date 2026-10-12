@@ -10,7 +10,7 @@ use toml::de::{DeTable, DeValue};
 
 use crate::ladder::{Decision, Ladder, Pick, Rung};
 use crate::region::Region;
-use crate::spec::{Constant, Domain, Kind, Shape, Sort, Spec, Value, Var, space};
+use crate::spec::{Alternative, Constant, Domain, Kind, Shape, Sort, Spec, Value, Var, space};
 use crate::when::When;
 
 /// The meta-model version a profile file declares as `api`.
@@ -20,7 +20,12 @@ pub const API: i64 = 1;
 const RESERVED: [&str; 3] = ["api", "target", "provenance"];
 
 /// A typed ladder, and the flag it raises when evaluated at a point.
-type Build = fn(&[Rung]) -> (Box<dyn Any + Send + Sync>, std::sync::Arc<std::sync::atomic::AtomicBool>);
+type Build = fn(
+    &[Rung],
+) -> (
+    Box<dyn Any + Send + Sync>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+);
 
 pub(crate) struct Registered {
     pub(crate) spec: &'static Spec,
@@ -93,7 +98,7 @@ pub struct Target {
 }
 
 /// A profile file read against a registry.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct File {
     pub origin: String,
     pub target: Target,
@@ -106,9 +111,8 @@ pub struct File {
 }
 
 impl File {
-    /// Whether the file says it was measured on its device: `[provenance]
-    /// measured = false` marks numbers carried over from elsewhere. Only
-    /// reporting reads it; resolution never does.
+    /// False where `[provenance] measured = false` marks numbers carried over
+    /// from another device. Only reporting reads it.
     #[must_use]
     pub fn measured(&self) -> bool {
         !self
@@ -133,16 +137,14 @@ impl Registry {
         }
     }
 
-    /// Register `T`. Panics on a declaration the meta-model forbids: these
-    /// are code errors, and any test that assembles the registry finds them.
+    /// Register `T`. Panics on a declaration the meta-model forbids: a code
+    /// error any test that assembles the registry finds.
     pub fn add<T: Decision>(&mut self) -> &mut Registry {
         self.add_defaulting::<T>(T::spec().default)
     }
 
-    /// Register `T` with this backend's own default, spelled as the TOML
-    /// value a profile would hold. For a decision several backends share
-    /// whose safe default differs between them: a fusion is on where the
-    /// backend ships its kernel.
+    /// Register `T` with this backend's own default, as TOML: for a shared
+    /// decision whose safe default differs between backends.
     pub fn add_defaulting<T: Decision>(&mut self, default: &str) -> &mut Registry {
         let spec = T::spec();
         if let Err(why) = self.admit(spec) {
@@ -252,7 +254,7 @@ impl Registry {
 
     fn default_rungs(&self, spec: &'static Spec, default: &str) -> Result<Vec<Rung>, String> {
         let text = format!("x = {default}");
-        let mut walk = Walk::new(self, &text, "default", Strict::CheckedIn);
+        let mut walk = Walk::new(self, &text, Strict::CheckedIn);
         let table = DeTable::parse(&text).map_err(|e| e.message().to_string())?;
         let value = table.get_ref().iter().next().map(|(_, v)| v.clone());
         let Some(value) = value else {
@@ -322,7 +324,7 @@ impl Registry {
         strict: Strict,
         under: Option<&BTreeMap<&'static str, Vec<Rung>>>,
     ) -> Result<File, Refusal> {
-        let mut walk = Walk::new(self, text, origin, strict);
+        let mut walk = Walk::new(self, text, strict);
         walk.under = under;
         let refuse = |diagnostics| Refusal {
             origin: origin.to_string(),
@@ -338,10 +340,7 @@ impl Registry {
         };
         let mut file = File {
             origin: origin.to_string(),
-            target: Target::default(),
-            provenance: Vec::new(),
-            entries: BTreeMap::new(),
-            defaulted: Vec::new(),
+            ..File::default()
         };
         let mut api_seen = false;
         for (key, value) in table.get_ref().iter() {
@@ -374,7 +373,7 @@ impl Registry {
         if !api_seen {
             walk.err(0, format!("a profile starts with `api = {API}`"));
         }
-        walk.file_lints(&mut file);
+        walk.file_lints(&file);
         file.defaulted = std::mem::take(&mut walk.defaulted);
         if walk.diags.is_empty() {
             Ok(file)
@@ -382,17 +381,24 @@ impl Registry {
             Err(refuse(walk.diags))
         }
     }
+}
 
-    /// The decisions a file leaves out, filled from the registry, as one
-    /// complete set of rungs per id.
-    pub(crate) fn complete(&self, file: &File) -> BTreeMap<&'static str, (Vec<Rung>, bool)> {
-        self.decisions
+impl Target {
+    /// `assumes` as an inline TOML table.
+    pub(crate) fn assumes_toml(&self, facts: &[Var]) -> String {
+        let assumed: Vec<String> = self
+            .assumes
             .iter()
-            .map(|(id, reg)| match file.entries.get(id) {
-                Some(rungs) => (*id, (rungs.clone(), false)),
-                None => (*id, (reg.default.clone(), true)),
+            .map(|&(i, c)| {
+                let f = &facts[i];
+                let v = match f.domain {
+                    Domain::Enum(_) => format!("\"{}\"", f.domain.render(c)),
+                    _ => f.domain.render(c),
+                };
+                format!("{} = {v}", f.name)
             })
-            .collect()
+            .collect();
+        format!("{{ {} }}", assumed.join(", "))
     }
 }
 
@@ -408,28 +414,23 @@ fn admit_sort(c: &Constant) -> Result<(), String> {
 
 fn admit_constant(c: &Constant) -> Result<(), String> {
     admit_sort(c)?;
-    let text = format!("x = {}", c.default);
-    let table =
-        DeTable::parse(&text).map_err(|e| format!("default `{}`: {}", c.default, e.message()))?;
-    let value = table
-        .get_ref()
-        .iter()
-        .next()
-        .map(|(_, v)| v.clone())
-        .ok_or("empty default")?;
-    let v = literal(&c.kind, value.get_ref())
-        .ok_or_else(|| format!("default `{}` is not {}", c.default, c.kind.describe()))?;
+    let not = || format!("default `{}` is not {}", c.default, c.kind.describe());
+    let v = default_literal(c)?.ok_or_else(not)?;
     if !c.kind.admits(&v) {
-        return Err(format!(
-            "default `{}` is not {}",
-            c.default,
-            c.kind.describe()
-        ));
+        return Err(not());
     }
     Ok(())
 }
 
-pub(crate) fn parse_consistent(rule: &str) -> Result<(&str, &str), String> {
+fn default_literal(c: &Constant) -> Result<Option<Value>, String> {
+    let text = format!("x = {}", c.default);
+    let table =
+        DeTable::parse(&text).map_err(|e| format!("default `{}`: {}", c.default, e.message()))?;
+    let (_, value) = table.get_ref().iter().next().ok_or("empty default")?;
+    Ok(literal(&c.kind, value.get_ref()))
+}
+
+fn parse_consistent(rule: &str) -> Result<(&str, &str), String> {
     let (id, alt) = rule
         .split_once('=')
         .ok_or_else(|| format!("`{rule}` is not `<decision> = <alternative>`"))?;
@@ -505,7 +506,7 @@ struct Walk<'a> {
 }
 
 impl<'a> Walk<'a> {
-    fn new(reg: &'a Registry, text: &'a str, _origin: &str, strict: Strict) -> Walk<'a> {
+    fn new(reg: &'a Registry, text: &'a str, strict: Strict) -> Walk<'a> {
         Walk {
             reg,
             text,
@@ -1057,7 +1058,7 @@ impl<'a> Walk<'a> {
 
     /// Lints across a whole file: requires against assumes, consistency
     /// between decisions, and (checked in) completeness.
-    fn file_lints(&mut self, file: &mut File) {
+    fn file_lints(&mut self, file: &File) {
         let facts = self.reg.facts;
         let fact_space = space(facts);
         let mut assumed = fact_space.clone();
@@ -1065,24 +1066,19 @@ impl<'a> Walk<'a> {
             assumed[i] = crate::region::Set::point(c);
         }
         let assumed = Region::full(&assumed);
-        let picks: Vec<(&'static str, &'static str)> = file
+        let picks: Vec<(&'static str, &'static Alternative)> = file
             .entries
             .iter()
             .flat_map(|(id, rungs)| {
                 let spec = self.reg.spec(id).expect("entries are registered");
                 rungs.iter().filter_map(move |r| match r.pick {
-                    Pick::Alternative { index, .. } => Some((*id, spec.alternatives()[index].name)),
+                    Pick::Alternative { index, .. } => Some((*id, &spec.alternatives()[index])),
                     _ => None,
                 })
             })
             .collect();
-        for &(id, alt_name) in &picks {
-            let spec = self.reg.spec(id).expect("registered");
-            let alt = spec
-                .alternatives()
-                .iter()
-                .find(|a| a.name == alt_name)
-                .expect("declared");
+        for (id, alt) in picks {
+            let alt_name = alt.name;
             let at = self.spans.get(id).copied().unwrap_or(0);
             if !alt.requires.is_empty() {
                 let req = When::compile(alt.requires, facts).expect("checked at registration");
@@ -1141,9 +1137,9 @@ impl<'a> Walk<'a> {
     }
 }
 
-pub(crate) fn constant_default(c: &Constant) -> Value {
-    let text = format!("x = {}", c.default);
-    let table = DeTable::parse(&text).expect("checked at registration");
-    let (_, v) = table.get_ref().iter().next().expect("one entry");
-    literal(&c.kind, v.get_ref()).expect("checked at registration")
+fn constant_default(c: &Constant) -> Value {
+    default_literal(c)
+        .ok()
+        .flatten()
+        .expect("checked at registration")
 }

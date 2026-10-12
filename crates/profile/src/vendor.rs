@@ -1,7 +1,15 @@
 //! GPU vendors, as a `vendor` fact spells them.
 
 /// Every vendor a `vendor` fact may name, for its [`crate::Domain::Enum`].
-pub const NAMES: &[&str] = &["nvidia", "amd", "intel", "apple", "qualcomm", "imagination", "other"];
+pub const NAMES: &[&str] = &[
+    "nvidia",
+    "amd",
+    "intel",
+    "apple",
+    "qualcomm",
+    "imagination",
+    "other",
+];
 
 /// The vendor a PCI vendor id stands for.
 #[must_use]

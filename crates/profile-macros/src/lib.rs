@@ -85,6 +85,7 @@ fn snake(ident: &Ident) -> String {
 }
 
 /// A domain or constant range spelled in an attribute.
+#[derive(Clone)]
 enum Values {
     Any,
     Set(Vec<i64>),
@@ -120,7 +121,7 @@ fn parse_names(input: ParseStream) -> syn::Result<Vec<String>> {
         .collect())
 }
 
-fn parse_range(input: ParseStream) -> syn::Result<(Expr, Expr)> {
+fn parse_range(input: ParseStream) -> syn::Result<Values> {
     let content;
     parenthesized!(content in input);
     let range: syn::ExprRange = content.parse()?;
@@ -131,12 +132,23 @@ fn parse_range(input: ParseStream) -> syn::Result<(Expr, Expr)> {
         ));
     }
     match (range.start, range.end) {
-        (Some(lo), Some(hi)) => Ok((*lo, *hi)),
+        (Some(lo), Some(hi)) => Ok(Values::Range(Box::new((*lo, *hi)))),
         _ => Err(syn::Error::new_spanned(
             Ident::new("range", Span::call_site()),
             "a range has both ends",
         )),
     }
+}
+
+/// `set(..)`, `range(..)`, or a list of names after one of `names`; `None`
+/// for any other word.
+fn parse_values(word: &str, names: &[&str], input: ParseStream) -> syn::Result<Option<Values>> {
+    Ok(Some(match word {
+        "set" => Values::Set(parse_ints(input)?),
+        "range" => parse_range(input)?,
+        w if names.contains(&w) => Values::Names(parse_names(input)?),
+        _ => return Ok(None),
+    }))
 }
 
 struct VarDecl {
@@ -163,20 +175,17 @@ fn parse_var(input: ParseStream, dynamic: bool) -> syn::Result<VarDecl> {
             } else {
                 input.parse()?
             };
-            match word.to_string().as_str() {
+            let w = word.to_string();
+            match w.as_str() {
                 "derived" => var.derived = true,
-                "set" => var.values = Values::Set(parse_ints(input)?),
-                "range" => {
-                    let (lo, hi) = parse_range(input)?;
-                    var.values = Values::Range(Box::new((lo, hi)));
-                }
-                "enum" => var.values = Values::Names(parse_names(input)?),
                 "bool" => var.values = Values::Bool,
                 _ => {
-                    return Err(syn::Error::new_spanned(
-                        word,
-                        "expected derived, set(..), range(..), enum(..) or bool",
-                    ));
+                    var.values = parse_values(&w, &["enum"], input)?.ok_or_else(|| {
+                        syn::Error::new_spanned(
+                            word,
+                            "expected derived, set(..), range(..), enum(..) or bool",
+                        )
+                    })?;
                 }
             }
             if !(input.peek(Ident) || input.peek(Token![enum])) {
@@ -244,20 +253,13 @@ impl Parse for DecisionAttr {
                     let mut values = Values::Any;
                     if !content.is_empty() {
                         let word: Ident = content.parse()?;
-                        values = match word.to_string().as_str() {
-                            "set" => Values::Set(parse_ints(&content)?),
-                            "range" => {
-                                let (lo, hi) = parse_range(&content)?;
-                                Values::Range(Box::new((lo, hi)))
-                            }
-                            "word" | "words" => Values::Names(parse_names(&content)?),
-                            _ => {
-                                return Err(syn::Error::new_spanned(
+                        values = parse_values(&word.to_string(), &["word", "words"], &content)?
+                            .ok_or_else(|| {
+                                syn::Error::new_spanned(
                                     word,
                                     "expected set(..), range(..) or word(..)",
-                                ));
-                            }
-                        };
+                                )
+                            })?;
                     }
                     attr.constant = Some(values);
                 }
@@ -301,8 +303,8 @@ impl Parse for DecisionAttr {
     }
 }
 
-fn domain_tokens(values: &Values) -> syn::Result<Tokens> {
-    Ok(match values {
+fn domain_tokens(values: &Values) -> Tokens {
+    match values {
         Values::Any => quote!(::profile::Domain::Int {
             lo: 0,
             hi: i64::MAX
@@ -314,7 +316,7 @@ fn domain_tokens(values: &Values) -> syn::Result<Tokens> {
         }
         Values::Names(n) => quote!(::profile::Domain::Enum(&[#(#n),*])),
         Values::Bool => quote!(::profile::Domain::Bool),
-    })
+    }
 }
 
 /// `e` without the invisible group a `macro_rules!` fragment wraps it in.
@@ -371,7 +373,7 @@ enum Ty {
     Words,
 }
 
-fn ty_of(ty: &Type) -> syn::Result<(Ty, Tokens)> {
+fn ty_of(ty: &Type) -> syn::Result<Ty> {
     let text = quote!(#ty).to_string().replace(' ', "");
     let t = match text.as_str() {
         "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64" | "isize" => Ty::Int,
@@ -387,7 +389,7 @@ fn ty_of(ty: &Type) -> syn::Result<(Ty, Tokens)> {
             ));
         }
     };
-    Ok((t, quote!(#ty)))
+    Ok(t)
 }
 
 struct ConstDecl {
@@ -405,7 +407,7 @@ fn constant(
     sort: Option<bool>,
     span_of: &dyn quote::ToTokens,
 ) -> syn::Result<ConstDecl> {
-    let (t, ty_tokens) = ty_of(ty)?;
+    let t = ty_of(ty)?;
     let (kind, specialize) = match (&values, t) {
         (Values::Set(v), Ty::Int) => (quote!(::profile::Kind::Ints(&[#(#v),*])), true),
         (Values::Range(r), Ty::Int) => {
@@ -465,9 +467,9 @@ fn constant(
     };
     let convert = match t {
         Ty::Int => {
-            quote!(<#ty_tokens>::try_from(v.as_int()).expect("a registry-checked integer fits its field"))
+            quote!(<#ty>::try_from(v.as_int()).expect("a registry-checked integer fits its field"))
         }
-        Ty::Float => quote!(v.as_float() as #ty_tokens),
+        Ty::Float => quote!(v.as_float() as #ty),
         Ty::Bool => quote!(v.as_bool()),
         Ty::Owned => quote!(v.as_word().to_string()),
         Ty::Words => quote!(v.as_words()),
@@ -503,13 +505,8 @@ fn field_constant(field: &syn::Field) -> syn::Result<ConstDecl> {
         attr.parse_args_with(|input: ParseStream| {
             while !input.is_empty() {
                 let key: Ident = input.parse()?;
-                match key.to_string().as_str() {
-                    "set" => values = Values::Set(parse_ints(input)?),
-                    "range" => {
-                        let (lo, hi) = parse_range(input)?;
-                        values = Values::Range(Box::new((lo, hi)));
-                    }
-                    "word" | "words" => values = Values::Names(parse_names(input)?),
+                let word = key.to_string();
+                match word.as_str() {
                     "default" => {
                         input.parse::<Token![=]>()?;
                         default = Some(input.parse::<Expr>()?);
@@ -517,10 +514,12 @@ fn field_constant(field: &syn::Field) -> syn::Result<ConstDecl> {
                     "launch" => sort = Some(false),
                     "specialize" => sort = Some(true),
                     _ => {
-                        return Err(syn::Error::new_spanned(
-                            key,
-                            "expected set, range, word, words, default, launch or specialize",
-                        ));
+                        values = parse_values(&word, &["word", "words"], input)?.ok_or_else(|| {
+                            syn::Error::new_spanned(
+                                key,
+                                "expected set, range, word, words, default, launch or specialize",
+                            )
+                        })?;
                     }
                 }
                 if input.peek(Token![,]) {
@@ -563,16 +562,12 @@ fn expand(input: &DeriveInput) -> syn::Result<Tokens> {
     let id = &attr.id;
     let type_doc = doc(&input.attrs);
 
-    let var_specs = attr
-        .vars
-        .iter()
-        .map(|v| {
-            let name = &v.name;
-            let domain = domain_tokens(&v.values)?;
-            let (dynamic, derived) = (v.dynamic, v.derived);
-            Ok(quote!(::profile::Var { name: #name, domain: #domain, dynamic: #dynamic, derived: #derived }))
-        })
-        .collect::<syn::Result<Vec<_>>>()?;
+    let var_specs = attr.vars.iter().map(|v| {
+        let name = &v.name;
+        let domain = domain_tokens(&v.values);
+        let (dynamic, derived) = (v.dynamic, v.derived);
+        quote!(::profile::Var { name: #name, domain: #domain, dynamic: #dynamic, derived: #derived })
+    });
 
     let at_ident = format_ident!("{}At", ident);
     let (at_type, at_def) = if attr.vars.is_empty() {
@@ -725,12 +720,7 @@ fn expand(input: &DeriveInput) -> syn::Result<Tokens> {
             }
             (Fields::Unnamed(f), false, Some(values)) if f.unnamed.len() == 1 => {
                 let field = &f.unnamed[0];
-                let values = match values {
-                    Values::Set(v) => Values::Set(v.clone()),
-                    Values::Range(r) => Values::Range(r.clone()),
-                    Values::Names(n) => Values::Names(n.clone()),
-                    Values::Any | Values::Bool => Values::Any,
-                };
+                let values = values.clone();
                 let default = match &attr.default {
                     Some(Expr::Lit(ExprLit {
                         lit: Lit::Str(s), ..

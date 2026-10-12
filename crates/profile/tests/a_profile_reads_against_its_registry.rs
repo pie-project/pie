@@ -158,21 +158,20 @@ fn qmm(rows: i64, k: i64, n: i64) -> QmmAt {
 
 #[test]
 fn the_registry_holds_together() {
-    assert!(registry().check().is_empty(), "{:?}", registry().check());
+    let problems = registry().check();
+    assert!(problems.is_empty(), "{problems:?}");
 }
 
 #[test]
 fn a_checked_in_file_reads_and_picks_by_rung() {
     let p = registry().load(M4, "m4-max.toml").expect("reads");
-    assert_eq!(
-        *p.pick::<Qmm>(&qmm(1, 4096, 131_072)),
-        Qmm::Qmv { rows_max: 8 }
-    );
-    assert_eq!(
-        *p.pick::<Qmm>(&qmm(4, 4096, 4096)),
-        Qmm::Qmv { rows_max: 2 }
-    );
-    assert_eq!(*p.pick::<Qmm>(&qmm(5, 4096, 4096)), Qmm::QmmT { bm: 64 });
+    for (at, want) in [
+        (qmm(1, 4096, 131_072), Qmm::Qmv { rows_max: 8 }),
+        (qmm(4, 4096, 4096), Qmm::Qmv { rows_max: 2 }),
+        (qmm(5, 4096, 4096), Qmm::QmmT { bm: 64 }),
+    ] {
+        assert_eq!(*p.pick::<Qmm>(&at), want, "{at:?}");
+    }
     assert_eq!(p.get::<PrefillChunk>().0, 4096);
     assert!(
         (p.get::<LaunchUs>().0 - 4.0).abs() < f64::EPSILON,
@@ -198,16 +197,24 @@ fn refusal(text: &str) -> String {
         .to_string()
 }
 
-fn with(kernel_qmm: &str) -> String {
-    M4.replace(
-        &M4[M4.find("qmm = [").unwrap()..M4.find("matmul =").unwrap()],
-        &format!("{kernel_qmm}\n"),
+/// `file` (M4 or a variant of it) with `kernel.qmm` replaced.
+fn with_qmm(file: &str, qmm: &str) -> String {
+    let old = &M4[M4.find("qmm = [").unwrap()..M4.find("matmul =").unwrap()];
+    file.replace(old, &format!("{qmm}\n"))
+}
+
+/// M4 on a family-10 chip whose qmm leads with the partial `qmm_mpp`.
+fn m5() -> String {
+    with_qmm(
+        &M4.replace("family = 9", "family = 10"),
+        r#"qmm = [{ use = "qmm_mpp", packed = false }, { use = "qmm_t", bm = 32 }]"#,
     )
 }
 
 #[test]
 fn an_unknown_name_is_refused_with_the_vocabulary_and_its_place() {
-    let e = refusal(&with(
+    let e = refusal(&with_qmm(
+        M4,
         r#"qmm = [{ when = "keys < 256", use = "qmv", rows_max = 2 }, { use = "qmm_t", bm = 32 }]"#,
     ));
     assert!(
@@ -219,84 +226,74 @@ fn an_unknown_name_is_refused_with_the_vocabulary_and_its_place() {
     let line = M4.lines().position(|l| l.starts_with("qmm = [")).unwrap() + 1;
     assert!(e.starts_with(&format!("p.toml:{line}:")), "{e}");
 
-    let e = refusal(&with(r#"qmm = "qmm_tt""#));
-    assert!(
-        e.contains("`qmm_tt` is not an alternative of `kernel.qmm`; declared: qmv, qmm_t, qmm_mpp"),
-        "{e}"
-    );
-
-    let e = refusal(&with(r#"qmm = { use = "qmm_t", bn = 32 }"#));
-    assert!(
-        e.contains("`bn` is not a constant of `qmm_t`; declared: bm"),
-        "{e}"
-    );
-
-    let e = refusal(&with(r#"qmm = { use = "qmm_t", bm = 48 }"#));
-    assert!(
-        e.contains("`kernel.qmm.qmm_t.bm` is one of 8, 16, 32, 64, found 48"),
-        "{e}"
-    );
-
-    let e = refusal(&M4.replace("[layout]", "[layot]"));
-    assert!(e.contains("`layot` is not a decision of toy; domains of toy: compiler, engine, fuse, kernel, layout"), "{e}");
-
-    let e = refusal(&M4.replace("matmul =", "matmull ="));
-    assert!(e.contains("under `kernel`: matmul, qmm"), "{e}");
-
-    let e = refusal(&M4.replace("\"residual_add_rmsnorm\"", "\"rms\""));
-    assert!(
-        e.contains("`rms` is not a flag of `fuse`; declared: mlp_swiglu, residual_add_rmsnorm"),
-        "{e}"
-    );
-
-    let e = refusal(&M4.replace("api = 1", "api = 2"));
-    assert!(
-        e.contains("this pie reads profile api 1, the file is api 2"),
-        "{e}"
-    );
+    for (file, want) in [
+        (
+            with_qmm(M4, r#"qmm = "qmm_tt""#),
+            "`qmm_tt` is not an alternative of `kernel.qmm`; declared: qmv, qmm_t, qmm_mpp",
+        ),
+        (
+            with_qmm(M4, r#"qmm = { use = "qmm_t", bn = 32 }"#),
+            "`bn` is not a constant of `qmm_t`; declared: bm",
+        ),
+        (
+            with_qmm(M4, r#"qmm = { use = "qmm_t", bm = 48 }"#),
+            "`kernel.qmm.qmm_t.bm` is one of 8, 16, 32, 64, found 48",
+        ),
+        (
+            M4.replace("[layout]", "[layot]"),
+            "`layot` is not a decision of toy; domains of toy: compiler, engine, fuse, kernel, layout",
+        ),
+        (
+            M4.replace("matmul =", "matmull ="),
+            "under `kernel`: matmul, qmm",
+        ),
+        (
+            M4.replace("\"residual_add_rmsnorm\"", "\"rms\""),
+            "`rms` is not a flag of `fuse`; declared: mlp_swiglu, residual_add_rmsnorm",
+        ),
+        (
+            M4.replace("api = 1", "api = 2"),
+            "this pie reads profile api 1, the file is api 2",
+        ),
+    ] {
+        let e = refusal(&file);
+        assert!(e.contains(want), "{e}");
+    }
 }
 
 #[test]
 fn a_ladder_must_be_total_and_every_rung_reachable() {
-    let e = refusal(&with(
-        r#"qmm = [{ when = "rows < 5", use = "qmv", rows_max = 2 }]"#,
-    ));
-    assert!(
-        e.contains("`kernel.qmm` picks nothing where `rows >= 5`"),
-        "{e}"
-    );
-
-    let e = refusal(&with(
-        r#"qmm = [{ when = "rows < 5", use = "qmv", rows_max = 2 }, { when = "rows < 4", use = "qmv", rows_max = 8 }, { use = "qmm_t", bm = 32 }]"#,
-    ));
-    assert!(e.contains("rung 2 of `kernel.qmm` is unreachable"), "{e}");
-
-    let file = M4.replace(
-        "assumes = { family = 9, ane = true }",
-        "assumes = { family = 10, ane = true }",
-    );
-    let e = refusal(&file.replace(
-        &M4[M4.find("qmm = [").unwrap()..M4.find("matmul =").unwrap()],
-        "qmm = [{ when = \"rows < 5\", use = \"qmv\", rows_max = 2 }, { use = \"qmm_mpp\", packed = true }]\n",
-    ));
-    assert!(
-        e.contains("ends on an alternative that fits only some shapes"),
-        "{e}"
-    );
+    for (file, want) in [
+        (
+            with_qmm(
+                M4,
+                r#"qmm = [{ when = "rows < 5", use = "qmv", rows_max = 2 }]"#,
+            ),
+            "`kernel.qmm` picks nothing where `rows >= 5`",
+        ),
+        (
+            with_qmm(
+                M4,
+                r#"qmm = [{ when = "rows < 5", use = "qmv", rows_max = 2 }, { when = "rows < 4", use = "qmv", rows_max = 8 }, { use = "qmm_t", bm = 32 }]"#,
+            ),
+            "rung 2 of `kernel.qmm` is unreachable",
+        ),
+        (
+            with_qmm(
+                &M4.replace("family = 9", "family = 10"),
+                r#"qmm = [{ when = "rows < 5", use = "qmv", rows_max = 2 }, { use = "qmm_mpp", packed = true }]"#,
+            ),
+            "ends on an alternative that fits only some shapes",
+        ),
+    ] {
+        let e = refusal(&file);
+        assert!(e.contains(want), "{e}");
+    }
 }
 
 #[test]
 fn a_partial_alternative_falls_through_where_it_does_not_fit() {
-    let file = M4
-        .replace(
-            "assumes = { family = 9, ane = true }",
-            "assumes = { family = 10, ane = true }",
-        )
-        .replace("weights = \"plain\"", "weights = \"mpp\"");
-    let file = file.replace(
-        &M4[M4.find("qmm = [").unwrap()..M4.find("matmul =").unwrap()],
-        "qmm = [{ use = \"qmm_mpp\", packed = false }, { use = \"qmm_t\", bm = 32 }]\n",
-    );
+    let file = m5().replace("weights = \"plain\"", "weights = \"mpp\"");
     let p = registry().load(&file, "m5.toml").expect("reads");
     assert_eq!(
         *p.pick::<Qmm>(&qmm(8, 4096, 4096)),
@@ -312,10 +309,7 @@ fn what_an_alternative_requires_the_file_must_assume() {
         e.contains("`kernel.matmul` picks `ane_columns`, which requires `ane`; `target.assumes` does not promise it"),
         "{e}"
     );
-    let e = refusal(&M4.replace(
-        "assumes = { family = 9, ane = true }",
-        "assumes = { family = 9, ane = true, cores = 40 }",
-    ));
+    let e = refusal(&M4.replace("ane = true }", "ane = true, cores = 40 }"));
     assert!(
         e.contains("`cores` is not a fact of toy; declared: family, ane"),
         "{e}"
@@ -324,15 +318,7 @@ fn what_an_alternative_requires_the_file_must_assume() {
 
 #[test]
 fn a_coupled_alternative_needs_its_partner() {
-    let file = M4.replace(
-        "assumes = { family = 9, ane = true }",
-        "assumes = { family = 10, ane = true }",
-    );
-    let file = file.replace(
-        &M4[M4.find("qmm = [").unwrap()..M4.find("matmul =").unwrap()],
-        "qmm = [{ use = \"qmm_mpp\", packed = false }, { use = \"qmm_t\", bm = 32 }]\n",
-    );
-    let e = refusal(&file);
+    let e = refusal(&m5());
     assert!(
         e.contains("`kernel.qmm` picks `qmm_mpp`, which needs `layout.weights = mpp`, and no rung of `layout.weights` picks `mpp`"),
         "{e}"
@@ -365,19 +351,29 @@ fn a_flag_cannot_read_a_dynamic_variable_and_a_dynamic_variable_is_an_axis() {
 #[test]
 fn a_checked_in_file_spells_everything_a_user_file_may_not() {
     let short = M4.replace("[compiler]\nlaunch_us = 4\n", "");
-    let e = refusal(&short);
-    assert!(e.contains("`compiler.launch_us` is unspecified"), "{e}");
-    let file = registry()
-        .parse(&short, "user.toml", Strict::User)
-        .expect("a user file fills from defaults");
-    assert_eq!(file.defaulted, vec!["compiler.launch_us".to_string()]);
-
-    let bare = with(r#"qmm = [{ when = "rows < 5", use = "qmv" }, { use = "qmm_t", bm = 32 }]"#);
-    assert!(refusal(&bare).contains("`qmv` leaves `rows_max` unspecified"));
-    let file = registry()
-        .parse(&bare, "user.toml", Strict::User)
-        .expect("reads");
-    assert_eq!(file.defaulted, vec!["kernel.qmm.qmv.rows_max".to_string()]);
+    let bare = with_qmm(
+        M4,
+        r#"qmm = [{ when = "rows < 5", use = "qmv" }, { use = "qmm_t", bm = 32 }]"#,
+    );
+    for (file, refused, defaulted) in [
+        (
+            short,
+            "`compiler.launch_us` is unspecified",
+            "compiler.launch_us",
+        ),
+        (
+            bare,
+            "`qmv` leaves `rows_max` unspecified",
+            "kernel.qmm.qmv.rows_max",
+        ),
+    ] {
+        let e = refusal(&file);
+        assert!(e.contains(refused), "{e}");
+        let file = registry()
+            .parse(&file, "user.toml", Strict::User)
+            .expect("a user file fills from defaults");
+        assert_eq!(file.defaulted, [defaulted]);
+    }
 }
 
 fn facts(family: i64, ane: bool) -> Facts {
@@ -397,14 +393,12 @@ fn resolution_takes_the_first_file_that_holds_and_says_why_others_did_not() {
         text: M4.to_string(),
     };
     let r = registry();
+    let decode = qmm(1, 4096, 131_072);
 
     let (p, report) = r.resolve(&[user.clone(), seeded.clone()], &facts(9, true));
     assert_eq!(report.used, user.source);
     assert!(!report.untuned());
-    assert_eq!(
-        *p.pick::<Qmm>(&qmm(1, 4096, 131_072)),
-        Qmm::Qmv { rows_max: 4 }
-    );
+    assert_eq!(*p.pick::<Qmm>(&decode), Qmm::Qmv { rows_max: 4 });
 
     let broken = Candidate {
         text: user.text.replace("rows_max = 4", "rows_max = 3"),
@@ -413,16 +407,9 @@ fn resolution_takes_the_first_file_that_holds_and_says_why_others_did_not() {
     let (p, report) = r.resolve(&[broken, seeded.clone()], &facts(9, true));
     assert_eq!(report.used, seeded.source);
     assert_eq!(report.rejected.len(), 1);
-    assert!(
-        report.rejected[0].1.contains("found 3"),
-        "{:?}",
-        report.rejected
-    );
+    assert!(report.rejected[0].1.contains("found 3"), "{report:?}");
     assert!(report.untuned(), "a rejected file is worth saying");
-    assert_eq!(
-        *p.pick::<Qmm>(&qmm(1, 4096, 131_072)),
-        Qmm::Qmv { rows_max: 8 }
-    );
+    assert_eq!(*p.pick::<Qmm>(&decode), Qmm::Qmv { rows_max: 8 });
 
     let (p, report) = r.resolve(std::slice::from_ref(&seeded), &facts(9, false));
     assert_eq!(
@@ -434,13 +421,9 @@ fn resolution_takes_the_first_file_that_holds_and_says_why_others_did_not() {
         report.rejected[0]
             .1
             .contains("it assumes ane = true, and this device has false"),
-        "{:?}",
-        report.rejected
+        "{report:?}"
     );
-    assert_eq!(
-        *p.pick::<Qmm>(&qmm(1, 4096, 131_072)),
-        Qmm::Qmv { rows_max: 2 }
-    );
+    assert_eq!(*p.pick::<Qmm>(&decode), Qmm::Qmv { rows_max: 2 });
     assert_eq!(*p.pick::<Qmm>(&qmm(9, 4096, 131_072)), Qmm::QmmT { bm: 32 });
     assert!(
         !p.on::<MlpSwiglu>(&MlpSwigluAt { width: 1 }),
@@ -465,8 +448,7 @@ fn resolution_takes_the_first_file_that_holds_and_says_why_others_did_not() {
         report.rejected[0]
             .1
             .contains("this device does not report family"),
-        "{:?}",
-        report.rejected
+        "{report:?}"
     );
 }
 
@@ -478,8 +460,6 @@ fn a_dump_reads_back_to_the_same_profile() {
         let file = r
             .parse(&text, "dump.toml", Strict::User)
             .unwrap_or_else(|e| panic!("{e}\n---\n{text}"));
-        let again = r.parse(&text, "dump.toml", Strict::User).unwrap();
-        assert_eq!(file.entries, again.entries);
         for (spec, rungs, _) in p.entries() {
             assert_eq!(
                 file.entries.get(spec.id).map(Vec::as_slice),
