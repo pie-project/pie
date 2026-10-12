@@ -8,12 +8,12 @@ pub(crate) struct Recording {
 
     used: std::cell::Cell<u64>,
 
-    pub(crate) layout: Vec<(u32, u32)>,
+    pub(crate) layout: Vec<crate::serve::ReadSpan>,
     pub(crate) launches: u32,
 }
 
 impl Recording {
-    pub(crate) fn new(kept: Kept, layout: Vec<(u32, u32)>, launches: u32) -> Recording {
+    pub(crate) fn new(kept: Kept, layout: Vec<crate::serve::ReadSpan>, launches: u32) -> Recording {
         Recording {
             kept,
             used: std::cell::Cell::new(0),

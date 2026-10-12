@@ -45,6 +45,24 @@ pub fn silu(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
     activation(ctx, "elementwise.silu", "silu", x, o)
 }
 
+pub fn cast_f32_to_bf16(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
+    const OP: &str = "elementwise.cast";
+    if x.dtype != Dtype::F32 || o.dtype != Dtype::Bf16 {
+        return Err(refuse(
+            OP,
+            format!(
+                "{:?} into {:?}; this cast is f32 into bf16",
+                x.dtype, o.dtype
+            ),
+        ));
+    }
+    let lanes = elementwise(OP, o.width, o.rows)?;
+    ctx.fire(
+        Fire::at("dit/cast.slang", "cast_f32_to_bf16").apply(Grid::of(lanes, GROUP)),
+        &[x.arg(), o.arg_mut(), lanes[0].arg()],
+    )
+}
+
 pub fn tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
     activation(ctx, "elementwise.tanh", "tanh", x, o)
 }
