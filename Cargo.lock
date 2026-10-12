@@ -1921,12 +1921,14 @@ dependencies = [
  "memmap2",
  "naga",
  "pie-eta-ir",
+ "pie-poem",
  "pie-poem-compiler",
  "pie-poem-exec",
  "pie-poem-ir",
  "pie-profile",
  "toml 1.1.4+spec-1.1.0",
  "tracing",
+ "ztensor-compat",
 ]
 
 [[package]]
