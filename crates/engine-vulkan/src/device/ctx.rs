@@ -610,22 +610,9 @@ impl Context {
                 .unwrap_or(false)
         };
 
-        let cores = if has_extension(&device_exts, ash::nv::shader_sm_builtins::NAME) {
-            let mut sm = vk::PhysicalDeviceShaderSMBuiltinsPropertiesNV::default();
-            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sm);
-            unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
-            sm.shader_sm_count
-        } else if has_extension(&device_exts, ash::amd::shader_core_properties::NAME) {
-            let mut cu = vk::PhysicalDeviceShaderCorePropertiesAMD::default();
-            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut cu);
-            unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
-            cu.shader_engine_count
-                * cu.shader_arrays_per_engine_count
-                * cu.compute_units_per_shader_array
-        } else {
-            0
-        };
-        let cores = (cores > 0).then_some(cores);
+        let cores = kernels_vulkan::cores::shader_cores(&device_exts, &mut |p2| unsafe {
+            instance.get_physical_device_properties2(physical, p2);
+        });
 
         let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default();

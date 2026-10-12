@@ -38,6 +38,7 @@ wgpu = { version = "30", default-features = false, features = [
     "dx12",
 ], optional = true }
 ash = { version = "0.38", default-features = false, optional = true }
+kernels-vulkan = { path = "../kernels-vulkan", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-std = { path = "../web-std" }
@@ -49,4 +50,4 @@ wgpu = { version = "30", default-features = false, features = [
 
 [features]
 default = []
-wgpu = ["dep:wgpu", "dep:naga", "dep:ash"]
+wgpu = ["dep:wgpu", "dep:naga", "dep:ash", "dep:kernels-vulkan", "kernels-vulkan/probe"]

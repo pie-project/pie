@@ -1,5 +1,7 @@
 pub mod attn;
 pub mod collective;
+#[cfg(feature = "probe")]
+pub mod cores;
 pub mod elemwise;
 pub mod encode;
 pub mod error;
