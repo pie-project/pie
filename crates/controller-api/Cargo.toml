@@ -14,7 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 ids = { path = "../ids" }
 serde = { version = "1.0", features = ["derive"] }
-tarpc = { version = "0.37", features = ["serde1"] }
+tarpc = { version = "0.38", features = ["serde1"] }
 
 [dev-dependencies]
 serde_json = "1.0"

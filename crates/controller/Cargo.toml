@@ -16,7 +16,7 @@ crate-type = ["rlib"]
 [dependencies]
 controller-api = { path = "../controller-api" }
 ids = { path = "../ids" }
-tarpc = { version = "0.37", features = [
+tarpc = { version = "0.38", features = [
     "serde-transport",
     "serde-transport-bincode",
     "tcp",

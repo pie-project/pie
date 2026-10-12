@@ -180,7 +180,7 @@ libc = "0.2"
 [workspace.package]
 version = "0.5.4"
 
-rust-version = "1.91"
+rust-version = "1.96"
 
 [workspace.dependencies]
 linkme = "0.3"

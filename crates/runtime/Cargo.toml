@@ -24,7 +24,7 @@ client-api = { package = "pie-client-api", path = "../client-api" }
 parking_lot = "0.12"
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
-wasmparser = "0.254"
+wasmparser = "0.259"
 rand = { version = "0.10.2", features = ["std_rng", "sys_rng"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing = "0.1.44"
@@ -49,7 +49,7 @@ ztensor-compat = { workspace = true }
 blake3 = "1.8"
 fancy-regex = "0.19"
 async-trait = "0.1.91"
-wasm-metadata = "0.259"
+wasm-metadata = "0.261"
 rustc-hash = "2.1"
 smallvec = "1"
 lru = "0.18.1"
@@ -73,7 +73,7 @@ opentelemetry-otlp = { version = "0.33", default-features = false, features = [
     "trace",
     "metrics",
 ] }
-wasmtime = { version = "48.0.1", default-features = false, features = [
+wasmtime = { version = "49.0.2", default-features = false, features = [
     "runtime",
     "std",
     "anyhow",
@@ -88,8 +88,8 @@ wasmtime = { version = "48.0.1", default-features = false, features = [
     "addr2line",
     "demangle",
 ] }
-wasmtime-wasi = { version = "48.0.1", default-features = false, features = ["p2", "p3"] }
-wasmtime-wasi-http = { version = "48.0.1", default-features = false, features = [
+wasmtime-wasi = { version = "49.0.2", default-features = false, features = ["p2", "p3"] }
+wasmtime-wasi-http = { version = "49.0.2", default-features = false, features = [
     "p2",
     "p3",
     "default-send-request",
@@ -99,7 +99,7 @@ wasmtime-wasi-http = { version = "48.0.1", default-features = false, features = 
 tokio = { version = "1.53", default-features = false, features = ["sync", "macros"] }
 web-std = { path = "../web-std" }
 wasmtime-web = { path = "../wasmtime-web" }
-wasmtime = { version = "48.0.1", default-features = false, features = [
+wasmtime = { version = "49.0.2", default-features = false, features = [
     "runtime",
     "std",
     "anyhow",
@@ -123,7 +123,7 @@ getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 
 # iOS, iPadOS, visionOS, tvOS and watchOS give an app no executable memory.
 [target.'cfg(all(target_vendor = "apple", not(target_os = "macos")))'.dependencies]
-wasmtime = { version = "48.0.1", default-features = false, features = ["pulley"] }
+wasmtime = { version = "49.0.2", default-features = false, features = ["pulley"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 engine-metal = { path = "../engine-metal", optional = true }
@@ -139,4 +139,4 @@ profile-fire = []
 
 [dev-dependencies]
 tempfile = "3"
-wasmtime = { version = "48", default-features = false, features = ["wat"] }
+wasmtime = { version = "49", default-features = false, features = ["wat"] }

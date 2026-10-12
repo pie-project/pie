@@ -4,36 +4,57 @@
 
 use std::path::{Path, PathBuf};
 
-use jni::JNIEnv;
-use jni::objects::{JByteArray, JClass, JObject, JString};
-use jni::sys::{jint, jlong, jobjectArray};
+use jni::errors::{ErrorPolicy, ThrowRuntimeExAndDefault};
+use jni::objects::{JByteArray, JClass, JObjectArray, JString};
+use jni::strings::{JNIStr, JNIString};
+use jni::sys::{jint, jlong};
+use jni::{Env, EnvUnowned, jni_str};
 use worker::Server;
 use worker::embedded::Settings;
 
-const EXCEPTION: &str = "org/pieproject/client/PieException$Server";
+const EXCEPTION: &JNIStr = jni_str!("org/pieproject/client/PieException$Server");
 
-/// Runs `f`, throwing its error into the JVM and returning `failed` in its place.
-fn throwing<'local, T>(
-    env: &mut JNIEnv<'local>,
-    failed: T,
-    f: impl FnOnce(&mut JNIEnv<'local>) -> anyhow::Result<T>,
-) -> T {
-    match f(env) {
-        Ok(value) => value,
-        Err(error) => {
-            if !env.exception_check().unwrap_or(false) {
-                let _ = env.throw_new(EXCEPTION, format!("{error:#}"));
-            }
-            failed
+/// Throws a native call's error as `EXCEPTION`, returning the default in its place.
+struct ThrowServer;
+
+impl<T: Default> ErrorPolicy<T, anyhow::Error> for ThrowServer {
+    type Captures<'local: 'call, 'call> = ();
+
+    fn on_error<'local: 'call, 'call>(
+        env: &mut Env<'local>,
+        _: &mut (),
+        error: anyhow::Error,
+    ) -> jni::errors::Result<T> {
+        if !env.exception_check() {
+            let _ = env.throw_new(EXCEPTION, JNIString::from(format!("{error:#}")));
         }
+        Ok(T::default())
+    }
+
+    fn on_panic<'local: 'call, 'call>(
+        env: &mut Env<'local>,
+        captures: &mut (),
+        payload: Box<dyn std::any::Any + Send + 'static>,
+    ) -> jni::errors::Result<T> {
+        <ThrowRuntimeExAndDefault as ErrorPolicy<T, jni::errors::Error>>::on_panic(
+            env, captures, payload,
+        )
     }
 }
 
-fn string(env: &mut JNIEnv, value: &JString) -> anyhow::Result<String> {
-    Ok(env.get_string(value)?.into())
+/// Runs `f`, throwing its error (or panic) into the JVM.
+fn throwing<'local, T: Default>(
+    env: &mut EnvUnowned<'local>,
+    f: impl FnOnce(&mut Env<'local>) -> anyhow::Result<T>,
+) -> T {
+    env.with_env(f).resolve::<ThrowServer>()
 }
 
-fn optional_string(env: &mut JNIEnv, value: &JString) -> anyhow::Result<Option<String>> {
+fn string(env: &mut Env, value: &JString) -> anyhow::Result<String> {
+    Ok(value.try_to_string(env)?)
+}
+
+fn optional_string(env: &mut Env, value: &JString) -> anyhow::Result<Option<String>> {
     if value.is_null() {
         Ok(None)
     } else {
@@ -72,14 +93,14 @@ fn boot(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_pieproject_server_NativeCore_start(
-    mut env: JNIEnv,
+    mut env: EnvUnowned,
     _: JClass,
     artifact: JString,
     config: JString,
     home: JString,
     listen: JString,
 ) -> jlong {
-    throwing(&mut env, 0, |env| {
+    throwing(&mut env, |env| {
         let artifact = PathBuf::from(string(env, &artifact)?);
         let config = optional_string(env, &config)?;
         let home = PathBuf::from(string(env, &home)?);
@@ -91,11 +112,11 @@ pub extern "system" fn Java_org_pieproject_server_NativeCore_start(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_pieproject_server_NativeCore_summary<'a>(
-    mut env: JNIEnv<'a>,
+    mut env: EnvUnowned<'a>,
     _: JClass,
     handle: jlong,
 ) -> JString<'a> {
-    throwing(&mut env, JObject::null().into(), |env| {
+    throwing(&mut env, |env| {
         let summary = serde_json::to_string(server(handle)?.summary())?;
         Ok(env.new_string(summary)?)
     })
@@ -103,28 +124,28 @@ pub extern "system" fn Java_org_pieproject_server_NativeCore_summary<'a>(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_pieproject_server_NativeCore_listenAddr<'a>(
-    mut env: JNIEnv<'a>,
+    mut env: EnvUnowned<'a>,
     _: JClass,
     handle: jlong,
 ) -> JString<'a> {
-    throwing(&mut env, JObject::null().into(), |env| {
+    throwing(&mut env, |env| {
         Ok(match server(handle)?.listen_addr() {
             Some(addr) => env.new_string(addr.to_string())?,
-            None => JObject::null().into(),
+            None => JString::default(),
         })
     })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_pieproject_server_NativeCore_install<'a>(
-    mut env: JNIEnv<'a>,
+    mut env: EnvUnowned<'a>,
     _: JClass,
     handle: jlong,
     program: JByteArray,
     file: JString,
     version: JString,
 ) -> JString<'a> {
-    throwing(&mut env, JObject::null().into(), |env| {
+    throwing(&mut env, |env| {
         let program = env.convert_byte_array(&program)?;
         let file = string(env, &file)?;
         let version = optional_string(env, &version)?;
@@ -137,13 +158,13 @@ pub extern "system" fn Java_org_pieproject_server_NativeCore_install<'a>(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_pieproject_server_NativeCore_installLanguage(
-    mut env: JNIEnv,
+    mut env: EnvUnowned,
     _: JClass,
     handle: jlong,
     language: JString,
     component: JByteArray,
 ) {
-    throwing(&mut env, (), |env| {
+    throwing(&mut env, |env| {
         let language = string(env, &language)?;
         let component = env.convert_byte_array(&component)?;
         server(handle)?
@@ -155,11 +176,11 @@ pub extern "system" fn Java_org_pieproject_server_NativeCore_installLanguage(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_pieproject_server_NativeCore_openSession(
-    mut env: JNIEnv,
+    mut env: EnvUnowned,
     _: JClass,
     handle: jlong,
 ) -> jint {
-    throwing(&mut env, 0, |_| {
+    throwing(&mut env, |_| {
         let session = server(handle)?
             .open_session()
             .map_err(|e| e.context("open session"))?;
@@ -169,7 +190,7 @@ pub extern "system" fn Java_org_pieproject_server_NativeCore_openSession(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_pieproject_server_NativeCore_closeSession(
-    _: JNIEnv,
+    _: EnvUnowned,
     _: JClass,
     handle: jlong,
     session: jint,
@@ -181,46 +202,46 @@ pub extern "system" fn Java_org_pieproject_server_NativeCore_closeSession(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_pieproject_server_NativeCore_sendFrame(
-    mut env: JNIEnv,
+    mut env: EnvUnowned,
     _: JClass,
     handle: jlong,
     session: jint,
     frame: JByteArray,
 ) {
-    throwing(&mut env, (), |env| {
+    throwing(&mut env, |env| {
         let frame = env.convert_byte_array(&frame)?;
         server(handle)?.send_frame(session as u32, &frame)
     });
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_pieproject_server_NativeCore_recvFrames(
-    mut env: JNIEnv,
+pub extern "system" fn Java_org_pieproject_server_NativeCore_recvFrames<'a>(
+    mut env: EnvUnowned<'a>,
     _: JClass,
     handle: jlong,
     session: jint,
     max_wait_ms: jint,
     max: jint,
-) -> jobjectArray {
-    throwing(&mut env, std::ptr::null_mut(), |env| {
+) -> JObjectArray<'a, JByteArray<'a>> {
+    throwing(&mut env, |env| {
         let frames = server(handle)?.recv_frames(
             session as u32,
             max_wait_ms.max(0) as u64,
             max.max(1) as usize,
         )?;
-        let array = env.new_object_array(frames.len() as i32, "[B", JObject::null())?;
+        let array = JObjectArray::<JByteArray>::new(env, frames.len(), JByteArray::default())?;
         for (i, frame) in frames.iter().enumerate() {
             let bytes = env.byte_array_from_slice(frame)?;
-            env.set_object_array_element(&array, i as i32, &bytes)?;
-            env.delete_local_ref(bytes)?;
+            array.set_element(env, i, &bytes)?;
+            env.delete_local_ref(bytes);
         }
-        Ok(array.into_raw())
+        Ok(array)
     })
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_pieproject_server_NativeCore_shutdown(
-    _: JNIEnv,
+    _: EnvUnowned,
     _: JClass,
     handle: jlong,
 ) {
