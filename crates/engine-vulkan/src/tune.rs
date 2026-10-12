@@ -24,6 +24,7 @@ const ASSUME: &[&str] = &["vendor", "subgroup", "coopmat", "cores"];
 
 /// What a tuned overlay on `base` may assume: its target, and the facts
 /// [`ASSUME`] names as this device reports them.
+#[cfg(any(test, feature = "vulkan"))]
 fn target(base: &Profile, facts: &Facts) -> profile::Target {
     let mut target = base.target().clone();
     for name in ASSUME {
