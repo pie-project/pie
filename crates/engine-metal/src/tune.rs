@@ -103,7 +103,10 @@ impl Grid {
             fp16: false,
         };
         let shapes = |taken: Vec<(u32, u32, u32)>| {
-            let total: f64 = taken.iter().map(|&(n, k, c)| f64::from(n) * f64::from(k) * f64::from(c)).sum();
+            let total: f64 = taken
+                .iter()
+                .map(|&(n, k, c)| f64::from(n) * f64::from(k) * f64::from(c))
+                .sum();
             taken
                 .iter()
                 .map(|&(n, k, c)| (n, k, f64::from(n) * f64::from(k) * f64::from(c) / total))
@@ -115,7 +118,12 @@ impl Grid {
                 // The four heaviest, and four spread down the census to its
                 // small attention projections: a crossover learned on large
                 // banks alone misplaces small ones.
-                shapes: shapes([0, 1, 2, 3, 9, 15, 20, 21].iter().map(|&i| CENSUS[i]).collect()),
+                shapes: shapes(
+                    [0, 1, 2, 3, 9, 15, 20, 21]
+                        .iter()
+                        .map(|&i| CENSUS[i])
+                        .collect(),
+                ),
                 banks: vec![fp16, bank(4, 64), bank(4, 32), bank(8, 64), bank(2, 64)],
             },
             Depth::Full => Grid {
@@ -308,7 +316,8 @@ impl Measured {
                 p.bank.bits,
                 p.bank.group,
                 u8::from(p.bank.fp16),
-                p.baseline.map_or_else(|| "-".to_string(), |b| b.to_string()),
+                p.baseline
+                    .map_or_else(|| "-".to_string(), |b| b.to_string()),
                 times.join(",")
             );
         }
@@ -338,7 +347,9 @@ impl Measured {
             } else if let Some(rest) = line.strip_prefix("point ") {
                 let f: Vec<&str> = rest.split(' ').collect();
                 let num = |i: usize| -> Result<u32, String> {
-                    f.get(i).and_then(|v| v.parse().ok()).ok_or(format!("field {i} of `{line}`"))
+                    f.get(i)
+                        .and_then(|v| v.parse().ok())
+                        .ok_or(format!("field {i} of `{line}`"))
                 };
                 let times: Vec<Option<f64>> = f
                     .get(7)
@@ -361,7 +372,9 @@ impl Measured {
             }
         }
         if seen != bodies {
-            return Err("the measurements were taken over another candidate list; measure again".into());
+            return Err(
+                "the measurements were taken over another candidate list; measure again".into(),
+            );
         }
         Ok(out)
     }
@@ -383,7 +396,13 @@ pub fn fit(measured: &Measured, grid: &Grid, cores: u32) -> Result<(Entries, Vec
     let mut lines = Vec::new();
     // `qmm_fp16`: whether the fp16 format's best time beats the emulated
     // format's over the 4-bit, 64-group points, weighted as decode-heavy.
-    let best = |p: &Point| p.times.iter().flatten().copied().fold(f64::INFINITY, f64::min);
+    let best = |p: &Point| {
+        p.times
+            .iter()
+            .flatten()
+            .copied()
+            .fold(f64::INFINITY, f64::min)
+    };
     let mut fp16_cost = 0.0;
     let mut emulated_cost = 0.0;
     for p in measured.points.iter().filter(|p| p.bank.fp16) {
@@ -448,10 +467,7 @@ pub fn fit(measured: &Measured, grid: &Grid, cores: u32) -> Result<(Entries, Vec
     if let Some(b) = fit.baseline {
         let _ = write!(text, "; today's ladder runs at {:.3}x", b / fit.floor);
     }
-    lines.push(Line {
-        id: spec.id,
-        text,
-    });
+    lines.push(Line { id: spec.id, text });
     let entries = vec![
         (spec.id.to_string(), ladder),
         (QmmFp16::spec().id.to_string(), fp16_on.to_string()),
@@ -505,8 +521,8 @@ mod device {
 
     use kernels_metal::linear::quant;
     use kernels_metal::{ArgValue, Encode, Error, Fire, Tensor, Tuning};
-    use profile::Decision as _;
     use poem_ir::Dtype;
+    use profile::Decision as _;
 
     use profile::search::{self, Bench, CONTEXT, Check, LANES, Line, PROMPT, STEPS, Serving};
 
@@ -561,7 +577,12 @@ mod device {
     /// Serve `artifact` under the complete profile `file`: a prompt, then
     /// steps at each lane count, timed, once the Neural Engine's programs
     /// are ready (or refused, which the serving records).
-    fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<Serving, String> {
+    fn serve(
+        artifact: &Path,
+        deployment: &str,
+        device: &str,
+        file: &str,
+    ) -> Result<Serving, String> {
         use poem::{Platform, Request};
         let slots = *LANES.iter().max().expect("lanes") as u32;
         let dir = std::env::temp_dir().join(format!("pie-tune-{}", std::process::id()));
@@ -611,11 +632,14 @@ mod device {
                 match ane.compiled() {
                     Some(Ok(())) => break,
                     Some(Err(why)) => {
-                        refused = Some(why.lines().next().unwrap_or("").chars().take(100).collect());
+                        refused =
+                            Some(why.lines().next().unwrap_or("").chars().take(100).collect());
                         break;
                     }
                     None if waited.elapsed().as_secs() > 1200 => {
-                        return Err("the Neural Engine programs did not compile in 20 minutes".into());
+                        return Err(
+                            "the Neural Engine programs did not compile in 20 minutes".into()
+                        );
                     }
                     None => std::thread::sleep(std::time::Duration::from_millis(250)),
                 }
@@ -624,7 +648,9 @@ mod device {
         let token = |i: u32| 100 + (i * 7919) % 5000;
         let prompt: Vec<u32> = (0..PROMPT).map(token).collect();
         // One fire of `lanes`: each lane's tokens into its own slot.
-        let fire = |shell: &mut crate::Shell, lanes: &[(u32, &[u32])]| -> Result<(f64, Vec<f32>), String> {
+        let fire = |shell: &mut crate::Shell,
+                    lanes: &[(u32, &[u32])]|
+         -> Result<(f64, Vec<f32>), String> {
             let lanes: Vec<crate::Lane> = lanes
                 .iter()
                 .map(|&(slot, tokens)| crate::Lane {
@@ -658,9 +684,14 @@ mod device {
         for &lanes in &LANES {
             let mut times = Vec::new();
             for step in 0..=STEPS {
-                let next: Vec<[u32; 1]> = (0..lanes).map(|l| [token((step * lanes + l) as u32)]).collect();
-                let batch: Vec<(u32, &[u32])> =
-                    next.iter().enumerate().map(|(l, t)| (l as u32, &t[..])).collect();
+                let next: Vec<[u32; 1]> = (0..lanes)
+                    .map(|l| [token((step * lanes + l) as u32)])
+                    .collect();
+                let batch: Vec<(u32, &[u32])> = next
+                    .iter()
+                    .enumerate()
+                    .map(|(l, t)| (l as u32, &t[..]))
+                    .collect();
                 let (ms, _) = fire(&mut shell, &batch)?;
                 // The first step of a lane count compiles or records.
                 if step > 0 {
@@ -874,7 +905,8 @@ mod device {
         };
         for _ in 0..copies {
             for (bytes, into) in [(&packed, 0), (&sc, 1), (&bi, 2)] {
-                let mut b = Buffer::zeroed(device, bytes.len() as u64).map_err(|e| e.to_string())?;
+                let mut b =
+                    Buffer::zeroed(device, bytes.len() as u64).map_err(|e| e.to_string())?;
                 b.write(0, bytes).map_err(|e| e.to_string())?;
                 let h = handles.bind(&b, 0, b.bytes()).map_err(|e| e.to_string())?;
                 match into {
@@ -965,10 +997,14 @@ mod device {
             // Nothing to serve: the kernel bench's fit stands alone, and
             // the provenance says no end-to-end run judged it.
             chosen = fitted;
-            for k in knobs.iter().filter(|k| k.id != "kernel.qmm" && k.id != "kernel.qmm_fp16") {
+            for k in knobs
+                .iter()
+                .filter(|k| k.id != "kernel.qmm" && k.id != "kernel.qmm_fp16")
+            {
                 lines.push(Line {
                     id: k.id,
-                    text: "not searched: no model to serve (import one, or pass --check)".to_string(),
+                    text: "not searched: no model to serve (import one, or pass --check)"
+                        .to_string(),
                 });
             }
         } else {
@@ -997,7 +1033,9 @@ mod device {
             say("end to end: nothing changed, so nothing to compare");
         }
         for (at, (_, deployment)) in models.iter().enumerate().filter(|_| !unchanged) {
-            say(&format!("end to end: serving {deployment} under today's profile and the tuned one"));
+            say(&format!(
+                "end to end: serving {deployment} under today's profile and the tuned one"
+            ));
             match search::check(&mut bench, at, &today, &draft) {
                 Ok(c) => {
                     say(&format!("  {}", c.describe()));
@@ -1013,7 +1051,11 @@ mod device {
         } else {
             format!(
                 "kernels against the f64 reference; end to end: {}",
-                checks.iter().map(Check::describe).collect::<Vec<_>>().join("; ")
+                checks
+                    .iter()
+                    .map(Check::describe)
+                    .collect::<Vec<_>>()
+                    .join("; ")
             )
         };
         let seconds = began.elapsed().as_secs_f64();
@@ -1113,7 +1155,12 @@ mod device {
             let precast_b = alloc(u64::from(cap) * u64::from(k) * 2)?;
             let partial_b = alloc(8 * u64::from(cap) * u64::from(n) * 4)?;
             let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).map_err(|e| e.to_string());
-            let (ha, ho, hp, hq) = (bind(&act_b)?, bind(&out_b)?, bind(&precast_b)?, bind(&partial_b)?);
+            let (ha, ho, hp, hq) = (
+                bind(&act_b)?,
+                bind(&out_b)?,
+                bind(&precast_b)?,
+                bind(&partial_b)?,
+            );
             let partial_rows = partial_b.bytes() / (u64::from(n) * 4);
 
             for bank in &grid.banks {
@@ -1138,7 +1185,12 @@ mod device {
                             mpp_codes: None,
                             codes: Tensor::new(w.codes[copy], n, k, dtype(bank.bits, bank.group)),
                             scales: Tensor::new(w.scales[copy], n, k / bank.group, Dtype::Bf16),
-                            biases: Some(Tensor::new(w.biases[copy], n, k / bank.group, Dtype::Bf16)),
+                            biases: Some(Tensor::new(
+                                w.biases[copy],
+                                n,
+                                k / bank.group,
+                                Dtype::Bf16,
+                            )),
                             group: bank.group,
                             bits: bank.bits,
                             ld: k,
@@ -1359,7 +1411,8 @@ mod tests {
 
     #[test]
     fn every_candidate_forces_a_ladder_the_registry_reads() {
-        let (base, _) = crate::chip::resolve("Apple M4 Max", &crate::chip::facts(9, 40, true), None);
+        let (base, _) =
+            crate::chip::resolve("Apple M4 Max", &crate::chip::facts(9, 40, true), None);
         let registry = crate::chip::registry();
         for q in candidates(&base) {
             let p = registry
@@ -1390,8 +1443,9 @@ mod tests {
                         .iter()
                         .map(|q| match *q {
                             Qmm::Mpp => None,
-                            Qmm::Tiled { crossover_tg } => (rows >= 4)
-                                .then(|| 12.0 + f64::from(crossover_tg) / 1000.0),
+                            Qmm::Tiled { crossover_tg } => {
+                                (rows >= 4).then(|| 12.0 + f64::from(crossover_tg) / 1000.0)
+                            }
                             Qmm::Qmv { packs: 2, .. } => None,
                             Qmm::Qmv { rows_max, .. } => {
                                 Some(f64::from(rows) + f64::from(8 - rows_max) / 10.0)
@@ -1420,7 +1474,10 @@ mod tests {
             tuned.contains("{ when = \"rows >= 16\", use = \"tiled\", crossover_tg = 64 }"),
             "{tuned}"
         );
-        assert!(tuned.contains("{ use = \"qmv\", rows_max = 8, packs = 1, crossover_tg = 160 }"), "{tuned}");
+        assert!(
+            tuned.contains("{ use = \"qmv\", rows_max = 8, packs = 1, crossover_tg = 160 }"),
+            "{tuned}"
+        );
         assert_eq!(lines.len(), 2);
         let file = assemble(
             &base,
@@ -1474,7 +1531,8 @@ mod tests {
 
     #[test]
     fn measurements_read_back_as_written() {
-        let (base, _) = crate::chip::resolve("Apple M4 Max", &crate::chip::facts(9, 40, true), None);
+        let (base, _) =
+            crate::chip::resolve("Apple M4 Max", &crate::chip::facts(9, 40, true), None);
         let candidates = candidates(&base);
         let mut times = vec![None; candidates.len()];
         times[0] = Some(1.5e-4);
@@ -1485,11 +1543,19 @@ mod tests {
                 rows: 8,
                 n: 5120,
                 k: 17408,
-                bank: Bank { bits: 4, group: 64, fp16: true },
+                bank: Bank {
+                    bits: 4,
+                    group: 64,
+                    fp16: true,
+                },
                 times,
                 baseline: Some(3),
             }],
-            wrong: vec![("use = \"qmv\", rows_max = 8, packs = 2, crossover_tg = 160".into(), 3, "8 x 1 x 2: off".into())],
+            wrong: vec![(
+                "use = \"qmv\", rows_max = 8, packs = 2, crossover_tg = 160".into(),
+                3,
+                "8 x 1 x 2: off".into(),
+            )],
         };
         let back = Measured::from_text(&m.to_text("Apple M4 Max"), &candidates).unwrap();
         assert_eq!(back.points[0].times, m.points[0].times);
@@ -1506,7 +1572,13 @@ mod tests {
         let registry = crate::chip::registry();
         let knobs = profile::search::knobs(&base, SEARCH_SKIPS, "kernel.ane");
         let ids: Vec<&str> = knobs.iter().map(|k| k.id).collect();
-        for want in ["kernel.sdpa.prefill", "kernel.gdn.scan", "kernel.ane.mlp", "fuse.mlp_swiglu", "compiler.launch_us"] {
+        for want in [
+            "kernel.sdpa.prefill",
+            "kernel.gdn.scan",
+            "kernel.ane.mlp",
+            "fuse.mlp_swiglu",
+            "compiler.launch_us",
+        ] {
             assert!(ids.contains(&want), "{want} not searched: {ids:?}");
         }
         assert!(!ids.contains(&"kernel.sdpa.kv_q8") && !ids.contains(&"kernel.qmm"));
@@ -1521,13 +1593,17 @@ mod tests {
 
     #[test]
     fn a_load_reads_only_the_decisions_it_evaluates() {
-        let (base, _) = crate::chip::resolve("Apple M4 Max", &crate::chip::facts(9, 40, true), None);
+        let (base, _) =
+            crate::chip::resolve("Apple M4 Max", &crate::chip::facts(9, 40, true), None);
         let tuning = kernels_metal::Tuning::new(base.clone(), false, 40);
         let _ = tuning.qmm_mpp();
-        assert!(base.read().is_empty(), "sizing at load is not a read: {:?}", base.read());
+        assert!(
+            base.read().is_empty(),
+            "sizing at load is not a read: {:?}",
+            base.read()
+        );
         let _ = tuning.qmm(&tuning.qmm_at(8, 4096, 4096, 4, 64));
         // The point reads the fp16 flag for its format.
         assert_eq!(base.read(), vec!["kernel.qmm", "kernel.qmm_fp16"]);
     }
-
 }

@@ -241,8 +241,9 @@ fn stored_q8_and_all_attention_routes_match_fp64() {
                     }
                 }
             }
-            let per = attn::split::workspace_words(attn::split::split_count(m as u32, 32), qh as u32)
-                .unwrap();
+            let per =
+                attn::split::workspace_words(attn::split::split_count(m as u32, 32), qh as u32)
+                    .unwrap();
             let words = m.div_ceil(8) as u32 * per;
             let workspace = upload(&vec![0xa5; words as usize * 4 + 64]);
             for route in 0..5 {

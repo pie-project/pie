@@ -285,18 +285,29 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pie-chip-{}", std::process::id()));
         let path = user_path(&dir, "Apple M4 Max");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "api = 1\n[kernel]\nqmm = [{ use = \"tiled\", crossover_tg = 120 }, \"qmv\"]\n").unwrap();
+        std::fs::write(
+            &path,
+            "api = 1\n[kernel]\nqmm = [{ use = \"tiled\", crossover_tg = 120 }, \"qmv\"]\n",
+        )
+        .unwrap();
         let (profile, report) = resolve("Apple M4 Max", &facts(9, 40, true), Some(&dir));
         assert!(
             matches!(report.used, profile::Source::User(_)),
             "{report:?}"
         );
         assert_eq!(
-            profile.ladder::<kernels_metal::tuning::Qmm>().values().next(),
+            profile
+                .ladder::<kernels_metal::tuning::Qmm>()
+                .values()
+                .next(),
             Some(&kernels_metal::tuning::Qmm::Tiled { crossover_tg: 120 })
         );
 
-        std::fs::write(&path, "api = 1\n[kernel]\nqmm = [{ use = \"tiled\", crossover_tg = 0 }, \"qmv\"]\n").unwrap();
+        std::fs::write(
+            &path,
+            "api = 1\n[kernel]\nqmm = [{ use = \"tiled\", crossover_tg = 0 }, \"qmv\"]\n",
+        )
+        .unwrap();
         let (profile, report) = resolve("Apple M4 Max", &facts(9, 40, true), Some(&dir));
         assert_eq!(
             report.used,
@@ -304,7 +315,10 @@ mod tests {
         );
         assert_eq!(report.rejected.len(), 1, "{report:?}");
         assert_eq!(
-            profile.ladder::<kernels_metal::tuning::Qmm>().values().next(),
+            profile
+                .ladder::<kernels_metal::tuning::Qmm>()
+                .values()
+                .next(),
             Some(&kernels_metal::tuning::Qmm::Tiled { crossover_tg: 96 }),
             "the M4 Max file again"
         );

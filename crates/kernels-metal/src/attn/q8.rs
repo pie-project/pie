@@ -1,8 +1,8 @@
 use super::{DecodePlan, Paged};
 use crate::encode::{Arg, Ctx, Fire, Grid, stated};
+use crate::tuning::SdpaMppRows;
 use crate::{Error, KvPool, Tensor};
 use dtype::Dtype;
-use crate::tuning::SdpaMppRows;
 
 pub fn enabled(pool: &KvPool, dim: u32) -> bool {
     pool.q8

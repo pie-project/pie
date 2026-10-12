@@ -104,11 +104,7 @@ fn gdn_staged_launch_at(shape: &Delta, requests: u32, rows: u32, scan: GdnScan) 
     let GdnScan::Staged { min_rows } = scan else {
         return None;
     };
-    if shape.k_dim != 128
-        || shape.v_dim != 128
-        || requests == 0
-        || rows / requests < min_rows
-    {
+    if shape.k_dim != 128 || shape.v_dim != 128 || requests == 0 || rows / requests < min_rows {
         return None;
     }
     Some(Grid::of(
@@ -451,7 +447,9 @@ pub fn gated_delta(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let rows = nonzero(OP, "rows", qkv.rows)?;
-    if let Some((point, stamp, grid)) = gdn_scan_step_launch(&shape, rows, lanes_rows(tuning.gdn_scan())) {
+    if let Some((point, stamp, grid)) =
+        gdn_scan_step_launch(&shape, rows, lanes_rows(tuning.gdn_scan()))
+    {
         return ctx.fire(
             Fire::at(GDN_SCAN_FILE, point).stamp(stamp).apply(grid),
             &[
@@ -533,7 +531,9 @@ pub fn gated_delta_chunked(
             &args,
         );
     }
-    if let Some((point, stamp, grid)) = gdn_scan_launch(&shape, lanes, lanes_rows(tuning.gdn_scan())) {
+    if let Some((point, stamp, grid)) =
+        gdn_scan_launch(&shape, lanes, lanes_rows(tuning.gdn_scan()))
+    {
         return ctx.fire(
             Fire::at(GDN_SCAN_FILE, point).stamp(stamp).apply(grid),
             &args,
@@ -839,7 +839,8 @@ pub fn gated_delta_committed(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let lanes = committed_lanes(OP, indptr)?;
-    if let Some((point, stamp, grid)) = gdn_scan_committed_launch(&shape, lanes, lanes_rows(tuning.gdn_scan()))
+    if let Some((point, stamp, grid)) =
+        gdn_scan_committed_launch(&shape, lanes, lanes_rows(tuning.gdn_scan()))
     {
         return ctx.fire(
             Fire::at(GDN_SCAN_FILE, point).stamp(stamp).apply(grid),

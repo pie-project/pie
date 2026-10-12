@@ -56,7 +56,6 @@ const SDPA_TILED: [&str; 4] = [
     "sdpa_paged_tiled_bfloat16_d_512",
 ];
 
-
 const SDPA_DECODE_LSE: [&str; 4] = [
     "sdpa_paged_decode_lse_bfloat16_d_64",
     "sdpa_paged_decode_lse_bfloat16_d_128",
@@ -415,7 +414,18 @@ fn vector(
     );
     if q8::enabled(pool, head_dim) {
         return q8::attention(
-            ctx, op, q, pool, plan, window, causal, head_dim, sm_scale, o, lse, false,
+            ctx,
+            op,
+            q,
+            pool,
+            plan,
+            window,
+            causal,
+            head_dim,
+            sm_scale,
+            o,
+            lse,
+            false,
             crate::tuning::SdpaMppRows::DEFAULT,
         );
     }
@@ -649,7 +659,18 @@ fn tiled(
             mask_stride: plan.mask_stride,
         };
         return q8::attention(
-            ctx, op, q, pool, &decode, window, causal, head_dim, sm_scale, o, lse, allow_mpp,
+            ctx,
+            op,
+            q,
+            pool,
+            &decode,
+            window,
+            causal,
+            head_dim,
+            sm_scale,
+            o,
+            lse,
+            allow_mpp,
             crate::tuning::SdpaMppRows::DEFAULT,
         );
     }

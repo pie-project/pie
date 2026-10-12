@@ -63,7 +63,6 @@ const QMV_GROUP: [u32; 3] = [32, 2, 1];
 pub(crate) const QMM_BK: i32 = 32;
 const PRECAST_BK: i32 = 64;
 
-
 const BM_RUNGS: [i32; 4] = [8, 16, 32, 64];
 
 const BN_RUNGS: [i32; 3] = [16, 32, 64];
@@ -293,7 +292,6 @@ pub fn mb_block(rows: i32, capacity: i32) -> Option<(i32, i32)> {
         .find_map(fits)
         .or_else(|| fits(BM_RUNGS[0]))
 }
-
 
 #[must_use]
 /// The widest row tile up to `widen_to` that still fills, for a padded

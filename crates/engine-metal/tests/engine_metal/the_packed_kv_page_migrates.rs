@@ -249,7 +249,9 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
 
     // The pool's planes may be GPU-private: read them through the store.
     let read_page = |pools: &Pools, values: bool, page: usize| -> Vec<u8> {
-        let all = pools.read_kv(0, values, 0, plane_bytes).expect("read plane");
+        let all = pools
+            .read_kv(0, values, 0, plane_bytes)
+            .expect("read plane");
         all[page * page_bytes..(page + 1) * page_bytes].to_vec()
     };
 

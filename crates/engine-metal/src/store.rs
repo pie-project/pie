@@ -462,11 +462,14 @@ impl Pools {
         Ok(out)
     }
 
-/// `len` bytes at `offset` of cache row `row`'s key plane, or its value
+    /// `len` bytes at `offset` of cache row `row`'s key plane, or its value
     /// plane when `values`: a host read of a pool whose planes may be
     /// GPU-private.
     pub fn read_kv(&self, row: usize, values: bool, offset: u64, len: u64) -> Result<Vec<u8>> {
-        let Some(Shape::Kv { keys, values: v, .. }) = self.shapes.get(row).copied() else {
+        let Some(Shape::Kv {
+            keys, values: v, ..
+        }) = self.shapes.get(row).copied()
+        else {
             return Err(Fault::Ceiling {
                 what: "kv cache rows",
                 need: row as u64 + 1,

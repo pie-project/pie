@@ -118,7 +118,13 @@ fn each_checked_in_profile_runs_its_familys_old_tuning() {
         let t = Tuning::new(profile.clone(), false, 10);
         let o = old(family);
         for rows in [1, 2, 4, 5, 7, 8, 9, 11, 12, 16, 17, 32, 512] {
-            for (n, k) in [(512, 4096), (1000, 4096), (1024, 4096), (4096, 1000), (8192, 8192)] {
+            for (n, k) in [
+                (512, 4096),
+                (1000, 4096),
+                (1024, 4096),
+                (4096, 1000),
+                (8192, 8192),
+            ] {
                 for (bits, group, format) in [
                     (4, 64, "fp16"),
                     (4, 64, "emulated"),
@@ -127,7 +133,15 @@ fn each_checked_in_profile_runs_its_familys_old_tuning() {
                     (8, 64, "emulated"),
                 ] {
                     // No checked-in ladder reads `fill`.
-                    let at = QmmAt { rows, fill: 0, n, k, bits, group, format };
+                    let at = QmmAt {
+                        rows,
+                        fill: 0,
+                        n,
+                        k,
+                        bits,
+                        group,
+                        format,
+                    };
                     assert_eq!(
                         t.qmm(&at).first(),
                         Some(&old_qmm(&o, &at)),
