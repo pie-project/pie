@@ -44,15 +44,13 @@ use crate::hlo::{Cmp, Elem, Fold, Val};
 use crate::linear::gemm::{dot_split, extent, head_rows, project};
 use crate::tensor::{Bank, Tensor};
 
-/// Above this many `rows · groups`, the weight is decoded once and
-/// contracted densely instead of group by group (measured on v6e: at 8 rows
-/// group-batched wins down to groups of 16; at 64 rows over 64 groups the
-/// dense decode wins).
-const GROUPED_MAX: i64 = 2048;
-
-/// Whether an `m`-row projection over `groups` groups runs group-batched.
-pub(crate) const fn grouped(m: i64, groups: i64) -> bool {
-    m * groups <= GROUPED_MAX
+/// Whether an `m`-row projection over `groups` groups of a packed bank runs
+/// group-batched: up to `kernel.quant.decode`'s `max_cells` of `rows ·
+/// groups`; past it the weight is decoded once and contracted densely
+/// (measured on v6e: at 8 rows group-batched wins down to groups of 16; at
+/// 64 rows over 64 groups the dense decode wins).
+pub(crate) fn grouped(cx: &Cx<'_>, m: i64, groups: i64) -> bool {
+    m * groups <= cx.tuning().grouped.max_cells
 }
 
 /// A packed plane as a `U8 [rows, row_bytes]` handle over the same bytes: a
@@ -209,7 +207,7 @@ pub(crate) fn contract_codes(
     let w = code_planes(cx, raw, bits, groups)?;
     let w = decode(cx, w)?;
     let xp = permute_act(cx, x, groups, per)?;
-    if grouped(m, groups) {
+    if grouped(cx, m, groups) {
         let mut out = grouped_dot(cx, xp, w, factor)?;
         if let Some(b) = bias {
             let o = offset_dot(cx, x, b)?;
@@ -444,12 +442,6 @@ pub(crate) fn code_values(cx: &mut Cx<'_>, c: Codes, elem: Elem) -> Result<Val, 
     })
 }
 
-/// A projection whose `m` rows at most run group-batched: the dot
-/// contracts each group on its own and the factors scale the `[G, m, n]`
-/// partials, so only a free convert feeds the MXU (measured on v6e: at bf16
-/// speed up to 64 rows; past it decoding the weight once wins).
-pub(crate) const GROUPED_ROWS: i64 = 64;
-
 /// `x · wᵀ` for codes `[n, k]` with one `factor` (f32 `[n, G]`, and affine
 /// `bias`) per group: f32 `[m, n]`.
 pub(crate) fn contract_native(
@@ -473,7 +465,12 @@ pub(crate) fn contract_native(
     };
     let q = code_values(cx, codes, Elem::Bf16)?;
     let q = cx.reshape(q, &[n, groups, k / groups])?;
-    if m <= GROUPED_ROWS {
+    // Up to `kernel.quant.decode`'s `max_rows` a native bank runs
+    // group-batched: the dot contracts each group on its own and the
+    // factors scale the `[G, m, n]` partials, so only a free convert feeds
+    // the MXU (measured on v6e: at bf16 speed up to 64 rows; past it
+    // decoding the weight once wins).
+    if m <= cx.tuning().grouped.max_rows {
         let xp = cx.reshape(x, &[m, groups, k / groups])?;
         let mut out = grouped_dot(cx, xp, q, factor)?;
         if let Some(b) = bias {

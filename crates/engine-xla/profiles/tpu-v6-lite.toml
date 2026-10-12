@@ -2,14 +2,58 @@
 api = 1
 
 [target]
-device = "TPU v6 lite"
+device  = "TPU v6 lite"
+assumes = { generation = 6 }
 
 [provenance]
-source   = "the MoE formulation and loop shape measured on v6e for gpt-oss-20b, carried over"
+source   = "the MoE formulation, its cost model and loop shape, the quantized decode crossover, attention and scan chunks and the weight layouts measured on v6e for gpt-oss-20b; padding and prices carried over"
 measured = true
 
+[compiler]
+cond_fixed_us       = 5.0
+cond_per_arm_us     = 0.6
+cost.attention_us   = 60.0
+cost.collective_us  = 50.0
+cost.custom_us      = 20.0
+cost.elementwise_us = 4.0
+cost.layout_us      = 4.0
+cost.linear_us      = 40.0
+cost.spatial_us     = 40.0
+fat_region_us       = 250.0
+fork_floor_us       = 20.0
+launch_us           = 1.0
+side_streams        = 2
+
+[engine]
+pad.growth          = 200
+pad.mixed_host_rung = 16
+pad.page_floor      = 16
+pad.room            = 128
+
 [kernel]
-moe.path          = "auto"
-moe.gmm           = true
-moe.loop_unroll   = 2
-moe.loop_tile_max = 128
+attn.block_keys             = 512
+attn.block_rows             = 512
+attn.budget_mi              = 16
+attn.per_row_max            = 2
+moe.cost.dense_all_mi       = 128
+moe.cost.loop_row_ns        = 10
+moe.cost.loop_tile_ns       = 14_000
+moe.cost.slice_bytes_per_ns = 1_200
+moe.cost.slice_mib          = 18
+moe.cost.slice_pairs        = 8
+moe.cost.whole_bytes_per_ns = 1_450
+moe.cost.whole_partial_fs   = 5_500
+moe.gmm_block_mib           = 12
+moe.gmm_tm                  = 16
+moe.loop_tile_max           = 128
+moe.loop_unroll             = 2
+moe.path                    = { use = "auto", gmm = true }
+quant.decode                = { use = "grouped", max_cells = 2048, max_rows = 64 }
+ssm.chunk                   = 64
+ssm.kda_chunk               = 16
+ssm.long_chunk              = 128
+
+[layout]
+embed_fold     = true
+gemm_transpose = true
+mxfp4_prescale = "fits"

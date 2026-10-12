@@ -99,6 +99,7 @@ pub fn bidirectional(
         let qv = cx.read(q)?;
         let kv = cx.read(k)?;
         let vv = cx.read(v)?;
+        let ch = cx.tuning().chunks;
         let f = cx.func();
         let (lo, hi, _) = segment_of(f, seg, images, r)?;
         let q4 = f.reshape(qv, &[r, heads.kvh, heads.g, heads.d])?;
@@ -112,6 +113,7 @@ pub fn bidirectional(
             &rows,
             i64::from(k.rows),
             f64::from(sm_scale),
+            ch,
         )?;
         cx.write(o, fl.o)
     })

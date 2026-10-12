@@ -29,6 +29,7 @@ use crate::cx::{Ctx, Cx, expect};
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Elem, Fold, Func, GatherDims, Malformed, Val};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
+use crate::tuning::Chunks;
 
 // ------------------------------------------------------------------ helpers
 
@@ -856,14 +857,8 @@ impl Flashed {
 
 // ------------------------------------------------------------------ drivers
 
-/// Element budget of one chunk's largest intermediate.
-const BUDGET: i64 = 1 << 24;
-
-/// Query rows per block of the blocked driver.
-const BLOCK_ROWS: i64 = 512;
-
-/// Keys per chunk of the blocked driver.
-const BLOCK_KEYS: i64 = 512;
+// One chunk's element budget and the blocked driver's rows per block and
+// keys per chunk are `kernel.attn.*` (`Tuning::chunks`).
 
 /// The keys a per-row walk visits.
 #[derive(Clone, Copy, Debug)]
@@ -883,6 +878,7 @@ pub(crate) fn per_row(
     rows: &Rows,
     keys: KeyList,
     scale: f64,
+    ch: Chunks,
 ) -> Built<Flashed> {
     let Planes::Paged { geom, .. } = *planes else {
         return bad("the per-row walk reads a paged pool");
@@ -896,7 +892,7 @@ pub(crate) fn per_row(
         KeyList::Table(t) => f.dims(t)[1],
     };
     let width = (h.kvh * (h.d + h.dv)).max(h.qh()).max(1);
-    let c = pow2_floor((BUDGET / (r * width)).max(8)).min(round_up(total, 8));
+    let c = pow2_floor((ch.budget / (r * width)).max(8)).min(round_up(total, 8));
     // A windowed row admits at most `window` keys: chunks of about that
     // width (whole pages), walked from the lowest admitted one, read the
     // window and not the whole span.
@@ -1106,10 +1102,11 @@ pub(crate) fn blocked(
     rows: &Rows,
     keys: i64,
     scale: f64,
+    ch: Chunks,
 ) -> Built<Flashed> {
     let r = f.dims(rows.q)[0];
     let qh = h.qh().max(1);
-    let br = BLOCK_ROWS.min(round_up(r, 8));
+    let br = ch.block_rows.min(round_up(r, 8));
     let nb = cdiv(r, br);
     let rp = nb * br;
     let rows_p = if rp > r {
@@ -1118,8 +1115,8 @@ pub(crate) fn blocked(
         *rows
     };
     let width = (h.kvh * (h.d + h.dv)).max(1);
-    let fit = pow2_floor((BUDGET / (br * qh)).min(BUDGET / width).max(8));
-    let c = BLOCK_KEYS.min(fit).min(round_up(keys.max(1), 8));
+    let fit = pow2_floor((ch.budget / (br * qh)).min(ch.budget / width).max(8));
+    let c = ch.block_keys.min(fit).min(round_up(keys.max(1), 8));
     // Lanes narrower than a chunk: walk them a span at a time, so no chunk
     // straddles two lanes (the mask is then read as a window, below).
     let c = match rule.kp_span {
@@ -1652,7 +1649,7 @@ pub(crate) fn attend(ctx: &Ctx<'_>, call: Paged, pool: &KvPool) -> Result<(), Er
         let geom = read_geometry(cx, pool)?;
         let walk = match call.walk {
             _ if call.selection.is_some() => Walk::PerRow,
-            Walk::Auto if r <= 2 * geom.lanes => Walk::PerRow,
+            Walk::Auto if r <= cx.tuning().attn_per_row_max * geom.lanes => Walk::PerRow,
             Walk::Auto => Walk::Blocked,
             w => w,
         };
@@ -1744,12 +1741,13 @@ pub(crate) fn attend(ctx: &Ctx<'_>, call: Paged, pool: &KvPool) -> Result<(), Er
             }
             None => None,
         };
+        let ch = cx.tuning().chunks;
         let f = cx.func();
         let scale = f64::from(call.sm_scale);
         let flashed = match (walk, sel) {
             (_, Some((sel, ratio))) => {
                 let table = selected_positions(f, sel, qpos, ratio)?;
-                per_row(f, &planes, &heads, &rule, &rs, KeyList::Table(table), scale)?
+                per_row(f, &planes, &heads, &rule, &rs, KeyList::Table(table), scale, ch)?
             }
             (Walk::Blocked, None) => blocked(
                 f,
@@ -1759,8 +1757,9 @@ pub(crate) fn attend(ctx: &Ctx<'_>, call: Paged, pool: &KvPool) -> Result<(), Er
                 &rs,
                 geom.lanes * geom.span,
                 scale,
+                ch,
             )?,
-            _ => per_row(f, &planes, &heads, &rule, &rs, KeyList::Range, scale)?,
+            _ => per_row(f, &planes, &heads, &rule, &rs, KeyList::Range, scale, ch)?,
         };
         let lse = match call.lse {
             Some(_) => Some(flashed.lse2(f)?),

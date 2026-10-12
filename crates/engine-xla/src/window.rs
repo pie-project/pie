@@ -4,7 +4,6 @@ use kernels_xla::Tensor;
 use poem_compiler::{CompiledModel, Lowering, Region};
 use poem_exec::fire::{EventId, MaskSpan, Sink, WindowTable, fallback};
 use poem_exec::store::check::{self, rebase};
-use poem_exec::store::kv::Geometry;
 use poem_ir::{Def, Dim, Dtype, GeomKind, Operands, Operation, RuntimeInput, Trace, Ty};
 
 use crate::inputs::Inputs;
@@ -70,32 +69,6 @@ pub struct GatheredSpace {
     pub last_page_lens: Tensor,
 
     pub kv_len: Tensor,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct Copies<'a> {
-    pub bucket: u32,
-
-    pub enabled: bool,
-
-    pub spaces: &'a [Geometry],
-
-    pub positions: &'a [i32],
-
-    pub request_of_token: &'a [i32],
-}
-
-impl Copies<'_> {
-    #[must_use]
-    pub fn off() -> Copies<'static> {
-        Copies {
-            bucket: 0,
-            enabled: false,
-            spaces: &[],
-            positions: &[],
-            request_of_token: &[],
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -221,102 +194,14 @@ fn seat(windows: &mut Vec<Window>, window: Window) -> u32 {
     index as u32
 }
 
-fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], copies: Copies<'_>) -> Window {
-    let mut rows_host: Vec<i32> = Vec::new();
-    let mut lanes: Vec<usize> = Vec::new();
-    let mut bounds: Vec<i32> = vec![0];
-    for run in runs {
-        for row in run.row_offset..run.row_offset + run.rows {
-            rows_host.push(row as i32);
-        }
-        for lane in run.lane_offset..run.lane_offset + run.lanes {
-            let lane = lane as usize;
-
-            let width = indptr_host
-                .get(lane + 1)
-                .zip(indptr_host.get(lane))
-                .map_or(0, |(end, start)| end - start);
-            bounds.push(bounds.last().copied().unwrap_or(0) + width);
-            lanes.push(lane);
-        }
-    }
-
-    let relay = |table: &[i32]| -> Vec<i32> {
-        rows_host
-            .iter()
-            .map(|&row| table.get(row as usize).copied().unwrap_or(0))
-            .collect()
-    };
-    let positions_host = relay(copies.positions);
-    let request_of_token_host = relay(copies.request_of_token);
-
-    let spaces = copies
-        .spaces
-        .iter()
-        .map(|space| {
-            let mut page_indptr_host: Vec<i32> = vec![0];
-            let mut page_indices_host: Vec<i32> = Vec::new();
-            let mut last_page_lens_host: Vec<i32> = Vec::new();
-            let mut kv_len_host: Vec<i32> = Vec::new();
-            for &lane in &lanes {
-                let start = space.indptr.get(lane).copied().unwrap_or(0).max(0) as usize;
-                let end = space.indptr.get(lane + 1).copied().unwrap_or(0).max(0) as usize;
-                let pages = space.indices.get(start..end).unwrap_or(&[]);
-                page_indices_host.extend_from_slice(pages);
-                page_indptr_host.push(page_indices_host.len() as i32);
-                last_page_lens_host.push(space.last_page_len.get(lane).copied().unwrap_or(0));
-                kv_len_host.push(space.kv_len.get(lane).copied().unwrap_or(0));
-            }
-            GatheredSpace {
-                page_indptr_host,
-                page_indices_host,
-                last_page_lens_host,
-                kv_len_host,
-                page_indptr: Tensor::new(NIL, 0, 1, Dtype::I32),
-                page_indices: Tensor::new(NIL, 0, 1, Dtype::I32),
-                last_page_lens: Tensor::new(NIL, 0, 1, Dtype::I32),
-                kv_len: Tensor::new(NIL, 0, 1, Dtype::I32),
-            }
-        })
-        .collect();
-
-    Window {
-        span: MaskSpan {
-            row_offset: 0,
-            rows: rows_host.len() as u32,
-            lane_offset: 0,
-            lanes: lanes.len() as u32,
-        },
-        indptr_host: bounds,
-        indptr: Tensor::new(NIL, 0, 1, Dtype::I32),
-        gathered: Some(Gathered {
-            runs: runs.to_vec(),
-            rows: Tensor::new(NIL, 0, 1, Dtype::I32),
-            rows_host,
-            positions: Tensor::new(NIL, 0, 1, Dtype::I32),
-            positions_host,
-            request_of_token: Tensor::new(NIL, 0, 1, Dtype::I32),
-            request_of_token_host,
-            spaces,
-        }),
-
-        patch: MaskSpan::default(),
-        voxel: MaskSpan::default(),
-        pass: 0,
-        passes: 1,
-    }
-}
-
 impl Windows {
     #[allow(clippy::too_many_arguments)]
     pub fn of(
-        trace: &Trace,
         compiled: &CompiledModel,
         classes: &WindowTable,
         patches: &WindowTable,
         voxels: &WindowTable,
         indptr_host: &[i32],
-        copies: Copies<'_>,
         run_caps: &[u32],
         run_passes: &[u32],
     ) -> Result<Windows> {
@@ -368,19 +253,6 @@ impl Windows {
 
             if spans.is_empty() {
                 spans.push(MaskSpan::default());
-            }
-
-            if spans.len() > 1
-                && copies.enabled
-                && fallback::copies(compiled, axis, &region.mask, copies.bucket)
-                && copyable_mask(trace, compiled, &region.mask)
-            {
-                let mut gathered = gather_of(&spans, indptr_host, copies);
-                gathered.patch = patch;
-                gathered.voxel = voxel;
-                of_region.push((runs.len() as u32, 1));
-                runs.push(seat(&mut windows, gathered));
-                continue;
             }
 
             let cap = run_caps.get(at).copied().unwrap_or(0);

@@ -15,7 +15,7 @@ use checkpoint::plan::{LoadPlan, StorageTarget, compile_streaming};
 use checkpoint::serving::Stamp;
 use checkpoint::types::{BackendKind, ScaleForm, TensorId};
 use kernels_xla::{Bank, Tensor};
-use poem_ir::{Dtype, Fused, ParamSource, Trace};
+use poem_ir::{Dtype, ParamSource, Trace};
 
 use crate::device::Device;
 use crate::error::{Fault, Result};
@@ -114,6 +114,36 @@ pub(crate) fn plane_bytes(name: &str, dtype: Dtype, shape: &[u64]) -> Result<u64
     Ok(rows.saturating_mul(width).saturating_mul(element))
 }
 
+/// How a load lays its weights out on the device: the profile's
+/// `layout.*` decisions (`crate::chip::Engine`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Layouts {
+    /// An mxfp4 bank may land pre-scaled to e5m2 where it fits.
+    pub prescale: bool,
+    /// Gemm-only weights land transposed `[K, N]` (`gemm_only`).
+    pub gemm_transpose: bool,
+    /// Gather-only sub-byte tables land folded (`gather_only`).
+    pub embed_fold: bool,
+}
+
+impl Layouts {
+    /// Every layout on: how every load landed before the profile chose.
+    pub const DEFAULT: Layouts = Layouts {
+        prescale: true,
+        gemm_transpose: true,
+        embed_fold: true,
+    };
+
+    #[must_use]
+    pub fn of(engine: &crate::chip::Engine) -> Layouts {
+        Layouts {
+            prescale: engine.prescale == crate::chip::Mxfp4Prescale::Fits,
+            gemm_transpose: engine.gemm_transpose,
+            embed_fold: engine.embed_fold,
+        }
+    }
+}
+
 impl Weights {
     pub fn resident(
         device: &Device,
@@ -122,6 +152,7 @@ impl Weights {
         contract: &ModelContract,
         path: &Path,
         device_cap: u64,
+        layouts: Layouts,
     ) -> Result<Weights> {
         if let Some(param) = trace.params.iter().find(|p| p.dtype == Dtype::U4g64tiled) {
             return Err(Fault::Param {
@@ -204,7 +235,7 @@ impl Weights {
             }
         }
         let extra: u64 = prescale.keys().map(|&at| sizes[at]).sum();
-        if total + extra > device_cap {
+        if !layouts.prescale || total + extra > device_cap {
             prescale.clear();
         }
         let scales_of: BTreeMap<usize, usize> = prescale.iter().map(|(&c, &s)| (s, c)).collect();
@@ -223,14 +254,14 @@ impl Weights {
             }
         };
 
-        let transposed = gemm_only(trace, &bank_planes);
+        let transposed = gemm_only(trace, &bank_planes, layouts);
         let codes_planes: std::collections::BTreeSet<usize> =
             pairings.keys().map(|name| index[name]).collect();
         // A gather-only table lands folded, `[V/128, 128·row]` (codes as
         // their packed bytes, scales and zero points alike): see
         // `gather_only`.
         let mut folded: BTreeMap<usize, (u64, u64)> = BTreeMap::new();
-        for at in gather_only(trace, &codes_planes) {
+        for at in gather_only(trace, &codes_planes, layouts) {
             let pairing = pairings[trace.params[at].name.as_str()];
             for plane in [Some(at), Some(pairing.scales), pairing.biases]
                 .into_iter()
@@ -573,9 +604,13 @@ pub(crate) fn serves_this_deployment(path: &Path, backend: &str, deployment: &st
 fn gemm_only(
     trace: &Trace,
     banks: &std::collections::BTreeSet<usize>,
+    layouts: Layouts,
 ) -> std::collections::BTreeSet<usize> {
     use poem_ir::{Def, Linear, Operands, Operation};
     let mut out = std::collections::BTreeSet::new();
+    if !layouts.gemm_transpose {
+        return out;
+    }
     let param_of = |v: poem_ir::ValueId| match trace.values.get(v.0 as usize).map(|d| &d.def) {
         Some(Def::Weight(p)) => Some(*p as usize),
         _ => None,
@@ -586,12 +621,9 @@ fn gemm_only(
         inputs.clear();
         node.op.inputs(&mut inputs);
         let w = match &node.op {
-            Operation::Linear(Linear::Matmul { w, .. } | Linear::LmHead { w, .. })
-            | Operation::Fused(
-                Fused::MatmulBias { w, .. }
-                | Fused::MatmulGeglu { w, .. }
-                | Fused::LmHeadSoftcap { w, .. },
-            ) => Some(*w),
+            // XLA ships no fused kernels (`crate::FUSED` is empty), so no
+            // `Fused` op reaches a trace this reads.
+            Operation::Linear(Linear::Matmul { w, .. } | Linear::LmHead { w, .. }) => Some(*w),
             _ => None,
         };
         for &v in &inputs {
@@ -663,9 +695,13 @@ fn fold_of(rows: u64, row: u64) -> (u64, u64) {
 fn gather_only(
     trace: &Trace,
     codes: &std::collections::BTreeSet<usize>,
+    layouts: Layouts,
 ) -> std::collections::BTreeSet<usize> {
     use poem_ir::{Def, Layout, Operands, Operation};
     let mut out = std::collections::BTreeSet::new();
+    if !layouts.embed_fold {
+        return out;
+    }
     let param_of = |v: poem_ir::ValueId| match trace.values.get(v.0 as usize).map(|d| &d.def) {
         Some(Def::Weight(p)) => Some(*p as usize),
         _ => None,
@@ -896,9 +932,16 @@ impl TensorSink for Landing<'_> {
 /// mint, and no buffers. A quantized param `X` pairs with the params
 /// `X.scales` (and `X.biases`) the plan declares beside it, as the landing
 /// plan's attachments pair them; an mxfp4 bank lands pre-scaled when
-/// `prescale` (the choice a device with room makes), else as codes.
+/// `prescale` (the choice a device with room makes, and the profile allows),
+/// else as codes, and the layouts are `layouts`'s.
 impl Weights {
-    pub(crate) fn dry(handles: &Handles, trace: &Trace, prescale: bool) -> Result<Weights> {
+    pub(crate) fn dry(
+        handles: &Handles,
+        trace: &Trace,
+        prescale: bool,
+        layouts: Layouts,
+    ) -> Result<Weights> {
+        let prescale = prescale && layouts.prescale;
         let index: BTreeMap<&str, usize> = trace
             .params
             .iter()
@@ -953,10 +996,10 @@ impl Weights {
                 rectangle(&p.shape)
             }
         };
-        let transposed = gemm_only(trace, &bank_planes);
+        let transposed = gemm_only(trace, &bank_planes, layouts);
         let codes_planes: std::collections::BTreeSet<usize> = pairings.keys().copied().collect();
         let mut folded: BTreeMap<usize, (u64, u64)> = BTreeMap::new();
-        for at in gather_only(trace, &codes_planes) {
+        for at in gather_only(trace, &codes_planes, layouts) {
             let pairing = pairings[&at];
             for plane in [Some(at), Some(pairing.scales), pairing.biases]
                 .into_iter()

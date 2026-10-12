@@ -181,6 +181,7 @@ pub fn forward(
         let qv = cx.read(q)?;
         let kv = cx.read(k)?;
         let vv = cx.read(v)?;
+        let ch = cx.tuning().chunks;
         let f = cx.func();
         let (qlo, _, s) = segment_of(f, qi, segments, r)?;
         let sc = super::paged::clamp_i(f, s, 0, segments - 1)?;
@@ -201,7 +202,7 @@ pub fn forward(
             rows.begin = Some(lo);
         }
         let planes = Planes::Plain { k: kv, v: vv };
-        let fl = blocked(f, &planes, &heads, &rule, &rows, nk, f64::from(sm_scale))?;
+        let fl = blocked(f, &planes, &heads, &rule, &rows, nk, f64::from(sm_scale), ch)?;
         cx.write(o, fl.o)
     })
 }
