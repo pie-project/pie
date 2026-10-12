@@ -1449,7 +1449,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             let lane_base: Vec<u32> = req
                 .lanes
                 .iter()
-                .map(|lane| lane.positions.first().copied().unwrap_or(0))
+                .map(|lane| lane.positions.first().copied().unwrap_or(lane.kv.held))
                 .collect();
             req.media = crate::pipeline::media::lane_media(&matched, &lane_rows, &lane_base);
         }

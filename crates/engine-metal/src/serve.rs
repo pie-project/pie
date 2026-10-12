@@ -2567,6 +2567,7 @@ impl Shell {
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
+        let mut rotations: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut slot_ids: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut rs_plans: Vec<crate::rs::LanePlan> = Vec::with_capacity(lanes.len());
         let mut rs_active = false;
@@ -2758,13 +2759,15 @@ impl Shell {
                     for &token in ports.tokens_for(rows_here)? {
                         tokens.push(token as i32);
                     }
-                    match ports.positions_for(have, rows_here)? {
-                        Some(stated) => {
-                            positions.extend(stated.iter().map(|&at| narrow(u64::from(at))));
-                        }
-                        None => positions
-                            .extend((0..rows_here).map(|at| narrow(u64::from(have) + at as u64))),
-                    }
+                    let rows: Vec<i32> = (0..rows_here)
+                        .map(|at| narrow(u64::from(have) + at as u64))
+                        .collect();
+                    let stated: Vec<i32> = match ports.positions_for(have, rows_here)? {
+                        Some(stated) => stated.iter().map(|&at| narrow(u64::from(at))).collect(),
+                        None => rows.clone(),
+                    };
+                    positions.extend(if self.states_mrope { &rows } else { &stated });
+                    rotations.extend(stated);
                     match &device_writes[source] {
                         Some((slots, offsets)) => {
                             writes.extend(slots.iter().zip(offsets).map(|(&page, &off)| {
@@ -2781,10 +2784,15 @@ impl Shell {
                 None => {
                     for (at, token) in lane.tokens.iter().enumerate() {
                         tokens.push(*token as i32);
-                        positions.push(match seated.positions.get(at) {
-                            Some(&stated) => narrow(u64::from(stated)),
-                            None => narrow(u64::from(have) + at as u64),
-                        });
+                        let row = narrow(u64::from(have) + at as u64);
+                        let stated = seated
+                            .positions
+                            .get(at)
+                            .map_or(row, |&p| narrow(u64::from(p)));
+                        // With mrope the rotation rides its own table, and the
+                        // plain one is the causal bound: a KV row.
+                        positions.push(if self.states_mrope { row } else { stated });
+                        rotations.push(stated);
                         request_of_token.push(at_lane);
                         slot_of_row.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
                     }
@@ -2975,7 +2983,7 @@ impl Shell {
                     }
                     None => {
                         for i in 0..row.rows as usize {
-                            let p = positions[row.row_offset as usize + i];
+                            let p = rotations[row.row_offset as usize + i];
                             mrope_positions[at + 3 * i] = p;
                             mrope_positions[at + 3 * i + 1] = p;
                             mrope_positions[at + 3 * i + 2] = p;
