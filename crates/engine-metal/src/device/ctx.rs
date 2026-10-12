@@ -147,8 +147,8 @@ impl Context {
     }
 
     /// The working set other processes hold now: what of it the system
-    /// could not hand this one (free, inactive, purgeable and speculative
-    /// pages are counted as handed). Measured before a load wires anything,
+    /// could not hand this one (app memory, wired and compressed pages; the
+    /// file cache is counted as handed). Measured before a load wires anything,
     /// it is what `device_memory_share` yields to, as on CUDA. 0
     /// where the system does not say.
     #[must_use]
@@ -811,13 +811,16 @@ fn available_memory() -> Option<u64> {
         };
         // SAFETY: a plain query.
         let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
-        (rc == libc::KERN_SUCCESS).then(|| {
-            (u64::from(stats.free_count)
-                + u64::from(stats.inactive_count)
-                + u64::from(stats.purgeable_count)
-                + u64::from(stats.speculative_count))
-                * page
-        })
+        // What the system cannot hand out is what Activity Monitor calls
+        // used: app memory (anonymous pages a process may not give back),
+        // wired and compressed. The file cache, active or not, is handed out
+        // on demand, and a model's own weights sit in it after a read.
+        let used = (u64::from(stats.internal_page_count)
+            .saturating_sub(u64::from(stats.purgeable_count))
+            + u64::from(stats.wire_count)
+            + u64::from(stats.compressor_page_count))
+            * page;
+        (rc == libc::KERN_SUCCESS).then(|| Context::physical_memory().saturating_sub(used))
     }
     #[cfg(not(target_os = "macos"))]
     {
