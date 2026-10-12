@@ -3,8 +3,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::region::Region;
-use crate::spec::{Spec, Value};
+use crate::region::{Region, Set};
+use crate::spec::{Spec, Value, space};
 use crate::when::When;
 
 /// What a rung picks, before it is typed.
@@ -28,9 +28,10 @@ pub struct Rung {
 }
 
 /// The shape a decision is evaluated at: one coordinate per declared
-/// variable, in declaration order. Enumerations are their value's index.
+/// variable, in declaration order. Enumerations are their value's index;
+/// `None` is a value this point does not know.
 pub trait Point {
-    fn coord(&self, var: usize) -> i64;
+    fn coord(&self, var: usize) -> Option<i64>;
 }
 
 /// A decision with no shape variables.
@@ -38,7 +39,7 @@ pub trait Point {
 pub struct Anywhere;
 
 impl Point for Anywhere {
-    fn coord(&self, var: usize) -> i64 {
+    fn coord(&self, var: usize) -> Option<i64> {
         unreachable!("a decision with no variables asked for variable {var}")
     }
 }
@@ -99,18 +100,33 @@ impl<T: Decision> Ladder<T> {
     }
 
     /// Every rung whose region holds `at` and whose value fits it, in
-    /// order: for code that tries each until one can run.
+    /// order: for code that tries each until one can run. Where `at` does
+    /// not know a variable, a rung holds only if it holds whatever the
+    /// value, so a `when` that compares it does not.
     pub fn candidates<'a>(&'a self, at: &T::At) -> impl Iterator<Item = &'a T> {
         self.mark();
-        let n = T::spec().vars.len();
+        let vars = T::spec().vars;
+        // Where a variable is unknown, every point `at` may be.
+        let point = (0..vars.len())
+            .map(|i| at.coord(i))
+            .collect::<Option<Vec<i64>>>()
+            .ok_or_else(|| {
+                let space = space(vars);
+                let cell: Vec<Set> = space
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| at.coord(i).map_or_else(|| s.clone(), Set::point))
+                    .collect();
+                (Region::full(&cell), space)
+            });
         self.rungs
             .iter()
             .filter(move |(region, value)| {
-                region
-                    .boxes()
-                    .iter()
-                    .any(|b| (0..n).all(|i| b[i].contains(at.coord(i))))
-                    && value.fits(at)
+                let holds = match &point {
+                    Ok(coords) => region.contains(coords),
+                    Err((cell, space)) => cell.is_subset(region, space),
+                };
+                holds && value.fits(at)
             })
             .map(|(_, value)| value)
     }

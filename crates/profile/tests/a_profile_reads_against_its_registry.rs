@@ -303,6 +303,40 @@ fn a_partial_alternative_falls_through_where_it_does_not_fit() {
 }
 
 #[test]
+fn a_rung_that_compares_an_unknown_variable_does_not_hold() {
+    /// A tile by rows and how full the device is, which a device that
+    /// does not say its size leaves unknown.
+    #[derive(Clone, Copy, Debug, PartialEq, Decision)]
+    #[decision(
+        id = "kernel.tile",
+        shape(rows, fill: derived optional;),
+        constant(set(8, 16, 32, 64)),
+        default = r#"[
+            { when = "fill >= 8", value = 64 },
+            { when = "fill < 8 and rows < 4", value = 8 },
+            { when = "rows >= 100 or not (fill < 2)", value = 32 },
+            { value = 16 },
+        ]"#
+    )]
+    struct Tile(u32);
+    let mut r = registry();
+    r.add::<Tile>();
+    assert!(r.check().is_empty(), "{:?}", r.check());
+    let p = r.defaults();
+    let tile = |rows, fill| p.pick::<Tile>(&TileAt { rows, fill }).0;
+    assert_eq!(tile(2, Some(9)), 64);
+    assert_eq!(tile(2, Some(1)), 8);
+    assert_eq!(tile(50, Some(3)), 32);
+    assert_eq!(tile(2, None), 16, "neither side of `fill < 8` holds");
+    assert_eq!(tile(50, None), 16);
+    assert_eq!(
+        tile(200, None),
+        32,
+        "a rung holds where it does whatever `fill` is"
+    );
+}
+
+#[test]
 fn what_an_alternative_requires_the_file_must_assume() {
     let e = refusal(&M4.replace("ane = true", "ane = false"));
     assert!(

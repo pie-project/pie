@@ -22,7 +22,8 @@
 //! - `shape(dynamic, ..; fixed, ..)` declares variables; each may say
 //!   `: set(..)`, `: range(a..=b)`, `: enum(a, b)`, `: bool`, and a dynamic
 //!   one `: derived`. A struct `<Type>At` with one field per variable is
-//!   generated as the point the ladder is evaluated at.
+//!   generated as the point the ladder is evaluated at; an integer variable
+//!   that says `optional` is an `Option<i64>` there, `None` where unknown.
 //! - `fits = path` names `fn(&Self, &<Type>At) -> bool` for partial
 //!   alternatives.
 //! - `tune = search | price | engine | never` says how `pie tune` treats
@@ -156,6 +157,7 @@ struct VarDecl {
     values: Values,
     dynamic: bool,
     derived: bool,
+    optional: bool,
 }
 
 fn parse_var(input: ParseStream, dynamic: bool) -> syn::Result<VarDecl> {
@@ -165,6 +167,7 @@ fn parse_var(input: ParseStream, dynamic: bool) -> syn::Result<VarDecl> {
         values: Values::Any,
         dynamic,
         derived: false,
+        optional: false,
     };
     if input.peek(Token![:]) {
         input.parse::<Token![:]>()?;
@@ -178,12 +181,13 @@ fn parse_var(input: ParseStream, dynamic: bool) -> syn::Result<VarDecl> {
             let w = word.to_string();
             match w.as_str() {
                 "derived" => var.derived = true,
+                "optional" => var.optional = true,
                 "bool" => var.values = Values::Bool,
                 _ => {
                     var.values = parse_values(&w, &["enum"], input)?.ok_or_else(|| {
                         syn::Error::new_spanned(
                             word,
-                            "expected derived, set(..), range(..), enum(..) or bool",
+                            "expected derived, optional, set(..), range(..), enum(..) or bool",
                         )
                     })?;
                 }
@@ -192,6 +196,12 @@ fn parse_var(input: ParseStream, dynamic: bool) -> syn::Result<VarDecl> {
                 break;
             }
         }
+    }
+    if var.optional && matches!(var.values, Values::Names(_) | Values::Bool) {
+        return Err(syn::Error::new_spanned(
+            name,
+            "only an integer variable is optional",
+        ));
     }
     Ok(var)
 }
@@ -578,19 +588,21 @@ fn expand(input: &DeriveInput) -> syn::Result<Tokens> {
             match v.values {
                 Values::Names(_) => quote!(pub #f: &'static str),
                 Values::Bool => quote!(pub #f: bool),
+                _ if v.optional => quote!(pub #f: Option<i64>),
                 _ => quote!(pub #f: i64),
             }
         });
         let arms = attr.vars.iter().enumerate().map(|(i, v)| {
             let f = format_ident!("{}", v.name);
             match &v.values {
-                Values::Names(n) => quote!(#i => {
+                Values::Names(n) => quote!(#i => Some({
                     const NAMES: &[&str] = &[#(#n),*];
                     NAMES.iter().position(|n| *n == self.#f)
                         .unwrap_or_else(|| panic!("`{}` is not a value of `{}`", self.#f, stringify!(#f))) as i64
-                }),
-                Values::Bool => quote!(#i => i64::from(self.#f)),
-                _ => quote!(#i => self.#f),
+                })),
+                Values::Bool => quote!(#i => Some(i64::from(self.#f))),
+                _ if v.optional => quote!(#i => self.#f),
+                _ => quote!(#i => Some(self.#f)),
             }
         });
         let doc = format!("The shape `{}` is chosen at.", id.value());
@@ -601,7 +613,7 @@ fn expand(input: &DeriveInput) -> syn::Result<Tokens> {
                 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
                 #vis struct #at_ident { #(#fields),* }
                 impl ::profile::Point for #at_ident {
-                    fn coord(&self, var: usize) -> i64 {
+                    fn coord(&self, var: usize) -> Option<i64> {
                         match var { #(#arms,)* _ => unreachable!("no variable {var}") }
                     }
                 }
