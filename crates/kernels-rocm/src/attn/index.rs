@@ -5,7 +5,7 @@ use crate::attn::kv;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
-const FILE: &str = "attn/index.cuh";
+const FILE: &str = "attn/index.hip";
 
 const K_BLOCK: u32 = 256;
 
@@ -156,7 +156,7 @@ pub fn block_mean(
     ctx.fire(
         OP,
         Fire::at(
-            "attn/pool.cuh",
+            "attn/pool.hip",
             "::pie::attn::index_block_mean_paged<::pie::bf16>",
         )
         .apply(Launch::per_row(boundary_pos.rows, POOL_BLOCK)),

@@ -6,7 +6,7 @@ use crate::jit::{
 };
 use crate::tensor::Tensor;
 
-const FILE: &str = "elemwise/modulate.cuh";
+const FILE: &str = "elemwise/modulate.hip";
 
 const BLOCK: u32 = 256;
 

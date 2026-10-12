@@ -6,7 +6,7 @@ use crate::jit::{
 };
 use crate::tensor::Tensor;
 
-const FILE: &str = "linear/lora.cuh";
+const FILE: &str = "linear/lora.hip";
 
 const BLOCK: u32 = 256;
 

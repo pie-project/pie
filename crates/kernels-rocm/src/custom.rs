@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
 use crate::tensor::{KvPool, Tensor};
 
-const FILE: &str = "attn/qkv_fused.cuh";
+const FILE: &str = "attn/qkv_fused.hip";
 
 #[allow(clippy::too_many_arguments)]
 pub fn qkv_fused_qknorm_rope_vnorm_write(

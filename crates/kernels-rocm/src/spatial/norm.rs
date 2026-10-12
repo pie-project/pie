@@ -4,7 +4,7 @@ use crate::spatial::{flat_elements, lanes_of};
 use crate::tensor::Tensor;
 use dtype::Dtype;
 
-const FILE: &str = "spatial/norm.cuh";
+const FILE: &str = "spatial/norm.hip";
 
 const OP: &str = "spatial.group_norm";
 

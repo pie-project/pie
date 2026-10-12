@@ -6,7 +6,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
-const FILE: &str = "elemwise/rope.cuh";
+const FILE: &str = "elemwise/rope.hip";
 
 pub const ROTATE_BLOCK: u32 = 256;
 

@@ -2,7 +2,7 @@ use crate::error::Error;
 
 use crate::jit::{Arg, Ctx, Fire, Launch, symbol};
 
-const FILE: &str = "graph/conditional.cuh";
+const FILE: &str = "graph/conditional.hip";
 
 fn once() -> Launch {
     Launch::grid([1, 1, 1], [1, 1, 1])

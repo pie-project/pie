@@ -48,41 +48,18 @@ pub(crate) fn gemv_bf16(
         ArgValue::I32(k),
         ArgValue::F32(0.0),
     ];
-    // `kernel.gemv.bf16`: Blackwell profiles pick `narrow`.
-    let tuning = ctx.tuning();
-    let narrow = tuning.gemv_narrow;
-
-    if n.unsigned_abs() <= tuning.gemv_splitk_max_n {
-        let (instantiation, warps) = if narrow {
-            (
-                "::pie::linear::gemv_splitk_bf16_kernel<::pie::i32(4), 2>",
-                4,
-            )
-        } else {
-            (
-                "::pie::linear::gemv_splitk_bf16_kernel<::pie::i32(8), 1>",
-                8,
-            )
-        };
-        return ctx.fire(
-            "linear.gemv",
-            Fire::at("linear/gemv.cuh", instantiation)
-                .apply(Launch::grid([n.unsigned_abs(), 1, 1], [32, warps, 1])),
-            &values,
-        );
-    }
-
-    let instantiation = if narrow {
-        "::pie::linear::gemv_bf16_kernel<::pie::i32(4), 2>"
+    // Four wavefronts a block: a row each, or (for a short N, which would
+    // not fill the device a wavefront per row) one row split four ways on K.
+    const WAVES: u32 = 4;
+    let rows = n.unsigned_abs();
+    let (instantiation, grid) = if rows <= ctx.tuning().gemv_splitk_max_n {
+        ("::pie::linear::gemv_bf16<4, true>", rows)
     } else {
-        "::pie::linear::gemv_bf16_kernel<::pie::i32(4), 4>"
+        ("::pie::linear::gemv_bf16<4, false>", rows.div_ceil(WAVES))
     };
     ctx.fire(
         "linear.gemv",
-        Fire::at("linear/gemv.cuh", instantiation).apply(Launch::grid(
-            [n.unsigned_abs().div_ceil(4), 1, 1],
-            [32, 4, 1],
-        )),
+        Fire::at("linear/gemv.hip", instantiation).apply(Launch::grid([grid, 1, 1], [64, WAVES, 1])),
         &values,
     )
 }

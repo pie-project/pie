@@ -14,7 +14,7 @@ mod root;
 
 pub use abi::{Arg, ArgValue};
 pub use ctx::{Ctx, Fire, Launch, Pad, Slabs};
-pub use root::{Headers, Root, Toolchain};
+pub use root::Root;
 
 use crate::error::Error;
 
@@ -150,35 +150,12 @@ macro_rules! dtype_dispatch {
 
 pub(crate) use dtype_dispatch;
 
-/// Compiles the carried unit `file` with no instantiation of its own (a
-/// probe kernel stands in), so header and syntax errors show without a
-/// template being stamped. `Err` is the compiler's log.
+/// Compiles `source` the way a carried unit is compiled (every carried
+/// header in scope) and loads it on the current device, so a test can
+/// launch device text that is not a carried unit. Returns the module and
+/// the lowered name of each of `wanted`.
 #[cfg(feature = "rocm")]
-pub fn probe(file: &'static str) -> Result<(), String> {
-    let root = Root::of(file).ok_or_else(|| format!("no carried unit is named `{file}`"))?;
-    let arch = cache::arch(0).ok_or("no HIP device answered its architecture")?;
-    hiprtc::compile_text(&hiprtc::Job {
-        name: root.name,
-        source: format!("{}\n__global__ void pie_sweep_probe() {{}}\n", root.text),
-        arch,
-        options: root.options,
-        headers: root.header_set(),
-        floor: root.floor,
-        wanted: &["pie_sweep_probe".to_owned()],
-    })
-    .map(|_| ())
-    .map_err(|fault| match fault {
-        Fault::Compile { log, .. } => log,
-        other => other.to_string(),
-    })
-}
-
-/// Compiles `source` the way a carried unit is compiled (the compat header
-/// first, the shims and library headers in scope) and loads it on the
-/// current device, so a test can launch device text that is not a carried
-/// unit. Returns the module and the lowered name of each of `wanted`.
-#[cfg(feature = "rocm")]
-pub fn compile_with_shims(
+pub fn compile_source(
     name: &'static str,
     source: &str,
     wanted: &[&str],
@@ -189,9 +166,7 @@ pub fn compile_with_shims(
         name,
         source: source.to_owned(),
         arch,
-        options: &[],
-        headers: Headers::Library.set(),
-        floor: Toolchain::ANY,
+        headers: crate::source::LIBRARY,
         wanted: &wanted,
     })
     .map_err(|fault| match fault {

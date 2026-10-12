@@ -45,21 +45,11 @@ impl Request<'_> {
     }
 }
 
+/// The query tile every prefill work item covers: the one the kernel walks
+/// (`attn::paged::PREFILL_TILE_Q`), whatever the batch's shape.
 #[must_use]
-const fn determine_cta_tile_q(avg_packed_qo_len: u64, head_dim: u32) -> u32 {
-    if head_dim >= 512 {
-        if avg_packed_qo_len <= 32 {
-            return 16;
-        }
-        return 32;
-    }
-    if avg_packed_qo_len > 64 && head_dim < 256 {
-        128
-    } else if avg_packed_qo_len > 16 {
-        64
-    } else {
-        16
-    }
+const fn determine_cta_tile_q(_avg_packed_qo_len: u64, _head_dim: u32) -> u32 {
+    crate::attn::paged::PREFILL_TILE_Q
 }
 
 fn search_kv_chunk_size(

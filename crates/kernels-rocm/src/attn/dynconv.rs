@@ -4,7 +4,7 @@ use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::{RaggedTensor, Tensor};
 
-const FILE: &str = "attn/block_dyn_conv.cuh";
+const FILE: &str = "attn/block_dyn_conv.hip";
 
 const BLOCK: u32 = 256;
 

@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, Ctx, Fire, Launch, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
-const FILE: &str = "elemwise/sinusoid.cuh";
+const FILE: &str = "elemwise/sinusoid.hip";
 
 const BLOCK: u32 = 256;
 

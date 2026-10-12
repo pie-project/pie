@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "layout/scatter_live.cuh";
+const FILE: &str = "layout/scatter_live.hip";
 
 const WARP: u32 = 32;
 

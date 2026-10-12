@@ -3,7 +3,7 @@ use crate::jit::{Arg, Ctx, Fire, Launch, aligned16, count, dtype_dispatch, refus
 use crate::spatial::lanes_of;
 use crate::tensor::Tensor;
 
-const FILE: &str = "spatial/attn.cuh";
+const FILE: &str = "spatial/attn.hip";
 
 const OP: &str = "spatial.attention";
 

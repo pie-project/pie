@@ -1,7 +1,7 @@
 use std::ffi::{CStr, CString, c_char};
 
 use crate::hip::sys;
-use crate::jit::{Fault, Toolchain};
+use crate::jit::Fault;
 use crate::source::Header;
 
 fn api() -> Result<&'static sys::Api, Fault> {
@@ -11,7 +11,9 @@ fn api() -> Result<&'static sys::Api, Fault> {
     })
 }
 
-pub(crate) fn version() -> Result<Toolchain, Fault> {
+/// hiprtc's version, as `major.minor`: part of the cache key, because a
+/// compile also reads ROCm's installed device headers.
+pub(crate) fn version() -> Result<String, Fault> {
     let mut major = 0i32;
     let mut minor = 0i32;
 
@@ -22,34 +24,14 @@ pub(crate) fn version() -> Result<Toolchain, Fault> {
             code,
         });
     }
-    Ok(Toolchain::new(
-        u32::try_from(major).unwrap_or(0),
-        u32::try_from(minor).unwrap_or(0),
-    ))
-}
-
-fn admits(unit: &'static str, floor: Toolchain) -> Result<(), Fault> {
-    if floor.is_any() {
-        return Ok(());
-    }
-    let have = version()?;
-    if floor.met_by(have) {
-        Ok(())
-    } else {
-        Err(Fault::Compile {
-            unit,
-            log: format!("needs hiprtc {floor} and this process loaded {have}"),
-        })
-    }
+    Ok(format!("{major}.{minor}"))
 }
 
 pub(crate) struct Job<'a> {
     pub name: &'static str,
     pub source: String,
     pub arch: &'a str,
-    pub options: &'a [&'a str],
     pub headers: &'a [Header],
-    pub floor: Toolchain,
     pub wanted: &'a [String],
 }
 
@@ -62,7 +44,6 @@ pub(crate) struct Built {
 pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
     let unit = job.name;
     let api = api()?;
-    admits(unit, job.floor)?;
     if job.wanted.is_empty() {
         return Err(Fault::Compile {
             unit,
@@ -72,9 +53,9 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
             ),
         });
     }
-    let options = options(job.arch, job.options)?;
+    let options = options(job.arch)?;
 
-    let root = CString::new(format!("{COMPAT}{}", job.source)).map_err(|_| Fault::Compile {
+    let root = CString::new(job.source.clone()).map_err(|_| Fault::Compile {
         unit,
         log: format!("`{unit}`'s source contains a NUL"),
     })?;
@@ -208,22 +189,14 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
     })
 }
 
-/// Put ahead of every unit: the CUDA-to-HIP names and the 32-lane warp, in
-/// `shim/pie_hip_compat.h`. It shifts the unit's line numbers by one.
-const COMPAT: &str = "#include \"pie_hip_compat.h\"\n";
-
-/// Options NVRTC takes that clang has no spelling for; the carried units
-/// still name them, so they are dropped here rather than in every root.
-const NVRTC_ONLY: &[&str] = &["--device-as-default-execution-space"];
-
-/// The ROCm include root, for the few device headers hiprtc does not carry
-/// itself (`hip/hip_fp8.h`, `hip/hip_cooperative_groups.h`).
+/// The ROCm include root, for HIP's own device headers that hiprtc does not
+/// carry itself (`hip/hip_fp8.h`, `hip/amd_detail/...`).
 fn include_root() -> String {
     let root = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_owned());
     format!("-I{root}/include")
 }
 
-fn options(arch: &str, extra: &[&str]) -> Result<Vec<CString>, Fault> {
+fn options(arch: &str) -> Result<Vec<CString>, Fault> {
     if !arch.starts_with("gfx") {
         return Err(Fault::Compile {
             unit: "hiprtc",
@@ -234,21 +207,12 @@ fn options(arch: &str, extra: &[&str]) -> Result<Vec<CString>, Fault> {
         unit: "hiprtc",
         log: format!("{what} contains a NUL"),
     };
-    let mut all = vec![
-        CString::new(format!("--offload-arch={arch}")).map_err(|_| nul("the architecture"))?,
-        c"-std=c++17".to_owned(),
-        c"-O3".to_owned(),
-        // NVRTC's `--fmad=false`: no contraction of a*b+c into an fma, so a
-        // kernel's rounding matches its reference.
-        c"-ffp-contract=off".to_owned(),
-        CString::new(include_root()).map_err(|_| nul("ROCM_PATH"))?,
-    ];
-    for option in extra {
-        if NVRTC_ONLY.contains(option) {
-            continue;
-        }
-        all.push(CString::new(*option).map_err(|_| nul(&format!("the option `{option}`")))?);
+    let mut all =
+        vec![CString::new(format!("--offload-arch={arch}")).map_err(|_| nul("the architecture"))?];
+    for option in crate::jit::root::OPTIONS {
+        all.push(CString::new(option).map_err(|_| nul("an option"))?);
     }
+    all.push(CString::new(include_root()).map_err(|_| nul("ROCM_PATH"))?);
     Ok(all)
 }
 

@@ -8,7 +8,7 @@ use crate::linear::gemm;
 use crate::linear::moe::GroupSeat;
 use crate::tensor::Tensor;
 
-const FILE: &str = "linear/quant.cuh";
+const FILE: &str = "linear/quant.hip";
 
 const BLOCK: u32 = 256;
 

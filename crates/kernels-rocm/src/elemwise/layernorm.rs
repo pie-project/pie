@@ -3,7 +3,7 @@ use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "elemwise/layernorm.cuh";
+const FILE: &str = "elemwise/layernorm.hip";
 
 const BLOCK: u32 = 256;
 

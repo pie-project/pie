@@ -3,7 +3,7 @@ use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
 use crate::spatial::{flat_elements, lane_pair};
 use crate::tensor::Tensor;
 
-const FILE: &str = "spatial/resample.cuh";
+const FILE: &str = "spatial/resample.hip";
 
 const BLOCK: u32 = 256;
 

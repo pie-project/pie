@@ -5,7 +5,7 @@ use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated
 use crate::linear::moe::GroupSeat;
 use crate::tensor::Tensor;
 
-const FILE: &str = "linear/tiled.cuh";
+const FILE: &str = "linear/tiled.hip";
 
 const BLOCK: u32 = 256;
 

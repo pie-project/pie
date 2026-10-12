@@ -4,7 +4,7 @@ use crate::attn::fa2_abi::Partials;
 use crate::attn::plan::Device;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, refuse, symbol};
 
-pub const FILE: &str = "attn/attention.cuh";
+pub const FILE: &str = "attn/attention.hip";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeArm {

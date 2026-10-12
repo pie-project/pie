@@ -4,9 +4,9 @@ use dtype::Dtype;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const PIXELS: &str = "layout/pixels.cuh";
+const PIXELS: &str = "layout/pixels.hip";
 
-const GRID_TAPS: &str = "layout/grid_taps.cuh";
+const GRID_TAPS: &str = "layout/grid_taps.hip";
 
 const BLOCK: u32 = 256;
 

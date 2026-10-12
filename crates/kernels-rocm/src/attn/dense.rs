@@ -3,7 +3,7 @@ use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "attn/dense.cuh";
+const FILE: &str = "attn/dense.hip";
 
 const WARPS: u32 = 4;
 

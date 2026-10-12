@@ -6,11 +6,12 @@ use crate::jit::{
 };
 use crate::tensor::Tensor;
 
-const FILE: &str = "elemwise/norm.cuh";
+const FILE: &str = "elemwise/norm.hip";
 
 const BLOCK: u32 = 256;
 
-const WARP: u32 = 32;
+/// Lanes per wavefront on CDNA: a block is a whole number of them.
+const WARP: u32 = 64;
 
 const VEC_WIDTH: u32 = 8;
 
@@ -360,7 +361,7 @@ pub fn rmsnorm_gated_by(
     ctx.fire(
         OP,
         Fire::at(
-            "elemwise/norm.cuh",
+            "elemwise/norm.hip",
             symbol(&format!("::pie::elemwise::rmsnorm_gated_by<{t}>")),
         )
         .apply(Launch::grid(
@@ -415,23 +416,8 @@ pub fn residual_add_rmsnorm(
     let hidden = stated(OP, nonzero(OP, "the normed width", y.width)?)?;
     let rows = nonzero(OP, "rows", y.rows)?;
     let plus = if plus_one { "true" } else { "false" };
-    let vectors = y.dtype == Dtype::Bf16
-        && y.width.is_multiple_of(VEC_WIDTH)
-        && [x.ptr, y.ptr, weight.ptr, out.ptr]
-            .iter()
-            .all(|&at| aligned16(at));
-    let (entrypoint, block) = if vectors {
-        let block = (y.width / VEC_WIDTH).clamp(WARP, BLOCK).next_power_of_two();
-        (
-            format!("::pie::elemwise::residual_add_rmsnorm_vec8<{block}, {plus}>"),
-            block,
-        )
-    } else {
-        (
-            format!("::pie::elemwise::residual_add_rmsnorm<{t}, 256, {plus}>"),
-            BLOCK,
-        )
-    };
+    let entrypoint = format!("::pie::elemwise::residual_add_rmsnorm<{t}, 256, {plus}>");
+    let block = BLOCK;
     ctx.fire(
         OP,
         Fire::at(FILE, symbol(&entrypoint)).apply(Launch::per_row(rows, block)),

@@ -3,7 +3,7 @@ use crate::jit::{ArgValue, Ctx, Fire, Launch, stated};
 use crate::spatial::lane_pair;
 use crate::tensor::Tensor;
 
-const FILE: &str = "spatial/rule.cuh";
+const FILE: &str = "spatial/rule.hip";
 
 const OP: &str = "spatial.grid";
 

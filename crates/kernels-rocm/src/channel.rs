@@ -2,7 +2,7 @@ use crate::error::Error;
 
 use crate::jit::{ArgValue, Ctx, Fire, Launch};
 
-const FILE: &str = "channel/channels.cuh";
+const FILE: &str = "channel/channels.hip";
 
 pub type DevicePtr = u64;
 

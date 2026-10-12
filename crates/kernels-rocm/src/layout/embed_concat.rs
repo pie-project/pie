@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "layout/embed_concat.cuh";
+const FILE: &str = "layout/embed_concat.hip";
 
 const BLOCK: u32 = 256;
 

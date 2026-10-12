@@ -5,7 +5,7 @@ use crate::elemwise::rope::ROTATE_BLOCK;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "elemwise/rope_axes.cuh";
+const FILE: &str = "elemwise/rope_axes.hip";
 
 pub const MAX_AXES: usize = 4;
 

@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "elemwise/relative_bucket_bias.cuh";
+const FILE: &str = "elemwise/relative_bucket_bias.hip";
 
 const BLOCK: u32 = 256;
 

@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "layout/embed_weighted.cuh";
+const FILE: &str = "layout/embed_weighted.hip";
 
 const WARP: u32 = 32;
 

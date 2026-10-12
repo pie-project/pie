@@ -62,9 +62,7 @@ fn load(root: &Root, instantiation: &str, key: &str, arch: &str) -> Result<Resol
                 name: root.name,
                 source: root.text.to_owned(),
                 arch,
-                options: root.options,
-                headers: root.header_set(),
-                floor: root.floor,
+                headers: crate::source::LIBRARY,
                 wanted: std::slice::from_ref(&instantiation.to_owned()),
             })?;
             if !built.log.trim().is_empty() {

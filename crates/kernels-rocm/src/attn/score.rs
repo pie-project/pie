@@ -6,7 +6,7 @@ use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
-const FILE: &str = "attn/score.cuh";
+const FILE: &str = "attn/score.hip";
 
 const WARPS: u32 = 8;
 

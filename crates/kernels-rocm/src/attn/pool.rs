@@ -5,7 +5,7 @@ use crate::attn::kv;
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, nonzero, refuse};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
-const FILE: &str = "attn/pool.cuh";
+const FILE: &str = "attn/pool.hip";
 
 const META_BLOCK: u32 = 128;
 

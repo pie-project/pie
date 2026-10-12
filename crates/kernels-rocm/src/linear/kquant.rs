@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "linear/kquant.cuh";
+const FILE: &str = "linear/kquant.hip";
 
 const WARP: u32 = 32;
 

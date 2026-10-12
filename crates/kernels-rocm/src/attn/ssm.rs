@@ -2,11 +2,11 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
 };
 use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 
-const FILE: &str = "attn/ssm.cuh";
+const FILE: &str = "attn/ssm.hip";
 
 const BLOCK: u32 = 256;
 
@@ -18,11 +18,7 @@ const PREP_BLOCK: u32 = 128;
 
 const CONV_VEC: u32 = 8;
 
-const CONV_K_MAX: u32 = 8;
-
 const CONV_BLOCK: u32 = 64;
-
-const GDN_BLOCK: u32 = 128;
 
 const fn kda_shmem(d: u32) -> u32 {
     3u32.saturating_mul(d).saturating_mul(FLOAT)
@@ -46,18 +42,12 @@ fn requests(op: &'static str, x: RaggedTensor) -> Result<u32, Error> {
 
 #[derive(Clone, Copy)]
 enum StagePlanes {
-    Step,
     Chunk,
 }
 
 impl StagePlanes {
     const fn names(self) -> (&'static str, &'static str, &'static str) {
         match self {
-            StagePlanes::Step => (
-                "attn.ssm_gdn_step_qk",
-                "attn.ssm_gdn_step_v",
-                "attn.ssm_gdn_step_gates",
-            ),
             StagePlanes::Chunk => (
                 "attn.ssm_gdn_chunk_qk",
                 "attn.ssm_gdn_chunk_v",
@@ -229,15 +219,10 @@ fn conv1d_update(
         false,
         false,
     )?;
-    let vectors = channels % CONV_VEC == 0
-        && conv_width <= CONV_K_MAX
-        && dilation == 1
-        && state.conv_stride % i64::from(CONV_VEC) == 0
-        && aligned16(x.ptr)
-        && aligned16(y.ptr)
-        && aligned16(weight.ptr)
-        && aligned16(state.conv_slab.ptr);
-    let mut args = vec![
+    // A thread owns 8 channels of a row.
+    let entrypoint = symbol(&format!("::pie::attn::ssm_conv1d_update{}", out.args()));
+    let launch = Launch::grid([channels.div_ceil(CONV_VEC * CONV_BLOCK), rows, 1], [CONV_BLOCK, 1, 1]);
+    let args = [
         x.arg(),
         weight.arg(),
         ArgValue::ABSENT,
@@ -248,33 +233,11 @@ fn conv1d_update(
         stated(op, rows)?.arg(),
         c.arg(),
         k.arg(),
-    ];
-    let (entrypoint, launch) = if vectors {
-        (
-            symbol(&format!(
-                "::pie::attn::ssm_causal_conv1d_update_batched_vec8{}",
-                out.args()
-            )),
-            Launch::grid(
-                [(channels / CONV_VEC).div_ceil(CONV_BLOCK), rows, 1],
-                [CONV_BLOCK, 1, 1],
-            ),
-        )
-    } else {
-        args.push(dil.arg());
-        (
-            symbol(&format!(
-                "::pie::attn::ssm_causal_conv1d_update_batched{}",
-                out.args()
-            )),
-            Launch::grid([channels.div_ceil(BLOCK), rows, 1], [BLOCK, 1, 1]),
-        )
-    };
-    args.extend([
+        dil.arg(),
         state.write_state.arg(),
         state.write_state_mask.arg(),
         ctx.stage(),
-    ]);
+    ];
     ctx.fire(op, Fire::at(FILE, entrypoint).apply(launch), &args)
 }
 
@@ -335,12 +298,8 @@ fn conv1d_chunked(
     y: &mut Tensor,
     out: ConvOut,
 ) -> Result<(), Error> {
-    const CHANNEL_TILE_FROM: u32 = 8;
-
     const TILE_BLOCK: u32 = 128;
     const CONV_TT: u32 = 32;
-
-    const PER_CHANNEL_BLOCK: u32 = 64;
 
     dtype_dispatch!(op, x.data.dtype, { Bf16 => () });
     let (channels, c, k) = conv_extents(op, x.data, y, conv_width)?;
@@ -354,43 +313,11 @@ fn conv1d_chunked(
         true,
         true,
     )?;
-    let reach = (conv_width.saturating_sub(1)).saturating_mul(dilation);
-    let row_tiled = reach <= CONV_TT;
-    let (entrypoint, launch) = if row_tiled {
-        (
-            symbol(&format!(
-                "::pie::attn::ssm_causal_conv1d_chunked_batched_row_tile{}",
-                out.args()
-            )),
-            Launch::grid(
-                [
-                    channels.div_ceil(TILE_BLOCK),
-                    x.data.rows.div_ceil(CONV_TT).max(1),
-                    1,
-                ],
-                [TILE_BLOCK, 1, 1],
-            ),
-        )
-    } else if lanes >= CHANNEL_TILE_FROM {
-        (
-            symbol(&format!(
-                "::pie::attn::ssm_causal_conv1d_chunked_batched_channel_tile{}",
-                out.args()
-            )),
-            Launch::grid(
-                [channels.div_ceil(TILE_BLOCK), lanes, 1],
-                [TILE_BLOCK, 1, 1],
-            ),
-        )
-    } else {
-        (
-            symbol(&format!(
-                "::pie::attn::ssm_causal_conv1d_chunked_batched{}",
-                out.args()
-            )),
-            Launch::grid([channels, lanes, 1], [PER_CHANNEL_BLOCK, 1, 1]),
-        )
-    };
+    let entrypoint = symbol(&format!("::pie::attn::ssm_conv1d_chunked{}", out.args()));
+    let launch = Launch::grid(
+        [channels.div_ceil(TILE_BLOCK), x.data.rows.div_ceil(CONV_TT).max(1), 1],
+        [TILE_BLOCK, 1, 1],
+    );
     ctx.fire(
         op,
         Fire::at(FILE, entrypoint).apply(launch),
@@ -414,15 +341,12 @@ fn conv1d_chunked(
             stated(op, lanes)?.arg(),
         ],
     )?;
-    if !row_tiled || !state.write_state {
+    if !state.write_state {
         return Ok(());
     }
     ctx.fire(
         op,
-        Fire::at(
-            FILE,
-            symbol("::pie::attn::ssm_causal_conv1d_state_commit<::pie::bf16>"),
-        )
+        Fire::at(FILE, symbol("::pie::attn::ssm_conv1d_state_commit<::pie::bf16>"))
         .apply(Launch::grid(
             [channels.div_ceil(TILE_BLOCK), lanes, 1],
             [TILE_BLOCK, 1, 1],
@@ -638,10 +562,6 @@ pub fn gated_delta(
 ) -> Result<(), Error> {
     const OP: &str = "attention.ssm_gated_delta";
 
-    const SMEM_ARM_WIDTH: u32 = 128;
-
-    const SMEM_BV: u32 = 128;
-
     let _ = z;
     dtype_dispatch!(OP, qkv.dtype, { Bf16 => () });
     debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` reads an f32 decay row");
@@ -658,42 +578,13 @@ pub fn gated_delta(
     if fused_fits(&shape, state) {
         return shape.decode_fused(ctx, OP, qkv, gates, state, y);
     }
-    let staged = shape.stage(ctx, OP, qkv, gates, StagePlanes::Step)?;
-
-    let (entrypoint, launch) = if v_dim == SMEM_ARM_WIDTH && k_dim == SMEM_ARM_WIDTH {
-        (
-            "::pie::attn::ssm_gated_delta_step_batched_gqa_smem<::pie::attn::gqa_smem_bv>",
-            Launch::grid([v_dim.div_ceil(SMEM_BV), shape.n, v_heads], [SMEM_BV, 1, 1])
-                .smem(k_dim * SMEM_BV * 2 + 2 * k_dim * FLOAT),
-        )
-    } else {
-        (
-            "::pie::attn::ssm_gated_delta_step_batched_gqa<::pie::attn::state_bf16, false>",
-            Launch::grid([shape.n, v_heads, 1], [GDN_BLOCK, 1, 1]).smem(2 * k_dim * FLOAT),
-        )
-    };
-    ctx.fire(
+    Err(refuse(
         OP,
-        Fire::at(FILE, entrypoint).apply(launch),
-        &[
-            ArgValue::Ptr(staged.q_norm),
-            ArgValue::Ptr(staged.k_norm),
-            ArgValue::Ptr(staged.v),
-            ArgValue::Ptr(staged.g_log),
-            ArgValue::Ptr(staged.beta),
-            state.slab.arg(),
-            state.slot_ids.arg(),
-            state.slot_stride_elems.arg(),
-            y.arg(),
-            stated(OP, k_heads)?.arg(),
-            stated(OP, v_heads)?.arg(),
-            stated(OP, k_dim)?.arg(),
-            stated(OP, v_dim)?.arg(),
-            state.write_state.arg(),
-            state.write_state_mask.arg(),
-            ctx.stage(),
-        ],
-    )
+        format!(
+            "the decode step is built for 8-aligned rows, a value head in whole 16-wide \
+             tiles and a key head of at most 128; this one is {k_dim} x {v_dim}"
+        ),
+    ))
 }
 
 const FUSED_BLOCK: u32 = 256;
@@ -750,158 +641,6 @@ impl Delta {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn gated_delta_chunked_fla(
-    ctx: &Ctx,
-    op: &'static str,
-    shape: &Delta,
-    staged: &DeltaStaged,
-    qkv: RaggedTensor,
-    state: &RecurrentPool,
-    y: &mut Tensor,
-) -> Result<(), Error> {
-    const CH: u32 = 64;
-    const BVT: u32 = 16;
-    const BLOCK: u32 = 256;
-    let lanes = requests(op, qkv)?;
-    seated(op, state, "ssm_gdn_chunk", true, true, true)?;
-    let (k_dim, v_dim, v_heads, k_heads) = (shape.k_dim, shape.v_dim, shape.v_heads, shape.k_heads);
-    let slots = shape.n.div_ceil(CH) + lanes;
-    let padded = Delta {
-        n: shape.n + CH,
-        ..*shape
-    };
-    let per_slot = |heads: u32, width: u32| u64::from(slots) * u64::from(heads) * u64::from(width);
-    let gcum = plane(ctx, op, "attn.ssm_gdn_chunk_gcum", shape.elems(v_heads, 1))?;
-    let qb = plane_bf16(
-        ctx,
-        op,
-        "attn.ssm_gdn_chunk_qb",
-        padded.elems(k_heads, k_dim),
-    )?;
-    let kb = plane_bf16(
-        ctx,
-        op,
-        "attn.ssm_gdn_chunk_kb",
-        padded.elems(k_heads, k_dim),
-    )?;
-    let kt = plane_bf16(
-        ctx,
-        op,
-        "attn.ssm_gdn_chunk_kt",
-        per_slot(k_heads, k_dim * CH),
-    )?;
-    let w = plane_bf16(
-        ctx,
-        op,
-        "attn.ssm_gdn_chunk_w",
-        padded.elems(v_heads, k_dim),
-    )?;
-    let u = plane_bf16(
-        ctx,
-        op,
-        "attn.ssm_gdn_chunk_u",
-        padded.elems(v_heads, v_dim),
-    )?;
-    let vnt = plane_bf16(
-        ctx,
-        op,
-        "attn.ssm_gdn_chunk_vnt",
-        per_slot(v_heads, v_dim * CH),
-    )?;
-    let hct = plane_bf16(
-        ctx,
-        op,
-        "attn.ssm_gdn_chunk_hct",
-        per_slot(v_heads, v_dim * k_dim),
-    )?;
-    let wu_smem = CH * CH * FLOAT + CH * k_dim * 2 + CH * CH * 2 + 4 * CH * FLOAT;
-    ctx.fire(
-        op,
-        Fire::at(FILE, "::pie::attn::ssm_gdn_chunk_wu<128, 128>")
-            .apply(Launch::grid([slots, v_heads, 1], [BLOCK, 1, 1]).smem(wu_smem)),
-        &[
-            ArgValue::Ptr(staged.q_norm),
-            ArgValue::Ptr(staged.k_norm),
-            ArgValue::Ptr(staged.v),
-            ArgValue::Ptr(staged.g_log),
-            ArgValue::Ptr(staged.beta),
-            state.slot_ids.arg(),
-            qkv.indptr.arg(),
-            state.commit_len.arg(),
-            state.begin_at.arg(),
-            ArgValue::Ptr(gcum),
-            ArgValue::Ptr(qb),
-            ArgValue::Ptr(kb),
-            ArgValue::Ptr(kt),
-            ArgValue::Ptr(w),
-            ArgValue::Ptr(u),
-            stated(op, lanes)?.arg(),
-            stated(op, k_heads)?.arg(),
-            stated(op, v_heads)?.arg(),
-            ctx.stage(),
-        ],
-    )?;
-    ctx.fire(
-        op,
-        Fire::at(
-            FILE,
-            "::pie::attn::ssm_gdn_chunk_h<::pie::attn::state_bf16, 128, 128, 16>",
-        )
-        .apply(Launch::grid(
-            [lanes * v_heads * (v_dim / BVT), 1, 1],
-            [BLOCK, 1, 1],
-        )),
-        &[
-            ArgValue::Ptr(gcum),
-            ArgValue::Ptr(kt),
-            ArgValue::Ptr(w),
-            ArgValue::Ptr(u),
-            ArgValue::Ptr(vnt),
-            ArgValue::Ptr(hct),
-            state.slab.arg(),
-            state.slot_ids.arg(),
-            qkv.indptr.arg(),
-            state.slot_stride_elems.arg(),
-            state.commit_len.arg(),
-            state.begin_at.arg(),
-            state.write_state.arg(),
-            state.write_state_mask.arg(),
-            stated(op, lanes)?.arg(),
-            stated(op, k_heads)?.arg(),
-            stated(op, v_heads)?.arg(),
-            ctx.stage(),
-        ],
-    )?;
-    ctx.fire(
-        op,
-        Fire::at(FILE, "::pie::attn::ssm_gdn_chunk_o<128, 128, 16>")
-            .apply(Launch::grid([slots, v_heads, 1], [BLOCK, 1, 1])),
-        &[
-            ArgValue::Ptr(gcum),
-            ArgValue::Ptr(qb),
-            ArgValue::Ptr(kb),
-            ArgValue::Ptr(vnt),
-            ArgValue::Ptr(hct),
-            state.slot_ids.arg(),
-            qkv.indptr.arg(),
-            state.commit_len.arg(),
-            state.begin_at.arg(),
-            y.arg(),
-            stated(op, lanes)?.arg(),
-            stated(op, k_heads)?.arg(),
-            stated(op, v_heads)?.arg(),
-            ctx.stage(),
-        ],
-    )
-}
-
-fn plane_bf16(ctx: &Ctx, op: &'static str, name: &'static str, elems: u64) -> Result<u64, Error> {
-    let bytes = usize::try_from(elems.saturating_mul(2))
-        .map_err(|_| refuse(op, format!("{elems} bf16 elements do not fit this host")))?;
-    Ok(ctx.scratch_shared(op, name, bytes)? as u64)
-}
-
-#[allow(clippy::too_many_arguments)]
 pub fn gated_delta_chunked_serial(
     ctx: &Ctx,
     qkv: RaggedTensor,
@@ -939,13 +678,8 @@ pub fn gated_delta_chunked(
 ) -> Result<(), Error> {
     const OP: &str = "attention.ssm_gated_delta_chunked";
 
-    const BK_MAX_FLA: u32 = 128;
-
-    const BV_FLA: u32 = 128;
-
-    const WARP_TILED_K_MAX: u32 = 256;
-
-    const SCAN_WARPS: u32 = 4;
+    /// State columns a scan block owns.
+    const SCAN_BV: u32 = 128;
 
     let _ = z;
     dtype_dispatch!(OP, qkv.data.dtype, { Bf16 => () });
@@ -954,139 +688,27 @@ pub fn gated_delta_chunked(
     let shape = Delta::of(OP, qkv.data, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let lanes = requests(OP, qkv)?;
     let staged = shape.stage(ctx, OP, qkv.data, gates, StagePlanes::Chunk)?;
-    if k_dim == BK_MAX_FLA && v_dim == BV_FLA && !SERIAL_SCAN.with(core::cell::Cell::get) {
-        return gated_delta_chunked_fla(ctx, OP, &shape, &staged, qkv, state, y);
-    }
-    if k_dim <= BK_MAX_FLA && v_dim.is_multiple_of(BV_FLA) {
-        seated(
-            OP,
-            state,
-            "ssm_gated_delta_chunked_batched_fla",
-            true,
-            true,
-            true,
-        )?;
-        return ctx.fire(
-            OP,
-            Fire::at(
-                FILE,
-                "::pie::attn::ssm_gated_delta_chunked_batched_fla<::pie::attn::state_bf16, 128, 128>",
-            )
-            .apply(
-                Launch::grid([v_dim / BV_FLA, lanes, v_heads], [BV_FLA, 1, 1])
-                    .smem(2 * BK_MAX_FLA * FLOAT),
-            ),
-            &[
-                ArgValue::Ptr(staged.q_norm),
-                ArgValue::Ptr(staged.k_norm),
-                ArgValue::Ptr(staged.v),
-                ArgValue::Ptr(staged.g_log),
-                ArgValue::Ptr(staged.beta),
-                state.slab.arg(),
-                state.slot_ids.arg(),
-                qkv.indptr.arg(),
-                state.slot_stride_elems.arg(),
-                y.arg(),
-                stated(OP, k_heads)?.arg(),
-                stated(OP, v_heads)?.arg(),
-                stated(OP, k_dim)?.arg(),
-                stated(OP, v_dim)?.arg(),
-                state.write_state.arg(),
-                state.commit_len.arg(),
-                state.write_state_mask.arg(),
-                state.begin_at.arg(),
-                state.fused_decay.arg(),
-                ctx.stage(),
-            ],
-        );
-    }
-
-    if k_dim <= WARP_TILED_K_MAX {
-        seated(
-            OP,
-            state,
-            "ssm_gated_delta_chunked_batched_warp_tiled_gqa",
-            true,
-            false,
-            false,
-        )?;
-        return ctx.fire(
-            OP,
-            Fire::at(
-                FILE,
-                "::pie::attn::ssm_gated_delta_chunked_batched_warp_tiled_gqa<::pie::attn::state_bf16, false>",
-            )
-            .apply(Launch::grid(
-                [lanes, v_heads, v_dim.div_ceil(SCAN_WARPS)],
-                [SCAN_WARPS * WARP, 1, 1],
-            )),
-            &[
-                ArgValue::Ptr(staged.q_norm),
-                ArgValue::Ptr(staged.k_norm),
-                ArgValue::Ptr(staged.v),
-                ArgValue::Ptr(staged.g_log),
-                ArgValue::Ptr(staged.beta),
-                state.slab.arg(),
-                state.slot_ids.arg(),
-                qkv.indptr.arg(),
-                state.slot_stride_elems.arg(),
-                y.arg(),
-                stated(OP, k_heads)?.arg(),
-                stated(OP, v_heads)?.arg(),
-                stated(OP, k_dim)?.arg(),
-                stated(OP, v_dim)?.arg(),
-                state.write_state.arg(),
-                state.write_state_mask.arg(),
-                ctx.stage(),
-            ],
-        );
-    }
-
-    seated(
-        OP,
-        state,
-        "ssm_gated_delta_chunked_batched",
-        false,
-        false,
-        false,
-    )?;
-    let (q_norm, k_norm) = if v_heads == k_heads {
-        (staged.q_norm, staged.k_norm)
-    } else {
-        let wide = shape.elems(v_heads, k_dim);
-        let repeated = plane(ctx, OP, "attn.ssm_gdn_chunk_repeat", 2 * wide)?;
-        let (q, k) = (repeated, repeated + wide * u64::from(FLOAT));
-        for (src, dst) in [(staged.q_norm, q), (staged.k_norm, k)] {
-            ctx.fire(
+    // The recurrence, token by token per request: a thread per state
+    // column, its key-head entries in registers.
+    let bk = match k_dim {
+        0..=128 => 128,
+        129..=256 => 256,
+        _ => {
+            return Err(refuse(
                 OP,
-                Fire::at(
-                    FILE,
-                    "::pie::attn::repeat_interleave_heads_fp32<::pie::attn::f32>",
-                )
-                .apply(Launch::grid([shape.n, v_heads, 1], [BLOCK, 1, 1])),
-                &[
-                    ArgValue::Ptr(src),
-                    ArgValue::Ptr(dst),
-                    stated(OP, k_heads)?.arg(),
-                    stated(OP, v_heads)?.arg(),
-                    stated(OP, k_dim)?.arg(),
-                    stated(OP, v_heads / k_heads)?.arg(),
-                    ctx.stage(),
-                ],
-            )?;
+                format!("the scan holds a key head of at most 256 and this one is {k_dim}"),
+            ));
         }
-        (q, k)
     };
+    seated(OP, state, "ssm_gdn_scan", true, true, true)?;
+    let bv = v_dim.min(SCAN_BV);
     ctx.fire(
         OP,
-        Fire::at(
-            FILE,
-            "::pie::attn::ssm_gated_delta_chunked_batched<::pie::attn::state_bf16, false>",
-        )
-        .apply(Launch::grid([lanes, v_heads, 1], [GDN_BLOCK, 1, 1]).smem(2 * k_dim * FLOAT)),
+        Fire::at(FILE, symbol(&format!("::pie::attn::ssm_gdn_scan<{bk}, {bv}>")))
+            .apply(Launch::grid([v_dim.div_ceil(bv), lanes, v_heads], [bv, 1, 1])),
         &[
-            ArgValue::Ptr(q_norm),
-            ArgValue::Ptr(k_norm),
+            ArgValue::Ptr(staged.q_norm),
+            ArgValue::Ptr(staged.k_norm),
             ArgValue::Ptr(staged.v),
             ArgValue::Ptr(staged.g_log),
             ArgValue::Ptr(staged.beta),
@@ -1095,9 +717,15 @@ pub fn gated_delta_chunked(
             qkv.indptr.arg(),
             state.slot_stride_elems.arg(),
             y.arg(),
+            stated(OP, k_heads)?.arg(),
             stated(OP, v_heads)?.arg(),
             stated(OP, k_dim)?.arg(),
             stated(OP, v_dim)?.arg(),
+            state.write_state.arg(),
+            state.commit_len.arg(),
+            state.write_state_mask.arg(),
+            state.begin_at.arg(),
+            state.fused_decay.arg(),
             ctx.stage(),
         ],
     )

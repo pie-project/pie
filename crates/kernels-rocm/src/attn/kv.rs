@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, refuse, stated};
 use crate::tensor::{KvPool, Tensor};
 
-const FILE: &str = "attn/kv.cuh";
+const FILE: &str = "attn/kv.hip";
 
 const BLOCK: u32 = 256;
 
@@ -212,7 +212,7 @@ fn envelope_update_appended(
     ctx.fire(
         op,
         Fire::at(
-            "layout/envelope.cuh",
+            "layout/envelope.hip",
             "::pie::layout::update_appended<::pie::bf16>",
         )
         .apply(Launch::grid(
@@ -469,7 +469,7 @@ pub(crate) fn write_mla_to_pages(
     let num_requests = lanes_of(op, indptr)?;
     ctx.fire(
         op,
-        Fire::at("attn/mla.cuh", "::pie::attn::mla_kv_append")
+        Fire::at("attn/mla.hip", "::pie::attn::mla_kv_append")
             .apply(Launch::per_row(ckv.rows, MLA_WRITE_BLOCK)),
         &[
             ckv.arg(),

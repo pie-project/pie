@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, Ctx, Fire, Launch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "linear/lane_gemm.cuh";
+const FILE: &str = "linear/lane_gemm.hip";
 
 const BLOCK: u32 = 256;
 

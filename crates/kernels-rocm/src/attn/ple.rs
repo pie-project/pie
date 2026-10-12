@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, nonzero, refuse, stated};
 use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 
-const FILE: &str = "attn/ple.cuh";
+const FILE: &str = "attn/ple.hip";
 
 const BLOCK: u32 = 128;
 

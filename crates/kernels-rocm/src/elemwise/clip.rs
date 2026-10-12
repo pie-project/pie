@@ -3,7 +3,7 @@ use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "elemwise/clip.cuh";
+const FILE: &str = "elemwise/clip.hip";
 
 const BLOCK: u32 = 256;
 

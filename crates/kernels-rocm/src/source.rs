@@ -12,33 +12,7 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/headers.rs"));
 }
 
-pub use generated::{LIBRARY, SHIM, UPSTREAM};
-
-const SHIMMED: [Header; SHIM.len() + LIBRARY.len()] =
-    join::<{ SHIM.len() + LIBRARY.len() }>(SHIM, LIBRARY);
-
-pub const DEVICE_HEADERS: &[Header] = &SHIMMED;
-
-pub const ALL_HEADERS: &[Header] =
-    &join::<{ SHIM.len() + LIBRARY.len() + UPSTREAM.len() }>(&SHIMMED, UPSTREAM);
-
-const fn join<const N: usize>(left: &[Header], right: &[Header]) -> [Header; N] {
-    let mut out = [Header { name: "", text: "" }; N];
-    let mut w = 0;
-    let mut i = 0;
-    while i < left.len() {
-        out[w] = left[i];
-        w += 1;
-        i += 1;
-    }
-    let mut j = 0;
-    while j < right.len() {
-        out[w] = right[j];
-        w += 1;
-        j += 1;
-    }
-    out
-}
+pub use generated::LIBRARY;
 
 #[must_use]
 pub fn text_of(name: &str) -> Option<&'static str> {
@@ -46,21 +20,6 @@ pub fn text_of(name: &str) -> Option<&'static str> {
         .iter()
         .find(|header| header.name == name)
         .map(|header| header.text)
-}
-
-pub(crate) const fn str_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i < a.len() {
-        if a[i] != b[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
 }
 
 pub fn as_rtc_arrays(headers: &[Header]) -> Result<(Vec<CString>, Vec<CString>), String> {

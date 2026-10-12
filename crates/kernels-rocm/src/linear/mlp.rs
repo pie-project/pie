@@ -3,7 +3,7 @@ use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
-const FILE: &str = "linear/glu.cuh";
+const FILE: &str = "linear/glu.hip";
 
 const BLOCK: u32 = 256;
 

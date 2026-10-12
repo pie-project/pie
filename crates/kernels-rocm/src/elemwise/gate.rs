@@ -24,7 +24,7 @@ pub fn sigmoid_mul(ctx: &Ctx, gate: Tensor, fan: u32, x: &mut Tensor) -> Result<
     ctx.fire(
         OP,
         Fire::at(
-            "linear/glu.cuh",
+            "linear/glu.hip",
             "::pie::linear::gate_sigmoid_mul<::pie::bf16>",
         )
         .apply(Launch::flat(lanes, BLOCK)),
@@ -74,7 +74,7 @@ pub fn sigmoid_mul_heads(
     ctx.fire(
         OP,
         Fire::at(
-            "linear/glu.cuh",
+            "linear/glu.hip",
             "::pie::linear::gate_sigmoid_mul_heads<::pie::bf16>",
         )
         .apply(Launch::per_row(rows, BLOCK)),

@@ -6,7 +6,7 @@ use crate::jit::{
 };
 use crate::tensor::Tensor;
 
-const FILE: &str = "linear/moe.cuh";
+const FILE: &str = "linear/moe.hip";
 
 const BLOCK: u32 = 256;
 
@@ -780,7 +780,7 @@ fn matmul_select_mxfp4(
         let work = order + (work_at * core::mem::size_of::<i32>()) as u64;
         ctx.fire(
             op,
-            Fire::at("linear/quant.cuh", symbol("::pie::linear::moe_route_order"))
+            Fire::at("linear/quant.hip", symbol("::pie::linear::moe_route_order"))
                 .apply(Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1]).smem(2 * (experts + 1) * 4)),
             &[
                 routes.arg(),
@@ -819,7 +819,7 @@ fn matmul_select_mxfp4(
         ]);
         return ctx.fire(
             op,
-            Fire::at("linear/quant.cuh", symbol(&entry)).apply(Launch::grid(
+            Fire::at("linear/quant.hip", symbol(&entry)).apply(Launch::grid(
                 [
                     if wmma { work_cap } else { experts },
                     y.width.div_ceil(GROUPED_TILE_N),
@@ -833,7 +833,7 @@ fn matmul_select_mxfp4(
     ctx.fire(
         op,
         Fire::at(
-            "linear/quant.cuh",
+            "linear/quant.hip",
             symbol(&format!(
                 "::pie::linear::moe_matmul_select_mxfp4<{t}, ::pie::i32({ROWS_PER_WARP})>"
             )),
@@ -988,7 +988,7 @@ fn matmul_select_mlxu4(
     let work = order + (work_at * core::mem::size_of::<i32>()) as u64;
     ctx.fire(
         op,
-        Fire::at("linear/quant.cuh", symbol("::pie::linear::moe_route_order"))
+        Fire::at("linear/quant.hip", symbol("::pie::linear::moe_route_order"))
             .apply(Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1]).smem(2 * (experts + 1) * 4)),
         &[
             routes.arg(),
@@ -1034,7 +1034,7 @@ fn matmul_select_mlxu4(
         ]);
         return ctx.fire(
             op,
-            Fire::at("linear/quant.cuh", symbol(&entry)).apply(Launch::grid(
+            Fire::at("linear/quant.hip", symbol(&entry)).apply(Launch::grid(
                 [
                     if wmma { work_cap } else { experts },
                     y.width.div_ceil(GROUPED_TILE_N),
@@ -1048,7 +1048,7 @@ fn matmul_select_mlxu4(
     ctx.fire(
         op,
         Fire::at(
-            "linear/quant.cuh",
+            "linear/quant.hip",
             symbol(&format!(
                 "::pie::linear::moe_matmul_select_mlxu4<{t}, ::pie::i32({bits}), ::pie::i32({group}), \
                  ::pie::i32({ROWS_PER_WARP})>"
@@ -1194,7 +1194,7 @@ pub fn sigmoid_gate_add(
     ctx.fire(
         OP,
         Fire::at(
-            "linear/glu.cuh",
+            "linear/glu.hip",
             symbol(&format!("::pie::linear::moe_sigmoid_gate_add<{t}>")),
         )
         .apply(elementwise_rows(OP, y.rows, y.width)?),

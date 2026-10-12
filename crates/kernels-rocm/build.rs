@@ -1,16 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+//! Carries every file under `kernels/` into the binary as a `Header`, named
+//! by its path relative to `kernels/`: hiprtc resolves a quoted include by
+//! that name, and `Root::of` finds a unit by it.
+
 use std::path::{Path, PathBuf};
-
-const TREES: [(&str, &str); 2] = [("kernels", "kernels"), ("shim", "shim")];
-
-const UPSTREAM_ROOTS: [&str; 1] = ["flashinfer"];
-
-fn is_header(path: &Path) -> bool {
-    !matches!(
-        path.file_name().and_then(|n| n.to_str()),
-        Some("LICENSE" | "MODIFICATIONS" | "README.md")
-    )
-}
 
 fn walk(dir: &Path, base: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -21,12 +13,8 @@ fn walk(dir: &Path, base: &Path, out: &mut Vec<PathBuf>) {
     for path in sorted {
         if path.is_dir() {
             walk(&path, base, out);
-        } else if is_header(&path) {
-            out.push(
-                path.strip_prefix(base)
-                    .expect("walked from base")
-                    .to_path_buf(),
-            );
+        } else {
+            out.push(path.strip_prefix(base).expect("walked from base").to_path_buf());
         }
     }
 }
@@ -38,119 +26,31 @@ fn spell(rel: &Path) -> String {
         .join("/")
 }
 
-fn quoted_includes(source: &str) -> Vec<&str> {
-    source
-        .lines()
-        .filter_map(|line| {
-            let rest = line.strip_prefix("#include")?;
-            let rest = rest.strip_prefix([' ', '\t'])?.trim_start();
-            let rest = rest.strip_prefix('"')?;
-            rest.split('"').next()
-        })
-        .collect()
-}
-
-fn normalise(base: &Path, spelling: &str) -> Option<PathBuf> {
-    let mut out = base.to_path_buf();
-    for part in spelling.split('/') {
-        match part {
-            "." | "" => {}
-            ".." => {
-                if !out.pop() {
-                    return None;
-                }
-            }
-            other => out.push(other),
-        }
-    }
-    Some(out)
-}
-
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    for (_, tree) in TREES {
-        println!("cargo:rerun-if-changed={tree}");
-    }
+    println!("cargo:rerun-if-changed=kernels");
 
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets this"));
-    let [(_, kernels_tree), (_, shim_tree)] = TREES;
-    let (kernels, shim) = (manifest.join(kernels_tree), manifest.join(shim_tree));
+    let kernels = manifest.join("kernels");
+    let mut files = Vec::new();
+    walk(&kernels, &kernels, &mut files);
 
-    let mut kernel_files = Vec::new();
-    walk(&kernels, &kernels, &mut kernel_files);
-    let mut shim_files = Vec::new();
-    walk(&shim, &shim, &mut shim_files);
-
-    let upstream = |rel: &Path| {
-        rel.components()
-            .next()
-            .and_then(|c| c.as_os_str().to_str())
-            .is_some_and(|first| UPSTREAM_ROOTS.contains(&first))
-    };
-
-    let mut named: BTreeMap<String, (&str, PathBuf)> = BTreeMap::new();
-    for rel in &shim_files {
-        named.insert(spell(rel), (shim_tree, rel.clone()));
-    }
-    for rel in &kernel_files {
-        named.insert(spell(rel), (kernels_tree, rel.clone()));
-    }
-
-    let mut extra: BTreeSet<(String, String)> = BTreeSet::new();
-    for rel in &kernel_files {
-        let text = std::fs::read_to_string(kernels.join(rel)).unwrap_or_default();
-        let dir = rel.parent().unwrap_or(Path::new("")).to_path_buf();
-        for spelling in quoted_includes(&text) {
-            if named.contains_key(spelling) {
-                continue;
-            }
-            let Some(target) = normalise(&dir, spelling) else {
-                continue;
-            };
-            if kernels.join(&target).is_file() {
-                extra.insert((spelling.to_owned(), spell(&target)));
-            }
-        }
-    }
-
-    let row = |name: &str, root: &str, rel: &str| {
-        format!(
+    let mut rows = String::new();
+    for rel in &files {
+        let name = spell(rel);
+        rows.push_str(&format!(
             "    Header {{ name: {name:?}, \
-             text: include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/{root}/{rel}\")) }},\n"
-        )
-    };
-
-    let (mut shim_rows, mut lib_rows, mut up_rows) = (String::new(), String::new(), String::new());
-    for (name, (root, rel)) in &named {
-        let line = row(name, root, &spell(rel));
-        if *root == shim_tree {
-            shim_rows.push_str(&line);
-        } else if upstream(rel) {
-            up_rows.push_str(&line);
-        } else {
-            lib_rows.push_str(&line);
-        }
-    }
-    for (spelling, target) in &extra {
-        let line = row(spelling, kernels_tree, target);
-        if upstream(Path::new(target)) {
-            up_rows.push_str(&line);
-        } else {
-            lib_rows.push_str(&line);
-        }
+             text: include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/kernels/{name}\")) }},\n"
+        ));
     }
 
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets this")).join("headers.rs");
     std::fs::write(
         &out,
         format!(
-            "// GENERATED by build.rs from the carried `.cuh` and shim trees. Do not edit.\n\
+            "// GENERATED by build.rs from `kernels/`. Do not edit.\n\
              #[rustfmt::skip]\n\
-             pub const SHIM: &[Header] = &[\n{shim_rows}];\n\n\
-             #[rustfmt::skip]\n\
-             pub const LIBRARY: &[Header] = &[\n{lib_rows}];\n\n\
-             #[rustfmt::skip]\n\
-             pub const UPSTREAM: &[Header] = &[\n{up_rows}];\n"
+             pub const LIBRARY: &[Header] = &[\n{rows}];\n"
         ),
     )
     .expect("OUT_DIR is writable");

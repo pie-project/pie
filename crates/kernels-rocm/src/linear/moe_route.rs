@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::jit::{Arg, Ctx, Fire, Launch, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
-const FILE: &str = "linear/moe_route.cuh";
+const FILE: &str = "linear/moe_route.hip";
 
 const BLOCK: u32 = 256;
 

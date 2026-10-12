@@ -248,23 +248,6 @@ pub(crate) fn arch_name(ordinal: i32) -> Option<String> {
     base.starts_with("gfx").then(|| base.to_owned())
 }
 
-/// How many blocks of `threads` threads and `smem` bytes of dynamic LDS one
-/// CU holds at once for `function`; `None` when HIP would not say.
-pub(crate) fn occupancy(function: sys::Function, threads: u32, smem: u32) -> Option<u32> {
-    let api = sys::api().ok()?;
-    let mut blocks: i32 = 0;
-    // SAFETY: `function` is a loaded kernel; the out-parameter is a local.
-    let code = unsafe {
-        (api.hip.hipModuleOccupancyMaxActiveBlocksPerMultiprocessor)(
-            &raw mut blocks,
-            function,
-            i32::try_from(threads).ok()?,
-            usize::try_from(smem).ok()?,
-        )
-    };
-    (code == sys::HIP_SUCCESS && blocks > 0).then(|| blocks.unsigned_abs())
-}
-
 fn attribute(which: i32, ordinal: i32) -> Option<u32> {
     let api = sys::api().ok()?;
     let mut value: i32 = 0;

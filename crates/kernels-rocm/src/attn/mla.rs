@@ -77,7 +77,7 @@ fn split_kv_a_norm(
     ctx.fire(
         op,
         Fire::at(
-            "attn/mla.cuh",
+            "attn/mla.hip",
             crate::jit::symbol(&format!("::pie::attn::mla_latents<{t}, 256>")),
         )
         .apply(rms(kv_a.rows)),
@@ -168,7 +168,7 @@ pub fn split_q_b(
     ctx.fire(
         OP,
         Fire::at(
-            "attn/mla.cuh",
+            "attn/mla.hip",
             crate::jit::symbol(&format!("::pie::attn::mla_split_q_b<{t}>")),
         )
         .apply(Launch::flat(total.unsigned_abs(), BLOCK)),
@@ -454,7 +454,7 @@ pub(crate) mod naive {
             return ctx.fire(
                 op,
                 Fire::at(
-                    "attn/mla.cuh",
+                    "attn/mla.hip",
                     "::pie::attn::mla_naive::mma_detail::mla_mma_paged_kernel",
                 )
                 .apply(launch),
@@ -513,7 +513,7 @@ pub(crate) mod naive {
         ctx.fire(
             op,
             Fire::at(
-                "attn/mla.cuh",
+                "attn/mla.hip",
                 "::pie::attn::mla_naive::mla_naive_paged_kernel",
             )
             .apply(launch),
@@ -544,12 +544,11 @@ pub(crate) mod naive {
 }
 
 mod mla_fa2 {
-    use super::{Ctx, Error, Layer, refuse};
-    use crate::attn::fa2_abi::{UintFastdiv, resolve};
+    use super::{Ctx, Error, Layer, UintFastdiv, refuse, resolve};
     use crate::attn::plan::{MlaPlan, MlaPlanInfo};
     use crate::jit::{Fire, Launch};
 
-    const FILE: &str = "attn/mla.cuh";
+    const FILE: &str = "attn/mla.hip";
 
     pub const INST: [[&str; 2]; 3] = [
         [
@@ -789,7 +788,7 @@ mod mla_fa2 {
         ctx.fire(
             op,
             Fire::at(FILE, row[usize::from(causal)]).apply(launch),
-            &[crate::attn::fa2::block(params)],
+            &[super::block(params)],
         )
     }
 }
@@ -1051,5 +1050,52 @@ mod tests {
             [32, 4, 2],
             "a lane, a warp in its warpgroup, a warpgroup"
         );
+    }
+}
+
+// The FlashInfer ABI pieces the MLA path above still marshals; they go with
+// it when MLA gets its own AMD kernel.
+
+pub type DevicePtr = u64;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct UintFastdiv {
+    words: [u64; 3],
+}
+
+impl UintFastdiv {
+    #[must_use]
+    pub const fn new(divisor: u32) -> Self {
+        let d = if divisor == 0 { 1 } else { divisor } as u64;
+        let q = u64::MAX / d;
+        let r = u64::MAX % d;
+        let carry = if r + 1 == d { 1 } else { 0 };
+        Self {
+            words: [d, q.wrapping_add(carry).wrapping_add(1), d],
+        }
+    }
+}
+
+const _: () = assert!(
+    core::mem::size_of::<UintFastdiv>() == 24,
+    "UintFastdiv: sizeof disagrees with the measured ::flashinfer::uint_fastdiv",
+);
+const _: () = assert!(
+    core::mem::align_of::<UintFastdiv>() == 8,
+    "UintFastdiv: alignof disagrees with the measured ::flashinfer::uint_fastdiv",
+);
+
+pub(crate) const fn resolve(base: DevicePtr, off: Option<u32>) -> DevicePtr {
+    match off {
+        Some(off) => base.saturating_add(off as u64),
+        None => base,
+    }
+}
+
+pub(crate) fn block<P>(params: &P) -> ArgValue {
+    ArgValue::Bytes {
+        ptr: core::ptr::from_ref(params).cast::<u8>(),
+        len: core::mem::size_of::<P>(),
     }
 }

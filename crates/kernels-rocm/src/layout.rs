@@ -6,11 +6,12 @@ use crate::jit::{
 };
 use crate::tensor::Tensor;
 
-const FILE: &str = "layout/layout.cuh";
+const FILE: &str = "layout/layout.hip";
 
 const BLOCK: u32 = 256;
 
-const WARP: u32 = 32;
+/// Lanes per wavefront on CDNA: a block is a whole number of them.
+const WAVE: u32 = 64;
 
 const VEC_WIDTH: u32 = 8;
 
@@ -20,9 +21,9 @@ fn route_rows(rows: u32, width: u32) -> Launch {
     Launch::per_row(
         rows,
         width
-            .div_ceil(WARP)
+            .div_ceil(WAVE)
             .max(1)
-            .saturating_mul(WARP)
+            .saturating_mul(WAVE)
             .min(MAX_BLOCK),
     )
 }
@@ -378,26 +379,13 @@ pub fn split_rows(
     );
     let left_dim = stated(OP, nonzero(OP, "the left half of this cut", left.width)?)?;
     let right_dim = stated(OP, nonzero(OP, "the right half of this cut", right.width)?)?;
-    let vectors = x.dtype == Dtype::Bf16
-        && left.width.is_multiple_of(VEC_WIDTH)
-        && right.width.is_multiple_of(VEC_WIDTH)
-        && aligned16(x.ptr)
-        && aligned16(left.ptr)
-        && aligned16(right.ptr);
-    let (entrypoint, launch) = if vectors {
-        (
-            "::pie::layout::split_rows_vec8<::pie::bf16>".to_string(),
-            Launch::grid(
-                [left.rows, (x.width / VEC_WIDTH).div_ceil(BLOCK), 1],
-                [BLOCK, 1, 1],
-            ),
-        )
-    } else {
-        (
-            format!("::pie::layout::split_rows<{t}>"),
-            route_rows(left.rows, left.width),
-        )
-    };
+    // One thread per 8 elements; the kernel falls back to single elements
+    // when the row's halves do not allow 16-byte moves.
+    let entrypoint = format!("::pie::layout::split_rows<{t}>");
+    let launch = Launch::grid(
+        [left.rows, x.width.div_ceil(VEC_WIDTH * BLOCK), 1],
+        [BLOCK, 1, 1],
+    );
     ctx.fire(
         OP,
         Fire::at(FILE, symbol(&entrypoint)).apply(launch),
@@ -461,7 +449,7 @@ pub fn select(
 
 fn unit(bytes: u64, a: u64, b: u64) -> (&'static str, u64) {
     if bytes.is_multiple_of(16) && aligned16(a) && aligned16(b) {
-        ("::int4", 16)
+        ("::pie::b128", 16)
     } else if bytes.is_multiple_of(4) && a.is_multiple_of(4) && b.is_multiple_of(4) {
         ("::pie::i32", 4)
     } else {
@@ -620,7 +608,7 @@ fn permute_rows(
     )
 }
 
-const TOPK_FILE: &str = "layout/topk.cuh";
+const TOPK_FILE: &str = "layout/topk.hip";
 
 const TOPK_THREADS: u32 = 128;
 

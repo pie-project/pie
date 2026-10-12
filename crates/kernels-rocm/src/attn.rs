@@ -1,14 +1,12 @@
 pub mod dynconv;
 
-pub mod fa2;
-
-pub mod fa2_abi;
-
 pub mod index;
 
 pub mod kv;
 
 pub mod mla;
+
+pub mod paged;
 
 pub mod plan;
 
@@ -31,16 +29,11 @@ pub mod ssm;
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::attn::fa2_abi::{
-    Buffers, DecodeRelParams, PrefillRelParams, make_decode_params, make_prefill_params,
-};
 use crate::attn::plan::{DecodePlan, PrefillPlan};
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 const BLOCK: u32 = 256;
-
-const NO_SOFT_CAP: f32 = 0.0;
 
 #[must_use]
 const fn elementwise(n: u32) -> Launch {
@@ -112,22 +105,6 @@ fn lanes_carry(
     ))
 }
 
-fn pool_buffers(q_ptr: u64, pool: &KvPool, plan_ws: plan::Workspace, o_ptr: u64) -> Buffers {
-    Buffers {
-        q: q_ptr,
-        k_pages: pool.keys.ptr,
-        v_pages: pool.values.ptr,
-        o: o_ptr,
-        kv_page_indices: pool.page_indices.ptr,
-        kv_page_indptr: pool.page_indptr.ptr,
-        kv_last_page_lens: pool.last_page_lens.ptr,
-        qo_indptr: 0,
-        lse: 0,
-        int_buffer: plan_ws.int_ptr,
-        float_buffer: plan_ws.float_ptr,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn fa2_decode(
     ctx: &Ctx,
@@ -162,52 +139,17 @@ fn fa2_decode(
         stated(op, head_dim)?,
     );
 
-    let mut bufs = pool_buffers(q.data.ptr, pool, plan.workspace, o.ptr);
-    bufs.qo_indptr = q.indptr.ptr;
-    if let Some(lse) = &lse {
-        lse_plane(op, lse, q.data.rows, plan.shape.num_q_heads);
-        bufs.lse = lse.ptr;
+    if rel.is_some() {
+        return Err(Error::Unsupported { op });
     }
-    let (params, split) =
-        make_decode_params(plan, &bufs, window_left, NO_SOFT_CAP, sm_scale, false);
-    let point = |arm| fa2::DecodePoint {
-        head_dim: plan.shape.head_dim,
-        group_size: plan.shape.group_size(),
-        arm,
-        padded_batch_size: params.padded_batch_size,
-        num_kv_heads: plan.shape.num_kv_heads,
-        device: plan.device,
+    let lse_ptr = match &lse {
+        Some(lse) => {
+            lse_plane(op, lse, q.data.rows, plan.shape.num_q_heads);
+            lse.ptr
+        }
+        None => 0,
     };
-    match rel {
-        None => {
-            let arm = fa2::decode_arm(plan.full_attention_variant(), window_left, NO_SOFT_CAP);
-            fa2::decode(ctx, op, point(arm), &params)?;
-        }
-        Some(rel) => {
-            rel_table(
-                op,
-                &rel.bias,
-                q.data.rows,
-                plan.shape.num_q_heads,
-                rel.extent,
-            )?;
-            let arm = fa2::decode_rel_arm(plan.full_attention_variant(), window_left);
-            let params = DecodeRelParams {
-                base: params,
-                rel_bias: rel.bias.ptr,
-                rel_extent: rel.extent,
-                rel_heads: plan.shape.num_q_heads,
-                log_floor: rel.log_floor,
-                log_alpha: rel.log_alpha,
-            };
-            fa2::decode(ctx, op, point(arm), &params)?;
-        }
-    }
-    if plan.info.split_kv {
-        fa2::fold(ctx, op, &split)
-    } else {
-        Ok(())
-    }
+    paged::decode(ctx, op, q, plan, pool, window_left, sm_scale, o, lse_ptr)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -238,64 +180,17 @@ fn fa2_prefill(
     );
 
     lanes_carry(op, &q, plan.shape.lane_offset, plan.shape.num_requests)?;
-    let mut bufs = pool_buffers(q.data.ptr, pool, plan.workspace, o.ptr);
-    bufs.qo_indptr = q.indptr.ptr;
-    if let Some(lse) = &lse {
-        lse_plane(op, lse, q.data.rows, plan.shape.num_q_heads);
-        bufs.lse = lse.ptr;
+    if mask.is_some() || rel.is_some() {
+        return Err(Error::Unsupported { op });
     }
-    let (mut params, split) = make_prefill_params(plan, &bufs, window_left, NO_SOFT_CAP, sm_scale);
-    if let Some((bits, indptr)) = &mask {
-        params.maybe_custom_mask = bits.ptr;
-        params.maybe_mask_indptr = indptr.ptr;
-    }
-    let point = |arm| fa2::PrefillPoint {
-        head_dim: plan.shape.head_dim,
-        cta_tile_q: plan.cta_tile_q(),
-        arm,
-        padded_batch_size: params.padded_batch_size,
-        num_kv_heads: plan.shape.num_kv_heads,
-        device: plan.device,
+    let lse_ptr = match &lse {
+        Some(lse) => {
+            lse_plane(op, lse, q.data.rows, plan.shape.num_q_heads);
+            lse.ptr
+        }
+        None => 0,
     };
-    match rel {
-        None => {
-            let arm = match mask {
-                Some(_) => fa2::prefill_custom_arm(NO_SOFT_CAP),
-                None => fa2::prefill_arm(plan.full_attention_variant(), plan.causal, NO_SOFT_CAP),
-            };
-            fa2::prefill(ctx, op, point(arm), &params)?;
-        }
-        Some(rel) => {
-            if mask.is_some() || !plan.causal {
-                return Err(refuse(
-                    op,
-                    "the relative-bias arm is causal and takes no custom mask",
-                ));
-            }
-            rel_table(
-                op,
-                &rel.bias,
-                q.data.rows,
-                plan.shape.num_q_heads,
-                rel.extent,
-            )?;
-            let arm = fa2::prefill_rel_arm(plan.full_attention_variant(), window_left);
-            let params = PrefillRelParams {
-                base: params,
-                rel_bias: rel.bias.ptr,
-                rel_extent: rel.extent,
-                rel_heads: plan.shape.num_q_heads,
-                log_floor: rel.log_floor,
-                log_alpha: rel.log_alpha,
-            };
-            fa2::prefill(ctx, op, point(arm), &params)?;
-        }
-    }
-    if plan.info.split_kv {
-        fa2::fold(ctx, op, &split)
-    } else {
-        Ok(())
-    }
+    paged::prefill(ctx, op, q, plan, pool, window_left, sm_scale, o, lse_ptr)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -478,35 +373,6 @@ pub struct RelBias {
     pub log_alpha: f32,
 }
 
-fn rel_table(
-    op: &'static str,
-    bias: &Tensor,
-    rows: u32,
-    heads: u32,
-    extent: u32,
-) -> Result<(), Error> {
-    if bias.dtype != Dtype::F32 {
-        return Err(refuse(
-            op,
-            format!(
-                "the relative-bias table is {:?}, and the score adds f32",
-                bias.dtype
-            ),
-        ));
-    }
-    let width = u64::from(heads) * u64::from(extent);
-    if bias.rows != rows || u64::from(bias.width) != width {
-        return Err(refuse(
-            op,
-            format!(
-                "the relative-bias table is [{}, {}] and the fire's queries want [{rows}, {heads} x {extent}]",
-                bias.rows, bias.width
-            ),
-        ));
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn decode_rel(
     ctx: &Ctx,
@@ -582,7 +448,7 @@ pub fn sink(
     ctx.fire(
         OP,
         Fire::at(
-            "attn/attention.cuh",
+            "attn/attention.hip",
             symbol(&format!("::pie::attn::sink_rescale<{t}>")),
         )
         .apply(per_head_elementwise(o.rows, heads, head_dim)),
@@ -627,7 +493,7 @@ pub fn merge_lse(
     ctx.fire(
         OP,
         Fire::at(
-            "attn/attention.cuh",
+            "attn/attention.hip",
             symbol(&format!("::pie::attn::merge_lse_combine<{t}>")),
         )
         .apply(Launch::grid(
@@ -671,7 +537,7 @@ pub fn logit_softcap(ctx: &Ctx, x: &mut Tensor, cap: f32) -> Result<(), Error> {
     ctx.fire(
         OP,
         Fire::at(
-            "attn/attention.cuh",
+            "attn/attention.hip",
             symbol(&format!("::pie::attn::logit_softcap<{t}>")),
         )
         .apply(elementwise(lanes)),
@@ -771,7 +637,7 @@ pub fn res_blend(
     ctx.fire(
         OP,
         Fire::at(
-            "elemwise/norm.cuh",
+            "elemwise/norm.hip",
             symbol(&format!("::pie::elemwise::res_blend<{t}>")),
         )
         .apply(Launch::per_row(y.rows, BLOCK)),

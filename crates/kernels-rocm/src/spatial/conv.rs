@@ -6,7 +6,7 @@ use crate::spatial::lane_pair;
 use crate::tensor::Tensor;
 use dtype::Dtype;
 
-const FILE: &str = "spatial/conv.cuh";
+const FILE: &str = "spatial/conv.hip";
 
 const OP: &str = "spatial.conv3d";
 

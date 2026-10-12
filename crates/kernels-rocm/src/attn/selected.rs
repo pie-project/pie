@@ -6,7 +6,7 @@ use crate::attn::mla::naive::{NAIVE_BLOCK, NAIVE_MAX_PER, head_group};
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
-const FILE: &str = "attn/sdpa_selected.cuh";
+const FILE: &str = "attn/sdpa_selected.hip";
 
 const ENTRY: &str = "::pie::attn::sdpa_selected::sdpa_paged_selected_kernel<::pie::bf16>";
 
