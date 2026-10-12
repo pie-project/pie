@@ -1,7 +1,10 @@
 pub mod clip;
-pub mod dit;
 pub mod gate;
 pub mod hc;
+pub mod modulate;
 pub mod norm;
+pub mod pointwise;
 pub mod rope;
+pub mod rope_axes;
 pub mod rope_mrope;
+pub mod sinusoid;

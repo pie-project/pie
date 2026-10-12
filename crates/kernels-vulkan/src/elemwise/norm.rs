@@ -342,6 +342,16 @@ pub fn layernorm(
     )
 }
 
+pub fn layernorm_no_scale(ctx: &Ctx<'_>, x: Tensor, eps: f32, y: Tensor) -> Result<(), Error> {
+    const OP: &str = "elementwise.layernorm_no_scale";
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "layernorm_no_scale_bf16", F32 => "layernorm_no_scale_f32" });
+    let grid = rms_grid(OP, x.width, x.width, x.rows)?;
+    ctx.fire(
+        Fire::at("norm/layernorm.slang", entry).apply(grid),
+        &[x.arg(), y.arg_mut(), eps.arg(), x.width.arg()],
+    )
+}
+
 pub fn standardize(ctx: &Ctx<'_>, bias: Tensor, scale: Tensor, out: Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.standardize";
     let entry = dtype_dispatch!(OP, out.dtype, { Bf16 => "standardize_bf16" });

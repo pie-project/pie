@@ -13,6 +13,17 @@ impl DispatchLinear for Run<'_> {
 impl Run<'_> {
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_vulkan::Error> {
         match op {
+            Linear::Matmul { act, w, y }
+                if self.tensor(*act).dtype == poem_ir::Dtype::F32 && self.banked(*w).is_none() =>
+            {
+                linear::lane_gemm::act_x_wt(
+                    self.ctx(),
+                    "linear.matmul",
+                    self.tensor(*act),
+                    self.tensor(*w),
+                    self.tensor(*y),
+                )
+            }
             Linear::Matmul { act, w, y } => match self.banked(*w) {
                 Some(bank) => linear::quant::matmul(
                     self.ctx(),

@@ -1538,7 +1538,7 @@ impl Shell {
                 let values = u32::try_from(copy.bytes / 2).unwrap_or(u32::MAX);
                 let source = self.handles.bind(copy.cell, 0, u64::from(values) * 4)?;
                 let into = self.handles.bind(store, copy.at, copy.bytes)?;
-                kernels_vulkan::elemwise::dit::cast_f32_to_bf16(
+                kernels_vulkan::elemwise::pointwise::cast_f32_to_bf16(
                     &sink,
                     kernels_vulkan::Tensor::new(source, values, 1, Dtype::F32),
                     kernels_vulkan::Tensor::new(into, values, 1, Dtype::Bf16),

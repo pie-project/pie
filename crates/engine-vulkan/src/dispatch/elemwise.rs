@@ -102,7 +102,7 @@ impl Run<'_> {
                 self.tensor(*x),
             ),
 
-            Elementwise::LayernormNoScale { x, eps, y } => elemwise::dit::layernorm_no_scale(
+            Elementwise::LayernormNoScale { x, eps, y } => elemwise::norm::layernorm_no_scale(
                 self.ctx(),
                 self.tensor(*x),
                 *eps,
@@ -114,12 +114,12 @@ impl Run<'_> {
                 lane_of_row,
                 form,
                 y,
-            } => elemwise::dit::modulate(
+            } => elemwise::modulate::modulate(
                 self.ctx(),
                 match form {
-                    poem_ir::ModulateForm::ScaleShift => elemwise::dit::Form::ScaleShift,
-                    poem_ir::ModulateForm::Scale => elemwise::dit::Form::Scale,
-                    poem_ir::ModulateForm::TanhGate => elemwise::dit::Form::TanhGate,
+                    poem_ir::ModulateForm::ScaleShift => elemwise::modulate::Form::ScaleShift,
+                    poem_ir::ModulateForm::Scale => elemwise::modulate::Form::Scale,
+                    poem_ir::ModulateForm::TanhGate => elemwise::modulate::Form::TanhGate,
                 },
                 self.tensor(*x),
                 match lane_of_row {
@@ -135,7 +135,7 @@ impl Run<'_> {
                 y,
                 lane_of_row,
                 r_out: _,
-            } => elemwise::dit::gated_residual_add(
+            } => elemwise::modulate::gated_residual_add(
                 self.ctx(),
                 self.tensor(*r),
                 match lane_of_row {
@@ -153,7 +153,7 @@ impl Run<'_> {
                 flip_sin_cos,
                 scale,
                 y,
-            } => elemwise::dit::sinusoid(
+            } => elemwise::sinusoid::sinusoid(
                 self.ctx(),
                 self.tensor(*t),
                 *dim,
@@ -163,12 +163,12 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
             Elementwise::Silu { x, x_out: _ } => {
-                elemwise::dit::silu(self.ctx(), self.tensor(*x), self.tensor(*x))
+                elemwise::pointwise::silu(self.ctx(), self.tensor(*x), self.tensor(*x))
             }
             Elementwise::Tanh { x, x_out: _ } => {
-                elemwise::dit::tanh(self.ctx(), self.tensor(*x), self.tensor(*x))
+                elemwise::pointwise::tanh(self.ctx(), self.tensor(*x), self.tensor(*x))
             }
-            Elementwise::Add { x, y, z } => elemwise::dit::add(
+            Elementwise::Add { x, y, z } => elemwise::pointwise::add(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*y),
@@ -183,17 +183,17 @@ impl Run<'_> {
                 rotary_dim,
                 head_dim,
                 x_out: _,
-            } => elemwise::dit::rope_axes(
+            } => elemwise::rope_axes::rope_axes(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*positions),
                 *dims,
                 *thetas,
                 match form {
-                    poem_ir::RopeForm::Interleaved => elemwise::dit::RopeForm::Interleaved,
-                    poem_ir::RopeForm::Neox => elemwise::dit::RopeForm::Neox,
-                    poem_ir::RopeForm::Split => elemwise::dit::RopeForm::Split,
-                    poem_ir::RopeForm::SplitLadder => elemwise::dit::RopeForm::SplitLadder,
+                    poem_ir::RopeForm::Interleaved => elemwise::rope_axes::RopeForm::Interleaved,
+                    poem_ir::RopeForm::Neox => elemwise::rope_axes::RopeForm::Neox,
+                    poem_ir::RopeForm::Split => elemwise::rope_axes::RopeForm::Split,
+                    poem_ir::RopeForm::SplitLadder => elemwise::rope_axes::RopeForm::SplitLadder,
                 },
                 *rotary_dim,
                 *head_dim,

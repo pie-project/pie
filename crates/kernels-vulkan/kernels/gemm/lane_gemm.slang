@@ -31,7 +31,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
     y[row * uint(pc.n) + col] = PIE_YS(acc);
 }
 
-// pie:instantiate dense_f32_w_bf16
-// pie:instantiate dense_f32_w_f32 PIE_W_F32=1
-// pie:instantiate dense_f32_w_bf16_y_bf16 PIE_Y_BF16=1
-// pie:instantiate dense_f32_w_f32_y_bf16 PIE_W_F32=1 PIE_Y_BF16=1
+// pie:instantiate lane_gemm_f32_bf16_f32
+// pie:instantiate lane_gemm_f32_f32_f32 PIE_W_F32=1
+// pie:instantiate lane_gemm_f32_bf16_bf16 PIE_Y_BF16=1
+// pie:instantiate lane_gemm_f32_f32_bf16 PIE_W_F32=1 PIE_Y_BF16=1

@@ -768,51 +768,24 @@ pub fn copy_words(ctx: &Ctx<'_>, src: Tensor, dst: Tensor, bytes: u64) -> Result
 }
 
 pub fn pack_rows(ctx: &Ctx<'_>, x: Tensor, perm: Tensor, o: Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.pack_rows";
-    let entry = dtype_dispatch!(OP, o.dtype, { Bf16 => "pack_rows_bf16", F32 => "pack_rows_f32" });
-    permute_rows(ctx, OP, entry, x, perm, o, o.rows)
+    let index = permutation("layout.pack_rows", perm, o.rows)?;
+    gather_rows(ctx, x, index, o)
 }
 
 pub fn unpack_rows(ctx: &Ctx<'_>, x: Tensor, perm: Tensor, o: Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.unpack_rows";
-    let entry =
-        dtype_dispatch!(OP, x.dtype, { Bf16 => "unpack_rows_bf16", F32 => "unpack_rows_f32" });
-    permute_rows(ctx, OP, entry, x, perm, o, x.rows)
+    let index = permutation("layout.unpack_rows", perm, x.rows)?;
+    scatter_rows(ctx, x, index, o)
 }
 
-fn permute_rows(
-    ctx: &Ctx<'_>,
-    op: &'static str,
-    entry: &'static str,
-    x: Tensor,
-    perm: Tensor,
-    o: Tensor,
-    rows: u32,
-) -> Result<(), Error> {
-    let rows = nonzero(op, "rows to move", rows)?;
-    if perm.dtype != dtype::Dtype::I32
-        || u64::from(perm.rows) * u64::from(perm.width) < u64::from(rows)
-    {
+fn permutation(op: &'static str, perm: Tensor, rows: u32) -> Result<Tensor, Error> {
+    if u64::from(perm.rows) * u64::from(perm.width) < u64::from(rows) {
         return Err(refuse(
             op,
             format!(
-                "a {:?} permutation of {} x {} for {rows} rows",
-                perm.dtype, perm.rows, perm.width
+                "a {} x {} permutation for {rows} rows",
+                perm.rows, perm.width
             ),
         ));
     }
-    if x.dtype != o.dtype || x.width != o.width {
-        return Err(refuse(
-            op,
-            format!(
-                "{} x {:?} rows into {} x {:?}",
-                x.width, x.dtype, o.width, o.dtype
-            ),
-        ));
-    }
-    let width = nonzero(op, "the row width", o.width)?;
-    ctx.fire(
-        Fire::at("layout/row_permute.slang", entry).apply(Grid::of([width, rows, 1], [256, 1, 1])),
-        &[x.arg(), o.arg_mut(), perm.arg(), width.arg(), rows.arg()],
-    )
+    Ok(Tensor::new(perm.buf, rows, 1, perm.dtype))
 }

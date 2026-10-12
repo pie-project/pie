@@ -16,9 +16,7 @@ PIE_BUFFER_RO(1, k);
 PIE_BUFFER_RO(2, v);
 PIE_BUFFER_RW(3, o);
 [[vk::binding(4)]] StructuredBuffer<int> segments;
-#ifdef PIE_RAGGED
 [[vk::binding(5)]] StructuredBuffer<int> kv_segments;
-#endif
 struct Push { int num_segments; int num_q_heads; int num_kv_heads; int head_dim; float sm_scale; };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
@@ -37,11 +35,7 @@ int2 span_of(int row) {
         int mid = (lo + hi + 1) >> 1;
         if (segments[uint(mid)] <= row) lo = mid; else hi = mid - 1;
     }
-#ifdef PIE_RAGGED
     return int2(kv_segments[uint(lo)], kv_segments[uint(lo + 1)]);
-#else
-    return int2(segments[uint(lo)], segments[uint(lo + 1)]);
-#endif
 }
 
 [numthreads(PIE_THREADS, 1, 1)]
@@ -124,5 +118,5 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     [ForceUnroll] for (uint d = 0u; d < uint(PIE_DPT); d++) o[q_row + d0 + d] = PIE_STORE(acc[d] * inv);
 }
 
-// pie:instantiate tiled_ragged_bf16_d_64 PIE_D=64 PIE_RAGGED=1
-// pie:instantiate tiled_ragged_bf16_d_128 PIE_D=128 PIE_RAGGED=1
+// pie:instantiate ragged_tiled_bf16_d_64 PIE_D=64
+// pie:instantiate ragged_tiled_bf16_d_128 PIE_D=128

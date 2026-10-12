@@ -1,9 +1,8 @@
-#include "dit/types.slang"
+#include "common/bf16.slang"
 
-
-[[vk::binding(0)]] StructuredBuffer<PIE_XT> x;
+[[vk::binding(0)]] StructuredBuffer<PIE_ACT> x;
 [[vk::binding(1)]] StructuredBuffer<float> positions;
-[[vk::binding(2)]] RWStructuredBuffer<PIE_XT> o;
+[[vk::binding(2)]] RWStructuredBuffer<PIE_ACT> o;
 
 struct Push {
     uint d0; uint d1; uint d2; uint d3;
@@ -87,11 +86,11 @@ void main(uint3 gid : SV_DispatchThreadID) {
             hi = first_channel + dims[axis] / 2u + within;
         }
     }
-    float va = PIE_XL(x[xh + lo]);
-    float vb = PIE_XL(x[xh + hi]);
-    o[xh + lo] = PIE_XS(va * cos_v - vb * sin_v);
-    o[xh + hi] = PIE_XS(vb * cos_v + va * sin_v);
+    float va = PIE_LOAD(x[xh + lo]);
+    float vb = PIE_LOAD(x[xh + hi]);
+    o[xh + lo] = PIE_STORE(va * cos_v - vb * sin_v);
+    o[xh + hi] = PIE_STORE(vb * cos_v + va * sin_v);
 }
 
 // pie:instantiate rope_axes_bf16
-// pie:instantiate rope_axes_f32 PIE_X_F32=1
+// pie:instantiate rope_axes_f32 PIE_ACT_F32=1

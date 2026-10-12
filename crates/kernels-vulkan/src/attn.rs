@@ -14,6 +14,7 @@ pub mod arbiter;
 pub mod dense;
 pub mod merge;
 pub mod ple;
+pub mod ragged;
 pub mod score;
 pub mod ssm;
 

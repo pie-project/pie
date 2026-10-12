@@ -1,4 +1,3 @@
-
 [[vk::binding(0)]] StructuredBuffer<float> t;
 [[vk::binding(1)]] RWStructuredBuffer<float> o;
 

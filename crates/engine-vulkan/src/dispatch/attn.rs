@@ -256,7 +256,7 @@ impl Run<'_> {
                     poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal => {}
                     _ => return Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
                 }
-                attn::dense::ragged(
+                attn::ragged::forward(
                     self.ctx(),
                     self.uncut(*q),
                     self.uncut(*k),
