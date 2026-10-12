@@ -72,7 +72,6 @@ fn the_z_image_rows_bake_every_case() {
     the_refiners_attend_within_a_lane_and_the_trunk_within_the_group();
     the_dit_turns_three_interleaved_axes_and_the_encoder_the_whole_neox_head();
     the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk();
-    every_row_bakes();
     the_generative_facts_state_the_readings_the_schedule_and_the_latent_space();
 }
 
@@ -537,46 +536,6 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
             folds += 1;
         }
         assert_eq!(folds, 2 * modulated, "{deployment}");
-    }
-}
-
-fn every_row_bakes() {
-    for deployment in ROWS {
-        for platform in [Platform::Cuda, Platform::Metal] {
-            let plan = trace(deployment, platform);
-            let max_tokens = if deployment == TURBO { 8192 } else { 4096 };
-            let budget = poem_compiler::Budget {
-                max_lanes: 64,
-                max_tokens,
-                buckets: (0..=13)
-                    .map(|i| 1 << i)
-                    .filter(|b| *b <= max_tokens)
-                    .collect(),
-                max_adapters: 0,
-            };
-            let budgets = poem_compiler::Budgets::of(budget)
-                .with_voxels(poem_compiler::VoxelLadder::new(4096, 4));
-            let compiled = poem_compiler::compile_axes(
-                &plan,
-                &budgets,
-                &poem_compiler::DeviceProfile::default(),
-            )
-            .unwrap_or_else(|why| panic!("{deployment} {platform:?}: does not bake: {why}"));
-            assert!(
-                !compiled.regions.is_empty(),
-                "{deployment} {platform:?}: a bake with no regions"
-            );
-            let tiled: usize = compiled
-                .regions
-                .iter()
-                .map(|region| region.nodes.len())
-                .sum();
-            assert_eq!(
-                tiled,
-                plan.nodes.len(),
-                "{deployment} {platform:?}: the regions tile the nodes once"
-            );
-        }
     }
 }
 

@@ -58,7 +58,7 @@ fn the_hunyuan_image_3_rows_bake_every_case() {
     the_canvas_reads_a_bidirectional_masked_attention_over_the_frozen_prefix();
     the_mixture_is_a_renormalised_top_k_over_the_whole_bank_beside_a_shared_expert();
     both_fact_columns_state_what_the_trace_does();
-    every_row_bakes_on_every_platform_at_its_own_rank();
+    a_sharded_row_reduces_once_per_cut_projection();
 }
 
 fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
@@ -488,39 +488,7 @@ fn validate(facts: &poem::generative::Generative) {
     }
 }
 
-fn budget() -> poem_compiler::Budget {
-    poem_compiler::Budget {
-        max_lanes: 8,
-        max_tokens: 8192,
-        buckets: vec![64, 1024, 8192],
-        max_adapters: 0,
-    }
-}
-
-fn every_row_bakes_on_every_platform_at_its_own_rank() {
-    for platform in PLATFORMS {
-        for deployment in ROWS {
-            let plan = trace(deployment, platform);
-            let budgets = poem_compiler::Budgets::of(budget())
-                .with_voxels(poem_compiler::VoxelLadder::new(8192, 4));
-            let compiled = poem_compiler::compile_axes(
-                &plan,
-                &budgets,
-                &poem_compiler::DeviceProfile::default(),
-            )
-            .unwrap_or_else(|why| panic!("{platform:?}: `{deployment}` does not bake: {why}"));
-            let tiled: usize = compiled.regions.iter().map(|r| r.nodes.len()).sum();
-            assert_eq!(
-                tiled,
-                plan.nodes.len(),
-                "{platform:?} `{deployment}`: the regions tile the node list once"
-            );
-            assert!(
-                compiled.voxels.is_some(),
-                "{platform:?} `{deployment}`: the image head is a voxel plan"
-            );
-        }
-    }
+fn a_sharded_row_reduces_once_per_cut_projection() {
     for deployment in [TP1, TP4] {
         let plan = trace(deployment, Platform::Cuda);
         let d = dims(deployment);

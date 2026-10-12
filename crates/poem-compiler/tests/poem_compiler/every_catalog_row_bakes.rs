@@ -3,8 +3,8 @@ use poem_compiler::{
 };
 
 use crate::common;
-use common::{PLATFORMS, bake_with};
-use poem_ir::Trace;
+use common::{PLATFORMS, bake_with, states};
+use poem_ir::{RowAxis, Trace};
 
 fn forced() -> DeviceProfile {
     DeviceProfile {
@@ -45,8 +45,13 @@ fn admits(trace: &Trace, compiled: &CompiledModel, at: usize, profile: &DevicePr
         && launches(region) * profile.empty_launch_us > paid
 }
 
+/// Every catalog row, on every platform, under the default profile and one
+/// that forces conditionals: it bakes against the ladders its own axes state,
+/// its regions tile its nodes once, it plans a voxel axis iff it carries a
+/// VAE, each conditional region is one the gates admit and every other one is
+/// not, and no collective is elided.
 #[test]
-fn every_conditional_region_clears_every_gate_and_every_other_one_does_not() {
+fn every_row_bakes_on_every_platform() {
     let mut wrong: Vec<String> = Vec::new();
 
     for row in poem_compiler::catalog::deployments().chain(poem_compiler::catalog::splits()) {
@@ -56,6 +61,18 @@ fn every_conditional_region_clears_every_gate_and_every_other_one_does_not() {
             for profile in [DeviceProfile::default(), forced()] {
                 let compiled = bake_with(&trace, &profile)
                     .unwrap_or_else(|why| panic!("{deployment} on {platform:?} bakes: {why}"));
+                let tiled: usize = compiled.regions.iter().map(|r| r.nodes.len()).sum();
+                if tiled != trace.nodes.len() {
+                    wrong.push(format!(
+                        "`{deployment}` as {platform:?}: the regions tile {tiled} of {} nodes",
+                        trace.nodes.len()
+                    ));
+                }
+                if compiled.voxels.is_some() != states(&trace, RowAxis::Voxels) {
+                    wrong.push(format!(
+                        "`{deployment}` as {platform:?}: a voxel plan iff a voxel axis"
+                    ));
+                }
                 for at in 0..compiled.regions.len() {
                     let region = &compiled.regions[at];
                     let conditional = region.lowering != Lowering::AlwaysLaunch;

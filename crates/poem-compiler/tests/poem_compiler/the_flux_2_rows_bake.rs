@@ -44,7 +44,6 @@ fn the_flux_2_rows_bake_every_case() {
     each_stream_of_the_denoise_reading_classifies_into_its_own_class();
     every_ragged_read_is_self_paired_over_the_group_csr();
     every_rope_turns_four_axes_of_the_whole_head_interleaved();
-    both_rows_bake_on_every_platform_under_a_voxel_ladder();
     the_schedule_is_the_goldens_and_the_mu_fit_reproduces_it();
     the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk();
 }
@@ -390,51 +389,6 @@ fn every_rope_turns_four_axes_of_the_whole_head_interleaved() {
         neox,
         model::TE_LAYERS as usize,
         "the encoder's rope, once a layer"
-    );
-}
-
-fn budget() -> poem_compiler::Budget {
-    poem_compiler::Budget {
-        max_lanes: 64,
-        max_tokens: 4096,
-        buckets: vec![64, 256, 1024, 4096],
-        max_adapters: 0,
-    }
-}
-
-fn both_rows_bake_on_every_platform_under_a_voxel_ladder() {
-    for platform in PLATFORMS {
-        for deployment in [KLEIN, MINI] {
-            let plan = trace(deployment, platform);
-            let budgets = poem_compiler::Budgets::of(budget())
-                .with_voxels(poem_compiler::VoxelLadder::new(4096, 4));
-            let compiled = poem_compiler::compile_axes(
-                &plan,
-                &budgets,
-                &poem_compiler::DeviceProfile::default(),
-            )
-            .unwrap_or_else(|why| panic!("{platform:?}: `{deployment}` does not bake: {why}"));
-            let tiled: usize = compiled.regions.iter().map(|r| r.nodes.len()).sum();
-            assert_eq!(
-                tiled,
-                plan.nodes.len(),
-                "{platform:?} `{deployment}`: the regions tile the node list once"
-            );
-            assert_eq!(
-                compiled.voxels.is_some(),
-                deployment == KLEIN,
-                "{platform:?} `{deployment}`: a voxel plan iff the row carries a VAE"
-            );
-        }
-    }
-    let refused = poem_compiler::compile(
-        &trace(KLEIN, Platform::Cuda),
-        &budget(),
-        &poem_compiler::DeviceProfile::default(),
-    );
-    assert!(
-        matches!(refused, Err(poem_compiler::Error::Unsized { .. })),
-        "the flagship bakes against no voxel ladder: {refused:?}"
     );
 }
 

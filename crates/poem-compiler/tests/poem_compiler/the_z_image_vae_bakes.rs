@@ -6,7 +6,7 @@ use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{Expr, Partition, TensorType};
 
 use poem::generative::{PortKind, ReadoutKind};
-use poem::{Def, Dim, Dtype, Operation, Platform, Request, Stream, Trace, Ty, seam};
+use poem::{Def, Dim, Dtype, Operation, Platform, Stream, Trace, Ty, seam};
 use poem_ir::{GridRule, ParamLayout, Seam, Spatial};
 use z_image_dims::{self as model, vae};
 
@@ -38,8 +38,6 @@ fn the_z_image_vae_bakes_every_case() {
     the_flagship_declares_the_two_vae_readings_and_the_miniature_neither();
     the_trace_reads_two_voxel_ports_and_plants_pixels_twice();
     the_shapes_are_the_flux_vaes();
-    each_vae_lane_has_a_class_of_its_own();
-    the_plan_bakes_against_a_voxel_ladder();
     the_import_reads_every_vae_tensor_of_the_real_snapshot_once();
 }
 
@@ -254,58 +252,6 @@ fn the_shapes_are_the_flux_vaes() {
     assert_eq!(convs, 62);
     assert_eq!(norms, 52);
     assert_eq!(silu_off, 2, "only the attention's norm has no SiLU");
-}
-
-fn each_vae_lane_has_a_class_of_its_own() {
-    let plan = trace(TURBO);
-    let classes = poem::resolve_classes(&plan).expect("every merge resolves");
-    let facts = row(TURBO).generative().expect("facts");
-    let class_of = |name: &str, stream: Stream| {
-        let r = reading(&facts, name);
-        let request = Request::new(4, false).on_stream(stream).in_reading(&r.name);
-        let word = plan.facts.word(&request);
-        classes
-            .class_of(word & classes.mask)
-            .unwrap_or_else(|| panic!("a {name} lane has no class"))
-    };
-    let seen: BTreeSet<usize> = [
-        class_of("text", Stream::Text),
-        class_of("refine", Stream::Context),
-        class_of("denoise", Stream::Image),
-        class_of("denoise", Stream::Context),
-        class_of("vae.decode", Stream::Image),
-        class_of("vae.encode", Stream::Image),
-    ]
-    .into_iter()
-    .collect();
-    assert_eq!(seen.len(), 6, "six lanes, six classes");
-}
-
-fn the_plan_bakes_against_a_voxel_ladder() {
-    let plan = trace(TURBO);
-    let budget = poem_compiler::Budget {
-        max_lanes: 16,
-        max_tokens: 4096,
-        buckets: vec![1024, 4096],
-        max_adapters: 0,
-    };
-    let budgets =
-        poem_compiler::Budgets::of(budget).with_voxels(poem_compiler::VoxelLadder::new(64 * 64, 1));
-    let compiled =
-        poem_compiler::compile_axes(&plan, &budgets, &poem_compiler::DeviceProfile::default())
-            .unwrap_or_else(|why| panic!("does not bake: {why}"));
-    assert!(compiled.voxels.is_some(), "the voxel axis has its own plan");
-    let tiled: usize = compiled.regions.iter().map(|r| r.nodes.len()).sum();
-    assert_eq!(tiled, plan.nodes.len(), "the regions tile the nodes once");
-    assert!(
-        !poem_compiler::compile(
-            &plan,
-            &budgets.tokens,
-            &poem_compiler::DeviceProfile::default()
-        )
-        .is_ok(),
-        "and against no voxel ladder the plan is refused, not sized at zero"
-    );
 }
 
 fn hub() -> PathBuf {

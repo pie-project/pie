@@ -35,7 +35,6 @@ fn the_mini_dit_row_bakes_every_case() {
     each_stream_classifies_into_its_own_class_and_every_merge_resolves();
     the_joint_attention_is_self_paired_and_the_cross_attention_is_not();
     every_rope_turns_three_axes_of_the_whole_head_interleaved();
-    the_plan_bakes_on_every_platform();
     the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk();
     the_generative_facts_are_the_ports_the_trace_reads();
 }
@@ -278,39 +277,6 @@ fn every_rope_turns_three_axes_of_the_whole_head_interleaved() {
         ropes_after_cross, 0,
         "the affine cross norm is followed by no rope"
     );
-}
-
-fn the_plan_bakes_on_every_platform() {
-    for platform in PLATFORMS {
-        let plan = trace(platform);
-        let budget = poem_compiler::Budget {
-            max_lanes: 256,
-            max_tokens: 8192,
-            buckets: vec![
-                1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
-            ],
-            max_adapters: 0,
-        };
-        let compiled =
-            poem_compiler::compile(&plan, &budget, &poem_compiler::DeviceProfile::default())
-                .unwrap_or_else(|why| {
-                    panic!("{platform:?}: the mini-dit plan does not bake: {why}")
-                });
-        assert!(
-            !compiled.regions.is_empty(),
-            "{platform:?}: a bake with no regions"
-        );
-        let tiled: usize = compiled
-            .regions
-            .iter()
-            .map(|region| region.nodes.len())
-            .sum();
-        assert_eq!(
-            tiled,
-            plan.nodes.len(),
-            "{platform:?}: the regions tile the node list once"
-        );
-    }
 }
 
 fn the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk() {

@@ -62,7 +62,6 @@ fn the_minimax_h3_rows_bake_every_case() {
     one_joint_read_per_block_and_one_lane_read_per_refiner();
     the_trunk_turns_three_neox_axes_and_the_refiner_turns_nothing();
     the_modality_gather_is_three_weight_blocks_and_one_column_slice();
-    every_row_bakes_on_every_platform();
     the_sharded_worlds_trace_and_bake();
     the_generative_facts_state_the_readings_the_latent_and_two_shifts();
     the_modulation_is_a_lane_vector_and_every_gated_fold_folds_its_residual();
@@ -394,25 +393,6 @@ fn budget() -> poem_compiler::Budget {
         max_tokens: 4096,
         buckets: vec![64, 256, 1024, 4096],
         max_adapters: 0,
-    }
-}
-
-fn every_row_bakes_on_every_platform() {
-    for platform in PLATFORMS {
-        for deployment in ROWS {
-            let plan = trace(deployment, platform);
-            let compiled =
-                poem_compiler::compile(&plan, &budget(), &poem_compiler::DeviceProfile::default())
-                    .unwrap_or_else(|why| {
-                        panic!("{platform:?}: `{deployment}` does not bake: {why}")
-                    });
-            let tiled: usize = compiled.regions.iter().map(|r| r.nodes.len()).sum();
-            assert_eq!(
-                tiled,
-                plan.nodes.len(),
-                "{platform:?} `{deployment}`: the regions tile the node list once"
-            );
-        }
     }
 }
 

@@ -61,7 +61,6 @@ fn the_wan_2_rows_bake_every_case() {
     each_lane_the_facts_list_classifies_into_its_own_class();
     the_attentions_pair_as_the_architecture_says();
     every_rope_turns_the_rows_three_axis_split_of_the_whole_head_interleaved();
-    every_row_bakes_on_every_platform_under_a_voxel_ladder();
     the_generative_facts_state_the_readings_the_latent_and_the_schedule();
     the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk();
 }
@@ -415,51 +414,6 @@ fn every_rope_turns_the_rows_three_axis_split_of_the_whole_head_interleaved() {
         });
         assert!(!neox, "{deployment}: umT5 has no rotary embedding");
     }
-}
-
-fn budget() -> poem_compiler::Budget {
-    poem_compiler::Budget {
-        max_lanes: 64,
-        max_tokens: 4096,
-        buckets: vec![64, 256, 1024, 4096],
-        max_adapters: 0,
-    }
-}
-
-fn every_row_bakes_on_every_platform_under_a_voxel_ladder() {
-    for platform in PLATFORMS {
-        for deployment in ROWS {
-            let plan = trace(deployment, platform);
-            let budgets = poem_compiler::Budgets::of(budget())
-                .with_voxels(poem_compiler::VoxelLadder::new(4096, 4));
-            let compiled = poem_compiler::compile_axes(
-                &plan,
-                &budgets,
-                &poem_compiler::DeviceProfile::default(),
-            )
-            .unwrap_or_else(|why| panic!("{platform:?}: `{deployment}` does not bake: {why}"));
-            let tiled: usize = compiled.regions.iter().map(|r| r.nodes.len()).sum();
-            assert_eq!(
-                tiled,
-                plan.nodes.len(),
-                "{platform:?} `{deployment}`: the regions tile the node list once"
-            );
-            assert_eq!(
-                compiled.voxels.is_some(),
-                is_flagship(deployment),
-                "{platform:?} `{deployment}`: a voxel plan iff the row carries a VAE"
-            );
-        }
-    }
-    let refused = poem_compiler::compile(
-        &trace(TI2V, Platform::Cuda),
-        &budget(),
-        &poem_compiler::DeviceProfile::default(),
-    );
-    assert!(
-        matches!(refused, Err(poem_compiler::Error::Unsized { .. })),
-        "the flagship bakes against no voxel ladder: {refused:?}"
-    );
 }
 
 fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {

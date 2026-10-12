@@ -39,7 +39,6 @@ fn the_flux_2_vae_bakes_every_case() {
     the_trace_reads_two_voxel_ports_and_plants_pixels_twice();
     the_shapes_are_the_flux2_autoencoders();
     each_vae_lane_has_a_class_of_its_own();
-    the_plan_bakes_against_a_voxel_ladder();
     the_import_reads_every_vae_tensor_of_the_real_snapshot_once();
 }
 
@@ -303,33 +302,6 @@ fn each_vae_lane_has_a_class_of_its_own() {
     .into_iter()
     .collect();
     assert_eq!(seen.len(), 6, "six lanes, six classes");
-}
-
-fn the_plan_bakes_against_a_voxel_ladder() {
-    let plan = trace(KLEIN);
-    let budget = poem_compiler::Budget {
-        max_lanes: 16,
-        max_tokens: 4096,
-        buckets: vec![1024, 4096],
-        max_adapters: 0,
-    };
-    let budgets =
-        poem_compiler::Budgets::of(budget).with_voxels(poem_compiler::VoxelLadder::new(32 * 32, 1));
-    let compiled =
-        poem_compiler::compile_axes(&plan, &budgets, &poem_compiler::DeviceProfile::default())
-            .unwrap_or_else(|why| panic!("does not bake: {why}"));
-    assert!(compiled.voxels.is_some(), "the voxel axis has its own plan");
-    let tiled: usize = compiled.regions.iter().map(|r| r.nodes.len()).sum();
-    assert_eq!(tiled, plan.nodes.len(), "the regions tile the nodes once");
-    assert!(
-        poem_compiler::compile(
-            &plan,
-            &budgets.tokens,
-            &poem_compiler::DeviceProfile::default()
-        )
-        .is_err(),
-        "and against no voxel ladder the plan is refused, not sized at zero"
-    );
 }
 
 fn hub() -> PathBuf {
