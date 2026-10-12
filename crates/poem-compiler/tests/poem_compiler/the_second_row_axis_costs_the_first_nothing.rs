@@ -1,5 +1,4 @@
 use poem_compiler::{Budget, Budgets, DeviceProfile, PatchLadder, RowAxis, compile, compile_axes};
-use crate::common;
 use poem_ir::{
     CacheRow, Def, Dim, Dtype, Guard, Node, Operation, Param, Seam, Trace, Ty, ValueDecl, ValueId,
 };

@@ -1,14 +1,14 @@
 //! poem-compiler's integration tests, one binary: each module was a test file.
 
-pub mod common;
-pub mod flux_2_dims;
-pub mod hunyuan_image_3_dims;
-pub mod ltx_2_dims;
-pub mod mini_dit_dims;
-pub mod minimax_h3_dims;
-pub mod sparse_gguf;
-pub mod wan_2_dims;
-pub mod z_image_dims;
+mod common;
+mod flux_2_dims;
+mod hunyuan_image_3_dims;
+mod ltx_2_dims;
+mod mini_dit_dims;
+mod minimax_h3_dims;
+mod sparse_gguf;
+mod wan_2_dims;
+mod z_image_dims;
 
 mod a_banded_head_gathers_the_logits_it_holds_a_band_of;
 mod a_fused_kernel_replaces_what_its_pattern_matches;
