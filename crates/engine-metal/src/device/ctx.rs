@@ -69,7 +69,8 @@ pub struct Context {
     name: String,
     working_set: u64,
     max_buffer: u64,
-    cores: u32,
+    /// The GPU's cores, where the IORegistry says: iOS does not.
+    cores: Option<u32>,
     /// The newest `MTLGPUFamily::AppleN` the device supports.
     family: u32,
     /// The Metal 4 mapping side, opened on first use: most loads never map a
@@ -124,10 +125,7 @@ impl Context {
                     ),
                 });
             }
-            let cores = super::iokit::gpu_cores().ok_or_else(|| Fault::Device {
-                call: "IORegistryEntryCreateCFProperty",
-                why: format!("the IORegistry does not say how many GPU cores `{name}` has"),
-            })?;
+            let cores = super::iokit::gpu_cores();
             let family = family(&device);
             let working_set = device.recommendedMaxWorkingSetSize();
             let max_buffer = device.maxBufferLength() as u64;
@@ -202,7 +200,7 @@ impl Context {
     }
 
     #[must_use]
-    pub fn cores(&self) -> u32 {
+    pub fn cores(&self) -> Option<u32> {
         self.cores
     }
 
@@ -845,13 +843,13 @@ fn available_memory() -> Option<u64> {
     }
 }
 
-#[cfg(all(test, target_vendor = "apple"))]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     #[test]
     fn the_core_count_is_the_registrys_not_a_guess() {
         let ctx = super::Context::bind().expect("a Metal 4 device");
         let cores = super::super::iokit::gpu_cores().expect("the registry says");
-        assert_eq!(ctx.cores(), cores);
+        assert_eq!(ctx.cores(), Some(cores));
         assert!(
             cores >= 7,
             "no Apple Silicon GPU has fewer than 7 cores: {cores}"

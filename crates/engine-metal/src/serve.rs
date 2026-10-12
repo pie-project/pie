@@ -368,9 +368,14 @@ impl Shell {
             None
         };
 
-        let profile = boot
-            .profile
-            .unwrap_or_else(|| DeviceProfile::of(&chip, device.cores(), &[], &[]));
+        let profile = boot.profile.unwrap_or_else(|| {
+            DeviceProfile::of(
+                &chip,
+                crate::chip::pricing_cores(&chip, device.cores()),
+                &[],
+                &[],
+            )
+        });
         let budgets = {
             let base = match boot.patches.clone() {
                 None => Budgets::of(boot.budget.clone()),
@@ -1138,7 +1143,7 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn cores(&self) -> u32 {
+    pub fn cores(&self) -> Option<u32> {
         self.device.cores()
     }
 

@@ -127,6 +127,18 @@ impl ExpertsThreads {
     }
 }
 
+/// The GPU cores the compiler prices a device at that does not say its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "compiler.unreported_cores", constant(range(1..=1024)), default = 32, tune = price)]
+pub struct UnreportedCores(pub u32);
+
+/// The GPU cores the compiler prices at: the device's, or where it does not
+/// say, the profile's stand-in.
+#[must_use]
+pub fn pricing_cores(profile: &Profile, cores: Option<u32>) -> u32 {
+    cores.unwrap_or_else(|| profile.get::<UnreportedCores>().0)
+}
+
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("metal", FACTS, AXES);
     kernels_metal::tuning::register(&mut r);
@@ -137,7 +149,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<AneMinRows>()
         .add::<AneMinColumns>()
         .add::<ExpertsPrefetch>()
-        .add::<ExpertsThreads>();
+        .add::<ExpertsThreads>()
+        .add::<UnreportedCores>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
     // Metal forks no side streams: one queue serves every region.
     poem_compiler::costs::register(&mut r, 0);
@@ -173,12 +186,15 @@ pub static SHELF: Shelf = Shelf {
 };
 
 #[must_use]
-pub fn facts(family: u32, cores: u32, perf_cores: u32, ane: bool) -> Facts {
-    Facts::of(registry())
+pub fn facts(family: u32, cores: Option<u32>, perf_cores: u32, ane: bool) -> Facts {
+    let facts = Facts::of(registry())
         .int("family", i64::from(family))
-        .int("cores", i64::from(cores))
         .int("perf_cores", i64::from(perf_cores))
-        .flag("ane", ane)
+        .flag("ane", ane);
+    match cores {
+        Some(cores) => facts.int("cores", i64::from(cores)),
+        None => facts,
+    }
 }
 
 /// The CPU's performance cores, or every physical core on a CPU without
@@ -254,7 +270,7 @@ pub fn tell_untuned(device: &str, report: &Report) {
 /// registry refuses.
 #[must_use]
 pub fn tuning(overrides: &str, wide_range: bool) -> kernels_metal::Tuning {
-    kernels_metal::Tuning::new(registry().with_overrides(overrides), wide_range, 16)
+    kernels_metal::Tuning::new(registry().with_overrides(overrides), wide_range, Some(16))
 }
 
 #[cfg(test)]
@@ -350,11 +366,11 @@ mod tests {
 
     #[test]
     fn a_device_no_file_names_runs_its_family_and_is_told_so() {
-        let (profile, report) = resolve("Apple A17 Pro GPU", &facts(9, 6, 10, true), None);
+        let (profile, report) = resolve("Apple A17 Pro GPU", &facts(9, None, 10, true), None);
         assert_eq!(report.used, profile::Source::Seeded("apple9.toml".into()));
         assert!(report.untuned());
         assert_eq!(*profile.get::<AneMlp>(), AneMlp::Share { percent: 47 });
-        let (profile, report) = resolve("Apple A17 Pro GPU", &facts(9, 6, 10, false), None);
+        let (profile, report) = resolve("Apple A17 Pro GPU", &facts(9, None, 10, false), None);
         assert!(report.rejected.is_empty(), "{report:?}");
         assert_eq!(
             *profile.get::<AneMlp>(),
@@ -365,7 +381,7 @@ mod tests {
 
     #[test]
     fn the_m4_pro_runs_its_family_and_what_it_measured() {
-        let (profile, report) = resolve("Apple M4 Pro", &facts(9, 20, 10, true), None);
+        let (profile, report) = resolve("Apple M4 Pro", &facts(9, Some(20), 10, true), None);
         assert_eq!(
             report.layers,
             [
@@ -388,7 +404,7 @@ mod tests {
             "api = 1\n[kernel]\nqmm = [{ use = \"tiled\", crossover_tg = 120 }, \"qmv\"]\n",
         )
         .unwrap();
-        let (profile, report) = resolve("Apple M4 Max", &facts(9, 40, 10, true), Some(&dir));
+        let (profile, report) = resolve("Apple M4 Max", &facts(9, Some(40), 10, true), Some(&dir));
         assert!(
             matches!(report.used, profile::Source::User(_)),
             "{report:?}"
@@ -406,7 +422,7 @@ mod tests {
             "api = 1\n[kernel]\nqmm = [{ use = \"tiled\", crossover_tg = 0 }, \"qmv\"]\n",
         )
         .unwrap();
-        let (profile, report) = resolve("Apple M4 Max", &facts(9, 40, 10, true), Some(&dir));
+        let (profile, report) = resolve("Apple M4 Max", &facts(9, Some(40), 10, true), Some(&dir));
         assert_eq!(report.used, profile::Source::Seeded("apple9.toml".into()));
         assert_eq!(report.rejected.len(), 1, "{report:?}");
         assert_eq!(

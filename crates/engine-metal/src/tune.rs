@@ -340,7 +340,11 @@ const SEARCH_SKIPS: &[&str] = &[
     "compiler.cost.collective_us",
 ];
 
-fn fit(measured: &Measured, grid: &Grid, cores: u32) -> Result<(Entries, Vec<Line>), String> {
+fn fit(
+    measured: &Measured,
+    grid: &Grid,
+    cores: Option<u32>,
+) -> Result<(Entries, Vec<Line>), String> {
     let mut lines = Vec::new();
     // `qmm_fp16`: whether the fp16 format's best beats the emulated one's.
     let best = |p: &Point| {
@@ -382,8 +386,17 @@ fn fit(measured: &Measured, grid: &Grid, cores: u32) -> Result<(Entries, Vec<Lin
             )
         },
     });
+    let fp16 = (QmmFp16::spec().id.to_string(), fp16_on.to_string());
 
     let spec = Qmm::spec();
+    let Some(cores) = cores else {
+        lines.push(Line {
+            id: spec.id,
+            text: "not searched: the device does not say its GPU cores, so `fill` is unknown"
+                .to_string(),
+        });
+        return Ok((vec![fp16], lines));
+    };
     let candidates: Vec<Candidate> = measured
         .candidates
         .iter()
@@ -423,10 +436,7 @@ fn fit(measured: &Measured, grid: &Grid, cores: u32) -> Result<(Entries, Vec<Lin
         let _ = write!(text, "; today's ladder runs at {:.3}x", b / fit.floor);
     }
     lines.push(Line { id: spec.id, text });
-    let entries = vec![
-        (spec.id.to_string(), ladder),
-        (QmmFp16::spec().id.to_string(), fp16_on.to_string()),
-    ];
+    let entries = vec![(spec.id.to_string(), ladder), fp16];
     Ok((entries, lines))
 }
 
@@ -580,7 +590,7 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
 
 /// A hash of the fused trace and compiled plan a load under `text` runs:
 /// two files with the same plan serve the same.
-fn plan_of(deployment: &str, text: &str, cores: u32) -> Option<u64> {
+fn plan_of(deployment: &str, text: &str, cores: Option<u32>) -> Option<u64> {
     use std::hash::{Hash, Hasher};
     let profile = crate::chip::registry().load_user(text, "plan").ok()?;
     let row = poem_compiler::catalog::deployment(deployment)?;
@@ -596,7 +606,12 @@ fn plan_of(deployment: &str, text: &str, cores: u32) -> Option<u64> {
     let compiled = poem_compiler::compile_axes(
         &trace,
         &budgets,
-        &poem_compiler::DeviceProfile::of(&profile, cores, &[], &[]),
+        &poem_compiler::DeviceProfile::of(
+            &profile,
+            crate::chip::pricing_cores(&profile, cores),
+            &[],
+            &[],
+        ),
     )
     .ok()?;
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -621,7 +636,7 @@ struct Metal<'a> {
     device: &'a str,
     base: &'a Profile,
     facts: &'a profile::Facts,
-    cores: u32,
+    cores: Option<u32>,
 }
 
 impl Bench for Metal<'_> {
@@ -807,7 +822,11 @@ pub fn run(
     );
     let (base, report) = crate::chip::resolve(&name, &facts, profiles);
     say(&format!(
-        "{name}: {cores} GPU cores, family {}; starting from {}",
+        "{name}: {}, family {}; starting from {}",
+        cores.map_or_else(
+            || "GPU cores unreported".to_string(),
+            |cores| format!("{cores} GPU cores")
+        ),
         device.family(),
         report.used
     ));
@@ -921,7 +940,7 @@ pub fn run(
         )
     };
     let seconds = began.elapsed().as_secs_f64();
-    let provenance = [
+    let mut provenance = vec![
         (
             "source",
             format!("\"pie tune --{} on this machine\"", depth.word()),
@@ -930,10 +949,12 @@ pub fn run(
         ("from", format!("\"{}\"", report.used)),
         ("pie", format!("\"{}\"", env!("CARGO_PKG_VERSION"))),
         ("mix", "\"standard-1\"".to_string()),
-        ("cores", cores.to_string()),
+    ];
+    provenance.extend(cores.map(|cores| ("cores", cores.to_string())));
+    provenance.extend([
         ("seconds", format!("{seconds:.0}")),
         ("checked", format!("\"{}\"", checked.replace('"', "'"))),
-    ];
+    ]);
     let file = assemble(&base, &name, &facts, &tuned, &provenance)?;
     Ok(Outcome {
         device: name,
@@ -953,7 +974,7 @@ pub fn run(
 fn measure(
     device: &Context,
     base: &Profile,
-    cores: u32,
+    cores: Option<u32>,
     grid: &Grid,
     say: &mut dyn FnMut(&str),
 ) -> Result<Measured, String> {
@@ -1243,8 +1264,11 @@ mod tests {
 
     #[test]
     fn every_candidate_forces_a_ladder_the_registry_reads() {
-        let (base, _) =
-            crate::chip::resolve("Apple M4 Max", &crate::chip::facts(9, 40, 10, true), None);
+        let (base, _) = crate::chip::resolve(
+            "Apple M4 Max",
+            &crate::chip::facts(9, Some(40), 10, true),
+            None,
+        );
         let registry = crate::chip::registry();
         for q in candidates(&base) {
             let p = registry
@@ -1261,7 +1285,7 @@ mod tests {
 
     #[test]
     fn a_fitted_ladder_assembles_into_a_file_this_device_takes() {
-        let facts = crate::chip::facts(9, 40, 10, true);
+        let facts = crate::chip::facts(9, Some(40), 10, true);
         let (base, _) = crate::chip::resolve("Apple M4 Max", &facts, None);
         let grid = Grid::of(Depth::Quick);
         let candidates = candidates(&base);
@@ -1300,7 +1324,17 @@ mod tests {
             points,
             wrong: Vec::new(),
         };
-        let (entries, lines) = fit(&measured, &grid, 40).unwrap();
+        let (unfitted, why) = fit(&measured, &grid, None).unwrap();
+        assert_eq!(
+            unfitted
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["kernel.qmm_fp16"],
+            "without the cores, `fill` is unknown and the ladder is not fitted"
+        );
+        assert!(why[1].text.starts_with("not searched"), "{why:?}");
+        let (entries, lines) = fit(&measured, &grid, Some(40)).unwrap();
         let tuned = profile::search::render_overrides(&entries);
         assert!(
             tuned.contains("{ when = \"rows >= 16\", use = \"tiled\", crossover_tg = 64 }"),
@@ -1364,8 +1398,11 @@ mod tests {
 
     #[test]
     fn measurements_read_back_as_written() {
-        let (base, _) =
-            crate::chip::resolve("Apple M4 Max", &crate::chip::facts(9, 40, 10, true), None);
+        let (base, _) = crate::chip::resolve(
+            "Apple M4 Max",
+            &crate::chip::facts(9, Some(40), 10, true),
+            None,
+        );
         let candidates = candidates(&base);
         let mut times = vec![None; candidates.len()];
         times[0] = Some(1.5e-4);
@@ -1400,7 +1437,7 @@ mod tests {
 
     #[test]
     fn every_search_candidate_reads_against_the_registry() {
-        let facts = crate::chip::facts(10, 40, 10, true);
+        let facts = crate::chip::facts(10, Some(40), 10, true);
         let (base, _) = crate::chip::resolve("Apple M5 Max", &facts, None);
         let knobs = profile::search::knobs(&base, SEARCH_SKIPS, "kernel.ane");
         let ids: Vec<&str> = knobs.iter().map(|k| k.id).collect();
@@ -1424,9 +1461,12 @@ mod tests {
 
     #[test]
     fn a_load_reads_only_the_decisions_it_evaluates() {
-        let (base, _) =
-            crate::chip::resolve("Apple M4 Max", &crate::chip::facts(9, 40, 10, true), None);
-        let tuning = kernels_metal::Tuning::new(base.clone(), false, 40);
+        let (base, _) = crate::chip::resolve(
+            "Apple M4 Max",
+            &crate::chip::facts(9, Some(40), 10, true),
+            None,
+        );
+        let tuning = kernels_metal::Tuning::new(base.clone(), false, Some(40));
         let _ = tuning.qmm_mpp();
         assert!(
             base.read().is_empty(),

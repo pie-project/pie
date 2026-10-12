@@ -8,11 +8,12 @@ use profile::{Decision, Profile, Registry};
 /// where its 4-bit, 64-group codes take the fp16 GEMM format, else
 /// `emulated`. `fill` is how full the device is: eighths of a wave of
 /// 32x64 output tiles over its cores, so a rung can say "fills the device"
-/// in a way that holds on chips of any size.
+/// in a way that holds on chips of any size; unknown on a device that does
+/// not say its cores, where a rung that reads it does not hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(
     id = "kernel.qmm",
-    shape(rows, fill: derived; n, k, bits, group, format: enum(fp16, emulated)),
+    shape(rows, fill: derived optional; n, k, bits, group, format: enum(fp16, emulated)),
     tune = search,
     default = r#"[
         { when = "rows >= 5 and (bits == 2 or format == fp16)", use = "tiled", crossover_tg = 160 },
@@ -275,18 +276,19 @@ pub fn register(registry: &mut Registry) {
 pub struct Tuning {
     profile: Profile,
     wide_range: bool,
-    cores: u32,
+    cores: Option<u32>,
 }
 
 impl Tuning {
     /// `wide_range`: the model's activations leave the fp16 range (diffusion
     /// latents), so it takes the wide tiled kernel and no fp16 GEMM format.
+    /// `cores`: the GPU's, where the device says.
     #[must_use]
-    pub fn new(profile: Profile, wide_range: bool, cores: u32) -> Tuning {
+    pub fn new(profile: Profile, wide_range: bool, cores: Option<u32>) -> Tuning {
         Tuning {
             profile,
             wide_range,
-            cores: cores.max(1),
+            cores,
         }
     }
 
@@ -294,7 +296,7 @@ impl Tuning {
     pub fn qmm_at(&self, rows: u32, n: u32, k: u32, bits: u32, group: u32) -> QmmAt {
         QmmAt {
             rows: i64::from(rows),
-            fill: fill(rows, n, self.cores),
+            fill: self.cores.map(|cores| fill(rows, n, cores)),
             n: i64::from(n),
             k: i64::from(k),
             bits: i64::from(bits),
@@ -445,5 +447,33 @@ impl Tuning {
     #[must_use]
     pub fn gdn_scan(&self) -> GdnScan {
         *self.profile.get::<GdnScan>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rung_that_reads_fill_does_not_hold_without_the_cores() {
+        let mut registry = Registry::new("metal", &[], &["rows"]);
+        register(&mut registry);
+        let profile = registry.with_overrides(
+            "[kernel]\nqmm = [{ when = \"fill >= 8\", use = \"tiled\", crossover_tg = 160 }, \"qmv\"]\n",
+        );
+        let first = |cores| {
+            let t = Tuning::new(profile.clone(), false, cores);
+            t.qmm(&t.qmm_at(64, 4096, 4096, 4, 64))[0]
+        };
+        assert_eq!(first(Some(10)), Qmm::Tiled { crossover_tg: 160 });
+        assert_eq!(
+            first(None),
+            Qmm::Qmv {
+                rows_max: 8,
+                packs: 1,
+                crossover_tg: 160
+            },
+            "the next rung serves"
+        );
     }
 }
