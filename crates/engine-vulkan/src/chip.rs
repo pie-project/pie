@@ -32,6 +32,10 @@ pub fn registry() -> &'static Registry {
 
 pub const SEEDED: &[(&str, &str)] = &[
     (
+        "qualcomm-adreno-32.toml",
+        include_str!("../profiles/qualcomm-adreno-32.toml"),
+    ),
+    (
         "qualcomm-adreno-64.toml",
         include_str!("../profiles/qualcomm-adreno-64.toml"),
     ),
@@ -42,6 +46,14 @@ pub const SEEDED: &[(&str, &str)] = &[
     (
         "qualcomm-adreno.toml",
         include_str!("../profiles/qualcomm-adreno.toml"),
+    ),
+    (
+        "imagination-powervr-32.toml",
+        include_str!("../profiles/imagination-powervr-32.toml"),
+    ),
+    (
+        "imagination-powervr-64.toml",
+        include_str!("../profiles/imagination-powervr-64.toml"),
     ),
     (
         "imagination-powervr-128.toml",
@@ -252,6 +264,18 @@ mod tests {
                 Some("qualcomm-adreno.toml"),
             ),
             (
+                device("qualcomm", 32, None, false),
+                Some("qualcomm-adreno-32.toml"),
+            ),
+            (
+                device("imagination", 32, None, false),
+                Some("imagination-powervr-32.toml"),
+            ),
+            (
+                device("imagination", 64, None, false),
+                Some("imagination-powervr-64.toml"),
+            ),
+            (
                 device("imagination", 128, None, false),
                 Some("imagination-powervr-128.toml"),
             ),
@@ -268,7 +292,7 @@ mod tests {
     /// The dense matmul the per-vendor cascade before `kernel.qmm` picked:
     /// coopmat, register tiles on Adreno, then tiled, from 12 rows over whole
     /// 32-code tiles; for one row, the one-row kernel on Adreno (32 lanes a
-    /// row) and on a 128-lane PowerVR (8 lanes a row, two rows a lane); else
+    /// row) and on PowerVR (8 lanes a row, two rows a lane); else
     /// four vectors a workgroup.
     fn old_qmm(d: &Device, rows: u32, n: u32, k: u32) -> Qmm {
         let qualcomm = d.vendor == "qualcomm";
@@ -284,7 +308,7 @@ mod tests {
             Qmm::Tiled { crossover_tg: 160 }
         } else if one_row && qualcomm && d.subgroup >= 32 {
             Qmm::OneRow { lanes: 32, rows: 1 }
-        } else if one_row && d.vendor == "imagination" && d.subgroup == 128 {
+        } else if one_row && d.vendor == "imagination" && d.subgroup >= 32 {
             Qmm::OneRow { lanes: 8, rows: 2 }
         } else {
             Qmm::Qmv { vecs: 4 }
@@ -304,6 +328,9 @@ mod tests {
             device("qualcomm", 64, None, false),
             device("qualcomm", 128, Some(6), false),
             device("qualcomm", 16, None, false),
+            device("qualcomm", 32, None, false),
+            device("imagination", 32, None, false),
+            device("imagination", 64, None, false),
             device("imagination", 128, None, false),
             device("imagination", 16, None, false),
             device("other", 32, None, false),
