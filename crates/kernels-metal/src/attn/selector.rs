@@ -102,7 +102,14 @@ pub fn walk(
     {
         return Err(refuse(
             OP,
-            "hp, tokens and picks carry one row per candidate row",
+            format!(
+                "hp, tokens and picks carry one row per candidate row: {} candidate rows \
+                 against picks {}, tokens {}, hp {:?}",
+                cand.data.rows,
+                picks.rows,
+                tokens.rows,
+                hp.map(|h| h.rows)
+            ),
         ));
     }
     let hp_arg = hp.map_or_else(|| pred.arg(), |h| h.arg());

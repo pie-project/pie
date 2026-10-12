@@ -18,7 +18,7 @@ struct Params {
 
 @compute @workgroup_size(PIE_GROUP_X, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-//#if defined(PIE_F32)
+//#if defined(PIE_F32) || defined(PIE_I32)
     let c = gid.x;
     let pitch = params.width;
 //#else
@@ -45,6 +45,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // pie:instantiate row_gather_bf16 PIE_GROUP_X=256
 // pie:instantiate row_gather_f32 PIE_F32=1 PIE_GROUP_X=256
+// pie:instantiate row_gather_i32 PIE_I32=1 PIE_GROUP_X=256
 // pie:instantiate row_scatter_bf16 PIE_SCATTER=1 PIE_GROUP_X=256
 // pie:instantiate row_scatter_f32 PIE_SCATTER=1 PIE_F32=1 PIE_GROUP_X=256
 // pie:instantiate row_scatter_live_bf16 PIE_LIVE=1 PIE_GROUP_X=256

@@ -103,9 +103,17 @@ pub fn split_rows(x: &Value, width: u32) -> (Value, Value) {
     (left, right)
 }
 
+/// The rows of `x` at `rows`; a value of one axis (a row's token) gathers to
+/// one axis too.
 pub fn gather_rows(x: &Value, rows: &Value) -> Value {
     let r = x.rec();
-    let y = r.fresh(tensor(Dim::Readouts, x.width(), x.dtype()));
+    let y = r.fresh(match x.ty() {
+        Ty::Tensor { shape, dtype } if shape.len() == 1 => Ty::Tensor {
+            shape: vec![Dim::Readouts],
+            dtype: *dtype,
+        },
+        _ => tensor(Dim::Readouts, x.width(), x.dtype()),
+    });
     r.push(
         Layout::GatherRows {
             x: x.id(),
