@@ -1,12 +1,13 @@
 //! The slot file an engine suspends kv pages into below host memory: one
-//! per rank, locked, one kv page per fixed slot, written and read around the
-//! page cache where the filesystem allows it. Preallocated where blocks are
-//! written in place; removed when the engine lets go of it.
+//! per rank, one kv page per fixed slot, written and read around the page
+//! cache where the filesystem allows it. Preallocated where blocks are
+//! written in place, and unlinked once open, so it never outlives the
+//! process that holds it.
 
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Slot offsets and lengths are multiples of this, as direct I/O asks.
 pub const ALIGN: usize = 4096;
@@ -14,15 +15,17 @@ pub const ALIGN: usize = 4096;
 #[derive(Debug)]
 pub struct SlotFile {
     file: File,
-    path: PathBuf,
     stride: usize,
     slots: u32,
 }
 
 impl SlotFile {
     /// `dir/r<rank>.kv` with as many slots of `slot_bytes` as `budget`
-    /// holds; `None` when that is none. The file is locked for the life of
-    /// the load, so two servers never share one.
+    /// holds; `None` when that is none. The path is unlinked once the file
+    /// is open and locked: what it holds means nothing to the next run, and
+    /// the space comes back when the process exits, however it exits. The
+    /// lock covers the moment before the unlink, so two servers never share
+    /// one file.
     pub fn open(dir: &Path, rank: u32, slot_bytes: u64, budget: u64) -> io::Result<Option<Self>> {
         let stride = usize::try_from(slot_bytes)
             .map_err(io::Error::other)?
@@ -40,6 +43,7 @@ impl SlotFile {
                 path.display()
             ))
         })?;
+        std::fs::remove_file(&path)?;
         let len = u64::from(slots) * stride as u64;
         file.set_len(len)?;
         // APFS copies on write: a page written lands in new blocks and the
@@ -54,7 +58,6 @@ impl SlotFile {
         }
         Ok(Some(Self {
             file,
-            path,
             stride,
             slots,
         }))
@@ -134,14 +137,6 @@ fn open_direct(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-/// What a slot file holds means nothing once the engine that wrote it lets
-/// go, so it does not outlive the engine on disk.
-impl Drop for SlotFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 /// A heap buffer of `len` bytes that starts on an `ALIGN` boundary: the
 /// stage one page goes through on an engine whose kv lives in host memory.
 #[derive(Debug, Default)]
@@ -174,7 +169,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_slot_reads_back_what_was_written_and_the_file_is_one_servers() {
+    fn a_slot_reads_back_what_was_written_and_each_server_has_its_own_file() {
         let dir = std::env::temp_dir().join(format!("pie-slot-file-{}", std::process::id()));
         let file = SlotFile::open(&dir, 0, 5000, 4 * 8192).unwrap().unwrap();
         assert_eq!((file.slots(), file.stride()), (4, 8192));
@@ -185,7 +180,8 @@ mod tests {
             .enumerate()
             .for_each(|(i, b)| *b = i as u8);
         file.write(3, stage.as_slice()).unwrap();
-        assert!(SlotFile::open(&dir, 0, 5000, 4 * 8192).is_err());
+        let other = SlotFile::open(&dir, 0, 5000, 4 * 8192).unwrap().unwrap();
+        other.write(3, Aligned::zeroed(8192).as_slice()).unwrap();
         let mut back = Aligned::zeroed(8192);
         file.read(3, back.as_mut_slice()).unwrap();
         assert_eq!(back.as_slice(), stage.as_slice());
@@ -195,13 +191,14 @@ mod tests {
     }
 
     #[test]
-    fn rewriting_every_slot_keeps_the_file_within_its_budget_and_dropping_it_removes_it() {
+    fn rewriting_every_slot_keeps_the_file_within_its_budget_and_it_leaves_no_path() {
         use std::os::unix::fs::MetadataExt;
         let dir = std::env::temp_dir().join(format!("pie-slot-budget-{}", std::process::id()));
         let path = dir.join("r0.kv");
         let budget = 64 * 8192;
         let file = SlotFile::open(&dir, 0, 8192, budget).unwrap().unwrap();
-        let used = || std::fs::metadata(&path).unwrap().blocks() * 512;
+        assert!(!path.exists(), "the slot file outlives its process");
+        let used = || file.file.metadata().unwrap().blocks() * 512;
         let stage = Aligned::zeroed(file.stride());
         for _ in 0..3 {
             for slot in 0..file.slots() {
@@ -214,7 +211,6 @@ mod tests {
             );
         }
         drop(file);
-        assert!(!path.exists(), "the slot file outlived its engine");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
