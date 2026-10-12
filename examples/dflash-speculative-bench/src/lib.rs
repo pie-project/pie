@@ -685,6 +685,9 @@ struct Output {
     /// The fires' measured prices, milliseconds by width — `0` the draft
     /// fire, `1` the plain fire, then each verify width fired.
     prices_ms: Vec<(u32, f64)>,
+    /// Gaps between consecutive tokens reaching the guest, µs (`report_timing`
+    /// only): with the client's `t0` stamp, the harness's per-token arrivals.
+    intertoken_us: Vec<u32>,
 }
 
 /// **WHAT A FIRE COSTS HERE, MEASURED, BY ITS SHAPE.** A price is the median
@@ -1307,6 +1310,10 @@ async fn main(input: Input) -> Result<Output> {
     // and `anchor` is the token AT position `held`, not yet written.
     let mut held = n;
     let mut generated: Vec<u32> = vec![anchor as u32];
+    // When each token reached the guest, from the first: a round commits its
+    // accepted prefix at once, so all but its first token arrive 0 µs apart.
+    let first_ns = monotonic_now_ns();
+    let mut emitted_ns: Vec<u64> = vec![first_ns];
     let mut rounds = 0usize;
     let mut drafted = 0usize;
     let mut accepted = 0usize;
@@ -1390,6 +1397,7 @@ async fn main(input: Input) -> Result<Output> {
             prices.verified(1, monotonic_now_ns().saturating_sub(fired_at));
             held += 1;
             generated.push(anchor as u32);
+            emitted_ns.push(monotonic_now_ns());
             continue;
         }
 
@@ -1694,12 +1702,15 @@ async fn main(input: Input) -> Result<Output> {
         // A drafting round leaves its accepted prefix buffered for the next
         // fire to fold; a gated one folded its own row already.
         survivors = if drafting { kept as u32 + 1 } else { 0 };
+        let round_ns = monotonic_now_ns();
         for tok in proposals[..kept].iter() {
             generated.push(*tok as u32);
+            emitted_ns.push(round_ns);
         }
         // The break's token is the TARGET's, so the round is never wrong.
         anchor = truth[kept];
         generated.push(anchor as u32);
+        emitted_ns.push(round_ns);
         // Positions `held ..= held + kept` carried tokens the target agreed
         // with and stay; everything above them is stale and never read.
         held += kept as u32 + 1;
@@ -1712,6 +1723,12 @@ async fn main(input: Input) -> Result<Output> {
     }
     generated.truncate(input.max_tokens);
     let count = generated.len();
+    emitted_ns.truncate(count);
+    let intertoken_us: Vec<u32> = if input.report_timing {
+        emitted_ns.windows(2).map(|w| (w[1].saturating_sub(w[0]) / 1_000) as u32).collect()
+    } else {
+        Vec::new()
+    };
     Ok(Output {
         sampler: "dflash-speculative-bench",
         text: model::decode(&generated)?,
@@ -1740,5 +1757,6 @@ async fn main(input: Input) -> Result<Output> {
         rs_page,
         plain_fires,
         prices_ms: prices.report(),
+        intertoken_us,
     })
 }
