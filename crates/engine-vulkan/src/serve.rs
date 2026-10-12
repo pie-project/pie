@@ -173,6 +173,9 @@ pub struct Seated<'a> {
     pub pages: &'a [u32],
 
     pub held: Option<u32>,
+    /// A lane of a reading that declares no KV space (a denoiser's): it
+    /// neither reads nor extends its slot's history.
+    pub kv_less: bool,
 
     pub mask: Option<&'a Masking>,
 
@@ -211,6 +214,7 @@ impl<'a> Seated<'a> {
             lane,
             pages: &[],
             held: None,
+            kv_less: false,
             mask: None,
             adapter: None,
             positions: &[],
@@ -2082,6 +2086,7 @@ impl Shell {
         let lane_count = composition.lane_count();
 
         let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
+        let mut kv_less: Vec<bool> = Vec::with_capacity(lanes.len());
 
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -2125,6 +2130,7 @@ impl Shell {
             }
 
             let have = match seated.held {
+                _ if seated.kv_less => 0,
                 Some(held) => held,
                 None => self
                     .held
@@ -2155,6 +2161,7 @@ impl Shell {
                 have,
                 rows: row.rows,
             });
+            kv_less.push(seated.kv_less);
 
             tables.push(std::borrow::Cow::Borrowed(seated.pages));
 
@@ -2257,7 +2264,21 @@ impl Shell {
         }
 
         let page_size = u64::from(self.pools.paging().page_size).max(1);
-        let paging = self.pools.paging();
+        // A fire of readings that declare no KV space (a denoiser's, a VAE's)
+        // asks the pool for nothing; its geometry is shaped for the bindings
+        // and never read.
+        let kv_free = !kv_less.is_empty() && kv_less.iter().all(|&free| free);
+        let paging = if kv_free {
+            let widest = seats.iter().map(|seat| seat.rows).max().unwrap_or(0);
+            Paging {
+                pages_per_slot: u32::try_from(u64::from(widest).div_ceil(page_size).max(1))
+                    .unwrap_or(u32::MAX),
+                slots: seats.iter().map(|seat| seat.slot + 1).max().unwrap_or(1),
+                ..self.pools.paging()
+            }
+        } else {
+            self.pools.paging()
+        };
         let written = writes
             .iter()
             .flatten()
@@ -2284,6 +2305,7 @@ impl Shell {
                 })
                 .chain(std::iter::once(written))
                 .max()
+                .filter(|_| !kv_free)
                 .map_or(0, |pages| u32::try_from(pages).unwrap_or(u32::MAX)),
             state_slots: slot_ids
                 .iter()
@@ -2756,6 +2778,7 @@ impl Shell {
             readout_layout,
             descriptor,
             seats,
+            kv_less,
             tables,
             windows,
             slots,
@@ -2839,8 +2862,9 @@ impl Shell {
     }
 
     fn advance(&mut self, p: &Prepared<'_>) {
-        for (seat, table) in p.seats.iter().zip(&p.tables) {
+        for ((seat, table), kv_less) in p.seats.iter().zip(&p.tables).zip(&p.kv_less) {
             if table.is_empty()
+                && !kv_less
                 && let Some(slot) = self.held.get_mut(seat.slot as usize)
             {
                 *slot = seat.have + seat.rows;
@@ -2893,6 +2917,7 @@ pub struct Prepared<'a> {
     readout_layout: Vec<ReadSpan>,
     descriptor: FireDescriptor,
     seats: Vec<Seat>,
+    kv_less: Vec<bool>,
 
     tables: Vec<std::borrow::Cow<'a, [u32]>>,
     windows: Windows,
@@ -3062,6 +3087,10 @@ impl engine::frame::Shell for Shell {
             .map(|replay| (replay.layout.clone(), replay.launches));
         if let Some((layout, launches)) = replayable {
             let key = key.expect("a recording was found under a key");
+            // The recording copies the plane out as it did when walked.
+            let pixels = self
+                .pixel_rect(&prepared)?
+                .map_or(0, |(_, rows, width)| rows * width);
             self.generation = self.generation.wrapping_add(1);
             self.advance(&prepared);
             let seq = self.airborne.enter();
@@ -3101,10 +3130,7 @@ impl engine::frame::Shell for Shell {
                 arm: prepared.arm,
                 rows: layout,
                 launches,
-                // The recording copies the plane out as it did when walked.
-                pixels: self
-                    .pixel_rect(&prepared)?
-                    .map_or(0, |(_, rows, width)| rows * width),
+                pixels,
                 step: PhantomData,
             });
         }

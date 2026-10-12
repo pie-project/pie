@@ -148,7 +148,11 @@ impl DeviceTuning {
         // PowerVR (Pixel 11 Pro, Tensor G6) decodes Qwen3.5-0.8B at 11 tok/s
         // on `qmv`, 27 on the one-row point, and 33 with 8 lanes a row
         // carrying two rows each.
+        // Its prefill halves on the register-tiled point too: 1.2k tokens of
+        // the same model in 11.5 s against 23, FLUX.2 klein's four steps in
+        // 65 s of matmul against 140.
         if info.vendor == Vendor::Imagination {
+            t.qmm_register_tiles = true;
             t.qmv_one_row = info.subgroup_size >= 32;
             t.qmv_one_row_lanes = 8;
             t.qmv_one_row_rows = 2;

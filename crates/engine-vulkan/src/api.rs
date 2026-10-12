@@ -1203,6 +1203,7 @@ impl Vulkan {
                     },
                     pages: &lane.kv.pages,
                     held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                    kv_less: lane.kv_less,
                     captures_scores: lane.captures_scores,
 
                     mask: lane.mask.as_ref(),
