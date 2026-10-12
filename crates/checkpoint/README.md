@@ -4,9 +4,8 @@ Typed checkpoint compiler: a checkpoint and a contract in, a verified memory
 layout a device can be pointed at out.
 
 It was called model-loader, and the name claimed more than the code does: a
-model loader would know model semantics, and nothing here knows a family —
-`tests/standalone.rs` is that refusal written as four properties. What it knows
-is a checkpoint.
+model loader would know model semantics, and nothing here knows a family. What
+it knows is a checkpoint.
 
 ```text
 checkpoint  ──materialize──▶  model contract  ──compile──▶  load plan  ──execute──▶  arena + sink
@@ -20,8 +19,7 @@ checkpoint  ──materialize──▶  model contract  ──compile──▶  
 states. None of the three inputs is a model's name: the caller states what it
 needs as a contract over the checkpoint's byte space, the loader reads the
 checkpoint's own metadata, and the target carries the numbers a device
-measured. `tests/standalone.rs` pins that as four properties rather than as
-prose.
+measured.
 
 The contract is internal IR. It read `author(facts, source, policy)` here, for
 an engine-side contract author that R3 deleted with the legacy load contract;

@@ -39,7 +39,7 @@ did NOT fold, and the line between them is what a **guest** imports:
 above it; **`plan` and `eval` never depend on each other**, because they answer
 different questions about the same bound trace — *how do we execute this* versus
 *what does it produce*. Cargo used to enforce that by not having the edge;
-`tests/module_layering.rs` enforces it now, and says why.
+now it is a rule of the module layout that nothing checks.
 
 `codegen` is the only module here that reaches outside the toolchain, and only
 for the launch package: it builds one out of `driver-abi`, the same
