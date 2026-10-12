@@ -98,13 +98,15 @@ fn pick_models(
 
 #[cfg(feature = "vulkan")]
 fn tune_vulkan(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
-    let models = pick_models(engine_vulkan::tune::artifacts(req.artifacts), req)?;
-    let out = engine_vulkan::tune::run(Some(req.profiles), &models, say)?;
+    use engine_vulkan::tune::{Depth, artifacts, run};
+    let depth = if req.full { Depth::Full } else { Depth::Quick };
+    let models = pick_models(artifacts(req.artifacts), req)?;
+    let out = run(depth, Some(req.profiles), req.cache, req.refit, &models, say)?;
     Ok(Tuned {
         device: out.device,
         file: out.file,
         lines: out.lines.into_iter().map(|l| (l.id, l.text)).collect(),
-        wrong: Vec::new(),
+        wrong: out.wrong,
         checks: out.checks.iter().map(|c| (c.describe(), c.passes())).collect(),
         changed: out.changed,
         seconds: out.seconds,

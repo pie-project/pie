@@ -1,8 +1,14 @@
-//! `pie tune` on Vulkan: every decision this backend does not mark `never`
-//! is searched end to end on served models (`profile::search`), starting
-//! from the profile the device resolves to (a user file, a named one, or the
-//! one its facts derive), and the result is written as a complete profile
-//! for the user's shelf. `.wiki/pie-tune.md` holds the design.
+//! `pie tune` on Vulkan: `kernel.qmm` is measured kernel by kernel and a
+//! ladder fitted to the times (`qmm`), then that ladder and every other
+//! decision this backend does not mark `never` are searched end to end on
+//! served models (`profile::search`), starting from the profile the device
+//! resolves to (a user file, a named one, or the one its facts derive). The
+//! result is written as a complete profile for the user's shelf.
+//! `.wiki/pie-tune.md` holds the design.
+
+pub mod qmm;
+
+pub use qmm::Depth;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -25,6 +31,8 @@ pub struct Outcome {
     /// The complete profile, ready for the user's shelf.
     pub file: String,
     pub lines: Vec<Line>,
+    /// Kernel candidates that answered wrongly, and where.
+    pub wrong: Vec<String>,
     /// The end-to-end runs, today's profile against the tuned one.
     pub checks: Vec<Check>,
     /// Whether the tuned file differs from today's at all.
@@ -228,10 +236,69 @@ impl Bench for Vulkan<'_> {
     }
 }
 
-/// Run the tune on the device a load opens: search, check, and assemble
-/// the file. `say` hears progress.
+/// Measure `kernel.qmm` on the device a load opens and fit its ladder; the
+/// measurements are kept under `cache`, and `refit` reads them from there.
+fn bench_qmm(
+    depth: Depth,
+    name: &str,
+    base: &Profile,
+    cores: u32,
+    cache: &Path,
+    refit: bool,
+    say: &mut dyn FnMut(&str),
+) -> Result<(search::Entries, Vec<Line>, Vec<String>), String> {
+    let grid = qmm::Grid::of(depth);
+    let kept = cache
+        .join(profile::id_of(name))
+        .join(format!("vulkan-qmm-{}.txt", depth.word()));
+    let measured = if refit {
+        let text = std::fs::read_to_string(&kept)
+            .map_err(|e| format!("no measurements at {}: {e}", kept.display()))?;
+        say(&format!("refitting the measurements in {}", kept.display()));
+        // The kept file lists the candidates this device ran.
+        let all = qmm::candidates(base);
+        let ran: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("candidate "))
+            .filter_map(|b| all.iter().find(|q| qmm::body(q) == b).copied())
+            .collect();
+        qmm::Measured::from_text(&text, &ran)?
+    } else {
+        let m = measure(base, &grid, say)?;
+        if let Some(dir) = kept.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::write(&kept, m.to_text(name)).map_err(|e| e.to_string())?;
+        say(&format!("measurements kept in {}", kept.display()));
+        m
+    };
+    let (fitted, lines) = qmm::fit(&measured, &grid, cores)?;
+    let wrong = measured
+        .wrong
+        .iter()
+        .map(|(body, n, first)| format!("{body}: wrong at {n} points; first at {first}"))
+        .collect();
+    Ok((fitted, lines, wrong))
+}
+
+#[cfg(feature = "vulkan")]
+fn measure(base: &Profile, grid: &qmm::Grid, say: &mut dyn FnMut(&str)) -> Result<qmm::Measured, String> {
+    let device = crate::device::Context::bind(&crate::api::DeviceBoot::default()).map_err(|e| e.to_string())?;
+    qmm::measure(&device, base, grid, say)
+}
+
+#[cfg(not(feature = "vulkan"))]
+fn measure(_: &Profile, _: &qmm::Grid, _: &mut dyn FnMut(&str)) -> Result<qmm::Measured, String> {
+    Err("this build carries no Vulkan device code".to_string())
+}
+
+/// Run the tune on the device a load opens: measure and fit `kernel.qmm`,
+/// search, check, and assemble the file. `say` hears progress.
 pub fn run(
+    depth: Depth,
     profiles: Option<&Path>,
+    cache: &Path,
+    refit: bool,
     models: &[(PathBuf, String)],
     say: &mut dyn FnMut(&str),
 ) -> Result<Outcome, String> {
@@ -247,7 +314,27 @@ pub fn run(
         facts.describe().join(", "),
         report.used
     ));
-    let knobs = search::knobs(&base, SEARCH_SKIPS, "");
+    let (fitted, mut lines, wrong) = bench_qmm(depth, &name, &base, cores, cache, refit, say)?;
+    // The fitted matmul is a candidate like any other: a ladder learned on
+    // kernels alone must also win on the served models to be kept.
+    let mut knobs: Vec<search::Knob> = Vec::new();
+    for (id, value) in &fitted {
+        let (spec, rungs, _) = base
+            .entries()
+            .find(|(s, ..)| s.id == id.as_str())
+            .expect("a Vulkan decision");
+        let current = profile::render::value_toml(spec, rungs);
+        if current.replace(char::is_whitespace, "") != value.replace(char::is_whitespace, "") {
+            knobs.push(search::Knob {
+                id: spec.id,
+                current,
+                candidates: vec![(value.clone(), String::new())],
+                halfway: false,
+                plan_only: false,
+            });
+        }
+    }
+    knobs.extend(search::knobs(&base, SEARCH_SKIPS, ""));
     let mut bench = Vulkan {
         models,
         device: &name,
@@ -255,10 +342,11 @@ pub fn run(
         facts: &facts,
         cores,
     };
-    let mut lines = Vec::new();
     let mut chosen = Vec::new();
     if models.is_empty() {
-        for k in &knobs {
+        // Nothing to serve: the kernel bench's fit stands alone.
+        chosen = fitted;
+        for k in knobs.iter().filter(|k| k.id != "kernel.qmm") {
             lines.push(Line {
                 id: k.id,
                 text: "not searched: no model to serve (import one, or pass --check)".to_string(),
@@ -273,7 +361,7 @@ pub fn run(
         ));
         let (found, searched) = search::search(&mut bench, chosen, &knobs, "", say)?;
         chosen = found;
-        lines = searched;
+        lines.extend(searched);
     }
     let tuned = search::render_overrides(&chosen);
     let today = bench.file(&[])?;
@@ -302,16 +390,16 @@ pub fn run(
     let checked = if unchanged {
         "nothing changed".to_string()
     } else if checks.is_empty() {
-        "no end-to-end run".to_string()
+        "kernels against the f64 reference; no end-to-end run".to_string()
     } else {
         format!(
-            "end to end: {}",
+            "kernels against the f64 reference; end to end: {}",
             checks.iter().map(Check::describe).collect::<Vec<_>>().join("; ")
         )
     };
     let seconds = began.elapsed().as_secs_f64();
     let provenance = [
-        ("source", "\"pie tune on this machine\"".to_string()),
+        ("source", format!("\"pie tune --{} on this machine\"", depth.word())),
         ("measured", "true".to_string()),
         ("tuned", format!("[{}]", tuned_ids.join(", "))),
         ("from", format!("\"{}\"", report.used)),
@@ -332,6 +420,7 @@ pub fn run(
         device: name,
         file,
         lines,
+        wrong,
         checks,
         changed: !unchanged,
         seconds,
