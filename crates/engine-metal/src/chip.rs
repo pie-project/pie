@@ -134,29 +134,17 @@ macro_rules! seeded {
 }
 
 seeded!(
-    "apple-m1.toml",
-    "apple-m1-pro.toml",
-    "apple-m1-max.toml",
-    "apple-m1-ultra.toml",
-    "apple-m2.toml",
-    "apple-m2-pro.toml",
-    "apple-m2-max.toml",
-    "apple-m2-ultra.toml",
-    "apple-m3.toml",
-    "apple-m3-pro.toml",
-    "apple-m3-max.toml",
-    "apple-m3-ultra.toml",
-    "apple-m4.toml",
-    "apple-m4-pro.toml",
-    "apple-m4-max.toml",
-    "apple-m5.toml",
-    "apple-m5-pro.toml",
-    "apple-m5-max.toml",
+    "apple7.toml",
+    "apple8.toml",
+    "apple9.toml",
+    "apple9/apple-m4-pro.toml",
+    "apple10.toml",
 );
 
 pub static SHELF: Shelf = Shelf {
     backend: "metal",
     seeded: SEEDED,
+    derived: None,
 };
 
 #[must_use]
@@ -219,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn every_checked_in_profile_reads_strictly_and_is_filed_under_its_device() {
+    fn the_checked_in_profiles_hold_together() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
         SHELF
             .check(registry(), &dir)
@@ -249,15 +237,33 @@ mod tests {
     }
 
     #[test]
-    fn a_device_without_a_file_runs_the_defaults_and_is_told_so() {
+    fn a_device_no_file_names_runs_its_family_and_is_told_so() {
         let (profile, report) = resolve("Apple A17 Pro GPU", &facts(9, 6, true), None);
-        assert_eq!(report.used, profile::Source::Defaults);
+        assert_eq!(report.used, profile::Source::Seeded("apple9.toml".into()));
         assert!(report.untuned());
+        assert_eq!(*profile.get::<AneMlp>(), AneMlp::Share { percent: 47 });
+        let (profile, report) = resolve("Apple A17 Pro GPU", &facts(9, 6, false), None);
+        assert!(report.rejected.is_empty(), "{report:?}");
         assert_eq!(
             *profile.get::<AneMlp>(),
             AneMlp::Gpu,
-            "a default may require nothing"
+            "without the Neural Engine, its rung goes"
         );
+    }
+
+    #[test]
+    fn the_m4_pro_runs_its_family_and_what_it_measured() {
+        let (profile, report) = resolve("Apple M4 Pro", &facts(9, 20, true), None);
+        assert_eq!(
+            report.layers,
+            [
+                profile::Source::Seeded("apple9.toml".into()),
+                profile::Source::Seeded("apple9/apple-m4-pro.toml".into())
+            ]
+        );
+        assert_eq!(report.measured, ["kernel.ane.mlp", "kernel.qmm_splitk"]);
+        assert!(!report.untuned());
+        assert_eq!(*profile.get::<AneMlp>(), AneMlp::Share { percent: 71 });
     }
 
     #[test]
@@ -289,10 +295,7 @@ mod tests {
         )
         .unwrap();
         let (profile, report) = resolve("Apple M4 Max", &facts(9, 40, true), Some(&dir));
-        assert_eq!(
-            report.used,
-            profile::Source::Seeded("apple-m4-max.toml".into())
-        );
+        assert_eq!(report.used, profile::Source::Seeded("apple9.toml".into()));
         assert_eq!(report.rejected.len(), 1, "{report:?}");
         assert_eq!(
             profile
@@ -300,7 +303,7 @@ mod tests {
                 .values()
                 .next(),
             Some(&kernels_metal::tuning::Qmm::Tiled { crossover_tg: 96 }),
-            "the M4 Max file again"
+            "the Apple9 family file again"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

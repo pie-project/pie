@@ -1,5 +1,5 @@
-//! Every checked-in profile not measured on its chip resolves to what
-//! `DeviceTuning::of(family)` gave that chip before profiles existed; the
+//! Every chip of a family resolves to what `DeviceTuning::of(family)` gave
+//! it before profiles existed, but what was measured on it since; the
 //! functions below are that table, frozen.
 
 use engine_metal::chip::{self, AneMlp, AneProjections, StreamCut, WeightsLayout};
@@ -61,117 +61,131 @@ fn old_qmm(family: u32, at: &QmmAt) -> Qmm {
     }
 }
 
-fn family_of(device: &str) -> u32 {
-    match device.split_whitespace().nth(1) {
-        Some(m) if m.starts_with("M1") => 7,
-        Some(m) if m.starts_with("M2") => 8,
-        Some(m) if m.starts_with("M3") || m.starts_with("M4") => 9,
-        Some(m) if m.starts_with("M5") => 10,
-        other => panic!("no family for {other:?}"),
+/// Chips of each family, an iPhone's among them: none is named by a file
+/// but the M4 Pro.
+const CHIPS: &[(u32, &str)] = &[
+    (7, "Apple M1"),
+    (7, "Apple M1 Ultra"),
+    (8, "Apple M2 Max"),
+    (9, "Apple M3"),
+    (9, "Apple M4 Max"),
+    (9, "Apple A17 Pro GPU"),
+    (10, "Apple M5"),
+    (10, "Apple M5 Pro"),
+];
+
+/// What `DeviceTuning::of(family)` gave a chip with the Neural Engine, but
+/// the split-K fill and the Neural Engine's MLP share, which `fill_tg` and
+/// `mlp` stand in for.
+fn assert_old_tuning(device: &str, family: u32, fill_tg: u32, mlp: Option<AneMlp>) {
+    let (profile, report) = chip::resolve(device, &chip::facts(family, 10, true), None);
+    assert_eq!(
+        report.layers.first(),
+        Some(&Source::Seeded(format!("apple{family}.toml"))),
+        "{device}"
+    );
+    assert!(report.rejected.is_empty(), "{device}: {report:?}");
+    let t = Tuning::new(profile.clone(), false, 10);
+    let (_, _, mpp, sdpa_mpp, gdn_scan) = old(family);
+    for rows in [1, 2, 4, 5, 7, 8, 9, 11, 12, 16, 17, 32, 512] {
+        for (n, k) in [
+            (512, 4096),
+            (1000, 4096),
+            (1024, 4096),
+            (4096, 1000),
+            (8192, 8192),
+        ] {
+            for (bits, group, format) in [
+                (4, 64, "fp16"),
+                (4, 64, "emulated"),
+                (4, 32, "emulated"),
+                (2, 64, "emulated"),
+                (8, 64, "emulated"),
+            ] {
+                // No checked-in ladder reads `fill`.
+                let at = QmmAt {
+                    rows,
+                    fill: 0,
+                    n,
+                    k,
+                    bits,
+                    group,
+                    format,
+                };
+                assert_eq!(
+                    t.qmm(&at).first(),
+                    Some(&old_qmm(family, &at)),
+                    "{device}: {at:?}"
+                );
+            }
+        }
     }
+    for experts in [1, 8, 64, 128, 256] {
+        for pairs in [0, 1, 7, 8, 64, 255, 256, 2048, 4096, 8191, 8192, 65_536] {
+            assert_eq!(
+                t.moe_tile_rows(pairs, experts),
+                old_tile(pairs, experts),
+                "{device}: {pairs} pairs over {experts} experts"
+            );
+        }
+    }
+    assert!(
+        t.fp16_gemm_format(4, 64) && !t.fp16_gemm_format(4, 32),
+        "{device}"
+    );
+    assert_eq!(
+        (t.qmm_mpp(), t.moe_mpp(), t.sdpa_mpp()),
+        (mpp, mpp, sdpa_mpp),
+        "{device}"
+    );
+    assert_eq!(t.qmm_splitk(), Some((fill_tg, 8)), "{device}");
+    assert_eq!(t.sdpa_tile_rows_per_request(), 32, "{device}");
+    assert!(t.sdpa_mma() && !t.kv_q8(), "{device}");
+    assert_eq!(t.gdn_scan(), gdn_scan, "{device}");
+    let mlp = mlp.unwrap_or(if mpp {
+        AneMlp::Units { units: 8 }
+    } else {
+        AneMlp::Share { percent: 47 }
+    });
+    assert_eq!(*profile.get::<AneMlp>(), mlp, "{device}");
+    assert_eq!(
+        *profile.get::<AneProjections>(),
+        AneProjections::Share { percent: 47 }
+    );
+    assert_eq!(
+        *profile.get::<WeightsLayout>(),
+        WeightsLayout::Plain,
+        "{device}"
+    );
+    assert_eq!(*profile.get::<StreamCut>(), StreamCut::FanOut);
+    assert_eq!(
+        poem_compiler::DeviceProfile::of(&profile, 10, &[], &[]),
+        poem_compiler::DeviceProfile {
+            sms: 10,
+            side_streams: 0,
+            ..poem_compiler::DeviceProfile::default()
+        },
+        "{device}"
+    );
+    assert_eq!(
+        poem_compiler::fuse::flags::kernels(&profile),
+        ["elementwise.residual_add_rmsnorm", "linear.mlp_swiglu"],
+        "{device}"
+    );
 }
 
 #[test]
 fn each_checked_in_profile_runs_its_familys_old_tuning() {
-    assert_eq!(chip::SEEDED.len(), 18);
-    for (name, text) in chip::SEEDED {
-        let file = chip::registry()
-            .parse(text, name, profile::Strict::CheckedIn)
-            .unwrap_or_else(|e| panic!("{e}"));
-        if file.measured() {
-            continue;
-        }
-        let device = file.target.device.expect("named");
-        let family = family_of(&device);
-        let (profile, report) = chip::resolve(&device, &chip::facts(family, 10, true), None);
-        assert_eq!(report.used, Source::Seeded((*name).to_string()), "{device}");
-        let t = Tuning::new(profile.clone(), false, 10);
-        let (_, _, mpp, sdpa_mpp, gdn_scan) = old(family);
-        for rows in [1, 2, 4, 5, 7, 8, 9, 11, 12, 16, 17, 32, 512] {
-            for (n, k) in [
-                (512, 4096),
-                (1000, 4096),
-                (1024, 4096),
-                (4096, 1000),
-                (8192, 8192),
-            ] {
-                for (bits, group, format) in [
-                    (4, 64, "fp16"),
-                    (4, 64, "emulated"),
-                    (4, 32, "emulated"),
-                    (2, 64, "emulated"),
-                    (8, 64, "emulated"),
-                ] {
-                    // No checked-in ladder reads `fill`.
-                    let at = QmmAt {
-                        rows,
-                        fill: 0,
-                        n,
-                        k,
-                        bits,
-                        group,
-                        format,
-                    };
-                    assert_eq!(
-                        t.qmm(&at).first(),
-                        Some(&old_qmm(family, &at)),
-                        "{device}: {at:?}"
-                    );
-                }
-            }
-        }
-        for experts in [1, 8, 64, 128, 256] {
-            for pairs in [0, 1, 7, 8, 64, 255, 256, 2048, 4096, 8191, 8192, 65_536] {
-                assert_eq!(
-                    t.moe_tile_rows(pairs, experts),
-                    old_tile(pairs, experts),
-                    "{device}: {pairs} pairs over {experts} experts"
-                );
-            }
-        }
-        assert!(
-            t.fp16_gemm_format(4, 64) && !t.fp16_gemm_format(4, 32),
-            "{device}"
-        );
-        assert_eq!(
-            (t.qmm_mpp(), t.moe_mpp(), t.sdpa_mpp()),
-            (mpp, mpp, sdpa_mpp),
-            "{device}"
-        );
-        assert_eq!(t.sdpa_tile_rows_per_request(), 32, "{device}");
-        assert!(t.sdpa_mma() && !t.kv_q8(), "{device}");
-        assert_eq!(t.gdn_scan(), gdn_scan, "{device}");
-        let mlp = if mpp {
-            AneMlp::Units { units: 8 }
-        } else {
-            AneMlp::Share { percent: 47 }
-        };
-        assert_eq!(*profile.get::<AneMlp>(), mlp, "{device}");
-        assert_eq!(
-            *profile.get::<AneProjections>(),
-            AneProjections::Share { percent: 47 }
-        );
-        assert_eq!(
-            *profile.get::<WeightsLayout>(),
-            WeightsLayout::Plain,
-            "{device}"
-        );
-        assert_eq!(*profile.get::<StreamCut>(), StreamCut::FanOut);
-        assert_eq!(
-            poem_compiler::DeviceProfile::of(&profile, 10, &[], &[]),
-            poem_compiler::DeviceProfile {
-                sms: 10,
-                side_streams: 0,
-                ..poem_compiler::DeviceProfile::default()
-            },
-            "{device}"
-        );
-        assert_eq!(
-            poem_compiler::fuse::flags::kernels(&profile),
-            ["elementwise.residual_add_rmsnorm", "linear.mlp_swiglu"],
-            "{device}"
-        );
+    for &(family, device) in CHIPS {
+        assert_old_tuning(device, family, 512, None);
     }
+}
+
+#[test]
+fn the_m4_pro_runs_its_family_and_the_two_values_it_measured() {
+    assert_old_tuning("Apple M4 Pro", 9, 896, Some(AneMlp::Share { percent: 71 }));
+    let (_, report) = chip::resolve("Apple M4 Pro", &chip::facts(9, 20, true), None);
+    assert_eq!(report.measured, ["kernel.ane.mlp", "kernel.qmm_splitk"]);
 }
 
 #[test]
@@ -193,28 +207,24 @@ fn a_wide_range_model_leaves_the_fp16_format_on_any_chip() {
 }
 
 #[test]
-fn a_mac_whose_bridge_does_not_load_runs_the_defaults_whole() {
+fn a_mac_whose_bridge_does_not_load_runs_its_family_on_the_gpu() {
     let (profile, report) = chip::resolve("Apple M5 Max", &chip::facts(10, 40, false), None);
-    assert_eq!(report.used, Source::Defaults);
-    assert!(
-        report.rejected[0].1.contains("ane"),
-        "{:?}",
-        report.rejected
-    );
+    assert_eq!(report.used, Source::Seeded("apple10.toml".into()));
+    assert!(report.rejected.is_empty(), "{report:?}");
     let t = Tuning::new(profile.clone(), false, 10);
-    assert!(!t.qmm_mpp() && !t.sdpa_mpp());
+    assert!(
+        t.qmm_mpp() && t.sdpa_mpp(),
+        "the family's GPU tuning stands"
+    );
     assert_eq!(*profile.get::<AneMlp>(), AneMlp::Gpu);
+    assert_eq!(*profile.get::<AneProjections>(), AneProjections::Gpu);
 }
 
 #[test]
-fn a_profile_for_another_family_is_refused() {
-    let (_, report) = chip::resolve("Apple M4 Max", &chip::facts(10, 40, true), None);
-    assert_eq!(report.used, Source::Defaults);
-    assert!(
-        report.rejected[0]
-            .1
-            .contains("it assumes family = 9, and this device has 10"),
-        "{:?}",
-        report.rejected
-    );
+fn a_device_file_applies_only_within_its_family() {
+    let (profile, report) = chip::resolve("Apple M4 Pro", &chip::facts(10, 40, true), None);
+    assert_eq!(report.layers, [Source::Seeded("apple10.toml".into())]);
+    assert_eq!(*profile.get::<AneMlp>(), AneMlp::Units { units: 8 });
+    let (_, report) = chip::resolve("Apple M4 Pro", &chip::facts(11, 40, true), None);
+    assert_eq!(report.used, Source::Defaults, "no family applies");
 }

@@ -1,14 +1,12 @@
-# Apple M1 Max. Every decision the Metal registry declares, spelled out.
+# The Apple7 GPU family (M1): what every device of the family runs. Every decision the Metal registry declares, spelled out.
 api = 1
 fuse = ["mlp_swiglu", "residual_add_rmsnorm"]
 
 [target]
-device  = "Apple M1 Max"
-assumes = { family = 7, ane = true }
+assumes = { family = 7 }
 
 [provenance]
-source   = "the Apple7 family tuning pie applied before per-chip profiles, carried over unchanged"
-measured = false
+source = "the Apple7 family tuning pie applied before per-chip profiles, carried over unchanged"
 
 [kernel]
 qmm = [
@@ -42,8 +40,8 @@ sdpa.tile_rows_per_request  = 32
 sdpa.mma                    = true
 sdpa.kv_q8                  = false
 gdn.scan                    = { use = "simd", rows = 4 }
-ane.mlp                     = { use = "share", percent = 47 }
-ane.projections             = { use = "share", percent = 47 }
+ane.mlp                     = [{ when = "ane", use = "share", percent = 47 }, "gpu"]
+ane.projections             = [{ when = "ane", use = "share", percent = 47 }, "gpu"]
 
 [compiler]
 launch_us              = 1.0

@@ -1,18 +1,17 @@
-# Apple M2 Max. Every decision the Metal registry declares, spelled out.
+# The Apple10 GPU family (M5): what every device of the family runs. Every decision the Metal registry declares, spelled out.
 api = 1
 fuse = ["mlp_swiglu", "residual_add_rmsnorm"]
 
 [target]
-device  = "Apple M2 Max"
-assumes = { family = 8, ane = true }
+assumes = { family = 10 }
 
 [provenance]
-source   = "the Apple8 family tuning pie applied before per-chip profiles, carried over unchanged"
-measured = false
+source = "the Apple10 family tuning pie applied before per-chip profiles, carried over unchanged"
 
 [kernel]
 qmm = [
-  { when = "(rows >= 5 and bits == 2) or (rows >= 8 and format == fp16)", use = "tiled", crossover_tg = 160 },
+  { when = "rows >= 8 and (rows > 16 or n >= 1024)", use = "mpp" },
+  { when = "rows >= 5 and (bits == 2 or format == fp16)", use = "tiled", crossover_tg = 160 },
   { when = "rows >= 12", use = "tiled", crossover_tg = 160 },
   { use = "qmv", rows_max = 8, packs = 1, crossover_tg = 160 },
 ]
@@ -31,7 +30,7 @@ sdpa.mpp_rows.paired_below = 32
 sdpa.split = 32
 ane.min_rows = 256
 ane.min_columns = 4096
-moe.path              = "tiled"
+moe.path              = "mpp"
 moe.tile_rows = [
   { when = "per_expert < 2",   value = 1 },
   { when = "per_expert >= 32", value = 32 },
@@ -41,9 +40,9 @@ sdpa.prefill                = "mpp"
 sdpa.tile_rows_per_request  = 32
 sdpa.mma                    = true
 sdpa.kv_q8                  = false
-gdn.scan                    = { use = "simd", rows = 4 }
-ane.mlp                     = { use = "share", percent = 47 }
-ane.projections             = { use = "share", percent = 47 }
+gdn.scan                    = { use = "staged", min_rows = 32 }
+ane.mlp                     = [{ when = "ane", use = "units", units = 8 }, "gpu"]
+ane.projections             = [{ when = "ane", use = "share", percent = 47 }, "gpu"]
 
 [compiler]
 launch_us              = 1.0

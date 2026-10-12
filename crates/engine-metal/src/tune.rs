@@ -875,11 +875,13 @@ pub fn run(
         lines.extend(searched);
     }
     let tuned = search::render_overrides(&chosen);
-    let tuned_ids: Vec<String> = lines
-        .iter()
-        .filter(|l| !l.text.starts_with("not searched"))
-        .map(|l| format!("\"{}\"", l.id))
-        .collect();
+    let mut tuned_ids: Vec<String> = Vec::new();
+    for l in lines.iter().filter(|l| !l.text.starts_with("not searched")) {
+        let id = format!("\"{}\"", l.id);
+        if !tuned_ids.contains(&id) {
+            tuned_ids.push(id);
+        }
+    }
     let today = assemble(&base, &name, &facts, "", &[])?;
     let draft = assemble(&base, &name, &facts, &tuned, &[])?;
     let mut checks = Vec::new();
@@ -919,8 +921,7 @@ pub fn run(
             "source",
             format!("\"pie tune --{} on this machine\"", depth.word()),
         ),
-        ("measured", "true".to_string()),
-        ("tuned", format!("[{}]", tuned_ids.join(", "))),
+        ("measured", format!("[{}]", tuned_ids.join(", "))),
         ("from", format!("\"{}\"", report.used)),
         ("pie", format!("\"{}\"", env!("CARGO_PKG_VERSION"))),
         ("mix", "\"standard-1\"".to_string()),
@@ -1310,11 +1311,14 @@ mod tests {
             "Apple M4 Max",
             &facts,
             &tuned,
-            &[("measured", "true".to_string())],
+            &[("measured", "[\"kernel.qmm\"]".to_string())],
         )
         .unwrap();
         assert!(file.contains("device = \"Apple M4 Max\""), "{file}");
-        assert!(file.trim_end().ends_with("measured = true"), "{file}");
+        assert!(
+            file.trim_end().ends_with("measured = [\"kernel.qmm\"]"),
+            "{file}"
+        );
     }
 
     #[test]
@@ -1393,7 +1397,6 @@ mod tests {
     fn every_search_candidate_reads_against_the_registry() {
         let facts = crate::chip::facts(10, 40, true);
         let (base, _) = crate::chip::resolve("Apple M5 Max", &facts, None);
-        let registry = crate::chip::registry();
         let knobs = profile::search::knobs(&base, SEARCH_SKIPS, "kernel.ane");
         let ids: Vec<&str> = knobs.iter().map(|k| k.id).collect();
         for want in [
@@ -1408,8 +1411,7 @@ mod tests {
         assert!(!ids.contains(&"kernel.sdpa.kv_q8") && !ids.contains(&"kernel.qmm"));
         for k in &knobs {
             for (label, text) in &k.candidates {
-                registry
-                    .overlay(&base, text, base.target().clone(), Source::User("t".into()))
+                assemble(&base, "Apple M5 Max", &facts, text, &[])
                     .unwrap_or_else(|e| panic!("{} = {label}: {e}", k.id));
             }
         }
