@@ -479,6 +479,17 @@ pub fn check(bench: &mut dyn Bench, model: usize, today: &str, tuned: &str) -> R
     })
 }
 
+/// A value as one line for the report: a ladder's rungs joined, and long
+/// ones cut.
+fn shown(label: &str) -> String {
+    let one: String = label.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one.chars().count() > 90 {
+        format!("{}…", one.chars().take(90).collect::<String>())
+    } else {
+        one
+    }
+}
+
 /// A decision's best candidate so far: its mean relative time, label,
 /// file, what each model it moved served, and the mean it must beat.
 type Best = (f64, String, String, Vec<(usize, Serving)>, f64);
@@ -566,6 +577,7 @@ pub fn search(
             let label = queue[at].clone();
             at += 1;
             tried.push((label.clone(), false));
+            let seen = shown(&label);
             let trial = with_entry(&chosen, knob.id, &label);
             let text = match bench.file(&trial) {
                 Ok(t) => t,
@@ -573,7 +585,7 @@ pub fn search(
                     let why = why.lines().next().unwrap_or("").to_string();
                     // `origin:line:col: ` says nothing a reader needs.
                     let why = why.splitn(4, ':').nth(3).map_or(why.clone(), |w| w.trim().to_string());
-                    notes.push(format!("refused: {why}\u{1f}{label}"));
+                    notes.push(format!("refused: {why}\u{1f}{seen}"));
                     continue;
                 }
             };
@@ -583,7 +595,7 @@ pub fn search(
                 .filter(|&m| !knob.plan_only || plans[m].is_none() || bench.plan(m, &text) != plans[m])
                 .collect();
             if on.is_empty() {
-                notes.push(format!("plans the same\u{1f}{label}"));
+                notes.push(format!("plans the same\u{1f}{seen}"));
                 continue;
             }
             let mut got: Vec<(usize, Serving)> = Vec::new();
@@ -604,18 +616,18 @@ pub fn search(
                 let served = match bench.serve(m, &text) {
                     Ok(s) if s.refused.is_some() && base.refused.is_none() => {
                         let why = s.refused.unwrap_or_default();
-                        notes.push(format!("{label}: the co-processor refused it ({why})"));
+                        notes.push(format!("{seen}: the co-processor refused it ({why})"));
                         continue 'candidate;
                     }
                     Ok(s) => s,
                     Err(why) => {
                         let why: String = why.lines().next().unwrap_or("").chars().take(100).collect();
-                        notes.push(format!("{label} did not serve ({why})"));
+                        notes.push(format!("{seen} did not serve ({why})"));
                         continue 'candidate;
                     }
                 };
                 if let Some(why) = disagrees(&base.readout, &served.readout) {
-                    notes.push(format!("{label} reads differently on {} ({why})", names[m]));
+                    notes.push(format!("{seen} reads differently on {} ({why})", names[m]));
                     continue 'candidate;
                 }
                 let rm = relative(&served, base);
@@ -628,12 +640,12 @@ pub fn search(
                 r += rm / on.len() as f64;
                 got.push((m, served));
             }
-            say(&format!("  {} = {label}: {:+.1}%", knob.id, (r - 1.0) * 100.0));
+            say(&format!("  {} = {seen}: {:+.1}%", knob.id, (r - 1.0) * 100.0));
             if let Some(last) = tried.last_mut() {
                 last.1 = true;
             }
             if let Some(worse) = worse {
-                notes.push(format!("{label} costs a model ({worse})"));
+                notes.push(format!("{seen} costs a model ({worse})"));
                 continue;
             }
             // The mean must beat the models' noise, which averaging over
@@ -652,10 +664,11 @@ pub fn search(
                 for (m, served) in got {
                     incumbent[m] = Some(served);
                 }
-                format!("{label}: {:.1}% faster end to end", (1.0 - r) * 100.0)
+                format!("{}: {:.1}% faster end to end", shown(&label), (1.0 - r) * 100.0)
             }
             Some((r, label, _, _, bar)) => format!(
-                "kept; the best other, {label}, was {:+.1}% (a change must beat {:.1}%)",
+                "kept; the best other, {}, was {:+.1}% (a change must beat {:.1}%)",
+                shown(&label),
                 (r - 1.0) * 100.0,
                 (1.0 - bar) * 100.0
             ),
