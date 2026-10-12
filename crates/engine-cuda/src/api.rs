@@ -17,7 +17,7 @@ use engine::program::{
 use engine::transfer::{KvCopy, MemoryDomain, StateCopy, StateDirection};
 use eta_ir::registry::{GeometryClass, ModelProfile, Port, PortMask};
 use eta_ir::types::Dtype;
-use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder, VoxelLadder};
+use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder, VoxelLadder};
 use poem_ir::Trace;
 
 use crate::error::Fault;
@@ -469,7 +469,6 @@ impl Engine for Cuda {
             budget: bake_budgets(&budgets),
             patches,
             voxels,
-            profile: None::<DeviceProfile>,
             page_size: budgets.page_size,
             context: budgets.max_context,
             slots: budgets.slots,

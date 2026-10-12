@@ -216,17 +216,9 @@ impl Shell {
         self.graphs
     }
 
-    pub fn set_mode(&mut self, graphs: Graphs) {
-        self.graphs = graphs;
-    }
-
     #[must_use]
     pub fn copying(&self) -> bool {
         self.copies
-    }
-
-    pub fn set_copies(&mut self, copies: bool) {
-        self.copies = copies;
     }
 
     #[must_use]

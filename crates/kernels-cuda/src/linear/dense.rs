@@ -516,7 +516,6 @@ struct Device {
     lt: LtCtx,
     plans: HashMap<(i32, i32, i32), Arc<LtPlan>>,
     chosen: HashMap<u64, Tactic>,
-    seen: HashMap<u64, u32>,
     disk: DiskCache,
 }
 
@@ -535,7 +534,6 @@ fn with_device<R>(f: impl FnOnce(&mut Device) -> R) -> R {
                 },
                 plans: HashMap::new(),
                 chosen: HashMap::new(),
-                seen: HashMap::new(),
                 disk: DiskCache::new(),
             }))
         }))
@@ -595,8 +593,6 @@ impl Device {
         if (call.m as usize) * (call.n as usize) * 2 > 256 * 1024 * 1024 {
             return None;
         }
-        let seen = self.seen.entry(key).or_insert(0);
-        *seen += 1;
         let tactic = tune(handle, stream, &self.lt, plan, call);
         self.disk.store(key, tactic.encode());
         self.chosen.insert(key, tactic);

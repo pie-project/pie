@@ -24,7 +24,6 @@ pub mod sched_mla;
 
 pub mod sched_prefill;
 
-pub mod sched_sm90;
 
 pub mod selector;
 
@@ -36,7 +35,7 @@ use dtype::Dtype;
 use crate::attn::fa2_abi::{
     Buffers, DecodeRelParams, PrefillRelParams, make_decode_params, make_prefill_params,
 };
-use crate::attn::plan::{DecodePlan, PrefillPlan, PrefillPlanSm90};
+use crate::attn::plan::{DecodePlan, PrefillPlan};
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
@@ -567,23 +566,6 @@ pub fn prefill_rel(
         None,
         Some(rel),
     )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn prefill_sm90(
-    _ctx: &Ctx,
-    _q: RaggedTensor,
-    _plan: &PrefillPlanSm90,
-    _pool: &KvPool,
-    _window: Option<u32>,
-    _head_dim: u32,
-    _kv_heads: u32,
-    _sm_scale: f32,
-    _o: &mut Tensor,
-) -> Result<(), Error> {
-    Err(Error::Unsupported {
-        op: "attention.prefill_sm90",
-    })
 }
 
 pub fn sink(

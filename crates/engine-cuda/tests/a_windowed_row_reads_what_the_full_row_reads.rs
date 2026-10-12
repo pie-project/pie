@@ -26,7 +26,6 @@ fn logits(trace: Trace, path: &Path, prompt: &[u32], decodes: u32) -> Vec<Vec<f3
         checkpoint: path,
         budget: Budget::new(1, CHUNK),
         patches: None,
-        profile: None,
         page_size: 16,
         context: 1024,
         slots: 1,

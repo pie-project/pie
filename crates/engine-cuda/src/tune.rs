@@ -94,7 +94,6 @@ fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, St
                 ..engine::load::Budgets::default()
             },
         ),
-        profile: None,
         page_size: 16,
         context: CONTEXT,
         slots,

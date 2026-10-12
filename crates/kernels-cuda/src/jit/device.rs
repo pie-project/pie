@@ -179,23 +179,37 @@ fn grow(
     Ok(())
 }
 
+/// The device the calling thread has current.
+fn current() -> Option<i32> {
+    let mut ordinal: i32 = 0;
+    (unsafe { rt::cudaGetDevice(&raw mut ordinal) } == rt::cudaError::cudaSuccess).then_some(ordinal)
+}
+
+/// A device fact read once per device: a process may drive several GPUs,
+/// and the first one asked does not answer for the others.
+fn per_device(
+    cache: &'static OnceLock<Mutex<HashMap<i32, Option<u32>>>>,
+    read: impl FnOnce(i32) -> Option<u32>,
+) -> Option<u32> {
+    let ordinal = current()?;
+    let mut map = cache
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *map.entry(ordinal).or_insert_with(|| read(ordinal))
+}
+
 #[must_use]
 pub(crate) fn multiprocessors() -> Option<u32> {
-    static COUNT: OnceLock<Option<u32>> = OnceLock::new();
-    *COUNT.get_or_init(|| attribute(rt::cudaDeviceAttr::cudaDevAttrMultiProcessorCount))
+    static COUNT: OnceLock<Mutex<HashMap<i32, Option<u32>>>> = OnceLock::new();
+    per_device(&COUNT, |o| attribute(rt::cudaDeviceAttr::cudaDevAttrMultiProcessorCount, o))
 }
 
 #[must_use]
 pub(crate) fn compute_capability_major() -> Option<u32> {
-    static MAJOR: OnceLock<Option<u32>> = OnceLock::new();
-    *MAJOR.get_or_init(|| {
+    static MAJOR: OnceLock<Mutex<HashMap<i32, Option<u32>>>> = OnceLock::new();
+    per_device(&MAJOR, |ordinal| {
         use cudarc::driver::sys as dr;
-
-        let mut ordinal: i32 = 0;
-
-        if unsafe { rt::cudaGetDevice(&raw mut ordinal) } != rt::cudaError::cudaSuccess {
-            return None;
-        }
         cudarc::driver::result::init().ok()?;
         let mut device: dr::CUdevice = 0;
 
@@ -215,19 +229,20 @@ pub(crate) fn compute_capability_major() -> Option<u32> {
     })
 }
 
-#[allow(dead_code)]
 #[must_use]
 pub(crate) fn max_shared_memory_per_sm() -> Option<u32> {
-    static BYTES: OnceLock<Option<u32>> = OnceLock::new();
-    *BYTES
-        .get_or_init(|| attribute(rt::cudaDeviceAttr::cudaDevAttrMaxSharedMemoryPerMultiprocessor))
+    static BYTES: OnceLock<Mutex<HashMap<i32, Option<u32>>>> = OnceLock::new();
+    per_device(&BYTES, |o| {
+        attribute(rt::cudaDeviceAttr::cudaDevAttrMaxSharedMemoryPerMultiprocessor, o)
+    })
 }
 
-#[allow(dead_code)]
 #[must_use]
 pub(crate) fn max_shared_memory_per_block_optin() -> Option<u32> {
-    static BYTES: OnceLock<Option<u32>> = OnceLock::new();
-    *BYTES.get_or_init(|| attribute(rt::cudaDeviceAttr::cudaDevAttrMaxSharedMemoryPerBlockOptin))
+    static BYTES: OnceLock<Mutex<HashMap<i32, Option<u32>>>> = OnceLock::new();
+    per_device(&BYTES, |o| {
+        attribute(rt::cudaDeviceAttr::cudaDevAttrMaxSharedMemoryPerBlockOptin, o)
+    })
 }
 
 pub(crate) fn properties(ordinal: i32) -> Option<rt::cudaDeviceProp> {
@@ -236,12 +251,7 @@ pub(crate) fn properties(ordinal: i32) -> Option<rt::cudaDeviceProp> {
     (code == rt::cudaError::cudaSuccess).then_some(prop)
 }
 
-fn attribute(which: rt::cudaDeviceAttr) -> Option<u32> {
-    let mut ordinal: i32 = 0;
-
-    if unsafe { rt::cudaGetDevice(&raw mut ordinal) } != rt::cudaError::cudaSuccess {
-        return None;
-    }
+fn attribute(which: rt::cudaDeviceAttr, ordinal: i32) -> Option<u32> {
     let mut value: i32 = 0;
 
     let code = unsafe { rt::cudaDeviceGetAttribute(&raw mut value, which, ordinal) };

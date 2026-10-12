@@ -72,7 +72,6 @@ fn ready(what: &str) -> Option<Shell> {
         checkpoint: &checkpoint,
         budget: Budget::new(LANES, TOKENS),
         patches: None,
-        profile: None,
         page_size: PAGE,
         context: 512,
         slots: LANES,

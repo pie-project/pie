@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use checkpoint::contract::ModelContract;
-use poem_compiler::{Budget, DeviceProfile};
+use poem_compiler::Budget;
 use poem_ir::Trace;
 
 use super::diag::Diagnostics;
@@ -23,22 +23,6 @@ impl Graphs {
     #[must_use]
     pub fn records(self) -> bool {
         matches!(self, Graphs::On)
-    }
-}
-
-impl std::str::FromStr for Graphs {
-    type Err = String;
-
-    fn from_str(word: &str) -> std::result::Result<Graphs, String> {
-        match word {
-            "off" | "eager" => Ok(Graphs::Off),
-            "shaped" => Ok(Graphs::Shaped),
-            "on" | "graph" => Ok(Graphs::On),
-            other => Err(format!(
-                "`{other}` does not name a graph mode; the spellings are \
-                 `on` (or `graph`), `shaped`, and `off` (or `eager`)"
-            )),
-        }
     }
 }
 
@@ -73,22 +57,6 @@ impl Recording {
         match self {
             Recording::Bodies { mem_megabytes, .. } => mem_megabytes,
             Recording::Off | Recording::Shaped => 0,
-        }
-    }
-}
-
-impl std::str::FromStr for Recording {
-    type Err = String;
-
-    fn from_str(word: &str) -> std::result::Result<Recording, String> {
-        match word {
-            "off" => Ok(Recording::Off),
-            "shaped" => Ok(Recording::Shaped),
-            "bodies" => Ok(Recording::default()),
-            other => Err(format!(
-                "`{other}` does not name a recording mode; the spellings are \
-                 `off`, `shaped`, and `bodies`"
-            )),
         }
     }
 }
@@ -148,7 +116,6 @@ pub struct Boot<'a> {
     pub budget: Budget,
     pub patches: Option<poem_compiler::PatchLadder>,
     pub voxels: Option<poem_compiler::VoxelLadder>,
-    pub profile: Option<DeviceProfile>,
     pub page_size: u32,
     pub context: u32,
     pub slots: u32,

@@ -1,7 +1,7 @@
 use std::cell::Cell;
 
 use kernels_cuda::attn::plan::{
-    DecodePlan, Device, Live, MlaPlan, PrefillPlan, PrefillPlanSm90, Shape, Toggles, Workspace,
+    DecodePlan, Device, Live, MlaPlan, PrefillPlan, Shape, Toggles, Workspace,
 };
 use kernels_cuda::linear::lora::Segments;
 use kernels_cuda::linear::moe::{ExpertTable, GroupSeat};
@@ -346,8 +346,6 @@ pub enum StructSlot {
     Decode(DecodePlan),
 
     Prefill(PrefillPlan),
-
-    PrefillSm90(PrefillPlanSm90),
 
     Mla(MlaPlan),
 }
@@ -2001,11 +1999,6 @@ impl<'c> Run<'c> {
                     p.causal,
                     p.graph_capturable,
                     p.mask_indptr
-                ),
-                StructSlot::PrefillSm90(p) => write!(
-                    sink,
-                    "s{:?}{:?}{:?}{}{}",
-                    p.info, p.workspace, p.shape, p.total_tokens, p.causal
                 ),
                 StructSlot::Mla(p) => write!(
                     sink,

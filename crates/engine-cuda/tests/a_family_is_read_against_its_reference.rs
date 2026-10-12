@@ -154,7 +154,6 @@ fn every_probe_is_dumped() {
         checkpoint: &snapshot,
         budget: Budget::new(4, context),
         patches: None,
-        profile: None,
         page_size: 16,
         context,
         slots: 4,

@@ -19,11 +19,9 @@ pub mod moe_route;
 
 pub mod rel_bias;
 
-pub mod fp8;
 
 pub mod kquant;
 
-pub mod nvfp4;
 
 pub mod quant;
 

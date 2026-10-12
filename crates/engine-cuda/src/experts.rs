@@ -14,8 +14,6 @@ const COUNTER: u64 = 4;
 
 const MOVES: usize = 2;
 
-const GROUP_MOVES: usize = 1;
-
 const CELL: u64 = 32;
 
 const CELL_PLANES: usize = 3;
@@ -1640,7 +1638,7 @@ impl Tier {
         if let Some(swap) = self.swap {
             return Some(Step::Close(swap));
         }
-        if GROUP_MOVES == 0 || self.berths.is_empty() || !self.ladder_open {
+        if self.berths.is_empty() || !self.ladder_open {
             return None;
         }
         let hits = self.group_mirror.read(0, self.group_mirror.bytes());

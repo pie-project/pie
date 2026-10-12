@@ -51,9 +51,8 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     boot.budget.buckets = crate::api::lattice(stated_buckets.clone(), boot.budget.max_tokens);
 
     let grouped: &[&str] = if engine.grouped { &crate::GROUPED } else { &[] };
-    let mut profile = boot.profile.take().unwrap_or_else(|| {
-        DeviceProfile::of(&chip, device.device().num_sm, &crate::EXCLUSIVE, grouped)
-    });
+    let mut profile =
+        DeviceProfile::of(&chip, device.device().num_sm, &crate::EXCLUSIVE, grouped);
     profile.exclusive = crate::EXCLUSIVE
         .iter()
         .map(|op| (*op).to_string())

@@ -72,7 +72,7 @@ fn plan_floats(budget: &Budget, facts: &Facts, device: &Device) -> Vec<Option<u6
                         device,
                     ),
                     StructKind::AttnPrefillPlanSm90 => {
-                        graph_float_bytes(&seat.reading, device.num_sm)
+                        unreachable!("no CUDA trace plans an sm90 prefill")
                     }
                     StructKind::AttnDecodePlan => graph_float_bytes(&seat.reading, device.num_sm)
                         .max(decode_float_bytes(&seat.reading, budget.max_lanes)),

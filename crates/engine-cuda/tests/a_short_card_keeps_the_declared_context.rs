@@ -87,7 +87,6 @@ fn a_short_card_keeps_the_declared_context() {
         checkpoint: &checkpoint,
         budget: Budget::new(LANES, TOKENS),
         patches: None,
-        profile: None,
         page_size: PAGE,
         context: CONTEXT,
         slots: 256,

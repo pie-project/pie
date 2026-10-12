@@ -98,7 +98,6 @@ fn a_fitted_pool_is_pledged_what_it_declared() {
         checkpoint: &checkpoint,
         budget: Budget::new(LANES, TOKENS),
         patches: None,
-        profile: None,
         page_size: PAGE,
         context: CONTEXT,
         slots: 256,

@@ -216,10 +216,8 @@ pub fn conv3d_on(
         && aligned16(w.ptr)
         && cache.is_none_or(|c| aligned16(c.ptr))
         && (!o.width.is_multiple_of(8) || aligned16(o.ptr));
-    let tensor_core = vectorised
-        && ctx
-            .compute_capability_major()
-            .is_some_and(|major| major >= 8);
+    // Every GPU pie serves is sm_80 or later, which has the tensor cores.
+    let tensor_core = vectorised;
     let mma = match path {
         ConvPath::Auto => tensor_core,
         ConvPath::Direct => false,
@@ -228,7 +226,7 @@ pub fn conv3d_on(
                 return Err(refuse(
                     OP,
                     format!(
-                        "the tensor-core kernel needs C_in % 8 == 0 ({}), 16-byte planes and sm_80+",
+                        "the tensor-core kernel needs C_in % 8 == 0 ({}) and 16-byte planes",
                         x.width
                     ),
                 ));
