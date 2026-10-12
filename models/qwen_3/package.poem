@@ -43,6 +43,7 @@ MODELS = [
 
 U4 = dtype.u4g64
 BF = dtype.bf16
+U8 = dtype.u8g64
 
 DEPLOYMENTS = [
     deployment("qwen36-27b", weights = U4, kv = BF, drafter = "mtp"),
@@ -75,6 +76,7 @@ DEPLOYMENTS = [
     deployment("qwen38-27b", weights = U4, kv = BF, parts = ["vision"]),
     deployment("qwen38-27b", weights = BF, kv = BF, drafter = "mtp", parts = ["vision"]),
     deployment("qwen35-d0.8b", weights = U4, kv = BF, parts = ["vision"]),
+    deployment("qwen35-d0.8b", weights = U8, kv = BF, parts = ["vision"]),
     deployment("qwen35-d0.8b", weights = BF, kv = BF, parts = ["vision"]),
 ]
 
