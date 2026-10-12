@@ -1126,7 +1126,7 @@ impl Recorder {
         static PRICE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
         *PRICE.get_or_init(|| {
             let nodes = graph.nodes().filter(|nodes| *nodes > 0)?;
-            let (bytes, _) = crate::device::nodes::exec_footprint(graph, COPIES).ok()?;
+            let bytes = graph.instantiated_bytes(COPIES).ok()?;
             let price = (bytes > 0.0).then(|| (bytes / nodes as f64).ceil() as usize);
             if crate::serve::diag::on().arm_trace {
                 eprintln!(

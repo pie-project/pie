@@ -1199,7 +1199,7 @@ impl Shell {
         if super::diag::on().arm_trace {
             let slabs = kernels_cuda::jit::Slabs::census();
             let total: usize = slabs.iter().map(|(_, bytes)| *bytes).sum();
-            let free = crate::device::nodes::free_bytes().unwrap_or(0);
+            let free = crate::device::free_bytes().unwrap_or(0);
             eprintln!(
                 "[arm-trace] device memory: free {} MiB; arena committed {} MiB, inputs reserve {} MiB, buffered activations {} MiB, readout rows {} MiB, rs scratch {} MiB, pool committed {} MiB",
                 free >> 20,
