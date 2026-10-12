@@ -22,6 +22,60 @@ pub struct PatchSeat {
     pub dtype: Dtype,
 }
 
+/// A per-lane or per-row input a diffusion fire reads off a channel: the
+/// latents, the timestep vector, the context, the axis positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortSeat {
+    pub kind: engine::fire::PortKind,
+    pub port: u8,
+    pub width: u32,
+    pub dtype: Dtype,
+}
+
+impl PortSeat {
+    #[must_use]
+    pub fn per_lane(&self) -> bool {
+        self.kind == engine::fire::PortKind::LaneVector
+    }
+
+    #[must_use]
+    pub fn row_bytes(&self) -> u64 {
+        u64::from(self.width) * poem_compiler::arena::elem_bytes(self.dtype).unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PortAt {
+    seat: PortSeat,
+    at: u64,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PackingAt {
+    group_indptr: u64,
+    lane_indptr: u64,
+    reference_tag: u64,
+    permutation: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PackingHandles {
+    pub group_indptr: Tensor,
+    pub lane_indptr: Tensor,
+    pub reference_tag: Tensor,
+    pub permutation: Tensor,
+}
+
+/// One selection's packing of a fire's rows into attention groups.
+#[derive(Debug, Clone, Copy)]
+pub struct PackingFire<'a> {
+    pub group_indptr: &'a [i32],
+    pub lane_indptr: &'a [i32],
+    pub reference_tag: &'a [i32],
+    pub permutation: &'a [i32],
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PatchAt {
     payload: u64,
@@ -76,6 +130,10 @@ pub struct Handles {
 
     pub rs_replay: Option<Tensor>,
     pub rs_commit: Option<Tensor>,
+
+    pub group_of_lane: Option<Tensor>,
+    pub packings: Vec<PackingHandles>,
+    pub ports: Vec<Tensor>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -134,6 +192,9 @@ pub struct Fire<'a> {
 
     pub rs_replay: Option<&'a [i32]>,
     pub rs_commit: Option<&'a [i32]>,
+
+    pub group_of_lane: &'a [i32],
+    pub packings: &'a [PackingFire<'a>],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -175,6 +236,10 @@ pub struct Inputs {
 
     rs_replay: u64,
     rs_commit: u64,
+
+    group_of_lane: u64,
+    packings: Vec<PackingAt>,
+    ports: Vec<PortAt>,
 }
 
 impl Inputs {
@@ -188,6 +253,8 @@ impl Inputs {
         gathered: usize,
         patch: Option<PatchSeat>,
         mrope: bool,
+        ports: &[PortSeat],
+        selections: usize,
     ) -> Result<Inputs> {
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(budget.max_lanes);
@@ -243,6 +310,26 @@ impl Inputs {
         let mrope = mrope.then(|| take(rows * AXES * 4));
         let rs_replay = take(lanes * 4);
         let rs_commit = take(lanes * 4);
+        let group_of_lane = if selections == 0 { 0 } else { take(lanes * 4) };
+        let packings: Vec<PackingAt> = (0..selections)
+            .map(|_| PackingAt {
+                group_indptr: take((lanes + 1) * 4),
+                lane_indptr: take((lanes + 1) * 4),
+                reference_tag: take(rows * 4),
+                permutation: take(rows * 4),
+            })
+            .collect();
+        let ports: Vec<PortAt> = ports
+            .iter()
+            .map(|seat| {
+                let bytes = if seat.per_lane() { lanes } else { rows } * seat.row_bytes();
+                PortAt {
+                    seat: *seat,
+                    at: take(bytes),
+                    bytes,
+                }
+            })
+            .collect();
         let total = at;
 
         let store = Buffer::host(device, total)?;
@@ -267,7 +354,21 @@ impl Inputs {
             mrope,
             rs_replay,
             rs_commit,
+            group_of_lane,
+            packings,
+            ports,
         })
+    }
+
+    pub fn write_port(&mut self, at: u64, bytes: &[u8]) -> Result<()> {
+        self.store.write(at, bytes)
+    }
+
+    /// The store and the offset of port `port`'s rectangle, for a channel's
+    /// cell to be copied into.
+    #[must_use]
+    pub fn port_seat(&self, port: usize) -> Option<(&Buffer, u64)> {
+        self.ports.get(port).map(|at| (&self.store, at.at))
     }
 
     #[must_use]
@@ -473,6 +574,86 @@ impl Inputs {
             }
         };
 
+        let group_of_lane = if self.packings.is_empty() {
+            None
+        } else {
+            if fire.group_of_lane.len() as u32 > lanes {
+                return Err(Fault::Ceiling {
+                    what: "group-of-lane entries",
+                    need: fire.group_of_lane.len() as u64,
+                    have: u64::from(lanes),
+                });
+            }
+            self.store
+                .write(self.group_of_lane, bytes_of(fire.group_of_lane))?;
+            Some(i32s(handles, &self.store, self.group_of_lane, lanes)?)
+        };
+        if fire.packings.len() != self.packings.len() {
+            return Err(Fault::Ceiling {
+                what: "packing tables against the selections this load carved",
+                need: fire.packings.len() as u64,
+                have: self.packings.len() as u64,
+            });
+        }
+        let mut packings = Vec::with_capacity(self.packings.len());
+        let mut scratch: Vec<i32> = Vec::new();
+        for (at, staged) in self.packings.iter().zip(fire.packings) {
+            for (what, have, ceiling) in [
+                (
+                    "group indptr entries",
+                    staged.group_indptr.len() as u64,
+                    u64::from(lanes) + 1,
+                ),
+                (
+                    "lane indptr entries",
+                    staged.lane_indptr.len() as u64,
+                    u64::from(lanes) + 1,
+                ),
+                (
+                    "reference tags",
+                    staged.reference_tag.len() as u64,
+                    u64::from(rows),
+                ),
+                (
+                    "packed row permutation",
+                    staged.permutation.len() as u64,
+                    u64::from(rows),
+                ),
+            ] {
+                if have > ceiling {
+                    return Err(Fault::Ceiling {
+                        what,
+                        need: have,
+                        have: ceiling,
+                    });
+                }
+            }
+            csr(&mut scratch, staged.group_indptr, lanes + 1);
+            self.store.write(at.group_indptr, bytes_of(&scratch))?;
+            csr(&mut scratch, staged.lane_indptr, lanes + 1);
+            self.store.write(at.lane_indptr, bytes_of(&scratch))?;
+            rows_table(&mut scratch, staged.reference_tag, rows);
+            self.store.write(at.reference_tag, bytes_of(&scratch))?;
+            rows_table(&mut scratch, staged.permutation, rows);
+            self.store.write(at.permutation, bytes_of(&scratch))?;
+            packings.push(PackingHandles {
+                group_indptr: i32s(handles, &self.store, at.group_indptr, lanes + 1)?,
+                lane_indptr: i32s(handles, &self.store, at.lane_indptr, lanes + 1)?,
+                reference_tag: i32s(handles, &self.store, at.reference_tag, rows)?,
+                permutation: i32s(handles, &self.store, at.permutation, rows)?,
+            });
+        }
+        let mut ports = Vec::with_capacity(self.ports.len());
+        for at in &self.ports {
+            let carved = if at.seat.per_lane() { lanes } else { rows };
+            ports.push(Tensor::new(
+                handles.bind(&self.store, at.at, at.bytes)?,
+                carved,
+                at.seat.width,
+                at.seat.dtype,
+            ));
+        }
+
         let mut spaces = Vec::with_capacity(self.spaces.len());
         for (at, geometry) in self.spaces.iter().zip(fire.spaces) {
             self.store.write(at.indptr, bytes_of(&geometry.indptr))?;
@@ -554,6 +735,9 @@ impl Inputs {
             } else {
                 None
             },
+            group_of_lane,
+            packings,
+            ports,
         })
     }
 
@@ -600,4 +784,17 @@ fn bytes_of(values: &[i32]) -> &[u8] {
     unsafe {
         core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
     }
+}
+
+fn csr(into: &mut Vec<i32>, staged: &[i32], ceiling: u32) {
+    into.clear();
+    into.extend_from_slice(staged);
+    let last = into.last().copied().unwrap_or(0);
+    into.resize(ceiling as usize, last);
+}
+
+fn rows_table(into: &mut Vec<i32>, staged: &[i32], rows: u32) {
+    into.clear();
+    into.extend_from_slice(staged);
+    into.resize(rows as usize, -1);
 }

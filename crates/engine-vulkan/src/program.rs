@@ -22,6 +22,8 @@ impl From<String> for Refusal {
 
 struct Instance {
     program: ProgramId,
+    /// The registered channels the instance binds, in its program's order.
+    ids: Vec<ChannelId>,
     plan: Arc<ExecPlan>,
     inst: InterpInstance,
     geometry: GeometryClass,
@@ -33,6 +35,23 @@ struct Instance {
     landing: Arc<Mutex<Vec<(u32, u64)>>>,
     /// Set by a pass that faulted after its fire returned.
     faulted: Arc<AtomicBool>,
+}
+
+/// The cell a lane's input port reads this fire: the one the instance's own
+/// take would read.
+#[derive(Debug, Clone)]
+pub enum PortCell {
+    /// On the host ring, as wire bytes.
+    Host {
+        bytes: Vec<u8>,
+        dtype: eta_ir::types::Dtype,
+    },
+    /// On the device, kept there by a pass still on the queue or landed.
+    #[cfg(feature = "vulkan")]
+    Device {
+        cell: crate::device::Buffer,
+        dtype: eta_ir::types::Dtype,
+    },
 }
 
 #[derive(Default)]
@@ -186,6 +205,7 @@ impl Plane {
             id,
             Instance {
                 program: binding.program,
+                ids: binding.channels.clone(),
                 plan,
                 inst,
                 geometry: binding.geometry,
@@ -223,6 +243,38 @@ impl Plane {
                 what: "instance",
                 id,
             })
+    }
+
+    /// The cell channel `id` of `instance` holds for an input port this fire.
+    pub fn port_cell(&self, instance: InstanceId, id: ChannelId) -> Result<PortCell, Refusal> {
+        let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
+            what: "instance",
+            id: instance,
+        })?;
+        let dense = seat.ids.iter().position(|&held| held == id).ok_or_else(|| {
+            Refusal::Program(format!(
+                "a port feed names channel {id}, which instance {instance} does not carry"
+            ))
+        })?;
+        let ring = &seat.inst.channels[dense];
+        let dtype = eta_exec::concrete_dtype(seat.plan.package.channels[dense].dtype);
+        #[cfg(feature = "vulkan")]
+        if let Some(cell) = seat.session.kept_cell(dense as u32) {
+            return Ok(PortCell::Device {
+                cell: cell.clone(),
+                dtype,
+            });
+        }
+        if ring.is_empty() {
+            return Err(Refusal::Program(format!(
+                "port channel {id} of instance {instance} holds no cell; publish one before \
+                 the fire that reads it"
+            )));
+        }
+        let value = ring.front();
+        let mut bytes = vec![0u8; eta_exec::wire_cell_bytes(value.dtype(), value.len())];
+        eta_exec::encode_wire(&value, &mut bytes);
+        Ok(PortCell::Host { bytes, dtype })
     }
 
     pub fn envelope_fold_len(&self, instance: InstanceId) -> Result<Option<u32>, Refusal> {

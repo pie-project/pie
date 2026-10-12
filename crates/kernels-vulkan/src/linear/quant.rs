@@ -1,7 +1,5 @@
 #![allow(clippy::too_many_arguments)]
 
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
 
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, refuse, stated};
 use crate::error::Error;
@@ -333,19 +331,7 @@ pub fn qmv_grid(op: &'static str, vecs: i32, out_vec_size: i32) -> Result<[u32; 
     Ok([x, out_vec_size.unsigned_abs().div_ceil(4), 1])
 }
 
-fn symbol(name: &str) -> &'static str {
-    static INTERNED: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
-    let mut map = INTERNED
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(found) = map.get(name) {
-        return found;
-    }
-    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
-    map.insert(name.to_owned(), leaked);
-    leaked
-}
+use crate::encode::symbol;
 
 pub struct Scratch<'a> {
     pub precast: &'a dyn Fn(u32, u32) -> Option<Tensor>,

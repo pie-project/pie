@@ -12,6 +12,7 @@ mod dispatch;
 pub mod encode;
 mod error;
 pub mod experts;
+pub mod feeds;
 pub mod guest;
 pub mod inputs;
 pub mod mask;

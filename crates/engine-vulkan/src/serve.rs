@@ -35,6 +35,10 @@ const SCORES_SEAM: &str = poem_compiler::EXPORT_SEAMS[2];
 
 const DRAFTS_SEAM: &str = poem_compiler::EXPORT_SEAMS[3];
 
+const VELOCITY_SEAM: &str = poem_compiler::FLOAT_READOUT_SEAMS[0];
+
+const HIDDEN_SEAM: &str = poem_compiler::FLOAT_READOUT_SEAMS[1];
+
 pub struct Boot<'a> {
     pub trace: Trace,
 
@@ -188,6 +192,12 @@ pub struct Seated<'a> {
     /// A device cell holding the lane's one token, written by a pass still
     /// on the queue; the fire copies it in behind that pass.
     pub feed: Option<&'a Buffer>,
+
+    /// The stream and attention group a diffusion lane packs into.
+    pub stream: engine::fire::LaneStream,
+    pub group: Option<u32>,
+    /// The cells feeding the lane's input ports this fire.
+    pub ports: &'a [(engine::fire::PortFeed, crate::program::PortCell)],
 }
 
 impl<'a> Seated<'a> {
@@ -208,6 +218,9 @@ impl<'a> Seated<'a> {
             rs_reset: engine::fire::RsReset::Inferred,
             rs_slot: None,
             feed: None,
+            stream: engine::fire::LaneStream::Text,
+            group: None,
+            ports: &[],
         }
     }
 
@@ -339,7 +352,12 @@ pub struct Shell {
 
     capturing: poem_ir::ClassSet,
 
+    /// The value a fire reads back: the logits, or a diffusion model's
+    /// velocity or hidden state.
     out: ValueId,
+    readout_seam: engine::fire::ReadoutSeam,
+    readout_dtype: Dtype,
+    feeds: crate::feeds::Feeds,
 
     mtp: Option<ValueId>,
 
@@ -528,6 +546,16 @@ impl Shell {
             .nodes
             .iter()
             .any(|node| matches!(node.op, Operation::Layout(Layout::ScatterLiveRows { .. })));
+        let feeds = crate::feeds::Feeds::of(&boot.trace, &compiled);
+        if let Some(value) = feeds.unlanded.first() {
+            return Err(Fault::Program {
+                at: "serve::load",
+                why: format!(
+                    "value {} merges ports under a guard this shell cannot select by",
+                    value.0
+                ),
+            });
+        }
         let inputs = (0..arms)
             .map(|_| {
                 Inputs::reserve(
@@ -539,21 +567,44 @@ impl Shell {
                     gathers,
                     patch_seat,
                     states_mrope,
+                    &feeds.seats(),
+                    feeds.selections.len(),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let out = boot
+        // A text model reads its logits; a diffusion model reads its last
+        // velocity, or a hidden state, as the readout.
+        let logits_seam = boot
             .trace
             .seams
             .iter()
             .find(|seam| seam.seam == OUT_SEAM)
-            .and_then(|seam| seam.values.first().copied())
-            .ok_or_else(|| Fault::Unbound {
-                what: format!(
-                    "no `{OUT_SEAM}` seam, so a fire would compute nothing a reader can take"
-                ),
-            })?;
+            .and_then(|seam| seam.values.first().copied());
+        let last_of = |name: &str| {
+            boot.trace
+                .seams
+                .iter()
+                .rfind(|seam| seam.seam == name)
+                .and_then(|seam| seam.values.first().copied())
+        };
+        let (out, readout_seam) = match logits_seam {
+            Some(out) => (out, engine::fire::ReadoutSeam::Logits),
+            None => match last_of(VELOCITY_SEAM) {
+                Some(v) => (v, engine::fire::ReadoutSeam::Velocity),
+                None => match last_of(HIDDEN_SEAM) {
+                    Some(h) => (h, engine::fire::ReadoutSeam::Hidden),
+                    None => {
+                        return Err(Fault::Unbound {
+                            what: format!(
+                                "no `{OUT_SEAM}`, `{VELOCITY_SEAM}` or `{HIDDEN_SEAM}` seam, so \
+                                 a fire would compute nothing a reader can take"
+                            ),
+                        });
+                    }
+                },
+            },
+        };
 
         let mtp = boot
             .trace
@@ -616,7 +667,7 @@ impl Shell {
             score_heads,
             boot.budget.max_lanes,
         )?;
-        let (out_width, mtp_width, drafts_plane) = {
+        let (out_width, mtp_width, drafts_plane, readout_dtype) = {
             let carved = arena.slots(
                 &handles,
                 &compiled.arena,
@@ -632,18 +683,24 @@ impl Shell {
             )?;
             let logits = carved.0[out.0 as usize].ok_or_else(|| Fault::Unbound {
                 what: format!(
-                    "value {}, the out seam, which the carve gave no rectangle",
+                    "value {}, the {readout_seam:?} readout, which the carve gave no rectangle",
                     out.0
                 ),
             })?;
-            if logits.dtype != Dtype::Bf16 {
+            let readable = match readout_seam {
+                engine::fire::ReadoutSeam::Logits => logits.dtype == Dtype::Bf16,
+                _ => matches!(logits.dtype, Dtype::Bf16 | Dtype::F32),
+            };
+            if !readable {
                 return Err(Fault::Unbound {
                     what: format!(
-                        "an out seam landed as {:?}, which this shell cannot read back",
+                        "a {readout_seam:?} readout landed as {:?}, which this shell cannot \
+                         read back",
                         logits.dtype
                     ),
                 });
             }
+            let readout_dtype = logits.dtype;
 
             let mtp_width = match mtp {
                 Some(mtp) => {
@@ -696,14 +753,18 @@ impl Shell {
                 None => None,
             };
             handles.rewind();
-            (logits.width, mtp_width, drafts_plane)
+            (logits.width, mtp_width, drafts_plane, readout_dtype)
         };
 
         let readout = (0..arms)
             .map(|_| {
                 Buffer::host(
                     &device,
-                    u64::from(readout_rows(boot.budget.max_lanes)) * u64::from(out_width) * 2,
+                    u64::from(match readout_seam {
+                        engine::fire::ReadoutSeam::Logits => readout_rows(boot.budget.max_lanes),
+                        _ => boot.budget.max_tokens,
+                    }) * u64::from(out_width)
+                        * elem(readout_dtype),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -829,6 +890,9 @@ impl Shell {
             rs_buffers,
             rs_scratch: None,
             out,
+            readout_seam,
+            readout_dtype,
+            feeds,
             mtp,
             drafts_plane,
 
@@ -959,6 +1023,11 @@ impl Shell {
     #[must_use]
     pub fn compiled(&self) -> u64 {
         self.pipelines.compiled()
+    }
+
+    #[must_use]
+    pub fn readout_seam(&self) -> engine::fire::ReadoutSeam {
+        self.readout_seam
     }
 
     pub fn out_width(&self) -> Result<u64> {
@@ -1226,7 +1295,7 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn readout_row(&self, landed: &Landed, lane: u32) -> Option<(&Buffer, u64, u32)> {
+    pub fn readout_row(&self, landed: &Landed, lane: u32) -> Option<(&Buffer, u64, u32, Dtype)> {
         let (arm, rows) = match self.landed_seats.get(&landed.seq) {
             Some(seat) if seat.generation == self.generation => (seat.arm, &seat.rows),
             Some(_) => return None,
@@ -1244,8 +1313,9 @@ impl Shell {
         let width = u64::from(self.out_width);
         Some((
             self.readout.get(arm)?,
-            u64::from(start) * width * 2,
+            u64::from(start) * width * elem(self.readout_dtype),
             count * self.out_width,
+            self.readout_dtype,
         ))
     }
 
@@ -1261,7 +1331,7 @@ impl Shell {
     }
 
     fn feed(&self, p: &Prepared<'_>) -> Result<Option<Pending>> {
-        if p.feeds.is_empty() {
+        if p.feeds.is_empty() && p.port_copies.is_empty() {
             return Ok(None);
         }
         let (store, tokens) = self.inputs[p.arm].token_seat();
@@ -1269,7 +1339,146 @@ impl Shell {
         for &(row, cell) in &p.feeds {
             frame.copy(cell, 0, store, tokens + u64::from(row) * 4, 4)?;
         }
+        for &(cell, at, bytes) in &p.port_copies {
+            frame.copy(cell, 0, store, at, bytes)?;
+        }
         frame.commit_async(None).map(Some)
+    }
+
+    /// Copies each guarded merge's port rows into its column before the walk.
+    #[cfg(not(feature = "vulkan"))]
+    fn land_merges(&self, _frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
+        if p.merge_lands.is_empty() {
+            Ok(())
+        } else {
+            Err(program("serve::land_merges", "a merged port needs a device".into()))
+        }
+    }
+
+    /// Copies each guarded merge's port rows into its column before the walk.
+    #[cfg(feature = "vulkan")]
+    fn land_merges(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
+        for land in &p.merge_lands {
+            let column = p.slots.0[land.merge.0 as usize].ok_or_else(|| Fault::Unbound {
+                what: format!("value {}, a merge over a port, which the carve gave no rectangle", land.merge.0),
+            })?;
+            let row_bytes = land.seat.row_bytes();
+            let bytes = u64::from(land.rows) * row_bytes;
+            let row = self.handles.get(column.buf).ok_or_else(|| Fault::Unbound {
+                what: format!("handle {}, a merged column's, which this fire minted no row for", column.buf),
+            })?;
+            let into = Buffer::of_slab(row.slab().clone());
+            let into_at = row.offset() + u64::from(land.first) * row_bytes;
+            if !land.fed {
+                frame.fill_zero(&into, into_at, bytes)?;
+                continue;
+            }
+            let (store, at) = self.inputs[p.arm].port_seat(land.port).ok_or_else(|| Fault::Unbound {
+                what: format!("the {:?} port {} rectangle, which this load carved none of", land.seat.kind, land.seat.port),
+            })?;
+            frame.copy(store, at + u64::from(land.first) * row_bytes, &into, into_at, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Lands every port a lane's class reads: a host cell into the inputs
+    /// store now, a device cell as a copy behind the pass that kept it.
+    fn feed_ports<'a>(
+        &mut self,
+        arm: usize,
+        composition: &Composition,
+        lanes: &'a [Seated<'a>],
+    ) -> Result<Vec<(&'a Buffer, u64, u64)>> {
+        #[cfg_attr(not(feature = "vulkan"), allow(unused_mut))]
+        let mut copies = Vec::new();
+        if self.feeds.ports.is_empty() {
+            return Ok(copies);
+        }
+        for (at_lane, row) in composition.lanes().iter().enumerate() {
+            let seated = &lanes[row.source as usize];
+            for (index, (seat, readers)) in self.feeds.ports.iter().enumerate() {
+                if !readers.contains(row.class as usize) {
+                    continue;
+                }
+                let Some((_, cell)) = seated
+                    .ports
+                    .iter()
+                    .find(|(feed, _)| feed.kind == seat.kind && feed.port == seat.port)
+                else {
+                    return Err(program(
+                        "serve::feed_ports",
+                        format!(
+                            "lane {} runs in a class that reads the {:?} port {}, and the lane \
+                             feeds no channel for it",
+                            row.source, seat.kind, seat.port
+                        ),
+                    ));
+                };
+                if seat.kind == engine::fire::PortKind::Voxels {
+                    return Err(program(
+                        "serve::feed_ports",
+                        "a voxel port feeds the spatial readings, which this shell does not \
+                         serve yet"
+                            .into(),
+                    ));
+                }
+                let (cells, offset) = if seat.per_lane() {
+                    (1u64, at_lane as u64)
+                } else {
+                    (u64::from(row.rows), u64::from(row.row_offset))
+                };
+                let bytes = cells * seat.row_bytes();
+                let (store, base) = self.inputs[arm].port_seat(index).ok_or_else(|| {
+                    program(
+                        "serve::feed_ports",
+                        format!("port index {index}, and this load carved fewer"),
+                    )
+                })?;
+                let at = base + offset * seat.row_bytes();
+                match cell {
+                    crate::program::PortCell::Host { bytes: raw, dtype } => {
+                        let landed = port_bytes(raw, *dtype, seat.dtype, bytes).ok_or_else(|| {
+                            program(
+                                "serve::feed_ports",
+                                format!(
+                                    "lane {} feeds a {:?} port of {bytes} bytes with a {:?} cell \
+                                     of {} bytes",
+                                    row.source,
+                                    seat.dtype,
+                                    dtype,
+                                    raw.len()
+                                ),
+                            )
+                        })?;
+                        let _ = store;
+                        self.inputs[arm].write_port(at, &landed)?;
+                    }
+                    #[cfg(feature = "vulkan")]
+                    crate::program::PortCell::Device { cell, dtype } => {
+                        let same = matches!(
+                            (*dtype, seat.dtype),
+                            (eta_ir::types::Dtype::F32, Dtype::F32)
+                                | (eta_ir::types::Dtype::I32, Dtype::I32)
+                        );
+                        if !same || cell.bytes() < bytes {
+                            return Err(program(
+                                "serve::feed_ports",
+                                format!(
+                                    "lane {} feeds a {:?} port of {bytes} bytes off a {:?} device \
+                                     cell of {} bytes; a kept cell lands only at its own element",
+                                    row.source,
+                                    seat.dtype,
+                                    dtype,
+                                    cell.bytes()
+                                ),
+                            ));
+                        }
+                        copies.push((cell, at, bytes));
+                    }
+                }
+            }
+        }
+        Ok(copies)
     }
 
     #[must_use]
@@ -1327,21 +1536,26 @@ impl Shell {
             return Ok(());
         }
         let width = self.out_width as usize;
+        let size = elem(self.readout_dtype) as usize;
         let total: usize = flight.rows.iter().map(|&(_, n)| n as usize).sum();
-        let mut raw = vec![0u8; total * width * 2];
+        let mut raw = vec![0u8; total * width * size];
         self.readout[flight.arm].read(0, &mut raw)?;
 
         let rows: Vec<Vec<f32>> = flight
             .rows
             .iter()
             .map(|&(start, n)| {
-                let from = start as usize * width * 2;
-                raw[from..from + n as usize * width * 2]
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|pair| bf16(u16::from_le_bytes([pair[0], pair[1]])))
-                    .collect()
+                let from = start as usize * width * size;
+                let row = &raw[from..from + n as usize * width * size];
+                if self.readout_dtype == Dtype::F32 {
+                    row.as_chunks::<4>().0.iter().map(|w| f32::from_le_bytes(*w)).collect()
+                } else {
+                    row.as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|pair| bf16(u16::from_le_bytes([pair[0], pair[1]])))
+                        .collect()
+                }
             })
             .collect();
 
@@ -1904,7 +2118,41 @@ impl Shell {
             }
         }
 
-        let (readout_rows, readout_layout) = readout_table(&composition, lanes)?;
+        let (group_of_lane, packings) = if self.feeds.selections.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            let facts: Vec<poem_exec::fire::LaneFacts> = lanes
+                .iter()
+                .map(|seated| poem_exec::fire::LaneFacts {
+                    stream: seated.stream as u8,
+                    group: seated.group,
+                })
+                .collect();
+            let group_of_lane = poem_exec::fire::group_of_lane(composition.lanes(), &facts);
+            let mut packings = Vec::with_capacity(self.feeds.selections.len());
+            for &select in &self.feeds.selections {
+                packings.push(
+                    poem_exec::fire::pack(select, composition.lanes(), &facts, &group_of_lane, rows)
+                        .map_err(|fault| Fault::from(poem_exec::Error::Fire(fault)))?,
+                );
+            }
+            (group_of_lane, packings)
+        };
+        let packing_fires: Vec<crate::inputs::PackingFire<'_>> = packings
+            .iter()
+            .map(|packed| crate::inputs::PackingFire {
+                group_indptr: &packed.group_indptr,
+                lane_indptr: &packed.lane_indptr,
+                reference_tag: &packed.reference_tag,
+                permutation: &packed.permutation,
+            })
+            .collect();
+
+        let (readout_rows, readout_layout) = readout_table(
+            &composition,
+            lanes,
+            self.readout_seam != engine::fire::ReadoutSeam::Logits,
+        )?;
         let bound = self.inputs[arm].write(
             &self.handles,
             &crate::inputs::Fire {
@@ -1928,9 +2176,44 @@ impl Shell {
                     grids: &patch_grids,
                 }),
                 mrope_positions: self.states_mrope.then_some(mrope_positions.as_slice()),
+                group_of_lane: &group_of_lane,
+                packings: &packing_fires,
             },
         )?;
         windows.bind(&self.handles, bound.windows)?;
+        let port_copies = self.feed_ports(arm, &composition, lanes)?;
+        let mut merge_lands: Vec<MergeLand> = Vec::new();
+        for (at_lane, row) in composition.lanes().iter().enumerate() {
+            let seated = &lanes[row.source as usize];
+            for merged in &self.feeds.merged {
+                if !merged.select.holds(row.word) {
+                    continue;
+                }
+                let fed = seated
+                    .ports
+                    .iter()
+                    .any(|(feed, _)| feed.kind == merged.seat.kind && feed.port == merged.seat.port);
+                merge_lands.push(MergeLand {
+                    merge: merged.merge,
+                    seat: merged.seat,
+                    first: if merged.seat.per_lane() {
+                        at_lane as u32
+                    } else {
+                        row.row_offset
+                    },
+                    rows: if merged.seat.per_lane() { 1 } else { row.rows },
+                    port: self
+                        .feeds
+                        .ports
+                        .iter()
+                        .position(|(seat, _)| {
+                            seat.kind == merged.seat.kind && seat.port == merged.seat.port
+                        })
+                        .unwrap_or(usize::MAX),
+                    fed,
+                });
+            }
+        }
 
         let readouts = u64::from(lane_count).max(readout_rows.len() as u64);
         let readouts_ceiling = poem_compiler::arena::readouts_ceiling(&self.budgets.tokens);
@@ -1999,6 +2282,21 @@ impl Shell {
                 mask_stride: bound.mask_stride,
             },
 
+            group_of_lane: bound.group_of_lane,
+            packings: self
+                .feeds
+                .selections
+                .iter()
+                .copied()
+                .zip(bound.packings.iter().copied())
+                .collect(),
+            ports: self
+                .feeds
+                .ports
+                .iter()
+                .zip(&bound.ports)
+                .map(|((seat, _), tensor)| (seat.kind, seat.port, *tensor))
+                .collect(),
             scores: match self.scores.as_ref() {
                 Some(slab) => Some(slab.seat(&self.handles)?),
                 None => None,
@@ -2039,6 +2337,8 @@ impl Shell {
             lanes,
             done,
             feeds,
+            port_copies,
+            merge_lands,
             arm,
             readout_rows,
             readout_layout,
@@ -2076,11 +2376,12 @@ impl Shell {
     fn walk_once(&self, p: &Prepared<'_>, keep: bool, split: bool) -> Result<Walked> {
         let place = At::new();
 
-        let frame = Some(if keep {
+        let mut frame = Some(if keep {
             self.device.frame_kept()?
         } else {
             self.device.frame()?
         });
+        self.land_merges(frame.as_mut().expect("just opened"), p)?;
         let sink = Encoded::Live(Sink::new(
             &self.device,
             frame.as_ref().expect("the walk opened a frame"),
@@ -2158,6 +2459,10 @@ pub struct Prepared<'a> {
     lanes: &'a [Seated<'a>],
     done: Option<Done>,
     feeds: Vec<(u32, &'a Buffer)>,
+    /// Device cells copied into the input ports behind the passes that kept
+    /// them: (cell, offset in the inputs store, bytes).
+    port_copies: Vec<(&'a Buffer, u64, u64)>,
+    merge_lands: Vec<MergeLand>,
 
     arm: usize,
     readout_rows: Vec<i32>,
@@ -2210,7 +2515,11 @@ pub const READOUT_ROWS_PER_LANE: u32 = 8;
 
 type ReadoutTable = (Vec<i32>, Vec<(u32, u32)>);
 
-fn readout_table(composition: &Composition, lanes: &[Seated<'_>]) -> Result<ReadoutTable> {
+fn readout_table(
+    composition: &Composition,
+    lanes: &[Seated<'_>],
+    every_row: bool,
+) -> Result<ReadoutTable> {
     let mut table: Vec<i32> = Vec::with_capacity(lanes.len());
     let mut layout: Vec<(u32, u32)> = vec![(0, 0); lanes.len()];
     for row in composition.lanes() {
@@ -2232,6 +2541,9 @@ fn readout_table(composition: &Composition, lanes: &[Seated<'_>]) -> Result<Read
                 }
                 list.iter().map(|&at| row.row_offset + at).collect()
             }
+            // A velocity or hidden readout is the whole lane's; logits are
+            // its last row's.
+            _ if every_row => (row.row_offset..row.row_offset + row.rows).collect(),
             _ => vec![row.row_offset + row.rows - 1],
         };
         layout[source] = (
@@ -2251,6 +2563,19 @@ fn readout_rows(max_lanes: u32) -> u32 {
     max_lanes
         .saturating_mul(READOUT_ROWS_PER_LANE)
         .max(max_lanes)
+}
+
+/// A port's rows copied into the merged column a guarded `merge` reads, for
+/// one lane; zeros where the lane feeds no channel for the port.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
+struct MergeLand {
+    merge: ValueId,
+    seat: crate::inputs::PortSeat,
+    port: usize,
+    first: u32,
+    rows: u32,
+    fed: bool,
 }
 
 struct Flight {
@@ -2401,7 +2726,7 @@ impl engine::frame::Shell for Shell {
             _ => None,
         };
 
-        let seat_rows = self.readout[prepared.arm].bytes() / (width * 2).max(1);
+        let seat_rows = self.readout[prepared.arm].bytes() / (width * elem(self.readout_dtype)).max(1);
         if prepared.readout_rows.len() as u64 > seat_rows {
             return Err(Fault::Ceiling {
                 what: "readout rows in one step",
@@ -2419,10 +2744,10 @@ impl engine::frame::Shell for Shell {
             };
             frame.copy(
                 self.arena.store(),
-                base + at * width * 2,
+                base + at * width * elem(self.readout_dtype),
                 &self.readout[prepared.arm],
-                cursor * width * 2,
-                width * 2,
+                cursor * width * elem(self.readout_dtype),
+                width * elem(self.readout_dtype),
             )?;
             if let Some((draft_base, seat)) = draft.as_ref() {
                 frame.copy(
@@ -2540,6 +2865,36 @@ impl kernels_vulkan::Encode for Encoded<'_> {
             Encoded::Live(sink) => sink.absent(),
         }
     }
+}
+
+/// A host cell's wire bytes as the port's elements: as they are, or f32 cast
+/// to bf16; `None` when they do not fill the port.
+fn port_bytes(raw: &[u8], from: eta_ir::types::Dtype, to: Dtype, bytes: u64) -> Option<Vec<u8>> {
+    let bytes = usize::try_from(bytes).ok()?;
+    match (from, to) {
+        (eta_ir::types::Dtype::F32, Dtype::Bf16) => {
+            let values = bytes / 2;
+            if raw.len() < values * 4 {
+                return None;
+            }
+            Some(
+                raw.as_chunks::<4>().0[..values]
+                    .iter()
+                    .flat_map(|word| {
+                        let bits = f32::from_le_bytes(*word).to_bits();
+                        let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+                        ((rounded >> 16) as u16).to_le_bytes()
+                    })
+                    .collect(),
+            )
+        }
+        _ if raw.len() >= bytes => Some(raw[..bytes].to_vec()),
+        _ => None,
+    }
+}
+
+fn elem(dtype: Dtype) -> u64 {
+    poem_compiler::arena::elem_bytes(dtype).unwrap_or(2)
 }
 
 fn bf16(bits: u16) -> f32 {

@@ -253,7 +253,12 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         .filter_map(|node| node.layer)
         .max()
         .map_or(0, |top| top + 1);
-    let vocab = u32::try_from(shell.out_width().map_err(fault)?).unwrap_or(u32::MAX);
+    let width = u32::try_from(shell.out_width().map_err(fault)?).unwrap_or(u32::MAX);
+    let seam = shell.readout_seam();
+    let vocab = match seam {
+        engine::fire::ReadoutSeam::Logits => width,
+        _ => 0,
+    };
     Ok(ModelProfile {
         vocab,
         page_size: budgets.page_size,
@@ -271,8 +276,11 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         has_attn_page_mask: false,
 
         has_lora: true,
-        has_velocity: false,
-        velocity_width: 0,
+        has_velocity: seam == engine::fire::ReadoutSeam::Velocity,
+        velocity_width: match seam {
+            engine::fire::ReadoutSeam::Velocity => width,
+            _ => 0,
+        },
         has_pixels: false,
         pixels_width: 0,
         kernels: Vec::new(),
@@ -842,7 +850,12 @@ impl Vulkan {
                     Some(shell.device()),
                     shell
                         .readout_row(landed, attachment.lane)
-                        .map(|(seat, at, width)| crate::guest::run::Readout { seat, at, width }),
+                        .map(|(seat, at, width, dtype)| crate::guest::run::Readout {
+                    seat,
+                    at,
+                    width,
+                    f32: dtype == poem_ir::Dtype::F32,
+                }),
                 ),
                 None => (None, None),
             };
@@ -908,7 +921,12 @@ impl Vulkan {
             let attachment = &step.attachments[0];
             let seat = shell
                 .readout_row(landed, attachment.lane)
-                .map(|(seat, at, width)| crate::guest::run::Readout { seat, at, width });
+                .map(|(seat, at, width, dtype)| crate::guest::run::Readout {
+                    seat,
+                    at,
+                    width,
+                    f32: dtype == poem_ir::Dtype::F32,
+                });
             let done = sink.clone().map(|sink| Done { at, sink });
             programs
                 .fire_deferred(attachment.instance, shell.device(), seat, done)
@@ -1012,6 +1030,34 @@ impl Vulkan {
             }
         }
 
+        // The cells a lane's input ports read, off the instance it is
+        // attached to.
+        let mut port_cells: Vec<Vec<(engine::fire::PortFeed, crate::program::PortCell)>> =
+            vec![Vec::new(); submission.lanes.len()];
+        for (at, lane) in submission.lanes.iter().enumerate() {
+            if lane.ports.is_empty() {
+                continue;
+            }
+            let instance = submission
+                .attachments
+                .iter()
+                .find(|attachment| attachment.lane as usize == at)
+                .map(|attachment| attachment.instance)
+                .ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "lane {at} feeds input ports and has no attachment; a port is read \
+                         through the instance the lane is attached to"
+                    ))
+                })?;
+            for feed in &lane.ports {
+                let cell = self
+                    .programs
+                    .port_cell(instance, feed.channel)
+                    .map_err(refusal)?;
+                port_cells[at].push((*feed, cell));
+            }
+        }
+
         let sink = self.sink.clone();
 
         let mut lane_adapters: Vec<Option<u32>> = vec![None; submission.lanes.len()];
@@ -1080,6 +1126,10 @@ impl Vulkan {
                     feed: feeds[at].as_ref(),
                     #[cfg(not(feature = "vulkan"))]
                     feed: None,
+
+                    stream: lane.stream,
+                    group: lane.group,
+                    ports: &port_cells[at],
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;

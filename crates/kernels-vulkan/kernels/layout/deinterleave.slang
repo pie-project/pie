@@ -38,4 +38,5 @@ void main(uint3 gid : SV_DispatchThreadID) {
 }
 
 // pie:instantiate split_rows_bf16
+// pie:instantiate split_rows_f32 PIE_ACT_F32=1
 // pie:instantiate select_slice_bf16 PIE_SELECT=1

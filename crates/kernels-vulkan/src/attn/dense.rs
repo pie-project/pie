@@ -117,3 +117,70 @@ pub fn bidirectional(
         ],
     )
 }
+
+/// Full attention inside each segment of a packed fire: a query row of
+/// segment `s` attends the rows `kv_indptr[s]..kv_indptr[s + 1]` of the key
+/// and value rectangles. Both CSRs are padded with their last entry, so a
+/// segment past the live ones is empty.
+#[allow(clippy::too_many_arguments)]
+pub fn ragged(
+    ctx: &Ctx<'_>,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_indptr: Tensor,
+    kv_indptr: Tensor,
+    head_dim: u32,
+    kv_heads: u32,
+    sm_scale: f32,
+    o: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.ragged";
+    nonzero(OP, "the head width", head_dim)?;
+    let Some(at) = stamp_for(head_dim) else {
+        return Err(refuse(OP, format!("a {head_dim}-wide head is wider than any stamp")));
+    };
+    let entry = match q.dtype {
+        Dtype::Bf16 => ["ragged_bf16_d_64", "ragged_bf16_d_128", "ragged_bf16_d_256"][at],
+        Dtype::F32 => ["ragged_f32_d_64", "ragged_f32_d_128", "ragged_f32_d_256"][at],
+        other => return Err(Error::DtypeUnsupported { op: OP, dtype: other }),
+    };
+    let q_heads = row_heads(OP, "query", q.width, head_dim)?;
+    let kv_heads = nonzero(OP, "kv heads", kv_heads)?;
+    if k.width != kv_heads * head_dim || v.width != k.width || !q_heads.is_multiple_of(kv_heads) {
+        return Err(refuse(
+            OP,
+            format!(
+                "{q_heads} query heads over a {}-wide key of {kv_heads} x {head_dim}",
+                k.width
+            ),
+        ));
+    }
+    for (what, t) in [("query", q_indptr), ("key", kv_indptr)] {
+        if t.dtype != Dtype::I32 {
+            return Err(refuse(OP, format!("the {what} CSR is {:?}, not i32", t.dtype)));
+        }
+    }
+    let entries = (q_indptr.rows * q_indptr.width).min(kv_indptr.rows * kv_indptr.width);
+    let segments = entries
+        .checked_sub(1)
+        .filter(|s| *s > 0)
+        .ok_or_else(|| refuse(OP, format!("a CSR of {entries} entries names no segment")))?;
+    let rows = nonzero(OP, "query rows", q.rows)?;
+    ctx.fire(
+        Fire::at(FILE, entry).apply(Grid::of([q_heads * THREADS, rows, 1], [THREADS, 1, 1])),
+        &[
+            q.arg(),
+            k.arg(),
+            v.arg(),
+            o.arg_mut(),
+            q_indptr.arg(),
+            kv_indptr.arg(),
+            stated(OP, segments)?.arg(),
+            stated(OP, q_heads)?.arg(),
+            stated(OP, kv_heads)?.arg(),
+            stated(OP, head_dim)?.arg(),
+            sm_scale.arg(),
+        ],
+    )
+}

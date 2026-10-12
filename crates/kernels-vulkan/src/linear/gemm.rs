@@ -4,6 +4,7 @@
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, nonzero, refuse, stated};
 use crate::error::Error;
 use crate::tensor::Tensor;
+use dtype::Dtype;
 
 pub const TILE_M: u32 = 32;
 
@@ -51,6 +52,9 @@ pub fn act_x_wt(
     w: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
+    if act.dtype == Dtype::F32 {
+        return f32_act(ctx, op, act, w, y);
+    }
     dtype_dispatch!(op, act.dtype, { Bf16 => () });
     let (rows, columns, contraction) = extent(op, act, w, y)?;
     if rows == 0 {
@@ -123,4 +127,36 @@ fn tile_grid(op: &'static str, rows: u32, columns: u32) -> Result<Grid, Error> {
         ],
         TILE_GROUP,
     ))
+}
+
+/// An f32 activation against a bf16 or f32 weight, one invocation an output.
+fn f32_act(ctx: &Ctx<'_>, op: &'static str, act: Tensor, w: Tensor, y: Tensor) -> Result<(), Error> {
+    let (rows, columns, contraction) = extent(op, act, w, y)?;
+    if rows == 0 {
+        return Ok(());
+    }
+    let entry = match (w.dtype, y.dtype) {
+        (Dtype::Bf16, Dtype::F32) => "dense_f32_w_bf16",
+        (Dtype::F32, Dtype::F32) => "dense_f32_w_f32",
+        (Dtype::Bf16, Dtype::Bf16) => "dense_f32_w_bf16_y_bf16",
+        (Dtype::F32, Dtype::Bf16) => "dense_f32_w_f32_y_bf16",
+        (weight, out) => {
+            return Err(refuse(
+                op,
+                format!("an f32 activation against a {weight:?} weight into {out:?}"),
+            ));
+        }
+    };
+    ctx.fire(
+        Fire::at("gemm/dense_f32.slang", entry)
+            .apply(Grid::of([columns, rows, 1], [64, 4, 1])),
+        &[
+            act.arg(),
+            w.arg(),
+            y.arg_mut(),
+            stated(op, rows)?.arg(),
+            stated(op, columns)?.arg(),
+            stated(op, contraction)?.arg(),
+        ],
+    )
 }

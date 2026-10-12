@@ -294,7 +294,7 @@ pub fn rmsnorm_gated_by(
 
 pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.residual_add";
-    let entry = dtype_dispatch!(OP, y.dtype, { Bf16 => "residual_add_bf16" });
+    let entry = dtype_dispatch!(OP, y.dtype, { Bf16 => "residual_add_bf16", F32 => "residual_add_f32" });
     let lanes = elementwise(OP, y.width, y.rows)?;
     ctx.fire(
         Fire::at("norm/residual_add.slang", entry).apply(Grid::of(lanes, [FLAT_GROUP, 1, 1])),
@@ -304,7 +304,12 @@ pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
 
 pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.add_bias";
-    let entry = dtype_dispatch!(OP, out.dtype, { Bf16 => "add_bias_bf16" });
+    let entry = match (out.dtype, bias.dtype) {
+        (Dtype::Bf16, Dtype::Bf16) => "add_bias_bf16",
+        (Dtype::F32, Dtype::F32) => "add_bias_f32",
+        (Dtype::F32, Dtype::Bf16) => "add_bias_f32_bf16",
+        (row, bank) => return Err(refuse(OP, format!("a {bank:?} bias on a {row:?} row"))),
+    };
     let lanes = elementwise_rows(OP, out.width, out.rows)?;
     ctx.fire(
         Fire::at("norm/add_bias.slang", entry).apply(Grid::of(lanes, [FLAT_GROUP, 1, 1])),
@@ -376,7 +381,7 @@ pub fn standardize(ctx: &Ctx<'_>, bias: Tensor, scale: Tensor, out: Tensor) -> R
 
 pub fn mul_scalar(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.mul_scalar";
-    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "layer_scalar_mul_stated_bf16" });
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "layer_scalar_mul_stated_bf16", F32 => "layer_scalar_mul_stated_f32" });
     let lanes = elementwise(OP, x.width, x.rows)?;
     ctx.fire(
         Fire::at("norm/layer_scalar.slang", entry).apply(Grid::of(lanes, [FLAT_GROUP, 1, 1])),

@@ -104,6 +104,13 @@ pub struct FireBindings {
     pub rs: Option<std::sync::Arc<crate::rs::Seat>>,
 
     pub scores: Option<crate::scores::ScoreSeat>,
+
+    /// Each lane's attention group, and each selection's packing of the
+    /// fire's rows into groups, in the order the load lists the selections.
+    pub group_of_lane: Option<Tensor>,
+    pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
+    /// The input ports' rectangles, by kind and port.
+    pub ports: Vec<(engine::fire::PortKind, u8, Tensor)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -273,6 +280,10 @@ impl<'c> Run<'c> {
 
     pub(crate) fn at_region(&self) -> u32 {
         self.place.region.get()
+    }
+
+    pub(crate) fn run_index(&self) -> u32 {
+        self.place.run.get()
     }
 
     pub(crate) fn nodes(&self) -> &'c [Node] {
@@ -518,13 +529,45 @@ impl<'c> Run<'c> {
                     )
                 })
             }
+            Def::Input(RuntimeInput::Latents { port, .. }) => {
+                self.port(at, engine::fire::PortKind::Latents, *port)
+            }
+            Def::Input(RuntimeInput::LaneVector { port, .. }) => {
+                self.port(at, engine::fire::PortKind::LaneVector, *port)
+            }
+            Def::Input(RuntimeInput::Context { port, .. }) => {
+                self.port(at, engine::fire::PortKind::Context, *port)
+            }
+            Def::Input(RuntimeInput::AxisPositions { port, .. }) => {
+                self.port(at, engine::fire::PortKind::AxisPositions, *port)
+            }
+            Def::Input(RuntimeInput::RowPermutation { select }) => {
+                self.packing(at, *select).permutation
+            }
+            Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::GroupOfLane,
+                ..
+            }) => self.fire.group_of_lane.unwrap_or_else(|| {
+                panic!("value {at} reads the group-of-lane table, which this load carved none of")
+            }),
+            Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::GroupIndptr { select },
+                ..
+            }) => self.packing(at, *select).group_indptr,
+            Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::LaneIndptr { select },
+                ..
+            }) => self.packing(at, *select).lane_indptr,
+            Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::ReferenceTag { select },
+                ..
+            }) => self.packing(at, *select).reference_tag,
+            Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::RequestOfToken,
+                ..
+            }) if self.fire.geometry.is_empty() => self.fire.tables.request_of_token,
             Def::Input(
-                which @ (RuntimeInput::RowPermutation { .. }
-                | RuntimeInput::Latents { .. }
-                | RuntimeInput::LaneVector { .. }
-                | RuntimeInput::Context { .. }
-                | RuntimeInput::AxisPositions { .. }
-                | RuntimeInput::Grid
+                which @ (RuntimeInput::Grid
                 | RuntimeInput::Voxels { .. }
                 | RuntimeInput::TokenGrid { .. }),
             ) => panic!("value {at} reads {which:?}, which this shell does not stage"),
@@ -581,6 +624,28 @@ impl<'c> Run<'c> {
                  never to a tensor"
             ),
         }
+    }
+
+    fn port(&self, at: usize, kind: engine::fire::PortKind, port: u8) -> Tensor {
+        self.fire
+            .ports
+            .iter()
+            .find(|(k, p, _)| *k == kind && *p == port)
+            .map(|(_, _, tensor)| *tensor)
+            .unwrap_or_else(|| {
+                panic!("value {at} reads the {kind:?} port {port}, which this load carved none of")
+            })
+    }
+
+    fn packing(&self, at: usize, select: poem_ir::Selection) -> crate::inputs::PackingHandles {
+        self.fire
+            .packings
+            .iter()
+            .find(|(held, _)| *held == select)
+            .map(|(_, packing)| *packing)
+            .unwrap_or_else(|| {
+                panic!("value {at} reads a packing of {select:?}, which this fire staged none of")
+            })
     }
 
     pub(crate) fn ragged(&self, id: ValueId) -> RaggedTensor {
