@@ -59,20 +59,21 @@ pub struct Tuned {
     pub seconds: f64,
 }
 
-/// The check models: those `req.check` names among `found`, or the
-/// smallest of `found`.
+/// The check models among the artifacts stamped for `backend`: those
+/// `req.check` names, or the smallest.
 #[cfg(any(
     feature = "cuda",
     feature = "vulkan",
     all(feature = "metal", target_vendor = "apple")
 ))]
 fn pick_models(
-    found: Vec<(std::path::PathBuf, String)>,
+    backend: &str,
     req: &TuneRequest<'_>,
 ) -> Result<Vec<(std::path::PathBuf, String)>, String> {
     if req.no_check {
         return Ok(Vec::new());
     }
+    let found = artifacts(req.artifacts, backend);
     if req.check.is_empty() {
         return Ok(found.into_iter().take(1).collect());
     }
@@ -96,57 +97,95 @@ fn pick_models(
     Ok(picked)
 }
 
-#[cfg(feature = "vulkan")]
-fn tune_vulkan(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
-    use engine_vulkan::tune::{Depth, artifacts, run};
-    let depth = if req.full { Depth::Full } else { Depth::Quick };
-    let models = pick_models(artifacts(req.artifacts), req)?;
-    let out = run(depth, Some(req.profiles), req.cache, req.refit, &models, say)?;
-    Ok(Tuned {
-        device: out.device,
-        file: out.file,
-        lines: out.lines.into_iter().map(|l| (l.id, l.text)).collect(),
-        wrong: out.wrong,
-        checks: out.checks.iter().map(|c| (c.describe(), c.passes())).collect(),
-        changed: out.changed,
-        seconds: out.seconds,
-    })
+/// The `.zt` artifacts under `store` stamped for `backend`, as (path,
+/// deployment), smallest file first.
+#[cfg(any(
+    feature = "cuda",
+    feature = "vulkan",
+    all(feature = "metal", target_vendor = "apple")
+))]
+fn artifacts(store: &Path, backend: &str) -> Vec<(std::path::PathBuf, String)> {
+    let mut out: Vec<(u64, std::path::PathBuf, String)> = Vec::new();
+    let Ok(dirs) = std::fs::read_dir(store) else {
+        return Vec::new();
+    };
+    for dir in dirs.flatten() {
+        let Ok(files) = std::fs::read_dir(dir.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().is_none_or(|e| e != "zt") {
+                continue;
+            }
+            let Some(stamp) = checkpoint::file::serve::stamp_of(&path).ok().flatten() else {
+                continue;
+            };
+            if stamp.backend == backend {
+                let bytes = file.metadata().map_or(u64::MAX, |m| m.len());
+                out.push((bytes, path, stamp.deployment));
+            }
+        }
+    }
+    out.sort_by_key(|(bytes, ..)| *bytes);
+    out.into_iter().map(|(_, p, d)| (p, d)).collect()
 }
+
+/// A backend's tune output as [`Tuned`]: each backend has its own type, with
+/// the same field names.
+#[cfg(any(
+    feature = "cuda",
+    feature = "vulkan",
+    all(feature = "metal", target_vendor = "apple")
+))]
+macro_rules! tuned {
+    ($out:ident, wrong: $wrong:expr) => {
+        Tuned {
+            device: $out.device,
+            file: $out.file,
+            lines: $out.lines.into_iter().map(|l| (l.id, l.text)).collect(),
+            wrong: $wrong,
+            checks: $out
+                .checks
+                .iter()
+                .map(|c| (c.describe(), c.passes()))
+                .collect(),
+            changed: $out.changed,
+            seconds: $out.seconds,
+        }
+    };
+}
+
+/// `pie tune` on a backend that measures a kernel grid at a depth.
+#[cfg(any(feature = "vulkan", all(feature = "metal", target_vendor = "apple")))]
+macro_rules! tune_grid {
+    ($name:ident, $engine:ident, $backend:literal) => {
+        fn $name(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
+            use $engine::tune::{Depth, run};
+            let depth = if req.full { Depth::Full } else { Depth::Quick };
+            let models = pick_models($backend, req)?;
+            let out = run(depth, Some(req.profiles), req.cache, req.refit, &models, say)?;
+            Ok(tuned!(out, wrong: out.wrong))
+        }
+    };
+}
+
+#[cfg(feature = "vulkan")]
+tune_grid!(tune_vulkan, engine_vulkan, "vulkan");
+
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+tune_grid!(tune_metal, engine_metal, "metal");
 
 #[cfg(feature = "cuda")]
 fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
-    let models = pick_models(engine_cuda::tune::artifacts(req.artifacts), req)?;
+    let models = pick_models("cuda", req)?;
     let out = engine_cuda::tune::run(Some(req.profiles), &models, say)?;
-    Ok(Tuned {
-        device: out.device,
-        file: out.file,
-        lines: out.lines.into_iter().map(|l| (l.id, l.text)).collect(),
-        wrong: Vec::new(),
-        checks: out.checks.iter().map(|c| (c.describe(), c.passes())).collect(),
-        changed: out.changed,
-        seconds: out.seconds,
-    })
-}
-
-#[cfg(all(feature = "metal", target_vendor = "apple"))]
-fn tune_metal(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
-    use engine_metal::tune::{Depth, artifacts, run};
-    let depth = if req.full { Depth::Full } else { Depth::Quick };
-    let models = pick_models(artifacts(req.artifacts), req)?;
-    let out = run(depth, Some(req.profiles), req.cache, req.refit, &models, say)?;
-    Ok(Tuned {
-        device: out.device,
-        file: out.file,
-        lines: out.lines.into_iter().map(|l| (l.id, l.text)).collect(),
-        wrong: out.wrong,
-        checks: out.checks.iter().map(|c| (c.describe(), c.passes())).collect(),
-        changed: out.changed,
-        seconds: out.seconds,
-    })
+    Ok(tuned!(out, wrong: Vec::new()))
 }
 
 /// Every backend this build hosts.
 #[must_use]
+#[allow(clippy::vec_init_then_push)]
 pub fn backends() -> Vec<Backend> {
     #[allow(unused_mut)]
     let mut out = Vec::new();

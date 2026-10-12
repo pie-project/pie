@@ -1366,8 +1366,8 @@ mod tests {
     }
 
     fn a_grouped_lanes_first_frame_waits_for_its_cohort() {
-        let mut policy = FramePolicy::new(1, 64, 4096, None)
-            .with_submit_deadline(Duration::from_secs(86_400));
+        let mut policy =
+            FramePolicy::new(1, 64, 4096, None).with_submit_deadline(Duration::from_secs(86_400));
         let owner = pid();
         let (caption, context, image) = (pid(), pid(), pid());
         let now = Instant::now();
@@ -1412,8 +1412,8 @@ mod tests {
 
     fn a_group_composes_on_a_pipeline_that_already_fired_ungrouped() {
         for reuse_first in [false, true] {
-            let mut policy = FramePolicy::new(1, 64, 4096, None)
-                    .with_submit_deadline(Duration::from_millis(50));
+            let mut policy =
+                FramePolicy::new(1, 64, 4096, None).with_submit_deadline(Duration::from_millis(50));
             let owner = pid();
             let (image, context) = (pid(), pid());
             let now = Instant::now();
@@ -1463,8 +1463,7 @@ mod tests {
 
     fn a_stated_cohort_is_never_sealed_short() {
         let leash = Duration::from_millis(50);
-        let mut policy = FramePolicy::new(1, 64, 4096, None)
-            .with_submit_deadline(leash);
+        let mut policy = FramePolicy::new(1, 64, 4096, None).with_submit_deadline(leash);
         let owner = pid();
         let (image, text) = (pid(), pid());
         let now = Instant::now();
@@ -1534,8 +1533,7 @@ mod tests {
 
     fn a_group_never_fires_short_when_the_leash_drops_a_member() {
         let leash = Duration::from_millis(50);
-        let mut policy = FramePolicy::new(1, 64, 4096, None)
-            .with_submit_deadline(leash);
+        let mut policy = FramePolicy::new(1, 64, 4096, None).with_submit_deadline(leash);
         let owner = pid();
         let (image, text) = (pid(), pid());
         let now = Instant::now();
@@ -1562,8 +1560,8 @@ mod tests {
     }
 
     fn a_gathering_cohort_holds_its_own_lanes_and_not_the_fleet() {
-        let mut policy = FramePolicy::new(1, 64, 4096, None)
-            .with_submit_deadline(Duration::from_millis(50));
+        let mut policy =
+            FramePolicy::new(1, 64, 4096, None).with_submit_deadline(Duration::from_millis(50));
         let owner = pid();
         let grouped = pid();
         let stranger = pid();
@@ -1579,8 +1577,8 @@ mod tests {
     }
 
     fn a_group_is_never_split_across_two_partitions() {
-        let mut policy = FramePolicy::new(1, 8, 4096, None)
-            .with_submit_deadline(Duration::from_millis(50));
+        let mut policy =
+            FramePolicy::new(1, 8, 4096, None).with_submit_deadline(Duration::from_millis(50));
         let owner = ProcessId::from_u128(9);
         let stranger = ProcessId::from_u128(1);
         let (image, text) = (ProcessId::from_u128(2), ProcessId::from_u128(3));
@@ -1600,8 +1598,8 @@ mod tests {
     }
 
     fn incomplete_lane_holds_the_seal_until_it_completes() {
-        let mut policy = FramePolicy::new(2, 64, 4096, None)
-            .with_submit_deadline(Duration::from_secs(86_400));
+        let mut policy =
+            FramePolicy::new(2, 64, 4096, None).with_submit_deadline(Duration::from_secs(86_400));
         let (fast, slow) = (pid(), pid());
         policy.on_fire_enqueued(stamp(fast, 0, 0, 2), Some(fast), 1, 1, 1, None);
         policy.on_fire_enqueued(stamp(fast, 0, 1, 2), Some(fast), 2, 1, 1, None);
