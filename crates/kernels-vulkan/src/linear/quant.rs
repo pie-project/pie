@@ -140,7 +140,9 @@ fn qmv1_name(group: i32, bits: i32, lanes: u32, rows: u32) -> &'static str {
     if lanes == 32 && rows == 1 {
         symbol(&format!("affine_qmv1_bf16_gs_{group}_b_{bits}"))
     } else {
-        symbol(&format!("affine_qmv1_bf16_gs_{group}_b_{bits}_l{lanes}_r{rows}"))
+        symbol(&format!(
+            "affine_qmv1_bf16_gs_{group}_b_{bits}_l{lanes}_r{rows}"
+        ))
     }
 }
 
