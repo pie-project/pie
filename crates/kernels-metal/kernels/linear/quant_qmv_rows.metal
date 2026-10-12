@@ -225,14 +225,27 @@ METAL_FUNC void qmv_rows_impl(
 // unroll_count(4) and a simdgroup_barrier(mem_none) both make it correct.
 // The p=1 rungs (R in {2,3}) trip fewer than 4 times, so unroll_count(4)
 // still fully unrolls them: that hot path is byte-for-byte unchanged.
+        if (packs_per_thread > 1) {
+          // At p=2 the accumulators outnumber what the Metal compiler keeps
+          // straight once this loop unrolls at all: leave it rolled.
+#pragma clang loop unroll(disable)
+          for (int r = 0; r < R; r++) {
+            U sum = load_vector<T, U, values_per_thread, bits>(xb + roff[r], x_thread);
+            for (int row = 0; row < results_per_simdgroup; row++) {
+              result[row][r] += qdot_staged<U, values_per_thread, bits, packs_per_thread>(
+                  pack[row], x_thread, s[row], b[row], sum);
+            }
+          }
+        } else {
 #pragma clang loop unroll_count(4)
-      for (int r = 0; r < R; r++) {
-        U sum = load_vector<T, U, values_per_thread, bits>(xb + roff[r], x_thread);
-        for (int row = 0; row < results_per_simdgroup; row++) {
-          result[row][r] += qdot_staged<U, values_per_thread, bits, packs_per_thread>(
-              pack[row], x_thread, s[row], b[row], sum);
+          for (int r = 0; r < R; r++) {
+            U sum = load_vector<T, U, values_per_thread, bits>(xb + roff[r], x_thread);
+            for (int row = 0; row < results_per_simdgroup; row++) {
+              result[row][r] += qdot_staged<U, values_per_thread, bits, packs_per_thread>(
+                  pack[row], x_thread, s[row], b[row], sum);
+            }
+          }
         }
-      }
       }
     }
     ws += block_size * bytes_per_pack / pack_factor;
