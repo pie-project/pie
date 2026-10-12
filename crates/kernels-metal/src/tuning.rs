@@ -179,15 +179,6 @@ pub struct SdpaMppRows {
     pub paired_below: u32,
 }
 
-impl SdpaMppRows {
-    /// The registry defaults, for paths that run without a profile.
-    pub const DEFAULT: SdpaMppRows = SdpaMppRows {
-        from: 32,
-        direct_from: 512,
-        paired_below: 32,
-    };
-}
-
 /// How many slices the split paged-attention kernel aims for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.split", constant(set(8, 16, 32)), default = 32, tune = search)]
@@ -387,11 +378,6 @@ impl Tuning {
             per_expert: i64::from(pairs / experts),
         };
         self.profile.pick::<MoeTileRows>(&at).0
-    }
-
-    /// Every row tile this profile can sort into, for sizing the stack.
-    pub fn moe_tiles(&self) -> impl Iterator<Item = u32> + '_ {
-        self.profile.ladder::<MoeTileRows>().values().map(|t| t.0)
     }
 
     #[must_use]

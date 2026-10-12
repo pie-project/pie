@@ -23,10 +23,9 @@ pub(super) fn mpp_fits(
     lse: bool,
     rows: SdpaMppRows,
 ) -> bool {
-    let SdpaMppRows { from, .. } = rows;
     causal
         && !lse
-        && q.rows >= from
+        && q.rows >= rows.from
         && matches!(dim, 128 | 256)
         && pool.page_size == 32
         && pool.keys.dtype == Dtype::Bf16

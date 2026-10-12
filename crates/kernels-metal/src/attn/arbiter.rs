@@ -144,6 +144,7 @@ fn arbitrate(
             sm_scale,
             o,
             lse,
+            tuning,
         );
     }
     if tuning.sdpa_mpp()
@@ -178,19 +179,7 @@ fn arbitrate(
         );
     }
     tiled(
-        ctx,
-        op,
-        q,
-        pool,
-        plan,
-        mask,
-        window,
-        causal,
-        head_dim,
-        sm_scale,
-        o,
-        lse,
-        tuning.sdpa_mpp(),
+        ctx, op, q, pool, plan, mask, window, causal, head_dim, sm_scale, o, lse, tuning,
     )
 }
 

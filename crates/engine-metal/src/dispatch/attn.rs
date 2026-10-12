@@ -136,6 +136,7 @@ impl Run<'_> {
                 o,
             } => attn::decode(
                 self.ctx(),
+                self.tuning(),
                 self.tensor(*q),
                 self.decode_plan(*plan),
                 self.pool(*cache),
@@ -295,6 +296,7 @@ impl Run<'_> {
                 lse,
             } => attn::decode_lse(
                 self.ctx(),
+                self.tuning(),
                 self.tensor(*q),
                 self.decode_plan(*plan),
                 self.pool(*cache),

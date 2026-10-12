@@ -300,8 +300,18 @@ fn decode_over(
     };
     let ot = Tensor::new(ho, rows as u32, (Q_HEADS * head_dim) as u32, Dtype::Bf16);
     rig.fire(|s| {
-        attn::decode(s, qt, plan, pool, None, head_dim as u32, sm_scale, ot)
-            .expect("decode launch");
+        attn::decode(
+            s,
+            &engine_metal::chip::tuning("", false),
+            qt,
+            plan,
+            pool,
+            None,
+            head_dim as u32,
+            sm_scale,
+            ot,
+        )
+        .expect("decode launch");
     });
     bf16_floats(&rig.handles.read(ho, obytes).expect("read out"))
 }
