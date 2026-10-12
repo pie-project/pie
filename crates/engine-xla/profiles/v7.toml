@@ -1,0 +1,8 @@
+# TPU v7 Ironwood ("TPU7x" to PJRT): what every TPU of generation 7 runs.
+api = 1
+
+[target]
+assumes = { generation = 7 }
+
+[provenance]
+source = "the registry defaults, measured on v6e; nothing measured on v7, whose VMEM and HBM sized limits scale from its facts"

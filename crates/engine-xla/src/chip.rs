@@ -14,9 +14,11 @@ pub const FACTS: &[Var] = &[
     Var::fixed("mxu", Domain::COUNT),
 ];
 
-/// One TPU generation's sizes, per chip (one PJRT device).
+/// One TPU generation's sizes, per PJRT device: a chip, or on v7 one of
+/// its two chiplets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tpu {
+    /// 0 for a kind pie does not know, which no family file assumes.
     pub generation: u32,
     pub hbm_gib: u32,
     pub vmem_mib: u32,
@@ -24,13 +26,28 @@ pub struct Tpu {
 }
 
 impl Tpu {
-    /// What the defaults were measured on, and what an unknown kind is
-    /// taken for.
+    /// What the defaults were measured on.
     pub const V6E: Tpu = Tpu {
         generation: 6,
         hbm_gib: 32,
         vmem_mib: 128,
         mxu: 256,
+    };
+
+    /// Ironwood ("TPU7x" to PJRT), one device per chiplet: half the chip's
+    /// 192 GiB, and JAX's `tpu_info` VMEM and MXU figures.
+    pub const V7: Tpu = Tpu {
+        generation: 7,
+        hbm_gib: 96,
+        vmem_mib: 64,
+        mxu: 256,
+    };
+
+    /// A kind pie does not know: no family applies, and the sizes are a
+    /// v6e's.
+    pub const UNKNOWN: Tpu = Tpu {
+        generation: 0,
+        ..Tpu::V6E
     };
 
     /// The TPU PJRT names `kind`. The v4 and v5p VMEM sizes are unmeasured
@@ -42,6 +59,8 @@ impl Tpu {
         let k = k.trim();
         if k.starts_with("tpu v6") {
             Tpu::V6E
+        } else if k == "tpu7x" || k == "tpu7" {
+            Tpu::V7
         } else if k.starts_with("tpu v5 lite") || k.starts_with("tpu v5e") {
             Tpu {
                 generation: 5,
@@ -64,8 +83,13 @@ impl Tpu {
                 mxu: 128,
             }
         } else {
-            Tpu::V6E
+            Tpu::UNKNOWN
         }
+    }
+
+    #[must_use]
+    pub fn known(&self) -> bool {
+        self.generation > 0
     }
 
     #[must_use]
@@ -255,7 +279,7 @@ macro_rules! seeded {
     };
 }
 
-seeded!("v6e.toml");
+seeded!("v6e.toml", "v7.toml");
 
 pub static SHELF: Shelf = Shelf {
     backend: "xla",
@@ -310,14 +334,42 @@ mod tests {
             compiler_profile(&profile),
             poem_compiler::DeviceProfile::default()
         );
-        let (_, report) = resolve("TPU v5 lite", None);
-        assert_eq!(report.used, profile::Source::Defaults);
     }
 
     #[test]
-    fn an_unknown_kind_is_taken_for_a_v6e_and_sizes_scale_with_the_chip() {
-        assert_eq!(Tpu::of("TPU v9 ultra"), Tpu::V6E);
-        assert_eq!(Tpu::of(""), Tpu::V6E);
+    fn a_kind_names_its_family_and_its_sizes() {
+        for (kind, tpu, family) in [
+            ("TPU v6 lite", Tpu::V6E, Some("v6e.toml")),
+            ("TPU v6e", Tpu::V6E, Some("v6e.toml")),
+            ("TPU7x", Tpu::V7, Some("v7.toml")),
+            ("TPU v5 lite", Tpu::of("TPU v5e"), None),
+            ("TPU v5p", Tpu::of("TPU v5"), None),
+            ("TPU v9 ultra", Tpu::UNKNOWN, None),
+            ("", Tpu::UNKNOWN, None),
+        ] {
+            assert_eq!(Tpu::of(kind), tpu, "{kind}");
+            let (_, report) = resolve(kind, None);
+            let used = family.map_or(profile::Source::Defaults, |f| {
+                profile::Source::Seeded(f.into())
+            });
+            assert_eq!(report.used, used, "{kind}");
+            assert_eq!(report.untuned(), kind != "TPU v6 lite" && kind != "TPU v6e");
+        }
+        assert_eq!(
+            Tpu::of("TPU7x"),
+            Tpu {
+                generation: 7,
+                hbm_gib: 96,
+                vmem_mib: 64,
+                mxu: 256,
+            }
+        );
+        assert!(!Tpu::of("TPU v9 ultra").known());
+        assert_eq!(Tpu::of("TPU v9 ultra").vmem_bytes(), Tpu::V6E.vmem_bytes());
+    }
+
+    #[test]
+    fn sizes_scale_with_the_chip() {
         assert_eq!(Tpu::V6E.headroom(), 2 << 30);
         assert_eq!(Tpu::of("TPU v5 lite").headroom(), 1 << 30);
         assert!(!Tpu::V6E.fp8_native());
@@ -326,6 +378,22 @@ mod tests {
             ..kernels_xla::tuning::Tuning::DEFAULT
         };
         assert!(v4.vmem_cap() < 16 << 20, "a v4 never asks past its VMEM");
+
+        let v7 = Tpu::V7;
+        assert!(v7.fp8_native());
+        assert_eq!(v7.headroom(), 6 << 30);
+        assert_eq!(v7.hbm_bytes() / 8 * 5, 60 << 30, "the dry prescale bound");
+        let (profile, _) = resolve("TPU7x", None);
+        let tuning = kernels_xla::tuning::Tuning::on(&profile, v7.vmem_bytes());
+        assert_eq!(
+            tuning,
+            kernels_xla::tuning::Tuning {
+                vmem_bytes: 64 << 20,
+                ..kernels_xla::tuning::Tuning::DEFAULT
+            }
+        );
+        assert_eq!(tuning.vmem_cap(), 55 << 20);
+        assert_eq!(tuning.decode_round_bytes(), 16 << 20);
     }
 
     #[test]
