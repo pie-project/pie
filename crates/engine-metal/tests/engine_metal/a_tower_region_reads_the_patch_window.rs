@@ -2,7 +2,7 @@ use engine_metal::window::{Copies, Windows};
 use poem_compiler::{
     Budget, Budgets, CompiledModel, DeviceProfile, PatchLadder, RowAxis, compile_axes,
 };
-use poem_exec::fire::{FireDescriptor, Lane, compose_axes};
+use poem_exec::fire::{Lane, compose_axes};
 use poem_exec::store::arena::rect;
 use poem_ir::ops::Elementwise;
 use poem_ir::{
