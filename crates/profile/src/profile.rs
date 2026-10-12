@@ -171,6 +171,8 @@ struct Entry {
     rungs: Vec<Rung>,
     typed: Box<dyn Any + Send + Sync>,
     defaulted: bool,
+    /// Raised when the decision is evaluated at a point.
+    read: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct Inner {
@@ -261,6 +263,7 @@ impl Profile {
         if !matches!(entry.spec.shape, crate::spec::Shape::Flag) || !entry.spec.vars.is_empty() {
             return None;
         }
+        entry.read.store(true, std::sync::atomic::Ordering::Relaxed);
         Some(!entry.rungs.is_empty())
     }
 
@@ -268,6 +271,19 @@ impl Profile {
     #[must_use]
     pub fn get<T: Decision<At = Anywhere>>(&self) -> &T {
         self.pick::<T>(&Anywhere)
+    }
+
+    /// The decisions a load has asked anything of so far: evaluated a
+    /// ladder at a point, or read a flag by id. A decision a model never
+    /// reads cannot change how that model serves.
+    #[must_use]
+    pub fn read(&self) -> Vec<&'static str> {
+        self.0
+            .entries
+            .iter()
+            .filter(|(_, e)| e.read.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// Every decision with its untyped rungs, in id order.
@@ -324,7 +340,7 @@ impl Registry {
             .into_iter()
             .map(|(id, (rungs, defaulted))| {
                 let reg = self.registered(id).expect("complete walks the registry");
-                let typed = (reg.build)(&rungs);
+                let (typed, read) = (reg.build)(&rungs);
                 (
                     id,
                     Entry {
@@ -332,6 +348,7 @@ impl Registry {
                         rungs,
                         typed,
                         defaulted,
+                        read,
                     },
                 )
             })
@@ -385,13 +402,35 @@ impl Registry {
         target: crate::registry::Target,
         source: Source,
     ) -> Result<Profile, crate::registry::Refusal> {
-        let over = self.parse(&format!("api = 1\n{overrides}"), "tuned decisions", Strict::User)?;
+        // What the overrides may require is what the target assumes.
+        let mut head = String::from("api = 1\n");
+        if !target.assumes.is_empty() {
+            let assumed: Vec<String> = target
+                .assumes
+                .iter()
+                .map(|&(i, c)| {
+                    let f = &self.facts[i];
+                    let v = match f.domain {
+                        Domain::Enum(_) => format!("\"{}\"", f.domain.render(c)),
+                        _ => f.domain.render(c),
+                    };
+                    format!("{} = {v}", f.name)
+                })
+                .collect();
+            head.push_str(&format!("[target]\nassumes = {{ {} }}\n", assumed.join(", ")));
+        }
         let mut entries: BTreeMap<&'static str, Vec<Rung>> = base
             .0
             .entries
             .iter()
             .map(|(id, e)| (*id, e.rungs.clone()))
             .collect();
+        let over = self.parse_over(
+            &format!("{head}{overrides}"),
+            "tuned decisions",
+            Strict::User,
+            Some(&entries),
+        )?;
         for (id, rungs) in over.entries {
             entries.insert(id, rungs);
         }

@@ -147,7 +147,9 @@ fn rung_toml(spec: &Spec, rung: &Rung, bare_ok: bool) -> String {
     }
 }
 
-fn value_toml(spec: &Spec, rungs: &[Rung]) -> String {
+/// A decision's rungs as the TOML value of its key.
+#[must_use]
+pub fn value_toml(spec: &Spec, rungs: &[Rung]) -> String {
     if let Shape::Flag = spec.shape {
         return match rungs.first() {
             None => "false".to_string(),

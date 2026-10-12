@@ -19,7 +19,8 @@ pub const API: i64 = 1;
 /// Top-level keys that are not decisions.
 const RESERVED: [&str; 3] = ["api", "target", "provenance"];
 
-type Build = fn(&[Rung]) -> Box<dyn Any + Send + Sync>;
+/// A typed ladder, and the flag it raises when evaluated at a point.
+type Build = fn(&[Rung]) -> (Box<dyn Any + Send + Sync>, std::sync::Arc<std::sync::atomic::AtomicBool>);
 
 pub(crate) struct Registered {
     pub(crate) spec: &'static Spec,
@@ -154,7 +155,11 @@ impl Registry {
             spec.id,
             Registered {
                 spec,
-                build: |rungs| Box::new(Ladder::<T>::of(rungs)),
+                build: |rungs| {
+                    let ladder = Ladder::<T>::of(rungs);
+                    let read = ladder.read_flag();
+                    (Box::new(ladder), read)
+                },
                 default: rungs,
                 default_text: default.to_string(),
             },
@@ -304,7 +309,21 @@ impl Registry {
 
     /// Read `text` as a profile. `origin` names it in diagnostics.
     pub fn parse(&self, text: &str, origin: &str, strict: Strict) -> Result<File, Refusal> {
+        self.parse_over(text, origin, strict, None)
+    }
+
+    /// [`Registry::parse`] for a file laid over `under`: a decision the file
+    /// leaves out is `under`'s, not the registry default, when a rule such
+    /// as `consistent_with` looks at it.
+    pub(crate) fn parse_over(
+        &self,
+        text: &str,
+        origin: &str,
+        strict: Strict,
+        under: Option<&BTreeMap<&'static str, Vec<Rung>>>,
+    ) -> Result<File, Refusal> {
         let mut walk = Walk::new(self, text, origin, strict);
+        walk.under = under;
         let refuse = |diagnostics| Refusal {
             origin: origin.to_string(),
             diagnostics,
@@ -481,6 +500,8 @@ struct Walk<'a> {
     defaulted: Vec<String>,
     /// Where each entry was spelled, for lints that point at it.
     spans: BTreeMap<&'static str, usize>,
+    /// What a decision the file leaves out holds, when not the default.
+    under: Option<&'a BTreeMap<&'static str, Vec<Rung>>>,
 }
 
 impl<'a> Walk<'a> {
@@ -492,6 +513,7 @@ impl<'a> Walk<'a> {
             diags: Vec::new(),
             defaulted: Vec::new(),
             spans: BTreeMap::new(),
+            under: None,
         }
     }
 
@@ -1078,7 +1100,11 @@ impl<'a> Walk<'a> {
                 let Ok((other_id, other_alt)) = parse_consistent(rule) else {
                     continue;
                 };
-                let other_has = match file.entries.get(other_id) {
+                let other_has = match file
+                    .entries
+                    .get(other_id)
+                    .or_else(|| self.under.and_then(|u| u.get(other_id)))
+                {
                     Some(rungs) => {
                         let other = self.reg.spec(other_id);
                         rungs.iter().any(|r| {

@@ -1,5 +1,8 @@
 //! Rungs, ladders, and the trait a decision's Rust type implements.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::region::Region;
 use crate::spec::{Spec, Value};
 use crate::when::When;
@@ -62,6 +65,9 @@ pub trait Decision: Sized + Clone + Send + Sync + 'static {
 #[derive(Clone, Debug)]
 pub struct Ladder<T> {
     rungs: Vec<(Region, T)>,
+    /// Raised the first time the ladder is evaluated at a point: whether a
+    /// load ever asked this decision anything (`Profile::read`).
+    read: Arc<AtomicBool>,
 }
 
 impl<T: Decision> Ladder<T> {
@@ -72,6 +78,17 @@ impl<T: Decision> Ladder<T> {
                 .iter()
                 .map(|r| (r.region.clone(), T::build(&r.pick)))
                 .collect(),
+            read: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn read_flag(&self) -> Arc<AtomicBool> {
+        self.read.clone()
+    }
+
+    fn mark(&self) {
+        if !self.read.load(Ordering::Relaxed) {
+            self.read.store(true, Ordering::Relaxed);
         }
     }
 
@@ -79,6 +96,7 @@ impl<T: Decision> Ladder<T> {
     /// A checked choice or constant ladder always answers.
     #[must_use]
     pub fn at(&self, at: &T::At) -> Option<&T> {
+        self.mark();
         let n = T::spec().vars.len();
         self.rungs
             .iter()
@@ -96,6 +114,7 @@ impl<T: Decision> Ladder<T> {
     /// order: for code that tries each until one can run (a runtime
     /// condition, such as scratch room, can still turn one down).
     pub fn candidates<'a>(&'a self, at: &'a T::At) -> impl Iterator<Item = &'a T> + 'a {
+        self.mark();
         let n = T::spec().vars.len();
         self.rungs
             .iter()
