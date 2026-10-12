@@ -394,7 +394,9 @@ jobs:
       # The device tests: kernels-cuda's compile only under its cuda feature,
       # and engine-cuda's skip on a machine without a card. The ignored ones
       # need imported artifacts and golden dumps this pod does not hold.
-      - run: cargo test --no-fail-fast -p engine-cuda -p kernels-cuda --features engine-cuda/cuda,kernels-cuda/cuda
+      # One test at a time, as when each was its own binary: a few toggle an
+      # engine knob through the environment, and they share one card.
+      - run: cargo test --no-fail-fast -p engine-cuda -p kernels-cuda --features engine-cuda/cuda,kernels-cuda/cuda -- --test-threads=1
       - run: bash scripts/ci/cuda-e2e.sh
       - name: no CUDA shared library is linked
         run: |
