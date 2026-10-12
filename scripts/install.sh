@@ -3,10 +3,10 @@
 #
 #   curl -fsSL https://pie-project.org/install.sh | bash
 #   curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=cuda13.0 bash
-#   curl -fsSL https://pie-project.org/install.sh | PIE_VERSION=0.5.4 bash
+#   curl -fsSL https://pie-project.org/install.sh | PIE_VERSION=0.5.2 bash
 #
 # Environment overrides:
-#   PIE_VERSION       Release tag (default: 0.5.4).
+#   PIE_VERSION       Release tag (default: the latest release).
 #   PIE_FLAVOR        metal|wgpu (macOS arm64) | cuda13.0|vulkan|wgpu (Linux, WSL included). Auto-detected when unset.
 #   PIE_INSTALL_DIR   Install location for the `pie` binary (default: ~/.local/bin).
 #   PIE_HOME          Where the Python and JavaScript support goes (default: ~/.pie).
@@ -16,10 +16,16 @@
 set -euo pipefail
 
 PIE_REPO="${PIE_REPO:-pie-project/pie}"
-PIE_VERSION="${PIE_VERSION:-0.5.4}"
+# Unset, the latest release: GitHub redirects `releases/latest/download/` to
+# it, so no tag is written here to go stale ahead of a release.
+PIE_VERSION="${PIE_VERSION:-latest}"
 PIE_INSTALL_DIR="${PIE_INSTALL_DIR:-${HOME}/.local/bin}"
 PIE_HOME="${PIE_HOME:-${HOME}/.pie}"
-PIE_DOWNLOAD_BASE="${PIE_DOWNLOAD_BASE:-https://github.com/${PIE_REPO}/releases/download/${PIE_VERSION}}"
+if [ "$PIE_VERSION" = latest ]; then
+  PIE_DOWNLOAD_BASE="${PIE_DOWNLOAD_BASE:-https://github.com/${PIE_REPO}/releases/latest/download}"
+else
+  PIE_DOWNLOAD_BASE="${PIE_DOWNLOAD_BASE:-https://github.com/${PIE_REPO}/releases/download/${PIE_VERSION}}"
+fi
 PIE_DETECTED_FLAVOR=""
 PIE_FLAVOR_REASON=""
 
