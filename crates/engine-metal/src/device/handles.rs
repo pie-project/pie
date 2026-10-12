@@ -88,8 +88,18 @@ impl Handles {
         #[cfg(target_vendor = "apple")]
         {
             let mut out = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
-            use objc2_metal::MTLBuffer as _;
+            use objc2_metal::{MTLBuffer as _, MTLResource as _};
             let have = binding.slab().length() as u64;
+            // A private buffer has no host mapping: reading it is a fault,
+            // not a copy from a null address.
+            if binding.slab().storageMode() == objc2_metal::MTLStorageMode::Private {
+                return Err(Fault::Device {
+                    call: "Handles::read",
+                    why: "the handle names a GPU-private buffer, which the host cannot read; \
+                          read the pool through its store"
+                        .to_string(),
+                });
+            }
             if binding.offset().saturating_add(len) > have {
                 return Err(Fault::Ceiling {
                     what: "bytes read off one handle",
