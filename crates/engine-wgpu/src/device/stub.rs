@@ -34,11 +34,11 @@ pub struct Handed {
 }
 
 impl Context {
-    pub fn bind(_boot: &DeviceBoot) -> Result<Context> {
+    pub fn bind(_boot: &DeviceBoot, _share: f64) -> Result<Context> {
         Err(Fault::Deviceless)
     }
 
-    pub fn adopt(_boot: &DeviceBoot, handed: Handed) -> Result<Context> {
+    pub fn adopt(_boot: &DeviceBoot, _share: f64, handed: Handed) -> Result<Context> {
         match handed.never {}
     }
 

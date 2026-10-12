@@ -12,7 +12,7 @@
   const finish = (status) => window.__pie_done?.(status);
   const params = new URLSearchParams(location.search);
   const model = params.get("model") ?? "models/tiny.wgpu.zt";
-  const config = { max_total_pages: 512, max_forward_tokens: 1024, max_forward_requests: 8, max_state_slots: 16 };
+  const config = { device_kv_budget: "256MiB", max_forward_tokens: 1024, max_forward_requests: 8, max_state_slots: 16 };
 
   try {
     // What `import "@pie-project/language-python"` does.

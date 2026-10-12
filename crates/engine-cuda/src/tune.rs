@@ -56,7 +56,8 @@ fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, St
         page_size: 16,
         context: CONTEXT,
         slots,
-        pages: slots * CONTEXT / 16,
+        kv_budget: None,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         ordinal: 0,
         knobs: crate::Knobs {
             chip: Some(chip.clone()),

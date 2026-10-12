@@ -157,7 +157,8 @@ fn every_probe_is_dumped() {
         page_size: 16,
         context,
         slots: 4,
-        pages: 4 * context / 16,
+        kv_budget: None,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         ordinal: 0,
         knobs: Knobs {
             chip: Some(engine_cuda::chip::pinned(Graphs::Off, None)),

@@ -451,6 +451,11 @@ struct Input {
     /// Announce `ready` and wait for the harness's `start` before the clock.
     #[serde(default)]
     wait_for_start: bool,
+    /// Send `t0` when the prefill's token is in hand, the harness's
+    /// first-token stamp (`text-completion-bench`'s envelope): without it a
+    /// speculative row has a latency but no TTFT, so no decode rate.
+    #[serde(default)]
+    report_timing: bool,
     #[serde(default = "default_max_tokens")]
     max_tokens: usize,
     /// Decode one token a fire instead — the same sequence by a different
@@ -1291,6 +1296,10 @@ async fn main(input: Input) -> Result<Output> {
         });
         fwd.submit(&pipe).context("prefill submit")?;
         anchor = next.take_host::<Vec<i32>>().await.context("prefill readback")?[0];
+    }
+
+    if input.report_timing {
+        session::send("t0");
     }
 
     // ── THE LOOP ────────────────────────────────────────────────────────

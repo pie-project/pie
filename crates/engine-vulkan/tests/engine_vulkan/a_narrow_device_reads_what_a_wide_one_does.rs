@@ -20,10 +20,13 @@ fn artifact() -> Option<(PathBuf, String)> {
 }
 
 fn bind(index: u32) -> Option<Context> {
-    Context::bind(&DeviceBoot {
-        device_index: index,
-        ..DeviceBoot::default()
-    })
+    Context::bind(
+        &DeviceBoot {
+            device_index: index,
+            ..DeviceBoot::default()
+        },
+        engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+    )
     .ok()
 }
 
@@ -68,7 +71,6 @@ fn serve(index: u32, artifact: &Path, deployment: &str, kernel: Option<&str>) ->
         page_size: 16,
         context: CONTEXT,
         slots: 1,
-        pages: CONTEXT / 16,
         runahead: engine::runahead::Runahead::F1,
         device: &boot,
         residency: engine::load::Residency::default(),

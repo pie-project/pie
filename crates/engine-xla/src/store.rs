@@ -228,7 +228,9 @@ pub fn window_of(trace: &Trace) -> Result<Option<u32>> {
         .max())
 }
 
-/// Bytes the pools of `trace` take at `paging`, sink page and slot included.
+/// Bytes the pools of `trace` take at `paging`, sink page and slot included:
+/// what [`Pools::reserve`] lands there, compressor and recurrent-verb
+/// planes too.
 pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
     let mut total = 0u64;
     for row in &trace.caches {
@@ -258,7 +260,20 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
             }
         };
     }
+    let cells = plane_pages(paging, false) * u64::from(paging.page_size);
+    for (_, width) in compressor_spaces(trace) {
+        // Its `[kv, score]` pair, both bf16.
+        total += 2 * cells * width * 2;
+    }
+    if let Some(layout) = crate::rs::Layout::read(trace)? {
+        total += rs_rows(paging) * layout.token_bytes;
+    }
     Ok(total)
+}
+
+/// The rows of a recurrent-verb buffer plane: a page of rows per slot.
+fn rs_rows(paging: Paging) -> u64 {
+    u64::from(paging.slots.max(1)) * u64::from(paging.page_size.max(1))
 }
 
 impl Pools {
@@ -274,7 +289,6 @@ impl Pools {
         let mut roots = Vec::with_capacity(trace.caches.len());
         let mut shapes = Vec::with_capacity(trace.caches.len());
         let mut compressor = Vec::new();
-        let mut bytes = 0u64;
         let cells =
             u32::try_from((paging.pages() + 1) * u64::from(paging.page_size)).map_err(|_| {
                 Fault::Ceiling {
@@ -329,7 +343,6 @@ impl Pools {
                         width: narrow(split.keys),
                     });
                     let mut row_roots = vec![keys];
-                    bytes += u64::from(cells) * split.keys * elem_bytes(name, *dtype)?;
                     if !shared {
                         row_planes.push(device.zeros_or_dry(
                             *dtype,
@@ -345,7 +358,6 @@ impl Pools {
                             rows: cells,
                             width: narrow(split.values),
                         }));
-                        bytes += u64::from(cells) * split.values * elem_bytes(name, *dtype)?;
                     }
                     planes.push(row_planes);
                     roots.push(row_roots);
@@ -357,9 +369,7 @@ impl Pools {
                         windowed,
                     });
                 }
-                CacheRow::State {
-                    name, slab, dtype, ..
-                } => {
+                CacheRow::State { slab, dtype, .. } => {
                     let stride: u64 = slab.iter().product();
                     let dtype = state_dtype(*dtype);
                     let slots = paging.slots + 1;
@@ -373,7 +383,6 @@ impl Pools {
                         rows: slots,
                         width: narrow(stride),
                     })]);
-                    bytes += stride * u64::from(slots) * elem_bytes(name, dtype)?;
                     shapes.push(Shape::State { stride, dtype });
                 }
             }
@@ -390,7 +399,6 @@ impl Pools {
                     rows: cells,
                     width: narrow(width),
                 }));
-                bytes += u64::from(cells) * width * 2;
             }
             planes.push(bufs);
             roots.push(pair.clone());
@@ -398,7 +406,7 @@ impl Pools {
         }
         let mut rs_buffers = Vec::new();
         if let Some(layout) = rs {
-            let rows = paging.slots.max(1) * paging.page_size.max(1);
+            let rows = narrow(rs_rows(paging));
             for plane in &layout.planes {
                 let row = planes.len() as u32;
                 planes.push(vec![device.zeros_or_dry(plane.dtype, rows, plane.width)?]);
@@ -410,7 +418,6 @@ impl Pools {
                 });
                 roots.push(vec![t]);
                 rs_buffers.push(t);
-                bytes += u64::from(rows) * plane.row_bytes;
             }
         }
         Ok(Pools {
@@ -421,7 +428,7 @@ impl Pools {
             rs_buffers,
             paging,
             watermark: engine::frame::Demand::ZERO,
-            bytes,
+            bytes: pool_demand(trace, paging)?,
         })
     }
 

@@ -101,11 +101,11 @@ fn a_fitted_pool_is_pledged_what_it_declared() {
         page_size: PAGE,
         context: CONTEXT,
         slots: 256,
-        pages: 256 * CONTEXT / PAGE,
+        kv_budget: None,
+        memory_share: FRACTION,
         ordinal: 0,
         knobs: Knobs {
             chip: Some(engine_cuda::chip::pinned(engine_cuda::Graphs::Off, None)),
-            gpu_mem_utilization: FRACTION,
             ..Knobs::default()
         },
         cache_dir: None,

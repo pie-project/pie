@@ -76,7 +76,6 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         page_size: 16,
         context: CONTEXT,
         slots,
-        pages: slots * CONTEXT / 16,
         runahead: engine::runahead::Runahead::F1,
         device: &boot,
         residency: engine::load::Residency::default(),
@@ -260,8 +259,11 @@ fn measure(
     grid: &qmm::Grid,
     say: &mut dyn FnMut(&str),
 ) -> Result<qmm::Measured, String> {
-    let device = crate::device::Context::bind(&crate::api::DeviceBoot::default())
-        .map_err(|e| e.to_string())?;
+    let device = crate::device::Context::bind(
+        &crate::api::DeviceBoot::default(),
+        engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+    )
+    .map_err(|e| e.to_string())?;
     qmm::measure(&device, base, grid, say)
 }
 

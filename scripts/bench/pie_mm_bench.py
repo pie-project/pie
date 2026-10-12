@@ -77,9 +77,7 @@ def build_config(args: argparse.Namespace, port: int):
     else:
         max_concurrent = None if args.concurrency == 0 else args.concurrency
 
-    engine_options = {
-        "gpu_mem_utilization": args.gpu_mem_util,
-    }
+    engine_options = {}
     requested_scheduler_kwargs = {
         "default_token_limit": args.default_token_limit,
         "default_endowment_pages": args.endowment_pages,
@@ -111,6 +109,7 @@ def build_config(args: argparse.Namespace, port: int):
         model=ModelConfig(
             name="default",
             hf_repo=args.model,
+            device_memory_share=args.gpu_mem_util,
             engine=EngineConfig(
                 type=args.engine,
                 device=device,
@@ -127,7 +126,7 @@ def build_config(args: argparse.Namespace, port: int):
         "image": args.image,
         "engine": args.engine,
         "endowment_pages": args.endowment_pages,
-        "gpu_mem_utilization": args.gpu_mem_util,
+        "device_memory_share": args.gpu_mem_util,
         "max_concurrent_processes": max_concurrent,
         "temperature": args.temperature,
         "top_p": args.top_p,

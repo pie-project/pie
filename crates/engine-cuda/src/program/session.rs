@@ -206,17 +206,6 @@ impl Session {
         }
     }
 
-    #[cfg(any(test, feature = "probe"))]
-    pub fn skew_prediction(&mut self, channel: u32, head: i64, tail: i64) {
-        let shift = |counter: &mut u64, by: i64| {
-            *counter = counter.saturating_add_signed(by);
-        };
-        if let Some(cursor) = self.cursors.get_mut(channel as usize) {
-            shift(&mut cursor.head, head);
-            shift(&mut cursor.tail, tail);
-        }
-    }
-
     #[must_use]
     pub fn commit_word(&self) -> u64 {
         self.commit.device()

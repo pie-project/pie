@@ -21,10 +21,14 @@ if str(BENCH) not in sys.path:
 import pie_bench  # noqa: E402
 
 
-def _engine_table(argv: list[str]) -> dict:
+def _table(argv: list[str], name: str) -> dict:
     args = pie_bench.build_parser().parse_args(argv)
     cfg, _ = pie_bench.build_config(args)
-    return tomllib.loads(cfg.to_toml())["engine"]
+    return tomllib.loads(cfg.to_toml())[name]
+
+
+def _engine_table(argv: list[str]) -> dict:
+    return _table(argv, "engine")
 
 
 def _tput(snapshot: Path, engine: str, *extra: str) -> list[str]:
@@ -64,4 +68,6 @@ def test_the_context_rides_beside_the_other_engine_knobs(tmp_path):
     )
     assert engine["max_model_len"] == 16384
     assert engine["max_forward_requests"] == 64
-    assert engine["gpu_mem_utilization"] == 0.9
+    assert _table(
+        _tput(tmp_path, "cuda_native", "--max-model-len", "16384"), "model"
+    )["device_memory_share"] == 0.9

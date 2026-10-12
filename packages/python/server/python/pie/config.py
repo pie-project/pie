@@ -78,6 +78,11 @@ class ModelConfig:
     # Sizes with a unit ("20GiB"); omit for uncapped.
     device_weight_budget: Optional[str] = None
     host_weight_budget: Optional[str] = None
+    # Device bytes for the kv pages and state slots ("20GiB"); omit to fill
+    # what device_memory_share leaves past the weights.
+    device_kv_budget: Optional[str] = None
+    # The share of the device's memory the load may take; omit for 0.9.
+    device_memory_share: Optional[float] = None
     # Pinned host bytes for suspended kv; omit for one device kv pool, "0B" for off.
     host_kv_budget: Optional[str] = None
     # Disk bytes suspended kv spills to once host is full; "0B"/omitted is off.
@@ -116,7 +121,8 @@ class Config:
         m = self.model
         model: dict = {"name": m.name, "model": m.hf_repo}
         for name in ("precision", "kv", "drafter", "weight_dtype", "device_weight_budget", "host_weight_budget",
-                     "host_kv_budget", "disk_kv_budget", "disk_kv_path"):
+                     "device_kv_budget", "device_memory_share", "host_kv_budget", "disk_kv_budget",
+                     "disk_kv_path"):
             put(model, name, getattr(m, name))
         if m.off:
             model["off"] = list(m.off)

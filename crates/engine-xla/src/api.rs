@@ -43,7 +43,7 @@ use crate::serve::{Boot, Lane, Seated, Shell};
 
 pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, String>;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceBoot {
     /// The PJRT plugin; `None` finds one (`PIE_XLA_PLUGIN`,
     /// `TPU_LIBRARY_PATH`, then `libtpu.so`).
@@ -51,9 +51,6 @@ pub struct DeviceBoot {
 
     /// Which addressable device of the plugin's client.
     pub ordinal: u32,
-
-    /// The fraction of device memory this engine plans against.
-    pub mem_utilization: f64,
 
     /// `$PIE_HOME/profiles`, where a user's TPU profiles live.
     pub profiles: Option<PathBuf>,
@@ -71,7 +68,6 @@ impl Default for DeviceBoot {
         DeviceBoot {
             plugin: None,
             ordinal: 0,
-            mem_utilization: crate::boot::DEFAULT_MEM_UTILIZATION,
             profiles: None,
             prewarm: false,
             window_pool: true,
@@ -362,7 +358,7 @@ impl Engine for Xla {
             trace,
             checkpoint,
             budgets,
-            residency: _,
+            residency,
             ordinal,
             frames_in_flight: _,
         } = request;
@@ -393,7 +389,8 @@ impl Engine for Xla {
                 page_size: budgets.page_size,
                 context: budgets.max_context,
                 slots: budgets.slots,
-                pages: budgets.pages,
+                kv_budget: residency.device_kv_budget,
+                memory_share: residency.device_memory_share,
                 device: &boot,
             },
             voxels,

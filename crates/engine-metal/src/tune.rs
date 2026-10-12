@@ -487,9 +487,9 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         page_size: 16,
         context: CONTEXT,
         slots,
-        pages: slots * CONTEXT / 16,
+        kv_budget: None,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         runahead: engine::runahead::Runahead::F1,
-        gpu_mem_utilization: crate::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
         profiles: Some(dir.clone()),
         residency: crate::ResidencyPlan::default(),
     })

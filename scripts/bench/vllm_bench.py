@@ -639,10 +639,10 @@ def main() -> None:
             "--num-gpu-blocks-override",
             type=int,
             default=0,
-            help="Exact KV block count. Paired with --block-size 16 this is "
-                 "the token-for-token match to pie's `total_pages` engine "
-                 "option, so both engines can be sized by the same budget "
-                 "instead of by a calibrated memory fraction.",
+            help="Exact KV block count, the counterpart of pie's `[model] "
+                 "device_kv_budget` in blocks, so both engines can be sized "
+                 "by the same budget instead of by a calibrated memory "
+                 "fraction.",
         )
         sp.add_argument(
             "--block-size",

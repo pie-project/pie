@@ -783,12 +783,6 @@ impl Bodies {
         }
     }
 
-    pub fn body_drop(&mut self, key: &BodyKey) -> bool {
-        let dropped = self.map.drop_body(key);
-        self.body_refuse(key.clone());
-        dropped
-    }
-
     pub fn body_armed(&mut self, key: &BodyKey) -> bool {
         let armed = self.map.pin(key);
         if armed {
@@ -815,11 +809,6 @@ impl Bodies {
 
     pub fn seal_bodies(&mut self) {
         self.map.seal();
-    }
-
-    #[must_use]
-    pub fn bodies_sealed(&self) -> bool {
-        self.map.sealed()
     }
 
     #[must_use]
@@ -1158,12 +1147,6 @@ impl BodyMap {
 
     fn refuse(&mut self, key: BodyKey) -> bool {
         self.bodies_refused.insert(key)
-    }
-
-    fn drop_body(&mut self, key: &BodyKey) -> bool {
-        self.body_order.retain(|held| held != key);
-        self.body_warm.remove(key);
-        self.bodies.remove(key).is_some()
     }
 
     fn sealed(&self) -> bool {

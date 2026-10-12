@@ -155,8 +155,8 @@ mod tests {
         assert_eq!(to_file_path("model.engine.device"), "engine.device");
         assert_eq!(to_file_path("model.weight_dtype"), "model.weight_dtype");
         assert_eq!(
-            to_file_path("model.engine.options.gpu_mem_utilization"),
-            "engine.gpu_mem_utilization"
+            to_file_path("model.engine.options.max_forward_tokens"),
+            "engine.max_forward_tokens"
         );
         assert_eq!(to_file_path("telemetry.enabled"), "server.telemetry");
         assert_eq!(to_file_path("offload.enabled"), "cluster.offload");

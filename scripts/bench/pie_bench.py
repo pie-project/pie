@@ -254,9 +254,7 @@ def build_config(args: argparse.Namespace):
     device = [d.strip() for d in args.device.split(",")] if "," in args.device else [args.device]
     engine_options: dict[str, Any]
     if args.engine == "cuda_native":
-        engine_options = {
-            "gpu_mem_utilization": args.gpu_mem_util,
-        }
+        engine_options = {}
         # Eight `engine_options` writes STOOD HERE (`memory_profile`,
         # `kv_cache_dtype`, `runtime_quant`, `mxfp4_moe`,
         # `stream_routed_experts`, `mtp_assistant_snapshot_dir`,
@@ -264,16 +262,10 @@ def build_config(args: argparse.Namespace):
         # keys is retired in the worker's config, which refuses unknown
         # options BY NAME -- so each write produced a config the server
         # would not boot. The flags went with the writes.
-        # `gpu_mem_utilization` sizes only the memory planner's *logical* KV
-        # budget; the runtime is free to exceed it, so it cannot create KV
-        # pressure. `max_total_pages` is the one binding cap, and
+        # The kv pool is `[model] device_kv_budget` (bytes) or what
+        # `device_memory_share` leaves; both ride on the ModelConfig below.
         # `swap_pool_size` is what arms the suspend/restore rung (it defaults
-        # to 0, i.e. off). The knob is named `max_total_pages` here and
-        # `total_pages` on Metal because they are not the same quantity: there
-        # the value IS the pool, here it is a ceiling over a number derived
-        # from `gpu_mem_utilization` (crates/worker/src/config.rs).
-        if getattr(args, "total_pages", 0):
-            engine_options["max_total_pages"] = args.total_pages
+        # to 0, i.e. off).
         # Pin the forward layout only on explicit request: an unasked-for pin
         # collapses the planner's lattice to a guess. Needed when the planner
         # reports "no viable crates/poem-compiler/KV layout fits budget", which a large
@@ -308,10 +300,9 @@ def build_config(args: argparse.Namespace):
         # page past it.
         engine_options["max_model_len"] = args.max_model_len
     elif args.engine == "metal":
-        # Apple Silicon. The Metal engine sizes its own heap from the
-        # checkpoint and exposes no memory-fraction knob, so the CUDA-shaped
-        # `gpu_mem_utilization` has nowhere to go; the batching caps are the
-        # only tunables it reads.
+        # Apple Silicon: the pool is sized from `[model] device_kv_budget` /
+        # `device_memory_share` as on CUDA; the batching caps are the engine
+        # tunables it reads.
         engine_options = {}
         # `stream_routed_experts` / `expert_slab_bytes` writes STOOD HERE;
         # both keys retired from `MetalEngineOptions` (the residency lever is
@@ -320,8 +311,6 @@ def build_config(args: argparse.Namespace):
             engine_options["max_forward_tokens"] = args.max_forward_tokens
         if getattr(args, "max_forward_requests", 0):
             engine_options["max_forward_requests"] = args.max_forward_requests
-        if getattr(args, "total_pages", 0):
-            engine_options["total_pages"] = args.total_pages
         # `--engine-option KEY=VALUE`, handed to the Metal options as typed
         # (`max_state_slots`, ...), as the cuda arm does.
         for raw in getattr(args, "engine_option", []) or []:
@@ -342,9 +331,9 @@ def build_config(args: argparse.Namespace):
         # `--max-model-len` is the cross-engine context knob (llama.cpp takes
         # it as `--ctx-size`, vLLM as `max_model_len`), ONE REQUEST's context
         # on every engine — the Metal engine included: its fleet is derived
-        # as `total_pages * page_size / max_model_len` lanes, so a value
-        # multiplied by the fleet (which this once did) hands an 8-way run
-        # one lane. Size `--total-pages` to `fleet * max_model_len / 16`.
+        # from the pool over `max_model_len`, so a value multiplied by the
+        # fleet (which this once did) hands an 8-way run one lane. Size
+        # `--device-kv-budget` to hold `fleet` sequences of it.
         engine_options["max_model_len"] = args.max_model_len
         # A recurrent model's state pool is sized by `max_state_slots` (default
         # 256 seats: ~30 GiB of delta state for a qwen3.8-class trunk).
@@ -532,6 +521,8 @@ def build_config(args: argparse.Namespace):
             # derives them from the working set when unset.
             device_weight_budget=getattr(args, "device_weight_budget", None),
             host_weight_budget=getattr(args, "host_weight_budget", None),
+            device_kv_budget=getattr(args, "device_kv_budget", None),
+            device_memory_share=args.gpu_mem_util,
             engine=EngineConfig(
                 type=args.engine,
                 device=device,
@@ -1501,16 +1492,14 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument(
             "--kv-pages", type=int, default=2048,
             help="DEAD for cuda_native: never reaches engine_options, so it "
-                 "silently does nothing. Use --total-pages to cap KV.",
+                 "silently does nothing. Use --device-kv-budget to cap KV.",
         )
         sp.add_argument(
-            "--total-pages",
-            type=int,
-            default=0,
-            help="HARD cap on resident KV pages (cuda_native engine option). "
-                 "0 leaves the engine to derive its own budget. This is the "
-                 "only knob that actually bounds KV residency — --gpu-mem-util "
-                 "sizes the planner's logical budget only.",
+            "--device-kv-budget",
+            default=None,
+            help="[model] device_kv_budget: device bytes for the kv pages and "
+                 "state slots, with a unit (\"8GiB\"). Omit to fill what "
+                 "--gpu-mem-util ([model] device_memory_share) leaves.",
         )
         sp.add_argument(
             "--swap-pool-size",

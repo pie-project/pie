@@ -90,7 +90,8 @@ fn ready(what: &str) -> Option<Shell> {
         page_size: PAGE,
         context: 512,
         slots: 8,
-        pages: 8 * 512 / PAGE,
+        kv_budget: None,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         ordinal: 0,
         knobs: engine_cuda::Knobs {
             chip: Some(engine_cuda::chip::pinned(engine_cuda::Graphs::Off, None)),

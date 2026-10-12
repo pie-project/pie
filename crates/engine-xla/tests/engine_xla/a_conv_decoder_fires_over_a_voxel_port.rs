@@ -406,6 +406,7 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
     drop(source);
 
     let max_voxels: u32 = BOXES.iter().map(|b| voxels(*b) as u32).sum::<u32>() + 8;
+    let kv_budget = crate::common::kv_budget(&trace, 64, 4, 16);
     let mut shell = Shell::load_with(
         Boot {
             trace,
@@ -416,7 +417,8 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
             page_size: 16,
             context: 64,
             slots: 4,
-            pages: 16,
+            kv_budget,
+            memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
             device: &DeviceBoot::default(),
         },
         Some(VoxelLadder::new(max_voxels, 4)),
@@ -670,6 +672,7 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
         b.build()
     };
     drop(source);
+    let kv_budget = crate::common::kv_budget(&trace, 64, 4, 16);
     let mut shell = Shell::load_with(
         Boot {
             trace,
@@ -680,7 +683,8 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
             page_size: 16,
             context: 64,
             slots: 4,
-            pages: 16,
+            kv_budget,
+            memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
             device: &DeviceBoot::default(),
         },
         Some(VoxelLadder::new(256, 4)),

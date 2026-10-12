@@ -62,10 +62,10 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
                         help="Comma-separated parts to leave unloaded (e.g. vision)")
     parser.add_argument("--drafter", default=None,
                         help="Drafter to serve with (mtp, dflash, ...; none to serve without)")
-    parser.add_argument("--max-total-pages", type=int, default=None,
-                        help="[model.engine.options] total_pages: cap the KV page pool "
-                             "(a dsv4 page carries every layer's index-key and compressor "
-                             "caches, so the derived pool can outrun the device)")
+    parser.add_argument("--device-kv-budget", default=None,
+                        help="[model] device_kv_budget, e.g. 4GiB: the device bytes of the "
+                             "kv pool (a dsv4 page carries every layer's index-key and "
+                             "compressor caches, so a filled pool can outrun the device)")
     parser.add_argument("--engine-option", action="append", default=[],
                         metavar="KEY=VALUE",
                         help="one `[model.engine.options]` entry, repeatable (e.g. "
@@ -388,8 +388,6 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
         engine_subsection["spec_ngram_num_drafts"] = args.spec_num_drafts
     if args.graphs is not None:
         engine_subsection["graphs"] = args.graphs
-    if args.max_total_pages is not None:
-        engine_subsection["total_pages"] = args.max_total_pages
     for entry in args.engine_option:
         key, _, value = entry.partition("=")
         typed: object = value
@@ -410,6 +408,7 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
             off=[p for p in (args.off or "").split(",") if p],
             drafter=args.drafter,
             device_weight_budget=args.device_weight_budget,
+            device_kv_budget=args.device_kv_budget,
             # `kv_pages` retired from the schema (6d3189654): the worker
             # refuses the key by name, so the flag is not forwarded.
             engine=EngineConfig(

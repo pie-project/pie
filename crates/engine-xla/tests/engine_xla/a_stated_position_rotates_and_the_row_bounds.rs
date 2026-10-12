@@ -41,6 +41,7 @@ fn a_prompt_stated_ahead_of_its_rows_reads_what_it_reads_at_them() {
 
     let context = 256;
     let _device = engine_xla::bench::lock_device();
+    let kv_budget = common::kv_budget(&trace, context, 2, 2 * context / 16);
     let mut shell = Shell::load(Boot {
         trace,
         contract: &m.contract,
@@ -49,7 +50,8 @@ fn a_prompt_stated_ahead_of_its_rows_reads_what_it_reads_at_them() {
         page_size: 16,
         context,
         slots: 2,
-        pages: 2 * context / 16,
+        kv_budget,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         device: &DeviceBoot::default(),
         patches: m
             .deployment

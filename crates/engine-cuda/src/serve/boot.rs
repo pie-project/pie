@@ -61,27 +61,14 @@ impl Recording {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Knobs {
-    pub gpu_mem_utilization: f64,
     pub diagnostics: Diagnostics,
     pub nccl_transport: crate::comm::Transport,
     /// The user's profile directory; `None` reads only the checked-in ones.
     pub profiles: Option<std::path::PathBuf>,
     /// A profile used as is instead of resolving one (`chip::pinned`).
     pub chip: Option<profile::Profile>,
-}
-
-impl Default for Knobs {
-    fn default() -> Knobs {
-        Knobs {
-            gpu_mem_utilization: DEFAULT_GPU_MEM_UTILIZATION,
-            diagnostics: Diagnostics::default(),
-            nccl_transport: crate::comm::Transport::default(),
-            profiles: None,
-            chip: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -91,8 +78,6 @@ pub enum Golden {
     Eager,
     Body,
 }
-
-pub const DEFAULT_GPU_MEM_UTILIZATION: f64 = 0.90;
 
 pub const DEFAULT_BODIES_MEGABYTES: u32 = 4096;
 
@@ -106,7 +91,12 @@ pub struct Boot<'a> {
     pub page_size: u32,
     pub context: u32,
     pub slots: u32,
-    pub pages: u32,
+    /// `[model] device_kv_budget`: the bytes the cache rows take; `None`
+    /// fills what `memory_share` leaves.
+    pub kv_budget: Option<u64>,
+    /// `[model] device_memory_share`: the share of the card this load may
+    /// hold, less what was in use when it began.
+    pub memory_share: f64,
     pub ordinal: i32,
     pub knobs: Knobs,
     pub cache_dir: Option<&'a Path>,

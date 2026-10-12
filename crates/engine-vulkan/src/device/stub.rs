@@ -33,7 +33,7 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn bind(_boot: &DeviceBoot) -> Result<Context> {
+    pub fn bind(_boot: &DeviceBoot, _share: f64) -> Result<Context> {
         Err(Fault::Deviceless)
     }
 

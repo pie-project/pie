@@ -325,7 +325,7 @@ jobs:
           # on one core: they open side by side.
           node tests/browser/tools/headless.mjs . --timeout 900000 \
             "tests/browser/transport.html?n=20&model=models/tiny.wgpu.zt" \
-            "tests/browser/index.html?auto&max_tokens=4&model=models/tiny.wgpu.zt&config=max_total_pages%20%3D%20512,max_forward_tokens%20%3D%201024,max_forward_requests%20%3D%208,max_state_slots%20%3D%2016" \
+            "tests/browser/index.html?auto&max_tokens=4&model=models/tiny.wgpu.zt&config=device_kv_budget%20%3D%20%22256MiB%22,max_forward_tokens%20%3D%201024,max_forward_requests%20%3D%208,max_state_slots%20%3D%2016" \
             "tests/browser/server.html?model=models/tiny.wgpu.zt"
         env:
           PIE_CHROME_ARGS: --use-webgpu-adapter=swiftshader --enable-unsafe-swiftshader

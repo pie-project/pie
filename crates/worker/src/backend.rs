@@ -64,7 +64,6 @@ pub use engine::Capabilities as EngineCapabilities;
 
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn metal_geometry_is_stated(opts: &MetalEngineOptions) -> Result<()> {
-    // `total_pages` may be 0: the pool is then fitted to the device.
     for (key, value) in [
         ("max_forward_tokens", opts.max_forward_tokens),
         ("max_forward_requests", opts.max_forward_requests),
@@ -98,7 +97,6 @@ fn cuda_budgets(
         .filter(|&len| len > 0)
         .unwrap_or_else(|| engine::Budgets::default().max_context)
         .max(page_size);
-    let pages_per_slot = max_context.div_ceil(page_size).max(1);
     engine::Budgets {
         max_lanes: opts.max_forward_requests.unwrap_or(256).max(1),
         max_tokens: opts.max_forward_tokens.unwrap_or(8192).max(1),
@@ -107,10 +105,6 @@ fn cuda_budgets(
         page_size,
         max_context,
         slots: opts.max_state_slots.unwrap_or(256).max(1),
-        pages: opts
-            .max_total_pages
-            .unwrap_or_else(|| pages_per_slot.saturating_mul(256))
-            .max(1),
         max_patches: patch_ceilings.0,
         max_images: patch_ceilings.1,
         max_voxels: voxel_ceilings.0,
@@ -126,7 +120,6 @@ fn device_boot(
     adapter_dir: Option<&Path>,
 ) -> Result<DeviceBoot> {
     let mut knobs = Knobs {
-        gpu_mem_utilization: opts.gpu_mem_utilization,
         profiles: Some(home.join("profiles")),
         ..Knobs::default()
     };
@@ -381,10 +374,7 @@ pub(crate) fn create_engine_backend(
         }
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         EngineOptions::Metal(opts) => {
-            let mut boot_doc = format!(
-                "[metal]\ngpu_mem_utilization = {:?}\n",
-                opts.gpu_mem_utilization
-            );
+            let mut boot_doc = "[metal]\n".to_string();
             if let Some(words) = opts.diagnostics.as_deref() {
                 boot_doc.push_str(&format!(
                     "diagnostics = {}\n",
@@ -420,7 +410,6 @@ pub(crate) fn create_engine_backend(
                     page_size,
                     max_context,
                     slots: opts.max_state_slots.unwrap_or(256).max(1),
-                    pages: opts.total_pages,
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
                     max_voxels: None,
@@ -432,8 +421,8 @@ pub(crate) fn create_engine_backend(
         #[cfg(feature = "vulkan")]
         EngineOptions::Vulkan(opts) => {
             let mut boot_doc = format!(
-                "[vulkan]\ndevice_index = {}\ngpu_mem_utilization = {:?}\nvalidation = {}\n",
-                opts.device_index, opts.gpu_mem_utilization, opts.validation
+                "[vulkan]\ndevice_index = {}\nvalidation = {}\n",
+                opts.device_index, opts.validation
             );
             // Pipelines build in seconds on a phone; they persist under
             // the engine cache unless the config names another file.
@@ -461,7 +450,6 @@ pub(crate) fn create_engine_backend(
                     page_size: defaults.page_size,
                     max_context: opts.max_model_len.unwrap_or(defaults.max_context),
                     slots: opts.max_state_slots.unwrap_or(256).max(1),
-                    pages: opts.max_total_pages.unwrap_or(defaults.pages).max(1),
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
                     max_voxels: None,
@@ -473,9 +461,8 @@ pub(crate) fn create_engine_backend(
         #[cfg(feature = "wgpu")]
         EngineOptions::Wgpu(opts) => {
             let mut boot_doc = format!(
-                "[wgpu]\nadapter_index = {}\ngpu_mem_utilization = {:?}\npower_preference = {}\n",
+                "[wgpu]\nadapter_index = {}\npower_preference = {}\n",
                 opts.adapter_index,
-                opts.gpu_mem_utilization,
                 toml::Value::String(opts.power_preference.clone()),
             );
             if let Some(backends) = &opts.backends {
@@ -512,7 +499,6 @@ pub(crate) fn create_engine_backend(
                     page_size: defaults.page_size,
                     max_context: opts.max_model_len.unwrap_or(defaults.max_context),
                     slots: opts.max_state_slots.unwrap_or(256).max(1),
-                    pages: opts.max_total_pages.unwrap_or(defaults.pages).max(1),
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
                     max_voxels: None,
@@ -524,9 +510,8 @@ pub(crate) fn create_engine_backend(
         #[cfg(feature = "xla")]
         EngineOptions::Xla(opts) => {
             let mut boot_doc = format!(
-                "[xla]\ndevice = {}\nmem_utilization = {:?}\nprewarm = {}\nprofiles = {}\n",
+                "[xla]\ndevice = {}\nprewarm = {}\nprofiles = {}\n",
                 opts.device_index,
-                opts.mem_utilization,
                 opts.prewarm,
                 toml::Value::String(home.join("profiles").display().to_string()),
             );
@@ -555,7 +540,6 @@ pub(crate) fn create_engine_backend(
                         .unwrap_or(defaults.max_context)
                         .max(defaults.page_size),
                     slots: opts.max_state_slots.unwrap_or(256).max(1),
-                    pages: opts.max_total_pages.unwrap_or(defaults.pages).max(1),
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
                     max_voxels: None,
@@ -624,19 +608,12 @@ mod tests {
     fn the_pool_budget_seats_by_state_slots_not_pages() {
         let mut opts = CudaNativeEngineOptions {
             kv_page_size: Some(16),
-            max_total_pages: Some(1024),
             ..Default::default()
         };
         let budgets = cuda_budgets(&opts, 0, (None, None), (None, None));
         assert_eq!(budgets.page_size, 16);
         assert_eq!(budgets.max_context, 4096);
         assert_eq!(budgets.slots, 256);
-        assert_eq!(budgets.pages, 1024);
-        opts.max_total_pages = None;
-        assert_eq!(
-            cuda_budgets(&opts, 0, (None, None), (None, None)).pages,
-            65536
-        );
 
         opts.max_state_slots = Some(4);
         assert_eq!(cuda_budgets(&opts, 0, (None, None), (None, None)).slots, 4);

@@ -201,7 +201,8 @@ pub fn load(trace: Trace, contract: &ModelContract, checkpoint: &Path, max_voxel
         page_size: 16,
         context: 64,
         slots: 2,
-        pages: 4,
+        kv_budget: None,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         ordinal: 0,
         knobs: Knobs {
             chip: Some(engine_cuda::chip::pinned(Graphs::Off, Some(Recording::Off))),
