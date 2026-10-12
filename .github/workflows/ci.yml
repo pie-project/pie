@@ -92,13 +92,12 @@ jobs:
       - name: cargo build (all targets)
         run: cargo build --workspace --all-targets --exclude pie-server-py --exclude pie-server-node --exclude engine-cuda
       # nextest runs the test binaries side by side, where `cargo test` runs
-      # them one after another; most hold one test. worker's binary-facing
-      # tests need an engine feature; its library tests do not. inferlet holds
-      # the workspace's one doctest.
+      # them one after another. It tests the package set the build above
+      # built, so it links what is already compiled rather than unifying
+      # features anew. inferlet holds the workspace's one doctest.
       - name: cargo test
         run: |
-          cargo nextest run --workspace --exclude pie-server-py --exclude pie-server-node --exclude worker --exclude engine-cuda --no-fail-fast
-          cargo nextest run -p worker --lib
+          cargo nextest run --workspace --exclude pie-server-py --exclude pie-server-node --exclude engine-cuda --no-fail-fast
           cargo test --doc -p inferlet
       # The C library from C: its header compiles warning-free, its version
       # matches the library's, and a refused boot reports why.
