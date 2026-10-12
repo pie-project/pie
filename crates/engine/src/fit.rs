@@ -168,9 +168,24 @@ pub fn pool_within(
     (fit >= one_slot).then_some((fit, slots))
 }
 
+pub fn pool_for(
+    budget: Option<u64>,
+    slots: u32,
+    one_slot: u64,
+    room: u64,
+    bytes_at: impl Fn(u64, u32) -> u64,
+) -> Result<(u64, u32), Short> {
+    let slots = match budget {
+        Some(_) => slots,
+        None => pool_within(PAGE_CEILING, slots, one_slot, room, &bytes_at)
+            .map_or(least_state_slots(1).min(slots), |(_, slots)| slots),
+    };
+    pages_for(budget, room, one_slot, |pages| bytes_at(pages, slots)).map(|pages| (pages, slots))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Short, pages_for, pool_within};
+    use super::{Short, pages_for, pool_for, pool_within};
 
     #[test]
     fn a_budget_buys_its_pages_and_none_fills_the_room() {
@@ -228,5 +243,40 @@ mod tests {
         let (pages, slots) = pool_within(65536, 256, 256, 2048 * PAGE, bytes_at).unwrap();
         assert!(slots < 256 && pages >= 256 && bytes_at(pages, slots) <= 2048 * PAGE);
         assert_eq!(pool_within(65536, 3, 256, 255 * PAGE, bytes_at), None);
+    }
+
+    #[test]
+    fn a_hybrid_gives_up_slots_before_one_sequence() {
+        const PAGE: u64 = 1 << 20;
+        const SLOT: u64 = 150 << 20;
+        let bytes_at = |pages: u64, slots: u32| pages * PAGE + u64::from(slots) * SLOT;
+        let room = 75_000 * PAGE;
+        let (pages, slots) = pool_for(None, 1024, 256, room, bytes_at).unwrap();
+        assert!(
+            (3..1024).contains(&slots),
+            "the slots are cut to the room: {slots}"
+        );
+        assert!(pages >= 256 && bytes_at(pages, slots) <= room);
+        assert_eq!(
+            pool_for(None, 16, 256, room, bytes_at).map(|(_, slots)| slots),
+            Ok(16),
+            "slots that fit are kept"
+        );
+        assert_eq!(
+            pool_for(Some(room), 1024, 256, room, bytes_at),
+            Err(Short::Sequence {
+                budget: room,
+                least: bytes_at(256, 1024)
+            }),
+            "a stated budget seats the asked slots or is refused"
+        );
+        assert_eq!(
+            pool_for(None, 1024, 256, 256 * PAGE, bytes_at),
+            Err(Short::Room {
+                room: 256 * PAGE,
+                least: bytes_at(256, 3)
+            }),
+            "a refusal states the least the pool takes, not the asked slots"
+        );
     }
 }

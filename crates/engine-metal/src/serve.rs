@@ -552,9 +552,11 @@ impl Shell {
         // scratch and the driver's floor are placed. A stated `kv_budget` is
         // its bytes; none takes all of the room.
         let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
-        let paging_at = |pages: u64| Paging::of(boot.page_size, boot.context, boot.slots, pages);
-        let demand =
-            crate::store::PoolDemand::of(&boot.trace, paging_at(1)?, rs_layout.as_deref())?;
+        let paging_at =
+            |pages: u64, slots: u32| Paging::of(boot.page_size, boot.context, slots, pages);
+        let demand_at = |slots: u32| {
+            crate::store::PoolDemand::of(&boot.trace, paging_at(1, slots)?, rs_layout.as_deref())
+        };
         let accounting = |pool: u64| {
             crate::store::accounting::Accounting::with_scratch(
                 device.working_set(),
@@ -565,14 +567,16 @@ impl Shell {
                 pool,
             )
         };
-        let pages = engine::fit::pages_for(
+        let (pages, slots) = engine::fit::pool_for(
             boot.kv_budget,
+            boot.slots,
+            u64::from(paging_at(1, boot.slots)?.pages_per_slot),
             accounting(0).pool,
-            u64::from(paging_at(1)?.pages_per_slot),
-            |pages| demand.bytes(pages),
+            |pages, slots| demand_at(slots).map_or(u64::MAX, |demand| demand.bytes(pages)),
         )
         .map_err(|short| Fault::Residency(short.to_string()))?;
-        let paging = paging_at(pages)?;
+        let demand = demand_at(slots)?;
+        let paging = paging_at(pages, slots)?;
 
         {
             let acct = accounting(demand.bytes(pages));
@@ -1024,7 +1028,7 @@ impl Shell {
             row_cuts,
             run_caps,
             run_passes,
-            held: vec![0; boot.slots as usize],
+            held: vec![0; paging.slots as usize],
             out,
             mtp,
             drafts_plane,

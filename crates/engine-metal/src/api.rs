@@ -430,7 +430,7 @@ impl Engine for Metal {
             let paging = crate::store::kv::Paging::of(
                 budgets.page_size,
                 budgets.max_context,
-                budgets.slots,
+                engine::fit::least_state_slots(1).min(budgets.slots),
                 1,
             )
             .map_err(|error| fault(Fault::from(error)))?;
