@@ -382,13 +382,16 @@ pub fn run(
             Err(why) => say(&format!("  {deployment} did not serve: {why}")),
         }
     }
-    let tuned_ids: Vec<String> = lines
-        .iter()
-        .filter(|l| !l.text.starts_with("not searched"))
-        .map(|l| format!("\"{}\"", l.id))
-        .collect();
+    // The kernel bench and the search both report `kernel.qmm`.
+    let mut tuned_ids: Vec<String> = Vec::new();
+    for l in lines.iter().filter(|l| !l.text.starts_with("not searched")) {
+        let id = format!("\"{}\"", l.id);
+        if !tuned_ids.contains(&id) {
+            tuned_ids.push(id);
+        }
+    }
     let checked = if unchanged {
-        "nothing changed".to_string()
+        "kernels against the f64 reference; nothing changed".to_string()
     } else if checks.is_empty() {
         "kernels against the f64 reference; no end-to-end run".to_string()
     } else {
