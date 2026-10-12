@@ -2,7 +2,7 @@
 
 // Ragged bidirectional attention, tiled: a workgroup holds 32 query
 // rows of one head, four invocations a row with a quarter of its dims each,
-// and streams the keys through workgroup memory 16 at a time with an online
+// and streams the keys through workgroup memory 4 at a time with an online
 // softmax. A row's keys are its segment's: `segments` (the query CSR) finds
 // the segment, and `kv_segments` (ragged) or `segments` itself names its
 // keys.
@@ -12,7 +12,7 @@
 #endif
 #define PIE_BQ 32
 #define PIE_PARTS 4
-#define PIE_BKEY 16
+#define PIE_BKEY 4
 #define PIE_THREADS (PIE_BQ * PIE_PARTS)
 #define PIE_DPT (PIE_D / PIE_PARTS)
 
