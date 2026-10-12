@@ -763,7 +763,11 @@ pub fn matmul_select_batched(
         return Ok(false);
     };
     ctx.fire(
-        Fire::at(SORT_FILE, "route_sort").apply(Grid::of([1024, 1, 1], [1024, 1, 1])),
+        {
+            let lanes = tuning.sort_lanes();
+            let entry = if lanes == 1024 { "route_sort" } else { "route_sort_256" };
+            Fire::at(SORT_FILE, entry).apply(Grid::of([lanes, 1, 1], [lanes, 1, 1]))
+        },
         &[
             routes.arg(),
             scratch.perm.arg_mut(),

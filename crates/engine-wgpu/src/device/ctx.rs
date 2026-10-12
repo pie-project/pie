@@ -620,6 +620,16 @@ impl Context {
         }
     }
 
+    /// Invocations and bytes of workgroup memory a compute workgroup may
+    /// use on this adapter.
+    #[must_use]
+    pub fn workgroup_limits(&self) -> (u32, u32) {
+        (
+            self.core.limits.max_compute_invocations_per_workgroup,
+            self.core.limits.max_compute_workgroup_storage_size,
+        )
+    }
+
     /// Storage buffers a shader stage may bind.
     #[must_use]
     pub fn storage_buffers(&self) -> u32 {

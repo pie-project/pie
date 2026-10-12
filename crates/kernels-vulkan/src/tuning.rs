@@ -129,6 +129,13 @@ pub enum DecodeSplit {
 #[decision(id = "kernel.sdpa.decode.split_min_keys", constant(range(1..=65_536)), default = 256, tune = search)]
 pub struct DecodeSplitMinKeys(pub u32);
 
+/// Query rows a tiled attention workgroup holds, 32 lanes each: fewer rows
+/// mean more workgroups and less reuse of each key. The device's invocation
+/// limit caps it whatever the profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.tile_rows", constant(set(8, 16, 32)), default = 32, tune = search)]
+pub struct SdpaTileRows(pub u32);
+
 /// Register every decision this crate reads.
 pub fn register(registry: &mut Registry) {
     registry
@@ -143,21 +150,78 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaTileRowsPerRequest>()
         .add::<SdpaMma>()
         .add::<DecodeSplit>()
-        .add::<DecodeSplitMinKeys>();
+        .add::<DecodeSplitMinKeys>()
+        .add::<SdpaTileRows>();
+}
+
+/// What a device allows a kernel, as the engine measured it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Multiprocessors or compute units a per-core decision multiplies.
+    pub cores: u32,
+    /// The narrowest subgroup a pipeline runs at.
+    pub lanes: u32,
+    /// `maxComputeSharedMemorySize`, in bytes.
+    pub shared_bytes: u32,
+    /// `maxComputeWorkGroupInvocations`.
+    pub invocations: u32,
+}
+
+impl Limits {
+    /// What a test or a tool assumes of a device it does not open: 16 cores,
+    /// 32 lanes, 32 KiB of workgroup memory, 1024 invocations.
+    pub const ASSUMED: Limits = Limits {
+        cores: 16,
+        lanes: 32,
+        shared_bytes: 32 << 10,
+        invocations: 1024,
+    };
+
+    /// `ASSUMED` with `cores` cores.
+    #[must_use]
+    pub fn with_cores(cores: u32) -> Limits {
+        Limits {
+            cores,
+            ..Limits::ASSUMED
+        }
+    }
 }
 
 /// What one load's kernels run under: the device's resolved profile, and
-/// the core count a per-core decision multiplies.
+/// what the device allows.
 #[derive(Clone, Debug)]
 pub struct Tuning {
     profile: Profile,
-    cores: u32,
+    limits: Limits,
 }
 
 impl Tuning {
     #[must_use]
-    pub fn new(profile: Profile, cores: u32) -> Tuning {
-        Tuning { profile, cores }
+    pub fn new(profile: Profile, limits: Limits) -> Tuning {
+        Tuning { profile, limits }
+    }
+
+    #[must_use]
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+
+    /// Query rows a tiled attention workgroup holds: the profile's, as far
+    /// as the device's invocations allow 32 lanes each.
+    #[must_use]
+    pub fn sdpa_tile_rows(&self) -> u32 {
+        let fits = (self.limits.invocations / 32).max(8);
+        let mut rows = self.profile.get::<SdpaTileRows>().0;
+        while rows > fits && rows > 8 {
+            rows /= 2;
+        }
+        rows
+    }
+
+    /// Invocations the route sort runs: 1024 where the device allows it.
+    #[must_use]
+    pub fn sort_lanes(&self) -> u32 {
+        if self.limits.invocations >= 1024 { 1024 } else { 256 }
     }
 
     #[must_use]
@@ -228,7 +292,7 @@ impl Tuning {
     pub fn sdpa_split_groups(&self) -> u32 {
         match *self.profile.get::<DecodeSplit>() {
             DecodeSplit::Fixed { groups } => groups,
-            DecodeSplit::PerCore { per } => self.cores.saturating_mul(per).max(1),
+            DecodeSplit::PerCore { per } => self.limits.cores.saturating_mul(per).max(1),
         }
     }
 

@@ -358,7 +358,16 @@ impl Shell {
         let measured = device.chip();
         let (chip, chip_report) = crate::chip::resolve(&measured, boot.device.profiles.as_deref());
         crate::chip::SHELF.tell_untuned(&measured.name, &chip_report);
-        let tuning = kernels_vulkan::Tuning::new(chip.clone(), device.cores());
+        let (shared_bytes, invocations) = device.compute_limits();
+        let tuning = kernels_vulkan::Tuning::new(
+            chip.clone(),
+            kernels_vulkan::tuning::Limits {
+                cores: device.cores(),
+                lanes: device.lanes(),
+                shared_bytes,
+                invocations,
+            },
+        );
         let boot = Boot {
             trace: poem_compiler::fuse::fuse(
                 boot.trace,

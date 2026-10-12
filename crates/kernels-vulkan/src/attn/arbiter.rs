@@ -62,7 +62,7 @@ fn arbitrate(
         );
     }
     tiled(
-        ctx, op, q, pool, plan, mask, window, head_dim, sm_scale, o, lse,
+        ctx, tuning, op, q, pool, plan, mask, window, head_dim, sm_scale, o, lse,
     )
 }
 

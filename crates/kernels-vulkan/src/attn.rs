@@ -155,7 +155,42 @@ pub fn plan_prefill(
 
 const FILE: &str = "attn/sdpa_paged.slang";
 
-pub(crate) const SDPA_TILE: u32 = 32;
+/// A tiled entry at `rows` rows a workgroup: the 32-row name, or its
+/// `_r16` / `_r8` variant.
+fn tiled_entry(base: &'static str, rows: u32) -> &'static str {
+    if rows == 32 {
+        return base;
+    }
+    let at = SDPA_TILED
+        .iter()
+        .chain(&SDPA_TILED_LSE)
+        .position(|e| *e == base)
+        .expect("a tiled entry");
+    let (r16, r8) = (&SDPA_TILED_R16, &SDPA_TILED_R8);
+    if rows == 16 { r16[at] } else { r8[at] }
+}
+
+const SDPA_TILED_R16: [&str; 8] = [
+    "sdpa_paged_tiled_bfloat16_d_64_r16",
+    "sdpa_paged_tiled_bfloat16_d_128_r16",
+    "sdpa_paged_tiled_bfloat16_d_256_r16",
+    "sdpa_paged_tiled_bfloat16_d_512_r16",
+    "sdpa_paged_tiled_lse_bfloat16_d_64_r16",
+    "sdpa_paged_tiled_lse_bfloat16_d_128_r16",
+    "sdpa_paged_tiled_lse_bfloat16_d_256_r16",
+    "sdpa_paged_tiled_lse_bfloat16_d_512_r16",
+];
+
+const SDPA_TILED_R8: [&str; 8] = [
+    "sdpa_paged_tiled_bfloat16_d_64_r8",
+    "sdpa_paged_tiled_bfloat16_d_128_r8",
+    "sdpa_paged_tiled_bfloat16_d_256_r8",
+    "sdpa_paged_tiled_bfloat16_d_512_r8",
+    "sdpa_paged_tiled_lse_bfloat16_d_64_r8",
+    "sdpa_paged_tiled_lse_bfloat16_d_128_r8",
+    "sdpa_paged_tiled_lse_bfloat16_d_256_r8",
+    "sdpa_paged_tiled_lse_bfloat16_d_512_r8",
+];
 
 const SDPA_WIDTHS: [u32; 4] = [64, 128, 256, 512];
 
@@ -708,8 +743,10 @@ pub fn prefill_selected(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn tiled(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     op: &'static str,
     q: Tensor,
     pool: &KvPool,
@@ -727,10 +764,12 @@ pub(crate) fn tiled(
         "the attention lands one output row per query row"
     );
     let shape = Paged::of(op, q, pool, window, head_dim)?;
-    let entry = match lse {
+    let tile = tuning.sdpa_tile_rows();
+    let base = match lse {
         None => SDPA_TILED[shape.at],
         Some(_) => SDPA_TILED_LSE[shape.at],
     };
+    let entry = tiled_entry(base, tile);
     let mut args = sdpa_args(
         ctx,
         op,
@@ -752,8 +791,8 @@ pub(crate) fn tiled(
     }
     ctx.fire(
         Fire::at(FILE, entry)
-            .groups([shape.q_heads, shape.rows.div_ceil(SDPA_TILE), 1])
-            .group([32, SDPA_TILE, 1]),
+            .groups([shape.q_heads, shape.rows.div_ceil(tile), 1])
+            .group([32, tile, 1]),
         &args,
     )
 }
@@ -851,79 +890,6 @@ fn decode_arm(
         }
     }
     vector(ctx, op, q, pool, plan, window, head_dim, sm_scale, o, lse)
-}
-
-pub fn prefill(
-    ctx: &Ctx<'_>,
-    q: RaggedTensor,
-    plan: &PrefillPlan,
-    pool: &KvPool,
-    window: Option<u32>,
-    head_dim: u32,
-    kv_heads: u32,
-    sm_scale: f32,
-    o: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attention.prefill";
-    kv_heads_agree(OP, pool, head_dim, kv_heads)?;
-    tiled(
-        ctx, OP, q.data, pool, plan, plan.mask, window, head_dim, sm_scale, o, None,
-    )
-}
-
-pub fn prefill_lse(
-    ctx: &Ctx<'_>,
-    q: RaggedTensor,
-    plan: &PrefillPlan,
-    pool: &KvPool,
-    window: Option<u32>,
-    head_dim: u32,
-    kv_heads: u32,
-    sm_scale: f32,
-    o: Tensor,
-    lse: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attention.prefill_lse";
-    kv_heads_agree(OP, pool, head_dim, kv_heads)?;
-    tiled(
-        ctx,
-        OP,
-        q.data,
-        pool,
-        plan,
-        plan.mask,
-        window,
-        head_dim,
-        sm_scale,
-        o,
-        Some(lse),
-    )
-}
-
-pub fn masked(
-    ctx: &Ctx<'_>,
-    q: RaggedTensor,
-    plan: &PrefillPlan,
-    mask: Tensor,
-    pool: &KvPool,
-    window: Option<u32>,
-    head_dim: u32,
-    sm_scale: f32,
-    o: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attention.masked";
-    if mask.dtype != Dtype::U8 {
-        return Err(refuse(
-            OP,
-            format!(
-                "the mask this op states is {:?}, and the shader reads packed u8 mask planes",
-                mask.dtype
-            ),
-        ));
-    }
-    tiled(
-        ctx, OP, q.data, pool, plan, mask, window, head_dim, sm_scale, o, None,
-    )
 }
 
 pub fn sink(

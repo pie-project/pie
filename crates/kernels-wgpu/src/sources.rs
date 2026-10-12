@@ -125,3 +125,54 @@ fn workgroup_of(wgsl: &str, defines: &BTreeMap<String, String>) -> [u32; 3] {
     }
     group
 }
+
+/// Bytes of workgroup memory an expanded shader declares: every
+/// `var<workgroup>`, arrays of scalars, vectors and arrays of them, with
+/// lengths given as literals or as module `const`s. What a device's
+/// `max_compute_workgroup_storage_size` is held against.
+#[must_use]
+pub fn workgroup_bytes(wgsl: &str) -> u64 {
+    let consts: std::collections::BTreeMap<&str, u64> = wgsl
+        .lines()
+        .filter_map(|l| {
+            let rest = l.trim().strip_prefix("const ")?;
+            let (name, value) = rest.split_once('=')?;
+            let value = value.trim().trim_end_matches(';').trim().trim_end_matches('u');
+            Some((name.trim().split(':').next()?.trim(), value.parse().ok()?))
+        })
+        .collect();
+    fn size(ty: &str, consts: &std::collections::BTreeMap<&str, u64>) -> u64 {
+        let ty = ty.trim();
+        if let Some(inner) = ty.strip_prefix("array<").and_then(|t| t.strip_suffix('>')) {
+            let Some((elem, len)) = inner.rsplit_once(',') else {
+                return 0;
+            };
+            let len = len.trim().trim_end_matches('u');
+            let n = len.parse().ok().or_else(|| consts.get(len).copied()).unwrap_or(0);
+            return n * size(elem, consts);
+        }
+        let lanes = if ty.starts_with("vec2") {
+            2
+        } else if ty.starts_with("vec3") || ty.starts_with("vec4") {
+            4
+        } else {
+            1
+        };
+        let scalar = if ty.contains("f16") { 2 } else { 4 };
+        lanes * scalar
+    }
+    wgsl.lines()
+        .filter_map(|l| l.trim().strip_prefix("var<workgroup>"))
+        .filter_map(|rest| rest.split_once(':'))
+        .map(|(_, ty)| size(ty.trim().trim_end_matches(';'), &consts))
+        .sum()
+}
+
+#[cfg(test)]
+mod workgroup_tests {
+    #[test]
+    fn workgroup_bytes_count_arrays_consts_and_scalars() {
+        let wgsl = "const PIE_XS_WORDS = 4096u;\nvar<workgroup> xs_shared: array<u32, PIE_XS_WORDS>;\nvar<workgroup> xs_staged: u32;\nvar<workgroup> p: array<array<f32, 32>, 16>;\n";
+        assert_eq!(super::workgroup_bytes(wgsl), 4096 * 4 + 4 + 16 * 32 * 4);
+    }
+}

@@ -208,7 +208,10 @@ pub fn resolve_facts(name: &str, facts: &Facts, profiles: Option<&Path>) -> (Pro
 /// decision. Panics on an override the registry refuses.
 #[must_use]
 pub fn tuning(overrides: &str, cores: u32) -> kernels_vulkan::Tuning {
-    kernels_vulkan::Tuning::new(registry().with_overrides(overrides), cores)
+    kernels_vulkan::Tuning::new(
+        registry().with_overrides(overrides),
+        kernels_vulkan::tuning::Limits::with_cores(cores),
+    )
 }
 
 #[cfg(test)]
@@ -284,7 +287,7 @@ mod tests {
             let (profile, report) = resolve(&d, None);
             assert_eq!(report.used, Source::Derived, "{d:?}: {report:?}");
             let cores = d.pricing_cores();
-            let t = kernels_vulkan::Tuning::new(profile, cores);
+            let t = kernels_vulkan::Tuning::new(profile, kernels_vulkan::tuning::Limits::with_cores(cores));
             let new = (
                 t.qmm_min_rows(),
                 t.qmm_crossover_tg(),
@@ -324,7 +327,10 @@ mod tests {
     fn a_device_reporting_fewer_than_16_cores_is_split_by_what_it_reported() {
         let d = device("nvidia", 32, Some(10), false);
         let (profile, _) = resolve(&d, None);
-        let t = kernels_vulkan::Tuning::new(profile, d.pricing_cores());
+        let t = kernels_vulkan::Tuning::new(
+            profile,
+            kernels_vulkan::tuning::Limits::with_cores(d.pricing_cores()),
+        );
         assert_eq!(t.sdpa_split_groups(), 10, "the old floor of 16 was a guess");
     }
 
@@ -348,7 +354,7 @@ mod tests {
             "{:?}",
             report.rejected
         );
-        assert!(!kernels_vulkan::Tuning::new(profile, 16).qmv_one_row());
+        assert!(!kernels_vulkan::Tuning::new(profile, kernels_vulkan::tuning::Limits::ASSUMED).qmv_one_row());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -108,6 +108,11 @@ impl Context {
     }
 
     #[must_use]
+    pub fn workgroup_limits(&self) -> (u32, u32) {
+        match self.never {}
+    }
+
+    #[must_use]
     pub fn left(&self) -> u64 {
         match self.never {}
     }

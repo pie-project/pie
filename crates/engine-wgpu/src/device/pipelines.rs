@@ -309,6 +309,26 @@ impl Pipelines {
                 kernels_wgpu::Capability::Baseline => entrypoint,
                 other => Box::leak(other.variant(entrypoint).into_boxed_str()),
             };
+            // A variant past the adapter's workgroup limits is not
+            // built: a lower tier stands in, and the baseline says why.
+            let invocations: u32 = expanded.workgroup.iter().product();
+            let bytes = kernels_wgpu::sources::workgroup_bytes(&expanded.wgsl);
+            let (max_invocations, max_bytes) = device.workgroup_limits();
+            if invocations > max_invocations || bytes > u64::from(max_bytes) {
+                let fault = Fault::Shader {
+                    file: fire.file,
+                    entrypoint,
+                    why: format!(
+                        "{invocations} invocations and {bytes} B of workgroup memory, past this \
+                         adapter's {max_invocations} and {max_bytes} B"
+                    ),
+                };
+                if tier == kernels_wgpu::Capability::Baseline {
+                    return Err(fault);
+                }
+                last = Some(fault);
+                continue;
+            }
             let wgsl = promote_storage(&expanded.wgsl);
             match build(device.core(), cache.as_ref(), fire, name, tier, &wgsl) {
                 Ok(pipeline) => {
