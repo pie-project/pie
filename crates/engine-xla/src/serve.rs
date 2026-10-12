@@ -32,7 +32,7 @@ use crate::store::kv::{self, Paging, Seat};
 use crate::store::{Pools, SpaceSeat};
 use crate::trace::{Handles, Root, Source, Tracer};
 use crate::weights::Weights;
-use crate::window::{At, Copies, Cursor, Windows};
+use crate::window::{At, Cursor, Windows};
 
 pub use crate::dit::{Clips, Pixels, PortCell, SelfCond};
 
@@ -1511,13 +1511,11 @@ impl Shell {
         };
 
         let mut windows = Windows::of(
-            &self.trace,
             &self.compiled,
             composition.classes(),
             composition.patch_classes(),
             composition.voxel_classes(),
             &indptr_host,
-            Copies::off(),
             &[],
             &[],
         )?;

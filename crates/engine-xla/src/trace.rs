@@ -370,7 +370,8 @@ fn root_value(
         // A sub-byte codes plane lands with its rows padded to whole
         // 128-lane tiles (`crate::weights::gemm_only`).
         let rows = if ty.elem.bits() < 8 {
-            (ty.dims[0] + 127) / 128 * 128
+            let tile = crate::weights::CODES_TILE as i64;
+            (ty.dims[0] + tile - 1) / tile * tile
         } else {
             ty.dims[0]
         };

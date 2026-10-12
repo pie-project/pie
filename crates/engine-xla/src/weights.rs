@@ -15,7 +15,7 @@ use checkpoint::plan::{LoadPlan, StorageTarget, compile_streaming};
 use checkpoint::serving::Stamp;
 use checkpoint::types::{BackendKind, ScaleForm, TensorId};
 use kernels_xla::{Bank, Tensor};
-use poem_ir::{Dtype, Fused, ParamSource, Trace};
+use poem_ir::{Dtype, ParamSource, Trace};
 
 use crate::device::Device;
 use crate::error::{Fault, Result};
@@ -586,12 +586,9 @@ fn gemm_only(
         inputs.clear();
         node.op.inputs(&mut inputs);
         let w = match &node.op {
-            Operation::Linear(Linear::Matmul { w, .. } | Linear::LmHead { w, .. })
-            | Operation::Fused(
-                Fused::MatmulBias { w, .. }
-                | Fused::MatmulGeglu { w, .. }
-                | Fused::LmHeadSoftcap { w, .. },
-            ) => Some(*w),
+            // XLA ships no fused kernels (`crate::FUSED` is empty), so no
+            // `Fused` op reaches a trace this reads.
+            Operation::Linear(Linear::Matmul { w, .. } | Linear::LmHead { w, .. }) => Some(*w),
             _ => None,
         };
         for &v in &inputs {
