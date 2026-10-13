@@ -100,6 +100,15 @@ def read_concat(reads, own, w, names):
 def read_stack(reads, own, w, rows):
     if own:
         reads.read_own(w)
+    elif w.dtype == dtype.bf16:
+        # bf16 rows stack as they are: each expert's legs side by side on
+        # its rows, the experts on a new leading axis.
+        r, c = w.shape[1], w.shape[2]
+        legs = lambda parts: [src(p).transmute([1, r // len(parts), c], encoding(w.dtype)) for p in parts]
+        reads.read_expr(w, concat(0, [
+            concat(1, legs(parts)) if len(parts) > 1 else legs(parts)[0]
+            for parts in rows
+        ]))
     else:
         reads.read_stack(w, rows)
 

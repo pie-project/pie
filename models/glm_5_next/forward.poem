@@ -299,10 +299,15 @@ def mlp(x, f, hint):
         f.scaling,
         hint,
     )
-    packed = ops.linear.moe_matmul_select_quant(x, f.gate_up, routes, f.top_k)
+    def select(act, bank):
+        if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
+            return ops.linear.moe_matmul_select(act, bank, routes, f.top_k)
+        return ops.linear.moe_matmul_select_quant(act, bank, routes, f.top_k)
+
+    packed = select(x, f.gate_up)
     act = ops.linear.mlp_swiglu_clamp(packed, f.inter, f.limit)
     routed = ops.linear.moe_weighted_sum(
-        ops.linear.moe_matmul_select_quant(act, f.down, routes, f.top_k),
+        select(act, f.down),
         weights,
     )
     s = f.shared
