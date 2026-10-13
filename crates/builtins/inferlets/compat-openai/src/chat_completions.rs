@@ -390,9 +390,15 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
     };
     let stream = req.stream;
 
-    if stream {
-        emit::send(&ids.chunk(json!({"role": "assistant", "content": ""}), None));
-    }
+    // The role rides on the first delta, as the open servers send it: an
+    // empty role chunk ahead of the prefill would read as the first token.
+    let mut role = Some("assistant");
+    let mut delta = |mut v: Value| {
+        if let Some(r) = role.take() {
+            v["role"] = json!(r);
+        }
+        v
+    };
     let mut calls = 0usize;
     let outcome = compat::run(&req, |event| {
         if !stream {
@@ -400,14 +406,17 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
         }
         match event {
             Event::Reasoning(text) => {
-                emit::send(&ids.chunk(json!({"reasoning_content": text}), None));
+                emit::send(&ids.chunk(delta(json!({"reasoning_content": text})), None));
             }
             Event::ReasoningEnd => {}
             Event::Text(text) => {
-                emit::send(&ids.chunk(json!({"content": text}), None));
+                emit::send(&ids.chunk(delta(json!({"content": text})), None));
             }
             Event::ToolCall(call) => {
-                emit::send(&ids.chunk(json!({"tool_calls": [tool_call_json(calls, &call)]}), None));
+                emit::send(&ids.chunk(
+                    delta(json!({"tool_calls": [tool_call_json(calls, &call)]})),
+                    None,
+                ));
                 calls += 1;
             }
         }
@@ -415,7 +424,7 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
     .await?;
 
     if stream {
-        emit::send(&ids.chunk(json!({}), Some(finish_reason(outcome.finish))));
+        emit::send(&ids.chunk(delta(json!({})), Some(finish_reason(outcome.finish))));
         if include_usage {
             emit::send(&json!({
                 "id": ids.id,
