@@ -10,7 +10,8 @@
 //!     cargo test -p kernels-cuda --features cuda --release --test kernels_cuda \
 //!         the_tcgen05_grouped_gemm_paces -- --ignored --nocapture
 //!
-//! `PIE_TC5_TOKENS` keeps one token count; `PIE_TC5_SPLITS` overrides the
+//! `PIE_TC5_LAYER` keeps the layers whose name holds it, `PIE_TC5_TOKENS`
+//! one token count; `PIE_TC5_SPLITS` overrides the
 //! plan's K splits.
 
 use crate::common::Gpu;
@@ -103,6 +104,9 @@ fn operand(
 
 #[allow(clippy::too_many_lines)]
 fn layer(name: &str, experts: usize, top: usize, [n, k]: [usize; 2], kind: Kind) {
+    if std::env::var("PIE_TC5_LAYER").is_ok_and(|only| !name.contains(only.as_str())) {
+        return;
+    }
     let mut gpu = Gpu::open();
     let ctx = gpu.ctx();
     let stream: rt::cudaStream_t = ctx.stream().cast();
