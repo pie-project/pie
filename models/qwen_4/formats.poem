@@ -1,6 +1,7 @@
-# How a Qwen 3.8 Flash Next checkpoint is laid out: transformers' names, or
-# mlx_lm's, with the hyper-connections, the n-gram embedding and the draft
-# head beside the trunk.
+# How a Qwen 3.8 Flash Next checkpoint is laid out: transformers' names,
+# modelopt's NVFP4 export of them (each expert its own e2m1 planes, the
+# n-gram table e4m3 under one scale), or mlx_lm's, with the hyper-connections,
+# the n-gram embedding and the draft head beside the trunk.
 
 def product(xs):
     out = 1
@@ -31,11 +32,20 @@ def squeezed(name):
 
 LAYOUTS = [
     struct(
+        name = "modelopt",
+        trunk = "model.language_model.",
+        head = "lm_head.weight",
+        tower = "model.visual.",
+        mlx = False,
+        nvfp4 = True,
+    ),
+    struct(
         name = "transformers",
         trunk = "model.language_model.",
         head = "lm_head.weight",
         tower = "model.visual.",
         mlx = False,
+        nvfp4 = False,
     ),
     struct(
         name = "mlx_lm",
@@ -43,14 +53,21 @@ LAYOUTS = [
         head = "language_model.lm_head.weight",
         tower = "vision_tower.",
         mlx = True,
+        nvfp4 = False,
     ),
 ]
 
+def recognizes(layout):
+    """`layout` is recognized by its embedding; modelopt's, which shares
+    transformers' names, by the e4m3 scales of its first expert."""
+    scaled = lambda: has(layout.trunk + "layers.0.mlp.experts.0.gate_proj.weight_scale")
+    return lambda checkpoint: has(layout.trunk + "embed_tokens.weight") and scaled() == layout.nvfp4
+
 def safetensors_format(layout, read, states = []):
-    """`layout`'s format, recognized by its embedding: `read(reads, layout)`."""
+    """`layout`'s format: `read(reads, layout)`."""
     return format(
         layout.name,
-        recognizes = lambda checkpoint: has(layout.trunk + "embed_tokens.weight"),
+        recognizes = recognizes(layout),
         read = lambda reads: read(reads, layout),
         states = states,
     )
@@ -78,9 +95,55 @@ def read_gdn(reads, g, n):
     reads.read(g.norm, n("linear_attn.norm.weight"))
     reads.read(g.out_proj, n("linear_attn.out_proj.weight"))
 
+E4M3 = raw(dtype.e4m3)
+
+F32 = raw(dtype.f32)
+
+def nvfp4_bank(reads, w, experts):
+    """A routed bank of modelopt NVFP4 experts, `experts` the stems of each
+    expert's legs (gate and up, or down): `{stem}.weight` packs two e2m1 codes
+    a byte beside `{stem}.weight_scale`, an e4m3 per 16 codes, and the scalars
+    `{stem}.weight_scale_2` (the leg's tensor scale) and `{stem}.input_scale`
+    (its activations'). The legs stack on the leading axis, which is the
+    bank's `[experts, rows, cols]` rectangle byte for byte; a leg's tensor
+    scale lands once a row of it, and an expert's legs read one activation,
+    so its first leg's input scale is the expert's."""
+    if w.dtype != dtype.nvfp4:
+        fail("`{}`: this checkpoint's experts are NVFP4, and this deployment reads them as {}; import the deployment that keeps them NVFP4".format(w.name, w.dtype))
+    count, rows, cols = w.shape[0], w.shape[1], w.shape[2]
+    legs = len(experts[0])
+    per_leg = rows // legs
+    if len(experts) != count or per_leg * legs != rows:
+        fail("`{}` is {} and the checkpoint holds {} experts of {} legs".format(w.name, w.shape, len(experts), legs))
+    codes = []
+    scales = []
+    tensors = []
+    inputs = []
+    for stems in experts:
+        for stem in stems:
+            codes.append(src(stem + ".weight").transmute([1, per_leg, cols], grouped(w)))
+            scales.append(src(stem + ".weight_scale").transmute([1, per_leg, cols // 16], E4M3))
+            tensors.append(src(stem + ".weight_scale_2").transmute([1, 1], F32).gather(1, [0] * per_leg))
+        inputs.append(src(stems[0] + ".input_scale").transmute([1], F32))
+    counted = scales_shape(w)
+
+    # One leg an expert stacks to the bank's own rectangle; two read it as
+    # their `[2 * experts, rows / 2, ...]` stack.
+    whole = lambda expr, shape, encoding: expr if legs == 1 else expr.transmute(shape, encoding)
+    reads.extend([
+        tensor(w.name, whole(concat(0, codes), w.shape, grouped(w)), grouped(w)),
+        tensor(scales_name(w.name), whole(concat(0, scales), counted, E4M3), E4M3, shape = counted, scaling = w),
+        tensor(global_scales_name(w.name), whole(concat(0, tensors), [count, rows], F32), F32, shape = [count, rows], tensor_scaling = w),
+        tensor(input_scales_name(w.name), concat(0, inputs), F32, shape = [count]),
+    ])
+
 def read_routed(reads, f, n, layout):
     reads.read(f.router, n("mlp.gate.weight"))
-    if layout.mlx:
+    if layout.nvfp4:
+        expert = lambda e, leg: n("mlp.experts.{}.{}_proj".format(e, leg))
+        nvfp4_bank(reads, f.gate_up, [[expert(e, "gate"), expert(e, "up")] for e in range(f.experts)])
+        nvfp4_bank(reads, f.down, [[expert(e, "down")] for e in range(f.experts)])
+    elif layout.mlx:
         reads.read_concat(f.gate_up, [n("mlp.switch_mlp.gate_proj.weight"), n("mlp.switch_mlp.up_proj.weight")])
         reads.read(f.down, n("mlp.switch_mlp.down_proj.weight"))
     else:
@@ -157,10 +220,11 @@ def read(m, reads, layout):
 
     p = m.ple
     n = lambda tail: trunk("layers.{}.ple.{}".format(p.layer, tail))
-    reads.read_concat(p.table, [
-        n("ple_embedding.ngram_embedding.shard_{}.weight".format(i))
-        for i in range(p.shards)
-    ])
+    shards = [n("ple_embedding.ngram_embedding.shard_{}.weight".format(i)) for i in range(p.shards)]
+    if layout.nvfp4:
+        read_e4m3_table(reads, p.table, shards, n("ple_embedding.ngram_embedding.weight_scale"))
+    else:
+        reads.read_concat(p.table, shards)
     reads.read(p.key_proj, n("key_proj.weight"))
     reads.read(p.value_proj, n("value_proj.weight"))
     reads.read_expr(p.norm_key, norm(n("norm_key.weight")))
@@ -169,6 +233,25 @@ def read(m, reads, layout):
     reads.read_expr(p.conv, squeezed(n("conv1d.weight")))
 
     read_mixer(reads, m.mixer, norm, trunk("hyper_connection_mixer"))
+
+def read_e4m3_table(reads, w, shards, scale):
+    """`w` from e4m3 shards under one stored scale: each shard widened and
+    scaled, then the shards joined."""
+    if w.dtype != dtype.bf16:
+        fail("`{}`: the n-gram table is stored e4m3 under one scale and is read as bf16, not {}".format(w.name, w.dtype))
+    at = w.name + ".scale"
+    factor = src(scale).transmute([1, 1], stored(scale))
+    if stored(scale) != raw(dtype.bf16):
+        factor = factor.cast(raw(dtype.bf16))
+    parts = [tensor(at, factor, raw(dtype.bf16), shape = [1, 1], internal = True)]
+    for i, shard in enumerate(shards):
+        if stored(shard) != E4M3:
+            fail("`{}`: `{}` is stored {}, and this checkpoint's n-gram shards are e4m3".format(w.name, shard, stored(shard)))
+        wide = "{}.wide{}".format(w.name, i)
+        parts.append(tensor(wide, src(shard).cast(raw(dtype.bf16)), raw(dtype.bf16), internal = True))
+        parts.append(tensor("{}.shard{}".format(w.name, i), out(wide).scale_by(out(at)), raw(dtype.bf16), internal = True))
+    parts.append(tensor(w.name, concat(0, [out("{}.shard{}".format(w.name, i)) for i in range(len(shards))]), raw(dtype.bf16), shape = w.shape))
+    reads.extend(parts)
 
 def read_mixer(reads, res, norm, site):
     """A hyper-connection's mix-in, and its injection if it has one."""

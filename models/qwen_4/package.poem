@@ -2,7 +2,9 @@
 # with full attention every fourth, routed experts, an n-gram embedding,
 # a multi-token draft head and a vision tower; its four-layer, sixteen-expert
 # miniature; and a micro model of toy widths for engine tests, which lists no
-# deployment.
+# deployment. NVIDIA's NVFP4 export serves its experts as it stores them; a
+# deployment that keeps them comes after every other, so an import of a bf16
+# checkpoint picks one it can write.
 
 load("//lib/spoken.poem", "QWEN_STOP", "QWEN_VISION", "QWEN_AUDIO")
 
@@ -20,6 +22,8 @@ MODELS = [
 
 MIXED = [dtype.u4g64, dtype.u2g128]
 
+NVFP4 = [dtype.bf16, dtype.nvfp4]
+
 DEPLOYMENTS = [
     deployment("qwen38-flash-next", weights = dtype.u4g64, kv = dtype.bf16),
     deployment("qwen38-flash-next", weights = MIXED, kv = dtype.bf16, drafter = "mtp"),
@@ -29,4 +33,6 @@ DEPLOYMENTS = [
     deployment("qwen38-flash-next", weights = dtype.bf16, kv = dtype.bf16),
     deployment("qwen38-flash-next", weights = MIXED, kv = dtype.bf16, parts = ["vision"], drafter = "mtp"),
     deployment("qwen38-flash-next", weights = MIXED, kv = dtype.bf16, parts = ["vision"]),
+    deployment("qwen38-flash-next", weights = NVFP4, kv = dtype.bf16),
+    deployment("qwen38-flash-next-mini", weights = NVFP4, kv = dtype.bf16),
 ]

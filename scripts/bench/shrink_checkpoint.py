@@ -763,6 +763,69 @@ def _rewrite_qwen4_exp(cfg: dict, plan: Plan) -> None:
         cfg["language_model_only"] = True
 
 
+def _modelopt_modules(name: str, plan: Plan) -> list[str]:
+    """A module (or module glob) a modelopt recipe names, as the miniature
+    names it: once per output layer its source layer became, not at all when
+    the miniature drops it (the MTP head, an unselected layer), unchanged when
+    it is no layer's."""
+    if name.startswith("mtp."):
+        return []
+    if not name.startswith(plan.layer_prefix):
+        return [name]
+    head, dot, tail = name[len(plan.layer_prefix):].partition(".")
+    if not head.isdigit():
+        return [name]
+    return [f"{plan.layer_prefix}{out}{dot}{tail}"
+            for out, src in enumerate(plan.src_layers) if src == int(head)]
+
+
+def _modelopt_renamed(names: list[str], plan: Plan) -> list[str]:
+    return [out for name in names for out in _modelopt_modules(name, plan)]
+
+
+def _rewrite_qwen4_exp_modelopt(cfg: dict, plan: Plan) -> None:
+    """Qwen3.8-Flash-Next as NVIDIA's modelopt exports it: the `qwen4_exp`
+    rewrite, and the recipe's module lists moved onto the miniature's names.
+
+    The recipe is MIXED_PRECISION -- NVFP4 routed experts, an fp8 n-gram
+    table, fp8 block-128 MTP experts -- and states it per module, by source
+    name. A reader (vLLM's) quantizes exactly the modules the recipe lists, so
+    a kept layer must keep its entry under its new number and a dropped one
+    must lose it; the MTP head's goes with the head. Each kept expert keeps
+    its own `weight_scale_2` and `input_scale`: dropping experts slices no
+    plane of a survivor, so every scale still describes the codes beside it."""
+    _rewrite_qwen4_exp(cfg, plan)
+    q = cfg.get("quantization_config")
+    if not isinstance(q, dict):
+        return
+    for group in (q.get("config_groups") or {}).values():
+        if isinstance(group, dict) and isinstance(group.get("targets"), list):
+            group["targets"] = _modelopt_renamed(group["targets"], plan)
+    _rename_modelopt_lists(q, plan)
+    q["config_groups"] = {k: g for k, g in (q.get("config_groups") or {}).items()
+                          if not isinstance(g, dict) or g.get("targets")}
+
+
+def _rename_modelopt_lists(q: dict, plan: Plan) -> None:
+    for key in ("ignore", "exclude_modules"):
+        if isinstance(q.get(key), list):
+            q[key] = _modelopt_renamed(q[key], plan)
+    if isinstance(q.get("quantized_layers"), dict):
+        q["quantized_layers"] = {out: spec for name, spec in q["quantized_layers"].items()
+                                 for out in _modelopt_modules(name, plan)}
+
+
+def _rewrite_modelopt_quant_file(out_dir: Path, plan: Plan) -> None:
+    """`hf_quant_config.json`, modelopt's own statement of the recipe, moved
+    onto the miniature's names as the config's twin is."""
+    path = out_dir / "hf_quant_config.json"
+    if not path.exists():
+        return
+    doc = json.loads(path.read_text())
+    _rename_modelopt_lists(doc.get("quantization", {}), plan)
+    path.write_text(json.dumps(doc, indent=2) + "\n")
+
+
 # --------------------------------------------------------------------------- #
 # The PLE n-gram table: a re-carve, not a slice
 # --------------------------------------------------------------------------- #
@@ -1070,7 +1133,9 @@ def carry_quant_overrides(cfg: dict, pairs: list[tuple[str, str]]) -> dict[str, 
     kept: dict[str, int] = {}
     for key in ("quantization", "quantization_config"):
         table = cfg.get(key)
-        if not isinstance(table, dict):
+        if not isinstance(table, dict) or table.get("quant_method") == "modelopt":
+            # A modelopt recipe names modules in lists, which the family's
+            # own rewrite moves.
             continue
         # An override is a module's own `bits` / `group_size`; any other dict
         # (compressed-tensors' `config_groups`) is the recipe itself.
@@ -1417,6 +1482,35 @@ FAMILIES: dict[str, dict[str, Any]] = {
         default_layers="0-3",
         config_rewrite=_rewrite_qwen4_exp,
         text_cfg_key="text_config",
+        marker_re=re.compile(r"\.mlp\.experts\.gate_up_proj$"),
+    ),
+    # NVIDIA's modelopt NVFP4 export of the same names: every routed expert
+    # its own `gate_proj`/`up_proj`/`down_proj`, each a `weight` of packed
+    # e2m1 pairs beside an e4m3 `weight_scale` per 16 codes and the scalars
+    # `weight_scale_2` and `input_scale` -- so the bank shrinks by dropping
+    # whole experts, every survivor's scales untouched. The n-gram shards are
+    # e4m3 under one `ngram_embedding.weight_scale`, which the carve leaves
+    # true of every row it moves. The MTP head (fp8 block-128 experts) goes,
+    # as it does from the bf16 export.
+    "qwen4_exp_modelopt": dict(
+        model_type="qwen4_exp",
+        layer_prefix="model.language_model.layers.",
+        expert_re=re.compile(r"\.mlp\.experts\.(\d+)\."),
+        router_suffixes=("mlp.gate.weight",),
+        part_re=re.compile(r"\.ngram_embedding\.shard_(\d+)\."),
+        default_parts=8,
+        globals_keep=("model.language_model.embed_tokens.weight",
+                      "lm_head.weight",
+                      "model.language_model.hyper_connection_mixer.hc_norm.weight",
+                      "model.language_model.hyper_connection_mixer."
+                      "input_mix_weight_down.weight",
+                      "model.language_model.hyper_connection_mixer."
+                      "input_mix_weight_up.weight"),
+        default_layers="0-3",
+        config_rewrite=_rewrite_qwen4_exp_modelopt,
+        aux_rewrite=_rewrite_modelopt_quant_file,
+        text_cfg_key="text_config",
+        marker_re=re.compile(r"\.mlp\.experts\.\d+\.gate_proj\.weight_scale$"),
     ),
     "kimi_k25": dict(
         layer_prefix="language_model.model.layers.",
@@ -1577,7 +1671,9 @@ def resolve_family(cfg: dict, weight_map: dict[str, str],
     if len(named) == 1:
         return named[0]
     fits = [k for k in named
-            if any(n.startswith(FAMILIES[k]["layer_prefix"]) for n in weight_map)]
+            if any(n.startswith(FAMILIES[k]["layer_prefix"]) for n in weight_map)
+            and ("marker_re" not in FAMILIES[k]
+                 or any(FAMILIES[k]["marker_re"].search(n) for n in weight_map))]
     if len(fits) != 1:
         raise SystemExit(
             f"model_type {model_type!r} is described by {named}, and the index "
@@ -1884,6 +1980,8 @@ def main() -> int:
               f"renumbered names")
     (out_dir / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
     copy_aux_files(args.repo, args.revision, out_dir)
+    if fam.get("aux_rewrite") is not None:
+        fam["aux_rewrite"](out_dir, plan)
     write_index(out_dir, shard_files)
     if plan.family == "deepseek_v41":
         write_engram_token_map(out_dir)
