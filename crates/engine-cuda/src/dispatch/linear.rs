@@ -1,5 +1,6 @@
 use kernels_cuda::Tensor;
 use kernels_cuda::linear;
+#[cfg(feature = "cuda")]
 use kernels_cuda::linear::act_quant;
 use kernels_cuda::linear::moe::GroupSeat;
 use kernels_cuda::linear::quant::OffsetKind;
@@ -682,9 +683,34 @@ impl Run<'_> {
         )
     }
 
+    #[cfg(not(feature = "cuda"))]
+    fn select_act_quant(
+        &mut self,
+        _: ValueId,
+        _: ValueId,
+        _: ValueId,
+        _: ActQuant,
+        _: Option<ValueId>,
+        _: ValueId,
+    ) -> Result<(), kernels_cuda::Error> {
+        lowp("linear.moe_matmul_select_act_quant")
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn matmul_act_quant(
+        &mut self,
+        _: ValueId,
+        _: ValueId,
+        _: ActQuant,
+        _: ValueId,
+    ) -> Result<(), kernels_cuda::Error> {
+        lowp("linear.matmul_act_quant")
+    }
+
     /// A select whose activations are quantized first, on the grouped
     /// tcgen05 GEMM: NVFP4 against an NVFP4 bank, each route under its
     /// expert's static global, or e4m3 in `gran`s against an MXFP4 bank.
+    #[cfg(feature = "cuda")]
     fn select_act_quant(
         &mut self,
         x: ValueId,
@@ -788,6 +814,7 @@ impl Run<'_> {
 
     /// A projection whose activations are quantized first, on the tcgen05
     /// GEMM: e4m3 in `gran`s against MXFP4 codes.
+    #[cfg(feature = "cuda")]
     fn matmul_act_quant(
         &mut self,
         act: ValueId,
@@ -993,6 +1020,7 @@ pub(crate) fn tensor_scales(
 /// A low-precision product runs on the tcgen05 GEMMs or not at all: an
 /// A4/A8 deployment does not fall back to bf16 activations.
 fn lowp(op: &'static str) -> Result<(), kernels_cuda::Error> {
+    #[cfg(feature = "cuda")]
     if linear::tc5::supported() {
         return Ok(());
     }
@@ -1006,9 +1034,11 @@ fn lowp(op: &'static str) -> Result<(), kernels_cuda::Error> {
 }
 
 /// A routed bank's scales laid into atoms, one a stream.
+#[cfg(feature = "cuda")]
 const BANK_ATOMS: &str = "linear.act_quant.bank_atoms";
 
 /// An NVFP4 bank's per-expert product scales, one a stream.
+#[cfg(feature = "cuda")]
 const EXPERT_ALPHA: &str = "linear.act_quant.expert_alpha";
 
 const STAGED_EXPERT_BYTES: u64 = 1536 * 1024 * 1024;
