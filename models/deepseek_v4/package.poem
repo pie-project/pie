@@ -21,18 +21,24 @@ U4 = dtype.u4g64
 U2 = dtype.u2g64
 FP4 = dtype.mxfp4
 
+# DeepSeek's reference precision: its fp8 projections and fp4 experts each
+# read e4m3 activations in 1x128 blocks (W8A8 and W4A8).
+W8A8 = [dtype.fp8b128a8, dtype.mxfp4a8]
+
 DEPLOYMENTS = [
     deployment("dsv41-flash", weights = U4, kv = BF),
     deployment("dsv41-flash", weights = [BF, FP4], kv = BF),
     deployment("dsv41-flash-mini", weights = [BF, FP4], kv = BF),
     deployment("dsv4-flash", weights = [BF, FP4], kv = BF, drafter = "mtp"),
     deployment("dsv4-flash", weights = [BF, FP4], kv = BF),
+    deployment("dsv4-flash", weights = W8A8, kv = BF),
     deployment("dsv4-flash", weights = [U4, U2, FP4], kv = BF, drafter = "mtp"),
     deployment("dsv4-flash-mini", weights = [U4, U2, FP4], kv = BF, drafter = "mtp"),
     deployment("dsv4-flash", weights = [U4, U2], kv = BF),
     deployment("dsv4-flash-mini", weights = [U4, U2], kv = BF),
     deployment("dsv4-flash-mini", weights = BF, kv = BF),
     deployment("dsv4-flash-mini", weights = [BF, FP4], kv = BF),
+    deployment("dsv4-flash-mini", weights = W8A8, kv = BF),
     deployment("dsv4-pro", weights = [BF, FP4], kv = BF),
     deployment("dsv4-pro-mini", weights = [BF, FP4], kv = BF),
     deployment("dsv4-base", weights = BF, kv = BF),

@@ -7,7 +7,7 @@ the reference for the deployments that serve dequantized weights at bf16
 activations.
 
     python3 scripts/dsv4_release_parity_ref.py <snapshot-dir> OUT [--steps 16] [--probes probes.json]
-        [--dtype float32]
+        [--dtype float32] [--act-quant] [--tag ref]
 
 Writes `OUT/probes.json` (`{"probes": [{"name", "ids"}]}`; a stated file is
 used instead) and, per probe NAME, the three files every reference writes:
@@ -29,6 +29,19 @@ to bf16, which holds every such value exactly, into `OUT/.bf16-view`, the config
 `quantization_config` and `expert_dtype` taken off. The reference runs in
 float32 by default: its hyper-connection streams are f32 and its bf16 arm
 hands them to bf16 projections unconverted.
+
+`--act-quant` reads the release at DeepSeek's own precision
+(`inference/model.py`'s `linear`): every projection the release stores fp8
+or fp4 (attention's `wq_a`, `wq_b`, `wkv`, `wo_b`, the indexer's `wq_b`,
+the shared and routed experts) quantizes its bf16 activations first, e4m3
+under one power-of-two (ue8m0) scale a 1x128 block (`act_quant`), and lands
+its product at bf16; a routed expert weighs its activations by the route
+before its down leg quantizes them, and its routes and the shared expert
+sum in f32. Those products are exact (each code times its scale), so the
+quantized activations' f32 matmul is the reference's fp8 and fp4 GEMMs. The
+reference's quant-dequant simulations elsewhere (the window KV's fp8 1x64,
+the indexer's fp4 after a Hadamard rotation) are not applied, as pie applies
+none of them.
 """
 
 import argparse
@@ -38,6 +51,7 @@ import time
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import save_file
 from transformers import AutoTokenizer, DeepseekV4ForCausalLM
@@ -67,6 +81,78 @@ def read_out_fp8(codes, scale):
     factors = torch.pow(2.0, scale.view(torch.uint8).float() - 127.0)
     factors = factors.repeat_interleave(group, 0)[:rows].repeat_interleave(group, 1)[:, :cols]
     return (codes.float() * factors).to(torch.bfloat16)
+
+def act_quant(x, block=128):
+    """DeepSeek's `act_quant` with `scale_fmt = ue8m0`, read back: bf16
+    activations in 1x`block` blocks, each scale `2^ceil(log2(amax / 448))` of
+    its block (the amax floored at 1e-4), the codes e4m3."""
+    shape = x.shape
+    x = x.to(torch.bfloat16).float().reshape(-1, shape[-1] // block, block)
+    amax = x.abs().amax(-1, keepdim=True).clamp(min=1e-4)
+    s = torch.pow(2.0, torch.ceil(torch.log2(amax * (1.0 / 448.0))))
+    q = (x / s).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float()
+    return (q * s).reshape(shape)
+
+
+def quantized(linear):
+    """`linear` reading its activations as `act_quant` lands them and
+    landing its product at bf16."""
+    def forward(x):
+        return F.linear(act_quant(x), linear.weight).to(torch.bfloat16).to(x.dtype)
+    linear.forward = forward
+
+
+def experts_forward(self, hidden_states, top_k_index, top_k_weights):
+    """`inference/model.py`'s `Expert` over the routes: gate and up of the
+    quantized activations at bf16, the SwiGLU in f32 times the route's
+    weight, then the down leg of those quantized, summed in f32."""
+    final = torch.zeros(hidden_states.shape, dtype=torch.float32, device=hidden_states.device)
+    for e in range(self.num_experts):
+        token_idx, top_k_pos = torch.where(top_k_index == e)
+        if token_idx.numel() == 0:
+            continue
+        x = act_quant(hidden_states[token_idx])
+        gate_up = F.linear(x, self.gate_up_proj[e]).to(torch.bfloat16).float()
+        gate, up = gate_up.chunk(2, dim=-1)
+        gate = gate.clamp(max=self.limit)
+        up = up.clamp(min=-self.limit, max=self.limit)
+        act = F.silu(gate) * up * top_k_weights[token_idx, top_k_pos, None].float()
+        down = F.linear(act_quant(act), self.down_proj[e]).to(torch.bfloat16).float()
+        final.index_add_(0, token_idx, down)
+    return final
+
+
+def moe_forward(self, hidden_states, input_ids=None):
+    batch, seq_len, hidden_dim = hidden_states.shape
+    flat = hidden_states.view(-1, hidden_dim)
+    if self.is_hash:
+        _, weights, indices = self.gate(hidden_states, input_ids)
+    else:
+        _, weights, indices = self.gate(hidden_states)
+    routed = experts_forward(self.experts, flat, indices, weights)
+    shared = self.shared_experts(hidden_states).view(-1, hidden_dim).float()
+    return (routed + shared).to(torch.bfloat16).to(hidden_states.dtype).view(batch, seq_len, hidden_dim)
+
+
+def at_release_precision(model, parts=("dense", "experts")):
+    """Every fp8 (`dense`) and fp4 (`experts`) projection of `model` read as
+    the release reads it."""
+    from transformers.models.deepseek_v4 import modeling_deepseek_v4 as v4
+
+    for module in model.modules():
+        if "dense" not in parts:
+            pass
+        elif isinstance(module, v4.DeepseekV4Attention):
+            for linear in (module.q_a_proj, module.q_b_proj, module.kv_proj, module.o_b_proj):
+                quantized(linear)
+        elif isinstance(module, v4.DeepseekV4Indexer):
+            quantized(module.q_b_proj)
+        elif isinstance(module, v4.DeepseekV4MLP):
+            for linear in (module.gate_proj, module.up_proj, module.down_proj):
+                quantized(linear)
+        if "experts" in parts and isinstance(module, v4.DeepseekV4SparseMoeBlock):
+            module.forward = moe_forward.__get__(module)
+
 
 def bf16_view(snapshot, view):
     if os.path.exists(os.path.join(view, "model.safetensors")):
@@ -105,6 +191,8 @@ def main():
     ap.add_argument("--probes", default=None)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
+    ap.add_argument("--act-quant", default=None, const="dense,experts", nargs="?")
+    ap.add_argument("--tag", default="ref")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -113,6 +201,8 @@ def main():
     bf16_view(args.snapshot, view)
     model = DeepseekV4ForCausalLM.from_pretrained(view, dtype=getattr(torch, args.dtype))
     model.to(args.device).eval()
+    if args.act_quant:
+        at_release_precision(model, args.act_quant.split(","))
 
     if args.probes:
         probes = json.load(open(args.probes))["probes"]
@@ -145,11 +235,11 @@ def main():
                 gen_rows.append(row)
                 last = int(row.argmax())
         vocab = tf.shape[-1]
-        tf.astype(np.float32).tofile(os.path.join(args.out, f"{name}.ref.tf.f32"))
-        np.stack(gen_rows).astype(np.float32).tofile(os.path.join(args.out, f"{name}.ref.gen.f32"))
+        tf.astype(np.float32).tofile(os.path.join(args.out, f"{name}.{args.tag}.tf.f32"))
+        np.stack(gen_rows).astype(np.float32).tofile(os.path.join(args.out, f"{name}.{args.tag}.gen.f32"))
         json.dump(
             {"ids": ids, "argmax": [int(a) for a in tf.argmax(-1)], "gen": produced, "vocab": vocab},
-            open(os.path.join(args.out, f"{name}.ref.json"), "w"),
+            open(os.path.join(args.out, f"{name}.{args.tag}.json"), "w"),
         )
         print(f"  {name}: {len(ids)} tokens, vocab {vocab}, gen={produced[:12]}  ({time.time() - started:.1f}s)")
 

@@ -236,7 +236,11 @@ def moe_flash(n, d, experts, gate, banks, weights, dense):
         scaling = d.scaling,
     )
 
-def flash(w, r, kv, d):
+def flash(w, r, kv, d, quant = None):
+    """V4-Flash or V4-Pro at `w`, its routed banks as `r` says; with `quant`
+    the projections DeepSeek's reference reads at fp8 (attention's q and kv
+    downs and ups, its output's up, the indexer's q up and the shared
+    expert) are stored and read at that precision, the rest at `w`."""
     dense = compute(w)
     hidden = d.hidden
     streams = d.streams
@@ -254,9 +258,10 @@ def flash(w, r, kv, d):
             norm_eps = d.norm_eps,
         )
 
-    def layer_at(prefix, key, ratio, hash, experts, routed_banks, weights, sdense):
+    def layer_at(prefix, key, ratio, hash, experts, routed_banks, weights, sdense, lin = None):
         """The layer named `prefix`, its caches named by `key`."""
         n = lambda s: "{}.{}".format(prefix, s)
+        q = lin if lin != None else weights
         norm = lambda s, dim: weight(n(s), [dim], sdense)
         lora_a, lora_b = banks(prefix, hidden, sdense)
         has_indexer = ratio == 4
@@ -279,7 +284,7 @@ def flash(w, r, kv, d):
                 theta = d.compress_theta,
                 yarn = YARN,
                 window = d.index_window,
-                wq_b = weight(n("indexer.wq_b"), [idx_w, d.q_lora], weights),
+                wq_b = weight(n("indexer.wq_b"), [idx_w, d.q_lora], q),
                 weights_proj = weight(n("indexer.weights_proj"), [d.index_heads, hidden], weights),
                 compressor = compressor(n("indexer.compressor"), ratio, 2 * d.index_head_dim, d.index_head_dim),
                 wk = None,
@@ -300,15 +305,15 @@ def flash(w, r, kv, d):
                 theta = d.compress_theta if ratio != None else d.theta,
                 yarn = YARN if ratio != None else None,
                 sm_scale = f32(1.0 / f32(sqrt(d.head_dim))),
-                q_down = weight(n("q_down"), [d.q_lora, hidden], weights),
+                q_down = weight(n("q_down"), [d.q_lora, hidden], q),
                 q_norm = norm("q_norm", d.q_lora),
                 q_norm_eps = d.norm_eps,
-                q_up = weight(n("q_up"), [q_w, d.q_lora], weights).columns(),
-                kv_down = weight(n("kv_down"), [kv_latent, hidden], weights),
+                q_up = weight(n("q_up"), [q_w, d.q_lora], q).columns(),
+                kv_down = weight(n("kv_down"), [kv_latent, hidden], q),
                 kv_norm = norm("kv_norm", kv_latent),
                 kv_norm_eps = d.norm_eps,
                 o_down = weight(n("o_down"), [o_out, q_w // d.o_groups], weights).columns(),
-                o_up = weight(n("o_up"), [hidden, o_out], weights).rows(),
+                o_up = weight(n("o_up"), [hidden, o_out], q).rows(),
                 o_groups = d.o_groups,
                 sink = weight(n("attn_sink"), [d.heads], sdense).columns(),
                 kv = "kv." + key,
@@ -317,7 +322,7 @@ def flash(w, r, kv, d):
                 selection = "own" if has_indexer else "none",
             ),
             mlp_mix = mix(n, "mlp_mix", streams, hidden),
-            mlp = moe_flash(n, d, experts, gate, routed_banks, weights, sdense),
+            mlp = moe_flash(n, d, experts, gate, routed_banks, q, sdense),
             lora_a = lora_a,
             lora_b = lora_b,
             engram = None,
@@ -333,6 +338,7 @@ def flash(w, r, kv, d):
             routed_banks = banks_at(r, l),
             weights = w,
             sdense = dense,
+            lin = quant,
         )
         for l in range(d.layers)
     ]
@@ -600,6 +606,8 @@ def layout(id, deploy):
     bf = dtype.bf16
     u4 = dtype.u4g64
     mx = dtype.mxfp4
+    fp8 = dtype.fp8b128a8
+    mxa8 = dtype.mxfp4a8
     kv = deploy.kv
     mtp = deploy.drafter == "mtp"
     if id == "dsv41-flash" and ws == [u4]:
@@ -617,6 +625,8 @@ def layout(id, deploy):
             return flash(u4, DQ_2BIT_FULL, kv, flash_dims(43, flash_ratios(), 3, draft = True))
         if ws == [bf, mx]:
             return flash(bf, split_of(mx), kv, flash_dims(43, flash_ratios(), 3, draft = mtp))
+        if ws == [fp8, mxa8] and not mtp:
+            return flash(bf, split_of(mxa8), kv, flash_dims(43, flash_ratios(), 3), quant = fp8)
     if id == "dsv4-flash-mini":
         if ws == [bf] and not mtp:
             return flash(bf, uniform(bf), kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16))
@@ -626,6 +636,8 @@ def layout(id, deploy):
             return flash(u4, DQ_2BIT, kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16, draft = True))
         if ws == [bf, mx] and not mtp:
             return flash(bf, split_of(mx), kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16))
+        if ws == [fp8, mxa8] and not mtp:
+            return flash(bf, split_of(mxa8), kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16), quant = fp8)
     if id == "dsv4-pro" and ws == [bf, mx] and not mtp:
         return flash(bf, split_of(mx), kv, pro_dims(61, pro_ratios(), 3))
     if id == "dsv4-pro-mini" and ws == [bf, mx] and not mtp:
