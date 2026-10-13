@@ -57,6 +57,41 @@ pub fn blocked(
     )
 }
 
+/// Gemma's per-block form: axis `a` owns its own `2·sections[a]`-wide block,
+/// a rotate_half over that block.
+#[allow(clippy::too_many_arguments)]
+pub fn split(
+    ctx: &Ctx,
+    q: &mut Tensor,
+    k: &mut Tensor,
+    positions: Tensor,
+    sections: [u32; AXES as usize],
+    rotary_dim: u32,
+    head_dim: u32,
+    theta: f32,
+) -> Result<(), Error> {
+    if sections.iter().all(|&s| s == 0) {
+        return Err(refuse(
+            "elementwise.rope_mrope",
+            format!(
+                "the sections {sections:?} name no frequency pair, and a split rotation \
+                 turns each axis by the pairs its section holds"
+            ),
+        ));
+    }
+    fire(
+        ctx,
+        "::pie::elemwise::rope_mrope_split<::pie::bf16>",
+        q,
+        k,
+        positions,
+        sections,
+        rotary_dim,
+        head_dim,
+        theta,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fire(
     ctx: &Ctx,

@@ -21,16 +21,6 @@ const REFUSED: &[Refusal] = &[Refusal {
     needle: "op: \"attention.pool_lse_selected\"",
 }];
 
-fn refuses_split_mrope(op: &poem_ir::ops::Operation) -> bool {
-    matches!(
-        op,
-        poem_ir::ops::Operation::Elementwise(poem_ir::ops::Elementwise::RopeMrope {
-            form: poem_ir::ops::MropeForm::Split,
-            ..
-        })
-    )
-}
-
 const CANNOT_SERVE: &[(&str, &[&str])] = &[
     ("dsv4-flash-bf16-kv-bf16", &["attention.pool_lse_selected"]),
     (
@@ -69,9 +59,6 @@ const CANNOT_SERVE: &[(&str, &[&str])] = &[
         "dsv4-flash-mtp-u4g64-u2g64-mxfp4-kv-bf16",
         &["attention.pool_lse_selected"],
     ),
-    ("gemma4-26b-a4b-vision-u4g64-kv-bf16", &[SPLIT_MROPE]),
-    ("gemma4-31b-vision-u4g64-kv-bf16", &[SPLIT_MROPE]),
-    ("gemma4-e4b-vision-bf16-kv-bf16", &[SPLIT_MROPE]),
 ];
 
 fn ops_of(deployment: &str) -> BTreeSet<String> {
@@ -79,31 +66,13 @@ fn ops_of(deployment: &str) -> BTreeSet<String> {
     row.trace(PLATFORM)
         .nodes
         .iter()
-        .map(|node| {
-            if refuses_split_mrope(&node.op) {
-                SPLIT_MROPE.to_string()
-            } else {
-                node.op.name().to_string()
-            }
-        })
+        .map(|node| node.op.name().to_string())
         .collect()
 }
 
-const SPLIT_MROPE: &str = "elementwise.rope_mrope(form=Split)";
-
 fn refused() -> BTreeMap<&'static str, &'static Refusal> {
-    let mut refused: BTreeMap<&'static str, &'static Refusal> =
-        REFUSED.iter().map(|r| (r.op, r)).collect();
-    refused.insert(SPLIT_MROPE, &SPLIT_MROPE_REFUSAL);
-    refused
+    REFUSED.iter().map(|r| (r.op, r)).collect()
 }
-
-static SPLIT_MROPE_REFUSAL: Refusal = Refusal {
-    op: SPLIT_MROPE,
-    why: "gemma's per-block rotate_half has no CUDA kernel; metal, vulkan and wgpu cover it",
-    file: "src/dispatch/attn.rs",
-    needle: "",
-};
 
 fn stopped() -> BTreeMap<String, BTreeSet<String>> {
     let refused = refused();
@@ -199,16 +168,7 @@ fn no_exemption_outlives_its_reason() {
 fn every_refusal_is_still_carried() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut gone = Vec::new();
-    for refusal in REFUSED.iter().chain(std::iter::once(&SPLIT_MROPE_REFUSAL)) {
-        if refusal.needle.is_empty() {
-            let elemwise = root.join("src/dispatch/elemwise.rs");
-            let source = std::fs::read_to_string(&elemwise).expect("elemwise.rs reads");
-            assert!(
-                source.contains("MropeForm::Split"),
-                "the split M-RoPE refusal has gone from dispatch/elemwise.rs"
-            );
-            continue;
-        }
+    for refusal in REFUSED {
         let path = root.join(refusal.file);
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("{} reads: {error}", refusal.file));

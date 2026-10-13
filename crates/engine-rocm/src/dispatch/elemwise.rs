@@ -514,11 +514,7 @@ impl Run<'_> {
             } => (match form {
                 MropeForm::Interleaved => elemwise::rope_mrope::interleaved,
                 MropeForm::Blocked => elemwise::rope_mrope::blocked,
-                MropeForm::Split => {
-                    return Err(kernels_rocm::Error::Unsupported {
-                        op: "elementwise.rope_mrope",
-                    });
-                }
+                MropeForm::Split => elemwise::rope_mrope::split,
             })(
                 self.ctx(),
                 &mut self.tensor(*q),
