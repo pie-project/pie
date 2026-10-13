@@ -271,6 +271,10 @@ pub enum Attention {
         plan: ValueId,
         q_pe: ValueId,
         cache: ValueId,
+        /// The tokens a query reads back through, itself included; none
+        /// reads every row.
+        #[serde(default)]
+        window: Option<u32>,
         heads: u32,
         kv_lora_rank: u32,
         sm_scale: f32,
@@ -282,6 +286,10 @@ pub enum Attention {
         plan: ValueId,
         q_pe: ValueId,
         cache: ValueId,
+        /// The tokens a query reads back through, itself included; none
+        /// reads every row.
+        #[serde(default)]
+        window: Option<u32>,
         heads: u32,
         kv_lora_rank: u32,
         sm_scale: f32,

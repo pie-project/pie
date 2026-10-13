@@ -416,7 +416,7 @@ pub(crate) mod naive {
 
     pub const NAIVE_WARPS: i32 = NAIVE_BLOCK as i32 / 32;
 
-    pub const NAIVE_MAX_PER: i32 = 16;
+    pub const NAIVE_MAX_PER: i32 = 32;
 
     pub const NAIVE_MAX_PE_PER: i32 = 4;
 
@@ -461,6 +461,7 @@ pub(crate) mod naive {
         pub sm_scale: f32,
         pub causal: bool,
         pub top_k: i32,
+        pub window: i32,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -492,7 +493,10 @@ pub(crate) mod naive {
         }
         let selected = ptrs.selection != 0;
 
-        if !selected && mma_supported(shape.kv_lora_rank, shape.rope_dim, shape.num_heads) {
+        if !selected
+            && shape.window == 0
+            && mma_supported(shape.kv_lora_rank, shape.rope_dim, shape.num_heads)
+        {
             #[allow(clippy::cast_sign_loss)]
             let launch = Launch::grid(
                 [
@@ -538,7 +542,7 @@ pub(crate) mod naive {
                 op,
                 format!(
                     "the latent rank {ckv} is not one this kernel can lane-split \
-                     (a multiple of 32, at most 512)"
+                     (a multiple of 32, at most 1024)"
                 ),
             ));
         }
@@ -567,7 +571,11 @@ pub(crate) mod naive {
             op,
             Fire::at(
                 "attn/mla.cuh",
-                "::pie::attn::mla_naive::mla_naive_paged_kernel",
+                if ckv / 32 > 16 {
+                    "::pie::attn::mla_naive::mla_naive_paged_kernel<32>"
+                } else {
+                    "::pie::attn::mla_naive::mla_naive_paged_kernel<16>"
+                },
             )
             .apply(launch),
             &[
@@ -591,6 +599,7 @@ pub(crate) mod naive {
                 shape.sm_scale.arg(),
                 shape.causal.arg(),
                 g.arg(),
+                shape.window.arg(),
                 ctx.stage(),
             ],
         )
@@ -861,12 +870,21 @@ fn dispatch_dense(
     num_heads: i32,
     sm_scale: f32,
     causal: bool,
+    window: Option<u32>,
     o: &mut Tensor,
     lse: u64,
 ) -> Result<(), Error> {
     // `kernel.mla.path`: Blackwell profiles pick `naive`; otherwise the FA2
-    // arm the plan's device fits.
-    if ctx.tuning().mla_naive {
+    // arm the plan's device fits. The FA2 arms read a 512-wide latent and
+    // every row, so a window or another width is the naive kernel's too.
+    if ctx.tuning().mla_naive || window.is_some() || layer.kv_lora_rank != 512 {
+        let window = match window {
+            None => 0,
+            Some(w) => i32::try_from(w)
+                .ok()
+                .filter(|&w| w > 0)
+                .ok_or_else(|| refuse(op, format!("a {w}-token window is not one it reads")))?,
+        };
         let num_requests = kv::lanes_of(op, qo_indptr)?;
         return naive::fire(
             ctx,
@@ -894,6 +912,7 @@ fn dispatch_dense(
                 sm_scale,
                 causal,
                 top_k: 0,
+                window,
             },
         );
     }
@@ -939,6 +958,7 @@ pub fn attention_decode(
     heads: u32,
     kv_lora_rank: u32,
     sm_scale: f32,
+    window: Option<u32>,
     o: &mut Tensor,
     lse: Option<&mut Tensor>,
 ) -> Result<(), Error> {
@@ -959,6 +979,7 @@ pub fn attention_decode(
         heads,
         sm_scale,
         false,
+        window,
         o,
         lse_plane(OP, lse, o.rows, heads)?,
     )
@@ -974,6 +995,7 @@ pub fn attention_prefill(
     heads: u32,
     kv_lora_rank: u32,
     sm_scale: f32,
+    window: Option<u32>,
     o: &mut Tensor,
     lse: Option<&mut Tensor>,
 ) -> Result<(), Error> {
@@ -994,6 +1016,7 @@ pub fn attention_prefill(
         heads,
         sm_scale,
         true,
+        window,
         o,
         lse_plane(OP, lse, o.rows, heads)?,
     )
@@ -1059,6 +1082,7 @@ fn selected(
             sm_scale,
             causal,
             top_k: stated(op, selection.width)?,
+            window: 0,
         },
     )
 }

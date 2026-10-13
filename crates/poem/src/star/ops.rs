@@ -1001,6 +1001,7 @@ pub(crate) static OPS: &[Op] = &[
             "heads",
             "kv_lora_rank",
             "sm_scale",
+            "window",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -1010,10 +1011,20 @@ pub(crate) static OPS: &[Op] = &[
             let heads: u32 = a.next()?;
             let kv_lora_rank: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
+            let window: Option<u32> = a.next()?;
             result(
                 heap,
                 dsl("attn.mla_decode", || {
-                    ops::attn::mla_decode(&q, &plan, &q_pe, pages, heads, kv_lora_rank, sm_scale)
+                    ops::attn::mla_decode(
+                        &q,
+                        &plan,
+                        &q_pe,
+                        pages,
+                        heads,
+                        kv_lora_rank,
+                        sm_scale,
+                        window,
+                    )
                 })?,
             )
         },
@@ -1029,6 +1040,7 @@ pub(crate) static OPS: &[Op] = &[
             "heads",
             "kv_lora_rank",
             "sm_scale",
+            "window",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -1038,10 +1050,20 @@ pub(crate) static OPS: &[Op] = &[
             let heads: u32 = a.next()?;
             let kv_lora_rank: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
+            let window: Option<u32> = a.next()?;
             result(
                 heap,
                 dsl("attn.mla_prefill", || {
-                    ops::attn::mla_prefill(&q, &plan, &q_pe, pages, heads, kv_lora_rank, sm_scale)
+                    ops::attn::mla_prefill(
+                        &q,
+                        &plan,
+                        &q_pe,
+                        pages,
+                        heads,
+                        kv_lora_rank,
+                        sm_scale,
+                        window,
+                    )
                 })?,
             )
         },
@@ -1135,6 +1157,7 @@ pub(crate) static OPS: &[Op] = &[
             "heads",
             "kv_lora_rank",
             "sm_scale",
+            "window",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -1144,6 +1167,7 @@ pub(crate) static OPS: &[Op] = &[
             let heads: u32 = a.next()?;
             let kv_lora_rank: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
+            let window: Option<u32> = a.next()?;
             result(
                 heap,
                 dsl("attn.mla_decode_lse", || {
@@ -1155,6 +1179,7 @@ pub(crate) static OPS: &[Op] = &[
                         heads,
                         kv_lora_rank,
                         sm_scale,
+                        window,
                     )
                 })?,
             )
@@ -1171,6 +1196,7 @@ pub(crate) static OPS: &[Op] = &[
             "heads",
             "kv_lora_rank",
             "sm_scale",
+            "window",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -1180,6 +1206,7 @@ pub(crate) static OPS: &[Op] = &[
             let heads: u32 = a.next()?;
             let kv_lora_rank: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
+            let window: Option<u32> = a.next()?;
             result(
                 heap,
                 dsl("attn.mla_prefill_lse", || {
@@ -1191,6 +1218,7 @@ pub(crate) static OPS: &[Op] = &[
                         heads,
                         kv_lora_rank,
                         sm_scale,
+                        window,
                     )
                 })?,
             )

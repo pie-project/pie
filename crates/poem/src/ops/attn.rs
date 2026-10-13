@@ -1005,6 +1005,7 @@ fn mla_scored(
     sm_scale: f32,
     decode: bool,
     with_lse: bool,
+    window: Option<u32>,
 ) -> (Value, Option<Value>) {
     let r = q.rec();
     let width = u64::from(heads) * u64::from(kv_lora_rank);
@@ -1018,6 +1019,7 @@ fn mla_scored(
             plan: plan_id,
             q_pe: q_pe_id,
             cache: pages,
+            window,
             heads,
             kv_lora_rank,
             sm_scale,
@@ -1029,6 +1031,7 @@ fn mla_scored(
             plan: plan_id,
             q_pe: q_pe_id,
             cache: pages,
+            window,
             heads,
             kv_lora_rank,
             sm_scale,
@@ -1074,6 +1077,7 @@ pub fn mla_decode(
     heads: u32,
     kv_lora_rank: u32,
     sm_scale: f32,
+    window: Option<u32>,
 ) -> Value {
     mla_scored(
         q,
@@ -1086,6 +1090,7 @@ pub fn mla_decode(
         sm_scale,
         true,
         false,
+        window,
     )
     .0
 }
@@ -1098,6 +1103,7 @@ pub fn mla_prefill(
     heads: u32,
     kv_lora_rank: u32,
     sm_scale: f32,
+    window: Option<u32>,
 ) -> Value {
     mla_scored(
         q,
@@ -1110,6 +1116,7 @@ pub fn mla_prefill(
         sm_scale,
         false,
         false,
+        window,
     )
     .0
 }
@@ -1136,6 +1143,7 @@ pub fn mla_decode_selected(
         sm_scale,
         true,
         false,
+        None,
     )
     .0
 }
@@ -1162,6 +1170,7 @@ pub fn mla_prefill_selected(
         sm_scale,
         false,
         false,
+        None,
     )
     .0
 }
@@ -1176,6 +1185,7 @@ pub fn mla_decode_lse(
     heads: u32,
     kv_lora_rank: u32,
     sm_scale: f32,
+    window: Option<u32>,
 ) -> (Value, Value) {
     lse_of(mla_scored(
         q,
@@ -1188,6 +1198,7 @@ pub fn mla_decode_lse(
         sm_scale,
         true,
         true,
+        window,
     ))
 }
 
@@ -1200,6 +1211,7 @@ pub fn mla_prefill_lse(
     heads: u32,
     kv_lora_rank: u32,
     sm_scale: f32,
+    window: Option<u32>,
 ) -> (Value, Value) {
     lse_of(mla_scored(
         q,
@@ -1212,6 +1224,7 @@ pub fn mla_prefill_lse(
         sm_scale,
         false,
         true,
+        window,
     ))
 }
 
@@ -1239,6 +1252,7 @@ pub fn mla_decode_selected_lse(
         sm_scale,
         true,
         true,
+        None,
     ))
 }
 
@@ -1266,6 +1280,7 @@ pub fn mla_prefill_selected_lse(
         sm_scale,
         false,
         true,
+        None,
     ))
 }
 

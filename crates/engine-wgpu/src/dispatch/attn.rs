@@ -550,10 +550,17 @@ impl Run<'_> {
                 Err(kernels_wgpu::Error::Unsupported { op: op.name() })
             }
             Attention::MlaDecode {
+                window: Some(_), ..
+            }
+            | Attention::MlaPrefill {
+                window: Some(_), ..
+            } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
+            Attention::MlaDecode {
                 q,
                 plan: _,
                 q_pe,
                 cache,
+                window: None,
                 heads,
                 kv_lora_rank,
                 sm_scale,
@@ -582,6 +589,7 @@ impl Run<'_> {
                 plan: _,
                 q_pe,
                 cache,
+                window: None,
                 heads,
                 kv_lora_rank,
                 sm_scale,

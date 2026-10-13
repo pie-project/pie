@@ -3,8 +3,8 @@
 // A latent attention asked for its log-sum-exp lands, beside its scores, each
 // row's per-head base-2 log of the softmax denominator a sink rescales by.
 // Every arm is read against a host reference: the FA2 arm the plan takes, the
-// tensor-core and the naive arm (`kernel.mla.path = naive`), and the naive
-// arm reading a selection.
+// tensor-core and the naive arm (`kernel.mla.path = naive`), the naive arm
+// reading a selection, and the naive arm a window sends any read to.
 
 use crate::common::{Gpu, Lcg, close, from_bf16};
 use dtype::Dtype;
@@ -68,9 +68,9 @@ impl Case {
         out
     }
 
-    /// The scores and the base-2 log-sum-exp, over every causal key or the
-    /// selection.
-    fn reference(&self, selected: bool) -> (Vec<f32>, Vec<f32>) {
+    /// The scores and the base-2 log-sum-exp, over every causal key (the
+    /// last `window` of them, given one) or the selection.
+    fn reference(&self, selected: bool, window: Option<usize>) -> (Vec<f32>, Vec<f32>) {
         let tokens = self.tokens();
         let mut out = vec![0f32; tokens * HEADS * RANK];
         let mut lse = vec![0f32; tokens * HEADS];
@@ -82,7 +82,7 @@ impl Case {
                 let keys: Vec<usize> = if selected {
                     Self::picked(abs)
                 } else {
-                    (0..=abs).collect()
+                    ((abs + 1).saturating_sub(window.unwrap_or(abs + 1))..=abs).collect()
                 };
                 for h in 0..HEADS {
                     let qn = &self.q_nope[(t * HEADS + h) * RANK..][..RANK];
@@ -231,6 +231,7 @@ fn score(
     raw: &Raw,
     naive: bool,
     selected: bool,
+    window: Option<u32>,
 ) -> (Vec<u16>, Vec<f32>) {
     let device = Device::probe(&gpu.ctx()).expect("the device answers its attributes");
     let plan = plan(gpu, case, &device);
@@ -275,6 +276,7 @@ fn score(
             HEADS as u32,
             RANK as u32,
             case.sm_scale,
+            window,
             &mut o,
             Some(&mut lse),
         )
@@ -326,11 +328,21 @@ fn the_mla_scores_land_their_log_sum_exp() {
         last_page_lens: gpu.up(&LAST_PAGE_LENS),
         selection: gpu.up(&case.selection()),
     };
-    let dense = case.reference(false);
-    let fa2 = score(&mut gpu, &case, &raw, false, false);
+    let dense = case.reference(false, None);
+    let fa2 = score(&mut gpu, &case, &raw, false, false, None);
     assert_landed(&fa2, &dense, "the FA2 arm");
-    let mma = score(&mut gpu, &case, &raw, true, false);
+    let mma = score(&mut gpu, &case, &raw, true, false, None);
     assert_landed(&mma, &dense, "the tensor-core arm");
-    let picked = score(&mut gpu, &case, &raw, true, true);
-    assert_landed(&picked, &case.reference(true), "the selected naive arm");
+    let picked = score(&mut gpu, &case, &raw, true, true, None);
+    assert_landed(
+        &picked,
+        &case.reference(true, None),
+        "the selected naive arm",
+    );
+    let windowed = score(&mut gpu, &case, &raw, false, false, Some(24));
+    assert_landed(
+        &windowed,
+        &case.reference(false, Some(24)),
+        "the windowed naive arm",
+    );
 }
