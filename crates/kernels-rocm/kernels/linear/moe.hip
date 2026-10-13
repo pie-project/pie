@@ -489,7 +489,34 @@ __global__ __launch_bounds__(256) void moe_matmul_select_dense_batch(
     if (!group_item(offsets, work, num_experts, MT, item)) return;
     const T* w = bank + static_cast<long long>(item.expert) * n * k;
     batch_tile<BatchDense<T, 256>, T, MT, NBW, 3>(act, order, item.begin, item.count, {w}, nullptr, out, act_div, n,
-                                                  k);
+                                                  k, blockIdx.y);
+}
+
+// The dense projection as one expert every row routes to: y[m, n] = act[m,
+// k]·wᵀ (SWIGLU: h[m, n] = silu(act·gateᵀ)·(act·upᵀ) from a packed [gate |
+// up] bank of 2·n rows), MT rows of act an item, 64 output rows a block. One
+// dimension of blocks: each 64-row tile's `splits` slices of K, `items`
+// items each, in turn, the tiles dealt round the eight XCDs (block b runs on
+// XCD b mod 8) so a tile's items run on one XCD at once and their later
+// reads of the weight (cached reads, past one item) find its L2. A slice is
+// `per` stages; SPLIT lands each slice's f32 partial in `part` ([splits, m,
+// n], 2·n under SWIGLU) for mgemm_finalize to sum in slice order.
+constexpr int kDenseXcds = 8;
+
+template <int MT, bool SWIGLU, bool SPLIT, bool NT>
+__global__ __launch_bounds__(256) void dense_batch_bf16(const bf16* __restrict__ act, const bf16* __restrict__ w,
+                                                        bf16* __restrict__ y, float* __restrict__ part, int m, int n,
+                                                        int k, int items, int tiles, int splits, int per) {
+    constexpr int SBY = MT >= 32 ? 128 : 256;  // a stage of 64 or 128 elements
+    const int b = blockIdx.x, xcd = b % kDenseXcds, slot = b / kDenseXcds;
+    const int item = slot % items, rest = slot / items, split = rest % splits;
+    const int tile = rest / splits * kDenseXcds + xcd;
+    if (tile >= tiles) return;
+    const int begin = item * MT;
+    float* slice = SPLIT ? part + static_cast<long long>(split) * m * (SWIGLU ? 2 * n : n) : nullptr;
+    batch_tile<BatchDense<bf16, SBY>, bf16, MT, SWIGLU ? 2 : 1, 3, SWIGLU, NT>(
+        act, nullptr, begin, min(MT, m - begin), {w}, nullptr, y, 1, n, k, tile, split * per, (split + 1) * per,
+        slice);
 }
 
 }  // namespace pie::linear

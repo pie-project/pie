@@ -824,6 +824,10 @@ constexpr u32 kBatchVoid = 0xfffff000u;
 __device__ __forceinline__ void bload_nt(i32x4& d, moe_rsrc r, u32 v) {
     asm volatile("buffer_load_dwordx4 %0, %1, %2, 0 offen nt" : "=v"(d) : "v"(v), "s"(r) : "memory");
 }
+// The same cached: a weight other blocks read again.
+__device__ __forceinline__ void bload_kept(i32x4& d, moe_rsrc r, u32 v) {
+    asm volatile("buffer_load_dwordx4 %0, %1, %2, 0 offen" : "=v"(d) : "v"(v), "s"(r) : "memory");
+}
 template <int BYTES>
 __device__ __forceinline__ void bload_run(moe_i2& d, moe_rsrc r, u32 v) {
     static_assert(BYTES == 1 || BYTES == 2 || BYTES == 4 || BYTES == 8, "a run of 1, 2, 4 or 8 bytes");
@@ -1036,14 +1040,23 @@ struct BatchAffine {
 };
 
 // y[route] = W·act[route / act_div] (+ bias) for routes order[begin ..
-// begin + count) (count ≤ MT) of one expert, weight rows [blockIdx.y·64·NBW,
-// +64·NBW). Rounds once on the store, after the bias. Short of 16 routes the
-// activation's rows past MT read one zero row.
-template <class C, class T, int MT, int NBW, int DEPTH>
+// begin + count) (count ≤ MT) of one expert (routes begin .. begin + count
+// themselves without an order), weight rows [tile·64·NBW, +64·NBW). Rounds
+// once on the store, after the bias. Short of 16 routes the activation's
+// rows past MT read one zero row. SWIGLU reads a packed [gate | up] bank of
+// 2·n rows and lands silu(gate)·up over n: a wave's two blocks are its 16
+// gate rows and the matching up rows, the products rounded to T first, as
+// the unfused projection lands them. A block may take stages [s0, s1) of K
+// alone and land its f32 partial in `part` (rows of n, 2·n under SWIGLU,
+// gate then up) for a later sum, unbiased and unrounded. NT reads the weight
+// as no other block reads it again.
+template <class C, class T, int MT, int NBW, int DEPTH, bool SWIGLU = false, bool NT = true>
 __device__ __forceinline__ void batch_tile(const T* __restrict__ act, const i32* __restrict__ order, int begin,
                                            int count, const typename C::Planes& p, const T* __restrict__ bias,
-                                           T* __restrict__ out, int act_div, int n, int k) {
-    static_assert(MT == 4 || MT == 8 || MT == 16 || MT == 32, "a batch item is 4, 8, 16 or 32 routes");
+                                           T* __restrict__ out, int act_div, int n, int k, int tile, int s0 = 0,
+                                           int s1 = -1, float* __restrict__ part = nullptr) {
+    static_assert(!SWIGLU || NBW == 2, "a SwiGLU wave takes a gate block and its up block");
+    static_assert(MT == 4 || MT == 8 || MT == 16 || MT == 32 || MT == 64, "a batch item is 4 to 64 routes");
     constexpr int MB = MT < 16 ? 1 : MT / 16, KC = C::kStageK, LD = KC + 8, R = DEPTH + 1;
     constexpr int RT = MT < 16 ? MT + 1 : MT;  // LDS rows a buffer
     constexpr int WAVES = kGroupThreads / kWave;
@@ -1062,9 +1075,14 @@ __device__ __forceinline__ void batch_tile(const T* __restrict__ act, const i32*
 
     const int tid = threadIdx.x, l = lane(), r16 = l % 16, g = l / 16;
     const int wave = __builtin_amdgcn_readfirstlane(tid / kWave);
-    const int row0 = (blockIdx.y * WAVES + wave) * (16 * NBW);
-    const int stages = (k + KC - 1) / KC;
-    const typename C::Run run = C::run(p, n, k);
+    const int row0 = (tile * WAVES + wave) * (SWIGLU ? 16 : 16 * NBW);
+    const int all = (k + KC - 1) / KC, first = s0;
+    const int stages = (s1 < 0 ? all : min(s1, all)) - first;
+    const typename C::Run run = C::run(p, SWIGLU ? 2 * n : n, k);
+    // The bank row of the wave's local row r; a row past the bank reads the
+    // last.
+    auto bank_row = [&](int r) { return SWIGLU ? min(row0 + r % 16, n - 1) + r / 16 * n : min(row0 + r, n - 1); };
+    auto route = [&](int m) { return order != nullptr ? order[begin + m] : begin + m; };
     const moe_rsrc wr = C::codes(run);
 
     // The routes' activation rows; a route past the item reads the first and
@@ -1079,20 +1097,20 @@ __device__ __forceinline__ void batch_tile(const T* __restrict__ act, const i32*
         const int m = piece / (KC / 8);
         mine[i] = tid + i * kGroupThreads < PA;
         live[i] = m < count;
-        src[i] = act + static_cast<long long>(order[begin + (live[i] ? m : 0)] / act_div) * k;
+        src[i] = act + static_cast<long long>(route(live[i] ? m : 0) / act_div) * k;
         col[i] = (piece % (KC / 8)) * 8;
         at[i] = m * LD + col[i];
     }
     // A wave's read i takes 16 bytes of its stage's flat run of rows, the
-    // (64·i + l)th; a row past the bank reads the last.
+    // (64·i + l)th.
     u32 wv[NL];
     int frow[NBW];
 #pragma unroll
-    for (int nb = 0; nb < NBW; ++nb) frow[nb] = min(row0 + nb * 16 + r16, n - 1);
+    for (int nb = 0; nb < NBW; ++nb) frow[nb] = bank_row(nb * 16 + r16);
 #pragma unroll
     for (int i = 0; i < NL; ++i) {
         const int flat = kWave * i + l;
-        wv[i] = static_cast<u32>(min(row0 + flat / LPR, n - 1)) * C::row_bytes(run) + flat % LPR * 16;
+        wv[i] = static_cast<u32>(bank_row(flat / LPR)) * C::row_bytes(run) + flat % LPR * 16;
     }
 
     i32x4 w[R][NL];
@@ -1108,21 +1126,28 @@ __device__ __forceinline__ void batch_tile(const T* __restrict__ act, const i32*
     // stage the activation rereads the last and the weight reads nothing.
     auto issue = [&](auto slot, int s) {
         constexpr int S = decltype(slot)::value;
-        const int sc = min(s, stages - 1);
+        const int sc = first + min(s, stages - 1), sa = first + s;
         const bool on = s < stages;
 #pragma unroll
         for (int i = 0; i < NA; ++i) gload16(a[S][i], src[i] + min(sc * KC + col[i], k - 8));
 #pragma unroll
-        for (int i = 0; i < NL; ++i) bload_nt(w[S][i], wr, on ? wv[i] + s * SBY : kBatchVoid);
+        for (int i = 0; i < NL; ++i) {
+            const u32 v = on ? wv[i] + sa * SBY : kBatchVoid;
+            if constexpr (NT) {
+                bload_nt(w[S][i], wr, v);
+            } else {
+                bload_kept(w[S][i], wr, v);
+            }
+        }
 #pragma unroll
-        for (int nb = 0; nb < NBW; ++nb) C::issue_factors(f[S][nb], run, frow[nb], s, on);
+        for (int nb = 0; nb < NBW; ++nb) C::issue_factors(f[S][nb], run, frow[nb], sa, on);
     };
     auto store = [&](auto slot, int buf, int s) {
         constexpr int S = decltype(slot)::value;
         T* st = xs + buf * (RT * LD);
 #pragma unroll
         for (int i = 0; i < NA; ++i) {
-            const bool on = live[i] && s * KC + col[i] < k;
+            const bool on = live[i] && (first + s) * KC + col[i] < k;
             if (PA % kGroupThreads == 0 || mine[i])
                 *reinterpret_cast<b128*>(st + at[i]) =
                     on ? C::shuffle(__builtin_bit_cast(b128, a[S][i])) : b128{{0u, 0u, 0u, 0u}};
@@ -1268,13 +1293,29 @@ __device__ __forceinline__ void batch_tile(const T* __restrict__ act, const i32*
         for (int t = 0; t < 4; ++t) {
             const int m = mb * 16 + 4 * g + t;
             if (m >= count) continue;
-            T* o = out + static_cast<long long>(order[begin + m]) * n;
+            if (part != nullptr) {
+                float* q = part + static_cast<long long>(route(m)) * (SWIGLU ? 2 * n : n);
 #pragma unroll
-            for (int nb = 0; nb < NBW; ++nb) {
-                const int c = row0 + nb * 16 + r16;
+                for (int nb = 0; nb < NBW; ++nb) {
+                    const int c = row0 + (SWIGLU ? 0 : nb * 16) + r16;
+                    if (c < n) q[(SWIGLU ? nb * n : 0) + c] = acc[nb][mb][t];
+                }
+                continue;
+            }
+            T* o = out + static_cast<long long>(route(m)) * n;
+            if constexpr (SWIGLU) {
+                const int c = row0 + r16;
                 if (c >= n) continue;
-                const float b = bias != nullptr ? to_f32(bias[c]) : 0.f;
-                o[c] = from_f32<T>(acc[nb][mb][t] + b);
+                const float gt = to_f32(from_f32<T>(acc[0][mb][t])), up = to_f32(from_f32<T>(acc[1][mb][t]));
+                o[c] = from_f32<T>(gt * (1.f / (1.f + __expf(-gt))) * up);
+            } else {
+#pragma unroll
+                for (int nb = 0; nb < NBW; ++nb) {
+                    const int c = row0 + nb * 16 + r16;
+                    if (c >= n) continue;
+                    const float b = bias != nullptr ? to_f32(bias[c]) : 0.f;
+                    o[c] = from_f32<T>(acc[nb][mb][t] + b);
+                }
             }
         }
 }

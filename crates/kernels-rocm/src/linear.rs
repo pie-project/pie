@@ -1,5 +1,7 @@
 #[cfg(feature = "rocm")]
 mod dense;
+#[cfg(feature = "rocm")]
+mod dense_batch;
 
 pub mod gemm;
 

@@ -1200,7 +1200,7 @@ __global__ __launch_bounds__(256) void moe_matmul_select_mxfp4_batch(
     const long long rows = static_cast<long long>(item.expert) * n;
     batch_tile<BatchMxfp4<MT == 32 ? 64 : 128>, bf16, MT, NBW, kBatchDepth>(
         act, order, item.begin, item.count, {c + rows * (k / 2), s + rows * (k / 32)},
-        bias != nullptr ? bias + rows : nullptr, out, act_div, n, k);
+        bias != nullptr ? bias + rows : nullptr, out, act_div, n, k, blockIdx.y);
 }
 
 template <int BITS, int GROUP, int MT, int NBW>
@@ -1224,7 +1224,7 @@ __global__ __launch_bounds__(256) void moe_matmul_select_mlxu4_batch(
         act, order, item.begin, item.count,
         {reinterpret_cast<const u32*>(c) + rows * (k / 8), reinterpret_cast<const bf16*>(s) + factors,
          reinterpret_cast<const bf16*>(b) + factors},
-        nullptr, out, act_div, n, k);
+        nullptr, out, act_div, n, k, blockIdx.y);
 }
 
 // The grouped legs off the matrix core, any T, f32 throughout: one expert a

@@ -10,6 +10,7 @@ use crate::hip::blas::{self, Operand};
 use crate::hip::{lt, sys};
 use crate::jit::{Ctx, refuse};
 
+use super::dense_batch::dense_batch_bf16;
 use super::gemv::{gemv_bf16, skinny_bf16, skinny_swiglu_bf16};
 use super::mgemm::mgemm_bf16;
 
@@ -42,6 +43,9 @@ pub(crate) fn act_x_wt(
     }
     if m == 1 && gemv_bf16(ctx, w, act, bias, y, n, k).is_ok() {
         return Ok(bias != 0);
+    }
+    if bias == 0 && batch_on(ctx, m, n, k) && dense_batch_bf16(ctx, w, act, y, m, n, k, false)? {
+        return Ok(false);
     }
     if bias == 0 && mgemm_on() && mgemm_bf16(ctx, w, act, y, m, n, k, false)? {
         return Ok(false);
@@ -109,7 +113,22 @@ pub(crate) fn act_x_wt_swiglu(
     if skinny && skinny_swiglu_bf16(ctx, gate_up, act, h, m, intermediate, k).is_ok() {
         return Ok(true);
     }
+    if batch_on(ctx, m, 2 * intermediate, k)
+        && dense_batch_bf16(ctx, gate_up, act, h, m, intermediate, k, true)?
+    {
+        return Ok(true);
+    }
     Ok(mgemm_on() && mgemm_bf16(ctx, gate_up, act, h, m, intermediate, k, true)?)
+}
+
+/// Whether the batch engine takes `m` rows over an n x k weight
+/// (`kernel.dense.batch_*`).
+fn batch_on(ctx: &Ctx, m: i32, n: i32, k: i32) -> bool {
+    let t = ctx.tuning();
+    let weight = i64::from(n) * i64::from(k);
+    (t.dense_batch_from as i32..=t.dense_batch_until as i32).contains(&m)
+        && (i64::from(t.dense_batch_weight_mi) << 20..=i64::from(t.dense_batch_weight_max_mi) << 20)
+            .contains(&weight)
 }
 
 /// The decode-batch kernel streams the weight at ~1.7 TB/s against

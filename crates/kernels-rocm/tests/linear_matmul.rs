@@ -134,3 +134,72 @@ fn the_fused_swiglu_is_the_matmul_then_the_swiglu() {
         assert_eq!(diff, 0, "{m}x{i}x{k}: {diff} cells differ");
     }
 }
+
+/// The batch engine's projection (forced over every row count it covers):
+/// one item and several, a ragged N, a K short of a whole stage, and the
+/// fused SwiGLU against its own matmul then the swiglu.
+#[test]
+fn the_batch_engine_projection() {
+    let Some(gpu) = Gpu::open() else { return };
+    let mut t = kernels_rocm::tuning::Tuning::DEFAULT;
+    t.dense_batch_from = 1;
+    t.dense_batch_until = 4096;
+    t.dense_batch_weight_mi = 0;
+    t.dense_batch_weight_max_mi = 65_536;
+    let ctx = gpu.ctx().with_tuning(t);
+    for (m, n, k) in [
+        (8u32, 1000u32, 1024u32),
+        (17, 784, 1032),
+        (32, 4096, 2048),
+        (64, 1024, 2048),
+        (100, 520, 1096),
+        (256, 192, 512),
+    ] {
+        let a: Vec<f32> = values((m * k) as usize, 21, 1.0)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let w: Vec<f32> = values((n * k) as usize, 22, 0.05)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let at = gpu.tensor(&a, m, k, Dtype::Bf16);
+        let wt = gpu.tensor(&w, n, k, Dtype::Bf16);
+        let mut y = gpu.zeros(m, n, Dtype::Bf16);
+        gemm::matmul(&ctx, at, wt, &mut y).unwrap();
+        close_bf16(
+            &format!("batch matmul {m}x{n}x{k}"),
+            &gpu.read(&y),
+            &reference(&a, &w, None, m as usize, n as usize, k as usize),
+            2.0,
+        );
+    }
+    for (m, i, k) in [(8u32, 512u32, 1024u32), (40, 1000, 2048), (200, 136, 1032)] {
+        let a: Vec<f32> = values((m * k) as usize, 23, 1.0)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let w: Vec<f32> = values((2 * i * k) as usize, 24, 0.05)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let at = gpu.tensor(&a, m, k, Dtype::Bf16);
+        let wt = gpu.tensor(&w, 2 * i, k, Dtype::Bf16);
+        let mut h = gpu.zeros(m, i, Dtype::Bf16);
+        assert!(
+            gemm::matmul_swiglu(&ctx, at, wt, &mut h).unwrap(),
+            "{m}x{i}x{k} fused"
+        );
+        let mut packed = gpu.zeros(m, 2 * i, Dtype::Bf16);
+        gemm::matmul(&ctx, at, wt, &mut packed).unwrap();
+        let mut h2 = gpu.zeros(m, i, Dtype::Bf16);
+        kernels_rocm::linear::mlp::swiglu(&ctx, packed, i, 1, &mut h2).unwrap();
+        let (got, want) = (gpu.read(&h), gpu.read(&h2));
+        let diff = got
+            .iter()
+            .zip(&want)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(diff, 0, "batch {m}x{i}x{k}: {diff} cells differ");
+    }
+}

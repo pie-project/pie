@@ -165,6 +165,27 @@ pub struct MoeBatchFrom(pub u32);
 #[decision(id = "kernel.moe.batch_until", constant(range(0..=4096)), default = 32, tune = search)]
 pub struct MoeBatchUntil(pub u32);
 
+/// The rows from which, and up to which, a bf16 projection (and the fused
+/// gate/up SwiGLU) takes the batch engine over hipBLASLt; until 0, never.
+/// On MI300X it wins by 1.2x only at a few rows over a wide bank (Qwen3.8's
+/// gate/up); hipBLASLt streams the rest at least as fast.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.dense.batch_from", constant(range(0..=4096)), default = 8, tune = search)]
+pub struct DenseBatchFrom(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.dense.batch_until", constant(range(0..=4096)), default = 16, tune = search)]
+pub struct DenseBatchUntil(pub u32);
+
+/// The weights (n·k, in Mi elements) the batch engine takes, from and up to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.dense.batch_weight_mi", constant(range(0..=65_536)), default = 128, tune = search)]
+pub struct DenseBatchWeightMi(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.dense.batch_weight_max_mi", constant(range(0..=65_536)), default = 192, tune = search)]
+pub struct DenseBatchWeightMaxMi(pub u32);
+
 pub fn register(registry: &mut Registry) {
     registry
         .add::<MoeGrouped>()
@@ -193,7 +214,11 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeAffineGroupedFrom>()
         .add::<MoeBatch>()
         .add::<MoeBatchFrom>()
-        .add::<MoeBatchUntil>();
+        .add::<MoeBatchUntil>()
+        .add::<DenseBatchFrom>()
+        .add::<DenseBatchUntil>()
+        .add::<DenseBatchWeightMi>()
+        .add::<DenseBatchWeightMaxMi>();
 }
 
 /// The kernel decisions one load runs under, read once from its profile.
@@ -228,6 +253,10 @@ pub struct Tuning {
     pub moe_batch: bool,
     pub moe_batch_from: u32,
     pub moe_batch_until: u32,
+    pub dense_batch_from: u32,
+    pub dense_batch_until: u32,
+    pub dense_batch_weight_mi: u32,
+    pub dense_batch_weight_max_mi: u32,
 }
 
 impl Tuning {
@@ -260,6 +289,10 @@ impl Tuning {
         moe_batch: true,
         moe_batch_from: 2,
         moe_batch_until: 32,
+        dense_batch_from: 8,
+        dense_batch_until: 16,
+        dense_batch_weight_mi: 128,
+        dense_batch_weight_max_mi: 192,
     };
 
     #[must_use]
@@ -292,6 +325,10 @@ impl Tuning {
             moe_batch: profile.on::<MoeBatch>(&Anywhere),
             moe_batch_from: profile.get::<MoeBatchFrom>().0,
             moe_batch_until: profile.get::<MoeBatchUntil>().0,
+            dense_batch_from: profile.get::<DenseBatchFrom>().0,
+            dense_batch_until: profile.get::<DenseBatchUntil>().0,
+            dense_batch_weight_mi: profile.get::<DenseBatchWeightMi>().0,
+            dense_batch_weight_max_mi: profile.get::<DenseBatchWeightMaxMi>().0,
         }
     }
 }
