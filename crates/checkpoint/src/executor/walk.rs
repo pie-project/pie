@@ -1309,7 +1309,9 @@ impl Walk<'_, '_> {
                 output.ok_or_else(|| invalid("per-block Scale requires an output buffer"))?;
             let elements = match transform.from {
                 None => decode_values(bytes, payload()?)?,
-                Some(QuantScheme::Mxfp4E2M1E8M0) => decode_mxfp4_elements(bytes),
+                Some(QuantScheme::Mxfp4E2M1E8M0 | QuantScheme::Nvfp4E2M1E4M3) => {
+                    decode_mxfp4_elements(bytes)
+                }
                 Some(QuantScheme::Int4B8) => decode_int4b8_elements(bytes),
                 Some(QuantScheme::Fp8E4M3) => decode_fp8_e4m3_elements(bytes),
                 Some(QuantScheme::MlxAffineU4) => {
@@ -1538,6 +1540,12 @@ impl Walk<'_, '_> {
             && transform.metadata_source.is_some()
         {
             return self.fp8_block_cast(source, transform, output, bytes, to);
+        }
+        // An e4m3 plane with no block factors beside it is widened code for
+        // code; a scale stored once for the whole plane (modelopt's per-tensor
+        // FP8) is the contract's own per-block Scale over the result.
+        if from == DType::E4m3 && matches!(to, DType::Bf16 | DType::F16 | DType::F32) {
+            return encode_values(&decode_fp8_e4m3_elements(bytes), to);
         }
         cast_elements(bytes, from, to)
     }
