@@ -10,7 +10,7 @@ const FILE: &str = "attn/ssm.hip";
 
 const BLOCK: u32 = 256;
 
-const WARP: u32 = 32;
+const WAVE: u32 = 64;
 
 const FLOAT: u32 = 4;
 
@@ -18,10 +18,6 @@ const PREP_BLOCK: u32 = 128;
 
 /// A thread a channel for the decode conv.
 const CONV_UPDATE_BLOCK: u32 = 256;
-
-const fn kda_shmem(d: u32) -> u32 {
-    3u32.saturating_mul(d).saturating_mul(FLOAT)
-}
 
 fn requests(op: &'static str, x: RaggedTensor) -> Result<u32, Error> {
     if x.indptr.dtype != Dtype::I32 {
@@ -1025,29 +1021,6 @@ impl Kda {
         })
     }
 
-    /// The scan walks each head's `D x D` state in place, so a fire in which
-    /// some row may not fold its boundary (no fold asked, or a predicate
-    /// naming the lanes that do) gets a working copy per row and head; a
-    /// fire that folds everywhere walks the slots themselves.
-    fn work(
-        self,
-        ctx: &Ctx,
-        op: &'static str,
-        state: &RecurrentPool,
-        rows: u32,
-    ) -> Result<u64, Error> {
-        if state.write_state && state.write_state_mask.is_absent() {
-            return Ok(0);
-        }
-        let cells = u64::from(self.head_dim) * u64::from(self.head_dim);
-        plane(
-            ctx,
-            op,
-            "attn.ssm_kda_work",
-            u64::from(rows) * u64::from(self.heads) * cells,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn stage(
         self,
@@ -1062,6 +1035,8 @@ impl Kda {
         gate_floor: f32,
     ) -> Result<KdaStaged, Error> {
         const PLANES: u32 = 3;
+        /// Heads a staging wavefront norms.
+        const PREP_HEADS: u32 = 4;
 
         let wide = u64::from(self.n) * u64::from(self.width);
         let decay = u64::from(self.n) * u64::from(self.heads);
@@ -1078,8 +1053,14 @@ impl Kda {
 
         ctx.fire(
             op,
-            Fire::at(FILE, "::pie::attn::ssm_kda_qkv_prep<::pie::bf16, 128>")
-                .apply(Launch::grid([self.n, PLANES, 1], [PREP_BLOCK, 1, 1])),
+            Fire::at(FILE, "::pie::attn::ssm_kda_qkv_prep<::pie::bf16, 128>").apply(Launch::grid(
+                [
+                    self.n,
+                    PLANES,
+                    self.heads.div_ceil(PREP_HEADS * (PREP_BLOCK / WAVE)),
+                ],
+                [PREP_BLOCK, 1, 1],
+            )),
             &[
                 mixed.arg(),
                 ArgValue::Ptr(staged.q_norm),
@@ -1094,8 +1075,8 @@ impl Kda {
         ctx.fire(
             op,
             Fire::at(FILE, "::pie::attn::ssm_kda_gate_beta<::pie::bf16>").apply(Launch::grid(
-                [self.n, self.heads, 1],
-                [self.head_dim.clamp(WARP, PREP_BLOCK), 1, 1],
+                [self.n, self.width.div_ceil(4 * PREP_BLOCK), 1],
+                [PREP_BLOCK, 1, 1],
             )),
             &[
                 f.arg(),
@@ -1128,6 +1109,27 @@ fn f32_state(op: &'static str, state: &RecurrentPool) -> Result<(), Error> {
     Ok(())
 }
 
+/// The token kernels hold a KDA state row on eight lanes in whole 32-wide
+/// pieces, up to this wide.
+const KDA_MAX_HEAD: u32 = 128;
+
+/// Value rows a decode block walks when the batch is too small for a block
+/// per row and head.
+const KDA_TILE_ROWS: u32 = 32;
+
+fn kda_head(op: &'static str, head_dim: u32) -> Result<(), Error> {
+    if !head_dim.is_multiple_of(32) || head_dim > KDA_MAX_HEAD {
+        return Err(refuse(
+            op,
+            format!(
+                "the KDA recurrence holds a head of whole 32-wide pieces, at most \
+                 {KDA_MAX_HEAD}, and this one is {head_dim}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn kda_step(
     ctx: &Ctx,
@@ -1153,33 +1155,70 @@ pub fn kda_step(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Kda::of(OP, mixed, f, b, y, heads, head_dim)?;
     f32_state(OP, state)?;
+    kda_head(OP, head_dim)?;
     seated(OP, state, "ssm_kda_step_batched", true, false, false)?;
-    let staged = shape.stage(ctx, OP, mixed, f, b, dt_bias, a_log, norm_eps, gate_floor)?;
-    let work = shape.work(ctx, OP, state, shape.n)?;
+    // A block a (row, head) once the batch fills the device; under that,
+    // each head's rows split over D / 32 blocks.
+    let rows = if shape.n.saturating_mul(shape.heads) >= ROWS_STEP_FROM {
+        head_dim
+    } else {
+        KDA_TILE_ROWS
+    };
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::ssm_kda_step_batched").apply(
-            Launch::grid([shape.n, shape.heads, 1], [STEP_BLOCK, 1, 1])
-                .smem(kda_shmem(shape.head_dim)),
-        ),
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::attn::ssm_kda_step_batched<{head_dim}, {rows}>"
+            )),
+        )
+        .apply(Launch::grid(
+            [shape.n, shape.heads, head_dim / rows],
+            [STEP_BLOCK, 1, 1],
+        )),
         &[
-            ArgValue::Ptr(staged.q_norm),
-            ArgValue::Ptr(staged.k_norm),
-            ArgValue::Ptr(staged.v),
-            ArgValue::Ptr(staged.gate),
-            ArgValue::Ptr(staged.beta),
+            mixed.arg(),
+            f.arg(),
+            b.arg(),
+            a_log.arg(),
+            dt_bias.arg(),
             state.slab.arg(),
             state.slot_ids.arg(),
             state.slot_stride_elems.arg(),
             y.arg(),
             stated(OP, shape.heads)?.arg(),
-            stated(OP, shape.head_dim)?.arg(),
+            norm_eps.arg(),
+            gate_floor.arg(),
             state.write_state.arg(),
             state.write_state_mask.arg(),
-            ArgValue::Ptr(work),
             ctx.stage(),
         ],
     )
+}
+
+/// `kda_chunked` through the token-by-token scan whatever the head: the
+/// reference the chunk-parallel passes answer to.
+#[allow(clippy::too_many_arguments)]
+pub fn kda_chunked_serial(
+    ctx: &Ctx,
+    mixed: RaggedTensor,
+    f: Tensor,
+    b: Tensor,
+    dt_bias: Tensor,
+    a_log: Tensor,
+    state: &RecurrentPool,
+    heads: u32,
+    head_dim: u32,
+    norm_eps: f32,
+    gate_floor: f32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    SERIAL_SCAN.with(|flag| flag.set(true));
+    let out = kda_chunked(
+        ctx, mixed, f, b, dt_bias, a_log, state, heads, head_dim, norm_eps, gate_floor, y,
+    );
+    SERIAL_SCAN.with(|flag| flag.set(false));
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1199,8 +1238,6 @@ pub fn kda_chunked(
 ) -> Result<(), Error> {
     const OP: &str = "attention.ssm_kda_chunked";
 
-    const PREFILL_MAX_WARPS: u32 = 32;
-
     dtype_dispatch!(OP, mixed.data.dtype, { Bf16 => () });
     debug_assert_eq!(dt_bias.dtype, Dtype::F32, "`{OP}` reads an f32 decay bias");
     debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
@@ -1208,20 +1245,32 @@ pub fn kda_chunked(
     let shape = Kda::of(OP, mixed.data, f, b, y, heads, head_dim)?;
     let lanes = requests(OP, mixed)?;
     f32_state(OP, state)?;
+    kda_head(OP, head_dim)?;
     seated(OP, state, "ssm_kda_chunked_batched", true, true, true)?;
+    if head_dim == CHUNK_HEAD && !SERIAL_SCAN.with(core::cell::Cell::get) {
+        return kda_chunk_parallel(
+            ctx,
+            OP,
+            &shape,
+            mixed,
+            [f, b, dt_bias, a_log],
+            state,
+            lanes,
+            [norm_eps, gate_floor],
+            y,
+        );
+    }
     let staged = shape.stage(
         ctx, OP, mixed.data, f, b, dt_bias, a_log, norm_eps, gate_floor,
     )?;
-    let work = shape.work(ctx, OP, state, lanes)?;
+    // A request a block, a value row to eight lanes.
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::ssm_kda_chunked_batched").apply(
-            Launch::grid(
-                [lanes, shape.heads, 1],
-                [shape.head_dim.min(PREFILL_MAX_WARPS) * WARP, 1, 1],
-            )
-            .smem(kda_shmem(shape.head_dim)),
-        ),
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::attn::ssm_kda_chunked_batched<{head_dim}>")),
+        )
+        .apply(Launch::grid([lanes, shape.heads, 1], [8 * head_dim, 1, 1])),
         &[
             ArgValue::Ptr(staged.q_norm),
             ArgValue::Ptr(staged.k_norm),
@@ -1239,8 +1288,114 @@ pub fn kda_chunked(
             state.commit_len.arg(),
             state.write_state_mask.arg(),
             state.begin_at.arg(),
-            ArgValue::Ptr(work),
             ctx.stage(),
         ],
+    )
+}
+
+/// The recurrence as three chunk-parallel passes (see `ssm_kda_chunk_*`),
+/// over the chunk slots the gated delta rule's passes use.
+#[allow(clippy::too_many_arguments)]
+fn kda_chunk_parallel(
+    ctx: &Ctx,
+    op: &'static str,
+    shape: &Kda,
+    mixed: RaggedTensor,
+    [f, b, dt_bias, a_log]: [Tensor; 4],
+    state: &RecurrentPool,
+    lanes: u32,
+    [norm_eps, gate_floor]: [f32; 2],
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    let (d, heads) = (shape.head_dim, shape.heads);
+    let slots = shape.n.div_ceil(CHUNK) + lanes;
+    let per_slot = |width: u32| u64::from(slots) * u64::from(heads) * u64::from(width);
+    let kt = plane_bf16(ctx, op, "attn.ssm_kda_chunk_kt", per_slot(d * CHUNK))?;
+    let w = plane_bf16(ctx, op, "attn.ssm_kda_chunk_w", per_slot(CHUNK * d))?;
+    let ut = plane_bf16(ctx, op, "attn.ssm_kda_chunk_ut", per_slot(d * CHUNK))?;
+    let qg = plane_bf16(ctx, op, "attn.ssm_kda_chunk_qg", per_slot(CHUNK * d))?;
+    let p = plane_bf16(ctx, op, "attn.ssm_kda_chunk_p", per_slot(CHUNK * CHUNK))?;
+    let gl = plane(ctx, op, "attn.ssm_kda_chunk_gl", per_slot(d))?;
+    let vnt = plane_bf16(ctx, op, "attn.ssm_kda_chunk_vnt", per_slot(d * CHUNK))?;
+    let hct = plane_bf16(ctx, op, "attn.ssm_kda_chunk_hct", per_slot(d * d))?;
+    let tail = |args: &mut Vec<ArgValue>| -> Result<(), Error> {
+        args.push(stated(op, lanes)?.arg());
+        args.push(stated(op, heads)?.arg());
+        args.push(ctx.stage());
+        Ok(())
+    };
+
+    let args = vec![
+        mixed.data.arg(),
+        f.arg(),
+        b.arg(),
+        a_log.arg(),
+        dt_bias.arg(),
+        state.slot_ids.arg(),
+        mixed.indptr.arg(),
+        state.commit_len.arg(),
+        state.begin_at.arg(),
+        ArgValue::Ptr(kt),
+        ArgValue::Ptr(w),
+        ArgValue::Ptr(ut),
+        ArgValue::Ptr(qg),
+        ArgValue::Ptr(p),
+        ArgValue::Ptr(gl),
+        stated(op, lanes)?.arg(),
+        stated(op, heads)?.arg(),
+        norm_eps.arg(),
+        gate_floor.arg(),
+        ctx.stage(),
+    ];
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::attn::ssm_kda_chunk_wu<128>")
+            .apply(Launch::grid([slots, heads, 1], [2 * BLOCK, 1, 1])),
+        &args,
+    )?;
+
+    let mut args = vec![
+        ArgValue::Ptr(kt),
+        ArgValue::Ptr(w),
+        ArgValue::Ptr(ut),
+        ArgValue::Ptr(gl),
+        ArgValue::Ptr(vnt),
+        ArgValue::Ptr(hct),
+        state.slab.arg(),
+        state.slot_ids.arg(),
+        mixed.indptr.arg(),
+        state.slot_stride_elems.arg(),
+        state.commit_len.arg(),
+        state.begin_at.arg(),
+        state.write_state.arg(),
+        state.write_state_mask.arg(),
+    ];
+    tail(&mut args)?;
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::attn::ssm_kda_chunk_h<128>").apply(Launch::grid(
+            [lanes * heads * (d / CHUNK_SLICE), 1, 1],
+            [BLOCK, 1, 1],
+        )),
+        &args,
+    )?;
+
+    let mut args = vec![
+        ArgValue::Ptr(qg),
+        ArgValue::Ptr(p),
+        ArgValue::Ptr(vnt),
+        ArgValue::Ptr(hct),
+        state.slot_ids.arg(),
+        mixed.indptr.arg(),
+        state.commit_len.arg(),
+        state.begin_at.arg(),
+        y.arg(),
+    ];
+    tail(&mut args)?;
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::attn::ssm_kda_chunk_o<128>")
+            .apply(Launch::grid([slots, heads, 1], [BLOCK, 1, 1])),
+        &args,
     )
 }
