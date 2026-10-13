@@ -465,7 +465,7 @@ fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, String)>) -> Result<(),
 #[must_use]
 pub fn one_rank(w: Dtype, kv: Dtype) -> Deploy {
     Deploy {
-        weights: vec![w],
+        weights: vec![w.into()],
         kv,
         tp: 1,
         parts: Vec::new(),

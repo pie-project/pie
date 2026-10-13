@@ -4,7 +4,7 @@
 
 use std::fmt;
 
-use crate::{Dtype, Predicate, Weight};
+use crate::{Dtype, Precision, Predicate, Weight};
 use allocative::Allocative;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::{Methods, MethodsBuilder};
@@ -40,6 +40,56 @@ impl<'v> StarlarkValue<'v> for DtypeValue {
 #[must_use]
 pub fn word(dtype: Dtype) -> String {
     format!("{dtype:?}").to_lowercase()
+}
+
+/// The name a precision is spelled by: its dtype's, then what it quantizes
+/// its activations to (`nvfp4a4`).
+#[must_use]
+pub fn precision_word(precision: Precision) -> String {
+    word(precision.dtype) + &precision.suffix()
+}
+
+/// A stored dtype whose products quantize their activations
+/// (`dtype.nvfp4a4`), which a deployment lists and a layout declares a
+/// weight at as it does a dtype.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ProvidesStaticType, NoSerialize, Allocative)]
+pub struct PrecisionValue(#[allocative(skip)] pub Precision);
+
+starlark_simple_value!(PrecisionValue);
+
+impl fmt::Display for PrecisionValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "dtype.{}", precision_word(self.0))
+    }
+}
+
+#[starlark_value(type = "precision")]
+impl<'v> StarlarkValue<'v> for PrecisionValue {
+    fn equals(&self, other: Value<'v>) -> starlark::Result<bool> {
+        Ok(other
+            .downcast_ref::<PrecisionValue>()
+            .is_some_and(|other| other.0 == self.0))
+    }
+}
+
+/// The precision `value` states: a dtype (whose products read their
+/// activations as they are) or a [`PrecisionValue`].
+pub fn precision<'v>(value: Value<'v>) -> anyhow::Result<Precision> {
+    if let Some(d) = value.downcast_ref::<DtypeValue>() {
+        return Ok(Precision::of(d.0));
+    }
+    value
+        .downcast_ref::<PrecisionValue>()
+        .map(|p| p.0)
+        .ok_or_else(|| anyhow::anyhow!("a dtype was wanted, not {}", value.get_type()))
+}
+
+/// `precision` on the heap: a dtype when it quantizes no activations.
+pub fn alloc_precision<'v>(heap: Heap<'v>, precision: Precision) -> Value<'v> {
+    match precision.act {
+        None => heap.alloc(DtypeValue(precision.dtype)),
+        Some(_) => heap.alloc(PrecisionValue(precision)),
+    }
 }
 
 /// A weight a layout declares.
@@ -143,9 +193,23 @@ fn weight_methods(builder: &mut MethodsBuilder) {
         Ok(this.0.shape.clone())
     }
 
+    /// The dtype the weight is stored at.
     #[starlark(attribute)]
     fn dtype(this: &WeightValue) -> anyhow::Result<DtypeValue> {
         Ok(DtypeValue(this.0.dtype))
+    }
+
+    /// The weight's precision: its dtype and what its products quantize
+    /// their activations to.
+    #[starlark(attribute)]
+    fn precision<'v>(this: &WeightValue, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
+        Ok(alloc_precision(
+            heap,
+            Precision {
+                dtype: this.0.dtype,
+                act: this.0.act,
+            },
+        ))
     }
 }
 

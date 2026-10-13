@@ -114,6 +114,30 @@ impl Recorder {
         });
     }
 
+    /// The plane `suffix` of `w` (its `.input_scales`, say) as a weight
+    /// value of its own, for an op that reads it beside the codes.
+    pub fn weight_plane(&self, w: &Weight, suffix: &str) -> ValueId {
+        self.weight(w);
+        let mut p = self.inner.borrow_mut();
+        let name = format!("{}{suffix}", w.name);
+        let at = p
+            .params
+            .iter()
+            .position(|q| q.name == name)
+            .unwrap_or_else(|| panic!("`{}` stores no `{name}` plane", w.name));
+        let def = Def::Weight(at as u32);
+        if let Some(seen) = p.values.iter().position(|v| v.def == def) {
+            return ValueId(seen as u32);
+        }
+        let param = &p.params[at];
+        let ty = Ty::Tensor {
+            shape: param.shape.iter().copied().map(Dim::Const).collect(),
+            dtype: param.dtype,
+        };
+        p.values.push(ValueDecl { def, ty });
+        ValueId((p.values.len() - 1) as u32)
+    }
+
     pub fn weight(&self, w: &Weight) -> ValueId {
         let mut p = self.inner.borrow_mut();
         let w = &w.placed(p.platform);

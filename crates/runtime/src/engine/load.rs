@@ -46,7 +46,7 @@ fn no_such_deployment(name: &str) -> String {
 pub struct Overrides {
     /// The precision the config expects; a checkpoint stored at another is
     /// refused rather than re-quantized.
-    pub precision: Option<Vec<poem_ir::Dtype>>,
+    pub precision: Option<Vec<poem::Precision>>,
     pub kv: Option<poem_ir::Dtype>,
     pub off: Vec<String>,
     /// `Some(None)` serves without the checkpoint's drafter.

@@ -205,7 +205,7 @@ fn by_load(row: &poem_compiler::catalog::Deployment) -> bool {
     row.deploy
         .weights
         .iter()
-        .all(|w| matches!(w, Dtype::Bf16 | Dtype::Mxfp4))
+        .all(|w| w.act.is_none() && matches!(w.dtype, Dtype::Bf16 | Dtype::Mxfp4))
 }
 
 #[test]

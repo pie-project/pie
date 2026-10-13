@@ -1,9 +1,10 @@
 use kernels_cuda::Tensor;
 use kernels_cuda::linear;
+use kernels_cuda::linear::act_quant;
 use kernels_cuda::linear::moe::GroupSeat;
 use kernels_cuda::linear::quant::OffsetKind;
 use poem_exec::{DispatchLinear, KernelError};
-use poem_ir::{Dtype, Fused, Linear, Operands, ValueId};
+use poem_ir::{ActQuant, Dtype, Fused, Linear, Operands, ValueId};
 
 use crate::run::Run;
 
@@ -177,6 +178,9 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
+            Linear::MatmulActQuant {
+                act, w, quant, y, ..
+            } => self.matmul_act_quant(*act, *w, *quant, *y),
             Linear::Matmul { act, w, y } => match self.maybe_tiled_planes(*w) {
                 Some((codes, scales, biases, seat)) => {
                     let act = self.tensor(*act);
@@ -566,46 +570,17 @@ impl Run<'_> {
                 )
             }
             Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
-                let (codes, scales, biases, seat) = self.planes(*bank);
-                let routes = self.tensor(*routes);
-                if codes.dtype == Dtype::Nvfp4 {
-                    let tensor_scales = tensor_scales("linear.moe_matmul_select_quant", biases)?;
-                    let (codes, scales, tensor_scales, routes, seat) =
-                        match self.staged_experts(codes, scales, Some(tensor_scales), routes) {
-                            Some((codes, scales, Some(tensor_scales), routes)) => {
-                                (codes, scales, tensor_scales, routes, GroupSeat::RESIDENT)
-                            }
-                            _ => (codes, scales, tensor_scales, routes, seat),
-                        };
-                    return linear::nvfp4::matmul_select(
-                        self.ctx(),
-                        self.tensor(*x),
-                        codes,
-                        scales,
-                        tensor_scales,
-                        routes,
-                        &mut self.tensor(*y),
-                        seat,
-                    );
-                }
-                let (codes, scales, biases, routes, seat) =
-                    match self.staged_experts(codes, scales, biases, routes) {
-                        Some((codes, scales, biases, routes)) => {
-                            (codes, scales, biases, routes, GroupSeat::RESIDENT)
-                        }
-                        None => (codes, scales, biases, routes, seat),
-                    };
-                linear::moe::matmul_select_quant(
-                    self.ctx(),
-                    self.tensor(*x),
-                    codes,
-                    scales,
-                    biases,
-                    routes,
-                    &mut self.tensor(*y),
-                    seat,
-                )
+                let x = self.tensor(*x);
+                self.select_quant(x, *bank, *routes, *y, None)
             }
+            Linear::MoeMatmulSelectActQuant {
+                x,
+                bank,
+                routes,
+                quant,
+                input_scales,
+                y,
+            } => self.select_act_quant(*x, *bank, *routes, *quant, *input_scales, *y),
             Linear::MoeWeightedSum { routed, weights, y } => linear::moe::weighted_sum(
                 self.ctx(),
                 self.tensor(*routed),
@@ -654,6 +629,203 @@ impl Run<'_> {
                 self.tensor(*gate),
                 &mut self.tensor(*y),
             ),
+        }
+    }
+
+    /// A quantized bank's select of `x`, an nvfp4 bank's row tensor scales
+    /// replaced by `folded` when stated.
+    fn select_quant(
+        &mut self,
+        x: Tensor,
+        bank: ValueId,
+        routes: ValueId,
+        y: ValueId,
+        folded: Option<Tensor>,
+    ) -> Result<(), kernels_cuda::Error> {
+        let (codes, scales, biases, seat) = self.planes(bank);
+        let routes = self.tensor(routes);
+        if codes.dtype == Dtype::Nvfp4 {
+            let tensor_scales = match folded {
+                Some(folded) => folded,
+                None => tensor_scales("linear.moe_matmul_select_quant", biases)?,
+            };
+            let (codes, scales, tensor_scales, routes, seat) =
+                match self.staged_experts(codes, scales, Some(tensor_scales), routes) {
+                    Some((codes, scales, Some(tensor_scales), routes)) => {
+                        (codes, scales, tensor_scales, routes, GroupSeat::RESIDENT)
+                    }
+                    _ => (codes, scales, tensor_scales, routes, seat),
+                };
+            return linear::nvfp4::matmul_select(
+                self.ctx(),
+                x,
+                codes,
+                scales,
+                tensor_scales,
+                routes,
+                &mut self.tensor(y),
+                seat,
+            );
+        }
+        let (codes, scales, biases, routes, seat) =
+            match self.staged_experts(codes, scales, biases, routes) {
+                Some((codes, scales, biases, routes)) => {
+                    (codes, scales, biases, routes, GroupSeat::RESIDENT)
+                }
+                None => (codes, scales, biases, routes, seat),
+            };
+        linear::moe::matmul_select_quant(
+            self.ctx(),
+            x,
+            codes,
+            scales,
+            biases,
+            routes,
+            &mut self.tensor(y),
+            seat,
+        )
+    }
+
+    /// A select whose activations are quantized first: NVFP4 against an
+    /// NVFP4 bank, each route under its expert's static global, or e4m3 in
+    /// `gran`s against an MXFP4 bank. Until the grouped tcgen05 GEMM lands
+    /// they are read back to bf16 (each `q · sf` exact) and multiplied by the
+    /// bank's bf16 select, the global folded into the row tensor scales: the
+    /// low-precision product's every product, summed in another order.
+    // INTERIM(tc5::grouped_gemm): the grouped tcgen05 GEMM of the codes and
+    // atoms `act_quant::quantize` lands replaces the read-back here.
+    fn select_act_quant(
+        &mut self,
+        x: ValueId,
+        bank: ValueId,
+        routes: ValueId,
+        quant: ActQuant,
+        input_scales: Option<ValueId>,
+        y: ValueId,
+    ) -> Result<(), kernels_cuda::Error> {
+        const OP: &str = "linear.moe_matmul_select_act_quant";
+        lowp(OP)?;
+        let (codes, _, biases, _) = self.planes(bank);
+        let x = self.tensor(x);
+        let route_t = self.tensor(routes);
+        let count = route_t.rows * route_t.width;
+        match (codes.dtype, quant) {
+            (Dtype::Nvfp4, ActQuant::Nvfp4) => {
+                let globals = self.tensor(input_scales.ok_or_else(|| {
+                    kernels_cuda::Error::Backend {
+                        op: OP,
+                        detail: "an nvfp4 bank's W4A4 select is traced without its input \
+                                 scales"
+                            .to_string(),
+                    }
+                })?);
+                let tensor_scales = tensor_scales(OP, biases)?;
+                let div = if x.rows == count { 1 } else { route_t.width };
+                let bytes = count as usize * x.width as usize * 2;
+                let out = self.ctx().scratch_stream(OP, ROUTED_ACTS, bytes)? as u64;
+                let xq = act_quant::read_back(
+                    self.ctx(),
+                    OP,
+                    act_quant::Format::Nvfp4,
+                    act_quant::Source {
+                        x,
+                        rows: count,
+                        div,
+                        routes: Some(route_t),
+                        input_scales: Some(globals),
+                    },
+                    out,
+                )?;
+                let experts = tensor_scales.rows;
+                let rows = tensor_scales.width / 4;
+                let folded = self.ctx().scratch_stream(
+                    OP,
+                    FOLDED_SCALES,
+                    experts as usize * rows as usize * 4,
+                )? as u64;
+                act_quant::fold_input_scales(
+                    self.ctx(),
+                    OP,
+                    tensor_scales.ptr,
+                    globals.ptr,
+                    folded,
+                    experts,
+                    rows,
+                )?;
+                let folded = Tensor::new(folded, experts, tensor_scales.width, tensor_scales.dtype);
+                self.select_quant(xq, bank, routes, y, Some(folded))
+            }
+            (Dtype::Mxfp4, ActQuant::E4m3 { gran }) => {
+                let bytes = x.rows as usize * x.width as usize * 2;
+                let out = self.ctx().scratch_stream(OP, ROUTED_ACTS, bytes)? as u64;
+                let xq = act_quant::read_back(
+                    self.ctx(),
+                    OP,
+                    act_quant::Format::E4m3 { gran },
+                    act_quant::Source::rows(x, None),
+                    out,
+                )?;
+                self.select_quant(xq, bank, routes, y, None)
+            }
+            (stored, quant) => Err(kernels_cuda::Error::Backend {
+                op: OP,
+                detail: format!(
+                    "a {stored:?} bank has no select against {quant:?} activations; NVFP4 \
+                     banks take NVFP4 activations and MXFP4 banks e4m3"
+                ),
+            }),
+        }
+    }
+
+    /// A projection whose activations are quantized first, on the tcgen05
+    /// GEMM: e4m3 in `gran`s against MXFP4 codes.
+    fn matmul_act_quant(
+        &mut self,
+        act: ValueId,
+        w: ValueId,
+        quant: ActQuant,
+        y: ValueId,
+    ) -> Result<(), kernels_cuda::Error> {
+        const OP: &str = "linear.matmul_act_quant";
+        lowp(OP)?;
+        let (codes, scales, _, seat) = self.planes(w);
+        if seat.streams() {
+            return Err(kernels_cuda::Error::Backend {
+                op: OP,
+                detail: "a low-precision projection reads resident planes, and these are \
+                         seated by a streaming tier"
+                    .to_string(),
+            });
+        }
+        let act = self.tensor(act);
+        let mut out = self.tensor(y);
+        let (n, k) = (out.width, act.width);
+        match (codes.dtype, quant) {
+            (Dtype::Mxfp4, ActQuant::E4m3 { gran }) => act_quant::matmul(
+                self.ctx(),
+                OP,
+                act_quant::Format::E4m3 { gran },
+                act_quant::Source::rows(act, None),
+                act_quant::Weight {
+                    codes: codes.ptr,
+                    scales: scales.ptr,
+                    n,
+                    k,
+                    elem: linear::tc5::Elem::E2m1,
+                    gran: 32,
+                },
+                &mut out,
+                1.0,
+            ),
+            // The tcgen05 GEMM takes its alpha from the host, and an NVFP4
+            // projection's (`input_scale · tensor scale`) lives on the device.
+            (stored, quant) => Err(kernels_cuda::Error::Backend {
+                op: OP,
+                detail: format!(
+                    "a {stored:?} projection has no dense product against {quant:?} \
+                     activations yet; MXFP4 projections take e4m3"
+                ),
+            }),
         }
     }
 
@@ -789,6 +961,27 @@ pub(crate) fn tensor_scales(
         detail: "an nvfp4 bank is bound without its tensor scales".to_string(),
     })
 }
+
+/// A low-precision product runs on the tcgen05 GEMMs or not at all: an
+/// A4/A8 deployment does not fall back to bf16 activations.
+fn lowp(op: &'static str) -> Result<(), kernels_cuda::Error> {
+    if linear::tc5::supported() {
+        return Ok(());
+    }
+    Err(kernels_cuda::Error::Backend {
+        op,
+        detail: "a product that quantizes its activations runs on the tcgen05 GEMMs \
+                 (sm_100a/sm_103a, NVRTC 12.9 or newer), which this device or NVRTC lacks; \
+                 serve the deployment that reads bf16 activations instead"
+            .to_string(),
+    })
+}
+
+/// A select's quantized activations read back to bf16, one a stream.
+const ROUTED_ACTS: &str = "linear.act_quant.routed";
+
+/// An nvfp4 bank's row tensor scales times its experts' input scales.
+const FOLDED_SCALES: &str = "linear.act_quant.folded";
 
 const STAGED_EXPERT_BYTES: u64 = 1536 * 1024 * 1024;
 

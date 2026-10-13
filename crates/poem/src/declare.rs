@@ -1,6 +1,6 @@
 use poem_ir::{
-    BIASES, Dtype, GLOBAL_SCALES, INPUT_SCALES, Param, ParamLayout, ParamSource, Platform, SCALES,
-    Shard, TILED_BAND, TILED_STEP,
+    ActQuant, BIASES, Dtype, GLOBAL_SCALES, INPUT_SCALES, Param, ParamLayout, ParamSource,
+    Platform, SCALES, Shard, TILED_BAND, TILED_STEP,
 };
 
 #[derive(Clone, Debug)]
@@ -8,6 +8,9 @@ pub struct Weight {
     pub name: String,
     pub shape: Vec<u64>,
     pub dtype: Dtype,
+    /// The precision a product quantizes its activations to before reading
+    /// this weight, or `None` for one that reads them as they are.
+    pub act: Option<ActQuant>,
     pub shard: Shard,
     pub source: ParamSource,
     pub layout: ParamLayout,
@@ -24,9 +27,24 @@ impl Weight {
             name: name.into(),
             shape: shape.into_iter().collect(),
             dtype,
+            act: None,
             shard: Shard::Replicated,
             source: ParamSource::Checkpoint,
             layout: ParamLayout::Natural,
+        }
+    }
+
+    /// A weight stored at `precision`'s dtype, its products quantizing their
+    /// activations as it says.
+    #[must_use]
+    pub fn at(
+        name: impl Into<String>,
+        shape: impl IntoIterator<Item = u64>,
+        precision: Precision,
+    ) -> Weight {
+        Weight {
+            act: precision.act,
+            ..Weight::sym(name, shape, precision.dtype)
         }
     }
 
@@ -436,10 +454,66 @@ impl Weight {
             name: p.name.clone(),
             shape,
             dtype: p.dtype,
+            act: None,
             shard,
             source: p.source,
             layout: p.layout,
         }
+    }
+}
+
+/// The precision a deployment states for a bank: the dtype its weights are
+/// stored at and, for a low-precision product, the precision its activations
+/// are quantized to (`nvfp4a4`: NVFP4 weights against NVFP4 activations).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Precision {
+    pub dtype: Dtype,
+    pub act: Option<ActQuant>,
+}
+
+impl Precision {
+    /// The stored dtypes that quantize their activations, by the word a
+    /// deployment's name spells each: NVFP4 against NVFP4 (W4A4, vLLM's
+    /// modelopt product) and MXFP4 against e4m3 in DeepSeek's 1x128 blocks
+    /// (W4A8).
+    pub const ACTED: [Precision; 2] = [
+        Precision {
+            dtype: Dtype::Nvfp4,
+            act: Some(ActQuant::Nvfp4),
+        },
+        Precision {
+            dtype: Dtype::Mxfp4,
+            act: Some(ActQuant::E4m3 { gran: 128 }),
+        },
+    ];
+
+    #[must_use]
+    pub const fn of(dtype: Dtype) -> Precision {
+        Precision { dtype, act: None }
+    }
+
+    /// What a deployment's name appends to its dtype's word: `a4` for NVFP4
+    /// activations, `a8` for e4m3 in 128s, `a8g{n}` in `n`s.
+    #[must_use]
+    pub fn suffix(self) -> String {
+        match self.act {
+            None => String::new(),
+            Some(ActQuant::Nvfp4) => "a4".to_string(),
+            Some(ActQuant::E4m3 { gran: 128 }) => "a8".to_string(),
+            Some(ActQuant::E4m3 { gran }) => format!("a8g{gran}"),
+        }
+    }
+}
+
+impl From<Dtype> for Precision {
+    fn from(dtype: Dtype) -> Precision {
+        Precision::of(dtype)
+    }
+}
+
+impl PartialEq<Dtype> for Precision {
+    fn eq(&self, other: &Dtype) -> bool {
+        self.act.is_none() && self.dtype == *other
     }
 }
 

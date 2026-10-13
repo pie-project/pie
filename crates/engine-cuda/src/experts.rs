@@ -594,7 +594,8 @@ fn routed(
         let (bank, dense) = match op {
             Linear::MoeMatmulSelect { bank, .. } => (*bank, true),
             Linear::MoeMatmulSelectBias { bank, .. }
-            | Linear::MoeMatmulSelectQuant { bank, .. } => (*bank, false),
+            | Linear::MoeMatmulSelectQuant { bank, .. }
+            | Linear::MoeMatmulSelectActQuant { bank, .. } => (*bank, false),
             _ => continue,
         };
         let at = weight_of(trace, bank)?;

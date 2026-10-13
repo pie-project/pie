@@ -16,7 +16,7 @@ pub use collective::Collective;
 pub use elemwise::{Elementwise, GateActivation, ModulateForm, MropeForm, RopeForm};
 pub use fused::{Fused, NormKind};
 pub use layout::{Layout, PixelOrder, TapKind};
-pub use linear::Linear;
+pub use linear::{ActQuant, Linear};
 pub use spatial::{GridRule, Spatial, TimePad, VoxelSegment};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

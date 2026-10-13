@@ -1,20 +1,53 @@
 use super::*;
 
+/// `act . w^T`; a weight whose precision quantizes its activations has
+/// them quantized first.
 pub fn matmul(act: &Value, w: &Weight) -> Value {
     let r = act.rec();
     let y = r.fresh(tensor(act.rows(), w.dim(0), act.dtype()));
-    r.push(
-        Linear::Matmul {
-            act: act.id(),
-            w: r.weight(w),
-            y: y.id(),
-        },
-        &[act],
-    );
+    match w.act {
+        None => r.push(
+            Linear::Matmul {
+                act: act.id(),
+                w: r.weight(w),
+                y: y.id(),
+            },
+            &[act],
+        ),
+        Some(quant) => r.push(
+            Linear::MatmulActQuant {
+                act: act.id(),
+                w: r.weight(w),
+                quant,
+                input_scales: input_scales(r, w, quant),
+                y: y.id(),
+            },
+            &[act],
+        ),
+    }
     y
 }
 
+/// The static global a format quantizes `w`'s activations under, the
+/// weight's own `.input_scales` plane.
+fn input_scales(r: &Recorder, w: &Weight, quant: ActQuant) -> Option<ValueId> {
+    quant
+        .global()
+        .then(|| r.weight_plane(w, poem_ir::INPUT_SCALES))
+}
+
+/// `w` is read by `op`, which multiplies activations as they are.
+fn unquantized(w: &Weight, op: &str) {
+    assert!(
+        w.act.is_none(),
+        "`{}` quantizes its activations, and {op} reads them at their own dtype; \
+         declare it at its stored dtype",
+        w.name,
+    );
+}
+
 pub fn lm_head(act: &Value, w: &Weight) -> Value {
+    unquantized(w, "a head");
     let r = act.rec();
     let y = r.fresh(tensor(act.rows(), w.dim(0), act.dtype()));
     r.push(
@@ -213,6 +246,7 @@ pub fn moe_topk_sigmoid(
 }
 
 pub fn rel_bias(x: &Value, w: &Weight, heads: u32, d_rel: u32, extent: u32) -> Value {
+    unquantized(w, "a relative bias");
     let r = x.rec();
     let y = r.fresh(tensor(
         x.rows(),
@@ -413,6 +447,7 @@ pub fn group_routes(x: &Value, groups: u32) -> Value {
 }
 
 pub fn matmul_grouped(x: &Value, w: &Weight, routes: &Value, groups: u32) -> Value {
+    unquantized(w, "a grouped matmul");
     let r = x.rec();
     assert!(
         groups > 0
@@ -445,6 +480,7 @@ pub fn matmul_grouped(x: &Value, w: &Weight, routes: &Value, groups: u32) -> Val
     y
 }
 pub fn moe_matmul_select(x: &Value, bank: &Weight, routes: &Value, top_k: u32) -> Value {
+    unquantized(bank, "a dense bank's select");
     let r = x.rec();
     let y = r.fresh(tensor(Dim::TokensTimes(top_k), bank.dim(1), x.dtype()));
     r.push(
@@ -466,6 +502,7 @@ pub fn moe_matmul_select_bias(
     routes: &Value,
     top_k: u32,
 ) -> Value {
+    unquantized(bank, "a biased select");
     let r = x.rec();
     let y = r.fresh(tensor(Dim::TokensTimes(top_k), bank.dim(1), x.dtype()));
     r.push(
@@ -481,18 +518,33 @@ pub fn moe_matmul_select_bias(
     y
 }
 
+/// A quantized bank's select; a bank whose precision quantizes its
+/// activations has each route's quantized first.
 pub fn moe_matmul_select_quant(x: &Value, bank: &Weight, routes: &Value, top_k: u32) -> Value {
     let r = x.rec();
     let y = r.fresh(tensor(Dim::TokensTimes(top_k), bank.dim(1), x.dtype()));
-    r.push(
-        Linear::MoeMatmulSelectQuant {
-            x: x.id(),
-            bank: r.weight(bank),
-            routes: routes.id(),
-            y: y.id(),
-        },
-        &[x, routes],
-    );
+    match bank.act {
+        None => r.push(
+            Linear::MoeMatmulSelectQuant {
+                x: x.id(),
+                bank: r.weight(bank),
+                routes: routes.id(),
+                y: y.id(),
+            },
+            &[x, routes],
+        ),
+        Some(quant) => r.push(
+            Linear::MoeMatmulSelectActQuant {
+                x: x.id(),
+                bank: r.weight(bank),
+                routes: routes.id(),
+                quant,
+                input_scales: input_scales(r, bank, quant),
+                y: y.id(),
+            },
+            &[x, routes],
+        ),
+    }
     y
 }
 

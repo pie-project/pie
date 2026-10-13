@@ -15,8 +15,8 @@ pub use fact::{Builtin, Fact, Facts};
 pub use guard::Guard;
 pub use operands::Operands;
 pub use ops::{
-    Attention, Collective, Elementwise, Fused, GateActivation, GridRule, IndexScore, Layout,
-    Linear, ModulateForm, MropeForm, NormKind, Operation, PixelOrder, RaggedMask, RopeForm,
+    ActQuant, Attention, Collective, Elementwise, Fused, GateActivation, GridRule, IndexScore,
+    Layout, Linear, ModulateForm, MropeForm, NormKind, Operation, PixelOrder, RaggedMask, RopeForm,
     Spatial, TapKind, TimePad, VoxelSegment,
 };
 pub use request::{Request, Stream};

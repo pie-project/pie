@@ -742,10 +742,20 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Linear::MoeMatmulSelect { .. } => &[(In(2), I32)],
             Linear::MoeMatmulSelectBias { .. } => &[(In(3), I32)],
             Linear::MoeMatmulSelectQuant { .. } => &[(In(2), I32)],
+            Linear::MoeMatmulSelectActQuant {
+                input_scales: Some(_),
+                ..
+            } => &[(In(2), I32), (In(3), F32)],
+            Linear::MoeMatmulSelectActQuant { .. } => &[(In(2), I32)],
+            Linear::MatmulActQuant {
+                input_scales: Some(_),
+                ..
+            } => &[(In(2), F32)],
             Linear::MoeWeightedSum { .. } => &[(In(1), F32)],
             Linear::MoeBiasSum { .. } => &[(In(2), I32), (In(3), F32)],
             Linear::LoraCorrect { .. } => &[(In(3), I32)],
             Linear::Matmul { .. }
+            | Linear::MatmulActQuant { .. }
             | Linear::LmHead { .. }
             | Linear::MlpSwiglu { .. }
             | Linear::MlpSwigluClamp { .. }
