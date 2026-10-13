@@ -661,34 +661,22 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     }
 }
 
-// The split-K sum in f32, four at a time, to bf16.
-__global__ __launch_bounds__(256) void tc5_finalize(const float4* __restrict__ part,
+// The split-K sum in f32, four at a time, to bf16, leaving the sum zero for
+// the next launch's splits.
+__global__ __launch_bounds__(256) void tc5_finalize(float4* __restrict__ part,
                                                     uint2* __restrict__ y, int quads) {
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i < quads) {
         const float4 v = part[i];
+        part[i] = make_float4(0.f, 0.f, 0.f, 0.f);
         y[i] = make_uint2(pack_bf16x2(v.x, v.y), pack_bf16x2(v.z, v.w));
     }
 }
 
-// A grouped split-K sum's routed rows (below group[experts] when contiguous,
-// under each count when masked): zeroed before the GEMM (y absent), rounded
-// to y after it. A block a row of `n`.
-__global__ __launch_bounds__(128) void tc5_zero_routed(float4* __restrict__ part,
-                                                       uint2* __restrict__ y,
-                                                       const int* __restrict__ counts,
-                                                       int experts, int m_max, int n) {
-    const int row = static_cast<int>(blockIdx.x);
-    if (m_max == 0 ? row >= __ldg(&counts[experts]) : row % m_max >= __ldg(&counts[row / m_max])) {
-        return;
-    }
-    float4* at = part + static_cast<size_t>(row) * (n / 4);
-    for (int i = static_cast<int>(threadIdx.x); i < n / 4; i += blockDim.x) {
-        at[i] = make_float4(0.f, 0.f, 0.f, 0.f);
-    }
-}
-
-__global__ __launch_bounds__(128) void tc5_finalize_routed(const float4* __restrict__ part,
+// As tc5_finalize for a grouped launch's routed rows alone (below
+// group[experts] when contiguous, under each count when masked; the rest
+// were never summed into): a block a row of `n`.
+__global__ __launch_bounds__(128) void tc5_finalize_routed(float4* __restrict__ part,
                                                            uint2* __restrict__ y,
                                                            const int* __restrict__ counts,
                                                            int experts, int m_max, int n) {
@@ -699,6 +687,7 @@ __global__ __launch_bounds__(128) void tc5_finalize_routed(const float4* __restr
     const size_t base = static_cast<size_t>(row) * (n / 4);
     for (int i = static_cast<int>(threadIdx.x); i < n / 4; i += blockDim.x) {
         const float4 v = part[base + i];
+        part[base + i] = make_float4(0.f, 0.f, 0.f, 0.f);
         y[base + i] = make_uint2(pack_bf16x2(v.x, v.y), pack_bf16x2(v.z, v.w));
     }
 }

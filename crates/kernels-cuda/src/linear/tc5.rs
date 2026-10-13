@@ -705,24 +705,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     let part = if splits > 1 {
         let bytes = job.y_rows as usize * n as usize * 4;
         let part = ctx.scratch_stream(OP, SPLIT_PARTIAL, bytes)?;
-        if routed {
-            // Only the routed rows are summed, so only they zero.
-            fire_routed(
-                ctx,
-                "::pie::linear::tc5_zero_routed",
-                part as u64,
-                0,
-                group,
-                job.y_rows,
-                n,
-            )?;
-        } else {
-            // SAFETY: a slab of `bytes` this context owns, on its stream.
-            let code = unsafe { rt::cudaMemsetAsync(part, 0, bytes, ctx.stream().cast()) };
-            if code != rt::cudaError::cudaSuccess {
-                return Err(refuse(OP, format!("cudaMemsetAsync answered {code:?}")));
-            }
-        }
+        zero_once(ctx, part, bytes)?;
         part as u64
     } else {
         0
@@ -828,6 +811,45 @@ fn fire_routed(
 /// The f32 split-K sum, one a stream: the finalize after the GEMM on the
 /// same stream consumes it.
 const SPLIT_PARTIAL: &str = "linear.tc5.split_partial";
+
+/// The bytes from the start of each split-sum slab known to be zero.
+fn zeroed() -> std::sync::MutexGuard<'static, HashMap<usize, usize>> {
+    static ZEROED: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+    ZEROED
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Slabs were freed: an address may come back holding anything.
+pub(crate) fn forget_zeroed() {
+    zeroed().clear();
+}
+
+/// Keeps the split sum's slab zero past `bytes`. Every finalize zeroes what
+/// it rounds, so a slab is cleared once, when first seen or first asked for
+/// more than before, and never again a launch.
+fn zero_once(ctx: &Ctx, part: *mut core::ffi::c_void, bytes: usize) -> Result<(), Error> {
+    let mut zeroed = zeroed();
+    let have = zeroed.entry(part.addr()).or_insert(0);
+    if bytes <= *have {
+        return Ok(());
+    }
+    // SAFETY: a slab of at least `bytes` this context owns, on its stream.
+    let code = unsafe {
+        rt::cudaMemsetAsync(
+            part.cast::<u8>().add(*have).cast(),
+            0,
+            bytes - *have,
+            ctx.stream().cast(),
+        )
+    };
+    if code != rt::cudaError::cudaSuccess {
+        return Err(refuse(OP, format!("cudaMemsetAsync answered {code:?}")));
+    }
+    *have = bytes;
+    Ok(())
+}
 
 /// An atom-layout scale tensor as TMA reads it: [row block][atom][128 words],
 /// boxes of `atoms` atoms by `row_blocks` row blocks, zero past either end.
