@@ -11,7 +11,7 @@ use crate::chatml::{ChatML, ChatMLInstruct};
 
 pub const FORMATS: &[&str] = &[
     "chatml", "harmony", "gemma", "deepseek", "dots", "glm", "kimi", "kimi3", "inkling", "atem",
-    "minimax", "hy", "lines", "raw",
+    "mimo", "minimax", "hy", "lines", "raw",
 ];
 
 /// A format and its settings; a setting the format does not read is refused.
@@ -78,7 +78,7 @@ impl Spec {
             "lines" => &["stop", "bos", "eos"],
             "raw" => &["stop"],
             "harmony" | "deepseek" | "dots" | "glm" | "kimi" | "kimi3" | "inkling" | "atem"
-            | "minimax" => &[],
+            | "mimo" | "minimax" => &[],
             other => {
                 return Err(format!(
                     "`{other}` names no template format; this build ships {}",
@@ -127,6 +127,7 @@ pub fn build(spec: &Spec, tokenizer: Arc<Tokenizer>) -> Result<Arc<dyn Instruct>
         "kimi3" => Arc::new(crate::kimi3::Kimi3::new(tokenizer)),
         "inkling" => Arc::new(crate::inkling::Inkling::new(tokenizer)),
         "atem" => Arc::new(crate::atem::Atem::new(tokenizer)),
+        "mimo" => Arc::new(crate::mimo::Mimo::new(tokenizer)),
         "minimax" => Arc::new(crate::minimax::MiniMax::new(tokenizer)),
         "hy" => Arc::new(crate::hy::Hy::new(tokenizer, spec.thinking)),
         "lines" => Arc::new(crate::lines::Lines::new(

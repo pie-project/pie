@@ -32,6 +32,7 @@ fn the_new_templates_write_what_the_reference_renders_every_case() {
     minimax_opens_with_the_system_and_developer_turns();
     hy_writes_the_reasoning_mode_the_turns_the_calls_and_the_cue();
     dots_opens_on_the_default_system_turn_and_answers_a_tool_in_a_user_turn();
+    mimo_writes_its_turns_untrimmed_and_its_tools_a_turn_ahead();
 }
 
 /// Dots3's template opens a conversation with no system turn on its default
@@ -170,6 +171,50 @@ fn hy_writes_the_reasoning_mode_the_turns_the_calls_and_the_cue() {
     ];
     assert_eq!(got, want);
     assert_eq!(template.seal(), vec![120025]);
+}
+
+/// MiMo-V2.6's template closes a turn on a bare `<|im_end|>`, writes it
+/// untrimmed, states the tools in a system turn of their own, and cues past
+/// an empty thinking block for `enable_thinking: false`.
+fn mimo_writes_its_turns_untrimmed_and_its_tools_a_turn_ahead() {
+    let Some(tokenizer) = snapshot("XiaomiMiMo/MiMo-V2.6-Flash-RL", "mini-l6-e8") else {
+        return;
+    };
+    let template = chat_template::mimo::Mimo::new(tokenizer);
+    let turns: Vec<u32> = vec![
+        151644, 8948, 198, 2610, 525, 50537, 13, 151645, 151644, 872, 198, 3838, 374, 220, 16, 22,
+        3039, 220, 17, 18, 5267, 151645,
+    ];
+    let cue: Vec<u32> = vec![151644, 77091, 198];
+    let mut got = template.system_user("You are terse.", &format!("{MESSAGE}\n"));
+    got.extend(template.cue());
+    assert_eq!(got, [turns, cue.clone()].concat());
+    assert_eq!(
+        template.cue_without_thinking(),
+        [cue, vec![151667, 151668]].concat()
+    );
+
+    let tool = r#"{"type": "function", "function": {"name": "get_weather", "description": "Weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}"#;
+    let tools: Vec<u32> = vec![
+        151644, 8948, 198, 2610, 525, 3897, 448, 279, 2701, 7375, 1447, 27, 15918, 397, 4913, 1313,
+        788, 330, 1688, 497, 330, 1688, 788, 5212, 606, 788, 330, 455, 69364, 497, 330, 4684, 788,
+        330, 28981, 497, 330, 13786, 788, 5212, 1313, 788, 330, 1700, 497, 330, 13193, 788, 5212,
+        8926, 788, 5212, 1313, 788, 330, 917, 30975, 3417, 532, 522, 15918, 29, 151645,
+    ];
+    assert_eq!(template.equip(&[tool.to_string()]), tools);
+    assert_eq!(
+        template.answer("get_weather", "sunny"),
+        vec![151644, 14172, 198, 82, 27297, 151645]
+    );
+
+    let mut got = template.assistant("391");
+    got.extend(template.user("And 18?"));
+    let want: Vec<u32> = vec![
+        151644, 77091, 198, 151667, 151668, 18, 24, 16, 151645, 151644, 872, 198, 3036, 220, 16,
+        23, 30, 151645,
+    ];
+    assert_eq!(got, want);
+    assert_eq!(template.seal(), vec![151645, 151643]);
 }
 
 /// Qwen3.5's template trims every turn and, with `enable_thinking: false`,
