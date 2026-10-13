@@ -923,7 +923,11 @@ fn stamp_block_masks(req: &mut crate::engine::FireRequest) {
         return;
     }
     for lane in &mut req.lanes {
-        if lane.block_draft && lane.mask.is_none() {
+        if !lane.block_draft {
+            continue;
+        }
+        lane.bidirectional = true;
+        if lane.mask.is_none() {
             lane.mask = Some(::engine::Masking::Extent(::engine::Mask::new(
                 vec![0, u32::MAX],
                 u64::from(u32::MAX),
