@@ -190,3 +190,144 @@ fn an_fp8_plane_beside_e8m0_exponents_encodes_as_its_bf16_values_do() {
         }
     }
 }
+
+// Two planes fused along their rows, as a gate and an up leg are read into
+// one; leg `b` raises every exponent by one, so a leg read under the other's
+// exponents (or none) reads off by a factor.
+const LEGS: [(&str, u8); 2] = [("a", 0), ("b", 1)];
+
+fn fused_value(plane: &Plane, leg: usize, row: usize, col: usize) -> f32 {
+    plane.value(row, col) * if leg == 1 { 2.0 } else { 1.0 }
+}
+
+fn write_fused(dir: &std::path::Path, plane: &Plane, bf16_twin: bool) {
+    let [scale_rows, scale_cols] = plane.scale_shape();
+    let mut writer = ztensor::Writer::create(dir.join("model.zt")).expect("the container opens");
+    for (at, (leg, raise)) in LEGS.into_iter().enumerate() {
+        let shape = vec![plane.rows as u64, plane.cols as u64];
+        if bf16_twin {
+            let values: Vec<u8> = (0..plane.rows)
+                .flat_map(|row| (0..plane.cols).map(move |col| (row, col)))
+                .flat_map(|(row, col)| {
+                    half::bf16::from_f32(fused_value(plane, at, row, col)).to_le_bytes()
+                })
+                .collect();
+            writer
+                .add(format!("{leg}.weight"), shape, ztensor::Leaf::BF16, &values)
+                .expect("the bf16 twin lands");
+            continue;
+        }
+        let exponents: Vec<u8> = (0..scale_rows)
+            .flat_map(|r| (0..scale_cols).map(move |c| exponent(r, c) + raise))
+            .collect();
+        let codes: Vec<u8> = (0..plane.rows)
+            .flat_map(|row| (0..plane.cols).map(move |col| code(row, col)))
+            .collect();
+        writer
+            .add(
+                format!("{leg}.scale"),
+                vec![scale_rows as u64, scale_cols as u64],
+                ztensor::Leaf::E8M0,
+                &exponents,
+            )
+            .expect("the exponents land");
+        writer
+            .add(format!("{leg}.weight"), shape, ztensor::Leaf::E4M3, &codes)
+            .expect("the codes land");
+    }
+    writer.finish().expect("the container closes");
+}
+
+fn fused_contract(plane: &Plane, encoding: Encoding) -> ModelContract {
+    ModelContract {
+        alignment: 256,
+        tensors: vec![TensorContract::new(
+            "w",
+            Expr::concat(0, vec![Expr::src("a.weight"), Expr::src("b.weight")])
+                .cast(encoding.clone()),
+            vec![2 * plane.rows as i64, plane.cols as i64],
+            encoding,
+        )],
+        groups: Vec::new(),
+    }
+}
+
+#[test]
+fn fused_fp8_planes_each_read_under_their_own_exponents() {
+    let plane = &PLANES[0];
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    write_fused(dir.path(), plane, false);
+    let contract = fused_contract(plane, Encoding::Raw(DType::Bf16));
+    let metadata = parse_metadata(dir.path()).expect("the checkpoint reads");
+    for streamed in [false, true] {
+        let plan = if streamed {
+            compile_streaming(&metadata, &contract, StorageTarget::default())
+        } else {
+            let target = StorageTarget {
+                tile_map_mask: CONVERT_TILE_MAP_MASK,
+                ..StorageTarget::default()
+            };
+            compile(&metadata, &contract, target)
+        }
+        .expect("the fused read compiles");
+        let mut sink = MemorySink::default();
+        let run = Execution::new(&plan, dir.path()).sink(&mut sink);
+        let run = if streamed { run.streaming() } else { run };
+        run.run().expect("the fused read runs on the host");
+        let landed = &sink.tensors["w"];
+        for leg in 0..LEGS.len() {
+            for row in 0..plane.rows {
+                for col in 0..plane.cols {
+                    let at = ((leg * plane.rows + row) * plane.cols + col) * 2;
+                    let got = u16::from_le_bytes([landed[at], landed[at + 1]]);
+                    assert_eq!(
+                        got,
+                        half::bf16::from_f32(fused_value(plane, leg, row, col)).to_bits(),
+                        "streamed {streamed}: leg {leg} [{row}, {col}]"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fused_fp8_planes_encode_as_their_bf16_values_do() {
+    let plane = &PLANES[0];
+    for scheme in [QuantScheme::MlxAffineU4, QuantScheme::Mxfp4E2M1E8M0] {
+        let spec = QuantSpec {
+            scheme,
+            logical_dtype: DType::Bf16,
+            bits_per_element: scheme.default_bits(),
+            group_size: scheme.default_group_size(),
+            channel_axis: None,
+        };
+        let mut landed = Vec::new();
+        for bf16_twin in [false, true] {
+            let dir = tempfile::tempdir().expect("a scratch directory");
+            write_fused(dir.path(), plane, bf16_twin);
+            let metadata = parse_metadata(dir.path()).expect("the checkpoint reads");
+            let contract = fused_contract(plane, Encoding::Quant(spec.clone()));
+            let target = StorageTarget {
+                tile_map_mask: CONVERT_TILE_MAP_MASK,
+                ..StorageTarget::default()
+            };
+            let plan = compile(&metadata, &contract, target).expect("the fused encode compiles");
+            let storage = Execution::new(&plan, dir.path())
+                .run()
+                .expect("the fused encode runs on the host");
+            let public: BTreeMap<String, Vec<u8>> = plan
+                .tensors
+                .iter()
+                .filter(|decl| decl.visibility.is_public())
+                .map(|decl| (decl.name.clone(), storage.tensors[&decl.name].clone()))
+                .collect();
+            landed.push(public);
+        }
+        assert!(!landed[0].is_empty());
+        assert_eq!(
+            landed[0], landed[1],
+            "{scheme:?}: the fused FP8 legs and their bf16 values encode apart"
+        );
+    }
+}

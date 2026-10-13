@@ -238,3 +238,107 @@ fn checked_mul_i64(lhs: i64, rhs: u64, context: &str) -> Result<u64, Error> {
     lhs.checked_mul(rhs)
         .or_overflow(format!("{context}: byte overflow"))
 }
+
+/// A block-scaled FP8 plane is read out through the factors beside it only
+/// when its Cast reads it straight from the checkpoint; a Cast over a Concat
+/// of such planes (a gate and up leg fused) would read the joined codes with
+/// no factors at all. Each leg is cast on its own, into a tensor of its own,
+/// and the legs are joined after; a Cast this cannot split is refused.
+pub fn cast_block_scaled_fp8_legs_apart(
+    contract: &ModelContract,
+    metadata: &Metadata,
+) -> Result<ModelContract, Error> {
+    let sources = crate::file::Sources::new(metadata);
+    let scaled = |expr: &Expr| {
+        expr.sources().into_iter().any(|name| {
+            sources
+                .by_name(name)
+                .is_some_and(|raw| sources.fp8_block_scale(raw).is_some())
+        })
+    };
+    if !contract.tensors.iter().any(|tensor| scaled(&tensor.expr)) {
+        return Ok(contract.clone());
+    }
+    let mut tensors = Vec::with_capacity(contract.tensors.len());
+    for tensor in &contract.tensors {
+        let mut legs = Vec::new();
+        let expr = split_casts(tensor.expr.clone(), &tensor.name, &scaled, &mut legs)?;
+        tensors.extend(legs);
+        tensors.push(TensorContract {
+            expr,
+            ..tensor.clone()
+        });
+    }
+    Ok(ModelContract {
+        tensors,
+        ..contract.clone()
+    })
+}
+
+fn split_casts(
+    expr: Expr,
+    name: &str,
+    scaled: &impl Fn(&Expr) -> bool,
+    legs: &mut Vec<TensorContract>,
+) -> Result<Expr, Error> {
+    let expr = expr.map_children(|child| split_casts(child, name, scaled, legs))?;
+    let Expr::Cast { src, to, chunks } = expr else {
+        return Ok(expr);
+    };
+    let mut joined_inside = false;
+    src.visit(&mut |inner| {
+        if let Expr::Concat { parts, .. } = inner {
+            joined_inside |= parts.iter().any(scaled);
+        }
+    });
+    if !joined_inside {
+        return Ok(Expr::Cast { src, to, chunks });
+    }
+    let Expr::Concat { axis, parts } = *src else {
+        return Err(Error::Contract(format!(
+            "'{name}' casts block-scaled FP8 planes joined under another \
+             operation, which would read their codes with no factors"
+        )));
+    };
+    if chunks != 0 {
+        return Err(Error::Contract(format!(
+            "'{name}' casts block-scaled FP8 planes joined and cut into {chunks} \
+             shards at once; state the cut on each plane"
+        )));
+    }
+    // an encode reads the joined plane at its logical float, each leg read
+    // out to that float first
+    let leg_to = match &to {
+        Encoding::Quant(spec) => Encoding::Raw(spec.logical_dtype),
+        raw => raw.clone(),
+    };
+    let mut joined = Vec::with_capacity(parts.len());
+    for part in parts {
+        let own = scaled(&part);
+        let cast = Expr::Cast {
+            src: Box::new(part),
+            to: leg_to.clone(),
+            chunks: 0,
+        };
+        if !own {
+            joined.push(cast);
+            continue;
+        }
+        let leg = format!("{name}.fp8_leg{}", legs.len());
+        legs.push(TensorContract::inferred(leg.clone(), cast, leg_to.clone()).internal());
+        joined.push(Expr::Out(leg));
+    }
+    let joined = Expr::Concat {
+        axis,
+        parts: joined,
+    };
+    Ok(if leg_to == to {
+        joined
+    } else {
+        Expr::Cast {
+            src: Box::new(joined),
+            to,
+            chunks: 0,
+        }
+    })
+}

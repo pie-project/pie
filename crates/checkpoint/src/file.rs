@@ -9,7 +9,7 @@ pub mod zt;
 
 pub use zt::encoding_of;
 
-use crate::types::{CheckpointFormat, Encoding, FileId, TensorId};
+use crate::types::{CheckpointFormat, DType, Encoding, FileId, TensorId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Metadata {
@@ -173,6 +173,21 @@ impl<'a> Sources<'a> {
 
     pub fn by_name(&self, name: &str) -> Option<&'a RawTensor> {
         self.metadata.tensors.get(*self.by_name.get(name)? as usize)
+    }
+
+    /// The block factors an FP8 plane is read under: f32 factors beside it as
+    /// `<name>_scale_inv`, or (DeepSeek's release layout) e8m0 exponents beside
+    /// it as `<stem>.scale`. A plane that is not FP8 has none.
+    pub fn fp8_block_scale(&self, raw: &RawTensor) -> Option<&'a RawTensor> {
+        if !matches!(raw.encoding, Encoding::Raw(DType::E4m3)) {
+            return None;
+        }
+        self.by_name(&format!("{}_scale_inv", raw.name))
+            .or_else(|| {
+                let stem = raw.name.strip_suffix(".weight")?;
+                self.by_name(&format!("{stem}.scale"))
+                    .filter(|scale| matches!(scale.encoding, Encoding::Raw(DType::E8m0)))
+            })
     }
 
     pub fn tensor(&self, id: TensorId) -> Option<&'a RawTensor> {

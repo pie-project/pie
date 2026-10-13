@@ -982,20 +982,7 @@ impl Builder<'_> {
     ) -> TransformSpec {
         transform.metadata_source = source.and_then(|source| {
             let raw = self.sources.tensor(source.tensor_id)?;
-            if !matches!(raw.encoding, Encoding::Raw(DType::E4m3)) {
-                return None;
-            }
-            // f32 factors beside the plane as `<name>_scale_inv`, or (DeepSeek's
-            // release layout) e8m0 exponents beside it as `<stem>.scale`
-            self.sources
-                .by_name(&format!("{}_scale_inv", raw.name))
-                .or_else(|| {
-                    let stem = raw.name.strip_suffix(".weight")?;
-                    self.sources
-                        .by_name(&format!("{stem}.scale"))
-                        .filter(|scale| matches!(scale.encoding, Encoding::Raw(DType::E8m0)))
-                })
-                .map(|scale| scale.id)
+            self.sources.fp8_block_scale(raw).map(|scale| scale.id)
         });
         transform
     }
