@@ -16,20 +16,15 @@ inline void staged_dequant(uint4 codes, float scale, float bias, threadgroup hal
 }
 
 template <int M, int SPLIT>
-[[kernel]] void
-affine_qmm_staged(const device uint *weights [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
-                  const device bfloat *biases [[buffer(2)]], const device bfloat *input [[buffer(3)]],
-                  device bfloat *output [[buffer(4)]], constant int &width [[buffer(5)]],
-                  constant int &columns [[buffer(6)]], device float *partials [[buffer(7)]],
-                  constant int &rows [[buffer(8)]], constant int &stride [[buffer(9)]],
-                  uint2 position [[threadgroup_position_in_grid]],
-                  uint lane [[thread_index_in_simdgroup]],
-                  uint simd [[simdgroup_index_in_threadgroup]]) {
+METAL_FUNC void staged_tile(const device uint *weights, const device bfloat *scales,
+                            const device bfloat *biases, const device bfloat *input,
+                            device bfloat *output, constant int &width, constant int &columns,
+                            device float *partials, constant int &rows, constant int &stride,
+                            uint2 position, uint lane, uint simd, threadgroup half *stages,
+                            threadgroup uint4 *pairs) {
   constexpr int N = 32, K = 32;
-  threadgroup half stages[2][2][K * N];
-  threadgroup uint4 pairs[2][2 * N];
-  threadgroup half *stage = &stages[simd][0][0];
-  threadgroup uint4 *pair = &pairs[simd][0];
+  threadgroup half *stage = stages + simd * 2 * K * N;
+  threadgroup uint4 *pair = pairs + simd * 2 * N;
   const uint column = position.x * 2 * N + simd * N;
   const int blocks = width / (2 * K) / SPLIT;
   const int first = int(position.y) * blocks, last = first + blocks;
@@ -92,8 +87,135 @@ affine_qmm_staged(const device uint *weights [[buffer(0)]], const device bfloat 
   }
 }
 
+template <int M, int SPLIT>
+[[kernel]] void
+affine_qmm_staged(const device uint *weights [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
+                  const device bfloat *biases [[buffer(2)]], const device bfloat *input [[buffer(3)]],
+                  device bfloat *output [[buffer(4)]], constant int &width [[buffer(5)]],
+                  constant int &columns [[buffer(6)]], device float *partials [[buffer(7)]],
+                  constant int &rows [[buffer(8)]], constant int &stride [[buffer(9)]],
+                  uint2 position [[threadgroup_position_in_grid]],
+                  uint lane [[thread_index_in_simdgroup]],
+                  uint simd [[simdgroup_index_in_threadgroup]]) {
+  threadgroup half stages[2 * 2 * 32 * 32];
+  threadgroup uint4 pairs[2 * 2 * 32];
+  staged_tile<M, SPLIT>(weights, scales, biases, input, output, width, columns, partials, rows,
+                        stride, position, lane, simd, stages, pairs);
+}
+
 #define PIE_STAGED_POINT(name, m, split)                                                           \
   template [[host_name(name)]] [[kernel]] void affine_qmm_staged<m, split>(                        \
+      const device uint *, const device bfloat *, const device bfloat *, const device bfloat *,    \
+      device bfloat *, constant int &, constant int &, device float *, constant int &,             \
+      constant int &, uint2, uint, uint);
+
+// The same eight rows, the dequantized tile handed to the MPP op from registers: no
+// threadgroup stage, and a lane reads 32 contiguous bytes of a column a step, four
+// lanes a whole 128-byte line. Inside each 256-wide span of the contraction the order
+// of k is permuted alike for both operands, so a lane's share of a column is one whole
+// quant group (one scale, one bias): logical k = 4q + 16t + r of run `cc` is physical
+// 64q + 8cc + 4t + r. Cooperative inputs need the 26.2 tensor ops; an older system
+// compiles this point as the staged tile it replaces. `SPLIT` is the grid's y extent.
+template <int SPLIT>
+[[kernel]] void
+affine_qmm_coop(const device uint *weights [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
+                const device bfloat *biases [[buffer(2)]], const device bfloat *input [[buffer(3)]],
+                device bfloat *output [[buffer(4)]], constant int &width [[buffer(5)]],
+                constant int &columns [[buffer(6)]], device float *partials [[buffer(7)]],
+                constant int &rows [[buffer(8)]], constant int &stride [[buffer(9)]],
+                uint2 position [[threadgroup_position_in_grid]],
+                uint lane [[thread_index_in_simdgroup]],
+                uint simd [[simdgroup_index_in_threadgroup]]) {
+#if __TENSOR_OPS_SUPPORT_DEPLOYMENT_TARGET_26_2
+  constexpr int N = 32;
+  constexpr auto descriptor = matmul2d_descriptor(16, N, 32, false, true, false,
+                                                  matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<descriptor, execution_simdgroup> multiply;
+  auto a = multiply.get_left_input_cooperative_tensor<bfloat, half, float>();
+  auto b = multiply.get_right_input_cooperative_tensor<bfloat, half, float>();
+  auto total = multiply.get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
+#pragma unroll
+  for (ushort i = 0; i < total.get_capacity(); ++i)
+    total[i] = 0.0f;
+#pragma unroll
+  for (ushort i = 0; i < a.get_capacity(); ++i)
+    a[i] = bfloat(0.0f);
+  // The operand layouts put lane `lane` on group `q` of each span and on row (of the
+  // activations) or column (of the weights, plus 8j) `sub`, both as they lay it out.
+  const ushort q = (lane & 1) + 2 * ((lane >> 3) & 1);
+  const ushort sub = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
+  const uint column = position.x * 2 * N + simd * N;
+  const int spans = width / 256 / SPLIT;
+  const int first = int(position.y) * spans, last = first + spans;
+  const ulong words = ulong(stride) / 32, groups = ulong(stride) / 64;
+  const bool live = int(sub) < rows;
+  const device uint4 *codes =
+      reinterpret_cast<const device uint4 *>(weights) + ulong(column + sub) * words + 2 * q;
+  const device bfloat *scale = scales + ulong(column + sub) * groups + q;
+  const device bfloat *bias = biases + ulong(column + sub) * groups + q;
+  const device uint4 *x = reinterpret_cast<const device uint4 *>(
+                              input + ulong(min(int(sub), rows - 1)) * width) + 8 * q;
+  for (int span = first; span < last; ++span) {
+    half2 s[4], z[4];
+#pragma unroll
+    for (ushort j = 0; j < 4; ++j) {
+      s[j] = half2(half(float(scale[8 * j * groups + span * 4])));
+      z[j] = half2(half(float(bias[8 * j * groups + span * 4])));
+    }
+#pragma unroll
+    for (ushort h = 0; h < 2; ++h) {
+      uint4 w[4];
+#pragma unroll
+      for (ushort j = 0; j < 4; ++j)
+        w[j] = codes[8 * j * words + span * 8 + h];
+#pragma unroll
+      for (ushort cc = 0; cc < 4; ++cc) {
+        const uint4 xv = x[span * 32 + h * 4 + cc];
+#pragma unroll
+        for (ushort t = 0; t < 2; ++t)
+#pragma unroll
+          for (ushort r = 0; r < 4; ++r)
+            a[8 * t + r] = live ? as_type<bfloat2>(xv[2 * t + r / 2])[r % 2] : bfloat(0.0f);
+        // Two codes a step: the half 1024 + code, less 1024, is the code exactly.
+#pragma unroll
+        for (ushort j = 0; j < 4; ++j) {
+          const uint word = w[j][cc];
+#pragma unroll
+          for (ushort r = 0; r < 4; ++r) {
+            half2 v = as_type<half2>(((word >> (4 * r)) & 0x000F000Fu) | 0x64006400u) - half2(1024.0h);
+            v = fma(v, s[j], z[j]);
+            b[4 * j + r] = v.x;
+            b[16 + 4 * j + r] = v.y;
+          }
+        }
+        multiply.run(a, b, total);
+      }
+    }
+  }
+#pragma unroll
+  for (ushort i = 0; i < total.get_capacity(); ++i) {
+    if (!total.is_valid_element(i))
+      continue;
+    const auto at = total.get_multidimensional_index(i);
+    const uint row = at[1];
+    if (row >= uint(rows) || row >= 8)
+      continue;
+    const ulong o = ulong(row) * columns + column + at[0];
+    if constexpr (SPLIT > 1)
+      partials[ulong(position.y) * rows * columns + o] = total[i];
+    else
+      output[o] = bfloat(total[i]);
+  }
+#else
+  threadgroup half stages[2 * 2 * 32 * 32];
+  threadgroup uint4 pairs[2 * 2 * 32];
+  staged_tile<8, SPLIT>(weights, scales, biases, input, output, width, columns, partials, rows,
+                        stride, position, lane, simd, stages, pairs);
+#endif
+}
+
+#define PIE_COOP_POINT(name, split)                                                                \
+  template [[host_name(name)]] [[kernel]] void affine_qmm_coop<split>(                             \
       const device uint *, const device bfloat *, const device bfloat *, const device bfloat *,    \
       device bfloat *, constant int &, constant int &, device float *, constant int &,             \
       constant int &, uint2, uint, uint);
