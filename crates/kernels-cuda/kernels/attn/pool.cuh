@@ -601,4 +601,129 @@ __global__ void pool_lse_paged(
     }
 }
 
+// `pool_lse_paged` over the compressed rows `attention.index_topk` selected
+// for each query: a row's `top_k` ids, ended early by a negative one, and an
+// id not yet closed at the query's position read as nothing.
+__global__ void pool_lse_selected_paged(
+    const bf16* __restrict__ q,
+    const bf16* __restrict__ comp_kv_pages,
+    const i32* __restrict__ selection,
+    bf16* __restrict__ o,
+    float* __restrict__ lse_out,
+    const i32* __restrict__ positions,
+    const u32* __restrict__ kv_page_indices,
+    const u32* __restrict__ kv_page_indptr,
+    const i32* __restrict__ req_of_token,
+    int num_q_heads,
+    int head_dim,
+    int ratio,
+    int top_k,
+    int page_size,
+    float scale,
+    const u32* __restrict__ win) {
+    const int qi = blockIdx.x;
+
+    if (win != nullptr && qi >= static_cast<int>(win[0])) return;
+
+    const int qi_row = win != nullptr ? qi + static_cast<int>(win[1]) : qi;
+    const int q_head = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const int req = req_of_token[qi_row];
+    const int qpos = positions[qi_row];
+    const int num_visible = (qpos + 1) / ratio;
+    const i32* srow = selection + static_cast<long long>(qi_row) * top_k;
+
+    extern __shared__ float smem[];
+    float* q_smem = smem;
+    float* reduce = smem + head_dim;
+
+    const bf16* q_row =
+        q + (static_cast<long long>(qi_row) * num_q_heads + q_head) * head_dim;
+    for (int d = tid; d < head_dim; d += ATTN_BLOCK) {
+        q_smem[d] = bf16_to_f32(q_row[d]);
+    }
+    __syncthreads();
+
+    bf16* o_row =
+        o + (static_cast<long long>(qi_row) * num_q_heads + q_head) * head_dim;
+
+    float local_max = neg_inf();
+    if (num_visible > 0) {
+        for (int n = tid; n < top_k; n += ATTN_BLOCK) {
+            const int c = srow[n];
+            if (c < 0) break;
+            if (c >= num_visible) continue;
+            const long long slot = paged_slot(kv_page_indices, kv_page_indptr, req,
+                                              (c + 1) * ratio - 1, page_size);
+            const bf16* k_row = comp_kv_pages + slot * head_dim;
+            float dot = 0.f;
+            for (int d = 0; d < head_dim; ++d) {
+                dot += q_smem[d] * bf16_to_f32(k_row[d]);
+            }
+            local_max = fmaxf(local_max, dot * scale);
+        }
+    }
+    reduce[tid] = local_max;
+    __syncthreads();
+    for (int off = ATTN_BLOCK / 2; off > 0; off >>= 1) {
+        if (tid < off) reduce[tid] = fmaxf(reduce[tid], reduce[tid + off]);
+        __syncthreads();
+    }
+    const float row_max = reduce[0];
+    __syncthreads();
+
+    if (!isfinite(row_max)) {
+        for (int d = tid; d < head_dim; d += ATTN_BLOCK) {
+            o_row[d] = f32_to_bf16(0.f);
+        }
+        if (lse_out != nullptr && tid == 0) {
+            lse_out[qi_row * num_q_heads + q_head] = neg_inf();
+        }
+        return;
+    }
+
+    const int dims_per_thread = (head_dim + ATTN_BLOCK - 1) / ATTN_BLOCK;
+    float acc[8] = {};
+    float local_z = 0.f;
+
+    for (int n = 0; n < top_k; ++n) {
+        const int c = srow[n];
+        if (c < 0) break;
+        if (c >= num_visible) continue;
+        const long long slot = paged_slot(kv_page_indices, kv_page_indptr, req,
+                                          (c + 1) * ratio - 1, page_size);
+        const bf16* k_row = comp_kv_pages + slot * head_dim;
+        float dot = 0.f;
+        for (int d = tid; d < head_dim; d += ATTN_BLOCK) {
+            dot += q_smem[d] * bf16_to_f32(k_row[d]);
+        }
+        reduce[tid] = dot;
+        __syncthreads();
+        for (int off = ATTN_BLOCK / 2; off > 0; off >>= 1) {
+            if (tid < off) reduce[tid] += reduce[tid + off];
+            __syncthreads();
+        }
+        const float w = expf(reduce[0] * scale - row_max);
+        __syncthreads();
+        local_z += w;
+
+        for (int i = 0; i < dims_per_thread; ++i) {
+            const int d = tid + i * ATTN_BLOCK;
+            if (d < head_dim) acc[i] += w * bf16_to_f32(k_row[d]);
+        }
+    }
+
+    const float inv_z = local_z > 0.f ? 1.0f / local_z : 0.f;
+    if (lse_out != nullptr && tid == 0) {
+        constexpr float kLog2e = 1.44269504088896340736f;
+        lse_out[qi_row * num_q_heads + q_head] =
+            local_z > 0.f ? ((logf(local_z) + row_max) * kLog2e) : neg_inf();
+    }
+    for (int i = 0; i < dims_per_thread; ++i) {
+        const int d = tid + i * ATTN_BLOCK;
+        if (d < head_dim) o_row[d] = f32_to_bf16(acc[i] * inv_z);
+    }
+}
+
 }

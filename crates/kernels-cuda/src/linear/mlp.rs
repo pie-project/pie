@@ -133,23 +133,46 @@ pub fn swiglu_clamp_alpha(
 }
 
 pub fn swiglu_clamp_split(
-    _ctx: &Ctx,
+    ctx: &Ctx,
     gate: Tensor,
-    _up: Tensor,
-    _limit: f32,
-    _y: &mut Tensor,
+    up: Tensor,
+    fan: u32,
+    limit: f32,
+    y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "linear.mlp_swiglu_clamp_split";
-    Err(refuse(
+    let t = dtype_dispatch!(OP, gate.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    debug_assert_eq!(
+        (gate.rows, gate.width),
+        (up.rows, up.width),
+        "`{OP}`'s gate and up planes are one rectangle"
+    );
+    let n = y.elements();
+    let lanes = u32::try_from(n).map_err(|_| {
+        refuse(
+            OP,
+            format!("{n} elements do not fit a 32-bit launch extent"),
+        )
+    })?;
+    nonzero(OP, "the activation's element count", lanes)?;
+    ctx.fire(
         OP,
-        format!(
-            "the unfused swiglu-clamp pair is the 2-bit MLX expert path's combine, and \
-             `{FILE}` instantiates no `swiglu_clamp_split` unit — this plane serves the \
-             packed `linear.mlp_swiglu_clamp` row (halves of {} at {:?}) and no MLX \
-             affine bank",
-            gate.width, gate.dtype,
-        ),
-    ))
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::linear::mlp_swiglu_clamp_split<{t}>")),
+        )
+        .apply(Launch::flat(lanes, BLOCK)),
+        &[
+            gate.arg(),
+            up.arg(),
+            y.arg(),
+            stated(OP, lanes)?.arg(),
+            stated(OP, y.width)?.arg(),
+            limit.arg(),
+            stated(OP, fan)?.arg(),
+            ctx.stage(),
+        ],
+    )
 }
 
 pub fn geglu_tanh(

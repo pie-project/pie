@@ -334,3 +334,102 @@ pub fn attention_lse(
         ],
     )
 }
+
+/// Every query row reads only the compressed rows `selection` names for it:
+/// `top_k` i32 ids a row, ended early by a negative one.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_lse_selected(
+    ctx: &Ctx,
+    q: Tensor,
+    positions: Tensor,
+    request_of_token: Tensor,
+    selection: Tensor,
+    entries: &KvPool,
+    ratio: u32,
+    top_k: u32,
+    heads: u32,
+    head_dim: u32,
+    sm_scale: f32,
+    o: &mut Tensor,
+    lse: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.pool_lse_selected";
+    dtype_dispatch!(OP, q.dtype, { Bf16 => () });
+    debug_assert_eq!(
+        lse.dtype,
+        Dtype::F32,
+        "`{OP}` lands an f32 log-sum-exp plane"
+    );
+    debug_assert_eq!(
+        selection.dtype,
+        Dtype::I32,
+        "`{OP}` walks the i32 compressed-row ids `attention.index_topk` published"
+    );
+    debug_assert_eq!(
+        request_of_token.dtype,
+        Dtype::I32,
+        "`{OP}` reads an i32 owning request per token"
+    );
+    let ratio = pooling_ratio(OP, ratio)?;
+    let top_k = count(OP, "the selection budget this reader states", top_k)?;
+    let num_q_heads = count(OP, "the head count this attention states", heads)?;
+    let head_dim = count(OP, "the head width this attention states", head_dim)?;
+    nonzero(OP, "rows", o.rows)?;
+    if head_dim.unsigned_abs() > 8 * ATTN_BLOCK {
+        return Err(refuse(
+            OP,
+            format!(
+                "the head width {head_dim} is above the {} a block's eight accumulators per lane hold",
+                8 * ATTN_BLOCK
+            ),
+        ));
+    }
+    if selection.width != top_k.unsigned_abs() {
+        return Err(refuse(
+            OP,
+            format!(
+                "the selection is {} wide and this reader walks the {top_k} ids it states",
+                selection.width
+            ),
+        ));
+    }
+    if selection.rows < o.rows {
+        return Err(refuse(
+            OP,
+            format!(
+                "the selection seats {} rows and this reader launches {}",
+                selection.rows, o.rows
+            ),
+        ));
+    }
+
+    let smem = head_dim
+        .unsigned_abs()
+        .saturating_add(ATTN_BLOCK)
+        .saturating_mul(u32::try_from(core::mem::size_of::<f32>()).unwrap_or(4));
+
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::attn::pool_lse_selected_paged").apply(
+            Launch::grid([o.rows, num_q_heads.unsigned_abs(), 1], [ATTN_BLOCK, 1, 1]).smem(smem),
+        ),
+        &[
+            q.arg(),
+            entries.keys.arg(),
+            selection.arg(),
+            o.arg(),
+            lse.arg(),
+            positions.arg(),
+            entries.page_indices.arg(),
+            entries.page_indptr.arg(),
+            request_of_token.arg(),
+            num_q_heads.arg(),
+            head_dim.arg(),
+            ratio.arg(),
+            top_k.arg(),
+            entries.page_size.arg(),
+            sm_scale.arg(),
+            ctx.stage(),
+        ],
+    )
+}

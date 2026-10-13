@@ -265,13 +265,17 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::MlpSwigluClampSplit { gate, up, limit, y } => linear::mlp::swiglu_clamp_split(
-                self.ctx(),
-                self.tensor(*gate),
-                self.tensor(*up),
-                *limit,
-                &mut self.tensor(*y),
-            ),
+            Linear::MlpSwigluClampSplit { gate, up, limit, y } => {
+                let fan = self.plane_fan(self.tensor(*y).rows);
+                linear::mlp::swiglu_clamp_split(
+                    self.ctx(),
+                    self.tensor(*gate),
+                    self.tensor(*up),
+                    fan,
+                    *limit,
+                    &mut self.tensor(*y),
+                )
+            }
             Linear::MlpGegluTanh { gate, up, y } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::mlp::geglu_tanh(
