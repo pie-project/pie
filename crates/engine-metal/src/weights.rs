@@ -37,6 +37,8 @@ pub struct AdapterPlane<'a> {
 pub struct Weights {
     store: Store,
     mapped: Vec<Buffer>,
+    /// The bytes of the planes the mapped windows bind in place.
+    bound: u64,
     table: WeightTable,
     tier: Option<RefCell<Tier>>,
     rows: Option<RefCell<gather::Slab>>,
@@ -264,6 +266,7 @@ impl Weights {
         Ok(Weights {
             store,
             mapped: Vec::new(),
+            bound: 0,
             table: WeightTable(weight_table),
             tier,
             rows,
@@ -567,6 +570,18 @@ impl Weights {
             );
         }
         Ok(())
+    }
+
+    /// The bytes the mapped windows hold past the planes they bind: on a
+    /// streamed load read out of the artifact, its routed bank, which
+    /// `bytes` already charges as the windows' length.
+    #[must_use]
+    pub fn spanned(&self) -> u64 {
+        self.mapped
+            .iter()
+            .map(Buffer::bytes)
+            .sum::<u64>()
+            .saturating_sub(self.bound)
     }
 
     #[must_use]
@@ -1032,6 +1047,7 @@ fn warm(
             )));
         }
     }
+    let bound = covers.iter().map(|(_, _, length)| *length).sum::<u64>();
     let cuts = mapping::cut(&map, mapping::ceiling(device.max_buffer()), &covers)
         .map_err(|why| Some(why.to_string()))?;
     let mut files = Vec::with_capacity(cuts.len());
@@ -1148,6 +1164,7 @@ fn warm(
     Ok(Weights {
         store,
         mapped: files,
+        bound,
         table: WeightTable(table),
         tier,
         rows,
