@@ -195,7 +195,11 @@ impl Run<'_> {
             Linear::Matmul { act, w, y } => match self.maybe_tiled_planes(*w) {
                 Some((codes, scales, biases, seat)) => {
                     let act = self.tensor(*act);
-                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from {
+                    // The GEMV lands one 16-row tile; past it the GEMM, whatever
+                    // the dense arm's threshold.
+                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from
+                        || act.rows > linear::tiled::GEMV_ROWS
+                    {
                         linear::tiled::matmul
                     } else {
                         linear::tiled::matmul_gemv
@@ -215,7 +219,11 @@ impl Run<'_> {
             Linear::LmHead { act, w, y } => match self.maybe_tiled_planes(*w) {
                 Some((codes, scales, biases, seat)) => {
                     let act = self.tensor(*act);
-                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from {
+                    // The GEMV lands one 16-row tile; past it the GEMM, whatever
+                    // the dense arm's threshold.
+                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from
+                        || act.rows > linear::tiled::GEMV_ROWS
+                    {
                         linear::tiled::lm_head
                     } else {
                         linear::tiled::lm_head_gemv

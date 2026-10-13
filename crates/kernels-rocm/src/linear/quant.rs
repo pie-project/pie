@@ -269,6 +269,47 @@ fn dense_affine(
     }
     let cus = ctx.multiprocessors().unwrap_or(304).max(1);
     let axis = offset.axis();
+    if y.rows > Stream::ROWS
+        && let Some(tile) = Tile::plan(bits, group, offset, k, y.rows)
+    {
+        let blocks = y.rows.div_ceil(tile.bm()) * n.div_ceil(tile.bn());
+        let split = GemmSplit::plan_stages(ctx, op, y.rows, n, k / tile.ks, 2, blocks, cus)?;
+        ctx.fire(
+            op,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::linear::matmul_affine_tile<{t}, {f}, ::pie::i32({bits}), {axis}, \
+                     ::pie::i32({group}), ::pie::i32({}), ::pie::i32({}), ::pie::i32({}), \
+                     ::pie::i32({}), ::pie::i32({})>",
+                    tile.ks, tile.wm, tile.rs, tile.nt, tile.depth
+                )),
+            )
+            .apply(Launch::grid(
+                [
+                    y.rows.div_ceil(tile.bm()),
+                    n.div_ceil(tile.bn()),
+                    split.splits,
+                ],
+                [TILE_THREADS, 1, 1],
+            )),
+            &[
+                act.arg(),
+                codes.arg(),
+                scales.arg(),
+                biases.map_or(ArgValue::ABSENT, |b| b.arg()),
+                y.arg(),
+                split.part_arg(),
+                split.per_arg(op)?,
+                stated(op, y.rows)?.arg(),
+                stated(op, n)?.arg(),
+                stated(op, k)?.arg(),
+                ArgValue::Ptr(seat.cell),
+                ctx.stage(),
+            ],
+        )?;
+        return split.finalize(ctx, op, FILE, t, y);
+    }
     if y.rows > DECODE_ROWS && k.is_multiple_of(GEMM_KC) {
         // Activation rows a block: the tallest tile that still lands a
         // block on every compute unit, so a short prefill is not one row
@@ -309,28 +350,59 @@ fn dense_affine(
         )?;
         return split.finalize(ctx, op, FILE, t, y);
     }
-    let (entry, launch) = {
-        let d = Decode::plan(bits, group, n, k, y.rows, cus);
-        (
-            format!(
+    if let Some(s) = Stream::plan(bits, group, offset, n, k, y.rows, cus) {
+        let split = GemmSplit::fixed(ctx, op, y.rows, n, s.slices)?;
+        ctx.fire(
+            op,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::linear::matmul_affine_stream<{t}, {f}, ::pie::i32({bits}), {axis}, \
+                     ::pie::i32({group}), ::pie::i32({}), ::pie::i32({}), ::pie::i32({}), \
+                     ::pie::i32({}), ::pie::i32({}), ::pie::i32({}), ::pie::i32({})>",
+                    s.lane, s.nt, s.rs, s.rows, s.pieces, s.split, s.depth
+                )),
+            )
+            .apply(Launch::grid(
+                [s.blocks, s.slices, 1],
+                [WAVE * s.split, 1, 1],
+            )),
+            &[
+                act.arg(),
+                codes.arg(),
+                scales.arg(),
+                biases.map_or(ArgValue::ABSENT, |b| b.arg()),
+                y.arg(),
+                split.part_arg(),
+                stated(op, y.rows)?.arg(),
+                stated(op, n)?.arg(),
+                stated(op, k)?.arg(),
+                ArgValue::Ptr(seat.cell),
+                ctx.stage(),
+            ],
+        )?;
+        return split.finalize(ctx, op, FILE, t, y);
+    }
+    let d = Decode::plan(bits, group, n, k, y.rows, cus);
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            symbol(&format!(
                 "::pie::linear::matmul_affine_decode<{t}, {f}, ::pie::i32({bits}), {axis}, \
                  ::pie::i32({group}), ::pie::i32({}), ::pie::i32({}), ::pie::i32({}), \
                  ::pie::i32({}), ::pie::i32({}), ::pie::i32({})>",
                 d.shape, d.lane, d.nt, d.rs, d.split, d.round
-            ),
-            Launch::grid(
-                [
-                    n.div_ceil(d.shape * d.nt),
-                    y.rows.div_ceil(d.shape * d.rs),
-                    1,
-                ],
-                [64 * d.split, 1, 1],
-            ),
+            )),
         )
-    };
-    ctx.fire(
-        op,
-        Fire::at(FILE, symbol(&entry)).apply(launch),
+        .apply(Launch::grid(
+            [
+                n.div_ceil(d.shape * d.nt),
+                y.rows.div_ceil(d.shape * d.rs),
+                1,
+            ],
+            [64 * d.split, 1, 1],
+        )),
         &[
             act.arg(),
             codes.arg(),
@@ -377,11 +449,26 @@ impl GemmSplit {
         blocks: u32,
         cus: u32,
     ) -> Result<Self, Error> {
-        let stages = k / GEMM_KC;
-        // Twice the device in blocks, eight stages a slice at least: a
-        // partial is written and read once more, so no further.
+        // Eight 64-code stages a slice at least.
+        Self::plan_stages(ctx, op, rows, n, k / GEMM_KC, 8, blocks, cus)
+    }
+
+    /// The slicing of `stages` K stages, `least` a slice at least: twice
+    /// the device in blocks, since a partial is written and read once
+    /// more, so no further.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_stages(
+        ctx: &Ctx,
+        op: &'static str,
+        rows: u32,
+        n: u32,
+        stages: u32,
+        least: u32,
+        blocks: u32,
+        cus: u32,
+    ) -> Result<Self, Error> {
         let mut splits = 1;
-        while blocks * splits < 2 * cus && stages / (2 * splits) >= 8 && splits < 16 {
+        while blocks * splits < 2 * cus && stages / (2 * splits) >= least && splits < 16 {
             splits *= 2;
         }
         let per = stages.div_ceil(splits);
@@ -395,6 +482,23 @@ impl GemmSplit {
         Ok(Self {
             splits,
             per,
+            part,
+            rows,
+            n,
+        })
+    }
+
+    /// `splits` slices a kernel walks on its own (no stages a slice).
+    fn fixed(ctx: &Ctx, op: &'static str, rows: u32, n: u32, splits: u32) -> Result<Self, Error> {
+        let part = if splits > 1 {
+            let bytes = splits as usize * rows as usize * n as usize * 4;
+            ctx.scratch(op, "linear.quant.gemm_part", bytes)? as u64
+        } else {
+            0
+        };
+        Ok(Self {
+            splits,
+            per: 0,
             part,
             rows,
             n,
@@ -445,6 +549,172 @@ impl GemmSplit {
                 ctx.stage(),
             ],
         )
+    }
+}
+
+/// The tile kernel's threads a block (four wavefronts).
+const TILE_THREADS: u32 = 256;
+
+/// The tile kernel's tiling (linear/quant.hip `matmul_affine_tile`): `ks`
+/// codes a K stage, `wm` x `4 / wm` wavefronts of `rs` x `nt` 16 x 16
+/// tiles, `depth` stages in flight.
+#[derive(Clone, Copy, Debug)]
+struct Tile {
+    ks: u32,
+    wm: u32,
+    rs: u32,
+    nt: u32,
+    depth: u32,
+}
+
+impl Tile {
+    const fn bm(self) -> u32 {
+        self.wm * 16 * self.rs
+    }
+
+    const fn bn(self) -> u32 {
+        4 / self.wm * 16 * self.nt
+    }
+
+    fn plan(bits: u32, group: u32, offset: OffsetKind, k: u32, rows: u32) -> Option<Self> {
+        // A lane group's quarter of a group is whole words, at most four;
+        // a group is two to eight 16-code segments.
+        if !matches!(group * bits / 32, 4 | 8 | 16) || !matches!(group / 16, 2 | 4 | 8) {
+            return None;
+        }
+        // Activation rows a block by what the rows fill; the stage's code
+        // bytes a weight row shrink as the activation tile grows, to keep
+        // LDS within a block.
+        let (wm, rs, nt, row_bytes) = if rows <= 16 {
+            (1, 1, 1, 128)
+        } else if rows <= 32 {
+            (2, 1, 2, 128)
+        } else {
+            (2, 2, 2, 64)
+        };
+        let tile = Self {
+            ks: row_bytes * 8 / bits,
+            wm,
+            rs,
+            nt,
+            depth: 2,
+        };
+        let (bm, bn, ks) = (tile.bm(), tile.bn(), tile.ks);
+        let groups = ks / group;
+        let off_bytes = match offset {
+            OffsetKind::PreConst => 0,
+            OffsetKind::PreInt => 1,
+            OffsetKind::Post | OffsetKind::PreReal => 2,
+        };
+        let lds = bn * (row_bytes + 16)
+            + bm * (ks + 8) * 2
+            + bn * groups * (2 + off_bytes)
+            + groups * bm * 4;
+        let whole = |bytes: u32| bytes.is_multiple_of(16 * TILE_THREADS);
+        (ks.is_multiple_of(group)
+            && k.is_multiple_of(ks)
+            && (groups * 2).is_multiple_of(4)
+            && (groups * off_bytes).is_multiple_of(4)
+            && whole(bn * row_bytes)
+            && whole(bm * ks)
+            && lds <= 64 << 10)
+            .then_some(tile)
+    }
+}
+
+/// The streaming kernel's tiling (linear/quant.hip `matmul_affine_stream`):
+/// `lane` codes a lane reads a piece, `nt` and `rs` tiles of four weight and
+/// activation rows, `rows` of the four an activation tile lands, `pieces`
+/// a wavefront holds the activation of and `split` wavefronts a block, so
+/// a block walks a slice of K a tile, `slices` of K over the grid, `depth`
+/// tiles in flight a block, `blocks` persistent blocks a slice.
+#[derive(Clone, Copy, Debug)]
+struct Stream {
+    lane: u32,
+    nt: u32,
+    rs: u32,
+    rows: u32,
+    pieces: u32,
+    split: u32,
+    slices: u32,
+    depth: u32,
+    blocks: u32,
+}
+
+impl Stream {
+    /// The most activation rows the kernel takes.
+    const ROWS: u32 = 8;
+
+    fn plan(
+        bits: u32,
+        group: u32,
+        offset: OffsetKind,
+        n: u32,
+        k: u32,
+        rows: u32,
+        cus: u32,
+    ) -> Option<Self> {
+        if rows > Self::ROWS {
+            return None;
+        }
+        // Sixteen bytes a lane, or the most whole words of one group.
+        let mut lane = 128 / bits;
+        while lane > 8 && !group.is_multiple_of(lane) {
+            lane /= 2;
+        }
+        let piece = 16 * lane;
+        let piece_groups = piece / group;
+        // K in whole pieces; a piece's factor rows whole 4-byte words.
+        let off_bytes = if offset == OffsetKind::PreInt { 1 } else { 2 };
+        let words = |bytes: u32| piece_groups * bytes / 4;
+        if !group.is_multiple_of(lane)
+            || !k.is_multiple_of(piece)
+            || !piece.is_multiple_of(group)
+            || words(2) == 0
+            || (offset != OffsetKind::PreConst && words(off_bytes) == 0)
+        {
+            return None;
+        }
+        let rs = rows.div_ceil(4);
+        let rows_used = if rs == 1 { rows } else { 4 };
+        // Two tiles of four weight rows (four streamed no faster and hold
+        // more registers), one where a piece's factors take two words a lane.
+        let most_words = words(2).max(if offset == OffsetKind::PreConst {
+            0
+        } else {
+            words(off_bytes)
+        });
+        let mut nt = 2;
+        while nt > 1 && 4 * nt * most_words > 64 {
+            nt /= 2;
+        }
+        if 4 * nt * most_words > 64 {
+            return None;
+        }
+        // A wavefront holds the activation of two pieces for one activation
+        // tile, of one for two (more spill out of the registers); sixteen
+        // wavefronts a block, and K past what they hold sliced over the grid.
+        let total = k / piece;
+        let most = if rs == 1 { 2 } else { 1 };
+        let slices = total.div_ceil(16 * most);
+        let per = total.div_ceil(slices);
+        let pieces = per.div_ceil(16);
+        let tiles = n.div_ceil(4 * nt);
+        Some(Self {
+            lane,
+            nt,
+            rs,
+            rows: rows_used,
+            pieces,
+            split: per.div_ceil(pieces),
+            slices,
+            // Two tiles in flight, one where the activation fills the
+            // registers.
+            depth: if pieces > 1 { 1 } else { 2 },
+            // Up to two blocks a compute unit (their tiles' reads in flight,
+            // more only queue), as few as land the same tiles each.
+            blocks: tiles.div_ceil(tiles.div_ceil((2 * cus).div_ceil(slices))),
+        })
     }
 }
 

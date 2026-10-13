@@ -60,10 +60,13 @@ pub enum MlaPath {
     Naive,
 }
 
-/// The fewest rows a quantised projection takes the tiled GEMM for (and,
-/// for a held bank, the bf16 decode into cuBLAS); fewer take the GEMV.
+/// The fewest rows a held affine-quantised bank decodes to bf16 for
+/// hipBLASLt, fewer taking the native kernels (on MI300X the decode starts
+/// to win near 128 rows: below, the native kernels read a quarter of the
+/// bytes), and the fewest a tiled bank takes the tiled GEMM for (past the
+/// GEMV's 16 rows it takes it regardless).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.qmm.gemm_from", constant(range(1..=4096)), default = 16, tune = search)]
+#[decision(id = "kernel.qmm.gemm_from", constant(range(1..=4096)), default = 128, tune = search)]
 pub struct QmmGemmFrom(pub u32);
 
 /// The fewest rows the tiled quantised GEMM takes its long tile (64 x 128,
@@ -239,7 +242,7 @@ impl Tuning {
         gemv_narrow: false,
         gemv_splitk_max_n: 4096,
         mla_naive: false,
-        qmm_gemm_from: 16,
+        qmm_gemm_from: 128,
         qmm_long_rows: 512,
         qmm_split_warps_per_sm: 58,
         qmm_split_thin_max: 32,

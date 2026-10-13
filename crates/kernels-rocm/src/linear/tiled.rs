@@ -298,6 +298,9 @@ pub const MIN_SPLIT: u32 = 8;
 
 pub const THIN_ROWS: u32 = 8;
 
+/// The most activation rows the GEMV lands (one 16-row tile of the core).
+pub const GEMV_ROWS: u32 = 16;
+
 /// Split-K depth for `rows` x `n`: aims for `kernel.qmm.split_warps_per_sm`
 /// warps on every SM, capped by the thin (8 rows or fewer) or wide maximum.
 fn carve_for(n: u32, rows: u32, ctx: &Ctx) -> Carve {
@@ -393,6 +396,15 @@ pub fn gemv_with(
             op,
             "the tiled arm serves resident dense projections only, and these planes are \
              seated by a streaming tier",
+        ));
+    }
+    if y.rows > GEMV_ROWS {
+        return Err(refuse(
+            op,
+            format!(
+                "the GEMV lands {GEMV_ROWS} activation rows at most, and {} were bound",
+                y.rows
+            ),
         ));
     }
     debug_assert_eq!(

@@ -33,6 +33,19 @@ __device__ __forceinline__ u32 word(V v, int i) {
 }
 __device__ __forceinline__ u32 word(u32 v, int) { return v; }
 
+// A read the compiler knows is of global memory: through a generic pointer
+// it issues a flat read, which also counts against LDS waits, so a loop's
+// LDS traffic would wait on its prefetch. NT marks codes streamed once.
+template <class V, bool NT = false>
+__device__ __forceinline__ V read_global(const void* p) {
+    const auto* g = (const __attribute__((address_space(1))) V*)(p);
+    if constexpr (NT) {
+        return __builtin_nontemporal_load(g);
+    } else {
+        return *g;
+    }
+}
+
 // Global reads issued and waited by hand, for a loop that keeps a round of
 // reads in flight across its arithmetic: the compiler, counting its own
 // reads, sinks each to its use and waits there for it and every read
@@ -194,6 +207,61 @@ struct Unpack {
                 p[j] = __builtin_amdgcn_perm(q, kHigh, 0x01000100u | static_cast<u32>(4 + 2 * j) |
                                                            (static_cast<u32>(5 + 2 * j) << 16));
         }
+    }
+};
+
+// (x & mask) | bits as one instruction: with both constants literal the
+// compiler splits it in two (a three-operand instruction takes no literal
+// on gfx9), so they reach it opaque, from registers. (Not the instruction
+// itself in asm: the hazard checks cannot see into asm next to the
+// matrix cores.)
+__device__ __forceinline__ u32 and_or(u32 x, u32 mask, u32 bits) {
+    asm("" : "+v"(mask));
+    asm("" : "+s"(bits));
+    return (x & mask) | bits;
+}
+
+// The codes of one 32-bit word as matrix-core operands in the order that
+// costs fewest instructions, with the activation shuffled to match. A word
+// of P codes gives P / 2 pairs, pair i holding codes i and i + P/2 (one
+// shift and one and-or each: the magic exponent fills the upper bits of
+// both halves at once); a 4-code operand is pairs 2h and 2h + 1, so it
+// reads codes 2h, 2h + P/2, 2h + 1, 2h + 1 + P/2. `act` lays the word's P
+// activations (P / 2 words, two a word in k order) out the same way.
+// Eight-bit codes in bf16, which overflow 128's mantissa, are converted
+// outright, in the same order.
+template <class T, int kBits>
+struct Quads {
+    static constexpr int kPer = 32 / kBits;  // codes a word
+    static constexpr int kSteps = kPer / 4;  // 4-code operands a word
+    static constexpr bool kF16 = is_same<T, f16>::value;
+    static constexpr bool kConvert = !kF16 && kBits == 8;
+    static constexpr float kMagic = kF16 ? 1024.f : (kConvert ? 0.f : 128.f);
+    static constexpr u32 kHigh = kF16 ? 0x64006400u : 0x43004300u;
+    static constexpr u32 kMask = ((1u << kBits) - 1) * 0x00010001u;
+    static_assert(kBits == 2 || kBits == 4 || kBits == 8, "codes are two, four or eight bits");
+
+    // Operand h of word q, as B.
+    __device__ static __forceinline__ void codes(u32 q, Words<2> (&b)[kSteps]) {
+        if constexpr (kConvert) {
+            u32 f[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) f[i] = __builtin_bit_cast(u32, static_cast<float>((q >> (8 * i)) & 0xffu));
+            // A small integer's f32 is its bf16 in the upper half, exactly.
+            b[0] = Words<2>{__builtin_amdgcn_perm(f[2], f[0], 0x07060302u),
+                            __builtin_amdgcn_perm(f[3], f[1], 0x07060302u)};
+        } else {
+#pragma unroll
+            for (int h = 0; h < kSteps; ++h)
+                b[h] = Words<2>{and_or(q >> (kBits * 2 * h), kMask, kHigh),
+                                and_or(q >> (kBits * (2 * h + 1)), kMask, kHigh)};
+        }
+    }
+
+    // Operand h of the activations d[0 .. P/2) under the same codes, as A.
+    __device__ static __forceinline__ Words<2> act(const u32* d, int h) {
+        const u32 lo = d[h], hi = d[h + kPer / 4];
+        return Words<2>{__builtin_amdgcn_perm(hi, lo, 0x05040100u), __builtin_amdgcn_perm(hi, lo, 0x07060302u)};
     }
 };
 

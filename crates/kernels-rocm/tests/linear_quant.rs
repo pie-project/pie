@@ -136,12 +136,12 @@ struct Weight {
 
 impl Weight {
     fn new(bits: u32, group: u32, offset: OffsetKind, n: u32, k: u32, e: Elem, seed: u64) -> Self {
-        let bytes = (n * k * bits / 8) as usize;
+        let bytes = n as usize * k as usize * bits as usize / 8;
         let codes: Vec<u8> = values(bytes, seed, 1.0)
             .iter()
             .map(|v| ((v + 1.0) * 128.0) as u8)
             .collect();
-        let groups = (n * k / group) as usize;
+        let groups = n as usize * k as usize / group as usize;
         let scales: Vec<f32> = values(groups, seed + 1, 1.0)
             .iter()
             .map(|v| e.round(0.02 + 0.01 * v))
@@ -343,6 +343,54 @@ fn linear_quant_matmul() {
     ];
     for (i, c) in cases.iter().enumerate() {
         run(&gpu, c, 11 + i as u64);
+    }
+}
+
+/// The streaming kernel past one tile a block, with a wavefront holding
+/// more than one piece (one of them dead), and a ragged N; the tile kernel
+/// at each activation tile, K sliced over the grid, ragged M and N.
+#[test]
+fn linear_quant_stream_and_tile() {
+    let Some(gpu) = Gpu::open() else { return };
+    use Elem::{Bf16, F16};
+    use OffsetKind::{Post, PreConst, PreInt, PreReal};
+    let case = |e, bits, group, offset, rows, n, k| Case {
+        e,
+        bits,
+        group,
+        offset,
+        rows,
+        n,
+        k,
+    };
+    let cases = [
+        // Streaming: tiles past the persistent blocks, both activation
+        // tiles, a wavefront of two pieces with one dead, ragged N.
+        case(Bf16, 4, 64, Post, 1, 12288, 512),
+        case(Bf16, 4, 64, Post, 3, 12288, 512),
+        case(Bf16, 4, 64, Post, 6, 12288, 512),
+        case(Bf16, 4, 64, Post, 1, 256, 8704),
+        // K past what a block holds, sliced over the grid.
+        case(Bf16, 4, 64, Post, 2, 320, 17408),
+        case(Bf16, 4, 64, Post, 7, 320, 17408),
+        case(Bf16, 4, 64, Post, 8, 1000, 1536),
+        case(Bf16, 8, 64, PreInt, 2, 4096, 1024),
+        case(Bf16, 4, 128, PreConst, 4, 2048, 2048),
+        case(F16, 4, 32, PreReal, 5, 1024, 1024),
+        // Tile: 16-, 32- and 64-row activation tiles, K sliced, ragged.
+        case(Bf16, 4, 64, Post, 9, 256, 4096),
+        case(Bf16, 4, 64, Post, 16, 1000, 2048),
+        case(Bf16, 4, 64, Post, 24, 256, 4096),
+        case(Bf16, 4, 64, Post, 32, 640, 1024),
+        case(Bf16, 4, 64, Post, 48, 256, 4096),
+        case(Bf16, 4, 64, Post, 77, 1000, 1024),
+        case(Bf16, 4, 64, Post, 200, 256, 2048),
+        case(Bf16, 8, 64, Post, 20, 512, 1024),
+        case(Bf16, 4, 32, PreReal, 40, 256, 1024),
+        case(F16, 4, 64, Post, 24, 512, 1024),
+    ];
+    for (i, c) in cases.iter().enumerate() {
+        run(&gpu, c, 101 + i as u64);
     }
 }
 
@@ -805,5 +853,109 @@ fn bench_linear_quant() {
             "  bf16 {rows_bf16}x{k} rows    1: {us:8.1} us  {:5.2} TB/s",
             f64::from(rows_bf16 * k * 2) / us * 1e-6
         );
+    }
+}
+
+/// The best of three timings: the device may be shared.
+fn best(mut f: impl FnMut() -> f64) -> f64 {
+    (0..3).map(|_| f()).fold(f64::INFINITY, f64::min)
+}
+
+/// The dense u4 g64 projections a deployment runs, at decode and short
+/// prefill rows, on cold planes of random codes: the native kernels
+/// (`quant::matmul`), the decode-to-bf16 arm (`quant::matmul_via_dense`),
+/// and the bf16 projection of the same shape (random weights too: the
+/// device streams constant data faster). Throughput is of the packed bytes
+/// (codes and factor pairs). `PIE_BENCH_SHAPES=NxK,...` and
+/// `PIE_BENCH_ROWS=1,8,...` narrow it, `PIE_BENCH_NATIVE` times the native
+/// kernels alone. `--ignored` to run.
+#[test]
+#[ignore = "benchmark"]
+fn bench_affine_dense() {
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    let e = Elem::Bf16;
+    let list = |var: &str, all: &str| std::env::var(var).unwrap_or_else(|_| all.into());
+    let shapes: Vec<(u32, u32)> = list(
+        "PIE_BENCH_SHAPES",
+        "24576x4096,4096x12288,4096x4096,4096x8192,154880x4096,17408x5120,5120x17408",
+    )
+    .split(',')
+    .map(|s| {
+        let (n, k) = s.split_once('x').unwrap();
+        (n.parse().unwrap(), k.parse().unwrap())
+    })
+    .collect();
+    let rows: Vec<u32> = list("PIE_BENCH_ROWS", "1,8,16,32,64,128,256")
+        .split(',')
+        .map(|r| r.parse().unwrap())
+        .collect();
+    let cold = |bytes: f64| ((512.0 * 1024.0 * 1024.0 / bytes).ceil() as usize).max(2);
+    for (n, k) in shapes {
+        let mut held = Held::new(&gpu);
+        let w = Weight::new(4, 64, OffsetKind::Post, n, k, e, 5);
+        let bytes = f64::from(n) * f64::from(k) / 2.0 + 4.0 * f64::from(n) * f64::from(k / 64);
+        let copies = cold(bytes);
+        let planes: Vec<_> = (0..copies).map(|_| w.planes(&mut held, e)).collect();
+        let dense_copies = cold(2.0 * f64::from(n) * f64::from(k));
+        let weights = values((n * k) as usize, 2, 0.05);
+        let dense: Vec<_> = (0..dense_copies)
+            .map(|_| held.elems(&weights, n, k, e))
+            .collect();
+        drop(weights);
+        quant::warm_decoded_weight(&ctx, 2 * u64::from(n) * u64::from(k)).unwrap();
+        eprintln!("u4 g64 {n}x{k} ({:.1} MB packed)", bytes * 1e-6);
+        for &m in &rows {
+            let x = values((m * k) as usize, 6, 1.0);
+            let xt = held.elems(&x, m, k, e);
+            let mut y = held.zeros(m, n, e);
+            let mut time = |via_dense: bool| {
+                let entry = if via_dense {
+                    quant::matmul_via_dense
+                } else {
+                    quant::matmul
+                };
+                best(|| {
+                    let mut at = 0;
+                    gpu.time_graph(2 * copies as u32, || {
+                        let (codes, scales, offs) = planes[at % copies];
+                        at += 1;
+                        entry(
+                            &ctx,
+                            xt,
+                            codes,
+                            scales,
+                            OffsetKind::Post,
+                            offs,
+                            Dtype::Bf16,
+                            &mut y,
+                            GroupSeat::RESIDENT,
+                        )
+                        .unwrap();
+                    })
+                })
+            };
+            let native = time(false);
+            if std::env::var("PIE_BENCH_NATIVE").is_ok() {
+                eprintln!(
+                    "  rows {m:>4}: native {native:8.1} us {:5.2} TB/s",
+                    bytes / native * 1e-6
+                );
+                continue;
+            }
+            let via = time(true);
+            let bf16 = best(|| {
+                let mut at = 0;
+                gpu.time_graph(2 * dense_copies as u32, || {
+                    kernels_rocm::linear::gemm::matmul(&ctx, xt, dense[at % dense_copies], &mut y)
+                        .unwrap();
+                    at += 1;
+                })
+            });
+            eprintln!(
+                "  rows {m:>4}: native {native:8.1} us {:5.2} TB/s | via-dense {via:8.1} us | bf16 {bf16:8.1} us",
+                bytes / native * 1e-6,
+            );
+        }
     }
 }

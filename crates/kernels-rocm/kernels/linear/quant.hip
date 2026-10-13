@@ -255,6 +255,613 @@ __global__ __launch_bounds__(kWave* SPLIT) void matmul_affine_decode(
     }
 }
 
+// y[m, n] = act[m] · W[n] for the rows of a decode (up to eight),
+// streaming the codes once. The products run on the 4 x 4 x 4 core:
+// sixteen blocks of four lanes, lane 4b + j of block b holding weight row j
+// and activation row j of a tile over the same LANE codes, at
+// k = 16·LANE·p + LANE·b of piece p. So one read is four weight rows of
+// 16·LANE codes each, and no lane exchanges codes.
+//
+// A block of SPLIT wavefronts is persistent over tiles of 4·NT weight
+// rows (blockIdx.x, then every gridDim.x-th). Wavefront w owns pieces
+// w + SPLIT·i, i < P, of every tile, so the block reads whole rows at once,
+// and holds their activation (RS tiles of four rows, E of the four live)
+// for the kernel's life, as matrix-core operands in `Quads` order with Σ x
+// of each, so a tile's only reads are its codes and factors, D tiles in
+// flight. The codes go to the core raw, so a product sums Σ x·(c + magic),
+// and each piece folds into f32 as
+//
+//   Σ x·w = s·Σ x·(c + magic) + (o − magic·s)·Σ x
+//
+// (LANE codes are one group's). A piece's factors for the 4·NT rows are
+// one 4-byte read a lane of each plane, handed to the lanes that use them
+// by `ds_bpermute`. The wavefronts' sums meet in LDS. K is whole pieces.
+template <class T, class F, int kBits, int kOffset, int kGroup, int LANE, int NT, int RS, int E, int P, int SPLIT,
+          int D>
+__global__ __launch_bounds__(kWave* SPLIT) void matmul_affine_stream(
+    const T* __restrict__ act, const u8* __restrict__ codes, const u8* __restrict__ scales,
+    const u8* __restrict__ biases, T* __restrict__ out, float* __restrict__ slices, int m, int n, int k,
+    const AffineSeat* __restrict__ seat, const u32* __restrict__ win) {
+    using Q = Quads<T, kBits>;
+    constexpr int kBytes = LANE * kBits / 8;  // code bytes a lane reads a piece
+    constexpr int kWords = kBytes / 4;
+    constexpr int kPiece = 16 * LANE;
+    constexpr int kPieceGroups = kPiece / kGroup;
+    constexpr bool kOffsets = kOffset != kOffPreConst;
+    constexpr int kOffBytes = kOffset == kOffPreInt ? 1 : 2;
+    constexpr int kRows = 4 * NT;                          // weight rows a tile
+    constexpr int kScaleWords = kPieceGroups * 2 / 4;       // a row's factor words a piece
+    constexpr int kOffWords = kPieceGroups * kOffBytes / 4;
+    static_assert(kWave == 64, "sixteen blocks of four lanes");
+    static_assert(kBytes == 4 || kBytes == 8 || kBytes == 16, "a lane reads one 4-, 8- or 16-byte access");
+    static_assert(kGroup % LANE == 0 && kPiece % kGroup == 0 && LANE >= 8,
+                  "a lane's codes are whole words of one group");
+    static_assert(kScaleWords >= 1 && kRows * kScaleWords <= kWave, "a piece's scales are a word a lane");
+    static_assert(!kOffsets || (kOffWords >= 1 && kRows * kOffWords <= kWave), "a piece's offsets are a word a lane");
+
+    const int rows = win == nullptr ? m : min(m, static_cast<int>(win[0]));
+    if (rows <= 0) return;
+    const AffinePlanes planes = seated(codes, scales, biases, seat);
+    const int l = lane(), j = l % 4, b = l / 4;
+    const int wave = __builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x) / kWave);
+    const int groups = k / kGroup;
+    const int tiles = (n + kRows - 1) / kRows;
+    const long long row_bytes = static_cast<long long>(k) * kBits / 8;
+    // K past what a block's wavefronts hold is sliced over blockIdx.y, a
+    // slice of SPLIT·P pieces, each slice's f32 sums landing in `slices`
+    // (slice-major, [rows][n] each) for `affine_gemm_finalize` to add up.
+    const int base = blockIdx.y * SPLIT * P, pieces = min(k / kPiece, base + SPLIT * P);
+
+    // This wavefront's pieces: piece i is base + wave + SPLIT·i, live below
+    // `pieces` (a dead one reads the last live piece and multiplies nothing).
+    auto piece = [&](int i) { return min(base + wave + SPLIT * i, pieces - 1); };
+    auto alive = [&](int i) { return base + wave + SPLIT * i < pieces; };
+
+    // The activation, once: operand h of word w of piece i, tile rs, and Σ x.
+    // Its reads go out behind the first tile's, so the codes are in flight
+    // first.
+    Words<4> xr[P][RS][LANE / 8];
+    auto issue_act = [&]() {
+#pragma unroll
+        for (int i = 0; i < P; ++i)
+#pragma unroll
+            for (int rs = 0; rs < RS; ++rs) {
+                const u8* x = reinterpret_cast<const u8*>(act + piece(i) * kPiece);
+                const u32 off = 2 * (static_cast<u32>(min(4 * rs + j, rows - 1)) * k + LANE * b);
+#pragma unroll
+                for (int q = 0; q < LANE / 8; ++q) xr[i][rs][q] = read_global<Words<4>>(x + off + 16 * q);
+            }
+    };
+    Words<2> xa[P][RS][kWords][Q::kSteps];
+    mfma_cd sx[P][RS];
+    auto prime = [&]() {
+        const Words<2> ones{kOnes<T>, kOnes<T>};
+#pragma unroll
+        for (int i = 0; i < P; ++i)
+#pragma unroll
+            for (int rs = 0; rs < RS; ++rs) {
+                u32 d[LANE / 2];
+#pragma unroll
+                for (int q = 0; q < LANE / 8; ++q) {
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) d[4 * q + e] = alive(i) ? xr[i][rs][q][e] : 0u;
+                }
+                sx[i][rs] = mfma_zero();
+#pragma unroll
+                for (int w = 0; w < kWords; ++w)
+#pragma unroll
+                    for (int h = 0; h < Q::kSteps; ++h) {
+                        xa[i][rs][w][h] = Q::act(d + w * (Q::kPer / 2), h);
+                        sx[i][rs] = mfma4x4<T>(xa[i][rs][w][h], ones, sx[i][rs]);
+                    }
+            }
+    };
+    // Factor reads: lane s < kRows·words reads word s / kRows of row
+    // s % kRows; lane 4b + j takes its group's from the lane holding row
+    // 4·nt + j, as a byte address for `ds_bpermute`, and a shift. Where both
+    // planes fit half a wavefront, one read takes them, the upper half the
+    // offsets.
+    constexpr bool kPacked = kOffsets && kRows * kScaleWords <= kWave / 2 && kRows * kOffWords <= kWave / 2;
+    const int my_group = LANE * b / kGroup;  // within a piece
+    auto factor_lane = [&](int words) { return min(kPacked ? l % (kWave / 2) : l, kRows * words - 1); };
+    auto factor_src = [&](int nt, int bytes, bool off) {
+        return 4 * ((my_group * bytes / 4) * kRows + 4 * nt + j + (kPacked && off ? kWave / 2 : 0));
+    };
+    const int scale_shift = my_group * 2 % 4 * 8, off_shift = my_group * kOffBytes % 4 * 8;
+
+    struct Tile {
+        Words<kWords> w[P][NT];
+        u32 s[P], o[P];
+    };
+    auto issue = [&](Tile& tl, int t) {
+        const int row0 = t * kRows;
+        u32 co[NT];
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+            co[nt] = static_cast<u32>((min(row0 + 4 * nt + j, n - 1) - row0) * row_bytes) + b * kBytes;
+        const int fs = factor_lane(kScaleWords), fo = factor_lane(kOffWords);
+        const u32 so = static_cast<u32>((min(row0 + fs % kRows, n - 1) - row0) * groups * 2) + fs / kRows * 4;
+        const u32 oo = static_cast<u32>((min(row0 + fo % kRows, n - 1) - row0) * groups * kOffBytes) + fo / kRows * 4;
+#pragma unroll
+        for (int i = 0; i < P; ++i) {
+            const int pc = piece(i);
+            const u8* cb = planes.codes + row0 * row_bytes + static_cast<long long>(pc) * kPiece * kBits / 8;
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) tl.w[i][nt] = read_global<Words<kWords>, true>(cb + co[nt]);
+            const long long f0 = static_cast<long long>(row0) * groups + pc * kPieceGroups;
+            if constexpr (kPacked) {
+                tl.s[i] = read_global<u32>(l < kWave / 2 ? planes.scales + f0 * 2 + so : planes.biases + f0 * kOffBytes + oo);
+                tl.o[i] = tl.s[i];
+            } else {
+                tl.s[i] = read_global<u32>(planes.scales + f0 * 2 + so);
+                if constexpr (kOffsets) {
+                    tl.o[i] = read_global<u32>(planes.biases + f0 * kOffBytes + oo);
+                } else {
+                    tl.o[i] = 0;
+                }
+            }
+        }
+    };
+
+    // The wavefronts' partial sums, two tiles' worth so a tile's writes
+    // need no barrier behind the previous tile's reads.
+    constexpr int kCells = NT * RS * 16;
+    __shared__ float part[2][kCells][SPLIT];
+
+    auto land = [&](const Tile& tl, int t, int slot) {
+        mfma_cd acc[NT][RS];
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+            for (int rs = 0; rs < RS; ++rs) acc[nt][rs] = mfma_zero();
+#pragma unroll
+        for (int i = 0; i < P; ++i) {
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+                const u32 sw = __builtin_amdgcn_ds_bpermute(factor_src(nt, 2, false), tl.s[i]) >> scale_shift;
+                u32 ow = 0;
+                if constexpr (kOffsets)
+                    ow = __builtin_amdgcn_ds_bpermute(factor_src(nt, kOffBytes, true), tl.o[i]) >> off_shift;
+                const Factor f = factor_bits<F, kBits, kOffset>(sw & 0xffffu, ow & (kOffBytes == 1 ? 0xffu : 0xffffu));
+                const float o = additive<kOffset>(f) - Q::kMagic * f.s;
+                mfma_cd d[RS];
+#pragma unroll
+                for (int rs = 0; rs < RS; ++rs) d[rs] = mfma_zero();
+#pragma unroll
+                for (int w = 0; w < kWords; ++w) {
+                    Words<2> c[Q::kSteps];
+                    Q::codes(word(tl.w[i][nt], w), c);
+#pragma unroll
+                    for (int h = 0; h < Q::kSteps; ++h)
+#pragma unroll
+                        for (int rs = 0; rs < RS; ++rs) d[rs] = mfma4x4<T>(xa[i][rs][w][h], c[h], d[rs]);
+                }
+#pragma unroll
+                for (int rs = 0; rs < RS; ++rs)
+#pragma unroll
+                    for (int e = 0; e < E; ++e)
+                        acc[nt][rs][e] = fmaf(f.s, d[rs][e], fmaf(o, sx[i][rs][e], acc[nt][rs][e]));
+            }
+        }
+        // Lane 4b + j's D[e] is activation row e, weight row j, summed over
+        // its block's k: sum the sixteen blocks (a rotate by 4 and by 8
+        // within a 16-lane row, then across the rows), and the wavefronts'
+        // sums in LDS, in wavefront order.
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+            for (int rs = 0; rs < RS; ++rs)
+#pragma unroll
+                for (int e = 0; e < E; ++e) {
+                    float v = acc[nt][rs][e];
+                    v += __builtin_bit_cast(  // row_ror:4
+                        float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x124, 0xf, 0xf, true));
+                    v += __builtin_bit_cast(  // row_ror:8
+                        float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x128, 0xf, 0xf, true));
+                    v += __builtin_bit_cast(  // lane ^ 16
+                        float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401f));
+                    v += __shfl_xor(v, 32, kWave);
+                    acc[nt][rs][e] = v;
+                }
+        if (l < 4) {
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+                for (int rs = 0; rs < RS; ++rs)
+#pragma unroll
+                    for (int e = 0; e < E; ++e) part[slot][((nt * RS + rs) * 4 + e) * 4 + j][wave] = acc[nt][rs][e];
+        }
+        lds_barrier();
+        for (int cell = threadIdx.x; cell < kCells; cell += blockDim.x) {
+            float v = 0.f;
+#pragma unroll
+            for (int q = 0; q < SPLIT; ++q) v += part[slot][cell][q];
+            const int c = cell % 4, r = cell / 4 % 4, rs = cell / 16 % RS, nt = cell / (16 * RS);
+            const int row = 4 * rs + r, col = t * kRows + 4 * nt + c;
+            if (row >= rows || col >= n) continue;
+            if (slices != nullptr) {
+                slices[(static_cast<long long>(blockIdx.y) * rows + row) * n + col] = v;
+            } else {
+                out[static_cast<long long>(row) * n + col] = from_f32<T>(v);
+            }
+        }
+    };
+
+    // D tiles in flight: slot d lands tile i + d, then reads tile i + d + D.
+    // The first tile's codes go out before the activation's reads, the
+    // rest behind them. Every read in the steady loop is unconditional, so
+    // the compiler's waits count the slots behind the one landing (a read
+    // under a branch makes it wait for all of them); the scheduling
+    // barriers keep each slot's reads where they are issued, as it would
+    // sink them to their use. A block of fewer than D tiles lands them one
+    // at a time.
+    const int step = gridDim.x, first = blockIdx.x;
+    if (first >= tiles) return;
+    const int count = (tiles - first + step - 1) / step;
+    static_assert(D >= 1 && D <= 4, "tiles in flight");
+    auto tile = [&](int at) { return first + at * step; };
+    Tile ring[D];
+    if (count < D) {
+        issue(ring[0], tile(0));
+        issue_act();
+        prime();
+        for (int at = 0; at < count; ++at) {
+            if (at > 0) issue(ring[0], tile(at));
+            land(ring[0], tile(at), at & 1);
+        }
+        return;
+    }
+    issue(ring[0], tile(0));
+    __builtin_amdgcn_sched_barrier(0);
+    issue_act();
+    __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+    for (int d = 1; d < D; ++d) issue(ring[d], tile(d));
+    __builtin_amdgcn_sched_barrier(0);
+    prime();
+    // Steady: every slot reads its next tile.
+    int i = 0;
+    for (; i + 2 * D <= count; i += D) {
+#pragma unroll
+        for (int d = 0; d < D; ++d) {
+            land(ring[d], tile(i + d), (i + d) & 1);
+            __builtin_amdgcn_sched_barrier(0);
+            issue(ring[d], tile(i + d + D));
+            __builtin_amdgcn_sched_barrier(0);
+        }
+    }
+    // The last D to 2D − 1 tiles: D in flight, the rest read as slots free.
+#pragma unroll
+    for (int d = 0; d < D; ++d) {
+        land(ring[d], tile(i + d), (i + d) & 1);
+        if (i + d + D < count) issue(ring[d], tile(i + d + D));
+    }
+#pragma unroll
+    for (int d = 0; d < D; ++d)
+        if (i + D + d < count) land(ring[d], tile(i + D + d), (i + D + d) & 1);
+}
+
+// y = act · Wᵀ over an affine-quantized W, from a few rows past a decode
+// to a prefill: a GEMM whose weight tile stays packed until a lane takes it
+// to the matrix core. A block of four wavefronts lands a BM x BN tile of
+// y, WM x WN wavefronts of (16·RS) x (16·NT) each, walking K in stages of
+// KS codes; a grid short of the device slices K over blockIdx.z, `per`
+// stages a slice, each slice's f32 partial landing in `part` (slice-major,
+// [rows][n] each) for `affine_gemm_finalize` to sum in order.
+//
+// A stage reads, coalesced along the rows, the packed codes of BN weight
+// rows, their factors, and BM activation rows into registers, and lands
+// them in LDS: the codes as they are, the factors as two planes, the
+// activation shuffled into `Quads` order a word of codes at a time. The
+// next stage's reads are in flight while the matrix cores take this one.
+//
+// The products run on the 16 x 16 x 16 core with the activation as A and
+// the raw codes as B (lane group g of the four holds a quarter of each
+// group of codes, so a product never mixes two groups), and a group folds
+// into f32 as Σ x·w = s·Σ x·(c + magic) + (o − magic·s)·Σ x, with Σ x summed
+// as the stage lands. K is a whole number of stages.
+template <class T, class F, int kBits, int kOffset, int kGroup, int KS, int WM, int RS, int NT, int DEPTH>
+__global__ __launch_bounds__(4 * kWave) void matmul_affine_tile(
+    const T* __restrict__ act, const u8* __restrict__ codes, const u8* __restrict__ scales,
+    const u8* __restrict__ biases, T* __restrict__ out, float* __restrict__ part, int per, int m, int n, int k,
+    const AffineSeat* __restrict__ seat, const u32* __restrict__ win) {
+    using Q = Quads<T, kBits>;
+    constexpr int kThreads = 4 * kWave;
+    constexpr int WN = 4 / WM;
+    constexpr int BM = WM * 16 * RS, BN = WN * 16 * NT;
+    constexpr int kGroups = KS / kGroup;      // groups a stage
+    constexpr int kRowBytes = KS * kBits / 8;  // a weight row's codes a stage
+    constexpr int kLaneBytes = kGroup * kBits / 32;  // a lane group's quarter of a group
+    constexpr int kLaneWords = kLaneBytes / 4;
+    constexpr int kSteps = kGroup / 16;  // 16 x 16 x 16 products a group
+    constexpr int kCodePitch = kRowBytes + 16;  // LDS row strides, off the bank period
+    constexpr int kActPitch = KS + 8;
+    constexpr bool kOffsets = kOffset != kOffPreConst;
+    constexpr int kOffBytes = kOffset == kOffPreInt ? 1 : 2;
+    // Reads a thread a stage: 16-byte code chunks, 4-byte factor words,
+    // 16-byte activation chunks (two a 16-code segment).
+    constexpr int kCodeReads = BN * kRowBytes / 16 / kThreads;
+    constexpr int kScaleWords = BN * kGroups * 2 / 4, kOffWords = BN * kGroups * kOffBytes / 4;
+    constexpr int kScaleReads = (kScaleWords + kThreads - 1) / kThreads;
+    constexpr int kOffReads = kOffsets ? (kOffWords + kThreads - 1) / kThreads : 0;
+    constexpr int kActSegs = BM * KS / 16 / kThreads;
+    static_assert(kWave == 64 && (WM == 1 || WM == 2 || WM == 4), "four 64-lane wavefronts");
+    static_assert(kLaneBytes == 4 || kLaneBytes == 8 || kLaneBytes == 16, "a lane group takes whole words of a group");
+    static_assert(KS % kGroup == 0 && kCodeReads * 16 * kThreads == BN * kRowBytes, "a stage is whole reads");
+    static_assert(kActSegs * 16 * kThreads == BM * KS && (kGroups * 2) % 4 == 0 && (kGroups * kOffBytes) % 4 == 0,
+                  "a stage's activation and factors are whole reads");
+    static_assert(16 % (Q::kPer) == 0 || Q::kPer == 16, "a 16-code segment is whole words of codes");
+
+    // A stage in LDS: the codes, the activation, the factor planes, and Σ x
+    // of each group of codes of each activation row.
+    __shared__ __align__(16) u8 ws[BN * kCodePitch];
+    __shared__ __align__(16) T xs[BM * kActPitch];
+    __shared__ __align__(16) u16 fs[BN * kGroups];
+    __shared__ __align__(16) u8 fo[kOffsets ? BN * kGroups * kOffBytes : 4];
+    __shared__ __align__(16) float sxs[kGroups][BM];
+
+    const int rows = win == nullptr ? m : min(m, static_cast<int>(win[0]));
+    const int m0 = blockIdx.x * BM;
+    if (m0 >= rows) return;
+    const AffinePlanes planes = seated(codes, scales, biases, seat);
+    const int n0 = blockIdx.y * BN;
+    const int tid = threadIdx.x, l = lane(), wave = tid / kWave;
+    const int wm = wave / WN, wn = wave % WN;
+    const int r16 = l % 16, g = l / 16;
+    const int stages = k / KS;
+    const int first = blockIdx.z * per, last = min(stages, first + per);
+    if (first >= last) return;
+    const int groups = k / kGroup;
+
+    // A thread's reads, as byte offsets from the block's bases (wavefront-
+    // uniform, so the loop walks scalar registers): its code chunks, factor
+    // words and activation segments, rows past the live ones clamped to the
+    // last.
+    const long long row_bytes = static_cast<long long>(k) * kBits / 8;
+    const u8* code_base = planes.codes + n0 * row_bytes;
+    const u8* scale_base = planes.scales + static_cast<long long>(n0) * groups * 2;
+    const u8* off_base = planes.biases + static_cast<long long>(n0) * groups * kOffBytes;
+    const u8* act_base = reinterpret_cast<const u8*>(act + static_cast<long long>(m0) * k);
+    u32 co[kCodeReads], so[kScaleReads], oo[kOffReads > 0 ? kOffReads : 1], xo[kActSegs];
+#pragma unroll
+    for (int i = 0; i < kCodeReads; ++i) {
+        const int c = i * kThreads + tid, row = c / (kRowBytes / 16), col = c % (kRowBytes / 16);
+        co[i] = static_cast<u32>((min(n0 + row, n - 1) - n0) * row_bytes) + col * 16;
+    }
+    auto factor_at = [&](int i, int words, int bytes) {  // word i·threads + tid of a factor plane
+        const int w = min(i * kThreads + tid, words - 1);
+        const int row = w * 4 / (kGroups * bytes), at = w * 4 % (kGroups * bytes);
+        return static_cast<u32>((min(n0 + row, n - 1) - n0) * groups * bytes + at);
+    };
+#pragma unroll
+    for (int i = 0; i < kScaleReads; ++i) so[i] = factor_at(i, kScaleWords, 2);
+#pragma unroll
+    for (int i = 0; i < kOffReads; ++i) oo[i] = factor_at(i, kOffWords, kOffBytes);
+#pragma unroll
+    for (int i = 0; i < kActSegs; ++i) {
+        const int s = i * kThreads + tid, row = s / (KS / 16), col = s % (KS / 16);
+        xo[i] = static_cast<u32>((min(m0 + row, rows - 1) - m0) * k * 2) + col * 32;
+    }
+    auto code_lds = [&](int i) {
+        const int c = i * kThreads + tid;
+        return c / (kRowBytes / 16) * kCodePitch + c % (kRowBytes / 16) * 16;
+    };
+    auto act_lds = [&](int i) {
+        const int s = i * kThreads + tid;
+        return s / (KS / 16) * kActPitch + s % (KS / 16) * 16;
+    };
+
+    struct Stage {
+        Words<4> c[kCodeReads];
+        u32 s[kScaleReads], o[kOffReads > 0 ? kOffReads : 1];
+        Words<4> x[kActSegs][2];
+    };
+    auto load = [&](Stage& st, int sg) {
+        const u8* cb = code_base + sg * kRowBytes;
+        const u8* sb = scale_base + sg * kGroups * 2;
+        const u8* ob = off_base + sg * kGroups * kOffBytes;
+        const u8* xb = act_base + sg * KS * 2;
+#pragma unroll
+        for (int i = 0; i < kCodeReads; ++i) st.c[i] = read_global<Words<4>, true>(cb + co[i]);
+#pragma unroll
+        for (int i = 0; i < kScaleReads; ++i) st.s[i] = read_global<u32>(sb + so[i]);
+#pragma unroll
+        for (int i = 0; i < kOffReads; ++i) st.o[i] = read_global<u32>(ob + oo[i]);
+#pragma unroll
+        for (int i = 0; i < kActSegs; ++i)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) st.x[i][h] = read_global<Words<4>>(xb + xo[i] + 16 * h);
+    };
+    auto store = [&](const Stage& st) {
+#pragma unroll
+        for (int i = 0; i < kCodeReads; ++i) *reinterpret_cast<Words<4>*>(ws + code_lds(i)) = st.c[i];
+#pragma unroll
+        for (int i = 0; i < kScaleReads; ++i) {
+            const int w = i * kThreads + tid;
+            if (kScaleWords % kThreads == 0 || w < kScaleWords) reinterpret_cast<u32*>(fs)[w] = st.s[i];
+        }
+#pragma unroll
+        for (int i = 0; i < kOffReads; ++i) {
+            const int w = i * kThreads + tid;
+            if (kOffWords % kThreads == 0 || w < kOffWords) reinterpret_cast<u32*>(fo)[w] = st.o[i];
+        }
+        // Sixteen activations in k order to `Quads` order, word of codes
+        // by word of codes, and the sum of each group of them.
+        constexpr int kSegs = kGroup / 16;  // segments a group
+        static_assert(kSegs == 2 || kSegs == 4 || kSegs == 8, "a group is two, four or eight segments");
+#pragma unroll
+        for (int i = 0; i < kActSegs; ++i) {
+            u32 d[8], q[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) d[e] = st.x[i][e / 4][e % 4];
+            // The sum on the 4 x 4 x 4 core against ones: lane 4b + j's D[t]
+            // is lane 4b + t's, a block being four adjacent segments of a row.
+            const Words<2> ones{kOnes<T>, kOnes<T>};
+            mfma_cd four = mfma_zero();
+#pragma unroll
+            for (int w = 0; w < 4; ++w) four = mfma4x4<T>(Words<2>{d[2 * w], d[2 * w + 1]}, ones, four);
+            const int seg = i * kThreads + tid, row = seg / (KS / 16), col = seg % (KS / 16);
+            float sum;
+            if constexpr (kSegs == 2) {
+                sum = col % 4 < 2 ? four[0] + four[1] : four[2] + four[3];
+            } else {
+                sum = (four[0] + four[1]) + (four[2] + four[3]);
+                if constexpr (kSegs == 8) sum += __shfl_xor(sum, 4, kWave);
+            }
+            if (col % kSegs == 0) sxs[col / kSegs][row] = sum;
+#pragma unroll
+            for (int c = 0; c < 8; c += Q::kPer / 2)
+#pragma unroll
+                for (int h = 0; h < Q::kSteps; ++h) {
+                    const Words<2> a = Q::act(d + c, h);
+                    q[c + 2 * h] = a[0];
+                    q[c + 2 * h + 1] = a[1];
+                }
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+                *reinterpret_cast<Words<4>*>(xs + act_lds(i) + 8 * h) =
+                    Words<4>{q[4 * h], q[4 * h + 1], q[4 * h + 2], q[4 * h + 3]};
+        }
+    };
+
+    mfma_cd acc[NT][RS];
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+        for (int rs = 0; rs < RS; ++rs) acc[nt][rs] = mfma_zero();
+
+    auto compute = [&]() {
+#pragma unroll 2
+        for (int gi = 0; gi < kGroups; ++gi) {
+            // This lane group's quarter of group gi: its codes for NT weight
+            // tiles, its activation for RS tiles; every tile's product of a
+            // step issued together, so the cores have independent work.
+            Words<kLaneWords> c[NT];
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+                const int row = wn * 16 * NT + nt * 16 + r16;
+                c[nt] = *reinterpret_cast<const Words<kLaneWords>*>(ws + row * kCodePitch + gi * (kGroup * kBits / 8) +
+                                                                     g * kLaneBytes);
+            }
+            Words<4> a4[RS][kSteps / 2];
+#pragma unroll
+            for (int rs = 0; rs < RS; ++rs) {
+                const int row = wm * 16 * RS + rs * 16 + r16;
+                const T* xr = xs + row * kActPitch + gi * kGroup + g * (kGroup / 4);
+#pragma unroll
+                for (int s0 = 0; s0 < kSteps / 2; ++s0) a4[rs][s0] = *reinterpret_cast<const Words<4>*>(xr + 8 * s0);
+            }
+            mfma_cd d[NT][RS], sx[RS];
+#pragma unroll
+            for (int rs = 0; rs < RS; ++rs) {
+                // Σ x of activation rows 4g .. 4g + 3 of the tile, as D lays them.
+                sx[rs] = *reinterpret_cast<const mfma_cd*>(&sxs[gi][wm * 16 * RS + rs * 16 + 4 * g]);
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt) d[nt][rs] = mfma_zero();
+            }
+#pragma unroll
+            for (int s = 0; s < kSteps; ++s) {
+                Words<2> b[NT];
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt) {
+                    Words<2> q[Q::kSteps];
+                    Q::codes(word(c[nt], s / Q::kSteps), q);
+                    b[nt] = q[s % Q::kSteps];
+                }
+#pragma unroll
+                for (int rs = 0; rs < RS; ++rs) {
+                    const Words<2> a{a4[rs][s / 2][2 * (s % 2)], a4[rs][s / 2][2 * (s % 2) + 1]};
+#pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) d[nt][rs] = mfma16x16<T>(a, b[nt], d[nt][rs]);
+                }
+            }
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+                const int row = wn * 16 * NT + nt * 16 + r16;
+                u32 ob = 0;
+                if constexpr (kOffset == kOffPreInt) {
+                    ob = fo[row * kGroups + gi];
+                } else if constexpr (kOffsets) {
+                    ob = reinterpret_cast<const u16*>(fo)[row * kGroups + gi];
+                }
+                const Factor f = factor_bits<F, kBits, kOffset>(fs[row * kGroups + gi], ob);
+                const float o = additive<kOffset>(f) - Q::kMagic * f.s;
+#pragma unroll
+                for (int rs = 0; rs < RS; ++rs)
+#pragma unroll
+                    for (int t = 0; t < 4; ++t)
+                        acc[nt][rs][t] = fmaf(f.s, d[nt][rs][t], fmaf(o, sx[rs][t], acc[nt][rs][t]));
+            }
+        }
+    };
+
+    // DEPTH stages in flight: slot d lands stage first + i + d, then reads
+    // stage first + i + d + DEPTH into itself. The steady loop's reads are
+    // unconditional, so the compiler's waits count the slots behind the one
+    // landing (a read under a branch makes it wait for all of them); the
+    // last DEPTH to 2·DEPTH − 1 stages drain behind it.
+    const int C = last - first;
+    auto at = [&](int i) { return first + i; };
+    auto stage = [&](const Stage& s) {
+        store(s);
+        lds_barrier();
+        compute();
+        lds_barrier();
+    };
+    Stage st[DEPTH];
+    if (C < DEPTH) {
+        for (int i = 0; i < C; ++i) {
+            load(st[0], at(i));
+            stage(st[0]);
+        }
+    } else {
+#pragma unroll
+        for (int d = 0; d < DEPTH; ++d) load(st[d], at(d));
+        int i = 0;
+        for (; i + 2 * DEPTH <= C; i += DEPTH) {
+#pragma unroll
+            for (int d = 0; d < DEPTH; ++d) {
+                store(st[d]);
+                lds_barrier();
+                load(st[d], at(i + d + DEPTH));
+                compute();
+                lds_barrier();
+            }
+        }
+#pragma unroll
+        for (int d = 0; d < DEPTH; ++d) {
+            store(st[d]);
+            lds_barrier();
+            if (i + d + DEPTH < C) load(st[d], at(i + d + DEPTH));
+            compute();
+            lds_barrier();
+        }
+#pragma unroll
+        for (int d = 0; d < DEPTH; ++d)
+            if (i + DEPTH + d < C) stage(st[d]);
+    }
+
+    // Lane (r16, g)'s D[t] is activation row 4g + t and weight row r16 of
+    // its tile pair.
+#pragma unroll
+    for (int rs = 0; rs < RS; ++rs)
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const int row = m0 + wm * 16 * RS + rs * 16 + 4 * g + t;
+            if (row >= rows) continue;
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+                const int col = n0 + wn * 16 * NT + nt * 16 + r16;
+                if (col >= n) continue;
+                if (part != nullptr) {
+                    part[(static_cast<long long>(blockIdx.z) * rows + row) * n + col] = acc[nt][rs][t];
+                } else {
+                    out[static_cast<long long>(row) * n + col] = from_f32<T>(acc[nt][rs][t]);
+                }
+            }
+        }
+}
+
 // The prefill arm: a 64-code stage of 128 weight rows, two threads a row,
 // each decoding 32 codes into the tile.
 template <class T, class F, int kBits, int kOffset, int kGroup>
