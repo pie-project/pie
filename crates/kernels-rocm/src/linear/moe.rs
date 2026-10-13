@@ -408,6 +408,30 @@ pub fn matmul_select(
     const OP: &str = "linear.moe_matmul_select";
 
     let fan = selected(OP, x, routes, y)?;
+    // A decode batch over a resident bank: each expert read once for all its
+    // routes.
+    if let Some(count) = dense_experts(x, bank, y, experts)
+        && x.width.is_multiple_of(8)
+        && let Some(mt) = batch_items(ctx, &fan, count)
+    {
+        let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+        return select_batch(
+            ctx,
+            OP,
+            FILE,
+            &format!(
+                "::pie::linear::moe_matmul_select_dense_batch<{t}, ::pie::i32({mt}), ::pie::i32({BATCH_NBW})>"
+            ),
+            x,
+            &[bank.arg()],
+            routes,
+            y,
+            &fan,
+            count,
+            mt,
+            None,
+        );
+    }
     if let Some(count) = grouped_worth(ctx, x, bank, y, &fan, experts) {
         if x.width.is_multiple_of(8) {
             return select_grouped(ctx, OP, x, bank, routes, y, count, &fan);
@@ -426,15 +450,10 @@ pub fn matmul_select(
 /// The most experts `moe_route_order` buckets in its LDS.
 const ORDER_EXPERT_CAP: u32 = 4096;
 
-fn grouped_worth(
-    ctx: &Ctx,
-    x: Tensor,
-    bank: Tensor,
-    y: &Tensor,
-    fan: &Selected,
-    experts: ExpertTable,
-) -> Option<u32> {
-    if !ctx.tuning().moe_grouped || experts.streams() {
+/// The experts of a resident 16-bit bank the expert-ordered legs can
+/// bucket, if it is one.
+fn dense_experts(x: Tensor, bank: Tensor, y: &Tensor, experts: ExpertTable) -> Option<u32> {
+    if experts.streams() {
         return None;
     }
     if !matches!(x.dtype, Dtype::Bf16 | Dtype::F16) || bank.dtype != x.dtype {
@@ -447,7 +466,104 @@ fn grouped_worth(
     if u64::from(bank.width) != u64::from(x.width) * u64::from(y.width) {
         return None;
     }
+    Some(count)
+}
+
+fn grouped_worth(
+    ctx: &Ctx,
+    x: Tensor,
+    bank: Tensor,
+    y: &Tensor,
+    fan: &Selected,
+    experts: ExpertTable,
+) -> Option<u32> {
+    if !ctx.tuning().moe_grouped {
+        return None;
+    }
+    let count = dense_experts(x, bank, y, experts)?;
     (fan.route_count.div_ceil(count) >= ctx.tuning().moe_group_at).then_some(count)
+}
+
+/// 16-row weight blocks a batch wave takes (the kernels' `NBW`), and so the
+/// rows a batch block takes.
+const BATCH_NBW: u32 = 1;
+const BATCH_ROWS: u32 = 64 * BATCH_NBW;
+
+/// The routes a batch item takes, if the batch legs take this fire: from
+/// `kernel.moe.batch_from` tokens' routes (one token's read each expert once
+/// on the stream, which orders nothing), while the experts average (routes over
+/// experts, rounded up) at most `kernel.moe.batch_until`. An item is the
+/// least of 4, 8, 16 and 32 routes past the average by two of its square
+/// roots and one, so the busier experts of a random routing still read their
+/// weight once, and an item stages no more empty rows than that takes.
+fn batch_items(ctx: &Ctx, fan: &Selected, experts: u32) -> Option<u32> {
+    let t = ctx.tuning();
+    let top_k = fan.top_k.unsigned_abs();
+    if !t.moe_batch || fan.route_count < t.moe_batch_from.saturating_mul(top_k) {
+        return None;
+    }
+    let per = fan.route_count.div_ceil(experts);
+    if per > t.moe_batch_until {
+        return None;
+    }
+    // per + 2·√per + 1 = (√per + 1)², so an item of `mt` covers it while
+    // √per + 1 ≤ √mt, i.e. per ≤ (√mt - 1)².
+    Some(match per {
+        0..=1 => 4,
+        2..=3 => 8,
+        4..=9 => 16,
+        _ => 32,
+    })
+}
+
+/// A batch fire: routes ordered by expert into `mt`-route items, then one
+/// item a block row against `BATCH_ROWS` weight rows a block. `planes` are
+/// the bank's arguments, between the work list and the result; a packed
+/// bank's seat follows the extents.
+#[allow(clippy::too_many_arguments)]
+fn select_batch(
+    ctx: &Ctx,
+    op: &'static str,
+    file: &'static str,
+    entry: &str,
+    x: Tensor,
+    planes: &[ArgValue],
+    routes: Tensor,
+    y: &mut Tensor,
+    fan: &Selected,
+    experts: u32,
+    mt: u32,
+    seat: Option<GroupSeat>,
+) -> Result<(), Error> {
+    let k = stated(op, x.width)?;
+    let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
+    let ordered = route_order(ctx, op, routes, fan, experts, mt)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    let mut args = vec![
+        x.arg(),
+        ArgValue::Ptr(ordered.order),
+        ArgValue::Ptr(ordered.offsets),
+        ArgValue::Ptr(ordered.work),
+    ];
+    args.extend_from_slice(planes);
+    args.extend([
+        y.arg(),
+        act_div.arg(),
+        n.arg(),
+        k.arg(),
+        stated(op, experts)?.arg(),
+    ]);
+    if let Some(seat) = seat {
+        args.extend([ArgValue::Ptr(seat.cell), ArgValue::Ptr(seat.hits)]);
+    }
+    ctx.fire(
+        op,
+        Fire::at(file, symbol(entry)).apply(Launch::grid(
+            [ordered.work_cap, y.width.div_ceil(BATCH_ROWS), 1],
+            [GROUP_BLOCK, 1, 1],
+        )),
+        &args,
+    )
 }
 
 /// The planes `moe_route_order` lands: routes in expert order, each
@@ -466,9 +582,28 @@ struct RouteOrder {
 const GROUP_ROUTES: u32 = 32;
 const GROUP_ROUTES_WIDE: u32 = 128;
 const GROUP_WIDE_AT: u32 = 64;
-/// Weight rows a grouped block takes (`kGroupTileN`).
+
+const fn group_routes(fan: &Selected, experts: u32) -> u32 {
+    let per = fan.route_count / experts;
+    if per >= GROUP_WIDE_AT {
+        GROUP_ROUTES_WIDE
+    } else if per >= GROUP_ROUTES {
+        64
+    } else {
+        GROUP_ROUTES
+    }
+}
+/// Weight rows a grouped block takes off the matrix core (`kSimtTileN`),
+/// and its threads.
 const GROUP_TILE_N: u32 = 128;
 const GROUP_BLOCK: u32 = 256;
+
+/// A matrix-core grouped launch over `items` items of `routes` routes: 32
+/// weight rows a wave, eight waves at 128 routes (`kGroupWaves`), else four.
+fn group_launch(items: u32, routes: u32, n: u32) -> Launch {
+    let waves = if routes > GROUP_ROUTES { 8 } else { 4 };
+    Launch::grid([items, n.div_ceil(32 * waves), 1], [64 * waves, 1, 1])
+}
 
 fn route_order(
     ctx: &Ctx,
@@ -476,16 +611,14 @@ fn route_order(
     routes: Tensor,
     fan: &Selected,
     experts: u32,
+    group: u32,
 ) -> Result<RouteOrder, Error> {
     const ROUTE_ORDER: &str = "moe_route_order";
     const ORDER_BLOCK: u32 = 1024;
-    let group = if fan.route_count / experts >= GROUP_WIDE_AT {
-        GROUP_ROUTES_WIDE
-    } else {
-        GROUP_ROUTES
-    };
     let offsets_at = (fan.route_count as usize).next_multiple_of(64);
-    let work_cap = fan.route_count.div_ceil(group) + experts;
+    // An expert's last item is its only short one, and only an expert with a
+    // route has one.
+    let work_cap = fan.route_count.div_ceil(group) + experts.min(fan.route_count);
     let work_at = (offsets_at + experts as usize + 2).next_multiple_of(64);
     let order = ctx.scratch(
         op,
@@ -536,7 +669,7 @@ fn select_grouped(
     let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
-    let ordered = route_order(ctx, op, routes, fan, experts)?;
+    let ordered = route_order(ctx, op, routes, fan, experts, group_routes(fan, experts))?;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
     ctx.fire(
         op,
@@ -547,10 +680,7 @@ fn select_grouped(
                 ordered.routes
             )),
         )
-        .apply(Launch::grid(
-            [ordered.work_cap, y.width.div_ceil(GROUP_TILE_N), 1],
-            [GROUP_BLOCK, 1, 1],
-        )),
+        .apply(group_launch(ordered.work_cap, ordered.routes, y.width)),
         &[
             x.arg(),
             ArgValue::Ptr(ordered.order),
@@ -967,8 +1097,35 @@ fn matmul_select_mxfp4(
     // pays only once an expert serves more than `kernel.moe.mxfp4_grouped_reuse`
     // routes on average; routes over experts is a floor on that average.
     let experts = codes.rows.clamp(1, ORDER_EXPERT_CAP);
+    if x.dtype == Dtype::Bf16
+        && codes.rows <= ORDER_EXPERT_CAP
+        && let Some(mt) = batch_items(ctx, &fan, experts)
+        // Short of 32 routes a lane reads its two scale bytes as one.
+        && (mt == 32 || x.width.is_multiple_of(2 * MXFP4_BLOCK))
+    {
+        return select_batch(
+            ctx,
+            op,
+            "linear/quant.hip",
+            &format!(
+                "::pie::linear::moe_matmul_select_mxfp4_batch<::pie::i32({mt}), ::pie::i32({BATCH_NBW})>"
+            ),
+            x,
+            &[
+                codes.arg(),
+                scales.arg(),
+                bias.map_or(ArgValue::ABSENT, |bias| bias.arg()),
+            ],
+            routes,
+            y,
+            &fan,
+            experts,
+            mt,
+            Some(seat),
+        );
+    }
     if fan.route_count > ctx.tuning().mxfp4_grouped_reuse * experts && ctx.tuning().mxfp4_grouped {
-        let ordered = route_order(ctx, op, routes, &fan, experts)?;
+        let ordered = route_order(ctx, op, routes, &fan, experts, group_routes(&fan, experts))?;
         let wmma = x.dtype == Dtype::Bf16 && ctx.tuning().mxfp4_wmma;
         let entry = if wmma {
             format!(
@@ -1000,14 +1157,14 @@ fn matmul_select_mxfp4(
         ]);
         return ctx.fire(
             op,
-            Fire::at("linear/quant.hip", symbol(&entry)).apply(Launch::grid(
-                [
-                    if wmma { ordered.work_cap } else { experts },
-                    y.width.div_ceil(GROUP_TILE_N),
-                    1,
-                ],
-                [GROUP_BLOCK, 1, 1],
-            )),
+            Fire::at("linear/quant.hip", symbol(&entry)).apply(if wmma {
+                group_launch(ordered.work_cap, ordered.routes, y.width)
+            } else {
+                Launch::grid(
+                    [experts, y.width.div_ceil(GROUP_TILE_N), 1],
+                    [GROUP_BLOCK, 1, 1],
+                )
+            }),
             &args,
         );
     }
@@ -1154,9 +1311,35 @@ fn matmul_select_mlxu4(
     let act_div = if fan.by_token { fan.top_k } else { 1 };
 
     let experts = codes.rows.clamp(1, ORDER_EXPERT_CAP);
+    // The batch legs read four-bit codes, and a lane's factors of a stage
+    // (an even count of groups) as one read.
+    if bits == 4
+        && x.dtype == Dtype::Bf16
+        && codes.rows <= ORDER_EXPERT_CAP
+        && x.width.is_multiple_of(2 * group)
+        && let Some(mt) = batch_items(ctx, &fan, experts)
+    {
+        return select_batch(
+            ctx,
+            op,
+            "linear/quant.hip",
+            &format!(
+                "::pie::linear::moe_matmul_select_mlxu4_batch<::pie::i32({bits}), ::pie::i32({group}), \
+                 ::pie::i32({mt}), ::pie::i32({BATCH_NBW})>"
+            ),
+            x,
+            &[codes.arg(), scales.arg(), biases.arg()],
+            routes,
+            y,
+            &fan,
+            experts,
+            mt,
+            Some(seat),
+        );
+    }
     let tuning = ctx.tuning();
     if tuning.affine_grouped && fan.route_count >= tuning.affine_grouped_from {
-        let ordered = route_order(ctx, op, routes, &fan, experts)?;
+        let ordered = route_order(ctx, op, routes, &fan, experts, group_routes(&fan, experts))?;
         let wmma = x.dtype == Dtype::Bf16 && tuning.affine_wmma;
         let entry = if wmma {
             format!(
@@ -1192,14 +1375,14 @@ fn matmul_select_mlxu4(
         ]);
         return ctx.fire(
             op,
-            Fire::at("linear/quant.hip", symbol(&entry)).apply(Launch::grid(
-                [
-                    if wmma { ordered.work_cap } else { experts },
-                    y.width.div_ceil(GROUP_TILE_N),
-                    1,
-                ],
-                [GROUP_BLOCK, 1, 1],
-            )),
+            Fire::at("linear/quant.hip", symbol(&entry)).apply(if wmma {
+                group_launch(ordered.work_cap, ordered.routes, y.width)
+            } else {
+                Launch::grid(
+                    [experts, y.width.div_ceil(GROUP_TILE_N), 1],
+                    [GROUP_BLOCK, 1, 1],
+                )
+            }),
             &args,
         );
     }

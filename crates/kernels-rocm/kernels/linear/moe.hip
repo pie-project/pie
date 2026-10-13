@@ -464,9 +464,9 @@ __global__ __launch_bounds__(256) void moe_matmul_select_gemv_by_route(
 
 // The grouped dense leg: routes ordered by expert (moe_route_order in
 // linear/quant.hip), one work item of up to MT a block. Grid (work items,
-// ⌈N / 128⌉), 256 threads.
+// ⌈N / (32·waves)⌉), kGroupWaves<MT> waves.
 template <class T, int MT>
-__global__ __launch_bounds__(256) void moe_matmul_select_grouped(const T* __restrict__ act, const i32* __restrict__ order,
+__global__ __launch_bounds__(kGroupWaves<MT>* kWave) void moe_matmul_select_grouped(const T* __restrict__ act, const i32* __restrict__ order,
                                                                  const i32* __restrict__ offsets,
                                                                  const i32* __restrict__ work,
                                                                  const T* __restrict__ bank, T* __restrict__ out,
@@ -475,6 +475,21 @@ __global__ __launch_bounds__(256) void moe_matmul_select_grouped(const T* __rest
     if (!group_item(offsets, work, num_experts, MT, item)) return;
     const T* w = bank + static_cast<long long>(item.expert) * n * k;
     grouped_tile<GroupDense<T>, T, MT>(act, order, item.begin, item.count, {w}, nullptr, out, act_div, n, k);
+}
+
+// The batch dense leg (decode batches): one work item of up to MT routes a
+// block, 64·NBW weight rows (grid (work cap, ⌈n / (64·NBW)⌉), 256 threads),
+// a stage 128 elements of a row.
+template <class T, int MT, int NBW>
+__global__ __launch_bounds__(256) void moe_matmul_select_dense_batch(
+    const T* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
+    const i32* __restrict__ work, const T* __restrict__ bank, T* __restrict__ out, int act_div, int n, int k,
+    int num_experts) {
+    GroupItem item;
+    if (!group_item(offsets, work, num_experts, MT, item)) return;
+    const T* w = bank + static_cast<long long>(item.expert) * n * k;
+    batch_tile<BatchDense<T, 256>, T, MT, NBW, 3>(act, order, item.begin, item.count, {w}, nullptr, out, act_div, n,
+                                                  k);
 }
 
 }  // namespace pie::linear

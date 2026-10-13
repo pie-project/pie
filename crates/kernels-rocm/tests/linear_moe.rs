@@ -2,7 +2,8 @@
 //! sigmoid with and without sinks, sqrt-softplus, the hash table, the group
 //! fan-out), the folds back into token rows, and the expert matmuls over a
 //! dense, an mxfp4 and an MLX affine bank on each of their legs (the decode
-//! stream, the grouped matrix-core leg, the off-core grouped leg, rocBLAS).
+//! stream, the batch leg, the grouped matrix-core leg, the off-core grouped
+//! leg, rocBLAS).
 
 #![cfg(feature = "rocm")]
 
@@ -556,15 +557,25 @@ fn moe_matmul_dense() {
     let Some(gpu) = Gpu::open() else { return };
     let planes = Planes::default();
     // (experts, tokens, top_k, n, k): the decode stream across short and long
-    // K and a ragged N, then fires wide enough to group natively (in 32- and
-    // 128-route items), and a K the native legs cannot read, which rocBLAS
-    // takes.
+    // K and a ragged N; the batch leg in 4- to 32-route items, K short of a
+    // whole stage, and past its reach the grouped leg; fires wide enough to
+    // group natively (in 32-, 64- and 128-route items), and a K the native
+    // legs cannot read, which rocBLAS takes.
     for (experts, tokens, top_k, n, k, leg) in [
         (8u32, 1u32, 2u32, 1280u32, 2560u32, "stream"),
         (6, 3, 3, 1000, 640, "stream"),
         (4, 2, 2, 72, 7168, "stream"),
         (3, 2, 1, 13, 64, "stream"),
+        (8, 1, 2, 1280, 2560, "batch"),
+        (6, 3, 3, 1000, 640, "batch"),
+        (4, 2, 2, 72, 7168, "batch"),
+        (3, 2, 1, 13, 64, "batch"),
+        (8, 40, 4, 520, 264, "batch"),
+        (5, 64, 2, 136, 2312, "batch"),
+        (4, 96, 4, 136, 512, "batch"),
+        (3, 100, 2, 300, 264, "batch"),
         (8, 40, 4, 520, 256, "grouped"),
+        (4, 48, 4, 136, 512, "grouped"),
         (5, 64, 2, 128, 2304, "grouped"),
         (4, 96, 4, 136, 512, "grouped"),
         (3, 20, 2, 50, 60, "blas"),
@@ -582,11 +593,11 @@ fn moe_matmul_dense() {
             w: bf16s(e * nn * kd, 11, 0.1),
         };
         let bt = gpu.tensor(&bank.w, experts, n * k, Dtype::Bf16);
-        let ctx = if leg == "stream" {
-            tuned(&gpu, |t| t.moe_grouped = false)
-        } else {
-            gpu.ctx()
-        };
+        let ctx = tuned(&gpu, |t| {
+            t.moe_grouped = leg != "stream";
+            t.moe_batch = leg == "batch";
+            t.moe_batch_from = 1;
+        });
         for by_token in [true, false] {
             let routes = make_routes(t, kk, e, u64::from(n), leg != "blas");
             let x_rows = if by_token { t } else { t * kk };
@@ -606,8 +617,9 @@ fn moe_matmul_dense() {
         }
     }
 
-    // The stream under a window (rows 1..3 of 4 tokens live) and through an
-    // expert table, which also counts each expert's routes.
+    // The stream and the batch leg under a window (rows 1..3 of 4 tokens
+    // live), and the stream through an expert table, which also counts each
+    // expert's routes.
     let (experts, tokens, top_k, n, k) = (4u32, 4u32, 2u32, 96u32, 512u32);
     let bank = Dense {
         n: 96,
@@ -620,28 +632,31 @@ fn moe_matmul_dense() {
     let xt = gpu.tensor(&x, tokens, k, Dtype::Bf16);
     let rt = planes.i32s(&routes, tokens, top_k);
     let (want, mag) = reference(&bank, &x, &routes, 2, true, None);
-    let mut y = gpu.zeros(tokens * top_k, n, Dtype::Bf16);
     let win = gpu.ints(&[2, 1, 0, 0]);
+    for leg in ["stream", "batch"] {
+        let mut y = gpu.zeros(tokens * top_k, n, Dtype::Bf16);
+        let ctx = tuned(&gpu, |t| t.moe_batch = leg == "batch");
+        ctx.arm_stage(win.ptr);
+        moe::matmul_select(&ctx, xt, bt, rt, &mut y, moe::ExpertTable::RESIDENT).unwrap();
+        ctx.disarm_stage();
+        let have = gpu.read(&y);
+        let live = 2 * 96..6 * 96;
+        close_dot(
+            &format!("windowed {leg}"),
+            &have[live.clone()],
+            &want[live.clone()],
+            &mag[live],
+            1e-5,
+        );
+        assert!(
+            have[..2 * 96]
+                .iter()
+                .chain(&have[6 * 96..])
+                .all(|&v| v == 0.0),
+            "{leg}: dead rows untouched"
+        );
+    }
     let ctx = gpu.ctx();
-    ctx.arm_stage(win.ptr);
-    moe::matmul_select(&ctx, xt, bt, rt, &mut y, moe::ExpertTable::RESIDENT).unwrap();
-    ctx.disarm_stage();
-    let have = gpu.read(&y);
-    let live = 2 * 96..6 * 96;
-    close_dot(
-        "windowed stream",
-        &have[live.clone()],
-        &want[live.clone()],
-        &mag[live],
-        1e-5,
-    );
-    assert!(
-        have[..2 * 96]
-            .iter()
-            .chain(&have[6 * 96..])
-            .all(|&v| v == 0.0),
-        "dead rows untouched"
-    );
 
     let table: Vec<u64> = (0..4u64).map(|e| bt.ptr + e * 96 * 512 * 2).collect();
     let table_t = planes.keep(hip::Buffer::from_slice(&table).unwrap(), 4, 1, Dtype::U8);
@@ -688,13 +703,22 @@ fn mxfp4_bank(experts: usize, n: usize, k: usize, seed: u64) -> (Vec<u8>, Vec<u8
 fn moe_matmul_mxfp4() {
     let Some(gpu) = Gpu::open() else { return };
     let planes = Planes::default();
-    // Decode (stream), then grouped on the matrix core and off it; a bias
-    // on the gate/up leg.
+    // Decode (the stream, and the batch leg in 16- and 32-route items, K
+    // short of a whole stage), then grouped on the matrix core and off it;
+    // a bias on the gate/up leg.
     for (experts, tokens, top_k, n, k, leg) in [
         (8u32, 1u32, 4u32, 1280u32, 2560u32, "stream"),
         (6, 2, 3, 2560, 640, "stream"),
         (4, 2, 2, 100, 7168, "stream"),
+        (8, 1, 4, 1280, 2560, "batch"),
+        (6, 2, 3, 2560, 640, "batch"),
+        (4, 2, 2, 100, 7168, "batch"),
+        (8, 50, 4, 384, 512, "batch"),
+        (5, 33, 3, 136, 2336, "batch"),
+        (4, 72, 4, 256, 512, "batch"),
+        (3, 80, 2, 200, 2304, "batch"),
         (8, 50, 4, 384, 512, "wmma"),
+        (4, 40, 4, 256, 512, "wmma"),
         (5, 33, 3, 136, 2304, "wmma"),
         (4, 72, 4, 256, 512, "wmma"),
         (8, 50, 4, 200, 512, "simt"),
@@ -714,6 +738,8 @@ fn moe_matmul_mxfp4() {
         let ctx = tuned(&gpu, |t| {
             t.mxfp4_grouped = leg != "stream";
             t.mxfp4_wmma = leg == "wmma";
+            t.moe_batch = leg == "batch";
+            t.moe_batch_from = 1;
         });
         for (by_token, biased) in [(true, false), (false, true)] {
             let routes = make_routes(t, kk, e, u64::from(k), true);
@@ -814,14 +840,27 @@ fn affine_bank(
 fn moe_matmul_affine() {
     let Some(gpu) = Gpu::open() else { return };
     let planes = Planes::default();
-    for (bits, group) in [(4u32, 64u32), (4, 32), (2, 32), (8, 128), (8, 32)] {
+    for (bits, group) in [(4u32, 64u32), (4, 32), (4, 128), (2, 32), (8, 128), (8, 32)] {
         for (experts, tokens, top_k, n, k, leg) in [
             (6u32, 2u32, 3u32, 640u32, 2560u32, "stream"),
             (4, 1, 2, 70, 1024, "stream"),
+            (6, 2, 3, 640, 2560, "batch"),
+            (4, 1, 2, 70, 1024, "batch"),
+            (6, 3, 2, 200, 1280, "batch"),
+            (8, 40, 4, 264, 512, "batch"),
+            (4, 24, 4, 136, 1280, "batch"),
+            (4, 72, 4, 136, 256, "batch"),
+            (3, 80, 2, 200, 640, "batch"),
             (8, 40, 4, 264, 512, "wmma"),
             (4, 72, 4, 136, 256, "wmma"),
+            (4, 48, 4, 136, 256, "wmma"),
             (8, 40, 4, 136, 384, "simt"),
         ] {
+            // The batch leg reads four-bit codes, an even count of groups a
+            // row.
+            if leg == "batch" && (bits != 4 || k % (2 * group) != 0) {
+                continue;
+            }
             let (e, t, kk, nn, kd) = (
                 experts as usize,
                 tokens as usize,
@@ -844,6 +883,8 @@ fn moe_matmul_affine() {
                 t.affine_grouped = leg != "stream";
                 t.affine_grouped_from = 1;
                 t.affine_wmma = leg == "wmma";
+                t.moe_batch = leg == "batch";
+                t.moe_batch_from = 1;
             });
             for by_token in [true, false] {
                 let routes = make_routes(t, kk, e, u64::from(n), true);
@@ -939,12 +980,16 @@ fn f16s(n: usize, seed: u64, scale: f32) -> Vec<f32> {
 
 #[test]
 fn moe_matmul_f16() {
-    // The f16 instantiations: the dense stream and both grouped widths, the
+    // The f16 instantiations: the dense stream, batch leg and both grouped
+    // widths, the
     // mxfp4 stream and its off-core grouped leg, and the affine stream.
     let Some(gpu) = Gpu::open() else { return };
     let planes = Planes::default();
     for (experts, tokens, top_k, n, k, leg) in [
         (6u32, 2u32, 3u32, 300u32, 640u32, "stream"),
+        (6, 2, 3, 300, 648, "batch"),
+        (8, 40, 4, 200, 256, "batch"),
+        (3, 100, 2, 136, 264, "batch"),
         (8, 40, 4, 200, 256, "grouped"),
         (4, 96, 4, 136, 512, "grouped"),
     ] {
@@ -961,11 +1006,11 @@ fn moe_matmul_f16() {
             w: f16s(e * nn * kd, 51, 0.1),
         };
         let bt = planes.f16s(&bank.w, experts, n * k);
-        let ctx = if leg == "stream" {
-            tuned(&gpu, |t| t.moe_grouped = false)
-        } else {
-            gpu.ctx()
-        };
+        let ctx = tuned(&gpu, |t| {
+            t.moe_grouped = leg != "stream";
+            t.moe_batch = leg == "batch";
+            t.moe_batch_from = 1;
+        });
         let routes = make_routes(t, kk, e, 52, true);
         let x = f16s(t * kd, 53, 1.0);
         let xt = planes.f16s(&x, tokens, k);
@@ -990,7 +1035,10 @@ fn moe_matmul_f16() {
         let (codes, scales, bank) = mxfp4_bank(6, nn, kd, 61);
         let ct = planes.bytes(&codes, 6, n * k / 2);
         let st = planes.bytes(&scales, 6, n * k / 32);
-        let ctx = tuned(&gpu, |t| t.mxfp4_grouped = leg != "stream");
+        let ctx = tuned(&gpu, |t| {
+            t.mxfp4_grouped = leg != "stream";
+            t.moe_batch = false;
+        });
         let routes = make_routes(t, kk, 6, 62, true);
         let x = f16s(t * kd, 63, 1.0);
         let xt = planes.f16s(&x, tokens, k);
@@ -1016,7 +1064,10 @@ fn moe_matmul_f16() {
         let ct = planes.bytes(&codes, 6, n * k * bits / 8);
         let st = planes.bytes(&scales, 6, 2 * n * k / group);
         let bt = planes.bytes(&biases, 6, 2 * n * k / group);
-        let ctx = tuned(&gpu, |t| t.affine_grouped = false);
+        let ctx = tuned(&gpu, |t| {
+            t.affine_grouped = false;
+            t.moe_batch = false;
+        });
         let routes = make_routes(t, kk, 6, 72, true);
         let x = f16s(t * kd, 73, 1.0);
         let xt = planes.f16s(&x, tokens, k);
@@ -1059,7 +1110,10 @@ fn moe_matmul_windowed_grouped() {
     let xt = gpu.tensor(&x, tokens, k, Dtype::Bf16);
     let rt = planes.i32s(&routes, tokens, top_k);
     let mut y = gpu.zeros(tokens * top_k, n, Dtype::Bf16);
-    let ctx = tuned(&gpu, |t| t.mxfp4_grouped_reuse = 0);
+    let ctx = tuned(&gpu, |t| {
+        t.mxfp4_grouped_reuse = 0;
+        t.moe_batch = false;
+    });
     let win = gpu.ints(&[2, 1, 0, 0]);
     ctx.arm_stage(win.ptr);
     moe::matmul_select_quant(&ctx, xt, ct, st, None, rt, &mut y, moe::GroupSeat::RESIDENT).unwrap();
@@ -1417,6 +1471,196 @@ fn bench_moe_crossover() {
                 .unwrap();
             });
             println!("mxfp4 {per_expert:2} routes/expert {leg:8}: {us:8.1} us");
+        }
+    }
+}
+
+/// One expert bank of a served model as the benches lay it out.
+#[derive(Clone, Copy)]
+enum Codec {
+    Bf16,
+    Mxfp4,
+    Affine4,
+}
+
+impl Codec {
+    /// Bytes an expert's n x k weight holds, codes and factors.
+    fn bytes(self, n: u32, k: u32) -> u64 {
+        let e = u64::from(n) * u64::from(k);
+        match self {
+            Codec::Bf16 => 2 * e,
+            Codec::Mxfp4 => e / 2 + e / 32,
+            Codec::Affine4 => e / 2 + 4 * e / 64,
+        }
+    }
+}
+
+/// A bank of `experts` experts of `codec` (uninitialised: the benches time
+/// reads, not values).
+fn bench_bank(planes: &Planes, codec: Codec, experts: u32, n: u32, k: u32) -> [Tensor; 3] {
+    let alloc = |bytes: u64, width: u64| {
+        planes.keep(
+            hip::Buffer::alloc(bytes as usize).unwrap(),
+            experts,
+            u32::try_from(width).unwrap(),
+            Dtype::U8,
+        )
+    };
+    let e = u64::from(n) * u64::from(k);
+    let rows = u64::from(experts);
+    match codec {
+        Codec::Bf16 => {
+            let mut b = alloc(rows * e * 2, e);
+            b.dtype = Dtype::Bf16;
+            [b, b, b]
+        }
+        Codec::Mxfp4 => [
+            alloc(rows * e / 2, e / 2),
+            alloc(rows * e / 32, e / 32),
+            alloc(1, 1),
+        ],
+        Codec::Affine4 => [
+            alloc(rows * e / 2, e / 2),
+            alloc(rows * e / 32, e / 32),
+            alloc(rows * e / 32, e / 32),
+        ],
+    }
+}
+
+/// The bank's copy `copy` of `experts` experts as one bank.
+fn bank_copy(t: Tensor, copy: u32, experts: u32) -> Tensor {
+    let mut t = t;
+    t.ptr += u64::from(copy) * u64::from(experts) * u64::from(t.width) * t.dtype.bytes_ceil();
+    t.rows = experts;
+    t
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bench_fire(
+    ctx: &Ctx,
+    codec: Codec,
+    bank: [Tensor; 3],
+    copy: u32,
+    experts: u32,
+    x: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+) {
+    let at = |t| bank_copy(t, copy, experts);
+    match codec {
+        Codec::Bf16 => {
+            moe::matmul_select(ctx, x, at(bank[0]), routes, y, moe::ExpertTable::RESIDENT)
+        }
+        Codec::Mxfp4 => moe::matmul_select_quant(
+            ctx,
+            x,
+            at(bank[0]),
+            at(bank[1]),
+            None,
+            routes,
+            y,
+            moe::GroupSeat::RESIDENT,
+        ),
+        Codec::Affine4 => moe::matmul_select_quant(
+            ctx,
+            x,
+            at(bank[0]),
+            at(bank[1]),
+            Some(at(bank[2])),
+            routes,
+            y,
+            moe::GroupSeat::RESIDENT,
+        ),
+    }
+    .unwrap();
+}
+
+#[test]
+#[ignore = "benchmark: cargo test --release --features rocm --test linear_moe -- --ignored --nocapture"]
+fn bench_moe_models() {
+    // The served models' expert matmuls at decode batches (GB/s of the
+    // experts the routes touch) and prefill (TFLOP/s), random top-k over the
+    // release's expert count, cold: the plans rotate over copies of the bank
+    // at least 2 GB together. PIE_BENCH_MOE filters by name,
+    // PIE_BENCH_MOE_TOKENS lists the token counts, PIE_BENCH_MOE_BATCH_FROM
+    // and _UNTIL move the batch legs' reach.
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = tuned(&gpu, |t| {
+        if let Ok(v) = std::env::var("PIE_BENCH_MOE_BATCH_UNTIL") {
+            t.moe_batch_until = v.parse().unwrap();
+        }
+        if let Ok(v) = std::env::var("PIE_BENCH_MOE_BATCH_FROM") {
+            t.moe_batch_from = v.parse().unwrap();
+        }
+    });
+    let only = std::env::var("PIE_BENCH_MOE").unwrap_or_default();
+    let token_list: Vec<usize> = std::env::var("PIE_BENCH_MOE_TOKENS").map_or_else(
+        |_| vec![1, 8, 32, 128, 2048, 8192],
+        |v| v.split(',').map(|t| t.parse().unwrap()).collect(),
+    );
+    for (name, codec, experts, top_k, n, k) in [
+        (
+            "glm53-mini gate_up u4",
+            Codec::Affine4,
+            32u32,
+            8usize,
+            4096u32,
+            4096u32,
+        ),
+        ("glm53-mini down u4", Codec::Affine4, 32, 8, 4096, 2048),
+        ("kimi-k3 gate_up mxfp4", Codec::Mxfp4, 896, 16, 6144, 3584),
+        ("kimi-k3 down mxfp4", Codec::Mxfp4, 896, 16, 3584, 3072),
+        ("dsv41 gate mxfp4", Codec::Mxfp4, 384, 6, 2304, 5120),
+        ("dsv41 down mxfp4", Codec::Mxfp4, 384, 6, 5120, 2304),
+        ("qwen3.8 gate_up bf16", Codec::Bf16, 512, 10, 1280, 2560),
+        ("qwen3.8 down bf16", Codec::Bf16, 512, 10, 2560, 640),
+        ("qwen3.8 gate_up u4", Codec::Affine4, 512, 10, 1280, 2560),
+        ("qwen3.8 down u4", Codec::Affine4, 512, 10, 2560, 640),
+    ] {
+        if !only.is_empty() && !name.contains(only.as_str()) {
+            continue;
+        }
+        let planes = Planes::default();
+        let per = codec.bytes(n, k);
+        let copies = (2u64 << 30).div_ceil(per * u64::from(experts)).clamp(1, 16) as u32;
+        let bank = bench_bank(&planes, codec, experts * copies, n, k);
+        for &tokens in &token_list {
+            let routes_n = tokens * top_k;
+            let plans = 8usize;
+            let routes: Vec<(Tensor, Vec<i32>)> = (0..plans)
+                .map(|s| {
+                    let r = make_routes(tokens, top_k, experts as usize, 1000 + s as u64, false);
+                    (planes.i32s(&r, tokens as u32, top_k as u32), r)
+                })
+                .collect();
+            let x = planes.keep(
+                hip::Buffer::alloc(tokens * k as usize * 2).unwrap(),
+                tokens as u32,
+                k,
+                Dtype::Bf16,
+            );
+            let mut y = planes.keep(
+                hip::Buffer::alloc(routes_n * n as usize * 2).unwrap(),
+                routes_n as u32,
+                n,
+                Dtype::Bf16,
+            );
+            let reps = if tokens >= 2048 { 8 } else { 32 };
+            let mut i = 0usize;
+            let us = gpu.time_graph(reps, || {
+                let s = i % plans;
+                let copy = u32::try_from(s).unwrap() % copies;
+                bench_fire(&ctx, codec, bank, copy, experts, x, routes[s].0, &mut y);
+                i += 1;
+            });
+            let touched =
+                routes.iter().map(|r| distinct(&r.1)).sum::<usize>() as f64 / plans as f64;
+            println!(
+                "{name:22} tokens {tokens:5} ({:6.1} routes/expert): {us:9.1} us  {:6.0} GB/s  {:6.1} TFLOP/s",
+                routes_n as f64 / touched,
+                touched * per as f64 / us / 1e3,
+                2.0 * routes_n as f64 * f64::from(n) * f64::from(k) / us / 1e6
+            );
         }
     }
 }

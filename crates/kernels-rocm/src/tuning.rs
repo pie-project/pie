@@ -143,6 +143,25 @@ pub struct MoeAffineWmma;
 #[decision(id = "kernel.moe.affine_grouped_from", constant(range(1..=65_536)), default = 16, tune = search)]
 pub struct MoeAffineGroupedFrom(pub u32);
 
+/// Whether a routed matmul whose experts see few routes each (a decode
+/// batch) takes the batch kernels, which read each expert once for all its
+/// routes, over the per-route stream and the grouped GEMM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.batch", flag, default = true, tune = search)]
+pub struct MoeBatch;
+
+/// The fewest tokens (routes over the fan-out) a batch fire takes; fewer
+/// stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.batch_from", constant(range(1..=65_536)), default = 2, tune = search)]
+pub struct MoeBatchFrom(pub u32);
+
+/// The most routes an expert averages (routes over experts, rounded up)
+/// that a batch fire takes; more group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.batch_until", constant(range(0..=4096)), default = 32, tune = search)]
+pub struct MoeBatchUntil(pub u32);
+
 pub fn register(registry: &mut Registry) {
     registry
         .add::<MoeGrouped>()
@@ -168,7 +187,10 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4GroupedReuse>()
         .add::<MoeAffineGrouped>()
         .add::<MoeAffineWmma>()
-        .add::<MoeAffineGroupedFrom>();
+        .add::<MoeAffineGroupedFrom>()
+        .add::<MoeBatch>()
+        .add::<MoeBatchFrom>()
+        .add::<MoeBatchUntil>();
 }
 
 /// The kernel decisions one load runs under, read once from its profile.
@@ -200,6 +222,9 @@ pub struct Tuning {
     pub affine_grouped: bool,
     pub affine_wmma: bool,
     pub affine_grouped_from: u32,
+    pub moe_batch: bool,
+    pub moe_batch_from: u32,
+    pub moe_batch_until: u32,
 }
 
 impl Tuning {
@@ -229,6 +254,9 @@ impl Tuning {
         affine_grouped: true,
         affine_wmma: true,
         affine_grouped_from: 16,
+        moe_batch: true,
+        moe_batch_from: 2,
+        moe_batch_until: 32,
     };
 
     #[must_use]
@@ -258,6 +286,9 @@ impl Tuning {
             affine_grouped: profile.on::<MoeAffineGrouped>(&Anywhere),
             affine_wmma: profile.on::<MoeAffineWmma>(&Anywhere),
             affine_grouped_from: profile.get::<MoeAffineGroupedFrom>().0,
+            moe_batch: profile.on::<MoeBatch>(&Anywhere),
+            moe_batch_from: profile.get::<MoeBatchFrom>().0,
+            moe_batch_until: profile.get::<MoeBatchUntil>().0,
         }
     }
 }

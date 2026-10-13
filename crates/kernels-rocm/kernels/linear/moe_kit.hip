@@ -13,16 +13,20 @@
 // gather in LDS and fold into rows at the end.
 //
 // The grouped engine (prefill: an expert sees many routes) takes a work item
-// of up to 32 or 128 of one expert's routes, gathers their activation rows
-// into LDS and multiplies them against 128 weight rows a block on the 16 x 16
-// x 16 matrix core, the weight decoded from registers straight into the
-// operand.
+// of up to 32, 64 or 128 of one expert's routes, gathers their activation
+// rows into LDS and multiplies them against 128 or 256 weight rows a block on
+// the 16 x 16 x 16 matrix core, the weight decoded from registers straight
+// into the operand.
 //
-// Both rely on the matrix core reading its k positions in any order so long
+// The batch engine (decode batches: an expert sees 1 to 32 routes) reads an
+// expert's weight once for all its routes, streaming it into registers
+// several stages ahead by hand, and multiplies 4 to 32 routes at a time.
+//
+// All rely on the matrix core reading its k positions in any order so long
 // as both operands agree: a codec decodes codes in whatever pairing is
 // cheapest, and the activation is staged in that same order.
 
-#include "prelude/mfma.hip"
+#include "linear/mgemm.hip"
 
 namespace pie::linear {
 
@@ -533,8 +537,11 @@ __device__ __forceinline__ void stream_zero(T* __restrict__ y, int n, int rows_p
 
 // A work item is up to MT routes of one expert: 32, or 128 for an expert
 // with routes enough to fill it, which reads its weight a quarter as often.
-constexpr int kGroupTileN = 128;  // weight rows a block (N), 32 a wave
 constexpr int kGroupThreads = 256;
+// Weight rows are 32 a wave; a 64- or 128-route item takes eight waves, 256
+// rows, so two waves a SIMD share the one activation tile the LDS holds.
+template <int MT>
+constexpr int kGroupWaves = MT >= 64 ? 8 : 4;
 
 // A codec for the grouped engine decodes a chunk (kCodes codes, one fetch)
 // into kCodes / 2 dwords of bf16 / f16 pairs, the exact operand, in the
@@ -615,24 +622,25 @@ struct GroupAffine {
 };
 
 // y[route] = W·act[route / act_div] (+ bias) for routes order[begin ..
-// begin + count) (count ≤ MT) of one expert, weight rows [blockIdx.y·128,
-// +128). Rounds once on the store, after the bias.
+// begin + count) (count ≤ MT) of one expert, weight rows [blockIdx.y·32·
+// waves, +32·waves). Rounds once on the store, after the bias.
 template <class C, class T, int MT>
 __device__ __forceinline__ void grouped_tile(const T* __restrict__ act, const i32* __restrict__ order, int begin,
                                              int count, const typename C::Planes& p, const T* __restrict__ bias,
                                              T* __restrict__ out, int act_div, int n, int k) {
-    static_assert(MT == 32 || MT == 128, "a work item is 32 or 128 routes");
+    static_assert(MT == 32 || MT == 64 || MT == 128, "a work item is 32, 64 or 128 routes");
     constexpr int CODES = C::kCodes, KU = MT == 32 || C::kKU == 1 ? C::kKU : C::kKU / 2;
     constexpr int KC = 4 * KU * CODES;  // codes a stage
     constexpr int LD = KC + 8;          // LDS row pitch, elements
-    constexpr int MB = MT / 16, NB = kGroupTileN / (16 * (kGroupThreads / kWave));
-    constexpr int NA = MT * KC / 8 / kGroupThreads;  // 16-byte activation reads a thread a stage
+    constexpr int THREADS = kGroupWaves<MT> * kWave, TILE_N = 32 * kGroupWaves<MT>;
+    constexpr int MB = MT / 16, NB = 2;
+    constexpr int NA = MT * KC / 8 / THREADS;  // 16-byte activation reads a thread a stage
     constexpr int WORDS = CODES / 2;
-    static_assert(NA * 8 * kGroupThreads == MT * KC, "the activation tile splits evenly");
+    static_assert(NA * 8 * THREADS == MT * KC, "the activation tile splits evenly");
     __shared__ __align__(16) T xt[MT * LD];
 
     const int tid = threadIdx.x, wave = tid / kWave, l = lane(), r16 = l % 16, g = l / 16;
-    const int row0 = blockIdx.y * kGroupTileN + wave * NB * 16;
+    const int row0 = blockIdx.y * TILE_N + wave * NB * 16;
     const int chunks = k / CODES;
     const int stages = (k + KC - 1) / KC;
 
@@ -643,7 +651,7 @@ __device__ __forceinline__ void grouped_tile(const T* __restrict__ act, const i3
     bool live[NA];
 #pragma unroll
     for (int i = 0; i < NA; ++i) {
-        const int piece = tid + i * kGroupThreads;
+        const int piece = tid + i * THREADS;
         const int m = piece / (KC / 8);
         live[i] = m < count;
         src[i] = act + static_cast<long long>(order[begin + (live[i] ? m : 0)] / act_div) * k;
@@ -770,6 +778,505 @@ __device__ __forceinline__ bool group_item(const i32* __restrict__ offsets, cons
     item.begin = offsets[item.expert] + (w % 65536) * routes;
     item.count = min(offsets[item.expert + 1] - item.begin, routes);
     return item.count > 0;
+}
+
+// ------------------------------------------------------------- batch ----
+
+// A work item of up to MT (4, 8, 16 or 32) routes of one expert against
+// 64·NBW weight rows a block, NBW 16-row blocks a wave. A stage of the weight
+// goes from memory to registers DEPTH stages ahead of its use, by hand-issued
+// buffer reads waited by hand (as mgemm's); each wave read takes whole rows
+// of the stage (kRowBytes a row, 128 bytes or more on 8 lanes), which the
+// card streams near its peak where the matrix core's own layout (16 rows of
+// 32 or 64 bytes a read) would not. At its turn the stage goes through the wave's own LDS,
+// whence each lane reads its operand pieces; the routes' activation is
+// staged through LDS for the block, double-buffered, one barrier a stage.
+// The matrix core takes the activation as A and the decoded weight as B, so
+// a lane's D cells are its own weight row against four routes.
+//
+// A codec reads kPieces pieces a lane a stage (kStageK codes of a row over
+// the four lane groups), lane group g's piece j at byte poff(j, g) of the
+// row's stage and element kpos(j, g) of the activation's; each of a piece's
+// kWords code words decodes into four dwords of pairs, the order `shuffle`
+// puts eight natural activation elements into. A kFold codec (affine)
+// multiplies raw codes and applies a piece's scale and bias after its
+// products: its piece is a fourth of one factor group, so the four lane
+// groups of one product share their factors.
+
+typedef unsigned int moe_rsrc __attribute__((ext_vector_type(4)));
+typedef int moe_i2 __attribute__((ext_vector_type(2)));
+
+// A plane as a raw buffer descriptor: reads at or past `bytes` land zeros
+// and touch no memory.
+__device__ __forceinline__ moe_rsrc batch_plane(const void* base, unsigned long long bytes) {
+    const unsigned long long a = reinterpret_cast<unsigned long long>(base);
+    return moe_rsrc{static_cast<u32>(__builtin_amdgcn_readfirstlane(static_cast<int>(a))),
+                    static_cast<u32>(__builtin_amdgcn_readfirstlane(static_cast<int>(a >> 32))) & 0xffffu,
+                    static_cast<u32>(bytes < 0xfffff000ull ? bytes : 0xfffff000ull), 0x00020000u};
+}
+
+// The offset a read past every plane takes: a stage past the last.
+constexpr u32 kBatchVoid = 0xfffff000u;
+
+// Buffer reads the compiler neither counts nor moves: 16 bytes nt (the
+// weight, read once, whole lines), and 1, 2, 4 or 8 bytes cached (a factor
+// run, whose line the neighbouring stages read).
+__device__ __forceinline__ void bload_nt(i32x4& d, moe_rsrc r, u32 v) {
+    asm volatile("buffer_load_dwordx4 %0, %1, %2, 0 offen nt" : "=v"(d) : "v"(v), "s"(r) : "memory");
+}
+template <int BYTES>
+__device__ __forceinline__ void bload_run(moe_i2& d, moe_rsrc r, u32 v) {
+    static_assert(BYTES == 1 || BYTES == 2 || BYTES == 4 || BYTES == 8, "a run of 1, 2, 4 or 8 bytes");
+    if constexpr (BYTES == 8) {
+        asm volatile("buffer_load_dwordx2 %0, %1, %2, 0 offen" : "=v"(d) : "v"(v), "s"(r) : "memory");
+    } else if constexpr (BYTES == 4) {
+        asm volatile("buffer_load_dword %0, %1, %2, 0 offen" : "=v"(d[0]) : "v"(v), "s"(r) : "memory");
+    } else if constexpr (BYTES == 2) {
+        asm volatile("buffer_load_ushort %0, %1, %2, 0 offen" : "=v"(d[0]) : "v"(v), "s"(r) : "memory");
+    } else {
+        asm volatile("buffer_load_ubyte %0, %1, %2, 0 offen" : "=v"(d[0]) : "v"(v), "s"(r) : "memory");
+    }
+}
+
+// The same through a lane's own address, cached.
+template <int BYTES>
+__device__ __forceinline__ void gload_run(moe_i2& d, const void* p) {
+    static_assert(BYTES == 2 || BYTES == 4 || BYTES == 8, "a run of 2, 4 or 8 bytes");
+    if constexpr (BYTES == 8) {
+        asm volatile("global_load_dwordx2 %0, %1, off" : "=v"(d) : "v"(p) : "memory");
+    } else if constexpr (BYTES == 4) {
+        asm volatile("global_load_dword %0, %1, off" : "=v"(d[0]) : "v"(p) : "memory");
+    } else {
+        asm volatile("global_load_ushort %0, %1, off" : "=v"(d[0]) : "v"(p) : "memory");
+    }
+}
+
+template <class V>
+__device__ __forceinline__ void batch_hold(V& v) {
+    asm volatile("" : "+v"(v));
+}
+
+// An operand piece of BYTES bytes from LDS, as dwords.
+template <int BYTES>
+struct BatchPiece {
+    u32 w[BYTES / 4];
+};
+
+template <int BYTES>
+__device__ __forceinline__ BatchPiece<BYTES> lds_piece(const u8* p) {
+    BatchPiece<BYTES> v;
+    if constexpr (BYTES == 16) {
+        const b128 x = *reinterpret_cast<const b128*>(p);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) v.w[i] = x.w[i];
+    } else if constexpr (BYTES == 8) {
+        const moe_u2 x = *reinterpret_cast<const moe_u2*>(p);
+        v.w[0] = x[0];
+        v.w[1] = x[1];
+    } else {
+        v.w[0] = *reinterpret_cast<const u32*>(p);
+    }
+    return v;
+}
+
+// A dense T bank: SBY / 2 elements a row a stage, a piece one 16-byte chunk
+// (chunk 4j + g).
+template <class T, int SBY>
+struct BatchDense {
+    static_assert(SBY == 128 || SBY == 256, "a stage of 64 or 128 elements");
+    static constexpr int kRowBytes = SBY, kPad = 16, kStageK = SBY / 2, kPieces = SBY / 64, kWords = 1;
+    static constexpr int kPieceBytes = 16, kFactorLoads = 0, kFactorLds = 0;
+    static constexpr bool kFold = false;
+    struct Planes {
+        const T* w;
+    };
+    struct Run {
+        moe_rsrc w;
+        u32 row;
+    };
+    struct Factors {};
+    struct Piece {};
+    static __device__ __forceinline__ Run run(const Planes& p, int n, int k) {
+        return {batch_plane(p.w, 2ull * n * k), 2u * k};
+    }
+    static __device__ __forceinline__ moe_rsrc codes(const Run& r) { return r.w; }
+    static __device__ __forceinline__ u32 row_bytes(const Run& r) { return r.row; }
+    static constexpr __device__ int poff(int j, int g) { return 16 * (4 * j + g); }
+    static constexpr __device__ int kpos(int j, int g) { return 8 * (4 * j + g); }
+    static __device__ __forceinline__ void issue_factors(Factors&, const Run&, int, int, bool) {}
+    static __device__ __forceinline__ void tie_factors(Factors&) {}
+    static __device__ __forceinline__ void stage_factors(const Factors&, u8*) {}
+    static __device__ __forceinline__ Piece prep(const Factors&, int) { return {}; }
+    static __device__ __forceinline__ void decode(const Piece&, const BatchPiece<16>& c, int, u32* d) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) d[i] = c.w[i];
+    }
+    static __device__ __forceinline__ b128 shuffle(b128 x) { return x; }
+};
+
+// An mxfp4 bank in bf16: a stage is SBY / 16 blocks of 32 codes a row,
+// each block's scale folded into its decode table. Lane group g takes KU of
+// them, [KU·g, +KU), so its KU scale bytes are one read of its own.
+template <int SBY>
+struct BatchMxfp4 {
+    static_assert(SBY == 64 || SBY == 128, "a stage of four or eight blocks");
+    static constexpr int KU = SBY / 64;
+    static constexpr int kRowBytes = SBY, kPad = 16, kStageK = 2 * SBY, kPieces = KU, kWords = 4;
+    static constexpr int kPieceBytes = 16, kFactorLoads = 1, kFactorLds = 0;
+    static constexpr bool kFold = false;
+    struct Planes {
+        const u8* codes;
+        const u8* scales;
+    };
+    struct Run {
+        moe_rsrc codes, scales;
+        u32 code_row, scale_row;
+    };
+    struct Factors {
+        moe_i2 scale;
+    };
+    using Piece = Fp4Tables;
+    static __device__ __forceinline__ Run run(const Planes& p, int n, int k) {
+        return {batch_plane(p.codes, 1ull * n * k / 2), batch_plane(p.scales, 1ull * n * k / 32), k / 2u, k / 32u};
+    }
+    static __device__ __forceinline__ moe_rsrc codes(const Run& r) { return r.codes; }
+    static __device__ __forceinline__ u32 row_bytes(const Run& r) { return r.code_row; }
+    static constexpr __device__ int poff(int j, int g) { return 16 * (KU * g + j); }
+    static constexpr __device__ int kpos(int j, int g) { return 32 * (KU * g + j); }
+    static __device__ __forceinline__ void issue_factors(Factors& f, const Run& run, int row, int s, bool live) {
+        const u32 v = live ? row * run.scale_row + s * (4 * KU) + lane() / 16 * KU : kBatchVoid;
+        bload_run<KU>(f.scale, run.scales, v);
+    }
+    static __device__ __forceinline__ void tie_factors(Factors& f) { batch_hold(f.scale); }
+    static __device__ __forceinline__ void stage_factors(const Factors&, u8*) {}
+    static __device__ __forceinline__ Piece prep(const Factors& f, int j) {
+        return fp4_tables_scaled((static_cast<u32>(f.scale[0]) >> (8 * j)) & 0xffu);
+    }
+    static __device__ __forceinline__ void decode(const Piece& t, const BatchPiece<16>& c, int q, u32* d) {
+        fp4_word(c.w[q], t, d);
+    }
+    static __device__ __forceinline__ b128 shuffle(b128 x) { return fp4_shuffle(x); }
+};
+
+// A four-bit affine bank (MLX) in bf16: lane group g's piece j is codes
+// [GROUP/4·g, +GROUP/4) of the stage's group j, so the product of one piece
+// is one group's, and the piece's value is (Σ code·x)·scale + (Σx)·bias. The
+// codes enter as 128 + code (exact), so the product is Σ code·x + 128·Σx and
+// the bias taken is bias − 128·scale. A stage's factors of a row (KU scales,
+// then KU biases) are read by the lane groups, two a plane, and meet in the
+// wave's LDS.
+template <int GROUP, int SBY>
+struct BatchAffine {
+    static_assert(GROUP == 32 || GROUP == 64 || GROUP == 128, "a 32-, 64- or 128-code group");
+    static constexpr int KU = 2 * SBY / GROUP;  // groups a stage
+    static_assert(KU == 2 || KU == 4 || KU == 8, "two to eight groups a stage");
+    static constexpr int LB = KU;  // bytes a lane group reads
+    static constexpr int kRowBytes = SBY, kStageK = 2 * SBY, kPieces = KU, kWords = GROUP / 32;
+    static constexpr int kPieceBytes = GROUP / 8, kPad = kPieceBytes == 8 ? 8 : 16;
+    static constexpr int kFactorLoads = 1, kFactorLds = 4 * KU;  // LDS a row
+    static constexpr bool kFold = true;
+    using Planes = typename StreamAffine<bf16, 4, GROUP>::Planes;
+    struct Run {
+        moe_rsrc codes;
+        const u8* factors;  // the lane's plane: scales or biases
+        u32 code_row, factor_row, last;
+    };
+    struct Factors {
+        moe_i2 f;
+    };
+    struct Piece {};
+    static __device__ __forceinline__ Run run(const Planes& p, int n, int k) {
+        const u32 factor_row = 2u * (k / GROUP);
+        const void* plane = lane() / 16 < 2 ? static_cast<const void*>(p.scales) : static_cast<const void*>(p.biases);
+        return {batch_plane(p.codes, 1ull * n * k / 2), static_cast<const u8*>(plane), k / 2u, factor_row,
+                static_cast<u32>(n) * factor_row - LB};
+    }
+    static __device__ __forceinline__ moe_rsrc codes(const Run& r) { return r.codes; }
+    static __device__ __forceinline__ u32 row_bytes(const Run& r) { return r.code_row; }
+    static constexpr __device__ int poff(int j, int g) { return GROUP / 2 * j + GROUP / 8 * g; }
+    static constexpr __device__ int kpos(int j, int g) { return GROUP * j + GROUP / 4 * g; }
+    // Lane group g reads half g % 2 of the stage's scales (g < 2) or biases;
+    // past the planes' end it rereads their last run (its products are
+    // zeros).
+    static __device__ __forceinline__ u32 half(int g) { return static_cast<u32>(g % 2 * KU); }
+    static __device__ __forceinline__ void issue_factors(Factors& f, const Run& run, int row, int s, bool) {
+        const u32 v = min(row * run.factor_row + s * (2 * KU) + half(lane() / 16), run.last);
+        gload_run<LB>(f.f, run.factors + v);
+    }
+    static __device__ __forceinline__ void tie_factors(Factors& f) { batch_hold(f.f); }
+    // `at` is the lane's row of the wave's factor LDS.
+    static __device__ __forceinline__ void stage_factors(const Factors& f, u8* at) {
+        const int g = lane() / 16;
+        u8* p = at + (g < 2 ? 0 : 2 * KU) + half(g);
+        if constexpr (LB == 8) {
+            *reinterpret_cast<moe_u2*>(p) = __builtin_bit_cast(moe_u2, f.f);
+        } else if constexpr (LB == 4) {
+            *reinterpret_cast<u32*>(p) = static_cast<u32>(f.f[0]);
+        } else {
+            *reinterpret_cast<u16*>(p) = static_cast<u16>(f.f[0]);
+        }
+    }
+    static __device__ __forceinline__ Piece prep(const Factors&, int) { return {}; }
+    // Eight codes as (c0,c4) (c1,c5) (c2,c6) (c3,c7), each 128 + code.
+    static __device__ __forceinline__ void decode(const Piece&, const BatchPiece<GROUP / 8>& c, int q, u32* d) {
+        const u32 w = c.w[q];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) d[i] = ((w >> (4 * i)) & 0x000F000Fu) | 0x43004300u;
+    }
+    static __device__ __forceinline__ b128 shuffle(b128 x) {
+        return {{pair_lo(x.w[0], x.w[2]), pair_hi(x.w[0], x.w[2]), pair_lo(x.w[1], x.w[3]), pair_hi(x.w[1], x.w[3])}};
+    }
+    // Group j's scale and its bias less 128 scales, from the lane's row of
+    // the factor LDS.
+    static __device__ __forceinline__ void factors(const u8* at, int j, float& scale, float& bias) {
+        const u16 s = reinterpret_cast<const u16*>(at)[j], b = reinterpret_cast<const u16*>(at)[KU + j];
+        scale = __builtin_bit_cast(float, static_cast<u32>(s) << 16);
+        bias = fmaf(-128.f, scale, __builtin_bit_cast(float, static_cast<u32>(b) << 16));
+    }
+};
+
+// y[route] = W·act[route / act_div] (+ bias) for routes order[begin ..
+// begin + count) (count ≤ MT) of one expert, weight rows [blockIdx.y·64·NBW,
+// +64·NBW). Rounds once on the store, after the bias. Short of 16 routes the
+// activation's rows past MT read one zero row.
+template <class C, class T, int MT, int NBW, int DEPTH>
+__device__ __forceinline__ void batch_tile(const T* __restrict__ act, const i32* __restrict__ order, int begin,
+                                           int count, const typename C::Planes& p, const T* __restrict__ bias,
+                                           T* __restrict__ out, int act_div, int n, int k) {
+    static_assert(MT == 4 || MT == 8 || MT == 16 || MT == 32, "a batch item is 4, 8, 16 or 32 routes");
+    constexpr int MB = MT < 16 ? 1 : MT / 16, KC = C::kStageK, LD = KC + 8, R = DEPTH + 1;
+    constexpr int RT = MT < 16 ? MT + 1 : MT;  // LDS rows a buffer
+    constexpr int WAVES = kGroupThreads / kWave;
+    constexpr int RW = 16 * NBW;                         // weight rows a wave
+    constexpr int SBY = C::kRowBytes, LPR = SBY / 16;    // a row's stage, its 16-byte reads
+    constexpr int NL = RW * SBY / (16 * kWave);          // 16-byte weight reads a lane a stage
+    constexpr int PITCH = SBY + C::kPad, FPITCH = C::kFactorLds;
+    constexpr int PA = MT * KC / 8;                                // 16-byte activation pieces a stage
+    constexpr int NA = (PA + kGroupThreads - 1) / kGroupThreads;  // reads a thread
+    constexpr int NW = NL + NBW * C::kFactorLoads;                // weight reads a lane a stage
+    static_assert(PA % kGroupThreads == 0 || PA < kGroupThreads, "the activation stage splits evenly");
+    static_assert(NL >= 1 && NL * 16 * kWave == RW * SBY && kWave % LPR == 0, "a wave's stage is whole reads");
+    static_assert(DEPTH >= 2 && NW + (DEPTH - 1) * (NA + NW) < 64, "the reads in flight fit the count");
+    __shared__ __align__(16) T xs[2 * RT * LD];
+    __shared__ __align__(16) u8 wl[WAVES][RW * (PITCH + FPITCH)];
+
+    const int tid = threadIdx.x, l = lane(), r16 = l % 16, g = l / 16;
+    const int wave = __builtin_amdgcn_readfirstlane(tid / kWave);
+    const int row0 = (blockIdx.y * WAVES + wave) * (16 * NBW);
+    const int stages = (k + KC - 1) / KC;
+    const typename C::Run run = C::run(p, n, k);
+    const moe_rsrc wr = C::codes(run);
+
+    // The routes' activation rows; a route past the item reads the first and
+    // a piece past K the row's last (both land as zeros). Short of a thread a
+    // piece, the threads past the stage reread a piece and store nothing.
+    const T* src[NA];
+    int col[NA], at[NA];
+    bool live[NA], mine[NA];
+#pragma unroll
+    for (int i = 0; i < NA; ++i) {
+        const int piece = (tid + i * kGroupThreads) % PA;
+        const int m = piece / (KC / 8);
+        mine[i] = tid + i * kGroupThreads < PA;
+        live[i] = m < count;
+        src[i] = act + static_cast<long long>(order[begin + (live[i] ? m : 0)] / act_div) * k;
+        col[i] = (piece % (KC / 8)) * 8;
+        at[i] = m * LD + col[i];
+    }
+    // A wave's read i takes 16 bytes of its stage's flat run of rows, the
+    // (64·i + l)th; a row past the bank reads the last.
+    u32 wv[NL];
+    int frow[NBW];
+#pragma unroll
+    for (int nb = 0; nb < NBW; ++nb) frow[nb] = min(row0 + nb * 16 + r16, n - 1);
+#pragma unroll
+    for (int i = 0; i < NL; ++i) {
+        const int flat = kWave * i + l;
+        wv[i] = static_cast<u32>(min(row0 + flat / LPR, n - 1)) * C::row_bytes(run) + flat % LPR * 16;
+    }
+
+    i32x4 w[R][NL];
+    typename C::Factors f[R][NBW];
+    i32x4 a[R][NA];
+    mfma_cd acc[NBW][MB];
+#pragma unroll
+    for (int nb = 0; nb < NBW; ++nb)
+#pragma unroll
+        for (int mb = 0; mb < MB; ++mb) acc[nb][mb] = mfma_zero();
+
+    // Stage s's reads, the activation's then the weight's; past the last
+    // stage the activation rereads the last and the weight reads nothing.
+    auto issue = [&](auto slot, int s) {
+        constexpr int S = decltype(slot)::value;
+        const int sc = min(s, stages - 1);
+        const bool on = s < stages;
+#pragma unroll
+        for (int i = 0; i < NA; ++i) gload16(a[S][i], src[i] + min(sc * KC + col[i], k - 8));
+#pragma unroll
+        for (int i = 0; i < NL; ++i) bload_nt(w[S][i], wr, on ? wv[i] + s * SBY : kBatchVoid);
+#pragma unroll
+        for (int nb = 0; nb < NBW; ++nb) C::issue_factors(f[S][nb], run, frow[nb], s, on);
+    };
+    auto store = [&](auto slot, int buf, int s) {
+        constexpr int S = decltype(slot)::value;
+        T* st = xs + buf * (RT * LD);
+#pragma unroll
+        for (int i = 0; i < NA; ++i) {
+            const bool on = live[i] && s * KC + col[i] < k;
+            if (PA % kGroupThreads == 0 || mine[i])
+                *reinterpret_cast<b128*>(st + at[i]) =
+                    on ? C::shuffle(__builtin_bit_cast(b128, a[S][i])) : b128{{0u, 0u, 0u, 0u}};
+        }
+    };
+    // The stage's weight into the wave's LDS, as it was read.
+    auto stage_weight = [&](auto slot) {
+        constexpr int S = decltype(slot)::value;
+#pragma unroll
+        for (int i = 0; i < NL; ++i) {
+            const int flat = kWave * i + l;
+            u8* q = wl[wave] + flat / LPR * PITCH + flat % LPR * 16;
+            if constexpr (PITCH % 16 == 0) {
+                *reinterpret_cast<i32x4*>(q) = w[S][i];
+            } else {
+                reinterpret_cast<moe_u2*>(q)[0] = moe_u2{static_cast<u32>(w[S][i][0]), static_cast<u32>(w[S][i][1])};
+                reinterpret_cast<moe_u2*>(q)[1] = moe_u2{static_cast<u32>(w[S][i][2]), static_cast<u32>(w[S][i][3])};
+            }
+        }
+#pragma unroll
+        for (int nb = 0; nb < NBW; ++nb) C::stage_factors(f[S][nb], wl[wave] + RW * PITCH + (nb * 16 + r16) * FPITCH);
+    };
+    // Every LDS read of the stage is issued before the first product, so the
+    // products wait out the reads once, not piece by piece.
+    auto multiply = [&](auto slot, const T* xb) {
+        constexpr int S = decltype(slot)::value;
+        constexpr int KU = C::kPieces, W = C::kWords;
+        constexpr u32 kOnes = is_same<T, f16>::value ? 0x3C003C00u : 0x3F803F80u;
+        BatchPiece<C::kPieceBytes> cw[KU][NBW];
+        b128 xv[KU][W][MB];
+        float scale[KU][NBW], shift[KU][NBW];
+#pragma unroll
+        for (int j = 0; j < KU; ++j)
+#pragma unroll
+            for (int nb = 0; nb < NBW; ++nb)
+                cw[j][nb] = lds_piece<C::kPieceBytes>(wl[wave] + (nb * 16 + r16) * PITCH + C::poff(j, g));
+#pragma unroll
+        for (int j = 0; j < KU; ++j)
+#pragma unroll
+            for (int q = 0; q < W; ++q)
+#pragma unroll
+                for (int mb = 0; mb < MB; ++mb)
+                    xv[j][q][mb] = *reinterpret_cast<const b128*>(xb + mb * 16 * LD + C::kpos(j, g) + 8 * q);
+        if constexpr (C::kFold) {
+#pragma unroll
+            for (int j = 0; j < KU; ++j)
+#pragma unroll
+                for (int nb = 0; nb < NBW; ++nb)
+                    C::factors(wl[wave] + RW * PITCH + (nb * 16 + r16) * FPITCH, j, scale[j][nb], shift[j][nb]);
+        }
+#pragma unroll
+        for (int j = 0; j < KU; ++j) {
+            typename C::Piece pc[NBW];
+#pragma unroll
+            for (int nb = 0; nb < NBW; ++nb) pc[nb] = C::prep(f[S][nb], j);
+            mfma_cd part[NBW][MB], xsum[MB];
+            if constexpr (C::kFold) {
+#pragma unroll
+                for (int mb = 0; mb < MB; ++mb) {
+                    xsum[mb] = mfma_zero();
+#pragma unroll
+                    for (int nb = 0; nb < NBW; ++nb) part[nb][mb] = mfma_zero();
+                }
+            }
+#pragma unroll
+            for (int q = 0; q < W; ++q) {
+#pragma unroll
+                for (int nb = 0; nb < NBW; ++nb) {
+                    u32 d[4];
+                    C::decode(pc[nb], cw[j][nb], q, d);
+#pragma unroll
+                    for (int mb = 0; mb < MB; ++mb) {
+                        const b128& x = xv[j][q][mb];
+                        mfma_cd& c = C::kFold ? part[nb][mb] : acc[nb][mb];
+                        c = mma16x16<T>(x.w[0], x.w[1], d[0], d[1], c);
+                        c = mma16x16<T>(x.w[2], x.w[3], d[2], d[3], c);
+                    }
+                }
+                if constexpr (C::kFold) {
+#pragma unroll
+                    for (int mb = 0; mb < MB; ++mb) {
+                        const b128& x = xv[j][q][mb];
+                        xsum[mb] = mma16x16<T>(x.w[0], x.w[1], kOnes, kOnes, xsum[mb]);
+                        xsum[mb] = mma16x16<T>(x.w[2], x.w[3], kOnes, kOnes, xsum[mb]);
+                    }
+                }
+            }
+            if constexpr (C::kFold) {
+#pragma unroll
+                for (int nb = 0; nb < NBW; ++nb)
+#pragma unroll
+                    for (int mb = 0; mb < MB; ++mb)
+#pragma unroll
+                        for (int t = 0; t < 4; ++t)
+                            acc[nb][mb][t] = fmaf(scale[j][nb], part[nb][mb][t],
+                                                  fmaf(shift[j][nb], xsum[mb][t], acc[nb][mb][t]));
+            }
+        }
+    };
+
+    Unroll<DEPTH, 0>::run([&](auto slot, int s) { issue(slot, s); }, 0);
+    // The first stage's activation: younger than it are its own weight and
+    // the DEPTH - 1 stages behind.
+    vm_wait<NW + (DEPTH - 1) * (NA + NW)>();
+    tie(a[0]);
+    store(Const<0>{}, 0, 0);
+    if constexpr (MT < 16)
+        for (int i = tid; i < LD; i += kGroupThreads) xs[MT * LD + i] = xs[(RT + MT) * LD + i] = from_f32<T>(0.f);
+    lds_barrier();
+
+    const T* xrow = xs + (MT < 16 ? min(r16, MT) : r16) * LD;
+    auto stage_at = [&](auto cur, int s) {
+        constexpr int CU = decltype(cur)::value;
+        constexpr int NEXT = (CU + 1) % R;
+        if (s >= stages) return;
+        // Stage s + 1's activation, and so (older still) stage s's weight.
+        vm_wait<NW + (DEPTH - 2) * (NA + NW)>();
+        tie(a[NEXT]);
+        tie(w[CU]);
+#pragma unroll
+        for (int nb = 0; nb < NBW; ++nb) C::tie_factors(f[CU][nb]);
+        store(Const<NEXT>{}, (s + 1) & 1, s + 1);
+        stage_weight(Const<CU>{});
+        issue(Const<(CU + DEPTH) % R>{}, s + DEPTH);
+        multiply(Const<CU>{}, xrow + (s & 1) * (RT * LD));
+        lds_barrier();
+    };
+    for (int s = 0; s < stages; s += R) Unroll<R, 0>::run(stage_at, s);
+    // The reads past the end land before their registers are given up.
+    vm_wait<0>();
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        tie(a[r]);
+        tie(w[r]);
+#pragma unroll
+        for (int nb = 0; nb < NBW; ++nb) C::tie_factors(f[r][nb]);
+    }
+
+    // D cell (route 4g + t, weight row r16) of block (nb, mb).
+#pragma unroll
+    for (int mb = 0; mb < MB; ++mb)
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const int m = mb * 16 + 4 * g + t;
+            if (m >= count) continue;
+            T* o = out + static_cast<long long>(order[begin + m]) * n;
+#pragma unroll
+            for (int nb = 0; nb < NBW; ++nb) {
+                const int c = row0 + nb * 16 + r16;
+                if (c >= n) continue;
+                const float b = bias != nullptr ? to_f32(bias[c]) : 0.f;
+                o[c] = from_f32<T>(acc[nb][mb][t] + b);
+            }
+        }
 }
 
 // ----------------------------------------------------------- ordering ---

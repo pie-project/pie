@@ -374,53 +374,98 @@ namespace pie::linear {
 // routes (plane route indices), offsets[num_experts] starts the routes no
 // expert takes, and `work` lists one item (e << 16 | slice) for each
 // `group_routes` routes of an expert, at most `work_cap`, their count in
-// offsets[num_experts + 1]. One block; dynamic LDS of 2·(num_experts + 1)
-// ints.
-__global__ __launch_bounds__(1024) void moe_route_order(const i32* __restrict__ routes, i32* __restrict__ order,
-                                                        i32* __restrict__ offsets, i32* __restrict__ work, int work_cap,
-                                                        int group_routes, int top_k, int route_count, int num_experts,
-                                                        const u32* __restrict__ win) {
+// offsets[num_experts + 1]. One block of 256 threads; dynamic LDS of
+// 2·(num_experts + 1) ints. A thread holds its first kOrderHeld routes in
+// registers across the two passes over them, and owns a run of the buckets
+// for the prefix, so the block meets at four barriers.
+constexpr int kOrderThreads = 1024;
+constexpr int kOrderHeld = 2;
+
+__global__ __launch_bounds__(kOrderThreads) void moe_route_order(const i32* __restrict__ routes,
+                                                                 i32* __restrict__ order, i32* __restrict__ offsets,
+                                                                 i32* __restrict__ work, int work_cap,
+                                                                 int group_routes, int top_k, int route_count,
+                                                                 int num_experts, const u32* __restrict__ win) {
     extern __shared__ i32 order_smem[];
-    __shared__ i32 wave_totals[1024 / 32];
+    __shared__ i32 wave_totals[2][kOrderThreads / kWave];
     i32* counts = order_smem;
     i32* fill = counts + num_experts + 1;
+    const int tid = threadIdx.x, l = lane(), wave = tid / kWave;
     const int live = win != nullptr ? min(static_cast<int>(win[0]) * top_k, route_count) : route_count;
     const int base = win != nullptr ? static_cast<int>(win[1]) * top_k : 0;
-    for (int e = threadIdx.x; e <= num_experts; e += blockDim.x) {
+    auto bucket = [&](int r) {
+        const int e = routes[base + r];
+        return e < 0 || e >= num_experts ? num_experts : e;
+    };
+    int held[kOrderHeld];
+#pragma unroll
+    for (int i = 0; i < kOrderHeld; ++i) {
+        const int r = tid + i * kOrderThreads;
+        held[i] = r < live ? bucket(r) : -1;
+    }
+    for (int e = tid; e <= num_experts; e += kOrderThreads) {
         counts[e] = 0;
         fill[e] = 0;
     }
     __syncthreads();
-    for (int r = threadIdx.x; r < live; r += blockDim.x) {
-        int e = routes[base + r];
-        if (e < 0 || e >= num_experts) e = num_experts;
-        atomicAdd(counts + e, 1);
-    }
+#pragma unroll
+    for (int i = 0; i < kOrderHeld; ++i)
+        if (held[i] >= 0) atomicAdd(counts + held[i], 1);
+    for (int r = tid + kOrderHeld * kOrderThreads; r < live; r += kOrderThreads) atomicAdd(counts + bucket(r), 1);
     __syncthreads();
 
-    // Prefix the counts (in place, into offsets) and the work items.
-    int run = 0, items = 0;
-    for (int e0 = 0; e0 <= num_experts; e0 += blockDim.x) {
-        const int e = e0 + threadIdx.x;
-        const int c = e <= num_experts ? counts[e] : 0;
-        const int slices = e < num_experts ? (c + group_routes - 1) / group_routes : 0;
-        int total, slice_total;
-        const int at = run + block_scan(c, wave_totals, total);
-        const int first = items + block_scan(slices, wave_totals, slice_total);
-        if (e <= num_experts) {
-            counts[e] = at;
-            offsets[e] = at;
+    // Thread t's buckets [t·per, +per): their routes and items, prefixed
+    // over the block (a wave scan, then the waves' totals).
+    const int per = (num_experts + kOrderThreads) / kOrderThreads;
+    const int e0 = min(tid * per, num_experts + 1), e1 = min(e0 + per, num_experts + 1);
+    int mine = 0, items = 0;
+    for (int e = e0; e < e1; ++e) {
+        const int c = counts[e];
+        mine += c;
+        if (e < num_experts) items += (c + group_routes - 1) / group_routes;
+    }
+    int run = mine, first = items;
+#pragma unroll
+    for (int off = 1; off < kWave; off <<= 1) {
+        const int a = __shfl_up(run, off, kWave), b = __shfl_up(first, off, kWave);
+        if (l >= off) {
+            run += a;
+            first += b;
         }
-        for (int s = 0; s < slices && first + s < work_cap; ++s) work[first + s] = e * 65536 + s;
-        run += total;
-        items += slice_total;
     }
-    if (threadIdx.x == 0) offsets[num_experts + 1] = min(items, work_cap);
+    if (l == kWave - 1) {
+        wave_totals[0][wave] = run;
+        wave_totals[1][wave] = first;
+    }
+    __syncthreads();
+    run -= mine;
+    first -= items;
+    int total = 0;
+#pragma unroll
+    for (int w = 0; w < kOrderThreads / kWave; ++w) {
+        if (w < wave) {
+            run += wave_totals[0][w];
+            first += wave_totals[1][w];
+        }
+        total += wave_totals[1][w];
+    }
+    for (int e = e0; e < e1; ++e) {
+        const int c = counts[e];
+        counts[e] = run;
+        offsets[e] = run;
+        const int slices = e < num_experts ? (c + group_routes - 1) / group_routes : 0;
+        for (int s = 0; s < slices && first + s < work_cap; ++s) work[first + s] = e * 65536 + s;
+        run += c;
+        first += slices;
+    }
+    if (tid == 0) offsets[num_experts + 1] = min(total, work_cap);
     __syncthreads();
 
-    for (int r = threadIdx.x; r < live; r += blockDim.x) {
-        int e = routes[base + r];
-        if (e < 0 || e >= num_experts) e = num_experts;
+#pragma unroll
+    for (int i = 0; i < kOrderHeld; ++i)
+        if (held[i] >= 0) order[counts[held[i]] + atomicAdd(fill + held[i], 1)] = base + tid + i * kOrderThreads;
+    for (int r = tid + kOrderHeld * kOrderThreads; r < live; r += kOrderThreads) {
+        const int e = bucket(r);
         order[counts[e] + atomicAdd(fill + e, 1)] = base + r;
     }
 }
@@ -486,9 +531,10 @@ __global__ __launch_bounds__(256) void moe_matmul_select_mlxu4(
 }
 
 // The grouped legs on the matrix core (bf16): one work item of up to MT
-// routes a block, 128 weight rows (grid (work cap, ⌈n / 128⌉), 256 threads).
+// routes a block, 32 weight rows a wave (grid (work cap, ⌈n / (32·waves)⌉),
+// kGroupWaves<MT> waves).
 template <int MT>
-__global__ __launch_bounds__(256) void moe_matmul_select_mxfp4_wmma(
+__global__ __launch_bounds__(kGroupWaves<MT>* kWave) void moe_matmul_select_mxfp4_wmma(
     const bf16* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const u8* __restrict__ codes, const u8* __restrict__ scales,
     const bf16* __restrict__ bias, bf16* __restrict__ out, int act_div, int n, int k, int num_experts,
@@ -505,7 +551,7 @@ __global__ __launch_bounds__(256) void moe_matmul_select_mxfp4_wmma(
 }
 
 template <int BITS, int GROUP, int MT>
-__global__ __launch_bounds__(256) void moe_matmul_select_mlxu4_wmma(
+__global__ __launch_bounds__(kGroupWaves<MT>* kWave) void moe_matmul_select_mlxu4_wmma(
     const bf16* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const u8* __restrict__ codes, const u8* __restrict__ scales,
     const u8* __restrict__ biases, bf16* __restrict__ out, int act_div, int n, int k, int num_experts,
@@ -522,6 +568,54 @@ __global__ __launch_bounds__(256) void moe_matmul_select_mlxu4_wmma(
     grouped_tile<GroupAffine<BITS, GROUP>, bf16, MT>(
         act, order, item.begin, item.count,
         {reinterpret_cast<const u32*>(c) + rows * (k * BITS / 32), reinterpret_cast<const bf16*>(s) + factors,
+         reinterpret_cast<const bf16*>(b) + factors},
+        nullptr, out, act_div, n, k);
+}
+
+// The batch legs (decode batches, bf16): one work item of up to MT routes a
+// block, 64·NBW weight rows (grid (work cap, ⌈n / (64·NBW)⌉), 256 threads).
+// A stage is 256 codes a row short of 32 routes, 128 at 32, so the
+// activation's two LDS buffers stay near 17 KB.
+constexpr int kBatchDepth = 3;
+
+template <int MT, int NBW>
+__global__ __launch_bounds__(256) void moe_matmul_select_mxfp4_batch(
+    const bf16* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
+    const i32* __restrict__ work, const u8* __restrict__ codes, const u8* __restrict__ scales,
+    const bf16* __restrict__ bias, bf16* __restrict__ out, int act_div, int n, int k, int num_experts,
+    const MoeGroupBases* __restrict__ bases, unsigned int* __restrict__ group_hits) {
+    GroupItem item;
+    if (!group_item(offsets, work, num_experts, MT, item)) return;
+    if (group_hits != nullptr && blockIdx.y == 0 && threadIdx.x == 0)
+        atomicAdd(group_hits, static_cast<unsigned>(item.count));
+    const u8* c = bases != nullptr ? bases->codes : codes;
+    const u8* s = bases != nullptr ? bases->scales : scales;
+    const long long rows = static_cast<long long>(item.expert) * n;
+    batch_tile<BatchMxfp4<MT == 32 ? 64 : 128>, bf16, MT, NBW, kBatchDepth>(
+        act, order, item.begin, item.count, {c + rows * (k / 2), s + rows * (k / 32)},
+        bias != nullptr ? bias + rows : nullptr, out, act_div, n, k);
+}
+
+template <int BITS, int GROUP, int MT, int NBW>
+__global__ __launch_bounds__(256) void moe_matmul_select_mlxu4_batch(
+    const bf16* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
+    const i32* __restrict__ work, const u8* __restrict__ codes, const u8* __restrict__ scales,
+    const u8* __restrict__ biases, bf16* __restrict__ out, int act_div, int n, int k, int num_experts,
+    const MoeGroupBases* __restrict__ bases, unsigned int* __restrict__ group_hits) {
+    static_assert(BITS == 4, "the batch leg reads four-bit codes");
+    constexpr int ROW_BYTES = MT < 32 || GROUP == 128 ? 128 : 64;
+    GroupItem item;
+    if (!group_item(offsets, work, num_experts, MT, item)) return;
+    if (group_hits != nullptr && blockIdx.y == 0 && threadIdx.x == 0)
+        atomicAdd(group_hits, static_cast<unsigned>(item.count));
+    const u8* c = bases != nullptr ? bases->codes : codes;
+    const u8* s = bases != nullptr ? bases->scales : scales;
+    const u8* b = bases != nullptr ? bases->biases : biases;
+    const long long rows = static_cast<long long>(item.expert) * n;
+    const long long factors = rows * (k / GROUP);
+    batch_tile<BatchAffine<GROUP, ROW_BYTES>, bf16, MT, NBW, kBatchDepth>(
+        act, order, item.begin, item.count,
+        {reinterpret_cast<const u32*>(c) + rows * (k / 8), reinterpret_cast<const bf16*>(s) + factors,
          reinterpret_cast<const bf16*>(b) + factors},
         nullptr, out, act_div, n, k);
 }
