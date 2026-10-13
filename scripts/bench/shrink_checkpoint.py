@@ -306,6 +306,10 @@ class Plan:
     engram_carve: "EngramCarve | None" = None
 
 
+# The top-k a Hy4 miniature's indexer ranks (see `_rewrite_hy_v4`).
+HY_V4_MINI_TOPK = 16
+
+
 def _text_cfg(cfg: dict, plan: Plan) -> dict:
     return cfg[plan.text_cfg_key] if plan.text_cfg_key else cfg
 
@@ -354,6 +358,21 @@ def _rewrite_glm(cfg: dict, plan: Plan) -> None:
         for key in ("kda_layers", "full_attn_layers"):
             if isinstance(lac.get(key), list):
                 lac[key] = [remap[s] for s in lac[key] if s in remap]
+
+
+def _rewrite_hy_v4(cfg: dict, plan: Plan) -> None:
+    _rewrite_common(cfg, plan)
+    for key in ("mlp_layer_types", "indexer_types", "layer_types"):
+        if isinstance(cfg.get(key), list):
+            cfg[key] = _slice_list(cfg[key], plan.src_layers)
+    # A "shared" indexer layer reads the last "full" layer's top-k.
+    it = cfg.get("indexer_types")
+    if isinstance(it, list) and it and it[0] != "full":
+        raise SystemExit("hy_v4: selected layer block must start on a 'full' indexer layer")
+    # The release ranks 2048 keys, past every sequence a parity probe holds;
+    # sixteen makes the indexer's choice (and the shared layers' reuse of it)
+    # part of what the miniature is read against.
+    cfg["index_topk"] = HY_V4_MINI_TOPK
 
 
 def _rewrite_dsv4(cfg: dict, plan: Plan) -> None:
@@ -1163,6 +1182,25 @@ FAMILIES: dict[str, dict[str, Any]] = {
         globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"),
         default_layers="0-6",
         config_rewrite=_rewrite_glm,
+    ),
+    # Hy4-preview: the routed bank stacked on dim 0 (`gate_up_proj` /
+    # `down_proj`, one plane each per layer). Layers 0-5: the dense layer, the
+    # three "full" indexer layers 0, 1 and 5 and the "shared" 2-4 that reuse
+    # layer 1's choice. The MTP head (`model.mtp_layers.`) is dropped.
+    "hy_v4": dict(
+        layer_prefix="model.layers.",
+        expert_re=None,
+        router_suffixes=(
+            "mlp.gate.weight",
+            "mlp.gate.e_score_correction_bias",
+            "mlp.experts.gate_up_proj",
+            "mlp.experts.down_proj",
+        ),
+        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
+                      "model.hc_head.hc_head_fn", "model.hc_head.hc_head_scale",
+                      "model.hc_head.hc_head_base"),
+        default_layers="0-5",
+        config_rewrite=_rewrite_hy_v4,
     ),
     # GLM-5.3-Flash as `mlx_lm` publishes it (Vontra/GLM-5.3-Flash-MLX-*): the
     # trunk under `model.language_model.layers.`, one affine trio per expert,
