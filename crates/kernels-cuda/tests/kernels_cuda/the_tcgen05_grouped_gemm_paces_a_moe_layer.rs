@@ -19,8 +19,8 @@ use crate::common::tc5::random;
 use crate::the_tcgen05_gemm_lands_and_paces_what_cublaslt_does::{BATCH, FLUSH, Timer, noise};
 use kernels_cuda::cudarc::runtime::sys as rt;
 use kernels_cuda::linear::tc5::{
-    Elem, GROUP_ALIGN, Grouped, Groups, Operand, Plan, atom_bytes, grouped_gemm_with,
-    masked_atom_bytes, supported,
+    Elem, Epilogue, GROUP_ALIGN, Glu, Grouped, Groups, Operand, Out, Plan, atom_bytes,
+    grouped_gemm_epi, grouped_gemm_with, masked_atom_bytes, supported,
 };
 
 /// Each token's `top` distinct experts: uniform, or skewed so the first
@@ -227,6 +227,52 @@ fn layer(name: &str, experts: usize, top: usize, [n, k]: [usize; 2], kind: Kind)
                     us,
                     flops / us * 1e-6
                 ));
+                // A gate_up's fused form: the SwiGLU of the halves, landed as
+                // the down projection's quantized operand.
+                if name.contains("gate_up") {
+                    let inter = n / 2;
+                    let scale_rows = match groups[0] {
+                        Groups::Masked { m_max, .. } => {
+                            experts * (m_max as usize).next_multiple_of(128)
+                        }
+                        Groups::Contiguous { .. } => rows,
+                    };
+                    let out = if kind.act.0 == Elem::E2m1 {
+                        Out::Nvfp4 {
+                            data: gpu.zeros(rows * inter / 2),
+                            scales: gpu.zeros(atom_bytes(scale_rows, inter, 16)),
+                            gscale: 1.0,
+                        }
+                    } else {
+                        Out::Fp8Block {
+                            data: gpu.zeros(rows * inter),
+                            scales: gpu.zeros(atom_bytes(scale_rows, inter, 128)),
+                        }
+                    };
+                    let epi = Epilogue {
+                        glu: Some(Glu::Swiglu),
+                        out,
+                        row_scale: 0,
+                    };
+                    let fused = |i: usize| {
+                        grouped_gemm_epi(
+                            &ctx,
+                            act,
+                            w,
+                            0,
+                            grouped(i),
+                            [inter as u32, k as u32],
+                            1.0,
+                            epi,
+                            routed as u32,
+                        )
+                    };
+                    let us = match fused(0) {
+                        Ok(()) => timer.median(|i| fused(i).expect("fires again")),
+                        Err(why) => panic!("{name} {} fused: {why}", kind.name),
+                    };
+                    cells.push(format!("+swiglu+quant {us:.1}us"));
+                }
             }
             let busiest = routings
                 .iter()

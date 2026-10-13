@@ -437,7 +437,8 @@ impl Epilogue {
     }
 
     /// Fits a plan to the epilogue: an unswapped GLU tile is gate 128 | up
-    /// 128, a swapped one at most 128 wide, and nothing splits K past a GLU.
+    /// 128, a swapped one at most 128 wide (more Q tiles past it), and
+    /// nothing splits K past a GLU.
     fn fit(&self, mut plan: Plan) -> Result<Plan, Error> {
         if self.glu.is_none() {
             if self.out != Out::Bf16 {
@@ -447,7 +448,9 @@ impl Epilogue {
         }
         if plan.swap {
             if plan.bn > 128 {
-                return Err(refuse(OP, "a swapped GLU tile is at most 128 wide"));
+                // Two accumulators of 128 fill a stage's TMEM: wider rows take
+                // more Q tiles.
+                plan.bn = 128;
             }
         } else {
             plan.bn = 256;
@@ -788,10 +791,10 @@ pub fn grouped_gemm_epi_with(
             }
         }
         Groups::Masked { counts, m_max } => {
-            if !plan.swap || plan.pair || plan.bn < m_max.min(256) || m_max > 256 {
+            if !plan.swap || plan.pair || m_max > 256 {
                 return Err(refuse(
                     OP,
-                    "a masked group runs swapped on lone CTAs, its Q tile its m_max <= 256",
+                    "a masked group runs swapped on lone CTAs, m_max <= 256",
                 ));
             }
             if m_max == 0 {

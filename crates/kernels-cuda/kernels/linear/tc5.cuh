@@ -725,19 +725,60 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                     h[j] *= rs;
                 }
             };
-            // DeepSeek's 1x128 block of an unswapped row spans the tile's four
-            // chunks: a first pass finds its amax.
-            float row_amax = 0.f;
+            // DeepSeek's 1x128 block of an unswapped row is the tile's four
+            // chunks: held in registers, its amax known once they are read.
             if constexpr (kOut == 1 && !kSwap) {
-#pragma unroll 1
+                const bool reverse = kOv > 0 && acc == 0;
+                auto col = [&](u32 chunk) { return reverse ? 32 * (kChunks - 1 - chunk) : 32 * chunk; };
+                float hall[kChunks][32];
+                float amax = 0.f;
+#pragma unroll
                 for (u32 chunk = 0; chunk < kChunks; ++chunk) {
-                    float h[32];
-                    product(32 * chunk, h);
+                    product(col(chunk), hall[chunk]);
+                    if (kOv > 0 && chunk + 1 == kOvChunks) {
+                        tc_fence_before();
+                        __syncwarp();
+                        if (lane == 0) {
+                            arrive_leader(&tover[acc]);
+                        }
+                    }
+                    if (chunk + 1 == kChunks) {
+                        tc_fence_before();
+                        __syncwarp();
+                        if (lane == 0) {
+                            arrive_leader(&tempty[acc]);
+                        }
+                    }
 #pragma unroll
                     for (int j = 0; j < 32; ++j) {
-                        row_amax = fmaxf(row_amax, fabsf(h[j]));
+                        amax = fmaxf(amax, fabsf(hall[chunk][j]));
                     }
                 }
+                if (live && x.lim_q > 0) {
+                    const int ce = tc5k::ue8m0_exponent(amax);
+#pragma unroll
+                    for (u32 chunk = 0; chunk < kChunks; ++chunk) {
+                        const float(&h)[32] = hall[chunk];
+                        u32 w[8];
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            float e[4];
+#pragma unroll
+                            for (int b = 0; b < 4; ++b) {
+                                e[b] = fminf(fmaxf(ldexpf(h[4 * j + b], -ce), -448.f), 448.f);
+                            }
+                            w[j] = static_cast<u32>(tc5k::e4m3x2(e[0], e[1])) |
+                                   (static_cast<u32>(tc5k::e4m3x2(e[2], e[3])) << 16);
+                        }
+                        uint4* out = reinterpret_cast<uint4*>(
+                            epi.q + static_cast<size_t>(p) * inter + x.out_q + col(chunk));
+                        out[0] = make_uint4(w[0], w[1], w[2], w[3]);
+                        out[1] = make_uint4(w[4], w[5], w[6], w[7]);
+                    }
+                    epi.qs[tc5k::atom_at(x.s_row + i, x.out_q / 128, inter / 128)] =
+                        static_cast<unsigned char>(ce + 127);
+                }
+                continue;
             }
             // The shared columns go first: stage 0 drains tail first, stage
             // 1 head first, and the next tile's MMA starts once they are read.
@@ -841,29 +882,6 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                             if (j0 + j < x.lim_q) {
                                 y[static_cast<size_t>(q0 + j) * ldy + p] = f32_to_bf16(h[j]);
                             }
-                        }
-                    }
-                } else if constexpr (kOut == 1) {
-                    // A row's 32 e4m3 bytes; its scale once a tile.
-                    if (live && j0 < x.lim_q) {
-                        const int ce = tc5k::ue8m0_exponent(row_amax);
-                        u32 w[8];
-#pragma unroll
-                        for (int j = 0; j < 8; ++j) {
-                            const float a = fminf(fmaxf(ldexpf(h[4 * j], -ce), -448.f), 448.f);
-                            const float b = fminf(fmaxf(ldexpf(h[4 * j + 1], -ce), -448.f), 448.f);
-                            const float c = fminf(fmaxf(ldexpf(h[4 * j + 2], -ce), -448.f), 448.f);
-                            const float d = fminf(fmaxf(ldexpf(h[4 * j + 3], -ce), -448.f), 448.f);
-                            w[j] = static_cast<u32>(tc5k::e4m3x2(a, b)) |
-                                   (static_cast<u32>(tc5k::e4m3x2(c, d)) << 16);
-                        }
-                        uint4* out = reinterpret_cast<uint4*>(
-                            epi.q + static_cast<size_t>(p) * inter + q0);
-                        out[0] = make_uint4(w[0], w[1], w[2], w[3]);
-                        out[1] = make_uint4(w[4], w[5], w[6], w[7]);
-                        if (c0 == 0) {
-                            epi.qs[tc5k::atom_at(x.s_row + i, x.out_q / 128, inter / 128)] =
-                                static_cast<unsigned char>(ce + 127);
                         }
                     }
                 } else if constexpr (kOut == 2) {
