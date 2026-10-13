@@ -243,7 +243,7 @@ const fn atoms_k(kind: Kind, gran: u32) -> u32 {
 
 /// The dynamic shared memory the kernel lays out, mirrored from it, plus
 /// the 1024 bytes it may spend aligning the ring.
-const fn smem_bytes(kind: Kind, gran_p: u32, gran_q: u32, plan: Plan) -> u32 {
+const fn smem_bytes(kind: Kind, gran_p: u32, gran_q: u32, plan: Plan, pt: u32) -> u32 {
     let Plan {
         swap,
         pair,
@@ -251,12 +251,12 @@ const fn smem_bytes(kind: Kind, gran_p: u32, gran_q: u32, plan: Plan) -> u32 {
         stages,
         ..
     } = plan;
-    let stage = 128 * 128
+    let stage = 128 * 128 * pt
         + bn / if pair { 2 } else { 1 } * 128
-        + atoms_k(kind, gran_p) * 512
+        + atoms_k(kind, gran_p) * 512 * pt
         + atoms_k(kind, gran_q) * bn.div_ceil(128) * 512;
     let out = (stages * stage).div_ceil(1024) * 1024;
-    let bar = out + if swap { 0 } else { 4 * 2 * 2048 };
+    let bar = out + if swap { 1024 } else { 4 * 2 * 2048 };
     // The routing a grouped launch holds is reserved for every launch.
     bar + (2 * stages + 16) * 8 + 8 + MAX_ROUTES * 8 + 1024
 }
@@ -329,9 +329,10 @@ impl Plan {
         }
     }
 
-    fn staged(mut self, kind: Kind, gran_p: u32, gran_q: u32) -> Self {
+    fn staged(mut self, kind: Kind, gran_p: u32, gran_q: u32, pt: u32) -> Self {
         let mut stages = 8;
-        while stages > 2 && smem_bytes(kind, gran_p, gran_q, Self { stages, ..self }) > SMEM_CAP {
+        while stages > 2 && smem_bytes(kind, gran_p, gran_q, Self { stages, ..self }, pt) > SMEM_CAP
+        {
             stages -= 1;
         }
         self.stages = stages;
@@ -363,13 +364,184 @@ pub fn gemm_with(
     alpha: f32,
     plan: Plan,
 ) -> Result<(), Error> {
+    gemm_epi_with(ctx, act, w, y, [m, n, k], alpha, Epilogue::STORE, plan)
+}
+
+/// A gate/up pair's activation, the epilogue reads off the product.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Glu {
+    /// `silu(g) * u` (`mlp_swiglu`).
+    Swiglu,
+    /// `silu(min(g, limit)) * clamp(u, ±limit)` (`mlp_swiglu_clamp`).
+    SwigluClamp { limit: f32 },
+    /// `(clamp(u, ±limit) + 1) * g' * sigmoid(alpha * g')`, `g' = min(g,
+    /// limit)` (`mlp_swiglu_clamp_alpha`).
+    SwigluClampAlpha { limit: f32, alpha: f32 },
+}
+
+/// Where the epilogue lands its `rows x n` result.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Out {
+    /// bf16 at `y`, row stride `n`.
+    Bf16,
+    /// The next GEMM's fp8 operand: e4m3 `[rows][n]` at `data`, and a ue8m0
+    /// scale a 1x128 block (`2^ceil(log2(max(amax, 1e-4) / 448))`, values
+    /// clamped to ±448) in the atom layout at `scales`, `n / 128` columns.
+    /// Needs a GLU and `n % 128 == 0`.
+    Fp8Block { data: u64, scales: u64 },
+    /// The next GEMM's NVFP4 operand: e2m1 `[rows][n / 2]` at `data`, and a
+    /// ue4m3 scale a 16 (`e4m3(gscale * amax / 6)`, vLLM's and modelopt's)
+    /// in the atom layout at `scales`, `n / 16` columns. `gscale` is the
+    /// global scale, `1 / input_scale`; the next GEMM's alpha carries
+    /// `input_scale`. Needs a GLU and `n % 128 == 0`.
+    Nvfp4 { data: u64, scales: u64, gscale: f32 },
+}
+
+/// What the epilogue does past `alpha * act . w^T`.
+///
+/// With a GLU the weight holds the gate's `n` rows, then the up's `n`
+/// (each expert's so, in a bank), and the output is `rows x n`. Output rows
+/// index scales as the activation would: a masked group's pad each expert to
+/// whole 128-row blocks ([`masked_atom_offset`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Epilogue {
+    pub glu: Option<Glu>,
+    pub out: Out,
+    /// A device `f32` a output row multiplying it last (the routed weight
+    /// in a down projection's epilogue), or 0.
+    pub row_scale: u64,
+}
+
+impl Epilogue {
+    pub const STORE: Self = Self {
+        glu: None,
+        out: Out::Bf16,
+        row_scale: 0,
+    };
+
+    const fn glu_code(&self) -> u32 {
+        match self.glu {
+            None => 0,
+            Some(Glu::Swiglu) => 1,
+            Some(Glu::SwigluClamp { .. }) => 2,
+            Some(Glu::SwigluClampAlpha { .. }) => 3,
+        }
+    }
+
+    const fn out_code(&self) -> u32 {
+        match self.out {
+            Out::Bf16 => 0,
+            Out::Fp8Block { .. } => 1,
+            Out::Nvfp4 { .. } => 2,
+        }
+    }
+
+    /// Fits a plan to the epilogue: an unswapped GLU tile is gate 128 | up
+    /// 128, a swapped one at most 128 wide, and nothing splits K past a GLU.
+    fn fit(&self, mut plan: Plan) -> Result<Plan, Error> {
+        if self.glu.is_none() {
+            if self.out != Out::Bf16 {
+                return Err(refuse(OP, "a quantized store follows a GLU"));
+            }
+            return Ok(plan);
+        }
+        if plan.swap {
+            if plan.bn > 128 {
+                return Err(refuse(OP, "a swapped GLU tile is at most 128 wide"));
+            }
+        } else {
+            plan.bn = 256;
+        }
+        plan.splits = 1;
+        Ok(plan)
+    }
+
+    fn args(&self, n: u32, pad: u32) -> EpiArgs {
+        let (limit, galpha) = match self.glu {
+            Some(Glu::SwigluClamp { limit }) => (limit, 1.0),
+            Some(Glu::SwigluClampAlpha { limit, alpha }) => (limit, alpha),
+            _ => (0.0, 1.0),
+        };
+        let (q, qs, gscale) = match self.out {
+            Out::Bf16 => (0, 0, 1.0),
+            Out::Fp8Block { data, scales } => (data, scales, 1.0),
+            Out::Nvfp4 {
+                data,
+                scales,
+                gscale,
+            } => (data, scales, gscale),
+        };
+        EpiArgs {
+            inter: i32::try_from(n).unwrap_or(i32::MAX),
+            limit,
+            galpha,
+            q,
+            qs,
+            gscale,
+            row_scale: self.row_scale,
+            pad: i32::try_from(pad).unwrap_or(i32::MAX),
+        }
+    }
+}
+
+/// The kernel's `Epi`, field for field.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct EpiArgs {
+    inter: i32,
+    limit: f32,
+    galpha: f32,
+    q: u64,
+    qs: u64,
+    gscale: f32,
+    row_scale: u64,
+    pad: i32,
+}
+
+/// `y = epilogue(alpha * act . w^T)` for `[m, n, k]`, `n` the output's
+/// columns, choosing the plan.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_epi(
+    ctx: &Ctx,
+    act: Operand,
+    w: Operand,
+    y: u64,
+    [m, n, k]: [u32; 3],
+    alpha: f32,
+    epi: Epilogue,
+) -> Result<(), Error> {
+    let sms = ctx.multiprocessors().unwrap_or(148);
+    let plan = Plan::choose(m, if epi.glu.is_some() { 2 * n } else { n }, k, sms);
+    gemm_epi_with(ctx, act, w, y, [m, n, k], alpha, epi, plan)
+}
+
+/// As [`gemm_epi`], under a stated plan.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_epi_with(
+    ctx: &Ctx,
+    act: Operand,
+    w: Operand,
+    y: u64,
+    [m, n, k]: [u32; 3],
+    alpha: f32,
+    epi: Epilogue,
+    plan: Plan,
+) -> Result<(), Error> {
     if m == 0 || n == 0 {
         return Ok(());
     }
+    let plan = epi.fit(plan)?;
     let kind = admit(act, w, n, k, plan)?;
+    let glu = epi.glu.is_some();
+    if glu && !n.is_multiple_of(128) {
+        return Err(refuse(OP, "a GLU's gate rows are whole 128-row blocks"));
+    }
+    let w_rows = if glu { 2 * n } else { n };
     let (p, q) = if plan.swap { (w, act) } else { (act, w) };
     let (rows_p, rows_q) = if plan.swap { (n, m) } else { (m, n) };
+    let (map_p, map_q) = if plan.swap { (w_rows, m) } else { (m, w_rows) };
     let ctas = if plan.pair { 2 } else { 1 };
+    let q_step = if glu && !plan.swap { 128 } else { plan.bn };
     launch(
         ctx,
         Job {
@@ -378,10 +550,13 @@ pub fn gemm_with(
             p,
             q,
             rows: [rows_p, rows_q],
-            scale_rows: [rows_p, rows_q],
+            map_rows: [map_p, map_q],
+            scale_rows: [map_p, map_q],
             y_rows: m,
-            tiles: rows_p.div_ceil(128 * ctas) * rows_q.div_ceil(plan.bn),
+            tiles: rows_p.div_ceil(128 * ctas) * rows_q.div_ceil(q_step),
             group: Group::NONE,
+            epi,
+            pad: 0,
         },
         y,
         [n, k],
@@ -504,13 +679,10 @@ pub fn grouped_gemm(
     alpha: f32,
     routed: u32,
 ) -> Result<(), Error> {
-    let sms = ctx.multiprocessors().unwrap_or(148);
-    let plan = Plan::grouped(&g, n, k, routed, sms);
-    grouped_gemm_with(ctx, act, w, y, g, [n, k], alpha, plan)
+    grouped_gemm_epi(ctx, act, w, y, g, [n, k], alpha, Epilogue::STORE, routed)
 }
 
-/// As [`grouped_gemm`], under a stated plan: unswapped and lone for a
-/// contiguous group, swapped and lone for a masked one.
+/// As [`grouped_gemm_epi`] with no epilogue past the product.
 #[allow(clippy::too_many_arguments)]
 pub fn grouped_gemm_with(
     ctx: &Ctx,
@@ -522,9 +694,51 @@ pub fn grouped_gemm_with(
     alpha: f32,
     plan: Plan,
 ) -> Result<(), Error> {
+    grouped_gemm_epi_with(ctx, act, w, y, g, [n, k], alpha, Epilogue::STORE, plan)
+}
+
+/// [`grouped_gemm`] under an epilogue: `n` the output's columns, a GLU's
+/// bank `[experts][2n][k]` (each expert's gate rows, then its up rows).
+#[allow(clippy::too_many_arguments)]
+pub fn grouped_gemm_epi(
+    ctx: &Ctx,
+    act: Operand,
+    w: Operand,
+    y: u64,
+    g: Grouped,
+    [n, k]: [u32; 2],
+    alpha: f32,
+    epi: Epilogue,
+    routed: u32,
+) -> Result<(), Error> {
+    let sms = ctx.multiprocessors().unwrap_or(148);
+    let plan = Plan::grouped(&g, n, k, routed, sms);
+    grouped_gemm_epi_with(ctx, act, w, y, g, [n, k], alpha, epi, plan)
+}
+
+/// As [`grouped_gemm_epi`], under a stated plan: unswapped and lone for a
+/// contiguous group, swapped and lone for a masked one.
+#[allow(clippy::too_many_arguments)]
+pub fn grouped_gemm_epi_with(
+    ctx: &Ctx,
+    act: Operand,
+    w: Operand,
+    y: u64,
+    g: Grouped,
+    [n, k]: [u32; 2],
+    alpha: f32,
+    epi: Epilogue,
+    plan: Plan,
+) -> Result<(), Error> {
     if g.experts == 0 || n == 0 {
         return Ok(());
     }
+    let plan = epi.fit(plan)?;
+    let glu = epi.glu.is_some();
+    if glu && !n.is_multiple_of(128) {
+        return Err(refuse(OP, "a GLU's gate rows are whole 128-row blocks"));
+    }
+    let n_per = if glu { 2 * n } else { n };
     if g.experts >= MAX_ROUTES {
         return Err(refuse(
             OP,
@@ -541,7 +755,8 @@ pub fn grouped_gemm_with(
             "a scaled bank's experts are whole 128-row blocks",
         ));
     }
-    let bank = g.experts * n;
+    let bank = g.experts * n_per;
+    let q_step = if glu { 128 } else { plan.bn };
     let job = match g.groups {
         Groups::Contiguous { offsets, rows } => {
             if plan.swap || plan.pair {
@@ -556,17 +771,20 @@ pub fn grouped_gemm_with(
                 p: act,
                 q: w,
                 rows: [rows, bank],
+                map_rows: [rows, bank],
                 scale_rows: [rows, bank],
                 y_rows: rows,
-                tiles: rows.div_ceil(128) * n.div_ceil(plan.bn),
+                tiles: rows.div_ceil(128) * n.div_ceil(q_step),
                 group: Group {
                     mode: 1,
                     ptr: offsets,
                     experts: g.experts,
-                    n,
+                    n: n_per,
                     m_max: 0,
                     alpha_e: g.alpha_e,
                 },
+                epi,
+                pad: 0,
             }
         }
         Groups::Masked { counts, m_max } => {
@@ -585,6 +803,7 @@ pub fn grouped_gemm_with(
                 p: w,
                 q: act,
                 rows: [bank, g.experts * m_max],
+                map_rows: [bank, g.experts * m_max],
                 scale_rows: [bank, g.experts * m_max.div_ceil(128) * 128],
                 y_rows: g.experts * m_max,
                 tiles: g.experts * n.div_ceil(128) * m_max.div_ceil(plan.bn),
@@ -592,10 +811,12 @@ pub fn grouped_gemm_with(
                     mode: 2,
                     ptr: counts,
                     experts: g.experts,
-                    n,
+                    n: n_per,
                     m_max,
                     alpha_e: g.alpha_e,
                 },
+                epi,
+                pad: m_max.div_ceil(128) * 128,
             }
         }
     };
@@ -661,26 +882,44 @@ struct Job {
     plan: Plan,
     p: Operand,
     q: Operand,
+    /// The kernel's extents: rows of P and Q it tiles (a GLU's output
+    /// columns on the weight side).
     rows: [u32; 2],
+    /// The P and Q tensors' rows, and their scale tensors'.
+    map_rows: [u32; 2],
     scale_rows: [u32; 2],
     y_rows: u32,
     tiles: u32,
     group: Group,
+    epi: Epilogue,
+    /// A masked group's scale rows an expert.
+    pad: u32,
 }
 
 fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(), Error> {
     let Job {
-        kind, p, q, group, ..
+        kind,
+        p,
+        q,
+        group,
+        epi,
+        ..
     } = job;
+    let glu = epi.glu.is_some();
+    // A GLU swapped reads two weight tiles a stage; unswapped, its Q tile
+    // comes in two 128-row halves.
+    let pt = if glu && job.plan.swap { 2 } else { 1 };
+    let halves = glu && !job.plan.swap;
     let gran = |o: Operand| o.scales.map_or(128, |s| s.gran);
-    let plan = job.plan.staged(kind, gran(p), gran(q));
-    let smem = smem_bytes(kind, gran(p), gran(q), plan);
+    let plan = job.plan.staged(kind, gran(p), gran(q), pt);
+    let smem = smem_bytes(kind, gran(p), gran(q), plan, pt);
     let ctas = if plan.pair { 2 } else { 1 };
     let [rows_p, rows_q] = job.rows;
 
-    let map_p = tensor_map(kind, p, rows_p, k, 128)?;
-    let map_q = tensor_map(kind, q, rows_q, k, plan.bn / ctas)?;
-    let map_y = if plan.swap {
+    let map_p = tensor_map(kind, p, job.map_rows[0], k, 128)?;
+    let q_box = if halves { 128 } else { plan.bn / ctas };
+    let map_q = tensor_map(kind, q, job.map_rows[1], k, q_box)?;
+    let map_y = if plan.swap || epi.out != Out::Bf16 {
         [0; 16]
     } else {
         output_map(y, job.y_rows, n)?
@@ -690,7 +929,9 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
         None => Ok([0; 16]),
     };
     let map_sfp = atoms(p, job.scale_rows[0], 1)?;
-    let map_sfq = atoms(q, job.scale_rows[1], plan.bn.div_ceil(128))?;
+    let q_blocks = if halves { 1 } else { plan.bn.div_ceil(128) };
+    let map_sfq = atoms(q, job.scale_rows[1], q_blocks)?;
+    let epi_args = epi.args(n, job.pad);
     let sms = ctx.multiprocessors().unwrap_or(148);
     // Too few tiles to fill the SMs split K, each split keeping four K steps
     // or more to pipeline; the splits sum in f32 and one pass rounds.
@@ -713,7 +954,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     let units = job.tiles * splits;
     let grid = ctas * units.min(sms / ctas).max(1);
     let entry = symbol(&format!(
-        "::pie::linear::tc5_gemm<{}, {}, {}, {}, {}, {}, {}, {}, {ctas}, {}>",
+        "::pie::linear::tc5_gemm<{}, {}, {}, {}, {}, {}, {}, {}, {ctas}, {}, {}, {}>",
         kind.code(),
         kind.format(p.elem),
         kind.format(q.elem),
@@ -723,6 +964,8 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
         plan.stages,
         u32::from(plan.swap),
         group.mode,
+        epi.glu_code(),
+        epi.out_code(),
     ));
     let map = |m: &[u64; 16]| ArgValue::Bytes {
         ptr: m.as_ptr().cast(),
@@ -747,6 +990,10 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
         ArgValue::I32(int(group.n)?),
         ArgValue::I32(int(group.m_max)?),
         ArgValue::Ptr(group.alpha_e),
+        ArgValue::Bytes {
+            ptr: (&raw const epi_args).cast(),
+            len: core::mem::size_of::<EpiArgs>(),
+        },
     ];
     ctx.fire(
         OP,
@@ -1060,9 +1307,9 @@ mod tests {
                     stages: 0,
                     splits: 0,
                 }
-                .staged(kind, g, g);
+                .staged(kind, g, g, 1);
                 assert!(plan.stages >= 3, "{kind:?} bn={bn}: {plan:?}");
-                assert!(smem_bytes(kind, g, g, plan) <= SMEM_CAP);
+                assert!(smem_bytes(kind, g, g, plan, 1) <= SMEM_CAP);
             }
         }
     }

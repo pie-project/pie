@@ -68,22 +68,120 @@ __host__ __device__ constexpr unsigned pow2_cols(unsigned n) {
 
 }  // namespace tc5k
 
+// What the epilogue does past the product (host mirror: tc5.rs `EpiArgs`).
+struct Epi {
+    int inter;               // a GLU's output columns (its gate rows; up rows follow)
+    float limit, galpha;     // the clamp variants' limit, clamp_alpha's alpha
+    unsigned char* q;        // the quantized output, [rows][inter] (fp4: inter / 2)
+    unsigned char* qs;       // its scale atoms, cols inter / 128 (fp8) or / 16 (fp4)
+    float gscale;            // NVFP4's global scale, 1 / input_scale
+    const float* row_scale;  // a weight each output row (routed), or null
+    int pad;                 // masked: scale rows an expert; 0 otherwise
+};
+
+namespace tc5k {
+
+// The GLUs pie's MLPs use, over a gate and an up value.
+template <int kGlu>
+__device__ __forceinline__ float glu(float g, float u, float limit, float galpha) {
+    if constexpr (kGlu == 1) {
+        return g / (1.f + __expf(-g)) * u;
+    } else {
+        g = fminf(g, limit);
+        u = fminf(fmaxf(u, -limit), limit);
+        if constexpr (kGlu == 2) {
+            return g / (1.f + expf(-g)) * u;
+        } else {
+            return (u + 1.f) * (g / (1.f + expf(-galpha * g)));
+        }
+    }
+}
+
+// DeepSeek's 1x128 ue8m0 scale for a block whose largest magnitude is
+// amax: 2^ceil(log2(max(amax, 1e-4) / 448)), as its exponent.
+__device__ __forceinline__ int ue8m0_exponent(float amax) {
+    int e;
+    const float m = frexpf(fmaxf(amax, 1e-4f) / 448.f, &e);
+    return m == 0.5f ? e - 1 : e;
+}
+
+__device__ __forceinline__ unsigned short e4m3x2(float lo, float hi) {
+    unsigned short r;
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"(hi), "f"(lo));
+    return r;
+}
+
+__device__ __forceinline__ unsigned e2m1x8(const float (&v)[8]) {
+    unsigned r;
+    asm("{\n\t.reg .b8 b0, b1, b2, b3;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b0, %2, %1;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b1, %4, %3;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b2, %6, %5;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b3, %8, %7;\n\t"
+        "mov.b32 %0, {b0, b1, b2, b3};\n\t}"
+        : "=r"(r)
+        : "f"(v[0]), "f"(v[1]), "f"(v[2]), "f"(v[3]), "f"(v[4]), "f"(v[5]), "f"(v[6]), "f"(v[7]));
+    return r;
+}
+
+__device__ __forceinline__ float rcp_approx(float a) {
+    float r;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a));
+    return r;
+}
+
+// NVFP4's block scale (vLLM / modelopt): e4m3(gscale * amax / 6), and the
+// factor its 16 values are multiplied by before rounding to e2m1.
+__device__ __forceinline__ unsigned char nvfp4_scale(float amax, float gscale, float& out) {
+    const float sf = gscale * (amax * rcp_approx(6.f));
+    const unsigned short pair = e4m3x2(sf, 0.f);
+    const unsigned char code = static_cast<unsigned char>(pair & 0xff);
+    unsigned short wide = code;
+    float back;
+    asm("{\n\t.reg .b32 h;\n\t.reg .b16 lo, hi;\n\tcvt.rn.f16x2.e4m3x2 h, %1;\n\t"
+        "mov.b32 {lo, hi}, h;\n\tcvt.f32.f16 %0, lo;\n\t}"
+        : "=f"(back)
+        : "h"(wide));
+    out = back != 0.f ? rcp_approx(back * rcp_approx(gscale)) : 0.f;
+    return code;
+}
+
+// The byte of scale (row, col) in an atom-layout tensor of `cols` columns.
+__device__ __forceinline__ size_t atom_at(int row, int col, int cols) {
+    const int atoms_k = (cols + 3) / 4;
+    return static_cast<size_t>((row / 128) * atoms_k + col / 4) * 512 + (row % 32) * 16 +
+           ((row / 32) % 4) * 4 + col % 4;
+}
+
+}  // namespace tc5k
+
 template <int kKind, int kFmtP, int kFmtQ, int kGranP, int kGranQ, int kBN, int kStages,
-          int kSwap, int kPair, int kGroup>
+          int kSwap, int kPair, int kGroup, int kGlu, int kOut>
 __global__ __launch_bounds__(224, 1) void tc5_gemm(
     const __grid_constant__ tc5::TmaMap map_p, const __grid_constant__ tc5::TmaMap map_q,
     const __grid_constant__ tc5::TmaMap map_y, const __grid_constant__ tc5::TmaMap map_sfp,
     const __grid_constant__ tc5::TmaMap map_sfq, bf16* __restrict__ y, int rows_p, int rows_q,
     int k, int ldy, float alpha, float* __restrict__ part, int splits,
     const int* __restrict__ group, int experts, int n_per, int m_max,
-    const float* __restrict__ alpha_e) {
+    const float* __restrict__ alpha_e, Epi epi) {
     using namespace tc5;
     static_assert(kBN % 32 == 0 && kBN >= 32 && kBN <= 256, "the Q tile is 32..256 rows");
     static_assert(kKind >= 0 && kKind <= 3, "four kinds");
     static_assert(kPair == 1 || (kPair == 2 && !kSwap && kBN >= 64), "a pair splits a wide Q");
     static_assert(kGroup == 0 || (kPair == 1 && (kGroup == 1) == !kSwap),
                   "contiguous groups run unswapped, masked swapped, both on lone CTAs");
+    static_assert(kGlu == 0 || kSwap || kBN == 256, "an unswapped GLU tile is gate 128 | up 128");
+    static_assert(kGlu == 0 || !kSwap || kBN <= 128, "a swapped GLU tile holds two accumulators");
+    static_assert(kOut == 0 || kGlu != 0, "a quantized store follows a GLU");
 
+    // A GLU tile reads the weight's gate rows and the matching up rows `inter`
+    // further on, side by side: unswapped as the two halves of the Q tile,
+    // swapped as two P tiles into two accumulators.
+    constexpr bool kFused = kGlu != 0;
+    constexpr u32 kPT = kFused && kSwap ? 2 : 1;
+    constexpr u32 kAccN = kBN * kPT;
+    constexpr u32 kQStep = kFused && !kSwap ? 128 : kBN;  // output columns a Q tile
+    const int inter = epi.inter;
     constexpr u32 kM = 128 * kPair;
     constexpr u32 kQRows = kBN / kPair;
     constexpr u32 kStageK = tc5k::stage_k(kKind);
@@ -99,10 +197,10 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     constexpr u32 kAtomsP = tc5k::atoms_k(kKind, kGranP);
     constexpr u32 kAtomsQ = tc5k::atoms_k(kKind, kGranQ);
     constexpr u32 kRowAtomsQ = (kBN + 127) / 128;
-    constexpr u32 kSfP = kAtomsP * 512;               // this CTA's P rows
+    constexpr u32 kSfP = kAtomsP * 512 * kPT;         // this CTA's P rows (each P tile's)
     constexpr u32 kSfQ = kAtomsQ * kRowAtomsQ * 512;  // all of Q's rows, in each CTA
-    constexpr u32 kTx = kPair * (kTxP + kTxQ + kSfP + kSfQ);
-    constexpr u32 kSfCols = 4 * kAtomsP + 4 * kAtomsQ * kRowAtomsQ;
+    constexpr u32 kTx = kPair * (kTxP * kPT + kTxQ + kSfP + kSfQ);
+    constexpr u32 kSfCols = 4 * kAtomsP * kPT + 4 * kAtomsQ * kRowAtomsQ;
     // Scales go to TMEM from their own warp, up to four K steps ahead in
     // their own slots: a copy in the MMA thread's stream would hold every
     // MMA behind it until it lands, and a shallower ring would hold the
@@ -113,20 +211,22 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     // TMEM the stages share kOv columns -- stage 0's tail is stage 1's head --
     // and a tile's first MMA waits until the previous tile's epilogue has
     // read them. The scale slots sit past both stages.
-    constexpr u32 kOvRaw = 2 * kBN + kSfAll > 512 ? 2 * kBN + kSfAll - 512 : 0;
+    constexpr u32 kOvRaw = 2 * kAccN + kSfAll > 512 ? 2 * kAccN + kSfAll - 512 : 0;
     constexpr u32 kOv = (kOvRaw + 15) / 16 * 16;
     constexpr u32 kOvChunks = (kOv + 31) / 32;
-    constexpr u32 kStride = kBN - kOv;
-    constexpr u32 kCols = tc5k::pow2_cols(kStride + kBN + kSfAll);
+    constexpr u32 kStride = kAccN - kOv;
+    constexpr u32 kCols = tc5k::pow2_cols(kStride + kAccN + kSfAll);
     static_assert(kCols <= 512, "TMEM is 512 columns");
 
-    constexpr u32 kOffQ = kStages * kTileP;
+    constexpr u32 kOffQ = kStages * kTileP * kPT;
     constexpr u32 kOffSfP = kOffQ + kStages * kTileQ;
     constexpr u32 kOffSfQ = kOffSfP + kStages * kSfP;
     // Each epilogue warp stages two 32 x 32 bf16 boxes for the TMA store.
     constexpr u32 kOffOut = (kOffSfQ + kStages * kSfQ + 1023) / 1024 * 1024;
-    constexpr u32 kOut = kSwap ? 0 : 4 * 2 * 2048;
-    constexpr u32 kOffBar = kOffOut + kOut;
+    // A swapped GLU quantizing over the P rows reduces its amax through
+    // shared memory instead.
+    constexpr u32 kOutBytes = kSwap ? (kOut != 0 ? 1024 : 0) : 4 * 2 * 2048;
+    constexpr u32 kOffBar = kOffOut + kOutBytes;
     // A grouped launch holds the routing (offsets or counts) in shared memory:
     // every role reads it once a unit, empty units most.
     constexpr u32 kGroupInts = kGroup == 0 ? 0 : 2 * 1028;
@@ -186,7 +286,9 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     // A masked launch counts each expert's tiles up front, so units map
     // straight onto the busy experts: walking empty ones costs every role
     // a unit's bookkeeping each.
-    const int masked_p = (n_per + 127) / 128;
+    // An expert's output columns: its bank rows, or a GLU's gate rows.
+    const int span = kFused ? inter : n_per;
+    const int masked_p = (span + 127) / 128;
     if (kGroup != 0 && warp == 0) {
         for (int i = static_cast<int>(lane); i < experts + (kGroup == 1 ? 1 : 0); i += 32) {
             routes[i] = __ldg(&group[i]);
@@ -232,8 +334,8 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     const int num_p = kGroup == 2   ? masked_p
                       : kGroup == 1 ? (routes[experts] + 127) / 128
                                     : (rows_p + static_cast<int>(kM) - 1) / static_cast<int>(kM);
-    const int num_q = kGroup == 0 ? (rows_q + kBN - 1) / kBN
-                      : kGroup == 1 ? (n_per + kBN - 1) / kBN
+    const int num_q = kGroup == 0 ? (rows_q + static_cast<int>(kQStep) - 1) / static_cast<int>(kQStep)
+                      : kGroup == 1 ? (span + static_cast<int>(kQStep) - 1) / static_cast<int>(kQStep)
                                     : (m_max + kBN - 1) / kBN;
     const int num_kb = (k + static_cast<int>(kStageK) - 1) / static_cast<int>(kStageK);
     // A unit is one tile's share of K: `splits` of them a tile when a
@@ -251,7 +353,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
         u32 quarter;
         int kb0, kb1;
         float alpha;
-        int out_p, out_q, lim_p, lim_q;
+        int out_p, out_q, lim_p, lim_q, s_row;
     };
     // Every role walks the same units and skips the same empty ones (a
     // contiguous tile past the routed rows, a masked tile past its count).
@@ -292,7 +394,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
         }
         if constexpr (kGroup == 0) {
             x.p_row = pt * static_cast<int>(kM);
-            x.q_row = qt * kBN;
+            x.q_row = qt * static_cast<int>(kQStep);
             x.p_block = pt * kPair;
             x.out_p = x.p_row;
             x.out_q = x.q_row;
@@ -316,12 +418,12 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
             if (routes[e] % 128 != 0) {
                 asm volatile("trap;");
             }
-            x.q_row = e * n_per + qt * kBN;
+            x.q_row = e * n_per + qt * static_cast<int>(kQStep);
             x.p_block = pt;
             x.out_p = x.p_row;
-            x.out_q = qt * kBN;
+            x.out_q = qt * static_cast<int>(kQStep);
             x.lim_p = 128;
-            x.lim_q = n_per - qt * kBN;
+            x.lim_q = span - qt * static_cast<int>(kQStep);
         } else {
             const int count = min(routes[e], m_max);
             if (qt * kBN >= count) {
@@ -332,7 +434,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
             x.p_block = x.p_row / 128;
             x.out_p = pt * 128;
             x.out_q = x.q_row;
-            x.lim_p = n_per - pt * 128;
+            x.lim_p = span - pt * 128;
             x.lim_q = count - qt * kBN;
         }
         // A Q tile narrower than its 128-row scale atom reads the atom's
@@ -342,6 +444,8 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
             kGroup == 2 ? e * ((m_max + 127) / 128) * 128 + qt * kBN : x.q_row;
         x.q_block = q_scale_row / 128;
         x.quarter = static_cast<u32>(q_scale_row % 128) / 32;
+        // The scale row a quantized store gives y's first row of this tile.
+        x.s_row = kSwap ? (kGroup == 2 ? e * epi.pad + qt * kBN : x.out_q) : x.out_p;
         if (kGroup != 0 && alpha_e != nullptr) {
             x.alpha *= __ldg(&alpha_e[e]);
         }
@@ -379,28 +483,52 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                     if (leader) {
                         bar_arrive_expect_tx(&full[s], kTx);
                     }
-                    unsigned char* tile_p = smem + s * kTileP;
+                    unsigned char* tile_p = smem + s * kTileP * kPT;
                     unsigned char* tile_q = smem + kOffQ + s * kTileQ;
-                    if constexpr (kPair == 2) {
-                        tma_load_2d_pair(tile_p, &full[s], &map_p, kb * kInner, p0);
-                        tma_load_2d_pair(tile_q, &full[s], &map_q, kb * kInner, q0);
+                    auto load2 = [&](void* dst, const TmaMap* map, int row) {
+                        if constexpr (kPair == 2) {
+                            tma_load_2d_pair(dst, &full[s], map, kb * kInner, row);
+                        } else {
+                            tma_load_2d(dst, &full[s], map, kb * kInner, row);
+                        }
+                    };
+                    auto load3 = [&](void* dst, const TmaMap* map, int atom, int block) {
+                        if constexpr (kPair == 2) {
+                            tma_load_3d_pair(dst, &full[s], map, 0, atom, block);
+                        } else {
+                            tma_load_3d(dst, &full[s], map, 0, atom, block);
+                        }
+                    };
+                    // A GLU's second P tile, or the up half of its Q tile,
+                    // reads the rows `inter` past the gate's.
+                    for (u32 h = 0; h < kPT; ++h) {
+                        load2(tile_p + h * kTileP, &map_p, p0 + static_cast<int>(h) * inter);
+                    }
+                    if constexpr (kFused && !kSwap && kPair == 1) {
+                        load2(tile_q, &map_q, x.q_row);
+                        load2(tile_q + 128 * 128, &map_q, x.q_row + inter);
+                    } else if constexpr (kFused && !kSwap) {
+                        load2(tile_q, &map_q, x.q_row + static_cast<int>(rank) * inter);
                     } else {
-                        tma_load_2d(tile_p, &full[s], &map_p, kb * kInner, p0);
-                        tma_load_2d(tile_q, &full[s], &map_q, kb * kInner, q0);
+                        load2(tile_q, &map_q, q0);
                     }
                     if constexpr (kScaled) {
                         const int atom_p = static_cast<int>(kb * kStageK / kGranP / 4);
                         const int atom_q = static_cast<int>(kb * kStageK / kGranQ / 4);
-                        const int block_p = x.p_block + static_cast<int>(rank);
-                        const int block_q = x.q_block;
                         unsigned char* sf_p = smem + kOffSfP + s * kSfP;
                         unsigned char* sf_q = smem + kOffSfQ + s * kSfQ;
-                        if constexpr (kPair == 2) {
-                            tma_load_3d_pair(sf_p, &full[s], &map_sfp, 0, atom_p, block_p);
-                            tma_load_3d_pair(sf_q, &full[s], &map_sfq, 0, atom_q, block_q);
+                        for (u32 h = 0; h < kPT; ++h) {
+                            load3(sf_p + h * kAtomsP * 512, &map_sfp, atom_p,
+                                  x.p_block + static_cast<int>(rank) +
+                                      static_cast<int>(h) * inter / 128);
+                        }
+                        if constexpr (kFused && !kSwap) {
+                            for (int h = 0; h < 2; ++h) {
+                                load3(sf_q + h * kAtomsQ * 512, &map_sfq, atom_q,
+                                      (x.q_row + h * inter) / 128);
+                            }
                         } else {
-                            tma_load_3d(sf_p, &full[s], &map_sfp, 0, atom_p, block_p);
-                            tma_load_3d(sf_q, &full[s], &map_sfq, 0, atom_q, block_q);
+                            load3(sf_q, &map_sfq, atom_q, x.q_block);
                         }
                     }
                     if (++s == kStages) {
@@ -433,11 +561,11 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                     }
                     bar_wait(&full[s], phase);
                     tc_fence_after();
-                    const u32 sf_tp = tmem + kStride + kBN + slot * kSfCols;
-                    const u32 sf_tq = sf_tp + 4 * kAtomsP;
+                    const u32 sf_tp = tmem + kStride + kAccN + slot * kSfCols;
+                    const u32 sf_tq = sf_tp + 4 * kAtomsP * kPT;
                     const u32 sf_p = smem_addr(smem + kOffSfP + s * kSfP);
                     const u32 sf_q = smem_addr(smem + kOffSfQ + s * kSfQ);
-                    for (u32 a = 0; a < kAtomsP; ++a) {
+                    for (u32 a = 0; a < kAtomsP * kPT; ++a) {
                         tc_cp_sf_atom<kPair>(sf_tp + 4 * a, sdesc_sf(sf_p + a * 512));
                     }
                     for (u32 r = 0; r < kRowAtomsQ; ++r) {
@@ -467,7 +595,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                 const u32 acc = static_cast<u32>(it) % 2;
                 bar_wait(&tempty[acc], ((static_cast<u32>(it) / 2) & 1) ^ 1);
                 tc_fence_after();
-                const u32 d = tmem + acc * kStride;
+                const u32 d0 = tmem + acc * kStride;
                 const u32 quarter_q = x.quarter;
                 for (int kb = kb0; kb < x.kb1; ++kb, ++step) {
                     bar_wait(&full[s], phase);
@@ -476,17 +604,21 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                         bar_wait(&sf_ready[slot], (step / kSfSlots) & 1);
                     }
                     tc_fence_after();
-                    const u32 tile_p = smem_addr(smem + s * kTileP);
+                    const u32 tile_p = smem_addr(smem + s * kTileP * kPT);
                     const u32 tile_q = smem_addr(smem + kOffQ + s * kTileQ);
-                    const u32 sf_tp = tmem + kStride + kBN + slot * kSfCols;
-                    const u32 sf_tq = sf_tp + 4 * kAtomsP;
+                    const u32 sf_tp0 = tmem + kStride + kAccN + slot * kSfCols;
+                    const u32 sf_tq = sf_tp0 + 4 * kAtomsP * kPT;
                     if (kOv > 0 && kb == kb0 && it > 0) {
                         const u32 prev = static_cast<u32>(it - 1);
                         bar_wait(&tover[prev % 2], (prev / 2) & 1);
                         tc_fence_after();
                     }
-                    const u64 desc_p = sdesc_sw128(tile_p);
                     const u64 desc_q = sdesc_sw128(tile_q);
+#pragma unroll
+                    for (u32 h = 0; h < kPT; ++h) {
+                    const u64 desc_p = sdesc_sw128(tile_p + h * kTileP);
+                    const u32 d = d0 + h * kBN;
+                    const u32 sf_tp = sf_tp0 + 4 * h * kAtomsP;
 #pragma unroll
                     for (u32 j = 0; j < 4; ++j) {
                         const u64 a = desc_p + 2 * j;
@@ -517,6 +649,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                                 mma_nvf4<kPair>(d, a, b, desc, accumulate, col_p, col_q);
                             }
                         }
+                    }
                     }
                     commit(&empty[s]);
                     if (++s == kStages) {
@@ -553,15 +686,67 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
             const bool live = i < x.lim_p;
             const int p = x.out_p + i;
             const u32 taddr = tmem + acc * kStride + ((warp * 32) << 16);
+            // A GLU reads its gate columns and, kUp further on, its up ones.
+            constexpr u32 kChunks = (kFused ? (kSwap ? kBN : 128) : kBN) / 32;
+            constexpr u32 kUp = kSwap ? kBN : 128;
+            const float rs_row =
+                !kSwap && epi.row_scale != nullptr && live ? epi.row_scale[p] : 1.f;
+            // This tile's 32 values a chunk, past alpha, the GLU and the
+            // routed weight.
+            auto product = [&](u32 c0, float (&h)[32]) {
+                u32 v[32];
+                tmem_ld32(taddr + c0, v);
+                if constexpr (kFused) {
+                    u32 u[32];
+                    tmem_ld32(taddr + kUp + c0, u);
+                    tmem_wait_ld();
+#pragma unroll
+                    for (int j = 0; j < 32; ++j) {
+                        h[j] = tc5k::glu<kGlu>(__uint_as_float(v[j]) * alpha,
+                                               __uint_as_float(u[j]) * alpha, epi.limit,
+                                               epi.galpha);
+                    }
+                } else {
+                    tmem_wait_ld();
+#pragma unroll
+                    for (int j = 0; j < 32; ++j) {
+                        h[j] = __uint_as_float(v[j]) * alpha;
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < 32; ++j) {
+                    float rs = rs_row;
+                    if constexpr (kSwap) {
+                        const int c = static_cast<int>(c0) + j;
+                        rs = epi.row_scale != nullptr && c < x.lim_q
+                                 ? epi.row_scale[x.out_q + c]
+                                 : 1.f;
+                    }
+                    h[j] *= rs;
+                }
+            };
+            // DeepSeek's 1x128 block of an unswapped row spans the tile's four
+            // chunks: a first pass finds its amax.
+            float row_amax = 0.f;
+            if constexpr (kOut == 1 && !kSwap) {
+#pragma unroll 1
+                for (u32 chunk = 0; chunk < kChunks; ++chunk) {
+                    float h[32];
+                    product(32 * chunk, h);
+#pragma unroll
+                    for (int j = 0; j < 32; ++j) {
+                        row_amax = fmaxf(row_amax, fabsf(h[j]));
+                    }
+                }
+            }
             // The shared columns go first: stage 0 drains tail first, stage
             // 1 head first, and the next tile's MMA starts once they are read.
             const bool reverse = kOv > 0 && acc == 0;
 #pragma unroll 1
-            for (u32 chunk = 0; chunk < kBN / 32; ++chunk) {
-                const u32 c0 = reverse ? kBN - 32 * (chunk + 1) : 32 * chunk;
-                u32 v[32];
-                tmem_ld32(taddr + c0, v);
-                tmem_wait_ld();
+            for (u32 chunk = 0; chunk < kChunks; ++chunk) {
+                const u32 c0 = reverse ? 32 * (kChunks - 1 - chunk) : 32 * chunk;
+                float h[32];
+                product(c0, h);
                 if (kOv > 0 && chunk + 1 == kOvChunks) {
                     tc_fence_before();
                     __syncwarp();
@@ -569,7 +754,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                         arrive_leader(&tover[acc]);
                     }
                 }
-                if (chunk + 1 == kBN / 32) {
+                if (chunk + 1 == kChunks) {
                     tc_fence_before();
                     __syncwarp();
                     if (lane == 0) {
@@ -578,25 +763,135 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                 }
                 const int j0 = static_cast<int>(c0);
                 const int q0 = x.out_q + j0;
-                if constexpr (kSwap) {
+                if constexpr (kSwap && kOut == 1) {
+                    // A token's 1x128 block is this tile's 128 P rows: its
+                    // amax reduces across the four warps.
+                    float* red = reinterpret_cast<float*>(smem + kOffOut);
+                    float mine = 0.f;
+#pragma unroll
+                    for (int j = 0; j < 32; ++j) {
+                        float m = live ? fabsf(h[j]) : 0.f;
+#pragma unroll
+                        for (int d = 16; d > 0; d >>= 1) {
+                            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, d));
+                        }
+                        mine = lane == static_cast<u32>(j) ? m : mine;
+                    }
+                    asm volatile("bar.sync 1, 128;" ::: "memory");
+                    red[warp * 32 + lane] = mine;
+                    asm volatile("bar.sync 1, 128;" ::: "memory");
+#pragma unroll
+                    for (int j = 0; j < 32; ++j) {
+                        const float amax = fmaxf(fmaxf(red[j], red[32 + j]),
+                                                 fmaxf(red[64 + j], red[96 + j]));
+                        const int ce = tc5k::ue8m0_exponent(amax);
+                        if (j0 + j < x.lim_q) {
+                            const float q = fminf(fmaxf(ldexpf(h[j], -ce), -448.f), 448.f);
+                            if (live) {
+                                epi.q[static_cast<size_t>(q0 + j) * inter + p] =
+                                    static_cast<unsigned char>(tc5k::e4m3x2(q, 0.f) & 0xff);
+                            }
+                            if (row == 0) {
+                                epi.qs[tc5k::atom_at(x.s_row + j0 + j, x.out_p / 128,
+                                                     inter / 128)] =
+                                    static_cast<unsigned char>(ce + 127);
+                            }
+                        }
+                    }
+                } else if constexpr (kSwap && kOut == 2) {
+                    // A token's 16-wide NVFP4 block is 16 lanes; lane pairs
+                    // share a byte.
+#pragma unroll
+                    for (int j = 0; j < 32; ++j) {
+                        float m = live ? fabsf(h[j]) : 0.f;
+#pragma unroll
+                        for (int d = 8; d > 0; d >>= 1) {
+                            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, d));
+                        }
+                        float scale;
+                        const unsigned char code = tc5k::nvfp4_scale(m, epi.gscale, scale);
+                        const float mine = live ? h[j] * scale : 0.f;
+                        const float odd = __shfl_down_sync(0xffffffffu, mine, 1);
+                        if (j0 + j < x.lim_q && live) {
+                            const size_t r = static_cast<size_t>(q0 + j);
+                            if ((lane & 1) == 0) {
+                                float pairs[8] = {mine, odd, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+                                epi.q[r * (inter / 2) + p / 2] =
+                                    static_cast<unsigned char>(tc5k::e2m1x8(pairs) & 0xff);
+                            }
+                            if ((lane & 15) == 0) {
+                                epi.qs[tc5k::atom_at(x.s_row + j0 + j, p / 16, inter / 16)] =
+                                    code;
+                            }
+                        }
+                    }
+                } else if constexpr (kSwap) {
                     // A warp's lanes are 32 consecutive weight rows: each
                     // column is one coalesced 64-byte run of y.
                     if (live && splits > 1) {
 #pragma unroll
                         for (int j = 0; j < 32; ++j) {
                             if (j0 + j < x.lim_q) {
-                                red_add(part + static_cast<size_t>(q0 + j) * ldy + p,
-                                        __uint_as_float(v[j]) * alpha);
+                                red_add(part + static_cast<size_t>(q0 + j) * ldy + p, h[j]);
                             }
                         }
                     } else if (live) {
 #pragma unroll
                         for (int j = 0; j < 32; ++j) {
                             if (j0 + j < x.lim_q) {
-                                y[static_cast<size_t>(q0 + j) * ldy + p] =
-                                    f32_to_bf16(__uint_as_float(v[j]) * alpha);
+                                y[static_cast<size_t>(q0 + j) * ldy + p] = f32_to_bf16(h[j]);
                             }
                         }
+                    }
+                } else if constexpr (kOut == 1) {
+                    // A row's 32 e4m3 bytes; its scale once a tile.
+                    if (live && j0 < x.lim_q) {
+                        const int ce = tc5k::ue8m0_exponent(row_amax);
+                        u32 w[8];
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            const float a = fminf(fmaxf(ldexpf(h[4 * j], -ce), -448.f), 448.f);
+                            const float b = fminf(fmaxf(ldexpf(h[4 * j + 1], -ce), -448.f), 448.f);
+                            const float c = fminf(fmaxf(ldexpf(h[4 * j + 2], -ce), -448.f), 448.f);
+                            const float d = fminf(fmaxf(ldexpf(h[4 * j + 3], -ce), -448.f), 448.f);
+                            w[j] = static_cast<u32>(tc5k::e4m3x2(a, b)) |
+                                   (static_cast<u32>(tc5k::e4m3x2(c, d)) << 16);
+                        }
+                        uint4* out = reinterpret_cast<uint4*>(
+                            epi.q + static_cast<size_t>(p) * inter + q0);
+                        out[0] = make_uint4(w[0], w[1], w[2], w[3]);
+                        out[1] = make_uint4(w[4], w[5], w[6], w[7]);
+                        if (c0 == 0) {
+                            epi.qs[tc5k::atom_at(x.s_row + i, x.out_q / 128, inter / 128)] =
+                                static_cast<unsigned char>(ce + 127);
+                        }
+                    }
+                } else if constexpr (kOut == 2) {
+                    // A row's two 16-wide blocks: 16 bytes and two scales.
+                    if (live && j0 < x.lim_q) {
+                        u32 w[4];
+#pragma unroll
+                        for (int b = 0; b < 2; ++b) {
+                            float m = 0.f;
+#pragma unroll
+                            for (int j = 0; j < 16; ++j) {
+                                m = fmaxf(m, fabsf(h[16 * b + j]));
+                            }
+                            float scale;
+                            const unsigned char code = tc5k::nvfp4_scale(m, epi.gscale, scale);
+#pragma unroll
+                            for (int g = 0; g < 2; ++g) {
+                                float e[8];
+#pragma unroll
+                                for (int j = 0; j < 8; ++j) {
+                                    e[j] = h[16 * b + 8 * g + j] * scale;
+                                }
+                                w[2 * b + g] = tc5k::e2m1x8(e);
+                            }
+                            epi.qs[tc5k::atom_at(x.s_row + i, q0 / 16 + b, inter / 16)] = code;
+                        }
+                        *reinterpret_cast<uint4*>(epi.q + static_cast<size_t>(p) * (inter / 2) +
+                                                  q0 / 2) = make_uint4(w[0], w[1], w[2], w[3]);
                     }
                 } else if (splits > 1) {
                     // A thread's 32 sums of its row, four at a time.
@@ -605,10 +900,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
 #pragma unroll
                         for (int j = 0; j < 32; j += 4) {
                             if (j0 + j < x.lim_q) {
-                                red_add4(at + j, __uint_as_float(v[j]) * alpha,
-                                         __uint_as_float(v[j + 1]) * alpha,
-                                         __uint_as_float(v[j + 2]) * alpha,
-                                         __uint_as_float(v[j + 3]) * alpha);
+                                red_add4(at + j, h[j], h[j + 1], h[j + 2], h[j + 3]);
                             }
                         }
                     }
@@ -623,21 +915,18 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
 #pragma unroll
                     for (u32 j = 0; j < 4; ++j) {
                         uint4 w;
-                        w.x = pack_bf16x2(__uint_as_float(v[8 * j + 0]) * alpha,
-                                          __uint_as_float(v[8 * j + 1]) * alpha);
-                        w.y = pack_bf16x2(__uint_as_float(v[8 * j + 2]) * alpha,
-                                          __uint_as_float(v[8 * j + 3]) * alpha);
-                        w.z = pack_bf16x2(__uint_as_float(v[8 * j + 4]) * alpha,
-                                          __uint_as_float(v[8 * j + 5]) * alpha);
-                        w.w = pack_bf16x2(__uint_as_float(v[8 * j + 6]) * alpha,
-                                          __uint_as_float(v[8 * j + 7]) * alpha);
+                        w.x = pack_bf16x2(h[8 * j + 0], h[8 * j + 1]);
+                        w.y = pack_bf16x2(h[8 * j + 2], h[8 * j + 3]);
+                        w.z = pack_bf16x2(h[8 * j + 4], h[8 * j + 5]);
+                        w.w = pack_bf16x2(h[8 * j + 6], h[8 * j + 7]);
                         *reinterpret_cast<uint4*>(box + lane * 64 + 16 * (j ^ ((lane >> 1) & 3))) =
                             w;
                     }
                     fence_async_shared();
                     __syncwarp();
                     if (lane == 0) {
-                        tma_store_2d(&map_y, box, q0, x.out_p + static_cast<int>(rank * 128 + warp * 32));
+                        tma_store_2d(&map_y, box, q0,
+                                     x.out_p + static_cast<int>(rank * 128 + warp * 32));
                         bulk_commit();
                     }
                     out_buf ^= 1;
