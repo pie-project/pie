@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use super::iq_grid;
 use super::{Progress, Residency};
 use crate::codec::cast::{cast_elements, decode_values, encode_values};
+use crate::codec::e8m0::exp2_e8m0;
 use crate::codec::fp8::{decode_fp8_e4m3_elements, f32_to_fp8_e4m3};
 use crate::codec::int4::decode_int4b8_elements;
 use crate::codec::mlx::decode_mlx_affine_codes;
@@ -1404,7 +1405,22 @@ impl Walk<'_, '_> {
         } else {
             return Err(invalid("host Encode requires a source or input buffer"));
         };
-        let values = decode_values(bytes, operand_dtype)?;
+        // a block-scaled FP8 source is read out through its factors, as the
+        // other encodes read it
+        let values = match (operand_dtype, inputs.first(), source) {
+            (DType::E4m3, None, Some(source)) => {
+                let (r, c) = (checked_usize_i64(rows)?, checked_usize_i64(cols)?);
+                let operand = self.fp8_block_operand(source, transform, bytes, r, c)?;
+                let mut row = vec![0.0f32; c];
+                let mut values = Vec::with_capacity(r * c);
+                for at in 0..r {
+                    operand.row_bf16(at, c, &mut row);
+                    values.extend(row.iter().map(|&v| f64::from(v)));
+                }
+                values
+            }
+            _ => decode_values(bytes, operand_dtype)?,
+        };
         if values.len() as i64 != rows * cols {
             return Err(invalid(format!(
                 "Encode was handed {} elements for the {shape:?} it must quantize",
@@ -1860,12 +1876,17 @@ impl Walk<'_, '_> {
                 weight.shape, scale.shape
             )));
         };
-        if !matches!(scale.encoding, Encoding::Raw(DType::F32)) {
-            return Err(invalid(format!(
-                "FP8 Encode scale '{}' must be F32",
-                scale.name
-            )));
-        }
+        // f32 factors, or e8m0 exponents (a factor of 2^(e - 127) each)
+        let factor_bytes = match scale.encoding {
+            Encoding::Raw(DType::F32) => 4,
+            Encoding::Raw(DType::E8m0) => 1,
+            _ => {
+                return Err(invalid(format!(
+                    "FP8 Encode scale '{}' must be F32 factors or E8M0 exponents",
+                    scale.name
+                )));
+            }
+        };
         let (true_rows, true_cols) = (checked_usize_i64(true_rows)?, checked_usize_i64(true_cols)?);
         let (scale_rows, scale_cols) = (
             checked_usize_i64(scale_rows)?,
@@ -1892,6 +1913,7 @@ impl Walk<'_, '_> {
             )));
         }
 
+        let width: u32 = factor_bytes;
         let factor_bytes = self.read_extent(&SourceExtent {
             file_id: scale.file_id,
             tensor_id: scale.id,
@@ -1899,21 +1921,25 @@ impl Walk<'_, '_> {
             span_bytes: scale.span_bytes,
             stride: Extent {
                 base_offset: 0,
-                element_bytes: 4,
+                element_bytes: width,
                 dims: vec![crate::extent::Dim {
                     count: (scale_rows * scale_cols) as i64,
-                    src_stride: 4,
-                    dst_stride: 4,
+                    src_stride: i64::from(width),
+                    dst_stride: i64::from(width),
                 }],
             },
-            dtype: DType::F32,
+            dtype: if width == 4 { DType::F32 } else { DType::E8m0 },
         })?;
-        let factors: Vec<f32> = factor_bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|le| f32::from_le_bytes(*le))
-            .collect();
+        let factors: Vec<f32> = if width == 4 {
+            factor_bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|le| f32::from_le_bytes(*le))
+                .collect()
+        } else {
+            factor_bytes.iter().map(|&e| exp2_e8m0(e)).collect()
+        };
         if factors.len() != scale_rows * scale_cols {
             return Err(invalid(format!(
                 "FP8 factors '{}' hold {} values, not [{scale_rows}, {scale_cols}]",

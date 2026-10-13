@@ -7,6 +7,7 @@ mod a_diffusers_pipeline_reads_as_one_prefixed_name_space;
 mod a_pre_sharded_fp8_weight_reads_each_chunk_under_its_own_factors;
 mod a_replicated_shard_lands_on_every_rank_of_its_group;
 mod an_fp32_pipeline_component_lands_as_bf16_planes;
+mod an_fp8_plane_beside_e8m0_exponents_reads_under_them;
 mod groups;
 mod memory_mount;
 mod quant_terms;
