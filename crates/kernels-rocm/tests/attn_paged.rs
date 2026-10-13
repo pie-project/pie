@@ -275,6 +275,18 @@ fn run_decode(gpu: &Gpu, c: &Case, kv_lens: &[u32], window: Option<u32>, max_gri
 }
 
 fn run_prefill(gpu: &Gpu, c: &Case, qo_lens: &[u32], prefix: &[u32], stride: usize) {
+    run_prefill_window(gpu, c, qo_lens, prefix, stride, None, false);
+}
+
+fn run_prefill_window(
+    gpu: &Gpu,
+    c: &Case,
+    qo_lens: &[u32],
+    prefix: &[u32],
+    stride: usize,
+    window: Option<u32>,
+    graph: bool,
+) {
     let ctx = gpu.ctx();
     let device = plan::Device::probe(&ctx).unwrap();
     let n = qo_lens.len() as u32;
@@ -316,9 +328,9 @@ fn run_prefill(gpu: &Gpu, c: &Case, qo_lens: &[u32], prefix: &[u32], stride: usi
         total,
         shape,
         live,
-        None,
+        window,
         true,
-        false,
+        graph,
         None,
         &device,
         plan::Toggles::default(),
@@ -332,7 +344,7 @@ fn run_prefill(gpu: &Gpu, c: &Case, qo_lens: &[u32], prefix: &[u32], stride: usi
         q,
         &built,
         &cache.pool,
-        None,
+        window,
         c.head_dim,
         c.kv_heads,
         0.0,
@@ -358,10 +370,10 @@ fn run_prefill(gpu: &Gpu, c: &Case, qo_lens: &[u32], prefix: &[u32], stride: usi
                 kv_lens[r] as usize,
                 qo_lens[r] as usize,
                 t,
-                None,
+                window,
             );
             let tag = format!(
-                "prefill d{} g{} hnd={} split={} req {r} token {t}",
+                "prefill d{} g{} hnd={} split={} window={window:?} graph={graph} req {r} token {t}",
                 c.head_dim,
                 c.q_heads / c.kv_heads,
                 c.hnd,
@@ -441,4 +453,20 @@ fn attn_paged_wide_heads() {
     }
     run_decode(&gpu, &sliding, &[5, 300, 2000], Some(1024), 4096);
     run_prefill(&gpu, &sliding, &[1200, 70], &[0, 1500], 1);
+    // DeepSeek-V4's sliding window (128 keys) as its decode reads it, one
+    // query row a request over caches past and short of the window (whole,
+    // unsplit), a wide batch of them (split), and windowed prefills whose
+    // tiles straddle tokens.
+    run_prefill_window(&gpu, &mqa, &[1, 1, 1, 1], &[0, 40, 127, 900], 1, Some(128), false);
+    run_prefill_window(&gpu, &mqa, &[1; 64], &[600; 64], 7, Some(128), false);
+    run_prefill_window(&gpu, &mqa, &[3, 70, 200], &[300, 0, 31], 1, Some(128), false);
+    run_prefill_window(&gpu, &global, &[33, 130], &[100, 900], 1, Some(128), false);
+    run_prefill_window(&gpu, &sliding, &[1200, 70], &[0, 1500], 3, Some(1024), false);
+    // Windows long enough to split: the partials' rows count each request's
+    // chunks over the window's reach.
+    run_prefill_window(&gpu, &mqa, &[1, 2], &[2000, 700], 1, Some(512), false);
+    // A captured plan pads its grid past the work, split or whole.
+    run_prefill_window(&gpu, &mqa, &[1, 1, 1], &[0, 40, 900], 1, Some(128), true);
+    run_prefill_window(&gpu, &mqa, &[1, 2], &[2000, 700], 1, Some(512), true);
+    run_prefill_window(&gpu, &sliding, &[1, 3], &[3000, 5000], 1, Some(1024), false);
 }

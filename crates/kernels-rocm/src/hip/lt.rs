@@ -35,14 +35,19 @@ fn answered(call: &'static str, status: LtStatus) -> Result<(), Refused> {
 /// that fit it.
 pub const WORKSPACE: usize = 32 << 20;
 
-/// Row-major `y[m, n] = x[m, k] · w[n, k]ᵀ (+ bias[n])`.
+/// Row-major `y[m, n] = x[m, k] · w[n, k]ᵀ (+ bias[n])`; with `groups` > 1,
+/// that for each group g of a row: `y[m, g·n..][n] = x[m, g·k..][k] ·
+/// w[g][n, k]ᵀ`, x a [m, groups·k] and y a [m, groups·n] plane, w the
+/// groups' [n, k] blocks one after another (one strided-batched launch).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Shape {
     pub m: u32,
     pub n: u32,
     pub k: u32,
     pub bias: bool,
+    pub groups: u32,
 }
+
 
 struct Plan {
     desc: LtDesc,
@@ -115,18 +120,45 @@ impl Plan {
                     set(sys::LT_DESC_BIAS_DATA_TYPE, &sys::LT_R_16BF),
                 )?;
             }
+            let g = u64::from(s.groups.max(1));
             answered(
                 "hipblasLtMatrixLayoutCreate",
                 (lt.hipblasLtMatrixLayoutCreate)(&raw mut a, sys::LT_R_16BF, k, n, k as i64),
             )?;
             answered(
                 "hipblasLtMatrixLayoutCreate",
-                (lt.hipblasLtMatrixLayoutCreate)(&raw mut b, sys::LT_R_16BF, k, m, k as i64),
+                (lt.hipblasLtMatrixLayoutCreate)(&raw mut b, sys::LT_R_16BF, k, m, (g * k) as i64),
             )?;
             answered(
                 "hipblasLtMatrixLayoutCreate",
-                (lt.hipblasLtMatrixLayoutCreate)(&raw mut d, sys::LT_R_16BF, n, m, n as i64),
+                (lt.hipblasLtMatrixLayoutCreate)(&raw mut d, sys::LT_R_16BF, n, m, (g * n) as i64),
             )?;
+            if g > 1 {
+                // A group's weight block follows the last; its activation and
+                // result columns sit k and n along their rows.
+                let count = g as i32;
+                for (layout, stride) in [(a, n * k), (b, k), (d, n)] {
+                    let stride = stride as i64;
+                    answered(
+                        "hipblasLtMatrixLayoutSetAttribute",
+                        (lt.hipblasLtMatrixLayoutSetAttribute)(
+                            layout,
+                            sys::LT_LAYOUT_BATCH_COUNT,
+                            core::ptr::from_ref(&count).cast(),
+                            4,
+                        ),
+                    )?;
+                    answered(
+                        "hipblasLtMatrixLayoutSetAttribute",
+                        (lt.hipblasLtMatrixLayoutSetAttribute)(
+                            layout,
+                            sys::LT_LAYOUT_STRIDED_BATCH_OFFSET,
+                            core::ptr::from_ref(&stride).cast(),
+                            8,
+                        ),
+                    )?;
+                }
+            }
             answered(
                 "hipblasLtMatmulPreferenceCreate",
                 (lt.hipblasLtMatmulPreferenceCreate)(&raw mut pref),

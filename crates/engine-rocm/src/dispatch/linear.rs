@@ -532,13 +532,28 @@ impl Run<'_> {
                 let mut y =
                     kernels_rocm::tensor::Tensor::new(y.ptr, rows, y.width / groups_nz, y.dtype);
                 let (bank, experts) = self.expert_bank(*w);
-                linear::moe::matmul_select(
+                // The weight is the groups' [n, k] blocks stacked as one
+                // [groups·n, k] matrix; the select reads it as `groups`
+                // experts of n·k, the shape its expert-ordered legs take.
+                let (n, k) = (u64::from(y.width), u64::from(x.width));
+                let bank = if !experts.streams()
+                    && u64::from(bank.rows) * u64::from(bank.width)
+                        == u64::from(groups_nz) * n * k
+                    && let Ok(stride) = u32::try_from(n * k)
+                {
+                    kernels_rocm::tensor::Tensor::new(bank.ptr, groups_nz, stride, bank.dtype)
+                } else {
+                    bank
+                };
+                let identity = self.group_routes_of(*routes, groups_nz);
+                linear::moe::matmul_grouped(
                     self.ctx(),
                     x,
                     bank,
                     self.tensor(*routes),
                     &mut y,
                     experts,
+                    identity,
                 )
             }
             Linear::MoeMatmulSelect { x, bank, routes, y } => {

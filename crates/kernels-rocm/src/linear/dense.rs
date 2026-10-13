@@ -55,6 +55,7 @@ pub(crate) fn act_x_wt(
         n: n.unsigned_abs(),
         k: k.unsigned_abs(),
         bias: false,
+        groups: 1,
     };
     let workspace = ctx.scratch_shared(op, "linear.lt_workspace", lt::WORKSPACE)? as u64;
     // SAFETY: the three planes are device ranges the caller sized at [m, k],

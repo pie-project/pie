@@ -726,6 +726,11 @@ fn moe_matmul_mxfp4() {
         (4, 40, 4, 256, 512, "wmma"),
         (5, 33, 3, 136, 2304, "wmma"),
         (4, 72, 4, 256, 512, "wmma"),
+        // Few items over a long K: the matrix-core leg slices K (4 slices,
+        // an odd stage count; 2 slices of 32-route items).
+        (4, 40, 4, 256, 4096, "wmma"),
+        (4, 64, 2, 136, 4160, "wmma"),
+        (3, 20, 2, 136, 4096, "wmma"),
         (8, 50, 4, 200, 512, "simt"),
     ] {
         let (e, t, kk, nn, kd) = (
@@ -1100,46 +1105,100 @@ fn moe_matmul_f16() {
     }
 }
 
+/// The grouped projection (DeepSeek's grouped o-projection): every row's
+/// group g through block g, x and y [tokens·groups] rows. Few tokens take
+/// the routed legs; past the batch legs' reach, identity routes take one
+/// strided-batched hipBLASLt launch, and the routed select is the
+/// reference's equal either way.
+#[test]
+fn moe_matmul_grouped_projection() {
+    let Some(gpu) = Gpu::open() else { return };
+    let planes = Planes::default();
+    let ctx = gpu.ctx();
+    for (groups, n, k) in [(8u32, 128u32, 512u32), (4, 72, 264)] {
+        let (g, nn, kd) = (groups as usize, n as usize, k as usize);
+        let bank = Dense {
+            n: nn,
+            k: kd,
+            w: bf16s(g * nn * kd, 31, 0.1),
+        };
+        let bt = gpu.tensor(&bank.w, groups, n * k, Dtype::Bf16);
+        for tokens in [1u32, 8, 33, 64, 130] {
+            let t = tokens as usize;
+            let routes: Vec<i32> = (0..t * g).map(|i| (i % g) as i32).collect();
+            let rows = tokens * groups;
+            let x = bf16s(t * g * kd, 32 + u64::from(tokens), 1.0);
+            let xt = gpu.tensor(&x, rows, k, Dtype::Bf16);
+            let rt = planes.i32s(&routes, tokens, groups);
+            let (want, mag) = reference(&bank, &x, &routes, g, false, None);
+            for identity in [true, false] {
+                let mut y = gpu.zeros(rows, n, Dtype::Bf16);
+                moe::matmul_grouped(
+                    &ctx,
+                    xt,
+                    bt,
+                    rt,
+                    &mut y,
+                    moe::ExpertTable::RESIDENT,
+                    identity,
+                )
+                .unwrap();
+                close_dot(
+                    &format!("grouped {groups}x{n}x{k} tokens {tokens} identity={identity}"),
+                    &gpu.read(&y),
+                    &want,
+                    &mag,
+                    1e-5,
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn moe_matmul_windowed_grouped() {
     // The grouped legs order only the window's live routes: rows 1..3 of 4
-    // tokens.
+    // tokens; at K 4096 the matrix-core leg slices K, and its sum lands only
+    // the live routes too.
     let Some(gpu) = Gpu::open() else { return };
     let planes = Planes::default();
-    let (experts, tokens, top_k, n, k) = (4u32, 4u32, 4u32, 128u32, 256u32);
-    let (codes, scales, bank) = mxfp4_bank(4, 128, 256, 77);
-    let ct = planes.bytes(&codes, experts, n * k / 2);
-    let st = planes.bytes(&scales, experts, n * k / 32);
-    let routes = make_routes(4, 4, 4, 78, false);
-    let x = bf16s(4 * 256, 79, 1.0);
-    let xt = gpu.tensor(&x, tokens, k, Dtype::Bf16);
-    let rt = planes.i32s(&routes, tokens, top_k);
-    let mut y = gpu.zeros(tokens * top_k, n, Dtype::Bf16);
-    let ctx = tuned(&gpu, |t| {
-        t.mxfp4_grouped_reuse = 0;
-        t.moe_batch = false;
-    });
-    let win = gpu.ints(&[2, 1, 0, 0]);
-    ctx.arm_stage(win.ptr);
-    moe::matmul_select_quant(&ctx, xt, ct, st, None, rt, &mut y, moe::GroupSeat::RESIDENT).unwrap();
-    ctx.disarm_stage();
-    let (want, mag) = reference(&bank, &x, &routes, 4, true, None);
-    let have = gpu.read(&y);
-    let live = 4 * 128..12 * 128;
-    close_dot(
-        "windowed grouped",
-        &have[live.clone()],
-        &want[live.clone()],
-        &mag[live],
-        1e-5,
-    );
-    assert!(
-        have[..4 * 128]
-            .iter()
-            .chain(&have[12 * 128..])
-            .all(|&v| v == 0.0),
-        "dead rows untouched"
-    );
+    for k in [256u32, 4096] {
+        let (experts, tokens, top_k, n) = (4u32, 4u32, 4u32, 128u32);
+        let (codes, scales, bank) = mxfp4_bank(4, 128, k as usize, 77);
+        let ct = planes.bytes(&codes, experts, n * k / 2);
+        let st = planes.bytes(&scales, experts, n * k / 32);
+        let routes = make_routes(4, 4, 4, 78, false);
+        let x = bf16s(4 * k as usize, 79, 1.0);
+        let xt = gpu.tensor(&x, tokens, k, Dtype::Bf16);
+        let rt = planes.i32s(&routes, tokens, top_k);
+        let mut y = gpu.zeros(tokens * top_k, n, Dtype::Bf16);
+        let ctx = tuned(&gpu, |t| {
+            t.mxfp4_grouped_reuse = 0;
+            t.moe_batch = false;
+        });
+        let win = gpu.ints(&[2, 1, 0, 0]);
+        ctx.arm_stage(win.ptr);
+        moe::matmul_select_quant(&ctx, xt, ct, st, None, rt, &mut y, moe::GroupSeat::RESIDENT)
+            .unwrap();
+        ctx.disarm_stage();
+        let (want, mag) = reference(&bank, &x, &routes, 4, true, None);
+        let have = gpu.read(&y);
+        let live = 4 * 128..12 * 128;
+        close_dot(
+            &format!("windowed grouped k {k}"),
+            &have[live.clone()],
+            &want[live.clone()],
+            &mag[live],
+            1e-5,
+        );
+        assert!(
+            have[..4 * 128]
+                .iter()
+                .chain(&have[12 * 128..])
+                .all(|&v| v == 0.0),
+            "k {k}: dead rows untouched"
+        );
+    }
 }
 
 // ------------------------------------------------------------- benches --
@@ -1620,6 +1679,12 @@ fn bench_moe_models() {
         ("kimi-k3 down mxfp4", Codec::Mxfp4, 896, 16, 3584, 3072),
         ("dsv41 gate mxfp4", Codec::Mxfp4, 384, 6, 2304, 5120),
         ("dsv41 down mxfp4", Codec::Mxfp4, 384, 6, 5120, 2304),
+        // The mini's 16 experts: 128 tokens give each 48 routes.
+        ("dsv41-mini gate mxfp4", Codec::Mxfp4, 16, 6, 2304, 5120),
+        ("dsv41-mini down mxfp4", Codec::Mxfp4, 16, 6, 5120, 2304),
+        // The grouped o-projection: each token's eight 4096-wide head groups
+        // through their own 1024-row block, every group a route.
+        ("dsv41 o_down bf16", Codec::Bf16, 8, 8, 1024, 4096),
         ("qwen3.8 gate_up bf16", Codec::Bf16, 512, 10, 1280, 2560),
         ("qwen3.8 down bf16", Codec::Bf16, 512, 10, 2560, 640),
         ("qwen3.8 gate_up u4", Codec::Affine4, 512, 10, 1280, 2560),
@@ -1670,5 +1735,60 @@ fn bench_moe_models() {
                 2.0 * routes_n as f64 * f64::from(n) * f64::from(k) / us / 1e6
             );
         }
+    }
+}
+
+#[test]
+#[ignore = "benchmark: cargo test --release --features rocm --test linear_moe -- --ignored --nocapture"]
+fn bench_grouped_projection() {
+    // DeepSeek-V4's grouped o-projection: 8 groups of a 4096-wide head slice
+    // through 1024-row blocks (a 64 MB bank), every token a route each; the
+    // routed select against the strided-batched launch, cold over copies of
+    // the bank 1 GB together. GB/s of the bank.
+    let Some(gpu) = Gpu::open() else { return };
+    let planes = Planes::default();
+    let ctx = gpu.ctx();
+    let (groups, n, k) = (8u32, 1024u32, 4096u32);
+    let per = u64::from(groups) * u64::from(n) * u64::from(k) * 2;
+    let copies = 16u32;
+    let bank = planes.keep(
+        hip::Buffer::alloc((per * u64::from(copies)) as usize).unwrap(),
+        groups,
+        n * k,
+        Dtype::Bf16,
+    );
+    for tokens in [1u32, 8, 32, 64, 128, 256, 512] {
+        let rows = tokens * groups;
+        let routes: Vec<i32> = (0..rows).map(|i| (i % groups) as i32).collect();
+        let rt = planes.i32s(&routes, tokens, groups);
+        let x = planes.keep(
+            hip::Buffer::alloc((rows * k * 2) as usize).unwrap(),
+            rows,
+            k,
+            Dtype::Bf16,
+        );
+        let mut y = planes.keep(
+            hip::Buffer::alloc((rows * n * 2) as usize).unwrap(),
+            rows,
+            n,
+            Dtype::Bf16,
+        );
+        let mut line = format!("o_down {groups}x{n}x{k} tokens {tokens:4}:");
+        for identity in [false, true] {
+            let mut i = 0u32;
+            let us = gpu.time_graph(32, || {
+                let mut b = bank;
+                b.ptr += u64::from(i % copies) * per;
+                moe::matmul_grouped(&ctx, x, b, rt, &mut y, moe::ExpertTable::RESIDENT, identity)
+                    .unwrap();
+                i += 1;
+            });
+            line += &format!(
+                "  {}: {us:7.1} us {:5.0} GB/s",
+                if identity { "strided" } else { "routed" },
+                per as f64 / us / 1e3
+            );
+        }
+        println!("{line}");
     }
 }

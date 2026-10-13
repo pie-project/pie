@@ -458,8 +458,23 @@ __global__ __launch_bounds__(64 * kDecodeMfmaWaves<D>) void paged_decode_mfma(co
 // (col l%16, k 4(l/16)+t) and D as (row 4(l/16)+t, col l%16): the Sᵀ result
 // is already Pᵀ's operand layout, and every lane's output column is one
 // query row, so the softmax rescale is the lane's own.
+//
+// The LDS rows are padded so an operand read's 16 rows fall in distinct
+// banks (K rows by 32 bytes, Vᵀ rows by 8), and Vᵀ is staged with a wave's
+// lanes on 16 consecutive keys of four columns, so its 2-byte stores of a
+// column land side by side. The next tile's K and V are read into registers
+// while this one multiplies. A wavefront whose 16 rows are all past the
+// request's queries (a decode's 64-head group fills half the tile) only
+// stages.
 
 constexpr int kPrefillTileQ = 128;
+
+// The keys a tile reads from its first under a window of `wl` keys behind a
+// row (kv_len without one): the window, then its rows' tokens, one more
+// where a tile starts mid-token (sched_prefill's `window_reach`).
+__device__ __forceinline__ int window_reach(int wl, int G) {
+    return wl + (kPrefillTileQ + G - 1) / G + 1;
+}
 
 template <int D>
 constexpr int prefill_bc() {
@@ -471,8 +486,11 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
     constexpr int BC = prefill_bc<D>();
     constexpr int KS = D / 16;   // k steps over the head for Sᵀ, d tiles for Oᵀ
     constexpr int KT = BC / 16;  // key tiles per kv tile
-    __shared__ bf16 ks[BC][D];
-    __shared__ bf16 vt[D][BC];
+    constexpr int KPAD = D + 16, VPAD = BC + 4;
+    constexpr int THREADS = 512, RD = BC * D / 8 / THREADS;  // 16-byte reads a thread a tile
+    static_assert(RD * 8 * THREADS == BC * D && THREADS % BC == 0, "the tile splits evenly");
+    __shared__ alignas(16) bf16 ks[BC][KPAD];
+    __shared__ alignas(16) bf16 vt[D][VPAD];
 
     const int bx = blockIdx.x;
     const int kv_head = blockIdx.y;
@@ -503,6 +521,8 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
     const int head = kv_head * G + packed % G;
     const bool row_live = token < qo_len;
     const int quad = ln / 16;
+    // Whether any of the wavefront's rows is a query (its first row is).
+    const bool wave_live = (qo_tile * kPrefillTileQ + wave * 16) / G < qo_len;
 
     // Qᵀ as B operands: column = this lane's query row, k = 4·quad + t.
     mfma_ab qf[KS];
@@ -521,63 +541,92 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
     const int key_hi = CAUSAL ? kv_len - qo_len + token : kv_len - 1;
     const int key_lo = kv_len - qo_len + token - wl;
 
-    for (int kv0 = chunk_start; kv0 < chunk_end; kv0 += BC) {
-        // Stage K and Vᵀ: 16 bytes (8 elements of one key) per thread-step.
-        for (int c = threadIdx.x; c < BC * D / 8; c += blockDim.x) {
-            const int key = c / (D / 8), j = (c % (D / 8)) * 8;
-            Pack8<bf16> kv8{}, vv8{};
-            if (kv0 + key < chunk_end) {
-                const long long at = kv_token<HND, D>(p, req, kv0 + key, kv_head, j);
-                kv8 = *reinterpret_cast<const Pack8<bf16>*>(p.k + at);
-                vv8 = *reinterpret_cast<const Pack8<bf16>*>(p.v + at);
-            }
-            *reinterpret_cast<Pack8<bf16>*>(&ks[key][j]) = kv8;
+    // A thread's reads of a tile: K piece c = tid + r·THREADS as (key c /
+    // (D/8), columns 8·(c % (D/8))), a wavefront one key's row; V piece c as
+    // (key c % BC, columns 8·(c / BC)), a wavefront 16 keys of four columns.
+    // Every read is issued (a key past the chunk reads the chunk's last,
+    // and lands as zeros at the store), so no read waits on another.
+    Pack8<bf16> kr[RD], vr[RD];
+    auto fetch = [&](int kv0) {
 #pragma unroll
-            for (int e = 0; e < 8; ++e) vt[j + e][key] = vv8.v[e];
+        for (int r = 0; r < RD; ++r) {
+            const int c = threadIdx.x + r * THREADS;
+            const int kkey = kv0 + c / (D / 8), kj = (c % (D / 8)) * 8;
+            const int vkey = kv0 + c % BC, vj = (c / BC) * 8;
+            kr[r] = *reinterpret_cast<const Pack8<bf16>*>(
+                p.k + kv_token<HND, D>(p, req, min(kkey, chunk_end - 1), kv_head, kj));
+            vr[r] = *reinterpret_cast<const Pack8<bf16>*>(
+                p.v + kv_token<HND, D>(p, req, min(vkey, chunk_end - 1), kv_head, vj));
         }
-        __syncthreads();
+    };
+    auto stage = [&](int kv0) {
+#pragma unroll
+        for (int r = 0; r < RD; ++r) {
+            const int c = threadIdx.x + r * THREADS;
+            const Pack8<bf16> k8 = kv0 + c / (D / 8) < chunk_end ? kr[r] : Pack8<bf16>{};
+            const Pack8<bf16> v8 = kv0 + c % BC < chunk_end ? vr[r] : Pack8<bf16>{};
+            *reinterpret_cast<Pack8<bf16>*>(&ks[c / (D / 8)][(c % (D / 8)) * 8]) = k8;
+            const int vkey = c % BC, vj = (c / BC) * 8;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) vt[vj + e][vkey] = v8.v[e];
+        }
+    };
+    if (chunk_start < chunk_end) fetch(chunk_start);
 
-        // Sᵀ: lane holds keys 4·quad + t of each 16-key tile, for its row.
-        mfma_cd s[KT];
+    for (int kv0 = chunk_start; kv0 < chunk_end; kv0 += BC) {
+        stage(kv0);
+        __syncthreads();
+        if (kv0 + BC < chunk_end) fetch(kv0 + BC);
+        if (wave_live) {
+            // Sᵀ: lane holds keys 4·quad + t of each 16-key tile, for its row;
+            // two chains over the head, so a product waits on the one before
+            // the last.
+            mfma_cd s[KT];
 #pragma unroll
-        for (int kt = 0; kt < KT; ++kt) {
-            s[kt] = mfma_cd{0.f, 0.f, 0.f, 0.f};
+            for (int kt = 0; kt < KT; ++kt) {
+                mfma_cd s2 = mfma_cd{0.f, 0.f, 0.f, 0.f};
+                s[kt] = mfma_cd{0.f, 0.f, 0.f, 0.f};
 #pragma unroll
-            for (int st = 0; st < KS; ++st) s[kt] = mfma16(load4(&ks[kt * 16 + ln % 16][st * 16 + 4 * quad]), qf[st], s[kt]);
-        }
-        float tile_max = neg_inf();
-#pragma unroll
-        for (int kt = 0; kt < KT; ++kt)
-#pragma unroll
-            for (int t = 0; t < 4; ++t) {
-                const int key = kv0 + kt * 16 + 4 * quad + t;
-                const bool seen = row_live && key < chunk_end && key <= key_hi && key >= key_lo;
-                s[kt][t] = seen ? s[kt][t] * p.scale_log2 : neg_inf();
-                tile_max = fmaxf(tile_max, s[kt][t]);
+                for (int st = 0; st < KS; st += 2) {
+                    s[kt] = mfma16(load4(&ks[kt * 16 + ln % 16][st * 16 + 4 * quad]), qf[st], s[kt]);
+                    s2 = mfma16(load4(&ks[kt * 16 + ln % 16][(st + 1) * 16 + 4 * quad]), qf[st + 1], s2);
+                }
+                s[kt] += s2;
             }
-        tile_max = fmaxf(tile_max, __shfl_xor(tile_max, 16, kWave));
-        tile_max = fmaxf(tile_max, __shfl_xor(tile_max, 32, kWave));
-        const float m_new = fmaxf(m, tile_max);
-        const float alpha = m_new == neg_inf() ? 1.f : exp2f(m - m_new);
-        float sum = 0.f;
-        mfma_ab pt[KT];
+            float tile_max = neg_inf();
 #pragma unroll
-        for (int kt = 0; kt < KT; ++kt) {
-            float e[4];
+            for (int kt = 0; kt < KT; ++kt)
 #pragma unroll
-            for (int t = 0; t < 4; ++t) {
-                e[t] = m_new == neg_inf() ? 0.f : exp2f(s[kt][t] - m_new);
-                sum += e[t];
+                for (int t = 0; t < 4; ++t) {
+                    const int key = kv0 + kt * 16 + 4 * quad + t;
+                    const bool seen = row_live && key < chunk_end && key <= key_hi && key >= key_lo;
+                    s[kt][t] = seen ? s[kt][t] * p.scale_log2 : neg_inf();
+                    tile_max = fmaxf(tile_max, s[kt][t]);
+                }
+            tile_max = fmaxf(tile_max, __shfl_xor(tile_max, 16, kWave));
+            tile_max = fmaxf(tile_max, __shfl_xor(tile_max, 32, kWave));
+            const float m_new = fmaxf(m, tile_max);
+            const float alpha = m_new == neg_inf() ? 1.f : exp2f(m - m_new);
+            float sum = 0.f;
+            mfma_ab pt[KT];
+#pragma unroll
+            for (int kt = 0; kt < KT; ++kt) {
+                float e[4];
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    e[t] = m_new == neg_inf() ? 0.f : exp2f(s[kt][t] - m_new);
+                    sum += e[t];
+                }
+                pt[kt] = pack4(e[0], e[1], e[2], e[3]);
             }
-            pt[kt] = pack4(e[0], e[1], e[2], e[3]);
-        }
-        l = l * alpha + sum;
-        m = m_new;
+            l = l * alpha + sum;
+            m = m_new;
 #pragma unroll
-        for (int dt = 0; dt < KS; ++dt) {
-            o[dt] *= alpha;
+            for (int dt = 0; dt < KS; ++dt) {
+                o[dt] *= alpha;
 #pragma unroll
-            for (int kt = 0; kt < KT; ++kt) o[dt] = mfma16(load4(&vt[dt * 16 + ln % 16][kt * 16 + 4 * quad]), pt[kt], o[dt]);
+                for (int kt = 0; kt < KT; ++kt) o[dt] = mfma16(load4(&vt[dt * 16 + ln % 16][kt * 16 + 4 * quad]), pt[kt], o[dt]);
+            }
         }
         __syncthreads();
     }
@@ -588,7 +637,7 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
     l += __shfl_xor(l, 32, kWave);
     if (!row_live) return;
 
-    const int num_chunks = (min(kv_len, wl + kPrefillTileQ) + chunk - 1) / chunk;
+    const int num_chunks = (min(kv_len, window_reach(wl, G)) + chunk - 1) / chunk;
     const long long row = p.partition
         ? static_cast<long long>(p.o_indptr[req]) + static_cast<long long>(token) * num_chunks + kv_tile
         : static_cast<long long>(p.o_indptr[req]) + token;
@@ -788,7 +837,7 @@ __global__ __launch_bounds__(512) void paged_prefill(const Paged p) {
     l += __shfl_xor(l, 32, kWave);
     if (!row_live) return;
 
-    const int num_chunks = (min(kv_len, wl + kPrefillTileQ) + chunk - 1) / chunk;
+    const int num_chunks = (min(kv_len, window_reach(wl, G)) + chunk - 1) / chunk;
     const long long row = p.partition
         ? static_cast<long long>(p.o_indptr[req]) + static_cast<long long>(token) * num_chunks + kv_tile
         : static_cast<long long>(p.o_indptr[req]) + token;

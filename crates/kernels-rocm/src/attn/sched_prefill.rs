@@ -81,6 +81,16 @@ fn search_kv_chunk_size(
     (enable_cuda_graph || low < max_kv_len, low)
 }
 
+/// The keys a windowed tile of `tile` packed rows reads from its first:
+/// the window, then its rows' tokens (⌈tile / group⌉, and one more where a
+/// tile starts mid-token), as the prefill kernels' `window_reach`.
+const fn window_reach(window_left: u32, tile: u32, group: u64) -> u64 {
+    window_left as u64 + (tile as u64).div_ceil(group) + 1
+}
+
+/// Windowed walks no longer than this many least chunks run whole, unsplit.
+const WINDOW_WHOLE: u64 = 2;
+
 fn graph_tiles(rows: u32, batch: u32, group: u64, head_dim: u32) -> (u32, u64) {
     let batch = u64::from(batch.max(1));
     let max_seq_len = u64::from(rows).saturating_sub(batch - 1);
@@ -157,12 +167,15 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
         (tile, tiles)
     };
 
+    // Under a window a tile reads the window behind its first query row
+    // and its own rows' keys: `window_reach` keys from its first (the
+    // kernels count a request's chunks over the same reach).
     let effective_kv_lens: Vec<u64> = kv_pages
         .iter()
         .map(|&pages| {
             let full = u64::from(pages);
             match req.window_left {
-                Some(window_left) => (u64::from(window_left) + u64::from(cta_tile_q))
+                Some(window_left) => window_reach(window_left, cta_tile_q, group)
                     .div_ceil(u64::from(req.page_size))
                     .min(full),
                 None => full,
@@ -170,14 +183,25 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
         })
         .collect();
 
-    let (split_kv, kv_chunk_size_in_pages) = search_kv_chunk_size(
-        req.enable_cuda_graph,
-        max_batch_size_if_split,
-        &packed_qo_lens,
-        &effective_kv_lens,
-        cta_tile_q,
-        min_kv_chunk_size,
-    );
+    // A short window's walk is a few kv tiles: splitting it would cost a
+    // fold of the partials for a chunk or two each. The window alone decides
+    // (no length does), so a captured plan keeps its layout across replays.
+    let whole = req.window_left.is_some_and(|window_left| {
+        window_reach(window_left, cta_tile_q, group).div_ceil(u64::from(req.page_size))
+            <= WINDOW_WHOLE * min_kv_chunk_size
+    });
+    let (split_kv, kv_chunk_size_in_pages) = if whole {
+        (false, effective_kv_lens.iter().copied().max().unwrap_or(1).max(1))
+    } else {
+        search_kv_chunk_size(
+            req.enable_cuda_graph,
+            max_batch_size_if_split,
+            &packed_qo_lens,
+            &effective_kv_lens,
+            cta_tile_q,
+            min_kv_chunk_size,
+        )
+    };
 
     let mut request_indices = Vec::new();
     let mut qo_tile_indices = Vec::new();
@@ -320,6 +344,10 @@ fn layout(
             16,
             "batch_prefill_merge_indptr",
         )?);
+    }
+    // A captured grid is padded past the work: its extra blocks read the
+    // mask and leave.
+    if sched.split_kv || req.enable_cuda_graph {
         info.block_valid_mask_offset =
             Some(ints.alloc(padded, 16, "batch_prefill_block_valid_mask")?);
     }
@@ -382,6 +410,8 @@ fn stage(
             &sched.merge_indptr,
             "batch_prefill_merge_indptr",
         )?;
+    }
+    if sched.split_kv || req.enable_cuda_graph {
         staging.put_bools(
             at(info.block_valid_mask_offset),
             (0..sched.padded_batch_size).map(|i| i < sched.new_batch_size as usize),

@@ -449,6 +449,75 @@ pub fn matmul_select(
     select_gemv(ctx, OP, x, bank, routes, y, experts)
 }
 
+/// A grouped projection (`linear.matmul_grouped`): row r's group g, x[r·groups
+/// + g] (k wide), through the bank's expert routes[r][g] (n x k) into y[r·groups
+/// + g]. `identity` states the routes are `group_routes`' (route g for group
+/// g, every row), so the fire is `groups` dense matmuls over strided planes:
+/// past the batch legs' reach (an expert there sees a route a row, too many
+/// for them, and too few experts for the grouped leg to fill the card) one
+/// strided-batched hipBLASLt launch takes it, else the routed select.
+pub fn matmul_grouped(
+    ctx: &Ctx,
+    x: Tensor,
+    bank: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+    experts: ExpertTable,
+    identity: bool,
+) -> Result<(), Error> {
+    const OP: &str = "linear.matmul_grouped";
+    let groups = routes.width;
+    if identity
+        && groups > 1
+        && x.dtype == Dtype::Bf16
+        && bank.dtype == Dtype::Bf16
+        && y.dtype == Dtype::Bf16
+        && dense_experts(x, bank, y, experts) == Some(groups)
+        && routes.rows > ctx.tuning().moe_batch_until
+        && x.rows == routes.rows * groups
+        && y.rows == x.rows
+        && grouped_lt(ctx, OP, x.ptr, bank.ptr, y.ptr, routes.rows, y.width, x.width, groups)?
+    {
+        return Ok(());
+    }
+    matmul_select(ctx, x, bank, routes, y, experts)
+}
+
+/// `groups` strided bf16 matmuls in one hipBLASLt launch; `Ok(false)` where
+/// hipBLASLt is absent or offers no algorithm.
+#[allow(clippy::too_many_arguments)]
+fn grouped_lt(
+    ctx: &Ctx,
+    op: &'static str,
+    x: u64,
+    w: u64,
+    y: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    groups: u32,
+) -> Result<bool, Error> {
+    use crate::hip::lt;
+    let shape = lt::Shape {
+        m,
+        n,
+        k,
+        bias: false,
+        groups,
+    };
+    let workspace = ctx.scratch_shared(op, "linear.lt_workspace", lt::WORKSPACE)? as u64;
+    let start = crate::prof::on()
+        .then(|| crate::prof::begin(ctx.stream()))
+        .flatten();
+    // SAFETY: x is [m, groups·k], y [m, groups·n] and w groups blocks of
+    // [n, k], device planes the caller sized; the workspace is this stream's.
+    let landed = unsafe { lt::matmul(shape, x, w, 0, y, workspace, ctx.stream()) };
+    crate::prof::end(ctx.stream(), start, || {
+        format!("{op} hipblaslt groups={groups} m={m} n={n} k={k}")
+    });
+    landed.map_err(|why| refuse(op, format!("{why} at {groups} x M={m} N={n} K={k}")))
+}
+
 /// The most experts `moe_route_order` buckets in its LDS.
 const ORDER_EXPERT_CAP: u32 = 4096;
 

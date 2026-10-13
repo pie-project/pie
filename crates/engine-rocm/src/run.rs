@@ -1636,6 +1636,19 @@ impl<'c> Run<'c> {
         }
     }
 
+    /// Whether `id` is `linear.group_routes`' over `groups` (route g for
+    /// every row's group g).
+    pub(crate) fn group_routes_of(&self, id: ValueId, groups: u32) -> bool {
+        let Def::Op(at) = self.values[id.0 as usize].def else {
+            return false;
+        };
+        matches!(
+            self.nodes.get(at as usize).map(|node| &node.op),
+            Some(poem_ir::Operation::Linear(poem_ir::Linear::GroupRoutes { groups: g, routes }))
+                if *g == groups && *routes == id
+        )
+    }
+
     pub(crate) fn expert_bank(&self, id: ValueId) -> (Tensor, ExpertTable) {
         let at = id.0 as usize;
         let Def::Weight(w) = &self.values[at].def else {

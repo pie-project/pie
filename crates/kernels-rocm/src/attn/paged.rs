@@ -287,13 +287,13 @@ pub fn prefill(
         heads: shape.num_q_heads,
         head_dim: shape.head_dim,
     });
+    if info.enable_cuda_graph {
+        args.block_valid = at(int, info.block_valid_mask_offset);
+    }
     match &split {
         Some(parts) => {
             args.o = parts.parts;
             args.lse = parts.part_lse;
-            if info.enable_cuda_graph {
-                args.block_valid = at(int, info.block_valid_mask_offset);
-            }
         }
         None => {
             args.o = o.ptr;

@@ -82,6 +82,7 @@ fn bench_lt_survey() {
                 n,
                 k,
                 bias: false,
+                groups: 1,
             };
             let reps = (2 * ptrs.len()).max(20) as u32;
             // SAFETY: the operands are live device tensors of the shape's

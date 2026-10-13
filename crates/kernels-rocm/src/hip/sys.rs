@@ -323,6 +323,9 @@ pub const LT_EPILOGUE_DEFAULT: c_int = 1;
 pub const LT_EPILOGUE_BIAS: c_int = 4;
 /// `HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES`.
 pub const LT_PREF_MAX_WORKSPACE_BYTES: c_int = 1;
+/// `hipblasLtMatrixLayoutAttribute_t`.
+pub const LT_LAYOUT_BATCH_COUNT: c_int = 0;
+pub const LT_LAYOUT_STRIDED_BATCH_OFFSET: c_int = 1;
 
 /// `hipblasLtMatmulHeuristicResult_t`: a 24-byte algo, then its workspace,
 /// state and waves (56 bytes, as `/opt/rocm/include/hipblaslt/hipblaslt.h`
@@ -347,6 +350,7 @@ table!(Hipblaslt from "libhipblaslt.so" {
     fn hipblasLtMatmulDescSetAttribute(desc: LtDesc, attr: c_int, value: *const c_void, size: usize) -> LtStatus;
     fn hipblasLtMatrixLayoutCreate(layout: *mut LtLayout, dtype: c_int, rows: u64, cols: u64, ld: i64) -> LtStatus;
     fn hipblasLtMatrixLayoutDestroy(layout: LtLayout) -> LtStatus;
+    fn hipblasLtMatrixLayoutSetAttribute(layout: LtLayout, attr: c_int, value: *const c_void, size: usize) -> LtStatus;
     fn hipblasLtMatmulPreferenceCreate(pref: *mut LtPreference) -> LtStatus;
     fn hipblasLtMatmulPreferenceDestroy(pref: LtPreference) -> LtStatus;
     fn hipblasLtMatmulPreferenceSetAttribute(pref: LtPreference, attr: c_int, value: *const c_void, size: usize) -> LtStatus;
