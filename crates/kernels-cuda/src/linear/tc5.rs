@@ -21,6 +21,8 @@ const OP: &str = "linear.tc5";
 const FILE: &str = "linear/tc5.cuh";
 const THREADS: u32 = 224;
 const SMEM_CAP: u32 = 232_448;
+/// The routing entries a grouped launch holds in shared memory.
+const MAX_ROUTES: u32 = 1028;
 
 /// An operand's element type as it lies in global memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -255,7 +257,8 @@ const fn smem_bytes(kind: Kind, gran_p: u32, gran_q: u32, plan: Plan) -> u32 {
         + atoms_k(kind, gran_q) * bn.div_ceil(128) * 512;
     let out = (stages * stage).div_ceil(1024) * 1024;
     let bar = out + if swap { 0 } else { 4 * 2 * 2048 };
-    bar + (2 * stages + 16) * 8 + 8 + 1024
+    // The routing a grouped launch holds is reserved for every launch.
+    bar + (2 * stages + 16) * 8 + 8 + MAX_ROUTES * 8 + 1024
 }
 
 /// One shape's specialization: which side is the MMA's M, whether two CTAs
@@ -312,8 +315,10 @@ impl Plan {
 
     /// K splits for `tiles` tiles of `steps` K steps on `slots` CTAs (or
     /// pairs): enough to fill them once three or more fit, each keeping four
-    /// steps to pipeline. Fewer than three do not repay the f32 sum's zeroing
-    /// and rounding passes.
+    /// steps to pipeline. Fewer do not repay the f32 sum's zeroing, its
+    /// reductions (one a split per output) and its rounding pass (two
+    /// splits of a long-K mid-M tile measured slower for fp8 and NVFP4),
+    /// and more than one wave of splits only multiplies the reductions.
     #[must_use]
     pub fn splits_for(tiles: u32, steps: u32, slots: u32) -> u32 {
         let fit = slots / tiles.max(1);
@@ -464,13 +469,21 @@ impl Plan {
             }
             Groups::Masked { m_max, .. } => {
                 let bn = m_max.next_multiple_of(32).clamp(32, 256);
-                let busy = g.experts.min(routed.max(1)) * m_max.div_ceil(bn);
+                let busy = g.experts.min(routed.max(1)) * m_max.div_ceil(bn) * n.div_ceil(128);
+                // The masked sum's zeroing and rounding passes walk every
+                // expert's rows: they repay only a launch that leaves most
+                // SMs idle.
+                let splits = if busy * 4 <= sms {
+                    Self::splits_for(busy, steps, sms)
+                } else {
+                    1
+                };
                 Self {
                     swap: true,
                     pair: false,
                     bn,
                     stages: 0,
-                    splits: Self::splits_for(busy * n.div_ceil(128), steps, sms),
+                    splits,
                 }
             }
         }
@@ -511,6 +524,15 @@ pub fn grouped_gemm_with(
 ) -> Result<(), Error> {
     if g.experts == 0 || n == 0 {
         return Ok(());
+    }
+    if g.experts >= MAX_ROUTES {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} experts; a launch routes fewer than {MAX_ROUTES}",
+                g.experts
+            ),
+        ));
     }
     let kind = admit(act, w, n, k, plan)?;
     if act.scales.is_some() && !n.is_multiple_of(128) {
@@ -982,6 +1004,22 @@ mod tests {
         );
         assert_eq!(atom_offset(128, 0, 8), 1024);
         assert_eq!(atom_bytes(129, 4096, 16), 2 * 64 * 512);
+    }
+
+    #[test]
+    fn a_decode_splits_and_a_full_wave_does_not() {
+        assert_eq!(
+            Plan::splits_for(32, 32, 148),
+            4,
+            "32 tiles leave 116 SMs idle"
+        );
+        assert_eq!(Plan::splits_for(128, 112, 148), 1);
+        assert_eq!(Plan::splits_for(4096, 32, 148), 1);
+        assert_eq!(
+            Plan::splits_for(8, 8, 148),
+            2,
+            "four steps a split at least"
+        );
     }
 
     #[test]

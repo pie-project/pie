@@ -16,9 +16,9 @@ use kernels_cuda::cudarc::cublaslt::sys as lt;
 use kernels_cuda::cudarc::runtime::sys as rt;
 use kernels_cuda::linear::tc5::{Elem, Operand, atom_bytes, gemm, supported};
 
-const FLUSH: usize = 512 << 20;
+pub(crate) const FLUSH: usize = 512 << 20;
 const ROUNDS: usize = 7;
-const BATCH: usize = 16;
+pub(crate) const BATCH: usize = 16;
 /// Weight copies a batch cycles through cover at least this many bytes.
 const COLD: usize = 384 << 20;
 
@@ -32,22 +32,22 @@ fn splitmix(state: &mut u64) -> u64 {
 
 /// Bytes whose every reading is finite: bf16 pairs, fp8 or fp4 codes,
 /// and scale bytes, all of modest magnitude.
-fn noise(bytes: usize, mask: u8, base: u8, seed: u64) -> Vec<u8> {
+pub(crate) fn noise(bytes: usize, mask: u8, base: u8, seed: u64) -> Vec<u8> {
     let mut state = seed;
     (0..bytes)
         .map(|_| (splitmix(&mut state) as u8 & mask) | base)
         .collect()
 }
 
-struct Timer {
-    flush: u64,
-    stream: rt::cudaStream_t,
+pub(crate) struct Timer {
+    pub(crate) flush: u64,
+    pub(crate) stream: rt::cudaStream_t,
 }
 
 impl Timer {
     /// The median over `ROUNDS` of the mean microseconds a launch takes in a
     /// back-to-back batch of `BATCH`, launch `i` reading weight copy `i`.
-    fn median(&self, mut launch: impl FnMut(usize)) -> f64 {
+    pub(crate) fn median(&self, mut launch: impl FnMut(usize)) -> f64 {
         launch(0);
         let mut times = Vec::with_capacity(ROUNDS);
         unsafe {

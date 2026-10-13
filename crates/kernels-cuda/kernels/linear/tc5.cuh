@@ -127,7 +127,10 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     constexpr u32 kOffOut = (kOffSfQ + kStages * kSfQ + 1023) / 1024 * 1024;
     constexpr u32 kOut = kSwap ? 0 : 4 * 2 * 2048;
     constexpr u32 kOffBar = kOffOut + kOut;
-    constexpr u32 kBytes = kOffBar + (2 * kStages + 16) * 8 + 8;
+    // A grouped launch holds the routing (offsets or counts) in shared memory:
+    // every role reads it once a unit, empty units most.
+    constexpr u32 kGroupInts = kGroup == 0 ? 0 : 2 * 1028;
+    constexpr u32 kBytes = kOffBar + (2 * kStages + 16) * 8 + 8 + kGroupInts * 4;
 
     extern __shared__ unsigned char smem_raw[];
     const u32 raw = smem_addr(smem_raw);
@@ -141,6 +144,8 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     u64* sf_ready = tover + 2;
     u64* sf_free = sf_ready + 4;
     u32* tmem_slot = reinterpret_cast<u32*>(sf_free + 4);
+    int* routes = reinterpret_cast<int*>(tmem_slot + 2);
+    int* starts = routes + 1028;
 
     const u32 warp = threadIdx.x / 32;
     const u32 lane = threadIdx.x % 32;
@@ -180,6 +185,41 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
         tmem_alloc<kPair>(tmem_slot, kCols);
         tmem_relinquish<kPair>();
     }
+    // A masked launch counts each expert's tiles up front, so units map
+    // straight onto the busy experts: walking empty ones costs every role
+    // a unit's bookkeeping each.
+    const int masked_p = (n_per + 127) / 128;
+    if (kGroup != 0 && warp == 0) {
+        for (int i = static_cast<int>(lane); i < experts + (kGroup == 1 ? 1 : 0); i += 32) {
+            routes[i] = __ldg(&group[i]);
+        }
+        if constexpr (kGroup == 2) {
+            __syncwarp();
+            const int per = (experts + 31) / 32;
+            const int lo = min(experts, static_cast<int>(lane) * per);
+            const int hi = min(experts, lo + per);
+            auto tiles_of = [&](int e) {
+                return (min(routes[e], m_max) + kBN - 1) / kBN * masked_p;
+            };
+            int sum = 0;
+            for (int i = lo; i < hi; ++i) {
+                sum += tiles_of(i);
+            }
+            int incl = sum;
+            for (int d = 1; d < 32; d <<= 1) {
+                const int up = __shfl_up_sync(0xffffffffu, incl, d);
+                incl += lane >= static_cast<u32>(d) ? up : 0;
+            }
+            int run = incl - sum;
+            for (int i = lo; i < hi; ++i) {
+                starts[i] = run;
+                run += tiles_of(i);
+            }
+            if (lane == 31) {
+                starts[experts] = incl;
+            }
+        }
+    }
     tc_fence_before();
     if constexpr (kPair == 2) {
         cluster_sync();
@@ -190,8 +230,10 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     const u32 tmem = *tmem_slot;
 
     // Tiles along P and Q (of one expert, when grouped), and the experts.
-    const int num_p = kGroup == 2 ? (n_per + 127) / 128
-                                  : (rows_p + static_cast<int>(kM) - 1) / static_cast<int>(kM);
+    // Contiguous P tiles stop at the routed rows.
+    const int num_p = kGroup == 2   ? masked_p
+                      : kGroup == 1 ? (routes[experts] + 127) / 128
+                                    : (rows_p + static_cast<int>(kM) - 1) / static_cast<int>(kM);
     const int num_q = kGroup == 0 ? (rows_q + kBN - 1) / kBN
                       : kGroup == 1 ? (n_per + kBN - 1) / kBN
                                     : (m_max + kBN - 1) / kBN;
@@ -199,7 +241,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     // A unit is one tile's share of K: `splits` of them a tile when a
     // decode's few tiles would leave SMs idle, summed in f32 at `part`.
     const int kb_per = (num_kb + splits - 1) / splits;
-    const int tiles = num_p * num_q * splits * (kGroup == 2 ? experts : 1);
+    const int tiles = (kGroup == 2 ? starts[experts] : num_p * num_q) * splits;
     const int first_tile = static_cast<int>(blockIdx.x) / kPair;
     const int tile_step = static_cast<int>(gridDim.x) / kPair;
 
@@ -223,10 +265,22 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
         x.alpha = alpha;
         int e = 0, pt, qt;
         if constexpr (kGroup == 2) {
-            e = t / (num_p * num_q);
-            const int r = t - e * num_p * num_q;
-            pt = r / num_q;
-            qt = r - pt * num_q;
+            // The last expert whose tiles start at or before t: an empty
+            // expert shares its start with the next.
+            int lo = 0, hi = experts - 1;
+            while (lo < hi) {
+                const int mid = (lo + hi + 1) / 2;
+                if (starts[mid] <= t) {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            e = lo;
+            const int q_tiles = (min(routes[e], m_max) + kBN - 1) / kBN;
+            const int r = t - starts[e];
+            pt = r / q_tiles;
+            qt = r - pt * q_tiles;
         } else {
             // Groups of 8 P tiles walk Q together, so a wave shares both
             // operands.
@@ -248,20 +302,20 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
             x.lim_q = rows_q - x.q_row;
         } else if constexpr (kGroup == 1) {
             x.p_row = pt * 128;
-            if (x.p_row >= __ldg(&group[experts])) {
+            if (x.p_row >= routes[experts]) {
                 return false;
             }
             int lo = 0, hi = experts - 1;
             while (lo < hi) {
                 const int mid = (lo + hi + 1) / 2;
-                if (__ldg(&group[mid]) <= x.p_row) {
+                if (routes[mid] <= x.p_row) {
                     lo = mid;
                 } else {
                     hi = mid - 1;
                 }
             }
             e = lo;
-            if (__ldg(&group[e]) % 128 != 0) {
+            if (routes[e] % 128 != 0) {
                 asm volatile("trap;");
             }
             x.q_row = e * n_per + qt * kBN;
@@ -271,7 +325,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
             x.lim_p = 128;
             x.lim_q = n_per - qt * kBN;
         } else {
-            const int count = __ldg(&group[e]);
+            const int count = min(routes[e], m_max);
             if (qt * kBN >= count) {
                 return false;
             }
