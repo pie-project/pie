@@ -203,9 +203,14 @@ __host__ __device__ constexpr int decode_fold_heads(int G, int D, int waves) {
 // 16-byte value reads. Eight wavefronts interleave their rounds over the
 // chunk (a 256-key chunk is one round each) and fold through LDS at the end,
 // as the other decode does.
+// Eight wavefronts a block; four at 512-wide heads, whose round needs more
+// than the 256 registers a wavefront gets at two a SIMD.
+template <int D>
+constexpr int kDecodeMfmaWaves = D >= 512 ? 4 : 8;
+
 template <int D, int G, bool HND>
-__global__ __launch_bounds__(512) void paged_decode_mfma(const Paged p) {
-    constexpr int WAVES = 8, SUB = 16, KT = SUB / 16, KP = D / 32;
+__global__ __launch_bounds__(64 * kDecodeMfmaWaves<D>) void paged_decode_mfma(const Paged p) {
+    constexpr int WAVES = kDecodeMfmaWaves<D>, SUB = 16, KT = SUB / 16, KP = D / 32;
     constexpr int LPK = D / 8;           // lanes a key's value row spans
     constexpr int KPI = kWave / LPK;     // keys one value read covers
     constexpr int VR = SUB / KPI;        // value reads a round
@@ -234,17 +239,36 @@ __global__ __launch_bounds__(512) void paged_decode_mfma(const Paged p) {
     const int lo = p.window_left >= 0 ? max(start, kv_len - 1 - p.window_left) : start;
     const int g = l % 16, quad = l / 16;
 
-    // Qᵀ as B operands: this lane's column is head g, k pairs 8·quad.
-    mfma_ab2 qf[KP];
+    // Qᵀ as B operands: this lane's column is head g, k pairs 8·quad. Held in
+    // registers, except at 512-wide heads, where they would push the round's
+    // reads into scratch: there every wavefront rereads them from LDS.
+    constexpr bool QLDS = D >= 512;
+    mfma_ab2 qf[QLDS ? 1 : KP];
+    __shared__ mfma_ab2 qs[QLDS ? KP : 1][kWave];
     {
         const bf16* qrow = p.q + static_cast<long long>(p.q_indptr[req]) * p.q_stride_n +
                            static_cast<long long>(kv_head * G + min(g, G - 1)) * p.q_stride_h;
+        if constexpr (QLDS) {
+            if (wave == 0) {
 #pragma unroll
-        for (int st = 0; st < KP; ++st) {
-            qf[st] = load8(qrow + st * 32 + 8 * quad);
-            if (g >= G) qf[st] = mfma_ab2{};
+                for (int st = 0; st < KP; ++st) qs[st][l] = g < G ? load8(qrow + st * 32 + 8 * quad) : mfma_ab2{};
+            }
+            __syncthreads();
+        } else {
+#pragma unroll
+            for (int st = 0; st < KP; ++st) {
+                qf[st] = load8(qrow + st * 32 + 8 * quad);
+                if (g >= G) qf[st] = mfma_ab2{};
+            }
         }
     }
+    auto q_at = [&](int st) -> mfma_ab2 {
+        if constexpr (QLDS) {
+            return qs[st][l];
+        } else {
+            return qf[st];
+        }
+    };
 
     float m = neg_inf(), lsum = 0.f;
     float acc[G][8];
@@ -267,25 +291,42 @@ __global__ __launch_bounds__(512) void paged_decode_mfma(const Paged p) {
     for (int t0 = w0 + wave * SUB; t0 < wend; t0 += WAVES * SUB) {
         // The round's key and value reads, all issued before any is used
         // (past the chunk they reread its last key, which weighs zero).
-        mfma_ab2 kr[KT][KP];
-#pragma unroll
-        for (int kt = 0; kt < KT; ++kt) {
-            const bf16* row = p.k + at(min(t0 + kt * 16 + g, wend - 1), 0) + 8 * quad;
-#pragma unroll
-            for (int st = 0; st < KP; ++st) kr[kt][st] = load8(row + st * 32);
-        }
-        Pack8<bf16> vr[VR];
-#pragma unroll
-        for (int i = 0; i < VR; ++i)
-            vr[i] = *reinterpret_cast<const Pack8<bf16>*>(
-                p.v + at(min(t0 + i * KPI + parity, wend - 1), col));
-
+        // The key reads in halves (KH of them at once): a 512-wide head's
+        // whole key row beside its value reads would not fit the registers.
+        constexpr int KH = QLDS ? KP / 2 : KP;
         mfma_cd s[KT];
+        mfma_ab2 kr[KT][KH];
+        auto read_keys = [&](int half) {
 #pragma unroll
-        for (int kt = 0; kt < KT; ++kt) {
-            s[kt] = mfma_zero();
+            for (int kt = 0; kt < KT; ++kt) {
+                const bf16* row = p.k + at(min(t0 + kt * 16 + g, wend - 1), 0) + 8 * quad + half * KH * 32;
 #pragma unroll
-            for (int st = 0; st < KP; ++st) s[kt] = mfma16x2(kr[kt][st], qf[st], s[kt]);
+                for (int st = 0; st < KH; ++st) kr[kt][st] = load8(row + st * 32);
+            }
+        };
+        auto score_keys = [&](int half) {
+#pragma unroll
+            for (int kt = 0; kt < KT; ++kt)
+#pragma unroll
+                for (int st = 0; st < KH; ++st) s[kt] = mfma16x2(kr[kt][st], q_at(half * KH + st), s[kt]);
+        };
+#pragma unroll
+        for (int kt = 0; kt < KT; ++kt) s[kt] = mfma_zero();
+        read_keys(0);
+        // The value reads ride ahead of the scores, except at 512-wide heads,
+        // which read them in halves after the weights (registers again).
+        auto value_at = [&](int i) {
+            return *reinterpret_cast<const Pack8<bf16>*>(p.v + at(min(t0 + i * KPI + parity, wend - 1), col));
+        };
+        Pack8<bf16> vr[QLDS ? 1 : VR];
+        if constexpr (!QLDS) {
+#pragma unroll
+            for (int i = 0; i < VR; ++i) vr[i] = value_at(i);
+        }
+        score_keys(0);
+        if constexpr (KH < KP) {
+            read_keys(1);
+            score_keys(1);
         }
         float tmax = neg_inf();
 #pragma unroll
@@ -323,18 +364,31 @@ __global__ __launch_bounds__(512) void paged_decode_mfma(const Paged p) {
 #pragma unroll
             for (int c = 0; c < 8; ++c) acc[h][c] *= a;
         }
-#pragma unroll
-        for (int i = 0; i < VR; ++i) {
+        auto weigh = [&](int i, const Pack8<bf16>& v) {
             const int kl = i * KPI + parity;
             float pv[G];
 #pragma unroll
             for (int h = 0; h < G; ++h) pv[h] = ps[wave][kl][h];
 #pragma unroll
             for (int c = 0; c < 8; ++c) {
-                const float vf = to_f32(vr[i].v[c]);
+                const float vf = to_f32(v.v[c]);
 #pragma unroll
                 for (int h = 0; h < G; ++h) acc[h][c] += pv[h] * vf;
             }
+        };
+        if constexpr (QLDS) {
+            constexpr int VH = VR / 2;
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                Pack8<bf16> vh[VH];
+#pragma unroll
+                for (int i = 0; i < VH; ++i) vh[i] = value_at(half * VH + i);
+#pragma unroll
+                for (int i = 0; i < VH; ++i) weigh(half * VH + i, vh[i]);
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < VR; ++i) weigh(i, vr[i]);
         }
         __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
         __builtin_amdgcn_wave_barrier();

@@ -208,7 +208,8 @@ pub fn decode(
                 "::pie::attn::paged_decode_mfma<{}, {group}, {hnd}>",
                 shape.head_dim
             )),
-            512,
+            // `kDecodeMfmaWaves`: four wavefronts at 512-wide heads.
+            if shape.head_dim >= 512 { 256 } else { 512 },
         )
     } else {
         let waves = decode_waves(group, shape.head_dim);

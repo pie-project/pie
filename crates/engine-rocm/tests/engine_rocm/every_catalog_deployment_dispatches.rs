@@ -14,52 +14,10 @@ struct Refusal {
     needle: &'static str,
 }
 
-const REFUSED: &[Refusal] = &[Refusal {
-    op: "attention.pool_lse_selected",
-    why: "no selected reader in pool.cuh; metal, vulkan and wgpu all cover it",
-    file: "src/dispatch/attn.rs",
-    needle: "op: \"attention.pool_lse_selected\"",
-}];
+/// Every op the catalog traces is served on this backend.
+const REFUSED: &[Refusal] = &[];
 
-const CANNOT_SERVE: &[(&str, &[&str])] = &[
-    ("dsv4-flash-bf16-kv-bf16", &["attention.pool_lse_selected"]),
-    (
-        "dsv4-flash-mini-bf16-kv-bf16",
-        &["attention.pool_lse_selected"],
-    ),
-    (
-        "dsv4-flash-mini-bf16-mxfp4-kv-bf16",
-        &["attention.pool_lse_selected"],
-    ),
-    (
-        "dsv41-flash-u4g64-kv-bf16",
-        &["attention.pool_lse_selected"],
-    ),
-    (
-        "dsv41-flash-bf16-mxfp4-kv-bf16",
-        &["attention.pool_lse_selected"],
-    ),
-    (
-        "dsv41-flash-mini-bf16-mxfp4-kv-bf16",
-        &["attention.pool_lse_selected"],
-    ),
-    (
-        "dsv4-flash-mini-u4g64-u2g64-kv-bf16",
-        &["attention.pool_lse_selected"],
-    ),
-    (
-        "dsv4-flash-u4g64-u2g64-kv-bf16",
-        &["attention.pool_lse_selected"],
-    ),
-    (
-        "dsv4-flash-mini-mtp-u4g64-u2g64-mxfp4-kv-bf16",
-        &["attention.pool_lse_selected"],
-    ),
-    (
-        "dsv4-flash-mtp-u4g64-u2g64-mxfp4-kv-bf16",
-        &["attention.pool_lse_selected"],
-    ),
-];
+const CANNOT_SERVE: &[(&str, &[&str])] = &[];
 
 fn ops_of(deployment: &str) -> BTreeSet<String> {
     let row = poem_compiler::catalog::deployment(deployment).expect("the row is in the catalog");

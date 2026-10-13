@@ -365,8 +365,6 @@ pub(crate) mod naive {
 
     pub const NAIVE_BLOCK: u32 = 256;
 
-    pub const NAIVE_WARPS: i32 = NAIVE_BLOCK as i32 / 32;
-
     pub const NAIVE_MAX_PER: i32 = 16;
 
     pub const NAIVE_MAX_PE_PER: i32 = 4;
@@ -385,11 +383,6 @@ pub(crate) mod naive {
         let per = WAVES as i64 * kv_lora_rank as i64 + 2 * WAVES as i64;
         let bytes = per * 4;
         if bytes < 0 { 0 } else { bytes as u32 }
-    }
-
-    #[must_use]
-    pub fn head_group(num_heads: i32, total_tokens: i32) -> i32 {
-        group_of(NAIVE_WARPS, num_heads, total_tokens)
     }
 
     /// Query heads a block of the MLA walk takes: as many as its wavefronts
@@ -1036,7 +1029,7 @@ pub fn attention_prefill_selected(
 #[cfg(test)]
 mod tests {
     use super::latent::supported;
-    use super::naive::{head_group, wave_group};
+    use super::naive::wave_group;
 
     #[test]
     fn the_matrix_core_walk_takes_the_512_latent_with_or_without_rope() {
@@ -1051,6 +1044,5 @@ mod tests {
         assert_eq!(wave_group(64, 1), 1);
         assert_eq!(wave_group(64, 4096), 4);
         assert_eq!(wave_group(6, 4096), 2);
-        assert_eq!(head_group(64, 4096), 8);
     }
 }

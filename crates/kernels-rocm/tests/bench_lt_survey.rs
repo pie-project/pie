@@ -15,14 +15,25 @@ use kernels_rocm::hip::lt;
 fn bench_lt_survey() {
     let Some(gpu) = Gpu::open() else { return };
     let ws = gpu.zeros(1, (lt::WORKSPACE / 2) as u32, Dtype::Bf16);
-    for (n, k) in [
-        (34816u32, 5120u32),
-        (5120, 17408),
-        (16384, 5120),
-        (5120, 6144),
-    ] {
+    let shapes: Vec<(u32, u32)> = std::env::var("SURVEY_NK").ok().map_or(
+        vec![(34816, 5120), (5120, 17408), (16384, 5120), (5120, 6144)],
+        |v| {
+            v.split(';')
+                .map(|p| {
+                    let mut it = p.split(',').map(|x| x.parse().unwrap());
+                    (it.next().unwrap(), it.next().unwrap())
+                })
+                .collect()
+        },
+    );
+    for (n, k) in shapes {
         let w = gpu.tensor(&values((n * k) as usize, 2, 0.05), n, k, Dtype::Bf16);
-        for m in [32u32, 64, 128, 256] {
+        let ms: Vec<u32> = std::env::var("SURVEY_M")
+            .ok()
+            .map_or(vec![32, 64, 128, 256], |v| {
+                v.split(',').map(|x| x.parse().unwrap()).collect()
+            });
+        for m in ms.iter().copied() {
             let a = gpu.tensor(&values((m * k) as usize, 1, 1.0), m, k, Dtype::Bf16);
             let y = gpu.zeros(m, n, Dtype::Bf16);
             let s = lt::Shape {

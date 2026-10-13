@@ -32,10 +32,21 @@ pub const EXCLUSIVE: [&str; 0] = [];
 
 pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
 
-/// The fused kernels this backend ships; the compiler forms only these. The
-/// CUDA engine's other fusions have no AMD kernel yet, so their primitives
-/// stay apart here.
-pub const FUSED: [&str; 2] = ["elementwise.residual_add_rmsnorm", "linear.mlp_swiglu"];
+/// The fused kernels this backend ships; the compiler forms only these.
+pub const FUSED: [&str; 12] = [
+    "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
+    "elementwise.rmsnorm_residual_add",
+    "elementwise.embed_scale_add_select",
+    "elementwise.embed_scale_add",
+    "elementwise.residual_add_rmsnorm",
+    "linear.matmul_geglu",
+    "linear.lm_head_softcap",
+    "linear.matmul_bias",
+    "linear.mlp_swiglu",
+    "elementwise.gated_residual_norm_modulate",
+    "elementwise.norm_modulate",
+    "elementwise.rmsnorm_rope_partial_q",
+];
 
 /// The fused kernels left on with `fuse-chains=off`.
 pub const UNCHAINED: [&str; 1] = ["elementwise.residual_add_rmsnorm"];
