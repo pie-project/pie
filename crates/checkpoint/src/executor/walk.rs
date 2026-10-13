@@ -16,7 +16,7 @@ use crate::codec::int4::decode_int4b8_elements;
 use crate::codec::mlx::decode_mlx_affine_codes;
 use crate::codec::mlx::mlx_affine_group_params_bits;
 use crate::codec::mxfp4::{decode_mxfp4_elements, encode_mxfp4_group};
-use crate::codec::rows::{EncodeOperand, encode_rows};
+use crate::codec::rows::{EncodeOperand, encode_rows, fp8_block_grid};
 use crate::consume::SourceLedger;
 use crate::error::Error;
 use crate::executor::arena::{ArenaBacking, ArenaSpan, TileMapOp};
@@ -1863,35 +1863,24 @@ impl Walk<'_, '_> {
             checked_usize_i64(scale_rows)?,
             checked_usize_i64(scale_cols)?,
         );
-        // A trailing block may be short (576 rows under 5 factors of 128),
-        // so the block is the widest a factor covers, and each axis must
-        // count exactly its factors in blocks of it.
-        let group = true_rows
-            .div_ceil(scale_rows.max(1))
-            .max(true_cols.div_ceil(scale_cols.max(1)));
-        if scale_rows == 0
-            || scale_cols == 0
-            || group == 0
-            || true_rows.div_ceil(group) != scale_rows
-            || true_cols.div_ceil(group) != scale_cols
-        {
-            return Err(invalid(format!(
-                "FP8 Encode source '{}' has unsupported scale shape \
-                 [{scale_rows}, {scale_cols}] for weight [{true_rows}, {true_cols}]",
-                weight.name
-            )));
-        }
+        let chunks = usize::try_from(transform.fp8_chunks).unwrap_or(usize::MAX);
+        let grid = fp8_block_grid([true_rows, true_cols], [scale_rows, scale_cols], chunks)
+            .map_err(|why| invalid(format!("FP8 source '{}' {why}", weight.name)))?;
 
-        let base = checked_usize(source.stride.base_offset)?;
-        let scale_row_offset = (base / true_cols) / group;
-        let scale_col_offset = (base % true_cols) / group;
-        if scale_row_offset + rows.div_ceil(group) > scale_rows + 1
-            || scale_col_offset + cols.div_ceil(group) > scale_cols + 1
-        {
+        // A view's offset into the codes is carried in its file offset, its
+        // stride's base, or both; one code is one byte.
+        let base = source
+            .file_offset
+            .checked_sub(weight.file_offset)
+            .and_then(|into| into.checked_add(source.stride.base_offset))
+            .ok_or_else(|| invalid(format!("FP8 shard of '{}' starts before it", weight.name)))?;
+        let base = checked_usize(base)?;
+        let (first_row, first_col) = (base / true_cols, base % true_cols);
+        if first_row + rows > true_rows || first_col + cols > true_cols {
             return Err(invalid(format!(
-                "FP8 Encode shard [{rows}, {cols}] at offset {base} reaches past \
-                 the [{scale_rows}, {scale_cols}] factors of '{}'",
-                scale.name
+                "FP8 shard [{rows}, {cols}] at offset {base} reaches past the \
+                 [{true_rows}, {true_cols}] codes of '{}'",
+                weight.name
             )));
         }
 
@@ -1917,24 +1906,22 @@ impl Walk<'_, '_> {
             .iter()
             .map(|le| f32::from_le_bytes(*le))
             .collect();
-        let last_index = (scale_row_offset + (rows.saturating_sub(1)) / group) * scale_cols
-            + scale_col_offset
-            + (cols.saturating_sub(1)) / group;
-        if rows > 0 && cols > 0 && last_index >= factors.len() {
+        if factors.len() != scale_rows * scale_cols {
             return Err(invalid(format!(
-                "FP8 Encode factors for '{}' end at {} but the shard reads {}",
+                "FP8 factors '{}' hold {} values, not [{scale_rows}, {scale_cols}]",
                 scale.name,
-                factors.len(),
-                last_index
+                factors.len()
             )));
         }
         Ok(EncodeOperand::BlockScaledFp8 {
             bytes,
             factors,
             scale_cols,
-            group,
-            scale_row_offset,
-            scale_col_offset,
+            group: grid.group,
+            chunk_rows: grid.chunk_rows,
+            chunk_blocks: grid.chunk_blocks,
+            first_row,
+            first_col,
         })
     }
 

@@ -1531,6 +1531,7 @@ fn decodes_a_packed_plane(expr: &Expr, checkpoint: &Metadata, contract: &ModelCo
             Expr::Cast {
                 src,
                 to: Encoding::Raw(_),
+                ..
             } => src,
             Expr::Scale {
                 src,

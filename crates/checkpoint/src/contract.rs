@@ -69,9 +69,14 @@ pub enum Expr {
         layout: RepackLayout,
         to: TensorType,
     },
+    /// `src` re-encoded as `to`. A block-scaled FP8 source read so states
+    /// `chunks`, the shards its rows are stored cut into, each scaled apart
+    /// (0: one grid over every row).
     Cast {
         src: Box<Expr>,
         to: Encoding,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        chunks: u32,
     },
     Scale {
         src: Box<Expr>,
@@ -496,9 +501,16 @@ impl Expr {
     }
 
     pub fn cast(self, to: Encoding) -> Self {
+        self.cast_chunked(to, 0)
+    }
+
+    /// [`Expr::cast`] of a block-scaled FP8 source whose rows are stored cut
+    /// into `chunks` shards, each under a factor grid of its own.
+    pub fn cast_chunked(self, to: Encoding, chunks: u32) -> Self {
         Expr::Cast {
             src: Box::new(self),
             to,
+            chunks,
         }
     }
 
@@ -697,9 +709,10 @@ impl Expr {
                 src: boxed(src)?,
                 op,
             },
-            Expr::Cast { src, to } => Expr::Cast {
+            Expr::Cast { src, to, chunks } => Expr::Cast {
                 src: boxed(src)?,
                 to,
+                chunks,
             },
             Expr::Scale { src, factor } => Expr::Scale {
                 src: boxed(src)?,
@@ -730,4 +743,8 @@ impl Expr {
             },
         })
     }
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }

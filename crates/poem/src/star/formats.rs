@@ -241,12 +241,17 @@ fn expr_methods(builder: &mut MethodsBuilder) {
         ))))
     }
 
-    /// The values re-encoded as `encoding`.
+    /// The values re-encoded as `encoding`; a block-scaled FP8 source states
+    /// the `chunks` its rows are stored cut into, each under factors of its
+    /// own.
     fn cast(
         this: &ExprValue,
         #[starlark(require = pos)] encoding: &EncodingValue,
+        #[starlark(require = named, default = 0)] chunks: u32,
     ) -> anyhow::Result<ExprValue> {
-        Ok(ExprValue(this.0.clone().cast(encoding.0.clone())))
+        Ok(ExprValue(
+            this.0.clone().cast_chunked(encoding.0.clone(), chunks),
+        ))
     }
 
     /// The values times `factor`.

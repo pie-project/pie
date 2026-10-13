@@ -1326,6 +1326,7 @@ mod tests {
                     Expr::Cast {
                         src: Box::new(Expr::Src("stored".into())),
                         to: Encoding::Raw(DType::F32),
+                        chunks: 0,
                     },
                 ),
                 entry(
@@ -1333,6 +1334,7 @@ mod tests {
                     Expr::Cast {
                         src: Box::new(Expr::Out("leaf".into())),
                         to: Encoding::Raw(DType::F32),
+                        chunks: 0,
                     },
                 ),
             ],

@@ -287,13 +287,13 @@ impl Builder<'_> {
                     self.transform_with(payload, &decl, TileMapKind::Unary, Vec::new(), spec)?;
                 (value, decl)
             }
-            Expr::Cast { src, to } => {
+            Expr::Cast { src, to, chunks } => {
                 let operand = TensorDecl {
                     encoding: self.resolver.infer(src, &contract.name)?.encoding,
                     ..decl
                 };
                 let (value, _) = self.operand_bytes(src, &operand)?;
-                self.convert(value, operand, to)?
+                self.convert(value, operand, to, *chunks)?
             }
             Expr::Const { .. } => {
                 return Err(Error::Internal(
@@ -529,6 +529,7 @@ impl Builder<'_> {
         value: Value,
         decl: TensorDecl,
         to: &Encoding,
+        chunks: u32,
     ) -> Result<(Value, TensorDecl)> {
         let out = TensorDecl {
             encoding: to.clone(),
@@ -541,6 +542,7 @@ impl Builder<'_> {
                 TileMapKind::Cast,
                 TransformSpec {
                     to: Some(dtype_to_quant_marker(dtype)),
+                    fp8_chunks: chunks,
                     ..TransformSpec::default()
                 },
             )?,
@@ -563,7 +565,7 @@ impl Builder<'_> {
             }
             (Encoding::Raw(_), Encoding::Quant(target)) => {
                 let metadata = self.quant_metadata_outputs(&out)?;
-                self.encode(value, &out, target.scheme, &metadata)?
+                self.encode(value, &out, target.scheme, &metadata, chunks)?
             }
             (Encoding::Quant(_), Encoding::Quant(_)) => {
                 return Err(Error::Internal(
@@ -677,6 +679,7 @@ impl Builder<'_> {
         decl: &TensorDecl,
         scheme: QuantScheme,
         metadata: &[TensorDecl],
+        chunks: u32,
     ) -> Result<Value> {
         if metadata.is_empty() {
             return self.transform(
@@ -685,6 +688,7 @@ impl Builder<'_> {
                 TileMapKind::Encode,
                 TransformSpec {
                     to: Some(scheme),
+                    fp8_chunks: chunks,
                     ..TransformSpec::default()
                 },
             );
@@ -701,6 +705,7 @@ impl Builder<'_> {
         let transform = self.with_block_scale_source(
             TransformSpec {
                 to: Some(scheme),
+                fp8_chunks: chunks,
                 ..TransformSpec::default()
             },
             source.as_ref(),

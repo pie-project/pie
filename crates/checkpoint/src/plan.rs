@@ -238,6 +238,11 @@ pub struct TransformSpec {
     pub repack: Option<RepackSpec>,
     pub scratch_bytes: u64,
     pub metadata_source: Option<TensorId>,
+    /// The shards a block-scaled FP8 source's rows are stored cut into, each
+    /// under a factor grid of its own (0: one grid, or the one cut its
+    /// factors account for).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub fp8_chunks: u32,
     pub scale_factor_bits: u32,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub bias_bits: u32,
