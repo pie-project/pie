@@ -13,6 +13,7 @@ pub mod inkling;
 pub mod kimi;
 pub mod kimi3;
 pub mod lines;
+pub mod minimax;
 pub mod raw;
 pub mod spec;
 

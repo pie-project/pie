@@ -22,8 +22,8 @@ A model is spoken through a template and a tokenizer, both stated as data in
 `package.poem`, so no Rust names a model:
 
 - `template(format, …)` picks a format the runtime ships (`chatml`, `harmony`,
-  `gemma`, `deepseek`, `glm`, `kimi`, `kimi3`, `inkling`, `atem`, `lines`,
-  `raw`) and sets what the format leaves open: ChatML its `thinking`,
+  `gemma`, `deepseek`, `glm`, `kimi`, `kimi3`, `inkling`, `atem`, `minimax`,
+  `lines`, `raw`) and sets what the format leaves open: ChatML its `thinking`,
   `preserve_thinking`, `tools`, `generation_suffix` and `stop`; `lines` its
   `stop`, `bos` and `eos`; `raw` its `stop`. A setting the format does not
   read is refused.
