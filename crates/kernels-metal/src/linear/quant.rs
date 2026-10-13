@@ -962,6 +962,17 @@ const STAGED_DEEP: i32 = 8192;
 
 const STAGED_FEW_TILES: i32 = 32;
 
+/// The contraction span the register-fed tile permutes within: four quant groups.
+const COOP_SPAN: i32 = 256;
+
+/// Narrower than this the staged tile is as quick (a 1024-column projection is 32 tiles).
+const COOP_LEAST_COLUMNS: i32 = 4096;
+
+/// From this many columns the register-fed tile fills the device without a k cut.
+const COOP_WHOLE_COLUMNS: i32 = 12288;
+
+const COOP_SPLIT: i32 = 4;
+
 #[allow(clippy::too_many_arguments)]
 fn staged(
     ctx: &Ctx<'_>,
@@ -974,6 +985,49 @@ fn staged(
     (m, n, k, cols, ld): (i32, i32, i32, i32, i32),
 ) -> Result<(), Error> {
     let tiles = cols / 64;
+    if cols >= COOP_LEAST_COLUMNS && k % COOP_SPAN == 0 {
+        // Wide enough to fill the device from its columns alone, it runs whole; narrower, the
+        // contraction is cut in four so a 5120-column projection is not 160 simdgroups.
+        let split = if cols >= COOP_WHOLE_COLUMNS || (k / COOP_SPAN) % COOP_SPLIT != 0 {
+            1
+        } else {
+            COOP_SPLIT
+        };
+        let partial = if split > 1 {
+            (scratch.partials)(m.unsigned_abs() * split.unsigned_abs(), n.unsigned_abs())
+        } else {
+            None
+        };
+        if split == 1 || partial.is_some() {
+            let entry = symbol(&format!("affine_qmm_coop_m{STAGED_TILE}_k{split}"));
+            let stamp = symbol(&format!("PIE_COOP_POINT(\"{entry}\",{split})"));
+            ctx.fire(
+                Fire::at(STAGED_FILE, entry).stamp(stamp).apply(Grid::of(
+                    [64 * tiles.unsigned_abs(), split.unsigned_abs(), 1],
+                    [64, 1, 1],
+                )),
+                &[
+                    w.codes.arg(),
+                    w.scales.arg(),
+                    biases.arg(),
+                    act.arg(),
+                    y.arg_mut(),
+                    k.arg(),
+                    n.arg(),
+                    match partial {
+                        Some(partial) => partial.arg_mut(),
+                        None => ctx.absent()?,
+                    },
+                    m.arg(),
+                    ld.arg(),
+                ],
+            )?;
+            return match partial {
+                Some(partial) => splitk_reduce(ctx, op, y, partial, (m, n, cols), split),
+                None => Ok(()),
+            };
+        }
+    }
     let mut split = if k >= STAGED_DEEP || tiles < STAGED_FEW_TILES {
         STAGED_SPLIT_WIDE
     } else {
@@ -1013,9 +1067,21 @@ fn staged(
             ld.arg(),
         ],
     )?;
-    let Some(partial) = partial else {
-        return Ok(());
-    };
+    match partial {
+        Some(partial) => splitk_reduce(ctx, op, y, partial, (m, n, cols), split),
+        None => Ok(()),
+    }
+}
+
+/// Folds the `split` stacked f32 partials of an `m x n` product into `y`, over `cols` columns.
+fn splitk_reduce(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    y: Tensor,
+    partial: Tensor,
+    (m, n, cols): (i32, i32, i32),
+    split: i32,
+) -> Result<(), Error> {
     let stride = m
         .checked_mul(n)
         .ok_or_else(|| refuse(op, format!("{m} x {n} partials will not stack")))?;
