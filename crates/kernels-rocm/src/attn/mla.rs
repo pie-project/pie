@@ -357,6 +357,8 @@ pub fn kv_append(
     )
 }
 
+/// The reference walk of `kernels/attn/mla.hip` (`mla_naive`): any latent
+/// and rope width, a wavefront per (query row, key stride).
 pub(crate) mod naive {
     use super::{ArgValue, Ctx, Error, Fire, Launch, refuse};
     use crate::jit::Arg;
@@ -371,25 +373,34 @@ pub(crate) mod naive {
 
     pub const WAVE_TARGET: i64 = 296;
 
-    pub const MMA_BM: i32 = 16;
+    /// Wavefronts in the MLA walk's block.
+    const WAVES: i32 = NAIVE_BLOCK as i32 / 64;
 
-    pub const MMA_SMEM_BYTES: u32 = 100_032;
+    /// The widest latent and rope rows a lane-split walk holds.
+    pub const MAX_LATENT: i32 = 64 * NAIVE_MAX_PER;
+    pub const MAX_ROPE: i32 = 64 * NAIVE_MAX_PE_PER;
 
     #[must_use]
     pub const fn naive_smem_bytes(kv_lora_rank: i32) -> u32 {
-        let per = NAIVE_WARPS as i64 * kv_lora_rank as i64 + 2 * NAIVE_WARPS as i64;
+        let per = WAVES as i64 * kv_lora_rank as i64 + 2 * WAVES as i64;
         let bytes = per * 4;
         if bytes < 0 { 0 } else { bytes as u32 }
     }
 
     #[must_use]
-    pub const fn mma_supported(kv_lora_rank: i32, rope_dim: i32, num_heads: i32) -> bool {
-        kv_lora_rank == 512 && rope_dim == 64 && num_heads % MMA_BM == 0
+    pub fn head_group(num_heads: i32, total_tokens: i32) -> i32 {
+        group_of(NAIVE_WARPS, num_heads, total_tokens)
     }
 
+    /// Query heads a block of the MLA walk takes: as many as its wavefronts
+    /// while the grid still fills the device.
     #[must_use]
-    pub fn head_group(num_heads: i32, total_tokens: i32) -> i32 {
-        let mut g = NAIVE_WARPS;
+    pub fn wave_group(num_heads: i32, total_tokens: i32) -> i32 {
+        group_of(WAVES, num_heads, total_tokens)
+    }
+
+    fn group_of(most: i32, num_heads: i32, total_tokens: i32) -> i32 {
+        let mut g = most;
         while g > 1
             && (num_heads % g != 0
                 || i64::from(total_tokens) * i64::from(num_heads / g) < WAVE_TARGET)
@@ -427,8 +438,6 @@ pub(crate) mod naive {
     }
 
     pub fn fire(ctx: &Ctx, op: &'static str, ptrs: Ptrs, shape: Shape) -> Result<(), Error> {
-        const MMA_THREADS: u32 = 256;
-
         if shape.total_tokens <= 0 {
             return Err(refuse(op, "the query this attention was handed is empty"));
         }
@@ -438,73 +447,25 @@ pub(crate) mod naive {
                 "the CSR triple this attention resolves its pages from is null",
             ));
         }
-        let selected = ptrs.selection != 0;
-
-        if !selected && mma_supported(shape.kv_lora_rank, shape.rope_dim, shape.num_heads) {
-            #[allow(clippy::cast_sign_loss)]
-            let launch = Launch::grid(
-                [
-                    (shape.num_heads / MMA_BM).max(0) as u32,
-                    shape.total_tokens.max(0) as u32,
-                    1,
-                ],
-                [MMA_THREADS, 1, 1],
-            )
-            .smem(MMA_SMEM_BYTES);
-            return ctx.fire(
-                op,
-                Fire::at(
-                    "attn/mla.hip",
-                    "::pie::attn::mla_naive::mma_detail::mla_mma_paged_kernel",
-                )
-                .apply(launch),
-                &[
-                    ArgValue::Ptr(ptrs.q_nope),
-                    ArgValue::Ptr(ptrs.q_pe),
-                    ArgValue::Ptr(ptrs.ckv_pages),
-                    ArgValue::Ptr(ptrs.kpe_pages),
-                    ArgValue::Ptr(ptrs.qo_indptr),
-                    ArgValue::Ptr(ptrs.kv_page_indices),
-                    ArgValue::Ptr(ptrs.kv_page_indptr),
-                    ArgValue::Ptr(ptrs.kv_last_page_lens),
-                    ArgValue::Ptr(ptrs.o),
-                    shape.num_requests.arg(),
-                    shape.num_heads.arg(),
-                    shape.page_size.arg(),
-                    shape.sm_scale.arg(),
-                    shape.causal.arg(),
-                    ctx.stage(),
-                ],
-            );
-        }
-
-        let ckv = shape.kv_lora_rank;
-        let kpe = shape.rope_dim;
-        if ckv % 32 != 0 || ckv / 32 > NAIVE_MAX_PER {
+        let (ckv, kpe) = (shape.kv_lora_rank, shape.rope_dim);
+        if ckv <= 0 || ckv > MAX_LATENT {
             return Err(refuse(
                 op,
-                format!(
-                    "the latent rank {ckv} is not one this kernel can lane-split \
-                     (a multiple of 32, at most 512)"
-                ),
+                format!("the latent rank {ckv} is not one this walk holds (1..={MAX_LATENT})"),
             ));
         }
-        if kpe % 32 != 0 || kpe / 32 > NAIVE_MAX_PE_PER {
+        if !(0..=MAX_ROPE).contains(&kpe) {
             return Err(refuse(
                 op,
-                format!(
-                    "the rope width {kpe} is not one this kernel can lane-split \
-                     (a multiple of 32, at most 128)"
-                ),
+                format!("the rope width {kpe} is not one this walk holds (0..={MAX_ROPE})"),
             ));
         }
-
-        let g = head_group(shape.num_heads, shape.total_tokens);
+        let g = wave_group(shape.num_heads, shape.total_tokens);
         #[allow(clippy::cast_sign_loss)]
         let launch = Launch::grid(
             [
-                shape.total_tokens.max(0) as u32,
-                (shape.num_heads / g.max(1)).max(1) as u32,
+                shape.total_tokens as u32,
+                (shape.num_heads / g).max(1) as u32,
                 1,
             ],
             [NAIVE_BLOCK, 1, 1],
@@ -543,252 +504,276 @@ pub(crate) mod naive {
     }
 }
 
-mod mla_fa2 {
-    use super::{Ctx, Error, Layer, UintFastdiv, refuse, resolve};
-    use crate::attn::plan::{MlaPlan, MlaPlanInfo};
-    use crate::jit::{Fire, Launch};
+/// The matrix-core walk of `kernels/attn/mla.hip` (`mla`): a 512-wide
+/// latent beside a 64-wide (or no) rope plane, 64 query rows a block.
+pub(crate) mod latent {
+    use super::{ArgValue, Ctx, Error, Fire, Launch, Layer, refuse};
+    use crate::attn::plan::MlaPlan;
+    use crate::jit::symbol;
 
     const FILE: &str = "attn/mla.hip";
 
-    pub const INST: [[&str; 2]; 3] = [
-        [
-            "::flashinfer::mla::BatchMLAPagedAttentionKernel\
-             <::pie::attn::mla_fa2::Traits<false, 2u, true, 64u>, \
-             ::pie::attn::mla_fa2::Params>",
-            "::flashinfer::mla::BatchMLAPagedAttentionKernel\
-             <::pie::attn::mla_fa2::Traits<true, 2u, true, 64u>, \
-             ::pie::attn::mla_fa2::Params>",
-        ],
-        [
-            "::flashinfer::mla::BatchMLAPagedAttentionKernel\
-             <::pie::attn::mla_fa2::Traits<false, 2u, true, 32u>, \
-             ::pie::attn::mla_fa2::Params>",
-            "::flashinfer::mla::BatchMLAPagedAttentionKernel\
-             <::pie::attn::mla_fa2::Traits<true, 2u, true, 32u>, \
-             ::pie::attn::mla_fa2::Params>",
-        ],
-        [
-            "::flashinfer::mla::BatchMLAPagedAttentionKernel\
-             <::pie::attn::mla_fa2::Traits<false, 1u, false, 16u>, \
-             ::pie::attn::mla_fa2::Params>",
-            "::flashinfer::mla::BatchMLAPagedAttentionKernel\
-             <::pie::attn::mla_fa2::Traits<true, 1u, false, 16u>, \
-             ::pie::attn::mla_fa2::Params>",
-        ],
-    ];
+    pub const RANK: i32 = 512;
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct Arm {
-        #[allow(dead_code)]
-        pub stages: u32,
-        pub cta_tile_kv: u32,
-        #[allow(dead_code)]
-        pub qk_shard: bool,
-        pub smem: u32,
-    }
+    /// Query rows a block owns, and its threads.
+    pub const BLOCK_ROWS: u32 = 64;
+    const THREADS: u32 = 512;
 
-    pub const ARMS: [Arm; 3] = [
-        Arm {
-            stages: 2,
-            cta_tile_kv: 64,
-            qk_shard: true,
-            smem: 221_696,
-        },
-        Arm {
-            stages: 2,
-            cta_tile_kv: 32,
-            qk_shard: true,
-            smem: 147_968,
-        },
-        Arm {
-            stages: 1,
-            cta_tile_kv: 16,
-            qk_shard: false,
-            smem: 92_672,
-        },
-    ];
+    /// Keys a split takes at least: two of the walk's 32-key tiles.
+    const MIN_SHARE: u64 = 64;
+
+    const MAX_SPLITS: u64 = 64;
 
     #[must_use]
-    pub const fn arm_index(smem_limit_per_sm: u32) -> Option<usize> {
-        let mut i = 0;
-        while i < ARMS.len() {
-            if smem_limit_per_sm >= ARMS[i].smem {
-                return Some(i);
-            }
-            i += 1;
-        }
-        None
+    pub const fn supported(rank: i32, rope: i32) -> bool {
+        rank == RANK && (rope == 0 || rope == 64)
     }
 
+    fn scale_log2(sm_scale: f32) -> f32 {
+        sm_scale * core::f32::consts::LOG2_E
+    }
+
+    fn by_value<P>(params: &P) -> ArgValue {
+        ArgValue::Bytes {
+            ptr: core::ptr::from_ref(params).cast::<u8>(),
+            len: core::mem::size_of::<P>(),
+        }
+    }
+
+    const fn at(base: u64, off: Option<u32>) -> u64 {
+        match off {
+            Some(off) => base + off as u64,
+            None => 0,
+        }
+    }
+
+    /// `pie::attn::mla::Work`, field for field.
     #[repr(C)]
-    #[derive(Clone, Copy, Debug)]
-    pub struct MlaParams {
+    #[derive(Clone, Copy, Debug, Default)]
+    struct Work {
+        q_nope: u64,
+        q_pe: u64,
+        ckv: u64,
+        kpe: u64,
+        kv_indices: u64,
+        q_indptr: u64,
+        kv_indptr: u64,
+        partial_indptr: u64,
+        q_len: u64,
+        kv_len: u64,
+        q_start: u64,
+        kv_start: u64,
+        kv_end: u64,
+        work_indptr: u64,
+        o: u64,
+        lse: u64,
+        partial_o: u64,
+        partial_lse: u64,
+        num_heads: i32,
+        page_size: i32,
+        scale_log2: f32,
+        causal: i32,
+    }
+
+    const _: () = assert!(core::mem::size_of::<Work>() == 160);
+
+    /// `pie::attn::mla::Merge`, field for field.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    struct Merge {
+        start: u64,
+        end: u64,
+        pstart: u64,
+        pend: u64,
+        stride: u64,
+        partial_o: u64,
+        partial_lse: u64,
+        o: u64,
+        lse: u64,
+        num_heads: i32,
+    }
+
+    const _: () = assert!(core::mem::size_of::<Merge>() == 80);
+
+    /// `pie::attn::mla::Gather`, field for field.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default)]
+    pub(crate) struct Gather {
         pub q_nope: u64,
         pub q_pe: u64,
         pub ckv: u64,
         pub kpe: u64,
-        pub partial_o: u64,
-        pub partial_lse: u64,
-        pub final_o: u64,
-        pub final_lse: u64,
-        pub q_indptr: u64,
-        pub kv_indptr: u64,
-        pub partial_indptr: u64,
-        pub merge_packed_offset_start: u64,
-        pub merge_packed_offset_end: u64,
-        pub merge_partial_packed_offset_start: u64,
-        pub merge_partial_packed_offset_end: u64,
-        pub merge_partial_stride: u64,
-        pub kv_indices: u64,
-        pub q_len: u64,
-        pub kv_len: u64,
-        pub q_start: u64,
-        pub kv_start: u64,
-        pub kv_end: u64,
-        pub work_indptr: u64,
-        pub block_size: UintFastdiv,
-        pub num_heads: UintFastdiv,
-        pub q_nope_stride_n: u32,
-        pub q_nope_stride_h: u32,
-        pub q_pe_stride_n: u32,
-        pub q_pe_stride_h: u32,
-        pub ckv_stride_page: u32,
-        pub ckv_stride_n: u32,
-        pub kpe_stride_page: u32,
-        pub kpe_stride_n: u32,
-        pub o_stride_n: u32,
-        pub o_stride_h: u32,
-        pub sm_scale: f32,
-        pub ckv_scale: f32,
-        pub kpe_scale: f32,
-        pub return_lse_base_on_e: bool,
-    }
-
-    const _: () = assert!(
-        core::mem::size_of::<MlaParams>() == 288,
-        "MlaParams: sizeof disagrees with the measured ::flashinfer::MLAParams",
-    );
-    const _: () = assert!(
-        core::mem::align_of::<MlaParams>() == 8,
-        "MlaParams: alignof disagrees with the measured ::flashinfer::MLAParams",
-    );
-    const _: () = assert!(core::mem::offset_of!(MlaParams, q_nope) == 0);
-    const _: () = assert!(core::mem::offset_of!(MlaParams, work_indptr) == 176);
-    const _: () = assert!(core::mem::offset_of!(MlaParams, block_size) == 184);
-    const _: () = assert!(core::mem::offset_of!(MlaParams, num_heads) == 208);
-    const _: () = assert!(core::mem::offset_of!(MlaParams, q_nope_stride_n) == 232);
-    const _: () = assert!(core::mem::offset_of!(MlaParams, o_stride_h) == 268);
-    const _: () = assert!(core::mem::offset_of!(MlaParams, sm_scale) == 272);
-    const _: () = assert!(core::mem::offset_of!(MlaParams, ckv_scale) == 276);
-    const _: () = assert!(core::mem::offset_of!(MlaParams, kpe_scale) == 280);
-    const _: () = assert!(core::mem::offset_of!(MlaParams, return_lse_base_on_e) == 284);
-
-    #[derive(Clone, Copy, Debug)]
-    pub struct Buffers {
-        pub q_nope: u64,
-        pub q_pe: u64,
-        pub out: u64,
-        pub kv_page_indices: u64,
+        pub page_indices: u64,
+        pub page_indptr: u64,
+        pub last_page_lens: u64,
+        pub qo_indptr: u64,
+        pub positions: u64,
+        pub req_of_token: u64,
+        pub selection: u64,
+        pub o: u64,
         pub lse: u64,
+        pub part_o: u64,
+        pub part_lse: u64,
+        pub win: u64,
+        pub top_k: i32,
+        pub num_requests: i32,
+        pub num_heads: i32,
+        pub page_size: i32,
+        pub ratio: i32,
+        pub splits: i32,
+        pub causal: i32,
+        pub scale_log2: f32,
     }
 
-    #[must_use]
-    #[allow(clippy::cast_sign_loss)]
-    pub fn pack(
-        plan: &MlaPlan,
-        layer: &Layer,
-        num_heads: u32,
-        sm_scale: f32,
-        buffers: Buffers,
-        want_lse: bool,
-    ) -> MlaParams {
-        let info = &plan.info;
-        let int_buf = plan.workspace.int_ptr;
-        let float_buf = plan.workspace.float_ptr;
-        let page_size = layer.page_size as u32;
-        let rank = layer.kv_lora_rank as u32;
-        let rope = layer.rope_dim as u32;
-        MlaParams {
-            q_nope: buffers.q_nope,
-            q_pe: buffers.q_pe,
-            ckv: layer.ckv_pages,
-            kpe: layer.kpe_pages,
-            partial_o: resolve(float_buf, info.partial_o_offset),
-            partial_lse: resolve(float_buf, info.partial_lse_offset),
-            final_o: buffers.out,
-            final_lse: if want_lse { buffers.lse } else { 0 },
-            q_indptr: resolve(int_buf, info.q_indptr_offset),
-            kv_indptr: resolve(int_buf, info.kv_indptr_offset),
-            partial_indptr: resolve(int_buf, info.partial_indptr_offset),
-            merge_packed_offset_start: resolve(int_buf, info.merge_packed_offset_start_offset),
-            merge_packed_offset_end: resolve(int_buf, info.merge_packed_offset_end_offset),
-            merge_partial_packed_offset_start: resolve(
-                int_buf,
-                info.merge_partial_packed_offset_start_offset,
-            ),
-            merge_partial_packed_offset_end: resolve(
-                int_buf,
-                info.merge_partial_packed_offset_end_offset,
-            ),
-            merge_partial_stride: resolve(int_buf, info.merge_partial_stride_offset),
-            kv_indices: buffers.kv_page_indices,
-            q_len: resolve(int_buf, info.q_len_offset),
-            kv_len: resolve(int_buf, info.kv_len_offset),
-            q_start: resolve(int_buf, info.q_start_offset),
-            kv_start: resolve(int_buf, info.kv_start_offset),
-            kv_end: resolve(int_buf, info.kv_end_offset),
-            work_indptr: resolve(int_buf, info.work_indptr_offset),
-            block_size: UintFastdiv::new(page_size),
-            num_heads: UintFastdiv::new(num_heads),
-            q_nope_stride_n: num_heads * rank,
-            q_nope_stride_h: rank,
-            q_pe_stride_n: num_heads * rope,
-            q_pe_stride_h: rope,
-            ckv_stride_page: page_size * rank,
-            ckv_stride_n: rank,
-            kpe_stride_page: page_size * rope,
-            kpe_stride_n: rope,
-            o_stride_n: num_heads * rank,
-            o_stride_h: rank,
-            sm_scale,
-            ckv_scale: 1.0,
-            kpe_scale: 1.0,
-            return_lse_base_on_e: true,
-        }
-    }
+    const _: () = assert!(core::mem::size_of::<Gather>() == 160);
 
-    // The kernel reads its warp from `threadIdx.y` and its warpgroup from
-    // `threadIdx.z`; a flat 256-wide block hands every thread warp 0 of
-    // warpgroup 0 and a lane index up to 255, and the tile loads then run 32
-    // rows into the 16-row `CTA_TILE_KV` buffers.
-    pub const BLOCK: [u32; 3] = [32, 4, 2];
-
-    #[must_use]
-    pub const fn grid(info: &MlaPlanInfo, arm: Arm) -> Launch {
-        Launch::grid([info.num_blks_x as u32, info.num_blks_y as u32, 1], BLOCK)
-            .smem(arm.smem)
-            .cooperative()
-    }
-
-    pub fn fire(
+    /// The planned walk: the MLA scheduler's work list over the batch, then
+    /// the fold of every split row. The fold always runs (its blocks with
+    /// nothing to fold return): a captured step replays it whatever split
+    /// the next plan stages.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn planned(
         ctx: &Ctx,
         op: &'static str,
-        arm: usize,
+        plan: &MlaPlan,
+        q_nope: u64,
+        q_pe: u64,
+        layer: &Layer,
+        kv_indices: u64,
+        num_heads: i32,
+        sm_scale: f32,
         causal: bool,
-        params: &MlaParams,
-        launch: Launch,
+        o: u64,
     ) -> Result<(), Error> {
-        let Some(row) = INST.get(arm) else {
+        if plan.num_heads != num_heads.unsigned_abs() {
             return Err(refuse(
                 op,
-                "no `DISPATCH_SMEM_CONFIG` arm exists for this device",
+                format!(
+                    "the plan was cut for {} heads and this attention states {num_heads}",
+                    plan.num_heads
+                ),
             ));
+        }
+        let info = &plan.info;
+        let int = plan.workspace.int_ptr;
+        let float = plan.workspace.float_ptr;
+        let work = Work {
+            q_nope,
+            q_pe,
+            ckv: layer.ckv_pages,
+            kpe: layer.kpe_pages,
+            kv_indices,
+            q_indptr: at(int, info.q_indptr_offset),
+            kv_indptr: at(int, info.kv_indptr_offset),
+            partial_indptr: at(int, info.partial_indptr_offset),
+            q_len: at(int, info.q_len_offset),
+            kv_len: at(int, info.kv_len_offset),
+            q_start: at(int, info.q_start_offset),
+            kv_start: at(int, info.kv_start_offset),
+            kv_end: at(int, info.kv_end_offset),
+            work_indptr: at(int, info.work_indptr_offset),
+            o,
+            lse: 0,
+            partial_o: at(float, info.partial_o_offset),
+            partial_lse: at(float, info.partial_lse_offset),
+            num_heads,
+            page_size: layer.page_size,
+            scale_log2: scale_log2(sm_scale),
+            causal: i32::from(causal),
         };
-
+        #[allow(clippy::cast_sign_loss)]
+        let grid = [info.num_blks_x as u32, info.num_blks_y as u32, 1];
+        let entry = symbol(&format!("::pie::attn::mla::mla_paged<{}>", layer.rope_dim));
         ctx.fire(
             op,
-            Fire::at(FILE, row[usize::from(causal)]).apply(launch),
-            &[super::block(params)],
+            Fire::at(FILE, entry).apply(Launch::grid(grid, [THREADS, 1, 1])),
+            &[by_value(&work)],
+        )?;
+        let merge = Merge {
+            start: at(int, info.merge_packed_offset_start_offset),
+            end: at(int, info.merge_packed_offset_end_offset),
+            pstart: at(int, info.merge_partial_packed_offset_start_offset),
+            pend: at(int, info.merge_partial_packed_offset_end_offset),
+            stride: at(int, info.merge_partial_stride_offset),
+            partial_o: work.partial_o,
+            partial_lse: work.partial_lse,
+            o,
+            lse: 0,
+            num_heads,
+        };
+        ctx.fire(
+            op,
+            Fire::at(FILE, "::pie::attn::mla::mla_merge")
+                .apply(Launch::grid([plan.device.num_sm.max(1), 1, 1], [256, 1, 1])),
+            &[by_value(&merge)],
+        )
+    }
+
+    /// How many splits a gathered walk cuts each row's key list into: enough
+    /// blocks to fill the device twice over, no split under two tiles.
+    #[must_use]
+    pub fn splits(ctx: &Ctx, rows: u32, heads: i32, max_list: i64) -> i32 {
+        let cus = u64::from(ctx.multiprocessors().unwrap_or(304).max(1));
+        let base = u64::from(rows).max(1) * u64::from(heads.unsigned_abs().div_ceil(BLOCK_ROWS));
+        let want = (2 * cus).div_ceil(base.max(1));
+        let cap = max_list.max(1).unsigned_abs().div_ceil(MIN_SHARE);
+        #[allow(clippy::cast_possible_truncation)]
+        let s = want.min(cap).clamp(1, MAX_SPLITS) as i32;
+        s
+    }
+
+    /// The gathered walk: one block per (64 heads, token, split), then the
+    /// fold of the splits when there are several. `g.splits` says how many;
+    /// the partial planes come from this fire's scratch.
+    pub fn gather(
+        ctx: &Ctx,
+        op: &'static str,
+        rope: i32,
+        rows: u32,
+        mut g: Gather,
+    ) -> Result<(), Error> {
+        if rows == 0 {
+            return Ok(());
+        }
+        if g.num_heads <= 0 || g.splits <= 0 {
+            return Err(refuse(op, "the walk states no heads or no splits"));
+        }
+        let heads = g.num_heads.unsigned_abs();
+        let splits = g.splits.unsigned_abs();
+        if splits > 1 {
+            let cells = rows as usize * heads as usize * splits as usize;
+            let rank = RANK.unsigned_abs() as usize;
+            g.part_o = ctx.scratch(op, "attn.mla_part_o", cells * rank * 4)? as usize as u64;
+            g.part_lse = ctx.scratch(op, "attn.mla_part_lse", cells * 4)? as usize as u64;
+        }
+        if let ArgValue::Ptr(win) = ctx.stage() {
+            g.win = win;
+        }
+        let entry = symbol(&format!("::pie::attn::mla::latent_gather<{rope}>"));
+        ctx.fire(
+            op,
+            Fire::at(FILE, entry).apply(Launch::grid(
+                [heads.div_ceil(BLOCK_ROWS), rows, splits],
+                [THREADS, 1, 1],
+            )),
+            &[by_value(&g)],
+        )?;
+        if splits == 1 {
+            return Ok(());
+        }
+        ctx.fire(
+            op,
+            Fire::at(FILE, "::pie::attn::mla::latent_merge")
+                .apply(Launch::grid([rows, heads, 1], [64, 1, 1])),
+            &[
+                ArgValue::Ptr(g.part_o),
+                ArgValue::Ptr(g.part_lse),
+                ArgValue::Ptr(g.o),
+                ArgValue::Ptr(g.lse),
+                ArgValue::I32(g.num_heads),
+                ArgValue::I32(g.splits),
+                ctx.stage(),
+            ],
         )
     }
 }
@@ -808,67 +793,50 @@ fn dispatch_dense(
     causal: bool,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    // `kernel.mla.path`: Blackwell profiles pick `naive`; otherwise the FA2
-    // arm the plan's device fits.
-    if ctx.tuning().mla_naive {
-        let num_requests = kv::lanes_of(op, qo_indptr)?;
-        return naive::fire(
+    // `kernel.mla.path = naive` takes the reference walk; otherwise the
+    // matrix-core walk where it is built.
+    if !ctx.tuning().mla_naive && latent::supported(layer.kv_lora_rank, layer.rope_dim) {
+        return latent::planned(
             ctx,
             op,
-            naive::Ptrs {
-                q_nope: q_nope.ptr,
-                q_pe: q_pe.ptr,
-                ckv_pages: layer.ckv_pages,
-                kpe_pages: layer.kpe_pages,
-                qo_indptr: qo_indptr.ptr,
-                kv_page_indices: pool.page_indices.ptr,
-                kv_page_indptr: pool.page_indptr.ptr,
-                kv_last_page_lens: pool.last_page_lens.ptr,
-                o: o.ptr,
-                selection: 0,
-            },
-            naive::Shape {
-                kv_lora_rank: layer.kv_lora_rank,
-                rope_dim: layer.rope_dim,
-                page_size: layer.page_size,
-                total_tokens: stated(op, o.rows)?,
-                num_requests,
-                num_heads,
-                sm_scale,
-                causal,
-                top_k: 0,
-            },
+            plan,
+            q_nope.ptr,
+            q_pe.ptr,
+            layer,
+            pool.page_indices.ptr,
+            num_heads,
+            sm_scale,
+            causal,
+            o.ptr,
         );
     }
-
-    let Some(arm) = mla_fa2::arm_index(plan.device.max_smem_per_sm) else {
-        return Err(refuse(
-            op,
-            "no `DISPATCH_SMEM_CONFIG` arm fits this device's shared memory per SM",
-        ));
-    };
-
-    let params = mla_fa2::pack(
-        plan,
-        layer,
-        num_heads.unsigned_abs(),
-        sm_scale,
-        mla_fa2::Buffers {
-            q_nope: q_nope.ptr,
-            q_pe: q_pe.ptr,
-            out: o.ptr,
-            kv_page_indices: pool.page_indices.ptr,
-            lse: 0,
-        },
-        false,
-    );
-    mla_fa2::fire(
+    let num_requests = kv::lanes_of(op, qo_indptr)?;
+    naive::fire(
         ctx,
         op,
-        arm,
-        causal,
-        &params,
-        mla_fa2::grid(&plan.info, mla_fa2::ARMS[arm]),
+        naive::Ptrs {
+            q_nope: q_nope.ptr,
+            q_pe: q_pe.ptr,
+            ckv_pages: layer.ckv_pages,
+            kpe_pages: layer.kpe_pages,
+            qo_indptr: qo_indptr.ptr,
+            kv_page_indices: pool.page_indices.ptr,
+            kv_page_indptr: pool.page_indptr.ptr,
+            kv_last_page_lens: pool.last_page_lens.ptr,
+            o: o.ptr,
+            selection: 0,
+        },
+        naive::Shape {
+            kv_lora_rank: layer.kv_lora_rank,
+            rope_dim: layer.rope_dim,
+            page_size: layer.page_size,
+            total_tokens: stated(op, o.rows)?,
+            num_requests,
+            num_heads,
+            sm_scale,
+            causal,
+            top_k: 0,
+        },
     )
 }
 
@@ -948,6 +916,36 @@ fn selected(
         ));
     }
     let num_requests = kv::lanes_of(op, q.indptr)?;
+    let top_k = stated(op, selection.width)?;
+    if !ctx.tuning().mla_naive && latent::supported(layer.kv_lora_rank, layer.rope_dim) {
+        return latent::gather(
+            ctx,
+            op,
+            layer.rope_dim,
+            o.rows,
+            latent::Gather {
+                q_nope: q.data.ptr,
+                q_pe: q_pe.ptr,
+                ckv: layer.ckv_pages,
+                kpe: layer.kpe_pages,
+                page_indices: pool.page_indices.ptr,
+                page_indptr: pool.page_indptr.ptr,
+                last_page_lens: pool.last_page_lens.ptr,
+                qo_indptr: q.indptr.ptr,
+                selection: selection.ptr,
+                o: o.ptr,
+                top_k,
+                num_requests,
+                num_heads: heads,
+                page_size: layer.page_size,
+                ratio: 1,
+                splits: latent::splits(ctx, o.rows, heads, i64::from(top_k)),
+                causal: i32::from(causal),
+                scale_log2: sm_scale * core::f32::consts::LOG2_E,
+                ..latent::Gather::default()
+            },
+        );
+    }
     naive::fire(
         ctx,
         op,
@@ -972,7 +970,7 @@ fn selected(
             num_heads: heads,
             sm_scale,
             causal,
-            top_k: stated(op, selection.width)?,
+            top_k,
         },
     )
 }
@@ -1037,65 +1035,22 @@ pub fn attention_prefill_selected(
 
 #[cfg(test)]
 mod tests {
-    use super::mla_fa2::{ARMS, BLOCK, arm_index};
-    use crate::attn::plan::Device;
+    use super::latent::supported;
+    use super::naive::{head_group, wave_group};
 
     #[test]
-    fn the_ada_ceiling_takes_the_sixteen_row_arm_and_it_fits_one_block() {
-        let arm = arm_index(Device::L40S.max_smem_per_sm).expect("an arm fits the L40S");
-        assert_eq!(ARMS[arm].cta_tile_kv, 16);
-        assert!(ARMS[arm].smem <= Device::L40S.max_smem_per_block_optin);
-        assert_eq!(
-            BLOCK,
-            [32, 4, 2],
-            "a lane, a warp in its warpgroup, a warpgroup"
-        );
+    fn the_matrix_core_walk_takes_the_512_latent_with_or_without_rope() {
+        assert!(supported(512, 64));
+        assert!(supported(512, 0));
+        assert!(!supported(256, 64));
+        assert!(!supported(512, 32));
     }
-}
 
-// The FlashInfer ABI pieces the MLA path above still marshals; they go with
-// it when MLA gets its own AMD kernel.
-
-pub type DevicePtr = u64;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
-pub struct UintFastdiv {
-    words: [u64; 3],
-}
-
-impl UintFastdiv {
-    #[must_use]
-    pub const fn new(divisor: u32) -> Self {
-        let d = if divisor == 0 { 1 } else { divisor } as u64;
-        let q = u64::MAX / d;
-        let r = u64::MAX % d;
-        let carry = if r + 1 == d { 1 } else { 0 };
-        Self {
-            words: [d, q.wrapping_add(carry).wrapping_add(1), d],
-        }
-    }
-}
-
-const _: () = assert!(
-    core::mem::size_of::<UintFastdiv>() == 24,
-    "UintFastdiv: sizeof disagrees with the measured ::flashinfer::uint_fastdiv",
-);
-const _: () = assert!(
-    core::mem::align_of::<UintFastdiv>() == 8,
-    "UintFastdiv: alignof disagrees with the measured ::flashinfer::uint_fastdiv",
-);
-
-pub(crate) const fn resolve(base: DevicePtr, off: Option<u32>) -> DevicePtr {
-    match off {
-        Some(off) => base.saturating_add(off as u64),
-        None => base,
-    }
-}
-
-pub(crate) fn block<P>(params: &P) -> ArgValue {
-    ArgValue::Bytes {
-        ptr: core::ptr::from_ref(params).cast::<u8>(),
-        len: core::mem::size_of::<P>(),
+    #[test]
+    fn a_head_group_divides_the_heads_and_fits_the_block() {
+        assert_eq!(wave_group(64, 1), 1);
+        assert_eq!(wave_group(64, 4096), 4);
+        assert_eq!(wave_group(6, 4096), 2);
+        assert_eq!(head_group(64, 4096), 8);
     }
 }

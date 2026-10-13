@@ -2,7 +2,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::attn::kv;
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 const FILE: &str = "attn/index.hip";
@@ -11,9 +11,26 @@ const K_BLOCK: u32 = 256;
 
 const POOL_BLOCK: u32 = 256;
 
+/// Keys a scoring block ranks.
+const SCORE_KEYS: u32 = 256;
+
+const SELECT_BLOCK: u32 = 1024;
+
+/// Keys a collecting block filters.
+const COLLECT_KEYS: u32 = 2048;
+
+/// The most rows a ranking takes through its summaries and candidate
+/// lists; past it each row is one block's walk.
+const LIST_ROWS: u32 = 512;
+
+/// A scoring block's kept top scores, and a row's candidate list.
+const SUMMARY: usize = 16;
+const CANDIDATES: usize = 4096;
+
+/// One thread per head, in whole wavefronts.
 #[must_use]
 fn q_rope_block(n_heads: i32) -> u32 {
-    (n_heads.unsigned_abs().div_ceil(32) * 32).max(32)
+    (n_heads.unsigned_abs().div_ceil(64) * 64).clamp(64, 1024)
 }
 
 fn pool_pitch(op: &'static str, pool: &KvPool, row: i32) -> Result<(), Error> {
@@ -228,6 +245,11 @@ pub fn topk(
         .checked_mul(keys.page_size)
         .filter(|bound| *bound > 0)
         .ok_or_else(|| refuse(OP, "the page budget this fire's pool row states is zero"))?;
+    // A score row's pitch is whole 16-byte reads for the selection.
+    let max_kv = max_kv
+        .checked_add(3)
+        .map(|v| v & !3)
+        .ok_or_else(|| refuse(OP, "the page budget overflows the kernel's int"))?;
     let scores = ctx.scratch(
         OP,
         "attn.index_topk_scores",
@@ -236,28 +258,149 @@ pub fn topk(
             .saturating_mul(core::mem::size_of::<f32>()),
     )?;
 
-    ctx.fire(
-        OP,
-        Fire::at(FILE, "::pie::attn::index_topk_paged<::pie::bf16>")
-            .apply(Launch::per_row(selection.rows, K_BLOCK)),
-        &[
-            q.data.arg(),
-            ArgValue::Ptr(weights.map_or(0, |w| w.ptr)),
-            keys.keys.arg(),
+    let ratio = count(OP, "the pooling ratio this ranking states", ratio.max(1))?;
+    let rows = selection.rows;
+    let max_keys = (max_kv / ratio).max(1).unsigned_abs();
+    let scores = ArgValue::Ptr(scores as usize as u64);
+    let weights = ArgValue::Ptr(weights.map_or(0, |w| w.ptr));
+    // The matrix-core scoring holds a row's heads as up to four 16-head
+    // tiles of 64- or 128-wide keys; any other shape takes a thread a key.
+    let tiles = heads.unsigned_abs().div_ceil(16);
+    let mfma = matches!(head_dim, 64 | 128) && tiles <= 4;
+    let score_blocks = max_keys.div_ceil(SCORE_KEYS);
+    // A decode's few rows go through the summaries and candidate lists; a
+    // prefill's many rows fill the device a row a block.
+    let lists = if mfma && rows <= LIST_ROWS {
+        let rows_n = rows as usize;
+        let stride = score_blocks as usize * SUMMARY;
+        let take = |name, bytes: usize| ctx.scratch(OP, name, bytes).map(|p| p as usize as u64);
+        TopkLists {
+            summary: take("attn.index_topk_summary", rows_n * stride * 4)?,
+            bound: take("attn.index_topk_bound", rows_n * 4)?,
+            count: take("attn.index_topk_count", rows_n * 4)?,
+            cand_idx: take("attn.index_topk_cand_idx", rows_n * CANDIDATES * 4)?,
+            cand_key: take("attn.index_topk_cand_key", rows_n * CANDIDATES * 4)?,
+            summary_stride: stated(OP, u32::try_from(stride).unwrap_or(u32::MAX))?,
+        }
+    } else {
+        TopkLists::default()
+    };
+    let row_args = |extra: &[ArgValue]| -> Vec<ArgValue> {
+        let mut v = vec![
             q.indptr.arg(),
             keys.page_indices.arg(),
             keys.page_indptr.arg(),
             keys.last_page_lens.arg(),
-            ArgValue::Ptr(scores as usize as u64),
-            selection.arg(),
             num_requests.arg(),
-            heads.arg(),
-            head_dim.arg(),
             keys.page_size.arg(),
             max_kv.arg(),
-            top_k.arg(),
-            count(OP, "the pooling ratio this ranking states", ratio.max(1))?.arg(),
-            ctx.stage(),
-        ],
+        ];
+        v.extend_from_slice(extra);
+        v
+    };
+    let launch = Launch::grid([score_blocks, rows, 1], [SCORE_KEYS, 1, 1]);
+    if mfma {
+        let entry = symbol(&format!(
+            "::pie::attn::index_score_paged<::pie::bf16, {head_dim}, {tiles}>"
+        ));
+        ctx.fire(
+            OP,
+            Fire::at(FILE, entry).apply(launch),
+            &[
+                q.data.arg(),
+                weights,
+                keys.keys.arg(),
+                q.indptr.arg(),
+                keys.page_indices.arg(),
+                keys.page_indptr.arg(),
+                keys.last_page_lens.arg(),
+                scores,
+                num_requests.arg(),
+                heads.arg(),
+                keys.page_size.arg(),
+                max_kv.arg(),
+                ratio.arg(),
+                ArgValue::Ptr(lists.summary),
+                lists.summary_stride.arg(),
+                ctx.stage(),
+            ],
+        )?;
+    } else {
+        ctx.fire(
+            OP,
+            Fire::at(FILE, "::pie::attn::index_score_any<::pie::bf16>").apply(launch),
+            &[
+                q.data.arg(),
+                weights,
+                keys.keys.arg(),
+                q.indptr.arg(),
+                keys.page_indices.arg(),
+                keys.page_indptr.arg(),
+                keys.last_page_lens.arg(),
+                scores,
+                num_requests.arg(),
+                heads.arg(),
+                head_dim.arg(),
+                keys.page_size.arg(),
+                max_kv.arg(),
+                ratio.arg(),
+                ctx.stage(),
+            ],
+        )?;
+    }
+    if lists.count != 0 {
+        let mut args = vec![by_value(&lists)];
+        args.extend(row_args(&[top_k.arg(), ratio.arg(), ctx.stage()]));
+        ctx.fire(
+            OP,
+            Fire::at(FILE, "::pie::attn::index_topk_bound")
+                .apply(Launch::grid([rows, 1, 1], [SELECT_BLOCK, 1, 1])),
+            &args,
+        )?;
+        let mut args = vec![by_value(&lists), scores];
+        args.extend(row_args(&[top_k.arg(), ratio.arg(), ctx.stage()]));
+        ctx.fire(
+            OP,
+            Fire::at(FILE, "::pie::attn::index_topk_collect").apply(Launch::grid(
+                [max_keys.div_ceil(COLLECT_KEYS), rows, 1],
+                [256, 1, 1],
+            )),
+            &args,
+        )?;
+    }
+    let mut args = vec![scores, selection.arg()];
+    args.extend(row_args(&[
+        top_k.arg(),
+        ratio.arg(),
+        by_value(&lists),
+        ctx.stage(),
+    ]));
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::attn::index_topk_select")
+            .apply(Launch::grid([rows, 1, 1], [SELECT_BLOCK, 1, 1])),
+        &args,
     )
+}
+
+/// `pie::attn::TopkLists`, field for field: a ranking's summaries and
+/// candidate lists (all null: every row takes the one-block walk).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct TopkLists {
+    summary: u64,
+    bound: u64,
+    count: u64,
+    cand_idx: u64,
+    cand_key: u64,
+    summary_stride: i32,
+}
+
+const _: () = assert!(core::mem::size_of::<TopkLists>() == 48);
+
+fn by_value<P>(params: &P) -> ArgValue {
+    ArgValue::Bytes {
+        ptr: core::ptr::from_ref(params).cast::<u8>(),
+        len: core::mem::size_of::<P>(),
+    }
 }

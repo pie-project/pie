@@ -73,6 +73,39 @@ pub fn kv_len_limit_step(x: u64) -> u64 {
     }
 }
 
+/// The kv chunk a split work item takes: the even share of the batch's
+/// keys per cluster, in whole 32-key tiles (and no less than 256 past the
+/// shortest batches, where the fold would cost more than the walk saves),
+/// grown until the chunks fit the clusters in one round. Each chunk runs
+/// on one cluster, so one more chunk than clusters doubles the step.
+#[must_use]
+fn kv_len_limit(tile_lens: &[u64], total: u64, num_clusters: u32) -> u64 {
+    let even = total.div_ceil(u64::from(num_clusters)).max(1);
+    let mut limit = if even <= 64 {
+        kv_len_limit_step(even)
+    } else {
+        even.next_multiple_of(32).max(256)
+    };
+    let longest = tile_lens.iter().copied().max().unwrap_or(0);
+    let works = |limit: u64| -> u64 { tile_lens.iter().map(|&l| l.div_ceil(limit).max(1)).sum() };
+    if limit >= longest || works(limit) <= u64::from(num_clusters) {
+        return limit;
+    }
+    // The work count falls as the chunk grows: the least chunk (in 32-key
+    // steps) that fits, or the longest tile (no split) when none does.
+    let (mut lo, mut hi) = (limit / 32, longest.div_ceil(32));
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if works(mid * 32) <= u64::from(num_clusters) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    limit = hi * 32;
+    limit
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
     let batch = req.live.requests as usize;
@@ -135,14 +168,16 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     };
 
     let mut total_kv_lens: u64 = 0;
+    let mut tile_lens: Vec<u64> = Vec::new();
     for i in 0..batch {
         let num_qo_tiles = packed_qo_lens[i].div_ceil(cluster_tile_q);
         for qo_tile_idx in 0..num_qo_tiles {
-            total_kv_lens +=
-                u64::from(effective(qo_lens[i], kv_lens[i], qo_tile_idx, num_qo_tiles));
+            let len = u64::from(effective(qo_lens[i], kv_lens[i], qo_tile_idx, num_qo_tiles));
+            total_kv_lens += len;
+            tile_lens.push(len);
         }
     }
-    let kv_len_limit = kv_len_limit_step(total_kv_lens.div_ceil(u64::from(num_clusters)).max(1));
+    let kv_len_limit = kv_len_limit(&tile_lens, total_kv_lens, num_clusters);
 
     let mut heap = CostHeap::new(num_clusters);
     let mut clusters = vec![ClusterWork::default(); num_clusters as usize];
@@ -380,6 +415,15 @@ pub fn plan(
     const SIZEOF_DTYPE_O: usize = 2;
     let mut floats = AlignedAllocator::new(op, float_bytes);
     let rows = 2 * sched.num_clusters as usize * sched.cluster_tile_q as usize;
+    if sched.partial_o_nnz > rows as i64 {
+        return Err(refuse(
+            op,
+            format!(
+                "the schedule splits {} partial rows past the {rows} its workspace holds",
+                sched.partial_o_nnz
+            ),
+        ));
+    }
     info.partial_o_offset = Some(floats.alloc(
         rows * SIZEOF_DTYPE_O * req.head_dim_o as usize,
         16,
@@ -393,4 +437,30 @@ pub fn plan(
         int_bytes: int_used,
         float_bytes: floats.used(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kv_len_limit;
+
+    fn works(lens: &[u64], limit: u64) -> u64 {
+        lens.iter().map(|&l| l.div_ceil(limit).max(1)).sum()
+    }
+
+    #[test]
+    fn the_chunks_fit_the_clusters_in_one_round() {
+        // 96 heads: clusters of two blocks, 152 of them.
+        let lens = vec![8192u64; 32];
+        let limit = kv_len_limit(&lens, 32 * 8192, 152);
+        assert!(works(&lens, limit) <= 152, "{limit}");
+        assert_eq!(limit, 2048);
+        // 64 heads on 304: the even share in whole tiles, nine chunks a request.
+        let limit = kv_len_limit(&lens, 32 * 8192, 304);
+        assert_eq!((limit % 32, works(&lens, limit)), (0, 288));
+        // One long request keeps its 256-key floor.
+        assert_eq!(kv_len_limit(&[32768], 32768, 304), 256);
+        // More tiles than clusters: no split.
+        let many = vec![100u64; 400];
+        assert_eq!(kv_len_limit(&many, 40_000, 304), 256);
+    }
 }
