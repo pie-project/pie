@@ -396,10 +396,11 @@ fn rope_partial(
 ) -> Result<(), Error> {
     let num_q_heads = q_heads(op, q.width, head_dim)?;
     let num_kv_heads = heads(op, k.width, head_dim)?;
+    let pairs = cache_pairs(rotary_dim / 2);
     ctx.fire(
         op,
         Fire::at(FILE, "::pie::elemwise::rope_partial<::pie::bf16>")
-            .apply(Launch::per_row(q.rows, ROTATE_BLOCK)),
+            .apply(Launch::per_row(q.rows, ROTATE_BLOCK).smem(pairs * 2 * 4)),
         &[
             q.arg(),
             k.arg(),
@@ -411,6 +412,7 @@ fn rope_partial(
             stated(op, rotary_dim)?.arg(),
             stated(op, span)?.arg(),
             theta.arg(),
+            stated(op, pairs)?.arg(),
             ctx.stage(),
         ],
     )

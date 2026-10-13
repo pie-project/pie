@@ -199,15 +199,31 @@ __global__ __launch_bounds__(BLOCK) void rmsnorm_gated_f32_in(const float* __res
     }
 }
 
-// y += x over the first `n` elements of a `width`-wide plane.
+// y += x over the first `n` elements of a `width`-wide plane: the live rows
+// (the window's, else all) are one contiguous run, swept by a grid sized to
+// the device rather than to the launch's padded extent, eight elements a
+// thread where the rows allow.
 template <class T>
 __global__ void residual_add(T* __restrict__ y, const T* __restrict__ x, usize n, int width,
                              const u32* __restrict__ win) {
-    const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const long long at = flat_at(win, static_cast<long long>(i), width);
-    if (at < 0) return;
-    y[at] = from_f32<T>(to_f32(y[at]) + to_f32(x[at]));
+    const long long live = win == nullptr ? static_cast<long long>(n)
+                                          : min(static_cast<long long>(n), static_cast<long long>(win[0]) * width);
+    const long long base = win == nullptr ? 0 : static_cast<long long>(win[1]) * width;
+    const long long stride = static_cast<long long>(gridDim.x) * blockDim.x;
+    const long long first = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    T* yb = y + base;
+    const T* xb = x + base;
+    if (width % 8 == 0 && aligned16(yb) && aligned16(xb)) {
+        for (long long p = first; p < live / 8; p += stride) {
+            const Pack8<T> a = reinterpret_cast<const Pack8<T>*>(xb)[p];
+            Pack8<T> b = reinterpret_cast<Pack8<T>*>(yb)[p];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) b.v[e] = from_f32<T>(to_f32(b.v[e]) + to_f32(a.v[e]));
+            reinterpret_cast<Pack8<T>*>(yb)[p] = b;
+        }
+        return;
+    }
+    for (long long i = first; i < live; i += stride) yb[i] = from_f32<T>(to_f32(yb[i]) + to_f32(xb[i]));
 }
 
 // x *= s, with s rounded to T first as the reference does.

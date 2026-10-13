@@ -10,9 +10,11 @@ pub const MAX_RING: u32 = 64;
 
 pub const NO_TICKET: u64 = u64::MAX;
 
-const PULL_BLOCK: u32 = 256;
+/// Sixteen 32-lane teams, a ticket each at once (`kTeam`).
+const PULL_BLOCK: u32 = 512;
 
-const BUMP_BLOCK: u32 = 1;
+/// A thread per put or take, a wavefront of them at a time.
+const BUMP_BLOCK: u32 = 64;
 
 const MASK_BLOCK: u32 = 256;
 

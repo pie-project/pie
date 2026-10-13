@@ -21,6 +21,17 @@ const MAX_PER: i32 = 16;
 /// over more than one head.
 const WAVE_TARGET: i64 = 296;
 
+/// The matrix-core walk's block (`kSelThreads`) and the keys its LDS lists
+/// a window at a time (`kSelTable`): a block of keys wider than that takes
+/// the vector walk.
+const MFMA_THREADS: u32 = 256;
+const MFMA_TABLE: i32 = 1024;
+
+/// The most splits a row's entries take (`kMergeSplits`), and the fold's
+/// block.
+const MAX_SPLITS: u32 = 16;
+const MERGE_BLOCK: u32 = 256;
+
 /// The query heads one block answers: as many as divide the heads, down to
 /// one when fewer blocks would leave the device idle.
 fn head_group(num_heads: i32, total_tokens: i32) -> i32 {
@@ -126,6 +137,20 @@ fn selected(
     }
     let num_requests = kv::lanes_of(op, q.indptr)?;
 
+    let group = q_heads / kv_heads;
+    if matches!(head_dim, 64 | 128 | 256) && group <= 16 && ratio <= MFMA_TABLE {
+        return selected_mfma(
+            ctx,
+            op,
+            q,
+            selection,
+            pool,
+            [num_requests, q_heads, kv_heads, head_dim, top_k, ratio],
+            sm_scale,
+            o,
+        );
+    }
+
     let g = head_group(q_heads, total_tokens);
     #[allow(clippy::cast_sign_loss)]
     let launch = Launch::grid(
@@ -216,5 +241,84 @@ pub fn attention_prefill_selected(
         sm_scale,
         ratio,
         o,
+    )
+}
+
+/// The matrix-core walk: a block per (row, kv head, split of the row's
+/// entries), the group's heads sharing each key and value read. Rows too few
+/// to fill the device split their entries, the splits' sums folded by
+/// `sdpa_selected_merge`.
+#[allow(clippy::too_many_arguments)]
+fn selected_mfma(
+    ctx: &Ctx,
+    op: &'static str,
+    q: RaggedTensor,
+    selection: Tensor,
+    pool: &KvPool,
+    [num_requests, q_heads, kv_heads, head_dim, top_k, ratio]: [i32; 6],
+    sm_scale: f32,
+    o: &mut Tensor,
+) -> Result<(), Error> {
+    let group = q_heads / kv_heads;
+    let rows = o.rows;
+    #[allow(clippy::cast_sign_loss)]
+    let blocks = rows.saturating_mul(kv_heads as u32).max(1);
+    let splits = (ctx.multiprocessors().unwrap_or(304) / blocks).clamp(1, MAX_SPLITS);
+    let part = if splits > 1 {
+        let floats = splits as usize * rows as usize * q_heads as usize * (head_dim as usize + 2);
+        ctx.scratch(
+            op,
+            "attn.selected_splits",
+            floats * core::mem::size_of::<f32>(),
+        )? as usize as u64
+    } else {
+        0
+    };
+    let entry = crate::jit::symbol(&format!(
+        "::pie::attn::sdpa_selected::sdpa_selected_mfma<{head_dim}, {group}>"
+    ));
+    #[allow(clippy::cast_sign_loss)]
+    let launch = Launch::grid([rows, kv_heads as u32, splits], [MFMA_THREADS, 1, 1]);
+    ctx.fire(
+        op,
+        Fire::at(FILE, entry).apply(launch),
+        &[
+            q.data.arg(),
+            pool.keys.arg(),
+            pool.values.arg(),
+            q.indptr.arg(),
+            pool.page_indices.arg(),
+            pool.page_indptr.arg(),
+            pool.last_page_lens.arg(),
+            selection.arg(),
+            ArgValue::Ptr(o.ptr),
+            ArgValue::Ptr(part),
+            num_requests.arg(),
+            q_heads.arg(),
+            kv_heads.arg(),
+            pool.page_size.arg(),
+            (sm_scale * core::f32::consts::LOG2_E).arg(),
+            top_k.arg(),
+            ratio.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    if splits == 1 {
+        return Ok(());
+    }
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::attn::sdpa_selected::sdpa_selected_merge").apply(Launch::grid(
+            [rows, q_heads as u32, 1],
+            [(head_dim as u32).min(MERGE_BLOCK), 1, 1],
+        )),
+        &[
+            ArgValue::Ptr(part),
+            ArgValue::Ptr(o.ptr),
+            q_heads.arg(),
+            head_dim.arg(),
+            stated(op, splits)?.arg(),
+            ctx.stage(),
+        ],
     )
 }

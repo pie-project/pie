@@ -27,7 +27,14 @@ pub fn sigmoid_mul(ctx: &Ctx, gate: Tensor, fan: u32, x: &mut Tensor) -> Result<
             "linear/glu.hip",
             "::pie::linear::gate_sigmoid_mul<::pie::bf16>",
         )
-        .apply(Launch::flat(lanes, BLOCK)),
+        .apply(super::norm::sweep(
+            u64::from(lanes),
+            if x.width.is_multiple_of(4) && x.ptr.is_multiple_of(8) && gate.ptr.is_multiple_of(8) {
+                4
+            } else {
+                1
+            },
+        )),
         &[
             x.arg(),
             gate.arg(),

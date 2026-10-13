@@ -60,29 +60,42 @@ __device__ __forceinline__ void ple_prepare(const PleHash& h, const i64* __restr
 // A predecessor from the state, cell 0 the oldest.
 __device__ __forceinline__ int ple_cell(const PleHash& h, int cell) { return cell == 0 ? h.eos : cell - 1; }
 
-// One token per thread, each from its own slot (decode: a request is one row).
+// A thread per (token, head), each token from its own slot (decode: a
+// request is one row): a block holds whole rows, `blockDim.x / heads` of
+// them, so each row's state moves once its heads have all read it.
 __global__ void ple_ngram_ids_update(const int* __restrict__ ids, int* __restrict__ state_base,
                                      const int* __restrict__ slot_ids, long long slot_stride_elems,
                                      int* __restrict__ ngram_ids, int rows, PleHash h,
                                      const i64* __restrict__ map, const u32* __restrict__ win) {
     const Window window_{win};
-    const int r = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (r >= rows || !window_.live(r)) return;
-    const long long r_row = window_.plane(r);
-    const int slot = slot_ids[r];
-    if (slot < 0) return;
-    int* state = state_base + static_cast<long long>(slot) * slot_stride_elems;
-
+    const int per_block = static_cast<int>(blockDim.x) / h.heads;
+    const int local = static_cast<int>(threadIdx.x) / h.heads, head = static_cast<int>(threadIdx.x) % h.heads;
+    const int r = static_cast<int>(blockIdx.x) * per_block + local;
+    const bool live = local < per_block && r < rows && window_.live(r);
+    const long long r_row = live ? window_.plane(r) : 0;
+    const int slot = live ? slot_ids[r] : -1;
+    int* state = state_base + static_cast<long long>(max(slot, 0)) * slot_stride_elems;
     const int span = h.ngram - 1;
-    int window[kPleMaxNgram];
-    window[0] = ids[r_row];
-    for (int p = 1; p <= span; ++p) window[p] = ple_cell(h, state[span - p]);
-    ple_prepare(h, map, window);
-
-    ple_hash_row(h, window, ngram_ids + r_row * h.heads);
-
-    for (int p = 0; p < span - 1; ++p) state[p] = state[p + 1];
-    state[span - 1] = ids[r_row] + 1;
+    int token = 0;
+    if (slot >= 0) {
+        int window[kPleMaxNgram];
+        token = ids[r_row];
+        window[0] = token;
+        for (int p = 1; p <= span; ++p) window[p] = ple_cell(h, state[span - p]);
+        ple_prepare(h, map, window);
+        // The head's order (heads are (ngram − 1)·heads_per_ngram, the
+        // launcher checks), and its hash of the window's first `order` ids.
+        const int order = 2 + head / h.heads_per_ngram;
+        u64 mixed = static_cast<u64>(window[0]) * h.mults[0];
+        for (int p = 1; p < order; ++p) mixed ^= static_cast<u64>(window[p]) * h.mults[p];
+        ngram_ids[r_row * h.heads + head] = static_cast<int>(mixed % h.primes[head] + h.offsets[head]);
+    }
+    // Every head of the row has read the state before it moves.
+    __syncthreads();
+    if (slot >= 0 && head == 0) {
+        for (int p = 0; p < span - 1; ++p) state[p] = state[p + 1];
+        state[span - 1] = token + 1;
+    }
 }
 
 // One block per request over its (begin-offset, commit-capped) span of rows,

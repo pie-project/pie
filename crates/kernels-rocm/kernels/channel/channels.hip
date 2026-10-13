@@ -74,26 +74,37 @@ struct SettleLane {
 };
 static_assert(sizeof(SettleLane) == 16, "SettleLane ABI");
 
-__device__ __forceinline__ u64 load_system_acquire(const u64* word) {
-    return __hip_atomic_load(word, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
-}
-
 __device__ __forceinline__ void store_system_relaxed(u64* word, u64 value) {
     __hip_atomic_store(word, value, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-// Tickets a pull block validates at once; one bit each in `held`.
-constexpr u32 PULL_CHUNK = 256;
-constexpr u32 PULL_CHUNK_WORDS = PULL_CHUNK / 32;
+// A team of `kTeam` lanes per ticket: half a wavefront, as wide as the
+// cells the decode moves (a few to a hundred bytes).
+constexpr u32 kTeam = 32;
 
+typedef u32 u32x4 __attribute__((ext_vector_type(4)));
+
+// The ring's head and tail words, read as one pair: one system-coherent
+// 16-byte read (one bus request; each aligned 8-byte half untorn) where the
+// pair is aligned, else two, and one system acquire after, so what the host
+// wrote before it moved either is visible to the reads that follow. (Each
+// word only grows, so seeing one a moment before the other only ever
+// refuses more.)
 __device__ __forceinline__ bool ticket_holds(const Ticket& ticket, u64& head, u64& tail) {
     if ((ticket.flags & TICKET_SHADOW) != 0) {
         head = 0;
         tail = 0;
         return true;
     }
-    head = load_system_acquire(ticket.words + 0);
-    tail = load_system_acquire(ticket.words + 1);
+    if (aligned16(ticket.words)) {
+        const u32x4 pair = *reinterpret_cast<const volatile u32x4*>(ticket.words);
+        head = static_cast<u64>(pair.x) | static_cast<u64>(pair.y) << 32;
+        tail = static_cast<u64>(pair.z) | static_cast<u64>(pair.w) << 32;
+    } else {
+        head = __hip_atomic_load(ticket.words + 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        tail = __hip_atomic_load(ticket.words + 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
     bool ok = true;
     if ((ticket.flags & TICKET_CONSUME) != 0) ok = head == ticket.expected_head;
     if ((ticket.flags & TICKET_REQUIRE_INPUT) != 0) ok = ok && tail > head;
@@ -105,8 +116,25 @@ __device__ __forceinline__ bool ticket_holds(const Ticket& ticket, u64& head, u6
     return ok;
 }
 
-// One cell of `ticket`'s ring, from its host mirror into device cells,
-// copied by a team of `width` threads of which this one is `at`.
+// `bytes` bytes from `source` to `destination` by a team of `width` lanes of
+// which this is `at`, in the widest unit both ends and the length allow.
+__device__ __forceinline__ void copy_cell(u8* destination, const u8* source, u32 bytes, u32 at, u32 width) {
+    const usize both = reinterpret_cast<usize>(destination) | reinterpret_cast<usize>(source) | bytes;
+    if ((both & 15u) == 0) {
+        for (u32 i = at; i < bytes / 16; i += width)
+            reinterpret_cast<b128*>(destination)[i] = reinterpret_cast<const b128*>(source)[i];
+    } else if ((both & 7u) == 0) {
+        for (u32 i = at; i < bytes / 8; i += width)
+            reinterpret_cast<u64*>(destination)[i] = reinterpret_cast<const u64*>(source)[i];
+    } else if ((both & 3u) == 0) {
+        for (u32 i = at; i < bytes / 4; i += width)
+            reinterpret_cast<u32*>(destination)[i] = reinterpret_cast<const u32*>(source)[i];
+    } else {
+        for (u32 i = at; i < bytes; i += width) destination[i] = source[i];
+    }
+}
+
+// One cell of `ticket`'s ring, from its host mirror into device cells.
 __device__ __forceinline__ void pull_cell(const Ticket& ticket, u32 ring, u32 at, u32 width) {
     const u8* source = ticket.mirror + static_cast<usize>(ring) * ticket.wire_bytes;
     u8* destination = ticket.cells + static_cast<usize>(ring) * ticket.native_bytes;
@@ -114,45 +142,26 @@ __device__ __forceinline__ void pull_cell(const Ticket& ticket, u32 ring, u32 at
         for (u32 i = at; i < ticket.native_bytes; i += width) destination[i] = static_cast<u8>((source[i / 8] >> (i % 8)) & 1u);
         return;
     }
-    if (ticket.native_bytes % sizeof(b128) == 0 && aligned16(source) && aligned16(destination)) {
-        const b128* in = reinterpret_cast<const b128*>(source);
-        b128* out = reinterpret_cast<b128*>(destination);
-        for (u32 i = at; i < ticket.native_bytes / sizeof(b128); i += width) out[i] = in[i];
-        return;
-    }
-    for (u32 i = at; i < ticket.native_bytes; i += width) destination[i] = source[i];
+    copy_cell(destination, source, ticket.native_bytes, at, width);
 }
 
-// One block per lane: every ticket checked against its ring (a refusal
-// clears the lane's commit word), then each host-written cell it consumes
-// pulled, a wavefront per cell.
+// One block per lane, a team per ticket: each ticket checked against its
+// ring and, when it holds and consumes a host-written cell, that cell
+// pulled at once; then the lane's commit word, cleared if any refused.
 __global__ void pull_validate(const Ticket* __restrict__ tickets, const PullLane* __restrict__ lanes,
                               u32 lane_count) {
     const u32 lane_index = blockIdx.x;
     if (lane_index >= lane_count) return;
     const PullLane lane = lanes[lane_index];
-    __shared__ u32 held[PULL_CHUNK_WORDS];
     __shared__ u32 vetoed;
-    if (threadIdx.x == 0) {
-        vetoed = 0;
-        lane.pass_commit[0] = lane.initial_commit;
-        lane.pass_commit[1] = 0;
-    }
-    const u32 team = blockDim.x < static_cast<u32>(kWave) ? blockDim.x : static_cast<u32>(kWave);
-    const u32 teams = blockDim.x / team;
-    const u32 mine = threadIdx.x / team;
-    const u32 within = threadIdx.x % team;
-    const u32 width = blockDim.x < PULL_CHUNK ? blockDim.x : PULL_CHUNK;
-    for (u32 base = 0; base < lane.ticket_count; base += width) {
-        const u32 span = min(lane.ticket_count - base, width);
-        for (u32 word = threadIdx.x; word < PULL_CHUNK_WORDS; word += blockDim.x) held[word] = 0;
-        __syncthreads();
-        if (threadIdx.x < span) {
-            const Ticket ticket = tickets[lane.ticket_offset + base + threadIdx.x];
-            u64 head = 0, tail = 0;
-            if (ticket_holds(ticket, head, tail)) {
-                atomicOr(&held[threadIdx.x / 32], 1u << (threadIdx.x % 32));
-            } else {
+    if (threadIdx.x == 0) vetoed = 0;
+    __syncthreads();
+    const u32 teams = blockDim.x / kTeam, mine = threadIdx.x / kTeam, within = threadIdx.x % kTeam;
+    for (u32 index = mine; index < lane.ticket_count; index += teams) {
+        const Ticket ticket = tickets[lane.ticket_offset + index];
+        u64 head = 0, tail = 0;
+        if (!ticket_holds(ticket, head, tail)) {
+            if (within == 0) {
                 if (lane.diagnose != 0) {
                     printf("[kernels-rocm] pull-validate reject: slot=%u flags=0x%x head=%llu tail=%llu "
                            "expected_head=%llu expected_tail=%llu cap1=%u\n",
@@ -161,49 +170,72 @@ __global__ void pull_validate(const Ticket* __restrict__ tickets, const PullLane
                            static_cast<unsigned long long>(ticket.expected_head),
                            static_cast<unsigned long long>(ticket.expected_tail), ticket.cap1);
                 }
-                atomicOr(&vetoed, 1u);
+                vetoed = 1;
             }
+            continue;
         }
-        __syncthreads();
-        for (u32 index = mine; index < span; index += teams) {
-            const Ticket ticket = tickets[lane.ticket_offset + base + index];
-            const bool valid = ((held[index / 32] >> (index % 32)) & 1u) != 0;
-            if (!valid || (ticket.flags & TICKET_HOST_WRITER) == 0 || (ticket.flags & TICKET_CONSUME) == 0) continue;
-            const u32 ring = static_cast<u32>(ticket.expected_head % ticket.cap1);
-            pull_cell(ticket, ring, within, team);
-            if (within == 0) lane.full[static_cast<usize>(ticket.slot) * MAX_RING + ring] = 1;
-        }
-        __syncthreads();
+        if ((ticket.flags & TICKET_HOST_WRITER) == 0 || (ticket.flags & TICKET_CONSUME) == 0) continue;
+        const u32 ring = static_cast<u32>(ticket.expected_head % ticket.cap1);
+        pull_cell(ticket, ring, within, kTeam);
+        if (within == 0) lane.full[static_cast<usize>(ticket.slot) * MAX_RING + ring] = 1;
     }
-    if (threadIdx.x == 0 && vetoed != 0) atomicAnd(lane.pass_commit, 0u);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        lane.pass_commit[0] = vetoed != 0 ? 0u : lane.initial_commit;
+        lane.pass_commit[1] = 0;
+    }
 }
 
 // On commit: a cell put fills the tail and advances it, a cell taken
-// empties the head and advances it. One thread per lane.
+// empties the head and advances it, in list order. A thread per entry (a
+// block's worth at a time): the k-th put of a slot fills the cell k past
+// its tail and the last of them leaves the tail, so a slot named twice
+// lands as the sequential walk does; the takes follow the puts.
 __global__ void commit_bump(const BumpLane* __restrict__ lanes, u32 lane_count) {
-    if (blockIdx.x >= lane_count || threadIdx.x != 0) return;
+    if (blockIdx.x >= lane_count) return;
     const BumpLane lane = lanes[blockIdx.x];
     if (!*lane.commit) return;
-    for (u32 i = 0; i < lane.put_count; ++i) {
-        const u32 slot = lane.put[i];
-        lane.full[static_cast<usize>(slot) * MAX_RING + lane.tail[slot]] = 1;
-        lane.tail[slot] = (lane.tail[slot] + 1) % lane.cap1[slot];
-    }
-    for (u32 i = 0; i < lane.taken_count; ++i) {
-        const u32 slot = lane.taken[i];
-        lane.full[static_cast<usize>(slot) * MAX_RING + lane.head[slot]] = 0;
-        lane.head[slot] = (lane.head[slot] + 1) % lane.cap1[slot];
+    for (int phase = 0; phase < 2; ++phase) {
+        const u32* list = phase == 0 ? lane.put : lane.taken;
+        const u32 count = phase == 0 ? lane.put_count : lane.taken_count;
+        u32* cursor = phase == 0 ? lane.tail : lane.head;
+        const u8 fill = phase == 0 ? 1 : 0;
+        for (u32 base = 0; base < count; base += blockDim.x) {
+            const u32 i = base + threadIdx.x;
+            u32 slot = 0, rank = 0, at = 0, cap1 = 1;
+            bool last = false;
+            if (i < count) {
+                slot = list[i];
+                u32 same = 0;
+                for (u32 j = base; j < min(count, base + blockDim.x); ++j) {
+                    if (list[j] != slot) continue;
+                    if (j < i) ++rank;
+                    ++same;
+                }
+                last = rank + 1 == same;
+                cap1 = lane.cap1[slot];
+                at = cursor[slot];
+            }
+            __syncthreads();  // every cursor read before any moves
+            if (i < count) {
+                const u32 ring = rank == 0 ? at : (at + rank) % cap1;
+                lane.full[static_cast<usize>(slot) * MAX_RING + ring] = fill;
+                if (last) cursor[slot] = (at + rank + 1) % cap1;
+            }
+            __syncthreads();  // this chunk's moves before the next reads
+        }
     }
 }
 
 // On commit: each device-written cell a host reads, copied (or bit-packed)
-// out to its host mirror. One block per lane.
+// out to its host mirror. One block per lane, a team per ticket.
 __global__ void scatter_publish(const Ticket* __restrict__ tickets, const PublishLane* __restrict__ lanes,
                                 u32 lane_count) {
     if (blockIdx.x >= lane_count) return;
     const PublishLane lane = lanes[blockIdx.x];
     if (lane.commit == nullptr || *lane.commit == 0u) return;
-    for (u32 index = 0; index < lane.ticket_count; ++index) {
+    const u32 teams = blockDim.x / kTeam, mine = threadIdx.x / kTeam, within = threadIdx.x % kTeam;
+    for (u32 index = mine; index < lane.ticket_count; index += teams) {
         const Ticket ticket = tickets[lane.ticket_offset + index];
         const u32 outward = TICKET_PUBLISH | TICKET_HOST_READER;
         if ((ticket.flags & outward) != outward || (ticket.flags & TICKET_SHADOW) != 0) continue;
@@ -212,7 +244,7 @@ __global__ void scatter_publish(const Ticket* __restrict__ tickets, const Publis
         const u8* source = ticket.cells + static_cast<usize>(ring) * ticket.native_bytes;
         u8* destination = const_cast<u8*>(ticket.mirror) + static_cast<usize>(ring) * ticket.wire_bytes;
         if ((ticket.flags & TICKET_PACKED_BOOL) != 0) {
-            for (u32 i = threadIdx.x; i < ticket.wire_bytes; i += blockDim.x) {
+            for (u32 i = within; i < ticket.wire_bytes; i += kTeam) {
                 u8 packed = 0;
                 for (u32 bit = 0; bit < 8u && i * 8u + bit < ticket.native_bytes; ++bit) {
                     if (source[i * 8u + bit] != 0u) packed |= static_cast<u8>(1u << bit);
@@ -220,9 +252,8 @@ __global__ void scatter_publish(const Ticket* __restrict__ tickets, const Publis
                 destination[i] = packed;
             }
         } else {
-            for (u32 i = threadIdx.x; i < ticket.wire_bytes; i += blockDim.x) destination[i] = source[i];
+            copy_cell(destination, source, ticket.wire_bytes, within, kTeam);
         }
-        __syncthreads();
     }
 }
 

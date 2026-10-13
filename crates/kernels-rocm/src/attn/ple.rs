@@ -8,6 +8,16 @@ const FILE: &str = "attn/ple.hip";
 
 const BLOCK: u32 = 128;
 
+/// The decode update's block: a thread per (row, head), whole rows a block.
+const UPDATE_BLOCK: u32 = 256;
+
+#[allow(clippy::cast_sign_loss)]
+fn update_launch(rows: u32, heads: i32) -> Launch {
+    let heads = heads.max(1) as u32;
+    let per_block = (UPDATE_BLOCK / heads).max(1);
+    Launch::grid([rows.div_ceil(per_block), 1, 1], [per_block * heads, 1, 1])
+}
+
 #[repr(C)]
 struct PleHash {
     mults: [u64; 4],
@@ -95,7 +105,7 @@ pub fn ngram_ids(
     let rows = nonzero(OP, "rows", ids.rows)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::ple_ngram_ids_update").apply(Launch::flat(rows, BLOCK)),
+        Fire::at(FILE, "::pie::attn::ple_ngram_ids_update").apply(update_launch(rows, h.heads)),
         &[
             ids.arg(),
             state.slab.arg(),

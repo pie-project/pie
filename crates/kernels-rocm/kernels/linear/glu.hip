@@ -10,16 +10,38 @@ namespace pie::linear {
 __device__ __forceinline__ float sigmoid(float x) { return 1.f / (1.f + __expf(-x)); }
 
 // x *= sigmoid(gate), elementwise over a `width`-wide plane.
+// The live rows (the window's `fan`-row groups, else all `n` elements) are
+// one contiguous run, swept by a grid sized to the device rather than to the
+// launch's padded extent, four elements (8 bytes) a thread where the rows
+// allow: the sigmoid's ALU wants more threads in flight than 16-byte packs
+// leave at decode rows.
+template <class T>
+struct alignas(4 * sizeof(T)) GatePack {
+    T v[4];
+};
+
 template <class T>
 __global__ void gate_sigmoid_mul(T* __restrict__ x, const T* __restrict__ gate, i32 n, i32 width,
                                  i32 fan, const u32* __restrict__ win) {
-    const i32 i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const Window window{win};
-    const long long row = i / width;
-    if (!window.live(row, fan)) return;
-    const long long at = window.plane(row, fan) * width + i % width;
-    x[at] = from_f32<T>(to_f32(x[at]) * sigmoid(to_f32(gate[at])));
+    const long long rows_live = win == nullptr ? n / max(width, 1) : static_cast<long long>(win[0]) * fan;
+    const long long live = min(static_cast<long long>(n), rows_live * width);
+    const long long base = win == nullptr ? 0 : static_cast<long long>(win[1]) * fan * width;
+    const long long stride = static_cast<long long>(gridDim.x) * blockDim.x;
+    const long long first = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    T* xb = x + base;
+    const T* gb = gate + base;
+    const usize ends = reinterpret_cast<usize>(xb) | reinterpret_cast<usize>(gb);
+    if (width % 4 == 0 && (ends & (4 * sizeof(T) - 1)) == 0) {
+        for (long long p = first; p < live / 4; p += stride) {
+            GatePack<T> v = reinterpret_cast<GatePack<T>*>(xb)[p];
+            const GatePack<T> g = reinterpret_cast<const GatePack<T>*>(gb)[p];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) v.v[e] = from_f32<T>(to_f32(v.v[e]) * sigmoid(to_f32(g.v[e])));
+            reinterpret_cast<GatePack<T>*>(xb)[p] = v;
+        }
+        return;
+    }
+    for (long long i = first; i < live; i += stride) xb[i] = from_f32<T>(to_f32(xb[i]) * sigmoid(to_f32(gb[i])));
 }
 
 // y = silu(gate) · up. Grid: (rows, ⌈I / block⌉).

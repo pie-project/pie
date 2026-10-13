@@ -59,6 +59,18 @@ fn elementwise(op: &'static str, t: Tensor) -> Result<(Launch, u64), Error> {
     Ok((Launch::flat(lanes, BLOCK), n))
 }
 
+/// The most blocks a grid-stride sweep launches: enough to fill the device,
+/// however far the launch's stated extent is padded past its live rows.
+pub(crate) const SWEEP_BLOCKS: u64 = 2048;
+
+/// A grid-stride sweep over `n` elements, `per` a thread.
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn sweep(n: u64, per: u64) -> Launch {
+    let units = n.div_ceil(per.max(1));
+    let blocks = units.div_ceil(u64::from(BLOCK)).clamp(1, SWEEP_BLOCKS);
+    Launch::grid([blocks as u32, 1, 1], [BLOCK, 1, 1])
+}
+
 fn route_rows(rows: u32, width: u32) -> Launch {
     const MAX_BLOCK: u32 = 1024;
 
@@ -389,10 +401,12 @@ pub fn rmsnorm_gated_by(
 pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.residual_add";
     let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    let (launch, n) = elementwise(OP, *y)?;
+    let (_, n) = elementwise(OP, *y)?;
+    let packed = y.width.is_multiple_of(8) && x.ptr.is_multiple_of(16) && y.ptr.is_multiple_of(16);
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::residual_add<{t}>"))).apply(launch),
+        Fire::at(FILE, symbol(&format!("::pie::elemwise::residual_add<{t}>")))
+            .apply(sweep(n, if packed { 8 } else { 1 })),
         &[
             y.arg(),
             x.arg(),

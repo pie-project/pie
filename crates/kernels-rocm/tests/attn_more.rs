@@ -358,83 +358,213 @@ fn dense_attends_inside_each_segment() {
 #[test]
 fn selected_attention_reads_the_named_blocks_and_the_open_one() {
     let Some(gpu) = Gpu::open() else { return };
-    let ctx = gpu.ctx();
     for (hq, hk, d) in [(4u32, 2u32, 64u32), (8, 2, 128), (2, 1, 96)] {
-        let (ps, ratio, top_k) = (16usize, 4u32, 5u32);
         // The last case runs enough rows that a block answers two heads.
         let fresh = if d == 96 { [150u32, 1, 160] } else { [1, 6, 3] };
         let prefix = [40u32, 0, 70];
-        let kv_lens: Vec<u32> = fresh.iter().zip(&prefix).map(|(f, p)| f + p).collect();
-        let Cache {
-            pool, keys, vals, ..
-        } = paged_cache(&gpu, hk as usize, d as usize, ps, &kv_lens, 30);
-        let qo = indptr_of(&fresh);
-        let total = *qo.last().unwrap() as usize;
-        let qs = bf16s(total * (hq * d) as usize, 12, 1.0);
-        // A row's selection: distinct block ids, some past its causal end
-        // and some -1.
-        let mut sel = Vec::new();
-        for t in 0..total {
-            for n in 0..top_k as i32 {
-                sel.push(match (t as i32 + n) % 4 {
-                    0 => -1,
-                    _ => (n * 3 + t as i32) % 20,
-                });
-            }
+        check_selected(&gpu, hq, hk, d, 16, 4, 5, &fresh, &prefix, false, 30);
+    }
+}
+
+/// The decode shape of Qwen3.8-Flash-Next's selected layer (24 query heads
+/// over 2 kv heads of 256, blocks of 4): one fresh row a request, at 1, 7,
+/// 128 and 512 requests, contexts past and short of the budget.
+#[test]
+fn selected_decode_at_the_models_shape() {
+    let Some(gpu) = Gpu::open() else { return };
+    for (lanes, top_k, longest) in [
+        (1usize, 64u32, 900u32),
+        (7, 64, 300),
+        (128, 32, 200),
+        (512, 8, 60),
+    ] {
+        let fresh = vec![1u32; lanes];
+        let prefix: Vec<u32> = (0..lanes as u32).map(|i| (i * 37 + 11) % longest).collect();
+        check_selected(
+            &gpu,
+            24,
+            2,
+            256,
+            16,
+            4,
+            top_k,
+            &fresh,
+            &prefix,
+            true,
+            70 + lanes as u64,
+        );
+    }
+    // A prefill at the same shape: rows that share a request.
+    check_selected(
+        &gpu,
+        24,
+        2,
+        256,
+        16,
+        4,
+        16,
+        &[40, 1, 23],
+        &[100, 7, 0],
+        false,
+        90,
+    );
+    // Selections whose entries run past one LDS window of keys.
+    check_selected(
+        &gpu,
+        8,
+        1,
+        128,
+        16,
+        4,
+        600,
+        &[1, 2],
+        &[2600, 2399],
+        false,
+        91,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_selected(
+    gpu: &Gpu,
+    hq: u32,
+    hk: u32,
+    d: u32,
+    ps: usize,
+    ratio: u32,
+    top_k: u32,
+    fresh: &[u32],
+    prefix: &[u32],
+    decode: bool,
+    seed: u64,
+) {
+    let ctx = gpu.ctx();
+    let kv_lens: Vec<u32> = fresh.iter().zip(prefix).map(|(f, p)| f + p).collect();
+    let Cache {
+        pool, keys, vals, ..
+    } = paged_cache(gpu, hk as usize, d as usize, ps, &kv_lens, seed);
+    let qo = indptr_of(fresh);
+    let total = *qo.last().unwrap() as usize;
+    let qs = bf16s(total * (hq * d) as usize, seed + 7, 1.0);
+    // A row's selection: distinct block ids, some past its causal end and
+    // some -1.
+    let mut sel = Vec::new();
+    for t in 0..total {
+        for n in 0..top_k as i32 {
+            sel.push(match (t as i32 + n) % 4 {
+                0 => -1,
+                _ => (n * 3 + t as i32) % (4 * top_k as i32).max(20),
+            });
         }
-        let q = RaggedTensor {
-            data: gpu.tensor(&qs, total as u32, hq * d, Dtype::Bf16),
-            indptr: gpu.column(&qo),
-        };
-        let selection = gpu.ints_shaped(&sel, total as u32, top_k);
-        let scale = 1.0 / (d as f32).sqrt();
-        let mut o = gpu.zeros(total as u32, hq * d, Dtype::Bf16);
+    }
+    // Distinct: (n·3 + t) mod M repeats only when 3·Δn ≡ 0 (mod M).
+    let q = RaggedTensor {
+        data: gpu.tensor(&qs, total as u32, hq * d, Dtype::Bf16),
+        indptr: gpu.column(&qo),
+    };
+    let selection = gpu.ints_shaped(&sel, total as u32, top_k);
+    let scale = 1.0 / (d as f32).sqrt();
+    let mut o = gpu.zeros(total as u32, hq * d, Dtype::Bf16);
+    if decode {
+        selected::attention_decode_selected(
+            &ctx, q, selection, &pool, None, d, scale, ratio, &mut o,
+        )
+        .unwrap();
+    } else {
         selected::attention_prefill_selected(
             &ctx, q, selection, &pool, None, d, hk, scale, ratio, &mut o,
         )
         .unwrap();
-        let got = gpu.read(&o);
-        let (d_, g, ratio_) = (d as usize, (hq / hk) as usize, ratio as usize);
-        for r in 0..fresh.len() {
-            for i in 0..fresh[r] as usize {
-                let t = qo[r] as usize + i;
-                let j_end = prefix[r] as usize + i + 1;
-                let nblocks = j_end / ratio_;
-                let mut picked: Vec<usize> = Vec::new();
-                for n in 0..(top_k as usize).min(nblocks) {
-                    let c = sel[t * top_k as usize + n];
-                    if c >= 0 && (c as usize) < nblocks && !picked.contains(&(c as usize)) {
-                        picked.push(c as usize);
-                    }
-                }
-                let mut ks_: Vec<usize> = picked
-                    .iter()
-                    .flat_map(|&c| c * ratio_..(c + 1) * ratio_)
-                    .collect();
-                ks_.extend(nblocks * ratio_..j_end);
-                for h in 0..hq as usize {
-                    let kh = h / g;
-                    let at = |j: usize| (j * hk as usize + kh) * d_;
-                    let want = attend(
-                        &qs[(t * hq as usize + h) * d_..(t * hq as usize + h + 1) * d_],
-                        |j| {
-                            (
-                                keys[r][at(j)..at(j) + d_].to_vec(),
-                                vals[r][at(j)..at(j) + d_].to_vec(),
-                            )
-                        },
-                        &ks_,
-                        f64::from(scale),
+    }
+    let got = gpu.read(&o);
+    let (d_, g, ratio_) = (d as usize, (hq / hk) as usize, ratio as usize);
+    for r in 0..fresh.len() {
+        for i in 0..fresh[r] as usize {
+            let t = qo[r] as usize + i;
+            let j_end = prefix[r] as usize + i + 1;
+            let nblocks = j_end / ratio_;
+            let mut picked: Vec<usize> = Vec::new();
+            for n in 0..(top_k as usize).min(nblocks) {
+                let c = sel[t * top_k as usize + n];
+                if c >= 0 && (c as usize) < nblocks {
+                    assert!(
+                        !picked.contains(&(c as usize)),
+                        "the test's selection repeats"
                     );
-                    close_abs(
-                        &format!("selected d{d} row {t} head {h}"),
-                        &got[(t * hq as usize + h) * d_..(t * hq as usize + h + 1) * d_],
-                        &want,
-                        1e-2,
-                    );
+                    picked.push(c as usize);
                 }
             }
+            let mut ks_: Vec<usize> = picked
+                .iter()
+                .flat_map(|&c| c * ratio_..(c + 1) * ratio_)
+                .collect();
+            ks_.extend(nblocks * ratio_..j_end);
+            for h in 0..hq as usize {
+                let kh = h / g;
+                let at = |j: usize| (j * hk as usize + kh) * d_;
+                let want = attend(
+                    &qs[(t * hq as usize + h) * d_..(t * hq as usize + h + 1) * d_],
+                    |j| {
+                        (
+                            keys[r][at(j)..at(j) + d_].to_vec(),
+                            vals[r][at(j)..at(j) + d_].to_vec(),
+                        )
+                    },
+                    &ks_,
+                    f64::from(scale),
+                );
+                close_abs(
+                    &format!("selected d{d} g{g} row {t} head {h}"),
+                    &got[(t * hq as usize + h) * d_..(t * hq as usize + h + 1) * d_],
+                    &want,
+                    1e-2,
+                );
+            }
         }
+    }
+}
+
+/// Device time of the selected decode at the model's shape, every block
+/// selected (contexts short of the budget), replayed from a graph.
+/// `cargo test --release --features rocm --test attn_more bench_selected -- --ignored --nocapture`
+#[test]
+#[ignore = "benchmark"]
+fn bench_selected_decode() {
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    let (hq, hk, d, ps, ratio, top_k) = (24u32, 2u32, 256u32, 16usize, 4u32, 2048u32);
+    for (lanes, len) in [
+        (1usize, 1100u32),
+        (32, 1100),
+        (128, 1100),
+        (128, 4096),
+        (512, 1100),
+    ] {
+        let kv_lens = vec![len; lanes];
+        let Cache { pool, .. } = paged_cache(&gpu, hk as usize, d as usize, ps, &kv_lens, 5);
+        let qo = indptr_of(&vec![1u32; lanes]);
+        let qs = bf16s(lanes * (hq * d) as usize, 3, 1.0);
+        let sel: Vec<i32> = (0..lanes)
+            .flat_map(|_| (0..top_k as i32).map(|n| if n < (len / ratio) as i32 { n } else { -1 }))
+            .collect();
+        let q = RaggedTensor {
+            data: gpu.tensor(&qs, lanes as u32, hq * d, Dtype::Bf16),
+            indptr: gpu.column(&qo),
+        };
+        let selection = gpu.ints_shaped(&sel, lanes as u32, top_k);
+        let mut o = gpu.zeros(lanes as u32, hq * d, Dtype::Bf16);
+        let us = gpu.time_graph(50, || {
+            selected::attention_decode_selected(
+                &ctx, q, selection, &pool, None, d, 0.0625, ratio, &mut o,
+            )
+            .unwrap();
+        });
+        let keys = (len.min(top_k * ratio) as usize) * lanes;
+        let bytes = keys * (hk * d) as usize * 2 * 2;
+        println!(
+            "selected decode lanes{lanes} ctx{len}: {us:.1} us ({:.0} GB/s of kv)",
+            bytes as f64 / us / 1e3
+        );
     }
 }
 
@@ -883,6 +1013,210 @@ fn ple_ngram_ids_hash_windows_across_the_state() {
         }
         assert_eq!(got, want, "ple chunked ids map={with_map}");
         assert_eq!(state, want_state, "ple chunked state map={with_map}");
+    }
+}
+
+/// Qwen3.8-Flash-Next's hash (trigrams, eight heads an order) over a
+/// vocabulary-wide id map: `ple_row` generalized.
+#[allow(clippy::too_many_arguments)]
+fn ple_ids(
+    mut window: Vec<i32>,
+    map: Option<&[i64]>,
+    mults: &[u64],
+    primes: &[u64],
+    offsets: &[u64],
+    per_order: usize,
+    eos: i32,
+) -> Vec<i32> {
+    let mut crossed = false;
+    for w in window.iter_mut().skip(1) {
+        if crossed {
+            *w = eos;
+        }
+        if *w == eos {
+            crossed = true;
+        }
+    }
+    if let Some(map) = map {
+        for w in &mut window {
+            *w = map[*w as usize] as i32;
+        }
+    }
+    let mut out = Vec::new();
+    for order in 2..=window.len() {
+        let mut mixed = (window[0] as u64).wrapping_mul(mults[0]);
+        for p in 1..order {
+            mixed ^= (window[p] as u64).wrapping_mul(mults[p]);
+        }
+        for k in 0..per_order {
+            let head = (order - 2) * per_order + k;
+            out.push((mixed % primes[head] + offsets[head]) as i32);
+        }
+    }
+    out
+}
+
+struct PleShape {
+    mults: Vec<u64>,
+    primes: Vec<u64>,
+    offsets: Vec<u64>,
+    map: Vec<i64>,
+}
+
+const PLE_VOCAB: usize = 248_320;
+const PLE_EOS: i32 = 248_044;
+
+fn ple_shape() -> PleShape {
+    let mults = vec![
+        0x9e37_79b9_7f4a_7c15,
+        0xc2b2_ae3d_27d4_eb4f,
+        0x1656_67b1_9e37_79f9,
+    ];
+    let primes: Vec<u64> = (0..16u64).map(|h| 1_249_999 - 2 * h * h - 7 * h).collect();
+    let mut offsets = vec![0u64];
+    for p in &primes[..15] {
+        offsets.push(offsets.last().unwrap() + p);
+    }
+    let map = (0..PLE_VOCAB as i64)
+        .map(|i| (i * 7919 + 13) % PLE_VOCAB as i64)
+        .collect();
+    PleShape {
+        mults,
+        primes,
+        offsets,
+        map,
+    }
+}
+
+/// The decode update at the model's shape, 1 to 512 rows, each on its own
+/// slot (some none), states holding eos and empty cells.
+#[test]
+fn ple_ngram_ids_at_the_models_shape() {
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    let raw = Raw::default();
+    let shape = ple_shape();
+    let map_t = raw.upload(&shape.map, PLE_VOCAB as u32, 1, Dtype::I64);
+    let stride = 4usize;
+    for rows in [1usize, 7, 128, 512] {
+        for with_map in [false, true] {
+            let slots: Vec<i32> = (0..rows as i32)
+                .map(|r| if r % 11 == 5 { -1 } else { rows as i32 - 1 - r })
+                .collect();
+            let ids: Vec<i32> = (0..rows)
+                .map(|r| ((r * 7907 + 3) % PLE_VOCAB) as i32)
+                .collect();
+            let state0: Vec<i32> = (0..rows * stride)
+                .map(|i| match i % 7 {
+                    0 => 0,
+                    3 => PLE_EOS + 1,
+                    _ => ((i * 4241) % PLE_VOCAB) as i32 + 1,
+                })
+                .collect();
+            let slab = raw.upload(&state0, rows as u32, stride as u32, Dtype::I32);
+            let pool = RecurrentPool {
+                slab,
+                slot_ids: gpu.column(&slots),
+                slot_stride_elems: stride as i64,
+                conv_slab: Tensor::ABSENT,
+                conv_stride: 0,
+                write_state: true,
+                write_state_mask: Tensor::ABSENT,
+                commit_len: Tensor::ABSENT,
+                begin_at: Tensor::ABSENT,
+                fused_decay: false,
+            };
+            let mut out = raw.upload(&vec![-1i32; rows * 16], rows as u32, 16, Dtype::I32);
+            kernels_rocm::attn_ple::ngram_ids(
+                &ctx,
+                gpu.column(&ids),
+                &pool,
+                PLE_EOS as u32,
+                &shape.mults,
+                &shape.primes,
+                &shape.offsets,
+                8,
+                with_map.then_some(map_t),
+                &mut out,
+            )
+            .unwrap();
+            let (got, state) = (raw.read_i32(&gpu, &out), raw.read_i32(&gpu, &slab));
+            let mut want_state = state0.clone();
+            let cell = |c: i32| if c == 0 { PLE_EOS } else { c - 1 };
+            for r in 0..rows {
+                let want = if slots[r] < 0 {
+                    vec![-1; 16]
+                } else {
+                    let at = slots[r] as usize * stride;
+                    let s = &state0[at..at + 2];
+                    (want_state[at], want_state[at + 1]) = (s[1], ids[r] + 1);
+                    ple_ids(
+                        vec![ids[r], cell(s[1]), cell(s[0])],
+                        with_map.then_some(&shape.map[..]),
+                        &shape.mults,
+                        &shape.primes,
+                        &shape.offsets,
+                        8,
+                        PLE_EOS,
+                    )
+                };
+                assert_eq!(
+                    &got[r * 16..(r + 1) * 16],
+                    &want[..],
+                    "ple rows{rows} row {r} map={with_map}"
+                );
+            }
+            assert_eq!(state, want_state, "ple rows{rows} state map={with_map}");
+        }
+    }
+}
+
+/// Device time of the decode update at the model's shape.
+/// `cargo test --release --features rocm --test attn_more bench_ple -- --ignored --nocapture`
+#[test]
+#[ignore = "benchmark"]
+fn bench_ple_ngram_ids() {
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    let raw = Raw::default();
+    let shape = ple_shape();
+    let map_t = raw.upload(&shape.map, PLE_VOCAB as u32, 1, Dtype::I64);
+    for rows in [1usize, 32, 128, 512] {
+        let slots: Vec<i32> = (0..rows as i32).collect();
+        let ids: Vec<i32> = (0..rows)
+            .map(|r| ((r * 7907 + 3) % PLE_VOCAB) as i32)
+            .collect();
+        let slab = raw.upload(&vec![5i32; rows * 4], rows as u32, 4, Dtype::I32);
+        let pool = RecurrentPool {
+            slab,
+            slot_ids: gpu.column(&slots),
+            slot_stride_elems: 4,
+            conv_slab: Tensor::ABSENT,
+            conv_stride: 0,
+            write_state: true,
+            write_state_mask: Tensor::ABSENT,
+            commit_len: Tensor::ABSENT,
+            begin_at: Tensor::ABSENT,
+            fused_decay: false,
+        };
+        let ids_t = gpu.column(&ids);
+        let mut out = raw.upload(&vec![0i32; rows * 16], rows as u32, 16, Dtype::I32);
+        let us = gpu.time_graph(50, || {
+            kernels_rocm::attn_ple::ngram_ids(
+                &ctx,
+                ids_t,
+                &pool,
+                PLE_EOS as u32,
+                &shape.mults,
+                &shape.primes,
+                &shape.offsets,
+                8,
+                Some(map_t),
+                &mut out,
+            )
+            .unwrap();
+        });
+        println!("ple_ngram_ids rows{rows}: {us:.1} us");
     }
 }
 

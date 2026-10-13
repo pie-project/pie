@@ -143,22 +143,33 @@ __global__ void rope_yarn(bf16* __restrict__ q, bf16* __restrict__ k,
 // Partial rotary: the first rotary_dim/2 pairs of every head turn, pair i
 // with i + span (span = rotary_dim/2 for a plain partial rotary, head_dim/2
 // for a proportional one); the rest of the head is left alone. One block
-// per token row, q heads then k heads.
+// per token row, q heads then k heads; the row's first `cache_pairs` angles
+// are taken once into LDS (cos then sin) and shared by its heads.
 template <class T>
 __global__ void rope_partial(T* __restrict__ q, T* __restrict__ k,
                              const i32* __restrict__ positions, int position_delta,
                              int num_q_heads, int num_kv_heads, int head_dim, int rotary_dim,
-                             int span, float theta, const u32* __restrict__ win) {
+                             int span, float theta, int cache_pairs, const u32* __restrict__ win) {
     const Window window{win};
     if (!window.live(blockIdx.x)) return;
     const long long row = window.plane(blockIdx.x);
     const int pairs = rotary_dim / 2;
     const int pos = positions[row] + position_delta;
+    extern __shared__ float partial_cs[];
+    for (int i = threadIdx.x; i < cache_pairs; i += blockDim.x) {
+        rotation(pos, i, span, theta, partial_cs[i], partial_cs[cache_pairs + i]);
+    }
+    if (cache_pairs > 0) lds_barrier();
     for (int t = threadIdx.x; t < (num_q_heads + num_kv_heads) * pairs; t += blockDim.x) {
         const int head = t / pairs;
         const int i = t % pairs;
         float c, s;
-        rotation(pos, i, span, theta, c, s);
+        if (i < cache_pairs) {
+            c = partial_cs[i];
+            s = partial_cs[cache_pairs + i];
+        } else {
+            rotation(pos, i, span, theta, c, s);
+        }
         rotate_pair(head_at(q, k, row, head, num_q_heads, num_kv_heads, head_dim), i, span, c, s);
     }
 }
