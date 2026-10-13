@@ -10,7 +10,7 @@
 pub mod adapter;
 pub mod caps;
 pub mod channel;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod disk;
 pub mod engine;
 pub mod error;

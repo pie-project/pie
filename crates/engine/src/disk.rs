@@ -6,6 +6,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
@@ -49,7 +50,7 @@ impl SlotFile {
         // APFS copies on write: a page written lands in new blocks and the
         // preallocated ones stay reserved, so preallocating there doubles
         // the file's footprint instead of guaranteeing it.
-        #[cfg(not(target_vendor = "apple"))]
+        #[cfg(all(unix, not(target_vendor = "apple")))]
         if let Err(error) =
             rustix::fs::fallocate(&file, rustix::fs::FallocateFlags::empty(), 0, len)
             && error != rustix::io::Errno::OPNOTSUPP
@@ -137,6 +138,40 @@ fn open_direct(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Windows reads and writes at an offset through `seek_read`/`seek_write`,
+/// which may stop short: the whole slot is looped through, as Unix's
+/// `read_exact_at`/`write_all_at` do.
+#[cfg(windows)]
+trait FileExt {
+    fn write_all_at(&self, buf: &[u8], at: u64) -> io::Result<()>;
+    fn read_exact_at(&self, buf: &mut [u8], at: u64) -> io::Result<()>;
+}
+
+#[cfg(windows)]
+impl FileExt for File {
+    fn write_all_at(&self, mut buf: &[u8], mut at: u64) -> io::Result<()> {
+        use std::os::windows::fs::FileExt as _;
+        while !buf.is_empty() {
+            match self.seek_write(buf, at)? {
+                0 => return Err(io::ErrorKind::WriteZero.into()),
+                n => (buf, at) = (&buf[n..], at + n as u64),
+            }
+        }
+        Ok(())
+    }
+
+    fn read_exact_at(&self, mut buf: &mut [u8], mut at: u64) -> io::Result<()> {
+        use std::os::windows::fs::FileExt as _;
+        while !buf.is_empty() {
+            match self.seek_read(buf, at)? {
+                0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+                n => (buf, at) = (&mut buf[n..], at + n as u64),
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A heap buffer of `len` bytes that starts on an `ALIGN` boundary: the
 /// stage one page goes through on an engine whose kv lives in host memory.
 #[derive(Debug, Default)]
@@ -190,6 +225,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn rewriting_every_slot_keeps_the_file_within_its_budget_and_it_leaves_no_path() {
         use std::os::unix::fs::MetadataExt;
