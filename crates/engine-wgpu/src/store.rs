@@ -96,8 +96,6 @@ pub struct Pools {
     paging: Paging,
 
     watermark: engine::frame::Demand,
-
-    state_scratch: Option<Buffer>,
 }
 
 impl Pools {
@@ -180,23 +178,11 @@ impl Pools {
             }
             debug_assert_eq!(slabs.len(), index + 1, "one allocation per cache row");
         }
-        let widest = shapes
-            .iter()
-            .map(|shape| match shape {
-                Shape::State { stride, dtype } => stride * u64::from(elem_size(*dtype)),
-                Shape::Kv { .. } => 0,
-            })
-            .max()
-            .unwrap_or(0);
-        let state_scratch = (widest > 0)
-            .then(|| Buffer::zeroed(device, widest))
-            .transpose()?;
         Ok(Pools {
             slabs,
             shapes,
             paging,
             watermark: engine::frame::Demand::ZERO,
-            state_scratch,
         })
     }
 
@@ -358,16 +344,18 @@ impl Pools {
                 workspace: 0,
             },
         )?;
-        let Some(scratch) = self.state_scratch.as_ref() else {
-            return Ok(());
-        };
         for (slab, shape) in self.slabs.iter().zip(&self.shapes) {
             let Shape::State { stride, dtype } = *shape else {
                 continue;
             };
             let bytes = stride * u64::from(elem_size(dtype));
-            frame.copy(slab, u64::from(src) * bytes, scratch, 0, bytes)?;
-            frame.copy(scratch, 0, slab, u64::from(dst) * bytes, bytes)?;
+            frame.copy(
+                slab,
+                u64::from(src) * bytes,
+                slab,
+                u64::from(dst) * bytes,
+                bytes,
+            )?;
         }
         Ok(())
     }

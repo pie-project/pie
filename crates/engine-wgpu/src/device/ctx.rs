@@ -847,14 +847,16 @@ impl Frame {
             });
         }
         crate::encode::record_copy();
-        self.encode(|encoder| {
-            encoder.copy_buffer_to_buffer(
-                &source.slab().buffer,
-                source_at,
-                &into.slab().buffer,
-                into_at,
-                Some(len),
-            );
+        let (from, to) = (&source.slab().buffer, &into.slab().buffer);
+        // wgpu refuses a copy whose ends are one buffer: it goes through
+        // scratch, which also reads overlapping ends as they were.
+        let stage = (from == to).then(|| self.scratch_slot(len));
+        self.encode(|encoder| match &stage {
+            None => encoder.copy_buffer_to_buffer(from, source_at, to, into_at, Some(len)),
+            Some((scratch, at)) => {
+                encoder.copy_buffer_to_buffer(from, source_at, scratch, *at, Some(len));
+                encoder.copy_buffer_to_buffer(scratch, *at, to, into_at, Some(len));
+            }
         })
     }
 
@@ -1045,5 +1047,31 @@ impl Pending {
         crate::encode::record_wait_call();
         self.inner.harvest();
         self.inner.core.take_error("submission")
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use crate::device::Buffer;
+
+    #[test]
+    fn a_copy_between_two_spans_of_one_buffer_lands() {
+        if !present() {
+            return;
+        }
+        let device = Context::bind(&DeviceBoot::default(), 0.1).unwrap();
+        let mut buffer = Buffer::zeroed(&device, 64).unwrap();
+        let ramp: Vec<u8> = (1..=24).collect();
+        buffer.write(0, &ramp).unwrap();
+        let mut frame = device.frame().unwrap();
+        frame.copy(&buffer, 0, &buffer, 32, 16).unwrap();
+        // Overlapping ends read the source as it was before the copy.
+        frame.copy(&buffer, 0, &buffer, 8, 16).unwrap();
+        frame.commit().unwrap();
+        let mut got = [0u8; 64];
+        buffer.read(0, &mut got).unwrap();
+        assert_eq!(got[32..48], ramp[..16]);
+        assert_eq!(got[8..24], ramp[..16]);
     }
 }
