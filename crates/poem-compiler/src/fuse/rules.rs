@@ -26,6 +26,7 @@ pub(super) fn all() -> Vec<Rule> {
         gated_residual_norm_modulate(),
         norm_modulate(),
         rmsnorm_rope_partial_q(),
+        hc_norm_project(),
     ]
 }
 
@@ -476,6 +477,25 @@ fn rmsnorm_rope_partial_q() -> Rule {
             span: m.u32("span"),
             y: m.value("y"),
             q_out: m.value("q_out"),
+        }
+    })
+}
+
+/// mHC's f32 stream norm read only by its mix projection.
+fn hc_norm_project() -> Rule {
+    let pattern = template(|p| {
+        let normed = elemwise::hc_rmsnorm_f32(&p.rows("streams", W), p.f32("eps"));
+        let count = p.u32("stream_count");
+        let weight = p.weight("weight", [u64::from(count), W]);
+        p.export("mixes", &elemwise::hc_project(&normed, &weight, count));
+    });
+    Rule::new("elementwise.hc_norm_project", [pattern], |m| {
+        Fused::HcNormProject {
+            streams: m.value("streams"),
+            eps: m.f32("eps"),
+            weight: m.value("weight"),
+            stream_count: m.u32("stream_count"),
+            mixes: m.value("mixes"),
         }
     })
 }

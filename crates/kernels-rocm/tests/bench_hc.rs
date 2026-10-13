@@ -86,6 +86,16 @@ fn bench_hc() {
                     us,
                     nf * wf * 4.0 + f64::from(mix_hc) * wf * 4.0,
                 );
+                let us = time_sets(&gpu, sets, |i| {
+                    hc::norm_project(&ctx, streams[i], fn_w, 1e-6, M, &mut mixes[i]).unwrap();
+                });
+                report(
+                    "hc_norm_project",
+                    h,
+                    n,
+                    us,
+                    nf * wf * 2.0 + f64::from(mix_hc) * wf * 4.0,
+                );
                 let mut x: Vec<Tensor> = (0..sets).map(|_| gpu.zeros(n, h, Dtype::Bf16)).collect();
                 let mut post = gpu.zeros(n, M, Dtype::F32);
                 let mut comb = gpu.zeros(n, M * M, Dtype::F32);

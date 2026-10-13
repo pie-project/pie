@@ -1,5 +1,5 @@
 //! The hyper-connection kernels against a host reference: mHC's norm,
-//! projection, Sinkhorn gates, fold and trunk collapse, the stream expand,
+//! projection (and the two fused), Sinkhorn gates, fold and trunk collapse, the stream expand,
 //! and the gated-residual mix, inject and per-layer-embedding gate. Rows are
 //! M streams of H: a small row whose H is not a multiple of the block, one
 //! whose H is not a multiple of a 16-byte pack (the scalar forms), eight
@@ -232,6 +232,12 @@ fn mhc_chain(gpu: &Gpu, s: Shape) {
         hc::project(&ctx, normed, hc_fn, m as u32, &mut mixes).unwrap();
         let (want, tol) = host_project(&normed_h, &fn_h, m * h, rows_out);
         close_within(&what("hc_project"), &gpu.read(&mixes), &want, &tol);
+
+        // The norm and the projection in one, against the host's norm.
+        let mut fused = gpu.zeros(rows, rows_out as u32, Dtype::F32);
+        hc::norm_project(&ctx, streams, hc_fn, eps, m as u32, &mut fused).unwrap();
+        let (want, tol) = host_project(&host_normed(s, &streams_h, eps), &fn_h, m * h, rows_out);
+        close_within(&what("hc_norm_project"), &gpu.read(&fused), &want, &tol);
     }
 
     // The gates, from a mix row of the scale a real projection gives.
@@ -325,6 +331,7 @@ fn mhc_chain(gpu: &Gpu, s: Shape) {
     let fn_h = values(mix_hc * m * h, 2, 0.05);
     let hc_fn = gpu.tensor(&fn_h, mix_hc as u32, wide, Dtype::F32);
     let mut mixes_w = gpu.zeros(rows, mix_hc as u32, Dtype::F32);
+    let mut fused_w = gpu.zeros(rows, mix_hc as u32, Dtype::F32);
     let mut x = gpu.zeros(rows, h as u32, Dtype::Bf16);
     let mut post = gpu.zeros(rows, m as u32, Dtype::F32);
     let mut comb = gpu.zeros(rows, (m * m) as u32, Dtype::F32);
@@ -333,6 +340,7 @@ fn mhc_chain(gpu: &Gpu, s: Shape) {
     ctx.arm_stage(win.ptr);
     hc::rmsnorm_f32(&ctx, streams, eps, &mut normed_w).unwrap();
     hc::project(&ctx, normed, hc_fn, m as u32, &mut mixes_w).unwrap();
+    hc::norm_project(&ctx, streams, hc_fn, eps, m as u32, &mut fused_w).unwrap();
     hc::gates(
         &ctx, mixes, streams, scale, base, m as u32, gate_eps, alpha, iters, &mut x, &mut post,
         &mut comb,
@@ -360,6 +368,12 @@ fn mhc_chain(gpu: &Gpu, s: Shape) {
     close_within(
         &what("windowed hc_project"),
         &gpu.read(&mixes_w),
+        &windowed(&want_mix, mix_hc, live.clone()),
+        &tol,
+    );
+    close_within(
+        &what("windowed hc_norm_project"),
+        &gpu.read(&fused_w),
         &windowed(&want_mix, mix_hc, live.clone()),
         &tol,
     );

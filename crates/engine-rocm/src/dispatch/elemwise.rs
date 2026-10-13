@@ -193,6 +193,20 @@ impl Run<'_> {
                 *span,
                 &mut self.tensor(*y),
             ),
+            Fused::HcNormProject {
+                streams,
+                eps,
+                weight,
+                stream_count,
+                mixes,
+            } => elemwise::hc::norm_project(
+                self.ctx(),
+                self.tensor(*streams),
+                self.tensor(*weight),
+                *eps,
+                *stream_count,
+                &mut self.tensor(*mixes),
+            ),
             Fused::NormModulate {
                 x,
                 norm,

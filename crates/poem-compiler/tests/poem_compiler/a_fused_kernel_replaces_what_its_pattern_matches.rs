@@ -173,3 +173,44 @@ fn the_qkv_write_stays_apart_when_its_norms_do_not() {
     );
     assert_eq!(ops(&fused), ops(&apart), "no op folds");
 }
+
+fn mhc_mixes(p: &Pattern) -> (poem::Value, poem::Value) {
+    let normed = elemwise::hc_rmsnorm_f32(&p.rows("streams", 256), 1e-6);
+    let mixes = elemwise::hc_project(&normed, &p.weight("dynamic", [24, 256]), 4);
+    (normed, mixes)
+}
+
+#[test]
+fn an_mhc_norm_read_only_by_its_projection_folds_into_it() {
+    let fused = fuse(
+        trace(|p| drop(mhc_mixes(p))),
+        &["elementwise.hc_norm_project"],
+    );
+    assert_eq!(ops(&fused), ["elementwise.hc_norm_project"]);
+    let Some(poem_ir::Operation::Fused(poem_ir::Fused::HcNormProject {
+        eps, stream_count, ..
+    })) = fused.nodes.first().map(|node| &node.op)
+    else {
+        panic!("the op is the fused projection");
+    };
+    assert_eq!((*eps, *stream_count), (1e-6, 4));
+}
+
+#[test]
+fn an_mhc_norm_read_elsewhere_stays_written() {
+    let fused = fuse(
+        trace(|p| {
+            let (normed, _) = mhc_mixes(p);
+            elemwise::silu(&normed);
+        }),
+        &["elementwise.hc_norm_project"],
+    );
+    assert_eq!(
+        ops(&fused),
+        [
+            "elementwise.hc_rmsnorm_f32",
+            "elementwise.hc_project",
+            "elementwise.silu"
+        ]
+    );
+}

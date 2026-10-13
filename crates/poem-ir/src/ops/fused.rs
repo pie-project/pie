@@ -100,6 +100,16 @@ pub enum Fused {
         form: ModulateForm,
         out: ValueId,
     },
+    /// mHC's mix projection of the f32-normed stream row, from the streams
+    /// themselves: the norm (no weight) is a row scale, so it lands on the
+    /// projection's sums and the normed row is never written.
+    HcNormProject {
+        streams: ValueId,
+        eps: f32,
+        weight: ValueId,
+        stream_count: u32,
+        mixes: ValueId,
+    },
     MatmulGeglu {
         act: ValueId,
         w: ValueId,
@@ -201,6 +211,9 @@ impl Operands for Fused {
                 sink.extend([*r, *g, *y, *m]);
                 sink.extend(*lane_of_row);
             }
+            Self::HcNormProject {
+                streams, weight, ..
+            } => sink.extend([*streams, *weight]),
             Self::MatmulGeglu { act, w, .. } | Self::LmHeadSoftcap { act, w, .. } => {
                 sink.extend([*act, *w]);
             }
@@ -269,6 +282,7 @@ impl Operands for Fused {
             } => {
                 sink.extend([*r_out, *normed, *out]);
             }
+            Self::HcNormProject { mixes, .. } => sink.push(*mixes),
             Self::MatmulGeglu { packed, y, .. } => sink.extend([*packed, *y]),
             Self::MlpSwiglu { packed, h, y, .. } => sink.extend([*packed, *h, *y]),
             Self::LmHeadSoftcap { y, y_out, .. } => sink.extend([*y, *y_out]),
@@ -288,7 +302,8 @@ impl Operands for Fused {
             Self::LmHeadSoftcap { y, y_out, .. } | Self::MatmulBias { y, y_out, .. } => {
                 sink.push((*y_out, *y));
             }
-            Self::MatmulGeglu { .. }
+            Self::HcNormProject { .. }
+            | Self::MatmulGeglu { .. }
             | Self::MlpSwiglu { .. }
             | Self::QkvFusedQknormRopeVnormWrite { .. } => {}
         }
@@ -304,6 +319,7 @@ impl Operands for Fused {
             Self::RmsnormRopePartialQ { .. } => "elementwise.rmsnorm_rope_partial_q",
             Self::NormModulate { .. } => "elementwise.norm_modulate",
             Self::GatedResidualNormModulate { .. } => "elementwise.gated_residual_norm_modulate",
+            Self::HcNormProject { .. } => "elementwise.hc_norm_project",
             Self::MatmulGeglu { .. } => "linear.matmul_geglu",
             Self::MlpSwiglu { .. } => "linear.mlp_swiglu",
             Self::LmHeadSoftcap { .. } => "linear.lm_head_softcap",

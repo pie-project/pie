@@ -136,6 +136,17 @@ const PROJECT_WAVES: u32 = 4;
 /// The most K slices it sums (`hc_project_sum` holds one a register).
 const PROJECT_SLICES: u32 = 64;
 
+fn compute_units() -> u32 {
+    #[cfg(feature = "rocm")]
+    {
+        crate::linear::compute_units()
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        304
+    }
+}
+
 /// How the tiled projection cuts its rows and K: `nt` 16-row tiles a
 /// wavefront (two past one tile), `tiles` row blocks, and K in `slices`
 /// slices of `per`, sliced until the blocks cover the compute units once, a
@@ -153,7 +164,7 @@ impl Slicing {
         let nt = if rows > PROJECT_ROWS { 2 } else { 1 };
         let tiles = rows.div_ceil(PROJECT_ROWS * nt);
         let grain = 64 * PROJECT_WAVES;
-        let want = crate::linear::compute_units()
+        let want = compute_units()
             .div_ceil(tiles)
             .clamp(1, fan.div_ceil(grain).min(PROJECT_SLICES));
         let per = fan.div_ceil(want).div_ceil(grain) * grain;
@@ -290,6 +301,98 @@ pub fn project(
         )
         .apply(Launch::flat(rows * mix_hc, 64)),
         &[part, mixes.arg(), stated(OP, rows)?.arg(), ctx.stage()],
+    )
+}
+
+/// `project` of `rmsnorm_f32` of the streams, the f32 normed row never
+/// landed: the norm has no weight, so it scales the projection's sums.
+pub fn norm_project(
+    ctx: &Ctx,
+    streams: Tensor,
+    hc_fn: Tensor,
+    eps: f32,
+    stream_count: u32,
+    mixes: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.hc_norm_project";
+    let t = dtype_dispatch!(OP, streams.dtype, { Bf16 => "::pie::bf16" });
+    debug_assert!(
+        hc_fn.dtype == Dtype::F32 && mixes.dtype == Dtype::F32,
+        "`{OP}` projects through an f32 plane into an f32 row"
+    );
+    let rows = nonzero(OP, "rows", mixes.rows)?;
+    let fan = nonzero(
+        OP,
+        "the stream row this projection contracts",
+        streams.width,
+    )?;
+    let tiled = fan.is_multiple_of(64)
+        && streams.ptr.is_multiple_of(16)
+        && hc_fn.ptr.is_multiple_of(16)
+        && hc_fn.width == fan
+        && hc_fn.rows == mixes.width;
+    if !tiled {
+        // The primitives, over a normed row of scratch.
+        let bytes = rows as usize * fan as usize * 4;
+        let normed = ctx.scratch(OP, "elementwise.hc_norm_project_normed", bytes)? as usize as u64;
+        let mut normed = Tensor::new(normed, streams.rows, fan, Dtype::F32);
+        rmsnorm_f32(ctx, streams, eps, &mut normed)?;
+        return project(ctx, normed, hc_fn, stream_count, mixes);
+    }
+    let mix_hc = hc_fn.rows;
+    let layer_row = 2 * stream_count + stream_count * stream_count;
+    if stream_count == 0
+        || stream_count > MAX_HC_MULT
+        || (mix_hc != layer_row && mix_hc != stream_count)
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "a {stream_count}-stream mix row is {layer_row} wide and a trunk collapse row \
+                 is {stream_count}; the plane lands {mix_hc} rows"
+            ),
+        ));
+    }
+    let plan = Slicing::of(rows, fan);
+    let part = plan.part(ctx, OP, rows, mix_hc + 1, true)?;
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::hc_norm_project_tiled<{t}, {mix_hc}, {}, {PROJECT_WAVES}>",
+                plan.nt
+            )),
+        )
+        .apply(plan.launch()),
+        &[
+            streams.arg(),
+            hc_fn.arg(),
+            part,
+            stated(OP, rows)?.arg(),
+            stated(OP, fan)?.arg(),
+            stated(OP, plan.per)?.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::hc_norm_project_sum<{mix_hc}, {}>",
+                plan.slices
+            )),
+        )
+        .apply(Launch::per_row(rows, (mix_hc + 64) / 64 * 64)),
+        &[
+            part,
+            mixes.arg(),
+            stated(OP, rows)?.arg(),
+            stated(OP, fan)?.arg(),
+            eps.arg(),
+            ctx.stage(),
+        ],
     )
 }
 

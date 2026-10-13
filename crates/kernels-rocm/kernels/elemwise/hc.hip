@@ -247,6 +247,147 @@ __global__ void hc_project_sum(const float* __restrict__ part, float* __restrict
     mixes[window.plane(n) * O + (idx - n * O)] = acc;
 }
 
+// The mix projection of the normed stream row, from the streams: the norm
+// has no weight, so mixes = (x·fnᵀ)·rsqrt(mean(x²) + eps), and the f32 row
+// is never written. The tiling is `hc_project_tiled`'s over 2-byte streams:
+// a lane reads 8 k of its row a 16-byte pack and feeds them to eight steps,
+// and alongside the products sums its squares. Block (s, t) lands its slice's
+// sums in part[s][n][o] and its rows' squares in part[s][n][O], a row of
+// O + 1, for `hc_norm_project_sum`. K is a multiple of 64 and every operand 16-byte
+// aligned (the launcher's check).
+template <class T, int O, int NT, int WAVES>
+__global__ __launch_bounds__(WAVES * 64) void hc_norm_project_tiled(
+    const T* __restrict__ streams, const float* __restrict__ hc_fn, float* __restrict__ part,
+    int N, int K, int per, const u32* __restrict__ win) {
+    constexpr int OT = (O + 15) / 16;
+    __shared__ mfma_cd tiles[WAVES - 1][NT][OT][kWave];
+    __shared__ float squares[WAVES - 1][NT][16];
+    const int n0 = static_cast<int>(blockIdx.y) * 16 * NT;
+    const Window window{win};
+    if (!window.live(n0)) return;
+    const int l = lane(), w = static_cast<int>(threadIdx.x) / kWave, r = l % 16, g = l / 16;
+    bool lands[NT];
+    const T* x[NT];
+#pragma unroll
+    for (int b = 0; b < NT; ++b) {
+        const int n = n0 + 16 * b + r;
+        lands[b] = n < N && window.live(n);
+        x[b] = streams + window.plane(lands[b] ? n : n0) * K + 8 * g;
+    }
+    const float* a[OT];
+#pragma unroll
+    for (int t = 0; t < OT; ++t) a[t] = hc_fn + static_cast<long long>(min(16 * t + r, O - 1)) * K + 8 * g;
+
+    mfma_cd acc[NT][OT];
+    float sq[NT];
+#pragma unroll
+    for (int b = 0; b < NT; ++b) {
+        sq[b] = 0.f;
+#pragma unroll
+        for (int t = 0; t < OT; ++t) acc[b][t] = mfma_zero();
+    }
+    const int begin = static_cast<int>(blockIdx.x) * per;
+    const int end = min(K, begin + per);
+    for (int kb = begin + 64 * w; kb < end; kb += 64 * WAVES) {
+        float xv[NT][2][8];
+        float4 av[OT][2][2];
+#pragma unroll
+        for (int b = 0; b < NT; ++b) {
+#pragma unroll
+            for (int u = 0; u < 2; ++u) load8(x[b] + kb + 32 * u, xv[b][u]);
+        }
+#pragma unroll
+        for (int t = 0; t < OT; ++t) {
+#pragma unroll
+            for (int u = 0; u < 2; ++u) {
+                av[t][u][0] = *reinterpret_cast<const float4*>(a[t] + kb + 32 * u);
+                av[t][u][1] = *reinterpret_cast<const float4*>(a[t] + kb + 32 * u + 4);
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+#pragma unroll
+            for (int b = 0; b < NT; ++b) {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) sq[b] += xv[b][u][e] * xv[b][u][e];
+#pragma unroll
+                for (int t = 0; t < OT; ++t) {
+#pragma unroll
+                    for (int q = 0; q < 2; ++q) {
+                        const float4 wv = av[t][u][q];
+                        acc[b][t] = mfma4_f32(wv.x, xv[b][u][4 * q + 0], acc[b][t]);
+                        acc[b][t] = mfma4_f32(wv.y, xv[b][u][4 * q + 1], acc[b][t]);
+                        acc[b][t] = mfma4_f32(wv.z, xv[b][u][4 * q + 2], acc[b][t]);
+                        acc[b][t] = mfma4_f32(wv.w, xv[b][u][4 * q + 3], acc[b][t]);
+                    }
+                }
+            }
+        }
+    }
+    // A row's squares over the wavefront's four lane groups, then over the
+    // waves in wave order.
+#pragma unroll
+    for (int b = 0; b < NT; ++b) {
+        sq[b] += __shfl_xor(sq[b], 16, kWave);
+        sq[b] += __shfl_xor(sq[b], 32, kWave);
+    }
+    if (w > 0) {
+#pragma unroll
+        for (int b = 0; b < NT; ++b) {
+#pragma unroll
+            for (int t = 0; t < OT; ++t) tiles[w - 1][b][t][l] = acc[b][t];
+            if (g == 0) squares[w - 1][b][r] = sq[b];
+        }
+    }
+    lds_barrier();
+    if (w > 0) return;
+#pragma unroll
+    for (int b = 0; b < NT; ++b) {
+        if (!lands[b]) continue;
+        const int n = n0 + 16 * b + r;
+#pragma unroll
+        for (int v = 0; v < WAVES - 1; ++v) {
+            sq[b] += squares[v][b][r];
+#pragma unroll
+            for (int t = 0; t < OT; ++t) acc[b][t] += tiles[v][b][t][l];
+        }
+        float* dst = part + (static_cast<long long>(blockIdx.x) * N + n) * (O + 1);
+        if (g == 0) dst[O] = sq[b];
+#pragma unroll
+        for (int t = 0; t < OT; ++t) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int o = 16 * t + 4 * g + e;
+                if (o < O) dst[o] = acc[b][t][e];
+            }
+        }
+    }
+}
+
+// The K slices' sums in slice order, scaled by the row's norm:
+// mixes[row][o] = Σ_s part[s][n][o] · rsqrt(Σ_s part[s][n][O] / K + eps),
+// a block a row and a thread a column.
+template <int O, int S>
+__global__ __launch_bounds__((O + kWave) / kWave * kWave) void hc_norm_project_sum(
+    const float* __restrict__ part, float* __restrict__ mixes, int N, int K, float eps,
+    const u32* __restrict__ win) {
+    __shared__ float squares;
+    const int n = static_cast<int>(blockIdx.x), o = static_cast<int>(threadIdx.x);
+    const Window window{win};
+    if (!window.live(n)) return;
+    const long long stride = static_cast<long long>(N) * (O + 1);
+    const float* p = part + static_cast<long long>(n) * (O + 1) + min(o, O);
+    float v[S];
+#pragma unroll
+    for (int s = 0; s < S; ++s) v[s] = p[s * stride];
+    float acc = 0.f;
+#pragma unroll
+    for (int s = 0; s < S; ++s) acc += v[s];
+    if (o == O) squares = acc;
+    lds_barrier();
+    if (o < O) mixes[window.plane(n) * O + o] = acc * rsqrtf(squares / static_cast<float>(K) + eps);
+}
+
 // Sinkhorn on one wavefront: lane t < M² holds combination entry
 // (t / M, t % M), a row or column sum gathers its M entries in index order,
 // and every lane past M² mirrors the last entry. Row softmax (+ eps), then a
