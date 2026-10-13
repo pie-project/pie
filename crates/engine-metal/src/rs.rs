@@ -6,6 +6,7 @@ use engine::fire::{FoldLen, RsVerb};
 use kernels_metal::Tensor;
 use poem_ir::{Attention, Def, Dim, Dtype, Operation, Trace, Ty, ValueId};
 
+use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
 use crate::store::kv::Paging;
@@ -308,6 +309,31 @@ impl Buffers {
     #[must_use]
     pub fn page_tokens(&self) -> u32 {
         self.page_tokens
+    }
+
+    /// Copies each `(src, dst)` slot's buffered page: a recurrent slot is
+    /// its state and its buffer page, and a copy of one that left the rows
+    /// behind would hand the fold whatever the destination last held.
+    pub fn copy_pages(&self, frame: &mut Frame, moves: &[(u32, u32)]) -> Result<()> {
+        for &(src, dst) in moves {
+            if src == dst {
+                continue;
+            }
+            let need = src.max(dst) + 1;
+            if need > self.slots {
+                return Err(Fault::Ceiling {
+                    what: "recurrent buffer page slots",
+                    need: u64::from(need),
+                    have: u64::from(self.slots),
+                });
+            }
+            let (from, to) = (
+                u64::from(src) * self.page_bytes,
+                u64::from(dst) * self.page_bytes,
+            );
+            frame.copy_span(&self.slab, from, &self.slab, to, self.page_bytes)?;
+        }
+        Ok(())
     }
 
     fn handle(&self, handles: &Handles) -> Result<u32> {
