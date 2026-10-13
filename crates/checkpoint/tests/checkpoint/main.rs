@@ -1,5 +1,6 @@
 //! checkpoint's integration tests, one binary: each module was a test file.
 
+mod a_block_scaled_fp8_plane_lands_as_bf16;
 mod a_component_that_keeps_its_weights_a_folder_down_is_still_read;
 mod a_constant_lands_as_the_bytes_it_carries;
 mod a_diffusers_pipeline_reads_as_one_prefixed_name_space;

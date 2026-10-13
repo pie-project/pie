@@ -948,6 +948,7 @@ impl Walk<'_, '_> {
                 inputs.first().copied(),
                 outputs.first().copied(),
                 &input,
+                &transform,
             )?,
             TileMapKind::Scale => {
                 self.scale_bytes(source, inputs, outputs.first().copied(), &input, &transform)?
@@ -1518,6 +1519,7 @@ impl Walk<'_, '_> {
         input: Option<BufferId>,
         output: Option<BufferId>,
         bytes: &[u8],
+        transform: &TransformSpec,
     ) -> Result<Vec<u8>, Error> {
         let output = output.ok_or_else(|| invalid("host Cast requires an output buffer"))?;
         let from = if let Some(input) = input {
@@ -1531,7 +1533,66 @@ impl Walk<'_, '_> {
         if from == to {
             return Ok(bytes.to_vec());
         }
+        if from == DType::E4m3
+            && let Some(source) = source
+            && transform.metadata_source.is_some()
+        {
+            return self.fp8_block_cast(source, transform, output, bytes, to);
+        }
         cast_elements(bytes, from, to)
+    }
+
+    /// A block-scaled FP8 source read at a wider float: each code times its
+    /// block's factor, rounded to bf16 as an encode of it reads it.
+    fn fp8_block_cast(
+        &self,
+        source: &SourceExtent,
+        transform: &TransformSpec,
+        output: BufferId,
+        bytes: &[u8],
+        to: DType,
+    ) -> Result<Vec<u8>, Error> {
+        let shape = self.buffer_shape(output)?.to_vec();
+        let Some((rows, cols)) = crate::types::rectangle(&shape) else {
+            return Err(invalid(format!(
+                "host Cast of a block-scaled FP8 source reads a [rows, cols] rectangle, \
+                 and {shape:?} is none"
+            )));
+        };
+        let (rows, cols) = (checked_usize_i64(rows)?, checked_usize_i64(cols)?);
+        if bytes.len() != rows * cols {
+            return Err(invalid(format!(
+                "host Cast read {} bytes for a [{rows}, {cols}] FP8 plane",
+                bytes.len()
+            )));
+        }
+        let width = match to {
+            DType::Bf16 | DType::F16 => 2,
+            DType::F32 => 4,
+            other => {
+                return Err(invalid(format!(
+                    "host Cast widens block-scaled FP8 to a float, not {other:?}"
+                )));
+            }
+        };
+        let operand = self.fp8_block_operand(source, transform, bytes, rows, cols)?;
+        let mut out = vec![0u8; rows * cols * width];
+        let mut buf = vec![0.0f32; cols];
+        for (row, dst) in out.chunks_exact_mut(cols * width).enumerate() {
+            operand.row_bf16(row, cols, &mut buf);
+            for (value, le) in buf.iter().zip(dst.chunks_exact_mut(width)) {
+                match to {
+                    DType::Bf16 => {
+                        le.copy_from_slice(&bf16::from_f32(*value).to_bits().to_le_bytes())
+                    }
+                    DType::F16 => {
+                        le.copy_from_slice(&half::f16::from_f32(*value).to_bits().to_le_bytes());
+                    }
+                    _ => le.copy_from_slice(&value.to_le_bytes()),
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn decode_bytes(
@@ -1802,16 +1863,24 @@ impl Walk<'_, '_> {
             checked_usize_i64(scale_rows)?,
             checked_usize_i64(scale_cols)?,
         );
-        let group_rows = true_rows.checked_div(scale_rows).unwrap_or(0);
-        let group_cols = true_cols.checked_div(scale_cols).unwrap_or(0);
-        if group_rows == 0 || group_rows != group_cols {
+        // A trailing block may be short (576 rows under 5 factors of 128),
+        // so the block is the widest a factor covers, and each axis must
+        // count exactly its factors in blocks of it.
+        let group = true_rows
+            .div_ceil(scale_rows.max(1))
+            .max(true_cols.div_ceil(scale_cols.max(1)));
+        if scale_rows == 0
+            || scale_cols == 0
+            || group == 0
+            || true_rows.div_ceil(group) != scale_rows
+            || true_cols.div_ceil(group) != scale_cols
+        {
             return Err(invalid(format!(
                 "FP8 Encode source '{}' has unsupported scale shape \
                  [{scale_rows}, {scale_cols}] for weight [{true_rows}, {true_cols}]",
                 weight.name
             )));
         }
-        let group = group_rows;
 
         let base = checked_usize(source.stride.base_offset)?;
         let scale_row_offset = (base / true_cols) / group;
