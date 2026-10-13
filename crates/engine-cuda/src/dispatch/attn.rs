@@ -1523,6 +1523,18 @@ impl Run<'_> {
         k: u32,
     ) -> Result<kernels_cuda::Tensor, kernels_cuda::Error> {
         match self.maybe_planes(w) {
+            Some((codes, scales, biases, seat)) if codes.dtype == poem_ir::Dtype::Nvfp4 => {
+                kernels_cuda::linear::nvfp4::decoded_plane(
+                    self.ctx(),
+                    op,
+                    codes,
+                    scales,
+                    super::linear::tensor_scales(op, biases)?,
+                    n,
+                    k,
+                    seat,
+                )
+            }
             Some((codes, scales, biases, seat)) => kernels_cuda::linear::quant::decoded_plane(
                 self.ctx(),
                 op,

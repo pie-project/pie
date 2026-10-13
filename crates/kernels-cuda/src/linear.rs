@@ -13,6 +13,8 @@ pub mod lora;
 
 pub mod mlp;
 
+pub mod nvfp4;
+
 pub mod moe;
 
 pub mod moe_route;

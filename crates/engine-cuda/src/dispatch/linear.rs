@@ -541,6 +541,14 @@ impl Run<'_> {
                 y,
             } => {
                 let (codes, scales, affine, seat) = self.planes(*bank);
+                if codes.dtype == Dtype::Nvfp4 {
+                    return Err(kernels_cuda::Error::Backend {
+                        op: "linear.moe_matmul_select_bias",
+                        detail: "an nvfp4 bank's biased select has no cuda point; its \
+                                 select reads no expert bias"
+                            .to_string(),
+                    });
+                }
                 debug_assert!(
                     affine.is_none(),
                     "the biased select is the mxfp4 gate/up leg's; an affine bank's \
@@ -560,6 +568,26 @@ impl Run<'_> {
             Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
                 let (codes, scales, biases, seat) = self.planes(*bank);
                 let routes = self.tensor(*routes);
+                if codes.dtype == Dtype::Nvfp4 {
+                    let tensor_scales = tensor_scales("linear.moe_matmul_select_quant", biases)?;
+                    let (codes, scales, tensor_scales, routes, seat) =
+                        match self.staged_experts(codes, scales, Some(tensor_scales), routes) {
+                            Some((codes, scales, Some(tensor_scales), routes)) => {
+                                (codes, scales, tensor_scales, routes, GroupSeat::RESIDENT)
+                            }
+                            _ => (codes, scales, tensor_scales, routes, seat),
+                        };
+                    return linear::nvfp4::matmul_select(
+                        self.ctx(),
+                        self.tensor(*x),
+                        codes,
+                        scales,
+                        tensor_scales,
+                        routes,
+                        &mut self.tensor(*y),
+                        seat,
+                    );
+                }
                 let (codes, scales, biases, routes, seat) =
                     match self.staged_experts(codes, scales, biases, routes) {
                         Some((codes, scales, biases, routes)) => {
@@ -642,6 +670,18 @@ impl Run<'_> {
         y: &ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         match self.maybe_planes(*w) {
+            Some((codes, scales, biases, seat)) if codes.dtype == Dtype::Nvfp4 => {
+                linear::nvfp4::matmul(
+                    self.ctx(),
+                    "linear.matmul",
+                    self.tensor(*act),
+                    codes,
+                    scales,
+                    tensor_scales("linear.matmul", biases)?,
+                    &mut self.tensor(*y),
+                    seat,
+                )
+            }
             Some((codes, scales, biases, seat)) => {
                 let act = self.tensor(*act);
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
@@ -687,6 +727,18 @@ impl Run<'_> {
         y: &ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         match self.maybe_planes(*w) {
+            Some((codes, scales, biases, seat)) if codes.dtype == Dtype::Nvfp4 => {
+                linear::nvfp4::matmul(
+                    self.ctx(),
+                    "linear.lm_head",
+                    self.tensor(*act),
+                    codes,
+                    scales,
+                    tensor_scales("linear.lm_head", biases)?,
+                    &mut self.tensor(*y),
+                    seat,
+                )
+            }
             Some((codes, scales, biases, seat)) => {
                 let act = self.tensor(*act);
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
@@ -724,6 +776,18 @@ impl Run<'_> {
             },
         }
     }
+}
+
+/// An nvfp4 bank's tensor scales, which its planes carry where an affine
+/// bank's zero points ride.
+pub(crate) fn tensor_scales(
+    op: &'static str,
+    planes: Option<Tensor>,
+) -> Result<Tensor, kernels_cuda::Error> {
+    planes.ok_or_else(|| kernels_cuda::Error::Backend {
+        op,
+        detail: "an nvfp4 bank is bound without its tensor scales".to_string(),
+    })
 }
 
 const STAGED_EXPERT_BYTES: u64 = 1536 * 1024 * 1024;

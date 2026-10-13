@@ -323,15 +323,20 @@ pub fn topk_sqrt_softplus(
     )
 }
 
-struct Selected {
-    route_count: u32,
+pub(crate) struct Selected {
+    pub(crate) route_count: u32,
 
-    top_k: i32,
+    pub(crate) top_k: i32,
 
-    by_token: bool,
+    pub(crate) by_token: bool,
 }
 
-fn selected(op: &'static str, x: Tensor, routes: Tensor, y: &Tensor) -> Result<Selected, Error> {
+pub(crate) fn selected(
+    op: &'static str,
+    x: Tensor,
+    routes: Tensor,
+    y: &Tensor,
+) -> Result<Selected, Error> {
     debug_assert_eq!(routes.dtype, Dtype::I32, "`{op}` walks i32 routes");
     let top_k = nonzero(op, "the routed fan-out", routes.width)?;
     let route_count = routes.rows.checked_mul(top_k).ok_or_else(|| {
@@ -731,19 +736,19 @@ pub(crate) fn select_gemv(
     )
 }
 
-const EXPERT_CAP: u32 = 4096;
-const GROUPED_TILE_N: u32 = 128;
-const GROUPED_BLOCK: u32 = 256;
+pub(crate) const EXPERT_CAP: u32 = 4096;
+pub(crate) const GROUPED_TILE_N: u32 = 128;
+pub(crate) const GROUPED_BLOCK: u32 = 256;
 const WMMA_ROUTES: u32 = 32;
 
-struct RouteOrder {
-    order: u64,
-    offsets: u64,
-    work: u64,
-    work_cap: u32,
+pub(crate) struct RouteOrder {
+    pub(crate) order: u64,
+    pub(crate) offsets: u64,
+    pub(crate) work: u64,
+    pub(crate) work_cap: u32,
 }
 
-fn route_order(
+pub(crate) fn route_order(
     ctx: &Ctx,
     op: &'static str,
     routes: Tensor,
