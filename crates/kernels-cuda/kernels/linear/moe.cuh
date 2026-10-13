@@ -1334,6 +1334,32 @@ __global__ void moe_weighted_sum(
     out[static_cast<long long>(plane_row) * hidden + h] = Elem<T>::from_f32(acc);
 }
 
+// Each token's weighted routed rows plus its shared row, summed in f32.
+template <class T>
+__global__ void moe_sum_add(
+    T* __restrict__ out,
+    const T* __restrict__ src,
+    const T* __restrict__ shared,
+    int top_k, int hidden,
+    const u32* __restrict__ win)
+{
+    const int n = blockIdx.x;
+
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const int h = blockIdx.y * blockDim.x + threadIdx.x;
+    if (h >= hidden) return;
+
+    const long long base = static_cast<long long>(plane_row) * top_k;
+    float acc = 0.f;
+    for (int k = 0; k < top_k; ++k) {
+        acc += Elem<T>::to_f32(src[(base + k) * hidden + h]);
+    }
+    const long long at = static_cast<long long>(plane_row) * hidden + h;
+    out[at] = Elem<T>::from_f32(acc + Elem<T>::to_f32(shared[at]));
+}
+
 template <class T>
 __global__ void moe_bias_sum(
     T* __restrict__ out,

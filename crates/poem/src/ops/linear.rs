@@ -127,6 +127,29 @@ pub fn mlp_swiglu_clamp_split(gate: &Value, up: &Value, limit: f32) -> Value {
     y
 }
 
+/// `mlp_swiglu_clamp_split` of routed rows, each times its route's weight
+/// before it rounds.
+pub fn mlp_swiglu_clamp_split_routed(
+    gate: &Value,
+    up: &Value,
+    weights: &Value,
+    limit: f32,
+) -> Value {
+    let r = gate.rec();
+    let y = r.fresh(gate.ty().clone());
+    r.push(
+        Linear::MlpSwigluClampSplitRouted {
+            gate: gate.id(),
+            up: up.id(),
+            weights: weights.id(),
+            limit,
+            y: y.id(),
+        },
+        &[gate, up, weights],
+    );
+    y
+}
+
 pub fn mlp_geglu_tanh(gate: &Value, up: &Value) -> Value {
     let r = gate.rec();
     let y = r.fresh(gate.ty().clone());
@@ -564,6 +587,22 @@ pub fn moe_weighted_sum(routed: &Value, weights: &Value) -> Value {
             y: y.id(),
         },
         &[routed, weights],
+    );
+    y
+}
+
+/// Each token's weighted routed rows summed, plus its `shared` row, rounded
+/// once.
+pub fn moe_sum_add(routed: &Value, shared: &Value) -> Value {
+    let r = routed.rec();
+    let y = r.fresh(tensor(Dim::Tokens, routed.width(), routed.dtype()));
+    r.push(
+        Linear::MoeSumAdd {
+            routed: routed.id(),
+            shared: shared.id(),
+            y: y.id(),
+        },
+        &[routed, shared],
     );
     y
 }

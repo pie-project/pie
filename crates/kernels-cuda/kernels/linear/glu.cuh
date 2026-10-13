@@ -267,6 +267,34 @@ __global__ void mlp_swiglu_clamp_split(
     y[at] = Elem<T>::from_f32((g / (1.f + expf(-g))) * u);
 }
 
+// Each routed row times its route's weight before it rounds.
+template <class T>
+__global__ void mlp_swiglu_clamp_split_routed(
+    const T* __restrict__ gate,
+    const T* __restrict__ up,
+    const float* __restrict__ weights,
+    T* __restrict__ y,
+    i32 n,
+    i32 width,
+    float limit,
+    i32 fan,
+    const u32* __restrict__ win)
+{
+    const i32 idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    if (win != nullptr &&
+        static_cast<long long>(idx) >=
+            static_cast<long long>(win[0]) * fan * width) return;
+    const long long at = win != nullptr
+        ? idx + static_cast<long long>(win[1]) * fan * width
+        : idx;
+
+    const float g = fminf(Elem<T>::to_f32(gate[at]), limit);
+    const float u = fminf(fmaxf(Elem<T>::to_f32(up[at]), -limit), limit);
+    y[at] = Elem<T>::from_f32((g / (1.f + expf(-g))) * u * weights[at / width]);
+}
+
 template <class T>
 __global__ void mlp_swiglu_clamp_alpha(
     const T* __restrict__ packed,

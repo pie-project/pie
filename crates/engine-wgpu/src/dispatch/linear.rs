@@ -122,9 +122,9 @@ impl Run<'_> {
             Linear::RelBias { .. }
             | Linear::MoeTopkSigmoidSink { .. }
             | Linear::MatmulActQuant { .. }
-            | Linear::MoeMatmulSelectActQuant { .. } => {
-                Err(kernels_wgpu::Error::Unsupported { op: op.name() })
-            }
+            | Linear::MoeMatmulSelectActQuant { .. }
+            | Linear::MlpSwigluClampSplitRouted { .. }
+            | Linear::MoeSumAdd { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
             Linear::MlpGegluTanhPacked {
                 packed,
                 intermediate,

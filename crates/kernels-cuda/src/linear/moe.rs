@@ -1142,6 +1142,40 @@ pub fn weighted_sum(
     )
 }
 
+/// Each token's weighted routed rows summed in f32, plus its `shared` row,
+/// rounded once.
+pub fn sum_add(ctx: &Ctx, routed: Tensor, shared: Tensor, y: &mut Tensor) -> Result<(), Error> {
+    const OP: &str = "linear.moe_sum_add";
+    let t = dtype_dispatch!(OP, routed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    nonzero(OP, "the token rows this fold lands on", y.rows)?;
+    if !routed.rows.is_multiple_of(y.rows)
+        || (shared.rows, shared.width) != (y.rows, y.width)
+        || routed.width != y.width
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} x {} routed rows and {} x {} shared ones do not fold into {} x {}",
+                routed.rows, routed.width, shared.rows, shared.width, y.rows, y.width
+            ),
+        ));
+    }
+    let top_k = routed.rows / y.rows;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, symbol(&format!("::pie::linear::moe_sum_add<{t}>")))
+            .apply(elementwise_rows(OP, y.rows, y.width)?),
+        &[
+            y.arg(),
+            routed.arg(),
+            shared.arg(),
+            stated(OP, top_k)?.arg(),
+            stated(OP, y.width)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
 pub fn bias_sum(
     ctx: &Ctx,
     x: Tensor,

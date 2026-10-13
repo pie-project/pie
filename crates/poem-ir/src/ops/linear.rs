@@ -84,6 +84,16 @@ pub enum Linear {
         limit: f32,
         y: ValueId,
     },
+    /// [`Linear::MlpSwigluClampSplit`] of routed rows, each row times its
+    /// route's weight before it rounds: DeepSeek's expert scales its
+    /// activations before its down leg quantizes them.
+    MlpSwigluClampSplitRouted {
+        gate: ValueId,
+        up: ValueId,
+        weights: ValueId,
+        limit: f32,
+        y: ValueId,
+    },
     MlpGegluTanh {
         gate: ValueId,
         up: ValueId,
@@ -227,6 +237,13 @@ pub enum Linear {
         weights: ValueId,
         y: ValueId,
     },
+    /// Each token's routed rows (already weighted) summed in f32, plus its
+    /// `shared` row, rounded once.
+    MoeSumAdd {
+        routed: ValueId,
+        shared: ValueId,
+        y: ValueId,
+    },
     MoeBiasSum {
         x: ValueId,
         bias: ValueId,
@@ -270,6 +287,9 @@ impl Operands for Linear {
             Self::MlpSwigluClamp { packed, .. } => sink.push(*packed),
             Self::MlpSwigluClampAlpha { packed, .. } => sink.push(*packed),
             Self::MlpSwigluClampSplit { gate, up, .. } => sink.extend([*gate, *up]),
+            Self::MlpSwigluClampSplitRouted {
+                gate, up, weights, ..
+            } => sink.extend([*gate, *up, *weights]),
             Self::MlpGegluTanh { gate, up, .. } => sink.extend([*gate, *up]),
             Self::MlpGeluTanh { x, .. } => sink.push(*x),
             Self::MlpGegluTanhPacked { packed, .. } => sink.push(*packed),
@@ -337,6 +357,7 @@ impl Operands for Linear {
             Self::MoeWeightedSum {
                 routed, weights, ..
             } => sink.extend([*routed, *weights]),
+            Self::MoeSumAdd { routed, shared, .. } => sink.extend([*routed, *shared]),
             Self::MoeBiasSum {
                 x,
                 bias,
@@ -375,6 +396,7 @@ impl Operands for Linear {
             Self::MlpSwigluClamp { y, .. } => sink.push(*y),
             Self::MlpSwigluClampAlpha { y, .. } => sink.push(*y),
             Self::MlpSwigluClampSplit { y, .. } => sink.push(*y),
+            Self::MlpSwigluClampSplitRouted { y, .. } => sink.push(*y),
             Self::MlpGegluTanh { y, .. } => sink.push(*y),
             Self::MlpGeluTanh { y, .. } => sink.push(*y),
             Self::MlpGegluTanhPacked { y, .. } => sink.push(*y),
@@ -408,6 +430,7 @@ impl Operands for Linear {
             Self::MoeMatmulSelectQuant { y, .. } => sink.push(*y),
             Self::MoeMatmulSelectActQuant { y, .. } => sink.push(*y),
             Self::MoeWeightedSum { y, .. } => sink.push(*y),
+            Self::MoeSumAdd { y, .. } => sink.push(*y),
             Self::MoeBiasSum { y, .. } => sink.push(*y),
             Self::MoeSigmoidGateAdd { y, .. } => sink.push(*y),
             Self::LoraCorrect { y_out, .. } => sink.push(*y_out),
@@ -423,6 +446,7 @@ impl Operands for Linear {
             | Self::MlpSwigluClamp { .. }
             | Self::MlpSwigluClampAlpha { .. }
             | Self::MlpSwigluClampSplit { .. }
+            | Self::MlpSwigluClampSplitRouted { .. }
             | Self::MlpGegluTanh { .. }
             | Self::MlpGeluTanh { .. }
             | Self::MlpGegluTanhPacked { .. }
@@ -442,6 +466,7 @@ impl Operands for Linear {
             | Self::MoeMatmulSelectQuant { .. }
             | Self::MoeMatmulSelectActQuant { .. }
             | Self::MoeWeightedSum { .. }
+            | Self::MoeSumAdd { .. }
             | Self::MoeBiasSum { .. }
             | Self::MoeSigmoidGateAdd { .. } => {}
         }
@@ -455,6 +480,7 @@ impl Operands for Linear {
             Self::MlpSwigluClamp { .. } => "linear.mlp_swiglu_clamp",
             Self::MlpSwigluClampAlpha { .. } => "linear.mlp_swiglu_clamp_alpha",
             Self::MlpSwigluClampSplit { .. } => "linear.mlp_swiglu_clamp_split",
+            Self::MlpSwigluClampSplitRouted { .. } => "linear.mlp_swiglu_clamp_split_routed",
             Self::MlpGegluTanh { .. } => "linear.mlp_geglu_tanh",
             Self::MlpGeluTanh { .. } => "linear.mlp_gelu_tanh",
             Self::MlpGegluTanhPacked { .. } => "linear.mlp_geglu_tanh_packed",
@@ -474,6 +500,7 @@ impl Operands for Linear {
             Self::MoeMatmulSelectQuant { .. } => "linear.moe_matmul_select_quant",
             Self::MoeMatmulSelectActQuant { .. } => "linear.moe_matmul_select_act_quant",
             Self::MoeWeightedSum { .. } => "linear.moe_weighted_sum",
+            Self::MoeSumAdd { .. } => "linear.moe_sum_add",
             Self::MoeBiasSum { .. } => "linear.moe_bias_sum",
             Self::MoeSigmoidGateAdd { .. } => "linear.moe_sigmoid_gate_add",
             Self::LoraCorrect { .. } => "linear.lora_correct",

@@ -490,6 +490,9 @@ fn the_activation_quantizers_land_what_the_host_rounds_every_case() {
     }
     routed_select(Format::Nvfp4, 70, false);
     routed_select(Format::E4m3 { gran: 128 }, 5, false);
+    // DeepSeek-V4-Flash's routed legs at one token.
+    routed_select_at(Format::E4m3 { gran: 128 }, 1, true, [16, 6, 2048, 4096]);
+    routed_select_at(Format::E4m3 { gran: 128 }, 1, false, [16, 6, 4096, 2048]);
 }
 
 /// A routed bank on the grouped tcgen05 GEMM, masked (few tokens) or
@@ -497,7 +500,11 @@ fn the_activation_quantizers_land_what_the_host_rounds_every_case() {
 /// expert's global) and its expert's dequantized weight, times the expert's
 /// product scale.
 fn routed_select(fmt: Format, tokens: usize, by_token: bool) {
-    let (experts, top_k, n, k) = (8usize, 3usize, 256usize, 512usize);
+    routed_select_at(fmt, tokens, by_token, [8, 3, 256, 512]);
+}
+
+fn routed_select_at(fmt: Format, tokens: usize, by_token: bool, dims: [usize; 4]) {
+    let [experts, top_k, n, k] = dims;
     let nvfp4 = fmt == Format::Nvfp4;
     let gran = if nvfp4 { 16 } else { 32 };
     let mut lcg = Lcg::seeded(0x5e1 ^ (tokens * 7 + usize::from(by_token)) as u64);

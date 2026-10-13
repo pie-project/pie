@@ -1407,10 +1407,22 @@ fn lay_atoms(
         else {
             continue;
         };
+        // An MXFP4 plane is `[.., rows, blocks, 16]` bytes, an NVFP4 one its
+        // logical `[.., rows, k]`.
         let shape = &trace.params[at].shape;
-        let (&k, lead) = shape.split_last().unwrap_or((&0, &[]));
-        let rows: u64 = lead.iter().product();
-        let cols = k / u64::from(gran);
+        let (rows, cols): (u64, u64) = match trace.params[at].dtype {
+            Dtype::Mxfp4 if shape.len() >= 2 => (
+                shape[..shape.len() - 2].iter().product(),
+                shape[shape.len() - 2],
+            ),
+            _ => {
+                let (&k, lead) = shape.split_last().unwrap_or((&0, &[]));
+                (lead.iter().product(), k / u64::from(gran))
+            }
+        };
+        if rows == 0 || cols == 0 {
+            continue;
+        }
         if seat.streams()
             || crate::device::alloc::is_host_pointer(scales.ptr)
             || !rows.is_multiple_of(128)

@@ -752,6 +752,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 ..
             } => &[(In(2), F32)],
             Linear::MoeWeightedSum { .. } => &[(In(1), F32)],
+            Linear::MlpSwigluClampSplitRouted { .. } => &[(In(2), F32)],
             Linear::MoeBiasSum { .. } => &[(In(2), I32), (In(3), F32)],
             Linear::LoraCorrect { .. } => &[(In(3), I32)],
             Linear::Matmul { .. }
@@ -761,6 +762,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Linear::MlpSwigluClamp { .. }
             | Linear::MlpSwigluClampAlpha { .. }
             | Linear::MlpSwigluClampSplit { .. }
+            | Linear::MoeSumAdd { .. }
             | Linear::MlpGegluTanh { .. }
             | Linear::MlpGeluTanh { .. }
             | Linear::MlpGegluTanhPacked { .. }

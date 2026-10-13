@@ -661,10 +661,16 @@ fn restated(shard: &Shard, logical: &[u64], plane: &[u64], name: &str) -> Shard 
     let Some(&stored) = plane.get(at) else {
         return Shard::Replicated;
     };
-    assert_eq!(
-        logical[..at],
-        plane[..at],
-        "`{name}`: the axes before its cut are not stored verbatim",
+    // An axis before the cut is stored verbatim, or (an fp8b128 projection's
+    // block exponents) one a 128-wide block.
+    assert!(
+        logical[..at]
+            .iter()
+            .zip(&plane[..at])
+            .all(|(l, p)| p == l || *p == l.div_ceil(128)),
+        "`{name}`: the axes before its cut, {:?}, are stored {:?}",
+        &logical[..at],
+        &plane[..at],
     );
     assert!(
         stored > 0 && whole.is_multiple_of(stored),

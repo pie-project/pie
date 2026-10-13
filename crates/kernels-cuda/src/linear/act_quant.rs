@@ -358,10 +358,10 @@ pub struct Bank {
     pub alpha_e: u64,
 }
 
-/// A fire of this many tokens or fewer lays its routes out masked, each
-/// expert's rows a block of the fire's tokens (no expert is routed a token
-/// twice); a wider one lays them out contiguous.
-const MASKED_TOKENS: u32 = 64;
+/// A fire of this many routes or fewer lays them out masked, each expert's
+/// rows a block as long as the fire's routes (a routing may name one expert
+/// twice for a token); a wider one lays them out contiguous.
+const MASKED_ROUTES: u32 = 64;
 
 const ROUTE_COUNTS: &str = "linear.act_quant.route_counts";
 const ROUTE_OFFSETS: &str = "linear.act_quant.route_offsets";
@@ -400,7 +400,7 @@ pub fn select(
         return Ok(());
     }
     let div = if x.rows == count { 1 } else { routes.width };
-    let m_max = if tokens <= MASKED_TOKENS { tokens } else { 0 };
+    let m_max = if count <= MASKED_ROUTES { count } else { 0 };
     let e = experts as usize;
     let i32s = |name, len: usize| -> Result<u64, Error> {
         Ok(ctx.scratch_stream(op, name, len * 4)? as u64)

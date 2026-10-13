@@ -3104,6 +3104,23 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "linear",
+        name: "mlp_swiglu_clamp_split_routed",
+        params: &["gate", "up", "weights", "limit"],
+        call: |a, heap| {
+            let gate: Value = a.next()?;
+            let up: Value = a.next()?;
+            let weights: Value = a.next()?;
+            let limit: f32 = a.next()?;
+            result(
+                heap,
+                dsl("linear.mlp_swiglu_clamp_split_routed", || {
+                    ops::linear::mlp_swiglu_clamp_split_routed(&gate, &up, &weights, limit)
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "linear",
         name: "mlp_geglu_tanh",
         params: &["gate", "up"],
         call: |a, heap| {
@@ -3549,6 +3566,21 @@ pub(crate) static OPS: &[Op] = &[
                 heap,
                 dsl("linear.moe_weighted_sum", || {
                     ops::linear::moe_weighted_sum(&routed, &weights)
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "linear",
+        name: "moe_sum_add",
+        params: &["routed", "shared"],
+        call: |a, heap| {
+            let routed: Value = a.next()?;
+            let shared: Value = a.next()?;
+            result(
+                heap,
+                dsl("linear.moe_sum_add", || {
+                    ops::linear::moe_sum_add(&routed, &shared)
                 })?,
             )
         },

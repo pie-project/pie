@@ -275,6 +275,30 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
+            Linear::MlpSwigluClampSplitRouted {
+                gate,
+                up,
+                weights,
+                limit,
+                y,
+            } => {
+                let fan = self.plane_fan(self.tensor(*y).rows);
+                linear::mlp::swiglu_clamp_split_routed(
+                    self.ctx(),
+                    self.tensor(*gate),
+                    self.tensor(*up),
+                    self.tensor(*weights),
+                    fan,
+                    *limit,
+                    &mut self.tensor(*y),
+                )
+            }
+            Linear::MoeSumAdd { routed, shared, y } => linear::moe::sum_add(
+                self.ctx(),
+                self.tensor(*routed),
+                self.tensor(*shared),
+                &mut self.tensor(*y),
+            ),
             Linear::MlpSwigluClampSplit { gate, up, limit, y } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::mlp::swiglu_clamp_split(
@@ -768,7 +792,9 @@ impl Run<'_> {
                 )?;
                 (act_quant::Format::Nvfp4, linear::tc5::Elem::E2m1, 16, alpha)
             }
-            (Dtype::Mxfp4, ActQuant::E4m3 { gran }) => (
+            // An MXFP4 bank's codes are bound as bytes; only an MXFP4 bank pairs
+            // with e4m3 activations.
+            (Dtype::Mxfp4 | Dtype::U8, ActQuant::E4m3 { gran }) => (
                 act_quant::Format::E4m3 { gran },
                 linear::tc5::Elem::E2m1,
                 32,
@@ -841,7 +867,7 @@ impl Run<'_> {
         let mut out = self.tensor(y);
         let (n, k) = (out.width, act.width);
         match (codes.dtype, quant) {
-            (Dtype::Mxfp4, ActQuant::E4m3 { gran }) => act_quant::matmul(
+            (Dtype::Mxfp4 | Dtype::U8, ActQuant::E4m3 { gran }) => act_quant::matmul(
                 self.ctx(),
                 OP,
                 act_quant::Format::E4m3 { gran },
