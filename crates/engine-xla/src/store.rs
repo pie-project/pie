@@ -14,7 +14,7 @@
 
 pub mod kv;
 
-use engine::transfer::KvCopy;
+use engine::transfer::KvRun;
 use kernels_xla::hlo::Elem;
 use kernels_xla::{KvPool, RecurrentPool, Tensor};
 use poem_ir::{CacheRow, Dtype, Trace};
@@ -94,58 +94,6 @@ pub enum CachePool {
 
 #[derive(Clone, Debug, Default)]
 pub struct CacheTable(pub Vec<CachePool>);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Move {
-    pub src_page: u32,
-    pub src_token: u32,
-    pub dst_page: u32,
-    pub dst_token: u32,
-    pub tokens: u32,
-}
-
-impl Move {
-    pub fn plan(copy: &KvCopy, page_size: u32) -> std::result::Result<Vec<Move>, String> {
-        if copy.src_page_ids.len() != copy.dst_page_ids.len() {
-            return Err(format!(
-                "src_page_ids has {} entries and dst_page_ids {}",
-                copy.src_page_ids.len(),
-                copy.dst_page_ids.len()
-            ));
-        }
-        let mut moves: Vec<Move> = Vec::with_capacity(copy.src_page_ids.len() + copy.moves.len());
-        for (src, dst) in copy.src_page_ids.iter().zip(&copy.dst_page_ids) {
-            moves.push(Move {
-                src_page: *src,
-                src_token: 0,
-                dst_page: *dst,
-                dst_token: 0,
-                tokens: page_size,
-            });
-        }
-        for (at, cell) in copy.moves.iter().enumerate() {
-            if cell.src_token_offset >= page_size || cell.dst_token_offset >= page_size {
-                return Err(format!(
-                    "kv move {at} names token offsets {}/{} in pages of {page_size} tokens",
-                    cell.src_token_offset, cell.dst_token_offset
-                ));
-            }
-            if cell.src_page_id == cell.dst_page_id
-                && cell.src_token_offset == cell.dst_token_offset
-            {
-                continue;
-            }
-            moves.push(Move {
-                src_page: cell.src_page_id,
-                src_token: cell.src_token_offset,
-                dst_page: cell.dst_page_id,
-                dst_token: cell.dst_token_offset,
-                tokens: 1,
-            });
-        }
-        Ok(moves)
-    }
-}
 
 pub struct Pools {
     /// Per cache row: `[keys, values]` for kv (values absent when shared),
@@ -675,11 +623,11 @@ impl Pools {
         &mut self,
         device: &Device,
         handles: &Handles,
-        moves: &[Move],
-        windowed: &[Move],
+        moves: &[KvRun],
+        windowed: &[KvRun],
     ) -> Result<()> {
         let page = self.paging.page_size;
-        let cells = |moves: &[Move], pages: u64| -> Result<(Vec<i64>, Vec<i64>)> {
+        let cells = |moves: &[KvRun], pages: u64| -> Result<(Vec<i64>, Vec<i64>)> {
             let mut src: Vec<i64> = Vec::new();
             let mut dst: Vec<i64> = Vec::new();
             for m in moves {

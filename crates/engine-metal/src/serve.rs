@@ -1077,7 +1077,7 @@ impl Shell {
         Ok(())
     }
 
-    pub fn copy_kv(&mut self, moves: &[crate::store::Move]) -> Result<()> {
+    pub fn copy_kv(&mut self, moves: &[engine::transfer::KvRun]) -> Result<()> {
         if moves.is_empty() {
             return Ok(());
         }

@@ -1,6 +1,6 @@
 pub mod kv;
 
-use engine::transfer::KvCopy;
+use engine::transfer::KvRun;
 use kernels_wgpu::{KvPool, RecurrentPool, Tensor};
 use poem_ir::{CacheRow, Dtype, Trace};
 
@@ -87,92 +87,6 @@ pub struct Seats {
     pub slot_ids: Tensor,
 
     pub slot_of_row: Tensor,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Move {
-    pub src_page: u32,
-
-    pub src_token: u32,
-
-    pub dst_page: u32,
-
-    pub dst_token: u32,
-
-    pub tokens: u32,
-}
-
-impl Move {
-    pub fn plan(copy: &KvCopy, page_size: u32) -> std::result::Result<Vec<Move>, String> {
-        if copy.src_page_ids.len() != copy.dst_page_ids.len() {
-            return Err(format!(
-                "src_page_ids has {} entries and dst_page_ids {}",
-                copy.src_page_ids.len(),
-                copy.dst_page_ids.len()
-            ));
-        }
-        let mut moves: Vec<Move> = Vec::with_capacity(copy.src_page_ids.len() + copy.moves.len());
-
-        for (src, dst) in copy.src_page_ids.iter().zip(&copy.dst_page_ids) {
-            moves.push(Move {
-                src_page: *src,
-                src_token: 0,
-                dst_page: *dst,
-                dst_token: 0,
-                tokens: page_size,
-            });
-        }
-
-        for (at, cell) in copy.moves.iter().enumerate() {
-            if cell.src_token_offset >= page_size || cell.dst_token_offset >= page_size {
-                return Err(format!(
-                    "kv move {at} names token offsets {}/{} in pages of {page_size} tokens",
-                    cell.src_token_offset, cell.dst_token_offset
-                ));
-            }
-
-            if cell.src_page_id == cell.dst_page_id
-                && cell.src_token_offset == cell.dst_token_offset
-            {
-                continue;
-            }
-            let run = moves.last_mut().filter(|run| {
-                run.src_page == cell.src_page_id
-                    && run.dst_page == cell.dst_page_id
-                    && run.src_token + run.tokens == cell.src_token_offset
-                    && run.dst_token + run.tokens == cell.dst_token_offset
-                    && run.src_token + run.tokens < page_size
-            });
-            match run {
-                Some(run) => run.tokens += 1,
-                None => moves.push(Move {
-                    src_page: cell.src_page_id,
-                    src_token: cell.src_token_offset,
-                    dst_page: cell.dst_page_id,
-                    dst_token: cell.dst_token_offset,
-                    tokens: 1,
-                }),
-            }
-        }
-        for run in &moves {
-            if run.src_page != run.dst_page {
-                continue;
-            }
-            let (lo, hi) = (
-                u32::min(run.src_token, run.dst_token),
-                u32::max(run.src_token, run.dst_token),
-            );
-            if hi - lo < run.tokens {
-                return Err(format!(
-                    "a kv move of {} tokens reads page {} from token {} and writes the same \
-                     page at token {} — the two ends overlap, and a blit whose regions \
-                     overlap is undefined rather than a shift",
-                    run.tokens, run.src_page, run.src_token, run.dst_token
-                ));
-            }
-        }
-        Ok(moves)
-    }
 }
 
 #[derive(Debug)]
@@ -458,7 +372,7 @@ impl Pools {
         Ok(())
     }
 
-    pub fn copy_kv(&mut self, frame: &mut Frame, moves: &[Move]) -> Result<()> {
+    pub fn copy_kv(&mut self, frame: &mut Frame, moves: &[KvRun]) -> Result<()> {
         if moves.is_empty() {
             return Ok(());
         }

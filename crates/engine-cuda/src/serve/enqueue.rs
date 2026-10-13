@@ -92,11 +92,11 @@ impl Shell {
         slot: &SlotGuard,
     ) -> Result<(u32, Option<Readback>)> {
         let page_size = self.pools.paging().page_size;
-        let window_copies: Vec<crate::store::Move> = p
+        let window_copies: Vec<engine::transfer::KvRun> = p
             .lanes
             .iter()
             .flat_map(|lane| lane.window_copies)
-            .map(|&(src, dst)| crate::store::Move {
+            .map(|&(src, dst)| engine::transfer::KvRun {
                 src_page: src,
                 src_token: 0,
                 dst_page: dst,
