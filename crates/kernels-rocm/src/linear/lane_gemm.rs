@@ -53,14 +53,14 @@ pub fn act_x_wt(
             ),
         ));
     }
-    let warps = BLOCK / 32;
+    let waves = BLOCK / 64;
     ctx.fire(
         op,
         Fire::at(
             FILE,
             symbol(&format!("::pie::linear::lane_gemm<{ta}, {tw}, {ty}>")),
         )
-        .apply(Launch::grid([n.div_ceil(warps), y.rows, 1], [BLOCK, 1, 1])),
+        .apply(Launch::grid([n.div_ceil(waves), y.rows, 1], [BLOCK, 1, 1])),
         &[
             act.arg(),
             w.arg(),

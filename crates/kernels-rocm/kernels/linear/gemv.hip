@@ -110,12 +110,19 @@ __device__ __forceinline__ float skinny_reduce(skinny_cd d) {
     return a;
 }
 
-// SWIGLU: the weight is a packed [gate | up] bank of 2N rows and output
-// column n is silu(g)·u of rows n and N + n, each rounded to bf16 first as
-// the unfused projection would store them.
-template <int ROWS, int YT, int UNRL, bool SWIGLU = false>
+// The skinny kernel's epilogue. SWIGLU and GEGLU read a packed [gate | up]
+// bank of 2N rows, output column n being act(g)·u of rows n and N + n, each
+// rounded to bf16 first as the unfused projection would store them;
+// SOFTCAP lands cap·tanh(v / cap) of the rounded product.
+constexpr int kSkinnyStore = 0;
+constexpr int kSkinnySwiglu = 1;
+constexpr int kSkinnyGeglu = 2;
+constexpr int kSkinnySoftcap = 3;
+
+template <int ROWS, int YT, int UNRL, int EPI = kSkinnyStore>
 __global__ __launch_bounds__(1024) void skinny_bf16(const bf16* __restrict__ weight, const bf16* __restrict__ act,
-                                                    bf16* __restrict__ out, int N, int K, int waves) {
+                                                    bf16* __restrict__ out, int N, int K, int waves, float cap) {
+    constexpr bool SWIGLU = EPI == kSkinnySwiglu || EPI == kSkinnyGeglu;  // two weight rows a column
     constexpr int WR = SWIGLU ? 2 * YT : YT;  // weight rows a wavefront streams
     extern __shared__ b128 act_s[];
     const int wave = threadIdx.y, l = lane();
@@ -172,7 +179,13 @@ __global__ __launch_bounds__(1024) void skinny_bf16(const bf16* __restrict__ wei
                 if constexpr (SWIGLU) {
                     const float g = to_f32(from_f32<bf16>(v));
                     const float u = to_f32(from_f32<bf16>(skinny_reduce(acc[r][YT + y])));
-                    v = g / (1.f + __expf(-g)) * u;
+                    if constexpr (EPI == kSkinnyGeglu) {
+                        v = 0.5f * g * (1.f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g))) * u;
+                    } else {
+                        v = g / (1.f + __expf(-g)) * u;
+                    }
+                } else if constexpr (EPI == kSkinnySoftcap) {
+                    v = cap * tanhf(to_f32(from_f32<bf16>(v)) * (1.f / cap));
                 }
                 if (l == kWave - 1 && n0 + y < N) out[static_cast<long long>(r) * N + n0 + y] = from_f32<bf16>(v);
             }

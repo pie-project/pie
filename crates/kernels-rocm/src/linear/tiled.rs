@@ -3,6 +3,7 @@ use dtype::Dtype;
 use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::linear::moe::GroupSeat;
+use crate::linear::quant::GemmSplit;
 use crate::tensor::Tensor;
 
 const FILE: &str = "linear/tiled.hip";
@@ -11,10 +12,11 @@ const BLOCK: u32 = 256;
 
 const TILE_K: u32 = 64;
 
-const LD_A: u32 = TILE_K + 8;
-
 const BAND: u32 = 16;
 
+/// The prefill GEMM's tile: `m` activation rows (32, 64 or 128) by `n`
+/// output columns, `threads` a block. The kernel lands 128 columns with
+/// 256 threads, single-staged in LDS with the next stage's reads in flight.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Tuple {
     pub m: u32,
@@ -23,30 +25,18 @@ pub struct Tuple {
     pub stages: u32,
 }
 
-impl Tuple {
-    const fn smem(self) -> u32 {
-        let staging = self.stages * self.m * LD_A;
-        let epilogue = self.m * (self.n + 8);
-        if staging > epilogue {
-            staging * 2
-        } else {
-            epilogue * 2
-        }
-    }
-}
-
 pub const LONG: Tuple = Tuple {
-    m: 64,
+    m: 128,
     n: 128,
     threads: 256,
-    stages: 2,
+    stages: 1,
 };
 
 pub const SHORT: Tuple = Tuple {
     m: 32,
     n: 128,
     threads: 256,
-    stages: 4,
+    stages: 1,
 };
 
 /// The tile `rows` rows take: the long one from `long_rows`
@@ -212,7 +202,7 @@ fn tiled_launch(
     seat: GroupSeat,
     tuple: Tuple,
 ) -> Result<(), Error> {
-    let t = dtype_dispatch!(op, act.dtype, { Bf16 => "::pie::bf16" });
+    dtype_dispatch!(op, act.dtype, { Bf16 => () });
     if seat.streams() {
         return Err(refuse(
             op,
@@ -244,34 +234,47 @@ fn tiled_launch(
         m,
         n: tile_n,
         threads,
-        stages,
+        ..
     } = tuple;
+    if tile_n != 128 || threads != 256 || ![32, 64, 128].contains(&m) {
+        return Err(refuse(
+            op,
+            format!(
+                "the tiled GEMM lands 128 columns with 256 threads and 32, 64 or 128 rows, \
+                 not {tuple:?}"
+            ),
+        ));
+    }
+    let cus = ctx.multiprocessors().unwrap_or(304).max(1);
+    let blocks = y.rows.div_ceil(m) * n.div_ceil(tile_n);
+    let split = GemmSplit::plan(ctx, op, y.rows, n, k, blocks, cus)?;
     ctx.fire(
         op,
         Fire::at(
             FILE,
             symbol(&format!(
-                "::pie::linear::matmul_affine_tiled<{t}, ::pie::i32(4), ::pie::i32({group}), \
-                 ::pie::i32({m}), ::pie::i32({tile_n}), ::pie::i32({threads}), \
-                 ::pie::i32({stages})>"
+                "::pie::linear::matmul_affine_tiled<::pie::i32({group}), ::pie::i32({m})>"
             )),
         )
-        .apply(
-            Launch::grid([y.rows.div_ceil(m), n.div_ceil(tile_n), 1], [threads, 1, 1])
-                .smem(tuple.smem()),
-        ),
+        .apply(Launch::grid(
+            [y.rows.div_ceil(m), n.div_ceil(tile_n), split.splits],
+            [threads, 1, 1],
+        )),
         &[
             act.arg(),
             codes.arg(),
             scales.arg(),
             biases.arg(),
             y.arg(),
+            split.part_arg(),
+            split.per_arg(op)?,
             stated(op, y.rows)?.arg(),
             stated(op, n)?.arg(),
             stated(op, k)?.arg(),
             ctx.stage(),
         ],
-    )
+    )?;
+    split.finalize(ctx, op, FILE, "::pie::bf16", y)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -281,19 +284,15 @@ pub struct Carve {
 }
 
 impl Carve {
+    /// A block is one band's `split` wavefronts.
     #[must_use]
     pub const fn threads(self) -> u32 {
-        32 * self.bands * self.split
-    }
-
-    const fn smem(self, rows: u32) -> u32 {
-        if self.split > 1 {
-            self.bands * self.split * rows * BAND * 4
-        } else {
-            0
-        }
+        64 * self.bands * self.split
     }
 }
+
+/// Wavefronts a block at most.
+const MAX_SPLIT: u32 = 16;
 
 pub const MIN_SPLIT: u32 = 8;
 
@@ -305,7 +304,8 @@ fn carve_for(n: u32, rows: u32, ctx: &Ctx) -> Carve {
     let tuning = ctx.tuning();
     // A context that cannot say its SM count aims as an L40S would.
     let sms = ctx.multiprocessors().unwrap_or(142);
-    let warps = sms.saturating_mul(tuning.qmm_split_warps_per_sm).max(1);
+    // The knob counts 32-lane warps; a 64-lane wavefront is two.
+    let warps = (sms.saturating_mul(tuning.qmm_split_warps_per_sm) / 2).max(1);
     let bands = n.div_ceil(BAND);
     let deepest = if rows <= THIN_ROWS {
         tuning.qmm_split_thin_max
@@ -325,20 +325,9 @@ fn carve_for(n: u32, rows: u32, ctx: &Ctx) -> Carve {
     } else {
         want
     };
-    Carve { bands: 1, split }
-}
-
-const fn bucket(rows: u32) -> u32 {
-    if rows <= 1 {
-        1
-    } else if rows <= 2 {
-        2
-    } else if rows <= 4 {
-        4
-    } else if rows <= 8 {
-        8
-    } else {
-        16
+    Carve {
+        bands: 1,
+        split: split.min(MAX_SPLIT),
     }
 }
 
@@ -398,7 +387,7 @@ pub fn gemv_with(
     seat: GroupSeat,
     carve: Carve,
 ) -> Result<(), Error> {
-    let t = dtype_dispatch!(op, act.dtype, { Bf16 => "::pie::bf16" });
+    dtype_dispatch!(op, act.dtype, { Bf16 => () });
     if seat.streams() {
         return Err(refuse(
             op,
@@ -436,22 +425,22 @@ pub fn gemv_with(
             ),
         ));
     }
-    let rows = bucket(y.rows);
     let Carve { bands, split } = carve;
-    let threads = carve.threads();
+    if bands != 1 || !(1..=MAX_SPLIT).contains(&split) {
+        return Err(refuse(
+            op,
+            format!("a block is one band of 1 to {MAX_SPLIT} wavefronts, not {carve:?}"),
+        ));
+    }
     ctx.fire(
         op,
         Fire::at(
             FILE,
             symbol(&format!(
-                "::pie::linear::gemv_affine_tiled<{t}, ::pie::i32(4), ::pie::i32({group}), \
-                 ::pie::i32({rows}), ::pie::i32({bands}), ::pie::i32({split})>"
+                "::pie::linear::gemv_affine_tiled<::pie::i32({group}), ::pie::i32({split})>"
             )),
         )
-        .apply(
-            Launch::grid([(n_pad / BAND).div_ceil(bands), 1, 1], [threads, 1, 1])
-                .smem(carve.smem(rows)),
-        ),
+        .apply(Launch::grid([n_pad / BAND, 1, 1], [carve.threads(), 1, 1])),
         &[
             act.arg(),
             codes.arg(),

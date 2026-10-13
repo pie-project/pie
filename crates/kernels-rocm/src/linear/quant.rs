@@ -12,7 +12,7 @@ const FILE: &str = "linear/quant.hip";
 
 const BLOCK: u32 = 256;
 
-const WARP: u32 = 32;
+const WAVE: u32 = 64;
 
 /// The bf16 tile a plane is decoded into before the dense gemm reads it:
 /// one a stream, the size of the widest plane fired on it, since the decode
@@ -26,9 +26,9 @@ fn route_rows(rows: u32, width: u32) -> Launch {
     Launch::per_row(
         rows,
         width
-            .div_ceil(WARP)
+            .div_ceil(WAVE)
             .max(1)
-            .saturating_mul(WARP)
+            .saturating_mul(WAVE)
             .min(MAX_BLOCK),
     )
 }
@@ -261,42 +261,252 @@ fn dense_affine(
     y: &mut Tensor,
     seat: GroupSeat,
 ) -> Result<(), Error> {
-    const ROWS_PER_WARP: u32 = 4;
-    const BLOCK_LANES: u32 = 128;
-
     let t = dtype_dispatch!(op, act.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let f = dtype_dispatch!(op, factor, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let Affine { bits, group, n, k } = affine(op, act, codes, scales, offset, biases, y)?;
     if y.rows == 0 {
         return Ok(());
     }
-    let tile = (BLOCK_LANES / WARP) * ROWS_PER_WARP;
+    let cus = ctx.multiprocessors().unwrap_or(304).max(1);
+    let axis = offset.axis();
+    if y.rows > DECODE_ROWS && k.is_multiple_of(GEMM_KC) {
+        // Activation rows a block: the tallest tile that still lands a
+        // block on every compute unit, so a short prefill is not one row
+        // of blocks.
+        let blocks = |bm: u32| y.rows.div_ceil(bm) * n.div_ceil(GEMM_BN);
+        let bm = [128, 64]
+            .into_iter()
+            .find(|&bm| blocks(bm) >= cus)
+            .unwrap_or(32);
+        let split = GemmSplit::plan(ctx, op, y.rows, n, k, blocks(bm), cus)?;
+        ctx.fire(
+            op,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::linear::matmul_affine_gemm<{t}, {f}, ::pie::i32({bits}), {axis}, \
+                     ::pie::i32({group}), ::pie::i32({bm})>"
+                )),
+            )
+            .apply(Launch::grid(
+                [y.rows.div_ceil(bm), n.div_ceil(GEMM_BN), split.splits],
+                [GEMM_THREADS, 1, 1],
+            )),
+            &[
+                act.arg(),
+                codes.arg(),
+                scales.arg(),
+                biases.map_or(ArgValue::ABSENT, |b| b.arg()),
+                y.arg(),
+                split.part_arg(),
+                split.per_arg(op)?,
+                stated(op, y.rows)?.arg(),
+                stated(op, n)?.arg(),
+                stated(op, k)?.arg(),
+                ArgValue::Ptr(seat.cell),
+                ctx.stage(),
+            ],
+        )?;
+        return split.finalize(ctx, op, FILE, t, y);
+    }
+    let (entry, launch) = {
+        let d = Decode::plan(bits, group, n, k, y.rows, cus);
+        (
+            format!(
+                "::pie::linear::matmul_affine_decode<{t}, {f}, ::pie::i32({bits}), {axis}, \
+                 ::pie::i32({group}), ::pie::i32({}), ::pie::i32({}), ::pie::i32({}), \
+                 ::pie::i32({}), ::pie::i32({}), ::pie::i32({})>",
+                d.shape, d.lane, d.nt, d.rs, d.split, d.round
+            ),
+            Launch::grid(
+                [
+                    n.div_ceil(d.shape * d.nt),
+                    y.rows.div_ceil(d.shape * d.rs),
+                    1,
+                ],
+                [64 * d.split, 1, 1],
+            ),
+        )
+    };
     ctx.fire(
         op,
-        Fire::at(
-            FILE,
-            symbol(&format!(
-                "::pie::linear::matmul_affine<{t}, {f}, ::pie::i32({bits}), {}, \
-                 ::pie::i32({group}), ::pie::i32({ROWS_PER_WARP})>",
-                offset.axis()
-            )),
-        )
-        .apply(Launch::grid(
-            [y.rows, n.div_ceil(tile), 1],
-            [BLOCK_LANES, 1, 1],
-        )),
+        Fire::at(FILE, symbol(&entry)).apply(launch),
         &[
             act.arg(),
             codes.arg(),
             scales.arg(),
             biases.map_or(ArgValue::ABSENT, |b| b.arg()),
             y.arg(),
+            stated(op, y.rows)?.arg(),
             stated(op, n)?.arg(),
             stated(op, k)?.arg(),
             ArgValue::Ptr(seat.cell),
             ctx.stage(),
         ],
     )
+}
+
+/// The most rows the streaming decode kernel takes in one launch row; past
+/// it a K in whole stages takes the GEMM.
+const DECODE_ROWS: u32 = 64;
+
+/// The GEMM's K stage, output columns a block, and threads a block.
+const GEMM_KC: u32 = 64;
+const GEMM_BN: u32 = 128;
+const GEMM_THREADS: u32 = 256;
+
+/// The affine GEMM's K slicing (linear/affine.hip): a grid short of the
+/// device slices K over blockIdx.z, each slice's f32 partial landing in
+/// scratch for the finalize to sum in order.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GemmSplit {
+    pub splits: u32,
+    per: u32,
+    part: u64,
+    rows: u32,
+    n: u32,
+}
+
+impl GemmSplit {
+    pub(crate) fn plan(
+        ctx: &Ctx,
+        op: &'static str,
+        rows: u32,
+        n: u32,
+        k: u32,
+        blocks: u32,
+        cus: u32,
+    ) -> Result<Self, Error> {
+        let stages = k / GEMM_KC;
+        // Twice the device in blocks, eight stages a slice at least: a
+        // partial is written and read once more, so no further.
+        let mut splits = 1;
+        while blocks * splits < 2 * cus && stages / (2 * splits) >= 8 && splits < 16 {
+            splits *= 2;
+        }
+        let per = stages.div_ceil(splits);
+        let splits = stages.div_ceil(per);
+        let part = if splits > 1 {
+            let bytes = splits as usize * rows as usize * n as usize * 4;
+            ctx.scratch(op, "linear.quant.gemm_part", bytes)? as u64
+        } else {
+            0
+        };
+        Ok(Self {
+            splits,
+            per,
+            part,
+            rows,
+            n,
+        })
+    }
+
+    pub(crate) fn part_arg(self) -> ArgValue {
+        if self.splits > 1 {
+            ArgValue::Ptr(self.part)
+        } else {
+            ArgValue::ABSENT
+        }
+    }
+
+    pub(crate) fn per_arg(self, op: &'static str) -> Result<ArgValue, Error> {
+        Ok(stated(op, self.per)?.arg())
+    }
+
+    /// The slices' sum into `y`, when K was sliced.
+    pub(crate) fn finalize(
+        self,
+        ctx: &Ctx,
+        op: &'static str,
+        file: &'static str,
+        t: &str,
+        y: &Tensor,
+    ) -> Result<(), Error> {
+        if self.splits <= 1 {
+            return Ok(());
+        }
+        let cells = self.rows * self.n;
+        ctx.fire(
+            op,
+            Fire::at(
+                file,
+                symbol(&format!("::pie::linear::affine_gemm_finalize<{t}>")),
+            )
+            .apply(Launch::grid(
+                [cells.div_ceil(256).min(4096), 1, 1],
+                [256, 1, 1],
+            )),
+            &[
+                ArgValue::Ptr(self.part),
+                y.arg(),
+                stated(op, self.rows)?.arg(),
+                stated(op, self.n)?.arg(),
+                stated(op, self.splits)?.arg(),
+                ctx.stage(),
+            ],
+        )
+    }
+}
+
+/// The decode kernel's tiling: the matrix-core `shape` (4 x 4 x 4 or
+/// 16 x 16 x 16), `lane` codes a lane reads at once, `nt` and `rs` tiles
+/// of weight and activation rows a wavefront, `split` wavefronts a block
+/// over K, `round` pieces a wavefront reads at once.
+#[derive(Clone, Copy, Debug)]
+struct Decode {
+    shape: u32,
+    lane: u32,
+    nt: u32,
+    rs: u32,
+    split: u32,
+    round: u32,
+}
+
+impl Decode {
+    fn plan(bits: u32, group: u32, n: u32, k: u32, rows: u32, cus: u32) -> Self {
+        // Up to eight rows, the 4 x 4 x 4 core: sixteen dots a block of four
+        // lanes, four weight rows by four activation rows, and a lane's
+        // codes one group's. Past eight, the 16 x 16 x 16 core, whose
+        // product spans four lanes' codes, so a lane holds a quarter group
+        // at most.
+        let (shape, rs, nt, most) = if rows <= 8 {
+            (4, rows.div_ceil(4), 4, group)
+        } else {
+            let rs = rows.div_ceil(16).min(4);
+            (16, rs, if rs <= 2 { 2 } else { 1 }, group / 4)
+        };
+        // Sixteen bytes a lane, or the largest power of two of codes that
+        // fits: a group is whole words, so four bytes at least. The
+        // activation's share (two bytes a code a row) stays within 128 bytes
+        // a lane.
+        let mut lane = (128 / bits).min(if rs > 2 { 16 } else { 64 / rs });
+        while lane > 4 && !most.is_multiple_of(lane) {
+            lane /= 2;
+        }
+        // Pieces a round: as many as about a hundred registers hold, since
+        // the hand-issued reads must fit the VGPRs outright.
+        let regs = nt * (lane * bits / 32).max(1) + rs * lane / 2 + 2 * nt;
+        let round = (112 / regs).clamp(1, 4).min(if shape == 4 { 2 } else { 4 });
+        let pieces = k.div_ceil(64 / shape * lane);
+        let blocks = n.div_ceil(shape * nt);
+        // Eight wavefronts a compute unit to keep the codes in flight, but
+        // a round of pieces a wavefront at least, sixteen a block at most,
+        // and the block's partial sums within 32 KiB of LDS.
+        let cells = nt * rs * shape * shape * if shape == 4 { 4 } else { 1 };
+        let want = (8 * cus).div_ceil(blocks).next_power_of_two();
+        let mut split = want.min(16);
+        while split > 1 && (round * split > pieces || split * cells * 4 > 32 << 10) {
+            split /= 2;
+        }
+        Self {
+            shape,
+            lane,
+            nt,
+            rs,
+            split,
+            round,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

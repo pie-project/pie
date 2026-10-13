@@ -79,9 +79,6 @@ pub(crate) fn compute_units() -> u32 {
     })
 }
 
-/// The LDS the skinny kernel may give the activation rows (one block a CU).
-const SKINNY_LDS: u32 = 64 << 10;
-
 /// The skinny kernel's wavefronts a block.
 const SKINNY_WAVES: u32 = 16;
 
@@ -97,7 +94,7 @@ pub(crate) fn skinny_bf16(
     n: i32,
     k: i32,
 ) -> Result<(), Error> {
-    skinny(ctx, weight, act, out, m, n, k, false)
+    skinny(ctx, weight, act, out, m, n, k, SkinnyEpilogue::Store)
 }
 
 /// [`skinny_bf16`] over a packed `[gate | up]` bank of 2n rows, landing
@@ -111,11 +108,33 @@ pub(crate) fn skinny_swiglu_bf16(
     n: i32,
     k: i32,
 ) -> Result<(), Error> {
-    skinny(ctx, weight, act, out, m, n, k, true)
+    skinny(ctx, weight, act, out, m, n, k, SkinnyEpilogue::Swiglu)
+}
+
+/// What the skinny kernel lands of each product: it as is, the gated
+/// activation of a packed `[gate | up]` bank of 2n rows (`n` columns), or
+/// `cap · tanh(v / cap)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SkinnyEpilogue {
+    Store,
+    Swiglu,
+    Geglu,
+    Softcap(f32),
+}
+
+impl SkinnyEpilogue {
+    const fn code(self) -> u32 {
+        match self {
+            Self::Store => 0,
+            Self::Swiglu => 1,
+            Self::Geglu => 2,
+            Self::Softcap(_) => 3,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn skinny(
+pub(crate) fn skinny(
     ctx: &Ctx,
     weight: u64,
     act: u64,
@@ -123,11 +142,12 @@ fn skinny(
     m: i32,
     n: i32,
     k: i32,
-    swiglu: bool,
+    epilogue: SkinnyEpilogue,
 ) -> Result<(), Error> {
+    let swiglu = matches!(epilogue, SkinnyEpilogue::Swiglu | SkinnyEpilogue::Geglu);
     const OP: &str = "linear.skinny";
     let (mu, nu, ku) = (m.unsigned_abs(), n.unsigned_abs(), k.unsigned_abs());
-    if !(1..=8).contains(&m) || n <= 0 || k <= 0 || k % 8 != 0 || mu * ku * 2 > SKINNY_LDS {
+    if !super::skinny::fits(m, n, k) {
         return Err(refuse(
             OP,
             format!("covers 1..=8 rows of K in whole eights within LDS, not m={m} n={n} k={k}"),
@@ -168,7 +188,14 @@ fn skinny(
     let waves = (1..=SKINNY_WAVES)
         .find(|&w| rounds(w) == target)
         .unwrap_or(SKINNY_WAVES);
-    let symbol = format!("::pie::linear::skinny_bf16<{m}, {yt}, {unrl}, {swiglu}>");
+    let symbol = format!(
+        "::pie::linear::skinny_bf16<{m}, {yt}, {unrl}, {}>",
+        epilogue.code()
+    );
+    let cap = match epilogue {
+        SkinnyEpilogue::Softcap(cap) => cap,
+        _ => 0.0,
+    };
     ctx.fire(
         OP,
         Fire::at("linear/gemv.hip", crate::jit::symbol(&symbol))
@@ -180,6 +207,7 @@ fn skinny(
             ArgValue::I32(n),
             ArgValue::I32(k),
             ArgValue::I32(waves as i32),
+            ArgValue::F32(cap),
         ],
     )
 }

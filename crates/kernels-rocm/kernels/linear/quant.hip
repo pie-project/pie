@@ -1,8 +1,363 @@
 #pragma once
 
-// Quantized linear kernels.
+// Quantized linear kernels: the dense affine projections and the casts a
+// load runs, then the MoE expert banks.
 
-#include "prelude/device.hip"
+#include "linear/affine.hip"
+
+namespace pie::linear {
+
+// ------------------------------------------------------------- affine --
+
+// A factor read as its bits: F's 16 bits, or a zero point's byte.
+template <class F, int kBits, int kOffset>
+__device__ __forceinline__ Factor factor_bits(u32 s, u32 off) {
+    auto real = [](u32 h) {
+        if constexpr (is_same<F, bf16>::value) {
+            return __builtin_bit_cast(float, h << 16);
+        } else {
+            return static_cast<float>(__builtin_bit_cast(f16, static_cast<u16>(h)));
+        }
+    };
+    if constexpr (kOffset == kOffPost || kOffset == kOffPreReal) {
+        return {real(s), real(off)};
+    } else if constexpr (kOffset == kOffPreInt) {
+        return {real(s), static_cast<float>(off)};
+    } else {
+        return {real(s), static_cast<float>(1 << (kBits - 1))};
+    }
+}
+
+// y[m, n] = act[m] · W[n] over an affine-quantized W, for the few rows of a
+// decode: bound by streaming the codes once. The products run on the
+// matrix cores with the activation as A and the codes as B, both raw, so a
+// product sums Σ x·(c + magic); each group of codes then folds into f32 as
+//
+//   Σ x·w = s·Σ x·(c + magic) + (o − magic·s)·Σ x
+//
+// the row sums Σ x from one more product against ones.
+//
+// SHAPE 4, the 4 x 4 x 4 core (one to four activation rows): sixteen blocks
+// of four lanes, block b's lanes holding four weight rows and four
+// activation rows over the same LANE codes at k = 16·LANE·p + LANE·b, so a
+// read is four weight rows of 16·LANE codes each. A block sums its own k;
+// the sixteen blocks add up at the end.
+//
+// SHAPE 16, the 16 x 16 x 16 core (up to 64 rows): lane group g of the
+// four holds LANE codes of sixteen weight rows at k = 4·LANE·p + LANE·g,
+// one group of codes between them (4·LANE codes at most a group), and
+// the core sums the four.
+//
+// A wavefront owns NT tiles of SHAPE weight rows and RS tiles of SHAPE
+// activation rows (from a launch row of blocks blockIdx.y) and walks a
+// SPLIT-th of K, R pieces at a time: a round's reads are all issued by
+// hand before the first is waited on, and each piece multiplies as it
+// lands. A piece past K (or past the wavefront's share) rereads live codes
+// and counts as zero.
+template <class T, class F, int kBits, int kOffset, int kGroup, int SHAPE, int LANE, int NT, int RS, int SPLIT, int R>
+__global__ __launch_bounds__(kWave* SPLIT) void matmul_affine_decode(
+    const T* __restrict__ act, const u8* __restrict__ codes, const u8* __restrict__ scales,
+    const u8* __restrict__ biases, T* __restrict__ out, int m, int n, int k, const AffineSeat* __restrict__ seat,
+    const u32* __restrict__ win) {
+    using U = Unpack<T, kBits>;
+    constexpr int kSlots = kWave / SHAPE;     // lane groups along k
+    constexpr int kBytes = LANE * kBits / 8;  // codes a lane reads a piece
+    constexpr int kWords = kBytes / 4;
+    constexpr int kPiece = kSlots * LANE;
+    constexpr int kXBytes = 2 * LANE < 16 ? 2 * LANE : 16;  // activation bytes a read
+    constexpr int kXReads = 2 * LANE / kXBytes;
+    constexpr bool kOffsets = kOffset != kOffPreConst;
+    constexpr int kReads = NT * (kOffsets ? 3 : 2) + RS * kXReads;  // a piece's reads
+    static_assert(kWave == 64 && (SHAPE == 4 || SHAPE == 16), "a 4 x 4 x 4 or 16 x 16 x 16 core");
+    static_assert(kBytes == 4 || kBytes == 8 || kBytes == 16, "a lane reads one 4-, 8- or 16-byte access");
+    static_assert(kGroup % (SHAPE == 4 ? LANE : 4 * LANE) == 0 && LANE % 4 == 0,
+                  "a product's codes are whole 4-code steps of one group");
+    static_assert(R >= 1 && R <= 4 && R * kReads < 64, "a round's reads fit the count");
+
+    const int rows = win == nullptr ? m : min(m, static_cast<int>(win[0]));
+    const int r0 = blockIdx.y * SHAPE * RS;
+    if (r0 >= rows) return;
+    const AffinePlanes planes = seated(codes, scales, biases, seat);
+
+    const int l = lane(), wave = threadIdx.x / kWave;
+    const int across = l % SHAPE, slot = l / SHAPE;  // a lane's row in a tile, and its k
+    const int col0 = blockIdx.x * SHAPE * NT;
+    const int groups = k / kGroup;
+    const int pieces = (k + kPiece - 1) / kPiece;
+    // The pieces this wavefront walks, a whole number of rounds.
+    const int per = ((pieces + SPLIT - 1) / SPLIT + R - 1) / R * R;
+    const int mine = max(0, min(per, pieces - wave * per));
+
+    const u8* wp[NT];
+    long long fp[NT];
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+        const long long row = min(col0 + SHAPE * nt + across, n - 1);
+        wp[nt] = planes.codes + row * k * kBits / 8;
+        fp[nt] = row * groups;
+    }
+    const T* xp[RS];
+#pragma unroll
+    for (int rs = 0; rs < RS; ++rs)
+        xp[rs] = act + static_cast<long long>(min(r0 + SHAPE * rs + across, rows - 1)) * k;
+
+    struct Piece {
+        Words<kWords> w[NT];
+        Words<kXBytes / 4> x[RS][kXReads];
+        u32 s[NT], o[NT];
+    };
+    auto first = [&](int r) { return (wave * per + r) * kPiece + LANE * slot; };
+    auto issue = [&](Piece& at, int r) {
+        const int kc = min(first(min(r, mine - 1)), k - LANE);
+        const int group = kc / kGroup;
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+            issue_read<kBytes>(at.w[nt], wp[nt] + kc * kBits / 8);
+            issue_read_small(at.s[nt], planes.scales + (fp[nt] + group) * 2);
+            if constexpr (kOffsets) {
+                constexpr bool kByte = kOffset == kOffPreInt;
+                issue_read_small<kByte>(at.o[nt], planes.biases + (fp[nt] + group) * (kByte ? 1 : 2));
+            }
+        }
+#pragma unroll
+        for (int rs = 0; rs < RS; ++rs)
+#pragma unroll
+            for (int q = 0; q < kXReads; ++q) issue_read<kXBytes>(at.x[rs][q], xp[rs] + kc + q * kXBytes / 2);
+    };
+    auto settle = [&](Piece& at) {
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+            hold(at.w[nt]);
+            hold(at.s[nt]);
+            if constexpr (kOffsets) hold(at.o[nt]);
+        }
+#pragma unroll
+        for (int rs = 0; rs < RS; ++rs)
+#pragma unroll
+            for (int q = 0; q < kXReads; ++q) hold(at.x[rs][q]);
+    };
+
+    mfma_cd acc[NT][RS];
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+        for (int rs = 0; rs < RS; ++rs) acc[nt][rs] = mfma_zero();
+    const Words<2> ones{kOnes<T>, kOnes<T>};
+    auto product = [](Words<2> a, Words<2> b, mfma_cd c) {
+        if constexpr (SHAPE == 4) {
+            return mfma4x4<T>(a, b, c);
+        } else {
+            return mfma16x16<T>(a, b, c);
+        }
+    };
+
+    auto multiply = [&](Piece& at, int r) {
+        const bool live = r < mine && first(r) < k;
+        u32 x[RS][LANE / 2];
+#pragma unroll
+        for (int rs = 0; rs < RS; ++rs)
+#pragma unroll
+            for (int i = 0; i < LANE / 2; ++i)
+                x[rs][i] = live ? at.x[rs][i / (kXBytes / 4)][i % (kXBytes / 4)] : 0u;
+        mfma_cd d[NT][RS], sx[RS];
+#pragma unroll
+        for (int rs = 0; rs < RS; ++rs) {
+            sx[rs] = mfma_zero();
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) d[nt][rs] = mfma_zero();
+        }
+#pragma unroll
+        for (int w = 0; w < kWords; ++w) {
+            u32 p[NT][U::kPairs];
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) U::pairs(word(at.w[nt], w), p[nt]);
+#pragma unroll
+            for (int i = 0; i < U::kPairs; i += 2) {
+                const int q = (w * U::kPairs + i) / 2;  // the 4-code step
+#pragma unroll
+                for (int rs = 0; rs < RS; ++rs) {
+                    const Words<2> a{x[rs][2 * q], x[rs][2 * q + 1]};
+                    sx[rs] = product(a, ones, sx[rs]);
+#pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) d[nt][rs] = product(a, Words<2>{p[nt][i], p[nt][i + 1]}, d[nt][rs]);
+                }
+            }
+        }
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+            const Factor f = factor_bits<F, kBits, kOffset>(at.s[nt], at.o[nt]);
+            const float o = additive<kOffset>(f) - U::kMagic * f.s;
+#pragma unroll
+            for (int rs = 0; rs < RS; ++rs)
+#pragma unroll
+                for (int t = 0; t < 4; ++t) acc[nt][rs][t] = fmaf(f.s, d[nt][rs][t], fmaf(o, sx[rs][t], acc[nt][rs][t]));
+        }
+    };
+
+    for (int r = 0; r < mine; r += R) {
+        Piece at[R];
+#pragma unroll
+        for (int i = 0; i < R; ++i) issue(at[i], r + i);
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            // Piece i lands with the R − 1 − i behind it still in flight.
+            if (i == 0) wait_reads<(R - 1) * kReads>();
+            if (i == 1) wait_reads<(R > 2 ? R - 2 : 0) * kReads>();
+            if (i == 2) wait_reads<(R > 3 ? R - 3 : 0) * kReads>();
+            if (i == 3) wait_reads<0>();
+            settle(at[i]);
+            multiply(at[i], r + i);
+        }
+    }
+
+    // A lane's D[t] is row `down(t)` and column `across` of its tile pair.
+    // The 4 x 4 x 4 core's sixteen blocks each hold their own k: sum the
+    // four of a 16-lane row (lanes j, j + 4, j + 8, j + 12, which a rotate
+    // by 4 and by 8 pairs) here, the rows below with the wavefronts.
+    auto down = [&](int t) { return SHAPE == 4 ? t : 4 * slot + t; };
+    if constexpr (SHAPE == 4) {
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+            for (int rs = 0; rs < RS; ++rs)
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    float v = acc[nt][rs][t];
+                    v += __builtin_bit_cast(  // row_ror:4
+                        float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x124, 0xf, 0xf, false));
+                    v += __builtin_bit_cast(  // row_ror:8
+                        float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x128, 0xf, 0xf, false));
+                    acc[nt][rs][t] = v;
+                }
+    }
+    constexpr int kCells = NT * RS * SHAPE * SHAPE;           // the block's outputs
+    constexpr int kParts = SHAPE == 4 ? 4 * SPLIT : SPLIT;  // partial sums a cell
+    __shared__ float part[kParts][kCells];
+    if (SHAPE == 16 || l % 16 < 4) {
+        const int at = SHAPE == 4 ? 4 * wave + l / 16 : wave;
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+            for (int rs = 0; rs < RS; ++rs)
+#pragma unroll
+                for (int t = 0; t < 4; ++t)
+                    part[at][((nt * RS + rs) * SHAPE + down(t)) * SHAPE + across] = acc[nt][rs][t];
+    }
+    __syncthreads();
+    for (int cell = threadIdx.x; cell < kCells; cell += blockDim.x) {
+        float v = 0.f;
+#pragma unroll
+        for (int i = 0; i < kParts; ++i) v += part[i][cell];
+        const int c = cell % SHAPE, rr = cell / SHAPE % SHAPE, rs = cell / (SHAPE * SHAPE) % RS,
+                  nt = cell / (SHAPE * SHAPE * RS);
+        const int row = r0 + SHAPE * rs + rr, col = col0 + SHAPE * nt + c;
+        if (row < rows && col < n) out[static_cast<long long>(row) * n + col] = from_f32<T>(v);
+    }
+}
+
+// The prefill arm: a 64-code stage of 128 weight rows, two threads a row,
+// each decoding 32 codes into the tile.
+template <class T, class F, int kBits, int kOffset, int kGroup>
+struct AffineRows {
+    static constexpr int kCodes = 32;  // codes a thread a stage
+    static constexpr int kPerWord = 32 / kBits;
+    static constexpr int kWords = kCodes / kPerWord;
+    static constexpr bool kOneGroup = kGroup % kCodes == 0;
+    static constexpr int kFactors = kOneGroup ? 1 : kWords;
+
+    AffinePlanes planes;
+    int row, half, wrow, k, groups;
+    Words<kWords < 4 ? kWords : 4> words[kWords < 4 ? 1 : kWords / 4];
+    Factor f[kFactors];
+
+    __device__ __forceinline__ AffineRows(AffinePlanes p, int n, int k_) : planes(p), k(k_) {
+        row = threadIdx.x / 2;
+        half = threadIdx.x % 2;
+        wrow = min(static_cast<int>(blockIdx.y) * kGemmBN + row, n - 1);
+        groups = k / kGroup;
+    }
+
+    __device__ __forceinline__ void load(int c) {
+        const int k0 = c * kGemmKC + half * kCodes;
+        const u8* at = planes.codes + static_cast<long long>(wrow) * k * kBits / 8 + k0 * kBits / 8;
+        constexpr int W = kWords < 4 ? kWords : 4;
+#pragma unroll
+        for (int i = 0; i < (kWords < 4 ? 1 : kWords / 4); ++i)
+            words[i] = *reinterpret_cast<const Words<W>*>(at + 16 * i);
+#pragma unroll
+        for (int i = 0; i < kFactors; ++i)
+            f[i] = factor_at<F, kBits, kOffset>(planes.scales, planes.biases,
+                                                static_cast<long long>(wrow) * groups + (k0 + i * kPerWord) / kGroup);
+    }
+
+    __device__ __forceinline__ void store(T* ws) {
+        u32 out[kCodes / 2];
+#pragma unroll
+        for (int w = 0; w < kWords; ++w) {
+            float c[kPerWord];
+            codes_f32<kBits>(words[w / 4][w % 4], c);
+            const Factor fw = f[kOneGroup ? 0 : w];
+#pragma unroll
+            for (int i = 0; i < kPerWord; i += 2)
+                out[(w * kPerWord + i) / 2] = pack_pair<T>(dequant<kOffset>(c[i], fw), dequant<kOffset>(c[i + 1], fw));
+        }
+#pragma unroll
+        for (int i = 0; i < kCodes / 8; ++i)
+            *reinterpret_cast<Words<4>*>(ws + row * kGemmLd + half * kCodes + 8 * i) =
+                Words<4>{out[4 * i], out[4 * i + 1], out[4 * i + 2], out[4 * i + 3]};
+    }
+};
+
+// y = act · Wᵀ over an affine-quantized W, BM activation rows a block.
+// K is a whole number of 64-code stages.
+template <class T, class F, int kBits, int kOffset, int kGroup, int BM>
+__global__ __launch_bounds__(kGemmThreads) void matmul_affine_gemm(
+    const T* __restrict__ act, const u8* __restrict__ codes, const u8* __restrict__ scales,
+    const u8* __restrict__ biases, T* __restrict__ out, float* __restrict__ part, int per, int m, int n, int k,
+    const AffineSeat* __restrict__ seat, const u32* __restrict__ win) {
+    const int rows = win == nullptr ? m : min(m, static_cast<int>(win[0]));
+    if (static_cast<int>(blockIdx.x) * BM >= rows) return;
+    AffineRows<T, F, kBits, kOffset, kGroup> stage(seated(codes, scales, biases, seat), n, k);
+    affine_gemm<T, BM>(act, out, part, per, rows, n, k, stage);
+}
+
+// The plane decoded to bf16, one thread a 32-bit code word, as the dense
+// GEMM then reads it.
+template <class F, int kBits, int kOffset, int kGroup>
+__global__ void dequant_affine(const u8* __restrict__ codes, const u8* __restrict__ scales,
+                               const u8* __restrict__ biases, bf16* __restrict__ out, int n, int k) {
+    constexpr int kPerWord = 32 / kBits;
+    const int words_per_row = k / kPerWord;
+    const long long at = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (at >= static_cast<long long>(n) * words_per_row) return;
+    const int row = static_cast<int>(at / words_per_row);
+    const int word = static_cast<int>(at % words_per_row);
+    const Factor f = factor_at<F, kBits, kOffset>(scales, biases,
+                                                  static_cast<long long>(row) * (k / kGroup) +
+                                                      word * kPerWord / kGroup);
+    float c[kPerWord];
+    codes_f32<kBits>(reinterpret_cast<const u32*>(codes)[at], c);
+    u32* dst = reinterpret_cast<u32*>(out + static_cast<long long>(row) * k + word * kPerWord);
+#pragma unroll
+    for (int i = 0; i < kPerWord; i += 2) dst[i / 2] = pack_pair<bf16>(dequant<kOffset>(c[i], f), dequant<kOffset>(c[i + 1], f));
+}
+
+// --------------------------------------------------------------- casts --
+
+template <class T>
+__global__ void cast_f32_to(const float* __restrict__ src, T* __restrict__ dst, usize n) {
+    const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = from_f32<T>(src[i]);
+}
+
+// buf[row] *= l, elementwise: one block a row.
+template <class T>
+__global__ void scale_rows(T* __restrict__ buf, const T* __restrict__ l, int width) {
+    T* row = buf + static_cast<usize>(blockIdx.x) * width;
+    for (int c = threadIdx.x; c < width; c += blockDim.x) row[c] = from_f32<T>(to_f32(row[c]) * to_f32(l[c]));
+}
+
+}  // namespace pie::linear
 
 // ================================================================ MoE ====
 //
