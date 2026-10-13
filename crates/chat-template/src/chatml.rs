@@ -166,6 +166,8 @@ pub fn tool_names(tools: &[String]) -> Option<String> {
 /// `ws` sits where RFC 8259 §2 allows insignificant whitespace — around the
 /// structural characters and nowhere else — so a model that writes `: ` or a
 /// newline between tokens keeps a legal token rather than running to budget.
+/// A run of it is bounded (an indented newline fits), so a model the grammar
+/// holds cannot spend its budget on whitespace either.
 pub const JSON_GRAMMAR: &str = r#"json-object ::= "{" ws (json-members ws)? "}"
 json-members ::= json-pair (ws "," ws json-pair)*
 json-pair ::= json-string ws ":" ws json-value
@@ -175,7 +177,7 @@ json-chars ::= json-char*
 json-char ::= [^"\\\x00-\x1f] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
 json-number ::= "-"? [0-9]+ ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
 json-array ::= "[" ws (json-value (ws "," ws json-value)* ws)? "]"
-ws ::= [ \t\n\r]*
+ws ::= [ \t\n\r]{0,20}
 "#;
 
 impl Instruct for ChatMLInstruct {
