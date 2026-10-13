@@ -176,6 +176,34 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
+    /// `w` lands columns `start .. start + len` of the checkpoint's tensor
+    /// `from`, its last axis. A raw tensor is sliced; MLX affine codes are
+    /// read by naming their planes, each sliced over the same columns: the
+    /// words, the scales and the biases, a range that keeps whole groups.
+    pub fn read_columns(
+        &mut self,
+        w: &Weight,
+        from: impl Into<String>,
+        start: i64,
+        len: i64,
+    ) -> Result<(), Error> {
+        let w = &w.placed(self.platform);
+        let from = from.into();
+        if recorded(|| format!("read_columns {w:?} {from:?} {start} {len}")) {
+            return Ok(());
+        }
+        self.whole_checkpoint(w)?;
+        if !stored_mlx_codes(self.src, &from)? || matches!(encoding(w.dtype), Encoding::Raw(_)) {
+            let axis = column_axis(self.src, &from)?;
+            let read = declare(self.src, w, Expr::src(from).slice(axis, start, len))?;
+            self.tensors.push(read);
+            return Ok(());
+        }
+        let read = affine_columns(self.src, w, &from, start, len)?;
+        self.tensors.extend(read);
+        Ok(())
+    }
+
     pub fn read_own(&mut self, w: &Weight) -> Result<(), Error> {
         let w = &w.placed(self.platform);
         if recorded(|| format!("read_own {w:?}")) {
@@ -767,6 +795,109 @@ fn affine_planes(
         .scaling(pairing),
         factors(src, crate::biases_name(&w.name), &biases, counted, axis)?
             .offsetting(w.name.clone()),
+    ])
+}
+
+fn column_axis(src: &ztensor::Source, name: &str) -> Result<u8, Error> {
+    let Some(tensor) = src.get(name) else {
+        return Err(Error::Missing(name.to_string()));
+    };
+    Ok(u8::try_from(tensor.shape().len().saturating_sub(1)).expect("a rank inside u8"))
+}
+
+/// Columns `start .. start + len` of the MLX affine bank `from`, read as
+/// `w`'s planes: its words, scales and biases each sliced over the columns.
+fn affine_columns(
+    src: &ztensor::Source,
+    w: &Weight,
+    from: &str,
+    start: i64,
+    len: i64,
+) -> Result<Vec<TensorContract>, Error> {
+    let refuse = |detail: String| Error::Illegible {
+        name: w.name.clone(),
+        detail,
+    };
+    if !matches!(
+        w.dtype,
+        Dtype::U4g64 | Dtype::U8g64 | Dtype::U4g32 | Dtype::U2g32 | Dtype::U2g64 | Dtype::U2g128
+    ) {
+        return Err(refuse(format!(
+            "`{from}` holds MLX affine codes and this model reads its columns as {:?}, \
+             which is not an affine bank",
+            w.dtype
+        )));
+    }
+    let stem = from
+        .strip_suffix(".weight")
+        .expect("MLX codes are named `.weight`");
+    let (scales, biases) = (crate::scales_name(stem), crate::biases_name(stem));
+    let per_word = word_codes(w.dtype);
+    let group = i64::from(group_of(w.dtype));
+    let codes = unpacked_extents(src, w, from)?;
+    let groups = src
+        .get(&scales)
+        .and_then(|t| t.shape().last().copied())
+        .map(|n| i64::try_from(n).expect("an extent inside i64"));
+    let columns = *codes.last().expect("a bank has a contracted axis");
+    if groups.map(|g| g * group) != Some(columns) {
+        return Err(refuse(format!(
+            "`{from}` holds {columns} columns of codes against {groups:?} groups in \
+             `{scales}`, which is not one group of {group} per scale: it is stored \
+             at another width or grouping than {:?}",
+            w.dtype
+        )));
+    }
+    if start % group != 0 || len % group != 0 || start + len > columns {
+        return Err(refuse(format!(
+            "columns {start}..{} of `{from}` ({columns} wide) do not keep whole groups \
+             of {group}, so they are not a slice of its codes and its scales",
+            start + len
+        )));
+    }
+    let axis = u8::try_from(codes.len() - 1).expect("a rank inside u8");
+    let mut shape = codes.clone();
+    *shape.last_mut().expect("a contracted axis") = len;
+    if shape != extents(w) {
+        return Err(refuse(format!(
+            "columns {start}..{} of `{from}` are {shape:?} and this text declares {:?}",
+            start + len,
+            extents(w)
+        )));
+    }
+    let pairing = scaling(w);
+    let counted = divided(&shape, pairing.channel_axis, pairing.group_size, &w.name);
+    let factor = |name: String, of: &str| -> Result<TensorContract, Error> {
+        let expr = Expr::src(of.to_string()).slice(axis, start / group, len / group);
+        let stored = agreed(src, &name, &expr)?;
+        let want = encoding(Dtype::Bf16);
+        Ok(TensorContract::new(
+            name.clone(),
+            ladder(&name, expr, &stored, &want)?,
+            counted.clone(),
+            want,
+        ))
+    };
+    // A transmute renames a whole tensor: the sliced words are published
+    // first, and their name is what reads as codes.
+    let mut words = shape.clone();
+    *words.last_mut().expect("a contracted axis") = len / per_word;
+    let sliced = format!("{}.words", w.name);
+    Ok(vec![
+        TensorContract::new(
+            sliced.clone(),
+            Expr::src(from.to_string()).slice(axis, start / per_word, len / per_word),
+            words,
+            Encoding::Raw(DType::U32),
+        )
+        .internal(),
+        TensorContract::inferred(
+            w.name.clone(),
+            Expr::out(sliced).transmute(TensorType::new(shape.clone(), grouped(w))),
+            grouped(w),
+        ),
+        factor(crate::scales_name(&w.name), &scales)?.scaling(pairing),
+        factor(crate::biases_name(&w.name), &biases)?.offsetting(w.name.clone()),
     ])
 }
 

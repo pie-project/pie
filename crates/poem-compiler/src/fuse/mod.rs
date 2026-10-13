@@ -118,6 +118,15 @@ impl Match<'_> {
         }
     }
 
+    /// The dtype the weight bound to `name` is stored in (a packed bank's
+    /// own, where its value's type is the element it reads as).
+    fn weight_dtype(&self, name: &str) -> Option<Dtype> {
+        match self.trace.values[self.value(name).0 as usize].def {
+            poem_ir::Def::Weight(i) => Some(self.trace.params[i as usize].dtype),
+            _ => None,
+        }
+    }
+
     fn dtype(&self, name: &str) -> Option<Dtype> {
         match self.ty(name) {
             Ty::Tensor { dtype, .. } => Some(*dtype),

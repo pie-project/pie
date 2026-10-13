@@ -6,7 +6,7 @@ use poem::pattern::{Pattern, Template, template};
 use poem_ir::ops::fused::PostNorm;
 use poem_ir::{Dim, Dtype, Elementwise, Fused, ModulateForm, NormKind, Operation, Ty};
 
-use super::Rule;
+use super::{Match, Rule};
 
 /// A placeholder width for pattern holes; the matcher compares op fields, not
 /// the types of the values they hold.
@@ -209,6 +209,13 @@ fn embed_scale_add_select() -> Rule {
             y_scaled: m.value("y_scaled"),
         },
     )
+    .when(dense_table)
+}
+
+/// The fused kernels read the table's rows as plain elements; a packed bank
+/// (gemma-4's per-layer tables at u4) is gathered by its own kernel.
+fn dense_table(m: &Match<'_>) -> bool {
+    m.weight_dtype("table").and_then(Dtype::elem).is_some()
 }
 
 fn embed_scale_add() -> Rule {
@@ -226,6 +233,7 @@ fn embed_scale_add() -> Rule {
             y_scaled: m.value("y_scaled"),
         }
     })
+    .when(dense_table)
 }
 
 /// A residual add whose sum is normed.

@@ -147,7 +147,7 @@ def safetensors(m, reads, layout):
         reads.read(ple.model_norm, at("per_layer_projection_norm.weight"))
         for l, p in enumerate(ple.per_layer):
             n = lambda leaf: "{}layers.{}.{}".format(layout.trunk, l, leaf)
-            reads.read_expr(p.table, src(at("embed_tokens_per_layer.weight")).slice(1, l * ple.dim, ple.dim))
+            reads.read_columns(p.table, at("embed_tokens_per_layer.weight"), l * ple.dim, ple.dim)
             reads.read(p.gate, n("per_layer_input_gate.weight"))
             reads.read(p.proj, n("per_layer_projection.weight"))
             reads.read(p.norm, n("post_per_layer_input_norm.weight"))
