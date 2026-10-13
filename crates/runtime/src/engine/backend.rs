@@ -34,6 +34,7 @@ impl EngineSpec {
 pub mod open {
     #[cfg(any(
         feature = "cuda",
+        feature = "rocm",
         feature = "vulkan",
         feature = "wgpu",
         feature = "xla",
@@ -54,6 +55,24 @@ pub mod open {
             0 => Err(super::anyhow!("a cuda group requires at least one rank")),
             1 => Ok((cuda(boots.remove(0))?, 1)),
             ranks => engine_cuda::open_group(boots, crate::engine::load::contract_for)
+                .map(|group| (Box::new(group) as EngineBox, ranks))
+                .map_err(::anyhow::Error::msg),
+        }
+    }
+
+    #[cfg(feature = "rocm")]
+    pub fn rocm(boot: engine_rocm::DeviceBoot) -> Result<EngineBox> {
+        engine_rocm::open(boot, crate::engine::load::contract_for)
+            .map(|engine| Box::new(engine) as EngineBox)
+            .map_err(::anyhow::Error::msg)
+    }
+
+    #[cfg(feature = "rocm")]
+    pub fn rocm_group(mut boots: Vec<engine_rocm::DeviceBoot>) -> Result<(EngineBox, usize)> {
+        match boots.len() {
+            0 => Err(super::anyhow!("a rocm group requires at least one rank")),
+            1 => Ok((rocm(boots.remove(0))?, 1)),
+            ranks => engine_rocm::open_group(boots, crate::engine::load::contract_for)
                 .map(|group| (Box::new(group) as EngineBox, ranks))
                 .map_err(::anyhow::Error::msg),
         }
@@ -106,19 +125,19 @@ pub mod open {
     }
 }
 
-#[cfg(feature = "cuda")]
-pub use engine_cuda::comm::Transport;
-#[cfg(feature = "cuda")]
-pub use engine_cuda::{DeviceBoot, Diagnostics, Graphs, Knobs, Recording, World, ordinal_of};
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub use crate::gpu_engine::comm::Transport;
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub use crate::gpu_engine::{DeviceBoot, Diagnostics, Graphs, Knobs, Recording, World, ordinal_of};
 
 mod remote;
 
 pub use remote::{RemoteDisconnectHandle, RemoteEngine};
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 #[must_use]
 pub fn envelopes_resolved() -> u64 {
-    engine_cuda::Shell::envelopes_resolved()
+    crate::gpu_engine::Shell::envelopes_resolved()
 }
 
 struct EngineRegistration {

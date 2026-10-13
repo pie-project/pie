@@ -8,7 +8,7 @@ pub mod profiles;
 
 pub use waker;
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub use backend::envelopes_resolved;
 pub use backend::{
     EngineBox, EngineSpec, RemoteDisconnectHandle, RemoteEngine, SchedulerLimits, get_spec, open,

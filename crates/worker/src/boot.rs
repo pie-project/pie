@@ -51,11 +51,11 @@ pub(crate) fn load_model_engines(
         #[allow(unreachable_patterns)]
         if tp_degree > 1 {
             match flavor {
-                #[cfg(feature = "cuda")]
-                Flavor::Cuda => {}
+                #[cfg(any(feature = "cuda", feature = "rocm"))]
+                Flavor::NATIVE => {}
                 _ => anyhow::bail!(
                     "model {:?}: tensor_parallel_size={tp_degree} is only \
-                     supported for cuda_native",
+                     supported for cuda_native and rocm_native",
                     m.name,
                 ),
             }
@@ -321,7 +321,7 @@ fn artifact_name(path: &Path) -> String {
               would be a parameter list with a name"
 )]
 #[cfg_attr(
-    not(feature = "cuda"),
+    not(any(feature = "cuda", feature = "rocm")),
     allow(
         unused_variables,
         unreachable_code,
@@ -342,9 +342,9 @@ fn create_engine_group(
     frames_in_flight: u8,
     opened: Option<runtime::engine::EngineBox>,
 ) -> Result<GroupEngine> {
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     {
-        if flavor == Flavor::Cuda && tp_degree > 1 {
+        if flavor == Flavor::NATIVE && tp_degree > 1 {
             let rank_opts = cuda_rank_options(m, group_idx, group, base_opts)?;
             return crate::backend::create_engine_backend_group(
                 &rank_opts,
@@ -369,7 +369,7 @@ fn create_engine_group(
         }
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     let _ = (flavor, tp_degree);
 
     let first_engine_idx = group.first().copied().ok_or_else(|| {
@@ -400,12 +400,12 @@ fn create_engine_group(
 }
 
 fn embedded_opts_for_device(base_opts: &EngineOptions, device: String) -> EngineOptions {
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     let _ = &device;
 
     #[allow(unreachable_patterns)]
     match base_opts {
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
         EngineOptions::CudaNative(opts) => {
             let mut opts = opts.clone();
             opts.device = device;
@@ -416,7 +416,7 @@ fn embedded_opts_for_device(base_opts: &EngineOptions, device: String) -> Engine
 }
 
 fn apply_embedded_verbose(options: &mut EngineOptions, verbose: bool) {
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     #[allow(
         irrefutable_let_patterns,
         reason = "`EngineOptions` has one variant in a CUDA-only build"
@@ -425,11 +425,11 @@ fn apply_embedded_verbose(options: &mut EngineOptions, verbose: bool) {
         opts.verbose = verbose;
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     let _ = (options, verbose);
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn cuda_rank_options(
     m: &config::ModelConfig,
     group_idx: usize,

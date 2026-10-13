@@ -7,6 +7,7 @@ use crate::value::{Dtype, ValueDecl, ValueId};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Platform {
     Cuda,
+    Rocm,
     Metal,
     Wgpu,
     Vulkan,
@@ -18,6 +19,7 @@ impl Platform {
     pub fn backend(self) -> &'static str {
         match self {
             Platform::Cuda => "cuda",
+            Platform::Rocm => "rocm",
             Platform::Metal => "metal",
             Platform::Wgpu => "wgpu",
             Platform::Vulkan => "vulkan",

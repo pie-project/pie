@@ -11,6 +11,8 @@ pub enum Backend {
     Metal = 1,
 
     Vulkan = 2,
+
+    Hip = 3,
 }
 
 const ROW_BUCKET_GENERIC: u8 = 0;

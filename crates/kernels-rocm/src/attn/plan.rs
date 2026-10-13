@@ -436,18 +436,6 @@ pub fn plan_prefill(
             Err(declined) => return Err(declined),
         };
 
-    let cta_tile_q = u32::try_from(built.info.cta_tile_q).unwrap_or(0);
-    if shape.head_dim >= 256 && cta_tile_q == 128 {
-        return Err(refuse(
-            OP,
-            format!(
-                "head width {} with CTA_TILE_Q {cta_tile_q} has no valid KernelTraits — \
-                 `IsInvalid()` is true for every NUM_MMA_KV, so no unit exists and none can",
-                shape.head_dim
-            ),
-        ));
-    }
-
     Ok(PrefillPlan {
         info: built.info,
         int_upload: built.int_upload,
@@ -528,7 +516,12 @@ pub fn upload(ctx: &Ctx, op: &'static str, bytes: &[u8], int_ptr: u64) -> Result
                 ctx.stream(),
             )
         }
-        .map_err(|code| refuse(op, format!("`hipMemcpyAsync` answered {code} staging the plan")))
+        .map_err(|code| {
+            refuse(
+                op,
+                format!("`hipMemcpyAsync` answered {code} staging the plan"),
+            )
+        })
     }
     #[cfg(not(feature = "rocm"))]
     {

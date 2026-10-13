@@ -1877,6 +1877,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-rocm"
+version = "0.5.4"
+dependencies = [
+ "checkpoint",
+ "engine",
+ "eta-compiler",
+ "eta-exec",
+ "kernels-rocm",
+ "libc",
+ "memmap2",
+ "pie-eta-ir",
+ "pie-poem",
+ "pie-poem-compiler",
+ "pie-poem-exec",
+ "pie-poem-ir",
+ "pie-profile",
+ "serde_json",
+ "tempfile",
+ "tokenizer",
+ "toml",
+ "windows-sys 0.61.2",
+ "ztensor",
+ "ztensor-compat",
+]
+
+[[package]]
 name = "engine-vulkan"
 version = "0.5.4"
 dependencies = [
@@ -5126,6 +5152,7 @@ dependencies = [
  "engine",
  "engine-cuda",
  "engine-metal",
+ "engine-rocm",
  "engine-vulkan",
  "engine-wgpu",
  "engine-xla",

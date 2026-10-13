@@ -35,6 +35,8 @@ pub mod disk;
 pub mod elemwise;
 pub mod error;
 pub mod graph;
+#[cfg(feature = "rocm")]
+pub mod hip;
 pub mod jit;
 pub mod layout;
 pub mod linear;
@@ -42,8 +44,6 @@ pub mod seat;
 pub mod source;
 pub mod spatial;
 pub mod tensor;
-#[cfg(feature = "rocm")]
-pub mod hip;
 
 pub use error::Error;
 pub use jit::{Arg, ArgValue, Ctx, Fire, Launch, Pad, Slabs};

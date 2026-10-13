@@ -7,6 +7,11 @@ use core::ffi::{c_char, c_int, c_uint, c_void};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use super::rt::{
+    Event, Graph, GraphExec, GraphNode, HostFn, MemAccessDesc, MemAllocationProp, MemcpyAttributes,
+    PointerAttributes,
+};
+
 pub type HipError = c_int;
 pub type HiprtcResult = c_int;
 
@@ -115,6 +120,51 @@ table!(Hip from "libamdhip64.so" {
         stream: Stream,
         params: *mut *mut c_void,
     ) -> HipError;
+    fn hipDeviceSynchronize() -> HipError;
+    fn hipDeviceCanAccessPeer(can: *mut c_int, device: c_int, peer: c_int) -> HipError;
+    fn hipDeviceGetP2PAttribute(value: *mut c_int, attr: c_int, src: c_int, dst: c_int) -> HipError;
+    fn hipDeviceEnablePeerAccess(peer: c_int, flags: c_uint) -> HipError;
+    fn hipMemset(dst: *mut c_void, value: c_int, bytes: usize) -> HipError;
+    fn hipMemsetAsync(dst: *mut c_void, value: c_int, bytes: usize, stream: Stream) -> HipError;
+    fn hipMemcpyBatchAsync(dsts: *mut *mut c_void, srcs: *mut *mut c_void, sizes: *mut usize, count: usize, attrs: *mut MemcpyAttributes, attr_idxs: *mut usize, num_attrs: usize, fail_idx: *mut usize, stream: Stream) -> HipError;
+    fn hipHostMalloc(ptr: *mut *mut c_void, bytes: usize, flags: c_uint) -> HipError;
+    fn hipHostFree(ptr: *mut c_void) -> HipError;
+    fn hipHostRegister(ptr: *mut c_void, bytes: usize, flags: c_uint) -> HipError;
+    fn hipHostUnregister(ptr: *mut c_void) -> HipError;
+    fn hipHostGetDevicePointer(dev: *mut *mut c_void, host: *mut c_void, flags: c_uint) -> HipError;
+    fn hipPointerGetAttributes(attrs: *mut PointerAttributes, ptr: *const c_void) -> HipError;
+    fn hipStreamCreateWithFlags(stream: *mut Stream, flags: c_uint) -> HipError;
+    fn hipStreamWaitEvent(stream: Stream, event: Event, flags: c_uint) -> HipError;
+    fn hipLaunchHostFunc(stream: Stream, func: HostFn, data: *mut c_void) -> HipError;
+    fn hipStreamBeginCapture(stream: Stream, mode: c_int) -> HipError;
+    fn hipStreamBeginCaptureToGraph(stream: Stream, graph: Graph, deps: *const GraphNode, edges: *const c_void, count: usize, mode: c_int) -> HipError;
+    fn hipStreamEndCapture(stream: Stream, graph: *mut Graph) -> HipError;
+    fn hipStreamGetCaptureInfo_v2(stream: Stream, status: *mut c_int, id: *mut u64, graph: *mut Graph, deps: *mut *const GraphNode, count: *mut usize) -> HipError;
+    fn hipStreamUpdateCaptureDependencies(stream: Stream, deps: *mut GraphNode, count: usize, flags: c_uint) -> HipError;
+    fn hipEventCreate(event: *mut Event) -> HipError;
+    fn hipEventCreateWithFlags(event: *mut Event, flags: c_uint) -> HipError;
+    fn hipEventDestroy(event: Event) -> HipError;
+    fn hipEventRecord(event: Event, stream: Stream) -> HipError;
+    fn hipEventSynchronize(event: Event) -> HipError;
+    fn hipEventQuery(event: Event) -> HipError;
+    fn hipEventElapsedTime(ms: *mut f32, start: Event, stop: Event) -> HipError;
+    fn hipGraphInstantiateWithFlags(exec: *mut GraphExec, graph: Graph, flags: u64) -> HipError;
+    fn hipGraphUpload(exec: GraphExec, stream: Stream) -> HipError;
+    fn hipGraphLaunch(exec: GraphExec, stream: Stream) -> HipError;
+    fn hipGraphExecDestroy(exec: GraphExec) -> HipError;
+    fn hipGraphDestroy(graph: Graph) -> HipError;
+    fn hipGraphDebugDotPrint(graph: Graph, path: *const c_char, flags: c_uint) -> HipError;
+    fn hipGraphGetNodes(graph: Graph, nodes: *mut GraphNode, count: *mut usize) -> HipError;
+    fn hipGraphGetEdges(graph: Graph, from: *mut GraphNode, to: *mut GraphNode, count: *mut usize) -> HipError;
+    fn hipMemCreate(handle: *mut u64, bytes: usize, prop: *const MemAllocationProp, flags: u64) -> HipError;
+    fn hipMemRelease(handle: u64) -> HipError;
+    fn hipMemAddressReserve(ptr: *mut *mut c_void, bytes: usize, align: usize, addr: *mut c_void, flags: u64) -> HipError;
+    fn hipMemAddressFree(ptr: *mut c_void, bytes: usize) -> HipError;
+    fn hipMemMap(ptr: *mut c_void, bytes: usize, offset: usize, handle: u64, flags: u64) -> HipError;
+    fn hipMemUnmap(ptr: *mut c_void, bytes: usize) -> HipError;
+    fn hipMemSetAccess(ptr: *mut c_void, bytes: usize, desc: *const MemAccessDesc, count: usize) -> HipError;
+    fn hipMemGetAllocationGranularity(granularity: *mut usize, prop: *const MemAllocationProp, option: c_int) -> HipError;
+    fn hipFuncGetAttribute(value: *mut c_int, attr: c_int, function: Function) -> HipError;
 });
 
 table!(Hiprtc from "libhiprtc.so" {
@@ -240,7 +290,85 @@ table!(Rocblas from "librocblas.so" {
 /// absorbs go through it.
 pub fn rocblas() -> Result<&'static Rocblas, String> {
     static ROCBLAS: OnceLock<Result<Rocblas, String>> = OnceLock::new();
-    ROCBLAS.get_or_init(Rocblas::open).as_ref().map_err(Clone::clone)
+    ROCBLAS
+        .get_or_init(Rocblas::open)
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+pub type Lt = *mut c_void;
+pub type LtDesc = *mut c_void;
+pub type LtLayout = *mut c_void;
+pub type LtPreference = *mut c_void;
+pub type LtStatus = c_int;
+
+pub const LT_SUCCESS: LtStatus = 0;
+/// `HIPBLAS_COMPUTE_32F`.
+pub const LT_COMPUTE_F32: c_int = 2;
+/// `hipDataType`.
+pub const LT_R_32F: c_int = 0;
+pub const LT_R_16F: c_int = 2;
+pub const LT_R_16BF: c_int = 14;
+/// `hipblasOperation_t`.
+pub const LT_OP_N: c_int = 111;
+pub const LT_OP_T: c_int = 112;
+/// `hipblasLtMatmulDescAttributes_t`.
+pub const LT_DESC_TRANSA: c_int = 0;
+pub const LT_DESC_TRANSB: c_int = 1;
+pub const LT_DESC_EPILOGUE: c_int = 2;
+pub const LT_DESC_BIAS_POINTER: c_int = 3;
+pub const LT_DESC_BIAS_DATA_TYPE: c_int = 4;
+/// `hipblasLtEpilogue_t`.
+pub const LT_EPILOGUE_DEFAULT: c_int = 1;
+pub const LT_EPILOGUE_BIAS: c_int = 4;
+/// `HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES`.
+pub const LT_PREF_MAX_WORKSPACE_BYTES: c_int = 1;
+
+/// `hipblasLtMatmulHeuristicResult_t`: a 24-byte algo, then its workspace,
+/// state and waves (56 bytes, as `/opt/rocm/include/hipblaslt/hipblaslt.h`
+/// lays it out).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LtHeuristic {
+    pub algo: [u64; 3],
+    pub workspace: usize,
+    pub state: LtStatus,
+    pub waves: f32,
+    pub reserved: [c_int; 4],
+}
+
+const _: () = assert!(core::mem::size_of::<LtHeuristic>() == 56);
+
+table!(Hipblaslt from "libhipblaslt.so" {
+    fn hipblasLtCreate(handle: *mut Lt) -> LtStatus;
+    fn hipblasLtDestroy(handle: Lt) -> LtStatus;
+    fn hipblasLtMatmulDescCreate(desc: *mut LtDesc, compute: c_int, scale: c_int) -> LtStatus;
+    fn hipblasLtMatmulDescDestroy(desc: LtDesc) -> LtStatus;
+    fn hipblasLtMatmulDescSetAttribute(desc: LtDesc, attr: c_int, value: *const c_void, size: usize) -> LtStatus;
+    fn hipblasLtMatrixLayoutCreate(layout: *mut LtLayout, dtype: c_int, rows: u64, cols: u64, ld: i64) -> LtStatus;
+    fn hipblasLtMatrixLayoutDestroy(layout: LtLayout) -> LtStatus;
+    fn hipblasLtMatmulPreferenceCreate(pref: *mut LtPreference) -> LtStatus;
+    fn hipblasLtMatmulPreferenceDestroy(pref: LtPreference) -> LtStatus;
+    fn hipblasLtMatmulPreferenceSetAttribute(pref: LtPreference, attr: c_int, value: *const c_void, size: usize) -> LtStatus;
+    fn hipblasLtMatmulAlgoGetHeuristic(
+        handle: Lt, desc: LtDesc, a: LtLayout, b: LtLayout, c: LtLayout, d: LtLayout,
+        pref: LtPreference, requested: c_int, results: *mut LtHeuristic, returned: *mut c_int,
+    ) -> LtStatus;
+    fn hipblasLtMatmul(
+        handle: Lt, desc: LtDesc, alpha: *const c_void,
+        a: *const c_void, a_layout: LtLayout, b: *const c_void, b_layout: LtLayout,
+        beta: *const c_void, c: *const c_void, c_layout: LtLayout,
+        d: *mut c_void, d_layout: LtLayout,
+        algo: *const c_void, workspace: *mut c_void, workspace_bytes: usize, stream: Stream,
+    ) -> LtStatus;
+});
+
+/// hipBLASLt, opened on first use; a box without it falls back to rocBLAS.
+pub fn hipblaslt() -> Result<&'static Hipblaslt, String> {
+    static LT: OnceLock<Result<Hipblaslt, String>> = OnceLock::new();
+    LT.get_or_init(Hipblaslt::open)
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 /// Where to look for a ROCm library: the loader's own search first, then
@@ -260,7 +388,10 @@ fn open_library(name: &str) -> Result<libloading::Library, String> {
             Err(e) => tried.push(format!("{}: {e}", path.display())),
         }
     }
-    Err(format!("no `{name}` could be loaded ({})", tried.join("; ")))
+    Err(format!(
+        "no `{name}` could be loaded ({})",
+        tried.join("; ")
+    ))
 }
 
 pub struct Api {

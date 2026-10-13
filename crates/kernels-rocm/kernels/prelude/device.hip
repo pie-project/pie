@@ -50,6 +50,17 @@ constexpr int kWave = 32;
 
 __device__ __forceinline__ int lane() { return static_cast<int>(__lane_id()); }
 
+// A workgroup barrier that orders LDS only. `__syncthreads()` also drains
+// every outstanding global load and store (vmcnt 0) before it waits, which
+// stalls a loop on the operands it prefetched; this one leaves them in
+// flight. Global memory a block writes and then reads across it still needs
+// `__syncthreads()`.
+__device__ __forceinline__ void lds_barrier() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+
 // Storage and arithmetic types meet at f32: every kernel loads, works in f32,
 // and rounds once on the store (round to nearest even for bf16 and f16).
 template <class T>

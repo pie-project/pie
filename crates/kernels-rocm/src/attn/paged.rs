@@ -12,7 +12,7 @@ pub const FILE: &str = "attn/paged.hip";
 
 /// The prefill kernel's query tile: 64 packed (token, head) rows a block.
 /// The prefill scheduler cuts its work list at this tile.
-pub const PREFILL_TILE_Q: u32 = 64;
+pub const PREFILL_TILE_Q: u32 = 128;
 
 const LDS_BYTES: u32 = 64 * 1024;
 
@@ -76,11 +76,19 @@ fn head_dim_built(op: &'static str, head_dim: u32) -> Result<(), Error> {
     }
     Err(refuse(
         op,
-        format!("no paged attention is built at head width {head_dim}; it is built at 64/128/256/512"),
+        format!(
+            "no paged attention is built at head width {head_dim}; it is built at 64/128/256/512"
+        ),
     ))
 }
 
-fn pool_args(q: RaggedTensor, pool: &KvPool, num_qo_heads: u32, num_kv_heads: u32, head_dim: u32) -> Args {
+fn pool_args(
+    q: RaggedTensor,
+    pool: &KvPool,
+    num_qo_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+) -> Args {
     Args {
         q: q.data.ptr,
         k: pool.keys.ptr,
@@ -146,7 +154,13 @@ pub fn decode(
     let info = &plan.info;
     let int = plan.workspace.int_ptr;
     let float = plan.workspace.float_ptr;
-    let mut args = pool_args(q, pool, shape.num_q_heads, shape.num_kv_heads, shape.head_dim);
+    let mut args = pool_args(
+        q,
+        pool,
+        shape.num_q_heads,
+        shape.num_kv_heads,
+        shape.head_dim,
+    );
     args.request_indices = at(int, info.request_indices_offset);
     args.kv_tile_indices = at(int, info.kv_tile_indices_offset);
     args.kv_chunk_size = at(int, info.kv_chunk_size_ptr_offset);
@@ -177,17 +191,32 @@ pub fn decode(
             args.lse = lse;
         }
     }
-    let waves = decode_waves(group, shape.head_dim);
     let hnd = if shape.hnd_layout { "true" } else { "false" };
-    let entry = symbol(&format!(
-        "::pie::attn::paged_decode<{}, {group}, {waves}, {hnd}>",
-        shape.head_dim
-    ));
+    // The matrix-core decode takes a group within one 16-column tile; a
+    // wider group takes the vector decode.
+    let (entry, threads) = if group <= 16 && shape.head_dim.is_multiple_of(32) {
+        (
+            symbol(&format!(
+                "::pie::attn::paged_decode_mfma<{}, {group}, {hnd}>",
+                shape.head_dim
+            )),
+            512,
+        )
+    } else {
+        let waves = decode_waves(group, shape.head_dim);
+        (
+            symbol(&format!(
+                "::pie::attn::paged_decode<{}, {group}, {waves}, {hnd}>",
+                shape.head_dim
+            )),
+            64 * waves,
+        )
+    };
     ctx.fire(
         op,
         Fire::at(FILE, entry).apply(Launch::grid(
             [info.padded_batch_size as u32, shape.num_kv_heads, 1],
-            [64 * waves, 1, 1],
+            [threads, 1, 1],
         )),
         &[by_value(&args)],
     )?;
@@ -223,7 +252,13 @@ pub fn prefill(
     }
     let int = plan.workspace.int_ptr;
     let float = plan.workspace.float_ptr;
-    let mut args = pool_args(q, pool, shape.num_q_heads, shape.num_kv_heads, shape.head_dim);
+    let mut args = pool_args(
+        q,
+        pool,
+        shape.num_q_heads,
+        shape.num_kv_heads,
+        shape.head_dim,
+    );
     args.o_indptr = at(int, info.o_indptr_offset);
     args.request_indices = at(int, info.request_indices_offset);
     args.qo_tile_indices = at(int, info.qo_tile_indices_offset);
@@ -258,15 +293,20 @@ pub fn prefill(
     }
     let hnd = if shape.hnd_layout { "true" } else { "false" };
     let causal = if plan.causal { "true" } else { "false" };
+    let kernel = if matches!(shape.head_dim, 128 | 256) {
+        "paged_prefill"
+    } else {
+        "paged_prefill_wide"
+    };
     let entry = symbol(&format!(
-        "::pie::attn::paged_prefill<{}, {hnd}, {causal}>",
+        "::pie::attn::{kernel}<{}, {hnd}, {causal}>",
         shape.head_dim
     ));
     ctx.fire(
         op,
         Fire::at(FILE, entry).apply(Launch::grid(
             [info.padded_batch_size as u32, shape.num_kv_heads, 1],
-            [256, 1, 1],
+            [512, 1, 1],
         )),
         &[by_value(&args)],
     )?;
@@ -290,7 +330,7 @@ fn merge(ctx: &Ctx, op: &'static str, parts: &Partials) -> Result<(), Error> {
             FILE,
             symbol(&format!("::pie::attn::merge_partials<{}>", parts.head_dim)),
         )
-        .apply(Launch::grid([blocks, 1, 1], [64, 1, 1])),
+        .apply(Launch::grid([blocks, 1, 1], [256, 1, 1])),
         &[
             ArgValue::Ptr(parts.parts),
             ArgValue::Ptr(parts.part_lse),

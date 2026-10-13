@@ -303,7 +303,7 @@ pub fn with_host_codegen<'a>(
         .then(|| registered.as_ref()?.emitted(backend))
         .flatten();
 
-    let region_analysis = if plan.region_analysis.is_empty() && backend == "cuda" {
+    let region_analysis = if plan.region_analysis.is_empty() && matches!(backend, "cuda" | "hip") {
         registered
             .as_ref()
             .map(|program| program.region_analysis())

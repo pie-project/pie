@@ -12,7 +12,7 @@ use crate::plan::{CompiledStage, Dimension, LANE_TABLE_ABI_VERSION, Region};
 use crate::codegen::op_view::{OpView, result_bases};
 use crate::codegen::slots::Slots;
 
-use super::runtime::singleton_runtime_source;
+use super::runtime::{Dialect, runtime_source};
 use super::singleton::valid_identifier;
 use super::validate::validate_generated_region;
 
@@ -353,6 +353,15 @@ pub fn emit_fused_region(
     stage: &CompiledStage,
     region: &Region,
 ) -> Result<String, EmitError> {
+    emit_fused_region_in(Dialect::Cuda, entry_name, stage, region)
+}
+
+pub fn emit_fused_region_in(
+    dialect: Dialect,
+    entry_name: &str,
+    stage: &CompiledStage,
+    region: &Region,
+) -> Result<String, EmitError> {
     if !valid_identifier(entry_name) {
         return Err(EmitError::EntryNameNotCIdentifier(EmitterKind::CudaFused));
     }
@@ -371,7 +380,7 @@ pub fn emit_fused_region(
     let direct = analyze_direct_argmax(stage, region, &bases);
     let skipped = direct.skipped;
 
-    let mut source = singleton_runtime_source();
+    let mut source = runtime_source(dialect);
     source.push_str(PROLOGUE);
     source.push_str(entry_name);
     source.push_str(SIGNATURE);

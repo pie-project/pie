@@ -99,8 +99,7 @@ pub(crate) fn take(
     {
         return Ok(slab.ptr);
     }
-    if capture_status(stream).is_some_and(|s| s != sys::STREAM_CAPTURE_STATUS_NONE)
-    {
+    if capture_status(stream).is_some_and(|s| s != sys::STREAM_CAPTURE_STATUS_NONE) {
         return Err(Fault::Unwarmed {
             name,
             have: held
@@ -229,7 +228,9 @@ pub(crate) fn max_shared_memory_per_sm() -> Option<u32> {
 #[must_use]
 pub(crate) fn max_shared_memory_per_block_optin() -> Option<u32> {
     static BYTES: OnceLock<Mutex<HashMap<i32, Option<u32>>>> = OnceLock::new();
-    per_device(&BYTES, |o| attribute(sys::ATTR_SHARED_MEM_PER_BLOCK_OPTIN, o))
+    per_device(&BYTES, |o| {
+        attribute(sys::ATTR_SHARED_MEM_PER_BLOCK_OPTIN, o)
+    })
 }
 
 /// The device's `gcnArchName` with its target features stripped: `gfx942`
@@ -243,7 +244,10 @@ pub(crate) fn arch_name(ordinal: i32) -> Option<String> {
         return None;
     }
     let field = &prop[sys::DEVICE_PROP_GCN_ARCH_NAME..sys::DEVICE_PROP_GCN_ARCH_NAME + 256];
-    let full = std::ffi::CStr::from_bytes_until_nul(field).ok()?.to_str().ok()?;
+    let full = std::ffi::CStr::from_bytes_until_nul(field)
+        .ok()?
+        .to_str()
+        .ok()?;
     let base = full.split(':').next()?;
     base.starts_with("gfx").then(|| base.to_owned())
 }

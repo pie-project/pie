@@ -1,0 +1,126 @@
+#![cfg(feature = "rocm")]
+
+use std::path::{Path, PathBuf};
+
+use engine_rocm::{Boot, Knobs, Shell};
+use poem::Platform;
+use poem_compiler::Budget;
+
+const DEPLOYMENT: &str = "qwen35-d0.8b-bf16-kv-bf16";
+
+const PAGE: u32 = 16;
+const LANES: u32 = 16;
+const TOKENS: u32 = 8192;
+const CONTEXT: u32 = 32768;
+
+// A tenth of a 32 GB card: enough for the weight tier and a sequence, not
+// for an 8192-token working set, so the boot halves the token budget. Stated
+// in bytes, so a card of any size is asked for the same share.
+const SHARE: f64 = 3.2e9;
+
+fn fraction() -> f64 {
+    use kernels_rocm::hip::rt;
+
+    let (mut free, mut total) = (0usize, 0usize);
+    // SAFETY: two live locals; the call only writes them.
+    let asked = unsafe { rt::hipMemGetInfo(&raw mut free, &raw mut total) };
+    assert_eq!(asked, rt::hipSuccess, "hipMemGetInfo answers");
+    SHARE / total as f64
+}
+
+fn snapshot() -> Option<PathBuf> {
+    if let Ok(stated) = std::env::var("PIE_SMOKE_SNAPSHOT") {
+        let path = PathBuf::from(stated);
+        return path.is_dir().then_some(path);
+    }
+    let home = std::env::var("HOME").ok()?;
+    let snapshots =
+        Path::new(&home).join(".cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots");
+    std::fs::read_dir(snapshots)
+        .ok()?
+        .filter_map(|entry| Some(entry.ok()?.path()))
+        .find(|path| path.join("tokenizer.json").exists())
+}
+
+fn container(snapshot: &Path) -> Option<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(snapshot)
+        .ok()?
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let name = path.file_name()?.to_str()?;
+            (name.ends_with(".safetensors") || name.ends_with(".zt")).then_some(path)
+        })
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
+#[test]
+fn a_short_card_keeps_the_declared_context() {
+    if !engine_rocm::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let Some(checkpoint) = snapshot() else {
+        eprintln!("no Qwen3.5-0.8B snapshot in the hugging face cache (set PIE_SMOKE_SNAPSHOT)");
+        return;
+    };
+    let Some(container) = container(&checkpoint) else {
+        eprintln!("{checkpoint:?} holds no tensor container");
+        return;
+    };
+    let deployment =
+        poem_compiler::catalog::deployment(DEPLOYMENT).expect("the catalog ships the deployment");
+    let trace = deployment.trace(Platform::Rocm);
+    let source = ztensor_compat::index(&container).expect("the checkpoint opens");
+    let contract = deployment
+        .contract(&source, Platform::Rocm)
+        .expect("the deployment's import contract fits its own checkpoint");
+    drop(source);
+
+    let shell = Shell::load(Boot {
+        voxels: None,
+        deferred_tier: false,
+        residency: engine_rocm::experts::Plan::default(),
+        trace,
+        contract: &contract,
+        checkpoint: &checkpoint,
+        budget: Budget::new(LANES, TOKENS),
+        patches: None,
+        page_size: PAGE,
+        context: CONTEXT,
+        slots: 256,
+        kv_budget: None,
+        memory_share: fraction(),
+        ordinal: 0,
+        knobs: Knobs::default(),
+        cache_dir: None,
+        runahead: engine::runahead::Runahead::F1,
+        world: engine_rocm::World::default(),
+        comm: core::ptr::null_mut(),
+    })
+    .expect("a tenth of the card still holds one sequence");
+
+    let served = shell.budget().max_tokens;
+    assert!(
+        served < TOKENS,
+        "the fraction is tight enough that the token budget halved: {served} of {TOKENS}"
+    );
+    assert!(
+        served >= 1024,
+        "and the halving stopped at its floor, not below: {served}"
+    );
+    let paging = shell.paging();
+    assert_eq!(
+        paging.context(),
+        CONTEXT,
+        "the declared context is the sequence's ceiling, and a sequence spans many \
+         forwards; only the per-forward budget shrinks"
+    );
+    assert_eq!(paging.pages_per_slot, CONTEXT / PAGE);
+    assert!(
+        paging.pages() >= u64::from(paging.pages_per_slot),
+        "and the pool seats at least one sequence at it: {} pages",
+        paging.pages()
+    );
+}

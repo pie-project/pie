@@ -9,7 +9,7 @@ use crate::codegen::wellformed::{ops_valid, region_ranges_valid, value_types_val
 use crate::plan::{CompiledStage, LANE_TABLE_ABI_VERSION, LibraryOp, Region, RegionKind};
 
 use super::fused::{PREAMBLE, PROLOGUE, SIGNATURE};
-use super::runtime::singleton_runtime_source;
+use super::runtime::{Dialect, runtime_source};
 use super::singleton::valid_identifier;
 
 const BODY: &str = r#"
@@ -76,6 +76,15 @@ pub fn emit_scan_region(
     stage: &CompiledStage,
     region: &Region,
 ) -> Result<String, EmitError> {
+    emit_scan_region_in(Dialect::Cuda, entry_name, stage, region)
+}
+
+pub fn emit_scan_region_in(
+    dialect: Dialect,
+    entry_name: &str,
+    stage: &CompiledStage,
+    region: &Region,
+) -> Result<String, EmitError> {
     if !valid_identifier(entry_name) {
         return Err(EmitError::EntryNameNotCIdentifier(EmitterKind::CudaScan));
     }
@@ -94,7 +103,7 @@ pub fn emit_scan_region(
         return Err(EmitError::RegionNodeOutOfRange(RegionForm::CudaScan));
     }
 
-    let mut source = singleton_runtime_source();
+    let mut source = runtime_source(dialect);
     source.push_str(PROLOGUE);
     source.push_str(entry_name);
     source.push_str(SIGNATURE);

@@ -25,6 +25,9 @@ pub struct WorkEstimate {
     pub gdy: u32,
 }
 
+/// The fewest tokens a split decode chunk carries.
+const CHUNK_FLOOR_TOKENS: u32 = 256;
+
 pub fn estimate(
     op: &'static str,
     req: &Request<'_>,
@@ -51,11 +54,15 @@ pub fn estimate(
         });
     }
 
-    let mut low = if req.chunk_floor_128 {
-        (128 / req.page_size).max(1)
+    // The matrix-core decode walks a chunk four wavefronts of 32 keys a
+    // round; a chunk under two rounds leaves wavefronts idle and multiplies
+    // the partials the merge folds.
+    let floor_tokens = if req.chunk_floor_128 {
+        CHUNK_FLOOR_TOKENS.max(128)
     } else {
-        1
+        CHUNK_FLOOR_TOKENS
     };
+    let mut low = (floor_tokens / req.page_size).max(1);
     let mut high = pages.iter().copied().max().unwrap_or(0);
     while low < high {
         let mid = u32::midpoint(low, high);

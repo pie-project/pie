@@ -144,9 +144,8 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
     for expr in &wanted {
         let mut mangled: *const c_char = std::ptr::null();
 
-        let code = unsafe {
-            (api.rtc.hiprtcGetLoweredName)(program.0, expr.as_ptr(), &raw mut mangled)
-        };
+        let code =
+            unsafe { (api.rtc.hiprtcGetLoweredName)(program.0, expr.as_ptr(), &raw mut mangled) };
         if code != sys::HIPRTC_SUCCESS || mangled.is_null() {
             return Err(Fault::Compile {
                 unit,

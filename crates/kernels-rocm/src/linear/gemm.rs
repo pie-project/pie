@@ -22,6 +22,35 @@ pub fn matmul_bias(
     act_x_wt(ctx, "linear.matmul_bias", act, w, Some(bias), y)
 }
 
+/// `h = silu(act · gateᵀ) · (act · upᵀ)` over a packed `[gate | up]` bank in
+/// one fire, for the few rows a decode carries. `Ok(false)` when the fused
+/// fire does not cover the shape, leaving the matmul and the swiglu to the
+/// caller.
+pub fn matmul_swiglu(
+    ctx: &Ctx,
+    act: Tensor,
+    gate_up: Tensor,
+    h: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "linear.matmul_swiglu";
+    dtype_dispatch!(OP, act.dtype, { Bf16 => () });
+    if gate_up.dtype != dtype::Dtype::Bf16 || gate_up.rows != 2 * h.width || h.rows == 0 {
+        return Ok(false);
+    }
+    let i = count(OP, "the intermediate width", h.width)?;
+    let k = count(OP, "the contraction", act.width)?;
+    let m = ctx.opaque_rows(stated(OP, h.rows)?);
+    #[cfg(feature = "rocm")]
+    {
+        dense::act_x_wt_swiglu(ctx, act.ptr, gate_up.ptr, h.ptr, m, i, k)
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = (ctx, m, i, k);
+        Err(crate::jit::runtimeless(OP))
+    }
+}
+
 pub fn lm_head(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(), Error> {
     act_x_wt(ctx, "linear.lm_head", act, w, None, y)
 }

@@ -4,7 +4,7 @@ use alloc::string::String;
 
 use eta_ir::op::OP_TABLE;
 
-use super::runtime::singleton_runtime_source;
+use super::runtime::{Dialect, runtime_source};
 
 const ENTRY: &str = include_str!("../../../runtime/cuda/ptir_m1_entry.cuh");
 
@@ -23,6 +23,14 @@ pub fn supported_tag(tag: u8) -> bool {
 }
 
 pub fn emit_singleton_region(entry_name: &str, op_tag: u8) -> Result<String, EmitError> {
+    emit_singleton_region_in(Dialect::Cuda, entry_name, op_tag)
+}
+
+pub fn emit_singleton_region_in(
+    dialect: Dialect,
+    entry_name: &str,
+    op_tag: u8,
+) -> Result<String, EmitError> {
     if !valid_identifier(entry_name) {
         return Err(EmitError::EntryNameNotCIdentifier(
             EmitterKind::CudaSingleton,
@@ -31,7 +39,7 @@ pub fn emit_singleton_region(entry_name: &str, op_tag: u8) -> Result<String, Emi
     if !supported_tag(op_tag) {
         return Err(EmitError::UnsupportedSingletonOpcode { tag: op_tag });
     }
-    let mut source = singleton_runtime_source();
+    let mut source = runtime_source(dialect);
     source.push_str("\nextern \"C\" __global__ void ");
     source.push_str(entry_name);
     source.push_str(ENTRY);

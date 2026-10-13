@@ -56,6 +56,8 @@ pub fn ragged(
     mask: RaggedMask,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    let _ = (ctx, q, k, v, q_indptr, kv_indptr, head_dim, sm_scale, mask, o);
+    let _ = (
+        ctx, q, k, v, q_indptr, kv_indptr, head_dim, sm_scale, mask, o,
+    );
     Err(Error::Unsupported { op: OP })
 }

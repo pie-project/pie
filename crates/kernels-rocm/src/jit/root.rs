@@ -5,9 +5,12 @@ use crate::source::{self, LIBRARY};
 /// and a fused path says so in its own text with `fmaf`.
 /// A unit is also a header other units include, so it carries `#pragma
 /// once`, which clang flags in the file it compiles first.
-pub const OPTIONS: [&str; 4] =
-    ["-std=c++17", "-O3", "-ffp-contract=off", "-Wno-pragma-once-outside-header"];
-
+pub const OPTIONS: [&str; 4] = [
+    "-std=c++17",
+    "-O3",
+    "-ffp-contract=off",
+    "-Wno-pragma-once-outside-header",
+];
 
 /// A unit hiprtc compiles: one `.hip` file under `kernels/`, with every
 /// other carried file in scope as a header.

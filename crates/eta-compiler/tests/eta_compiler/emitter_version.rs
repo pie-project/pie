@@ -1,10 +1,11 @@
 use crate::msl_corpus::{corpus_bound, corpus_stages, extended_stages};
-use eta_compiler::codegen::cuda::CUDA_GENERATED_EMITTER_VERSION;
+use eta_compiler::codegen::cuda::{CUDA_GENERATED_EMITTER_VERSION, HIP_GENERATED_EMITTER_VERSION};
 use eta_compiler::codegen::metal::METAL_M1_EMITTER_VERSION;
 use eta_compiler::codegen::program::{Backend, emit_program};
 
 const PINNED: &[(&str, u16, u64)] = &[
-    ("cuda", 40, 0xa92f_4d4b_c783_4735),
+    ("cuda", 41, 0xcf9a_e9f7_e5ae_6a51),
+    ("hip", 1, 0x05ab_b3af_344c_17bb),
     ("metal", 54, 0x8ee1_2aad_36d1_edd4),
 ];
 
@@ -30,6 +31,7 @@ fn fingerprint(backend: Backend) -> u64 {
 fn backend_of(name: &str) -> Backend {
     match name {
         "cuda" => Backend::Cuda,
+        "hip" => Backend::Hip,
         "metal" => Backend::Metal,
         other => panic!("no backend named `{other}`"),
     }
@@ -45,6 +47,7 @@ fn the_pinned_versions_are_the_compiled_ones() {
     for (name, version, _) in PINNED {
         let constant = match backend_of(name) {
             Backend::Cuda => CUDA_GENERATED_EMITTER_VERSION,
+            Backend::Hip => HIP_GENERATED_EMITTER_VERSION,
             Backend::Metal => METAL_M1_EMITTER_VERSION,
         };
         assert_eq!(

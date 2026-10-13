@@ -63,6 +63,7 @@ pub struct Tuned {
 /// `req.check` names, or the smallest.
 #[cfg(any(
     feature = "cuda",
+    feature = "rocm",
     feature = "vulkan",
     all(feature = "metal", target_vendor = "apple")
 ))]
@@ -101,6 +102,7 @@ fn pick_models(
 /// deployment), smallest file first.
 #[cfg(any(
     feature = "cuda",
+    feature = "rocm",
     feature = "vulkan",
     all(feature = "metal", target_vendor = "apple")
 ))]
@@ -135,6 +137,7 @@ fn artifacts(store: &Path, backend: &str) -> Vec<(std::path::PathBuf, String)> {
 /// the same field names.
 #[cfg(any(
     feature = "cuda",
+    feature = "rocm",
     feature = "vulkan",
     all(feature = "metal", target_vendor = "apple")
 ))]
@@ -176,6 +179,13 @@ tune_grid!(tune_vulkan, engine_vulkan, "vulkan");
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 tune_grid!(tune_metal, engine_metal, "metal");
 
+#[cfg(feature = "rocm")]
+fn tune_rocm(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
+    let models = pick_models("rocm", req)?;
+    let out = engine_rocm::tune::run(Some(req.profiles), &models, say)?;
+    Ok(tuned!(out, wrong: Vec::new()))
+}
+
 #[cfg(feature = "cuda")]
 fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
     let models = pick_models("cuda", req)?;
@@ -197,6 +207,15 @@ pub fn backends() -> Vec<Backend> {
         probe: || engine_cuda::chip::probe(0),
         resolve: engine_cuda::chip::resolve,
         tune: Some(tune_cuda),
+    });
+    #[cfg(feature = "rocm")]
+    out.push(Backend {
+        name: "rocm",
+        registry: engine_rocm::chip::registry,
+        shelf: &engine_rocm::chip::SHELF,
+        probe: || engine_rocm::chip::probe(0),
+        resolve: engine_rocm::chip::resolve,
+        tune: Some(tune_rocm),
     });
     #[cfg(feature = "vulkan")]
     out.push(Backend {

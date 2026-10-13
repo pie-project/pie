@@ -46,7 +46,11 @@ pub(crate) fn resolve(root: &Root, instantiation: &str) -> Result<&'static Resol
         call: "hipGetDeviceProperties",
         code: -1,
     })?;
-    let key = format!("{}/rtc{}", root.key(instantiation, arch), hiprtc::version()?);
+    let key = format!(
+        "{}/rtc{}",
+        root.key(instantiation, arch),
+        hiprtc::version()?
+    );
     slot(&format!("hip:{ordinal}|{key}"))
         .get_or_init(|| load(root, instantiation, &key, arch))
         .as_ref()
@@ -147,7 +151,8 @@ fn entry_by_name(
     let api = api("hipModuleGetFunction")?;
     let mut function: sys::Function = std::ptr::null_mut();
 
-    let code = unsafe { (api.hip.hipModuleGetFunction)(&raw mut function, module, c_name.as_ptr()) };
+    let code =
+        unsafe { (api.hip.hipModuleGetFunction)(&raw mut function, module, c_name.as_ptr()) };
     match code {
         sys::HIP_SUCCESS => Ok(function),
         NOT_FOUND => Err(Fault::Compile {

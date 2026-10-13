@@ -932,14 +932,20 @@ fn stamp_block_masks(req: &mut crate::engine::FireRequest) {
     }
 }
 
+/// `device_rows`, when given, are the rows each lane carries on the device:
+/// a pooled pass stages no host tokens, and its words still state its rows,
+/// so a single-token lane takes the decode branch.
 fn stamp_lane_words(
     req: &mut crate::engine::FireRequest,
     fire_wide_mask: bool,
     carries_media: bool,
+    device_rows: Option<&[u32]>,
 ) {
     let model = crate::model::model();
-    for lane in &mut req.lanes {
-        let rows = u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX);
+    for (at, lane) in req.lanes.iter_mut().enumerate() {
+        let rows = device_rows
+            .and_then(|rows| rows.get(at).copied())
+            .unwrap_or_else(|| u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX));
         lane.word = model.word(
             rows,
             lane.mask.is_some() || fire_wide_mask,
@@ -1439,7 +1445,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             }
         }
         stamp_block_masks(&mut req);
-        stamp_lane_words(&mut req, fire_wide_mask, carries_media);
+        stamp_lane_words(&mut req, fire_wide_mask, carries_media, None);
         if !matched.is_empty() {
             let lane_rows: Vec<u32> = req
                 .lanes
@@ -2727,7 +2733,13 @@ async fn fire_device_geometry<C: FireContext>(
             lane.captures_scores = captures;
         }
     }
-    stamp_lane_words(&mut req, fire_wide_mask, false);
+    // A pooled split narrow enough to stage no host rows still knows each
+    // lane's rows; its words carry them.
+    let device_rows: Option<Vec<u32>> = devgeo_split
+        .as_ref()
+        .filter(|_| !wide)
+        .map(|split| split.windows(2).map(|lane| lane[1] - lane[0]).collect());
+    stamp_lane_words(&mut req, fire_wide_mask, false, device_rows.as_deref());
     if let Err(refusal) = seat_lane_slots(&mut req, &stores, ws.id).await {
         reclaim_pending_device_grant(ctx, &fwd);
         record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);

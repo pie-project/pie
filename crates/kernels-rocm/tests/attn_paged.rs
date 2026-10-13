@@ -30,8 +30,15 @@ struct Cache {
 }
 
 fn cache(gpu: &Gpu, c: &Case, kv_lens: &[u32], seed: u64) -> Cache {
-    let (h, d, ps) = (c.kv_heads as usize, c.head_dim as usize, c.page_size as usize);
-    let pages_of: Vec<usize> = kv_lens.iter().map(|&n| (n as usize).div_ceil(ps).max(1)).collect();
+    let (h, d, ps) = (
+        c.kv_heads as usize,
+        c.head_dim as usize,
+        c.page_size as usize,
+    );
+    let pages_of: Vec<usize> = kv_lens
+        .iter()
+        .map(|&n| (n as usize).div_ceil(ps).max(1))
+        .collect();
     let total_pages: usize = pages_of.iter().sum::<usize>() + 3;
     let order: Vec<i32> = (0..total_pages as i32).rev().collect();
     let mut page_indptr = vec![0i32];
@@ -44,21 +51,35 @@ fn cache(gpu: &Gpu, c: &Case, kv_lens: &[u32], seed: u64) -> Cache {
         }
         page_indptr.push(page_indices.len() as i32);
     }
-    let last: Vec<i32> = kv_lens.iter().zip(&pages_of).map(|(&n, &p)| (n as usize - (p - 1) * ps) as i32).collect();
+    let last: Vec<i32> = kv_lens
+        .iter()
+        .zip(&pages_of)
+        .map(|(&n, &p)| (n as usize - (p - 1) * ps) as i32)
+        .collect();
 
     let mut kp = vec![0f32; total_pages * ps * h * d];
     let mut vp = vec![0f32; total_pages * ps * h * d];
     let mut keys = Vec::new();
     let mut vals = Vec::new();
     for (r, &n) in kv_lens.iter().enumerate() {
-        let k: Vec<f32> = values(n as usize * h * d, seed + r as u64, 1.0).into_iter().map(round_bf16).collect();
-        let v: Vec<f32> = values(n as usize * h * d, seed + 100 + r as u64, 1.0).into_iter().map(round_bf16).collect();
+        let k: Vec<f32> = values(n as usize * h * d, seed + r as u64, 1.0)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let v: Vec<f32> = values(n as usize * h * d, seed + 100 + r as u64, 1.0)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
         for t in 0..n as usize {
             let page = page_indices[page_indptr[r] as usize + t / ps] as usize;
             let slot = t % ps;
             for hh in 0..h {
                 for j in 0..d {
-                    let at = if c.hnd { ((page * h + hh) * ps + slot) * d + j } else { ((page * ps + slot) * h + hh) * d + j };
+                    let at = if c.hnd {
+                        ((page * h + hh) * ps + slot) * d + j
+                    } else {
+                        ((page * ps + slot) * h + hh) * d + j
+                    };
                     kp[at] = k[(t * h + hh) * d + j];
                     vp[at] = v[(t * h + hh) * d + j];
                 }
@@ -91,13 +112,27 @@ fn cache(gpu: &Gpu, c: &Case, kv_lens: &[u32], seed: u64) -> Cache {
         max_pages_per_request: *pages_of.iter().max().unwrap() as i32,
         pages_in_batch: page_indices.len() as i32,
     };
-    Cache { pool, keys, vals, page_indptr }
+    Cache {
+        pool,
+        keys,
+        vals,
+        page_indptr,
+    }
 }
 
 /// Row `token` of a request with `qo_len` queries over `kv` keys: causal,
 /// optionally windowed (keys at or after the query's position − window + 1).
 #[allow(clippy::too_many_arguments)]
-fn reference_row(c: &Case, q: &[f32], keys: &[f32], vals: &[f32], kv: usize, qo_len: usize, token: usize, window: Option<u32>) -> (Vec<f32>, Vec<f32>) {
+fn reference_row(
+    c: &Case,
+    q: &[f32],
+    keys: &[f32],
+    vals: &[f32],
+    kv: usize,
+    qo_len: usize,
+    token: usize,
+    window: Option<u32>,
+) -> (Vec<f32>, Vec<f32>) {
     let (hq, hk, d) = (c.q_heads as usize, c.kv_heads as usize, c.head_dim as usize);
     let g = hq / hk;
     let scale = 1.0 / (d as f64).sqrt();
@@ -108,13 +143,21 @@ fn reference_row(c: &Case, q: &[f32], keys: &[f32], vals: &[f32], kv: usize, qo_
     for head in 0..hq {
         let kh = head / g;
         let s: Vec<f64> = (lo..=pos)
-            .map(|t| (0..d).map(|j| f64::from(q[head * d + j]) * f64::from(keys[(t * hk + kh) * d + j])).sum::<f64>() * scale)
+            .map(|t| {
+                (0..d)
+                    .map(|j| f64::from(q[head * d + j]) * f64::from(keys[(t * hk + kh) * d + j]))
+                    .sum::<f64>()
+                    * scale
+            })
             .collect();
         let m = s.iter().cloned().fold(f64::MIN, f64::max);
         let e: Vec<f64> = s.iter().map(|x| (x - m).exp()).collect();
         let z: f64 = e.iter().sum();
         for j in 0..d {
-            let acc: f64 = (lo..=pos).zip(&e).map(|(t, w)| w * f64::from(vals[(t * hk + kh) * d + j])).sum();
+            let acc: f64 = (lo..=pos)
+                .zip(&e)
+                .map(|(t, w)| w * f64::from(vals[(t * hk + kh) * d + j]))
+                .sum();
             out[head * d + j] = (acc / z) as f32;
         }
         lse[head] = ((m + z.ln()) * std::f64::consts::LOG2_E) as f32;
@@ -126,7 +169,12 @@ fn workspace(gpu: &Gpu) -> plan::Workspace {
     const BYTES: usize = 32 << 20;
     let int = gpu.zeros(1, (BYTES / 4) as u32, Dtype::F32);
     let float = gpu.zeros(1, (BYTES / 4) as u32, Dtype::F32);
-    plan::Workspace { int_ptr: int.ptr, int_bytes: BYTES, float_ptr: float.ptr, float_bytes: BYTES }
+    plan::Workspace {
+        int_ptr: int.ptr,
+        int_bytes: BYTES,
+        float_ptr: float.ptr,
+        float_bytes: BYTES,
+    }
 }
 
 fn close(what: &str, have: &[f32], want: &[f32], tol: f32) {
@@ -140,27 +188,89 @@ fn run_decode(gpu: &Gpu, c: &Case, kv_lens: &[u32], window: Option<u32>, max_gri
     let device = plan::Device::probe(&ctx).unwrap();
     let n = kv_lens.len() as u32;
     let cache = cache(gpu, c, kv_lens, 7);
-    let qv: Vec<f32> = values((n * c.q_heads * c.head_dim) as usize, 3, 1.0).into_iter().map(round_bf16).collect();
+    let qv: Vec<f32> = values((n * c.q_heads * c.head_dim) as usize, 3, 1.0)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
     let q = RaggedTensor {
         data: gpu.tensor(&qv, n, c.q_heads * c.head_dim, Dtype::Bf16),
         indptr: gpu.column(&(0..=n as i32).collect::<Vec<_>>()),
     };
-    let shape = plan::Shape { num_requests: n, lane_offset: 0, num_q_heads: c.q_heads, num_kv_heads: c.kv_heads, head_dim: c.head_dim, page_size: c.page_size, hnd_layout: c.hnd };
-    let live = plan::Live { requests: n, lane_offset: 0, row_offset: 0, rows: n };
+    let shape = plan::Shape {
+        num_requests: n,
+        lane_offset: 0,
+        num_q_heads: c.q_heads,
+        num_kv_heads: c.kv_heads,
+        head_dim: c.head_dim,
+        page_size: c.page_size,
+        hnd_layout: c.hnd,
+    };
+    let live = plan::Live {
+        requests: n,
+        lane_offset: 0,
+        row_offset: 0,
+        rows: n,
+    };
     let kv_len: Vec<i32> = kv_lens.iter().map(|&x| x as i32).collect();
-    let built = plan::plan_decode(&cache.page_indptr, &kv_len, shape, live, window, false, max_grid, plan::Toggles::default(), &device, workspace(gpu)).unwrap();
+    let built = plan::plan_decode(
+        &cache.page_indptr,
+        &kv_len,
+        shape,
+        live,
+        window,
+        false,
+        max_grid,
+        plan::Toggles::default(),
+        &device,
+        workspace(gpu),
+    )
+    .unwrap();
     built.stage(&ctx).unwrap();
     let mut o = gpu.zeros(n, c.q_heads * c.head_dim, Dtype::Bf16);
     let mut lse = gpu.zeros(n, c.q_heads, Dtype::F32);
-    attn::decode_lse(&ctx, q, &built, &cache.pool, window, c.head_dim, 0.0, &mut o, &mut lse).unwrap();
-    eprintln!("decode d{} hnd={} window={window:?} split={} items={}", c.head_dim, c.hnd, built.info.split_kv, built.info.padded_batch_size);
+    attn::decode_lse(
+        &ctx,
+        q,
+        &built,
+        &cache.pool,
+        window,
+        c.head_dim,
+        0.0,
+        &mut o,
+        &mut lse,
+    )
+    .unwrap();
+    eprintln!(
+        "decode d{} hnd={} window={window:?} split={} items={}",
+        c.head_dim, c.hnd, built.info.split_kv, built.info.padded_batch_size
+    );
     let (got, got_lse) = (gpu.read(&o), gpu.read(&lse));
     let row = (c.q_heads * c.head_dim) as usize;
     for r in 0..n as usize {
-        let (want, want_lse) = reference_row(c, &qv[r * row..(r + 1) * row], &cache.keys[r], &cache.vals[r], kv_lens[r] as usize, 1, 0, window);
-        let tag = format!("decode d{} g{} hnd={} split={} req {r}", c.head_dim, c.q_heads / c.kv_heads, c.hnd, built.info.split_kv);
+        let (want, want_lse) = reference_row(
+            c,
+            &qv[r * row..(r + 1) * row],
+            &cache.keys[r],
+            &cache.vals[r],
+            kv_lens[r] as usize,
+            1,
+            0,
+            window,
+        );
+        let tag = format!(
+            "decode d{} g{} hnd={} split={} req {r}",
+            c.head_dim,
+            c.q_heads / c.kv_heads,
+            c.hnd,
+            built.info.split_kv
+        );
         close(&tag, &got[r * row..(r + 1) * row], &want, 1.5e-2);
-        close(&format!("{tag} lse"), &got_lse[r * c.q_heads as usize..(r + 1) * c.q_heads as usize], &want_lse, 1e-3);
+        close(
+            &format!("{tag} lse"),
+            &got_lse[r * c.q_heads as usize..(r + 1) * c.q_heads as usize],
+            &want_lse,
+            1e-3,
+        );
     }
 }
 
@@ -171,20 +281,68 @@ fn run_prefill(gpu: &Gpu, c: &Case, qo_lens: &[u32], prefix: &[u32], stride: usi
     let kv_lens: Vec<u32> = qo_lens.iter().zip(prefix).map(|(q, p)| q + p).collect();
     let cache = cache(gpu, c, &kv_lens, 11);
     let total: u32 = qo_lens.iter().sum();
-    let qv: Vec<f32> = values((total * c.q_heads * c.head_dim) as usize, 5, 1.0).into_iter().map(round_bf16).collect();
+    let qv: Vec<f32> = values((total * c.q_heads * c.head_dim) as usize, 5, 1.0)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
     let mut qo_indptr = vec![0i32];
     for &l in qo_lens {
         qo_indptr.push(qo_indptr.last().unwrap() + l as i32);
     }
-    let q = RaggedTensor { data: gpu.tensor(&qv, total, c.q_heads * c.head_dim, Dtype::Bf16), indptr: gpu.column(&qo_indptr) };
-    let shape = plan::Shape { num_requests: n, lane_offset: 0, num_q_heads: c.q_heads, num_kv_heads: c.kv_heads, head_dim: c.head_dim, page_size: c.page_size, hnd_layout: c.hnd };
-    let live = plan::Live { requests: n, lane_offset: 0, row_offset: 0, rows: total };
+    let q = RaggedTensor {
+        data: gpu.tensor(&qv, total, c.q_heads * c.head_dim, Dtype::Bf16),
+        indptr: gpu.column(&qo_indptr),
+    };
+    let shape = plan::Shape {
+        num_requests: n,
+        lane_offset: 0,
+        num_q_heads: c.q_heads,
+        num_kv_heads: c.kv_heads,
+        head_dim: c.head_dim,
+        page_size: c.page_size,
+        hnd_layout: c.hnd,
+    };
+    let live = plan::Live {
+        requests: n,
+        lane_offset: 0,
+        row_offset: 0,
+        rows: total,
+    };
     let kv_len: Vec<i32> = kv_lens.iter().map(|&x| x as i32).collect();
-    let built = plan::plan_prefill(&qo_indptr, &cache.page_indptr, &kv_len, total, shape, live, None, true, false, None, &device, plan::Toggles::default(), workspace(gpu)).unwrap();
+    let built = plan::plan_prefill(
+        &qo_indptr,
+        &cache.page_indptr,
+        &kv_len,
+        total,
+        shape,
+        live,
+        None,
+        true,
+        false,
+        None,
+        &device,
+        plan::Toggles::default(),
+        workspace(gpu),
+    )
+    .unwrap();
     built.stage(&ctx).unwrap();
     let mut o = gpu.zeros(total, c.q_heads * c.head_dim, Dtype::Bf16);
-    attn::prefill(&ctx, q, &built, &cache.pool, None, c.head_dim, c.kv_heads, 0.0, &mut o).unwrap();
-    eprintln!("prefill d{} hnd={} split={} items={} tile={}", c.head_dim, c.hnd, built.info.split_kv, built.info.padded_batch_size, built.info.cta_tile_q);
+    attn::prefill(
+        &ctx,
+        q,
+        &built,
+        &cache.pool,
+        None,
+        c.head_dim,
+        c.kv_heads,
+        0.0,
+        &mut o,
+    )
+    .unwrap();
+    eprintln!(
+        "prefill d{} hnd={} split={} items={} tile={}",
+        c.head_dim, c.hnd, built.info.split_kv, built.info.padded_batch_size, built.info.cta_tile_q
+    );
     let got = gpu.read(&o);
     let row = (c.q_heads * c.head_dim) as usize;
     for r in 0..n as usize {
@@ -192,8 +350,23 @@ fn run_prefill(gpu: &Gpu, c: &Case, qo_lens: &[u32], prefix: &[u32], stride: usi
         let last = qo_lens[r] as usize - 1;
         for t in (0..qo_lens[r] as usize).filter(|t| t % stride == 0 || *t == last) {
             let at = qo_indptr[r] as usize + t;
-            let (want, _) = reference_row(c, &qv[at * row..(at + 1) * row], &cache.keys[r], &cache.vals[r], kv_lens[r] as usize, qo_lens[r] as usize, t, None);
-            let tag = format!("prefill d{} g{} hnd={} split={} req {r} token {t}", c.head_dim, c.q_heads / c.kv_heads, c.hnd, built.info.split_kv);
+            let (want, _) = reference_row(
+                c,
+                &qv[at * row..(at + 1) * row],
+                &cache.keys[r],
+                &cache.vals[r],
+                kv_lens[r] as usize,
+                qo_lens[r] as usize,
+                t,
+                None,
+            );
+            let tag = format!(
+                "prefill d{} g{} hnd={} split={} req {r} token {t}",
+                c.head_dim,
+                c.q_heads / c.kv_heads,
+                c.hnd,
+                built.info.split_kv
+            );
             close(&tag, &got[at * row..(at + 1) * row], &want, 1.5e-2);
         }
     }
@@ -202,8 +375,20 @@ fn run_prefill(gpu: &Gpu, c: &Case, qo_lens: &[u32], prefix: &[u32], stride: usi
 #[test]
 fn attn_paged() {
     let Some(gpu) = Gpu::open() else { return };
-    let qwen = Case { q_heads: 8, kv_heads: 2, head_dim: 256, page_size: 16, hnd: false };
-    let small = Case { q_heads: 4, kv_heads: 2, head_dim: 128, page_size: 32, hnd: true };
+    let qwen = Case {
+        q_heads: 8,
+        kv_heads: 2,
+        head_dim: 256,
+        page_size: 16,
+        hnd: false,
+    };
+    let small = Case {
+        q_heads: 4,
+        kv_heads: 2,
+        head_dim: 128,
+        page_size: 32,
+        hnd: true,
+    };
 
     for c in [&qwen, &small] {
         // A large grid: one item per request. A one-block grid: every

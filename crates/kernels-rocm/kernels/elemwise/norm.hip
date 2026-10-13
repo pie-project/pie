@@ -105,6 +105,55 @@ __global__ __launch_bounds__(BLOCK) void residual_add_rmsnorm(const T* __restric
     const T* xr = x + row;
     T* yr = y + row;
     const bool packed = hidden % 8 == 0 && aligned16(xr) && aligned16(yr);
+    // A row of at most PPT packs a thread stays in registers from the add to
+    // the scale: no store and reload of the stream between them. The sums
+    // walk the same packs in the same order as `norm_row`'s.
+    constexpr int PPT = 4;
+    if (packed && hidden / 8 <= PPT * BLOCK && aligned16(out + row) && (w == nullptr || aligned16(w))) {
+        __shared__ float smem[BLOCK / kWave];
+        const int packs = hidden / 8;
+        Pack8<T> b[PPT], wv[PPT];
+#pragma unroll
+        for (int p = 0; p < PPT; ++p) {
+            const int i = threadIdx.x + p * BLOCK;
+            if (i < packs) {
+                const Pack8<T> a = reinterpret_cast<const Pack8<T>*>(xr)[i];
+                b[p] = reinterpret_cast<const Pack8<T>*>(yr)[i];
+                if (w != nullptr) wv[p] = reinterpret_cast<const Pack8<T>*>(w)[i];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) b[p].v[j] = from_f32<T>(to_f32(b[p].v[j]) + to_f32(a.v[j]));
+            }
+        }
+        float local = 0.f;
+#pragma unroll
+        for (int p = 0; p < PPT; ++p) {
+            const int i = threadIdx.x + p * BLOCK;
+            if (i < packs) {
+                reinterpret_cast<Pack8<T>*>(yr)[i] = b[p];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float v = to_f32(b[p].v[j]);
+                    local += v * v;
+                }
+            }
+        }
+        const float inv = rsqrtf(block_sum(local, smem) / static_cast<float>(hidden) + eps);
+#pragma unroll
+        for (int p = 0; p < PPT; ++p) {
+            const int i = threadIdx.x + p * BLOCK;
+            if (i < packs) {
+                Pack8<T> q;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    float sc = w == nullptr ? 1.f : to_f32(wv[p].v[j]);
+                    if constexpr (PLUS_ONE) sc += 1.f;
+                    q.v[j] = from_f32<T>(to_f32(b[p].v[j]) * inv * sc);
+                }
+                reinterpret_cast<Pack8<T>*>(out + row)[i] = q;
+            }
+        }
+        return;
+    }
     if (packed) {
         for (int i = threadIdx.x; i < hidden / 8; i += BLOCK) {
             const Pack8<T> a = reinterpret_cast<const Pack8<T>*>(xr)[i];

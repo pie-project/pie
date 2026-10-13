@@ -6,6 +6,8 @@ pub fn default_config_content() -> Result<String> {
     let engine_block: Option<&str> = match flavor {
         #[cfg(feature = "cuda")]
         Some(flavor::Flavor::Cuda) => Some(CUDA_ENGINE_BLOCK),
+        #[cfg(feature = "rocm")]
+        Some(flavor::Flavor::Rocm) => Some(ROCM_ENGINE_BLOCK),
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         Some(flavor::Flavor::Metal) => Some(METAL_ENGINE_BLOCK),
         #[cfg(feature = "vulkan")]
@@ -21,7 +23,7 @@ pub fn default_config_content() -> Result<String> {
         bail!(
             "this pie binary carries no engine, so there is no `[engine]` \
              section to write and the config would not parse. Rebuild with \
-             `--features cuda`, `--features vulkan`, `--features wgpu`, `--features xla`, or, \
+             `--features cuda`, `--features rocm`, `--features vulkan`, `--features wgpu`, `--features xla`, or, \
              on Apple hardware, `--features metal`."
         );
     };
@@ -116,6 +118,21 @@ activation_dtype = "bfloat16"
 #                           # 4096. State it at what you serve: a decode body
 #                           # for n lanes is armed only when the pool holds
 #                           # n x max_model_len tokens
+"#;
+
+#[cfg(feature = "rocm")]
+const ROCM_ENGINE_BLOCK: &str = r#"
+[engine]
+# Which keys are valid here depends on `type`: the common ones below, plus
+# whatever the named engine accepts. A key it does not know is a parse error
+# naming the engine that rejected it.
+type = "rocm_native"
+device = ["rocm:0"]
+tensor_parallel_size = 1
+activation_dtype = "bfloat16"
+# kv_page_size    = 32      # omit: the engine derives one
+# max_state_slots = 256     # recurrent-state seats (hybrid models); omit for 256
+# max_model_len   = 4096    # the most tokens one sequence may hold; omit for 4096
 "#;
 
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
@@ -232,6 +249,8 @@ mod tests {
         let expected: Option<&str> = match flavor::default_flavor() {
             #[cfg(feature = "cuda")]
             Some(flavor::Flavor::Cuda) => Some("cuda_native"),
+            #[cfg(feature = "rocm")]
+            Some(flavor::Flavor::Rocm) => Some("rocm_native"),
             #[cfg(all(feature = "metal", target_vendor = "apple"))]
             Some(flavor::Flavor::Metal) => Some("metal"),
             #[cfg(feature = "vulkan")]

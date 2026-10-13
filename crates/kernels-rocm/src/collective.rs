@@ -239,9 +239,7 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
         let bytes = usize::try_from(y.elements().saturating_mul(y.dtype.bytes_ceil()))
             .map_err(|_| refuse(OP, "the gathered rectangle does not fit this address space"))?;
         let stage = ctx.scratch(OP, "all_gather_stage", bytes)?;
-        let code = unsafe {
-            (nccl.ncclAllGather)(send, stage, count, dtype, comm, ctx.stream())
-        };
+        let code = unsafe { (nccl.ncclAllGather)(send, stage, count, dtype, comm, ctx.stream()) };
         answered(OP, "ncclAllGather", code)?;
         crate::layout::gather_width_concat(ctx, stage as usize as u64, y, x.width, world)
     }

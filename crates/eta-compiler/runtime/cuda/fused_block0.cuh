@@ -539,9 +539,9 @@ __device__ __forceinline__ void ptir_parallel_pivot_cummass(
       }
       for (m1_u32 offset = 16u; offset > 0u; offset >>= 1) {
         const float other_value =
-            __shfl_down_sync(0xFFFFFFFFu, best_value, offset);
+            m1_chunk_down(best_value, offset);
         const m1_u32 other_index =
-            __shfl_down_sync(0xFFFFFFFFu, best_index, offset);
+            m1_chunk_down(best_index, offset);
         if (other_index != none &&
             (best_index == none ||
              m1_sort_better(
@@ -763,7 +763,6 @@ __device__ __forceinline__ void ptir_parallel_reduce_f32(
   const m1_u32 lane = threadIdx.x & 31u;
   const m1_u32 warp = threadIdx.x >> 5u;
   const m1_u32 warps = blockDim.x >> 5u;
-  const unsigned mask = 0xffffffffu;
   for (m1_u32 row = 0; row < input_desc.rows; ++row) {
     const m1_u32 base = row * input_desc.last;
     if (input_desc.last == 0u) {
@@ -786,7 +785,7 @@ __device__ __forceinline__ void ptir_parallel_reduce_f32(
       float value =
           index < input_desc.last ? values[base + index] : identity;
       for (m1_u32 offset = 16u; offset > 0u; offset >>= 1u) {
-        const float other = __shfl_down_sync(mask, value, offset);
+        const float other = m1_chunk_down(value, offset);
         if (lane < offset) {
           value =
               tag == 0x30u
@@ -815,7 +814,7 @@ __device__ __forceinline__ void ptir_parallel_reduce_f32(
         float value =
             index < count ? reduction_input[index] : identity;
         for (m1_u32 offset = 16u; offset > 0u; offset >>= 1u) {
-          const float other = __shfl_down_sync(mask, value, offset);
+          const float other = m1_chunk_down(value, offset);
           if (lane < offset) {
             value =
                 tag == 0x30u
@@ -849,7 +848,6 @@ __device__ __forceinline__ void ptir_parallel_argmax(
   const m1_u32 lane = threadIdx.x & 31u;
   const m1_u32 warp = threadIdx.x >> 5u;
   const m1_u32 warps = blockDim.x >> 5u;
-  const unsigned mask = 0xffffffffu;
   const m1_u32 first_chunks = (input_desc.last + 31u) / 32u;
   if (input_desc.dtype == 0u) {
     M1ArgmaxCandidate* work_a =
@@ -877,9 +875,9 @@ __device__ __forceinline__ void ptir_parallel_argmax(
                 : M1ArgmaxCandidate{m1_neg_inf(), 0u, 0u, 0u};
         for (m1_u32 offset = 16u; offset > 0u; offset >>= 1u) {
           M1ArgmaxCandidate other{
-              __shfl_down_sync(mask, candidate.value, offset),
-              __shfl_down_sync(mask, candidate.index, offset),
-              __shfl_down_sync(mask, candidate.have, offset),
+              m1_chunk_down(candidate.value, offset),
+              m1_chunk_down(candidate.index, offset),
+              m1_chunk_down(candidate.have, offset),
               0u};
           if (lane < offset)
             candidate = m1_argmax_combine(candidate, other);
@@ -902,9 +900,9 @@ __device__ __forceinline__ void ptir_parallel_argmax(
                   : M1ArgmaxCandidate{m1_neg_inf(), 0u, 0u, 0u};
           for (m1_u32 offset = 16u; offset > 0u; offset >>= 1u) {
             M1ArgmaxCandidate other{
-                __shfl_down_sync(mask, candidate.value, offset),
-                __shfl_down_sync(mask, candidate.index, offset),
-                __shfl_down_sync(mask, candidate.have, offset),
+                m1_chunk_down(candidate.value, offset),
+                m1_chunk_down(candidate.index, offset),
+                m1_chunk_down(candidate.have, offset),
                 0u};
             if (lane < offset)
               candidate = m1_argmax_combine(candidate, other);
@@ -947,9 +945,9 @@ __device__ __forceinline__ void ptir_parallel_argmax(
               : M1IntArgmaxCandidate{0ll, 0u, 0u};
       for (m1_u32 offset = 16u; offset > 0u; offset >>= 1u) {
         M1IntArgmaxCandidate other{
-            __shfl_down_sync(mask, candidate.value, offset),
-            __shfl_down_sync(mask, candidate.index, offset),
-            __shfl_down_sync(mask, candidate.have, offset)};
+            m1_chunk_down(candidate.value, offset),
+            m1_chunk_down(candidate.index, offset),
+            m1_chunk_down(candidate.have, offset)};
         if (lane < offset)
           candidate = m1_int_argmax_combine(candidate, other);
       }
@@ -971,9 +969,9 @@ __device__ __forceinline__ void ptir_parallel_argmax(
                 : M1IntArgmaxCandidate{0ll, 0u, 0u};
         for (m1_u32 offset = 16u; offset > 0u; offset >>= 1u) {
           M1IntArgmaxCandidate other{
-              __shfl_down_sync(mask, candidate.value, offset),
-              __shfl_down_sync(mask, candidate.index, offset),
-              __shfl_down_sync(mask, candidate.have, offset)};
+              m1_chunk_down(candidate.value, offset),
+              m1_chunk_down(candidate.index, offset),
+              m1_chunk_down(candidate.have, offset)};
           if (lane < offset)
             candidate = m1_int_argmax_combine(candidate, other);
         }
@@ -993,12 +991,11 @@ __device__ __forceinline__ void ptir_parallel_argmax(
 
 __device__ __forceinline__ M1ArgmaxCandidate m1_argmax_warp_reduce(
     M1ArgmaxCandidate candidate, m1_u32 lane) {
-  const unsigned mask = 0xffffffffu;
   for (m1_u32 offset = 16u; offset > 0u; offset >>= 1u) {
     M1ArgmaxCandidate other{
-        __shfl_down_sync(mask, candidate.value, offset),
-        __shfl_down_sync(mask, candidate.index, offset),
-        __shfl_down_sync(mask, candidate.have, offset),
+        m1_chunk_down(candidate.value, offset),
+        m1_chunk_down(candidate.index, offset),
+        m1_chunk_down(candidate.have, offset),
         0u};
     if (lane < offset)
       candidate = m1_argmax_combine(candidate, other);
@@ -1008,12 +1005,11 @@ __device__ __forceinline__ M1ArgmaxCandidate m1_argmax_warp_reduce(
 
 __device__ __forceinline__ M1IntArgmaxCandidate m1_int_argmax_warp_reduce(
     M1IntArgmaxCandidate candidate, m1_u32 lane) {
-  const unsigned mask = 0xffffffffu;
   for (m1_u32 offset = 16u; offset > 0u; offset >>= 1u) {
     M1IntArgmaxCandidate other{
-        __shfl_down_sync(mask, candidate.value, offset),
-        __shfl_down_sync(mask, candidate.index, offset),
-        __shfl_down_sync(mask, candidate.have, offset)};
+        m1_chunk_down(candidate.value, offset),
+        m1_chunk_down(candidate.index, offset),
+        m1_chunk_down(candidate.have, offset)};
     if (lane < offset)
       candidate = m1_int_argmax_combine(candidate, other);
   }

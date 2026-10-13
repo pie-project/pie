@@ -926,7 +926,7 @@ pub(super) fn emit_stream(
                 );
                 let _ = writeln!(
                     epilogue,
-                    "        const float other = __shfl_down_sync(0xffffffffu, v, offset);"
+                    "        const float other = m1_chunk_down(v, offset);"
                 );
                 let _ = writeln!(epilogue, "        v = {};", combine("v", "other"));
                 let _ = writeln!(epilogue, "      }}");

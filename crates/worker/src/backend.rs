@@ -5,12 +5,12 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 use runtime::engine::backend::{DeviceBoot, Diagnostics, Knobs, Transport, World, ordinal_of};
 
 use crate::backend::flavor::Flavor;
 use crate::config;
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
 use crate::config::CudaNativeEngineOptions;
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 use crate::config::MetalEngineOptions;
@@ -23,7 +23,7 @@ use crate::config::XlaEngineOptions;
 
 #[derive(Clone)]
 pub enum EngineOptions {
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     CudaNative(CudaNativeEngineOptions),
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     Metal(MetalEngineOptions),
@@ -38,8 +38,8 @@ pub enum EngineOptions {
 impl EngineOptions {
     pub fn flavor(&self) -> Flavor {
         match self {
-            #[cfg(feature = "cuda")]
-            EngineOptions::CudaNative(_) => Flavor::Cuda,
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
+            EngineOptions::CudaNative(_) => Flavor::NATIVE,
             #[cfg(all(feature = "metal", target_vendor = "apple"))]
             EngineOptions::Metal(_) => Flavor::Metal,
             #[cfg(feature = "vulkan")]
@@ -50,6 +50,7 @@ impl EngineOptions {
             EngineOptions::Xla(_) => Flavor::Xla,
             #[cfg(not(any(
                 feature = "cuda",
+                feature = "rocm",
                 feature = "vulkan",
                 feature = "wgpu",
                 feature = "xla",
@@ -84,7 +85,7 @@ fn metal_geometry_is_stated(opts: &MetalEngineOptions) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
 fn cuda_budgets(
     opts: &CudaNativeEngineOptions,
     adapter_seats: u32,
@@ -112,7 +113,7 @@ fn cuda_budgets(
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn device_boot(
     opts: &CudaNativeEngineOptions,
     home: &Path,
@@ -143,7 +144,39 @@ fn device_boot(
     })
 }
 
+/// The platform the native GPU engine traces its model for.
 #[cfg(feature = "cuda")]
+const NATIVE_PLATFORM: poem_ir::Platform = poem_ir::Platform::Cuda;
+#[cfg(feature = "rocm")]
+const NATIVE_PLATFORM: poem_ir::Platform = poem_ir::Platform::Rocm;
+
+/// The native GPU engine on one device, CUDA or ROCm as this build carries.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+fn open_native(boot: DeviceBoot) -> Result<runtime::engine::EngineBox> {
+    #[cfg(feature = "cuda")]
+    {
+        runtime::engine::backend::open::cuda(boot)
+    }
+    #[cfg(feature = "rocm")]
+    {
+        runtime::engine::backend::open::rocm(boot)
+    }
+}
+
+/// The native GPU engine over a tensor-parallel group of devices.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+fn open_native_group(boots: Vec<DeviceBoot>) -> Result<(runtime::engine::EngineBox, usize)> {
+    #[cfg(feature = "cuda")]
+    {
+        runtime::engine::backend::open::cuda_group(boots)
+    }
+    #[cfg(feature = "rocm")]
+    {
+        runtime::engine::backend::open::rocm_group(boots)
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn dump_device_boot(home: &Path, boot: &DeviceBoot, group_id: usize, rank: Option<usize>) {
     let dir = home.join("logs");
     let name = match rank {
@@ -238,7 +271,8 @@ fn validate_snapshot_dir(snapshot_dir: &Path) -> Result<()> {
     ))
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn create_engine_backend_group(
     rank_options: &[EngineOptions],
     snapshot_dir: &Path,
@@ -278,7 +312,7 @@ pub(crate) fn create_engine_backend_group(
     }
 
     let ranks = boots.len();
-    let (mut backend, opened) = runtime::engine::backend::open::cuda_group(boots)?;
+    let (mut backend, opened) = open_native_group(boots)?;
     if opened != ranks {
         return Err(anyhow!(
             "cuda group opened {opened} ranks for {ranks} rank configs"
@@ -301,7 +335,7 @@ pub(crate) fn create_engine_backend_group(
         cache_dir,
         cuda_budgets(opts, adapters.seats(), patch_ceilings, voxel_ceilings),
         residency,
-        poem_ir::Platform::Cuda,
+        NATIVE_PLATFORM,
         component,
         frames_in_flight,
         overrides,
@@ -318,7 +352,7 @@ pub(crate) fn create_engine_backend_group(
 }
 
 #[cfg_attr(
-    not(feature = "cuda"),
+    not(any(feature = "cuda", feature = "rocm")),
     allow(
         unused_variables,
         unreachable_code,
@@ -353,23 +387,24 @@ pub(crate) fn create_engine_backend(
     ) = match options {
         #[cfg(not(any(
             feature = "cuda",
+            feature = "rocm",
             feature = "vulkan",
             feature = "wgpu",
             feature = "xla",
             all(feature = "metal", target_vendor = "apple")
         )))]
         _ => unreachable!("`EngineOptions` has no variants in this build"),
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
         EngineOptions::CudaNative(opts) => {
             let boot = device_boot(opts, home, cache_dir, adapter_dir)?;
             if opts.verbose {
                 dump_device_boot(home, &boot, group_id, None);
             }
-            let backend = runtime::engine::backend::open::cuda(boot)?;
+            let backend = open_native(boot)?;
             (
                 backend,
                 cuda_budgets(opts, adapters.seats(), patch_ceilings, voxel_ceilings),
-                poem_ir::Platform::Cuda,
+                NATIVE_PLATFORM,
             )
         }
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
@@ -550,7 +585,7 @@ pub(crate) fn create_engine_backend(
         }
     };
     #[cfg_attr(
-        not(feature = "cuda"),
+        not(any(feature = "cuda", feature = "rocm")),
         allow(
             unreachable_code,
             reason = "`EngineOptions` has no variants in this build"
@@ -684,7 +719,7 @@ pub fn calculate_topology(world_size: usize, tp_degree: usize) -> Result<Vec<Vec
 }
 
 #[cfg_attr(
-    not(feature = "cuda"),
+    not(any(feature = "cuda", feature = "rocm")),
     allow(
         unused_variables,
         unreachable_code,
@@ -694,8 +729,8 @@ pub fn calculate_topology(world_size: usize, tp_degree: usize) -> Result<Vec<Vec
 )]
 pub(crate) fn build_options(m: &config::ModelConfig, flavor: Flavor) -> Result<EngineOptions> {
     match flavor {
-        #[cfg(feature = "cuda")]
-        Flavor::Cuda => {
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        Flavor::NATIVE => {
             let mut c: CudaNativeEngineOptions = m
                 .engine
                 .options

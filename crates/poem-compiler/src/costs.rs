@@ -36,10 +36,27 @@ micros! {
 pub struct SideStreams(pub u32);
 
 /// Register the cost decisions, with this backend's own side-stream default.
+/// Whether a backend's graphs have a conditional node for `If` / `Switch`
+/// regions to lower onto.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Conditionals {
+    Native,
+    /// None (HIP graphs): a conditional is priced past any launch it could
+    /// skip, so every region lowers to `AlwaysLaunch`.
+    Absent,
+}
+
 pub fn register(registry: &mut Registry, side_streams: u32) {
+    register_for(registry, side_streams, Conditionals::Native);
+}
+
+pub fn register_for(registry: &mut Registry, side_streams: u32, conditionals: Conditionals) {
+    registry.add::<LaunchUs>();
+    match conditionals {
+        Conditionals::Native => registry.add::<CondFixedUs>(),
+        Conditionals::Absent => registry.add_defaulting::<CondFixedUs>("1000000"),
+    };
     registry
-        .add::<LaunchUs>()
-        .add::<CondFixedUs>()
         .add::<CondPerArmUs>()
         .add::<FatRegionUs>()
         .add::<ForkFloorUs>()

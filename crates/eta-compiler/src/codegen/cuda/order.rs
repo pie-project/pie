@@ -9,7 +9,7 @@ use crate::codegen::wellformed::{ops_valid, region_ranges_valid, value_types_val
 use crate::plan::{CompiledStage, LANE_TABLE_ABI_VERSION, LibraryOp, Region, RegionKind};
 
 use super::fused::{PREAMBLE, PROLOGUE, SIGNATURE};
-use super::runtime::singleton_runtime_source;
+use super::runtime::{Dialect, runtime_source};
 use super::singleton::valid_identifier;
 
 const ORDER_WORKER_CAP: u32 = 256;
@@ -273,7 +273,7 @@ const BODY_SELECT: &str = r#"
             if (at < kSelectCap) sel_cand[at] = ((m1_u64)key << 32) | (m1_u64)i;
           }
           const bool equal = valid && key == threshold;
-          const unsigned ballot = __ballot_sync(0xffffffffu, equal);
+          const unsigned ballot = m1_chunk_ballot(equal);
           if (sel_lane == 0u) sel_warp[sel_warp_id] = __popc(ballot);
           __syncthreads();
           if (threadIdx.x == 0u) {
@@ -365,6 +365,15 @@ pub fn emit_order_region(
     stage: &CompiledStage,
     region: &Region,
 ) -> Result<String, EmitError> {
+    emit_order_region_in(Dialect::Cuda, entry_name, stage, region)
+}
+
+pub fn emit_order_region_in(
+    dialect: Dialect,
+    entry_name: &str,
+    stage: &CompiledStage,
+    region: &Region,
+) -> Result<String, EmitError> {
     if !valid_identifier(entry_name) {
         return Err(EmitError::EntryNameNotCIdentifier(EmitterKind::CudaOrder));
     }
@@ -388,7 +397,7 @@ pub fn emit_order_region(
         order.imm
     };
 
-    let mut source = singleton_runtime_source();
+    let mut source = runtime_source(dialect);
     source.push_str(PROLOGUE);
     source.push_str(entry_name);
     source.push_str(SIGNATURE);

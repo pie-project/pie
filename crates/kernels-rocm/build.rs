@@ -14,7 +14,11 @@ fn walk(dir: &Path, base: &Path, out: &mut Vec<PathBuf>) {
         if path.is_dir() {
             walk(&path, base, out);
         } else {
-            out.push(path.strip_prefix(base).expect("walked from base").to_path_buf());
+            out.push(
+                path.strip_prefix(base)
+                    .expect("walked from base")
+                    .to_path_buf(),
+            );
         }
     }
 }

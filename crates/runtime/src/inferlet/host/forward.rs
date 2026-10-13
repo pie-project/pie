@@ -1691,10 +1691,16 @@ impl ProcessCtx {
                     let taint = prog.geometry_taint();
                     let devgeo = match devgeo {
                 Some(devgeo) => Some(devgeo),
+                // A program the decode envelope covers runs ahead: its pages
+                // and write slots are the host's, so the next fire is staged
+                // while this one runs. Pooled device geometry reads every
+                // descriptor port back from the device before it stages, so
+                // it is only the pass for programs the envelope declines.
                 None if devgeo_capable
                     && !taint.host_derivable()
                     && readable.start == 0
-                    && readable.end.is_none() =>
+                    && readable.end.is_none()
+                    && !envelope_runs_ahead(&prog.bound.container, device_port_mask) =>
                 {
                     crate::pipeline::fire::lease::detect_pooled_device_geometry(
                         &prog.bound.container,
@@ -2523,6 +2529,21 @@ impl pie::inferlet::forward_diffusion::HostForwardPass for ProcessCtx {
             Mode::Denoise => CanvasMode::Denoise,
         };
         self.core_canvas(this, mode).await
+    }
+}
+
+/// Whether the decode envelope classifies `container` and the engine reads
+/// every port that envelope requires from the device.
+fn envelope_runs_ahead(
+    container: &eta_ir::container::TraceContainer,
+    device_port_mask: PortMask,
+) -> bool {
+    let mut why = String::new();
+    match crate::pipeline::fire::geometry::classify_decode_envelope_why(container, &mut why) {
+        Ok(Some(envelope)) => device_port_mask.covers(
+            crate::pipeline::fire::geometry::envelope_required_ports(&envelope),
+        ),
+        Ok(None) | Err(_) => false,
     }
 }
 

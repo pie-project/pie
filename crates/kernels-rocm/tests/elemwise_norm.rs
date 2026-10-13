@@ -32,7 +32,10 @@ fn elemwise_norm() {
     for (rows_n, width) in [(5u32, 1024u32), (3, 1000)] {
         let n = (rows_n * width) as usize;
         let xs: Vec<f32> = values(n, 1, 2.0).into_iter().map(round_bf16).collect();
-        let ws: Vec<f32> = values(width as usize, 2, 0.5).into_iter().map(round_bf16).collect();
+        let ws: Vec<f32> = values(width as usize, 2, 0.5)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
         let x = gpu.tensor(&xs, rows_n, width, Dtype::Bf16);
         let w = gpu.tensor(&ws, 1, width, Dtype::Bf16);
 
@@ -52,7 +55,12 @@ fn elemwise_norm() {
         let mut out = gpu.zeros(rows_n, width, Dtype::Bf16);
         norm::residual_add_rmsnorm(&ctx, x, &mut stream, w, true, 1e-6, &mut out).unwrap();
         let summed: Vec<f32> = ys.iter().zip(&xs).map(|(a, b)| round_bf16(a + b)).collect();
-        close_bf16("residual_add_rmsnorm stream", &gpu.read(&stream), &summed, 0.0);
+        close_bf16(
+            "residual_add_rmsnorm stream",
+            &gpu.read(&stream),
+            &summed,
+            0.0,
+        );
         let want = rows(&summed, width as usize, |r| rms(r, Some(&ws), true, 1e-6));
         close_bf16("residual_add_rmsnorm out", &gpu.read(&out), &want, 1.0);
 
@@ -63,8 +71,14 @@ fn elemwise_norm() {
 
     // Per head: 4 rows of 8 heads x 256 (Qwen 3.5's q/k norm geometry).
     let (r, heads, hd) = (4u32, 8u32, 256u32);
-    let xs: Vec<f32> = values((r * heads * hd) as usize, 4, 3.0).into_iter().map(round_bf16).collect();
-    let ws: Vec<f32> = values(hd as usize, 5, 0.3).into_iter().map(round_bf16).collect();
+    let xs: Vec<f32> = values((r * heads * hd) as usize, 4, 3.0)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
+    let ws: Vec<f32> = values(hd as usize, 5, 0.3)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
     let x = gpu.tensor(&xs, r, heads * hd, Dtype::Bf16);
     let w = gpu.tensor(&ws, 1, hd, Dtype::Bf16);
     let mut y = gpu.zeros(r, heads * hd, Dtype::Bf16);
@@ -98,8 +112,14 @@ fn elemwise_norm() {
 
     // A window: the launch covers 6 rows, the staged extent is rows 2..5.
     let (r, width) = (6u32, 512u32);
-    let xs: Vec<f32> = values((r * width) as usize, 9, 1.0).into_iter().map(round_bf16).collect();
-    let ws: Vec<f32> = values(width as usize, 10, 0.5).into_iter().map(round_bf16).collect();
+    let xs: Vec<f32> = values((r * width) as usize, 9, 1.0)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
+    let ws: Vec<f32> = values(width as usize, 10, 0.5)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
     let x = gpu.tensor(&xs, r, width, Dtype::Bf16);
     let w = gpu.tensor(&ws, 1, width, Dtype::Bf16);
     let win = gpu.ints(&[3, 2, 0, 0]);
@@ -112,9 +132,17 @@ fn elemwise_norm() {
     for row in 0..r as usize {
         let have = &got[row * w_..(row + 1) * w_];
         if (2..5).contains(&row) {
-            close_bf16("windowed row", have, &rms(&xs[row * w_..(row + 1) * w_], Some(&ws), true, 1e-6), 1.0);
+            close_bf16(
+                "windowed row",
+                have,
+                &rms(&xs[row * w_..(row + 1) * w_], Some(&ws), true, 1e-6),
+                1.0,
+            );
         } else {
-            assert!(have.iter().all(|v| *v == 0.0), "row {row} is outside the window and stays untouched");
+            assert!(
+                have.iter().all(|v| *v == 0.0),
+                "row {row} is outside the window and stays untouched"
+            );
         }
     }
 }

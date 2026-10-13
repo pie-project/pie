@@ -22,8 +22,14 @@ fn elemwise_pointwise() {
     let (rows, qh, kh, hd, rot, theta) = (5u32, 8u32, 2u32, 256u32, 64u32, 1e7f32);
     let span = rot / 2;
     let positions = [0i32, 1, 17, 4095, 131_071];
-    let qs: Vec<f32> = values((rows * qh * hd) as usize, 1, 1.0).into_iter().map(round_bf16).collect();
-    let ks: Vec<f32> = values((rows * kh * hd) as usize, 2, 1.0).into_iter().map(round_bf16).collect();
+    let qs: Vec<f32> = values((rows * qh * hd) as usize, 1, 1.0)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
+    let ks: Vec<f32> = values((rows * kh * hd) as usize, 2, 1.0)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
     let mut q = gpu.tensor(&qs, rows, qh * hd, Dtype::Bf16);
     let mut k = gpu.tensor(&ks, rows, kh * hd, Dtype::Bf16);
     let pos = gpu.column(&positions);
@@ -37,7 +43,10 @@ fn elemwise_pointwise() {
                 for i in 0..span as usize {
                     let ang = p * f64::from(theta).powf(-(i as f64) / f64::from(span));
                     let (s, c) = ang.sin_cos();
-                    let (a, b) = (f64::from(x[base + i]), f64::from(x[base + i + span as usize]));
+                    let (a, b) = (
+                        f64::from(x[base + i]),
+                        f64::from(x[base + i + span as usize]),
+                    );
                     out[base + i] = (a * c - b * s) as f32;
                     out[base + i + span as usize] = (b * c + a * s) as f32;
                 }
@@ -61,7 +70,10 @@ fn elemwise_pointwise() {
     close_bf16("gate_sigmoid_mul", &gpu.read(&x), &want, 1.0);
 
     let (rows, inter) = (4u32, 1536u32);
-    let packed: Vec<f32> = values((rows * 2 * inter) as usize, 5, 3.0).into_iter().map(round_bf16).collect();
+    let packed: Vec<f32> = values((rows * 2 * inter) as usize, 5, 3.0)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
     let p = gpu.tensor(&packed, rows, 2 * inter, Dtype::Bf16);
     let mut y = gpu.zeros(rows, inter, Dtype::Bf16);
     mlp::swiglu(&ctx, p, inter, 1, &mut y).unwrap();

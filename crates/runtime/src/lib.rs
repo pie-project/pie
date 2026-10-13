@@ -1,5 +1,16 @@
 #[cfg(feature = "cuda")]
 extern crate engine_cuda as _;
+#[cfg(feature = "rocm")]
+extern crate engine_rocm as _;
+
+// The native GPU engine this build carries. engine-rocm is engine-cuda's
+// shape on HIP, so every caller reaches either through this one name.
+#[cfg(all(feature = "cuda", feature = "rocm"))]
+compile_error!("`cuda` and `rocm` are each the native GPU engine; a build carries one");
+#[cfg(feature = "cuda")]
+pub(crate) use engine_cuda as gpu_engine;
+#[cfg(feature = "rocm")]
+pub(crate) use engine_rocm as gpu_engine;
 
 #[cfg(target_arch = "wasm32")]
 extern crate wasmtime_web as wasmtime_wasi;

@@ -1,0 +1,7 @@
+api = 1
+
+# CDNA 3: MI300X, MI300A, MI325X (gfx942). The registry defaults, as
+# measured nowhere yet.
+[target]
+tier    = "gfx94"
+assumes = { cc = 94 }

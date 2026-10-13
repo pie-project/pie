@@ -171,7 +171,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         req.max_layers = pass.max_layers;
     }
     req.single_token_mode = false;
-    stamp_lane_words(&mut req, false, false);
+    stamp_lane_words(&mut req, false, false, None);
     if let Err(refusal) = seat_lane_slots(&mut req, &stores, ws.id).await {
         record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
         return Ok(Err(refusal));

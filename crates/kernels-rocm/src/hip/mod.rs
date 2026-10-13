@@ -3,6 +3,8 @@
 //! one of its kernels on a [`Stream`].
 
 pub mod blas;
+pub mod lt;
+pub mod rt;
 pub mod sys;
 
 use core::ffi::{c_char, c_int, c_void};
@@ -69,7 +71,11 @@ pub fn multiprocessors(ordinal: u32) -> Result<u32, Error> {
     let mut value: c_int = 0;
     check!(
         "hip.multiprocessors",
-        hipDeviceGetAttribute(&raw mut value, sys::ATTR_MULTIPROCESSOR_COUNT, ordinal as c_int)
+        hipDeviceGetAttribute(
+            &raw mut value,
+            sys::ATTR_MULTIPROCESSOR_COUNT,
+            ordinal as c_int
+        )
     );
     Ok(value as u32)
 }
@@ -164,6 +170,42 @@ impl Drop for Stream {
     }
 }
 
+/// A point on a stream's timeline, for timing the work between two.
+pub struct Event(rt::Event);
+
+impl Event {
+    pub fn new() -> Result<Self, Error> {
+        let mut event: rt::Event = core::ptr::null_mut();
+        check!("hip.event", hipEventCreate(&raw mut event));
+        Ok(Self(event))
+    }
+
+    pub fn record(&self, stream: &Stream) -> Result<(), Error> {
+        check!("hip.event_record", hipEventRecord(self.0, stream.0));
+        Ok(())
+    }
+
+    /// Milliseconds from `start` to `self`, waiting for `self` to land.
+    pub fn since(&self, start: &Event) -> Result<f32, Error> {
+        check!("hip.event_sync", hipEventSynchronize(self.0));
+        let mut ms = 0f32;
+        check!(
+            "hip.event_elapsed",
+            hipEventElapsedTime(&raw mut ms, start.0, self.0)
+        );
+        Ok(ms)
+    }
+}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        if let Ok(api) = sys::api() {
+            // SAFETY: the event came from `hipEventCreate` and is destroyed once.
+            unsafe { (api.hip.hipEventDestroy)(self.0) };
+        }
+    }
+}
+
 /// A compiled code object plus the mangled names hiprtc lowered each
 /// requested expression to.
 pub struct Built {
@@ -172,36 +214,66 @@ pub struct Built {
     pub log: String,
 }
 
-fn rtc_fault(unit: &str, call: &'static str, code: sys::HiprtcResult, log: &str) -> Error {
+/// Why [`compile`] produced no code object.
+#[derive(Clone, Debug)]
+pub enum CompileError {
+    /// The source does not compile: the same source always fails.
+    Rejected(String),
+    /// hiprtc itself failed (not loaded, out of memory, ...): a retry may not.
+    Failed(String),
+}
+
+impl core::fmt::Display for CompileError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Rejected(why) | Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+impl From<CompileError> for Error {
+    fn from(why: CompileError) -> Self {
+        Error::Backend {
+            op: "hiprtc.compile",
+            detail: why.to_string(),
+        }
+    }
+}
+
+/// `HIPRTC_ERROR_COMPILATION`.
+const RTC_COMPILATION: sys::HiprtcResult = 6;
+
+fn rtc_fault(unit: &str, call: &'static str, code: sys::HiprtcResult, log: &str) -> CompileError {
     let text = sys::api()
         .ok()
         // SAFETY: `hiprtcGetErrorString` returns a static, NUL-terminated string.
         .map(|api| unsafe { CStr::from_ptr((api.rtc.hiprtcGetErrorString)(code)) })
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    Error::Backend {
-        op: "hiprtc.compile",
-        detail: format!("`{unit}`: `{call}` answered {code} ({text}){log}"),
+    let why = format!("`{unit}`: `{call}` answered {code} ({text}){log}");
+    if code == RTC_COMPILATION {
+        CompileError::Rejected(why)
+    } else {
+        CompileError::Failed(why)
     }
 }
 
 /// Compiles `source` for `arch` (e.g. `gfx942`) and lowers each of `wanted`
-/// (a kernel name or template instantiation) to the symbol to load it by.
+/// (a kernel name or template instantiation) to the symbol to load it by;
+/// `wanted` may be empty for `extern "C"` entries, loaded by their own name.
 pub fn compile(
     unit: &str,
     source: &str,
     arch: &str,
     options: &[&str],
     wanted: &[&str],
-) -> Result<Built, Error> {
-    let api = loaded("hiprtc.compile")?;
-    let nul = |what: &str| Error::Backend {
-        op: "hiprtc.compile",
-        detail: format!("`{unit}`: {what} contains a NUL"),
-    };
+) -> Result<Built, CompileError> {
+    let api = sys::api().map_err(CompileError::Failed)?;
+    let nul = |what: &str| CompileError::Rejected(format!("`{unit}`: {what} contains a NUL"));
     let c_source = CString::new(source).map_err(|_| nul("the source"))?;
     let c_name = CString::new(unit).map_err(|_| nul("the unit name"))?;
-    let mut owned: Vec<CString> = vec![CString::new(format!("--offload-arch={arch}")).map_err(|_| nul("the arch"))?];
+    let mut owned: Vec<CString> =
+        vec![CString::new(format!("--offload-arch={arch}")).map_err(|_| nul("the arch"))?];
     for option in options {
         owned.push(CString::new(*option).map_err(|_| nul("an option"))?);
     }
@@ -253,10 +325,18 @@ pub fn compile(
         unsafe { (api.rtc.hiprtcGetProgramLogSize)(program.0, &raw mut bytes) };
         let mut text = vec![0u8; bytes.max(1)];
         unsafe { (api.rtc.hiprtcGetProgramLog)(program.0, text.as_mut_ptr().cast()) };
-        String::from_utf8_lossy(&text).trim_end_matches('\0').trim().to_owned()
+        String::from_utf8_lossy(&text)
+            .trim_end_matches('\0')
+            .trim()
+            .to_owned()
     };
     if compiled != sys::HIPRTC_SUCCESS {
-        return Err(rtc_fault(unit, "hiprtcCompileProgram", compiled, &format!(":\n{log}")));
+        return Err(rtc_fault(
+            unit,
+            "hiprtcCompileProgram",
+            compiled,
+            &format!(":\n{log}"),
+        ));
     }
 
     let mut lowered = Vec::with_capacity(c_wanted.len());
@@ -264,11 +344,16 @@ pub fn compile(
         let mut out: *const c_char = core::ptr::null();
         // SAFETY: the lowered string is owned by `program`; it is copied out
         // before the program is destroyed.
-        let code = unsafe { (api.rtc.hiprtcGetLoweredName)(program.0, name.as_ptr(), &raw mut out) };
+        let code =
+            unsafe { (api.rtc.hiprtcGetLoweredName)(program.0, name.as_ptr(), &raw mut out) };
         if code != sys::HIPRTC_SUCCESS || out.is_null() {
             return Err(rtc_fault(unit, "hiprtcGetLoweredName", code, ""));
         }
-        lowered.push(unsafe { CStr::from_ptr(out) }.to_string_lossy().into_owned());
+        lowered.push(
+            unsafe { CStr::from_ptr(out) }
+                .to_string_lossy()
+                .into_owned(),
+        );
     }
 
     let mut size = 0usize;
@@ -295,7 +380,10 @@ pub struct Module(sys::Module);
 impl Module {
     pub fn load(code: &[u8]) -> Result<Self, Error> {
         let mut module: sys::Module = core::ptr::null_mut();
-        check!("hip.module_load", hipModuleLoadData(&raw mut module, code.as_ptr().cast()));
+        check!(
+            "hip.module_load",
+            hipModuleLoadData(&raw mut module, code.as_ptr().cast())
+        );
         Ok(Self(module))
     }
 
@@ -305,7 +393,10 @@ impl Module {
             detail: format!("`{symbol}` contains a NUL"),
         })?;
         let mut function: sys::Function = core::ptr::null_mut();
-        check!("hip.function", hipModuleGetFunction(&raw mut function, self.0, name.as_ptr()));
+        check!(
+            "hip.function",
+            hipModuleGetFunction(&raw mut function, self.0, name.as_ptr())
+        );
         Ok(Function(function))
     }
 }
@@ -389,5 +480,26 @@ pub unsafe fn memcpy_async(
     };
     // SAFETY: the caller vouches for both ranges and the stream.
     let code = unsafe { (api.hip.hipMemcpyAsync)(dst, src, bytes, kind, stream) };
-    if code == sys::HIP_SUCCESS { Ok(()) } else { Err(code) }
+    if code == sys::HIP_SUCCESS {
+        Ok(())
+    } else {
+        Err(code)
+    }
+}
+
+/// The marketing name of device `ordinal` ("AMD Instinct MI300X"), from
+/// `hipDeviceProp_tR0600.name`, its first field.
+#[must_use]
+pub fn device_name(ordinal: u32) -> Option<String> {
+    let api = sys::api().ok()?;
+    let mut prop = vec![0u8; sys::DEVICE_PROP_BYTES];
+    // SAFETY: `prop` is a zeroed buffer the size of `hipDeviceProp_tR0600`.
+    let code = unsafe {
+        (api.hip.hipGetDevicePropertiesR0600)(prop.as_mut_ptr().cast(), ordinal as c_int)
+    };
+    if code != sys::HIP_SUCCESS {
+        return None;
+    }
+    let name = CStr::from_bytes_until_nul(&prop[..256]).ok()?;
+    Some(name.to_string_lossy().into_owned())
 }

@@ -218,12 +218,20 @@ pub fn this_box() -> Option<Platform> {
     {
         return Some(Platform::Cuda);
     }
-    #[cfg(all(not(feature = "cuda"), feature = "metal", target_vendor = "apple"))]
+    #[cfg(feature = "rocm")]
+    {
+        return Some(Platform::Rocm);
+    }
+    #[cfg(all(
+        not(any(feature = "cuda", feature = "rocm")),
+        feature = "metal",
+        target_vendor = "apple"
+    ))]
     {
         return Some(Platform::Metal);
     }
     #[cfg(all(
-        not(feature = "cuda"),
+        not(any(feature = "cuda", feature = "rocm")),
         not(all(feature = "metal", target_vendor = "apple")),
         feature = "vulkan"
     ))]
@@ -231,7 +239,7 @@ pub fn this_box() -> Option<Platform> {
         return Some(Platform::Vulkan);
     }
     #[cfg(all(
-        not(feature = "cuda"),
+        not(any(feature = "cuda", feature = "rocm")),
         not(all(feature = "metal", target_vendor = "apple")),
         not(feature = "vulkan"),
         feature = "wgpu"
@@ -240,7 +248,7 @@ pub fn this_box() -> Option<Platform> {
         return Some(Platform::Wgpu);
     }
     #[cfg(all(
-        not(feature = "cuda"),
+        not(any(feature = "cuda", feature = "rocm")),
         not(all(feature = "metal", target_vendor = "apple")),
         not(feature = "vulkan"),
         not(feature = "wgpu"),
@@ -272,6 +280,7 @@ fn backend_of(platform: Platform) -> checkpoint::types::BackendKind {
         Platform::Wgpu => checkpoint::types::BackendKind::Wgpu,
         Platform::Xla => checkpoint::types::BackendKind::Xla,
         Platform::Cuda => checkpoint::types::BackendKind::Cuda,
+        Platform::Rocm => checkpoint::types::BackendKind::Rocm,
     }
 }
 
@@ -445,7 +454,7 @@ pub fn request(
     })
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 #[must_use]
 pub fn sequence(trace: &Trace) -> Option<Vec<String>> {
     let at: std::collections::BTreeMap<&str, usize> = trace
@@ -454,7 +463,7 @@ pub fn sequence(trace: &Trace) -> Option<Vec<String>> {
         .enumerate()
         .map(|(at, param)| (param.name.as_str(), at))
         .collect();
-    let mut pairings = engine_cuda::experts::Attachments::new();
+    let mut pairings = crate::gpu_engine::experts::Attachments::new();
     for (codes, param) in trace.params.iter().enumerate() {
         let mut companions = Vec::new();
         if let Some(&scales) = at.get(poem::scales_name(&param.name).as_str()) {
@@ -467,7 +476,7 @@ pub fn sequence(trace: &Trace) -> Option<Vec<String>> {
             pairings.insert(codes, companions);
         }
     }
-    let ranking = engine_cuda::experts::Ranking::of(trace, &pairings).ok()?;
+    let ranking = crate::gpu_engine::experts::Ranking::of(trace, &pairings).ok()?;
     Some(
         ranking
             .images()
@@ -478,7 +487,7 @@ pub fn sequence(trace: &Trace) -> Option<Vec<String>> {
     )
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(any(feature = "cuda", feature = "rocm")))]
 #[must_use]
 pub fn sequence(_trace: &Trace) -> Option<Vec<String>> {
     None

@@ -671,7 +671,12 @@ fn stage_plane(ctx: &Ctx, op: &'static str, dst: u64, src: u64, bytes: u64) -> R
                 ctx.stream(),
             )
         }
-        .map_err(|code| refuse(op, format!("`hipMemcpyAsync` answered {code} stacking a block")))
+        .map_err(|code| {
+            refuse(
+                op,
+                format!("`hipMemcpyAsync` answered {code} stacking a block"),
+            )
+        })
     }
     #[cfg(not(feature = "rocm"))]
     {
