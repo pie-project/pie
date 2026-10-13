@@ -6,6 +6,7 @@ pub mod atem;
 pub mod chatml;
 pub mod decode;
 pub mod deepseek;
+pub mod dots;
 pub mod gemma;
 pub mod glm;
 pub mod harmony;

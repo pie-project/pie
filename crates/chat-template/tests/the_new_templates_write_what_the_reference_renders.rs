@@ -31,6 +31,59 @@ fn the_new_templates_write_what_the_reference_renders_every_case() {
     gemma_closes_an_empty_thought_channel_where_its_template_does();
     minimax_opens_with_the_system_and_developer_turns();
     hy_writes_the_reasoning_mode_the_turns_the_calls_and_the_cue();
+    dots_opens_on_the_default_system_turn_and_answers_a_tool_in_a_user_turn();
+}
+
+/// Dots3's template opens a conversation with no system turn on its default
+/// one, writes no newline between turns, and hands a tool's result back in a
+/// user turn. With `enable_thinking: false` it cues past an empty thinking
+/// block (and ends the user's text with `<no_think>`, written here by hand).
+fn dots_opens_on_the_default_system_turn_and_answers_a_tool_in_a_user_turn() {
+    let Some(tokenizer) = snapshot("dots-studio/dots3-note-prev", "mini-l6-e16") else {
+        return;
+    };
+    let template = chat_template::dots::Dots::new(tokenizer);
+    let question: Vec<u32> = vec![151665, 3838, 374, 220, 16, 22, 3039, 220, 17, 18, 30];
+    let default_system: Vec<u32> = vec![151650, 2610, 525, 264, 10950, 17847, 13, 151651];
+    let terse: Vec<u32> = vec![151650, 2610, 525, 50537, 13, 151651];
+
+    let mut got = template.first_user(MESSAGE);
+    got.extend(template.cue());
+    assert_eq!(
+        got,
+        [
+            default_system.clone(),
+            question.clone(),
+            vec![151666, 151667]
+        ]
+        .concat()
+    );
+
+    let mut got = template.system_user("You are terse.", &format!("{MESSAGE}<no_think>"));
+    got.extend(template.cue_without_thinking());
+    let want = [
+        terse,
+        question.clone(),
+        vec![151723, 151666, 151667, 151721, 271, 151722, 271],
+    ]
+    .concat();
+    assert_eq!(got, want);
+
+    let mut got = template.first_user(MESSAGE);
+    got.extend(template.assistant("Let me check."));
+    got.extend(template.answer("multiply", "391"));
+    got.extend(template.cue());
+    let want = [
+        default_system,
+        question,
+        vec![151666, 151667, 10061, 752, 1779, 13, 151668],
+        vec![
+            151665, 198, 151726, 198, 18, 24, 16, 198, 151727, 151666, 151667,
+        ],
+    ]
+    .concat();
+    assert_eq!(got, want);
+    assert_eq!(template.seal(), vec![151643, 151668]);
 }
 
 /// Hy4's template opens with the reasoning mode, writes a past turn's

@@ -10,8 +10,8 @@ use crate::Instruct;
 use crate::chatml::{ChatML, ChatMLInstruct};
 
 pub const FORMATS: &[&str] = &[
-    "chatml", "harmony", "gemma", "deepseek", "glm", "kimi", "kimi3", "inkling", "atem", "minimax",
-    "hy", "lines", "raw",
+    "chatml", "harmony", "gemma", "deepseek", "dots", "glm", "kimi", "kimi3", "inkling", "atem",
+    "minimax", "hy", "lines", "raw",
 ];
 
 /// A format and its settings; a setting the format does not read is refused.
@@ -77,9 +77,8 @@ impl Spec {
             "gemma" | "hy" => &["thinking"],
             "lines" => &["stop", "bos", "eos"],
             "raw" => &["stop"],
-            "harmony" | "deepseek" | "glm" | "kimi" | "kimi3" | "inkling" | "atem" | "minimax" => {
-                &[]
-            }
+            "harmony" | "deepseek" | "dots" | "glm" | "kimi" | "kimi3" | "inkling" | "atem"
+            | "minimax" => &[],
             other => {
                 return Err(format!(
                     "`{other}` names no template format; this build ships {}",
@@ -122,6 +121,7 @@ pub fn build(spec: &Spec, tokenizer: Arc<Tokenizer>) -> Result<Arc<dyn Instruct>
         "harmony" => Arc::new(crate::harmony::Harmony::new(tokenizer)),
         "gemma" => Arc::new(crate::gemma::Gemma::new(tokenizer, spec.thinking)),
         "deepseek" => Arc::new(crate::deepseek::DeepSeek::new(tokenizer)),
+        "dots" => Arc::new(crate::dots::Dots::new(tokenizer)),
         "glm" => Arc::new(crate::glm::Glm::new(tokenizer)),
         "kimi" => Arc::new(crate::kimi::Kimi::new(tokenizer)),
         "kimi3" => Arc::new(crate::kimi3::Kimi3::new(tokenizer)),
