@@ -409,3 +409,123 @@ fn attn_ssm() {
         }
     }
 }
+
+/// The step's window, fold mask and skipped lanes, against the host
+/// recurrence, at Qwen3.8-Flash-Next's mixer (16 key heads, 48 value heads
+/// of 128: a block a head and row) and at 64-wide heads (the tiled step).
+/// Stated rows outside the window, and lanes seated at -1, must leave the
+/// output and every slot untouched; masked lanes answer but do not fold.
+#[test]
+fn the_step_reads_its_window_and_mask() {
+    let Some(gpu) = Gpu::open() else { return };
+    for g in [
+        Geo {
+            k_heads: 16,
+            v_heads: 48,
+            k_dim: 128,
+            v_dim: 128,
+            conv: 4,
+        },
+        Geo {
+            k_heads: 2,
+            v_heads: 4,
+            k_dim: 64,
+            v_dim: 64,
+            conv: 4,
+        },
+    ] {
+        let (c, vh, se) = (g.conv_dim(), g.v_heads, g.state_elems());
+        // Seven stated rows; the live four are rows 2..6, their lanes 1..5.
+        let (stated, live, row0, lane0) = (7usize, 4usize, 2usize, 1usize);
+        let slots: Vec<i32> = vec![6, 0, -1, 4, 2, 5, 3];
+        let mask: Vec<u8> = vec![1, 1, 1, 0, 1, 1, 1];
+        let slots_n = 8usize;
+        let slab_v: Vec<f32> = values(slots_n * se, 31, 0.2)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let qkv: Vec<f32> = values(stated * c, 32, 1.0)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let gates: Vec<f32> = values(stated * 2 * vh, 33, 1.0)
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                if i % (2 * vh) < vh {
+                    -0.05 - 0.5 * v.abs()
+                } else {
+                    0.5 + 0.45 * v
+                }
+            })
+            .collect();
+
+        // The host: every live lane with a seat, from its slot's state.
+        let mut want_y = vec![0f32; stated * vh * g.v_dim];
+        let mut want_slab = slab_v.clone();
+        for r in 0..live {
+            let (row, lane) = (row0 + r, lane0 + r);
+            let Ok(slot) = usize::try_from(slots[lane]) else {
+                continue;
+            };
+            for h in 0..vh {
+                let kh = h / (vh / g.k_heads);
+                let base = row * c;
+                let q = l2(
+                    &qkv[base + kh * g.k_dim..base + (kh + 1) * g.k_dim],
+                    1.0 / (g.k_dim as f32).sqrt(),
+                );
+                let kk = l2(
+                    &qkv[base + (g.k_heads + kh) * g.k_dim..base + (g.k_heads + kh + 1) * g.k_dim],
+                    1.0,
+                );
+                let v0 = base + 2 * g.k_heads * g.k_dim + h * g.v_dim;
+                let v = qkv[v0..v0 + g.v_dim].to_vec();
+                let at = slot * se + h * g.k_dim * g.v_dim;
+                let mut s = slab_v[at..at + g.k_dim * g.v_dim].to_vec();
+                let gl = gates[row * 2 * vh + h];
+                let b = gates[row * 2 * vh + vh + h];
+                let o = delta(&mut s, &[q], &[kk], &[v], &[gl], &[b], g.k_dim, g.v_dim);
+                let y0 = (row * vh + h) * g.v_dim;
+                want_y[y0..y0 + g.v_dim].copy_from_slice(&o[0]);
+                if mask[lane] != 0 {
+                    want_slab[at..at + g.k_dim * g.v_dim].copy_from_slice(&s);
+                }
+            }
+        }
+
+        let slab = gpu.tensor(&slab_v, slots_n as u32, se as u32, Dtype::Bf16);
+        let mut state = pool(slab, Tensor::ABSENT, gpu.column(&slots), &g);
+        let mut words = vec![0i32; mask.len().div_ceil(4)];
+        for (i, &b) in mask.iter().enumerate() {
+            words[i / 4] |= i32::from(b) << (8 * (i % 4));
+        }
+        let m = gpu.ints(&words);
+        state.write_state_mask = Tensor::new(m.ptr, mask.len() as u32, 1, Dtype::U8);
+        let mut y = gpu.zeros(stated as u32, (vh * g.v_dim) as u32, Dtype::F32);
+        let win = gpu.ints(&[live as i32, row0 as i32, live as i32, lane0 as i32]);
+        let ctx = gpu.ctx();
+        ctx.arm_stage(win.ptr);
+        ssm::gated_delta(
+            &ctx,
+            gpu.tensor(&qkv, stated as u32, c as u32, Dtype::Bf16),
+            Tensor::ABSENT,
+            gpu.tensor(&gates, stated as u32, 2 * vh as u32, Dtype::F32),
+            &state,
+            g.k_heads as u32,
+            vh as u32,
+            g.k_dim as u32,
+            g.v_dim as u32,
+            &mut y,
+        )
+        .unwrap();
+        let what = format!("windowed step {}x{}", vh, g.v_dim);
+        close_abs(&format!("{what}: y"), &gpu.read(&y), &want_y, 2e-3);
+        close_abs(
+            &format!("{what}: state"),
+            &gpu.read(&slab),
+            &want_slab,
+            8e-3,
+        );
+    }
+}

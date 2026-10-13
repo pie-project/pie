@@ -27,10 +27,24 @@
 
 namespace pie::attn {
 
+using f32x4 = float __attribute__((ext_vector_type(4)));
+using f32x2 = float __attribute__((ext_vector_type(2)));
+
 __device__ __forceinline__ float silu(float z) { return z / (1.f + __expf(-z)); }
 
 __device__ __forceinline__ bool folds(bool write_state, const u8* mask, int r) {
     return write_state && (mask == nullptr || mask[r] != 0);
+}
+
+// `folds` through a scalar load of the aligned word that holds the byte
+// (a uniform byte load is a vector load, and waiting on it waits on every
+// load issued before it): for a row a block, read where the stores need it.
+__device__ __forceinline__ bool folds_uniform(bool write_state, const u8* mask, int r) {
+    if (!write_state) return false;
+    if (mask == nullptr) return true;
+    const int off = static_cast<int>((reinterpret_cast<usize>(mask) + static_cast<usize>(r)) & 3);
+    const u32 word = *reinterpret_cast<const u32*>(mask + r - off);
+    return ((word >> (8 * off)) & 0xffu) != 0;
 }
 
 template <bool SILU, bool RESIDUAL>
@@ -389,114 +403,198 @@ __global__ __launch_bounds__(256) void ssm_gdn_decode_step(
     }
 }
 
-// The step for a batch: grid (rows, V_h), block BLOCK, a block per (row, head)
-// over the head's whole K × V state. Thread t owns columns 8(t%16).. of rows
-// t/16 + (BLOCK/16)q, so each wavefront read is four whole 256-byte state
-// rows; the column sums fold the row groups through two shuffles and LDS. The
-// same arithmetic as `ssm_gdn_decode_step`, summed in another order.
-template <int KD, int VD, int BLOCK = 512>
+// The decode steps' state traffic: read once and written once a step, and
+// not again until the next step, past every other layer's. Non-temporal, so
+// it streams past the caches it would only evict from (a tenth faster at a
+// batch's 200-500 MiB of state).
+using u32x4 = u32 __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ u32x4 state_load(const bf16* p) {
+    return __builtin_nontemporal_load(reinterpret_cast<const u32x4*>(p));
+}
+__device__ __forceinline__ void state_store(bf16* p, u32x4 v) {
+    __builtin_nontemporal_store(v, reinterpret_cast<u32x4*>(p));
+}
+__device__ __forceinline__ f32x4 state_load(const f32x4* p) { return __builtin_nontemporal_load(p); }
+__device__ __forceinline__ void state_store(f32x4* p, f32x4 v) { __builtin_nontemporal_store(v, p); }
+
+// bf16 pairs packed in a word, low element first.
+__device__ __forceinline__ float bf16_lo(u32 w) { return __builtin_bit_cast(float, w << 16); }
+__device__ __forceinline__ float bf16_hi(u32 w) { return __builtin_bit_cast(float, w & 0xffff0000u); }
+
+// Round to nearest even into the upper half, as `from_f32<bf16>` rounds every
+// finite value and the NaNs arithmetic makes (canonical, or widened from
+// bf16): two integer ops where the conversion spends five, and a pair packs
+// in one more.
+__device__ __forceinline__ u32 bf16_rne_bits(float x) {
+    const u32 u = __builtin_bit_cast(u32, x);
+    return u + 0x7fffu + ((u >> 16) & 1u);
+}
+__device__ __forceinline__ float bf16_round(float x) {
+    return __builtin_bit_cast(float, bf16_rne_bits(x) & 0xffff0000u);
+}
+__device__ __forceinline__ u32 bf16_pack_rne(float lo, float hi) {
+    return __builtin_amdgcn_perm(bf16_rne_bits(hi), bf16_rne_bits(lo), 0x07060302u);
+}
+
+// The step for a batch: grid (V_h, rows), block BLOCK, a block per (head,
+// row), consecutive blocks on consecutive heads of a slot so the device
+// sweeps each slot's state in order. Thread t owns columns 8(t % 16).. of
+// rows t / 16 + (BLOCK / 16)q: a wavefront read is four whole consecutive
+// 256-byte state rows, the block's reads its head's 32 KiB in order. The
+// norms of q and k factor out of the sums,
+//
+//   kv[j] = g·|k|⁻¹·Σ_i S[i][j]·k[i]      o[j] = q_scale·|q|⁻¹·Σ_i S'[i][j]·q[i]
+//
+// so the block meets at two barriers: one for the kv sums and the norms
+// together, one for the outputs (the column sums fold the lane's rows, the
+// row groups of a wavefront by shuffles, then the wavefronts through LDS).
+// The arithmetic of `ssm_gdn_decode_step` in fused pairs and another order.
+template <int KD, int VD, int BLOCK>
 __global__ __launch_bounds__(BLOCK) void ssm_gdn_decode_rows(
     const bf16* __restrict__ qkv, const float* __restrict__ gates, bf16* __restrict__ state_base,
     const i32* __restrict__ slot_ids, long long slot_stride, float* __restrict__ out, int K_h, int V_h,
     int conv_dim, float q_scale, bool write_state, const u8* __restrict__ mask, const u32* __restrict__ win) {
     constexpr int WAVES = BLOCK / kWave, VEC = 8, CG = VD / VEC, RG = BLOCK / CG, Q = KD / RG;
-    static_assert(VD % VEC == 0 && BLOCK % CG == 0 && KD % RG == 0 && kWave % CG == 0 && KD == 2 * kWave &&
-                      BLOCK >= 2 * KD,
-                  "whole packs, whole row groups, and q, k a wavefront pair each");
-    __shared__ float sq[KD], sk[KD];
-    __shared__ float red[WAVES][VD];
-    __shared__ float norm_part[4];
+    static_assert(VD % VEC == 0 && BLOCK % CG == 0 && KD % RG == 0 && kWave % CG == 0,
+                  "whole packs, whole row groups");
+    __shared__ alignas(16) float red[2][WAVES][VD];
+    __shared__ float norms[WAVES][2];
 
-    const int r = blockIdx.x, h = blockIdx.y;
+    const int h = blockIdx.x, r = blockIdx.y;
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
     const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
     const int slot = slot_ids[rl];
     if (slot < 0) return;
-    const bool fold = folds(write_state, mask, rl);
     const int tid = threadIdx.x, wave = tid / kWave, l = lane();
     const int h_k = h / (V_h / K_h);
     const bf16* qkv_row = qkv + row * conv_dim;
     const int cg = tid % CG, rg = tid / CG, j0 = cg * VEC;
 
-    // Every read of the step issued first.
-    bf16* head = state_base + static_cast<long long>(slot) * slot_stride + static_cast<long long>(h) * KD * VD;
-    Pack8<bf16> sp[Q];
+    // The token's reads, then the state's: every read of the step in flight
+    // before any is used.
+    float qi[Q], ki[Q];
 #pragma unroll
-    for (int q = 0; q < Q; ++q) sp[q] = *reinterpret_cast<const Pack8<bf16>*>(head + static_cast<long long>(rg + RG * q) * VD + j0);
+    for (int q = 0; q < Q; ++q) {
+        qi[q] = to_f32(qkv_row[h_k * KD + rg + RG * q]);
+        ki[q] = to_f32(qkv_row[K_h * KD + h_k * KD + rg + RG * q]);
+    }
     const Pack8<bf16> vp = *reinterpret_cast<const Pack8<bf16>*>(qkv_row + 2LL * K_h * KD + static_cast<long long>(h) * VD + j0);
     const float g_log = gates[row * 2 * V_h + h];
     const float beta = gates[row * 2 * V_h + V_h + h];
-    // Wavefronts 0-1 hold q's key head, 2-3 k's.
-    const int e = tid % KD;
-    const float qk = tid < 2 * KD ? to_f32(qkv_row[(tid < KD ? 0 : K_h * KD) + h_k * KD + e]) : 0.f;
-
-    const float part = wave_sum(qk * qk);
-    if (l == 0 && wave < 4) norm_part[wave] = part;
-    lds_barrier();
-    const float qn = norm_part[0] + norm_part[1], kn = norm_part[2] + norm_part[3];
-    if (tid < KD) sq[e] = qk * rsqrtf(qn + 1e-6f) * q_scale;
-    else if (tid < 2 * KD) sk[e] = qk * rsqrtf(kn + 1e-6f);
-    lds_barrier();
-
-    const float g = __expf(g_log);
-    // Column sums over the KD rows: this thread's Q rows, then the four row
-    // groups a wavefront holds (lanes cg, cg ± 16, ± 32), then the wavefronts.
-    auto column_sum = [&](float (&x)[VEC]) {
+    bf16* head = state_base + static_cast<long long>(slot) * slot_stride + static_cast<long long>(h) * KD * VD;
+    u32x4 sp[Q];
 #pragma unroll
-        for (int u = 0; u < VEC; ++u) {
+    for (int q = 0; q < Q; ++q) sp[q] = state_load(head + (rg + RG * q) * VD + j0);
+    const bool fold = folds_uniform(write_state, mask, rl);
+
+    // Over the row groups of a column: the wavefront's lanes CG apart, then
+    // the wavefronts. Every thread of a column gets the same total.
+    auto lanes = [](float v) {
 #pragma unroll
-            for (int off = CG; off < kWave; off <<= 1) x[u] += __shfl_xor(x[u], off, kWave);
-        }
+        for (int off = CG; off < kWave; off <<= 1) v += __shfl_xor(v, off, kWave);
+        return v;
+    };
+    auto column_sums = [&](float (&x)[VEC], int buf) {
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) x[u] = lanes(x[u]);
         if (l < CG) {
-#pragma unroll
-            for (int u = 0; u < VEC; ++u) red[wave][l * VEC + u] = x[u];
+            *reinterpret_cast<f32x4*>(&red[buf][wave][j0]) = f32x4{x[0], x[1], x[2], x[3]};
+            *reinterpret_cast<f32x4*>(&red[buf][wave][j0 + 4]) = f32x4{x[4], x[5], x[6], x[7]};
         }
-        lds_barrier();
+    };
+    auto column_totals = [&](float (&x)[VEC], int buf) {
 #pragma unroll
-        for (int u = 0; u < VEC; ++u) {
-            float total = 0.f;
+        for (int u = 0; u < VEC; ++u) x[u] = 0.f;
 #pragma unroll
-            for (int w = 0; w < WAVES; ++w) total += red[w][cg * VEC + u];
-            x[u] = total;
+        for (int w = 0; w < WAVES; ++w) {
+            const f32x4 a = *reinterpret_cast<const f32x4*>(&red[buf][w][j0]);
+            const f32x4 b = *reinterpret_cast<const f32x4*>(&red[buf][w][j0 + 4]);
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                x[u] += a[u];
+                x[4 + u] += b[u];
+            }
         }
-        lds_barrier();
     };
 
+    // Σ_i S[i][j]·k[i] and the norms' partial sums.
+    f32x2 x2[VEC / 2];
+#pragma unroll
+    for (int w = 0; w < VEC / 2; ++w) x2[w] = f32x2{0.f, 0.f};
+    float qq = 0.f, kk = 0.f;
+#pragma unroll
+    for (int q = 0; q < Q; ++q) {
+        qq += qi[q] * qi[q];
+        kk += ki[q] * ki[q];
+        const f32x2 k2 = {ki[q], ki[q]};
+#pragma unroll
+        for (int w = 0; w < VEC / 2; ++w)
+            x2[w] = __builtin_elementwise_fma(f32x2{bf16_lo(sp[q][w]), bf16_hi(sp[q][w])}, k2, x2[w]);
+    }
+    // Unpacked again for the update rather than held: half the registers,
+    // a fifth more wavefronts resident.
+#pragma unroll
+    for (int q = 0; q < Q; ++q) asm volatile("" : "+v"(sp[q]));
     float x[VEC];
 #pragma unroll
-    for (int u = 0; u < VEC; ++u) x[u] = 0.f;
+    for (int w = 0; w < VEC / 2; ++w) {
+        x[2 * w] = x2[w].x;
+        x[2 * w + 1] = x2[w].y;
+    }
+    column_sums(x, 0);
+    qq = lanes(qq);
+    kk = lanes(kk);
+    if (l == 0) {
+        norms[wave][0] = qq;
+        norms[wave][1] = kk;
+    }
+    lds_barrier();
+    column_totals(x, 0);
+    float qn = 0.f, kn = 0.f;
+#pragma unroll
+    for (int w = 0; w < WAVES; ++w) {
+        qn += norms[w][0];
+        kn += norms[w][1];
+    }
+    const float g = __expf(g_log);
+    const float rk = rsqrtf(kn + 1e-6f), rq = rsqrtf(qn + 1e-6f) * q_scale;
+
+    // δ[j], the update, Σ_i S'[i][j]·q[i].
+    f32x2 d2[VEC / 2];
+#pragma unroll
+    for (int w = 0; w < VEC / 2; ++w) {
+        d2[w] = f32x2{(to_f32(vp.v[2 * w]) - x[2 * w] * (g * rk)) * beta,
+                      (to_f32(vp.v[2 * w + 1]) - x[2 * w + 1] * (g * rk)) * beta};
+        x2[w] = f32x2{0.f, 0.f};
+    }
+    const f32x2 g2 = {g, g};
 #pragma unroll
     for (int q = 0; q < Q; ++q) {
-        const float ki = sk[rg + RG * q];
+        const float kh = ki[q] * rk;
+        const f32x2 k2 = {kh, kh}, q2 = {qi[q], qi[q]};
+        u32x4 st;
 #pragma unroll
-        for (int u = 0; u < VEC; ++u) x[u] += to_f32(sp[q].v[u]) * g * ki;
-    }
-    column_sum(x);
-    float delta[VEC];
-#pragma unroll
-    for (int u = 0; u < VEC; ++u) {
-        delta[u] = (to_f32(vp.v[u]) - x[u]) * beta;
-        x[u] = 0.f;
-    }
-#pragma unroll
-    for (int q = 0; q < Q; ++q) {
-        const int i = rg + RG * q;
-        const float ki = sk[i], qi = sq[i];
-        Pack8<bf16> st;
-#pragma unroll
-        for (int u = 0; u < VEC; ++u) {
-            const float next = to_f32(from_f32<bf16>(to_f32(sp[q].v[u]) * g)) + ki * delta[u];
-            st.v[u] = from_f32<bf16>(next);
-            x[u] += next * qi;
+        for (int w = 0; w < VEC / 2; ++w) {
+            const f32x2 dec = f32x2{bf16_lo(sp[q][w]), bf16_hi(sp[q][w])} * g2;
+            const f32x2 next = __builtin_elementwise_fma(k2, d2[w], f32x2{bf16_round(dec.x), bf16_round(dec.y)});
+            st[w] = bf16_pack_rne(next.x, next.y);
+            x2[w] = __builtin_elementwise_fma(next, q2, x2[w]);
         }
-        if (fold) *reinterpret_cast<Pack8<bf16>*>(head + static_cast<long long>(i) * VD + j0) = st;
+        if (fold) state_store(head + (rg + RG * q) * VD + j0, st);
     }
-    column_sum(x);
-    if (tid < CG) {
-        float* o = out + (row * V_h + h) * VD + j0;
 #pragma unroll
-        for (int u = 0; u < VEC; ++u) o[u] = x[u];
+    for (int w = 0; w < VEC / 2; ++w) {
+        x[2 * w] = x2[w].x;
+        x[2 * w + 1] = x2[w].y;
+    }
+    column_sums(x, 1);
+    lds_barrier();
+    if (tid < CG) {
+        column_totals(x, 1);
+        float* o = out + (row * V_h + h) * VD + j0;
+        *reinterpret_cast<f32x4*>(o) = f32x4{x[0] * rq, x[1] * rq, x[2] * rq, x[3] * rq};
+        *reinterpret_cast<f32x4*>(o + 4) = f32x4{x[4] * rq, x[5] * rq, x[6] * rq, x[7] * rq};
     }
 }
 
@@ -1130,7 +1228,6 @@ __global__ __launch_bounds__(256) void ssm_gdn_chunk_o(
 // (q̂, k̂, v, the gate [n][H][D] and β [n][H], at the launch row). Every
 // recurrence lands its output at row + row_offset.
 
-using f32x4 = float __attribute__((ext_vector_type(4)));
 
 __device__ __forceinline__ float sigmoid(float x) { return 1.f / (1.f + __expf(-x)); }
 
@@ -1262,83 +1359,133 @@ __device__ __forceinline__ KdaToken<E> kda_token(const float* q, const float* k,
     return t;
 }
 
-// Decode: one token per row, straight from its projections. Grid (rows, H,
-// D / ROWS), block 256: a block walks ROWS value rows of one head, every read
-// of the step issued before any is used. ROWS = D (a block a row and head) fills the
-// device from a batch; under that, 32-row tiles spread each head over D / 32
-// blocks.
+// The decode step's rows: `kda_row_step` over R rows at once, in fused pairs
+// (v_pk_mul / v_pk_fma), each phase across every row before the next so the
+// rows' chains interleave. The sums over a lane's pieces run in E pair
+// accumulators, then over the row's eight lanes. Rounds once where the
+// token kernels round twice.
+template <int R, int E>
+__device__ __forceinline__ void kda_rows_step(f32x4 (&s)[R][E], const f32x4 (&q)[E], const f32x4 (&k)[E],
+                                              const f32x4 (&a)[E], const float (&v)[R], float beta,
+                                              float (&y)[R]) {
+    auto pairs = [](f32x2 (&x)[E]) {
+#pragma unroll
+        for (int w = 1; w < E; w <<= 1)
+#pragma unroll
+            for (int e = 0; e + w < E; e += 2 * w) x[e] += x[e + w];
+        return x[0].x + x[0].y;
+    };
+    float d[R];
+#pragma unroll
+    for (int p = 0; p < R; ++p) {
+        f32x2 kv[E];
+#pragma unroll
+        for (int e = 0; e < E; ++e) {
+            const f32x2 lo = s[p][e].xy * a[e].xy, hi = s[p][e].zw * a[e].zw;
+            s[p][e].xy = lo;
+            s[p][e].zw = hi;
+            kv[e] = __builtin_elementwise_fma(hi, k[e].zw, lo * k[e].xy);
+        }
+        d[p] = pairs(kv);
+    }
+#pragma unroll
+    for (int p = 0; p < R; ++p) d[p] = (v[p] - row8_sum(d[p])) * beta;
+#pragma unroll
+    for (int p = 0; p < R; ++p) {
+        const f32x2 d2 = {d[p], d[p]};
+        f32x2 o[E];
+#pragma unroll
+        for (int e = 0; e < E; ++e) {
+            const f32x2 lo = __builtin_elementwise_fma(k[e].xy, d2, s[p][e].xy);
+            const f32x2 hi = __builtin_elementwise_fma(k[e].zw, d2, s[p][e].zw);
+            s[p][e].xy = lo;
+            s[p][e].zw = hi;
+            o[e] = __builtin_elementwise_fma(hi, q[e].zw, lo * q[e].xy);
+        }
+        y[p] = pairs(o);
+    }
+#pragma unroll
+    for (int p = 0; p < R; ++p) y[p] = row8_sum(y[p]);
+}
+
+// Decode: one token per row, straight from its projections. Grid (H, rows,
+// D / ROWS), block 256: a block walks ROWS value rows of one head, eight
+// lanes a row (lane c the pieces at k = 4c + 32e) and each lane group
+// R = ROWS / 32 rows 32 apart, so a wavefront's read is eight whole
+// consecutive rows. Each wavefront norms and gates the token's channels
+// itself, two a lane, and hands them to its rows' lanes through its own
+// slice of LDS: the wavefronts share nothing and meet at no barrier, each
+// running from its reads to its stores on its own.
 template <int D, int ROWS>
 __global__ __launch_bounds__(256) void ssm_kda_step_batched(
     const bf16* __restrict__ mixed, const bf16* __restrict__ f, const bf16* __restrict__ b,
     const float* __restrict__ a_log, const float* __restrict__ dt_bias, float* __restrict__ state_base,
     const i32* __restrict__ slot_ids, long long slot_stride, float* __restrict__ out, int H, float eps, float floor,
     bool write_state, const u8* __restrict__ mask, const u32* __restrict__ win) {
-    constexpr int E = D / 32, RPP = 256 / kKdaRowLanes, PASSES = ROWS / RPP;
-    static_assert(D % 32 == 0 && ROWS % RPP == 0 && D % ROWS == 0, "whole pieces, whole passes");
-    const int r = blockIdx.x, h = blockIdx.y;
+    constexpr int E = D / 32, RPP = 256 / kKdaRowLanes, R = ROWS / RPP, WAVES = 256 / kWave;
+    static_assert(D % 32 == 0 && D <= 2 * kWave && ROWS % RPP == 0 && D % ROWS == 0,
+                  "whole pieces, two channels a lane, whole passes");
+    const int h = blockIdx.x, r = blockIdx.y;
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
     const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
     const int slot = slot_ids[rl];
     if (slot < 0) return;
-    const bool fold = folds(write_state, mask, rl);
-    const int c = threadIdx.x % kKdaRowLanes;
-    const int v0 = blockIdx.z * ROWS + threadIdx.x / kKdaRowLanes;
+    const int tid = threadIdx.x, wave = tid / kWave, l = lane();
+    const int c = tid % kKdaRowLanes;
+    const int v0 = blockIdx.z * ROWS + tid / kKdaRowLanes;
     const long long width = static_cast<long long>(H) * D;
     float* head = state_base + static_cast<long long>(slot) * slot_stride + static_cast<long long>(h) * D * D;
     const bf16* q = mixed + row * 3 * width + static_cast<long long>(h) * D;
-    const int tid = threadIdx.x, wave = tid / kWave;
 
     // The token's reads first, so waiting on them waits on no state read;
-    // then the state's.
-    const int ch = min(tid, D - 1);
-    const float qx = to_f32(q[ch]), kx = to_f32(q[width + ch]);
-    const float fx = to_f32(f[row * width + static_cast<long long>(h) * D + ch]) + dt_bias[h * D + ch];
-    float vv[PASSES];
+    // then the state's. Lane l holds channels 2l, 2l + 1.
+    const bool mine = 2 * l < D;
+    const int ch = mine ? 2 * l : 0;
+    const u32 qw = *reinterpret_cast<const u32*>(q + ch), kw = *reinterpret_cast<const u32*>(q + width + ch);
+    const u32 fw = *reinterpret_cast<const u32*>(f + row * width + static_cast<long long>(h) * D + ch);
+    const float2 dt = *reinterpret_cast<const float2*>(dt_bias + h * D + ch);
+    float vv[R];
 #pragma unroll
-    for (int p = 0; p < PASSES; ++p) vv[p] = to_f32(q[2 * width + v0 + RPP * p]);
-    const float beta = sigmoid(to_f32(b[row * H + h])), a = __expf(a_log[h]);
-    f32x4 s[PASSES][E];
+    for (int p = 0; p < R; ++p) vv[p] = to_f32(q[2 * width + v0 + RPP * p]);
+    const float braw = to_f32(b[row * H + h]), al = a_log[h];
+    f32x4 s[R][E];
 #pragma unroll
-    for (int p = 0; p < PASSES; ++p)
+    for (int p = 0; p < R; ++p)
 #pragma unroll
         for (int e = 0; e < E; ++e)
-            s[p][e] = *reinterpret_cast<const f32x4*>(head + static_cast<long long>(v0 + RPP * p) * D + 4 * c + 32 * e);
+            s[p][e] = state_load(reinterpret_cast<const f32x4*>(head + static_cast<long long>(v0 + RPP * p) * D + 4 * c + 32 * e));
+    const bool fold = folds_uniform(write_state, mask, rl);
 
-    // The head's q̂, k̂ and decays once a block, a thread a channel, as the
-    // staging kernels compute them.
-    __shared__ alignas(16) float sq[D], sk[D], sa[D];
-    __shared__ float part[2][256 / kWave];
-    const bool mine = tid < D;
-    if (mine) sa[tid] = __expf(kda_gate(fx, a, floor));
-    const float qs = wave_sum(mine ? qx * qx : 0.f), ks = wave_sum(mine ? kx * kx : 0.f);
-    if (lane() == 0) {
-        part[0][wave] = qs;
-        part[1][wave] = ks;
-    }
-    lds_barrier();
-    float qn = 0.f, kn = 0.f;
-#pragma unroll
-    for (int w = 0; w < 256 / kWave; ++w) {
-        qn += part[0][w];
-        kn += part[1][w];
-    }
+    // q̂, k̂ and the decays as the staging kernels compute them, into this
+    // wavefront's slice.
+    __shared__ alignas(16) float tq[WAVES][D], tk[WAVES][D], ta[WAVES][D];
+    const float q0 = mine ? bf16_lo(qw) : 0.f, q1 = mine ? bf16_hi(qw) : 0.f;
+    const float k0 = mine ? bf16_lo(kw) : 0.f, k1 = mine ? bf16_hi(kw) : 0.f;
+    const float rq = rsqrtf(wave_sum(q0 * q0 + q1 * q1) + eps), rk = rsqrtf(wave_sum(k0 * k0 + k1 * k1) + eps);
+    const float a = __expf(al), rd = rsqrtf(static_cast<float>(D));
     if (mine) {
-        sq[tid] = qx * rsqrtf(qn + eps) * rsqrtf(static_cast<float>(D));
-        sk[tid] = kx * rsqrtf(kn + eps);
+        *reinterpret_cast<float2*>(&tq[wave][ch]) = float2{q0 * rq * rd, q1 * rq * rd};
+        *reinterpret_cast<float2*>(&tk[wave][ch]) = float2{k0 * rk, k1 * rk};
+        *reinterpret_cast<float2*>(&ta[wave][ch]) = float2{__expf(kda_gate(bf16_lo(fw) + dt.x, a, floor)),
+                                                          __expf(kda_gate(bf16_hi(fw) + dt.y, a, floor))};
     }
-    lds_barrier();
-    const KdaToken<E> tk = kda_token<E>(sq, sk, sa, c, false);
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront", "local");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront", "local");
+    const KdaToken<E> tok = kda_token<E>(tq[wave], tk[wave], ta[wave], c, false);
+    const float beta = sigmoid(braw);
 
     float* o = out + (row * H + h) * D;
+    float y[R];
+    kda_rows_step<R, E>(s, tok.q, tok.k, tok.a, vv, beta, y);
 #pragma unroll
-    for (int p = 0; p < PASSES; ++p) {
-        const float y = kda_row_step<E>(s[p], tk.q, tk.k, tk.a, vv[p], beta);
-        if (c == 0) o[v0 + RPP * p] = y;
+    for (int p = 0; p < R; ++p) {
+        if (c == 0) o[v0 + RPP * p] = y[p];
         if (fold) {
 #pragma unroll
             for (int e = 0; e < E; ++e)
-                *reinterpret_cast<f32x4*>(head + static_cast<long long>(v0 + RPP * p) * D + 4 * c + 32 * e) = s[p][e];
+                state_store(reinterpret_cast<f32x4*>(head + static_cast<long long>(v0 + RPP * p) * D + 4 * c + 32 * e), s[p][e]);
         }
     }
 }

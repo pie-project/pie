@@ -261,10 +261,10 @@ fn bench_gated_delta_prefill() {
     }
 }
 
-/// A batch's step (a block per row and head) answers what the tiled step
-/// answers row by row.
+/// A batch's step (a block per head and row, slots reversed) answers what
+/// its rows answer stepped one at a time.
 #[test]
-fn the_batch_step_answers_the_tiled_step() {
+fn the_batch_step_answers_its_rows_one_at_a_time() {
     let _turn = TURN
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -354,11 +354,11 @@ fn the_batch_step_answers_the_tiled_step() {
     let (e, at) = worst(&yb, &yt);
     assert!(
         e < 2e-3,
-        "output {at}: batch {} tiled {} ({e})",
+        "output {at}: batch {} row by row {} ({e})",
         yb[at],
         yt[at]
     );
     let (es, _) = worst(&sb, &st);
     assert!(es < 1e-2, "states differ by {es}");
-    eprintln!("batch vs tiled step: output {e}, state {es}");
+    eprintln!("batch vs row-by-row step: output {e}, state {es}");
 }

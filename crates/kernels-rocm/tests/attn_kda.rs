@@ -407,41 +407,72 @@ fn the_step_reads_its_window() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(gpu) = Gpu::open() else { return };
-    let g = Geo {
-        heads: 2,
-        d: 128,
-        floor: 0.0,
-        steep: false,
-    };
-    // Six stated rows; the live three are rows 2..5, their lanes 1..4.
-    let rows = 6;
-    let inp = inputs(g, rows, rows, 21);
-    let slots: Vec<i32> = vec![5, 4, 3, 2, 1, 0];
-    let lanes: Vec<Lane> = (0..3)
-        .map(|r| Lane {
-            rows: r + 2..r + 3,
-            slot: slots[r + 1] as usize,
-            fold: true,
-        })
-        .collect();
-    let (y, slab) = reference(g, &inp, rows, &lanes);
-    let seats = Seats {
-        slots: &slots,
-        ..Seats::default()
-    };
-    let mut bd = bind(&gpu, g, &inp, rows, &seats);
-    let win = gpu.ints(&[3, 2, 3, 1]);
-    let ctx = gpu.ctx();
-    ctx.arm_stage(win.ptr);
-    step(&gpu, &ctx, g, &mut bd);
-    check("windowed step: y", g, &gpu.read(&bd.y), &y, TIGHT);
-    check(
-        "windowed step: state",
-        g,
-        &gpu.read(&bd.state.slab),
-        &slab,
-        TIGHT,
-    );
+    // Two heads take the tiles (a head over four blocks); GLM-5.3-Flash's 64
+    // heads of 8 stated rows a block a whole head.
+    for (n, (g, rows)) in [
+        (
+            Geo {
+                heads: 2,
+                d: 128,
+                floor: 0.0,
+                steep: false,
+            },
+            6usize,
+        ),
+        (
+            Geo {
+                heads: 64,
+                d: 128,
+                floor: -5.0,
+                steep: false,
+            },
+            8,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // The live rows are 2..rows - 1, their lanes 1..rows - 2; one live
+        // lane has no seat and one does not fold.
+        let live = rows - 3;
+        let inp = inputs(g, rows, rows, 21 + n as u64);
+        let mut slots: Vec<i32> = (0..rows as i32).rev().collect();
+        slots[2] = -1;
+        let mask: Vec<i32> = (0..rows).map(|l| i32::from(l != 3)).collect();
+        let lanes: Vec<Lane> = (0..live)
+            .filter(|&r| slots[r + 1] >= 0)
+            .map(|r| Lane {
+                rows: r + 2..r + 3,
+                slot: slots[r + 1] as usize,
+                fold: mask[r + 1] != 0,
+            })
+            .collect();
+        let (y, slab) = reference(g, &inp, rows, &lanes);
+        let seats = Seats {
+            slots: &slots,
+            mask: Some(&mask),
+            ..Seats::default()
+        };
+        let mut bd = bind(&gpu, g, &inp, rows, &seats);
+        let win = gpu.ints(&[live as i32, 2, live as i32, 1]);
+        let ctx = gpu.ctx();
+        ctx.arm_stage(win.ptr);
+        step(&gpu, &ctx, g, &mut bd);
+        check(
+            &format!("windowed step {n}: y"),
+            g,
+            &gpu.read(&bd.y),
+            &y,
+            TIGHT,
+        );
+        check(
+            &format!("windowed step {n}: state"),
+            g,
+            &gpu.read(&bd.state.slab),
+            &slab,
+            TIGHT,
+        );
+    }
 }
 
 struct Case {

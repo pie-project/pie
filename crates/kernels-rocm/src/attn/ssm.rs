@@ -580,9 +580,10 @@ pub fn gated_delta(
         false,
         false,
     )?;
+    // A block a (head, row) at any batch: even one row of 48 heads runs in
+    // under half the tiled step's time.
     if shape.k_dim == CHUNK_HEAD
         && shape.v_dim == CHUNK_HEAD
-        && shape.n * shape.v_heads >= ROWS_STEP_FROM
         && state.slot_stride_elems % 8 == 0
         && shape.conv_dim.is_multiple_of(8)
     {
@@ -614,8 +615,8 @@ fn fused_fits(shape: &Delta, state: &RecurrentPool) -> bool {
         && shape.k_dim <= FUSED_BLOCK * VEC / FUSED_BV
 }
 
-/// From this many (row, head) pairs the batch step's block a pair fills the
-/// device; under it the tiled step's eight blocks a pair do.
+/// From this many (row, head) pairs the KDA step's block a whole head fills
+/// the device; under it each head's rows split over D / 32 blocks.
 const ROWS_STEP_FROM: u32 = 256;
 
 impl Delta {
@@ -633,7 +634,7 @@ impl Delta {
         ctx.fire(
             op,
             Fire::at(FILE, "::pie::attn::ssm_gdn_decode_rows<128, 128, 256>")
-                .apply(Launch::grid([self.n, self.v_heads, 1], [FUSED_BLOCK, 1, 1])),
+                .apply(Launch::grid([self.v_heads, self.n, 1], [FUSED_BLOCK, 1, 1])),
             &[
                 qkv.arg(),
                 gates.arg(),
@@ -1173,7 +1174,7 @@ pub fn kda_step(
             )),
         )
         .apply(Launch::grid(
-            [shape.n, shape.heads, head_dim / rows],
+            [shape.heads, shape.n, head_dim / rows],
             [STEP_BLOCK, 1, 1],
         )),
         &[
