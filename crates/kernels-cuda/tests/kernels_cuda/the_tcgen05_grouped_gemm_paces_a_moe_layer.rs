@@ -139,7 +139,12 @@ fn layer(name: &str, experts: usize, top: usize, [n, k]: [usize; 2], kind: Kind)
             let flops = 2.0 * (routed * n * k) as f64;
             let mut cells = Vec::new();
             for masked in [true, false] {
-                if masked && tokens > 128 || !masked && tokens < 128 {
+                let busiest = routings
+                    .iter()
+                    .flat_map(|c| c.iter().copied())
+                    .max()
+                    .unwrap_or(0);
+                if masked && (tokens > 1024 || busiest > 256) || !masked && tokens < 128 {
                     continue;
                 }
                 let (groups, rows, act_atoms): (Vec<Groups>, usize, usize) = if masked {

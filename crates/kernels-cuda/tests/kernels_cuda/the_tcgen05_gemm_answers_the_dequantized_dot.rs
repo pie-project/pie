@@ -247,6 +247,7 @@ fn the_deepseek_blocks_land_through_ue8m0() {
     check(scaled(f8, f8, [40, 256, 2048], None, 1.0));
     check(scaled(f8, f8, [300, 256, 1152], pair(256), 1.0));
     check(scaled(f8, f8, [129, 192, 640], pair(64), 1.0));
+    check(scaled(f8, f8, [256, 512, 8192], pair(256), 1.0));
     let mx = (Elem::E4m3, Some(32));
     check(scaled(mx, mx, [130, 128, 320], plan(false, 128), 1.0));
 }

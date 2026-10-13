@@ -107,7 +107,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     // their own slots: a copy in the MMA thread's stream would hold every
     // MMA behind it until it lands, and a shallower ring would hold the
     // copier on the MMAs.
-    constexpr u32 kSfSlots = 4;
+    constexpr u32 kSfSlots = kStages < 4 ? kStages : 4;
     constexpr u32 kSfAll = kScaled ? kSfSlots * kSfCols : 0;
     // Two accumulator stages always. When they and the scale slots overrun
     // TMEM the stages share kOv columns -- stage 0's tail is stage 1's head --
@@ -142,8 +142,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     u64* tempty = tfull + 2;
     u64* tover = tempty + 2;
     u64* sf_ready = tover + 2;
-    u64* sf_free = sf_ready + 4;
-    u32* tmem_slot = reinterpret_cast<u32*>(sf_free + 4);
+    u32* tmem_slot = reinterpret_cast<u32*>(sf_ready + 8);
     int* routes = reinterpret_cast<int*>(tmem_slot + 2);
     int* starts = routes + 1028;
 
@@ -177,7 +176,6 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
         }
         for (u32 a = 0; a < kSfSlots; ++a) {
             bar_init(&sf_ready[a], 1);
-            bar_init(&sf_free[a], 1);
         }
         bar_init_fence();
     }
@@ -413,10 +411,11 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
             }
         }
     } else if (warp == 6) {
-        // The scale copier: each K step's scales into slot (step % 2) once
-        // the MMAs two steps back have read it. Shared memory holds [row
-        // block][atom]; TMEM takes [atom][row block], a step's row blocks
-        // adjacent.
+        // The scale copier: each K step's scales into slot (step %
+        // kSfSlots) once the MMAs kSfSlots steps back have read it -- the
+        // commit that empties that step's stage says so, and the MMA thread
+        // commits nothing else for it. Shared memory holds [row block][atom];
+        // TMEM takes [atom][row block], a step's row blocks adjacent.
         if (kScaled && lane == 0 && leader) {
             u32 s = 0, phase = 0, step = 0;
             for (int t = first_tile; t < tiles; t += tile_step) {
@@ -426,7 +425,12 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                 }
                 for (int kb = x.kb0; kb < x.kb1; ++kb, ++step) {
                     const u32 slot = step % kSfSlots;
-                    bar_wait(&sf_free[slot], ((step / kSfSlots) & 1) ^ 1);
+                    // A slot is free once the MMAs of the step that last read it
+                    // are done: the commit that empties that step's stage says so.
+                    if (step >= kSfSlots) {
+                        const u32 last = step - kSfSlots;
+                        bar_wait(&empty[last % kStages], (last / kStages) & 1);
+                    }
                     bar_wait(&full[s], phase);
                     tc_fence_after();
                     const u32 sf_tp = tmem + kStride + kBN + slot * kSfCols;
@@ -515,9 +519,6 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                         }
                     }
                     commit(&empty[s]);
-                    if constexpr (kScaled) {
-                        tc_commit<kPair>(&sf_free[slot]);
-                    }
                     if (++s == kStages) {
                         s = 0;
                         phase ^= 1;
