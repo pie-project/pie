@@ -166,7 +166,7 @@ fn reference_row(
 }
 
 fn workspace(gpu: &Gpu) -> plan::Workspace {
-    const BYTES: usize = 32 << 20;
+    const BYTES: usize = 256 << 20;
     let int = gpu.zeros(1, (BYTES / 4) as u32, Dtype::F32);
     let float = gpu.zeros(1, (BYTES / 4) as u32, Dtype::F32);
     plan::Workspace {
@@ -402,4 +402,43 @@ fn attn_paged() {
         // Enough query tiles to fill the device: the schedule does not split.
         run_prefill(&gpu, c, &[2600, 2600], &[0, 300], 97);
     }
+}
+
+/// The head widths and groups past Qwen's: Gemma 4's global layers (512
+/// wide, group 8) and sliding ones (256 wide, group 2, a 1024 window), and
+/// DeepSeek-V4's single shared head (512 wide, group 64).
+#[test]
+fn attn_paged_wide_heads() {
+    let Some(gpu) = Gpu::open() else { return };
+    let global = Case {
+        q_heads: 32,
+        kv_heads: 4,
+        head_dim: 512,
+        page_size: 16,
+        hnd: false,
+    };
+    let sliding = Case {
+        q_heads: 32,
+        kv_heads: 16,
+        head_dim: 256,
+        page_size: 16,
+        hnd: false,
+    };
+    let mqa = Case {
+        q_heads: 64,
+        kv_heads: 1,
+        head_dim: 512,
+        page_size: 16,
+        hnd: false,
+    };
+    run_decode(&gpu, &global, &[1, 37, 300, 1000], None, 4096);
+    run_decode(&gpu, &global, &[1, 37, 300, 1000], None, 1);
+    // (DeepSeek-V4 decodes through its pool reader, not this one: only the
+    // prefill takes its 64-head group.)
+    for c in [&global, &mqa] {
+        run_prefill(&gpu, c, &[1, 70, 200], &[0, 0, 0], 1);
+        run_prefill(&gpu, c, &[33, 5, 130], &[100, 17, 900], 1);
+    }
+    run_decode(&gpu, &sliding, &[5, 300, 2000], Some(1024), 4096);
+    run_prefill(&gpu, &sliding, &[1200, 70], &[0, 1500], 1);
 }

@@ -183,6 +183,14 @@ __global__ __launch_bounds__(kWave* WAVES) void paged_decode(const Paged p) {
     }
 }
 
+// The most heads whose wavefront outputs fold through LDS at once: a
+// divisor of G within 48 KiB.
+__host__ __device__ constexpr int decode_fold_heads(int G, int D, int waves) {
+    for (int h = G; h > 1; --h)
+        if (G % h == 0 && waves * h * D * 4 <= 48 * 1024) return h;
+    return 1;
+}
+
 // The decode on the matrix core. Per wavefront, SUB keys a round:
 //
 //   Sᵀ (16 keys × 16) = K · Qᵀ     A = K rows straight from the pages, B = Qᵀ
@@ -205,7 +213,10 @@ __global__ __launch_bounds__(512) void paged_decode_mfma(const Paged p) {
     __shared__ float ps[WAVES][SUB][G];
     __shared__ float alph[WAVES][G];
     __shared__ float part_m[WAVES][G], part_l[WAVES][G];
-    __shared__ float part_o[WAVES][G][D];
+    // The wavefronts' outputs fold through LDS HG heads at a time: all G at
+    // once where they fit beside the rest (D = 512 does not).
+    constexpr int HG = decode_fold_heads(G, D, WAVES);
+    __shared__ float part_o[WAVES][HG][D];
     // The chunk's page table, a window of TABLE pages at a time: a key's
     // address then needs no read of global memory before its own.
     constexpr int TABLE = 512;
@@ -344,33 +355,37 @@ __global__ __launch_bounds__(512) void paged_decode_mfma(const Paged p) {
         part_m[wave][g] = m;
         part_l[wave][g] = lsum;
     }
-    if (l < LPK)
-#pragma unroll
-        for (int h = 0; h < G; ++h)
-#pragma unroll
-            for (int c = 0; c < 8; ++c) part_o[wave][h][col + c] = acc[h][c];
-    __syncthreads();
 
     const long long row = static_cast<long long>(bx) * p.num_qo_heads;
-    for (int i = threadIdx.x; i < G * D; i += blockDim.x) {
-        const int h = i / D, j = i % D;
-        float big = neg_inf();
 #pragma unroll
-        for (int w = 0; w < WAVES; ++w) big = fmaxf(big, part_m[w][h]);
-        float sum = 0.f, out = 0.f;
-        if (big != neg_inf()) {
+    for (int h0 = 0; h0 < G; h0 += HG) {
+        if (h0 > 0) __syncthreads();
+        if (l < LPK)
 #pragma unroll
-            for (int w = 0; w < WAVES; ++w) {
-                const float f = exp2f(part_m[w][h] - big);
-                sum += part_l[w][h] * f;
-                out += part_o[w][h][j] * f;
+            for (int h = 0; h < HG; ++h)
+#pragma unroll
+                for (int c = 0; c < 8; ++c) part_o[wave][h][col + c] = acc[h0 + h][c];
+        __syncthreads();
+        for (int i = threadIdx.x; i < HG * D; i += blockDim.x) {
+            const int hl = i / D, h = h0 + hl, j = i % D;
+            float big = neg_inf();
+#pragma unroll
+            for (int w = 0; w < WAVES; ++w) big = fmaxf(big, part_m[w][h]);
+            float sum = 0.f, out = 0.f;
+            if (big != neg_inf()) {
+#pragma unroll
+                for (int w = 0; w < WAVES; ++w) {
+                    const float f = exp2f(part_m[w][h] - big);
+                    sum += part_l[w][h] * f;
+                    out += part_o[w][hl][j] * f;
+                }
             }
+            const float value = sum > 0.f ? out / sum : 0.f;
+            const long long at = (row + kv_head * G + h) * D + j;
+            if (p.partition) static_cast<float*>(p.o)[at] = value;
+            else static_cast<bf16*>(p.o)[at] = from_f32<bf16>(value);
+            if (j == 0 && p.lse != nullptr) p.lse[row + kv_head * G + h] = sum > 0.f ? big + log2f(sum) : neg_inf();
         }
-        const float value = sum > 0.f ? out / sum : 0.f;
-        const long long at = (row + kv_head * G + h) * D + j;
-        if (p.partition) static_cast<float*>(p.o)[at] = value;
-        else static_cast<bf16*>(p.o)[at] = from_f32<bf16>(value);
-        if (j == 0 && p.lse != nullptr) p.lse[row + kv_head * G + h] = sum > 0.f ? big + log2f(sum) : neg_inf();
     }
 }
 
