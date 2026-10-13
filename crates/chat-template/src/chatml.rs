@@ -159,15 +159,23 @@ pub fn tool_names(tools: &[String]) -> Option<String> {
     Some(names.join(" | "))
 }
 
-pub const JSON_GRAMMAR: &str = r#"json-object ::= "{" json-members? "}"
-json-members ::= json-pair ("," json-pair)*
-json-pair ::= json-string ":" json-value
+/// The JSON value production every tool grammar in this crate ends with.
+///
+/// `json-char` bars U+0000-U+001F, as RFC 8259 §7 does: a raw control
+/// character the grammar let through would be a call `serde_json` refuses.
+/// `ws` sits where RFC 8259 §2 allows insignificant whitespace — around the
+/// structural characters and nowhere else — so a model that writes `: ` or a
+/// newline between tokens keeps a legal token rather than running to budget.
+pub const JSON_GRAMMAR: &str = r#"json-object ::= "{" ws (json-members ws)? "}"
+json-members ::= json-pair (ws "," ws json-pair)*
+json-pair ::= json-string ws ":" ws json-value
 json-value ::= json-string | json-number | json-object | json-array | "true" | "false" | "null"
 json-string ::= "\"" json-chars "\""
 json-chars ::= json-char*
 json-char ::= [^"\\\x00-\x1f] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
 json-number ::= "-"? [0-9]+ ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
-json-array ::= "[" (json-value ("," json-value)*)? "]"
+json-array ::= "[" ws (json-value (ws "," ws json-value)* ws)? "]"
+ws ::= [ \t\n\r]*
 "#;
 
 impl Instruct for ChatMLInstruct {
@@ -265,6 +273,26 @@ struct ChatMLToolDecoder {
     inside: bool,
 }
 
+/// The first `</tool_call>` that is not inside a JSON string. Measured on the
+/// 27B: an argument string held the closer verbatim, and a search blind to
+/// string context cut the call in half and dropped both halves.
+fn closer_outside_string(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let closer = TOOL_CALL_CLOSE.as_bytes();
+    let mut at = 0;
+    let mut in_string = false;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' if in_string => at += 1,
+            b'"' => in_string = !in_string,
+            _ if !in_string && bytes[at..].starts_with(closer) => return Some(at),
+            _ => {}
+        }
+        at += 1;
+    }
+    None
+}
+
 impl ToolDecoder for ChatMLToolDecoder {
     fn feed(&mut self, tokens: &[u32]) -> Vec<ToolEvent> {
         let text = self.decoder.feed(tokens);
@@ -273,7 +301,7 @@ impl ToolDecoder for ChatMLToolDecoder {
         let mut events = Vec::new();
         loop {
             if self.inside {
-                let Some(at) = self.accumulated.find(TOOL_CALL_CLOSE) else {
+                let Some(at) = closer_outside_string(&self.accumulated) else {
                     return events;
                 };
                 let call = self.accumulated[..at].trim().to_string();
