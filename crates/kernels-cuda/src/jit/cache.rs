@@ -36,10 +36,19 @@ fn slot(key: &str) -> &'static Slot {
 
 pub(crate) fn resolve(root: &Root, instantiation: &str) -> Result<&'static Resolved, Fault> {
     bind_context()?;
-    let arch = arch().ok_or(Fault::Device {
+    let plain = arch().ok_or(Fault::Device {
         call: "cuDeviceGet",
         code: -1,
     })?;
+    let target = root.target(plain).ok_or_else(|| Fault::Compile {
+        unit: root.name,
+        log: format!(
+            "`{}` compiles for an arch-specific target and {plain} has none: \
+             the unit is for another chip",
+            root.name
+        ),
+    })?;
+    let arch = target.as_str();
     let key = root.key(instantiation, arch);
     let mut ordinal: i32 = 0;
     let code = unsafe { rt::cudaGetDevice(&raw mut ordinal) };
@@ -245,6 +254,14 @@ pub fn arch() -> Option<&'static str> {
         Some(format!("sm_{major}{minor}"))
     })
     .as_deref()
+}
+
+/// What the current device's arch-specific target admits under the NVRTC
+/// this process loaded: all false off a device, or when NVRTC is absent.
+#[must_use]
+pub fn features() -> crate::jit::Features {
+    let nvrtc = nvrtc::version().unwrap_or(crate::jit::Toolchain::ANY);
+    crate::jit::Features::of(arch().unwrap_or(""), nvrtc)
 }
 
 fn attribute(device: dr::CUdevice, which: dr::CUdevice_attribute) -> Option<i32> {

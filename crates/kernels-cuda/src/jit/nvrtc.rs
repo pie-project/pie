@@ -261,14 +261,24 @@ fn tile_header_mismatch(log: &str) -> Option<String> {
     )
 }
 
+/// `sm_XY`, its arch-specific `sm_XYa` or its family `sm_XYf`: each makes
+/// NVRTC emit SASS.
+fn real(arch: &str) -> bool {
+    let Some(rest) = arch.strip_prefix("sm_") else {
+        return false;
+    };
+    let digits = rest.strip_suffix(['a', 'f']).unwrap_or(rest);
+    digits.len() >= 2 && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
 fn options(arch: &str, extra: &[&str]) -> Result<Vec<CString>, Fault> {
-    if !arch.starts_with("sm_") {
+    if !real(arch) {
         return Err(Fault::Compile {
             unit: "nvrtc",
             log: format!(
-                "`{arch}` is not a real architecture: only `sm_XY` makes NVRTC emit SASS, \
-                 and a virtual `compute_XY` would hand the driver PTX to JIT a second time \
-                 at load"
+                "`{arch}` is not a real architecture: only `sm_XY` (or its `sm_XYa`/`sm_XYf` \
+                 twin) makes NVRTC emit SASS, and a virtual `compute_XY` would hand the \
+                 driver PTX to JIT a second time at load"
             ),
         });
     }
@@ -325,7 +335,7 @@ impl Drop for Program {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jit::Root;
+    use crate::jit::{Features, Root, Toolchain};
 
     /// The units that include the fp8 shim directly, each named with a kernel
     /// that converts fp8 and one that does not. The bf16 one is the point:
@@ -376,6 +386,86 @@ mod tests {
             eprintln!("skipped: libnvrtc is not loadable on this box");
         }
         present
+    }
+
+    #[test]
+    fn the_arch_specific_and_family_targets_are_real_and_a_virtual_one_is_not() {
+        for real in ["sm_80", "sm_100", "sm_100a", "sm_103a", "sm_120a", "sm_100f"] {
+            assert!(options(real, &[]).is_ok(), "{real} emits SASS");
+        }
+        for not in ["compute_100a", "sm_", "sm_a", "sm_100b", "sm_10x"] {
+            assert!(options(not, &[]).is_err(), "{not} is no target");
+        }
+    }
+
+    /// Every tcgen05 wrapper, issued once: what the arch-specific target
+    /// must take and the plain one must refuse.
+    const TCGEN05_PROBE: &str = r#"
+#include "prelude/tc5.cuh"
+namespace pie {
+__global__ void tc5_probe(const __grid_constant__ tc5::TmaMap map, const void* src, unsigned* out) {
+    using namespace tc5;
+    __shared__ alignas(1024) unsigned char tile[1024];
+    __shared__ u64 bar;
+    __shared__ u32 slot;
+    if (threadIdx.x == 0) {
+        bar_init(&bar, 1);
+        bar_init_fence();
+        bar_arrive_expect_tx(&bar, 1024);
+        tma_load_2d(tile, &bar, &map, 0, 0);
+        bulk_load(tile, src, 512, &bar);
+        bar_wait(&bar, 0);
+    }
+    tmem_alloc(&slot, 32);
+    tmem_relinquish();
+    tc_fence_before();
+    __syncthreads();
+    tc_fence_after();
+    const u32 t = slot;
+    const u64 d = sdesc_sw128(smem_addr(tile));
+    if (threadIdx.x == 0) {
+        tc_cp_sf_atom(t, sdesc_sf(smem_addr(tile)));
+        mma_f16(t, d, d, idesc_dense(kF16Bf16, kF16Bf16, 128, 32), false);
+        mma_f8f6f4(t, d, d, idesc_dense(kE4M3, kE4M3, 128, 32), true);
+        mma_mxf8f6f4(t, d, d, idesc_scaled(kE4M3, kE2M1, 128, 32, true), true, t, t);
+        mma_nvf4(t, d, d, idesc_scaled(kNvE2M1, kNvE2M1, 128, 32, false), true, t, t);
+        tc_commit(&bar);
+    }
+    u32 v[32];
+    tmem_ld32(t, v);
+    tmem_wait_ld();
+    out[threadIdx.x] = v[threadIdx.x % 32];
+    tmem_dealloc(t, 32);
+}
+}
+"#;
+
+    /// tcgen05 exists at the arch-specific target alone: the wrappers lower
+    /// at sm_100a and sm_103a, and the plain sm_100 refuses their PTX.
+    #[test]
+    fn the_tcgen05_wrappers_lower_at_the_arch_specific_targets_only() {
+        if !nvrtc_is_here() || !Features::NVRTC.met_by(version().unwrap_or(Toolchain::ANY)) {
+            return;
+        }
+        let wanted = vec!["::pie::tc5_probe".to_owned()];
+        let job = |arch| Job {
+            name: "tc5_probe",
+            source: TCGEN05_PROBE.to_owned(),
+            arch,
+            options: &[],
+            headers: crate::source::DEVICE_HEADERS,
+            floor: Features::NVRTC,
+            wanted: &wanted,
+        };
+        for arch in ["sm_100a", "sm_103a"] {
+            if let Err(why) = compile_text(&job(arch)) {
+                panic!("the tcgen05 unit would not lower at {arch}: {why}");
+            }
+        }
+        assert!(
+            compile_text(&job("sm_100")).is_err(),
+            "the plain target took tcgen05"
+        );
     }
 
     /// sm_80 has no fp8 cvt and takes the portable path; sm_89 is where the
