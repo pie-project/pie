@@ -29,3 +29,6 @@ pub mod tiled;
 
 #[cfg(feature = "cuda")]
 pub mod tc5;
+
+#[cfg(feature = "cuda")]
+pub mod act_quant;
