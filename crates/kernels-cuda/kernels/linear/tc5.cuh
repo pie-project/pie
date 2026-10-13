@@ -14,8 +14,11 @@
 //
 // Warps 0-3 drain the accumulator (one TMEM lane quarter each), warp 4's
 // lane 0 is the TMA producer, warp 5 owns TMEM and its lane 0 issues every
-// MMA. A stage is 128 bytes of K for each row of both tiles, so every kind
-// steps the K-major descriptor by 32 bytes four times a stage.
+// MMA, warp 6's lane 0 copies block scales into TMEM. A stage is 128 bytes
+// of K for each row of both tiles, so every kind steps the K-major
+// descriptor by 32 bytes four times a stage. When the tiles are too few to
+// fill the SMs, each splits K and the splits sum in f32 at `part`, which
+// tc5_finalize rounds to y.
 //
 // A pair (kPair 2, a cluster of two) runs cta_group::2: each CTA loads its
 // 128 rows of P and half of Q's rows, rank 0 issues the 256-row MMA over
