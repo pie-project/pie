@@ -642,6 +642,7 @@ impl Run<'_> {
     ) -> Result<(), kernels_cuda::Error> {
         let (codes, scales, biases, seat) = self.planes(bank);
         let routes = self.tensor(routes);
+        per_tensor_e4m3_is_a_table("linear.moe_matmul_select_quant", codes)?;
         if codes.dtype == Dtype::Nvfp4 {
             let tensor_scales = tensor_scales("linear.moe_matmul_select_quant", biases)?;
             let (codes, scales, tensor_scales, routes, seat) =
@@ -696,6 +697,7 @@ impl Run<'_> {
         const OP: &str = "linear.moe_matmul_select_act_quant";
         lowp(OP)?;
         let (codes, scales, biases, seat) = self.planes(bank);
+        per_tensor_e4m3_is_a_table(OP, codes)?;
         if seat.streams() || crate::device::alloc::is_host_pointer(codes.ptr) {
             return Err(kernels_cuda::Error::Backend {
                 op: OP,
@@ -848,6 +850,9 @@ impl Run<'_> {
         w: &ValueId,
         y: &ValueId,
     ) -> Result<(), kernels_cuda::Error> {
+        if let Some((codes, ..)) = self.maybe_planes(*w) {
+            per_tensor_e4m3_is_a_table("linear.matmul", codes)?;
+        }
         match self.maybe_planes(*w) {
             Some((codes, scales, biases, seat)) if codes.dtype == Dtype::Nvfp4 => {
                 linear::nvfp4::matmul(
@@ -905,6 +910,9 @@ impl Run<'_> {
         w: &ValueId,
         y: &ValueId,
     ) -> Result<(), kernels_cuda::Error> {
+        if let Some((codes, ..)) = self.maybe_planes(*w) {
+            per_tensor_e4m3_is_a_table("linear.lm_head", codes)?;
+        }
         match self.maybe_planes(*w) {
             Some((codes, scales, biases, seat)) if codes.dtype == Dtype::Nvfp4 => {
                 linear::nvfp4::matmul(
@@ -955,6 +963,19 @@ impl Run<'_> {
             },
         }
     }
+}
+
+/// A per-tensor e4m3 plane is a gathered table's, which no product reads.
+fn per_tensor_e4m3_is_a_table(op: &'static str, codes: Tensor) -> Result<(), kernels_cuda::Error> {
+    if codes.dtype == Dtype::E4m3tensor {
+        return Err(kernels_cuda::Error::Backend {
+            op,
+            detail: "a per-tensor e4m3 plane is read by the n-gram gather alone; no cuda \
+                     product multiplies one"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// An nvfp4 bank's tensor scales, which its planes carry where an affine

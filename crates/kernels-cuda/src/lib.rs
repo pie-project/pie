@@ -25,6 +25,9 @@ pub mod attn_ple;
 #[path = "layout/embed_concat.rs"]
 pub mod layout_embed_concat;
 
+#[path = "layout/embed_e4m3.rs"]
+pub mod layout_embed_e4m3;
+
 #[path = "layout/pixels.rs"]
 pub mod layout_pixels;
 

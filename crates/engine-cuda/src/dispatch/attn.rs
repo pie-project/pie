@@ -1523,6 +1523,13 @@ impl Run<'_> {
         k: u32,
     ) -> Result<kernels_cuda::Tensor, kernels_cuda::Error> {
         match self.maybe_planes(w) {
+            Some((codes, ..)) if codes.dtype == poem_ir::Dtype::E4m3tensor => {
+                Err(kernels_cuda::Error::Backend {
+                    op,
+                    detail: "a per-tensor e4m3 plane is read by the n-gram gather alone"
+                        .to_string(),
+                })
+            }
             Some((codes, scales, biases, seat)) if codes.dtype == poem_ir::Dtype::Nvfp4 => {
                 kernels_cuda::linear::nvfp4::decoded_plane(
                     self.ctx(),
