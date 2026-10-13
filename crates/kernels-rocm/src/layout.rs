@@ -610,7 +610,11 @@ fn permute_rows(
 
 const TOPK_FILE: &str = "layout/topk.hip";
 
-const TOPK_THREADS: u32 = 128;
+const TOPK_THREADS: u32 = 1024;
+
+/// The dynamic LDS a top-k block may pool candidates in: 64 KiB less the
+/// kernel's own few KiB.
+const TOPK_POOL_BYTES: u32 = 56 * 1024;
 
 pub fn argmax(ctx: &Ctx, x: Tensor, column: u32, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "layout.argmax";
@@ -684,13 +688,29 @@ pub fn topk(
             format!("the indices plane is not [{rows}, {k}] i32"),
         ));
     }
+    // The kernel pools the columns reaching its floor in LDS: at most k
+    // threads' columns, ⌈width / threads⌉ + 8 each, as 8-byte keys.
+    let pool = u64::from(k) * (u64::from(x.width.div_ceil(TOPK_THREADS)) + 8) * 8;
+    let pool = u32::try_from(pool)
+        .ok()
+        .filter(|&bytes| bytes <= TOPK_POOL_BYTES)
+        .ok_or_else(|| {
+            refuse(
+                OP,
+                format!(
+                    "a {}-wide row pools {pool} bytes of top-{k} candidates, past the {TOPK_POOL_BYTES} \
+                     bytes of LDS a block holds beside its own",
+                    x.width
+                ),
+            )
+        })?;
     ctx.fire(
         OP,
         Fire::at(
             TOPK_FILE,
             symbol(&format!("::pie::layout::topk_rows<{t}, {k}>")),
         )
-        .apply(Launch::per_row(rows, TOPK_THREADS)),
+        .apply(Launch::per_row(rows, TOPK_THREADS).smem(pool)),
         &[
             x.arg(),
             values.arg(),

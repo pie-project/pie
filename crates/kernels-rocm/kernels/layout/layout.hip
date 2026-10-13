@@ -29,6 +29,121 @@ __global__ void embed(const i32* __restrict__ ids, const bf16* __restrict__ tabl
     }
 }
 
+// The token's embedding row, scaled and added into the residual stream:
+//   e = table[id], ê = e·a, y += ê, ŷ = y·b
+// with a and b rounded to bf16 first and every intermediate rounded where
+// it lands, as the model computes it in bf16. One thread per element.
+__device__ __forceinline__ float bf16_round(float v) { return to_f32(from_f32<bf16>(v)); }
+
+__global__ void embed_scale_add(const i32* __restrict__ ids, const bf16* __restrict__ table,
+                                bf16* __restrict__ e, float a, bf16* __restrict__ e_scaled,
+                                bf16* __restrict__ y, float b, bf16* __restrict__ y_scaled, int hidden,
+                                int vocab, int rows, const u32* __restrict__ win) {
+    const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= static_cast<long long>(rows) * hidden) return;
+    const Window window{win};
+    const long long n = idx / hidden;
+    if (!window.live(n)) return;
+    const long long row = window.plane(n);
+    const int h = static_cast<int>(idx % hidden);
+    const i32 id = ids[row];
+    const long long at = row * hidden + h;
+    const bf16 ev = table[static_cast<long long>(id >= 0 && id < vocab ? id : 0) * hidden + h];
+    e[at] = ev;
+    const float es = bf16_round(to_f32(ev) * bf16_round(a));
+    e_scaled[at] = from_f32<bf16>(es);
+    const float yv = bf16_round(to_f32(y[at]) + es);
+    y[at] = from_f32<bf16>(yv);
+    y_scaled[at] = from_f32<bf16>(yv * bf16_round(b));
+}
+
+// embed_scale_add whose residual is one layer's slice of a stacked row,
+// [.. | layer col..col+hidden | ..], landing in its own plane.
+__global__ void embed_scale_add_select(const i32* __restrict__ ids, const bf16* __restrict__ table,
+                                       bf16* __restrict__ e, float a, bf16* __restrict__ e_scaled,
+                                       const bf16* __restrict__ stacked, int stacked_width, int col,
+                                       bf16* __restrict__ y_out, float b, bf16* __restrict__ y_scaled,
+                                       int hidden, int vocab, int rows, const u32* __restrict__ win) {
+    const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= static_cast<long long>(rows) * hidden) return;
+    const Window window{win};
+    const long long n = idx / hidden;
+    if (!window.live(n)) return;
+    const long long row = window.plane(n);
+    const int h = static_cast<int>(idx % hidden);
+    const i32 id = ids[row];
+    const long long at = row * hidden + h;
+    const bf16 ev = table[static_cast<long long>(id >= 0 && id < vocab ? id : 0) * hidden + h];
+    e[at] = ev;
+    const float es = bf16_round(to_f32(ev) * bf16_round(a));
+    e_scaled[at] = from_f32<bf16>(es);
+    const float yv = bf16_round(to_f32(stacked[row * stacked_width + col + h]) + es);
+    y_out[at] = from_f32<bf16>(yv);
+    y_scaled[at] = from_f32<bf16>(yv * bf16_round(b));
+}
+
+// One rank's band of a vocabulary-sharded table: rows [offset, offset +
+// local) gather, every other id lands zeros (the all-reduce after sums the
+// bands). One block per row.
+template <class T>
+__global__ void embed_vocab_shard(const i32* __restrict__ ids, const T* __restrict__ table,
+                                  T* __restrict__ y, int hidden, int local, int offset,
+                                  const u32* __restrict__ win) {
+    const Window window{win};
+    if (!window.live(blockIdx.x)) return;
+    const long long row = window.plane(blockIdx.x);
+    const int id = ids[row] - offset;
+    const bool mine = id >= 0 && id < local;
+    const T* src = table + static_cast<long long>(mine ? id : 0) * hidden;
+    T* dst = y + row * hidden;
+    for (int h = threadIdx.x; h < hidden; h += blockDim.x) dst[h] = mine ? src[h] : from_f32<T>(0.f);
+}
+
+// An all-gather's rank-major landing, `world` planes of [rows, width], laid
+// side by side: dst[r] = [src₀[r] | src₁[r] | ...]. One thread per element.
+template <class T>
+__global__ void gather_width_concat(const T* __restrict__ src, T* __restrict__ dst, int rows, int width,
+                                    int world) {
+    const long long wide = static_cast<long long>(width) * world;
+    const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= static_cast<long long>(rows) * wide) return;
+    const long long r = idx / wide;
+    const long long c = idx - r * wide;
+    const long long k = c / width;
+    dst[idx] = src[(k * rows + r) * width + (c - k * width)];
+}
+
+// A fused projection row [q | k | v] into its three planes. Grid: (rows,
+// blocks striding the wider of q and kv).
+template <class T>
+__global__ void split_qkv(const T* __restrict__ src, T* __restrict__ q, T* __restrict__ k,
+                          T* __restrict__ v, i32 q_dim, i32 kv_dim, const u32* __restrict__ win) {
+    const Window window{win};
+    if (!window.live(blockIdx.x)) return;
+    const long long row = window.plane(blockIdx.x);
+    const T* s = src + row * (q_dim + 2 * kv_dim);
+    const int first = blockIdx.y * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.y;
+    for (int j = first; j < q_dim; j += stride) q[row * q_dim + j] = s[j];
+    for (int j = first; j < kv_dim; j += stride) {
+        k[row * kv_dim + j] = s[q_dim + j];
+        v[row * kv_dim + j] = s[q_dim + kv_dim + j];
+    }
+}
+
+// out[n] = table[n][offset .. offset + width]: one layer's slice of a
+// stacked row. One block per row.
+template <class T>
+__global__ void select(const T* __restrict__ table, T* __restrict__ out, int stride, int offset, int width,
+                       const u32* __restrict__ win) {
+    const Window window{win};
+    if (!window.live(blockIdx.x)) return;
+    const long long row = window.plane(blockIdx.x);
+    const T* src = table + row * stride + offset;
+    T* dst = out + row * width;
+    for (int i = threadIdx.x; i < width; i += blockDim.x) dst[i] = src[i];
+}
+
 // A packed row of heads [q₀ g₀ | q₁ g₁ | ...] (each head_dim wide) into q
 // and gate. Grid: (rows, heads).
 template <class T>
@@ -90,6 +205,30 @@ __global__ void scatter_rows(const U* __restrict__ tight, U* __restrict__ wide,
                              const i32* __restrict__ index, int units) {
     const U* src = tight + static_cast<long long>(blockIdx.x) * units;
     U* dst = wide + static_cast<long long>(index[blockIdx.x]) * units;
+    for (int i = threadIdx.x; i < units; i += blockDim.x) dst[i] = src[i];
+}
+
+// o[n] = x[perm[n]], `units` U per row. One block per row.
+template <class U>
+__global__ void pack_rows(const U* __restrict__ x, const i32* __restrict__ perm, U* __restrict__ o,
+                          int units, const u32* __restrict__ win) {
+    const Window window{win};
+    if (!window.live(blockIdx.x)) return;
+    const long long row = window.plane(blockIdx.x);
+    const U* src = x + static_cast<long long>(perm[row]) * units;
+    U* dst = o + row * units;
+    for (int i = threadIdx.x; i < units; i += blockDim.x) dst[i] = src[i];
+}
+
+// o[perm[n]] = x[n], `units` U per row: pack_rows undone. One block per row.
+template <class U>
+__global__ void unpack_rows(const U* __restrict__ x, const i32* __restrict__ perm, U* __restrict__ o,
+                            int units, const u32* __restrict__ win) {
+    const Window window{win};
+    if (!window.live(blockIdx.x)) return;
+    const long long row = window.plane(blockIdx.x);
+    const U* src = x + row * units;
+    U* dst = o + static_cast<long long>(perm[row]) * units;
     for (int i = threadIdx.x; i < units; i += blockDim.x) dst[i] = src[i];
 }
 

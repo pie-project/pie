@@ -6,7 +6,8 @@ use crate::tensor::Tensor;
 
 const FILE: &str = "layout/embed_weighted.hip";
 
-const WARP: u32 = 32;
+/// Lanes per wavefront on CDNA: a block is a whole number of them.
+const WAVE: u32 = 64;
 
 const MAX_BLOCK: u32 = 1024;
 
@@ -68,9 +69,9 @@ pub fn embed_weighted(
     let rows = nonzero(OP, "rows", y.rows)?;
     let threads = y
         .width
-        .div_ceil(WARP)
+        .div_ceil(WAVE)
         .max(1)
-        .saturating_mul(WARP)
+        .saturating_mul(WAVE)
         .min(MAX_BLOCK);
     ctx.fire(
         OP,
