@@ -572,6 +572,9 @@ fn moe_matmul_dense() {
         (3, 2, 1, 13, 64, "batch"),
         (8, 40, 4, 520, 264, "batch"),
         (5, 64, 2, 136, 2312, "batch"),
+        (4, 30, 4, 264, 520, "batch"),
+        (3, 46, 2, 136, 1032, "batch"),
+        (2, 60, 2, 200, 1024, "batch"),
         (4, 96, 4, 136, 512, "batch"),
         (3, 100, 2, 300, 264, "batch"),
         (8, 40, 4, 520, 256, "grouped"),
@@ -597,6 +600,8 @@ fn moe_matmul_dense() {
             t.moe_grouped = leg != "stream";
             t.moe_batch = leg == "batch";
             t.moe_batch_from = 1;
+            // Up to 64 routes an expert, so a 64-route item fills.
+            t.moe_dense_batch_until = 64;
         });
         for by_token in [true, false] {
             let routes = make_routes(t, kk, e, u64::from(n), leg != "blas");
@@ -1588,6 +1593,7 @@ fn bench_moe_models() {
     let ctx = tuned(&gpu, |t| {
         if let Ok(v) = std::env::var("PIE_BENCH_MOE_BATCH_UNTIL") {
             t.moe_batch_until = v.parse().unwrap();
+            t.moe_dense_batch_until = t.moe_batch_until;
         }
         if let Ok(v) = std::env::var("PIE_BENCH_MOE_BATCH_FROM") {
             t.moe_batch_from = v.parse().unwrap();
@@ -1608,6 +1614,8 @@ fn bench_moe_models() {
             4096u32,
         ),
         ("glm53-mini down u4", Codec::Affine4, 32, 8, 4096, 2048),
+        ("glm53-mini gate_up bf16", Codec::Bf16, 32, 8, 4096, 4096),
+        ("glm53-mini down bf16", Codec::Bf16, 32, 8, 4096, 2048),
         ("kimi-k3 gate_up mxfp4", Codec::Mxfp4, 896, 16, 6144, 3584),
         ("kimi-k3 down mxfp4", Codec::Mxfp4, 896, 16, 3584, 3072),
         ("dsv41 gate mxfp4", Codec::Mxfp4, 384, 6, 2304, 5120),

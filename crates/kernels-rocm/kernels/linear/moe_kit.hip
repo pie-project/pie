@@ -1078,6 +1078,9 @@ __device__ __forceinline__ void batch_tile(const T* __restrict__ act, const i32*
     const int row0 = (tile * WAVES + wave) * (SWIGLU ? 16 : 16 * NBW);
     const int all = (k + KC - 1) / KC, first = s0;
     const int stages = (s1 < 0 ? all : min(s1, all)) - first;
+    // The item's 16-route blocks that hold a route: the rest neither read
+    // their activation nor multiply.
+    const int live_mb = MB == 1 ? 1 : __builtin_amdgcn_readfirstlane((count + 15) / 16);
     const typename C::Run run = C::run(p, SWIGLU ? 2 * n : n, k);
     // The bank row of the wave's local row r; a row past the bank reads the
     // last.
@@ -1190,7 +1193,8 @@ __device__ __forceinline__ void batch_tile(const T* __restrict__ act, const i32*
             for (int q = 0; q < W; ++q)
 #pragma unroll
                 for (int mb = 0; mb < MB; ++mb)
-                    xv[j][q][mb] = *reinterpret_cast<const b128*>(xb + mb * 16 * LD + C::kpos(j, g) + 8 * q);
+                    if (mb < live_mb)
+                        xv[j][q][mb] = *reinterpret_cast<const b128*>(xb + mb * 16 * LD + C::kpos(j, g) + 8 * q);
         if constexpr (C::kFold) {
 #pragma unroll
             for (int j = 0; j < KU; ++j)
@@ -1220,6 +1224,7 @@ __device__ __forceinline__ void batch_tile(const T* __restrict__ act, const i32*
                     C::decode(pc[nb], cw[j][nb], q, d);
 #pragma unroll
                     for (int mb = 0; mb < MB; ++mb) {
+                        if (mb >= live_mb) continue;
                         const b128& x = xv[j][q][mb];
                         mfma_cd& c = C::kFold ? part[nb][mb] : acc[nb][mb];
                         c = mma16x16<T>(x.w[0], x.w[1], d[0], d[1], c);
@@ -1229,6 +1234,7 @@ __device__ __forceinline__ void batch_tile(const T* __restrict__ act, const i32*
                 if constexpr (C::kFold) {
 #pragma unroll
                     for (int mb = 0; mb < MB; ++mb) {
+                        if (mb >= live_mb) continue;
                         const b128& x = xv[j][q][mb];
                         xsum[mb] = mma16x16<T>(x.w[0], x.w[1], kOnes, kOnes, xsum[mb]);
                         xsum[mb] = mma16x16<T>(x.w[2], x.w[3], kOnes, kOnes, xsum[mb]);

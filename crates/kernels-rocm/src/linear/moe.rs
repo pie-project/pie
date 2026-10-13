@@ -412,15 +412,16 @@ pub fn matmul_select(
     // routes.
     if let Some(count) = dense_experts(x, bank, y, experts)
         && x.width.is_multiple_of(8)
-        && let Some(mt) = batch_items(ctx, &fan, count)
+        && let Some(mt) = batch_items(ctx, &fan, count, 64, ctx.tuning().moe_dense_batch_until)
     {
         let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+        let nbw = dense_nbw(mt);
         return select_batch(
             ctx,
             OP,
             FILE,
             &format!(
-                "::pie::linear::moe_matmul_select_dense_batch<{t}, ::pie::i32({mt}), ::pie::i32({BATCH_NBW})>"
+                "::pie::linear::moe_matmul_select_dense_batch<{t}, ::pie::i32({mt}), ::pie::i32({nbw})>"
             ),
             x,
             &[bank.arg()],
@@ -429,6 +430,7 @@ pub fn matmul_select(
             &fan,
             count,
             mt,
+            nbw,
             None,
         );
     }
@@ -487,23 +489,30 @@ fn grouped_worth(
 /// 16-row weight blocks a batch wave takes (the kernels' `NBW`), and so the
 /// rows a batch block takes.
 const BATCH_NBW: u32 = 1;
-const BATCH_ROWS: u32 = 64 * BATCH_NBW;
+
+/// 16-row weight blocks a dense batch wave takes for `mt`-route items: two
+/// at 64, each activation piece read from LDS then feeding twice the products.
+const fn dense_nbw(mt: u32) -> u32 {
+    if mt >= 64 { DENSE_WIDE_NBW } else { BATCH_NBW }
+}
+const DENSE_WIDE_NBW: u32 = 2;
 
 /// The routes a batch item takes, if the batch legs take this fire: from
 /// `kernel.moe.batch_from` tokens' routes (one token's read each expert once
 /// on the stream, which orders nothing), while the experts average (routes over
-/// experts, rounded up) at most `kernel.moe.batch_until`. An item is the
-/// least of 4, 8, 16 and 32 routes past the average by two of its square
-/// roots and one, so the busier experts of a random routing still read their
-/// weight once, and an item stages no more empty rows than that takes.
-fn batch_items(ctx: &Ctx, fan: &Selected, experts: u32) -> Option<u32> {
+/// experts, rounded up) at most `until`. An item is the least of 4, 8, 16, 32
+/// and (a bank whose kernels take it, `widest`) 64 routes past the average by
+/// two of its square roots and one, so the busier experts of a random routing
+/// still read their weight once, and an item stages no more empty rows than
+/// that takes; past them an expert takes several of the widest.
+fn batch_items(ctx: &Ctx, fan: &Selected, experts: u32, widest: u32, until: u32) -> Option<u32> {
     let t = ctx.tuning();
     let top_k = fan.top_k.unsigned_abs();
     if !t.moe_batch || fan.route_count < t.moe_batch_from.saturating_mul(top_k) {
         return None;
     }
     let per = fan.route_count.div_ceil(experts);
-    if per > t.moe_batch_until {
+    if per > until {
         return None;
     }
     // per + 2·√per + 1 = (√per + 1)², so an item of `mt` covers it while
@@ -512,12 +521,13 @@ fn batch_items(ctx: &Ctx, fan: &Selected, experts: u32) -> Option<u32> {
         0..=1 => 4,
         2..=3 => 8,
         4..=9 => 16,
-        _ => 32,
+        10..=25 => 32,
+        _ => widest,
     })
 }
 
 /// A batch fire: routes ordered by expert into `mt`-route items, then one
-/// item a block row against `BATCH_ROWS` weight rows a block. `planes` are
+/// item a block row against 64·nbw weight rows a block. `planes` are
 /// the bank's arguments, between the work list and the result; a packed
 /// bank's seat follows the extents.
 #[allow(clippy::too_many_arguments)]
@@ -533,6 +543,7 @@ fn select_batch(
     fan: &Selected,
     experts: u32,
     mt: u32,
+    nbw: u32,
     seat: Option<GroupSeat>,
 ) -> Result<(), Error> {
     let k = stated(op, x.width)?;
@@ -559,7 +570,7 @@ fn select_batch(
     ctx.fire(
         op,
         Fire::at(file, symbol(entry)).apply(Launch::grid(
-            [ordered.work_cap, y.width.div_ceil(BATCH_ROWS), 1],
+            [ordered.work_cap, y.width.div_ceil(64 * nbw), 1],
             [GROUP_BLOCK, 1, 1],
         )),
         &args,
@@ -1099,7 +1110,7 @@ fn matmul_select_mxfp4(
     let experts = codes.rows.clamp(1, ORDER_EXPERT_CAP);
     if x.dtype == Dtype::Bf16
         && codes.rows <= ORDER_EXPERT_CAP
-        && let Some(mt) = batch_items(ctx, &fan, experts)
+        && let Some(mt) = batch_items(ctx, &fan, experts, 32, ctx.tuning().moe_batch_until)
         // Short of 32 routes a lane reads its two scale bytes as one.
         && (mt == 32 || x.width.is_multiple_of(2 * MXFP4_BLOCK))
     {
@@ -1121,6 +1132,7 @@ fn matmul_select_mxfp4(
             &fan,
             experts,
             mt,
+            BATCH_NBW,
             Some(seat),
         );
     }
@@ -1317,7 +1329,7 @@ fn matmul_select_mlxu4(
         && x.dtype == Dtype::Bf16
         && codes.rows <= ORDER_EXPERT_CAP
         && x.width.is_multiple_of(2 * group)
-        && let Some(mt) = batch_items(ctx, &fan, experts)
+        && let Some(mt) = batch_items(ctx, &fan, experts, 32, ctx.tuning().moe_batch_until)
     {
         return select_batch(
             ctx,
@@ -1334,6 +1346,7 @@ fn matmul_select_mlxu4(
             &fan,
             experts,
             mt,
+            BATCH_NBW,
             Some(seat),
         );
     }

@@ -488,7 +488,7 @@ __global__ __launch_bounds__(256) void moe_matmul_select_dense_batch(
     GroupItem item;
     if (!group_item(offsets, work, num_experts, MT, item)) return;
     const T* w = bank + static_cast<long long>(item.expert) * n * k;
-    batch_tile<BatchDense<T, 256>, T, MT, NBW, 3>(act, order, item.begin, item.count, {w}, nullptr, out, act_div, n,
+    batch_tile<BatchDense<T, MT >= 32 ? 128 : 256>, T, MT, NBW, 3>(act, order, item.begin, item.count, {w}, nullptr, out, act_div, n,
                                                   k, blockIdx.y);
 }
 

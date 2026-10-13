@@ -165,6 +165,12 @@ pub struct MoeBatchFrom(pub u32);
 #[decision(id = "kernel.moe.batch_until", constant(range(0..=4096)), default = 32, tune = search)]
 pub struct MoeBatchUntil(pub u32);
 
+/// The same for a bf16 / f16 bank, whose 64-route items keep the matrix
+/// core ahead of the grouped GEMM's up to ~4 such items an expert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.dense_batch_until", constant(range(0..=4096)), default = 160, tune = search)]
+pub struct MoeDenseBatchUntil(pub u32);
+
 /// The rows from which, and up to which, a bf16 projection (and the fused
 /// gate/up SwiGLU) takes the batch engine over hipBLASLt; until 0, never.
 /// On MI300X it wins by 1.2x only at a few rows over a wide bank (Qwen3.8's
@@ -215,6 +221,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeBatch>()
         .add::<MoeBatchFrom>()
         .add::<MoeBatchUntil>()
+        .add::<MoeDenseBatchUntil>()
         .add::<DenseBatchFrom>()
         .add::<DenseBatchUntil>()
         .add::<DenseBatchWeightMi>()
@@ -253,6 +260,7 @@ pub struct Tuning {
     pub moe_batch: bool,
     pub moe_batch_from: u32,
     pub moe_batch_until: u32,
+    pub moe_dense_batch_until: u32,
     pub dense_batch_from: u32,
     pub dense_batch_until: u32,
     pub dense_batch_weight_mi: u32,
@@ -289,6 +297,7 @@ impl Tuning {
         moe_batch: true,
         moe_batch_from: 2,
         moe_batch_until: 32,
+        moe_dense_batch_until: 160,
         dense_batch_from: 8,
         dense_batch_until: 16,
         dense_batch_weight_mi: 128,
@@ -325,6 +334,7 @@ impl Tuning {
             moe_batch: profile.on::<MoeBatch>(&Anywhere),
             moe_batch_from: profile.get::<MoeBatchFrom>().0,
             moe_batch_until: profile.get::<MoeBatchUntil>().0,
+            moe_dense_batch_until: profile.get::<MoeDenseBatchUntil>().0,
             dense_batch_from: profile.get::<DenseBatchFrom>().0,
             dense_batch_until: profile.get::<DenseBatchUntil>().0,
             dense_batch_weight_mi: profile.get::<DenseBatchWeightMi>().0,
