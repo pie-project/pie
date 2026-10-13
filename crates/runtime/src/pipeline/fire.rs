@@ -620,8 +620,8 @@ fn prepare_host_kv_reserved(
         let page = u64::from(stores.kv_page_size);
         return Err(ReservedError::Fatal(format!(
             "pipeline: this fire would grow its sequence to {} KV page(s) (up to {} tokens), \
-             past the model's max_context of {} tokens ({} page(s)); the sequence is at \
-             its ceiling and cannot take another token",
+             past the {} tokens ({} page(s)) one sequence holds on this engine; raise \
+             `[engine] max_model_len` or send fewer tokens",
             writable.end,
             writable.end.saturating_mul(page),
             stores.context_pages.saturating_mul(page),
