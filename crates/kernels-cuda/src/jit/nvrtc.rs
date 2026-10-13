@@ -390,7 +390,9 @@ mod tests {
 
     #[test]
     fn the_arch_specific_and_family_targets_are_real_and_a_virtual_one_is_not() {
-        for real in ["sm_80", "sm_100", "sm_100a", "sm_103a", "sm_120a", "sm_100f"] {
+        for real in [
+            "sm_80", "sm_100", "sm_100a", "sm_103a", "sm_120a", "sm_100f",
+        ] {
             assert!(options(real, &[]).is_ok(), "{real} emits SASS");
         }
         for not in ["compute_100a", "sm_", "sm_a", "sm_100b", "sm_10x"] {

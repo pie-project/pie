@@ -1,0 +1,526 @@
+//! Native datacenter-Blackwell GEMMs: one persistent tcgen05 kernel
+//! (`linear/tc5.cuh`) specialized per kind and tile at JIT time, fed by
+//! TMA tensor maps encoded here. `y[m][n] = alpha * sum_k act[m][k] * w[n][k]`
+//! with both operands K-major and `y` bf16, `m x n` with row stride `n`.
+//!
+//! Block scales are 512-byte atoms of 128 rows x 4 scale columns (see
+//! [`atom_offset`]), atoms of one 128-row block consecutive along K, rows
+//! padded to whole blocks with finite (zero) bytes. A scale column covers
+//! `gran` K: 16 for NVFP4's ue4m3, 32 or 128 for ue8m0.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+use cudarc::driver::sys as dr;
+
+use crate::error::Error;
+use crate::jit::{ArgValue, Ctx, Fire, Launch, refuse, symbol};
+
+const OP: &str = "linear.tc5";
+const FILE: &str = "linear/tc5.cuh";
+const THREADS: u32 = 192;
+const SMEM_CAP: u32 = 232_448;
+
+/// An operand's element type as it lies in global memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Elem {
+    Bf16,
+    /// fp8 e4m3, one a byte.
+    E4m3,
+    /// fp4 e2m1, two a byte, the even element in the low nibble.
+    E2m1,
+}
+
+/// A block-scale tensor in the atom layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Scales {
+    pub ptr: u64,
+    /// The K a scale covers: 16 (ue4m3), 32 or 128 (ue8m0).
+    pub gran: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Operand {
+    pub ptr: u64,
+    pub elem: Elem,
+    pub scales: Option<Scales>,
+}
+
+impl Operand {
+    #[must_use]
+    pub const fn plain(ptr: u64, elem: Elem) -> Self {
+        Self {
+            ptr,
+            elem,
+            scales: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn scaled(ptr: u64, elem: Elem, scales: u64, gran: u32) -> Self {
+        Self {
+            ptr,
+            elem,
+            scales: Some(Scales { ptr: scales, gran }),
+        }
+    }
+}
+
+/// The byte of scale `(row, col)` in an atom-layout tensor whose rows carry
+/// `cols` scale columns.
+#[must_use]
+pub const fn atom_offset(row: usize, col: usize, cols: usize) -> usize {
+    let atoms_k = cols.div_ceil(4);
+    ((row / 128) * atoms_k + col / 4) * 512 + (row % 32) * 16 + ((row / 32) % 4) * 4 + col % 4
+}
+
+/// The bytes an atom-layout scale tensor for `rows x k` at `gran` takes.
+#[must_use]
+pub const fn atom_bytes(rows: usize, k: usize, gran: usize) -> usize {
+    rows.div_ceil(128) * k.div_ceil(gran).div_ceil(4) * 512
+}
+
+/// Whether this device and NVRTC run the tcgen05 kernels.
+#[must_use]
+pub fn supported() -> bool {
+    crate::jit::cache::features().tcgen05
+}
+
+/// bf16 x bf16 -> bf16, f32 accumulation.
+pub fn gemm_bf16(ctx: &Ctx, act: u64, w: u64, y: u64, m: u32, n: u32, k: u32) -> Result<(), Error> {
+    gemm(
+        ctx,
+        Operand::plain(act, Elem::Bf16),
+        Operand::plain(w, Elem::Bf16),
+        y,
+        [m, n, k],
+        1.0,
+    )
+}
+
+/// fp8 e4m3 W8A8 with DeepSeek's blocks: one ue8m0 scale per 1x128 of the
+/// activation and per 128x128 of the weight, the weight's spread to every
+/// row of its block (gran 128 on both).
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_fp8_block(
+    ctx: &Ctx,
+    act: u64,
+    act_scales: u64,
+    w: u64,
+    w_scales: u64,
+    y: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> Result<(), Error> {
+    gemm(
+        ctx,
+        Operand::scaled(act, Elem::E4m3, act_scales, 128),
+        Operand::scaled(w, Elem::E4m3, w_scales, 128),
+        y,
+        [m, n, k],
+        1.0,
+    )
+}
+
+/// NVFP4 W4A4: e2m1 with a ue4m3 scale a 16, `alpha` the product of the
+/// two global scales.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_nvfp4(
+    ctx: &Ctx,
+    act: u64,
+    act_scales: u64,
+    w: u64,
+    w_scales: u64,
+    y: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    alpha: f32,
+) -> Result<(), Error> {
+    gemm(
+        ctx,
+        Operand::scaled(act, Elem::E2m1, act_scales, 16),
+        Operand::scaled(w, Elem::E2m1, w_scales, 16),
+        y,
+        [m, n, k],
+        alpha,
+    )
+}
+
+/// W4A8: MXFP4 weights (e2m1, ue8m0 a 32) against e4m3 activations with a
+/// ue8m0 scale a `act_gran` (32 or 128).
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_w4a8(
+    ctx: &Ctx,
+    act: u64,
+    act_scales: u64,
+    act_gran: u32,
+    w: u64,
+    w_scales: u64,
+    y: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> Result<(), Error> {
+    gemm(
+        ctx,
+        Operand::scaled(act, Elem::E4m3, act_scales, act_gran),
+        Operand::scaled(w, Elem::E2m1, w_scales, 32),
+        y,
+        [m, n, k],
+        1.0,
+    )
+}
+
+/// The kernel's operand kind, and each side's format code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Bf16,
+    Fp8,
+    Mx,
+    Nvf4,
+}
+
+impl Kind {
+    const fn code(self) -> u32 {
+        match self {
+            Self::Bf16 => 0,
+            Self::Fp8 => 1,
+            Self::Mx => 2,
+            Self::Nvf4 => 3,
+        }
+    }
+
+    const fn stage_k(self) -> u32 {
+        match self {
+            Self::Bf16 => 64,
+            Self::Nvf4 => 256,
+            Self::Fp8 | Self::Mx => 128,
+        }
+    }
+
+    fn of(act: Operand, w: Operand) -> Result<Self, String> {
+        let gran = |o: Operand| o.scales.map(|s| s.gran);
+        match (act.elem, w.elem, gran(act), gran(w)) {
+            (Elem::Bf16, Elem::Bf16, None, None) => Ok(Self::Bf16),
+            (Elem::E4m3, Elem::E4m3, None, None) => Ok(Self::Fp8),
+            (Elem::E2m1, Elem::E2m1, Some(16), Some(16)) => Ok(Self::Nvf4),
+            (Elem::E4m3 | Elem::E2m1, Elem::E4m3 | Elem::E2m1, Some(a), Some(b))
+                if matches!(a, 32 | 128) && matches!(b, 32 | 128) =>
+            {
+                Ok(Self::Mx)
+            }
+            other => Err(format!(
+                "no tcgen05 kind multiplies {other:?} (act elem, w elem, act gran, w gran): \
+                 bf16 x bf16, e4m3 x e4m3, nvfp4 (gran 16) or e4m3/e2m1 with ue8m0 at 32/128"
+            )),
+        }
+    }
+
+    /// The instruction descriptor's format code for one side.
+    const fn format(self, elem: Elem) -> u32 {
+        match (self, elem) {
+            (Self::Bf16, _) | (Self::Nvf4, _) => 1,
+            (_, Elem::E2m1) => 5,
+            _ => 0,
+        }
+    }
+}
+
+const fn atoms_k(kind: Kind, gran: u32) -> u32 {
+    match kind {
+        Kind::Bf16 | Kind::Fp8 => 0,
+        Kind::Mx | Kind::Nvf4 => {
+            let atoms = kind.stage_k() / gran / 4;
+            if atoms == 0 { 1 } else { atoms }
+        }
+    }
+}
+
+/// The dynamic shared memory the kernel lays out, mirrored from it, plus
+/// the 1024 bytes it may spend aligning the ring.
+const fn smem_bytes(kind: Kind, gran_p: u32, gran_q: u32, bn: u32, stages: u32) -> u32 {
+    let stage = 128 * 128
+        + bn * 128
+        + atoms_k(kind, gran_p) * 512
+        + atoms_k(kind, gran_q) * bn.div_ceil(128) * 512;
+    let bar = (stages * stage).div_ceil(8) * 8;
+    bar + (2 * stages + 4) * 8 + 8 + 1024
+}
+
+/// One shape's specialization: which side is the MMA's 128 rows, the Q
+/// tile, and the ring depth that fits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Plan {
+    pub swap: bool,
+    pub bn: u32,
+    pub stages: u32,
+}
+
+impl Plan {
+    /// Rows of 64 or fewer put the weight on the 128-row side, the rows on
+    /// a narrow Q tile.
+    #[must_use]
+    pub fn choose(m: u32, n: u32) -> Self {
+        let _ = n;
+        let swap = m <= 64;
+        let bn = if swap {
+            m.next_multiple_of(32).max(32)
+        } else {
+            128
+        };
+        Self {
+            swap,
+            bn,
+            stages: 0,
+        }
+    }
+
+    fn staged(mut self, kind: Kind, gran_p: u32, gran_q: u32) -> Self {
+        let mut stages = 8;
+        while stages > 2 && smem_bytes(kind, gran_p, gran_q, self.bn, stages) > SMEM_CAP {
+            stages -= 1;
+        }
+        self.stages = stages;
+        self
+    }
+}
+
+/// `y = alpha * act . w^T` for `[m, n, k]`, choosing the plan.
+pub fn gemm(
+    ctx: &Ctx,
+    act: Operand,
+    w: Operand,
+    y: u64,
+    [m, n, k]: [u32; 3],
+    alpha: f32,
+) -> Result<(), Error> {
+    gemm_with(ctx, act, w, y, [m, n, k], alpha, Plan::choose(m, n))
+}
+
+/// As [`gemm`], under a stated plan (its `stages` is refit to the kind).
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_with(
+    ctx: &Ctx,
+    act: Operand,
+    w: Operand,
+    y: u64,
+    [m, n, k]: [u32; 3],
+    alpha: f32,
+    plan: Plan,
+) -> Result<(), Error> {
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    if k == 0 {
+        return Err(refuse(OP, "an empty contraction"));
+    }
+    if !supported() {
+        return Err(refuse(
+            OP,
+            "this device has no tcgen05 (sm_100a/sm_103a), or NVRTC is older than 12.9",
+        ));
+    }
+    let kind = Kind::of(act, w).map_err(|why| refuse(OP, why))?;
+    if !n.is_multiple_of(8) {
+        return Err(refuse(OP, format!("n = {n} is not a whole number of 8s")));
+    }
+    // Whole 32-row quarters: a scaled Q tile narrower than its scale atom
+    // starts its scale columns at its own quarter.
+    if !matches!(plan.bn, 32 | 64 | 96 | 128 | 160 | 192 | 224 | 256) {
+        return Err(refuse(OP, format!("a Q tile of {} rows", plan.bn)));
+    }
+    let (p, q) = if plan.swap { (w, act) } else { (act, w) };
+    let (rows_p, rows_q) = if plan.swap { (n, m) } else { (m, n) };
+    let gran = |o: Operand| o.scales.map_or(128, |s| s.gran);
+    let plan = plan.staged(kind, gran(p), gran(q));
+    let smem = smem_bytes(kind, gran(p), gran(q), plan.bn, plan.stages);
+
+    let map_p = tensor_map(kind, p, rows_p, k, 128)?;
+    let map_q = tensor_map(kind, q, rows_q, k, plan.bn)?;
+    let atoms = |o: Operand| {
+        o.scales
+            .map_or(0, |s| k.div_ceil(s.gran).div_ceil(4))
+            .try_into()
+            .unwrap_or(i32::MAX)
+    };
+    let tiles = rows_p.div_ceil(128) * rows_q.div_ceil(plan.bn);
+    let grid = tiles.min(ctx.multiprocessors().unwrap_or(148));
+    let entry = symbol(&format!(
+        "::pie::linear::tc5_gemm<{}, {}, {}, {}, {}, {}, {}, {}>",
+        kind.code(),
+        kind.format(p.elem),
+        kind.format(q.elem),
+        gran(p),
+        gran(q),
+        plan.bn,
+        plan.stages,
+        u32::from(plan.swap),
+    ));
+    let int = |v: u32| i32::try_from(v).map_err(|_| refuse(OP, format!("{v} overflows an int")));
+    let values = [
+        ArgValue::Bytes {
+            ptr: map_p.as_ptr().cast(),
+            len: 128,
+        },
+        ArgValue::Bytes {
+            ptr: map_q.as_ptr().cast(),
+            len: 128,
+        },
+        ArgValue::Ptr(p.scales.map_or(0, |s| s.ptr)),
+        ArgValue::Ptr(q.scales.map_or(0, |s| s.ptr)),
+        ArgValue::Ptr(y),
+        ArgValue::I32(int(rows_p)?),
+        ArgValue::I32(int(rows_q)?),
+        ArgValue::I32(int(k)?),
+        ArgValue::I32(int(n)?),
+        ArgValue::F32(alpha),
+        ArgValue::I32(atoms(p)),
+        ArgValue::I32(atoms(q)),
+    ];
+    ctx.fire(
+        OP,
+        Fire::at(FILE, entry).apply(Launch::grid([grid, 1, 1], [THREADS, 1, 1]).smem(smem)),
+        &values,
+    )
+}
+
+type MapKey = (u64, u32, u32, u32, u32);
+
+/// The tensor map of a K-major `rows x k` operand, boxes of 128 bytes of K
+/// by `box_rows`, swizzled 128B. Encoding is host-only and cheap; the cache
+/// spares the driver call on a replayed shape.
+fn tensor_map(
+    kind: Kind,
+    o: Operand,
+    rows: u32,
+    k: u32,
+    box_rows: u32,
+) -> Result<[u64; 16], Error> {
+    use dr::CUtensorMapDataType as T;
+
+    static MAPS: OnceLock<Mutex<HashMap<MapKey, [u64; 16]>>> = OnceLock::new();
+    let key = (o.ptr, rows, k, box_rows, kind.code() * 4 + o.elem as u32);
+    let maps = MAPS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(found) = maps
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+    {
+        return Ok(*found);
+    }
+
+    // (type, inner extent in the type's elements, row stride in bytes, box width)
+    let (ty, inner, stride, box_k) = match (kind, o.elem) {
+        (_, Elem::Bf16) => (T::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, k, u64::from(k) * 2, 64),
+        (_, Elem::E4m3) => (T::CU_TENSOR_MAP_DATA_TYPE_UINT8, k, u64::from(k), 128),
+        (Kind::Nvf4, Elem::E2m1) => (
+            T::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            k / 2,
+            u64::from(k) / 2,
+            128,
+        ),
+        (_, Elem::E2m1) => (
+            T::CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B,
+            k,
+            u64::from(k) / 2,
+            128,
+        ),
+    };
+    // Packed fp4 rows are 16-byte strides; unpacked (16U4_ALIGN16B) ones
+    // must be whole 64-byte runs.
+    let whole = if ty == T::CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B {
+        128
+    } else {
+        32
+    };
+    if o.elem == Elem::E2m1 && !k.is_multiple_of(whole) {
+        return Err(refuse(
+            OP,
+            format!("an fp4 k of {k} is not a whole number of {whole}s for this kind"),
+        ));
+    }
+    if !stride.is_multiple_of(16) || !o.ptr.is_multiple_of(16) {
+        return Err(refuse(
+            OP,
+            format!("TMA needs 16-byte rows and base; this operand's row is {stride} bytes"),
+        ));
+    }
+    let dims = [u64::from(inner), u64::from(rows)];
+    let strides = [stride];
+    let boxes = [box_k, box_rows];
+    let steps = [1u32, 1];
+    let mut map: dr::CUtensorMap = unsafe { core::mem::zeroed() };
+    // SAFETY: every pointer is to a live local of the length the rank says.
+    let code = unsafe {
+        dr::cuTensorMapEncodeTiled(
+            &raw mut map,
+            ty,
+            2,
+            o.ptr as *mut core::ffi::c_void,
+            dims.as_ptr(),
+            strides.as_ptr(),
+            boxes.as_ptr(),
+            steps.as_ptr(),
+            dr::CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+            dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+            dr::CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            dr::CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+        )
+    };
+    if code != dr::CUresult::CUDA_SUCCESS {
+        return Err(refuse(
+            OP,
+            format!("cuTensorMapEncodeTiled answered {code:?} for {o:?} as {rows} x {k}"),
+        ));
+    }
+    // SAFETY: CUtensorMap is 128 opaque bytes, 64-aligned.
+    let raw: [u64; 16] = unsafe { core::mem::transmute(map) };
+    maps.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, raw);
+    Ok(raw)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_atom_is_the_layout_tcgen05_cp_lands() {
+        assert_eq!(atom_offset(0, 0, 4), 0);
+        assert_eq!(atom_offset(0, 3, 4), 3);
+        assert_eq!(atom_offset(32, 0, 4), 4);
+        assert_eq!(atom_offset(1, 0, 4), 16);
+        assert_eq!(atom_offset(127, 3, 4), 511);
+        assert_eq!(
+            atom_offset(0, 4, 8),
+            512,
+            "atoms of a row block run along K"
+        );
+        assert_eq!(atom_offset(128, 0, 8), 1024);
+        assert_eq!(atom_bytes(129, 4096, 16), 2 * 64 * 512);
+    }
+
+    #[test]
+    fn every_kind_fits_its_ring() {
+        for (kind, g) in [
+            (Kind::Bf16, 128),
+            (Kind::Fp8, 128),
+            (Kind::Mx, 32),
+            (Kind::Nvf4, 16),
+        ] {
+            for bn in [32, 64, 128, 256] {
+                let plan = Plan {
+                    swap: false,
+                    bn,
+                    stages: 0,
+                }
+                .staged(kind, g, g);
+                assert!(plan.stages >= 3, "{kind:?} bn={bn}: {plan:?}");
+                assert!(smem_bytes(kind, g, g, bn, plan.stages) <= SMEM_CAP);
+            }
+        }
+    }
+}
