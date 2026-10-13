@@ -606,6 +606,23 @@ def _rewrite_gpt_oss(cfg: dict, plan: Plan) -> None:
         cfg["experts_per_token"] = min(cfg["experts_per_token"], plan.experts)
 
 
+def _rewrite_mimo_v2(cfg: dict, plan: Plan) -> None:
+    """MiMo-V2.6: `hybrid_layer_pattern` (1 = sliding) and `moe_layer_freq`
+    (0 = dense) are per-layer lists, cut with the layers. The towers' planes
+    are not kept, so their configs go too and the miniature is text-only."""
+    _rewrite_common(cfg, plan)
+    for key in ("hybrid_layer_pattern", "moe_layer_freq"):
+        if isinstance(cfg.get(key), list):
+            cfg[key] = _slice_list(cfg[key], plan.src_layers)
+    for key in ("vision_config", "audio_config"):
+        if key in cfg:
+            cfg[key] = None
+    # The fused qkv is stored pre-sharded at `num_key_value_heads` chunks; the
+    # depth cut moves no width, so every kept projection keeps its layout.
+    if "num_nextn_predict_layers" not in cfg:
+        cfg["num_nextn_predict_layers"] = 0
+
+
 def _rewrite_qwen3_5_moe(cfg: dict, plan: Plan) -> None:
     _rewrite_common(cfg, plan)
     # Everything below lives in `text_config`, not at the top level: the
@@ -1518,6 +1535,20 @@ FAMILIES: dict[str, dict[str, Any]] = {
         # covers both.
         default_layers="0-3",
         config_rewrite=_rewrite_gpt_oss,
+    ),
+    # MiMo-V2.6 (Flash and Pro): one plane per expert (MXFP4 codes as
+    # `.weight` beside `.weight_scale` exponents), fp8 dense planes beside
+    # `weight_scale_inv`, the MTP head under `model.mtp.` (dropped) and the
+    # vision and audio towers (dropped).
+    "mimo_v2": dict(
+        layer_prefix="model.layers.",
+        expert_re=re.compile(r"\.mlp\.experts\.(\d+)\."),
+        router_suffixes=("mlp.gate.weight", "mlp.gate.e_score_correction_bias"),
+        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"),
+        # Flash: the dense full layer 0, four sliding layers, the full layer
+        # 5. Pro's next full layer is 7 (`--layers 0-2,7`).
+        default_layers="0-5",
+        config_rewrite=_rewrite_mimo_v2,
     ),
 }
 
