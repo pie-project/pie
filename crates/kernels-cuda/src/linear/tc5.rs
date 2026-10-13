@@ -18,7 +18,7 @@ use crate::jit::{ArgValue, Ctx, Fire, Launch, refuse, symbol};
 
 const OP: &str = "linear.tc5";
 const FILE: &str = "linear/tc5.cuh";
-const THREADS: u32 = 192;
+const THREADS: u32 = 224;
 const SMEM_CAP: u32 = 232_448;
 
 /// An operand's element type as it lies in global memory.
@@ -241,46 +241,56 @@ const fn atoms_k(kind: Kind, gran: u32) -> u32 {
 /// The dynamic shared memory the kernel lays out, mirrored from it, plus
 /// the 1024 bytes it may spend aligning the ring.
 const fn smem_bytes(kind: Kind, gran_p: u32, gran_q: u32, plan: Plan) -> u32 {
-    let Plan { swap, bn, stages } = plan;
+    let Plan {
+        swap,
+        pair,
+        bn,
+        stages,
+    } = plan;
     let stage = 128 * 128
-        + bn * 128
+        + bn / if pair { 2 } else { 1 } * 128
         + atoms_k(kind, gran_p) * 512
         + atoms_k(kind, gran_q) * bn.div_ceil(128) * 512;
     let out = (stages * stage).div_ceil(1024) * 1024;
     let bar = out + if swap { 0 } else { 4 * 2 * 2048 };
-    bar + (2 * stages + 6) * 8 + 8 + 1024
+    bar + (2 * stages + 12) * 8 + 8 + 1024
 }
 
-/// One shape's specialization: which side is the MMA's 128 rows, the Q
-/// tile, and the ring depth that fits.
+/// One shape's specialization: which side is the MMA's M, whether two CTAs
+/// share a 256-row MMA, the Q tile, and the ring depth that fits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plan {
     pub swap: bool,
+    /// A cluster of two CTAs runs each 256-row tile (`cta_group::2`).
+    pub pair: bool,
     pub bn: u32,
     pub stages: u32,
 }
 
 impl Plan {
     /// Rows of 64 or fewer put the weight on the 128-row side, the rows on
-    /// a narrow Q tile. Otherwise the Q tile is 256 wide unless 128 fills
-    /// the `sms` better: a 128-wide tile streams its operands at about two
-    /// thirds the rate.
+    /// a narrow Q tile. Otherwise a pair of CTAs runs 256 x 256 tiles, each
+    /// streaming half of both operands' bytes a lone CTA would, unless
+    /// lone 128 x 128 tiles fill the `sms` enough better to outweigh it
+    /// (they stream at about half the rate).
     #[must_use]
     pub fn choose(m: u32, n: u32, sms: u32) -> Self {
-        let swap = m <= 64;
-        let bn = if swap {
-            m.next_multiple_of(32).max(32)
-        } else {
-            let waves = |bn: u32| (m.div_ceil(128) * n.div_ceil(bn)).div_ceil(sms.max(1));
-            if 13 * waves(256) <= 10 * waves(128) {
-                256
-            } else {
-                128
-            }
+        if m <= 64 {
+            return Self {
+                swap: true,
+                pair: false,
+                bn: m.next_multiple_of(32).max(32),
+                stages: 0,
+            };
+        }
+        let waves = |rows: u32, bn: u32, per: u32| {
+            (m.div_ceil(rows) * n.div_ceil(bn)).div_ceil((sms / per).max(1))
         };
+        let pair = 10 * waves(256, 256, 2) <= 9 * waves(128, 128, 1);
         Self {
-            swap,
-            bn,
+            swap: false,
+            pair,
+            bn: if pair { 256 } else { 128 },
             stages: 0,
         }
     }
@@ -340,29 +350,36 @@ pub fn gemm_with(
     if !matches!(plan.bn, 32 | 64 | 96 | 128 | 160 | 192 | 224 | 256) {
         return Err(refuse(OP, format!("a Q tile of {} rows", plan.bn)));
     }
+    if plan.pair && (plan.swap || plan.bn < 64) {
+        return Err(refuse(
+            OP,
+            "a CTA pair splits an unswapped Q tile of 64 or more",
+        ));
+    }
     let (p, q) = if plan.swap { (w, act) } else { (act, w) };
     let (rows_p, rows_q) = if plan.swap { (n, m) } else { (m, n) };
     let gran = |o: Operand| o.scales.map_or(128, |s| s.gran);
     let plan = plan.staged(kind, gran(p), gran(q));
     let smem = smem_bytes(kind, gran(p), gran(q), plan);
+    let ctas = if plan.pair { 2 } else { 1 };
 
     let map_p = tensor_map(kind, p, rows_p, k, 128)?;
-    let map_q = tensor_map(kind, q, rows_q, k, plan.bn)?;
+    let map_q = tensor_map(kind, q, rows_q, k, plan.bn / ctas)?;
     let map_y = if plan.swap {
         [0; 16]
     } else {
         output_map(y, m, n)?
     };
-    let atoms = |o: Operand| {
-        o.scales
-            .map_or(0, |s| k.div_ceil(s.gran).div_ceil(4))
-            .try_into()
-            .unwrap_or(i32::MAX)
+    let atoms = |o: Operand, rows: u32, row_blocks: u32| match o.scales {
+        Some(s) => scale_map(s, rows, k, atoms_k(kind, s.gran), row_blocks),
+        None => Ok([0; 16]),
     };
-    let tiles = rows_p.div_ceil(128) * rows_q.div_ceil(plan.bn);
-    let grid = tiles.min(ctx.multiprocessors().unwrap_or(148));
+    let map_sfp = atoms(p, rows_p, 1)?;
+    let map_sfq = atoms(q, rows_q, plan.bn.div_ceil(128))?;
+    let tiles = rows_p.div_ceil(128 * ctas) * rows_q.div_ceil(plan.bn);
+    let grid = ctas * tiles.min(ctx.multiprocessors().unwrap_or(148) / ctas);
     let entry = symbol(&format!(
-        "::pie::linear::tc5_gemm<{}, {}, {}, {}, {}, {}, {}, {}>",
+        "::pie::linear::tc5_gemm<{}, {}, {}, {}, {}, {}, {}, {}, {ctas}>",
         kind.code(),
         kind.format(p.elem),
         kind.format(q.elem),
@@ -373,35 +390,55 @@ pub fn gemm_with(
         u32::from(plan.swap),
     ));
     let int = |v: u32| i32::try_from(v).map_err(|_| refuse(OP, format!("{v} overflows an int")));
+    let map = |m: &[u64; 16]| ArgValue::Bytes {
+        ptr: m.as_ptr().cast(),
+        len: 128,
+    };
     let values = [
-        ArgValue::Bytes {
-            ptr: map_p.as_ptr().cast(),
-            len: 128,
-        },
-        ArgValue::Bytes {
-            ptr: map_q.as_ptr().cast(),
-            len: 128,
-        },
-        ArgValue::Bytes {
-            ptr: map_y.as_ptr().cast(),
-            len: 128,
-        },
-        ArgValue::Ptr(p.scales.map_or(0, |s| s.ptr)),
-        ArgValue::Ptr(q.scales.map_or(0, |s| s.ptr)),
+        map(&map_p),
+        map(&map_q),
+        map(&map_y),
+        map(&map_sfp),
+        map(&map_sfq),
         ArgValue::Ptr(y),
         ArgValue::I32(int(rows_p)?),
         ArgValue::I32(int(rows_q)?),
         ArgValue::I32(int(k)?),
         ArgValue::I32(int(n)?),
         ArgValue::F32(alpha),
-        ArgValue::I32(atoms(p)),
-        ArgValue::I32(atoms(q)),
     ];
     ctx.fire(
         OP,
-        Fire::at(FILE, entry).apply(Launch::grid([grid, 1, 1], [THREADS, 1, 1]).smem(smem)),
+        Fire::at(FILE, entry).apply(
+            Launch::grid([grid, 1, 1], [THREADS, 1, 1])
+                .smem(smem)
+                .cluster(ctas),
+        ),
         &values,
     )
+}
+
+/// An atom-layout scale tensor as TMA reads it: [row block][atom][128 words],
+/// boxes of `atoms` atoms by `row_blocks` row blocks, zero past either end.
+fn scale_map(
+    s: Scales,
+    rows: u32,
+    k: u32,
+    atoms: u32,
+    row_blocks: u32,
+) -> Result<[u64; 16], Error> {
+    if !s.ptr.is_multiple_of(16) {
+        return Err(refuse(OP, "TMA needs the scales 16-byte aligned"));
+    }
+    let along = k.div_ceil(s.gran).div_ceil(4);
+    encode(Map {
+        ptr: s.ptr,
+        ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT32,
+        dims: [128, along, rows.div_ceil(128)],
+        strides: [512, u64::from(along) * 512],
+        boxes: [128, atoms, row_blocks],
+        swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+    })
 }
 
 /// The tensor map of a K-major `rows x k` operand, boxes of 128 bytes of K
@@ -454,9 +491,9 @@ fn tensor_map(
     encode(Map {
         ptr: o.ptr,
         ty,
-        dims: [inner, rows],
-        stride,
-        boxes: [box_k, box_rows],
+        dims: [inner, rows, 0],
+        strides: [stride, 0],
+        boxes: [box_k, box_rows, 1],
         swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
     })
 }
@@ -470,9 +507,9 @@ fn output_map(y: u64, m: u32, n: u32) -> Result<[u64; 16], Error> {
     encode(Map {
         ptr: y,
         ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-        dims: [n, m],
-        stride: u64::from(n) * 2,
-        boxes: [32, 32],
+        dims: [n, m, 0],
+        strides: [u64::from(n) * 2, 0],
+        boxes: [32, 32, 1],
         swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B,
     })
 }
@@ -481,9 +518,10 @@ fn output_map(y: u64, m: u32, n: u32) -> Result<[u64; 16], Error> {
 struct Map {
     ptr: u64,
     ty: dr::CUtensorMapDataType,
-    dims: [u32; 2],
-    stride: u64,
-    boxes: [u32; 2],
+    /// A zero third extent makes the map 2D.
+    dims: [u32; 3],
+    strides: [u64; 2],
+    boxes: [u32; 3],
     swizzle: dr::CUtensorMapSwizzle,
 }
 
@@ -500,17 +538,18 @@ fn encode(m: Map) -> Result<[u64; 16], Error> {
         return Ok(*found);
     }
     let dims = m.dims.map(u64::from);
-    let steps = [1u32, 1];
+    let steps = [1u32, 1, 1];
+    let rank = if m.dims[2] == 0 { 2 } else { 3 };
     let mut map: dr::CUtensorMap = unsafe { core::mem::zeroed() };
     // SAFETY: every pointer is to a live local of the length the rank says.
     let code = unsafe {
         dr::cuTensorMapEncodeTiled(
             &raw mut map,
             m.ty,
-            2,
+            rank,
             m.ptr as *mut core::ffi::c_void,
             dims.as_ptr(),
-            [m.stride].as_ptr(),
+            m.strides.as_ptr(),
             m.boxes.as_ptr(),
             steps.as_ptr(),
             dr::CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
@@ -567,6 +606,7 @@ mod tests {
             for bn in [32, 64, 128, 256] {
                 let plan = Plan {
                     swap: false,
+                    pair: bn >= 64,
                     bn,
                     stages: 0,
                 }

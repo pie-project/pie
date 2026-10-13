@@ -1,8 +1,9 @@
 #![cfg(feature = "cuda")]
 
 //! The tcgen05 GEMMs' rate beside cuBLASLt's at the shapes a decoder
-//! layer fires, L2 flushed before every timed launch. Ignored: it is a
-//! measurement, not a check. Run alone on an idle GPU:
+//! layer fires. Each timed batch walks enough weight copies that none is
+//! in L2 when its launch reads it, as a layer's weights are not. Ignored:
+//! it is a measurement, not a check. Run alone on an idle GPU:
 //!
 //!     cargo test -p kernels-cuda --features cuda --release --test kernels_cuda \
 //!         the_tcgen05_gemm_reports -- --ignored --nocapture
@@ -15,7 +16,10 @@ use kernels_cuda::cudarc::runtime::sys as rt;
 use kernels_cuda::linear::tc5::{Elem, Operand, atom_bytes, gemm, supported};
 
 const FLUSH: usize = 512 << 20;
-const RUNS: usize = 15;
+const ROUNDS: usize = 7;
+const BATCH: usize = 16;
+/// Weight copies a batch cycles through cover at least this many bytes.
+const COLD: usize = 384 << 20;
 
 fn splitmix(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -40,31 +44,40 @@ struct Timer {
 }
 
 impl Timer {
-    /// The median microseconds of `RUNS` launches, each after an L2 flush.
-    fn median(&self, mut launch: impl FnMut()) -> f64 {
-        launch();
-        let mut times = Vec::with_capacity(RUNS);
+    /// The median over `ROUNDS` of the mean microseconds a launch takes in a
+    /// back-to-back batch of `BATCH`, launch `i` reading weight copy `i`.
+    fn median(&self, mut launch: impl FnMut(usize)) -> f64 {
+        launch(0);
+        let mut times = Vec::with_capacity(ROUNDS);
         unsafe {
             let (mut start, mut stop): (rt::cudaEvent_t, rt::cudaEvent_t) =
                 (core::ptr::null_mut(), core::ptr::null_mut());
             rt::cudaEventCreate(&raw mut start);
             rt::cudaEventCreate(&raw mut stop);
-            for _ in 0..RUNS {
+            for _ in 0..ROUNDS {
                 rt::cudaMemsetAsync(self.flush as *mut c_void, 0, FLUSH, self.stream);
                 rt::cudaEventRecord(start, self.stream);
-                launch();
+                for i in 0..BATCH {
+                    launch(i);
+                }
                 rt::cudaEventRecord(stop, self.stream);
                 rt::cudaEventSynchronize(stop);
                 let mut ms = 0f32;
                 rt::cudaEventElapsedTime(&raw mut ms, start, stop);
-                times.push(f64::from(ms) * 1e3);
+                times.push(f64::from(ms) * 1e3 / BATCH as f64);
             }
             rt::cudaEventDestroy(start);
             rt::cudaEventDestroy(stop);
         }
         times.sort_by(f64::total_cmp);
-        times[RUNS / 2]
+        times[ROUNDS / 2]
     }
+}
+
+/// Copies of one weight, enough to cover `COLD` bytes (at most `BATCH`).
+fn copies(gpu: &mut Gpu, bytes: &[u8]) -> Vec<u64> {
+    let count = COLD.div_ceil(bytes.len().max(1)).clamp(1, BATCH);
+    (0..count).map(|_| gpu.up(bytes)).collect()
 }
 
 /// One cuBLASLt matmul, `D[m][n] = act . w^T` in bf16, planned once.
@@ -299,9 +312,9 @@ fn the_tcgen05_gemm_reports_its_rate_beside_cublaslt() {
     );
     println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
     for (n, k) in [(4096, 4096), (7168, 2048), (2048, 7168), (14336, 4096)] {
-        let w16 = gpu.up(&noise(n * k * 2, 0xbf, 0x00, 1));
-        let w8 = gpu.up(&noise(n * k, 0xb7, 0x00, 2));
-        let w4 = gpu.up(&noise(n * k / 2, 0xff, 0x00, 3));
+        let w16 = copies(&mut gpu, &noise(n * k * 2, 0xbf, 0x00, 1));
+        let w8 = copies(&mut gpu, &noise(n * k, 0xb7, 0x00, 2));
+        let w4 = copies(&mut gpu, &noise(n * k / 2, 0xff, 0x00, 3));
         let sw128 = gpu.up(&noise(atom_bytes(n, k, 128), 0x03, 0x7c, 4));
         let sw32 = gpu.up(&noise(atom_bytes(n, k, 32), 0x03, 0x7c, 5));
         let sw16 = gpu.up(&noise(atom_bytes(n, k, 16), 0x07, 0x30, 6));
@@ -315,20 +328,24 @@ fn the_tcgen05_gemm_reports_its_rate_beside_cublaslt() {
             let y = gpu.zeros(m * n * 2);
             let shape = [m as u32, n as u32, k as u32];
 
-            let lt_rate = |kind: LtKind, w: u64, a: u64, sw: u64, sa: u64| -> String {
+            let lt_rate = |kind: LtKind, w: &[u64], a: u64, sw: u64, sa: u64| -> String {
                 match unsafe { Lt::plan(kind, [m, n, k], sw, sa, ws, ws_bytes) } {
                     Ok(plan) => {
-                        let us = timer.median(|| plan.run(w, a, y, stream));
+                        let us = timer.median(|i| plan.run(w[i % w.len()], a, y, stream));
                         format!("{:.0} ({us:.1}us)", tflops(m, n, k, us))
                     }
                     Err(why) => format!("n/a: {why}"),
                 }
             };
-            let tc_rate = |a: Operand, w: Operand, alpha: f32| -> String {
-                match gemm(&ctx, a, w, y, shape, alpha) {
+            let tc_rate = |a: Operand, w: Operand, ptrs: &[u64]| -> String {
+                let at = |i: usize| Operand {
+                    ptr: ptrs[i % ptrs.len()],
+                    ..w
+                };
+                match gemm(&ctx, a, at(0), y, shape, 1.0) {
                     Ok(()) => {
-                        let us = timer.median(|| {
-                            gemm(&ctx, a, w, y, shape, alpha).expect("fires again");
+                        let us = timer.median(|i| {
+                            gemm(&ctx, a, at(i), y, shape, 1.0).expect("fires again");
                         });
                         format!("{:.0} ({us:.1}us)", tflops(m, n, k, us))
                     }
@@ -336,38 +353,38 @@ fn the_tcgen05_gemm_reports_its_rate_beside_cublaslt() {
                 }
             };
             let row = [
-                lt_rate(LtKind::Bf16, w16, a16, 0, 0),
+                lt_rate(LtKind::Bf16, &w16, a16, 0, 0),
                 tc_rate(
                     Operand::plain(a16, Elem::Bf16),
-                    Operand::plain(w16, Elem::Bf16),
-                    1.0,
+                    Operand::plain(0, Elem::Bf16),
+                    &w16,
                 ),
-                lt_rate(LtKind::Mxfp8, w8, a8, sw32, sa32),
+                lt_rate(LtKind::Mxfp8, &w8, a8, sw32, sa32),
                 tc_rate(
                     Operand::plain(a8, Elem::E4m3),
-                    Operand::plain(w8, Elem::E4m3),
-                    1.0,
+                    Operand::plain(0, Elem::E4m3),
+                    &w8,
                 ),
                 tc_rate(
                     Operand::scaled(a8, Elem::E4m3, sa128, 128),
-                    Operand::scaled(w8, Elem::E4m3, sw128, 128),
-                    1.0,
+                    Operand::scaled(0, Elem::E4m3, sw128, 128),
+                    &w8,
                 ),
                 tc_rate(
                     Operand::scaled(a8, Elem::E4m3, sa32, 32),
-                    Operand::scaled(w8, Elem::E4m3, sw32, 32),
-                    1.0,
+                    Operand::scaled(0, Elem::E4m3, sw32, 32),
+                    &w8,
                 ),
-                lt_rate(LtKind::Nvfp4, w4, a4, sw16, sa16),
+                lt_rate(LtKind::Nvfp4, &w4, a4, sw16, sa16),
                 tc_rate(
                     Operand::scaled(a4, Elem::E2m1, sa16, 16),
-                    Operand::scaled(w4, Elem::E2m1, sw16, 16),
-                    1.0,
+                    Operand::scaled(0, Elem::E2m1, sw16, 16),
+                    &w4,
                 ),
                 tc_rate(
                     Operand::scaled(a8, Elem::E4m3, sa128, 128),
-                    Operand::scaled(w4, Elem::E2m1, sw32, 32),
-                    1.0,
+                    Operand::scaled(0, Elem::E2m1, sw32, 32),
+                    &w4,
                 ),
             ];
             println!("| {m} | {n} | {k} | {} |", row.join(" | "));

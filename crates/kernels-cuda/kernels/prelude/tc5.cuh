@@ -97,6 +97,64 @@ __device__ __forceinline__ void tma_load_2d_multicast(void* dst, u64* bar, const
         : "memory");
 }
 
+// A 3D box at (x, y, z), completing `bar`.
+__device__ __forceinline__ void tma_load_3d(void* dst, u64* bar, const TmaMap* map, int x, int y,
+                                            int z) {
+    asm volatile(
+        "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes"
+        " [%0], [%1, {%3, %4, %5}], [%2];" ::"r"(smem_addr(dst)),
+        "l"(reinterpret_cast<u64>(map)), "r"(smem_addr(bar)), "r"(x), "r"(y), "r"(z)
+        : "memory");
+}
+
+// ---- CTA pairs (cta_group::2) -------------------------------------------------
+// Two CTAs of a cluster run one MMA of 256 rows: each holds its 128 rows of
+// A, half of B's rows and its own half of D. Rank 0 issues; its barriers
+// count both CTAs' transactions.
+
+__device__ __forceinline__ u32 cluster_rank() {
+    u32 rank;
+    asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(rank));
+    return rank;
+}
+
+__device__ __forceinline__ void cluster_sync() {
+    asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::
+                     : "memory");
+}
+
+// Arrives once on the barrier at `bar`'s offset in CTA `rank` of the cluster.
+__device__ __forceinline__ void bar_arrive_at(u64* bar, u32 rank) {
+    asm volatile(
+        "{\n\t.reg .b32 remote;\n\t"
+        "mapa.shared::cluster.u32 remote, %0, %1;\n\t"
+        "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [remote];\n\t}" ::"r"(smem_addr(bar)),
+        "r"(rank)
+        : "memory");
+}
+
+// The rank-0 twin of a barrier address: TMA issued by either CTA of a pair
+// completes its bytes there.
+__device__ __forceinline__ u32 leader_bar(u64* bar) { return smem_addr(bar) & 0xFEFFFFFFu; }
+
+__device__ __forceinline__ void tma_load_2d_pair(void* dst, u64* bar, const TmaMap* map, int x,
+                                                 int y) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global.mbarrier::complete_tx::bytes"
+        " [%0], [%1, {%3, %4}], [%2];" ::"r"(smem_addr(dst)),
+        "l"(reinterpret_cast<u64>(map)), "r"(leader_bar(bar)), "r"(x), "r"(y)
+        : "memory");
+}
+
+__device__ __forceinline__ void tma_load_3d_pair(void* dst, u64* bar, const TmaMap* map, int x,
+                                                 int y, int z) {
+    asm volatile(
+        "cp.async.bulk.tensor.3d.cta_group::2.shared::cluster.global.mbarrier::complete_tx::bytes"
+        " [%0], [%1, {%3, %4, %5}], [%2];" ::"r"(smem_addr(dst)),
+        "l"(reinterpret_cast<u64>(map)), "r"(leader_bar(bar)), "r"(x), "r"(y), "r"(z)
+        : "memory");
+}
+
 // A contiguous run of `bytes` (a multiple of 16) into shared memory.
 __device__ __forceinline__ void bulk_load(void* dst, const void* src, u32 bytes, u64* bar) {
     asm volatile(
@@ -136,23 +194,36 @@ __device__ __forceinline__ void fence_async_shared() {
 }
 
 // ---- tcgen05: allocation and ordering ------------------------------------
+// G is the cta_group: 1 for a lone CTA, 2 for a pair, where every op below
+// but the fences acts on both CTAs (the allocation is issued by the same
+// warp in each).
+
+#define PIE_TC5_GROUP(G, head, tail, ...)              \
+    if constexpr ((G) == 1) {                          \
+        asm volatile(head "1" tail __VA_ARGS__);       \
+    } else {                                           \
+        asm volatile(head "2" tail __VA_ARGS__);       \
+    }
 
 // Whole-warp: `cols` (a power of two, 32..512) TMEM columns; the base
 // address lands in shared memory at `dst`.
+template <int G = 1>
 __device__ __forceinline__ void tmem_alloc(u32* dst, u32 cols) {
-    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" ::"r"(
-                     smem_addr(dst)),
-                 "r"(cols));
+    PIE_TC5_GROUP(G, "tcgen05.alloc.cta_group::", ".sync.aligned.shared::cta.b32 [%0], %1;",
+                  ::"r"(smem_addr(dst)), "r"(cols))
 }
 
 // Whole-warp: this CTA allocates no more, so a co-resident one may.
+template <int G = 1>
 __device__ __forceinline__ void tmem_relinquish() {
-    asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
+    PIE_TC5_GROUP(G, "tcgen05.relinquish_alloc_permit.cta_group::", ".sync.aligned;", ::)
 }
 
 // Whole-warp, the warp that allocated.
+template <int G = 1>
 __device__ __forceinline__ void tmem_dealloc(u32 base, u32 cols) {
-    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" ::"r"(base), "r"(cols));
+    PIE_TC5_GROUP(G, "tcgen05.dealloc.cta_group::", ".sync.aligned.b32 %0, %1;", ::"r"(base),
+                  "r"(cols))
 }
 
 // Orders tcgen05 work around a thread synchronization (barrier wait or
@@ -167,10 +238,19 @@ __device__ __forceinline__ void tc_fence_after() {
 
 // Arrives once on `bar` when every tcgen05 op this thread issued before it
 // (mma, cp) has completed. Implies fence::before_thread_sync.
+template <int G = 1>
 __device__ __forceinline__ void tc_commit(u64* bar) {
+    PIE_TC5_GROUP(G, "tcgen05.commit.cta_group::",
+                  ".mbarrier::arrive::one.shared::cluster.b64 [%0];", ::"r"(smem_addr(bar))
+                  : "memory")
+}
+
+// As tc_commit for a pair: one arrival on `bar`'s offset in both CTAs.
+__device__ __forceinline__ void tc_commit_pair(u64* bar) {
     asm volatile(
-        "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];" ::"r"(
-            smem_addr(bar))
+        "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64"
+        " [%0], %1;" ::"r"(smem_addr(bar)),
+        "h"(static_cast<unsigned short>(3))
         : "memory");
 }
 
@@ -230,46 +310,48 @@ __host__ __device__ constexpr u32 idesc_with_ids(u32 desc, u32 sfa_id, u32 sfb_i
 // D[tmem] (+)= A[smem] . B[smem]^T, one thread issues. `acc` false
 // overwrites D.
 
+#define PIE_TC5_MMA_HEAD "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\ttcgen05.mma.cta_group::"
+
+template <int G = 1>
 __device__ __forceinline__ void mma_f16(u32 d, u64 a, u64 b, u32 idesc, bool acc) {
-    asm volatile(
-        "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
-        "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t}" ::"r"(d),
-        "l"(a), "l"(b), "r"(idesc), "r"(static_cast<u32>(acc)));
+    PIE_TC5_GROUP(G, PIE_TC5_MMA_HEAD, ".kind::f16 [%0], %1, %2, %3, p;\n\t}", ::"r"(d), "l"(a),
+                  "l"(b), "r"(idesc), "r"(static_cast<u32>(acc)))
 }
 
+template <int G = 1>
 __device__ __forceinline__ void mma_f8f6f4(u32 d, u64 a, u64 b, u32 idesc, bool acc) {
-    asm volatile(
-        "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
-        "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], %1, %2, %3, p;\n\t}" ::"r"(d),
-        "l"(a), "l"(b), "r"(idesc), "r"(static_cast<u32>(acc)));
+    PIE_TC5_GROUP(G, PIE_TC5_MMA_HEAD, ".kind::f8f6f4 [%0], %1, %2, %3, p;\n\t}", ::"r"(d),
+                  "l"(a), "l"(b), "r"(idesc), "r"(static_cast<u32>(acc)))
 }
 
 // One ue8m0 scale per 32 K of each row, read from TMEM at sfa / sfb.
+template <int G = 1>
 __device__ __forceinline__ void mma_mxf8f6f4(u32 d, u64 a, u64 b, u32 idesc, bool acc, u32 sfa,
                                              u32 sfb) {
-    asm volatile(
-        "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
-        "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale [%0], %1, %2, %3, [%5], [%6], p;\n\t}" ::"r"(
-            d),
-        "l"(a), "l"(b), "r"(idesc), "r"(static_cast<u32>(acc)), "r"(sfa), "r"(sfb));
+    PIE_TC5_GROUP(G, PIE_TC5_MMA_HEAD,
+                  ".kind::mxf8f6f4.block_scale [%0], %1, %2, %3, [%5], [%6], p;\n\t}", ::"r"(d),
+                  "l"(a), "l"(b), "r"(idesc), "r"(static_cast<u32>(acc)), "r"(sfa), "r"(sfb))
 }
 
 // NVFP4: packed e2m1, one ue4m3 scale per 16 K of each row (four a column).
+template <int G = 1>
 __device__ __forceinline__ void mma_nvf4(u32 d, u64 a, u64 b, u32 idesc, bool acc, u32 sfa,
                                          u32 sfb) {
-    asm volatile(
-        "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
-        "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.block16 [%0], %1, %2, %3, [%5], [%6], "
-        "p;\n\t}" ::"r"(d),
-        "l"(a), "l"(b), "r"(idesc), "r"(static_cast<u32>(acc)), "r"(sfa), "r"(sfb));
+    PIE_TC5_GROUP(G, PIE_TC5_MMA_HEAD,
+                  ".kind::mxf4nvf4.block_scale.block16 [%0], %1, %2, %3, [%5], [%6], p;\n\t}",
+                  ::"r"(d), "l"(a), "l"(b), "r"(idesc), "r"(static_cast<u32>(acc)), "r"(sfa),
+                  "r"(sfb))
 }
 
 // ---- tcgen05: data movement -------------------------------------------------
 
 // A 512-byte scale atom (32 rows of 16 bytes) into 4 TMEM columns, copied
 // to all four lane quarters: row r of the atom lands in lane r of each.
+// A pair copies each CTA's atom at that offset into its own TMEM.
+template <int G = 1>
 __device__ __forceinline__ void tc_cp_sf_atom(u32 taddr, u64 sdesc) {
-    asm volatile("tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;" ::"r"(taddr), "l"(sdesc));
+    PIE_TC5_GROUP(G, "tcgen05.cp.cta_group::", ".32x128b.warpx4 [%0], %1;", ::"r"(taddr),
+                  "l"(sdesc))
 }
 
 // Whole-warp: 32 consecutive columns of the warp's 32 lanes, one row a

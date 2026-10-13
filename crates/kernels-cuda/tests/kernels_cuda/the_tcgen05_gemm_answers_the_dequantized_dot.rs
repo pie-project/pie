@@ -202,6 +202,7 @@ fn bf16(m: usize, n: usize, k: usize, plan: Option<Plan>) -> Case {
 fn plan(swap: bool, bn: u32) -> Option<Plan> {
     Some(Plan {
         swap,
+        pair: false,
         bn,
         stages: 0,
     })
@@ -262,28 +263,38 @@ fn the_wide_tiles_shared_columns_land_what_the_narrow_tile_lands() {
             Operand::scaled(ptr, elem, gpu.up(atoms), *gran as u32)
         };
         let (a_op, w_op) = (up(&mut gpu, &act, a.0), up(&mut gpu, &wt, w.0));
-        let outs: Vec<Vec<u16>> = [128, 256]
+        let plans = [plan(false, 128), plan(false, 256), pair(128), pair(256)];
+        let outs: Vec<Vec<u16>> = plans
             .into_iter()
-            .map(|bn| {
+            .map(|plan| {
                 let y = gpu.zeros(m * n * 2);
                 let shape = [m as u32, n as u32, k as u32];
-                gemm_with(
-                    &gpu.ctx(),
-                    a_op,
-                    w_op,
-                    y,
-                    shape,
-                    1.0,
-                    plan(false, bn).unwrap(),
-                )
-                .unwrap_or_else(|e| panic!("{a:?} x {w:?} bn={bn}: {e}"));
+                gemm_with(&gpu.ctx(), a_op, w_op, y, shape, 1.0, plan.unwrap())
+                    .unwrap_or_else(|e| panic!("{a:?} x {w:?} {plan:?}: {e}"));
                 gpu.sync();
                 gpu.down(y, m * n)
             })
             .collect();
-        let differ = outs[0].iter().zip(&outs[1]).filter(|(x, y)| x != y).count();
-        assert_eq!(differ, 0, "{a:?} x {w:?}: {differ} of {} differ", m * n);
+        for (i, out) in outs.iter().enumerate().skip(1) {
+            let differ = outs[0].iter().zip(out).filter(|(x, y)| x != y).count();
+            assert_eq!(
+                differ,
+                0,
+                "{a:?} x {w:?} under {:?}: {differ} of {} differ",
+                plans[i],
+                m * n
+            );
+        }
     }
+}
+
+fn pair(bn: u32) -> Option<Plan> {
+    Some(Plan {
+        swap: false,
+        pair: true,
+        bn,
+        stages: 0,
+    })
 }
 
 /// More tiles than SMs, so each CTA walks several and both accumulator
@@ -342,6 +353,8 @@ fn the_deepseek_blocks_land_through_ue8m0() {
     check(scaled(f8, f8, [64, 512, 896], plan(false, 256), 1.0));
     check(scaled(f8, f8, [1, 384, 1024], None, 1.0));
     check(scaled(f8, f8, [40, 256, 2048], None, 1.0));
+    check(scaled(f8, f8, [300, 256, 1152], pair(256), 1.0));
+    check(scaled(f8, f8, [129, 192, 640], pair(64), 1.0));
     let mx = (Elem::E4m3, Some(32));
     check(scaled(mx, mx, [130, 128, 320], plan(false, 128), 1.0));
 }
@@ -353,6 +366,8 @@ fn nvfp4_lands_its_sixteen_wide_scales_and_global_alpha() {
     check(scaled(nv, nv, [128, 128, 288], plan(false, 64), 1.0));
     check(scaled(nv, nv, [130, 512, 512], plan(false, 256), 1.0));
     check(scaled(nv, nv, [5, 384, 768], None, 2.0));
+    check(scaled(nv, nv, [140, 256, 1024], pair(256), 1.0));
+    check(scaled(nv, nv, [300, 128, 288], pair(128), 1.0));
 }
 
 fn mxfp4_weights_meet_fp8_activations() {
@@ -362,6 +377,7 @@ fn mxfp4_weights_meet_fp8_activations() {
         check(scaled(act, w4, [128, 128, 256], plan(false, 128), 1.0));
         check(scaled(act, w4, [150, 192, 640], plan(false, 64), 1.0));
         check(scaled(act, w4, [7, 256, 1024], None, 1.0));
+        check(scaled(act, w4, [150, 192, 640], pair(64), 1.0));
     }
 }
 
@@ -373,4 +389,7 @@ fn the_bf16_kind_lands_the_dot_at_whole_and_ragged_tiles() {
     check(bf16(130, 96, 136, plan(false, 64)));
     check(bf16(1, 384, 512, None));
     check(bf16(37, 1000, 264, None));
+    check(bf16(300, 200, 520, pair(128)));
+    check(bf16(520, 512, 1024, pair(256)));
+    check(bf16(257, 96, 136, pair(64)));
 }
