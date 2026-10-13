@@ -5,13 +5,11 @@ These are diagnostics for the engine, driven through the Python `eta` port
 assert every copy produced the same tokens. A greedy program is a pure
 function of its prompt, so any spread is the engine's, not the guest's.
 
-Known state (2026-09-05, engine-cuda): the UNFORKED decode is batch-invariant
-on both models, but any decode from a working set produced by
-`WorkingSet.fork` diverges across concurrent processes (one fork suffices;
-sequential runs are stable) — on gemma-4-E4B (attention-only, KV fork only)
-as well as on Qwen3.5-0.8B (hybrid), so the second test fails on both and
-points at the KV copy-on-write path — the page-aligned control (third test)
-is stable, so it is the CoW copy of a shared page, not the shared read.
+Known state (2026-10-12, engine-cuda, RTX 4090): the forked decodes are
+stable on gemma-4-E4B and Qwen3.5-0.8B over four boots each (the
+copy-on-write divergence recorded on 2026-09-05 is gone). The first test
+once saw two outputs on Qwen3.5-0.8B straight after boot, a near-tie
+flipping at the third token; three later boots were stable.
 
     uv run python tests/examples/test_engine_repro.py --attach ws://127.0.0.1:8080
 """
