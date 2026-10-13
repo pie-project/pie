@@ -541,6 +541,14 @@ def _rewrite_kimi_k3(cfg: dict, plan: Plan) -> None:
         _flatten_text_only(cfg, plan)
 
 
+def _rewrite_dots3(cfg: dict, plan: Plan) -> None:
+    _rewrite_common(cfg, plan)
+    # `layer_types` says full (DSA) or sliding per layer, and layer 0 is the
+    # one dense MLP, so the cut keeps it up front.
+    cfg["layer_types"] = _slice_list(cfg["layer_types"], plan.src_layers)
+    cfg["first_k_dense_replace"] = _dense_prefix_len(plan, cfg["first_k_dense_replace"])
+
+
 def _rewrite_muse_glimmer(cfg: dict, plan: Plan) -> None:
     _rewrite_common(cfg, plan)
     # Both per-layer lists live in `text_config`: `layer_types` says sliding
@@ -1201,6 +1209,19 @@ FAMILIES: dict[str, dict[str, Any]] = {
                       "model.hc_head.hc_head_base"),
         default_layers="0-5",
         config_rewrite=_rewrite_hy_v4,
+    ),
+    # Dots3 NOTE: DSA layers (full) and sliding-window latent layers, a
+    # dense layer 0, then routed experts. Layers 0-5 are both full layers up
+    # front, three sliding ones and a full one, so both latent widths and both
+    # caches are read. The vision and audio towers and the MTP head (layer 46,
+    # `model.mtp.embed_tokens`) are not kept.
+    "dots3_note": dict(
+        layer_prefix="model.layers.",
+        expert_re=re.compile(r"\.mlp\.experts\.(\d+)\."),
+        router_suffixes=("mlp.gate.weight", "mlp.gate.e_score_correction_bias"),
+        globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"),
+        default_layers="0-5",
+        config_rewrite=_rewrite_dots3,
     ),
     # GLM-5.3-Flash as `mlx_lm` publishes it (Vontra/GLM-5.3-Flash-MLX-*): the
     # trunk under `model.language_model.layers.`, one affine trio per expert,
