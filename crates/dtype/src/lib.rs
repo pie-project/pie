@@ -46,12 +46,13 @@ pub enum Dtype {
     I6g16k,
     E4m3row,
     E4m3tile128,
+    E4m3tensor,
     Ptq1_0,
     KvU4,
 }
 
 impl Dtype {
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 35] = [
         Self::F32,
         Self::F16,
         Self::Bf16,
@@ -84,6 +85,7 @@ impl Dtype {
         Self::I6g16k,
         Self::E4m3row,
         Self::E4m3tile128,
+        Self::E4m3tensor,
         Self::Ptq1_0,
         Self::KvU4,
     ];
@@ -232,6 +234,14 @@ impl Dtype {
                 gain: &F32,
                 offset: None,
             },
+            // e4m3 codes under one f32 scale for the whole tensor, as
+            // modelopt stores a per-tensor FP8 table.
+            Self::E4m3tensor => &Fmt::Q {
+                g: Group::Tensor,
+                elem: Elem::E { e: 4, m: 3 },
+                gain: &F32,
+                offset: None,
+            },
             // Prism-private ternary, block 128: base-3 trit codes + one fp16 scale
             // per 128 weights, no offset. 28 B/block = 1.75 bpw.
             Self::Ptq1_0 => &Fmt::Q {
@@ -289,6 +299,7 @@ impl Dtype {
             Self::I6g16k => "g16_i6_g16_i8_f16_n_n",
             Self::E4m3row => "gr_e4m3_f32_n",
             Self::E4m3tile128 => "g128x128_e4m3_f32_n",
+            Self::E4m3tensor => "gt_e4m3_f32_n",
             Self::Ptq1_0 => "g128_t3_f16_n",
             Self::KvU4 => "g256_u4_f16_n",
         }

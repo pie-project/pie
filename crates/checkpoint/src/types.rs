@@ -83,11 +83,15 @@ pub enum QuantScheme {
     /// NVFP4 as modelopt stores it: e2m1 codes under one e4m3 scale per 16,
     /// those under the f32 tensor scale of their row (`.global_scales`).
     Nvfp4E2M1E4M3,
+    /// e4m3 codes under one f32 scale for the whole tensor (modelopt's
+    /// per-tensor FP8).
+    Fp8E4M3Tensor,
 }
 
 impl QuantScheme {
     pub fn default_bits(self) -> u8 {
         match self {
+            Self::Fp8E4M3Tensor => 8,
             Self::AwqInt4
             | Self::GptqInt4
             | Self::Mxfp4E2M1E8M0
@@ -146,6 +150,7 @@ impl QuantScheme {
             | Self::GgufIq3Xxs
             | Self::GgufIq3S => 32,
             Self::Fp8E4M3
+            | Self::Fp8E4M3Tensor
             | Self::Fp8E5M2
             | Self::Int8Symmetric
             | Self::Int8Asymmetric
@@ -353,4 +358,6 @@ pub enum ScaleForm {
     /// attachment's second companion (`zero_point_tensor`) is the plane of
     /// tensor scales, one per row.
     E4m3TensorScaled,
+    /// One f32 scale for the whole tensor, a scalar plane.
+    F32Tensor,
 }

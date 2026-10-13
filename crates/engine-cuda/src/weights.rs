@@ -128,7 +128,7 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
                 Dtype::U2g32 | Dtype::U2g64 | Dtype::U2g128 => {
                     rows.saturating_mul(width).div_ceil(4)
                 }
-                Dtype::U8g64 => rows.saturating_mul(width),
+                Dtype::U8g64 | Dtype::E4m3tensor => rows.saturating_mul(width),
                 Dtype::U2g16k | Dtype::I3g16k | Dtype::U4g32k | Dtype::U5g32k | Dtype::I6g16k => {
                     rows.saturating_mul(width)
                 }
@@ -664,6 +664,7 @@ fn pairings<'a>(
                 "is an affine bank whose zero points this plan does not publish as a \
                  param of their own",
             )?),
+            ScaleForm::F32Tensor => None,
             ScaleForm::E4m3TensorScaled => Some(row(
                 attachment.zero_point_tensor.ok_or_else(|| Fault::Param {
                     name: (*name).to_string(),
@@ -1158,7 +1159,7 @@ fn packed(
         Dtype::Mxfp4 => place.width,
         Dtype::U4g64 | Dtype::U4g32 | Dtype::U4g64tiled | Dtype::Nvfp4 => place.width.div_ceil(2),
         Dtype::U2g32 | Dtype::U2g64 | Dtype::U2g128 => place.width.div_ceil(4),
-        Dtype::U8g64 => place.width,
+        Dtype::U8g64 | Dtype::E4m3tensor => place.width,
         other => poem_compiler::arena::elem_bytes(other)
             .and_then(|element| u32::try_from(element).ok())
             .map(|element| place.width.saturating_mul(element))
@@ -1167,12 +1168,11 @@ fn packed(
                 why: "is a packed plane in a storage element that has no element size",
             })?,
     };
-    // NVFP4 codes keep their dtype, which is how a select tells their
-    // e4m3 scales and tensor scales from an affine bank's factor pair.
-    let marked = if place.dtype == Dtype::Nvfp4 {
-        Dtype::Nvfp4
-    } else {
-        Dtype::U8
+    // NVFP4 and per-tensor e4m3 codes keep their dtype, which is how a
+    // reader tells their scales from an affine bank's factor pair.
+    let marked = match place.dtype {
+        Dtype::Nvfp4 | Dtype::E4m3tensor => place.dtype,
+        _ => Dtype::U8,
     };
     Ok(Tensor::new(
         address(tier, store, place.offset, param)?,

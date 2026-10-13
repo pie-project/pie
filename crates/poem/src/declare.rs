@@ -313,6 +313,18 @@ impl Weight {
                     },
                 ]
             }
+            Dtype::E4m3tensor => vec![
+                BankPlane {
+                    suffix: "",
+                    shape: self.shape.clone(),
+                    dtype: Dtype::E4m3tensor,
+                },
+                BankPlane {
+                    suffix: SCALES,
+                    shape: Vec::new(),
+                    dtype: Dtype::F32,
+                },
+            ],
             Dtype::E4m3row | Dtype::E4m3tile128 | Dtype::KvU4 => panic!(
                 "`{}`: {} is served but not yet a weight representation a \
                  model text declares",
@@ -559,6 +571,7 @@ pub fn compute_dtype(dtype: Dtype) -> Option<Dtype> {
         | Dtype::I6g16k
         | Dtype::E4m3row
         | Dtype::E4m3tile128
+        | Dtype::E4m3tensor
         | Dtype::Ptq1_0 => Some(Dtype::Bf16),
         Dtype::I64 => Some(Dtype::I64),
         Dtype::I32

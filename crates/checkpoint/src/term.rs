@@ -93,6 +93,7 @@ impl QuantSpec {
             QuantScheme::None => return None,
 
             QuantScheme::Fp8E4M3 => *Dtype::E4m3row.repr(),
+            QuantScheme::Fp8E4M3Tensor => *Dtype::E4m3tensor.repr(),
             QuantScheme::Fp8E5M2 => GR_E5M2_F32_N,
             QuantScheme::Int8Symmetric => GR_I8_F32_N,
 
@@ -304,6 +305,9 @@ pub fn spec_of_canonical(term: &Term) -> Option<QuantSpec> {
         (g, Leaf::E2M1, Leaf::E8M0, Offset::None) => spec(QuantScheme::Mxfp4E2M1E8M0, 4, n(g)?),
         (g, Leaf::I(4), Leaf::F16, Offset::None) => spec(QuantScheme::Int4B8, 4, n(g)?),
         (ZGroup::Row, Leaf::E4M3, Leaf::F32, Offset::None) => spec(QuantScheme::Fp8E4M3, 8, 1),
+        (ZGroup::Tensor, Leaf::E4M3, Leaf::F32, Offset::None) => {
+            spec(QuantScheme::Fp8E4M3Tensor, 8, 1)
+        }
         (ZGroup::Row, Leaf::E5M2, Leaf::F32, Offset::None) => spec(QuantScheme::Fp8E5M2, 8, 1),
         (ZGroup::Row, Leaf::I(8), Leaf::F32, Offset::None) => {
             spec(QuantScheme::Int8Symmetric, 8, 1)
@@ -445,5 +449,31 @@ mod tests {
             None,
             "NVFP4 groups sixteen codes and no other count"
         );
+    }
+
+    #[test]
+    fn a_per_tensor_e4m3_plane_carries_one_scale_and_reads_back_as_itself() {
+        use crate::types::Encoding;
+        let spec = QuantSpec {
+            scheme: QuantScheme::Fp8E4M3Tensor,
+            logical_dtype: Dtype::Bf16,
+            bits_per_element: 8,
+            group_size: 1,
+            channel_axis: None,
+        };
+        assert_eq!(spec.term(), Some(*Dtype::E4m3tensor.repr()));
+        let term = term_of(&Encoding::Quant(spec)).expect("a type the container states");
+        let planes = term.planes(&[1000, 160]).expect("its planes lay out");
+        let laid: Vec<(&str, Vec<u64>, u64)> = planes
+            .iter()
+            .map(|plane| (plane.path.as_str(), plane.shape.clone(), plane.len))
+            .collect();
+        assert_eq!(
+            laid,
+            vec![("code", vec![1000, 160], 160_000), ("gain", vec![], 4)],
+            "a byte a code, and one f32 for all of them"
+        );
+        let read = spec_of_canonical(&term).expect("the term reads back");
+        assert_eq!(read.scheme, QuantScheme::Fp8E4M3Tensor);
     }
 }

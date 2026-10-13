@@ -670,6 +670,13 @@ fn pairings<'a>(
                           no point this shell stamps reads one; it serves on cuda",
                 });
             }
+            ScaleForm::F32Tensor => {
+                return Err(Fault::Param {
+                    name: (*name).to_string(),
+                    why: "is an e4m3 table under one f32 scale, and no point this shell \
+                          stamps reads one; it serves on cuda",
+                });
+            }
         };
         let biases = match (attachment.scale_form, attachment.zero_point_tensor) {
             (_, Some(id)) => Some(row(

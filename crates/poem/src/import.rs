@@ -266,6 +266,7 @@ fn claim_kind(dtype: Dtype) -> Kind {
     match dtype {
         Dtype::Mxfp4
         | Dtype::Nvfp4
+        | Dtype::E4m3tensor
         | Dtype::U4g64
         | Dtype::U8g64
         | Dtype::U4g32
@@ -281,6 +282,7 @@ fn group_of(dtype: Dtype) -> u32 {
     match dtype {
         Dtype::Mxfp4 => 32,
         Dtype::Nvfp4 => 16,
+        Dtype::E4m3tensor => 1,
         Dtype::U4g64 | Dtype::U8g64 | Dtype::U2g64 | Dtype::U4g64tiled => 64,
         Dtype::U4g32 | Dtype::U2g32 => 32,
         Dtype::U2g128 => 128,
@@ -316,6 +318,7 @@ fn claim(w: &Weight, tp: u32) -> Claim {
     let (encoding, scales) = match w.dtype {
         Dtype::Mxfp4
         | Dtype::Nvfp4
+        | Dtype::E4m3tensor
         | Dtype::U4g64
         | Dtype::U8g64
         | Dtype::U4g32
@@ -1560,6 +1563,19 @@ fn interned(
     pairing: Scales,
 ) -> Result<Vec<TensorContract>, Error> {
     seams_clear_the_blocked_axis(of, bands.as_ref(), pairing.channel_axis, pairing.group_size);
+    if pairing.form == ScaleForm::F32Tensor {
+        // One scale for the whole tensor, which every rank holds whole.
+        let name = crate::scales_name(of);
+        return Ok(vec![
+            TensorContract::new(
+                name.clone(),
+                Expr::src(name),
+                Vec::new(),
+                encoding(Dtype::F32),
+            )
+            .scaling(pairing),
+        ]);
+    }
     let declared = divided(shape, pairing.channel_axis, pairing.group_size, of);
     let plane = |name: String, dtype: Dtype, shape: Vec<i64>| {
         let expr = banded(&name, bands.as_ref());
@@ -1778,6 +1794,7 @@ pub fn scaling(w: &Weight) -> Scales {
     let form = match w.dtype {
         Dtype::Mxfp4 => ScaleForm::RawE8M0,
         Dtype::Nvfp4 => ScaleForm::E4m3TensorScaled,
+        Dtype::E4m3tensor => ScaleForm::F32Tensor,
         Dtype::U4g64
         | Dtype::U8g64
         | Dtype::U4g32
@@ -1924,6 +1941,13 @@ pub fn encoding(dtype: Dtype) -> Encoding {
             logical_dtype: DType::Bf16,
             bits_per_element: 4,
             group_size: 16,
+            channel_axis: None,
+        }),
+        Dtype::E4m3tensor => Encoding::Quant(QuantSpec {
+            scheme: QuantScheme::Fp8E4M3Tensor,
+            logical_dtype: DType::Bf16,
+            bits_per_element: 8,
+            group_size: 1,
             channel_axis: None,
         }),
         Dtype::E4m3row | Dtype::E4m3tile128 => panic!(
