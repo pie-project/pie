@@ -601,7 +601,13 @@ impl Shell {
         {
             let acct = accounting(demand.bytes(pages));
             acct.admit(Some(weights.bytes()), boot.memory_share)?;
-            let source = boot.residency.source_bytes();
+            // A bank read out of the artifact's own mapping is already in the
+            // weights, as the windows that span it: only what lies outside them
+            // is streamed on top.
+            let source = boot
+                .residency
+                .source_bytes()
+                .saturating_sub(weights.spanned());
             let ram = Context::physical_memory();
             let wired = acct.weights + acct.scratch + acct.minimum + acct.floor;
             if source > 0 && ram > 0 && wired + source > ram - ram / 6 {
