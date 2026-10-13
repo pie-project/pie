@@ -1,9 +1,10 @@
 #![cfg(feature = "cuda")]
 
-//! The tcgen05 GEMMs' rate beside cuBLASLt's at the shapes a decoder
-//! layer fires. Each timed batch walks enough weight copies that none is
-//! in L2 when its launch reads it, as a layer's weights are not. Ignored:
-//! it is a measurement, not a check. Run alone on an idle GPU:
+//! The tcgen05 GEMMs beside cuBLASLt: the block-scaled kinds land its
+//! products from the same scale bytes, and an ignored measurement reports
+//! both rates at the shapes a decoder layer fires. Each timed batch walks
+//! enough weight copies that none is in L2 when its launch reads it, as a
+//! layer's weights are not. Run it alone on an idle GPU:
 //!
 //!     cargo test -p kernels-cuda --features cuda --release --test kernels_cuda \
 //!         the_tcgen05_gemm_reports -- --ignored --nocapture
@@ -282,6 +283,62 @@ impl Drop for Lt {
             }
             lt::cublasLtMatmulDescDestroy(self.desc);
             lt::cublasLtDestroy(self.handle);
+        }
+    }
+}
+
+/// The atom layout is cuBLASLt's own: the same scale bytes land the same
+/// NVFP4 and MXFP8 products through its block-scaled matmul.
+#[test]
+fn the_block_scaled_kinds_land_what_cublaslt_lands_from_the_same_scales() {
+    use crate::common::from_bf16;
+    if !supported() {
+        eprintln!("skipped: no tcgen05 on this device");
+        return;
+    }
+    let mut gpu = Gpu::open();
+    let ctx = gpu.ctx();
+    let stream: rt::cudaStream_t = ctx.stream().cast();
+    let ws_bytes = 32 << 20;
+    let ws = gpu.zeros(ws_bytes);
+    for (m, n, k) in [(256, 512, 1024), (40, 256, 2048), (1000, 768, 512)] {
+        for kind in [LtKind::Nvfp4, LtKind::Mxfp8] {
+            let (elem, gran, per_byte, mask, sf) = match kind {
+                LtKind::Nvfp4 => (Elem::E2m1, 16, 2, 0xff, (0x07, 0x30)),
+                _ => (Elem::E4m3, 32, 1, 0xb7, (0x03, 0x7c)),
+            };
+            let w = gpu.up(&noise(n * k / per_byte, mask, 0, 21));
+            let a = gpu.up(&noise(m * k / per_byte, mask, 0, 22));
+            let sw = gpu.up(&noise(atom_bytes(n, k, gran), sf.0, sf.1, 23));
+            let sa = gpu.up(&noise(atom_bytes(m, k, gran), sf.0, sf.1, 24));
+            let (ours, theirs) = (gpu.zeros(m * n * 2), gpu.zeros(m * n * 2));
+            let lt = unsafe { Lt::plan(kind, [m, n, k], sw, sa, ws, ws_bytes) }
+                .unwrap_or_else(|why| panic!("cuBLASLt plans no {m}x{n}x{k}: {why}"));
+            lt.run(w, a, theirs, stream);
+            gemm(
+                &ctx,
+                Operand::scaled(a, elem, sa, gran as u32),
+                Operand::scaled(w, elem, sw, gran as u32),
+                ours,
+                [m as u32, n as u32, k as u32],
+                1.0,
+            )
+            .expect("tc5 fires");
+            gpu.sync();
+            let ours: Vec<u16> = gpu.down(ours, m * n);
+            let theirs: Vec<u16> = gpu.down(theirs, m * n);
+            let mut exact = 0;
+            for (i, (&o, &t)) in ours.iter().zip(&theirs).enumerate() {
+                let (o, t) = (from_bf16(o), from_bf16(t));
+                assert!(
+                    (o - t).abs() <= t.abs() / 64.0 + 1e-3,
+                    "{m}x{n}x{k}: y[{}][{}] = {o}, cuBLASLt {t}",
+                    i / n,
+                    i % n
+                );
+                exact += usize::from(o == t);
+            }
+            eprintln!("{m}x{n}x{k}: {exact} of {} bit-equal to cuBLASLt", m * n);
         }
     }
 }
