@@ -94,6 +94,12 @@ pub struct Request {
     pub response_format: ResponseFormat,
     pub sampling: Sampling,
     pub max_tokens: usize,
+    /// Tokens generated before a stop token may end the generation; a stop
+    /// token sampled earlier is dropped and generation goes on.
+    pub min_tokens: usize,
+    /// Stop tokens never end the generation (they are dropped), so it runs
+    /// to `max_tokens` or a stop sequence.
+    pub ignore_eos: bool,
     /// Stop sequences: generation ends when the content ends with one, and
     /// the sequence itself is not returned.
     pub stop: Vec<String>,
@@ -116,6 +122,8 @@ impl Request {
             response_format: ResponseFormat::Text,
             sampling: Sampling::default(),
             max_tokens: DEFAULT_MAX_TOKENS,
+            min_tokens: 0,
+            ignore_eos: false,
             stop: Vec::new(),
             thinking: Thinking::ModelDefault,
             stream: false,

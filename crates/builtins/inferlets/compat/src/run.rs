@@ -113,9 +113,14 @@ pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, 
         stop_hit: None,
     };
     let mut error: Option<String> = None;
+    let mut seen = 0usize;
 
     let mut on_token = |token: u32| -> ControlFlow<()> {
+        seen += 1;
         if stop_tokens.contains(&token) {
+            if req.ignore_eos || seen <= req.min_tokens {
+                return ControlFlow::Continue(());
+            }
             out.finish = Some(Finish::Stop);
             return ControlFlow::Break(());
         }

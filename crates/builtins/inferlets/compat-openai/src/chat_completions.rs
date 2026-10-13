@@ -11,7 +11,8 @@
 //! (`text`/`json_object`/`json_schema`), `stream` and
 //! `stream_options.include_usage`, `temperature`, `top_p`, `top_k`,
 //! `max_tokens`/`max_completion_tokens`, `stop`, `seed`,
-//! `presence_penalty`, `frequency_penalty`, `repetition_penalty`,
+//! `presence_penalty`, `frequency_penalty`, `repetition_penalty`, the vLLM
+//! extensions `min_tokens` and `ignore_eos`,
 //! `reasoning_effort: "none"` and `chat_template_kwargs.enable_thinking` to
 //! switch thinking off or on.
 //!
@@ -42,6 +43,8 @@ struct Body {
     top_k: Option<u32>,
     max_tokens: Option<usize>,
     max_completion_tokens: Option<usize>,
+    min_tokens: usize,
+    ignore_eos: bool,
     stop: Option<Value>,
     seed: Option<i64>,
     n: Option<u32>,
@@ -319,6 +322,8 @@ fn parse(body: Value) -> Result<(Request, bool), ApiError> {
         }
         req.max_tokens = max;
     }
+    req.min_tokens = body.min_tokens;
+    req.ignore_eos = body.ignore_eos;
     req.stop = stop_sequences(body.stop)?;
     req.thinking = match body.reasoning_effort.as_deref() {
         Some("none") => Thinking::Disabled,

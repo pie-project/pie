@@ -3,7 +3,8 @@
 //!
 //! Supported: `prompt` (one string, or a one-element array), `max_tokens`
 //! (default 16), `temperature`, `top_p`, `top_k`, `stop`, `seed`, `echo`,
-//! the penalties, `stream` and `stream_options.include_usage`.
+//! the penalties, `stream` and `stream_options.include_usage`, and the vLLM
+//! extensions `min_tokens` and `ignore_eos`.
 //!
 //! Refused with 400: more than one prompt, token-array prompts, `suffix`,
 //! `logprobs`, and `n > 1`. Anything a thinking model emits as a thinking
@@ -20,6 +21,8 @@ use crate::{invalid, stop_sequences, usage};
 struct Body {
     prompt: Option<Value>,
     max_tokens: Option<usize>,
+    min_tokens: usize,
+    ignore_eos: bool,
     temperature: Option<f32>,
     top_p: Option<f32>,
     top_k: Option<u32>,
@@ -89,6 +92,8 @@ fn parse(body: Value) -> Result<Parsed, ApiError> {
     if req.max_tokens == 0 {
         return Err(invalid("max_tokens must be at least 1", Some("max_tokens")));
     }
+    req.min_tokens = body.min_tokens;
+    req.ignore_eos = body.ignore_eos;
     if let Some(t) = body.temperature {
         req.sampling.temperature = t;
     }
