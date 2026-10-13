@@ -45,54 +45,109 @@ enum Incoming {
 }
 
 struct LiveTurns {
-    streams: Vec<TokenRx>,
+    turns: Vec<Turn>,
     cursor: usize,
+}
+
+/// A turn's stream and the request it answers: once its response has gone
+/// out, the request has been heard and a later failure has no one to tell.
+struct Turn {
+    corr: Option<u32>,
+    answered: bool,
+    rx: TokenRx,
 }
 
 enum TurnEvent {
     Item(Tokens),
-    Aborted,
+    Aborted { corr: Option<u32>, answered: bool },
 }
 
 impl LiveTurns {
     fn new() -> Self {
         Self {
-            streams: Vec::new(),
+            turns: Vec::new(),
             cursor: 0,
         }
     }
 
-    fn push(&mut self, rx: TokenRx) {
-        self.streams.push(rx);
+    fn push(&mut self, corr: Option<u32>, rx: TokenRx) {
+        self.turns.push(Turn {
+            corr,
+            answered: false,
+            rx,
+        });
     }
 
     async fn next(&mut self) -> TurnEvent {
-        let live = self.streams.len();
+        let live = self.turns.len();
         if live == 0 {
             return std::future::pending::<TurnEvent>().await;
         }
-        self.streams.rotate_left(self.cursor % live);
+        self.turns.rotate_left(self.cursor % live);
         self.cursor = 0;
         let (item, index, _) = futures::future::select_all(
-            self.streams
+            self.turns
                 .iter_mut()
-                .map(|rx| Box::pin(rx.recv()))
+                .map(|turn| Box::pin(turn.rx.recv()))
                 .collect::<Vec<_>>(),
         )
         .await;
         self.cursor = index + 1;
         match item {
             Some(Tokens::Eos) => {
-                self.streams.remove(index);
+                self.turns.remove(index);
                 TurnEvent::Item(Tokens::Eos)
             }
-            Some(other) => TurnEvent::Item(other),
+            Some(Tokens::Chunk(msg)) => {
+                let turn = &mut self.turns[index];
+                if let client_api::ServerMessage::Response { corr_id, .. } = &msg
+                    && turn.corr == Some(*corr_id)
+                {
+                    turn.answered = true;
+                }
+                TurnEvent::Item(Tokens::Chunk(msg))
+            }
             None => {
-                self.streams.remove(index);
-                TurnEvent::Aborted
+                let turn = self.turns.remove(index);
+                TurnEvent::Aborted {
+                    corr: turn.corr,
+                    answered: turn.answered,
+                }
             }
         }
     }
+}
+
+type Tx = futures::stream::SplitSink<WebSocket, Message>;
+
+/// Says `why` to the request `corr` names and goes on serving. A failure
+/// with no request to say it to ends the socket instead: nothing the client
+/// waits on would otherwise ever hear back. `false` once the socket is done.
+async fn answer(tx: &mut Tx, corr: Option<u32>, why: &str) -> bool {
+    if corr.is_none() {
+        end(tx, None, why).await;
+        return false;
+    }
+    tx.send(refusal(corr, why)).await.is_ok()
+}
+
+/// Ends the socket over `why`, answered under `corr` where there is one and
+/// on the close frame, so a client that reads its responses or only its
+/// close hears why, and so does the server log.
+async fn end(tx: &mut Tx, corr: Option<u32>, why: &str) {
+    tracing::warn!("closing a client socket: {why}");
+    let _ = tx.send(refusal(corr, why)).await;
+    // A close frame's reason is at most 123 bytes.
+    let mut cut = why.len().min(123);
+    while !why.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let _ = tx
+        .send(Message::Close(Some(CloseFrame {
+            code: close_code::POLICY,
+            reason: why[..cut].into(),
+        })))
+        .await;
 }
 
 async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
@@ -100,35 +155,17 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
 
     let first = match read_first_turn(&mut rx_ws).await {
         Ok(req) => req,
-        Err(Some(why)) => {
-            let _ = tx.send(Message::Text(error_json(&why).into())).await;
-            let _ = tx.send(Message::Close(None)).await;
-            return;
-        }
+        Err(Some((corr, why))) => return end(&mut tx, corr, &why).await,
         Err(None) => return,
     };
+    let corr = first.message.corr_id();
     let (handle, first_rx) = match state.sessions.create(ident, first, Affinity::Sticky).await {
         Ok(pair) => pair,
-        Err(e) => {
-            // A session refused on its first turn is closed, and the reason
-            // rides on the close frame as well as the error frame ahead of
-            // it: a client that reads only its response frames still sees
-            // why its socket went, and so does the server log.
-            let why = e.to_string();
-            tracing::warn!("session refused on its first turn: {why}");
-            let _ = tx.send(Message::Text(error_json(&why).into())).await;
-            let _ = tx
-                .send(Message::Close(Some(CloseFrame {
-                    code: close_code::POLICY,
-                    reason: why.into(),
-                })))
-                .await;
-            return;
-        }
+        Err(e) => return end(&mut tx, corr, &e.to_string()).await,
     };
 
     let mut live = LiveTurns::new();
-    live.push(first_rx);
+    live.push(corr, first_rx);
     // A launch may wait at admission for a seat, so it waits here beside the
     // session's running turns and keeps their output flowing; every other
     // frame (an upload's chunks among them) is still dispatched in order.
@@ -142,9 +179,9 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
     loop {
         tokio::select! {
             Some((corr, turn)) = admitting.next(), if !admitting.is_empty() => match turn {
-                Ok(new_rx) => live.push(new_rx),
+                Ok(new_rx) => live.push(corr, new_rx),
                 Err(e) => {
-                    if tx.send(refusal(corr, &SessionError::to_string(&e))).await.is_err() {
+                    if !answer(&mut tx, corr, &SessionError::to_string(&e)).await {
                         break;
                     }
                 }
@@ -169,64 +206,35 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
                         break;
                     }
                 }
-                TurnEvent::Aborted => {
-                    if tx
-                        .send(Message::Text(error_json("stream aborted").into()))
-                        .await
-                        .is_err()
-                    {
+                TurnEvent::Aborted { corr, answered } => {
+                    // A turn already answered (a launched process) has no
+                    // request left to hear that its worker went away.
+                    let corr = if answered { None } else { corr };
+                    if !answer(&mut tx, corr, "the worker serving this turn went away").await {
                         break;
                     }
                 }
             },
 
             incoming = rx_ws.next() => match incoming {
-                Some(Ok(Message::Text(t))) if too_large(t.len()).is_some() => {
-                    let why = too_large(t.len()).expect("guard matched");
-                    if tx.send(Message::Text(error_json(&why).into())).await.is_err() {
-                        break;
-                    }
-                }
-                Some(Ok(Message::Binary(b))) if too_large(b.len()).is_some() => {
-                    let why = too_large(b.len()).expect("guard matched");
-                    if tx.send(Message::Text(error_json(&why).into())).await.is_err() {
-                        break;
-                    }
-                }
-                Some(Ok(Message::Text(t))) => match parse_incoming(t.as_str()) {
+                Some(Ok(frame @ (Message::Text(_) | Message::Binary(_)))) => match read(&frame) {
                     Ok(Incoming::Turn(req)) if is_launch(&req) => admitting.push(admit(req)),
                     Ok(Incoming::Turn(req)) => {
                         let corr = req.message.corr_id();
                         match handle.turn(req).await {
-                            Ok(new_rx) => live.push(new_rx),
+                            Ok(new_rx) => live.push(corr, new_rx),
                             Err(e) => {
-                                if tx.send(refusal(corr, &e.to_string())).await.is_err() {
+                                if !answer(&mut tx, corr, &e.to_string()).await {
                                     break;
                                 }
                             }
                         }
                     }
                     Ok(Incoming::Cancel) => handle.cancel().await,
-                    Err(e) => {
-                        let _ = tx.send(Message::Text(error_json(&e).into())).await;
-                    }
-                },
-                Some(Ok(Message::Binary(b))) => match parse_incoming_bytes(&b) {
-                    Ok(Incoming::Turn(req)) if is_launch(&req) => admitting.push(admit(req)),
-                    Ok(Incoming::Turn(req)) => {
-                        let corr = req.message.corr_id();
-                        match handle.turn(req).await {
-                            Ok(new_rx) => live.push(new_rx),
-                            Err(e) => {
-                                if tx.send(refusal(corr, &e.to_string())).await.is_err() {
-                                    break;
-                                }
-                            }
+                    Err(why) => {
+                        if !answer(&mut tx, corr_of(&frame), &why).await {
+                            break;
                         }
-                    }
-                    Ok(Incoming::Cancel) => handle.cancel().await,
-                    Err(e) => {
-                        let _ = tx.send(Message::Text(error_json(&e).into())).await;
                     }
                 },
                 Some(Ok(Message::Close(_))) | None => break,
@@ -246,26 +254,41 @@ fn is_launch(req: &TurnInput) -> bool {
 
 async fn read_first_turn(
     rx_ws: &mut futures::stream::SplitStream<WebSocket>,
-) -> Result<TurnInput, Option<String>> {
+) -> Result<TurnInput, Option<(Option<u32>, String)>> {
     loop {
         match rx_ws.next().await {
-            Some(Ok(Message::Text(t))) if too_large(t.len()).is_some() => {
-                return Err(too_large(t.len()));
-            }
-            Some(Ok(Message::Binary(b))) if too_large(b.len()).is_some() => {
-                return Err(too_large(b.len()));
-            }
-            Some(Ok(Message::Text(t))) => match parse_incoming(t.as_str()) {
+            Some(Ok(frame @ (Message::Text(_) | Message::Binary(_)))) => match read(&frame) {
                 Ok(Incoming::Turn(req)) => return Ok(req),
-                _ => continue,
-            },
-            Some(Ok(Message::Binary(b))) => match parse_incoming_bytes(&b) {
-                Ok(Incoming::Turn(req)) => return Ok(req),
-                _ => continue,
+                Ok(Incoming::Cancel) => continue,
+                Err(why) => return Err(Some((corr_of(&frame), why))),
             },
             Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return Err(None),
             Some(Ok(_)) => continue,
         }
+    }
+}
+
+/// A text or binary frame as the message it carries.
+fn read(frame: &Message) -> Result<Incoming, String> {
+    match frame {
+        Message::Text(t) => too_large(t.len()).map_or_else(|| parse_incoming(t.as_str()), Err),
+        Message::Binary(b) => too_large(b.len()).map_or_else(|| parse_incoming_bytes(b), Err),
+        _ => Err("not a text or binary frame".to_string()),
+    }
+}
+
+/// The request id a frame carries, read on its own: a frame refused before
+/// it parses whole (too large, or not a message this gateway knows) is still
+/// answered under it when it has one.
+fn corr_of(frame: &Message) -> Option<u32> {
+    #[derive(serde::Deserialize)]
+    struct Corr {
+        corr_id: Option<u32>,
+    }
+    match frame {
+        Message::Text(t) => serde_json::from_str::<Corr>(t).ok()?.corr_id,
+        Message::Binary(b) => rmp_serde::from_slice::<Corr>(b).ok()?.corr_id,
+        _ => None,
     }
 }
 
@@ -332,6 +355,41 @@ mod refusal_tests {
         a_correlated_call_is_refused_under_its_own_id();
         an_uncorrelated_frame_gets_the_bare_error();
         every_call_that_expects_a_response_carries_its_id();
+        a_frame_too_large_to_serve_is_refused_under_the_id_it_carries();
+        a_frame_this_gateway_cannot_read_is_refused_under_its_id();
+        a_frame_with_no_id_has_none_to_answer_under();
+    }
+
+    fn a_frame_too_large_to_serve_is_refused_under_the_id_it_carries() {
+        let frame = Message::Binary(
+            rmp_serde::to_vec_named(&client_api::ClientMessage::Query {
+                corr_id: 9,
+                subject: "x".repeat(MAX_CLIENT_FRAME_BYTES),
+                record: String::new(),
+            })
+            .unwrap()
+            .into(),
+        );
+        let why = read(&frame).err().expect("past the frame limit");
+        assert!(why.contains("too large"), "{why}");
+        assert_eq!(corr_of(&frame), Some(9));
+    }
+
+    fn a_frame_this_gateway_cannot_read_is_refused_under_its_id() {
+        let frame = Message::Text(r#"{"type": "no_such_message", "corr_id": 4}"#.into());
+        assert!(read(&frame).is_err());
+        assert_eq!(corr_of(&frame), Some(4));
+    }
+
+    fn a_frame_with_no_id_has_none_to_answer_under() {
+        for frame in [
+            Message::Text("{not json".into()),
+            Message::Text(r#"{"type": "no_such_message"}"#.into()),
+            Message::Binary(vec![0xc1].into()),
+        ] {
+            assert!(read(&frame).is_err());
+            assert_eq!(corr_of(&frame), None);
+        }
     }
 
     fn a_correlated_call_is_refused_under_its_own_id() {
