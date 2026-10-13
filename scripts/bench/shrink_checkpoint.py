@@ -1996,8 +1996,9 @@ def apply_engram_carve(outs: list["OutTensor"], src: dict[str, SrcTensor], plan:
 def mark_fp8_readout(outs: list["OutTensor"], plan: Plan) -> list["OutTensor"]:
     """Pair every fp8 plane with its `.scale` exponents so it is written as
     bf16, and drop the exponent planes from the output. The fp4 experts
-    (int8 code pairs) are not touched: pie reads them as MXFP4."""
-    if plan.family != "deepseek_v41":
+    (int8 code pairs) are not touched: pie reads them as MXFP4. DeepSeek-V4's
+    release layout (V4-Pro) stores its dense planes the same way."""
+    if plan.family not in ("deepseek_v41", "deepseek_v4"):
         return outs
     by_name = {ot.name: ot for ot in outs}
     kept: list[OutTensor] = []
