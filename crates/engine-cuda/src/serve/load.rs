@@ -1137,6 +1137,11 @@ fn decoded_weight_planes(
                 continue;
             };
             let at_tokens = match &node.op {
+                // A low-precision product decodes no bf16 tile.
+                poem_ir::Operation::Linear(
+                    poem_ir::Linear::MatmulActQuant { .. }
+                    | poem_ir::Linear::MoeMatmulSelectActQuant { .. },
+                ) => continue,
                 poem_ir::Operation::Linear(_) => {
                     outputs.clear();
                     node.op.outputs(&mut outputs);

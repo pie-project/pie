@@ -778,19 +778,10 @@ impl Run<'_> {
                 });
             }
         };
-        // The bank's scales laid into each expert's whole row blocks, each
-        // fire: an artifact stores them row-major.
-        let atom_bytes = linear::tc5::atom_bytes((experts * n) as usize, k as usize, gran);
-        let atoms = self.ctx().scratch_stream(OP, BANK_ATOMS, atom_bytes)? as u64;
-        act_quant::scales_to_atoms(
-            self.ctx(),
-            OP,
-            scales.ptr,
-            atoms,
-            experts * n,
-            k / gran as u32,
-            1,
-        )?;
+        if !self.scales_in_atoms(bank) {
+            return Err(unlaid(OP));
+        }
+        let atoms = scales.ptr;
         act_quant::select(
             self.ctx(),
             OP,
@@ -833,6 +824,9 @@ impl Run<'_> {
                     .to_string(),
             });
         }
+        if !self.scales_in_atoms(w) {
+            return Err(unlaid(OP));
+        }
         let act = self.tensor(act);
         let mut out = self.tensor(y);
         let (n, k) = (out.width, act.width);
@@ -849,6 +843,7 @@ impl Run<'_> {
                     k,
                     elem: linear::tc5::Elem::E2m1,
                     gran: 32,
+                    laid: true,
                 },
                 &mut out,
                 1.0,
@@ -1033,9 +1028,17 @@ fn lowp(op: &'static str) -> Result<(), kernels_cuda::Error> {
     })
 }
 
-/// A routed bank's scales laid into atoms, one a stream.
+/// A low-precision bank whose scales the load could not lay into atoms.
 #[cfg(feature = "cuda")]
-const BANK_ATOMS: &str = "linear.act_quant.bank_atoms";
+fn unlaid(op: &'static str) -> kernels_cuda::Error {
+    kernels_cuda::Error::Backend {
+        op,
+        detail: "a low-precision bank's scales are laid into tcgen05 atoms at load, which \
+                 takes a resident bank of whole 128-row blocks whose rows hold whole fours \
+                 of scales; this one is not"
+            .to_string(),
+    }
+}
 
 /// An NVFP4 bank's per-expert product scales, one a stream.
 #[cfg(feature = "cuda")]

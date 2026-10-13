@@ -279,8 +279,8 @@ const WEIGHT_ATOMS: &str = "linear.act_quant.weight_atoms";
 
 /// A dense projection's weight as the tcgen05 GEMM reads it: `codes` its
 /// `n` rows of `k` codes (two e2m1 a byte, the even one low), `scales` its
-/// row-major one-byte scales, `gran` K a scale, ue8m0 (MXFP4) or e4m3
-/// (NVFP4).
+/// one-byte scales (row-major, or already in atoms when `laid`), `gran` K a
+/// scale, ue8m0 (MXFP4) or e4m3 (NVFP4).
 #[derive(Clone, Copy, Debug)]
 pub struct Weight {
     pub codes: u64,
@@ -289,6 +289,7 @@ pub struct Weight {
     pub k: u32,
     pub elem: tc5::Elem,
     pub gran: u32,
+    pub laid: bool,
 }
 
 /// `y = quant(act) · w^T` on the tcgen05 GEMM, `alpha` the product's global
@@ -319,12 +320,14 @@ pub fn matmul(
     let atom_bytes = tc5::atom_bytes(m as usize, k as usize, fmt.gran() as usize);
     let atoms = ctx.scratch_stream(op, ACT_ATOMS, atom_bytes)?;
     quantize(ctx, op, fmt, act, codes as u64, atoms as u64, atom_bytes)?;
-    let w_atoms = ctx.scratch_stream(
-        op,
-        WEIGHT_ATOMS,
-        tc5::atom_bytes(w.n as usize, k as usize, w.gran as usize),
-    )?;
-    scales_to_atoms(ctx, op, w.scales, w_atoms as u64, w.n, k / w.gran, 1)?;
+    let w_atoms = if w.laid {
+        w.scales
+    } else {
+        let bytes = tc5::atom_bytes(w.n as usize, k as usize, w.gran as usize);
+        let atoms = ctx.scratch_stream(op, WEIGHT_ATOMS, bytes)? as u64;
+        scales_to_atoms(ctx, op, w.scales, atoms, w.n, k / w.gran, 1)?;
+        atoms
+    };
     let a_elem = match fmt {
         Format::Nvfp4 => tc5::Elem::E2m1,
         Format::E4m3 { .. } => tc5::Elem::E4m3,

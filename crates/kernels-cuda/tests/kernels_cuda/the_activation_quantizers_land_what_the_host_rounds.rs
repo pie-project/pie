@@ -355,6 +355,7 @@ fn w4a8_matmul(m: usize, n: usize, k: usize, gran: usize) {
             k: k as u32,
             elem: Elem::E2m1,
             gran: 32,
+            laid: false,
         },
         &mut y,
         1.0,

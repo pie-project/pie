@@ -875,6 +875,7 @@ impl Weights {
                 }
                 Some(pairing) => WeightRow::Planes {
                     repacked: place.dtype == Dtype::U4g64tiled,
+                    atoms: false,
                     codes: packed(experts.as_ref(), &store, &places, at)?,
                     scales: packed(experts.as_ref(), &store, &places, pairing.scales)?,
                     biases: match pairing.biases {
@@ -908,6 +909,8 @@ impl Weights {
             };
             table.push(Some(row));
         }
+        #[cfg(feature = "cuda")]
+        lay_atoms(trace, &mut table, stream)?;
         if let Some(tier) = experts.as_mut() {
             let slabs: Vec<u64> = tier
                 .plan()
@@ -1350,4 +1353,93 @@ mod tests {
             100
         );
     }
+}
+
+/// The banks a low-precision product reads, and the K a scale of each covers:
+/// their scales are read only by that product, which takes them in atoms.
+#[cfg(feature = "cuda")]
+fn act_quant_banks(trace: &Trace) -> BTreeMap<usize, u32> {
+    use poem_ir::{Def, Linear, Operation};
+    let mut banks = BTreeMap::new();
+    for node in &trace.nodes {
+        let w = match &node.op {
+            Operation::Linear(
+                Linear::MatmulActQuant { w, .. } | Linear::MoeMatmulSelectActQuant { bank: w, .. },
+            ) => *w,
+            _ => continue,
+        };
+        let Some(Def::Weight(at)) = trace.values.get(w.0 as usize).map(|v| &v.def) else {
+            continue;
+        };
+        let at = *at as usize;
+        let gran = match trace.params[at].dtype {
+            Dtype::Nvfp4 => 16,
+            Dtype::Mxfp4 => 32,
+            _ => continue,
+        };
+        banks.insert(at, gran);
+    }
+    banks
+}
+
+/// Each low-precision bank's scales laid into the tcgen05 GEMM's atoms in
+/// place, once: a resident bank whose rows are whole 128-row blocks and
+/// whose rows' scales are whole atoms of four, where the atoms take the
+/// bytes the row-major plane does. A bank this cannot lay keeps its
+/// row-major scales, and its product refuses it.
+#[cfg(feature = "cuda")]
+fn lay_atoms(
+    trace: &Trace,
+    table: &mut [Option<WeightRow>],
+    stream: *mut core::ffi::c_void,
+) -> Result<()> {
+    let banks = act_quant_banks(trace);
+    let mut temp: Option<Buffer> = None;
+    for (at, gran) in banks {
+        let Some(Some(WeightRow::Planes {
+            scales,
+            seat,
+            atoms,
+            ..
+        })) = table.get_mut(at)
+        else {
+            continue;
+        };
+        let shape = &trace.params[at].shape;
+        let (&k, lead) = shape.split_last().unwrap_or((&0, &[]));
+        let rows: u64 = lead.iter().product();
+        let cols = k / u64::from(gran);
+        if seat.streams()
+            || crate::device::alloc::is_host_pointer(scales.ptr)
+            || !rows.is_multiple_of(128)
+            || !cols.is_multiple_of(4)
+        {
+            continue;
+        }
+        let bytes = usize::try_from(rows * cols).unwrap_or(usize::MAX);
+        if temp.as_ref().is_none_or(|t| t.bytes() < bytes) {
+            if temp.is_some() {
+                crate::device::ctx::sync(stream)?;
+            }
+            temp = Some(Buffer::zeroed(bytes)?);
+        }
+        let held = temp.as_ref().map_or(0, Buffer::ptr);
+        // SAFETY: `stream` is the load's stream, live for the load.
+        let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
+        kernels_cuda::linear::act_quant::scales_to_atoms(
+            &ctx,
+            "linear.act_quant",
+            scales.ptr,
+            held,
+            u32::try_from(rows).unwrap_or(u32::MAX),
+            u32::try_from(cols).unwrap_or(u32::MAX),
+            1,
+        )?;
+        crate::device::copy_any(stream, scales.ptr, held, bytes)?;
+        *atoms = true;
+    }
+    if temp.is_some() {
+        crate::device::ctx::sync(stream)?;
+    }
+    Ok(())
 }
