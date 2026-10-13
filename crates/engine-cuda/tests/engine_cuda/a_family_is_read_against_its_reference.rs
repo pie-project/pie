@@ -161,7 +161,11 @@ fn every_probe_is_dumped() {
         context,
         slots: 4,
         kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        memory_share: std::env::var("PIE_PARITY_MEMORY_SHARE")
+            .ok()
+            .map_or(engine::load::DEFAULT_DEVICE_MEMORY_SHARE, |share| {
+                share.parse().expect("a device memory share")
+            }),
         ordinal: 0,
         knobs: Knobs {
             chip: Some(engine_cuda::chip::pinned(Graphs::Off, None)),
