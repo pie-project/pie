@@ -21,7 +21,9 @@ use crate::types::{
     TensorDecl, TensorId, encoding_dense_element_bytes, encoding_nbytes,
 };
 
-const MAX_RUNS: usize = 1 << 20;
+/// The runs a copy list may hold: an NVFP4 bank's row tensor scales are one
+/// run a row (Qwen 3.8 Flash Next's 512-expert down bank is 1.3M of them).
+const MAX_RUNS: usize = 1 << 22;
 
 pub fn build(
     metadata: &Metadata,
