@@ -123,6 +123,7 @@ pub fn decode_selected(
     head_dim: u32,
     sm_scale: f32,
     ratio: u32,
+    per_head: bool,
 ) -> Value {
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
@@ -136,6 +137,7 @@ pub fn decode_selected(
             head_dim,
             sm_scale,
             ratio,
+            per_head,
             o: o.id(),
         },
         &[q, plan, selection],
@@ -154,6 +156,7 @@ pub fn prefill_selected(
     kv_heads: u32,
     sm_scale: f32,
     ratio: u32,
+    per_head: bool,
 ) -> Value {
     let r = q.rec();
     let o = r.fresh(q.ty().clone());
@@ -168,6 +171,7 @@ pub fn prefill_selected(
             kv_heads,
             sm_scale,
             ratio,
+            per_head,
             o: o.id(),
         },
         &[q, plan, selection],
@@ -1164,9 +1168,15 @@ pub fn index_topk(
     head_dim: u32,
     top_k: u32,
     ratio: u32,
+    score: IndexScore,
 ) -> Value {
     let r = q.rec();
-    let selection = r.fresh(tensor(q.rows(), top_k, Dtype::I32));
+    // A block-max ranking selects for each head on its own.
+    let runs = match score {
+        IndexScore::Pooled => 1,
+        IndexScore::BlockMax => heads,
+    };
+    let selection = r.fresh(tensor(q.rows(), runs * top_k, Dtype::I32));
     let mut deps = vec![q];
     deps.extend(weights);
     r.push(
@@ -1178,6 +1188,7 @@ pub fn index_topk(
             head_dim,
             top_k,
             ratio,
+            score,
             selection: selection.id(),
         },
         &deps,

@@ -18,7 +18,8 @@ constexpr int kMaxPer = 16;
 // and take no per-row selection, so this walk is written out: the reduction is
 // `mla_naive_paged_kernel`'s, and only the key loop and the K/V addressing
 // differ (two planes at `(slot * n_kv_heads + kv_head) * D`, V accumulated
-// rather than K).
+// rather than K). With `per_head` the selection row holds one run of `top_k`
+// blocks per kv head, and a head's queries read their kv head's run.
 template <class T>
 __global__ void sdpa_paged_selected_kernel(
     const T* __restrict__ queries,
@@ -31,7 +32,7 @@ __global__ void sdpa_paged_selected_kernel(
     const i32* __restrict__ selection,
     T* __restrict__ o,
     i32 R, i32 H, i32 KVH, i32 D, i32 page_size, float sm_scale,
-    i32 top_k, i32 ratio, i32 G,
+    i32 top_k, i32 ratio, i32 G, i32 per_head,
     const u32* __restrict__ win)
 {
     const int t = static_cast<int>(blockIdx.x);
@@ -67,7 +68,9 @@ __global__ void sdpa_paged_selected_kernel(
 
     const int nblocks = (ratio > 0) ? j_end / ratio : 0;
     const int blocks = min(top_k, nblocks);
-    const i32* srow = selection + static_cast<long long>(t_row) * top_k;
+    const i32* srow = per_head
+        ? selection + (static_cast<long long>(t_row) * KVH + kv_head) * top_k
+        : selection + static_cast<long long>(t_row) * top_k;
 
     extern __shared__ float smem[];
     float* wacc = smem;

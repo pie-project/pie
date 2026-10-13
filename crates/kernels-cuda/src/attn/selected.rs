@@ -30,6 +30,7 @@ fn selected(
     kv_heads: Option<u32>,
     sm_scale: f32,
     ratio: u32,
+    per_head: bool,
     o: &mut Tensor,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, q.data.dtype, { Bf16 => () });
@@ -95,7 +96,15 @@ fn selected(
             "the selection does not carry one row per query row",
         ));
     }
-    let top_k = count(op, "the selection budget", selection.width)?;
+    let runs = if per_head { kv_heads } else { 1 };
+    let width = stated(op, selection.width)?;
+    if width <= 0 || width % runs != 0 {
+        return Err(refuse(
+            op,
+            format!("the {width}-wide selection is not one run per each of {runs} kv heads"),
+        ));
+    }
+    let top_k = width / runs;
     let ratio = count(op, "the block width this reader expands", ratio)?;
     let total_tokens = stated(op, o.rows)?;
     if total_tokens <= 0 {
@@ -136,6 +145,7 @@ fn selected(
             top_k.arg(),
             ratio.arg(),
             g.arg(),
+            i32::from(per_head).arg(),
             ctx.stage(),
         ],
     )
@@ -151,6 +161,7 @@ pub fn attention_decode_selected(
     head_dim: u32,
     sm_scale: f32,
     ratio: u32,
+    per_head: bool,
     o: &mut Tensor,
 ) -> Result<(), Error> {
     selected(
@@ -164,6 +175,7 @@ pub fn attention_decode_selected(
         None,
         sm_scale,
         ratio,
+        per_head,
         o,
     )
 }
@@ -179,6 +191,7 @@ pub fn attention_prefill_selected(
     kv_heads: u32,
     sm_scale: f32,
     ratio: u32,
+    per_head: bool,
     o: &mut Tensor,
 ) -> Result<(), Error> {
     selected(
@@ -192,6 +205,7 @@ pub fn attention_prefill_selected(
         Some(kv_heads),
         sm_scale,
         ratio,
+        per_head,
         o,
     )
 }

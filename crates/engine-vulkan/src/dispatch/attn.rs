@@ -1,6 +1,6 @@
 use kernels_vulkan::attn;
 use poem_exec::{DispatchAttention, KernelError};
-use poem_ir::{Attention, Operands, StructKind};
+use poem_ir::{Attention, IndexScore, Operands, StructKind};
 
 use crate::run::{Run, StructSlot};
 
@@ -170,6 +170,12 @@ impl Run<'_> {
                 self.tuning(),
             ),
 
+            Attention::DecodeSelected { per_head: true, .. }
+            | Attention::PrefillSelected { per_head: true, .. }
+            | Attention::IndexTopk {
+                score: IndexScore::BlockMax,
+                ..
+            } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
             Attention::DecodeSelected {
                 q,
                 plan,
@@ -179,6 +185,7 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 ratio,
+                per_head: false,
                 o,
             } => attn::decode_selected(
                 self.ctx(),
@@ -203,6 +210,7 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 ratio,
+                per_head: false,
                 o,
             } => attn::prefill_selected(
                 self.ctx(),
@@ -1079,6 +1087,7 @@ impl Run<'_> {
                 head_dim,
                 top_k,
                 ratio,
+                score: IndexScore::Pooled,
                 selection,
             } => {
                 let Some(scores) = self.index_scores() else {

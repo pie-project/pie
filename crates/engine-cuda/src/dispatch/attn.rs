@@ -1,7 +1,7 @@
 use kernels_cuda::attn::{self, fa2, index, mla, plan, pool, selected};
 use kernels_cuda::attn_dense;
 use poem_exec::{DispatchAttention, KernelError};
-use poem_ir::{Attention, StructKind};
+use poem_ir::{Attention, IndexScore, StructKind};
 
 use crate::run::{Run, StructSlot};
 use kernels_cuda::RaggedTensor;
@@ -201,6 +201,7 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 ratio,
+                per_head,
                 o,
             } => selected::attention_decode_selected(
                 self.ctx(),
@@ -211,6 +212,7 @@ impl Run<'_> {
                 *head_dim,
                 *sm_scale,
                 *ratio,
+                *per_head,
                 &mut self.tensor(*o),
             ),
             Attention::PrefillSelected {
@@ -223,6 +225,7 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 ratio,
+                per_head,
                 o,
             } => selected::attention_prefill_selected(
                 self.ctx(),
@@ -234,6 +237,7 @@ impl Run<'_> {
                 *kv_heads,
                 *sm_scale,
                 *ratio,
+                *per_head,
                 &mut self.tensor(*o),
             ),
             Attention::DecodeRel {
@@ -1157,6 +1161,7 @@ impl Run<'_> {
                 head_dim,
                 top_k,
                 ratio,
+                score: IndexScore::Pooled,
                 selection,
             } => index::topk(
                 self.ctx(),
@@ -1169,6 +1174,33 @@ impl Run<'_> {
                 *ratio,
                 &mut self.tensor(*selection),
             ),
+            Attention::IndexTopk {
+                q,
+                weights,
+                keys,
+                heads,
+                head_dim,
+                top_k,
+                ratio,
+                score: IndexScore::BlockMax,
+                selection,
+            } => {
+                if weights.is_some() {
+                    return Err(kernels_cuda::Error::Unsupported {
+                        op: "attention.index_topk",
+                    });
+                }
+                index::topk_block_max(
+                    self.ctx(),
+                    self.ragged_lanes(*q),
+                    &self.pool(*keys),
+                    *heads,
+                    *head_dim,
+                    *top_k,
+                    *ratio,
+                    &mut self.tensor(*selection),
+                )
+            }
             Attention::IndexKvAppend {
                 k,
                 keys,

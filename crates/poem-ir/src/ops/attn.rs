@@ -149,6 +149,10 @@ pub enum Attention {
         head_dim: u32,
         sm_scale: f32,
         ratio: u32,
+        /// The selection holds one run of blocks per kv head, each head's
+        /// queries reading its own; else one run every head shares.
+        #[serde(default)]
+        per_head: bool,
         o: ValueId,
     },
     PrefillSelected {
@@ -161,6 +165,8 @@ pub enum Attention {
         kv_heads: u32,
         sm_scale: f32,
         ratio: u32,
+        #[serde(default)]
+        per_head: bool,
         o: ValueId,
     },
     Sink {
@@ -434,6 +440,8 @@ pub enum Attention {
         head_dim: u32,
         top_k: u32,
         ratio: u32,
+        #[serde(default)]
+        score: IndexScore,
         selection: ValueId,
     },
     IndexKvAppend {
@@ -544,6 +552,19 @@ pub enum Attention {
         map: Option<ValueId>,
         ngram_ids: ValueId,
     },
+}
+
+/// How `attention.index_topk` scores a block of keys.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum IndexScore {
+    /// `Σ_h relu(q_h·k)·w_h` against the one pooled key that stands for each
+    /// closed block; one selection every head shares.
+    #[default]
+    Pooled,
+    /// `max_s q_h·k_s` over the keys of each block the row sees, per head: a
+    /// run of `top_k` blocks for each head, ascending, the row's own block
+    /// always in it, and every visible block when they fit.
+    BlockMax,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

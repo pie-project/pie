@@ -112,6 +112,7 @@ pub(crate) static OPS: &[Op] = &[
             "head_dim",
             "sm_scale",
             "ratio",
+            "per_head",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -122,11 +123,20 @@ pub(crate) static OPS: &[Op] = &[
             let head_dim: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
             let ratio: u32 = a.next()?;
+            let per_head: Option<bool> = a.next()?;
             result(
                 heap,
                 dsl("attn.decode_selected", || {
                     ops::attn::decode_selected(
-                        &q, &plan, &selection, pages, window, head_dim, sm_scale, ratio,
+                        &q,
+                        &plan,
+                        &selection,
+                        pages,
+                        window,
+                        head_dim,
+                        sm_scale,
+                        ratio,
+                        per_head.unwrap_or(false),
                     )
                 })?,
             )
@@ -145,6 +155,7 @@ pub(crate) static OPS: &[Op] = &[
             "kv_heads",
             "sm_scale",
             "ratio",
+            "per_head",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -156,11 +167,21 @@ pub(crate) static OPS: &[Op] = &[
             let kv_heads: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
             let ratio: u32 = a.next()?;
+            let per_head: Option<bool> = a.next()?;
             result(
                 heap,
                 dsl("attn.prefill_selected", || {
                     ops::attn::prefill_selected(
-                        &q, &plan, &selection, pages, window, head_dim, kv_heads, sm_scale, ratio,
+                        &q,
+                        &plan,
+                        &selection,
+                        pages,
+                        window,
+                        head_dim,
+                        kv_heads,
+                        sm_scale,
+                        ratio,
+                        per_head.unwrap_or(false),
                     )
                 })?,
             )
@@ -1148,7 +1169,7 @@ pub(crate) static OPS: &[Op] = &[
         module: "attn",
         name: "index_topk",
         params: &[
-            "q", "weights", "keys", "heads", "head_dim", "top_k", "ratio",
+            "q", "weights", "keys", "heads", "head_dim", "top_k", "ratio", "score",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -1158,10 +1179,20 @@ pub(crate) static OPS: &[Op] = &[
             let head_dim: u32 = a.next()?;
             let top_k: u32 = a.next()?;
             let ratio: u32 = a.next()?;
+            let score: Option<IndexScore> = a.next()?;
             result(
                 heap,
                 dsl("attn.index_topk", || {
-                    ops::attn::index_topk(&q, weights.as_ref(), keys, heads, head_dim, top_k, ratio)
+                    ops::attn::index_topk(
+                        &q,
+                        weights.as_ref(),
+                        keys,
+                        heads,
+                        head_dim,
+                        top_k,
+                        ratio,
+                        score.unwrap_or_default(),
+                    )
                 })?,
             )
         },

@@ -11,7 +11,7 @@ pub mod layout;
 pub mod linear;
 pub mod spatial;
 
-pub use attn::{Attention, RaggedMask};
+pub use attn::{Attention, IndexScore, RaggedMask};
 pub use collective::Collective;
 pub use elemwise::{Elementwise, GateActivation, ModulateForm, MropeForm, RopeForm};
 pub use fused::{Fused, NormKind};
