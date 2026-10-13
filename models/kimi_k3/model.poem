@@ -82,6 +82,7 @@ def fixture():
         layers = 8,
         dense_layers = 1,
         full_attn_every = 4,
+        last_full = False,
         res_block = 4,
         attn_res = AT_BLOCK_START,
         gate_floor = 0.0,
@@ -114,12 +115,14 @@ def fixture():
 
 def released(layers, experts, res_block):
     """`moonshotai/Kimi-K3` at `layers` layers and `experts` routed experts,
-    AttnRes blocks of `res_block`."""
+    AttnRes blocks of `res_block`. Its last layer is an MLA layer whatever
+    its place in the period."""
     return struct(
         hidden = 7168,
         layers = layers,
         dense_layers = 1,
         full_attn_every = 4,
+        last_full = True,
         res_block = res_block,
         attn_res = EVERY,
         gate_floor = -5.0,
@@ -151,6 +154,7 @@ def released(layers, experts, res_block):
     )
 
 DIMS = {
+    "kimik3-2.8t": released(93, 896, 12),
     "kimik3-mini": released(8, 32, 4),
     "kimik3": fixture(),
 }
@@ -188,7 +192,7 @@ def layout(id, deploy):
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s, width: weight(n(s), [width], weights)
-        if closes_a_block(l, d.full_attn_every):
+        if closes_a_block(l, d.full_attn_every) or (d.last_full and l == d.layers - 1):
             mixer = attention(
                 n,
                 a,

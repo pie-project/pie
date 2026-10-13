@@ -1055,8 +1055,11 @@ def carry_quant_overrides(cfg: dict, pairs: list[tuple[str, str]]) -> dict[str, 
         table = cfg.get(key)
         if not isinstance(table, dict):
             continue
-        modules = {k: v for k, v in table.items() if isinstance(v, dict)}
-        rebuilt = {k: v for k, v in table.items() if not isinstance(v, dict)}
+        # An override is a module's own `bits` / `group_size`; any other dict
+        # (compressed-tensors' `config_groups`) is the recipe itself.
+        override = lambda v: isinstance(v, dict) and ("bits" in v or "group_size" in v)
+        modules = {k: v for k, v in table.items() if override(v)}
+        rebuilt = {k: v for k, v in table.items() if not override(v)}
         for module, spec in modules.items():
             head = module + "."
             for out_name, src_name in pairs:
@@ -2107,7 +2110,9 @@ def assign_rows(pairs: list[tuple[str, str]], src: dict[str, SrcTensor],
         t = src[src_name]
         ot = OutTensor(out_name, t)
         if router_rows is not None:
-            tail = out_name.split(plan.layer_prefix, 1)[-1]
+            # The source name: `--text-only` strips the wrapper off `out_name`,
+            # and with it the layer prefix the suffix is found after.
+            tail = src_name.split(plan.layer_prefix, 1)[-1]
             tail = tail.split(".", 1)[-1] if "." in tail else tail
             if tail in plan.router_suffixes and t.shape and t.shape[0] > router_rows:
                 ot.rows = router_rows
