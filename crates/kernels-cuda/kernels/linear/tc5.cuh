@@ -50,6 +50,7 @@ template <int kKind, int kFmtP, int kFmtQ, int kGranP, int kGranQ, int kBN, int 
           int kSwap>
 __global__ __launch_bounds__(192, 1) void tc5_gemm(
     const __grid_constant__ tc5::TmaMap map_p, const __grid_constant__ tc5::TmaMap map_q,
+    const __grid_constant__ tc5::TmaMap map_y,
     const unsigned char* __restrict__ sf_p, const unsigned char* __restrict__ sf_q,
     bf16* __restrict__ y, int rows_p, int rows_q, int k, int ldy, float alpha, int sf_atoms_p,
     int sf_atoms_q) {
@@ -73,15 +74,26 @@ __global__ __launch_bounds__(192, 1) void tc5_gemm(
     constexpr u32 kSfP = kAtomsP * 512;
     constexpr u32 kSfQ = kAtomsQ * kRowAtomsQ * 512;
     constexpr u32 kSfCols = 4 * kAtomsP + 4 * kAtomsQ * kRowAtomsQ;
-    constexpr u32 kAcc = 2 * kBN + kSfCols <= 512 ? 2 : 1;
-    constexpr u32 kCols = tc5k::pow2_cols(kAcc * kBN + kSfCols);
+    // Two accumulator stages always. When they and the scale columns overrun
+    // TMEM the stages share kOv columns -- stage 0's tail is stage 1's head --
+    // and a tile's first MMA waits until the previous tile's epilogue has
+    // read them. The scale columns sit past both stages.
+    constexpr u32 kOvRaw = 2 * kBN + kSfCols > 512 ? 2 * kBN + kSfCols - 512 : 0;
+    constexpr u32 kOv = (kOvRaw + 15) / 16 * 16;
+    constexpr u32 kOvChunks = (kOv + 31) / 32;
+    constexpr u32 kAcc = 2;
+    constexpr u32 kStride = kBN - kOv;
+    constexpr u32 kCols = tc5k::pow2_cols(kStride + kBN + kSfCols);
     static_assert(kCols <= 512, "TMEM is 512 columns");
 
     constexpr u32 kOffQ = kStages * kTileP;
     constexpr u32 kOffSfP = kOffQ + kStages * kTileQ;
     constexpr u32 kOffSfQ = kOffSfP + kStages * kSfP;
-    constexpr u32 kOffBar = (kOffSfQ + kStages * kSfQ + 7) / 8 * 8;
-    constexpr u32 kBytes = kOffBar + (2 * kStages + 4) * 8 + 8;
+    // Each epilogue warp stages two 32 x 32 bf16 boxes for the TMA store.
+    constexpr u32 kOffOut = (kOffSfQ + kStages * kSfQ + 1023) / 1024 * 1024;
+    constexpr u32 kOut = kSwap ? 0 : 4 * 2 * 2048;
+    constexpr u32 kOffBar = kOffOut + kOut;
+    constexpr u32 kBytes = kOffBar + (2 * kStages + 6) * 8 + 8;
 
     extern __shared__ unsigned char smem_raw[];
     const u32 raw = smem_addr(smem_raw);
@@ -91,7 +103,8 @@ __global__ __launch_bounds__(192, 1) void tc5_gemm(
     u64* empty = full + kStages;
     u64* tfull = empty + kStages;
     u64* tempty = tfull + 2;
-    u32* tmem_slot = reinterpret_cast<u32*>(tempty + 2);
+    u64* tover = tempty + 2;
+    u32* tmem_slot = reinterpret_cast<u32*>(tover + 2);
 
     const u32 warp = threadIdx.x / 32;
     const u32 lane = threadIdx.x % 32;
@@ -113,6 +126,7 @@ __global__ __launch_bounds__(192, 1) void tc5_gemm(
         for (u32 a = 0; a < 2; ++a) {
             bar_init(&tfull[a], 1);
             bar_init(&tempty[a], 4);
+            bar_init(&tover[a], 4);
         }
         bar_init_fence();
     }
@@ -155,22 +169,40 @@ __global__ __launch_bounds__(192, 1) void tc5_gemm(
                     if constexpr (kScaled) {
                         const int first_p = static_cast<int>(kb * kStageK / kGranP / 4);
                         const int first_q = static_cast<int>(kb * kStageK / kGranQ / 4);
+                        unsigned char* atoms_p = smem + kOffSfP + s * kSfP;
+                        unsigned char* atoms_q = smem + kOffSfQ + s * kSfQ;
+                        // An atom past the tensor (a K tail, a row block past
+                        // Q) scales zeros the TMA filled; it is zeroed here,
+                        // since a stale NaN scale would poison them.
                         u32 bytes = kTxP + kTxQ;
+                        bool zeroed = false;
+                        auto zero = [&](unsigned char* atom) {
+                            for (u32 i = 0; i < 32; ++i) {
+                                reinterpret_cast<uint4*>(atom)[i] = make_uint4(0, 0, 0, 0);
+                            }
+                            zeroed = true;
+                        };
                         for (u32 a = 0; a < kAtomsP; ++a) {
-                            bytes += first_p + static_cast<int>(a) < sf_atoms_p ? 512 : 0;
+                            if (first_p + static_cast<int>(a) < sf_atoms_p) {
+                                bytes += 512;
+                            } else {
+                                zero(atoms_p + a * 512);
+                            }
                         }
                         for (u32 a = 0; a < kAtomsQ; ++a) {
                             for (u32 ra = 0; ra < kRowAtomsQ; ++ra) {
                                 const int gra = qt * kBN / 128 + static_cast<int>(ra);
-                                bytes += first_q + static_cast<int>(a) < sf_atoms_q &&
-                                                 gra < row_atoms_q
-                                             ? 512
-                                             : 0;
+                                if (first_q + static_cast<int>(a) < sf_atoms_q && gra < row_atoms_q) {
+                                    bytes += 512;
+                                } else {
+                                    zero(atoms_q + (a * kRowAtomsQ + ra) * 512);
+                                }
                             }
                         }
+                        if (zeroed) {
+                            fence_async_shared();
+                        }
                         bar_arrive_expect_tx(&full[s], bytes);
-                        unsigned char* atoms_p = smem + kOffSfP + s * kSfP;
-                        unsigned char* atoms_q = smem + kOffSfQ + s * kSfQ;
                         for (u32 a = 0; a < kAtomsP; ++a) {
                             const int at = first_p + static_cast<int>(a);
                             if (at < sf_atoms_p) {
@@ -206,7 +238,7 @@ __global__ __launch_bounds__(192, 1) void tc5_gemm(
     } else if (warp == 5) {
         if (lane == 0) {
             u32 s = 0, phase = 0;
-            const u32 sf_tp = tmem + kAcc * kBN;
+            const u32 sf_tp = tmem + kStride + kBN;
             const u32 sf_tq = sf_tp + 4 * kAtomsP;
             int it = 0;
             for (int t = blockIdx.x; t < tiles; t += gridDim.x, ++it) {
@@ -215,7 +247,7 @@ __global__ __launch_bounds__(192, 1) void tc5_gemm(
                 const u32 acc = static_cast<u32>(it) % kAcc;
                 bar_wait(&tempty[acc], ((static_cast<u32>(it) / kAcc) & 1) ^ 1);
                 tc_fence_after();
-                const u32 d = tmem + acc * kBN;
+                const u32 d = tmem + acc * kStride;
                 // A Q tile narrower than its 128-row scale atom reads the
                 // atom's columns from its own 32-row quarter on.
                 const u32 quarter_q = static_cast<u32>(qt * kBN % 128) / 32;
@@ -233,6 +265,11 @@ __global__ __launch_bounds__(192, 1) void tc5_gemm(
                         for (u32 a = 0; a < kAtomsQ * kRowAtomsQ; ++a) {
                             tc_cp_sf_atom(sf_tq + 4 * a, sdesc_sf(atoms_q + a * 512));
                         }
+                    }
+                    if (kOv > 0 && kb == 0 && it > 0) {
+                        const u32 prev = static_cast<u32>(it - 1);
+                        bar_wait(&tover[prev % 2], (prev / 2) & 1);
+                        tc_fence_after();
                     }
                     const u64 desc_p = sdesc_sw128(tile_p);
                     const u64 desc_q = sdesc_sw128(tile_q);
@@ -277,6 +314,7 @@ __global__ __launch_bounds__(192, 1) void tc5_gemm(
     } else {
         int it = 0;
         const u32 row = warp * 32 + lane;
+        u32 out_buf = 0;
         for (int t = blockIdx.x; t < tiles; t += gridDim.x, ++it) {
             int pt, qt;
             tile_of(t, pt, qt);
@@ -284,13 +322,24 @@ __global__ __launch_bounds__(192, 1) void tc5_gemm(
             bar_wait(&tfull[acc], (static_cast<u32>(it) / kAcc) & 1);
             tc_fence_after();
             const int p = pt * 128 + static_cast<int>(row);
-            const u32 taddr = tmem + acc * kBN + ((warp * 32) << 16);
+            const u32 taddr = tmem + acc * kStride + ((warp * 32) << 16);
+            // The shared columns go first: stage 0 drains tail first, stage
+            // 1 head first, and the next tile's MMA starts once they are read.
+            const bool reverse = kOv > 0 && acc == 0;
 #pragma unroll 1
-            for (u32 c0 = 0; c0 < kBN; c0 += 32) {
+            for (u32 chunk = 0; chunk < kBN / 32; ++chunk) {
+                const u32 c0 = reverse ? kBN - 32 * (chunk + 1) : 32 * chunk;
                 u32 v[32];
                 tmem_ld32(taddr + c0, v);
                 tmem_wait_ld();
-                if (c0 + 32 == kBN) {
+                if (kOv > 0 && chunk + 1 == kOvChunks) {
+                    tc_fence_before();
+                    __syncwarp();
+                    if (lane == 0) {
+                        bar_arrive(&tover[acc]);
+                    }
+                }
+                if (chunk + 1 == kBN / 32) {
                     tc_fence_before();
                     __syncwarp();
                     if (lane == 0) {
@@ -298,21 +347,28 @@ __global__ __launch_bounds__(192, 1) void tc5_gemm(
                     }
                 }
                 const int q0 = qt * kBN + static_cast<int>(c0);
-                if (p >= rows_p) {
-                    continue;
-                }
                 if constexpr (kSwap) {
+                    // A warp's lanes are 32 consecutive weight rows: each
+                    // column is one coalesced 64-byte run of y.
+                    if (p < rows_p) {
 #pragma unroll
-                    for (int j = 0; j < 32; ++j) {
-                        if (q0 + j < rows_q) {
-                            y[static_cast<size_t>(q0 + j) * ldy + p] =
-                                f32_to_bf16(__uint_as_float(v[j]) * alpha);
+                        for (int j = 0; j < 32; ++j) {
+                            if (q0 + j < rows_q) {
+                                y[static_cast<size_t>(q0 + j) * ldy + p] =
+                                    f32_to_bf16(__uint_as_float(v[j]) * alpha);
+                            }
                         }
                     }
-                } else if (q0 + 32 <= rows_q) {
-                    uint4* out = reinterpret_cast<uint4*>(y + static_cast<size_t>(p) * ldy + q0);
+                } else {
+                    // The warp's 32 x 32 box goes out by TMA from a 64-byte
+                    // swizzled stage, which also drops rows and columns past y.
+                    unsigned char* box = smem + kOffOut + (warp * 2 + out_buf) * 2048;
+                    if (lane == 0) {
+                        bulk_wait_read<1>();
+                    }
+                    __syncwarp();
 #pragma unroll
-                    for (int j = 0; j < 4; ++j) {
+                    for (u32 j = 0; j < 4; ++j) {
                         uint4 w;
                         w.x = pack_bf16x2(__uint_as_float(v[8 * j + 0]) * alpha,
                                           __uint_as_float(v[8 * j + 1]) * alpha);
@@ -322,18 +378,20 @@ __global__ __launch_bounds__(192, 1) void tc5_gemm(
                                           __uint_as_float(v[8 * j + 5]) * alpha);
                         w.w = pack_bf16x2(__uint_as_float(v[8 * j + 6]) * alpha,
                                           __uint_as_float(v[8 * j + 7]) * alpha);
-                        out[j] = w;
+                        *reinterpret_cast<uint4*>(box + lane * 64 + 16 * (j ^ ((lane >> 1) & 3))) = w;
                     }
-                } else {
-#pragma unroll
-                    for (int j = 0; j < 32; ++j) {
-                        if (q0 + j < rows_q) {
-                            y[static_cast<size_t>(p) * ldy + q0 + j] =
-                                f32_to_bf16(__uint_as_float(v[j]) * alpha);
-                        }
+                    fence_async_shared();
+                    __syncwarp();
+                    if (lane == 0) {
+                        tma_store_2d(&map_y, box, q0, pt * 128 + static_cast<int>(warp) * 32);
+                        bulk_commit();
                     }
+                    out_buf ^= 1;
                 }
             }
+        }
+        if (!kSwap && lane == 0) {
+            bulk_wait_all();
         }
     }
 

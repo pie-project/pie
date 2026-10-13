@@ -240,13 +240,15 @@ const fn atoms_k(kind: Kind, gran: u32) -> u32 {
 
 /// The dynamic shared memory the kernel lays out, mirrored from it, plus
 /// the 1024 bytes it may spend aligning the ring.
-const fn smem_bytes(kind: Kind, gran_p: u32, gran_q: u32, bn: u32, stages: u32) -> u32 {
+const fn smem_bytes(kind: Kind, gran_p: u32, gran_q: u32, plan: Plan) -> u32 {
+    let Plan { swap, bn, stages } = plan;
     let stage = 128 * 128
         + bn * 128
         + atoms_k(kind, gran_p) * 512
         + atoms_k(kind, gran_q) * bn.div_ceil(128) * 512;
-    let bar = (stages * stage).div_ceil(8) * 8;
-    bar + (2 * stages + 4) * 8 + 8 + 1024
+    let out = (stages * stage).div_ceil(1024) * 1024;
+    let bar = out + if swap { 0 } else { 4 * 2 * 2048 };
+    bar + (2 * stages + 6) * 8 + 8 + 1024
 }
 
 /// One shape's specialization: which side is the MMA's 128 rows, the Q
@@ -260,15 +262,21 @@ pub struct Plan {
 
 impl Plan {
     /// Rows of 64 or fewer put the weight on the 128-row side, the rows on
-    /// a narrow Q tile.
+    /// a narrow Q tile. Otherwise the Q tile is 256 wide unless 128 fills
+    /// the `sms` better: a 128-wide tile streams its operands at about two
+    /// thirds the rate.
     #[must_use]
-    pub fn choose(m: u32, n: u32) -> Self {
-        let _ = n;
+    pub fn choose(m: u32, n: u32, sms: u32) -> Self {
         let swap = m <= 64;
         let bn = if swap {
             m.next_multiple_of(32).max(32)
         } else {
-            128
+            let waves = |bn: u32| (m.div_ceil(128) * n.div_ceil(bn)).div_ceil(sms.max(1));
+            if 13 * waves(256) <= 10 * waves(128) {
+                256
+            } else {
+                128
+            }
         };
         Self {
             swap,
@@ -279,7 +287,7 @@ impl Plan {
 
     fn staged(mut self, kind: Kind, gran_p: u32, gran_q: u32) -> Self {
         let mut stages = 8;
-        while stages > 2 && smem_bytes(kind, gran_p, gran_q, self.bn, stages) > SMEM_CAP {
+        while stages > 2 && smem_bytes(kind, gran_p, gran_q, Self { stages, ..self }) > SMEM_CAP {
             stages -= 1;
         }
         self.stages = stages;
@@ -296,7 +304,8 @@ pub fn gemm(
     [m, n, k]: [u32; 3],
     alpha: f32,
 ) -> Result<(), Error> {
-    gemm_with(ctx, act, w, y, [m, n, k], alpha, Plan::choose(m, n))
+    let sms = ctx.multiprocessors().unwrap_or(148);
+    gemm_with(ctx, act, w, y, [m, n, k], alpha, Plan::choose(m, n, sms))
 }
 
 /// As [`gemm`], under a stated plan (its `stages` is refit to the kind).
@@ -335,10 +344,15 @@ pub fn gemm_with(
     let (rows_p, rows_q) = if plan.swap { (n, m) } else { (m, n) };
     let gran = |o: Operand| o.scales.map_or(128, |s| s.gran);
     let plan = plan.staged(kind, gran(p), gran(q));
-    let smem = smem_bytes(kind, gran(p), gran(q), plan.bn, plan.stages);
+    let smem = smem_bytes(kind, gran(p), gran(q), plan);
 
     let map_p = tensor_map(kind, p, rows_p, k, 128)?;
     let map_q = tensor_map(kind, q, rows_q, k, plan.bn)?;
+    let map_y = if plan.swap {
+        [0; 16]
+    } else {
+        output_map(y, m, n)?
+    };
     let atoms = |o: Operand| {
         o.scales
             .map_or(0, |s| k.div_ceil(s.gran).div_ceil(4))
@@ -368,6 +382,10 @@ pub fn gemm_with(
             ptr: map_q.as_ptr().cast(),
             len: 128,
         },
+        ArgValue::Bytes {
+            ptr: map_y.as_ptr().cast(),
+            len: 128,
+        },
         ArgValue::Ptr(p.scales.map_or(0, |s| s.ptr)),
         ArgValue::Ptr(q.scales.map_or(0, |s| s.ptr)),
         ArgValue::Ptr(y),
@@ -386,11 +404,8 @@ pub fn gemm_with(
     )
 }
 
-type MapKey = (u64, u32, u32, u32, u32);
-
 /// The tensor map of a K-major `rows x k` operand, boxes of 128 bytes of K
-/// by `box_rows`, swizzled 128B. Encoding is host-only and cheap; the cache
-/// spares the driver call on a replayed shape.
+/// by `box_rows`, swizzled 128B.
 fn tensor_map(
     kind: Kind,
     o: Operand,
@@ -399,17 +414,6 @@ fn tensor_map(
     box_rows: u32,
 ) -> Result<[u64; 16], Error> {
     use dr::CUtensorMapDataType as T;
-
-    static MAPS: OnceLock<Mutex<HashMap<MapKey, [u64; 16]>>> = OnceLock::new();
-    let key = (o.ptr, rows, k, box_rows, kind.code() * 4 + o.elem as u32);
-    let maps = MAPS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(found) = maps
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&key)
-    {
-        return Ok(*found);
-    }
 
     // (type, inner extent in the type's elements, row stride in bytes, box width)
     let (ty, inner, stride, box_k) = match (kind, o.elem) {
@@ -447,24 +451,70 @@ fn tensor_map(
             format!("TMA needs 16-byte rows and base; this operand's row is {stride} bytes"),
         ));
     }
-    let dims = [u64::from(inner), u64::from(rows)];
-    let strides = [stride];
-    let boxes = [box_k, box_rows];
+    encode(Map {
+        ptr: o.ptr,
+        ty,
+        dims: [inner, rows],
+        stride,
+        boxes: [box_k, box_rows],
+        swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+    })
+}
+
+/// The bf16 `m x n` output, in the 32 x 32 boxes an epilogue warp stores
+/// from its 64-byte-swizzled stage.
+fn output_map(y: u64, m: u32, n: u32) -> Result<[u64; 16], Error> {
+    if !y.is_multiple_of(16) {
+        return Err(refuse(OP, "TMA needs the output 16-byte aligned"));
+    }
+    encode(Map {
+        ptr: y,
+        ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        dims: [n, m],
+        stride: u64::from(n) * 2,
+        boxes: [32, 32],
+        swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B,
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Map {
+    ptr: u64,
+    ty: dr::CUtensorMapDataType,
+    dims: [u32; 2],
+    stride: u64,
+    boxes: [u32; 2],
+    swizzle: dr::CUtensorMapSwizzle,
+}
+
+/// Encoding is host-only and cheap; the cache spares the driver call on a
+/// replayed shape.
+fn encode(m: Map) -> Result<[u64; 16], Error> {
+    static MAPS: OnceLock<Mutex<HashMap<Map, [u64; 16]>>> = OnceLock::new();
+    let maps = MAPS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(found) = maps
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&m)
+    {
+        return Ok(*found);
+    }
+    let dims = m.dims.map(u64::from);
     let steps = [1u32, 1];
     let mut map: dr::CUtensorMap = unsafe { core::mem::zeroed() };
     // SAFETY: every pointer is to a live local of the length the rank says.
     let code = unsafe {
         dr::cuTensorMapEncodeTiled(
             &raw mut map,
-            ty,
+            m.ty,
             2,
-            o.ptr as *mut core::ffi::c_void,
+            m.ptr as *mut core::ffi::c_void,
             dims.as_ptr(),
-            strides.as_ptr(),
-            boxes.as_ptr(),
+            [m.stride].as_ptr(),
+            m.boxes.as_ptr(),
             steps.as_ptr(),
             dr::CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-            dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+            m.swizzle,
             dr::CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
             dr::CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
         )
@@ -472,14 +522,17 @@ fn tensor_map(
     if code != dr::CUresult::CUDA_SUCCESS {
         return Err(refuse(
             OP,
-            format!("cuTensorMapEncodeTiled answered {code:?} for {o:?} as {rows} x {k}"),
+            format!(
+                "cuTensorMapEncodeTiled answered {code:?} for a {:?} {} x {} at {:#x}",
+                m.ty, m.dims[1], m.dims[0], m.ptr
+            ),
         ));
     }
     // SAFETY: CUtensorMap is 128 opaque bytes, 64-aligned.
     let raw: [u64; 16] = unsafe { core::mem::transmute(map) };
     maps.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(key, raw);
+        .insert(m, raw);
     Ok(raw)
 }
 
@@ -519,7 +572,7 @@ mod tests {
                 }
                 .staged(kind, g, g);
                 assert!(plan.stages >= 3, "{kind:?} bn={bn}: {plan:?}");
-                assert!(smem_bytes(kind, g, g, bn, plan.stages) <= SMEM_CAP);
+                assert!(smem_bytes(kind, g, g, plan) <= SMEM_CAP);
             }
         }
     }

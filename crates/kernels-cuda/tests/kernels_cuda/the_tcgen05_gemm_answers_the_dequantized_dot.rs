@@ -147,7 +147,7 @@ fn check(case: Case) {
     let y = gpu.up(&vec![0x7fc0u16; tall * n]);
     let plan = case
         .plan
-        .unwrap_or_else(|| Plan::choose(m as u32, n as u32));
+        .unwrap_or_else(|| Plan::choose(m as u32, n as u32, 148));
     gemm_with(
         &gpu.ctx(),
         a_op,
@@ -215,6 +215,7 @@ fn the_tcgen05_gemm_answers_the_dequantized_dot_every_case() {
     }
     the_bf16_kind_lands_the_dot_at_whole_and_ragged_tiles();
     the_bf16_kind_lands_what_cublas_lands_over_many_waves();
+    the_wide_tiles_shared_columns_land_what_the_narrow_tile_lands();
     the_fp8_kind_lands_the_scaled_dot();
     the_deepseek_blocks_land_through_ue8m0();
     nvfp4_lands_its_sixteen_wide_scales_and_global_alpha();
@@ -236,6 +237,52 @@ fn scaled(
         k,
         plan,
         alpha,
+    }
+}
+
+/// Every scaled kind at more tiles than SMs on a 256-wide Q tile, where the
+/// two accumulator stages share columns, lands what the 128-wide tile (whose
+/// stages do not, and which the host reference holds above) lands.
+fn the_wide_tiles_shared_columns_land_what_the_narrow_tile_lands() {
+    let kinds = [
+        ((Elem::E4m3, Some(128)), (Elem::E4m3, Some(128))),
+        ((Elem::E2m1, Some(16)), (Elem::E2m1, Some(16))),
+        ((Elem::E4m3, Some(128)), (Elem::E2m1, Some(32))),
+    ];
+    let (m, n, k) = (1536, 4096, 768);
+    for (a, w) in kinds {
+        let mut lcg = Lcg::seeded(0x3a);
+        let mut bits = 0x3a;
+        let act = side(&mut lcg, &mut bits, a.0, a.1, m, k);
+        let wt = side(&mut lcg, &mut bits, w.0, w.1, n, k);
+        let mut gpu = Gpu::open();
+        let up = |gpu: &mut Gpu, s: &Side, elem: Elem| {
+            let ptr = gpu.up(&s.bytes);
+            let (atoms, _, gran) = s.scales.as_ref().expect("scaled");
+            Operand::scaled(ptr, elem, gpu.up(atoms), *gran as u32)
+        };
+        let (a_op, w_op) = (up(&mut gpu, &act, a.0), up(&mut gpu, &wt, w.0));
+        let outs: Vec<Vec<u16>> = [128, 256]
+            .into_iter()
+            .map(|bn| {
+                let y = gpu.zeros(m * n * 2);
+                let shape = [m as u32, n as u32, k as u32];
+                gemm_with(
+                    &gpu.ctx(),
+                    a_op,
+                    w_op,
+                    y,
+                    shape,
+                    1.0,
+                    plan(false, bn).unwrap(),
+                )
+                .unwrap_or_else(|e| panic!("{a:?} x {w:?} bn={bn}: {e}"));
+                gpu.sync();
+                gpu.down(y, m * n)
+            })
+            .collect();
+        let differ = outs[0].iter().zip(&outs[1]).filter(|(x, y)| x != y).count();
+        assert_eq!(differ, 0, "{a:?} x {w:?}: {differ} of {} differ", m * n);
     }
 }
 

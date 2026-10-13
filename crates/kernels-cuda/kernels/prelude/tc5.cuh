@@ -106,6 +106,35 @@ __device__ __forceinline__ void bulk_load(void* dst, const void* src, u32 bytes,
         : "memory");
 }
 
+// A 2D box of shared memory out to (x, y); rows and columns past the
+// tensor's extent are dropped. Joins this thread's open bulk group.
+__device__ __forceinline__ void tma_store_2d(const TmaMap* map, const void* src, int x, int y) {
+    asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%2, %3}], [%1];" ::"l"(
+                     reinterpret_cast<u64>(map)),
+                 "r"(smem_addr(src)), "r"(x), "r"(y)
+                 : "memory");
+}
+
+__device__ __forceinline__ void bulk_commit() {
+    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+}
+
+// Until at most N of this thread's bulk groups still read shared memory.
+template <int N>
+__device__ __forceinline__ void bulk_wait_read() {
+    asm volatile("cp.async.bulk.wait_group.read %0;" ::"n"(N) : "memory");
+}
+
+// Until all of this thread's bulk groups have landed.
+__device__ __forceinline__ void bulk_wait_all() {
+    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+}
+
+// Makes generic-proxy writes to shared memory visible to TMA.
+__device__ __forceinline__ void fence_async_shared() {
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+}
+
 // ---- tcgen05: allocation and ordering ------------------------------------
 
 // Whole-warp: `cols` (a power of two, 32..512) TMEM columns; the base
