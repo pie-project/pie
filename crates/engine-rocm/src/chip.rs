@@ -67,7 +67,7 @@ pub struct WorkingSetPercent(pub u32);
 /// Row buckets per doubling of the default lattice: 1 is powers of two, 2
 /// adds a bucket between each, which pads less and records more bodies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.lattice_steps", constant(set(1, 2)), default = 1, tune = engine)]
+#[decision(id = "engine.lattice_steps", constant(set(1, 2, 4)), default = 1, tune = engine)]
 pub struct LatticeSteps(pub u32);
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {

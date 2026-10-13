@@ -240,3 +240,28 @@ fn linear_skinny_epilogues() {
     // Past its rows the kernel declines, and the engine takes the unfused path.
     assert!(!skinny::covers(9, 1000, 1024, Epilogue::Geglu, 64));
 }
+
+/// The split swiglu-clamp: the gate clamped from above, the up half both
+/// ways, against the host.
+#[test]
+fn linear_swiglu_clamp_split() {
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    let (rows, width, limit) = (5u32, 2304u32, 1.5f32);
+    let g = bf16s(rows * width, 31, 3.0);
+    let u = bf16s(rows * width, 32, 3.0);
+    let gt = gpu.tensor(&g, rows, width, Dtype::Bf16);
+    let ut = gpu.tensor(&u, rows, width, Dtype::Bf16);
+    let mut y = gpu.zeros(rows, width, Dtype::Bf16);
+    mlp::swiglu_clamp_split(&ctx, gt, ut, limit, &mut y).unwrap();
+    let want: Vec<f32> = g
+        .iter()
+        .zip(&u)
+        .map(|(&g, &u)| {
+            let g = g.min(limit);
+            let u = u.clamp(-limit, limit);
+            g * sigmoid(g) * u
+        })
+        .collect();
+    close_bf16("swiglu_clamp_split", &gpu.read(&y), &want, 1.0);
+}

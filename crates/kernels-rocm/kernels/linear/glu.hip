@@ -123,6 +123,20 @@ __global__ void mlp_swiglu_clamp(const T* __restrict__ packed, T* __restrict__ y
     });
 }
 
+// As mlp_swiglu_clamp over separate gate and up planes (the combine behind
+// expert banks the matmul lands as two halves).
+template <class T>
+__global__ void mlp_swiglu_clamp_split(const T* __restrict__ gate, const T* __restrict__ up, T* __restrict__ y,
+                                       i32 n, i32 width, float limit, i32 fan, const u32* __restrict__ win) {
+    const i32 i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const long long at = flat_at(i, width, fan, win);
+    if (at < 0) return;
+    const float g = fminf(to_f32(gate[at]), limit);
+    const float u = fminf(fmaxf(to_f32(up[at]), -limit), limit);
+    y[at] = from_f32<T>(g / (1.f + expf(-g)) * u);
+}
+
 // As mlp_swiglu_clamp, with the gate's sigmoid sharpened by `alpha` and the
 // up half shifted by one: (u + 1) · g·sigmoid(α·g).
 template <class T>

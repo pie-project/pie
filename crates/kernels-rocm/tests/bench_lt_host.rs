@@ -16,7 +16,7 @@ fn bench_lt_host() {
     let Some(gpu) = Gpu::open() else { return };
     let (n, k) = (16384u32, 5376u32);
     let w = gpu.tensor(&values((n * k) as usize, 2, 0.05), n, k, Dtype::Bf16);
-    for m in [256u32, 256, 200, 201, 8192, 8192, 1000] {
+    for m in [512u32, 512, 384, 128] {
         let a = gpu.tensor(&values((m * k) as usize, 1, 1.0), m, k, Dtype::Bf16);
         let mut y = gpu.zeros(m, n, Dtype::Bf16);
         gpu.sync();
