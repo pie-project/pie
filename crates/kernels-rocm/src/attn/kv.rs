@@ -8,6 +8,12 @@ const FILE: &str = "attn/kv.hip";
 
 const BLOCK: u32 = 256;
 
+/// One wavefront: an fp4 block is reduced by one.
+const WAVE: u32 = 64;
+
+/// Elements a dequant thread moves (`kDequantRun`).
+const DEQUANT_RUN: u32 = 8;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
 pub enum KvScheme {
@@ -280,11 +286,10 @@ fn write_kv_quantised(
                 "::pie::attn::kv_append_per_token_head<::pie::false_type::value>"
             };
 
-            let smem = 2 * (BLOCK / 32) * (core::mem::size_of::<f32>() as u32);
             ctx.fire(
                 op,
                 Fire::at(FILE, instantiation)
-                    .apply(Launch::grid([tokens, heads, 1], [BLOCK, 1, 1]).smem(smem)),
+                    .apply(Launch::grid([tokens, heads, 1], [BLOCK, 1, 1])),
                 &[
                     k.arg(),
                     v.arg(),
@@ -312,7 +317,7 @@ fn write_kv_quantised(
                 op,
                 Fire::at(FILE, "::pie::attn::kv_append_fp4_block").apply(Launch::grid(
                     [tokens, heads, blocks.unsigned_abs()],
-                    [32, 1, 1],
+                    [WAVE, 1, 1],
                 )),
                 &[
                     k.arg(),
@@ -349,7 +354,8 @@ fn active_geometry(
 ) -> (i64, i32, Launch) {
     let page_elems = page_size * num_kv_heads * head_dim;
     let logical_n = i64::from(num_pages_in_batch) * i64::from(page_elems);
-    let blocks = (logical_n + i64::from(BLOCK) - 1) / i64::from(BLOCK);
+    let per_block = i64::from(BLOCK * DEQUANT_RUN);
+    let blocks = (logical_n + per_block - 1) / per_block;
     (
         logical_n,
         page_elems,

@@ -27,7 +27,8 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
 
     const WARP_BLOCK: u32 = 256;
 
-    const WARPS_PER_BLOCK: u32 = WARP_BLOCK / 32;
+    // The `_warp` entry runs one wavefront of 64 lanes per (row, head).
+    const WARPS_PER_BLOCK: u32 = WARP_BLOCK / 64;
 
     const DECODE_BLOCK: u32 = 128;
 

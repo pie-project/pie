@@ -2,7 +2,6 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::attn::kv;
-use crate::attn::mla::naive::{NAIVE_BLOCK, NAIVE_MAX_PER, head_group};
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
@@ -10,10 +9,34 @@ const FILE: &str = "attn/sdpa_selected.hip";
 
 const ENTRY: &str = "::pie::attn::sdpa_selected::sdpa_paged_selected_kernel<::pie::bf16>";
 
+/// The kernel's block: eight 32-lane groups (`kBlock`, `kLanes`).
+const BLOCK: u32 = 256;
+
+const GROUPS: i32 = BLOCK as i32 / 32;
+
+/// Elements of a head one lane holds (`kMaxPer`): heads up to 512 wide.
+const MAX_PER: i32 = 16;
+
+/// Blocks enough to fill the device before a block shares its groups out
+/// over more than one head.
+const WAVE_TARGET: i64 = 296;
+
+/// The query heads one block answers: as many as divide the heads, down to
+/// one when fewer blocks would leave the device idle.
+fn head_group(num_heads: i32, total_tokens: i32) -> i32 {
+    let mut g = GROUPS;
+    while g > 1
+        && (num_heads % g != 0 || i64::from(total_tokens) * i64::from(num_heads / g) < WAVE_TARGET)
+    {
+        g >>= 1;
+    }
+    g
+}
+
 #[must_use]
 const fn smem_bytes(head_dim: i32) -> u32 {
-    let warps = NAIVE_BLOCK as i64 / 32;
-    let per = warps * head_dim as i64 + 2 * warps;
+    let groups = GROUPS as i64;
+    let per = groups * head_dim as i64 + 2 * groups;
     let bytes = per * 4;
     if bytes < 0 { 0 } else { bytes as u32 }
 }
@@ -45,7 +68,7 @@ fn selected(
         ));
     }
     let head_dim = count(op, "the head width this attention states", head_dim)?;
-    if head_dim % 32 != 0 || head_dim / 32 > NAIVE_MAX_PER {
+    if head_dim % 32 != 0 || head_dim / 32 > MAX_PER {
         return Err(refuse(
             op,
             format!(
@@ -111,7 +134,7 @@ fn selected(
             (q_heads / g.max(1)).max(1) as u32,
             1,
         ],
-        [NAIVE_BLOCK, 1, 1],
+        [BLOCK, 1, 1],
     )
     .smem(smem_bytes(head_dim));
     ctx.fire(

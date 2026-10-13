@@ -3,6 +3,7 @@
 //! staged. A split plan writes f32 partials per kv chunk, and
 //! [`merge`] folds them into the output rows.
 
+use crate::attn::kv;
 use crate::attn::plan::{DecodePlan, PrefillPlan};
 use crate::error::Error;
 use crate::jit::{ArgValue, Ctx, Fire, Launch, refuse, symbol};
@@ -89,10 +90,17 @@ fn pool_args(
     num_kv_heads: u32,
     head_dim: u32,
 ) -> Args {
+    // A quantized pool is read through its bf16 shadow, which the fire
+    // refreshed (`kv::dequant_active`) before this one.
+    let (k, v) = if kv::native_bf16(pool) {
+        (pool.keys.ptr, pool.values.ptr)
+    } else {
+        (pool.bf16_keys.ptr, pool.bf16_values.ptr)
+    };
     Args {
         q: q.data.ptr,
-        k: pool.keys.ptr,
-        v: pool.values.ptr,
+        k,
+        v,
         page_indices: pool.page_indices.ptr,
         page_indptr: pool.page_indptr.ptr,
         last_page_len: pool.last_page_lens.ptr,

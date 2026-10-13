@@ -8,9 +8,10 @@ use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 const FILE: &str = "attn/score.hip";
 
-const WARPS: u32 = 8;
+/// Wavefronts a block splits the keys over, each dotting one key.
+const WAVES: u32 = 4;
 
-const BLOCK: u32 = WARPS * 32;
+const BLOCK: u32 = WAVES * 64;
 
 const STAMPS: [u32; 4] = [64, 128, 256, 512];
 
@@ -134,13 +135,15 @@ pub fn capture(
         scores.rows
     );
 
-    let floats = head_width.saturating_add(2 * WARPS);
+    let floats = head_width.saturating_add(2 * WAVES);
     let smem = floats
         .checked_mul(u32::try_from(core::mem::size_of::<f32>()).unwrap_or(4))
         .ok_or_else(|| {
             refuse(
                 OP,
-                format!("a {head_width}-wide head over {WARPS} warps overflows its shared plane"),
+                format!(
+                    "a {head_width}-wide head over {WAVES} wavefronts overflows its shared plane"
+                ),
             )
         })?;
 
@@ -155,7 +158,7 @@ pub fn capture(
         Fire::at(
             FILE,
             symbol(&format!(
-                "::pie::attn::score_capture<{stamp}, {WARPS}, {hnd}>"
+                "::pie::attn::score_capture<{stamp}, {WAVES}, {hnd}>"
             )),
         )
         .apply(Launch::grid([requests, num_q_heads, 1], [BLOCK, 1, 1]).smem(smem)),

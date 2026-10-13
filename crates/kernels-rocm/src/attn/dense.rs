@@ -5,11 +5,17 @@ use crate::tensor::Tensor;
 
 const FILE: &str = "attn/dense.hip";
 
-const WARPS: u32 = 4;
+/// Wavefronts a block runs, 16 query rows each.
+const WAVES: u32 = 4;
 
-const BLOCK: u32 = WARPS * 32;
+const BLOCK: u32 = WAVES * 64;
 
-const STAMPS: [u32; 3] = [64, 128, 256];
+/// Query rows a block answers.
+const TILE: u32 = WAVES * 16;
+
+/// The head widths the kernel is stamped at (multiples of 16); a head is
+/// zero-padded to the first that holds it.
+const STAMPS: [u32; 5] = [64, 80, 96, 128, 256];
 
 fn row_heads(op: &'static str, what: &str, width: u32, head_dim: u32) -> Result<u32, Error> {
     if width == 0 || !width.is_multiple_of(head_dim) {
@@ -72,27 +78,18 @@ pub fn bidirectional(
     let images = kv::lanes_of(OP, segments)?;
     let rows = count(OP, "the patch rows this attention answers", q.rows)?;
 
-    let floats = head_width
-        .saturating_mul(WARPS + 1)
-        .saturating_add(2 * WARPS);
-    let smem = floats
-        .checked_mul(u32::try_from(core::mem::size_of::<f32>()).unwrap_or(4))
-        .ok_or_else(|| {
-            refuse(
-                OP,
-                format!("a {head_width}-wide head over {WARPS} warps overflows its shared plane"),
-            )
-        })?;
-
     ctx.fire(
         OP,
         Fire::at(
             FILE,
             symbol(&format!(
-                "::pie::attn::dense_bidirectional<{stamp}, {WARPS}>"
+                "::pie::attn::dense_bidirectional<{stamp}, {WAVES}>"
             )),
         )
-        .apply(Launch::grid([rows.unsigned_abs(), num_q_heads, 1], [BLOCK, 1, 1]).smem(smem)),
+        .apply(Launch::grid(
+            [rows.unsigned_abs().div_ceil(TILE), num_q_heads, 1],
+            [BLOCK, 1, 1],
+        )),
         &[
             q.arg(),
             k.arg(),
@@ -104,6 +101,7 @@ pub fn bidirectional(
             stated(OP, num_kv_heads)?.arg(),
             head_dim.arg(),
             sm_scale.arg(),
+            rows.arg(),
         ],
     )
 }
