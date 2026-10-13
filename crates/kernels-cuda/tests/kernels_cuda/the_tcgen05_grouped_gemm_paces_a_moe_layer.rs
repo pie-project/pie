@@ -11,8 +11,8 @@
 //!         the_tcgen05_grouped_gemm_paces -- --ignored --nocapture
 //!
 //! `PIE_TC5_LAYER` keeps the layers whose name holds it, `PIE_TC5_TOKENS`
-//! one token count; `PIE_TC5_SPLITS` overrides the
-//! plan's K splits.
+//! one token count; `PIE_TC5_SPLITS` overrides the plan's K splits;
+//! `PIE_TC5_FUSED_BF16` lands the fused gate_up's GLU as bf16 instead.
 
 use crate::common::Gpu;
 use crate::common::tc5::random;
@@ -237,7 +237,9 @@ fn layer(name: &str, experts: usize, top: usize, [n, k]: [usize; 2], kind: Kind)
                         }
                         Groups::Contiguous { .. } => rows,
                     };
-                    let out = if kind.act.0 == Elem::E2m1 {
+                    let out = if std::env::var("PIE_TC5_FUSED_BF16").is_ok() {
+                        Out::Bf16
+                    } else if kind.act.0 == Elem::E2m1 {
                         Out::Nvfp4 {
                             data: gpu.zeros(rows * inter / 2),
                             scales: gpu.zeros(atom_bytes(scale_rows, inter, 16)),
@@ -259,7 +261,7 @@ fn layer(name: &str, experts: usize, top: usize, [n, k]: [usize; 2], kind: Kind)
                             &ctx,
                             act,
                             w,
-                            0,
+                            y,
                             grouped(i),
                             [inter as u32, k as u32],
                             1.0,

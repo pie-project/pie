@@ -81,18 +81,21 @@ struct Epi {
 
 namespace tc5k {
 
-// The GLUs pie's MLPs use, over a gate and an up value.
+// The GLUs pie's MLPs use, over a gate and an up value. Fast exp and
+// divide: a precise division a value is most of a fused tile's epilogue,
+// and that epilogue then paces the MMAs. (A gate so negative its exp
+// overflows divides to 0, its limit.)
 template <int kGlu>
 __device__ __forceinline__ float glu(float g, float u, float limit, float galpha) {
     if constexpr (kGlu == 1) {
-        return g / (1.f + __expf(-g)) * u;
+        return __fdividef(g, 1.f + __expf(-g)) * u;
     } else {
         g = fminf(g, limit);
         u = fminf(fmaxf(u, -limit), limit);
         if constexpr (kGlu == 2) {
-            return g / (1.f + expf(-g)) * u;
+            return __fdividef(g, 1.f + __expf(-g)) * u;
         } else {
-            return (u + 1.f) * (g / (1.f + expf(-galpha * g)));
+            return (u + 1.f) * __fdividef(g, 1.f + __expf(-galpha * g));
         }
     }
 }
@@ -103,6 +106,11 @@ __device__ __forceinline__ int ue8m0_exponent(float amax) {
     int e;
     const float m = frexpf(fmaxf(amax, 1e-4f) / 448.f, &e);
     return m == 0.5f ? e - 1 : e;
+}
+
+// 2^-e for a block exponent: exact, and in range from the 1e-4 floor up.
+__device__ __forceinline__ float pow2_neg(int e) {
+    return __int_as_float((127 - e) << 23);
 }
 
 __device__ __forceinline__ unsigned short e4m3x2(float lo, float hi) {
@@ -197,10 +205,13 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     constexpr u32 kAtomsP = tc5k::atoms_k(kKind, kGranP);
     constexpr u32 kAtomsQ = tc5k::atoms_k(kKind, kGranQ);
     constexpr u32 kRowAtomsQ = (kBN + 127) / 128;
-    constexpr u32 kSfP = kAtomsP * 512 * kPT;         // this CTA's P rows (each P tile's)
+    // A contiguous P tile starts at either 64-row half: its scales span two
+    // row blocks.
+    constexpr u32 kRowAtomsP = kGroup == 1 && kScaled ? 2 : 1;
+    constexpr u32 kSfP = kAtomsP * 512 * kPT * kRowAtomsP;  // this CTA's P rows (each P tile's)
     constexpr u32 kSfQ = kAtomsQ * kRowAtomsQ * 512;  // all of Q's rows, in each CTA
     constexpr u32 kTx = kPair * (kTxP * kPT + kTxQ + kSfP + kSfQ);
-    constexpr u32 kSfCols = 4 * kAtomsP * kPT + 4 * kAtomsQ * kRowAtomsQ;
+    constexpr u32 kSfCols = 4 * kAtomsP * kPT * kRowAtomsP + 4 * kAtomsQ * kRowAtomsQ;
     // Scales go to TMEM from their own warp, up to four K steps ahead in
     // their own slots: a copy in the MMA thread's stream would hold every
     // MMA behind it until it lands, and a shallower ring would hold the
@@ -289,17 +300,23 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     // An expert's output columns: its bank rows, or a GLU's gate rows.
     const int span = kFused ? inter : n_per;
     const int masked_p = (span + 127) / 128;
+    const int cont_q = (span + static_cast<int>(kQStep) - 1) / static_cast<int>(kQStep);
     if (kGroup != 0 && warp == 0) {
         for (int i = static_cast<int>(lane); i < experts + (kGroup == 1 ? 1 : 0); i += 32) {
             routes[i] = __ldg(&group[i]);
         }
-        if constexpr (kGroup == 2) {
+        {
             __syncwarp();
             const int per = (experts + 31) / 32;
             const int lo = min(experts, static_cast<int>(lane) * per);
             const int hi = min(experts, lo + per);
+            // An expert's tiles: its rows' 128-row tiles by the Q tiles.
             auto tiles_of = [&](int e) {
-                return (min(routes[e], m_max) + kBN - 1) / kBN * masked_p;
+                if constexpr (kGroup == 1) {
+                    return (routes[e + 1] - routes[e] + 127) / 128 * cont_q;
+                } else {
+                    return (min(routes[e], m_max) + kBN - 1) / kBN * masked_p;
+                }
             };
             int sum = 0;
             for (int i = lo; i < hi; ++i) {
@@ -341,7 +358,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     // A unit is one tile's share of K: `splits` of them a tile when a
     // decode's few tiles would leave SMs idle, summed in f32 at `part`.
     const int kb_per = (num_kb + splits - 1) / splits;
-    const int tiles = (kGroup == 2 ? starts[experts] : num_p * num_q) * splits;
+    const int tiles = (kGroup != 0 ? starts[experts] : num_p * num_q) * splits;
     const int first_tile = static_cast<int>(blockIdx.x) / kPair;
     const int tile_step = static_cast<int>(gridDim.x) / kPair;
 
@@ -350,7 +367,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     // lim_p and j < lim_q.
     struct Unit {
         int p_row, q_row, p_block, q_block;
-        u32 quarter;
+        u32 quarter, pquarter;
         int kb0, kb1;
         float alpha;
         int out_p, out_q, lim_p, lim_q, s_row;
@@ -364,7 +381,8 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
         x.kb1 = min(num_kb, x.kb0 + kb_per);
         x.alpha = alpha;
         int e = 0, pt, qt;
-        if constexpr (kGroup == 2) {
+        x.pquarter = 0;
+        if constexpr (kGroup != 0) {
             // The last expert whose tiles start at or before t: an empty
             // expert shares its start with the next.
             int lo = 0, hi = experts - 1;
@@ -377,10 +395,17 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                 }
             }
             e = lo;
-            const int q_tiles = (min(routes[e], m_max) + kBN - 1) / kBN;
             const int r = t - starts[e];
-            pt = r / q_tiles;
-            qt = r - pt * q_tiles;
+            if constexpr (kGroup == 1) {
+                // An expert's row tiles walk fastest, sharing its weight tile.
+                const int m_tiles = (routes[e + 1] - routes[e] + 127) / 128;
+                qt = r / m_tiles;
+                pt = r - qt * m_tiles;
+            } else {
+                const int q_tiles = (min(routes[e], m_max) + kBN - 1) / kBN;
+                pt = r / q_tiles;
+                qt = r - pt * q_tiles;
+            }
         } else {
             // Groups of 8 P tiles walk Q together, so a wave shares both
             // operands.
@@ -401,28 +426,19 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
             x.lim_p = rows_p - x.p_row;
             x.lim_q = rows_q - x.q_row;
         } else if constexpr (kGroup == 1) {
-            x.p_row = pt * 128;
-            if (x.p_row >= routes[experts]) {
-                return false;
-            }
-            int lo = 0, hi = experts - 1;
-            while (lo < hi) {
-                const int mid = (lo + hi + 1) / 2;
-                if (routes[mid] <= x.p_row) {
-                    lo = mid;
-                } else {
-                    hi = mid - 1;
-                }
-            }
-            e = lo;
-            if (routes[e] % 128 != 0) {
+            // A tile starts at its expert's rows, either 64-row half (the
+            // MMA faults on A-side scales at an odd quarter): its
+            // rows past the expert's are another's, and land nowhere.
+            if (routes[e] % 64 != 0) {
                 asm volatile("trap;");
             }
+            x.p_row = routes[e] + pt * 128;
             x.q_row = e * n_per + qt * static_cast<int>(kQStep);
-            x.p_block = pt;
+            x.p_block = x.p_row / 128;
+            x.pquarter = static_cast<u32>(x.p_row % 128) / 32;
             x.out_p = x.p_row;
             x.out_q = qt * static_cast<int>(kQStep);
-            x.lim_p = 128;
+            x.lim_p = min(128, routes[e + 1] - x.p_row);
             x.lim_q = span - qt * static_cast<int>(kQStep);
         } else {
             const int count = min(routes[e], m_max);
@@ -562,11 +578,20 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                     bar_wait(&full[s], phase);
                     tc_fence_after();
                     const u32 sf_tp = tmem + kStride + kAccN + slot * kSfCols;
-                    const u32 sf_tq = sf_tp + 4 * kAtomsP * kPT;
+                    const u32 sf_tq = sf_tp + 4 * kAtomsP * kPT * kRowAtomsP;
                     const u32 sf_p = smem_addr(smem + kOffSfP + s * kSfP);
                     const u32 sf_q = smem_addr(smem + kOffSfQ + s * kSfQ);
-                    for (u32 a = 0; a < kAtomsP * kPT; ++a) {
-                        tc_cp_sf_atom<kPair>(sf_tp + 4 * a, sdesc_sf(sf_p + a * 512));
+                    // P's scales as Q's: [row block][atom] in, [atom][row block]
+                    // out, each P tile's after the last's.
+                    for (u32 h = 0; h < kPT; ++h) {
+                        for (u32 r = 0; r < kRowAtomsP; ++r) {
+                            for (u32 a = 0; a < kAtomsP; ++a) {
+                                const u32 base = h * kAtomsP * kRowAtomsP;
+                                tc_cp_sf_atom<kPair>(
+                                    sf_tp + 4 * (base + a * kRowAtomsP + r),
+                                    sdesc_sf(sf_p + (base + r * kAtomsP + a) * 512));
+                            }
+                        }
                     }
                     for (u32 r = 0; r < kRowAtomsQ; ++r) {
                         for (u32 a = 0; a < kAtomsQ; ++a) {
@@ -607,7 +632,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                     const u32 tile_p = smem_addr(smem + s * kTileP * kPT);
                     const u32 tile_q = smem_addr(smem + kOffQ + s * kTileQ);
                     const u32 sf_tp0 = tmem + kStride + kAccN + slot * kSfCols;
-                    const u32 sf_tq = sf_tp0 + 4 * kAtomsP * kPT;
+                    const u32 sf_tq = sf_tp0 + 4 * kAtomsP * kPT * kRowAtomsP;
                     if (kOv > 0 && kb == kb0 && it > 0) {
                         const u32 prev = static_cast<u32>(it - 1);
                         bar_wait(&tover[prev % 2], (prev / 2) & 1);
@@ -618,7 +643,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                     for (u32 h = 0; h < kPT; ++h) {
                     const u64 desc_p = sdesc_sw128(tile_p + h * kTileP);
                     const u32 d = d0 + h * kBN;
-                    const u32 sf_tp = sf_tp0 + 4 * h * kAtomsP;
+                    const u32 sf_tp = sf_tp0 + 4 * h * kAtomsP * kRowAtomsP;
 #pragma unroll
                     for (u32 j = 0; j < 4; ++j) {
                         const u64 a = desc_p + 2 * j;
@@ -635,7 +660,10 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                             const u32 cp = k0 / kGranP;
                             const u32 cq = k0 / kGranQ;
                             const u32 col_p =
-                                sf_tp + 4 * (cp / 4 - static_cast<u32>(kb) * kStageK / kGranP / 4);
+                                sf_tp +
+                                4 * kRowAtomsP *
+                                    (cp / 4 - static_cast<u32>(kb) * kStageK / kGranP / 4) +
+                                x.pquarter;
                             const u32 col_q =
                                 sf_tq +
                                 4 * kRowAtomsQ *
@@ -693,13 +721,15 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                 !kSwap && epi.row_scale != nullptr && live ? epi.row_scale[p] : 1.f;
             // This tile's 32 values a chunk, past alpha, the GLU and the
             // routed weight.
-            auto product = [&](u32 c0, float (&h)[32]) {
-                u32 v[32];
+            // A chunk's raw columns (a GLU's gate and up), then its values.
+            auto fetch = [&](u32 c0, u32 (&v)[32], u32 (&u)[32]) {
                 tmem_ld32(taddr + c0, v);
                 if constexpr (kFused) {
-                    u32 u[32];
                     tmem_ld32(taddr + kUp + c0, u);
-                    tmem_wait_ld();
+                }
+            };
+            auto finish = [&](u32 c0, const u32 (&v)[32], const u32 (&u)[32], float (&h)[32]) {
+                if constexpr (kFused) {
 #pragma unroll
                     for (int j = 0; j < 32; ++j) {
                         h[j] = tc5k::glu<kGlu>(__uint_as_float(v[j]) * alpha,
@@ -707,7 +737,6 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                                                epi.galpha);
                     }
                 } else {
-                    tmem_wait_ld();
 #pragma unroll
                     for (int j = 0; j < 32; ++j) {
                         h[j] = __uint_as_float(v[j]) * alpha;
@@ -725,30 +754,64 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                     h[j] *= rs;
                 }
             };
+            auto product = [&](u32 c0, float (&h)[32]) {
+                u32 v[32], u[32];
+                fetch(c0, v, u);
+                tmem_wait_ld();
+                finish(c0, v, u, h);
+            };
+            // The columns the next tile's MMA shares go first: stage 0
+            // drains tail first, stage 1 head first. A GLU's math is long
+            // enough to hold that MMA back, so its shared columns are all
+            // read before any of it, and the MMA released then.
+            const bool reverse = kOv > 0 && acc == 0;
+            auto col = [&](u32 chunk) {
+                return reverse ? 32 * (kChunks - 1 - chunk) : 32 * chunk;
+            };
+            constexpr bool kEarly = kFused && kOv > 0;
+            constexpr u32 kPre = kEarly ? kOvChunks : 1;
+            u32 pre_v[kPre][32], pre_u[kPre][32];
+            if constexpr (kEarly) {
+#pragma unroll
+                for (u32 c = 0; c < kPre; ++c) {
+                    fetch(col(c), pre_v[c], pre_u[c]);
+                }
+                tmem_wait_ld();
+                tc_fence_before();
+                __syncwarp();
+                if (lane == 0) {
+                    arrive_leader(&tover[acc]);
+                }
+            }
+            auto value = [&](u32 chunk, float (&h)[32]) {
+                if (kEarly && chunk < kPre) {
+                    finish(col(chunk), pre_v[chunk], pre_u[chunk], h);
+                } else {
+                    product(col(chunk), h);
+                }
+                if (!kEarly && kOv > 0 && chunk + 1 == kOvChunks) {
+                    tc_fence_before();
+                    __syncwarp();
+                    if (lane == 0) {
+                        arrive_leader(&tover[acc]);
+                    }
+                }
+                if (chunk + 1 == kChunks) {
+                    tc_fence_before();
+                    __syncwarp();
+                    if (lane == 0) {
+                        arrive_leader(&tempty[acc]);
+                    }
+                }
+            };
             // DeepSeek's 1x128 block of an unswapped row is the tile's four
             // chunks: held in registers, its amax known once they are read.
             if constexpr (kOut == 1 && !kSwap) {
-                const bool reverse = kOv > 0 && acc == 0;
-                auto col = [&](u32 chunk) { return reverse ? 32 * (kChunks - 1 - chunk) : 32 * chunk; };
                 float hall[kChunks][32];
                 float amax = 0.f;
 #pragma unroll
                 for (u32 chunk = 0; chunk < kChunks; ++chunk) {
-                    product(col(chunk), hall[chunk]);
-                    if (kOv > 0 && chunk + 1 == kOvChunks) {
-                        tc_fence_before();
-                        __syncwarp();
-                        if (lane == 0) {
-                            arrive_leader(&tover[acc]);
-                        }
-                    }
-                    if (chunk + 1 == kChunks) {
-                        tc_fence_before();
-                        __syncwarp();
-                        if (lane == 0) {
-                            arrive_leader(&tempty[acc]);
-                        }
-                    }
+                    value(chunk, hall[chunk]);
 #pragma unroll
                     for (int j = 0; j < 32; ++j) {
                         amax = fmaxf(amax, fabsf(hall[chunk][j]));
@@ -756,6 +819,8 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                 }
                 if (live && x.lim_q > 0) {
                     const int ce = tc5k::ue8m0_exponent(amax);
+                    // satfinite clamps to +-448.
+                    const float down = tc5k::pow2_neg(ce);
 #pragma unroll
                     for (u32 chunk = 0; chunk < kChunks; ++chunk) {
                         const float(&h)[32] = hall[chunk];
@@ -765,7 +830,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                             float e[4];
 #pragma unroll
                             for (int b = 0; b < 4; ++b) {
-                                e[b] = fminf(fmaxf(ldexpf(h[4 * j + b], -ce), -448.f), 448.f);
+                                e[b] = h[4 * j + b] * down;
                             }
                             w[j] = static_cast<u32>(tc5k::e4m3x2(e[0], e[1])) |
                                    (static_cast<u32>(tc5k::e4m3x2(e[2], e[3])) << 16);
@@ -780,28 +845,11 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                 }
                 continue;
             }
-            // The shared columns go first: stage 0 drains tail first, stage
-            // 1 head first, and the next tile's MMA starts once they are read.
-            const bool reverse = kOv > 0 && acc == 0;
-#pragma unroll 1
+#pragma unroll(kEarly ? kChunks : 1)
             for (u32 chunk = 0; chunk < kChunks; ++chunk) {
-                const u32 c0 = reverse ? 32 * (kChunks - 1 - chunk) : 32 * chunk;
+                const u32 c0 = col(chunk);
                 float h[32];
-                product(c0, h);
-                if (kOv > 0 && chunk + 1 == kOvChunks) {
-                    tc_fence_before();
-                    __syncwarp();
-                    if (lane == 0) {
-                        arrive_leader(&tover[acc]);
-                    }
-                }
-                if (chunk + 1 == kChunks) {
-                    tc_fence_before();
-                    __syncwarp();
-                    if (lane == 0) {
-                        arrive_leader(&tempty[acc]);
-                    }
-                }
+                value(chunk, h);
                 const int j0 = static_cast<int>(c0);
                 const int q0 = x.out_q + j0;
                 if constexpr (kSwap && kOut == 1) {
@@ -827,7 +875,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                                                  fmaxf(red[64 + j], red[96 + j]));
                         const int ce = tc5k::ue8m0_exponent(amax);
                         if (j0 + j < x.lim_q) {
-                            const float q = fminf(fmaxf(ldexpf(h[j], -ce), -448.f), 448.f);
+                            const float q = h[j] * tc5k::pow2_neg(ce);
                             if (live) {
                                 epi.q[static_cast<size_t>(q0 + j) * inter + p] =
                                     static_cast<unsigned char>(tc5k::e4m3x2(q, 0.f) & 0xff);
@@ -922,9 +970,10 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                             }
                         }
                     }
-                } else {
+                } else if (static_cast<int>(rank * 128 + warp * 32) < x.lim_p) {
                     // The warp's 32 x 32 box goes out by TMA from a 64-byte
-                    // swizzled stage, which also drops rows and columns past y.
+                    // swizzled stage, which also drops rows and columns past y
+                    // (a contiguous tile's warps past its expert land nothing).
                     unsigned char* box = smem + kOffOut + (warp * 2 + out_buf) * 2048;
                     if (lane == 0) {
                         bulk_wait_read<1>();

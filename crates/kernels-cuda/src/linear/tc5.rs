@@ -243,7 +243,14 @@ const fn atoms_k(kind: Kind, gran: u32) -> u32 {
 
 /// The dynamic shared memory the kernel lays out, mirrored from it, plus
 /// the 1024 bytes it may spend aligning the ring.
-const fn smem_bytes(kind: Kind, gran_p: u32, gran_q: u32, plan: Plan, pt: u32) -> u32 {
+const fn smem_bytes(
+    kind: Kind,
+    gran_p: u32,
+    gran_q: u32,
+    plan: Plan,
+    pt: u32,
+    p_blocks: u32,
+) -> u32 {
     let Plan {
         swap,
         pair,
@@ -253,7 +260,7 @@ const fn smem_bytes(kind: Kind, gran_p: u32, gran_q: u32, plan: Plan, pt: u32) -
     } = plan;
     let stage = 128 * 128 * pt
         + bn / if pair { 2 } else { 1 } * 128
-        + atoms_k(kind, gran_p) * 512 * pt
+        + atoms_k(kind, gran_p) * 512 * pt * p_blocks
         + atoms_k(kind, gran_q) * bn.div_ceil(128) * 512;
     let out = (stages * stage).div_ceil(1024) * 1024;
     let bar = out + if swap { 1024 } else { 4 * 2 * 2048 };
@@ -329,9 +336,10 @@ impl Plan {
         }
     }
 
-    fn staged(mut self, kind: Kind, gran_p: u32, gran_q: u32, pt: u32) -> Self {
+    fn staged(mut self, kind: Kind, gran_p: u32, gran_q: u32, pt: u32, p_blocks: u32) -> Self {
         let mut stages = 8;
-        while stages > 2 && smem_bytes(kind, gran_p, gran_q, Self { stages, ..self }, pt) > SMEM_CAP
+        while stages > 2
+            && smem_bytes(kind, gran_p, gran_q, Self { stages, ..self }, pt, p_blocks) > SMEM_CAP
         {
             stages -= 1;
         }
@@ -587,8 +595,11 @@ pub enum Groups {
     Masked { counts: u64, m_max: u32 },
 }
 
-/// Where a contiguous group's rows start.
-pub const GROUP_ALIGN: u32 = 128;
+/// Where a contiguous group's rows start: a 64-row half of a scale row
+/// block, so a tile's warps never straddle experts and its scales start at
+/// a column the MMA takes (it faults on odd 32-row quarters of the A side's
+/// scales). 128 served before and still does.
+pub const GROUP_ALIGN: u32 = 64;
 
 /// A grouped GEMM: each routed row against its expert's weight.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -914,8 +925,10 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     let pt = if glu && job.plan.swap { 2 } else { 1 };
     let halves = glu && !job.plan.swap;
     let gran = |o: Operand| o.scales.map_or(128, |s| s.gran);
-    let plan = job.plan.staged(kind, gran(p), gran(q), pt);
-    let smem = smem_bytes(kind, gran(p), gran(q), plan, pt);
+    // A contiguous tile starting mid-block reads two row blocks of scales.
+    let p_blocks = if group.mode == 1 { 2 } else { 1 };
+    let plan = job.plan.staged(kind, gran(p), gran(q), pt, p_blocks);
+    let smem = smem_bytes(kind, gran(p), gran(q), plan, pt, p_blocks);
     let ctas = if plan.pair { 2 } else { 1 };
     let [rows_p, rows_q] = job.rows;
 
@@ -931,7 +944,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
         Some(s) => scale_map(s, rows, k, atoms_k(kind, s.gran), row_blocks),
         None => Ok([0; 16]),
     };
-    let map_sfp = atoms(p, job.scale_rows[0], 1)?;
+    let map_sfp = atoms(p, job.scale_rows[0], p_blocks)?;
     let q_blocks = if halves { 1 } else { plan.bn.div_ceil(128) };
     let map_sfq = atoms(q, job.scale_rows[1], q_blocks)?;
     let epi_args = epi.args(n, job.pad);
@@ -1310,9 +1323,9 @@ mod tests {
                     stages: 0,
                     splits: 0,
                 }
-                .staged(kind, g, g, 1);
+                .staged(kind, g, g, 1, 1);
                 assert!(plan.stages >= 3, "{kind:?} bn={bn}: {plan:?}");
-                assert!(smem_bytes(kind, g, g, plan, 1) <= SMEM_CAP);
+                assert!(smem_bytes(kind, g, g, plan, 1, 1) <= SMEM_CAP);
             }
         }
     }

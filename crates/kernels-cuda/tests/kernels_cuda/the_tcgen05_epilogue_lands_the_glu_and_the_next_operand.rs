@@ -3,7 +3,7 @@
 use crate::common::tc5::{Side, e2m1, e4m3, side};
 use crate::common::{Gpu, Lcg, from_bf16};
 use kernels_cuda::linear::tc5::{
-    Elem, Epilogue, Glu, Grouped, Groups, Operand, Out, Plan, atom_bytes, atom_offset,
+    Elem, Epilogue, GROUP_ALIGN, Glu, Grouped, Groups, Operand, Out, Plan, atom_bytes, atom_offset,
     gemm_epi_with, grouped_gemm_epi_with, supported,
 };
 
@@ -323,7 +323,7 @@ fn grouped(
             for i in 0..c {
                 rows_of.push((o + i, o + i, o + i, e));
             }
-            offsets.push(o + c.next_multiple_of(128));
+            offsets.push(o + c.next_multiple_of(GROUP_ALIGN as usize));
         }
         let rows = offsets[experts] + 128;
         let act = side(&mut lcg, &mut bits, a.0, a.1, rows, k);
