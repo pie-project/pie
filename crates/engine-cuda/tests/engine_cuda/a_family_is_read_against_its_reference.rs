@@ -63,8 +63,11 @@ fn every_probe_is_dumped() {
             let stamp = checkpoint::file::serve::stamp_of(&artifact)
                 .expect("the artifact reads")
                 .expect("the artifact carries a serving stamp");
-            let deployment = poem_compiler::catalog::deployment(&stamp.deployment)
-                .unwrap_or_else(|| panic!("no deployment {}", stamp.deployment));
+            // A stated row serves the artifact's planes if they are its own:
+            // `nvfp4a4` reads the planes an `nvfp4` import lands.
+            let name = std::env::var("PIE_PARITY_DEPLOYMENT").unwrap_or(stamp.deployment);
+            let deployment = poem_compiler::catalog::deployment(&name)
+                .unwrap_or_else(|| panic!("no deployment {name}"));
             let trace = deployment.trace(Platform::Cuda);
             let source = ztensor_compat::index(&artifact).expect("the artifact opens");
             let contract = poem::import::own_contract(

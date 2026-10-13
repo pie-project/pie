@@ -2,7 +2,9 @@
 # with full attention every fourth, routed experts, an n-gram embedding,
 # a multi-token draft head and a vision tower; its four-layer, sixteen-expert
 # miniature; and a micro model of toy widths for engine tests, which lists no
-# deployment. NVIDIA's NVFP4 export serves its experts as it stores them; a
+# deployment. NVIDIA's NVFP4 export serves its experts as it stores them,
+# against bf16 activations or (`nvfp4a4`, on the tcgen05 GEMMs) against
+# NVFP4 ones under each expert's calibrated input scale, as vLLM serves it; a
 # deployment that keeps them comes after every other, so an import of a bf16
 # checkpoint picks one it can write.
 
@@ -24,6 +26,8 @@ MIXED = [dtype.u4g64, dtype.u2g128]
 
 NVFP4 = [dtype.bf16, dtype.nvfp4]
 
+NVFP4_A4 = [dtype.bf16, dtype.nvfp4a4]
+
 DEPLOYMENTS = [
     deployment("qwen38-flash-next", weights = dtype.u4g64, kv = dtype.bf16),
     deployment("qwen38-flash-next", weights = MIXED, kv = dtype.bf16, drafter = "mtp"),
@@ -35,4 +39,6 @@ DEPLOYMENTS = [
     deployment("qwen38-flash-next", weights = MIXED, kv = dtype.bf16, parts = ["vision"]),
     deployment("qwen38-flash-next", weights = NVFP4, kv = dtype.bf16),
     deployment("qwen38-flash-next-mini", weights = NVFP4, kv = dtype.bf16),
+    deployment("qwen38-flash-next", weights = NVFP4_A4, kv = dtype.bf16),
+    deployment("qwen38-flash-next-mini", weights = NVFP4_A4, kv = dtype.bf16),
 ]

@@ -305,25 +305,29 @@ MIXED_2BIT = struct(
     table = dtype.u4g32,
 )
 
-# modelopt's NVFP4 export: the routed experts e2m1 under e4m3 scales, the
-# rest as stored but the n-gram table, which the export stores e4m3 under one
-# scale and which lands at bf16 (no encode here writes its 160-wide rows
+# modelopt's NVFP4 export: the routed experts e2m1 under e4m3 scales, read
+# against bf16 activations (`dtype.nvfp4`) or NVFP4 ones (`dtype.nvfp4a4`),
+# the rest as stored but the n-gram table, which the export stores e4m3 under
+# one scale and which lands at bf16 (no encode here writes its 160-wide rows
 # narrower).
-NVFP4 = struct(
-    embed = dtype.bf16,
-    head = dtype.bf16,
-    proj = dtype.bf16,
-    inject = dtype.bf16,
-    gdn_ba = dtype.bf16,
-    experts = dtype.nvfp4,
-    table = dtype.bf16,
-)
+def nvfp4_mix(experts):
+    return struct(
+        embed = dtype.bf16,
+        head = dtype.bf16,
+        proj = dtype.bf16,
+        inject = dtype.bf16,
+        gdn_ba = dtype.bf16,
+        experts = experts,
+        table = dtype.bf16,
+    )
 
 def layout(id, deploy):
     vision = "vision" in deploy.parts
     mtp = deploy.drafter == "mtp"
     mixed = deploy.weights == [dtype.u4g64, dtype.u2g128]
-    nvfp4 = deploy.weights == [dtype.bf16, dtype.nvfp4]
+    nvfp4 = None
+    if deploy.weights in [[dtype.bf16, dtype.nvfp4], [dtype.bf16, dtype.nvfp4a4]]:
+        nvfp4 = nvfp4_mix(deploy.weights[1])
     refused = "{} does not ship {}".format(id, deploy)
     if id == "qwen38-flash-next-micro":
         if len(deploy.weights) != 1:
@@ -332,8 +336,8 @@ def layout(id, deploy):
     if id == "qwen38-flash-next-mini":
         if mixed:
             return build(MIXED_2BIT, deploy.kv, MINI, HASHES["mini"], False, False)
-        if nvfp4:
-            return build(NVFP4, deploy.kv, MINI, HASHES["mini"], False, False)
+        if nvfp4 != None:
+            return build(nvfp4, deploy.kv, MINI, HASHES["mini"], False, False)
         if len(deploy.weights) != 1:
             fail(refused)
         return build(mix_of(deploy.weights[0]), deploy.kv, MINI, HASHES["mini"], False, False)
@@ -341,8 +345,8 @@ def layout(id, deploy):
         return build(mix_of(deploy.weights[0]), deploy.kv, FLASH, HASHES["flash"], False, False)
     if mixed and (mtp or deploy.drafter == None):
         return build(MIXED_2BIT, deploy.kv, FLASH, HASHES["flash"], mtp, vision)
-    if nvfp4 and not vision and deploy.drafter == None:
-        return build(NVFP4, deploy.kv, FLASH, HASHES["flash"], False, False)
+    if nvfp4 != None and not vision and deploy.drafter == None:
+        return build(nvfp4, deploy.kv, FLASH, HASHES["flash"], False, False)
     fail(refused)
 
 def build(mix, kv, d, hashes, draft, vision):
