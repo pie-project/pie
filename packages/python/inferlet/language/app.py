@@ -26,6 +26,7 @@ import importlib
 import inspect
 import json
 import linecache
+import pkgutil
 import sys
 import traceback
 import types
@@ -40,8 +41,6 @@ _STDLIB_SKIP = {
 
 
 def _prewarm_stdlib() -> None:
-    import pkgutil
-
     def wanted(name: str) -> bool:
         parts = name.split(".")
         return not any(part.startswith("_") or part in ("test", "tests") for part in parts) and (
@@ -77,6 +76,12 @@ _prewarm_stdlib()
 # traceback instead of a wasm trap.
 from componentize_py_types import Err as _WitErr
 from wit_world import exports
+import wit_world.imports
+
+# The world's interfaces are the program's to import, not only the ones
+# `inferlet` happens to (`wit_world.imports.monotonic_clock`): carry them all.
+for _info in pkgutil.iter_modules(wit_world.imports.__path__, "wit_world.imports."):
+    importlib.import_module(_info.name)
 
 import inferlet as _inferlet  # bundled: the source imports this by name
 
