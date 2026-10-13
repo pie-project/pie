@@ -19,8 +19,6 @@ namespace wmma = ::nvcuda::wmma;
 
 [[maybe_unused]] constexpr int kMoeVecWidth = 8;
 
-constexpr int kMaxTopK = 16;
-
 constexpr int kGemvWarps = 4;
 
 using f32 = float;
@@ -1302,8 +1300,7 @@ __global__ void moe_weighted_sum_batched(
     if (h >= hidden) return;
     float acc = 0.f;
     #pragma unroll
-    for (int k = 0; k < kMaxTopK; ++k) {
-        if (k >= batch) break;
+    for (int k = 0; k < batch; ++k) {
         const float v = Elem<T>::to_f32(src[(long long)k * hidden + h]);
         acc += weights[k] * v;
     }
@@ -1329,8 +1326,7 @@ __global__ void moe_weighted_sum(
     const long long base = static_cast<long long>(plane_row) * top_k;
     float acc = 0.f;
     #pragma unroll
-    for (int k = 0; k < kMaxTopK; ++k) {
-        if (k >= top_k) break;
+    for (int k = 0; k < top_k; ++k) {
         const long long r = base + k;
         const float v = Elem<T>::to_f32(src[r * hidden + h]);
         acc += weights[r] * v;
@@ -1384,8 +1380,7 @@ __global__ void moe_weighted_sum_add(
     const long long base = static_cast<long long>(n) * top_k;
     float acc = 0.f;
     #pragma unroll
-    for (int k = 0; k < kMaxTopK; ++k) {
-        if (k >= top_k) break;
+    for (int k = 0; k < top_k; ++k) {
         const long long r = base + k;
         const float v = Elem<T>::to_f32(src[r * hidden + h]);
         acc += weights[r] * v;
@@ -1475,8 +1470,7 @@ __global__ void moe_weighted_sum_aligned(
     const long long base = static_cast<long long>(n) * top_k;
     float acc = 0.f;
 #pragma unroll
-    for (int k = 0; k < kMaxTopK; ++k) {
-        if (k >= top_k) break;
+    for (int k = 0; k < top_k; ++k) {
         const long long route = base + k;
         const int row = route_to_aligned_row[route];
         const float v = Elem<T>::to_f32(
