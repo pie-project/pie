@@ -822,6 +822,10 @@ pub fn copy_words(ctx: &Ctx<'_>, src: Tensor, dst: Tensor, bytes: u64) -> Result
 }
 
 const TOPK_THREADS: u32 = 128;
+/// A row this wide is a vocabulary: one 128-thread group a row left the
+/// device a few cores' worth of work for a draft block's eight rows.
+const TOPK_WIDE_FROM: u32 = 16_384;
+const TOPK_WIDE_THREADS: u32 = 1024;
 
 pub fn topk(
     ctx: &Ctx<'_>,
@@ -831,12 +835,17 @@ pub fn topk(
     indices: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "layout.topk";
-    let entry = match (x.dtype, k) {
-        (Dtype::Bf16, 8) => "topk_rows_bfloat16_k_8",
-        (Dtype::Bf16, 16) => "topk_rows_bfloat16_k_16",
-        (Dtype::F32, 8) => "topk_rows_float32_k_8",
-        (Dtype::F32, 16) => "topk_rows_float32_k_16",
-        (dtype, k) => {
+    let wide = x.width >= TOPK_WIDE_FROM;
+    let entry = match (x.dtype, k, wide) {
+        (Dtype::Bf16, 8, false) => "topk_rows_bfloat16_k_8",
+        (Dtype::Bf16, 16, false) => "topk_rows_bfloat16_k_16",
+        (Dtype::F32, 8, false) => "topk_rows_float32_k_8",
+        (Dtype::F32, 16, false) => "topk_rows_float32_k_16",
+        (Dtype::Bf16, 8, true) => "topk_rows_wide_bfloat16_k_8",
+        (Dtype::Bf16, 16, true) => "topk_rows_wide_bfloat16_k_16",
+        (Dtype::F32, 8, true) => "topk_rows_wide_float32_k_8",
+        (Dtype::F32, 16, true) => "topk_rows_wide_float32_k_16",
+        (dtype, k, _) => {
             return Err(refuse(
                 OP,
                 format!(
@@ -859,9 +868,10 @@ pub fn topk(
             format!("the indices plane is not [{rows}, {k}] i32"),
         ));
     }
+    let threads = if wide { TOPK_WIDE_THREADS } else { TOPK_THREADS };
     ctx.fire(
         Fire::at("layout/topk.metal", entry)
-            .apply(Grid::of([TOPK_THREADS, rows, 1], [TOPK_THREADS, 1, 1])),
+            .apply(Grid::of([threads, rows, 1], [threads, 1, 1])),
         &[
             x.arg(),
             values.arg_mut(),
