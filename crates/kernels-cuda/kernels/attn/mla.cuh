@@ -325,6 +325,7 @@ __global__ void mla_naive_paged_kernel(
     const std::uint32_t* __restrict__ kv_page_indptr,
     const std::uint32_t* __restrict__ kv_last_page_lens,
     __nv_bfloat16* __restrict__ o,
+    float* __restrict__ lse,
     const std::int32_t* __restrict__ selection, int top_k,
     int R, int H, int CKV, int KPE, int page_size, float sm_scale, bool causal,
     int G,
@@ -447,6 +448,10 @@ __global__ void mla_naive_paged_kernel(
         const float inv = (l_all > 0.f) ? (1.f / l_all) : 0.f;
         o[(static_cast<long long>(t_row) * H + blockIdx.y * G + gg) * CKV + d] =
             __float2bfloat16(v * inv);
+        if (lse != nullptr && d == 0) {
+            lse[static_cast<long long>(t_row) * H + blockIdx.y * G + gg] =
+                (l_all > 0.f) ? (m_all + logf(l_all)) * 1.4426950408889634f : -CUDART_INF_F;
+        }
     }
 }
 
@@ -547,6 +552,7 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     const std::uint32_t* __restrict__ kv_page_indptr,
     const std::uint32_t* __restrict__ kv_last_page_lens,
     __nv_bfloat16* __restrict__ o,
+    float* __restrict__ lse,
     int R, int H, int page_size, float sm_scale, bool causal,
     const u32* __restrict__ win)
 {
@@ -770,6 +776,11 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     }
 
     __syncthreads();
+    if (lse != nullptr && tid < kBM) {
+        const float l = sL[tid];
+        lse[static_cast<long long>(t_row) * H + h0 + tid] =
+            (l > 0.f) ? (sM[tid] + logf(l)) * 1.4426950408889634f : -CUDART_INF_F;
+    }
     const float l0 = sL[g], l1 = sL[g + 8];
     const float i0 = (l0 > 0.f) ? (1.f / l0) : 0.f;
     const float i1 = (l1 > 0.f) ? (1.f / l1) : 0.f;

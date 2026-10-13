@@ -131,12 +131,16 @@ pub fn project(
     }
     let mix_hc = hc_fn.rows;
     let layer_row = 2 * stream_count + stream_count * stream_count;
-    if mixes.width != mix_hc || (mix_hc != layer_row && mix_hc != stream_count) {
+    let independent_row = 2 * stream_count;
+    if mixes.width != mix_hc
+        || (mix_hc != layer_row && mix_hc != independent_row && mix_hc != stream_count)
+    {
         return Err(refuse(
             OP,
             format!(
-                "a {stream_count}-stream mix row is {layer_row} wide and a trunk collapse row \
-                 is {stream_count}; the plane lands {} rows into a {}-wide row",
+                "a {stream_count}-stream mix row is {layer_row} wide ({independent_row} without \
+                 its combine) and a trunk collapse row is {stream_count}; the plane lands {} \
+                 rows into a {}-wide row",
                 hc_fn.rows, mixes.width
             ),
         ));
@@ -168,6 +172,7 @@ pub fn gates(
     gate_eps: f32,
     alpha: f32,
     sinkhorn: u32,
+    comb: bool,
     x: &mut Tensor,
     post_mix: &mut Tensor,
     comb_mix: &mut Tensor,
@@ -190,6 +195,19 @@ pub fn gates(
         post_mix.width == fan && comb_mix.width == fan * fan,
         "the gate matrices are `[N, M]` and `[N, M, M]`"
     );
+    // Without a combine the mix row is the pre and post logits alone, and
+    // the combine landed is the identity the fold carries each stream by.
+    let mix_hc = if comb { 2 * fan + fan * fan } else { 2 * fan };
+    if normed.width != mix_hc {
+        return Err(refuse(
+            OP,
+            format!(
+                "a {fan}-stream mix row {} its combine is {mix_hc} wide and this one is {}",
+                if comb { "with" } else { "without" },
+                normed.width
+            ),
+        ));
+    }
     nonzero(OP, "rows", x.rows)?;
     ctx.fire(
         OP,
@@ -211,6 +229,7 @@ pub fn gates(
             gate_eps.arg(),
             alpha.arg(),
             stated(OP, sinkhorn)?.arg(),
+            comb.arg(),
             ctx.stage(),
         ],
     )

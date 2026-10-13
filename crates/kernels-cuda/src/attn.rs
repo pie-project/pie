@@ -576,6 +576,17 @@ pub fn sink(
 ) -> Result<(), Error> {
     const OP: &str = "attention.sink";
     let t = dtype_dispatch!(OP, o.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    // The sinks are the scores' own element, or f32 as a checkpoint keeps them.
+    let s = match sink.dtype {
+        Dtype::F32 => "float",
+        held if held == o.dtype => t,
+        held => {
+            return Err(refuse(
+                OP,
+                format!("the sinks are {held:?} and the scores {:?}", o.dtype),
+            ));
+        }
+    };
     let heads = row_heads(OP, o.width, head_dim)?;
     lse_plane(OP, &lse, o.rows, heads);
     let rows = count(OP, "rows", o.rows)?;
@@ -583,7 +594,7 @@ pub fn sink(
         OP,
         Fire::at(
             "attn/attention.cuh",
-            symbol(&format!("::pie::attn::sink_rescale<{t}>")),
+            symbol(&format!("::pie::attn::sink_rescale<{t}, {s}>")),
         )
         .apply(per_head_elementwise(o.rows, heads, head_dim)),
         &[

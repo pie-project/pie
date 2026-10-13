@@ -52,6 +52,32 @@ fn rope_per_head(op: &'static str, q_pe: Tensor, heads: i32) -> Result<i32, Erro
     Ok(width / heads)
 }
 
+/// Where a scoring lands its rows' per-head base-2 log-sum-exp, if asked:
+/// an f32 plane of one entry per head per row.
+fn lse_plane(
+    op: &'static str,
+    lse: Option<&mut Tensor>,
+    rows: u32,
+    heads: i32,
+) -> Result<u64, Error> {
+    let Some(lse) = lse else {
+        return Ok(0);
+    };
+    if lse.dtype != Dtype::F32 || lse.rows != rows || i64::from(lse.width) != i64::from(heads) {
+        return Err(refuse(
+            op,
+            format!(
+                "the log-sum-exp plane is {:?} [{}, {}] and the scores want f32 [{rows}, {heads}]",
+                lse.dtype, lse.rows, lse.width
+            ),
+        ));
+    }
+    if lse.ptr == 0 {
+        return Err(refuse(op, "the log-sum-exp plane is null"));
+    }
+    Ok(lse.ptr)
+}
+
 fn split_kv_a_norm(
     ctx: &Ctx,
     op: &'static str,
@@ -448,6 +474,7 @@ pub(crate) mod naive {
         pub kv_page_indptr: u64,
         pub kv_last_page_lens: u64,
         pub o: u64,
+        pub lse: u64,
         pub selection: u64,
     }
 
@@ -493,6 +520,7 @@ pub(crate) mod naive {
                     ArgValue::Ptr(ptrs.kv_page_indptr),
                     ArgValue::Ptr(ptrs.kv_last_page_lens),
                     ArgValue::Ptr(ptrs.o),
+                    ArgValue::Ptr(ptrs.lse),
                     shape.num_requests.arg(),
                     shape.num_heads.arg(),
                     shape.page_size.arg(),
@@ -552,6 +580,7 @@ pub(crate) mod naive {
                 ArgValue::Ptr(ptrs.kv_page_indptr),
                 ArgValue::Ptr(ptrs.kv_last_page_lens),
                 ArgValue::Ptr(ptrs.o),
+                ArgValue::Ptr(ptrs.lse),
                 ArgValue::Ptr(ptrs.selection),
                 shape.top_k.arg(),
                 shape.num_requests.arg(),
@@ -779,7 +808,7 @@ mod mla_fa2 {
             sm_scale,
             ckv_scale: 1.0,
             kpe_scale: 1.0,
-            return_lse_base_on_e: true,
+            return_lse_base_on_e: false,
         }
     }
 
@@ -833,6 +862,7 @@ fn dispatch_dense(
     sm_scale: f32,
     causal: bool,
     o: &mut Tensor,
+    lse: u64,
 ) -> Result<(), Error> {
     // `kernel.mla.path`: Blackwell profiles pick `naive`; otherwise the FA2
     // arm the plan's device fits.
@@ -851,6 +881,7 @@ fn dispatch_dense(
                 kv_page_indptr: pool.page_indptr.ptr,
                 kv_last_page_lens: pool.last_page_lens.ptr,
                 o: o.ptr,
+                lse,
                 selection: 0,
             },
             naive::Shape {
@@ -884,9 +915,9 @@ fn dispatch_dense(
             q_pe: q_pe.ptr,
             out: o.ptr,
             kv_page_indices: pool.page_indices.ptr,
-            lse: 0,
+            lse,
         },
-        false,
+        lse != 0,
     );
     mla_fa2::fire(
         ctx,
@@ -909,6 +940,7 @@ pub fn attention_decode(
     kv_lora_rank: u32,
     sm_scale: f32,
     o: &mut Tensor,
+    lse: Option<&mut Tensor>,
 ) -> Result<(), Error> {
     const OP: &str = "attention.mla_decode";
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
@@ -916,7 +948,19 @@ pub fn attention_decode(
     let rope = rope_per_head(OP, q_pe, heads)?;
     let layer = Layer::of(OP, pool, kv_lora_rank, rope)?;
     dispatch_dense(
-        ctx, OP, plan, q.data, q_pe, &layer, pool, q.indptr, heads, sm_scale, false, o,
+        ctx,
+        OP,
+        plan,
+        q.data,
+        q_pe,
+        &layer,
+        pool,
+        q.indptr,
+        heads,
+        sm_scale,
+        false,
+        o,
+        lse_plane(OP, lse, o.rows, heads)?,
     )
 }
 
@@ -931,6 +975,7 @@ pub fn attention_prefill(
     kv_lora_rank: u32,
     sm_scale: f32,
     o: &mut Tensor,
+    lse: Option<&mut Tensor>,
 ) -> Result<(), Error> {
     const OP: &str = "attention.mla_prefill";
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
@@ -938,7 +983,19 @@ pub fn attention_prefill(
     let rope = rope_per_head(OP, q_pe, heads)?;
     let layer = Layer::of(OP, pool, kv_lora_rank, rope)?;
     dispatch_dense(
-        ctx, OP, plan, q.data, q_pe, &layer, pool, q.indptr, heads, sm_scale, true, o,
+        ctx,
+        OP,
+        plan,
+        q.data,
+        q_pe,
+        &layer,
+        pool,
+        q.indptr,
+        heads,
+        sm_scale,
+        true,
+        o,
+        lse_plane(OP, lse, o.rows, heads)?,
     )
 }
 
@@ -955,6 +1012,7 @@ fn selected(
     sm_scale: f32,
     causal: bool,
     o: &mut Tensor,
+    lse: Option<&mut Tensor>,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, q.data.dtype, { Bf16 => () });
     debug_assert_eq!(selection.dtype, Dtype::I32, "the selection is i32 page ids");
@@ -974,6 +1032,7 @@ fn selected(
         ));
     }
     let num_requests = kv::lanes_of(op, q.indptr)?;
+    let lse = lse_plane(op, lse, o.rows, heads)?;
     naive::fire(
         ctx,
         op,
@@ -987,6 +1046,7 @@ fn selected(
             kv_page_indptr: pool.page_indptr.ptr,
             kv_last_page_lens: pool.last_page_lens.ptr,
             o: o.ptr,
+            lse,
             selection: selection.ptr,
         },
         naive::Shape {
@@ -1015,6 +1075,7 @@ pub fn attention_decode_selected(
     kv_lora_rank: u32,
     sm_scale: f32,
     o: &mut Tensor,
+    lse: Option<&mut Tensor>,
 ) -> Result<(), Error> {
     let _ = plan;
     selected(
@@ -1029,6 +1090,7 @@ pub fn attention_decode_selected(
         sm_scale,
         false,
         o,
+        lse,
     )
 }
 
@@ -1044,6 +1106,7 @@ pub fn attention_prefill_selected(
     kv_lora_rank: u32,
     sm_scale: f32,
     o: &mut Tensor,
+    lse: Option<&mut Tensor>,
 ) -> Result<(), Error> {
     let _ = plan;
     selected(
@@ -1058,6 +1121,7 @@ pub fn attention_prefill_selected(
         sm_scale,
         true,
         o,
+        lse,
     )
 }
 

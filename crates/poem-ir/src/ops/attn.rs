@@ -275,6 +275,7 @@ pub enum Attention {
         kv_lora_rank: u32,
         sm_scale: f32,
         o: ValueId,
+        lse: Option<ValueId>,
     },
     MlaPrefill {
         q: ValueId,
@@ -285,6 +286,7 @@ pub enum Attention {
         kv_lora_rank: u32,
         sm_scale: f32,
         o: ValueId,
+        lse: Option<ValueId>,
     },
     MlaDecodeSelected {
         q: ValueId,
@@ -296,6 +298,7 @@ pub enum Attention {
         kv_lora_rank: u32,
         sm_scale: f32,
         o: ValueId,
+        lse: Option<ValueId>,
     },
     MlaPrefillSelected {
         q: ValueId,
@@ -307,6 +310,7 @@ pub enum Attention {
         kv_lora_rank: u32,
         sm_scale: f32,
         o: ValueId,
+        lse: Option<ValueId>,
     },
 
     SsmCausalConv1d {
@@ -971,10 +975,22 @@ impl Operands for Attention {
             Self::MlaAbsorbQ { q_latent, .. } => sink.push(*q_latent),
             Self::MlaAbsorbOut { o, .. } => sink.push(*o),
             Self::MlaKvAppend { .. } => {}
-            Self::MlaDecode { o, .. } => sink.push(*o),
-            Self::MlaPrefill { o, .. } => sink.push(*o),
-            Self::MlaDecodeSelected { o, .. } => sink.push(*o),
-            Self::MlaPrefillSelected { o, .. } => sink.push(*o),
+            Self::MlaDecode { o, lse, .. } => {
+                sink.push(*o);
+                sink.extend(*lse);
+            }
+            Self::MlaPrefill { o, lse, .. } => {
+                sink.push(*o);
+                sink.extend(*lse);
+            }
+            Self::MlaDecodeSelected { o, lse, .. } => {
+                sink.push(*o);
+                sink.extend(*lse);
+            }
+            Self::MlaPrefillSelected { o, lse, .. } => {
+                sink.push(*o);
+                sink.extend(*lse);
+            }
             Self::SsmCausalConv1d { y, .. } => sink.push(*y),
             Self::ShortConv { y, .. } => sink.push(*y),
             Self::ShortConvChunked { y, .. } => sink.push(*y),

@@ -661,9 +661,20 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Attention::MlaAbsorbOut { .. } => &[],
             Attention::MlaLatentsRope { .. } => &[(In(1), I32)],
             Attention::MlaKvAppend { .. } => &[(In(2), CACHE), (In(3), I32), (In(4), I32)],
+            Attention::MlaDecode { lse: Some(_), .. }
+            | Attention::MlaPrefill { lse: Some(_), .. } => {
+                &[(In(1), MLA_PLAN), (In(3), CACHE), (Out(1), F32)]
+            }
             Attention::MlaDecode { .. } | Attention::MlaPrefill { .. } => {
                 &[(In(1), MLA_PLAN), (In(3), CACHE)]
             }
+            Attention::MlaDecodeSelected { lse: Some(_), .. }
+            | Attention::MlaPrefillSelected { lse: Some(_), .. } => &[
+                (In(1), MLA_PLAN),
+                (In(3), I32),
+                (In(4), CACHE),
+                (Out(1), F32),
+            ],
             Attention::MlaDecodeSelected { .. } | Attention::MlaPrefillSelected { .. } => {
                 &[(In(1), MLA_PLAN), (In(3), I32), (In(4), CACHE)]
             }

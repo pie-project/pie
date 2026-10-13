@@ -361,11 +361,11 @@ __global__ void lse_log2_to_ln(T* __restrict__ lse, usize n) {
     if (isfinite(v)) lse[i] = static_cast<T>(v * kLn2);
 }
 
-template <class T>
+template <class T, class S = T>
 __global__ void sink_rescale(
     T* __restrict__ o,
     const float* __restrict__ lse,
-    const T* __restrict__ sinks,
+    const S* __restrict__ sinks,
     i32 N,
     i32 num_q_heads,
     i32 head_dim,
@@ -381,7 +381,7 @@ __global__ void sink_rescale(
 
     constexpr float kLn2 = 0.69314718055994530942f;
     const float lse_val = lse[t_row * num_q_heads + h];
-    const float sink = Elem<T>::to_f32(sinks[h]);
+    const float sink = Elem<S>::to_f32(sinks[h]);
     float r;
     if (!isfinite(lse_val)) {
 

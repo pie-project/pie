@@ -60,6 +60,7 @@ __global__ void hc_gates(
     float hc_eps,
     float hc_post_alpha,
     int sinkhorn_iters,
+    bool combined,
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
@@ -70,7 +71,10 @@ __global__ void hc_gates(
 
     const int tid = threadIdx.x;
 
-    const int mix_hc = M * 2 + M * M;
+    // Without a combine (the independent form) the row is the pre and post
+    // logits alone, the post gate carries the eps the pre gate does, and the
+    // combine is the identity.
+    const int mix_hc = combined ? M * 2 + M * M : M * 2;
     const float* row = mixes + static_cast<long long>(plane_row) * mix_hc;
 
     __shared__ float pre[MAX_HC_MULT];
@@ -85,10 +89,27 @@ __global__ void hc_gates(
     if (tid < M) {
 
         const float logit = row[M + tid] * scale[1] + base[M + tid];
-        post[tid] = 1.f / (1.f + expf(-logit)) * hc_post_alpha;
+        post[tid] = 1.f / (1.f + expf(-logit)) * hc_post_alpha + (combined ? 0.f : hc_eps);
         post_mix[static_cast<long long>(plane_row) * M + tid] = post[tid];
     }
     __syncthreads();
+
+    if (!combined) {
+        if (tid < M * M) {
+            comb_mix[static_cast<long long>(plane_row) * M * M + tid] =
+                (tid / M == tid % M) ? 1.f : 0.f;
+        }
+        const T* res_n = residual + static_cast<long long>(plane_row) * M * H;
+        T* out = layer_input + static_cast<long long>(plane_row) * H;
+        for (int h = tid; h < H; h += blockDim.x) {
+            float acc = 0.f;
+            for (int i = 0; i < M; ++i) {
+                acc += pre[i] * Elem<T>::to_f32(res_n[i * H + h]);
+            }
+            out[h] = Elem<T>::from_f32(acc);
+        }
+        return;
+    }
 
     if (tid < M * M) {
         const float logit = row[2 * M + tid] * scale[2] + base[2 * M + tid];

@@ -1126,6 +1126,156 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "attn",
+        name: "mla_decode_lse",
+        params: &[
+            "q",
+            "plan",
+            "q_pe",
+            "pages",
+            "heads",
+            "kv_lora_rank",
+            "sm_scale",
+        ],
+        call: |a, heap| {
+            let q: Value = a.next()?;
+            let plan: Value = a.next()?;
+            let q_pe: Value = a.next()?;
+            let pages: ValueId = a.next()?;
+            let heads: u32 = a.next()?;
+            let kv_lora_rank: u32 = a.next()?;
+            let sm_scale: f32 = a.next()?;
+            result(
+                heap,
+                dsl("attn.mla_decode_lse", || {
+                    ops::attn::mla_decode_lse(
+                        &q,
+                        &plan,
+                        &q_pe,
+                        pages,
+                        heads,
+                        kv_lora_rank,
+                        sm_scale,
+                    )
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "attn",
+        name: "mla_prefill_lse",
+        params: &[
+            "q",
+            "plan",
+            "q_pe",
+            "pages",
+            "heads",
+            "kv_lora_rank",
+            "sm_scale",
+        ],
+        call: |a, heap| {
+            let q: Value = a.next()?;
+            let plan: Value = a.next()?;
+            let q_pe: Value = a.next()?;
+            let pages: ValueId = a.next()?;
+            let heads: u32 = a.next()?;
+            let kv_lora_rank: u32 = a.next()?;
+            let sm_scale: f32 = a.next()?;
+            result(
+                heap,
+                dsl("attn.mla_prefill_lse", || {
+                    ops::attn::mla_prefill_lse(
+                        &q,
+                        &plan,
+                        &q_pe,
+                        pages,
+                        heads,
+                        kv_lora_rank,
+                        sm_scale,
+                    )
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "attn",
+        name: "mla_decode_selected_lse",
+        params: &[
+            "q",
+            "plan",
+            "q_pe",
+            "selection",
+            "pages",
+            "heads",
+            "kv_lora_rank",
+            "sm_scale",
+        ],
+        call: |a, heap| {
+            let q: Value = a.next()?;
+            let plan: Value = a.next()?;
+            let q_pe: Value = a.next()?;
+            let selection: Value = a.next()?;
+            let pages: ValueId = a.next()?;
+            let heads: u32 = a.next()?;
+            let kv_lora_rank: u32 = a.next()?;
+            let sm_scale: f32 = a.next()?;
+            result(
+                heap,
+                dsl("attn.mla_decode_selected_lse", || {
+                    ops::attn::mla_decode_selected_lse(
+                        &q,
+                        &plan,
+                        &q_pe,
+                        &selection,
+                        pages,
+                        heads,
+                        kv_lora_rank,
+                        sm_scale,
+                    )
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "attn",
+        name: "mla_prefill_selected_lse",
+        params: &[
+            "q",
+            "plan",
+            "q_pe",
+            "selection",
+            "pages",
+            "heads",
+            "kv_lora_rank",
+            "sm_scale",
+        ],
+        call: |a, heap| {
+            let q: Value = a.next()?;
+            let plan: Value = a.next()?;
+            let q_pe: Value = a.next()?;
+            let selection: Value = a.next()?;
+            let pages: ValueId = a.next()?;
+            let heads: u32 = a.next()?;
+            let kv_lora_rank: u32 = a.next()?;
+            let sm_scale: f32 = a.next()?;
+            result(
+                heap,
+                dsl("attn.mla_prefill_selected_lse", || {
+                    ops::attn::mla_prefill_selected_lse(
+                        &q,
+                        &plan,
+                        &q_pe,
+                        &selection,
+                        pages,
+                        heads,
+                        kv_lora_rank,
+                        sm_scale,
+                    )
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "attn",
         name: "index_layernorm_rope",
         params: &["k", "positions", "norm", "eps", "bias", "rope_dim", "theta"],
         call: |a, heap| {
@@ -2184,6 +2334,42 @@ pub(crate) static OPS: &[Op] = &[
                         gate_eps,
                         alpha,
                         sinkhorn,
+                    )
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "elemwise",
+        name: "hc_gates_independent",
+        params: &[
+            "mixes",
+            "streams",
+            "scale",
+            "base",
+            "stream_count",
+            "gate_eps",
+            "alpha",
+        ],
+        call: |a, heap| {
+            let mixes: Value = a.next()?;
+            let streams: Value = a.next()?;
+            let scale: Weight = a.next()?;
+            let base: Weight = a.next()?;
+            let stream_count: u32 = a.next()?;
+            let gate_eps: f32 = a.next()?;
+            let alpha: f32 = a.next()?;
+            result(
+                heap,
+                dsl("elemwise.hc_gates_independent", || {
+                    ops::elemwise::hc_gates_independent(
+                        &mixes,
+                        &streams,
+                        &scale,
+                        &base,
+                        stream_count,
+                        gate_eps,
+                        alpha,
                     )
                 })?,
             )
