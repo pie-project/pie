@@ -24,6 +24,6 @@ pub use trace::{
     BlockDrafter, CacheRow, Node, Param, ParamLayout, ParamSource, Platform, Seam, Shard, Trace,
 };
 pub use value::{
-    BIASES, Def, Dim, Dtype, GeomKind, PerAxis, RowAxis, RuntimeInput, SCALES, Selection,
-    StructKind, TILED_BAND, TILED_STEP, Ty, ValueDecl, ValueId,
+    BIASES, Def, Dim, Dtype, GLOBAL_SCALES, GeomKind, INPUT_SCALES, PerAxis, RowAxis, RuntimeInput,
+    SCALES, Selection, StructKind, TILED_BAND, TILED_STEP, Ty, ValueDecl, ValueId,
 };

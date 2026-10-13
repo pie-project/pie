@@ -582,6 +582,13 @@ fn pairings<'a>(
                           point this shell stamps reads them in the width they are stored",
                 });
             }
+            ScaleForm::E4m3TensorScaled => {
+                return Err(Fault::Param {
+                    name: (*name).to_string(),
+                    why: "is an NVFP4 bank (e4m3 scales under per-row tensor scales), and \
+                          no point this shell stamps reads one; it serves on cuda",
+                });
+            }
         };
 
         let biases = match (attachment.scale_form, attachment.zero_point_tensor) {

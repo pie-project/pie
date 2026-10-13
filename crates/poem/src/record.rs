@@ -631,9 +631,12 @@ fn restated(shard: &Shard, logical: &[u64], plane: &[u64], name: &str) -> Shard 
     };
     let at = *axis as usize;
     let whole = logical[at];
-    let stored = *plane.get(at).unwrap_or_else(|| {
-        panic!("`{name}` stores {plane:?} and its cut names axis {at} of {logical:?}")
-    });
+    // A plane that stops short of the cut axis (an nvfp4 bank's per-row
+    // and per-expert scales under a cut of its contracted axis) is held
+    // whole by every rank.
+    let Some(&stored) = plane.get(at) else {
+        return Shard::Replicated;
+    };
     assert_eq!(
         logical[..at],
         plane[..at],

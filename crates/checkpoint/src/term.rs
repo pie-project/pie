@@ -1,5 +1,5 @@
 use dtype::Dtype;
-use dtype::{BIASES, Elem, Fmt, Group, Off, SCALES, spells};
+use dtype::{BIASES, Elem, Fmt, GLOBAL_SCALES, Group, Off, SCALES, spells};
 use ztensor::{Group as ZGroup, Leaf, Offset, Plane, Term};
 
 use crate::error::Error;
@@ -159,6 +159,13 @@ impl QuantSpec {
             // through a ztensor term (that grammar has no ternary), so `term_of`
             // leaves the served block untyped and self-contained, like the lattices.
             QuantScheme::Ptq1_0 => *Dtype::Ptq1_0.repr(),
+
+            QuantScheme::Nvfp4E2M1E4M3 => {
+                if bits != 4 || group != 16 {
+                    return None;
+                }
+                *Dtype::Nvfp4.repr()
+            }
         })
     }
 
@@ -255,6 +262,23 @@ pub fn spec_of_canonical(term: &Term) -> Option<QuantSpec> {
     else {
         return None;
     };
+    if let (ZGroup::N(16), Leaf::E2M1, Offset::None) = (group, code, offset)
+        && let Term::Group {
+            group: ZGroup::Row,
+            code: Leaf::E4M3,
+            gain: tensor,
+            offset: Offset::None,
+        } = gain.as_ref()
+        && tensor.leaf() == Some(Leaf::F32)
+    {
+        return Some(QuantSpec {
+            scheme: QuantScheme::Nvfp4E2M1E4M3,
+            logical_dtype: Dtype::Bf16,
+            bits_per_element: 4,
+            group_size: 16,
+            channel_axis: None,
+        });
+    }
     let gain_leaf = gain.leaf()?;
     let offset_leaf = match offset {
         Offset::None => None,
@@ -347,7 +371,8 @@ pub fn blob_planes(
 pub fn plane_name(object: &str, path: &str) -> String {
     match path {
         "data" | "code" => object.to_string(),
-        "gain" => format!("{object}{SCALES}"),
+        "gain" | "gain.code" => format!("{object}{SCALES}"),
+        "gain.gain" => format!("{object}{GLOBAL_SCALES}"),
         "offset" => format!("{object}{BIASES}"),
         other => format!("{object}.{other}"),
     }
@@ -358,9 +383,67 @@ pub fn plane_of(name: &str) -> Vec<(String, &'static str)> {
     let mut out = vec![(name.to_string(), "code")];
     if let Some(object) = name.strip_suffix(SCALES) {
         out.push((object.to_string(), "gain"));
+        out.push((object.to_string(), "gain.code"));
+    }
+    if let Some(object) = name.strip_suffix(GLOBAL_SCALES) {
+        out.push((object.to_string(), "gain.gain"));
     }
     if let Some(object) = name.strip_suffix(BIASES) {
         out.push((object.to_string(), "offset"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nvfp4(group: u32) -> QuantSpec {
+        QuantSpec {
+            scheme: QuantScheme::Nvfp4E2M1E4M3,
+            logical_dtype: Dtype::Bf16,
+            bits_per_element: 4,
+            group_size: group,
+            channel_axis: None,
+        }
+    }
+
+    #[test]
+    fn an_nvfp4_object_names_its_two_gains_and_reads_back_as_itself() {
+        use crate::types::Encoding;
+        let term = term_of(&Encoding::Quant(nvfp4(16)))
+            .expect("an nvfp4 weight is a type the container states");
+        let planes = term.planes(&[8, 64, 256]).expect("a bank's planes lay out");
+        let laid: Vec<(&str, Vec<u64>)> = planes
+            .iter()
+            .map(|plane| (plane.path.as_str(), plane.shape.clone()))
+            .collect();
+        assert_eq!(
+            laid,
+            vec![
+                ("code", vec![8, 64, 256]),
+                ("gain.code", vec![8, 64, 16]),
+                ("gain.gain", vec![8, 64]),
+            ],
+            "codes, an e4m3 per 16 of them, an f32 per row"
+        );
+        let names: Vec<String> = ["code", "gain.code", "gain.gain"]
+            .into_iter()
+            .map(|path| plane_name("w", path))
+            .collect();
+        assert_eq!(names, ["w", "w.scales", "w.global_scales"]);
+        assert!(
+            plane_of("w.global_scales").contains(&("w".to_string(), "gain.gain")),
+            "a tensor scale plane is found under its object"
+        );
+        assert!(plane_of("w.scales").contains(&("w".to_string(), "gain.code")));
+        let read = spec_of_canonical(&term).expect("the term reads back");
+        assert_eq!(read.scheme, QuantScheme::Nvfp4E2M1E4M3);
+        assert_eq!((read.bits_per_element, read.group_size), (4, 16));
+        assert_eq!(
+            nvfp4(32).term(),
+            None,
+            "NVFP4 groups sixteen codes and no other count"
+        );
+    }
 }

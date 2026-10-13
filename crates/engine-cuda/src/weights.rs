@@ -122,7 +122,7 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
             let (rows, width) = rectangle(&param.shape);
             Ok(match param.dtype {
                 Dtype::Mxfp4 => rows.saturating_mul(width),
-                Dtype::U4g64 | Dtype::U4g32 | Dtype::U4g64tiled => {
+                Dtype::U4g64 | Dtype::U4g32 | Dtype::U4g64tiled | Dtype::Nvfp4 => {
                     rows.saturating_mul(width).div_ceil(2)
                 }
                 Dtype::U2g32 | Dtype::U2g64 | Dtype::U2g128 => {
@@ -664,12 +664,22 @@ fn pairings<'a>(
                 "is an affine bank whose zero points this plan does not publish as a \
                  param of their own",
             )?),
+            ScaleForm::E4m3TensorScaled => Some(row(
+                attachment.zero_point_tensor.ok_or_else(|| Fault::Param {
+                    name: (*name).to_string(),
+                    why: "is an NVFP4 bank whose attachment names no tensor scales; its \
+                          e4m3 scales are half of each weight",
+                })?,
+                "is an NVFP4 bank whose tensor scales this plan does not publish as a \
+                 param of their own",
+            )?),
             ScaleForm::F32Factors => {
                 return Err(Fault::Param {
                     name: (*name).to_string(),
                     why: "carries a scale form no point this shell stamps reads: the \
                           cuda plane's split-plane banks are mxfp4 codes under raw \
-                          e8m0 exponents and MLX affine codes under bf16 factor pairs",
+                          e8m0 exponents, MLX affine codes under bf16 factor pairs and \
+                          NVFP4 codes under e4m3 scales and f32 tensor scales",
                 });
             }
         };
@@ -1146,7 +1156,7 @@ fn packed(
     let place = places[param];
     let width = match place.dtype {
         Dtype::Mxfp4 => place.width,
-        Dtype::U4g64 | Dtype::U4g32 | Dtype::U4g64tiled => place.width.div_ceil(2),
+        Dtype::U4g64 | Dtype::U4g32 | Dtype::U4g64tiled | Dtype::Nvfp4 => place.width.div_ceil(2),
         Dtype::U2g32 | Dtype::U2g64 | Dtype::U2g128 => place.width.div_ceil(4),
         Dtype::U8g64 => place.width,
         other => poem_compiler::arena::elem_bytes(other)
@@ -1157,11 +1167,18 @@ fn packed(
                 why: "is a packed plane in a storage element that has no element size",
             })?,
     };
+    // NVFP4 codes keep their dtype, which is how a select tells their
+    // e4m3 scales and tensor scales from an affine bank's factor pair.
+    let marked = if place.dtype == Dtype::Nvfp4 {
+        Dtype::Nvfp4
+    } else {
+        Dtype::U8
+    };
     Ok(Tensor::new(
         address(tier, store, place.offset, param)?,
         place.rows,
         width,
-        Dtype::U8,
+        marked,
     ))
 }
 

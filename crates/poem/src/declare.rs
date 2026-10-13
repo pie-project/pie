@@ -1,5 +1,6 @@
 use poem_ir::{
-    BIASES, Dtype, Param, ParamLayout, ParamSource, Platform, SCALES, Shard, TILED_BAND, TILED_STEP,
+    BIASES, Dtype, GLOBAL_SCALES, INPUT_SCALES, Param, ParamLayout, ParamSource, Platform, SCALES,
+    Shard, TILED_BAND, TILED_STEP,
 };
 
 #[derive(Clone, Debug)]
@@ -257,7 +258,44 @@ impl Weight {
                     },
                 ]
             }
-            Dtype::Nvfp4 | Dtype::E4m3row | Dtype::E4m3tile128 | Dtype::KvU4 => panic!(
+            Dtype::Nvfp4 => {
+                let (&k, lead) = self
+                    .shape
+                    .split_last()
+                    .expect("an nvfp4 bank's logical shape ends in its contracted axis");
+                assert!(
+                    k % 16 == 0,
+                    "`{}` is an nvfp4 bank contracting over {k}, which is not a whole \
+                     number of 16-code groups",
+                    self.name,
+                );
+                let mut scales = lead.to_vec();
+                scales.push(k / 16);
+                let slabs = lead.split_last().map_or(&[][..], |(_, slabs)| slabs);
+                vec![
+                    BankPlane {
+                        suffix: "",
+                        shape: self.shape.clone(),
+                        dtype: Dtype::Nvfp4,
+                    },
+                    BankPlane {
+                        suffix: SCALES,
+                        shape: scales,
+                        dtype: Dtype::E4m3,
+                    },
+                    BankPlane {
+                        suffix: GLOBAL_SCALES,
+                        shape: lead.to_vec(),
+                        dtype: Dtype::F32,
+                    },
+                    BankPlane {
+                        suffix: INPUT_SCALES,
+                        shape: slabs.to_vec(),
+                        dtype: Dtype::F32,
+                    },
+                ]
+            }
+            Dtype::E4m3row | Dtype::E4m3tile128 | Dtype::KvU4 => panic!(
                 "`{}`: {} is served but not yet a weight representation a \
                  model text declares",
                 self.name, self.dtype
@@ -413,6 +451,16 @@ pub fn scales_name(of: &str) -> String {
 #[must_use]
 pub fn biases_name(of: &str) -> String {
     format!("{of}{BIASES}")
+}
+
+#[must_use]
+pub fn global_scales_name(of: &str) -> String {
+    format!("{of}{GLOBAL_SCALES}")
+}
+
+#[must_use]
+pub fn input_scales_name(of: &str) -> String {
+    format!("{of}{INPUT_SCALES}")
 }
 
 #[must_use]
