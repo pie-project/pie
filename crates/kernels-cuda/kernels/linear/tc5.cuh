@@ -25,7 +25,17 @@
 // both, and each drains its own half of D. Both CTAs' loads complete rank
 // 0's barriers; rank 0's commits arrive in both.
 //
-// Kinds:  0  bf16 x bf16             kind::f16           K 64 a stage
+// Grouped (kGroup, a mixture of experts' bank of weights [E][n_per][K]):
+//   1  contiguous: the activation's rows sorted by expert, expert e's at
+//      [group[e], group[e+1]), each start a multiple of 128 (pad rows are
+//      computed and land, unread). P is the activation, tiles never cross
+//      an expert.
+//   2  masked: expert e's rows at [e * m_max, e * m_max + group[e]) of a
+//      [E * m_max] activation, its scales in row blocks padded per expert
+//      to whole 128s. Swapped: P is the expert's weight, Q its few rows.
+// alpha_e, when given, scales expert e's product too.
+//
+// Kinds:  0  bf16 x bf16            kind::f16           K 64 a stage
 //         1  fp8 x fp8               kind::f8f6f4        K 128
 //         2  {e4m3, e2m1} x {..}     kind::mxf8f6f4      K 128, ue8m0 scales
 //         3  nvfp4 x nvfp4           kind::mxf4nvf4      K 256, ue4m3 scales a 16
@@ -59,16 +69,20 @@ __host__ __device__ constexpr unsigned pow2_cols(unsigned n) {
 }  // namespace tc5k
 
 template <int kKind, int kFmtP, int kFmtQ, int kGranP, int kGranQ, int kBN, int kStages,
-          int kSwap, int kPair>
+          int kSwap, int kPair, int kGroup>
 __global__ __launch_bounds__(224, 1) void tc5_gemm(
     const __grid_constant__ tc5::TmaMap map_p, const __grid_constant__ tc5::TmaMap map_q,
     const __grid_constant__ tc5::TmaMap map_y, const __grid_constant__ tc5::TmaMap map_sfp,
     const __grid_constant__ tc5::TmaMap map_sfq, bf16* __restrict__ y, int rows_p, int rows_q,
-    int k, int ldy, float alpha, float* __restrict__ part, int splits) {
+    int k, int ldy, float alpha, float* __restrict__ part, int splits,
+    const int* __restrict__ group, int experts, int n_per, int m_max,
+    const float* __restrict__ alpha_e) {
     using namespace tc5;
     static_assert(kBN % 32 == 0 && kBN >= 32 && kBN <= 256, "the Q tile is 32..256 rows");
     static_assert(kKind >= 0 && kKind <= 3, "four kinds");
     static_assert(kPair == 1 || (kPair == 2 && !kSwap && kBN >= 64), "a pair splits a wide Q");
+    static_assert(kGroup == 0 || (kPair == 1 && (kGroup == 1) == !kSwap),
+                  "contiguous groups run unswapped, masked swapped, both on lone CTAs");
 
     constexpr u32 kM = 128 * kPair;
     constexpr u32 kQRows = kBN / kPair;
@@ -175,29 +189,111 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     tc_fence_after();
     const u32 tmem = *tmem_slot;
 
-    const int num_p = (rows_p + static_cast<int>(kM) - 1) / static_cast<int>(kM);
-    const int num_q = (rows_q + kBN - 1) / kBN;
+    // Tiles along P and Q (of one expert, when grouped), and the experts.
+    const int num_p = kGroup == 2 ? (n_per + 127) / 128
+                                  : (rows_p + static_cast<int>(kM) - 1) / static_cast<int>(kM);
+    const int num_q = kGroup == 0 ? (rows_q + kBN - 1) / kBN
+                      : kGroup == 1 ? (n_per + kBN - 1) / kBN
+                                    : (m_max + kBN - 1) / kBN;
     const int num_kb = (k + static_cast<int>(kStageK) - 1) / static_cast<int>(kStageK);
     // A unit is one tile's share of K: `splits` of them a tile when a
     // decode's few tiles would leave SMs idle, summed in f32 at `part`.
     const int kb_per = (num_kb + splits - 1) / splits;
-    const int tiles = num_p * num_q * splits;
+    const int tiles = num_p * num_q * splits * (kGroup == 2 ? experts : 1);
     const int first_tile = static_cast<int>(blockIdx.x) / kPair;
     const int tile_step = static_cast<int>(gridDim.x) / kPair;
 
-    // Groups of 8 P tiles walk Q together, so a wave shares both operands.
-    auto tile_of = [&](int u, int& pt, int& qt, int& kb0, int& kb1) {
-        constexpr int kGroup = 8;
+    // Where a unit reads and lands. D's tile-local [i][j] lands at y[out_p
+    // + i][out_q + j] unswapped, y[out_q + j][out_p + i] swapped, for i <
+    // lim_p and j < lim_q.
+    struct Unit {
+        int p_row, q_row, p_block, q_block;
+        u32 quarter;
+        int kb0, kb1;
+        float alpha;
+        int out_p, out_q, lim_p, lim_q;
+    };
+    // Every role walks the same units and skips the same empty ones (a
+    // contiguous tile past the routed rows, a masked tile past its count).
+    auto unit_of = [&](int u, Unit& x) -> bool {
         const int t = u / splits;
         const int ks = u - t * splits;
-        kb0 = ks * kb_per;
-        kb1 = min(num_kb, kb0 + kb_per);
-        const int group = t / (kGroup * num_q);
-        const int first = group * kGroup;
-        const int size = min(num_p - first, kGroup);
-        const int r = t - group * kGroup * num_q;
-        pt = first + r % size;
-        qt = r / size;
+        x.kb0 = ks * kb_per;
+        x.kb1 = min(num_kb, x.kb0 + kb_per);
+        x.alpha = alpha;
+        int e = 0, pt, qt;
+        if constexpr (kGroup == 2) {
+            e = t / (num_p * num_q);
+            const int r = t - e * num_p * num_q;
+            pt = r / num_q;
+            qt = r - pt * num_q;
+        } else {
+            // Groups of 8 P tiles walk Q together, so a wave shares both
+            // operands.
+            constexpr int kRaster = 8;
+            const int band = t / (kRaster * num_q);
+            const int first = band * kRaster;
+            const int size = min(num_p - first, kRaster);
+            const int r = t - band * kRaster * num_q;
+            pt = first + r % size;
+            qt = r / size;
+        }
+        if constexpr (kGroup == 0) {
+            x.p_row = pt * static_cast<int>(kM);
+            x.q_row = qt * kBN;
+            x.p_block = pt * kPair;
+            x.out_p = x.p_row;
+            x.out_q = x.q_row;
+            x.lim_p = rows_p - x.p_row;
+            x.lim_q = rows_q - x.q_row;
+        } else if constexpr (kGroup == 1) {
+            x.p_row = pt * 128;
+            if (x.p_row >= __ldg(&group[experts])) {
+                return false;
+            }
+            int lo = 0, hi = experts - 1;
+            while (lo < hi) {
+                const int mid = (lo + hi + 1) / 2;
+                if (__ldg(&group[mid]) <= x.p_row) {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            e = lo;
+            if (__ldg(&group[e]) % 128 != 0) {
+                asm volatile("trap;");
+            }
+            x.q_row = e * n_per + qt * kBN;
+            x.p_block = pt;
+            x.out_p = x.p_row;
+            x.out_q = qt * kBN;
+            x.lim_p = 128;
+            x.lim_q = n_per - qt * kBN;
+        } else {
+            const int count = __ldg(&group[e]);
+            if (qt * kBN >= count) {
+                return false;
+            }
+            x.p_row = e * n_per + pt * 128;
+            x.q_row = e * m_max + qt * kBN;
+            x.p_block = x.p_row / 128;
+            x.out_p = pt * 128;
+            x.out_q = x.q_row;
+            x.lim_p = n_per - pt * 128;
+            x.lim_q = count - qt * kBN;
+        }
+        // A Q tile narrower than its 128-row scale atom reads the atom's
+        // columns from its own 32-row quarter on; masked rows' scales are
+        // padded to whole row blocks an expert.
+        const int q_scale_row =
+            kGroup == 2 ? e * ((m_max + 127) / 128) * 128 + qt * kBN : x.q_row;
+        x.q_block = q_scale_row / 128;
+        x.quarter = static_cast<u32>(q_scale_row % 128) / 32;
+        if (kGroup != 0 && alpha_e != nullptr) {
+            x.alpha *= __ldg(&alpha_e[e]);
+        }
+        return true;
     };
 
     // Every arrival a pair counts lands on rank 0's barrier.
@@ -220,11 +316,13 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
         if (lane == 0) {
             u32 s = 0, phase = 0;
             for (int t = first_tile; t < tiles; t += tile_step) {
-                int pt, qt, kb0, kb1;
-                tile_of(t, pt, qt, kb0, kb1);
-                const int p0 = pt * static_cast<int>(kM) + static_cast<int>(rank) * 128;
-                const int q0 = qt * kBN + static_cast<int>(rank * kQRows);
-                for (int kb = kb0; kb < kb1; ++kb) {
+                Unit x;
+                if (!unit_of(t, x)) {
+                    continue;
+                }
+                const int p0 = x.p_row + static_cast<int>(rank) * 128;
+                const int q0 = x.q_row + static_cast<int>(rank * kQRows);
+                for (int kb = x.kb0; kb < x.kb1; ++kb) {
                     bar_wait(&empty[s], phase ^ 1);
                     if (leader) {
                         bar_arrive_expect_tx(&full[s], kTx);
@@ -241,8 +339,8 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                     if constexpr (kScaled) {
                         const int atom_p = static_cast<int>(kb * kStageK / kGranP / 4);
                         const int atom_q = static_cast<int>(kb * kStageK / kGranQ / 4);
-                        const int block_p = pt * kPair + static_cast<int>(rank);
-                        const int block_q = qt * kBN / 128;
+                        const int block_p = x.p_block + static_cast<int>(rank);
+                        const int block_q = x.q_block;
                         unsigned char* sf_p = smem + kOffSfP + s * kSfP;
                         unsigned char* sf_q = smem + kOffSfQ + s * kSfQ;
                         if constexpr (kPair == 2) {
@@ -268,9 +366,11 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
         if (kScaled && lane == 0 && leader) {
             u32 s = 0, phase = 0, step = 0;
             for (int t = first_tile; t < tiles; t += tile_step) {
-                int pt, qt, kb0, kb1;
-                tile_of(t, pt, qt, kb0, kb1);
-                for (int kb = kb0; kb < kb1; ++kb, ++step) {
+                Unit x;
+                if (!unit_of(t, x)) {
+                    continue;
+                }
+                for (int kb = x.kb0; kb < x.kb1; ++kb, ++step) {
                     const u32 slot = step % kSfSlots;
                     bar_wait(&sf_free[slot], ((step / kSfSlots) & 1) ^ 1);
                     bar_wait(&full[s], phase);
@@ -300,17 +400,18 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
         if (lane == 0 && leader) {
             u32 s = 0, phase = 0, step = 0;
             int it = 0;
-            for (int t = first_tile; t < tiles; t += tile_step, ++it) {
-                int pt, qt, kb0, kb1;
-                tile_of(t, pt, qt, kb0, kb1);
+            for (int t = first_tile; t < tiles; t += tile_step) {
+                Unit x;
+                if (!unit_of(t, x)) {
+                    continue;
+                }
+                const int kb0 = x.kb0;
                 const u32 acc = static_cast<u32>(it) % 2;
                 bar_wait(&tempty[acc], ((static_cast<u32>(it) / 2) & 1) ^ 1);
                 tc_fence_after();
                 const u32 d = tmem + acc * kStride;
-                // A Q tile narrower than its 128-row scale atom reads the
-                // atom's columns from its own 32-row quarter on.
-                const u32 quarter_q = static_cast<u32>(qt * kBN % 128) / 32;
-                for (int kb = kb0; kb < kb1; ++kb, ++step) {
+                const u32 quarter_q = x.quarter;
+                for (int kb = kb0; kb < x.kb1; ++kb, ++step) {
                     bar_wait(&full[s], phase);
                     const u32 slot = step % kSfSlots;
                     if constexpr (kScaled) {
@@ -369,6 +470,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                     }
                 }
                 commit(&tfull[acc]);
+                ++it;
             }
             // Both CTAs' epilogues have read the last accumulator, so every
             // commit has landed before either CTA retires its barriers.
@@ -381,15 +483,20 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
         int it = 0;
         const u32 row = warp * 32 + lane;
         u32 out_buf = 0;
-        for (int t = first_tile; t < tiles; t += tile_step, ++it) {
-            int pt, qt;
-            int kb0, kb1;
-            tile_of(t, pt, qt, kb0, kb1);
+        for (int t = first_tile; t < tiles; t += tile_step) {
+            Unit x;
+            if (!unit_of(t, x)) {
+                continue;
+            }
             const u32 acc = static_cast<u32>(it) % 2;
             bar_wait(&tfull[acc], (static_cast<u32>(it) / 2) & 1);
             tc_fence_after();
-            const int p_block = pt * static_cast<int>(kM) + static_cast<int>(rank) * 128;
-            const int p = p_block + static_cast<int>(row);
+            ++it;
+            const float alpha = x.alpha;
+            // This thread's tile-local P row, and where it lands.
+            const int i = static_cast<int>(rank * 128 + row);
+            const bool live = i < x.lim_p;
+            const int p = x.out_p + i;
             const u32 taddr = tmem + acc * kStride + ((warp * 32) << 16);
             // The shared columns go first: stage 0 drains tail first, stage
             // 1 head first, and the next tile's MMA starts once they are read.
@@ -414,22 +521,23 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                         arrive_leader(&tempty[acc]);
                     }
                 }
-                const int q0 = qt * kBN + static_cast<int>(c0);
+                const int j0 = static_cast<int>(c0);
+                const int q0 = x.out_q + j0;
                 if constexpr (kSwap) {
                     // A warp's lanes are 32 consecutive weight rows: each
                     // column is one coalesced 64-byte run of y.
-                    if (p < rows_p && splits > 1) {
+                    if (live && splits > 1) {
 #pragma unroll
                         for (int j = 0; j < 32; ++j) {
-                            if (q0 + j < rows_q) {
+                            if (j0 + j < x.lim_q) {
                                 red_add(part + static_cast<size_t>(q0 + j) * ldy + p,
                                         __uint_as_float(v[j]) * alpha);
                             }
                         }
-                    } else if (p < rows_p) {
+                    } else if (live) {
 #pragma unroll
                         for (int j = 0; j < 32; ++j) {
-                            if (q0 + j < rows_q) {
+                            if (j0 + j < x.lim_q) {
                                 y[static_cast<size_t>(q0 + j) * ldy + p] =
                                     f32_to_bf16(__uint_as_float(v[j]) * alpha);
                             }
@@ -437,11 +545,11 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                     }
                 } else if (splits > 1) {
                     // A thread's 32 sums of its row, four at a time.
-                    if (p < rows_p) {
+                    if (live) {
                         float* at = part + static_cast<size_t>(p) * ldy + q0;
 #pragma unroll
                         for (int j = 0; j < 32; j += 4) {
-                            if (q0 + j < rows_q) {
+                            if (j0 + j < x.lim_q) {
                                 red_add4(at + j, __uint_as_float(v[j]) * alpha,
                                          __uint_as_float(v[j + 1]) * alpha,
                                          __uint_as_float(v[j + 2]) * alpha,
@@ -474,7 +582,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                     fence_async_shared();
                     __syncwarp();
                     if (lane == 0) {
-                        tma_store_2d(&map_y, box, q0, p_block + static_cast<int>(warp) * 32);
+                        tma_store_2d(&map_y, box, q0, x.out_p + static_cast<int>(rank * 128 + warp * 32));
                         bulk_commit();
                     }
                     out_buf ^= 1;
@@ -505,6 +613,38 @@ __global__ __launch_bounds__(256) void tc5_finalize(const float4* __restrict__ p
     if (i < quads) {
         const float4 v = part[i];
         y[i] = make_uint2(pack_bf16x2(v.x, v.y), pack_bf16x2(v.z, v.w));
+    }
+}
+
+// A grouped split-K sum's routed rows (below group[experts] when contiguous,
+// under each count when masked): zeroed before the GEMM (y absent), rounded
+// to y after it. A block a row of `n`.
+__global__ __launch_bounds__(128) void tc5_zero_routed(float4* __restrict__ part,
+                                                       uint2* __restrict__ y,
+                                                       const int* __restrict__ counts,
+                                                       int experts, int m_max, int n) {
+    const int row = static_cast<int>(blockIdx.x);
+    if (m_max == 0 ? row >= __ldg(&counts[experts]) : row % m_max >= __ldg(&counts[row / m_max])) {
+        return;
+    }
+    float4* at = part + static_cast<size_t>(row) * (n / 4);
+    for (int i = static_cast<int>(threadIdx.x); i < n / 4; i += blockDim.x) {
+        at[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+    }
+}
+
+__global__ __launch_bounds__(128) void tc5_finalize_routed(const float4* __restrict__ part,
+                                                           uint2* __restrict__ y,
+                                                           const int* __restrict__ counts,
+                                                           int experts, int m_max, int n) {
+    const int row = static_cast<int>(blockIdx.x);
+    if (m_max == 0 ? row >= __ldg(&counts[experts]) : row % m_max >= __ldg(&counts[row / m_max])) {
+        return;
+    }
+    const size_t base = static_cast<size_t>(row) * (n / 4);
+    for (int i = static_cast<int>(threadIdx.x); i < n / 4; i += blockDim.x) {
+        const float4 v = part[base + i];
+        y[base + i] = make_uint2(pack_bf16x2(v.x, v.y), pack_bf16x2(v.z, v.w));
     }
 }
 

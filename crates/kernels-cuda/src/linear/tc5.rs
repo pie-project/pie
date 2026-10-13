@@ -361,6 +361,227 @@ pub fn gemm_with(
     if m == 0 || n == 0 {
         return Ok(());
     }
+    let kind = admit(act, w, n, k, plan)?;
+    let (p, q) = if plan.swap { (w, act) } else { (act, w) };
+    let (rows_p, rows_q) = if plan.swap { (n, m) } else { (m, n) };
+    let ctas = if plan.pair { 2 } else { 1 };
+    launch(
+        ctx,
+        Job {
+            kind,
+            plan,
+            p,
+            q,
+            rows: [rows_p, rows_q],
+            scale_rows: [rows_p, rows_q],
+            y_rows: m,
+            tiles: rows_p.div_ceil(128 * ctas) * rows_q.div_ceil(plan.bn),
+            group: Group::NONE,
+        },
+        y,
+        [n, k],
+        alpha,
+    )
+}
+
+/// How a grouped GEMM's activation rows meet a bank of `experts` weights
+/// `[experts][n][k]` (each expert's scales atoms of its own whole row blocks,
+/// so `n` is a multiple of 128 for a scaled kind).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Groups {
+    /// The prefill layout: rows sorted by expert, expert e's rows at
+    /// `[offsets[e], offsets[e + 1])` of a `rows`-row activation (and of
+    /// `y`, `rows x n`). `offsets` is a device `i32[experts + 1]`, every
+    /// entry a multiple of [`GROUP_ALIGN`]; the pad rows between experts
+    /// are computed and land, unread. Rows past `offsets[experts]` are not
+    /// touched.
+    Contiguous { offsets: u64, rows: u32 },
+    /// The decode layout: expert e's rows at `[e * m_max, e * m_max +
+    /// counts[e])` of an `experts * m_max`-row activation and of `y`.
+    /// `counts` is a device `i32[experts]`, each at most `m_max <= 256`.
+    /// The activation's scale atoms pad each expert to whole row blocks:
+    /// see [`masked_atom_offset`]. Rows past a count are not touched.
+    Masked { counts: u64, m_max: u32 },
+}
+
+/// Where a contiguous group's rows start.
+pub const GROUP_ALIGN: u32 = 128;
+
+/// A grouped GEMM: each routed row against its expert's weight.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Grouped {
+    pub experts: u32,
+    pub groups: Groups,
+    /// A device `f32[experts]` scaling each expert's product besides
+    /// `alpha` (NVFP4's per-expert global scale), or 0.
+    pub alpha_e: u64,
+}
+
+/// The byte of scale `(row, col)` of expert `e`'s activation in the masked
+/// layout, rows carrying `cols` scale columns.
+#[must_use]
+pub const fn masked_atom_offset(
+    e: usize,
+    row: usize,
+    col: usize,
+    m_max: usize,
+    cols: usize,
+) -> usize {
+    atom_offset(e * m_max.div_ceil(128) * 128 + row, col, cols)
+}
+
+/// The bytes a masked activation's scale atoms take.
+#[must_use]
+pub const fn masked_atom_bytes(experts: usize, m_max: usize, k: usize, gran: usize) -> usize {
+    atom_bytes(experts * m_max.div_ceil(128) * 128, k, gran)
+}
+
+impl Plan {
+    /// A grouped GEMM's plan. Contiguous groups run unswapped on lone CTAs
+    /// (a pair's 256-row tile would cross experts at 128-row alignment);
+    /// masked groups swap, the Q tile the rows an expert may hold. `routed`
+    /// is the rows the routing is expected to fill in all (a decode's
+    /// tokens x top-k), which sizes the K splits without reading counts.
+    #[must_use]
+    pub fn grouped(g: &Grouped, n: u32, k: u32, routed: u32, sms: u32) -> Self {
+        let steps = k.div_ceil(128);
+        match g.groups {
+            Groups::Contiguous { .. } => {
+                let row_tiles = routed.div_ceil(128) + g.experts.min(routed);
+                let tiles = |bn: u32| row_tiles * n.div_ceil(bn);
+                let bn = if n.is_multiple_of(256) && tiles(256) >= sms {
+                    256
+                } else {
+                    128
+                };
+                Self {
+                    swap: false,
+                    pair: false,
+                    bn,
+                    stages: 0,
+                    splits: Self::splits_for(tiles(bn), steps, sms),
+                }
+            }
+            Groups::Masked { m_max, .. } => {
+                let bn = m_max.next_multiple_of(32).clamp(32, 256);
+                let busy = g.experts.min(routed.max(1)) * m_max.div_ceil(bn);
+                Self {
+                    swap: true,
+                    pair: false,
+                    bn,
+                    stages: 0,
+                    splits: Self::splits_for(busy * n.div_ceil(128), steps, sms),
+                }
+            }
+        }
+    }
+}
+
+/// `y = alpha * alpha_e[e] * act . w[e]^T`, each row against its expert
+/// `e`'s weight, for a bank of `[experts][n][k]`. `routed` sizes the plan;
+/// see [`Plan::grouped`].
+#[allow(clippy::too_many_arguments)]
+pub fn grouped_gemm(
+    ctx: &Ctx,
+    act: Operand,
+    w: Operand,
+    y: u64,
+    g: Grouped,
+    [n, k]: [u32; 2],
+    alpha: f32,
+    routed: u32,
+) -> Result<(), Error> {
+    let sms = ctx.multiprocessors().unwrap_or(148);
+    let plan = Plan::grouped(&g, n, k, routed, sms);
+    grouped_gemm_with(ctx, act, w, y, g, [n, k], alpha, plan)
+}
+
+/// As [`grouped_gemm`], under a stated plan: unswapped and lone for a
+/// contiguous group, swapped and lone for a masked one.
+#[allow(clippy::too_many_arguments)]
+pub fn grouped_gemm_with(
+    ctx: &Ctx,
+    act: Operand,
+    w: Operand,
+    y: u64,
+    g: Grouped,
+    [n, k]: [u32; 2],
+    alpha: f32,
+    plan: Plan,
+) -> Result<(), Error> {
+    if g.experts == 0 || n == 0 {
+        return Ok(());
+    }
+    let kind = admit(act, w, n, k, plan)?;
+    if act.scales.is_some() && !n.is_multiple_of(128) {
+        return Err(refuse(
+            OP,
+            "a scaled bank's experts are whole 128-row blocks",
+        ));
+    }
+    let bank = g.experts * n;
+    let job = match g.groups {
+        Groups::Contiguous { offsets, rows } => {
+            if plan.swap || plan.pair {
+                return Err(refuse(OP, "a contiguous group runs unswapped on lone CTAs"));
+            }
+            if rows == 0 {
+                return Ok(());
+            }
+            Job {
+                kind,
+                plan,
+                p: act,
+                q: w,
+                rows: [rows, bank],
+                scale_rows: [rows, bank],
+                y_rows: rows,
+                tiles: rows.div_ceil(128) * n.div_ceil(plan.bn),
+                group: Group {
+                    mode: 1,
+                    ptr: offsets,
+                    experts: g.experts,
+                    n,
+                    m_max: 0,
+                    alpha_e: g.alpha_e,
+                },
+            }
+        }
+        Groups::Masked { counts, m_max } => {
+            if !plan.swap || plan.pair || plan.bn < m_max.min(256) || m_max > 256 {
+                return Err(refuse(
+                    OP,
+                    "a masked group runs swapped on lone CTAs, its Q tile its m_max <= 256",
+                ));
+            }
+            if m_max == 0 {
+                return Ok(());
+            }
+            Job {
+                kind,
+                plan,
+                p: w,
+                q: act,
+                rows: [bank, g.experts * m_max],
+                scale_rows: [bank, g.experts * m_max.div_ceil(128) * 128],
+                y_rows: g.experts * m_max,
+                tiles: g.experts * n.div_ceil(128) * m_max.div_ceil(plan.bn),
+                group: Group {
+                    mode: 2,
+                    ptr: counts,
+                    experts: g.experts,
+                    n,
+                    m_max,
+                    alpha_e: g.alpha_e,
+                },
+            }
+        }
+    };
+    launch(ctx, job, y, [n, k], alpha)
+}
+
+/// The kind of `act x w`, once the device, shape and plan admit it.
+fn admit(act: Operand, w: Operand, n: u32, k: u32, plan: Plan) -> Result<Kind, Error> {
     if k == 0 {
         return Err(refuse(OP, "an empty contraction"));
     }
@@ -385,52 +606,109 @@ pub fn gemm_with(
             "a CTA pair splits an unswapped Q tile of 64 or more",
         ));
     }
-    let (p, q) = if plan.swap { (w, act) } else { (act, w) };
-    let (rows_p, rows_q) = if plan.swap { (n, m) } else { (m, n) };
+    Ok(kind)
+}
+
+/// The kernel's grouping arguments; mode 0 is none.
+#[derive(Clone, Copy)]
+struct Group {
+    mode: u32,
+    ptr: u64,
+    experts: u32,
+    n: u32,
+    m_max: u32,
+    alpha_e: u64,
+}
+
+impl Group {
+    const NONE: Self = Self {
+        mode: 0,
+        ptr: 0,
+        experts: 0,
+        n: 0,
+        m_max: 0,
+        alpha_e: 0,
+    };
+}
+
+/// One launch: the MMA's sides, their tensors' rows and their scales' rows,
+/// the output's rows (`y_rows x n`, or the split sum's), and the tiles the
+/// grid and the splits are sized by.
+struct Job {
+    kind: Kind,
+    plan: Plan,
+    p: Operand,
+    q: Operand,
+    rows: [u32; 2],
+    scale_rows: [u32; 2],
+    y_rows: u32,
+    tiles: u32,
+    group: Group,
+}
+
+fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(), Error> {
+    let Job {
+        kind, p, q, group, ..
+    } = job;
     let gran = |o: Operand| o.scales.map_or(128, |s| s.gran);
-    let plan = plan.staged(kind, gran(p), gran(q));
+    let plan = job.plan.staged(kind, gran(p), gran(q));
     let smem = smem_bytes(kind, gran(p), gran(q), plan);
     let ctas = if plan.pair { 2 } else { 1 };
+    let [rows_p, rows_q] = job.rows;
 
     let map_p = tensor_map(kind, p, rows_p, k, 128)?;
     let map_q = tensor_map(kind, q, rows_q, k, plan.bn / ctas)?;
     let map_y = if plan.swap {
         [0; 16]
     } else {
-        output_map(y, m, n)?
+        output_map(y, job.y_rows, n)?
     };
     let atoms = |o: Operand, rows: u32, row_blocks: u32| match o.scales {
         Some(s) => scale_map(s, rows, k, atoms_k(kind, s.gran), row_blocks),
         None => Ok([0; 16]),
     };
-    let map_sfp = atoms(p, rows_p, 1)?;
-    let map_sfq = atoms(q, rows_q, plan.bn.div_ceil(128))?;
+    let map_sfp = atoms(p, job.scale_rows[0], 1)?;
+    let map_sfq = atoms(q, job.scale_rows[1], plan.bn.div_ceil(128))?;
     let sms = ctx.multiprocessors().unwrap_or(148);
-    let tiles = rows_p.div_ceil(128 * ctas) * rows_q.div_ceil(plan.bn);
     // Too few tiles to fill the SMs split K, each split keeping four K steps
     // or more to pipeline; the splits sum in f32 and one pass rounds.
     let steps = k.div_ceil(kind.stage_k());
     let splits = match plan.splits {
-        0 => Plan::splits_for(tiles, steps, sms / ctas),
+        0 => Plan::splits_for(job.tiles, steps, sms / ctas),
         s => s.clamp(1, steps),
     };
     let splits = steps.div_ceil(steps.div_ceil(splits));
+    let int = |v: u32| i32::try_from(v).map_err(|_| refuse(OP, format!("{v} overflows an int")));
+    let routed = group.mode != 0;
     let part = if splits > 1 {
-        let bytes = m as usize * n as usize * 4;
+        let bytes = job.y_rows as usize * n as usize * 4;
         let part = ctx.scratch_stream(OP, SPLIT_PARTIAL, bytes)?;
-        // SAFETY: a slab of `bytes` this context owns, on its stream.
-        let code = unsafe { rt::cudaMemsetAsync(part, 0, bytes, ctx.stream().cast()) };
-        if code != rt::cudaError::cudaSuccess {
-            return Err(refuse(OP, format!("cudaMemsetAsync answered {code:?}")));
+        if routed {
+            // Only the routed rows are summed, so only they zero.
+            fire_routed(
+                ctx,
+                "::pie::linear::tc5_zero_routed",
+                part as u64,
+                0,
+                group,
+                job.y_rows,
+                n,
+            )?;
+        } else {
+            // SAFETY: a slab of `bytes` this context owns, on its stream.
+            let code = unsafe { rt::cudaMemsetAsync(part, 0, bytes, ctx.stream().cast()) };
+            if code != rt::cudaError::cudaSuccess {
+                return Err(refuse(OP, format!("cudaMemsetAsync answered {code:?}")));
+            }
         }
         part as u64
     } else {
         0
     };
-    let units = tiles * splits;
-    let grid = ctas * units.min(sms / ctas);
+    let units = job.tiles * splits;
+    let grid = ctas * units.min(sms / ctas).max(1);
     let entry = symbol(&format!(
-        "::pie::linear::tc5_gemm<{}, {}, {}, {}, {}, {}, {}, {}, {ctas}>",
+        "::pie::linear::tc5_gemm<{}, {}, {}, {}, {}, {}, {}, {}, {ctas}, {}>",
         kind.code(),
         kind.format(p.elem),
         kind.format(q.elem),
@@ -439,8 +717,8 @@ pub fn gemm_with(
         plan.bn,
         plan.stages,
         u32::from(plan.swap),
+        group.mode,
     ));
-    let int = |v: u32| i32::try_from(v).map_err(|_| refuse(OP, format!("{v} overflows an int")));
     let map = |m: &[u64; 16]| ArgValue::Bytes {
         ptr: m.as_ptr().cast(),
         len: 128,
@@ -459,6 +737,11 @@ pub fn gemm_with(
         ArgValue::F32(alpha),
         ArgValue::Ptr(part),
         ArgValue::I32(int(splits)?),
+        ArgValue::Ptr(group.ptr),
+        ArgValue::I32(int(group.experts)?),
+        ArgValue::I32(int(group.n)?),
+        ArgValue::I32(int(group.m_max)?),
+        ArgValue::Ptr(group.alpha_e),
     ];
     ctx.fire(
         OP,
@@ -472,7 +755,18 @@ pub fn gemm_with(
     if splits == 1 {
         return Ok(());
     }
-    let quads = m * n / 4;
+    if routed {
+        return fire_routed(
+            ctx,
+            "::pie::linear::tc5_finalize_routed",
+            part,
+            y,
+            group,
+            job.y_rows,
+            n,
+        );
+    }
+    let quads = job.y_rows * n / 4;
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::linear::tc5_finalize").apply(Launch::flat(quads, 256)),
@@ -480,6 +774,31 @@ pub fn gemm_with(
             ArgValue::Ptr(part),
             ArgValue::Ptr(y),
             ArgValue::I32(int(quads)?),
+        ],
+    )
+}
+
+/// A pass over a grouped GEMM's routed rows of `rows`, a block a row.
+fn fire_routed(
+    ctx: &Ctx,
+    entry: &'static str,
+    part: u64,
+    y: u64,
+    group: Group,
+    rows: u32,
+    n: u32,
+) -> Result<(), Error> {
+    let int = |v: u32| i32::try_from(v).map_err(|_| refuse(OP, format!("{v} overflows an int")));
+    ctx.fire(
+        OP,
+        Fire::at(FILE, entry).apply(Launch::per_row(rows, 128)),
+        &[
+            ArgValue::Ptr(part),
+            ArgValue::Ptr(y),
+            ArgValue::Ptr(group.ptr),
+            ArgValue::I32(int(group.experts)?),
+            ArgValue::I32(int(group.m_max)?),
+            ArgValue::I32(int(n)?),
         ],
     )
 }
