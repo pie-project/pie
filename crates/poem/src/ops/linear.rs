@@ -3,6 +3,11 @@ use super::*;
 /// `act . w^T`; a weight whose precision quantizes its activations has
 /// them quantized first.
 pub fn matmul(act: &Value, w: &Weight) -> Value {
+    assert!(
+        w.act.is_some() || w.dtype != Dtype::Fp8b128,
+        "`{}` is stored fp8b128, which a W8A8 product reads; declare it at fp8b128a8",
+        w.name,
+    );
     let r = act.rec();
     let y = r.fresh(tensor(act.rows(), w.dim(0), act.dtype()));
     match w.act {
@@ -20,6 +25,7 @@ pub fn matmul(act: &Value, w: &Weight) -> Value {
                 w: r.weight(w),
                 quant,
                 input_scales: input_scales(r, w, quant),
+                scales: (w.dtype == Dtype::Fp8b128).then(|| r.weight_plane(w, poem_ir::SCALES)),
                 y: y.id(),
             },
             &[act],
@@ -39,7 +45,7 @@ fn input_scales(r: &Recorder, w: &Weight, quant: ActQuant) -> Option<ValueId> {
 /// `w` is read by `op`, which multiplies activations as they are.
 fn unquantized(w: &Weight, op: &str) {
     assert!(
-        w.act.is_none(),
+        w.act.is_none() && w.dtype != Dtype::Fp8b128,
         "`{}` quantizes its activations, and {op} reads them at their own dtype; \
          declare it at its stored dtype",
         w.name,

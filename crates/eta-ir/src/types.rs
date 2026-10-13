@@ -48,6 +48,7 @@ pub const fn class_of(d: Dtype) -> Option<DtypeClass> {
         | Dtype::E4m3row
         | Dtype::E4m3tile128
         | Dtype::E4m3tensor
+        | Dtype::Fp8b128
         | Dtype::Ptq1_0
         | Dtype::KvU4 => None,
     }

@@ -180,8 +180,13 @@ impl Run<'_> {
                 )
             }
             Linear::MatmulActQuant {
-                act, w, quant, y, ..
-            } => self.matmul_act_quant(*act, *w, *quant, *y),
+                act,
+                w,
+                quant,
+                scales,
+                y,
+                ..
+            } => self.matmul_act_quant(*act, *w, *quant, *scales, *y),
             Linear::Matmul { act, w, y } => match self.maybe_tiled_planes(*w) {
                 Some((codes, scales, biases, seat)) => {
                     let act = self.tensor(*act);
@@ -702,6 +707,7 @@ impl Run<'_> {
         _: ValueId,
         _: ValueId,
         _: ActQuant,
+        _: Option<ValueId>,
         _: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         lowp("linear.matmul_act_quant")
@@ -811,10 +817,14 @@ impl Run<'_> {
         act: ValueId,
         w: ValueId,
         quant: ActQuant,
+        block_scales: Option<ValueId>,
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "linear.matmul_act_quant";
         lowp(OP)?;
+        if let Some(block_scales) = block_scales {
+            return self.fp8_block_matmul(act, w, quant, block_scales, y);
+        }
         let (codes, scales, _, seat) = self.planes(w);
         if seat.streams() {
             return Err(kernels_cuda::Error::Backend {
@@ -858,6 +868,55 @@ impl Run<'_> {
                 ),
             }),
         }
+    }
+
+    /// An fp8b128 projection against e4m3 activations in 1x128 blocks on
+    /// one tcgen05 GEMM (DeepSeek's W8A8): raw e4m3 codes beside the block
+    /// exponents the load spread into atoms.
+    #[cfg(feature = "cuda")]
+    fn fp8_block_matmul(
+        &mut self,
+        act: ValueId,
+        w: ValueId,
+        quant: ActQuant,
+        block_scales: ValueId,
+        y: ValueId,
+    ) -> Result<(), kernels_cuda::Error> {
+        const OP: &str = "linear.matmul_act_quant";
+        if quant != (ActQuant::E4m3 { gran: 128 }) {
+            return Err(kernels_cuda::Error::Backend {
+                op: OP,
+                detail: format!(
+                    "an fp8b128 projection reads e4m3 activations in 1x128 blocks, not \
+                     {quant:?}"
+                ),
+            });
+        }
+        let codes = self.tensor(w);
+        let atoms = self.tensor(block_scales);
+        if atoms.dtype != Dtype::U8 {
+            return Err(unlaid(OP));
+        }
+        let act = self.tensor(act);
+        let mut out = self.tensor(y);
+        let (n, k) = (out.width, act.width);
+        act_quant::matmul(
+            self.ctx(),
+            OP,
+            act_quant::Format::E4m3 { gran: 128 },
+            act_quant::Source::rows(act, None),
+            act_quant::Weight {
+                codes: codes.ptr,
+                scales: atoms.ptr,
+                n,
+                k,
+                elem: linear::tc5::Elem::E4m3,
+                gran: 128,
+                laid: true,
+            },
+            &mut out,
+            1.0,
+        )
     }
 
     fn dense_weight(&mut self, w: ValueId) -> bool {

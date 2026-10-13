@@ -45,12 +45,14 @@ pub enum Linear {
     },
     /// `act` quantized as `quant` states (under `input_scales`, the weight's
     /// static global, when the format has one), then multiplied by `w`'s
-    /// codes at that precision.
+    /// codes at that precision; `scales` the weight's block scales when they
+    /// are a plane of their own beside raw codes (`fp8b128`).
     MatmulActQuant {
         act: ValueId,
         w: ValueId,
         quant: ActQuant,
         input_scales: Option<ValueId>,
+        scales: Option<ValueId>,
         y: ValueId,
     },
     LmHead {
@@ -256,10 +258,12 @@ impl Operands for Linear {
                 act,
                 w,
                 input_scales,
+                scales,
                 ..
             } => {
                 sink.extend([*act, *w]);
                 sink.extend(*input_scales);
+                sink.extend(*scales);
             }
             Self::LmHead { act, w, .. } => sink.extend([*act, *w]),
             Self::MlpSwiglu { packed, .. } => sink.push(*packed),

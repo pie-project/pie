@@ -335,7 +335,7 @@ pub fn matmul(
     tc5::gemm(
         ctx,
         tc5::Operand::scaled(codes as u64, a_elem, atoms as u64, fmt.gran()),
-        tc5::Operand::scaled(w.codes, w.elem, w_atoms as u64, w.gran),
+        tc5::Operand::scaled(w.codes, w.elem, w_atoms, w.gran),
         y.ptr,
         [m, w.n, k],
         alpha,

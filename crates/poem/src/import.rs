@@ -357,6 +357,11 @@ fn claim(w: &Weight, tp: u32) -> Claim {
             "a {:?} weight is served but no load contract declares one",
             w.dtype
         ),
+        Dtype::Fp8b128 => panic!(
+            "`{}`: an fp8b128 weight is claimed plane by plane, its raw codes and \
+             exponents each their own",
+            w.name
+        ),
     };
     Claim {
         name: w.name.clone(),
@@ -637,6 +642,9 @@ fn planes(
     from: impl Into<String>,
 ) -> Result<Vec<TensorContract>, Error> {
     let from = from.into();
+    if w.dtype == Dtype::Fp8b128 {
+        return fp8_block_planes(src, w, vec![from]);
+    }
     if stored_raw(src, &from)? {
         if placed_road_covers(w) {
             return placed_from_encode(w, |canon| Ok(vec![copy(src, canon, from)?]));
@@ -682,6 +690,9 @@ fn planes_fused(
     parts: impl IntoIterator<Item = String>,
 ) -> Result<Vec<TensorContract>, Error> {
     let parts: Vec<String> = parts.into_iter().collect();
+    if w.dtype == Dtype::Fp8b128 {
+        return fp8_block_planes(src, w, parts);
+    }
     if parts.iter().try_fold(true, |all, part| {
         Ok::<bool, Error>(all && stored_raw(src, part)?)
     })? {
@@ -1232,6 +1243,93 @@ fn mx_planes(
             encoding(Dtype::E8m0),
         )
         .scaling(pairing),
+    ])
+}
+
+/// An fp8b128 weight as DeepSeek releases it: each leg `{stem}.weight` raw
+/// e4m3 codes beside `{stem}.scale`, one e8m0 exponent a 128x128 block, both
+/// landed as stored; legs join along their rows, each a whole number of
+/// blocks.
+fn fp8_block_planes(
+    src: &ztensor::Source,
+    w: &Weight,
+    parts: Vec<String>,
+) -> Result<Vec<TensorContract>, Error> {
+    let illegible = |detail: String| Error::Illegible {
+        name: w.name.clone(),
+        detail,
+    };
+    if w.shape.len() != 2 {
+        return Err(illegible(format!(
+            "it is declared {:?}; an fp8b128 weight is one projection",
+            w.shape
+        )));
+    }
+    let axis = if parts.len() > 1 { pack_axis(w) } else { 0 };
+    if axis != 0 {
+        return Err(illegible(
+            "its legs join along the contracted axis, and its blocks are read whole".into(),
+        ));
+    }
+    let shape_of = |name: &str| -> Vec<i64> {
+        src.get(name)
+            .map(|tensor| tensor.shape().iter().map(|&n| n as i64).collect())
+            .unwrap_or_default()
+    };
+    let mut codes = Vec::new();
+    let mut scales = Vec::new();
+    let mut legs = Vec::new();
+    for (at, part) in parts.iter().enumerate() {
+        let stem = part.strip_suffix(".weight").ok_or_else(|| {
+            illegible(format!(
+                "`{part}` holds fp8 codes, whose exponents are named beside a `.weight`, \
+                 and it does not end in one"
+            ))
+        })?;
+        let held = shape_of(part);
+        let stored = stored_encoding(src, part)?;
+        let [rows, cols] = held[..] else {
+            return Err(illegible(format!(
+                "`{part}` is stored {held:?}, not a matrix"
+            )));
+        };
+        if stored != Encoding::Raw(DType::E4m3) || (at + 1 < parts.len() && rows % 128 != 0) {
+            return Err(illegible(format!(
+                "`{part}` is stored {stored:?} {held:?}; an fp8b128 leg is e4m3, a whole \
+                 number of 128-row blocks but the last"
+            )));
+        }
+        let scale = format!("{stem}.scale");
+        let blocks = vec![(rows + 127) / 128, (cols + 127) / 128];
+        let stored = stored_encoding(src, &scale)?;
+        if stored != Encoding::Raw(DType::E8m0) || shape_of(&scale) != blocks {
+            return Err(illegible(format!(
+                "`{scale}` is stored {stored:?} {:?}; fp8b128 exponents are one e8m0 a \
+                 128x128 block, {blocks:?}",
+                shape_of(&scale)
+            )));
+        }
+        codes.push(Expr::src(part.clone()));
+        scales.push(Expr::src(scale));
+        legs.push(held);
+    }
+    holds_the_declared_rectangle(w, axis, &legs)?;
+    let [n, k] = extents(w)[..] else {
+        unreachable!("a two-dimensional weight has two extents")
+    };
+    Ok(vec![
+        TensorContract::new(
+            w.name.clone(),
+            joined(axis, codes),
+            vec![n, k],
+            encoding(Dtype::E4m3),
+        ),
+        TensorContract::new(
+            crate::scales_name(&w.name),
+            joined(axis, scales),
+            vec![(n + 127) / 128, (k + 127) / 128],
+            encoding(Dtype::E8m0),
+        ),
     ])
 }
 
@@ -1954,6 +2052,10 @@ pub fn encoding(dtype: Dtype) -> Encoding {
             "a {:?} weight is served but no load contract declares one",
             dtype
         ),
+        Dtype::Fp8b128 => panic!(
+            "an fp8b128 weight is encoded plane by plane, its raw codes and exponents \
+             each their own"
+        ),
         // PTQ1_0 joins the self-contained block family: its `g128_t3_f16_n` term
         // resolves to `QuantScheme::Ptq1_0` (ternary, one inline fp16 scale).
         Dtype::U2g16k
@@ -2019,6 +2121,69 @@ mod tests {
         the_mlx_road_lands_the_placed_order_and_bands_its_rows();
         a_dense_row_is_untouched_by_the_guard();
         modelopt_nvfp4_legs_land_their_codes_scales_and_a_tensor_scale_a_row();
+        deepseek_fp8_legs_land_their_codes_and_block_exponents_as_stored();
+    }
+
+    fn deepseek_fp8_legs_land_their_codes_and_block_exponents_as_stored() {
+        use checkpoint::executor::Execution;
+        use checkpoint::executor::sink::MemorySink;
+        use checkpoint::plan::{StorageTarget, compile};
+
+        const LEG: u64 = 128;
+        const WIDTH: u64 = 256;
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let mut writer =
+            ztensor::Writer::create(dir.path().join("model.zt")).expect("the container opens");
+        for (leg, fill) in [("w1", 1u8), ("w3", 2)] {
+            writer
+                .add(
+                    format!("ffn.{leg}.scale"),
+                    vec![1, 2],
+                    ztensor::Leaf::E8M0,
+                    &[120 + fill, 124 + fill],
+                )
+                .expect("exponents land");
+            writer
+                .add(
+                    format!("ffn.{leg}.weight"),
+                    vec![LEG, WIDTH],
+                    ztensor::Leaf::E4M3,
+                    &vec![fill; (LEG * WIDTH) as usize],
+                )
+                .expect("codes land");
+        }
+        writer.finish().expect("the container closes");
+        let src = ztensor::Source::open(dir.path().join("model.zt")).expect("it reads back");
+
+        let w = Weight::sym("gate_up", [2 * LEG, WIDTH], Dtype::Fp8b128).packed([LEG, LEG]);
+        let parts = ["ffn.w1.weight", "ffn.w3.weight"].map(String::from);
+        let read = planes_fused(&src, &w, parts).expect("the legs read as one fp8b128 weight");
+        let names: Vec<&str> = read.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["gate_up", "gate_up.scales"]);
+        let contract = ModelContract {
+            alignment: ALIGNMENT,
+            tensors: read,
+            groups: Vec::new(),
+        };
+        let metadata = checkpoint::file::read::parse_metadata(dir.path()).expect("it parses");
+        let plan = compile(&metadata, &contract, StorageTarget::default()).expect("it compiles");
+        let mut sink = MemorySink::default();
+        Execution::new(&plan, dir.path())
+            .sink(&mut sink)
+            .run()
+            .expect("the plan executes");
+        let codes = &sink.tensors["gate_up"];
+        let half = (LEG * WIDTH) as usize;
+        assert_eq!(codes.len(), 2 * half);
+        assert!(codes[..half].iter().all(|b| *b == 1) && codes[half..].iter().all(|b| *b == 2));
+        assert_eq!(sink.tensors["gate_up.scales"], [121, 125, 122, 126]);
+
+        let short = Weight::sym("gate_up", [2 * LEG, 2 * WIDTH], Dtype::Fp8b128).packed([LEG, LEG]);
+        let parts = ["ffn.w1.weight", "ffn.w3.weight"].map(String::from);
+        assert!(
+            planes_fused(&src, &short, parts).is_err(),
+            "legs narrower than the declared weight are refused"
+        );
     }
 
     fn modelopt_nvfp4_legs_land_their_codes_scales_and_a_tensor_scale_a_row() {

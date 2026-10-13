@@ -387,6 +387,87 @@ fn w4a8_matmul(m: usize, n: usize, k: usize, gran: usize) {
     assert_eq!(bad, 0, "{bad} of {} outputs off the read-back dot", m * n);
 }
 
+/// DeepSeek's W8A8: e4m3 activations in 1x128 blocks against e4m3 codes
+/// under one ue8m0 exponent a 128x128 block, the block's exponent spread to
+/// each of its rows' atoms.
+fn w8a8_block_matmul(m: usize, n: usize, k: usize) {
+    let mut lcg = Lcg::seeded(0x88 ^ (m * n + k) as u64);
+    let (raw, _) = activations(&mut lcg, m, k);
+    let (bn, bk) = (n.div_ceil(128), k.div_ceil(128));
+    let blocks: Vec<u8> = (0..bn * bk).map(|i| 118 + (i * 5 % 9) as u8).collect();
+    let mut codes = vec![0u8; n * k];
+    let mut w = vec![0f32; n * k];
+    for r in 0..n {
+        for c in 0..k {
+            let u = ((lcg.unit() + 1.0) * 128.0) as u32;
+            let code = ((u & 0x80) | ((3 + (u >> 2) % 8) << 3) | (u & 7)) as u8;
+            codes[r * k + c] = code;
+            let s = blocks[(r / 128) * bk + c / 128];
+            w[r * k + c] = e4m3(code) * 2f32.powi(i32::from(s) - 127);
+        }
+    }
+    let mut gpu = Gpu::open();
+    let x_at = gpu.up(&raw);
+    let codes_at = gpu.up(&codes);
+    let blocks_at = gpu.up(&blocks);
+    let atoms_at = gpu.zeros(atom_bytes(n, k, 128));
+    let y_at = gpu.zeros(m * n * 2);
+    let values_at = gpu.zeros(m * k * 2);
+    let ctx = gpu.ctx();
+    scales_to_atoms(&ctx, OP, blocks_at, atoms_at, n as u32, bk as u32, 128)
+        .expect("the exponents spread");
+    let fmt = Format::E4m3 { gran: 128 };
+    let src = Source::rows(Tensor::new(x_at, m as u32, k as u32, Dtype::Bf16), None);
+    let mut y = Tensor::new(y_at, m as u32, n as u32, Dtype::Bf16);
+    matmul(
+        &ctx,
+        OP,
+        fmt,
+        src,
+        Weight {
+            codes: codes_at,
+            scales: atoms_at,
+            n: n as u32,
+            k: k as u32,
+            elem: Elem::E4m3,
+            gran: 128,
+            laid: true,
+        },
+        &mut y,
+        1.0,
+    )
+    .expect("the W8A8 product fires");
+    read_back(&ctx, OP, fmt, src, values_at).expect("the read-back fires");
+    gpu.sync();
+    let got: Vec<u16> = gpu.down(y_at, m * n);
+    let a: Vec<f32> = gpu
+        .down::<u16>(values_at, m * k)
+        .into_iter()
+        .map(from_bf16)
+        .collect();
+    let mut bad = 0;
+    for r in 0..m {
+        for c in 0..n {
+            let want: f64 = (0..k)
+                .map(|i| f64::from(a[r * k + i]) * f64::from(w[c * k + i]))
+                .sum();
+            let g = from_bf16(got[r * n + c]);
+            if !close(g, want as f32) {
+                bad += 1;
+                if bad <= 5 {
+                    eprintln!("W8A8 ({r}, {c}): got {g} want {want}");
+                }
+            }
+        }
+    }
+    assert_eq!(
+        bad,
+        0,
+        "{bad} of {} W8A8 outputs off the read-back dot",
+        m * n
+    );
+}
+
 #[test]
 fn the_activation_quantizers_land_what_the_host_rounds_every_case() {
     e4m3_codes_and_atoms(128);
@@ -401,6 +482,8 @@ fn the_activation_quantizers_land_what_the_host_rounds_every_case() {
     w4a8_matmul(7, 256, 512, 128);
     w4a8_matmul(200, 384, 1024, 128);
     w4a8_matmul(64, 128, 256, 32);
+    w8a8_block_matmul(5, 384, 640);
+    w8a8_block_matmul(300, 256, 1024);
     for tokens in [3, 40, 150] {
         routed_select(Format::Nvfp4, tokens, true);
         routed_select(Format::E4m3 { gran: 128 }, tokens, true);

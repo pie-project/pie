@@ -911,6 +911,8 @@ impl Weights {
         }
         #[cfg(feature = "cuda")]
         lay_atoms(trace, &mut table, stream)?;
+        #[cfg(feature = "cuda")]
+        lay_block_atoms(trace, &mut table, &mut decoded, stream)?;
         if let Some(tier) = experts.as_mut() {
             let slabs: Vec<u64> = tier
                 .plan()
@@ -1440,6 +1442,68 @@ fn lay_atoms(
     }
     if temp.is_some() {
         crate::device::ctx::sync(stream)?;
+    }
+    Ok(())
+}
+
+/// Each fp8b128 projection's block exponents spread into the tcgen05 GEMM's
+/// atoms, one row of them a weight row, in a buffer of their own (the atoms
+/// are 128 times the plane), bound in the plane's place as raw bytes: a
+/// low-precision projection reads a `u8` scale plane as laid.
+#[cfg(feature = "cuda")]
+fn lay_block_atoms(
+    trace: &Trace,
+    table: &mut [Option<WeightRow>],
+    held: &mut Vec<Buffer>,
+    stream: *mut core::ffi::c_void,
+) -> Result<()> {
+    use poem_ir::{Def, Linear, Operation};
+    let weight = |id: poem_ir::ValueId| match trace.values.get(id.0 as usize).map(|v| &v.def) {
+        Some(Def::Weight(at)) => Some(*at as usize),
+        _ => None,
+    };
+    for node in &trace.nodes {
+        let Operation::Linear(Linear::MatmulActQuant {
+            w,
+            scales: Some(scales),
+            ..
+        }) = &node.op
+        else {
+            continue;
+        };
+        let (Some(codes), Some(at)) = (weight(*w), weight(*scales)) else {
+            continue;
+        };
+        let Some(Some(WeightRow::Dense(plane))) = table.get(at).copied() else {
+            continue;
+        };
+        if plane.dtype == Dtype::U8 {
+            continue;
+        }
+        let [n, k] = trace.params[codes].shape[..] else {
+            continue;
+        };
+        let (rows, cols) = (n, k.div_ceil(128));
+        let bytes = kernels_cuda::linear::tc5::atom_bytes(rows as usize, k as usize, 128);
+        let atoms = Buffer::zeroed(bytes)?;
+        // SAFETY: `stream` is the load's stream, live for the load.
+        let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
+        kernels_cuda::linear::act_quant::scales_to_atoms(
+            &ctx,
+            "linear.act_quant",
+            plane.ptr,
+            atoms.ptr(),
+            u32::try_from(rows).unwrap_or(u32::MAX),
+            u32::try_from(cols).unwrap_or(u32::MAX),
+            128,
+        )?;
+        table[at] = Some(WeightRow::Dense(Tensor::new(
+            atoms.ptr(),
+            u32::try_from(rows).unwrap_or(u32::MAX),
+            u32::try_from(cols).unwrap_or(u32::MAX),
+            Dtype::U8,
+        )));
+        held.push(atoms);
     }
     Ok(())
 }
