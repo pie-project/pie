@@ -30,6 +30,93 @@ fn the_new_templates_write_what_the_reference_renders_every_case() {
     chatml_trims_the_turn_and_closes_an_empty_thinking_block();
     gemma_closes_an_empty_thought_channel_where_its_template_does();
     minimax_opens_with_the_system_and_developer_turns();
+    hy_writes_the_reasoning_mode_the_turns_the_calls_and_the_cue();
+}
+
+/// Hy4's template opens with the reasoning mode, writes a past turn's
+/// thinking block empty, lists the tools in the leading system turn, and
+/// cues an opened thinking block, or a closed one under `no_think`.
+fn hy_writes_the_reasoning_mode_the_turns_the_calls_and_the_cue() {
+    let Some(tokenizer) = snapshot(
+        "tencent/Hy4-preview",
+        "705d81ee51566a186d645b74c974d642ef2828fe",
+    ) else {
+        return;
+    };
+    let template = chat_template::hy::Hy::new(tokenizer.clone(), true);
+    let quiet = chat_template::hy::Hy::new(tokenizer, false);
+    let high: Vec<u32> = vec![120039, 59785, 287, 62, 4138, 506, 25, 19369, 120025];
+    let no_think: Vec<u32> = vec![
+        120039, 59785, 287, 62, 4138, 506, 25, 3202, 32980, 1121, 120025,
+    ];
+    let user: Vec<u32> = vec![
+        120000, 3717, 120001, 3462, 341, 220, 1162, 3697, 220, 1498, 30, 120025,
+    ];
+    let answered: Vec<u32> = vec![
+        120000, 611, 10372, 120001, 120029, 120030, 29206, 120025, 120000, 3717, 120001, 4231, 220,
+        1004, 3697, 220, 1498, 30, 120025,
+    ];
+    let cue: Vec<u32> = vec![120000, 611, 10372, 120001, 120029];
+    let closed: Vec<u32> = [cue.clone(), vec![120030]].concat();
+    let opening = |mode: &[u32]| [vec![120000, 13251, 120001], mode.to_vec()].concat();
+
+    let mut got = template.first_user(MESSAGE);
+    got.extend(template.cue());
+    assert_eq!(got, [opening(&high), user.clone(), cue.clone()].concat());
+
+    let mut got = template.system_user("You are terse.", MESSAGE);
+    got.extend(template.cue());
+    let system: Vec<u32> = vec![120000, 13251, 120001, 3681, 488, 257, 8940, 13];
+    assert_eq!(
+        got,
+        [system, high.clone(), user.clone(), cue.clone()].concat()
+    );
+
+    let mut got = template.first_user(MESSAGE);
+    got.extend(template.assistant("391"));
+    got.extend(template.user("And 18 times 23?"));
+    got.extend(template.cue());
+    let want = [opening(&high), user.clone(), answered.clone(), cue.clone()].concat();
+    assert_eq!(got, want);
+
+    let mut got = quiet.first_user(MESSAGE);
+    got.extend(quiet.assistant("<think:opensource>17*23 = 391.</think:opensource>391"));
+    got.extend(quiet.user("And 18 times 23?"));
+    got.extend(quiet.cue());
+    let want = [opening(&no_think), user.clone(), answered, closed.clone()].concat();
+    assert_eq!(got, want);
+    assert_eq!(template.cue_without_thinking(), closed);
+
+    let tools = [r#"{"type": "function", "function": {"name": "get_weather", "description": "Weather for a city, in °C.", "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city"]}}}"#.to_string()];
+    let mut got = template.equip(&tools);
+    got.extend(template.user("Weather in Paris for 2 days?"));
+    got.extend(template.assistant(
+        "<think:opensource>Call the tool.</think:opensource><tool_call>\n\
+         {\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\",\"days\":2}}\n</tool_call>",
+    ));
+    got.extend(template.answer("get_weather", "{\"temp\": 21}"));
+    got.extend(template.cue());
+    let want: Vec<u32> = vec![
+        120000, 13251, 120001, 2, 21650, 268, 3681, 1296, 1971, 936, 474, 984, 4405, 302, 12824,
+        430, 269, 2122, 7343, 364, 3681, 488, 4308, 430, 1477, 41207, 2742, 676, 17736, 1569,
+        17736, 29, 14816, 17017, 926, 27, 17736, 332, 16249, 1859, 2486, 549, 998, 62, 49005, 1453,
+        549, 18264, 2486, 549, 59185, 373, 259, 7370, 11, 297, 11184, 34, 50150, 549, 28125, 2486,
+        19634, 5298, 2486, 549, 6045, 1453, 549, 37488, 2486, 19634, 38090, 2486, 19634, 5298,
+        2486, 549, 3828, 44156, 549, 30405, 2486, 19634, 5298, 2486, 549, 28751, 1, 21115, 549,
+        21062, 2486, 17044, 38090, 7081, 16472, 358, 17736, 4079, 2943, 1477, 1971, 8344, 11, 435,
+        1595, 1419, 3329, 220, 120035, 198, 2943, 1630, 1477, 1971, 11, 435, 1595, 1315, 2341,
+        1322, 926, 120033, 90, 6703, 18826, 92, 120040, 90, 1692, 26105, 12, 16, 92, 120041,
+        120042, 90, 1692, 18177, 12, 16, 92, 120043, 120040, 90, 1692, 26105, 12, 17, 92, 120041,
+        120042, 90, 1692, 18177, 12, 17, 92, 120043, 1605, 120034, 198, 4428, 269, 1754, 299, 1477,
+        1971, 8344, 11, 435, 1595, 3329, 220, 120036, 120039, 59785, 287, 62, 4138, 506, 25, 19369,
+        120025, 120000, 3717, 120001, 59185, 297, 15641, 373, 220, 17, 4341, 30, 120025, 120000,
+        611, 10372, 120001, 120029, 10523, 269, 5509, 13, 120030, 120035, 120033, 998, 62, 49005,
+        120040, 38090, 120041, 120042, 65431, 120043, 120040, 30405, 120041, 120042, 17, 120043,
+        120034, 120036, 120025, 120000, 23441, 120001, 120037, 16249, 22093, 2486, 220, 1723, 92,
+        120038, 120025, 120000, 611, 10372, 120001, 120029,
+    ];
+    assert_eq!(got, want);
+    assert_eq!(template.seal(), vec![120025]);
 }
 
 /// Qwen3.5's template trims every turn and, with `enable_thinking: false`,

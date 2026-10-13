@@ -3,7 +3,7 @@ name = "chat-template"
 version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "How a turn of conversation is written into tokens and read back out of them: the Instruct surface, the chat/reasoning/tool decoders, and the named prompt formats (ChatML, Harmony, Gemma, DeepSeek, Kimi) the catalog's models are configurations of."
+description = "How a turn of conversation is written into tokens and read back out of them: the Instruct surface, the chat/reasoning/tool decoders, and the named prompt formats (ChatML, Harmony, Gemma, DeepSeek, Kimi, Hy) the catalog's models are configurations of."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 

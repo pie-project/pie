@@ -11,14 +11,14 @@ use crate::chatml::{ChatML, ChatMLInstruct};
 
 pub const FORMATS: &[&str] = &[
     "chatml", "harmony", "gemma", "deepseek", "glm", "kimi", "kimi3", "inkling", "atem", "minimax",
-    "lines", "raw",
+    "hy", "lines", "raw",
 ];
 
 /// A format and its settings; a setting the format does not read is refused.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Spec {
     pub format: String,
-    /// ChatML, gemma.
+    /// ChatML, gemma, hy.
     pub thinking: bool,
     pub preserve_thinking: bool,
     pub tools: bool,
@@ -74,7 +74,7 @@ impl Spec {
                 "generation_suffix",
                 "stop",
             ],
-            "gemma" => &["thinking"],
+            "gemma" | "hy" => &["thinking"],
             "lines" => &["stop", "bos", "eos"],
             "raw" => &["stop"],
             "harmony" | "deepseek" | "glm" | "kimi" | "kimi3" | "inkling" | "atem" | "minimax" => {
@@ -128,6 +128,7 @@ pub fn build(spec: &Spec, tokenizer: Arc<Tokenizer>) -> Result<Arc<dyn Instruct>
         "inkling" => Arc::new(crate::inkling::Inkling::new(tokenizer)),
         "atem" => Arc::new(crate::atem::Atem::new(tokenizer)),
         "minimax" => Arc::new(crate::minimax::MiniMax::new(tokenizer)),
+        "hy" => Arc::new(crate::hy::Hy::new(tokenizer, spec.thinking)),
         "lines" => Arc::new(crate::lines::Lines::new(
             tokenizer,
             spec.bos.as_deref().unwrap_or_default(),

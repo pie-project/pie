@@ -9,6 +9,7 @@ pub mod deepseek;
 pub mod gemma;
 pub mod glm;
 pub mod harmony;
+pub mod hy;
 pub mod inkling;
 pub mod kimi;
 pub mod kimi3;

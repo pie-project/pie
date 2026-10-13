@@ -22,10 +22,10 @@ A model is spoken through a template and a tokenizer, both stated as data in
 `package.poem`, so no Rust names a model:
 
 - `template(format, …)` picks a format the runtime ships (`chatml`, `harmony`,
-  `gemma`, `deepseek`, `glm`, `kimi`, `kimi3`, `inkling`, `atem`, `minimax`,
+  `gemma`, `deepseek`, `glm`, `kimi`, `kimi3`, `inkling`, `atem`, `minimax`, `hy`,
   `lines`, `raw`) and sets what the format leaves open: ChatML its `thinking`,
   `preserve_thinking`, `tools`, `generation_suffix` and `stop`; `lines` its
-  `stop`, `bos` and `eos`; `raw` its `stop`. A setting the format does not
+  `stop`, `bos` and `eos`; `raw` its `stop`; `hy` its `thinking`. A setting the format does not
   read is refused.
 - `tokenizer(markers, pinned, parts)` states what the model asks of the
   tokenizer an artifact carries: `markers`, groups of tokens the vocabulary
