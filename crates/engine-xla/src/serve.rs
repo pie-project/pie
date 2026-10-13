@@ -863,7 +863,7 @@ impl Shell {
         Ok(())
     }
 
-    pub fn copy_kv(&mut self, moves: &[crate::store::Move]) -> Result<()> {
+    pub fn copy_kv(&mut self, moves: &[engine::transfer::KvRun]) -> Result<()> {
         self.pools.copy_kv(&self.device, &self.handles, moves, &[])
     }
 
@@ -1401,10 +1401,10 @@ impl Shell {
         }
         // The windowed pages the runtime copies before this fire (a fork's
         // window), whole pages in the windowed pool's own ids.
-        let window_copies: Vec<crate::store::Move> = lanes
+        let window_copies: Vec<engine::transfer::KvRun> = lanes
             .iter()
             .flat_map(|seated| seated.window_copies)
-            .map(|&(src, dst)| crate::store::Move {
+            .map(|&(src, dst)| engine::transfer::KvRun {
                 src_page: src,
                 src_token: 0,
                 dst_page: dst,

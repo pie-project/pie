@@ -907,64 +907,7 @@ impl Engine for Cuda {
             });
         }
         let page_size = self.loaded_mut()?.paging().page_size;
-        let mut moves: Vec<crate::store::Move> =
-            Vec::with_capacity(copy.src_page_ids.len() + copy.moves.len());
-        for (src, dst) in copy.src_page_ids.iter().zip(&copy.dst_page_ids) {
-            moves.push(crate::store::Move {
-                src_page: *src,
-                src_token: 0,
-                dst_page: *dst,
-                dst_token: 0,
-                tokens: page_size,
-            });
-        }
-        for (at, cell) in copy.moves.iter().enumerate() {
-            if cell.src_token_offset >= page_size || cell.dst_token_offset >= page_size {
-                return Err(Error::Invalid(format!(
-                    "kv move {at} names token offsets {}/{} in pages of {page_size} tokens",
-                    cell.src_token_offset, cell.dst_token_offset
-                )));
-            }
-            if cell.src_page_id == cell.dst_page_id
-                && cell.src_token_offset == cell.dst_token_offset
-            {
-                continue;
-            }
-            let run = moves.last_mut().filter(|run| {
-                run.src_page == cell.src_page_id
-                    && run.dst_page == cell.dst_page_id
-                    && run.src_token + run.tokens == cell.src_token_offset
-                    && run.dst_token + run.tokens == cell.dst_token_offset
-                    && run.src_token + run.tokens < page_size
-            });
-            match run {
-                Some(run) => run.tokens += 1,
-                None => moves.push(crate::store::Move {
-                    src_page: cell.src_page_id,
-                    src_token: cell.src_token_offset,
-                    dst_page: cell.dst_page_id,
-                    dst_token: cell.dst_token_offset,
-                    tokens: 1,
-                }),
-            }
-        }
-        for run in &moves {
-            if run.src_page != run.dst_page {
-                continue;
-            }
-            let (lo, hi) = (
-                u32::min(run.src_token, run.dst_token),
-                u32::max(run.src_token, run.dst_token),
-            );
-            if hi - lo < run.tokens {
-                return Err(Error::Invalid(format!(
-                    "a kv move of {} tokens reads page {} from token {} and writes the same \
-                     page at token {} — the two ends overlap, and a device copy whose ends \
-                     overlap is undefined rather than a shift",
-                    run.tokens, run.src_page, run.src_token, run.dst_token
-                )));
-            }
-        }
+        let moves = copy.runs(page_size)?;
         self.loaded_mut()?
             .copy_kv(&moves, !copy.moves.is_empty())
             .map_err(fault)

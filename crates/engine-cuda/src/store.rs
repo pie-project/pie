@@ -1,6 +1,7 @@
 pub mod kv;
 pub mod rs;
 
+use engine::transfer::KvRun;
 use kernels_cuda::{KvPool, RecurrentPool, Tensor};
 use poem_ir::{Attention, CacheRow, Def, Dtype, Operands, Operation, Trace};
 
@@ -436,15 +437,6 @@ impl Seats {
         self.begin_at = boundary;
         self
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Move {
-    pub src_page: u32,
-    pub src_token: u32,
-    pub dst_page: u32,
-    pub dst_token: u32,
-    pub tokens: u32,
 }
 
 #[derive(Debug)]
@@ -1196,8 +1188,8 @@ impl Pools {
     pub fn copy_kv(
         &mut self,
         stream: *mut core::ffi::c_void,
-        moves: &[Move],
-        windowed: &[Move],
+        moves: &[KvRun],
+        windowed: &[KvRun],
     ) -> Result<()> {
         if moves.is_empty() && windowed.is_empty() {
             return Ok(());

@@ -121,6 +121,17 @@ pub struct KvMove {
     pub src_token_offset: u32,
 }
 
+/// `tokens` kv cells copied from one page to another, the unit a device
+/// copies in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvRun {
+    pub src_page: u32,
+    pub src_token: u32,
+    pub dst_page: u32,
+    pub dst_token: u32,
+    pub tokens: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvCopy {
     pub src: MemoryDomain,
@@ -157,6 +168,68 @@ impl KvCopy {
             )));
         }
         Ok(())
+    }
+
+    /// The copy over pages of `page_size` tokens as runs: one per whole
+    /// page pair, and the per-token moves merged where each continues the
+    /// last within one page. A run whose two ends overlap on one page is
+    /// refused: a device copy of overlapping regions is undefined, not a
+    /// shift.
+    pub fn runs(&self, page_size: u32) -> crate::Result<Vec<KvRun>> {
+        self.validate()?;
+        let mut runs: Vec<KvRun> = self
+            .src_page_ids
+            .iter()
+            .zip(&self.dst_page_ids)
+            .map(|(&src_page, &dst_page)| KvRun {
+                src_page,
+                src_token: 0,
+                dst_page,
+                dst_token: 0,
+                tokens: page_size,
+            })
+            .collect();
+        for (at, cell) in self.moves.iter().enumerate() {
+            if cell.src_token_offset >= page_size || cell.dst_token_offset >= page_size {
+                return Err(crate::Error::Invalid(format!(
+                    "kv move {at} names token offsets {}/{} in pages of {page_size} tokens",
+                    cell.src_token_offset, cell.dst_token_offset
+                )));
+            }
+            if cell.src_page_id == cell.dst_page_id
+                && cell.src_token_offset == cell.dst_token_offset
+            {
+                continue;
+            }
+            let run = runs.last_mut().filter(|run| {
+                run.src_page == cell.src_page_id
+                    && run.dst_page == cell.dst_page_id
+                    && run.src_token + run.tokens == cell.src_token_offset
+                    && run.dst_token + run.tokens == cell.dst_token_offset
+                    && run.src_token + run.tokens < page_size
+            });
+            match run {
+                Some(run) => run.tokens += 1,
+                None => runs.push(KvRun {
+                    src_page: cell.src_page_id,
+                    src_token: cell.src_token_offset,
+                    dst_page: cell.dst_page_id,
+                    dst_token: cell.dst_token_offset,
+                    tokens: 1,
+                }),
+            }
+        }
+        if let Some(run) = runs.iter().find(|run| {
+            run.src_page == run.dst_page && run.src_token.abs_diff(run.dst_token) < run.tokens
+        }) {
+            return Err(crate::Error::Invalid(format!(
+                "a kv move of {} tokens reads page {} from token {} and writes the same page \
+                 at token {} — the two ends overlap, and a device copy whose ends overlap is \
+                 undefined rather than a shift",
+                run.tokens, run.src_page, run.src_token, run.dst_token
+            )));
+        }
+        Ok(runs)
     }
 
     /// A whole-page move between `device` and a tier below it: the tier,
