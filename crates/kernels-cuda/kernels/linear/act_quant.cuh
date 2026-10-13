@@ -17,7 +17,11 @@
 // that multiplies by the global once.
 //
 // Out row `r` reads `x` row `r / div`; with `routes`, its global is its
-// route's expert's, and a dropped route (`routes[r] < 0`) lands zeros.
+// route's expert's, and a dropped route (`routes[r] < 0`) lands zeros. With
+// `pos`, its codes land at row `pos[r]` of a grouped layout (a dropped route
+// nowhere), its scales at that row's atom row: the same row for the
+// contiguous layout, expert `pos / m_max`'s whole row blocks for the masked
+// one (`m_max > 0`).
 
 #include "linear/quant.cuh"
 
@@ -61,6 +65,13 @@ __device__ __forceinline__ float e4m3_value(u8 b) {
     return static_cast<float>(v);
 }
 
+// The atom row of grouped row `o`.
+__device__ __forceinline__ int atom_row(int o, int m_max) {
+    if (m_max == 0) return o;
+    const int pad = (m_max + 127) / 128 * 128;
+    return o / m_max * pad + o % m_max;
+}
+
 __device__ __forceinline__ float global_of(const float* __restrict__ input_scales,
                                            const i32* __restrict__ routes, int r, bool* dropped) {
     int e = 0;
@@ -80,6 +91,8 @@ __global__ void act_quant_nvfp4(
     const bf16* __restrict__ x,
     const i32* __restrict__ routes,
     const float* __restrict__ input_scales,
+    const i32* __restrict__ pos,
+    int m_max,
     u8* __restrict__ codes,
     u8* __restrict__ atoms,
     bf16* __restrict__ values,
@@ -107,13 +120,15 @@ __global__ void act_quant_nvfp4(
     const float sf_value = e4m3_value(sf_code);
     const float out_scale = sf_value != 0.f ? rcp_approx_ftz(sf_value * rcp_approx_ftz(gs)) : 0.f;
     if constexpr (kMode == kQuantCodes) {
-        u8* dst = codes + static_cast<long long>(r) * (k / 2) + b * 8;
+        const int o = pos != nullptr ? pos[r] : r;
+        if (o < 0) return;
+        u8* dst = codes + static_cast<long long>(o) * (k / 2) + b * 8;
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             dst[i] = static_cast<u8>(e2m1_code(v[2 * i] * out_scale)
                                      | (e2m1_code(v[2 * i + 1] * out_scale) << 4));
         }
-        atoms[atom_offset(r, b, blocks)] = sf_code;
+        atoms[atom_offset(atom_row(o, m_max), b, blocks)] = sf_code;
     } else {
         bf16* dst = values + static_cast<long long>(r) * k + b * 16;
 #pragma unroll
@@ -127,6 +142,8 @@ __global__ void act_quant_nvfp4(
 template <int kMode, int kGran>
 __global__ void act_quant_e4m3(
     const bf16* __restrict__ x,
+    const i32* __restrict__ pos,
+    int m_max,
     u8* __restrict__ codes,
     u8* __restrict__ atoms,
     bf16* __restrict__ values,
@@ -159,13 +176,15 @@ __global__ void act_quant_e4m3(
     const int e = static_cast<int>((bits >> 23) & 0xFFu) - 127 + ((bits & 0x7FFFFFu) != 0u ? 1 : 0);
     const float s = __uint_as_float(static_cast<unsigned>(e + 127) << 23);
     if constexpr (kMode == kQuantCodes) {
-        u8* dst = codes + static_cast<long long>(r) * k + b * kGran + lane * kEach;
+        const int o = pos != nullptr ? pos[r] : r;
+        if (o < 0) return;
+        u8* dst = codes + static_cast<long long>(o) * k + b * kGran + lane * kEach;
 #pragma unroll
         for (int i = 0; i < kEach; ++i) {
             dst[i] = __nv_cvt_float_to_fp8(fminf(fmaxf(v[i] / s, -448.f), 448.f),
                                            __NV_SATFINITE, __NV_E4M3);
         }
-        if (lane == 0) atoms[atom_offset(r, b, blocks)] = static_cast<u8>(e + 127);
+        if (lane == 0) atoms[atom_offset(atom_row(o, m_max), b, blocks)] = static_cast<u8>(e + 127);
     } else {
         bf16* dst = values + static_cast<long long>(r) * k + b * kGran + lane * kEach;
 #pragma unroll
@@ -194,18 +213,77 @@ __global__ void scales_to_atoms(
     atoms[atom_offset(r, c, cols)] = plane[static_cast<long long>(r / div) * cols + c];
 }
 
-// Each expert's row tensor scales times its activations' static global:
-// the one factor a bf16 product of read-back values multiplies its sum by.
-__global__ void fold_input_scales(
-    const float* __restrict__ tensor_scales,
+// Routes laid out by expert for the grouped GEMM: each routed expert's
+// count, its rows' start (whole 128-row blocks apart for the contiguous
+// layout, `m_max` apart for the masked one) and each route's row.
+__global__ void route_count(const i32* __restrict__ routes, int count, i32* __restrict__ counts)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r < count && routes[r] >= 0) atomicAdd(&counts[routes[r]], 1);
+}
+
+__global__ void route_offsets(
+    const i32* __restrict__ counts,
+    int experts,
+    int m_max,
+    i32* __restrict__ offsets,
+    i32* __restrict__ cursor)
+{
+    if (threadIdx.x != 0) return;
+    int at = 0;
+    for (int e = 0; e < experts; ++e) {
+        offsets[e] = at;
+        cursor[e] = at;
+        at += m_max > 0 ? m_max : (counts[e] + 127) / 128 * 128;
+    }
+    offsets[experts] = at;
+}
+
+__global__ void route_place(
+    const i32* __restrict__ routes,
+    int count,
+    i32* __restrict__ cursor,
+    i32* __restrict__ pos)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= count) return;
+    pos[r] = routes[r] >= 0 ? atomicAdd(&cursor[routes[r]], 1) : -1;
+}
+
+// `y[r] = grouped[pos[r]]`, a dropped route zeros; a thread a pair.
+__global__ void route_gather(
+    const bf16* __restrict__ grouped,
+    const i32* __restrict__ pos,
+    bf16* __restrict__ y,
+    int count,
+    int n)
+{
+    const long long at = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (at >= static_cast<long long>(count) * (n / 2)) return;
+    const int r = static_cast<int>(at / (n / 2));
+    const int c = static_cast<int>(at % (n / 2)) * 2;
+    const int o = pos[r];
+    bf16x2* dst = reinterpret_cast<bf16x2*>(y + static_cast<long long>(r) * n + c);
+    if (o < 0) {
+        *dst = f32_to_bf16x2(0.f, 0.f);
+        return;
+    }
+    *dst = *reinterpret_cast<const bf16x2*>(grouped + static_cast<long long>(o) * n + c);
+}
+
+// Each expert's product scale: its activations' static global times its
+// weight's tensor scale, the first row's standing for the expert's (vLLM
+// reads the gate leg's for both of a gated bank's legs).
+__global__ void expert_alpha(
     const float* __restrict__ input_scales,
-    float* __restrict__ folded,
+    const float* __restrict__ tensor_scales,
+    float* __restrict__ alpha,
     int experts,
     int rows)
 {
-    const long long at = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (at >= static_cast<long long>(experts) * rows) return;
-    folded[at] = input_scales[at / rows] * tensor_scales[at];
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= experts) return;
+    alpha[e] = input_scales[e] * tensor_scales[static_cast<long long>(e) * rows];
 }
 
 }  // namespace pie::linear

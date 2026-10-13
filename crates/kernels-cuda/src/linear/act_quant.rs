@@ -7,7 +7,10 @@
 //! multiplies by the global once.
 //!
 //! [`matmul`] is the dense product: activations quantized, the weight's
-//! scales laid out in atoms, one [`tc5`] GEMM.
+//! scales laid out in atoms, one [`tc5`] GEMM. [`select`] is the routed one:
+//! the routes laid out by expert on the device, each quantized into its
+//! expert's rows (under its expert's global), one grouped [`tc5`] GEMM, and
+//! the rows gathered back to route order.
 
 use cudarc::runtime::sys as rt;
 use dtype::Dtype;
@@ -71,7 +74,10 @@ impl Format {
 
 /// Where a quantization reads: `rows` out rows, row `r` reading `x` row
 /// `r / div`, its global (NVFP4) its route's expert's with `routes`, else
-/// `input_scales[0]`.
+/// `input_scales[0]`; with `pos`, a device `i32[rows]`, row `r`'s codes land
+/// at row `pos[r]` of a grouped layout (none where it is negative), the
+/// masked one's scales padded to whole row blocks an expert when `m_max` is
+/// stated.
 #[derive(Clone, Copy, Debug)]
 pub struct Source {
     pub x: Tensor,
@@ -79,6 +85,8 @@ pub struct Source {
     pub div: u32,
     pub routes: Option<Tensor>,
     pub input_scales: Option<Tensor>,
+    pub pos: u64,
+    pub m_max: u32,
 }
 
 impl Source {
@@ -91,6 +99,8 @@ impl Source {
             div: 1,
             routes: None,
             input_scales,
+            pos: 0,
+            m_max: 0,
         }
     }
 }
@@ -147,6 +157,8 @@ fn launch(
                     src.x.arg(),
                     ptr(src.routes),
                     ptr(src.input_scales),
+                    ArgValue::Ptr(src.pos),
+                    int(src.m_max)?,
                     ArgValue::Ptr(codes),
                     ArgValue::Ptr(atoms),
                     ArgValue::Ptr(values),
@@ -174,6 +186,8 @@ fn launch(
                 .apply(Launch::flat(threads, BLOCK)),
                 &[
                     src.x.arg(),
+                    ArgValue::Ptr(src.pos),
+                    int(src.m_max)?,
                     ArgValue::Ptr(codes),
                     ArgValue::Ptr(atoms),
                     ArgValue::Ptr(values),
@@ -186,8 +200,9 @@ fn launch(
     }
 }
 
-/// Codes (`rows x fmt.row_bytes(k)`) and atom-layout scales (zeroed first,
-/// so the padding the GEMM reads is finite), as [`tc5`] reads them.
+/// Codes (`fmt.row_bytes(k)` a row) and atom-layout scales, `atom_bytes`
+/// of them zeroed first so the padding the GEMM reads is finite, as [`tc5`]
+/// reads them.
 pub fn quantize(
     ctx: &Ctx,
     op: &'static str,
@@ -195,9 +210,9 @@ pub fn quantize(
     src: Source,
     codes: u64,
     atoms: u64,
+    atom_bytes: usize,
 ) -> Result<(), Error> {
-    let bytes = tc5::atom_bytes(src.rows as usize, src.x.width as usize, fmt.gran() as usize);
-    zero(ctx, op, atoms, bytes)?;
+    zero(ctx, op, atoms, atom_bytes)?;
     launch(ctx, op, fmt, 0, src, codes, atoms, 0)
 }
 
@@ -243,32 +258,6 @@ pub fn scales_to_atoms(
             stated(op, rows)?.arg(),
             stated(op, cols)?.arg(),
             stated(op, div.max(1))?.arg(),
-        ],
-    )
-}
-
-/// `folded[e][r] = input_scales[e] · tensor_scales[e][r]`: the one factor a
-/// bf16 product of [`read_back`] values multiplies a row's sum by.
-pub fn fold_input_scales(
-    ctx: &Ctx,
-    op: &'static str,
-    tensor_scales: u64,
-    input_scales: u64,
-    folded: u64,
-    experts: u32,
-    rows: u32,
-) -> Result<(), Error> {
-    let n = u32::try_from(u64::from(experts) * u64::from(rows))
-        .map_err(|_| refuse(op, format!("{experts} x {rows} scales overflow a launch")))?;
-    ctx.fire(
-        op,
-        Fire::at(FILE, "::pie::linear::fold_input_scales").apply(Launch::flat(n, BLOCK)),
-        &[
-            ArgValue::Ptr(tensor_scales),
-            ArgValue::Ptr(input_scales),
-            ArgValue::Ptr(folded),
-            stated(op, experts)?.arg(),
-            stated(op, rows)?.arg(),
         ],
     )
 }
@@ -327,12 +316,9 @@ pub fn matmul(
         return Ok(());
     }
     let codes = ctx.scratch_stream(op, ACT_CODES, m as usize * fmt.row_bytes(k) as usize)?;
-    let atoms = ctx.scratch_stream(
-        op,
-        ACT_ATOMS,
-        tc5::atom_bytes(m as usize, k as usize, fmt.gran() as usize),
-    )?;
-    quantize(ctx, op, fmt, act, codes as u64, atoms as u64)?;
+    let atom_bytes = tc5::atom_bytes(m as usize, k as usize, fmt.gran() as usize);
+    let atoms = ctx.scratch_stream(op, ACT_ATOMS, atom_bytes)?;
+    quantize(ctx, op, fmt, act, codes as u64, atoms as u64, atom_bytes)?;
     let w_atoms = ctx.scratch_stream(
         op,
         WEIGHT_ATOMS,
@@ -350,5 +336,194 @@ pub fn matmul(
         y.ptr,
         [m, w.n, k],
         alpha,
+    )
+}
+
+/// A routed bank as the grouped tcgen05 GEMM reads it: `codes`
+/// `[experts][n][k]`, its scales laid into atoms of each expert's whole row
+/// blocks, `gran` K a scale, and `alpha_e` a device `f32[experts]` scaling
+/// each expert's product (NVFP4's `input_scale · tensor scale`) or 0.
+#[derive(Clone, Copy, Debug)]
+pub struct Bank {
+    pub codes: u64,
+    pub atoms: u64,
+    pub experts: u32,
+    pub n: u32,
+    pub k: u32,
+    pub elem: tc5::Elem,
+    pub gran: u32,
+    pub alpha_e: u64,
+}
+
+/// A fire of this many tokens or fewer lays its routes out masked, each
+/// expert's rows a block of the fire's tokens (no expert is routed a token
+/// twice); a wider one lays them out contiguous.
+const MASKED_TOKENS: u32 = 64;
+
+const ROUTE_COUNTS: &str = "linear.act_quant.route_counts";
+const ROUTE_OFFSETS: &str = "linear.act_quant.route_offsets";
+const ROUTE_CURSOR: &str = "linear.act_quant.route_cursor";
+const ROUTE_POS: &str = "linear.act_quant.route_pos";
+const GROUPED_Y: &str = "linear.act_quant.grouped_y";
+
+/// `y[route] = quant(x[route or its token]) · W[routes[route]]^T` on one
+/// grouped tcgen05 GEMM, each route's activations quantized under its
+/// expert's global (NVFP4, `input_scales` one an expert); a dropped route
+/// lands zeros.
+#[allow(clippy::too_many_arguments)]
+pub fn select(
+    ctx: &Ctx,
+    op: &'static str,
+    fmt: Format,
+    x: Tensor,
+    routes: Tensor,
+    input_scales: Option<Tensor>,
+    bank: Bank,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    let Bank { experts, n, k, .. } = bank;
+    let tokens = routes.rows;
+    let count = tokens * routes.width;
+    if x.width != k || y.rows != count || y.width != n {
+        return Err(refuse(
+            op,
+            format!(
+                "{} x {} activations, {count} routes, against [{experts}][{n}][{k}] into {} x {}",
+                x.rows, x.width, y.rows, y.width
+            ),
+        ));
+    }
+    if count == 0 {
+        return Ok(());
+    }
+    let div = if x.rows == count { 1 } else { routes.width };
+    let m_max = if tokens <= MASKED_TOKENS { tokens } else { 0 };
+    let e = experts as usize;
+    let i32s = |name, len: usize| -> Result<u64, Error> {
+        Ok(ctx.scratch_stream(op, name, len * 4)? as u64)
+    };
+    let counts = i32s(ROUTE_COUNTS, e)?;
+    let offsets = i32s(ROUTE_OFFSETS, e + 1)?;
+    let cursor = i32s(ROUTE_CURSOR, e)?;
+    let pos = i32s(ROUTE_POS, count as usize)?;
+    zero(ctx, op, counts, e * 4)?;
+    let int = |v: u32| stated(op, v).map(|v| v.arg());
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::linear::route_count").apply(Launch::flat(count, BLOCK)),
+        &[routes.arg(), int(count)?, ArgValue::Ptr(counts)],
+    )?;
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::linear::route_offsets").apply(Launch::flat(32, 32)),
+        &[
+            ArgValue::Ptr(counts),
+            int(experts)?,
+            int(m_max)?,
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(cursor),
+        ],
+    )?;
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::linear::route_place").apply(Launch::flat(count, BLOCK)),
+        &[
+            routes.arg(),
+            int(count)?,
+            ArgValue::Ptr(cursor),
+            ArgValue::Ptr(pos),
+        ],
+    )?;
+
+    let gran = fmt.gran() as usize;
+    let (rows, groups, atom_bytes) = if m_max > 0 {
+        let rows = experts * m_max;
+        let groups = tc5::Groups::Masked { counts, m_max };
+        (
+            rows,
+            groups,
+            tc5::masked_atom_bytes(e, m_max as usize, k as usize, gran),
+        )
+    } else {
+        // Each expert's rows start a whole block apart.
+        let rows = (count + (tc5::GROUP_ALIGN - 1) * experts.min(count))
+            .next_multiple_of(tc5::GROUP_ALIGN);
+        let groups = tc5::Groups::Contiguous { offsets, rows };
+        (
+            rows,
+            groups,
+            tc5::atom_bytes(rows as usize, k as usize, gran),
+        )
+    };
+    let codes = ctx.scratch_stream(op, ACT_CODES, rows as usize * fmt.row_bytes(k) as usize)?;
+    let atoms = ctx.scratch_stream(op, ACT_ATOMS, atom_bytes)?;
+    let src = Source {
+        x,
+        rows: count,
+        div,
+        // A dropped route lands nowhere; NVFP4 reads each route's expert's
+        // global.
+        routes: (fmt == Format::Nvfp4).then_some(routes),
+        input_scales,
+        pos,
+        m_max,
+    };
+    quantize(ctx, op, fmt, src, codes as u64, atoms as u64, atom_bytes)?;
+    let grouped = ctx.scratch_stream(op, GROUPED_Y, rows as usize * n as usize * 2)? as u64;
+    let a_elem = match fmt {
+        Format::Nvfp4 => tc5::Elem::E2m1,
+        Format::E4m3 { .. } => tc5::Elem::E4m3,
+    };
+    tc5::grouped_gemm(
+        ctx,
+        tc5::Operand::scaled(codes as u64, a_elem, atoms as u64, fmt.gran()),
+        tc5::Operand::scaled(bank.codes, bank.elem, bank.atoms, bank.gran),
+        grouped,
+        tc5::Grouped {
+            experts,
+            groups,
+            alpha_e: bank.alpha_e,
+        },
+        [n, k],
+        1.0,
+        count,
+    )?;
+    let pairs = u32::try_from(u64::from(count) * u64::from(n / 2))
+        .map_err(|_| refuse(op, format!("{count} routes of {n} overflow a launch")))?;
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::linear::route_gather").apply(Launch::flat(pairs, BLOCK)),
+        &[
+            ArgValue::Ptr(grouped),
+            ArgValue::Ptr(pos),
+            y.arg(),
+            int(count)?,
+            int(n)?,
+        ],
+    )
+}
+
+/// `alpha[e] = input_scales[e] · tensor_scales[e][0]`: an NVFP4 bank's
+/// per-expert product scale, its first row's tensor scale standing for the
+/// expert's (vLLM reads a gated bank's gate leg's for both legs).
+pub fn expert_alpha(
+    ctx: &Ctx,
+    op: &'static str,
+    input_scales: u64,
+    tensor_scales: u64,
+    alpha: u64,
+    experts: u32,
+    rows: u32,
+) -> Result<(), Error> {
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::linear::expert_alpha").apply(Launch::flat(experts, BLOCK)),
+        &[
+            ArgValue::Ptr(input_scales),
+            ArgValue::Ptr(tensor_scales),
+            ArgValue::Ptr(alpha),
+            stated(op, experts)?.arg(),
+            stated(op, rows)?.arg(),
+        ],
     )
 }

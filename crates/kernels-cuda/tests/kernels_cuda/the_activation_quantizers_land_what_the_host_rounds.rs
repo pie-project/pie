@@ -3,7 +3,8 @@
 use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::linear::act_quant::{
-    Format, Source, Weight, matmul, quantize, read_back, scales_to_atoms,
+    Bank, Format, Source, Weight, expert_alpha, matmul, quantize, read_back, scales_to_atoms,
+    select,
 };
 use kernels_cuda::linear::tc5::{Elem, atom_bytes, atom_offset, supported};
 use kernels_cuda::tensor::Tensor;
@@ -103,7 +104,16 @@ fn e4m3_codes_and_atoms(gran: usize) {
     let ctx = gpu.ctx();
     let fmt = Format::E4m3 { gran: gran as u32 };
     let src = Source::rows(Tensor::new(x_at, rows as u32, k as u32, Dtype::Bf16), None);
-    quantize(&ctx, OP, fmt, src, codes_at, atoms_at).expect("the quantizer fires");
+    quantize(
+        &ctx,
+        OP,
+        fmt,
+        src,
+        codes_at,
+        atoms_at,
+        atom_bytes(rows, k, gran),
+    )
+    .expect("the quantizer fires");
     read_back(&ctx, OP, fmt, src, values_at).expect("the read-back fires");
     gpu.sync();
     let codes: Vec<u8> = gpu.down(codes_at, rows * k);
@@ -154,7 +164,16 @@ fn nvfp4_codes_and_atoms() {
         Tensor::new(x_at, rows as u32, k as u32, Dtype::Bf16),
         Some(Tensor::new(is_at, 1, 1, Dtype::F32)),
     );
-    quantize(&ctx, OP, Format::Nvfp4, src, codes_at, atoms_at).expect("the quantizer fires");
+    quantize(
+        &ctx,
+        OP,
+        Format::Nvfp4,
+        src,
+        codes_at,
+        atoms_at,
+        atom_bytes(rows, k, 16),
+    )
+    .expect("the quantizer fires");
     read_back(&ctx, OP, Format::Nvfp4, src, values_at).expect("the read-back fires");
     gpu.sync();
     let codes: Vec<u8> = gpu.down(codes_at, rows * k / 2);
@@ -232,6 +251,8 @@ fn routed_nvfp4_reads_each_expert_global() {
                 Dtype::I32,
             )),
             input_scales: Some(Tensor::new(is_at, experts as u32, 1, Dtype::F32)),
+            pos: 0,
+            m_max: 0,
         },
         routed_at,
     )
@@ -379,4 +400,160 @@ fn the_activation_quantizers_land_what_the_host_rounds_every_case() {
     w4a8_matmul(7, 256, 512, 128);
     w4a8_matmul(200, 384, 1024, 128);
     w4a8_matmul(64, 128, 256, 32);
+    for tokens in [3, 40, 150] {
+        routed_select(Format::Nvfp4, tokens, true);
+        routed_select(Format::E4m3 { gran: 128 }, tokens, true);
+    }
+    routed_select(Format::Nvfp4, 70, false);
+    routed_select(Format::E4m3 { gran: 128 }, 5, false);
+}
+
+/// A routed bank on the grouped tcgen05 GEMM, masked (few tokens) or
+/// contiguous: each route the dot of its read-back activations (under its
+/// expert's global) and its expert's dequantized weight, times the expert's
+/// product scale.
+fn routed_select(fmt: Format, tokens: usize, by_token: bool) {
+    let (experts, top_k, n, k) = (8usize, 3usize, 256usize, 512usize);
+    let nvfp4 = fmt == Format::Nvfp4;
+    let gran = if nvfp4 { 16 } else { 32 };
+    let mut lcg = Lcg::seeded(0x5e1 ^ (tokens * 7 + usize::from(by_token)) as u64);
+    let count = tokens * top_k;
+    let act_rows = if by_token { tokens } else { count };
+    let (raw, _) = activations(&mut lcg, act_rows, k);
+    let mut routes: Vec<i32> = (0..count)
+        .map(|r| ((r / top_k * 5 + r % top_k * 3 + r / 97) % experts) as i32)
+        .collect();
+    routes[1] = -1;
+    let input_scales: Vec<f32> = (0..experts).map(|e| 0.004 + 0.003 * e as f32).collect();
+    let tensor: Vec<f32> = (0..experts * n)
+        .map(|r| 0.5 + (r / n) as f32 * 0.125)
+        .collect();
+    let mut codes = vec![0u8; experts * n * k / 2];
+    let mut w = vec![0f32; experts * n * k];
+    let scales: Vec<u8> = (0..experts * n * k / gran)
+        .map(|i| {
+            if nvfp4 {
+                0x30 + (i * 5 % 16) as u8
+            } else {
+                121 + (i * 7 % 12) as u8
+            }
+        })
+        .collect();
+    for i in 0..experts * n * k {
+        let code = ((lcg.unit() + 1.0) * 8.0) as u8 & 0xf;
+        codes[i / 2] |= code << (4 * (i % 2));
+        let s = scales[i / gran];
+        w[i] = e2m1(code)
+            * if nvfp4 {
+                e4m3(s)
+            } else {
+                2f32.powi(i32::from(s) - 127)
+            };
+    }
+    let mut gpu = Gpu::open();
+    let x_at = gpu.up(&raw);
+    let routes_at = gpu.up(&routes);
+    let is_at = gpu.up(&input_scales);
+    let ts_at = gpu.up(&tensor);
+    let codes_at = gpu.up(&codes);
+    let scales_at = gpu.up(&scales);
+    let atoms_at = gpu.zeros(atom_bytes(experts * n, k, gran));
+    let alpha_at = gpu.zeros(experts * 4);
+    let y_at = gpu.zeros(count * n * 2);
+    let values_at = gpu.zeros(count * k * 2);
+    let ctx = gpu.ctx();
+    let x = Tensor::new(x_at, act_rows as u32, k as u32, Dtype::Bf16);
+    let route_t = Tensor::new(routes_at, tokens as u32, top_k as u32, Dtype::I32);
+    let globals = nvfp4.then(|| Tensor::new(is_at, experts as u32, 1, Dtype::F32));
+    scales_to_atoms(
+        &ctx,
+        OP,
+        scales_at,
+        atoms_at,
+        (experts * n) as u32,
+        (k / gran) as u32,
+        1,
+    )
+    .expect("the bank's atoms land");
+    if nvfp4 {
+        expert_alpha(&ctx, OP, is_at, ts_at, alpha_at, experts as u32, n as u32)
+            .expect("the product scales land");
+    }
+    let mut y = Tensor::new(y_at, count as u32, n as u32, Dtype::Bf16);
+    select(
+        &ctx,
+        OP,
+        fmt,
+        x,
+        route_t,
+        globals,
+        Bank {
+            codes: codes_at,
+            atoms: atoms_at,
+            experts: experts as u32,
+            n: n as u32,
+            k: k as u32,
+            elem: Elem::E2m1,
+            gran: gran as u32,
+            alpha_e: if nvfp4 { alpha_at } else { 0 },
+        },
+        &mut y,
+    )
+    .expect("the routed product fires");
+    let div = if by_token { top_k } else { 1 };
+    read_back(
+        &ctx,
+        OP,
+        fmt,
+        Source {
+            x,
+            rows: count as u32,
+            div: div as u32,
+            routes: nvfp4.then_some(route_t),
+            input_scales: globals,
+            pos: 0,
+            m_max: 0,
+        },
+        values_at,
+    )
+    .expect("the read-back fires");
+    gpu.sync();
+    let got: Vec<u16> = gpu.down(y_at, count * n);
+    let a: Vec<f32> = gpu
+        .down::<u16>(values_at, count * k)
+        .into_iter()
+        .map(from_bf16)
+        .collect();
+    let mut bad = 0;
+    for r in 0..count {
+        for c in 0..n {
+            let g = from_bf16(got[r * n + c]);
+            if routes[r] < 0 {
+                assert_eq!(g, 0.0, "dropped route {r}");
+                continue;
+            }
+            let e = routes[r] as usize;
+            let alpha = if nvfp4 {
+                input_scales[e] * tensor[e * n]
+            } else {
+                1.0
+            };
+            let want: f64 = (0..k)
+                .map(|i| f64::from(a[r * k + i]) * f64::from(w[(e * n + c) * k + i]))
+                .sum::<f64>()
+                * f64::from(alpha);
+            if !close(g, want as f32) {
+                bad += 1;
+                if bad <= 5 {
+                    eprintln!("{fmt:?} route {r} (expert {e}) column {c}: got {g} want {want}");
+                }
+            }
+        }
+    }
+    assert_eq!(
+        bad,
+        0,
+        "{fmt:?} {tokens} tokens: {bad} of {} outputs off",
+        count * n
+    );
 }

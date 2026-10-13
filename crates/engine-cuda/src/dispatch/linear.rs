@@ -571,7 +571,7 @@ impl Run<'_> {
             }
             Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
                 let x = self.tensor(*x);
-                self.select_quant(x, *bank, *routes, *y, None)
+                self.select_quant(x, *bank, *routes, *y)
             }
             Linear::MoeMatmulSelectActQuant {
                 x,
@@ -632,23 +632,18 @@ impl Run<'_> {
         }
     }
 
-    /// A quantized bank's select of `x`, an nvfp4 bank's row tensor scales
-    /// replaced by `folded` when stated.
+    /// A quantized bank's select of `x`.
     fn select_quant(
         &mut self,
         x: Tensor,
         bank: ValueId,
         routes: ValueId,
         y: ValueId,
-        folded: Option<Tensor>,
     ) -> Result<(), kernels_cuda::Error> {
         let (codes, scales, biases, seat) = self.planes(bank);
         let routes = self.tensor(routes);
         if codes.dtype == Dtype::Nvfp4 {
-            let tensor_scales = match folded {
-                Some(folded) => folded,
-                None => tensor_scales("linear.moe_matmul_select_quant", biases)?,
-            };
+            let tensor_scales = tensor_scales("linear.moe_matmul_select_quant", biases)?;
             let (codes, scales, tensor_scales, routes, seat) =
                 match self.staged_experts(codes, scales, Some(tensor_scales), routes) {
                     Some((codes, scales, Some(tensor_scales), routes)) => {
@@ -686,14 +681,9 @@ impl Run<'_> {
         )
     }
 
-    /// A select whose activations are quantized first: NVFP4 against an
-    /// NVFP4 bank, each route under its expert's static global, or e4m3 in
-    /// `gran`s against an MXFP4 bank. Until the grouped tcgen05 GEMM lands
-    /// they are read back to bf16 (each `q · sf` exact) and multiplied by the
-    /// bank's bf16 select, the global folded into the row tensor scales: the
-    /// low-precision product's every product, summed in another order.
-    // INTERIM(tc5::grouped_gemm): the grouped tcgen05 GEMM of the codes and
-    // atoms `act_quant::quantize` lands replaces the read-back here.
+    /// A select whose activations are quantized first, on the grouped
+    /// tcgen05 GEMM: NVFP4 against an NVFP4 bank, each route under its
+    /// expert's static global, or e4m3 in `gran`s against an MXFP4 bank.
     fn select_act_quant(
         &mut self,
         x: ValueId,
@@ -705,11 +695,20 @@ impl Run<'_> {
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "linear.moe_matmul_select_act_quant";
         lowp(OP)?;
-        let (codes, _, biases, _) = self.planes(bank);
+        let (codes, scales, biases, seat) = self.planes(bank);
+        if seat.streams() || crate::device::alloc::is_host_pointer(codes.ptr) {
+            return Err(kernels_cuda::Error::Backend {
+                op: OP,
+                detail: "a low-precision select reads a resident bank, and this one is \
+                         seated by a streaming tier"
+                    .to_string(),
+            });
+        }
         let x = self.tensor(x);
         let route_t = self.tensor(routes);
-        let count = route_t.rows * route_t.width;
-        match (codes.dtype, quant) {
+        let mut out = self.tensor(y);
+        let (experts, n, k) = (codes.rows, out.width, x.width);
+        let (fmt, elem, gran, alpha_e) = match (codes.dtype, quant) {
             (Dtype::Nvfp4, ActQuant::Nvfp4) => {
                 let globals = self.tensor(input_scales.ok_or_else(|| {
                     kernels_cuda::Error::Backend {
@@ -720,61 +719,69 @@ impl Run<'_> {
                     }
                 })?);
                 let tensor_scales = tensor_scales(OP, biases)?;
-                let div = if x.rows == count { 1 } else { route_t.width };
-                let bytes = count as usize * x.width as usize * 2;
-                let out = self.ctx().scratch_stream(OP, ROUTED_ACTS, bytes)? as u64;
-                let xq = act_quant::read_back(
+                let alpha = self
+                    .ctx()
+                    .scratch_stream(OP, EXPERT_ALPHA, experts as usize * 4)?
+                    as u64;
+                act_quant::expert_alpha(
                     self.ctx(),
                     OP,
-                    act_quant::Format::Nvfp4,
-                    act_quant::Source {
-                        x,
-                        rows: count,
-                        div,
-                        routes: Some(route_t),
-                        input_scales: Some(globals),
-                    },
-                    out,
-                )?;
-                let experts = tensor_scales.rows;
-                let rows = tensor_scales.width / 4;
-                let folded = self.ctx().scratch_stream(
-                    OP,
-                    FOLDED_SCALES,
-                    experts as usize * rows as usize * 4,
-                )? as u64;
-                act_quant::fold_input_scales(
-                    self.ctx(),
-                    OP,
-                    tensor_scales.ptr,
                     globals.ptr,
-                    folded,
+                    tensor_scales.ptr,
+                    alpha,
                     experts,
-                    rows,
+                    n,
                 )?;
-                let folded = Tensor::new(folded, experts, tensor_scales.width, tensor_scales.dtype);
-                self.select_quant(xq, bank, routes, y, Some(folded))
+                (act_quant::Format::Nvfp4, linear::tc5::Elem::E2m1, 16, alpha)
             }
-            (Dtype::Mxfp4, ActQuant::E4m3 { gran }) => {
-                let bytes = x.rows as usize * x.width as usize * 2;
-                let out = self.ctx().scratch_stream(OP, ROUTED_ACTS, bytes)? as u64;
-                let xq = act_quant::read_back(
-                    self.ctx(),
-                    OP,
-                    act_quant::Format::E4m3 { gran },
-                    act_quant::Source::rows(x, None),
-                    out,
-                )?;
-                self.select_quant(xq, bank, routes, y, None)
+            (Dtype::Mxfp4, ActQuant::E4m3 { gran }) => (
+                act_quant::Format::E4m3 { gran },
+                linear::tc5::Elem::E2m1,
+                32,
+                0,
+            ),
+            (stored, quant) => {
+                return Err(kernels_cuda::Error::Backend {
+                    op: OP,
+                    detail: format!(
+                        "a {stored:?} bank has no select against {quant:?} activations; \
+                         NVFP4 banks take NVFP4 activations and MXFP4 banks e4m3"
+                    ),
+                });
             }
-            (stored, quant) => Err(kernels_cuda::Error::Backend {
-                op: OP,
-                detail: format!(
-                    "a {stored:?} bank has no select against {quant:?} activations; NVFP4 \
-                     banks take NVFP4 activations and MXFP4 banks e4m3"
-                ),
-            }),
-        }
+        };
+        // The bank's scales laid into each expert's whole row blocks, each
+        // fire: an artifact stores them row-major.
+        let atom_bytes = linear::tc5::atom_bytes((experts * n) as usize, k as usize, gran);
+        let atoms = self.ctx().scratch_stream(OP, BANK_ATOMS, atom_bytes)? as u64;
+        act_quant::scales_to_atoms(
+            self.ctx(),
+            OP,
+            scales.ptr,
+            atoms,
+            experts * n,
+            k / gran as u32,
+            1,
+        )?;
+        act_quant::select(
+            self.ctx(),
+            OP,
+            fmt,
+            x,
+            route_t,
+            input_scales.map(|v| self.tensor(v)),
+            act_quant::Bank {
+                codes: codes.ptr,
+                atoms,
+                experts,
+                n,
+                k,
+                elem,
+                gran: gran as u32,
+                alpha_e,
+            },
+            &mut out,
+        )
     }
 
     /// A projection whose activations are quantized first, on the tcgen05
@@ -977,11 +984,11 @@ fn lowp(op: &'static str) -> Result<(), kernels_cuda::Error> {
     })
 }
 
-/// A select's quantized activations read back to bf16, one a stream.
-const ROUTED_ACTS: &str = "linear.act_quant.routed";
+/// A routed bank's scales laid into atoms, one a stream.
+const BANK_ATOMS: &str = "linear.act_quant.bank_atoms";
 
-/// An nvfp4 bank's row tensor scales times its experts' input scales.
-const FOLDED_SCALES: &str = "linear.act_quant.folded";
+/// An NVFP4 bank's per-expert product scales, one a stream.
+const EXPERT_ALPHA: &str = "linear.act_quant.expert_alpha";
 
 const STAGED_EXPERT_BYTES: u64 = 1536 * 1024 * 1024;
 
