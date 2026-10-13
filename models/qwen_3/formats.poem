@@ -41,6 +41,15 @@ LAYOUTS = [
         head = "lm_head.weight",
         tower = "model.visual.",
         mlx = False,
+        config = "text_config.",
+    ),
+    struct(
+        name = "transformers_text",
+        trunk = "model.",
+        head = "lm_head.weight",
+        tower = None,
+        mlx = False,
+        config = "",
     ),
     struct(
         name = "mlx_lm",
@@ -48,6 +57,7 @@ LAYOUTS = [
         head = "language_model.lm_head.weight",
         tower = "vision_tower.",
         mlx = True,
+        config = "text_config.",
     ),
 ]
 
@@ -148,9 +158,12 @@ def formats(m):
             read = lambda reads: gguf(m, reads),
         )]
     arch = text_attribute("general.architecture") or ""
-    states = configured(m, "text_config.")
     return [
-        safetensors_format(layout, lambda reads, layout: safetensors(m, reads, layout), states)
+        safetensors_format(
+            layout,
+            lambda reads, layout: safetensors(m, reads, layout),
+            configured(m, layout.config),
+        )
         for layout in LAYOUTS
     ] + [
         format(
@@ -232,6 +245,8 @@ def safetensors(m, reads, layout):
             reads.read(w.mlp.down, n("mlp.down_proj.weight"))
 
     if m.tower != None:
+        if layout.tower == None:
+            fail("a {} checkpoint holds no vision tower; import this deployment without it".format(layout.name))
         read_tower(reads, m.tower, layout.tower, layout.mlx)
 
     if m.mtp != None:

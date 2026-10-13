@@ -1094,6 +1094,23 @@ FAMILIES: dict[str, dict[str, Any]] = {
         text_cfg_key="text_config",
         keep_res=(re.compile(r"^model\.visual\."),),
     ),
+    # The same decoder shipped text-only, as `Qwen3_5MoeForCausalLM` (Qwen3.8
+    # Max): the trunk at `model.layers.` with no wrapper, the configuration
+    # flat at the top level, no tower to keep.
+    "qwen3_5_moe_text": dict(
+        layer_prefix="model.layers.",
+        expert_re=None,
+        router_suffixes=(
+            "mlp.gate.weight",
+            "mlp.experts.gate_up_proj",
+            "mlp.experts.down_proj",
+        ),
+        globals_keep=("model.embed_tokens.weight",
+                      "model.norm.weight",
+                      "lm_head.weight"),
+        default_layers="0-7",
+        config_rewrite=_rewrite_qwen3_5_moe,
+    ),
     # The same architecture as `mlx_lm.convert` leaves it, which is a different
     # *checkpoint* -- the `deepseek_v4` / `deepseek_v4_mlx` split again. Two
     # things move: the wrapper and the trunk swap places, so the prefix is

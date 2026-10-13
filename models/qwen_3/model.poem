@@ -225,6 +225,14 @@ def a17b(**over):
     d.update(over)
     return d
 
+def a95b(**over):
+    """Qwen3.8 Max (2.4T-A95B), text only."""
+    d = dims(hidden = 8192, layers = 92, attn_every = 4, q_heads = 64, kv_heads = 4, head_dim = 256,
+             rotary_dim = 64, k_heads = 16, v_heads = 128, k_dim = 128, v_dim = 128,
+             mlp = moe(512, 10, 2048, 2048), vocab = 248320, tied = False)
+    d.update(over)
+    return d
+
 def micro_text(head_dim, rotate_kv):
     return dims(hidden = 128, layers = 2, attn_every = 1, q_heads = 4, kv_heads = 2, head_dim = head_dim,
                 rotary_dim = 16, k_heads = 4, v_heads = 4, k_dim = head_dim, v_dim = head_dim,
@@ -247,6 +255,8 @@ FIXED = {
     "qwen36-35b-a3b-mini": a3b(layers = 5, mlp = moe(16, 8, 512, 512)),
     "qwen36-35b-a3b-mini64": a3b(layers = 5, mlp = moe(64, 8, 512, 512)),
     "ornith15-397b-mini": a17b(layers = 5, mlp = moe(16, 10, 1024, 1024)),
+    "qwen38-max": a95b(),
+    "qwen38-max-mini": a95b(layers = 5, mlp = moe(16, 10, 2048, 2048)),
     "qwen3-a3b-micro": dims(hidden = 512, layers = 4, attn_every = 1, q_heads = 8, kv_heads = 2,
                             head_dim = 64, rotary_dim = 64, k_heads = 8, v_heads = 8, k_dim = 64,
                             v_dim = 64, mlp = moe(32, 4, 128, 128), vocab = 2048, tied = True),
