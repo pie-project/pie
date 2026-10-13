@@ -1,7 +1,9 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{
+    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
+};
 use crate::tensor::Tensor;
 
 const FILE: &str = "elemwise/hc.hip";
@@ -9,6 +11,37 @@ const FILE: &str = "elemwise/hc.hip";
 const BLOCK: u32 = 256;
 
 const MAX_HC_MULT: u32 = 8;
+
+/// The stream kernels' threads a block. A thread takes 8 columns, so a
+/// 4096-wide stream row is four blocks.
+const CHUNK_BLOCK: u32 = 128;
+
+/// The row norm's threads a block, and the 8-column packs a thread holds in
+/// registers between the norm's sum and its store.
+const NORM_BLOCK: u32 = 512;
+const NORM_CAP: u32 = 8;
+
+/// Whether a kernel over `hidden`-wide 2-byte rows moves 16-byte packs:
+/// every row starts 16-byte aligned when the width is a multiple of 8 and
+/// every plane does.
+fn packs(hidden: u32, planes: &[&Tensor]) -> &'static str {
+    if hidden.is_multiple_of(8) && planes.iter().all(|t| t.ptr.is_multiple_of(16)) {
+        "::pie::true_type::value"
+    } else {
+        "::pie::false_type::value"
+    }
+}
+
+/// A stream kernel's launch: block (n, lead + c) over chunk c of row n,
+/// after `lead` blocks a row that do something else.
+fn per_chunk(op: &'static str, rows: u32, hidden: u32, lead: u32) -> Result<Launch, Error> {
+    nonzero(op, "rows", rows)?;
+    nonzero(op, "the hidden width", hidden)?;
+    Ok(Launch::grid(
+        [rows, lead + hidden.div_ceil(8 * CHUNK_BLOCK), 1],
+        [CHUNK_BLOCK, 1, 1],
+    ))
+}
 
 fn stream_fan(op: &'static str, wide: u32, hidden: u32) -> Result<u32, Error> {
     nonzero(op, "the hidden width", hidden)?;
@@ -34,19 +67,6 @@ fn stream_fan(op: &'static str, wide: u32, hidden: u32) -> Result<u32, Error> {
     Ok(fan)
 }
 
-fn elementwise_in(op: &'static str, rows: u32, width: u32) -> Result<Launch, Error> {
-    nonzero(op, "rows", rows)?;
-    nonzero(op, "width", width)?;
-    let n = u64::from(rows) * u64::from(width);
-    let lanes = u32::try_from(n).map_err(|_| {
-        refuse(
-            op,
-            format!("{n} elements do not fit a 32-bit launch extent"),
-        )
-    })?;
-    Ok(Launch::flat(lanes, BLOCK))
-}
-
 pub fn expand(ctx: &Ctx, x: Tensor, streams: u32, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.hc_expand";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -56,18 +76,17 @@ pub fn expand(ctx: &Ctx, x: Tensor, streams: u32, y: &mut Tensor) -> Result<(), 
         fan, streams,
         "the row's stream fan is the count the statement states"
     );
+    let vec = packs(x.width, &[&x, y]);
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::hc_expand<{t}>")))
-            .apply(elementwise_in(OP, x.rows, x.width)?),
-        &[
-            x.arg(),
-            y.arg(),
-            stated(OP, x.rows)?.arg(),
-            stated(OP, fan)?.arg(),
-            stated(OP, x.width)?.arg(),
-            ctx.stage(),
-        ],
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::hc_expand<{t}, {fan}, {CHUNK_BLOCK}, {vec}>"
+            )),
+        )
+        .apply(per_chunk(OP, x.rows, x.width, 0)?),
+        &[x.arg(), y.arg(), stated(OP, x.width)?.arg(), ctx.stage()],
     )
 }
 
@@ -80,18 +99,94 @@ pub fn rmsnorm_f32(ctx: &Ctx, streams: Tensor, eps: f32, y: &mut Tensor) -> Resu
         "the normed rectangle is the stream rectangle"
     );
     nonzero(OP, "rows", y.rows)?;
+    let dim = nonzero(OP, "the normed row's width", y.width)?;
+    // The row held in registers needs whole, aligned packs that fit.
+    let vec = dim.is_multiple_of(8)
+        && dim / 8 <= NORM_BLOCK * NORM_CAP
+        && streams.ptr.is_multiple_of(16)
+        && y.ptr.is_multiple_of(16);
+    let vec = if vec {
+        "::pie::true_type::value"
+    } else {
+        "::pie::false_type::value"
+    };
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::elemwise::hc_rmsnorm_f32<::pie::bf16, 256>")
-            .apply(Launch::per_row(y.rows, BLOCK)),
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::hc_rmsnorm_f32<::pie::bf16, {NORM_BLOCK}, {NORM_CAP}, {vec}>"
+            )),
+        )
+        .apply(Launch::per_row(y.rows, NORM_BLOCK)),
         &[
             streams.arg(),
             y.arg(),
-            stated(OP, nonzero(OP, "the normed row's width", y.width)?)?.arg(),
+            stated(OP, dim)?.arg(),
             eps.arg(),
             ctx.stage(),
         ],
     )
+}
+
+/// The rows a tile of the tiled projection takes.
+const PROJECT_ROWS: u32 = 16;
+/// The tiled projection's wavefronts a block; each walks 64 k a step.
+const PROJECT_WAVES: u32 = 4;
+/// The most K slices it sums (`hc_project_sum` holds one a register).
+const PROJECT_SLICES: u32 = 64;
+
+/// How the tiled projection cuts its rows and K: `nt` 16-row tiles a
+/// wavefront (two past one tile), `tiles` row blocks, and K in `slices`
+/// slices of `per`, sliced until the blocks cover the compute units once, a
+/// slice at least one step of every wavefront.
+#[derive(Clone, Copy)]
+struct Slicing {
+    nt: u32,
+    tiles: u32,
+    per: u32,
+    slices: u32,
+}
+
+impl Slicing {
+    fn of(rows: u32, fan: u32) -> Self {
+        let nt = if rows > PROJECT_ROWS { 2 } else { 1 };
+        let tiles = rows.div_ceil(PROJECT_ROWS * nt);
+        let grain = 64 * PROJECT_WAVES;
+        let want = crate::linear::compute_units()
+            .div_ceil(tiles)
+            .clamp(1, fan.div_ceil(grain).min(PROJECT_SLICES));
+        let per = fan.div_ceil(want).div_ceil(grain) * grain;
+        Self {
+            nt,
+            tiles,
+            per,
+            slices: fan.div_ceil(per),
+        }
+    }
+
+    fn launch(self) -> Launch {
+        Launch::grid([self.slices, self.tiles, 1], [64 * PROJECT_WAVES, 1, 1])
+    }
+
+    /// The slices' partial sums, `[slices][rows][width]` f32, when there
+    /// is more than one slice (or `always`).
+    fn part(
+        self,
+        ctx: &Ctx,
+        op: &'static str,
+        rows: u32,
+        width: u32,
+        always: bool,
+    ) -> Result<ArgValue, Error> {
+        if self.slices == 1 && !always {
+            return Ok(ArgValue::ABSENT);
+        }
+        let bytes = self.slices as usize * rows as usize * width as usize * 4;
+        Ok(ArgValue::Ptr(
+            ctx.scratch(op, "elementwise.hc_project_part", bytes)? as usize as u64,
+        ))
+    }
 }
 
 pub fn project(
@@ -142,18 +237,59 @@ pub fn project(
         ));
     }
     let rows = nonzero(OP, "rows", mixes.rows)?;
+    if !fan.is_multiple_of(64) || !normed.ptr.is_multiple_of(16) || !hc_fn.ptr.is_multiple_of(16) {
+        return ctx.fire(
+            OP,
+            Fire::at(FILE, "::pie::elemwise::hc_project<256>")
+                .apply(Launch::grid([rows * mix_hc, 1, 1], [BLOCK, 1, 1])),
+            &[
+                normed.arg(),
+                hc_fn.arg(),
+                mixes.arg(),
+                stated(OP, fan)?.arg(),
+                stated(OP, mix_hc)?.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
+
+    let plan = Slicing::of(rows, fan);
+    let part = plan.part(ctx, OP, rows, mix_hc, false)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::elemwise::hc_project<256>")
-            .apply(Launch::grid([rows * mix_hc, 1, 1], [BLOCK, 1, 1])),
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::hc_project_tiled<{mix_hc}, {}, {PROJECT_WAVES}>",
+                plan.nt
+            )),
+        )
+        .apply(plan.launch()),
         &[
             normed.arg(),
             hc_fn.arg(),
+            part,
             mixes.arg(),
+            stated(OP, rows)?.arg(),
             stated(OP, fan)?.arg(),
-            stated(OP, mix_hc)?.arg(),
+            stated(OP, plan.per)?.arg(),
             ctx.stage(),
         ],
+    )?;
+    if plan.slices == 1 {
+        return Ok(());
+    }
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::hc_project_sum<{mix_hc}, {}>",
+                plan.slices
+            )),
+        )
+        .apply(Launch::flat(rows * mix_hc, 64)),
+        &[part, mixes.arg(), stated(OP, rows)?.arg(), ctx.stage()],
     )
 }
 
@@ -190,14 +326,16 @@ pub fn gates(
         post_mix.width == fan && comb_mix.width == fan * fan,
         "the gate matrices are `[N, M]` and `[N, M, M]`"
     );
-    nonzero(OP, "rows", x.rows)?;
+    let vec = packs(x.width, &[&streams, x]);
     ctx.fire(
         OP,
         Fire::at(
             FILE,
-            symbol(&format!("::pie::elemwise::hc_gates<{t}, 256>")),
+            symbol(&format!(
+                "::pie::elemwise::hc_gates<{t}, {fan}, {CHUNK_BLOCK}, {vec}>"
+            )),
         )
-        .apply(Launch::per_row(x.rows, BLOCK)),
+        .apply(per_chunk(OP, x.rows, x.width, 1)?),
         &[
             normed.arg(),
             scale.arg(),
@@ -206,8 +344,7 @@ pub fn gates(
             post_mix.arg(),
             comb_mix.arg(),
             x.arg(),
-            stated(OP, fan)?.arg(),
-            stated(OP, nonzero(OP, "the hidden width", x.width)?)?.arg(),
+            stated(OP, x.width)?.arg(),
             gate_eps.arg(),
             alpha.arg(),
             stated(OP, sinkhorn)?.arg(),
@@ -235,18 +372,22 @@ pub fn fold(
         post_mix.dtype == Dtype::F32 && comb_mix.dtype == Dtype::F32,
         "`{OP}` reads f32 gate matrices"
     );
+    let vec = packs(x.width, &[&x, &streams, y]);
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::hc_fold<{t}>")))
-            .apply(elementwise_in(OP, y.rows, x.width)?),
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::hc_fold<{t}, {fan}, {CHUNK_BLOCK}, {vec}>"
+            )),
+        )
+        .apply(per_chunk(OP, y.rows, x.width, 0)?),
         &[
             x.arg(),
             streams.arg(),
             post_mix.arg(),
             comb_mix.arg(),
             y.arg(),
-            stated(OP, y.rows)?.arg(),
-            stated(OP, fan)?.arg(),
             stated(OP, x.width)?.arg(),
             ctx.stage(),
         ],
@@ -284,22 +425,23 @@ pub fn collapse(
             ),
         ));
     }
-    nonzero(OP, "rows", y.rows)?;
+    let vec = packs(y.width, &[&streams, y]);
     ctx.fire(
         OP,
         Fire::at(
             FILE,
-            symbol(&format!("::pie::elemwise::hc_head_postprocess<{t}, 256>")),
+            symbol(&format!(
+                "::pie::elemwise::hc_head_postprocess<{t}, {fan}, {CHUNK_BLOCK}, {vec}>"
+            )),
         )
-        .apply(Launch::per_row(y.rows, BLOCK)),
+        .apply(per_chunk(OP, y.rows, y.width, 0)?),
         &[
             mixes.arg(),
             scale.arg(),
             base.arg(),
             streams.arg(),
             y.arg(),
-            stated(OP, fan)?.arg(),
-            stated(OP, nonzero(OP, "the hidden width", y.width)?)?.arg(),
+            stated(OP, y.width)?.arg(),
             hc_eps.arg(),
             ctx.stage(),
         ],
@@ -325,16 +467,20 @@ pub fn mix(
         "the gate rectangle is the stream rectangle"
     );
     debug_assert_eq!(y.rows, normed.rows, "the mix lands one narrow row per row");
-    nonzero(OP, "rows", y.rows)?;
+    let vec = packs(y.width, &[&gates, &normed, y]);
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::hc_mix<{t}, 256>")))
-            .apply(Launch::per_row(y.rows, BLOCK)),
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::elemwise::hc_mix<{t}, {fan}, {CHUNK_BLOCK}, {vec}>"
+            )),
+        )
+        .apply(per_chunk(OP, y.rows, y.width, 0)?),
         &[
             gates.arg(),
             normed.arg(),
             y.arg(),
-            stated(OP, fan)?.arg(),
             stated(OP, y.width)?.arg(),
             ctx.stage(),
         ],
@@ -359,19 +505,20 @@ pub fn inject(
         gates.rows == o.rows && gates.width == fan && hyper.rows == o.rows,
         "one gate logit per stream per row, one wide row per row"
     );
-    nonzero(OP, "rows", o.rows)?;
+    let vec = packs(o.width, &[&o, hyper]);
     ctx.fire(
         OP,
         Fire::at(
             FILE,
-            symbol(&format!("::pie::elemwise::hc_inject<{t}, 256>")),
+            symbol(&format!(
+                "::pie::elemwise::hc_inject<{t}, {fan}, {CHUNK_BLOCK}, {vec}>"
+            )),
         )
-        .apply(Launch::per_row(o.rows, BLOCK)),
+        .apply(per_chunk(OP, o.rows, o.width, 0)?),
         &[
             o.arg(),
             gates.arg(),
             hyper.arg(),
-            stated(OP, fan)?.arg(),
             stated(OP, o.width)?.arg(),
             ctx.stage(),
         ],

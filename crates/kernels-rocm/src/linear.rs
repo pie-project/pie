@@ -9,6 +9,7 @@ pub mod lane_gemm;
 
 #[cfg(feature = "rocm")]
 mod gemv;
+pub(crate) use gemv::compute_units;
 #[cfg(feature = "rocm")]
 mod mgemm;
 #[cfg(feature = "rocm")]

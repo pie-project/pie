@@ -20,6 +20,7 @@
 // gates its rows on the window.
 
 #include "prelude/device.hip"
+#include "prelude/mfma.hip"
 
 namespace pie::elemwise {
 
@@ -29,7 +30,69 @@ __device__ __forceinline__ float sigmoid(float z) { return 1.f / (1.f + expf(-z)
 
 __device__ __forceinline__ float fast_sigmoid(float z) { return 1.f / (1.f + __expf(-z)); }
 
-// mixes[row][o] = Σ_d normed[row][d]·hc_fn[o][d]: one block per (row, o).
+// The streams' kernels split each row along H: block (n, c) takes elements
+// [c·8·BLOCK, (c+1)·8·BLOCK) of row n, every thread a pack of 8 when the
+// launcher found the row 16-byte aligned (VEC) and otherwise 8 elements
+// BLOCK apart. M (the stream count) is a template parameter, so the stream
+// loops unroll and every stream's pack is in flight at once.
+
+template <class T>
+__device__ __forceinline__ void load8(const T* p, float (&v)[8]) {
+    const Pack8<T> q = *reinterpret_cast<const Pack8<T>*>(p);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) v[k] = to_f32(q.v[k]);
+}
+
+template <class T>
+__device__ __forceinline__ void store8(T* p, const float (&v)[8]) {
+    Pack8<T> q;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) q.v[k] = from_f32<T>(v[k]);
+    *reinterpret_cast<Pack8<T>*>(p) = q;
+}
+
+// The column h of chunk `chunk` the thread's k-th element is, and whether it
+// is one: a pack's k-th lane when VEC, otherwise every BLOCK-th column.
+template <int BLOCK, bool VEC>
+__device__ __forceinline__ int column(int chunk, int k) {
+    return VEC ? (chunk * BLOCK + static_cast<int>(threadIdx.x)) * 8 + k
+               : chunk * BLOCK * 8 + k * BLOCK + static_cast<int>(threadIdx.x);
+}
+
+// out[h] = Σ_i g[i]·stream_i[h] over the thread's columns of one row.
+template <class T, int M, int BLOCK, bool VEC>
+__device__ __forceinline__ void combine_streams(const float (&g)[M], const T* __restrict__ res,
+                                                T* __restrict__ out, int H, int chunk) {
+    if constexpr (VEC) {
+        const int h = column<BLOCK, VEC>(chunk, 0);
+        if (h >= H) return;
+        float v[M][8];
+#pragma unroll
+        for (int i = 0; i < M; ++i) load8(res + static_cast<long long>(i) * H + h, v[i]);
+        float acc[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            acc[k] = 0.f;
+#pragma unroll
+            for (int i = 0; i < M; ++i) acc[k] += g[i] * v[i][k];
+        }
+        store8(out + h, acc);
+    } else {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int h = column<BLOCK, VEC>(chunk, k);
+            if (h < H) {
+                float acc = 0.f;
+#pragma unroll
+                for (int i = 0; i < M; ++i) acc += g[i] * to_f32(res[static_cast<long long>(i) * H + h]);
+                out[h] = from_f32<T>(acc);
+            }
+        }
+    }
+}
+
+// mixes[row][o] = Σ_d normed[row][d]·hc_fn[o][d]: one block per (row, o),
+// the fallback for a contraction the tiled form does not take.
 template <int BLOCK = 256>
 __global__ __launch_bounds__(BLOCK) void hc_project(const float* __restrict__ normed,
                                                     const float* __restrict__ hc_fn,
@@ -58,163 +121,310 @@ __global__ __launch_bounds__(BLOCK) void hc_project(const float* __restrict__ no
     if (threadIdx.x == 0) mixes[row * mix_hc + o] = total;
 }
 
+// The mix projection as a K-sliced f32 matrix-core product. Block (s, t)
+// takes rows [16·NT·t, 16·NT·(t+1)) and the K slice [s·per, (s+1)·per); its
+// WAVES wavefronts walk the slice 64 k a step, interleaved, each holding
+// NT x OT v_mfma_f32_16x16x4f32 accumulators: A the plane's rows (16
+// outputs a tile), B the stream rows (16 rows a tile). A lane reads a
+// 16-byte run of k for its row of every operand and feeds its four floats
+// to four steps; A and B read alike, so the product is the same. The waves'
+// tiles add in wave order and the block lands its slice's sums in
+// part[s][n][o] for `hc_project_sum`, or with one slice straight into the
+// mixes. K is a multiple of 64 and both operands 16-byte aligned (the
+// launcher's check).
+template <int O, int NT, int WAVES>
+__global__ __launch_bounds__(WAVES * 64) void hc_project_tiled(const float* __restrict__ normed,
+                                                        const float* __restrict__ hc_fn,
+                                                        float* __restrict__ part,
+                                                        float* __restrict__ mixes, int N, int K,
+                                                        int per, const u32* __restrict__ win) {
+    constexpr int OT = (O + 15) / 16;
+    __shared__ mfma_cd tiles[WAVES - 1][NT][OT][kWave];
+    const int n0 = static_cast<int>(blockIdx.y) * 16 * NT;
+    const Window window{win};
+    if (!window.live(n0)) return;
+    const int l = lane(), w = static_cast<int>(threadIdx.x) / kWave, r = l % 16, g = l / 16;
+    // A row past the launch or the window reads the tile's first row; its
+    // sums are never landed.
+    bool lands[NT];
+    const float* x[NT];
+#pragma unroll
+    for (int b = 0; b < NT; ++b) {
+        const int n = n0 + 16 * b + r;
+        lands[b] = n < N && window.live(n);
+        x[b] = normed + window.plane(lands[b] ? n : n0) * K + 4 * g;
+    }
+    const float* a[OT];
+#pragma unroll
+    for (int t = 0; t < OT; ++t) a[t] = hc_fn + static_cast<long long>(min(16 * t + r, O - 1)) * K + 4 * g;
+
+    mfma_cd acc[NT][OT];
+#pragma unroll
+    for (int b = 0; b < NT; ++b) {
+#pragma unroll
+        for (int t = 0; t < OT; ++t) acc[b][t] = mfma_zero();
+    }
+    const int begin = static_cast<int>(blockIdx.x) * per;
+    const int end = min(K, begin + per);
+    for (int kb = begin + 64 * w; kb < end; kb += 64 * WAVES) {
+        float4 xv[NT][4];
+        float4 av[OT][4];
+#pragma unroll
+        for (int b = 0; b < NT; ++b) {
+#pragma unroll
+            for (int u = 0; u < 4; ++u) xv[b][u] = *reinterpret_cast<const float4*>(x[b] + kb + 16 * u);
+        }
+#pragma unroll
+        for (int t = 0; t < OT; ++t) {
+#pragma unroll
+            for (int u = 0; u < 4; ++u) av[t][u] = *reinterpret_cast<const float4*>(a[t] + kb + 16 * u);
+        }
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+#pragma unroll
+            for (int b = 0; b < NT; ++b) {
+#pragma unroll
+                for (int t = 0; t < OT; ++t) {
+                    acc[b][t] = mfma4_f32(av[t][u].x, xv[b][u].x, acc[b][t]);
+                    acc[b][t] = mfma4_f32(av[t][u].y, xv[b][u].y, acc[b][t]);
+                    acc[b][t] = mfma4_f32(av[t][u].z, xv[b][u].z, acc[b][t]);
+                    acc[b][t] = mfma4_f32(av[t][u].w, xv[b][u].w, acc[b][t]);
+                }
+            }
+        }
+    }
+    if (w > 0) {
+#pragma unroll
+        for (int b = 0; b < NT; ++b) {
+#pragma unroll
+            for (int t = 0; t < OT; ++t) tiles[w - 1][b][t][l] = acc[b][t];
+        }
+    }
+    lds_barrier();
+    if (w > 0) return;
+#pragma unroll
+    for (int b = 0; b < NT; ++b) {
+        if (!lands[b]) continue;
+        const int n = n0 + 16 * b + r;
+#pragma unroll
+        for (int v = 0; v < WAVES - 1; ++v) {
+#pragma unroll
+            for (int t = 0; t < OT; ++t) acc[b][t] += tiles[v][b][t][l];
+        }
+        // The lane's cells: outputs 16t + 4g + e of row n.
+        float* dst = part != nullptr
+                         ? part + (static_cast<long long>(blockIdx.x) * N + n) * O
+                         : mixes + window.plane(n) * O;
+#pragma unroll
+        for (int t = 0; t < OT; ++t) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int o = 16 * t + 4 * g + e;
+                if (o < O) dst[o] = acc[b][t][e];
+            }
+        }
+    }
+}
+
+// The K slices' sums in slice order: mixes[row][o] = Σ_s part[s][n][o],
+// every slice's load in flight at once.
+template <int O, int S>
+__global__ void hc_project_sum(const float* __restrict__ part, float* __restrict__ mixes, int N,
+                               const u32* __restrict__ win) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= N * O) return;
+    const int n = idx / O;
+    const Window window{win};
+    if (!window.live(n)) return;
+    const long long stride = static_cast<long long>(N) * O;
+    const float* p = part + idx;
+    float v[S];
+#pragma unroll
+    for (int s = 0; s < S; ++s) v[s] = p[s * stride];
+    float acc = 0.f;
+#pragma unroll
+    for (int s = 0; s < S; ++s) acc += v[s];
+    mixes[window.plane(n) * O + (idx - n * O)] = acc;
+}
+
+// Sinkhorn on one wavefront: lane t < M² holds combination entry
+// (t / M, t % M), a row or column sum gathers its M entries in index order,
+// and every lane past M² mirrors the last entry. Row softmax (+ eps), then a
+// column normalisation, is the first step; each of the remaining
+// iterations normalises rows, then columns.
+template <int M>
+__device__ __forceinline__ float sinkhorn(float c, float eps, int iters) {
+    const int t = min(lane(), M * M - 1);
+    const int i = t / M, j = t - (t / M) * M;
+    auto row_sum = [&](float v) {
+        float sum = 0.f;
+#pragma unroll
+        for (int jj = 0; jj < M; ++jj) sum += __shfl(v, i * M + jj, kWave);
+        return sum;
+    };
+    auto normalise_column = [&]() {
+        float sum = 0.f;
+#pragma unroll
+        for (int ii = 0; ii < M; ++ii) sum += __shfl(c, ii * M + j, kWave);
+        c /= sum + eps;
+    };
+    float top = __shfl(c, i * M, kWave);
+#pragma unroll
+    for (int jj = 1; jj < M; ++jj) top = fmaxf(top, __shfl(c, i * M + jj, kWave));
+    const float e = expf(c - top);
+    c = e / row_sum(e) + eps;
+    normalise_column();
+    for (int iter = 1; iter < iters; ++iter) {
+        c /= row_sum(c) + eps;
+        normalise_column();
+    }
+    return c;
+}
+
 // The gates of one row from its mix row, then the layer input
-// x = Σ_i pre[i]·stream_i. Lands post[M] and comb[M][M] for `hc_fold`.
-template <class T, int BLOCK = 256>
+// x = Σ_i pre[i]·stream_i. Block (n, 0) lands post[M] and comb[M][M] for
+// `hc_fold` on its first wavefront; block (n, 1 + c) lands chunk c of x,
+// its pre gates its own.
+template <class T, int M, int BLOCK, bool VEC>
 __global__ __launch_bounds__(BLOCK) void hc_gates(
     const float* __restrict__ mixes, const float* __restrict__ scale, const float* __restrict__ base,
     const T* __restrict__ residual, float* __restrict__ post_mix, float* __restrict__ comb_mix,
-    T* __restrict__ layer_input, int M, int H, float hc_eps, float hc_post_alpha,
-    int sinkhorn_iters, const u32* __restrict__ win) {
-    static_assert(BLOCK >= MAX_HC_MULT * MAX_HC_MULT, "a thread per combination entry");
+    T* __restrict__ layer_input, int H, float hc_eps, float hc_post_alpha, int sinkhorn_iters,
+    const u32* __restrict__ win) {
+    static_assert(M >= 1 && M <= MAX_HC_MULT && M * M <= kWave, "a lane per combination entry");
     const Window window{win};
     if (!window.live(blockIdx.x)) return;
     const long long row = window.plane(blockIdx.x);
-    const int tid = threadIdx.x;
     const float* mix = mixes + row * (2 * M + M * M);
 
-    __shared__ float pre[MAX_HC_MULT];
-    __shared__ float comb[MAX_HC_MULT * MAX_HC_MULT];
-
-    if (tid < M) {
-        pre[tid] = sigmoid(mix[tid] * scale[0] + base[tid]) + hc_eps;
-        post_mix[row * M + tid] = sigmoid(mix[M + tid] * scale[1] + base[M + tid]) * hc_post_alpha;
+    if (blockIdx.y == 0) {
+        if (threadIdx.x >= kWave) return;
+        const int l = lane();
+        const int t = min(l, M * M - 1);
+        const float logit = mix[2 * M + t] * scale[2] + base[2 * M + t];
+        const float c = sinkhorn<M>(logit, hc_eps, sinkhorn_iters);
+        if (l < M) post_mix[row * M + l] = sigmoid(mix[M + l] * scale[1] + base[M + l]) * hc_post_alpha;
+        if (l < M * M) comb_mix[row * M * M + l] = c;
+        return;
     }
-    if (tid < M * M) comb[tid] = mix[2 * M + tid] * scale[2] + base[2 * M + tid];
-    lds_barrier();
-
-    // Row softmax (+ eps), then a column normalisation: the first Sinkhorn
-    // step. Each of the remaining iterations normalises rows, then columns.
-    auto normalise_columns = [&]() {
-        if (tid < M) {
-            float sum = 0.f;
-            for (int i = 0; i < M; ++i) sum += comb[i * M + tid];
-            sum += hc_eps;
-            for (int i = 0; i < M; ++i) comb[i * M + tid] /= sum;
-        }
-        lds_barrier();
-    };
-    if (tid < M) {
-        float* r = comb + tid * M;
-        float top = neg_inf();
-        for (int j = 0; j < M; ++j) top = fmaxf(top, r[j]);
-        float sum = 0.f;
-        for (int j = 0; j < M; ++j) {
-            r[j] = expf(r[j] - top);
-            sum += r[j];
-        }
-        for (int j = 0; j < M; ++j) r[j] = r[j] / sum + hc_eps;
-    }
-    lds_barrier();
-    normalise_columns();
-    for (int iter = 1; iter < sinkhorn_iters; ++iter) {
-        if (tid < M) {
-            float* r = comb + tid * M;
-            float sum = 0.f;
-            for (int j = 0; j < M; ++j) sum += r[j];
-            sum += hc_eps;
-            for (int j = 0; j < M; ++j) r[j] /= sum;
-        }
-        lds_barrier();
-        normalise_columns();
-    }
-    if (tid < M * M) comb_mix[row * M * M + tid] = comb[tid];
-
-    const T* res = residual + row * M * H;
-    T* out = layer_input + row * H;
-    for (int h = tid; h < H; h += BLOCK) {
-        float acc = 0.f;
+    float pre[M];
 #pragma unroll
-        for (int i = 0; i < MAX_HC_MULT; ++i) {
-            if (i < M) acc += pre[i] * to_f32(res[static_cast<long long>(i) * H + h]);
-        }
-        out[h] = from_f32<T>(acc);
-    }
+    for (int i = 0; i < M; ++i) pre[i] = sigmoid(mix[i] * scale[0] + base[i]) + hc_eps;
+    combine_streams<T, M, BLOCK, VEC>(pre, residual + row * M * H, layer_input + row * H, H,
+                                      static_cast<int>(blockIdx.y) - 1);
 }
 
 // The streams after the layer: out_j = post[j]·x + Σ_i comb[i][j]·stream_i,
-// one thread per (row, h). `residual` and `out` may be one plane: a thread
-// reads its column of every stream before it writes any.
-template <class T>
-__global__ void hc_fold(const T* __restrict__ x, const T* residual,
-                        const float* __restrict__ post_mix, const float* __restrict__ comb_mix,
-                        T* out, int N, int M, int H, const u32* __restrict__ win) {
-    const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (M > MAX_HC_MULT || idx >= static_cast<long long>(N) * H) return;
-    const int h = static_cast<int>(idx % H);
+// block (n, c) over chunk c of row n. `residual` and `out` may be one plane:
+// a thread reads its columns of every stream before it writes any.
+template <class T, int M, int BLOCK, bool VEC>
+__global__ __launch_bounds__(BLOCK) void hc_fold(const T* __restrict__ x, const T* residual,
+                                                 const float* __restrict__ post_mix,
+                                                 const float* __restrict__ comb_mix, T* out, int H,
+                                                 const u32* __restrict__ win) {
     const Window window{win};
-    if (!window.live(idx / H)) return;
-    const long long row = window.plane(idx / H);
+    if (!window.live(blockIdx.x)) return;
+    const long long row = window.plane(blockIdx.x);
+    const int chunk = static_cast<int>(blockIdx.y);
+    float comb[M * M], post[M];
+#pragma unroll
+    for (int t = 0; t < M * M; ++t) comb[t] = comb_mix[row * M * M + t];
+#pragma unroll
+    for (int j = 0; j < M; ++j) post[j] = post_mix[row * M + j];
+    const T* xr = x + row * H;
+    const T* res = residual + row * M * H;
+    T* dst = out + row * M * H;
 
-    const float* comb = comb_mix + row * M * M;
-    const float* post = post_mix + row * M;
-    const float xh = to_f32(x[row * H + h]);
-    const T* res = residual + row * M * H + h;
-    T* dst = out + row * M * H + h;
-
-    float r[MAX_HC_MULT];
+    if constexpr (VEC) {
+        const int h = column<BLOCK, VEC>(chunk, 0);
+        if (h >= H) return;
+        float xv[8], r[M][8];
+        load8(xr + h, xv);
 #pragma unroll
-    for (int i = 0; i < MAX_HC_MULT; ++i) {
-        r[i] = i < M ? to_f32(res[static_cast<long long>(i) * H]) : 0.f;
-    }
+        for (int i = 0; i < M; ++i) load8(res + static_cast<long long>(i) * H + h, r[i]);
 #pragma unroll
-    for (int j = 0; j < MAX_HC_MULT; ++j) {
-        if (j < M) {
-            float acc = post[j] * xh;
+        for (int j = 0; j < M; ++j) {
+            float acc[8];
 #pragma unroll
-            for (int i = 0; i < MAX_HC_MULT; ++i) {
-                if (i < M) acc += comb[i * M + j] * r[i];
+            for (int k = 0; k < 8; ++k) {
+                acc[k] = post[j] * xv[k];
+#pragma unroll
+                for (int i = 0; i < M; ++i) acc[k] += comb[i * M + j] * r[i][k];
             }
-            dst[static_cast<long long>(j) * H] = from_f32<T>(acc);
+            store8(dst + static_cast<long long>(j) * H + h, acc);
+        }
+    } else {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int h = column<BLOCK, VEC>(chunk, k);
+            if (h >= H) continue;
+            const float xh = to_f32(xr[h]);
+            float r[M];
+#pragma unroll
+            for (int i = 0; i < M; ++i) r[i] = to_f32(res[static_cast<long long>(i) * H + h]);
+#pragma unroll
+            for (int j = 0; j < M; ++j) {
+                float acc = post[j] * xh;
+#pragma unroll
+                for (int i = 0; i < M; ++i) acc += comb[i * M + j] * r[i];
+                dst[static_cast<long long>(j) * H + h] = from_f32<T>(acc);
+            }
         }
     }
 }
 
-// The trunk's collapse before the head: y = Σ_i (sigmoid(logit_i) + eps)·stream_i.
-template <class T, int BLOCK = 256>
+// The trunk's collapse before the head: y = Σ_i (sigmoid(logit_i) + eps)·stream_i,
+// block (n, c) over chunk c of row n.
+template <class T, int M, int BLOCK, bool VEC>
 __global__ __launch_bounds__(BLOCK) void hc_head_postprocess(
     const float* __restrict__ mixes, const float* __restrict__ scale, const float* __restrict__ base,
-    const T* __restrict__ residual, T* __restrict__ out, int M, int H, float hc_eps,
+    const T* __restrict__ residual, T* __restrict__ out, int H, float hc_eps,
     const u32* __restrict__ win) {
     const Window window{win};
     if (!window.live(blockIdx.x)) return;
     const long long row = window.plane(blockIdx.x);
-    __shared__ float gates[MAX_HC_MULT];
-    if (threadIdx.x < M) {
-        gates[threadIdx.x] = sigmoid(mixes[row * M + threadIdx.x] * scale[0] + base[threadIdx.x]) + hc_eps;
-    }
-    lds_barrier();
-
-    const T* res = residual + row * M * H;
-    T* dst = out + row * H;
-    for (int h = threadIdx.x; h < H; h += BLOCK) {
-        float acc = 0.f;
+    float gates[M];
 #pragma unroll
-        for (int i = 0; i < MAX_HC_MULT; ++i) {
-            if (i < M) acc += gates[i] * to_f32(res[static_cast<long long>(i) * H + h]);
-        }
-        dst[h] = from_f32<T>(acc);
-    }
+    for (int i = 0; i < M; ++i) gates[i] = sigmoid(mixes[row * M + i] * scale[0] + base[i]) + hc_eps;
+    combine_streams<T, M, BLOCK, VEC>(gates, residual + row * M * H, out + row * H, H,
+                                      static_cast<int>(blockIdx.y));
 }
 
-// Every stream of a row starts as the row: output[row][m][h] = input[row][h].
-template <class T>
-__global__ void hc_expand(const T* __restrict__ input, T* __restrict__ output, int N, int M, int H,
-                          const u32* __restrict__ win) {
-    const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= static_cast<long long>(N) * H) return;
-    const int h = static_cast<int>(idx % H);
+// Every stream of a row starts as the row: output[row][m][h] = input[row][h],
+// block (n, c) over chunk c of row n.
+template <class T, int M, int BLOCK, bool VEC>
+__global__ __launch_bounds__(BLOCK) void hc_expand(const T* __restrict__ input,
+                                                   T* __restrict__ output, int H,
+                                                   const u32* __restrict__ win) {
     const Window window{win};
-    if (!window.live(idx / H)) return;
-    const long long row = window.plane(idx / H);
-    const T v = input[row * H + h];
-    T* dst = output + row * M * H + h;
-    for (int m = 0; m < M; ++m) dst[static_cast<long long>(m) * H] = v;
+    if (!window.live(blockIdx.x)) return;
+    const long long row = window.plane(blockIdx.x);
+    const int chunk = static_cast<int>(blockIdx.y);
+    const T* src = input + row * H;
+    T* dst = output + row * M * H;
+    if constexpr (VEC) {
+        const int h = column<BLOCK, VEC>(chunk, 0);
+        if (h >= H) return;
+        const b128 v = *reinterpret_cast<const b128*>(src + h);
+#pragma unroll
+        for (int m = 0; m < M; ++m) *reinterpret_cast<b128*>(dst + static_cast<long long>(m) * H + h) = v;
+    } else {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int h = column<BLOCK, VEC>(chunk, k);
+            if (h >= H) continue;
+            const T v = src[h];
+#pragma unroll
+            for (int m = 0; m < M; ++m) dst[static_cast<long long>(m) * H + h] = v;
+        }
+    }
 }
 
 // The stream row widened to f32 and scaled by rsqrt(mean(x²) + eps), no
-// weight: the mix projection's input.
-template <class T, int BLOCK = 256>
+// weight: the mix projection's input. One block a row; with VEC the row
+// stays in registers between its sum and its store (at most CAP packs a
+// thread, the launcher's check).
+template <class T, int BLOCK, int CAP, bool VEC>
 __global__ __launch_bounds__(BLOCK) void hc_rmsnorm_f32(const T* __restrict__ input,
                                                         float* __restrict__ output, int dim,
                                                         float eps, const u32* __restrict__ win) {
@@ -224,56 +434,127 @@ __global__ __launch_bounds__(BLOCK) void hc_rmsnorm_f32(const T* __restrict__ in
     const long long row = window.plane(blockIdx.x);
     const T* src = input + row * dim;
     float* dst = output + row * dim;
-    float local = 0.f;
-    for (int d = threadIdx.x; d < dim; d += BLOCK) {
-        const float v = to_f32(src[d]);
-        local += v * v;
+    if constexpr (VEC) {
+        const int packs = dim / 8;
+        float v[CAP][8];
+        float local = 0.f;
+#pragma unroll
+        for (int c = 0; c < CAP; ++c) {
+            const int p = c * BLOCK + static_cast<int>(threadIdx.x);
+            if (p < packs) {
+                load8(src + 8 * p, v[c]);
+#pragma unroll
+                for (int k = 0; k < 8; ++k) local += v[c][k] * v[c][k];
+            }
+        }
+        const float s = rsqrtf(block_sum(local, smem) / static_cast<float>(dim) + eps);
+#pragma unroll
+        for (int c = 0; c < CAP; ++c) {
+            const int p = c * BLOCK + static_cast<int>(threadIdx.x);
+            if (p < packs) {
+                float4* d = reinterpret_cast<float4*>(dst + 8 * p);
+                d[0] = make_float4(v[c][0] * s, v[c][1] * s, v[c][2] * s, v[c][3] * s);
+                d[1] = make_float4(v[c][4] * s, v[c][5] * s, v[c][6] * s, v[c][7] * s);
+            }
+        }
+    } else {
+        float local = 0.f;
+        for (int d = threadIdx.x; d < dim; d += BLOCK) {
+            const float v = to_f32(src[d]);
+            local += v * v;
+        }
+        const float s = rsqrtf(block_sum(local, smem) / static_cast<float>(dim) + eps);
+        for (int d = threadIdx.x; d < dim; d += BLOCK) dst[d] = to_f32(src[d]) * s;
     }
-    const float s = rsqrtf(block_sum(local, smem) / static_cast<float>(dim) + eps);
-    for (int d = threadIdx.x; d < dim; d += BLOCK) dst[d] = to_f32(src[d]) * s;
 }
 
-// The layer input from the streams: y[h] = mean_s(normed_s[h]·sigmoid(gate_s[h])).
-template <class T, int BLOCK = 256>
+// The layer input from the streams: y[h] = mean_s(normed_s[h]·sigmoid(gate_s[h])),
+// block (n, c) over chunk c of row n.
+template <class T, int M, int BLOCK, bool VEC>
 __global__ __launch_bounds__(BLOCK) void hc_mix(const T* __restrict__ gates,
                                                 const T* __restrict__ normed, T* __restrict__ y,
-                                                int M, int H, const u32* __restrict__ win) {
+                                                int H, const u32* __restrict__ win) {
     const Window window{win};
     if (!window.live(blockIdx.x)) return;
     const long long row = window.plane(blockIdx.x);
+    const int chunk = static_cast<int>(blockIdx.y);
     const T* g = gates + row * M * H;
     const T* v = normed + row * M * H;
     T* dst = y + row * H;
-    for (int h = threadIdx.x; h < H; h += BLOCK) {
-        float acc = 0.f;
+    if constexpr (VEC) {
+        const int h = column<BLOCK, VEC>(chunk, 0);
+        if (h >= H) return;
+        float gv[M][8], vv[M][8];
+#pragma unroll
         for (int s = 0; s < M; ++s) {
-            const long long at = static_cast<long long>(s) * H + h;
-            acc += to_f32(v[at]) / (1.f + __expf(-to_f32(g[at])));
+            load8(g + static_cast<long long>(s) * H + h, gv[s]);
+            load8(v + static_cast<long long>(s) * H + h, vv[s]);
         }
-        dst[h] = from_f32<T>(acc / static_cast<float>(M));
+        float acc[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            acc[k] = 0.f;
+#pragma unroll
+            for (int s = 0; s < M; ++s) acc[k] += vv[s][k] / (1.f + __expf(-gv[s][k]));
+            acc[k] /= static_cast<float>(M);
+        }
+        store8(dst + h, acc);
+    } else {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int h = column<BLOCK, VEC>(chunk, k);
+            if (h >= H) continue;
+            float acc = 0.f;
+#pragma unroll
+            for (int s = 0; s < M; ++s) {
+                const long long at = static_cast<long long>(s) * H + h;
+                acc += to_f32(v[at]) / (1.f + __expf(-to_f32(g[at])));
+            }
+            dst[h] = from_f32<T>(acc / static_cast<float>(M));
+        }
     }
 }
 
-// The layer's output back into every stream: hyper_s += 2·sigmoid(gate_s/M)·o.
-template <class T, int BLOCK = 256>
+// The layer's output back into every stream: hyper_s += 2·sigmoid(gate_s/M)·o,
+// block (n, c) over chunk c of row n.
+template <class T, int M, int BLOCK, bool VEC>
 __global__ __launch_bounds__(BLOCK) void hc_inject(const T* __restrict__ o,
                                                    const T* __restrict__ gates,
-                                                   T* __restrict__ hyper, int M, int H,
+                                                   T* __restrict__ hyper, int H,
                                                    const u32* __restrict__ win) {
     const Window window{win};
     if (!window.live(blockIdx.x)) return;
     const long long row = window.plane(blockIdx.x);
+    const int chunk = static_cast<int>(blockIdx.y);
     const T* orow = o + row * H;
     T* hr = hyper + row * M * H;
-    __shared__ float g[MAX_HC_MULT];
-    if (threadIdx.x < M) {
-        g[threadIdx.x] = 2.f * fast_sigmoid(to_f32(gates[row * M + threadIdx.x]) / static_cast<float>(M));
-    }
-    lds_barrier();
-    for (int s = 0; s < M; ++s) {
-        for (int h = threadIdx.x; h < H; h += BLOCK) {
-            const long long at = static_cast<long long>(s) * H + h;
-            hr[at] = from_f32<T>(to_f32(hr[at]) + g[s] * to_f32(orow[h]));
+    float g[M];
+#pragma unroll
+    for (int s = 0; s < M; ++s) g[s] = 2.f * fast_sigmoid(to_f32(gates[row * M + s]) / static_cast<float>(M));
+    if constexpr (VEC) {
+        const int h = column<BLOCK, VEC>(chunk, 0);
+        if (h >= H) return;
+        float ov[8], hv[M][8];
+        load8(orow + h, ov);
+#pragma unroll
+        for (int s = 0; s < M; ++s) load8(hr + static_cast<long long>(s) * H + h, hv[s]);
+#pragma unroll
+        for (int s = 0; s < M; ++s) {
+#pragma unroll
+            for (int k = 0; k < 8; ++k) hv[s][k] = hv[s][k] + g[s] * ov[k];
+            store8(hr + static_cast<long long>(s) * H + h, hv[s]);
+        }
+    } else {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int h = column<BLOCK, VEC>(chunk, k);
+            if (h >= H) continue;
+            const float oh = to_f32(orow[h]);
+#pragma unroll
+            for (int s = 0; s < M; ++s) {
+                const long long at = static_cast<long long>(s) * H + h;
+                hr[at] = from_f32<T>(to_f32(hr[at]) + g[s] * oh);
+            }
         }
     }
 }
