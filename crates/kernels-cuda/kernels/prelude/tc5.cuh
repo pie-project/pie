@@ -188,6 +188,18 @@ __device__ __forceinline__ void bulk_wait_all() {
     asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
 }
 
+// An f32 add to global memory that returns nothing.
+__device__ __forceinline__ void red_add(float* at, float v) {
+    asm volatile("red.global.add.f32 [%0], %1;" ::"l"(at), "f"(v) : "memory");
+}
+
+// Four f32 adds to 16 aligned bytes of global memory (sm_90+).
+__device__ __forceinline__ void red_add4(float* at, float a, float b, float c, float d) {
+    asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" ::"l"(at), "f"(a), "f"(b),
+                 "f"(c), "f"(d)
+                 : "memory");
+}
+
 // Makes generic-proxy writes to shared memory visible to TMA.
 __device__ __forceinline__ void fence_async_shared() {
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");

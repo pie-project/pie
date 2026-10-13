@@ -61,7 +61,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     const __grid_constant__ tc5::TmaMap map_p, const __grid_constant__ tc5::TmaMap map_q,
     const __grid_constant__ tc5::TmaMap map_y, const __grid_constant__ tc5::TmaMap map_sfp,
     const __grid_constant__ tc5::TmaMap map_sfq, bf16* __restrict__ y, int rows_p, int rows_q,
-    int k, int ldy, float alpha) {
+    int k, int ldy, float alpha, float* __restrict__ part, int splits) {
     using namespace tc5;
     static_assert(kBN % 32 == 0 && kBN >= 32 && kBN <= 256, "the Q tile is 32..256 rows");
     static_assert(kKind >= 0 && kKind <= 3, "four kinds");
@@ -169,14 +169,21 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
 
     const int num_p = (rows_p + static_cast<int>(kM) - 1) / static_cast<int>(kM);
     const int num_q = (rows_q + kBN - 1) / kBN;
-    const int tiles = num_p * num_q;
     const int num_kb = (k + static_cast<int>(kStageK) - 1) / static_cast<int>(kStageK);
+    // A unit is one tile's share of K: `splits` of them a tile when a
+    // decode's few tiles would leave SMs idle, summed in f32 at `part`.
+    const int kb_per = (num_kb + splits - 1) / splits;
+    const int tiles = num_p * num_q * splits;
     const int first_tile = static_cast<int>(blockIdx.x) / kPair;
     const int tile_step = static_cast<int>(gridDim.x) / kPair;
 
     // Groups of 8 P tiles walk Q together, so a wave shares both operands.
-    auto tile_of = [&](int t, int& pt, int& qt) {
+    auto tile_of = [&](int u, int& pt, int& qt, int& kb0, int& kb1) {
         constexpr int kGroup = 8;
+        const int t = u / splits;
+        const int ks = u - t * splits;
+        kb0 = ks * kb_per;
+        kb1 = min(num_kb, kb0 + kb_per);
         const int group = t / (kGroup * num_q);
         const int first = group * kGroup;
         const int size = min(num_p - first, kGroup);
@@ -205,11 +212,11 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
         if (lane == 0) {
             u32 s = 0, phase = 0;
             for (int t = first_tile; t < tiles; t += tile_step) {
-                int pt, qt;
-                tile_of(t, pt, qt);
+                int pt, qt, kb0, kb1;
+                tile_of(t, pt, qt, kb0, kb1);
                 const int p0 = pt * static_cast<int>(kM) + static_cast<int>(rank) * 128;
                 const int q0 = qt * kBN + static_cast<int>(rank * kQRows);
-                for (int kb = 0; kb < num_kb; ++kb) {
+                for (int kb = kb0; kb < kb1; ++kb) {
                     bar_wait(&empty[s], phase ^ 1);
                     if (leader) {
                         bar_arrive_expect_tx(&full[s], kTx);
@@ -253,7 +260,9 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
         if (kScaled && lane == 0 && leader) {
             u32 s = 0, phase = 0, step = 0;
             for (int t = first_tile; t < tiles; t += tile_step) {
-                for (int kb = 0; kb < num_kb; ++kb, ++step) {
+                int pt, qt, kb0, kb1;
+                tile_of(t, pt, qt, kb0, kb1);
+                for (int kb = kb0; kb < kb1; ++kb, ++step) {
                     const u32 slot = step & 1;
                     bar_wait(&sf_free[slot], ((step >> 1) & 1) ^ 1);
                     bar_wait(&full[s], phase);
@@ -284,8 +293,8 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
             u32 s = 0, phase = 0, step = 0;
             int it = 0;
             for (int t = first_tile; t < tiles; t += tile_step, ++it) {
-                int pt, qt;
-                tile_of(t, pt, qt);
+                int pt, qt, kb0, kb1;
+                tile_of(t, pt, qt, kb0, kb1);
                 const u32 acc = static_cast<u32>(it) % 2;
                 bar_wait(&tempty[acc], ((static_cast<u32>(it) / 2) & 1) ^ 1);
                 tc_fence_after();
@@ -293,7 +302,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                 // A Q tile narrower than its 128-row scale atom reads the
                 // atom's columns from its own 32-row quarter on.
                 const u32 quarter_q = static_cast<u32>(qt * kBN % 128) / 32;
-                for (int kb = 0; kb < num_kb; ++kb, ++step) {
+                for (int kb = kb0; kb < kb1; ++kb, ++step) {
                     bar_wait(&full[s], phase);
                     const u32 slot = step & 1;
                     if constexpr (kScaled) {
@@ -304,7 +313,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                     const u32 tile_q = smem_addr(smem + kOffQ + s * kTileQ);
                     const u32 sf_tp = tmem + kStride + kBN + slot * kSfCols;
                     const u32 sf_tq = sf_tp + 4 * kAtomsP;
-                    if (kOv > 0 && kb == 0 && it > 0) {
+                    if (kOv > 0 && kb == kb0 && it > 0) {
                         const u32 prev = static_cast<u32>(it - 1);
                         bar_wait(&tover[prev % 2], (prev / 2) & 1);
                         tc_fence_after();
@@ -315,7 +324,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                     for (u32 j = 0; j < 4; ++j) {
                         const u64 a = desc_p + 2 * j;
                         const u64 b = desc_q + 2 * j;
-                        const bool accumulate = kb > 0 || j > 0;
+                        const bool accumulate = kb > kb0 || j > 0;
                         if constexpr (kKind == 0) {
                             mma_f16<kPair>(d, a, b, idesc_dense(kF16Bf16, kF16Bf16, kM, kBN),
                                            accumulate);
@@ -366,7 +375,8 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
         u32 out_buf = 0;
         for (int t = first_tile; t < tiles; t += tile_step, ++it) {
             int pt, qt;
-            tile_of(t, pt, qt);
+            int kb0, kb1;
+            tile_of(t, pt, qt, kb0, kb1);
             const u32 acc = static_cast<u32>(it) % 2;
             bar_wait(&tfull[acc], (static_cast<u32>(it) / 2) & 1);
             tc_fence_after();
@@ -400,12 +410,34 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                 if constexpr (kSwap) {
                     // A warp's lanes are 32 consecutive weight rows: each
                     // column is one coalesced 64-byte run of y.
-                    if (p < rows_p) {
+                    if (p < rows_p && splits > 1) {
+#pragma unroll
+                        for (int j = 0; j < 32; ++j) {
+                            if (q0 + j < rows_q) {
+                                red_add(part + static_cast<size_t>(q0 + j) * ldy + p,
+                                        __uint_as_float(v[j]) * alpha);
+                            }
+                        }
+                    } else if (p < rows_p) {
 #pragma unroll
                         for (int j = 0; j < 32; ++j) {
                             if (q0 + j < rows_q) {
                                 y[static_cast<size_t>(q0 + j) * ldy + p] =
                                     f32_to_bf16(__uint_as_float(v[j]) * alpha);
+                            }
+                        }
+                    }
+                } else if (splits > 1) {
+                    // A thread's 32 sums of its row, four at a time.
+                    if (p < rows_p) {
+                        float* at = part + static_cast<size_t>(p) * ldy + q0;
+#pragma unroll
+                        for (int j = 0; j < 32; j += 4) {
+                            if (q0 + j < rows_q) {
+                                red_add4(at + j, __uint_as_float(v[j]) * alpha,
+                                         __uint_as_float(v[j + 1]) * alpha,
+                                         __uint_as_float(v[j + 2]) * alpha,
+                                         __uint_as_float(v[j + 3]) * alpha);
                             }
                         }
                     }
@@ -455,6 +487,16 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     if (warp == 5) {
         tc_fence_after();
         tmem_dealloc<kPair>(tmem, kCols);
+    }
+}
+
+// The split-K sum in f32, four at a time, to bf16.
+__global__ __launch_bounds__(256) void tc5_finalize(const float4* __restrict__ part,
+                                                    uint2* __restrict__ y, int quads) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < quads) {
+        const float4 v = part[i];
+        y[i] = make_uint2(pack_bf16x2(v.x, v.y), pack_bf16x2(v.z, v.w));
     }
 }
 

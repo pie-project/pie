@@ -147,7 +147,7 @@ fn check(case: Case) {
     let y = gpu.up(&vec![0x7fc0u16; tall * n]);
     let plan = case
         .plan
-        .unwrap_or_else(|| Plan::choose(m as u32, n as u32, 148));
+        .unwrap_or_else(|| Plan::choose(m as u32, n as u32, k as u32, 148));
     gemm_with(
         &gpu.ctx(),
         a_op,
@@ -205,6 +205,7 @@ fn plan(swap: bool, bn: u32) -> Option<Plan> {
         pair: false,
         bn,
         stages: 0,
+        splits: 0,
     })
 }
 
@@ -294,6 +295,7 @@ fn pair(bn: u32) -> Option<Plan> {
         pair: true,
         bn,
         stages: 0,
+        splits: 0,
     })
 }
 
@@ -366,6 +368,7 @@ fn nvfp4_lands_its_sixteen_wide_scales_and_global_alpha() {
     check(scaled(nv, nv, [128, 128, 288], plan(false, 64), 1.0));
     check(scaled(nv, nv, [130, 512, 512], plan(false, 256), 1.0));
     check(scaled(nv, nv, [5, 384, 768], None, 2.0));
+    check(scaled(nv, nv, [9, 256, 4096], None, 0.5));
     check(scaled(nv, nv, [140, 256, 1024], pair(256), 1.0));
     check(scaled(nv, nv, [300, 128, 288], pair(128), 1.0));
 }
@@ -378,6 +381,7 @@ fn mxfp4_weights_meet_fp8_activations() {
         check(scaled(act, w4, [150, 192, 640], plan(false, 64), 1.0));
         check(scaled(act, w4, [7, 256, 1024], None, 1.0));
         check(scaled(act, w4, [150, 192, 640], pair(64), 1.0));
+        check(scaled(act, w4, [130, 256, 2048], None, 1.0));
     }
 }
 
@@ -389,7 +393,9 @@ fn the_bf16_kind_lands_the_dot_at_whole_and_ragged_tiles() {
     check(bf16(130, 96, 136, plan(false, 64)));
     check(bf16(1, 384, 512, None));
     check(bf16(37, 1000, 264, None));
+    check(bf16(16, 256, 4104, None));
     check(bf16(300, 200, 520, pair(128)));
     check(bf16(520, 512, 1024, pair(256)));
     check(bf16(257, 96, 136, pair(64)));
+    check(bf16(200, 384, 2056, None));
 }

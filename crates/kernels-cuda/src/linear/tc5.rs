@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use cudarc::driver::sys as dr;
+use cudarc::runtime::sys as rt;
 
 use crate::error::Error;
 use crate::jit::{ArgValue, Ctx, Fire, Launch, refuse, symbol};
@@ -246,6 +247,7 @@ const fn smem_bytes(kind: Kind, gran_p: u32, gran_q: u32, plan: Plan) -> u32 {
         pair,
         bn,
         stages,
+        ..
     } = plan;
     let stage = 128 * 128
         + bn / if pair { 2 } else { 1 } * 128
@@ -265,33 +267,60 @@ pub struct Plan {
     pub pair: bool,
     pub bn: u32,
     pub stages: u32,
+    /// K splits of a tile, summed in f32; 0 picks enough to fill the
+    /// SMs.
+    pub splits: u32,
 }
 
 impl Plan {
     /// Rows of 64 or fewer put the weight on the 128-row side, the rows on
     /// a narrow Q tile. Otherwise a pair of CTAs runs 256 x 256 tiles, each
-    /// streaming half of both operands' bytes a lone CTA would, unless
-    /// lone 128 x 128 tiles fill the `sms` enough better to outweigh it
-    /// (they stream at about half the rate).
+    /// streaming half of both operands' bytes a lone CTA would, unless lone
+    /// 128 x 128 tiles finish sooner for filling the `sms` better (a lone
+    /// SM runs at about 0.55 a paired one's rate). Either splits K when its
+    /// tiles leave SMs idle; see [`Plan::splits_for`].
     #[must_use]
-    pub fn choose(m: u32, n: u32, sms: u32) -> Self {
+    pub fn choose(m: u32, n: u32, k: u32, sms: u32) -> Self {
         if m <= 64 {
             return Self {
                 swap: true,
                 pair: false,
                 bn: m.next_multiple_of(32).max(32),
                 stages: 0,
+                splits: 0,
             };
         }
-        let waves = |rows: u32, bn: u32, per: u32| {
-            (m.div_ceil(rows) * n.div_ceil(bn)).div_ceil((sms / per).max(1))
+        // Time in units of a lone 128 x 128 x 128 step on one SM.
+        let steps = k.div_ceil(128);
+        let time = |rows: u32, ctas: u32, rate: f64| {
+            let tiles = m.div_ceil(rows) * n.div_ceil(rows);
+            let splits = Self::splits_for(tiles, steps, sms / ctas);
+            let waves = (tiles * splits).div_ceil((sms / ctas).max(1));
+            let area = f64::from(rows * rows) / f64::from(128 * 128 * ctas);
+            let penalty = if splits > 1 { 1.15 } else { 1.0 };
+            f64::from(waves) * area * f64::from(steps.div_ceil(splits)) / rate * penalty
         };
-        let pair = 10 * waves(256, 256, 2) <= 9 * waves(128, 128, 1);
+        let pair = time(256, 2, 1.8) <= time(128, 1, 1.0);
         Self {
             swap: false,
             pair,
             bn: if pair { 256 } else { 128 },
             stages: 0,
+            splits: 0,
+        }
+    }
+
+    /// K splits for `tiles` tiles of `steps` K steps on `slots` CTAs (or
+    /// pairs): enough to fill them once three or more fit, each keeping four
+    /// steps to pipeline. Fewer than three do not repay the f32 sum's zeroing
+    /// and rounding passes.
+    #[must_use]
+    pub fn splits_for(tiles: u32, steps: u32, slots: u32) -> u32 {
+        let fit = slots / tiles.max(1);
+        if fit < 3 {
+            1
+        } else {
+            fit.min((steps / 4).max(1))
         }
     }
 
@@ -315,7 +344,7 @@ pub fn gemm(
     alpha: f32,
 ) -> Result<(), Error> {
     let sms = ctx.multiprocessors().unwrap_or(148);
-    gemm_with(ctx, act, w, y, [m, n, k], alpha, Plan::choose(m, n, sms))
+    gemm_with(ctx, act, w, y, [m, n, k], alpha, Plan::choose(m, n, k, sms))
 }
 
 /// As [`gemm`], under a stated plan (its `stages` is refit to the kind).
@@ -376,8 +405,30 @@ pub fn gemm_with(
     };
     let map_sfp = atoms(p, rows_p, 1)?;
     let map_sfq = atoms(q, rows_q, plan.bn.div_ceil(128))?;
+    let sms = ctx.multiprocessors().unwrap_or(148);
     let tiles = rows_p.div_ceil(128 * ctas) * rows_q.div_ceil(plan.bn);
-    let grid = ctas * tiles.min(ctx.multiprocessors().unwrap_or(148) / ctas);
+    // Too few tiles to fill the SMs split K, each split keeping four K steps
+    // or more to pipeline; the splits sum in f32 and one pass rounds.
+    let steps = k.div_ceil(kind.stage_k());
+    let splits = match plan.splits {
+        0 => Plan::splits_for(tiles, steps, sms / ctas),
+        s => s.clamp(1, steps),
+    };
+    let splits = steps.div_ceil(steps.div_ceil(splits));
+    let part = if splits > 1 {
+        let bytes = m as usize * n as usize * 4;
+        let part = ctx.scratch_stream(OP, SPLIT_PARTIAL, bytes)?;
+        // SAFETY: a slab of `bytes` this context owns, on its stream.
+        let code = unsafe { rt::cudaMemsetAsync(part, 0, bytes, ctx.stream().cast()) };
+        if code != rt::cudaError::cudaSuccess {
+            return Err(refuse(OP, format!("cudaMemsetAsync answered {code:?}")));
+        }
+        part as u64
+    } else {
+        0
+    };
+    let units = tiles * splits;
+    let grid = ctas * units.min(sms / ctas);
     let entry = symbol(&format!(
         "::pie::linear::tc5_gemm<{}, {}, {}, {}, {}, {}, {}, {}, {ctas}>",
         kind.code(),
@@ -406,6 +457,8 @@ pub fn gemm_with(
         ArgValue::I32(int(k)?),
         ArgValue::I32(int(n)?),
         ArgValue::F32(alpha),
+        ArgValue::Ptr(part),
+        ArgValue::I32(int(splits)?),
     ];
     ctx.fire(
         OP,
@@ -415,8 +468,25 @@ pub fn gemm_with(
                 .cluster(ctas),
         ),
         &values,
+    )?;
+    if splits == 1 {
+        return Ok(());
+    }
+    let quads = m * n / 4;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::linear::tc5_finalize").apply(Launch::flat(quads, 256)),
+        &[
+            ArgValue::Ptr(part),
+            ArgValue::Ptr(y),
+            ArgValue::I32(int(quads)?),
+        ],
     )
 }
+
+/// The f32 split-K sum, one a stream: the finalize after the GEMM on the
+/// same stream consumes it.
+const SPLIT_PARTIAL: &str = "linear.tc5.split_partial";
 
 /// An atom-layout scale tensor as TMA reads it: [row block][atom][128 words],
 /// boxes of `atoms` atoms by `row_blocks` row blocks, zero past either end.
@@ -609,6 +679,7 @@ mod tests {
                     pair: bn >= 64,
                     bn,
                     stages: 0,
+                    splits: 0,
                 }
                 .staged(kind, g, g);
                 assert!(plan.stages >= 3, "{kind:?} bn={bn}: {plan:?}");
