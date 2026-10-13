@@ -11,6 +11,7 @@ use crate::hip::{lt, sys};
 use crate::jit::{Ctx, refuse};
 
 use super::gemv::{gemv_bf16, skinny_bf16, skinny_swiglu_bf16};
+use super::mgemm::mgemm_bf16;
 
 /// Up to four rows the skinny kernel streams the weight faster than
 /// hipBLASLt tiles it; up to eight it still does for a small weight.
@@ -42,6 +43,9 @@ pub(crate) fn act_x_wt(
     if m == 1 && gemv_bf16(ctx, w, act, bias, y, n, k).is_ok() {
         return Ok(bias != 0);
     }
+    if bias == 0 && mgemm_on() && mgemm_bf16(ctx, w, act, y, m, n, k, false)? {
+        return Ok(false);
+    }
     let shape = lt::Shape {
         m: m.unsigned_abs(),
         n: n.unsigned_abs(),
@@ -51,9 +55,14 @@ pub(crate) fn act_x_wt(
     let workspace = ctx.scratch_shared(op, "linear.lt_workspace", lt::WORKSPACE)? as u64;
     // SAFETY: the three planes are device ranges the caller sized at [m, k],
     // [n, k] and [m, n]; the workspace is this stream's.
-    if unsafe { lt::matmul(shape, act, w, 0, y, workspace, ctx.stream()) }
-        .map_err(|why| refuse(op, format!("{why} at M={m} N={n} K={k}")))?
-    {
+    let start = crate::prof::on()
+        .then(|| crate::prof::begin(ctx.stream()))
+        .flatten();
+    let landed = unsafe { lt::matmul(shape, act, w, 0, y, workspace, ctx.stream()) };
+    crate::prof::end(ctx.stream(), start, || {
+        format!("{op} hipblaslt m={m} n={n} k={k}")
+    });
+    if landed.map_err(|why| refuse(op, format!("{why} at M={m} N={n} K={k}")))? {
         return Ok(false);
     }
     let handle = ctx.blas(op)?;
@@ -97,5 +106,17 @@ pub(crate) fn act_x_wt_swiglu(
     }
     let skinny = m <= SKINNY_ALWAYS
         || (m <= SKINNY_SMALL && 2 * i64::from(intermediate) * i64::from(k) <= SKINNY_SMALL_WEIGHT);
-    Ok(skinny && skinny_swiglu_bf16(ctx, gate_up, act, h, m, intermediate, k).is_ok())
+    if skinny && skinny_swiglu_bf16(ctx, gate_up, act, h, m, intermediate, k).is_ok() {
+        return Ok(true);
+    }
+    Ok(mgemm_on() && mgemm_bf16(ctx, gate_up, act, h, m, intermediate, k, true)?)
+}
+
+/// The decode-batch kernel streams the weight at ~1.7 TB/s against
+/// hipBLASLt's ~2.2-2.9 (its 16-rows-a-read operand layout, and the read
+/// counter's issue order, cap it), so it serves only under `PIE_MGEMM`
+/// until its weight goes through LDS.
+fn mgemm_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PIE_MGEMM").is_some())
 }

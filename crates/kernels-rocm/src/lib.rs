@@ -40,6 +40,7 @@ pub mod hip;
 pub mod jit;
 pub mod layout;
 pub mod linear;
+pub mod prof;
 pub mod seat;
 pub mod source;
 pub mod spatial;

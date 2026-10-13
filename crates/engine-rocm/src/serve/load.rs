@@ -960,6 +960,9 @@ impl Shell {
             );
             shell.bodies_mem = usize::try_from(fitted.bodies).unwrap_or(usize::MAX);
         }
+        if kernels_rocm::prof::on() {
+            shell.bodies_mem = 0;
+        }
         if (fitted.slots as usize) < shell.held.len() {
             eprintln!(
                 "engine-cuda: [engine] max_state_slots {} is served at {} on this card: the \

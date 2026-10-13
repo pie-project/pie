@@ -1390,7 +1390,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         } else {
             GeometryClass::Host
         };
-        tracing::info!(
+        tracing::debug!(
             geometry = ?req.geometry,
             lanes = req.lanes.len(),
             qo_indptr = ?geometry.qo_indptr,
@@ -2759,7 +2759,7 @@ async fn fire_device_geometry<C: FireContext>(
     {
         req.geometry = GeometryClass::DeviceGeometry;
     }
-    tracing::info!(
+    tracing::debug!(
         geometry = ?req.geometry,
         lanes = req.lanes.len(),
         qo_indptr = ?resolved_qo_indptr,

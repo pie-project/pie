@@ -262,3 +262,113 @@ pub unsafe fn matmul(
     })?;
     Ok(true)
 }
+
+/// Every algorithm the heuristic offers for `s` (up to `count`), each timed
+/// over `reps` launches on `stream`: (index, mean µs, workspace bytes).
+///
+/// # Safety
+/// As [`matmul`]; the stream must not be capturing.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn survey(
+    s: Shape,
+    x: u64,
+    w: u64,
+    y: u64,
+    workspace: u64,
+    stream: Stream,
+    count: usize,
+    reps: u32,
+) -> Result<Vec<(usize, f64, usize)>, Refused> {
+    let Ok(lt) = sys::hipblaslt() else {
+        return Ok(Vec::new());
+    };
+    let mut handle: Lt = core::ptr::null_mut();
+    // SAFETY: writes the handle.
+    answered("hipblasLtCreate", unsafe {
+        (lt.hipblasLtCreate)(&raw mut handle)
+    })?;
+    let Some(plan) = Plan::build(lt, handle, s)? else {
+        return Ok(Vec::new());
+    };
+    let mut pref: sys::LtPreference = core::ptr::null_mut();
+    let mut algos = vec![LtHeuristic::default(); count];
+    let mut returned: c_int = 0;
+    // SAFETY: the plan's descriptors are live; the out-array holds `count`.
+    unsafe {
+        answered(
+            "hipblasLtMatmulPreferenceCreate",
+            (lt.hipblasLtMatmulPreferenceCreate)(&raw mut pref),
+        )?;
+        let ws: u64 = WORKSPACE as u64;
+        (lt.hipblasLtMatmulPreferenceSetAttribute)(
+            pref,
+            sys::LT_PREF_MAX_WORKSPACE_BYTES,
+            core::ptr::from_ref(&ws).cast(),
+            8,
+        );
+        answered(
+            "hipblasLtMatmulAlgoGetHeuristic",
+            (lt.hipblasLtMatmulAlgoGetHeuristic)(
+                handle,
+                plan.desc,
+                plan.a,
+                plan.b,
+                plan.d,
+                plan.d,
+                pref,
+                count as c_int,
+                algos.as_mut_ptr(),
+                &raw mut returned,
+            ),
+        )?;
+    }
+    let (alpha, beta) = (1f32, 0f32);
+    let mut out = Vec::new();
+    for (index, algo) in algos.iter().take(returned.max(0) as usize).enumerate() {
+        if algo.state != sys::LT_SUCCESS {
+            continue;
+        }
+        let launch = || unsafe {
+            (lt.hipblasLtMatmul)(
+                handle,
+                plan.desc,
+                core::ptr::from_ref(&alpha).cast(),
+                w as usize as *const c_void,
+                plan.a,
+                x as usize as *const c_void,
+                plan.b,
+                core::ptr::from_ref(&beta).cast(),
+                y as usize as *const c_void,
+                plan.d,
+                y as usize as *mut c_void,
+                plan.d,
+                algo.algo.as_ptr().cast(),
+                workspace as usize as *mut c_void,
+                WORKSPACE,
+                stream,
+            )
+        };
+        if launch() != sys::LT_SUCCESS {
+            continue;
+        }
+        let mut ms = f32::NAN;
+        // SAFETY: two fresh events on a live stream, destroyed here.
+        unsafe {
+            let (mut start, mut stop): (super::rt::Event, super::rt::Event) =
+                (core::ptr::null_mut(), core::ptr::null_mut());
+            super::rt::hipEventCreate(&raw mut start);
+            super::rt::hipEventCreate(&raw mut stop);
+            super::rt::hipEventRecord(start, stream.cast());
+            for _ in 0..reps {
+                launch();
+            }
+            super::rt::hipEventRecord(stop, stream.cast());
+            super::rt::hipEventSynchronize(stop);
+            super::rt::hipEventElapsedTime(&raw mut ms, start, stop);
+            super::rt::hipEventDestroy(start);
+            super::rt::hipEventDestroy(stop);
+        }
+        out.push((index, f64::from(ms) * 1e3 / f64::from(reps), algo.workspace));
+    }
+    Ok(out)
+}

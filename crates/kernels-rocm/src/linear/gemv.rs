@@ -67,7 +67,7 @@ pub(crate) fn gemv_bf16(
 
 /// The current device's compute units, asked once per process (every device
 /// a process drives is the same part).
-fn compute_units() -> u32 {
+pub(crate) fn compute_units() -> u32 {
     static CUS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *CUS.get_or_init(|| {
         let mut device = 0i32;

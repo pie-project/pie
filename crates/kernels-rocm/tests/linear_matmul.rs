@@ -42,6 +42,13 @@ fn linear_matmul() {
         (8, 1024, 3584),
         (37, 1000, 1024),
         (64, 1024, 2048),
+        // The decode batch's kernel: unsplit, split K, past 128 rows (the
+        // narrower stage), a ragged N and M.
+        (128, 4096, 1024),
+        (128, 512, 4096),
+        (200, 1024, 2048),
+        (17, 784, 1024),
+        (256, 96, 2048),
     ] {
         let a: Vec<f32> = values((m * k) as usize, 1, 1.0)
             .into_iter()

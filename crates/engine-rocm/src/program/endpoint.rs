@@ -321,14 +321,14 @@ pub mod pool {
 
     static POOL: Mutex<Option<HashMap<PoolKey, Vec<Entry>>>> = Mutex::new(None);
 
-    fn current_device() -> Option<i32> {
+    pub(crate) fn current_device() -> Option<i32> {
         let mut device = 0i32;
         // SAFETY: writes one int.
         let code = unsafe { kernels_rocm::hip::rt::hipGetDevice(&raw mut device) };
         (code == 0).then_some(device)
     }
 
-    fn stream_of(device: i32) -> Option<*mut core::ffi::c_void> {
+    pub(crate) fn stream_of(device: i32) -> Option<*mut core::ffi::c_void> {
         let stream = STREAMS
             .get(usize::try_from(device).ok()?)?
             .load(Ordering::Acquire);

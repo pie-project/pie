@@ -925,6 +925,9 @@ impl Bodies {
         }
 
         walk_capture(at, run, place, Streams::Serial)?;
+        if kernels_rocm::prof::on() {
+            return Ok(());
+        }
 
         if self.sealed_decline() {
             let declines = self.recorder.bstats.sealed_declines;

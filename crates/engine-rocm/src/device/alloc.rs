@@ -38,14 +38,7 @@ impl Buffer {
         {
             use kernels_rocm::hip::rt;
 
-            let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
-            // SAFETY: `base` is a live local; the allocation is this buffer's, freed exactly once in `Drop`.
-            let allocated = unsafe {
-                crate::device::ctx::check("hipMalloc", rt::hipMalloc(&raw mut base, bytes))
-            };
-            if let Err(fault) = allocated {
-                return Err(out_of_room(fault, bytes));
-            }
+            let base = recycle::alloc(bytes)? as *mut core::ffi::c_void;
             // SAFETY: `base` is the allocation just made, of `bytes` bytes.
             unsafe {
                 crate::device::ctx::check("hipMemset", rt::hipMemset(base, 0, bytes))?;
@@ -69,14 +62,7 @@ impl Buffer {
         {
             use kernels_rocm::hip::rt;
 
-            let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
-            // SAFETY: `base` is a live local; the allocation is this buffer's, freed exactly once in `Drop`.
-            let allocated = unsafe {
-                crate::device::ctx::check("hipMalloc", rt::hipMalloc(&raw mut base, bytes))
-            };
-            if let Err(fault) = allocated {
-                return Err(out_of_room(fault, bytes));
-            }
+            let base = recycle::alloc(bytes)? as *mut core::ffi::c_void;
             // SAFETY: `base` is the allocation just made, of `bytes` bytes, and
             // `stream` is the one every later read of it is ordered on.
             unsafe {
@@ -441,10 +427,7 @@ impl Drop for Buffer {
     fn drop(&mut self) {
         #[cfg(feature = "rocm")]
         if self.ptr != 0 {
-            // SAFETY: the pointer came from this buffer's own `cudaMalloc` and is freed exactly once.
-            unsafe {
-                let _ = kernels_rocm::hip::rt::hipFree(self.ptr as *mut core::ffi::c_void);
-            }
+            recycle::release(self.ptr, self.bytes);
         }
     }
 }
@@ -1135,4 +1118,129 @@ fn staged_through_ring(dst: u64, bytes: &[u8], stream: *mut core::ffi::c_void) -
     }
     *used = true;
     Ok(true)
+}
+
+/// Device memory a dropped [`Buffer`] leaves, kept for the next of its size.
+/// `hipFree` waits for the whole device, so a buffer dropped while frames
+/// are airborne (a lane table outgrown, a channel closed) would stall the
+/// engine thread for the frame in flight; kept behind an event on the
+/// compute stream instead, it is handed out again once that event lands.
+#[cfg(feature = "rocm")]
+mod recycle {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use kernels_rocm::hip::rt;
+
+    use crate::error::Result;
+
+    /// The bytes kept across every size at most; an allocation the device
+    /// refuses frees them all first, so this bounds only what an idle load
+    /// sits on.
+    const BUDGET: usize = 8 << 30;
+
+    struct Kept {
+        ptr: u64,
+        event: rt::Event,
+    }
+
+    // SAFETY: entries are touched only under the mutex; the memory and the
+    // event are process-wide HIP objects.
+    unsafe impl Send for Kept {}
+
+    /// Kept buffers by (device, bytes).
+    type Shelf = Option<HashMap<(i32, usize), Vec<Kept>>>;
+
+    static KEPT: Mutex<Shelf> = Mutex::new(None);
+    static HELD: AtomicUsize = AtomicUsize::new(0);
+
+    fn kept() -> std::sync::MutexGuard<'static, Shelf> {
+        KEPT.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `bytes` of device memory: a kept buffer whose last reader has
+    /// landed, else a fresh one; on a refusal everything kept is freed and
+    /// the allocation is tried once more.
+    pub(super) fn alloc(bytes: usize) -> Result<u64> {
+        if let Some(device) = crate::program::endpoint::pool::current_device() {
+            let mut kept = kept();
+            if let Some(list) = kept.as_mut().and_then(|map| map.get_mut(&(device, bytes)))
+                // SAFETY: each event is its entry's own, recorded at its release.
+                && let Some(at) = list
+                    .iter()
+                    .position(|entry| unsafe { rt::hipEventQuery(entry.event) } == 0)
+            {
+                let entry = list.swap_remove(at);
+                drop(kept);
+                HELD.fetch_sub(bytes, Ordering::Relaxed);
+                // SAFETY: the event has landed and is destroyed once.
+                unsafe { rt::hipEventDestroy(entry.event) };
+                return Ok(entry.ptr);
+            }
+        }
+        let fresh = |bytes: usize| {
+            let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
+            // SAFETY: `base` is a live local the call fills.
+            let code = unsafe { rt::hipMalloc(&raw mut base, bytes) };
+            crate::device::ctx::check("hipMalloc", code).map(|()| base as u64)
+        };
+        match fresh(bytes) {
+            Ok(ptr) => Ok(ptr),
+            Err(_) if drain() => fresh(bytes).map_err(|fault| super::out_of_room(fault, bytes)),
+            Err(fault) => Err(super::out_of_room(fault, bytes)),
+        }
+    }
+
+    /// Keeps `ptr` for its size behind an event on its device's compute
+    /// stream, or frees it when the budget is spent or no stream was
+    /// adopted.
+    pub(super) fn release(ptr: u64, bytes: usize) {
+        if HELD.load(Ordering::Relaxed) + bytes <= BUDGET
+            && let Some(device) = crate::program::endpoint::pool::current_device()
+            && let Some(stream) = crate::program::endpoint::pool::stream_of(device)
+        {
+            let mut event: rt::Event = core::ptr::null_mut();
+            // SAFETY: creates and records a fresh event on a live stream.
+            let recorded = unsafe {
+                rt::hipEventCreateWithFlags(&raw mut event, rt::hipEventDisableTiming) == 0
+                    && rt::hipEventRecord(event, stream.cast()) == 0
+            };
+            if recorded {
+                HELD.fetch_add(bytes, Ordering::Relaxed);
+                kept()
+                    .get_or_insert_with(HashMap::new)
+                    .entry((device, bytes))
+                    .or_default()
+                    .push(Kept { ptr, event });
+                return;
+            }
+            if !event.is_null() {
+                // SAFETY: the event is this call's own.
+                unsafe { rt::hipEventDestroy(event) };
+            }
+        }
+        // SAFETY: the pointer came from `alloc` and is freed exactly once.
+        let _ = unsafe { rt::hipFree(ptr as *mut core::ffi::c_void) };
+    }
+
+    /// Frees every kept buffer; whether there was any.
+    fn drain() -> bool {
+        let Some(map) = kept().take() else {
+            return false;
+        };
+        let mut any = false;
+        for entry in map.into_values().flatten() {
+            any = true;
+            // SAFETY: each pointer and event is its entry's own; `hipFree`
+            // waits for the device, so no reader is left.
+            unsafe {
+                rt::hipEventDestroy(entry.event);
+                let _ = rt::hipFree(entry.ptr as *mut core::ffi::c_void);
+            }
+        }
+        HELD.store(0, Ordering::Relaxed);
+        any
+    }
 }

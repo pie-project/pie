@@ -7,6 +7,10 @@ pub mod lane_gemm;
 
 #[cfg(feature = "rocm")]
 mod gemv;
+#[cfg(feature = "rocm")]
+mod mgemm;
+#[cfg(feature = "rocm")]
+pub use mgemm::force as force_mgemm;
 pub mod skinny;
 
 pub mod lora;

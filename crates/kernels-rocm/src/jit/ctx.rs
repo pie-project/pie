@@ -447,6 +447,12 @@ impl Ctx {
             };
             eprintln!("fire: {gap} {op} {}", fire.entrypoint);
         }
+        if crate::prof::on() {
+            let start = crate::prof::begin(self.stream);
+            let issued = self.issue(op, &root, fire.entrypoint, fire.launch, args);
+            crate::prof::end(self.stream, start, || format!("{op} {}", fire.entrypoint));
+            return issued;
+        }
         self.issue(op, &root, fire.entrypoint, fire.launch, args)
     }
 
