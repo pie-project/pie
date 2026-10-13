@@ -86,9 +86,12 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     constexpr u32 kSfQ = kAtomsQ * kRowAtomsQ * 512;  // all of Q's rows, in each CTA
     constexpr u32 kTx = kPair * (kTxP + kTxQ + kSfP + kSfQ);
     constexpr u32 kSfCols = 4 * kAtomsP + 4 * kAtomsQ * kRowAtomsQ;
-    // Scales go to TMEM from their own warp, two K steps' slots: a copy in
-    // the MMA thread's stream would hold every MMA behind it until it lands.
-    constexpr u32 kSfAll = 2 * kSfCols;
+    // Scales go to TMEM from their own warp, up to four K steps ahead in
+    // their own slots: a copy in the MMA thread's stream would hold every
+    // MMA behind it until it lands, and a shallower ring would hold the
+    // copier on the MMAs.
+    constexpr u32 kSfSlots = 4;
+    constexpr u32 kSfAll = kScaled ? kSfSlots * kSfCols : 0;
     // Two accumulator stages always. When they and the scale slots overrun
     // TMEM the stages share kOv columns -- stage 0's tail is stage 1's head --
     // and a tile's first MMA waits until the previous tile's epilogue has
@@ -107,7 +110,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     constexpr u32 kOffOut = (kOffSfQ + kStages * kSfQ + 1023) / 1024 * 1024;
     constexpr u32 kOut = kSwap ? 0 : 4 * 2 * 2048;
     constexpr u32 kOffBar = kOffOut + kOut;
-    constexpr u32 kBytes = kOffBar + (2 * kStages + 12) * 8 + 8;
+    constexpr u32 kBytes = kOffBar + (2 * kStages + 16) * 8 + 8;
 
     extern __shared__ unsigned char smem_raw[];
     const u32 raw = smem_addr(smem_raw);
@@ -119,8 +122,8 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     u64* tempty = tfull + 2;
     u64* tover = tempty + 2;
     u64* sf_ready = tover + 2;
-    u64* sf_free = sf_ready + 2;
-    u32* tmem_slot = reinterpret_cast<u32*>(sf_free + 2);
+    u64* sf_free = sf_ready + 4;
+    u32* tmem_slot = reinterpret_cast<u32*>(sf_free + 4);
 
     const u32 warp = threadIdx.x / 32;
     const u32 lane = threadIdx.x % 32;
@@ -149,6 +152,8 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
             bar_init(&tfull[a], 1);
             bar_init(&tempty[a], 4 * kPair);
             bar_init(&tover[a], 4 * kPair);
+        }
+        for (u32 a = 0; a < kSfSlots; ++a) {
             bar_init(&sf_ready[a], 1);
             bar_init(&sf_free[a], 1);
         }
@@ -263,8 +268,8 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                 int pt, qt, kb0, kb1;
                 tile_of(t, pt, qt, kb0, kb1);
                 for (int kb = kb0; kb < kb1; ++kb, ++step) {
-                    const u32 slot = step & 1;
-                    bar_wait(&sf_free[slot], ((step >> 1) & 1) ^ 1);
+                    const u32 slot = step % kSfSlots;
+                    bar_wait(&sf_free[slot], ((step / kSfSlots) & 1) ^ 1);
                     bar_wait(&full[s], phase);
                     tc_fence_after();
                     const u32 sf_tp = tmem + kStride + kBN + slot * kSfCols;
@@ -304,9 +309,9 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
                 const u32 quarter_q = static_cast<u32>(qt * kBN % 128) / 32;
                 for (int kb = kb0; kb < kb1; ++kb, ++step) {
                     bar_wait(&full[s], phase);
-                    const u32 slot = step & 1;
+                    const u32 slot = step % kSfSlots;
                     if constexpr (kScaled) {
-                        bar_wait(&sf_ready[slot], (step >> 1) & 1);
+                        bar_wait(&sf_ready[slot], (step / kSfSlots) & 1);
                     }
                     tc_fence_after();
                     const u32 tile_p = smem_addr(smem + s * kTileP);

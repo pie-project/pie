@@ -255,7 +255,7 @@ const fn smem_bytes(kind: Kind, gran_p: u32, gran_q: u32, plan: Plan) -> u32 {
         + atoms_k(kind, gran_q) * bn.div_ceil(128) * 512;
     let out = (stages * stage).div_ceil(1024) * 1024;
     let bar = out + if swap { 0 } else { 4 * 2 * 2048 };
-    bar + (2 * stages + 12) * 8 + 8 + 1024
+    bar + (2 * stages + 16) * 8 + 8 + 1024
 }
 
 /// One shape's specialization: which side is the MMA's M, whether two CTAs
