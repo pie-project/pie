@@ -32,55 +32,18 @@ import signal
 import statistics
 import subprocess
 import sys
-import threading
 import time
 import urllib.request
 
-PREFILL = dict(batch=32, input_len=4096, output_len=1)
-DECODE_BATCHES = (1, 8, 64)
-DECODE_INPUT, DECODE_OUTPUT = 512, 256
-SERVE = dict(num_prompts=256, input_len=1024, output_len=256)
-
-
-class MemSampler:
-    """nvidia-smi memory.used and utilization every `period` seconds, into
-    `path`, with every compute process's pid:MiB, so a neighbour sharing the
-    device during a measurement shows."""
-
-    def __init__(self, path: str, period: float = 1.0) -> None:
-        self.path, self.period = path, period
-        self.peak = 0
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-
-    def _run(self) -> None:
-        with open(self.path, "w") as f:
-            f.write("t,memory_used_mib,util_pct,processes\n")
-            t0 = time.time()
-            while not self._stop.is_set():
-                try:
-                    used, util = subprocess.run(
-                        ["nvidia-smi", "--query-gpu=memory.used,utilization.gpu", "--format=csv,noheader,nounits"],
-                        capture_output=True, text=True, timeout=10).stdout.split(",")[:2]
-                    procs = subprocess.run(
-                        ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
-                        capture_output=True, text=True, timeout=10).stdout.split("\n")
-                    procs = " ".join(p.replace(", ", ":") for p in procs if p.strip())
-                    used = int(used)
-                    self.peak = max(self.peak, used)
-                    f.write(f"{time.time() - t0:.1f},{used},{util.strip()},{procs}\n")
-                    f.flush()
-                except Exception:
-                    pass
-                self._stop.wait(self.period)
-
-    def __enter__(self) -> "MemSampler":
-        self._thread.start()
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self._stop.set()
-        self._thread.join()
+from common import (
+    FIXED_DECODE_BATCHES as DECODE_BATCHES,
+    FIXED_DECODE_INPUT as DECODE_INPUT,
+    FIXED_DECODE_OUTPUT as DECODE_OUTPUT,
+    FIXED_PREFILL as PREFILL,
+    FIXED_SERVE as SERVE,
+    MemSampler,
+    fixed_prompt_ids,
+)
 
 
 def engine_args(args: argparse.Namespace) -> list[str]:
@@ -97,7 +60,7 @@ def engine_args(args: argparse.Namespace) -> list[str]:
     return flags + shlex.split(args.extra)
 
 
-def offline(args: argparse.Namespace) -> dict:
+def offline(args: argparse.Namespace, mem: MemSampler) -> dict:
     from vllm import LLM, SamplingParams
     from vllm.engine.arg_utils import EngineArgs
     from vllm.inputs import TokensPrompt
@@ -106,12 +69,12 @@ def offline(args: argparse.Namespace) -> dict:
     p = EngineArgs.add_cli_args(FlexibleArgumentParser())
     eargs = EngineArgs.from_cli_args(p.parse_args(["--model", args.model] + engine_args(args)))
     llm = LLM(**vars(eargs))
+    mem.measuring()
     vocab = llm.get_tokenizer().vocab_size
     rng = random.Random(0)
 
     def prompts(batch: int, input_len: int) -> list:
-        return [TokensPrompt(prompt_token_ids=[rng.randrange(100, vocab - 100) for _ in range(input_len)])
-                for _ in range(batch)]
+        return [TokensPrompt(prompt_token_ids=ids) for ids in fixed_prompt_ids(rng, vocab, batch, input_len)]
 
     def timed(batch: int, input_len: int, output_len: int) -> dict:
         sp = SamplingParams(temperature=0.0, max_tokens=output_len, min_tokens=output_len, ignore_eos=True)
@@ -144,7 +107,7 @@ def offline(args: argparse.Namespace) -> dict:
     return res
 
 
-def serve(args: argparse.Namespace) -> dict:
+def serve(args: argparse.Namespace, mem: MemSampler) -> dict:
     vllm = os.path.join(os.path.dirname(sys.executable), "vllm")
     port = str(args.port)
     cmd = [vllm, "serve", args.model, "--port", port] + engine_args(args)
@@ -163,6 +126,7 @@ def serve(args: argparse.Namespace) -> dict:
                 if time.time() > deadline:
                     raise SystemExit("vllm serve did not come up")
                 time.sleep(5)
+        mem.measuring()
         bench = [
             vllm, "bench", "serve", "--backend", "vllm", "--model", args.model,
             "--port", port, "--dataset-name", "random",
@@ -205,10 +169,11 @@ def main() -> None:
 
     with MemSampler(os.path.join(args.out, f"gpu_mem_{args.mode}.csv")) as mem:
         t0 = time.time()
-        res = offline(args) if args.mode == "offline" else serve(args)
+        res = offline(args, mem) if args.mode == "offline" else serve(args, mem)
     res.update(mode=args.mode, model=args.model, argv=shlex.join(sys.argv),
                engine_flags=shlex.join(engine_args(args)), wall_s=time.time() - t0,
-               peak_gpu_mem_mib=mem.peak)
+               peak_gpu_mem_mib=mem.peak, contended=bool(mem.foreign),
+               foreign_pids=sorted(mem.foreign), foreign_pids_at_load=sorted(mem.foreign_at_load))
     path = os.path.join(args.out, f"{args.mode}.json")
     with open(path, "w") as f:
         json.dump(res, f, indent=2)
