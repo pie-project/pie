@@ -36,6 +36,24 @@ __global__ void mlp_swiglu(const T* __restrict__ packed, T* __restrict__ y, i32 
     y[row * I + i] = from_f32<T>(g * sigmoid(g) * u);
 }
 
+// ---------------------------------------------------------------- MoE --
+
+// y = routed + shared · sigmoid(gate[row · stride]): the shared expert
+// folded in behind its scalar gate. Grid (rows, ⌈H / block⌉).
+template <class T>
+__global__ void moe_sigmoid_gate_add(T* __restrict__ out, const T* __restrict__ sum, const T* __restrict__ x,
+                                     const T* __restrict__ scalar_gate, i32 H, i32 stride,
+                                     const u32* __restrict__ win) {
+    const Window window{win};
+    if (!window.live(blockIdx.x)) return;
+    const long long row = window.plane(blockIdx.x);
+    const i32 h = blockIdx.y * blockDim.x + threadIdx.x;
+    if (h >= H) return;
+    const float s = sigmoid(to_f32(scalar_gate[row * stride]));
+    const long long i = row * H + h;
+    out[i] = from_f32<T>(to_f32(sum[i]) + to_f32(x[i]) * s);
+}
+
 }  // namespace pie::linear
 
 // ---------------------------------------------------------------------------

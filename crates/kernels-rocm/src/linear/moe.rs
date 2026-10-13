@@ -10,22 +10,23 @@ const FILE: &str = "linear/moe.hip";
 
 const BLOCK: u32 = 256;
 
-const WARP: u32 = 32;
-
-const GEMV_WARPS: u32 = 4;
-
 const MAX_EXPERTS: u32 = 512;
 
-const MAX_GRID_Y: u32 = 65_535;
-
-const fn rms(rows: u32) -> Launch {
-    Launch::per_row(rows, BLOCK).smem((BLOCK / WARP) * 4)
-}
+/// A router is one wavefront a token row, each lane landing one pick.
+const ROUTER_LANES: u32 = 64;
 
 const fn router_lane(rows: u32) -> Launch {
-    const ROUTER_BLOCK: u32 = 64;
+    Launch::per_row(rows, ROUTER_LANES)
+}
 
-    Launch::per_row(rows, ROUTER_BLOCK)
+fn router_fan(op: &'static str, fan: u32) -> Result<(), Error> {
+    if fan > ROUTER_LANES {
+        return Err(refuse(
+            op,
+            format!("the fan-out is {fan}, above the {ROUTER_LANES} picks one wavefront lands"),
+        ));
+    }
+    Ok(())
 }
 
 fn elementwise_rows(op: &'static str, rows: u32, width: u32) -> Result<Launch, Error> {
@@ -62,6 +63,7 @@ fn router_extents(
     );
     nonzero(op, "rows", logits.rows)?;
     nonzero(op, "the fan-out this router states", top_k)?;
+    router_fan(op, top_k)?;
     if experts > MAX_EXPERTS {
         return Err(refuse(
             op,
@@ -169,7 +171,7 @@ fn ranked_router(
     let (e, k) = router_extents(op, logits, experts, top_k)?;
     ctx.fire(
         op,
-        Fire::at(file, entrypoint).apply(rms(logits.rows)),
+        Fire::at(file, entrypoint).apply(router_lane(logits.rows)),
         &[
             logits.arg(),
             routes.arg(),
@@ -235,6 +237,7 @@ pub fn topk_sigmoid_sink(
     ranked_planes(OP, logits, fan, routes, weights);
     nonzero(OP, "rows", logits.rows)?;
     nonzero(OP, "the fan-out this router states", top_k)?;
+    router_fan(OP, fan)?;
     let width = experts
         .checked_add(sink)
         .ok_or_else(|| refuse(OP, "the expert count does not count"))?;
@@ -272,7 +275,7 @@ pub fn topk_sigmoid_sink(
             FILE,
             symbol(&format!("::pie::linear::moe_topk_sigmoid_sink<{t}>")),
         )
-        .apply(rms(logits.rows)),
+        .apply(router_lane(logits.rows)),
         &[
             logits.arg(),
             routes.arg(),
@@ -404,14 +407,163 @@ pub fn matmul_select(
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_matmul_select";
 
-    #[cfg(feature = "rocm")]
-    {
-        let fan = selected(OP, x, routes, y)?;
-        if let Some(count) = grouped_worth(ctx, x, bank, y, &fan, experts) {
-            return select_grouped(ctx, OP, x, bank, routes, y, count);
+    let fan = selected(OP, x, routes, y)?;
+    if let Some(count) = grouped_worth(ctx, x, bank, y, &fan, experts) {
+        if x.width.is_multiple_of(8) {
+            return select_grouped(ctx, OP, x, bank, routes, y, count, &fan);
+        }
+        // A row the native legs cannot read in 16-byte pieces: rocBLAS's
+        // batched GEMM, eagerly. Where both run the native leg is several
+        // times the faster.
+        #[cfg(feature = "rocm")]
+        if ctx.stage() == ArgValue::Ptr(0) && blas_worth(x, y, &fan, count) {
+            return select_grouped_blas(ctx, OP, x, bank, routes, y, count);
         }
     }
     select_gemv(ctx, OP, x, bank, routes, y, experts)
+}
+
+/// The most experts `moe_route_order` buckets in its LDS.
+const ORDER_EXPERT_CAP: u32 = 4096;
+
+fn grouped_worth(
+    ctx: &Ctx,
+    x: Tensor,
+    bank: Tensor,
+    y: &Tensor,
+    fan: &Selected,
+    experts: ExpertTable,
+) -> Option<u32> {
+    if !ctx.tuning().moe_grouped || experts.streams() {
+        return None;
+    }
+    if !matches!(x.dtype, Dtype::Bf16 | Dtype::F16) || bank.dtype != x.dtype {
+        return None;
+    }
+    let count = bank.rows;
+    if count == 0 || count > ORDER_EXPERT_CAP {
+        return None;
+    }
+    if u64::from(bank.width) != u64::from(x.width) * u64::from(y.width) {
+        return None;
+    }
+    (fan.route_count.div_ceil(count) >= ctx.tuning().moe_group_at).then_some(count)
+}
+
+/// The planes `moe_route_order` lands: routes in expert order, each
+/// expert's run, and the work list of `routes`-route items.
+struct RouteOrder {
+    order: u64,
+    offsets: u64,
+    work: u64,
+    work_cap: u32,
+    routes: u32,
+}
+
+/// Routes a grouped work item takes: 32, or 128 once the experts average
+/// `GROUP_WIDE_AT` routes, where reading each expert's weight a quarter as
+/// often outweighs the taller tile's emptier last item.
+const GROUP_ROUTES: u32 = 32;
+const GROUP_ROUTES_WIDE: u32 = 128;
+const GROUP_WIDE_AT: u32 = 64;
+/// Weight rows a grouped block takes (`kGroupTileN`).
+const GROUP_TILE_N: u32 = 128;
+const GROUP_BLOCK: u32 = 256;
+
+fn route_order(
+    ctx: &Ctx,
+    op: &'static str,
+    routes: Tensor,
+    fan: &Selected,
+    experts: u32,
+) -> Result<RouteOrder, Error> {
+    const ROUTE_ORDER: &str = "moe_route_order";
+    const ORDER_BLOCK: u32 = 1024;
+    let group = if fan.route_count / experts >= GROUP_WIDE_AT {
+        GROUP_ROUTES_WIDE
+    } else {
+        GROUP_ROUTES
+    };
+    let offsets_at = (fan.route_count as usize).next_multiple_of(64);
+    let work_cap = fan.route_count.div_ceil(group) + experts;
+    let work_at = (offsets_at + experts as usize + 2).next_multiple_of(64);
+    let order = ctx.scratch(
+        op,
+        ROUTE_ORDER,
+        (work_at + work_cap as usize) * core::mem::size_of::<i32>(),
+    )? as usize as u64;
+    let offsets = order + (offsets_at * core::mem::size_of::<i32>()) as u64;
+    let work = order + (work_at * core::mem::size_of::<i32>()) as u64;
+    ctx.fire(
+        op,
+        Fire::at("linear/quant.hip", symbol("::pie::linear::moe_route_order"))
+            .apply(Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1]).smem(2 * (experts + 1) * 4)),
+        &[
+            routes.arg(),
+            ArgValue::Ptr(order),
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(work),
+            stated(op, work_cap)?.arg(),
+            group.arg(),
+            fan.top_k.arg(),
+            stated(op, fan.route_count)?.arg(),
+            stated(op, experts)?.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    Ok(RouteOrder {
+        order,
+        offsets,
+        work,
+        work_cap,
+        routes: group,
+    })
+}
+
+/// The grouped dense leg: routes ordered by expert, then 32 or 128 of one expert's
+/// routes against 128 of its weight rows a block on the matrix core.
+#[allow(clippy::too_many_arguments)]
+fn select_grouped(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    bank: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+    experts: u32,
+    fan: &Selected,
+) -> Result<(), Error> {
+    let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let k = stated(op, x.width)?;
+    let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
+    let ordered = route_order(ctx, op, routes, fan, experts)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::linear::moe_matmul_select_grouped<{t}, ::pie::i32({})>",
+                ordered.routes
+            )),
+        )
+        .apply(Launch::grid(
+            [ordered.work_cap, y.width.div_ceil(GROUP_TILE_N), 1],
+            [GROUP_BLOCK, 1, 1],
+        )),
+        &[
+            x.arg(),
+            ArgValue::Ptr(ordered.order),
+            ArgValue::Ptr(ordered.offsets),
+            ArgValue::Ptr(ordered.work),
+            bank.arg(),
+            y.arg(),
+            act_div.arg(),
+            n.arg(),
+            k.arg(),
+            stated(op, experts)?.arg(),
+        ],
+    )
 }
 
 #[cfg(feature = "rocm")]
@@ -429,46 +581,25 @@ const fn block_rows(per_expert: u32) -> u32 {
 #[cfg(feature = "rocm")]
 const GROUP_WORKSPACE_CAP: u64 = 512 << 20;
 
+/// Whether the rocBLAS leg seats its experts and its staged workspace fits.
 #[cfg(feature = "rocm")]
-fn grouped_worth(
-    ctx: &Ctx,
-    x: Tensor,
-    bank: Tensor,
-    y: &Tensor,
-    fan: &Selected,
-    experts: ExpertTable,
-) -> Option<u32> {
-    if !ctx.tuning().moe_grouped {
-        return None;
+fn blas_worth(x: Tensor, y: &Tensor, fan: &Selected, count: u32) -> bool {
+    if count > MAX_EXPERTS {
+        return false;
     }
-    if experts.streams() || !matches!(ctx.stage(), ArgValue::Ptr(0)) {
-        return None;
-    }
-    if !matches!(x.dtype, Dtype::Bf16 | Dtype::F16) || bank.dtype != x.dtype {
-        return None;
-    }
-    let count = bank.rows;
-    if count == 0 || count > MAX_EXPERTS {
-        return None;
-    }
-    if u64::from(bank.width) != u64::from(x.width) * u64::from(y.width) {
-        return None;
-    }
-    let per_expert = fan.route_count.div_ceil(count);
-    if per_expert < ctx.tuning().moe_group_at {
-        return None;
-    }
-    let block = block_rows(per_expert);
+    let block = block_rows(fan.route_count.div_ceil(count));
     let blocks = u64::from(count) + u64::from(fan.route_count.div_ceil(block));
-    let rows = blocks * u64::from(block);
-    let staged = rows
-        .checked_mul(u64::from(x.width) + u64::from(y.width))?
-        .checked_mul(x.dtype.bytes_ceil())?;
-    (staged <= GROUP_WORKSPACE_CAP).then_some(count)
+    let staged = (blocks * u64::from(block))
+        .saturating_mul(u64::from(x.width) + u64::from(y.width))
+        .saturating_mul(x.dtype.bytes_ceil());
+    staged <= GROUP_WORKSPACE_CAP
 }
 
+/// The rocBLAS leg: routes bucketed into blocks of one expert, gathered,
+/// multiplied as one batched GEMM, and scattered back.
 #[cfg(feature = "rocm")]
-fn select_grouped(
+#[allow(clippy::too_many_arguments)]
+fn select_grouped_blas(
     ctx: &Ctx,
     op: &'static str,
     x: Tensor,
@@ -650,6 +781,89 @@ fn select_grouped(
     )
 }
 
+/// Waves a stream block runs (`kStreamWaves`).
+const STREAM_WAVES: u32 = 4;
+const STREAM_LANES: u32 = 64;
+const STREAM_BLOCK: u32 = STREAM_WAVES * STREAM_LANES;
+/// The LDS a block may hold.
+const STREAM_LDS: u32 = 64 << 10;
+
+/// Unit-dot slots a stream wave holds in LDS, short of a single row.
+const STREAM_DOTS: u32 = 1024;
+
+/// The slots a stream row takes (`stream_slots`): one a unit for a row of
+/// fewer units than lanes, else one a lane.
+const fn stream_slots(units: u32) -> u32 {
+    if units < STREAM_LANES {
+        units
+    } else {
+        STREAM_LANES
+    }
+}
+
+/// A stream codec as the launch sees it: codes a unit, units a lane
+/// fetches a round (`kUnroll`), and whether it stages unit sums.
+#[derive(Clone, Copy)]
+struct StreamCodec {
+    codes: u32,
+    unroll: u32,
+    xsum: bool,
+}
+
+/// The rows a stream wave takes for rows of `units` units: the count (≤ 64,
+/// its slots within `STREAM_DOTS`) whose run wastes the least of its last
+/// round of fetches, the more rows on a tie.
+fn stream_rows(units: u32, unroll: u32) -> u32 {
+    let round = STREAM_LANES * unroll;
+    let most = (STREAM_DOTS / stream_slots(units).max(1)).clamp(1, STREAM_LANES);
+    (1..=most)
+        .max_by_key(|&r| {
+            let run = r * units;
+            // The share of the fetched units the run uses, in 1/1024ths.
+            (
+                u64::from(run) * 1024 / u64::from(run.div_ceil(round) * round),
+                r,
+            )
+        })
+        .unwrap_or(1)
+}
+
+/// The decode stream's launch over `routes` routes of `n` rows: each wave
+/// takes `stream_rows` rows, and the block stages the activation (and,
+/// `xsum`, its unit sums) and its waves' unit dots in LDS. The rows a wave
+/// takes ride along as the kernel's `rows_per_wave`.
+fn stream_launch(
+    op: &'static str,
+    routes: u32,
+    n: u32,
+    k: u32,
+    codec: StreamCodec,
+) -> Result<(Launch, i32), Error> {
+    let units = k / codec.codes;
+    let rows = stream_rows(units, codec.unroll);
+    let lds = u64::from(2 * k).next_multiple_of(16)
+        + if codec.xsum {
+            u64::from(units.next_multiple_of(4)) * 4
+        } else {
+            0
+        }
+        + u64::from(STREAM_WAVES * rows) * u64::from(stream_slots(units)) * 4;
+    if lds > u64::from(STREAM_LDS) {
+        return Err(refuse(
+            op,
+            format!(
+                "a {k}-wide row stages {lds} bytes of LDS, past the {STREAM_LDS} a block holds"
+            ),
+        ));
+    }
+    let launch = Launch::grid(
+        [routes, n.div_ceil(STREAM_WAVES * rows), 1],
+        [STREAM_BLOCK, 1, 1],
+    )
+    .smem(lds as u32);
+    Ok((launch, stated(op, rows)?))
+}
+
 pub(crate) fn select_gemv(
     ctx: &Ctx,
     op: &'static str,
@@ -664,27 +878,28 @@ pub(crate) fn select_gemv(
     let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(bank.dtype, x.dtype, "the bank rides the activation's dtype");
     let fan = selected(op, x, routes, y)?;
-    if fan.route_count > MAX_GRID_Y {
-        return Err(refuse(
-            op,
-            format!(
-                "the route run is {}, above the {MAX_GRID_Y} rows this GEMV puts on the \
-                 grid's y axis; the aligned batched leg is what a wider fire wants",
-                fan.route_count
-            ),
-        ));
-    }
     if x.width == 0 || !x.width.is_multiple_of(VEC_WIDTH) {
         return Err(refuse(
             op,
             format!(
-                "K is {}, not a whole number of {VEC_WIDTH}-element float4 loads",
+                "K is {}, not a whole number of {VEC_WIDTH}-element 16-byte loads",
                 x.width
             ),
         ));
     }
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
+    let (launch, rows) = stream_launch(
+        op,
+        fan.route_count,
+        y.width,
+        x.width,
+        StreamCodec {
+            codes: VEC_WIDTH,
+            unroll: 8,
+            xsum: false,
+        },
+    )?;
     let form = if fan.by_token { "by_token" } else { "by_route" };
     ctx.fire(
         op,
@@ -694,10 +909,7 @@ pub(crate) fn select_gemv(
                 "::pie::linear::moe_matmul_select_gemv_{form}<{t}>"
             )),
         )
-        .apply(Launch::grid(
-            [y.width.div_ceil(GEMV_WARPS), fan.route_count, 1],
-            [WARP, GEMV_WARPS, 1],
-        )),
+        .apply(launch),
         &[
             routes.arg(),
             x.arg(),
@@ -709,6 +921,7 @@ pub(crate) fn select_gemv(
             (i64::from(n) * i64::from(k)).arg(), // the bank's expert stride
             ArgValue::Ptr(experts.table),
             ArgValue::Ptr(experts.hits),
+            rows.arg(),
             ctx.stage(),
         ],
     )
@@ -727,10 +940,6 @@ fn matmul_select_mxfp4(
     seat: GroupSeat,
 ) -> Result<(), Error> {
     const MXFP4_BLOCK: u32 = 32;
-
-    const ROWS_PER_WARP: u32 = 4;
-
-    const DECODE_BLOCK: u32 = 128;
 
     let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(codes.dtype, Dtype::U8, "an mxfp4 bank's codes are u8");
@@ -751,59 +960,31 @@ fn matmul_select_mxfp4(
     }
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
-    let tile = (DECODE_BLOCK / WARP) * ROWS_PER_WARP;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
 
-    const ROUTE_ORDER: &str = "moe_route_order";
-    const ORDER_BLOCK: u32 = 1024;
-    const EXPERT_CAP: u32 = 4096;
     // The grouped kernels read an expert once per batch of its routes, the
     // by-route one once per route but at the card's streaming rate, so grouping
     // pays only once an expert serves more than `kernel.moe.mxfp4_grouped_reuse`
     // routes on average; routes over experts is a floor on that average.
-    const GROUPED_TILE_N: u32 = 128;
-    const GROUPED_BLOCK: u32 = 256;
-    const WMMA_ROUTES: u32 = 32;
-
-    let experts = codes.rows.clamp(1, EXPERT_CAP);
+    let experts = codes.rows.clamp(1, ORDER_EXPERT_CAP);
     if fan.route_count > ctx.tuning().mxfp4_grouped_reuse * experts && ctx.tuning().mxfp4_grouped {
-        let order_words = fan.route_count as usize;
-        let offsets_at = order_words.next_multiple_of(64);
-        let work_cap = fan.route_count.div_ceil(WMMA_ROUTES) + experts;
-        let work_at = (offsets_at + experts as usize + 2).next_multiple_of(64);
-        let order = ctx.scratch(
-            op,
-            ROUTE_ORDER,
-            (work_at + work_cap as usize) * core::mem::size_of::<i32>(),
-        )? as usize as u64;
-        let offsets = order + (offsets_at * core::mem::size_of::<i32>()) as u64;
-        let work = order + (work_at * core::mem::size_of::<i32>()) as u64;
-        ctx.fire(
-            op,
-            Fire::at("linear/quant.hip", symbol("::pie::linear::moe_route_order"))
-                .apply(Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1]).smem(2 * (experts + 1) * 4)),
-            &[
-                routes.arg(),
-                ArgValue::Ptr(order),
-                ArgValue::Ptr(offsets),
-                ArgValue::Ptr(work),
-                stated(op, work_cap)?.arg(),
-                WMMA_ROUTES.arg(),
-                fan.top_k.arg(),
-                stated(op, fan.route_count)?.arg(),
-                stated(op, experts)?.arg(),
-                ctx.stage(),
-            ],
-        )?;
+        let ordered = route_order(ctx, op, routes, &fan, experts)?;
         let wmma = x.dtype == Dtype::Bf16 && ctx.tuning().mxfp4_wmma;
         let entry = if wmma {
-            "::pie::linear::moe_matmul_select_mxfp4_wmma".to_string()
+            format!(
+                "::pie::linear::moe_matmul_select_mxfp4_wmma<::pie::i32({})>",
+                ordered.routes
+            )
         } else {
             format!("::pie::linear::moe_matmul_select_mxfp4_grouped<{t}>")
         };
-        let mut args = vec![x.arg(), ArgValue::Ptr(order), ArgValue::Ptr(offsets)];
+        let mut args = vec![
+            x.arg(),
+            ArgValue::Ptr(ordered.order),
+            ArgValue::Ptr(ordered.offsets),
+        ];
         if wmma {
-            args.push(ArgValue::Ptr(work));
+            args.push(ArgValue::Ptr(ordered.work));
         }
         args.extend([
             codes.arg(),
@@ -821,27 +1002,33 @@ fn matmul_select_mxfp4(
             op,
             Fire::at("linear/quant.hip", symbol(&entry)).apply(Launch::grid(
                 [
-                    if wmma { work_cap } else { experts },
-                    y.width.div_ceil(GROUPED_TILE_N),
+                    if wmma { ordered.work_cap } else { experts },
+                    y.width.div_ceil(GROUP_TILE_N),
                     1,
                 ],
-                [GROUPED_BLOCK, 1, 1],
+                [GROUP_BLOCK, 1, 1],
             )),
             &args,
         );
     }
+    let (launch, rows) = stream_launch(
+        op,
+        fan.route_count,
+        y.width,
+        x.width,
+        StreamCodec {
+            codes: MXFP4_BLOCK,
+            unroll: 4,
+            xsum: false,
+        },
+    )?;
     ctx.fire(
         op,
         Fire::at(
             "linear/quant.hip",
-            symbol(&format!(
-                "::pie::linear::moe_matmul_select_mxfp4<{t}, ::pie::i32({ROWS_PER_WARP})>"
-            )),
+            symbol(&format!("::pie::linear::moe_matmul_select_mxfp4<{t}>")),
         )
-        .apply(Launch::grid(
-            [fan.route_count, y.width.div_ceil(tile), 1],
-            [DECODE_BLOCK, 1, 1],
-        )),
+        .apply(launch),
         &[
             x.arg(),
             routes.arg(),
@@ -855,6 +1042,7 @@ fn matmul_select_mxfp4(
             k.arg(),
             ArgValue::Ptr(seat.cell),
             ArgValue::Ptr(seat.hits),
+            rows.arg(),
             ctx.stage(),
         ],
     )
@@ -905,9 +1093,7 @@ fn matmul_select_mlxu4(
     y: &mut Tensor,
     seat: GroupSeat,
 ) -> Result<(), Error> {
-    const ROWS_PER_WARP: u32 = 4;
-
-    const DECODE_BLOCK: u32 = 128;
+    const UNIT: u32 = 32;
 
     let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(
@@ -956,7 +1142,7 @@ fn matmul_select_mlxu4(
         0
     };
     let group = u32::try_from(group).unwrap_or(0);
-    if !matches!(group, 32 | 64 | 128) || !group.is_multiple_of(32 / bits) {
+    if !matches!(group, 32 | 64 | 128) {
         return Err(refuse(
             op,
             format!(
@@ -965,50 +1151,18 @@ fn matmul_select_mlxu4(
             ),
         ));
     }
-    let tile = (DECODE_BLOCK / WARP) * ROWS_PER_WARP;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
 
-    const ROUTE_ORDER: &str = "moe_route_order";
-    const ORDER_BLOCK: u32 = 1024;
-    const EXPERT_CAP: u32 = 4096;
-    const GROUPED_TILE_N: u32 = 128;
-    const GROUPED_BLOCK: u32 = 256;
-    const WMMA_ROUTES: u32 = 32;
-    let experts = codes.rows.clamp(1, EXPERT_CAP);
-    let order_words = fan.route_count as usize;
-    let offsets_at = order_words.next_multiple_of(64);
-    let work_cap = fan.route_count.div_ceil(WMMA_ROUTES) + experts;
-    let work_at = (offsets_at + experts as usize + 2).next_multiple_of(64);
-    let order = ctx.scratch(
-        op,
-        ROUTE_ORDER,
-        (work_at + work_cap as usize) * core::mem::size_of::<i32>(),
-    )? as usize as u64;
-    let offsets = order + (offsets_at * core::mem::size_of::<i32>()) as u64;
-    let work = order + (work_at * core::mem::size_of::<i32>()) as u64;
-    ctx.fire(
-        op,
-        Fire::at("linear/quant.hip", symbol("::pie::linear::moe_route_order"))
-            .apply(Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1]).smem(2 * (experts + 1) * 4)),
-        &[
-            routes.arg(),
-            ArgValue::Ptr(order),
-            ArgValue::Ptr(offsets),
-            ArgValue::Ptr(work),
-            stated(op, work_cap)?.arg(),
-            WMMA_ROUTES.arg(),
-            fan.top_k.arg(),
-            stated(op, fan.route_count)?.arg(),
-            stated(op, experts)?.arg(),
-            ctx.stage(),
-        ],
-    )?;
+    let experts = codes.rows.clamp(1, ORDER_EXPERT_CAP);
     let tuning = ctx.tuning();
     if tuning.affine_grouped && fan.route_count >= tuning.affine_grouped_from {
+        let ordered = route_order(ctx, op, routes, &fan, experts)?;
         let wmma = x.dtype == Dtype::Bf16 && tuning.affine_wmma;
         let entry = if wmma {
             format!(
-                "::pie::linear::moe_matmul_select_mlxu4_wmma<::pie::i32({bits}), ::pie::i32({group})>"
+                "::pie::linear::moe_matmul_select_mlxu4_wmma<::pie::i32({bits}), ::pie::i32({group}), \
+                 ::pie::i32({})>",
+                ordered.routes
             )
         } else {
             format!(
@@ -1016,9 +1170,13 @@ fn matmul_select_mlxu4(
                  ::pie::i32({group})>"
             )
         };
-        let mut args = vec![x.arg(), ArgValue::Ptr(order), ArgValue::Ptr(offsets)];
+        let mut args = vec![
+            x.arg(),
+            ArgValue::Ptr(ordered.order),
+            ArgValue::Ptr(ordered.offsets),
+        ];
         if wmma {
-            args.push(ArgValue::Ptr(work));
+            args.push(ArgValue::Ptr(ordered.work));
         }
         args.extend([
             codes.arg(),
@@ -1036,32 +1194,38 @@ fn matmul_select_mlxu4(
             op,
             Fire::at("linear/quant.hip", symbol(&entry)).apply(Launch::grid(
                 [
-                    if wmma { work_cap } else { experts },
-                    y.width.div_ceil(GROUPED_TILE_N),
+                    if wmma { ordered.work_cap } else { experts },
+                    y.width.div_ceil(GROUP_TILE_N),
                     1,
                 ],
-                [GROUPED_BLOCK, 1, 1],
+                [GROUP_BLOCK, 1, 1],
             )),
             &args,
         );
     }
+    let (launch, rows) = stream_launch(
+        op,
+        fan.route_count,
+        y.width,
+        x.width,
+        StreamCodec {
+            codes: UNIT,
+            unroll: if bits == 8 { 2 } else { 4 },
+            xsum: true,
+        },
+    )?;
     ctx.fire(
         op,
         Fire::at(
             "linear/quant.hip",
             symbol(&format!(
-                "::pie::linear::moe_matmul_select_mlxu4<{t}, ::pie::i32({bits}), ::pie::i32({group}), \
-                 ::pie::i32({ROWS_PER_WARP})>"
+                "::pie::linear::moe_matmul_select_mlxu4<{t}, ::pie::i32({bits}), ::pie::i32({group})>"
             )),
         )
-        .apply(Launch::grid(
-            [fan.route_count, y.width.div_ceil(tile), 1],
-            [DECODE_BLOCK, 1, 1],
-        )),
+        .apply(launch),
         &[
             x.arg(),
             routes.arg(),
-            ArgValue::Ptr(order),
             codes.arg(),
             scales.arg(),
             biases.arg(),
@@ -1072,6 +1236,7 @@ fn matmul_select_mlxu4(
             k.arg(),
             ArgValue::Ptr(seat.cell),
             ArgValue::Ptr(seat.hits),
+            rows.arg(),
             ctx.stage(),
         ],
     )
