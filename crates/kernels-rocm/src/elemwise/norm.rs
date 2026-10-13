@@ -366,7 +366,12 @@ pub fn rmsnorm_gated_by(
         )
         .apply(Launch::grid(
             [y.rows, heads, 1],
-            [d.clamp(KDA_BLOCK_MIN, KDA_BLOCK_MAX), 1, 1],
+            // Whole wavefronts: the block's sum reduces wave by wave.
+            [
+                d.next_multiple_of(WARP).clamp(KDA_BLOCK_MIN, KDA_BLOCK_MAX),
+                1,
+                1,
+            ],
         )),
         &[
             x.arg(),

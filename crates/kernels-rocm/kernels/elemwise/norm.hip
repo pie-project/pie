@@ -5,6 +5,7 @@
 // multiple of 8 and whose planes are 16-byte aligned moves in 16-byte packs.
 
 #include "prelude/device.hip"
+#include "elemwise/pointwise.hip"
 
 namespace pie::elemwise {
 
@@ -204,9 +205,8 @@ __global__ void residual_add(T* __restrict__ y, const T* __restrict__ x, usize n
                              const u32* __restrict__ win) {
     const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const Window window{win};
-    if (!window.live(static_cast<long long>(i / width))) return;
-    const usize at = static_cast<usize>(window.plane(static_cast<long long>(i / width))) * width + i % width;
+    const long long at = flat_at(win, static_cast<long long>(i), width);
+    if (at < 0) return;
     y[at] = from_f32<T>(to_f32(y[at]) + to_f32(x[at]));
 }
 
@@ -216,9 +216,8 @@ __global__ void mul_scalar(T* __restrict__ x, float s, usize n, int width,
                            const u32* __restrict__ win) {
     const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const Window window{win};
-    if (!window.live(static_cast<long long>(i / width))) return;
-    const usize at = static_cast<usize>(window.plane(static_cast<long long>(i / width))) * width + i % width;
+    const long long at = flat_at(win, static_cast<long long>(i), width);
+    if (at < 0) return;
     x[at] = from_f32<T>(to_f32(x[at]) * to_f32(from_f32<T>(s)));
 }
 
@@ -230,6 +229,270 @@ __global__ void add_bias(T* __restrict__ out, const TB* __restrict__ bias, int d
     if (!window.live(blockIdx.x)) return;
     T* row = out + window.plane(blockIdx.x) * dim;
     for (int d = threadIdx.x; d < dim; d += blockDim.x) row[d] = from_f32<T>(to_f32(row[d]) + to_f32(bias[d]));
+}
+
+// x = silu(s · x).
+template <class T>
+__global__ void silu_scaled(T* __restrict__ x, float s, usize n, int width,
+                            const u32* __restrict__ win) {
+    const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const long long at = flat_at(win, static_cast<long long>(i), width);
+    if (at < 0) return;
+    const float v = to_f32(x[at]) * s;
+    x[at] = from_f32<T>(v / (1.f + __expf(-v)));
+}
+
+// x *= s[0], the factor read from a one-element device plane.
+template <class T>
+__global__ void scale(T* __restrict__ x, const T* __restrict__ s, usize n, int width,
+                      const u32* __restrict__ win) {
+    const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const long long at = flat_at(win, static_cast<long long>(i), width);
+    if (at < 0) return;
+    x[at] = from_f32<T>(to_f32(x[at]) * to_f32(s[0]));
+}
+
+// out = (out - bias) · scale per column, one block per row. The launch is
+// the plane's true extent: no window.
+template <class T>
+__global__ void standardize(T* __restrict__ out, const T* __restrict__ bias,
+                            const T* __restrict__ scale, int dim) {
+    T* row = out + static_cast<long long>(blockIdx.x) * dim;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x)
+        row[d] = from_f32<T>((to_f32(row[d]) - to_f32(bias[d])) * to_f32(scale[d]));
+}
+
+// y = rmsnorm(x) · (w + 1) over each `group`-wide slice of a row; the weight
+// spans the full row, one slice of it per group. A launch over
+// `rows * groups` blocks.
+template <class T, int BLOCK>
+__global__ __launch_bounds__(BLOCK) void rmsnorm_grouped_plus_one(const T* __restrict__ x,
+                                                                  const T* __restrict__ w,
+                                                                  T* __restrict__ y, int group,
+                                                                  int groups, float eps,
+                                                                  const u32* __restrict__ win) {
+    const Window window{win};
+    if (!window.live(blockIdx.x, groups)) return;
+    const long long at = window.plane(blockIdx.x, groups) * group;
+    const T* wg = w + static_cast<long long>(blockIdx.x % groups) * group;
+    norm_row<T, BLOCK, true>(x + at, wg, y + at, group, eps);
+}
+
+// y = rmsnorm(o) · w · sigmoid(g) per `D`-wide head, o and w in f32: the
+// KDA output norm. Grid (rows, H); a block of one or two wavefronts walks
+// one head.
+template <class T>
+__global__ __launch_bounds__(128) void rmsnorm_gated_by(const float* __restrict__ o,
+                                                        const T* __restrict__ g,
+                                                        const float* __restrict__ w,
+                                                        T* __restrict__ y, int H, int D, float eps,
+                                                        const u32* __restrict__ win) {
+    __shared__ float smem[128 / kWave];
+    const Window window{win};
+    if (!window.live(blockIdx.x)) return;
+    const long long base = (window.plane(blockIdx.x) * H + blockIdx.y) * D;
+    float local = 0.f;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) local += o[base + d] * o[base + d];
+    const float inv = rsqrtf(block_sum(local, smem) / static_cast<float>(D) + eps);
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        const float gate = 1.f / (1.f + __expf(-to_f32(g[base + d])));
+        y[base + d] = from_f32<T>(o[base + d] * inv * w[d] * gate);
+    }
+}
+
+// `V` elements moved as one access: a 16-byte pack of eight, or one.
+template <class T, int V>
+struct alignas(sizeof(T) * V) Lanes {
+    T v[V];
+};
+
+// The fused norm-then-residual chain of a sandwich-norm block:
+//   t = rmsnorm(x) · w0, y += t, [scaled = y · s[0]], [out = rmsnorm(last) · (w1 [+ 1])]
+// where `last` is the scaled stream when there is one, else the stream.
+// Every step rounds to T as it is stored and the next reads the rounded
+// value. A row of at most CHUNKS · BLOCK groups of V elements stays in
+// registers through the chain; loads index a clamped group so they issue
+// unconditionally, and the tail groups are masked out of the sums.
+template <class T, int BLOCK, int V, int CHUNKS, bool SCALE, bool POST, bool POST_PLUS_ONE>
+__device__ __forceinline__ void residual_chain(const T* __restrict__ x, const T* __restrict__ w0,
+                                               T* __restrict__ t, T* __restrict__ y,
+                                               const T* __restrict__ s, T* __restrict__ scaled,
+                                               const T* __restrict__ w1, T* __restrict__ out,
+                                               int hidden, float eps0, float eps1,
+                                               const u32* __restrict__ win) {
+    using L = Lanes<T, V>;
+    __shared__ float smem[BLOCK / kWave];
+    const Window window{win};
+    if (!window.live(blockIdx.x)) return;
+    const long long base = window.plane(blockIdx.x) * hidden;
+    const int groups = hidden / V;
+    const int tid = static_cast<int>(threadIdx.x);
+
+    L xv[CHUNKS], yv[CHUNKS], wv0[CHUNKS], wv1[CHUNKS];
+#pragma unroll
+    for (int c = 0; c < CHUNKS; ++c) {
+        const int k = min(tid + c * BLOCK, groups - 1);
+        xv[c] = reinterpret_cast<const L*>(x + base)[k];
+        yv[c] = reinterpret_cast<const L*>(y + base)[k];
+        wv0[c] = reinterpret_cast<const L*>(w0)[k];
+        if constexpr (POST) wv1[c] = reinterpret_cast<const L*>(w1)[k];
+    }
+    float local = 0.f;
+#pragma unroll
+    for (int c = 0; c < CHUNKS; ++c) {
+        if (tid + c * BLOCK < groups) {
+#pragma unroll
+            for (int j = 0; j < V; ++j) {
+                const float v = to_f32(xv[c].v[j]);
+                local += v * v;
+            }
+        }
+    }
+    const float inv0 = rsqrtf(block_sum(local, smem) / static_cast<float>(hidden) + eps0);
+    const float sf = SCALE ? to_f32(s[0]) : 1.f;
+
+    L last[CHUNKS];
+    float local1 = 0.f;
+#pragma unroll
+    for (int c = 0; c < CHUNKS; ++c) {
+        const int i = tid + c * BLOCK;
+        if (i < groups) {
+            L tq, yq;
+#pragma unroll
+            for (int j = 0; j < V; ++j) {
+                tq.v[j] = from_f32<T>(to_f32(xv[c].v[j]) * inv0 * to_f32(wv0[c].v[j]));
+                yq.v[j] = from_f32<T>(to_f32(yv[c].v[j]) + to_f32(tq.v[j]));
+            }
+            reinterpret_cast<L*>(t + base)[i] = tq;
+            reinterpret_cast<L*>(y + base)[i] = yq;
+            last[c] = yq;
+            if constexpr (SCALE) {
+#pragma unroll
+                for (int j = 0; j < V; ++j) last[c].v[j] = from_f32<T>(to_f32(yq.v[j]) * sf);
+                reinterpret_cast<L*>(scaled + base)[i] = last[c];
+            }
+#pragma unroll
+            for (int j = 0; j < V; ++j) {
+                const float v = to_f32(last[c].v[j]);
+                local1 += v * v;
+            }
+        }
+    }
+    if constexpr (POST) {
+        const float inv1 = rsqrtf(block_sum(local1, smem) / static_cast<float>(hidden) + eps1);
+#pragma unroll
+        for (int c = 0; c < CHUNKS; ++c) {
+            const int i = tid + c * BLOCK;
+            if (i < groups) {
+                L oq;
+#pragma unroll
+                for (int j = 0; j < V; ++j) {
+                    float sc = to_f32(wv1[c].v[j]);
+                    if constexpr (POST_PLUS_ONE) sc += 1.f;
+                    oq.v[j] = from_f32<T>(to_f32(last[c].v[j]) * inv1 * sc);
+                }
+                reinterpret_cast<L*>(out + base)[i] = oq;
+            }
+        }
+    }
+}
+
+// The chain element by element: any T, any width up to PER_THREAD · BLOCK.
+template <class T, int BLOCK, int PER_THREAD, bool SCALE, bool POST, bool POST_PLUS_ONE>
+__global__ __launch_bounds__(BLOCK) void rmsnorm_residual_add(
+    const T* __restrict__ x, const T* __restrict__ w0, T* __restrict__ t, T* __restrict__ y,
+    const T* __restrict__ s, T* __restrict__ scaled, const T* __restrict__ w1, T* __restrict__ out,
+    int hidden, float eps0, float eps1, const u32* __restrict__ win) {
+    residual_chain<T, BLOCK, 1, PER_THREAD, SCALE, POST, POST_PLUS_ONE>(
+        x, w0, t, y, s, scaled, w1, out, hidden, eps0, eps1, win);
+}
+
+// The chain in 16-byte packs: bf16, a width that is a multiple of 8, every
+// plane 16-byte aligned.
+template <int BLOCK, int CHUNKS, bool SCALE, bool POST, bool POST_PLUS_ONE>
+__global__ __launch_bounds__(BLOCK) void rmsnorm_residual_add_vec8(
+    const bf16* __restrict__ x, const bf16* __restrict__ w0, bf16* __restrict__ t,
+    bf16* __restrict__ y, const bf16* __restrict__ s, bf16* __restrict__ scaled,
+    const bf16* __restrict__ w1, bf16* __restrict__ out, int hidden, float eps0, float eps1,
+    const u32* __restrict__ win) {
+    residual_chain<bf16, BLOCK, 8, CHUNKS, SCALE, POST, POST_PLUS_ONE>(
+        x, w0, t, y, s, scaled, w1, out, hidden, eps0, eps1, win);
+}
+
+// The candidates a residual blend may weigh, besides the prefix.
+constexpr int kBlendMax = 32;
+
+// The attention-residual blend: a row's candidates are the B closed blocks'
+// rows (stacked [B][block_rows][H]) and the prefix row. Each scores
+// <rmsnorm(v) · norm_w, proj_w>; a softmax over the B + 1 scores weighs them,
+// and out is their weighted sum. One block of 256 threads per row.
+template <class T>
+__global__ __launch_bounds__(256) void res_blend(const T* __restrict__ prefix,
+                                                 const T* __restrict__ blocks,
+                                                 const T* __restrict__ norm_w,
+                                                 const T* __restrict__ proj_w, T* __restrict__ out,
+                                                 i32 B, i32 H, i32 block_rows, float eps,
+                                                 const u32* __restrict__ win) {
+    constexpr int kWaves = 256 / kWave;
+    __shared__ float part[2][kWaves];
+    __shared__ float prob[kBlendMax + 1];
+    const Window window{win};
+    if (!window.live(blockIdx.x)) return;
+    const long long row = window.plane(blockIdx.x);
+    const long long at = row * H;
+    auto candidate = [&](int j) {
+        return j < B ? blocks + (static_cast<long long>(j) * block_rows + row) * H : prefix + at;
+    };
+    const int w = static_cast<int>(threadIdx.x) / kWave;
+
+    // A score is rsqrt(mean(v²) + eps) · Σ v · norm_w · proj_w: the sum of
+    // squares and the projection share one pass over the candidate.
+    for (int j = 0; j <= B; ++j) {
+        const T* v = candidate(j);
+        float ss = 0.f, dot = 0.f;
+        for (int h = threadIdx.x; h < H; h += 256) {
+            const float x = to_f32(v[h]);
+            ss += x * x;
+            dot += x * to_f32(norm_w[h]) * to_f32(proj_w[h]);
+        }
+        ss = wave_sum(ss);
+        dot = wave_sum(dot);
+        if (lane() == 0) {
+            part[0][w] = ss;
+            part[1][w] = dot;
+        }
+        lds_barrier();
+        if (threadIdx.x == 0) {
+            float s2 = 0.f, d = 0.f;
+            for (int i = 0; i < kWaves; ++i) {
+                s2 += part[0][i];
+                d += part[1][i];
+            }
+            prob[j] = d * rsqrtf(s2 / static_cast<float>(H) + eps);
+        }
+        lds_barrier();
+    }
+
+    if (threadIdx.x == 0) {
+        float m = prob[0];
+        for (int j = 1; j <= B; ++j) m = fmaxf(m, prob[j]);
+        float sum = 0.f;
+        for (int j = 0; j <= B; ++j) {
+            prob[j] = __expf(prob[j] - m);
+            sum += prob[j];
+        }
+        const float inv = 1.f / sum;
+        for (int j = 0; j <= B; ++j) prob[j] *= inv;
+    }
+    lds_barrier();
+
+    for (int h = threadIdx.x; h < H; h += 256) {
+        float acc = 0.f;
+        for (int j = 0; j <= B; ++j) acc += prob[j] * to_f32(candidate(j)[h]);
+        out[at + h] = from_f32<T>(acc);
+    }
 }
 
 }  // namespace pie::elemwise

@@ -37,3 +37,28 @@ __global__ void mlp_swiglu(const T* __restrict__ packed, T* __restrict__ y, i32 
 }
 
 }  // namespace pie::linear
+
+// ---------------------------------------------------------------------------
+// Per-head sigmoid gate.
+// ---------------------------------------------------------------------------
+
+namespace pie::linear {
+
+// x *= scale · sigmoid(gate[head]): one logit per `head_dim`-wide head, the
+// gate plane `heads` wide. One block per row.
+template <class T>
+__global__ void gate_sigmoid_mul_heads(T* __restrict__ x, const T* __restrict__ gate, i32 heads,
+                                       i32 head_dim, float scale, const u32* __restrict__ win) {
+    const Window window{win};
+    if (!window.live(blockIdx.x)) return;
+    const long long row = window.plane(blockIdx.x);
+    const i32 width = heads * head_dim;
+    T* xr = x + row * width;
+    const T* gr = gate + row * heads;
+    for (i32 i = threadIdx.x; i < width; i += blockDim.x) {
+        const float s = scale / (1.f + __expf(-to_f32(gr[i / head_dim])));
+        xr[i] = from_f32<T>(to_f32(xr[i]) * s);
+    }
+}
+
+}  // namespace pie::linear
