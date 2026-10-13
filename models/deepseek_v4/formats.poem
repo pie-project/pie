@@ -1,8 +1,10 @@
 # How a DeepSeek-V4 checkpoint is laid out. V4.1-Flash: its per-expert
 # release layout, or MLX's stacked one. V4-Flash, V4-Pro and the base: the
-# per-expert release layout, an artifact with an `--aux` overlay, the flash
-# mlx spelling, transformers' deepseek-v3 one, or GGUF's; the flash spellings
-# share their names, so a reading is what tells them apart.
+# per-expert release layout (its dense planes bf16, or fp8 beside `.scale`
+# e8m0 exponents; V4-Flash's draft head under `mtp.0.`), an artifact with an
+# `--aux` overlay, the flash mlx spelling, transformers' deepseek-v3 one, or
+# GGUF's; the flash spellings share their names, so a reading is what tells
+# them apart.
 
 AFFINE = [dtype.u4g64, dtype.u8g64, dtype.u4g32, dtype.u2g32, dtype.u2g64, dtype.u2g128]
 
@@ -173,60 +175,79 @@ def compressor_reads(reads, c, at):
     reads.read(c.norm, at + ".norm.weight")
 
 def release(m, reads):
-    if m.mtp != None:
-        fail("this deployment declares a draft head, which only the flash mlx reading (with an `--aux` overlay) lands")
     reads.read(m.embed, "embed.weight")
     if m.head != None:
         reads.read(m.head, "head.weight")
     reads.read(m.final_norm, "norm.weight")
     if m.hc_head != None:
-        reads.read(m.hc_head.base, "hc_head_base")
-        reads.read(m.hc_head.dynamic, "hc_head_fn")
-        reads.read(m.hc_head.scale, "hc_head_scale")
+        head_reads(reads, m.hc_head, "")
     for l, w in enumerate(m.layers):
-        n = lambda s: "layers.{}.{}".format(l, s)
-        for mix, tag in [(w.attn_mix, "attn"), (w.mlp_mix, "ffn")]:
-            reads.read(mix.scale, n("hc_{}_scale".format(tag)))
-            reads.read(mix.base, n("hc_{}_base".format(tag)))
-            if mix.dynamic != None:
-                reads.read(mix.dynamic, n("hc_{}_fn".format(tag)))
-        if w.attn_norm != None:
-            reads.read(w.attn_norm, n("attn_norm.weight"))
-        if w.mlp_norm != None:
-            reads.read(w.mlp_norm, n("ffn_norm.weight"))
-        at = w.attn
-        reads.read(at.q_down, n("attn.wq_a.weight"))
-        reads.read(at.q_norm, n("attn.q_norm.weight"))
-        reads.read(at.q_up, n("attn.wq_b.weight"))
-        reads.read(at.kv_down, n("attn.wkv.weight"))
-        reads.read(at.kv_norm, n("attn.kv_norm.weight"))
-        reads.read(at.o_down, n("attn.wo_a.weight"))
-        reads.read(at.o_up, n("attn.wo_b.weight"))
-        reads.read(at.sink, n("attn.attn_sink"))
-        if at.pool != None and at.pool.compressor != None:
-            compressor_reads(reads, at.pool.compressor, n("attn.compressor"))
-        ix = at.indexer
-        if ix != None:
-            reads.read(ix.wq_b, n("attn.indexer.wq_b.weight"))
-            reads.read(ix.weights_proj, n("attn.indexer.weights_proj.weight"))
-            if ix.compressor != None:
-                compressor_reads(reads, ix.compressor, n("attn.indexer.compressor"))
-        f = w.mlp
-        if f.kind != "moe_flash":
-            fail("the release layout holds DeepSeekMoE blocks only")
-        reads.read(f.router, n("ffn.gate.weight"))
-        if f.gate.kind == "hash":
-            reads.read(f.gate.tid2eid, n("ffn.gate.tid2eid"))
-        else:
-            reads.read(f.gate.bias, n("ffn.gate.bias"))
-        expert = lambda e, leg: n("ffn.experts.{}.{}.weight".format(e, leg))
-        if f.gate_up.fused != None:
-            fail("the release layout's routed gate and up legs are read apart")
-        read_bank(reads, f.gate_up.gate, [expert(e, "w1") for e in range(f.experts)])
-        read_bank(reads, f.gate_up.up, [expert(e, "w3") for e in range(f.experts)])
-        read_bank(reads, f.down, [expert(e, "w2") for e in range(f.experts)])
-        reads.read_concat(f.shared_gate_up, [n("ffn.shared_experts.w1.weight"), n("ffn.shared_experts.w3.weight")])
-        reads.read(f.shared_down, n("ffn.shared_experts.w2.weight"))
+        release_layer(reads, w, "layers.{}.".format(l))
+    if m.mtp != None:
+        mtp = m.mtp
+        if not has("mtp.0.e_proj.weight"):
+            fail("this deployment declares a draft head, and the checkpoint holds no `mtp.0.`")
+        reads.read(mtp.enorm, "mtp.0.enorm.weight")
+        reads.read(mtp.hnorm, "mtp.0.hnorm.weight")
+        reads.read(mtp.e_proj, "mtp.0.e_proj.weight")
+        # one projection the hyper-connection streams share, read once a stream
+        reads.read_expr(mtp.h_proj, concat(0, [src("mtp.0.h_proj.weight")] * m.hyper.streams))
+        release_layer(reads, mtp.block, "mtp.0.")
+        head_reads(reads, mtp.hc_head, "mtp.0.")
+        reads.read(mtp.norm, "mtp.0.norm.weight")
+
+def head_reads(reads, h, at):
+    reads.read(h.base, at + "hc_head_base")
+    reads.read(h.dynamic, at + "hc_head_fn")
+    reads.read(h.scale, at + "hc_head_scale")
+
+def release_layer(reads, w, at):
+    """One block under `at` (`layers.N.`, or the draft head's `mtp.0.`): dense
+    planes at whatever the file stores (bf16, or fp8 beside `.scale` e8m0
+    exponents), the routed legs one plane per expert."""
+    n = lambda s: at + s
+    for mix, tag in [(w.attn_mix, "attn"), (w.mlp_mix, "ffn")]:
+        reads.read(mix.scale, n("hc_{}_scale".format(tag)))
+        reads.read(mix.base, n("hc_{}_base".format(tag)))
+        if mix.dynamic != None:
+            reads.read(mix.dynamic, n("hc_{}_fn".format(tag)))
+    if w.attn_norm != None:
+        reads.read(w.attn_norm, n("attn_norm.weight"))
+    if w.mlp_norm != None:
+        reads.read(w.mlp_norm, n("ffn_norm.weight"))
+    a = w.attn
+    reads.read(a.q_down, n("attn.wq_a.weight"))
+    reads.read(a.q_norm, n("attn.q_norm.weight"))
+    reads.read(a.q_up, n("attn.wq_b.weight"))
+    reads.read(a.kv_down, n("attn.wkv.weight"))
+    reads.read(a.kv_norm, n("attn.kv_norm.weight"))
+    reads.read(a.o_down, n("attn.wo_a.weight"))
+    reads.read(a.o_up, n("attn.wo_b.weight"))
+    reads.read(a.sink, n("attn.attn_sink"))
+    if a.pool != None and a.pool.compressor != None:
+        compressor_reads(reads, a.pool.compressor, n("attn.compressor"))
+    ix = a.indexer
+    if ix != None:
+        reads.read(ix.wq_b, n("attn.indexer.wq_b.weight"))
+        reads.read(ix.weights_proj, n("attn.indexer.weights_proj.weight"))
+        if ix.compressor != None:
+            compressor_reads(reads, ix.compressor, n("attn.indexer.compressor"))
+    f = w.mlp
+    if f.kind != "moe_flash":
+        fail("the release layout holds DeepSeekMoE blocks only")
+    reads.read(f.router, n("ffn.gate.weight"))
+    if f.gate.kind == "hash":
+        reads.read(f.gate.tid2eid, n("ffn.gate.tid2eid"))
+    else:
+        reads.read(f.gate.bias, n("ffn.gate.bias"))
+    expert = lambda e, leg: n("ffn.experts.{}.{}.weight".format(e, leg))
+    if f.gate_up.fused != None:
+        fail("the release layout's routed gate and up legs are read apart")
+    read_bank(reads, f.gate_up.gate, [expert(e, "w1") for e in range(f.experts)])
+    read_bank(reads, f.gate_up.up, [expert(e, "w3") for e in range(f.experts)])
+    read_bank(reads, f.down, [expert(e, "w2") for e in range(f.experts)])
+    reads.read_concat(f.shared_gate_up, [n("ffn.shared_experts.w1.weight"), n("ffn.shared_experts.w3.weight")])
+    reads.read(f.shared_down, n("ffn.shared_experts.w2.weight"))
 
 # ---------------------------------------------------------------------------
 # V4.1-Flash.

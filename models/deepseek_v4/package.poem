@@ -25,6 +25,8 @@ DEPLOYMENTS = [
     deployment("dsv41-flash", weights = U4, kv = BF),
     deployment("dsv41-flash", weights = [BF, FP4], kv = BF),
     deployment("dsv41-flash-mini", weights = [BF, FP4], kv = BF),
+    deployment("dsv4-flash", weights = [BF, FP4], kv = BF, drafter = "mtp"),
+    deployment("dsv4-flash", weights = [BF, FP4], kv = BF),
     deployment("dsv4-flash", weights = [U4, U2, FP4], kv = BF, drafter = "mtp"),
     deployment("dsv4-flash-mini", weights = [U4, U2, FP4], kv = BF, drafter = "mtp"),
     deployment("dsv4-flash", weights = [U4, U2], kv = BF),

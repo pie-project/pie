@@ -1,6 +1,10 @@
-"""DeepSeek-V4 reference logits for a release-layout snapshot (V4-Pro's
-`mini-l5-e16`), from `transformers`' own `deepseek_v4`, so a pie reading of the
-same snapshot can be read against it.
+"""DeepSeek-V4 reference logits for a release-layout snapshot (V4-Pro's or
+V4-Flash's `mini-l5-e16`), from `transformers`' own `deepseek_v4`, so a pie
+reading of the same snapshot can be read against it. Activations stay bf16 (or
+f32): the release's FP8 activation quantization (`act_quant` before every fp8
+or fp4 GEMM, and the KV and indexer quant-dequant) is not applied, so this is
+the reference for the deployments that serve dequantized weights at bf16
+activations.
 
     python3 scripts/dsv4_release_parity_ref.py <snapshot-dir> OUT [--steps 16] [--probes probes.json]
         [--dtype float32]
@@ -19,8 +23,9 @@ against these.
 
 `transformers` reads bf16 planes, and the release stores its routed experts
 as MXFP4 codes (two e2m1 nibbles a byte, the low one first) beside `.scale`
-e8m0 exponents, one a 32-wide block. Each is written out to bf16, which holds
-every such value exactly, into `OUT/.bf16-view`, the configuration's
+e8m0 exponents, one a 32-wide block, and V4-Flash's release its dense planes as
+fp8 beside `.scale` e8m0 exponents, one a 128-square block. Each is written out
+to bf16, which holds every such value exactly, into `OUT/.bf16-view`, the configuration's
 `quantization_config` and `expert_dtype` taken off. The reference runs in
 float32 by default: its hyper-connection streams are f32 and its bf16 arm
 hands them to bf16 projections unconverted.
@@ -53,6 +58,16 @@ def read_out(codes, scale):
     values = values * torch.pow(2.0, scale.view(torch.uint8).float() - 127.0).unsqueeze(-1)
     return values.reshape(codes.shape[0], -1).to(torch.bfloat16)
 
+def read_out_fp8(codes, scale):
+    """An fp8 plane under its `.scale` e8m0 exponents, one a square block
+    (128 wide in V4): each code times two to its block's exponent, which
+    bf16 holds exactly."""
+    rows, cols = codes.shape
+    group = max(-(-rows // scale.shape[0]), -(-cols // scale.shape[1]))
+    factors = torch.pow(2.0, scale.view(torch.uint8).float() - 127.0)
+    factors = factors.repeat_interleave(group, 0)[:rows].repeat_interleave(group, 1)[:, :cols]
+    return (codes.float() * factors).to(torch.bfloat16)
+
 def bf16_view(snapshot, view):
     if os.path.exists(os.path.join(view, "model.safetensors")):
         return
@@ -68,11 +83,13 @@ def bf16_view(snapshot, view):
 
     state = {}
     for name in index:
-        if ".experts." in name and name.endswith(".scale"):
+        if name.endswith(".scale") and name[: -len(".scale")] + ".weight" in index:
             continue
         t = get(name)
         if ".experts." in name and t.dtype in (torch.int8, torch.uint8):
             t = read_out(t, get(name[: -len(".weight")] + ".scale"))
+        elif t.dtype == torch.float8_e4m3fn:
+            t = read_out_fp8(t, get(name[: -len(".weight")] + ".scale"))
         state[name] = t.contiguous()
     save_file(state, os.path.join(view, "model.safetensors"), metadata={"format": "pt"})
     config = json.load(open(os.path.join(snapshot, "config.json")))
