@@ -264,15 +264,17 @@ pub unsafe fn matmul(
 }
 
 /// Every algorithm the heuristic offers for `s` (up to `count`), each timed
-/// over `reps` launches on `stream`: (index, mean µs, workspace bytes).
+/// over `reps` launches on `stream`: (index, mean µs, workspace bytes). The
+/// launches cycle through the copies in `w`, so copies past the last-level
+/// cache time a cold weight, as a decode step streams it.
 ///
 /// # Safety
-/// As [`matmul`]; the stream must not be capturing.
+/// As [`matmul`], for every copy in `w`; the stream must not be capturing.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn survey(
     s: Shape,
     x: u64,
-    w: u64,
+    w: &[u64],
     y: u64,
     workspace: u64,
     stream: Stream,
@@ -282,6 +284,9 @@ pub unsafe fn survey(
     let Ok(lt) = sys::hipblaslt() else {
         return Ok(Vec::new());
     };
+    if w.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut handle: Lt = core::ptr::null_mut();
     // SAFETY: writes the handle.
     answered("hipblasLtCreate", unsafe {
@@ -328,7 +333,7 @@ pub unsafe fn survey(
         if algo.state != sys::LT_SUCCESS {
             continue;
         }
-        let launch = || unsafe {
+        let launch = |w: u64| unsafe {
             (lt.hipblasLtMatmul)(
                 handle,
                 plan.desc,
@@ -348,7 +353,7 @@ pub unsafe fn survey(
                 stream,
             )
         };
-        if launch() != sys::LT_SUCCESS {
+        if w.iter().any(|&w| launch(w) != sys::LT_SUCCESS) {
             continue;
         }
         let mut ms = f32::NAN;
@@ -359,8 +364,8 @@ pub unsafe fn survey(
             super::rt::hipEventCreate(&raw mut start);
             super::rt::hipEventCreate(&raw mut stop);
             super::rt::hipEventRecord(start, stream.cast());
-            for _ in 0..reps {
-                launch();
+            for r in 0..reps as usize {
+                launch(w[r % w.len()]);
             }
             super::rt::hipEventRecord(stop, stream.cast());
             super::rt::hipEventSynchronize(stop);
