@@ -251,6 +251,9 @@ pub struct Toggles {
 
     pub chunk_floor_128: bool,
 
+    /// The fewest keys a split decode chunk carries; 0 takes 256.
+    pub chunk_floor_tokens: u32,
+
     pub prefill_ctas_per_sm: u32,
 
     pub static_max_requests: u32,
@@ -263,6 +266,7 @@ impl Toggles {
             force_split_small: tuning.decode_split_small,
             window_split: tuning.decode_split_window,
             chunk_floor_128: tuning.decode_chunk_floor_128,
+            chunk_floor_tokens: tuning.decode_chunk_floor_tokens,
             prefill_ctas_per_sm: tuning.prefill_ctas_per_sm,
             static_max_requests: tuning.decode_static_max_requests,
         }
@@ -356,6 +360,7 @@ pub fn plan_decode(
             head_dim: shape.head_dim,
             enable_cuda_graph,
             chunk_floor_128: toggles.chunk_floor_128,
+            chunk_floor_tokens: toggles.chunk_floor_tokens,
         };
         sched_decode::plan(
             OP,

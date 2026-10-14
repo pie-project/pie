@@ -199,8 +199,18 @@ fn linear_skinny_epilogues() {
     use kernels_rocm::linear::skinny::{self, Epilogue};
     let Some(gpu) = Gpu::open() else { return };
     let ctx = gpu.ctx();
-    let (n, k) = (1000u32, 1024u32);
-    for m in [1u32, 3, 8] {
+    // The diagonal kernel's shapes, then banks of at least 8192 rows (whole
+    // products on the matrix core): a K split across wavefronts with the
+    // activation read from L2, and one staged in LDS.
+    for (n, k, m) in [
+        (1000u32, 1024u32, 1u32),
+        (1000, 1024, 3),
+        (1000, 1024, 8),
+        (4200, 12800, 3),
+        (4200, 12800, 8),
+        (8200, 2048, 4),
+        (8200, 2048, 7),
+    ] {
         let x = bf16s(m * k, 5, 1.0);
         let w = bf16s(2 * n * k, 6, 0.08);
         let at = gpu.tensor(&x, m, k, Dtype::Bf16);
@@ -213,7 +223,16 @@ fn linear_skinny_epilogues() {
             round_bf16(v as f32)
         };
         for epilogue in [Epilogue::Geglu, Epilogue::Softcap(2.0), Epilogue::Store] {
-            assert!(skinny::covers(m as i32, n as i32, k as i32, epilogue, 64));
+            // The wide bank's GLU halves would double its reference cost.
+            if n == 8200 && epilogue == Epilogue::Geglu {
+                continue;
+            }
+            // Past two rows a long K over a short bank is left unfused.
+            let reread = m > 2 && m * k * 2 > 64 << 10 && n < 8192 && epilogue != Epilogue::Geglu;
+            assert_eq!(skinny::covers(m as i32, n as i32, k as i32, epilogue, 64), !reread);
+            if reread {
+                continue;
+            }
             let y = gpu.zeros(m, n, Dtype::Bf16);
             skinny::skinny_bf16(
                 &ctx, wt.ptr, at.ptr, y.ptr, m as i32, n as i32, k as i32, epilogue,
@@ -230,7 +249,7 @@ fn linear_skinny_epilogues() {
                 })
                 .collect();
             close_bf16(
-                &format!("skinny {epilogue:?} m={m}"),
+                &format!("skinny {epilogue:?} m={m} n={n} k={k}"),
                 &gpu.read(&y),
                 &want,
                 2.0,

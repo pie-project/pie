@@ -40,6 +40,13 @@ fn linear_matmul() {
         (4, 1024, 2048),
         (8, 6144, 1024),
         (8, 1024, 3584),
+        // The skinny kernels' few rows past four (whole products on the
+        // matrix core), a ragged N, and an activation past LDS (read from L2).
+        (3, 1000, 2048),
+        (5, 1030, 1024),
+        (6, 4100, 5376),
+        (2, 520, 17408),
+        (8, 1024, 21504),
         (37, 1000, 1024),
         (64, 1024, 2048),
         // The decode batch's kernel: unsplit, split K, past 128 rows (the
@@ -105,6 +112,11 @@ fn the_fused_swiglu_is_the_matmul_then_the_swiglu() {
         (4, 3584, 1024),
         (3, 1000, 2048),
         (8, 512, 1024),
+        // Banks of at least 8192 rows (whole products) and
+        // a K past LDS.
+        (3, 4200, 2048),
+        (4, 4600, 5120),
+        (2, 300, 17408),
     ] {
         let a: Vec<f32> = values((m * k) as usize, 11, 1.0)
             .into_iter()

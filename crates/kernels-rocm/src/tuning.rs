@@ -36,6 +36,12 @@ pub struct DecodeSplitWindow;
 #[decision(id = "kernel.sdpa.decode.chunk_floor_128", flag, default = false, tune = search)]
 pub struct DecodeChunkFloor128;
 
+/// The fewest keys a split decode chunk carries (the flag above lowers it
+/// to 128 at most).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.chunk_floor_tokens", constant(range(16..=4096)), default = 64, tune = search)]
+pub struct DecodeChunkFloorTokens(pub u32);
+
 /// How a bf16 GEMV (one activation row) is laid out: `wide` (an 8-warp
 /// split-K block up to `kernel.gemv.splitk_max_n` columns, 4 rows x 4 warps
 /// past it), or `narrow` (4 warps x 2 for both), which Blackwell prefers.
@@ -117,6 +123,25 @@ pub struct GemmHeuristics(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.gemm.skinny_rows", constant(range(0..=64)), default = 64, tune = search)]
 pub struct GemmSkinnyRows(pub u32);
+
+/// The fewest activation rows the skinny projection runs on whole products
+/// (four rows an MFMA) rather than the diagonal kernel; past 8 never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.skinny_quad_from", constant(range(1..=9)), default = 3, tune = search)]
+pub struct GemmSkinnyQuadFrom(pub u32);
+
+/// The most rows a dense bf16 projection gives the skinny kernels whatever
+/// its weight; past it hipBLASLt or the batch engine take it (a small
+/// weight stays skinny to eight rows).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.skinny_dense_rows", constant(range(0..=8)), default = 4, tune = search)]
+pub struct GemmSkinnyDenseRows(pub u32);
+
+/// Past the skinny rows (up to eight), a bank this wide (output columns)
+/// takes the batch engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.skinny_batch_min_n", constant(range(0..=4_194_304)), default = 65536, tune = search)]
+pub struct GemmSkinnyBatchMinN(pub u32);
 
 /// Routes an expert must average before bf16/f16 routed matmuls group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -207,6 +232,7 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeSplitSmall>()
         .add::<DecodeSplitWindow>()
         .add::<DecodeChunkFloor128>()
+        .add::<DecodeChunkFloorTokens>()
         .add::<GemvBf16>()
         .add::<GemvSplitkMaxN>()
         .add::<MlaPath>()
@@ -220,6 +246,9 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmWorkspaceMb>()
         .add::<GemmHeuristics>()
         .add::<GemmSkinnyRows>()
+        .add::<GemmSkinnyQuadFrom>()
+        .add::<GemmSkinnyDenseRows>()
+        .add::<GemmSkinnyBatchMinN>()
         .add::<MoeGroupAt>()
         .add::<MoeMxfp4GroupedReuse>()
         .add::<MoeAffineGrouped>()
@@ -245,6 +274,7 @@ pub struct Tuning {
     pub decode_split_small: bool,
     pub decode_split_window: bool,
     pub decode_chunk_floor_128: bool,
+    pub decode_chunk_floor_tokens: u32,
     /// `kernel.gemv.bf16 = narrow`.
     pub gemv_narrow: bool,
     pub gemv_splitk_max_n: u32,
@@ -260,6 +290,9 @@ pub struct Tuning {
     pub gemm_workspace_mb: u32,
     pub gemm_heuristics: u32,
     pub gemm_skinny_rows: u32,
+    pub gemm_skinny_quad_from: u32,
+    pub gemm_skinny_dense_rows: u32,
+    pub gemm_skinny_batch_min_n: u32,
     pub moe_group_at: u32,
     pub mxfp4_grouped_reuse: u32,
     pub affine_grouped: bool,
@@ -285,6 +318,7 @@ impl Tuning {
         decode_split_small: false,
         decode_split_window: false,
         decode_chunk_floor_128: false,
+        decode_chunk_floor_tokens: 64,
         gemv_narrow: false,
         gemv_splitk_max_n: 4096,
         mla_naive: false,
@@ -298,6 +332,9 @@ impl Tuning {
         gemm_workspace_mb: 8,
         gemm_heuristics: 8,
         gemm_skinny_rows: 64,
+        gemm_skinny_quad_from: 3,
+        gemm_skinny_dense_rows: 4,
+        gemm_skinny_batch_min_n: 65536,
         moe_group_at: 4,
         mxfp4_grouped_reuse: 2,
         affine_grouped: true,
@@ -323,6 +360,7 @@ impl Tuning {
             decode_split_small: profile.on::<DecodeSplitSmall>(&Anywhere),
             decode_split_window: profile.on::<DecodeSplitWindow>(&Anywhere),
             decode_chunk_floor_128: profile.on::<DecodeChunkFloor128>(&Anywhere),
+            decode_chunk_floor_tokens: profile.get::<DecodeChunkFloorTokens>().0,
             gemv_narrow: *profile.get::<GemvBf16>() == GemvBf16::Narrow,
             gemv_splitk_max_n: profile.get::<GemvSplitkMaxN>().0,
             mla_naive: *profile.get::<MlaPath>() == MlaPath::Naive,
@@ -336,6 +374,9 @@ impl Tuning {
             gemm_workspace_mb: profile.get::<GemmWorkspaceMb>().0,
             gemm_heuristics: profile.get::<GemmHeuristics>().0,
             gemm_skinny_rows: profile.get::<GemmSkinnyRows>().0,
+            gemm_skinny_quad_from: profile.get::<GemmSkinnyQuadFrom>().0,
+            gemm_skinny_dense_rows: profile.get::<GemmSkinnyDenseRows>().0,
+            gemm_skinny_batch_min_n: profile.get::<GemmSkinnyBatchMinN>().0,
             moe_group_at: profile.get::<MoeGroupAt>().0,
             mxfp4_grouped_reuse: profile.get::<MoeMxfp4GroupedReuse>().0,
             affine_grouped: profile.on::<MoeAffineGrouped>(&Anywhere),

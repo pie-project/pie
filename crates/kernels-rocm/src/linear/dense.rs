@@ -14,11 +14,51 @@ use super::dense_batch::dense_batch_bf16;
 use super::gemv::{gemv_bf16, skinny_bf16, skinny_swiglu_bf16};
 use super::mgemm::mgemm_bf16;
 
-/// Up to four rows the skinny kernel streams the weight faster than
-/// hipBLASLt tiles it; up to eight it still does for a small weight.
-const SKINNY_ALWAYS: i32 = 4;
+/// Up to eight rows the skinny kernels always take a small weight.
 const SKINNY_SMALL: i32 = 8;
 const SKINNY_SMALL_WEIGHT: i64 = 1 << 21;
+/// The LDS the skinny kernels stage their activation rows in, and the
+/// fewest bank rows their whole-product kernel takes (`linear/gemv.rs`).
+const SKINNY_LDS: i64 = 64 << 10;
+const SKINNY_QUAD_ROWS: i32 = super::gemv::QUAD_MIN_ROWS as i32;
+
+/// Who takes `m` rows over a bank of `rows` weight rows (`2n` for a packed
+/// `[gate | up]` bank): the plain projection and its fused GLU ask the same,
+/// so the two land the same bits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// The skinny kernels (`linear/gemv.hip`).
+    Skinny,
+    /// The decode-batch engine (`kernel.dense.batch_*`, or up to eight rows
+    /// over a bank at least `kernel.gemm.skinny_batch_min_n` wide).
+    Batch,
+    /// What follows: the gemv, hipBLASLt, rocBLAS.
+    Other,
+}
+
+fn route(ctx: &Ctx, m: i32, rows: i32, k: i32) -> Route {
+    let t = ctx.tuning();
+    if m <= SKINNY_SMALL && i64::from(rows) * i64::from(k) <= SKINNY_SMALL_WEIGHT {
+        return Route::Skinny;
+    }
+    // Past two rows an activation beyond LDS (a long K) costs the diagonal
+    // kernel its L2 rereads, where hipBLASLt still tiles a short bank faster;
+    // a bank of the whole-product kernel's width keeps it.
+    let reread = m > 2 && 2 * i64::from(m) * i64::from(k) > SKINNY_LDS && rows < SKINNY_QUAD_ROWS;
+    if m <= t.gemm_skinny_dense_rows as i32 && !reread {
+        return Route::Skinny;
+    }
+    // Past the skinny rows an lm_head-wide bank streams best on the batch
+    // engine (~7% past hipBLASLt's tiles at eight rows); others take
+    // hipBLASLt unless the batch window holds them.
+    if batch_on(ctx, m, rows, k)
+        || (m <= SKINNY_SMALL && rows.unsigned_abs() >= t.gemm_skinny_batch_min_n)
+    {
+        Route::Batch
+    } else {
+        Route::Other
+    }
+}
 
 /// Returns whether the bias was folded into the store (only the gemv folds
 /// one); `false` leaves the bias for the caller to add.
@@ -36,15 +76,14 @@ pub(crate) fn act_x_wt(
     if m <= 0 || n <= 0 || k <= 0 {
         return Ok(false);
     }
-    let skinny = m <= SKINNY_ALWAYS
-        || (m <= SKINNY_SMALL && i64::from(n) * i64::from(k) <= SKINNY_SMALL_WEIGHT);
-    if bias == 0 && skinny && skinny_bf16(ctx, w, act, y, m, n, k).is_ok() {
+    let way = route(ctx, m, n, k);
+    if bias == 0 && way == Route::Skinny && skinny_bf16(ctx, w, act, y, m, n, k).is_ok() {
         return Ok(false);
     }
     if m == 1 && gemv_bf16(ctx, w, act, bias, y, n, k).is_ok() {
         return Ok(bias != 0);
     }
-    if bias == 0 && batch_on(ctx, m, n, k) && dense_batch_bf16(ctx, w, act, y, m, n, k, false)? {
+    if bias == 0 && way == Route::Batch && dense_batch_bf16(ctx, w, act, y, m, n, k, false)? {
         return Ok(false);
     }
     if bias == 0 && mgemm_on() && mgemm_bf16(ctx, w, act, y, m, n, k, false)? {
@@ -109,14 +148,11 @@ pub(crate) fn act_x_wt_swiglu(
     if m <= 0 || intermediate <= 0 || k <= 0 {
         return Ok(false);
     }
-    let skinny = m <= SKINNY_ALWAYS
-        || (m <= SKINNY_SMALL && 2 * i64::from(intermediate) * i64::from(k) <= SKINNY_SMALL_WEIGHT);
-    if skinny && skinny_swiglu_bf16(ctx, gate_up, act, h, m, intermediate, k).is_ok() {
+    let way = route(ctx, m, 2 * intermediate, k);
+    if way == Route::Skinny && skinny_swiglu_bf16(ctx, gate_up, act, h, m, intermediate, k).is_ok() {
         return Ok(true);
     }
-    if batch_on(ctx, m, 2 * intermediate, k)
-        && dense_batch_bf16(ctx, gate_up, act, h, m, intermediate, k, true)?
-    {
+    if way == Route::Batch && dense_batch_bf16(ctx, gate_up, act, h, m, intermediate, k, true)? {
         return Ok(true);
     }
     Ok(mgemm_on() && mgemm_bf16(ctx, gate_up, act, h, m, intermediate, k, true)?)

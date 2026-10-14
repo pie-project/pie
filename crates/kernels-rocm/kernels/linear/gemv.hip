@@ -119,7 +119,7 @@ constexpr int kSkinnySwiglu = 1;
 constexpr int kSkinnyGeglu = 2;
 constexpr int kSkinnySoftcap = 3;
 
-template <int ROWS, int YT, int UNRL, int EPI = kSkinnyStore>
+template <int ROWS, int YT, int UNRL, int EPI = kSkinnyStore, bool ACT_G = false>
 __global__ __launch_bounds__(1024) void skinny_bf16(const bf16* __restrict__ weight, const bf16* __restrict__ act,
                                                     bf16* __restrict__ out, int N, int K, int waves, float cap) {
     constexpr bool SWIGLU = EPI == kSkinnySwiglu || EPI == kSkinnyGeglu;  // two weight rows a column
@@ -127,9 +127,11 @@ __global__ __launch_bounds__(1024) void skinny_bf16(const bf16* __restrict__ wei
     extern __shared__ b128 act_s[];
     const int wave = threadIdx.y, l = lane();
     const int packs = K / 8;
-    for (int i = wave * kWave + l; i < ROWS * packs; i += blockDim.y * kWave)
-        act_s[i] = reinterpret_cast<const b128*>(act)[i];
-    __syncthreads();
+    const b128* act_g = reinterpret_cast<const b128*>(act);
+    if constexpr (!ACT_G) {
+        for (int i = wave * kWave + l; i < ROWS * packs; i += blockDim.y * kWave) act_s[i] = act_g[i];
+        __syncthreads();
+    }
     if (wave >= waves) return;
     constexpr int STEP = kWave * UNRL;  // packs a wavefront walks a round
     for (int n0 = (blockIdx.x * waves + wave) * YT; n0 < N; n0 += gridDim.x * waves * YT) {
@@ -157,7 +159,15 @@ __global__ __launch_bounds__(1024) void skinny_bf16(const bf16* __restrict__ wei
             for (int u = 0; u < UNRL; ++u) {
                 const int p = p0 + u * kWave + l;
 #pragma unroll
-                for (int r = 0; r < ROWS; ++r) xv[r][u] = p < packs ? act_s[r * packs + p] : b128{};
+                for (int r = 0; r < ROWS; ++r) {
+                    if constexpr (ACT_G) {
+                        // The activation stays in L2: an unguarded load (clamped), zeroed past K.
+                        const b128 x = act_g[r * packs + min(p, packs - 1)];
+                        xv[r][u] = p < packs ? x : b128{};
+                    } else {
+                        xv[r][u] = p < packs ? act_s[r * packs + p] : b128{};
+                    }
+                }
             }
 #pragma unroll
             for (int u = 0; u < UNRL; ++u)
@@ -189,6 +199,181 @@ __global__ __launch_bounds__(1024) void skinny_bf16(const bf16* __restrict__ wei
                 }
                 if (l == kWave - 1 && n0 + y < N) out[static_cast<long long>(r) * N + n0 + y] = from_f32<bf16>(v);
             }
+    }
+}
+
+// ------------------------------------------------------------ skinny4 --
+
+// The skinny projection with the matrix core doing whole products: in each
+// 4 x 4 x 4 block (lanes 4b..4b+3) lane i holds activation row i as A's row
+// and weight row n0 + i as B's column at the block's own 8-element chunk,
+// so D[r][j] sums act[r] · w[n0 + j] over that chunk, and the 16 blocks walk
+// 16 consecutive chunks (four rows x 256 B a wavefront read). Up to four
+// activation rows an MFMA (eight take two), against the diagonal kernel's
+// one: the few-rows decode stays bound by the weight stream.
+//
+// A tile is G groups of four rows (twice that for a packed [gate | up]
+// bank); KS wavefronts split its K, each keeping UNRL chunks of every row in
+// flight, and the block's `waves` wavefronts take waves / KS tiles a round.
+// A wavefront sums its 16 blocks' cells by lane butterflies; the KS slices
+// meet in LDS, summed in slice order. The activation sits in LDS (each row
+// padded a chunk, so the four rows of a block hit distinct banks), or in L2
+// when it does not fit (ACT_G). The block is exactly `waves` wavefronts.
+template <int ROWS, int G, int UNRL, int EPI = kSkinnyStore, bool ACT_G = false, int KS = 1>
+__global__ __launch_bounds__(1024) void skinny4_bf16(const bf16* __restrict__ weight, const bf16* __restrict__ act,
+                                                     bf16* __restrict__ out, int N, int K, int waves, float cap) {
+    constexpr bool SWIGLU = EPI == kSkinnySwiglu || EPI == kSkinnyGeglu;
+    constexpr int WG = SWIGLU ? 2 * G : G;  // four-row weight groups a wavefront streams
+    constexpr int RB = (ROWS + 3) / 4;      // four-row activation blocks
+    constexpr int CELLS = RB * WG * 4;      // a lane's sums
+    extern __shared__ b128 act_s[];
+    const int wave = threadIdx.y, l = lane();
+    const int blk = l >> 2, i = l & 3;
+    const int packs = K / 8;
+    const int stride = packs + 1;  // LDS row stride in packs
+    const b128* act_g = reinterpret_cast<const b128*>(act);
+    if constexpr (!ACT_G) {
+        for (int e = wave * kWave + l; e < ROWS * packs; e += blockDim.y * kWave) {
+            const int r = e / packs;
+            act_s[r * stride + (e - r * packs)] = act_g[e];
+        }
+        __syncthreads();
+    }
+    // The slices' sums, past the staged activation.
+    float* red = reinterpret_cast<float*>(act_s + (ACT_G ? 0 : ROWS * stride));
+    // This lane's activation row in each block, clamped (rows past ROWS are zeroed).
+    int arow[RB];
+#pragma unroll
+    for (int rb = 0; rb < RB; ++rb) arow[rb] = min(4 * rb + i, ROWS - 1);
+    const int ks = KS == 1 ? 0 : wave % KS;
+    const int tpb = waves / KS;  // tiles a block a round
+    const int tw = wave / KS;
+    // This slice's chunks: whole rounds of 16, the last slice short.
+    const int per = ((packs + KS - 1) / KS + 15) / 16 * 16;
+    const int cb = ks * per, ce = min(cb + per, packs);
+    constexpr int STEP = 16 * UNRL;  // chunks a row walks a round
+    constexpr int TROWS = 4 * G;
+    // Tiles deal round the blocks first (a short bank still spreads over
+    // every CU), then round each block's tile slots.
+    const int tiles = (N + TROWS - 1) / TROWS;
+    for (int t0 = 0; t0 < tiles; t0 += gridDim.x * tpb) {
+        const int n0 = (t0 + tw * gridDim.x + blockIdx.x) * TROWS;
+        const bool valid = n0 < N;
+        skinny_cd acc[RB][WG];
+#pragma unroll
+        for (int rb = 0; rb < RB; ++rb)
+#pragma unroll
+            for (int g = 0; g < WG; ++g) acc[rb][g] = skinny_cd{0.f, 0.f, 0.f, 0.f};
+        if (valid) {
+            const skinny_v4* wr[WG];
+#pragma unroll
+            for (int g = 0; g < WG; ++g) {
+                const int row = min(n0 + 4 * (g % G) + i, N - 1) + (g >= G ? N : 0);
+                wr[g] = reinterpret_cast<const skinny_v4*>(weight + static_cast<long long>(row) * K);
+            }
+            for (int c0 = cb; c0 < ce; c0 += STEP) {
+                skinny_v4 wv[WG][UNRL];
+                b128 xv[RB][UNRL];
+#pragma unroll
+                for (int u = 0; u < UNRL; ++u) {
+                    const int c = min(c0 + u * 16 + blk, ce - 1);
+#pragma unroll
+                    for (int g = 0; g < WG; ++g) wv[g][u] = __builtin_nontemporal_load(wr[g] + c);
+                }
+#pragma unroll
+                for (int u = 0; u < UNRL; ++u) {
+                    const int c = c0 + u * 16 + blk;
+                    const int cc = min(c, ce - 1);
+#pragma unroll
+                    for (int rb = 0; rb < RB; ++rb) {
+                        b128 x;
+                        if constexpr (ACT_G) {
+                            x = act_g[arow[rb] * packs + cc];
+                        } else {
+                            x = act_s[arow[rb] * stride + cc];
+                        }
+                        const bool live = c < ce && 4 * rb + i < ROWS;
+                        xv[rb][u] = live ? x : b128{};
+                    }
+                }
+#pragma unroll
+                for (int u = 0; u < UNRL; ++u)
+#pragma unroll
+                    for (int rb = 0; rb < RB; ++rb)
+#pragma unroll
+                        for (int g = 0; g < WG; ++g) {
+                            const skinny_ab* x4 = reinterpret_cast<const skinny_ab*>(&xv[rb][u]);
+                            const skinny_ab* w4 = reinterpret_cast<const skinny_ab*>(&wv[g][u]);
+                            acc[rb][g] = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(x4[0], w4[0], acc[rb][g], 0, 0, 0);
+                            acc[rb][g] = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(x4[1], w4[1], acc[rb][g], 0, 0, 0);
+                        }
+            }
+            // Sum the 16 blocks: lanes j, j + 4, ..., j + 60 hold column j's cells.
+#pragma unroll
+            for (int rb = 0; rb < RB; ++rb)
+#pragma unroll
+                for (int g = 0; g < WG; ++g)
+#pragma unroll
+                    for (int r = 0; r < 4; ++r) {
+                        float v = acc[rb][g][r];
+                        v += __shfl_xor(v, 4, kWave);
+                        v += __shfl_xor(v, 8, kWave);
+                        v += __shfl_xor(v, 16, kWave);
+                        v += __shfl_xor(v, 32, kWave);
+                        acc[rb][g][r] = v;
+                    }
+        }
+        if constexpr (KS > 1) {
+            if (valid && blk == 0) {
+#pragma unroll
+                for (int rb = 0; rb < RB; ++rb)
+#pragma unroll
+                    for (int g = 0; g < WG; ++g)
+#pragma unroll
+                        for (int r = 0; r < 4; ++r) red[(wave * CELLS + (rb * WG + g) * 4 + r) * 4 + i] = acc[rb][g][r];
+            }
+            __syncthreads();
+            if (valid && ks == 0 && blk == 0) {
+#pragma unroll
+                for (int rb = 0; rb < RB; ++rb)
+#pragma unroll
+                    for (int g = 0; g < WG; ++g)
+#pragma unroll
+                        for (int r = 0; r < 4; ++r) {
+                            float v = 0.f;
+#pragma unroll
+                            for (int s2 = 0; s2 < KS; ++s2) v += red[((wave + s2) * CELLS + (rb * WG + g) * 4 + r) * 4 + i];
+                            acc[rb][g][r] = v;
+                        }
+            }
+            __syncthreads();
+        }
+        if (valid && ks == 0 && blk == 0) {
+#pragma unroll
+            for (int g = 0; g < G; ++g) {
+                const int n = n0 + 4 * g + i;
+#pragma unroll
+                for (int rb = 0; rb < RB; ++rb)
+#pragma unroll
+                    for (int r = 0; r < 4; ++r) {
+                        const int row = 4 * rb + r;
+                        if (row >= ROWS) continue;
+                        float v = acc[rb][g][r];
+                        if constexpr (SWIGLU) {
+                            const float gt = to_f32(from_f32<bf16>(v));
+                            const float up = to_f32(from_f32<bf16>(acc[rb][G + g][r]));
+                            if constexpr (EPI == kSkinnyGeglu) {
+                                v = 0.5f * gt * (1.f + tanhf(0.7978845608028654f * (gt + 0.044715f * gt * gt * gt))) * up;
+                            } else {
+                                v = gt / (1.f + __expf(-gt)) * up;
+                            }
+                        } else if constexpr (EPI == kSkinnySoftcap) {
+                            v = cap * tanhf(to_f32(from_f32<bf16>(v)) * (1.f / cap));
+                        }
+                        if (n < N) out[static_cast<long long>(row) * N + n] = from_f32<bf16>(v);
+                    }
+            }
+        }
     }
 }
 

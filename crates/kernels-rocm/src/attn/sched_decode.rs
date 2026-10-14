@@ -15,6 +15,8 @@ pub struct Request<'a> {
     pub head_dim: u32,
     pub enable_cuda_graph: bool,
     pub chunk_floor_128: bool,
+    /// The fewest keys a split chunk carries; 0 takes `CHUNK_FLOOR_TOKENS`.
+    pub chunk_floor_tokens: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,10 +62,14 @@ pub fn estimate(
     // The matrix-core decode walks a chunk four wavefronts of 32 keys a
     // round; a chunk under two rounds leaves wavefronts idle and multiplies
     // the partials the merge folds.
+    let floor = match req.chunk_floor_tokens {
+        0 => CHUNK_FLOOR_TOKENS,
+        f => f,
+    };
     let floor_tokens = if req.chunk_floor_128 {
-        CHUNK_FLOOR_TOKENS.max(128)
+        floor.min(128)
     } else {
-        CHUNK_FLOOR_TOKENS
+        floor
     };
     let mut low = (floor_tokens / req.page_size).max(1);
     let mut high = pages.iter().copied().max().unwrap_or(0);
