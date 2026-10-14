@@ -193,9 +193,25 @@ __global__ void index_topk_paged(
     int nkeys = (total > 0) ? total / stride : 0;
     if (nkeys > score_stride) nkeys = score_stride;
 
+    // A row that sees no more blocks than the budget selects them all: its
+    // scores would rank nothing, so none are taken.
+    if (nkeys <= topk) {
+        for (int n = tid; n < topk; n += kBlock) srow[n] = (n < nkeys) ? n : -1;
+        return;
+    }
+
     float* frow = scores + static_cast<long long>(t) * score_stride;
     const T* qi = idx_q + static_cast<long long>(t_row) * H * D;
     const T* wi = (idx_w != nullptr) ? idx_w + static_cast<long long>(t_row) * H : nullptr;
+    // The row's query, read once into shared memory where every key's
+    // thread reads it (the same values, in the same order).
+    constexpr int kStagedQuery = 1024;
+    __shared__ float q_s[kStagedQuery];
+    const bool staged = H * D <= kStagedQuery;
+    if (staged) {
+        for (int i = tid; i < H * D; i += kBlock) q_s[i] = Elem<T>::to_f32(qi[i]);
+    }
+    __syncthreads();
     for (int j = tid; j < nkeys; j += kBlock) {
         const int cell = (j + 1) * stride - 1;
         const int page =
@@ -207,17 +223,16 @@ __global__ void index_topk_paged(
         for (int h = 0; h < H; ++h) {
             const T* qh = qi + static_cast<long long>(h) * D;
             float dot = 0.f;
-            for (int d = 0; d < D; ++d) dot += Elem<T>::to_f32(qh[d]) * Elem<T>::to_f32(kj[d]);
+            if (staged) {
+                for (int d = 0; d < D; ++d) dot += q_s[h * D + d] * Elem<T>::to_f32(kj[d]);
+            } else {
+                for (int d = 0; d < D; ++d) dot += Elem<T>::to_f32(qh[d]) * Elem<T>::to_f32(kj[d]);
+            }
             acc += fmaxf(dot, 0.f) * (idx_w != nullptr ? Elem<T>::to_f32(wi[h]) : 1.f);
         }
         frow[j] = acc;
     }
     __syncthreads();
-
-    if (nkeys <= topk) {
-        for (int n = tid; n < topk; n += kBlock) srow[n] = (n < nkeys) ? n : -1;
-        return;
-    }
 
     __shared__ float red[kBlock];
     float lo_l = pos_inf(), hi_l = -pos_inf();
