@@ -14,7 +14,7 @@ using namespace metal;
 //   order the lanes take them, with their sums, so a lane reads its 16 inputs
 //   of a 64-code group as one load and no threadgroup stages them;
 // - a lane reads its two words of a 64-code group (one scale, one bias) as
-//   one 8-byte load per fragment, its next group's while this one's MMAs run.
+//   one 8-byte load per fragment, the next two groups' while these two's MMAs run.
 // A threadgroup is 4 simdgroups of 16 columns; a lane holds column fm of each
 // 8-column fragment and reads words 2c and 2c + 1 (c = fn / 2) of its 64-code
 // group, whose pair p (codes p and p + 4 of word 2c + j) is its operand of
@@ -108,53 +108,67 @@ affine_qmm_sg(const device uint *weights [[buffer(0)]], const device bfloat *sca
   const device float *sums = reinterpret_cast<const device float *>(table + 8 * ulong(width));
   const int spans = width / kSpan / SPLIT;
   const int first = int(position.y) * spans * 4, last = first + spans * 4;
+  // Two groups a step: their words, scales and biases load while the step before runs.
+  constexpr int U = 2;
   float2 acc[NF];
-  uint2 q[NF];
-  float qs[NF], qb[NF];
+  uint2 q[U][NF];
+  float qs[U][NF], qb[U][NF];
 #pragma unroll
-  for (int f = 0; f < NF; ++f) {
+  for (int f = 0; f < NF; ++f)
     acc[f] = float2(0.0f);
-    q[f] = w0[f * apart + ulong(first) * 4];
-    qs[f] = float(s0[8 * f * groups + first]);
-    qb[f] = float(b0[8 * f * groups + first]);
-  }
-  for (int h = first; h < last; ++h) {
-    uint2 cw[NF];
-    float2 ck[NF];
+#pragma unroll
+  for (int u = 0; u < U; ++u)
 #pragma unroll
     for (int f = 0; f < NF; ++f) {
-      cw[f] = q[f];
-      ck[f] = float2(qs[f], fma(-128.0f, qs[f], qb[f]));
+      q[u][f] = w0[f * apart + ulong(first + u) * 4];
+      qs[u][f] = float(s0[8 * f * groups + first + u]);
+      qb[u][f] = float(b0[8 * f * groups + first + u]);
     }
-    if (h + 1 < last) {
+  for (int h0 = first; h0 < last; h0 += U) {
+    uint2 cw[U][NF];
+    float2 ck[U][NF];
+#pragma unroll
+    for (int u = 0; u < U; ++u)
 #pragma unroll
       for (int f = 0; f < NF; ++f) {
-        q[f] = w0[f * apart + ulong(h + 1) * 4];
-        qs[f] = float(s0[8 * f * groups + h + 1]);
-        qb[f] = float(b0[8 * f * groups + h + 1]);
+        cw[u][f] = q[u][f];
+        ck[u][f] = float2(qs[u][f], fma(-128.0f, qs[u][f], qb[u][f]));
       }
+    if (h0 + U < last) {
+#pragma unroll
+      for (int u = 0; u < U; ++u)
+#pragma unroll
+        for (int f = 0; f < NF; ++f) {
+          q[u][f] = w0[f * apart + ulong(h0 + U + u) * 4];
+          qs[u][f] = float(s0[8 * f * groups + h0 + U + u]);
+          qb[u][f] = float(b0[8 * f * groups + h0 + U + u]);
+        }
     }
-    const vec<bfloat, 16> x = xt[ulong(h) * 32];
-    // One chain per 64 codes (one scale and bias).
-    float2 d[NF];
 #pragma unroll
-    for (int f = 0; f < NF; ++f)
-      d[f] = float2(0.0f);
+    for (int u = 0; u < U; ++u) {
+      const int h = h0 + u;
+      const vec<bfloat, 16> x = xt[ulong(h) * 32];
+      // One chain per 64 codes (one scale and bias).
+      float2 d[NF];
 #pragma unroll
-    for (int j = 0; j < 2; ++j)
+      for (int f = 0; f < NF; ++f)
+        d[f] = float2(0.0f);
 #pragma unroll
-      for (uint p = 0; p < 4; ++p) {
-        const bfloat2 b = bfloat2(x[8 * j + 2 * p], x[8 * j + 2 * p + 1]);
+      for (int j = 0; j < 2; ++j)
 #pragma unroll
-        for (int f = 0; f < NF; ++f)
-          mma(d[f], as_type<bfloat2>(((cw[f][j] >> (4 * p)) & 0x000F000Fu) | 0x43004300u), b);
+        for (uint p = 0; p < 4; ++p) {
+          const bfloat2 b = bfloat2(x[8 * j + 2 * p], x[8 * j + 2 * p + 1]);
+#pragma unroll
+          for (int f = 0; f < NF; ++f)
+            mma(d[f], as_type<bfloat2>(((cw[u][f][j] >> (4 * p)) & 0x000F000Fu) | 0x43004300u), b);
+        }
+      const float2 sm = *reinterpret_cast<const device float2 *>(sums + 2 * ulong(h) * 8 + fn) +
+                        *reinterpret_cast<const device float2 *>(sums + (2 * ulong(h) + 1) * 8 + fn);
+#pragma unroll
+      for (int f = 0; f < NF; ++f) {
+        acc[f] = fma(d[f], ck[u][f].x, acc[f]);
+        acc[f] = fma(sm, ck[u][f].y, acc[f]);
       }
-    const float2 sm = *reinterpret_cast<const device float2 *>(sums + 2 * ulong(h) * 8 + fn) +
-                      *reinterpret_cast<const device float2 *>(sums + (2 * ulong(h) + 1) * 8 + fn);
-#pragma unroll
-    for (int f = 0; f < NF; ++f) {
-      acc[f] = fma(d[f], ck[f].x, acc[f]);
-      acc[f] = fma(sm, ck[f].y, acc[f]);
     }
   }
 #pragma unroll
