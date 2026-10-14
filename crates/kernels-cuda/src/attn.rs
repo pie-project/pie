@@ -208,6 +208,18 @@ fn fa2_decode_with(
     };
     let tensor_cores = xqa::takes(ctx, plan, pool, rel.is_some());
     match rel {
+        // A whole-window plan's block reads its request's window entire and
+        // lands the request's rows (sinks folded) itself: no partial, no fold.
+        None if tensor_cores && plan.info.whole => {
+            let direct = fa2_abi::DecodeParams {
+                o: split.o,
+                lse: split.lse,
+                partition_kv: false,
+                ..params
+            };
+            xqa::decode(ctx, op, plan, &direct, sinks)?;
+            return Ok(sinks.is_some());
+        }
         None if tensor_cores => {
             xqa::decode(ctx, op, plan, &params, sinks)?;
             if !plan.info.split_kv {

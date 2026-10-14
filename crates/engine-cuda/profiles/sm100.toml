@@ -54,6 +54,12 @@ sdpa.decode.xqa = true
 # read through the prefill kernel) take it from 16 requests; narrower, the
 # FA2 decode reads them faster.
 sdpa.decode.xqa_from_64 = 16
+# A window of up to 128 keys reads whole on the tensor cores at any batch, a
+# block a (request, kv head) landing its rows and sinks with no split to
+# fold: gpt-oss-120b's 128-key sliding layers drop their merge, and its
+# decode step takes 3.45 / 8.94 / 15.42 ms at 1 / 8 / 64 requests where it
+# took 3.55 / 9.02 / 16.54.
+sdpa.decode.xqa_whole_window = 128
 # A dense projection's bias from the cuBLASLt epilogue, not a separate add
 # (gpt-oss's qkv and o: about 0.44 ms a bs64 decode step).
 gemm.bias_epilogue = true

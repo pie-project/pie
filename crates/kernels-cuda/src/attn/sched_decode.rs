@@ -18,6 +18,10 @@ pub struct Request<'a> {
     /// The sliding window's `window_left`: a request's tiles cover only the
     /// keys its one query row sees, the last `window_left + 1`.
     pub window_left: Option<u32>,
+    /// One work item a request, its whole window one chunk: the tensor-core
+    /// decode lands each request's rows itself (the partial planes and the
+    /// fold stay laid out for a decode that cannot).
+    pub whole: bool,
 }
 
 /// Each request's pages a decode walks: all of them, or under a sliding
@@ -59,6 +63,14 @@ pub fn estimate(
         return Err(refuse(op, "the pool's page size is zero"));
     }
 
+    if req.whole {
+        return Ok(WorkEstimate {
+            split_kv: true,
+            kv_chunk_size_in_pages: pages.iter().copied().max().unwrap_or(0).max(1),
+            new_batch_size: req.live.requests,
+            gdy,
+        });
+    }
     if u64::from(req.batch_size) * u64::from(gdy) >= u64::from(max_grid_size) {
         return Ok(WorkEstimate {
             split_kv: req.enable_cuda_graph,
@@ -101,6 +113,7 @@ pub fn estimate(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schedule {
     pub split_kv: bool,
+    pub whole: bool,
     pub enable_cuda_graph: bool,
     pub kv_chunk_size_in_pages: u32,
     pub new_batch_size: u32,
@@ -148,6 +161,7 @@ pub fn schedule(
 
     Ok(Schedule {
         split_kv: est.split_kv,
+        whole: req.whole,
         enable_cuda_graph: req.enable_cuda_graph,
         kv_chunk_size_in_pages: est.kv_chunk_size_in_pages,
         new_batch_size: est.new_batch_size,
@@ -176,6 +190,7 @@ fn layout(
     let mut info = DecodePlanInfo {
         enable_cuda_graph: sched.enable_cuda_graph,
         split_kv: sched.split_kv,
+        whole: sched.whole,
         padded_batch_size: padded as i64,
         ..DecodePlanInfo::default()
     };
@@ -326,6 +341,7 @@ pub fn static_nonsplit(
     )?;
     let sched = Schedule {
         split_kv: false,
+        whole: false,
         enable_cuda_graph,
         kv_chunk_size_in_pages: 1,
         new_batch_size: live.requests,

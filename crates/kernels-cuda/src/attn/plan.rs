@@ -372,6 +372,9 @@ pub fn plan_decode(
             enable_cuda_graph,
             chunk_floor_128: toggles.chunk_floor_128,
             window_left: u32::try_from(window_left).ok(),
+            whole: toggles
+                .xqa
+                .whole(shape.head_dim, shape.group_size(), window_left),
         };
         sched_decode::plan(
             OP,
@@ -574,6 +577,9 @@ pub struct DecodePlanInfo {
     pub kv_chunk_size_ptr_offset: Option<u32>,
     pub enable_cuda_graph: bool,
     pub split_kv: bool,
+    /// Each request one work item over its whole window, which the
+    /// tensor-core decode lands unsplit (`xqa::Gate::whole`).
+    pub whole: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

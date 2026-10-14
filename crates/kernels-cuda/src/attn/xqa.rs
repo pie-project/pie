@@ -74,6 +74,8 @@ impl Stamp {
 pub struct Gate {
     pub on: bool,
     pub from_64: u32,
+    /// The widest window (`window_left + 1` keys) read whole, unsplit.
+    pub whole_window: u32,
 }
 
 impl Gate {
@@ -82,6 +84,7 @@ impl Gate {
         Self {
             on: tuning.decode_xqa,
             from_64: tuning.decode_xqa_from_64,
+            whole_window: tuning.decode_xqa_whole_window,
         }
     }
 
@@ -97,6 +100,16 @@ impl Gate {
     pub fn takes(self, head_dim: u32, group: u32, requests: u32) -> bool {
         self.stamps(head_dim, group) && (head_dim != 64 || requests >= self.from_64)
     }
+
+    /// Whether a window of `window_left + 1` keys is read whole at any
+    /// batch: one block a (request, kv head) lands its rows, with no split
+    /// to fold (a short window's split folds dearer than its block reads).
+    #[must_use]
+    pub fn whole(self, head_dim: u32, group: u32, window_left: i32) -> bool {
+        window_left >= 0
+            && u32::try_from(window_left).is_ok_and(|left| left < self.whole_window)
+            && self.stamps(head_dim, group)
+    }
 }
 
 /// Whether this decode takes the tensor-core kernel.
@@ -104,7 +117,7 @@ impl Gate {
 pub fn takes(ctx: &Ctx, plan: &DecodePlan, pool: &KvPool, rel: bool) -> bool {
     let group = plan.shape.group_size();
     let head_dim = plan.shape.head_dim;
-    Gate::of(ctx.tuning()).takes(head_dim, group, plan.shape.num_requests)
+    (plan.info.whole || Gate::of(ctx.tuning()).takes(head_dim, group, plan.shape.num_requests))
         && !rel
         && plan.shape.num_kv_heads * group == plan.shape.num_q_heads
         && !plan.shape.hnd_layout
@@ -201,9 +214,14 @@ mod tests {
         let gate = Gate {
             on: true,
             from_64: 16,
+            whole_window: 128,
         };
         assert!(gate.takes(256, 2, 1) && gate.takes(64, 8, 16));
         assert!(!gate.takes(64, 8, 15) && !gate.takes(256, 16, 64) && !gate.takes(512, 8, 64));
+        // A window of up to 128 keys reads whole at any batch; a wider one,
+        // a full row or an unstamped head does not.
+        assert!(gate.whole(64, 8, 127) && gate.whole(256, 2, 0));
+        assert!(!gate.whole(64, 8, 128) && !gate.whole(64, 8, -1) && !gate.whole(512, 8, 0));
         assert!(gate.stamps(64, 8));
         assert!(!Gate::default().stamps(256, 2));
     }

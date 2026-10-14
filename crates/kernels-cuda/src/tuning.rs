@@ -259,6 +259,13 @@ pub struct DecodeXqa;
 #[decision(id = "kernel.sdpa.decode.xqa_from_64", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct DecodeXqaFrom64(pub u32);
 
+/// The widest sliding window (keys a query row sees) the tensor-core decode
+/// reads whole, a block a (request, kv head) landing its rows and sinks
+/// itself, with no split to fold; 0 splits every window as the plan sizes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.xqa_whole_window", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct DecodeXqaWholeWindow(pub u32);
+
 /// Whether a split attention's partial states fold a warp a (row, head)
 /// rather than through the staged persistent merge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -306,6 +313,7 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeGroupedPrefillLse>()
         .add::<DecodeXqa>()
         .add::<DecodeXqaFrom64>()
+        .add::<DecodeXqaWholeWindow>()
         .add::<SdpaSelectedMma>()
         .add::<SdpaIndexMma>()
         .add::<GemmNarrowN>();
@@ -355,6 +363,7 @@ pub struct Tuning {
     pub decode_grouped_prefill_lse: bool,
     pub decode_xqa: bool,
     pub decode_xqa_from_64: u32,
+    pub decode_xqa_whole_window: u32,
     pub selected_mma: bool,
     pub index_mma: bool,
     pub gemm_narrow_n: u32,
@@ -402,6 +411,7 @@ impl Tuning {
         decode_grouped_prefill_lse: false,
         decode_xqa: false,
         decode_xqa_from_64: 0,
+        decode_xqa_whole_window: 0,
         selected_mma: false,
         index_mma: false,
         gemm_narrow_n: 0,
@@ -449,6 +459,7 @@ impl Tuning {
             decode_grouped_prefill_lse: profile.on::<DecodeGroupedPrefillLse>(&Anywhere),
             decode_xqa: profile.on::<DecodeXqa>(&Anywhere),
             decode_xqa_from_64: profile.get::<DecodeXqaFrom64>().0,
+            decode_xqa_whole_window: profile.get::<DecodeXqaWholeWindow>().0,
             selected_mma: profile.on::<SdpaSelectedMma>(&Anywhere),
             index_mma: profile.on::<SdpaIndexMma>(&Anywhere),
             gemm_narrow_n: profile.get::<GemmNarrowN>().0,

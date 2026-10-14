@@ -370,7 +370,10 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
             }
         }
         const int qo_head = kv_head * static_cast<int>(group) + h;
-        const long long row = static_cast<long long>(bx) * num_qo_heads + qo_head;
+        // A partial lands at its work item; an unsplit row where its query
+        // row sits (a whole-window plan's requests are the fire's lanes).
+        const long long row =
+            static_cast<long long>(partition_kv ? bx : q_indptr[batch]) * num_qo_heads + qo_head;
         float out = (l > 0.f && !empty) ? acc / l : 0.f;
         const float lse_v = (l > 0.f && !empty) ? m + log2f(l) : kEmpty;
         if (!partition_kv && sinks != nullptr) {
