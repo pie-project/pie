@@ -450,7 +450,7 @@ pub fn select(
         1.0,
         count,
     )?;
-    gather_back(ctx, op, grouped, pos, y)
+    gather_back(ctx, op, grouped, pos, routes.width, y)
 }
 
 /// Routes laid out by expert on the device, as the grouped [`tc5`] GEMM
@@ -498,7 +498,13 @@ pub(crate) fn lay_out(
     ctx.fire(
         op,
         Fire::at(FILE, "::pie::linear::route_count").apply(Launch::flat(count, BLOCK)),
-        &[routes.arg(), int(count)?, ArgValue::Ptr(counts)],
+        &[
+            routes.arg(),
+            int(count)?,
+            int(routes.width)?,
+            ctx.stage(),
+            ArgValue::Ptr(counts),
+        ],
     )?;
     ctx.fire(
         op,
@@ -518,6 +524,8 @@ pub(crate) fn lay_out(
         &[
             routes.arg(),
             int(count)?,
+            int(routes.width)?,
+            ctx.stage(),
             ArgValue::Ptr(cursor),
             ArgValue::Ptr(pos),
         ],
@@ -548,6 +556,7 @@ pub(crate) fn gather_back(
     op: &'static str,
     grouped: u64,
     pos: u64,
+    top: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     let (count, n) = (y.rows, y.width);
@@ -563,6 +572,8 @@ pub(crate) fn gather_back(
             y.arg(),
             int(count)?,
             int(n)?,
+            int(top)?,
+            ctx.stage(),
         ],
     )
 }

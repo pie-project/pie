@@ -216,10 +216,25 @@ __global__ void scales_to_atoms(
 // Routes laid out by expert for the grouped GEMM: each routed expert's
 // count, its rows' start (`align` rows apart, rounded up, for the contiguous
 // layout, `m_max` apart for the masked one) and each route's row.
-__global__ void route_count(const i32* __restrict__ routes, int count, i32* __restrict__ counts)
+// Under a live window (`win`: `win[0]` tokens from token `win[1]`, `top`
+// routes a token) only its routes are laid out; the rest are neither read
+// into the GEMM nor written back.
+__device__ __forceinline__ bool route_live(int r, int top, const u32* __restrict__ win)
+{
+    if (win == nullptr) return true;
+    const int t = r / top - static_cast<int>(win[1]);
+    return t >= 0 && t < static_cast<int>(win[0]);
+}
+
+__global__ void route_count(
+    const i32* __restrict__ routes,
+    int count,
+    int top,
+    const u32* __restrict__ win,
+    i32* __restrict__ counts)
 {
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r < count && routes[r] >= 0) atomicAdd(&counts[routes[r]], 1);
+    if (r < count && routes[r] >= 0 && route_live(r, top, win)) atomicAdd(&counts[routes[r]], 1);
 }
 
 __global__ void route_offsets(
@@ -243,25 +258,31 @@ __global__ void route_offsets(
 __global__ void route_place(
     const i32* __restrict__ routes,
     int count,
+    int top,
+    const u32* __restrict__ win,
     i32* __restrict__ cursor,
     i32* __restrict__ pos)
 {
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= count) return;
-    pos[r] = routes[r] >= 0 ? atomicAdd(&cursor[routes[r]], 1) : -1;
+    pos[r] = routes[r] >= 0 && route_live(r, top, win) ? atomicAdd(&cursor[routes[r]], 1) : -1;
 }
 
-// `y[r] = grouped[pos[r]]`, a dropped route zeros; a thread a pair.
+// `y[r] = grouped[pos[r]]`, a dropped route zeros, a route past the live
+// window untouched; a thread a pair.
 __global__ void route_gather(
     const bf16* __restrict__ grouped,
     const i32* __restrict__ pos,
     bf16* __restrict__ y,
     int count,
-    int n)
+    int n,
+    int top,
+    const u32* __restrict__ win)
 {
     const long long at = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (at >= static_cast<long long>(count) * (n / 2)) return;
     const int r = static_cast<int>(at / (n / 2));
+    if (!route_live(r, top, win)) return;
     const int c = static_cast<int>(at % (n / 2)) * 2;
     const int o = pos[r];
     bf16x2* dst = reinterpret_cast<bf16x2*>(y + static_cast<long long>(r) * n + c);

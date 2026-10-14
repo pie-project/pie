@@ -412,7 +412,7 @@ pub fn matmul_select(
     #[cfg(feature = "cuda")]
     {
         let fan = selected(OP, x, routes, y)?;
-        if tc5_worth(ctx, x, bank.dtype, y, experts) {
+        if tc5_worth(x, bank.dtype, y, experts, routes.rows, fan.route_count) {
             return select_tc5(
                 ctx,
                 OP,
@@ -430,15 +430,28 @@ pub fn matmul_select(
     select_gemv(ctx, OP, x, bank, routes, y, experts)
 }
 
-/// Whether a select of `x` (bf16) runs on the grouped tcgen05 GEMM: a
-/// resident bank, unstaged, on a device that has it, at widths its tiles
-/// take.
+/// A fire of fewer tokens keeps the GEMV: its layout's four small launches
+/// cost more than they save (Qwen3.6-35B-A3B decode: 3.9 ms a token on the
+/// GEMV against 5.3 ms on the grouped GEMM at one token, even at eight).
 #[cfg(feature = "cuda")]
-fn tc5_worth(ctx: &Ctx, x: Tensor, bank: Dtype, y: &Tensor, experts: ExpertTable) -> bool {
-    x.dtype == Dtype::Bf16
+const TC5_TOKENS: u32 = 16;
+
+/// Whether a select of `x` (bf16) runs on the grouped tcgen05 GEMM: a
+/// resident bank on a device that has it, at widths its tiles take (a live
+/// window lays out only its routes), for a fire wide enough to repay it.
+#[cfg(feature = "cuda")]
+fn tc5_worth(
+    x: Tensor,
+    bank: Dtype,
+    y: &Tensor,
+    experts: ExpertTable,
+    tokens: u32,
+    routes: u32,
+) -> bool {
+    (tokens >= TC5_TOKENS || routes > MAX_GRID_Y)
+        && x.dtype == Dtype::Bf16
         && bank == Dtype::Bf16
         && !experts.streams()
-        && matches!(ctx.stage(), ArgValue::Ptr(0))
         && x.width.is_multiple_of(64)
         && y.width.is_multiple_of(64)
         && crate::linear::tc5::supported()
@@ -489,7 +502,7 @@ pub(crate) fn select_tc5(
         1.0,
         count,
     )?;
-    act_quant::gather_back(ctx, op, ys, layout.pos, y)
+    act_quant::gather_back(ctx, op, ys, layout.pos, routes.width, y)
 }
 
 #[cfg(feature = "cuda")]

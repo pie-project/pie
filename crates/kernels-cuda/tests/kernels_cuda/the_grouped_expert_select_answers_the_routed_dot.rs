@@ -136,6 +136,7 @@ fn the_grouped_expert_select_answers_the_routed_dot_every_case() {
 /// decode fire laid out masked, prefill fires contiguous, one of them past
 /// 65535 routes, and one expert taking most of them.
 fn the_tcgen05_widths_land_masked_and_contiguous() {
+    check(16, 20, 2, 256, 128, true, Spread::Mixed);
     check(16, 9, 2, 256, 128, true, Spread::Mixed);
     check(16, 64, 4, 256, 192, false, Spread::Mixed);
     check(16, 70, 4, 256, 192, true, Spread::Mixed);
