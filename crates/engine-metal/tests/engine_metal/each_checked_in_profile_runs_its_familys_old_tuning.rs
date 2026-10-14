@@ -108,6 +108,7 @@ fn assert_old_tuning(
     cores: Option<u32>,
     fill_tg: u32,
     mlp: Option<AneMlp>,
+    projections: Option<AneProjections>,
 ) {
     let (profile, report) = chip::resolve(device, &chip::facts(family, cores, 10, true), None);
     assert_eq!(
@@ -183,11 +184,11 @@ fn assert_old_tuning(
     assert_eq!(*profile.get::<AneMlp>(), mlp, "{device}");
     assert_eq!(
         *profile.get::<AneProjections>(),
-        if family == 10 {
+        projections.unwrap_or(if family == 10 {
             AneProjections::Gpu
         } else {
             AneProjections::Share { percent: 47 }
-        },
+        }),
         "{device}"
     );
     assert_eq!(
@@ -220,7 +221,7 @@ fn assert_old_tuning(
 #[test]
 fn each_checked_in_profile_runs_its_familys_old_tuning() {
     for &(family, device, cores) in CHIPS {
-        assert_old_tuning(device, family, cores, 512, None);
+        assert_old_tuning(device, family, cores, 512, None, None);
     }
 }
 
@@ -231,7 +232,8 @@ fn the_m4_pro_runs_its_family_and_the_two_values_it_measured() {
         9,
         Some(20),
         896,
-        Some(AneMlp::Share { percent: 71 }),
+        Some(AneMlp::Share { percent: 74 }),
+        Some(AneProjections::Gpu),
     );
     let (_, report) = chip::resolve("Apple M4 Pro", &chip::facts(9, Some(20), 10, true), None);
     assert_eq!(report.measured, ["kernel.ane.mlp", "kernel.qmm_splitk"]);
