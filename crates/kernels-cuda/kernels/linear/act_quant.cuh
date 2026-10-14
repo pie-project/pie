@@ -330,6 +330,71 @@ __global__ void route_offsets(
 // starts. The same integers, without one thread walking every expert.
 constexpr int kOffsetThreads = 1024;
 
+// `route_count_tally`, `route_offsets_scan` and `route_place_tally` in one
+// block, for a fire of at most `kOffsetThreads * kSmallPer` routes: the
+// counts tallied in shared memory, scanned into the experts' starts, each
+// route placed at its start past its rank. `shared` is `2 * experts` ints.
+constexpr int kSmallPer = 16;
+
+__global__ void __launch_bounds__(kOffsetThreads) route_lay_out_small(
+    const i32* __restrict__ routes,
+    int count,
+    int top,
+    const u32* __restrict__ win,
+    int experts,
+    int m_max,
+    int align,
+    i32* __restrict__ counts,
+    i32* __restrict__ offsets,
+    i32* __restrict__ pos)
+{
+    extern __shared__ int lay[];
+    int* tally = lay;
+    int* start = lay + experts;
+    __shared__ int run_sum[kOffsetThreads];
+    const int tid = static_cast<int>(threadIdx.x);
+    for (int e = tid; e < experts; e += kOffsetThreads) tally[e] = 0;
+    __syncthreads();
+    int rank[kSmallPer];
+#pragma unroll
+    for (int i = 0; i < kSmallPer; ++i) {
+        const int r = tid + i * kOffsetThreads;
+        rank[i] = -1;
+        if (r < count) {
+            const int e = routes[r];
+            if (e >= 0 && e < experts && route_live(r, top, win)) rank[i] = atomicAdd(&tally[e], 1);
+        }
+    }
+    __syncthreads();
+    const int per = (experts + kOffsetThreads - 1) / kOffsetThreads;
+    const int lo = min(tid * per, experts), hi = min(lo + per, experts);
+    auto rows = [&](int e) { return m_max > 0 ? m_max : (tally[e] + align - 1) / align * align; };
+    int sum = 0;
+    for (int e = lo; e < hi; ++e) sum += rows(e);
+    run_sum[tid] = sum;
+    __syncthreads();
+    for (int step = 1; step < kOffsetThreads; step <<= 1) {
+        const int add = tid >= step ? run_sum[tid - step] : 0;
+        __syncthreads();
+        run_sum[tid] += add;
+        __syncthreads();
+    }
+    int at = run_sum[tid] - sum;
+    for (int e = lo; e < hi; ++e) {
+        start[e] = at;
+        offsets[e] = at;
+        counts[e] = tally[e];
+        at += rows(e);
+    }
+    if (tid == kOffsetThreads - 1) offsets[experts] = run_sum[tid];
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < kSmallPer; ++i) {
+        const int r = tid + i * kOffsetThreads;
+        if (r < count) pos[r] = rank[i] >= 0 ? start[routes[r]] + rank[i] : -1;
+    }
+}
+
 __global__ void __launch_bounds__(kOffsetThreads) route_offsets_scan(
     const i32* __restrict__ counts,
     int experts,

@@ -25,6 +25,9 @@ const FILE: &str = "linear/act_quant.cuh";
 const BLOCK: u32 = 256;
 /// The routes one `route_*_tally` block lays out (`kTallyRoutes`).
 const TALLY_ROUTES: u32 = 2048;
+/// The most routes `route_lay_out_small` lays out in one block
+/// (`kOffsetThreads * kSmallPer`).
+const SMALL_LAYOUT: u32 = 1024 * 16;
 
 /// The precision activations are quantized to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -495,8 +498,49 @@ pub(crate) fn lay_out(
     let offsets = i32s(ROUTE_OFFSETS, e + 1)?;
     let cursor = i32s(ROUTE_CURSOR, e)?;
     let pos = i32s(ROUTE_POS, count as usize)?;
-    zero(ctx, op, counts, e * 4)?;
     let int = |v: u32| stated(op, v).map(|v| v.arg());
+    let laid = |pos| {
+        if m_max > 0 {
+            Layout {
+                pos,
+                rows: experts * m_max,
+                groups: tc5::Groups::Masked { counts, m_max },
+                m_max,
+            }
+        } else {
+            // Each expert's rows start a whole alignment apart.
+            let rows = (count + (align - 1) * experts.min(count)).next_multiple_of(align);
+            Layout {
+                pos,
+                rows,
+                groups: tc5::Groups::Contiguous { offsets, rows },
+                m_max,
+            }
+        }
+    };
+    // A narrow fire lays out in one block (`route_lay_out_small`): one launch,
+    // not a clear and three.
+    if count <= SMALL_LAYOUT {
+        ctx.fire(
+            op,
+            Fire::at(FILE, "::pie::linear::route_lay_out_small")
+                .apply(Launch::flat(1024, 1024).smem(8 * experts)),
+            &[
+                routes.arg(),
+                int(count)?,
+                int(routes.width)?,
+                ctx.stage(),
+                int(experts)?,
+                int(m_max)?,
+                int(align)?,
+                ArgValue::Ptr(counts),
+                ArgValue::Ptr(offsets),
+                ArgValue::Ptr(pos),
+            ],
+        )?;
+        return Ok(laid(pos));
+    }
+    zero(ctx, op, counts, e * 4)?;
     // A block of routes tallies its experts in shared memory and touches the
     // global count once an expert (`route_count_tally`).
     let tally = Launch::flat(count.div_ceil(TALLY_ROUTES) * BLOCK, BLOCK).smem(8 * experts);
@@ -538,23 +582,7 @@ pub(crate) fn lay_out(
             ArgValue::Ptr(pos),
         ],
     )?;
-    Ok(if m_max > 0 {
-        Layout {
-            pos,
-            rows: experts * m_max,
-            groups: tc5::Groups::Masked { counts, m_max },
-            m_max,
-        }
-    } else {
-        // Each expert's rows start a whole alignment apart.
-        let rows = (count + (align - 1) * experts.min(count)).next_multiple_of(align);
-        Layout {
-            pos,
-            rows,
-            groups: tc5::Groups::Contiguous { offsets, rows },
-            m_max,
-        }
-    })
+    Ok(laid(pos))
 }
 
 /// `y[r] = grouped[pos[r]]`, a dropped route's row zeros: the grouped
