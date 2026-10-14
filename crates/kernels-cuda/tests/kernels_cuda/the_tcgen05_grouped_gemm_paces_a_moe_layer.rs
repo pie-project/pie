@@ -115,10 +115,10 @@ fn layer(name: &str, experts: usize, top: usize, [n, k]: [usize; 2], kind: Kind)
         flush: gpu.zeros(FLUSH),
         stream,
     };
-    let bank_atoms = kind
-        .w
-        .1
-        .map_or(0, |g| atom_bytes(experts * n, k, g as usize));
+    // A W4A16 bank's scales lie row-major: as many bytes, rounded up.
+    let bank_atoms = kind.w.1.map_or(0, |g| {
+        atom_bytes(experts * n, k, g as usize).max(experts * n * k / g as usize)
+    });
     let w = operand(&mut gpu, kind.w, experts * n, k, bank_atoms, 3);
     let alpha_e = gpu.up(&vec![1f32; experts]);
     for skewed in [false, true] {
@@ -238,7 +238,9 @@ fn layer(name: &str, experts: usize, top: usize, [n, k]: [usize; 2], kind: Kind)
                         }
                         Groups::Contiguous { .. } => rows,
                     };
-                    let out = if std::env::var("PIE_TC5_FUSED_BF16").is_ok() {
+                    let out = if std::env::var("PIE_TC5_FUSED_BF16").is_ok()
+                        || kind.act.0 == Elem::Bf16
+                    {
                         Out::Bf16
                     } else if kind.act.0 == Elem::E2m1 {
                         Out::Nvfp4 {
@@ -359,4 +361,17 @@ fn the_tcgen05_grouped_gemm_paces_a_moe_layer() {
     }
     layer("qwen gate_up", 512, 10, [1280, 2560], nvfp4);
     layer("qwen down", 512, 10, [2560, 640], nvfp4);
+    let w4a16 = Kind {
+        name: "w4a16 mxfp4",
+        act: (Elem::Bf16, None),
+        w: (Elem::E2m1, Some(32)),
+    };
+    layer("gpt-oss gate_up", 128, 4, [5760, 2880], w4a16);
+    layer("gpt-oss down", 128, 4, [2880, 2880], w4a16);
+    let bf16 = Kind {
+        name: "bf16",
+        act: (Elem::Bf16, None),
+        w: (Elem::Bf16, None),
+    };
+    layer("gpt-oss-bf16 gate_up", 128, 4, [5760, 2880], bf16);
 }

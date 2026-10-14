@@ -573,8 +573,11 @@ pub fn gemm_epi_with(
     let plan = unpaired_if_mixed(act, w, epi.fit(plan)?);
     let kind = admit(act, w, n, k, plan)?;
     let glu = epi.glu.is_some();
-    if glu && !n.is_multiple_of(128) {
-        return Err(refuse(OP, "a GLU's gate rows are whole 128-row blocks"));
+    if glu && !n.is_multiple_of(128) && !glu_any_rows(act, w, epi) {
+        return Err(refuse(
+            OP,
+            "a block-scaled GLU's gate rows, or a quantized one's, are whole 128-row blocks",
+        ));
     }
     let w_rows = if glu { 2 * n } else { n };
     let (p, q) = if plan.swap { (w, act) } else { (act, w) };
@@ -780,8 +783,11 @@ pub fn grouped_gemm_epi_with(
     }
     let plan = unpaired_if_mixed(act, w, epi.fit(plan)?);
     let glu = epi.glu.is_some();
-    if glu && !n.is_multiple_of(128) {
-        return Err(refuse(OP, "a GLU's gate rows are whole 128-row blocks"));
+    if glu && !n.is_multiple_of(128) && !glu_any_rows(act, w, epi) {
+        return Err(refuse(
+            OP,
+            "a block-scaled GLU's gate rows, or a quantized one's, are whole 128-row blocks",
+        ));
     }
     let n_per = if glu { 2 * n } else { n };
     if g.experts >= MAX_ROUTES {
@@ -895,6 +901,13 @@ fn admit(act: Operand, w: Operand, n: u32, k: u32, plan: Plan) -> Result<Kind, E
         ));
     }
     Ok(kind)
+}
+
+/// Whether a GLU's gate rows may end mid-block: its weight carries no TMEM
+/// scales (bf16 or W4A16, whose rows past the gate's land nowhere) and it
+/// lands bf16.
+fn glu_any_rows(act: Operand, w: Operand, epi: Epilogue) -> bool {
+    matches!(Kind::of(act, w), Ok(Kind::Bf16 | Kind::Mixed(_))) && epi.out == Out::Bf16
 }
 
 /// A W4A16 weight runs on lone CTAs: its transform warps write each CTA's
