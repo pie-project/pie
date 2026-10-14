@@ -155,6 +155,107 @@ __device__ __forceinline__ void compute(const Chunk<kTiles, kNb>& cc, float (&ac
 /// With `kGlu`, the bank's `n` rows are `inter` gate rows and as many up
 /// rows: a warp's two tiles are 16 gate rows and their up rows, and `out`
 /// is the GLU, `inter` wide (a CTA 64 of it).
+/// A block-wide exclusive scan of one value a thread (blockDim.x a whole
+/// number of warps, at most 1024); the total lands in `*total`.
+__device__ __forceinline__ int w4_block_scan(int v, int* warp_sums, int* total) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int warps = static_cast<int>(blockDim.x) >> 5;
+    int x = v;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        const int y = __shfl_up_sync(0xffffffffu, x, off);
+        if (lane >= off) x += y;
+    }
+    if (lane == 31) warp_sums[warp] = x;
+    __syncthreads();
+    if (warp == 0) {
+        int w = lane < warps ? warp_sums[lane] : 0;
+#pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            const int y = __shfl_up_sync(0xffffffffu, w, off);
+            if (lane >= off) w += y;
+        }
+        if (lane < warps) warp_sums[lane] = w;
+        if (lane == 31) *total = w;
+    }
+    __syncthreads();
+    const int before = warp > 0 ? warp_sums[warp - 1] : 0;
+    return before + x - v;
+}
+
+/// `moe_route_order`'s product (routes sorted by expert, each expert's
+/// offset, the work list of (expert, slice) items in expert order) with the
+/// two serial walks over the experts done as block scans.
+__global__ void moe_route_order_scan(
+    const i32* __restrict__ routes,
+    i32* __restrict__ order,
+    i32* __restrict__ offsets,
+    i32* __restrict__ work,
+    int work_cap,
+    int group_routes,
+    int top_k,
+    int route_count,
+    int num_experts,
+    const u32* __restrict__ win)
+{
+    extern __shared__ i32 order_smem[];
+    i32* counts = order_smem;
+    i32* fill = counts + num_experts + 1;
+    __shared__ int warp_sums[32];
+    __shared__ int total;
+    const int live = win != nullptr
+        ? min(static_cast<int>(win[0]) * top_k, route_count)
+        : route_count;
+    const int base = win != nullptr ? static_cast<int>(win[1]) * top_k : 0;
+    const int tid = static_cast<int>(threadIdx.x);
+    const int threads = static_cast<int>(blockDim.x);
+    for (int e = tid; e <= num_experts; e += threads) {
+        counts[e] = 0;
+        fill[e] = 0;
+    }
+    __syncthreads();
+    for (int r = tid; r < live; r += threads) {
+        int e = routes[base + r];
+        if (e < 0 || e >= num_experts) e = num_experts;
+        atomicAdd(counts + e, 1);
+    }
+    __syncthreads();
+    // Each thread a contiguous run of experts: their routes and work items.
+    const int per = (num_experts + 1 + threads - 1) / threads;
+    const int e0 = min(tid * per, num_experts + 1);
+    const int e1 = min(e0 + per, num_experts + 1);
+    int mine = 0, items = 0;
+    for (int e = e0; e < e1; ++e) {
+        const int c = counts[e];
+        mine += c;
+        if (e < num_experts) items += (c + group_routes - 1) / group_routes;
+    }
+    int route_at = w4_block_scan(mine, warp_sums, &total);
+    __syncthreads();
+    int item_at = w4_block_scan(items, warp_sums, &total);
+    const int items_total = total;
+    __syncthreads();
+    for (int e = e0; e < e1; ++e) {
+        const int c = counts[e];
+        counts[e] = route_at;
+        offsets[e] = route_at;
+        route_at += c;
+        if (e < num_experts) {
+            for (int g = 0; g * group_routes < c; ++g, ++item_at)
+                if (item_at < work_cap) work[item_at] = e * 65536 + g;
+        }
+    }
+    if (tid == 0) offsets[num_experts + 1] = min(items_total, work_cap);
+    __syncthreads();
+    for (int r = tid; r < live; r += threads) {
+        int e = routes[base + r];
+        if (e < 0 || e >= num_experts) e = num_experts;
+        const int pos = counts[e] + atomicAdd(fill + e, 1);
+        order[pos] = base + r;
+    }
+}
+
 template <int kNb, int kDepth, int kGlu>
 __global__ void __launch_bounds__(128) moe_select_mxfp4_mma(
     const bf16* __restrict__ act,

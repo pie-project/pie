@@ -991,10 +991,12 @@ pub(crate) fn route_order(
     fan: &Selected,
     experts: u32,
 ) -> Result<RouteOrder, Error> {
-    route_order_sliced(ctx, op, routes, fan, experts, WMMA_ROUTES)
+    route_order_sliced(ctx, op, routes, fan, experts, WMMA_ROUTES, false)
 }
 
-/// [`route_order`] with each work item `slice` routes of one expert.
+/// [`route_order`] with each work item `slice` routes of one expert; with
+/// `scan`, its walks over the experts run as block scans
+/// (`moe_route_order_scan`) instead of on one thread.
 fn route_order_sliced(
     ctx: &Ctx,
     op: &'static str,
@@ -1002,6 +1004,7 @@ fn route_order_sliced(
     fan: &Selected,
     experts: u32,
     slice: u32,
+    scan: bool,
 ) -> Result<RouteOrder, Error> {
     const ORDER_BLOCK: u32 = 1024;
     let offsets_at = (fan.route_count as usize).next_multiple_of(64);
@@ -1016,8 +1019,15 @@ fn route_order_sliced(
     let work = order + (work_at * core::mem::size_of::<i32>()) as u64;
     ctx.fire(
         op,
-        Fire::at("linear/quant.cuh", symbol("::pie::linear::moe_route_order"))
-            .apply(Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1]).smem(2 * (experts + 1) * 4)),
+        if scan {
+            Fire::at(
+                "linear/moe_w4.cuh",
+                symbol("::pie::linear::moe_route_order_scan"),
+            )
+        } else {
+            Fire::at("linear/quant.cuh", symbol("::pie::linear::moe_route_order"))
+        }
+        .apply(Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1]).smem(2 * (experts + 1) * 4)),
         &[
             routes.arg(),
             ArgValue::Ptr(order),
@@ -1115,7 +1125,7 @@ fn select_mxfp4_mma(
         offsets,
         work,
         work_cap,
-    } = route_order_sliced(ctx, op, routes, fan, experts, 8 * nb)?;
+    } = route_order_sliced(ctx, op, routes, fan, experts, 8 * nb, true)?;
     ctx.fire(
         op,
         Fire::at(
