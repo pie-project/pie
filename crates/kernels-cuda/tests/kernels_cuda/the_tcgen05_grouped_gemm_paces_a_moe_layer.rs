@@ -14,6 +14,7 @@
 //! one token count; `PIE_TC5_SPLITS` overrides the plan's K splits;
 //! `PIE_TC5_PAIR=0|1` runs contiguous launches on lone CTAs or CTA pairs;
 //! `PIE_TC5_FUSED_BF16` lands the fused gate_up's GLU as bf16 instead.
+//! `PIE_TC5_CONTIGUOUS` lays a fire under 128 tokens out contiguous too.
 
 use crate::common::Gpu;
 use crate::common::tc5::random;
@@ -149,7 +150,11 @@ fn layer(name: &str, experts: usize, top: usize, [n, k]: [usize; 2], kind: Kind)
                     .flat_map(|c| c.iter().copied())
                     .max()
                     .unwrap_or(0);
-                if masked && (tokens > 1024 || busiest > 256) || !masked && tokens < 128 {
+                // `PIE_TC5_CONTIGUOUS` lays a narrow fire out contiguous too.
+                let contiguous_narrow = std::env::var("PIE_TC5_CONTIGUOUS").is_ok();
+                if masked && (tokens > 1024 || busiest > 256)
+                    || !masked && tokens < 128 && !contiguous_narrow
+                {
                     continue;
                 }
                 let (groups, rows, act_atoms): (Vec<Groups>, usize, usize) = if masked {
