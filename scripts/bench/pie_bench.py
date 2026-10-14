@@ -590,6 +590,8 @@ async def cli_pie_client(args: argparse.Namespace):
             f"--no-default-features --features {feature}"
         )
 
+    # launch to the ready banner: the model load, as other engines' servers report it
+    launched = time.perf_counter()
     proc = await asyncio.create_subprocess_exec(
         str(pie_bin),
         "--config",
@@ -692,6 +694,7 @@ async def cli_pie_client(args: argparse.Namespace):
             # gateway edge landed; match the phrase, not the scheme.
             if "Server ready at " in text:
                 server_ready = True
+                engine_config["server load s"] = round(time.perf_counter() - launched, 3)
                 break
             if proc.returncode is not None:
                 raise RuntimeError(
