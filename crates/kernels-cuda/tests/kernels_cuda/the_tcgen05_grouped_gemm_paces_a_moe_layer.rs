@@ -14,7 +14,8 @@
 //! one token count; `PIE_TC5_SPLITS` overrides the plan's K splits;
 //! `PIE_TC5_PAIR=0|1` runs contiguous launches on lone CTAs or CTA pairs;
 //! `PIE_TC5_FUSED_BF16` lands the fused gate_up's GLU as bf16 instead.
-//! `PIE_TC5_CONTIGUOUS` lays a fire under 128 tokens out contiguous too.
+//! `PIE_TC5_CONTIGUOUS` lays a fire under 128 tokens out contiguous too;
+//! `PIE_TC5_BN` overrides the plan's Q tile.
 
 use crate::common::Gpu;
 use crate::common::tc5::random;
@@ -338,6 +339,12 @@ fn plan_for(g: &Grouped, shape: [u32; 2], routed: u32) -> Plan {
         .and_then(|v| v.parse().ok())
     {
         plan.splits = s;
+    }
+    if let Some(bn) = std::env::var("PIE_TC5_BN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        plan.bn = bn;
     }
     if let (Groups::Contiguous { .. }, Ok(pair)) = (g.groups, std::env::var("PIE_TC5_PAIR")) {
         plan.pair = pair == "1";
