@@ -67,6 +67,13 @@ pub struct SdpaSelectedMma;
 #[decision(id = "kernel.sdpa.index_mma", flag, default = false, tune = search)]
 pub struct SdpaIndexMma;
 
+/// The widest dense bf16 product (in columns) the GEMM tuner may also time
+/// on the narrow kernel (a block a row, every column's sum in registers);
+/// 0 never offers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.narrow_n", constant(range(0..=8)), default = 0, tune = search)]
+pub struct GemmNarrowN(pub u32);
+
 /// Whether a small decode batch still splits its keys across blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.decode.split_small", flag, default = false, tune = search)]
@@ -253,7 +260,8 @@ pub fn register(registry: &mut Registry) {
         .add::<PrefillTc5>()
         .add::<DecodeGroupedPrefillFrom>()
         .add::<SdpaSelectedMma>()
-        .add::<SdpaIndexMma>();
+        .add::<SdpaIndexMma>()
+        .add::<GemmNarrowN>();
 }
 
 /// The kernel decisions one load runs under, read once from its profile.
@@ -296,6 +304,7 @@ pub struct Tuning {
     pub decode_grouped_prefill_from: u32,
     pub selected_mma: bool,
     pub index_mma: bool,
+    pub gemm_narrow_n: u32,
 }
 
 impl Tuning {
@@ -336,6 +345,7 @@ impl Tuning {
         decode_grouped_prefill_from: 0,
         selected_mma: false,
         index_mma: false,
+        gemm_narrow_n: 0,
     };
 
     #[must_use]
@@ -376,6 +386,7 @@ impl Tuning {
             decode_grouped_prefill_from: profile.get::<DecodeGroupedPrefillFrom>().0,
             selected_mma: profile.on::<SdpaSelectedMma>(&Anywhere),
             index_mma: profile.on::<SdpaIndexMma>(&Anywhere),
+            gemm_narrow_n: profile.get::<GemmNarrowN>().0,
         }
     }
 }

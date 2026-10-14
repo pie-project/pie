@@ -15,6 +15,7 @@ device = "NVIDIA B200"
 # scalar walk. Its pooled index scores on the tensor cores too: 0.11 s of
 # the same prefill against 1.20 s a thread a block.
 [kernel]
+gemm.narrow_n = 8
 gemm.skinny_rows = 0
 sdpa.index_mma = true
 sdpa.selected_mma = true
@@ -33,6 +34,7 @@ state_slots_per_lane = 2
 source = "pie tune (quick, gemma4-31b) and the scoreboard's fixed points, end to end"
 measured = [
   "kernel.gemm.heuristics",
+  "kernel.gemm.narrow_n",
   "kernel.gemm.skinny_rows",
   "kernel.gemm.tc5_glu_from",
   "kernel.gemm.workspace_mb",

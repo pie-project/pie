@@ -23,7 +23,7 @@ use cudarc::runtime::sys::{
     cudaStreamSynchronize,
 };
 
-use super::gemv::gemv_bf16;
+use super::gemv::{gemm_narrow_bf16, gemv_bf16};
 use crate::jit::device::capture_status;
 use crate::jit::{Ctx, refuse};
 
@@ -61,6 +61,8 @@ enum Tactic {
     Gemv,
     GemmEx,
     Lt(usize),
+    /// `gemm_narrow_bf16`: a block a row, at most eight columns.
+    Narrow,
 }
 
 impl Tactic {
@@ -69,6 +71,7 @@ impl Tactic {
             Self::GemmEx => (0, 0),
             Self::Lt(algo) => (1, i32::try_from(algo).unwrap_or(0)),
             Self::Gemv => (2, 0),
+            Self::Narrow => (3, 0),
         }
     }
 
@@ -77,6 +80,7 @@ impl Tactic {
             0 => Some(Self::GemmEx),
             1 => usize::try_from(algo).ok().map(Self::Lt),
             2 => Some(Self::Gemv),
+            3 => Some(Self::Narrow),
             _ => None,
         }
     }
@@ -113,6 +117,7 @@ pub(crate) fn act_x_wt(
         device.configure(
             (tuning.gemm_workspace_mb as usize) << 20,
             tuning.gemm_heuristics as usize,
+            tuning.gemm_narrow_n,
         );
         let plan = device.plan_for(call);
         let tactic = capturing
@@ -207,6 +212,17 @@ fn run_tactic(
                 )
                 .is_ok()
         }
+        Tactic::Narrow => gemm_narrow_bf16(
+            &unsafe { Ctx::on(stream) },
+            call.w,
+            call.act,
+            call.bias,
+            call.y,
+            call.m,
+            call.n,
+            call.k,
+        )
+        .is_ok(),
         Tactic::GemmEx => {
             gemm_ex(
                 handle,
@@ -519,6 +535,9 @@ fn run_lt(
 struct Device {
     lt: LtCtx,
     heuristics: usize,
+    /// `kernel.gemm.narrow_n`: products this many columns or fewer may time
+    /// the narrow kernel.
+    narrow_n: u32,
     plans: HashMap<(i32, i32, i32), Arc<LtPlan>>,
     chosen: HashMap<u64, Tactic>,
     disk: DiskCache,
@@ -538,6 +557,7 @@ fn with_device<R>(f: impl FnOnce(&mut Device) -> R) -> R {
                     workspace_bytes: 8 * 1024 * 1024,
                 },
                 heuristics: 8,
+                narrow_n: 0,
                 plans: HashMap::new(),
                 chosen: HashMap::new(),
                 disk: DiskCache::new(),
@@ -554,10 +574,14 @@ impl Device {
     /// Lay a load's GEMM settings on this device (`kernel.gemm.workspace_mb`,
     /// `kernel.gemm.heuristics`): plans and tactics chosen under other
     /// settings are dropped, since an algorithm may need more workspace.
-    fn configure(&mut self, workspace_bytes: usize, heuristics: usize) {
-        if self.lt.workspace_bytes != workspace_bytes || self.heuristics != heuristics {
+    fn configure(&mut self, workspace_bytes: usize, heuristics: usize, narrow_n: u32) {
+        if self.lt.workspace_bytes != workspace_bytes
+            || self.heuristics != heuristics
+            || self.narrow_n != narrow_n
+        {
             self.lt.workspace_bytes = workspace_bytes;
             self.heuristics = heuristics;
+            self.narrow_n = narrow_n;
             self.plans.clear();
             self.chosen.clear();
         }
@@ -591,7 +615,12 @@ impl Device {
         call: Call,
         capturing: cudaStreamCaptureStatus,
     ) -> Option<Tactic> {
-        let key = shape_key(call, self.lt.workspace_bytes, self.heuristics);
+        let key = shape_key(
+            call,
+            self.lt.workspace_bytes,
+            self.heuristics,
+            self.narrow_n,
+        );
         if let Some(tactic) = self.chosen.get(&key) {
             return Some(*tactic);
         }
@@ -612,7 +641,7 @@ impl Device {
         if (call.m as usize) * (call.n as usize) * 2 > 256 * 1024 * 1024 {
             return None;
         }
-        let tactic = tune(handle, stream, &self.lt, plan, call);
+        let tactic = tune(handle, stream, &self.lt, plan, call, self.narrow_n);
         self.disk.store(key, tactic.encode());
         self.chosen.insert(key, tactic);
         tracing::info!(
@@ -626,13 +655,21 @@ impl Device {
     }
 }
 
-fn shape_key(call: Call, workspace_bytes: usize, heuristics: usize) -> u64 {
+fn shape_key(call: Call, workspace_bytes: usize, heuristics: usize, narrow_n: u32) -> u64 {
     let mut bytes = [0u8; 28];
     bytes[..4].copy_from_slice(&call.m.to_le_bytes());
     bytes[4..8].copy_from_slice(&call.n.to_le_bytes());
     bytes[8..12].copy_from_slice(&call.k.to_le_bytes());
     bytes[12..20].copy_from_slice(&(workspace_bytes as u64).to_le_bytes());
     bytes[20..].copy_from_slice(&(heuristics as u64).to_le_bytes());
+    // A shape the narrow kernel may serve keys apart from the one it may
+    // not; every other key is what it was.
+    if narrow_n > 0 && call.n <= narrow_n as i32 {
+        let mut wider = [0u8; 32];
+        wider[..28].copy_from_slice(&bytes);
+        wider[28..].copy_from_slice(&narrow_n.to_le_bytes());
+        return crate::source::fnv1a64(&wider);
+    }
     crate::source::fnv1a64(&bytes)
 }
 
@@ -642,6 +679,7 @@ fn tune(
     lt: &LtCtx,
     plan: Option<&LtPlan>,
     call: Call,
+    narrow_n: u32,
 ) -> Tactic {
     let mut candidates = Vec::new();
     if call.m == 1 {
@@ -651,6 +689,10 @@ fn tune(
         candidates.extend((0..plan.heuristics.len()).map(Tactic::Lt));
     }
     candidates.push(Tactic::GemmEx);
+    // Last, so a tie keeps cuBLAS.
+    if call.n <= narrow_n as i32 && call.k % 8 == 0 {
+        candidates.push(Tactic::Narrow);
+    }
 
     let mut arena = TuneArena::empty();
     if !arena.init(handle, caller_stream, lt.workspace_bytes, call) {

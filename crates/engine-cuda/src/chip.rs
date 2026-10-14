@@ -440,6 +440,7 @@ mod tests {
                 gemm_skinny_rows: kernels_cuda::tuning::Tuning::of(&family).gemm_skinny_rows,
                 selected_mma: false,
                 index_mma: false,
+                gemm_narrow_n: 0,
                 ..tuning
             },
             kernels_cuda::tuning::Tuning::of(&family),

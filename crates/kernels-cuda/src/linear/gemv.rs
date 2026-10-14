@@ -86,3 +86,50 @@ pub(crate) fn gemv_bf16(
         &values,
     )
 }
+
+/// `out[m][n] = act[m] . weight[n]` for a product at most eight columns wide,
+/// a block a row: the tactic `kernel.gemm.narrow_n` lets the GEMM tuner try.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_narrow_bf16(
+    ctx: &Ctx,
+    weight: u64,
+    act: u64,
+    bias: u64,
+    out: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), Error> {
+    const OP: &str = "linear.gemm_narrow";
+    if m <= 0 || !(1..=8).contains(&n) || k <= 0 || k % 8 != 0 {
+        return Err(refuse(
+            OP,
+            format!("needs 1..=8 columns and k in whole eights, and was handed n={n}, k={k}"),
+        ));
+    }
+    if weight == 0 || act == 0 || out == 0 || !aligned16(weight) || !aligned16(act) {
+        return Err(refuse(
+            OP,
+            "the weight and the activation are 16-byte aligned, and nothing is null",
+        ));
+    }
+    ctx.fire(
+        OP,
+        Fire::at(
+            "linear/gemv.cuh",
+            crate::jit::symbol(&format!("::pie::linear::gemm_narrow_bf16_kernel<{n}>")),
+        )
+        .apply(Launch::grid([m.unsigned_abs(), 1, 1], [256, 1, 1])),
+        &[
+            ArgValue::Ptr(weight),
+            ArgValue::Ptr(act),
+            if bias == 0 {
+                ArgValue::ABSENT
+            } else {
+                ArgValue::Ptr(bias)
+            },
+            ArgValue::Ptr(out),
+            ArgValue::I32(k),
+        ],
+    )
+}
