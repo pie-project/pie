@@ -85,6 +85,15 @@ fn metal_geometry_is_stated(opts: &MetalEngineOptions) -> Result<()> {
     Ok(())
 }
 
+/// A fire's token budget unless `[engine] max_forward_tokens` states one. On
+/// ROCm it is vLLM's MI300X default (`max_num_batched_tokens` 16384): a wave
+/// of eight 2K prompts prefills in one fire instead of two, so the first
+/// half's decodes do not wait out the second half's prefill.
+#[cfg(feature = "rocm")]
+const DEFAULT_FORWARD_TOKENS: u32 = 16384;
+#[cfg(not(feature = "rocm"))]
+const DEFAULT_FORWARD_TOKENS: u32 = 8192;
+
 #[cfg(any(feature = "cuda", feature = "rocm", test))]
 fn cuda_budgets(
     opts: &CudaNativeEngineOptions,
@@ -100,7 +109,7 @@ fn cuda_budgets(
         .max(page_size);
     engine::Budgets {
         max_lanes: opts.max_forward_requests.unwrap_or(256).max(1),
-        max_tokens: opts.max_forward_tokens.unwrap_or(8192).max(1),
+        max_tokens: opts.max_forward_tokens.unwrap_or(DEFAULT_FORWARD_TOKENS).max(1),
         buckets: Vec::new(),
         max_adapters: adapter_seats,
         page_size,
