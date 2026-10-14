@@ -88,6 +88,31 @@ pub(crate) fn take(
     region: u32,
     bytes: usize,
 ) -> Result<*mut c_void, Fault> {
+    take_as(arena, stream, owner, name, region, bytes, false)
+}
+
+/// [`take`], a slab grown zeroed: for counters a launch leaves as it found
+/// them (each fire's last block puts its tickets back to zero).
+pub(crate) fn take_zeroed(
+    arena: u32,
+    stream: *mut c_void,
+    owner: *mut c_void,
+    name: &'static str,
+    region: u32,
+    bytes: usize,
+) -> Result<*mut c_void, Fault> {
+    take_as(arena, stream, owner, name, region, bytes, true)
+}
+
+fn take_as(
+    arena: u32,
+    stream: *mut c_void,
+    owner: *mut c_void,
+    name: &'static str,
+    region: u32,
+    bytes: usize,
+    zero: bool,
+) -> Result<*mut c_void, Fault> {
     if bytes == 0 {
         return Ok(core::ptr::null_mut());
     }
@@ -109,7 +134,7 @@ pub(crate) fn take(
             need: bytes,
         });
     }
-    grow(held, name, region, scope, bytes)?;
+    grow(held, name, region, scope, bytes, zero)?;
     Ok(held.slabs[&(name, region, scope)].ptr)
 }
 
@@ -135,6 +160,7 @@ fn grow(
     region: u32,
     scope: usize,
     bytes: usize,
+    zero: bool,
 ) -> Result<(), Fault> {
     let (old_ptr, old_bytes) = arena
         .slabs
@@ -170,6 +196,16 @@ fn grow(
             call: "hipMalloc",
             code,
         });
+    }
+    if zero {
+        // SAFETY: the slab just allocated, `want` bytes long.
+        let code = unsafe { (api.hip.hipMemset)(fresh, 0, want) };
+        if code != sys::HIP_SUCCESS {
+            return Err(Fault::Device {
+                call: "hipMemset",
+                code,
+            });
+        }
     }
     if !old_ptr.is_null() {
         arena.retired.push(old_ptr);

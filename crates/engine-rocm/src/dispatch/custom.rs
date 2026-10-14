@@ -7,6 +7,7 @@ use crate::run::Run;
 impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         match op {
+            Fused::GdnStep { .. } => return self.gdn_step(op),
             Fused::QkvFusedQknormRopeVnormWrite { .. } => self.custom_cuda(op),
             Fused::MatmulGeglu { .. }
             | Fused::MlpSwiglu { .. }
@@ -34,6 +35,108 @@ impl DispatchFused for Run<'_> {
 }
 
 impl Run<'_> {
+    /// The gated-delta decode step whole where the kernel covers it, else
+    /// its primitives over the values the fused op keeps.
+    fn gdn_step(&mut self, op: &Fused) -> Result<(), KernelError> {
+        use poem_exec::{DispatchAttention, DispatchLayout};
+        let Fused::GdnStep {
+            qkvz,
+            width,
+            qkv,
+            z,
+            conv_weight,
+            conv_state,
+            conv_width,
+            dilation,
+            conv,
+            ba,
+            dt_bias,
+            a_log,
+            gates,
+            state,
+            k_heads,
+            v_heads,
+            k_dim,
+            v_dim,
+            y,
+        } = *op
+        else {
+            unreachable!("only the gated-delta step comes here");
+        };
+        if !self.rs_extended() {
+            let done = kernels_rocm::attn::ssm::gdn_step_fused(
+                self.ctx(),
+                self.tensor(qkvz),
+                self.tensor(conv_weight),
+                &self.recurrent_absolute(conv_state),
+                conv_width,
+                dilation,
+                self.tensor(ba),
+                self.tensor(dt_bias),
+                self.tensor(a_log),
+                &self.recurrent_absolute(state),
+                k_heads,
+                v_heads,
+                k_dim,
+                v_dim,
+                &mut self.tensor(qkv),
+                &mut self.tensor(z),
+                &mut self.tensor(y),
+            )
+            .map_err(crate::error::kernel)?;
+            if done {
+                self.rs_move("attention.ssm_causal_conv1d", qkv, self.tensor(qkv))
+                    .map_err(crate::error::kernel)?;
+                return self
+                    .rs_move("attention.ssm_gdn_prep", ba, self.tensor(ba))
+                    .map_err(crate::error::kernel);
+            }
+        }
+        DispatchLayout::dispatch(
+            self,
+            &poem_ir::Layout::SplitRows {
+                x: qkvz,
+                width,
+                left: qkv,
+                right: z,
+            },
+        )?;
+        DispatchAttention::dispatch(
+            self,
+            &poem_ir::Attention::SsmCausalConv1d {
+                x: qkv,
+                weight: conv_weight,
+                state: conv_state,
+                conv_width,
+                dilation,
+                y: conv,
+            },
+        )?;
+        DispatchAttention::dispatch(
+            self,
+            &poem_ir::Attention::SsmGdnPrep {
+                ba,
+                dt_bias,
+                a_log,
+                gates,
+            },
+        )?;
+        DispatchAttention::dispatch(
+            self,
+            &poem_ir::Attention::SsmGatedDelta {
+                qkv: conv,
+                z,
+                gates,
+                state,
+                k_heads,
+                v_heads,
+                k_dim,
+                v_dim,
+                y,
+            },
+        )
+    }
+
     fn custom_cuda(&mut self, op: &Fused) -> Result<(), kernels_rocm::Error> {
         match op {
             Fused::QkvFusedQknormRopeVnormWrite {

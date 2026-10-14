@@ -27,6 +27,7 @@ pub(super) fn all() -> Vec<Rule> {
         norm_modulate(),
         rmsnorm_rope_partial_q(),
         hc_norm_project(),
+        ssm_gdn_step(),
     ]
 }
 
@@ -497,5 +498,63 @@ fn hc_norm_project() -> Rule {
             stream_count: m.u32("stream_count"),
             mixes: m.value("mixes"),
         }
+    })
+}
+
+/// A gated-delta layer's decode step: the split of its in-projection, the
+/// conv update, the gate prep and the recurrence, all under one guard.
+fn ssm_gdn_step() -> Rule {
+    let pattern = template(|p| {
+        let qkvz = p.rows("qkvz", 1 << 40);
+        let (qkv, z) = layout::split_rows(&qkvz, p.u32("width"));
+        p.export("qkv", &qkv);
+        p.export("z", &z);
+        let conv_state = p.cache("conv_state");
+        let conv = attn::ssm_causal_conv1d_dilated(
+            &qkv,
+            &p.weight("conv_weight", [W, W]),
+            conv_state,
+            p.u32("conv_width"),
+            p.u32("dilation"),
+        );
+        p.name("conv", &conv);
+        let gates = attn::ssm_gdn_prep(
+            &p.rows("ba", W),
+            &p.weight("dt_bias", [W]),
+            &p.weight("a_log", [W]),
+        );
+        p.name("gates", &gates);
+        let y = attn::ssm_gated_delta(
+            &conv,
+            &z,
+            &gates,
+            p.cache("state"),
+            p.u32("k_heads"),
+            p.u32("v_heads"),
+            p.u32("k_dim"),
+            p.u32("v_dim"),
+        );
+        p.export("y", &y);
+    });
+    Rule::new("attention.ssm_gdn_step", [pattern], |m| Fused::GdnStep {
+        qkvz: m.value("qkvz"),
+        width: m.u32("width"),
+        qkv: m.value("qkv"),
+        z: m.value("z"),
+        conv_weight: m.value("conv_weight"),
+        conv_state: m.value("conv_state"),
+        conv_width: m.u32("conv_width"),
+        dilation: m.u32("dilation"),
+        conv: m.value("conv"),
+        ba: m.value("ba"),
+        dt_bias: m.value("dt_bias"),
+        a_log: m.value("a_log"),
+        gates: m.value("gates"),
+        state: m.value("state"),
+        k_heads: m.u32("k_heads"),
+        v_heads: m.u32("v_heads"),
+        k_dim: m.u32("k_dim"),
+        v_dim: m.u32("v_dim"),
+        y: m.value("y"),
     })
 }

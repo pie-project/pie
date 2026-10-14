@@ -601,6 +601,107 @@ pub fn gated_delta(
     ))
 }
 
+/// The tickets every fused step launch draws from (a key head a row).
+const STEP_TICKETS: u32 = crate::jit::TICKETS;
+
+/// A gated-delta layer's decode step whole, from the in-projections' rows:
+/// `[qkv | z] = split(qkvz)`, the conv update of `qkv`, the gate prep of
+/// `ba` and the recurrence, in one launch (`ssm_gdn_step_fused`), landing
+/// the split's halves (`qkv`, `z`) and the recurrence's f32 row `y`.
+/// `Ok(false)` where the shape is not the one it is built for (128-wide
+/// heads, a conv of at most four taps, no dilation), which leaves the step
+/// to its primitives.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_step_fused(
+    ctx: &Ctx,
+    qkvz: Tensor,
+    conv_weight: Tensor,
+    conv_state: &RecurrentPool,
+    conv_width: u32,
+    dilation: u32,
+    ba: Tensor,
+    dt_bias: Tensor,
+    a_log: Tensor,
+    state: &RecurrentPool,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qkv: &mut Tensor,
+    z: &mut Tensor,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "attention.ssm_gdn_step";
+    let channels = 2 * k_heads * k_dim + v_heads * v_dim;
+    let covered = k_dim == CHUNK_HEAD
+        && v_dim == CHUNK_HEAD
+        && k_heads > 0
+        && v_heads.is_multiple_of(k_heads)
+        && (2..=4).contains(&conv_width)
+        && dilation == 1
+        && qkvz.dtype == Dtype::Bf16
+        && ba.dtype == Dtype::Bf16
+        && dt_bias.dtype == Dtype::Bf16
+        && a_log.dtype == Dtype::F32
+        && y.dtype == Dtype::F32
+        && qkvz.width == channels + v_heads * v_dim
+        && qkv.width == channels
+        && z.width == v_heads * v_dim
+        && ba.width == 2 * v_heads
+        && u64::from(conv_weight.rows) * u64::from(conv_weight.width)
+            == u64::from(channels) * u64::from(conv_width)
+        && state.slot_stride_elems % 8 == 0
+        && state.write_state_mask.is_absent() == conv_state.write_state_mask.is_absent()
+        && conv_state.commit_len.is_absent()
+        && conv_state.begin_at.is_absent()
+        && state.commit_len.is_absent()
+        && state.begin_at.is_absent()
+        && (conv_state.write_state || !conv_state.write_state_mask.is_absent())
+        && (state.write_state || !state.write_state_mask.is_absent());
+    if !covered {
+        return Ok(false);
+    }
+    let rows = nonzero(OP, "rows", qkvz.rows)?;
+    if u64::from(rows) * u64::from(k_heads) > u64::from(STEP_TICKETS) {
+        return Ok(false);
+    }
+    let tickets = ctx.tickets(OP, STEP_TICKETS)?;
+    #[allow(clippy::cast_precision_loss)]
+    let q_scale = (k_dim as f32).sqrt().recip();
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::attn::ssm_gdn_step_fused<128, 128, 256, 4>")
+            .apply(Launch::grid([v_heads, rows, 1], [FUSED_BLOCK, 1, 1])),
+        &[
+            qkvz.arg(),
+            conv_weight.arg(),
+            conv_state.conv_slab.arg(),
+            conv_state.slot_ids.arg(),
+            conv_state.conv_stride.arg(),
+            conv_state.write_state.arg(),
+            conv_state.write_state_mask.arg(),
+            ba.arg(),
+            a_log.arg(),
+            dt_bias.arg(),
+            state.slab.arg(),
+            state.slot_ids.arg(),
+            state.slot_stride_elems.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            qkv.arg(),
+            z.arg(),
+            y.arg(),
+            ArgValue::Ptr(tickets),
+            stated(OP, k_heads)?.arg(),
+            stated(OP, v_heads)?.arg(),
+            stated(OP, conv_width)?.arg(),
+            q_scale.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    Ok(true)
+}
+
 const FUSED_BLOCK: u32 = 256;
 
 const FUSED_BV: u32 = 16;

@@ -598,6 +598,240 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_decode_rows(
     }
 }
 
+// The whole decode step of a gated-delta layer in one launch, from the
+// in-projections' rows: split [qkv | z], the causal conv's update of the
+// head's q, k and v channels, the gate prep, and the recurrence of
+// `ssm_gdn_decode_rows`, each rounding where its unfused op stores. Grid
+// (V_h, rows), block BLOCK, a block per (value head, row).
+//
+// The q and k channels of a key head are shared by its G = V_h / K_h value
+// heads, so each of their blocks convolves them; their conv window may only
+// shift once all G have read it. Each block reads, then draws a ticket
+// (`tickets[r · K_h + h_k]`, zero between launches); the block that draws
+// the last shifts the shared channels and puts the ticket back to zero.
+// Each block shifts its own value channels. `qkv` and `z` land the split's
+// halves, which the step's other readers (the replay planes, the output
+// norm) read.
+template <int KD, int VD, int BLOCK, int KMAX>
+__global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused(
+    const bf16* __restrict__ qkvz, const bf16* __restrict__ conv_w, bf16* __restrict__ conv_base,
+    const i32* __restrict__ conv_slots, long long conv_stride, bool conv_write, const u8* __restrict__ conv_mask,
+    const bf16* __restrict__ ba, const float* __restrict__ a_log, const bf16* __restrict__ dt_bias,
+    bf16* __restrict__ state_base, const i32* __restrict__ slot_ids, long long slot_stride, bool write_state,
+    const u8* __restrict__ mask, bf16* __restrict__ qkv_out, bf16* __restrict__ z_out, float* __restrict__ out,
+    int* __restrict__ tickets, int K_h, int V_h, int K, float q_scale, const u32* __restrict__ win) {
+    constexpr int WAVES = BLOCK / kWave, VEC = 8, CG = VD / VEC, RG = BLOCK / CG, Q = KD / RG;
+    constexpr int CH = 2 * KD + VD, CPT = (CH + BLOCK - 1) / BLOCK;
+    static_assert(VD % VEC == 0 && BLOCK % CG == 0 && KD % RG == 0 && kWave % CG == 0,
+                  "whole packs, whole row groups");
+    __shared__ alignas(16) float red[2][WAVES][VD];
+    __shared__ float norms[WAVES][2];
+    __shared__ float cv[CH];
+    __shared__ int last_s;
+
+    const int h = blockIdx.x, r = blockIdx.y;
+    if (win != nullptr && r >= static_cast<int>(win[0])) return;
+    const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const int slot = slot_ids[rl];
+    const int cslot = conv_slots[rl];
+    if (slot < 0 || cslot < 0) return;
+    const int tid = threadIdx.x, wave = tid / kWave, l = lane();
+    const int G = V_h / K_h;
+    const int h_k = h / G;
+    const int C = 2 * K_h * KD + V_h * VD;  // the conv's channels: [q | k | v]
+    const long long QW = static_cast<long long>(C) + static_cast<long long>(V_h) * VD;
+    const bf16* in_row = qkvz + row * QW;
+    const int span = K - 1;
+
+    // The conv over this block's channels: q and k of its key head, v of
+    // its own; every read in flight before any is used.
+    int ch[CPT];
+    float xn[CPT], hist[CPT][KMAX], wk[CPT][KMAX];
+    bf16* cstate = conv_base + static_cast<long long>(cslot) * conv_stride;
+#pragma unroll
+    for (int u = 0; u < CPT; ++u) {
+        const int ii = min(tid + u * BLOCK, CH - 1);
+        ch[u] = ii < KD       ? h_k * KD + ii
+                : ii < 2 * KD ? K_h * KD + h_k * KD + (ii - KD)
+                              : 2 * K_h * KD + h * VD + (ii - 2 * KD);
+        xn[u] = to_f32(in_row[ch[u]]);
+#pragma unroll
+        for (int k = 0; k < KMAX; ++k) {
+            wk[u][k] = k < K ? to_f32(conv_w[ch[u] * K + k]) : 0.f;
+            hist[u][k] = k + 1 <= span ? to_f32(cstate[(k + 1) * C + ch[u]]) : 0.f;
+        }
+    }
+    const bool cfold = folds_uniform(conv_write, conv_mask, rl);
+#pragma unroll
+    for (int u = 0; u < CPT; ++u) {
+        const int i = tid + u * BLOCK;
+        if (i >= CH) continue;
+        float acc = 0.f;
+#pragma unroll
+        for (int k = 0; k < KMAX - 1; ++k)
+            if (k < K - 1) acc += wk[u][k] * hist[u][k];
+        acc += wk[u][K - 1 < KMAX ? K - 1 : 0] * xn[u];
+        cv[i] = to_f32(from_f32<bf16>(silu(acc)));
+        const bool own = i >= 2 * KD;
+        if (own || h % G == 0) qkv_out[row * C + ch[u]] = from_f32<bf16>(xn[u]);
+        if (own && cfold) {
+#pragma unroll
+            for (int k = 0; k < KMAX; ++k)
+                if (k < span) cstate[k * C + ch[u]] = from_f32<bf16>(hist[u][k]);
+            cstate[span * C + ch[u]] = from_f32<bf16>(xn[u]);
+        }
+    }
+    if (tid < VD) z_out[row * (V_h * VD) + h * VD + tid] = in_row[C + h * VD + tid];
+    // The ticket, once every read of the shared window has landed.
+    __syncthreads();
+    if (tid == 0) {
+        // The last block writes only what every block has read already
+        // (the barrier), so the ticket alone orders them.
+        const int at = r * K_h + h_k;
+        const bool last = atomicAdd(&tickets[at], 1) == G - 1;
+        if (last) atomicExch(&tickets[at], 0);
+        last_s = last;
+    }
+    __syncthreads();
+    if (last_s && cfold) {
+#pragma unroll
+        for (int u = 0; u < CPT; ++u) {
+            const int i = tid + u * BLOCK;
+            if (i >= 2 * KD) continue;
+#pragma unroll
+            for (int k = 0; k < KMAX; ++k)
+                if (k < span) cstate[k * C + ch[u]] = from_f32<bf16>(hist[u][k]);
+            cstate[span * C + ch[u]] = from_f32<bf16>(xn[u]);
+        }
+    }
+
+    // The gates, as `ssm_gdn_prep_ba_gates` lands them.
+    const float bb = to_f32(ba[row * 2 * V_h + h]);
+    const float za = to_f32(ba[row * 2 * V_h + V_h + h]) + to_f32(dt_bias[h]);
+    const float softplus = za > 20.f ? za : log1pf(__expf(za));
+    const float g_log = -__expf(a_log[h]) * softplus;
+    const float beta = 1.f / (1.f + __expf(-bb));
+
+    // The recurrence, as `ssm_gdn_decode_rows` walks it.
+    const int cg = tid % CG, rg = tid / CG, j0 = cg * VEC;
+    bf16* head = state_base + static_cast<long long>(slot) * slot_stride + static_cast<long long>(h) * KD * VD;
+    u32x4 sp[Q];
+#pragma unroll
+    for (int q = 0; q < Q; ++q) sp[q] = state_load(head + (rg + RG * q) * VD + j0);
+    const bool fold = folds_uniform(write_state, mask, rl);
+    float qi[Q], ki[Q], vv[VEC];
+#pragma unroll
+    for (int q = 0; q < Q; ++q) {
+        qi[q] = cv[rg + RG * q];
+        ki[q] = cv[KD + rg + RG * q];
+    }
+#pragma unroll
+    for (int u = 0; u < VEC; ++u) vv[u] = cv[2 * KD + j0 + u];
+
+    auto lanes = [](float v) {
+#pragma unroll
+        for (int off = CG; off < kWave; off <<= 1) v += __shfl_xor(v, off, kWave);
+        return v;
+    };
+    auto column_sums = [&](float (&x)[VEC], int buf) {
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) x[u] = lanes(x[u]);
+        if (l < CG) {
+            *reinterpret_cast<f32x4*>(&red[buf][wave][j0]) = f32x4{x[0], x[1], x[2], x[3]};
+            *reinterpret_cast<f32x4*>(&red[buf][wave][j0 + 4]) = f32x4{x[4], x[5], x[6], x[7]};
+        }
+    };
+    auto column_totals = [&](float (&x)[VEC], int buf) {
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) x[u] = 0.f;
+#pragma unroll
+        for (int w = 0; w < WAVES; ++w) {
+            const f32x4 a = *reinterpret_cast<const f32x4*>(&red[buf][w][j0]);
+            const f32x4 b = *reinterpret_cast<const f32x4*>(&red[buf][w][j0 + 4]);
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                x[u] += a[u];
+                x[4 + u] += b[u];
+            }
+        }
+    };
+
+    f32x2 x2[VEC / 2];
+#pragma unroll
+    for (int w = 0; w < VEC / 2; ++w) x2[w] = f32x2{0.f, 0.f};
+    float qq = 0.f, kk = 0.f;
+#pragma unroll
+    for (int q = 0; q < Q; ++q) {
+        qq += qi[q] * qi[q];
+        kk += ki[q] * ki[q];
+        const f32x2 k2 = {ki[q], ki[q]};
+#pragma unroll
+        for (int w = 0; w < VEC / 2; ++w)
+            x2[w] = __builtin_elementwise_fma(f32x2{bf16_lo(sp[q][w]), bf16_hi(sp[q][w])}, k2, x2[w]);
+    }
+#pragma unroll
+    for (int q = 0; q < Q; ++q) asm volatile("" : "+v"(sp[q]));
+    float x[VEC];
+#pragma unroll
+    for (int w = 0; w < VEC / 2; ++w) {
+        x[2 * w] = x2[w].x;
+        x[2 * w + 1] = x2[w].y;
+    }
+    column_sums(x, 0);
+    qq = lanes(qq);
+    kk = lanes(kk);
+    if (l == 0) {
+        norms[wave][0] = qq;
+        norms[wave][1] = kk;
+    }
+    lds_barrier();
+    column_totals(x, 0);
+    float qn = 0.f, kn = 0.f;
+#pragma unroll
+    for (int w = 0; w < WAVES; ++w) {
+        qn += norms[w][0];
+        kn += norms[w][1];
+    }
+    const float g = __expf(g_log);
+    const float rk = rsqrtf(kn + 1e-6f), rq = rsqrtf(qn + 1e-6f) * q_scale;
+
+    f32x2 d2[VEC / 2];
+#pragma unroll
+    for (int w = 0; w < VEC / 2; ++w) {
+        d2[w] = f32x2{(vv[2 * w] - x[2 * w] * (g * rk)) * beta, (vv[2 * w + 1] - x[2 * w + 1] * (g * rk)) * beta};
+        x2[w] = f32x2{0.f, 0.f};
+    }
+    const f32x2 g2 = {g, g};
+#pragma unroll
+    for (int q = 0; q < Q; ++q) {
+        const float kh = ki[q] * rk;
+        const f32x2 k2 = {kh, kh}, q2 = {qi[q], qi[q]};
+        u32x4 st;
+#pragma unroll
+        for (int w = 0; w < VEC / 2; ++w) {
+            const f32x2 dec = f32x2{bf16_lo(sp[q][w]), bf16_hi(sp[q][w])} * g2;
+            const f32x2 next = __builtin_elementwise_fma(k2, d2[w], f32x2{bf16_round(dec.x), bf16_round(dec.y)});
+            st[w] = bf16_pack_rne(next.x, next.y);
+            x2[w] = __builtin_elementwise_fma(next, q2, x2[w]);
+        }
+        if (fold) state_store(head + (rg + RG * q) * VD + j0, st);
+    }
+#pragma unroll
+    for (int w = 0; w < VEC / 2; ++w) {
+        x[2 * w] = x2[w].x;
+        x[2 * w + 1] = x2[w].y;
+    }
+    column_sums(x, 1);
+    lds_barrier();
+    if (tid < CG) {
+        column_totals(x, 1);
+        float* o = out + (row * V_h + h) * VD + j0;
+        *reinterpret_cast<f32x4*>(o) = f32x4{x[0] * rq, x[1] * rq, x[2] * rq, x[3] * rq};
+        *reinterpret_cast<f32x4*>(o + 4) = f32x4{x[4] * rq, x[5] * rq, x[6] * rq, x[7] * rq};
+    }
+}
+
 // ---------------------------------------------------- prefill (sequential) --
 
 // The recurrence over each request's rows, token by token, from the staged

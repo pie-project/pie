@@ -842,6 +842,12 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             } => &[(In(4), I32)],
             Fused::RmsnormRopePartialQ { .. } => &[(In(2), I32)],
             Fused::HcNormProject { .. } => &[(In(1), F32), (Out(0), F32)],
+            Fused::GdnStep { .. } => &[
+                (In(2), CACHE),
+                (In(6), CACHE),
+                (Out(3), F32),
+                (Out(4), F32),
+            ],
             Fused::EmbedScaleAdd { .. } | Fused::EmbedScaleAddSelect { .. } => &[(In(0), I32)],
             Fused::QkvFusedQknormRopeVnormWrite { .. } => {
                 &[(In(1), I32), (In(4), CACHE), (In(5), I32), (In(6), I32)]

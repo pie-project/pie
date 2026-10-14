@@ -13,7 +13,7 @@ pub mod hiprtc;
 mod root;
 
 pub use abi::{Arg, ArgValue};
-pub use ctx::{Ctx, Fire, Launch, Pad, Slabs};
+pub use ctx::{Ctx, Fire, Launch, Pad, Slabs, TICKETS};
 pub use root::Root;
 
 use crate::error::Error;

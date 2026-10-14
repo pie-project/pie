@@ -161,6 +161,10 @@ impl Pad {
 
 pub const NO_REGION: u32 = u32::MAX;
 
+/// The tickets a stream holds ([`Ctx::tickets`]): every launch that draws
+/// them asks for this many, so the slab never grows past its warm size.
+pub const TICKETS: u32 = 1 << 16;
+
 #[cfg(feature = "rocm")]
 pub const SHARED_REGION: u32 = u32::MAX - 1;
 
@@ -335,6 +339,36 @@ impl Ctx {
         #[cfg(not(feature = "rocm"))]
         {
             let _ = (name, bytes);
+            Err(crate::jit::runtimeless(op))
+        }
+    }
+
+    /// [`Ctx::tickets`] taken now, at the size every launch draws, so no
+    /// capture has to grow them: a load arms bodies before any eager fire.
+    pub fn warm_tickets(&self) -> Result<(), Error> {
+        self.tickets("pie.tickets", TICKETS).map(|_| ())
+    }
+
+    /// `count` i32 tickets, zero when first handed out, one slab a stream:
+    /// a launch that draws them puts every one back to zero before it ends
+    /// (its last block), so the next launch on the stream finds them zero.
+    pub fn tickets(&self, op: &'static str, count: u32) -> Result<u64, Error> {
+        #[cfg(feature = "rocm")]
+        {
+            crate::jit::device::take_zeroed(
+                self.slabs.0,
+                self.stream,
+                self.owner,
+                "pie.tickets",
+                NO_REGION,
+                count as usize * 4,
+            )
+            .map(|p| p as u64)
+            .map_err(|fault| fault.at(op))
+        }
+        #[cfg(not(feature = "rocm"))]
+        {
+            let _ = count;
             Err(crate::jit::runtimeless(op))
         }
     }

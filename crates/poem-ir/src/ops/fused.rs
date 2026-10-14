@@ -110,6 +110,32 @@ pub enum Fused {
         stream_count: u32,
         mixes: ValueId,
     },
+    /// A gated-delta layer's decode step from its in-projections' rows: the
+    /// split of `qkvz` at `width` into `qkv` and `z`, the causal conv update
+    /// of `qkv` into `conv`, the gate prep of `ba` into `gates`, and the
+    /// recurrence into `y`. Every intermediate keeps its value, so a backend
+    /// that cannot take the step whole runs the primitives over them.
+    GdnStep {
+        qkvz: ValueId,
+        width: u32,
+        qkv: ValueId,
+        z: ValueId,
+        conv_weight: ValueId,
+        conv_state: ValueId,
+        conv_width: u32,
+        dilation: u32,
+        conv: ValueId,
+        ba: ValueId,
+        dt_bias: ValueId,
+        a_log: ValueId,
+        gates: ValueId,
+        state: ValueId,
+        k_heads: u32,
+        v_heads: u32,
+        k_dim: u32,
+        v_dim: u32,
+        y: ValueId,
+    },
     MatmulGeglu {
         act: ValueId,
         w: ValueId,
@@ -214,6 +240,24 @@ impl Operands for Fused {
             Self::HcNormProject {
                 streams, weight, ..
             } => sink.extend([*streams, *weight]),
+            Self::GdnStep {
+                qkvz,
+                conv_weight,
+                conv_state,
+                ba,
+                dt_bias,
+                a_log,
+                state,
+                ..
+            } => sink.extend([
+                *qkvz,
+                *conv_weight,
+                *conv_state,
+                *ba,
+                *dt_bias,
+                *a_log,
+                *state,
+            ]),
             Self::MatmulGeglu { act, w, .. } | Self::LmHeadSoftcap { act, w, .. } => {
                 sink.extend([*act, *w]);
             }
@@ -283,6 +327,14 @@ impl Operands for Fused {
                 sink.extend([*r_out, *normed, *out]);
             }
             Self::HcNormProject { mixes, .. } => sink.push(*mixes),
+            Self::GdnStep {
+                qkv,
+                z,
+                conv,
+                gates,
+                y,
+                ..
+            } => sink.extend([*qkv, *z, *conv, *gates, *y]),
             Self::MatmulGeglu { packed, y, .. } => sink.extend([*packed, *y]),
             Self::MlpSwiglu { packed, h, y, .. } => sink.extend([*packed, *h, *y]),
             Self::LmHeadSoftcap { y, y_out, .. } => sink.extend([*y, *y_out]),
@@ -303,6 +355,7 @@ impl Operands for Fused {
                 sink.push((*y_out, *y));
             }
             Self::HcNormProject { .. }
+            | Self::GdnStep { .. }
             | Self::MatmulGeglu { .. }
             | Self::MlpSwiglu { .. }
             | Self::QkvFusedQknormRopeVnormWrite { .. } => {}
@@ -320,6 +373,7 @@ impl Operands for Fused {
             Self::NormModulate { .. } => "elementwise.norm_modulate",
             Self::GatedResidualNormModulate { .. } => "elementwise.gated_residual_norm_modulate",
             Self::HcNormProject { .. } => "elementwise.hc_norm_project",
+            Self::GdnStep { .. } => "attention.ssm_gdn_step",
             Self::MatmulGeglu { .. } => "linear.matmul_geglu",
             Self::MlpSwiglu { .. } => "linear.mlp_swiglu",
             Self::LmHeadSoftcap { .. } => "linear.lm_head_softcap",

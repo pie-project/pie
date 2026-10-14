@@ -214,3 +214,66 @@ fn an_mhc_norm_read_elsewhere_stays_written() {
         ]
     );
 }
+
+/// One gated-delta decode step (one key head, two value heads of 128), the
+/// conv's output handed to `read` as well when it is given.
+fn gdn_step(p: &Pattern, read_conv: bool) -> poem::Value {
+    let qkvz = p.rows("qkvz", 6 * 128);
+    let (qkv, z) = layout::split_rows(&qkvz, 4 * 128);
+    let conv = attn::ssm_causal_conv1d(
+        &qkv,
+        &p.weight("conv", [4 * 128, 4]),
+        p.cache("conv_state"),
+        4,
+    );
+    let gates = attn::ssm_gdn_prep(
+        &p.rows("ba", 4),
+        &p.weight("dt_bias", [2]),
+        &p.weight("a_log", [2]),
+    );
+    let y = attn::ssm_gated_delta(&conv, &z, &gates, p.cache("state"), 1, 2, 128, 128);
+    if read_conv {
+        elemwise::silu(&conv);
+    }
+    y
+}
+
+#[test]
+fn a_gated_delta_step_folds_into_one_launch() {
+    let fused = fuse(
+        trace(|p| {
+            elemwise::silu(&gdn_step(p, false));
+        }),
+        &["attention.ssm_gdn_step"],
+    );
+    assert_eq!(ops(&fused), ["attention.ssm_gdn_step", "elementwise.silu"]);
+    let Some(poem_ir::Operation::Fused(poem_ir::Fused::GdnStep {
+        width,
+        conv_width,
+        k_heads,
+        v_heads,
+        ..
+    })) = fused.nodes.first().map(|node| &node.op)
+    else {
+        panic!("the op is the fused step");
+    };
+    assert_eq!((*width, *conv_width, *k_heads, *v_heads), (512, 4, 1, 2));
+}
+
+#[test]
+fn a_gated_delta_step_whose_conv_is_read_elsewhere_stays_apart() {
+    let fused = fuse(
+        trace(|p| drop(gdn_step(p, true))),
+        &["attention.ssm_gdn_step"],
+    );
+    assert_eq!(
+        ops(&fused),
+        [
+            "layout.split_rows",
+            "attention.ssm_causal_conv1d",
+            "attention.ssm_gdn_prep",
+            "attention.ssm_gated_delta",
+            "elementwise.silu"
+        ]
+    );
+}

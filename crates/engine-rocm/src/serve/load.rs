@@ -903,6 +903,16 @@ impl Shell {
             })?;
             decoded = decoded.saturating_add(tile);
         }
+        // The tickets the fused launches draw, taken on every stream now:
+        // the bodies armed at load capture before any eager fire.
+        for ctx in core::iter::once(shell.device.ctx())
+            .chain(shell.device.side_ctx())
+            .chain(shell.device.conditional_ctx())
+        {
+            ctx.warm_tickets().map_err(|why| {
+                Fault::Residency(format!("the fused launches' tickets would not allocate ({why})"))
+            })?;
+        }
         let held_for_fires = programs;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
