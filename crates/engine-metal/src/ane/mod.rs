@@ -171,7 +171,10 @@ mod tests {
 
     #[test]
     fn a_routed_model_keeps_its_prompt_on_the_gpu() {
-        assert!(routes("qwen36-35b-a3b-u4g64-kv-bf16"), "Qwen3.6-35B-A3B routes its tokens");
+        assert!(
+            routes("qwen36-35b-a3b-u4g64-kv-bf16"),
+            "Qwen3.6-35B-A3B routes its tokens"
+        );
         assert!(!routes("qwen38-27b-u4g64-kv-bf16"), "Qwen3.8-27B is dense");
     }
 }
