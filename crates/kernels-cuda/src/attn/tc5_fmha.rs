@@ -58,6 +58,7 @@ pub(crate) fn try_prefill(
     q: RaggedTensor,
     plan: &PrefillPlan,
     pool: &KvPool,
+    window_left: i32,
     head_dim: u32,
     sm_scale: f32,
     o: &Tensor,
@@ -68,7 +69,10 @@ pub(crate) fn try_prefill(
     let requests = shape.num_requests;
     let page = u32::try_from(pool.page_size).unwrap_or(0);
     let (bkv, stages) = tiling(head_dim);
-    let fits = supported()
+    // The profile's decision (`kernel.sdpa.prefill.tc5`, on for sm_100)
+    // and the device's capability both: elsewhere FA2 serves as before.
+    let fits = ctx.tuning().prefill_tc5
+        && supported()
         && matches!(head_dim, 64 | 128 | 256)
         && requests > 0
         && kv::native_bf16(pool)
@@ -126,9 +130,9 @@ pub(crate) fn try_prefill(
         page: int(page),
         scale_log2: sm_scale_or_default(sm_scale, head_dim) * core::f32::consts::LOG2_E,
         causal: i32::from(plan.causal),
-        window_left: plan
-            .window
-            .map_or(-1, |w| i32::try_from(w).unwrap_or(i32::MAX) - 1),
+        // The op's window, as FA2 reads it: a plan may serve layers of
+        // several windows (Gemma's sliding and global layers share one).
+        window_left,
     };
     // Every request's tiles, rounded up a tile each.
     let bound = (rows * group).div_ceil(128) + requests;

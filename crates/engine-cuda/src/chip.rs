@@ -321,6 +321,18 @@ mod tests {
             assert!(report.untuned(), "{gpu}");
             assert_eq!(Engine::of(&profile), Engine::of(&registry().defaults()));
             let tuning = kernels_cuda::tuning::Tuning::of(&profile);
+            // sm_100 alone runs the tcgen05 prefill and reads a wide
+            // group's single-token rows through the prefill kernel; every
+            // other chip keeps FA2 and the decode kernel.
+            assert_eq!(
+                (tuning.prefill_tc5, tuning.decode_grouped_prefill_from),
+                if (major, minor) == (10, 0) {
+                    (true, 4)
+                } else {
+                    (false, 0)
+                },
+                "{gpu}"
+            );
             if major >= 10 {
                 assert!(tuning.gemv_narrow && tuning.mla_naive, "{gpu}");
                 // B200 alone also runs the tcgen05 selects and GLU epilogues.
@@ -340,6 +352,8 @@ mod tests {
                         ssm_gdn_fused_scan: false,
                         mxfp4_mma_until: defaults.mxfp4_mma_until,
                         mxfp4_mma_from: defaults.mxfp4_mma_from,
+                        prefill_tc5: false,
+                        decode_grouped_prefill_from: 0,
                         ..tuning
                     },
                     defaults,

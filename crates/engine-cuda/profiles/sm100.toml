@@ -22,3 +22,12 @@ ssm.gdn_fused_scan = true
 # tcgen05 GEMM; past 1024 routes the GEMM's reuse wins.
 moe.mxfp4_mma_from  = 64
 moe.mxfp4_mma_until = 1024
+# The tcgen05 prefill FMHA (sm_100a): a causal 4096-token prefill at
+# Qwen3.8-27B's 256-wide, six-way-grouped head runs at about 900 TFLOPS
+# where FA2 runs at about 300.
+sdpa.prefill.tc5 = true
+# A single-token row of a four-way or wider head group reads the cache
+# through the prefill kernel, whose tensor cores take the group's rows as
+# one tile: Qwen3.8-27B's 64-row decode step spends 0.64 ms in attention
+# where the decode kernel spends 1.62.
+sdpa.decode.grouped_prefill_from = 4

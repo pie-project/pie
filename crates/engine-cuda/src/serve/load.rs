@@ -61,6 +61,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         kernels.retain(|kernel| crate::UNCHAINED.contains(kernel));
     }
     boot.trace = poem_compiler::fuse::fuse(boot.trace.clone(), &kernels);
+    boot.trace = crate::grouped_decode::rewrite(
+        boot.trace.clone(),
+        kernels_cuda::tuning::Tuning::of(&chip).decode_grouped_prefill_from,
+    );
     if boot.knobs.diagnostics.trace_census {
         let mut census: std::collections::BTreeMap<&'static str, usize> =
             std::collections::BTreeMap::new();

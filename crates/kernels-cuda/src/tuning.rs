@@ -185,6 +185,19 @@ pub struct MoeAffineGroupedFrom(pub u32);
 #[decision(id = "kernel.ssm.gdn_fused_scan", flag, default = false, tune = search)]
 pub struct SsmGdnFusedScan;
 
+/// Whether a prefill the tcgen05 FMHA (`attn/tc5_fmha.cuh`, sm_100a) can
+/// serve runs on it; off, FA2 serves every prefill, as before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.prefill.tc5", flag, default = false, tune = search)]
+pub struct PrefillTc5;
+
+/// The fewest query heads to a KV head at which a single-token row reads
+/// the cache through the prefill kernel (tensor cores over the group's
+/// rows) instead of the decode kernel; 0 never does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.grouped_prefill_from", constant(range(0..=64)), default = 0, tune = search)]
+pub struct DecodeGroupedPrefillFrom(pub u32);
+
 pub fn register(registry: &mut Registry) {
     registry
         .add::<MoeGrouped>()
@@ -216,7 +229,9 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmTc5GluFrom>()
         .add::<SsmGdnFusedScan>()
         .add::<MoeMxfp4MmaUntil>()
-        .add::<MoeMxfp4MmaFrom>();
+        .add::<MoeMxfp4MmaFrom>()
+        .add::<PrefillTc5>()
+        .add::<DecodeGroupedPrefillFrom>();
 }
 
 /// The kernel decisions one load runs under, read once from its profile.
@@ -254,6 +269,8 @@ pub struct Tuning {
     pub ssm_gdn_fused_scan: bool,
     pub mxfp4_mma_until: u32,
     pub mxfp4_mma_from: u32,
+    pub prefill_tc5: bool,
+    pub decode_grouped_prefill_from: u32,
 }
 
 impl Tuning {
@@ -289,6 +306,8 @@ impl Tuning {
         ssm_gdn_fused_scan: false,
         mxfp4_mma_until: 0,
         mxfp4_mma_from: 64,
+        prefill_tc5: false,
+        decode_grouped_prefill_from: 0,
     };
 
     #[must_use]
@@ -324,6 +343,8 @@ impl Tuning {
             ssm_gdn_fused_scan: profile.on::<SsmGdnFusedScan>(&Anywhere),
             mxfp4_mma_until: profile.get::<MoeMxfp4MmaUntil>().0,
             mxfp4_mma_from: profile.get::<MoeMxfp4MmaFrom>().0,
+            prefill_tc5: profile.on::<PrefillTc5>(&Anywhere),
+            decode_grouped_prefill_from: profile.get::<DecodeGroupedPrefillFrom>().0,
         }
     }
 }

@@ -175,7 +175,16 @@ fn every_probe_is_dumped() {
             }),
         ordinal: 0,
         knobs: Knobs {
-            chip: Some(engine_cuda::chip::pinned(Graphs::Off, None)),
+            // Eager, at the registry defaults; `PIE_PARITY_KERNEL` adds
+            // `[kernel]` decisions (a chip profile's, `;`-separated) to
+            // read under.
+            chip: Some(match std::env::var("PIE_PARITY_KERNEL") {
+                Ok(kernel) => engine_cuda::chip::profile(&format!(
+                    "[engine]\ngraphs = \"off\"\n[kernel]\n{}\n",
+                    kernel.replace(';', "\n")
+                )),
+                Err(_) => engine_cuda::chip::pinned(Graphs::Off, None),
+            }),
             ..Knobs::default()
         },
         cache_dir: None,

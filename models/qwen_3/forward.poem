@@ -118,12 +118,9 @@ def forward(m, inputs):
     dr = m.dflash
     trunk_inputs = inputs.on(~block_rows(dr)) if dr != None else inputs
     ([input_m, input_s, input_d], input_p) = trunk_inputs.partition([fact.has(fact.Mask), fact.scores(), fact.single_token()])
-    # A single-token row with a wide head group reads its cache through the
-    # prefill kernel, whose tensor cores take the group's rows as one tile.
-    plan_d = ops.attn.plan_prefill if grouped_decode(m) else ops.attn.plan_decode
     plans = struct(
         m = ops.attn.plan_prefill(input_m, m.q_heads, m.kv_heads, m.head_dim, None),
-        d = plan_d(input_d, m.q_heads, m.kv_heads, m.head_dim, None),
+        d = ops.attn.plan_decode(input_d, m.q_heads, m.kv_heads, m.head_dim, None),
         p = ops.attn.plan_prefill(input_p, m.q_heads, m.kv_heads, m.head_dim, None),
         s = ops.attn.plan_prefill(input_s, m.q_heads, m.kv_heads, m.head_dim, None),
     )
@@ -227,9 +224,6 @@ def rotate(q, k, inputs, m, a):
     vision = m.tower != None
     return rope(q, k, positions(inputs, vision), vision, a.rotary_dim, m.head_dim, a.theta)
 
-def grouped_decode(m):
-    return m.q_heads // m.kv_heads >= 4
-
 def attn_mixer(x, inputs, m, plans, mask, a):
     pages = inputs.kv(a.kv)
     write_page = inputs.write_page(a.kv)
@@ -262,7 +256,7 @@ def attn_mixer(x, inputs, m, plans, mask, a):
     o = switch(q, [
         (fact.has(fact.Mask), lambda q: ops.attn.masked(q, plans.m, mask, pages, None, d, m.kv_heads, True, a.sm_scale)),
         (fact.scores(), scored),
-        (fact.single_token(), lambda q: ops.attn.prefill(q, plans.d, pages, None, d, m.kv_heads, a.sm_scale) if grouped_decode(m) else ops.attn.decode(q, plans.d, pages, None, d, a.sm_scale)),
+        (fact.single_token(), lambda q: ops.attn.decode(q, plans.d, pages, None, d, a.sm_scale)),
     ], otherwise = lambda q: ops.attn.prefill(q, plans.p, pages, None, d, m.kv_heads, a.sm_scale))
     seam.at(seam.ATTN_OUT, [o])
     if m.rotate_kv:

@@ -24,6 +24,8 @@ struct Case {
     requests: &'static [(usize, usize)],
     /// A sliding window: the keys a row reads, its own included.
     window: Option<u32>,
+    /// The softmax scale; `None` is 1/sqrt(head_dim).
+    scale: Option<f32>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -59,7 +61,11 @@ fn check(case: &Case) {
     let (v_raw, v) = lcg.row(cells * kvh * d);
 
     let mut gpu = Gpu::open();
-    let ctx = gpu.ctx();
+    // sm_100's profile decision; off, `attention.prefill` is FA2's.
+    let ctx = gpu.ctx().with_tuning(Tuning {
+        prefill_tc5: true,
+        ..Tuning::DEFAULT
+    });
     let Some(device) = Device::probe(&ctx) else {
         eprintln!("skipped: the device would not say its shape");
         return;
@@ -142,7 +148,7 @@ fn check(case: &Case) {
         data: Tensor::new(q_at, rows as u32, (qh * d) as u32, Dtype::Bf16),
         indptr: Tensor::new(qo_at, n + 1, 1, Dtype::I32),
     };
-    let sm_scale = 1.0 / (d as f32).sqrt();
+    let sm_scale = case.scale.unwrap_or(1.0 / (d as f32).sqrt());
     let mut o = Tensor::new(o_tc, rows as u32, (qh * d) as u32, Dtype::Bf16);
     attn::prefill(
         &ctx,
@@ -171,9 +177,26 @@ fn check(case: &Case) {
         &mut lse_t,
     )
     .expect("the FA2 prefill fires");
+    // The decision off, `attention.prefill` is FA2's, bit for bit.
+    let o_off = gpu.zeros(rows * qh * d * 2);
+    let mut o3 = Tensor::new(o_off, rows as u32, (qh * d) as u32, Dtype::Bf16);
+    attn::prefill(
+        &ctx.with_tuning(Tuning::DEFAULT),
+        q_t,
+        &built,
+        &pool,
+        case.window,
+        d as u32,
+        kvh as u32,
+        sm_scale,
+        &mut o3,
+    )
+    .expect("the FA2 prefill fires");
     gpu.sync();
     let got: Vec<u16> = gpu.down(o_tc, rows * qh * d);
     let fa2: Vec<u16> = gpu.down(o_fa, rows * qh * d);
+    let off: Vec<u16> = gpu.down(o_off, rows * qh * d);
+    assert_eq!(off, fa2, "with the decision off the prefill is FA2's");
 
     let mut worst_ref = 0f32;
     let mut worst_fa2 = 0f32;
@@ -228,6 +251,7 @@ fn the_tcgen05_prefill_answers_fa2_and_the_reference() {
         group: 4,
         requests: &[(70, 0), (33, 17), (200, 40), (129, 0)],
         window: None,
+        scale: None,
     });
     check(&Case {
         head_dim: 256,
@@ -235,6 +259,7 @@ fn the_tcgen05_prefill_answers_fa2_and_the_reference() {
         group: 6,
         requests: &[(70, 0), (65, 33), (200, 17)],
         window: None,
+        scale: None,
     });
     check(&Case {
         head_dim: 256,
@@ -242,6 +267,18 @@ fn the_tcgen05_prefill_answers_fa2_and_the_reference() {
         group: 2,
         requests: &[(300, 0), (90, 120)],
         window: Some(100),
+        scale: None,
+    });
+    // Gemma-4-31B's sliding layers: a 1024-key window over a 256-wide head
+    // of two query heads a KV head, at a unit scale (its queries and keys
+    // are normed), so scores run far past a 1/sqrt(d) head's.
+    check(&Case {
+        head_dim: 256,
+        kv_heads: 2,
+        group: 2,
+        requests: &[(329, 0), (1300, 0)],
+        window: Some(1024),
+        scale: Some(1.0),
     });
     // Long enough that most key tiles are whole to every row of a block,
     // their pages one falling run: one box an atom of the head.
@@ -251,6 +288,7 @@ fn the_tcgen05_prefill_answers_fa2_and_the_reference() {
         group: 4,
         requests: &[(600, 0), (200, 300)],
         window: None,
+        scale: None,
     });
     check(&Case {
         head_dim: 256,
@@ -258,6 +296,7 @@ fn the_tcgen05_prefill_answers_fa2_and_the_reference() {
         group: 6,
         requests: &[(500, 0)],
         window: None,
+        scale: None,
     });
     check(&Case {
         head_dim: 64,
@@ -265,6 +304,7 @@ fn the_tcgen05_prefill_answers_fa2_and_the_reference() {
         group: 1,
         requests: &[(150, 0), (90, 12)],
         window: None,
+        scale: None,
     });
 }
 
@@ -285,7 +325,11 @@ fn the_tcgen05_prefill_reports_its_rate_beside_fa2() {
     use kernels_cuda::cudarc::runtime::sys as rt;
 
     let mut gpu = Gpu::open();
-    let ctx = gpu.ctx();
+    // sm_100's profile decision; off, `attention.prefill` is FA2's.
+    let ctx = gpu.ctx().with_tuning(Tuning {
+        prefill_tc5: true,
+        ..Tuning::DEFAULT
+    });
     let Some(device) = Device::probe(&ctx) else {
         eprintln!("skipped: the device would not say its shape");
         return;

@@ -245,7 +245,7 @@ fn fa2_prefill(
     if lse.is_none()
         && mask.is_none()
         && rel.is_none()
-        && tc5_fmha::try_prefill(ctx, op, q, plan, pool, head_dim, sm_scale, o)?
+        && tc5_fmha::try_prefill(ctx, op, q, plan, pool, window_left, head_dim, sm_scale, o)?
     {
         return Ok(());
     }

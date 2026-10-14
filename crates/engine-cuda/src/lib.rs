@@ -12,6 +12,7 @@ mod error;
 pub mod experts;
 pub mod exports;
 pub mod group;
+pub mod grouped_decode;
 pub mod inputs;
 pub mod mask;
 pub mod program;

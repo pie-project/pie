@@ -361,20 +361,38 @@ mod tests {
             .flatten()
             .map(|schedule| schedule.kind)
             .collect();
-        // Four query heads to a KV head read single-token rows through the
-        // prefill kernel: every schedule qwen3.5 carves is a prefill one,
-        // the single-token rows' among them.
         assert!(
-            kinds
+            kinds.contains(&StructKind::AttnDecodePlan),
+            "qwen3.5 carves a decode schedule: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&StructKind::AttnPrefillPlan),
+            "and prefill ones: {kinds:?}"
+        );
+
+        // Where the profile reads single-token rows of a four-way group
+        // through the prefill kernel (sm_100), every schedule is a prefill
+        // one, the single-token rows' among them; off (every other chip),
+        // the trace is the one it was.
+        assert_eq!(crate::grouped_decode::rewrite(plan.clone(), 0), plan);
+        assert_eq!(crate::grouped_decode::rewrite(plan.clone(), 5), plan);
+        let grouped = probe(&crate::grouped_decode::rewrite(plan.clone(), 4))
+            .expect("the rewritten trace's caches read");
+        let regrouped: Vec<StructKind> = grouped
+            .plans
+            .iter()
+            .flatten()
+            .map(|schedule| schedule.kind)
+            .collect();
+        assert_eq!(regrouped.len(), kinds.len(), "{regrouped:?}");
+        assert!(
+            regrouped
                 .iter()
                 .all(|kind| *kind == StructKind::AttnPrefillPlan),
-            "qwen3.5 carves prefill schedules alone: {kinds:?}"
+            "the single-token rows plan as a prefill: {regrouped:?}"
         );
-        assert_eq!(
-            kinds.len(),
-            4,
-            "the masked, scored, single-token and prefill rows' schedules: {kinds:?}"
-        );
+        poem_ir::check(&crate::grouped_decode::rewrite(plan.clone(), 4))
+            .expect("the rewritten trace types");
 
         let states = plan
             .caches
