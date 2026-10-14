@@ -456,6 +456,74 @@ __global__ void rmsnorm_gated_f32_in(
     }
 }
 
+// The gated norm one warp per (row, head) when the normed width is `32 *
+// PER`: a lane carries `PER` consecutive values, so the sum of squares is
+// one butterfly and no block barrier; a block is eight such rows.
+template <class T, int PER>
+__global__ void __launch_bounds__(256) rmsnorm_gated_f32_in_warp(
+    const float* __restrict__ x,
+    const T* __restrict__ gate,
+    const float* __restrict__ weight,
+    T* __restrict__ y,
+    int units,
+    float eps,
+    int sigmoid_gate,
+    int heads,
+    const u32* __restrict__ win)
+{
+    static_assert(PER == 4 || PER == 8, "a lane's gate run is one 8- or 16-byte load");
+    constexpr int hidden = 32 * PER;
+    const int unit = static_cast<int>(blockIdx.x) * 8 + static_cast<int>(threadIdx.x >> 5);
+    if (unit >= units) return;
+    if (win != nullptr && unit / heads >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? unit + static_cast<int>(win[1]) * heads : unit;
+    const int lane = threadIdx.x & 31;
+    const long long at = static_cast<long long>(plane_row) * hidden + lane * PER;
+
+    float xv[PER];
+    float wv[PER];
+    T gv[PER];
+    #pragma unroll
+    for (int q = 0; q < PER / 4; ++q) {
+        const float4 xf = reinterpret_cast<const float4*>(x + at)[q];
+        const float4 wf = reinterpret_cast<const float4*>(weight + lane * PER)[q];
+        xv[4 * q] = xf.x;
+        xv[4 * q + 1] = xf.y;
+        xv[4 * q + 2] = xf.z;
+        xv[4 * q + 3] = xf.w;
+        wv[4 * q] = wf.x;
+        wv[4 * q + 1] = wf.y;
+        wv[4 * q + 2] = wf.z;
+        wv[4 * q + 3] = wf.w;
+    }
+    if constexpr (PER == 4) {
+        *reinterpret_cast<uint2*>(gv) = *reinterpret_cast<const uint2*>(gate + at);
+    } else {
+        *reinterpret_cast<uint4*>(gv) = *reinterpret_cast<const uint4*>(gate + at);
+    }
+    float local = 0.f;
+    #pragma unroll
+    for (int u = 0; u < PER; ++u) local += xv[u] * xv[u];
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) local += __shfl_xor_sync(0xffffffffu, local, off);
+    const float inv_rms = rsqrtf(local / static_cast<float>(hidden) + eps);
+
+    T out[PER];
+    #pragma unroll
+    for (int u = 0; u < PER; ++u) {
+        const float g = Elem<T>::to_f32(gv[u]);
+        const float sg = sigmoid_gate
+            ? 1.f / (1.f + __expf(-g))
+            : g / (1.f + __expf(-g));
+        out[u] = Elem<T>::from_f32(wv[u] * (xv[u] * inv_rms) * sg);
+    }
+    if constexpr (PER == 4) {
+        *reinterpret_cast<uint2*>(y + at) = *reinterpret_cast<const uint2*>(out);
+    } else {
+        *reinterpret_cast<uint4*>(y + at) = *reinterpret_cast<const uint4*>(out);
+    }
+}
+
 template <class T, int BLOCK, int PER_THREAD, bool SCALE, bool POST, bool POST_PLUS_ONE>
 __global__ void rmsnorm_residual_add(
     const T* __restrict__ x,

@@ -258,6 +258,47 @@ pub fn rmsnorm_gated(
     )?;
     let launch = rows_per_head(OP, y.rows, y.width, head_dim)?;
     let heads = stated(OP, per_head_split(y.width, head_dim))?;
+    let width = if head_dim == 0 { y.width } else { head_dim };
+    let aligned = [x.ptr, gate.ptr, weight.ptr, y.ptr]
+        .iter()
+        .all(|&at| aligned16(at));
+    if aligned && (width == 128 || width == 256) {
+        let units = y
+            .rows
+            .checked_mul(per_head_split(y.width, head_dim))
+            .ok_or_else(|| {
+                refuse(
+                    OP,
+                    format!(
+                        "{} rows of {} heads overflow a grid",
+                        y.rows,
+                        y.width / width
+                    ),
+                )
+            })?;
+        return ctx.fire(
+            OP,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::elemwise::rmsnorm_gated_f32_in_warp<{t}, {}>",
+                    width / 32
+                )),
+            )
+            .apply(Launch::grid([units.div_ceil(8), 1, 1], [BLOCK, 1, 1])),
+            &[
+                x.arg(),
+                gate.arg(),
+                weight.arg(),
+                y.arg(),
+                stated(OP, units)?.arg(),
+                eps.arg(),
+                i32::from(sigmoid_gate).arg(),
+                heads.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(
