@@ -75,13 +75,11 @@ class Model:
         return f"{PIE_HOME}/artifacts/{rev}/{rev}.{self.pie_deployment}.cuda.zt"
 
 
-# A hybrid trunk holds two recurrent-state slots a sequence, and pie's
-# default 256 slots seat 128: the serving burst runs at most 128 wide where
-# vLLM admits all 256.
-SEATS = "config: pie seats 128 sequences (max_state_slots 256 / 2 slots each); vLLM admits all 256"
-
-NVFP4_ARTIFACT = ("/root/pie-homes/nvfp4/artifacts/fc694b54fb0174e0913e6adf86691ef85a4ead47/"
-                  "fc694b54fb0174e0913e6adf86691ef85a4ead47.qwen38-flash-next-bf16-nvfp4-kv-bf16.cuda.zt")
+# A hybrid trunk holds two recurrent-state slots a sequence. Before cb4c39af
+# pie's default 256 slots seated 128, so its serving burst ran at most 128
+# wide where vLLM admits all 256; the default is now two slots a lane.
+SEATS = ("config: pie before cb4c39af seated 128 sequences (max_state_slots 256 / 2 slots each), "
+         "since then all 256 as vLLM")
 
 MODELS = {m.key: m for m in [
     Model("qwen38-27b", "Qwen/Qwen3.8-27B", "bf16 / kv bf16", "bf16 / kv bf16", "qwen38-27b-bf16-kv-bf16",
@@ -94,21 +92,20 @@ MODELS = {m.key: m for m in [
           "experts mxfp4 (w4a16), rest bf16 / kv bf16", "gptoss-120b-bf16-mxfp4-kv-bf16",
           vllm_flags=["--extra", "--moe-backend marlin"],
           note="vLLM: default Triton mxfp4 MoE crashes at warmup on this build; --moe-backend marlin"),
-    # A fire past 8191 tokens routes more than 65535 rows, which the bf16
-    # select GEMV refuses once the grouped leg's 512 MiB staging cap turns
-    # it away; 4096-token fires keep pie inside both.
+    # Before the tcgen05 grouped select, a fire past 8191 tokens routed more
+    # rows than the bf16 select GEMV takes, and the before runs held fires to
+    # 4096 tokens; the select has no such limit now.
     Model("qwen36-35b-a3b", "Qwen/Qwen3.6-35B-A3B", "bf16 / kv bf16", "bf16 / kv bf16",
-          "qwen36-35b-a3b-bf16-kv-bf16", pie_options=["max_forward_tokens=4096"],
-          note="pie: max_forward_tokens=4096 (wider fires refuse: bf16 MoE select route run > 65535); " + SEATS),
-    # One artifact serves both: W4A16 as imported, W4A4 under `precision`.
+          "qwen36-35b-a3b-bf16-kv-bf16",
+          note="pie before: max_forward_tokens=4096 (wider fires refused: bf16 MoE select route run > 65535); "
+               + SEATS),
     Model("qwen38-flash-next-nvfp4", "nvidia/Qwen3.8-Flash-Next-NVFP4",
           "experts nvfp4 W4A4 (CUTLASS) / kv bf16", "experts nvfp4 W4A4 / kv bf16",
           "qwen38-flash-next-bf16-nvfp4a4-kv-bf16", vllm_dir="/root/baselines/qwen38-flash-next-nvfp4",
-          pie_precision_flag="bf16+nvfp4a4", pie_artifact=NVFP4_ARTIFACT, note=SEATS),
+          note=SEATS),
     Model("qwen38-flash-next-nvfp4-w4a16", "nvidia/Qwen3.8-Flash-Next-NVFP4",
           "experts nvfp4 W4A16 (Marlin) / kv bf16", "experts nvfp4 W4A16 / kv bf16",
           "qwen38-flash-next-bf16-nvfp4-kv-bf16", vllm_flags=["--extra", "--moe-backend marlin"],
-          pie_artifact=NVFP4_ARTIFACT,
           note="vLLM serves this checkpoint W4A4 by default; this pair holds both to W4A16 (Marlin); " + SEATS),
     Model("deepseek-v4-flash", "deepseek-ai/DeepSeek-V4-Flash", "fp8 dense + mxfp4 experts / kv fp8_ds_mla", None,
           None, vllm_dir="/root/baselines/deepseek-v4-flash", note="pie: not runnable yet (other track)"),
@@ -178,6 +175,13 @@ def contention(path: Path) -> int:
 
 
 def merged(model: Model, engine: str) -> dict | None:
+    """Each mode's clean run, or, when every attempt was contended, the
+    least contended one, marked so. `engine` may name a kept-aside run
+    (`pie-before`)."""
+    return _merged(model, engine)
+
+
+def _merged(model: Model, engine: str) -> dict | None:
     """Each mode's clean run, or, when every attempt was contended, the
     least contended one, marked so."""
     base = Path(model.vllm_dir) if (engine == "vllm" and model.vllm_dir) else OUT / model.key / engine
@@ -252,6 +256,7 @@ def table() -> str:
         if not vdoc and not pdoc:
             continue
         v, p = points(vdoc), points(pdoc)
+        before = points(merged(model, "pie-before"))
         # A parenthesis names the kernel, not the precision.
         same = model.pie_precision and (re.sub(r" \(.*?\)", "", model.pie_precision)
                                         == re.sub(r" \(.*?\)", "", model.vllm_precision))
@@ -260,10 +265,8 @@ def table() -> str:
                   + (" (match)" if same else
                      " (MISMATCH)" if model.pie_precision else ""),
                   *( [f"note: {model.note}"] if model.note else []), "",
-                  "| point | vLLM | pie | pie/vLLM |", "|---|---:|---:|---:|"]
-        commits = sorted({run.get("pie_commit", "011c5aba") for run in (pdoc or {}).values()})
-        if commits:
-            lines.insert(len(lines) - 3, f"pie commit: {', '.join(commits)}")
+                  "| point | vLLM | pie | pie/vLLM | pie commit | pie before | before/vLLM |",
+                  "|---|---:|---:|---:|---|---:|---:|"]
         for engine, doc in (("vLLM", vdoc), ("pie", pdoc)):
             for mode, run in (doc or {}).items():
                 if run.get("contended_samples"):
@@ -272,7 +275,12 @@ def table() -> str:
         for label, key, unit, nd, higher in ROWS:
             a, b = p.get(key), v.get(key)
             r = ratio(a, b) if higher else ratio(b, a)
-            lines.append(f"| {label} | {fmt(b, unit, nd)} | {fmt(a, unit, nd)} | {r} |")
+            run = (pdoc or {}).get("serve" if label.startswith("serve") else "offline") or {}
+            commit = run.get("pie_commit", "011c5aba" if run else "–")
+            c = before.get(key)
+            rb = ratio(c, b) if higher else ratio(b, c)
+            lines.append(f"| {label} | {fmt(b, unit, nd)} | {fmt(a, unit, nd)} | {r} | {commit} "
+                         f"| {fmt(c, unit, nd)} | {rb} |")
         lines.append("")
     return "\n".join(lines)
 
