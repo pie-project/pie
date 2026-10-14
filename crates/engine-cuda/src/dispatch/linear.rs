@@ -733,7 +733,9 @@ impl Run<'_> {
                 .opaque_rows(i32::try_from(a.rows).unwrap_or(i32::MAX)),
         )
         .unwrap_or(a.rows);
-        tc5::gemm_epi(
+        // A tcgen05 launch that fails leaves the projection and the GLU to
+        // run apart.
+        Ok(tc5::gemm_epi(
             self.ctx(),
             tc5::Operand::plain(a.ptr, tc5::Elem::Bf16),
             tc5::Operand::plain(weight.ptr, tc5::Elem::Bf16),
@@ -744,8 +746,8 @@ impl Run<'_> {
                 glu: Some(glu),
                 ..tc5::Epilogue::STORE
             },
-        )?;
-        Ok(true)
+        )
+        .is_ok())
     }
 
     /// A gate-up select and its GLU as one grouped tcgen05 GEMM, the GLU in
@@ -755,6 +757,10 @@ impl Run<'_> {
     fn select_glu(&mut self, select: &Linear, glu: &Linear) -> Result<bool, kernels_cuda::Error> {
         use linear::moe::{ExpertTable, GluBank};
         use linear::tc5::Glu;
+        // The device and the profile first: nothing resolved off tcgen05.
+        if !self.ctx().tuning().moe_tc5 || !linear::tc5::supported() {
+            return Ok(false);
+        }
         let (packed, y, glu) = match *glu {
             Linear::MlpSwiglu { packed, y, .. } => (packed, y, Glu::Swiglu),
             Linear::MlpSwigluClamp {
@@ -1295,8 +1301,9 @@ fn lowp(op: &'static str) -> Result<(), kernels_cuda::Error> {
     Err(kernels_cuda::Error::Backend {
         op,
         detail: "a product that quantizes its activations runs on the tcgen05 GEMMs \
-                 (sm_100a/sm_103a, NVRTC 12.9 or newer), which this device or NVRTC lacks; \
-                 serve the deployment that reads bf16 activations instead"
+                 (sm_100a, sm_101a, sm_103a or sm_110a, NVRTC 12.9 or newer), which this \
+                 device or NVRTC lacks; serve the deployment that reads bf16 activations \
+                 instead"
             .to_string(),
     })
 }

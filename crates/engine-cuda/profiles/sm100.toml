@@ -7,3 +7,8 @@ assumes = { cc = 100 }
 [kernel]
 gemv.bf16 = "narrow"
 mla.path  = "naive"
+# The tcgen05 GEMMs (B200): routed selects from 16 tokens, a dense
+# projection's GLU in the epilogue from 64 rows.
+moe.tc5           = true
+moe.tc5_from      = 16
+gemm.tc5_glu_from = 64

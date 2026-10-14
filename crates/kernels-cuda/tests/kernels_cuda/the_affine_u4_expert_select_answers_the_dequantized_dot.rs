@@ -4,6 +4,7 @@ use crate::common::{Gpu, Lcg, close, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::linear::moe::{GroupSeat, matmul_select_quant};
 use kernels_cuda::tensor::Tensor;
+use kernels_cuda::tuning::Tuning;
 
 const GROUP: usize = 64;
 
@@ -75,8 +76,36 @@ fn check(
     );
 }
 
+/// Each case on the old arm and on the tcgen05 one (where the device has it).
 #[allow(clippy::too_many_arguments)]
 fn check_with(
+    experts: usize,
+    n: usize,
+    k: usize,
+    tokens: usize,
+    top_k: usize,
+    by_token: bool,
+    seed: u64,
+    bf16_weights: bool,
+) {
+    for tuning in [Tuning::DEFAULT, crate::common::TC5] {
+        check_with_tuned(
+            tuning,
+            experts,
+            n,
+            k,
+            tokens,
+            top_k,
+            by_token,
+            seed,
+            bf16_weights,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_with_tuned(
+    tuning: Tuning,
     experts: usize,
     n: usize,
     k: usize,
@@ -104,7 +133,7 @@ fn check_with(
     let biases_at = gpu.up(&bank.biases);
     let routes_at = gpu.up(&routes);
     let y_at = gpu.zeros(tokens * top_k * n * 2);
-    let ctx = gpu.ctx();
+    let ctx = gpu.ctx().with_tuning(tuning);
     let x_t = Tensor::new(x_at, act_rows as u32, k as u32, Dtype::Bf16);
     let codes_t = Tensor::new(codes_at, experts as u32, (n * k / 2) as u32, Dtype::U8);
     let scales_t = Tensor::new(
@@ -232,7 +261,7 @@ fn a_dense_affine_projection_is_priced_on_tcgen05() {
         let x = Tensor::new(gpu.up(&x_raw), m as u32, k as u32, Dtype::Bf16);
         let ya = gpu.zeros(m * n * 2);
         let yb = gpu.zeros(m * n * 2);
-        let ctx = gpu.ctx();
+        let ctx = gpu.ctx().with_tuning(crate::common::TC5);
         let fire = |tc5: bool, y: u64| {
             let mut out = Tensor::new(y, m as u32, n as u32, Dtype::Bf16);
             let (post, f, seat) = (OffsetKind::Post, Dtype::Bf16, GroupSeat::RESIDENT);

@@ -155,9 +155,9 @@ fn the_grouped_mxfp4_select_answers_the_per_route_one_every_case() {
 /// The grouped tcgen05 GEMM (W4A16, on a device that has it) at a gpt-oss
 /// leg's K, biased and bare, masked and contiguous.
 fn the_tcgen05_form_agrees_at_gpt_oss_widths() {
-    check(40, 576, 2880, true, true, Tuning::DEFAULT);
-    check(100, 384, 2880, true, false, Tuning::DEFAULT);
-    check(100, 384, 2880, false, true, Tuning::DEFAULT);
+    check(40, 576, 2880, true, true, crate::common::TC5);
+    check(100, 384, 2880, true, false, crate::common::TC5);
+    check(100, 384, 2880, false, true, crate::common::TC5);
 }
 
 fn the_token_read_leg_with_a_bias_agrees() {
@@ -213,7 +213,7 @@ fn price(n: usize, k: usize, by_token: bool, label: &str) {
         moe_tc5: false,
         ..Tuning::DEFAULT
     });
-    let tc5 = gpu.ctx();
+    let tc5 = gpu.ctx().with_tuning(crate::common::TC5);
     let x = Tensor::new(act_at, act_rows as u32, k as u32, Dtype::Bf16);
     let codes_t = Tensor::new(codes_at, EXPERTS as u32, (n * k / 2) as u32, Dtype::U8);
     let scales_t = Tensor::new(scales_at, EXPERTS as u32, (n * groups) as u32, Dtype::U8);

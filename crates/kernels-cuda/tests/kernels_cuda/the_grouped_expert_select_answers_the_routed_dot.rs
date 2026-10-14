@@ -4,6 +4,7 @@ use crate::common::{Gpu, Lcg, close, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::linear::moe::{ExpertTable, matmul_select};
 use kernels_cuda::tensor::Tensor;
+use kernels_cuda::tuning::Tuning;
 
 #[derive(Clone, Copy)]
 enum Spread {
@@ -44,7 +45,25 @@ fn routed_dot(
     y
 }
 
+/// Each case on the old arm and on the tcgen05 one (where the device has it).
+#[allow(clippy::too_many_arguments)]
 fn check(
+    experts: usize,
+    tokens: usize,
+    top_k: usize,
+    k: usize,
+    n: usize,
+    by_token: bool,
+    spread: Spread,
+) {
+    for tuning in [Tuning::DEFAULT, crate::common::TC5] {
+        check_tuned(tuning, experts, tokens, top_k, k, n, by_token, spread);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_tuned(
+    tuning: Tuning,
     experts: usize,
     tokens: usize,
     top_k: usize,
@@ -70,7 +89,7 @@ fn check(
     let routes_at = gpu.up(&routes);
     let y_at = gpu.zeros(route_count * n * 2);
 
-    let ctx = gpu.ctx();
+    let ctx = gpu.ctx().with_tuning(tuning);
     let x = Tensor::new(
         x_at,
         u32::try_from(x_rows).unwrap(),

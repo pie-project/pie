@@ -5,6 +5,7 @@ use dtype::Dtype;
 use kernels_cuda::linear::moe::GroupSeat;
 use kernels_cuda::linear::nvfp4::{matmul, matmul_select};
 use kernels_cuda::tensor::Tensor;
+use kernels_cuda::tuning::Tuning;
 
 const GROUP: usize = 16;
 
@@ -62,7 +63,25 @@ fn bank(lcg: &mut Lcg, slabs: usize, n: usize, k: usize) -> Bank {
     }
 }
 
+/// Each case on the old arm and on the tcgen05 one (where the device has it).
+#[allow(clippy::too_many_arguments)]
 fn routed(
+    experts: usize,
+    n: usize,
+    k: usize,
+    tokens: usize,
+    top_k: usize,
+    by_token: bool,
+    seed: u64,
+) {
+    for tuning in [Tuning::DEFAULT, crate::common::TC5] {
+        routed_tuned(tuning, experts, n, k, tokens, top_k, by_token, seed);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn routed_tuned(
+    tuning: Tuning,
     experts: usize,
     n: usize,
     k: usize,
@@ -86,7 +105,7 @@ fn routed(
     let tensor_at = gpu.up(&bank.tensor);
     let routes_at = gpu.up(&routes);
     let y_at = gpu.zeros(tokens * top_k * n * 2);
-    let ctx = gpu.ctx();
+    let ctx = gpu.ctx().with_tuning(tuning);
     let slab =
         |at: u64, bytes: usize, dtype: Dtype| Tensor::new(at, experts as u32, bytes as u32, dtype);
     let mut y_t = Tensor::new(y_at, (tokens * top_k) as u32, n as u32, Dtype::Bf16);

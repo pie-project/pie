@@ -183,6 +183,14 @@ impl Lcg {
 
 pub const TOLERANCE: f32 = 3.0e-2;
 
+/// The registry's tuning with the tcgen05 selects and GLU epilogues on, as
+/// B200's profile has them.
+pub const TC5: kernels_cuda::tuning::Tuning = kernels_cuda::tuning::Tuning {
+    moe_tc5: true,
+    gemm_tc5_glu_from: 64,
+    ..kernels_cuda::tuning::Tuning::DEFAULT
+};
+
 pub fn close(got: f32, want: f32) -> bool {
     (got - want).abs() <= TOLERANCE * want.abs().max(1.0)
 }

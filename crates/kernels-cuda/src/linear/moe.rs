@@ -413,7 +413,8 @@ pub fn matmul_select(
     {
         let fan = selected(OP, x, routes, y)?;
         if tc5_worth(ctx, x, bank.dtype, y, experts, routes.rows, fan.route_count) {
-            return select_tc5(
+            // A tcgen05 launch that fails falls back to the arm below.
+            if select_tc5(
                 ctx,
                 OP,
                 x,
@@ -422,7 +423,11 @@ pub fn matmul_select(
                 routes,
                 y,
                 crate::linear::tc5::Epilogue::STORE,
-            );
+            )
+            .is_ok()
+            {
+                return Ok(());
+            }
         }
         if let Some(count) = grouped_worth(ctx, x, bank, y, &fan, experts) {
             return select_grouped(ctx, OP, x, bank, routes, y, count);
@@ -613,7 +618,8 @@ pub fn select_glu(
     if !tc5_worth(ctx, x, dtype, y, experts, routes.rows, fan.route_count) {
         return Ok(false);
     }
-    select_tc5(
+    // A tcgen05 launch that fails leaves the select and the GLU to run apart.
+    Ok(select_tc5(
         ctx,
         OP,
         x,
@@ -627,8 +633,8 @@ pub fn select_glu(
             weight_scale,
             ..tc5::Epilogue::STORE
         },
-    )?;
-    Ok(true)
+    )
+    .is_ok())
 }
 
 #[cfg(feature = "cuda")]
@@ -1042,7 +1048,8 @@ fn matmul_select_mxfp4(
         )
     {
         use crate::linear::tc5;
-        return select_tc5(
+        // A tcgen05 launch that fails falls back to the arm below.
+        if select_tc5(
             ctx,
             op,
             x,
@@ -1054,7 +1061,11 @@ fn matmul_select_mxfp4(
                 bias: bias.map_or(0, |b| b.ptr),
                 ..tc5::Epilogue::STORE
             },
-        );
+        )
+        .is_ok()
+        {
+            return Ok(());
+        }
     }
     if x.width == 0 || !x.width.is_multiple_of(MXFP4_BLOCK) {
         return Err(refuse(
@@ -1228,7 +1239,8 @@ fn matmul_select_mlxu4(
         )
     {
         use crate::linear::tc5;
-        return select_tc5(
+        // A tcgen05 launch that fails falls back to the arm below.
+        if select_tc5(
             ctx,
             op,
             x,
@@ -1237,7 +1249,11 @@ fn matmul_select_mlxu4(
             routes,
             y,
             tc5::Epilogue::STORE,
-        );
+        )
+        .is_ok()
+        {
+            return Ok(());
+        }
     }
     let k = stated(op, nonzero(op, "K, the bank's contracted width", x.width)?)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;

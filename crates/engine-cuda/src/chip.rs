@@ -323,10 +323,15 @@ mod tests {
             let tuning = kernels_cuda::tuning::Tuning::of(&profile);
             if major >= 10 {
                 assert!(tuning.gemv_narrow && tuning.mla_naive, "{gpu}");
+                // B200 alone also runs the tcgen05 selects and GLU epilogues.
+                let b200 = (major, minor) == (10, 0);
+                assert_eq!(tuning.moe_tc5, b200, "{gpu}");
                 assert_eq!(
                     kernels_cuda::tuning::Tuning {
                         gemv_narrow: false,
                         mla_naive: false,
+                        moe_tc5: defaults.moe_tc5,
+                        gemm_tc5_glu_from: defaults.gemm_tc5_glu_from,
                         ..tuning
                     },
                     defaults,
@@ -402,6 +407,36 @@ mod tests {
             kernels_cuda::tuning::Tuning::of(&family),
             "only the skinny GEMM's reach differs from the family"
         );
+    }
+
+    #[test]
+    fn only_a_b200_runs_the_tcgen05_selects_and_glu_epilogues() {
+        let tuning = |major, minor, sms| {
+            kernels_cuda::tuning::Tuning::of(
+                &resolve("NVIDIA GPU", &facts(major, minor, sms), None).0,
+            )
+        };
+        let b200 = tuning(10, 0, 148);
+        assert!(b200.moe_tc5);
+        assert_eq!(b200.gemm_tc5_glu_from, 64);
+        for (major, minor) in [
+            (8, 0),
+            (8, 6),
+            (8, 7),
+            (8, 9),
+            (9, 0),
+            (10, 3),
+            (11, 0),
+            (12, 0),
+            (12, 1),
+        ] {
+            let other = tuning(major, minor, 132);
+            assert!(!other.moe_tc5, "sm_{major}{minor} keeps the old selects");
+            assert_eq!(
+                other.gemm_tc5_glu_from, 65_536,
+                "sm_{major}{minor} keeps the GLU apart"
+            );
+        }
     }
 
     #[test]

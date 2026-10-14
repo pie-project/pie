@@ -20,10 +20,12 @@ pub struct MoeMxfp4Grouped;
 #[decision(id = "kernel.moe.mxfp4_wmma", flag, default = true, tune = search)]
 pub struct MoeMxfp4Wmma;
 
-/// Whether routed matmuls (bf16 banks, and mxfp4 ones against bf16
+/// Whether routed matmuls (bf16 banks, and 4-bit ones against bf16
 /// activations) run on the grouped tcgen05 GEMM where the device has it.
+/// Off but where a chip's profile turns it on (B200's): its plans assume
+/// B200's shared memory and SM count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.tc5", flag, default = true, tune = search)]
+#[decision(id = "kernel.moe.tc5", flag, default = false, tune = search)]
 pub struct MoeTc5;
 
 /// The fewest tokens a fire routes on the tcgen05 GEMM; narrower fires keep
@@ -34,9 +36,9 @@ pub struct MoeTc5From(pub u32);
 
 /// The fewest rows a dense gate-up projection lands its GLU from the
 /// tcgen05 GEMM's epilogue at; fewer keep the skinny kernel or the GEMM and
-/// the GLU apart.
+/// the GLU apart. 65536 (never) but where a chip's profile says (B200's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.gemm.tc5_glu_from", constant(range(1..=65_536)), default = 64, tune = search)]
+#[decision(id = "kernel.gemm.tc5_glu_from", constant(range(1..=65_536)), default = 65_536, tune = search)]
 pub struct GemmTc5GluFrom(pub u32);
 
 /// Whether a small decode batch still splits its keys across blocks.
@@ -254,9 +256,9 @@ impl Tuning {
         affine_grouped: true,
         affine_wmma: true,
         affine_grouped_from: 16,
-        moe_tc5: true,
+        moe_tc5: false,
         moe_tc5_from: 16,
-        gemm_tc5_glu_from: 64,
+        gemm_tc5_glu_from: 65_536,
     };
 
     #[must_use]

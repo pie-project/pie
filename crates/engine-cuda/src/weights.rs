@@ -1396,6 +1396,16 @@ fn lay_atoms(
     stream: *mut core::ffi::c_void,
 ) -> Result<()> {
     let banks = act_quant_banks(trace);
+    // A deployment that quantizes its activations runs on the tcgen05 GEMMs
+    // alone: refused at load where they are not, not at its first fire.
+    if !banks.is_empty() && !kernels_cuda::linear::tc5::supported() {
+        return Err(Fault::Unsupported(
+            "this deployment quantizes its activations, which runs on the tcgen05 GEMMs \
+             (sm_100a, sm_101a, sm_103a or sm_110a, NVRTC 12.9 or newer) that this device or \
+             NVRTC lacks; serve the deployment that reads bf16 activations instead"
+                .to_string(),
+        ));
+    }
     let mut temp: Option<Buffer> = None;
     for (at, gran) in banks {
         let Some(Some(WeightRow::Planes {
