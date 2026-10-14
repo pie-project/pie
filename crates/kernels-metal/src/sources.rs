@@ -77,6 +77,10 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/attn/sdpa_paged.metal")),
     ),
     (
+        "attn/sdpa_gqa.metal",
+        include_str!(concat!(source_root!(), "/attn/sdpa_gqa.metal")),
+    ),
+    (
         "attn/sdpa_paged_mma.metal",
         include_str!(concat!(source_root!(), "/attn/sdpa_paged_mma.metal")),
     ),

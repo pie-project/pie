@@ -234,6 +234,13 @@ pub struct SdpaTileRowsPerRequest(pub u32);
 #[decision(id = "kernel.sdpa.mma", flag, default = true, tune = search)]
 pub struct SdpaMma;
 
+/// Whether a decode row reads each key and value once for its kv head's whole group of
+/// query heads (`sdpa_paged_decode_gqa`), as Splash's verify tiles do, rather than once
+/// per query head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.gqa", flag, default = false, tune = search)]
+pub struct SdpaGqa;
+
 /// Whether attention reads keys and values through the 8-bit kernel. It
 /// halves the pool and changes what attention reads: the operator's call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -279,6 +286,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaPrefill>()
         .add::<SdpaTileRowsPerRequest>()
         .add::<SdpaMma>()
+        .add::<SdpaGqa>()
         .add::<SdpaKvQ8>()
         .add::<GdnScan>();
 }
@@ -406,6 +414,11 @@ impl Tuning {
     #[must_use]
     pub fn sdpa_mma(&self) -> bool {
         self.profile.on::<SdpaMma>(&profile::Anywhere)
+    }
+
+    #[must_use]
+    pub fn sdpa_gqa(&self) -> bool {
+        self.profile.on::<SdpaGqa>(&profile::Anywhere)
     }
 
     #[must_use]

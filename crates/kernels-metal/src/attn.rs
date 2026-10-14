@@ -431,6 +431,41 @@ fn vector(
         );
     }
     let shape = Paged::of(op, q, pool, window, causal, head_dim)?;
+    if tuning.sdpa_gqa()
+        && lse.is_none()
+        && pool.keys.dtype == Dtype::Bf16
+        && shape.gqa <= 8
+        && pool.page_size % 8 == 0
+        && matches!(head_dim, 128 | 256)
+    {
+        // Each row reads its keys and values once for the kv head's group of query heads.
+        return ctx.fire(
+            Fire::at("attn/sdpa_gqa.metal", if head_dim == 256 {
+                "sdpa_paged_decode_gqa_bfloat16_d_256"
+            } else {
+                "sdpa_paged_decode_gqa_bfloat16_d_128"
+            })
+            .apply(Grid::of([128 * shape.kv_heads, shape.rows, 1], [128, 1, 1])),
+            &[
+                q.arg(),
+                pool.keys.arg(),
+                pool.values.arg(),
+                o.arg_mut(),
+                stated(op, shape.gqa)?.arg(),
+                plan.positions.arg(),
+                plan.request_of_token.arg(),
+                pool.page_indices.arg(),
+                pool.page_indptr.arg(),
+                pool.page_size.arg(),
+                stated(op, shape.kv_heads)?.arg(),
+                sm_scale.arg(),
+                plan.mask.arg(),
+                plan.mask_stride.arg(),
+                plan.mask_enabled.arg(),
+                shape.window.arg(),
+            ],
+        );
+    }
     // The read kernel is chosen by the POOL's dtype — the first KV-dtype dispatch
     // axis, mirroring how `append_paged` branches its write on `pool.keys.dtype`.
     // A bf16 pool takes the element-indexed decode; a packed KvU4 pool takes the
