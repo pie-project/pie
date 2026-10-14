@@ -99,8 +99,20 @@ fn check(interleaved: bool) {
                 write_offset: wo,
             };
             rope::yarn_split_append(
-                &ctx, packed, kv_heads * d, &mut qt, pos, params.0, params.1, params.2,
-                params.3, params.4, params.5, params.6, params.7, append,
+                &ctx,
+                packed,
+                kv_heads * d,
+                &mut qt,
+                pos,
+                params.0,
+                params.1,
+                params.2,
+                params.3,
+                params.4,
+                params.5,
+                params.6,
+                params.7,
+                append,
             )
             .expect("the split rotation fires");
         } else if mode == 1 {
@@ -146,9 +158,18 @@ fn check(interleaved: bool) {
     let apart = run(&mut gpu, 0);
     let fused = run(&mut gpu, 1);
     let split = run(&mut gpu, 2);
-    assert_eq!(split.0, apart.0, "interleaved {interleaved}: q from the packed row");
-    assert_eq!(split.2, apart.2, "interleaved {interleaved}: keys from the packed row");
-    assert_eq!(split.3, apart.3, "interleaved {interleaved}: values from the packed row");
+    assert_eq!(
+        split.0, apart.0,
+        "interleaved {interleaved}: q from the packed row"
+    );
+    assert_eq!(
+        split.2, apart.2,
+        "interleaved {interleaved}: keys from the packed row"
+    );
+    assert_eq!(
+        split.3, apart.3,
+        "interleaved {interleaved}: values from the packed row"
+    );
     assert!(apart.2.iter().any(|&b| b != 0), "the pair landed keys");
     assert_eq!(fused.0, apart.0, "interleaved {interleaved}: q");
     assert_eq!(fused.1, apart.1, "interleaved {interleaved}: k");

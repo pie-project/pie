@@ -131,8 +131,11 @@ impl Run<'_> {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
         let pool = self.pool(*cache);
-        let (mut qt, mut kt, mut vt) =
-            (self.tensor(*q_out), self.tensor(*k_out), self.tensor(*v_out));
+        let (mut qt, mut kt, mut vt) = (
+            self.tensor(*q_out),
+            self.tensor(*k_out),
+            self.tensor(*v_out),
+        );
         let append = rope::YarnAppend {
             v: vt,
             pool: &pool,

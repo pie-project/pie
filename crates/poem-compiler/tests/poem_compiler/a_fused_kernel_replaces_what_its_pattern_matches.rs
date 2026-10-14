@@ -242,7 +242,17 @@ fn a_split_rotation_and_its_cache_write_fold_into_one_op() {
             let packed = p.rows("packed", 768);
             let (q, k, v) = layout::split_qkv(&packed, 512, 128);
             let (qr, kr) = elemwise::rope_yarn(
-                &q, &k, &positions, 64, 150_000.0, 32.0, 32.0, 1.0, 1.3, 4096, interleaved,
+                &q,
+                &k,
+                &positions,
+                64,
+                150_000.0,
+                32.0,
+                32.0,
+                1.0,
+                1.3,
+                4096,
+                interleaved,
             );
             attn::kv_append(
                 &kr,
@@ -280,7 +290,14 @@ fn a_split_rotation_and_its_cache_write_fold_into_one_op() {
             panic!("the first op is the fused split rotation");
         };
         assert_eq!(
-            (*q_width, *kv_width, *head_dim, *theta, *original_max_position, *carried),
+            (
+                *q_width,
+                *kv_width,
+                *head_dim,
+                *theta,
+                *original_max_position,
+                *carried
+            ),
             (512, 128, 64, 150_000.0, 4096, interleaved)
         );
     }
