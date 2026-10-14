@@ -3324,7 +3324,9 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_prep(
 // chunk's rows split four ways and its value columns two ways over the
 // eight warps. Each operand of the next chunk streams in as soon as this
 // chunk is done with its buffer: q, w and u once `v_new` is formed, the
-// scores once the output is, and k and the decay into a second buffer.
+// scores once the output is, and the decay into a second buffer. The keys,
+// read by the fold alone, land in one buffer during the chunk they fold:
+// so two blocks fit an SM, and one's syncs hide behind the other's work.
 template <int BV>
 __global__ void __launch_bounds__(256) ssm_gdn_chunk_scan(
     const float* __restrict__ gcum,
@@ -3356,8 +3358,8 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_scan(
     extern __shared__ __align__(16) unsigned char gdn_smem[];
     bf16* sq = reinterpret_cast<bf16*>(gdn_smem);
     bf16* sw = sq + GDN_CH * GDN_LD;
-    bf16* sk0 = sw + GDN_CH * GDN_LD;
-    bf16* su = sk0 + 2 * GDN_CH * GDN_LD;
+    bf16* sk = sw + GDN_CH * GDN_LD;
+    bf16* su = sk + GDN_CH * GDN_LD;
     bf16* sp = su + GDN_CH * LDV;
     bf16* hs = sp + GDN_CH * GDN_LDC;
     bf16* vn = hs + BK * LDV;
@@ -3409,11 +3411,9 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_scan(
         ta = lane.t0 + jc * GDN_CH;
         L = min(GDN_CH, lane.t0 + lane.T - ta);
     };
-    auto load_kg = [&](int jc) {
+    auto load_k = [&](int jc) {
         int ta, L;
         span(jc, ta, L);
-        bf16* sk = sk0 + (jc & 1) * GDN_CH * GDN_LD;
-        float* sg = sg0 + (jc & 1) * GDN_CH;
         #pragma unroll
         for (int e = tid; e < GDN_CH * (BK / 8); e += THREADS) {
             const int i = e / (BK / 8);
@@ -3422,6 +3422,11 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_scan(
             gdn_cp16(sk + i * GDN_LD + c,
                      kn + (static_cast<long long>(ta + (in ? i : 0)) * K_h + hk) * BK + c, in);
         }
+    };
+    auto load_g = [&](int jc) {
+        int ta, L;
+        span(jc, ta, L);
+        float* sg = sg0 + (jc & 1) * GDN_CH;
         if (tid < GDN_CH) {
             const bool in = tid < L;
             gdn_cp4(sg + tid, gcum + static_cast<long long>(ta + (in ? tid : 0)) * V_h + h, in);
@@ -3458,7 +3463,7 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_scan(
         }
     };
 
-    load_kg(0);
+    load_g(0);
     load_qwu(0);
     load_p(0);
     gdn_cp_commit();
@@ -3475,12 +3480,14 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_scan(
         gdn_cp_wait_all();
         __syncthreads();
         const bool more = jc + 1 < nchunks;
-        if (more) load_kg(jc + 1);
+        // This chunk's keys, read only by its state fold, into the one key
+        // buffer the last fold is done with; the next chunk's decay ahead.
+        load_k(jc);
+        if (more) load_g(jc + 1);
         gdn_cp_commit();
 
         int ta, L;
         span(jc, ta, L);
-        const bf16* sk = sk0 + (jc & 1) * GDN_CH * GDN_LD;
         const float* sg = sg0 + (jc & 1) * GDN_CH;
         const float g_last = sg[L - 1];
 
@@ -3566,6 +3573,9 @@ __global__ void __launch_bounds__(256) ssm_gdn_chunk_scan(
         if (more) load_p(jc + 1);
         gdn_cp_commit();
 
+        // The keys' group is in once the two after it alone may be pending.
+        asm volatile("cp.async.wait_group 2;\n" ::: "memory");
+        __syncthreads();
         const float el = __expf(g_last);
         #pragma unroll
         for (int nt = 0; nt < NT; ++nt) {

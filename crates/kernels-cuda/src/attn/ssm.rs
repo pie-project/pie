@@ -824,7 +824,7 @@ const fn scan_smem(k_dim: u32) -> u32 {
     const LD: u32 = 136;
     const LDC: u32 = 72;
     let ldv = SCAN_BV + 8;
-    (4 * CH * LD + CH * ldv + CH * LDC + k_dim * ldv + 2 * CH * ldv) * 2 + 2 * CH * FLOAT
+    (3 * CH * LD + CH * ldv + CH * LDC + k_dim * ldv + 2 * CH * ldv) * 2 + 2 * CH * FLOAT
 }
 
 /// Whether a 128-wide prefill takes the two-launch scan: the profile turns
