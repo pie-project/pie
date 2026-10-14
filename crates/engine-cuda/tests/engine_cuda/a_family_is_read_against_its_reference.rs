@@ -66,7 +66,14 @@ fn every_probe_is_dumped() {
             // A stated row serves the artifact's planes if they are its own:
             // `nvfp4a4` reads the planes an `nvfp4` import lands.
             let name = std::env::var("PIE_PARITY_DEPLOYMENT").unwrap_or(stamp.deployment);
+            // A row the catalog does not list (a whole model's own export)
+            // still reads as its name spells.
             let deployment = poem_compiler::catalog::deployment(&name)
+                .or_else(|| {
+                    poem_compiler::catalog::repository()
+                        .parse(&name)
+                        .map(|d| &*Box::leak(Box::new(d)))
+                })
                 .unwrap_or_else(|| panic!("no deployment {name}"));
             let trace = deployment.trace(Platform::Cuda);
             let source = ztensor_compat::index(&artifact).expect("the artifact opens");
