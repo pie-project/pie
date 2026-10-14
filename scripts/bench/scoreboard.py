@@ -112,8 +112,10 @@ MODELS = {m.key: m for m in [
           "experts nvfp4 W4A16 (Marlin) / kv bf16", "experts nvfp4 W4A16 / kv bf16",
           "qwen38-flash-next-bf16-nvfp4-kv-bf16", vllm_flags=["--extra", "--moe-backend marlin"],
           note="vLLM serves this checkpoint W4A4 by default; this pair holds both to W4A16 (Marlin); " + SEATS),
-    Model("deepseek-v4-flash", "deepseek-ai/DeepSeek-V4-Flash", "fp8 dense + mxfp4 experts / kv fp8_ds_mla", None,
-          None, vllm_dir="/root/baselines/deepseek-v4-flash", note="pie: not runnable yet (other track)"),
+    Model("deepseek-v4-flash", "deepseek-ai/DeepSeek-V4-Flash", "fp8 dense + mxfp4 experts / kv fp8_ds_mla",
+          "fp8b128 dense W8A8 + mxfp4 experts W4A8 / kv bf16", "dsv4-flash-fp8b128a8-mxfp4a8-kv-bf16",
+          vllm_dir="/root/baselines/deepseek-v4-flash",
+          note="kv differs: vLLM fp8_ds_mla, pie bf16; pie's artifact is the #903 import of the official release"),
 ]}
 
 
