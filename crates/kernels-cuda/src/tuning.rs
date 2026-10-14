@@ -212,6 +212,13 @@ pub struct MoeAffineGroupedFrom(pub u32);
 #[decision(id = "kernel.ssm.gdn_fused_scan", flag, default = false, tune = search)]
 pub struct SsmGdnFusedScan;
 
+/// Whether a 128-wide gated delta prefill runs the one-launch tcgen05 walk
+/// (`attn/gdn_tc5.cuh`, sm_100a), the state in TMEM; off, the scan above
+/// serves it as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.gdn_tc5", flag, default = false, tune = search)]
+pub struct SsmGdnTc5;
+
 /// Whether a prefill the tcgen05 FMHA (`attn/tc5_fmha.cuh`, sm_100a) can
 /// serve runs on it; off, FA2 serves every prefill, as before it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -268,6 +275,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeTc5From>()
         .add::<GemmTc5GluFrom>()
         .add::<SsmGdnFusedScan>()
+        .add::<SsmGdnTc5>()
         .add::<SdpaMergeWarp>()
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
@@ -313,6 +321,7 @@ pub struct Tuning {
     pub moe_tc5_from: u32,
     pub gemm_tc5_glu_from: u32,
     pub ssm_gdn_fused_scan: bool,
+    pub ssm_gdn_tc5: bool,
     pub merge_warp: bool,
     pub mxfp4_mma_until: u32,
     pub mxfp4_mma_from: u32,
@@ -356,6 +365,7 @@ impl Tuning {
         moe_tc5_from: 16,
         gemm_tc5_glu_from: 65_536,
         ssm_gdn_fused_scan: false,
+        ssm_gdn_tc5: false,
         merge_warp: false,
         mxfp4_mma_until: 0,
         mxfp4_mma_from: 64,
@@ -399,6 +409,7 @@ impl Tuning {
             moe_tc5_from: profile.get::<MoeTc5From>().0,
             gemm_tc5_glu_from: profile.get::<GemmTc5GluFrom>().0,
             ssm_gdn_fused_scan: profile.on::<SsmGdnFusedScan>(&Anywhere),
+            ssm_gdn_tc5: profile.on::<SsmGdnTc5>(&Anywhere),
             merge_warp: profile.on::<SdpaMergeWarp>(&Anywhere),
             mxfp4_mma_until: profile.get::<MoeMxfp4MmaUntil>().0,
             mxfp4_mma_from: profile.get::<MoeMxfp4MmaFrom>().0,

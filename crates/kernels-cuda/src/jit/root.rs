@@ -101,6 +101,7 @@ const CONFIGURED: &[(&str, &[&str], Headers, Toolchain)] = &[
 const SPECIFIC: &[(&str, Toolchain)] = &[
     ("linear/tc5.cuh", Toolchain::new(12, 9)),
     ("attn/tc5_fmha.cuh", Toolchain::new(12, 9)),
+    ("attn/gdn_tc5.cuh", Toolchain::new(12, 9)),
 ];
 
 const fn specific_for(file: &str) -> Option<Toolchain> {

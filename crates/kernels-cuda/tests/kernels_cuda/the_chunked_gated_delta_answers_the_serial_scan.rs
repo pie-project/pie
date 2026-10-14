@@ -73,24 +73,32 @@ fn the_chunked_gated_delta_reads_and_lands_where_the_window_says() {
     });
 }
 
-/// Each case runs both prefill paths: the three wmma launches every card
-/// runs, and the two-launch scan the sm_100 profile turns on (a card whose
-/// blocks cannot hold it falls back to the three).
+/// Each case runs every prefill path: the three wmma launches every card
+/// runs, the two-launch scan, and the one-launch tcgen05 walk the sm_100
+/// profile turns on (a card that cannot run one falls back to the next).
 fn check(case: &Case) {
-    for fused in [false, true] {
-        check_on(case, fused);
+    for arm in [Arm::Split, Arm::Scan, Arm::Tc5] {
+        check_on(case, arm);
     }
 }
 
-fn tuned(fused: bool) -> Tuning {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Arm {
+    Split,
+    Scan,
+    Tc5,
+}
+
+fn tuned(arm: Arm) -> Tuning {
     Tuning {
-        ssm_gdn_fused_scan: fused,
+        ssm_gdn_fused_scan: arm != Arm::Split,
+        ssm_gdn_tc5: arm == Arm::Tc5,
         ..Tuning::DEFAULT
     }
 }
 
 #[allow(clippy::too_many_lines)]
-fn check_on(case: &Case, fused: bool) {
+fn check_on(case: &Case, fused: Arm) {
     let lens = case.lens;
     let (k_heads, v_heads, k_dim, v_dim) = (case.k_heads, case.v_heads, 128u32, 128u32);
     let conv_dim = (2 * k_heads * k_dim + v_heads * v_dim) as usize;
@@ -219,7 +227,7 @@ fn check_on(case: &Case, fused: bool) {
         .count();
     assert!(
         unstable == 0 && unstable_state == 0,
-        "two chunked fires (fused scan {fused}) disagree with each other: {unstable} output cells, {unstable_state} state cells"
+        "two chunked fires ({fused:?}) disagree with each other: {unstable} output cells, {unstable_state} state cells"
     );
     let landed = y_serial.iter().filter(|v| **v != 0.0).count();
     assert!(landed > 0, "the serial scan landed no output");
@@ -235,7 +243,7 @@ fn check_on(case: &Case, fused: bool) {
     let width = (v_heads * v_dim) as usize;
     assert!(
         worst < 3e-2,
-        "fused scan {fused}: output row {} col {}: serial {} against chunked {} (relative error {worst})",
+        "{fused:?}: output row {} col {}: serial {} against chunked {} (relative error {worst})",
         worst_at / width,
         worst_at % width,
         y_serial[worst_at],
@@ -249,10 +257,10 @@ fn check_on(case: &Case, fused: bool) {
     }
     assert!(
         worst_state < 3e-2,
-        "fused scan {fused}: the final states differ by {worst_state}"
+        "{fused:?}: the final states differ by {worst_state}"
     );
     eprintln!(
-        "chunked (fused scan {fused}) vs serial: worst output error {worst}, worst state error {worst_state}"
+        "chunked ({fused:?}) vs serial: worst output error {worst}, worst state error {worst_state}"
     );
 }
 
@@ -295,12 +303,19 @@ fn the_chunked_gated_delta_reports_its_rate_at_a_qwen38_27b_head() {
     // `PIE_GDN_ONLY=fused32` measures the two-launch scan at 32 requests
     // alone (a profiler's one launch).
     let only = std::env::var("PIE_GDN_ONLY").ok();
-    for (fused, requests) in [false, true]
+    for (fused, requests) in [Arm::Split, Arm::Scan, Arm::Tc5]
         .into_iter()
-        .flat_map(|fused| [1usize, 8, 32].map(|requests| (fused, requests)))
-        .filter(|&(fused, requests)| {
+        .flat_map(|arm| [1usize, 8, 32].map(|requests| (arm, requests)))
+        .filter(|&(arm, requests)| {
             only.as_deref().is_none_or(|o| {
-                o == format!("{}{requests}", if fused { "fused" } else { "split" })
+                o == format!(
+                    "{}{requests}",
+                    match arm {
+                        Arm::Split => "split",
+                        Arm::Scan => "fused",
+                        Arm::Tc5 => "tc5",
+                    }
+                )
             })
         })
     {
@@ -359,7 +374,11 @@ fn the_chunked_gated_delta_reports_its_rate_at_a_qwen38_27b_head() {
         let us = timer.median(fire);
         println!(
             "| {} | {requests} x {len} | {:.3} | {:.0} |",
-            if fused { "two-launch" } else { "three wmma" },
+            match fused {
+                Arm::Split => "three wmma",
+                Arm::Scan => "two-launch",
+                Arm::Tc5 => "tcgen05",
+            },
             us * 1e-3,
             rows as f64 / us * 1e6
         );

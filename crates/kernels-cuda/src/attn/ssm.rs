@@ -836,6 +836,112 @@ fn fused_scan(ctx: &Ctx, k_dim: u32) -> bool {
             .is_some_and(|cap| cap >= scan_smem(k_dim))
 }
 
+/// `pie::attn::gdn::Params`, field for field.
+#[cfg(feature = "cuda")]
+#[repr(C)]
+struct Tc5Params {
+    gates: u64,
+    state: u64,
+    slot_ids: u64,
+    qo_indptr: u64,
+    commit_len: u64,
+    begin_at: u64,
+    write_state_mask: u64,
+    out: u64,
+    win: u64,
+    slot_stride: i64,
+    lanes: i32,
+    k_heads: i32,
+    v_heads: i32,
+    write_state: i32,
+    q_scale: f32,
+}
+
+/// The one-launch tcgen05 walk (`attn/gdn_tc5.cuh`), where the profile
+/// asks for it and the device and operands admit it: 128-wide heads, rows
+/// TMA can read. `Ok(false)` leaves the prefill to the scans.
+#[cfg(feature = "cuda")]
+fn gated_delta_chunked_tc5(
+    ctx: &Ctx,
+    op: &'static str,
+    shape: &Delta,
+    qkv: RaggedTensor,
+    gates: Tensor,
+    state: &RecurrentPool,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    use crate::linear::tc5::{Map, encode, supported};
+    use cudarc::driver::sys as dr;
+    const FILE_TC5: &str = "attn/gdn_tc5.cuh";
+    /// `pie::attn::gdn::smem_bytes()`.
+    const SMEM: u32 = 213_504 + 1024;
+    if !(ctx.tuning().ssm_gdn_tc5
+        && supported()
+        && shape.k_dim == 128
+        && shape.v_dim == 128
+        && shape.v_heads.is_multiple_of(shape.k_heads.max(1))
+        && (shape.conv_dim * 2).is_multiple_of(16)
+        && aligned16(qkv.data.ptr)
+        && state.slot_stride_elems > 0)
+    {
+        return Ok(false);
+    }
+    let lanes = requests(op, qkv)?;
+    seated(op, state, "gdn_chunked_tc5", true, true, true)?;
+    let map = encode(Map {
+        ptr: qkv.data.ptr,
+        ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        dims: [shape.conv_dim, qkv.data.rows, 1],
+        strides: [
+            u64::from(shape.conv_dim) * 2,
+            u64::from(shape.conv_dim) * 2 * u64::from(qkv.data.rows.max(1)),
+        ],
+        boxes: [64, 64, 1],
+        swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+    })?;
+    #[allow(clippy::cast_precision_loss)]
+    let q_scale = (shape.k_dim as f32).sqrt().recip();
+    let int = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
+    let ArgValue::Ptr(win) = ctx.stage() else {
+        return Ok(false);
+    };
+    let params = Tc5Params {
+        gates: gates.ptr,
+        state: state.slab.ptr,
+        slot_ids: state.slot_ids.ptr,
+        qo_indptr: qkv.indptr.ptr,
+        commit_len: state.commit_len.ptr,
+        begin_at: state.begin_at.ptr,
+        write_state_mask: state.write_state_mask.ptr,
+        out: y.ptr,
+        win,
+        slot_stride: state.slot_stride_elems,
+        lanes: int(lanes),
+        k_heads: int(shape.k_heads),
+        v_heads: int(shape.v_heads),
+        write_state: i32::from(state.write_state),
+        q_scale,
+    };
+    let tiles = lanes.saturating_mul(shape.v_heads);
+    let grid = tiles.min(ctx.multiprocessors().unwrap_or(148)).max(1);
+    ctx.fire(
+        op,
+        Fire::at(FILE_TC5, symbol("::pie::attn::gdn::gdn_chunked_tc5"))
+            .apply(Launch::grid([grid, 1, 1], [448, 1, 1]).smem(SMEM)),
+        &[
+            ArgValue::Bytes {
+                ptr: map.as_ptr().cast(),
+                len: 128,
+            },
+            ArgValue::Bytes {
+                ptr: (&raw const params).cast(),
+                len: core::mem::size_of::<Tc5Params>(),
+            },
+        ],
+    )?;
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn gated_delta_chunked_fla(
     ctx: &Ctx,
@@ -1162,6 +1268,10 @@ pub fn gated_delta_chunked(
     let shape = Delta::of(OP, qkv.data, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let lanes = requests(OP, qkv)?;
     let wide = k_dim == BK_MAX_FLA && v_dim == BV_FLA && !SERIAL_SCAN.with(core::cell::Cell::get);
+    #[cfg(feature = "cuda")]
+    if wide && gated_delta_chunked_tc5(ctx, OP, &shape, qkv, gates, state, y)? {
+        return Ok(());
+    }
     let fused = wide && fused_scan(ctx, k_dim);
     if fused
         && shape.conv_dim.is_multiple_of(8)

@@ -16,6 +16,11 @@ gemm.tc5_glu_from = 64
 # gated delta scan holds; 32 x 4096 tokens take 7.8 ms a layer there where
 # the three wmma launches took about 97 (Qwen3.8-27B's head).
 ssm.gdn_fused_scan = true
+# The gated delta prefill in one tcgen05 launch, the state in TMEM: at
+# Qwen3.6-35B-A3B's head (16 key heads, 32 value heads) a layer over
+# 32 x 4096 tokens takes 2.84 ms where the two-launch scan takes 5.11, and
+# over 4 x 4096 0.34 where it takes 0.70.
+ssm.gdn_tc5 = true
 # A wide decode's split partials fold a warp a row: gpt-oss-120b's layers
 # at 64 requests fold in about 4 us where the staged merge took 17.
 sdpa.merge_warp = true
