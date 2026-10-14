@@ -38,6 +38,7 @@ import os
 import random
 import shlex
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -77,6 +78,8 @@ def bench_args(args: argparse.Namespace) -> argparse.Namespace:
     ]
     for opt in args.engine_option:
         argv += ["--engine-option", opt]
+    if getattr(args, "precision", None):
+        argv += ["--precision", args.precision]
     return pie_bench.build_parser().parse_args(argv)
 
 
@@ -188,13 +191,16 @@ def main() -> None:
     ap.add_argument("--inferlet-dir", default=str(ROOT / "examples" / "text-completion-bench"))
     ap.add_argument("--pie-bin", default=str(ROOT / "target" / "release" / "pie"))
     ap.add_argument("--engine-option", action="append", default=[], metavar="KEY=VALUE")
+    ap.add_argument("--precision", default=None, help="[model] precision, e.g. bf16+nvfp4a4")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
     with MemSampler(os.path.join(args.out, f"gpu_mem_{args.mode}.csv")) as mem:
         t0 = time.time()
         res = asyncio.run(run(args, mem))
-    res.update(mode=args.mode, model=args.model, hf=args.hf, argv=shlex.join(sys.argv),
+    commit = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
+                            capture_output=True, text=True).stdout.strip()
+    res.update(mode=args.mode, model=args.model, hf=args.hf, argv=shlex.join(sys.argv), pie_commit=commit,
                wall_s=time.time() - t0, peak_gpu_mem_mib=mem.peak,
                contended=bool(mem.foreign), foreign_pids=sorted(mem.foreign), foreign_samples=mem.foreign_samples,
                foreign_pids_at_load=sorted(mem.foreign_at_load))

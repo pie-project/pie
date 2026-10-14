@@ -26,6 +26,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -54,6 +55,11 @@ class Model:
     vllm_flags: list[str] = field(default_factory=list)
     # `--engine-option KEY=VALUE`s pie is served with.
     pie_options: list[str] = field(default_factory=list)
+    # `[model] precision`, for a deployment that shares another's artifact.
+    pie_precision_flag: str | None = None
+    # The artifact, when it was imported into another home under another
+    # deployment's name.
+    pie_artifact: str | None = None
     # A vLLM result measured before this driver existed, read as it stands.
     vllm_dir: str | None = None
     note: str = ""
@@ -63,12 +69,23 @@ class Model:
         return str(repo / "snapshots" / (repo / "refs" / "main").read_text().strip())
 
     def artifact(self) -> str:
+        if self.pie_artifact:
+            return self.pie_artifact
         rev = Path(self.snapshot()).name
         return f"{PIE_HOME}/artifacts/{rev}/{rev}.{self.pie_deployment}.cuda.zt"
 
 
+# A hybrid trunk holds two recurrent-state slots a sequence, and pie's
+# default 256 slots seat 128: the serving burst runs at most 128 wide where
+# vLLM admits all 256.
+SEATS = "config: pie seats 128 sequences (max_state_slots 256 / 2 slots each); vLLM admits all 256"
+
+NVFP4_ARTIFACT = ("/root/pie-homes/nvfp4/artifacts/fc694b54fb0174e0913e6adf86691ef85a4ead47/"
+                  "fc694b54fb0174e0913e6adf86691ef85a4ead47.qwen38-flash-next-bf16-nvfp4-kv-bf16.cuda.zt")
+
 MODELS = {m.key: m for m in [
-    Model("qwen38-27b", "Qwen/Qwen3.8-27B", "bf16 / kv bf16", "bf16 / kv bf16", "qwen38-27b-bf16-kv-bf16"),
+    Model("qwen38-27b", "Qwen/Qwen3.8-27B", "bf16 / kv bf16", "bf16 / kv bf16", "qwen38-27b-bf16-kv-bf16",
+          note=SEATS),
     Model("gemma4-31b", "google/gemma-4-31B-it", "bf16 / kv bf16", "bf16 / kv bf16", "gemma4-31b-bf16-kv-bf16"),
     # vLLM 0.31's default mxfp4 MoE on this B200 (Triton) fails its own
     # warmup with CUBLAS_STATUS_EXECUTION_FAILED, and both FlashInfer kinds
@@ -82,9 +99,17 @@ MODELS = {m.key: m for m in [
     # it away; 4096-token fires keep pie inside both.
     Model("qwen36-35b-a3b", "Qwen/Qwen3.6-35B-A3B", "bf16 / kv bf16", "bf16 / kv bf16",
           "qwen36-35b-a3b-bf16-kv-bf16", pie_options=["max_forward_tokens=4096"],
-          note="pie: max_forward_tokens=4096 (wider fires refuse: bf16 MoE select route run > 65535)"),
-    Model("qwen38-flash-next-nvfp4", "nvidia/Qwen3.8-Flash-Next-NVFP4", "nvfp4 / kv bf16", None, None,
-          vllm_dir="/root/baselines/qwen38-flash-next-nvfp4", note="pie: not runnable yet (other track)"),
+          note="pie: max_forward_tokens=4096 (wider fires refuse: bf16 MoE select route run > 65535); " + SEATS),
+    # One artifact serves both: W4A16 as imported, W4A4 under `precision`.
+    Model("qwen38-flash-next-nvfp4", "nvidia/Qwen3.8-Flash-Next-NVFP4",
+          "experts nvfp4 W4A4 (CUTLASS) / kv bf16", "experts nvfp4 W4A4 / kv bf16",
+          "qwen38-flash-next-bf16-nvfp4a4-kv-bf16", vllm_dir="/root/baselines/qwen38-flash-next-nvfp4",
+          pie_precision_flag="bf16+nvfp4a4", pie_artifact=NVFP4_ARTIFACT, note=SEATS),
+    Model("qwen38-flash-next-nvfp4-w4a16", "nvidia/Qwen3.8-Flash-Next-NVFP4",
+          "experts nvfp4 W4A16 (Marlin) / kv bf16", "experts nvfp4 W4A16 / kv bf16",
+          "qwen38-flash-next-bf16-nvfp4-kv-bf16", vllm_flags=["--extra", "--moe-backend marlin"],
+          pie_artifact=NVFP4_ARTIFACT,
+          note="vLLM serves this checkpoint W4A4 by default; this pair holds both to W4A16 (Marlin); " + SEATS),
     Model("deepseek-v4-flash", "deepseek-ai/DeepSeek-V4-Flash", "fp8 dense + mxfp4 experts / kv fp8_ds_mla", None,
           None, vllm_dir="/root/baselines/deepseek-v4-flash", note="pie: not runnable yet (other track)"),
 ]}
@@ -104,6 +129,8 @@ def run_once(model: Model, engine: str, mode: str, out: Path) -> dict | None:
                "--out", str(out)]
         for opt in model.pie_options:
             cmd += ["--engine-option", opt]
+        if model.pie_precision_flag:
+            cmd += ["--precision", model.pie_precision_flag]
     env = {**os.environ, "PIE_HOME": PIE_HOME}
     log("+", " ".join(cmd))
     with open(out / f"{mode}_driver.log", "w") as f:
@@ -225,12 +252,18 @@ def table() -> str:
         if not vdoc and not pdoc:
             continue
         v, p = points(vdoc), points(pdoc)
-        lines += [f"## {model.repo}", "",
+        # A parenthesis names the kernel, not the precision.
+        same = model.pie_precision and (re.sub(r" \(.*?\)", "", model.pie_precision)
+                                        == re.sub(r" \(.*?\)", "", model.vllm_precision))
+        lines += [f"## {model.repo} ({model.key})", "",
                   f"precision — vLLM: {model.vllm_precision}; pie: {model.pie_precision or '–'}"
-                  + (" (match)" if model.pie_precision == model.vllm_precision else
+                  + (" (match)" if same else
                      " (MISMATCH)" if model.pie_precision else ""),
                   *( [f"note: {model.note}"] if model.note else []), "",
                   "| point | vLLM | pie | pie/vLLM |", "|---|---:|---:|---:|"]
+        commits = sorted({run.get("pie_commit", "011c5aba") for run in (pdoc or {}).values()})
+        if commits:
+            lines.insert(len(lines) - 3, f"pie commit: {', '.join(commits)}")
         for engine, doc in (("vLLM", vdoc), ("pie", pdoc)):
             for mode, run in (doc or {}).items():
                 if run.get("contended_samples"):
