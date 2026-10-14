@@ -383,6 +383,55 @@ pub struct TokenInject {
     pub bytes: usize,
 }
 
+/// The fewest device-carried token runs one gather launch takes; under it
+/// each is copied on its own.
+const GATHERED_INJECTS: usize = 4;
+
+/// Lands each lane's device-carried tokens at its rows of `tokens`. A
+/// decode fire carries one a lane, so past a few lanes they go in one
+/// gather launch from a staged run table instead of a copy each. Inside a
+/// stream capture they are copied each, as a recording keeps them.
+fn inject_tokens(
+    device: &crate::device::Context,
+    runs: &mut Option<Buffer>,
+    tokens: u64,
+    injects: &[TokenInject],
+) -> Result<()> {
+    let stream = device.stream();
+    let words = injects
+        .iter()
+        .all(|inject| inject.bytes % 4 == 0 && inject.dst_off % 4 == 0);
+    if injects.len() < GATHERED_INJECTS || !words || crate::device::alloc::is_capturing(stream) {
+        for inject in injects {
+            crate::device::copy_d2d(stream, tokens + inject.dst_off, inject.src, inject.bytes)?;
+        }
+        return Ok(());
+    }
+    let table: Vec<kernels_cuda::channel::WordRun> = injects
+        .iter()
+        .map(|inject| kernels_cuda::channel::WordRun {
+            src: inject.src,
+            dst_word: u32::try_from(inject.dst_off / 4).unwrap_or(u32::MAX),
+            words: u32::try_from(inject.bytes / 4).unwrap_or(u32::MAX),
+        })
+        .collect();
+    let bytes = table.len() * size_of::<kernels_cuda::channel::WordRun>();
+    if runs.as_ref().is_none_or(|held| held.bytes() < bytes) {
+        *runs = Some(Buffer::zeroed(bytes.next_power_of_two())?);
+    }
+    let held = runs.as_mut().expect("sized just above");
+    // SAFETY: `WordRun` is plain `repr(C)` data, read as its bytes.
+    let raw = unsafe { core::slice::from_raw_parts(table.as_ptr().cast::<u8>(), bytes) };
+    held.stage(stream, 0, raw)?;
+    kernels_cuda::channel::gather_words(
+        device.ctx(),
+        held.ptr(),
+        tokens,
+        u32::try_from(table.len()).unwrap_or(u32::MAX),
+    )?;
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct Inputs {
     store: Buffer,
@@ -421,6 +470,7 @@ pub struct Inputs {
     max_rows: u32,
     plans: Vec<Option<Workspace>>,
     plan_values: usize,
+    inject_runs: Option<Buffer>,
 }
 
 impl Inputs {
@@ -602,6 +652,7 @@ impl Inputs {
             spaces,
             max_lanes: crate::window::lane_capacity(budget.max_lanes),
             max_rows: budget.max_tokens,
+            inject_runs: None,
             plan_values: grants.len(),
             plans: (0..runs as usize)
                 .flat_map(|run| {
@@ -1120,7 +1171,7 @@ impl Inputs {
     )]
     pub fn commit(
         &mut self,
-        stream: *mut core::ffi::c_void,
+        device: &crate::device::Context,
         slot: &SlotGuard,
         staged: &Staged,
         token_injects: &[TokenInject],
@@ -1157,7 +1208,13 @@ impl Inputs {
         let at_lane_of_row = self.lane_of_row;
         let at_group_of_lane = self.group_of_lane;
         let packing_places: Vec<PackingAt> = self.packings.clone();
-        let Inputs { store, staging, .. } = self;
+        let stream = device.stream();
+        let Inputs {
+            store,
+            staging,
+            inject_runs,
+            ..
+        } = self;
         let host = staging[slot.at() as usize].host();
 
         let mut spans: Vec<(u64, *const u8, usize)> = Vec::with_capacity(24);
@@ -1230,14 +1287,7 @@ impl Inputs {
         // SAFETY: the sources are the slot's pinned bytes, held until the `SlotGuard` drops.
         unsafe { store.stage_batch_from(stream, &spans)? };
 
-        for inject in token_injects {
-            crate::device::copy_d2d(
-                stream,
-                base + at_tokens + inject.dst_off,
-                inject.src,
-                inject.bytes,
-            )?;
-        }
+        inject_tokens(device, inject_runs, base + at_tokens, token_injects)?;
 
         Ok(Handles {
             tokens: i32s(base + at_tokens, rows),

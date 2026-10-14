@@ -296,9 +296,9 @@ impl FireCtx<'_> {
         let rows = p.composition.rows();
         let lane_count = p.composition.lane_count();
 
-        let handles =
-            self.inputs
-                .commit(self.device.stream(), slot, &p.lengths, &p.token_injects)?;
+        let handles = self
+            .inputs
+            .commit(self.device, slot, &p.lengths, &p.token_injects)?;
         p.windows.bind(handles.windows);
         p.windows.bind_live(handles.live_rows);
         p.windows.bind_qo_absolute(handles.qo_absolute);

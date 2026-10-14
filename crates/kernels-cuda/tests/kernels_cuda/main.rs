@@ -69,3 +69,4 @@ mod the_tcgen05_prefill_answers_fa2_and_the_reference;
 mod the_tcgen05_w4a16_gemm_answers_the_dequantized_dot;
 mod the_tensor_core_conv_lands_what_the_direct_kernel_lands;
 mod the_voxel_reshapes_land_the_reference_ordering;
+mod the_word_gather_lands_each_run_where_its_table_says;
