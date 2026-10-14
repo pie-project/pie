@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::operands::Operands;
 use crate::ops::elemwise::ModulateForm;
+use crate::ops::linear::Linear;
 use crate::value::ValueId;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -133,6 +134,15 @@ pub enum Fused {
         y: ValueId,
         y_out: ValueId,
     },
+    /// A routed gate-up select (`MoeMatmulSelect`, `..Bias` or `..Quant`,
+    /// its `y` the packed gate|up rows) and the GLU of it (`MlpSwiglu`,
+    /// `..Clamp` or `..ClampAlpha`): a backend may land the GLU from the
+    /// select's epilogue, or run the two. The packed rows are still an
+    /// output, read by nothing else.
+    MoeSelectGlu {
+        select: Box<Linear>,
+        glu: Box<Linear>,
+    },
     QkvFusedQknormRopeVnormWrite {
         packed: ValueId,
         positions: ValueId,
@@ -208,6 +218,7 @@ impl Operands for Fused {
                 act, gate_up, down, ..
             } => sink.extend([*act, *gate_up, *down]),
             Self::MatmulBias { act, w, bias, .. } => sink.extend([*act, *w, *bias]),
+            Self::MoeSelectGlu { select, .. } => select.inputs(sink),
             Self::QkvFusedQknormRopeVnormWrite {
                 packed,
                 positions,
@@ -273,6 +284,10 @@ impl Operands for Fused {
             Self::MlpSwiglu { packed, h, y, .. } => sink.extend([*packed, *h, *y]),
             Self::LmHeadSoftcap { y, y_out, .. } => sink.extend([*y, *y_out]),
             Self::MatmulBias { y, y_out, .. } => sink.extend([*y, *y_out]),
+            Self::MoeSelectGlu { select, glu } => {
+                select.outputs(sink);
+                glu.outputs(sink);
+            }
             Self::QkvFusedQknormRopeVnormWrite { q, .. } => sink.push(*q),
         }
     }
@@ -290,6 +305,7 @@ impl Operands for Fused {
             }
             Self::MatmulGeglu { .. }
             | Self::MlpSwiglu { .. }
+            | Self::MoeSelectGlu { .. }
             | Self::QkvFusedQknormRopeVnormWrite { .. } => {}
         }
     }
@@ -308,6 +324,7 @@ impl Operands for Fused {
             Self::MlpSwiglu { .. } => "linear.mlp_swiglu",
             Self::LmHeadSoftcap { .. } => "linear.lm_head_softcap",
             Self::MatmulBias { .. } => "linear.matmul_bias",
+            Self::MoeSelectGlu { .. } => "linear.moe_select_glu",
             Self::QkvFusedQknormRopeVnormWrite { .. } => {
                 "custom_cuda.qkv_fused_qknorm_rope_vnorm_write"
             }

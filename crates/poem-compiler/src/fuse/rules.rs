@@ -21,6 +21,7 @@ pub(super) fn all() -> Vec<Rule> {
         residual_add_rmsnorm(),
         mlp_swiglu(),
         matmul_geglu(),
+        moe_select_glu(),
         lm_head_softcap(),
         matmul_bias(),
         gated_residual_norm_modulate(),
@@ -274,6 +275,64 @@ fn mlp_swiglu() -> Rule {
         packed: m.value("packed"),
         h: m.value("h"),
         y: m.value("y"),
+    })
+}
+
+/// A routed gate-up select and its GLU: the select over a dense bank, a
+/// biased one (gpt-oss) or a quantized one, then SwiGLU, its clamp or its
+/// clamp-alpha form over the packed gate|up rows. The packed rows stay
+/// inside the match.
+fn moe_select_glu() -> Rule {
+    let mut alternatives = Vec::new();
+    for select in 0..3 {
+        for glu in 0..3 {
+            alternatives.push(template(|p| {
+                let x = p.rows("x", W);
+                let bank = p.weight("bank", [W, W, W]);
+                let routes = p.value(
+                    "routes",
+                    Ty::Tensor {
+                        shape: vec![Dim::Tokens, Dim::Const(W)],
+                        dtype: Dtype::I32,
+                    },
+                );
+                let top_k = p.u32("top_k");
+                let packed = match select {
+                    0 => linear::moe_matmul_select(&x, &bank, &routes, top_k),
+                    1 => linear::moe_matmul_select_bias(
+                        &x,
+                        &bank,
+                        &p.weight("bias", [W, W]),
+                        &routes,
+                        top_k,
+                    ),
+                    _ => linear::moe_matmul_select_quant(&x, &bank, &routes, top_k),
+                };
+                p.name("packed", &packed);
+                let intermediate = p.u32("intermediate");
+                let y = match glu {
+                    0 => linear::mlp_swiglu(&packed, intermediate),
+                    1 => linear::mlp_swiglu_clamp(&packed, intermediate, p.f32("limit")),
+                    _ => linear::mlp_swiglu_clamp_alpha(
+                        &packed,
+                        intermediate,
+                        p.f32("limit"),
+                        p.f32("alpha"),
+                    ),
+                };
+                p.export("y", &y);
+            }));
+        }
+    }
+    Rule::new("linear.moe_select_glu", alternatives, |m| {
+        let linear_op = |name| match m.op(name) {
+            Operation::Linear(op) => Box::new(op.clone()),
+            other => panic!("`{name}` is computed by {other:?}, not a linear op"),
+        };
+        Fused::MoeSelectGlu {
+            select: linear_op("packed"),
+            glu: linear_op("y"),
+        }
     })
 }
 

@@ -18,6 +18,14 @@ impl DispatchLinear for Run<'_> {
 impl Run<'_> {
     pub(super) fn fused_linear(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
         match op {
+            Fused::MoeSelectGlu { select, glu } => {
+                #[cfg(feature = "cuda")]
+                if self.select_glu(select, glu)? {
+                    return Ok(());
+                }
+                self.linear(select)?;
+                self.linear(glu)
+            }
             Fused::MatmulGeglu {
                 act,
                 w,
@@ -660,6 +668,98 @@ impl Run<'_> {
                 &mut self.tensor(*y),
             ),
         }
+    }
+
+    /// A gate-up select and its GLU as one grouped tcgen05 GEMM, the GLU in
+    /// its epilogue (a bf16 bank, or an mxfp4 one, biased or not), when the
+    /// fire takes it; `false` leaves the two to run apart.
+    #[cfg(feature = "cuda")]
+    fn select_glu(&mut self, select: &Linear, glu: &Linear) -> Result<bool, kernels_cuda::Error> {
+        use linear::moe::{ExpertTable, GluBank};
+        use linear::tc5::Glu;
+        let (packed, y, glu) = match *glu {
+            Linear::MlpSwiglu { packed, y, .. } => (packed, y, Glu::Swiglu),
+            Linear::MlpSwigluClamp {
+                packed, y, limit, ..
+            } => (packed, y, Glu::SwigluClamp { limit }),
+            Linear::MlpSwigluClampAlpha {
+                packed,
+                y,
+                limit,
+                alpha,
+                ..
+            } => (packed, y, Glu::SwigluClampAlpha { limit, alpha }),
+            _ => return Ok(false),
+        };
+        let (x, routes, bank, experts) = match *select {
+            Linear::MoeMatmulSelect {
+                x,
+                bank,
+                routes,
+                y: sy,
+            } if sy == packed => {
+                let (bank, experts) = self.expert_bank(bank);
+                (x, routes, GluBank::Bf16(bank), experts)
+            }
+            Linear::MoeMatmulSelectBias {
+                x,
+                bank,
+                bias,
+                routes,
+                y: sy,
+            } if sy == packed => {
+                let (codes, scales, affine, seat) = self.planes(bank);
+                if codes.dtype == Dtype::Nvfp4
+                    || affine.is_some()
+                    || seat.streams()
+                    || self.scales_in_atoms(bank)
+                {
+                    return Ok(false);
+                }
+                let bias = Some(self.tensor(bias));
+                (
+                    x,
+                    routes,
+                    GluBank::Mxfp4 {
+                        codes,
+                        scales,
+                        bias,
+                    },
+                    ExpertTable::RESIDENT,
+                )
+            }
+            Linear::MoeMatmulSelectQuant {
+                x,
+                bank,
+                routes,
+                y: sy,
+            } if sy == packed => {
+                let (codes, scales, biases, seat) = self.planes(bank);
+                if codes.dtype == Dtype::Nvfp4
+                    || biases.is_some()
+                    || seat.streams()
+                    || self.scales_in_atoms(bank)
+                    || crate::device::alloc::is_host_pointer(codes.ptr)
+                {
+                    return Ok(false);
+                }
+                (
+                    x,
+                    routes,
+                    GluBank::Mxfp4 {
+                        codes,
+                        scales,
+                        bias: None,
+                    },
+                    ExpertTable::RESIDENT,
+                )
+            }
+            _ => return Ok(false),
+        };
+        let x = self.tensor(x);
+        let routes = self.tensor(routes);
+        let mut out = self.tensor(y);
+        linear::moe::select_glu(self.ctx(), x, bank, routes, &mut out, glu, experts)
     }
 
     /// A quantized bank's select of `x`.

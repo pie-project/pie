@@ -507,6 +507,75 @@ pub(crate) fn select_tc5(
     act_quant::gather_back(ctx, op, ys, layout.pos, routes.width, y)
 }
 
+/// A gate-up bank a fused select reads: bf16 `[experts][2 * inter * k]`, or
+/// mxfp4 codes and row-major ue8m0 scales, with an optional bf16 bias a
+/// row; each expert's gate rows, then its up rows.
+#[derive(Clone, Copy, Debug)]
+pub enum GluBank {
+    Bf16(Tensor),
+    Mxfp4 {
+        codes: Tensor,
+        scales: Tensor,
+        bias: Option<Tensor>,
+    },
+}
+
+/// `y[route] = glu(x[route or its token] . W[routes[route]]^T)`, the GLU
+/// in the grouped tcgen05 GEMM's epilogue: `y` is `[routes][inter]`, the
+/// bank's experts `2 * inter` rows each. `Ok(false)` when this fire does
+/// not take it (no tcgen05, a narrow fire, a streamed bank, widths it does
+/// not tile): the caller runs the select and the GLU apart.
+#[cfg(feature = "cuda")]
+pub fn select_glu(
+    ctx: &Ctx,
+    x: Tensor,
+    bank: GluBank,
+    routes: Tensor,
+    y: &mut Tensor,
+    glu: crate::linear::tc5::Glu,
+    experts: ExpertTable,
+) -> Result<bool, Error> {
+    use crate::linear::tc5;
+    const OP: &str = "linear.moe_select_glu";
+    let fan = selected(OP, x, routes, y)?;
+    let (w, rows, bias, dtype) = match bank {
+        GluBank::Bf16(b) => (
+            tc5::Operand::plain(b.ptr, tc5::Elem::Bf16),
+            b.rows,
+            0,
+            b.dtype,
+        ),
+        GluBank::Mxfp4 {
+            codes,
+            scales,
+            bias,
+        } => (
+            tc5::Operand::scaled(codes.ptr, tc5::Elem::E2m1, scales.ptr, 32),
+            codes.rows,
+            bias.map_or(0, |b| b.ptr),
+            Dtype::Bf16,
+        ),
+    };
+    if !tc5_worth(ctx, x, dtype, y, experts, routes.rows, fan.route_count) {
+        return Ok(false);
+    }
+    select_tc5(
+        ctx,
+        OP,
+        x,
+        w,
+        rows,
+        routes,
+        y,
+        tc5::Epilogue {
+            glu: Some(glu),
+            bias,
+            ..tc5::Epilogue::STORE
+        },
+    )?;
+    Ok(true)
+}
+
 #[cfg(feature = "cuda")]
 const fn block_rows(per_expert: u32) -> u32 {
     let want = per_expert.next_power_of_two();
