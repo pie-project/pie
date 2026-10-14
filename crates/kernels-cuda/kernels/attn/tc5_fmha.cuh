@@ -32,6 +32,13 @@
 // in reverse, which no unmasked product can tell. A slice past the
 // request's pages lands as whatever the pool holds there (zeros past its
 // end): the softmax masks its scores and zeroes its V rows.
+//
+// A 512-wide head (Gemma-4's global layers) does not fit TMEM so: O alone
+// would fill it. A block there lands half of O, the 256 columns of its half
+// of V, its pair landing the other (both compute S whole); its key tile is
+// 32 tokens, S two buffers of 32 columns; Q's first 384 columns sit in
+// TMEM and its last 128 in shared memory, the A operand of their part of S
+// read from there.
 
 namespace pie::attn::fmha {
 
@@ -61,9 +68,15 @@ struct Params {
     int window_left;
 };
 
+// The columns of O a block lands, and of Q it holds in TMEM: a 512-wide
+// head splits O between two blocks and keeps Q's last 128 in shared memory.
+__host__ __device__ constexpr int o_width(int d) { return d > 256 ? d / 2 : d; }
+__host__ __device__ constexpr int q_held(int d) { return d > 256 ? d - 128 : d; }
+
 __host__ __device__ constexpr u32 smem_bytes(int d, int bkv, int stages) {
-    // The K and V rings, then barriers; 1024-aligned.
-    return 2u * u32(stages) * u32(d / 64) * u32(bkv) * 128u + 512u + 1024u;
+    // The K and V rings, Q's shared part, then barriers; 1024-aligned.
+    return u32(stages) * u32(d / 64 + o_width(d) / 64) * u32(bkv) * 128u +
+           u32((d - q_held(d)) / 64) * 128u * 128u + 512u + 1024u;
 }
 
 __device__ __forceinline__ u32 pack_bf16(float lo, float hi) {
@@ -103,6 +116,16 @@ __device__ __forceinline__ void tmem_st32(u32 taddr, const u32 (&v)[32]) {
         "r"(v[15]), "r"(v[16]), "r"(v[17]), "r"(v[18]), "r"(v[19]), "r"(v[20]), "r"(v[21]),
         "r"(v[22]), "r"(v[23]), "r"(v[24]), "r"(v[25]), "r"(v[26]), "r"(v[27]), "r"(v[28]),
         "r"(v[29]), "r"(v[30]), "r"(v[31])
+        : "memory");
+}
+
+__device__ __forceinline__ void tmem_st16(u32 taddr, const u32* v) {
+    asm volatile(
+        "tcgen05.st.sync.aligned.32x32b.x16.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, "
+        "%11, %12, %13, %14, %15, %16};" ::"r"(taddr),
+        "r"(v[0]), "r"(v[1]), "r"(v[2]), "r"(v[3]), "r"(v[4]), "r"(v[5]), "r"(v[6]), "r"(v[7]),
+        "r"(v[8]), "r"(v[9]), "r"(v[10]), "r"(v[11]), "r"(v[12]), "r"(v[13]), "r"(v[14]),
+        "r"(v[15])
         : "memory");
 }
 
@@ -147,29 +170,39 @@ __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill(
     const __grid_constant__ tc5::TmaMap map_k_run, const __grid_constant__ tc5::TmaMap map_v_run,
     const Params p, const int bound) {
     using namespace tc5;
-    static_assert(D == 64 || D == 128 || D == 256, "a head of 64, 128 or 256");
+    static_assert(D == 64 || D == 128 || D == 256 || D == 512, "a head of 64, 128, 256 or 512");
     constexpr int kBKV = BKV;
-    static_assert(BKV == 64 || BKV == 128, "a key tile is one or two 64-wide P atoms");
+    static_assert(BKV == 64 || BKV == 128 || (D == 512 && BKV == 32),
+                  "a key tile is one or two 64-wide P atoms, or half of one at a 512 head");
+    constexpr bool kSplit = D > 256;       // a block lands half of O
+    constexpr int DV = o_width(D);         // O's columns this block lands
+    constexpr int QT = q_held(D);          // Q's columns in TMEM; the rest in shared memory
     constexpr u32 kNA = D / 64;            // 64-wide atoms along the head
-    constexpr u32 kKA = kBKV / 64;         // 64-wide atoms along a key tile
+    constexpr u32 kNAV = DV / 64;          // 64-wide atoms along this block's V
     constexpr u32 kAtomKV = kBKV * 128;    // one 64-wide atom of a K or V tile
     constexpr u32 kTileKV = kNA * kAtomKV;
-    // Shared memory holds the K and V rings alone: Q and P live in TMEM.
+    constexpr u32 kTileV = kNAV * kAtomKV;
+    constexpr u32 kAtomQ = 128 * 128;      // one 64-wide atom of Q's shared part
+    // Shared memory holds the K and V rings and Q's part past TMEM (none
+    // below a 512 head): P lives in TMEM.
     constexpr u32 kOffK = 0;
     constexpr u32 kOffV = kOffK + ST * kTileKV;
-    constexpr u32 kOffBar = kOffV + ST * kTileKV;
+    constexpr u32 kOffQ = kOffV + ST * kTileV;
+    constexpr u32 kOffBar = kOffQ + ((D - QT) / 64) * kAtomQ;
     // TMEM: two S buffers (P overwrites its tile's, two bf16 a column), O,
     // and Q (two bf16 a column), the A operands read in place.
     constexpr u32 kColS = 0;
     constexpr u32 kColO = 2 * kBKV;
-    constexpr u32 kColQ = kColO + D;
+    constexpr u32 kColQ = kColO + DV;
     constexpr u32 kCols = 512;
-    static_assert(kColQ + D / 2 <= kCols, "S twice, O and Q fit TMEM");
-    (void)kKA;
+    static_assert(kColQ + QT / 2 <= kCols, "S twice, O and Q fit TMEM");
 
     Work w;
     if (!work_of(p, bound, static_cast<int>(blockIdx.x), w)) return;
-    const int h = blockIdx.y;
+    // A split head's two blocks sit side by side in y: its K tiles land
+    // for both at once.
+    const int h = kSplit ? static_cast<int>(blockIdx.y) >> 1 : static_cast<int>(blockIdx.y);
+    const int v0 = kSplit ? (static_cast<int>(blockIdx.y) & 1) * DV : 0;
 
     extern __shared__ unsigned char smem_raw[];
     const u32 raw = smem_addr(smem_raw);
@@ -271,6 +304,22 @@ __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill(
                                 static_cast<int>(a * 64), h, row < 0 ? 0x7fffff00 : row);
                 }
             };
+            // A split head's V: this block's half, a box a lane over its
+            // fewer atoms; the lane's 16 tokens' row is the K lane's of them.
+            constexpr int kBoxesV = (kBKV / 16) * kNAV;
+            const int t16v = b / static_cast<int>(kNAV);
+            const u32 av = static_cast<u32>(b) % kNAV;
+            auto load_v = [&](unsigned char* dst, u64* bar, int row, int row0, bool whole) {
+                if (whole) {
+                    if (b < static_cast<int>(kNAV)) {
+                        tma_load_3d(dst + av * kAtomKV, bar, &map_v_run,
+                                    v0 + static_cast<int>(av * 64), h, row0);
+                    }
+                } else if (b < kBoxesV) {
+                    tma_load_3d(dst + av * kAtomKV + t16v * 16 * 128, bar, &map_v,
+                                v0 + static_cast<int>(av * 64), h, row < 0 ? 0x7fffff00 : row);
+                }
+            };
             // Tiles every live row of the block reads whole: from the last
             // row's oldest key to the first row's newest.
             const int live_rows = min(128, w.qo_len * p.group - w.row0);
@@ -297,17 +346,27 @@ __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill(
                 if (lane == 0) bar_arrive_expect_tx(&k_full[st], kTileKV);
                 __syncwarp();
                 load(&map_k, &map_k_run, smem + kOffK + st * kTileKV, &k_full[st], row, row0, whole);
-                bar_wait(&v_empty[st], ph ^ 1);
-                if (lane == 0) bar_arrive_expect_tx(&v_full[st], kTileKV);
-                __syncwarp();
-                load(&map_v, &map_v_run, smem + kOffV + st * kTileKV, &v_full[st], row, row0, whole);
+                if constexpr (kSplit) {
+                    const int row_v =
+                        __shfl_sync(0xffffffffu, row, (t16v * static_cast<int>(kNA)) & 31);
+                    bar_wait(&v_empty[st], ph ^ 1);
+                    if (lane == 0) bar_arrive_expect_tx(&v_full[st], kTileV);
+                    __syncwarp();
+                    load_v(smem + kOffV + st * kTileV, &v_full[st], row_v, row0, whole);
+                } else {
+                    bar_wait(&v_empty[st], ph ^ 1);
+                    if (lane == 0) bar_arrive_expect_tx(&v_full[st], kTileKV);
+                    __syncwarp();
+                    load(&map_v, &map_v_run, smem + kOffV + st * kTileKV, &v_full[st], row, row0,
+                         whole);
+                }
                 row = next;
             }
         }
     } else if (warp == 5) {
         if (lane == 0 && nt > 0) {
             const u32 idesc_s = idesc_dense(kF16Bf16, kF16Bf16, 128, kBKV);
-            const u32 idesc_o = idesc_dense(kF16Bf16, kF16Bf16, 128, D) | (1u << 16);
+            const u32 idesc_o = idesc_dense(kF16Bf16, kF16Bf16, 128, DV) | (1u << 16);
             bar_wait(q_ready, 0);
             auto pv = [&](int i) {
                 const u32 st = i % ST;
@@ -315,7 +374,7 @@ __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill(
                 if (i == nt - 1) bar_wait(v_fixed, 0);
                 bar_wait(&p_full[i & 1], (i >> 1) & 1);
                 tc_fence_after();
-                const u32 vb = sbase + kOffV + st * kTileKV;
+                const u32 vb = sbase + kOffV + st * kTileV;
                 const u32 pa = tmem + kColS + (i & 1) * kBKV;
 #pragma unroll
                 for (u32 s = 0; s < kBKV / 16; ++s) {
@@ -335,9 +394,16 @@ __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill(
                 tc_fence_after();
                 const u32 kb = sbase + kOffK + st * kTileKV;
 #pragma unroll
-                for (u32 s = 0; s < D / 16; ++s) {
+                for (u32 s = 0; s < QT / 16; ++s) {
                     const u64 b = sdesc_sw128(kb + (s / 4) * kAtomKV) + 2 * (s % 4);
                     mma_f16_ts(tmem + kColS + sb * kBKV, tmem + kColQ + s * 8, b, idesc_s, s > 0);
+                }
+#pragma unroll
+                for (u32 s = QT / 16; s < D / 16; ++s) {
+                    const u32 sq = s - QT / 16;
+                    const u64 a = sdesc_sw128(sbase + kOffQ + (sq / 4) * kAtomQ) + 2 * (sq % 4);
+                    const u64 b = sdesc_sw128(kb + (s / 4) * kAtomKV) + 2 * (s % 4);
+                    mma_f16(tmem + kColS + sb * kBKV, a, b, idesc_s, true);
                 }
                 tc_commit(&s_full[sb]);
                 tc_commit(&k_empty[st]);
@@ -366,7 +432,7 @@ __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill(
                 p.q + static_cast<long long>(w.qo_start + (live ? tok : 0)) * p.q_stride +
                 static_cast<long long>(qh) * D);
 #pragma unroll 1
-            for (u32 c = 0; c < D / 2; c += 32) {
+            for (u32 c = 0; c < QT / 2; c += 32) {
                 u32 v[32];
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
@@ -377,6 +443,20 @@ __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill(
                     v[4 * i + 3] = x.w;
                 }
                 tmem_st32(tmem + lane_base + kColQ + c, v);
+            }
+            if constexpr (QT < D) {
+                // Q's last columns into shared memory as TMA would land them:
+                // 128-byte rows, their 16-byte words swizzled by the row.
+#pragma unroll
+                for (u32 g = 0; g < (D - QT) / 8; ++g) {
+                    const uint4 x = live ? src[QT / 8 + g] : make_uint4(0u, 0u, 0u, 0u);
+                    const u32 at = sbase + kOffQ + (g / 8) * kAtomQ + row * 128 +
+                                   (((g % 8) ^ (row % 8)) * 16);
+                    asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};" ::"r"(at), "r"(x.x),
+                                 "r"(x.y), "r"(x.z), "r"(x.w)
+                                 : "memory");
+                }
+                fence_async_shared();
             }
             tmem_wait_st();
             tc_fence_before();
@@ -436,7 +516,7 @@ __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill(
                 bar_wait(&pv_done[(j - 1) & 1], ((j - 1) >> 1) & 1);
                 tc_fence_after();
 #pragma unroll 1
-                for (u32 c = 0; c < D; c += 32) {
+                for (u32 c = 0; c < DV; c += 32) {
                     u32 v[32];
                     tmem_ld32(tmem + lane_base + kColO + c, v);
                     tmem_wait_ld();
@@ -448,12 +528,16 @@ __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill(
                 }
             }
             // P over its S, two bf16 a column, the A operand of P V.
+            if constexpr (kBKV / 2 < 32) {
+                tmem_st16(tmem + lane_base + kColS + st * kBKV, pk);
+            } else {
 #pragma unroll
-            for (u32 c = 0; c < kBKV / 2; c += 32) {
-                u32 v[32];
+                for (u32 c = 0; c < kBKV / 2; c += 32) {
+                    u32 v[32];
 #pragma unroll
-                for (int i = 0; i < 32; ++i) v[i] = pk[c + i];
-                tmem_st32(tmem + lane_base + kColS + st * kBKV + c, v);
+                    for (int i = 0; i < 32; ++i) v[i] = pk[c + i];
+                    tmem_st32(tmem + lane_base + kColS + st * kBKV + c, v);
+                }
             }
             tmem_wait_st();
             if (j == nt - 1) {
@@ -464,10 +548,10 @@ __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill(
                 const int valid = w.kv_len - k0;
                 if (static_cast<int>(row) < kBKV && static_cast<int>(row) >= valid) {
 #pragma unroll
-                    for (u32 a = 0; a < kNA; ++a) {
+                    for (u32 a = 0; a < kNAV; ++a) {
 #pragma unroll
                         for (u32 c = 0; c < 8; ++c) {
-                            const u32 at = sbase + kOffV + vst * kTileKV + a * kAtomKV + row * 128 + c * 16;
+                            const u32 at = sbase + kOffV + vst * kTileV + a * kAtomKV + row * 128 + c * 16;
                             asm volatile("st.shared.v4.b32 [%0], {%1, %1, %1, %1};" ::"r"(at), "r"(0u)
                                          : "memory");
                         }
@@ -488,9 +572,9 @@ __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill(
         // stores nothing.
         const float inv = l > 0.f ? 1.f / l : 0.f;
         u16* dst = p.o + static_cast<long long>(w.qo_start + (live ? tok : 0)) * p.o_stride +
-                   static_cast<long long>(qh) * D;
+                   static_cast<long long>(qh) * D + v0;
 #pragma unroll 1
-        for (u32 c = 0; c < D; c += 32) {
+        for (u32 c = 0; c < DV; c += 32) {
             u32 v[32];
             if (nt > 0) {
                 tmem_ld32(tmem + lane_base + kColO + c, v);

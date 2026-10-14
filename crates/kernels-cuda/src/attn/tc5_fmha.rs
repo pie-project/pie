@@ -1,6 +1,6 @@
 //! The tcgen05 prefill over a paged bf16 KV cache (`attn/tc5_fmha.cuh`), for
 //! the shapes it serves: a causal or full prefill, sliding or not, without a
-//! mask, a relative bias or a log-sum-exp, at a 64-, 128- or 256-wide head, an NHD
+//! mask, a relative bias or a log-sum-exp, at a 64-, 128-, 256- or 512-wide head, an NHD
 //! pool of 16-token pages, and rows long enough that a 128-row tile of
 //! packed query heads is mostly full. Everything else stays on FA2.
 
@@ -40,13 +40,26 @@ struct Params {
 }
 
 /// The key tile and ring depth a head width runs at: three stages of K and
-/// V fill shared memory, Q and P living in TMEM.
+/// V fill shared memory, Q and P living in TMEM. A 512-wide head's block
+/// lands half of O over 32-token tiles, four stages of K and its half of V
+/// beside Q's last 128 columns.
 const fn tiling(head_dim: u32) -> (u32, u32) {
-    if head_dim == 256 { (64, 3) } else { (128, 3) }
+    match head_dim {
+        512 => (32, 4),
+        256 => (64, 3),
+        _ => (128, 3),
+    }
 }
 
+/// The blocks a key head's O splits over: two at a 512-wide head.
+const fn o_split(head_dim: u32) -> u32 {
+    if head_dim > 256 { 2 } else { 1 }
+}
+
+/// `pie::attn::fmha::smem_bytes`.
 const fn smem_bytes(d: u32, bkv: u32, stages: u32) -> u32 {
-    2 * stages * (d / 64) * bkv * 128 + 512 + 1024
+    let held = if d > 256 { d - 128 } else { d };
+    stages * (d / 64 + d / o_split(d) / 64) * bkv * 128 + (d - held) / 64 * 128 * 128 + 512 + 1024
 }
 
 /// Whether this prefill runs on the tcgen05 kernel, and if so runs it.
@@ -73,7 +86,7 @@ pub(crate) fn try_prefill(
     // and the device's capability both: elsewhere FA2 serves as before.
     let fits = ctx.tuning().prefill_tc5
         && supported()
-        && matches!(head_dim, 64 | 128 | 256)
+        && matches!(head_dim, 64 | 128 | 256 | 512)
         && requests > 0
         && kv::native_bf16(pool)
         && pool.layout == NHD
@@ -149,7 +162,8 @@ pub(crate) fn try_prefill(
             )),
         )
         .apply(
-            Launch::grid([bound, kv_heads, 1], [192, 1, 1]).smem(smem_bytes(head_dim, bkv, stages)),
+            Launch::grid([bound, kv_heads * o_split(head_dim), 1], [192, 1, 1])
+                .smem(smem_bytes(head_dim, bkv, stages)),
         ),
         &[
             bytes(&map_k),

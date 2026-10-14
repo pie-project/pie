@@ -306,14 +306,52 @@ fn the_tcgen05_prefill_answers_fa2_and_the_reference() {
         window: None,
         scale: None,
     });
+    // Gemma-4-31B's global layers: a 512-wide head, eight query heads a
+    // key head, at a unit scale; each block lands half of O.
+    check(&Case {
+        head_dim: 512,
+        kv_heads: 2,
+        group: 8,
+        requests: &[(70, 0), (33, 17), (200, 40), (129, 0)],
+        window: None,
+        scale: Some(1.0 / 16.0),
+    });
+    // A serve's mixed fire: decode rows beside a chunk resuming a prefix.
+    check(&Case {
+        head_dim: 512,
+        kv_heads: 4,
+        group: 8,
+        requests: &[(1, 300), (256, 1793), (1, 47), (3, 20)],
+        window: None,
+        scale: Some(1.0),
+    });
+    // A whole 2049-token prompt at once, its last page one token: scores
+    // as steep as Gemma's normed queries and keys give.
+    check(&Case {
+        head_dim: 512,
+        kv_heads: 4,
+        group: 8,
+        requests: &[(2049, 0)],
+        window: None,
+        scale: Some(2.0),
+    });
+    check(&Case {
+        head_dim: 512,
+        kv_heads: 1,
+        group: 2,
+        requests: &[(600, 0), (90, 120)],
+        window: None,
+        scale: None,
+    });
 }
 
 /// The tcgen05 prefill's rate beside FA2's (the log-sum-exp form) over
 /// causal 4096-token requests at Qwen3.8-27B's full-attention head (256
-/// wide, six query heads a key head) and a 128-wide one with eight. FLOPs
-/// count the causal half. vLLM's prefill on B200 (FlashInfer's trtllm-gen
-/// FMHA) runs Qwen3.8-27B's 32 x 4096 at about 790 TFLOPS by the same
-/// count. Run it alone on an idle GPU:
+/// wide, six query heads a key head), a 128-wide one with eight, and
+/// Gemma-4-31B's two. FLOPs count the keys each row reads. vLLM's prefill
+/// on B200 (FlashInfer's trtllm-gen FMHA) runs Qwen3.8-27B's 32 x 4096 at
+/// about 790 TFLOPS by the same count, Gemma-4-31B's global layers at about
+/// 700 and its sliding ones at about 900. Run it alone on an idle GPU:
 ///
 ///     cargo test -p kernels-cuda --features cuda --release --test kernels_cuda \
 ///         the_tcgen05_prefill_reports -- --ignored --nocapture
@@ -341,12 +379,19 @@ fn the_tcgen05_prefill_reports_its_rate_beside_fa2() {
     };
     println!("| head | group | kv heads | requests x tokens | tc5 TFLOPS | FA2 TFLOPS |");
     println!("|---:|---:|---:|---|---:|---:|");
-    for (d, g, kvh, n) in [
-        (256usize, 6usize, 4usize, 1usize),
-        (256, 6, 4, 8),
-        (256, 6, 4, 32),
-        (128, 8, 8, 1),
-        (128, 8, 8, 8),
+    for (d, g, kvh, n, win, scatter) in [
+        (256usize, 6usize, 4usize, 1usize, None, false),
+        (256, 6, 4, 8, None, false),
+        (256, 6, 4, 32, None, false),
+        (128, 8, 8, 1, None, false),
+        (128, 8, 8, 8, None, false),
+        (512, 8, 4, 1, None, false),
+        (512, 8, 4, 32, None, false),
+        // Gemma-4-31B's global and sliding layers; a serve's pages lie
+        // scattered over the pool, no run for a tile to land in one box.
+        (512, 8, 4, 32, None, true),
+        (256, 2, 16, 32, Some(1024u32), false),
+        (256, 2, 16, 32, Some(1024u32), true),
     ] {
         let len = 4096usize;
         let qh = kvh * g;
@@ -358,7 +403,15 @@ fn the_tcgen05_prefill_reports_its_rate_beside_fa2() {
         let kv_indptr: Vec<i32> = (0..=n).map(|r| (r * pages_per) as i32).collect();
         let kv_len = vec![len as i32; n];
         let last = vec![PAGE as i32; n];
-        let indices: Vec<i32> = (0..pages as i32).collect();
+        let indices: Vec<i32> = (0..pages)
+            .map(|p| {
+                if scatter {
+                    (p * 7919 % pages) as i32
+                } else {
+                    p as i32
+                }
+            })
+            .collect();
         let mut lcg = Lcg::seeded(0x5eed);
         let (q_raw, _) = lcg.row(rows * qh * d);
         let (k_raw, _) = lcg.row(cells * kvh * d);
@@ -401,7 +454,7 @@ fn the_tcgen05_prefill_reports_its_rate_beside_fa2() {
             rows as u32,
             shape,
             live,
-            None,
+            win,
             true,
             false,
             None,
@@ -442,7 +495,7 @@ fn the_tcgen05_prefill_reports_its_rate_beside_fa2() {
         let tc5 = timer.median(|_| {
             let mut o = Tensor::new(o_at, rows as u32, (qh * d) as u32, Dtype::Bf16);
             attn::prefill(
-                &ctx, q_t, &built, &pool, None, d as u32, kvh as u32, sm_scale, &mut o,
+                &ctx, q_t, &built, &pool, win, d as u32, kvh as u32, sm_scale, &mut o,
             )
             .expect("the prefill fires");
         });
@@ -450,14 +503,19 @@ fn the_tcgen05_prefill_reports_its_rate_beside_fa2() {
             let mut o = Tensor::new(o_at, rows as u32, (qh * d) as u32, Dtype::Bf16);
             let mut lse = Tensor::new(lse_at, rows as u32, qh as u32, Dtype::F32);
             attn::prefill_lse(
-                &ctx, q_t, &built, &pool, None, d as u32, kvh as u32, sm_scale, &mut o, &mut lse,
+                &ctx, q_t, &built, &pool, win, d as u32, kvh as u32, sm_scale, &mut o, &mut lse,
             )
             .expect("the FA2 prefill fires");
         });
         // Causal: row t reads t + 1 keys.
-        let flops = 4.0 * (n * qh * d) as f64 * (len * (len + 1) / 2) as f64;
+        let keys: usize = (0..len)
+            .map(|t| win.map_or(t + 1, |w| (t + 1).min(w as usize)))
+            .sum();
+        let flops = 4.0 * (n * qh * d) as f64 * keys as f64;
         println!(
-            "| {d} | {g} | {kvh} | {n} x {len} | {:.0} | {:.0} |",
+            "| {d} | {g} | {kvh} | {n} x {len}{}{} | {:.0} | {:.0} |",
+            win.map_or(String::new(), |w| format!(", window {w}")),
+            if scatter { ", pages scattered" } else { "" },
             flops / tc5 * 1e-6,
             flops / fa2 * 1e-6
         );
