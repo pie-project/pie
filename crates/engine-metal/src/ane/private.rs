@@ -24,6 +24,9 @@ use crate::error::{Fault, Result};
 struct Layer {
     split: Split,
     source: Source,
+    /// The weight set this layer reads: its own when the site keeps every
+    /// layer converted, else the one of its parity.
+    set: usize,
 }
 
 /// What a dispatch's weight value names.
@@ -39,7 +42,10 @@ struct MlpSite {
     shape: Shape,
     layers: BTreeMap<u32, Layer>,
     shared: Shared,
-    sets: [Set; 2],
+    sets: Vec<Set>,
+    /// Every layer's weights were converted into a set of its own at load,
+    /// as Splash keeps them, so no fire stages any.
+    resident: bool,
     up_rows: Tensor,
     rotated: Tensor,
     ffn: Compiled<Ffn>,
@@ -157,12 +163,14 @@ struct Common {
     status: Tensor,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mlp_site(
     device: &Context,
     handles: &Handles,
     common: &Common,
     mlps: &[Mlp],
     split: AneMlp,
+    room: u64,
     keep: &mut Vec<Buffer>,
     keys: &mut BTreeMap<u32, Key>,
 ) -> Result<Option<MlpSite>> {
@@ -170,7 +178,14 @@ fn mlp_site(
     let Ok(shape) = Shape::new(hidden, intermediate, mlp_units(intermediate, split)) else {
         return Ok(None);
     };
-    let memory = Arc::new(Memory::new(&shape).map_err(fault)?);
+    let count = mlps
+        .iter()
+        .filter(|m| m.intermediate == intermediate && m.gate_up.codes.width == hidden)
+        .count();
+    // Every layer converted once, while it leaves the kv pool at least half
+    // the room: the memory Splash's split takes from its cache.
+    let resident = count > 2 && ffn::Weights::estimate(&shape) * count as u64 <= room / 2;
+    let memory = Arc::new(Memory::new(&shape, if resident { count } else { 2 }).map_err(fault)?);
     let inputs = memory
         .inputs
         .iter()
@@ -205,7 +220,11 @@ fn mlp_site(
                 .collect::<Result<_>>()?,
         })
     };
-    let sets = [set(&memory.sets[0], keep)?, set(&memory.sets[1], keep)?];
+    let sets = memory
+        .sets
+        .iter()
+        .map(|w| set(w, keep))
+        .collect::<Result<Vec<_>>>()?;
     let up_rows = banks::staging(device, handles, MAX_ROWS, shape.gpu, Dtype::Bf16, keep)?;
     let rotated = banks::staging(device, handles, MAX_ROWS, hidden, Dtype::F16, keep)?;
     let shared = Shared {
@@ -227,6 +246,11 @@ fn mlp_site(
             banks::staging(device, handles, hidden, 1, Dtype::F16, keep)?,
         ];
         let split = banks::split(handles, mlp, shape.gpu)?;
+        let set = if resident {
+            layers.len()
+        } else {
+            (mlp.layer & 1) as usize
+        };
         layers.insert(
             mlp.layer,
             Layer {
@@ -236,19 +260,29 @@ fn mlp_site(
                     down: mlp.down,
                     scales,
                 },
+                set,
             },
         );
     }
     eprintln!(
-        "ane: {} MLP layers split, Neural Engine takes {} of {intermediate} columns",
+        "ane: {} MLP layers split, Neural Engine takes {} of {intermediate} columns{}",
         layers.len(),
-        shape.ane
+        shape.ane,
+        if resident {
+            format!(
+                ", every layer's weights kept converted ({} MiB)",
+                memory.sets.iter().map(ffn::Weights::bytes).sum::<u64>() >> 20
+            )
+        } else {
+            String::new()
+        }
     );
     Ok(Some(MlpSite {
         shape,
         layers,
         shared,
         sets,
+        resident,
         up_rows,
         rotated,
         ffn: Arc::new(OnceLock::new()),
@@ -380,6 +414,7 @@ impl Job {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn load(
     device: &Context,
     handles: &Handles,
@@ -388,6 +423,7 @@ pub fn load(
     mlp_split: AneMlp,
     projection_split: AneProjections,
     min_rows: u32,
+    room: u64,
 ) -> Result<Option<Private>> {
     use objc2_metal::MTLDevice;
     let mut keep = Vec::new();
@@ -410,7 +446,7 @@ pub fn load(
         None
     } else {
         mlp_site(
-            device, handles, &common, mlps, mlp_split, &mut keep, &mut keys,
+            device, handles, &common, mlps, mlp_split, room, &mut keep, &mut keys,
         )?
     };
     let mut sites = Vec::new();
@@ -438,6 +474,19 @@ pub fn load(
         for layer in site.layers.values() {
             kernels::row_scales(&sink, &site.shape, &layer.source, signs)
                 .map_err(|e| fault(e.to_string()))?;
+        }
+        // A resident site converts every layer now, behind its row scales.
+        if site.resident {
+            for layer in site.layers.values() {
+                kernels::stage(
+                    &sink,
+                    &site.shape,
+                    &layer.source,
+                    signs,
+                    &site.sets[layer.set],
+                )
+                .map_err(|e| fault(e.to_string()))?;
+            }
         }
     }
     for site in &sites {
@@ -529,6 +578,18 @@ impl Private {
         Some(outcome)
     }
 
+    /// What the converted weights a resident MLP site keeps take, which
+    /// the kv pool gives up; nothing for a site that stages by layer.
+    #[must_use]
+    pub fn resident_bytes(&self) -> u64 {
+        self.mlp
+            .as_ref()
+            .filter(|site| site.resident)
+            .map_or(0, |site| {
+                site._memory.sets.iter().map(ffn::Weights::bytes).sum()
+            })
+    }
+
     /// How many MLPs the Neural Engine has been handed so far.
     #[must_use]
     pub fn splits(&self) -> u64 {
@@ -604,7 +665,10 @@ impl Private {
         let Some(source) = site.layers.get(&layer) else {
             return Ok(());
         };
-        let set = &site.sets[(layer & 1) as usize];
+        if site.resident {
+            return Ok(());
+        }
+        let set = &site.sets[source.set];
         kernels::stage(ctx, &site.shape, &source.source, site.shared.signs, set)?;
         site.staged.store(layer, Ordering::Release);
         Ok(())
@@ -624,7 +688,8 @@ impl Private {
         };
         kernels::prepare(ctx, &site.shared, x, rotated, plan.at.ready)?;
         if let Some(Ok(ffn)) = site.ffn.get() {
-            let binding = &ffn.evaluations[plan.evaluation].1[(plan.layer & 1) as usize];
+            let set = site.layers.get(&plan.layer).map_or(0, |l| l.set);
+            let binding = &ffn.evaluations[plan.evaluation].1[set];
             self.handoff.start(ctx, &ffn.program, binding, plan.at)?;
             self.splits.fetch_add(1, Ordering::AcqRel);
         }

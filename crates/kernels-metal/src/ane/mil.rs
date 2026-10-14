@@ -62,7 +62,8 @@ pub fn half(value: f32) -> u16 {
 /// procedure is specialized for.
 pub struct Input<'a> {
     pub name: String,
-    pub surfaces: [&'a Surface; 2],
+    /// The surface each binding reads, by binding.
+    pub surfaces: Vec<&'a Surface>,
     pub rows: u32,
     pub width: u32,
 }

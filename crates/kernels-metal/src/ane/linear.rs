@@ -96,7 +96,7 @@ fn inputs<'a>(shape: &Shape, memory: &'a Memory) -> Vec<Input<'a>> {
     for (k, x) in memory.inputs.iter().enumerate() {
         list.push(Input {
             name: format!("x{k}"),
-            surfaces: [x, x],
+            surfaces: vec![x, x],
             rows: shape.segment,
             width: 0,
         });
@@ -105,14 +105,14 @@ fn inputs<'a>(shape: &Shape, memory: &'a Memory) -> Vec<Input<'a>> {
     for k in 0..shape.segments() as usize {
         list.push(Input {
             name: format!("w{k}"),
-            surfaces: [&a.w[k], &b.w[k]],
+            surfaces: vec![&a.w[k], &b.w[k]],
             rows: shape.ane,
             width: shape.segment,
         });
     }
     list.push(Input {
         name: "s".into(),
-        surfaces: [&a.scale, &b.scale],
+        surfaces: vec![&a.scale, &b.scale],
         rows: shape.ane,
         width: 1,
     });

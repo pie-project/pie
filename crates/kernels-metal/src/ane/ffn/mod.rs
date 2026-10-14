@@ -1,5 +1,5 @@
 //! The Neural Engine's share of a split MLP: one program with a procedure
-//! per row count, bound twice over the two weight sets. TEMPORARY like the
+//! per row count, bound over each weight set. TEMPORARY like the
 //! bridge it runs on: the program format (MIL text over `tensor_buffer`
 //! IOSurface inputs) is undocumented and may change.
 
@@ -18,7 +18,7 @@ pub use shape::*;
 pub struct Ffn {
     pub program: Program,
     /// Per row count, that procedure bound over each weight set.
-    pub evaluations: Vec<(u32, [Binding; 2])>,
+    pub evaluations: Vec<(u32, Vec<Binding>)>,
 }
 
 impl Ffn {
@@ -51,7 +51,10 @@ impl Ffn {
                     .collect::<Result<Vec<_>, _>>()?;
                 program.bind(procedure, &surfaces, &memory.partial)
             };
-            evaluations.push((count, [bind(0)?, bind(1)?]));
+            evaluations.push((
+                count,
+                (0..memory.sets.len()).map(bind).collect::<Result<_, _>>()?,
+            ));
         }
         Ok(Ffn {
             program,

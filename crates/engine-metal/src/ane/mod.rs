@@ -91,6 +91,9 @@ impl Ane {
     pub fn compiled(&self) -> Option<std::result::Result<(), String>> {
         match *self {}
     }
+    pub fn resident_bytes(&self) -> u64 {
+        match *self {}
+    }
     pub fn splits(&self) -> u64 {
         match *self {}
     }
@@ -112,13 +115,16 @@ fn routes_experts(trace: &poem_ir::Trace) -> bool {
 /// Sets the Neural Engine up for the dense MLPs and the wide projections
 /// in `trace` as the chip's profile splits them, or `None` when the profile
 /// keeps both on the GPU, the model routes through experts, the bridge does
-/// not load, or the model has nothing it can take.
+/// not load, or the model has nothing it can take. `room` is what the load
+/// leaves its kv pool; the MLPs' weights stay converted where half of it
+/// holds them.
 pub fn load(
     device: &Context,
     handles: &Handles,
     trace: &poem_ir::Trace,
     weights: &crate::weights::Weights,
     chip: &profile::Profile,
+    room: u64,
 ) -> Result<Option<Ane>> {
     #[cfg(target_vendor = "apple")]
     {
@@ -149,11 +155,12 @@ pub fn load(
             mlp_split,
             projection_split,
             min_rows,
+            room,
         )
     }
     #[cfg(not(target_vendor = "apple"))]
     {
-        let _ = (device, handles, trace, weights, chip);
+        let _ = (device, handles, trace, weights, chip, room);
         Ok(None)
     }
 }

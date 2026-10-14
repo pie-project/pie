@@ -538,12 +538,22 @@ impl Shell {
             &boot.trace,
             *chip.get::<crate::chip::WeightsLayout>(),
         )?;
-        let ane = crate::ane::load(&device, &handles, &boot.trace, &weights, &chip).unwrap_or_else(
-            |why| {
+        // What the kv pool would have, before the Neural Engine takes any.
+        let room = crate::store::accounting::Accounting::with_scratch(
+            device.working_set(),
+            elsewhere,
+            boot.memory_share,
+            weights.bytes(),
+            compiled.arena.bytes,
+            0,
+        )
+        .pool;
+        let ane = crate::ane::load(&device, &handles, &boot.trace, &weights, &chip, room)
+            .unwrap_or_else(|why| {
                 eprintln!("the Neural Engine stays out of this load: {why}");
                 None
-            },
-        );
+            });
+        let ane_bytes = ane.as_ref().map_or(0, crate::ane::Ane::resident_bytes);
         handles.seal();
 
         // The kv pool and the recurrent-state buffers beside it: both are
@@ -562,7 +572,7 @@ impl Shell {
                 device.working_set(),
                 elsewhere,
                 boot.memory_share,
-                weights.bytes(),
+                weights.bytes() + ane_bytes,
                 compiled.arena.bytes,
                 pool,
             )

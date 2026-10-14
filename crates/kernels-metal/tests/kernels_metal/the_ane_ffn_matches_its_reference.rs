@@ -84,7 +84,7 @@ fn the_ane_ffn_matches_its_reference_on_one_chunk() {
         return;
     }
     let shape = Shape::new(SEGMENT, 2 * INTERMEDIATE_BLOCK, 1).unwrap();
-    let memory = Memory::new(&shape).unwrap();
+    let memory = Memory::new(&shape, 2).unwrap();
     let started = std::time::Instant::now();
     let ffn = Ffn::compile(&shape, &memory, &std::env::temp_dir().join("pie-ane-test")).unwrap();
     eprintln!("compiled in {:.1}s", started.elapsed().as_secs_f64());
