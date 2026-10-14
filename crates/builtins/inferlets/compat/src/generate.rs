@@ -200,10 +200,11 @@ pub async fn generate(
     let ws = WorkingSet::new();
     let slots = ws.reserve(pool_pages).context("reserve KV pages")?;
     let pool_ids = slots.ids().to_vec();
-    // The decode program's page list is cut to a bucket of the pool, padded
-    // with its last page past the reservation (page_indptr never reaches the
-    // padding): requests of different lengths then compile to one program,
-    // and the engine flies their epilogues as one batch instead of one apiece.
+    // The decode page list never changes, so it is seeded once and stays out
+    // of the epilogue. Its length still keys the program, so it is padded to
+    // a bucket with its last page (page_indptr never reaches the padding):
+    // requests of different lengths share one program and fly as one batch.
+    let first_page = pool_ids.first().copied().unwrap_or(0);
     let page_cap = pool_pages
         .max(DECODE_PAGE_FLOOR_TOKENS.div_ceil(page_t))
         .next_power_of_two();
@@ -343,9 +344,8 @@ pub async fn generate(
     let klen = Channel::from([n + 1]).named("klen");
     let w_slot = Channel::from([slot_n]).named("w_slot");
     let w_off = Channel::from([n % page_t]).named("w_off");
-    let pages = Channel::from(page_list.clone()).named("pages");
+    let pages = Channel::from(page_list).named("pages");
     let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_t)]).named("page_indptr");
-    let pool_ids_ch = Channel::from(page_list).named("pool_ids");
     let out = Channel::new([1], dtype::i32)
         .capacity(channel_capacity() as u32)
         .named("out");
@@ -390,7 +390,6 @@ pub async fn generate(
     )?;
     fwd.epilogue(move || {
         let base = fill.take(); // [1] u32 — the position this fire writes
-        let pids = pool_ids_ch.take();
         let r = rng.take();
         let taken = hist.map(|(c, p)| (c.take(), p.take()));
         let m = mask.map(|m| m.take());
@@ -406,11 +405,10 @@ pub async fn generate(
         let r_next = &r + iota(2);
 
         let logical_slot = &base / page_t;
-        let w_slot_v = gather(&pids, &logical_slot);
+        let w_slot_v = &logical_slot + first_page;
         let w_off_v = &base % page_t;
         let klen_v = &base + 1u32;
         let next_free = &base + 1u32;
-        let pages_v = reshape(&pids, [page_cap]);
         let page_count = klen_v.div_ceil(page_t);
         let pidx_v = indptr(1, &page_count);
 
@@ -421,10 +419,8 @@ pub async fn generate(
         klen.put(&klen_v);
         pos.put(&(&base - rope_delta));
         fill.put(&next_free);
-        pages.put(&pages_v);
         page_indptr.put(&pidx_v);
         rng.put(&r_next);
-        pool_ids_ch.put(&pids);
         if let (Some((c, p)), Some(next), Some((_, present))) = (hist, counts_next, taken) {
             c.put(&next);
             p.put(&present);
