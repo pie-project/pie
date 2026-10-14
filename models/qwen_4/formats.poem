@@ -235,23 +235,43 @@ def read(m, reads, layout):
     read_mixer(reads, m.mixer, norm, trunk("hyper_connection_mixer"))
 
 def read_e4m3_table(reads, w, shards, scale):
-    """`w` from e4m3 shards under one stored scale: each shard widened and
-    scaled, then the shards joined."""
+    """`w` from e4m3 shards under one stored scale: the shards joined as
+    stored beside the scale, or each shard widened and scaled to bf16."""
+    for shard in shards:
+        if stored(shard) != E4M3:
+            fail("`{}`: `{}` is stored {}, and this checkpoint's n-gram shards are e4m3".format(w.name, shard, stored(shard)))
+    if w.dtype == dtype.e4m3tensor:
+        read_e4m3_shards(reads, w, shards, scale)
+        return
     if w.dtype != dtype.bf16:
-        fail("`{}`: the n-gram table is stored e4m3 under one scale and is read as bf16, not {}".format(w.name, w.dtype))
+        fail("`{}`: the n-gram table is stored e4m3 under one scale and is read as it is or at bf16, not {}".format(w.name, w.dtype))
     at = w.name + ".scale"
     factor = src(scale).transmute([1, 1], stored(scale))
     if stored(scale) != raw(dtype.bf16):
         factor = factor.cast(raw(dtype.bf16))
     parts = [tensor(at, factor, raw(dtype.bf16), shape = [1, 1], internal = True)]
     for i, shard in enumerate(shards):
-        if stored(shard) != E4M3:
-            fail("`{}`: `{}` is stored {}, and this checkpoint's n-gram shards are e4m3".format(w.name, shard, stored(shard)))
         wide = "{}.wide{}".format(w.name, i)
         parts.append(tensor(wide, src(shard).cast(raw(dtype.bf16)), raw(dtype.bf16), internal = True))
         parts.append(tensor("{}.shard{}".format(w.name, i), out(wide).scale_by(out(at)), raw(dtype.bf16), internal = True))
     parts.append(tensor(w.name, concat(0, [out("{}.shard{}".format(w.name, i)) for i in range(len(shards))]), raw(dtype.bf16), shape = w.shape))
     reads.extend(parts)
+
+def read_e4m3_shards(reads, w, shards, scale):
+    """`w`'s e4m3 codes, the shards joined byte for byte, under the one
+    stored scale read as f32 (a one-value plane, as the artifact's scalar is
+    four bytes)."""
+    if product(shape(scale)) != 1:
+        fail("`{}`: `{}` is stored {}, and a per-tensor scale is one value".format(w.name, scale, shape(scale)))
+    codes = grouped(w)
+    parts = [src(shard).transmute(shape(shard), codes) for shard in shards]
+    factor = src(scale)
+    if stored(scale) != F32:
+        factor = factor.cast(F32)
+    reads.extend([
+        tensor(w.name, concat(0, parts), codes, shape = w.shape),
+        tensor(scales_name(w.name), factor, F32, shape = shape(scale), scaling = w),
+    ])
 
 def read_mixer(reads, res, norm, site):
     """A hyper-connection's mix-in, and its injection if it has one."""
