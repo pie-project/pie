@@ -354,6 +354,7 @@ mod tests {
                     major == 10 && minor == 0,
                     "{gpu}"
                 );
+                assert_eq!(tuning.merge_warp, b200, "{gpu}");
                 assert_eq!(
                     kernels_cuda::tuning::Tuning {
                         gemv_narrow: false,
@@ -361,6 +362,7 @@ mod tests {
                         moe_tc5: defaults.moe_tc5,
                         gemm_tc5_glu_from: defaults.gemm_tc5_glu_from,
                         ssm_gdn_fused_scan: false,
+                        merge_warp: false,
                         mxfp4_mma_until: defaults.mxfp4_mma_until,
                         mxfp4_mma_from: defaults.mxfp4_mma_from,
                         prefill_tc5: false,
@@ -502,6 +504,7 @@ mod tests {
         assert!(b200.moe_tc5);
         assert_eq!(b200.gemm_tc5_glu_from, 64);
         assert_eq!((b200.mxfp4_mma_from, b200.mxfp4_mma_until), (64, 1024));
+        assert!(b200.merge_warp);
         for (major, minor) in [
             (8, 0),
             (8, 6),
@@ -515,6 +518,10 @@ mod tests {
         ] {
             let other = tuning(major, minor, 132);
             assert!(!other.moe_tc5, "sm_{major}{minor} keeps the old selects");
+            assert!(
+                !other.merge_warp,
+                "sm_{major}{minor} keeps the staged merge"
+            );
             assert_eq!(
                 other.gemm_tc5_glu_from, 65_536,
                 "sm_{major}{minor} keeps the GLU apart"

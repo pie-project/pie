@@ -211,6 +211,12 @@ pub struct PrefillTc5;
 #[decision(id = "kernel.sdpa.decode.grouped_prefill_from", constant(range(0..=64)), default = 0, tune = search)]
 pub struct DecodeGroupedPrefillFrom(pub u32);
 
+/// Whether a split attention's partial states fold a warp a (row, head)
+/// rather than through the staged persistent merge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.merge_warp", flag, default = false, tune = search)]
+pub struct SdpaMergeWarp;
+
 pub fn register(registry: &mut Registry) {
     registry
         .add::<MoeGrouped>()
@@ -241,6 +247,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeTc5From>()
         .add::<GemmTc5GluFrom>()
         .add::<SsmGdnFusedScan>()
+        .add::<SdpaMergeWarp>()
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
         .add::<PrefillTc5>()
@@ -282,6 +289,7 @@ pub struct Tuning {
     pub moe_tc5_from: u32,
     pub gemm_tc5_glu_from: u32,
     pub ssm_gdn_fused_scan: bool,
+    pub merge_warp: bool,
     pub mxfp4_mma_until: u32,
     pub mxfp4_mma_from: u32,
     pub prefill_tc5: bool,
@@ -321,6 +329,7 @@ impl Tuning {
         moe_tc5_from: 16,
         gemm_tc5_glu_from: 65_536,
         ssm_gdn_fused_scan: false,
+        merge_warp: false,
         mxfp4_mma_until: 0,
         mxfp4_mma_from: 64,
         prefill_tc5: false,
@@ -360,6 +369,7 @@ impl Tuning {
             moe_tc5_from: profile.get::<MoeTc5From>().0,
             gemm_tc5_glu_from: profile.get::<GemmTc5GluFrom>().0,
             ssm_gdn_fused_scan: profile.on::<SsmGdnFusedScan>(&Anywhere),
+            merge_warp: profile.on::<SdpaMergeWarp>(&Anywhere),
             mxfp4_mma_until: profile.get::<MoeMxfp4MmaUntil>().0,
             mxfp4_mma_from: profile.get::<MoeMxfp4MmaFrom>().0,
             prefill_tc5: profile.on::<PrefillTc5>(&Anywhere),

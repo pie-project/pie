@@ -251,6 +251,25 @@ impl Fixture {
         }
     }
 
+    /// Fills the output planes with garbage, so a fire that lands nothing
+    /// is caught rather than read as the last one's answer.
+    fn scrub(&self) {
+        use kernels_cuda::cudarc::runtime::sys as rt;
+        let rows = self.case.lens.len();
+        unsafe {
+            rt::cudaMemset(
+                self.o as *mut core::ffi::c_void,
+                0x7f,
+                rows * (self.case.q_heads * self.case.head_dim) as usize * 2,
+            );
+            rt::cudaMemset(
+                self.lse as *mut core::ffi::c_void,
+                0x7f,
+                rows * self.case.q_heads as usize * 4,
+            );
+        }
+    }
+
     fn output(&self) -> (Vec<f32>, Vec<f32>) {
         self.gpu.sync();
         let rows = self.case.lens.len();
@@ -316,26 +335,35 @@ fn worst(got: &[f32], want: &[f32]) -> f32 {
         .fold(0.0, f32::max)
 }
 
+/// Each case under both folds of a split's partials: the staged persistent
+/// merge and the warp-a-row one.
 fn check(case: Case, via_prefill: bool) {
     let fx = fixture(case, 0x5eed);
-    if via_prefill {
-        fx.fire_prefill(Tuning::DEFAULT)();
-    } else {
-        fx.fire(Tuning::DEFAULT)();
-    }
-    let (o, lse) = fx.output();
     let (want_o, want_lse) = fx.reference();
-    let (eo, el) = (worst(&o, &want_o), worst(&lse, &want_lse));
-    assert!(
-        eo < 2e-2 && el < 1e-2,
-        "{} q / {} kv heads at {}, window {:?}, graph {}, via prefill {via_prefill}: output \
-         off by {eo}, lse by {el}",
-        case.q_heads,
-        case.kv_heads,
-        case.head_dim,
-        case.window,
-        case.graph
-    );
+    for merge_warp in [false, true] {
+        let tuning = Tuning {
+            merge_warp,
+            ..Tuning::DEFAULT
+        };
+        if via_prefill {
+            fx.fire_prefill(tuning)();
+        } else {
+            fx.fire(tuning)();
+        }
+        let (o, lse) = fx.output();
+        fx.scrub();
+        let (eo, el) = (worst(&o, &want_o), worst(&lse, &want_lse));
+        assert!(
+            eo < 2e-2 && el < 1e-2,
+            "{} q / {} kv heads at {}, window {:?}, graph {}, via prefill {via_prefill}, warp \
+             merge {merge_warp}: output off by {eo}, lse by {el}",
+            case.q_heads,
+            case.kv_heads,
+            case.head_dim,
+            case.window,
+            case.graph
+        );
+    }
 }
 
 const LENS: &[usize] = &[1, 15, 16, 17, 130, 300, 701];
@@ -430,8 +458,8 @@ fn a_decode_reports_its_time_at_gptoss_and_gemma4_heads() {
     static B1: [usize; 1] = [CTX];
     static B8: [usize; 8] = [CTX; 8];
     static B64: [usize; 64] = [CTX; 64];
-    println!("| layer | batch | graph | decode us | prefill us |");
-    println!("|---|---:|---|---:|---:|");
+    println!("| layer | batch | graph | decode us | + warp merge | prefill us | + warp merge |");
+    println!("|---|---:|---|---:|---:|---:|---:|");
     for (name, q_heads, kv_heads, head_dim, window) in [
         ("gpt-oss full", 64, 8, 64, None),
         ("gpt-oss sliding 128", 64, 8, 64, Some(128)),
@@ -450,10 +478,17 @@ fn a_decode_reports_its_time_at_gptoss_and_gemma4_heads() {
                 };
                 let mut fx = fixture(case, 7);
                 let flush = fx.gpu.zeros(FLUSH);
+                let warp = Tuning {
+                    merge_warp: true,
+                    ..Tuning::DEFAULT
+                };
                 let decode = time(&fx.gpu, flush, &fx.fire(Tuning::DEFAULT));
+                let decode_w = time(&fx.gpu, flush, &fx.fire(warp));
                 let prefill = time(&fx.gpu, flush, &fx.fire_prefill(Tuning::DEFAULT));
+                let prefill_w = time(&fx.gpu, flush, &fx.fire_prefill(warp));
                 println!(
-                    "| {name} | {} | {graph} | {decode:.1} | {prefill:.1} |",
+                    "| {name} | {} | {graph} | {decode:.1} | {decode_w:.1} | {prefill:.1} | \
+                     {prefill_w:.1} |",
                     lens.len()
                 );
             }

@@ -384,6 +384,37 @@ fn merge_blocks_per_sm(_instantiation: &'static str, _smem: u32) -> u32 {
     1
 }
 
+/// The split's partials folded a warp a (row, head), straight from global
+/// memory: a decode's rows hold two or three partials each, which the
+/// staged persistent merge spends most of its time synchronizing over.
+fn fold_warp(ctx: &Ctx, op: &'static str, split: &Partials, num_sms: u32) -> Result<(), Error> {
+    const WARPS: u32 = 8;
+    let pairs = split.max_seq_len.saturating_mul(split.num_heads);
+    let blocks = pairs.div_ceil(WARPS).clamp(1, num_sms.saturating_mul(8));
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::attn::merge_partials_warp<{}>",
+                split.head_dim
+            )),
+        )
+        .apply(Launch::grid([blocks, 1, 1], [32 * WARPS, 1, 1])),
+        &[
+            ArgValue::Ptr(split.tmp_v),
+            ArgValue::Ptr(split.tmp_s),
+            ArgValue::Ptr(split.indptr),
+            ArgValue::Ptr(split.o),
+            ArgValue::Ptr(split.lse),
+            split.max_seq_len.arg(),
+            ArgValue::Ptr(split.seq_len),
+            split.num_heads.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
 pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<(), Error> {
     let head_dim = split.head_dim;
     let (_, bdx, bdy) = merge_geometry(head_dim).ok_or_else(|| no_merge_row(op))?;
@@ -401,6 +432,12 @@ pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<(), 
     }
 
     let num_sms = ctx.multiprocessors().unwrap_or(1).max(1);
+    // A wide batch's rows hold a few partials each and fold a warp a row; a
+    // narrow one's rows hold many, which the staged merge pipelines.
+    let pairs = split.max_seq_len.saturating_mul(split.num_heads);
+    if ctx.tuning().merge_warp && head_dim.is_multiple_of(64) && pairs >= num_sms * 8 {
+        return fold_warp(ctx, op, split, num_sms);
+    }
     let blocks = grid_blocks(
         merge_blocks_per_sm(instantiation, smem),
         split.max_seq_len,
