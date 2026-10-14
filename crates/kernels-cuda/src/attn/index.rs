@@ -236,10 +236,16 @@ pub fn topk(
             .saturating_mul(core::mem::size_of::<f32>()),
     )?;
 
+    // The tensor-core scorer where the profile asks for it and the heads fit
+    // one mma's rows at its key width.
+    let entry = if ctx.tuning().index_mma && head_dim == 128 && heads <= 16 {
+        "::pie::attn::index_topk_paged_mma<::pie::bf16>"
+    } else {
+        "::pie::attn::index_topk_paged<::pie::bf16>"
+    };
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::index_topk_paged<::pie::bf16>")
-            .apply(Launch::per_row(selection.rows, K_BLOCK)),
+        Fire::at(FILE, entry).apply(Launch::per_row(selection.rows, K_BLOCK)),
         &[
             q.data.arg(),
             ArgValue::Ptr(weights.map_or(0, |w| w.ptr)),

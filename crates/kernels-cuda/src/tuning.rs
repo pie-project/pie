@@ -61,6 +61,12 @@ pub struct GemmTc5GluFrom(pub u32);
 #[decision(id = "kernel.sdpa.selected_mma", flag, default = false, tune = search)]
 pub struct SdpaSelectedMma;
 
+/// Whether a pooled index (`attention.index_topk`) scores its blocks on the
+/// tensor cores rather than a thread a block. Off scores the scalar way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.index_mma", flag, default = false, tune = search)]
+pub struct SdpaIndexMma;
+
 /// Whether a small decode batch still splits its keys across blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.decode.split_small", flag, default = false, tune = search)]
@@ -239,7 +245,8 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4MmaFrom>()
         .add::<PrefillTc5>()
         .add::<DecodeGroupedPrefillFrom>()
-        .add::<SdpaSelectedMma>();
+        .add::<SdpaSelectedMma>()
+        .add::<SdpaIndexMma>();
 }
 
 /// The kernel decisions one load runs under, read once from its profile.
@@ -280,6 +287,7 @@ pub struct Tuning {
     pub prefill_tc5: bool,
     pub decode_grouped_prefill_from: u32,
     pub selected_mma: bool,
+    pub index_mma: bool,
 }
 
 impl Tuning {
@@ -318,6 +326,7 @@ impl Tuning {
         prefill_tc5: false,
         decode_grouped_prefill_from: 0,
         selected_mma: false,
+        index_mma: false,
     };
 
     #[must_use]
@@ -356,6 +365,7 @@ impl Tuning {
             prefill_tc5: profile.on::<PrefillTc5>(&Anywhere),
             decode_grouped_prefill_from: profile.get::<DecodeGroupedPrefillFrom>().0,
             selected_mma: profile.on::<SdpaSelectedMma>(&Anywhere),
+            index_mma: profile.on::<SdpaIndexMma>(&Anywhere),
         }
     }
 }

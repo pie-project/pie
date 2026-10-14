@@ -4,12 +4,14 @@
 // it sees by the block's last key, `sum_h w_h · relu(q_h · k)`, and selects
 // the `TOP_K` best, ascending; a row that sees no more than `TOP_K` blocks
 // selects them all. Read against a host reference over a fresh prefill and a
-// continuation whose page tables are out of order.
+// continuation whose page tables are out of order, scored the scalar way
+// and on the tensor cores (`kernel.sdpa.index_mma`).
 
 use crate::common::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn::index;
 use kernels_cuda::tensor::{KvPool, RaggedTensor, Tensor};
+use kernels_cuda::tuning::Tuning;
 
 const HEADS: usize = 4;
 const DIM: usize = 128;
@@ -78,78 +80,75 @@ fn the_pooled_index_selects_its_best_blocks() {
     ];
     let indptr = gpu.up(&qo_indptr);
     let keys = pool(gpu.up(&k_raw), tables);
-    let sel_at = gpu.zeros(tokens * TOP_K * 4);
-    let mut selection = Tensor::new(sel_at, tokens as u32, TOP_K as u32, Dtype::I32);
-    let ctx = gpu.ctx();
-    index::topk(
-        &ctx,
-        RaggedTensor {
-            data: Tensor::new(
-                gpu.up(&q_raw),
-                tokens as u32,
-                (HEADS * DIM) as u32,
-                Dtype::Bf16,
-            ),
-            indptr: Tensor::new(indptr, qo_indptr.len() as u32, 1, Dtype::I32),
-        },
-        Some(Tensor::new(
-            gpu.up(&w_raw),
-            tokens as u32,
+    let q_at = gpu.up(&q_raw);
+    let w_at = gpu.up(&w_raw);
+    for mma in [false, true] {
+        let sel_at = gpu.zeros(tokens * TOP_K * 4);
+        let mut selection = Tensor::new(sel_at, tokens as u32, TOP_K as u32, Dtype::I32);
+        let ctx = gpu.ctx().with_tuning(Tuning {
+            index_mma: mma,
+            ..Tuning::DEFAULT
+        });
+        index::topk(
+            &ctx,
+            RaggedTensor {
+                data: Tensor::new(q_at, tokens as u32, (HEADS * DIM) as u32, Dtype::Bf16),
+                indptr: Tensor::new(indptr, qo_indptr.len() as u32, 1, Dtype::I32),
+            },
+            Some(Tensor::new(w_at, tokens as u32, HEADS as u32, Dtype::Bf16)),
+            &keys,
             HEADS as u32,
-            Dtype::Bf16,
-        )),
-        &keys,
-        HEADS as u32,
-        DIM as u32,
-        TOP_K as u32,
-        RATIO as u32,
-        &mut selection,
-    )
-    .expect("attention.index_topk ranks the pooled blocks");
-    gpu.sync();
-    let got: Vec<i32> = gpu.down(sel_at, tokens * TOP_K);
+            DIM as u32,
+            TOP_K as u32,
+            RATIO as u32,
+            &mut selection,
+        )
+        .expect("attention.index_topk ranks the pooled blocks");
+        gpu.sync();
+        let got: Vec<i32> = gpu.down(sel_at, tokens * TOP_K);
 
-    let mut t = 0;
-    let (mut ranked, mut whole) = (0, 0);
-    for r in 0..Q_LENS.len() {
-        for i in 0..Q_LENS[r] {
-            let seen = (KV_LENS[r] - Q_LENS[r] + i + 1) / RATIO;
-            let row = &got[t * TOP_K..(t + 1) * TOP_K];
-            if seen <= TOP_K {
-                let want: Vec<i32> = (0..TOP_K as i32)
-                    .map(|n| if (n as usize) < seen { n } else { -1 })
-                    .collect();
-                assert_eq!(
-                    row,
-                    &want[..],
-                    "row {t} sees {seen} blocks and takes them all"
-                );
-                whole += 1;
-            } else {
-                let score = |j: usize| -> f32 {
-                    let at = slot(r, (j + 1) * RATIO - 1) * DIM;
-                    (0..HEADS)
-                        .map(|h| {
-                            let qh = &q[(t * HEADS + h) * DIM..][..DIM];
-                            let dot: f32 =
-                                qh.iter().zip(&k[at..at + DIM]).map(|(a, b)| a * b).sum();
-                            dot.max(0.0) * w[t * HEADS + h]
-                        })
-                        .sum()
-                };
-                let mut order: Vec<usize> = (0..seen).collect();
-                order.sort_by(|&a, &b| score(b).total_cmp(&score(a)));
-                let mut want: Vec<i32> = order[..TOP_K].iter().map(|&j| j as i32).collect();
-                want.sort_unstable();
-                assert_eq!(
-                    row,
-                    &want[..],
-                    "row {t}: the best {TOP_K} of {seen} blocks, ascending"
-                );
-                ranked += 1;
+        let mut t = 0;
+        let (mut ranked, mut whole) = (0, 0);
+        for r in 0..Q_LENS.len() {
+            for i in 0..Q_LENS[r] {
+                let seen = (KV_LENS[r] - Q_LENS[r] + i + 1) / RATIO;
+                let row = &got[t * TOP_K..(t + 1) * TOP_K];
+                if seen <= TOP_K {
+                    let want: Vec<i32> = (0..TOP_K as i32)
+                        .map(|n| if (n as usize) < seen { n } else { -1 })
+                        .collect();
+                    assert_eq!(
+                        row,
+                        &want[..],
+                        "mma {mma}: row {t} sees {seen} blocks and takes them all"
+                    );
+                    whole += 1;
+                } else {
+                    let score = |j: usize| -> f32 {
+                        let at = slot(r, (j + 1) * RATIO - 1) * DIM;
+                        (0..HEADS)
+                            .map(|h| {
+                                let qh = &q[(t * HEADS + h) * DIM..][..DIM];
+                                let dot: f32 =
+                                    qh.iter().zip(&k[at..at + DIM]).map(|(a, b)| a * b).sum();
+                                dot.max(0.0) * w[t * HEADS + h]
+                            })
+                            .sum()
+                    };
+                    let mut order: Vec<usize> = (0..seen).collect();
+                    order.sort_by(|&a, &b| score(b).total_cmp(&score(a)));
+                    let mut want: Vec<i32> = order[..TOP_K].iter().map(|&j| j as i32).collect();
+                    want.sort_unstable();
+                    assert_eq!(
+                        row,
+                        &want[..],
+                        "mma {mma}: row {t}: the best {TOP_K} of {seen} blocks, ascending"
+                    );
+                    ranked += 1;
+                }
+                t += 1;
             }
-            t += 1;
         }
+        assert!(ranked > 0 && whole > 0, "both kinds of row were read");
     }
-    assert!(ranked > 0 && whole > 0, "both kinds of row were read");
 }

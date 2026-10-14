@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include "prelude/device.cuh"
 
 namespace pie::attn {
@@ -151,6 +153,51 @@ __global__ void index_topk_mask(
     for (int j = tid; j < nkeys; j += kBlock) mrow[j] = (logit[j] >= thr) ? 1 : 0;
 }
 
+// The `topk` best of a row's `nkeys` scores, ascending, `-1` past the end:
+// the threshold the counts bisect to, then the scores at or above it in order.
+__device__ __forceinline__ void select_top(const float* __restrict__ frow, int nkeys, int topk,
+                                           i32* __restrict__ srow, int tid)
+{
+    __shared__ float red[kBlock];
+    float lo_l = pos_inf(), hi_l = -pos_inf();
+    for (int j = tid; j < nkeys; j += kBlock) {
+        lo_l = fminf(lo_l, frow[j]);
+        hi_l = fmaxf(hi_l, frow[j]);
+    }
+    red[tid] = lo_l; __syncthreads();
+    for (int o = kBlock / 2; o > 0; o >>= 1) { if (tid < o) red[tid] = fminf(red[tid], red[tid + o]); __syncthreads(); }
+    float lo = red[0];
+    __syncthreads();
+    red[tid] = hi_l; __syncthreads();
+    for (int o = kBlock / 2; o > 0; o >>= 1) { if (tid < o) red[tid] = fmaxf(red[tid], red[tid + o]); __syncthreads(); }
+    float hi = red[0];
+    __syncthreads();
+
+    __shared__ int cnt_s;
+    float thr = hi;
+    for (int it = 0; it < 40; ++it) {
+        const float mid = 0.5f * (lo + hi);
+        if (tid == 0) cnt_s = 0;
+        __syncthreads();
+        int c = 0;
+        for (int j = tid; j < nkeys; j += kBlock) if (frow[j] >= mid) c++;
+        atomicAdd(&cnt_s, c);
+        __syncthreads();
+        const int cnt = cnt_s;
+        if (cnt > topk) lo = mid; else hi = mid;
+        __syncthreads();
+        thr = hi;
+    }
+
+    if (tid == 0) {
+        int n = 0;
+        for (int j = 0; j < nkeys && n < topk; ++j) {
+            if (frow[j] >= thr) srow[n++] = j;
+        }
+        for (; n < topk; ++n) srow[n] = -1;
+    }
+}
+
 template <class T>
 __global__ void index_topk_paged(
     const T* __restrict__ idx_q,
@@ -234,44 +281,163 @@ __global__ void index_topk_paged(
     }
     __syncthreads();
 
-    __shared__ float red[kBlock];
-    float lo_l = pos_inf(), hi_l = -pos_inf();
-    for (int j = tid; j < nkeys; j += kBlock) {
-        lo_l = fminf(lo_l, frow[j]);
-        hi_l = fmaxf(hi_l, frow[j]);
+    select_top(frow, nkeys, topk, srow, tid);
+}
+
+// `index_topk_paged` with the scores on the tensor cores: the row's heads
+// are an mma's rows (`H` <= 16, the rest zero), and each warp scores its own
+// 16-block chunks of the row's keys (`D` = 128), gathered into shared memory
+// a chunk at a time. The ranking that follows is the same.
+namespace index_mma {
+
+constexpr int kD = 128;
+constexpr int kLd = kD + 8;
+constexpr int kWarps = kBlock / 32;
+constexpr int kKeys = 16;
+
+__device__ __forceinline__ std::uint32_t smem_addr(const void* p) {
+    return static_cast<std::uint32_t>(__cvta_generic_to_shared(p));
+}
+
+__device__ __forceinline__ void mma_m16n8k16(float (&d)[4], const std::uint32_t (&a)[4],
+                                             const std::uint32_t (&b)[2]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+}  // namespace index_mma
+
+template <class T>
+__global__ void index_topk_paged_mma(
+    const T* __restrict__ idx_q,
+    const T* __restrict__ idx_w,
+    const T* __restrict__ key_pages,
+    const u32* __restrict__ qo_indptr,
+    const u32* __restrict__ kv_page_indices,
+    const u32* __restrict__ kv_page_indptr,
+    const u32* __restrict__ kv_last_page_lens,
+    float* __restrict__ scores,
+    i32* __restrict__ selection,
+    i32 R, i32 H, i32 D, i32 page_size, i32 score_stride, i32 topk,
+    i32 ratio,
+    const u32* __restrict__ win)
+{
+    using namespace index_mma;
+    const int t = static_cast<int>(blockIdx.x);
+    if (win != nullptr && t >= static_cast<int>(win[0])) return;
+    const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
+    if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    i32* srow = selection + static_cast<long long>(t_row) * topk;
+
+    int r = 0;
+    for (; r < R - 1; ++r) {
+        if (t < static_cast<int>(qo_indptr[r + 1])) break;
     }
-    red[tid] = lo_l; __syncthreads();
-    for (int o = kBlock / 2; o > 0; o >>= 1) { if (tid < o) red[tid] = fminf(red[tid], red[tid + o]); __syncthreads(); }
-    float lo = red[0];
-    __syncthreads();
-    red[tid] = hi_l; __syncthreads();
-    for (int o = kBlock / 2; o > 0; o >>= 1) { if (tid < o) red[tid] = fmaxf(red[tid], red[tid + o]); __syncthreads(); }
-    float hi = red[0];
+    const int qo_lo = static_cast<int>(qo_indptr[r]);
+    const int new_tokens = static_cast<int>(qo_indptr[r + 1]) - qo_lo;
+    const int pages_first = static_cast<int>(kv_page_indptr[r]);
+    const int num_pages = static_cast<int>(kv_page_indptr[r + 1]) - pages_first;
+    const int kv_len =
+        (num_pages - 1) * page_size + static_cast<int>(kv_last_page_lens[r]);
+    const int abs_q = kv_len - new_tokens + (t - qo_lo);
+
+    const int stride = (ratio > 0) ? ratio : 1;
+    const int total = abs_q + 1;
+    int nkeys = (total > 0) ? total / stride : 0;
+    if (nkeys > score_stride) nkeys = score_stride;
+
+    if (nkeys <= topk) {
+        for (int n = tid; n < topk; n += kBlock) srow[n] = (n < nkeys) ? n : -1;
+        return;
+    }
+
+    float* frow = scores + static_cast<long long>(t) * score_stride;
+    const T* qi = idx_q + static_cast<long long>(t_row) * H * kD;
+    __shared__ __align__(16) T q_s[16 * kLd];
+    __shared__ __align__(16) T k_s[kWarps][kKeys * kLd];
+    __shared__ float w_s[16];
+    __shared__ long long slot_s[kWarps][kKeys];
+    for (int i = tid; i < 16 * (kD / 8); i += kBlock) {
+        const int row = i / (kD / 8);
+        const int d = (i % (kD / 8)) * 8;
+        int4 v = make_int4(0, 0, 0, 0);
+        if (row < H) v = *reinterpret_cast<const int4*>(qi + row * kD + d);
+        *reinterpret_cast<int4*>(q_s + row * kLd + d) = v;
+    }
+    if (tid < 16) {
+        w_s[tid] = tid < H
+            ? (idx_w != nullptr ? Elem<T>::to_f32(idx_w[static_cast<long long>(t_row) * H + tid]) : 1.f)
+            : 0.f;
+    }
     __syncthreads();
 
-    __shared__ int cnt_s;
-    float thr = hi;
-    for (int it = 0; it < 40; ++it) {
-        const float mid = 0.5f * (lo + hi);
-        if (tid == 0) cnt_s = 0;
-        __syncthreads();
-        int c = 0;
-        for (int j = tid; j < nkeys; j += kBlock) if (frow[j] >= mid) c++;
-        atomicAdd(&cnt_s, c);
-        __syncthreads();
-        const int cnt = cnt_s;
-        if (cnt > topk) lo = mid; else hi = mid;
-        __syncthreads();
-        thr = hi;
-    }
-
-    if (tid == 0) {
-        int n = 0;
-        for (int j = 0; j < nkeys && n < topk; ++j) {
-            if (frow[j] >= thr) srow[n++] = j;
+    const int g = lane >> 2, p = (lane & 3) << 1;
+    T* ks = k_s[warp];
+    for (int base = warp * kKeys; base < nkeys; base += kWarps * kKeys) {
+        if (lane < kKeys) {
+            const int j = base + lane;
+            long long slot = -1;
+            if (j < nkeys) {
+                const int cell = (j + 1) * stride - 1;
+                slot = static_cast<long long>(kv_page_indices[pages_first + cell / page_size]) * page_size
+                    + cell % page_size;
+            }
+            slot_s[warp][lane] = slot;
         }
-        for (; n < topk; ++n) srow[n] = -1;
+        __syncwarp();
+        for (int c = lane; c < kKeys * (kD / 8); c += 32) {
+            const int key = c / (kD / 8);
+            const int d = (c % (kD / 8)) * 8;
+            const long long slot = slot_s[warp][key];
+            *reinterpret_cast<int4*>(ks + key * kLd + d) = slot >= 0
+                ? *reinterpret_cast<const int4*>(key_pages + slot * kD + d)
+                : make_int4(0, 0, 0, 0);
+        }
+        __syncwarp();
+        float acc[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
+#pragma unroll
+        for (int k0 = 0; k0 < kD; k0 += 16) {
+            std::uint32_t a[4];
+            {
+                const T* rp = q_s + (lane & 15) * kLd + k0 + ((lane & 16) ? 8 : 0);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                             : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+                             : "r"(smem_addr(rp)));
+            }
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                std::uint32_t b[2];
+                const T* rp = ks + (nt * 8 + (lane & 7)) * kLd + k0 + ((lane & 8) ? 8 : 0);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                             : "=r"(b[0]), "=r"(b[1])
+                             : "r"(smem_addr(rp)));
+                mma_m16n8k16(acc[nt], a, b);
+            }
+        }
+        // Rows `g` and `g + 8` are heads; a key's score sums its heads'
+        // weighted rectified dots, across the eight lane groups.
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                float v = fmaxf(acc[nt][i], 0.f) * w_s[g] + fmaxf(acc[nt][2 + i], 0.f) * w_s[g + 8];
+#pragma unroll
+                for (int sh = 4; sh < 32; sh <<= 1) v += __shfl_xor_sync(0xffffffffu, v, sh);
+                const int j = base + nt * 8 + p + i;
+                if (g == 0 && j < nkeys) frow[j] = v;
+            }
+        }
+        __syncwarp();
     }
+    __syncthreads();
+
+    select_top(frow, nkeys, topk, srow, tid);
 }
 
 constexpr int kMaxIndexHeads = 8;
