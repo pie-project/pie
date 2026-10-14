@@ -815,6 +815,7 @@ impl Shell {
             exports,
             graphs: engine.graphs,
             copies: engine.copies,
+            one_frame_when_short: engine.one_frame_when_short,
             pad: engine.recording.pad(),
             golden_arm: Golden::Off,
             bodies: engine.recording.bodies(),

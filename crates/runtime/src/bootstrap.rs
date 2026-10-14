@@ -131,6 +131,9 @@ pub struct EngineConfig {
     pub backend_kind: String,
     pub rs_cache_required: bool,
     pub rs_cache_slots: usize,
+    /// The engine asks for one frame a lane when its slots seat fewer lanes
+    /// than it batches (`PoolFacts::one_frame_when_short`).
+    pub one_frame_when_short: bool,
     pub rs_cache_slot_bytes: u64,
     pub rs_host_slots: usize,
     pub has_mtp_logits: bool,
@@ -243,12 +246,39 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     } = config.model;
 
     crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
-    let seat_cost = crate::scheduler::configured_dispatch_depth().max(1);
     let rs_pool = engine_configs
         .iter()
         .filter(|d| d.rs_cache_slots > 0)
         .min_by_key(|d| d.rs_cache_slots)
         .map(|d| (d.rs_cache_slots, d.total_pages));
+    // A lane holds a state slot per posted frame. Where every engine asks
+    // for it and the slots seat fewer lanes than the engines batch, post one
+    // frame a lane: up to twice the lanes seated, for the run-ahead a second
+    // frame bought.
+    let lanes = engine_configs
+        .iter()
+        .map(|d| d.limits.max_forward_requests)
+        .min()
+        .unwrap_or(0);
+    let depth = crate::scheduler::configured_dispatch_depth().max(1);
+    if let Some((slots, _)) = rs_pool
+        && depth > 1
+        && slots / depth < lanes
+        && engine_configs
+            .iter()
+            .all(|d| d.rs_cache_slots == 0 || d.one_frame_when_short)
+    {
+        tracing::info!(
+            lanes,
+            state_slots = slots,
+            seated_at_depth = slots / depth,
+            seated_at_one = slots.min(lanes),
+            "admission: the state slots seat fewer lanes than the engine batches; posting one \
+             frame a lane, as the engine's profile asks"
+        );
+        crate::scheduler::set_dispatch_depth(1);
+    }
+    let seat_cost = crate::scheduler::configured_dispatch_depth().max(1);
     let rs_seat_cap = rs_pool.map(|(slots, _)| (slots / seat_cost).max(1));
     let admission_cap = config
         .max_concurrent_processes

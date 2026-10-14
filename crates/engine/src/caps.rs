@@ -68,6 +68,12 @@ pub struct PoolFacts {
     pub host_state_slots: u32,
     #[serde(default)]
     pub disk_kv_pages: u32,
+    /// The engine would rather post one frame a lane than seat fewer lanes
+    /// than it batches when its state slots are short: the runtime then
+    /// dispatches one frame deep, so a lane holds one slot. False keeps the
+    /// configured depth whatever the slots seat.
+    #[serde(default)]
+    pub one_frame_when_short: bool,
 }
 
 impl PoolFacts {

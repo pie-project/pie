@@ -560,6 +560,7 @@ impl Engine for Cuda {
                 host_window_pages: shell.host_window_pages(),
                 host_state_slots: shell.host_state_slots(),
                 disk_kv_pages,
+                one_frame_when_short: shell.one_frame_when_short(),
             },
             limits: FireLimits {
                 max_lanes: shell.budget().max_lanes,

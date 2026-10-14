@@ -90,6 +90,8 @@ pub struct Shell {
     scores: Option<crate::scores::Scores>,
     graphs: Graphs,
     copies: bool,
+    /// `engine.one_frame_when_short`.
+    one_frame_when_short: bool,
     pad: bool,
     bodies: bool,
     bodies_mem: usize,
@@ -113,6 +115,13 @@ impl Shell {
     pub fn copy_state(&mut self, src: u32, dst: u32) -> Result<()> {
         self.pools.copy_slot(self.device.stream(), src, dst)?;
         self.device.synchronize()
+    }
+
+    /// Whether this load would post one frame a lane rather than seat fewer
+    /// lanes than it batches (`engine.one_frame_when_short`).
+    #[must_use]
+    pub fn one_frame_when_short(&self) -> bool {
+        self.one_frame_when_short
     }
 
     /// Host rs slots, one per device slot so every slot can be parked once.

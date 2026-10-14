@@ -78,6 +78,13 @@ pub struct LatticeSteps(pub u32);
 #[decision(id = "engine.state_slots_per_lane", constant(range(0..=8)), default = 0, tune = engine)]
 pub struct StateSlotsPerLane(pub u32);
 
+/// Whether a hybrid trunk whose state slots cannot seat every lane at the
+/// configured dispatch depth (two frames a lane) asks the runtime to post one
+/// frame a lane instead, seating up to twice the lanes. Off keeps the depth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.one_frame_when_short", flag, default = false, tune = engine)]
+pub struct OneFrameWhenShort;
+
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("cuda", FACTS, AXES);
     kernels_cuda::tuning::register(&mut r);
@@ -87,7 +94,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<Grouped>()
         .add::<WorkingSetPercent>()
         .add::<LatticeSteps>()
-        .add::<StateSlotsPerLane>();
+        .add::<StateSlotsPerLane>()
+        .add::<OneFrameWhenShort>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
     poem_compiler::costs::register(&mut r, 2);
     r
@@ -144,6 +152,7 @@ pub struct Engine {
     pub working_set_percent: u32,
     pub lattice_steps: u32,
     pub state_slots_per_lane: u32,
+    pub one_frame_when_short: bool,
 }
 
 impl Engine {
@@ -167,6 +176,7 @@ impl Engine {
             working_set_percent: profile.get::<WorkingSetPercent>().0,
             lattice_steps: profile.get::<LatticeSteps>().0,
             state_slots_per_lane: profile.get::<StateSlotsPerLane>().0,
+            one_frame_when_short: profile.on::<OneFrameWhenShort>(&Anywhere),
         }
     }
 }
@@ -412,6 +422,7 @@ mod tests {
                 working_set_percent: 50,
                 lattice_steps: 1,
                 state_slots_per_lane: 0,
+                one_frame_when_short: false,
             }
         );
         assert_eq!(
@@ -459,15 +470,18 @@ mod tests {
             "a B200 walks a selection on the tensor cores"
         );
         assert_eq!(Engine::of(&b200).state_slots_per_lane, 2);
+        assert!(Engine::of(&b200).one_frame_when_short);
         assert_eq!(
             Engine {
                 state_slots_per_lane: 0,
+                one_frame_when_short: false,
                 ..Engine::of(&b200)
             },
             Engine::of(&family),
-            "only the per-lane state slots differ from the family's engine"
+            "only the state seating differs from the family's engine"
         );
         assert_eq!(Engine::of(&family).state_slots_per_lane, 0);
+        assert!(!Engine::of(&family).one_frame_when_short);
     }
 
     /// The two-launch gated delta scan is an sm_100 family decision; every
