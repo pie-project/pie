@@ -3754,7 +3754,9 @@ impl Shell {
                     &self.handles,
                 );
                 #[cfg(target_vendor = "apple")]
-                let sink = sink.with_handoff(self.ane.as_ref().map(crate::ane::Ane::handoff));
+                let sink = sink
+                    .with_handoff(self.ane.as_ref().map(crate::ane::Ane::handoff))
+                    .flushing_after(HEAD_LAUNCHES);
                 Encoded::Live(sink)
             }
             Mode::Record | Mode::Replay => {
@@ -4130,6 +4132,13 @@ pub struct Landed {
     pub lanes: usize,
     pub launches: u32,
 }
+
+/// Launches a live encode commits ahead of the rest of its fire. Encoding
+/// a launch costs the host a fraction of a microsecond and running one costs
+/// the device tens, so a head this long keeps the device busy while the host
+/// encodes the tail: a 64-layer verify fire is some 1700 launches and 0.6 ms
+/// of encoding the device otherwise sat out.
+const HEAD_LAUNCHES: u32 = 64;
 
 fn fire_trace(line: impl FnOnce() -> String) {
     use std::sync::OnceLock;
