@@ -97,6 +97,50 @@ fn rms_row(
     )?;
     let launch = rows_per_head(op, y.rows, y.width, per_head_dim)?;
     let heads = stated(op, per_head_split(y.width, per_head_dim))?;
+    let width = if per_head_dim == 0 {
+        y.width
+    } else {
+        per_head_dim
+    };
+    if ctx.tuning().rows_vec
+        && (width == 128 || width == 256)
+        && [x.ptr, weight.ptr, y.ptr].iter().all(|&at| aligned16(at))
+    {
+        let units = y
+            .rows
+            .checked_mul(per_head_split(y.width, per_head_dim))
+            .ok_or_else(|| {
+                refuse(
+                    op,
+                    format!(
+                        "{} rows of {} heads overflow a grid",
+                        y.rows,
+                        y.width / width
+                    ),
+                )
+            })?;
+        let plus_one = template == OFFSET_BANK;
+        return ctx.fire(
+            op,
+            Fire::at(
+                FILE,
+                symbol(&format!(
+                    "::pie::elemwise::rmsnorm_in_warp<{t}, {}, {plus_one}>",
+                    width / 32
+                )),
+            )
+            .apply(Launch::grid([units.div_ceil(8), 1, 1], [BLOCK, 1, 1])),
+            &[
+                x.arg(),
+                weight.arg(),
+                y.arg(),
+                stated(op, units)?.arg(),
+                eps.arg(),
+                heads.arg(),
+                ctx.stage(),
+            ],
+        );
+    }
     ctx.fire(
         op,
         Fire::at(

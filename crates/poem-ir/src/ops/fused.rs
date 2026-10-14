@@ -144,6 +144,17 @@ pub enum Fused {
         y: ValueId,
         y_out: ValueId,
     },
+    /// A projection whose rows are cut at `width` straight after: a backend
+    /// may land each side from its own slice of the weight, or run the
+    /// matmul into `y` and cut it.
+    MatmulSplitRows {
+        act: ValueId,
+        w: ValueId,
+        width: u32,
+        y: ValueId,
+        left: ValueId,
+        right: ValueId,
+    },
     /// A routed gate-up select (`MoeMatmulSelect`, `..Bias` or `..Quant`,
     /// its `y` the packed gate|up rows) and the GLU of it (`MlpSwiglu`,
     /// `..Clamp`, `..ClampAlpha` or `MlpGegluTanhPacked`): a backend may land the GLU from the
@@ -301,6 +312,7 @@ impl Operands for Fused {
                 act, gate_up, down, ..
             } => sink.extend([*act, *gate_up, *down]),
             Self::MatmulBias { act, w, bias, .. } => sink.extend([*act, *w, *bias]),
+            Self::MatmulSplitRows { act, w, .. } => sink.extend([*act, *w]),
             Self::MoeSelectGlu { select, .. } => select.inputs(sink),
             Self::RopeYarnAppend {
                 q,
@@ -419,6 +431,7 @@ impl Operands for Fused {
             Self::MlpSwiglu { packed, h, y, .. } => sink.extend([*packed, *h, *y]),
             Self::LmHeadSoftcap { y, y_out, .. } => sink.extend([*y, *y_out]),
             Self::MatmulBias { y, y_out, .. } => sink.extend([*y, *y_out]),
+            Self::MatmulSplitRows { y, left, right, .. } => sink.extend([*y, *left, *right]),
             Self::MoeSelectGlu { select, glu } => {
                 select.outputs(sink);
                 glu.outputs(sink);
@@ -472,6 +485,7 @@ impl Operands for Fused {
             }
             Self::MatmulGeglu { .. }
             | Self::MatmulSwiglu { .. }
+            | Self::MatmulSplitRows { .. }
             | Self::MlpSwiglu { .. }
             | Self::MoeSelectGlu { .. }
             | Self::MoeExperts { .. }
@@ -495,6 +509,7 @@ impl Operands for Fused {
             Self::MlpSwiglu { .. } => "linear.mlp_swiglu",
             Self::LmHeadSoftcap { .. } => "linear.lm_head_softcap",
             Self::MatmulBias { .. } => "linear.matmul_bias",
+            Self::MatmulSplitRows { .. } => "linear.matmul_split_rows",
             Self::MoeSelectGlu { .. } => "linear.moe_select_glu",
             Self::RopeYarnAppend { .. } => "elementwise.rope_yarn_append",
             Self::SplitRopeYarnAppend { .. } => "elementwise.split_rope_yarn_append",

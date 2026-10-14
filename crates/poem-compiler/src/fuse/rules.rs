@@ -26,6 +26,7 @@ pub(super) fn all() -> Vec<Rule> {
         matmul_swiglu(),
         lm_head_softcap(),
         matmul_bias(),
+        matmul_split_rows(),
         gated_residual_norm_modulate(),
         norm_modulate(),
         rmsnorm_rope_partial_q(),
@@ -674,6 +675,29 @@ fn matmul_bias() -> Rule {
         y: m.value("y"),
         y_out: m.value("y_out"),
     })
+}
+
+/// A projection cut into two row halves (Qwen3.5's packed qkv|z), through
+/// the `recurrent` marker the cut's caller sets on the packed rows.
+fn matmul_split_rows() -> Rule {
+    let pattern = template(|p| {
+        let y = linear::matmul(&p.rows("act", W), &p.weight("w", [W, W]));
+        p.name("y", &y);
+        let (left, right) = layout::split_rows(&y, p.u32("width"));
+        p.export("left", &left);
+        p.export("right", &right);
+    });
+    Rule::new("linear.matmul_split_rows", [pattern], |m| {
+        Fused::MatmulSplitRows {
+            act: m.value("act"),
+            w: m.value("w"),
+            width: m.u32("width"),
+            y: m.value("y"),
+            left: m.value("left"),
+            right: m.value("right"),
+        }
+    })
+    .through_markers()
 }
 
 #[derive(Clone, Copy)]

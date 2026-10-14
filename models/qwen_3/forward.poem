@@ -276,21 +276,23 @@ def gdn_mixer(x, inputs, g, bonsai):
     seam.at(seam.RECURRENT, [qkvz])
     width = g.qkv_width
 
-    def step(qkvz):
-        qkv, z = ops.layout.split_rows(qkvz, width)
+    # The cut before the switch: a backend may land qkv and z from the
+    # projection's two weight slices, the packed rows never written.
+    qkv, z = ops.layout.split_rows(qkvz, width)
+
+    def step(qkv):
         qkv = ops.attn.ssm_causal_conv1d(qkv, g.conv, conv_state, g.conv_kernel)
         gates = ops.attn.ssm_gdn_prep(ba.on(fact.single_token()), g.dt_bias, g.a_log)
-        core = ops.attn.ssm_gated_delta(qkv, z, gates, delta_state, g.k_heads, g.v_heads, g.k_dim, g.v_dim)
-        return (core, z)
+        core = ops.attn.ssm_gated_delta(qkv, z.on(fact.single_token()), gates, delta_state, g.k_heads, g.v_heads, g.k_dim, g.v_dim)
+        return core
 
-    def chunked(qkvz):
-        qkv, z = ops.layout.split_rows(qkvz, width)
+    def chunked(qkv):
         qkv = ops.attn.ssm_causal_conv1d_chunked(qkv, g.conv, conv_state, g.conv_kernel)
         gates = ops.attn.ssm_gdn_prep(ba.on(~fact.single_token()), g.dt_bias, g.a_log)
-        core = ops.attn.ssm_gated_delta_chunked(qkv, z, gates, delta_state, g.k_heads, g.v_heads, g.k_dim, g.v_dim)
-        return (core, z)
+        core = ops.attn.ssm_gated_delta_chunked(qkv, z.on(~fact.single_token()), gates, delta_state, g.k_heads, g.v_heads, g.k_dim, g.v_dim)
+        return core
 
-    o, z = switch(qkvz, [(fact.single_token(), step)], otherwise = chunked)
+    o = switch(qkv, [(fact.single_token(), step)], otherwise = chunked)
     o = ops.elemwise.rmsnorm_gated(o, z, g.norm, g.v_dim, g.norm_eps, "silu")
     o_in = rot_take(o, bonsai.ssm) if bonsai != None else o
     return ops.linear.matmul(o_in, g.out_proj)

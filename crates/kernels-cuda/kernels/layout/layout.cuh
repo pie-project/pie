@@ -205,6 +205,31 @@ __global__ void split_q_gate(
     }
 }
 
+// `split_q_gate` 16 bytes a lane: a thread moves one eight-element run of
+// q and the matching run of the gate; `runs` is `head_dim / 8`.
+template <class T>
+__global__ void split_q_gate_vec8(
+    const T* __restrict__ packed,
+    T* __restrict__ q_out,
+    T* __restrict__ gate_out,
+    long long total, int num_heads, int runs,
+    const u32* __restrict__ win)
+{
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const long long unit = i / runs;
+    const int c = static_cast<int>(i - unit * runs);
+    if (win != nullptr && unit / num_heads >= static_cast<long long>(win[0])) return;
+    const long long u = win != nullptr
+        ? unit + static_cast<long long>(win[1]) * num_heads
+        : unit;
+    const long long head_dim = static_cast<long long>(runs) * 8;
+    const T* row = packed + u * 2 * head_dim + c * 8;
+    *reinterpret_cast<uint4*>(q_out + u * head_dim + c * 8) = *reinterpret_cast<const uint4*>(row);
+    *reinterpret_cast<uint4*>(gate_out + u * head_dim + c * 8) =
+        *reinterpret_cast<const uint4*>(row + head_dim);
+}
+
 template <class T>
 __global__ void concat_rows(
     const T* __restrict__ left,

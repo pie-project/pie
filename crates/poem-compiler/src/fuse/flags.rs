@@ -48,6 +48,7 @@ flags! {
     MatmulSwiglu = "fuse.matmul_swiglu" => "linear.matmul_swiglu",
     LmHeadSoftcap = "fuse.lm_head_softcap" => "linear.lm_head_softcap",
     MatmulBias = "fuse.matmul_bias" => "linear.matmul_bias",
+    MatmulSplitRows = "fuse.matmul_split_rows" => "linear.matmul_split_rows",
     GatedResidualNormModulate = "fuse.gated_residual_norm_modulate" => "elementwise.gated_residual_norm_modulate",
     NormModulate = "fuse.norm_modulate" => "elementwise.norm_modulate",
     RmsnormRopePartialQ = "fuse.rmsnorm_rope_partial_q" => "elementwise.rmsnorm_rope_partial_q",

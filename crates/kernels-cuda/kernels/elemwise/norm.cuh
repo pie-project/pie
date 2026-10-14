@@ -131,6 +131,58 @@ __global__ void rmsnorm_plus_one(
         x, weight, y, hidden, x_row_stride, y_row_stride, eps, heads, win);
 }
 
+template <int PER> struct LaneRun { using type = uint4; };
+template <> struct LaneRun<4> { using type = uint2; };
+
+// A 128- or 256-wide RMS norm one warp per (row, head): a lane carries
+// `PER` consecutive values in one 8- or 16-byte load, so the sum of squares
+// is one butterfly and no block barrier; a block is eight such units.
+// `units` counts (row, head) pairs; the rows are dense.
+template <class T, int PER, bool WEIGHT_PLUS_ONE>
+__global__ void __launch_bounds__(256) rmsnorm_in_warp(
+    const T* __restrict__ x,
+    const T* __restrict__ weight,
+    T* __restrict__ y,
+    int units,
+    float eps,
+    int heads,
+    const u32* __restrict__ win)
+{
+    static_assert(PER == 4 || PER == 8, "a lane's run is one 8- or 16-byte load");
+    constexpr int hidden = 32 * PER;
+    using Run = typename LaneRun<PER>::type;
+    const int unit = static_cast<int>(blockIdx.x) * 8 + static_cast<int>(threadIdx.x >> 5);
+    if (unit >= units) return;
+    if (win != nullptr && unit / heads >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? unit + static_cast<int>(win[1]) * heads : unit;
+    const int lane = threadIdx.x & 31;
+    const long long at = static_cast<long long>(plane_row) * hidden + lane * PER;
+
+    T xv[PER];
+    T wv[PER];
+    *reinterpret_cast<Run*>(xv) = *reinterpret_cast<const Run*>(x + at);
+    *reinterpret_cast<Run*>(wv) = *reinterpret_cast<const Run*>(weight + lane * PER);
+    float xf[PER];
+    float local = 0.f;
+    #pragma unroll
+    for (int u = 0; u < PER; ++u) {
+        xf[u] = Elem<T>::to_f32(xv[u]);
+        local += xf[u] * xf[u];
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) local += __shfl_xor_sync(0xffffffffu, local, off);
+    const float inv_rms = rsqrtf(local / static_cast<float>(hidden) + eps);
+
+    T out[PER];
+    #pragma unroll
+    for (int u = 0; u < PER; ++u) {
+        float w = Elem<T>::to_f32(wv[u]);
+        if constexpr (WEIGHT_PLUS_ONE) w += 1.f;
+        out[u] = Elem<T>::from_f32(xf[u] * inv_rms * w);
+    }
+    *reinterpret_cast<Run*>(y + at) = *reinterpret_cast<const Run*>(out);
+}
+
 template <class T, int BLOCK = 256>
 __global__ void rmsnorm_grouped_plus_one(
     const T* __restrict__ x,

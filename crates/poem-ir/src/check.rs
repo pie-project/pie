@@ -896,7 +896,8 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Fused::MatmulSwiglu { .. }
             | Fused::MlpSwiglu { .. }
             | Fused::LmHeadSoftcap { .. }
-            | Fused::MatmulBias { .. } => &[],
+            | Fused::MatmulBias { .. }
+            | Fused::MatmulSplitRows { .. } => &[],
             // The select's own: its routes are i32.
             Fused::MoeSelectGlu { select, .. } => match select.as_ref() {
                 Linear::MoeMatmulSelectBias { .. } => &[(In(3), I32)],

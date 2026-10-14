@@ -1193,6 +1193,7 @@ fn decoded_weight_planes(
                     | poem_ir::Fused::MatmulGeglu { .. }
                     | poem_ir::Fused::MlpSwiglu { .. }
                     | poem_ir::Fused::MatmulBias { .. }
+                    | poem_ir::Fused::MatmulSplitRows { .. }
                     | poem_ir::Fused::LmHeadSoftcap { .. }
                     | poem_ir::Fused::MoeSelectGlu { .. }
                     | poem_ir::Fused::MoeExperts { .. },

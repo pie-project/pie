@@ -21,6 +21,12 @@ ssm.gdn_fused_scan = true
 # 32 x 4096 tokens takes 2.84 ms where the two-launch scan takes 5.11, and
 # over 4 x 4096 0.34 where it takes 0.70.
 ssm.gdn_tc5 = true
+# The row kernels a prefill streams 16 bytes a lane: over 16384 of
+# Qwen3.6-35B-A3B's tokens the per-head q norm (16 x 256 wide) takes 54 us
+# where a block a head took 463, the q/gate cut 76 where it took 197, the
+# sigmoid gate 69 where it took 262; a long fire's packed qkv|z lands as two
+# GEMMs off the weight's two slices, never cut.
+elemwise.rows_vec = true
 # A wide decode's split partials fold a warp a row: gpt-oss-120b's layers
 # at 64 requests fold in about 4 us where the staged merge took 17.
 sdpa.merge_warp = true

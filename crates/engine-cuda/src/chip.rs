@@ -389,6 +389,7 @@ mod tests {
                     "{gpu}"
                 );
                 assert_eq!(tuning.ssm_gdn_tc5, b200, "{gpu}");
+                assert_eq!(tuning.rows_vec, b200, "{gpu}");
                 assert_eq!(tuning.merge_warp, b200, "{gpu}");
                 assert_eq!(tuning.gemm_bias_epilogue, b200, "{gpu}");
                 assert_eq!(tuning.decode_xqa, b200, "{gpu}");
@@ -410,6 +411,7 @@ mod tests {
                         gemm_tc5_glu_from: defaults.gemm_tc5_glu_from,
                         ssm_gdn_fused_scan: false,
                         ssm_gdn_tc5: false,
+                        rows_vec: false,
                         merge_warp: false,
                         mxfp4_mma_until: defaults.mxfp4_mma_until,
                         mxfp4_mma_from: defaults.mxfp4_mma_from,

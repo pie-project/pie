@@ -368,3 +368,20 @@ fn a_sink_folds_onto_the_attention_whose_log_sum_exp_it_reads() {
         );
     }
 }
+
+#[test]
+fn a_projection_cut_into_two_halves_lands_as_one_fused_op() {
+    let t = trace(|p| {
+        let (left, right) = layout::split_rows(&biased(p), 40);
+        elemwise::silu(&left);
+        elemwise::silu(&right);
+    });
+    assert_eq!(
+        ops(&fuse(t, &["linear.matmul_split_rows"])),
+        [
+            "linear.matmul_split_rows",
+            "elementwise.silu",
+            "elementwise.silu"
+        ]
+    );
+}

@@ -9,6 +9,10 @@ use poem_ir::{ActQuant, Dtype, Fused, Linear, Operands, ValueId};
 
 use crate::run::Run;
 
+/// The fewest rows a cut projection lands as two GEMMs: below it the cut of
+/// the packed rows costs less than a second weight walk.
+const SPLIT_GEMM_FROM: u32 = 256;
+
 impl DispatchLinear for Run<'_> {
     fn dispatch(&mut self, op: &Linear) -> Result<(), KernelError> {
         self.linear(op).map_err(crate::error::kernel)
@@ -174,6 +178,56 @@ impl Run<'_> {
                     self.ctx(),
                     self.tensor(*bias),
                     &mut self.tensor(*y),
+                )
+            }
+            Fused::MatmulSplitRows {
+                act,
+                w,
+                width,
+                y,
+                left,
+                right,
+            } => {
+                // Each half from its own slice of the weight rows, so the
+                // packed rows are never written and cut; a short fire, or a
+                // chip that keeps the old forms, runs the pair.
+                let a = self.tensor(*act);
+                if self.ctx().tuning().rows_vec
+                    && a.dtype == Dtype::Bf16
+                    && a.rows >= SPLIT_GEMM_FROM
+                    && self.dense_weight(*w)
+                {
+                    let weight = self.tensor(*w);
+                    let (l, r) = (self.tensor(*left), self.tensor(*right));
+                    if weight.dtype == Dtype::Bf16 && weight.rows == l.width + r.width {
+                        let cut = u64::from(*width) * u64::from(weight.width) * 2;
+                        let top = Tensor::new(weight.ptr, *width, weight.width, weight.dtype);
+                        let bottom = Tensor::new(
+                            weight.ptr + cut,
+                            weight.rows - *width,
+                            weight.width,
+                            weight.dtype,
+                        );
+                        linear::gemm::matmul(self.ctx(), a, top, &mut self.tensor(*left))?;
+                        return linear::gemm::matmul(
+                            self.ctx(),
+                            a,
+                            bottom,
+                            &mut self.tensor(*right),
+                        );
+                    }
+                }
+                self.linear(&Linear::Matmul {
+                    act: *act,
+                    w: *w,
+                    y: *y,
+                })?;
+                kernels_cuda::layout::split_rows(
+                    self.ctx(),
+                    self.tensor(*y),
+                    *width,
+                    &mut self.tensor(*left),
+                    &mut self.tensor(*right),
                 )
             }
             Fused::LmHeadSoftcap {
