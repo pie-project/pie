@@ -240,6 +240,73 @@ __global__ void route_count(
     if (r < count && routes[r] >= 0 && route_live(r, top, win)) atomicAdd(&counts[routes[r]], 1);
 }
 
+// `route_count` and `route_place` a block of routes at a time: the block
+// tallies its routes' experts in shared memory and adds each expert's tally
+// to the global count (or takes its rows from the cursor) once, not once a
+// route. A route's row within its expert is its rank in the block's tally
+// past the block's take: the same rows, the same counts, in another order
+// within an expert. `tally` is `2 * experts` ints of dynamic shared memory.
+constexpr int kTallyRoutes = 2048;
+
+__global__ void route_count_tally(
+    const i32* __restrict__ routes,
+    int count,
+    int top,
+    const u32* __restrict__ win,
+    int experts,
+    i32* __restrict__ counts)
+{
+    extern __shared__ int tally[];
+    for (int e = threadIdx.x; e < experts; e += blockDim.x) tally[e] = 0;
+    __syncthreads();
+    const int r0 = blockIdx.x * kTallyRoutes;
+    const int r1 = min(r0 + kTallyRoutes, count);
+    for (int r = r0 + threadIdx.x; r < r1; r += blockDim.x) {
+        const int e = routes[r];
+        if (e >= 0 && e < experts && route_live(r, top, win)) atomicAdd(&tally[e], 1);
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < experts; e += blockDim.x)
+        if (tally[e] != 0) atomicAdd(&counts[e], tally[e]);
+}
+
+__global__ void route_place_tally(
+    const i32* __restrict__ routes,
+    int count,
+    int top,
+    const u32* __restrict__ win,
+    int experts,
+    i32* __restrict__ cursor,
+    i32* __restrict__ pos)
+{
+    extern __shared__ int tally[];
+    int* base = tally + experts;
+    for (int e = threadIdx.x; e < experts; e += blockDim.x) tally[e] = 0;
+    __syncthreads();
+    const int r0 = blockIdx.x * kTallyRoutes;
+    const int r1 = min(r0 + kTallyRoutes, count);
+    constexpr int kPer = kTallyRoutes / 256;
+    int rank[kPer];
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+        const int r = r0 + threadIdx.x + i * 256;
+        rank[i] = -1;
+        if (r < r1) {
+            const int e = routes[r];
+            if (e >= 0 && e < experts && route_live(r, top, win)) rank[i] = atomicAdd(&tally[e], 1);
+        }
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < experts; e += blockDim.x)
+        base[e] = tally[e] != 0 ? atomicAdd(&cursor[e], tally[e]) : 0;
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+        const int r = r0 + threadIdx.x + i * 256;
+        if (r < r1) pos[r] = rank[i] >= 0 ? base[routes[r]] + rank[i] : -1;
+    }
+}
+
 __global__ void route_offsets(
     const i32* __restrict__ counts,
     int experts,
@@ -359,6 +426,44 @@ __global__ void route_gather_vec8(
         return;
     }
     *dst = *reinterpret_cast<const uint4*>(grouped + static_cast<long long>(o) * n + c);
+}
+
+// `moe_weighted_sum_vec8` of the grouped product read where it lies: token
+// t's eight columns from `grouped[pos[t * top + j]]`, weighted, summed in f32
+// in `j` order; a dropped route adds nothing. A token past the live window
+// (`win`, in tokens) is untouched.
+__global__ void route_weighted_gather_vec8(
+    const bf16* __restrict__ grouped,
+    const i32* __restrict__ pos,
+    const float* __restrict__ weights,
+    bf16* __restrict__ y,
+    int n,
+    int top,
+    const u32* __restrict__ win)
+{
+    const int t = blockIdx.x;
+    if (win != nullptr && t >= static_cast<int>(win[0])) return;
+    const int plane = win != nullptr ? t + static_cast<int>(win[1]) : t;
+    const int h0 = (blockIdx.y * blockDim.x + threadIdx.x) * 8;
+    if (h0 >= n) return;
+    float acc[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) acc[i] = 0.f;
+    const long long base = static_cast<long long>(plane) * top;
+    for (int j = 0; j < top; ++j) {
+        const int o = pos[base + j];
+        if (o < 0) continue;
+        const uint4 w = *reinterpret_cast<const uint4*>(grouped + static_cast<long long>(o) * n + h0);
+        const bf16* v8 = reinterpret_cast<const bf16*>(&w);
+        const float wr = weights[base + j];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc[i] += wr * bf16_to_f32(v8[i]);
+    }
+    uint4 out;
+    bf16* o8 = reinterpret_cast<bf16*>(&out);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) o8[i] = f32_to_bf16(acc[i]);
+    *reinterpret_cast<uint4*>(y + static_cast<long long>(plane) * n + h0) = out;
 }
 
 // `grouped[pos[r]] = x[r / div]`, 16 bytes a thread; a dropped route lands

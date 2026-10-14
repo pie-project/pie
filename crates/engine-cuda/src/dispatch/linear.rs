@@ -26,6 +26,24 @@ impl Run<'_> {
                 self.linear(select)?;
                 self.linear(glu)
             }
+            Fused::MoeExperts {
+                select,
+                glu,
+                down,
+                sum,
+            } => {
+                #[cfg(feature = "cuda")]
+                if self.moe_experts(select, glu, down, sum)? {
+                    return Ok(());
+                }
+                // Apart, the gate-up select and its GLU as their own fusion.
+                self.fused_linear(&Fused::MoeSelectGlu {
+                    select: select.clone(),
+                    glu: glu.clone(),
+                })?;
+                self.linear(down)?;
+                self.linear(sum)
+            }
             Fused::MatmulSwiglu {
                 act,
                 w,
@@ -755,7 +773,6 @@ impl Run<'_> {
     /// fire takes it; `false` leaves the two to run apart.
     #[cfg(feature = "cuda")]
     fn select_glu(&mut self, select: &Linear, glu: &Linear) -> Result<bool, kernels_cuda::Error> {
-        use linear::moe::{ExpertTable, GluBank};
         use linear::tc5::Glu;
         // The device and the profile first: nothing resolved off tcgen05.
         if !self.ctx().tuning().moe_tc5 || !linear::tc5::supported() {
@@ -776,15 +793,43 @@ impl Run<'_> {
             Linear::MlpGegluTanhPacked { packed, y, .. } => (packed, y, Glu::GegluTanh),
             _ => return Ok(false),
         };
-        let (x, routes, bank, experts) = match *select {
+        let Some((x, routes, sy, bank, experts)) = self.routed_bank(select) else {
+            return Ok(false);
+        };
+        if sy != packed {
+            return Ok(false);
+        }
+        let x = self.tensor(x);
+        let routes = self.tensor(routes);
+        let mut out = self.tensor(y);
+        linear::moe::select_glu(self.ctx(), x, bank, routes, &mut out, glu, experts)
+    }
+
+    /// A routed select's operands for the grouped tcgen05 GEMM: its input,
+    /// routes and output, and the bank as the GEMM reads it. `None` for a
+    /// bank it does not read (streamed, scales in atoms, host-seated, a
+    /// biased NVFP4 or affine one).
+    #[cfg(feature = "cuda")]
+    fn routed_bank(
+        &mut self,
+        select: &Linear,
+    ) -> Option<(
+        ValueId,
+        ValueId,
+        ValueId,
+        linear::moe::GluBank,
+        linear::moe::ExpertTable,
+    )> {
+        use linear::moe::{ExpertTable, GluBank};
+        Some(match *select {
             Linear::MoeMatmulSelect {
                 x,
                 bank,
                 routes,
                 y: sy,
-            } if sy == packed => {
+            } => {
                 let (bank, experts) = self.expert_bank(bank);
-                (x, routes, GluBank::Bf16(bank), experts)
+                (x, routes, sy, GluBank::Bf16(bank), experts)
             }
             Linear::MoeMatmulSelectBias {
                 x,
@@ -792,19 +837,20 @@ impl Run<'_> {
                 bias,
                 routes,
                 y: sy,
-            } if sy == packed => {
+            } => {
                 let (codes, scales, affine, seat) = self.planes(bank);
                 if codes.dtype == Dtype::Nvfp4
                     || affine.is_some()
                     || seat.streams()
                     || self.scales_in_atoms(bank)
                 {
-                    return Ok(false);
+                    return None;
                 }
                 let bias = Some(self.tensor(bias));
                 (
                     x,
                     routes,
+                    sy,
                     GluBank::Mxfp4 {
                         codes,
                         scales,
@@ -818,13 +864,13 @@ impl Run<'_> {
                 bank,
                 routes,
                 y: sy,
-            } if sy == packed => {
+            } => {
                 let (codes, scales, biases, seat) = self.planes(bank);
                 if seat.streams()
                     || self.scales_in_atoms(bank)
                     || crate::device::alloc::is_host_pointer(codes.ptr)
                 {
-                    return Ok(false);
+                    return None;
                 }
                 // NVFP4 carries its tensor scales as `biases`, an affine
                 // bank its zeros, mxfp4 none.
@@ -834,7 +880,7 @@ impl Run<'_> {
                         scales,
                         tensor_scales,
                     },
-                    (true, None) => return Ok(false),
+                    (true, None) => return None,
                     (false, Some(zeros)) => GluBank::Affine {
                         codes,
                         scales,
@@ -846,14 +892,93 @@ impl Run<'_> {
                         bias: None,
                     },
                 };
-                (x, routes, bank, ExpertTable::RESIDENT)
+                (x, routes, sy, bank, ExpertTable::RESIDENT)
             }
+            _ => return None,
+        })
+    }
+
+    /// A routed MLP whose rows stay laid out by expert from the gate-up select
+    /// to the weighted sum (`linear::moe::experts`); false when it does not
+    /// take this one.
+    #[cfg(feature = "cuda")]
+    fn moe_experts(
+        &mut self,
+        select: &Linear,
+        glu: &Linear,
+        down: &Linear,
+        sum: &Linear,
+    ) -> Result<bool, kernels_cuda::Error> {
+        use linear::tc5::Glu;
+        if !self.ctx().tuning().moe_tc5 || !linear::tc5::supported() {
+            return Ok(false);
+        }
+        let (packed, hidden, intermediate, glu) = match *glu {
+            Linear::MlpSwiglu {
+                packed,
+                y,
+                intermediate,
+            } => (packed, y, intermediate, Glu::Swiglu),
+            Linear::MlpSwigluClamp {
+                packed,
+                y,
+                intermediate,
+                limit,
+            } => (packed, y, intermediate, Glu::SwigluClamp { limit }),
+            Linear::MlpSwigluClampAlpha {
+                packed,
+                y,
+                intermediate,
+                limit,
+                alpha,
+            } => (
+                packed,
+                y,
+                intermediate,
+                Glu::SwigluClampAlpha { limit, alpha },
+            ),
+            Linear::MlpGegluTanhPacked {
+                packed,
+                y,
+                intermediate,
+            } => (packed, y, intermediate, Glu::GegluTanh),
             _ => return Ok(false),
         };
+        let Linear::MoeWeightedSum {
+            routed: summed,
+            weights,
+            y,
+        } = *sum
+        else {
+            return Ok(false);
+        };
+        let (
+            Some((x, routes, up_y, up, up_experts)),
+            Some((down_x, down_routes, down_y, down, down_experts)),
+        ) = (self.routed_bank(select), self.routed_bank(down))
+        else {
+            return Ok(false);
+        };
+        if up_y != packed || down_x != hidden || down_routes != routes || down_y != summed {
+            return Ok(false);
+        }
         let x = self.tensor(x);
         let routes = self.tensor(routes);
+        let weights = self.tensor(weights);
         let mut out = self.tensor(y);
-        linear::moe::select_glu(self.ctx(), x, bank, routes, &mut out, glu, experts)
+        linear::moe::experts(
+            self.ctx(),
+            x,
+            up,
+            glu,
+            down,
+            routes,
+            weights,
+            intermediate,
+            &mut out,
+            up_experts,
+            down_experts,
+        )
     }
 
     /// A quantized bank's select of `x`.

@@ -36,13 +36,14 @@ pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
 /// The fused kernels this backend ships; the compiler forms only these. A
 /// rule it does not list (`linear.mlp_swiglu`, which Metal splits across
 /// engines) leaves its primitives alone here.
-pub const FUSED: [&str; 15] = [
+pub const FUSED: [&str; 16] = [
     "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
     "elementwise.rmsnorm_residual_add",
     "elementwise.embed_scale_add_select",
     "elementwise.embed_scale_add",
     "elementwise.residual_add_rmsnorm",
     "linear.matmul_geglu",
+    "linear.moe_experts",
     "linear.moe_select_glu",
     "linear.matmul_swiglu",
     "linear.lm_head_softcap",

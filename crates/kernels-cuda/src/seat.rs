@@ -138,6 +138,7 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("linear.mlp_swiglu_clamp_alpha", Reads::Rows),
     entry("linear.mlp_swiglu_clamp_split", Reads::Rows),
     entry("linear.moe_bias_sum", Reads::Rows),
+    entry("linear.moe_experts", Reads::Rows),
     entry("linear.moe_hash_route", Reads::Rows),
     entry("linear.moe_matmul_select", Reads::Rows),
     entry("linear.moe_matmul_select_bias", Reads::Rows),

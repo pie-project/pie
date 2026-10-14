@@ -185,6 +185,17 @@ pub enum Fused {
         q_out: ValueId,
         k_out: ValueId,
     },
+    /// A routed MLP: the gate-up select and its GLU (as in `MoeSelectGlu`),
+    /// the down select of the GLU on the same routes, and the weighted sum
+    /// of its rows a token (`MoeWeightedSum`). A backend may keep the rows
+    /// between in its own layout, or run the four. The packed, GLU and
+    /// routed rows are still outputs, read by nothing else.
+    MoeExperts {
+        select: Box<Linear>,
+        glu: Box<Linear>,
+        down: Box<Linear>,
+        sum: Box<Linear>,
+    },
     QkvFusedQknormRopeVnormWrite {
         packed: ValueId,
         positions: ValueId,
@@ -279,6 +290,24 @@ impl Operands for Fused {
                 attn.inputs(sink);
                 sink.push(*sinks);
             }
+            Self::MoeExperts {
+                select, down, sum, ..
+            } => {
+                // The select's (x, bank, its bias, routes), the sum's weights,
+                // then the down bank and its bias.
+                select.inputs(sink);
+                if let Linear::MoeWeightedSum { weights, .. } = **sum {
+                    sink.push(weights);
+                }
+                match **down {
+                    Linear::MoeMatmulSelect { bank, .. }
+                    | Linear::MoeMatmulSelectQuant { bank, .. } => {
+                        sink.push(bank);
+                    }
+                    Linear::MoeMatmulSelectBias { bank, bias, .. } => sink.extend([bank, bias]),
+                    _ => {}
+                }
+            }
             Self::QkvFusedQknormRopeVnormWrite {
                 packed,
                 positions,
@@ -355,6 +384,17 @@ impl Operands for Fused {
                 attn.outputs(sink);
                 sink.push(*o_out);
             }
+            Self::MoeExperts {
+                select,
+                glu,
+                down,
+                sum,
+            } => {
+                select.outputs(sink);
+                glu.outputs(sink);
+                down.outputs(sink);
+                sum.outputs(sink);
+            }
             Self::QkvFusedQknormRopeVnormWrite { q, .. } => sink.push(*q),
         }
     }
@@ -380,6 +420,7 @@ impl Operands for Fused {
             | Self::MatmulSwiglu { .. }
             | Self::MlpSwiglu { .. }
             | Self::MoeSelectGlu { .. }
+            | Self::MoeExperts { .. }
             | Self::QkvFusedQknormRopeVnormWrite { .. } => {}
         }
     }
@@ -402,6 +443,7 @@ impl Operands for Fused {
             Self::MoeSelectGlu { .. } => "linear.moe_select_glu",
             Self::RopeYarnAppend { .. } => "elementwise.rope_yarn_append",
             Self::LseSink { .. } => "attention.lse_sink",
+            Self::MoeExperts { .. } => "linear.moe_experts",
             Self::QkvFusedQknormRopeVnormWrite { .. } => {
                 "custom_cuda.qkv_fused_qknorm_rope_vnorm_write"
             }

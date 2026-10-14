@@ -213,7 +213,8 @@ impl FamilyCosts {
                 | poem_ir::Fused::MlpSwiglu { .. }
                 | poem_ir::Fused::LmHeadSoftcap { .. }
                 | poem_ir::Fused::MatmulBias { .. }
-                | poem_ir::Fused::MoeSelectGlu { .. } => self.linear,
+                | poem_ir::Fused::MoeSelectGlu { .. }
+                | poem_ir::Fused::MoeExperts { .. } => self.linear,
                 poem_ir::Fused::QkvFusedQknormRopeVnormWrite { .. } => self.custom,
                 poem_ir::Fused::ResidualAddRmsnorm { .. }
                 | poem_ir::Fused::RmsnormResidualAdd { .. }

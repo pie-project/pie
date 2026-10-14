@@ -15,7 +15,8 @@ impl DispatchFused for Run<'_> {
             | Fused::MlpSwiglu { .. }
             | Fused::LmHeadSoftcap { .. }
             | Fused::MatmulBias { .. }
-            | Fused::MoeSelectGlu { .. } => self.fused_linear(op),
+            | Fused::MoeSelectGlu { .. }
+            | Fused::MoeExperts { .. } => self.fused_linear(op),
             Fused::ResidualAddRmsnorm { .. }
             | Fused::RmsnormResidualAdd { .. }
             | Fused::EmbedScaleAdd { .. }

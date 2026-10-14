@@ -1179,9 +1179,10 @@ fn decoded_weight_planes(
                     poem_ir::Linear::MatmulActQuant { .. }
                     | poem_ir::Linear::MoeMatmulSelectActQuant { .. },
                 ) => continue,
-                poem_ir::Operation::Fused(poem_ir::Fused::MoeSelectGlu { select, .. })
-                    if matches!(**select, poem_ir::Linear::MoeMatmulSelectActQuant { .. }) =>
-                {
+                poem_ir::Operation::Fused(
+                    poem_ir::Fused::MoeSelectGlu { select, .. }
+                    | poem_ir::Fused::MoeExperts { select, .. },
+                ) if matches!(**select, poem_ir::Linear::MoeMatmulSelectActQuant { .. }) => {
                     continue;
                 }
                 // A fused projection runs its matmul when no fused kernel
@@ -1193,7 +1194,8 @@ fn decoded_weight_planes(
                     | poem_ir::Fused::MlpSwiglu { .. }
                     | poem_ir::Fused::MatmulBias { .. }
                     | poem_ir::Fused::LmHeadSoftcap { .. }
-                    | poem_ir::Fused::MoeSelectGlu { .. },
+                    | poem_ir::Fused::MoeSelectGlu { .. }
+                    | poem_ir::Fused::MoeExperts { .. },
                 ) => {
                     outputs.clear();
                     node.op.outputs(&mut outputs);

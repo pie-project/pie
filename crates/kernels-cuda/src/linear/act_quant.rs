@@ -23,6 +23,8 @@ use crate::tensor::Tensor;
 const FILE: &str = "linear/act_quant.cuh";
 
 const BLOCK: u32 = 256;
+/// The routes one `route_*_tally` block lays out (`kTallyRoutes`).
+const TALLY_ROUTES: u32 = 2048;
 
 /// The precision activations are quantized to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -495,14 +497,18 @@ pub(crate) fn lay_out(
     let pos = i32s(ROUTE_POS, count as usize)?;
     zero(ctx, op, counts, e * 4)?;
     let int = |v: u32| stated(op, v).map(|v| v.arg());
+    // A block of routes tallies its experts in shared memory and touches the
+    // global count once an expert (`route_count_tally`).
+    let tally = Launch::flat(count.div_ceil(TALLY_ROUTES) * BLOCK, BLOCK).smem(8 * experts);
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::route_count").apply(Launch::flat(count, BLOCK)),
+        Fire::at(FILE, "::pie::linear::route_count_tally").apply(tally),
         &[
             routes.arg(),
             int(count)?,
             int(routes.width)?,
             ctx.stage(),
+            int(experts)?,
             ArgValue::Ptr(counts),
         ],
     )?;
@@ -521,12 +527,13 @@ pub(crate) fn lay_out(
     )?;
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::route_place").apply(Launch::flat(count, BLOCK)),
+        Fire::at(FILE, "::pie::linear::route_place_tally").apply(tally),
         &[
             routes.arg(),
             int(count)?,
             int(routes.width)?,
             ctx.stage(),
+            int(experts)?,
             ArgValue::Ptr(cursor),
             ArgValue::Ptr(pos),
         ],
@@ -580,6 +587,44 @@ pub(crate) fn gather_back(
             ArgValue::Ptr(pos),
             y.arg(),
             int(count)?,
+            int(n)?,
+            int(top)?,
+            ctx.stage(),
+        ],
+    )
+}
+
+/// `y[t] = sum_j weights[t][j] * grouped[pos[t * top + j]]`, in f32 and in
+/// `j` order, a dropped route adding nothing: `moe_weighted_sum` of the
+/// grouped product gathered back, read where it lies. Tokens past the live
+/// window are untouched.
+pub(crate) fn weighted_gather(
+    ctx: &Ctx,
+    op: &'static str,
+    grouped: u64,
+    pos: u64,
+    weights: Tensor,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    let (tokens, n, top) = (y.rows, y.width, weights.width);
+    if !n.is_multiple_of(8) || grouped % 16 != 0 || y.ptr % 16 != 0 {
+        return Err(refuse(
+            op,
+            format!("a weighted gather of {n}-wide rows in 16-byte runs"),
+        ));
+    }
+    let int = |v: u32| stated(op, v).map(|v| v.arg());
+    ctx.fire(
+        op,
+        Fire::at(FILE, "::pie::linear::route_weighted_gather_vec8").apply(Launch::grid(
+            [tokens, (n / 8).div_ceil(BLOCK), 1],
+            [BLOCK, 1, 1],
+        )),
+        &[
+            ArgValue::Ptr(grouped),
+            ArgValue::Ptr(pos),
+            weights.arg(),
+            y.arg(),
             int(n)?,
             int(top)?,
             ctx.stage(),

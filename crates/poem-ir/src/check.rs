@@ -899,6 +899,11 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 Linear::MoeMatmulSelectBias { .. } => &[(In(3), I32)],
                 _ => &[(In(2), I32)],
             },
+            // The select's routes, then the sum's weights.
+            Fused::MoeExperts { select, .. } => match select.as_ref() {
+                Linear::MoeMatmulSelectBias { .. } => &[(In(3), I32), (In(4), F32)],
+                _ => &[(In(2), I32), (In(3), F32)],
+            },
         },
         Operation::Collective(_) => &[],
         Operation::Spatial(op) => match op {

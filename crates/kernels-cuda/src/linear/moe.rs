@@ -550,6 +550,64 @@ pub(crate) fn affine_u4_group(x: Tensor, codes: Tensor, scales: Tensor, n: u32) 
     (groups * group == k && matches!(group, 32 | 64 | 128)).then_some(group as u32)
 }
 
+/// A bank's tcgen05 operand, its experts, its bias and weight-scale planes
+/// and the dtype `tc5_worth` reads, for a product `n` wide of `x`; `None`
+/// for an affine bank whose group the GEMM does not take.
+#[cfg(feature = "cuda")]
+#[allow(clippy::type_complexity)]
+fn bank_operand(
+    x: Tensor,
+    bank: GluBank,
+    n: u32,
+) -> Option<(crate::linear::tc5::Operand, u32, u64, u64, Dtype)> {
+    use crate::linear::tc5;
+    Some(match bank {
+        GluBank::Bf16(b) => (
+            tc5::Operand::plain(b.ptr, tc5::Elem::Bf16),
+            b.rows,
+            0,
+            0,
+            b.dtype,
+        ),
+        GluBank::Mxfp4 {
+            codes,
+            scales,
+            bias,
+        } => (
+            tc5::Operand::scaled(codes.ptr, tc5::Elem::E2m1, scales.ptr, 32),
+            codes.rows,
+            bias.map_or(0, |b| b.ptr),
+            0,
+            Dtype::Bf16,
+        ),
+        GluBank::Nvfp4 {
+            codes,
+            scales,
+            tensor_scales,
+        } => (
+            tc5::Operand::scaled(codes.ptr, tc5::Elem::E2m1, scales.ptr, 16),
+            codes.rows,
+            0,
+            tensor_scales.ptr,
+            Dtype::Bf16,
+        ),
+        GluBank::Affine {
+            codes,
+            scales,
+            zeros,
+        } => {
+            let group = affine_u4_group(x, codes, scales, n)?;
+            (
+                tc5::Operand::affine(codes.ptr, scales.ptr, zeros.ptr, group),
+                codes.rows,
+                0,
+                0,
+                Dtype::Bf16,
+            )
+        }
+    })
+}
+
 /// `y[route] = glu(x[route or its token] . W[routes[route]]^T)`, the GLU
 /// in the grouped tcgen05 GEMM's epilogue: `y` is `[routes][inter]`, the
 /// bank's experts `2 * inter` rows each. `Ok(false)` when this fire does
@@ -586,52 +644,8 @@ pub fn select_glu(
             select_mxfp4_mma(ctx, OP, x, codes, scales, bias, routes, y, &fan, Some(glu)).is_ok(),
         );
     }
-    let (w, rows, bias, weight_scale, dtype) = match bank {
-        GluBank::Bf16(b) => (
-            tc5::Operand::plain(b.ptr, tc5::Elem::Bf16),
-            b.rows,
-            0,
-            0,
-            b.dtype,
-        ),
-        GluBank::Mxfp4 {
-            codes,
-            scales,
-            bias,
-        } => (
-            tc5::Operand::scaled(codes.ptr, tc5::Elem::E2m1, scales.ptr, 32),
-            codes.rows,
-            bias.map_or(0, |b| b.ptr),
-            0,
-            Dtype::Bf16,
-        ),
-        GluBank::Nvfp4 {
-            codes,
-            scales,
-            tensor_scales,
-        } => (
-            tc5::Operand::scaled(codes.ptr, tc5::Elem::E2m1, scales.ptr, 16),
-            codes.rows,
-            0,
-            tensor_scales.ptr,
-            Dtype::Bf16,
-        ),
-        GluBank::Affine {
-            codes,
-            scales,
-            zeros,
-        } => {
-            let Some(group) = affine_u4_group(x, codes, scales, 2 * y.width) else {
-                return Ok(false);
-            };
-            (
-                tc5::Operand::affine(codes.ptr, scales.ptr, zeros.ptr, group),
-                codes.rows,
-                0,
-                0,
-                Dtype::Bf16,
-            )
-        }
+    let Some((w, rows, bias, weight_scale, dtype)) = bank_operand(x, bank, 2 * y.width) else {
+        return Ok(false);
     };
     if !tc5_worth(ctx, x, dtype, y, experts, routes.rows, fan.route_count) {
         return Ok(false);
@@ -653,6 +667,114 @@ pub fn select_glu(
         },
     )
     .is_ok())
+}
+
+/// A routed MLP on the grouped tcgen05 GEMM, its rows kept by expert from
+/// the gate-up select to the down select: `y[token]` is the sum over `j`
+/// of `weights[token][j]` times `down(glu(up(x[token])))` on expert
+/// `routes[token][j]`. The routes are laid out
+/// once, the activations scattered into their experts' rows once, the GLU
+/// lands from the gate-up GEMM's epilogue into the down GEMM's operand, and
+/// the weighted sum reads the down product where it lies. `Ok(false)` when
+/// a leg is not one the grouped GEMM takes: the caller runs the four apart.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn experts(
+    ctx: &Ctx,
+    x: Tensor,
+    up: GluBank,
+    glu: crate::linear::tc5::Glu,
+    down: GluBank,
+    routes: Tensor,
+    weights: Tensor,
+    inter: u32,
+    y: &mut Tensor,
+    up_experts: ExpertTable,
+    down_experts: ExpertTable,
+) -> Result<bool, Error> {
+    use crate::linear::{act_quant, tc5};
+    const OP: &str = "linear.moe_experts";
+    const GROUPED_X: &str = "linear.moe_tc5_x";
+    const GROUPED_H: &str = "linear.moe_tc5_h";
+    const GROUPED_Y: &str = "linear.moe_tc5_y";
+    let count = routes.rows * routes.width;
+    let hidden = Tensor::new(0, count, inter, Dtype::Bf16);
+    let routed = Tensor::new(0, count, y.width, Dtype::Bf16);
+    // An mxfp4 fire the register-dequant kernel takes stays on it.
+    let mma = |bank: GluBank| matches!(bank, GluBank::Mxfp4 { .. }) && mxfp4_mma_spans(ctx, count);
+    if count == 0
+        || mma(up)
+        || mma(down)
+        || weights.dtype != Dtype::F32
+        || weights.rows != routes.rows
+        || weights.width != routes.width
+        || y.rows != routes.rows
+        || !y.width.is_multiple_of(8)
+    {
+        return Ok(false);
+    }
+    let (Some(u), Some(d)) = (
+        bank_operand(x, up, 2 * inter),
+        bank_operand(hidden, down, y.width),
+    ) else {
+        return Ok(false);
+    };
+    if !tc5_worth(ctx, x, u.4, &hidden, up_experts, routes.rows, count)
+        || !tc5_worth(ctx, hidden, d.4, &routed, down_experts, routes.rows, count)
+        || u.1 != d.1
+    {
+        return Ok(false);
+    }
+    let experts = u.1;
+    let mut run = || -> Result<(), Error> {
+        let layout = act_quant::lay_out(ctx, OP, routes, experts, tc5::GROUP_ALIGN, true)?;
+        let k = x.width;
+        let rows = layout.rows as usize;
+        let hs = ctx.scratch_stream(OP, GROUPED_H, rows * inter as usize * 2)? as u64;
+        let grouped = tc5::Grouped {
+            experts,
+            groups: layout.groups,
+            alpha_e: 0,
+        };
+        let up_epi = tc5::Epilogue {
+            glu: Some(glu),
+            bias: u.2,
+            weight_scale: u.3,
+            ..tc5::Epilogue::STORE
+        };
+        let xs = ctx.scratch_stream(OP, GROUPED_X, rows * k as usize * 2)? as u64;
+        act_quant::scatter_rows(ctx, OP, x, routes.width, layout.pos, count, xs)?;
+        tc5::grouped_gemm_epi(
+            ctx,
+            tc5::Operand::plain(xs, tc5::Elem::Bf16),
+            u.0,
+            hs,
+            grouped,
+            [inter, k],
+            1.0,
+            up_epi,
+            count,
+        )?;
+        let ys = ctx.scratch_stream(OP, GROUPED_Y, rows * y.width as usize * 2)? as u64;
+        tc5::grouped_gemm_epi(
+            ctx,
+            tc5::Operand::plain(hs, tc5::Elem::Bf16),
+            d.0,
+            ys,
+            grouped,
+            [y.width, inter],
+            1.0,
+            tc5::Epilogue {
+                bias: d.2,
+                weight_scale: d.3,
+                ..tc5::Epilogue::STORE
+            },
+            count,
+        )?;
+        act_quant::weighted_gather(ctx, OP, ys, layout.pos, weights, y)
+    };
+    // A tcgen05 launch that fails leaves the four to run apart.
+    Ok(run().is_ok())
 }
 
 #[cfg(feature = "cuda")]
