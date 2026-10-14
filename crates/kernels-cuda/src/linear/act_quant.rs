@@ -640,7 +640,7 @@ pub(crate) fn weighted_gather(
     // Under a gate, the shared expert's row and its gate column (a pitch a
     // row); without, nothing.
     let (shared, gate, pitch) = gate.map_or((0, 0, 0), |(s, g)| (s.ptr, g.ptr, g.width));
-    if !n.is_multiple_of(8) || grouped % 16 != 0 || y.ptr % 16 != 0 {
+    if !n.is_multiple_of(8) || !grouped.is_multiple_of(16) || !y.ptr.is_multiple_of(16) {
         return Err(refuse(
             op,
             format!("a weighted gather of {n}-wide rows in 16-byte runs"),
