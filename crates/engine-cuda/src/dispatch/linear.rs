@@ -1163,24 +1163,6 @@ impl Run<'_> {
             }
             Some((codes, scales, biases, seat)) => {
                 let act = self.tensor(*act);
-                // A 4-bit affine projection on the tcgen05 GEMM, from the
-                // rows the dense arm takes on.
-                #[cfg(feature = "cuda")]
-                if act.rows >= self.ctx().tuning().qmm_gemm_from
-                    && linear::quant::matmul_tc5(
-                        self.ctx(),
-                        act,
-                        codes,
-                        scales,
-                        OffsetKind::Post,
-                        biases,
-                        Dtype::Bf16,
-                        &mut self.tensor(*y),
-                        seat,
-                    )?
-                {
-                    return Ok(());
-                }
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
                 let entry =
                     if act.rows >= self.ctx().tuning().qmm_gemm_from && !seat.streams() && held {
@@ -1241,24 +1223,6 @@ impl Run<'_> {
             }
             Some((codes, scales, biases, seat)) => {
                 let act = self.tensor(*act);
-                // A 4-bit affine projection on the tcgen05 GEMM, from the
-                // rows the dense arm takes on.
-                #[cfg(feature = "cuda")]
-                if act.rows >= self.ctx().tuning().qmm_gemm_from
-                    && linear::quant::matmul_tc5(
-                        self.ctx(),
-                        act,
-                        codes,
-                        scales,
-                        OffsetKind::Post,
-                        biases,
-                        Dtype::Bf16,
-                        &mut self.tensor(*y),
-                        seat,
-                    )?
-                {
-                    return Ok(());
-                }
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
                 let entry =
                     if act.rows >= self.ctx().tuning().qmm_gemm_from && !seat.streams() && held {
