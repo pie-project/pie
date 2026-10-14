@@ -57,3 +57,32 @@ fn gemma_4_writes_its_kv_through_the_fused_kernel() {
         layers
     );
 }
+
+#[test]
+fn gpt_oss_rotates_and_writes_its_kv_from_the_packed_row() {
+    let deployment = poem_compiler::catalog::deployment("gptoss-120b-bf16-mxfp4-kv-bf16")
+        .expect("the catalog states gptoss-120b");
+    let trace = deployment.trace(Platform::Cuda);
+    let count = |t: &poem_ir::Trace, op: &str| {
+        t.nodes
+            .iter()
+            .filter(|node| poem_ir::Operands::name(&node.op) == op)
+            .count()
+    };
+    let layers = count(&trace, "layout.split_qkv");
+    let fused = poem_compiler::fuse::fuse(
+        trace,
+        &[
+            "elementwise.split_rope_yarn_append",
+            "elementwise.rope_yarn_append",
+        ],
+    );
+    assert!(layers > 0);
+    assert_eq!(
+        (
+            count(&fused, "layout.split_qkv"),
+            count(&fused, "elementwise.split_rope_yarn_append")
+        ),
+        (0, layers)
+    );
+}

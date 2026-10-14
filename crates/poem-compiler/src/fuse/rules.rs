@@ -134,6 +134,8 @@ fn split_rope_yarn_append() -> Rule {
             v_out: m.value("v_split"),
         }
     })
+    // gpt-oss marks its split q and v with `attn.qv`, which no shell reads.
+    .through_markers()
     .when(|m| {
         let d = m.u32("d");
         m.dtype("packed") == Some(Dtype::Bf16)
