@@ -1015,7 +1015,7 @@ impl Weights {
     pub fn hosts_experts(&self) -> bool {
         self.experts
             .as_ref()
-            .is_some_and(|tier| tier.plan().host_image() > 0)
+            .is_some_and(|tier| tier.plan().hosts_beyond_declared())
     }
 
     #[must_use]

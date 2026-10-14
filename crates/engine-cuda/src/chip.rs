@@ -91,6 +91,13 @@ pub struct OneFrameWhenShort;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "engine.forward_tokens", constant(range(0..=65536)), default = 0, tune = engine)]
 pub struct ForwardTokens(pub u32);
+/// Whether a plane its package declares `host` (read only by row gathers, as
+/// a hashed n-gram table) is served from pinned, device-mapped host memory,
+/// its device bytes left to KV pages and state slots. Off holds every plane
+/// in device memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.host_planes", flag, default = false, tune = engine)]
+pub struct HostPlanes;
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("cuda", FACTS, AXES);
@@ -103,7 +110,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<LatticeSteps>()
         .add::<StateSlotsPerLane>()
         .add::<OneFrameWhenShort>()
-        .add::<ForwardTokens>();
+        .add::<ForwardTokens>()
+        .add::<HostPlanes>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
     poem_compiler::costs::register(&mut r, 2);
     r
@@ -162,6 +170,7 @@ pub struct Engine {
     pub state_slots_per_lane: u32,
     pub one_frame_when_short: bool,
     pub forward_tokens: u32,
+    pub host_planes: bool,
 }
 
 impl Engine {
@@ -187,6 +196,7 @@ impl Engine {
             state_slots_per_lane: profile.get::<StateSlotsPerLane>().0,
             one_frame_when_short: profile.on::<OneFrameWhenShort>(&Anywhere),
             forward_tokens: profile.get::<ForwardTokens>().0,
+            host_planes: profile.on::<HostPlanes>(&Anywhere),
         }
     }
 }
@@ -434,6 +444,7 @@ mod tests {
                 state_slots_per_lane: 0,
                 one_frame_when_short: false,
                 forward_tokens: 0,
+                host_planes: false,
             }
         );
         assert_eq!(
@@ -483,18 +494,22 @@ mod tests {
         assert_eq!(Engine::of(&b200).state_slots_per_lane, 2);
         assert!(Engine::of(&b200).one_frame_when_short);
         assert_eq!(Engine::of(&b200).forward_tokens, 16384);
+        assert!(Engine::of(&b200).host_planes);
         assert_eq!(
             Engine {
                 state_slots_per_lane: 0,
                 one_frame_when_short: false,
                 forward_tokens: 0,
+                host_planes: false,
                 ..Engine::of(&b200)
             },
             Engine::of(&family),
-            "only the state seating and the fire width differ from the family's engine"
+            "only the state seating, the fire width and the host planes differ from the \
+             family's engine"
         );
         assert_eq!(Engine::of(&family).state_slots_per_lane, 0);
         assert!(!Engine::of(&family).one_frame_when_short);
+        assert!(!Engine::of(&family).host_planes);
     }
 
     /// The two-launch gated delta scan is an sm_100 family decision; every

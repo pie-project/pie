@@ -153,6 +153,10 @@ impl Recorder {
                 plane.dtype,
                 w.source,
                 w.layout,
+                match plane.suffix {
+                    "" => w.placement,
+                    _ => poem_ir::ParamPlacement::Device,
+                },
             );
             first.get_or_insert(index);
         }
@@ -341,6 +345,7 @@ fn intern(
     dtype: Dtype,
     source: ParamSource,
     layout: ParamLayout,
+    placement: poem_ir::ParamPlacement,
 ) -> u32 {
     if let Some(i) = p.params.iter().position(|q| q.name == name) {
         let seen = &p.params[i];
@@ -357,6 +362,10 @@ fn intern(
             seen.layout == layout,
             "`{name}` is declared twice with two device layouts"
         );
+        assert!(
+            seen.placement == placement,
+            "`{name}` is declared twice with two placements"
+        );
         return i as u32;
     }
     p.params.push(Param {
@@ -366,6 +375,7 @@ fn intern(
         dtype,
         source,
         layout,
+        placement,
     });
     (p.params.len() - 1) as u32
 }

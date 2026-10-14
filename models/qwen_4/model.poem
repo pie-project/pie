@@ -426,7 +426,9 @@ def build(mix, kv, d, hashes, draft, vision):
         offsets = hashes.offsets,
         padded_vocab = padded,
         shards = shards,
-        table = weight("ple.table", [padded, hidden // heads], mix.table).packed([padded // shards] * shards),
+        # Read only by the n-gram gather, a few rows a token: a card whose
+        # profile says so serves it from pinned host memory.
+        table = weight("ple.table", [padded, hidden // heads], mix.table).packed([padded // shards] * shards).host(),
         key_proj = weight("ple.key_proj", [sh, hidden], proj),
         value_proj = weight("ple.value_proj", [hidden, hidden], proj),
         norm_key = weight("ple.norm_key", [sh], dense),

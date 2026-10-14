@@ -54,6 +54,20 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             tokens => tokens,
         };
     }
+    if engine.host_planes {
+        let freed = boot.residency.host_declared(&boot.trace)?;
+        if freed > 0 {
+            // The deferred fill republishes routed seats only; a dense row
+            // read through the artifact's mapping would stay there, so the
+            // host image is built at boot.
+            boot.deferred_tier = false;
+            eprintln!(
+                "engine-cuda: {:.1} GiB of planes the package declares `host` serve from \
+                 pinned host memory (engine.host_planes)",
+                freed as f64 / f64::from(1u32 << 30)
+            );
+        }
+    }
     if boot.slots == 0 {
         boot.slots = match engine.state_slots_per_lane {
             0 => DEFAULT_STATE_SLOTS,

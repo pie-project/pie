@@ -168,6 +168,13 @@ fn weight_methods(builder: &mut MethodsBuilder) {
         crate::star::forward::dsl("rows", || WeightValue(this.0.clone().rows()))
     }
 
+    /// The weight is read only by row gathers (a hashed table): a card whose
+    /// profile says so serves it from pinned host memory the device reads
+    /// through, every other card from its own memory.
+    fn host(this: &WeightValue) -> anyhow::Result<WeightValue> {
+        Ok(WeightValue(this.0.clone().host()))
+    }
+
     /// The weight is a bank the host registers, not one a checkpoint holds.
     fn registered(this: &WeightValue) -> anyhow::Result<WeightValue> {
         Ok(WeightValue(this.0.clone().registered()))

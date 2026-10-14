@@ -1,6 +1,6 @@
 use poem_ir::{
-    ActQuant, BIASES, Dtype, GLOBAL_SCALES, INPUT_SCALES, Param, ParamLayout, ParamSource,
-    Platform, SCALES, Shard, TILED_BAND, TILED_STEP,
+    ActQuant, BIASES, Dtype, GLOBAL_SCALES, INPUT_SCALES, Param, ParamLayout, ParamPlacement,
+    ParamSource, Platform, SCALES, Shard, TILED_BAND, TILED_STEP,
 };
 
 #[derive(Clone, Debug)]
@@ -14,6 +14,9 @@ pub struct Weight {
     pub shard: Shard,
     pub source: ParamSource,
     pub layout: ParamLayout,
+    /// Where the weight's leading plane (its codes) may be served from; its
+    /// companions (a scale) stay on the device.
+    pub placement: ParamPlacement,
 }
 
 impl Weight {
@@ -31,6 +34,7 @@ impl Weight {
             shard: Shard::Replicated,
             source: ParamSource::Checkpoint,
             layout: ParamLayout::Natural,
+            placement: ParamPlacement::Device,
         }
     }
 
@@ -58,6 +62,14 @@ impl Weight {
             u64::from(c_in) * u64::from(taps)
         );
         self.layout = ParamLayout::ConvTapsMajor { c_in, taps };
+        self
+    }
+
+    /// The weight is read only by row gathers, so a card whose profile asks
+    /// may serve it from pinned host memory the device reads through.
+    #[must_use]
+    pub fn host(mut self) -> Weight {
+        self.placement = ParamPlacement::Host;
         self
     }
 
@@ -493,6 +505,7 @@ impl Weight {
             shard,
             source: p.source,
             layout: p.layout,
+            placement: p.placement,
         }
     }
 }
