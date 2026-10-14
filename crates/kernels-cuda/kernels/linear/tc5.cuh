@@ -176,8 +176,8 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     static_assert(kBN % 32 == 0 && kBN >= 32 && kBN <= 256, "the Q tile is 32..256 rows");
     static_assert(kKind >= 0 && kKind <= 3, "four kinds");
     static_assert(kPair == 1 || (kPair == 2 && !kSwap && kBN >= 64), "a pair splits a wide Q");
-    static_assert(kGroup == 0 || (kPair == 1 && (kGroup == 1) == !kSwap),
-                  "contiguous groups run unswapped, masked swapped, both on lone CTAs");
+    static_assert(kGroup == 0 || ((kGroup == 1) == !kSwap && (kGroup == 1 || kPair == 1)),
+                  "contiguous groups run unswapped, masked swapped on lone CTAs");
     static_assert(kGlu == 0 || kSwap || kBN == 256, "an unswapped GLU tile is gate 128 | up 128");
     static_assert(kGlu == 0 || !kSwap || kBN <= 128, "a swapped GLU tile holds two accumulators");
     static_assert(kOut == 0 || kGlu != 0, "a quantized store follows a GLU");
@@ -313,7 +313,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
             // An expert's tiles: its rows' 128-row tiles by the Q tiles.
             auto tiles_of = [&](int e) {
                 if constexpr (kGroup == 1) {
-                    return (routes[e + 1] - routes[e] + 127) / 128 * cont_q;
+                    return (routes[e + 1] - routes[e] + kM - 1) / kM * cont_q;
                 } else {
                     return (min(routes[e], m_max) + kBN - 1) / kBN * masked_p;
                 }
@@ -349,7 +349,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
     // Tiles along P and Q (of one expert, when grouped), and the experts.
     // Contiguous P tiles stop at the routed rows.
     const int num_p = kGroup == 2   ? masked_p
-                      : kGroup == 1 ? (routes[experts] + 127) / 128
+                      : kGroup == 1 ? (routes[experts] + static_cast<int>(kM) - 1) / static_cast<int>(kM)
                                     : (rows_p + static_cast<int>(kM) - 1) / static_cast<int>(kM);
     const int num_q = kGroup == 0 ? (rows_q + static_cast<int>(kQStep) - 1) / static_cast<int>(kQStep)
                       : kGroup == 1 ? (span + static_cast<int>(kQStep) - 1) / static_cast<int>(kQStep)
@@ -398,7 +398,7 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
             const int r = t - starts[e];
             if constexpr (kGroup == 1) {
                 // An expert's row tiles walk fastest, sharing its weight tile.
-                const int m_tiles = (routes[e + 1] - routes[e] + 127) / 128;
+                const int m_tiles = (routes[e + 1] - routes[e] + static_cast<int>(kM) - 1) / static_cast<int>(kM);
                 qt = r / m_tiles;
                 pt = r - qt * m_tiles;
             } else {
@@ -432,13 +432,13 @@ __global__ __launch_bounds__(224, 1) void tc5_gemm(
             if (routes[e] % 64 != 0) {
                 asm volatile("trap;");
             }
-            x.p_row = routes[e] + pt * 128;
+            x.p_row = routes[e] + pt * static_cast<int>(kM);
             x.q_row = e * n_per + qt * static_cast<int>(kQStep);
             x.p_block = x.p_row / 128;
             x.pquarter = static_cast<u32>(x.p_row % 128) / 32;
             x.out_p = x.p_row;
             x.out_q = qt * static_cast<int>(kQStep);
-            x.lim_p = min(128, routes[e + 1] - x.p_row);
+            x.lim_p = min(static_cast<int>(kM), routes[e + 1] - x.p_row);
             x.lim_q = span - qt * static_cast<int>(kQStep);
         } else {
             const int count = min(routes[e], m_max);

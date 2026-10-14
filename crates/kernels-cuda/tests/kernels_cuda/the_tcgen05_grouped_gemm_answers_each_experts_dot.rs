@@ -335,6 +335,14 @@ fn the_tcgen05_grouped_gemm_answers_each_experts_dot_every_case() {
             ..lone(128).unwrap()
         }),
     );
+    // CTA pairs: 256-row tiles, each CTA its expert's next 128 rows.
+    let pair = Some(Plan {
+        pair: true,
+        ..lone(256).unwrap()
+    });
+    for (a, w) in [(bf, bf), (ds, ds), (nv, nv), (ds, w4)] {
+        contiguous(a, w, 6, [512, 1024], pair);
+    }
     masked(bf, bf, 6, 1, [384, 4104], 1);
     masked(bf, bf, 6, 1, [384, 4104], 0);
     masked(nv, nv, 12, 40, [256, 2048], 4);

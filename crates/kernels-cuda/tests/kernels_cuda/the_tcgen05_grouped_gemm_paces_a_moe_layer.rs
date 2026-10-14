@@ -12,6 +12,7 @@
 //!
 //! `PIE_TC5_LAYER` keeps the layers whose name holds it, `PIE_TC5_TOKENS`
 //! one token count; `PIE_TC5_SPLITS` overrides the plan's K splits;
+//! `PIE_TC5_PAIR=0|1` runs contiguous launches on lone CTAs or CTA pairs;
 //! `PIE_TC5_FUSED_BF16` lands the fused gate_up's GLU as bf16 instead.
 
 use crate::common::Gpu;
@@ -20,7 +21,7 @@ use crate::the_tcgen05_gemm_lands_and_paces_what_cublaslt_does::{BATCH, FLUSH, T
 use kernels_cuda::cudarc::runtime::sys as rt;
 use kernels_cuda::linear::tc5::{
     Elem, Epilogue, GROUP_ALIGN, Glu, Grouped, Groups, Operand, Out, Plan, atom_bytes,
-    grouped_gemm_epi, grouped_gemm_with, masked_atom_bytes, supported,
+    grouped_gemm_epi_with, grouped_gemm_with, masked_atom_bytes, supported,
 };
 
 /// Each token's `top` distinct experts: uniform, or skewed so the first
@@ -257,16 +258,18 @@ fn layer(name: &str, experts: usize, top: usize, [n, k]: [usize; 2], kind: Kind)
                         row_scale: 0,
                     };
                     let fused = |i: usize| {
-                        grouped_gemm_epi(
+                        let g = grouped(i);
+                        let shape = [inter as u32, k as u32];
+                        grouped_gemm_epi_with(
                             &ctx,
                             act,
                             w,
                             y,
-                            grouped(i),
-                            [inter as u32, k as u32],
+                            g,
+                            shape,
                             1.0,
                             epi,
-                            routed as u32,
+                            plan_for(&g, shape, routed as u32),
                         )
                     };
                     let us = match fused(0) {
@@ -303,14 +306,26 @@ fn run(
     alpha: f32,
     routed: u32,
 ) -> Result<(), kernels_cuda::Error> {
-    let mut plan = Plan::grouped(&g, shape[0], shape[1], routed, 148);
+    grouped_gemm_with(ctx, act, w, y, g, shape, alpha, plan_for(&g, shape, routed))
+}
+
+/// The grouped plan, its K splits overridden by `PIE_TC5_SPLITS` and a
+/// contiguous launch's CTA pairs by `PIE_TC5_PAIR` (0 or 1).
+fn plan_for(g: &Grouped, shape: [u32; 2], routed: u32) -> Plan {
+    let mut plan = Plan::grouped(g, shape[0], shape[1], routed, 148);
     if let Some(s) = std::env::var("PIE_TC5_SPLITS")
         .ok()
         .and_then(|v| v.parse().ok())
     {
         plan.splits = s;
     }
-    grouped_gemm_with(ctx, act, w, y, g, shape, alpha, plan)
+    if let (Groups::Contiguous { .. }, Ok(pair)) = (g.groups, std::env::var("PIE_TC5_PAIR")) {
+        plan.pair = pair == "1";
+        if plan.pair {
+            plan.bn = 256;
+        }
+    }
+    plan
 }
 
 #[test]

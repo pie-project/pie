@@ -270,19 +270,27 @@ fn dense(
     eprintln!("{what}: lands");
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Layout {
+    Contiguous,
+    /// Contiguous on CTA pairs: 256-row tiles.
+    ContiguousPair,
+    Masked,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn grouped(
     a: Spec,
     w: Spec,
     f: Glu,
     out: u32,
-    masked: bool,
+    layout: Layout,
     experts: usize,
     [n, k]: [usize; 2],
     routed: bool,
 ) {
-    let what =
-        format!("grouped {a:?} x {w:?} {f:?} out={out} masked={masked} e={experts} n={n} k={k}");
+    let masked = layout == Layout::Masked;
+    let what = format!("grouped {a:?} x {w:?} {f:?} out={out} {layout:?} e={experts} n={n} k={k}");
     let mut lcg = Lcg::seeded(0x9e ^ (n * k) as u64);
     let mut bits = 0x9e ^ k as u64;
     let wt = side(&mut lcg, &mut bits, w.0, w.1, experts * 2 * n, k);
@@ -366,7 +374,7 @@ fn grouped(
     };
     let plan = Plan {
         swap: masked,
-        pair: false,
+        pair: layout == Layout::ContiguousPair,
         bn: if masked { 64 } else { 256 },
         stages: 0,
         splits: 0,
@@ -421,19 +429,19 @@ fn the_tcgen05_epilogue_lands_the_glu_and_the_next_operand_every_case() {
         dense(a, w, sw, out, 140, [256, 512], false, false);
         dense(nv, nv, clamp, out, 9, [256, 512], true, true);
     }
-    for masked in [false, true] {
+    for layout in [Layout::Contiguous, Layout::ContiguousPair, Layout::Masked] {
         for out in [0, 1, 2] {
             // NVFP4 spans 448 x 6 of dynamic range a tensor: the heavy-tailed
             // fp8 products would flush whole blocks to zero, so bf16 feeds it.
             let (a, w) = if out == 2 { (bf, bf) } else { (ds, ds) };
-            grouped(a, w, Glu::Swiglu, out, masked, 6, [256, 512], out == 0);
+            grouped(a, w, Glu::Swiglu, out, layout, 6, [256, 512], out == 0);
         }
         grouped(
             nv,
             nv,
             Glu::SwigluClamp { limit: 7.0 },
             2,
-            masked,
+            layout,
             5,
             [128, 512],
             true,

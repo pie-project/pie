@@ -631,8 +631,10 @@ pub const fn masked_atom_bytes(experts: usize, m_max: usize, k: usize, gran: usi
 }
 
 impl Plan {
-    /// A grouped GEMM's plan. Contiguous groups run unswapped on lone CTAs
-    /// (a pair's 256-row tile would cross experts at 128-row alignment);
+    /// A grouped GEMM's plan. Contiguous groups run unswapped on lone CTAs:
+    /// a stated plan may pair them (256-row tiles, an expert's rows padded
+    /// to 256 in the MMA), which measured 2-7% ahead only at uniform routing
+    /// of 8192 tokens, up to 1.7x behind at 1024 and 25% behind skewed;
     /// masked groups swap, the Q tile the rows an expert may hold. `routed`
     /// is the rows the routing is expected to fill in all (a decode's
     /// tokens x top-k), which sizes the K splits without reading counts.
@@ -773,8 +775,8 @@ pub fn grouped_gemm_epi_with(
     let q_step = if glu { 128 } else { plan.bn };
     let job = match g.groups {
         Groups::Contiguous { offsets, rows } => {
-            if plan.swap || plan.pair {
-                return Err(refuse(OP, "a contiguous group runs unswapped on lone CTAs"));
+            if plan.swap {
+                return Err(refuse(OP, "a contiguous group runs unswapped"));
             }
             if rows == 0 {
                 return Ok(());
@@ -788,7 +790,7 @@ pub fn grouped_gemm_epi_with(
                 map_rows: [rows, bank],
                 scale_rows: [rows, bank],
                 y_rows: rows,
-                tiles: rows.div_ceil(128) * n.div_ceil(q_step),
+                tiles: rows.div_ceil(if plan.pair { 256 } else { 128 }) * n.div_ceil(q_step),
                 group: Group {
                     mode: 1,
                     ptr: offsets,
