@@ -375,22 +375,35 @@ __global__ void __launch_bounds__(kOffsetThreads) route_lay_out_small(
     auto rows = [&](int e) { return m_max > 0 ? m_max : (tally[e] + align - 1) / align * align; };
     int sum = 0;
     for (int e = lo; e < hi; ++e) sum += rows(e);
-    run_sum[tid] = sum;
-    __syncthreads();
-    for (int step = 1; step < kOffsetThreads; step <<= 1) {
-        const int add = tid >= step ? run_sum[tid - step] : 0;
-        __syncthreads();
-        run_sum[tid] += add;
-        __syncthreads();
+    // The runs scanned a warp at a time by shuffles, then the warps' totals
+    // by the first warp: two barriers, not two a doubling step.
+    const int lane = tid & 31, warp = tid >> 5;
+    int incl = sum;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        const int y = __shfl_up_sync(0xffffffffu, incl, off);
+        if (lane >= off) incl += y;
     }
-    int at = run_sum[tid] - sum;
+    if (lane == 31) run_sum[warp] = incl;
+    __syncthreads();
+    if (warp == 0) {
+        int w = run_sum[lane];
+#pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            const int y = __shfl_up_sync(0xffffffffu, w, off);
+            if (lane >= off) w += y;
+        }
+        run_sum[lane] = w;
+    }
+    __syncthreads();
+    int at = (warp > 0 ? run_sum[warp - 1] : 0) + incl - sum;
     for (int e = lo; e < hi; ++e) {
         start[e] = at;
         offsets[e] = at;
         counts[e] = tally[e];
         at += rows(e);
     }
-    if (tid == kOffsetThreads - 1) offsets[experts] = run_sum[tid];
+    if (tid == kOffsetThreads - 1) offsets[experts] = run_sum[31];
     // NVFP4's per-expert product scale (`expert_alpha`), where asked.
     if (alpha != nullptr) {
         for (int e = tid; e < experts; e += kOffsetThreads)
