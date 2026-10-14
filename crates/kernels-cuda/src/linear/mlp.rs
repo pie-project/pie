@@ -59,9 +59,20 @@ pub fn swiglu(
     const OP: &str = "linear.mlp_swiglu";
     let t = dtype_dispatch!(OP, packed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let (launch, width) = packed_halves(OP, packed, intermediate, fan, y)?;
+    // Eight columns a thread where the halves and both planes take whole
+    // 16-byte runs: the same values, element for element.
+    let (entry, launch) =
+        if intermediate.is_multiple_of(8) && packed.ptr % 16 == 0 && y.ptr % 16 == 0 {
+            (
+                "mlp_swiglu_vec8",
+                elementwise_rows(OP, y.rows, y.width / 8)?,
+            )
+        } else {
+            ("mlp_swiglu", launch)
+        };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::linear::mlp_swiglu<{t}>"))).apply(launch),
+        Fire::at(FILE, symbol(&format!("::pie::linear::{entry}<{t}>"))).apply(launch),
         &[
             packed.arg(),
             y.arg(),

@@ -1561,13 +1561,18 @@ pub fn weighted_sum(
         weights.rows == y.rows && weights.width == top_k,
         "the weight plane is one weight per route"
     );
+    // Eight columns a thread where the rows and both planes take whole
+    // 16-byte runs: the same sums, element for element.
+    let vec8 = y.width.is_multiple_of(8) && routed.ptr % 16 == 0 && y.ptr % 16 == 0;
+    let (entry, threads) = if vec8 {
+        ("moe_weighted_sum_vec8", y.width / 8)
+    } else {
+        ("moe_weighted_sum", y.width)
+    };
     ctx.fire(
         OP,
-        Fire::at(
-            FILE,
-            symbol(&format!("::pie::linear::moe_weighted_sum<{t}>")),
-        )
-        .apply(elementwise_rows(OP, y.rows, y.width)?),
+        Fire::at(FILE, symbol(&format!("::pie::linear::{entry}<{t}>")))
+            .apply(elementwise_rows(OP, y.rows, threads)?),
         &[
             y.arg(),
             routed.arg(),

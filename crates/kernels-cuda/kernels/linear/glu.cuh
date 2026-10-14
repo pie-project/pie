@@ -144,6 +144,34 @@ __global__ void mlp_swiglu(const T* __restrict__ packed, T* __restrict__ y, i32 
     mlp_swiglu_body<T, false>(packed, y, I, fan, win);
 }
 
+// `mlp_swiglu` eight columns a thread, read and written 16 bytes at a time:
+// the same value for every element.
+template <class T>
+__global__ void mlp_swiglu_vec8(const T* __restrict__ packed, T* __restrict__ y, i32 I,
+                                i32 fan, const u32* __restrict__ win) {
+    const i32 n = blockIdx.x;
+    if (win != nullptr && n >= static_cast<i32>(win[0]) * fan) return;
+    const i32 plane_row = win != nullptr ? n + static_cast<i32>(win[1]) * fan : n;
+    const i32 i0 = (blockIdx.y * blockDim.x + threadIdx.x) * 8;
+    if (i0 >= I) return;
+    const long long row = static_cast<long long>(plane_row) * I;
+    const long long packed_row = row * 2;
+    const uint4 gw = *reinterpret_cast<const uint4*>(packed + packed_row + i0);
+    const uint4 uw = *reinterpret_cast<const uint4*>(packed + packed_row + I + i0);
+    const T* g8 = reinterpret_cast<const T*>(&gw);
+    const T* u8 = reinterpret_cast<const T*>(&uw);
+    uint4 out;
+    T* o8 = reinterpret_cast<T*>(&out);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const float g = Elem<T>::to_f32(g8[k]);
+        const float u = Elem<T>::to_f32(u8[k]);
+        const float silu = g / (1.f + __expf(-g));
+        o8[k] = Elem<T>::from_f32(silu * u);
+    }
+    *reinterpret_cast<uint4*>(y + row + i0) = out;
+}
+
 template <class T, bool GateSecond>
 __device__ __forceinline__ void mlp_situ_body(
     const T* __restrict__ packed,

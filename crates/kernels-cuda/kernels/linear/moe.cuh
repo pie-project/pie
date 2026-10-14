@@ -1334,6 +1334,43 @@ __global__ void moe_weighted_sum(
     out[static_cast<long long>(plane_row) * hidden + h] = Elem<T>::from_f32(acc);
 }
 
+// `moe_weighted_sum` eight columns a thread, 16 bytes at a time: the same
+// sum, in the same order, for every element.
+template <class T>
+__global__ void moe_weighted_sum_vec8(
+    T* __restrict__ out,
+    const T* __restrict__ src,
+    const float* __restrict__ weights,
+    int top_k, int hidden,
+    const u32* __restrict__ win)
+{
+    const int n = blockIdx.x;
+
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const int h0 = (blockIdx.y * blockDim.x + threadIdx.x) * 8;
+    if (h0 >= hidden) return;
+
+    const long long base = static_cast<long long>(plane_row) * top_k;
+    float acc[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) acc[i] = 0.f;
+    for (int k = 0; k < top_k; ++k) {
+        const long long r = base + k;
+        const uint4 w = *reinterpret_cast<const uint4*>(src + r * hidden + h0);
+        const T* v8 = reinterpret_cast<const T*>(&w);
+        const float wr = weights[r];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) acc[i] += wr * Elem<T>::to_f32(v8[i]);
+    }
+    uint4 o;
+    T* o8 = reinterpret_cast<T*>(&o);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) o8[i] = Elem<T>::from_f32(acc[i]);
+    *reinterpret_cast<uint4*>(out + static_cast<long long>(plane_row) * hidden + h0) = o;
+}
+
 // Each token's weighted routed rows plus its shared row, summed in f32.
 template <class T>
 __global__ void moe_sum_add(
