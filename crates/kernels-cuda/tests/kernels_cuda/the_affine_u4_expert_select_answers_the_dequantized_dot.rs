@@ -208,3 +208,87 @@ fn a_wide_fire_takes_the_grouped_kernel_on_the_up_leg() {
 fn a_wide_fire_takes_the_grouped_kernel_on_the_down_leg_with_ragged_tiles() {
     check_with(16, 200, 704, 40, 8, false, 0x62, true);
 }
+
+/// A dense affine u4g64 projection on the tcgen05 GEMM against the arm it
+/// replaces (dequantize the weight to bf16, then cuBLAS), both agreeing.
+/// Ignored: a measurement. Run alone on an idle GPU.
+#[test]
+#[ignore = "a measurement: run alone, on an idle GPU"]
+fn a_dense_affine_projection_is_priced_on_tcgen05() {
+    use kernels_cuda::linear::quant::{OffsetKind, matmul_tc5, matmul_via_dense};
+    if !kernels_cuda::linear::tc5::supported() {
+        return;
+    }
+    let (n, k) = (4096usize, 4096usize);
+    let mut lcg = Lcg::seeded(0xaf);
+    let b = bank(&mut lcg, 1, n, k);
+    let mut gpu = Gpu::open();
+    let codes = Tensor::new(gpu.up(&b.codes), n as u32, (k / 2) as u32, Dtype::U8);
+    let factors = (k / GROUP * 2) as u32;
+    let scales = Tensor::new(gpu.up(&b.scales), n as u32, factors, Dtype::U8);
+    let biases = Tensor::new(gpu.up(&b.biases), n as u32, factors, Dtype::U8);
+    for m in [16usize, 128, 1024, 8192] {
+        let (x_raw, _) = lcg.row(m * k);
+        let x = Tensor::new(gpu.up(&x_raw), m as u32, k as u32, Dtype::Bf16);
+        let ya = gpu.zeros(m * n * 2);
+        let yb = gpu.zeros(m * n * 2);
+        let ctx = gpu.ctx();
+        let fire = |tc5: bool, y: u64| {
+            let mut out = Tensor::new(y, m as u32, n as u32, Dtype::Bf16);
+            let (post, f, seat) = (OffsetKind::Post, Dtype::Bf16, GroupSeat::RESIDENT);
+            if tc5 {
+                let took = matmul_tc5(
+                    &ctx,
+                    x,
+                    codes,
+                    scales,
+                    post,
+                    Some(biases),
+                    f,
+                    &mut out,
+                    seat,
+                )
+                .expect("fires");
+                assert!(took, "the tcgen05 arm takes a u4g64 projection");
+            } else {
+                matmul_via_dense(
+                    &ctx,
+                    x,
+                    codes,
+                    scales,
+                    post,
+                    Some(biases),
+                    f,
+                    &mut out,
+                    seat,
+                )
+                .expect("fires");
+            }
+        };
+        let time = |tc5: bool, y: u64| -> f64 {
+            fire(tc5, y);
+            gpu.sync();
+            let t0 = std::time::Instant::now();
+            for _ in 0..20 {
+                fire(tc5, y);
+            }
+            gpu.sync();
+            t0.elapsed().as_secs_f64() * 1e6 / 20.0
+        };
+        let dense_us = time(false, ya);
+        let tc5_us = time(true, yb);
+        let a: Vec<u16> = gpu.down(ya, m * n);
+        let c: Vec<u16> = gpu.down(yb, m * n);
+        let worst = a
+            .iter()
+            .zip(&c)
+            .map(|(p, q)| (from_bf16(*p) - from_bf16(*q)).abs() / from_bf16(*p).abs().max(1.0))
+            .fold(0f32, f32::max);
+        eprintln!(
+            "m={m} n={n} k={k}: dequantize+cuBLAS {dense_us:.1} us, tcgen05 {tc5_us:.1} us \
+             ({:.2}x); worst relative gap {worst:.4}",
+            dense_us / tc5_us
+        );
+        assert!(worst < 0.02, "the two arms disagree by {worst}");
+    }
+}
