@@ -170,3 +170,113 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
         ],
     )
 }
+
+/// Qwen's gated attention prologue in one launch
+/// (`q_gate_k_norm_rope_append`): the gate halves of the `[q_h | gate_h]`
+/// projection, q and k normed per head (`w + 1`) and turned by the partial
+/// rotation, and k and v appended to the pages. `Ok(false)` where the pool
+/// is not bf16 pages without envelopes, or a plane is not 16-byte aligned,
+/// leaving the step to its primitives.
+#[allow(clippy::too_many_arguments)]
+pub fn q_gate_k_norm_rope_append(
+    ctx: &Ctx,
+    qg: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_weight: Tensor,
+    k_weight: Tensor,
+    positions: Tensor,
+    q_eps: f32,
+    k_eps: f32,
+    pool: &KvPool,
+    write_page: Tensor,
+    write_offset: Tensor,
+    head_dim: u32,
+    rotary_dim: u32,
+    span: u32,
+    theta: f32,
+    q: &mut Tensor,
+    gate: &mut Tensor,
+    q_split: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "attention.q_gate_k_norm_rope_append";
+    const WAVES: u32 = 4;
+    let covered = matches!(head_dim, 64 | 128 | 256 | 512)
+        && qg.dtype == Dtype::Bf16
+        && k.dtype == Dtype::Bf16
+        && v.dtype == Dtype::Bf16
+        && crate::attn::kv::native_bf16(pool)
+        && !pool.has_envelopes
+        && rotary_dim > 0
+        && rotary_dim <= head_dim
+        && rotary_dim.is_multiple_of(2)
+        && span >= rotary_dim / 2
+        && span + rotary_dim / 2 <= head_dim
+        && qg.width.is_multiple_of(2 * head_dim)
+        && k.width.is_multiple_of(head_dim)
+        && v.width == k.width
+        && q.width == qg.width / 2
+        && gate.width == q.width
+        && q_split.width == q.width
+        && !write_page.is_absent()
+        && !write_offset.is_absent()
+        && [
+            qg.ptr,
+            k.ptr,
+            v.ptr,
+            q_weight.ptr,
+            k_weight.ptr,
+            q.ptr,
+            gate.ptr,
+            q_split.ptr,
+            pool.keys.ptr,
+            pool.values.ptr,
+        ]
+        .iter()
+        .all(|&at| at != 0 && at.is_multiple_of(16));
+    if !covered || qg.rows == 0 {
+        return Ok(covered);
+    }
+    let num_q_heads = q.width / head_dim;
+    let num_kv_heads = k.width / head_dim;
+    let hnd = if pool.layout != 0 { "true" } else { "false" };
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            crate::jit::symbol(&format!(
+                "::pie::custom::q_gate_k_norm_rope_append<{head_dim}, {WAVES}, {hnd}>"
+            )),
+        )
+        .apply(Launch::grid(
+            [qg.rows, (num_q_heads + num_kv_heads).div_ceil(WAVES), 1],
+            [64 * WAVES, 1, 1],
+        )),
+        &[
+            qg.arg(),
+            k.arg(),
+            v.arg(),
+            q_weight.arg(),
+            k_weight.arg(),
+            positions.arg(),
+            q.arg(),
+            gate.arg(),
+            q_split.arg(),
+            pool.keys.arg(),
+            pool.values.arg(),
+            write_page.arg(),
+            write_offset.arg(),
+            pool.row_valid.arg(),
+            ctx.stage(),
+            stated(OP, num_q_heads)?.arg(),
+            stated(OP, num_kv_heads)?.arg(),
+            pool.page_size.arg(),
+            q_eps.arg(),
+            k_eps.arg(),
+            stated(OP, rotary_dim)?.arg(),
+            stated(OP, span)?.arg(),
+            theta.arg(),
+        ],
+    )?;
+    Ok(true)
+}

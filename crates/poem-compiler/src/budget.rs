@@ -213,6 +213,7 @@ impl FamilyCosts {
                 | poem_ir::Fused::MatmulBias { .. } => self.linear,
                 poem_ir::Fused::QkvFusedQknormRopeVnormWrite { .. } => self.custom,
                 poem_ir::Fused::GdnStep { .. } => self.attention,
+                poem_ir::Fused::QGateNormRopeAppend { .. } => self.attention,
                 poem_ir::Fused::ResidualAddRmsnorm { .. }
                 | poem_ir::Fused::RmsnormResidualAdd { .. }
                 | poem_ir::Fused::EmbedScaleAdd { .. }

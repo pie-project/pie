@@ -8,7 +8,7 @@ impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         match op {
             Fused::QkvFusedQknormRopeVnormWrite { .. } => self.custom_cuda(op),
-            Fused::GdnStep { .. } => {
+            Fused::GdnStep { .. } | Fused::QGateNormRopeAppend { .. } => {
                 Err(kernels_cuda::Error::Unsupported { op: op.name() })
             }
             Fused::MatmulGeglu { .. }

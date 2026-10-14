@@ -65,6 +65,7 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("attention.ssm_gated_delta", Reads::RowsAndLanes),
     entry("attention.ssm_gdn_prep", Reads::Rows),
     entry("attention.ssm_gdn_step", Reads::RowsAndLanes),
+    entry("attention.q_gate_k_norm_rope_append", Reads::Rows),
     entry("attention.ssm_kda_step", Reads::Rows),
     entry("attention.ple_ngram_ids_chunked", Reads::RowsAndLanes),
     entry("attention.short_conv_chunked", Reads::RowsAndLanes),

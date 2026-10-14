@@ -8,6 +8,7 @@ impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         match op {
             Fused::GdnStep { .. } => return self.gdn_step(op),
+            Fused::QGateNormRopeAppend { .. } => return self.q_gate_append(op),
             Fused::QkvFusedQknormRopeVnormWrite { .. } => self.custom_cuda(op),
             Fused::MatmulGeglu { .. }
             | Fused::MlpSwiglu { .. }
@@ -133,6 +134,116 @@ impl Run<'_> {
                 k_dim,
                 v_dim,
                 y,
+            },
+        )
+    }
+
+    /// Qwen's gated attention prologue in one launch where the kernel takes
+    /// it, else its primitives over the values the fused op keeps.
+    fn q_gate_append(&mut self, op: &Fused) -> Result<(), KernelError> {
+        use poem_exec::{DispatchAttention, DispatchElementwise, DispatchLayout};
+        let Fused::QGateNormRopeAppend {
+            qg,
+            head_dim,
+            q,
+            gate,
+            q_norm,
+            q_eps,
+            qn,
+            k,
+            k_norm,
+            k_eps,
+            kn,
+            positions,
+            rotary_dim,
+            theta,
+            span,
+            q_out,
+            k_out,
+            v,
+            cache,
+            write_page,
+            write_offset,
+        } = *op
+        else {
+            unreachable!("only the gated attention prologue comes here");
+        };
+        if custom::q_gate_k_norm_rope_append(
+                self.ctx(),
+                self.tensor(qg),
+                self.tensor(k),
+                self.tensor(v),
+                self.tensor(q_norm),
+                self.tensor(k_norm),
+                self.tensor(positions),
+                q_eps,
+                k_eps,
+                &self.pool(cache),
+                self.tensor(write_page),
+                self.tensor(write_offset),
+                head_dim,
+                rotary_dim,
+                span,
+                theta,
+                &mut self.tensor(q_out),
+                &mut self.tensor(gate),
+                &mut self.tensor(q),
+            )
+            .map_err(crate::error::kernel)?
+        {
+            return Ok(());
+        }
+        DispatchLayout::dispatch(
+            self,
+            &poem_ir::Layout::SplitQGate {
+                packed: qg,
+                head_dim,
+                q,
+                gate,
+            },
+        )?;
+        DispatchElementwise::dispatch(
+            self,
+            &poem_ir::Elementwise::RmsnormPerHeadPlusOne {
+                x: q,
+                weight: q_norm,
+                head_dim,
+                eps: q_eps,
+                y: qn,
+            },
+        )?;
+        DispatchElementwise::dispatch(
+            self,
+            &poem_ir::Elementwise::RmsnormPerHeadPlusOne {
+                x: k,
+                weight: k_norm,
+                head_dim,
+                eps: k_eps,
+                y: kn,
+            },
+        )?;
+        DispatchElementwise::dispatch(
+            self,
+            &poem_ir::Elementwise::RopePartial {
+                q: qn,
+                k: kn,
+                positions,
+                rotary_dim,
+                head_dim,
+                theta,
+                span,
+                q_out,
+                k_out,
+            },
+        )?;
+        DispatchAttention::dispatch(
+            self,
+            &poem_ir::Attention::KvAppend {
+                k: k_out,
+                v,
+                cache,
+                write_page,
+                write_offset,
             },
         )
     }

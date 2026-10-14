@@ -28,6 +28,7 @@ pub(super) fn all() -> Vec<Rule> {
         rmsnorm_rope_partial_q(),
         hc_norm_project(),
         ssm_gdn_step(),
+        q_gate_k_norm_rope_append(),
     ]
 }
 
@@ -556,5 +557,64 @@ fn ssm_gdn_step() -> Rule {
         k_dim: m.u32("k_dim"),
         v_dim: m.u32("v_dim"),
         y: m.value("y"),
+    })
+}
+
+/// Qwen's gated attention prologue: the q/gate split, the two per-head
+/// norms, the partial rotation and the kv append, all under one guard.
+fn q_gate_k_norm_rope_append() -> Rule {
+    let pattern = template(|p| {
+        let d = p.u32("d");
+        let (q, gate) = layout::split_q_gate(&p.rows("qg", 2 * W), d);
+        // The split q is a seam's (`ATTN_QV`), so it still lands.
+        p.export("q", &q);
+        p.export("gate", &gate);
+        let qn = elemwise::rmsnorm_per_head_plus_one(&q, &p.weight("q_norm", [W]), d, p.f32("q_eps"));
+        p.name("qn", &qn);
+        let kn = elemwise::rmsnorm_per_head_plus_one(
+            &p.rows("k", W),
+            &p.weight("k_norm", [W]),
+            d,
+            p.f32("k_eps"),
+        );
+        p.name("kn", &kn);
+        let (q_out, k_out) = elemwise::rope_partial(
+            &qn,
+            &kn,
+            &p.indices("positions"),
+            p.u32("rotary"),
+            d,
+            p.f32("theta"),
+            Some(p.u32("span")),
+        );
+        p.export("q_out", &q_out);
+        p.name("k_out", &k_out);
+        let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
+        attn::kv_append(&k_out, &p.rows("v", W), p.cache("cache"), &write_page, &write_offset);
+    });
+    Rule::new("attention.q_gate_k_norm_rope_append", [pattern], |m| {
+        Fused::QGateNormRopeAppend {
+            qg: m.value("qg"),
+            head_dim: m.u32("d"),
+            q: m.value("q"),
+            gate: m.value("gate"),
+            q_norm: m.value("q_norm"),
+            q_eps: m.f32("q_eps"),
+            qn: m.value("qn"),
+            k: m.value("k"),
+            k_norm: m.value("k_norm"),
+            k_eps: m.f32("k_eps"),
+            kn: m.value("kn"),
+            positions: m.value("positions"),
+            rotary_dim: m.u32("rotary"),
+            theta: m.f32("theta"),
+            span: m.u32("span"),
+            q_out: m.value("q_out"),
+            k_out: m.value("k_out"),
+            v: m.value("v"),
+            cache: m.value("cache"),
+            write_page: m.value("write_page"),
+            write_offset: m.value("write_offset"),
+        }
     })
 }

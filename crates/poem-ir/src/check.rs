@@ -842,6 +842,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             } => &[(In(4), I32)],
             Fused::RmsnormRopePartialQ { .. } => &[(In(2), I32)],
             Fused::HcNormProject { .. } => &[(In(1), F32), (Out(0), F32)],
+            Fused::QGateNormRopeAppend { .. } => &[(In(4), I32), (In(6), CACHE), (In(7), I32), (In(8), I32)],
             Fused::GdnStep { .. } => &[
                 (In(2), CACHE),
                 (In(6), CACHE),

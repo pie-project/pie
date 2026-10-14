@@ -50,6 +50,7 @@ flags! {
     RmsnormRopePartialQ = "fuse.rmsnorm_rope_partial_q" => "elementwise.rmsnorm_rope_partial_q",
     HcNormProject = "fuse.hc_norm_project" => "elementwise.hc_norm_project",
     SsmGdnStep = "fuse.ssm_gdn_step" => "attention.ssm_gdn_step",
+    QGateKNormRopeAppend = "fuse.q_gate_k_norm_rope_append" => "attention.q_gate_k_norm_rope_append",
 }
 
 /// The fused kernels `profile` turns on, in rule order: what [`super::fuse`]

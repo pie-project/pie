@@ -136,6 +136,35 @@ pub enum Fused {
         v_dim: u32,
         y: ValueId,
     },
+    /// Qwen's gated attention prologue: the split of the `[q_h | gate_h]`
+    /// projection `qg` into `q` and `gate`, q and k normed per head (`w + 1`)
+    /// into `qn` and `kn`, both turned by the partial rotation into `q_out`
+    /// and `k_out` (in place, as the rotation lands them), and `k_out` and
+    /// `v` appended to `cache`. Every intermediate keeps its value, so a
+    /// backend that cannot take the step whole runs the primitives over them.
+    QGateNormRopeAppend {
+        qg: ValueId,
+        head_dim: u32,
+        q: ValueId,
+        gate: ValueId,
+        q_norm: ValueId,
+        q_eps: f32,
+        qn: ValueId,
+        k: ValueId,
+        k_norm: ValueId,
+        k_eps: f32,
+        kn: ValueId,
+        positions: ValueId,
+        rotary_dim: u32,
+        theta: f32,
+        span: u32,
+        q_out: ValueId,
+        k_out: ValueId,
+        v: ValueId,
+        cache: ValueId,
+        write_page: ValueId,
+        write_offset: ValueId,
+    },
     MatmulGeglu {
         act: ValueId,
         w: ValueId,
@@ -240,6 +269,28 @@ impl Operands for Fused {
             Self::HcNormProject {
                 streams, weight, ..
             } => sink.extend([*streams, *weight]),
+            Self::QGateNormRopeAppend {
+                qg,
+                q_norm,
+                k,
+                k_norm,
+                positions,
+                v,
+                cache,
+                write_page,
+                write_offset,
+                ..
+            } => sink.extend([
+                *qg,
+                *q_norm,
+                *k,
+                *k_norm,
+                *positions,
+                *v,
+                *cache,
+                *write_page,
+                *write_offset,
+            ]),
             Self::GdnStep {
                 qkvz,
                 conv_weight,
@@ -335,6 +386,15 @@ impl Operands for Fused {
                 y,
                 ..
             } => sink.extend([*qkv, *z, *conv, *gates, *y]),
+            Self::QGateNormRopeAppend {
+                q,
+                gate,
+                qn,
+                kn,
+                q_out,
+                k_out,
+                ..
+            } => sink.extend([*q, *gate, *qn, *kn, *q_out, *k_out]),
             Self::MatmulGeglu { packed, y, .. } => sink.extend([*packed, *y]),
             Self::MlpSwiglu { packed, h, y, .. } => sink.extend([*packed, *h, *y]),
             Self::LmHeadSoftcap { y, y_out, .. } => sink.extend([*y, *y_out]),
@@ -354,6 +414,13 @@ impl Operands for Fused {
             Self::LmHeadSoftcap { y, y_out, .. } | Self::MatmulBias { y, y_out, .. } => {
                 sink.push((*y_out, *y));
             }
+            Self::QGateNormRopeAppend {
+                qn,
+                kn,
+                q_out,
+                k_out,
+                ..
+            } => sink.extend([(*q_out, *qn), (*k_out, *kn)]),
             Self::HcNormProject { .. }
             | Self::GdnStep { .. }
             | Self::MatmulGeglu { .. }
@@ -374,6 +441,7 @@ impl Operands for Fused {
             Self::GatedResidualNormModulate { .. } => "elementwise.gated_residual_norm_modulate",
             Self::HcNormProject { .. } => "elementwise.hc_norm_project",
             Self::GdnStep { .. } => "attention.ssm_gdn_step",
+            Self::QGateNormRopeAppend { .. } => "attention.q_gate_k_norm_rope_append",
             Self::MatmulGeglu { .. } => "linear.matmul_geglu",
             Self::MlpSwiglu { .. } => "linear.mlp_swiglu",
             Self::LmHeadSoftcap { .. } => "linear.lm_head_softcap",
