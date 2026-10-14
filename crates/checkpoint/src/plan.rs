@@ -30,6 +30,7 @@ pub const TILE_MAP_REPACK: u32 = 1 << 6;
 pub const TILE_MAP_SCALE: u32 = 1 << 7;
 pub const TILE_MAP_BIAS: u32 = 1 << 8;
 pub const TILE_MAP_UNARY: u32 = 1 << 9;
+pub const TILE_MAP_GATHER: u32 = 1 << 10;
 
 pub fn compile(
     metadata: &crate::file::Metadata,
@@ -208,6 +209,9 @@ pub enum TileMapKind {
     Scale,
     Bias,
     Unary,
+    /// The input's blocks permuted along one axis (`TransformSpec::gather`),
+    /// a gather over a computed buffer rather than the checkpoint.
+    Gather,
 }
 
 impl TileMapKind {
@@ -222,6 +226,7 @@ impl TileMapKind {
             Self::Scale => TILE_MAP_SCALE,
             Self::Bias => TILE_MAP_BIAS,
             Self::Unary => TILE_MAP_UNARY,
+            Self::Gather => TILE_MAP_GATHER,
         }
     }
 }
@@ -247,6 +252,8 @@ pub struct TransformSpec {
     pub unary: Option<UnaryOp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gather: Option<GatherSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

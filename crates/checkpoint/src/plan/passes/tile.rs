@@ -1,8 +1,8 @@
 use crate::plan::index::PlanIndex;
 use crate::plan::{
     LoadPlan, SourceExtent, StorageInstr, StorageTarget, TILE_MAP_BIAS, TILE_MAP_CAST,
-    TILE_MAP_DECODE, TILE_MAP_ENCODE, TILE_MAP_REBLOCK, TILE_MAP_REPACK, TILE_MAP_SCALE,
-    TILE_MAP_UNARY, TileMapKind,
+    TILE_MAP_DECODE, TILE_MAP_ENCODE, TILE_MAP_GATHER, TILE_MAP_REBLOCK, TILE_MAP_REPACK,
+    TILE_MAP_SCALE, TILE_MAP_UNARY, TileMapKind,
 };
 use crate::types::{BackendKind, BufferId, DType, Encoding, QuantScheme};
 
@@ -21,8 +21,12 @@ pub const WGPU_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_SCALE | TILE_MAP_DE
 
 pub const XLA_TILE_MAP_MASK: u32 = WGPU_TILE_MAP_MASK;
 
-pub const HOST_TILE_MAP_MASK: u32 =
-    TILE_MAP_CAST | TILE_MAP_REBLOCK | TILE_MAP_SCALE | TILE_MAP_BIAS | TILE_MAP_UNARY;
+pub const HOST_TILE_MAP_MASK: u32 = TILE_MAP_CAST
+    | TILE_MAP_REBLOCK
+    | TILE_MAP_SCALE
+    | TILE_MAP_BIAS
+    | TILE_MAP_UNARY
+    | TILE_MAP_GATHER;
 
 pub const CONVERT_TILE_MAP_MASK: u32 =
     HOST_TILE_MAP_MASK | TILE_MAP_ENCODE | TILE_MAP_DECODE | TILE_MAP_REPACK;
@@ -128,6 +132,7 @@ fn cuda_kernel(facts: &TileMapFacts) -> Option<&'static str> {
         | TileMapKind::Transcode
         | TileMapKind::Reblock
         | TileMapKind::Unary
+        | TileMapKind::Gather
         | TileMapKind::Repack => None,
     }
 }

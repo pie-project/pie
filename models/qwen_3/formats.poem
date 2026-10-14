@@ -282,9 +282,12 @@ def gguf(m, reads):
     if m.mtp != None:
         fail("this deployment declares an MTP draft head and no GGUF spelling of one is settled; import it from the safetensors checkpoint")
     minus_one = lambda e: e.bias(-1.0)
-    # Ternary-Bonsai's GGUF stores the GDN v-heads tiled; the reads reorder
-    # every v-head-indexed tensor to the block order the scan pairs by.
-    v_grouped = attribute_value(GDN_V_GROUPED_KEY) == True
+    # llama.cpp's qwen35 converters store the GDN v-heads tiled, for ggml's
+    # broadcast; the reads reorder every v-head-indexed tensor to the block
+    # order the scan pairs by. A Hadamard-folded out_proj (Ternary-Bonsai's,
+    # `gdn_v_grouped`) keeps its columns in block order.
+    out_grouped = attribute_value(GDN_V_GROUPED_KEY) == True
+    tiled = out_grouped or text_attribute("general.architecture") in ["qwen35", "qwen35moe"]
 
     reads.read(m.embed, "token_embd.weight")
     reads.read_over(m.final_norm, "output_norm.weight", minus_one)
@@ -309,15 +312,16 @@ def gguf(m, reads):
             heads = g.v_heads
             width = g.v_dim
             rep = heads // g.k_heads
+            untile = tiled and rep > 1   # one v-head per k-head is the same either way
             sigma = lambda prefix, width: v_head_reorder_rows(prefix, heads, width, g.k_heads, rep)
 
             fused = spelled([n("ssm_in.weight")])
-            if fused != None and v_grouped:
+            if fused != None and untile:
                 z_base = k_w + heads * width
                 reads.read_expr(g.in_qkvz, src(fused).gather(0, sigma(k_w, width) + [z_base + i for i in sigma(0, width)]))
             elif fused != None:
                 reads.read(g.in_qkvz, fused)
-            elif v_grouped:
+            elif untile:
                 qkv = src(n("attn_qkv.weight")).gather(0, sigma(k_w, width))
                 gate = src(n("attn_gate.weight")).gather(0, sigma(0, width))
                 reads.read_expr(g.in_qkvz, concat(0, [qkv, gate]))
@@ -327,35 +331,38 @@ def gguf(m, reads):
             # `in_ba` is `[beta, alpha]`, beta first.
             legs = [n("ssm_beta.weight"), n("ssm_alpha.weight")]
             fused = spelled([n("ssm_beta_alpha.weight")])
-            if fused != None and v_grouped:
+            if fused != None and untile:
                 idx = sigma(0, 1)
                 reads.read_expr(g.in_ba, src(fused).gather(0, idx + [len(idx) + i for i in sigma(0, 1)]))
             elif fused != None:
                 reads.read(g.in_ba, fused)
-            elif v_grouped:
+            elif untile:
                 reads.read_expr(g.in_ba, concat(0, [src(leg).gather(0, sigma(0, 1)) for leg in legs]))
             else:
                 reads.read_concat(g.in_ba, legs)
-            if v_grouped:
+            if untile:
                 reads.read_expr(g.conv, src(n("ssm_conv1d.weight")).gather(0, sigma(k_w, width)))
                 reads.read_expr(g.dt_bias, src(n("ssm_dt.bias")).gather(0, sigma(0, 1)))
             else:
                 reads.read(g.conv, n("ssm_conv1d.weight"))
                 reads.read(g.dt_bias, n("ssm_dt.bias"))
             logarithm = spelled([n("ssm_a_log")])
-            if logarithm != None and v_grouped:
+            if logarithm != None and untile:
                 reads.read_expr(g.a_log, src(logarithm).gather(0, sigma(0, 1)))
             elif logarithm != None:
                 reads.read(g.a_log, logarithm)
             elif has(n("ssm_a")):
                 a = src(n("ssm_a"))
-                if v_grouped:
+                if untile:
                     a = a.gather(0, sigma(0, 1))
                 reads.read_expr(g.a_log, a.unary("neg_ln"))
             else:
                 held([n("ssm_a_log")])
             reads.read(g.norm, n("ssm_norm.weight"))
-            reads.read(g.out_proj, n("ssm_out.weight"))
+            if untile and not out_grouped:
+                reads.read_expr(g.out_proj, src(n("ssm_out.weight")).gather(1, sigma(0, width)))
+            else:
+                reads.read(g.out_proj, n("ssm_out.weight"))
 
         f = w.mlp
         if not f.routed:
