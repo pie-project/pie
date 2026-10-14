@@ -9,8 +9,13 @@ device = "NVIDIA B200"
 # 16.53, at 64 in 26.64 and 27.21. A model without those products reads
 # the same either way (Qwen3.8-27B 11.30 / 12.26 / 16.54 ms against
 # 11.29 / 12.34 / 16.48).
+#
+# The selected (sparse) attention runs on the tensor cores: one 32x4096
+# prefill of Qwen3.8-Flash-Next spends 1.07 s in it against 18.99 s in the
+# scalar walk.
 [kernel]
 gemm.skinny_rows = 0
+sdpa.selected_mma = true
 
 # Two recurrent-state slots a lane seat every lane a hybrid trunk batches
 # (the fixed 256 seat 128 at the default dispatch depth). 256 requests of
@@ -43,6 +48,7 @@ measured = [
   "kernel.sdpa.decode.split_window",
   "kernel.sdpa.decode.static_max_requests",
   "kernel.sdpa.prefill.ctas_per_sm",
+  "kernel.sdpa.selected_mma",
   "engine.copies",
   "engine.lattice_steps",
   "engine.recording",

@@ -10,6 +10,7 @@ use crate::common::{Gpu, Lcg, close, from_bf16};
 use dtype::Dtype;
 use kernels_cuda::attn::{index, selected};
 use kernels_cuda::tensor::{KvPool, RaggedTensor, Tensor};
+use kernels_cuda::tuning::Tuning;
 
 const IDX_HEADS: usize = 4;
 const IDX_DIM: usize = 128;
@@ -206,10 +207,13 @@ fn the_block_max_ranking_answers_the_reference() {
     let (k_at, v_at) = (gpu.up(&k_raw), gpu.up(&v_raw));
     let kv = pool(k_at, v_at, KV_HEADS * HEAD_DIM, tables);
     let q_at = gpu.up(&q_raw);
-    for decode in [false, true] {
+    for (mma, decode) in [(false, false), (false, true), (true, false), (true, true)] {
         let out = gpu.zeros(tokens * Q_HEADS * HEAD_DIM * 2);
         let mut o = Tensor::new(out, tokens as u32, (Q_HEADS * HEAD_DIM) as u32, Dtype::Bf16);
-        let ctx = gpu.ctx();
+        let ctx = gpu.ctx().with_tuning(Tuning {
+            selected_mma: mma,
+            ..Tuning::DEFAULT
+        });
         let q = ragged(q_at, Q_HEADS * HEAD_DIM);
         if decode {
             selected::attention_decode_selected(
@@ -246,7 +250,7 @@ fn the_block_max_ranking_answers_the_reference() {
             let g = from_bf16(g);
             assert!(
                 close(g, w),
-                "decode {decode}: row {} head {} dim {} landed {g} against {w}",
+                "mma {mma} decode {decode}: row {} head {} dim {} landed {g} against {w}",
                 i / (Q_HEADS * HEAD_DIM),
                 (i / HEAD_DIM) % Q_HEADS,
                 i % HEAD_DIM

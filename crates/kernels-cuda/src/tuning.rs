@@ -54,6 +54,13 @@ pub struct MoeMxfp4MmaFrom(pub u32);
 #[decision(id = "kernel.gemm.tc5_glu_from", constant(range(1..=65_536)), default = 65_536, tune = search)]
 pub struct GemmTc5GluFrom(pub u32);
 
+/// Whether a selected (sparse) attention runs on the tensor cores, a block a
+/// row and kv head, rather than the scalar walk. Off reads every key the
+/// scalar way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.selected_mma", flag, default = false, tune = search)]
+pub struct SdpaSelectedMma;
+
 /// Whether a small decode batch still splits its keys across blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.decode.split_small", flag, default = false, tune = search)]
@@ -231,7 +238,8 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
         .add::<PrefillTc5>()
-        .add::<DecodeGroupedPrefillFrom>();
+        .add::<DecodeGroupedPrefillFrom>()
+        .add::<SdpaSelectedMma>();
 }
 
 /// The kernel decisions one load runs under, read once from its profile.
@@ -271,6 +279,7 @@ pub struct Tuning {
     pub mxfp4_mma_from: u32,
     pub prefill_tc5: bool,
     pub decode_grouped_prefill_from: u32,
+    pub selected_mma: bool,
 }
 
 impl Tuning {
@@ -308,6 +317,7 @@ impl Tuning {
         mxfp4_mma_from: 64,
         prefill_tc5: false,
         decode_grouped_prefill_from: 0,
+        selected_mma: false,
     };
 
     #[must_use]
@@ -345,6 +355,7 @@ impl Tuning {
             mxfp4_mma_from: profile.get::<MoeMxfp4MmaFrom>().0,
             prefill_tc5: profile.on::<PrefillTc5>(&Anywhere),
             decode_grouped_prefill_from: profile.get::<DecodeGroupedPrefillFrom>().0,
+            selected_mma: profile.on::<SdpaSelectedMma>(&Anywhere),
         }
     }
 }

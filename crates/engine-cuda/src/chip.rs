@@ -436,10 +436,16 @@ mod tests {
         assert_eq!(
             kernels_cuda::tuning::Tuning {
                 gemm_skinny_rows: kernels_cuda::tuning::Tuning::of(&family).gemm_skinny_rows,
+                selected_mma: false,
                 ..tuning
             },
             kernels_cuda::tuning::Tuning::of(&family),
-            "only the skinny GEMM's reach differs from the family"
+            "only the skinny GEMM's reach and the selected attention's walk differ from \
+             the family"
+        );
+        assert!(
+            tuning.selected_mma,
+            "a B200 walks a selection on the tensor cores"
         );
         assert_eq!(Engine::of(&b200).state_slots_per_lane, 2);
         assert_eq!(
