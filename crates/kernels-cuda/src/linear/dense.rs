@@ -133,6 +133,19 @@ pub(crate) fn act_x_wt(
     unsafe {
         cublasSetWorkspace_v2(handle, ws, ws_bytes);
     }
+    // A cuBLASLt tactic lands the bias from its epilogue where the profile
+    // says (`kernel.gemm.bias_epilogue`); one it refuses runs bare and the
+    // bias is added after.
+    if let (Some(Tactic::Lt(index)), true, Some(plan)) = (
+        tactic,
+        bias != 0 && tuning.gemm_bias_epilogue,
+        plan.as_deref(),
+    ) && let Some(heuristic) = plan.heuristics.get(index)
+        && !lt_handle.is_null()
+        && run_lt_bias(lt_handle, plan, &heuristic.algo, stream, call, ws, ws_bytes)
+    {
+        return Ok(true);
+    }
     if let Some(tactic) = tactic
         && run_tactic(
             handle,
@@ -530,6 +543,103 @@ fn run_lt(
         )
     };
     status == lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS
+}
+
+/// [`run_lt`] with the bias (bf16, one a column of `y`) added in the
+/// epilogue, through a descriptor of its own for the call. False where the
+/// algorithm refuses the epilogue.
+fn run_lt_bias(
+    lt_handle: lt::cublasLtHandle_t,
+    plan: &LtPlan,
+    algo: &lt::cublasLtMatmulAlgo_t,
+    stream: *mut c_void,
+    call: Call,
+    ws: *mut c_void,
+    ws_bytes: usize,
+) -> bool {
+    struct Desc(lt::cublasLtMatmulDesc_t);
+    impl Drop for Desc {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                let _ = unsafe { lt::cublasLtMatmulDescDestroy(self.0) };
+            }
+        }
+    }
+    let ok = lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS;
+    let mut desc = Desc(std::ptr::null_mut());
+    if unsafe {
+        lt::cublasLtMatmulDescCreate(
+            &raw mut desc.0,
+            lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            lt::cudaDataType::CUDA_R_32F,
+        )
+    } != ok
+    {
+        return false;
+    }
+    let set = |attribute: lt::cublasLtMatmulDescAttributes_t,
+               value: *const c_void,
+               bytes: usize| unsafe {
+        lt::cublasLtMatmulDescSetAttribute(desc.0, attribute, value, bytes) == ok
+    };
+    let (ta, tb) = (
+        cublasOperation_t::CUBLAS_OP_T,
+        cublasOperation_t::CUBLAS_OP_N,
+    );
+    let epilogue = lt::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS;
+    let bias_ptr = dev(call.bias);
+    let bias_type = lt::cudaDataType::CUDA_R_16BF;
+    let size = std::mem::size_of::<cublasOperation_t>();
+    if !(set(
+        lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+        std::ptr::from_ref(&ta).cast(),
+        size,
+    ) && set(
+        lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+        std::ptr::from_ref(&tb).cast(),
+        size,
+    ) && set(
+        lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_EPILOGUE,
+        std::ptr::from_ref(&epilogue).cast(),
+        std::mem::size_of::<lt::cublasLtEpilogue_t>(),
+    ) && set(
+        lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+        std::ptr::from_ref(&bias_ptr).cast(),
+        std::mem::size_of::<*const c_void>(),
+    ) && set(
+        lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
+        std::ptr::from_ref(&bias_type).cast(),
+        std::mem::size_of::<lt::cudaDataType>(),
+    )) {
+        return false;
+    }
+    let alpha = 1.0f32;
+    let beta = 0.0f32;
+    let status = unsafe {
+        lt::cublasLtMatmul(
+            lt_handle,
+            desc.0,
+            std::ptr::from_ref(&alpha).cast(),
+            dev(call.w),
+            plan.a_desc,
+            dev(call.act),
+            plan.b_desc,
+            std::ptr::from_ref(&beta).cast(),
+            dev(call.y),
+            plan.c_desc,
+            dev_mut(call.y),
+            plan.c_desc,
+            std::ptr::from_ref(algo),
+            ws,
+            ws_bytes,
+            stream.cast(),
+        )
+    };
+    if status != ok {
+        clear_error();
+        return false;
+    }
+    true
 }
 
 struct Device {

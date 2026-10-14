@@ -41,6 +41,13 @@ pub struct MoeTc5From(pub u32);
 #[decision(id = "kernel.moe.mxfp4_mma_until", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMxfp4MmaUntil(pub u32);
 
+/// Whether a dense projection's bias lands from the cuBLASLt epilogue of the
+/// algorithm its shape chose, instead of a separate add. Off but where a
+/// chip's profile turns it on (B200's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.bias_epilogue", flag, default = false, tune = search)]
+pub struct GemmBiasEpilogue;
+
 /// The fewest routes a routed mxfp4 select runs on the register-dequant MMA
 /// kernel with (up to `kernel.moe.mxfp4_mma_until`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -257,6 +264,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaMergeWarp>()
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
+        .add::<GemmBiasEpilogue>()
         .add::<PrefillTc5>()
         .add::<DecodeGroupedPrefillFrom>()
         .add::<SdpaSelectedMma>()
@@ -300,6 +308,7 @@ pub struct Tuning {
     pub merge_warp: bool,
     pub mxfp4_mma_until: u32,
     pub mxfp4_mma_from: u32,
+    pub gemm_bias_epilogue: bool,
     pub prefill_tc5: bool,
     pub decode_grouped_prefill_from: u32,
     pub selected_mma: bool,
@@ -341,6 +350,7 @@ impl Tuning {
         merge_warp: false,
         mxfp4_mma_until: 0,
         mxfp4_mma_from: 64,
+        gemm_bias_epilogue: false,
         prefill_tc5: false,
         decode_grouped_prefill_from: 0,
         selected_mma: false,
@@ -382,6 +392,7 @@ impl Tuning {
             merge_warp: profile.on::<SdpaMergeWarp>(&Anywhere),
             mxfp4_mma_until: profile.get::<MoeMxfp4MmaUntil>().0,
             mxfp4_mma_from: profile.get::<MoeMxfp4MmaFrom>().0,
+            gemm_bias_epilogue: profile.on::<GemmBiasEpilogue>(&Anywhere),
             prefill_tc5: profile.on::<PrefillTc5>(&Anywhere),
             decode_grouped_prefill_from: profile.get::<DecodeGroupedPrefillFrom>().0,
             selected_mma: profile.on::<SdpaSelectedMma>(&Anywhere),

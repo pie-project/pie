@@ -34,3 +34,6 @@ sdpa.prefill.tc5 = true
 # one tile: Qwen3.8-27B's 64-row decode step spends 0.64 ms in attention
 # where the decode kernel spends 1.62.
 sdpa.decode.grouped_prefill_from = 4
+# A dense projection's bias from the cuBLASLt epilogue, not a separate add
+# (gpt-oss's qkv and o: about 0.44 ms a bs64 decode step).
+gemm.bias_epilogue = true

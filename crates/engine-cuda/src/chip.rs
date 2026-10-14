@@ -355,6 +355,7 @@ mod tests {
                     "{gpu}"
                 );
                 assert_eq!(tuning.merge_warp, b200, "{gpu}");
+                assert_eq!(tuning.gemm_bias_epilogue, b200, "{gpu}");
                 assert_eq!(
                     kernels_cuda::tuning::Tuning {
                         gemv_narrow: false,
@@ -367,6 +368,7 @@ mod tests {
                         mxfp4_mma_from: defaults.mxfp4_mma_from,
                         prefill_tc5: false,
                         decode_grouped_prefill_from: 0,
+                        gemm_bias_epilogue: false,
                         ..tuning
                     },
                     defaults,
