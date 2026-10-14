@@ -423,7 +423,8 @@ __global__ void hc_mix(
 }
 
 // `hc_mix` eight columns a thread, read and written 16 bytes at a time: the
-// same sums, element for element.
+// same sums, element for element. A row's columns spread over `gridDim.y`
+// blocks, so a narrow fire still fills the SMs.
 template <class T, int BLOCK = 256>
 __global__ void hc_mix_vec8(
     const T* __restrict__ gates,
@@ -445,7 +446,7 @@ __global__ void hc_mix_vec8(
     const T* nr = normed + static_cast<long long>(row) * M * H;
     T* yr = y + static_cast<long long>(row) * H;
 
-    for (int h0 = tid * 8; h0 < H; h0 += BLOCK * 8) {
+    for (int h0 = (blockIdx.y * BLOCK + tid) * 8; h0 < H; h0 += gridDim.y * BLOCK * 8) {
         float acc[8];
 #pragma unroll
         for (int i = 0; i < 8; ++i) acc[i] = 0.f;
@@ -506,7 +507,8 @@ __global__ void hc_inject(
     }
 }
 
-// `hc_inject` eight columns a thread, 16 bytes at a time: the same sums.
+// `hc_inject` eight columns a thread, 16 bytes at a time: the same sums. A
+// row's streams spread over `gridDim.y` blocks.
 template <class T, int BLOCK = 256>
 __global__ void hc_inject_vec8(
     const T* __restrict__ o,
@@ -536,7 +538,7 @@ __global__ void hc_inject_vec8(
     __syncthreads();
 
     const int total = M * H;
-    for (int i0 = tid * 8; i0 < total; i0 += BLOCK * 8) {
+    for (int i0 = (blockIdx.y * BLOCK + tid) * 8; i0 < total; i0 += gridDim.y * BLOCK * 8) {
         const int s = i0 / H;
         const int h0 = i0 - s * H;
         uint4 hw = *reinterpret_cast<const uint4*>(hr + i0);

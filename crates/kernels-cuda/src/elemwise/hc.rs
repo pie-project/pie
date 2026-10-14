@@ -327,6 +327,9 @@ pub fn collapse(
 
 /// Whether rows `width` wide (two-byte elements) at these planes split into
 /// whole aligned 16-byte runs.
+/// The threads a block of the spread 16-byte mix and inject.
+const SPREAD: u32 = 64;
+
 fn whole_runs(width: u32, planes: &[u64]) -> bool {
     width.is_multiple_of(8) && planes.iter().all(|p| p % 16 == 0)
 }
@@ -353,15 +356,24 @@ pub fn mix(
     nonzero(OP, "rows", y.rows)?;
     // Whole 16-byte runs where the width and the three planes allow them:
     // the same sums, element for element.
-    let entry = if whole_runs(y.width, &[gates.ptr, normed.ptr, y.ptr]) {
-        "hc_mix_vec8"
+    let vec8 = whole_runs(y.width, &[gates.ptr, normed.ptr, y.ptr]);
+    // The 16-byte form spreads a row's columns over blocks of 64 threads, so
+    // a decode fire's few rows still fill the SMs; each element's sum is the
+    // same one, in the same order.
+    let (entry, launch) = if vec8 {
+        (
+            format!("::pie::elemwise::hc_mix_vec8<{t}, {SPREAD}>"),
+            Launch::grid([y.rows, (y.width / 8).div_ceil(SPREAD), 1], [SPREAD, 1, 1]),
+        )
     } else {
-        "hc_mix"
+        (
+            format!("::pie::elemwise::hc_mix<{t}, 256>"),
+            Launch::per_row(y.rows, BLOCK),
+        )
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::{entry}<{t}, 256>")))
-            .apply(Launch::per_row(y.rows, BLOCK)),
+        Fire::at(FILE, symbol(&entry)).apply(launch),
         &[
             gates.arg(),
             normed.arg(),
@@ -392,15 +404,25 @@ pub fn inject(
         "one gate logit per stream per row, one wide row per row"
     );
     nonzero(OP, "rows", o.rows)?;
-    let entry = if whole_runs(o.width, &[o.ptr, hyper.ptr]) {
-        "hc_inject_vec8"
+    let vec8 = whole_runs(o.width, &[o.ptr, hyper.ptr]);
+    // As `mix`: a row's streams over blocks of 64 threads, the same sums.
+    let (entry, launch) = if vec8 {
+        (
+            format!("::pie::elemwise::hc_inject_vec8<{t}, {SPREAD}>"),
+            Launch::grid(
+                [o.rows, (fan * o.width / 8).div_ceil(SPREAD), 1],
+                [SPREAD, 1, 1],
+            ),
+        )
     } else {
-        "hc_inject"
+        (
+            format!("::pie::elemwise::hc_inject<{t}, 256>"),
+            Launch::per_row(o.rows, BLOCK),
+        )
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::{entry}<{t}, 256>")))
-            .apply(Launch::per_row(o.rows, BLOCK)),
+        Fire::at(FILE, symbol(&entry)).apply(launch),
         &[
             o.arg(),
             gates.arg(),
