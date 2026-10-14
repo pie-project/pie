@@ -50,6 +50,7 @@ flags! {
     GatedResidualNormModulate = "fuse.gated_residual_norm_modulate" => "elementwise.gated_residual_norm_modulate",
     NormModulate = "fuse.norm_modulate" => "elementwise.norm_modulate",
     RmsnormRopePartialQ = "fuse.rmsnorm_rope_partial_q" => "elementwise.rmsnorm_rope_partial_q",
+    RopeYarnAppend = "fuse.rope_yarn_append" => "elementwise.rope_yarn_append",
 }
 
 /// The fused kernels `profile` turns on, in rule order: what [`super::fuse`]

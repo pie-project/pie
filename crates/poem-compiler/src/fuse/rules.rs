@@ -28,7 +28,63 @@ pub(super) fn all() -> Vec<Rule> {
         gated_residual_norm_modulate(),
         norm_modulate(),
         rmsnorm_rope_partial_q(),
+        rope_yarn_append(),
     ]
+}
+
+/// YaRN over q and k, and the rotated k written to the cache with its v.
+fn rope_yarn_append() -> Rule {
+    let pattern = template(|p| {
+        let (q, k, v) = (p.rows("q", W), p.rows("k", W), p.rows("v", W));
+        let positions = p.indices("positions");
+        p.free("interleaved");
+        let (q, k) = elemwise::rope_yarn(
+            &q,
+            &k,
+            &positions,
+            p.u32("d"),
+            p.f32("theta"),
+            p.f32("factor"),
+            p.f32("beta_fast"),
+            p.f32("beta_slow"),
+            p.f32("attention_factor"),
+            p.u32("original_max_position"),
+            false,
+        );
+        p.name("k_out", &k);
+        let cache = p.cache("cache");
+        let (write_page, write_offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
+        attn::kv_append(&k, &v, cache, &write_page, &write_offset);
+        p.export("q_out", &q);
+    });
+    Rule::new("elementwise.rope_yarn_append", [pattern], |m| {
+        Fused::RopeYarnAppend {
+            q: m.value("q"),
+            k: m.value("k"),
+            v: m.value("v"),
+            positions: m.value("positions"),
+            head_dim: m.u32("d"),
+            theta: m.f32("theta"),
+            factor: m.f32("factor"),
+            beta_fast: m.f32("beta_fast"),
+            beta_slow: m.f32("beta_slow"),
+            attention_factor: m.f32("attention_factor"),
+            original_max_position: m.u32("original_max_position"),
+            interleaved: matches!(
+                m.op("q_out"),
+                Operation::Elementwise(Elementwise::RopeYarn {
+                    interleaved: true,
+                    ..
+                })
+            ),
+            cache: m.value("cache"),
+            write_page: m.value("write_page"),
+            write_offset: m.value("write_offset"),
+            q_out: m.value("q_out"),
+            k_out: m.value("k_out"),
+        }
+    })
+    .when(|m| m.dtype("q") == Some(Dtype::Bf16))
 }
 
 #[derive(Clone, Copy)]

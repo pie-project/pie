@@ -152,6 +152,28 @@ pub enum Fused {
         select: Box<Linear>,
         glu: Box<Linear>,
     },
+    /// YaRN over q and k, and the rotated k with its v landed in the paged
+    /// cache at each row's page and offset (`kv_append`); `k_out` is read by
+    /// nothing else.
+    RopeYarnAppend {
+        q: ValueId,
+        k: ValueId,
+        v: ValueId,
+        positions: ValueId,
+        head_dim: u32,
+        theta: f32,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        attention_factor: f32,
+        original_max_position: u32,
+        interleaved: bool,
+        cache: ValueId,
+        write_page: ValueId,
+        write_offset: ValueId,
+        q_out: ValueId,
+        k_out: ValueId,
+    },
     QkvFusedQknormRopeVnormWrite {
         packed: ValueId,
         positions: ValueId,
@@ -230,6 +252,16 @@ impl Operands for Fused {
             } => sink.extend([*act, *gate_up, *down]),
             Self::MatmulBias { act, w, bias, .. } => sink.extend([*act, *w, *bias]),
             Self::MoeSelectGlu { select, .. } => select.inputs(sink),
+            Self::RopeYarnAppend {
+                q,
+                k,
+                v,
+                positions,
+                cache,
+                write_page,
+                write_offset,
+                ..
+            } => sink.extend([*q, *k, *v, *positions, *cache, *write_page, *write_offset]),
             Self::QkvFusedQknormRopeVnormWrite {
                 packed,
                 positions,
@@ -301,6 +333,7 @@ impl Operands for Fused {
                 select.outputs(sink);
                 glu.outputs(sink);
             }
+            Self::RopeYarnAppend { q_out, k_out, .. } => sink.extend([*q_out, *k_out]),
             Self::QkvFusedQknormRopeVnormWrite { q, .. } => sink.push(*q),
         }
     }
@@ -311,6 +344,9 @@ impl Operands for Fused {
             Self::EmbedScaleAdd { y_out, y, .. } => sink.push((*y_out, *y)),
             Self::EmbedScaleAddSelect { .. } => {}
             Self::RmsnormRopePartialQ { q_out, y, .. } => sink.push((*q_out, *y)),
+            Self::RopeYarnAppend {
+                q_out, q, k_out, k, ..
+            } => sink.extend([(*q_out, *q), (*k_out, *k)]),
             Self::NormModulate { .. } => {}
             Self::GatedResidualNormModulate { r_out, r, .. } => sink.push((*r_out, *r)),
             Self::LmHeadSoftcap { y, y_out, .. } | Self::MatmulBias { y, y_out, .. } => {
@@ -340,6 +376,7 @@ impl Operands for Fused {
             Self::LmHeadSoftcap { .. } => "linear.lm_head_softcap",
             Self::MatmulBias { .. } => "linear.matmul_bias",
             Self::MoeSelectGlu { .. } => "linear.moe_select_glu",
+            Self::RopeYarnAppend { .. } => "elementwise.rope_yarn_append",
             Self::QkvFusedQknormRopeVnormWrite { .. } => {
                 "custom_cuda.qkv_fused_qknorm_rope_vnorm_write"
             }

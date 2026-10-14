@@ -868,6 +868,9 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Fused::QkvFusedQknormRopeVnormWrite { .. } => {
                 &[(In(1), I32), (In(4), CACHE), (In(5), I32), (In(6), I32)]
             }
+            Fused::RopeYarnAppend { .. } => {
+                &[(In(3), I32), (In(4), CACHE), (In(5), I32), (In(6), I32)]
+            }
             Fused::ResidualAddRmsnorm { .. }
             | Fused::RmsnormResidualAdd { .. }
             | Fused::NormModulate {

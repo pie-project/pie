@@ -456,7 +456,10 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::PoolLse { .. }
             | Attention::PoolLseSelected { .. } => false,
         },
-        Operation::Fused(op) => matches!(op, Fused::QkvFusedQknormRopeVnormWrite { .. }),
+        Operation::Fused(op) => matches!(
+            op,
+            Fused::QkvFusedQknormRopeVnormWrite { .. } | Fused::RopeYarnAppend { .. }
+        ),
         Operation::Spatial(op) => match op {
             Spatial::Conv3d { cache, .. } => cache.is_some(),
             Spatial::CacheStore { .. } => true,

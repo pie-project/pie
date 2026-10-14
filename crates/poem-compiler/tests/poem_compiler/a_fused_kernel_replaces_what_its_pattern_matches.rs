@@ -173,3 +173,50 @@ fn the_qkv_write_stays_apart_when_its_norms_do_not() {
     );
     assert_eq!(ops(&fused), ops(&apart), "no op folds");
 }
+
+fn yarn_write(p: &Pattern, interleaved: bool) {
+    let positions = p.indices("positions");
+    let (q, k, v) = (p.rows("q", 512), p.rows("k", 128), p.rows("v", 128));
+    let (q, k) = elemwise::rope_yarn(
+        &q, &k, &positions, 64, 150_000.0, 32.0, 32.0, 1.0, 1.3, 4096, interleaved,
+    );
+    attn::kv_append(
+        &k,
+        &v,
+        p.cache("kv"),
+        &p.rows("write_page", 1),
+        &p.rows("write_offset", 1),
+    );
+    elemwise::silu(&q);
+}
+
+/// gpt-oss's YaRN and its cache write fold into one launch, carrying the
+/// rotation's every parameter.
+#[test]
+fn a_yarn_rotation_and_its_cache_write_fold_into_one_op() {
+    for interleaved in [false, true] {
+        let fused = fuse(
+            trace(|p| yarn_write(p, interleaved)),
+            &["elementwise.rope_yarn_append"],
+        );
+        assert_eq!(
+            ops(&fused),
+            ["elementwise.rope_yarn_append", "elementwise.silu"]
+        );
+        let Some(poem_ir::Operation::Fused(poem_ir::Fused::RopeYarnAppend {
+            head_dim,
+            theta,
+            factor,
+            original_max_position,
+            interleaved: carried,
+            ..
+        })) = fused.nodes.first().map(|node| &node.op)
+        else {
+            panic!("the first op is the fused rotation");
+        };
+        assert_eq!(
+            (*head_dim, *theta, *factor, *original_max_position, *carried),
+            (64, 150_000.0, 32.0, 4096, interleaved)
+        );
+    }
+}

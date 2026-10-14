@@ -8,6 +8,7 @@ impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         match op {
             Fused::QkvFusedQknormRopeVnormWrite { .. } => self.custom_cuda(op),
+            Fused::RopeYarnAppend { .. } => self.rope_yarn_append(op),
             Fused::MatmulGeglu { .. }
             | Fused::MatmulSwiglu { .. }
             | Fused::MlpSwiglu { .. }
@@ -35,6 +36,80 @@ impl DispatchFused for Run<'_> {
 }
 
 impl Run<'_> {
+    /// YaRN and the cache write in one launch where the pool is the plain
+    /// bf16 one `kv_append` writes directly; else the two as they were.
+    fn rope_yarn_append(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        use kernels_cuda::elemwise::rope;
+        let Fused::RopeYarnAppend {
+            q,
+            k,
+            v,
+            positions,
+            head_dim,
+            theta,
+            factor,
+            beta_fast,
+            beta_slow,
+            attention_factor,
+            original_max_position,
+            interleaved,
+            cache,
+            write_page,
+            write_offset,
+            ..
+        } = op
+        else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        let pool = self.pool(*cache);
+        let append = rope::YarnAppend {
+            v: self.tensor(*v),
+            pool: &pool,
+            write_page: self.tensor(*write_page),
+            write_offset: self.tensor(*write_offset),
+        };
+        let (mut qt, mut kt) = (self.tensor(*q), self.tensor(*k));
+        if append.fits() {
+            return rope::yarn_append(
+                self.ctx(),
+                &mut qt,
+                &mut kt,
+                self.tensor(*positions),
+                *head_dim,
+                *theta,
+                *factor,
+                *beta_fast,
+                *beta_slow,
+                *attention_factor,
+                *original_max_position,
+                *interleaved,
+                append,
+            );
+        }
+        rope::yarn(
+            self.ctx(),
+            &mut qt,
+            &mut kt,
+            self.tensor(*positions),
+            *head_dim,
+            *theta,
+            *factor,
+            *beta_fast,
+            *beta_slow,
+            *attention_factor,
+            *original_max_position,
+            *interleaved,
+        )?;
+        kernels_cuda::attn::kv_append(
+            self.ctx(),
+            self.ragged_lanes(*k),
+            self.tensor(*v),
+            &pool,
+            self.tensor(*write_page),
+            self.tensor(*write_offset),
+        )
+    }
+
     fn custom_cuda(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
         match op {
             Fused::QkvFusedQknormRopeVnormWrite {

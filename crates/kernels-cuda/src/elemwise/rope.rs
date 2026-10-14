@@ -4,7 +4,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated};
-use crate::tensor::Tensor;
+use crate::tensor::{KvPool, Tensor};
 
 const FILE: &str = "elemwise/rope.cuh";
 
@@ -330,22 +330,115 @@ pub fn yarn(
     original_max_position: u32,
     interleaved: bool,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_yarn";
-    dtype_dispatch!(OP, q.dtype, { Bf16 => () });
-    debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
-    positions_stream(OP, positions, q);
+    yarn_fire(
+        ctx,
+        "elementwise.rope_yarn",
+        q,
+        k,
+        positions,
+        head_dim,
+        theta,
+        factor,
+        beta_fast,
+        beta_slow,
+        attention_factor,
+        original_max_position,
+        interleaved,
+        None,
+    )
+}
+
+/// Where a YaRN rotation also lands the rotated keys and the values in a
+/// paged cache, at each row's explicit page and offset.
+#[derive(Clone, Copy)]
+pub struct YarnAppend<'a> {
+    pub v: Tensor,
+    pub pool: &'a KvPool,
+    pub write_page: Tensor,
+    pub write_offset: Tensor,
+}
+
+impl YarnAppend<'_> {
+    /// Whether the fused write lands what `kv_append` would: a bf16 NHD
+    /// pool with no quantised planes and no envelopes to keep.
+    #[must_use]
+    pub fn fits(&self) -> bool {
+        self.pool.layout == 0
+            && !self.pool.has_envelopes
+            && self.pool.keys.dtype == Dtype::Bf16
+            && self.pool.values.dtype == Dtype::Bf16
+            && self.pool.key_scales.is_absent()
+            && self.pool.value_scales.is_absent()
+            && self.v.dtype == Dtype::Bf16
+    }
+}
+
+/// [`yarn`], landing the rotated keys and the values in `append`'s cache in
+/// the same launch. The caller checks [`YarnAppend::fits`] first.
+pub fn yarn_append(
+    ctx: &Ctx,
+    q: &mut Tensor,
+    k: &mut Tensor,
+    positions: Tensor,
+    head_dim: u32,
+    theta: f32,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+    attention_factor: f32,
+    original_max_position: u32,
+    interleaved: bool,
+    append: YarnAppend<'_>,
+) -> Result<(), Error> {
+    yarn_fire(
+        ctx,
+        "elementwise.rope_yarn_append",
+        q,
+        k,
+        positions,
+        head_dim,
+        theta,
+        factor,
+        beta_fast,
+        beta_slow,
+        attention_factor,
+        original_max_position,
+        interleaved,
+        Some(append),
+    )
+}
+
+fn yarn_fire(
+    ctx: &Ctx,
+    op: &'static str,
+    q: &mut Tensor,
+    k: &mut Tensor,
+    positions: Tensor,
+    head_dim: u32,
+    theta: f32,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+    attention_factor: f32,
+    original_max_position: u32,
+    interleaved: bool,
+    append: Option<YarnAppend<'_>>,
+) -> Result<(), Error> {
+    dtype_dispatch!(op, q.dtype, { Bf16 => () });
+    debug_assert_eq!(k.dtype, q.dtype, "`{op}` rotates q and k in one element");
+    positions_stream(op, positions, q);
     let max_position = stated(
-        OP,
+        op,
         nonzero(
-            OP,
+            op,
             "the position span this checkpoint's YaRN block states",
             original_max_position,
         )?,
     )?;
-    let num_q_heads = q_heads(OP, q.width, head_dim)?;
-    let num_kv_heads = heads(OP, k.width, head_dim)?;
+    let num_q_heads = q_heads(op, q.width, head_dim)?;
+    let num_kv_heads = heads(op, k.width, head_dim)?;
     let (low_dim, high_dim) = ramp_bounds(
-        stated(OP, head_dim)?,
+        stated(op, head_dim)?,
         theta,
         beta_fast,
         beta_slow,
@@ -354,9 +447,39 @@ pub fn yarn(
     let half = head_dim / 2;
     let pairs = cache_pairs(half);
     let per_block = heads_per_block(half);
+    let (entry, v, k_pages, v_pages, w_page, w_off, row_valid, page_size) = match append {
+        Some(a) => {
+            if !a.fits() {
+                return Err(refuse(
+                    op,
+                    "the fused YaRN write lands a bf16 NHD cache without envelopes only",
+                ));
+            }
+            (
+                "::pie::elemwise::rope_yarn<::pie::true_type::value>",
+                a.v.arg(),
+                a.pool.keys.arg(),
+                a.pool.values.arg(),
+                a.write_page.arg(),
+                a.write_offset.arg(),
+                a.pool.row_valid.arg(),
+                a.pool.page_size,
+            )
+        }
+        None => (
+            "::pie::elemwise::rope_yarn<::pie::false_type::value>",
+            ArgValue::ABSENT,
+            ArgValue::ABSENT,
+            ArgValue::ABSENT,
+            ArgValue::ABSENT,
+            ArgValue::ABSENT,
+            ArgValue::ABSENT,
+            0,
+        ),
+    };
     ctx.fire(
-        OP,
-        Fire::at(FILE, "::pie::elemwise::rope_yarn").apply(rotate_launch(
+        op,
+        Fire::at(FILE, entry).apply(rotate_launch(
             q.rows,
             num_q_heads + num_kv_heads,
             per_block,
@@ -366,17 +489,24 @@ pub fn yarn(
             q.arg(),
             k.arg(),
             positions.arg(),
-            stated(OP, num_q_heads)?.arg(),
-            stated(OP, num_kv_heads)?.arg(),
-            stated(OP, head_dim)?.arg(),
+            stated(op, num_q_heads)?.arg(),
+            stated(op, num_kv_heads)?.arg(),
+            stated(op, head_dim)?.arg(),
             theta.arg(),
             factor.arg(),
             low_dim.arg(),
             high_dim.arg(),
             attention_factor.arg(),
             interleaved.arg(),
-            stated(OP, per_block)?.arg(),
-            stated(OP, pairs)?.arg(),
+            stated(op, per_block)?.arg(),
+            stated(op, pairs)?.arg(),
+            v,
+            k_pages,
+            v_pages,
+            w_page,
+            w_off,
+            row_valid,
+            page_size.arg(),
             ctx.stage(),
         ],
     )

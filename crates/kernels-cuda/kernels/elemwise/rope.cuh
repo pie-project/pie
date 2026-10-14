@@ -446,6 +446,10 @@ __global__ void rotate_yarn(
     }
 }
 
+// YaRN over q and k in place; with kWriteKv, each rotated k pair and its v
+// pair land in the paged (NHD) cache at the row's explicit page and offset,
+// as `kv_append_explicit` lands them.
+template <bool kWriteKv>
 __global__ void rope_yarn(
     bf16* __restrict__ q,
     bf16* __restrict__ k,
@@ -457,6 +461,13 @@ __global__ void rope_yarn(
     bool interleaved,
     int heads_per_block,
     int cache_pairs,
+    const bf16* __restrict__ v,
+    bf16* __restrict__ k_pages,
+    bf16* __restrict__ v_pages,
+    const u32* __restrict__ w_page,
+    const u32* __restrict__ w_off,
+    const u8* __restrict__ row_valid,
+    int page_size,
     const u32* __restrict__ win)
 {
     extern __shared__ float2 yarn_cs[];
@@ -465,6 +476,15 @@ __global__ void rope_yarn(
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
 
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
+    KvSlot slot{};
+    bool write_this_row = false;
+    if constexpr (kWriteKv) {
+        slot.page = static_cast<int>(w_page[row]);
+        slot.offset_in_page = static_cast<int>(w_off[row]);
+        write_this_row = (row_valid == nullptr || row_valid[row] != 0) &&
+                         slot.offset_in_page >= 0 && slot.offset_in_page < page_size;
+    }
 
     const int total_heads = num_q_heads + num_kv_heads;
     const int half = head_dim / 2;
@@ -503,6 +523,23 @@ __global__ void rope_yarn(
                                      kv_h) * head_dim;
             if (interleaved) rotate_pair_interleaved(kp, dim_pair, cs.x, cs.y);
             else             rotate_pair(kp, half, dim_pair, cs.x, cs.y);
+            if constexpr (kWriteKv) {
+                if (write_this_row) {
+                    const int j0 = interleaved ? dim_pair * 2 : dim_pair;
+                    const int j1 = interleaved ? dim_pair * 2 + 1 : dim_pair + half;
+                    const bf16* vp =
+                        v + (static_cast<long long>(row) * num_kv_heads + kv_h) * head_dim;
+                    const int base = kv_h * head_dim;
+                    const long long d0 =
+                        kv_dst_index<false>(slot, base + j0, page_size, num_kv_heads, head_dim);
+                    const long long d1 =
+                        kv_dst_index<false>(slot, base + j1, page_size, num_kv_heads, head_dim);
+                    k_pages[d0] = kp[j0];
+                    k_pages[d1] = kp[j1];
+                    v_pages[d0] = vp[j0];
+                    v_pages[d1] = vp[j1];
+                }
+            }
         }
     }
 }

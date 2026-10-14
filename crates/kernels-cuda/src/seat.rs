@@ -110,6 +110,7 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("elementwise.rope_partial_last", Reads::Rows),
     entry("elementwise.rope_partial_q", Reads::Rows),
     entry("elementwise.rope_yarn", Reads::Rows),
+    entry("elementwise.rope_yarn_append", Reads::Rows),
     entry("elementwise.scale", Reads::Rows),
     entry("elementwise.silu", Reads::Rows),
     entry("elementwise.silu_scaled", Reads::Rows),

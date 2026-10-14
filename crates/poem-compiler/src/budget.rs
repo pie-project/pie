@@ -219,6 +219,7 @@ impl FamilyCosts {
                 | poem_ir::Fused::EmbedScaleAdd { .. }
                 | poem_ir::Fused::EmbedScaleAddSelect { .. }
                 | poem_ir::Fused::RmsnormRopePartialQ { .. }
+                | poem_ir::Fused::RopeYarnAppend { .. }
                 | poem_ir::Fused::NormModulate { .. }
                 | poem_ir::Fused::GatedResidualNormModulate { .. } => self.elementwise,
             },
