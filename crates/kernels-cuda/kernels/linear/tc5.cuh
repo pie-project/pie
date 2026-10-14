@@ -118,6 +118,7 @@ __device__ __forceinline__ int ue8m0_exponent(float amax) {
 
 // A W4A16 weight's transform warps.
 constexpr unsigned kXWarps = 8;
+constexpr unsigned kXGroups = 2;
 
 // Eight e2m1 codes (element i in bits 4i..4i+3) as bf16 times a block
 // scale: the magnitudes 0, .5, 1, 1.5, 2, 3, 4, 6 by byte permutes of their
@@ -234,6 +235,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     static_assert(kGlu == 0 || kSwap || kBN == 256, "an unswapped GLU tile is gate 128 | up 128");
     static_assert(kGlu == 0 || !kSwap || kBN <= 128, "a swapped GLU tile holds two accumulators");
     static_assert(kMix == 0 || (kKind == 0 && kPair == 1), "W4A16 runs kind::f16 on lone CTAs");
+    static_assert(kMix == 0 || kStages % 2 == 0, "W4A16's transform groups own alternate slots");
     static_assert(kOut == 0 || kGlu != 0, "a quantized store follows a GLU");
 
     // A GLU tile reads the weight's gate rows and the matching up rows `inter`
@@ -344,7 +346,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
         for (u32 s = 0; s < kStages; ++s) {
             bar_init(&full[s], 1);
             bar_init(&empty[s], 1);
-            bar_init(&xfull[s], tc5k::kXWarps);
+            bar_init(&xfull[s], tc5k::kXWarps / tc5k::kXGroups);
         }
         for (u32 a = 0; a < 2; ++a) {
             bar_init(&tfull[a], 1);
@@ -779,10 +781,18 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     } else if (kMixed && warp >= 7) {
         // The transform warps: each stage's raw weight codes as bf16 in the
         // 128-byte-swizzled K-major tile TMA would have landed. A thread
-        // keeps one 16-byte chunk (8 codes) of every 32nd row; its scales
+        // keeps one 16-byte chunk (8 codes) of every 16th row; its scales
         // come row-major from global memory.
-        const u32 t = threadIdx.x - 224;
+        // Two groups of warps take turns a stage: a stage's few rows leave
+        // each group's round mostly latency. The ring is even, so each slot
+        // is one group's and every barrier a group waits on, it waits on in
+        // order (a parity wait a round ahead would pass on the round
+        // before).
+        constexpr u32 kGroupWarps = tc5k::kXWarps / tc5k::kXGroups;
+        const u32 xgroup = (warp - 7) / kGroupWarps;
+        const u32 t = (threadIdx.x - 224) % (32 * kGroupWarps);
         const u32 c = t % 8;
+        u32 step = 0;
         constexpr int kWGran = kMix == 1 ? 32 : 16;
         // The weight's rows: a dense GLU's extent is its output columns,
         // its up rows past them; a bank's extent is all of its rows.
@@ -805,9 +815,9 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                     return x.q_row + ri;
                 }
             };
-            constexpr u32 kRowStep = 4 * tc5k::kXWarps;
+            constexpr u32 kRowStep = 4 * kGroupWarps;
             constexpr u32 kIters = kRawRows / kRowStep > 0 ? kRawRows / kRowStep : 1;
-            // A stage's scales load a stage ahead, by volatile loads the
+            // A stage's scales load before its wait, by volatile loads the
             // compiler keeps where they stand (a plain load would sink
             // past the barrier wait to its use, an L2 trip a row).
             auto load_sb = [&](int kb, unsigned (&sb)[kIters]) {
@@ -820,12 +830,16 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                                 : 0u;
                 }
             };
-            unsigned sb[kIters], next[kIters];
-            load_sb(x.kb0, sb);
-            for (int kb = x.kb0; kb < x.kb1; ++kb) {
-                if (kb + 1 < x.kb1) {
-                    load_sb(kb + 1, next);
+            for (int kb = x.kb0; kb < x.kb1; ++kb, ++step) {
+                if (step % tc5k::kXGroups != xgroup) {
+                    if (++s == kStages) {
+                        s = 0;
+                        phase ^= 1;
+                    }
+                    continue;
                 }
+                unsigned sb[kIters];
+                load_sb(kb, sb);
                 bar_wait(&full[s], phase);
                 const unsigned char* raw_s = smem + kOffRaw + s * kRawBytes;
                 unsigned char* tile = kMixP ? smem + s * kTileP * kPT : smem + kOffQ + s * kTileQ;
@@ -841,10 +855,6 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                     const u32 r = t / 8 + kRowStep * i;
                     *reinterpret_cast<uint4*>(tile + r * 128 + ((c ^ (r % 8)) * 16)) =
                         tc5k::dequant8<kMix>(code[i], static_cast<unsigned char>(sb[i]));
-                }
-#pragma unroll
-                for (u32 i = 0; i < kIters; ++i) {
-                    sb[i] = next[i];
                 }
                 fence_async_shared();
                 __syncwarp();

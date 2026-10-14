@@ -363,6 +363,11 @@ impl Plan {
         {
             stages -= 1;
         }
+        // A W4A16 weight's two transform groups take turns a stage: an even
+        // ring gives each its own slots, so each waits on them in order.
+        if matches!(kind, Kind::Mixed(_)) && stages % 2 == 1 {
+            stages -= 1;
+        }
         self.stages = stages;
         self
     }
@@ -435,8 +440,11 @@ pub enum Out {
 pub struct Epilogue {
     pub glu: Option<Glu>,
     pub out: Out,
-    /// A device `f32` a output row multiplying it last (the routed weight
-    /// in a down projection's epilogue), or 0.
+    /// A device `f32` a output row multiplying it last before the store:
+    /// after the GLU and before a quantized store takes its amax and
+    /// scales (DeepSeek's route weight on the w2 input), or 0. Indexed by
+    /// the GEMM's output row: a grouped launch's layout row (`e * m_max +
+    /// i` masked, the activation's row contiguous), not the route's.
     pub row_scale: u64,
     /// A device bf16 bias a weight row (`[n]`, a bank's `[experts][n]`, a
     /// GLU's gate rows then its up rows), added to the product before the
