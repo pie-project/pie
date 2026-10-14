@@ -32,7 +32,7 @@ use super::{Golden, Graphs, Prepared, Readback, Shell};
 #[derive(Debug)]
 pub(super) struct GuestBatch {
     launched: Vec<(usize, u64)>,
-    seq: u64,
+    pub(super) seq: u64,
 }
 
 fn seating(lanes: &[super::Seated<'_>]) -> String {

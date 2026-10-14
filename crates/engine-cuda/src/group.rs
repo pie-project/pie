@@ -499,6 +499,11 @@ impl Engine for Group {
         Ok(())
     }
 
+    fn publish_landed(&mut self) -> EngineResult<()> {
+        self.each(|rank| rank.publish_landed())?;
+        Ok(())
+    }
+
     fn expect_fire(&mut self, submission: &Step) {
         for rank in &self.ranks {
             if let Ok(mut rank) = rank.try_lock() {

@@ -712,6 +712,13 @@ impl Engine for Cuda {
         Ok(())
     }
 
+    fn publish_landed(&mut self) -> EngineResult<()> {
+        match self.shell.as_mut() {
+            Some(shell) => shell.reap_landed_guests().map_err(fault),
+            None => Ok(()),
+        }
+    }
+
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
         self.loaded_mut()?
             .register_program(registration)

@@ -352,6 +352,21 @@ impl Shell {
         self.reap_guests_at("shell.reap_guests")
     }
 
+    /// Settles the guest batch a step left owed once that step has landed:
+    /// its channels' cells reach their readers then, and not at the next
+    /// fire's enqueue, which a reader waiting on them may be what holds back.
+    pub fn reap_landed_guests(&mut self) -> Result<()> {
+        let Some(batch) = self.owed.as_ref() else {
+            return Ok(());
+        };
+        // The batch's own event is recorded behind its programs, so it says
+        // the batch has landed even before the step's settle is counted.
+        if self.airborne.settled_past(batch.seq) || self.guest_landed.done()? {
+            self.reap_guests_at("shell.reap_landed_guests")?;
+        }
+        Ok(())
+    }
+
     pub fn reap_guests_at(&mut self, site: &'static str) -> Result<()> {
         reap_guest_fires(
             &mut self.programs,
