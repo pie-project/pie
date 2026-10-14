@@ -23,7 +23,15 @@
 // than 2^8, so most tiles never touch O.
 //
 // KV tiles are kBKV tokens. The pool is NHD, `page` tokens a page; a tile
-// is whole pages, and a page past the request's lands as zeros.
+// is whole pages, landed as a box a 16-token page slice and 64-wide atom of
+// the head. TMA spends far longer on many small boxes than on the same
+// bytes in a few large ones, so a tile every row reads whole (no mask, no
+// key past the request's) whose pages lie in a run, rising or falling (the
+// pool hands pages out from a stack), lands as one box an atom instead
+// (`map_k_run`, `map_v_run`, kBKV rows a box): a falling run's slices land
+// in reverse, which no unmasked product can tell. A slice past the
+// request's pages lands as whatever the pool holds there (zeros past its
+// end): the softmax masks its scores and zeroes its V rows.
 
 namespace pie::attn::fmha {
 
@@ -136,6 +144,7 @@ __device__ __forceinline__ bool work_of(const Params& p, int bound, int block, W
 template <int D, int BKV, int ST>
 __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill(
     const __grid_constant__ tc5::TmaMap map_k, const __grid_constant__ tc5::TmaMap map_v,
+    const __grid_constant__ tc5::TmaMap map_k_run, const __grid_constant__ tc5::TmaMap map_v_run,
     const Params p, const int bound) {
     using namespace tc5;
     static_assert(D == 64 || D == 128 || D == 256, "a head of 64, 128 or 256");
@@ -230,44 +239,68 @@ __global__ __launch_bounds__(192, 1) void tc5_fmha_prefill(
             if (lane == 0) {
                 tma_prefetch(&map_k);
                 tma_prefetch(&map_v);
+                tma_prefetch(&map_k_run);
+                tma_prefetch(&map_v_run);
             }
             const int pages = (w.kv_len + p.page - 1) / p.page;
             // A tile is 16-token boxes, one 64-wide atom each, spread over the
-            // warp's lanes so their loads issue side by side. A box past the
-            // request's pages reads a row no tensor holds, which TMA lands as
-            // zeros.
+            // warp's lanes so their loads issue side by side; or, its pages
+            // in a run, one box an atom.
             constexpr int kBoxes = (kBKV / 16) * kNA;
             static_assert(kBoxes <= 32, "a box a lane");
             // This lane's box: its 16 tokens and its atom of the head. Its pool
             // row for the next tile is read while this one's loads go out, so
-            // the page table's latency stays off the loads' path.
+            // the page table's latency stays off the loads' path. A slice
+            // past the request's pages is -1: any row will do.
             const int b = static_cast<int>(lane);
             const int t16 = b / static_cast<int>(kNA);
             const u32 a = static_cast<u32>(b) % kNA;
             auto row_of = [&](int j) {
                 const int tok = (jb + j) * kBKV + t16 * 16;
                 const int at = tok / p.page;
-                return at < pages ? p.kv_indices[w.kv_page0 + at] * p.page + tok % p.page : 0x7fffff00;
+                return at < pages ? p.kv_indices[w.kv_page0 + at] * p.page + tok % p.page : -1;
             };
-            auto load = [&](const TmaMap* map, unsigned char* dst, u64* bar, int row) {
-                if (b < kBoxes) {
+            auto load = [&](const TmaMap* map, const TmaMap* run, unsigned char* dst, u64* bar,
+                            int row, int row0, bool whole) {
+                if (whole) {
+                    if (b < static_cast<int>(kNA)) {
+                        tma_load_3d(dst + a * kAtomKV, bar, run, static_cast<int>(a * 64), h, row0);
+                    }
+                } else if (b < kBoxes) {
                     tma_load_3d(dst + a * kAtomKV + t16 * 16 * 128, bar, map,
-                                static_cast<int>(a * 64), h, row);
+                                static_cast<int>(a * 64), h, row < 0 ? 0x7fffff00 : row);
                 }
             };
-            int row = b < kBoxes ? row_of(0) : 0;
+            // Tiles every live row of the block reads whole: from the last
+            // row's oldest key to the first row's newest.
+            const int live_rows = min(128, w.qo_len * p.group - w.row0);
+            const int tok_first = w.row0 / p.group;
+            const int tok_last = (w.row0 + live_rows - 1) / p.group;
+            const int whole_lo = p.window_left < 0
+                ? 0
+                : max(0, w.kv_len - w.qo_len + tok_last - p.window_left);
+            const int whole_hi = p.causal ? min(w.kv_len, w.kv_len - w.qo_len + tok_first + 1)
+                                          : w.kv_len;
+            int row = b < kBoxes ? row_of(0) : -1;
             for (int j = 0; j < nt; ++j) {
                 const u32 st = j % ST;
                 const u32 ph = (j / ST) & 1;
-                const int next = b < kBoxes && j + 1 < nt ? row_of(j + 1) : 0;
+                const int next = b < kBoxes && j + 1 < nt ? row_of(j + 1) : -1;
+                const int k0 = (jb + j) * kBKV;
+                int row0 = __shfl_sync(0xffffffffu, row, 0);
+                const bool inside = k0 >= whole_lo && k0 + kBKV <= whole_hi;
+                const bool up = __all_sync(0xffffffffu, b >= kBoxes || row == row0 + t16 * 16);
+                const bool down = __all_sync(0xffffffffu, b >= kBoxes || row == row0 - t16 * 16);
+                const bool whole = inside && (up || down);
+                if (!up) row0 -= (kBKV / 16 - 1) * 16;
                 bar_wait(&k_empty[st], ph ^ 1);
                 if (lane == 0) bar_arrive_expect_tx(&k_full[st], kTileKV);
                 __syncwarp();
-                load(&map_k, smem + kOffK + st * kTileKV, &k_full[st], row);
+                load(&map_k, &map_k_run, smem + kOffK + st * kTileKV, &k_full[st], row, row0, whole);
                 bar_wait(&v_empty[st], ph ^ 1);
                 if (lane == 0) bar_arrive_expect_tx(&v_full[st], kTileKV);
                 __syncwarp();
-                load(&map_v, smem + kOffV + st * kTileKV, &v_full[st], row);
+                load(&map_v, &map_v_run, smem + kOffV + st * kTileKV, &v_full[st], row, row0, whole);
                 row = next;
             }
         }

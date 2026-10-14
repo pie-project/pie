@@ -91,7 +91,9 @@ pub(crate) fn try_prefill(
     }
     let kv_heads = shape.num_kv_heads;
     let cells = pool.keys.rows;
-    let map = |ptr: u64| {
+    // A box a 16-token page slice, and one a whole tile for a tile whose
+    // pages lie in a run.
+    let map = |ptr: u64, rows: u32| {
         encode(Map {
             ptr,
             ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
@@ -100,12 +102,14 @@ pub(crate) fn try_prefill(
                 u64::from(head_dim) * 2,
                 u64::try_from(pool.seq_stride).unwrap_or(0) * 2,
             ],
-            boxes: [64, 1, 16],
+            boxes: [64, 1, rows],
             swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
         })
     };
-    let map_k = map(pool.keys.ptr)?;
-    let map_v = map(pool.values.ptr)?;
+    let map_k = map(pool.keys.ptr, 16)?;
+    let map_v = map(pool.values.ptr, 16)?;
+    let map_k_run = map(pool.keys.ptr, bkv)?;
+    let map_v_run = map(pool.values.ptr, bkv)?;
     let int = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
     let params = Params {
         q: q.data.ptr,
@@ -146,6 +150,8 @@ pub(crate) fn try_prefill(
         &[
             bytes(&map_k),
             bytes(&map_v),
+            bytes(&map_k_run),
+            bytes(&map_v_run),
             ArgValue::Bytes {
                 ptr: (&raw const params).cast(),
                 len: core::mem::size_of::<Params>(),

@@ -3,8 +3,9 @@
 //! A paged prefill answers what the host's attention says and what FA2
 //! lands: on a tcgen05 device `attention.prefill` runs the tcgen05 kernel,
 //! while the log-sum-exp form stays on FA2, so the two read the same pool
-//! side by side. Requests carry cached prefixes, page tables out of order,
-//! partial last pages, grouped query heads and a sliding window.
+//! side by side. Requests carry cached prefixes, page tables in falling
+//! runs (as the pool's stack hands them out), partial last pages, grouped
+//! query heads and a sliding window.
 
 use crate::common::{Gpu, Lcg, from_bf16};
 use dtype::Dtype;
@@ -43,8 +44,12 @@ fn check(case: &Case) {
         kv_len.push(len as i32);
     }
     let pages = *kv_indptr.last().unwrap() as usize;
-    // Pages in reverse, past a spare one: no request's are adjacent in order.
-    let indices: Vec<i32> = (0..pages).map(|p| (pages - p) as i32).collect();
+    // Pages in reverse, past a spare one, as the pool's stack hands them out:
+    // falling runs, broken every ten pages by a swapped pair.
+    let mut indices: Vec<i32> = (0..pages).map(|p| (pages - p) as i32).collect();
+    for p in (3..pages.saturating_sub(1)).step_by(10) {
+        indices.swap(p, p + 1);
+    }
     let cells = (pages + 1) * PAGE;
     let rows = *qo_indptr.last().unwrap() as usize;
 
@@ -238,6 +243,22 @@ fn the_tcgen05_prefill_answers_fa2_and_the_reference() {
         requests: &[(300, 0), (90, 120)],
         window: Some(100),
     });
+    // Long enough that most key tiles are whole to every row of a block,
+    // their pages one falling run: one box an atom of the head.
+    check(&Case {
+        head_dim: 128,
+        kv_heads: 1,
+        group: 4,
+        requests: &[(600, 0), (200, 300)],
+        window: None,
+    });
+    check(&Case {
+        head_dim: 256,
+        kv_heads: 1,
+        group: 6,
+        requests: &[(500, 0)],
+        window: None,
+    });
     check(&Case {
         head_dim: 64,
         kv_heads: 3,
@@ -279,6 +300,7 @@ fn the_tcgen05_prefill_reports_its_rate_beside_fa2() {
     for (d, g, kvh, n) in [
         (256usize, 6usize, 4usize, 1usize),
         (256, 6, 4, 8),
+        (256, 6, 4, 32),
         (128, 8, 8, 1),
         (128, 8, 8, 8),
     ] {
