@@ -35,10 +35,13 @@ ssm.conv_vec4 = true
 # at 64 requests fold in about 4 us where the staged merge took 17.
 sdpa.merge_warp = true
 
-# gpt-oss's mxfp4 selects from 64 routes to 1024 dequantize in registers on
+# gpt-oss's mxfp4 selects from 28 routes to 1024 dequantize in registers on
 # mma.sync: at decode widths that reads the bank about twice as fast as the
-# tcgen05 GEMM; past 1024 routes the GEMM's reuse wins.
-moe.mxfp4_mma_from  = 64
+# tcgen05 GEMM; past 1024 routes the GEMM's reuse wins. Below 28 routes the
+# per-route GEMV is faster (gpt-oss-120b, a layer's gate-up + down at 4
+# tokens: 91 us GEMV, 107 us register-dequant; at 7: 152 / 136; at 8: 171 /
+# 145).
+moe.mxfp4_mma_from  = 28
 moe.mxfp4_mma_until = 1024
 # The tcgen05 prefill FMHA (sm_100a): a causal 4096-token prefill at
 # Qwen3.8-27B's 256-wide, six-way-grouped head runs at about 900 TFLOPS

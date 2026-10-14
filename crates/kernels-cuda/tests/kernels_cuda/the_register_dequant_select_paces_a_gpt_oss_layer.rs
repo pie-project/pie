@@ -9,7 +9,7 @@
 //!     cargo test -p kernels-cuda --features cuda --release --test kernels_cuda \
 //!         the_register_dequant_select_paces -- --ignored --nocapture
 //!
-//! `PIE_W4_TOKENS` keeps one token count.
+//! `PIE_W4_TOKENS` (a comma list) keeps those token counts.
 
 use crate::common::Gpu;
 use dtype::Dtype;
@@ -77,13 +77,11 @@ fn the_register_dequant_select_paces_a_gpt_oss_layer() {
         "| tokens | leg | registry default us | tcgen05 us | register-dequant us | GB/s (default / tcgen05 / register) |"
     );
     println!("|---|---|---|---|---|---|");
-    let only: Option<usize> = std::env::var("PIE_W4_TOKENS")
+    let counts: Vec<usize> = std::env::var("PIE_W4_TOKENS")
         .ok()
-        .and_then(|v| v.parse().ok());
-    for tokens in [1usize, 8, 16, 32, 64, 128, 256, 512, 1024] {
-        if only.is_some_and(|t| t != tokens) {
-            continue;
-        }
+        .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![1, 8, 16, 32, 64, 128, 256, 512, 1024]);
+    for tokens in counts {
         let routings: Vec<Vec<i32>> = (0..ROUTINGS)
             .map(|r| routing(tokens, 0x9e37 + 7919 * r as u64 + tokens as u64))
             .collect();
