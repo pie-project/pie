@@ -356,6 +356,17 @@ impl Tuning {
             .any(|q| *q == Qmm::Mpp)
     }
 
+    /// Whether any dense matmul may take the register tile, whose input
+    /// table shares the precast room with no split partials: its partials
+    /// are reserved past that room at load.
+    #[must_use]
+    pub fn qmm_register(&self) -> bool {
+        self.profile
+            .ladder::<Qmm>()
+            .values()
+            .any(|q| *q == Qmm::Register)
+    }
+
     #[must_use]
     pub fn fp16_gemm_format(&self, bits: u32, group: u32) -> bool {
         !self.wide_range

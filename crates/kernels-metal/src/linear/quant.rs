@@ -761,7 +761,18 @@ fn act_x_wt_over(
                 }
             }
             Qmm::Register => {
-                if cols % REGISTER_COLUMNS == 0 {
+                // The rows' inputs as the lanes take them, and their sums: 8 x k bf16, then k / 4 f32.
+                let table = if cols % REGISTER_COLUMNS == 0 && m <= 8 {
+                    (scratch.precast)(9, contraction)
+                } else {
+                    None
+                };
+                if let Some(table) = table {
+                    ctx.fire(
+                        Fire::at(REGISTER_FILE, "qmm_sg_table")
+                            .apply(Grid::of([(k / 64).unsigned_abs(), 32, 1], [2, 32, 1])),
+                        &[act.arg(), table.arg_mut(), k.arg(), m.arg()],
+                    )?;
                     // Without room for the partials it runs whole.
                     let split = register_split(cols, k, tuning.cores());
                     let partial = (split > 1)
@@ -788,7 +799,7 @@ fn act_x_wt_over(
                             w.codes.arg(),
                             w.scales.arg(),
                             biases.arg(),
-                            act.arg(),
+                            table.arg(),
                             y.arg_mut(),
                             k.arg(),
                             n.arg(),

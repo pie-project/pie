@@ -96,15 +96,17 @@ pub struct Scratch {
 
 /// The partials of a split matmul: up to `slices` split-K slices of
 /// [`SPLITK_ROWS`] rows, or for MPP four partitions of up to `mpp_rows`
-/// padded rows.
+/// padded rows. Past the precast room where MPP or the register tile
+/// stages its input there while the partials are written.
 fn split_partial_room(
     precast: Option<Room>,
     width: u64,
     mpp: bool,
+    register: bool,
     slices: u64,
     mpp_rows: u64,
 ) -> Room {
-    let mut at = if mpp {
+    let mut at = if mpp || register {
         precast.map_or(0, |room| room.at + room.bytes())
     } else {
         0
@@ -209,7 +211,14 @@ impl Scratch {
                 let kernels_metal::tuning::QmmMpp { split_rows, .. } = tuning.qmm_mpp_tiles();
                 let mpp_rows = u64::from(2 * split_rows).div_ceil(32) * 32;
                 let slices = u64::from(tuning.qmm_splitk_max());
-                split_partial_room(precast, n, tuning.qmm_mpp(), slices, mpp_rows)
+                split_partial_room(
+                    precast,
+                    n,
+                    tuning.qmm_mpp(),
+                    tuning.qmm_register(),
+                    slices,
+                    mpp_rows,
+                )
             });
 
         let routed = (sorted > 0).then(|| {
@@ -543,7 +552,7 @@ mod tests {
         for rows in [8, 32, 64, 2048] {
             for width in [512, 5120, 17408] {
                 let precast = Room::lay(&mut 0, rows, width, Dtype::F16);
-                let partial = split_partial_room(Some(precast), 34816, true, 8, 64);
+                let partial = split_partial_room(Some(precast), 34816, true, false, 8, 64);
                 assert!(partial.at >= precast.at + precast.bytes());
                 assert_eq!(partial.at % ALIGN, 0);
                 assert!(partial.rows >= 64 * 4);
