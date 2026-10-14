@@ -448,9 +448,12 @@ pub fn select(
             tc5::masked_atom_bytes(e, m_max as usize, k as usize, gran),
         )
     } else {
-        // Each expert's rows start a whole block apart.
-        let rows = (count + (tc5::GROUP_ALIGN - 1) * experts.min(count))
-            .next_multiple_of(tc5::GROUP_ALIGN);
+        // Each expert's rows start a whole 128-row scale block apart (a
+        // multiple of the GEMM's group alignment), as `route_offsets` lays
+        // them.
+        const BLOCK_ROWS: u32 = 128;
+        const _: () = assert!(BLOCK_ROWS.is_multiple_of(tc5::GROUP_ALIGN));
+        let rows = (count + (BLOCK_ROWS - 1) * experts.min(count)).next_multiple_of(BLOCK_ROWS);
         let groups = tc5::Groups::Contiguous { offsets, rows };
         (
             rows,
