@@ -142,6 +142,10 @@ fn sample(
     (token, next)
 }
 
+/// The decode page list's floor, in tokens: every request shorter than this
+/// shares one decode program.
+const DECODE_PAGE_FLOOR_TOKENS: u32 = 2048;
+
 /// Generate up to `max_tokens` after `prompt`; each picture's span is
 /// prefilled whole in a fire of its own. Every sampled token — the
 /// stop token included, if one comes — goes to `on_token`, which ends
@@ -196,6 +200,15 @@ pub async fn generate(
     let ws = WorkingSet::new();
     let slots = ws.reserve(pool_pages).context("reserve KV pages")?;
     let pool_ids = slots.ids().to_vec();
+    // The decode program's page list is cut to a bucket of the pool, padded
+    // with its last page past the reservation (page_indptr never reaches the
+    // padding): requests of different lengths then compile to one program,
+    // and the engine flies their epilogues as one batch instead of one apiece.
+    let page_cap = pool_pages
+        .max(DECODE_PAGE_FLOOR_TOKENS.div_ceil(page_t))
+        .next_power_of_two();
+    let mut page_list = pool_ids.clone();
+    page_list.resize(page_cap as usize, *pool_ids.last().unwrap_or(&0));
     let pipe = Pipeline::new();
 
     let penalized = sampling.penalized();
@@ -330,9 +343,9 @@ pub async fn generate(
     let klen = Channel::from([n + 1]).named("klen");
     let w_slot = Channel::from([slot_n]).named("w_slot");
     let w_off = Channel::from([n % page_t]).named("w_off");
-    let pages = Channel::from(pool_ids.clone()).named("pages");
+    let pages = Channel::from(page_list.clone()).named("pages");
     let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_t)]).named("page_indptr");
-    let pool_ids_ch = Channel::from(pool_ids.clone()).named("pool_ids");
+    let pool_ids_ch = Channel::from(page_list).named("pool_ids");
     let out = Channel::new([1], dtype::i32)
         .capacity(channel_capacity() as u32)
         .named("out");
@@ -397,7 +410,7 @@ pub async fn generate(
         let w_off_v = &base % page_t;
         let klen_v = &base + 1u32;
         let next_free = &base + 1u32;
-        let pages_v = reshape(&pids, [pool_pages]);
+        let pages_v = reshape(&pids, [page_cap]);
         let page_count = klen_v.div_ceil(page_t);
         let pidx_v = indptr(1, &page_count);
 
