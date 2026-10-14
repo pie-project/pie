@@ -103,6 +103,36 @@ pub fn matmul_select(
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let fan = selected(OP, x, routes, y)?;
     let Planes { n, k } = planes(OP, codes, scales, tensor_scales, y.width, x.width)?;
+    // On the grouped tcgen05 GEMM (W4A16), the tensor scale a row in its
+    // epilogue.
+    #[cfg(feature = "cuda")]
+    if !seat.streams()
+        && k.is_multiple_of(64)
+        && crate::linear::moe::tc5_worth(
+            ctx,
+            x,
+            Dtype::Bf16,
+            y,
+            crate::linear::moe::ExpertTable::RESIDENT,
+            routes.rows,
+            fan.route_count,
+        )
+    {
+        use crate::linear::tc5;
+        return crate::linear::moe::select_tc5(
+            ctx,
+            OP,
+            x,
+            tc5::Operand::scaled(codes.ptr, tc5::Elem::E2m1, scales.ptr, 16),
+            codes.rows,
+            routes,
+            y,
+            tc5::Epilogue {
+                weight_scale: tensor_scales.ptr,
+                ..tc5::Epilogue::STORE
+            },
+        );
+    }
     nonzero(OP, "N, the bank's output width", n)?;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
     let experts = codes.rows.clamp(1, EXPERT_CAP);

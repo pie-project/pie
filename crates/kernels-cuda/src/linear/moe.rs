@@ -438,7 +438,7 @@ pub fn matmul_select(
 /// the layout's four (Qwen3.6-35B-A3B decode: 3.9 ms a token on the GEMV,
 /// 5.3 ms on the grouped GEMM, at one token, and even at eight).
 #[cfg(feature = "cuda")]
-fn tc5_worth(
+pub(crate) fn tc5_worth(
     ctx: &Ctx,
     x: Tensor,
     bank: Dtype,
@@ -507,9 +507,11 @@ pub(crate) fn select_tc5(
     act_quant::gather_back(ctx, op, ys, layout.pos, routes.width, y)
 }
 
-/// A gate-up bank a fused select reads: bf16 `[experts][2 * inter * k]`, or
-/// mxfp4 codes and row-major ue8m0 scales, with an optional bf16 bias a
-/// row; each expert's gate rows, then its up rows.
+/// A gate-up bank a fused select reads: bf16 `[experts][2 * inter * k]`,
+/// mxfp4 codes and row-major ue8m0 scales (with an optional bf16 bias a
+/// row), nvfp4 codes, e4m3 scales and an f32 tensor scale a row, or affine
+/// u4 codes and bf16 scales and zeros a group; each expert's gate rows,
+/// then its up rows.
 #[derive(Clone, Copy, Debug)]
 pub enum GluBank {
     Bf16(Tensor),
@@ -518,6 +520,29 @@ pub enum GluBank {
         scales: Tensor,
         bias: Option<Tensor>,
     },
+    Nvfp4 {
+        codes: Tensor,
+        scales: Tensor,
+        tensor_scales: Tensor,
+    },
+    Affine {
+        codes: Tensor,
+        scales: Tensor,
+        zeros: Tensor,
+    },
+}
+
+/// The group of an affine 4-bit bank of bf16 factors that the tcgen05
+/// GEMM takes (32, 64 or 128 codes), from its planes' widths.
+#[cfg(feature = "cuda")]
+pub(crate) fn affine_u4_group(x: Tensor, codes: Tensor, scales: Tensor, n: u32) -> Option<u32> {
+    let (k, n) = (u64::from(x.width), u64::from(n));
+    if x.dtype != Dtype::Bf16 || u64::from(codes.width) * 2 != k * n || k % 64 != 0 {
+        return None;
+    }
+    let groups = u64::from(scales.width).checked_div(2 * n)?;
+    let group = k.checked_div(groups)?;
+    (groups * group == k && matches!(group, 32 | 64 | 128)).then_some(group as u32)
 }
 
 /// `y[route] = glu(x[route or its token] . W[routes[route]]^T)`, the GLU
@@ -538,10 +563,11 @@ pub fn select_glu(
     use crate::linear::tc5;
     const OP: &str = "linear.moe_select_glu";
     let fan = selected(OP, x, routes, y)?;
-    let (w, rows, bias, dtype) = match bank {
+    let (w, rows, bias, weight_scale, dtype) = match bank {
         GluBank::Bf16(b) => (
             tc5::Operand::plain(b.ptr, tc5::Elem::Bf16),
             b.rows,
+            0,
             0,
             b.dtype,
         ),
@@ -553,8 +579,36 @@ pub fn select_glu(
             tc5::Operand::scaled(codes.ptr, tc5::Elem::E2m1, scales.ptr, 32),
             codes.rows,
             bias.map_or(0, |b| b.ptr),
+            0,
             Dtype::Bf16,
         ),
+        GluBank::Nvfp4 {
+            codes,
+            scales,
+            tensor_scales,
+        } => (
+            tc5::Operand::scaled(codes.ptr, tc5::Elem::E2m1, scales.ptr, 16),
+            codes.rows,
+            0,
+            tensor_scales.ptr,
+            Dtype::Bf16,
+        ),
+        GluBank::Affine {
+            codes,
+            scales,
+            zeros,
+        } => {
+            let Some(group) = affine_u4_group(x, codes, scales, 2 * y.width) else {
+                return Ok(false);
+            };
+            (
+                tc5::Operand::affine(codes.ptr, scales.ptr, zeros.ptr, group),
+                codes.rows,
+                0,
+                0,
+                Dtype::Bf16,
+            )
+        }
     };
     if !tc5_worth(ctx, x, dtype, y, experts, routes.rows, fan.route_count) {
         return Ok(false);
@@ -570,6 +624,7 @@ pub fn select_glu(
         tc5::Epilogue {
             glu: Some(glu),
             bias,
+            weight_scale,
             ..tc5::Epilogue::STORE
         },
     )?;
@@ -1158,6 +1213,32 @@ fn matmul_select_mlxu4(
         "a packed bank's planes bind as bytes"
     );
     let fan = selected(op, x, routes, y)?;
+    // A 4-bit bank of bf16 factors on the grouped tcgen05 GEMM.
+    #[cfg(feature = "cuda")]
+    if let Some(group) = affine_u4_group(x, codes, scales, y.width)
+        && !seat.streams()
+        && tc5_worth(
+            ctx,
+            x,
+            Dtype::Bf16,
+            y,
+            ExpertTable::RESIDENT,
+            routes.rows,
+            fan.route_count,
+        )
+    {
+        use crate::linear::tc5;
+        return select_tc5(
+            ctx,
+            op,
+            x,
+            tc5::Operand::affine(codes.ptr, scales.ptr, biases.ptr, group),
+            codes.rows,
+            routes,
+            y,
+            tc5::Epilogue::STORE,
+        );
+    }
     let k = stated(op, nonzero(op, "K, the bank's contracted width", x.width)?)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
     let elems = u64::from(x.width) * u64::from(y.width);

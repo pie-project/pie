@@ -814,24 +814,33 @@ impl Run<'_> {
                 y: sy,
             } if sy == packed => {
                 let (codes, scales, biases, seat) = self.planes(bank);
-                if codes.dtype == Dtype::Nvfp4
-                    || biases.is_some()
-                    || seat.streams()
+                if seat.streams()
                     || self.scales_in_atoms(bank)
                     || crate::device::alloc::is_host_pointer(codes.ptr)
                 {
                     return Ok(false);
                 }
-                (
-                    x,
-                    routes,
-                    GluBank::Mxfp4 {
+                // NVFP4 carries its tensor scales as `biases`, an affine
+                // bank its zeros, mxfp4 none.
+                let bank = match (codes.dtype == Dtype::Nvfp4, biases) {
+                    (true, Some(tensor_scales)) => GluBank::Nvfp4 {
+                        codes,
+                        scales,
+                        tensor_scales,
+                    },
+                    (true, None) => return Ok(false),
+                    (false, Some(zeros)) => GluBank::Affine {
+                        codes,
+                        scales,
+                        zeros,
+                    },
+                    (false, None) => GluBank::Mxfp4 {
                         codes,
                         scales,
                         bias: None,
                     },
-                    ExpertTable::RESIDENT,
-                )
+                };
+                (x, routes, bank, ExpertTable::RESIDENT)
             }
             _ => return Ok(false),
         };
@@ -1154,6 +1163,24 @@ impl Run<'_> {
             }
             Some((codes, scales, biases, seat)) => {
                 let act = self.tensor(*act);
+                // A 4-bit affine projection on the tcgen05 GEMM, from the
+                // rows the dense arm takes on.
+                #[cfg(feature = "cuda")]
+                if act.rows >= self.ctx().tuning().qmm_gemm_from
+                    && linear::quant::matmul_tc5(
+                        self.ctx(),
+                        act,
+                        codes,
+                        scales,
+                        OffsetKind::Post,
+                        biases,
+                        Dtype::Bf16,
+                        &mut self.tensor(*y),
+                        seat,
+                    )?
+                {
+                    return Ok(());
+                }
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
                 let entry =
                     if act.rows >= self.ctx().tuning().qmm_gemm_from && !seat.streams() && held {
@@ -1214,6 +1241,24 @@ impl Run<'_> {
             }
             Some((codes, scales, biases, seat)) => {
                 let act = self.tensor(*act);
+                // A 4-bit affine projection on the tcgen05 GEMM, from the
+                // rows the dense arm takes on.
+                #[cfg(feature = "cuda")]
+                if act.rows >= self.ctx().tuning().qmm_gemm_from
+                    && linear::quant::matmul_tc5(
+                        self.ctx(),
+                        act,
+                        codes,
+                        scales,
+                        OffsetKind::Post,
+                        biases,
+                        Dtype::Bf16,
+                        &mut self.tensor(*y),
+                        seat,
+                    )?
+                {
+                    return Ok(());
+                }
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
                 let entry =
                     if act.rows >= self.ctx().tuning().qmm_gemm_from && !seat.streams() && held {
