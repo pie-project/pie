@@ -237,6 +237,10 @@ fn check(case: &Case) {
     eprintln!("chunked vs serial: worst output error {worst}, worst state error {worst_state}");
 }
 
+/// vLLM 0.31 prefills 32 x 4096 tokens of Qwen3.8-27B through FlashInfer's
+/// CUTLASS chunked kernel in 150.6 ms over 48 layers (nsys), about 3.1 ms a
+/// layer against this table's last row.
+///
 /// The chunked scan's time per layer at Qwen3.8-27B's linear-attention head
 /// (sixteen key heads fanned to 48 value heads, 128 wide) over prefills of
 /// 4096-token requests. Run it alone on an idle GPU:

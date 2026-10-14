@@ -293,6 +293,11 @@ const QWEN38_27B: Geometry = Geometry {
     v_dim: 128,
 };
 
+/// vLLM 0.31's packed decode kernel (FLA's Triton `fused_recurrent`, on the
+/// f32 state Qwen3.8-27B's config asks for) at the same head, rows and
+/// timing, in microseconds: what the table's last column reads.
+const VLLM_US: [(usize, f64); 4] = [(1, 11.9), (8, 15.5), (64, 70.7), (256, 253.2)];
+
 /// The fused step's time per layer at Qwen3.8-27B's head, beside the state
 /// bytes it moves. Each launch of a timed batch walks its own slots, so a
 /// batch's state is not in L2 when a launch reads it, as a decode step's
@@ -327,8 +332,8 @@ fn the_fused_gdn_step_reports_its_rate_at_a_qwen38_27b_head() {
         flush: gpu.zeros(FLUSH),
         stream,
     };
-    println!("| rows | us / layer | state GB/s |");
-    println!("|---:|---:|---:|");
+    println!("| rows | us / layer | state GB/s | vLLM us |");
+    println!("|---:|---:|---:|---:|");
     for rows in [1usize, 8, 64, 256] {
         let sets = (COLD / (rows * bank * 2)).clamp(1, 16);
         let slots = rows * sets;
@@ -385,6 +390,13 @@ fn the_fused_gdn_step_reports_its_rate_at_a_qwen38_27b_head() {
         };
         let us = timer.median(fire);
         let bytes = (2 * rows * bank * 2) as f64;
-        println!("| {rows} | {us:.1} | {:.0} |", bytes / us * 1e-3);
+        let vllm = VLLM_US
+            .iter()
+            .find(|(r, _)| *r == rows)
+            .map_or(0.0, |(_, us)| *us);
+        println!(
+            "| {rows} | {us:.1} | {:.0} | {vllm:.1} |",
+            bytes / us * 1e-3
+        );
     }
 }
