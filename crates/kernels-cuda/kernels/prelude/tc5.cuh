@@ -282,6 +282,18 @@ __device__ __forceinline__ u64 sdesc_sw128(u32 saddr) {
     return d;
 }
 
+// The same for the 64-byte swizzle: rows of 64 bytes, 8-row atoms 512 bytes
+// apart, the tile 512-aligned.
+__device__ __forceinline__ u64 sdesc_sw64(u32 saddr) {
+    u64 d = 0;
+    d |= static_cast<u64>((saddr & 0x3FFFFu) >> 4);
+    d |= static_cast<u64>(1) << 16;
+    d |= static_cast<u64>(512 >> 4) << 32;
+    d |= static_cast<u64>(1) << 46;
+    d |= static_cast<u64>(4) << 61;  // SWIZZLE_64B
+    return d;
+}
+
 // Descriptor tcgen05.cp reads a scale atom through: unswizzled rows of 16
 // bytes, 8-row core matrices 128 bytes apart.
 __device__ __forceinline__ u64 sdesc_sf(u32 saddr) {

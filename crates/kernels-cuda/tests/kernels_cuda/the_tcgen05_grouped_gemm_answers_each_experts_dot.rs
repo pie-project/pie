@@ -118,7 +118,10 @@ fn contiguous(a: Spec, w: Spec, experts: usize, [n, k]: [usize; 2], plan: Option
     let y = gpu.up(&vec![NAN; rows * n]);
     let routed = counts.iter().sum::<usize>() as u32;
     let shape = [n as u32, k as u32];
-    let ctx = gpu.ctx();
+    let ctx = gpu.ctx().with_tuning(kernels_cuda::tuning::Tuning {
+        gemm_nvfp4_k128: K128.load(std::sync::atomic::Ordering::Relaxed),
+        ..kernels_cuda::tuning::Tuning::DEFAULT
+    });
     match plan {
         Some(plan) => grouped_gemm_with(&ctx, a_op, w_op, y, g, shape, 0.75, plan),
         None => grouped_gemm(&ctx, a_op, w_op, y, g, shape, 0.75, routed),
@@ -299,6 +302,9 @@ fn the_contiguous_group_lands_what_a_loop_of_dense_gemms_lands() {
     eprintln!("contiguous vs dense loop: {equal} of {all} bit-equal");
 }
 
+/// The contiguous cases' `kernel.gemm.nvfp4_k128`: NVFP4 at 128 K a stage.
+static K128: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[test]
 fn the_tcgen05_grouped_gemm_answers_each_experts_dot_every_case() {
     if !supported() {
@@ -314,6 +320,10 @@ fn the_tcgen05_grouped_gemm_answers_each_experts_dot_every_case() {
         contiguous(a, w, 8, [256, 512], None);
         masked(a, w, 8, 16, [256, 512], 0);
     }
+    // NVFP4 at 128 K a stage (64-byte rows), a ragged K tail and a K split.
+    K128.store(true, std::sync::atomic::Ordering::Relaxed);
+    contiguous(nv, nv, 8, [256, 512], None);
+    contiguous(nv, nv, 3, [640, 640], None);
     let lone = |bn| {
         Some(Plan {
             swap: false,
@@ -335,6 +345,7 @@ fn the_tcgen05_grouped_gemm_answers_each_experts_dot_every_case() {
             ..lone(128).unwrap()
         }),
     );
+    K128.store(false, std::sync::atomic::Ordering::Relaxed);
     // CTA pairs: 256-row tiles, each CTA its expert's next 128 rows.
     let pair = Some(Plan {
         pair: true,

@@ -59,7 +59,7 @@ namespace pie::linear {
 namespace tc5k {
 
 __host__ __device__ constexpr unsigned stage_k(int kind) {
-    return kind == 0 ? 64u : kind == 3 ? 256u : 128u;
+    return kind == 0 ? 64u : kind == 3 ? 256u : 128u;  // kind 4: NVFP4 at 128 K a stage
 }
 
 __host__ __device__ constexpr unsigned atoms_k(int kind, int gran) {
@@ -267,7 +267,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     const float* __restrict__ alpha_e, Epi epi) {
     using namespace tc5;
     static_assert(kBN % 32 == 0 && kBN >= 32 && kBN <= 256, "the Q tile is 32..256 rows");
-    static_assert(kKind >= 0 && kKind <= 3, "four kinds");
+    static_assert(kKind >= 0 && kKind <= 4, "five kinds (4: NVFP4 at 128 K a stage)");
     static_assert(kPair == 1 || (kPair == 2 && !kSwap && kBN >= 64), "a pair splits a wide Q");
     static_assert(kGroup == 0 || (((kGroup == 1) == !kSwap || (kGroup == 1 && kMix != 0)) &&
                                   (kGroup == 1 || kPair == 1)),
@@ -291,11 +291,14 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     constexpr u32 kM = 128 * kPair;
     constexpr u32 kQRows = kBN / kPair;
     constexpr u32 kStageK = tc5k::stage_k(kKind);
-    constexpr u32 kInstrK = kStageK / 4;
-    constexpr u32 kInner = kKind == 0 ? 64 : 128;  // TMA box width, in the map's elements
+    // NVFP4 at 128 K a stage (kind 4) runs two 64-K MMAs on 64-byte rows.
+    constexpr u32 kInstrK = kKind == 4 ? 64 : kStageK / 4;
+    constexpr u32 kSteps = kStageK / kInstrK;
+    constexpr u32 kRowBytes = kKind == 4 ? 64 : 128;
+    constexpr u32 kInner = kKind == 0 || kKind == 4 ? 64 : 128;  // TMA box width, in the map's elements
     constexpr bool kScaled = kKind >= 2;
-    constexpr u32 kTileP = 128 * 128;
-    constexpr u32 kTileQ = kQRows * 128;
+    constexpr u32 kTileP = 128 * kRowBytes;
+    constexpr u32 kTileQ = kQRows * kRowBytes;
     // TMA counts the bytes it reads: an fp4 operand unpacked to a byte an
     // element (16U4_ALIGN16B) fills its tile from half as many.
     constexpr u32 kTxP = kKind == 2 && kFmtP == kE2M1 ? kTileP / 2 : kTileP;
@@ -680,7 +683,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                         load_raw(raw_s, &map_q, q0);
                     } else if constexpr (kFused && !kSwap && kPair == 1) {
                         load2(tile_q, &map_q, x.q_row);
-                        load2(tile_q + 128 * 128, &map_q, x.q_row + inter);
+                        load2(tile_q + 128 * kRowBytes, &map_q, x.q_row + inter);
                     } else if constexpr (kFused && !kSwap) {
                         load2(tile_q, &map_q, x.q_row + static_cast<int>(rank) * inter);
                     } else {
@@ -797,16 +800,17 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                         bar_wait(&tover[prev % 2], (prev / 2) & 1);
                         tc_fence_after();
                     }
-                    const u64 desc_q = sdesc_sw128(tile_q);
+                    const u64 desc_q = kKind == 4 ? sdesc_sw64(tile_q) : sdesc_sw128(tile_q);
                     // A W4A16 A side's slot: this step's, in TMEM.
                     const u32 a_slot = tmem + kStride + kAccN + s * kPT * 32;
 #pragma unroll
                     for (u32 h = 0; h < kPT; ++h) {
-                    const u64 desc_p = sdesc_sw128(tile_p + h * kTileP);
+                    const u64 desc_p =
+                        kKind == 4 ? sdesc_sw64(tile_p + h * kTileP) : sdesc_sw128(tile_p + h * kTileP);
                     const u32 d = d0 + h * kBN;
                     const u32 sf_tp = sf_tp0 + 4 * h * kAtomsP * kRowAtomsP;
 #pragma unroll
-                    for (u32 j = 0; j < 4; ++j) {
+                    for (u32 j = 0; j < kSteps; ++j) {
                         const u64 a = desc_p + 2 * j;
                         const u64 b = desc_q + 2 * j;
                         const bool accumulate = kb > kb0 || j > 0;

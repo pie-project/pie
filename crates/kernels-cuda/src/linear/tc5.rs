@@ -218,6 +218,9 @@ enum Kind {
     Fp8,
     Mx,
     Nvf4,
+    /// NVFP4 at 128 K a stage (64-byte rows, 64-byte swizzle): half the
+    /// stage of [`Kind::Nvf4`], so twice the ring in the same shared memory.
+    Nvf4K128,
     /// W4A16: bf16 activations against 4-bit weights the kernel dequantizes
     /// to bf16 (1: e2m1 under ue8m0 a 32, mxfp4; 2: e2m1 under e4m3 a 16,
     /// nvfp4; 3: affine u4, bf16 scale and zero a group).
@@ -231,6 +234,7 @@ impl Kind {
             Self::Fp8 => 1,
             Self::Mx => 2,
             Self::Nvf4 => 3,
+            Self::Nvf4K128 => 4,
         }
     }
 
@@ -238,7 +242,15 @@ impl Kind {
         match self {
             Self::Bf16 | Self::Mixed(_) => 64,
             Self::Nvf4 => 256,
-            Self::Fp8 | Self::Mx => 128,
+            Self::Fp8 | Self::Mx | Self::Nvf4K128 => 128,
+        }
+    }
+
+    /// The bytes a tile row takes a stage (the swizzle's span).
+    const fn row_bytes(self) -> u32 {
+        match self {
+            Self::Nvf4K128 => 64,
+            _ => 128,
         }
     }
 
@@ -267,7 +279,7 @@ impl Kind {
     /// The instruction descriptor's format code for one side.
     const fn format(self, elem: Elem) -> u32 {
         match (self, elem) {
-            (Self::Bf16 | Self::Mixed(_), _) | (Self::Nvf4, _) => 1,
+            (Self::Bf16 | Self::Mixed(_), _) | (Self::Nvf4 | Self::Nvf4K128, _) => 1,
             (_, Elem::E2m1) => 5,
             _ => 0,
         }
@@ -277,7 +289,7 @@ impl Kind {
 const fn atoms_k(kind: Kind, gran: u32) -> u32 {
     match kind {
         Kind::Bf16 | Kind::Fp8 | Kind::Mixed(_) => 0,
-        Kind::Mx | Kind::Nvf4 => {
+        Kind::Mx | Kind::Nvf4 | Kind::Nvf4K128 => {
             let atoms = kind.stage_k() / gran / 4;
             if atoms == 0 { 1 } else { atoms }
         }
@@ -302,13 +314,14 @@ const fn smem_bytes(
         ..
     } = plan;
     // A W4A16 weight on the A side (swapped) lands in TMEM, not shared memory.
+    let row_bytes = kind.row_bytes();
     let p_tile = if swap && matches!(kind, Kind::Mixed(_)) {
         0
     } else {
-        128 * 128 * pt
+        128 * row_bytes * pt
     };
     let stage = p_tile
-        + bn / if pair { 2 } else { 1 } * 128
+        + bn / if pair { 2 } else { 1 } * row_bytes
         + atoms_k(kind, gran_p) * 512 * pt * p_blocks
         + atoms_k(kind, gran_q) * bn.div_ceil(128) * 512;
     // A W4A16 weight's raw codes: 32 bytes a row a stage.
@@ -1088,6 +1101,17 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
         epi,
         ..
     } = job;
+    // NVFP4 at 128 K a stage where the profile says (`kernel.gemm.nvfp4_k128`):
+    // the ring doubles in the same shared memory. Unswapped only: a swapped
+    // (masked) select measured slower at it (Qwen3.8-Flash-Next's gate-up at
+    // 64 tokens, 140 -> 184 us), an unswapped one 5% ahead at 1024 tokens
+    // and even at 8192. Whole 128s of K.
+    let kind = match kind {
+        Kind::Nvf4 if ctx.tuning().gemm_nvfp4_k128 && !job.plan.swap && k.is_multiple_of(128) => {
+            Kind::Nvf4K128
+        }
+        kind => kind,
+    };
     let glu = epi.glu.is_some();
     // A GLU swapped reads two weight tiles a stage; unswapped, its Q tile
     // comes in two 128-row halves.
@@ -1375,6 +1399,12 @@ fn tensor_map(
             u64::from(k) / 2,
             128,
         ),
+        (Kind::Nvf4K128, Elem::E2m1) => (
+            T::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            k / 2,
+            u64::from(k) / 2,
+            64,
+        ),
         (_, Elem::E2m1) => (
             T::CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B,
             k,
@@ -1408,7 +1438,11 @@ fn tensor_map(
         dims: [inner, rows, 0],
         strides: [stride, 0],
         boxes: [box_k, box_rows, 1],
-        swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+        swizzle: if kind.row_bytes() == 64 {
+            dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B
+        } else {
+            dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B
+        },
     })
 }
 

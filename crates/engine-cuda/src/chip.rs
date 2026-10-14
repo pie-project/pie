@@ -411,6 +411,7 @@ mod tests {
                         prefill_tc5: false,
                         decode_grouped_prefill_from: 0,
                         gemm_bias_epilogue: false,
+                        gemm_nvfp4_k128: false,
                         decode_grouped_prefill_lse: false,
                         decode_xqa: false,
                         decode_xqa_from_64: 0,

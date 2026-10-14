@@ -57,3 +57,6 @@ sdpa.decode.xqa_from_64 = 16
 # A dense projection's bias from the cuBLASLt epilogue, not a separate add
 # (gpt-oss's qkv and o: about 0.44 ms a bs64 decode step).
 gemm.bias_epilogue = true
+# An unswapped NVFP4 x NVFP4 GEMM at 128 K a stage (64-byte rows): twice the
+# ring in the same shared memory; W4A4 gate-up 5% ahead at 1024 tokens.
+gemm.nvfp4_k128 = true

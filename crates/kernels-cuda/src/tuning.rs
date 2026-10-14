@@ -41,6 +41,13 @@ pub struct MoeTc5From(pub u32);
 #[decision(id = "kernel.moe.mxfp4_mma_until", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMxfp4MmaUntil(pub u32);
 
+/// Whether an NVFP4 x NVFP4 tcgen05 GEMM runs 128 K a stage (64-byte rows
+/// under the 64-byte swizzle) instead of 256: the ring holds twice the
+/// stages. Off but where a chip's profile turns it on (B200's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.nvfp4_k128", flag, default = false, tune = search)]
+pub struct GemmNvfp4K128;
+
 /// Whether a dense projection's bias lands from the cuBLASLt epilogue of the
 /// algorithm its shape chose, instead of a separate add. Off but where a
 /// chip's profile turns it on (B200's).
@@ -293,6 +300,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
         .add::<GemmBiasEpilogue>()
+        .add::<GemmNvfp4K128>()
         .add::<PrefillTc5>()
         .add::<DecodeGroupedPrefillFrom>()
         .add::<DecodeGroupedPrefillLse>()
@@ -341,6 +349,7 @@ pub struct Tuning {
     pub mxfp4_mma_until: u32,
     pub mxfp4_mma_from: u32,
     pub gemm_bias_epilogue: bool,
+    pub gemm_nvfp4_k128: bool,
     pub prefill_tc5: bool,
     pub decode_grouped_prefill_from: u32,
     pub decode_grouped_prefill_lse: bool,
@@ -387,6 +396,7 @@ impl Tuning {
         mxfp4_mma_until: 0,
         mxfp4_mma_from: 64,
         gemm_bias_epilogue: false,
+        gemm_nvfp4_k128: false,
         prefill_tc5: false,
         decode_grouped_prefill_from: 0,
         decode_grouped_prefill_lse: false,
@@ -433,6 +443,7 @@ impl Tuning {
             mxfp4_mma_until: profile.get::<MoeMxfp4MmaUntil>().0,
             mxfp4_mma_from: profile.get::<MoeMxfp4MmaFrom>().0,
             gemm_bias_epilogue: profile.on::<GemmBiasEpilogue>(&Anywhere),
+            gemm_nvfp4_k128: profile.on::<GemmNvfp4K128>(&Anywhere),
             prefill_tc5: profile.on::<PrefillTc5>(&Anywhere),
             decode_grouped_prefill_from: profile.get::<DecodeGroupedPrefillFrom>().0,
             decode_grouped_prefill_lse: profile.on::<DecodeGroupedPrefillLse>(&Anywhere),
