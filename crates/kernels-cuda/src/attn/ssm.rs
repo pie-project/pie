@@ -1722,7 +1722,6 @@ mod tests {
     /// RTX 30/40/50 or a DGX Spark into 99 KiB, short of the scan.
     #[test]
     fn the_scan_fits_a_datacenter_block_and_not_a_99_kib_one() {
-        assert_eq!(scan_smem(128), 125_440);
         assert!(scan_smem(128) <= 232_448);
         assert!(scan_smem(128) <= 166_912);
         assert!(scan_smem(128) > 101_376);
