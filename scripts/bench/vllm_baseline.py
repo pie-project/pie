@@ -173,7 +173,7 @@ def main() -> None:
     res.update(mode=args.mode, model=args.model, argv=shlex.join(sys.argv),
                engine_flags=shlex.join(engine_args(args)), wall_s=time.time() - t0,
                peak_gpu_mem_mib=mem.peak, contended=bool(mem.foreign),
-               foreign_pids=sorted(mem.foreign), foreign_pids_at_load=sorted(mem.foreign_at_load))
+               foreign_pids=sorted(mem.foreign), foreign_samples=mem.foreign_samples, foreign_pids_at_load=sorted(mem.foreign_at_load))
     path = os.path.join(args.out, f"{args.mode}.json")
     with open(path, "w") as f:
         json.dump(res, f, indent=2)

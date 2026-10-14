@@ -196,7 +196,7 @@ def main() -> None:
         res = asyncio.run(run(args, mem))
     res.update(mode=args.mode, model=args.model, hf=args.hf, argv=shlex.join(sys.argv),
                wall_s=time.time() - t0, peak_gpu_mem_mib=mem.peak,
-               contended=bool(mem.foreign), foreign_pids=sorted(mem.foreign),
+               contended=bool(mem.foreign), foreign_pids=sorted(mem.foreign), foreign_samples=mem.foreign_samples,
                foreign_pids_at_load=sorted(mem.foreign_at_load))
     path = os.path.join(args.out, f"{args.mode}.json")
     with open(path, "w") as f:

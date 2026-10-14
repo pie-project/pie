@@ -52,6 +52,8 @@ class Model:
     # The pie deployment the artifact was imported as; None runs vLLM alone.
     pie_deployment: str | None
     vllm_flags: list[str] = field(default_factory=list)
+    # `--engine-option KEY=VALUE`s pie is served with.
+    pie_options: list[str] = field(default_factory=list)
     # A vLLM result measured before this driver existed, read as it stands.
     vllm_dir: str | None = None
     note: str = ""
@@ -68,10 +70,19 @@ class Model:
 MODELS = {m.key: m for m in [
     Model("qwen38-27b", "Qwen/Qwen3.8-27B", "bf16 / kv bf16", "bf16 / kv bf16", "qwen38-27b-bf16-kv-bf16"),
     Model("gemma4-31b", "google/gemma-4-31B-it", "bf16 / kv bf16", "bf16 / kv bf16", "gemma4-31b-bf16-kv-bf16"),
-    Model("gptoss-120b", "openai/gpt-oss-120b", "experts mxfp4, rest bf16 / kv bf16",
-          "experts mxfp4, rest bf16 / kv bf16", "gptoss-120b-bf16-mxfp4-kv-bf16"),
+    # vLLM 0.31's default mxfp4 MoE on this B200 (Triton) fails its own
+    # warmup with CUBLAS_STATUS_EXECUTION_FAILED, and both FlashInfer kinds
+    # refuse the device; Marlin (w4a16, as pie's) is what serves.
+    Model("gptoss-120b", "openai/gpt-oss-120b", "experts mxfp4 (w4a16), rest bf16 / kv bf16",
+          "experts mxfp4 (w4a16), rest bf16 / kv bf16", "gptoss-120b-bf16-mxfp4-kv-bf16",
+          vllm_flags=["--extra", "--moe-backend marlin"],
+          note="vLLM: default Triton mxfp4 MoE crashes at warmup on this build; --moe-backend marlin"),
+    # A fire past 8191 tokens routes more than 65535 rows, which the bf16
+    # select GEMV refuses once the grouped leg's 512 MiB staging cap turns
+    # it away; 4096-token fires keep pie inside both.
     Model("qwen36-35b-a3b", "Qwen/Qwen3.6-35B-A3B", "bf16 / kv bf16", "bf16 / kv bf16",
-          "qwen36-35b-a3b-bf16-kv-bf16"),
+          "qwen36-35b-a3b-bf16-kv-bf16", pie_options=["max_forward_tokens=4096"],
+          note="pie: max_forward_tokens=4096 (wider fires refuse: bf16 MoE select route run > 65535)"),
     Model("qwen38-flash-next-nvfp4", "nvidia/Qwen3.8-Flash-Next-NVFP4", "nvfp4 / kv bf16", None, None,
           vllm_dir="/root/baselines/qwen38-flash-next-nvfp4", note="pie: not runnable yet (other track)"),
     Model("deepseek-v4-flash", "deepseek-ai/DeepSeek-V4-Flash", "fp8 dense + mxfp4 experts / kv fp8_ds_mla", None,
@@ -91,6 +102,8 @@ def run_once(model: Model, engine: str, mode: str, out: Path) -> dict | None:
     else:
         cmd = [PIE_PY, "pie_baseline.py", mode, "--model", model.artifact(), "--hf", model.snapshot(),
                "--out", str(out)]
+        for opt in model.pie_options:
+            cmd += ["--engine-option", opt]
     env = {**os.environ, "PIE_HOME": PIE_HOME}
     log("+", " ".join(cmd))
     with open(out / f"{mode}_driver.log", "w") as f:
@@ -109,30 +122,46 @@ def measure(model: Model, engine: str, mode: str, attempts: int) -> dict | None:
         if waited > 1:
             log(f"  device idle after {waited:.0f}s")
         res = run_once(model, engine, mode, out)
-        if res is None:
-            return None
-        if not res.get("contended"):
+        if res is not None and not res.get("contended"):
             return res
-        # Keep the contended run beside the clean one, as vllm_baseline's
-        # first runs were kept, and go again.
-        aside = out / f"contended_{mode}_{attempt}"
+        # Keep the contended (or failed: a neighbour taking memory between
+        # the idle check and the load fails it) run aside and go again.
+        aside = out / f"{'contended' if res else 'failed'}_{mode}_{attempt}"
         aside.mkdir(exist_ok=True)
         for f in glob.glob(str(out / f"*{mode}*")):
             if os.path.isfile(f):
                 shutil.move(f, aside / os.path.basename(f))
-        log(f"  {engine} {mode} contended by pids {res.get('foreign_pids')}; kept in {aside}, again")
-    log(f"  {engine} {mode}: every attempt contended")
+        log(f"  {engine} {mode} {'contended by pids ' + str(res.get('foreign_pids')) if res else 'failed'};"
+            f" kept in {aside}, again")
+    log(f"  {engine} {mode}: no attempt was clean")
     return None
 
 
+def contention(path: Path) -> int:
+    """Samples of a run's memory log, about a second each, that show a
+    process besides the engine's own."""
+    doc = json.loads(path.read_text())
+    if "foreign_samples" in doc:
+        return doc["foreign_samples"] if doc.get("contended") else 0
+    csv = path.parent / f"gpu_mem_{path.stem}.csv"
+    if not doc.get("contended") or not csv.exists():
+        return 0
+    rows = [line.split(",") for line in csv.read_text().splitlines()[1:]]
+    return sum(1 for r in rows if len(r) > 3 and len(r[3].split()) > 1)
+
+
 def merged(model: Model, engine: str) -> dict | None:
+    """Each mode's clean run, or, when every attempt was contended, the
+    least contended one, marked so."""
     base = Path(model.vllm_dir) if (engine == "vllm" and model.vllm_dir) else OUT / model.key / engine
     doc = {}
     for mode in ("offline", "serve"):
-        hits = sorted(base.glob(f"**/{mode}.json"), key=lambda p: ("contended" in str(p), len(p.parts)))
+        hits = sorted(base.glob(f"**/{mode}.json"),
+                      key=lambda p: (contention(p), "contended" in str(p), len(p.parts)))
         if hits:
             doc[mode] = json.loads(hits[0].read_text())
             doc[mode]["path"] = str(hits[0])
+            doc[mode]["contended_samples"] = contention(hits[0])
     return doc or None
 
 
@@ -202,6 +231,11 @@ def table() -> str:
                      " (MISMATCH)" if model.pie_precision else ""),
                   *( [f"note: {model.note}"] if model.note else []), "",
                   "| point | vLLM | pie | pie/vLLM |", "|---|---:|---:|---:|"]
+        for engine, doc in (("vLLM", vdoc), ("pie", pdoc)):
+            for mode, run in (doc or {}).items():
+                if run.get("contended_samples"):
+                    lines.insert(len(lines) - 3, f"contended: {engine} {mode} saw a neighbour process in "
+                                 f"{run['contended_samples']} one-second samples (every attempt was contended)")
         for label, key, unit, nd, higher in ROWS:
             a, b = p.get(key), v.get(key)
             r = ratio(a, b) if higher else ratio(b, a)

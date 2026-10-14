@@ -688,6 +688,8 @@ class MemSampler:
         self.peak = 0
         self.foreign: set[int] = set()
         self.foreign_at_load: set[int] = set()
+        # Samples, about a second each, a neighbour was seen while measuring.
+        self.foreign_samples = 0
         self._measuring = threading.Event()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -703,9 +705,12 @@ class MemSampler:
                         ["nvidia-smi", "--query-gpu=memory.used,utilization.gpu", "--format=csv,noheader,nounits"],
                         capture_output=True, text=True, timeout=10).stdout.split(",")[:2]
                     _, apps = _gpu_compute_apps()
-                    for pid in apps:
-                        if not _descends_from(pid, me):
-                            (self.foreign if self._measuring.is_set() else self.foreign_at_load).add(pid)
+                    neighbours = {pid for pid in apps if not _descends_from(pid, me)}
+                    if self._measuring.is_set():
+                        self.foreign |= neighbours
+                        self.foreign_samples += bool(neighbours)
+                    else:
+                        self.foreign_at_load |= neighbours
                     used = int(used)
                     self.peak = max(self.peak, used)
                     procs = " ".join(f"{pid}:{mib}" for pid, mib in apps.items())
